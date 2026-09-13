@@ -1,0 +1,986 @@
+package web
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
+)
+
+// ============================================================================
+//  服务管理接口
+//
+//  设计要点：
+//    - 服务状态一律实时查询，不读数据库缓存（数据库只记录"是什么、怎么管"）
+//    - 应用市场的安装先做预检查，把缺依赖/端口冲突一次性说清楚
+//    - 纳管（managed=false）与托管（managed=true）在卸载行为上严格区分：
+//      纳管服务绝不允许面板卸载
+// ============================================================================
+
+// detectDocker 探测 Docker 环境（只返回真正连得上的 socket）。
+//
+// 统一在这里传 Cfg.UserHome：面板以 root 运行时 os.UserHomeDir() 得到
+// /var/root，于是 OrbStack 的 ~/.orbstack/run/docker.sock 永远找不到 ——
+// 表现为"没装 Docker"，其实只是找错了家目录。
+func (s *Server) detectDocker() (string, string) {
+	if sock := s.Cfg.DockerSocket; sock != "" {
+		if p, v := services.DetectDocker(sock, s.Cfg.UserHome); p != "" {
+			return p, v
+		}
+	}
+	return services.DetectDocker("", s.Cfg.UserHome)
+}
+
+// svcManager 构造服务管理器。
+func (s *Server) svcManager() *services.Manager {
+	sock, _ := s.detectDocker()
+	if sock == "" {
+		// 没探测到可连的 socket 时，保留用户配置的路径：
+		// compose 之类的操作交给 docker 自己去报更有用的错误。
+		sock = s.Cfg.DockerSocket
+	}
+	return services.NewManager(s.serviceRepo, services.Options{
+		HelperBin:    s.Cfg.ServicePath("zizpanel-helper"),
+		BrewBin:      s.Cfg.BrewBin,
+		DockerSocket: sock,
+		UserHome:     s.Cfg.UserHome,
+		UserName:     s.Cfg.User,
+		UID:          s.Cfg.UserUID,
+		WorkDir:      s.Cfg.WorkDir,
+	})
+}
+
+// ---------- 列表与详情 ----------
+
+func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	withHealth := r.URL.Query().Get("health") != "0"
+	list, err := mgr.List(r.Context(), withHealth)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "读取服务列表失败: "+err.Error())
+		return
+	}
+
+	// Docker 环境信息：前端据此决定是否显示 Docker 相关入口
+	sock, ver := s.cachedDocker()
+
+	ok(w, map[string]any{
+		"list": list,
+		"docker": map[string]any{
+			"available": sock != "",
+			"socket":    sock,
+			"version":   ver,
+		},
+		"categories": map[string]string{
+			"lnmp": "网站环境", "ai": "AI 服务", "tool": "运维工具",
+			"custom": "自定义", "other": "其它",
+		},
+	})
+}
+
+func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	mgr := s.svcManager()
+	v, err := mgr.Get(r.Context(), name)
+	if err != nil {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	ok(w, v)
+}
+
+// ---------- 服务操作 ----------
+
+func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	action := r.PathValue("action")
+
+	mgr := s.svcManager()
+	start := time.Now()
+	st, err := mgr.Action(r.Context(), name, action)
+	cost := time.Since(start).Milliseconds()
+
+	if err != nil {
+		s.audit(r, "service_"+action, name, "失败: "+err.Error(), false, "")
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(r, "service_"+action, name,
+		fmt.Sprintf("state=%s 耗时=%dms", st.Status, cost), true, "")
+
+	// 若刚动过的是 Qwen 服务，补一次预热。模型驻留是**进程内存**，
+	// 重启后两个模型全变冷，下一个网站请求要白等约 25 秒。
+	// 后台守温循环也能兜住这件事，但那是分钟级的；用户在这里手动重启，
+	// 几秒内就能恢复才对。QwenWarmResident 对已驻留的模型是空操作。
+	if svc, err := mgr.Get(r.Context(), name); err == nil && svc.LaunchLabel == services.QwenLabel {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if warmed, _ := mgr.QwenWarmResident(ctx); warmed > 0 {
+				s.Log.Info("服务操作后已补载 %d 个 Qwen 模型", warmed)
+			}
+		}()
+	}
+
+	ok(w, map[string]any{"state": st, "cost_ms": cost})
+}
+
+// ---------- 日志与日志流 ----------
+
+func (s *Server) handleServiceLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	lines := 200
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 5000 {
+			lines = n
+		}
+	}
+	mgr := s.svcManager()
+	content, err := mgr.Logs(r.Context(), name, lines)
+	if err != nil {
+		// 日志不可用不算致命，返回 200 + 提示，前端展示为说明性文字
+		ok(w, map[string]any{"content": "", "error": err.Error(), "lines": 0})
+		return
+	}
+	ok(w, map[string]any{"content": content, "lines": len(strings.Split(content, "\n"))})
+}
+
+// handleServiceLogStream 用 SSE 推送服务日志。
+//
+// 为什么用 SSE：日志是单向服务端推送，SSE 基于普通 HTTP，
+// 天然支持 Cookie 鉴权与浏览器自动重连，不需要 WebSocket 的握手与心跳设计。
+func (s *Server) handleServiceLogStream(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	flusher, okf := w.(http.Flusher)
+	if !okf {
+		fail(w, http.StatusInternalServerError, "当前服务不支持流式响应")
+		return
+	}
+	mgr := s.svcManager()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	ch, err := mgr.LogStream(ctx, name)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no") // 经 nginx 反代时必须关缓冲
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprint(w, "event: open\ndata: {}\n\n")
+	flusher.Flush()
+
+	ping := time.NewTicker(25 * time.Second)
+	defer ping.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ping.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		case chunk, alive := <-ch:
+			if !alive {
+				fmt.Fprint(w, "event: close\ndata: {}\n\n")
+				flusher.Flush()
+				return
+			}
+			if chunk == "" {
+				continue
+			}
+			// 把内容按行拆成多个 data: 行，符合 SSE 规范（避免单个超长 data 行）
+			for _, line := range strings.Split(strings.TrimRight(chunk, "\n"), "\n") {
+				fmt.Fprintf(w, "data: %s\n", line)
+			}
+			fmt.Fprint(w, "\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// ---------- 注册 / 编辑 / 移除 ----------
+
+type serviceReq struct {
+	Name         string `json:"name"`
+	DisplayName  string `json:"display_name"`
+	Kind         string `json:"kind"`
+	Category     string `json:"category"`
+	Icon         string `json:"icon"`
+	Description  string `json:"description"`
+	Port         int    `json:"port"`
+	LaunchLabel  string `json:"launch_label"`
+	PlistPath    string `json:"plist_path"`
+	WorkDir      string `json:"work_dir"`
+	StartCmd     string `json:"start_cmd"`
+	Container    string `json:"container"`
+	ComposeFile  string `json:"compose_file"`
+	Image        string `json:"image"`
+	HealthURL    string `json:"health_url"`
+	HealthExpect string `json:"health_expect"`
+	LogPath      string `json:"log_path"`
+	Enabled      *bool  `json:"enabled"`
+	Autostart    *bool  `json:"autostart"`
+}
+
+// handleServiceCreate 手工注册一个服务。
+func (s *Server) handleServiceCreate(w http.ResponseWriter, r *http.Request) {
+	var req serviceReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Name = services.NormalizeName(req.Name)
+	if req.Name == "" {
+		// 没给名字时用展示名推导
+		req.Name = services.NormalizeName(req.DisplayName)
+	}
+	if req.Name == "" {
+		fail(w, http.StatusBadRequest, "请填写服务标识（英文/数字/连字符）")
+		return
+	}
+	if req.DisplayName == "" {
+		req.DisplayName = req.Name
+	}
+	kind := services.Kind(req.Kind)
+	if kind == "" {
+		kind = services.KindNative
+	}
+	if kind == services.KindNative && req.LaunchLabel == "" && strings.TrimSpace(req.StartCmd) == "" {
+		fail(w, http.StatusBadRequest, "原生服务需要填写 launchd 标签（LaunchLabel）或启动命令之一")
+		return
+	}
+	if req.Kind == string(services.KindCompose) && req.ComposeFile == "" {
+		fail(w, http.StatusBadRequest, "compose 服务需要指定 compose 文件路径")
+		return
+	}
+	if req.Kind == string(services.KindDocker) && req.Container == "" {
+		req.Container = req.Name
+	}
+
+	// 端口冲突检查：同端口有两个服务时给出明确提示（不阻止，用户可能有特殊安排）
+	if req.Port > 0 {
+		if info, err := checkPortHelper(r.Context(), req.Port); err == nil && info != "" {
+			s.Log.Warn("注册服务 %s 时端口 %d 已被占用：%s", req.Name, req.Port, info)
+		}
+	}
+
+	svc := &services.Service{
+		Name: req.Name, DisplayName: req.DisplayName, Kind: kind,
+		Category: orDefault(req.Category, "custom"), Icon: orDefault(req.Icon, "🧩"),
+		Description: req.Description, Port: req.Port,
+		LaunchLabel: req.LaunchLabel, PlistPath: req.PlistPath, WorkDir: req.WorkDir,
+		StartCmd: req.StartCmd, Container: req.Container, ComposeFile: req.ComposeFile,
+		Image: req.Image, HealthURL: req.HealthURL, HealthExpect: req.HealthExpect,
+		LogPath: req.LogPath, Enabled: true, Managed: true,
+	}
+	if req.Enabled != nil {
+		svc.Enabled = *req.Enabled
+	}
+	if req.Autostart != nil {
+		svc.Autostart = *req.Autostart
+	}
+	if err := s.serviceRepo.Create(r.Context(), svc); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "service_create", svc.Name, "注册服务 "+svc.DisplayName, true, "")
+	ok(w, svc)
+}
+
+// handleServiceUpdate 更新服务记录。
+func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	cur, err := s.serviceRepo.Get(r.Context(), name)
+	if err != nil {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var req serviceReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 只覆盖传了的字段
+	if req.DisplayName != "" {
+		cur.DisplayName = req.DisplayName
+	}
+	if req.Category != "" {
+		cur.Category = req.Category
+	}
+	if req.Icon != "" {
+		cur.Icon = req.Icon
+	}
+	if req.Description != "" {
+		cur.Description = req.Description
+	}
+	if req.Port > 0 {
+		cur.Port = req.Port
+	}
+	if req.LaunchLabel != "" {
+		cur.LaunchLabel = req.LaunchLabel
+	}
+	if req.PlistPath != "" {
+		cur.PlistPath = req.PlistPath
+	}
+	if req.WorkDir != "" {
+		cur.WorkDir = req.WorkDir
+	}
+	if req.StartCmd != "" {
+		cur.StartCmd = req.StartCmd
+	}
+	if req.Container != "" {
+		cur.Container = req.Container
+	}
+	if req.ComposeFile != "" {
+		cur.ComposeFile = req.ComposeFile
+	}
+	if req.Image != "" {
+		cur.Image = req.Image
+	}
+	if req.HealthURL != "" {
+		cur.HealthURL = req.HealthURL
+	}
+	if req.HealthExpect != "" {
+		cur.HealthExpect = req.HealthExpect
+	}
+	if req.LogPath != "" {
+		cur.LogPath = req.LogPath
+	}
+	if req.Enabled != nil {
+		cur.Enabled = *req.Enabled
+	}
+	if req.Autostart != nil {
+		cur.Autostart = *req.Autostart
+	}
+	if err := s.serviceRepo.Update(r.Context(), cur); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(r, "service_update", name, "更新服务配置", true, "")
+	ok(w, cur)
+}
+
+// handleServiceDelete 从面板移除服务记录（不触碰系统）。
+func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	mgr := s.svcManager()
+	if err := mgr.Forget(r.Context(), name); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit(r, "service_forget", name, "从面板移除服务（不影响系统）", true, "")
+	ok(w, map[string]any{"msg": "已从面板移除。系统上的服务本身没有被改动。"})
+}
+
+// handleServiceUninstall 卸载托管服务。
+func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	mgr := s.svcManager()
+	if err := mgr.Uninstall(r.Context(), name); err != nil {
+		s.audit(r, "service_uninstall", name, "失败: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "service_uninstall", name, "卸载托管服务", true, "")
+	ok(w, map[string]any{"msg": "服务已卸载"})
+}
+
+// ---------- 应用市场 ----------
+
+func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	// 「已安装」必须看两个来源，缺一不可：
+	//
+	//  1. 面板自己的服务记录 —— 面板装过的；
+	//  2. Homebrew 里是否真的有这个 formula —— brew 装过的。
+	//
+	// 只查第 1 个就会出现真机上那种笑话：mini 上 nginx/php/mysql 明明
+	// 由 brew 装着、还在系统域跑着，应用市场却给它们显示"安装"按钮。
+	// 而用户点下去，重装一遍已经装好的东西。
+	//
+	// 键也要两套都记：面板记录里是服务名（如 php@8.3），
+	// 目录条目里是 ID（如 php83），过去只按 ID 查，
+	// 于是连"面板自己装的"都可能匹配不上。
+	installed := map[string]bool{}
+	if list, err := s.serviceRepo.List(ctx); err == nil {
+		for _, svc := range list {
+			installed[svc.Name] = true // 服务名
+			if svc.LaunchLabel != "" {
+				installed[svc.LaunchLabel] = true // launchd label
+			}
+		}
+	}
+	// 整批查一次（而不是循环里逐个查），见 installedFormulas 的说明
+	brewSet := s.installedFormulas(ctx)
+	dockerSock, _ := s.cachedDocker()
+
+	type item struct {
+		services.App
+		// Adopted 表示"这个服务已经在服务管理里登记过了"。
+		// 必须与 Installed 分开：一个应用可能**装了但没纳管**
+		// （用户自己装的、或换机器后没登记），这时该给的是「纳管」按钮，
+		// 而不是"已安装"就完事 —— 用户会发现列表里找不到它。
+		Adopted   bool `json:"adopted"`
+		Installed bool `json:"installed"`
+		// Available 表示当前环境能否安装（缺 Docker 的 compose 应用为 false）
+		Available bool   `json:"available"`
+		Note      string `json:"note"`
+	}
+	apps := services.Catalog()
+	out := make([]item, 0, len(apps))
+	for _, a := range apps {
+		// 先看面板记录（ID / 名称 / label 三种写法都认），
+		// 再对 brew 类应用查一次 Homebrew。
+		// 纳管类条目看的是"这个 launchd 服务是否已在面板记录里"，
+		// 而不是它是否被 brew 装过。少了这一条，已经纳管过的服务
+		// 在市场里仍然显示「接入纳管」按钮，点下去还报"已经纳管过了"——
+		// 状态和入口自相矛盾。
+		isInstalled := installed[a.ID] || installed[a.Name]
+		if !isInstalled && a.AdoptLabel != "" {
+			isInstalled = installed[a.AdoptLabel]
+		}
+		// 面板自研安装器部署的系统级服务：面板记录里有该 label，
+		// 或者 /Library/LaunchDaemons 下有对应 plist，都算已安装。
+		if !isInstalled && a.ServiceLabel != "" {
+			isInstalled = installed[a.ServiceLabel]
+			if !isInstalled {
+				if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", a.ServiceLabel+".plist")); err == nil {
+					isInstalled = true
+				}
+			}
+		}
+		if !isInstalled && a.BrewFormula != "" {
+			isInstalled = brewSet[a.BrewFormula]
+		}
+		// 纳管的判据：目录里的 label 是否已在面板记录里
+		adopted := false
+		if a.ServiceLabel != "" && installed[a.ServiceLabel] {
+			adopted = true
+		}
+		if !adopted && a.AdoptLabel != "" && installed[a.AdoptLabel] {
+			adopted = true
+		}
+		// compose / docker 应用没有 ServiceLabel：它们由面板直接以应用 ID
+		// 登记进服务管理。少了这条判断，刚装好的应用会显示成
+		// "已安装·未纳管"并给出一个点了必然报错的「纳管」按钮。
+		// installed 这张表只由面板的服务记录（名称与 launchd label）构成，
+		// 所以命中 ID 就等于"它确实已在服务管理里"。
+		if !adopted && (installed[a.ID] || installed[a.Name]) {
+			adopted = true
+		}
+		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true}
+		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
+			if dockerSock == "" {
+				it.Available = false
+				it.Note = "需要先安装 Docker 运行时（Colima）"
+			}
+		}
+		if a.AdoptLabel != "" {
+			// 纳管类应用：服务不存在时不可安装
+			if !adoptTargetExists(s.Cfg.UserHome, a.AdoptLabel) {
+				it.Available = false
+				it.Note = "未检测到该服务"
+			}
+		}
+		out = append(out, it)
+	}
+
+	sock, ver := s.cachedDocker()
+	ok(w, map[string]any{
+		"list":   out,
+		"docker": map[string]any{"available": sock != "", "socket": sock, "version": ver},
+	})
+}
+
+// handleMarketPreflight 安装前检查。
+func (s *Server) handleMarketPreflight(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found {
+		fail(w, http.StatusNotFound, "应用不存在: "+id)
+		return
+	}
+	mgr := s.svcManager()
+	ok(w, mgr.Preflight(r.Context(), app))
+}
+
+// handleMarketInstall 安装应用。
+//
+// 大多数条目走通用的 brew / compose 安装流程；但有四个项目用的是
+// 本项目自研的安装器（要建虚拟环境、改 nginx、注册系统级守护进程等），
+// 通用流程做不了，所以在这里按 ID 分流。
+func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	switch id {
+	case "iopaint":
+		s.handleInstallIOPaint(w, r)
+		return
+	case "qwen3tts":
+		s.handleInstallQwenTTS(w, r)
+		return
+	case "voicereceiver":
+		s.handleInstallVoiceReceiver(w, r)
+		return
+	case "phpmyadmin":
+		s.handleInstallPhpMyAdmin(w, r)
+		return
+	case "docker-runtime":
+		s.handleInstallDockerRuntime(w, r)
+		return
+	}
+
+	mgr := s.svcManager()
+	res, err := mgr.Install(r.Context(), id)
+	if err != nil {
+		s.audit(r, "market_install", id, "失败: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "market_install", id, strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleInstallLNMP 一键安装 LNMP 环境。
+//
+// 这是个"组合动作"：会 brew 安装三个包，并做四件包管理管不到的收尾工作
+// （nginx 改 listen 80、建 vhosts/include、初始化 MySQL、注册系统级守护进程）。
+// 详见 internal/services/lnmp.go 里的说明。
+//
+// 同步执行：这一步动辄十几分钟，所以前端要展示 result.Steps。
+// 之所以不做成异步 + 轮询：它不重启面板，连接不会断，
+// 同步返回反而让"到底成没成"更清楚。
+func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "lnmp", Steps: []string{}}
+	err := mgr.InstallLNMP(r.Context(), res)
+	if err != nil {
+		s.audit(r, "install_lnmp", "lnmp", "失败: "+err.Error(), false, "")
+		// 失败也要把已经走完的步骤带回去，否则用户不知道卡在哪一步
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_lnmp", "lnmp", strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleInstallPhpMyAdmin 单独部署 phpMyAdmin（LNMP 已装好、只想补它时用）。
+func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "phpmyadmin", Steps: []string{}}
+	if err := mgr.InstallPhpMyAdmin(r.Context(), res); err != nil {
+		s.audit(r, "install_phpmyadmin", "phpmyadmin", "失败: "+err.Error(), false, "")
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_phpmyadmin", "phpmyadmin", strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleQwenModels 返回两个 TTS 模型的下载与驻留状态。
+func (s *Server) handleQwenModels(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	list := mgr.QwenModelsStatus(r.Context())
+	ok(w, map[string]any{
+		"list":   list,
+		"active": mgr.QwenActiveModel(r.Context()),
+	})
+}
+
+// handleQwenModelSwitch 切换当前驻留的模型（加载目标、卸载其余）。
+func (s *Server) handleQwenModelSwitch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		fail(w, http.StatusBadRequest, "缺少模型名")
+		return
+	}
+	mgr := s.svcManager()
+	if err := mgr.SetQwenModel(r.Context(), req.Name); err != nil {
+		s.audit(r, "qwen_model_switch", req.Name, "失败: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "qwen_model_switch", req.Name, "已切换模型", true, "")
+	ok(w, map[string]any{"active": req.Name, "list": mgr.QwenModelsStatus(r.Context())})
+}
+
+// handleQwenModelUnload 释放某个模型占用的内存（下次用到会自动重新加载）。
+func (s *Server) handleQwenModelUnload(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		fail(w, http.StatusBadRequest, "缺少模型名")
+		return
+	}
+	mgr := s.svcManager()
+	if err := mgr.UnloadQwenModel(r.Context(), name); err != nil {
+		s.audit(r, "qwen_model_unload", name, "失败: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "qwen_model_unload", name, "已释放内存", true, "")
+	ok(w, map[string]any{"list": mgr.QwenModelsStatus(r.Context())})
+}
+
+// handleInstallQwenTTS 按 TtsVoice 插件的契约部署 Qwen3 TTS 服务。
+//
+// 契约来自 zizdog.cn 的 usr/plugins/TtsVoice/DEPLOY-QWEN.md ——
+// 端口、路径、模型名、启动参数都不能自由发挥，否则插件连不上。
+// 与手册的唯一差异：注册为系统级 LaunchDaemon 而非用户级 agent，
+// 这样不接显示器、无人登录时也能开机自启。
+func (s *Server) handleInstallQwenTTS(w http.ResponseWriter, r *http.Request) {
+	// auth 默认 true（不加鉴权是危险选项，必须由用户显式选）
+	req := struct {
+		Auth  *bool  `json:"auth"`
+		Token string `json:"token"`
+	}{}
+	if r.ContentLength > 0 {
+		if err := decode(r, &req); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	auth := true
+	if req.Auth != nil {
+		auth = *req.Auth
+	}
+
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "qwen3tts", Steps: []string{}}
+	if err := mgr.InstallQwenTTS(r.Context(), res, services.QwenOptions{
+		Auth:  auth,
+		Token: req.Token,
+	}); err != nil {
+		s.audit(r, "install_qwen3tts", "qwen3tts", "失败: "+err.Error(), false, "")
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_qwen3tts", "qwen3tts",
+		fmt.Sprintf("鉴权=%v ", auth)+strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleInstallVoiceReceiver 部署 TtsVoice 音色样本接收端 + 鉴权反代。
+//
+// 契约来自网站侧交接文档 HANDOFF-TO-MINI.md，receiver.py 逐字节照搬。
+// 部署完会把"要告诉网站侧的两项"（本机地址、共享密钥）直接列在结果里。
+func (s *Server) handleInstallVoiceReceiver(w http.ResponseWriter, r *http.Request) {
+	req := struct {
+		Token  string `json:"token"`
+		NoAuth bool   `json:"no_auth"`
+	}{}
+	if r.ContentLength > 0 {
+		if err := decode(r, &req); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "voicereceiver", Steps: []string{}}
+	if err := mgr.InstallVoiceReceiver(r.Context(), res, services.ReceiverOptions{
+		Token:  req.Token,
+		NoAuth: req.NoAuth,
+	}); err != nil {
+		s.audit(r, "install_voicereceiver", "voicereceiver", "失败: "+err.Error(), false, "")
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_voicereceiver", "voicereceiver", strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleInstallIOPaint 部署 IOPaint（图片去水印 / 物体擦除 / 扩图）。
+func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "iopaint", Steps: []string{}}
+	if err := mgr.InstallIOPaint(r.Context(), res); err != nil {
+		s.audit(r, "install_iopaint", "iopaint", "失败: "+err.Error(), false, "")
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_iopaint", "iopaint", strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleInstallDockerRuntime 安装 Docker 运行时（Colima）。
+func (s *Server) handleInstallDockerRuntime(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	res := &services.InstallResult{App: "docker-runtime", Name: "Docker 运行时（Colima）", Steps: []string{}}
+	if err := mgr.InstallColimaRuntime(r.Context(), res); err != nil {
+		s.audit(r, "install_docker_runtime", "docker-runtime", "失败: "+err.Error(), false, "")
+		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
+		return
+	}
+	s.audit(r, "install_docker_runtime", "docker-runtime", strings.Join(res.Steps, " | "), true, "")
+	ok(w, res)
+}
+
+// handleAdoptScan 扫描本机可纳管但尚未纳管的 launchd 服务。
+func (s *Server) handleAdoptScan(w http.ResponseWriter, r *http.Request) {
+	mgr := s.svcManager()
+	list, err := mgr.ScanAdoptable(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ok(w, map[string]any{"list": list})
+}
+
+type adoptReq struct {
+	Label       string `json:"label"`
+	DisplayName string `json:"display_name"`
+	Icon        string `json:"icon"`
+	Port        int    `json:"port"`
+	Category    string `json:"category"`
+}
+
+// handleAdopt 纳管一个已有的 launchd 服务。
+func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
+	var req adoptReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 先查重：同名 launchd 服务只能纳管一次。
+	//
+	// 踩过的坑：同一个服务先通过接口纳管（记录名 = label），
+	// 之后用户又从应用市场点了一次"纳管"（记录名 = 应用 ID），
+	// 于是服务管理里出现**两条指向同一 label 的记录**，
+	// 状态、启停都重复。name 字段有 UNIQUE 约束，但两条记录的
+	// name 不同、label 相同，约束拦不住 —— 所以必须在这里判。
+	if list, err := s.serviceRepo.List(r.Context()); err == nil {
+		for _, e := range list {
+			if e.LaunchLabel == req.Label {
+				fail(w, http.StatusConflict,
+					"该服务已经纳管过了（记录名："+e.DisplayName+"），无需重复纳管")
+				return
+			}
+		}
+	}
+
+	mgr := s.svcManager()
+	svc, err := mgr.AdoptCandidate(r.Context(), req.Label, req.DisplayName, req.Icon)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Port > 0 || req.Category != "" {
+		if req.Port > 0 {
+			svc.Port = req.Port
+		}
+		if req.Category != "" {
+			svc.Category = req.Category
+		}
+		_ = s.serviceRepo.Update(r.Context(), svc)
+	}
+	s.audit(r, "service_adopt", req.Label, "纳管服务 "+svc.DisplayName, true, "")
+	ok(w, svc)
+}
+
+// handlePortCandidates 返回若干可用端口（新建服务时参考）。
+func (s *Server) handlePortCandidates(w http.ResponseWriter, r *http.Request) {
+	from := 9000
+	if v := r.URL.Query().Get("from"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			from = n
+		}
+	}
+	mgr := s.svcManager()
+	ok(w, map[string]any{"ports": mgr.PortCandidates(r.Context(), from, 8)})
+}
+
+// ---------- 小工具 ----------
+
+func orDefault(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
+// checkPortHelper 通过助手查端口占用（需要 root 才能看到所有进程）。
+func checkPortHelper(ctx context.Context, port int) (string, error) {
+	res, err := helperCall(ctx, "port-check", strconv.Itoa(port))
+	if err != nil {
+		return "", err
+	}
+	data, _ := res["data"].(map[string]any)
+	inUse, _ := data["in_use"].(bool)
+	if !inUse {
+		return "", nil
+	}
+	holders, _ := data["holders"].([]any)
+	var names []string
+	for _, h := range holders {
+		names = append(names, fmt.Sprint(h))
+	}
+	return strings.Join(names, ", "), nil
+}
+
+// adoptTargetExists 判断纳管目标服务是否存在于本机。
+func adoptTargetExists(home, label string) bool {
+	if label == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", label+".plist")); err == nil {
+		return true
+	}
+	if home != "" {
+		if _, err := os.Stat(filepath.Join(home, "Library", "LaunchAgents", label+".plist")); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+//  应用市场用的短缓存
+//
+//  市场列表要给每个条目判断状态，而每个判断都很贵（brew 启动 0.4s+、
+//  Docker 套接字探测每次 800ms 超时）。循环里逐个调用会累加到数秒。
+//  这里统一成"整批查一次 + 30 秒 TTL"。
+//  TTL 取 30 秒的理由：用户刚在面板里装完东西，回到市场应该立刻看到
+//  状态变化；再长就会显得"装了没反应"，再短就失去缓存意义。
+// ---------------------------------------------------------------------------
+
+// marketCacheTTL 是市场缓存的保鲜期。
+//
+// 已装 formula 集合只在用户安装/卸载时变化，本身就是低频数据；30 秒的短 TTL
+// 会让「隔一会儿再打开市场」几乎必然触发一次 1.5 秒的 `brew list`。这里放宽到
+// 5 分钟，并在过期时走后台刷新，请求路径永远不等待 brew。
+const marketCacheTTL = 5 * time.Minute
+
+// marketRefreshTimeout 限制单次后台刷新的时长，避免 brew 卡死拖住刷新 goroutine。
+const marketRefreshTimeout = 60 * time.Second
+
+// installedFormulas 返回本机已安装的 brew formula 集合。
+//
+// 三种情况：
+//   - 缓存新鲜      → 直接返回；
+//   - 缓存过期      → 先返回旧值，同时后台刷新（用户感知不到 brew 的耗时）；
+//   - 尚无缓存      → 同步取一次（仅在启动预热未完成时会走到，见 WarmMarket）。
+func (s *Server) installedFormulas(ctx context.Context) map[string]bool {
+	s.mktMu.Lock()
+	brew, at := s.mktBrew, s.mktBrewAt
+	s.mktMu.Unlock()
+
+	if brew != nil && time.Since(at) < marketCacheTTL {
+		return brew
+	}
+	if brew != nil {
+		s.refreshMarketAsync()
+		return brew
+	}
+
+	// 冷启动兜底：这里必须同步，否则首屏会把所有应用都显示成"未安装"。
+	set := s.fetchInstalledFormulas(ctx)
+	s.mktMu.Lock()
+	if s.mktBrew == nil {
+		s.mktBrew, s.mktBrewAt = set, time.Now()
+	} else {
+		set = s.mktBrew
+	}
+	s.mktMu.Unlock()
+	return set
+}
+
+func (s *Server) fetchInstalledFormulas(ctx context.Context) map[string]bool {
+	set := s.svcManager().InstalledFormulas(ctx)
+	if set == nil {
+		set = map[string]bool{}
+	}
+	return set
+}
+
+// dockerMissTTL 是"没探测到 Docker"这一结果的最长保鲜期。
+//
+// 必须远小于 marketCacheTTL：探测失败往往是瞬时的（Colima 正在启动、
+// 机器刚重启、VM 还没就绪）。若把这次失败按正常 TTL 缓存 5 分钟，面板就会在
+// Docker 明明已经可用的情况下持续显示"未安装 Docker"—— 实测正是如此：
+// 安装运行时的过程中 VM 正在重启，探测失败被缓存，之后 docker ps 一切正常，
+// 面板却仍然报"未装"。负结果只保持几秒，让它自己很快纠正回来。
+const dockerMissTTL = 5 * time.Second
+
+// cachedDocker 探测 Docker 并缓存，避免每个条目都探一遍。
+func (s *Server) cachedDocker() (string, string) {
+	s.mktMu.Lock()
+	sock, ver, at := s.mktDocker, s.mktDockerV, s.mktDockerAt
+	s.mktMu.Unlock()
+
+	ttl := marketCacheTTL
+	if sock == "" {
+		ttl = dockerMissTTL // 负结果不长期缓存
+	}
+	if !at.IsZero() && time.Since(at) < ttl {
+		return sock, ver
+	}
+	if !at.IsZero() {
+		s.refreshMarketAsync()
+		return sock, ver
+	}
+	sock, ver = s.detectDocker()
+	s.mktMu.Lock()
+	if s.mktDockerAt.IsZero() {
+		s.mktDocker, s.mktDockerV, s.mktDockerAt = sock, ver, time.Now()
+	} else {
+		sock, ver = s.mktDocker, s.mktDockerV
+	}
+	s.mktMu.Unlock()
+	return sock, ver
+}
+
+// WarmMarket 在启动时预热市场缓存，让用户第一次打开市场就是热的。
+func (s *Server) WarmMarket(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, marketRefreshTimeout)
+	defer cancel()
+	s.refreshMarketCaches(ctx)
+}
+
+// refreshMarketAsync 触发一次后台刷新；已有刷新在跑时不重复启动。
+func (s *Server) refreshMarketAsync() {
+	if !s.mktRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.mktRefreshing.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), marketRefreshTimeout)
+		defer cancel()
+		s.refreshMarketCaches(ctx)
+	}()
+}
+
+// refreshMarketCaches 刷新市场依赖的两项慢查询：已装 formula 与 Docker 探测。
+//
+// 两项都在锁外完成，算完再一次性换入缓存 —— 慢查询绝不持有 mktMu，
+// 否则 brew 的 1.5 秒会阻塞所有市场请求。
+func (s *Server) refreshMarketCaches(ctx context.Context) {
+	set := s.fetchInstalledFormulas(ctx)
+	sock, ver := s.detectDocker()
+
+	s.mktMu.Lock()
+	s.mktBrew, s.mktBrewAt = set, time.Now()
+	// 探测成功才覆盖：一次失败不应把已知可用的 socket 抹掉，
+	// 否则容器列表会在 VM 抖动时突然全部"消失"。
+	if sock != "" || s.mktDockerAt.IsZero() {
+		s.mktDocker, s.mktDockerV, s.mktDockerAt = sock, ver, time.Now()
+	} else {
+		// 记为一次"失败"，让它按 dockerMissTTL 很快重试。
+		s.mktDockerAt = time.Now()
+	}
+	s.mktMu.Unlock()
+}

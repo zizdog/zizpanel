@@ -1,0 +1,24 @@
+# —— 构建产物 ——
+dist/
+
+# —— 发布私钥（绝不能进仓库）——
+.release-key/
+
+# —— 依赖 ——
+node_modules/
+
+# —— Python 缓存 ——
+__pycache__/
+*.pyc
+
+# —— macOS ——
+.DS_Store
+
+# —— 含明文口令的交接文档：仅存本机，不要提交 ——
+ZizPanel-当前状态.md
+
+# —— 真实面板口令（make uitest-live 用）——
+.panel-credential.local
+
+# —— 历史下载包（二进制产物）——
+macos-lnmp-setup-v104.zip

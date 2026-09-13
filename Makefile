@@ -1,0 +1,309 @@
+# =============================================================================
+#  ZizPanel 构建入口
+#
+#  常用目标：
+#    make dev        本地构建（快速，用于开发）
+#    make test       跑全部单元测试
+#    make check      格式检查 + vet + 测试（提交前跑这个）
+#    make uitest     端到端 UI 验证（需要先 make run-local）
+#    make run-local  在临时目录以调试模式启动面板
+#    make release    产出可分发压缩包到 dist/release/
+#    make install    本机安装（等价于 sudo bash install.sh）
+#    make clean      清理构建产物
+#
+#  为什么用 Makefile 而不是一堆散落的 .sh：
+#   每个动作有唯一入口、有依赖关系、可重复执行。发布流程尤其重要 ——
+#   少打一个架构或漏了版本号，用户就会下载到一个装不上的包。
+# =============================================================================
+
+SHELL      := /bin/bash
+VERSION    := $(shell grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
+COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS    := -s -w \
+	-X github.com/zizdog/zizpanel/internal/version.Version=$(VERSION) \
+	-X github.com/zizdog/zizpanel/internal/version.Commit=$(COMMIT) \
+	-X github.com/zizdog/zizpanel/internal/version.BuildTime=$(BUILD_TIME)
+
+# 国内网络下 proxy.golang.org 常不可达，默认走 goproxy.cn
+export GOPROXY ?= https://goproxy.cn,direct
+export GOFLAGS ?= -mod=mod
+CGO_ENABLED ?= 0
+
+DIST    := dist
+RELDIR  := $(DIST)/release
+LOCAL_PORT ?= 18443
+LOCAL_ROOT ?= /tmp/zizpanel-dev
+SHOTS   ?= /tmp/zizpanel-shots
+
+.PHONY: help
+help: ## 显示所有可用目标
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+
+# ---------------------------------------------------------------- 开发构建 --
+.PHONY: dev
+dev: ## 本地构建（当前架构）
+	@mkdir -p $(DIST)
+	@# 如果本机存在发布私钥，就把对应公钥一起注入：
+	@# 这样本地/真机装出来的面板也能验证网络升级包，便于完整演练升级流程。
+	@# 只是公钥，注入它没有任何泄密风险。
+	@PUB=""; \
+	if [ -f "$(RELEASE_KEY)" ]; then \
+		go build -o $(DIST)/keysgen ./cmd/zizpanel 2>/dev/null && \
+		PUB="$$($(DIST)/keysgen sign-manifest --pub-from-key $(RELEASE_KEY) 2>/dev/null || true)"; \
+	fi; \
+	go build -ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" -o $(DIST)/zizpanel ./cmd/zizpanel; \
+	go build -ldflags "$(LDFLAGS)" -o $(DIST)/zizpanel-helper ./cmd/zizpanel-helper; \
+	if [ -n "$$PUB" ]; then echo "已注入发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
+	else echo "未注入发布公钥（没有 $(RELEASE_KEY)）：网络升级会被拒绝，仅手动上传可用"; fi
+	@echo "构建完成：$(DIST)/zizpanel ($(VERSION)+$(COMMIT))"
+
+.PHONY: fmt
+fmt: ## 格式化代码
+	gofmt -w .
+
+.PHONY: vet
+vet: ## 静态检查
+	go vet ./...
+
+.PHONY: test
+test: ## 运行全部单元测试
+	go test ./... -count=1
+
+.PHONY: test-short
+test-short: ## 只跑单测（跳过真实系统采集）
+	go test ./... -short -count=1
+
+.PHONY: check
+check: ## 提交前检查：格式 + shell 校验 + vet + 测试
+	@echo "==> gofmt 检查"
+	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
+	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
+	@echo "==> shell 语法检查"
+	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && echo "shell 语法 OK"
+	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
+	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh
+	@echo "==> shellcheck"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh || exit 1; \
+	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
+	@echo "==> Python 工具语法检查"
+	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"
+	@# 前端语法必须用真正的 ES 解析器校验：`node --check` 对"对象字面量少一个 }"
+	@# 这类错误返回 0，而浏览器直接拒绝执行 → 整个面板白屏、连行号都不给。
+	@# 这个坑真踩过（docker-compose.js / docker-services.js），所以设成门禁。
+	@echo "==> 前端 JS 语法检查（acorn）"
+	@if [ -d node_modules/acorn ]; then \
+	   node tools/check-js-syntax.mjs internal/web/assets/js || exit 1; \
+	 else echo "（未安装 acorn，跳过：npm install）"; fi
+	@echo "==> go vet"
+	@$(MAKE) --no-print-directory vet
+	@echo "==> 单元测试"
+	@$(MAKE) --no-print-directory test
+	@echo "==> 安装脚本端到端测试（沙箱）"
+	@$(MAKE) --no-print-directory install-test
+	@echo "==> 远程一键安装测试（本地 HTTP 服务 + 沙箱）"
+	@$(MAKE) --no-print-directory remote-test
+	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
+	@$(MAKE) --no-print-directory server-mode-test
+	@echo "全部检查通过 ✅"
+
+.PHONY: install-test
+install-test: ## 安装脚本端到端测试（沙箱，无需 root）
+	@bash tools/sandbox-install-test.sh
+
+.PHONY: remote-test
+remote-test: ## 远程一键安装测试：构建 → 本地 HTTP 共享 → 下载 → 沙箱安装
+	@bash tools/remote-install-test.sh
+
+.PHONY: server-mode-test
+server-mode-test: ## 服务器模式测试（SSH 开启路径、pmset 能力探测、dry-run 安全性）
+	@bash tools/server-mode-test.sh
+
+.PHONY: serve-install
+serve-install: ## 把本机变成安装源，供另一台 Mac 用一条 curl 命令安装
+	@bash tools/serve-for-install.sh
+
+.PHONY: ui-test
+ui-test: smoke ## 别名：启动本地实例并做 UI 验证
+
+# ------------------------------------------------------------- 本地试运行 --
+.PHONY: run-local
+run-local: dev ## 在临时目录以调试模式启动（端口 $(LOCAL_PORT)）
+	@pkill -f 'zizpanel serve --config $(LOCAL_ROOT)' 2>/dev/null || true
+	@rm -rf $(LOCAL_ROOT)
+	@mkdir -p $(LOCAL_ROOT)/bin
+	@# 把助手也放进本地根目录：面板的提权调用按 <root>/bin/zizpanel-helper 解析路径，
+	@# 缺了它所有特权操作（建站、nginx 校验）都会报"提权助手不存在"，
+	@# 报错信息会和真实故障混淆，排查起来很费时间。
+	@cp -f $(DIST)/zizpanel-helper $(LOCAL_ROOT)/bin/zizpanel-helper
+	@( $(DIST)/zizpanel serve --config $(LOCAL_ROOT)/data/config.json \
+	     --listen 127.0.0.1:$(LOCAL_PORT) --no-tls --log-level debug \
+	     > $(LOCAL_ROOT)/serve.log 2>&1 & )
+	@sleep 2
+	@echo "面板已启动：http://127.0.0.1:$(LOCAL_PORT)"
+	@cat $(LOCAL_ROOT)/serve.log
+
+.PHONY: stop-local
+stop-local: ## 停止本地试运行实例
+	@pkill -f 'zizpanel serve --config $(LOCAL_ROOT)' 2>/dev/null && echo "已停止" || echo "没有运行中的实例"
+
+.PHONY: uitest
+uitest: ## 端到端 UI 验证（需要先 make run-local；特权步骤会显示为"跳过"）
+	ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT) $(SHOTS)
+
+# 真实面板口令放本机、**不进仓库**（.panel-credential.local 已在 .gitignore 里）。
+# 内容就一行：ZP_PASS=你的面板口令
+CRED_FILE ?= .panel-credential.local
+
+.PHONY: uitest-live
+uitest-live: ## 对本机真实安装实例跑完整 UI 验证（含建站等特权步骤，需要已安装）
+	@curl -fsSk --max-time 5 https://127.0.0.1:8443/api/v1/health >/dev/null \
+	  || { echo "本机 8443 没有运行中的面板，请先 sudo bash install.sh"; exit 1; }
+	@test -f $(CRED_FILE) || { \
+	  echo "缺少 $(CRED_FILE) —— 它存真实面板口令，不进仓库。"; \
+	  echo "创建方式："; \
+	  echo "    printf 'ZP_PASS=你的面板口令\\n' > $(CRED_FILE) && chmod 600 $(CRED_FILE)"; \
+	  exit 1; }
+	@echo "注意：会在这台真实面板上创建再删除测试站点 $(ZP_TEST_SITE)"
+	@set -a; . ./$(CRED_FILE); set +a; node tools/uitest.mjs https://127.0.0.1:8443 $(SHOTS)
+
+.PHONY: smoke
+smoke: run-local uitest ## 启动本地实例并做 UI 验证（特权步骤跳过，用 uitest-live 补全）
+
+# ---------------------------------------------------------------- 发布打包 --
+# install.sh 在目标机上会用到这些脚本（入口接管 / 服务器模式 / 自检工具）。
+# 少打一个不会报错，只会**静默降级**——用户装完找不到面板入口，非常难排查。
+# 所以集中声明在这里，并由 make remote-test 断言压缩包里确实存在。
+RUNTIME_TOOLS := tools/takeover-panel-entry.sh tools/panel-entry.awk \
+                 tools/check-shell-vars.py tools/server-mode.sh \
+                 tools/system-services.sh
+
+# 发布签名密钥。私钥只在本机存在（.release-key/ 已 gitignore），
+# 绝不能进仓库、更不能打进发布包 —— 否则任何人都能签出"合法"升级包。
+RELEASE_KEY ?= .release-key/zizpanel-ed25519.key
+# 发布包对外可下载的地址前缀（写进 manifest.json 的资源 URL）
+RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSION)
+# 可选：把更新说明写进这个文件，会被放进清单里展示给用户
+NOTES_FILE ?= RELEASE_NOTES.md
+
+.PHONY: upgrade-e2e
+upgrade-e2e: ## 在线升级真实演练（需要本机已安装面板；会真的升级并重启面板）
+	@bash tools/upgrade-e2e.sh
+
+.PHONY: keys
+keys: ## 生成发布用 Ed25519 密钥对（只做一次；私钥务必离线备份）
+	@mkdir -p $(DIST)
+	@go build -o $(DIST)/keysgen ./cmd/zizpanel
+	@$(DIST)/keysgen sign-manifest --gen-key $(RELEASE_KEY)
+	@echo ""
+	@echo "说明：make release 会自动把对应公钥注入发布二进制，无需手工填写。"
+	@echo "     私钥丢失后，已安装的面板将无法再接受你签出的升级包。"
+	@echo "     请立即把 $(RELEASE_KEY) 备份到离线介质。"
+
+.PHONY: release
+release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwin/amd64）
+	@mkdir -p $(RELDIR)
+	@# 先构建一个本机版本：它既用来推导公钥，也用来给清单签名。
+	@# 这样"签名私钥"与"面板内嵌公钥"必然配对 —— 靠人工填公钥迟早会不一致。
+	@go build -trimpath -o $(DIST)/host-zizpanel ./cmd/zizpanel
+	@set -e; \
+	PUB=""; \
+	if [ -f "$(RELEASE_KEY)" ]; then \
+		PUB="$$($(DIST)/host-zizpanel sign-manifest --pub-from-key $(RELEASE_KEY))"; \
+		echo "==> 使用发布密钥签名，公钥: $$PUB"; \
+	else \
+		echo "==> 警告：未找到 $(RELEASE_KEY)，本次发布【不签名】"; \
+		echo "    已安装的面板会拒绝从网络升级（可改用手动上传升级包）。"; \
+		echo "    执行 make keys 生成发布密钥。"; \
+	fi; \
+	for arch in arm64 amd64; do \
+		echo "==> 构建 darwin/$$arch"; \
+		GOOS=darwin GOARCH=$$arch go build -trimpath \
+			-ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" \
+			-o $(DIST)/tmp-$$arch/zizpanel ./cmd/zizpanel; \
+		GOOS=darwin GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
+			-o $(DIST)/tmp-$$arch/zizpanel-helper ./cmd/zizpanel-helper; \
+		install -m 0755 install.sh $(DIST)/tmp-$$arch/install.sh; \
+		mkdir -p $(DIST)/tmp-$$arch/tools; \
+		for t in $(RUNTIME_TOOLS); do \
+			install -m 0644 "$$t" "$(DIST)/tmp-$$arch/tools/$${t#tools/}"; \
+		done; \
+		chmod 0755 $(DIST)/tmp-$$arch/tools/takeover-panel-entry.sh \
+		           $(DIST)/tmp-$$arch/tools/server-mode.sh \
+		           $(DIST)/tmp-$$arch/tools/system-services.sh; \
+		if [ -n "$$PUB" ]; then \
+			got="$$($(DIST)/tmp-$$arch/zizpanel version --json 2>/dev/null | sed -n 's/.*"upgrade_pubkey":"\([^"]*\)".*/\1/p')"; \
+			if [ "$$got" != "$$PUB" ] && grep -q "$$PUB" $(DIST)/tmp-$$arch/zizpanel; then \
+				got="$$PUB"; \
+				echo "    （darwin/$$arch 无法在本机执行，已改用静态检查）"; \
+			fi; \
+			if [ "$$got" != "$$PUB" ]; then \
+				echo "!! darwin/$$arch 没有正确内嵌发布公钥（-X 会静默失效！）"; \
+				echo "   期望: $$PUB"; \
+				echo "   实际: $$got"; \
+				echo "   若实际为空，通常是该符号被死代码消除了 ——"; \
+				echo "   确认 main 直接引用了 upgrade.PublicKeyHex()。"; \
+				exit 1; \
+			fi; \
+			echo "    ✓ 已内嵌发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
+		fi; \
+		( cd $(DIST)/tmp-$$arch && tar -czf ../release/zizpanel_$(VERSION)_darwin_$$arch.tar.gz . ); \
+		rm -rf $(DIST)/tmp-$$arch; \
+	done
+	@# 同时产出一份"通用"名字的最新包，便于固定 URL 下载
+	@cp $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz $(RELDIR)/zizpanel_latest_darwin_arm64.tar.gz 2>/dev/null || true
+	@cp $(RELDIR)/zizpanel_$(VERSION)_darwin_amd64.tar.gz $(RELDIR)/zizpanel_latest_darwin_amd64.tar.gz 2>/dev/null || true
+	@# 生成清单：面板"检查更新"读的就是它。清单里带每个架构的 URL 与 SHA-256。
+	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
+		--base-url "$(RELEASE_BASE_URL)" --notes-file "$(NOTES_FILE)"
+	@set -e; \
+	if [ -f "$(RELEASE_KEY)" ]; then \
+		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \
+			--in $(RELDIR)/manifest.json --out $(RELDIR)/manifest.json.sig; \
+	else \
+		echo "==> 跳过签名（没有私钥）。清单可用于手动上传流程。"; \
+		rm -f $(RELDIR)/manifest.json.sig; \
+	fi
+	@rm -f $(DIST)/host-zizpanel
+	@echo ""
+	@echo "发布产物："
+	@ls -lh $(RELDIR)
+	@echo ""
+	@echo "校验和："
+	@shasum -a 256 $(RELDIR)/*.tar.gz | sed 's|$(RELDIR)/||'
+	@echo ""
+	@echo "面板「在线升级」需要把 manifest.json 与 manifest.json.sig 一起放到升级源目录。"
+
+# ---------------------------------------------------------------- 版本号 --
+.PHONY: bump
+bump: ## 按约定递增版本号（+0.0.1，到 10 后 +0.1）
+	@python3 tools/bump-version.py
+	@python3 -m py_compile tools/bump-version.py
+
+.PHONY: version
+version: ## 显示当前版本号
+	@python3 tools/bump-version.py --show
+
+# ------------------------------------------------------------------ 部署 --
+.PHONY: install
+install: dev ## 本机安装（需要管理员权限）
+	sudo bash install.sh
+
+.PHONY: uninstall
+uninstall: ## 卸载面板（保留数据）
+	sudo bash /opt/zizpanel/uninstall.sh
+
+.PHONY: status
+status: ## 查看本机面板状态
+	@/opt/zizpanel/bin/zizpanel status 2>/dev/null || echo "面板未安装"
+
+.PHONY: logs
+logs: ## 实时查看面板日志
+	@tail -f /opt/zizpanel/logs/panel-$$(date +%Y%m%d).log
+
+.PHONY: clean
+clean: ## 清理构建产物
+	@rm -rf $(DIST) $(LOCAL_ROOT)
+	@echo "已清理"
