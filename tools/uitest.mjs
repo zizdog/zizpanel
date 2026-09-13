@@ -400,16 +400,21 @@ try {
   });
 
   await step('应用市场安装前检查', async () => {
-    // 找一个可用的"安装"按钮（不是已安装、不是不可用）
-    const btn = page.locator('.content button:has-text("安装")').first();
+    // 找一个可用的"安装"按钮（不是已安装、不是不可用）。
+    //
+    // `:text-is()` 是**精确**匹配，不能写成 `:has-text("安装")`：
+    // 市场页顶部还有一颗「⚡ 一键安装 LNMP 环境」，同样含"安装"二字，
+    // 而且是页面里第一个匹配项 —— 用宽松匹配会点开 LNMP 向导，
+    // 于是"未显示检查项"失败，看起来像市场坏了，其实只是点错了按钮。
+    const btn = page.locator('.content button:text-is("安装")').first();
     if (!(await btn.count())) return;
     await btn.click();
     await page.waitForSelector('.modal', { timeout: 10000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000); // 等安装前检查异步返回
     await shot('34-market-preflight');
     const body = await page.locator('.modal-body').innerText();
     if (!body.includes('条件') && !body.includes('端口')) {
-      throw new Error('安装前检查未显示检查项');
+      throw new Error('安装前检查未显示检查项: ' + body.slice(0, 160));
     }
     await page.keyboard.press('Escape');
     await page.waitForTimeout(600);
@@ -761,8 +766,10 @@ try {
     await shot('46-docker-containers');
 
     const body = await page.locator('.content').innerText();
-    // 回归：原生 append 把 null 渲染成字面量 "null"，这个项目踩过
-    if (/\bnull\b/.test(body) || /\bundefined\b/.test(body)) {
+    // 回归：原生 append 把 null 渲染成字面量 "null"，这个项目踩过。
+    // 必须匹配"独立成词"的 null/undefined（前后为空白或首尾），
+    // 不能用 \b —— 那样会误伤 "Docker 内置网络" 这类正常文案。
+    if (/(^|\s)(null|undefined)(\s|$)/.test(body)) {
       throw new Error('Docker 页出现了字面量 null/undefined: ' + body.slice(0, 200));
     }
 
@@ -775,7 +782,10 @@ try {
     }
 
     // 环境可用：六个分区都要能切过去且不报错
-    for (const [tab, shot] of [
+    //
+    // 注意循环变量不能叫 shot —— 那会遮蔽上面的截图函数 shot()，
+    // 于是 await shot(shot) 变成"拿字符串当函数调"，报错还很误导（shot is not a function）。
+    for (const [tab, shotName] of [
       ['镜像', '47-docker-images'],
       ['数据卷', '48-docker-volumes'],
       ['网络', '49-docker-networks'],
@@ -784,12 +794,12 @@ try {
     ]) {
       await page.click(`button:has-text("${tab}")`);
       await page.waitForTimeout(1200);
-      await shot(shot);
+      await shot(shotName);
       const t = await page.locator('.content').innerText();
       if (!t.includes('Docker')) {
         throw new Error(`切到「${tab}」分区后页面异常: ` + t.slice(0, 150));
       }
-      if (/\bnull\b/.test(t) || /\bundefined\b/.test(t)) {
+      if (/(^|\s)(null|undefined)(\s|$)/.test(t)) {
         throw new Error(`「${tab}」分区出现字面量 null/undefined: ` + t.slice(0, 200));
       }
     }

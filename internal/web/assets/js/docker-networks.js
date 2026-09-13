@@ -14,6 +14,19 @@ import { h, clear, toast, confirmBox } from './ui.js';
 const BUILTIN = new Set(['bridge', 'host', 'none']);
 
 // 后端返回的 Created 同样是 Go time.Time 字符串，可能是零值 0001-01-01。
+
+// textOr 把"看起来是空"的值统一成占位符。
+//
+// 为什么不直接写 `v || '—'`：Docker 在某些内置网络上把 Driver 返回成**字符串 "null"**
+// （不是 JSON null），例如 none 网络的 /networks 响应里就是 "Driver":"null"。
+// 那样 `"null" || '—'` 得到的是字符串 "null"，表格里就真的渲染出一个 null ——
+// UI 测试的"不允许出现字面量 null"断言正是这么抓出来的。
+function textOr(v, placeholder = '—') {
+  const s = v == null ? '' : String(v).trim();
+  if (s === '' || s === 'null' || s === 'undefined') return placeholder;
+  return s;
+}
+
 function fmtTime(s) {
   if (!s) return '—';
   const t = Date.parse(s);
@@ -108,8 +121,8 @@ function buildTable(list, ctx, reload) {
             : null,
           n.Created ? h('div', { style: { fontSize: '11px', color: 'var(--text-mute)' }, text: fmtTime(n.Created) }) : null,
         ]),
-        h('td', { text: n.Driver || '—' }),
-        h('td', [h('span.pill' + (n.Scope === 'local' ? '' : '.brand'), { text: n.Scope || '—' })]),
+        h('td', { text: textOr(n.Driver) }),
+        h('td', [h('span.pill' + (n.Scope === 'local' ? '' : '.brand'), { text: textOr(n.Scope) })]),
         h('td', [h('code', { text: subnetOf(n) })]),
         h('td', [
           h('span.pill' + (connected > 0 ? '.ok' : ''), {

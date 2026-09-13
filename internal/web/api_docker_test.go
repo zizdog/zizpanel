@@ -16,6 +16,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
+	"github.com/zizdog/zizpanel/internal/version"
 )
 
 // ============================================================================
@@ -541,5 +542,34 @@ func TestSettingsCanClearUpgradeSource(t *testing.T) {
 		map[string]any{"upgrade_source": "ftp://example.com"}, cookies)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("非法升级源应 400，实际 %d: %v", res.StatusCode, out)
+	}
+}
+
+// TestHealthReturnsPlainVersionForWatchdog 健康检查必须返回**纯版本号**。
+//
+// 事故背景：升级看门狗把 /api/v1/health 的 version 与清单里的版本号做字符串比较。
+// 而这里原先返回 version.Full()，正式发布的二进制带 git commit（"0.3.1+9a304af"），
+// 于是新版**明明起来并且正常服务**，看门狗却匹配不上，90 秒后判定"启动失败"
+// 并把面板回滚 —— 真机上连续回滚了三次，面板一直升不上去。
+//
+// 更麻烦的是"自举"：看门狗脚本由**升级前的旧版本**生成，所以只改新版本的匹配
+// 逻辑救不了当次升级；必须让健康检查返回旧版断言所期望的形式。
+func TestHealthReturnsPlainVersionForWatchdog(t *testing.T) {
+	_, ts := newTestServer(t)
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/health", nil, nil)
+	if res.StatusCode != 200 {
+		t.Fatalf("健康检查应 200，实际 %d", res.StatusCode)
+	}
+	data, _ := out["data"].(map[string]any)
+	got := asString(data["version"])
+	if got == "" {
+		t.Fatal("健康检查必须带 version 字段（看门狗靠它判定新版是否起来）")
+	}
+	if strings.Contains(got, "+") {
+		t.Errorf("健康检查的 version 不能带 +commit 后缀（会让看门狗匹配不上并回滚）: %q", got)
+	}
+	// 必须是精确的 version.Version，而不是别的形式
+	if got != version.Version {
+		t.Errorf("健康检查的 version 应为纯版本号 %q，实际 %q", version.Version, got)
 	}
 }

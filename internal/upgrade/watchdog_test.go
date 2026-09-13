@@ -467,3 +467,32 @@ func TestCleanupStaleWatchdogSkipsRunningUpgrade(t *testing.T) {
 		t.Fatal("升级进行中时不应清理看门狗（会破坏正在进行的验证与回滚）")
 	}
 }
+
+// TestWatchdogAcceptsVersionWithCommitSuffix 是线上回滚事故的回归测试。
+//
+// 事故经过：/api/v1/health 返回的是 version.Full()，正式发布出来的二进制带 git commit
+// （例如 "0.3.1+9a304af"），而看门狗拿到的是清单里的纯版本号（"0.3.1"）。
+// 脚本里只精确匹配 `"version":"0.3.1"`，于是**新版明明起来并且正常服务**，
+// 看门狗 90 秒都匹配不上，判定"启动失败"并把面板回滚掉 —— 真机上连续回滚了三次。
+//
+// 之所以长期没暴露：平时构建的二进制 commit=dev，Full() 不带后缀。
+// 这个测试同时锁住两侧（新版判定与回滚后判定），任何一侧退回精确匹配都会失败。
+func TestWatchdogAcceptsVersionWithCommitSuffix(t *testing.T) {
+	opt := newTestOptions(t)
+	s := watchdogScript(opt, "run-1", "0.3.0", "0.3.1")
+
+	// 必须同时接受带后缀的形式：即模式里出现 "$WANT+" 与 "$FROM+"
+	if !strings.Contains(s, `"$WANT+"`) {
+		t.Error("看门狗判定新版时没有接受 +commit 后缀（会把正常服务的新版误判为启动失败并回滚）")
+	}
+	if !strings.Contains(s, `"$FROM+"`) {
+		t.Error("看门狗判定回滚结果时没有接受 +commit 后缀")
+	}
+	// 纯版本号的形式也必须仍然匹配（本地 dev 构建不带后缀）
+	if !strings.Contains(s, `"\"version\":\"$WANT\""`) {
+		t.Error("看门狗判定新版时丢掉了纯版本号的匹配")
+	}
+	if !strings.Contains(s, `"\"version\":\"$FROM\""`) {
+		t.Error("看门狗判定回滚时丢掉了纯版本号的匹配")
+	}
+}

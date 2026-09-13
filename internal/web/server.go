@@ -407,8 +407,17 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 //
 // 与 ping 分开：安装脚本与监控只需要知道"服务能否响应"，
 // 健康检查必须永远快速返回，可以被高频轮询。
+//
+// version 用 version.Version（纯版本号），**不要用 Full()**：
+// 升级看门狗把这里的 version 与清单里的版本号做字符串比较，而 Full() 在正式发布
+// 的二进制上会带 git commit（"0.3.1+9a304af"），于是**新版正常服务却匹配不上**，
+// 看门狗判定"启动失败"并回滚 —— 真机上连续回滚了三次，面板一直升不上去。
+//
+// 这个死结的麻烦之处在于"自举"：看门狗脚本是**升级前那个旧版本**生成的，
+// 所以改新版本里的匹配逻辑救不了当次升级；必须让健康检查返回旧版断言所期望的形式。
+// 两侧都做：这里返回纯版本号（治本），watchdog 那边也接受 +commit 后缀（兜底）。
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ok(w, map[string]any{"status": "ok", "version": version.Full()})
+	ok(w, map[string]any{"status": "ok", "version": version.Version})
 }
 
 // handleSetupStatus 告知前端是否需要走首次初始化向导。

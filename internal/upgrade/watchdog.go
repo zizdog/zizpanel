@@ -137,11 +137,18 @@ log() { echo "[$(date '+%%Y-%%m-%%d %%H:%%M:%%S')] $*"; }
 
 # 等新版通过健康检查。最多 90 秒：
 # 太短会把"启动稍慢"误判成失败并白白回滚；太长则用户盯着一个坏掉的面板干等。
+#
+# 匹配版本时必须同时接受「纯版本号」与「版本号+commit 后缀」两种形式：
+#   /api/v1/health 返回的是 version.Full()，正式发布出来的二进制带 git commit，
+#   形如 "0.3.1+9a304af"；而看门狗拿到的是清单里的纯版本号 "0.3.1"。
+#   早期只精确匹配 "0.3.1"，于是**新版明明起来并且正常服务**，看门狗却 90 秒都
+#   匹配不上，判定"启动失败"并把面板回滚掉 —— 真机上连续回滚了三次才发现。
+#   （之所以以前没暴露：那些二进制是 commit=dev 的本地构建，Full() 不带后缀。）
 ok=0
 for i in $(seq 1 "$HEALTH_TRIES"); do
   body="$(curl -fsSk --max-time 3 "$HEALTH" 2>/dev/null || true)"
   case "$body" in
-    *"\"version\":\"$WANT\""*) ok=1; break ;;
+    *"\"version\":\"$WANT\""*|*"\"version\":\"$WANT+"*) ok=1; break ;;
   esac
   sleep 1
 done
@@ -177,11 +184,12 @@ done
 
 launchctl kickstart -k "system/$PANEL_LABEL" >/dev/null 2>&1 || log "重启面板失败"
 
-# 再等旧版回来说明自己活着 —— 回滚也要被验证，不能"以为回滚成功了"
+# 再等旧版回来说明自己活着 —— 回滚也要被验证，不能"以为回滚成功了"。
+# 同样要接受 "+commit" 后缀（旧版也可能是带 commit 的构建）。
 for i in $(seq 1 "$ROLLBACK_TRIES"); do
   body="$(curl -fsSk --max-time 3 "$HEALTH" 2>/dev/null || true)"
   case "$body" in
-    *"\"version\":\"$FROM\""*) rolled=1; break ;;
+    *"\"version\":\"$FROM\""*|*"\"version\":\"$FROM+"*) rolled=1; break ;;
   esac
   sleep 1
 done
