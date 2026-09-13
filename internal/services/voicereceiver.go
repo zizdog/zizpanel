@@ -52,6 +52,7 @@ type receiverPaths struct {
 	Dir     string // ~/tts/voice-receiver
 	Script  string // ~/tts/voice-receiver/receiver.py
 	Samples string // ~/tts/voice-samples
+	Jobs    string // ~/tts/jobs（v1.3.0 的作业队列落盘目录）
 	OutLog  string
 	ErrLog  string
 	Plist   string // /Library/LaunchDaemons/com.zizdog.voicereceiver.plist
@@ -67,6 +68,7 @@ func (m *Manager) receiverPaths() receiverPaths {
 		Dir:     dir,
 		Script:  filepath.Join(dir, "receiver.py"),
 		Samples: filepath.Join(home, "tts", "voice-samples"),
+		Jobs:    filepath.Join(home, "tts", "jobs"),
 		OutLog:  filepath.Join(dir, "launchd.out.log"),
 		ErrLog:  filepath.Join(dir, "launchd.err.log"),
 		Plist:   "/Library/LaunchDaemons/" + receiverLabel + ".plist",
@@ -99,7 +101,7 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	p := m.receiverPaths()
 
 	// ---- 1. 目录与脚本 ----
-	for _, d := range []string{p.Dir, p.Samples} {
+	for _, d := range []string{p.Dir, p.Samples, p.Jobs} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("创建 %s 失败: %w", d, err)
 		}
@@ -244,6 +246,11 @@ func receiverPlist(p receiverPaths, user, token string) string {
         <string>%s</string>
         <string>--dir</string>
         <string>%s</string>
+        <!-- 作业队列目录也显式给绝对路径：launchd 下 HOME 不一定是真实用户家目录，
+             而 ~ 的展开依赖 HOME —— --dir 一直是显式传的，这里保持一致。
+             v1.3.0 的 /jobs/* 会把状态与分块落在这里（重启后据此恢复）。 -->
+        <string>--jobs-dir</string>
+        <string>%s</string>
         <!-- 0.0.0.0：这是唯一对外的入口，网站那台机器要能连上 -->
         <string>--host</string>
         <string>0.0.0.0</string>
@@ -272,7 +279,7 @@ func receiverPlist(p receiverPaths, user, token string) string {
     <string>%s</string>
 </dict>
 </plist>
-`, receiverLabel, user, p.Script, p.Samples, receiverPort, token, qwenUpstream,
+`, receiverLabel, user, p.Script, p.Samples, p.Jobs, receiverPort, token, qwenUpstream,
 		p.Dir, p.OutLog, p.ErrLog)
 }
 

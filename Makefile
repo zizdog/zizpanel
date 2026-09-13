@@ -71,6 +71,13 @@ vet: ## 静态检查
 test: ## 运行全部单元测试
 	go test ./... -count=1
 
+.PHONY: jobs-test
+jobs-test: ## receiver.py 的 /jobs 验收（本地假上游，不需要 GPU）
+	@echo "==> receiver /jobs 单元测试"
+	@python3 tools/test-voice-jobs-unit.py
+	@echo "==> receiver /jobs 端到端测试（假上游）"
+	@python3 tools/test-voice-jobs.py
+
 .PHONY: test-short
 test-short: ## 只跑单测（跳过真实系统采集）
 	go test ./... -short -count=1
@@ -101,6 +108,10 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory vet
 	@echo "==> 单元测试"
 	@$(MAKE) --no-print-directory test
+	@# receiver.py 的 /jobs 是纯 Python，go test 覆盖不到。
+	@# 它又是「关掉网站也能跑完」的唯一保障，所以进 check 门禁。
+	@echo "==> receiver /jobs 测试"
+	@$(MAKE) --no-print-directory jobs-test
 	@echo "==> 安装脚本端到端测试（沙箱）"
 	@$(MAKE) --no-print-directory install-test
 	@echo "==> 远程一键安装测试（本地 HTTP 服务 + 沙箱）"
