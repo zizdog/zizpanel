@@ -423,12 +423,24 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	// 目录条目里是 ID（如 php83），过去只按 ID 查，
 	// 于是连"面板自己装的"都可能匹配不上。
 	installed := map[string]bool{}
+	var svcRecords []*services.Service
 	if list, err := s.serviceRepo.List(ctx); err == nil {
+		svcRecords = list
 		for _, svc := range list {
 			installed[svc.Name] = true // 服务名
 			if svc.LaunchLabel != "" {
 				installed[svc.LaunchLabel] = true // launchd label
 			}
+		}
+	}
+	// 卸载计划要按"这个目录条目对应哪条面板记录"来算，先把记录索引好（只查一次库）
+	recByKey := map[string]*services.Service{}
+	for _, svc := range svcRecords {
+		if svc.Name != "" {
+			recByKey[svc.Name] = svc
+		}
+		if svc.LaunchLabel != "" {
+			recByKey[svc.LaunchLabel] = svc
 		}
 	}
 	// 整批查一次（而不是循环里逐个查），见 installedFormulas 的说明
@@ -464,6 +476,9 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 但这个绝对地址有两个用处：显示给用户看，以及给 SelfConf 应用
 		// （如 phpMyAdmin，它的 location 只在 nginx 上）当打开入口。
 		ProxyURL string `json:"proxy_url,omitempty"`
+		// Uninstall 是"这个应用该怎么卸载"的说明（步骤 + 可选删除的产物路径）。
+		// 给界面在确认框里如实展示 —— 卸载不可逆，用户必须知道具体会删什么。
+		Uninstall services.UninstallPlan `json:"uninstall"`
 	}
 	lanIP := s.lanIP()
 	apps := services.Catalog()
@@ -552,9 +567,18 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if a.UI != nil && a.UI.Slug != "" && lanIP != "" {
 			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
 		}
+		// 找这条目录对应的面板记录（label / 名称 / ID 三种写法都认）
+		var rec *services.Service
+		for _, key := range []string{a.ServiceLabel, a.AdoptLabel, a.ID, a.Name} {
+			if key != "" && recByKey[key] != nil {
+				rec = recByKey[key]
+				break
+			}
+		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
-			PortURL: portURL, ProxyURL: proxyURL}
+			PortURL: portURL, ProxyURL: proxyURL,
+			Uninstall: s.svcManager().PlanUninstallFor(ctx, a, rec)}
 		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
 			if dockerSock == "" {
 				it.Available = false
@@ -576,6 +600,59 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		"list":   out,
 		"docker": map[string]any{"available": sock != "", "socket": sock, "version": ver},
 	})
+}
+
+// handleMarketUninstall 从应用市场卸载一个应用。
+//
+// 三种语义（见 services.UninstallPlan）：
+//
+//	· service   —— 托管服务，走通用的 Manager.Uninstall；
+//	· installer —— 面板自研安装器装的，走 UninstallApp（卸服务 + 删 plist + 删记录，
+//	               并按 remove_data 决定是否删掉虚拟环境/模型/样本）；
+//	· forget    —— 纳管的第三方服务：**面板不卸载**，前端改用「取消纳管」
+//	               （那个走 DELETE /api/v1/services/{name}）。
+//
+// 走任务中心：brew uninstall / colima delete / 删几 GB 目录都不是秒级动作，
+// 而且用户需要看到"到底删了什么"。
+func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found {
+		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
+		return
+	}
+	removeData := r.URL.Query().Get("remove_data") == "1"
+	plan := s.svcManager().PlanUninstall(r.Context(), id)
+	switch plan.Kind {
+	case "service":
+		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
+			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				if err := s.svcManager().Uninstall(ctx, plan.Service); err != nil {
+					return nil, err
+				}
+				return map[string]any{"msg": "已卸载 " + app.Name}, nil
+			})
+	case "installer":
+		if plan.Blocked != "" {
+			fail(w, http.StatusConflict, plan.Blocked)
+			return
+		}
+		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
+			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				res := &services.InstallResult{App: app.ID, Steps: []string{}}
+				if err := s.svcManager().UninstallApp(ctx, app.ID, removeData, res); err != nil {
+					return res, err
+				}
+				return res, nil
+			})
+	default:
+		msg := plan.Blocked
+		if msg == "" {
+			msg = "「" + app.Name + "」不能从这里卸载（面板不会卸载你自己安装的软件；" +
+				"如只想从列表移除，请用「取消纳管」）"
+		}
+		fail(w, http.StatusBadRequest, msg)
+	}
 }
 
 // handleMarketPreflight 安装前检查。

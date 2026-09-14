@@ -560,3 +560,98 @@ func (m *Manager) RepairPhpMyAdminConfigPerm() (bool, error) {
 	}
 	return true, nil
 }
+
+// pmaMarker 是安装器写进默认站点的注释，卸载时按它定位要删的整段 location。
+//
+// 用注释当锚点而不是按 `/phpmyadmin` 匹配：那台机器上可能还有用户自己写的
+// phpMyAdmin location，按路径匹配会把别人的配置删掉。
+const pmaMarker = "# 由 ZizPanel 添加：phpMyAdmin 入口"
+
+// UninstallPhpMyAdmin 卸载 phpMyAdmin：撤掉 nginx 入口 + brew uninstall。
+//
+// 为什么必须由面板来做（而不是让用户自己 brew uninstall）：
+// 装的时候面板往默认站点里插了一段 location，直接 brew uninstall 会留下
+// 一个指向不存在目录的 location（访问变成 404/502，看起来像面板把站点弄坏了）。
+// 所以卸载必须**先撤 nginx 入口、再删包**，顺序反了会有一段时间是坏的。
+func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData bool, result *InstallResult) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("卸载 phpMyAdmin 需要以 root 运行")
+	}
+	// ---- 1. 撤掉 nginx 入口 ----
+	conf := filepath.Join(m.brewPrefix(), "etc", "nginx", "vhosts", "000-default.conf")
+	if data, err := os.ReadFile(conf); err == nil {
+		text := string(data)
+		if strings.Contains(text, pmaMarker) {
+			newText, err := removeMarkedLocation(text, pmaMarker)
+			if err != nil {
+				return err
+			}
+			if newText != text {
+				if err := m.writeNginxConfAndReload(ctx, conf, text, newText, result, "已移除默认站点里的 phpMyAdmin 入口"); err != nil {
+					return err
+				}
+			}
+		} else if result != nil {
+			result.step(ctx, "默认站点里没有面板添加的 phpMyAdmin 入口，跳过")
+		}
+	}
+
+	// ---- 2. 删包 ----
+	if m.brewHas(ctx, "phpmyadmin") {
+		if result != nil {
+			result.step(ctx, "正在 brew uninstall phpmyadmin")
+		}
+		if _, err := m.brewRun(ctx, 5*time.Minute, "uninstall", "phpmyadmin"); err != nil {
+			return fmt.Errorf("brew uninstall phpmyadmin 失败: %w", err)
+		}
+	} else if result != nil {
+		result.step(ctx, "phpmyadmin 未安装，跳过")
+	}
+
+	// ---- 3. 删面板自己的配置文件 ----
+	confFile := filepath.Join(m.brewPrefix(), "etc", "phpmyadmin.config.inc.php")
+	if removeData {
+		if err := os.Remove(confFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删除 %s 失败: %w", confFile, err)
+		}
+		if result != nil {
+			result.step(ctx, "已删除 "+confFile)
+		}
+	} else if result != nil {
+		result.step(ctx, "保留 "+confFile+"（需要删除请勾选「同时删除数据/配置」）")
+	}
+	return nil
+}
+
+// removeMarkedLocation 从 nginx 配置里删掉"以某条注释开头的那一整段 location"。
+//
+// 按花括号配对跳过，避免删多或删少。找不到配对的右括号时报错，
+// 由调用方决定是回滚还是放弃 —— 宁可不动，也不要留下半截配置。
+func removeMarkedLocation(text, marker string) (string, error) {
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if !strings.Contains(lines[i], marker) {
+			out = append(out, lines[i])
+			continue
+		}
+		// 从注释行开始，按花括号配对跳到这段 location 结束
+		depth := 0
+		j := i
+		for ; j < len(lines); j++ {
+			depth += strings.Count(lines[j], "{") - strings.Count(lines[j], "}")
+			if depth <= 0 && j > i {
+				break
+			}
+		}
+		if j >= len(lines) || depth != 0 {
+			return "", fmt.Errorf("默认站点配置里的 phpMyAdmin 入口块不完整（花括号不配对），拒绝改写")
+		}
+		// 顺手把紧随其后的空行也吃掉，避免留下连续空行
+		i = j
+		for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) == "" {
+			i++
+		}
+	}
+	return strings.Join(out, "\n"), nil
+}

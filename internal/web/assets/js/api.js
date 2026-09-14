@@ -181,6 +181,10 @@ export const api = {
   // 页面照样 200、资源全 404（白屏），只看状态码会得出错误结论。
   appProxies: () => request('GET', `${API_BASE}/market/proxies`),
   appProxyApply: () => request('POST', `${API_BASE}/market/proxies/apply`, {}),
+  // 从市场卸载：面板装的走这里（service/installer 两类）。
+  // 纳管的第三方服务面板不卸载，前端改用「取消纳管」（serviceForget）。
+  marketUninstall: (id, removeData = false) =>
+    request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
   marketInstall: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install`, {}),
   installLNMP: () => request('POST', `${API_BASE}/market/install-lnmp`, {}),

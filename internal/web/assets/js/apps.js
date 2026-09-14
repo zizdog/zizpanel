@@ -409,6 +409,7 @@ export function AppsView(content, ctx = {}) {
                   onclick: () => openInstaller(a),
                 })))),
         ...openButtons(a),
+        ...uninstallButtons(a),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
       ]),
     ]);
@@ -460,6 +461,101 @@ export function AppsView(content, ctx = {}) {
       }));
     }
     return out;
+  }
+
+  // uninstallButtons 给"面板装的"应用一个卸载入口。
+  //
+  // 为什么必须分三类（见 services.UninstallPlan）：
+  //   · service   —— 托管服务（compose 应用等），可以真卸载；
+  //   · installer —— 面板自研安装器装的（IOPaint / Qwen / 接收端 / phpMyAdmin /
+  //                  Docker 运行时），走安装器自己的卸载；
+  //   · forget    —— **纳管的第三方服务**（nginx / php / mysql / 用户自己注册的）：
+  //                  面板绝不卸载它们（删掉用户自己的 MySQL 等于删掉他的数据），
+  //                  只给「取消纳管」，并在确认框里说清楚"只移除记录，不动系统"。
+  // 没有这三类之一的（brew 核心组件、未安装）就不给按钮。
+  function uninstallButtons(a) {
+    const plan = a.uninstall || {};
+    if (!a.installed) return [];
+    if (plan.kind === 'service' || plan.kind === 'installer') {
+      return [h('button.btn.btn-sm.btn-danger', {
+        text: '卸载',
+        title: plan.blocked || '卸载「' + a.name + '」（会列出具体删除内容并要求确认）',
+        disabled: !!plan.blocked,
+        onclick: () => doUninstall(a, plan),
+      })];
+    }
+    if (plan.kind === 'forget') {
+      return [h('button.btn.btn-sm', {
+        text: '取消纳管',
+        title: '只把这个服务从面板记录里移除，不动系统上的任何东西',
+        onclick: () => doForget(a, plan),
+      })];
+    }
+    return [];
+  }
+
+  // doUninstall 先弹一个"会做什么"的确认框，再交给任务中心。
+  //
+  // 确认框里逐条列出步骤与可选删除的路径 —— 卸载不可逆，
+  // 一句"确定卸载吗"是不够的（用户有权知道模型/样本/任务会不会一起没）。
+  async function doUninstall(a, plan) {
+    const remove = h('input', { type: 'checkbox' });
+    const lines = (plan.steps || []).map((s) => h('li', { text: s }));
+    const body = h('div', [
+      h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
+      h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } }, lines),
+      plan.keep_note ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
+      (plan.data_paths || []).length
+        ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } }, [
+          remove,
+          h('span', { text: '同时删除数据/产物（不可恢复）：' }),
+        ])
+        : null,
+      (plan.data_paths || []).length
+        ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
+          (plan.data_paths || []).map((p) => h('li.mono', { text: p })))
+        : null,
+    ]);
+    const okGo = await new Promise((resolve) => {
+      const m = modal({
+        title: '卸载 ' + a.name,
+        body,
+        footer: (close) => [
+          h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
+          h('button.btn.btn-danger', {
+            text: '确认卸载',
+            onclick: () => { close(); resolve(true); },
+          }),
+        ],
+        onClose: () => resolve(false),
+      });
+    });
+    if (!okGo) return;
+    taskCenter.start({
+      kind: 'uninstall',
+      target: a.id,
+      title: '卸载 ' + a.name,
+      start: () => api.marketUninstall(a.id, remove.checked),
+      onDone: () => load(),
+    });
+  }
+
+  // doForget 取消纳管：只删面板记录，不动系统。
+  async function doForget(a, plan) {
+    const okGo = await confirmBox(
+      '把「' + a.name + '」从面板记录里移除？\n\n' +
+      '面板不会卸载你自己安装的软件（不跑 brew uninstall、不删文件），' +
+      '只是不再管它。要真正删除请在终端里自行处理。',
+      { title: '取消纳管', okText: '取消纳管' });
+    if (!okGo) return;
+    const name = plan.service || a.id;
+    try {
+      await api.serviceForget(name);
+      toast('已取消纳管', 'ok');
+      load();
+    } catch (e) {
+      toast('取消失败：' + e.message, 'err', 9000);
+    }
   }
 
   // openInstaller 按应用打开对应的部署对话框。

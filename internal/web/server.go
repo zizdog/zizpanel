@@ -304,6 +304,8 @@ func (s *Server) routes() http.Handler {
 	// 应用界面子路径：探测（只读）与生成 nginx 入口（写配置 + reload）
 	root.HandleFunc("GET /api/v1/market/proxies", s.requireAuth(s.handleAppProxyProbe))
 	root.HandleFunc("POST /api/v1/market/proxies/apply", s.requireAuth(s.handleAppProxyApply))
+	// 从市场卸载（service / installer 两类；纳管的走 DELETE /api/v1/services/{name}）
+	root.HandleFunc("DELETE /api/v1/market/{id}", s.requireAuth(s.handleMarketUninstall))
 
 	// ---------- 在线升级 ----------
 	// 升级会替换二进制并重启面板，所以每一个写操作都必须经过鉴权；
