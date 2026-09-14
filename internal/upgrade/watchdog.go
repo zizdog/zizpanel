@@ -130,10 +130,33 @@ HEALTH_TRIES=%d
 ROLLBACK_TRIES=%d
 RESULT="%s"
 PLIST="%s"
+PANEL_PLIST="%s"
 
 mkdir -p "$(dirname "$RESULT")"
 
 log() { echo "[$(date '+%%Y-%%m-%%d %%H:%%M:%%S')] $*"; }
+
+# recover_panel 把面板 job 重新装一遍。
+#
+# 为什么需要它（2026-09-14 真机事故）：mini 从 0.4.10 升 0.5.0 时，
+# 看门狗 90 秒都等不到新版，回滚之后连**旧版**也起不来，result 写着
+# "需要人工介入"；launchd 那边只有一句 last exit code = 78: EX_CONFIG，
+# 日志一个字都没有。而同一个二进制、同一份 config、同样的环境变量，
+# 手工执行却能正常起来并返回健康页 —— 也就是说**二进制没问题，是 launchd
+# 里那个 job 僵住了**。现场用 launchctl bootout + bootstrap 重新装一次
+# 立刻就恢复了，随后重试升级一次通过。
+# 光靠 kickstart 救不回来，所以这里在等待期间主动做一次重装。
+recover_panel() {
+  if [ ! -f "$PANEL_PLIST" ]; then
+    log "面板 plist 不存在（${PANEL_PLIST}），跳过重装"
+    return
+  fi
+  log "健康检查仍未通过，尝试重装面板 job（bootout + bootstrap）"
+  launchctl bootout "system/$PANEL_LABEL" >/dev/null 2>&1 || true
+  sleep 1
+  launchctl bootstrap system "$PANEL_PLIST" >/dev/null 2>&1 || log "bootstrap 失败，继续等待"
+  launchctl kickstart -k "system/$PANEL_LABEL" >/dev/null 2>&1 || log "kickstart 失败，继续等待"
+}
 
 # 等新版通过健康检查。最多 90 秒：
 # 太短会把"启动稍慢"误判成失败并白白回滚；太长则用户盯着一个坏掉的面板干等。
@@ -150,6 +173,11 @@ for i in $(seq 1 "$HEALTH_TRIES"); do
   case "$body" in
     *"\"version\":\"$WANT\""*|*"\"version\":\"$WANT+"*) ok=1; break ;;
   esac
+  # 三分之一、三分之二处各试一次"重装 job"（见 recover_panel 的说明）：
+  # 先给新版留出正常启动的时间，再介入，避免把慢启动误当成 job 僵死。
+  if [ "$i" = "$((HEALTH_TRIES / 3))" ] || [ "$i" = "$((HEALTH_TRIES * 2 / 3))" ]; then
+    recover_panel
+  fi
   sleep 1
 done
 
@@ -186,11 +214,16 @@ launchctl kickstart -k "system/$PANEL_LABEL" >/dev/null 2>&1 || log "重启面�
 
 # 再等旧版回来说明自己活着 —— 回滚也要被验证，不能"以为回滚成功了"。
 # 同样要接受 "+commit" 后缀（旧版也可能是带 commit 的构建）。
+# 中途同样允许一次"重装 job"：如果刚才新版起不来是 launchd job 僵住造成的，
+# 那么回滚后照样起不来（真机上就是这么演的），必须把 job 重装一遍。
 for i in $(seq 1 "$ROLLBACK_TRIES"); do
   body="$(curl -fsSk --max-time 3 "$HEALTH" 2>/dev/null || true)"
   case "$body" in
     *"\"version\":\"$FROM\""*|*"\"version\":\"$FROM+"*) rolled=1; break ;;
   esac
+  if [ "$i" = "$((ROLLBACK_TRIES / 3))" ] || [ "$i" = "$((ROLLBACK_TRIES * 2 / 3))" ]; then
+    recover_panel
+  fi
   sleep 1
 done
 
@@ -206,7 +239,8 @@ cleanup_self
 exit 0
 `, opt.BinDir, opt.WorkDir, opt.Label, WatchdogLabel, opt.HealthURL, to, from, runID,
 		opt.HealthTries, opt.RollbackTries,
-		resultPath(opt.WorkDir), watchdogPlistPath(opt))
+		resultPath(opt.WorkDir), watchdogPlistPath(opt),
+		filepath.Join(opt.PlistDir, opt.Label+".plist"))
 }
 
 // CleanupStaleWatchdog 清掉可能残留的看门狗任务与 plist。

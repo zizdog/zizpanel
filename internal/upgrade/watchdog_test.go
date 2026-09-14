@@ -149,8 +149,8 @@ func TestWatchdogRollsBackWhenNewVersionUnhealthy(t *testing.T) {
 	if !strings.Contains(calls, "bootout system/"+WatchdogLabel) {
 		t.Errorf("看门狗应当把自己从 launchd 里摘掉，实际：%s", calls)
 	}
-	if strings.Contains(calls, "bootout system/"+opt.Label) {
-		t.Fatalf("看门狗 bootout 了面板自己（%s）—— 升级成功后服务会直接消失！实际：%s",
+	if strings.Contains(calls, "bootout system/"+opt.Label) && !strings.Contains(calls, "bootstrap system") {
+		t.Fatalf("看门狗 bootout 了面板却没装回去（%s）—— 服务会直接消失！实际：%s",
 			opt.Label, calls)
 	}
 	if !strings.Contains(calls, "kickstart -k system/"+opt.Label) {
@@ -161,6 +161,11 @@ func TestWatchdogRollsBackWhenNewVersionUnhealthy(t *testing.T) {
 // TestWatchdogScriptNeverBootsOutPanel 直接检查生成的脚本文本。
 // 上一个测试跑的是回滚路径；这条不管走哪条路径都盯着同一个约束，
 // 因为"清理"和"回滚"是两段独立代码，都可能写错 label。
+//
+// 2026-09-14 补充：现在脚本里**确实**有一处 bootout 面板的语句，
+// 但它必须同时满足两个条件，否则就是当年"升级成功后服务消失"的事故重演：
+//  1. 只能出现在 recover_panel() 里 —— 也就是"健康检查已经连续失败"才会走到；
+//  2. 同一个函数里必须紧跟 bootstrap（把它装回去），不能只摘不装。
 func TestWatchdogScriptNeverBootsOutPanel(t *testing.T) {
 	opt := newTestOptions(t)
 	script := watchdogScript(opt, "test-run", "0.1.0", "0.2.0")
@@ -171,12 +176,37 @@ func TestWatchdogScriptNeverBootsOutPanel(t *testing.T) {
 	if !strings.Contains(script, `PANEL_LABEL="`+opt.Label+`"`) {
 		t.Error("脚本里应当有独立的面板 label 变量 PANEL_LABEL")
 	}
-	// 任何 bootout 后面都不能跟着面板 label
-	for _, line := range strings.Split(script, "\n") {
+
+	// 把脚本按函数切开：bootout 面板的语句只允许出现在 recover_panel 里。
+	lines := strings.Split(script, "\n")
+	fn := ""
+	bootIdx, bootFn := -1, ""
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasSuffix(trimmed, "() {") {
+			fn = strings.TrimSuffix(trimmed, "() {")
+		} else if trimmed == "}" {
+			fn = ""
+		}
 		if strings.Contains(line, "bootout") && strings.Contains(line, opt.Label) {
-			t.Fatalf("看门狗脚本里出现了 bootout 面板的语句：%s", strings.TrimSpace(line))
+			bootIdx, bootFn = i, fn
 		}
 	}
+	switch {
+	case bootIdx < 0:
+		// 没有这种语句本来就是允许的。
+	case bootFn != "recover_panel":
+		t.Fatalf("只有 recover_panel() 里才允许 bootout 面板，实际出现在 %q 里", bootFn)
+	default:
+		rest := strings.Join(lines[bootIdx:], "\n")
+		if end := strings.Index(rest, "\n}"); end >= 0 {
+			rest = rest[:end]
+		}
+		if !strings.Contains(rest, "launchctl bootstrap system") {
+			t.Error("recover_panel() 里 bootout 面板之后必须紧跟 bootstrap 把它装回去 —— 只摘不装会让面板彻底消失")
+		}
+	}
+
 	// 旧写法（单一 $LABEL）不能再出现
 	if strings.Contains(script, `bootout "system/$LABEL"`) {
 		t.Error("仍在使用混用的 $LABEL 变量，必须改成 $SELF_LABEL")

@@ -727,6 +727,78 @@ make remote-test     # 远程一键安装的端到端测试（本地 HTTP + 沙�
     界面上同时显示来源（如 `35.0 °C（IOHID tdie×24）`）；取不到时如实说原因，
     不再写死一句可能错的"需 root"。
 
+68. **仪表盘每重渲染一次就漏一条 SSE，攒到 6 条整个面板"卡死"** →
+    `renderApp()` 里按 `view.length >= 2` 判断这个页面要不要 `onLeave`
+    （清理长连接的回调）。而 `DashboardView(content, ctx = {})` **第二个形参带默认值**，
+    `Function.length` 是 **1** → 它注册清理函数的那个分支从来没走到过。
+    后果：切主题、切路由每渲染一次仪表盘就多一条 `/api/v1/system/stream` 长连接，
+    浏览器对同一主机只允许 6 条并行连接，占满之后**面板所有接口都不返回**：
+    页面停在"正在读取…"，而**服务端一切正常**（同一时刻 `curl` 是 200 / 56ms）。
+    排查时最容易走错方向 —— 会以为是后端挂了。
+    修法：不再用形参个数做路由判断，所有页面统一拿到同一份 ctx。
+    教训：**形参个数不是"能力声明"**；这类静默失效要有一眼能看出来的证据 ——
+    现在 `make uitest` 会遍历全部导航项，漏连接会让后续步骤直接超时。
+
+69. **日志流被服务端拒绝时，界面却说"正在重连…"** →
+    `EventSource` 只在"连上过、后来断了"时才自动重连；服务端返回非 200
+    （典型：这个服务没有任何可跟踪的日志文件，后端返回 400）时，
+    浏览器把 readyState 置为 `CLOSED` 并**永久放弃**。
+    老代码不区分这两种情况，一律显示"连接中断，正在重连…"，
+    用户就一直等一件永远不会发生的事。
+    修法：`sseServiceLogs` 的 onError 把 EventSource 一起回调给调用方，
+    按 `readyState === EventSource.CLOSED` 区分，并去非流式接口取真实原因
+    （"无法读取日志：该服务没有可跟踪的日志文件"），不把原因硬编码在文案里。
+
+70. **`make uitest` 断言里写死 `login`：全新实例上必然失败** →
+    审计页的关键词筛选测试原本搜 `login`。但全新实例第一次进面板走的是
+    **初始化**（`setup`）而不是**登录**，一条 `login` 记录都没有 ——
+    于是测试会在**完全正确的行为**上报错。这个坑只在干净实例上暴露，
+    对着用过一段时间的真机跑一直是绿的。
+    修法：从页面"动作"下拉里取一个**真实出现过**的动作名来筛，
+    测的是"筛选"这件事本身。教训：测试别依赖"这台机器恰好有历史数据"。
+
+71. **`pmset -g cap` 是多行输出，用整段做子串匹配会全军覆没** →
+    能力探测写的是 `strings.Contains(" "+out+" ", " "+key+" ")`，
+    而真机输出是**每行前带一个空格的多行文本**：
+    `Capabilities for AC Power:\n displaysleep\n disksleep\n sleep\n womp\n autorestart\n…`。
+    于是除首尾两个键外**全都匹配不上**，界面上把每一项都标成"本机不支持"，
+    用户因此永远改不了电源设置 —— 而 `pmset -g cap` 明明列着 `autorestart`。
+    单测没抓到（桩件当时是单行输出，等于按实现写了测试），
+    **升级到 mini 上做真机验证时才暴露**。
+    修法：按行切分、跳过表头，逐行取键；测试用**真机抓下来的原始字节**做固定样例
+    （`od -c` 抓的），不再自己编一份"看起来像"的输出。
+
+72. **`lsof` 参数被拼成一个字符串 → 端口探测永远返回 false** →
+    `fmt.Sprintf("-nP -iTCP:%d -sTCP:LISTEN", port)` 整个作为一个 argv 传给 lsof，
+    lsof 把它当成不认识的选项，报错退出、没有输出，于是"有没有人在听"永远是否。
+    真机上的表现最具误导性：用户**正连着 SSH**，「系统设置」页却写
+    "远程登录未监听（22 端口没人听）"—— 会把人骗去重开一遍 SSH。
+    修法：参数必须是独立的三个（`lsofListenArgs`），并让单测断言
+    "参数个数正确且每个参数里都不含空格"。
+
+73. **升级后 launchd 里的面板 job 僵住：新旧版都起不来，二进制却是好的** →
+    2026-09-14 mini 从 0.4.10 升 0.5.0 时现场：
+    - 看门狗 90 秒等不到新版 → 回滚 → **旧版也等不到** → `result.txt` 写
+      `回滚后旧版仍未通过健康检查，需要人工介入`，8443 彻底没人听；
+    - `launchctl print system/cn.zizpanel.panel` 只有一句
+      `last exit code = 78: EX_CONFIG`（`EX_CONFIG` = 配置错），
+      而 `launchd.err.log` / 面板日志**一个字都没有**；
+    - 关键反证：同一个二进制、同一份 `config.json`、同样的环境变量
+      （`ZIZPANEL_USER` / `ZIZPANEL_ROOT` / PATH），手工执行能正常起来并返回健康页 ——
+      所以**不是二进制、不是配置，是 launchd 里那个 job 僵住了**；
+    - 现场用 `sudo launchctl bootout system/cn.zizpanel.panel` +
+      `sudo launchctl bootstrap system /Library/LaunchDaemons/cn.zizpanel.panel.plist`
+      重装一次，立刻恢复，随后重试升级一次通过。
+    为什么 kickstart 救不回来：`kickstart -k` 只是"杀掉再拉起同一个 job"，
+    job 的注册信息本身坏了时它照样坏。
+    现在看门狗在等待期间（1/3 与 2/3 处）会主动做一次"bootout + bootstrap 重装"，
+    并且有测试锁死两条约束：这条语句**只能**出现在 `recover_panel()`（健康检查已连续失败）
+    里、且**必须紧跟 bootstrap 把它装回去** —— 只摘不装就是当年"升级成功后
+    面板从 launchd 里消失、入口 502"那个事故。
+    排查提示：遇到"升级完面板没了"，先手工跑一遍
+    `/opt/zizpanel/bin/zizpanel serve --config /opt/zizpanel/data/config.json`；
+    能起来就别再怀疑二进制，直接去重装 job。
+
 ---
 
 ## 开发路线
@@ -742,6 +814,40 @@ make remote-test     # 远程一键安装的端到端测试（本地 HTTP + 沙�
 | P4 | 计划任务与备份 | ✅ 已完成 |
 | P4 | 日志中心、数据库管理 | ✅ 已完成 |
 | P5 | 分发打磨：Mac mini 长期运行、远程一键安装、**在线升级**、备份恢复、跨机迁移 | 部分完成（部署见 [Mac-mini部署指南.md](Mac-mini部署指南.md)；在线升级已完成并真机演练通过；备份/跨机迁移待做） |
+
+---
+
+## 系统设置（把 macOS 配成服务器）
+
+侧边栏「系统设置」这一页**取代了原来的「系统监控」**：监控内容和仪表盘高度重复
+（同样的 CPU/内存/磁盘/网络/进程，仪表盘还多了曲线），而"这台 macOS 该怎么配成
+服务器"反倒只能靠装机时跑一次 `tools/server-mode.sh`。现在两件事各归其位：
+
+- **看指标** → 仪表盘（原监控页独有的「系统负载」「Swap 使用」已并入仪表盘的「系统信息」，
+  没有丢信息）；
+- **改 macOS** → 系统设置。
+
+页面上的每一项都遵循同一条纪律：**先显示当前真实值，再提供动作，执行完重新读回复核**。
+
+| 分组 | 做什么 | 依据 |
+|------|--------|------|
+| 主机状态 | 机型、面板是否 root、SSH 是否在听、自动登录、Tailscale | 只读探测 |
+| 一键设为服务器模式 | 电源 + 阻断更新 + 静默诊断 + 关索引 + 开 SSH，一条命令串起来 | `internal/sysconfig` |
+| 电源与睡眠 | `sleep`/`disksleep`=0、`womp`=1、`powernap`=0、`autorestart`=1、`displaysleep`=10 | 与 `tools/server-mode.sh` 的取值一致 |
+| 系统更新阻断 | 清掉安装类偏好 + hosts 里把 8 个更新域名指向 `0.0.0.0` | 见「阻止系统更新」一节 |
+| 崩溃报告与索引 | 关闭崩溃弹窗与自动上报、Spotlight 索引开关 | `CrashReporter`/`mdutil` |
+| 远程访问与登录 | 开启 SSH、关闭自动登录 | `launchctl` + `systemsetup` 回退 |
+
+三个来自真机的设计约束：
+
+1. **能力必须先探测。** `pmset -g cap` 决定哪些键这台机器支持 ——
+   MacBook Air 上 `autorestart` 不被支持，而 `pmset -a autorestart 1` 会
+   **静默返回 0 但什么都不做**。所以不支持的项在界面上直接标成"本机不支持"，
+   而不是给一个点了会骗人的按钮。
+2. **复核真实值，不看退出码。** 每个动作跑完重新 `Probe()` 一次，
+   界面显示的是系统现状，不是"我们请求过要改成什么"。
+3. **动作全部走任务中心。** 用户能看到每条 `$ 命令` 与它的输出，
+   关掉进度窗也不会中断（任务跑在 `context.Background()` 上）。
 
 ---
 
@@ -836,7 +942,8 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 
 - **AI 服务（原生，可用 Metal）**：Ollama、Qwen3 TTS（纳管本机已有）
 - **容器运行时**：Docker 运行时（Colima）—— 其余 Docker 应用的前提，可一键安装
-- **运维工具（Docker）**：Uptime Kuma、MinIO、n8n、Gitea、Stirling PDF
+- **运维工具（Docker）**：Uptime Kuma、MinIO、n8n、Gitea、Stirling PDF、
+  IT-Tools、File Browser、MetaTube、Squoosh
 
 > Pic Smaller 已移除：其目录条目的镜像 `joyqi/sfz` 在 Docker Hub 上并不存在，
 > 该项目也没有官方镜像。保留一个点了必然失败的条目比没有更糟。
@@ -844,6 +951,43 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 安装流程刻意分成两步：**先跑安装前检查，再安装**。
 检查会把缺 Docker / 缺 Homebrew 包 / 端口冲突一次列清楚，
 并给出可直接复制执行的修复命令 —— 而不是让用户点了安装等几分钟才发现缺依赖。
+
+#### 选品与安装路径：原生优先，其次多架构 Docker
+
+每个条目只走两条路之一，判断顺序固定（2026-09 定的长期规则，AGENTS.md 铁律 8）：
+
+1. **原生（首选）**：`brew info <name>` 能查到 formula 就写 `KindNative` + `BrewFormula`
+   （如 `filebrowser` 有 homebrew/core formula，bottle 覆盖 `arm64_tahoe/sequoia`）。
+   但 **formula 未必实现 `brew services`**：`brew info --json=v2 <name>` 的 `service`
+   字段为 `null`、源码里没有 `service do` 块时，面板的原生路径装完必然在
+   `brew services start` 失败，只留下一条 label 指向不存在 plist 的"托管"记录 ——
+   市场说已安装、服务管理里永远起不来。这种情况**宁可退到 Docker**，也不留假成功。
+2. **原生二进制**：只有官方 GitHub release 的 `darwin-arm64` 产物、没有 formula 时，
+   面板目前**没有**"下载 release 二进制 → 写 launchd plist"的通用安装器
+   （`internal/upgrade` 那套只服务面板自身升级）。**不要为单个应用临时发明安装器**；
+   这类应用先走 Docker，等通用安装器做出来再换（`metatube-server` 就是这种：
+   上游发了 `metatube-server-darwin-arm64.zip`，但目录里没有对应的安装路径）。
+3. **Docker（兜底）**：镜像必须**自带 `linux/arm64`**。用
+   `docker manifest inspect <image>:<tag>` 看 platforms 列表，必须出现
+   `linux/arm64`；compose 里**绝不写 `platform:`**，也不靠 Rosetta 转译
+   （转译慢、占内存，违背"原生优先"）。`internal/services` 里有一条测试
+   （`TestCatalogComposeNeverPinsPlatform`）锁死这一条。端口按既有写法绑
+   `<host>:<container>`（0.0.0.0），健康检查路径要能在源码/healthcheck 里找到出处。
+
+本轮 4 个新条目的判定结果（证据都写在 `internal/services/catalog.go` 的条目注释里）：
+
+| 应用 | 路线 | 依据（实测输出摘要） |
+|---|---|---|
+| IT-Tools | Docker | 官方镜像，`ghcr.io/corentinth/it-tools:latest` → `linux/amd64、linux/arm64` |
+| File Browser | Docker | brew formula 存在但无 `brew services` 定义 → 无法托管；官方镜像 `filebrowser/filebrowser:latest` → `linux/amd64、linux/arm64、linux/arm/v7` |
+| MetaTube Server | Docker | 官方镜像 `ghcr.io/metatube-community/metatube-server:latest` → `linux/amd64、linux/arm64`（上游另有 darwin-arm64 release 二进制，见上第 2 条） |
+| Squoosh | Docker（社区镜像） | 上游**没有**官方镜像（仓库里没有 Dockerfile）；社区 `pjmeca/squoosh:1.1.0` → `linux/amd64、linux/arm64、linux/arm/v7` |
+
+> 网络实测：本机 `registry-1.docker.io` / `hub.docker.com` 直连超时，
+> Docker Hub 上的 manifest 只能经镜像站读同一份 image index
+> （`docker manifest inspect docker.1ms.run/<image>:<tag>`）；`ghcr.io` 可直连。
+> 所以有官方 ghcr 镜像的项目（IT-Tools、MetaTube）优先写 ghcr 地址。
+> 选镜像前先确认该仓库能从本机真的拉到。
 
 ### Qwen3 TTS：两个模型都必须常驻
 

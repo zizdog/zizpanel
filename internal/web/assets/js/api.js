@@ -264,6 +264,13 @@ export const api = {
     return u.toString();
   },
 
+  // ---- 系统设置（把 macOS 配成服务器）----
+  // 探测是只读的，随时可刷新；动作一律走任务中心（返回 task_id），
+  // 因为其中「一键设为服务器模式」要跑十几条命令、动 hosts 与 pmset。
+  systemSettings: () => request('GET', `${API_BASE}/system/settings`),
+  systemSettingsAction: (action) =>
+    request('POST', `${API_BASE}/system/settings/${enc(action)}`, {}),
+
   // ---- nginx 环境 ----
   nginxTest: () => request('POST', `${API_BASE}/system/nginx/test`, {}),
   nginxStatus: () => request('GET', `${API_BASE}/system/nginx/status`),
@@ -324,12 +331,16 @@ function enc(v) {
 //
 // 服务日志用"按行推送"的 SSE：服务端把新增日志按行拆成多个 data 行，
 // EventSource 收到一整条 message 就是一段新增日志。
+//
+// onError 会带上 EventSource 本身（第二个参数）：调用方必须能区分
+// 「暂时断了、浏览器会自动重连」与「服务端明确拒绝（例如该服务没有日志文件，
+// 返回 400）、永远不会重连」—— 这两种情况的提示语不能是同一句（见 services.js）。
 export function sseServiceLogs(name, { onData, onError, onClose } = {}) {
   const es = new EventSource(apiURL(`services/${encodeURIComponent(name)}/logs/stream`),
     { withCredentials: true });
   if (onData) es.onmessage = (e) => onData(e.data + '\n');
   es.addEventListener('close', () => { if (onClose) onClose(); es.close(); });
-  if (onError) es.onerror = onError;
+  if (onError) es.onerror = (e) => onError(e, es);
   return es;
 }
 

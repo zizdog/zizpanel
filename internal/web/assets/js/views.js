@@ -209,6 +209,10 @@ export function DashboardView(content, ctx = {}) {
       ['操作系统', `macOS ${s.os || '?'} (${s.arch})`],
       ['处理器', s.cpu_model || '-'],
       ['运行时长', duration(s.uptime)],
+      // 系统负载与 Swap 原先只出现在「系统监控」页；那一页已改造成「系统设置」，
+      // 于是把这两项搬进仪表盘，避免页面改造反而丢掉信息。
+      ['系统负载 (1/5/15)', `${s.load_1.toFixed(2)} / ${s.load_5.toFixed(2)} / ${s.load_15.toFixed(2)}`],
+      ['Swap 使用', s.swap_total ? `${bytes(s.swap_used)} / ${bytes(s.swap_total)}` : '未启用'],
       ['进程数', String(s.procs)],
       // 取不到时**如实说原因**：以前这里写死"不可读取（需 root）"，
       // 而 Apple Silicon 上的真实原因是 powermetrics 没有 smc 采样器（不是权限）。
@@ -259,93 +263,6 @@ export function DashboardView(content, ctx = {}) {
     },
   });
   if (ctx.onLeave) ctx.onLeave(() => es.close());
-}
-
-// ============================================================================
-//  系统监控
-// ============================================================================
-
-export function MonitorView(content, ctx = {}) {
-  clear(content);
-
-  const spark = new Sparkline({ max: 120, height: 120, color: 'var(--brand)' });
-  const memSpark = new Sparkline({ max: 120, height: 120, color: 'var(--ok)' });
-  const statsList = h('dl.kv');
-  const procBody = h('tbody');
-
-  content.append(
-    h('div.grid.grid-2', [
-      h('div.card', [
-        h('div.card-head', [h('h3', { text: 'CPU 使用率' }), h('div.spacer'), h('span.sub', { text: '每 2 秒采样' })]),
-        h('div.card-body', [spark.svg]),
-      ]),
-      h('div.card', [
-        h('div.card-head', [h('h3', { text: '内存使用率' }), h('div.spacer'), h('span.sub', { text: '每 2 秒采样' })]),
-        h('div.card-body', [memSpark.svg]),
-      ]),
-    ]),
-    h('div.card', [
-      h('div.card-head', [h('h3', { text: '详细指标' })]),
-      h('div.card-body', [statsList]),
-    ]),
-    h('div.card', [
-      h('div.card-head', [h('h3', { text: '进程 Top 20' })]),
-      h('div.card-body.tight', [
-        h('table.table', [
-          h('thead', [h('tr', [
-            h('th', { text: 'PID' }), h('th', { text: '程序' }),
-            h('th', { text: 'CPU' }), h('th', { text: '内存' }), h('th', { text: '常驻内存' }),
-          ])]),
-          procBody,
-        ]),
-      ]),
-    ]),
-  );
-
-  const update = (s) => {
-    spark.push(s.cpu_used);
-    memSpark.push(s.mem_total ? (s.mem_used / s.mem_total) * 100 : 0);
-    clear(statsList);
-    const rows = [
-      ['CPU 使用率', pct(s.cpu_used)],
-      // 监控页也放一份温度：这是"现在机器热不热"最直观的一个数
-      ['CPU 温度', s.cpu_temp > 0
-        ? s.cpu_temp + ' °C' + (s.cpu_temp_note ? '（' + s.cpu_temp_note + '）' : '')
-        : '取不到' + (s.cpu_temp_note ? '：' + s.cpu_temp_note : '')],
-      ['系统负载 (1/5/15)', `${s.load_1.toFixed(2)} / ${s.load_5.toFixed(2)} / ${s.load_15.toFixed(2)}`],
-      ['物理内存', `${bytes(s.mem_used)} / ${bytes(s.mem_total)}`],
-      ['空闲内存', bytes(s.mem_free)],
-      ['可回收内存', bytes(s.mem_cached)],
-      ['Swap 使用', s.swap_total ? `${bytes(s.swap_used)} / ${bytes(s.swap_total)}` : '未启用'],
-      ['磁盘空间', `${bytes(s.disk_used)} / ${bytes(s.disk_total)}（剩余 ${bytes(s.disk_free)}）`],
-      ['网络累计接收', bytes(s.net_rx)],
-      ['网络累计发送', bytes(s.net_tx)],
-      ['实时下行', rate(s.net_rx_rate)],
-      ['实时上行', rate(s.net_tx_rate)],
-      ['进程总数', String(s.procs)],
-      ['系统运行时长', duration(s.uptime)],
-    ];
-    rows.forEach(([k, v]) => statsList.append(h('dt', { text: k }), h('dd', { text: v })));
-  };
-
-  const procTimer = setInterval(async () => {
-    try {
-      const res = await api.processes('cpu', 20);
-      clear(procBody);
-      (res.list || []).forEach((p) => procBody.append(h('tr', [
-        h('td.num.mono', { text: p.pid }),
-        h('td.mono', { text: p.command, title: p.command }),
-        h('td.num', { text: p.cpu != null ? p.cpu.toFixed(1) + '%' : '—' }),
-        h('td.num', { text: (p.mem || 0).toFixed(1) + '%' }),
-        h('td.num', { text: bytes((p.rss || 0) * 1024) }),
-      ])));
-    } catch { /* 静默 */ }
-  }, 4000);
-
-  const es = sse(apiURL('system/stream?interval=2'), { onSample: update });
-  if (ctx.onLeave) {
-    ctx.onLeave(() => { es.close(); clearInterval(procTimer); });
-  }
 }
 
 // ============================================================================
@@ -1171,7 +1088,8 @@ export function ComingSoonView(content, ctx = {}) {
           h('span.pill.ok', { text: '登录鉴权 + 会话管理' }),
           h('span.pill.ok', { text: '两步验证 TOTP' }),
           h('span.pill.ok', { text: '访问策略（IP 白名单）' }),
-          h('span.pill.ok', { text: '实时系统监控' }),
+          h('span.pill.ok', { text: '实时系统监控（仪表盘）' }),
+          h('span.pill.ok', { text: 'macOS 系统设置' }),
           h('span.pill.ok', { text: '操作审计' }),
           h('span.pill.ok', { text: '内存级登录限流' }),
         ]),

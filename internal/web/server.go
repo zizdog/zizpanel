@@ -134,6 +134,10 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/system/info", s.requireAuth(s.handleSystemInfo))
 	root.HandleFunc("GET /api/v1/system/stream", s.requireAuth(s.handleSystemStream))
 	root.HandleFunc("GET /api/v1/system/processes", s.requireAuth(s.handleProcesses))
+
+	// 系统设置（macOS 服务器化）：状态探测 + 一键动作（动作走任务中心）
+	root.HandleFunc("GET /api/v1/system/settings", s.requireAuth(s.handleSystemSettings))
+	root.HandleFunc("POST /api/v1/system/settings/{action}", s.requireAuth(s.handleSystemSettingsAction))
 	// 操作审计：检索 + 游标分页 + 导出（facets 给下拉框提供真实出现过的动作名）
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
 	root.HandleFunc("GET /api/v1/audit/facets", s.requireAuth(s.handleAuditFacets))

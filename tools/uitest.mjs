@@ -197,12 +197,25 @@ try {
     await page.click('button[title="切换主题"]');
   });
 
-  await step('切换到系统监控页', async () => {
-    await page.click('.nav-item:has-text("系统监控")');
+  await step('切换到系统设置页', async () => {
+    await page.click('.nav-item:has-text("系统设置")');
     await page.waitForTimeout(2600);
-    await shot('04-monitor');
+    await shot('04-system-settings');
     const txt = await page.locator('.content').innerText();
-    if (!txt.includes('详细指标')) throw new Error('监控页未渲染');
+    // 这一页取代了原来的「系统监控」（与仪表盘重复）。内容必须真的渲染出来：
+    // 服务器模式、电源策略、更新阻断 —— 少一个都说明接口或页面挂了。
+    for (const need of ['一键设为服务器模式', '电源与睡眠', '系统更新阻断', '远程访问与登录']) {
+      if (!txt.includes(need)) throw new Error(`系统设置页缺少「${need}」`);
+    }
+  });
+
+  await step('仪表盘确实包含负载与 Swap（没有因页面改造丢信息）', async () => {
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(2600);
+    const txt = await page.locator('.content').innerText();
+    for (const need of ['系统负载', 'Swap 使用']) {
+      if (!txt.includes(need)) throw new Error(`仪表盘缺少「${need}」`);
+    }
   });
 
   await step('打开面板设置', async () => {
@@ -435,16 +448,33 @@ try {
       // 没有服务卡片时跳过
       return;
     }
-    await logBtn.click();
-    await page.waitForSelector('.modal', { timeout: 8000 });
-    await page.waitForTimeout(2500);
-    await shot('31-service-logs');
-    const pill = await page.locator('.modal .pill').first().innerText();
-    if (!pill.includes('实时') && !pill.includes('中断') && !pill.includes('结束')) {
-      throw new Error('日志流状态异常: ' + pill);
+    // 有些服务本来就没有可跟踪的日志文件（例如 brew 的 mysql8.4 把日志写在别处），
+    // 此时后端对日志流返回 400，浏览器会如实记一条控制台错误 —— 这是**预期内**的。
+    // 要断言的是界面没有因此撒谎：不能一边被服务端拒绝、一边说"正在重连…"
+    // （EventSource 对非 200 响应不会重连）。
+    expectHTTPError = true;
+    try {
+      await logBtn.click();
+      await page.waitForSelector('.modal', { timeout: 8000 });
+      await page.waitForTimeout(2500);
+      await shot('31-service-logs');
+      const pill = await page.locator('.modal .pill').first().innerText();
+      const body = await page.locator('.modal-body').innerText().catch(() => '');
+      const okStates = ['实时', '中断', '结束', '无法读取日志'];
+      if (!okStates.some((s) => pill.includes(s))) {
+        throw new Error('日志流状态既不是实时/中断/结束，也不是明确的失败: ' + pill);
+      }
+      if (pill.includes('无法读取日志') && !/无法建立/.test(body)) {
+        throw new Error('日志流建立失败时没有说明原因: ' + body.slice(0, 200));
+      }
+      if (pill.includes('重连') && body.includes('无法建立')) {
+        throw new Error('服务端已拒绝连接，界面却说正在重连（浏览器不会重连）');
+      }
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(500);
+    } finally {
+      expectHTTPError = false;
     }
-    await page.keyboard.press('Escape');
-    await page.waitForTimeout(500);
   });
 
   await step('服务详情显示完整信息', async () => {
@@ -1065,14 +1095,26 @@ try {
       throw new Error('审计页出现字面量 null/undefined: ' + body.slice(0, 200));
     }
 
-    // 关键词筛选：搜 login，结果里应只剩 login 动作
+    // 关键词筛选：用一个**真实出现过**的动作名去筛。
+    //
+    // 这里以前写死搜 "login"，在一个全新的实例上必然失败：第一次进面板走的是
+    // 「初始化」而不是「登录」，一条 login 记录都没有 —— 于是测试会在**正确行为**
+    // 上报错（这个坑只有在全新实例上才暴露，对着用过的真机跑一直是绿的）。
+    // 现在从页面的动作下拉里取一个真实动作名，测的是"筛选"这件事本身。
     if (body.includes('没有符合条件') === false) {
-      await page.fill('input[placeholder^="关键词"]', 'login');
+      const kw = await page.evaluate(() => {
+        const sels = Array.from(document.querySelectorAll('.content select.select'));
+        const actionSel = sels.find((s) => Array.from(s.options).some((o) => o.textContent.includes('全部动作')));
+        const opt = actionSel && Array.from(actionSel.options).find((o) => o.value);
+        return opt ? opt.value : '';
+      });
+      if (!kw) throw new Error('审计页的动作下拉里没有任何真实动作可筛');
+      await page.fill('input[placeholder^="关键词"]', kw);
       await page.click('button:has-text("查询")');
       await page.waitForTimeout(1800);
       const filtered = await page.locator('.content').innerText();
-      if (!filtered.includes('login')) {
-        throw new Error('关键词筛选后没有出现 login: ' + filtered.slice(0, 200));
+      if (!filtered.includes(kw)) {
+        throw new Error(`关键词筛选「${kw}」后结果里没有它: ` + filtered.slice(0, 200));
       }
       await shot('54-audit-filtered');
 

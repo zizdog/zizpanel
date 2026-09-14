@@ -339,7 +339,24 @@ export function ServicesView(content, ctx = {}) {
           }
           box.scrollTop = box.scrollHeight;
         },
-        onError: () => {
+        onError: async (_ev, src) => {
+          // readyState === CLOSED 说明这次连接是**被服务端拒绝**的（非 200 或不是
+          // event-stream），浏览器不会再重连。此时还说"正在重连…"，
+          // 用户就在等一个永远不会发生的事 —— 这是误导。
+          // 真机上最常见的触发点：这个服务没有任何可跟踪的日志文件（后端返回 400）。
+          if (src && src.readyState === EventSource.CLOSED) {
+            status.className = 'pill warn';
+            status.textContent = '无法读取日志';
+            // 去非流式接口问一句真正的原因，别把原因硬编码在文案里。
+            let why = '';
+            try {
+              await api.serviceLogs(s.name, 1);
+            } catch (e) {
+              why = e.message;
+            }
+            box.textContent = '（日志流无法建立' + (why ? '：' + why : '') + '）\n' + box.textContent;
+            return;
+          }
           status.className = 'pill warn';
           status.textContent = '连接中断，正在重连…';
         },

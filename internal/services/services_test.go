@@ -102,6 +102,23 @@ func TestCatalogEntriesAreComplete(t *testing.T) {
 	}
 }
 
+// 目录里的 compose 条目**绝不允许**指定 platform。
+//
+// 这是 2026-09 定下的长期规则：只有镜像本身自带 linux/arm64 才允许进目录，
+// 写 `platform: linux/amd64` 会走 Rosetta 转译（慢且占内存），
+// 与"能原生就原生"的选品策略相悖。用测试锁死它，
+// 免得以后有人为了让某个只有 amd64 的镜像跑起来偷偷加一行。
+func TestCatalogComposeNeverPinsPlatform(t *testing.T) {
+	for _, a := range Catalog() {
+		if a.Kind != KindCompose {
+			continue
+		}
+		if strings.Contains(a.ComposeYAML, "platform:") {
+			t.Fatalf("compose 应用 %s 指定了 platform，违反「Docker 只允许原生 arm64 镜像」的规则", a.ID)
+		}
+	}
+}
+
 // 端口分配不应重复：两个应用抢同一个端口会让后装的那个直接失败。
 func TestCatalogPortsAreUnique(t *testing.T) {
 	seen := map[int]string{}

@@ -5,7 +5,8 @@
 
 import { api, ApiError } from './api.js';
 import { h, clear, toast, $, modal, bytes, duration, esc } from './ui.js';
-import { DashboardView, MonitorView, SettingsView } from './views.js';
+import { DashboardView, SettingsView } from './views.js';
+import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
 import { ServicesView } from './services.js';
 import { AppsView } from './apps.js';
@@ -30,7 +31,10 @@ export const state = {
 export const NAV = [
   { group: '总览' },
   { id: 'dashboard', title: '仪表盘', icon: '📊', view: DashboardView },
-  { id: 'monitor', title: '系统监控', icon: '📈', view: MonitorView },
+  // 「系统监控」已改成「系统设置」：监控内容和仪表盘高度重复，
+  // 而"把 macOS 配成服务器"（电源/更新阻断/SSH/索引）原来只在装机脚本里能做一次。
+  // 重复的指标（系统负载、Swap）已经并入仪表盘，没有丢信息。
+  { id: 'system', title: '系统设置', icon: '🛠️', view: SystemSettingsView },
   { group: '网站' },
   { id: 'sites', title: '网站管理', icon: '🌐', view: SitesView },
   { id: 'database', title: '数据库', icon: '🗄️', view: DatabaseView },
@@ -318,13 +322,18 @@ function renderApp() {
   // 渲染前先清理上一个页面的长连接（SSE / 定时器），避免叠加泄漏
   runCleanup();
 
-  // 渲染当前页面
+  // 渲染当前页面：所有页面统一拿到同一份 ctx。
+  //
+  // 这里以前写的是 `if (view.length >= 2)` —— 只有"声明了两个形参"的页面才拿得到
+  // onLeave。而 `export function DashboardView(content, ctx = {})` 因为有**默认值**，
+  // `Function.length` 是 1，于是仪表盘注册清理函数的那个分支从来没走到过：
+  // 每重渲染一次仪表盘就漏一条 /api/v1/system/stream 长连接（切主题、切路由都算），
+  // 攒够 6 条就把浏览器的"同一主机最多 6 个连接"占满 ——
+  // 之后面板所有接口都挂住不返回，**服务端其实一切正常**（curl 200/56ms），
+  // 只有浏览器里一片"正在读取…"。这是 2026-09-14 修掉的真坑。
+  // 教训：形参个数不是"能力声明"，别拿它做路由判断。
   const view = item.view;
-  if (typeof view === 'function' && view.length >= 2) {
-    view(content, { item, topbar, pageTitle, onLeave: registerCleanup });
-  } else {
-    view(content, { item });
-  }
+  view(content, { item, topbar, pageTitle, onLeave: registerCleanup });
   document.title = `${item.title} · ZizPanel`;
 }
 

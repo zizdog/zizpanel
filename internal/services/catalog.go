@@ -322,6 +322,139 @@ func Catalog() []App {
     restart: unless-stopped`),
 			DocsURL: "https://github.com/Stirling-Tools/Stirling-PDF",
 		},
+
+		// ---------------- 2026-09 新增（选品规则见 README「应用市场」） ----------------
+		//
+		// 长期规则（用户 2026-09-14 定下）：
+		//   ① **能原生就原生**：Homebrew formula 优先（也可用官方 darwin-arm64
+		//      预编译产物，前提是目录里已有对应的安装路径）；
+		//   ② **只能 Docker 时，镜像必须自带 linux/arm64**：
+		//      compose 里绝不写 `platform: linux/amd64`，也不靠 Rosetta 转译 ——
+		//      转译既慢又占内存，与"原生优先"的初衷相悖；
+		//   ③ 面板**没有**"下载 GitHub release 二进制 → 写 launchd plist"的通用
+		//      安装器（`internal/upgrade` 那套只服务面板自身升级）。所以
+		//      "有官方 arm64 二进制但没有 brew formula"的应用先走 Docker，
+		//      **不要为单个应用临时发明一套安装器**。
+		//
+		// 为什么每条 Docker 条目都把 arm64 证据写进注释：这条规则只能靠"查过"
+		// 来保证，写下来下次换镜像/换 tag 时才有对照。实测命令：
+		//   docker manifest inspect <image>:<tag>        # 看 platforms 列表
+		// 本机 registry-1.docker.io / hub.docker.com 直连超时（见 README），
+		// Docker Hub 上的镜像改经镜像站读同一份 image index：
+		//   docker manifest inspect docker.1ms.run/<image>:<tag>
+		// ghcr.io 可直连，官方 ghcr 镜像一律直查。
+		{
+			ID: "it-tools", Name: "IT-Tools（开发者工具箱）", Icon: "🧰",
+			Summary: "几十个开发者常用小工具，纯前端",
+			Description: "JSON 格式化、Base64/URL 编解码、UUID 与哈希生成、时间戳转换、" +
+				"正则测试、JWT 解析、CIDR 计算等常用小工具合集。" +
+				"全部逻辑在浏览器里本地执行，输入内容不上传。装好后访问 http://<本机地址>:8083。",
+			Category: "tool", Kind: KindCompose, Port: 8083,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 官方镜像（README 里给的就是 corentinth/it-tools 与 ghcr.io/corentinth/it-tools
+			// 两个地址）。这里用 ghcr：与本机网络实测有关 —— ghcr.io 可直连，
+			// Docker Hub 直连超时；两者是同一个官方项目，不是第三方转存。
+			// arm64 证据（ghcr.io 直查）：
+			//   docker manifest inspect ghcr.io/corentinth/it-tools:latest
+			//   → linux/amd64、linux/arm64（另有两个 unknown/unknown 的 attestation）
+			ComposeYAML: composeTemplate("it-tools", "ghcr.io/corentinth/it-tools:latest", 8083, 80, `
+    restart: unless-stopped`),
+			DocsURL: "https://github.com/CorentinTh/it-tools",
+		},
+		{
+			ID: "filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
+			Summary: "在浏览器里管理服务器上的文件",
+			Description: "浏览、上传、下载、重命名、删除与分享目录，支持多用户与细粒度权限。" +
+				"面板自带的文件管理器限定在白名单目录（网站目录、面板数据/日志/工作目录），" +
+				"File Browser 没有这个限制，适合当成日常入口。" +
+				"默认管理 compose 目录下的 data/（可在 Docker → Compose 里改挂载目录）。",
+			Category: "tool", Kind: KindCompose, Port: 8081,
+			// 官方镜像的 healthcheck 打的就是 /health（见仓库 docker/common/healthcheck.sh），
+			// 不是猜测的路径。
+			HealthPath: "/health",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 为什么有 brew formula 却走 Docker（唯一的例外，理由要写清楚）：
+			// homebrew/core 的 filebrowser（2.63.23，bottle 覆盖 arm64_tahoe/sequoia）
+			// **没有 service 定义** —— 读 `brew info --json=v2 filebrowser` 的 service
+			// 字段是 null，formula 源码里也没有 `service do` 块。
+			// 而面板的原生路径装完必须 `brew services start`，对这类 formula 必然失败：
+			// 结果是一条 launchd label 指向不存在 plist 的"托管"记录 —— 市场说已安装，
+			// 服务管理里却永远起不来。宁可用官方 Docker 镜像，也不留这种假成功。
+			// arm64 证据（Docker Hub 经镜像站读同一份 index）：
+			//   docker manifest inspect docker.1ms.run/filebrowser/filebrowser:latest
+			//   → linux/amd64、linux/arm64、linux/arm/v7
+			ComposeYAML: `services:
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    # 官方镜像默认以 uid 1000 的 user 运行，而面板创建的 compose 目录与
+    # bind mount 属主是 root —— 它的 init.sh 会因写不了 /config/settings.json
+    # 直接退出（set -e）。容器内以 root 运行即可，与目录里其它镜像一致。
+    user: "0:0"
+    ports:
+      - "8081:80"
+    volumes:
+      - ./data:/srv
+      - ./config:/config
+      - ./database:/database
+    restart: unless-stopped
+`,
+			PostInstallHint: "首次启动的 admin 密码是随机生成的，在「服务管理 → File Browser → 日志」里找 " +
+				"User 'admin' initialized with randomly generated password；登录后请立即修改。",
+			DocsURL: "https://filebrowser.org",
+		},
+		{
+			ID: "metatube-server", Name: "MetaTube（媒体元数据服务）", Icon: "🎬",
+			Summary: "给 Emby / Jellyfin 刮削影片元数据",
+			Description: "MetaTube 的 API 服务端：聚合 20+ 元数据提供方，供 Emby / Jellyfin 的 " +
+				"MetaTube 插件调用，按番号抓取封面、简介、演员等信息。" +
+				"装好后把插件里的服务地址填成 http://<本机地址>:8084。",
+			Category: "tool", Kind: KindCompose, Port: 8084,
+			// 项目自带 Web 首页（GET / 返回 app 与 version 的 JSON，见 route/route.go），
+			// 拿它当探活路径既真实又不受后续 API 变更影响。
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 上游 release（metatube-community/metatube-server-releases v1.4.0）
+			// 确实提供 metatube-server-darwin-arm64.zip，但面板没有"下载二进制并注册
+			// launchd"的通用安装器，所以这里用**官方** ghcr 镜像（不是第三方转存）。
+			// arm64 证据（ghcr.io 直查）：
+			//   docker manifest inspect ghcr.io/metatube-community/metatube-server:latest
+			//   → linux/amd64、linux/arm64（另有两个 unknown/unknown 的 attestation）
+			// 官方镜像默认 DSN 为空 = 内存 SQLite（只存影评缓存，重启即失，与上游
+			// Dockerfile 的默认值一致），因此不挂卷；要持久化自行加 DSN 与卷。
+			ComposeYAML: composeTemplate("metatube-server",
+				"ghcr.io/metatube-community/metatube-server:latest", 8084, 8080, `
+    restart: unless-stopped`),
+			PostInstallHint: "默认不鉴权（TOKEN 为空）：只建议在局域网内使用。" +
+				"要让局域网外访问，请在 compose 里加 TOKEN 环境变量，并让客户端带上同一个值。",
+			DocsURL: "https://github.com/metatube-community/metatube-sdk-go",
+		},
+		{
+			ID: "squoosh", Name: "Squoosh（图片压缩）", Icon: "🗜️",
+			Summary: "浏览器里的图片压缩，本地 wasm 完成",
+			Description: "PNG / JPEG / WebP / AVIF 等格式的压缩与尺寸调整，编解码全在浏览器里用 " +
+				"wasm 完成，图片不上传。装好后访问 http://<本机地址>:8085。" +
+				"注意：上游没有官方镜像（仓库里没有 Dockerfile），这里用的是社区镜像，" +
+				"只做静态文件托管，没有服务端逻辑。",
+			Category: "tool", Kind: KindCompose, Port: 8085,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 唯一一个没有官方镜像的条目，如实标注并固定版本号：
+			//   · 上游 GoogleChromeLabs/squoosh 仓库里没有任何 Dockerfile / 镜像发布
+			//     流程（`dev` 分支只有 codecs/*.Dockerfile，那是编译 wasm 编解码器用的）；
+			//   · 社区镜像里 pjmeca/squoosh 最新（2024-07 构建）、用 nginx 托管静态构建
+			//     （history 里可见 COPY app/build → /usr/share/nginx/html、rm sw.js、
+			//     CMD nginx），比 2022 年那批 npm run serve 的镜像干净；
+			//   · 固定 1.1.0 而不是 latest：这类无人维护的镜像不该跟着 tag 漂。
+			// arm64 证据（Docker Hub 经镜像站读同一份 index；两个 tag 的 arm64
+			// digest 相同）：
+			//   docker manifest inspect docker.1ms.run/pjmeca/squoosh:1.1.0
+			//   → linux/amd64、linux/arm64、linux/arm/v7
+			ComposeYAML: composeTemplate("squoosh", "pjmeca/squoosh:1.1.0", 8085, 80, `
+    restart: unless-stopped`),
+			DocsURL: "https://github.com/GoogleChromeLabs/squoosh",
+		},
 	}
 }
 
