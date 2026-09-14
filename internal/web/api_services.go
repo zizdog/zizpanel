@@ -643,7 +643,11 @@ func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request)
 		})
 }
 
-// handleQwenModels 返回两个 TTS 模型的下载与驻留状态。
+// handleQwenModels 返回 TTS 模型的下载与驻留状态。
+//
+// 2026-09-14 起模型清单里只有一个（1.7B-Base-8bit，用于音色克隆）——
+// 网站侧只支持自定义音色，预置音色已下线。返回的仍是**列表**，
+// 界面按列表渲染，以后清单再变不用改接口。
 func (s *Server) handleQwenModels(w http.ResponseWriter, r *http.Request) {
 	mgr := s.svcManager()
 	list := mgr.QwenModelsStatus(r.Context())

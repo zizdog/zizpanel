@@ -132,15 +132,13 @@ func stubModelWeights(t *testing.T, home, model string) {
 	}
 }
 
-// TestQwenWarmResidentLoadsBothModels 是这次需求的核心断言：
-// 服务重启后两个模型都变冷，守温必须把它们都补回驻留状态。
-// TestQwenWarmResidentLoadsBothModels 覆盖"内存宽裕"的情形。
+// TestQwenWarmResidentLoadsTheModel 是守温的核心断言：
+// 服务重启后模型变冷，守温必须把它补回驻留状态。
 //
-// 注意 policy 自 2026-09-14 起是**内存感知**的：16GB 机器只常驻默认模型
-// （两个 1.7B 都常驻约 10GB，会换页）。所以这里显式伪造一台 64GB 的机器。
-func TestQwenWarmResidentLoadsBothModels(t *testing.T) {
-	m, fake := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
-	m.qwenMemGBOverride = 64
+// 旧版是 TestQwenWarmResidentLoadsBothModels（双模型时代），
+// 随 2026-09-14 的单模型改动一起改名收窄：清单里只有一个模型。
+func TestQwenWarmResidentLoadsTheModel(t *testing.T) {
+	m, fake := fakeQwenManager(t, QwenModels[0].Name)
 	for _, mdl := range QwenModels {
 		stubModelWeights(t, m.opt.UserHome, mdl.Name)
 	}
@@ -169,37 +167,8 @@ func TestQwenWarmResidentLoadsBothModels(t *testing.T) {
 //
 // 这条锁住的是守温循环的代价：它每 2 分钟跑一次，如果每次都重新加载，
 // 就会把 GPU 一直占着，网站的合成请求反而被挤在后面。
-// TestQwenWarmResidentOnlyDefaultWhenMemoryTight 是上面那条的镜像：
-// 16GB 机器（本机与 mini 都是）只该常驻默认模型，另一个按需冷加载。
-func TestQwenWarmResidentOnlyDefaultWhenMemoryTight(t *testing.T) {
-	m, fake := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
-	m.qwenMemGBOverride = 16 // 与两台真机一致
-	for _, mdl := range QwenModels {
-		stubModelWeights(t, m.opt.UserHome, mdl.Name)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	warmed, failed := m.QwenWarmResident(ctx)
-	if failed != 0 {
-		t.Fatalf("不应有失败，failed=%d", failed)
-	}
-	if warmed != 1 {
-		t.Fatalf("内存吃紧时只应补载 1 个模型，实际 %d（同时常驻两个 1.7B 会把 16GB 机器拖进换页）", warmed)
-	}
-	if !fake.isLoaded(qwenDefaultModel) {
-		t.Errorf("应当常驻默认模型 %s", qwenDefaultModel)
-	}
-	for _, mdl := range QwenModels {
-		if mdl.Name != qwenDefaultModel && fake.isLoaded(mdl.Name) {
-			t.Errorf("内存吃紧时不该主动常驻 %s（它会按需冷加载）", mdl.Name)
-		}
-	}
-}
-
 func TestQwenWarmResidentIsNoopWhenResident(t *testing.T) {
-	m, fake := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
+	m, fake := fakeQwenManager(t, QwenModels[0].Name)
 	for _, mdl := range QwenModels {
 		stubModelWeights(t, m.opt.UserHome, mdl.Name)
 		fake.mu.Lock()
@@ -224,22 +193,19 @@ func TestQwenWarmResidentIsNoopWhenResident(t *testing.T) {
 // TestQwenWarmResidentSkipsUndownloaded 权重没下载的模型不能去加载。
 // 否则每次守温都会拿到一个难懂的加载失败，把日志刷满。
 func TestQwenWarmResidentSkipsUndownloaded(t *testing.T) {
-	m, fake := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
-	// 只给第一个模型造权重
-	stubModelWeights(t, m.opt.UserHome, QwenModels[0].Name)
+	// 假上游认识这个模型，但本机**没有下载权重** —— 这时不该去加载，
+	// 否则每次守温都会拿到一个难懂的加载失败，把日志刷满。
+	m, fake := fakeQwenManager(t, QwenModels[0].Name)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	warmed, failed := m.QwenWarmResident(ctx)
-	if warmed != 1 || failed != 0 {
-		t.Fatalf("应只补载已下载的那一个，实际 warmed=%d failed=%d", warmed, failed)
+	if warmed != 0 || failed != 0 {
+		t.Fatalf("权重没下载时应跳过（既不加载也不算失败），实际 warmed=%d failed=%d", warmed, failed)
 	}
-	if !fake.isLoaded(QwenModels[0].Name) {
-		t.Errorf("已下载的模型 %s 没有被加载", QwenModels[0].Name)
-	}
-	if fake.isLoaded(QwenModels[1].Name) {
-		t.Errorf("未下载的模型 %s 不该被加载", QwenModels[1].Name)
+	if fake.isLoaded(QwenModels[0].Name) {
+		t.Errorf("没有权重的模型 %s 不该被加载", QwenModels[0].Name)
 	}
 }
 
@@ -264,7 +230,7 @@ func TestQwenWarmResidentQuietWhenServiceDown(t *testing.T) {
 // 这里给 Manager 配一个真实的空数据库：repo 为 nil 时 qwenServiceRunning
 // 会提前返回，那样测到的只是一个"什么都没做"的空壳。
 func TestQwenKeepWarmStopsOnContext(t *testing.T) {
-	m, _ := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
+	m, _ := fakeQwenManager(t, QwenModels[0].Name)
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("打开临时数据库失败: %v", err)
@@ -294,11 +260,12 @@ func TestQwenKeepWarmStopsOnContext(t *testing.T) {
 
 // TestQwenUnloadStaleFreesOldModels 锁住"换模型后自动回收内存"。
 //
-// 2026-09-14 网站侧从 0.6B 换到 1.7B：老模型会一直占着内存（mlx-audio 没有淘汰），
-// 而两台机器都是 16GB（本机实测 swap 7GB/8GB）。所以守温循环里要顺手把
-// "已不在 QwenModels 清单里"的驻留模型卸掉 —— 下次换模型也不必人工重启服务。
+// 2026-09-14 网站侧只保留克隆（Base），CustomVoice 整体下线：老模型会一直占着
+// 内存（mlx-audio 没有淘汰机制），而两台机器都是 16GB（本机实测 swap 7GB/8GB）。
+// 所以守温循环里要顺手把"已不在 QwenModels 清单里"的驻留模型卸掉 ——
+// 这就是预置音色下线后把内存还回去的那一步，不必人工重启服务。
 func TestQwenUnloadStaleFreesOldModels(t *testing.T) {
-	stale := "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+	stale := "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
 	m, fake := fakeQwenManager(t, QwenModels[0].Name, stale)
 	for _, mdl := range QwenModels {
 		stubModelWeights(t, m.opt.UserHome, mdl.Name)
@@ -325,52 +292,5 @@ func TestQwenUnloadStaleFreesOldModels(t *testing.T) {
 	}
 	if !fake.isLoaded(QwenModels[0].Name) {
 		t.Error("清单里的模型不能被顺手卸掉")
-	}
-}
-
-// TestQwenEnforceSingleResidentKeepsDefaultOnly 锁住用户明确要求的策略：
-// "1.7B 只驻留 1 个，默认常驻克隆用的 Base"。
-//
-// 为什么必须强制：网站按请求切模型，只要两边都用过一次，两个 1.7B 就都在内存里，
-// 而 mlx-audio 没有淘汰机制。两台机器都是 16GB —— 实测两个都驻留时
-// 本机 swap 用到 7.3GB/8GB。
-func TestQwenEnforceSingleResidentKeepsDefaultOnly(t *testing.T) {
-	tight := func() (*Manager, *qwenFake) {
-		m, fake := fakeQwenManager(t, QwenModels[0].Name, QwenModels[1].Name)
-		m.qwenMemGBOverride = 16
-		fake.mu.Lock()
-		for _, mdl := range QwenModels {
-			fake.loaded[mdl.Name] = true
-		}
-		fake.mu.Unlock()
-		return m, fake
-	}
-
-	// 内存吃紧：只留默认模型
-	m, fake := tight()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	unloaded := m.QwenEnforceSingleResident(ctx)
-	if len(unloaded) != 1 {
-		t.Fatalf("应释放 1 个多余驻留的模型，实际 %v", unloaded)
-	}
-	if !fake.isLoaded(qwenDefaultModel) {
-		t.Error("默认（克隆 Base）模型必须保留")
-	}
-	for _, mdl := range QwenModels {
-		if mdl.Name != qwenDefaultModel && fake.isLoaded(mdl.Name) {
-			t.Errorf("内存吃紧时 %s 不该继续驻留", mdl.Name)
-		}
-	}
-
-	// 内存宽裕：不动（两个都驻留反而更快）
-	m2, fake2 := tight()
-	m2.qwenMemGBOverride = 64
-	unloaded2 := m2.QwenEnforceSingleResident(ctx)
-	if len(unloaded2) != 0 {
-		t.Errorf("内存宽裕时不该释放任何模型，实际 %v", unloaded2)
-	}
-	if !fake2.isLoaded(QwenModels[1].Name) {
-		t.Error("内存宽裕时另一个模型应继续驻留")
 	}
 }

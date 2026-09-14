@@ -100,37 +100,23 @@ func TestExistingReceiverHostReadsPlist(t *testing.T) {
 	}
 }
 
-// TestQwenWarmPolicyRespectsMemory 锁住"内存不够就只常驻一个模型"。
+// TestQwenWarmPolicyIsSingleModel 锁住 2026-09-14 定的模型策略。
 //
-// 背景：0.6B 时代两个模型都常驻约 4GB；换成 1.7B 后两个要 10GB 上下。
-// 本机与 mini 都是 16GB，再叠加 Docker/MySQL/Ollama，全常驻会把机器拖进换页
-// （实测本机 swap 曾用到 7GB/8GB）。交接文档的口径也是"吃紧就让它冷加载"。
-func TestQwenWarmPolicyRespectsMemory(t *testing.T) {
-	// 这两台真机都是 16GB → 不该尝试同时常驻两个 1.7B 模型
-	gb := memoryGB()
-	if gb > 0 && gb < qwenWarmAllMemGB {
-		m := NewManager(nil, Options{UserHome: t.TempDir(), UserName: "zizdog"})
-		if m.canWarmAllQwenModels() {
-			t.Errorf("本机 %dGB < %dGB，不该同时常驻两个模型（会把机器拖进换页）",
-				gb, qwenWarmAllMemGB)
-		}
-	} else {
-		t.Skipf("本机内存 %dGB，不适用于这条断言", gb)
+// 背景（usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md）：网站侧只支持自定义音色，
+// 预置音色整体下线，服务端只需要 1.7B-Base-8bit 一个模型；CustomVoice 与 0.6B
+// 的权重已从两台机器上删掉腾空间。
+//
+// 旧版这里断言的是"内存不够就只常驻一个模型"（双模型时代的守温策略）。
+// 现在清单里本来就只有一个模型，那条内存门槛逻辑连同它一起删掉了 ——
+// 留一条更直接的断言：清单里必须只有一个模型，且是克隆用的 Base。
+func TestQwenWarmPolicyIsSingleModel(t *testing.T) {
+	if len(QwenModels) != 1 {
+		t.Fatalf("清单里应只有一个模型（预置音色已下线），实际 %d 个", len(QwenModels))
 	}
-	// 门槛本身是常量，防止有人顺手调小到 16
-	if qwenWarmAllMemGB < 20 {
-		t.Errorf("门槛 %dGB 太低：两个 1.7B 常驻就要 ~10GB，留不出系统余量", qwenWarmAllMemGB)
+	if !strings.Contains(qwenDefaultModel, "1.7B-Base") {
+		t.Errorf("唯一的模型应是 1.7B-Base（克隆），实际 %s", qwenDefaultModel)
 	}
-	// 默认模型必须是克隆用的 Base（网站当前的主用法）
-	if !strings.Contains(qwenDefaultModel, "Base") {
-		t.Errorf("默认模型应仍是 Base（克隆是主用法），实际 %s", qwenDefaultModel)
+	if QwenModels[0].Name != qwenDefaultModel {
+		t.Errorf("清单里唯一的模型必须就是默认模型，实际 %s", QwenModels[0].Name)
 	}
-}
-
-// TestQwenWarmTargetsFallBackWithoutMemoryInfo：取不到内存信息时必须保守。
-func TestQwenWarmTargetsFallBackWithoutMemoryInfo(t *testing.T) {
-	m := NewManager(nil, Options{UserHome: t.TempDir(), UserName: "zizdog"})
-	// memoryGB() 依赖真机 sysctl，这里只断言"不 panic 且返回布尔"；
-	// 真正的保守分支在 canWarmAllQwenModels 里（gb<=0 → false）。
-	_ = m.canWarmAllQwenModels()
 }

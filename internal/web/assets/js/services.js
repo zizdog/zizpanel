@@ -777,13 +777,13 @@ export function newServiceModal(onDone, existing = null) {
 
 
 // ---------------------------------------------------------------------------
-//  Qwen3 TTS 的双模型切换
+//  Qwen3 TTS 的模型状态（常驻 / 已下载 / 未下载）
 //
-//  为什么要这个入口：Base 与 CustomVoice 能力**互斥** ——
-//  Base 能克隆音色但会静默忽略预置音色参数，CustomVoice 有 9 个预置音色
-//  但不会克隆。网站上「上传过音色就用克隆、没上传就用默认音色」要两全，
-//  就得两个模型都能用。而它们各自加载后都常驻内存（服务端没有淘汰机制），
-//  所以这里做成显式切换：加载目标、卸载其余，避免同时占约 10GB。
+//  2026-09-14 起网站侧只支持「自定义音色」（克隆），预置音色整体下线，
+//  所以服务端只有一个模型：1.7B-Base-8bit。这个入口保留的价值是两件事：
+//    · 看得见"模型到底在不在、驻没驻留"（服务挂掉时最需要看到它）
+//    · 手动**加载**（冷启动后不用等网站第一个请求）与**释放内存**（腾地方）
+//  它不再是"两个模型二选一"——清单里只有一个，界面按列表渲染，不做切换语义。
 // ---------------------------------------------------------------------------
 
 // qwenLaunchLabel 与服务端登记时用的 launchd 标签一致。
@@ -797,9 +797,9 @@ function openQwenModels(svc) {
   const body = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } }, [
     h('div', {
       style: { fontSize: '12px', color: 'var(--text-mute)', lineHeight: '1.6' },
-      text: '两个模型能力互斥：Base 负责音色克隆，CustomVoice 负责 9 个预置音色。' +
-        '实测两个都常驻内存约 4GB（16GB 机器上可用内存仍有 92%、无交换），' +
-        '所以默认两个都加载好，插件发来哪种请求都能立刻响应；需要腾内存时可单独释放。',
+      text: '网站侧插件现在只支持「自定义音色」（克隆），预置音色已下线，' +
+        '所以只需要 1.7B-Base 这一个模型（约 2.9GB）。常驻内存后第一次合成不用等冷加载；' +
+        '内存吃紧时可以释放，下次请求会自动重新加载（约 25 秒，不影响正确性）。',
     }),
     h('div', { id: 'qwen-model-list', style: { display: 'flex', flexDirection: 'column', gap: '8px' } }, [
       h('div', { style: { fontSize: '12px', color: 'var(--text-mute)' }, text: '读取中…' }),
@@ -863,22 +863,22 @@ function openQwenModels(svc) {
   }
 
   async function doSwitch(mdl, btn) {
-    // 首次加载要读约 2GB 权重，实测约 26 秒 —— 必须告知用户，否则会以为卡死。
+    // 首次加载要读约 2.9GB 权重，实测约 25 秒 —— 必须告知用户，否则会以为卡死。
     const okGo = await confirmBox(
-      '把「' + mdl.label + '」加载到内存？\n\n首次加载需读取约 2GB 权重，实测约 22-26 秒；' +
-      '完成前该服务无法推理。加载后另一个模型会保留，两者可同时使用。',
+      '把「' + mdl.label + '」加载到内存？\n\n首次加载需读取约 2.9GB 权重，实测约 25 秒；' +
+      '完成前该服务无法推理。加载后它会一直常驻，直到你显式释放。',
       { title: '加载模型', okText: '开始加载' }
     );
     if (!okGo) return;
     const old = btn.textContent;
     btn.disabled = true;
-    btn.textContent = '切换中，请稍候…';
+    btn.textContent = '加载中，请稍候…';
     try {
       await api.qwenSwitchModel(mdl.name);
       toast('已加载 ' + mdl.label, 'ok');
       await load();
     } catch (e) {
-      toast('切换失败：' + e.message, 'danger');
+      toast('加载失败：' + e.message, 'danger');
       btn.disabled = false;
       btn.textContent = old;
     }

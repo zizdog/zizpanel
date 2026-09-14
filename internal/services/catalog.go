@@ -119,8 +119,8 @@ func Catalog() []App {
 			ID: "qwen3tts", Name: "Qwen3 TTS（语音合成）", Icon: "🗣️",
 			Summary: "本地语音合成，支持音色克隆",
 			Description: "按 TtsVoice 插件的部署契约安装：Python 3.11 环境 + mlx-audio[server] " +
-				"+ 两个模型（Base 克隆 / CustomVoice 预置音色，各约 1.9GB）。" +
-				"两个模型都常驻内存，网站按请求里的 model 字段随时切换、无需重载。" +
+				"+ 1.7B-Base-8bit 模型（约 2.9GB，用于音色克隆）。" +
+				"网站侧插件现在只支持「自定义音色」，预置音色已下线，所以只需要这一个模型。" +
 				"可选择是否加鉴权；加了鉴权时 Qwen 只监听本机，" +
 				"对外由音色接收端（8899）提供带密钥的反向代理。",
 			Category: "ai", Kind: KindNative, PanelInstaller: "qwen3tts", ServiceLabel: "com.zizdog.qwen3tts",

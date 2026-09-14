@@ -989,35 +989,38 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 > 所以有官方 ghcr 镜像的项目（IT-Tools、MetaTube）优先写 ghcr 地址。
 > 选镜像前先确认该仓库能从本机真的拉到。
 
-### Qwen3 TTS：两个模型都必须常驻
+### Qwen3 TTS：只有一个模型（1.7B-Base-8bit，音色克隆）
 
-网站插件（TtsVoice）会**按每次请求体里的 `model` 字段**在两种变体之间切换：
-上传了音色样本用 `Base`（克隆），没上传用 `CustomVoice`（预置音色）。
-两者能力互斥，只装一个必然有一半是坏的，所以面板装的是**两个**。
+2026-09-14 起网站侧插件**只支持「自定义音色」（克隆）**，预置音色（CustomVoice）
+整体下线（见 `usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md`），所以服务端只需要
+**一个模型**：`mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit`。
 
-关于"要不要为了省内存互相驱逐"，结论来自读源码 + 真机实测，而不是估算：
-
-- mlx-audio 的 `ModelProvider.load_model` 就是一个**普通 dict**：
-  `if model_name not in self.models: self.models[model_name] = load_model(...)`，
-  没有 LRU、没有上限、没有 TTL，**只有显式 `DELETE /v1/models` 才会移除**。
-  所以交替请求不会互相挤掉，按请求切模型是安全的。
-- 但它**只活在进程内存里**：Qwen 服务一重启（重启机器、崩溃自愈、手动 kickstart），
-  两个模型全变冷。冷加载实测 **25 秒**，而热的时候同一句话只要 **2.1 秒** ——
-  叠加 30~60 秒的合成本身，会逼近网站插件那边的 60 秒超时，表现成"合成失败"。
-- 磁盘：每个 1.7B-8bit 模型 **2.9GB**（`hf` 缓存里有 blob + 快照软链）。
-- 内存：2026-09-14 起网站侧**统一用 1.7B**（预置音色 `1.7B-CustomVoice-8bit`、
-  克隆 `1.7B-Base-8bit`），0.6B 不再使用 —— 面板的模型登记也跟着换了，
-  否则"驻留模型"页面会把已经不用的 0.6B 当默认项。
-  两个 1.7B 同时驻留比 0.6B 明显占得多，**吃紧就让 Base 冷加载**（首次约 25 秒，不影响正确性）。
+- 面板的模型清单里因此只有这一条。这不是"省事"，而是**避免渲染出假选项**：
+  清单里留着 CustomVoice 的话，界面会显示一个可以点过去的模型，
+  而它的权重已经从两台机器上删掉腾空间了 —— 点它就是失败。
+  权重约 **2.9GB**（`hf` 缓存里是 blob + 快照软链）。
+- **Base 没到位整条链路一音频都出不来**（不是"降级到预置音色"，而是直接失败）。
+- 关于"要不要常驻"：结论来自读源码 + 真机实测，而不是估算 ——
+  mlx-audio 的 `ModelProvider.load_model` 就是一个**普通 dict**
+  （`if model_name not in self.models: ...`），没有 LRU、没有上限、没有 TTL，
+  **只有显式 `DELETE /v1/models` 才会移除**。但它只活在**进程内存**里：
+  服务一重启（重启机器、崩溃自愈、手动 kickstart）模型就变冷，
+  冷加载实测 **25 秒**，热的时候同一句话只要 **2.1 秒** —— 叠加 30~60 秒的合成本身，
+  会逼近网站插件那边的 60 秒超时，表现成"合成失败"。
   mlx 走内存映射，`ps` 的 RSS 常常只有几百 MB（权重按页换入），别拿 RSS 当占用。
 - 下载一律走**国内镜像**：`HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1`
   （不设后者，新版 huggingface_hub 会走 Xet CDN，实测下到一半报错）。
   面板自己的下载路径与写进 plist 的服务环境都用这两个值，见 `qwenHFMirror`。
 
-因此面板做两件事：安装时预热两个模型；**运行期每 2 分钟守温一次**
-（`StartQwenKeepWarm` → `QwenWarmResident`），发现哪个不在 `/v1/models` 里就补载哪个。
-在服务管理里手动重启 Qwen 后也会立即补载一次，不必等下一轮。
-界面上仍保留了显式「卸载」——同时跑 Docker、数据库的机器上，用户可能确实想腾内存。
+因此面板做两件事：安装时预热模型；**运行期每 2 分钟守温一次**
+（`StartQwenKeepWarm` → `QwenWarmResident`），发现它不在 `/v1/models` 里就补载。
+守温里还有一步 `QwenUnloadStale`：把**驻留在内存、但已不在清单里**的模型卸掉 ——
+这正是预置音色下线后把 CustomVoice 占的内存还回去的那一步，
+以后换模型也不必人工重启服务。界面上仍保留显式「释放内存」（同时跑 Docker、
+数据库的机器上用户可能确实想腾地方）。
+
+> 已经被删掉、不要再加回来的：`…1.7B-CustomVoice-8bit`、`…1.7B-CustomVoice-4bit`、
+> `…0.6B-CustomVoice-8bit`、`…0.6B-Base-8bit`（`TestQwenManifestDropsRetiredModels` 锁死）。
 
 接收端（8899）自 **v1.3.0** 起还提供**任务队列**（`/jobs/*`）：网站把分块后的文本提交过来，
 由本机一个常驻 worker **串行**逐块合成、退化自动重试、拼成整段音频，网站只轮询进度与下载。

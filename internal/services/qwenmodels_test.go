@@ -6,32 +6,47 @@ import (
 	"testing"
 )
 
-// TestQwenModelsCoverBothCapabilities 是这次需求的核心断言：
-// 必须同时提供「克隆」与「预置音色」两种能力。
+// TestQwenModelsSingleCloneModel 是这次改动（2026-09-14）的核心断言：
+// 清单里**只有一个**模型，且是克隆用的 1.7B-Base-8bit。
 //
-// 背景：这两个模型能力互斥 —— Base 会**静默忽略** voice 参数（不报错，
-// 只是不生效），CustomVoice 则不会克隆。只装一个的话，网站上
-// 「上传了音色用克隆、否则用默认音色」必然有一半是坏的，而且坏得很难排查。
-func TestQwenModelsCoverBothCapabilities(t *testing.T) {
-	roles := map[string]string{}
-	for _, m := range QwenModels {
-		roles[m.Role] = m.Name
+// 背景：网站侧插件现在只支持「自定义音色」（克隆），预置音色（CustomVoice）
+// 整体下线，对应的权重也从两台机器上删掉腾空间了。所以面板不能再列出
+// CustomVoice —— 那会渲染出一个"看起来能切过去"的假选项，点它就是失败。
+//
+// 旧的 TestQwenModelsCoverBothCapabilities（要求 clone + preset 两种能力都在）
+// 随这次需求一起删掉了：它锁的是已经作废的契约。
+func TestQwenModelsSingleCloneModel(t *testing.T) {
+	if len(QwenModels) != 1 {
+		t.Fatalf("模型清单里应恰好 1 个模型（预置音色已下线），实际 %d 个", len(QwenModels))
 	}
-	if roles["clone"] == "" {
-		t.Error("缺少克隆模型（Base）")
+	m := QwenModels[0]
+	if m.Role != "clone" {
+		t.Errorf("唯一的模型必须是克隆用的（role=clone），实际 role=%q", m.Role)
 	}
-	if roles["preset"] == "" {
-		t.Error("缺少预置音色模型（CustomVoice）")
+	if m.Name != qwenDefaultModel {
+		t.Errorf("唯一的模型必须就是默认模型 %s，实际 %s", qwenDefaultModel, m.Name)
 	}
-	if len(QwenModels) != 2 {
-		t.Errorf("应恰好两个模型，实际 %d 个", len(QwenModels))
+	if !strings.Contains(m.Name, "1.7B-Base") {
+		t.Errorf("模型名应指向 1.7B-Base，实际 %s", m.Name)
 	}
-	for _, m := range QwenModels {
-		if m.Name == "" || m.Label == "" || m.Note == "" {
-			t.Errorf("模型字段不完整: %+v", m)
-		}
-		if !strings.Contains(m.Name, "Qwen3-TTS") {
-			t.Errorf("模型名不像 Qwen3-TTS: %s", m.Name)
+	if m.Name == "" || m.Label == "" || m.Note == "" {
+		t.Errorf("模型字段不完整: %+v", m)
+	}
+	if !strings.Contains(m.Name, "Qwen3-TTS") {
+		t.Errorf("模型名不像 Qwen3-TTS: %s", m.Name)
+	}
+}
+
+// TestQwenManifestDropsRetiredModels 防止有人把已经下线的模型加回清单。
+//
+// 这些名字对应的权重在真机上已经删了（腾空间）；一旦重新出现在清单里，
+// 界面会显示"未下载"、用户点"加载"会失败，而网站侧根本不会请求它们。
+func TestQwenManifestDropsRetiredModels(t *testing.T) {
+	for _, mdl := range QwenModels {
+		for _, banned := range []string{"CustomVoice", "0.6B"} {
+			if strings.Contains(mdl.Name, banned) {
+				t.Errorf("清单里不应再有 %s 模型（网站侧已下线、权重已删）: %s", banned, mdl.Name)
+			}
 		}
 	}
 }

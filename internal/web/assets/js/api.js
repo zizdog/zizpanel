@@ -186,8 +186,9 @@ export const api = {
   // 更换音色接收端共享密钥。token 留空 = 让面板生成一个新的随机密钥。
   changeReceiverToken: (token) => request('POST', `${API_BASE}/voice/receiver/token`, { token: token || '' }),
 
-  // Qwen3 TTS 的双模型切换。
-  // Base 与 CustomVoice 能力互斥（克隆 vs 预置音色），两个都要装、按需切换。
+  // Qwen3 TTS 的模型状态。
+  // 2026-09-14 起只有一个模型（1.7B-Base-8bit，音色克隆）：网站侧预置音色下线。
+  // switch 现在等于"加载到内存"，unload 是"释放内存"（下次请求会自动重新加载）。
   qwenModels: () => request('GET', `${API_BASE}/qwen/models`),
   qwenSwitchModel: (name) => request('POST', `${API_BASE}/qwen/model`, { name }),
   qwenUnloadModel: (name) => request('DELETE', `${API_BASE}/qwen/model?name=${encodeURIComponent(name)}`),
