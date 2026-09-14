@@ -184,6 +184,95 @@ def main():
     mgr.cancel(fresh["job_id"])
     c.ok("重复 cancel 幂等", mgr.is_cancelled(fresh["job_id"]) is True)
 
+    # ================= v1.4.0 =================
+    print("\n【v1.4.0 normalize_sampling：缺省/部分/脏值】")
+    c.ok("None → 全默认",
+         m.normalize_sampling(None) == {"temperature": 0.7, "top_p": 0.9, "top_k": 40,
+                                        "repetition_penalty": 1.05},
+         m.normalize_sampling(None))
+    got = m.normalize_sampling({"temperature": 0.3})
+    c.ok("只给 temperature → 其余补默认",
+         got["temperature"] == 0.3 and got["top_k"] == 40 and got["top_p"] == 0.9, got)
+    got = m.normalize_sampling({"top_k": "40", "temperature": True, "top_p": None, "repetition_penalty": 1})
+    c.ok("脏值不采用（字符串/bool/None 一律忽略，用默认）",
+         got["top_k"] == 40 and got["temperature"] == 0.7 and got["top_p"] == 0.9
+         and got["repetition_penalty"] == 1.0, got)
+    got = m.normalize_sampling({"top_k": 12.9})
+    c.ok("top_k 取整", got["top_k"] == 12 and isinstance(got["top_k"], int), got)
+    got = m.normalize_sampling({"temperature": 1})
+    c.ok("temperature 归一成浮点", isinstance(got["temperature"], float), got)
+
+    print("\n【v1.4.0 wav 的时长换算与退化判定（字节率 48000、先减 44 字节头）】")
+    c.ok("1 秒 wav（48000 字节 + 44 头）≈ 1.0 秒",
+         abs(m.audio_seconds(48044, "wav") - 1.0) < 1e-9, m.audio_seconds(48044, "wav"))
+    c.ok("只有头 → 0 秒（不会因为减成负数而崩）",
+         m.audio_seconds(44, "wav") == 0.0 and m.audio_seconds(10, "wav") == 0.0)
+    c.ok("mp3 口径不变（16000）", m.audio_seconds(16000, "mp3") == 1.0)
+    # 判据线：cap = 400*0.08 = 32 秒；wav 需要 32*0.95*48000 + 44 字节
+    edge_wav = int(32 * 0.95 * 48000) + 44
+    c.ok("wav 正好在判据线上 → 退化", m.is_degenerate(edge_wav, 400, "wav") is True)
+    c.ok("wav 差 1 字节 → 不退化", m.is_degenerate(edge_wav - 1, 400, "wav") is False)
+    # 不减去文件头的话，判据线会落在 1459200（= 30.4 秒 × 48000）；
+    # 正确的逻辑在这个长度上应当判"不退化"（真实时长 30.3994 秒）。
+    no_hdr_edge = int(32 * 0.95 * 48000)
+    c.ok("少减 44 字节头会把「刚好差一点」的块误判成退化（锁住这个坑）",
+         m.is_degenerate(no_hdr_edge, 400, "wav") is False
+         and no_hdr_edge / 48000.0 >= 32 * 0.95 - 1e-9,
+         (m.is_degenerate(no_hdr_edge, 400, "wav"), no_hdr_edge / 48000.0))
+
+    print("\n【v1.4.0 merge_chunks：wav 去头拼接再补新头】")
+    import wave as _wave
+    d = tempfile.mkdtemp(prefix="zpwav-")
+    paths = []
+    pcm_all = b""
+    for i, n in enumerate((1000, 1500, 500)):
+        frames = bytes(((i * 7 + k) % 256) for k in range(n * 2))   # 16bit 单声道
+        pcm_all += frames
+        p = os.path.join(d, "%d.wav" % i)
+        with _wave.open(p, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(frames)
+        paths.append(p)
+    merged = m.merge_chunks(paths, "wav")
+    mp = os.path.join(d, "merged.wav")
+    with open(mp, "wb") as fh:
+        fh.write(merged)
+    with _wave.open(mp, "rb") as w:
+        c.ok("拼出来的 wav 能被标准库读（头合法）", True)
+        c.ok("采样率/位深/声道保持 24000/2/1",
+             (w.getframerate(), w.getsampwidth(), w.getnchannels()) == (24000, 2, 1),
+             (w.getframerate(), w.getsampwidth(), w.getnchannels()))
+        c.ok("帧数是各块之和（%d）" % (3000), w.getnframes() == 3000, w.getnframes())
+        c.ok("纯音频数据逐字节等于各块相加", w.readframes(3000) == pcm_all)
+    c.ok("只保留一个文件头（不是简单相接）",
+         merged.count(b"RIFF") == 1 and len(merged) == 44 + len(pcm_all), len(merged))
+    c.ok("mp3 路径仍是直接相接",
+         m.merge_chunks([paths[0], paths[1]], "mp3")
+         == open(paths[0], "rb").read() + open(paths[1], "rb").read())
+
+    # 子块按偶数字节对齐：塞一个奇数长度的 LIST 块，解析不能错位
+    odd = bytearray()
+    with open(paths[0], "rb") as fh:
+        raw = fh.read()
+    fmt_body = raw[20:20 + int.from_bytes(raw[16:20], "little")]
+    pcm0 = raw[44:]
+    odd += b"RIFF" + b"\x00\x00\x00\x00" + b"WAVE"
+    odd += b"fmt " + len(fmt_body).to_bytes(4, "little") + fmt_body
+    odd += b"LIST" + (5).to_bytes(4, "little") + b"abcde" + b"\x00"      # 奇数长度 + 填充字节
+    odd += b"data" + len(pcm0).to_bytes(4, "little") + pcm0
+    odd_path = os.path.join(d, "odd.wav")
+    with open(odd_path, "wb") as fh:
+        fh.write(bytes(odd))
+    merged_odd = m.merge_chunks([odd_path], "wav")
+    with open(os.path.join(d, "odd-out.wav"), "wb") as fh:
+        fh.write(merged_odd)
+    with _wave.open(os.path.join(d, "odd-out.wav"), "rb") as w:
+        c.ok("奇数长度子块后的 data 仍能正确解析（按偶数对齐）",
+             w.getnframes() == 1000 and w.readframes(1000) == pcm0, w.getnframes())
+    shutil.rmtree(d, ignore_errors=True)
+
     shutil.rmtree(work, ignore_errors=True)
 
     print("\n" + ("全部通过 ✅" if not c.fails else "存在失败项 ❌ %s" % c.fails))

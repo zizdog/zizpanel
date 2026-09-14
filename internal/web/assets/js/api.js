@@ -183,6 +183,8 @@ export const api = {
   installQwenTTS: (opts) => request('POST', `${API_BASE}/market/install-qwentts`, opts || {}),
   installVoiceReceiver: (opts) => request('POST', `${API_BASE}/market/install-voicereceiver`, opts || {}),
   installIOPaint: () => request('POST', `${API_BASE}/market/install-iopaint`, {}),
+  // 更换音色接收端共享密钥。token 留空 = 让面板生成一个新的随机密钥。
+  changeReceiverToken: (token) => request('POST', `${API_BASE}/voice/receiver/token`, { token: token || '' }),
 
   // Qwen3 TTS 的双模型切换。
   // Base 与 CustomVoice 能力互斥（克隆 vs 预置音色），两个都要装、按需切换。

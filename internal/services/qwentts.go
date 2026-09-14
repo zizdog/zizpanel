@@ -77,13 +77,13 @@ type QwenModel struct {
 // QwenModels 是两个可用模型。顺序即界面顺序，第一个是默认。
 var QwenModels = []QwenModel{
 	{
-		Name:  "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
+		Name:  "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
 		Role:  "clone",
 		Label: "Base（音色克隆）",
 		Note:  "支持上传参考音频克隆音色；会静默忽略 voice 预置音色参数",
 	},
 	{
-		Name:  "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+		Name:  "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
 		Role:  "preset",
 		Label: "CustomVoice（预置音色）",
 		Note:  "支持 9 个预置音色（vivian/serena/ryan/aiden/eric/dylan/uncle_fu/ono_anna/sohee）；不支持克隆",
@@ -91,7 +91,11 @@ var QwenModels = []QwenModel{
 }
 
 // qwenDefaultModel 是插件默认该填的那个：克隆是主用法，且历史配置都是它。
-const qwenDefaultModel = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+//
+// 2026-09-14 起网站侧全面切到 1.7B（见 usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md），
+// 0.6B 不再使用 —— 面板这里必须跟着改，否则面板的"驻留模型"页面会把已经不用的
+// 0.6B 当成默认项，用户点了等于切回旧模型。
+const qwenDefaultModel = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
 
 const (
 	qwenPort      = 8880
@@ -100,7 +104,15 @@ const (
 	qwenPipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
 	qwenHFMirror  = "https://hf-mirror.com"
 	qwenMinDiskGB = 10
-	qwenMinMemGB  = 15
+	// qwenWarmAllMemGB 是"允许把**两个**模型都常驻"的内存门槛。
+	//
+	// 为什么需要它：0.6B 时代两个模型都常驻约 4GB，16GB 机器很宽裕；
+	// 2026-09-14 换成 1.7B 之后两个都要 10GB 上下，再叠加 Docker / MySQL /
+	// Ollama / 面板自身，16GB 的机器会开始换页（实测本机 swap 已用 7GB/8GB）。
+	// 交接文档的口径也是"吃紧就让它冷加载（首次约 25 秒，不影响正确性）"。
+	// 低于这个门槛就只常驻**一个**（默认那个，克隆是主用法），其余的按需冷加载。
+	qwenWarmAllMemGB = 24
+	qwenMinMemGB     = 15
 )
 
 // QwenLabel 是 Qwen 服务的 launchd 标签。别的包（如 web 的服务操作）
@@ -750,6 +762,87 @@ func (m *Manager) UnloadQwenModel(ctx context.Context, name string) error {
 	return nil
 }
 
+// QwenEnforceSingleResident 在内存不宽裕的机器上强制"只驻留一个模型"。
+//
+// 策略来自用户明确要求（2026-09-14）：**1.7B 只驻留 1 个，默认常驻克隆用的 Base。**
+// 为什么必须"强制"而不只是"不主动预热"：网站按请求切模型（上传过样本走 Base、
+// 否则走 CustomVoice），只要两边都用过一次，两个 1.7B 就都会留在内存里 ——
+// mlx-audio **没有淘汰机制**，只有显式 DELETE 才释放。两台机器都是 16GB，
+// 实测两个 1.7B 常驻时本机 swap 用到 7.3GB/8GB，已经明显换页。
+//
+// 内存宽裕（≥ qwenWarmAllMemGB）的机器不动：那时候两个都常驻反而更快。
+// 被卸掉的那个不会"坏"——下次请求会冷加载（约 25 秒），交接文档明确接受这一点。
+func (m *Manager) QwenEnforceSingleResident(ctx context.Context) (unloaded []string) {
+	if m.canWarmAllQwenModels() {
+		return nil
+	}
+	loaded, err := m.qwenLoadedModels(ctx)
+	if err != nil {
+		return nil
+	}
+	if len(loaded) <= 1 {
+		return nil // 0 或 1 个驻留：没什么可省的
+	}
+	if !loaded[qwenDefaultModel] {
+		// 默认模型不在驻留集合里：不乱卸。调用点会先补载默认模型，
+		// 下一轮再走到这里自然就会把多余的那个清掉 ——
+		// 立刻卸会在"唯一能用的模型"上开天窗。
+		return nil
+	}
+	for name := range loaded {
+		if name == qwenDefaultModel {
+			continue
+		}
+		if _, err := m.qwenAPI(ctx, http.MethodDelete,
+			"/v1/models?model_name="+url.QueryEscape(name), time.Minute); err != nil {
+			qwenLog.Warn("释放多余驻留的模型 %s 失败: %v", name, err)
+			continue
+		}
+		unloaded = append(unloaded, name)
+	}
+	if len(unloaded) > 0 {
+		qwenLog.Info("只保留 1 个常驻模型（内存吃紧）：已释放 %s，保留 %s",
+			strings.Join(unloaded, ", "), qwenDefaultModel)
+	}
+	return unloaded
+}
+
+// QwenUnloadStale 释放"驻留在内存里、但已不在面板模型清单里"的模型。
+//
+// 为什么需要：模型清单会随网站侧升级而变（2026-09-14 从 0.6B 换成 1.7B）。
+// 老模型仍然占着内存，而 mlx-audio 没有淘汰机制 —— 只有显式 DELETE 才释放。
+// 两台机器都是 16GB，本机实测 swap 用到 7GB/8GB，把两个已经不用的 0.6B
+// （约 4GB）还回去是有意义的；而且**下次换模型也会自动清理**，不用人工重启服务。
+//
+// 只动"不在 QwenModels 里"的模型：清单内的模型无论如何不碰（那是我们自己的策略）。
+func (m *Manager) QwenUnloadStale(ctx context.Context) (unloaded []string, failed int) {
+	loaded, err := m.qwenLoadedModels(ctx)
+	if err != nil {
+		return nil, 0
+	}
+	managed := map[string]bool{}
+	for _, mdl := range QwenModels {
+		managed[mdl.Name] = true
+	}
+	for name := range loaded {
+		if managed[name] {
+			continue
+		}
+		if _, err := m.qwenAPI(ctx, http.MethodDelete,
+			"/v1/models?model_name="+url.QueryEscape(name), time.Minute); err != nil {
+			qwenLog.Warn("释放已不在清单里的模型 %s 失败: %v", name, err)
+			failed++
+			continue
+		}
+		unloaded = append(unloaded, name)
+	}
+	if len(unloaded) > 0 {
+		qwenLog.Info("已释放不再使用的模型：%s（清单里已经没有它们了）",
+			strings.Join(unloaded, ", "))
+	}
+	return unloaded, failed
+}
+
 // EnsureQwenModelsLoaded 把两个模型都加载好。
 //
 // 部署完成后立刻预热：这样网站上第一次请求（无论要克隆还是预置音色）
@@ -804,7 +897,21 @@ func (m *Manager) QwenWarmResident(ctx context.Context) (warmed, failed int) {
 		// 不该每 5 分钟往日志里塞一条错误。
 		return 0, 0
 	}
-	for _, mdl := range QwenModels {
+	targets := QwenModels
+	if !m.canWarmAllQwenModels() {
+		// 内存吃紧：只保证**默认模型**常驻（网站"没上传样本就用预置音色"那条路
+		// 仍会冷加载一次 CustomVoice，约 25 秒）。已经因为真实请求而驻留的模型
+		// 不会被卸载 —— 这里只是不再**主动**把两个都塞进去。
+		for _, mdl := range QwenModels {
+			if mdl.Name == qwenDefaultModel {
+				targets = []QwenModel{mdl}
+				break
+			}
+		}
+		qwenLog.Info("守温：内存 %dGB 低于 %dGB，只常驻 %s（另一个按需冷加载）",
+			memoryGB(), qwenWarmAllMemGB, qwenDefaultModel)
+	}
+	for _, mdl := range targets {
 		if loaded[mdl.Name] || !modelDownloaded(m.opt.UserHome, mdl.Name) {
 			continue
 		}
@@ -816,6 +923,24 @@ func (m *Manager) QwenWarmResident(ctx context.Context) (warmed, failed int) {
 		warmed++
 	}
 	return warmed, failed
+}
+
+// canWarmAllQwenModels 判断这台机器是否宽裕到可以同时常驻两个模型。
+//
+// 取不到内存信息时**保守**返回 false：宁可让第二个模型冷加载，
+// 也不要把一台内存不明的机器（可能是 16GB 的笔记本）推进换页。
+func (m *Manager) canWarmAllQwenModels() bool {
+	// 只有测试会设置它（与 qwenPortOverride 同一风格）：
+	// 阈值逻辑必须能在"16GB 机器"和"64GB 机器"两种情形下都被断言到，
+	// 而真机的内存是固定的。
+	gb := memoryGB()
+	if m.qwenMemGBOverride > 0 {
+		gb = m.qwenMemGBOverride
+	}
+	if gb <= 0 {
+		return false
+	}
+	return gb >= qwenWarmAllMemGB
 }
 
 // qwenServiceRunning 判断面板登记的 Qwen 服务当前是否真的在跑。
@@ -863,7 +988,15 @@ func (m *Manager) StartQwenKeepWarm(ctx context.Context) {
 		if !m.qwenServiceRunning(ctx) {
 			return
 		}
+		// 顺序有讲究：
+		//  ① 先清"已不在清单里"的旧模型（换模型后自动回收内存）
+		//  ② 再补载默认模型 —— 必须在"强制单驻留"**之前**，
+		//     否则会出现"先卸掉唯一驻留的模型、再慢慢加载"的空窗期，
+		//     这期间网站请求必然冷加载。
+		//  ③ 最后把多余的那个卸掉（内存吃紧时只留默认模型）
+		m.QwenUnloadStale(ctx)
 		warmed, _ := m.QwenWarmResident(ctx)
+		m.QwenEnforceSingleResident(ctx)
 		if warmed > 0 {
 			qwenLog.Info("守温：已补载 %d 个模型（网站下一个请求不必再等冷加载）", warmed)
 		}

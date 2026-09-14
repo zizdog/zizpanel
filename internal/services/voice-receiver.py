@@ -37,12 +37,19 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
 【兼容性】v1.2.0 相对 v1.1.0 只做**增量**：原有的路径、参数名、响应字段、
 状态码全部保持不变，所以还没升级的插件调用它不会有任何行为变化。
 
+【v1.4.0 增量】① 支持 response_format（wav/mp3，wav 拼整段要去头补头）；
+② sampling 四个参数（temperature/top_p/top_k/repetition_penalty）随块透传给上游，
+缺省 0.7/0.9/40/1.05 —— 不传上游 repetition_penalty 是 1.0，长句会整段变噪音；
+③ 退化判定的字节率按格式走（wav 48000 且先减 44 字节头）。
+**不做变速**：变速由网站用 ffmpeg 在下载后做，这里再变会双重变速。
+见 usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md。
+
 【v1.3.0 新增 /jobs/*】把「任务队列 + 逐块合成」搬到本机（契约见网站侧
 usr/plugins/TtsVoice/SPEC-TO-MINI-job-queue.md），这样**浏览器/网站关掉任务也能跑完**：
 
     POST   /jobs              提交任务（分块由网站负责，这里只逐块合成）
     GET    /jobs/{id}         查进度（要轻要快，网站会频繁轮询）
-    GET    /jobs/{id}/audio   下载拼好的整段 mp3（支持 Range）
+    GET    /jobs/{id}/audio   下载拼好的整段（wav/mp3，支持 Range）
     DELETE /jobs/{id}         取消 / 清理（幂等）
     GET    /jobs              队列总览（运维排查用）
 
@@ -79,7 +86,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
@@ -107,10 +114,48 @@ HOP_BY_HOP = {
 #   退化 ⟺ clean_bytes / 16000 >= cap_seconds * 0.95
 #
 # 注意用**浮点**比较，不要用整除：PHP 那边是浮点，整除会把边界值判反。
-BYTES_PER_SECOND = 16000
+BYTES_PER_SECOND = 16000        # mp3 128kbps 的字节率（名字不变，与网站侧口径一致）
+# wav 是 24kHz / 16bit / 单声道 = 48000 字节/秒；算时长时**要先减掉 44 字节文件头**，
+# 否则每块都会算长一点点（短块上足以把退化判定的边界判反）。v1.4.0 新增。
+BYTES_PER_SECOND_WAV = 48000
+WAV_HEADER_BYTES = 44
 DEGENERATE_RATIO = 0.95
 SECONDS_PER_TOKEN = 0.08
 SYNTH_ATTEMPTS = 3
+
+# ---------------- 采样参数（v1.4.0）----------------
+#
+# 网站现在随任务下发 sampling（见 HANDOFF-TO-PANEL-1.7B.md 第 2 条）：
+# Qwen 服务端默认把 repetition_penalty 压成 1.0（等于关掉重复惩罚），
+# 长句、中英数混排的段落会**整段变成噪音**（网站侧实测：不加 4 次只正常 1 次，
+# 加了 4 次全正常）。所以这 4 个数必须原样透传给 /v1/audio/speech。
+#
+# 老请求不带这个字段 —— 那就用同一组默认值（"有则用、无则默认"），
+# 这样 v1.3.0 的调用方不需要任何改动、也不会因为缺字段而退化。
+DEFAULT_SAMPLING = {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 40,
+    "repetition_penalty": 1.05,
+}
+_SAMPLING_INT_KEYS = ("top_k",)
+
+
+def normalize_sampling(raw):
+    '''
+    把请求里的 sampling 归一成那 4 个键：缺的补默认值，非数值一律忽略。
+
+    只认数值（bool 不算）—— 宁可用默认值，也不要把字符串塞进上游请求体。
+    top_k 是整数，其余按浮点。
+    '''
+    out = dict(DEFAULT_SAMPLING)
+    if isinstance(raw, dict):
+        for key in DEFAULT_SAMPLING:
+            value = raw.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            out[key] = int(value) if key in _SAMPLING_INT_KEYS else float(value)
+    return out
 
 # 单块合成的超时。worker 走 127.0.0.1，不受 nginx 60s 限制
 JOB_CHUNK_TIMEOUT = 300
@@ -265,18 +310,67 @@ def strip_id3(data):
     return data
 
 
-def is_degenerate(clean_len, max_tokens):
+def audio_seconds(num_bytes, ext="mp3"):
+    """按格式把交付字节数换算成秒数（wav 要先减掉 44 字节文件头）。"""
+    if ext == "wav":
+        return max(0, num_bytes - WAV_HEADER_BYTES) / float(BYTES_PER_SECOND_WAV)
+    return num_bytes / float(BYTES_PER_SECOND)
+
+
+def is_degenerate(clean_len, max_tokens, ext="mp3"):
     """
     与网站 Providers::synthesizeChunk() 同一个判据。
 
     退化时输出的是整段静音，时长会**正好**顶到 max_tokens 换算的上限，
     所以这个判据很干净：不是「超过经验值」，而是「撞到硬上限」。
+
+    ext 决定字节率：mp3 16000；wav 48000 且要先减掉文件头。
     """
     if max_tokens <= 0:
         return False
-    est_seconds = clean_len / float(BYTES_PER_SECOND)
+    est_seconds = audio_seconds(clean_len, ext)
     cap_seconds = max_tokens * SECONDS_PER_TOKEN
     return est_seconds >= cap_seconds * DEGENERATE_RATIO
+
+
+def merge_chunks(paths, ext="mp3"):
+    """
+    把各块拼成整段。两种格式的差别是这次升级最容易错的地方：
+
+      · mp3：首尾相接就行（每块都是纯音频帧，ID3 已在 _synth_chunk 里剥掉）。
+      · wav：**每块都自带 44 字节文件头，不能直接接** —— 直接接的话第二块起
+        会夹一个 RIFF 头，播放器（和网站的时长换算）都会错。
+        做法：逐块解析 RIFF 子块，收下第一个 "fmt " 与所有 "data" 的纯音频，
+        最后补一个**新的**头。子块按偶数字节对齐（sz 为奇数时后面有一字节填充）。
+    """
+    if ext != "wav":
+        parts = []
+        for path in paths:
+            with open(path, "rb") as fh:
+                parts.append(fh.read())
+        return b"".join(parts)
+
+    fmt = None
+    pcm = b""
+    for path in paths:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        off = 12                      # 跳过 "RIFF" + 长度 + "WAVE"
+        while off + 8 <= len(data):
+            cid = data[off:off + 4]
+            size = int.from_bytes(data[off + 4:off + 8], "little")
+            body = data[off + 8:off + 8 + size]
+            if cid == b"fmt " and fmt is None:
+                fmt = body
+            elif cid == b"data":
+                pcm += body
+            off += 8 + size + (size % 2)      # 子块按偶数字节对齐
+    if fmt is None:
+        raise ValueError("没有找到 wav 的 fmt 子块（上游返回的可能不是合法 wav）")
+    hdr = b"WAVE" + b"fmt " + len(fmt).to_bytes(4, "little") + fmt
+    hdr += b"\x00" if len(fmt) % 2 else b""
+    hdr += b"data" + len(pcm).to_bytes(4, "little")
+    return b"RIFF" + len(hdr + pcm).to_bytes(4, "little") + hdr + pcm
 
 
 def atomic_write(path, data):
@@ -329,8 +423,19 @@ class JobManager:
     def chunk_dir(self, job_id):
         return os.path.join(self.dir, job_id)
 
-    def final_path(self, job_id):
-        return os.path.join(self.chunk_dir(job_id), "final.mp3")
+    def job_ext(self, job):
+        """交付格式的扩展名。只认 wav/mp3，别的一律按 mp3。"""
+        fmt = str((job or {}).get("response_format") or "mp3").lower()
+        return "wav" if fmt == "wav" else "mp3"
+
+    def chunk_path(self, job, idx):
+        """单块文件路径：扩展名跟着格式走，wav 块自带 44 字节头。"""
+        return os.path.join(self.chunk_dir(job.get("job_id")), "%d.%s" % (idx, self.job_ext(job)))
+
+    def final_path(self, job):
+        """整段成品路径。参数从 job_id 改成 job：文件名要跟着格式走（不再写死 final.mp3）。"""
+        job_id = job.get("job_id") if isinstance(job, dict) else str(job)
+        return os.path.join(self.chunk_dir(job_id), "final.%s" % self.job_ext(job))
 
     # ---------- 状态读写 ----------
 
@@ -430,6 +535,8 @@ class JobManager:
             "ref_audio": ref_audio,
             "ref_text": str(payload.get("ref_text") or ""),
             "response_format": str(payload.get("response_format") or "mp3") or "mp3",
+            # 采样参数随任务下发（v1.4.0）：缺省就是那组默认值，见 DEFAULT_SAMPLING
+            "sampling": normalize_sampling(payload.get("sampling")),
             "total": len(chunks),
             "done": 0,
             "chunk_bytes": [],
@@ -610,7 +717,7 @@ class JobManager:
                 log("作业 %s 失败：%s" % (job_id, job["error"]))
                 return
 
-            atomic_write(os.path.join(self.chunk_dir(job_id), "%d.mp3" % idx), audio)
+            atomic_write(self.chunk_path(job, idx), audio)
             chunk_bytes.append(len(audio))
             attempts_all.append(attempts)
             done = idx + 1
@@ -621,34 +728,45 @@ class JobManager:
             log("作业 %s 进度 %d/%d（%d 字节，尝试 %d 次）"
                 % (job_id, done, len(chunks), len(audio), attempts))
 
-        # 全部完成：拼接成 final.mp3
-        parts = []
-        for i in range(len(chunks)):
-            p = os.path.join(self.chunk_dir(job_id), "%d.mp3" % i)
-            try:
-                with open(p, "rb") as fh:
-                    parts.append(fh.read())
-            except OSError as exc:
+        # 全部完成：拼接成整段（分格式，见 merge_chunks）
+        paths = [self.chunk_path(job, i) for i in range(len(chunks))]
+        for i, p in enumerate(paths):
+            if not os.path.exists(p):
                 job["status"] = JOB_FAILED
-                job["error"] = "拼接时读不到第 %d 块：%s" % (i + 1, exc)
+                job["error"] = "拼接时读不到第 %d 块：%s" % (i + 1, p)
                 self.save(job)
                 return
-        atomic_write(self.final_path(job_id), b"".join(parts))
+        try:
+            merged = merge_chunks(paths, self.job_ext(job))
+        except Exception as exc:      # noqa: BLE001 - 拼不出来必须如实报错，不能交付半个文件
+            job["status"] = JOB_FAILED
+            job["error"] = "拼接失败：%s" % exc
+            self.save(job)
+            log("作业 %s 拼接失败：%s" % (job_id, job["error"]))
+            return
+        final = self.final_path(job)
+        atomic_write(final, merged)
         job["status"] = JOB_READY
         job["done"] = len(chunks)
         self.save(job)
-        log("作业 %s 完成（%d 块，共 %d 字节）"
-            % (job_id, len(chunks), os.path.getsize(self.final_path(job_id))))
+        log("作业 %s 完成（%d 块，共 %d 字节，格式 %s）"
+            % (job_id, len(chunks), len(merged), self.job_ext(job)))
 
     def _synth_chunk(self, job, chunk):
         """
-        合成一块，含退化检测与重试。返回 (clean_mp3, used_bytes, attempts)。
+        合成一块，含退化检测与重试。返回 (clean_audio, used_bytes, attempts)。
 
-        重试策略与网站一致：退化就换一次随机采样重来（不设 temperature），
-        最多 SYNTH_ATTEMPTS 次；上游 5xx/连接错误按退避重试。
+        重试策略与网站一致：退化就重来一次，最多 SYNTH_ATTEMPTS 次；
+        上游 5xx/连接错误按退避重试。
+
+        格式与采样参数都跟着 job 走（v1.4.0）：
+          · response_format 用任务里的值，不再写死 mp3；
+          · sampling 的 4 个参数原样放进请求体（缺省用 DEFAULT_SAMPLING）——
+            不传的话上游 repetition_penalty 是 1.0，长句会整段变噪音。
         """
         text = chunk["text"]
         max_tokens = int(chunk["max_tokens"])
+        ext = self.job_ext(job)
         last_err = ""
 
         for attempt in range(1, SYNTH_ATTEMPTS + 1):
@@ -658,8 +776,9 @@ class JobManager:
                 "model": job["model"],
                 "input": text,
                 "max_tokens": max_tokens,
-                "response_format": "mp3",
+                "response_format": ext,
             }
+            body.update(job.get("sampling") or DEFAULT_SAMPLING)
             # voice 与 ref_audio 恰好一个（提交时已校验）
             if job.get("voice"):
                 body["voice"] = job["voice"]
@@ -667,7 +786,8 @@ class JobManager:
                 body["ref_audio"] = job["ref_audio"]
                 if job.get("ref_text"):
                     body["ref_text"] = job["ref_text"]
-            # 刻意不传 temperature：设成 0 会 100% 退化，交给服务端默认随机采样
+            # 采样参数已由上面的 body.update(sampling) 下发（v1.4.0）。
+            # 仍然不要自己改成 temperature=0：那是贪心解码，实测 100% 退化。
 
             try:
                 raw = self._post_speech(body)
@@ -685,9 +805,9 @@ class JobManager:
                 last_err = "上游返回空音频"
                 continue
 
-            if is_degenerate(len(clean), max_tokens):
+            if is_degenerate(len(clean), max_tokens, ext):
                 last_err = "输出退化（%.1f 秒，顶到 %.1f 秒上限）" % (
-                    len(clean) / float(BYTES_PER_SECOND), max_tokens * SECONDS_PER_TOKEN)
+                    audio_seconds(len(clean), ext), max_tokens * SECONDS_PER_TOKEN)
                 log("作业 %s 第 %d 块退化（尝试 %d/%d）"
                     % (job["job_id"], job["done"] + 1, attempt, SYNTH_ATTEMPTS))
                 continue
@@ -994,7 +1114,7 @@ class Handler(BaseHTTPRequestHandler):
         if job.get("status") != JOB_READY:
             return self._fail_jobs(409, "not ready")
 
-        final = JOB_MANAGER.final_path(job_id)
+        final = JOB_MANAGER.final_path(job)
         try:
             size = os.path.getsize(final)
         except OSError:
@@ -1029,7 +1149,10 @@ class Handler(BaseHTTPRequestHandler):
 
         length = end - start + 1
         self.send_response(code)
-        self.send_header("Content-Type", "audio/mpeg")
+        # Content-Type 跟着交付格式走（wav / mp3）——写死 audio/mpeg 会让浏览器
+        # 把 wav 当 mp3 处理，`<audio>` 在部分浏览器上直接不播。
+        self.send_header("Content-Type",
+                         "audio/wav" if JOB_MANAGER.job_ext(job) == "wav" else "audio/mpeg")
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-store")

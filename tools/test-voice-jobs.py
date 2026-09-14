@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-receiver.py v1.3.0 的 /jobs 验收测试（本地，不需要 GPU）。
+receiver.py v1.4.0 的 /jobs 验收测试（本地，不需要 GPU）。
 
 用一个假上游复刻 mlx-audio 的关键行为：
   · 返回带 ID3v2 头的 mp3 字节流（用来验证 strip_id3 与 chunk_bytes 口径）
@@ -52,6 +52,15 @@ def id3_wrap(payload):
     return b"ID3\x04\x00\x00" + synchsafe + tag_body + payload
 
 
+def wav_wrap(pcm, rate=24000):
+    """把纯 PCM 包成一个合法的 24kHz/16bit/单声道 wav（44 字节头）。"""
+    import struct
+    byte_rate = rate * 2
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, byte_rate, 2, 16)
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
 class FakeUpstream:
     """假 mlx-audio。"""
 
@@ -62,8 +71,10 @@ class FakeUpstream:
         self.lock = threading.Lock()
         self.concurrent = 0       # 当前同时在处理的请求数
         self.max_concurrent = 0   # 峰值（用来断言 worker 是串行的）
-        self.loaded = {"mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
-                       "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"}
+        self.loaded = {"mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+                       "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"}
+        # v1.4.0 验收要断言"receiver 到底把什么透传给了上游"，所以留下请求体
+        self.bodies = []
 
     def handler(self):
         outer = self
@@ -80,7 +91,13 @@ class FakeUpstream:
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 if raw:
-                    self.wfile.write(raw)
+                    try:
+                        self.wfile.write(raw)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # 取消/超时用例里 receiver 会提前断开连接。
+                        # 那是被测行为，不是夹具故障 —— 不吞掉的话
+                        # http.server 会打一段 traceback 混在测试输出里。
+                        pass
 
             def do_GET(self):
                 if self.path.startswith("/v1/models"):
@@ -103,6 +120,7 @@ class FakeUpstream:
                     outer.count += 1
                     outer.concurrent += 1
                     outer.max_concurrent = max(outer.max_concurrent, outer.concurrent)
+                    outer.bodies.append(body)
                 try:
                     if outer.slow:
                         time.sleep(outer.slow)
@@ -111,14 +129,21 @@ class FakeUpstream:
                         outer.concurrent -= 1
 
                 max_tokens = int(body.get("max_tokens") or 400)
+                want_wav = str(body.get("response_format") or "mp3").lower() == "wav"
+                # 字节率跟着格式走（wav 是 24000Hz/16bit/单声道 = 48000 字节/秒）
+                rate = 48000 if want_wav else BYTES_PER_SECOND
                 if outer.force_degenerate:
                     # 退化：输出正好顶到 max_tokens*0.08 秒对应的字节数（+一点点余量）
-                    payload_len = int(max_tokens * SECONDS_PER_TOKEN * BYTES_PER_SECOND) + 16
+                    payload_len = int(max_tokens * SECONDS_PER_TOKEN * rate) + 16
                 else:
                     # 正常：输出远小于上限（约为上限的 20%，不会触发退化判据）
-                    payload_len = int(max_tokens * SECONDS_PER_TOKEN * BYTES_PER_SECOND * 0.2)
+                    payload_len = int(max_tokens * SECONDS_PER_TOKEN * rate * 0.2)
                 payload = bytes((i % 251) for i in range(payload_len))
-                self._send(200, id3_wrap(payload), "audio/mpeg")
+                if want_wav:
+                    # 真 wav：标准 44 字节头 + PCM。这样拼接逻辑（去头补头）才是真的被测到。
+                    self._send(200, wav_wrap(payload), "audio/wav")
+                else:
+                    self._send(200, id3_wrap(payload), "audio/mpeg")
 
         return H
 
@@ -212,6 +237,20 @@ def call(method, url, body=None, token=TOKEN, timeout=60, headers=None):
             return exc.code, None, raw, dict(exc.headers)
 
 
+def _wait_ready(base, job_id, timeout=60):
+    """轮询到 ready/failed，返回最后一次 (status, body, raw, headers)。"""
+    import time as _t
+    deadline = _t.time() + timeout
+    last = (0, None, b"", {})
+    while _t.time() < deadline:
+        last = call("GET", base + "/jobs/" + job_id)
+        st, body = last[0], last[1]
+        if body and body.get("status") in ("ready", "failed", "cancelled"):
+            return last
+        _t.sleep(0.3)
+    return last
+
+
 class Checker:
     def __init__(self):
         self.fails = []
@@ -253,7 +292,7 @@ def main():
         print("\n【⑨ 回归：/v1/*、/voice、/voice/health、/voice/status 不变】")
         st, body, _, _ = call("GET", base + "/voice/health", token=None)
         c.ok("/voice/health 200", st == 200, (st, body))
-        c.ok("health.version = 1.3.0", body and body.get("version") == "1.3.0", body)
+        c.ok("health.version = 1.4.0", body and body.get("version") == "1.4.0", body)
         c.ok("health 字段齐全（dir/writable/auth/upstream）",
              bool(body and all(k in body for k in ("dir", "writable", "auth", "upstream"))), body)
 
@@ -523,6 +562,80 @@ def main():
         c.ok("chunk_bytes 有 4 块", b and len(b.get("chunk_bytes") or []) == 4, b)
 
         # ---------- 队列上限 ----------
+        # ---------- v1.4.0：wav + sampling 透传 ----------
+        print("\n【v1.4.0 ①：wav 任务（去头拼整段 + sampling 透传）】")
+        fake.bodies = []
+        st, body, _, _ = call("POST", base + "/jobs", {
+            "client_id": "probe-wav",
+            "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+            "voice": "vivian",
+            "response_format": "wav",
+            "sampling": {"temperature": 0.7, "top_p": 0.9, "top_k": 40, "repetition_penalty": 1.05},
+            "chunks": [{"text": "第一段。", "max_tokens": 400},
+                       {"text": "第二段。", "max_tokens": 400}],
+        })
+        wav_id = (body or {}).get("job_id")
+        c.ok("wav 任务提交成功（total=2）", st == 200 and body.get("total") == 2, (st, body))
+        # 等它跑完（两小块，很快）
+        st, body, _, _ = _wait_ready(base, wav_id, timeout=60)
+        c.ok("wav 任务 status=ready 且 done=2",
+             body and body.get("status") == "ready" and body.get("done") == 2, body)
+
+        c.ok("上游收到的 response_format 是 wav（不再写死 mp3）",
+             fake.bodies and all(b.get("response_format") == "wav" for b in fake.bodies),
+             [b.get("response_format") for b in fake.bodies])
+        need = {"temperature": 0.7, "top_p": 0.9, "top_k": 40, "repetition_penalty": 1.05}
+        c.ok("4 个采样参数原样透传给上游（位置参数，不是包在 sampling 里）",
+             fake.bodies and all(all(b.get(k) == v for k, v in need.items()) for b in fake.bodies),
+             fake.bodies[0] if fake.bodies else None)
+        c.ok("上游请求体里没有嵌套的 sampling 字段（值是摊平的）",
+             fake.bodies and all("sampling" not in b for b in fake.bodies))
+
+        # chunk_bytes 是"交付文件"的长度（wav 含 44 字节头）
+        # 注意：下载音频的响应体是二进制，json 解析会得到 None ——
+        # 所以要单独再查一次任务状态来断言 chunk_bytes。
+        _, wav_job, _, _ = call("GET", base + "/jobs/" + wav_id)
+        st, _, raw, hdrs = call("GET", base + "/jobs/" + wav_id + "/audio")
+        c.ok("下载 wav 200", st == 200, st)
+        c.ok("Content-Type = audio/wav", (hdrs.get("Content-Type") or "").startswith("audio/wav"),
+             hdrs.get("Content-Type"))
+        import struct as _struct
+        c.ok("整段是合法 wav（RIFF/WAVE 头）", raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", raw[:12])
+        c.ok("整段只有一个文件头（不是各块直接相接）", raw.count(b"RIFF") == 1, raw.count(b"RIFF"))
+        c.ok("采样率 24000 / 单声道 / 16bit",
+             _struct.unpack("<I", raw[24:28])[0] == 24000 and _struct.unpack("<H", raw[22:24])[0] == 1
+             and _struct.unpack("<H", raw[34:36])[0] == 16,
+             (_struct.unpack("<I", raw[24:28])[0], _struct.unpack("<H", raw[22:24])[0]))
+        c.ok("整段 PCM 长度 = 各块 chunk_bytes 之和减掉各自 44 字节头",
+             len(raw) - 44 == sum(wav_job.get("chunk_bytes") or []) - 44 * 2,
+             (len(raw), wav_job.get("chunk_bytes")))
+        c.ok("chunk_bytes 是含头的长度（每块都 > 44）",
+             all(n > 44 for n in (wav_job.get("chunk_bytes") or [])), wav_job.get("chunk_bytes"))
+
+        print("\n【v1.4.0 ②：不带 sampling 的老请求 → 用默认值（不能不发）】")
+        fake.bodies = []
+        st, body, _, _ = call("POST", base + "/jobs", {
+            "client_id": "probe-old",
+            "model": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+            "ref_audio": ref,
+            "chunks": [{"text": "老请求也不能退化。", "max_tokens": 400}],
+        })
+        old_id = (body or {}).get("job_id")
+        c.ok("老请求（无 sampling/response_format）仍提交成功", st == 200 and bool(old_id), (st, body))
+        st, body, _, _ = _wait_ready(base, old_id, timeout=60)
+        c.ok("老请求跑完（行为与 v1.3.0 一致：默认 mp3）",
+             body and body.get("status") == "ready", body)
+        c.ok("默认格式仍是 mp3",
+             fake.bodies and all(b.get("response_format") == "mp3" for b in fake.bodies),
+             [b.get("response_format") for b in fake.bodies])
+        c.ok("没给 sampling 时也补上了默认的 4 个参数（否则长句会变噪音）",
+             fake.bodies and all(all(b.get(k) == v for k, v in need.items()) for b in fake.bodies),
+             fake.bodies[0] if fake.bodies else None)
+        st, _, raw_mp3, hdrs = call("GET", base + "/jobs/" + old_id + "/audio")
+        c.ok("mp3 下载 Content-Type 仍是 audio/mpeg",
+             (hdrs.get("Content-Type") or "").startswith("audio/mpeg"), hdrs.get("Content-Type"))
+        c.ok("mp3 交付物没有 RIFF 头（还是老的相接方式）", not raw_mp3.startswith(b"RIFF"))
+
         print("\n【队列上限 500（用极小上限不便构造，只验证语义存在）】")
         # 直接改常量不方便（子进程），这里只确认活跃任务计数逻辑不报错
         st, body, _, _ = call("GET", base + "/jobs?status=queued,running")

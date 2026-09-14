@@ -386,6 +386,82 @@ export function ServicesView(content, ctx = {}) {
   }
 
   // ---------- 服务详情 ----------
+  // ---------------------------------------------------------------------
+  //  音色接收端：更换共享密钥
+  //
+  //  为什么单独做入口：这个密钥是**网站与接收端之间的共享凭据**，会泄露、要轮换。
+  //  以前只能"重新部署接收端"才能换（那会连 receiver.py 一起重写、重新登记服务），
+  //  而用户想要的只是换这一样东西 —— 换密钥不该有别的副作用。
+  //
+  //  改完**网站那边必须同步改**（openaiKey，接收端密钥由它推导），
+  //  否则上传音色与合成会立刻 403 —— 所以弹窗里要把这句话说在最前面。
+  // ---------------------------------------------------------------------
+  const RECEIVER_LABEL = 'com.zizdog.voicereceiver';
+
+  function randomReceiverToken() {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return 'ttsv-' + Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+  }
+
+  // 与后端 ValidateReceiverToken 同一套规则（字符集会写进 plist XML，脏字符会让服务起不来）
+  function validReceiverToken(t) {
+    return /^[A-Za-z0-9._-]{8,128}$/.test(t);
+  }
+
+  function changeReceiverToken(parentModal) {
+    const input = h('input.input', { value: randomReceiverToken(), spellcheck: 'false' });
+    const hint = h('div.hint', {});
+    const sync = () => {
+      hint.textContent = validReceiverToken(input.value.trim())
+        ? '只能包含字母、数字、- _ .（8–128 个字符）。'
+        : '⚠️ 密钥只能包含字母、数字、- _ .，长度 8–128（不能有空格或 & < > 等字符）。';
+      hint.style.color = validReceiverToken(input.value.trim()) ? 'var(--text-mute)' : 'var(--danger)';
+    };
+    input.addEventListener('input', sync);
+    sync();
+
+    const m = modal({
+      title: '更改音色接收端共享密钥',
+      body: h('div', [
+        h('div', {
+          style: {
+            background: 'var(--warn-soft)', border: '1px solid var(--border)',
+            borderRadius: '8px', padding: '10px 12px', marginBottom: '12px', fontSize: '12.5px', lineHeight: '1.7',
+          },
+          text: '改完密钥后，网站 TtsVoice 插件的 openaiKey 必须同步改成新值'
+            + '（接收端地址与 refUploadToken 都由它推导）。改完之前，上传音色与合成立刻会 403。',
+        }),
+        h('div.field', [h('label', { text: '新密钥' }), input, hint]),
+        h('div', { style: { display: 'flex', gap: '8px', marginTop: '4px' } }, [
+          h('button.btn.btn-sm', {
+            text: '🎲 重新生成',
+            onclick: () => { input.value = randomReceiverToken(); sync(); },
+          }),
+        ]),
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', {
+          text: '确认更换',
+          onclick: () => {
+            const token = input.value.trim();
+            if (!validReceiverToken(token)) { toast('密钥不合法：只能字母数字 - _ .，长度 8–128', 'warn'); return; }
+            close();
+            if (parentModal) parentModal.close();
+            // 走任务中心：要重写 plist、重载守护进程、再用新密钥验证一次
+            taskCenter.start({
+              kind: 'receiver-token',
+              target: 'voicereceiver',
+              title: '更换音色接收端共享密钥',
+              start: () => api.changeReceiverToken(token),
+            });
+          },
+        }),
+      ],
+    });
+  }
+
   async function openDetail(s) {
     let data;
     try {
@@ -426,6 +502,12 @@ export function ServicesView(content, ctx = {}) {
           text: '✏️ 编辑配置',
           onclick: (ev) => { m.close(); newServiceModal(load, cur); },
         }),
+        // 音色接收端专有：换共享密钥
+        cur.launch_label === RECEIVER_LABEL ? h('button.btn.btn-sm', {
+          text: '🔑 更改共享密钥',
+          title: '重新生成或指定「网站 ↔ 接收端」之间的共享密钥',
+          onclick: () => changeReceiverToken(m),
+        }) : null,
         h('button.btn.btn-sm', {
           text: '🚫 从面板移除',
           title: '只移除面板里的记录，系统上的服务不受影响',

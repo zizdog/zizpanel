@@ -135,6 +135,10 @@ type Manager struct {
 	// 实测就这么发生过：断言"服务不可用时应降级"的测试，因为本机恰好
 	// 有另一个项目在跑 Qwen 而失败，测出来的根本不是被测代码的行为。
 	qwenPortOverride int
+	// qwenMemGBOverride 仅供测试：伪造物理内存 GB（0 = 用真机值）。
+	// 守温策略是内存感知的（16GB 只常驻一个 1.7B 模型），而真机内存是固定的，
+	// 没有它就没法在同一个测试进程里同时断言"宽裕"和"吃紧"两种情形。
+	qwenMemGBOverride int
 }
 
 // Options 是管理器需要的环境信息。

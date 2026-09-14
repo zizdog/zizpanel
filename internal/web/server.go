@@ -253,6 +253,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/install-qwentts", s.requireAuth(s.handleInstallQwenTTS))
 	// 音色样本接收端 + 带鉴权的反向代理（网站唯一该访问的入口）
 	root.HandleFunc("POST /api/v1/market/install-voicereceiver", s.requireAuth(s.handleInstallVoiceReceiver))
+	// 只换共享密钥（保留监听地址与其余配置），见 handleChangeReceiverToken
+	root.HandleFunc("POST /api/v1/voice/receiver/token", s.requireAuth(s.handleChangeReceiverToken))
 	// 图片去水印 / 物体擦除（IOPaint）
 	root.HandleFunc("POST /api/v1/market/install-iopaint", s.requireAuth(s.handleInstallIOPaint))
 	root.HandleFunc("GET /api/v1/adoptable", s.requireAuth(s.handleAdoptScan))
