@@ -2,6 +2,7 @@ package sysconfig
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,7 +83,7 @@ func TestHostsBlockRoundTrip(t *testing.T) {
 	log := func(level, text string) { logs = append(logs, level+":"+text) }
 
 	// 加一次
-	if err := applyHostsBlock(ctx, &runner{log: log}); err != nil {
+	if err := applyHostsBlock(ctx, &runner{log: log}, ""); err != nil {
 		t.Fatalf("第一次加阻断失败：%v", err)
 	}
 	if !hostsHasBlock() {
@@ -99,7 +100,7 @@ func TestHostsBlockRoundTrip(t *testing.T) {
 	}
 
 	// 再加一次：必须幂等（不能再写一段）
-	if err := applyHostsBlock(ctx, &runner{log: log}); err != nil {
+	if err := applyHostsBlock(ctx, &runner{log: log}, ""); err != nil {
 		t.Fatalf("第二次加阻断失败：%v", err)
 	}
 	body, _ = os.ReadFile(path)
@@ -262,4 +263,177 @@ func TestProbeDoesNotPanicOnThisMachine(t *testing.T) {
 	}
 	t.Logf("本机：model=%s 便携=%v 更新已阻断=%v(hosts=%v) Spotlight=%q SSH在听=%v 崩溃弹窗=%q 自动登录=%q",
 		st.Model, st.Portable, st.Updates.Blocked, st.Updates.HostsBlocked, st.Spotlight, st.SSHListening, st.CrashDialog, st.AutoLogin)
+}
+
+// TestSoftwareupdateBinIsFoundOnThisMac 锁住"verify 动作真的能跑起来"。
+//
+// 真机事故（2026-09-14）：`VerifyUpdatesBlocked` 写死了 /usr/bin/softwareupdate，
+// 而 macOS 上它在 **/usr/sbin**（两台 Mac 都确认）。结果是"验证阻断"这个动作
+// 在任何机器上都失败，还报一句极具误导性的话：
+// "仍能查到更新（阻断可能没生效）" —— 实际只是命令路径写错、根本没执行。
+//
+// 这条断言在真机上跑：找不到二进制就说明路径表又错了。
+func TestSoftwareupdateBinIsFoundOnThisMac(t *testing.T) {
+	bin := softwareupdateBin()
+	if bin == "" {
+		t.Fatal("在这台 Mac 上找不到 softwareupdate —— 候选路径表错了（真机上是 /usr/sbin/softwareupdate）")
+	}
+	st, err := os.Stat(bin)
+	if err != nil || st.IsDir() {
+		t.Fatalf("解析出来的路径不可执行：%s (%v)", bin, err)
+	}
+	// 明确记下这个平台上的真实位置，方便以后有人改坏时一眼看出差异
+	t.Logf("softwareupdate = %s", bin)
+}
+
+// TestVerifyUpdatesBlockedGivesAccurateErrorWhenBinaryMissing：
+// 找不到命令时必须说"找不到命令"，**不能**说成"阻断没生效"（两者处置完全不同）。
+func TestVerifyUpdatesBlockedGivesAccurateErrorWhenBinaryMissing(t *testing.T) {
+	// 通过把候选路径与 PATH 都指向空来模拟"机器上没有这个命令"
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir())
+	origStat, origLook := statFn, lookPathFn
+	statFn = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	lookPathFn = func(string) (string, error) { return "", os.ErrNotExist }
+	defer func() { statFn, lookPathFn = origStat, origLook; _ = os.Setenv("PATH", origPath) }()
+
+	err := VerifyUpdatesBlocked(context.Background(), nil)
+	if err == nil {
+		t.Fatal("找不到 softwareupdate 时应报错")
+	}
+	if !strings.Contains(err.Error(), "找不到 softwareupdate") {
+		t.Errorf("错误信息应说明命令找不到，实际：%v", err)
+	}
+	if strings.Contains(err.Error(), "阻断可能没生效") {
+		t.Errorf("找不到命令时不该说成阻断失败（会把人带偏）：%v", err)
+	}
+}
+
+// TestPrevPrefsRoundTrip 锁住"回滚要恢复的是**原值**，不是猜出来的默认值"。
+//
+// 真机教训：早期 RestoreUpdates 一律把 5 个偏好写成 true，
+// 而它们在阻断之前未必都是 true —— 于是"恢复了系统更新"顺手改掉了用户的选择。
+// 现在阻断时把原值记进 hosts 阻断块的一行注释里，回滚按它恢复。
+func TestPrevPrefsRoundTrip(t *testing.T) {
+	m := map[string]string{
+		"AutomaticDownload":                "0", // 用户本来就关着的
+		"CriticalUpdateInstall":            "1",
+		"ConfigDataInstall":                "unset", // 键不存在，不该凭空写
+		"AutomaticCheckEnabled":            "1",
+		"AutomaticallyInstallMacOSUpdates": "0",
+	}
+	line := formatPrevPrefs(m)
+	if !strings.HasPrefix(line, prevPrefsTag) {
+		t.Fatalf("格式不对：%s", line)
+	}
+	// 放进一份 hosts 内容里再解析回来
+	hosts := "/etc/hosts 原内容\n" + hostsBegin + "\n0.0.0.0 swscan.apple.com\n" + line + "\n" + hostsEnd + "\n"
+	got := parsePrevPrefs(hosts)
+	for k, v := range m {
+		if got[k] != v {
+			t.Errorf("%s 应为 %q，解析出来是 %q", k, v, got[k])
+		}
+	}
+	// 没有记录时必须是空 map（调用方据此退回默认行为）
+	if len(parsePrevPrefs("nothing here")) != 0 {
+		t.Error("没有记录时应返回空 map")
+	}
+}
+
+// TestHostsBlockCarriesPrevPrefsAndRestoresByteIdentical：
+// 阻断块里带上原值记录后，**摘除掉仍然要逐字节还原** hosts。
+// 这一条是"回滚干净"的核心保证（真机上 diff 过 /etc/hosts）。
+func TestHostsBlockCarriesPrevPrefsAndRestoresByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	orig := dir + "/hosts"
+	const before = "127.0.0.1 localhost\n::1 localhost\n255.255.255.255 broadcasthost\n"
+	if err := os.WriteFile(orig, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := hostsPath
+	hostsPath = orig
+	defer func() { hostsPath = old }()
+
+	ctx := context.Background()
+	if err := applyHostsBlock(ctx, &runner{}, formatPrevPrefs(map[string]string{"AutomaticDownload": "0"})); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(orig)
+	if !strings.Contains(string(got), prevPrefsTag) {
+		t.Error("阻断块里应带上原值记录（回滚保真用）")
+	}
+	if !strings.Contains(string(got), "0.0.0.0 swscan.apple.com") {
+		t.Error("阻断域名没写进去")
+	}
+	if err := removeHostsBlock(ctx, &runner{}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(orig)
+	if string(after) != before {
+		t.Errorf("摘除阻断块后 hosts 应与原来逐字节一致：\n--- 期望 ---\n%q\n--- 实际 ---\n%q", before, string(after))
+	}
+}
+
+// TestJudgeSoftwareupdate 用**两台真机的真实输出**锁住判定逻辑。
+//
+// 这里的每一段输出都是 2026-09-14 实测抓下来的，尤其是第一条：
+// 阻断生效时 `softwareupdate --list` 打印 "错误的URL" 却**退出码为 0** ——
+// 早期判定把"看到错误文本"绑在 err != nil 上，于是把"已阻断"判成了
+// "仍能查到更新（阻断可能没生效）"，用户会去反复重做阻断。
+func TestJudgeSoftwareupdate(t *testing.T) {
+	cases := []struct {
+		name    string
+		out     string
+		runErr  error
+		wantNil bool
+		wantSub string
+	}{
+		{
+			name:    "mini 实测：hosts 阻断生效（错误的URL，退出码 0）",
+			out:     "错误的URL\nSoftware Update Tool\n\nFinding available software\n",
+			runErr:  nil,
+			wantNil: true,
+		},
+		{
+			name:    "英文系统：wrong url",
+			out:     "Software Update Tool\n\nFinding available software\nWrong URL\n",
+			runErr:  nil,
+			wantNil: true,
+		},
+		{
+			name:    "没有可用更新",
+			out:     "Software Update Tool\n\nFinding available software\nNo new software available.\n",
+			runErr:  nil,
+			wantNil: true,
+		},
+		{
+			name:    "本机实测：没阻断，真的列出了更新",
+			out:     "Software Update Tool\n\nFinding available software\nSoftware Update found the following new or updated software:\n* Label: Safari26.6.1SequoiaAuto-26.6.1\n",
+			runErr:  nil,
+			wantSub: "仍能查到更新",
+		},
+		{
+			name:    "命令本身失败：不能咬定是阻断失效",
+			out:     "some unexpected failure\n",
+			runErr:  errors.New("exit status 1"),
+			wantSub: "无法据此判断",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := judgeSoftwareupdate(c.out, c.runErr)
+			if c.wantNil {
+				if err != nil {
+					t.Fatalf("应判定为「已阻断」，实际报错：%v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("应报错，实际为 nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSub) {
+				t.Errorf("错误信息应包含 %q，实际：%v", c.wantSub, err)
+			}
+		})
+	}
 }

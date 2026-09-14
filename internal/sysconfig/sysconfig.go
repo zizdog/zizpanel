@@ -428,7 +428,7 @@ func hostsHasBlock() bool {
 }
 
 // applyHostsBlock 幂等地把阻断段写进 hosts；已经有就跳过。
-func applyHostsBlock(ctx context.Context, r *runner) error {
+func applyHostsBlock(ctx context.Context, r *runner, extraLines ...string) error {
 	if hostsHasBlock() {
 		if r.log != nil {
 			r.log(levelStep, "hosts 里已有阻断段，跳过")
@@ -439,6 +439,11 @@ func applyHostsBlock(ctx context.Context, r *runner) error {
 	sb.WriteString("\n" + hostsBegin + "\n")
 	for _, h := range updateHosts {
 		sb.WriteString("0.0.0.0 " + h + "\n")
+	}
+	for _, l := range extraLines {
+		if strings.TrimSpace(l) != "" {
+			sb.WriteString(l + "\n")
+		}
 	}
 	sb.WriteString(hostsEnd + "\n")
 	// 用追加写 + 立刻读回校验（不靠退出码）
@@ -615,7 +620,13 @@ func BlockUpdates(ctx context.Context, log LogFunc) error {
 	if log != nil {
 		log(levelStep, "4/5 把更新目录域名指向 0.0.0.0（真正兜底的一层）")
 	}
-	if err := applyHostsBlock(ctx, r); err != nil {
+	// 把改动前的偏好原值记进 hosts 阻断块里。
+	//
+	// 为什么要记：回滚时如果一律写成 true，就会**改掉用户原本的选择** ——
+	// 真机上"恢复更新"把 6 个偏好全写成了 true，而这些值在阻断之前未必都是 true。
+	// 记在 hosts 块里（而不是另建一个状态文件）有两个好处：
+	// 删块时它自动一起消失，不会留下孤儿状态；人肉排查时也能一眼看到原值。
+	if err := applyHostsBlock(ctx, r, prevPrefsComment(ctx)); err != nil {
 		return err
 	}
 
@@ -642,17 +653,30 @@ func RestoreUpdates(ctx context.Context, log LogFunc) error {
 		return fmt.Errorf("需要以 root 运行")
 	}
 	pref := "/Library/Preferences/com.apple.SoftwareUpdate.plist"
+	// 优先按阻断时记下的**原值**恢复；没有记录（老版本阻断的）才退回"按系统默认打开"。
+	prev := readPrevPrefs()
 	if log != nil {
-		log(levelStep, "恢复自动检查/下载/安装开关（安全数据更新也一并恢复）")
+		if len(prev) > 0 {
+			log(levelStep, fmt.Sprintf("按阻断前记录的原值恢复 %d 个开关", len(prev)))
+		} else {
+			log(levelStep, "没有找到阻断前的原值记录，按系统默认打开这 5 个开关")
+		}
 	}
-	for _, kv := range [][2]string{
-		{"AutomaticCheckEnabled", "true"},
-		{"AutomaticDownload", "true"},
-		{"AutomaticallyInstallMacOSUpdates", "true"},
-		{"CriticalUpdateInstall", "true"},
-		{"ConfigDataInstall", "true"},
-	} {
-		if _, err := r.run(ctx, "/usr/bin/defaults", "write", pref, kv[0], "-bool", kv[1]); err != nil {
+	if len(prev) == 0 {
+		prev = map[string]string{
+			"AutomaticCheckEnabled":            "1",
+			"AutomaticDownload":                "1",
+			"AutomaticallyInstallMacOSUpdates": "1",
+			"CriticalUpdateInstall":            "1",
+			"ConfigDataInstall":                "1",
+		}
+	}
+	for k, v := range sortedPrefs(prev) {
+		want := "false"
+		if v == "1" || strings.EqualFold(v, "true") {
+			want = "true"
+		}
+		if _, err := r.run(ctx, "/usr/bin/defaults", "write", pref, k, "-bool", want); err != nil {
 			return err
 		}
 	}
@@ -840,31 +864,166 @@ func sortedPrefs(m map[string]string) map[string]string {
 	return out
 }
 
+// softwareupdateBin 找到 softwareupdate 的绝对路径。
+//
+// 真机上它**不在 /usr/bin**，而在 **/usr/sbin**（两台 Mac 都实测确认）。
+// 早期这里写死了 /usr/bin/softwareupdate，于是"验证阻断"这个动作在任何机器上
+// 都必然失败，而且报的是一句极具误导性的话："仍能查到更新（阻断可能没生效）"
+// —— 实际原因只是命令路径写错、根本没跑起来。
+//
+// 按候选路径逐个试，最后退回 PATH 查找；都找不到就返回空串，
+// 由调用方给出**准确**的错误（"找不到 softwareupdate 命令"而不是"阻断没生效"）。
+func softwareupdateBin() string {
+	for _, p := range []string{"/usr/sbin/softwareupdate", "/usr/bin/softwareupdate"} {
+		if st, err := statFn(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	if p, err := lookPathFn("softwareupdate"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// statFn / lookPathFn 抽成变量只为可测：单测要把"这台机器上没有这个命令"
+// 这种情况造出来，而真机上它一直存在（路径写错才会"找不到"）。
+var (
+	statFn     = os.Stat
+	lookPathFn = exec.LookPath
+)
+
 // VerifyUpdatesBlocked 真的去问一次系统"有没有更新"（慢，约 10-30 秒），
 // 用来向用户证明阻断有效，而不是只看偏好值。
 func VerifyUpdatesBlocked(ctx context.Context, log LogFunc) error {
+	bin := softwareupdateBin()
+	if bin == "" {
+		return fmt.Errorf("找不到 softwareupdate 命令（试过 /usr/sbin、/usr/bin 与 PATH）—— " +
+			"这台机器无法用「问系统」的方式来验证，请改用偏好与 hosts 状态判断")
+	}
 	r := &runner{log: log}
 	cctx, cancel := context.WithTimeout(ctx, 40*time.Second)
 	defer cancel()
-	out, err := r.run(cctx, "/usr/bin/softwareupdate", "--list")
-	lower := strings.ToLower(out)
-	switch {
-	case err != nil && (strings.Contains(lower, "错误的url") || strings.Contains(lower, "wrong url") ||
-		strings.Contains(lower, "could not") || strings.Contains(lower, "timed out") ||
-		strings.Contains(lower, "无法") || strings.Contains(lower, "错误")):
-		if log != nil {
-			log(levelOK, "已验证：更新目录不可达 → 系统查不到任何更新")
-		}
-		return nil
-	case strings.Contains(lower, "no new software"):
-		if log != nil {
-			log(levelOK, "已验证：系统报告没有可用更新")
-		}
-		return nil
-	default:
-		if err != nil {
-			return fmt.Errorf("仍能查到更新（阻断可能没生效）：%s", firstLine(out, err))
-		}
-		return fmt.Errorf("仍能查到更新（阻断可能没生效）：%s", strings.TrimSpace(out))
+	out, err := r.run(cctx, bin, "--list")
+	if verdict := judgeSoftwareupdate(out, err); verdict != nil {
+		return verdict
 	}
+	if log != nil {
+		log(levelOK, "已验证：更新目录不可达 → 系统查不到任何更新")
+	}
+	return nil
+}
+
+// judgeSoftwareupdate 是"验证阻断"的判定逻辑（纯函数，便于用真机输出做单测）。
+//
+// 为什么单独抽出来：这条判定的三种结论（已阻断 / 没阻断 / 无法判断）
+// 直接决定用户下一步怎么做，判错一次就会把人带去修一个不存在的问题。
+//
+// 踩过的坑（2026-09-14 真机）：`softwareupdate --list` 在 hosts 阻断生效时
+// 会打印 "错误的URL"，但**退出码仍是 0**。早期判定把"看到错误文本"绑在
+// `err != nil` 上，于是"阻断明明有效"被判成了"仍能查到更新（阻断可能没生效）"
+// —— 比不报更糟：用户会去反复重做阻断。
+//
+// 所以判定顺序改成：
+//  1. 输出里有更新目录不可达的特征 → 已阻断（**不看退出码**）；
+//  2. 输出里有 "no new software" → 没有可用更新（也是"阻断有效"的一种表现）；
+//  3. 命令本身失败（但输出不像上面两种）→ 如实说"无法据此判断"，而不是咬定没阻断；
+//  4. 其余（真的列出了更新）→ 没阻断。
+func judgeSoftwareupdate(out string, runErr error) error {
+	lower := strings.ToLower(out)
+	// 只认"更新目录不可达"这类明确特征，不用宽泛的 "错误"/"could not"
+	// —— 否则网络断了、证书坏了都会被说成"阻断有效"。
+	unreachable := []string{
+		"错误的url", "wrong url", "could not connect", "can't connect",
+		"无法连接", "could not resolve", "swscan", "swdist",
+	}
+	for _, needle := range unreachable {
+		if strings.Contains(lower, needle) {
+			return nil
+		}
+	}
+	if strings.Contains(lower, "no new software") {
+		return nil
+	}
+	if runErr != nil {
+		return fmt.Errorf("softwareupdate 执行失败，无法据此判断阻断是否生效（这不是「阻断失效」）：%s",
+			firstLine(out, runErr))
+	}
+	// 真的列出了更新：把第一条给用户看，便于判断
+	return fmt.Errorf("仍能查到更新（阻断可能没生效）：%s", firstLine(out, nil))
+}
+
+// ---------- 阻断前的偏好原值（回滚保真） ----------
+
+// prevPrefsTag 是写在 hosts 阻断块里的一行注释：记录改动前的偏好原值。
+//
+// 用注释而不是单独的 JSON 文件：删块时它自动一起消失，不会留下孤儿状态，
+// 人肉排查 nginx/hosts 时也能直接看到"阻断前是什么值"。
+const prevPrefsTag = "# zizpanel-prev-prefs:"
+
+// trackedPrefs 是阻断会改动的偏好（回滚要按原值恢复的就是这几个）。
+var trackedPrefs = []string{
+	"AutomaticCheckEnabled", "AutomaticDownload", "AutomaticallyInstallMacOSUpdates",
+	"CriticalUpdateInstall", "ConfigDataInstall",
+}
+
+// prevPrefsComment 读当前值并拼成一行注释；读不到就返回空（不写这行）。
+func prevPrefsComment(ctx context.Context) string {
+	m := map[string]string{}
+	for _, k := range trackedPrefs {
+		v := strings.TrimSpace(runQuiet(ctx, "/usr/bin/defaults", "read",
+			"/Library/Preferences/com.apple.SoftwareUpdate.plist", k))
+		if v == "" {
+			v = "unset" // 键不存在：回滚时不该凭空写一个值进去
+		}
+		m[k] = v
+	}
+	return formatPrevPrefs(m)
+}
+
+// formatPrevPrefs 把原值拼成一行：`# zizpanel-prev-prefs: A=1 B=0`
+func formatPrevPrefs(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	// 注意：sortedPrefs 返回的是 map，range 出来的是 (key, value) ——
+	// 早期这里写成了 `for _, k := range keys`，于是 k 拿到的是**值**，
+	// 拼出来的是 "=0" 这种没有键名的垃圾（单测当场抓到）。
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, k := range names {
+		parts = append(parts, k+"="+m[k])
+	}
+	return prevPrefsTag + " " + strings.Join(parts, " ")
+}
+
+// parsePrevPrefs 从 hosts 内容里解析出原值（没有记录就返回空 map）。
+func parsePrevPrefs(hosts string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(hosts, "\n") {
+		i := strings.Index(line, prevPrefsTag)
+		if i < 0 {
+			continue
+		}
+		for _, kv := range strings.Fields(strings.TrimSpace(line[i+len(prevPrefsTag):])) {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || k == "" {
+				continue
+			}
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// readPrevPrefs 读当前 hosts 里的原值记录。
+func readPrevPrefs() map[string]string {
+	b, err := os.ReadFile(hostsPath)
+	if err != nil {
+		return nil
+	}
+	return parsePrevPrefs(string(b))
 }
