@@ -9,7 +9,10 @@ package sysinfo
 
 import (
 	"context"
+	_ "embed"
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -19,6 +22,21 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// tempReaderPy 是读 Apple Silicon 温度传感器的脚本（IOHID + ctypes）。
+// 从 stdin 喂给系统自带的 python3；理由见脚本头部注释。
+//
+//go:embed temp-reader.py
+var tempReaderPy string
+
+// firstLine 取错误信息的第一行：子进程的报错常常是多行堆栈，
+// 塞进一句界面提示里没有意义。
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
 
 // Sample 是一次系统指标快照。
 type Sample struct {
@@ -47,7 +65,11 @@ type Sample struct {
 	NetRxRate float64 `json:"net_rx_rate"` // 字节/秒
 	NetTxRate float64 `json:"net_tx_rate"`
 	CPUTemp   float64 `json:"cpu_temp"` // 摄氏度，取不到为 0
-	Procs     int     `json:"procs"`
+	// CPUTempNote 说明温度的来源，或者"为什么取不到"。
+	// 以前前端写死显示"不可读取（需 root）"—— 那句话在 Apple Silicon 上**是错的**
+	// （真实原因是 powermetrics 没有 smc 采样器），所以要如实回报原因。
+	CPUTempNote string `json:"cpu_temp_note"`
+	Procs       int    `json:"procs"`
 }
 
 // Collector 持有采样状态（上一次的 CPU 与网络累计值）。
@@ -73,10 +95,10 @@ type Collector struct {
 	refreshing atomic.Bool // 防止过期刷新叠加
 	sampling   atomic.Bool // 后台循环是否已启动
 
-	// 温度探针的缓存；只在 Collect 内访问，而 Collect 由 collectMu 串行化，故无需加锁。
-	tempAt       time.Time
-	tempVal      float64
-	tempDisabled bool
+	// 温度探针的缓存与说明；只在 Collect 内访问，而 Collect 由 collectMu 串行化，故无需加锁。
+	tempNote string
+	tempAt   time.Time
+	tempVal  float64
 }
 
 // demandTTL 是「无人查看」多久后暂停后台采样。
@@ -213,8 +235,8 @@ func (c *Collector) Collect(ctx context.Context) (Sample, error) {
 	}
 	out.NetRx, out.NetTx = n.rx, n.tx
 
-	// ---- 温度（Apple Silicon 需要 root + powermetrics，取不到就留 0）----
-	out.CPUTemp = c.readTemp(ctx)
+	// ---- 温度（Apple Silicon 走 IOHID，见 readTemp 的说明）----
+	out.CPUTemp, out.CPUTempNote = c.readTemp(ctx)
 
 	// 结果与基线一次性提交，短暂持锁。
 	c.mu.Lock()
@@ -434,37 +456,168 @@ func readNet(ctx context.Context) netCounters {
 	return netCounters{rx: rx, tx: tx}
 }
 
-// readTemp 读取 CPU 温度。Apple Silicon 上普通进程读不到 SMC，
-// 需要 root + powermetrics；因此这里只在明显可用时才返回数值。
-// tempTTL 是温度采样的最小间隔。
+// readTemp 读取 CPU 温度，返回（摄氏度，来源/原因说明）。取不到时温度为 0。
 //
-// powermetrics 是重量级工具（每次要起进程、接管电源管理采样），而温度本身变化很慢，
-// 每次采集都调用它纯属浪费；而且 Apple Silicon 上 `--samplers smc` 并不被支持
-// （实测 M4 返回 unrecognized sampler），永远拿不到值。因此这里做两件事：
-//   - 非 root 直接永久关闭该探针，省掉每轮一次 `id -u` 子进程；
-//   - 结果缓存 tempTTL，最多每分钟真正调用一次。
-func (c *Collector) readTemp(ctx context.Context) float64 {
-	if c.tempDisabled {
-		return 0
-	}
-	// powermetrics 需要 root；非 root 时这个探针永远不会成功，直接停用。
-	if !isRoot() {
-		c.tempDisabled = true
-		return 0
-	}
+// 平台差异（这是这段代码的全部复杂性来源）：
+//   - **Apple Silicon**：powermetrics **没有 smc 采样器**（M4 实测只支持
+//     tasks/battery/network/disk/interrupts/cpu_power/thermal/sfi/gpu_power/ane_power），
+//     而 thermal 给的是"热压力等级"不是温度。以前这里写 `--samplers smc`，
+//     在 M 系列上永远拿不到值，界面上就显示成"不可读取（需 root）" —— **那是误报**。
+//     正确做法是读 IOHID 的 AppleVendor 温度传感器（见 temp-reader.py）。
+//   - **Intel**：沿用 powermetrics 的 smc 采样器（老机器上它才是对的）。
+//
+// 采样本身很轻（HID 读取约 100ms；powermetrics 较重），而温度变化很慢，
+// 所以结果缓存 tempTTL，最多每分钟真正读一次。失败**不永久停用**：
+// 权限、python3 之类的条件可能随后被满足，下一轮就能自愈。
+func (c *Collector) readTemp(ctx context.Context) (float64, string) {
 	if !c.tempAt.IsZero() && time.Since(c.tempAt) < tempTTL {
-		return c.tempVal
+		return c.tempVal, c.tempNote
 	}
 	c.tempAt = time.Now()
 
-	out := runCmdTimeout(ctx, 1200*time.Millisecond, "powermetrics", "-n", "1", "-i", "500",
-		"--samplers", "smc")
-	if m := reTemp.FindStringSubmatch(out); len(m) == 2 {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
-			c.tempVal = round2(v)
+	if runtime.GOARCH == "arm64" {
+		if v, note := readTempIOHID(ctx); v > 0 {
+			c.tempVal, c.tempNote = v, note
+			return c.tempVal, c.tempNote
+		} else if note != "" {
+			c.tempNote = note
 		}
 	}
-	return c.tempVal
+	// Intel（以及 arm64 上 IOHID 失败的兜底）：powermetrics 的 smc 采样器
+	if isRoot() {
+		out := runCmdTimeout(ctx, 1500*time.Millisecond, "powermetrics", "-n", "1", "-i", "500",
+			"--samplers", "smc")
+		if m := reTemp.FindStringSubmatch(out); len(m) == 2 {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil && v > 0 {
+				c.tempVal, c.tempNote = round2(v), "powermetrics（SMC）"
+				return c.tempVal, c.tempNote
+			}
+		}
+		c.tempNote = "powermetrics 没有 smc 采样器（Apple Silicon 不支持），且 IOHID 也取不到"
+	} else if c.tempNote == "" {
+		c.tempNote = "没有可用来源（非 root，且 IOHID 取不到）"
+	}
+	c.tempVal = 0
+	return 0, c.tempNote
+}
+
+// readTempIOHID 走 IOHID 的 AppleVendor 温度传感器（Apple Silicon 的正确路径）。
+//
+// 用系统自带的 python3 + 内嵌脚本（见文件头 temp-reader.py 的说明：Go 原生要么
+// 引 cgo、要么引第三方 FFI 库，两条路对"同时出 arm64/amd64 两个包"的发布流程都不划算）。
+// 选哪个传感器、怎么过滤无效值都在 Go 这边做（chooseCPUTemp），所以那部分有单测。
+func readTempIOHID(ctx context.Context) (float64, string) {
+	python := "/usr/bin/python3"
+	if _, err := os.Stat(python); err != nil {
+		return 0, "没有 /usr/bin/python3（装 Command Line Tools 即可）"
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, python, "-")
+	cmd.Stdin = strings.NewReader(tempReaderPy)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, "IOHID 读取失败：" + firstLine(err.Error())
+	}
+	var payload struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Sensors []struct {
+			Name string  `json:"name"`
+			C    float64 `json:"c"`
+		} `json:"sensors"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return 0, "解析温度传感器输出失败"
+	}
+	if !payload.OK {
+		if payload.Error != "" {
+			return 0, payload.Error
+		}
+		return 0, "没读到温度传感器"
+	}
+	sensors := make([]tempSensor, 0, len(payload.Sensors))
+	for _, s := range payload.Sensors {
+		sensors = append(sensors, tempSensor{Name: s.Name, Celsius: s.C})
+	}
+	return chooseCPUTemp(sensors)
+}
+
+// tempSensor 是一个温度传感器的读数。抽出来是为了让"选哪个当 CPU 温度"可单测。
+type tempSensor struct {
+	Name    string
+	Mph     string // 未使用，占位保持结构稳定
+	Celsius float64
+}
+
+// isNonCPUSensor 判断一个传感器名字是否**明确不是** CPU 温度。
+//
+// 依据 M4 实测的传感器名：
+//   - `tcal` 是校准基准（恒定 51.8°C），拿它当 CPU 温度会凭空高出十几度；
+//   - `gas gauge battery` 是电池温度；
+//   - `NAND CH0 temp` 是 SSD 温度。
+//
+// 名字里带这些就绝对不能用 —— 宁可显示"取不到"，也不能给一个错的数。
+func isNonCPUSensor(lowerName string) bool {
+	for _, bad := range []string{"tcal", "battery", "gas gauge", "nand"} {
+		if strings.Contains(lowerName, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+// chooseCPUTemp 从传感器列表里挑出"CPU 温度"。
+//
+// 规则（依据 M4 实测的 46 个传感器）：
+//   - 先丢掉不合常理的读数：M4 上 `PMU tdev1/PMU2 tdev1/PMU2 tdev3` 会返回 **-22°C**，
+//     直接取最大值会把这些噪声当数据；所以先按 0 < t < 150 过滤。
+//   - 优先 **tdie**（die = 芯片核心温度，M4 上是 PMU tdie1..tdie12 + PMU2 tdie1..12，
+//     实测 33–36°C），取最大（最热的那个核心最能反映"CPU 有多热"）。
+//   - 没有 tdie 时退而取 PMU 系列，再退而取全体。
+//   - **明确排除 tcal**：那是校准基准（M4 上恒定 51.8°C），不是芯片温度，
+//     拿它当 CPU 温度会凭空高出十几度。
+func chooseCPUTemp(sensors []tempSensor) (float64, string) {
+	// 先把"绝不可能是 CPU 温度"的和不合常理的**一次性滤掉**，
+	// 后面三层选择都只在这个集合里挑 —— 排除规则只写一处，不会漏。
+	cands := make([]tempSensor, 0, len(sensors))
+	for _, s := range sensors {
+		if s.Celsius <= 0 || s.Celsius >= 150 {
+			continue // M4 实测有 -22°C 的无效读数
+		}
+		if isNonCPUSensor(strings.ToLower(s.Name)) {
+			continue // tcal / battery / NAND：明确不是 CPU
+		}
+		cands = append(cands, s)
+	}
+
+	maxMatching := func(pick func(string) bool) (float64, int) {
+		best, n := 0.0, 0
+		for _, s := range cands {
+			if !pick(strings.ToLower(s.Name)) {
+				continue
+			}
+			n++
+			if s.Celsius > best {
+				best = s.Celsius
+			}
+		}
+		return best, n
+	}
+
+	// 优先 tdie（芯片核心温度，M4 上 24 个，33–36°C）：取最热的核心。
+	if v, n := maxMatching(func(name string) bool { return strings.Contains(name, "tdie") }); n > 0 {
+		return round2(v), fmt.Sprintf("IOHID tdie×%d", n)
+	}
+	// 其次 PMU 系列（老机型/其它芯片的命名可能不同）
+	if v, n := maxMatching(func(name string) bool { return strings.Contains(name, "pmu") }); n > 0 {
+		return round2(v), fmt.Sprintf("IOHID PMU×%d", n)
+	}
+	// 最后退到任意"看起来是 SoC 温度"的传感器
+	if v, n := maxMatching(func(string) bool { return true }); n > 0 {
+		return round2(v), fmt.Sprintf("IOHID 其它×%d", n)
+	}
+	return 0, "没有可用的 CPU 温度传感器（读数都被过滤）"
 }
 
 var reTemp = regexp.MustCompile(`CPU die temperature:\s*([\d.]+)`)

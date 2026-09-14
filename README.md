@@ -708,6 +708,25 @@ make remote-test     # 远程一键安装的端到端测试（本地 HTTP + 沙�
     解决：让目标机上的升级源端口与清单里的 URL 对齐（这次就是把 mini 的服务起在 18877），
     或者为每台机器分别构建清单。
 
+67. **CPU 温度一直显示"不可读取（需 root）"，其实不是权限问题** →
+    Apple Silicon 上 `powermetrics` **没有 smc 采样器**（M4 实测只支持
+    tasks/battery/network/disk/interrupts/cpu_power/thermal/sfi/gpu_power/ane_power），
+    而 `thermal` 给的是"热压力等级"不是温度。老代码写的是
+    `powermetrics --samplers smc`，在 M 系列上永远拿不到值 → 前端把 0 显示成
+    "不可读取（需 root）"，把人往权限方向带（实测**根本不需要 root**）。
+    修法：Apple Silicon 走 **IOHID 的 AppleVendor 温度传感器**（page 0xff00 / usage 5），
+    用系统自带的 `/usr/bin/python3` + ctypes 调 IOKit/CoreFoundation
+    （脚本 `internal/sysinfo/temp-reader.py`，从 stdin 喂给 python3，零新增依赖）。
+    为什么不写 Go 原生：要么引 cgo（会给"同时出 arm64/amd64 两个包"的发布流程
+    引入交叉编译风险），要么引第三方 FFI 库（本机连 proxy.golang.org 都不通）。
+    选哪个传感器由 Go 决定（可单测），规则有两条血泪：
+    - **必须排除 `tcal`**：它是校准基准（M4 上恒定 51.8°C），当 CPU 温度会凭空高十几度；
+      同理排除 `battery`/`gas gauge`/`NAND`；
+    - **必须先过滤无效读数**：M4 上 `PMU tdev1`/`PMU2 tdev3` 会返回 **-22°C**，
+      直接取最大值会把这些噪声当数据。取 `tdie*`（芯片核心，M4 上 24 个）的最大值。
+    界面上同时显示来源（如 `35.0 °C（IOHID tdie×24）`）；取不到时如实说原因，
+    不再写死一句可能错的"需 root"。
+
 ---
 
 ## 开发路线

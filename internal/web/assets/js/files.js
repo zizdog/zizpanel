@@ -466,35 +466,7 @@ export function FilesView(content, ctx = {}) {
       return;
     }
 
-    editorModal(entry, res, replaceInEditor);
-  }
-
-  function replaceInEditor(editor, entry) {
-    const find = h('input.input', { placeholder: '查找内容' });
-    const repl = h('input.input', { placeholder: '替换为' });
-    const m = modal({
-      title: '查找替换',
-      body: h('div', [
-        h('div.field', [h('label', { text: '查找' }), find]),
-        h('div.field', [h('label', { text: '替换为' }), repl]),
-        h('div.hint', { text: '仅作用于当前编辑框内容，保存后才写入文件。查找按纯文本处理，不会把特殊字符当正则。' }),
-      ]),
-      footer: (close) => [
-        h('button.btn', { text: '取消', onclick: close }),
-        h('button.btn', {
-          text: '全部替换',
-          onclick: () => {
-            if (!find.value) return;
-            const parts = editor.value.split(find.value);
-            const n = parts.length - 1;
-            editor.value = parts.join(repl.value);
-            editor.dispatchEvent(new Event('input'));
-            toast(`已替换 ${n} 处（尚未保存）`, 'ok');
-            close();
-          },
-        }),
-      ],
-    });
+    editorModal(entry, res);
   }
 
   // ---------- 搜索 ----------
@@ -876,6 +848,17 @@ function ensureEditorStyle() {
     '.zpf-ta::selection { background: rgba(96,165,250,.35); color: transparent; -webkit-text-fill-color: transparent; }',
     // 纯文本模式（大文件 / 不认识的语言 / 代码过密）让 textarea 自己显示文字
     '.zpf-ta.zpf-plain { color: var(--text) !important; -webkit-text-fill-color: var(--text); }',
+    // 查找命中层：整层文字透明，只留 <mark> 的背景色块，所以它既可以垫在
+    // 高亮模式（彩色文字）下面，也可以垫在纯文本模式（textarea 自己显示文字）下面。
+    // color 必须显式写：mark 的 UA 样式会带上 MarkText 前景色，不覆盖就会把
+    // 下面那层的字盖成不透明色块后的另一种颜色。
+    '.zpf-hitbox { color: transparent; pointer-events: none; }',
+    '.zpf-hit, .zpf-hit-cur { color: transparent; padding: 0; margin: 0; border-radius: 2px; }',
+    '.zpf-hit { background: rgba(250, 204, 21, .30); }',
+    '.zpf-hit-cur { background: rgba(249, 115, 22, .70); box-shadow: 0 0 0 1px rgba(249, 115, 22, .85); }',
+    ':root[data-theme="light"] .zpf-hit { background: rgba(234, 179, 8, .40); }',
+    ':root[data-theme="light"] .zpf-hit-cur { background: rgba(249, 115, 22, .55); }',
+    '.zpf-fcount { display: inline-block; min-width: 54px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }',
     '.zpf-editor:fullscreen, .zpf-editor:-webkit-full-screen { border: none; border-radius: 0; }',
     '.zpf-com { color: #6b7688; font-style: italic; }',
     // 注意别把 .zpf-code（高亮层容器）写进着色规则：它一上色，所有未被 token 命中的
@@ -903,10 +886,11 @@ function ensureEditorStyle() {
 }
 
 /**
- * editorModal(entry, res, replaceInEditor) —— 打开在线编辑弹窗。
+ * editorModal(entry, res) —— 打开在线编辑弹窗。
  * 只在这里组装 UI；读文件/二进制判断仍由调用方负责。
+ * 查找/替换是弹窗内部的一条可折叠查找条（默认隐藏），不再走另一个小弹窗。
  */
-function editorModal(entry, res, replaceInEditor) {
+function editorModal(entry, res) {
   ensureEditorStyle();
   const lang = langOf(entry.name);
 
@@ -953,7 +937,22 @@ function editorModal(entry, res, replaceInEditor) {
   // h() 会跳过值为 false 的属性，spellcheck 只能创建后补 —— 否则代码里满屏红波浪线
   editor.setAttribute('spellcheck', 'false');
 
-  const codeWrap = h('div', { style: { position: 'relative', flex: '1 1 auto', minWidth: '0' } }, [hlLayer, editor]);
+  // 查找命中层：和高亮层同一套 zpfTextStyle、同一个 transform，所以逐像素对齐。
+  //
+  // 为什么不用 textarea 的 ::selection 来显示当前匹配：查找时焦点必须留在查找框里
+  // （否则"输入即查找"就断了），而浏览器只在输入控件**获得焦点**时才绘制它的选区 ——
+  // 失焦的 textarea 选区是看不见的。所以命中色块必须由外面这层画。
+  // 它垫在 textarea 下面（textarea 的背景是透明的），因此两行文字都能透出来：
+  // 高亮模式下透出彩色文字，纯文本模式下透出 textarea 自己渲染的文字。
+  const hitInner = h('code.zpf-code');
+  const hitLayer = h('pre.zpf-hitbox', {
+    style: Object.assign(zpfTextStyle(), {
+      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
+      overflow: 'hidden', zIndex: '1', display: 'none',
+    }),
+  }, [hitInner]);
+
+  const codeWrap = h('div', { style: { position: 'relative', flex: '1 1 auto', minWidth: '0' } }, [hlLayer, hitLayer, editor]);
 
   const editorBox = h('div.zpf-editor', {
     style: {
@@ -1003,6 +1002,14 @@ function editorModal(entry, res, replaceInEditor) {
     const y = editor.scrollTop;
     hlInner.style.transform = `translate(${-x}px, ${-y}px)`;
     linesInner.style.transform = `translateY(${-y}px)`;
+    if (hitLayer.style.display !== 'none') {
+      syncHits();
+      // 命中层只画可视区上下各 HIT_MARGIN 行；滚出这个范围才需要重画。
+      // 缓冲留 10 行：滚动事件里直接重画会让大文件每次滚动都扫一遍文本，很浪费。
+      const top = y / ZPF_LINE_HEIGHT;
+      const bottom = (y + editor.clientHeight) / ZPF_LINE_HEIGHT;
+      if (top < hitWinFirst + 10 || bottom > hitWinLast - 10) scheduleHits();
+    }
   }
 
   function render() {
@@ -1036,6 +1043,9 @@ function editorModal(entry, res, replaceInEditor) {
     if (tooBig) setHint(`文件较大（${humanSize(text.length)}），已改用纯文本模式以保证输入流畅；编辑与保存不受影响。`);
     else if (dense) setHint('代码片段过于密集，已改用纯文本模式以保证输入流畅。');
     else setHint('');
+    // 查找条开着时，文本一变命中位置也跟着变（用户可能直接在编辑区改代码）。
+    // 这里只重算计数、不滚动：用户正在编辑的地方不能被"跳到当前匹配"拽走。
+    if (findOpen) { recount(); paintHits(); }
     syncScroll();
   }
 
@@ -1051,7 +1061,12 @@ function editorModal(entry, res, replaceInEditor) {
 
   function applyHeight() {
     // 屏幕全屏时由 UA 决定尺寸，这里显式给 100% 更稳（各浏览器 UA 规则强度不一致）
-    editorBox.style.height = fsElement() ? '100%' : '58vh';
+    //
+    // 非全屏时要把查找条让出来的高度扣掉：编辑区是定高的，而 .modal 有 88vh 上限，
+    // 查找条一展开，正文就超出上限被 .modal-body 裁掉 —— 表现为编辑器最后几行
+    // （连同当前匹配的色块）看不见，点"下一处"像是没反应。
+    const shrink = findOpen && !fsElement() ? Math.min(160, findBar.offsetHeight + 8) : 0;
+    editorBox.style.height = fsElement() ? '100%' : `calc(58vh - ${shrink}px)`;
   }
 
   function setMaximized(on) {
@@ -1119,6 +1134,369 @@ function editorModal(entry, res, replaceInEditor) {
   };
   document.addEventListener('keydown', onEscCapture, true);
 
+  // ---------- 查找 / 替换条 ----------
+  //
+  // 为什么默认隐藏、而且在 DOM 顺序里排在编辑区之后：
+  // ui.js 的 modal() 打开弹窗后会自动 focus 里面第一个 input/textarea/select。
+  // 查找条里全是输入框 —— 一旦它先出现在 DOM 里（或者不隐藏），打开文件时焦点就会被
+  // 查找框抢走：用户一敲键盘是在搜索，而且编辑器根本收不到输入。
+  // 所以两道保险：① 默认 display:none；② 在 bodyEl 里排在 editorBox 之后，
+  // querySelector 找到的第一个控件永远是编辑用的 textarea。
+  // 视觉上它仍在编辑区上方，靠 flex 的 order:-1（只影响绘制顺序，不影响 DOM 顺序）。
+
+  const FIND_MAX = 20000;   // 命中上限：2MB 文件里搜单个字母能有几十万处，全存下来只会拖慢计数
+  const HIT_MARGIN = 40;    // 命中层窗口在可视区上下各多画 40 行，避免滚动时每帧重画
+  let findOpen = false;
+  let matches = [];
+  let truncated = false;
+  let cur = -1;
+  let hitWinFirst = 0;
+  let hitWinLast = 0;
+  let hitsRaf = 0;
+  let measureCtx = null;
+
+  const findInput = h('input.input', { placeholder: '查找内容', style: { width: '160px' } });
+  const replaceInput = h('input.input', { placeholder: '替换为', style: { width: '160px' } });
+  const caseCb = h('input', { type: 'checkbox', style: { margin: '0' } });
+  const findCount = h('span.zpf-fcount', { text: '0/0', title: '当前匹配 / 匹配总数' });
+  // onmousedown 里 preventDefault：点按钮不该把焦点从查找框抢走，
+  // 否则"输入关键词 → 点下一处 → 继续敲字"会变成敲进编辑区
+  const keepFocus = (e) => e.preventDefault();
+  const prevBtn = h('button.btn.btn-sm', { text: '↑ 上一处', title: '上一处（Shift+Enter）', onmousedown: keepFocus, onclick: () => stepMatch(-1) });
+  const nextBtn = h('button.btn.btn-sm', { text: '↓ 下一处', title: '下一处（Enter）', onmousedown: keepFocus, onclick: () => stepMatch(1) });
+  const findBar = h('div.zpf-findbar', {
+    style: {
+      display: 'none', flexDirection: 'column', gap: '6px',
+      marginBottom: '8px', padding: '8px 10px', order: '-1',
+      background: 'var(--panel-2)', border: '1px solid var(--border-soft)',
+      borderRadius: 'var(--radius-sm)',
+    },
+  }, [
+    // 分两行是刻意的：弹窗默认宽度下"查找 + 替换"挤一行会折行，把关闭按钮甩到
+    // 第二行去，看起来像坏了。两组各占一行，任何宽度下都整齐。
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } }, [
+      h('span', { style: { fontSize: '12.5px', color: 'var(--text-mute)' }, text: '查找' }),
+      findInput,
+      findCount,
+      prevBtn,
+      nextBtn,
+      h('label', {
+        style: { display: 'flex', alignItems: 'center', gap: '3px', fontSize: '12px', cursor: 'pointer' },
+        title: '区分大小写',
+      }, [caseCb, h('span', { text: 'Aa' })]),
+      h('div', { style: { flex: '1' } }),
+      h('button.btn.btn-sm', { text: '×', title: '关闭查找（Esc）', onclick: closeFind }),
+    ]),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } }, [
+      h('span', { style: { fontSize: '12.5px', color: 'var(--text-mute)' }, text: '替换为' }),
+      replaceInput,
+      h('button.btn.btn-sm', { text: '替换当前', title: '只替换当前匹配（尚未保存）', onmousedown: keepFocus, onclick: replaceCurrent }),
+      h('button.btn.btn-sm', { text: '全部替换', title: '替换全部匹配（尚未保存）', onmousedown: keepFocus, onclick: replaceAll }),
+    ]),
+  ]);
+
+  /**
+   * haystack(q) —— 按当前"区分大小写"开关返回用于 indexOf 的文本与关键词。
+   * 查找一律按**纯文本**处理，不把用户输入当正则（正则会让 `.` `*` `(` 这类
+   * 输入变成语法错误或意外命中，普通用户只会觉得"搜不到"）。
+   */
+  function haystack(q) {
+    const text = editor.value;
+    if (caseCb.checked) return { src: text, hay: text, needle: q };
+    const lo = text.toLowerCase();
+    const nlo = q.toLowerCase();
+    // 个别 Unicode 字符（如 'İ'）小写化后长度会变，长度一旦不同，命中下标就和原文
+    // 对不上（会画错位置、替换错字符）。这种极少数情况退回区分大小写：宁可少命中，不能错位。
+    if (lo.length !== text.length || nlo.length !== q.length) return { src: text, hay: text, needle: q };
+    return { src: text, hay: lo, needle: nlo };
+  }
+
+  function computeMatches() {
+    const q = findInput.value;
+    matches = [];
+    truncated = false;
+    if (!q) return;
+    const { hay, needle } = haystack(q);
+    let from = 0;
+    for (;;) {
+      const at = hay.indexOf(needle, from);
+      if (at < 0) break;
+      matches.push({ start: at, end: at + q.length });
+      if (matches.length >= FIND_MAX) { truncated = true; break; }
+      from = at + q.length;
+    }
+  }
+
+  function lineAt(text, pos) {
+    let line = 0;
+    for (let i = text.indexOf('\n'); i >= 0 && i < pos; i = text.indexOf('\n', i + 1)) line++;
+    return line;
+  }
+
+  function updateFindUI() {
+    const q = findInput.value;
+    if (!q) findCount.textContent = '0/0';
+    else if (!matches.length) findCount.textContent = '无匹配';
+    else findCount.textContent = `${cur + 1}/${matches.length}${truncated ? '+' : ''}`;
+    findCount.style.color = q && !matches.length ? '#f87171' : 'var(--text-mute)';
+    findCount.title = truncated ? `命中超过 ${FIND_MAX} 处，只统计并跳到前 ${FIND_MAX} 处` : '当前匹配 / 匹配总数';
+    prevBtn.disabled = !matches.length;
+    nextBtn.disabled = !matches.length;
+  }
+
+  function syncHits() {
+    // 窗口首行在文档里的 y 是 hitWinFirst*行高，所以整体上移这么多再减掉 scrollTop
+    hitInner.style.transform = `translate(${-editor.scrollLeft}px, ${hitWinFirst * ZPF_LINE_HEIGHT - editor.scrollTop}px)`;
+  }
+
+  function scheduleHits() {
+    if (hitsRaf) return;
+    hitsRaf = requestAnimationFrame(() => { hitsRaf = 0; paintHits(); });
+  }
+
+  /**
+   * paintHits() —— 把命中画进命中层（当前匹配换一个更醒目的颜色）。
+   * 只画可视区附近的窗口：大文件退回纯文本模式后 textarea 自己已经在渲染整篇文本，
+   * 再整篇镜像一份、每次滚动都重排，就是白白的双倍开销。
+   */
+  function paintHits() {
+    if (!findOpen || !findInput.value || !matches.length) {
+      hitLayer.style.display = 'none';
+      clear(hitInner);
+      return;
+    }
+    const text = editor.value;
+    const viewH = editor.clientHeight || 0;
+    const firstView = Math.floor(editor.scrollTop / ZPF_LINE_HEIGHT);
+    const lastView = firstView + Math.ceil(viewH / ZPF_LINE_HEIGHT) + 1;
+    const firstLine = Math.max(0, firstView - HIT_MARGIN);
+    const lastLine = lastView + HIT_MARGIN;
+
+    // 行号 → 字符下标（数换行）。纯文本模式的大文件下这是 O(n)，但只在重画时做一次，
+    // 比把整篇文本镜像进 DOM 便宜得多。
+    let line = 0;
+    let pos = 0;
+    while (line < firstLine && pos < text.length) {
+      const nl = text.indexOf('\n', pos);
+      if (nl < 0) break;
+      pos = nl + 1; line++;
+    }
+    const winStart = pos;
+    const winFirst = line;   // 窗口首行在文件里的真实行号（文件比 firstLine 短时会更小）
+    while (line <= lastLine && pos < text.length) {
+      const nl = text.indexOf('\n', pos);
+      if (nl < 0) { pos = text.length; break; }
+      pos = nl + 1; line++;
+    }
+    const winEnd = pos;
+
+    const curMatch = cur >= 0 ? matches[cur] : null;
+    const frag = document.createDocumentFragment();
+    let p = winStart;
+    for (const mt of matches) {
+      if (mt.end <= winStart) continue;
+      if (mt.start >= winEnd) break;
+      const s = Math.max(mt.start, winStart);
+      const e = Math.min(mt.end, winEnd);
+      if (s > p) frag.appendChild(document.createTextNode(text.slice(p, s)));
+      frag.appendChild(h('mark', {
+        class: mt === curMatch ? 'zpf-hit zpf-hit-cur' : 'zpf-hit',
+        text: text.slice(s, e),
+      }));
+      p = e;
+    }
+    if (p < winEnd) frag.appendChild(document.createTextNode(text.slice(p, winEnd)));
+
+    clear(hitInner);
+    hitInner.appendChild(frag);
+    hitWinFirst = winFirst;
+    hitWinLast = line;
+    hitLayer.style.display = '';
+    syncHits();
+  }
+
+  /** 用 canvas 量同一字体下的文字宽度：中文这类宽字符也能量准（按字符数×单宽算会偏）。 */
+  function textWidth(s) {
+    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+    measureCtx.font = `${ZPF_FONT_SIZE}px ${getComputedStyle(editor).fontFamily}`;
+    return measureCtx.measureText(s).width;
+  }
+
+  /** 把当前匹配滚进可视区（只动编辑器内部滚动，绝不 scrollIntoView，否则整个页面会被顶跑）。 */
+  function revealMatch(i) {
+    const mt = matches[i];
+    if (!mt) return;
+    const text = editor.value;
+    const lineTop = lineAt(text, mt.start) * ZPF_LINE_HEIGHT;
+    const viewH = editor.clientHeight;
+    if (lineTop - ZPF_LINE_HEIGHT < editor.scrollTop) {
+      editor.scrollTop = Math.max(0, lineTop - ZPF_LINE_HEIGHT);
+    } else if (lineTop + 2 * ZPF_LINE_HEIGHT > editor.scrollTop + viewH) {
+      editor.scrollTop = Math.max(0, lineTop + 2 * ZPF_LINE_HEIGHT - viewH);
+    }
+    // 横向：只有在匹配列真的滚出视野时才动，两侧各留 24px 余量
+    const lineStart = text.lastIndexOf('\n', mt.start - 1) + 1;
+    const before = text.slice(lineStart, mt.start).replace(/\t/g, '    ');
+    const self = text.slice(mt.start, mt.end).replace(/\t/g, '    ');
+    const x0 = textWidth(before);
+    const x1 = x0 + textWidth(self);
+    if (x0 - 24 < editor.scrollLeft) editor.scrollLeft = Math.max(0, x0 - 24);
+    else if (x1 + 24 > editor.scrollLeft + editor.clientWidth) {
+      editor.scrollLeft = Math.max(0, x1 + 24 - editor.clientWidth);
+    }
+    // 选区也设到匹配上：一是让"替换当前"有明确目标，二是用户点回编辑区时光标正好在匹配处。
+    // 注意不能 focus 编辑器 —— 焦点必须留在查找框里，否则"输入即查找"就断了；
+    // 失焦的 textarea 不绘制选区，所以可见的命中由 hitLayer 负责画（见上面的说明）。
+    editor.setSelectionRange(mt.start, mt.end);
+    syncScroll();
+  }
+
+  /** 重算命中并把"当前匹配"钉在 anchorStart 之后第一个（anchorStart 为空则从光标处往后找）。 */
+  function recount(anchorStart) {
+    const prev = cur >= 0 && matches[cur] ? matches[cur].start : null;
+    computeMatches();
+    const anchor = anchorStart != null ? anchorStart : prev;
+    if (!matches.length) cur = -1;
+    else if (anchor != null) {
+      const i = matches.findIndex((m) => m.start >= anchor);
+      cur = i < 0 ? matches.length - 1 : i;
+    } else {
+      // 在文件中间按 Ctrl+F 时不应该跳回文件头，从光标处往后找第一个
+      const i = matches.findIndex((m) => m.end > editor.selectionStart);
+      cur = i < 0 ? 0 : i;
+    }
+    updateFindUI();
+  }
+
+  /** 改文本、更新计数、把匹配重算一遍并跳到 anchorStart 之后的下一个匹配。 */
+  function findRefresh(anchorStart) {
+    recount(anchorStart);
+    if (cur >= 0) revealMatch(cur);
+    paintHits();
+  }
+
+  /** 下一处 / 上一处：到头循环回绕。 */
+  function stepMatch(delta) {
+    if (!matches.length) return;
+    cur = (cur + delta + matches.length) % matches.length;
+    updateFindUI();
+    revealMatch(cur);
+    paintHits();
+  }
+
+  /** 替换/直接改文本后的统一收口：滚动位置要显式放回去。 */
+  function applyEdited(next, anchorStart) {
+    const y = editor.scrollTop;
+    const x = editor.scrollLeft;
+    editor.value = next;
+    // 直接给 value 赋值在部分浏览器会把滚动位置弹回开头，存一下再放回去
+    editor.scrollTop = y;
+    editor.scrollLeft = x;
+    dirty = true;
+    stat.textContent = `${next.length} 字符（已修改）`;
+    scheduleRender();
+    findRefresh(anchorStart);
+  }
+
+  function replaceCurrent() {
+    if (cur < 0 || !matches.length) { toast('没有可替换的匹配', 'warn'); return; }
+    const mt = matches[cur];
+    const rep = replaceInput.value;
+    const next = editor.value.slice(0, mt.start) + rep + editor.value.slice(mt.end);
+    // 锚在插入内容之后：连续点"替换当前"会顺着往下替换，和编辑器里的替换流程一致
+    applyEdited(next, mt.start + rep.length);
+  }
+
+  function replaceAll() {
+    const q = findInput.value;
+    if (!q) { toast('请先输入查找内容', 'warn'); return; }
+    // 这里单独扫一遍而**不复用 matches**：matches 有 FIND_MAX 上限（大文件里搜单个
+    // 字母会撞上），拿它来"全部替换"会只替换前 2 万处却不告诉用户。
+    const { src, hay, needle } = haystack(q);
+    const rep = replaceInput.value;
+    let out = '';
+    let pos = 0;
+    let n = 0;
+    for (;;) {
+      const at = hay.indexOf(needle, pos);
+      if (at < 0) break;
+      out += src.slice(pos, at) + rep;
+      pos = at + q.length;
+      n++;
+    }
+    if (!n) { toast('没有可替换的匹配', 'warn'); return; }
+    out += src.slice(pos);
+    applyEdited(out, 0);
+    toast(`已替换 ${n} 处（尚未保存）`, 'ok');
+  }
+
+  function openFind() {
+    if (!findOpen) {
+      findOpen = true;
+      findBar.style.display = 'flex';
+      // 让出查找条占的高度，别把弹窗顶过 88vh 上限（见 applyHeight 的说明）
+      applyHeight();
+      requestAnimationFrame(syncScroll);
+    }
+    // 再按一次 Ctrl+F 或点按钮时把已有关键词选中，方便直接覆盖重输
+    findInput.focus();
+    findInput.select();
+    findRefresh();
+  }
+
+  function closeFind() {
+    if (!findOpen) return;
+    findOpen = false;
+    // 保留关键词和命中不删（matches 留着），但要清掉画出来的色块
+    findBar.style.display = 'none';
+    clear(hitInner);
+    hitLayer.style.display = 'none';
+    applyHeight();                 // 把高度还给编辑区
+    requestAnimationFrame(syncScroll);
+    // 焦点还给编辑器：按 Esc 关掉查找条之后，用户通常就是要接着改代码
+    editor.focus();
+  }
+
+  findInput.addEventListener('input', () => findRefresh());
+  findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); stepMatch(e.shiftKey ? -1 : 1); }
+  });
+  replaceInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); replaceCurrent(); }
+  });
+  caseCb.addEventListener('change', () => findRefresh());
+
+  // 为什么快捷键挂在 document 的**捕获阶段**：
+  // ① 焦点在查找框里时，Ctrl+F / Esc 不会冒泡到 textarea 的监听器上；
+  // ② ui.js 的 modal() 也是在 document 上（冒泡阶段）监听 Esc 的，捕获阶段先跑，
+  //    这样"查找条开着 → Esc 只关查找条；查找条关着 → Esc 才关弹窗"才成立。
+  const onEditorKey = (e) => {
+    const key = e.key || '';
+    const mod = e.ctrlKey || e.metaKey;
+    if (key === 'Escape') {
+      // 屏幕全屏时 Esc 归浏览器"退出全屏"用（见上面的 onEscCapture），
+      // 这时不能抢：否则 preventDefault 会让用户退不出全屏。
+      if (findOpen && !fsElement()) {
+        e.preventDefault();
+        e.stopPropagation();   // 拦住 modal 的 Esc，别把整个编辑弹窗一起关掉
+        closeFind();
+      }
+      return;
+    }
+    if (mod && !e.altKey && key.toLowerCase() === 'f') {
+      e.preventDefault();      // 拦掉浏览器自带的查找框，否则它会盖在面板上
+      openFind();
+      return;
+    }
+    // 焦点在查找框里时 Ctrl+S 也要保存。焦点在编辑区里时由 textarea 自己的监听处理，
+    // 这里不重复触发（否则会写两次文件、弹两个 toast）。
+    if (mod && findOpen && findBar.contains(e.target) && key.toLowerCase() === 's') {
+      e.preventDefault();
+      writeBack();
+    }
+  };
+  document.addEventListener('keydown', onEditorKey, true);
+
   // ---------- 工具栏 ----------
   const maxBtn = h('button.btn.btn-sm', {
     text: '⛶ 最大化', title: '撑满浏览器窗口（不进入系统全屏）',
@@ -1133,7 +1511,7 @@ function editorModal(entry, res, replaceInEditor) {
     stat,
     langPill,
     h('div', { style: { flex: '1' } }),
-    h('button.btn.btn-sm', { text: '查找替换', onclick: () => replaceInEditor(editor, entry) }),
+    h('button.btn.btn-sm', { text: '🔍 查找替换', title: '查找 / 替换（Ctrl+F）', onclick: openFind }),
     maxBtn,
     fsBtn,
   ]);
@@ -1141,6 +1519,9 @@ function editorModal(entry, res, replaceInEditor) {
   const bodyEl = h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: '0' } }, [
     toolbar,
     editorBox,
+    // 查找条排在编辑区之后是有意的，见上面"为什么默认隐藏"的说明；
+    // 视觉位置由它自己的 order:-1 决定（显示在编辑区上方）
+    findBar,
     bigHint,
     h('div.hint', { style: { marginTop: '8px' }, text: '保存采用"先写临时文件再替换"，写入中断不会破坏原文件。' }),
   ]);
@@ -1172,6 +1553,7 @@ function editorModal(entry, res, replaceInEditor) {
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
       document.removeEventListener('keydown', onEscCapture, true);
+      document.removeEventListener('keydown', onEditorKey, true);
       // 关弹窗时如果还在屏幕全屏，必须主动退出，否则会留在一块空白全屏层上
       if (fsElement()) {
         const exit = document.exitFullscreen || document.webkitExitFullscreen;

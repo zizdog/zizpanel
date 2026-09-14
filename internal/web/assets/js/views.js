@@ -210,7 +210,12 @@ export function DashboardView(content, ctx = {}) {
       ['处理器', s.cpu_model || '-'],
       ['运行时长', duration(s.uptime)],
       ['进程数', String(s.procs)],
-      ['CPU 温度', s.cpu_temp > 0 ? s.cpu_temp + ' °C' : '不可读取（需 root）'],
+      // 取不到时**如实说原因**：以前这里写死"不可读取（需 root）"，
+      // 而 Apple Silicon 上的真实原因是 powermetrics 没有 smc 采样器（不是权限）。
+      // 现在后端会把来源/原因放在 cpu_temp_note 里（例如 "IOHID tdie×24"）。
+      ['CPU 温度', s.cpu_temp > 0
+        ? s.cpu_temp + ' °C' + (s.cpu_temp_note ? '（' + s.cpu_temp_note + '）' : '')
+        : '取不到' + (s.cpu_temp_note ? '：' + s.cpu_temp_note : '')],
       ['面板地址', location.origin],
       ['服务端时间', new Date().toLocaleString('zh-CN')],
     ];
@@ -303,6 +308,10 @@ export function MonitorView(content, ctx = {}) {
     clear(statsList);
     const rows = [
       ['CPU 使用率', pct(s.cpu_used)],
+      // 监控页也放一份温度：这是"现在机器热不热"最直观的一个数
+      ['CPU 温度', s.cpu_temp > 0
+        ? s.cpu_temp + ' °C' + (s.cpu_temp_note ? '（' + s.cpu_temp_note + '）' : '')
+        : '取不到' + (s.cpu_temp_note ? '：' + s.cpu_temp_note : '')],
       ['系统负载 (1/5/15)', `${s.load_1.toFixed(2)} / ${s.load_5.toFixed(2)} / ${s.load_15.toFixed(2)}`],
       ['物理内存', `${bytes(s.mem_used)} / ${bytes(s.mem_total)}`],
       ['空闲内存', bytes(s.mem_free)],
