@@ -11,7 +11,10 @@
 //   - 擦除：ED（J：0/1/2/3）、EL（K：0/1/2）
 //   - 保存/恢复光标（s/u）、插入行（L）、删除行（M）、删除字符（P）
 //   - 回车、换行、退格、制表符
-// 未支持（可接受）：滚动区域（DECSTBM）、备用屏幕的完整语义、鼠标上报。
+//   - 回滚历史（滚出屏幕顶部的行保留下来，见 MAX_HISTORY）
+//   - 块状光标（DECTCEM：ESC[?25h/l 可见性）
+//   - 备用屏幕（ESC[?1049h/l，别名 ?47/?1047）
+// 未支持（可接受）：滚动区域（DECSTBM）、鼠标上报。
 
 // 默认调色板（与主流终端接近，深色背景）
 const PALETTE = [
@@ -47,6 +50,11 @@ function newCell(ch = ' ', fg = null, bg = null, attrs = 0) {
   return { ch, fg, bg, attrs };
 }
 
+// 回滚历史上限。2000 行是"够翻"和"不把浏览器内存吃光"的折中：
+// 每行是 cols 个 cell 对象，而且每行在 DOM 里至少一个节点，
+// 设成无上限的话，跑一晚上日志式输出的命令就会把标签页拖死。
+const MAX_HISTORY = 2000;
+
 // 样式位
 export const ATTR_BOLD = 1;
 export const ATTR_DIM = 2;
@@ -68,8 +76,7 @@ export class Terminal {
   }
 
   reset() {
-    this.grid = [];
-    for (let r = 0; r < this.rows; r++) this.grid.push(this.blankRow());
+    this.grid = this.freshGrid();
     this.x = 0;
     this.y = 0;
     this.fg = null;
@@ -77,14 +84,50 @@ export class Terminal {
     this.attrs = 0;
     this.savedX = 0;
     this.savedY = 0;
+    this.cursorVisible = true;
+    // 回滚历史：元素是 { seq, row }。
+    // seq 单调递增，render() 用它判断"哪些历史行已经进了 DOM"，
+    // 这样既不会重复渲染，上限裁剪时也知道该删掉哪些 DOM 节点。
+    this.history = [];
+    this.histSeq = 0;
+    this.histDirty = true;
+    // 备用屏幕状态（见 applyMode 里的 ?1049 处理）
+    this.altScreen = false;
+    this.mainSaved = null;
+    this.altGrid = null;
     // 解析状态：用于跨 write() 调用拼接不完整的转义序列
     this.pending = '';
   }
 
-  blankRow() {
+  freshGrid() {
+    const g = [];
+    for (let r = 0; r < this.rows; r++) g.push(this.blankRow());
+    return g;
+  }
+
+  blankRow(cols = this.cols) {
     const row = [];
-    for (let c = 0; c < this.cols; c++) row.push(newCell());
+    for (let c = 0; c < cols; c++) row.push(newCell());
     return row;
+  }
+
+  /** fitRow 把一行按给定列宽裁剪/补空。 */
+  fitRow(row, cols) {
+    while (row.length < cols) row.push(newCell());
+    row.length = cols;
+    return row;
+  }
+
+  /**
+   * fitGrid 把一整块网格调成 cols×rows。
+   * 备用屏切换期间窗口可能改过尺寸，被切走的那块屏会停在旧列宽/旧行数上；
+   * 不归一化的话渲染时 row[c-1] 会是 undefined（真的抛过 TypeError）。
+   */
+  fitGrid(grid, cols, rows) {
+    while (grid.length < rows) grid.push(this.blankRow(cols));
+    grid.length = rows;
+    for (const row of grid) this.fitRow(row, cols);
+    return grid;
   }
 
   resize(cols, rows) {
@@ -102,6 +145,13 @@ export class Terminal {
       void rowLen;
     }
     this.grid = next;
+    if (cols !== this.cols) {
+      // 历史行是按旧列宽渲染的。这里直接截断/补空，而不是重排换行 ——
+      // 只要有一行比容器宽，整块屏幕就会挤出**横向**滚动条，
+      // 而横向滚动会让"定宽 18px 行 + 等宽字体"的列对齐彻底失效。
+      for (const entry of this.history) this.fitRow(entry.row, cols);
+      this.histDirty = true; // 历史行要按新宽度重画
+    }
     this.cols = cols;
     this.rows = rows;
     // 修正光标位置
@@ -168,9 +218,23 @@ export class Terminal {
   }
 
   scrollUp() {
-    this.grid.shift();
+    const dropped = this.grid.shift();
+    // 备用屏里的滚动**绝不能**进回滚历史：vim/less 每重画一帧就可能滚一次，
+    // 若记进历史，用户退出后往上滚看到的全是重画帧垃圾，真正的历史反被冲掉。
+    if (dropped && !this.altScreen) this.pushHistory(dropped);
     this.grid.push(this.blankRow());
     this.y = this.rows - 1;
+  }
+
+  pushHistory(row) {
+    this.history.push({ seq: ++this.histSeq, row });
+    // 超上限丢最老的；对应 DOM 由 renderHistory() 按 seq 补齐/裁剪
+    if (this.history.length > MAX_HISTORY) this.history.shift();
+  }
+
+  clearHistory() {
+    this.history = [];
+    this.histDirty = true; // 让 render() 把历史 DOM 也清掉
   }
 
   /**
@@ -262,9 +326,72 @@ export class Terminal {
       case '@': this.insertChars(p0 || 1); return;
       case 's': this.savedX = this.x; this.savedY = this.y; return;
       case 'u': this.x = this.savedX; this.y = this.savedY; return;
-      case 'h': case 'l': return; // 模式设置（光标可见性等）：忽略
+      case 'h': this.applyMode(params, priv, true); return;
+      case 'l': this.applyMode(params, priv, false); return;
       default: return;
     }
+  }
+
+  /**
+   * applyMode 处理 DECSET/DECRST（ESC[?N h/l）。只实现真正影响渲染的模式。
+   */
+  applyMode(params, priv, on) {
+    // 不带 '?' 的是 ANSI 模式（插入模式、行回绕等），与渲染无关，忽略
+    if (priv !== '?') return;
+    for (const p of params) {
+      if (p === 25) {
+        // DECTCEM：程序可以隐藏光标（vim/less 会自己画）
+        this.cursorVisible = on;
+      } else if (p === 47 || p === 1047 || p === 1049) {
+        // 47/1047/1049 都是"备用屏幕"，差别只在清屏时机：
+        //   47   ：切换，但保留备用屏上一次留下的内容
+        //   1047 ：进入时清空，退出时也清空
+        //   1049 ：进入时清空 + 保存光标位置，退出时恢复光标（vim/less 用的就是它）
+        if (on) this.enterAltScreen(p !== 47);
+        else this.exitAltScreen(p === 1047);
+      }
+    }
+  }
+
+  enterAltScreen(clear) {
+    if (this.altScreen) return;
+    // 保存主屏的全部可恢复状态：网格、光标、回滚历史、DECSC 保存位。
+    // 网格是引用保存 —— 进入备用屏后主屏网格不会再被写，所以退出时原样就是"原样"。
+    this.mainSaved = {
+      grid: this.grid,
+      x: this.x,
+      y: this.y,
+      history: this.history,
+      savedX: this.savedX,
+      savedY: this.savedY,
+    };
+    this.altScreen = true;
+    if (clear || !this.altGrid) this.altGrid = this.freshGrid();
+    // 复用上一次的备用屏内容时也要归一化：中间可能改过窗口宽度
+    else this.fitGrid(this.altGrid, this.cols, this.rows);
+    this.grid = this.altGrid;
+    // 备用屏自己的历史恒为空（scrollUp 在备用屏下不入历史）
+    this.history = [];
+    this.x = 0;
+    this.y = 0;
+    this.histDirty = true; // 让 render() 清掉屏幕上主屏的历史行
+  }
+
+  exitAltScreen(clearAlt) {
+    if (!this.altScreen || !this.mainSaved) return;
+    // 47 的语义要求备用屏内容留到下次进入；1047l 要求退出前清空
+    this.altGrid = clearAlt ? null : this.grid;
+    // 主屏在备用屏期间不会被 resize 动到，所以要按**当前**尺寸归一化后再还原
+    this.grid = this.fitGrid(this.mainSaved.grid, this.cols, this.rows);
+    this.x = Math.min(this.mainSaved.x, this.cols - 1);
+    this.y = Math.min(this.mainSaved.y, this.rows - 1);
+    this.savedX = this.mainSaved.savedX;
+    this.savedY = this.mainSaved.savedY;
+    this.history = this.mainSaved.history;
+    for (const entry of this.history) this.fitRow(entry.row, this.cols);
+    this.mainSaved = null;
+    this.altScreen = false;
+    this.histDirty = true;
   }
 
   applySGR(params) {
@@ -310,6 +437,8 @@ export class Terminal {
   eraseDisplay(mode) {
     if (mode === 2 || mode === 3) {
       for (let r = 0; r < this.rows; r++) this.grid[r] = this.blankRow();
+      // 终端惯例：3J（erase saved lines）清回滚历史，2J 只清屏、不动历史。
+      if (mode === 3) this.clearHistory();
       if (mode === 2) { this.x = 0; this.y = 0; }
       return;
     }
@@ -372,64 +501,159 @@ export class Terminal {
   /**
    * render 把网格渲染成 DOM。
    *
+   * DOM 结构（都由本函数保证存在）：
+   *   .term-screen
+   *     .term-history   <- 回滚历史，行数 ≤ MAX_HISTORY
+   *     .term-rows      <- 恰好 rows 个 .term-line，与 grid 行按下标一一对应
+   *
+   * 分成两层的原因：滚出屏幕的行只要往 .term-history 里追加即可，
+   * "当前屏 32 行"的下标关系仍然只由 .term-rows 维护，
+   * 不会因为历史变长而算错。
+   *
    * 性能策略：逐行比较上一次的行内容，只有变化的行才重建 DOM。
    * 终端每秒可能刷新多次，全量重建会在长会话里明显卡顿。
    */
   render(container) {
-    while (container.childElementCount < this.rows) {
-      const line = document.createElement('div');
-      line.className = 'term-line';
-      container.appendChild(line);
-    }
-    while (container.childElementCount > this.rows) {
-      container.removeChild(container.lastChild);
-    }
+    const { histEl, rowsEl } = this.ensureStructure(container);
+    this.renderHistory(histEl);
+
+    while (rowsEl.childElementCount < this.rows) rowsEl.appendChild(this.newLineEl());
+    while (rowsEl.childElementCount > this.rows) rowsEl.removeChild(rowsEl.lastElementChild);
 
     for (let r = 0; r < this.rows; r++) {
       const row = this.grid[r];
-      const line = container.children[r];
+      const line = rowsEl.children[r];
       // 生成该行的"签名"：字符 + 样式，用于判断是否需要重绘
       let sig = '';
       for (let c = 0; c < this.cols; c++) {
         const cell = row[c];
         sig += cell.ch + (cell.fg || '') + (cell.bg || '') + cell.attrs;
       }
+      // 光标也进签名：光标移动时单元格内容没变，但这一行必须重画，
+      // 否则块状光标会停在原地不动。
+      if (this.cursorVisible && r === this.y) sig += '|C' + this.x;
       if (line.dataset.sig === sig) continue;
       line.dataset.sig = sig;
-
-      // 按连续相同样式分组，减少 span 数量
-      const frag = document.createDocumentFragment();
-      let runStart = 0;
-      for (let c = 1; c <= this.cols; c++) {
-        const prev = row[c - 1];
-        const cur = c < this.cols ? row[c] : null;
-        const same = cur && cur.fg === prev.fg && cur.bg === prev.bg && cur.attrs === prev.attrs;
-        if (!same) {
-          const text = this.sliceText(row, runStart, c);
-          if (text.trim() === '' && !prev.fg && !prev.bg && !prev.attrs) {
-            // 纯空白的默认样式：直接放文本节点，省去 span
-            frag.appendChild(document.createTextNode(text));
-          } else {
-            const span = document.createElement('span');
-            span.textContent = text;
-            if (prev.fg) span.style.color = prev.fg;
-            if (prev.bg) span.style.background = prev.bg;
-            if (prev.attrs & ATTR_BOLD) span.style.fontWeight = '700';
-            if (prev.attrs & ATTR_DIM) span.style.opacity = '0.65';
-            if (prev.attrs & ATTR_ITALIC) span.style.fontStyle = 'italic';
-            if (prev.attrs & ATTR_UNDERLINE) span.style.textDecoration = 'underline';
-            if (prev.attrs & ATTR_STRIKE) span.style.textDecoration = 'line-through';
-            if (prev.attrs & ATTR_REVERSE) {
-              span.style.color = prev.bg || '#1c1f26';
-              span.style.background = prev.fg || '#e6e9f0';
-            }
-            frag.appendChild(span);
-          }
-          runStart = c;
-        }
-      }
-      line.replaceChildren(frag);
+      this.paintLine(line, row, r);
     }
+  }
+
+  /**
+   * ensureStructure 保证容器里有 .term-history + .term-rows 两层骨架。
+   * 容器可能被外部 clear() 过（重连时会重建终端的 DOM），所以每次都核对。
+   */
+  ensureStructure(container) {
+    let histEl = container.firstElementChild;
+    let rowsEl = histEl ? histEl.nextElementSibling : null;
+    if (!histEl || !histEl.classList.contains('term-history') ||
+        !rowsEl || !rowsEl.classList.contains('term-rows')) {
+      while (container.firstChild) container.removeChild(container.firstChild);
+      histEl = document.createElement('div');
+      histEl.className = 'term-history';
+      rowsEl = document.createElement('div');
+      rowsEl.className = 'term-rows';
+      container.appendChild(histEl);
+      container.appendChild(rowsEl);
+      this.histDirty = true; // 骨架是新的，历史行得整体重画
+    }
+    return { histEl, rowsEl };
+  }
+
+  newLineEl() {
+    const line = document.createElement('div');
+    line.className = 'term-line';
+    return line;
+  }
+
+  /**
+   * renderHistory 让 .term-history 的 DOM 与 this.history 对齐。
+   *
+   * 正常情况每次只补 1 行（刚滚出去的那行），所以是 O(1)；
+   * 只有切换备用屏/改宽度/清屏这类整体换屏才会全量重画。
+   */
+  renderHistory(histEl) {
+    if (this.histDirty) {
+      while (histEl.firstChild) histEl.removeChild(histEl.firstChild);
+      this.histDirty = false;
+    }
+    // 超出上限被丢掉的最老行，DOM 里也要删掉
+    const firstSeq = this.history.length ? this.history[0].seq : 0;
+    while (histEl.firstElementChild && Number(histEl.firstElementChild.dataset.seq) < firstSeq) {
+      histEl.removeChild(histEl.firstElementChild);
+    }
+    while (histEl.childElementCount > this.history.length) {
+      histEl.removeChild(histEl.lastElementChild);
+    }
+    // 快路径：DOM 已经和历史一一对应
+    if (histEl.childElementCount === this.history.length && this.history.length) {
+      const lastDomSeq = Number(histEl.lastElementChild.dataset.seq);
+      if (lastDomSeq === this.history[this.history.length - 1].seq) return;
+    }
+
+    let lastSeq = histEl.lastElementChild ? Number(histEl.lastElementChild.dataset.seq) : 0;
+    const frag = document.createDocumentFragment();
+    for (const entry of this.history) {
+      if (entry.seq <= lastSeq) continue;
+      const line = this.newLineEl();
+      line.dataset.seq = String(entry.seq);
+      this.paintLine(line, entry.row, -1); // 历史行不画光标
+      frag.appendChild(line);
+    }
+    histEl.appendChild(frag);
+  }
+
+  /**
+   * paintLine 把一行 cell 画进 .term-line。
+   * cursorRowIndex 是这一行在网格里的行号；历史行传 -1（光标只在当前屏）。
+   */
+  paintLine(line, row, cursorRowIndex) {
+    const cx = this.cursorVisible && cursorRowIndex === this.y ? this.x : -1;
+
+    // 按连续相同样式分组，减少 span 数量
+    const frag = document.createDocumentFragment();
+    let runStart = 0;
+    for (let c = 1; c <= this.cols; c++) {
+      const prev = row[c - 1];
+      const cur = c < this.cols ? row[c] : null;
+      // 光标所在的那一格必须单独成段，否则它会被并进普通 span，反色块画不出来
+      const same = cur && cur.fg === prev.fg && cur.bg === prev.bg && cur.attrs === prev.attrs
+        && c !== cx && c !== cx + 1;
+      if (!same) {
+        const text = this.sliceText(row, runStart, c);
+        const isCursor = runStart === cx;
+        if (text.trim() === '' && !prev.fg && !prev.bg && !prev.attrs && !isCursor) {
+          // 纯空白的默认样式：直接放文本节点，省去 span
+          frag.appendChild(document.createTextNode(text));
+        } else {
+          const span = document.createElement('span');
+          span.textContent = text;
+          let fg = prev.fg;
+          let bg = prev.bg;
+          if (prev.attrs & ATTR_REVERSE) {
+            const swap = fg;
+            fg = bg || '#1c1f26';
+            bg = swap || '#e6e9f0';
+          }
+          if (fg) span.style.color = fg;
+          if (bg) span.style.background = bg;
+          if (prev.attrs & ATTR_BOLD) span.style.fontWeight = '700';
+          if (prev.attrs & ATTR_DIM) span.style.opacity = '0.65';
+          if (prev.attrs & ATTR_ITALIC) span.style.fontStyle = 'italic';
+          if (prev.attrs & ATTR_UNDERLINE) span.style.textDecoration = 'underline';
+          if (prev.attrs & ATTR_STRIKE) span.style.textDecoration = 'line-through';
+          if (isCursor) {
+            // 块状光标 = 反色块：拿该格的前景色当底、背景色当字色。
+            // 空格单元格（ch 是 ' '）也走这条路，所以空白处同样看得见。
+            span.classList.add('term-cursor');
+            span.style.color = bg || '#0b0d12';
+            span.style.background = fg || '#d8dee9';
+          }
+          frag.appendChild(span);
+        }
+        runStart = c;
+      }
+    }
+    line.replaceChildren(frag);
   }
 
   sliceText(row, from, to) {
@@ -438,14 +662,17 @@ export class Terminal {
     return s;
   }
 
-  /** plainText 返回纯文本内容（用于复制）。 */
+  /** plainText 返回纯文本内容（含回滚历史，供"复制全部"使用）。 */
   plainText() {
     const lines = [];
-    for (let r = 0; r < this.rows; r++) {
+    const push = (row) => {
       let s = '';
-      for (let c = 0; c < this.cols; c++) s += this.grid[r][c].ch;
+      const n = Math.min(this.cols, row.length);
+      for (let c = 0; c < n; c++) s += row[c].ch;
       lines.push(s.replace(/\s+$/, ''));
-    }
+    };
+    for (const entry of this.history) push(entry.row);
+    for (let r = 0; r < this.rows; r++) push(this.grid[r]);
     while (lines.length && lines[lines.length - 1] === '') lines.pop();
     return lines.join('\n');
   }

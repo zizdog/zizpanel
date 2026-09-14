@@ -10,6 +10,10 @@ import (
 	"github.com/zizdog/zizpanel/internal/store"
 )
 
+// ErrServiceNotFound 表示注册表里没有这条服务记录。
+// HTTP 层据此返回 404，而不是把"记录本来就没有"报成 500。
+var ErrServiceNotFound = errors.New("服务不存在")
+
 // Repository 负责服务注册表的持久化。
 //
 // 只存"这个服务是什么、怎么管"，不存运行状态 ——
@@ -143,7 +147,9 @@ func (r *Repository) Delete(ctx context.Context, name string) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("服务 %s 不存在", name)
+		// 用哨兵错误把"不存在"和真正的数据库故障分开：HTTP 层要据此返回 404，
+		// 而不是把"记录本来就没有"报成 500（曾让清理脚本/UI 测试看到假的服务端错误）。
+		return fmt.Errorf("%w: %s", ErrServiceNotFound, name)
 	}
 	return nil
 }

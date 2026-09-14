@@ -454,3 +454,23 @@ func TestComposeUpIsAsync(t *testing.T) {
 		t.Error("stop 是秒级动作，不该也变成异步任务")
 	}
 }
+
+// TestForgetMissingServiceIs404 锁住一个语义细节：
+// 删除（Forget）一个**不存在**的服务记录是 404，不是 500。
+//
+// 原本这里是 500 —— 后果不只是语义难看：UI 测试/清理脚本调用它清理
+// "上一次可能留下的测试服务"时，会凭空冒出一条假的服务端 500 错误，
+// 让整轮 UI 验证因为一条不存在的记录而失败。
+func TestForgetMissingServiceIs404(t *testing.T) {
+	_, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+
+	res, out, _ := doJSON(t, ts, "DELETE", "/api/v1/services/no-such-service-here", nil, cookies)
+	if res.StatusCode != 404 {
+		t.Fatalf("删除不存在的服务应是 404，实际 %d: %v", res.StatusCode, out)
+	}
+	if !strings.Contains(asString(out["msg"]), "不存在") {
+		t.Errorf("404 的说明应写清「服务不存在」，实际 %q", out["msg"])
+	}
+}

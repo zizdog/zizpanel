@@ -7,7 +7,7 @@
 package version
 
 // Version 是当前面板版本。语义化版本：主版本.次版本.修订号
-var Version = "0.4.2"
+var Version = "0.4.6"
 
 // Commit 与 BuildTime 由构建脚本通过 -ldflags 注入，源码运行时为空。
 var (

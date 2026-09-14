@@ -339,9 +339,35 @@ button, input, select, textarea { font: inherit; color: inherit; }
   font-variant-ligatures: none;
   font-kerning: none;
   tab-size: 8;
+  /* 关掉浏览器的滚动锚定：新增历史行后 scrollTop 由 JS 明确补偿，
+     两者同时调整会互相打架，导致"用户正在看的历史被顶走"。 */
+  overflow-anchor: none;
 }
 .term-line { height: 18px; white-space: pre; }
+/* 回滚历史与当前屏分两层：历史行只往下追加，当前屏行数恒为 rows，
+   这样 .term-line 与网格行的下标对应关系不会被历史长度影响。 */
+.term-history, .term-rows { white-space: pre; }
+.term-history { overflow-anchor: none; }
 .term-screen:focus { box-shadow: inset 0 0 0 1px var(--brand); }
+
+/* 块状光标。反色（背景=该格前景色、文字=该格背景色）由 JS 按单元格算好，
+   这里只负责形状和闪烁。
+   用 inline-block + height/line-height 18px 是为了让色块撑满整格：
+   行内元素自身的背景只有字身高（约 15px），会看起来"缺一截"。
+   vertical-align: top 让它与整行顶部对齐，基线因此和普通行完全一致。 */
+.term-cursor {
+  display: inline-block;
+  height: 18px;
+  line-height: 18px;
+  vertical-align: top;
+  animation: term-cursor-blink 1.06s steps(1, end) infinite;
+}
+@keyframes term-cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0.2; }
+}
+/* 失焦时停闪并变暗：终端没拿到焦点还在闪很吵，而且会让人误以为可以打字 */
+.term-screen:not(:focus) .term-cursor { animation: none; opacity: 0.55; }
 
 /* ---------- 文件管理 ---------- */
 .files-drop {

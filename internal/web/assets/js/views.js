@@ -538,6 +538,7 @@ export function SettingsView(content) {
             h('div.field', [h('label', { text: 'Shell 路径' }), shell,
               h('div.hint', { text: '留空则自动选择 /bin/zsh（macOS 默认）或 /bin/bash' })]),
             h('div.field', [h('label', { text: '空闲超时（分钟）' }), idle,
+              h('div.hint', { text: '0 = 不自动回收（会话一直留着，直到你点「关闭会话」或面板重启）' }),
               h('div.hint', { text: '填 0 表示不限制。超时后会话自动断开。' })]),
             h('div.field', [h('label', { text: '最大并发会话数' }), maxSess]),
           ]),

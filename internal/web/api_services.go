@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -381,6 +382,11 @@ func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	mgr := s.svcManager()
 	if err := mgr.Forget(r.Context(), name); err != nil {
+		// 记录不存在是 404（客户端用错名字），不是 500（服务端故障）
+		if errors.Is(err, services.ErrServiceNotFound) {
+			fail(w, http.StatusNotFound, err.Error())
+			return
+		}
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}

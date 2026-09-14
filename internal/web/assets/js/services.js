@@ -102,16 +102,20 @@ export function ServicesView(content, ctx = {}) {
    *
    * 用户的原话是：看到"1 个健康检查失败"这个提示，不知道接下来该做什么。
    * 光给一个红标签等于把排查工作全丢给用户。这里按**失败的种类**给出最可能的
-   * 原因与下一步动作 —— 尤其是 401：很多服务（Stirling PDF、Uptime Kuma 等）
-   * 首页/根路径本来就要求登录，401 其实说明它是好的，是**检查地址选错了**。
+   * 原因与下一步动作。
+   *
+   * 注意 401/403 这条分支现在很少走到：后端已经把"需要身份验证"判为**健康**
+   * （Stirling PDF 这类应用装完要设自己的账号密码，401 说明它活得好好的）。
+   * 只有当用户又填了「期望包含内容」时，才会因为内容对不上而失败 ——
+   * 所以这里的话术是"校验方式选错了"，而不是"服务有问题"。
    */
   function healthHint(health) {
     const code = Number(health.code || 0);
     const msg = String(health.message || '');
     if (code === 401 || code === 403) {
-      return '该地址要求身份验证，服务本身很可能是正常的。'
-        + '建议把「健康检查地址」改成不需要登录的路径（常见：/healthz、/api/health、/ping），'
-        + '或在「期望包含内容」留空、只看状态码。';
+      return '该地址要求身份验证，服务本身是正常的（所以默认按状态码判断时它算健康）。'
+        + '但登录页里不会有你填的「期望包含内容」，建议把它清空，'
+        + '或把「健康检查地址」换成不需要登录的路径（常见：/healthz、/api/health、/ping）。';
     }
     if (code === 404) {
       return '地址存在但路径不对（404）。确认健康检查地址写的是这个服务真实提供的路径。';
@@ -219,6 +223,16 @@ export function ServicesView(content, ctx = {}) {
         healthPill,
         s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
       ]),
+
+      // 需要身份验证（401/403）时，卡片上给一行**说明**：
+      // 后端已经把它判为健康（Stirling PDF 这类应用装完就是要设账号密码，
+      // 401 说明它活得好好的），但用户会疑惑"明明要登录，怎么显示健康"，
+      // 所以把原因摆出来，而不是只藏在标签的 title 里。
+      (health.checked && health.ok && (health.code === 401 || health.code === 403))
+        ? h('div', {
+          style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+          text: '健康检查：' + health.message + '（' + (health.latency_ms || 0) + 'ms）',
+        }) : null,
 
       // 健康检查失败：把"是什么、为什么、怎么办"都摆出来
       (health.checked && !health.ok) ? h('div', {

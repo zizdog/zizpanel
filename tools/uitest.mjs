@@ -515,18 +515,105 @@ try {
     await page.waitForTimeout(500);
   });
 
+  // 健康检查的两种判定（都是**自造服务**，不依赖这台机器上装了什么）：
+  //   1) 401/403 = 服务活着但要登录 → 必须算健康（用户报过这个误报：
+  //      Stirling PDF 设完自己的账号密码后一直被标成"健康检查失败"）
+  //   2) 真连不上 = 失败，且必须给出"检查了什么、为什么、点哪里"
+  //
+  // 用面板自己的接口当"要登录"的目标：健康检查不带会话 cookie，
+  // 必然拿到 401；用 9 号端口当"连不上"的目标（保留端口，不会有人监听）。
+  // zapQuiet：清理"上一次运行可能留下的"测试服务。
+  // 这条调用**预期会失败**（服务本来就不存在，接口返回 404），
+  // 用 expectHTTPError 开关把它排除在"浏览器控制台错误"之外 ——
+  // 否则每轮测试都会因为一条早就不存在的记录而失败。
+  const zapQuiet = async (name) => {
+    expectHTTPError = true;
+    try { await zapSvc(name); } finally { expectHTTPError = false; }
+  };
+  const zapSvc = (name) => page.evaluate(async ([b, n]) => {
+    const csrf = document.cookie.match(/(?:^|; )zp_csrf=([^;]*)/)?.[1] || '';
+    await fetch(b + '/api/v1/services/' + encodeURIComponent(n), {
+      method: 'DELETE', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    });
+  }, [base, name]);
+  const mkSvc = (payload) => page.evaluate(async ([b, p]) => {
+    const csrf = document.cookie.match(/(?:^|; )zp_csrf=([^;]*)/)?.[1] || '';
+    const r = await fetch(b + '/api/v1/services', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+      body: JSON.stringify(p),
+    });
+    const j = await r.json();
+    if (r.status !== 200) throw new Error('造服务失败 ' + r.status + ' ' + JSON.stringify(j));
+    return true;
+  }, [base, payload]);
+
+  await step('要登录的服务算健康（不再误报失败）', async () => {
+    const name = 'zp-ui-health-auth';
+    await zapQuiet(name);
+    // 面板自己的 API 在不带 cookie 时返回 401 —— 正是 Stirling PDF 那种情形
+    await mkSvc({
+      name, display_name: 'UI 测试：需要登录的服务', kind: 'native',
+      start_cmd: 'sleep 3600', health_url: base + '/api/v1/services',
+    });
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(600);
+    await page.click('.nav-item:has-text("服务管理")');
+    await page.waitForTimeout(2500);
+
+    // 服务卡片是**内联样式的 div**、没有类名，用 `.card div` 之类的选择器会取到
+    // 最内层那个不可见的元素（innerText 直接超时）。这里在浏览器里找
+    // "同时包含服务名与健康信息的最小 div" —— 精确且不依赖类名。
+    const txt = await page.evaluate((name) => {
+      const hits = Array.from(document.querySelectorAll('div')).filter((el) => {
+        const t = el.innerText || '';
+        return t.includes(name) && t.includes('健康');
+      });
+      return hits.length ? hits[hits.length - 1].innerText : null;
+    }, 'UI 测试：需要登录的服务');
+    if (!txt) throw new Error('服务管理页上没有找到刚造的测试服务卡片');
+    if (/健康检查失败/.test(txt)) {
+      throw new Error('401 不该再显示"健康检查失败"（这就是用户报的误报）: ' + txt.slice(0, 200));
+    }
+    if (!/健康/.test(txt)) {
+      throw new Error('401 的服务应被判为健康，实际卡片内容：' + txt.slice(0, 200));
+    }
+    if (!/身份验证/.test(txt)) {
+      throw new Error('健康但需要登录时，要说明原因（"需要身份验证，服务本身正常"）: ' + txt.slice(0, 200));
+    }
+    await shot('37a-health-auth-ok');
+    await zapSvc(name);
+  });
+
   await step('健康检查失败有可操作入口', async () => {
+    const name = 'zp-ui-health-down';
+    await zapQuiet(name);
+    // 9 号端口不会有人监听：稳定复现"连不上"
+    await mkSvc({
+      name, display_name: 'UI 测试：连不上的服务', kind: 'native',
+      start_cmd: 'sleep 3600', health_url: 'http://127.0.0.1:9/',
+    });
+    // 注意：**再次点击当前所在的导航项不会重新渲染**（hash 没变 → 不触发 hashchange），
+    // 所以这里先绕到仪表盘再回来，强制重新拉取服务列表（含健康检查）。
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(600);
     await page.click('.nav-item:has-text("服务管理")');
     await page.waitForTimeout(2000);
 
+    // 健康检查是异步的（每个服务最长 8s），轮询等待而不是固定 sleep
     const pill = page.locator('button:has-text("个健康检查失败")');
-    if (!(await pill.count())) {
-      console.log('        [跳过] 当前没有健康检查失败的服务');
-      return;
+    let appeared = false;
+    for (let i = 0; i < 20; i++) {
+      if (await pill.count()) { appeared = true; break; }
+      await page.waitForTimeout(500);
+    }
+    if (!appeared) {
+      throw new Error('造了一个连不上的服务，页头应当出现"N 个健康检查失败"');
     }
     await pill.first().click();
     await page.waitForTimeout(1200);
-    await shot('37-health-filtered');
+    await shot('37b-health-filtered');
 
     const body = await page.locator('.content').innerText();
     // 关键：不能只给一个红标签，必须告诉用户"检查了什么、大概为什么、下一步点哪"
@@ -535,11 +622,13 @@ try {
         throw new Error(`筛选后的页面缺少「${need}」，用户看完还是不知道怎么办: ` + body.slice(0, 220));
       }
     }
-    if ((body.includes('401') || body.includes('403')) && !body.includes('身份验证')) {
-      throw new Error('401/403 时应提示"该地址要求身份验证"，否则用户会以为服务坏了');
+    if (!/连不上|监听|超时/.test(body)) {
+      throw new Error('连不上时应给出人话（别把 curl 原始报错丢给用户）: ' + body.slice(0, 220));
     }
     await page.click('button:has-text("全部")');
     await page.waitForTimeout(800);
+    // 收拾干净：测试造的服务不能留在用户面板里
+    await zapSvc(name);
   });
 
   // ---------- 文件管理（P4）----------
@@ -922,6 +1011,42 @@ try {
     const txt = await page.locator('.content').innerText();
     if (!txt.includes('未启用') && !txt.includes('已连接') && !txt.includes('会话')) {
       throw new Error('终端页未正确渲染: ' + txt.slice(0, 120));
+    }
+  });
+
+  // 终端会话的回收：这条锁住一个会让"终端用不了"的泄漏 ——
+  // 离开页面后 PTY 读协程如果还阻塞着，会话就一直挂在列表里；
+  // 本机 max_sessions=3，挂满之后用户再点终端就只会看到"会话上限"。
+  await step('终端会话在离开页面后被回收', async () => {
+    const termList = () => page.evaluate(async (b) => {
+      const r = await fetch(b + '/api/v1/terminal', { credentials: 'same-origin' });
+      const j = await r.json();
+      return (j && j.data && j.data.list) || [];
+    }, base);
+
+    await page.click('.nav-item:has-text("Web 终端")');
+    await page.waitForTimeout(3000);
+    const pageTxt = await page.locator('.content').innerText();
+    if (/未启用/.test(pageTxt)) {
+      console.log('        [跳过] 这台机器的 Web 终端没有开启');
+      return;
+    }
+    const opened = await termList();
+    if (!opened.length) throw new Error('终端页已连接，但服务端没有会话记录');
+    await shot('45d-terminal-session');
+
+    // 离开页面（切路由会触发页面级 cleanup → closeWS → 服务端应回收会话）
+    await page.click('.nav-item:has-text("仪表盘")');
+    let released = false;
+    let now = opened;
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(500);
+      now = await termList();
+      if (now.length === 0) { released = true; break; }
+    }
+    if (!released) {
+      throw new Error(`离开终端页后仍有 ${now.length} 个会话挂着（会占满会话上限，` +
+        '最终让终端打不开）：' + JSON.stringify(now.map((x) => x.id)));
     }
   });
 

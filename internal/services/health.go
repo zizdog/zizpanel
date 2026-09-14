@@ -79,26 +79,46 @@ func httpHealth(ctx context.Context, s *Service) Health {
 		return h
 	}
 
-	h.OK = code >= 200 && code < 400
-	if h.OK {
-		h.Message = fmt.Sprintf("HTTP %d", code)
-	} else {
-		h.Message = fmt.Sprintf("HTTP %d", code)
+	// 401 / 403 判为**健康**。
+	//
+	// 用户报过这个误报：Stirling PDF 这类应用装完首次打开就要求设账号密码
+	// （那是它自己的登录），设完之后面板的健康检查必然拿到 401，
+	// 于是服务管理里一直显示"健康检查失败" —— 可服务完全正常。
+	//
+	// HTTP 健康检查的本质是"这个服务还活着吗"。能返回 401/403 恰恰证明
+	// HTTP 服务在监听、能处理请求、只是这个地址需要身份验证。
+	// 真想校验业务内容，用上面的「期望包含内容」字段。
+	if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		h.OK = true
+		h.Message = fmt.Sprintf("HTTP %d（需要身份验证，服务本身正常）", code)
+		return h
 	}
+
+	h.OK = code >= 200 && code < 400
+	h.Message = fmt.Sprintf("HTTP %d", code)
 	return h
 }
 
 // humanizeCurlError 把 curl 的失败转成用户能理解的话。
+//
+// 注意 curl 的措辞随版本/平台变：老版本说 "Connection refused"，
+// Homebrew 上较新的 curl 说 "Failed to connect to 127.0.0.1 port 8080
+// after 0 ms: Couldn't connect to server"。只匹配老措辞的话，
+// 用户看到的是一整行原始 curl 报错（实测就是这样），所以两种都要认。
 func humanizeCurlError(err error, body string) string {
 	msg := strings.TrimSpace(body)
 	switch {
-	case strings.Contains(msg, "Connection refused"):
-		return "连接被拒绝（服务端口没有在监听）"
-	case strings.Contains(msg, "Operation timed out"):
+	case strings.Contains(msg, "Connection refused"),
+		strings.Contains(msg, "Couldn't connect to server"),
+		strings.Contains(msg, "Failed to connect"):
+		return "连接不上（该端口没有在监听，或服务没启动）"
+	case strings.Contains(msg, "Operation timed out"), strings.Contains(msg, "timed out"):
 		return "连接超时（服务可能卡住或未启动）"
+	case strings.Contains(msg, "Empty reply from server"):
+		return "服务接受了连接但没有返回内容（可能正在启动）"
 	case strings.Contains(msg, "Could not resolve host"):
 		return "域名无法解析"
-	case strings.Contains(msg, "certificate"):
+	case strings.Contains(msg, "certificate"), strings.Contains(msg, "SSL"):
 		return "证书校验失败：" + truncate(msg, 120)
 	case msg != "":
 		return truncate(msg, 160)

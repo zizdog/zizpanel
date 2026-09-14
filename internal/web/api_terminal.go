@@ -173,11 +173,20 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// WebSocket -> pty
+	//
+	// 这里必须做两件"否则会话会泄漏"的事：
+	//  1. **读超时**：对端被强杀（关笔记本、浏览器崩溃、网线拔掉）时不会有 FIN，
+	//     ReadMessage 会一直阻塞。给一个远大于前端心跳（25s）的读超时即可判定"对端没了"。
+	//  2. **断开时主动 sess.Close()**：PTY 读协程阻塞在 sess.Read 上、并不监听 ctx，
+	//     不关掉 PTY 它永远不会返回 → wg.Wait() 卡住 → 下面的 mgr.Close() 不执行
+	//     → 会话一直挂在列表里（本机 max_sessions=3，挂满之后终端就打不开了）。
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
+		defer sess.Close("客户端断开")
 		for {
+			_ = ws.SetReadDeadline(time.Now().Add(wsClientTimeout))
 			op, payload, err := ws.ReadMessage()
 			if err != nil {
 				return
@@ -230,6 +239,12 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	closed = true
 	s.audit(r, "terminal_detach", sess.ID, "终端会话结束", true, "")
 }
+
+// wsClientTimeout 是"多久没收到客户端任何消息就认为它已经走了"。
+//
+// 前端每 25 秒发一次 ping（见 terminal.js 的心跳），所以真实空闲的会话会不断
+// 刷新这个期限；只有在浏览器被强杀/断网这种"没有 FIN"的情况下才会超时。
+const wsClientTimeout = 75 * time.Second
 
 func hostname() string {
 	h, err := os.Hostname()
