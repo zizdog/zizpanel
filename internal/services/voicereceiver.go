@@ -114,7 +114,7 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	// 若机器上是别的内容（手工改过 / 旧版本），这里覆盖并明确告知。
 	if old, err := os.ReadFile(p.Script); err != nil || string(old) != string(voiceReceiverPy) {
 		if err != nil {
-			result.Steps = append(result.Steps, "已写入 receiver.py（来自交接文档）")
+			result.step(ctx, "已写入 receiver.py（来自交接文档）")
 		} else {
 			result.Steps = append(result.Steps,
 				"检测到 receiver.py 与交接文档的版本不一致，已替换为文档版本")
@@ -123,7 +123,7 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 			return fmt.Errorf("写入 receiver.py 失败: %w", werr)
 		}
 	} else {
-		result.Steps = append(result.Steps, "receiver.py 已是最新（与交接文档一致）")
+		result.step(ctx, "receiver.py 已是最新（与交接文档一致）")
 	}
 	_ = chownTree(m.opt.UserName, p.Dir)
 
@@ -136,18 +136,18 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 		result.Steps = append(result.Steps,
 			"按选择**不启用鉴权**（密钥留空）——同内网任何人都能上传文件与调用合成")
 	case token != "":
-		result.Steps = append(result.Steps, "使用你指定的共享密钥")
+		result.step(ctx, "使用你指定的共享密钥")
 	default:
 		if existing := m.existingReceiverToken(p); existing != "" {
 			token = existing
-			result.Steps = append(result.Steps, "复用已有共享密钥（换掉会让网站那边失联）")
+			result.step(ctx, "复用已有共享密钥（换掉会让网站那边失联）")
 		} else {
 			t, err := randomHex(16)
 			if err != nil {
 				return err
 			}
 			token = "ttsv-" + t // 前缀与文档第 5.2 步生成的格式一致
-			result.Steps = append(result.Steps, "已自动生成共享密钥")
+			result.step(ctx, "已自动生成共享密钥")
 		}
 	}
 
@@ -162,20 +162,20 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	if err := m.bootstrapService(ctx, receiverLabel, p.Plist); err != nil {
 		return err
 	}
-	result.Steps = append(result.Steps, "已注册为系统级后台服务（开机自启、不依赖用户登录）")
+	result.step(ctx, "已注册为系统级后台服务（开机自启、不依赖用户登录）")
 
 	// ---- 4. 验证：只认真的返回了 auth:true ----
 	wantAuth := !opt.NoAuth
 	if !waitJSONBoolValue(ctx, fmt.Sprintf("http://127.0.0.1:%d/voice/health", receiverPort),
 		"auth", wantAuth, 20*time.Second) {
 		result.Warning = fmt.Sprintf("接收端已注册，但 /voice/health 未返回 auth:true。请看日志：%s", p.ErrLog)
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
-	result.Steps = append(result.Steps, "接收端已就绪并启用鉴权")
+	result.step(ctx, "接收端已就绪并启用鉴权")
 
 	if err := m.RegisterInstalledService(ctx, receiverLabel, "TtsVoice 音色接收端", "🔐", "ai", receiverPort); err != nil {
-		result.Steps = append(result.Steps, "（自动登记到服务管理失败："+err.Error()+"）")
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
 	}
 
 	// ---- 5. 把网站那边要的两样东西直接列出来 ----

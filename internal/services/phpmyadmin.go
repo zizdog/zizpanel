@@ -68,12 +68,12 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 	// 走 brew 而不是官网下载：实测 files.phpmyadmin.net 在国内**完全不可达**（连接超时），
 	// 而 brew 的 phpmyadmin 是 bottled（预编译），走国内镜像能正常下载。
 	if !m.brewHas(ctx, "phpmyadmin") {
-		result.Steps = append(result.Steps, "正在 brew install phpmyadmin")
+		result.step(ctx, "正在 brew install phpmyadmin")
 		if _, err := m.brewRun(ctx, 15*time.Minute, "install", "phpmyadmin"); err != nil {
 			return fmt.Errorf("安装 phpmyadmin 失败: %w", err)
 		}
 	} else {
-		result.Steps = append(result.Steps, "phpmyadmin 已安装，跳过")
+		result.step(ctx, "phpmyadmin 已安装，跳过")
 	}
 
 	p := m.pmaPaths()
@@ -138,7 +138,7 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 			_ = os.Symlink(rel, p.ConfLink)
 		}
 	}
-	result.Steps = append(result.Steps, "已写入 phpMyAdmin 配置（cookie 登录、随机 blowfish_secret）")
+	result.step(ctx, "已写入 phpMyAdmin 配置（cookie 登录、随机 blowfish_secret）")
 	if noPass {
 		result.Steps = append(result.Steps,
 			"检测到 MySQL root 当前无密码，已允许空密码登录（建议尽快在面板里给它设一个）")
@@ -164,16 +164,16 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 	if !ok {
 		result.Warning = "phpMyAdmin 已安装并写入配置，但 20 秒内访问 /phpmyadmin/ 无响应。" +
 			"请到「日志中心」查看 nginx 与 PHP-FPM 日志。"
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
 	if bad := phpMyAdminErrorIn(body); bad != "" {
 		result.Warning = "phpMyAdmin 返回了错误页：" + bad +
 			"（配置与权限请检查 " + p.ConfReal + "）"
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
-	result.Steps = append(result.Steps, "phpMyAdmin 已可用：http://<本机地址>/phpmyadmin/")
+	result.step(ctx, "phpMyAdmin 已可用：http://<本机地址>/phpmyadmin/")
 	return nil
 }
 
@@ -257,7 +257,7 @@ func (m *Manager) ensureFPMInclude(ctx context.Context, result *InstallResult) e
 	if err := m.reloadNginx(ctx); err != nil {
 		return err
 	}
-	result.Steps = append(result.Steps, "已生成 nginx 的 php-fpm 转发片段并重载")
+	result.step(ctx, "已生成 nginx 的 php-fpm 转发片段并重载")
 	return nil
 }
 
@@ -339,7 +339,7 @@ func (m *Manager) ensurePMAVhost(ctx context.Context, result *InstallResult) err
 	}
 	text := string(data)
 	if strings.Contains(text, "/phpmyadmin") {
-		result.Steps = append(result.Steps, "默认站点里已有 phpMyAdmin 入口，跳过")
+		result.step(ctx, "默认站点里已有 phpMyAdmin 入口，跳过")
 		return nil
 	}
 	block := `
@@ -386,7 +386,7 @@ func (m *Manager) writeNginxConfAndReload(ctx context.Context, conf, oldText, ne
 		_ = m.reloadNginx(ctx)
 		return fmt.Errorf("%v（已还原 %s）", err, filepath.Base(conf))
 	}
-	result.Steps = append(result.Steps, okMsg)
+	result.step(ctx, okMsg)
 	return nil
 }
 

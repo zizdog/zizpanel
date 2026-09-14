@@ -13,9 +13,15 @@
 //
 //  3. **部署输出原样显示**。compose 的报错（端口占用、镜像拉不到、yml 语法错）
 //     都在这段文本里，替用户"翻译"成一句话反而会丢信息。
+//
+//  4. **部署（up）是后台任务**。`docker compose up -d` 首次要拉镜像，几分钟很正常，
+//     所以 POST 立刻返回 task_id，进度（镜像层下载）在任务中心里实时看。
+//     关掉窗口不影响部署，随时能从顶栏「任务中心」重新打开。
+//     stop / restart 是秒级动作，仍然同步返回。
 
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
+import { taskCenter } from './tasks.js';
 
 // 与后端 validComposeName 保持一致：字母数字与 . _ -，不以点开头。
 // 前端先拦一道只是为了让用户更早看到问题；权威校验在后端。
@@ -197,8 +203,19 @@ export async function renderCompose(container, ctx) {
   }
 
   async function act(name, action) {
+    // 部署走任务中心：立刻打开进度窗，镜像层进度实时可见，关窗也不会中断。
+    // 这里不能再 await 完再弹"成功" —— 后端已经返回 202（只有 task_id），
+    // 那样会谎报成功、而且输出是空的。
     if (action === 'up') {
-      toast(`正在部署 ${name}（拉镜像可能需要几分钟）…`, 'info');
+      taskCenter.start({
+        kind: 'deploy',
+        target: 'compose:' + name,
+        title: `部署 Docker Compose 项目 ${name}`,
+        start: () => api.dockerComposeAction(name, 'up'),
+        // 部署成功后项目会被登记到服务管理，列表要跟着刷新
+        onDone: async () => { await load(); ctx.refresh && ctx.refresh(); },
+      });
+      return;
     }
     try {
       const res = await api.dockerComposeAction(name, action);

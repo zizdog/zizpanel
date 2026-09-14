@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -390,14 +391,13 @@ func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 // handleServiceUninstall 卸载托管服务。
 func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	mgr := s.svcManager()
-	if err := mgr.Uninstall(r.Context(), name); err != nil {
-		s.audit(r, "service_uninstall", name, "失败: "+err.Error(), false, "")
-		fail(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	s.audit(r, "service_uninstall", name, "卸载托管服务", true, "")
-	ok(w, map[string]any{"msg": "服务已卸载"})
+	s.launchTask(w, r, "uninstall", name, "卸载服务 "+name,
+		"service_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			if err := s.svcManager().Uninstall(ctx, name); err != nil {
+				return nil, err
+			}
+			return map[string]any{"msg": "服务已卸载"}, nil
+		})
 }
 
 // ---------- 应用市场 ----------
@@ -590,15 +590,19 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mgr := s.svcManager()
-	res, err := mgr.Install(r.Context(), id)
-	if err != nil {
-		s.audit(r, "market_install", id, "失败: "+err.Error(), false, "")
-		fail(w, http.StatusBadRequest, err.Error())
+	app, found := services.FindApp(id)
+	if !found {
+		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
 		return
 	}
-	s.audit(r, "market_install", id, strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	if app.AdoptLabel != "" {
+		fail(w, http.StatusBadRequest, "「"+app.Name+"」是纳管类应用，请用「纳管」而不是安装")
+		return
+	}
+	s.launchTask(w, r, "install", id, "安装 "+app.Name,
+		"market_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			return s.svcManager().Install(ctx, id)
+		})
 }
 
 // handleInstallLNMP 一键安装 LNMP 环境。
@@ -607,34 +611,30 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 // （nginx 改 listen 80、建 vhosts/include、初始化 MySQL、注册系统级守护进程）。
 // 详见 internal/services/lnmp.go 里的说明。
 //
-// 同步执行：这一步动辄十几分钟，所以前端要展示 result.Steps。
-// 之所以不做成异步 + 轮询：它不重启面板，连接不会断，
-// 同步返回反而让"到底成没成"更清楚。
+// 异步执行：这一步动辄十几分钟，同步请求期间用户只能看到"请等待"，
+// 而且任务挂在 r.Context() 上 —— 一刷新就把 brew 杀了。现在交给任务中心，
+// 立刻返回 task_id，进度走 SSE（见 SPEC-任务中心.md）。
 func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "lnmp", Steps: []string{}}
-	err := mgr.InstallLNMP(r.Context(), res)
-	if err != nil {
-		s.audit(r, "install_lnmp", "lnmp", "失败: "+err.Error(), false, "")
-		// 失败也要把已经走完的步骤带回去，否则用户不知道卡在哪一步
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_lnmp", "lnmp", strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	s.launchTask(w, r, "install", "lnmp", "一键安装 LNMP 环境（nginx / PHP 8.3 / MySQL 8.4）",
+		"install_lnmp", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "lnmp", Steps: []string{}}
+			if err := s.svcManager().InstallLNMP(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleInstallPhpMyAdmin 单独部署 phpMyAdmin（LNMP 已装好、只想补它时用）。
 func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request) {
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "phpmyadmin", Steps: []string{}}
-	if err := mgr.InstallPhpMyAdmin(r.Context(), res); err != nil {
-		s.audit(r, "install_phpmyadmin", "phpmyadmin", "失败: "+err.Error(), false, "")
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_phpmyadmin", "phpmyadmin", strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	s.launchTask(w, r, "install", "phpmyadmin", "部署 phpMyAdmin",
+		"install_phpmyadmin", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "phpmyadmin", Steps: []string{}}
+			if err := s.svcManager().InstallPhpMyAdmin(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleQwenModels 返回两个 TTS 模型的下载与驻留状态。
@@ -706,19 +706,15 @@ func (s *Server) handleInstallQwenTTS(w http.ResponseWriter, r *http.Request) {
 		auth = *req.Auth
 	}
 
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "qwen3tts", Steps: []string{}}
-	if err := mgr.InstallQwenTTS(r.Context(), res, services.QwenOptions{
-		Auth:  auth,
-		Token: req.Token,
-	}); err != nil {
-		s.audit(r, "install_qwen3tts", "qwen3tts", "失败: "+err.Error(), false, "")
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_qwen3tts", "qwen3tts",
-		fmt.Sprintf("鉴权=%v ", auth)+strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	opts := services.QwenOptions{Auth: auth, Token: req.Token}
+	s.launchTask(w, r, "install", "qwen3tts", "部署 Qwen3 TTS 语音服务",
+		"install_qwen3tts", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "qwen3tts", Steps: []string{}}
+			if err := s.svcManager().InstallQwenTTS(ctx, res, opts); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleInstallVoiceReceiver 部署 TtsVoice 音色样本接收端 + 鉴权反代。
@@ -736,44 +732,39 @@ func (s *Server) handleInstallVoiceReceiver(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "voicereceiver", Steps: []string{}}
-	if err := mgr.InstallVoiceReceiver(r.Context(), res, services.ReceiverOptions{
-		Token:  req.Token,
-		NoAuth: req.NoAuth,
-	}); err != nil {
-		s.audit(r, "install_voicereceiver", "voicereceiver", "失败: "+err.Error(), false, "")
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_voicereceiver", "voicereceiver", strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	opts := services.ReceiverOptions{Token: req.Token, NoAuth: req.NoAuth}
+	s.launchTask(w, r, "install", "voicereceiver", "部署音色样本接收端",
+		"install_voicereceiver", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "voicereceiver", Steps: []string{}}
+			if err := s.svcManager().InstallVoiceReceiver(ctx, res, opts); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleInstallIOPaint 部署 IOPaint（图片去水印 / 物体擦除 / 扩图）。
 func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "iopaint", Steps: []string{}}
-	if err := mgr.InstallIOPaint(r.Context(), res); err != nil {
-		s.audit(r, "install_iopaint", "iopaint", "失败: "+err.Error(), false, "")
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_iopaint", "iopaint", strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	s.launchTask(w, r, "install", "iopaint", "安装 IOPaint（图片去水印）",
+		"install_iopaint", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "iopaint", Steps: []string{}}
+			if err := s.svcManager().InstallIOPaint(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleInstallDockerRuntime 安装 Docker 运行时（Colima）。
 func (s *Server) handleInstallDockerRuntime(w http.ResponseWriter, r *http.Request) {
-	mgr := s.svcManager()
-	res := &services.InstallResult{App: "docker-runtime", Name: "Docker 运行时（Colima）", Steps: []string{}}
-	if err := mgr.InstallColimaRuntime(r.Context(), res); err != nil {
-		s.audit(r, "install_docker_runtime", "docker-runtime", "失败: "+err.Error(), false, "")
-		ok(w, map[string]any{"ok": false, "error": err.Error(), "steps": res.Steps})
-		return
-	}
-	s.audit(r, "install_docker_runtime", "docker-runtime", strings.Join(res.Steps, " | "), true, "")
-	ok(w, res)
+	s.launchTask(w, r, "install", "docker-runtime", "安装 Docker 运行时（Colima）",
+		"install_docker_runtime", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "docker-runtime", Name: "Docker 运行时（Colima）", Steps: []string{}}
+			if err := s.svcManager().InstallColimaRuntime(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleAdoptScan 扫描本机可纳管但尚未纳管的 launchd 服务。

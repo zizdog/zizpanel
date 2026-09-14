@@ -84,7 +84,10 @@ func (m *Manager) runColima(ctx context.Context, timeout time.Duration, args ...
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/usr/bin/sudo", full...)
-	out, err := cmd.CombinedOutput()
+	// colima 启动虚拟机可能要几十秒到几分钟，逐行流式让用户看得到进展。
+	// 标签必须带上 sudo 本身：日志里显示的命令要是**能照着复制**的完整命令，
+	// 少了 sudo 用户会以为是没降权的直接调用（那就完全是另一回事了）。
+	out, err := streamCmd(ctx, cmd)
 	text := strings.TrimSpace(string(out))
 	if err != nil {
 		if text != "" {
@@ -499,16 +502,16 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 		if _, err := m.runAsUser(ctx, 15*time.Minute, m.opt.BrewBin, args...); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", strings.Join(need, " "), err)
 		}
-		result.Steps = append(result.Steps, "已安装 "+strings.Join(need, "、"))
+		result.step(ctx, "已安装 "+strings.Join(need, "、"))
 	} else {
-		result.Steps = append(result.Steps, "colima / docker / docker-compose 已存在，跳过安装")
+		result.step(ctx, "colima / docker / docker-compose 已存在，跳过安装")
 	}
 
 	// ---- 2. 开机自启 + 登记 ----
 	if _, created := m.EnsureColimaRuntime(ctx); created {
-		result.Steps = append(result.Steps, "已配置开机自启（系统级 LaunchDaemon，无需登录）")
+		result.step(ctx, "已配置开机自启（系统级 LaunchDaemon，无需登录）")
 	} else {
-		result.Steps = append(result.Steps, "开机自启已存在，保持不动")
+		result.step(ctx, "开机自启已存在，保持不动")
 	}
 
 	// ---- 3. 起虚拟机 ----
@@ -517,7 +520,7 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 		result.Warning = "运行时已安装，但启动失败：" + firstMeaningfulLine(err.Error())
 		return nil
 	}
-	result.Steps = append(result.Steps, "Docker 虚拟机已启动")
+	result.step(ctx, "Docker 虚拟机已启动")
 
 	// ---- 4. 验证：真的调一次 Docker API ----
 	sock := filepath.Join(m.opt.UserHome, ".colima", "default", "docker.sock")
@@ -538,7 +541,7 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 		result.Warning = "Docker socket 已就绪，但引擎 API 无响应，请查看运行时日志"
 		return nil
 	}
-	result.Steps = append(result.Steps, "Docker 引擎已就绪（Server "+ver+"）")
+	result.step(ctx, "Docker 引擎已就绪（Server "+ver+"）")
 	result.Message = "Docker 运行时安装完成，现在可以安装 Docker 类应用了"
 	return nil
 }

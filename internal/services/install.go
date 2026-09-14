@@ -137,8 +137,9 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 	if m.opt.UserHome != "" {
 		cmd.Env = append(os.Environ(), "HOME="+m.opt.UserHome)
 	}
-	out, err := cmd.CombinedOutput()
-	text := string(out)
+	// 逐行流式：brew install 的下载/解压进度因此能实时出现在任务中心，
+	// 而不是等命令跑完才一次性看到。
+	text, err := streamCmd(ctx, cmd)
 	if err != nil {
 		return text, fmt.Errorf("brew %s 失败: %s", strings.Join(args, " "),
 			truncate(strings.TrimSpace(text), 500))
@@ -154,16 +155,16 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 
 	// 1) 确保包已安装
 	if !m.brewHas(ctx, app.BrewFormula) {
-		res.Steps = append(res.Steps, "正在 brew install "+app.BrewFormula+"（首次可能需要几分钟）")
+		res.step(ctx, "正在 brew install "+app.BrewFormula+"（首次可能需要几分钟）")
 		if _, err := m.brewRun(ctx, 30*time.Minute, "install", app.BrewFormula); err != nil {
 			return err
 		}
 	}
-	res.Steps = append(res.Steps, app.BrewFormula+" 已安装")
+	res.step(ctx, app.BrewFormula+" 已安装")
 
 	// 2) 交给 brew services 托管（它会写 LaunchAgent 并启动）
 	//    先停再起，避免"已运行但不在 brew 管理下"的状态导致 start 报错
-	res.Steps = append(res.Steps, "注册为后台服务并启动")
+	res.step(ctx, "注册为后台服务并启动")
 	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", app.BrewFormula); err != nil {
 		// 部分 formula 不支持 services（没有 service 定义），这时给出提示但不当作致命错误
 		res.Warning = fmt.Sprintf("已安装，但 brew services 启动失败：%v。"+
@@ -268,15 +269,15 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 	if err := os.WriteFile(composeFile, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("写入 compose 文件失败: %w", err)
 	}
-	res.Steps = append(res.Steps, "已生成 "+composeFile)
+	res.step(ctx, "已生成 "+composeFile)
 
 	// 启动（首次会拉镜像，给足超时）
-	res.Steps = append(res.Steps, "正在拉取镜像并启动容器（首次可能需要几分钟）")
+	res.step(ctx, "正在拉取镜像并启动容器（首次可能需要几分钟）")
 	drv := newComposeDriver(m.opt, &Service{ComposeFile: composeFile, Name: app.ID})
 	if _, err := drv.run(ctx, 20*time.Minute, "up", "-d"); err != nil {
 		return err
 	}
-	res.Steps = append(res.Steps, "容器已启动")
+	res.step(ctx, "容器已启动")
 	res.Service = &Service{ComposeFile: composeFile}
 	return nil
 }

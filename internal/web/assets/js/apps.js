@@ -2,12 +2,14 @@
 //
 // 核心思路：把"能不能装"和"装什么"分开。
 //   - 用户点安装时，先跑一次安装前检查（依赖、端口），把问题一次说清
-//   - 检查通过才真正安装，并在弹窗里逐步展示安装进度
+//   - 检查通过才真正安装；安装是**异步任务**，提交后进度交给「任务中心」，
+//     用户可以关窗口、切页面，随时从顶栏重新打开看进度（见 tasks.js）
 //   - 已经装过的应用显示"已安装"，可以一键跳到服务管理页
 
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
+import { taskCenter } from './tasks.js';
 
 let cache = null;
 
@@ -64,105 +66,16 @@ export function AppsView(content, ctx = {}) {
 
   // installLNMP 一键装 nginx + PHP + MySQL，并做四件包管理管不到的收尾工作。
   //
-  // 这一步可能跑十几分钟，且**不会**重启面板，所以用模态框同步展示步骤流，
-  // 让用户能一直看到"现在到哪了"。完成后提示他回到这里刷新（届时
-  // 这三个应用的按钮会变成「已安装」—— 因为市场现在会查 brew 了）。
-  async function installLNMP() {
-    const steps = h('div', { style: { maxHeight: '320px', overflow: 'auto', fontSize: '12.5px', lineHeight: '1.8' } });
-    const tip = h('div', { style: { color: 'var(--text-mute)', fontSize: '11.5px', marginBottom: '8px' },
-      text: '国内镜像下通常 10-40 分钟。中途请不要关闭页面 —— 面板不会重启，但关闭后就看进度了。' });
-    let closed = false;
-    modal({
+  // 这一步可能跑十几分钟，所以它**不再**是"同步请求 + 事后打印步骤"：
+  // 后端立刻返回 task_id，进度由任务中心（tasks.js）用 SSE 实时展示。
+  // 关掉进度窗、切页面都不会中断安装 —— 任务跑在 context.Background() 上。
+  function installLNMP() {
+    taskCenter.start({
+      kind: 'install',
+      target: 'lnmp',
       title: '一键安装 LNMP 环境',
-      body: h('div', [
-        tip,
-        h('div', { text: '将安装：nginx（改 listen 80）、PHP 8.3 FPM、MySQL 8.4（初始化数据目录），' +
-                       '并注册为系统级后台服务（开机自启、不依赖登录）。',
-          style: { fontSize: '12.5px', marginBottom: '10px' } }),
-        steps,
-      ]),
-      footer: (close) => [h('button.btn', { text: '后台继续（关闭窗口）', onclick: () => { closed = true; close(); } })],
-      onClose: () => { closed = true; },
+      start: () => api.installLNMP(),
     });
-    const push = (t) => {
-      if (closed) return;
-      appendAll(steps, h('div', { text: '· ' + t }));
-      steps.parentElement && (steps.parentElement.scrollTop = steps.parentElement.scrollHeight);
-    };
-    push('正在提交安装任务…（brew 安装阶段没有逐步输出，请耐心等待）');
-    try {
-      const res = await api.installLNMP();
-      (res.steps || []).forEach((t) => steps.append(h('div', { text: '· ' + t })));
-      if (res.ok === false) {
-        appendAll(steps, h('div', { style: { color: 'var(--danger)', marginTop: '8px' }, text: '失败：' + res.error }));
-        toast('LNMP 安装失败，详情见窗口', 'err', 12000);
-        return;
-      }
-      appendAll(steps, h('div', { style: { color: 'var(--ok)', marginTop: '8px' }, text: '✅ 安装完成' }));
-      if (res.warning) appendAll(steps, h('div', { style: { color: 'var(--warn)' }, text: '⚠️ ' + res.warning }));
-      toast('LNMP 环境已就绪', 'ok', 8000);
-      load();
-    } catch (e) {
-      appendAll(steps, h('div', { style: { color: 'var(--danger)', marginTop: '8px' }, text: '失败：' + e.message }));
-      toast(e.message, 'err', 12000);
-    }
-  }
-
-  // runTask 是"一键装某个组合"的通用展示器：
-  // 同步接口 + 步骤流。这类任务动辄十几分钟，必须让用户看到"现在到哪了"。
-  async function runTask(title, intro, fn) {
-    const steps = h('div', { style: { maxHeight: '320px', overflow: 'auto', fontSize: '12.5px', lineHeight: '1.8' } });
-    let closed = false;
-    modal({
-      title,
-      body: h('div', [
-        h('div', { style: { color: 'var(--text-mute)', fontSize: '11.5px', marginBottom: '8px' }, text: intro }),
-        steps,
-      ]),
-      footer: (close) => [h('button.btn', { text: '后台继续（关闭窗口）', onclick: () => { closed = true; close(); } })],
-      onClose: () => { closed = true; },
-    });
-    const push = (t) => { if (!closed) { appendAll(steps, h('div', { text: '· ' + t })); } };
-    push('已提交，正在执行…');
-    try {
-      const res = await fn();
-      (res.steps || []).forEach((t) => push(t));
-      if (res.ok === false) {
-        appendAll(steps, h('div', { style: { color: 'var(--danger)', marginTop: '8px' }, text: '失败：' + res.error }));
-        toast(title + '失败，详情见窗口', 'err', 12000);
-        return;
-      }
-      // 需要用户**记下来**的信息单独做成可复制区块。
-      // 埋在步骤日志里会被忽略，而密钥丢了就得重新部署。
-      if (res.token) {
-        appendAll(steps, h('div', {
-          style: {
-            marginTop: '12px', padding: '12px', background: 'var(--warn-soft)',
-            borderRadius: '6px', border: '1px solid var(--border)',
-          },
-        }, [
-          h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠️ 请记录共享密钥（只在这里显示）' }),
-          h('code', { style: { fontSize: '13px', userSelect: 'all', wordBreak: 'break-all' }, text: res.token }),
-          h('div', { style: { marginTop: '8px' } }, [
-            h('button.btn.btn-sm', {
-              text: '📋 复制密钥',
-              onclick: () => {
-                navigator.clipboard?.writeText(res.token)
-                  .then(() => toast('密钥已复制', 'ok'))
-                  .catch(() => toast('复制失败，请手动选中复制', 'warn'));
-              },
-            }),
-          ]),
-        ]));
-      }
-      appendAll(steps, h('div', { style: { color: 'var(--ok)', marginTop: '8px' }, text: '✅ 完成' }));
-      if (res.warning) appendAll(steps, h('div', { style: { color: 'var(--warn)' }, text: '⚠️ ' + res.warning }));
-      toast(title + ' 已完成', 'ok', 8000);
-      load();
-    } catch (e) {
-      appendAll(steps, h('div', { style: { color: 'var(--danger)', marginTop: '8px' }, text: '失败：' + e.message }));
-      toast(e.message, 'err', 12000);
-    }
   }
 
   // randomToken 生成与后端同格式的密钥：ttsv- + 32 位十六进制
@@ -177,7 +90,7 @@ export function AppsView(content, ctx = {}) {
   // 为什么把鉴权做成选项：mlx-audio 上游完全没有鉴权，对外暴露与否是
   // 一个真实取舍。默认勾选"加鉴权"，并且不加鉴权时明确写出后果 ——
   // 默认值要安全，危险选项要让用户看见代价。
-  function installQwenTTS() {
+  function installQwenTTS(appId) {
     const authOn = h('input', { type: 'checkbox', checked: true });
     const keyInput = h('input.input', { placeholder: '留空则自动生成', value: '' });
     const risk = h('div', {
@@ -229,17 +142,21 @@ export function AppsView(content, ctx = {}) {
           onclick: () => {
             const opts = { auth: authOn.checked, token: keyInput.value.trim() };
             close();
-            runTask('部署 Qwen3 TTS',
-              opts.auth ? '已选择加鉴权：装完会自动部署带密钥的反向代理入口。'
-                        : '未加鉴权：8880 将直接对外。',
-              () => api.installQwenTTS(opts));
+            toast(opts.auth ? '已选择加鉴权：装完会自动部署带密钥的反向代理入口。'
+                            : '未加鉴权：8880 将直接对外。', opts.auth ? 'info' : 'warn', 9000);
+            taskCenter.start({
+              kind: 'install',
+              target: appId || 'qwen3tts',
+              title: '部署 Qwen3 TTS',
+              start: () => api.installQwenTTS(opts),
+            });
           },
         }),
       ],
     });
   }
 
-  function installVoiceReceiver() {
+  function installVoiceReceiver(appId) {
     const keyInput = h('input.input', { placeholder: '留空则自动生成', value: '' });
     const noAuth = h('input', { type: 'checkbox' });
     const risk = h('div', {
@@ -279,19 +196,27 @@ export function AppsView(content, ctx = {}) {
           onclick: () => {
             const opts = { token: keyInput.value.trim(), no_auth: noAuth.checked };
             close();
-            runTask('部署音色接收端', '正在部署…', () => api.installVoiceReceiver(opts));
+            taskCenter.start({
+              kind: 'install',
+              target: appId || 'voicereceiver',
+              title: '部署音色接收端',
+              start: () => api.installVoiceReceiver(opts),
+            });
           },
         }),
       ],
     });
   }
 
-  function installIOPaint() {
-    runTask('部署 IOPaint（图片去水印）',
-      '安装 IOPaint：上传图片 → 涂抹水印/杂物 → 擦除，支持批量与视频。' +
-      '使用 LaMa 模型并启用 Apple Silicon MPS 加速。' +
-      '会拉取 torch（约 1~2GB），通常需要十几分钟。',
-      () => api.installIOPaint());
+  // installIOPaint / installPhpMyAdmin 都是"提交即返回"的异步任务，
+  // 真正的进度与结果（IOPaint 的访问地址等）在任务中心的进度窗里。
+  function installIOPaint(appId) {
+    taskCenter.start({
+      kind: 'install',
+      target: appId || 'iopaint',
+      title: '部署 IOPaint（图片去水印）',
+      start: () => api.installIOPaint(),
+    });
   }
 
   // adoptApp 把一个已安装但未登记的服务纳管进来。
@@ -327,10 +252,13 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  function installPhpMyAdmin() {
-    runTask('部署 phpMyAdmin',
-      '安装数据库管理界面并接入 nginx 默认站点，装完访问 http://<本机地址>/phpmyadmin/。',
-      () => api.installPhpMyAdmin());
+  function installPhpMyAdmin(appId) {
+    taskCenter.start({
+      kind: 'install',
+      target: appId || 'phpmyadmin',
+      title: '部署 phpMyAdmin',
+      start: () => api.installPhpMyAdmin(),
+    });
   }
 
   function renderGrid() {
@@ -406,33 +334,40 @@ export function AppsView(content, ctx = {}) {
         text: a.description,
       }) : null,
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
-        // 三种状态的按钮各不相同：
+        // 按钮状态：
+        //   有任务在跑     → 查看进度（点回任务中心的进度窗，而不是再点一次安装）
         //   已纳管        → 查看服务
         //   已装但未纳管   → **纳管**（这是兜底入口，之前缺失，用户找不到已装的应用）
         //   未安装        → 安装
-        a.adopted
-          ? h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } })
-          : (a.installed && a.service_label && a.service_in_launchd
-            // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
-            // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
-            // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
-            ? h('button.btn.btn-sm.btn-primary', {
-              text: '纳管',
-              title: '把这个已在运行的服务登记到「服务管理」',
-              onclick: () => adoptApp(a),
-            })
-            : (a.panel_installer && a.artifacts && !a.service_in_launchd
-              // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
+        taskCenter.findByTarget(a.id)
+          ? h('button.btn.btn-sm.btn-primary', {
+            text: '⟳ 查看进度',
+            title: '这个应用有正在进行的任务，点开看实时进度',
+            onclick: () => taskCenter.openTask(taskCenter.findByTarget(a.id).id),
+          })
+          : (a.adopted
+            ? h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } })
+            : (a.installed && a.service_label && a.service_in_launchd
+              // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
+              // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
+              // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
               ? h('button.btn.btn-sm.btn-primary', {
-                text: '重新部署',
-                title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
-                onclick: () => openInstaller(a),
+                text: '纳管',
+                title: '把这个已在运行的服务登记到「服务管理」',
+                onclick: () => adoptApp(a),
               })
-              : h('button.btn.btn-sm.btn-primary', {
-                text: '安装',
-                disabled: !a.available,
-                onclick: () => openInstaller(a),
-              }))),
+              : (a.panel_installer && a.artifacts && !a.service_in_launchd
+                // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
+                ? h('button.btn.btn-sm.btn-primary', {
+                  text: '重新部署',
+                  title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
+                  onclick: () => openInstaller(a),
+                })
+                : h('button.btn.btn-sm.btn-primary', {
+                  text: '安装',
+                  disabled: !a.available,
+                  onclick: () => openInstaller(a),
+                })))),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
       ]),
     ]);
@@ -448,11 +383,12 @@ export function AppsView(content, ctx = {}) {
   function openInstaller(a) {
     // 用面板自研安装器的项目要收集选项（例如 Qwen 的"要不要鉴权"、
     // 密钥从哪来），所以直接打开对应对话框，而不是走通用安装流程。
+    // 传 a.id 作为任务 target：市场卡片的「查看进度」就是按这个值找运行中的任务的。
     switch (a.panel_installer) {
-      case 'qwentts': installQwenTTS(); return;
-      case 'voicereceiver': installVoiceReceiver(); return;
-      case 'iopaint': installIOPaint(); return;
-      case 'phpmyadmin': installPhpMyAdmin(); return;
+      case 'qwentts': installQwenTTS(a.id); return;
+      case 'voicereceiver': installVoiceReceiver(a.id); return;
+      case 'iopaint': installIOPaint(a.id); return;
+      case 'phpmyadmin': installPhpMyAdmin(a.id); return;
     }
     preflight(a);
   }
@@ -528,44 +464,26 @@ export function AppsView(content, ctx = {}) {
   }
 
   // ---------- 执行安装 ----------
-  async function doInstall(a) {
-    const stepList = h('div', { style: { fontFamily: 'var(--mono)', fontSize: '12px', lineHeight: '1.8' } });
-    const box = h('div', [
-      h('div', { style: { marginBottom: '12px' } }, [
-        h('span.pill.brand', { text: '安装中，请勿关闭页面' }),
-      ]),
-      stepList,
-      h('div.hint', { style: { marginTop: '12px' }, text: '首次安装需要下载依赖或镜像，可能需要几分钟。' }),
-    ]);
-    const m = modal({ title: `正在安装：${a.name}`, wide: true, body: box });
-
-    const log = (text) => {
-      appendAll(stepList, h('div', { text: '▸ ' + text }));
-    };
-    log('开始安装…');
-
-    try {
-      const res = await api.marketInstall(a.id);
-      m.close();
-      toast(res.message || '安装完成', 'ok', 12000);
-      if (res.warning) toast(res.warning, 'warn', 15000);
-      // 装完直接跳到服务管理，用户能立刻确认状态
-      location.hash = '#/services';
-    } catch (e) {
-      m.close();
-      modal({
-        title: `安装失败：${a.name}`,
-        wide: true,
-        body: h('div', [
-          h('div', { style: { padding: '11px', background: 'var(--danger-soft)', borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.7' } }, [
-            h('div', { text: e.message }),
-          ]),
-          h('div.hint', { style: { marginTop: '12px' }, text: '如果是依赖缺失，先按提示安装依赖再重试；如果是端口冲突，可以换一个端口后重试。' }),
-        ]),
-      });
-    }
+  //
+  // 旧实现是"同步等请求 + 事后打印 steps"，用户在整个过程中看不到任何真实输出，
+  // 关掉窗口也找不回来。现在改成：POST 立刻返回 task_id，进度交给任务中心。
+  // 失败（4xx/5xx）由 taskCenter.start 统一 toast，这里不需要再兜一层。
+  function doInstall(a) {
+    taskCenter.start({
+      kind: 'install',
+      target: a.id,
+      title: `安装 ${a.name}`,
+      start: () => api.marketInstall(a.id),
+    });
   }
 
-  registerCleanup(() => { });
+  // 任务状态变化（开始/结束）时重画卡片：正在安装的应用，按钮要变成「查看进度」。
+  // 只订阅元信息变化，**不订阅日志行** —— 否则 brew 每输出一行都会重建整个网格。
+  // 这是页面级订阅，跟着页面一起清理：任务状态本身活在 tasks.js 的单例里，
+  // 清理掉的只是"这个页面要不要重画"。
+  registerCleanup(taskCenter.onChange((kind) => {
+    if (kind === 'lines' || !cache) return;
+    renderGrid();
+  }));
   load();
 }

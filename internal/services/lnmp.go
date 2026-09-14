@@ -60,12 +60,12 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		return fmt.Errorf("安装 LNMP 需要以 root 运行（面板正式安装时由 LaunchDaemon 以 root 启动）")
 	}
 
-	result.Steps = append(result.Steps, "开始安装 LNMP 环境（nginx / PHP 8.3 / MySQL 8.4）")
+	result.step(ctx, "开始安装 LNMP 环境（nginx / PHP 8.3 / MySQL 8.4）")
 
 	// ---- 1. 逐包安装 ----
 	for _, f := range LNMPFormulas {
 		if m.brewHas(ctx, f) {
-			result.Steps = append(result.Steps, f+" 已安装，跳过")
+			result.step(ctx, f+" 已安装，跳过")
 			continue
 		}
 		result.Steps = append(result.Steps,
@@ -73,7 +73,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		if _, err := m.brewRun(ctx, 40*time.Minute, "install", f); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", f, err)
 		}
-		result.Steps = append(result.Steps, f+" 安装完成")
+		result.step(ctx, f+" 安装完成")
 	}
 
 	// ---- 2. 本机约定的收尾工作 ----
@@ -103,14 +103,14 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		result.Steps = append(result.Steps,
 			"nginx / PHP / MySQL 均已在运行，跳过服务注册（不改动现有配置）")
 	} else {
-		result.Steps = append(result.Steps, "正在注册为系统级后台服务（不依赖用户登录）")
+		result.step(ctx, "正在注册为系统级后台服务（不依赖用户登录）")
 		if err := m.installSystemDaemons(ctx, result); err != nil {
 			return err
 		}
 	}
 
 	// ---- 4. 验证：只认端口真的在监听 ----
-	result.Steps = append(result.Steps, "正在验证服务是否真的可用")
+	result.step(ctx, "正在验证服务是否真的可用")
 	var notUp []string
 	for _, f := range LNMPFormulas {
 		port := LNMPPorts[f]
@@ -121,18 +121,18 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	if len(notUp) > 0 {
 		result.Warning = "以下服务未能确认在监听：" + strings.Join(notUp, "、") +
 			"。可到「服务管理」逐个查看日志。"
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
-	result.Steps = append(result.Steps, "nginx(80) / PHP-FPM(9000) / MySQL(3306) 均已在监听")
+	result.step(ctx, "nginx(80) / PHP-FPM(9000) / MySQL(3306) 均已在监听")
 
 	// ---- 5. phpMyAdmin ----
 	// 放在最后：它依赖 nginx 与 PHP-FPM 都已就绪，否则装完也打不开。
 	// 失败不阻断整个 LNMP —— 网站功能已经可用了，phpMyAdmin 可以稍后单独装。
-	result.Steps = append(result.Steps, "正在部署 phpMyAdmin（数据库管理界面）")
+	result.step(ctx, "正在部署 phpMyAdmin（数据库管理界面）")
 	if err := m.InstallPhpMyAdmin(ctx, result); err != nil {
 		result.Warning = "LNMP 已就绪，但 phpMyAdmin 部署失败：" + err.Error()
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 	}
 	return nil
 }
@@ -155,7 +155,7 @@ func (m *Manager) fixNginxBaseConfig(ctx context.Context, result *InstallResult)
 
 	if strings.Contains(text, "listen       8080;") {
 		text = strings.Replace(text, "listen       8080;", "listen       80;", 1)
-		result.Steps = append(result.Steps, "已把 nginx 默认端口 8080 改为 80")
+		result.step(ctx, "已把 nginx 默认端口 8080 改为 80")
 	}
 
 	vhostDir := filepath.Join(m.brewPrefix(), "etc", "nginx", "vhosts")
@@ -176,7 +176,7 @@ func (m *Manager) fixNginxBaseConfig(ctx context.Context, result *InstallResult)
 		insert := "\n    # 由 ZizPanel 添加：加载站点配置\n" +
 			"    include " + vhostDir + "/*.conf;\n"
 		text = text[:i] + insert + text[i:]
-		result.Steps = append(result.Steps, "已在 nginx.conf 中启用 vhosts 目录")
+		result.step(ctx, "已在 nginx.conf 中启用 vhosts 目录")
 	}
 
 	if text != orig {
@@ -193,7 +193,7 @@ func (m *Manager) fixNginxBaseConfig(ctx context.Context, result *InstallResult)
 			return fmt.Errorf("替换 nginx.conf 失败: %w", err)
 		}
 	}
-	result.Steps = append(result.Steps, "nginx 基础配置已就绪")
+	result.step(ctx, "nginx 基础配置已就绪")
 	return nil
 }
 
@@ -206,7 +206,7 @@ func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult) e
 	if entries, err := os.ReadDir(datadir); err == nil && len(entries) > 0 {
 		return nil // 已经初始化过
 	}
-	result.Steps = append(result.Steps, "MySQL 数据目录未初始化，正在初始化（root 初始无密码）")
+	result.step(ctx, "MySQL 数据目录未初始化，正在初始化（root 初始无密码）")
 	if err := os.MkdirAll(datadir, 0o755); err != nil {
 		return fmt.Errorf("创建 MySQL 数据目录失败: %w", err)
 	}
@@ -218,7 +218,7 @@ func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult) e
 		"--initialize-insecure", "--datadir="+datadir); err != nil {
 		return fmt.Errorf("MySQL 初始化失败: %w", err)
 	}
-	result.Steps = append(result.Steps, "MySQL 数据目录初始化完成")
+	result.step(ctx, "MySQL 数据目录初始化完成")
 	return nil
 }
 
@@ -237,7 +237,7 @@ func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResul
 	if err != nil {
 		return fmt.Errorf("注册系统级服务失败: %v（输出：%s）", err, tailText(stripANSI(out), 500))
 	}
-	result.Steps = append(result.Steps, "已注册为系统级 LaunchDaemon（开机自启，不依赖登录）")
+	result.step(ctx, "已注册为系统级 LaunchDaemon（开机自启，不依赖登录）")
 	return nil
 }
 
@@ -307,16 +307,14 @@ func (m *Manager) runAsUser(ctx context.Context, timeout time.Duration, name str
 	if m.opt.UserHome != "" {
 		cmd.Env = append(os.Environ(), "HOME="+m.opt.UserHome)
 	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return streamCmd(ctx, cmd)
 }
 
 // runRoot 以 root 执行命令（面板本身通常就是 root）。
 func (m *Manager) runRoot(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	return string(out), err
+	return streamCmd(ctx, exec.CommandContext(ctx, name, args...))
 }
 
 func tailText(s string, n int) string {

@@ -543,6 +543,83 @@ try {
   });
 
   // ---------- 文件管理（P4）----------
+  // ---------- 任务中心（安装/卸载的实时进度）----------
+  //
+  // 用户的明确要求：装东西要看得见过程，窗口能关掉、也能随时重新打开。
+  //
+  // 这里**不会真的安装或卸载任何东西**：只用一个不存在的服务名去调卸载接口
+  // （任务会因为"服务不存在"而失败）。真实安装会动用户机器上的
+  // brew / launchd / docker，UI 测试绝不能碰。
+  await step('任务中心：任务可在关窗后重新打开', async () => {
+    const taskId = await page.evaluate(async (b) => {
+      const csrf = document.cookie.match(/(?:^|; )zp_csrf=([^;]*)/)?.[1] || '';
+      const r = await fetch(b + '/api/v1/services/uitest-任务中心-不存在/uninstall', {
+        method: 'DELETE',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+      });
+      const j = await r.json();
+      // 长任务必须**立刻**返回 202，而不是傻等（老实现是同步请求）
+      if (r.status !== 202) {
+        throw new Error('卸载应立刻返回 202（长任务），实际 ' + r.status + ' ' + JSON.stringify(j));
+      }
+      const id = j && j.data && j.data.task_id;
+      if (!id) throw new Error('响应里没有 task_id：' + JSON.stringify(j));
+      return id;
+    }, base);
+    if (!taskId) throw new Error('没拿到 task_id');
+
+    // 顶栏入口必须**任何页面都在**（这是"随时能重开"的前提）
+    const btn = page.locator('#zp-task-btn');
+    if (!(await btn.count())) throw new Error('顶栏缺少任务中心入口 #zp-task-btn');
+
+    await btn.click();
+    await page.waitForTimeout(800);
+    let txt = await page.locator('.modal').last().innerText();
+    if (!/任务中心/.test(txt)) throw new Error('任务中心弹窗没打开：' + txt.slice(0, 120));
+    // 列表内容是异步拉回来的，**轮询等待**而不是固定 sleep：
+    // 固定 sleep 会让这条断言随机器快慢时通时不通（真发生过）。
+    let listed = false;
+    for (let i = 0; i < 20; i++) {
+      txt = await page.locator('.modal').last().innerText();
+      if (/uitest-任务中心-不存在|卸载服务/.test(txt)) { listed = true; break; }
+      await page.waitForTimeout(400);
+    }
+    if (!listed) {
+      throw new Error('任务列表里看不到刚提交的任务：' + txt.slice(0, 200));
+    }
+    await shot('45b-tasks-list');
+
+    // 打开进度窗：应当看到日志与"关闭窗口（后台继续）"
+    await page.locator('.modal').last().locator('text=/卸载服务/').first().click();
+    await page.waitForTimeout(1500);
+    txt = await page.locator('.modal').last().innerText();
+    if (!/关闭窗口（后台继续）/.test(txt)) {
+      throw new Error('进度窗缺少「关闭窗口（后台继续）」：' + txt.slice(0, 200));
+    }
+    // 任务会因为服务不存在而失败 —— 失败原因必须**看得见**，不能只显示一个红点
+    if (!/失败|不存在/.test(txt)) {
+      throw new Error('进度窗没有显示失败原因：' + txt.slice(0, 200));
+    }
+    await shot('45c-task-progress');
+
+    // 关掉窗口 ≠ 取消任务：关窗后还能从顶栏重新打开，任务记录仍在
+    await page.locator('.modal').last().locator('button:has-text("关闭窗口（后台继续）")').click();
+    await page.waitForTimeout(600);
+    await btn.click();
+    let back = false;
+    for (let i = 0; i < 20; i++) {
+      await page.waitForTimeout(400);
+      txt = await page.locator('.modal').last().innerText();
+      if (/卸载服务/.test(txt)) { back = true; break; }
+    }
+    if (!back) {
+      throw new Error('关窗后重新打开，任务不该消失：' + txt.slice(0, 200));
+    }
+    await page.locator('.modal').last().locator('button:has-text("关闭")').first().click();
+    await page.waitForTimeout(400);
+  });
+
   await step('清理上次测试残留', async () => {
     // 通过页面上下文调用 API：保证测试可重复运行
     // （上一次失败时留下的文件会让这次的"新建"返回 400）

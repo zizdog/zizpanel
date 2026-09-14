@@ -129,21 +129,12 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 }
 
 // audit 写一条审计记录。失败不影响主流程。
+// audit 写一条审计日志（请求处理期间用）。
+//
+// 拆成 captureAudit + auditAs 是因为**后台任务**也要写审计：任务结束时
+// HTTP 请求早就返回了，那时候 r.Context() 已取消，直接拿 r 写会静默失败。
 func (s *Server) audit(r *http.Request, action, target, detail string, success bool, msg string) {
-	actor := ""
-	if u := userFrom(r.Context()); u != nil {
-		actor = u.Username
-	}
-	okInt := 0
-	if success {
-		okInt = 1
-	}
-	_, err := s.Store.DB().ExecContext(r.Context(),
-		`INSERT INTO audit_logs(actor,ip,action,target,detail,ok,message) VALUES(?,?,?,?,?,?,?)`,
-		actor, s.clientIP(r), action, target, detail, okInt, msg)
-	if err != nil {
-		s.Log.Warn("写审计日志失败: %v", err)
-	}
+	s.auditAs(s.captureAudit(r), action, target, detail, success, msg)
 }
 
 // ---------- 账号相关 ----------

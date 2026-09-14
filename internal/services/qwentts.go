@@ -163,7 +163,7 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 
 	// ---- 0. 前置检查：这两个不够会在装到一半时失败，且失败原因很难懂 ----
-	if err := m.checkQwenPreconditions(result); err != nil {
+	if err := m.checkQwenPreconditions(ctx, result); err != nil {
 		return err
 	}
 
@@ -173,12 +173,12 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	// 指定 3.11 不是偏好：mlx-audio 在该版本有预编译 wheel（cp311），
 	// 更高版本可能没有 wheel，会退化成源码编译甚至装不上。
 	if !m.brewHas(ctx, qwenPythonVer) {
-		result.Steps = append(result.Steps, "正在安装 "+qwenPythonVer)
+		result.step(ctx, "正在安装 "+qwenPythonVer)
 		if _, err := m.brewRun(ctx, 20*time.Minute, "install", qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
 		}
 	} else {
-		result.Steps = append(result.Steps, qwenPythonVer+" 已安装，跳过")
+		result.step(ctx, qwenPythonVer+" 已安装，跳过")
 	}
 	py311 := filepath.Join(m.brewPrefix(), "opt", qwenPythonVer, "bin", "python3.11")
 	if _, err := os.Stat(py311); err != nil {
@@ -197,12 +197,12 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		_ = chownTree(m.opt.UserName, p.Home)
 	}
 	if _, err := os.Stat(p.Python); err != nil {
-		result.Steps = append(result.Steps, "正在创建 Python 虚拟环境")
+		result.step(ctx, "正在创建 Python 虚拟环境")
 		if out, err := m.runAsUser(ctx, 5*time.Minute, py311, "-m", "venv", p.Venv); err != nil {
 			return fmt.Errorf("创建虚拟环境失败: %v（%s）", err, tailText(out, 300))
 		}
 	} else {
-		result.Steps = append(result.Steps, "虚拟环境已存在，跳过创建")
+		result.step(ctx, "虚拟环境已存在，跳过创建")
 	}
 
 	// ---- 3. 安装 mlx-audio[server] ----
@@ -223,25 +223,25 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 
 	// ---- 6. 验证：等端口起来（首次加载模型要十几秒）----
-	result.Steps = append(result.Steps, "正在等待服务加载模型（首次约十几秒）")
+	result.step(ctx, "正在等待服务加载模型（首次约十几秒）")
 	if !waitPort(ctx, qwenPort, 90*time.Second) {
 		result.Warning = fmt.Sprintf("服务已注册，但 %d 秒内 %d 端口未监听。"+
 			"可查看日志：%s", 90, qwenPort, p.ErrLog)
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
-	result.Steps = append(result.Steps, fmt.Sprintf("Qwen3 TTS 已就绪，监听 %d 端口", qwenPort))
+	result.step(ctx, fmt.Sprintf("Qwen3 TTS 已就绪，监听 %d 端口", qwenPort))
 
 	// 预热两个模型。首次加载各需 20-30 秒，放在这里做掉，
 	// 网站上第一次请求就能直接出声，而不是让用户等半分钟以为坏了。
-	result.Steps = append(result.Steps, "正在预热两个模型（各自约 20-30 秒）…")
+	result.step(ctx, "正在预热两个模型（各自约 20-30 秒）…")
 	if n := m.EnsureQwenModelsLoaded(ctx); n > 0 {
-		result.Steps = append(result.Steps, fmt.Sprintf("已加载 %d 个模型，克隆与预置音色都可立即使用", n))
+		result.step(ctx, fmt.Sprintf("已加载 %d 个模型，克隆与预置音色都可立即使用", n))
 	}
 
 	// 自动登记进服务管理（用户不必再手工纳管）
 	if err := m.RegisterInstalledService(ctx, qwenLabel, "Qwen3 TTS", "🗣️", "ai", qwenPort); err != nil {
-		result.Steps = append(result.Steps, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
 	}
 
 	// ---- 7. 把插件要填的东西直接列出来 ----
@@ -254,12 +254,12 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		// 加了鉴权就必须有反代 —— 此时 Qwen 只监听 127.0.0.1，
 		// 网站**只能**通过 8899 访问。所以顺手把它一起装好，
 		// 否则用户会得到一个"装好了但连不上"的服务。
-		result.Steps = append(result.Steps, "",
+		result.step(ctx, "",
 			"已选择加鉴权 → 继续部署对外入口（带共享密钥的反向代理）")
 		if err := m.InstallVoiceReceiver(ctx, result, ReceiverOptions{Token: opt.Token}); err != nil {
 			result.Warning = "Qwen 已就绪，但反向代理部署失败：" + err.Error() +
 				"（此时 8880 只监听本机，网站连不上，请重试）"
-			result.Steps = append(result.Steps, "警告："+result.Warning)
+			result.step(ctx, "警告："+result.Warning)
 		}
 		return nil
 	}
@@ -294,7 +294,7 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 // 为什么要检查：两个 0.6B 模型同时驻留实测约 4GB，加系统与其它服务，
 // 16GB 是舒服的起点；低于它仍能跑，但要在用户动手前就提示，别让他
 // 等 20 分钟下载完才失败。磁盘按实测口径：两个模型约 3.7GB + 环境约 0.5GB。
-func (m *Manager) checkQwenPreconditions(result *InstallResult) error {
+func (m *Manager) checkQwenPreconditions(ctx context.Context, result *InstallResult) error {
 	memGB := memoryGB()
 	diskGB := freeDiskGB(m.opt.UserHome)
 	result.Steps = append(result.Steps,
@@ -303,7 +303,7 @@ func (m *Manager) checkQwenPreconditions(result *InstallResult) error {
 	if memGB > 0 && memGB < qwenMinMemGB {
 		result.Warning = fmt.Sprintf(
 			"内存只有 %dGB（建议 16GB 起）：两个模型同时驻留约 4GB，跑起来会偏紧", memGB)
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 	}
 	if diskGB > 0 && diskGB < qwenMinDiskGB {
 		return fmt.Errorf("可用磁盘只有 %dGB，建议至少 %dGB（环境约 0.5GB + 两个模型约 3.7GB）",
@@ -319,19 +319,19 @@ func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallRe
 	if out, err := m.runAsUser(ctx, 5*time.Minute, pip, "install", "-U", "pip", "-i", qwenPipMirror); err != nil {
 		return fmt.Errorf("升级 pip 失败: %v（%s）", err, tailText(out, 300))
 	}
-	result.Steps = append(result.Steps, "pip 已升级（走清华源）")
+	result.step(ctx, "pip 已升级（走清华源）")
 
 	// 判断是否已装：重复执行时不该再花十几分钟重装
 	out, _ := m.runAsUser(ctx, time.Minute, pip, "list")
 	if strings.Contains(out, "mlx-audio") {
-		result.Steps = append(result.Steps, "mlx-audio 已安装，跳过")
+		result.step(ctx, "mlx-audio 已安装，跳过")
 		return nil
 	}
-	result.Steps = append(result.Steps, "正在安装 mlx-audio[server]（依赖较多，请耐心等待）")
+	result.step(ctx, "正在安装 mlx-audio[server]（依赖较多，请耐心等待）")
 	if out, err := m.runAsUser(ctx, 40*time.Minute, pip, "install", "mlx-audio[server]", "-i", qwenPipMirror); err != nil {
 		return fmt.Errorf("安装 mlx-audio[server] 失败: %v（%s）", err, tailText(out, 500))
 	}
-	result.Steps = append(result.Steps, "mlx-audio[server] 安装完成")
+	result.step(ctx, "mlx-audio[server] 安装完成")
 	return nil
 }
 
@@ -367,7 +367,7 @@ func (m *Manager) downloadQwenModel(ctx context.Context, p qwenPaths, result *In
 // downloadOneQwenModel 下载单个模型并处理续传重试。
 func (m *Manager) downloadOneQwenModel(ctx context.Context, hf string, mdl QwenModel, result *InstallResult) error {
 	if modelDownloaded(m.opt.UserHome, mdl.Name) {
-		result.Steps = append(result.Steps, mdl.Label+" 已下载，跳过")
+		result.step(ctx, mdl.Label+" 已下载，跳过")
 		return nil
 	}
 
@@ -383,13 +383,13 @@ func (m *Manager) downloadOneQwenModel(ctx context.Context, hf string, mdl QwenM
 	for attempt := 1; attempt <= 3; attempt++ {
 		out, err := m.runAsUserEnv(ctx, 40*time.Minute, env, hf, "download", mdl.Name)
 		if err == nil {
-			result.Steps = append(result.Steps, mdl.Label+" 下载完成")
+			result.step(ctx, mdl.Label+" 下载完成")
 			return nil
 		}
 		lastOut, lastErr = out, err
 		if modelDownloaded(m.opt.UserHome, mdl.Name) {
 			// 命令报错但文件其实齐了（hf 有时在收尾阶段断连）
-			result.Steps = append(result.Steps, mdl.Label+" 下载完成（末次连接中断，但文件已齐）")
+			result.step(ctx, mdl.Label+" 下载完成（末次连接中断，但文件已齐）")
 			return nil
 		}
 		if attempt < 3 {
@@ -519,8 +519,9 @@ func (m *Manager) runAsUserEnv(ctx context.Context, timeout time.Duration, env [
 	e := append(os.Environ(), "HOME="+m.opt.UserHome)
 	e = append(e, env...)
 	cmd.Env = e
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	// 模型下载（hf download）动辄几百 MB，必须逐行流式，
+	// 否则用户在整个下载期间只能看到"正在下载模型"一句。
+	return streamCmd(ctx, cmd)
 }
 
 // memoryGB 返回物理内存 GB，取不到返回 0。

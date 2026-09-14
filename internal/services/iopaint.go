@@ -79,7 +79,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	// ---- 0. 资源预检 ----
 	// torch + 模型加起来不小，磁盘不够会在装到一半失败
 	diskGB := freeDiskGB(m.opt.UserHome)
-	result.Steps = append(result.Steps, fmt.Sprintf("环境检查：可用磁盘 %dGB", diskGB))
+	result.step(ctx, fmt.Sprintf("环境检查：可用磁盘 %dGB", diskGB))
 	if diskGB > 0 && diskGB < 8 {
 		return fmt.Errorf("可用磁盘只有 %dGB，建议至少 8GB（torch 约 2GB + 模型）", diskGB)
 	}
@@ -88,12 +88,12 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 
 	// ---- 1. Python 3.11 ----
 	if !m.brewHas(ctx, qwenPythonVer) {
-		result.Steps = append(result.Steps, "正在安装 "+qwenPythonVer)
+		result.step(ctx, "正在安装 "+qwenPythonVer)
 		if _, err := m.brewRun(ctx, 20*time.Minute, "install", qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
 		}
 	} else {
-		result.Steps = append(result.Steps, qwenPythonVer+" 已安装，跳过")
+		result.step(ctx, qwenPythonVer+" 已安装，跳过")
 	}
 	py311 := filepath.Join(m.brewPrefix(), "opt", qwenPythonVer, "bin", "python3.11")
 
@@ -105,12 +105,12 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	// 用户身份建 venv 会 Permission denied（在 Qwen 那边踩过）
 	_ = chownTree(m.opt.UserName, p.Root)
 	if _, err := os.Stat(p.Python); err != nil {
-		result.Steps = append(result.Steps, "正在创建 Python 虚拟环境")
+		result.step(ctx, "正在创建 Python 虚拟环境")
 		if out, err := m.runAsUser(ctx, 5*time.Minute, py311, "-m", "venv", p.Venv); err != nil {
 			return fmt.Errorf("创建虚拟环境失败: %v（%s）", err, tailText(out, 300))
 		}
 	} else {
-		result.Steps = append(result.Steps, "虚拟环境已存在，跳过创建")
+		result.step(ctx, "虚拟环境已存在，跳过创建")
 	}
 	_ = chownTree(m.opt.UserName, p.Root)
 
@@ -136,11 +136,11 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 
 	// ---- 5. 验证 ----
 	// 首次启动会下载模型（LaMa 约 200MB），所以给足时间
-	result.Steps = append(result.Steps, "正在等待服务就绪（首次会下载模型，约 200MB）")
+	result.step(ctx, "正在等待服务就绪（首次会下载模型，约 200MB）")
 	if !waitPort(ctx, iopaintPort, 180*time.Second) {
 		result.Warning = fmt.Sprintf("服务已注册，但 180 秒内 %d 端口未监听。请看日志：%s",
 			iopaintPort, p.ErrLog)
-		result.Steps = append(result.Steps, "警告："+result.Warning)
+		result.step(ctx, "警告："+result.Warning)
 		return nil
 	}
 
@@ -148,7 +148,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	result.Address = host
 
 	if err := m.RegisterInstalledService(ctx, iopaintLabel, "IOPaint（图片去水印）", "🖼️", "tool", iopaintPort); err != nil {
-		result.Steps = append(result.Steps, "（自动登记到服务管理失败："+err.Error()+"）")
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
 	}
 
 	result.Steps = append(result.Steps,
@@ -171,7 +171,7 @@ func (m *Manager) pipInstallIOPaint(ctx context.Context, p iopaintPaths, result 
 	}
 	out, _ := m.runAsUser(ctx, time.Minute, p.Pip, "list")
 	if strings.Contains(out, "iopaint") || strings.Contains(out, "IOPaint") {
-		result.Steps = append(result.Steps, "iopaint 已安装，跳过")
+		result.step(ctx, "iopaint 已安装，跳过")
 		return nil
 	}
 	// iopaint 会拉 torch —— 这是本流程里最大的一块（约 1~2GB），
@@ -181,7 +181,7 @@ func (m *Manager) pipInstallIOPaint(ctx context.Context, p iopaintPaths, result 
 	if out, err := m.runAsUser(ctx, 40*time.Minute, p.Pip, "install", "iopaint", "-i", qwenPipMirror); err != nil {
 		return fmt.Errorf("安装 iopaint 失败: %v（%s）", err, tailText(out, 500))
 	}
-	result.Steps = append(result.Steps, "iopaint 安装完成")
+	result.step(ctx, "iopaint 安装完成")
 	return nil
 }
 
@@ -195,13 +195,13 @@ func (m *Manager) pickIOPaintDevice(ctx context.Context, p iopaintPaths, result 
 	out, err := m.runAsUser(ctx, 2*time.Minute, p.Python, "-c", script)
 	dev := strings.TrimSpace(out)
 	if err != nil || (dev != "mps" && dev != "cpu") {
-		result.Steps = append(result.Steps, "未能探测到 MPS，回退到 CPU（较慢）")
+		result.step(ctx, "未能探测到 MPS，回退到 CPU（较慢）")
 		return "cpu"
 	}
 	if dev == "mps" {
-		result.Steps = append(result.Steps, "已启用 Apple Silicon MPS 加速")
+		result.step(ctx, "已启用 Apple Silicon MPS 加速")
 	} else {
-		result.Steps = append(result.Steps, "MPS 不可用，使用 CPU（较慢）")
+		result.step(ctx, "MPS 不可用，使用 CPU（较慢）")
 	}
 	return dev
 }

@@ -1,11 +1,13 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -83,6 +85,32 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 		action = "up"
 	}
 
+	// 「部署」是唯一的长动作：compose up -d 可能拉几分钟镜像，
+	// 同步请求期间用户只能看"正在部署"，而且一刷新就把 docker 拉取打断。
+	// 交给任务中心，进度（镜像层下载）走 SSE。
+	//
+	// stop / restart / status 都是秒级动作，保持同步返回 ——
+	// 前端已有的即时反馈（"已停止"）不需要改成任务。
+	if action == "up" {
+		s.launchTask(w, r, "deploy", "compose:"+name, "部署 Docker Compose 项目 "+name,
+			"docker_compose_up", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				mgr := s.svcManager()
+				out, err := mgr.DockerComposeAction(ctx, name, "up", removeVolumes)
+				if err != nil {
+					return nil, err
+				}
+				// 部署成功后顺手把项目登记成服务 —— 用户不必再去「可纳管」里加一遍。
+				registered := false
+				if file, ferr := mgr.ComposeProjectFile(name); ferr == nil {
+					if rerr := mgr.RegisterComposeProject(ctx, name, file); rerr == nil {
+						registered = true
+					}
+				}
+				return map[string]any{"name": name, "action": "up", "output": out, "registered": registered}, nil
+			})
+		return
+	}
+
 	mgr := s.svcManager()
 	out, err := mgr.DockerComposeAction(r.Context(), name, action, removeVolumes)
 	if err != nil {
@@ -92,17 +120,7 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 	}
 	s.audit(r, "docker_compose_"+action, name, "成功", true, "")
 
-	// 部署成功后顺手把项目登记成服务 —— 用户不必再去「可纳管」里加一遍。
-	registered := false
-	if action == "up" {
-		if file, ferr := mgr.ComposeProjectFile(name); ferr == nil {
-			if rerr := mgr.RegisterComposeProject(r.Context(), name, file); rerr == nil {
-				registered = true
-			}
-		}
-	}
-
-	ok(w, map[string]any{"name": name, "action": action, "output": out, "registered": registered})
+	ok(w, map[string]any{"name": name, "action": action, "output": out})
 }
 
 // handleDockerComposeDelete 删除项目目录（会先 down，避免留下孤儿容器）。

@@ -163,6 +163,17 @@ export const api = {
   serviceLogs: (name, lines = 300) =>
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/logs?lines=${lines}`),
 
+  // ---- 任务中心（安装/卸载的实时进度）----
+  //
+  // 任务只活在面板进程内存里，进程一重启就清空 —— 所以这里没有任何"持久化"接口，
+  // 前端也不该把任务 id 存进 localStorage 之类的地方。
+  tasks: () => request('GET', `${API_BASE}/tasks`),
+  task: (id, after = 0, limit = 800) =>
+    request('GET', `${API_BASE}/tasks/${encodeURIComponent(id)}?after=${after}&limit=${limit}`),
+  taskCancel: (id) => request('POST', `${API_BASE}/tasks/${encodeURIComponent(id)}/cancel`, {}),
+  // 进度用 SSE。URL 必须走 apiURL 拼相对路径：面板可能挂在 /_panel 子路径下。
+  taskStreamURL: (id) => apiURL(`tasks/${encodeURIComponent(id)}/stream`),
+
   // ---- 应用市场 ----
   market: () => request('GET', `${API_BASE}/market`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),

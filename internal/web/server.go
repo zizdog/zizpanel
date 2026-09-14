@@ -22,6 +22,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
+	"github.com/zizdog/zizpanel/internal/tasks"
 	"github.com/zizdog/zizpanel/internal/term"
 	"github.com/zizdog/zizpanel/internal/version"
 )
@@ -71,6 +72,11 @@ type Server struct {
 	termMgr  *term.Manager
 	termOnce sync.Once
 
+	// Tasks 是任务中心：安装/卸载这类长任务在后台跑，进度走 SSE。
+	// 它**不属于任何一次请求**，所以不注册进 HTTP 层，也不做持久化
+	// （面板重启后"正在安装"本身就是假的，见 SPEC-任务中心.md）。
+	Tasks *tasks.Manager
+
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time
@@ -95,6 +101,7 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		Procs:       sysinfo.NewProcSampler(),
 		Log:         logx.New("web"),
 		serviceRepo: services.NewRepository(st),
+		Tasks:       tasks.NewManager(),
 		static:      sub,
 		startAt:     time.Now(),
 	}
@@ -131,6 +138,12 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
 	root.HandleFunc("GET /api/v1/audit/facets", s.requireAuth(s.handleAuditFacets))
 	root.HandleFunc("GET /api/v1/audit/export", s.requireAuth(s.handleAuditExport))
+
+	// 任务中心：安装/卸载的实时进度（见 SPEC-任务中心.md）
+	root.HandleFunc("GET /api/v1/tasks", s.requireAuth(s.handleTasksList))
+	root.HandleFunc("GET /api/v1/tasks/{id}", s.requireAuth(s.handleTaskGet))
+	root.HandleFunc("GET /api/v1/tasks/{id}/stream", s.requireAuth(s.handleTaskStream))
+	root.HandleFunc("POST /api/v1/tasks/{id}/cancel", s.requireAuth(s.handleTaskCancel))
 
 	root.HandleFunc("POST /api/v1/account/password", s.requireAuth(s.handleChangePassword))
 	// 改用户名：要当前密码确认，但不吊销会话（会话按 user_id 关联）

@@ -10,12 +10,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/auth"
 	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
+	"github.com/zizdog/zizpanel/internal/tasks"
 	"github.com/zizdog/zizpanel/internal/version"
 )
 
@@ -165,6 +167,13 @@ func startFakeDocker(t *testing.T) (string, *fakeDaemon) {
 
 // newDockerTestServer 起一个面板实例，并把它的 Docker socket 指向假守护进程。
 func newDockerTestServer(t *testing.T, sock string) (*httptest.Server, []*http.Cookie) {
+	_, ts, cookies := newDockerTestServerWithSrv(t, sock)
+	return ts, cookies
+}
+
+// newDockerTestServerWithSrv 与 newDockerTestServer 相同，但把 *Server 也返回，
+// 给需要直接访问任务中心（srv.Tasks）的测试用。
+func newDockerTestServerWithSrv(t *testing.T, sock string) (*Server, *httptest.Server, []*http.Cookie) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
@@ -180,9 +189,18 @@ func newDockerTestServer(t *testing.T, sock string) (*httptest.Server, []*http.C
 	cfg.AccessMode = "any"
 	cfg.DockerSocket = sock
 	cfg.User = "zizdog"
-	cfg.UserHome = dir
+	// 与 newTestServer 同样的隔离：Cfg.UserHome/WWWRoot/LogRoot 绝不能指向真实家目录
+	// （见 README 坑 57：测试把用户真实 launchd plist 覆盖成空 plist 的事故）
+	cfg.UserHome = dir + "/home"
+	cfg.WWWRoot = cfg.UserHome + "/www"
+	cfg.LogRoot = cfg.WWWRoot + "/_logs"
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatal(err)
+	}
+	for _, d := range []string{cfg.UserHome, cfg.WWWRoot, cfg.LogRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	st, err := store.Open(dir)
 	if err != nil {
@@ -202,7 +220,7 @@ func newDockerTestServer(t *testing.T, sock string) (*httptest.Server, []*http.C
 	if res.StatusCode != 200 {
 		t.Fatalf("初始化失败 %d", res.StatusCode)
 	}
-	return ts, cookies
+	return srv, ts, cookies
 }
 
 // TestDockerInfoReportsEngine 环境探测要如实报告引擎版本。
@@ -437,17 +455,34 @@ func TestDockerComposeRejectsEmptyContent(t *testing.T) {
 }
 
 // TestDockerComposeActionRequiresFile 没有 yml 时不该去调 compose，而是明确报错。
+//
+// 注意（2026-09-14 起）：`up` 已经改成**异步任务**（compose up 可能拉几分钟镜像，
+// 见 SPEC-任务中心.md），所以这里的契约变成"接口立刻 202 + 任务随后失败"。
+// 失败原因仍然必须是"compose 文件不存在"，只是从 HTTP 响应挪到了任务里。
 func TestDockerComposeActionRequiresFile(t *testing.T) {
 	sock, _ := startFakeDocker(t)
-	ts, cookies := newDockerTestServer(t, sock)
+	srv, ts, cookies := newDockerTestServerWithSrv(t, sock)
 
 	res, out, _ := doJSON(t, ts, "POST",
 		"/api/v1/docker/compose/nonexistent/actions?action=up", map[string]any{}, cookies)
-	if res.StatusCode == 200 {
-		t.Fatal("没有 yml 时不该成功")
+	if res.StatusCode != 202 {
+		t.Fatalf("部署现在是长任务，应立刻 202，实际 %d: %v", res.StatusCode, out)
 	}
-	if !strings.Contains(asString(out["msg"]), "不存在") {
-		t.Errorf("应说明 compose 文件不存在，实际: %v", out["msg"])
+	data, _ := out["data"].(map[string]any)
+	task := srv.Tasks.Get(asString(data["task_id"]))
+	if task == nil {
+		t.Fatal("应返回可查询的 task_id")
+	}
+	select {
+	case <-task.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("没有 yml 时应快速失败，而不是卡住")
+	}
+	if task.Status() != tasks.StatusFailed {
+		t.Fatalf("没有 yml 时任务应失败，实际 %s", task.Status())
+	}
+	if !strings.Contains(task.Meta().Error, "不存在") {
+		t.Errorf("应说明 compose 文件不存在，实际: %v", task.Meta().Error)
 	}
 }
 

@@ -824,11 +824,13 @@ func (d *composeDriver) run(ctx context.Context, timeout time.Duration, args ...
 	if d.opt.DockerSocket != "" && os.Getenv("DOCKER_HOST") == "" {
 		cmd.Env = append(os.Environ(), "DOCKER_HOST=unix://"+d.opt.DockerSocket)
 	}
-	out, err := cmd.CombinedOutput()
+	// compose 的镜像层进度是逐行输出的，必须流式 ——
+	// 「正在拉取镜像」这一句话对用户毫无信息量，层进度才是真实进展。
+	out, err := streamCmd(ctx, cmd)
 	if err != nil {
-		return string(out), fmt.Errorf("compose 命令失败: %s", truncate(strings.TrimSpace(string(out)), 400))
+		return out, fmt.Errorf("compose 命令失败: %s", truncate(strings.TrimSpace(out), 400))
 	}
-	return string(out), nil
+	return out, nil
 }
 
 // Status 通过 `compose ps --format json` 判断运行状态。

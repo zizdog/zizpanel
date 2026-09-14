@@ -10,6 +10,7 @@
 import { api, sseServiceLogs } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
+import { taskCenter } from './tasks.js';
 
 // 页面上缓存的列表数据
 let cache = null;
@@ -433,11 +434,16 @@ export function ServicesView(content, ctx = {}) {
                 ? '这会停止并删除容器与网络（具名数据卷会保留）。'
                 : '这会卸载软件包并删除其后台服务配置。'),
               { title: '卸载服务', danger: true, okText: '确认卸载' })) return;
-            try {
-              await api.serviceUninstall(cur.name);
-              toast('已卸载', 'ok');
-              m.close(); load();
-            } catch (e) { toast(e.message, 'err', 12000); }
+            // 卸载是异步任务（可能跑几分钟）：请求立刻返回 task_id，
+            // 进度与结果都在任务中心的进度窗里看，关窗口不会中断它。
+            m.close();
+            taskCenter.start({
+              kind: 'uninstall',
+              target: cur.name,
+              title: `卸载 ${cur.display_name}`,
+              start: () => api.serviceUninstall(cur.name),
+            });
+            load();
           },
         }) : h('button.btn.btn-sm', {
           text: 'ℹ️ 这是纳管服务',

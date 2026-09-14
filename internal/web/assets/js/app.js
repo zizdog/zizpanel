@@ -16,6 +16,7 @@ import { LogsView } from './logs.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { AuditView } from './audit.js';
+import { taskCenter } from './tasks.js';
 
 // ---------------- 全局状态 ----------------
 export const state = {
@@ -291,6 +292,9 @@ function renderApp() {
     pageTitle,
     h('span.crumb', { text: item.group || '' }),
     h('div.spacer'),
+    // 任务中心入口：任务状态活在 tasks.js 的模块级单例里，不随路由重建，
+    // 所以任何页面都能重新打开正在安装的任务（关掉窗口 ≠ 取消任务）。
+    taskCenter.button(),
     h('span.pill.' + (user.totp_enabled ? 'ok' : 'warn'), {
       text: user.totp_enabled ? '2FA 已开启' : '2FA 未开启',
       title: '两步验证状态，可在「面板设置」中调整',
@@ -305,6 +309,11 @@ function renderApp() {
 
   mount(layout);
   document.body.classList.remove('nav-open');
+
+  // 任务中心初始化：内部幂等（只会拉一次 GET /api/v1/tasks，然后按运行中的任务建 SSE）。
+  // 之所以放在这里而不是 boot()，是因为 renderApp() 会重建顶栏按钮 ——
+  // 初始化完成后徽标要画在"当前这个"按钮上。
+  taskCenter.init();
 
   // 渲染前先清理上一个页面的长连接（SSE / 定时器），避免叠加泄漏
   runCleanup();
