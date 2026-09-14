@@ -44,10 +44,12 @@ export function AppsView(content, ctx = {}) {
       ]));
       return;
     }
-    // 探测是"能不能打开"的依据，失败不影响列表渲染（降级成只给直连入口）
-    try {
-      proxyState = await api.appProxies();
-    } catch { proxyState = null; }
+    // 探测是"能不能打开"的依据，但它要跑十几条网络请求（含 8 秒超时）。
+    // **不在打开页面时自动跑** —— 用户反馈"应用市场打开较慢，其它页面都是秒开"。
+    // 改为：结果缓存在内存里；点「检测可用性」时才真跑；生成入口后刷新一次。
+    if (!proxyState) {
+      proxyState = { enabled: true, items: [], _stale: true };
+    }
     renderHead();
     renderGrid();
   }
@@ -73,12 +75,30 @@ export function AppsView(content, ctx = {}) {
       // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
       proxyState && proxyState.enabled
         ? h('button.btn.btn-sm', {
+          text: '🔍 检测可用性',
+          title: '逐个探测应用界面能不能打开（要跑十几条请求，约 5-15 秒）',
+          onclick: () => doProbe(),
+        })
+        : null,
+      proxyState && proxyState.enabled
+        ? h('button.btn.btn-sm', {
           text: '🔗 生成 nginx 入口',
           title: '把每个有界面的应用挂到 http://<主机>/<应用>/（写入 nginx 并重载）',
           onclick: applyProxies,
         })
         : null,
     );
+  }
+
+  // doProbe 手动触发一次可用性探测（打开页面时不再自动跑，见 load() 的说明）。
+  async function doProbe() {
+    try {
+      toast('正在探测应用界面…', 'info', 3000);
+      proxyState = await api.appProxies();
+      renderGrid();
+    } catch (e) {
+      toast('探测失败：' + e.message, 'err', 8000);
+    }
   }
 
   // applyProxies 生成/更新 nginx 里的子路径入口。
@@ -452,7 +472,10 @@ export function AppsView(content, ctx = {}) {
     }
     // prefer_direct 是**人工实测**的结论（自动探测发现不了"资源全 200 但
     // 前端路由不认这个前缀"的情况），所以它的优先级高于探测结果。
-    const proxyOK = !!st.proxy_ok && !a.ui.prefer_direct;
+    // 尚未探测过（_stale）时按"能用"对待 —— 否则没点过检测的用户会看到所有应用
+    // 都被降级成"直连端口"（这不是我们想给的默认结论）。
+    const probed = !proxyState?._stale;
+    const proxyOK = !a.ui.prefer_direct && (probed ? !!st.proxy_ok : true);
     const why = a.ui.prefer_direct ? (a.ui.note || '这个应用不支持子路径') : (st.reason || a.ui.note || '');
     const out = [];
     if (proxyOK) {

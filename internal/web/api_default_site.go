@@ -224,13 +224,12 @@ func (s *Server) handlePhpMyAdmin(w http.ResponseWriter, r *http.Request) {
 // phpAdminLoginRequired 给未登录用户一张说明页：说清"要先去面板登录"，
 // 并给出登录地址（只有知道安全后缀的人才看得到这一页）。
 func (s *Server) phpAdminLoginRequired(w http.ResponseWriter, r *http.Request) {
-	entry := s.PanelEntryPath()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = fmt.Fprintf(w, `<h1>401 需要先登录面板</h1>
+	// 同上：未登录时**不暴露面板入口**（安全后缀不该从错误页泄露）
+	_, _ = io.WriteString(w, `<h1>401 需要先登录面板</h1>
 <p>phpMyAdmin 只对已登录的面板用户开放。</p>
-<p>请先打开面板（<a href="%s">%s</a>）登录，再从「应用市场 → phpMyAdmin → 打开」进入。</p>`,
-		entry, entry)
+<p>请在你平时使用的面板地址登录后，再从「应用市场 → phpMyAdmin → 打开」进入。</p>`)
 }
 
 func escHTML(s string) string {

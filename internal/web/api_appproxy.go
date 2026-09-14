@@ -438,10 +438,11 @@ func (s *Server) requireAppProxyAuth(slug string, next http.Handler) http.Handle
 		if _, err := s.Auth.AuthSession(r.Context(), s.sessionToken(r)); err != nil {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusUnauthorized)
-			entry := s.PanelEntryPath()
+			// **绝不回显面板入口**：未登录的访问者不该从这张错误页学到安全后缀
+			// （那等于把"安全入口"直接送出去）。这里只说"去面板登录"。
 			_, _ = fmt.Fprintf(w, `<h1>401 需要先登录面板</h1>
-<p>「%s」这个应用界面要求先登录面板（可在「面板设置 → 访问与安全」里关闭这个要求）。</p>
-<p>请先打开面板（<a href="%s">%s</a>）登录，再回来访问。</p>`, escHTML(slug), entry, entry)
+<p>「%s」这个应用界面要求先登录面板。</p>
+<p>请在你平时使用的面板地址登录后再回来访问。</p>`, escHTML(slug))
 			return
 		}
 		next.ServeHTTP(w, r)

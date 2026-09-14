@@ -10,7 +10,7 @@
 
 import { api, apiURL } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
-import { registerCleanup } from './app.js';
+import { state, registerCleanup, panelPath } from './app.js';
 
 let cache = null;
 let tab = 'databases';
@@ -129,10 +129,17 @@ export function DatabaseView(content, ctx = {}) {
     clear(headBox);
     // 主入口是 phpMyAdmin：库表、权限、导入导出这些它比面板做得全。
     // 面板自研那几个 Tab 保留为**应急入口**（phpMyAdmin 起不来时还能改密码）。
-    const pmaBtn = h('button.btn.btn-sm.btn-primary', {
+    // 用**真链接**（<a>）而不是 button + window.open：
+    //   · 用户能在浏览器状态栏 / 右键菜单里看到真实地址（不会被弹窗拦截器吞掉）；
+    //   · 可以中键新标签打开、可以复制链接。
+    // 之前是 button + window.open，被拦截时"点了没反应"，用户只能把当前页地址
+    // 复制出来（还带着浏览器的 #:~:text= 片段），看起来就像"链接拼错了"。
+    const pmaBtn = h('a.btn.btn-sm.btn-primary', {
       text: '↗ 打开 phpMyAdmin',
-      title: '库表与权限管理的推荐入口；面板内置工具作为应急备用',
-      onclick: () => window.open(pmaURL(), '_blank', 'noopener'),
+      href: pmaURL(),
+      target: '_blank',
+      rel: 'noopener',
+      title: '库表与权限管理的推荐入口（需先登录面板）；面板内置工具作为应急备用',
     });
     if (!cache?.connected) {
       appendAll(headBox,
