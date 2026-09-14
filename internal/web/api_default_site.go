@@ -138,29 +138,16 @@ func (s *Server) buildDefaultVhost() string {
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", filepath.Join(wwwRoot, "_logs"))
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", filepath.Join(wwwRoot, "_logs"))
 
-	// 应用界面代理（从目录生成，与应用市场那个按钮同源）
+	// 应用界面代理：**用与应用市场那个按钮完全相同的生成函数**（含 BEGIN/END 标记）。
+	//
+	// 为什么必须带标记：不带的话，应用市场点「生成 nginx 入口」时
+	// upsertAppProxyBlock 找不到旧块，于是**再插一份** → nginx 报
+	// `duplicate location "/filebrowser"`，整份配置回滚（用户 2026-09-15 实测）。
+	// 两处生成同一份内容、同一套标记，才谈得上幂等。
 	entries := appProxyEntries()
 	if len(entries) > 0 {
-		b.WriteString("    # ---- 应用界面代理（由「应用市场 → 生成 nginx 入口」维护）----\n")
-		for _, a := range entries {
-			fmt.Fprintf(&b, "    # %s（127.0.0.1:%d）\n", a.Name, a.Port)
-			fmt.Fprintf(&b, "    location = /%s {\n        return 301 /%s/;\n    }\n", a.Slug, a.Slug)
-			fmt.Fprintf(&b, "    location ^~ /%s/ {\n", a.Slug)
-			b.WriteString("        proxy_pass https://" + s.proxyUpstream() + ";\n")
-			b.WriteString("        proxy_ssl_verify off;\n")
-			b.WriteString("        proxy_ssl_server_name on;\n")
-			b.WriteString("        proxy_http_version 1.1;\n")
-			b.WriteString("        proxy_set_header Host $host;\n")
-			b.WriteString("        proxy_set_header X-Real-IP $remote_addr;\n")
-			b.WriteString("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-			b.WriteString("        proxy_set_header X-Forwarded-Proto $scheme;\n")
-			b.WriteString("        proxy_set_header Upgrade $http_upgrade;\n")
-			b.WriteString("        proxy_set_header Connection $connection_upgrade;\n")
-			b.WriteString("        proxy_read_timeout 300s;\n")
-			b.WriteString("        proxy_buffering off;\n")
-			b.WriteString("        proxy_cache off;\n")
-			b.WriteString("    }\n\n")
-		}
+		b.WriteString(appProxyBlock(entries, s.proxyUpstream()))
+		b.WriteString("\n")
 	}
 
 	b.WriteString("    location / {\n        try_files $uri $uri/ =404;\n    }\n\n")

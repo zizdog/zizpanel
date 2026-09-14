@@ -605,7 +605,16 @@ export function ServicesView(content, ctx = {}) {
             h('div', { style: { fontWeight: '550' }, text: c.label }),
             h('div', { style: { fontSize: '11px', color: 'var(--text-mute)' }, text: c.plist_path }),
           ]),
-          h('td', h('span.pill' + (c.running ? '.ok' : ''), { text: c.running ? '运行中' : '已停止' })),
+          // 状态措辞要分清三种情况：正在跑 / 已加载但按需启动（没有进程是正常的）/
+          // 根本没加载。macOS 上很多作业是按需触发的（系统 cron 就是），
+          // 一律写成"已停止"会让人以为服务坏了。
+          h('td', [
+            c.running
+              ? h('span.pill.ok', { text: '运行中' })
+              : (c.loaded
+                ? h('span.pill', { text: '待触发（按需运行）', title: '已加载到 launchd，但没有常驻进程 —— 这类作业在需要时才被拉起，属正常状态' })
+                : h('span.pill.warn', { text: '未加载' })),
+          ]),
           h('td.mono', { style: { fontSize: '11px' }, text: c.program || '—' }),
           h('td', h('button.btn.btn-sm.btn-primary', {
             text: '纳管',

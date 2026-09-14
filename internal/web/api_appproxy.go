@@ -183,6 +183,14 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "目录里没有任何带界面的应用")
 		return
 	}
+	// **直接整份重写默认站点**，而不是往现有文件里 upsert 一段。
+	//
+	// 为什么要改（用户 2026-09-15 实测 duplicate location）：
+	// 上一版的默认站点生成器写进去的应用 location **没有 BEGIN/END 标记**，
+	// 于是这个按钮找不到旧块、又插一份，nginx 直接语法冲突并整份回滚。
+	// 与其在旧内容上做补丁，不如让"默认站点"只有**一个生成函数**
+	// （buildDefaultVhost，它内部用的就是带标记的 appProxyBlock）：
+	// 内容永远自洽，历史遗留的无标记块也在这一次重写里被清掉。
 	res, err := s.callHelper(r.Context(), "vhost-read", defaultVhost)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "读取 nginx 配置失败: "+err.Error())
@@ -193,14 +201,10 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 		content, _ = data["content"].(string)
 	}
 	if strings.TrimSpace(content) == "" {
-		fail(w, http.StatusInternalServerError, "nginx 配置 "+defaultVhost+".conf 读不到内容，拒绝改写")
-		return
+		// 读不到也照样能写（helper 会做 nginx -t 与回滚），但先记一笔便于排查
+		s.Log.Warn("读不到 %s.conf 的现有内容，将直接整份重写", defaultVhost)
 	}
-	updated, err := upsertAppProxyBlock(content, appProxyBlock(entries, s.proxyUpstream()))
-	if err != nil {
-		fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	updated := s.buildDefaultVhost()
 	if err := s.writeVhost(r.Context(), defaultVhost, updated); err != nil {
 		fail(w, http.StatusInternalServerError, "写入 nginx 配置失败（已自动回滚）: "+err.Error())
 		return

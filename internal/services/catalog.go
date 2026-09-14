@@ -907,6 +907,16 @@ func (m *Manager) ScanAdoptable(ctx context.Context) ([]AdoptCandidate, error) {
 		}
 	}
 
+	// 按 brew formula 也去重一次：记录里的 label 前缀可能是旧的
+	// （真机上记录是 homebrew.mxcl.ollama，磁盘上是 sh.brew.ollama），
+	// 只比 label 会让同一个服务在"可纳管"里再出现一遍。
+	knownFormula := map[string]bool{}
+	for label := range known {
+		if f, ok := brewFormulaFromLabel(label); ok {
+			knownFormula[f] = true
+		}
+	}
+
 	candidates := []AdoptCandidate{}
 	dirs := []string{"/Library/LaunchDaemons"}
 	if m.opt.UserHome != "" {
@@ -929,6 +939,9 @@ func (m *Manager) ScanAdoptable(ctx context.Context) ([]AdoptCandidate, error) {
 			if isSystemLabel(label) || isSelfLabel(label) {
 				continue
 			}
+			if f, ok := brewFormulaFromLabel(label); ok && knownFormula[f] {
+				continue // 已经纳管过（只是 label 前缀不同）
+			}
 			path := filepath.Join(dir, name)
 			c := AdoptCandidate{Label: label, PlistPath: path}
 			c.Program = plistString(path, "Program")
@@ -945,6 +958,7 @@ func (m *Manager) ScanAdoptable(ctx context.Context) ([]AdoptCandidate, error) {
 			if st, err := priv.LaunchStatus(label); err == nil {
 				c.Running = st.Running
 				c.PID = st.PID
+				c.Loaded = st.Loaded
 			}
 			candidates = append(candidates, c)
 		}
@@ -961,13 +975,19 @@ func (m *Manager) ScanAdoptable(ctx context.Context) ([]AdoptCandidate, error) {
 		seen[c.Label] = true
 	}
 	for _, label := range m.loadedLabels(ctx) {
-		if seen[label] || known[label] || isSystemLabel(label) || isSelfLabel(label) {
+		if seen[label] || known[label] || knownFormula[label] || isSystemLabel(label) || isSelfLabel(label) {
+			continue
+		}
+		// Apple 自带的作业（plist 只在 /System/Library/...）不该出现在"可纳管"里：
+		// 它们属于 macOS 本身，纳管既没意义也容易被误停。
+		if isAppleSystemJob(label) {
 			continue
 		}
 		c := AdoptCandidate{Label: label, DisplayName: label}
 		if st, err := priv.LaunchStatus(label); err == nil {
 			c.Running = st.Running
 			c.PID = st.PID
+			c.Loaded = st.Loaded
 		}
 		candidates = append(candidates, c)
 	}
@@ -1005,6 +1025,12 @@ type AdoptCandidate struct {
 	LogPath     string `json:"log_path"`
 	Running     bool   `json:"running"`
 	PID         int    `json:"pid"`
+	// Loaded 表示这个作业此刻挂在 launchd 里（不管有没有进程）。
+	//
+	// 为什么需要：macOS 很多作业是**按需启动**的（launchd 在需要时才拉起，
+	// 平时没有进程）。只报"已停止"会让用户以为服务坏了 ——
+	// com.vix.cron（系统 cron）就是这样：loaded、无 PID，一切正常。
+	Loaded bool `json:"loaded"`
 }
 
 // selfLabels 是不允许纳管的服务：面板自身与关键基础设施。
@@ -1034,6 +1060,9 @@ func isSelfLabel(label string) bool {
 func isSystemLabel(label string) bool {
 	systemPrefixes := []string{
 		"com.apple.", "com.openssh.", "org.cups.", "com.microsoft.",
+		// com.vix.cron 是 macOS 自带的 cron（/System/Library/LaunchDaemons）——
+		// 它属于系统，纳管它没有意义，报"已停止"更是误导。
+		"com.vix.",
 		"com.google.", "com.adobe.", "com.docker.vmnetd", "com.openssh.sshd",
 		// 网络扩展（Tailscale / VPN 等）由系统网络栈托管，
 		// 面板没有能力也没有必要去启停它 —— 列出来只会让用户误点。
@@ -1150,4 +1179,18 @@ func (m *Manager) loadedLabels(ctx context.Context) []string {
 		out = append(out, label)
 	}
 	return out
+}
+
+// isAppleSystemJob 判断某个 launchd 作业是不是 macOS 自带的。
+//
+// 判据：它的 plist 只在 /System/Library/LaunchDaemons 或 LaunchAgents 下。
+// 这类作业（cron、各种 com.apple.*）属于系统本身，
+// 面板既不该纳管、也不该在"可纳管服务"里列出来让用户误停。
+func isAppleSystemJob(label string) bool {
+	for _, dir := range []string{"/System/Library/LaunchDaemons", "/System/Library/LaunchAgents"} {
+		if _, err := os.Stat(filepath.Join(dir, label+".plist")); err == nil {
+			return true
+		}
+	}
+	return false
 }
