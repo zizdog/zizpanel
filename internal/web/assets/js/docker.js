@@ -19,6 +19,7 @@ import { renderVolumes } from './docker-volumes.js';
 import { renderNetworks } from './docker-networks.js';
 import { renderCompose } from './docker-compose.js';
 import { renderDockerServices } from './docker-services.js';
+import { renderMirrors } from './docker-mirrors.js';
 
 const TABS = [
   { id: 'containers', title: '容器', icon: '📦', render: renderContainers, count: 'containers' },
@@ -26,6 +27,8 @@ const TABS = [
   { id: 'volumes', title: '数据卷', icon: '🗃️', render: renderVolumes, count: 'volumes' },
   { id: 'networks', title: '网络', icon: '🔌', render: renderNetworks, count: 'networks' },
   { id: 'compose', title: 'Compose', icon: '🧩', render: renderCompose, count: 'compose_projects' },
+  // 加速源：用户抱怨「拉取太慢」的直接对策（给 docker 守护进程配 registry-mirrors）
+  { id: 'mirrors', title: '加速源', icon: '🚀', render: renderMirrors, count: null },
   { id: 'services', title: '已纳管服务', icon: '⚙️', render: renderDockerServices, count: null },
 ];
 

@@ -307,6 +307,11 @@ func (s *Server) routes() http.Handler {
 	// 从市场卸载（service / installer 两类；纳管的走 DELETE /api/v1/services/{name}）
 	root.HandleFunc("DELETE /api/v1/market/{id}", s.requireAuth(s.handleMarketUninstall))
 
+	// Docker 镜像加速源（换源）：现状 / 检测可用性 / 保存并重启
+	root.HandleFunc("GET /api/v1/docker/mirrors", s.requireAuth(s.handleDockerMirrors))
+	root.HandleFunc("POST /api/v1/docker/mirrors/probe", s.requireAuth(s.handleDockerMirrorProbe))
+	root.HandleFunc("POST /api/v1/docker/mirrors", s.requireAuth(s.handleDockerMirrorSave))
+
 	// ---------- 在线升级 ----------
 	// 升级会替换二进制并重启面板，所以每一个写操作都必须经过鉴权；
 	// 执行升级额外要求进程是 root（见 handleUpgradeApply）。

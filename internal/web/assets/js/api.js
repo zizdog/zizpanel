@@ -292,6 +292,10 @@ export const api = {
   // library/redis、my_proj_db），不编码会把路径拆断。后端用的是 `{path...}`
   // 通配参数，所以编码后的 %2F 会被正确还原。
   dockerInfo: () => request('GET', `${API_BASE}/docker/info`),
+  // Docker 镜像加速源（换源）：现状 / 检测可用性 / 保存并重启运行时
+  dockerMirrors: () => request('GET', `${API_BASE}/docker/mirrors`),
+  dockerMirrorProbe: (urls) => request('POST', `${API_BASE}/docker/mirrors/probe`, urls ? { urls } : {}),
+  dockerMirrorSave: (mirrors) => request('POST', `${API_BASE}/docker/mirrors`, { mirrors }),
   dockerContainers: (all = true) => request('GET', `${API_BASE}/docker/containers?all=${all ? 1 : 0}`),
   // 容器名走查询参数而不是路径段：Go 1.22 的 `{path...}` 通配只能出现在
   // 模式末尾，而这三个接口后面还要跟 /logs、/inspect 或动作名。
