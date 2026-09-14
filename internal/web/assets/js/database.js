@@ -56,18 +56,13 @@ export function DatabaseView(content, ctx = {}) {
 
   // pmaURL 返回 phpMyAdmin 入口地址。
   //
-  // **必须用绝对地址指向 nginx 的端口（默认 80），不能用相对路径。**
-  // 踩过的坑：写成相对路径 '/phpmyadmin/' 时，浏览器会解析到面板自己的
-  // 地址（https://host:8443/phpmyadmin/）—— 那是面板的 SPA，
-  // 它不认识这个路径，于是卡在"正在连接面板…"永远出不来。
-  // phpMyAdmin 是 nginx 上的一个 location，跟面板不是同一个服务。
+  // 走**面板自己的入口**（`<当前地址>/<安全后缀>/phpmyadmin/`）：
+  //   · nginx 上那个 /phpmyadmin/ 已经收紧成"只允许本机"（外部直连 403，
+  //     这是用户要求的安全设定）；
+  //   · 面板这条路要求先登录面板，正是用户要的"必须登录才能进"；
+  //   · 用当前地址拼，所以从 127.0.0.1、局域网 IP、隧道域名访问都一致。
   function pmaURL() {
-    const host = location.hostname || '127.0.0.1';
-    // nginx 若不在 80 端口，可用 ?pma_port=8080 覆盖
-    const q = new URLSearchParams(location.search).get('pma_port');
-    const port = q || '80';
-    const suffix = port === '80' ? '' : ':' + port;
-    return `http://${host}${suffix}/phpmyadmin/`;
+    return panelPath('phpmyadmin/');
   }
 
   // credentialsForm 连接失败时显示的凭据表单。

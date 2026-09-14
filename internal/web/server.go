@@ -640,6 +640,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			"go_version":  goVersion(),
 			"install_id":  s.Cfg.InstallID,
 			"panel_path":  s.Cfg.DataDir,
+			// 面板入口（含安全后缀）：前端用它拼所有"打开"地址，
+			// 这样无论从 127.0.0.1:8443、局域网还是隧道访问，入口都是**同一个**。
+			"panel_entry":  s.PanelEntryPath(),
+			"panel_suffix": s.Cfg.PanelSuffix,
 		},
 		"counts": stats,
 	})

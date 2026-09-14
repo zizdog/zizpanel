@@ -37,7 +37,11 @@ func (s *Server) registerAppProxy(root *http.ServeMux) {
 	}
 	for _, app := range appproxy.Slugs() {
 		slug := app.UI.Slug
-		root.Handle("/"+slug+"/", appproxy.Handler(app))
+		h := appproxy.Handler(app)
+		if s.Cfg.AppProxyAuth {
+			h = s.requireAppProxyAuth(slug, h)
+		}
+		root.Handle("/"+slug+"/", h)
 		// 不带斜杠时补一个跳转：否则相对路径会解析到站点根（与 /_panel 同理）
 		root.Handle("/"+slug, http.RedirectHandler("/"+slug+"/", http.StatusMovedPermanently))
 	}
@@ -416,4 +420,26 @@ func (s *Server) proxyUpstream() string {
 		return "127.0.0.1" + addr[i:]
 	}
 	return addr
+}
+
+// requireAppProxyAuth 让应用界面也要求先登录面板。
+//
+// 用户提出的疑问（2026-09-15）：未登录时 File Browser / Squoosh 仍能访问，
+// 是否合理？—— Squoosh 完全没有自己的鉴权，File Browser 有登录但登录页本身
+// 也是公开的。既然它们挂在面板的端口上、而且面板已经是这台机器的总入口，
+// 默认要求先登录面板更符合"面板管到底"的预期（可在设置里关掉，
+// 关掉后就等同于直接访问端口，适合把某个应用单独开放出去的场景）。
+func (s *Server) requireAppProxyAuth(slug string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := s.Auth.AuthSession(r.Context(), s.sessionToken(r)); err != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			entry := s.PanelEntryPath()
+			_, _ = fmt.Fprintf(w, `<h1>401 需要先登录面板</h1>
+<p>「%s」这个应用界面要求先登录面板（可在「面板设置 → 访问与安全」里关闭这个要求）。</p>
+<p>请先打开面板（<a href="%s">%s</a>）登录，再回来访问。</p>`, escHTML(slug), entry, entry)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

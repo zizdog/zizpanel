@@ -86,6 +86,12 @@ type Config struct {
 	// 空串 = 不启用（本地开发/测试用）。真实安装时由 Bootstrap 随机生成，
 	// 也可以在「面板设置」里改或清空（清空要显式确认，那等于把面板放回根路径）。
 	PanelSuffix string `json:"panel_suffix"`
+	// AppProxyAuth 控制"应用界面（/iopaint/、/squoosh/ 等）是否要求先登录面板"。
+	//
+	// 默认 **true**：这些界面挂在面板同一个端口上，不要求登录就等于
+	// "知道 URL 就能用"（Squoosh 这类完全没有自己的鉴权）。
+	// 代价是访问前先过一次面板登录 —— 面板本来就是这台机器的总入口。
+	AppProxyAuth bool `json:"app_proxy_auth"`
 	// AppProxy 控制"把有界面的应用挂到 /<slug>/ 下"这个能力（默认开）。
 	//
 	// 为什么做成开关：面板的 /<slug>/ 是**公开路径**（应用自己鉴权，面板不拦），
@@ -195,7 +201,9 @@ func Default() *Config {
 		TLSEnable:  true,
 		AccessMode: "any",
 		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
-		AppProxy:      true,
+		AppProxy: true,
+		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）
+		AppProxyAuth:  true,
 		SessionHours:  72,
 		LoginMaxFail:  5,
 		LoginLockMins: 15,

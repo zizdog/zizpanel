@@ -8,7 +8,7 @@ import {
   h, clear, toast, modal, confirmBox, bytes, rate, pct, duration,
   levelOf, Sparkline, $,
 } from './ui.js';
-import { state, NAV } from './app.js';
+import { state, NAV, panelPath } from './app.js';
 
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
@@ -318,6 +318,22 @@ export function SettingsView(content) {
       style: { minHeight: '110px' },
     });
     const trustProxy = h('input', { type: 'checkbox', checked: !!s.trust_proxy });
+    // 安全后缀（安全入口）：可以随时改。改完**当前页面立刻失效**（新地址才有效），
+    // 所以界面上要说清楚并把新地址显示出来，别让用户改完自己找不到面板。
+    const suffixInput = h('input.input', { value: s.panel_suffix || '', placeholder: '留空 = 不启用安全入口', style: { flex: '1 1 200px' } });
+    const suffixNow = h('span.hint', { text: '当前入口：' + (s.panel_entry || '/') });
+    const randSuffix = h('button.btn.btn-sm', {
+      text: '🎲 随机生成',
+      onclick: () => {
+        const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+        let out = '';
+        const b = new Uint8Array(8);
+        crypto.getRandomValues(b);
+        for (const x of b) out += abc[x % abc.length];
+        suffixInput.value = out;
+      },
+    });
+    const proxyAuth = h('input', { type: 'checkbox', checked: s.app_proxy_auth !== false });
     const sessionHours = h('input.input', { type: 'number', value: s.session_hours, min: 1, max: 720 });
     const maxFail = h('input.input', { type: 'number', value: s.login_max_fail, min: 1, max: 50 });
     const lockMins = h('input.input', { type: 'number', value: s.login_lock_mins, min: 1, max: 1440 });
@@ -331,13 +347,33 @@ export function SettingsView(content) {
             access_mode: mode.value,
             ip_whitelist: whitelist.value.split('\n').map((x) => x.trim()).filter(Boolean),
             trust_proxy: trustProxy.checked,
+            panel_suffix: suffixInput.value.trim(),
+            app_proxy_auth: proxyAuth.checked,
             session_hours: Number(sessionHours.value),
             login_max_fail: Number(maxFail.value),
             login_lock_mins: Number(lockMins.value),
           };
-          await api.saveSettings(patch);
-          state.session.config = Object.assign({}, state.session.config, { access_mode: patch.access_mode });
-          toast('设置已保存并立即生效', 'ok');
+          const saved = await api.saveSettings(patch);
+          const entry = (saved && saved.panel_entry) || patch.panel_suffix;
+          state.session.config = Object.assign({}, state.session.config, {
+            access_mode: patch.access_mode,
+            panel_entry: entry,
+            panel_suffix: patch.panel_suffix,
+          });
+          if (patch.panel_suffix !== (s.panel_suffix || '')) {
+            // 后缀变了：当前地址已经失效，必须把新地址摆到用户眼前
+            modal({
+              title: '安全入口已修改',
+              body: h('div', [
+                h('p', { text: '新的面板入口是：' }),
+                h('div.mono', { style: { padding: '8px', background: 'var(--panel-2)', borderRadius: '6px' }, text: location.origin + entry }),
+                h('div.hint', { style: { marginTop: '8px' }, text: '当前页面马上就会失效（刷新会 404），请改用上面的地址。' }),
+              ]),
+              footer: (close) => [h('button.btn.btn-primary', { text: '知道了', onclick: () => { close(); location.href = entry; } })],
+            });
+          } else {
+            toast('设置已保存并立即生效', 'ok');
+          }
         } catch (e) { toast(e.message, 'err', 7000); }
         finally { save.disabled = false; }
       },
@@ -356,6 +392,18 @@ export function SettingsView(content) {
             h('div.hint', { html: '仅「白名单」模式生效。本机回环地址始终允许，不会被自己锁在门外。<br>Tailscale 网段：<code class="code">100.64.0.0/10</code>' }),
           ]),
           h('div.field', [
+            h('label', [h('span', { text: '安全入口后缀（仿宝塔：面板只在 /<后缀>/ 下提供服务）' })]),
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [suffixInput, randSuffix]),
+            suffixNow,
+            h('div.hint', { text: '留空 = 关闭安全入口（面板回到根路径，安全性下降，不建议）。改完当前页面会失效，新地址会弹窗告诉你。' }),
+          ]),
+          h('div.row', [
+            h('label', [h('span', { text: '应用界面（/iopaint/、/squoosh/ 等）要求先登录面板' })]),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+              proxyAuth, h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: '默认要求登录：这些界面挂在面板端口上，而 Squoosh 这类应用本身没有鉴权。' }),
+            ]),
+          ]),
+          h('div.row', [
             h('label', [h('span', { text: '信任反向代理头（X-Forwarded-For）' })]),
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
               trustProxy, h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: '仅当面板挂在 nginx 之后时开启；直连时开启会导致 IP 白名单可被伪造绕过。' }),

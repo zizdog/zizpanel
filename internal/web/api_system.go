@@ -287,8 +287,10 @@ func (s *Server) settingsView() map[string]any {
 		"www_root":         s.Cfg.WWWRoot,
 		"panel_public_url": s.Cfg.PanelPublicURL,
 		// 安全后缀（安全入口）：界面要显示"当前入口地址"，也允许改
-		"panel_suffix": s.Cfg.PanelSuffix,
-		"panel_entry":  s.PanelEntryPath(),
+		"panel_suffix":   s.Cfg.PanelSuffix,
+		"panel_entry":    s.PanelEntryPath(),
+		"app_proxy":      s.Cfg.AppProxy,
+		"app_proxy_auth": s.Cfg.AppProxyAuth,
 		// 升级源也要回传：设置页要能显示当前值并允许清空。
 		// 少了它，用户在页面上既看不到、也清不掉在线升级写进去的地址。
 		"upgrade_source": s.Cfg.UpgradeSource,
@@ -318,6 +320,9 @@ type settingsReq struct {
 	// PanelSuffix 是安全后缀。传空串 = 关闭安全入口（会让面板回到根路径，
 	// 界面会要求用户二次确认）；非空会被规范化（只留小写字母/数字/-/_）。
 	PanelSuffix *string `json:"panel_suffix"`
+	// AppProxy / AppProxyAuth：应用界面总开关与"是否要求登录面板"
+	AppProxy     *bool `json:"app_proxy"`
+	AppProxyAuth *bool `json:"app_proxy_auth"`
 	// UpgradeSource 是在线升级的默认源地址。传空串表示"清空"。
 	//
 	// 为什么必须能在这里改：在线升级的"检查更新"会把用过的源**写进配置**，
@@ -390,6 +395,12 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PanelPublicURL != nil {
 		cfg.PanelPublicURL = strings.TrimSpace(*req.PanelPublicURL)
+	}
+	if req.AppProxy != nil {
+		cfg.AppProxy = *req.AppProxy
+	}
+	if req.AppProxyAuth != nil {
+		cfg.AppProxyAuth = *req.AppProxyAuth
 	}
 	if req.PanelSuffix != nil {
 		raw := strings.TrimSpace(*req.PanelSuffix)

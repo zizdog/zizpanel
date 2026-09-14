@@ -54,6 +54,18 @@ export const NAV = [
 
 const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n]));
 
+// panelPath 拼"面板内的路径"，例如 panelPath('phpmyadmin/') → "/jab5c63/phpmyadmin/"。
+//
+// 为什么所有入口都要走它（用户明确要求"不同入口地址应该一致"）：
+// 面板可能从 127.0.0.1:8443、局域网 IP、或隧道域名访问。以前各处硬拼
+// `http://<局域网IP>/xxx/`，于是同一个应用在不同页面给出不同地址，
+// 有的还指向已经被收紧的 nginx 端口（403）。统一用**当前访问的面板地址** +
+// 安全后缀，入口就永远是同一个，且天然支持隧道访问。
+export function panelPath(sub = '') {
+  const entry = state.session?.config?.panel_entry || '/';
+  return entry.replace(/\/+$/, '/') + String(sub).replace(/^\/+/, '');
+}
+
 // ---------------- 主题 ----------------
 function initTheme() {
   const saved = localStorage.getItem('zp-theme');

@@ -8,7 +8,7 @@
 
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
-import { registerCleanup } from './app.js';
+import { registerCleanup, panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
 
 let cache = null;
@@ -442,9 +442,12 @@ export function AppsView(content, ctx = {}) {
     // 面板不反代，所以只能用 nginx 的**绝对地址** —— 用相对路径会打到
     // 面板自己的 SPA 回落上（返回 200 却是面板首页，极具误导性）。
     if (a.ui.self_conf) {
+      // SelfConf 的应用（phpMyAdmin）：它的 nginx location 只允许本机，
+      // 所以唯一能用的入口是**面板自己**那条（要求先登录面板）。
+      // 用户反馈过这里给出的是局域网地址 http://192.168.1.4/phpmyadmin/ → 403。
       return [h('a.btn.btn-sm.btn-primary', {
-        href: a.proxy_url || path, target: '_blank', rel: 'noopener', text: '打开',
-        title: '这个应用的入口由安装器直接写进 nginx（' + (a.proxy_url || path) + '）',
+        href: panelPath('phpmyadmin/'), target: '_blank', rel: 'noopener', text: '打开',
+        title: '经面板打开（需先登录面板；面板会反代到本机的 phpMyAdmin）',
       })];
     }
     // prefer_direct 是**人工实测**的结论（自动探测发现不了"资源全 200 但
@@ -458,14 +461,19 @@ export function AppsView(content, ctx = {}) {
         title: '经面板的 /' + a.ui.slug + '/ 打开（所有入口都通：80 端口、面板端口、隧道）',
       }));
       if (direct) {
-        out.push(h('a.btn.btn-sm', { href: direct, target: '_blank', rel: 'noopener', text: '直连', title: direct }));
+        out.push(h('a.btn.btn-sm', { href: direct, target: '_blank', rel: 'noopener', text: '直连端口', title: '绕过面板直接访问：' + direct }));
       }
     } else if (direct) {
+      // 子路径不可用（应用需要自己设 base path）：主入口仍是**面板内的子路径**尝试，
+      // 端口直连只作为次要入口，并明确标注它用的是哪台机器的哪个端口。
       out.push(h('a.btn.btn-sm.btn-primary', {
-        href: direct, target: '_blank', rel: 'noopener', text: '打开',
-        title: (why ? '子路径不可用：' + why + '。' : '') + '这里给的是端口直连地址',
+        href: path, target: '_blank', rel: 'noopener', text: '打开',
+        title: why || '子路径可能不可用',
       }));
-      out.push(h('a.btn.btn-sm', { href: path, target: '_blank', rel: 'noopener', text: '试试子路径', title: why || '子路径可能不可用' }));
+      out.push(h('a.btn.btn-sm', {
+        href: direct, target: '_blank', rel: 'noopener', text: '直连端口',
+        title: '绕过面板直接访问应用端口：' + direct,
+      }));
     } else {
       out.push(h('a.btn.btn-sm', {
         href: path, target: '_blank', rel: 'noopener', text: '打开',
