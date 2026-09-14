@@ -425,3 +425,48 @@ func TestHealthCheckWithoutURL(t *testing.T) {
 		t.Fatal("未检查时不应判为健康")
 	}
 }
+
+// TestCatalogUIDeclarationsAreSane 校验目录里的界面声明。
+//
+// 为什么需要：slug 会变成 nginx location 与面板路由。重复的 slug 会让
+// 两个应用抢同一个路径（后注册的静默覆盖前一个），而带斜杠或空格的 slug
+// 会生成语法错误的 nginx 配置。这些都不是编译期能发现的。
+func TestCatalogUIDeclarationsAreSane(t *testing.T) {
+	seen := map[string]string{}
+	for _, a := range Catalog() {
+		if a.UI == nil {
+			continue
+		}
+		if a.UI.Slug == "" {
+			t.Errorf("%s 声明了 UI 但没有 slug", a.ID)
+			continue
+		}
+		if strings.ContainsAny(a.UI.Slug, "/ \t") {
+			t.Errorf("%s 的 slug %q 含斜杠或空白（会写出坏的 nginx location）", a.ID, a.UI.Slug)
+		}
+		if prev, dup := seen[a.UI.Slug]; dup {
+			t.Errorf("slug %q 被 %s 与 %s 同时使用（会互相覆盖）", a.UI.Slug, prev, a.ID)
+		}
+		seen[a.UI.Slug] = a.ID
+		// 有界面的应用要么有端口（面板要反代过去），要么安装器自己写了 nginx
+		if a.Port <= 0 && !a.UI.SelfConf {
+			t.Errorf("%s 有界面、却既没有端口也不是 SelfConf：面板不知道反代到哪里", a.ID)
+		}
+	}
+	// 没有界面的应用不该有 UI（反之亦然：纯 API 不给「打开」按钮）
+	for _, a := range Catalog() {
+		if a.UI != nil && a.Port <= 0 && !a.UI.SelfConf {
+			t.Errorf("%s 的 UI 声明不完整", a.ID)
+		}
+	}
+	// phpMyAdmin 必须被标成"没有守护进程"，否则界面会一直说它"服务未注册"
+	adopted := false
+	for _, a := range Catalog() {
+		if a.ID == "phpmyadmin" {
+			adopted = a.NoDaemon
+		}
+	}
+	if !adopted {
+		t.Error("phpMyAdmin 应标记 NoDaemon（它没有守护进程，否则市场会误报「服务未注册」）")
+	}
+}

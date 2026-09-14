@@ -454,7 +454,18 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 「纳管」按钮必须以此为准：plist 不存在时点纳管必然报
 		// "找不到 xxx 的 plist，且该服务未在 launchd 中加载"。
 		ServiceInLaunchd bool `json:"service_in_launchd"`
+		// PortURL 是"直连端口"的入口（http://<本机局域网地址>:<端口>/）。
+		// 有界面的应用会给两个入口：子路径（/<slug>/，经面板或 nginx）
+		// 与直连端口。子路径探测不通过时（应用必须自己设 base path 才能挂子路径），
+		// 界面就把直连作为首选 —— 而不是给一个点开白屏的按钮。
+		PortURL string `json:"port_url,omitempty"`
+		// ProxyURL 是"经 nginx 的子路径入口"（http://<本机局域网地址>/<slug>/）。
+		// 面板自己反代的那些应用用**相对路径**更稳（任何入口都通），
+		// 但这个绝对地址有两个用处：显示给用户看，以及给 SelfConf 应用
+		// （如 phpMyAdmin，它的 location 只在 nginx 上）当打开入口。
+		ProxyURL string `json:"proxy_url,omitempty"`
 	}
+	lanIP := s.lanIP()
 	apps := services.Catalog()
 	out := make([]item, 0, len(apps))
 	for _, a := range apps {
@@ -534,8 +545,16 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if realLabel != "" {
 			a.ServiceLabel = realLabel
 		}
+		portURL, proxyURL := "", ""
+		if a.Port > 0 && lanIP != "" {
+			portURL = fmt.Sprintf("http://%s:%d/", lanIP, a.Port)
+		}
+		if a.UI != nil && a.UI.Slug != "" && lanIP != "" {
+			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
+		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
-			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd}
+			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
+			PortURL: portURL, ProxyURL: proxyURL}
 		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
 			if dockerSock == "" {
 				it.Available = false

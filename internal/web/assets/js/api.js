@@ -176,6 +176,11 @@ export const api = {
 
   // ---- 应用市场 ----
   market: () => request('GET', `${API_BASE}/market`),
+  // 应用界面子路径：探测（每个应用"现在能不能真的打开"）+ 生成 nginx 入口。
+  // 探测不是看 HTTP 200：它还会取页面里引用的 js/css，代理没改写对时
+  // 页面照样 200、资源全 404（白屏），只看状态码会得出错误结论。
+  appProxies: () => request('GET', `${API_BASE}/market/proxies`),
+  appProxyApply: () => request('POST', `${API_BASE}/market/proxies/apply`, {}),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
   marketInstall: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install`, {}),
   installLNMP: () => request('POST', `${API_BASE}/market/install-lnmp`, {}),

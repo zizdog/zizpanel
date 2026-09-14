@@ -58,6 +58,58 @@ type App struct {
 	PostInstallHint string `json:"post_install_hint"`
 	// DocsURL 官方文档
 	DocsURL string `json:"docs_url"`
+
+	// UI 非空表示这个应用有**网页界面**：市场里会给一个「打开」入口，
+	// 面板还会在 `/<slug>/` 上给它挂一个反向代理（见 internal/appproxy）。
+	// 没有界面的（纯 API / 数据库 / 运行时）留空，免得给出一个打不开的按钮。
+	UI *AppUI `json:"ui,omitempty"`
+	// NoDaemon 表示这个应用**没有常驻进程**：装完就是一个网页入口
+	// （phpMyAdmin 就是这种：nginx alias + php-fpm，没有自己的守护进程）。
+	// 有了它，市场就不会把"launchd 里找不到服务"当成异常去吓用户。
+	NoDaemon bool `json:"no_daemon,omitempty"`
+}
+
+// AppUI 描述一个应用的网页界面，以及"把它挂到子路径下"需要知道的事。
+//
+// 为什么要有 Rewrites：绝大多数前端是用**绝对路径**引资源的
+// （`<script src="/assets/index-xxx.js">`、`fetch("/api/v1")`、`io("/socket.io")`）。
+// 挂在 `/iopaint/` 下时，这些请求会打到站点根路径 → 页面白屏或接口 404。
+// 所以每个应用要声明"哪些绝对前缀需要改写到子路径下"，由面板统一改写
+// （见 internal/appproxy：响应体 + Location 响应头；真机实测过 IOPaint 与 Uptime Kuma）。
+//
+// 为什么要有 Note：子路径不是万能的 —— 有些应用必须自己在配置里设置
+// root_url / base path，光靠改写会坏。这种情况如实写出来，
+// 面板探测到代理不可用时会把「直连端口」作为首选入口，而不是假装能打开。
+type AppUI struct {
+	// Slug 是挂在面板与 nginx 上的子路径（不带斜杠），例如 iopaint
+	Slug string `json:"slug"`
+	// Target 是应用内部的入口路径，默认 "/"
+	Target string `json:"target,omitempty"`
+	// Rewrites 是响应体里的绝对路径改写规则，To 里可用 {slug} 占位
+	Rewrites []UIRewrite `json:"rewrites,omitempty"`
+	// Websocket 表示界面需要 WebSocket（socket.io / ws），代理必须放行 Upgrade
+	Websocket bool `json:"websocket,omitempty"`
+	// SelfConf 表示**安装器自己已经写了 nginx location**（如 phpMyAdmin 的 alias），
+	// 面板不要再生成代理，只提供「打开」入口。
+	SelfConf bool `json:"self_conf,omitempty"`
+	// PreferDirect 表示"这个应用挂子路径实测不可用（或需要它自己先配置 base path）"。
+	//
+	// 与 Note 的区别：Note 只是说明，PreferDirect 会改变界面行为 ——
+	// 「打开」按钮直接给端口直连，子路径降级成次要入口（"试试子路径"）。
+	// 为什么需要人工标一项：自动探测只能发现"资源 404"这类问题，
+	// 发现不了"资源都 200、但前端路由不认这个路径"（Uptime Kuma 就是这样：
+	// 页面标题都对、请求全 200，正文却是 Page Not Found）。
+	// 这一条由真机实测得出，别凭猜改。
+	PreferDirect bool `json:"prefer_direct,omitempty"`
+	// Note 是给用户看的实话：这条子路径有什么前提或限制
+	Note string `json:"note,omitempty"`
+}
+
+// UIRewrite 是一条字面量替换规则。
+type UIRewrite struct {
+	From string `json:"from"`
+	// To 支持 {slug} 占位符
+	To string `json:"to"`
 }
 
 // Requirement 是一条前置条件。
@@ -107,6 +159,16 @@ func Catalog() []App {
 		// 或 BrewFormula 判断。
 		{
 			ID: "iopaint", Name: "IOPaint（图片去水印）", Icon: "🖼️",
+			// 子路径：真机实测（mini，2026-09-14）。它的前端把 API 与 socket.io
+			// 都写成绝对路径，资源在 /assets/ 下，所以四条改写缺一不可。
+			UI: &AppUI{
+				Slug:      "iopaint",
+				Websocket: true,
+				Rewrites: []UIRewrite{
+					{From: `"/api/v1"`, To: `"/{slug}/api/v1"`},
+					{From: "/socket.io", To: "/{slug}/socket.io"},
+				},
+			},
 			Summary: "AI 擦除水印与杂物，支持批量与视频",
 			Description: "上传图片 → 涂抹要去掉的水印 → 擦除。使用 LaMa 模型并启用 " +
 				"Apple Silicon MPS 加速，单进程、模型仅约 200MB。" +
@@ -142,7 +204,11 @@ func Catalog() []App {
 		},
 		{
 			ID: "phpmyadmin", Name: "phpMyAdmin", Icon: "🐬",
-			Summary: "数据库管理界面（推荐入口）",
+			// phpMyAdmin 没有守护进程（nginx alias + php-fpm），装完就是一个网页入口。
+			// 它的 nginx location 由安装器自己写，所以 SelfConf=true：面板只给「打开」。
+			UI:       &AppUI{Slug: "phpmyadmin", SelfConf: true},
+			NoDaemon: true,
+			Summary:  "数据库管理界面（推荐入口）",
 			Description: "面板自研的库表管理功能有限，日常的库/表/权限/导入导出建议用 phpMyAdmin。" +
 				"装好后接入 nginx 默认站点，访问 http://<本机地址>/phpmyadmin/。" +
 				"面板内置那套保留为应急入口。",
@@ -233,6 +299,22 @@ func Catalog() []App {
 		// ---------------- 运维工具（Docker） ----------------
 		{
 			ID: "uptime-kuma", Name: "Uptime Kuma", Icon: "📡",
+			UI: &AppUI{
+				Slug:      "uptime-kuma",
+				Websocket: true,
+				Rewrites: []UIRewrite{
+					{From: "/socket.io", To: "/{slug}/socket.io"},
+					{From: `"/api/`, To: `"/{slug}/api/`},
+					{From: "/icon.svg", To: "/{slug}/icon.svg"},
+					{From: "/apple-touch-icon.png", To: "/{slug}/apple-touch-icon.png"},
+					{From: "/manifest.json", To: "/{slug}/manifest.json"},
+				},
+				Note: "Uptime Kuma 官方不支持子路径（改写到页面前端路由后是 Page Not Found，实测于 mini）",
+				// 真机实测：/uptime-kuma/ 能返回页面、资源全 200，但正文是
+				// "Page Not Found" —— 它的 Vue 路由不认这个前缀，只有官方
+				// 那套改 entrypoint 的社区方案才能挂子路径，面板不做那种侵入。
+				PreferDirect: true,
+			},
 			Summary:     "自托管服务监控与告警",
 			Description: "监控网站与服务的可用性，支持多种通知渠道（Telegram / Bark / 邮件等）。",
 			Category:    "tool", Kind: KindCompose, Port: 3001,
@@ -246,6 +328,11 @@ func Catalog() []App {
 		},
 		{
 			ID: "minio", Name: "MinIO", Icon: "🪣",
+			UI: &AppUI{
+				Slug:         "minio",
+				Note:         "MinIO 控制台需要在容器环境变量里设 MINIO_BROWSER_REDIRECT_URL 才能用子路径（面板只做改写，不保证可用）",
+				PreferDirect: true,
+			},
 			Summary: "S3 兼容的对象存储",
 			// 刻意避开 9000：那是 PHP-FPM 的固定端口（站点 vhost 都指向
 			// 127.0.0.1:9000），MinIO 默认也用 9000，两者会真的抢端口 ——
@@ -277,6 +364,12 @@ func Catalog() []App {
 		},
 		{
 			ID: "n8n", Name: "n8n", Icon: "🔗",
+			UI: &AppUI{
+				Slug:         "n8n",
+				Websocket:    true,
+				Note:         "n8n 需要在环境变量里设 N8N_PATH=/n8n/ 才能用子路径（面板只做改写，不保证可用）",
+				PreferDirect: true,
+			},
 			Summary:     "可视化自动化工作流",
 			Description: "用节点拖拽的方式编排自动化流程，可以对接 HTTP / 数据库 / AI 接口。",
 			Category:    "tool", Kind: KindCompose, Port: 5678,
@@ -293,6 +386,11 @@ func Catalog() []App {
 		},
 		{
 			ID: "gitea", Name: "Gitea", Icon: "🍵",
+			UI: &AppUI{
+				Slug:         "gitea",
+				Note:         "Gitea 需要在 app.ini 里设 ROOT_URL 带子路径才能用（面板只做改写，不保证可用）",
+				PreferDirect: true,
+			},
 			Summary:     "轻量自建 Git 服务",
 			Description: "资源占用极小的 Git 托管（含 Web 界面、Issue、CI 入口）。",
 			Category:    "tool", Kind: KindCompose, Port: 3000,
@@ -311,6 +409,11 @@ func Catalog() []App {
 		},
 		{
 			ID: "stirling-pdf", Name: "Stirling PDF", Icon: "📄",
+			UI: &AppUI{
+				Slug:         "stirling-pdf",
+				Note:         "Stirling 需要自己在配置里设 base path，面板只能硬挂；探测不通过时请用端口直连",
+				PreferDirect: true,
+			},
 			Summary:     "本地 PDF 工具箱",
 			Description: "合并、拆分、压缩、OCR、转图片等 PDF 操作，全部在本机完成，不上传云端。",
 			Category:    "tool", Kind: KindCompose, Port: 8082,
@@ -345,6 +448,8 @@ func Catalog() []App {
 		// ghcr.io 可直连，官方 ghcr 镜像一律直查。
 		{
 			ID: "it-tools", Name: "IT-Tools（开发者工具箱）", Icon: "🧰",
+			// 纯前端应用：所有逻辑在浏览器里跑，没有后端 API，只有静态资源前缀要改写。
+			UI:      &AppUI{Slug: "it-tools"},
 			Summary: "几十个开发者常用小工具，纯前端",
 			Description: "JSON 格式化、Base64/URL 编解码、UUID 与哈希生成、时间戳转换、" +
 				"正则测试、JWT 解析、CIDR 计算等常用小工具合集。" +
@@ -364,6 +469,10 @@ func Catalog() []App {
 		},
 		{
 			ID: "filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
+			UI: &AppUI{
+				Slug: "filebrowser",
+				Note: "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
+			},
 			Summary: "在浏览器里管理服务器上的文件",
 			Description: "浏览、上传、下载、重命名、删除与分享目录，支持多用户与细粒度权限。" +
 				"面板自带的文件管理器限定在白名单目录（网站目录、面板数据/日志/工作目录），" +
@@ -432,6 +541,7 @@ func Catalog() []App {
 		},
 		{
 			ID: "squoosh", Name: "Squoosh（图片压缩）", Icon: "🗜️",
+			UI:      &AppUI{Slug: "squoosh"},
 			Summary: "浏览器里的图片压缩，本地 wasm 完成",
 			Description: "PNG / JPEG / WebP / AVIF 等格式的压缩与尺寸调整，编解码全在浏览器里用 " +
 				"wasm 完成，图片不上传。装好后访问 http://<本机地址>:8085。" +

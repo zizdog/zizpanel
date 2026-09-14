@@ -301,6 +301,10 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/system/nginx/status", s.requireAuth(s.handleNginxStatus))
 	root.HandleFunc("POST /api/v1/system/nginx/repair", s.requireAuth(s.handleNginxEnvRepair))
 
+	// 应用界面子路径：探测（只读）与生成 nginx 入口（写配置 + reload）
+	root.HandleFunc("GET /api/v1/market/proxies", s.requireAuth(s.handleAppProxyProbe))
+	root.HandleFunc("POST /api/v1/market/proxies/apply", s.requireAuth(s.handleAppProxyApply))
+
 	// ---------- 在线升级 ----------
 	// 升级会替换二进制并重启面板，所以每一个写操作都必须经过鉴权；
 	// 执行升级额外要求进程是 root（见 handleUpgradeApply）。
@@ -313,6 +317,13 @@ func (s *Server) routes() http.Handler {
 
 	root.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleGetSettings))
 	root.HandleFunc("POST /api/v1/settings", s.requireAuth(s.handleSaveSettings))
+
+	// ---------- 应用界面的子路径代理 ----------
+	// 每个有界面的应用挂一个 /<slug>/（见 internal/appproxy 的说明）。
+	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会
+	// 返回面板自己的 index.html（**状态码还是 200**），
+	// 也就是说漏注册不会报错，只会让用户看到一个"打不开的应用页面"。
+	s.registerAppProxy(root)
 
 	// ---------- 前端静态资源 ----------
 	root.HandleFunc("/", s.handleStatic)

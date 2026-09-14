@@ -12,6 +12,10 @@ import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
 
 let cache = null;
+// proxyState 是 /api/v1/market/proxies 的探测结果（slug → {proxy_ok, reason}）。
+// 有界面的应用给两个入口：子路径 /<slug>/ 与直连端口；哪个能用由探测说了算，
+// 而不是"我们配了就假设它能打开"。
+let proxyState = null;
 
 export function AppsView(content, ctx = {}) {
   clear(content);
@@ -40,6 +44,10 @@ export function AppsView(content, ctx = {}) {
       ]));
       return;
     }
+    // 探测是"能不能打开"的依据，失败不影响列表渲染（降级成只给直连入口）
+    try {
+      proxyState = await api.appProxies();
+    } catch { proxyState = null; }
     renderHead();
     renderGrid();
   }
@@ -61,7 +69,33 @@ export function AppsView(content, ctx = {}) {
       // 各自卡片上的按钮就是入口 —— 顶部重复放一遍只会让人不知道该点哪。
       h('button.btn.btn-sm.btn-primary', { text: '⚡ 一键安装 LNMP 环境', onclick: installLNMP }),
       h('button.btn.btn-sm', { text: '⚙️ 服务管理', onclick: () => { location.hash = '#/services'; } }),
+      // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
+      // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
+      proxyState && proxyState.enabled
+        ? h('button.btn.btn-sm', {
+          text: '🔗 生成 nginx 入口',
+          title: '把每个有界面的应用挂到 http://<主机>/<应用>/（写入 nginx 并重载）',
+          onclick: applyProxies,
+        })
+        : null,
     );
+  }
+
+  // applyProxies 生成/更新 nginx 里的子路径入口。
+  // 秒级动作（写文件 + nginx -t + reload），后端同步返回，失败会原样带回 nginx 的报错。
+  async function applyProxies() {
+    try {
+      const r = await api.appProxyApply();
+      toast(`已写入 ${r.count} 个入口（${(r.slugs || []).join('、')}）并重载 nginx`, 'ok', 8000);
+    } catch (e) {
+      toast('生成失败：' + e.message, 'err', 12000);
+      return;
+    }
+    // 等 nginx 把新配置真正切上去再探测：reload 是异步的（旧 worker 要收尾），
+    // 立刻探测会拿到旧配置的结论，界面就会显示成"子路径不可用"。
+    await new Promise((r) => setTimeout(r, 900));
+    try { proxyState = await api.appProxies(); } catch { /* 忽略 */ }
+    renderGrid();
   }
 
   // installLNMP 一键装 nginx + PHP + MySQL，并做四件包管理管不到的收尾工作。
@@ -322,10 +356,16 @@ export function AppsView(content, ctx = {}) {
             // 装了但服务没在 launchd 里（plist 丢了/没注册成功）是一种**孤儿态**：
             // 说"已安装·未纳管"会让人以为点一下纳管就行，而那个按钮必然报错。
             // 所以这里如实说"服务未注册"。
-            ? h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
-              text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
-              title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
-            })
+            //
+            // 例外：no_daemon 的应用**本来就没有守护进程**（phpMyAdmin 是
+            // nginx alias + php-fpm，装完就是一个网页入口）。对它报"服务未注册"
+            // 是纯粹的误导 —— 用户反馈过这个。（2026-09-14）
+            ? (a.no_daemon
+              ? h('span.pill.ok', { text: '已安装·网页入口', title: '这个应用没有常驻进程，装完就是一个网页入口' })
+              : h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
+                text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
+                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
+              }))
             : null),
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
       ]),
@@ -368,9 +408,58 @@ export function AppsView(content, ctx = {}) {
                   disabled: !a.available,
                   onclick: () => openInstaller(a),
                 })))),
+        ...openButtons(a),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
       ]),
     ]);
+  }
+
+  // openButtons 给"有界面且已装"的应用两个入口：子路径与直连端口。
+  //
+  // 为什么主按钮可能指向直连：有些应用必须自己设 base path 才能挂子路径
+  // （n8n / Gitea / MinIO / Stirling 都是），硬挂会白屏。
+  // 探测（/api/v1/market/proxies）说不行，就把直连作为首选入口，
+  // 并在 title 里说清原因 —— 而不是给一个点开是白屏的按钮。
+  function openButtons(a) {
+    if (!a.ui || !a.ui.slug || !a.installed) return [];
+    const st = (proxyState?.items || []).find((x) => x.slug === a.ui.slug) || {};
+    const path = '/' + a.ui.slug + '/';
+    const direct = a.port_url || '';
+    // SelfConf（phpMyAdmin）：它的 location 由安装器直接写进 nginx，
+    // 面板不反代，所以只能用 nginx 的**绝对地址** —— 用相对路径会打到
+    // 面板自己的 SPA 回落上（返回 200 却是面板首页，极具误导性）。
+    if (a.ui.self_conf) {
+      return [h('a.btn.btn-sm.btn-primary', {
+        href: a.proxy_url || path, target: '_blank', rel: 'noopener', text: '打开',
+        title: '这个应用的入口由安装器直接写进 nginx（' + (a.proxy_url || path) + '）',
+      })];
+    }
+    // prefer_direct 是**人工实测**的结论（自动探测发现不了"资源全 200 但
+    // 前端路由不认这个前缀"的情况），所以它的优先级高于探测结果。
+    const proxyOK = !!st.proxy_ok && !a.ui.prefer_direct;
+    const why = a.ui.prefer_direct ? (a.ui.note || '这个应用不支持子路径') : (st.reason || a.ui.note || '');
+    const out = [];
+    if (proxyOK) {
+      out.push(h('a.btn.btn-sm.btn-primary', {
+        href: path, target: '_blank', rel: 'noopener', text: '打开',
+        title: '经面板的 /' + a.ui.slug + '/ 打开（所有入口都通：80 端口、面板端口、隧道）',
+      }));
+      if (direct) {
+        out.push(h('a.btn.btn-sm', { href: direct, target: '_blank', rel: 'noopener', text: '直连', title: direct }));
+      }
+    } else if (direct) {
+      out.push(h('a.btn.btn-sm.btn-primary', {
+        href: direct, target: '_blank', rel: 'noopener', text: '打开',
+        title: (why ? '子路径不可用：' + why + '。' : '') + '这里给的是端口直连地址',
+      }));
+      out.push(h('a.btn.btn-sm', { href: path, target: '_blank', rel: 'noopener', text: '试试子路径', title: why || '子路径可能不可用' }));
+    } else {
+      out.push(h('a.btn.btn-sm', {
+        href: path, target: '_blank', rel: 'noopener', text: '打开',
+        title: why || '应用可能没有启动',
+      }));
+    }
+    return out;
   }
 
   // openInstaller 按应用打开对应的部署对话框。

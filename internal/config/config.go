@@ -80,6 +80,13 @@ type Config struct {
 	LoginLockMins  int    `json:"login_lock_mins"` // 锁定时长（分钟）
 	Require2FA     bool   `json:"require_2fa"`     // 强制所有账号开启两步验证
 	PanelPublicURL string `json:"panel_public_url"`
+	// AppProxy 控制"把有界面的应用挂到 /<slug>/ 下"这个能力（默认开）。
+	//
+	// 为什么做成开关：面板的 /<slug>/ 是**公开路径**（应用自己鉴权，面板不拦），
+	// 于是它对"把面板暴露到公网"的用户来说等于多开了一组入口。
+	// 默认开是因为直连端口本来就在局域网上开着、且这是用户明确要的便利；
+	// 但只要用户觉得不合适，一个开关就能全关掉（页面上的入口也会跟着消失）。
+	AppProxy bool `json:"app_proxy"`
 
 	// ---------- 环境（LNMP 等由面板管理的系统组件） ----------
 	User     string `json:"user"`      // 面板运行用户（安装时确定）
@@ -172,15 +179,17 @@ func Default() *Config {
 
 	r := root()
 	c := &Config{
-		Version:       "0.1.0",
-		DataDir:       filepath.Join(r, "data"),
-		LogDir:        filepath.Join(r, "logs"),
-		RunDir:        filepath.Join(r, "run"),
-		WorkDir:       filepath.Join(r, "work"),
-		BinDir:        filepath.Join(r, "bin"),
-		Listen:        ":8443",
-		TLSEnable:     true,
-		AccessMode:    "any",
+		Version:    "0.1.0",
+		DataDir:    filepath.Join(r, "data"),
+		LogDir:     filepath.Join(r, "logs"),
+		RunDir:     filepath.Join(r, "run"),
+		WorkDir:    filepath.Join(r, "work"),
+		BinDir:     filepath.Join(r, "bin"),
+		Listen:     ":8443",
+		TLSEnable:  true,
+		AccessMode: "any",
+		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
+		AppProxy:      true,
 		SessionHours:  72,
 		LoginMaxFail:  5,
 		LoginLockMins: 15,
