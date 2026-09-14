@@ -34,6 +34,9 @@ DIST    := dist
 RELDIR  := $(DIST)/release
 LOCAL_PORT ?= 18443
 LOCAL_ROOT ?= /tmp/zizpanel-dev
+# 本地调试实例的安全后缀：固定值，方便 uitest 直接访问。
+# 真机安装时由 config.Bootstrap 随机生成（见 internal/config）。
+LOCAL_SUFFIX ?= dev
 SHOTS   ?= /tmp/zizpanel-shots
 
 .PHONY: help
@@ -151,9 +154,10 @@ run-local: dev ## 在临时目录以调试模式启动（端口 $(LOCAL_PORT)）
 	@cp -f $(DIST)/zizpanel-helper $(LOCAL_ROOT)/bin/zizpanel-helper
 	@( $(DIST)/zizpanel serve --config $(LOCAL_ROOT)/data/config.json \
 	     --listen 127.0.0.1:$(LOCAL_PORT) --no-tls --log-level debug \
+	     --panel-suffix "$(LOCAL_SUFFIX)" \
 	     > $(LOCAL_ROOT)/serve.log 2>&1 & )
 	@sleep 2
-	@echo "面板已启动：http://127.0.0.1:$(LOCAL_PORT)"
+	@echo "面板已启动：http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/"
 	@cat $(LOCAL_ROOT)/serve.log
 
 .PHONY: stop-local
@@ -162,7 +166,7 @@ stop-local: ## 停止本地试运行实例
 
 .PHONY: uitest
 uitest: ## 端到端 UI 验证（需要先 make run-local；特权步骤会显示为"跳过"）
-	ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT) $(SHOTS)
+	ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS)
 
 # 真实面板口令放本机、**不进仓库**（.panel-credential.local 已在 .gitignore 里）。
 # 内容就一行：ZP_PASS=你的面板口令
@@ -178,7 +182,10 @@ uitest-live: ## 对本机真实安装实例跑完整 UI 验证（含建站等特
 	  echo "    printf 'ZP_PASS=你的面板口令\\n' > $(CRED_FILE) && chmod 600 $(CRED_FILE)"; \
 	  exit 1; }
 	@echo "注意：会在这台真实面板上创建再删除测试站点 $(ZP_TEST_SITE)"
-	@set -a; . ./$(CRED_FILE); set +a; node tools/uitest.mjs https://127.0.0.1:8443 $(SHOTS)
+	@# 真实实例带安全后缀，入口不是根路径 —— 从配置里读出来，别写死
+	@SUFFIX=$$(python3 -c "import json;print(json.load(open('/opt/zizpanel/data/config.json')).get('panel_suffix',''))" 2>/dev/null); \
+	 BASE="https://127.0.0.1:8443/$$SUFFIX/"; \
+	 set -a; . ./$(CRED_FILE); set +a; node tools/uitest.mjs "$$BASE" $(SHOTS)
 
 .PHONY: smoke
 smoke: run-local uitest ## 启动本地实例并做 UI 验证（特权步骤跳过，用 uitest-live 补全）

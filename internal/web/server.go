@@ -306,6 +306,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/proxies/apply", s.requireAuth(s.handleAppProxyApply))
 	// 从市场卸载（service / installer 两类；纳管的走 DELETE /api/v1/services/{name}）
 	root.HandleFunc("DELETE /api/v1/market/{id}", s.requireAuth(s.handleMarketUninstall))
+	// 一键建站（Typecho / WordPress …）：建目录 + 建库 + 建站点 + 伪静态
+	root.HandleFunc("POST /api/v1/market/{id}/install-site", s.requireAuth(s.handleSiteAppInstall))
 
 	// Docker 镜像加速源（换源）：现状 / 检测可用性 / 保存并重启
 	root.HandleFunc("GET /api/v1/docker/mirrors", s.requireAuth(s.handleDockerMirrors))
@@ -322,20 +324,33 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/system/upgrade/apply", s.requireAuth(s.handleUpgradeApply))
 	root.HandleFunc("POST /api/v1/system/upgrade/dismiss", s.requireAuth(s.handleUpgradeDismiss))
 
+	// phpMyAdmin：只有登录面板的人才能进（路径在安全后缀之下）
+	root.HandleFunc("/phpmyadmin/", s.handlePhpMyAdmin)
+	root.HandleFunc("/phpmyadmin", s.handlePhpMyAdmin)
+
+	// 整理默认站点（建 www/localhost + 重写 000-default.conf，去掉 /_panel）
+	root.HandleFunc("POST /api/v1/system/default-site/apply", s.requireAuth(s.handleDefaultSiteApply))
+
 	root.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleGetSettings))
 	root.HandleFunc("POST /api/v1/settings", s.requireAuth(s.handleSaveSettings))
 
-	// ---------- 应用界面的子路径代理 ----------
-	// 每个有界面的应用挂一个 /<slug>/（见 internal/appproxy 的说明）。
+	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会
 	// 返回面板自己的 index.html（**状态码还是 200**），
 	// 也就是说漏注册不会报错，只会让用户看到一个"打不开的应用页面"。
-	s.registerAppProxy(root)
-
-	// ---------- 前端静态资源 ----------
 	root.HandleFunc("/", s.handleStatic)
 
-	return s.accessControl(root)
+	// ---------- 安全后缀闸门（见 panelGate 的说明）----------
+	//
+	// 结构：外层 mux 只放**公开**入口，其余全部交给闸门 + 内层 mux。
+	// 应用界面代理（/iopaint/ 等）必须挂在外层 —— 它们是给用户浏览器直接访问的，
+	// 不该要求先知道面板后缀。第一版把它们注册在内层，结果闸门先拦下来 →
+	// 应用入口全变成 404（真机验证时抓到）。
+	outer := http.NewServeMux()
+	s.registerAppProxy(outer)
+	outer.Handle("/", s.panelGate(root))
+
+	return s.accessControl(outer)
 }
 
 // ---------- 静态资源 ----------
@@ -639,4 +654,61 @@ func (s *Server) userView(u *auth.User) map[string]any {
 		"last_login_at": u.LastLoginAt,
 		"last_login_ip": u.LastLoginIP,
 	}
+}
+
+// ---------- 安全后缀（安全入口） ----------
+
+// panelGate 把面板的界面与接口挪到 /<suffix>/ 之下，其余一律 404。
+//
+// 为什么这么做（用户明确要求，模仿宝塔的"安全入口"）：
+// 面板直接开在 `https://<ip>:8443/` 上时，任何扫到端口的人都能看到登录页，
+// 而且像 `/_panel/` 这种固定路径一旦被 nginx 暴露到 80 端口，就更容易被发现。
+// 加一个随机后缀后，不知道后缀的人连登录页都看不到。
+//
+// 为什么用"闸门"而不是把所有路由都加上前缀：
+//
+//	· 内部路由一个字都不用改（少一处改动就少一类回归）；
+//	· 应用界面代理（`/iopaint/` 等）注册在**外层**，不经过这里，保持公开
+//	  —— 它们是给用户浏览器直接访问的，本来就不该要求先登录面板；
+//	· 升级看门狗的健康检查留在根路径（`/api/v1/health`）：它是升级流程的契约，
+//	  写在后缀里会让"升级过程中改后缀"变成一次断线。
+func (s *Server) panelGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 后缀**每次请求现读**，不在启动时固化：
+		// 用户在「面板设置」里改后缀后必须立刻生效，
+		// 否则会处于"设置说改了、实际还能从老路径进"的状态（比不改更糟）。
+		suffix := strings.Trim(s.Cfg.PanelSuffix, "/")
+		if suffix == "" {
+			// 未启用（本地开发/测试，或用户显式清空）：保持原样
+			next.ServeHTTP(w, r)
+			return
+		}
+		prefix := "/" + suffix
+		p := r.URL.Path
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = strings.TrimPrefix(p, prefix)
+			if r2.URL.Path == "" {
+				r2.URL.Path = "/"
+			}
+			next.ServeHTTP(w, r2)
+			return
+		}
+		// 升级看门狗与外部探活用的公开接口：留在根路径（不带任何敏感信息）
+		if p == "/api/v1/health" || p == "/api/v1/ping" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 其余一律当作"不存在"：不透露这里有面板，也不给任何跳转提示
+		writeErr(w, http.StatusNotFound, "404 page not found")
+	})
+}
+
+// PanelEntryPath 返回面板入口路径（含后缀），供界面与 CLI 显示。
+func (s *Server) PanelEntryPath() string {
+	suffix := strings.Trim(s.Cfg.PanelSuffix, "/")
+	if suffix == "" {
+		return "/"
+	}
+	return "/" + suffix + "/"
 }

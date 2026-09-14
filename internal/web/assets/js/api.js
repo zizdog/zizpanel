@@ -183,6 +183,8 @@ export const api = {
   appProxyApply: () => request('POST', `${API_BASE}/market/proxies/apply`, {}),
   // 从市场卸载：面板装的走这里（service/installer 两类）。
   // 纳管的第三方服务面板不卸载，前端改用「取消纳管」（serviceForget）。
+  // 一键建站：domain/admin_user/admin_pass/site_name
+  marketInstallSite: (id, payload) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install-site`, payload),
   marketUninstall: (id, removeData = false) =>
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),

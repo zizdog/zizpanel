@@ -114,7 +114,11 @@ func rewritableContentType(ct string) bool {
 func Handler(app services.App) http.Handler {
 	ui := app.UI
 	upstream := &url.URL{Scheme: "http", Host: "127.0.0.1:" + itoa(app.Port)}
-	rw := newRewriter(ui.Slug, ui.Rewrites)
+	// SelfBase：应用自己已经带上级路径，任何改写都是画蛇添足（会双重加前缀）
+	var rw *rewriter
+	if !ui.SelfBase {
+		rw = newRewriter(ui.Slug, ui.Rewrites)
+	}
 	prefix := "/" + ui.Slug
 
 	proxy := &httputil.ReverseProxy{
@@ -142,6 +146,14 @@ func Handler(app services.App) http.Handler {
 			pr.SetXForwarded()
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// 应用要求的安全头（如 Squoosh 的 COOP/COEP）：必须在**每一条**响应上，
+			// 包括 JS/CSS/图片，否则浏览器不会进入 crossOriginIsolated 状态。
+			for k, v := range ui.Headers {
+				resp.Header.Set(k, v)
+			}
+			if rw == nil {
+				return nil // SelfBase：应用自己处理路径，不碰响应
+			}
 			// 重定向：把 Location 也拉到子路径下（Kuma 的 / → /dashboard 就是这种）
 			if loc := resp.Header.Get("Location"); loc != "" {
 				resp.Header.Set("Location", rw.location(ui.Slug, loc))
@@ -161,6 +173,8 @@ func Handler(app services.App) http.Handler {
 			// 改写后长度变了，不能再用上游的 ETag/校验头（否则浏览器可能拿到旧内容）
 			resp.Header.Del("ETag")
 			resp.Header.Del("Last-Modified")
+			// 长度变了，Range 语义不再成立（否则浏览器可能按旧长度截断）
+			resp.Header.Del("Accept-Ranges")
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

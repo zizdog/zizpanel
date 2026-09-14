@@ -305,6 +305,7 @@ export function AppsView(content, ctx = {}) {
 
     // 按分类分组展示
     const groups = [
+      { key: 'site', label: '一键建站' },
       { key: 'ai', label: 'AI 服务' },
       { key: 'tool', label: '运维工具' },
       { key: 'other', label: '其它' },
@@ -318,7 +319,7 @@ export function AppsView(content, ctx = {}) {
       );
     }
     // 兜底：没有分类的也显示出来
-    const rest = list.filter((a) => !['ai', 'tool', 'other'].includes(a.category || 'other'));
+    const rest = list.filter((a) => !['site', 'ai', 'tool', 'other'].includes(a.category || 'other'));
     if (rest.length) {
       appendAll(grid, 
         h('div.section-title', { style: { marginTop: '20px' }, text: '其它' }),
@@ -351,7 +352,15 @@ export function AppsView(content, ctx = {}) {
         a.port > 0 ? h('span.pill', { text: ':' + a.port }) : null,
         a.kind === 'native' ? h('span.pill.brand', { text: '原生' }) : null,
         a.kind === 'compose' ? h('span.pill.brand', { text: 'Docker' }) : null,
-        a.adopted ? h('span.pill.ok', { text: '已纳管' })
+        // 原生 brew 服务：记录在、但 plist 不在 = 服务其实没注册（ollama 就是这样，
+        // 用户看到"已安装"却在服务管理里启动失败）。这一条要显式说出来。
+        (a.kind === 'native' && a.service_label && a.installed && !a.service_in_launchd)
+          ? h('span.pill.warn', {
+            text: '已安装·服务未注册',
+            title: '这个 brew 服务还没在 launchd 里注册（plist 不存在）。' +
+              '到「服务管理」点一次启动即可自动注册（面板会用 brew services start 补上）',
+          })
+          : (a.adopted ? h('span.pill.ok', { text: '已纳管' })
           : (a.installed
             // 装了但服务没在 launchd 里（plist 丢了/没注册成功）是一种**孤儿态**：
             // 说"已安装·未纳管"会让人以为点一下纳管就行，而那个按钮必然报错。
@@ -366,7 +375,7 @@ export function AppsView(content, ctx = {}) {
                 text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
                 title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
               }))
-            : null),
+            : null)),
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
       ]),
       a.description ? h('div', {
@@ -396,7 +405,9 @@ export function AppsView(content, ctx = {}) {
                 title: '把这个已在运行的服务登记到「服务管理」',
                 onclick: () => adoptApp(a),
               })
-              : (a.panel_installer && a.artifacts && !a.service_in_launchd
+              : (a.site_app
+                ? null // 建站类的入口由 siteInstallButtons 提供
+                : (a.panel_installer && a.artifacts && !a.service_in_launchd
                 // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
                 ? h('button.btn.btn-sm.btn-primary', {
                   text: '重新部署',
@@ -407,8 +418,9 @@ export function AppsView(content, ctx = {}) {
                   text: '安装',
                   disabled: !a.available,
                   onclick: () => openInstaller(a),
-                })))),
+                }))))),
         ...openButtons(a),
+        ...siteInstallButtons(a),
         ...uninstallButtons(a),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
       ]),
@@ -473,6 +485,66 @@ export function AppsView(content, ctx = {}) {
   //                  面板绝不卸载它们（删掉用户自己的 MySQL 等于删掉他的数据），
   //                  只给「取消纳管」，并在确认框里说清楚"只移除记录，不动系统"。
   // 没有这三类之一的（brew 核心组件、未安装）就不给按钮。
+  // siteInstallButtons 给「一键建站」类应用一个建站入口。
+  //
+  // 这类应用装出来是一个**网站**（目录 + 数据库 + 伪静态 + vhost），
+  // 不是服务也不是容器，所以按钮文案与流程都不同：先弹一个表单问域名与管理员，
+  // 再由后端一气做完（见 api_site_apps.go）。
+  function siteInstallButtons(a) {
+    if (!a.site_app) return [];
+    return [h('button.btn.btn-sm.btn-primary', {
+      text: '一键建站',
+      disabled: !a.available,
+      title: '自动下载源码、建库、建站点并套用伪静态',
+      onclick: () => openSiteInstall(a),
+    })];
+  }
+
+  async function openSiteInstall(a) {
+    const domain = h('input.input', { placeholder: '例如：blog.test', value: '' });
+    const php = h('input.input', { value: '8.3' });
+    const note = h('div.hint', {
+      text: '面板会自动：下载官方源码 → 解压到 ~/www/<域名> → 建库建用户 → 写配置文件 → ' +
+        '建站点并套用「' + (a.site_app.rewrite || '') + '」伪静态。',
+    });
+    const m = modal({
+      title: '一键建站 · ' + a.name,
+      body: h('div', [
+        h('div.field', [h('label', { text: '域名' }), domain,
+          h('div.hint', { text: '先用一个测试域名（如 blog.test）即可；域名创建后不可修改' })]),
+        h('div.field', [h('label', { text: 'PHP 版本' }), php]),
+        note,
+        (a.site_app.notes || []).length
+          ? h('ul', { style: { margin: '8px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
+            (a.site_app.notes || []).map((n) => h('li', { text: n })))
+          : null,
+        a.site_app.finish_path
+          ? h('div.hint', { style: { marginTop: '8px' }, text: '装完请打开 http://<域名>' + a.site_app.finish_path + ' 走完最后一步。' })
+          : null,
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', {
+          text: '开始建站',
+          onclick: async () => {
+            const d = domain.value.trim();
+            if (!d) { toast('请填域名', 'warn'); return; }
+            close();
+            taskCenter.start({
+              kind: 'site-install',
+              target: d,
+              title: '一键建站 ' + a.name + '（' + d + '）',
+              start: () => api.marketInstallSite(a.id, { domain: d, php: php.value.trim() || '8.3' }),
+              onDone: () => load(),
+            });
+          },
+        }),
+      ],
+    });
+    setTimeout(() => domain.focus(), 60);
+    return m;
+  }
+
   function uninstallButtons(a) {
     const plan = a.uninstall || {};
     if (!a.installed) return [];

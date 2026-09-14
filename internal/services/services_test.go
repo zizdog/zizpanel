@@ -80,12 +80,23 @@ func TestCatalogEntriesAreComplete(t *testing.T) {
 		} else {
 			switch a.Kind {
 			case KindNative:
-				// 用面板自研安装器部署的条目不需要 BrewFormula
-				// （它们要建 venv、改 nginx、注册系统级守护进程，
-				//  通用 brew 流程做不了）。但必须说清楚是谁装的，
-				// 否则"没有安装方式"就成了漏配。
-				if a.BrewFormula == "" && a.PanelInstaller == "" {
-					t.Fatalf("原生应用 %s 既没有 BrewFormula 也没有 PanelInstaller，无法自动安装", a.ID)
+				// 三种合法的"原生"安装方式：
+				//  ① 通用 brew formula；
+				//  ② 面板自研安装器（要建 venv、改 nginx、注册守护进程，通用流程做不了）；
+				//  ③ 一键建站（SiteApp）：装出来是一个网站，由面板的建站流程负责
+				//     （下载源码 + 建库 + 建站点），既不是包也不是常驻服务。
+				if a.BrewFormula == "" && a.PanelInstaller == "" && a.SiteApp == nil {
+					t.Fatalf("原生应用 %s 既没有 BrewFormula、PanelInstaller 也没有 SiteApp，无法自动安装", a.ID)
+				}
+				if a.SiteApp != nil {
+					// 建站类必须说清楚：从哪下、什么格式、套哪个伪静态、装完去哪继续
+					if a.SiteApp.DownloadURL == "" || a.SiteApp.Archive == "" ||
+						a.SiteApp.Rewrite == "" || a.SiteApp.FinishPath == "" {
+						t.Fatalf("建站应用 %s 的 SiteApp 描述不完整（下载地址/格式/伪静态/安装入口都要有）", a.ID)
+					}
+					if a.Category != "site" {
+						t.Errorf("建站应用 %s 的 category 应为 site（市场按它分组）", a.ID)
+					}
 				}
 			case KindCompose:
 				if a.ComposeYAML == "" {

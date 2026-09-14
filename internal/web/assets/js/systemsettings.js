@@ -244,6 +244,20 @@ export function SystemSettingsView(content, ctx = {}) {
       ['Tailscale', st.tailscale ? '已安装' : '未安装'],
     ];
     rows.forEach(([k, v]) => summary.append(h('dt', { text: k }), h('dd', { text: v })));
+    // 受 macOS 隐私保护（TCC）的目录：读不到就直说，并给出授权路径。
+    // 用户反馈过"把 ~/Documents 挂进 File Browser 却看不到文件、终端里报
+    // Operation not permitted" —— 那不是 Docker 的问题，是这里。
+    (st.protected_dirs || []).forEach((d) => {
+      summary.append(
+        h('dt', { text: d.name }),
+        h('dd', [
+          d.readable
+            ? h('span.pill.ok', { text: '可读' })
+            : h('span.pill.danger', { text: '读不到（需完全磁盘访问权限）', title: d.err || '' }),
+          h('span.hint', { text: ' ' + d.path }),
+        ]),
+      );
+    });
 
     // ---------- 电源 ----------
     clear(powerBody);

@@ -145,6 +145,10 @@ func cmdServe(args []string) error {
 	listen := fs.String("listen", "", "覆盖监听地址")
 	logLevel := fs.String("log-level", "info", "日志级别")
 	noTLS := fs.Bool("no-tls", false, "以 HTTP 启动")
+	// 安全后缀：显式传 --panel-suffix ""（空串）表示"这次不要后缀"，
+	// 供本地开发与端到端测试使用（它们需要访问根路径）。
+	// 只有**显式传了**才覆盖配置 —— 否则会把配置里已有的后缀抹掉。
+	panelSuffix := fs.String("panel-suffix", "", "覆盖面板安全后缀（传空串表示不启用）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -153,6 +157,12 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	// 只有显式传了 --panel-suffix 才覆盖（flag.Visit 能区分"没传"与"传了空串"）
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "panel-suffix" {
+			cfg.PanelSuffix = config.NormalizePanelSuffix(*panelSuffix)
+		}
+	})
 
 	// 目录先建好，再做归属自愈 —— 顺序反了的话，日志文件被别的身份占用时
 	// 连修复的机会都没有。

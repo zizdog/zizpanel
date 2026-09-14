@@ -63,6 +63,10 @@ type App struct {
 	// 面板还会在 `/<slug>/` 上给它挂一个反向代理（见 internal/appproxy）。
 	// 没有界面的（纯 API / 数据库 / 运行时）留空，免得给出一个打不开的按钮。
 	UI *AppUI `json:"ui,omitempty"`
+	// SiteApp 非空表示这是「一键建站」类应用：装完得到的是一个**网站**
+	// （目录 + 数据库 + 伪静态 + nginx vhost），而不是一个常驻服务。
+	// 面板按这个描述自动完成建站流程，用户只需要填域名与管理员账号。
+	SiteApp *SiteAppSpec `json:"site_app,omitempty"`
 	// NoDaemon 表示这个应用**没有常驻进程**：装完就是一个网页入口
 	// （phpMyAdmin 就是这种：nginx alias + php-fpm，没有自己的守护进程）。
 	// 有了它，市场就不会把"launchd 里找不到服务"当成异常去吓用户。
@@ -89,9 +93,21 @@ type AppUI struct {
 	Rewrites []UIRewrite `json:"rewrites,omitempty"`
 	// Websocket 表示界面需要 WebSocket（socket.io / ws），代理必须放行 Upgrade
 	Websocket bool `json:"websocket,omitempty"`
+	// SelfBase 表示**应用自己就会带上级路径**（例如 File Browser 的 `-b /filebrowser`）。
+	// 面板这时**不做任何路径改写** —— 否则会双重加前缀：
+	// 应用生成 /filebrowser/static/assets/x.js，面板再改写成
+	// /filebrowser/static/filebrowser/assets/x.js，资源全 404（真机实测）。
+	SelfBase bool `json:"self_base,omitempty"`
 	// SelfConf 表示**安装器自己已经写了 nginx location**（如 phpMyAdmin 的 alias），
 	// 面板不要再生成代理，只提供「打开」入口。
 	SelfConf bool `json:"self_conf,omitempty"`
+	// Headers 是反代时要附加（或覆盖）的响应头。
+	//
+	// 为什么需要：有些前端不是"路径不对"，而是**缺安全头就跑不起来** ——
+	// Squoosh 的编解码器要用 SharedArrayBuffer，浏览器要求页面处于
+	// crossOriginIsolated 状态（即带 COOP/COEP）；少了这两个头，它会
+	// 直接报 "Failed to load app"，而页面本身与资源请求全都是 200。
+	Headers map[string]string `json:"headers,omitempty"`
 	// PreferDirect 表示"这个应用挂子路径实测不可用（或需要它自己先配置 base path）"。
 	//
 	// 与 Note 的区别：Note 只是说明，PreferDirect 会改变界面行为 ——
@@ -110,6 +126,30 @@ type UIRewrite struct {
 	From string `json:"from"`
 	// To 支持 {slug} 占位符
 	To string `json:"to"`
+}
+
+// SiteAppSpec 描述一个"一键建站"应用怎么装。
+//
+// 为什么单独一类而不是塞进 ComposeYAML/BrewFormula：这类应用既不是服务也不是容器，
+// 它的产出是一个**站点**（www/<域名> 下的文件 + 一个数据库 + 一段伪静态）。
+// 安装流程也因此完全不同（见 internal/web/api_site_apps.go）：
+// 下载源码 → 解压 → 建库建用户 → 写配置文件 → 建站点（带伪静态）→ 探测首页。
+type SiteAppSpec struct {
+	// DownloadURL 是主下载地址；MirrorURLs 是备用地址（国内网络下主地址常常很慢）
+	DownloadURL string   `json:"download_url"`
+	MirrorURLs  []string `json:"mirror_urls,omitempty"`
+	// Archive: zip / tar.gz
+	Archive string `json:"archive"`
+	// StripTopDir 表示压缩包里有一层顶层目录需要剥掉（如 typecho/）
+	StripTopDir bool `json:"strip_top_dir,omitempty"`
+	// Rewrite 是伪静态预设名（与 sites.RewritePresets 的 name 对应）
+	Rewrite string `json:"rewrite"`
+	// FinishPath 是安装向导入口（装完提示用户去这里继续）
+	FinishPath string `json:"finish_path"`
+	// NeedsDB 表示要建数据库与用户
+	NeedsDB bool `json:"needs_db"`
+	// Notes 是给用户的关键提醒（数据库名/密码怎么填等）
+	Notes []string `json:"notes,omitempty"`
 }
 
 // Requirement 是一条前置条件。
@@ -471,7 +511,10 @@ func Catalog() []App {
 			ID: "filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
 			UI: &AppUI{
 				Slug: "filebrowser",
-				Note: "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
+				// compose 里用 `command: ["-b", "/filebrowser"]` 让它自带前缀，
+				// 所以面板不再改写路径（否则会 /filebrowser/static/filebrowser/…）
+				SelfBase: true,
+				Note:     "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
 			},
 			Summary: "在浏览器里管理服务器上的文件",
 			Description: "浏览、上传、下载、重命名、删除与分享目录，支持多用户与细粒度权限。" +
@@ -493,6 +536,14 @@ func Catalog() []App {
 			// arm64 证据（Docker Hub 经镜像站读同一份 index）：
 			//   docker manifest inspect docker.1ms.run/filebrowser/filebrowser:latest
 			//   → linux/amd64、linux/arm64、linux/arm/v7
+			//
+			// 2026-09-14 用户反馈后的两处调整：
+			//  ① **子路径**：它的前端用绝对路径（/static/…、/api/…），挂在
+			//     /filebrowser/ 下会一直转圈打不开（真机实测）。官方支持 `-b/--baseurl`，
+			//     而镜像的 /init.sh 会把参数原样转发给 filebrowser，所以直接加
+			//     `command: ["-b", "/filebrowser"]` —— 比在代理里改写路径可靠得多。
+			//  ② **默认目录**：用户要的是"Mac 用户那几个常用目录，别的不要看到"，
+			//     所以把 5 个目录分别挂成 /srv/<中文名>，而不是把整个家目录挂进去。
 			ComposeYAML: `services:
   filebrowser:
     image: filebrowser/filebrowser:latest
@@ -501,17 +552,71 @@ func Catalog() []App {
     # bind mount 属主是 root —— 它的 init.sh 会因写不了 /config/settings.json
     # 直接退出（set -e）。容器内以 root 运行即可，与目录里其它镜像一致。
     user: "0:0"
+    # 子路径：镜像的 /init.sh 会把参数透传给 filebrowser，所以这一行就能生效
+    command: ["-b", "/filebrowser"]
     ports:
       - "8081:80"
     volumes:
-      - ./data:/srv
+      # 只挂这几个常用目录（界面上就是 /srv 下的 5 个条目）。
+      # 想改挂载：Docker → Compose → filebrowser → 编辑 yml → 重新部署。
+      # ⚠️ macOS 的「文档/下载/桌面」等目录受隐私保护（TCC）：没给 Colima
+      #    （以及面板）授予「完全磁盘访问权限」时，容器里是空的、终端里会报
+      #    Operation not permitted。
+      - ~/Documents:/srv/文档
+      - ~/Downloads:/srv/下载
+      - ~/Music:/srv/音乐
+      - ~/Movies:/srv/影片
+      - ~/Desktop:/srv/桌面
       - ./config:/config
       - ./database:/database
     restart: unless-stopped
 `,
-			PostInstallHint: "首次启动的 admin 密码是随机生成的，在「服务管理 → File Browser → 日志」里找 " +
-				"User 'admin' initialized with randomly generated password；登录后请立即修改。",
+			// 首次启动会自动生成 admin 密码并打在容器日志里；面板部署完会把它捞出来
+			// 直接显示在安装结果里（用户不用再去服务管理翻日志）。
+			PostInstallHint: "默认用户名 admin，密码是首次启动随机生成的 —— 面板会把它显示在安装结果里。" +
+				"没看到就去「服务管理 → File Browser → 日志」找 `randomly generated password`，登录后请立刻改掉。",
 			DocsURL: "https://filebrowser.org",
+		},
+		// ---------------- 一键建站（Category: site） ----------------
+		{
+			ID: "typecho", Name: "Typecho", Icon: "📝",
+			Summary: "轻量博客程序，一键装好并配好伪静态",
+			Description: "国内最常用的轻量博客程序之一（PHP + MySQL）。" +
+				"面板会自动：下载官方最新版 → 解压到 ~/www/<域名> → 建库建用户 → " +
+				"写 config.inc.php → 建站点并套用 Typecho 伪静态。" +
+				"完成后打开 http://<域名>/install.php 走完最后一步（数据库信息已预填）。",
+			Category: "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				DownloadURL: "https://github.com/typecho/typecho/releases/latest/download/typecho.zip",
+				MirrorURLs:  []string{"https://cdn.jsdelivr.net/gh/typecho/typecho@master/typecho.zip"},
+				Archive:     "zip", StripTopDir: true,
+				Rewrite: "typecho", FinishPath: "/install.php", NeedsDB: true,
+				Notes: []string{
+					"安装向导里的「数据库地址」填 localhost，库名/用户名/密码见安装结果",
+					"Typecho 需要写权限：面板已把整个站点目录交给运行用户",
+				},
+			},
+			DocsURL: "https://typecho.org",
+		},
+		{
+			ID: "wordpress", Name: "WordPress", Icon: "🌐",
+			Summary: "最流行的建站程序，一键装好并配好伪静态",
+			Description: "面板会自动：下载官方中文版 → 解压到 ~/www/<域名> → 建库建用户 → " +
+				"生成 wp-config.php → 建站点并套用 WordPress 伪静态。" +
+				"完成后打开 http://<域名>/wp-admin/install.php 填站点标题与管理员账号即可。",
+			Category: "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 用官方中文站（国内可达性明显好于 wordpress.org）
+				DownloadURL: "https://cn.wordpress.org/latest-zh_CN.zip",
+				MirrorURLs:  []string{"https://wordpress.org/latest.zip"},
+				Archive:     "zip", StripTopDir: true,
+				Rewrite: "wordpress", FinishPath: "/wp-admin/install.php", NeedsDB: true,
+				Notes: []string{
+					"wp-config.php 已按安装结果里的库名/账号写好，向导里直接点「开始」即可",
+					"管理员账号密码由你在向导里设置（面板不预设，避免弱口令）",
+				},
+			},
+			DocsURL: "https://cn.wordpress.org",
 		},
 		{
 			ID: "metatube-server", Name: "MetaTube（媒体元数据服务）", Icon: "🎬",
@@ -541,7 +646,22 @@ func Catalog() []App {
 		},
 		{
 			ID: "squoosh", Name: "Squoosh（图片压缩）", Icon: "🗜️",
-			UI:      &AppUI{Slug: "squoosh"},
+			UI: &AppUI{
+				Slug: "squoosh",
+				// 真机实测（mini）：它的构建产物把**所有**资源放在 `/c/` 下
+				// （`self.nextDefineUri=location.origin+"/c/initial-app-….js"`），
+				// 子路径下不改写就会 "Failed to load app"。
+				Rewrites: []UIRewrite{
+					{From: "/c/", To: "/{slug}/c/"},
+					{From: "/manifest.json", To: "/{slug}/manifest.json"},
+				},
+				// 编解码器用 SharedArrayBuffer → 浏览器要求 crossOriginIsolated，
+				// 也就是必须带上 COOP/COEP；少了这两个头只会看到 "Failed to load app"。
+				Headers: map[string]string{
+					"Cross-Origin-Opener-Policy":   "same-origin",
+					"Cross-Origin-Embedder-Policy": "require-corp",
+				},
+			},
 			Summary: "浏览器里的图片压缩，本地 wasm 完成",
 			Description: "PNG / JPEG / WebP / AVIF 等格式的压缩与尺寸调整，编解码全在浏览器里用 " +
 				"wasm 完成，图片不上传。装好后访问 http://<本机地址>:8085。" +

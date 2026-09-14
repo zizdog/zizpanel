@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/zizdog/zizpanel/internal/config"
 	"net"
 	"net/http"
 	"os"
@@ -285,6 +286,9 @@ func (s *Server) settingsView() map[string]any {
 		"tls_enable":       s.Cfg.TLSEnable,
 		"www_root":         s.Cfg.WWWRoot,
 		"panel_public_url": s.Cfg.PanelPublicURL,
+		// 安全后缀（安全入口）：界面要显示"当前入口地址"，也允许改
+		"panel_suffix": s.Cfg.PanelSuffix,
+		"panel_entry":  s.PanelEntryPath(),
 		// 升级源也要回传：设置页要能显示当前值并允许清空。
 		// 少了它，用户在页面上既看不到、也清不掉在线升级写进去的地址。
 		"upgrade_source": s.Cfg.UpgradeSource,
@@ -311,6 +315,9 @@ type settingsReq struct {
 	LoginLockMins  *int      `json:"login_lock_mins"`
 	Require2FA     *bool     `json:"require_2fa"`
 	PanelPublicURL *string   `json:"panel_public_url"`
+	// PanelSuffix 是安全后缀。传空串 = 关闭安全入口（会让面板回到根路径，
+	// 界面会要求用户二次确认）；非空会被规范化（只留小写字母/数字/-/_）。
+	PanelSuffix *string `json:"panel_suffix"`
 	// UpgradeSource 是在线升级的默认源地址。传空串表示"清空"。
 	//
 	// 为什么必须能在这里改：在线升级的"检查更新"会把用过的源**写进配置**，
@@ -383,6 +390,17 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PanelPublicURL != nil {
 		cfg.PanelPublicURL = strings.TrimSpace(*req.PanelPublicURL)
+	}
+	if req.PanelSuffix != nil {
+		raw := strings.TrimSpace(*req.PanelSuffix)
+		next := config.NormalizePanelSuffix(raw)
+		if raw != "" && next == "" {
+			fail(w, http.StatusBadRequest, "安全后缀只能用字母、数字、- 与 _")
+			return
+		}
+		// 后缀是面板自己的路径，改了之后当前页面立刻失效 —— 保存时就告诉用户新地址，
+		// 别让人改完自己找不到面板了。
+		cfg.PanelSuffix = next
 	}
 	if req.UpgradeSource != nil {
 		src := strings.TrimSpace(*req.UpgradeSource)

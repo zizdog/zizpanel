@@ -161,6 +161,40 @@ func (d *nativeDriver) statusByPort(ctx context.Context) (State, error) {
 func (d *nativeDriver) Start(ctx context.Context) error {
 	plist, _ := d.plistPath()
 	if plist == "" {
+		// Homebrew 服务：plist 由 `brew services start` 生成。
+		// 只装了包、从没启动过服务时（ollama 就是这样），plist 并不存在，
+		// 直接报"找不到 plist"用户完全不知道下一步该干什么（真实反馈）。
+		// 这里就近修：用 brew services 启动一次，plist 就有了。
+		if formula, ok := brewFormulaFromLabel(d.svc.LaunchLabel); ok {
+			// nativeDriver 只带 Options（没有 Manager），而 brew 调用在 Manager 上；
+			// 用一个临时 Manager 即可 —— 它只用到 opt 里的 brew 路径与用户名。
+			tmp := NewManager(nil, d.opt)
+			if out, err := tmp.runAsUser(ctx, 2*time.Minute, brewPath(d.opt), "services", "start", formula); err != nil {
+				return fmt.Errorf("找不到 %s 的 plist，且 `brew services start %s` 也失败了：%v（%s）",
+					d.svc.LaunchLabel, formula, err, tailText(out, 300))
+			}
+			// brew 注册完再走一次正常路径
+			if p2, _ := d.plistPath(); p2 != "" {
+				if err := priv.LaunchLoad(d.svc.LaunchLabel); err == nil {
+					return nil
+				}
+			}
+			// 记录里的 label 可能是旧前缀（真机上 homebrew.mxcl.* 与 sh.brew.* 并存）。
+			// brew 刚刚用**当前**前缀写了 plist —— 那就看"服务到底跑起来没有"，
+			// 而不是死盯着旧 label 的 plist 文件：服务在跑就是成功。
+			real := BrewLabelFor(d.opt.UserHome, formula)
+			if real != "" && real != d.svc.LaunchLabel {
+				if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", real+".plist")); err == nil {
+					return nil
+				}
+				if _, err := os.Stat(filepath.Join(d.opt.UserHome, "Library", "LaunchAgents", real+".plist")); err == nil {
+					return nil
+				}
+			}
+			return fmt.Errorf("已执行 `brew services start %s`，但找不到它的 plist（试过 %s 与 %s）；"+
+				"请确认这个 formula 是否支持 brew services",
+				formula, d.svc.LaunchLabel, real)
+		}
 		return fmt.Errorf("找不到 %s 的 plist，无法启动", d.svc.LaunchLabel)
 	}
 	// 已加载则用 kickstart 拉起；未加载则 bootstrap
@@ -418,4 +452,33 @@ func portListening(ctx context.Context, port int) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// brewPath 返回 brew 可执行文件路径（macOS 上两种前缀都可能）。
+func brewPath(opt Options) string {
+	if opt.BrewBin != "" {
+		return opt.BrewBin
+	}
+	for _, p := range []string{"/opt/homebrew/bin/brew", "/usr/local/bin/brew"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "brew"
+}
+
+// brewFormulaFromLabel 从 launchd 标签推出 Homebrew formula 名。
+//
+// brew services 生成的标签形如 `homebrew.mxcl.ollama` / `sh.brew.mysql@8.4`，
+// 前缀随 brew 版本与安装方式变化（真机上两种前缀并存过），所以按后缀取。
+func brewFormulaFromLabel(label string) (string, bool) {
+	for _, prefix := range []string{"homebrew.mxcl.", "sh.brew."} {
+		if strings.HasPrefix(label, prefix) {
+			f := strings.TrimPrefix(label, prefix)
+			if f != "" {
+				return f, true
+			}
+		}
+	}
+	return "", false
 }

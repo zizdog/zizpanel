@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -106,8 +107,24 @@ type State struct {
 	Portable     bool        `json:"portable"`
 	Tailscale    bool        `json:"tailscale"`
 	IsRoot       bool        `json:"is_root"`
+	// ProtectedDirs 是 macOS 隐私保护目录（文档/下载/桌面…）的可读性。
+	//
+	// 为什么要探测（用户反馈）：把 ~/Documents 挂进 File Browser 容器后
+	// "文件看不到"，在 Web 终端里 cd 进去 ls 直接报 Operation not permitted。
+	// 那不是面板或 Docker 的 bug，而是 macOS 的 TCC：**没有「完全磁盘访问权限」
+	// 的进程读不了这些目录**。面板要主动把这件事说清楚并给出授权路径，
+	// 否则用户会在 Docker/权限/挂载上白折腾很久。
+	ProtectedDirs []ProtectedDir `json:"protected_dirs,omitempty"`
 	// Warnings 是要如实告诉用户的"做不到/有前提"的事（例如笔记本合盖必睡）。
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// ProtectedDir 是一个受 macOS 隐私保护的目录及其可读性。
+type ProtectedDir struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Readable bool   `json:"readable"`
+	Err      string `json:"err,omitempty"`
 }
 
 // powerDesired 是"服务器应该长什么样"。取值与 tools/server-mode.sh 保持一致
@@ -191,7 +208,52 @@ func Probe(ctx context.Context) State {
 	if !st.IsRoot {
 		st.Warnings = append(st.Warnings, "面板当前不是以 root 运行：电源/更新/hosts 这些设置改不动。")
 	}
+	st.ProtectedDirs = probeProtectedDirs()
+	for _, d := range st.ProtectedDirs {
+		if !d.Readable {
+			st.Warnings = append(st.Warnings,
+				"面板读不到"+d.Name+"（"+d.Path+"）："+d.Err+
+					"。这是 macOS 的隐私保护（TCC）—— 需要到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里"+
+					"把 /opt/zizpanel/bin/zizpanel（以及运行 Docker 的 Colima / lima）加进去，"+
+					"否则 Web 终端与容器里都看不到这些目录里的文件。")
+			break // 同因同果，说一次就够
+		}
+	}
 	return st
+}
+
+// probeProtectedDirs 逐个试读 macOS 的隐私保护目录。
+//
+// 用 os.ReadDir 而不是 os.Stat：TCC 拦的是"列目录/读内容"，
+// stat 往往仍然成功（能看到目录存在、却读不了里面的东西）——
+// 只 stat 会得出"一切正常"的错误结论。
+func probeProtectedDirs() []ProtectedDir {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	names := [][2]string{
+		{"文档", "Documents"},
+		{"下载", "Downloads"},
+		{"桌面", "Desktop"},
+		{"音乐", "Music"},
+		{"影片", "Movies"},
+	}
+	out := make([]ProtectedDir, 0, len(names))
+	for _, n := range names {
+		p := filepath.Join(home, n[1])
+		d := ProtectedDir{Name: n[0], Path: p}
+		if _, err := os.Stat(p); err != nil {
+			continue // 目录不存在（用户没建），不算问题
+		}
+		if _, err := os.ReadDir(p); err != nil {
+			d.Err = err.Error()
+		} else {
+			d.Readable = true
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 func probePower(ctx context.Context) []PowerItem {

@@ -166,3 +166,10 @@ func scanLines(r io.Reader, fn func(string)) {
 		}
 	}
 }
+
+// EmitProgress 是给 web 层用的：直接往 ctx 上的进度接收器写一行。
+//
+// 为什么导出：一键建站这类流程编排在 web 层（它要同时用 sites/mysql/services），
+// 但"进度"这套管道在 services 里。与其在 web 层再实现一遍，
+// 不如把这一行的发送暴露出来。
+func EmitProgress(ctx context.Context, level, text string) { emit(ctx, level, text) }

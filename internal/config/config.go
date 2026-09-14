@@ -80,6 +80,12 @@ type Config struct {
 	LoginLockMins  int    `json:"login_lock_mins"` // 锁定时长（分钟）
 	Require2FA     bool   `json:"require_2fa"`     // 强制所有账号开启两步验证
 	PanelPublicURL string `json:"panel_public_url"`
+	// PanelSuffix 是面板的**安全后缀**（宝塔那种"安全入口"）：
+	// 面板的界面与接口只在这个前缀下提供服务，直接访问 / 只会得到 404。
+	//
+	// 空串 = 不启用（本地开发/测试用）。真实安装时由 Bootstrap 随机生成，
+	// 也可以在「面板设置」里改或清空（清空要显式确认，那等于把面板放回根路径）。
+	PanelSuffix string `json:"panel_suffix"`
 	// AppProxy 控制"把有界面的应用挂到 /<slug>/ 下"这个能力（默认开）。
 	//
 	// 为什么做成开关：面板的 /<slug>/ 是**公开路径**（应用自己鉴权，面板不拦），
@@ -261,6 +267,9 @@ func Bootstrap(path string) (*Config, bool, error) {
 	c.path = path
 	c.Secret = randomHex(32)
 	c.InstallID = randomHex(8)
+	// 新建配置 = 真实安装：按用户要求生成安全后缀（宝塔式的"必须带一串随机路径"）。
+	// 已存在的配置不会被改动 —— 用户可能已经把它设成自己好记的值，或者故意清空。
+	c.PanelSuffix = RandomPanelSuffix()
 
 	// 以配置文件所在目录作为本实例的数据目录，兄弟目录作为 logs/run/work/bin
 	base := filepath.Dir(path)
@@ -303,11 +312,48 @@ func (c *Config) fixDataDirOwnership() {
 }
 
 // fill 补齐缺失字段（老版本配置升级用），保证默认值不被空串覆盖。
+// RandomPanelSuffix 生成一个安全后缀：8 位小写字母+数字。
+//
+// 为什么用这个字符集：要能直接放进 URL 路径、且不容易被念错/抄错
+// （去掉 0/o/1/l 之类易混字符）；长度取 8 位，暴力猜中概率可忽略。
+func RandomPanelSuffix() string {
+	const alphabet = "abcdefghjkmnpqrstuvwxyz23456789" // 去掉 i/l/o/0/1
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "panel" + randomHex(4)
+	}
+	out := make([]byte, len(b))
+	for i, v := range b {
+		out[i] = alphabet[int(v)%len(alphabet)]
+	}
+	return string(out)
+}
+
+// NormalizePanelSuffix 把用户填的后缀规范化成"可以放进 URL 路径"的形式。
+// 去掉斜杠与空白；只保留小写字母、数字、连字符与下划线；最长 32 位。
+func NormalizePanelSuffix(raw string) string {
+	raw = strings.Trim(strings.TrimSpace(raw), "/")
+	var b strings.Builder
+	for _, r := range strings.ToLower(raw) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if len(out) > 32 {
+		out = out[:32]
+	}
+	return out
+}
+
 func (c *Config) fill() {
 	d := Default()
 	if c.Secret == "" {
 		c.Secret = randomHex(32)
 	}
+	// 后缀统一规范化（配置文件可能被手工改过；带斜杠/空格的写法会让 URL 拼错）
+	c.PanelSuffix = NormalizePanelSuffix(c.PanelSuffix)
 	if c.InstallID == "" {
 		c.InstallID = randomHex(8)
 	}

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -279,7 +280,59 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 	}
 	res.step(ctx, "容器已启动")
 	res.Service = &Service{ComposeFile: composeFile}
+
+	// 有些容器镜像会在**首次启动时随机生成**管理员密码并只打在日志里
+	// （File Browser 就是）。用户要在"安装完成"这一屏就看到它，
+	// 而不是去「服务管理 → 日志」里翻 —— 那对不熟悉的人太难了。
+	m.scrapeGeneratedCredentials(ctx, app, res)
 	return nil
+}
+
+// generatedCredRe 匹配"首次启动随机生成的管理员密码"这类日志。
+//
+// 目前已知的：File Browser
+//
+//	User 'admin' initialized with randomly generated password: zNhlM0V4cDQCsuD2
+var generatedCredRe = regexp.MustCompile(`(?i)(?:user|username)[^\n]*?['"]([^'"]+)['"][^\n]*?password[:\s]+([A-Za-z0-9!@#$%^&*_+\-]{6,})`)
+
+// scrapeGeneratedCredentials 从刚启动的容器日志里捞"随机生成的账号密码"。
+//
+// 为什么值得做：这些密码**只出现一次**（日志里），用户没看到就只能删库重来。
+// 捞不到也不算失败 —— 有些应用不生成随机密码，那条提示就是多余的。
+func (m *Manager) scrapeGeneratedCredentials(ctx context.Context, app App, res *InstallResult) {
+	if app.UI == nil {
+		return
+	}
+	// 给容器一点时间把首启日志打出来
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(4 * time.Second):
+	}
+	drv := newComposeDriver(m.opt, &Service{ComposeFile: filepath.Join(m.composeDir(), app.ID, "docker-compose.yml"), Name: app.ID})
+	logs, err := drv.Logs(ctx, 120)
+	if err != nil || logs == "" {
+		return
+	}
+	match := generatedCredRe.FindStringSubmatch(logs)
+	if len(match) != 3 {
+		return
+	}
+	user, pass := match[1], match[2]
+	res.Steps = append(res.Steps,
+		"",
+		"┌─────────────────────────────────────────────┐",
+		"│  "+app.Name+" 的登录账号（首次启动随机生成）  │",
+		"└─────────────────────────────────────────────┘",
+		"  用户名 = "+user,
+		"  密  码 = "+pass,
+		"",
+		"  这串密码只在容器首次启动时生成一次，请立刻记下来；",
+		"  登录后到设置里改成自己的密码（改完这条记录就不重要了）。",
+	)
+	// 同时把密码写进安装提示，安装结果与市场卡片都能看到
+	res.Warning = ""
+	res.Steps = append(res.Steps, "  （同一份信息也记录在服务日志里）")
 }
 
 // composeDir 返回 compose 文件存放目录。

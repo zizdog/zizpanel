@@ -161,13 +161,19 @@ func panelURLs(cfg *config.Config) []string {
 		portPart = ":" + strconv.Itoa(port)
 	}
 
-	out := []string{fmt.Sprintf("%s://127.0.0.1%s", scheme, portPart)}
+	// 安全后缀：面板只在 /<suffix>/ 下提供服务，所以打印给用户的地址必须带上它，
+	// 否则用户会照着一个 404 的地址去试（这比不给地址更糟）。
+	suffix := ""
+	if sfx := strings.Trim(cfg.PanelSuffix, "/"); sfx != "" {
+		suffix = "/" + sfx + "/"
+	}
+	out := []string{fmt.Sprintf("%s://127.0.0.1%s%s", scheme, portPart, suffix)}
 	if ip := tlsx.PrimaryIP(); ip != "" && ip != "127.0.0.1" {
 		host := ip
 		if strings.Contains(ip, ":") { // IPv6 需要方括号
 			host = "[" + ip + "]"
 		}
-		out = append(out, fmt.Sprintf("%s://%s%s", scheme, host, portPart))
+		out = append(out, fmt.Sprintf("%s://%s%s%s", scheme, host, portPart, suffix))
 	}
 	return out
 }
