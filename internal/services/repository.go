@@ -40,6 +40,10 @@ func scanService(sc interface{ Scan(...any) error }) (*Service, error) {
 	s.Autostart = autostart == 1
 	s.Enabled = enabled == 1
 	s.Managed = managed == 1
+	// 显示名兜底：老记录里 display_name 存的可能就是 launchd 标签
+	// （sh.brew.mysql@8.4），界面上该显示「MySQL 8.4」。
+	// 在这里做而不是在注册时做，是为了让已登记的服务立刻变好看，不用重新纳管。
+	s.DisplayName = displayNameOf(&s)
 	return &s, nil
 }
 

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,9 +17,11 @@ import (
 // "dependency check failed for VM: lima not found" —— 而 lima 其实是装好的。
 // 面板、launchd、sudo -n -u 的默认 PATH 都不含 brew 目录，所以必须显式注入。
 func TestColimaEnvIncludesBrewBin(t *testing.T) {
+	// 家目录用临时目录：测试不该依赖（更不该写入）真实用户目录
+	home := t.TempDir()
 	m := NewManager(nil, Options{
 		BrewBin:  "/opt/homebrew/bin/brew",
-		UserHome: "/Users/zizdog",
+		UserHome: home,
 		UserName: "zizdog",
 	})
 	env := m.colimaEnv()
@@ -34,7 +38,7 @@ func TestColimaEnvIncludesBrewBin(t *testing.T) {
 	if !strings.Contains(path, "/opt/homebrew/bin") {
 		t.Errorf("PATH 必须含 brew 目录，实际: %s", path)
 	}
-	if !strings.Contains(strings.Join(env, " "), "HOME=/Users/zizdog") {
+	if !strings.Contains(strings.Join(env, " "), "HOME="+home) {
 		t.Errorf("必须设置 HOME，否则 colima 会用错家目录: %v", env)
 	}
 }
@@ -261,5 +265,66 @@ func TestLookupUIDGID(t *testing.T) {
 	}
 	if _, _, err := lookupUIDGID("__no_such_user__"); err == nil {
 		t.Error("不存在的用户应返回错误")
+	}
+}
+
+// TestColimaFastState 是"服务管理页慢"那条的回归测试。
+//
+// 原来每次刷新都跑 `colima status`（实测 1.07 秒），现在改读 Lima 实例目录：
+// hostagent 的 ha.pid 与 ssh.sock。这里用临时目录复刻三种状态。
+func TestColimaFastState(t *testing.T) {
+	// 家目录用 /tmp 下的短路径：macOS 的 unix socket 路径上限约 104 字节，
+	// 而 t.TempDir() 的路径（含完整测试名）轻易就超了，报错是误导性的
+	// "bind: invalid argument"，看起来像参数写错。
+	home, err0 := os.MkdirTemp("/tmp", "zpc")
+	if err0 != nil {
+		t.Fatal(err0)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	m := NewManager(nil, Options{UserHome: home})
+
+	// 1) 没有实例目录 → found=false（调用方据此回退到 CLI）
+	if running, _, found := m.colimaFastState(); found {
+		t.Error("没有实例目录时 found 应为 false")
+	} else if running {
+		t.Error("没有实例目录时不该报告运行中")
+	}
+
+	// 2) 造一个"正在运行"的实例：ha.pid 指向一个活着的进程（用测试进程自己），
+	//    并且 ssh.sock 是一个真实的 unix socket。
+	dir := filepath.Join(home, ".colima", "_lima", "colima")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ha.pid"), []byte(fmt.Sprint(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(dir, "ssh.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("造 unix socket 失败: %v", err)
+	}
+	defer ln.Close()
+
+	if running, detail, found := m.colimaFastState(); !found || !running {
+		t.Errorf("pid 活着 + socket 存在时应报运行中，实际 running=%v found=%v (%s)", running, found, detail)
+	}
+
+	// 3) pid 指向一个不存在的进程 → 必须报未运行。
+	//    这一条是关键：只看 socket 文件会被残留文件骗到（虚拟机没跑但 socket 还在）。
+	if err := os.WriteFile(filepath.Join(dir, "ha.pid"), []byte("999999"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if running, _, found := m.colimaFastState(); !found || running {
+		t.Errorf("pid 已死时应报未运行，实际 running=%v found=%v", running, found)
+	}
+
+	// 4) socket 没了 → 也必须报未运行（只看 pid 会被 PID 复用骗到）
+	if err := os.WriteFile(filepath.Join(dir, "ha.pid"), []byte(fmt.Sprint(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(sockPath)
+	if running, _, found := m.colimaFastState(); !found || running {
+		t.Errorf("socket 不存在时应报未运行，实际 running=%v found=%v", running, found)
 	}
 }

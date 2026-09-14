@@ -9,7 +9,8 @@
 ## 项目一句话
 
 只做 macOS 的类宝塔面板：Go 单二进制 + 内嵌原生 ESM 前端（**无构建步骤**）+ SQLite，
-一条 `curl | sudo bash` 装完即可远程网页操作。当前 **v0.3.5**，本机与 Mac mini **双机部署**。
+一条 `curl | sudo bash` 装完即可远程网页操作。当前本机 **v0.3.8**（Mac mini 停在 0.3.5，
+局域网关闭期间**不部署** mini）。
 
 ---
 
@@ -68,6 +69,13 @@
   测试要用 `Manager.qwenPortOverride` 之类的手段隔离。
 - **测试不许碰生产配置。** 涉及 nginx vhost 的测试必须沙箱化，
   并断言**生产的 `000-default.conf` 一字未变**（曾因为漏沙箱化把生产配置改坏，`/_panel` 全 502）。
+- **测试不许碰用户真实家目录。** `config.Default()` 里的 `UserHome`/`WWWRoot`
+  解析的是**真实**家目录，测试服务器必须把它们指向 `t.TempDir()`。
+  2026-09-14 事故：`newTestServer` 漏隔离 `UserHome`，`make check` 把用户真实的
+  `~/Library/LaunchAgents/sh.brew.*.plist` 覆盖成了空 plist —— 服务当时在跑所以
+  **零症状**，但只要重启或点一次"重启服务"就会永久起不来。现在有两道门禁：
+  护栏测试 `TestTestServerSandboxedAwayFromRealHome` +
+  `make check` 里的 `tools/check-test-pollution.sh`（跑测试前后给真实目录拍指纹）。
 
 ---
 

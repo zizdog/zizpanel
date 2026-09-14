@@ -129,6 +129,9 @@ export const api = {
   saveSettings: (patch) => request('POST', `${API_BASE}/settings`, patch),
   changePassword: (oldPwd, newPwd) =>
     request('POST', `${API_BASE}/account/password`, { old: oldPwd, new: newPwd }),
+  // 改用户名：要当前密码确认；成功后会话仍然有效（会话按 user_id 关联）
+  renameUser: (username, password) =>
+    request('POST', `${API_BASE}/account/username`, { username, password }),
   totpSetup: () => request('POST', `${API_BASE}/account/totp/setup`, {}),
   totpEnable: (secret, code) => request('POST', `${API_BASE}/account/totp/enable`, { secret, code }),
   totpDisable: (password) => request('POST', `${API_BASE}/account/totp/disable`, { password }),

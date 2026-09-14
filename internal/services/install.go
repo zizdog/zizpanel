@@ -207,6 +207,20 @@ func (m *Manager) brewServiceInfo(ctx context.Context, formula string) (label, p
 			}
 		}
 	}
+	// brew services info 拿不到时（老版本 brew、服务未启动、输出为空），
+	// 按磁盘上的 plist 反推真实标签 —— 否则就会用错标签去纳管。
+	if label == "" {
+		label = BrewLabelFor(m.opt.UserHome, formula)
+		if label != "" {
+			for _, d := range []string{filepath.Join(m.opt.UserHome, "Library", "LaunchAgents"),
+				"/Library/LaunchDaemons"} {
+				if p := filepath.Join(d, label+".plist"); fileExists(p) {
+					plist = p
+					break
+				}
+			}
+		}
+	}
 	if m.opt.UserHome != "" {
 		logPath = filepath.Join(m.opt.UserHome, "Library", "Logs", formula+".log")
 		// 有的 formula 把日志写到 .out.log / .err.log

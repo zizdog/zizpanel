@@ -277,7 +277,9 @@ function renderApp() {
     ]),
     nav,
     h('div.sidebar-foot', [
-      h('div', { text: '登录账号：' + (user.username || '-') }),
+      // 给个 id：改用户名后可以原地更新这一行，不必重渲染整个外壳
+      // （重渲染会把设置页打回第一个 Tab，用户会觉得"改完跳走了"）
+      h('div', { id: 'sidebar-account', text: '登录账号：' + (user.username || '-') }),
       h('div', { text: (state.session?.config?.listen || '') + (state.session?.config?.tls ? ' · HTTPS' : ' · HTTP') }),
     ]),
   ]);

@@ -655,8 +655,16 @@ var selfLabels = map[string]bool{
 }
 
 // isSelfLabel 判断是否为面板自身或关键基础设施。
+//
+// 除了点名的那两个，还一刀切排除 `cn.zizpanel.` 前缀 ——
+// 那是面板自己的作业（例如计划任务生成的 cn.zizpanel.cron.daily-backup）。
+// 真机上"可纳管扫描"就把面板自己的定时任务列了出来：它对用户毫无意义
+// （计划任务有专门页面管理），纳管进来还会多出一条莫名其妙的记录。
 func isSelfLabel(label string) bool {
-	return selfLabels[label]
+	if selfLabels[label] {
+		return true
+	}
+	return strings.HasPrefix(label, "cn.zizpanel.")
 }
 
 // isSystemLabel 判断是否为系统自带服务（不应出现在纳管列表里）。

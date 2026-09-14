@@ -72,7 +72,12 @@ let expectAuthFailure = false;
 // 这类错误是测试的断言对象，不应计为故障。
 let expectHTTPError = false;
 
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+// pageerror 一定要带堆栈：只记 message 的话，像 "statusBar is not defined"
+// 这种错误不告诉你是哪个文件哪一行，排查只能靠猜（真踩过）。
+page.on('pageerror', (e) => {
+  const at = (e.stack || '').split('\n').filter((l) => l.includes('assets/js/'))[0];
+  errors.push('pageerror: ' + e.message + (at ? ' @ ' + at.trim() : ''));
+});
 page.on('requestfailed', (r) => {
   const url = r.url();
   const why = r.failure()?.errorText || '';
@@ -249,7 +254,61 @@ try {
     await page.waitForTimeout(600);
   });
 
+  await step('用户名表单可用（只验证校验，不改真实账号）', async () => {
+    // 刻意**不提交合法的新用户名**：那会真的改名，而本测试后面还要用当前账号
+    // 登录（下一轮运行也一样）。成功路径由 Go 测试覆盖，那里有硬证据：
+    // 改名后旧用户名登录失败、新用户名登录成功、会话不受影响。
+    //
+    // 用户名卡片在「账号与两步验证」Tab 里，而上一步骤停在「关于与运维」，
+    // 所以要先切回来（曾漏这一步，测试报"缺少入口"，其实是找错了 Tab）。
+    await page.click('button:has-text("账号与两步验证")');
+    await page.waitForTimeout(1000);
+    const btn = page.locator('button:has-text("修改用户名")');
+    if (!(await btn.count())) throw new Error('设置页缺少「修改用户名」入口');
+    await shot('07b-username-card');
+
+    const nameInput = page.locator('input[placeholder^="新用户名"]');
+    const pwdInput = page.locator('input[placeholder^="当前密码（确认身份）"]');
+    if (!(await nameInput.count()) || !(await pwdInput.count())) {
+      throw new Error('用户名卡片缺少输入框');
+    }
+
+    // (a)(b) 两次点击都**故意**打回 400（用户名不合法 / 当前密码错），
+    // 这正是要断言的行为，所以用 expectHTTPError 开关把它们从
+    // "浏览器控制台错误"里排除 —— 否则整轮测试会因为这两条预期内的 400 判失败。
+    expectHTTPError = true;
+    try {
+      // (a) 非法用户名 → 明确提示
+      await nameInput.fill('a');
+      await pwdInput.fill('whatever-wrong');
+      await btn.click();
+      await page.waitForTimeout(1200);
+      let t = await page.locator('.toast').last().innerText().catch(() => '');
+      if (!/不合法|相同|密码/.test(t)) {
+        throw new Error('非法用户名没有给出明确提示，实际: ' + t);
+      }
+
+      // (b) 当前密码错 → 凭据错误（会打到接口，但不会改动账号）
+      await nameInput.fill('some-other-name');
+      await pwdInput.fill('definitely-wrong-password');
+      await btn.click();
+      await page.waitForTimeout(1500);
+      t = await page.locator('.toast').last().innerText().catch(() => '');
+      if (!/密码|凭据/.test(t)) {
+        throw new Error('当前密码错误时应提示凭据问题，实际: ' + t);
+      }
+      await shot('07c-username-rejected');
+      await pwdInput.fill('');
+    } finally {
+      expectHTTPError = false;
+    }
+  });
+
   await step('验证访问策略可保存', async () => {
+    // 访问策略控件在「访问与安全」Tab；上一步在「账号与两步验证」，先切回来。
+    // （设置页的每个步骤都自己选 Tab，不要依赖上一步留在哪儿。）
+    await page.click('button:has-text("访问与安全")');
+    await page.waitForTimeout(1000);
     // 切到白名单再切回来，验证接口与提示都正常
     await page.selectOption('select.select', 'whitelist');
     await page.fill('textarea.textarea', '100.64.0.0/10\n192.168.1.0/24');
@@ -454,6 +513,33 @@ try {
     if (inputs < 8) throw new Error('注册表单字段过少: ' + inputs);
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
+  });
+
+  await step('健康检查失败有可操作入口', async () => {
+    await page.click('.nav-item:has-text("服务管理")');
+    await page.waitForTimeout(2000);
+
+    const pill = page.locator('button:has-text("个健康检查失败")');
+    if (!(await pill.count())) {
+      console.log('        [跳过] 当前没有健康检查失败的服务');
+      return;
+    }
+    await pill.first().click();
+    await page.waitForTimeout(1200);
+    await shot('37-health-filtered');
+
+    const body = await page.locator('.content').innerText();
+    // 关键：不能只给一个红标签，必须告诉用户"检查了什么、大概为什么、下一步点哪"
+    for (const need of ['健康检查失败', '检查地址', '重新检查']) {
+      if (!body.includes(need)) {
+        throw new Error(`筛选后的页面缺少「${need}」，用户看完还是不知道怎么办: ` + body.slice(0, 220));
+      }
+    }
+    if ((body.includes('401') || body.includes('403')) && !body.includes('身份验证')) {
+      throw new Error('401/403 时应提示"该地址要求身份验证"，否则用户会以为服务坏了');
+    }
+    await page.click('button:has-text("全部")');
+    await page.waitForTimeout(800);
   });
 
   // ---------- 文件管理（P4）----------

@@ -67,7 +67,8 @@ def main() -> int:
 
     write_version(new)
     print(f"版本号：{cur} → {new}")
-    print("记得同时部署到本机与 mini，两边版本号应一致。")
+    # 局域网关闭期间只部署本机；恢复双机后两边版本号应一致。
+    print("记得部署到本机并在本机验证（局域网关闭期间不部署 mini）。")
     return 0
 
 

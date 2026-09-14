@@ -466,63 +466,7 @@ export function FilesView(content, ctx = {}) {
       return;
     }
 
-    const editor = h('textarea.textarea', {
-      value: res.content,
-      style: { minHeight: '420px', width: '100%', fontSize: '12.5px', lineHeight: '1.6' },
-      spellcheck: false,
-    });
-    const stat = h('span.sub', { text: `${res.content.length} 字符` });
-    editor.addEventListener('input', () => { stat.textContent = `${editor.value.length} 字符（已修改）`; });
-
-    let dirty = false;
-    editor.addEventListener('input', () => { dirty = true; });
-
-    const m = modal({
-      title: `编辑：${entry.name}`,
-      wide: true,
-      body: h('div', [
-        h('div', { style: { marginBottom: '8px', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } }, [
-          h('code.code', { text: entry.path }),
-          stat,
-          h('button.btn.btn-sm', {
-            text: '查找替换',
-            onclick: () => replaceInEditor(editor, entry),
-          }),
-        ]),
-        editor,
-        h('div.hint', { style: { marginTop: '8px' }, text: '保存采用"先写临时文件再替换"，写入中断不会破坏原文件。' }),
-      ]),
-      footer: (close) => [
-        h('button.btn', {
-          text: '取消',
-          onclick: () => { if (!dirty || confirm('有未保存的修改，确定关闭？')) close(); },
-        }),
-        h('button.btn.btn-primary', {
-          text: '保存',
-          onclick: async () => {
-            try {
-              await api.fileWrite(entry.path, editor.value);
-              dirty = false;
-              toast('已保存', 'ok');
-              close();
-            } catch (e) { toast(e.message, 'err', 10000); }
-          },
-        }),
-      ],
-      onClose: () => { },
-    });
-
-    // Ctrl/Cmd+S 保存
-    const onKey = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        api.fileWrite(entry.path, editor.value)
-          .then(() => { dirty = false; toast('已保存', 'ok'); })
-          .catch((err) => toast(err.message, 'err'));
-      }
-    };
-    editor.addEventListener('keydown', onKey);
-    registerCleanup(() => editor.removeEventListener('keydown', onKey));
+    editorModal(entry, res, replaceInEditor);
   }
 
   function replaceInEditor(editor, entry) {
@@ -627,6 +571,645 @@ export function FilesView(content, ctx = {}) {
 
   registerCleanup(() => { });
   load(cwd || undefined);
+}
+
+// ============================================================================
+//  在线编辑器：透明 textarea + 高亮层
+// ============================================================================
+//
+// 做法：一个 <pre> 放彩色高亮结果，一个 <textarea> 叠在它上面负责真正的输入；
+// textarea 的文字设成透明、只留光标，看起来就像在"直接编辑彩色代码"。
+//
+// 为什么不用 contenteditable：输入法、选区、撤销、光标位置全都要自己实现，
+// textarea 是浏览器白送的、行为最稳的输入控件。代价是两层必须逐像素对齐 ——
+// 字体、字号、行高、内边距、边框宽度、tab 宽度任何一项不一致都会错位，
+// 所以这些属性统一由 zpfTextStyle() 提供，两层共用同一份。
+
+const HL_MAX_CHARS = 200 * 1024; // 超过 200KB 直接跳过高亮：整篇重新分词的开销随体积线性增长，几 MB 的日志会把页面冻住
+const HL_MAX_TOKENS = 20000;     // 片段上限：压缩过的单行代码能在一屏里产生几万个 token，超了同样退回纯文本
+const LN_MAX = 20000;            // 行号上限：全换行的 2MB 文件能有上百万行，拼行号字符串会拖死输入
+const ZPF_FONT_SIZE = 13;
+const ZPF_LINE_HEIGHT = 20;
+const ZPF_PAD = '10px 12px';
+const ZPF_CSS_ID = 'zpf-editor-style';
+
+function zpfTextStyle() {
+  return {
+    fontFamily: 'var(--mono)',
+    fontSize: ZPF_FONT_SIZE + 'px',
+    lineHeight: ZPF_LINE_HEIGHT + 'px',
+    fontWeight: '400',
+    letterSpacing: 'normal',
+    tabSize: '4',
+    whiteSpace: 'pre',               // 必须 pre：pre-wrap 会折行，折行后行号槽和高亮层必然错位
+    padding: ZPF_PAD,
+    border: '1px solid transparent', // 透明边框占位：textarea 自带 1px 边框，高亮层不补就会差 1px
+    margin: '0',
+  };
+}
+
+// 扩展名 → 语言。任务里要求的语言集，不认识的一律纯文本。
+const EXT_LANG = {
+  php: 'php',
+  js: 'js', mjs: 'js', cjs: 'js',
+  ts: 'ts',
+  json: 'json',
+  go: 'go',
+  py: 'py',
+  sh: 'sh', bash: 'sh', zsh: 'sh',
+  yaml: 'yaml', yml: 'yaml',
+  html: 'html', htm: 'html',
+  css: 'css',
+  sql: 'sql',
+  ini: 'ini', conf: 'ini', cnf: 'ini',
+  md: 'md',
+};
+
+const LANG_LABEL = {
+  php: 'PHP', js: 'JavaScript', ts: 'TypeScript', json: 'JSON', go: 'Go',
+  py: 'Python', sh: 'Shell', yaml: 'YAML', html: 'HTML', css: 'CSS',
+  sql: 'SQL', ini: 'INI', md: 'Markdown',
+};
+
+// 语法规则：每种语言是一组 [组名, 正则源]，运行时拼成一条带命名分组的 alternation。
+// 顺序 = 优先级：注释/字符串必须排在关键字前面。整篇只跑一次 exec 循环，
+// 不能对每个 token 各来一遍 replace —— 那样既慢，又会让后一遍把前一遍的结果套娃。
+const RE_C_COM = String.raw`\/\/[^\n]*|\/\*[\s\S]*?\*\/`;
+const RE_HASH_COM = String.raw`#[^\n]*`;
+const RE_STR_DQ = String.raw`"(?:\\.|[^"\\\n])*"`;
+const RE_STR_SQ = String.raw`'(?:\\.|[^'\\\n])*'`;
+const RE_STR_JS = String.raw`\x60(?:\\.|[^\x60\\])*\x60|` + RE_STR_DQ + '|' + RE_STR_SQ;
+const RE_NUM = String.raw`\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)`;
+const RE_FN_CALL = String.raw`[A-Za-z_$][\w$]*(?=\s*\()`;
+const RE_TYPE_NAME = String.raw`\b[A-Z][A-Za-z0-9_$]*\b`;
+
+function kwRe(words) { return String.raw`\b(?:` + words + String.raw`)\b`; }
+
+const JS_KW = 'break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|with|yield|async|await|true|false|null|undefined|get|set';
+const TS_KW = JS_KW + '|interface|type|enum|implements|declare|namespace|abstract|public|private|protected|readonly|as|satisfies|keyof|infer|is|asserts|never|unknown|any|string|number|boolean|object|symbol|bigint|override';
+const GO_KW = 'break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var|nil|true|false|iota|make|new|len|cap|append|copy|delete|panic|recover';
+const PY_KW = 'and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|True|False|None|self';
+const SH_KW = 'if|then|else|elif|fi|for|while|until|do|done|case|esac|function|return|in|local|export|readonly|declare|source|alias|unset|shift|exit|eval|exec|trap|set|echo|printf|test|break|continue|true|false';
+const SQL_KW = 'select|from|where|insert|into|values|update|set|delete|create|table|drop|alter|add|index|view|join|left|right|inner|outer|on|group|by|order|having|limit|offset|union|all|distinct|as|and|or|not|null|is|like|between|exists|count|sum|avg|min|max|case|when|then|else|end|primary|key|foreign|references|default|unique|begin|commit|rollback|with|desc|asc';
+const PHP_KW = 'abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|do|echo|else|elseif|empty|enddeclare|endfor|endforeach|endif|endswitch|endwhile|enum|eval|exit|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null|this|parent|self';
+
+function jsLike(kw) {
+  return {
+    flags: 'g',
+    rules: [
+      ['com', RE_C_COM],
+      ['str', RE_STR_JS],
+      ['num', RE_NUM],
+      ['kw', kwRe(kw)],
+      ['fn', RE_FN_CALL],
+      ['typ', RE_TYPE_NAME],
+    ],
+  };
+}
+
+const LANG_DEFS = {
+  js: jsLike(JS_KW),
+  ts: jsLike(TS_KW),
+  json: {
+    flags: 'g',
+    rules: [
+      // 键名单独一色：JSON 里 "key": 和普通字符串靠这个区分
+      ['key', String.raw`"(?:\\.|[^"\\\n])*"(?=\s*:)`],
+      ['str', RE_STR_DQ],
+      ['num', RE_NUM],
+      ['kw', kwRe('true|false|null')],
+    ],
+  },
+  php: {
+    flags: 'g',
+    rules: [
+      // `#(?!\[)`：PHP 8 的属性语法 `#[Attr]` 不是注释，不能吃掉整行
+      ['com', String.raw`\/\/[^\n]*|\/\*[\s\S]*?\*\/|#(?!\[)[^\n]*`],
+      ['str', RE_STR_DQ + '|' + RE_STR_SQ],
+      ['vr', String.raw`\$[A-Za-z_]\w*`],
+      ['num', RE_NUM],
+      ['kw', kwRe(PHP_KW)],
+      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
+      ['typ', RE_TYPE_NAME],
+    ],
+  },
+  go: {
+    flags: 'g',
+    rules: [
+      ['com', RE_C_COM],
+      ['str', String.raw`\x60[^\x60]*\x60` + '|' + RE_STR_DQ + '|' + RE_STR_SQ],
+      ['num', RE_NUM],
+      ['kw', kwRe(GO_KW)],
+      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
+      ['typ', RE_TYPE_NAME],
+    ],
+  },
+  py: {
+    flags: 'g',
+    rules: [
+      ['com', RE_HASH_COM],
+      ['str', String.raw`[rRbBuUfF]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')`],
+      ['num', RE_NUM],
+      ['kw', kwRe(PY_KW)],
+      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
+      ['typ', RE_TYPE_NAME],
+    ],
+  },
+  sh: {
+    flags: 'g',
+    rules: [
+      ['com', RE_HASH_COM],
+      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
+      ['vr', String.raw`\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|\$[0-9@*#?$!-]`],
+      ['num', String.raw`\b\d+\b`],
+      ['kw', kwRe(SH_KW)],
+      ['fn', String.raw`[A-Za-z_][\w-]*(?=\s*\(\s*\))`],
+    ],
+  },
+  yaml: {
+    flags: 'gm',
+    rules: [
+      ['com', RE_HASH_COM],
+      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
+      ['key', String.raw`^[ \t]*-?[ \t]*[A-Za-z_][\w .-]*(?=:)`],
+      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
+      ['kw', kwRe('true|false|null|yes|no|on|off|True|False|Null|Yes|No|On|Off')],
+    ],
+  },
+  html: {
+    flags: 'gi',
+    rules: [
+      ['com', String.raw`<!--[\s\S]*?-->`],
+      ['imp', String.raw`<!doctype[^>]*>`],
+      ['tag', String.raw`<\/?[a-z][\w:-]*`],
+      ['attr', String.raw`[a-z_:][\w:.-]*(?=\s*=)`],
+      ['str', String.raw`"[^"\n]*"|'[^'\n]*'`],
+    ],
+  },
+  css: {
+    flags: 'g',
+    rules: [
+      ['com', String.raw`\/\*[\s\S]*?\*\/`],
+      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
+      ['at', String.raw`@[a-zA-Z-]+`],
+      ['imp', String.raw`!important\b`],
+      ['num', String.raw`#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|vmin|vmax|%|s|ms|deg|fr|ch)?`],
+      ['fn', String.raw`[a-zA-Z-]+(?=\()`],
+    ],
+  },
+  sql: {
+    flags: 'gi',
+    rules: [
+      ['com', String.raw`--[^\n]*|\/\*[\s\S]*?\*\/`],
+      ['str', String.raw`'(?:''|[^'])*'|"(?:""|[^"])*"`],
+      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
+      ['kw', kwRe(SQL_KW)],
+      ['fn', String.raw`[a-z_]\w*(?=\s*\()`],
+    ],
+  },
+  ini: {
+    flags: 'gim',
+    rules: [
+      ['com', String.raw`[;#][^\n]*`],
+      ['sec', String.raw`^[ \t]*\[[^\]\n]*\]`],
+      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
+      ['key', String.raw`^[ \t]*[A-Za-z_][\w.-]*(?=\s*[=:])`],
+      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
+      ['kw', kwRe('true|false|yes|no|on|off|null')],
+    ],
+  },
+  md: {
+    flags: 'gm',
+    rules: [
+      ['com', String.raw`<!--[\s\S]*?-->`],
+      ['hd', String.raw`^#{1,6}[^\n]*`],
+      ['delim', String.raw`^[ \t]*(?:\x60{3,}|~{3,})[^\n]*`],
+      ['code', String.raw`\x60[^\x60\n]+\x60`],
+      ['bold', String.raw`\*\*[^*\n]+\*\*|__[^_\n]+__`],
+      ['link', String.raw`!?\[[^\]\n]*\]\([^)\n]*\)`],
+      ['kw', String.raw`^[ \t]{0,3}(?:[-*+]|\d+\.)[ \t]|^[ \t]{0,3}>[ \t]?`],
+    ],
+  },
+};
+
+// 组名 → 注入样式里的类名
+const TOKEN_CLASS = {
+  com: 'zpf-com', str: 'zpf-str', num: 'zpf-num', kw: 'zpf-kw', fn: 'zpf-fn',
+  typ: 'zpf-typ', vr: 'zpf-vr', key: 'zpf-key', tag: 'zpf-tag', attr: 'zpf-attr',
+  at: 'zpf-at', imp: 'zpf-imp', hd: 'zpf-hd', link: 'zpf-link', sec: 'zpf-sec',
+  code: 'zpf-str', bold: 'zpf-b', delim: 'zpf-com',
+};
+
+const ZPF_REGEX = new Map();
+
+function langRegex(lang) {
+  let re = ZPF_REGEX.get(lang);
+  if (re) return re;
+  const def = LANG_DEFS[lang];
+  if (!def) return null;
+  re = new RegExp(def.rules.map(([name, src]) => `(?<${name}>${src})`).join('|'), def.flags || 'g');
+  ZPF_REGEX.set(lang, re);
+  return re;
+}
+
+/** paintHighlight(frag, text, lang) -> token 数：把文本切成"纯文本 + 上色 span"塞进 frag。 */
+function paintHighlight(frag, text, lang) {
+  const re = langRegex(lang);
+  if (!re) return 0;
+  re.lastIndex = 0;
+  let last = 0;
+  let count = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const tok = m[0];
+    // 零宽匹配会让 exec 原地踏步、死循环；正则都要求至少一个字符，这里只是兜底
+    if (!tok.length) { re.lastIndex++; continue; }
+    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const g = m.groups || {};
+    let cls = '';
+    for (const k in g) { if (g[k] !== undefined) { cls = TOKEN_CLASS[k] || ''; break; } }
+    frag.appendChild(cls ? h('span', { class: cls, text: tok }) : document.createTextNode(tok));
+    last = m.index + tok.length;
+    count++;
+  }
+  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+  return count;
+}
+
+/** langOf(name) -> 语言 id，不认识的返回 ''（纯文本）。 */
+function langOf(name) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(String(name));
+  return m ? (EXT_LANG[m[1].toLowerCase()] || '') : '';
+}
+
+function countLines(text) {
+  let n = 1;
+  for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++;
+  return n;
+}
+
+// 行号文本按"行数"缓存：输入时行数通常没变，没必要每次重新拼几万个数
+let zpfLnKey = -1;
+let zpfLnText = '';
+function lineNumbers(n) {
+  if (n === zpfLnKey) return zpfLnText;
+  const arr = new Array(n);
+  for (let i = 0; i < n; i++) arr[i] = i + 1;
+  zpfLnKey = n;
+  zpfLnText = arr.join('\n');
+  return zpfLnText;
+}
+
+// 面板禁止改 CSS 文件，所以编辑器自己的样式在这里注入一次。
+// 只能用 textContent 赋值：面板禁止一切 HTML 字符串注入，样式表也不例外。
+function ensureEditorStyle() {
+  if (document.getElementById(ZPF_CSS_ID)) return;
+  const st = document.createElement('style');
+  st.id = ZPF_CSS_ID;
+  st.textContent = [
+    '.zpf-code, .zpf-lines { margin: 0; transform-origin: 0 0; will-change: transform; }',
+    // <code> 默认是 inline，而 transform 对 inline 元素无效 —— 不改成 block 滚动同步会静默失效
+    '.zpf-code { display: block; }',
+    // 输入层的文字永远不可见（高亮层负责显示），否则会出现"双层文字"；
+    // ::selection 也要一起处理：某些浏览器选中时会用默认高亮前景色把文字显出来
+    '.zpf-ta { color: transparent !important; -webkit-text-fill-color: transparent; caret-color: var(--text); background: transparent !important; }',
+    '.zpf-ta::selection { background: rgba(96,165,250,.35); color: transparent; -webkit-text-fill-color: transparent; }',
+    // 纯文本模式（大文件 / 不认识的语言 / 代码过密）让 textarea 自己显示文字
+    '.zpf-ta.zpf-plain { color: var(--text) !important; -webkit-text-fill-color: var(--text); }',
+    '.zpf-editor:fullscreen, .zpf-editor:-webkit-full-screen { border: none; border-radius: 0; }',
+    '.zpf-com { color: #6b7688; font-style: italic; }',
+    // 注意别把 .zpf-code（高亮层容器）写进着色规则：它一上色，所有未被 token 命中的
+    // 普通文本（标识符、运算符、括号）都会跟着变绿，看起来整篇都是字符串
+    '.zpf-str { color: #86d99a; }',
+    '.zpf-num { color: #f0a868; }',
+    '.zpf-kw, .zpf-at, .zpf-sec { color: #c792ea; }',
+    '.zpf-fn, .zpf-key { color: #6fb3f2; }',
+    '.zpf-typ { color: #4ec9b0; }',
+    '.zpf-vr, .zpf-attr { color: #e2b96b; }',
+    '.zpf-tag, .zpf-imp { color: #f07178; }',
+    '.zpf-hd { color: #6fb3f2; font-weight: 600; }',
+    '.zpf-link { color: #6fb3f2; text-decoration: underline; }',
+    '.zpf-b { color: #c792ea; font-weight: 600; }',
+    ':root[data-theme="light"] .zpf-com { color: #8a93a3; }',
+    ':root[data-theme="light"] .zpf-str { color: #15803d; }',
+    ':root[data-theme="light"] .zpf-num { color: #b45309; }',
+    ':root[data-theme="light"] .zpf-kw, :root[data-theme="light"] .zpf-at, :root[data-theme="light"] .zpf-sec, :root[data-theme="light"] .zpf-b { color: #7c3aed; }',
+    ':root[data-theme="light"] .zpf-fn, :root[data-theme="light"] .zpf-key, :root[data-theme="light"] .zpf-hd, :root[data-theme="light"] .zpf-link { color: #1d4ed8; }',
+    ':root[data-theme="light"] .zpf-typ { color: #0f766e; }',
+    ':root[data-theme="light"] .zpf-vr, :root[data-theme="light"] .zpf-attr { color: #a16207; }',
+    ':root[data-theme="light"] .zpf-tag, :root[data-theme="light"] .zpf-imp { color: #b91c1c; }',
+  ].join('\n');
+  document.head.appendChild(st);
+}
+
+/**
+ * editorModal(entry, res, replaceInEditor) —— 打开在线编辑弹窗。
+ * 只在这里组装 UI；读文件/二进制判断仍由调用方负责。
+ */
+function editorModal(entry, res, replaceInEditor) {
+  ensureEditorStyle();
+  const lang = langOf(entry.name);
+
+  // 高亮层：用 <code> 包一层，滚动同步靠 transform 平移它（见 syncScroll）
+  const hlInner = h('code.zpf-code');
+  const hlLayer = h('pre.zpf-pre', {
+    style: Object.assign(zpfTextStyle(), {
+      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
+      overflow: 'hidden', color: 'var(--text)',
+    }),
+  }, [hlInner]);
+
+  const linesInner = h('pre.zpf-lines', {
+    style: Object.assign(zpfTextStyle(), {
+      padding: '0', border: 'none', textAlign: 'right',
+      color: 'var(--text-mute)', userSelect: 'none',
+    }),
+  });
+  const gutter = h('div', {
+    style: {
+      flexShrink: '0', overflow: 'hidden', background: 'var(--panel-2)',
+      border: '1px solid transparent', borderRightColor: 'var(--border-soft)',
+      padding: '10px 10px 10px 12px', width: 'calc(3ch + 26px)',
+      // 宽度用 ch 计算，所以 gutter 自己的字体也必须是等宽体，否则 ch 是正文字的宽度
+      fontFamily: 'var(--mono)', fontSize: ZPF_FONT_SIZE + 'px',
+    },
+    // 点行号栏会把焦点从 textarea 抢走，接着敲字就敲不进去
+    onmousedown: (e) => e.preventDefault(),
+  }, [linesInner]);
+
+  const editor = h('textarea.textarea.zpf-ta', {
+    value: res.content,
+    wrap: 'off',
+    autocapitalize: 'off',
+    autocomplete: 'off',
+    autocorrect: 'off',
+    style: Object.assign(zpfTextStyle(), {
+      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
+      width: '100%', height: '100%', resize: 'none', outline: 'none', minHeight: '0',
+      color: 'transparent', caretColor: 'var(--text)', background: 'transparent',
+      overflow: 'auto', zIndex: '2',
+    }),
+  });
+  // h() 会跳过值为 false 的属性，spellcheck 只能创建后补 —— 否则代码里满屏红波浪线
+  editor.setAttribute('spellcheck', 'false');
+
+  const codeWrap = h('div', { style: { position: 'relative', flex: '1 1 auto', minWidth: '0' } }, [hlLayer, editor]);
+
+  const editorBox = h('div.zpf-editor', {
+    style: {
+      position: 'relative', display: 'flex', flex: '1 1 auto',
+      height: '58vh', minHeight: '300px', overflow: 'hidden',
+      background: 'var(--bg-soft)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)', transition: 'border-color .16s',
+    },
+  }, [gutter, codeWrap]);
+
+  const stat = h('span', { style: { fontSize: '12px', color: 'var(--text-mute)' }, text: `${res.content.length} 字符` });
+  const bigHint = h('div.hint', { style: { display: 'none' } });
+  const langPill = h('span.pill', { text: lang ? LANG_LABEL[lang] : '纯文本' });
+
+  let dirty = false;
+  let dense = false;   // 代码过密（token 超预算）→ 永久退回纯文本，避免每次输入都要重绘几万个 span
+  let maximized = false;
+  let firstFocus = true;
+  let rafId = 0;
+  let lastHint = '';
+  let m = null;
+
+  function setHint(msg) {
+    if (msg === lastHint) return;
+    lastHint = msg;
+    if (msg) { bigHint.textContent = msg; bigHint.style.display = ''; }
+    else bigHint.style.display = 'none';
+  }
+
+  function renderGutter(text) {
+    const n = countLines(text);
+    if (n > LN_MAX) { gutter.style.display = 'none'; linesInner.textContent = ''; return; }
+    gutter.style.display = '';
+    gutter.style.width = `calc(${String(n).length}ch + 26px)`;
+    linesInner.textContent = lineNumbers(n);
+  }
+
+  // 高亮层与输入层的滚动同步。
+  //
+  // 为什么用 transform 而不是把 pre.scrollTop 设成和 textarea 一样：
+  // pre 必须隐藏自己的滚动条（否则会和 textarea 的滚动条叠成两条），
+  // 一旦隐藏，pre 的 clientHeight 就比 textarea 大，"滚到底"的位置对不上，
+  // 最后几行会错位。transform 没有可滚动范围，直接用 textarea 的值平移，
+  // 顶部和底部都严格对齐。
+  function syncScroll() {
+    const x = editor.scrollLeft;
+    const y = editor.scrollTop;
+    hlInner.style.transform = `translate(${-x}px, ${-y}px)`;
+    linesInner.style.transform = `translateY(${-y}px)`;
+  }
+
+  function render() {
+    const text = editor.value;
+    const tooBig = text.length > HL_MAX_CHARS;
+    const overlay = !!lang && !tooBig && !dense;
+
+    if (overlay) {
+      editor.classList.remove('zpf-plain');
+      hlLayer.style.display = '';
+      const frag = document.createDocumentFragment();
+      let n = 0;
+      try {
+        n = paintHighlight(frag, text, lang);
+      } catch (e) {
+        dense = true;
+        toast('语法高亮出错，已切换为纯文本：' + e.message, 'warn', 8000);
+      }
+      if (n > HL_MAX_TOKENS) dense = true;        // 片段太多，丢弃这次结果
+      else if (!dense) { clear(hlInner); hlInner.appendChild(frag); }
+    }
+
+    // 纯文本模式：让 textarea 自己显示文字（原生渲染比我们重绘一份快得多），
+    // 高亮层必须同时隐藏，否则两层文字会叠在一起
+    if (!overlay || dense) {
+      editor.classList.add('zpf-plain');
+      hlLayer.style.display = 'none';
+    }
+
+    renderGutter(text);
+    if (tooBig) setHint(`文件较大（${humanSize(text.length)}），已改用纯文本模式以保证输入流畅；编辑与保存不受影响。`);
+    else if (dense) setHint('代码片段过于密集，已改用纯文本模式以保证输入流畅。');
+    else setHint('');
+    syncScroll();
+  }
+
+  // 合并同一帧内的多次输入。不用 debounce：textarea 的文字是透明的，
+  // 高亮层必须紧跟输入，延迟重绘会让刚敲的字先"消失"再出现。
+  function scheduleRender() {
+    if (rafId) return;
+    rafId = requestAnimationFrame(() => { rafId = 0; render(); });
+  }
+
+  // ---------- 两种全屏 ----------
+  function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+
+  function applyHeight() {
+    // 屏幕全屏时由 UA 决定尺寸，这里显式给 100% 更稳（各浏览器 UA 规则强度不一致）
+    editorBox.style.height = fsElement() ? '100%' : '58vh';
+  }
+
+  function setMaximized(on) {
+    maximized = on;
+    // 注意：modal() 会把我传进去的 body 再包一层 .modal-body，
+    // 所以编辑器区外面其实有两层。要让编辑器撑满，必须让外层也变成
+    // "定高的纵向 flex"，否则里层 flex:1 没有可分配的空闲空间（表现为底部留一大块空白）。
+    const bodyWrap = m.el.querySelector('.modal-body');
+    if (on) {
+      // 网页全屏：只把弹窗撑满视口，不碰系统全屏
+      m.el.style.width = 'min(96vw, 1600px)';
+      m.el.style.maxWidth = '96vw';
+      m.el.style.height = '92vh';
+      m.el.style.maxHeight = '92vh';
+      bodyWrap.style.display = 'flex';
+      bodyWrap.style.flexDirection = 'column';
+      bodyWrap.style.flex = '1 1 auto';
+      bodyWrap.style.minHeight = '0';
+      bodyWrap.style.overflow = 'hidden';
+    } else {
+      m.el.style.width = '';
+      m.el.style.maxWidth = '';
+      m.el.style.height = '';
+      m.el.style.maxHeight = '';
+      bodyWrap.style.display = '';
+      bodyWrap.style.flexDirection = '';
+      bodyWrap.style.flex = '';
+      bodyWrap.style.minHeight = '';
+      bodyWrap.style.overflow = '';
+    }
+    maxBtn.textContent = on ? '🗗 还原' : '⛶ 最大化';
+    // 尺寸变了，textarea 的可滚动范围也变了，下一帧把高亮层对回去
+    requestAnimationFrame(syncScroll);
+  }
+
+  function toggleFullscreen() {
+    if (fsElement()) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit) {
+        const p = exit.call(document);
+        if (p && p.catch) p.catch(() => {});
+      }
+      return;
+    }
+    const req = editorBox.requestFullscreen || editorBox.webkitRequestFullscreen;
+    if (!req) { toast('当前浏览器不支持屏幕全屏', 'warn'); return; }
+    // 必须在用户手势里调用，浏览器可能拒绝（权限/手势失效）——不能静默失败
+    const p = req.call(editorBox);
+    if (p && p.catch) p.catch((e) => toast('进入屏幕全屏失败：' + (e && e.message ? e.message : e), 'err'));
+  }
+
+  function onFsChange() {
+    const on = !!fsElement();
+    fsBtn.textContent = on ? '🗗 退出全屏' : '⛶ 屏幕全屏';
+    applyHeight();
+    requestAnimationFrame(syncScroll);
+  }
+  document.addEventListener('fullscreenchange', onFsChange);
+  document.addEventListener('webkitfullscreenchange', onFsChange);
+
+  // 全屏下 Esc 是浏览器"退出全屏"的快捷键，但它也会冒泡到 modal 的 Esc 监听上 ——
+  // 不拦住的话，用户按一次 Esc 会连编辑器弹窗一起关掉。捕获阶段截住即可。
+  const onEscCapture = (e) => {
+    if (e.key === 'Escape' && fsElement()) e.stopPropagation();
+  };
+  document.addEventListener('keydown', onEscCapture, true);
+
+  // ---------- 工具栏 ----------
+  const maxBtn = h('button.btn.btn-sm', {
+    text: '⛶ 最大化', title: '撑满浏览器窗口（不进入系统全屏）',
+    onclick: () => setMaximized(!maximized),
+  });
+  const fsBtn = h('button.btn.btn-sm', {
+    text: '⛶ 屏幕全屏', title: '调用系统全屏，Esc 退出',
+    onclick: toggleFullscreen,
+  });
+  const toolbar = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } }, [
+    h('code.code', { text: entry.path }),
+    stat,
+    langPill,
+    h('div', { style: { flex: '1' } }),
+    h('button.btn.btn-sm', { text: '查找替换', onclick: () => replaceInEditor(editor, entry) }),
+    maxBtn,
+    fsBtn,
+  ]);
+
+  const bodyEl = h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: '0' } }, [
+    toolbar,
+    editorBox,
+    bigHint,
+    h('div.hint', { style: { marginTop: '8px' }, text: '保存采用"先写临时文件再替换"，写入中断不会破坏原文件。' }),
+  ]);
+
+  async function writeBack() {
+    try {
+      await api.fileWrite(entry.path, editor.value);
+      dirty = false;
+      toast('已保存', 'ok');
+      return true;
+    } catch (e) { toast(e.message, 'err', 10000); return false; }
+  }
+
+  m = modal({
+    title: `编辑：${entry.name}`,
+    wide: true,
+    body: bodyEl,
+    footer: () => [
+      h('button.btn', {
+        text: '取消',
+        onclick: () => { if (!dirty || confirm('有未保存的修改，确定关闭？')) m.close(); },
+      }),
+      h('button.btn.btn-primary', {
+        text: '保存',
+        onclick: async () => { if (await writeBack()) m.close(); },
+      }),
+    ],
+    onClose: () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+      document.removeEventListener('keydown', onEscCapture, true);
+      // 关弹窗时如果还在屏幕全屏，必须主动退出，否则会留在一块空白全屏层上
+      if (fsElement()) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit) { const p = exit.call(document); if (p && p.catch) p.catch(() => {}); }
+      }
+    },
+  });
+
+  editor.addEventListener('input', () => {
+    dirty = true;
+    stat.textContent = `${editor.value.length} 字符（已修改）`;
+    scheduleRender();
+  });
+  editor.addEventListener('scroll', syncScroll);
+  editor.addEventListener('focus', () => {
+    editorBox.style.borderColor = 'var(--brand)';
+    // 首次聚焦时把光标和滚动拉回开头。
+    // 坑：modal() 会自动 focus 第一个输入框，而给 textarea 赋 value 会把光标放在文末，
+    // focus 又会把光标滚进视野 —— 结果是打开文件直接停在最后一行，很莫名其妙。
+    if (firstFocus) {
+      firstFocus = false;
+      editor.setSelectionRange(0, 0);
+      editor.scrollTop = 0;
+      editor.scrollLeft = 0;
+      syncScroll();
+    }
+  });
+  editor.addEventListener('blur', () => { editorBox.style.borderColor = 'var(--border)'; });
+
+  // Ctrl/Cmd+S 保存（不关闭弹窗，和原来一致）
+  editor.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      writeBack();
+    }
+  });
+
+  render(); // 先画好再让用户看到，避免弹窗刚出现时高亮层是空的
 }
 
 // ---------- 小工具 ----------

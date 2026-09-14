@@ -22,9 +22,11 @@ func newTestManager(t *testing.T) (*Manager, *Repository) {
 	t.Cleanup(func() { _ = st.Close() })
 	repo := NewRepository(st)
 	m := NewManager(repo, Options{
-		BrewBin:  "/opt/homebrew/bin/brew",
-		UserHome: os.Getenv("HOME"),
-		UserName: os.Getenv("USER"),
+		BrewBin: "/opt/homebrew/bin/brew",
+		// ⚠️ 不能用 os.Getenv("HOME")：那是**真实**家目录。
+		// 测试里的所有用户可见路径都必须落在临时目录里（见 README 坑 57）。
+		UserHome: t.TempDir(),
+		UserName: "zizdog",
 		UID:      os.Getuid(),
 		WorkDir:  t.TempDir(),
 	})

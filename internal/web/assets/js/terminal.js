@@ -16,12 +16,18 @@ let ws = null;
 let term = null;
 let containerEl = null;
 let infoEl = null;
+// statusBar 必须和 containerEl / infoEl 一样放在模块级：
+// renderStatus() 是模块级函数，却要往这个元素里塞按钮。之前它是
+// TerminalView 里的 const，于是 renderStatus 一调用就抛
+// "statusBar is not defined"（终端状态栏永远不更新，而且只在浏览器
+// 控制台留下一行无文件名的 ReferenceError）。
+let statusBar = null;
 
 export function TerminalView(content, ctx = {}) {
   clear(content);
 
   const screen = h('div.term-screen', { tabindex: '0' });
-  const statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
+  statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
   infoEl = h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', lineHeight: '1.6' } });
   containerEl = screen;
 

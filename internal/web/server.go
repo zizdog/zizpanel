@@ -133,6 +133,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/audit/export", s.requireAuth(s.handleAuditExport))
 
 	root.HandleFunc("POST /api/v1/account/password", s.requireAuth(s.handleChangePassword))
+	// 改用户名：要当前密码确认，但不吊销会话（会话按 user_id 关联）
+	root.HandleFunc("POST /api/v1/account/username", s.requireAuth(s.handleRenameUser))
 	root.HandleFunc("POST /api/v1/account/totp/setup", s.requireAuth(s.handleTOTPSetup))
 	root.HandleFunc("POST /api/v1/account/totp/enable", s.requireAuth(s.handleTOTPEnable))
 	root.HandleFunc("POST /api/v1/account/totp/disable", s.requireAuth(s.handleTOTPDisable))

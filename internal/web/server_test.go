@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -19,6 +20,14 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
+	// ⚠️ 用户的真实家目录必须被隔离。config.Default() 会用 os.UserHomeDir()
+	// 解析出**真实**家目录，而市场/服务等处理器会往 Cfg.UserHome 下探测甚至写文件：
+	// 曾有一次集成测试把用户真实的 ~/Library/LaunchAgents/sh.brew.*.plist
+	// 覆盖成了 <plist/>（服务当时还在跑所以没立刻发现，重启后 PHP/MySQL 就起不来了）。
+	// 所有测试用的根目录一律指向 t.TempDir()。
+	cfg.UserHome = dir + "/home"
+	cfg.WWWRoot = cfg.UserHome + "/www"
+	cfg.LogRoot = cfg.WWWRoot + "/_logs"
 	cfg.DataDir = dir
 	cfg.LogDir = dir + "/logs"
 	cfg.RunDir = dir + "/run"
@@ -31,6 +40,12 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	cfg.AccessMode = "any"
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatal(err)
+	}
+	// 家目录/网站根目录不在 EnsureDirs 的清单里，显式建出来
+	for _, d := range []string{cfg.UserHome, cfg.WWWRoot, cfg.LogRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	st, err := store.Open(dir)
 	if err != nil {
@@ -45,6 +60,50 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	return srv, ts
+}
+
+// TestTestServerSandboxedAwayFromRealHome 是本项目最贵的一次事故的护栏。
+//
+// 2026-09-14：api_market_test.go 用 srv.Cfg.UserHome 造 plist 文件来复刻"本机实况"，
+// 而 newTestServer 当时只隔离了 DataDir 等目录、**没隔离 UserHome**，
+// 于是 `make check` 把用户真实的
+//
+//	~/Library/LaunchAgents/sh.brew.php@8.3.plist
+//	~/Library/LaunchAgents/sh.brew.mysql@8.4.plist
+//
+// 覆盖成了 8 字节的 `<plist/>`。当时服务还在跑所以毫无症状，
+// 但只要重启（或面板点一次"重启服务"）PHP/MySQL 就再也起不来了。
+//
+// 所以这里把"测试服务器的用户可见根目录必须落在临时目录里"钉死：
+// 谁再把 Cfg.UserHome 指回真实家目录，这个测试先红。
+func TestTestServerSandboxedAwayFromRealHome(t *testing.T) {
+	realHome, err := os.UserHomeDir()
+	if err != nil || realHome == "" {
+		t.Skip("拿不到真实家目录，跳过")
+	}
+	srv, _ := newTestServer(t)
+
+	if srv.Cfg.UserHome == realHome {
+		t.Fatalf("测试服务器的 UserHome 指向了真实家目录 %s：测试会写到用户的真实文件上", realHome)
+	}
+	for name, got := range map[string]string{
+		"UserHome": srv.Cfg.UserHome,
+		"WWWRoot":  srv.Cfg.WWWRoot,
+		"LogRoot":  srv.Cfg.LogRoot,
+	} {
+		if got == "" {
+			t.Errorf("%s 不该为空", name)
+			continue
+		}
+		if got == realHome || strings.HasPrefix(got, realHome+"/") {
+			t.Errorf("%s = %s 落在真实家目录里，测试会污染用户环境", name, got)
+		}
+		if !strings.HasPrefix(got, os.TempDir()) && !strings.Contains(got, "TestTestServerSandboxedAwayFromRealHome") {
+			// t.TempDir() 在 macOS 上常是 /var/folders/...（不是 os.TempDir()），
+			// 所以这里只做"不在真实家目录"的硬性判断，其余仅提示。
+			t.Logf("提示：%s = %s（不在 os.TempDir() 下，确认它确实是测试临时目录）", name, got)
+		}
+	}
 }
 
 // doJSON 发起 JSON 请求。默认自动带上 cookie 与 CSRF 头（模拟正常前端行为）。

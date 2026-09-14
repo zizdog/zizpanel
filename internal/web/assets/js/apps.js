@@ -390,7 +390,15 @@ export function AppsView(content, ctx = {}) {
         a.kind === 'native' ? h('span.pill.brand', { text: '原生' }) : null,
         a.kind === 'compose' ? h('span.pill.brand', { text: 'Docker' }) : null,
         a.adopted ? h('span.pill.ok', { text: '已纳管' })
-          : (a.installed ? h('span.pill', { text: '已安装·未纳管' }) : null),
+          : (a.installed
+            // 装了但服务没在 launchd 里（plist 丢了/没注册成功）是一种**孤儿态**：
+            // 说"已安装·未纳管"会让人以为点一下纳管就行，而那个按钮必然报错。
+            // 所以这里如实说"服务未注册"。
+            ? h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
+              text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
+              title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
+            })
+            : null),
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
       ]),
       a.description ? h('div', {
@@ -404,30 +412,49 @@ export function AppsView(content, ctx = {}) {
         //   未安装        → 安装
         a.adopted
           ? h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } })
-          : (a.installed && a.service_label
+          : (a.installed && a.service_label && a.service_in_launchd
+            // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
+            // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
+            // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
             ? h('button.btn.btn-sm.btn-primary', {
               text: '纳管',
               title: '把这个已在运行的服务登记到「服务管理」',
               onclick: () => adoptApp(a),
             })
-            : h('button.btn.btn-sm.btn-primary', {
-              text: '安装',
-              disabled: !a.available,
-              // 用面板自研安装器的项目要收集选项（例如 Qwen 的"要不要鉴权"、
-              // 密钥从哪来），所以直接打开对应对话框，而不是走通用安装流程。
-              onclick: () => {
-                switch (a.panel_installer) {
-                  case 'qwentts': installQwenTTS(); return;
-                  case 'voicereceiver': installVoiceReceiver(); return;
-                  case 'iopaint': installIOPaint(); return;
-                  case 'phpmyadmin': installPhpMyAdmin(); return;
-                }
-                preflight(a);
-              },
-            })),
+            : (a.panel_installer && a.artifacts && !a.service_in_launchd
+              // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
+              ? h('button.btn.btn-sm.btn-primary', {
+                text: '重新部署',
+                title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
+                onclick: () => openInstaller(a),
+              })
+              : h('button.btn.btn-sm.btn-primary', {
+                text: '安装',
+                disabled: !a.available,
+                onclick: () => openInstaller(a),
+              }))),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
       ]),
     ]);
+  }
+
+  // openInstaller 按应用打开对应的部署对话框。
+  //
+  // 抽出来是因为有**两个入口**要用它：
+  //   · 「安装」——没装过的应用；
+  //   · 「重新部署」——装了但服务没注册的孤儿态（plist 丢了等）。
+  // 安装器本身是幂等的：重跑会重建 venv/服务定义/plist 并登记到服务管理，
+  // 所以"重新部署"就是最合理的修复动作，不需要另写一套修复逻辑。
+  function openInstaller(a) {
+    // 用面板自研安装器的项目要收集选项（例如 Qwen 的"要不要鉴权"、
+    // 密钥从哪来），所以直接打开对应对话框，而不是走通用安装流程。
+    switch (a.panel_installer) {
+      case 'qwentts': installQwenTTS(); return;
+      case 'voicereceiver': installVoiceReceiver(); return;
+      case 'iopaint': installIOPaint(); return;
+      case 'phpmyadmin': installPhpMyAdmin(); return;
+    }
+    preflight(a);
   }
 
   // ---------- 安装前检查 ----------

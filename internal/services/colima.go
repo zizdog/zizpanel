@@ -144,11 +144,89 @@ func newColimaDriver(opt Options, s *Service) *colimaDriver {
 func (d *colimaDriver) Kind() Kind { return KindColima }
 
 // Status 查询虚拟机与 Docker 引擎的状态。
+// colimaFastState 用**文件系统判据**判断 Colima 虚拟机是否在跑。
+//
+// 为什么不直接跑 `colima status`：实测它要 **1.07 秒**（起 CLI、读配置、连 API），
+// 而服务管理页每次刷新都会查它 —— 整页 1.4s 里有 1.07s 花在这一条上。
+// 用户抱怨"服务管理页面加载慢"，根因就是这里。
+//
+// Lima 把实例状态放在 ~/.colima/_lima/<instance>/ 下：
+//
+//	ha.pid    hostagent 的 pid（虚拟机在跑时它一定活着）
+//	ssh.sock  串口/ssh 复用 socket
+//
+// 读这两个文件只要几毫秒。判据取"pid 活着 **且** socket 存在"——
+// 只判 pid 会被 PID 复用骗到，只判 socket 会被残留文件骗到。
+//
+// found=false 表示根本没找到实例目录（即从未启动过），调用方据此报"未启动"。
+func (m *Manager) colimaFastState() (running bool, detail string, found bool) {
+	home := m.opt.UserHome
+	if home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			home = h
+		}
+	}
+	if home == "" {
+		return false, "", false
+	}
+
+	// LIMA_HOME 可覆盖；Colima 默认用 ~/.colima/_lima。
+	base := os.Getenv("LIMA_HOME")
+	if base == "" {
+		base = filepath.Join(home, ".colima", "_lima")
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return false, "", false
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// 实例名：默认 profile 是 colima，带 profile 的是 colima-<name>
+		if e.Name() != "colima" && !strings.HasPrefix(e.Name(), "colima-") {
+			continue
+		}
+		dir := filepath.Join(base, e.Name())
+		alive := false
+		if b, err := os.ReadFile(filepath.Join(dir, "ha.pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				alive = processAlive(pid)
+			}
+		}
+		sockOK := false
+		if fi, err := os.Stat(filepath.Join(dir, "ssh.sock")); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			sockOK = true
+		}
+		if alive && sockOK {
+			return true, "虚拟机运行中（实例 " + e.Name() + "）", true
+		}
+		return false, "虚拟机未运行（实例 " + e.Name() + "）", true
+	}
+	return false, "", false
+}
+
 func (d *colimaDriver) Status(ctx context.Context) (State, error) {
 	m := &Manager{opt: d.opt}
 	if !m.ColimaInstalled() {
 		return State{Status: "not-installed", Detail: "未安装 Colima（brew install colima docker docker-compose）"}, nil
 	}
+	// 快路径：读 Lima 实例目录（毫秒级）
+	if running, detail, found := m.colimaFastState(); found {
+		if !running {
+			return State{Status: "stopped", Detail: detail}, nil
+		}
+		st := State{Status: "running", Running: true, Detail: detail}
+		if sock := m.opt.DockerSocket; sock != "" {
+			st.Detail += "（socket: " + sock + "）"
+		}
+		return st, nil
+	}
+
+	// 慢路径：没找到实例目录时仍然问一次 CLI。
+	// （理论上不该走到这里；留着是为了"判据失效"时行为不倒退，
+	//   宁可这一条慢，也不要误报成未安装/未运行。）
 	out, err := m.runColima(ctx, 20*time.Second, "status")
 	if err != nil {
 		// 虚拟机没起来时 colima status 返回非 0，这属于正常状态而非错误。
@@ -159,7 +237,6 @@ func (d *colimaDriver) Status(ctx context.Context) (State, error) {
 	}
 
 	st := State{Status: "running", Running: true}
-	// 从输出里取 socket 路径，顺带确认引擎真的在跑。
 	sock := ""
 	for _, ln := range strings.Split(out, "\n") {
 		if i := strings.Index(ln, "docker socket:"); i >= 0 {

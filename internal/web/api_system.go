@@ -171,6 +171,42 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"msg": "密码已修改，请重新登录"})
 }
 
+type renameUserReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// handleRenameUser 修改当前账号的用户名。
+//
+// 要当前密码：用户名是登录凭据的一半，而且审计里"谁做的"记的就是它 ——
+// 不能让一个被劫持的会话把账号改成事后追查对不上人的名字。
+// 会话不吊销：sessions 是按 user_id 关联的，改名不影响登录态。
+func (s *Server) handleRenameUser(w http.ResponseWriter, r *http.Request) {
+	var req renameUserReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	u := userFrom(r.Context())
+	if u == nil {
+		fail(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	newName, err := s.Auth.RenameUser(r.Context(), u.ID, req.Username, req.Password)
+	if err != nil {
+		// 失败也要留痕：改名尝试本身是安全相关事件
+		s.audit(r, "account_rename", strings.TrimSpace(req.Username),
+			"失败（原名 "+u.Username+"）: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.audit(r, "account_rename", newName, "用户名 "+u.Username+" → "+newName, true, "")
+	ok(w, map[string]any{
+		"username": newName,
+		"msg":      "用户名已改为 " + newName,
+	})
+}
+
 // handleTOTPSetup 生成新的 TOTP 密钥与二维码链接（此时尚未启用）。
 func (s *Server) handleTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())

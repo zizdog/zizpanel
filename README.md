@@ -269,6 +269,21 @@ sudo launchctl kickstart -k system/cn.zizpanel.panel
 
 ---
 
+## 账号
+
+面板是单管理员模型，账号在「面板设置 → 账号与安全」里管理：
+
+| 操作 | 说明 |
+|---|---|
+| 修改用户名 | 3-32 位字母数字与 `. _ - @`；**要当前密码确认** |
+| 修改密码 | 修改后所有会话立即失效，需要重新登录 |
+| 两步验证 | 可开启 TOTP；开启后登录要求动态验证码 |
+| 登录会话 | 列出活跃会话，可强制关闭 |
+
+改用户名为什么也要当前密码：用户名是登录凭据的一半，而且审计里"谁做了这件事"
+记的就是它 —— 不能让一个被劫持的会话把账号改成事后追查对不上人的名字。
+改完**不吊销会话**（会话按 user_id 关联），界面上侧边栏那一行会就地更新。
+
 ## 安全设计
 
 | 项目 | 做法 |
@@ -554,6 +569,72 @@ make remote-test     # 远程一键安装的端到端测试（本地 HTTP + 沙�
     `await shot(shot)` 报 `shot is not a function` → 改名 `shotName`。
     教训：**宽松匹配与变量遮蔽都会把排查方向带偏**，测试代码同样要精确。
 
+52. **brew 服务的 launchd 标签被硬编码成 `homebrew.mxcl.*`** →
+    应用市场里 PHP/nginx 显示「已安装·未纳管」，点「纳管」报
+    "找不到 homebrew.mxcl.php@8.3 的 plist，且该服务未在 launchd 中加载"。
+    真因：这台机器的 Homebrew 生成的是 **`sh.brew.php@8.3`**，而同一系统上
+    httpd 又是 `homebrew.mxcl.httpd` —— **两套前缀并存**，猜不得。
+    修法：按 `~/Library/LaunchAgents` 与 `/Library/LaunchDaemons` 里**真实存在的
+    plist** 反推标签（先试两个已知前缀，再按 `*.<formula>.plist` 兜底）；
+    市场的 `installed/adopted` 与「纳管」按钮都用这个真实标签。
+53. **"装了但服务没注册"的孤儿态没有出口** →
+    安装产物还在（`~/iopaint/.venv`），但 plist 没了/从没注册成功。
+    判断"已安装"只看服务记录与 plist，于是市场说"未安装"（用户会重装已有的东西），
+    服务管理里没有它，**纳管按钮也因为 installed=false 而不显示** —— 用户被卡在中间。
+    修法：按安装器的路径约定探测产物，市场增加 `artifacts` 与 `service_in_launchd`
+    两个状态；孤儿态显示「已安装·服务未注册」并给「重新部署」（安装器幂等）。
+54. **服务管理页每次刷新都要 1.4 秒，其中 1.07 秒是 `colima status`** →
+    这个 CLI 要起进程、读配置、连 API，而服务列表每次刷新都会查它。
+    修法：改用**文件系统判据** —— Lima 的实例目录（`~/.colima/_lima/<inst>/`）里有
+    hostagent 的 `ha.pid` 与 `ssh.sock`，两者都对才算在跑（只判 pid 会被 PID 复用骗到，
+    只判 socket 会被残留文件骗到），耗时从 1070ms 降到几毫秒。
+55. **健康检查失败只给一个红标签，用户不知道该做什么** →
+    页头显示"1 个健康检查失败"，点不开、也没有解释与动作。
+    修法：标签变成入口（点它只筛出失败的服务）；失败卡片里给出检查地址、
+    返回内容、**按失败种类给的建议**（401/403 专门解释为"该地址要求身份验证，
+    服务很可能是好的"），以及重新检查 / 查看日志 / 改检查地址三个动作。
+56. **可纳管扫描把面板自己的定时任务也列了出来** →
+    `cn.zizpanel.cron.daily-backup` 出现在"可纳管服务"里；它由面板的计划任务
+    页面管理，纳管进来毫无意义。
+    修法：`isSelfLabel` 除了点名的两个 label，再一刀切排除 `cn.zizpanel.` 前缀。
+57. **测试把用户的真实 launchd plist 覆盖成了空 plist**（本项目最贵的一次事故）→
+    `internal/web/api_market_test.go` 为了复刻"本机实况"，往 `srv.Cfg.UserHome`
+    下写 `sh.brew.php@8.3.plist` / `sh.brew.mysql@8.4.plist`；而测试服务器
+    `newTestServer` 当时只把 `DataDir`/`LogDir`/`RunDir` 等隔离到 `t.TempDir()`，
+    **唯独漏了 `UserHome`**（它来自 `config.Default()`，解析的是**真实**家目录）。
+    于是 `make check` 把用户真实的两个 plist 覆盖成了 8 字节的 `<plist/>`。
+    两个服务当时都在跑，所以**一点症状都没有**；但只要机器重启、或面板上点一次
+    "重启服务"（`launchctl bootout` 之后没有 plist 可以 bootstrap），
+    PHP-FPM 与 MySQL 就再也起不来了。同一轮测试还在 `~/iopaint/.venv/bin/`
+    造了个假可执行文件，让应用市场误报"IOPaint 已安装但服务未注册"。
+
+    修法（四层）：
+    - `newTestServer` 把 `UserHome`/`WWWRoot`/`LogRoot` 全部指向 `t.TempDir()`；
+    - `services_test.go` 不再用 `os.Getenv("HOME")`，`colima_test.go` 不再硬编码
+      `/Users/zizdog`；
+    - 新增护栏测试 `TestTestServerSandboxedAwayFromRealHome`：`Cfg.UserHome`
+      一旦指回真实家目录就直接红；
+    - 新增门禁 `tools/check-test-pollution.sh`（已并入 `make check`）：跑测试**前后**
+      给 `~/Library/LaunchAgents`（含内容哈希）、`~/www`、安装产物根拍指纹，
+      不一致就失败 —— 因为"看起来完全合理"的测试代码靠肉眼 review 是防不住的。
+
+    真实 plist 的恢复办法（供下次参考，**不需要重启服务**）：`launchctl print
+    gui/<uid>/<label>` 能打印出已加载作业的全部字段，再用 Homebrew 自己的
+    `brew ruby -e 'f=Formula["php@8.3"]; puts f.service.to_plist'` 重新生成，
+    逐字段核对后写回即可（`brew services restart` 也能修，但那会真的重启服务）。
+58. **Web 终端的状态栏按钮从来没渲染出来过**（`statusBar is not defined`）→
+    `terminal.js` 里 `statusBar` 是 `TerminalView()` 内部的 `const`，而往它里面
+    塞按钮的 `renderStatus()` 是**模块级函数** —— 一调用就抛 ReferenceError。
+    后果很隐蔽：终端能用，只是"清屏 / 复制全部 / 重连 / 关闭会话"这一排按钮
+    从来不出现；页面上看不出任何异常，浏览器控制台里的报错**连文件名行号都没有**。
+    修法：`statusBar` 与同文件的 `containerEl`/`infoEl` 一样提到模块级。
+    附带改进：`tools/uitest.mjs` 的 `pageerror` 现在记录**堆栈并挑出 assets/js 那一帧**，
+    否则下次还是只能靠猜是哪个文件。
+
+    > 这条是 UI 测试的控制台错误检查抓到的。它的价值不在于"页面能打开"，
+    > 而在于**任何一条 4xx/5xx 与 JS 运行时异常都会让整轮测试失败** ——
+    > 只是以前只记 message，抓到了也定位不到。
+
 ---
 
 ## 开发路线
@@ -708,6 +789,30 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 并给合成响应加 `X-TtsVoice-Model-Cold` 头，让插件能区分"慢是因为冷加载"还是"真的坏了"。
 两者都是纯增量，老插件不调用不受任何影响。
 
+### 显示名、纳管与健康检查
+
+**界面上显示软件名，不显示 launchd 标签。** 注册表里存的是标签
+（`sh.brew.mysql@8.4`、`com.zizdog.qwen3tts`），界面要显示的是「MySQL 8.4」。
+映射在读取注册表时兜底应用，所以**已登记的老记录不用重新纳管也会变好看**；
+用户手写的名字（如「Docker 运行时（Colima）」）不会被覆盖。
+
+**纳管要按磁盘上真实的 plist 来。** 不能硬编码 `homebrew.mxcl.<formula>`：
+实测同一台机器上既有 `homebrew.mxcl.httpd`，也有 `sh.brew.php@8.3`
+（Homebrew 前缀被定制过）—— 硬编码的后果是应用市场显示
+「已安装·未纳管」，点「纳管」却报"找不到 homebrew.mxcl.php@8.3 的 plist"。
+现在按 plist 反推标签，并且**只有服务确实在 launchd 里时才给「纳管」按钮**。
+
+**"装了但服务没注册"要给「重新部署」，而不是「安装」。** 安装产物还在
+（`~/iopaint/.venv`），但 plist 没了/从没注册成功 —— 这种孤儿态以前既不在
+服务管理里、也没有纳管按钮，用户什么都点不了。现在市场会如实说
+「已安装·服务未注册」并给出「重新部署」（安装器是幂等的，会重建服务定义）。
+
+**健康检查失败必须能"接着办"。** 一个红标签等于把排查全丢给用户，所以失败时
+卡片里会摆出：检查地址、返回内容、**按失败种类给的建议**、以及三个动作
+（重新检查 / 查看日志 / 改检查地址）。其中 `401/403` 专门解释成
+"该地址要求身份验证，服务本身很可能是正常的" —— 很多服务（Stirling PDF、
+Uptime Kuma 等）本就要求登录，这属于**检查地址选错了**，不是服务坏了。
+
 ### 服务日志
 
 用 SSE 实时推送。launchd 与命令驱动用"轮询文件增量"（简单、可取消、
@@ -745,6 +850,26 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 - 解压前扫描归档内条目，拒绝绝对路径与 `../`（zip-slip）
 - 写入用"临时文件 + rename"，中断不会留下半截文件
 - 新建文件归属真实用户（否则你在 Finder 里编辑会报权限错误）
+
+### 在线编辑器（代码高亮 + 两种全屏）
+
+文件管理器里的"编辑"用的是一个**带代码高亮**的编辑器：
+
+- **高亮**：按扩展名识别 `php` `js/mjs/cjs` `ts` `json` `go` `py` `sh/bash/zsh`
+  `yaml/yml` `html/htm` `css` `sql` `ini/conf/cnf` `md`；不认识的语言按纯文本。
+  着色覆盖注释/字符串/数字/关键字/函数名/类名（另按语言加变量、键名、标签、属性等）。
+- **实现方式**：一个 `<pre>` 放彩色高亮层，上面叠一个**文字透明、只留光标**的 `<textarea>`
+  负责真正的输入 —— textarea 是浏览器里行为最稳的输入控件，代价是两层必须逐像素对齐
+  （共用同一套字体/行高/内边距/透明边框，滚动用 `transform` 平移高亮层与行号层，
+  而不是同步 `scrollTop`：`<pre>` 隐藏滚动条后 `clientHeight` 比 textarea 大，滚到底会错位）。
+- **两种全屏**：「最大化」把弹窗撑满视口（`min(96vw,1600px)` / `92vh`，编辑区 `flex:1`）；
+  「屏幕全屏」调 Fullscreen API，`Esc` 退出后弹窗仍在。
+- **大文件保护**：超过 200KB 跳过高亮（纯文本显示）；<200KB 但 token 过密
+  （压缩/单行代码，>2 万）也退回纯文本并提示 —— 否则一个几 MB 的日志会把页面冻住。
+
+> 已知限制（如实说明）：200KB 判据按**字符数**而非 UTF-8 字节，中文文件字节超限但字符
+> 未超时仍会高亮；没有做可视区窗口化，所以 100–200KB 的文件输入时有几十毫秒级的
+> 重新分词开销（用 rAF 合并到一帧一次，不冻死也不掉字）。
 
 ### Web 终端
 

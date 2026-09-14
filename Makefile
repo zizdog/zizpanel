@@ -68,8 +68,8 @@ vet: ## 静态检查
 	go vet ./...
 
 .PHONY: test
-test: ## 运行全部单元测试
-	go test ./... -count=1
+test: ## 运行全部单元测试（含"不污染用户真实家目录"门禁）
+	@bash tools/check-test-pollution.sh
 
 .PHONY: jobs-test
 jobs-test: ## receiver.py 的 /jobs 验收（本地假上游，不需要 GPU）
@@ -90,10 +90,10 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@echo "==> shell 语法检查"
 	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh
+	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@echo "==> Python 工具语法检查"
 	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"

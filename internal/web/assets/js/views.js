@@ -594,6 +594,37 @@ export function SettingsView(content) {
       },
     });
 
+    // ---- 改用户名 ----
+    //
+    // 要当前密码：用户名是登录凭据的一半，审计里"谁做的"也记的是它。
+    // 成功后**原地更新侧边栏那一行**，不重渲染外壳 —— 重渲染会把设置页打回
+    // 第一个 Tab，用户会以为"改完把我踢走了"。
+    const newName = h('input.input', { value: user.username || '', placeholder: '新用户名（3-32 位字母数字 . _ - @）' });
+    const namePwd = h('input.input', { type: 'password', placeholder: '当前密码（确认身份）' });
+    const nameBtn = h('button.btn.btn-primary', {
+      text: '修改用户名',
+      onclick: async () => {
+        const v = newName.value.trim();
+        if (v === (user.username || '')) { toast('新用户名与当前相同', 'warn'); return; }
+        if (!namePwd.value) { toast('请输入当前密码以确认', 'warn'); namePwd.focus(); return; }
+        nameBtn.disabled = true;
+        try {
+          const res = await api.renameUser(v, namePwd.value);
+          const got = (res && res.username) || v;
+          if (state.session && state.session.user) state.session.user.username = got;
+          if (user) user.username = got;              // 同一对象，后续渲染也跟着变
+          const line = document.getElementById('sidebar-account');
+          if (line) line.textContent = '登录账号：' + got;
+          namePwd.value = '';
+          toast('用户名已改为 ' + got + '（登录时请用新名字）', 'ok', 8000);
+        } catch (e) {
+          toast(e.message, 'err', 9000);
+        } finally {
+          nameBtn.disabled = false;
+        }
+      },
+    });
+
     const totpBox = h('div');
     function renderTOTP() {
       clear(totpBox);
@@ -657,6 +688,20 @@ export function SettingsView(content) {
     try { sessions = (await api.sessions()).list || []; } catch { /* 忽略 */ }
 
     body.append(
+      h('div.card', [
+        h('div.card-head', [
+          h('h3', { text: '用户名' }),
+          h('div.spacer'),
+          h('span.sub', { text: '改名后登录用新用户名，当前会话不受影响' }),
+        ]),
+        h('div.card-body', [
+          h('div.row', [
+            h('div.field', [h('label', { text: '用户名' }), newName]),
+            h('div.field', [h('label', { text: '当前密码' }), namePwd]),
+          ]),
+          nameBtn,
+        ]),
+      ]),
       h('div.card', [
         h('div.card-head', [h('h3', { text: '修改密码' }), h('div.spacer'), h('span.sub', { text: '修改后所有登录会话立即失效' })]),
         h('div.card-body', [

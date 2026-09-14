@@ -35,6 +35,10 @@ var (
 	ErrUserNotFound       = errors.New("用户不存在")
 	ErrSessionInvalid     = errors.New("会话无效或已过期")
 	ErrWeakPassword       = errors.New("密码太短，至少 8 位")
+	ErrUsernameInvalid    = errors.New("用户名不合法：3-32 位，只能用字母、数字与 . _ - @")
+	ErrUsernameTaken      = errors.New("该用户名已被占用")
+	ErrUsernameSame       = errors.New("新用户名与当前相同")
+	ErrPasswordRequired   = errors.New("请输入当前密码以确认")
 )
 
 // User 是一个面板账号。
@@ -219,6 +223,69 @@ func (m *Manager) ChangePassword(ctx context.Context, userID int64, oldPwd, newP
 	_, _ = m.RevokeAll(ctx, userID)
 	return nil
 }
+
+// RenameUser 修改用户名，返回新名字。
+//
+// 为什么要**校验当前密码**：用户名就是登录凭据的一半，而且审计日志里"谁做了
+// 这件事"记的就是它。一个被劫持的会话不应该能悄悄把账号改成别人认不出来的名字
+// （那会让事后追查对不上人）。改密码都要求旧密码，改名同样要求。
+//
+// 为什么**不吊销会话**：会话表是按 user_id 关联的（见 sessions 表定义），
+// 改名不影响登录态。强制重新登录只会让用户以为出问题了。
+func (m *Manager) RenameUser(ctx context.Context, userID int64, newName, currentPwd string) (string, error) {
+	u, err := m.UserByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	newName = strings.TrimSpace(newName)
+	if newName == u.Username {
+		return "", ErrUsernameSame
+	}
+	if err := ValidateUsername(newName); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(currentPwd) == "" {
+		return "", ErrPasswordRequired
+	}
+	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(currentPwd)) != nil {
+		return "", ErrInvalidCredentials
+	}
+	// 唯一性先自己查一次，好给出人话；UNIQUE 约束仍会在并发下兜底。
+	var n int
+	if err := m.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM users WHERE username = ?`, newName).Scan(&n); err == nil && n > 0 {
+		return "", ErrUsernameTaken
+	}
+	if _, err := m.st.DB().ExecContext(ctx,
+		`UPDATE users SET username=?, updated_at=datetime('now','localtime') WHERE id=?`,
+		newName, userID); err != nil {
+		return "", err
+	}
+	m.auditRename(ctx, u.Username, newName)
+	return newName, nil
+}
+
+// ValidateUsername 校验用户名格式。导出是为了让 web 层能在改名前先做一次同样的校验
+// （少一次"提交了才报错"的往返）。
+func ValidateUsername(name string) error {
+	name = strings.TrimSpace(name)
+	if len(name) < 3 || len(name) > 32 {
+		return ErrUsernameInvalid
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-', r == '@':
+		default:
+			return ErrUsernameInvalid
+		}
+	}
+	return nil
+}
+
+// auditRename 是给审计留的钩子：auth 包不依赖 web 包，所以这里只是空实现，
+// 真正的审计由 web 层的调用方在成功后写入（见 handleRenameUser）。
+func (m *Manager) auditRename(ctx context.Context, oldName, newName string) {}
 
 // SetPassword 直接重设密码（管理员操作，不校验旧密码）。
 func (m *Manager) SetPassword(ctx context.Context, userID int64, newPwd string) error {

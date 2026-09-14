@@ -440,6 +440,14 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// Available 表示当前环境能否安装（缺 Docker 的 compose 应用为 false）
 		Available bool   `json:"available"`
 		Note      string `json:"note"`
+		// Artifacts 表示"磁盘上有安装产物"（面板自研安装器的应用才有意义）。
+		// 与 Installed 分开是为了区分「没装」和「装了但服务没注册」——
+		// 后者要给的是「重新部署」而不是「安装」。
+		Artifacts bool `json:"artifacts"`
+		// ServiceInLaunchd 表示这个应用的服务此刻真的能在 launchd 里找到。
+		// 「纳管」按钮必须以此为准：plist 不存在时点纳管必然报
+		// "找不到 xxx 的 plist，且该服务未在 launchd 中加载"。
+		ServiceInLaunchd bool `json:"service_in_launchd"`
 	}
 	apps := services.Catalog()
 	out := make([]item, 0, len(apps))
@@ -450,30 +458,62 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 而不是它是否被 brew 装过。少了这一条，已经纳管过的服务
 		// 在市场里仍然显示「接入纳管」按钮，点下去还报"已经纳管过了"——
 		// 状态和入口自相矛盾。
-		isInstalled := installed[a.ID] || installed[a.Name]
-		if !isInstalled && a.AdoptLabel != "" {
-			isInstalled = installed[a.AdoptLabel]
+		// brew 类应用的真实 launchd 标签必须**按磁盘上的 plist 推**，不能信目录里
+		// 写死的 homebrew.mxcl.*：实测同一台机器上 sh.brew.php@8.3 与
+		// homebrew.mxcl.httpd 两套前缀并存。用错标签的后果就是用户看到的
+		// "PHP 8.3 显示已安装·未纳管，点纳管报找不到 plist"。
+		realLabel := ""
+		if a.BrewFormula != "" {
+			realLabel = services.BrewLabelFor(s.Cfg.UserHome, a.BrewFormula)
 		}
-		// 面板自研安装器部署的系统级服务：面板记录里有该 label，
-		// 或者 /Library/LaunchDaemons 下有对应 plist，都算已安装。
-		if !isInstalled && a.ServiceLabel != "" {
-			isInstalled = installed[a.ServiceLabel]
-			if !isInstalled {
-				if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", a.ServiceLabel+".plist")); err == nil {
+		// 三个候选标签都要认：目录写死的、显式纳管用的、磁盘推出来的
+		cand := []string{a.ServiceLabel, a.AdoptLabel, realLabel}
+
+		isInstalled := installed[a.ID] || installed[a.Name]
+		for _, l := range cand {
+			if !isInstalled && l != "" {
+				isInstalled = installed[l]
+			}
+		}
+		// 面板自研安装器部署的系统级服务：/Library/LaunchDaemons 下有 plist 也算
+		if !isInstalled {
+			for _, l := range cand {
+				if l == "" {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", l+".plist")); err == nil {
 					isInstalled = true
+					break
 				}
 			}
 		}
 		if !isInstalled && a.BrewFormula != "" {
 			isInstalled = brewSet[a.BrewFormula]
 		}
-		// 纳管的判据：目录里的 label 是否已在面板记录里
-		adopted := false
-		if a.ServiceLabel != "" && installed[a.ServiceLabel] {
-			adopted = true
+		// 面板自研安装器：磁盘上有产物也算"已安装"（否则孤儿态会显示成"未安装"）
+		artifacts := false
+		if a.PanelInstaller != "" {
+			artifacts = services.InstallerArtifactExists(s.Cfg.UserHome, a.PanelInstaller)
+			if artifacts {
+				isInstalled = true
+			}
 		}
-		if !adopted && a.AdoptLabel != "" && installed[a.AdoptLabel] {
-			adopted = true
+		// 服务此刻是否真在 launchd 里（决定能不能"纳管"）
+		serviceInLaunchd := false
+		for _, l := range cand {
+			if l != "" && adoptTargetExists(s.Cfg.UserHome, l) {
+				serviceInLaunchd = true
+				break
+			}
+		}
+
+		// 纳管的判据：任一候选标签已在面板记录里
+		adopted := false
+		for _, l := range cand {
+			if l != "" && installed[l] {
+				adopted = true
+				break
+			}
 		}
 		// compose / docker 应用没有 ServiceLabel：它们由面板直接以应用 ID
 		// 登记进服务管理。少了这条判断，刚装好的应用会显示成
@@ -483,7 +523,13 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if !adopted && (installed[a.ID] || installed[a.Name]) {
 			adopted = true
 		}
-		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true}
+		// 纳管按钮拿的是 item 里的 service_label，所以这里替换成磁盘上真实的那个；
+		// 不然"显示已纳管/未纳管"修好了，"点纳管"照样会失败。
+		if realLabel != "" {
+			a.ServiceLabel = realLabel
+		}
+		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
+			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd}
 		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
 			if dockerSock == "" {
 				it.Available = false

@@ -42,10 +42,17 @@ export function ServicesView(content, ctx = {}) {
       { id: 'running', label: '运行中' },
       { id: 'stopped', label: '已停止' },
       { id: 'problem', label: '异常' },
+      { id: 'unhealthy', label: '仅健康检查失败' },
     ];
     appendAll(toolbarBox, 
       h('span.pill' + (running > 0 ? '.ok' : ''), { text: `${running}/${list.length} 运行中` }),
-      unhealthy > 0 ? h('span.pill.danger', { text: `${unhealthy} 个健康检查失败` }) : null,
+      // 做成可点的：用户看到"有失败"的第一反应是"哪些？怎么办？"，
+      // 所以点它直接筛出失败的服务（卡片里还有具体原因与下一步）。
+      unhealthy > 0 ? h('button.btn.btn-sm.btn-danger', {
+        text: `⚠ ${unhealthy} 个健康检查失败`,
+        title: '点这里只看失败的服务',
+        onclick: () => { filter = 'unhealthy'; renderToolbar(); renderCards(); },
+      }) : null,
       h('div', { style: { display: 'flex', gap: '4px' } }, filters.map((f) =>
         h(`button.btn.btn-sm${filter === f.id ? '.btn-primary' : ''}`, {
           text: f.label,
@@ -89,6 +96,43 @@ export function ServicesView(content, ctx = {}) {
     return { cls: '', text: '已停止' };
   }
 
+  /**
+   * healthHint 把"健康检查失败"翻译成"大概是什么问题、该怎么办"。
+   *
+   * 用户的原话是：看到"1 个健康检查失败"这个提示，不知道接下来该做什么。
+   * 光给一个红标签等于把排查工作全丢给用户。这里按**失败的种类**给出最可能的
+   * 原因与下一步动作 —— 尤其是 401：很多服务（Stirling PDF、Uptime Kuma 等）
+   * 首页/根路径本来就要求登录，401 其实说明它是好的，是**检查地址选错了**。
+   */
+  function healthHint(health) {
+    const code = Number(health.code || 0);
+    const msg = String(health.message || '');
+    if (code === 401 || code === 403) {
+      return '该地址要求身份验证，服务本身很可能是正常的。'
+        + '建议把「健康检查地址」改成不需要登录的路径（常见：/healthz、/api/health、/ping），'
+        + '或在「期望包含内容」留空、只看状态码。';
+    }
+    if (code === 404) {
+      return '地址存在但路径不对（404）。确认健康检查地址写的是这个服务真实提供的路径。';
+    }
+    if (code >= 500) {
+      return '服务自己返回了错误（5xx）。先看它的日志，通常是配置或依赖问题。';
+    }
+    if (/timeout|超时/i.test(msg)) {
+      return '响应超时：服务可能很忙或卡住了。看日志确认它是否在正常处理请求；'
+        + '如果是大应用，也可以把检查地址换成更轻量的路径。';
+    }
+    if (/refused|拒绝|无法连接|connect/i.test(msg)) {
+      return '连不上：服务没在监听这个地址。确认它已启动、端口写对了，'
+        + '以及它监听的是 127.0.0.1 还是 0.0.0.0（面板与服务的网络位置不同会影响）。';
+    }
+    if (/期望|包含|expect/i.test(msg)) {
+      return '响应里没有「期望包含内容」。可能是被重定向到了登录页，或该路径返回的是别的页面；'
+        + '建议把期望内容清空，只校验状态码。';
+    }
+    return '检查未通过。可以先看服务日志；若服务其实正常，多半是检查地址或期望内容选得不合适。';
+  }
+
   function matchesFilter(s) {
     if (filter === 'all') return true;
     const st = s.state || {};
@@ -97,6 +141,9 @@ export function ServicesView(content, ctx = {}) {
     if (filter === 'problem') {
       return st.status === 'error' || st.status === 'unavailable' ||
         (s.health && s.health.checked && !s.health.ok);
+    }
+    if (filter === 'unhealthy') {
+      return !!(s.health && s.health.checked && !s.health.ok);
     }
     return true;
   }
@@ -172,6 +219,23 @@ export function ServicesView(content, ctx = {}) {
         s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
       ]),
 
+      // 健康检查失败：把"是什么、为什么、怎么办"都摆出来
+      (health.checked && !health.ok) ? h('div', {
+        style: {
+          background: 'var(--panel)', border: '1px solid var(--danger, #d9534f)',
+          borderRadius: '8px', padding: '10px 12px', display: 'grid', gap: '6px',
+        },
+      }, [
+        h('div', { style: { fontSize: '12.5px', fontWeight: '620' }, text: '健康检查失败：' + (health.message || '未知原因') }),
+        h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', wordBreak: 'break-all' }, text: '检查地址：' + (health.url || '（未配置）') }),
+        h('div', { style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.6' }, text: healthHint(health) }),
+        h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+          h('button.btn.btn-sm.btn-primary', { text: '重新检查', onclick: () => recheckHealth(s) }),
+          h('button.btn.btn-sm', { text: '查看日志', onclick: () => openLogs(s) }),
+          h('button.btn.btn-sm', { text: '改检查地址', onclick: () => newServiceModal(load, s) }),
+        ]),
+      ]) : null,
+
       // 状态详情
       state.detail ? h('div', {
         style: { fontSize: '11.5px', color: 'var(--text-mute)', lineHeight: '1.5' },
@@ -189,6 +253,35 @@ export function ServicesView(content, ctx = {}) {
         h('button.btn.btn-sm', { text: '详情', onclick: () => openDetail(s) }),
       ]),
     ]);
+  }
+
+  // recheckHealth 重查单个服务的健康状态。
+  //
+  // 只请求这一个服务（GET /services/{name} 会带上最新的 health），
+  // 然后原地更新列表里的那一条并重画 —— 不整页重载，因为整页要重新
+  // 查询所有服务（含 colima/compose 这类偏慢的），而用户此刻只关心这一个。
+  async function recheckHealth(s) {
+    const t = toast(`正在重新检查「${s.display_name || s.name}」…`, 'info', 0);
+    try {
+      const fresh = await api.service(s.name);
+      const list = (cache && cache.list) || [];
+      const i = list.findIndex((x) => x.name === s.name);
+      if (i >= 0) list[i] = fresh;
+      t.remove();
+      const hl = fresh.health || {};
+      if (!hl.checked) {
+        toast('该服务没有配置健康检查地址', 'warn', 8000);
+      } else if (hl.ok) {
+        toast(`「${fresh.display_name || s.name}」健康检查已通过`, 'ok');
+      } else {
+        toast(`仍然失败：${hl.message || '未知原因'}`, 'warn', 9000);
+      }
+      renderToolbar();
+      renderCards();
+    } catch (e) {
+      t.remove();
+      toast('重新检查失败：' + e.message, 'err', 9000);
+    }
   }
 
   async function act(s, action) {
@@ -298,6 +391,9 @@ export function ServicesView(content, ctx = {}) {
       ['运行状态', state.status + (state.detail ? '（' + state.detail + '）' : '')],
       ['进程 PID', state.pid || '—'],
       ['健康检查', health.checked ? (health.ok ? '正常' : '失败') + '：' + health.message : '未配置'],
+      ['检查地址', health.url || '—'],
+      // 详情里同样给出"怎么办"，否则用户点进详情还是只有一个"失败"
+      ...(health.checked && !health.ok ? [['建议', healthHint(health)]] : []),
       ['访问地址', state.endpoint || '—'],
     ];
     if (cur.launch_label) rows.push(['launchd 标签', cur.launch_label]);
