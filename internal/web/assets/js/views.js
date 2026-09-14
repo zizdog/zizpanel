@@ -92,21 +92,65 @@ export function DashboardView(content, ctx = {}) {
     ]),
   ]);
 
-  // ---------- 待接入服务（服务管理在 P3 交付） ----------
+  // ---------- 服务状态 ----------
+  //
+  // 这里原先是一张"此模块正在开发中"的占位卡（P3 之前留下的）。
+  // 服务管理早已交付，那张卡就变成了**误导**：仪表盘告诉用户功能没做，
+  // 而侧边栏里它就在那儿可用。现在改成真实的服务概览。
+  const svcBody = h('div.card-body.tight');
   const servicesCard = h('div.card', [
     h('div.card-head', [
       h('h3', { text: '服务状态' }),
       h('div.spacer'),
-      h('span.sub', { text: '服务管理模块将在 P3 提供完整启停与日志' }),
+      h('button.btn.btn-ghost.btn-sm', {
+        text: '服务管理', onclick: () => go('services'),
+      }),
     ]),
-    h('div.card-body', [
-      h('div.empty', [
-        h('div.big', { text: '⚙️' }),
-        h('h4', { text: '此模块正在开发中' }),
-        h('p', { text: '当前可先用系统监控查看进程与资源占用。' }),
-      ]),
-    ]),
+    svcBody,
   ]);
+
+  async function loadServices() {
+    clear(svcBody);
+    svcBody.append(h('div.empty', [h('p', { text: '加载中…' })]));
+    let list = [];
+    try {
+      const res = await api.services(false);
+      list = (res && res.list) || [];
+    } catch (e) {
+      clear(svcBody);
+      svcBody.append(h('div.empty', [h('p', { text: '读取服务列表失败：' + e.message })]));
+      return;
+    }
+    clear(svcBody);
+    if (!list.length) {
+      svcBody.append(h('div.empty', [
+        h('div.big', { text: '⚙️' }),
+        h('p', { text: '还没有登记服务，可到「应用市场」安装，或在「服务管理」里纳管本机已有服务。' }),
+      ]));
+      return;
+    }
+    const running = list.filter((s) => (s.state || {}).running).length;
+    const rows = list.slice(0, 6).map((s) => {
+      const st = s.state || {};
+      return h('tr', [
+        h('td', [
+          h('span', { text: (s.icon || '') + ' ' }),
+          h('span', { text: s.display_name || s.name }),
+        ]),
+        h('td', [h(st.running ? 'span.pill.ok' : 'span.pill.warn', { text: st.status || 'unknown' })]),
+        h('td.mono', { text: s.port ? String(s.port) : '—' }),
+      ]);
+    });
+    if (list.length > rows.length) {
+      rows.push(h('tr', [h('td', { colspan: 3 }, [
+        h('span.hint', { text: `另有 ${list.length - rows.length} 个服务，见「服务管理」` }),
+      ])]));
+    }
+    svcBody.append(
+      h('div.hint', { style: { marginBottom: '6px' }, text: `${running}/${list.length} 个服务运行中` }),
+      h('table.table', [h('tbody', rows)]),
+    );
+  }
 
   content.append(
     topGrid,
@@ -115,7 +159,9 @@ export function DashboardView(content, ctx = {}) {
     servicesCard,
   );
 
-  // ---------- 数据更新 ----------
+  // ---------- 服务状态与数据更新 ----------
+  loadServices();
+
   function update(s) {
     state.metrics = s;
 

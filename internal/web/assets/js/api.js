@@ -106,7 +106,17 @@ export const api = {
   systemInfo: () => request('GET', `${API_BASE}/system/info`),
   processes: (sort = 'cpu', limit = 12) =>
     request('GET', `${API_BASE}/system/processes?sort=${sort}&limit=${limit}`),
+  // 审计：列表（带检索与游标分页）、筛选项、导出。
+  // audit() 保留原样给仪表盘用（它只关心最近的记录）。
   audit: (limit = 60) => request('GET', `${API_BASE}/audit?limit=${limit}`),
+  auditQuery: (params = {}) => {
+    const p = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') p.set(k, String(v));
+    });
+    return request('GET', `${API_BASE}/audit?${p.toString()}`);
+  },
+  auditFacets: () => request('GET', `${API_BASE}/audit/facets`),
   getSettings: () => request('GET', `${API_BASE}/settings`),
 
   // ---- 在线升级 ----

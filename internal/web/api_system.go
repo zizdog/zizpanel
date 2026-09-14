@@ -128,48 +128,6 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"list": out, "sort": sortBy})
 }
 
-// handleAudit 返回最近的操作审计记录。
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
-	limit := 100
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
-	}
-	rows, err := s.Store.DB().QueryContext(r.Context(),
-		`SELECT ts,actor,ip,action,target,detail,ok,message FROM audit_logs
-		 ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		fail(w, http.StatusInternalServerError, "读取审计日志失败")
-		return
-	}
-	defer rows.Close()
-	type entry struct {
-		Ts     string `json:"ts"`
-		Actor  string `json:"actor"`
-		IP     string `json:"ip"`
-		Action string `json:"action"`
-		Target string `json:"target"`
-		Detail string `json:"detail"`
-		OK     bool   `json:"ok"`
-		Msg    string `json:"message"`
-	}
-	var list []entry
-	for rows.Next() {
-		var e entry
-		var okInt int
-		if err := rows.Scan(&e.Ts, &e.Actor, &e.IP, &e.Action, &e.Target, &e.Detail, &okInt, &e.Msg); err != nil {
-			continue
-		}
-		e.OK = okInt == 1
-		list = append(list, e)
-	}
-	if list == nil {
-		list = []entry{}
-	}
-	ok(w, map[string]any{"list": list})
-}
-
 // audit 写一条审计记录。失败不影响主流程。
 func (s *Server) audit(r *http.Request, action, target, detail string, success bool, msg string) {
 	actor := ""

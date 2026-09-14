@@ -175,6 +175,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     message  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts);
+-- 审计页按 action 做精确筛选（下拉框），单列索引比全表扫划算
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);
 
 -- 键值设置（面板自身可调项）
 CREATE TABLE IF NOT EXISTS settings (

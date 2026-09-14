@@ -5,7 +5,7 @@
 
 import { api, ApiError } from './api.js';
 import { h, clear, toast, $, modal, bytes, duration, esc } from './ui.js';
-import { DashboardView, MonitorView, SettingsView, ComingSoonView } from './views.js';
+import { DashboardView, MonitorView, SettingsView } from './views.js';
 import { SitesView } from './sites.js';
 import { ServicesView } from './services.js';
 import { AppsView } from './apps.js';
@@ -15,6 +15,7 @@ import { CronView } from './cron.js';
 import { LogsView } from './logs.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
+import { AuditView } from './audit.js';
 
 // ---------------- 全局状态 ----------------
 export const state = {
@@ -42,7 +43,7 @@ export const NAV = [
   { id: 'cron', title: '计划任务', icon: '⏰', view: CronView },
   { id: 'logs', title: '日志中心', icon: '📜', view: LogsView },
   { group: '系统' },
-  { id: 'audit', title: '操作审计', icon: '🧾', view: ComingSoonView, phase: 'P1' },
+  { id: 'audit', title: '操作审计', icon: '🧾', view: AuditView },
   { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
 ];
 

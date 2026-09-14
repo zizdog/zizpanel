@@ -263,17 +263,27 @@ try {
     await page.waitForTimeout(800);
   });
 
-  await step('导航项全部为真实模块', async () => {
-    // P4 完成后已无占位页：遍历侧边栏，确认每一项都能打开且不是"正在开发中"
+  await step('导航项全部为真实模块（不再有占位页）', async () => {
+    // 这一段以前只点了「数据库」一项，注释却写着"遍历侧边栏" —— 名不副实。
+    // 现在真的逐项点开：占位页全部替换完了，这条断言才真正有保障。
     const items = await page.locator('.nav-item').allInnerTexts();
     if (items.length < 8) throw new Error('侧边栏导航项过少: ' + items.length);
-    await page.click('.nav-item:has-text("数据库")');
-    await page.waitForTimeout(2500);
-    await shot('08-database');
-    const txt = await page.locator('.content').innerText();
-    if (txt.includes('正在开发中')) {
-      throw new Error('数据库模块仍是占位页: ' + items.join(' / '));
+
+    const navItems = page.locator('.nav-item');
+    const n = await navItems.count();
+    const placeholders = [];
+    for (let i = 0; i < n; i++) {
+      const label = (await navItems.nth(i).innerText()).trim();
+      if (!label) continue;
+      await navItems.nth(i).click();
+      await page.waitForTimeout(1100);
+      const txt = await page.locator('.content').innerText();
+      if (txt.includes('正在开发中')) placeholders.push(label);
     }
+    if (placeholders.length) {
+      throw new Error('仍有占位页: ' + placeholders.join(' / '));
+    }
+    await shot('08-nav-all-real');
   });
 
   // ---------- 网站管理（P2）----------
@@ -749,6 +759,49 @@ try {
     const txt = await page.locator('.content').innerText();
     if (!txt.includes('未启用') && !txt.includes('已连接') && !txt.includes('会话')) {
       throw new Error('终端页未正确渲染: ' + txt.slice(0, 120));
+    }
+  });
+
+  // ---------- 操作审计（P1）----------
+  await step('操作审计页：筛选、加载更多、导出入口', async () => {
+    await page.click('.nav-item:has-text("操作审计")');
+    await page.waitForSelector('.card-head h3:has-text("操作审计")', { timeout: 15000 });
+    await page.waitForTimeout(2000);
+    await shot('53-audit');
+
+    const body = await page.locator('.content').innerText();
+    if (!body.includes('共 ') && !body.includes('没有符合条件')) {
+      throw new Error('审计页没有渲染出结果概要: ' + body.slice(0, 160));
+    }
+    if (/(^|\s)(null|undefined)(\s|$)/.test(body)) {
+      throw new Error('审计页出现字面量 null/undefined: ' + body.slice(0, 200));
+    }
+
+    // 关键词筛选：搜 login，结果里应只剩 login 动作
+    if (body.includes('没有符合条件') === false) {
+      await page.fill('input[placeholder^="关键词"]', 'login');
+      await page.click('button:has-text("查询")');
+      await page.waitForTimeout(1800);
+      const filtered = await page.locator('.content').innerText();
+      if (!filtered.includes('login')) {
+        throw new Error('关键词筛选后没有出现 login: ' + filtered.slice(0, 200));
+      }
+      await shot('54-audit-filtered');
+
+      // 重置应恢复（不残留筛选）
+      await page.click('button:has-text("重置")');
+      await page.waitForTimeout(1500);
+      const reset = await page.locator('.content').innerText();
+      if (!reset.includes('共 ')) {
+        throw new Error('重置后应仍有结果概要: ' + reset.slice(0, 160));
+      }
+    }
+
+    // 导出入口存在（不实际下载，避免测试里产生文件）
+    for (const label of ['导出 CSV', '导出 JSON']) {
+      if (!(await page.locator(`button:has-text("${label}")`).count())) {
+        throw new Error('缺少导出按钮: ' + label);
+      }
     }
   });
 
