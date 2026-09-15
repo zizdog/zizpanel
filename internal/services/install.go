@@ -127,16 +127,25 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	env := m.brewEnv()
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 && m.opt.UserName != "" {
-		full := append([]string{"-n", "-u", m.opt.UserName, m.opt.BrewBin}, args...)
+		// 注意： sudo 默认会**清空环境**（env_reset），所以镜像变量不能只放在
+		// 进程环境里 —— 必须显式用 `env` 在命令里带上，否则等于没设。
+		full := append([]string{"-n", "-u", m.opt.UserName, "/usr/bin/env"}, env...)
+		full = append(full, m.opt.BrewBin)
+		full = append(full, args...)
 		cmd = exec.CommandContext(ctx, "/usr/bin/sudo", full...)
 	} else {
 		cmd = exec.CommandContext(ctx, m.opt.BrewBin, args...)
+		cmd.Env = append(os.Environ(), env...)
 	}
 	// brew 需要正确的 HOME 才能找到 Cellar 与缓存
 	if m.opt.UserHome != "" {
-		cmd.Env = append(os.Environ(), "HOME="+m.opt.UserHome)
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, "HOME="+m.opt.UserHome)
 	}
 	// 逐行流式：brew install 的下载/解压进度因此能实时出现在任务中心，
 	// 而不是等命令跑完才一次性看到。
@@ -146,6 +155,34 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 			truncate(strings.TrimSpace(text), 500))
 	}
 	return text, nil
+}
+
+// brewEnv 返回跑 brew 时要注入的环境变量。
+//
+// 为什么必须显式注入：install.sh 只把镜像写进用户 shell 的 rc 文件，而**面板是
+// LaunchDaemon（root）**，那里面读不到用户的 rc —— 于是面板装 nginx/PHP/MySQL 时
+// brew 仍然走官方源（formulae.brew.sh / ghcr.io）。国内无代理时那条路基本不通，
+// 表现是"点安装后长时间没进度"，而且看起来像面板卡死。
+//
+// 默认用阿里云的 API/瓶源（国内实测 0.17s 响应）；已经设过的以用户设置为准
+// （尊重用户自己的镜像选择，不覆盖）。
+func (m *Manager) brewEnv() []string {
+	pick := func(key, def string) string {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+		return def
+	}
+	return []string{
+		"HOMEBREW_API_DOMAIN=" + pick("HOMEBREW_API_DOMAIN",
+			"https://mirrors.aliyun.com/homebrew/homebrew-bottles/api"),
+		"HOMEBREW_BOTTLE_DOMAIN=" + pick("HOMEBREW_BOTTLE_DOMAIN",
+			"https://mirrors.aliyun.com/homebrew/homebrew-bottles"),
+		// 自动更新会在每次 brew 命令前拉一遍仓库元数据：国内很慢，而且我们
+		// 不需要它（面板自己管安装）。
+		"HOMEBREW_NO_AUTO_UPDATE=1",
+		"HOMEBREW_NO_INSTALL_CLEANUP=1",
+	}
 }
 
 // installViaBrew 用 Homebrew 安装原生服务。

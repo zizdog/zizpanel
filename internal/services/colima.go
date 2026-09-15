@@ -499,7 +499,10 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 	}
 	if len(need) > 0 {
 		args := append([]string{"install"}, need...)
-		if _, err := m.runAsUser(ctx, 15*time.Minute, m.opt.BrewBin, args...); err != nil {
+		// 走 brewRun 而不是 runAsUser：它会注入国内镜像环境
+		// （HOMEBREW_API_DOMAIN/BOTTLE_DOMAIN）—— 面板是 LaunchDaemon，读不到
+		// 用户 shell 里的那些变量，不注入就只有官方源可用。
+		if _, err := m.brewRun(ctx, 15*time.Minute, args...); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", strings.Join(need, " "), err)
 		}
 		result.step(ctx, "已安装 "+strings.Join(need, "、"))

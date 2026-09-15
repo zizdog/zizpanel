@@ -14,6 +14,12 @@
 #     ZIZPANEL_SKIP_DEPS=1      跳过 Homebrew 依赖安装
 #     ZIZPANEL_SKIP_FIREWALL=1  跳过防火墙处理
 #
+# 国内网络：默认从 GitHub Releases 下载；**不通时会自动改用内置镜像**（见下）。
+#
+# 国内网络：默认从 GitHub Releases 下载。若直连很慢/不通，用自建镜像：
+#     curl -fsSL https://zizdog.com/zizpanel/install.sh | \
+#       sudo bash -s -- --download-base https://zizdog.com/zizpanel
+#
 #  设计要点：
 #   1. 幂等：重复执行不会破坏已有数据与配置，会保留 panel.db 与 config.json
 #   2. 可离线：若同目录存在 dist/zizpanel 则直接本地安装，不走网络
@@ -31,6 +37,12 @@ PANEL_PATH="${ZIZPANEL_PANEL_PATH:-/_panel}"
 ZIZPANEL_VERSION="${ZIZPANEL_VERSION:-latest}"
 # 下载源：默认 GitHub Releases；可换成自己的服务器
 ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE:-https://github.com/zizdog/zizpanel/releases}"
+# BUILTIN_MIRROR 是内置的国内镜像（同一个项目的自建源）。
+#
+# 为什么要有它：中国大陆无代理时 GitHub Release **完全不通**（2026-09 实测：
+# 20 秒 0 字节），而"从 GitHub 下载"和"从源码构建"两条路都绕不开 GitHub。
+# 有了它，用户只要能从任意一个地方拿到 install.sh，安装就能自动完成。
+BUILTIN_MIRROR="${ZIZPANEL_BUILTIN_MIRROR:-https://zizdog.com/zizpanel}"
 # 服务器模式：安装面板的同时把系统配置成适合长期无人值守运行
 # 可通过 --server-mode 参数或 ZIZPANEL_SERVER_MODE=1 开启
 ZIZPANEL_SERVER_MODE="${ZIZPANEL_SERVER_MODE:-0}"
@@ -163,10 +175,28 @@ detect_source() {
   done
 
   # 2) 联网下载预编译包
-  if curl -fsSI --max-time 10 "$ZIZPANEL_DOWNLOAD_BASE" >/dev/null 2>&1; then
-    SOURCE_KIND="download"
-    return 0
-  fi
+  #
+  # 注意：这里探的是**真实的 tarball 地址**，不是目录 —— 目录 HEAD 在 nginx 下
+  # 常常 403，会造成"明明镜像可用却判定不可达"。而且必须**逐个候选源都试一遍**：
+  # 官方不通时直接走"源码构建"是错的（普通用户机器上根本没有 Go 工具链），
+  # 正确做法是接着试内置镜像。
+  local arch="arm64" base
+  [ "$(uname -m)" = "x86_64" ] && arch="amd64"
+  for base in "$ZIZPANEL_DOWNLOAD_BASE" "$BUILTIN_MIRROR"; do
+    [ -n "$base" ] || continue
+    base="${base%/}"
+    if curl -fsSI --max-time 10 \
+        "$base/download/$ZIZPANEL_VERSION/zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz" \
+        >/dev/null 2>&1; then
+      if [ "$base" != "${ZIZPANEL_DOWNLOAD_BASE%/}" ]; then
+        warn "官方源不可达，改用内置镜像：$base"
+      fi
+      ZIZPANEL_DOWNLOAD_BASE="$base"
+      SOURCE_KIND="download"
+      return 0
+    fi
+  done
+  warn "下载源都不可达（官方与内置镜像），尝试从源码构建"
 
   # 3) 用 Go 从源码构建
   if command -v go >/dev/null 2>&1; then
@@ -190,7 +220,18 @@ download_binaries() {
 
   info "下载：$url"
   if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
-    die "下载失败。请检查网络，或改用离线安装（把 dist/ 与 install.sh 放在同一目录）"
+    # 自动退到内置镜像：用户不必知道镜像地址，curl 一条命令就行
+    if [ "$ZIZPANEL_DOWNLOAD_BASE" != "$BUILTIN_MIRROR" ]; then
+      warn "从 $ZIZPANEL_DOWNLOAD_BASE 下载失败，改用内置镜像重试"
+      url="$BUILTIN_MIRROR/download/$ZIZPANEL_VERSION/$file"
+      info "下载：$url"
+      if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
+        die "下载失败（官方与内置镜像都不通）。可改用离线安装：把 dist/ 与 install.sh 放在同一目录"
+      fi
+      ZIZPANEL_DOWNLOAD_BASE="$BUILTIN_MIRROR"
+    else
+      die "下载失败。请检查网络，或改用离线安装（把 dist/ 与 install.sh 放在同一目录）"
+    fi
   fi
   if ! tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"; then
     die "安装包解压失败，文件可能不完整"
@@ -1159,6 +1200,16 @@ parse_args() {
       --listen)
         shift
         ZIZPANEL_LISTEN="${1:-:8443}"
+        ;;
+      --download-base|--mirror)
+        # 国内直连 GitHub Releases 经常很慢甚至不通，所以升级/安装都要能指向自建镜像。
+        # 用法：curl -fsSL <镜像>/install.sh | sudo bash -s -- --download-base <镜像>
+        shift
+        ZIZPANEL_DOWNLOAD_BASE="${1:-}"
+        if [ -z "$ZIZPANEL_DOWNLOAD_BASE" ]; then
+          die "--download-base 后面要跟地址，例如 https://zizdog.com/zizpanel"
+        fi
+        ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE%/}"
         ;;
       -h|--help)
         sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'

@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -123,6 +126,42 @@ const (
 var gitHubReleaseMirrors = []string{
 	"https://ghfast.top/",
 	"https://gh-proxy.com/",
+}
+
+// orderBySpeed 按实测速度把候选地址从快到慢排序（速度 <=0 的排最后，保持原相对顺序）。
+//
+// 为什么要先探测：中国大陆无代理时 GitHub Release **完全不通**（实测 20 秒 0 字节），
+// 而官方地址排第一 + `--max-time 150` 意味着每个应用都先白等 150 秒。
+// 探测一次只要几秒，之后直接下最快的那个 —— 有代理/直连快的用户也不会被拖慢。
+func orderBySpeed(urls []string, speeds []int64) []string {
+	type item struct {
+		url   string
+		speed int64
+		idx   int
+	}
+	items := make([]item, 0, len(urls))
+	for i, u := range urls {
+		sp := int64(0)
+		if i < len(speeds) {
+			sp = speeds[i]
+		}
+		items = append(items, item{url: u, speed: sp, idx: i})
+	}
+	sort.SliceStable(items, func(a, b int) bool {
+		// 有速度的都排在没速度的前面；同速按原始顺序（官方优先）
+		if (items[a].speed > 0) != (items[b].speed > 0) {
+			return items[a].speed > 0
+		}
+		if items[a].speed != items[b].speed {
+			return items[a].speed > items[b].speed
+		}
+		return items[a].idx < items[b].idx
+	})
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.url)
+	}
+	return out
 }
 
 // releaseBinaryApps 是被本安装器服务的应用表。
@@ -533,7 +572,7 @@ func (m *Manager) downloadReleaseBinary(ctx context.Context, spec releaseBinaryA
 
 	// 已经有解压好的二进制时也要重下：升级/修复都走同一条路，
 	// 而"文件存在就跳过"会让用户永远修不好一个坏掉的二进制。
-	urls := spec.downloadURLs()
+	urls := m.orderDownloadURLs(ctx, spec, result)
 	// 先下到 .part 再改名：这样失败时**不会**破坏用户自己放进来的产物
 	// （下面"全部失败就看磁盘上有没有现成文件"那条退路要靠它成立）。
 	tmp := p.Asset + ".part"
@@ -1021,6 +1060,46 @@ func max64(a float64, b float64) float64 {
 func IsReleaseBinaryApp(id string) bool {
 	_, ok := releaseBinaryApps[id]
 	return ok
+}
+
+// orderDownloadURLs 先量一下各候选源的速度，再按快慢排序。
+//
+// 探测本身失败/超时都只当"这个源不可用"（速度 0），不会让安装失败。
+func (m *Manager) orderDownloadURLs(ctx context.Context, spec releaseBinaryApp,
+	result *InstallResult) []string {
+	urls := spec.downloadURLs()
+	if len(urls) < 2 {
+		return urls
+	}
+	// 只探前 256KB，6 秒上限：足够区分"通/不通/慢/快"，又不会把安装拖长
+	probeArgs := func(u string) []string {
+		return []string{"-sL", "-r", "0-262143", "--max-time", "6",
+			"-o", "/dev/null", "-w", "%{speed_download}", u}
+	}
+	speeds := make([]int64, 0, len(urls))
+	desc := make([]string, 0, len(urls))
+	for _, u := range urls {
+		out, err := m.runAsUser(ctx, 20*time.Second, "/usr/bin/curl", probeArgs(u)...)
+		sp := int64(0)
+		if err == nil {
+			if v, perr := strconv.ParseFloat(strings.TrimSpace(out), 64); perr == nil {
+				sp = int64(v)
+			}
+		}
+		speeds = append(speeds, sp)
+		desc = append(desc, fmt.Sprintf("%s %.0f KB/s", hostOf(u), float64(sp)/1024))
+	}
+	ordered := orderBySpeed(urls, speeds)
+	result.step(ctx, "下载源实测："+strings.Join(desc, "；")+"（按快的优先）")
+	return ordered
+}
+
+// hostOf 取 URL 的主机名，用于日志（不要把完整 URL 塞进一行日志）。
+func hostOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
 }
 
 // releaseBinaryPlan 给出安装器类应用的卸载计划。

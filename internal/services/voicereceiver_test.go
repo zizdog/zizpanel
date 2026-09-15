@@ -515,3 +515,28 @@ func TestBuiltinVoiceAssetIsUsableWav(t *testing.T) {
 		t.Error("内置音色太短（不足 1 秒），接收端会拒收")
 	}
 }
+
+// TestBrewEnvInjectsChinaMirrors 锁住"面板跑 brew 时必须注入国内镜像"。
+//
+// 背景：install.sh 只把镜像写进用户 shell 的 rc，而面板是 LaunchDaemon（root），
+// 读不到那个 rc；sudo 又会清空环境。结果面板装 nginx/PHP/MySQL 时 brew 走官方源，
+// 国内无代理基本不通，界面表现是"点了安装长时间没进度"，看着像面板卡死。
+func TestBrewEnvInjectsChinaMirrors(t *testing.T) {
+	m := &Manager{}
+	env := m.brewEnv()
+	joined := strings.Join(env, "\n")
+	for _, want := range []string{
+		"HOMEBREW_API_DOMAIN=https://mirrors.aliyun.com/homebrew/homebrew-bottles/api",
+		"HOMEBREW_BOTTLE_DOMAIN=https://mirrors.aliyun.com/homebrew/homebrew-bottles",
+		"HOMEBREW_NO_AUTO_UPDATE=1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("brewEnv 缺少 %s：\n%s", want, joined)
+		}
+	}
+	// 用户已经设过的以用户为准（不覆盖）
+	t.Setenv("HOMEBREW_API_DOMAIN", "https://example.com/api")
+	if got := strings.Join(m.brewEnv(), "\n"); !strings.Contains(got, "https://example.com/api") {
+		t.Error("用户自己设的 HOMEBREW_API_DOMAIN 应被尊重，不能被默认值覆盖")
+	}
+}

@@ -208,11 +208,22 @@ chmod +x "$SANDBOX/nginx/bin/nginx"
 pass "沙箱 nginx 环境就绪（vhost 目录已隔离，不会影响生产配置）"
 
 # ------------------------------------------------------------------- 构建 --
-step "构建二进制"
-( cd "$REPO" && PATH="/opt/homebrew/bin:$PATH" GOFLAGS=-mod=mod GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
-    go build -o dist/zizpanel ./cmd/zizpanel && \
-    go build -o dist/zizpanel-helper ./cmd/zizpanel-helper ) || { fail "构建失败"; exit 1; }
-pass "构建完成"
+#
+# 两种模式：
+#   · 默认：本地构建二进制，install.sh 走"离线安装"这条路径（不起网络，最快）；
+#   · ZIZPANEL_SANDBOX_DOWNLOAD_BASE=<镜像>：**不**预置本地二进制，让 install.sh
+#     真的去下载 —— 这是验证"GitHub 直连/国内自建镜像"那条路唯一诚实的办法
+#     （否则本地二进制会先被 detect_source 命中，下载分支永远跑不到）。
+if [ -n "${ZIZPANEL_SANDBOX_DOWNLOAD_BASE:-}" ]; then
+  step "跳过本地构建（本次要验证从网络下载）"
+  rm -f "$REPO/dist/zizpanel" "$REPO/dist/zizpanel-helper"
+else
+  step "构建二进制"
+  ( cd "$REPO" && PATH="/opt/homebrew/bin:$PATH" GOFLAGS=-mod=mod GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
+      go build -o dist/zizpanel ./cmd/zizpanel && \
+      go build -o dist/zizpanel-helper ./cmd/zizpanel-helper ) || { fail "构建失败"; exit 1; }
+  pass "构建完成"
+fi
 
 # ------------------------------------------------------------- 第一次安装 --
 step "执行安装（沙箱模式）"
@@ -226,7 +237,11 @@ export ZIZPANEL_LINK_DIR="$SANDBOX/usr/local/bin"
 export ZIZPANEL_APPS_DIR="$SANDBOX/Applications"
 export ZIZPANEL_SKIP_DEPS=1
 export ZIZPANEL_SKIP_FIREWALL=0
-export ZIZPANEL_DOWNLOAD_BASE="http://127.0.0.1:1/nonexistent"   # 强制走本地二进制
+if [ -n "${ZIZPANEL_SANDBOX_DOWNLOAD_BASE:-}" ]; then
+  export ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_SANDBOX_DOWNLOAD_BASE%/}"
+else
+  export ZIZPANEL_DOWNLOAD_BASE="http://127.0.0.1:1/nonexistent"   # 强制走本地二进制
+fi
 
 mkdir -p "$ZIZPANEL_PLIST_DIR" "$ZIZPANEL_SUDOERS_DIR" "$ZIZPANEL_LINK_DIR" "$ZIZPANEL_APPS_DIR"
 

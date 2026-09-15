@@ -469,3 +469,32 @@ func TestHealthURLReconcilesBothWays(t *testing.T) {
 		t.Error("frps 有 dashboard，应当生成健康检查地址")
 	}
 }
+
+// TestOrderBySpeed 锁住"官方慢就先走镜像，官方快就还走官方"。
+//
+// 中国大陆无代理时 GitHub Release 完全不通（实测 20 秒 0 字节），
+// 而"官方永远排第一 + 150 秒超时"会让每个应用先白等两分半钟。
+func TestOrderBySpeed(t *testing.T) {
+	urls := []string{"https://github.com/a/b.tgz", "https://ghfast.top/https://github.com/a/b.tgz"}
+
+	// 官方不通（0），镜像有速度 → 镜像排第一
+	got := orderBySpeed(urls, []int64{0, 250000})
+	if got[0] != urls[1] {
+		t.Errorf("官方不可达时应当先用镜像，实际 %v", got)
+	}
+	// 官方更快（有代理的情况）→ 仍用官方（可信度优先）
+	got = orderBySpeed(urls, []int64{5000000, 250000})
+	if got[0] != urls[0] {
+		t.Errorf("官方更快时应当用官方，实际 %v", got)
+	}
+	// 都没速度：保持原顺序（官方优先）
+	got = orderBySpeed(urls, []int64{0, 0})
+	if got[0] != urls[0] || got[1] != urls[1] {
+		t.Errorf("都不可达时应保持原顺序，实际 %v", got)
+	}
+	// 速度数组短于 URL 数组时不能 panic
+	got = orderBySpeed(urls, []int64{0})
+	if len(got) != 2 {
+		t.Errorf("长度应保持，实际 %v", got)
+	}
+}

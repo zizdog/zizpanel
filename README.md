@@ -1369,6 +1369,33 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 并给合成响应加 `X-TtsVoice-Model-Cold` 头，让插件能区分"慢是因为冷加载"还是"真的坏了"。
 两者都是纯增量，老插件不调用不受任何影响。
 
+
+### 国内网络：安装源与镜像
+
+中国大陆**无代理**时 GitHub Release 直连**完全不通**（实测 20 秒 0 字节），
+所以安装与升级都要能走国内源：
+
+```bash
+# 推荐（一键，脚本自己会回退到内置镜像）
+curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
+```
+
+- `install.sh` 会**先探真实 tarball 地址**：官方源不通就自动改用内置镜像
+  （`https://zizdog.com/zizpanel`），不再掉进"源码构建"那条路
+  （普通用户机器上没有 Go，那条路等于装不上）。
+  也可以显式指定：`--download-base <镜像>` 或 `ZIZPANEL_DOWNLOAD_BASE=<镜像>`。
+- 面板「系统设置 → 在线升级」的升级源填 `https://zizdog.com/zizpanel` 即可。
+- **面板自己跑 brew 时会注入国内镜像**（阿里云的
+  `HOMEBREW_API_DOMAIN` / `HOMEBREW_BOTTLE_DOMAIN`，实测 0.17s 响应）并关掉自动更新。
+  这一点很关键：`install.sh` 只把镜像写进用户 shell 的 rc，而面板是 LaunchDaemon
+  （root）读不到它、`sudo` 又会清空环境 —— 不注入的话，面板里装 nginx/PHP/MySQL
+  会走官方源，界面表现是"点了安装长时间没进度"。用户自己设过的以用户设置为准。
+- 市场里从 GitHub Release 下载的应用（lucky / frp / orbien…）会**先测各源速度再按快的排**，
+  避免在不通的官方源上白等 150 秒。实测：`github.com 0 KB/s；ghfast.top 80 KB/s；
+  gh-proxy.com 52 KB/s` → 直接走镜像，12MB 约 10 秒下完。
+- Qwen3 TTS 走清华 PyPI + `hf-mirror.com`（并设 `HF_HUB_DISABLE_XET=1`，
+  否则新版 huggingface_hub 会去连 hf-mirror 不代理的 Xet 后端）。
+
 ### 应用界面：一键「打开」与子路径代理
 
 有界面的应用在市场卡片上都有「打开」。同一个应用给**两个入口**，用哪个由探测说了算：
