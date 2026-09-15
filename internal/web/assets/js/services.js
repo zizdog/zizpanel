@@ -404,14 +404,16 @@ export function ServicesView(content, ctx = {}) {
 
   // ---------- 服务详情 ----------
   // ---------------------------------------------------------------------
-  //  音色接收端：更换共享密钥
+  //  音色接收端：调用密钥（receiver v1.6.0）
   //
-  //  为什么单独做入口：这个密钥是**网站与接收端之间的共享凭据**，会泄露、要轮换。
-  //  以前只能"重新部署接收端"才能换（那会连 receiver.py 一起重写、重新登记服务），
-  //  而用户想要的只是换这一样东西 —— 换密钥不该有别的副作用。
+  //  改版原因（用户要求）：
+  //    · 入口应该是**添加密钥**，而不是"更改共享密钥"——
+  //      一把共享密钥意味着任何一处泄露都要全员换，而且分不清是谁在用；
+  //    · 每把密钥可以单独设额度（单位：字），一个站点用超了不影响其它站点；
+  //    · 要能看到用量（今天/近 7 天/累计），否则"额度"只是个数。
   //
-  //  改完**网站那边必须同步改**（openaiKey，接收端密钥由它推导），
-  //  否则上传音色与合成会立刻 403 —— 所以弹窗里要把这句话说在最前面。
+  //  密钥与额度存在接收端的 keys.json 里，**按 mtime 热加载** ——
+  //  加/停/删/改额度都不需要重启，而它可能正在替用户合成。
   // ---------------------------------------------------------------------
   const RECEIVER_LABEL = 'com.zizdog.voicereceiver';
 
@@ -421,62 +423,328 @@ export function ServicesView(content, ctx = {}) {
     return 'ttsv-' + Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
   }
 
-  // 与后端 ValidateReceiverToken 同一套规则（字符集会写进 plist XML，脏字符会让服务起不来）
+  // 与后端 ValidateReceiverToken 同一套规则
   function validReceiverToken(t) {
     return /^[A-Za-z0-9._-]{8,128}$/.test(t);
   }
 
-  function changeReceiverToken(parentModal) {
-    const input = h('input.input', { value: randomReceiverToken(), spellcheck: 'false' });
-    const hint = h('div.hint', {});
-    const sync = () => {
-      hint.textContent = validReceiverToken(input.value.trim())
-        ? '只能包含字母、数字、- _ .（8–128 个字符）。'
-        : '⚠️ 密钥只能包含字母、数字、- _ .，长度 8–128（不能有空格或 & < > 等字符）。';
-      hint.style.color = validReceiverToken(input.value.trim()) ? 'var(--text-mute)' : 'var(--danger)';
-    };
-    input.addEventListener('input', sync);
-    sync();
+  // 字符数千分位：额度动辄几十万字，不分组很难一眼读出来
+  function fmtChars(n) {
+    return (Number(n) || 0).toLocaleString('zh-CN');
+  }
 
-    const m = modal({
-      title: '更改音色接收端共享密钥',
-      body: h('div', [
-        h('div', {
+  function maskKey(k) {
+    const v = String(k || '');
+    if (v.length <= 10) return v;
+    return v.slice(0, 6) + '…' + v.slice(-4);
+  }
+
+  // 14 天字数趋势：用最朴素的 div 条形（Sparkline 是百分比基准，画字数会误导）。
+  //
+  // 每天一个**固定宽度**的柱子 + 日期标签。第一版用了 flex:1，结果只有一天数据时
+  // 那根柱子铺满整条 64px 高的横带，看起来像一条蓝色横幅，根本读不出"这是一天"。
+  function dayBars(days) {
+    const list = Object.entries(days || {}).sort().slice(-14);
+    if (!list.length) return h('div.hint', { text: '还没有按天的用量数据。' });
+    const peak = Math.max(1, ...list.map(([, v]) => Number(v) || 0));
+    return h('div', [
+      h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', height: '64px' } },
+        list.map(([d, v]) => h('div', {
+          title: `${d}：${fmtChars(v)} 字`,
           style: {
-            background: 'var(--warn-soft)', border: '1px solid var(--border)',
-            borderRadius: '8px', padding: '10px 12px', marginBottom: '12px', fontSize: '12.5px', lineHeight: '1.7',
+            width: '26px', flex: '0 0 auto', borderRadius: '3px 3px 0 0',
+            background: 'var(--brand)', opacity: '0.75',
+            height: Math.max(3, Math.round((Number(v) || 0) / peak * 56)) + 'px',
           },
-          text: '改完密钥后，网站 TtsVoice 插件的 openaiKey 必须同步改成新值'
-            + '（接收端地址与 refUploadToken 都由它推导）。改完之前，上传音色与合成立刻会 403。',
-        }),
-        h('div.field', [h('label', { text: '新密钥' }), input, hint]),
-        h('div', { style: { display: 'flex', gap: '8px', marginTop: '4px' } }, [
-          h('button.btn.btn-sm', {
-            text: '🎲 重新生成',
-            onclick: () => { input.value = randomReceiverToken(); sync(); },
+        }))),
+      h('div', { style: { display: 'flex', gap: '6px', marginTop: '4px' } },
+        list.map(([d]) => h('div', {
+          style: { width: '26px', flex: '0 0 auto', fontSize: '10px', color: 'var(--text-mute)', textAlign: 'center' },
+          text: d.slice(5),
+        }))),
+      h('div.hint', {
+        style: { marginTop: '4px' },
+        text: list.length === 1
+          ? `目前只有 ${list[0][0]} 一天的数据（按天统计从 v1.6.0 开始记）。`
+          : `近 ${list.length} 天每天的字数（按天统计从 v1.6.0 开始记，历史累计见上面「累计」）。`,
+      }),
+    ]);
+  }
+
+  async function voiceKeysModal(parentModal) {
+    const box = h('div', [
+      h('div.empty', [h('div.big', { text: '🔑' }), h('p', { text: '正在读取密钥与用量…' })]),
+    ]);
+    const m = modal({ title: '调用密钥与用量（每个网站一把，可设额度）', wide: true, body: box });
+
+    function showSecret(key) {
+      modal({
+        title: '这把密钥的完整值（只显示这一次）',
+        body: h('div', [
+          h('div', {
+            style: {
+              background: 'var(--warn-soft)', border: '1px solid var(--border)',
+              borderRadius: '8px', padding: '10px 12px', marginBottom: '12px', fontSize: '12.5px', lineHeight: '1.7',
+            },
+            text: '把它填进该网站 TtsVoice 插件的 openaiKey（接收端地址与 refUploadToken 都由它推导）。'
+              + '列表里之后只显示掩码，复制请趁现在。',
           }),
+          h('input.input', { value: key, readOnly: true, spellcheck: 'false', onclick: (e) => e.target.select() }),
         ]),
-      ]),
-      footer: (close) => [
-        h('button.btn', { text: '取消', onclick: close }),
-        h('button.btn.btn-primary', {
-          text: '确认更换',
-          onclick: () => {
-            const token = input.value.trim();
-            if (!validReceiverToken(token)) { toast('密钥不合法：只能字母数字 - _ .，长度 8–128', 'warn'); return; }
-            close();
-            if (parentModal) parentModal.close();
-            // 走任务中心：要重写 plist、重载守护进程、再用新密钥验证一次
-            taskCenter.start({
-              kind: 'receiver-token',
-              target: 'voicereceiver',
-              title: '更换音色接收端共享密钥',
-              start: () => api.changeReceiverToken(token),
-            });
-          },
+        footer: (close) => [
+          h('button.btn.btn-primary', {
+            text: '复制并关闭',
+            onclick: async () => {
+              try {
+                await navigator.clipboard.writeText(key);
+                toast('已复制到剪贴板', 'ok');
+              } catch { toast('复制失败（浏览器限制），请手动选中复制', 'warn'); }
+              close();
+            },
+          }),
+        ],
+      });
+    }
+
+    async function addKey() {
+      const nameInput = h('input.input', { placeholder: '例如：zizdog.cn 网站', spellcheck: 'false' });
+      const quotaInput = h('input.input', { type: 'number', min: '0', value: '0', placeholder: '0 = 不限' });
+      const valueInput = h('input.input', { placeholder: '留空自动生成', spellcheck: 'false' });
+      const hint = h('div.hint', { text: '额度单位是「字」：按提交文本的字符数计（中文 1 字算 1，含标点）。0 = 不限量。' });
+      const vhint = h('div.hint', { text: '留空则由面板生成一个随机密钥。也可以填你已有的密钥值。' });
+
+      modal({
+        title: '添加调用密钥',
+        body: h('div', [
+          h('div.field', [h('label', { text: '名称（给谁用）' }), nameInput]),
+          h('div.field', [h('label', { text: '额度（字，0 = 不限）' }), quotaInput, hint]),
+          h('div.field', [h('label', { text: '密钥值（可留空）' }), valueInput, vhint]),
+        ]),
+        footer: (close) => [
+          h('button.btn', { text: '取消', onclick: close }),
+          h('button.btn.btn-primary', {
+            text: '添加',
+            onclick: async () => {
+              const value = valueInput.value.trim();
+              if (value && !validReceiverToken(value)) {
+                toast('密钥值不合法：只能字母数字 - _ .，长度 8–128', 'warn');
+                return;
+              }
+              const quota = Number(quotaInput.value || 0);
+              if (!Number.isFinite(quota) || quota < 0) { toast('额度不能是负数', 'warn'); return; }
+              try {
+                const r = await api.voiceKeyAdd({
+                  name: nameInput.value.trim(), value, quota_chars: Math.floor(quota),
+                });
+                close();
+                toast('已添加密钥', 'ok');
+                showSecret((r && r.key && r.key.key) || '');
+                await load();
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }),
+        ],
+      });
+    }
+
+    function editKey(row) {
+      const nameInput = h('input.input', { value: row.name || '', spellcheck: 'false' });
+      const quotaInput = h('input.input', { type: 'number', min: '0', value: String(row.quota_chars || 0) });
+      const resetValue = h('input', { type: 'checkbox' });
+      modal({
+        title: `编辑密钥：${row.name || row.id}`,
+        body: h('div', [
+          h('div.field', [h('label', { text: '名称' }), nameInput]),
+          h('div.field', [
+            h('label', { text: '额度（字，0 = 不限）' }), quotaInput,
+            h('div.hint', { text: `已用 ${fmtChars(row.used_chars)} 字。把额度调到低于已用，会让该站点立刻调不动（返回 429）。` }),
+          ]),
+          h('div.field', [
+            h('label', { style: { display: 'flex', gap: '7px', alignItems: 'center' } }, [
+              resetValue, h('span', { text: '同时重置密钥值（网站那边要同步改）' }),
+            ]),
+          ]),
+        ]),
+        footer: (close) => [
+          h('button.btn', { text: '取消', onclick: close }),
+          h('button.btn.btn-primary', {
+            text: '保存',
+            onclick: async () => {
+              const quota = Number(quotaInput.value || 0);
+              if (!Number.isFinite(quota) || quota < 0) { toast('额度不能是负数', 'warn'); return; }
+              const payload = {
+                name: nameInput.value.trim(),
+                quota_chars: Math.floor(quota),
+              };
+              if (resetValue.checked) payload.value = '';
+              try {
+                const r = await api.voiceKeyUpdate(row.id, payload);
+                close();
+                toast('已保存', 'ok');
+                if (resetValue.checked) {
+                  await load();
+                  if (r && r.key && r.key.key) showSecret(r.key.key);
+                } else {
+                  await load();
+                }
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }),
+        ],
+      });
+    }
+
+    async function load() {
+      clear(box);
+      let data = null;
+      let err = null;
+      try {
+        data = await api.voiceKeys();
+      } catch (e) { err = e; }
+
+      if (err) {
+        appendAll(box, h('div.empty', [
+          h('div.big', { text: '⚠️' }),
+          h('p', { text: err.message }),
+          h('div.hint', { text: '这个页面需要接收端 v1.6.0。请在「应用市场 → 音色样本接收端」重新部署一次。' }),
+        ]));
+        return;
+      }
+
+      const list = data.keys || [];
+      const total = data.total || {};
+
+      const head = h('div', { style: { display: 'flex', gap: '18px', flexWrap: 'wrap', marginBottom: '4px' } }, [
+        h('div', [h('div.sub', { text: '今日' }), h('div', { style: { fontSize: '18px', fontWeight: '600' }, text: fmtChars(total.today_chars) + ' 字' })]),
+        h('div', [h('div.sub', { text: '近 7 天' }), h('div', { style: { fontSize: '18px', fontWeight: '600' }, text: fmtChars(total.week_chars) + ' 字' })]),
+        h('div', [h('div.sub', { text: '累计' }), h('div', { style: { fontSize: '18px', fontWeight: '600' }, text: fmtChars(total.chars) + ' 字' })]),
+        h('div', [h('div.sub', { text: '调用次数' }), h('div', { style: { fontSize: '18px', fontWeight: '600' }, text: fmtChars(total.requests) })]),
+        h('div', [h('div.sub', { text: '产出音频' }), h('div', { style: { fontSize: '18px', fontWeight: '600' }, text: bytes(total.audio_bytes) })]),
+      ]);
+
+      const rows = list.map((row) => {
+        const quotaText = row.deleted ? '—'
+          : (row.unlimited ? '不限' : fmtChars(row.quota_chars) + ' 字');
+        const remaining = row.deleted ? '—'
+          : (row.unlimited ? '—' : fmtChars(row.remaining_chars) + ' 字');
+        // 额度进度条：一眼看出哪把快用完了
+        const pct = (!row.unlimited && row.quota_chars > 0)
+          ? Math.min(100, Math.round(row.used_chars / row.quota_chars * 100)) : 0;
+        const barColor = pct >= 100 ? 'var(--danger)' : (pct >= 80 ? 'var(--warn)' : 'var(--brand)');
+
+        const actions = [];
+        if (row.legacy) {
+          actions.push(h('button.btn.btn-sm', {
+            text: '迁移',
+            title: '重新部署接收端后，这把来自服务配置的密钥会变成可管理的密钥',
+            onclick: () => { if (parentModal) parentModal.close(); m.close(); toast('请在应用市场重新部署「音色样本接收端」以完成迁移', 'info', 8000); },
+          }));
+        } else if (!row.deleted) {
+          actions.push(h('button.btn.btn-sm', { text: '编辑', onclick: () => editKey(row) }));
+          actions.push(h('button.btn.btn-sm', {
+            text: row.enabled ? '停用' : '启用',
+            title: row.enabled ? '停用后该密钥立刻失效（网站会 403）' : '重新启用这把密钥',
+            onclick: async () => {
+              try {
+                await api.voiceKeyUpdate(row.id, { enabled: !row.enabled });
+                toast(row.enabled ? '已停用' : '已启用', 'ok');
+                await load();
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }));
+          actions.push(h('button.btn.btn-sm.btn-danger', {
+            text: '删除',
+            onclick: async () => {
+              if (!await confirmBox(
+                `删除密钥「${row.name || row.id}」？\n\n`
+                + '该密钥会**立刻失效**（接收端热加载，不用重启），用它调用的网站会开始 403。\n'
+                + '历史用量会保留在统计里。',
+                { title: '删除密钥', danger: true, okText: '确认删除' })) return;
+              try {
+                await api.voiceKeyDelete(row.id);
+                toast('已删除', 'ok');
+                await load();
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }));
+        }
+
+        return h('tr', { style: row.deleted ? { opacity: '0.6' } : {} }, [
+          h('td', [
+            h('strong', { text: row.name || row.id }),
+            row.deleted ? h('span.sub', { text: '  （已删除）' }) : null,
+            row.legacy ? h('span.sub', { text: '  （来自服务配置，未迁移）' }) : null,
+            !row.enabled && !row.deleted ? h('span.sub', { text: '  （已停用）' }) : null,
+          ]),
+          h('td', [
+            h('code', { text: maskKey(row.key) }),
+            row.key ? h('button.btn.btn-sm', {
+              text: '显示',
+              title: '查看完整密钥（用于填进网站插件）',
+              onclick: () => showSecret(row.key),
+            }) : null,
+            row.key ? h('button.btn.btn-sm', {
+              text: '复制',
+              onclick: async () => {
+                try { await navigator.clipboard.writeText(row.key); toast('已复制', 'ok'); }
+                catch { toast('复制失败（浏览器限制）', 'warn'); }
+              },
+            }) : null,
+          ]),
+          h('td', { text: quotaText }),
+          h('td', { text: fmtChars(row.used_chars) + ' 字' }),
+          h('td', [
+            h('div', { text: remaining }),
+            (!row.unlimited && !row.deleted)
+              ? h('div', {
+                  style: {
+                    height: '4px', borderRadius: '2px', marginTop: '3px',
+                    background: 'var(--border)', overflow: 'hidden', minWidth: '70px',
+                  },
+                }, [h('div', { style: { width: pct + '%', height: '100%', background: barColor } })])
+              : null,
+          ]),
+          h('td', { text: fmtChars(row.today_chars) + ' 字' }),
+          h('td', { text: row.last_used ? new Date(row.last_used * 1000).toLocaleString('zh-CN') : '未使用' }),
+          h('td', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, actions),
+        ]);
+      });
+
+      appendAll(box,
+        head,
+        h('div', { style: { margin: '10px 0 14px' } }, [dayBars(total.days)]),
+        list.length
+          ? h('table.table', [
+              h('thead', [h('tr', [
+                h('th', { text: '名称' }), h('th', { text: '密钥' }), h('th', { text: '额度' }),
+                h('th', { text: '已用' }), h('th', { text: '剩余' }), h('th', { text: '今日' }),
+                h('th', { text: '最后使用' }), h('th', { text: '操作' }),
+              ])]),
+              h('tbody', rows),
+            ])
+          : h('div.empty', [
+              h('div.big', { text: '🔑' }),
+              h('h4', { text: '还没有任何调用密钥' }),
+              h('p', { text: '添加一把给网站用；每个网站建议各用一把，并设置额度。' }),
+            ]),
+        h('div.hint', {
+          style: { marginTop: '12px' },
+          text: '额度按提交文本的字符数扣减（中文 1 字算 1，含标点）。'
+            + '额度用完时接收端返回 429（quota exceeded），与该密钥无效的 403 区分开。'
+            + '密钥与额度改动立即生效，不用重启接收端。',
         }),
-      ],
-    });
+        h('div', { style: { marginTop: '14px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
+          h('button.btn.btn-sm.btn-primary', { text: '➕ 添加密钥', onclick: addKey }),
+          h('button.btn.btn-sm', { text: '🔄 刷新', onclick: load }),
+        ]),
+        data.usage_error
+          ? h('div.hint', { style: { color: 'var(--danger)', marginTop: '8px' }, text: '用量读取失败：' + data.usage_error })
+          : null,
+      );
+    }
+
+    await load();
+    return m;
   }
 
   // ---------------------------------------------------------------------
@@ -678,11 +946,11 @@ export function ServicesView(content, ctx = {}) {
           text: '✏️ 编辑配置',
           onclick: (ev) => { m.close(); newServiceModal(load, cur); },
         }),
-        // 音色接收端专有：换共享密钥
+        // 音色接收端专有：调用密钥（多密钥 + 额度 + 用量）
         cur.launch_label === RECEIVER_LABEL ? h('button.btn.btn-sm', {
-          text: '🔑 更改共享密钥',
-          title: '重新生成或指定「网站 ↔ 接收端」之间的共享密钥',
-          onclick: () => changeReceiverToken(m),
+          text: '🔑 调用密钥',
+          title: '添加/停用/删除各网站的调用密钥，设置每把的额度（单位：字），查看用量',
+          onclick: () => voiceKeysModal(m),
         }) : null,
         // 音色接收端专有：各来源（每站一份参考音频）
         cur.launch_label === RECEIVER_LABEL ? h('button.btn.btn-sm', {

@@ -59,6 +59,8 @@ type receiverPaths struct {
 	Script  string // ~/tts/voice-receiver/receiver.py
 	Samples string // ~/tts/voice-samples
 	Jobs    string // ~/tts/jobs（v1.3.0 的作业队列落盘目录）
+	Keys    string // ~/tts/voice-receiver/keys.json（v1.6.0 多密钥 + 额度）
+	Usage   string // ~/tts/voice-receiver/usage.json（v1.6.0 用量统计，接收端写）
 	OutLog  string
 	ErrLog  string
 	Plist   string // /Library/LaunchDaemons/com.zizdog.voicereceiver.plist
@@ -75,10 +77,346 @@ func (m *Manager) receiverPaths() receiverPaths {
 		Script:  filepath.Join(dir, "receiver.py"),
 		Samples: filepath.Join(home, "tts", "voice-samples"),
 		Jobs:    filepath.Join(home, "tts", "jobs"),
+		Keys:    filepath.Join(dir, "keys.json"),
+		Usage:   filepath.Join(dir, "usage.json"),
 		OutLog:  filepath.Join(dir, "launchd.out.log"),
 		ErrLog:  filepath.Join(dir, "launchd.err.log"),
 		Plist:   "/Library/LaunchDaemons/" + receiverLabel + ".plist",
 	}
+}
+
+// ============================================================================
+//  多密钥 + 每密钥额度（v1.6.0）
+//
+//  为什么不再用 plist 里的单个 --token：多密钥、每密钥额度、用量统计都要求
+//  "改一次就生效"。plist 是 root 拥有的，改它要重写 XML 并重启守护进程 ——
+//  每加一个网站的密钥就重启一次正在跑合成的服务，不可接受。
+//
+//  所以：密钥与额度放 keys.json（面板写、接收端按 mtime 热加载），
+//  用量由接收端写 usage.json、面板通过 GET /usage 读。
+//  接收端仍接受 plist 里的 --token 作为兼容回退；重新部署时会被迁移成
+//  keys.json 里的一条 default 记录，plist 不再写 --token。
+// ============================================================================
+
+// VoiceKey 是 keys.json 里的一条密钥。
+type VoiceKey struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Key        string `json:"key"`
+	QuotaChars int64  `json:"quota_chars"` // 0 = 不限
+	Enabled    bool   `json:"enabled"`
+	Created    int64  `json:"created"`
+}
+
+// VoiceKeyView 是"密钥 + 实时用量"的合并视图（面板列表用）。
+type VoiceKeyView struct {
+	VoiceKey
+	UsedChars      int64            `json:"used_chars"`
+	RemainingChars int64            `json:"remaining_chars"`
+	Unlimited      bool             `json:"unlimited"`
+	TodayChars     int64            `json:"today_chars"`
+	WeekChars      int64            `json:"week_chars"`
+	Requests       int64            `json:"requests"`
+	Jobs           int64            `json:"jobs"`
+	AudioBytes     int64            `json:"audio_bytes"`
+	FirstUsed      int64            `json:"first_used"`
+	LastUsed       int64            `json:"last_used"`
+	Days           map[string]int64 `json:"days,omitempty"`
+	// Deleted 表示这条密钥已被删掉、只剩下历史用量（面板显示成"已删除"）。
+	Deleted bool `json:"deleted,omitempty"`
+	// Legacy 表示这条来自 plist 的兼容 --token（还没迁移，面板里只读）。
+	Legacy bool `json:"legacy,omitempty"`
+}
+
+// voiceKeysDoc 是 keys.json 的顶层结构。
+type voiceKeysDoc struct {
+	Version int        `json:"version"`
+	Updated int64      `json:"updated"`
+	Keys    []VoiceKey `json:"keys"`
+}
+
+// VoiceKeyID 校验并返回一个安全的密钥 id（与接收端的 valid_key_id 同规则）。
+func VoiceKeyID(raw string) (string, error) {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", fmt.Errorf("密钥 id 不能为空")
+	}
+	if len(id) > 64 {
+		return "", fmt.Errorf("密钥 id 过长（最多 64 字符）")
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return "", fmt.Errorf("密钥 id 只能包含字母、数字、- 和 _")
+		}
+	}
+	return id, nil
+}
+
+// LoadVoiceKeys 读 keys.json；文件不存在返回空表（不是错误）。
+func (m *Manager) LoadVoiceKeys() ([]VoiceKey, error) {
+	b, err := os.ReadFile(m.receiverPaths().Keys)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取密钥表失败: %w", err)
+	}
+	var doc voiceKeysDoc
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil, fmt.Errorf("密钥表格式不对（%s）: %w", m.receiverPaths().Keys, err)
+	}
+	return doc.Keys, nil
+}
+
+// SaveVoiceKeys 原子写 keys.json，并把它交给运行接收端的那个用户。
+//
+// 权限 0600 且归属运行用户：接收端要以该用户身份读取，而里面有明文密钥。
+func (m *Manager) SaveVoiceKeys(keys []VoiceKey) error {
+	p := m.receiverPaths()
+	if err := os.MkdirAll(p.Dir, 0o755); err != nil {
+		return fmt.Errorf("创建目录失败: %w", err)
+	}
+	doc := voiceKeysDoc{Version: 1, Updated: time.Now().Unix(), Keys: keys}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := p.Keys + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("写入密钥表失败: %w", err)
+	}
+	if err := os.Rename(tmp, p.Keys); err != nil {
+		return fmt.Errorf("安装密钥表失败: %w", err)
+	}
+	// 归属改为运行用户（面板以 root 运行，接收端以该用户运行）
+	if m.opt.UserName != "" {
+		if err := chownTree(m.opt.UserName, p.Keys); err != nil {
+			return fmt.Errorf("设置密钥表归属失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// NewVoiceKey 生成一条新密钥（id 与密钥值都在面板侧生成）。
+//
+// 密钥值留空时生成 `ttsv-<32 hex>`（与交接文档 5.2 步的格式一致）。
+func (m *Manager) NewVoiceKey(name, value string, quotaChars int64, enabled bool) (VoiceKey, error) {
+	if quotaChars < 0 {
+		return VoiceKey{}, fmt.Errorf("额度不能是负数")
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		h, err := randomHex(16)
+		if err != nil {
+			return VoiceKey{}, err
+		}
+		value = receiverTokenPrefix + h
+	}
+	if err := ValidateReceiverToken(value); err != nil {
+		return VoiceKey{}, err
+	}
+	id, err := randomHex(4)
+	if err != nil {
+		return VoiceKey{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "未命名密钥"
+	}
+	return VoiceKey{
+		ID:         "k-" + id,
+		Name:       name,
+		Key:        value,
+		QuotaChars: quotaChars,
+		Enabled:    enabled,
+		Created:    time.Now().Unix(),
+	}, nil
+}
+
+// voiceAuthKey 取一把可用于调用接收端自身的密钥（面板读来源/用量时用）。
+//
+// 优先用 keys.json 里第一条启用的；还没迁移的机器回退到 plist 的 --token。
+func (m *Manager) voiceAuthKey() (string, error) {
+	if keys, err := m.LoadVoiceKeys(); err == nil {
+		for _, k := range keys {
+			if k.Enabled && k.Key != "" {
+				return k.Key, nil
+			}
+		}
+	}
+	p := m.receiverPaths()
+	if _, err := os.Stat(p.Plist); err != nil {
+		return "", fmt.Errorf("接收端还没部署过（找不到 %s）", p.Plist)
+	}
+	if t := m.existingReceiverToken(p); t != "" {
+		return t, nil
+	}
+	return "", nil // 未启用鉴权：空密钥照常可调
+}
+
+// ensureVoiceKeys 保证密钥表存在：不存在就从现有 plist 的 --token（或新生成的
+// 值）建一条 default 记录。返回是否新建、以及当前第一条可用密钥。
+//
+// 迁移的关键一步：老机器上网站用的是 plist 里那把密钥，必须原样搬进
+// keys.json，否则"升级面板"就等于"网站全部 401"。
+func (m *Manager) ensureVoiceKeys(p receiverPaths, preferred string) (bool, string, error) {
+	keys, err := m.LoadVoiceKeys()
+	if err != nil {
+		return false, "", err
+	}
+	if len(keys) > 0 {
+		for _, k := range keys {
+			if k.Enabled && k.Key != "" {
+				return false, k.Key, nil
+			}
+		}
+		return false, "", nil
+	}
+
+	value := strings.TrimSpace(preferred)
+	if value == "" {
+		value = m.existingReceiverToken(p)
+	}
+	key, err := m.NewVoiceKey("默认密钥", value, 0, true)
+	if err != nil {
+		return false, "", err
+	}
+	// id 固定为 default：接收端的兼容回退也把 --token 记在 default 名下，
+	// 这样迁移前后历史用量落在同一个桶里，统计不会断成两截。
+	key.ID = "default"
+	if err := m.SaveVoiceKeys([]VoiceKey{key}); err != nil {
+		return false, "", err
+	}
+	return true, key.Key, nil
+}
+
+// AddVoiceKey 添加一条密钥。值不能与已有密钥重复（重复等于悄悄共用额度）。
+func (m *Manager) AddVoiceKey(name, value string, quotaChars int64, enabled bool) (VoiceKey, error) {
+	key, err := m.NewVoiceKey(name, value, quotaChars, enabled)
+	if err != nil {
+		return VoiceKey{}, err
+	}
+	keys, err := m.LoadVoiceKeys()
+	if err != nil {
+		return VoiceKey{}, err
+	}
+	for _, k := range keys {
+		if k.Key == key.Key {
+			return VoiceKey{}, fmt.Errorf("这个密钥值已经存在（%s），换一个或复制已有的", k.Name)
+		}
+	}
+	keys = append(keys, key)
+	if err := m.SaveVoiceKeys(keys); err != nil {
+		return VoiceKey{}, err
+	}
+	return key, nil
+}
+
+// UpdateVoiceKey 改一条密钥的名称/额度/启用状态/密钥值。
+//
+// 不允许把**最后一条启用的密钥**停用——那等于一键把所有人关在门外，
+// 而且从界面上看不出为什么。
+func (m *Manager) UpdateVoiceKey(id string, name *string, quotaChars *int64,
+	enabled *bool, value *string) (VoiceKey, error) {
+	keys, err := m.LoadVoiceKeys()
+	if err != nil {
+		return VoiceKey{}, err
+	}
+	idx := -1
+	for i, k := range keys {
+		if k.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return VoiceKey{}, fmt.Errorf("找不到密钥 %s（可能已被删除，刷新一下）", id)
+	}
+
+	if name != nil {
+		if n := strings.TrimSpace(*name); n != "" {
+			keys[idx].Name = n
+		}
+	}
+	if quotaChars != nil {
+		if *quotaChars < 0 {
+			return VoiceKey{}, fmt.Errorf("额度不能是负数")
+		}
+		keys[idx].QuotaChars = *quotaChars
+	}
+	if value != nil {
+		v := strings.TrimSpace(*value)
+		if v == "" {
+			h, err := randomHex(16)
+			if err != nil {
+				return VoiceKey{}, err
+			}
+			v = receiverTokenPrefix + h
+		}
+		if err := ValidateReceiverToken(v); err != nil {
+			return VoiceKey{}, err
+		}
+		for _, k := range keys {
+			if k.Key == v && k.ID != id {
+				return VoiceKey{}, fmt.Errorf("这个密钥值已经存在（%s）", k.Name)
+			}
+		}
+		keys[idx].Key = v
+	}
+	if enabled != nil {
+		if !*enabled {
+			remaining := 0
+			for _, k := range keys {
+				if k.ID != id && k.Enabled {
+					remaining++
+				}
+			}
+			if remaining == 0 {
+				return VoiceKey{}, fmt.Errorf("至少要保留一条启用的密钥，否则所有网站都会立刻 401")
+			}
+		}
+		keys[idx].Enabled = *enabled
+	}
+
+	if err := m.SaveVoiceKeys(keys); err != nil {
+		return VoiceKey{}, err
+	}
+	return keys[idx], nil
+}
+
+// DeleteVoiceKey 删除一条密钥（历史用量仍留在 usage.json 里）。
+func (m *Manager) DeleteVoiceKey(id string) error {
+	keys, err := m.LoadVoiceKeys()
+	if err != nil {
+		return err
+	}
+	out := make([]VoiceKey, 0, len(keys))
+	found := false
+	enabledLeft := 0
+	for _, k := range keys {
+		if k.ID == id {
+			found = true
+			if k.Enabled {
+				for _, o := range keys {
+					if o.ID != id && o.Enabled {
+						enabledLeft++
+					}
+				}
+				if enabledLeft == 0 {
+					return fmt.Errorf("这是最后一条启用的密钥，删掉会让所有网站立刻 401；" +
+						"请先添加并启用一条新的")
+				}
+			}
+			continue
+		}
+		out = append(out, k)
+	}
+	if !found {
+		return fmt.Errorf("找不到密钥 %s（可能已被删除，刷新一下）", id)
+	}
+	return m.SaveVoiceKeys(out)
 }
 
 // InstallVoiceReceiver 部署接收端，并返回共享密钥与对外地址。
@@ -138,29 +476,38 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	}
 	_ = chownTree(m.opt.UserName, p.Dir)
 
-	// ---- 2. 共享密钥 ----
-	// 优先级：用户指定 > 已有（复用，换掉会让网站立刻失联）> 自动生成
+	// ---- 2. 密钥表 ----
+	// v1.6.0：密钥与额度由 keys.json 管理（接收端热加载）。这里做两件事：
+	//   a) 表还不存在 → 用现有 plist 的 --token 建一条 default（迁移，网站不中断）
+	//   b) 用户显式指定了密钥 → 只有表里一条 key 都没有时才采用
 	token := strings.TrimSpace(opt.Token)
-	switch {
-	case opt.NoAuth:
+	if opt.NoAuth {
 		token = ""
 		result.Steps = append(result.Steps,
-			"按选择**不启用鉴权**（密钥留空）——同内网任何人都能上传文件与调用合成")
-	case token != "":
-		result.step(ctx, "使用你指定的共享密钥")
+			"按选择**不启用鉴权**（密钥表为空）——同内网任何人都能上传文件与调用合成")
+	}
+	fresh, primaryKey, err := m.ensureVoiceKeys(p, token)
+	if err != nil {
+		return err
+	}
+	switch {
+	case fresh && token != "":
+		result.step(ctx, "已按你指定的密钥建立密钥表")
+	case fresh:
+		result.step(ctx, "已建立密钥表（迁移了原有的共享密钥，网站不用改）")
+	case len(token) > 0:
+		result.step(ctx, "密钥表已存在，保持原有密钥不变（新增/改额度请用「调用密钥」）")
 	default:
-		if existing := m.existingReceiverToken(p); existing != "" {
-			token = existing
-			result.step(ctx, "复用已有共享密钥（换掉会让网站那边失联）")
-		} else {
-			t, err := randomHex(16)
-			if err != nil {
-				return err
-			}
-			token = receiverTokenPrefix + t // 前缀与文档第 5.2 步生成的格式一致
-			result.step(ctx, "已自动生成共享密钥")
+		result.step(ctx, "密钥表已存在，保持原有密钥不变")
+	}
+	keys, _ := m.LoadVoiceKeys()
+	enabled := 0
+	for _, k := range keys {
+		if k.Enabled {
+			enabled++
 		}
 	}
+	result.step(ctx, fmt.Sprintf("密钥表 %s：%d 条（启用 %d 条）", p.Keys, len(keys), enabled))
 
 	// ---- 3. 系统级服务 ----
 	// 监听地址：只接受 127.0.0.1 / 0.0.0.0 两个值（其他值交给 Python 报错没有意义，
@@ -182,12 +529,14 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	if bindHost != "0.0.0.0" && bindHost != "127.0.0.1" {
 		return fmt.Errorf("监听地址只支持 0.0.0.0（对局域网开放）或 127.0.0.1（仅本机）")
 	}
-	if err := m.applyReceiverPlist(ctx, result, p, token, bindHost); err != nil {
+	if err := m.applyReceiverPlist(ctx, result, p, bindHost); err != nil {
 		return err
 	}
 
-	// ---- 4. 验证：只认真的返回了 auth:true ----
-	wantAuth := !opt.NoAuth
+	// ---- 4. 验证：只认真的返回了 auth:true，并且**真拿密钥调一次** ----
+	// 只看 auth:true 不够：健康检查是"配置层面"的回答。这里再用密钥打一次
+	// /jobs（200）+ 用错误密钥打一次（403），才算鉴权真的生效。
+	wantAuth := !opt.NoAuth && (enabled > 0)
 	if !waitJSONBoolValue(ctx, fmt.Sprintf("http://127.0.0.1:%d/voice/health", receiverPort),
 		"auth", wantAuth, 20*time.Second) {
 		result.Warning = fmt.Sprintf("接收端已注册，但 /voice/health 未返回 auth:true。请看日志：%s", p.ErrLog)
@@ -195,6 +544,17 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 		return nil
 	}
 	result.step(ctx, "接收端已就绪并启用鉴权")
+
+	if primaryKey != "" {
+		ok, detail := m.verifyReceiverKey(ctx, primaryKey)
+		if !ok {
+			result.Warning = "接收端起来了，但用密钥访问 /jobs 没通过：" + detail +
+				"。请看日志 " + p.ErrLog
+			result.step(ctx, "警告："+result.Warning)
+			return nil
+		}
+		result.step(ctx, "已用密钥实测 /jobs（200），并确认错误密钥被拒（403）")
+	}
 
 	if err := m.RegisterInstalledService(ctx, receiverLabel, "TtsVoice 音色接收端", "🔐", "ai", receiverPort); err != nil {
 		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
@@ -207,7 +567,7 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	//   refUploadToken = openaiKey
 	// 所以这里只给这两项，不再让用户填四个字段（多填一处就多一个填错的机会）。
 	host := m.primaryIP()
-	key := token
+	key := primaryKey
 	if key == "" {
 		key = "（留空 —— 未启用鉴权）"
 	}
@@ -224,20 +584,48 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 		"  openaiKey     = 见下方可复制区块",
 		"",
 		"  接收端地址与密钥会自动从上面两项推导，不用另外填。",
+		"  多个网站请用「服务管理 → 音色接收端 → 详情 → 🔑 调用密钥」各发一把，",
+		"  并给每把设置额度（单位：字）—— 一把密钥泄露不影响其它站点。",
 		"  （密钥只放在结果里、不写进步骤文本：步骤会进操作审计，密钥不该留在那里。）",
 	)
-	result.Token = token
+	result.Token = primaryKey
 	result.Address = host
 	return nil
 }
 
+// verifyReceiverKey 用指定密钥真打一次 /jobs，并确认错误密钥被拒。
+//
+// 为什么要真打：历史上 launchctl 的退出码与 /voice/health 的 auth:true
+// 都谎报过成功（服务起来了但用的是旧配置）。鉴权这种"配错了就全站失联"
+// 的东西，必须用一次真实调用证明。
+func (m *Manager) verifyReceiverKey(ctx context.Context, key string) (bool, string) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/jobs?status=queued", receiverPort)
+
+	code, err := httpGetStatus(ctx, url, key)
+	if err != nil {
+		return false, err.Error()
+	}
+	if code != 200 {
+		return false, fmt.Sprintf("带正确密钥返回 %d", code)
+	}
+
+	badCode, err := httpGetStatus(ctx, url, "ttsv-definitely-not-a-key")
+	if err != nil {
+		return false, "错误密钥测试失败：" + err.Error()
+	}
+	if badCode == 200 {
+		return false, "错误密钥也能访问，鉴权没有真正生效"
+	}
+	return true, ""
+}
+
 // applyReceiverPlist 写 plist 并（重新）装载守护进程。
 //
-// 安装与"更改共享密钥"共用：两处都必须走同一条路，否则很容易出现
-// "改了 plist 但没重载"这种看着成功、实际还在用旧密钥的情况。
+// v1.6.0 起 plist 里不再写 --token：密钥与额度在 keys.json（热加载），
+// plist 只负责告诉接收端那个文件在哪。这样"加密钥/改额度"不需要重启服务。
 func (m *Manager) applyReceiverPlist(ctx context.Context, result *InstallResult,
-	p receiverPaths, token, host string) error {
-	plist := receiverPlist(p, m.opt.UserName, token, host)
+	p receiverPaths, host string) error {
+	plist := receiverPlist(p, m.opt.UserName, host)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("写入 plist 失败: %w", err)
 	}
@@ -253,7 +641,7 @@ func (m *Manager) applyReceiverPlist(ctx context.Context, result *InstallResult,
 
 // existingReceiverHost 从已有 plist 里读回监听地址；读不到返回 ""。
 //
-// 改密钥时**必须**保留原监听地址：本机是 127.0.0.1（只给同机的网站用），
+// 重新部署时**必须**保留原监听地址：本机是 127.0.0.1（只给同机的网站用），
 // mini 是 0.0.0.0（网站在别的机器上）。顺手改成默认值等于悄悄把它暴露到局域网。
 func (m *Manager) existingReceiverHost(p receiverPaths) string {
 	b, err := os.ReadFile(p.Plist)
@@ -262,7 +650,10 @@ func (m *Manager) existingReceiverHost(p receiverPaths) string {
 	}
 	lines := strings.Split(string(b), "\n")
 	for i, ln := range lines {
-		if strings.Contains(ln, "--host") && i+1 < len(lines) {
+		// 精确匹配 <string>--host</string>，不要用 Contains：
+		// plist 里允许 XML 注释，注释里提到 --host 是正常的，
+		// 用 Contains 会把注释当成参数行、然后从注释后面取到一个错的值。
+		if strings.TrimSpace(ln) == "<string>--host</string>" && i+1 < len(lines) {
 			v := strings.TrimSpace(lines[i+1])
 			v = strings.TrimPrefix(v, "<string>")
 			v = strings.TrimSuffix(v, "</string>")
@@ -297,92 +688,6 @@ func ValidateReceiverToken(token string) error {
 	return nil
 }
 
-// ChangeReceiverToken 只更换共享密钥：保留监听地址/脚本路径/上游等其余配置，
-// 重载守护进程，并**用新密钥真打一次接口**确认它已经生效。
-//
-// 不重新写 receiver.py（那是安装的事），也不动样本目录 —— 换密钥不该有别的副作用。
-func (m *Manager) ChangeReceiverToken(ctx context.Context, result *InstallResult, newToken string) error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("更改共享密钥需要以 root 运行")
-	}
-	if m.opt.UserName == "" {
-		return fmt.Errorf("无法确定运行该服务的真实用户")
-	}
-	p := m.receiverPaths()
-	if _, err := os.Stat(p.Plist); err != nil {
-		return fmt.Errorf("接收端还没部署过（找不到 %s），请先安装", p.Plist)
-	}
-
-	token := strings.TrimSpace(newToken)
-	if token == "" {
-		t, err := randomHex(16)
-		if err != nil {
-			return err
-		}
-		token = receiverTokenPrefix + t
-		result.step(ctx, "已生成新的随机密钥")
-	} else {
-		if err := ValidateReceiverToken(token); err != nil {
-			return err
-		}
-		result.step(ctx, "使用你指定的新密钥")
-	}
-
-	host := m.existingReceiverHost(p)
-	if host == "" {
-		host = "0.0.0.0"
-		result.step(ctx, "（原 plist 里没读到监听地址，按 0.0.0.0 处理）")
-	} else {
-		result.step(ctx, "保持原监听地址 "+host+" 不变")
-	}
-
-	if err := m.applyReceiverPlist(ctx, result, p, token, host); err != nil {
-		return err
-	}
-
-	// 用新密钥真的调一次：200 才算成功。只看 launchd 状态是不够的 ——
-	// 服务起来了但还用着旧密钥，是这次操作最可能的失败形态。
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		code, err := httpGetStatus(ctx, fmt.Sprintf("http://127.0.0.1:%d/jobs", receiverPort), token)
-		if err == nil && code == 200 {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("接收端已重载，但用新密钥访问 /jobs 仍不通（最后状态：%d %v）。"+
-				"服务可能没起来，请查看日志 %s", code, err, p.ErrLog)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	result.step(ctx, "新密钥已生效（/jobs 用新密钥返回 200）")
-
-	// 旧密钥必须失效 —— 否则"换密钥"是假的。这一步是这次改动的安全语义。
-	code, err := httpGetStatus(ctx, fmt.Sprintf("http://127.0.0.1:%d/jobs", receiverPort), "ttsv-definitely-not-the-key")
-	if err == nil && code == 200 {
-		return fmt.Errorf("新密钥生效了，但错误密钥也能访问 —— 鉴权没有真正开启，请检查 plist 的 --token")
-	}
-	result.step(ctx, "错误密钥仍被拒绝（403），鉴权正常")
-
-	// 密钥只放在 result.Token 里（前端做成可复制区块），**不进步骤文本**：
-	// 步骤会被写进操作审计，密钥不该留在审计日志里。
-	result.Steps = append(result.Steps,
-		"",
-		"┌─────────────────────────────────────────────┐",
-		"│  网站 TtsVoice 插件要同步改成新密钥         │",
-		"└─────────────────────────────────────────────┘",
-		"  需要改的是 openaiKey（接收端密钥由它自动推导）：",
-		"    refUploadToken = openaiKey = 新密钥（见下方可复制区块）",
-		"  改完之前，网站的上传音色与合成任务会 403。",
-	)
-	result.Token = token
-	result.Address = m.primaryIP()
-	return nil
-}
-
 // httpGetStatus 用指定密钥 GET 一个地址，只看状态码。
 func httpGetStatus(ctx context.Context, url, token string) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -411,7 +716,8 @@ func (m *Manager) existingReceiverToken(p receiverPaths) string {
 	// 取 --token 后面那个字符串
 	lines := strings.Split(string(b), "\n")
 	for i, ln := range lines {
-		if strings.Contains(ln, "--token") && i+1 < len(lines) {
+		// 同上：必须精确匹配参数行（模板注释里会出现 --token 这个词）
+		if strings.TrimSpace(ln) == "<string>--token</string>" && i+1 < len(lines) {
 			v := strings.TrimSpace(lines[i+1])
 			v = strings.TrimPrefix(v, "<string>")
 			v = strings.TrimSuffix(v, "</string>")
@@ -480,14 +786,175 @@ func (m *Manager) receiverBaseURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", receiverPort)
 }
 
-// receiverToken 读当前接收端密钥；未部署时返回错误（而不是空串 ——
-// 空串在接收端语义里是"不鉴权"，会把"没部署"伪装成"权限正常"）。
+// receiverToken 取一把可用于调用接收端自身的密钥；未部署时返回错误
+// （而不是空串 —— 空串在接收端语义里是"不鉴权"，会把"没部署"伪装成"权限正常"）。
+//
+// v1.6.0：优先用 keys.json 里第一条启用的密钥；还没迁移的机器回退到 plist 的 --token。
 func (m *Manager) receiverToken() (string, error) {
 	p := m.receiverPaths()
 	if _, err := os.Stat(p.Plist); err != nil {
 		return "", fmt.Errorf("接收端还没部署过（找不到 %s）", p.Plist)
 	}
+	if keys, err := m.LoadVoiceKeys(); err == nil {
+		for _, k := range keys {
+			if k.Enabled && k.Key != "" {
+				return k.Key, nil
+			}
+		}
+	}
 	return m.existingReceiverToken(p), nil
+}
+
+// VoiceUsage 读接收端的 /usage（各密钥额度/已用 + 全局合计）。
+func (m *Manager) VoiceUsage(ctx context.Context) (map[string]any, error) {
+	code, body, err := m.receiverCall(ctx, http.MethodGet, "/usage", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if code == http.StatusNotFound {
+		return nil, fmt.Errorf("接收端版本过旧（没有 /usage）。" +
+			"请在应用市场重新部署「音色样本接收端」，把它升到 v1.6.0")
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("接收端返回 %d：%s", code, receiverErrorMessage(code, body))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("接收端响应无法解析：%v", err)
+	}
+	return doc, nil
+}
+
+// VoiceKeysView 把 keys.json 与接收端的实时用量合并成面板要用的列表。
+//
+// 合并在这里做（而不是让前端拼）：额度、剩余、今日字数这些字段必须来自
+// 接收端的实际统计，缺一个就会出现"面板显示还有额度、实际已经调不动"。
+func (m *Manager) VoiceKeysView(ctx context.Context) (map[string]any, error) {
+	keys, err := m.LoadVoiceKeys()
+	if err != nil {
+		return nil, err
+	}
+	if keys == nil {
+		keys = []VoiceKey{}
+	}
+
+	usage, uerr := m.VoiceUsage(ctx)
+
+	byID := map[string]map[string]any{}
+	total := map[string]any{}
+	if uerr == nil {
+		if list, ok := usage["keys"].([]any); ok {
+			for _, item := range list {
+				mm, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, _ := mm["id"].(string); id != "" {
+					byID[id] = mm
+				}
+			}
+		}
+		if t, ok := usage["total"].(map[string]any); ok {
+			total = t
+		}
+	}
+
+	views := make([]VoiceKeyView, 0, len(keys))
+	seen := map[string]bool{}
+	fromUsage := func(id string) map[string]any { return byID[id] }
+	num := func(mm map[string]any, k string) int64 {
+		if mm == nil {
+			return 0
+		}
+		switch v := mm[k].(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
+		}
+		return 0
+	}
+
+	for _, k := range keys {
+		seen[k.ID] = true
+		u := fromUsage(k.ID)
+		view := VoiceKeyView{
+			VoiceKey:       k,
+			UsedChars:      num(u, "used_chars"),
+			RemainingChars: num(u, "remaining_chars"),
+			Unlimited:      k.QuotaChars <= 0,
+			TodayChars:     num(u, "today_chars"),
+			WeekChars:      num(u, "week_chars"),
+			Requests:       num(u, "requests"),
+			Jobs:           num(u, "jobs"),
+			AudioBytes:     num(u, "audio_bytes"),
+			FirstUsed:      num(u, "first_used"),
+			LastUsed:       num(u, "last_used"),
+		}
+		if k.QuotaChars > 0 {
+			view.RemainingChars = k.QuotaChars - view.UsedChars
+			if view.RemainingChars < 0 {
+				view.RemainingChars = 0
+			}
+		}
+		if u != nil {
+			if days, ok := u["days"].(map[string]any); ok {
+				view.Days = map[string]int64{}
+				for d, v := range days {
+					if f, ok := v.(float64); ok {
+						view.Days[d] = int64(f)
+					}
+				}
+			}
+		}
+		views = append(views, view)
+	}
+
+	// 接收端报的、但 keys.json 里没有的条目：可能是 plist 兼容密钥（legacy），
+	// 也可能是已经删掉的密钥留下的历史用量（deleted）。两者都要显示出来 ——
+	// 前者其实还能调用，后者是"总量对得上"的依据。
+	legacy := false
+	for _, item := range byID {
+		id, _ := item["id"].(string)
+		if id == "" || seen[id] {
+			continue
+		}
+		isLegacy, _ := item["legacy"].(bool)
+		isDeleted, _ := item["deleted"].(bool)
+		if isLegacy {
+			legacy = true
+		}
+		name, _ := item["name"].(string)
+		views = append(views, VoiceKeyView{
+			VoiceKey: VoiceKey{
+				ID: id, Name: name, QuotaChars: 0,
+				Enabled: isLegacy, // 兼容密钥其实还能调用
+			},
+			UsedChars:  num(item, "used_chars"),
+			Unlimited:  true,
+			TodayChars: num(item, "today_chars"),
+			WeekChars:  num(item, "week_chars"),
+			Requests:   num(item, "requests"),
+			Jobs:       num(item, "jobs"),
+			AudioBytes: num(item, "audio_bytes"),
+			FirstUsed:  num(item, "first_used"),
+			LastUsed:   num(item, "last_used"),
+			Deleted:    isDeleted,
+			Legacy:     isLegacy,
+		})
+	}
+
+	out := map[string]any{
+		"keys":  views,
+		"total": total,
+		"path":  m.receiverPaths().Keys,
+		// legacy=true 表示这台机器还在用 plist 里的兼容密钥（重新部署后会迁移成可管理的密钥）
+		"legacy": legacy,
+	}
+	if uerr != nil {
+		out["usage_error"] = uerr.Error()
+	}
+	return out, nil
 }
 
 // receiverCall 调一次接收端接口，返回状态码与响应体。
@@ -611,7 +1078,7 @@ func (m *Manager) VoiceSourceDelete(ctx context.Context, source string) error {
 }
 
 // receiverPlist 生成系统级 LaunchDaemon 定义。
-func receiverPlist(p receiverPaths, user, token, host string) string {
+func receiverPlist(p receiverPaths, user, host string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -638,7 +1105,10 @@ func receiverPlist(p receiverPaths, user, token, host string) string {
         <string>%s</string>
         <string>--port</string>
         <string>%d</string>
-        <string>--token</string>
+        <!-- v1.6.0：密钥与每密钥额度都在这个文件里（面板写、接收端按 mtime 热加载）。
+             所以 plist 里**不再放密钥**：加一个网站的密钥不需要重启正在跑合成的服务。
+             （老 plist 里的 --token 仍被接收端接受，重新部署时会被迁移进这个文件。） -->
+        <string>--keys-file</string>
         <string>%s</string>
         <!-- 上游 Qwen 服务只监听 127.0.0.1，由本代理对外提供鉴权 -->
         <string>--upstream</string>
@@ -661,7 +1131,7 @@ func receiverPlist(p receiverPaths, user, token, host string) string {
     <string>%s</string>
 </dict>
 </plist>
-`, receiverLabel, user, p.Script, p.Samples, p.Jobs, host, receiverPort, token, qwenUpstream,
+`, receiverLabel, user, p.Script, p.Samples, p.Jobs, host, receiverPort, p.Keys, qwenUpstream,
 		p.Dir, p.OutLog, p.ErrLog)
 }
 

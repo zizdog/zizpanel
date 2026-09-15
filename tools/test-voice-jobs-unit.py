@@ -333,6 +333,113 @@ def main():
              w.getnframes() == 1000 and w.readframes(1000) == pcm0, w.getnframes())
     shutil.rmtree(d, ignore_errors=True)
 
+    # ================= v1.6.0：多密钥 / 额度 / 用量 =================
+    print("\n【v1.6.0 count_chars：额度单位是字符数】")
+    c.ok("中文按 1 字算", m.count_chars("你好世界") == 4)
+    c.ok("中英混排各算 1", m.count_chars("你好ab") == 4)
+    c.ok("标点与空格也算（口径要可预测）", m.count_chars("你好，世界。") == 6)
+    c.ok("空/None → 0", m.count_chars("") == 0 and m.count_chars(None) == 0)
+
+    print("\n【v1.6.0 密钥 id / 密钥表匹配】")
+    c.ok("合法 id 接受", all(m.valid_key_id(x) for x in ("k-a1b2", "default", "站点" if False else "abc_123")))
+    c.ok("非法 id 拒绝（含路径与空格）",
+         not any(m.valid_key_id(x) for x in ("", "../x", "a b", "a/b", "x" * 65, None)))
+
+    kdir = os.path.join(work, "keys-unit")
+    os.makedirs(kdir, exist_ok=True)
+    kpath = os.path.join(kdir, "keys.json")
+    m.ARGS.token = ""          # 这一段只测密钥表本身，先关掉兼容 --token
+    m.KEYSTORE = m.KeyStore(kpath)
+    m.USAGE = m.UsageStore(os.path.join(kdir, "usage.json"))
+
+    def write_keys(keys):
+        with open(kpath, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "keys": keys}, fh, ensure_ascii=False)
+
+    write_keys([
+        {"id": "k-a", "name": "A", "key": "KEY-A", "quota_chars": 5, "enabled": True},
+        {"id": "k-off", "name": "停用", "key": "KEY-OFF", "enabled": False},
+    ])
+    c.ok("匹配到启用的密钥", m.KEYSTORE.match("KEY-A")[0] == "ok"
+         and m.KEYSTORE.match("KEY-A")[1]["id"] == "k-a", m.KEYSTORE.match("KEY-A"))
+    c.ok("停用的密钥 → disabled（不是 no，也不是 ok）",
+         m.KEYSTORE.match("KEY-OFF")[0] == "disabled", m.KEYSTORE.match("KEY-OFF"))
+    c.ok("不存在的密钥 → no", m.KEYSTORE.match("NOPE")[0] == "no")
+    c.ok("空密钥 → no", m.KEYSTORE.match("")[0] == "no")
+    c.ok("启用计数只算启用的", m.KEYSTORE.enabled_count() == 1, m.KEYSTORE.enabled_count())
+    c.ok("额度读得到", m.KEYSTORE.quota("k-a") == 5 and m.KEYSTORE.quota("nope") == 0)
+
+    print("\n【v1.6.0 密钥表热加载（按 mtime，不需要重启服务）】")
+    write_keys([
+        {"id": "k-a", "name": "A", "key": "KEY-A", "quota_chars": 5, "enabled": True},
+        {"id": "k-new", "name": "新", "key": "KEY-NEW", "enabled": True},
+    ])
+    time.sleep(0.02)
+    os.utime(kpath, None)      # 保证 mtime 变化（同秒内写入时 mtime 可能不变）
+    c.ok("新增的密钥立刻生效", m.KEYSTORE.match("KEY-NEW")[0] == "ok", m.KEYSTORE.all())
+
+    print("\n【v1.6.0 密钥表读坏时不能把所有人挡在门外】")
+    with open(kpath, "w", encoding="utf-8") as fh:
+        fh.write("{ 这不是 json")
+    os.utime(kpath, None)
+    c.ok("文件损坏时保留上一次的内存表（服务不中断）",
+         m.KEYSTORE.match("KEY-A")[0] == "ok", m.KEYSTORE.all())
+
+    print("\n【v1.6.0 兼容 --token：仍可用，并按 default 记账】")
+    m.ARGS.token = "LEGACY-TOKEN"
+    c.ok("--token 仍然通过（老 plist 不升级也能跑）",
+         m.KEYSTORE.match("LEGACY-TOKEN")[0] == "ok"
+         and m.KEYSTORE.match("LEGACY-TOKEN")[1]["id"] == "default",
+         m.KEYSTORE.match("LEGACY-TOKEN"))
+    m.ARGS.token = ""
+
+    print("\n【v1.6.0 额度检查】")
+    # 把密钥表恢复成可读
+    write_keys([{"id": "k-a", "name": "A", "key": "KEY-A", "quota_chars": 5, "enabled": True}])
+    os.utime(kpath, None)
+    c.ok("不限量（quota=0）永远通过", m.quota_check("k-unknown", 999999)[0] == "")
+    err, _ = m.quota_check("k-a", 5)
+    c.ok("用满额度：正好等于上限时通过", err == "", err)
+    err, _ = m.quota_check("k-a", 6)
+    c.ok("超过剩余额度时报错，且错误里带三个数字",
+         err and all(x in err for x in ("额度 5 字", "已用 0 字", "本次需要 6 字")), err)
+
+    print("\n【v1.6.0 用量记账：累计 + 按天 + 落盘】")
+    upath = os.path.join(kdir, "usage.json")
+    u = m.UsageStore(upath)
+    u.record("k-a", chars=10, requests=1, jobs=1)
+    u.record("k-a", chars=5, requests=2, audio_bytes=100)
+    u.record("k-b", chars=7, requests=1, jobs=1)
+    c.ok("累计字数按密钥分开记", u.chars("k-a") == 15 and u.chars("k-b") == 7,
+         (u.chars("k-a"), u.chars("k-b")))
+    items, total = u.view()
+    by = {i["id"]: i for i in items}
+    c.ok("视图里有密钥表里的 k-a（额度 5）",
+         by.get("k-a", {}).get("quota_chars") == 5 and not by.get("k-a", {}).get("deleted"),
+         by.get("k-a"))
+    c.ok("有历史用量、但已不在密钥表里的 k-b → 标记 deleted（总量才对得上）",
+         by.get("k-b", {}).get("deleted") is True
+         and by.get("k-b", {}).get("used_chars") == 7, by.get("k-b"))
+    c.ok("剩余额度 = max(0, 5-15) = 0（超额不会算成负数）",
+         by.get("k-a", {}).get("remaining_chars") == 0, by.get("k-a"))
+    c.ok("今日字数正确", by.get("k-a", {}).get("today_chars") == 15, by.get("k-a"))
+    c.ok("合计包含所有密钥", total.get("chars") == 22 and total.get("requests") == 4, total)
+    c.ok("按天曲线里有今天", m.today_str() in (total.get("days") or {}), total.get("days"))
+
+    u2 = m.UsageStore(upath)
+    c.ok("重新加载（模拟重启）后用量还在", u2.chars("k-a") == 15, u2.chars("k-a"))
+
+    print("\n【v1.6.0 按天明细只留最近 60 天】")
+    u3 = m.UsageStore(os.path.join(kdir, "usage-prune.json"))
+    old_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 400 * 86400))
+    entry = u3._entry("k-x")
+    for i in range(m.USAGE_DAYS_KEEP + 5):
+        entry["days"][time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))] = {"chars": 1}
+    u3._prune(entry)
+    c.ok("只保留最近 %d 天" % m.USAGE_DAYS_KEEP,
+         len(entry["days"]) == m.USAGE_DAYS_KEEP, len(entry["days"]))
+    c.ok("最老的那天被清掉", old_day not in entry["days"], sorted(entry["days"])[:2])
+
     shutil.rmtree(work, ignore_errors=True)
 
     print("\n" + ("全部通过 ✅" if not c.fails else "存在失败项 ❌ %s" % c.fails))

@@ -2,6 +2,7 @@ package services
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,11 +17,12 @@ func TestReceiverPlistHostIsConfigurable(t *testing.T) {
 	p := receiverPaths{
 		Dir: "/Users/u/tts/voice-receiver", Script: "/Users/u/tts/voice-receiver/receiver.py",
 		Samples: "/Users/u/tts/voice-samples", Jobs: "/Users/u/tts/jobs",
+		Keys:   "/Users/u/tts/voice-receiver/keys.json",
 		OutLog: "/tmp/out.log", ErrLog: "/tmp/err.log",
 		Plist: "/Library/LaunchDaemons/com.zizdog.voicereceiver.plist",
 	}
 
-	local := receiverPlist(p, "zizdog", "ttsv-abc", "127.0.0.1")
+	local := receiverPlist(p, "zizdog", "127.0.0.1")
 	if !strings.Contains(local, "<string>127.0.0.1</string>") {
 		t.Error("本机部署应能写成 127.0.0.1（只给同机的网站用，不暴露到局域网）")
 	}
@@ -28,17 +30,24 @@ func TestReceiverPlistHostIsConfigurable(t *testing.T) {
 		t.Error("传了 127.0.0.1 就不该同时出现 0.0.0.0")
 	}
 
-	lan := receiverPlist(p, "zizdog", "ttsv-abc", "0.0.0.0")
+	lan := receiverPlist(p, "zizdog", "0.0.0.0")
 	if !strings.Contains(lan, "<string>0.0.0.0</string>") {
 		t.Error("mini 部署仍应是 0.0.0.0")
 	}
 
-	// 密钥、脚本路径、作业目录都要照旧写进去（模板改动不能碰坏这些）
-	for _, want := range []string{"ttsv-abc", p.Script, p.Samples, p.Jobs,
-		"com.zizdog.voicereceiver", "--jobs-dir", qwenUpstream} {
+	// 脚本路径、样本/作业目录、密钥表路径都要写进去（模板改动不能碰坏这些）
+	for _, want := range []string{p.Script, p.Samples, p.Jobs, p.Keys,
+		"com.zizdog.voicereceiver", "--jobs-dir", "--keys-file", qwenUpstream} {
 		if !strings.Contains(local, want) {
 			t.Errorf("plist 里缺少 %q", want)
 		}
+	}
+
+	// v1.6.0：plist 里**不该**再有密钥参数 —— 它在 keys.json（热加载）。
+	// 留着 --token 的后果是：改密钥要重启正在合成中的服务，而且两份真值会漂移。
+	// （模板注释里会提到 --token 这个词，所以只断言参数行本身。）
+	if strings.Contains(local, "<string>--token</string>") {
+		t.Error("plist 里不该再写 --token 参数（密钥已迁到 keys.json）")
 	}
 }
 
@@ -75,11 +84,12 @@ func TestExistingReceiverHostReadsPlist(t *testing.T) {
 	m := NewManager(nil, Options{UserName: "zizdog", UserHome: dir})
 	p := receiverPaths{
 		Dir: dir, Script: dir + "/receiver.py", Samples: dir + "/samples",
-		Jobs: dir + "/jobs", OutLog: dir + "/o.log", ErrLog: dir + "/e.log",
+		Jobs: dir + "/jobs", Keys: dir + "/keys.json",
+		OutLog: dir + "/o.log", ErrLog: dir + "/e.log",
 		Plist: dir + "/com.zizdog.voicereceiver.plist",
 	}
 	write := func(host string) {
-		plist := receiverPlist(p, "zizdog", "ttsv-abc12345", host)
+		plist := receiverPlist(p, "zizdog", host)
 		if err := os.WriteFile(p.Plist, []byte(plist), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -194,3 +204,180 @@ func TestExistingReceiverTokenAcceptsCustomToken(t *testing.T) {
 		t.Errorf("空密钥应返回空串，实际 %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+//  v1.6.0 多密钥 / 额度
+// ---------------------------------------------------------------------------
+
+// newKeyTestManager 造一个只碰临时目录的 Manager。
+//
+// UserName 必须留空：SaveVoiceKeys 会按运行用户 chown，
+// 而测试里那个用户不存在（也不能去动真实用户的文件归属）。
+func newKeyTestManager(t *testing.T) (*Manager, receiverPaths) {
+	t.Helper()
+	dir := t.TempDir()
+	m := NewManager(nil, Options{UserHome: dir})
+	p := m.receiverPaths()
+	if err := os.MkdirAll(p.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// receiverPaths() 里的 Plist 是**真实系统路径**（/Library/LaunchDaemons/…）。
+	// 测试必须把它改到临时目录：这条断言曾经真的去写过真实 plist
+	// （当时因为权限不够才没造成破坏，纯属侥幸）。
+	p.Plist = filepath.Join(dir, receiverLabel+".plist")
+	if err := m.SaveVoiceKeys(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(p.Keys, dir) || !strings.HasPrefix(p.Plist, dir) {
+		t.Fatalf("测试路径必须全在临时目录里：keys=%s plist=%s", p.Keys, p.Plist)
+	}
+	return m, p
+}
+
+func TestVoiceKeyStoreRoundTrip(t *testing.T) {
+	m, p := newKeyTestManager(t)
+
+	if keys, err := m.LoadVoiceKeys(); err != nil || keys != nil {
+		t.Fatalf("密钥表不存在时应返回空表而不是错误：%v %v", keys, err)
+	}
+
+	k1, err := m.NewVoiceKey("A 站", "", 1000, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(k1.Key, receiverTokenPrefix) || len(k1.Key) != len(receiverTokenPrefix)+32 {
+		t.Errorf("自动生成的密钥应为 %s<32 hex>，实际 %q", receiverTokenPrefix, k1.Key)
+	}
+	if k1.ID == "" || !strings.HasPrefix(k1.ID, "k-") {
+		t.Errorf("密钥 id 应形如 k-<hex>，实际 %q", k1.ID)
+	}
+
+	if err := m.SaveVoiceKeys([]VoiceKey{k1}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := m.LoadVoiceKeys()
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("应读回 1 条密钥：%v %v", keys, err)
+	}
+	if keys[0].Name != "A 站" || keys[0].QuotaChars != 1000 || !keys[0].Enabled {
+		t.Errorf("密钥字段没有原样落盘：%+v", keys[0])
+	}
+	// 文件里是明文密钥，权限必须是 0600（接收端以运行用户读取）
+	if fi, err := os.Stat(p.Keys); err == nil {
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("密钥表权限应为 0600，实际 %o", fi.Mode().Perm())
+		}
+	}
+}
+
+func TestVoiceKeyGuards(t *testing.T) {
+	m, _ := newKeyTestManager(t)
+
+	if _, err := m.NewVoiceKey("x", "bad value with space", 0, true); err == nil {
+		t.Error("带空格的密钥值应被拒（会写坏/难用）")
+	}
+	if _, err := m.AddVoiceKey("负额度", "", -5, true); err == nil {
+		t.Error("负额度应被拒")
+	}
+
+	k1, err := m.AddVoiceKey("A", "", 100, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := m.AddVoiceKey("B", "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.AddVoiceKey("重值", k1.Key, 0, true); err == nil {
+		t.Error("重复的密钥值应被拒（否则两把密钥共用同一份额度）")
+	}
+
+	// 停用/删除最后一条**启用**的密钥 = 一键把所有人关在门外，必须拦住
+	if _, err := m.UpdateVoiceKey(k1.ID, nil, nil, boolPtr(false), nil); err != nil {
+		t.Fatalf("还有 B 启用时，停用 A 应当允许：%v", err)
+	}
+	if _, err := m.UpdateVoiceKey(k2.ID, nil, nil, boolPtr(false), nil); err == nil {
+		t.Error("停用最后一条启用的密钥应被拒")
+	}
+	if err := m.DeleteVoiceKey(k2.ID); err == nil {
+		t.Error("删除最后一条启用的密钥应被拒")
+	}
+
+	// 恢复 A、删掉 B，然后再删 A 也不行（那就一条都不剩了）
+	if _, err := m.UpdateVoiceKey(k1.ID, nil, nil, boolPtr(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteVoiceKey(k2.ID); err != nil {
+		t.Fatalf("B 未启用，删它应当允许：%v", err)
+	}
+	if err := m.DeleteVoiceKey(k1.ID); err == nil {
+		t.Error("删掉唯一一条启用的密钥应被拒")
+	}
+
+	if _, err := m.UpdateVoiceKey("k-nope", nil, nil, nil, nil); err == nil {
+		t.Error("改一条不存在的密钥应报错")
+	}
+	if err := m.DeleteVoiceKey("k-nope"); err == nil {
+		t.Error("删一条不存在的密钥应报错")
+	}
+}
+
+func TestEnsureVoiceKeysMigratesLegacyToken(t *testing.T) {
+	m, p := newKeyTestManager(t)
+
+	legacy := "ttsv-legacytoken0123456789abcdef"
+	plist := receiverPlist(p, "zizdog", "127.0.0.1")
+	// 手工塞一个老式 --token 进去，模拟"还没迁移的机器"
+	plist = strings.Replace(plist, "        <string>--keys-file</string>",
+		"        <string>--token</string>\n        <string>"+legacy+"</string>\n"+
+			"        <string>--keys-file</string>", 1)
+	if err := os.WriteFile(p.Plist, []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.existingReceiverToken(p); got != legacy {
+		t.Fatalf("前置条件：应能从 plist 读回老密钥，实际 %q", got)
+	}
+
+	fresh, primary, err := m.ensureVoiceKeys(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh || primary != legacy {
+		t.Errorf("迁移后应沿用老密钥（网站不能被迫改配置），实际 fresh=%v key=%q", fresh, primary)
+	}
+	keys, err := m.LoadVoiceKeys()
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("迁移后应有 1 条密钥：%v %v", keys, err)
+	}
+	if keys[0].ID != "default" || keys[0].Key != legacy || !keys[0].Enabled {
+		t.Errorf("迁移出的密钥应是 default/启用且值不变：%+v", keys[0])
+	}
+
+	// 幂等：再跑一次不会多出一条，也不会改掉已有密钥
+	fresh2, primary2, err := m.ensureVoiceKeys(p, "ttsv-somethingelse0000000000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh2 || primary2 != legacy {
+		t.Errorf("重复调用应保持原样（不能因为安装参数就换掉线上密钥）：fresh=%v key=%q",
+			fresh2, primary2)
+	}
+	if keys2, _ := m.LoadVoiceKeys(); len(keys2) != 1 {
+		t.Errorf("重复调用不该新增密钥，实际 %d 条", len(keys2))
+	}
+}
+
+func TestVoiceKeyIDValidation(t *testing.T) {
+	for _, good := range []string{"k-a1b2", "default", "abc_123", "K-9"} {
+		if _, err := VoiceKeyID(good); err != nil {
+			t.Errorf("%q 应当接受：%v", good, err)
+		}
+	}
+	for _, bad := range []string{"", "../x", "a b", "a/b", strings.Repeat("x", 65)} {
+		if _, err := VoiceKeyID(bad); err == nil {
+			t.Errorf("%q 应当被拒（会进 URL）", bad)
+		}
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

@@ -22,10 +22,11 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
      这个代理认这个头（也认 X-TtsVoice-Token），对上就转发。
 
 【接口】
-    GET  /voice/health              → 健康检查
+    GET  /voice/health              → 健康检查（无需密钥）
     GET  /health                    → 同上
     GET  /voice/status              → 上游模型驻留状态（v1.2.0 新增，只读）
                                       回答"网站下一个请求要不要等冷加载"
+    GET  /usage                     → 各密钥的额度/已用/今日/近 7 天 + 总量（v1.6.0）
     POST /voice                     Header: X-TtsVoice-Token / X-TtsVoice-Name
                                            / X-TtsVoice-Source（v1.5.0 新增）
                                     Body: 音频二进制
@@ -72,6 +73,22 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
   没有 ffmpeg 时不假装成功：只接受已是 24kHz/16bit/单声道的 wav，其余
   明确报错让用户去装 ffmpeg（宁可用不了，也不要再产出一个解码不了的文件）。
 
+【v1.6.0 多密钥 + 额度 + 用量】密钥从 plist 的单个 --token 挪到 keys.json：
+
+    · **多密钥**：每个网站（或每个调用方）一把密钥，面板里"添加密钥"即可，
+      按 mtime **热加载**，加/停/删都不需要重启正在跑合成的服务。
+    · **每密钥额度（单位：字）**：`quota_chars`，0 = 不限。按**提交文本的
+      字符数**计费（`len(text)`，中文 1 字算 1、含标点）。超额返回
+      **429** 且 error 以 `quota exceeded:` 开头（与 403 密钥错误区分开，
+      否则调用方会把"额度用完"当成"密钥错"去重试）。
+    · **用量统计**：usage.json 按密钥累计 chars / requests / jobs / audio_bytes，
+      另存最近 60 天的按天明细；`GET /usage` 返回每个密钥的额度、已用、剩余、
+      今日、近 7 天，以及全局合计与 30 天曲线。
+    · 调用被拒（密钥错/停用）**不计**用量；上游失败只计一次请求、不计字数与字节。
+    · 幂等重放（同一 client_id）不重复扣额度。
+    · `--token` 仍可用（兼容已部署的 plist）；面板重新部署接收端时会把它
+      迁移成 keys.json 里的一条 default 记录，之后密钥完全由文件管理。
+
 【v1.3.0 新增 /jobs/*】把「任务队列 + 逐块合成」搬到本机（契约见网站侧
 usr/plugins/TtsVoice/SPEC-TO-MINI-job-queue.md），这样**浏览器/网站关掉任务也能跑完**：
 
@@ -116,7 +133,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
@@ -682,6 +699,360 @@ def valid_job_id(job_id):
     return bool(re.match(r"^j-[0-9]{6,}-[0-9a-f]{4,16}$", job_id or ""))
 
 
+# ---------------- 多密钥 + 额度 + 用量（v1.6.0）----------------
+#
+# 为什么把密钥从 plist 挪到文件：
+#   plist 里的 --token 是"一个共享密钥"，改一次要重写 root 拥有的 plist 并重启服务。
+#   多密钥 + 每密钥额度 + 用量统计这三件事都需要一个**可热更新**的存储，
+#   所以：密钥与额度放 keys.json（面板写、接收端读，按 mtime 热加载），
+#   用量放 usage.json（接收端写、面板通过 /usage 读）。
+#
+#   --token 仍然保留为兼容回退：老 plist 里那一份不升级也能继续用；
+#   面板"重新部署接收端"时会把它迁移成 keys.json 里的一条 default 记录并清掉 plist 里的值。
+
+KEYS_FILE_VERSION = 1
+USAGE_FILE_VERSION = 1
+USAGE_DAYS_KEEP = 60          # 只保留最近 60 天的按天统计，避免文件无限增长
+
+
+def valid_key_id(key_id):
+    """密钥 id 会出现在 URL 与日志里，限制成安全字符集。"""
+    return bool(re.match(r"^[A-Za-z0-9_-]{1,64}$", key_id or ""))
+
+
+def today_str(ts=None):
+    return time.strftime("%Y-%m-%d", time.localtime(ts or time.time()))
+
+
+class KeyStore:
+    """
+    密钥表（面板写的 keys.json）。
+
+    按 mtime 热加载：面板加一条密钥后**不需要重启接收端** ——
+    否则每加一个网站的密钥都要重启一次正在跑合成的服务。
+    文件损坏/读不到时**不缓存空表**：宁可每次重试读盘，也不要因为一次
+    瞬时读取失败就把所有人挡在门外（那时面板写一次文件即可恢复）。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.mtime = None
+        self.keys = []
+        self.error = ""
+
+    def _load(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            self.keys, self.mtime, self.error = [], None, ""
+            return
+
+        if self.mtime is not None and st.st_mtime == self.mtime:
+            return
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            keys = doc.get("keys") if isinstance(doc, dict) else None
+            if not isinstance(keys, list):
+                raise ValueError("keys 不是数组")
+        except (OSError, ValueError) as exc:
+            # 读失败不改动已有内存表：一次读盘失败不该让线上所有密钥失效
+            self.error = str(exc)
+            log("⚠️ 密钥表读取失败（保留上一次的表）：%s" % exc)
+            return
+
+        self.keys = [k for k in keys if isinstance(k, dict)]
+        self.mtime = st.st_mtime
+        self.error = ""
+
+    def all(self):
+        with self.lock:
+            self._load()
+            return list(self.keys)
+
+    def enabled_count(self):
+        return sum(1 for k in self.all() if k.get("enabled", True))
+
+    def match(self, presented):
+        """
+        返回 (结果, 密钥记录)：
+          "ok"      验证通过（记录可能为 None = 兼容的 --token）
+          "disabled"密钥存在但被停用
+          "no"      没有匹配
+        用常数时间比较，避免时序侧信道。
+        """
+        if not presented:
+            return "no", None
+
+        hit = None
+        hit_disabled = False
+
+        for k in self.all():
+            value = str(k.get("key") or "")
+            if value and hmac.compare_digest(presented, value):
+                if k.get("enabled", True):
+                    hit = k
+                    break
+                hit_disabled = True
+
+        if hit is not None:
+            return "ok", hit
+
+        if hit_disabled:
+            return "disabled", None
+
+        # 兼容回退：plist 里的 --token（还没迁移的机器）。额度按 0=不限处理。
+        if ARGS.token and hmac.compare_digest(presented, ARGS.token):
+            return "ok", {"id": "default", "name": "默认密钥（来自服务配置）",
+                          "quota_chars": 0, "enabled": True}
+
+        return "no", None
+
+    def quota(self, key_id):
+        for k in self.all():
+            if k.get("id") == key_id:
+                try:
+                    return max(0, int(k.get("quota_chars") or 0))
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def name(self, key_id):
+        for k in self.all():
+            if k.get("id") == key_id:
+                return str(k.get("name") or key_id)
+        return key_id
+
+
+class UsageStore:
+    """
+    用量统计（接收端写的 usage.json）。
+
+    统计口径（面板与日志都按这套说）：
+      · chars        = 提交文本的**字符数**（len(text)，中文 1 字算 1，含标点）
+      · requests     = 鉴权通过的接口调用次数
+      · jobs         = 提交的合成任务数
+      · audio_bytes  = 下载出去的音频字节数
+    按密钥 + 按天（保留 60 天）双份记账。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.doc = {"version": USAGE_FILE_VERSION, "updated": 0, "keys": {}}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if isinstance(doc, dict) and isinstance(doc.get("keys"), dict):
+                self.doc = doc
+        except (OSError, ValueError):
+            pass
+
+    def _save(self):
+        try:
+            self.doc["updated"] = int(time.time())
+            atomic_write(self.path, json.dumps(self.doc, ensure_ascii=False, indent=1).encode())
+        except OSError as exc:
+            # 统计写不进去不能影响合成：只记日志
+            log("⚠️ 用量统计写入失败：%s" % exc)
+
+    def _entry(self, key_id):
+        keys = self.doc.setdefault("keys", {})
+        entry = keys.get(key_id)
+        if not isinstance(entry, dict):
+            entry = {"chars": 0, "requests": 0, "jobs": 0, "audio_bytes": 0,
+                     "first_used": 0, "last_used": 0, "days": {}}
+            keys[key_id] = entry
+        if not isinstance(entry.get("days"), dict):
+            entry["days"] = {}
+        return entry
+
+    def record(self, key_id, chars=0, requests=0, jobs=0, audio_bytes=0):
+        now = int(time.time())
+        with self.lock:
+            entry = self._entry(key_id)
+            entry["chars"] += int(chars)
+            entry["requests"] += int(requests)
+            entry["jobs"] += int(jobs)
+            entry["audio_bytes"] += int(audio_bytes)
+            if not entry["first_used"]:
+                entry["first_used"] = now
+            entry["last_used"] = now
+
+            if chars or requests or jobs or audio_bytes:
+                day = today_str(now)
+                d = entry["days"].get(day)
+                if not isinstance(d, dict):
+                    d = {"chars": 0, "requests": 0, "jobs": 0, "audio_bytes": 0}
+                    entry["days"][day] = d
+                d["chars"] += int(chars)
+                d["requests"] += int(requests)
+                d["jobs"] += int(jobs)
+                d["audio_bytes"] += int(audio_bytes)
+
+            self._prune(entry)
+            self._save()
+
+    def _prune(self, entry):
+        days = entry.get("days") or {}
+        if len(days) <= USAGE_DAYS_KEEP:
+            return
+        for day in sorted(days.keys())[:-USAGE_DAYS_KEEP]:
+            days.pop(day, None)
+
+    def chars(self, key_id):
+        """已用字符数（累计）。"""
+        entry = (self.doc.get("keys") or {}).get(key_id)
+        if not isinstance(entry, dict):
+            return 0
+        try:
+            return int(entry.get("chars") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def view(self):
+        """给 /usage 用的快照：每个密钥的额度、已用、剩余、今日/近 7 天。"""
+        now = time.time()
+        today = today_str(now)
+        week_ago = today_str(now - 6 * 86400)
+        out = []
+        seen = set()
+
+        def build(key_id, name, quota):
+            entry = (self.doc.get("keys") or {}).get(key_id) or {}
+            days = entry.get("days") or {}
+            used = int(entry.get("chars") or 0)
+            today_chars = int((days.get(today) or {}).get("chars") or 0)
+            week_chars = sum(int((v or {}).get("chars") or 0)
+                             for d, v in days.items() if d >= week_ago)
+            return {
+                "id": key_id,
+                "name": name,
+                "quota_chars": quota,
+                "used_chars": used,
+                "remaining_chars": (max(0, quota - used) if quota > 0 else 0),
+                "unlimited": quota <= 0,
+                "today_chars": today_chars,
+                "week_chars": week_chars,
+                "requests": int(entry.get("requests") or 0),
+                "jobs": int(entry.get("jobs") or 0),
+                "audio_bytes": int(entry.get("audio_bytes") or 0),
+                "first_used": int(entry.get("first_used") or 0),
+                "last_used": int(entry.get("last_used") or 0),
+                "days": {d: int((v or {}).get("chars") or 0) for d, v in days.items()},
+            }
+
+        for k in KEYSTORE.all():
+            key_id = str(k.get("id") or "")
+            if not key_id:
+                continue
+            seen.add(key_id)
+            quota = 0
+            try:
+                quota = max(0, int(k.get("quota_chars") or 0))
+            except (TypeError, ValueError):
+                quota = 0
+            item = build(key_id, str(k.get("name") or key_id), quota)
+            item["enabled"] = bool(k.get("enabled", True))
+            out.append(item)
+
+        # 兼容用的 --token 还在（面板还没迁移）时，把它也列出来：
+        # 它**确实还能调用**，按"已删除/历史"显示就是谎报。
+        if ARGS.token and "default" not in seen:
+            seen.add("default")
+            item = build("default", "默认密钥（来自服务配置，未迁移）", 0)
+            item["enabled"] = True
+            item["legacy"] = True
+            out.append(item)
+
+        # 已经不在密钥表里、但留有历史用量的 id（删掉的密钥）也报出来：
+        # 否则"总量对不上"会让人以为统计坏了。界面按"已删除"展示。
+        for key_id in sorted((self.doc.get("keys") or {}).keys()):
+            if key_id in seen:
+                continue
+            item = build(key_id, "(已删除的密钥)", 0)
+            item["enabled"] = False
+            item["deleted"] = True
+            out.append(item)
+
+        total = {
+            "chars": sum(i["used_chars"] for i in out),
+            "today_chars": sum(i["today_chars"] for i in out),
+            "week_chars": sum(i["week_chars"] for i in out),
+            "requests": sum(i["requests"] for i in out),
+            "jobs": sum(i["jobs"] for i in out),
+            "audio_bytes": sum(i["audio_bytes"] for i in out),
+        }
+        # 全局按天曲线（面板画趋势用）
+        days_total = {}
+        for i in out:
+            for d, c in (i.get("days") or {}).items():
+                days_total[d] = days_total.get(d, 0) + c
+        total["days"] = dict(sorted(days_total.items())[-30:])
+        return out, total
+
+
+KEYS_FILE = None
+KEYSTORE = None
+USAGE = None
+
+
+def key_authed(handler):
+    """
+    统一的鉴权入口。返回 (key_id, 错误信息)：
+      key_id 非空 = 通过（"default" 表示未配置鉴权时的匿名调用）
+      错误信息非空 = 拒绝，调用方据此返回 403
+    """
+    store = KEYSTORE
+    configured = bool(ARGS.token) or (store is not None and store.enabled_count() > 0)
+
+    if not configured:
+        # 没配任何密钥 = 不校验，与 v1.5.0 之前的行为一致（启动时打醒目警告）
+        return "default", ""
+
+    result, rec = store.match(handler._presented_token())
+
+    if result == "ok":
+        return (str(rec.get("id")) if rec else "default"), ""
+
+    if result == "disabled":
+        return "", "密钥已被停用"
+
+    return "", "密钥不匹配"
+
+
+def quota_check(key_id, chars):
+    """
+    额度检查。返回 (错误信息, 剩余额度)：
+      错误信息非空 = 超额（调用方返回 429）
+      剩余额度为 0 表示不限量
+    """
+    quota = KEYSTORE.quota(key_id) if KEYSTORE else 0
+
+    if quota <= 0:
+        return "", 0
+
+    used = USAGE.chars(key_id)
+    remaining = max(0, quota - used)
+
+    if chars > remaining:
+        return ("额度不足：本密钥额度 %d 字，已用 %d 字，本次需要 %d 字，"
+                "剩余 %d 字。请在面板「调用密钥」里调整额度，或换一个密钥。"
+                % (quota, used, chars, remaining)), 0
+
+    return "", remaining
+
+
+def count_chars(text):
+    """统计字符串的字符数（中文按 1 个字符算）。"""
+    return len(text or "")
+
+
 class JobManager:
     """
     作业的落盘、排队与执行。
@@ -1228,14 +1599,15 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def _token_ok(self):
-        """常数时间比较，避免时序侧信道"""
-        expected = (ARGS.token or "")
+        """兼容旧调用点：只要能匹配任一启用的密钥就算通过。"""
+        return self._auth_key()[0] != ""
 
-        if not expected:
-            # 没配密钥 = 不校验。启动时会打醒目警告。
-            return True
-
-        return hmac.compare_digest(self._presented_token(), expected)
+    def _auth_key(self):
+        """
+        统一鉴权：返回 (key_id, error)。key_id 非空 = 通过。
+        v1.6.0 起密钥表（keys.json）是唯一事实来源，--token 只作兼容回退。
+        """
+        return key_authed(self)
 
     def log_message(self, fmt, *args):
         """默认实现会往 stderr 打每个请求，这里压掉，只留我们自己的 log()"""
@@ -1271,25 +1643,40 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/voice/health", "/health", ""):
             directory = ARGS.dir
+            keys = KEYSTORE.all() if KEYSTORE else []
 
             return self._json(200, {
                 "ok": True,
                 "version": VERSION,
                 "dir": os.path.abspath(directory),
                 "writable": bool(os.path.isdir(directory) and os.access(directory, os.W_OK)),
-                "auth": bool(ARGS.token),
+                # auth=true 表示"配置了鉴权"（密钥表里有启用的密钥，或还留着兼容的 --token）
+                "auth": bool(ARGS.token) or any(k.get("enabled", True) for k in keys),
+                "keys": len(keys),
+                "keys_file": os.path.abspath(ARGS.keys_file),
                 "upstream": ARGS.upstream,
             })
+
+        # ---------- /usage（v1.6.0：用量统计 + 每密钥额度）----------
+        if path == "/usage":
+            key_id, err = self._auth_key()
+            if not key_id:
+                return self._fail(403, err)
+            USAGE.record(key_id, requests=1)
+            items, total = USAGE.view()
+            return self._json(200, {"ok": True, "keys": items, "total": total})
 
         # ---------- /voice/sources（v1.5.0：面板"各来源"页）----------
         if path == "/voice/sources":
             return self._voice_sources()
 
         # ---------- /jobs/*（v1.3.0）----------
-        # 统一用 X-TtsVoice-Token 鉴权（与 /voice 同一把 token）
+        # 统一用密钥表鉴权（与 /voice 同一套）
         if path == "/jobs":
-            if not self._token_ok():
-                return self._fail_jobs(403, "unauthorized")
+            key_id, err = self._auth_key()
+            if not key_id:
+                return self._fail_jobs(403, "unauthorized" if not err else "unauthorized")
+            USAGE.record(key_id, requests=1)
             status_filter = None
             if "?" in self.path:
                 q = self.path.split("?", 1)[1]
@@ -1316,8 +1703,10 @@ class Handler(BaseHTTPRequestHandler):
         # 给网站插件一个动手前的判断依据 —— 冷模型要等约 25 秒，
         # 知道了就能提前提示用户或把超时放宽，而不是让它超时失败。
         if path in ("/voice/status", "/status"):
-            if not self._token_ok():
-                return self._fail(403, "密钥不匹配")
+            key_id, err = self._auth_key()
+            if not key_id:
+                return self._fail(403, err or "密钥不匹配")
+            USAGE.record(key_id, requests=1)
 
             models = upstream_models()
 
@@ -1341,7 +1730,7 @@ class Handler(BaseHTTPRequestHandler):
                 "models": sorted(models),
                 "models_loaded": len(models),
                 "cold_load_seconds": 25,
-                "auth": bool(ARGS.token),
+                "auth": bool(ARGS.token) or (KEYSTORE.enabled_count() > 0),
             })
 
         # 其余 GET 走代理（/v1/models 等）
@@ -1406,8 +1795,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _jobs_get(self, path):
         """GET /jobs/{id} 与 GET /jobs/{id}/audio"""
-        if not self._token_ok():
+        key_id, err = self._auth_key()
+        if not key_id:
             return self._fail_jobs(403, "unauthorized")
+        USAGE.record(key_id, requests=1)
 
         rest = path[len("/jobs/"):]
         want_audio = rest.endswith("/audio")
@@ -1482,9 +1873,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(block)
                 remaining -= len(block)
 
+        # 用量统计：下载出去的音频字节数（整段或 Range 片段的实际字节）
+        USAGE.record(key_id, audio_bytes=length)
+
     def _jobs_create(self):
-        if not self._token_ok():
-            log("拒绝提交作业：密钥不匹配（来自 %s）" % self.client_address[0])
+        key_id, err = self._auth_key()
+        if not key_id:
+            log("拒绝提交作业：%s（来自 %s）" % (err or "密钥不匹配", self.client_address[0]))
             return self._fail_jobs(403, "unauthorized")
 
         data, err = self._read_body(16 * 1024 * 1024)
@@ -1500,6 +1895,23 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             return self._fail_jobs(400, "body must be a JSON object")
 
+        # ---- 额度检查（v1.6.0）：按提交文本的字符数计 ----
+        # 幂等重放（同一 client_id）不重复扣：submit() 会直接返回已有任务。
+        client_id = str(payload.get("client_id") or "").strip()
+        existing = JOB_MANAGER.find_by_client_id(client_id) if client_id else None
+        chars = 0
+        chunks_in = payload.get("chunks")
+        if isinstance(chunks_in, list):
+            for c in chunks_in:
+                if isinstance(c, dict):
+                    chars += count_chars(str(c.get("text") or ""))
+
+        if not existing and chars > 0:
+            qerr, _ = quota_check(key_id, chars)
+            if qerr:
+                log("拒绝提交作业：%s（key=%s，%d 字）" % (qerr, key_id, chars))
+                return self._fail_jobs(429, "quota exceeded: %s" % qerr)
+
         try:
             job = JOB_MANAGER.submit(payload)
         except QueueFullError:
@@ -1510,17 +1922,23 @@ class Handler(BaseHTTPRequestHandler):
             log("提交作业失败：%s" % exc)
             return self._fail_jobs(500, "internal error: %s" % exc)
 
+        if not existing:
+            USAGE.record(key_id, chars=chars, requests=1, jobs=1)
+
         return self._json(200, {
             "ok": True,
             "job_id": job.get("job_id"),
             "status": job.get("status"),
             "total": job.get("total"),
+            "chars": chars,
         })
 
     def _jobs_delete(self, path):
         """取消/清理。幂等：未知 job 也返回 200（网站删除时不至于报错）。"""
-        if not self._token_ok():
+        key_id, err = self._auth_key()
+        if not key_id:
             return self._fail_jobs(403, "unauthorized")
+        USAGE.record(key_id, requests=1)
 
         job_id = path[len("/jobs/"):]
         if not valid_job_id(job_id):
@@ -1541,9 +1959,11 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- ① 接收音色样本 ----------
 
     def _receive_voice(self):
-        if not self._token_ok():
-            log("拒绝上传：密钥不匹配（来自 %s）" % self.client_address[0])
-            return self._fail(403, "密钥不匹配")
+        key_id, err = self._auth_key()
+        if not key_id:
+            log("拒绝上传：%s（来自 %s）" % (err or "密钥不匹配", self.client_address[0]))
+            return self._fail(403, err or "密钥不匹配")
+        USAGE.record(key_id, requests=1)
 
         data, err = self._read_body(MAX_BYTES)
 
@@ -1666,8 +2086,10 @@ class Handler(BaseHTTPRequestHandler):
         last_used 从作业记录里反查：**样本的使用时间**才是用户关心的
         （mtime 只是上传时间），而 job 里存了 source。
         """
-        if not self._token_ok():
-            return self._fail(403, "密钥不匹配")
+        key_id, err = self._auth_key()
+        if not key_id:
+            return self._fail(403, err or "密钥不匹配")
+        USAGE.record(key_id, requests=1)
 
         last_used = {}
 
@@ -1743,8 +2165,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _voice_source_delete(self, path):
         """DELETE /voice/sources/{source}：删掉该来源目录（幂等）。"""
-        if not self._token_ok():
-            return self._fail(403, "密钥不匹配")
+        key_id, err = self._auth_key()
+        if not key_id:
+            return self._fail(403, err or "密钥不匹配")
+        USAGE.record(key_id, requests=1)
 
         raw = path[len("/voice/sources/"):]
         source = sanitize_source(unquote(raw))
@@ -1774,9 +2198,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- ② 转发到 Qwen 服务 ----------
 
     def _proxy(self):
-        if not self._token_ok():
-            log("拒绝代理：密钥不匹配（来自 %s，%s）"
-                % (self.client_address[0], self.path.split("?")[0]))
+        key_id, err = self._auth_key()
+        if not key_id:
+            log("拒绝代理：%s（来自 %s，%s）"
+                % (err or "密钥不匹配", self.client_address[0], self.path.split("?")[0]))
             return self._fail(403, "密钥不匹配（该服务已启用鉴权，请配置密钥）")
 
         parts = urlsplit(ARGS.upstream)
@@ -1790,15 +2215,25 @@ class Handler(BaseHTTPRequestHandler):
         # （那时模型必然已在内存里，永远报 false）。
         requested_model = ""
         model_state = None
+        speech_chars = 0
 
         if self.path.split("?", 1)[0].rstrip("/") == "/v1/audio/speech" and body:
             try:
-                requested_model = str(json.loads(body.decode("utf-8", "replace")).get("model") or "")
+                speech_req = json.loads(body.decode("utf-8", "replace"))
+                requested_model = str(speech_req.get("model") or "")
+                # 额度也管直连 /v1/audio/speech 的调用（不走 /jobs 的那条路）
+                speech_chars = count_chars(str(speech_req.get("input") or speech_req.get("text") or ""))
             except ValueError:
                 requested_model = ""
 
             if requested_model:
                 model_state = upstream_models()
+
+            if speech_chars > 0:
+                qerr, _ = quota_check(key_id, speech_chars)
+                if qerr:
+                    log("拒绝合成：%s（key=%s，%d 字）" % (qerr, key_id, speech_chars))
+                    return self._fail(429, "quota exceeded: %s" % qerr)
 
         # 组转发头：去掉逐跳头，并删掉 Host / Content-Length 让 http.client 自己算
         headers = {}
@@ -1836,6 +2271,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
 
+            # 用量统计：只有上游成功（2xx）才算消耗；失败的调用只计一次请求
+            if 200 <= resp.status < 300:
+                USAGE.record(key_id, chars=speech_chars, requests=1,
+                             audio_bytes=len(payload))
+            else:
+                USAGE.record(key_id, requests=1)
+
             cold = ""
             if requested_model and model_state is not None:
                 cold = "（冷加载）" if requested_model not in model_state else "（已驻留）"
@@ -1854,7 +2296,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ARGS, JOB_MANAGER
+    global ARGS, JOB_MANAGER, KEYSTORE, KEYS_FILE, USAGE
 
     parser = argparse.ArgumentParser(description="TtsVoice 接收端 + 带鉴权的 TTS 代理")
     parser.add_argument("--dir", default=os.path.expanduser("~/tts/voice-samples"),
@@ -1862,27 +2304,43 @@ def main():
     parser.add_argument("--host", default="0.0.0.0",
                         help="监听地址（默认 0.0.0.0）")
     parser.add_argument("--port", type=int, default=8899, help="监听端口（默认 8899）")
-    parser.add_argument("--token", default="", help="共享密钥，强烈建议设置")
+    parser.add_argument("--token", default="",
+                        help="兼容用的单个共享密钥（v1.6.0 起请改用 --keys-file）")
+    parser.add_argument("--keys-file", default=os.path.expanduser("~/tts/voice-receiver/keys.json"),
+                        help="多密钥 + 额度的 JSON（面板写、本服务按 mtime 热加载）")
+    parser.add_argument("--usage-file", default="",
+                        help="用量统计落盘路径（默认与 keys-file 同目录的 usage.json）")
     parser.add_argument("--upstream", default="http://127.0.0.1:8880",
                         help="上游 TTS 服务地址（默认 http://127.0.0.1:8880）")
     parser.add_argument("--jobs-dir", default=os.path.expanduser("~/tts/jobs"),
                         help="作业队列的落盘目录（默认 ~/tts/jobs）")
     ARGS = parser.parse_args()
 
+    if not ARGS.usage_file:
+        ARGS.usage_file = os.path.join(os.path.dirname(os.path.abspath(ARGS.keys_file)),
+                                       "usage.json")
+
     os.makedirs(ARGS.dir, exist_ok=True)
     os.makedirs(ARGS.jobs_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(ARGS.keys_file)), exist_ok=True)
+
+    KEYS_FILE = ARGS.keys_file
+    KEYSTORE = KeyStore(ARGS.keys_file)
+    USAGE = UsageStore(ARGS.usage_file)
 
     # 作业 worker 在进程内起一条线程（契约要求同一进程/端口）：
     # 单 worker、串行 —— 与上游 "Keep all GPU work serialized" 一致。
     JOB_MANAGER = JobManager(ARGS.jobs_dir, ARGS.upstream)
     JOB_MANAGER.start()
 
-    if not ARGS.token:
+    enabled = [k for k in KEYSTORE.all() if k.get("enabled", True)]
+
+    if not enabled and not ARGS.token:
         log("=" * 66)
-        log("⚠️  没有设置 --token")
+        log("⚠️  没有任何可用的密钥（keys.json 里没有启用项，也没有 --token）")
         log("    本代理将不做任何鉴权，而上游 Qwen 服务通常也没有鉴权 ——")
         log("    等于把语音合成能力完全敞开给能连到这个端口的人。")
-        log("    请加上：--token <随机密钥>")
+        log("    请在面板「服务管理 → 音色接收端 → 详情 → 🔑 调用密钥」里添加一个密钥。")
         log("=" * 66)
 
     server = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
@@ -1892,14 +2350,19 @@ def main():
     log("  样本目录: %s" % os.path.abspath(ARGS.dir))
     log("  上游    : %s" % ARGS.upstream)
     log("  作业目录: %s" % os.path.abspath(ARGS.jobs_dir))
-    log("  鉴权    : %s" % ("已启用" if ARGS.token else "★ 未启用"))
+    log("  密钥表  : %s（启用 %d 条%s）"
+        % (os.path.abspath(ARGS.keys_file), len(enabled),
+           "，另有兼容 --token" if ARGS.token else ""))
+    log("  用量统计: %s" % os.path.abspath(ARGS.usage_file))
+    log("  鉴权    : %s" % ("已启用" if (enabled or ARGS.token) else "★ 未启用"))
     log("")
     log("  插件里这样填：")
     log("    openaiBaseUrl = http://<本机地址>:%d/v1" % ARGS.port)
-    log("    openaiKey     = <上面的密钥>")
+    log("    openaiKey     = <面板里为该站点生成的密钥>")
     log("")
     log("  接收端地址与密钥由插件自动从上面两项推导，不用另外填。")
     log("  模型驻留状态（要不要等冷加载）：GET /voice/status")
+    log("  用量与额度：GET /usage（面板「调用密钥」页读的就是它）")
 
     try:
         server.serve_forever()

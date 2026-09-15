@@ -194,8 +194,16 @@ export const api = {
   installQwenTTS: (opts) => request('POST', `${API_BASE}/market/install-qwentts`, opts || {}),
   installVoiceReceiver: (opts) => request('POST', `${API_BASE}/market/install-voicereceiver`, opts || {}),
   installIOPaint: () => request('POST', `${API_BASE}/market/install-iopaint`, {}),
-  // 更换音色接收端共享密钥。token 留空 = 让面板生成一个新的随机密钥。
-  changeReceiverToken: (token) => request('POST', `${API_BASE}/voice/receiver/token`, { token: token || '' }),
+  // ---- 调用密钥（receiver v1.6.0）：多密钥 + 每密钥额度 + 用量 ----
+  // 入口是"添加密钥"而不是"改共享密钥"：一把泄露不必全员更换，
+  // 而且每把可以单独设额度（单位：字）。
+  voiceKeys: () => request('GET', `${API_BASE}/voice/receiver/keys`),
+  voiceKeyAdd: (payload) => request('POST', `${API_BASE}/voice/receiver/keys`, payload || {}),
+  voiceKeyUpdate: (id, payload) =>
+    request('PATCH', `${API_BASE}/voice/receiver/keys/${encodeURIComponent(id)}`, payload || {}),
+  voiceKeyDelete: (id) =>
+    request('DELETE', `${API_BASE}/voice/receiver/keys/${encodeURIComponent(id)}`),
+  voiceUsage: () => request('GET', `${API_BASE}/voice/receiver/usage`),
 
   // ---- 音色来源（receiver v1.5.0）----
   // 每个网站一份自己的参考音频，避免多站点互相覆盖（这正是"合成返回 0 字节"的根因之一）。

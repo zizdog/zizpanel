@@ -864,41 +864,6 @@ func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
-// handleChangeReceiverToken 更换 TtsVoice 接收端的共享密钥。
-//
-// 为什么要单独的入口：密钥是**网站与接收端之间的共享凭据**，会泄露、会轮换。
-// 之前只能靠"重新部署接收端"来换（那会连 receiver.py 一起重写、还要重新登记服务），
-// 用户想要的是"就换这一样东西"。
-//
-// 异步任务：要重写 plist（root）、重载守护进程、并用新密钥真打一次接口验证。
-func (s *Server) handleChangeReceiverToken(w http.ResponseWriter, r *http.Request) {
-	req := struct {
-		Token string `json:"token"`
-	}{}
-	if r.ContentLength > 0 {
-		if err := decode(r, &req); err != nil {
-			fail(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	// 自定义密钥先同步校验（字符集会写进 plist XML），错误当场返回，不要变成失败的任务
-	if t := strings.TrimSpace(req.Token); t != "" {
-		if err := services.ValidateReceiverToken(t); err != nil {
-			fail(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	newToken := req.Token
-	s.launchTask(w, r, "receiver-token", "voicereceiver", "更换音色接收端共享密钥",
-		"receiver_token_change", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
-			res := &services.InstallResult{App: "voicereceiver", Steps: []string{}}
-			if err := s.svcManager().ChangeReceiverToken(ctx, res, newToken); err != nil {
-				return res, err
-			}
-			return res, nil
-		})
-}
-
 // handleInstallDockerRuntime 安装 Docker 运行时（Colima）。
 func (s *Server) handleInstallDockerRuntime(w http.ResponseWriter, r *http.Request) {
 	s.launchTask(w, r, "install", "docker-runtime", "安装 Docker 运行时（Colima）",

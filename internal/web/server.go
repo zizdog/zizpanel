@@ -257,8 +257,12 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/install-qwentts", s.requireAuth(s.handleInstallQwenTTS))
 	// 音色样本接收端 + 带鉴权的反向代理（网站唯一该访问的入口）
 	root.HandleFunc("POST /api/v1/market/install-voicereceiver", s.requireAuth(s.handleInstallVoiceReceiver))
-	// 只换共享密钥（保留监听地址与其余配置），见 handleChangeReceiverToken
-	root.HandleFunc("POST /api/v1/voice/receiver/token", s.requireAuth(s.handleChangeReceiverToken))
+	// 多密钥 + 每密钥额度 + 用量统计（receiver v1.6.0），见 api_voice_keys.go
+	root.HandleFunc("GET /api/v1/voice/receiver/keys", s.requireAuth(s.handleVoiceKeys))
+	root.HandleFunc("POST /api/v1/voice/receiver/keys", s.requireAuth(s.handleVoiceKeyAdd))
+	root.HandleFunc("PATCH /api/v1/voice/receiver/keys/{id}", s.requireAuth(s.handleVoiceKeyUpdate))
+	root.HandleFunc("DELETE /api/v1/voice/receiver/keys/{id}", s.requireAuth(s.handleVoiceKeyDelete))
+	root.HandleFunc("GET /api/v1/voice/receiver/usage", s.requireAuth(s.handleVoiceUsage))
 	// 音色来源（receiver v1.5.0）：列表 / 替换 / 删除，见 api_voice_sources.go
 	root.HandleFunc("GET /api/v1/voice/receiver/sources", s.requireAuth(s.handleVoiceSources))
 	root.HandleFunc("POST /api/v1/voice/receiver/sources", s.requireAuth(s.handleVoiceSourceUpload))

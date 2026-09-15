@@ -173,7 +173,7 @@ def free_port():
 class Receiver:
     """真的把 receiver.py 当子进程跑起来（这样才能测 kill / 恢复）。"""
 
-    def __init__(self, port, upstream, jobs_dir, samples_dir):
+    def __init__(self, port, upstream, jobs_dir, samples_dir, keys_file=None):
         self.port = port
         self.jobs_dir = jobs_dir
         self.log_path = os.path.join(jobs_dir, "..", "receiver-test.log")
@@ -182,7 +182,11 @@ class Receiver:
                      "--dir", samples_dir,
                      "--jobs-dir", jobs_dir,
                      "--host", "127.0.0.1", "--port", str(port),
-                     "--token", TOKEN, "--upstream", upstream]
+                     # --token 仍然保留：它是兼容回退，老 plist 不升级也能跑；
+                     # 多密钥/额度/用量走 --keys-file（v1.6.0）
+                     "--token", TOKEN, "--upstream", upstream,
+                     "--keys-file", keys_file or os.path.join(jobs_dir, "..", "keys.json"),
+                     "--usage-file", os.path.join(jobs_dir, "..", "usage.json")]
 
     def start(self):
         self.logfh = open(self.log_path, "ab")
@@ -812,6 +816,159 @@ def main():
         # 直接改常量不方便（子进程），这里只确认活跃任务计数逻辑不报错
         st, body, _, _ = call("GET", base + "/jobs?status=queued,running")
         c.ok("多状态过滤可用", st == 200 and isinstance(body.get("jobs"), list), (st, body))
+
+        # ================= v1.6.0：多密钥 + 额度（字）+ 用量统计 =================
+        #
+        # 说明：这一段放在最后，因为它会写入 keys.json 并改变鉴权行为。
+        # TOKEN（--token）作为兼容回退始终可用，所以前面的用例不受影响。
+        print("\n【v1.6.0 多密钥：停用/错误/无密钥都被拒，正确密钥可用】")
+        keys_file = os.path.join(work, "keys.json")
+        usage_file = os.path.join(work, "usage.json")
+
+        def write_keys(keys):
+            with open(keys_file, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "keys": keys}, fh, ensure_ascii=False)
+
+        write_keys([
+            {"id": "k-a", "name": "A 站", "key": "KEY-AAA", "quota_chars": 10, "enabled": True, "created": 1},
+            {"id": "k-b", "name": "B 站", "key": "KEY-BBB", "quota_chars": 0, "enabled": True, "created": 2},
+            {"id": "k-off", "name": "停用", "key": "KEY-OFF", "quota_chars": 0, "enabled": False, "created": 3},
+        ])
+        # 等接收端热加载（按 mtime，最多 2 秒）
+        for _ in range(20):
+            st, hb, _, _ = call("GET", base + "/voice/health", token=None)
+            if (hb or {}).get("keys") == 3:
+                break
+            time.sleep(0.1)
+
+        c.ok("health 无需密钥且报告密钥数",
+             st == 200 and (hb or {}).get("auth") is True and hb.get("keys") == 3, hb)
+
+        q = {"model": model, "source": "site-a",
+             "chunks": [{"text": "一二三", "max_tokens": 400}]}
+
+        st, body, _, _ = call("POST", base + "/jobs", q, token=None)
+        c.ok("不带密钥 → 403", st == 403, (st, body))
+        st, body, _, _ = call("POST", base + "/jobs", q, token="KEY-WRONG")
+        c.ok("错误密钥 → 403", st == 403, (st, body))
+        st, body, _, _ = call("POST", base + "/jobs", q, token="KEY-OFF")
+        c.ok("已停用的密钥 → 403（停用要真的生效）", st == 403, (st, body))
+
+        print("\n【v1.6.0 额度：按提交文本的字数计，超额 429 且与 403 区分开】")
+        big = {**q, "client_id": "quota-big",
+               "chunks": [{"text": "这是一段超过十个字的文本", "max_tokens": 400}]}
+        big_chars = len("这是一段超过十个字的文本")
+        st, body, _, _ = call("POST", base + "/jobs", big, token="KEY-AAA")
+        c.ok("A 站超额（%d 字 > 额度 10）→ 429" % big_chars,
+             st == 429 and "quota exceeded" in json.dumps(body, ensure_ascii=False), (st, body))
+        c.ok("超额提示里写清了额度/已用/本次需要",
+             body and all(x in body.get("error", "") for x in
+                          ("额度 10 字", "本次需要 %d 字" % big_chars)), body)
+
+        st, body, _, _ = call("POST", base + "/jobs", {**q, "client_id": "quota-ok"}, token="KEY-AAA")
+        c.ok("A 站额度内（3 字）→ 200", st == 200 and body.get("chars") == 3, (st, body))
+        jid_a = (body or {}).get("job_id")
+        _wait_ready(base, jid_a, timeout=60)
+
+        st, usage, _, _ = call("GET", base + "/usage", token="KEY-AAA")
+        by_id = {k["id"]: k for k in (usage or {}).get("keys", [])}
+        c.ok("用量：A 站记到 3 字 / 1 个任务",
+             by_id.get("k-a", {}).get("used_chars") == 3
+             and by_id.get("k-a", {}).get("jobs") == 1, by_id.get("k-a"))
+        c.ok("用量：剩余额度 = 10-3 = 7",
+             by_id.get("k-a", {}).get("remaining_chars") == 7, by_id.get("k-a"))
+        c.ok("用量：B 站没被算进去（各密钥独立）",
+             by_id.get("k-b", {}).get("used_chars") == 0, by_id.get("k-b"))
+        c.ok("用量：列表里能看到被停用的密钥（enabled=false）",
+             by_id.get("k-off", {}).get("enabled") is False, by_id.get("k-off"))
+        c.ok("用量：今日字数也记了",
+             by_id.get("k-a", {}).get("today_chars") == 3, by_id.get("k-a"))
+        c.ok("用量：总量里有请求数/音频字节",
+             (usage or {}).get("total", {}).get("requests", 0) > 0
+             and (usage or {}).get("total", {}).get("audio_bytes", 0) > 0,
+             (usage or {}).get("total"))
+        c.ok("/usage 无密钥 → 403", call("GET", base + "/usage", token=None)[0] == 403)
+
+        # 剩 7 字：再来 8 字应当被拒，7 字（含标点）应当被放行
+        st, body, _, _ = call("POST", base + "/jobs", {
+            **q, "client_id": "quota-8", "chunks": [{"text": "一二三四五六七八", "max_tokens": 400}]},
+            token="KEY-AAA")
+        c.ok("A 站剩 7 字时提交 8 字 → 429（额度是硬上限）",
+             st == 429 and "quota exceeded" in json.dumps(body, ensure_ascii=False), (st, body))
+
+        st, body, _, _ = call("POST", base + "/jobs", {
+            **q, "client_id": "quota-b", "chunks": [{"text": "一二三四五六七", "max_tokens": 400}]},
+            token="KEY-BBB")
+        c.ok("B 站不限量：同样规模照常 200", st == 200, (st, body))
+
+        print("\n【v1.6.0 幂等重放不重复扣额度（队列中的同一 client_id）】")
+        # 契约：同一 client_id 只复用 queued/running 的任务。跑完之后再提交同一个
+        # client_id 是**一次新的合成**，本来就该重新计费 —— 所以这里必须在任务
+        # 还在队列里时重放，才测得到"不重复扣"。
+        fake.slow = 2.0
+        st, first, _, _ = call("POST", base + "/jobs", {
+            **q, "client_id": "quota-idem", "chunks": [{"text": "幂等重放", "max_tokens": 400}]},
+            token="KEY-AAA")
+        st2, again, _, _ = call("POST", base + "/jobs", {
+            **q, "client_id": "quota-idem", "chunks": [{"text": "幂等重放", "max_tokens": 400}]},
+            token="KEY-AAA")
+        st3, usage2, _, _ = call("GET", base + "/usage", token="KEY-AAA")
+        by2 = {k["id"]: k for k in (usage2 or {}).get("keys", [])}
+        c.ok("重放返回同一任务", st == 200 and st2 == 200
+             and first.get("job_id") == again.get("job_id"), (first, again))
+        c.ok("重放没有重复扣额度（只多了 4 字）",
+             by2.get("k-a", {}).get("used_chars") == 3 + len("幂等重放"),
+             (by2.get("k-a", {}).get("used_chars"), "期望", 3 + len("幂等重放")))
+        _wait_ready(base, first.get("job_id"), timeout=60)
+        fake.slow = 0.0
+
+        print("\n【v1.6.0 热加载：新增密钥不需要重启接收端】")
+        write_keys([
+            {"id": "k-a", "name": "A 站", "key": "KEY-AAA", "quota_chars": 10, "enabled": True, "created": 1},
+            {"id": "k-b", "name": "B 站", "key": "KEY-BBB", "quota_chars": 0, "enabled": True, "created": 2},
+            {"id": "k-off", "name": "停用", "key": "KEY-OFF", "quota_chars": 0, "enabled": False, "created": 3},
+            {"id": "k-new", "name": "新站", "key": "KEY-NEW", "quota_chars": 100, "enabled": True, "created": 4},
+        ])
+        for _ in range(20):
+            st, hb2, _, _ = call("GET", base + "/voice/health", token=None)
+            if (hb2 or {}).get("keys") == 4:
+                break
+            time.sleep(0.1)
+        st, body, _, _ = call("POST", base + "/jobs", {
+            **q, "client_id": "hot-new", "chunks": [{"text": "新密钥", "max_tokens": 400}]},
+            token="KEY-NEW")
+        c.ok("新增的密钥立即可用（未重启进程）", st == 200, (st, body))
+
+        print("\n【v1.6.0 用量持久化：重启接收端后统计还在】")
+        st, usage_now, _, _ = call("GET", base + "/usage", token="KEY-AAA")
+        before = {k["id"]: k for k in (usage_now or {}).get("keys", [])}.get("k-a", {}).get("used_chars")
+        c.ok("重启前读到累计用量", before and before > 0, before)
+        r.stop()
+        r = Receiver(port, upstream, jobs_dir, samples, keys_file=keys_file)
+        if not r.start():
+            c.ok("重启接收端", False, open(r.log_path).read()[-500:])
+        else:
+            st, usage3, _, _ = call("GET", base + "/usage", token="KEY-AAA")
+            by3 = {k["id"]: k for k in (usage3 or {}).get("keys", [])}
+            c.ok("重启后用量不丢（累计字数一致）",
+                 by3.get("k-a", {}).get("used_chars") == before, (before, by3.get("k-a")))
+            c.ok("重启后密钥表仍然生效", st == 200 and len(by3) >= 3, list(by3))
+
+        print("\n【v1.6.0 删除的密钥：历史用量仍可见（总量不会莫名对不上）】")
+        write_keys([
+            {"id": "k-b", "name": "B 站", "key": "KEY-BBB", "quota_chars": 0, "enabled": True, "created": 2},
+        ])
+        for _ in range(20):
+            st, hb3, _, _ = call("GET", base + "/voice/health", token=None)
+            if (hb3 or {}).get("keys") == 1:
+                break
+            time.sleep(0.1)
+        st, usage4, _, _ = call("GET", base + "/usage", token="KEY-BBB")
+        by4 = {k["id"]: k for k in (usage4 or {}).get("keys", [])}
+        c.ok("被删掉的密钥 id 仍以 deleted=true 出现",
+             by4.get("k-a", {}).get("deleted") is True, sorted(by4))
+        c.ok("被删掉的密钥不再能调用 → 403",
+             call("POST", base + "/jobs", q, token="KEY-AAA")[0] == 403)
 
     finally:
         r.stop()
