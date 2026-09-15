@@ -29,6 +29,7 @@ from urllib.parse import urlparse, parse_qs
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根目录
 RECEIVER = os.path.join(HERE, "internal", "services", "voice-receiver.py")
 TOKEN = "ttsv-testtoken"
+ADMIN = "admin-test-token"      # v1.7.0：用量重置要管理密钥
 
 # 与 receiver 内的判据保持一致（测试侧独立算一遍，避免"两边一起错"）
 BYTES_PER_SECOND = 16000
@@ -186,7 +187,8 @@ class Receiver:
                      # 多密钥/额度/用量走 --keys-file（v1.6.0）
                      "--token", TOKEN, "--upstream", upstream,
                      "--keys-file", keys_file or os.path.join(jobs_dir, "..", "keys.json"),
-                     "--usage-file", os.path.join(jobs_dir, "..", "usage.json")]
+                     "--usage-file", os.path.join(jobs_dir, "..", "usage.json"),
+                     "--admin-token", ADMIN]
 
     def start(self):
         self.logfh = open(self.log_path, "ab")
@@ -865,7 +867,7 @@ def main():
         c.ok("被拒的原因也在日志里",
              "密钥已被停用" in tail or "密钥不匹配" in tail, tail[-300:])
 
-        print("\n【v1.6.0 额度：按提交文本的字数计，超额 429 且与 403 区分开】")
+        print("\n【v1.6.0/v1.7.0 额度：按提交文本的字数计，超额 429 且与 403 区分开】")
         big = {**q, "client_id": "quota-big",
                "chunks": [{"text": "这是一段超过十个字的文本", "max_tokens": 400}]}
         big_chars = len("这是一段超过十个字的文本")
@@ -876,16 +878,29 @@ def main():
              body and all(x in body.get("error", "") for x in
                           ("额度 10 字", "本次需要 %d 字" % big_chars)), body)
 
+        fake.slow = 2.0     # 让它停在 running，好观察"占用"与"结算"的区别
         st, body, _, _ = call("POST", base + "/jobs", {**q, "client_id": "quota-ok"}, token="KEY-AAA")
         c.ok("A 站额度内（3 字）→ 200", st == 200 and body.get("chars") == 3, (st, body))
         jid_a = (body or {}).get("job_id")
-        _wait_ready(base, jid_a, timeout=60)
+
+        st, usage_mid, _, _ = call("GET", base + "/usage", token="KEY-AAA")
+        mid = {k["id"]: k for k in (usage_mid or {}).get("keys", [])}.get("k-a", {})
+        c.ok("v1.7.0：跑着的作业只**占用**额度，还没算已用",
+             mid.get("used_chars") == 0 and mid.get("reserved_chars") == 3, mid)
+        c.ok("v1.7.0：剩余额度把占用算进去了（10-0-3=7）",
+             mid.get("remaining_chars") == 7, mid)
+
+        st, body, _, _ = _wait_ready(base, jid_a, timeout=60)
+        c.ok("作业跑完 → ready", (body or {}).get("status") == "ready", body)
+        fake.slow = 0.0
 
         st, usage, _, _ = call("GET", base + "/usage", token="KEY-AAA")
         by_id = {k["id"]: k for k in (usage or {}).get("keys", [])}
-        c.ok("用量：A 站记到 3 字 / 1 个任务",
+        c.ok("用量：完成后才按实际完成结算成 3 字 / 1 个任务",
              by_id.get("k-a", {}).get("used_chars") == 3
              and by_id.get("k-a", {}).get("jobs") == 1, by_id.get("k-a"))
+        c.ok("用量：结算后占用清零",
+             by_id.get("k-a", {}).get("reserved_chars") == 0, by_id.get("k-a"))
         c.ok("用量：剩余额度 = 10-3 = 7",
              by_id.get("k-a", {}).get("remaining_chars") == 7, by_id.get("k-a"))
         c.ok("用量：B 站没被算进去（各密钥独立）",
@@ -927,9 +942,10 @@ def main():
         by2 = {k["id"]: k for k in (usage2 or {}).get("keys", [])}
         c.ok("重放返回同一任务", st == 200 and st2 == 200
              and first.get("job_id") == again.get("job_id"), (first, again))
-        c.ok("重放没有重复扣额度（只多了 4 字）",
-             by2.get("k-a", {}).get("used_chars") == 3 + len("幂等重放"),
-             (by2.get("k-a", {}).get("used_chars"), "期望", 3 + len("幂等重放")))
+        c.ok("重放没有重复占用（占用只有一份 4 字）",
+             by2.get("k-a", {}).get("used_chars") == 3
+             and by2.get("k-a", {}).get("reserved_chars") == len("幂等重放"),
+             by2.get("k-a"))
         _wait_ready(base, first.get("job_id"), timeout=60)
         fake.slow = 0.0
 
@@ -980,6 +996,127 @@ def main():
              by4.get("k-a", {}).get("deleted") is True, sorted(by4))
         c.ok("被删掉的密钥不再能调用 → 403",
              call("POST", base + "/jobs", q, token="KEY-AAA")[0] == 403)
+
+        # ================= v1.7.0：按实际完成结算 + 手动清零 =================
+        print("\n【v1.7.0 生成失败：只按已完成的块计费（不按提交的字数全额收）】")
+        write_keys([
+            {"id": "k-c", "name": "C 站", "key": "KEY-CCC", "quota_chars": 0, "enabled": True, "created": 9},
+        ])
+        for _ in range(20):
+            st, hb4, _, _ = call("GET", base + "/voice/health", token=None)
+            if (hb4 or {}).get("keys") == 1:
+                break
+            time.sleep(0.1)
+
+        fake.force_degenerate = True
+        st, body, _, _ = call("POST", base + "/jobs", {
+            "client_id": "bill-fail", "model": model, "source": "site-a",
+            "response_format": "mp3",
+            "chunks": [{"text": "这一块注定失败", "max_tokens": 400}]}, token="KEY-CCC")
+        fail_id = (body or {}).get("job_id")
+        st, view, _, _ = _wait_ready(base, fail_id, timeout=90)
+        c.ok("任务失败（上游一直退化）", (view or {}).get("status") == "failed", view)
+        fake.force_degenerate = False
+        st, usage_f, _, _ = call("GET", base + "/usage", token="KEY-CCC")
+        cf = {k["id"]: k for k in (usage_f or {}).get("keys", [])}.get("k-c", {})
+        c.ok("失败的作业一个字都没扣（0 块完成）", cf.get("used_chars") == 0, cf)
+        c.ok("失败的作业也把占用释放了", cf.get("reserved_chars") == 0, cf)
+
+        print("\n【v1.7.0 中途取消：只按已完成的块计费，其余退回】")
+        chunks4 = [{"text": "第一块两个字", "max_tokens": 400},
+                   {"text": "第二块两个字", "max_tokens": 400},
+                   {"text": "第三块两个字", "max_tokens": 400},
+                   {"text": "第四块两个字", "max_tokens": 400}]
+        fake.slow = 1.2
+        st, body, _, _ = call("POST", base + "/jobs", {
+            "client_id": "bill-cancel", "model": model, "source": "site-a",
+            "response_format": "mp3", "chunks": chunks4}, token="KEY-CCC")
+        cancel_id = (body or {}).get("job_id")
+        c.ok("多块任务已提交（共 %d 字）" % sum(len(c["text"]) for c in chunks4),
+             st == 200, (st, body))
+
+        # 等它至少完成一块，再取消
+        done_now = 0
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            st, b, _, _ = call("GET", "%s/jobs/%s" % (base, cancel_id))
+            done_now = (b or {}).get("done", 0)
+            if done_now >= 1:
+                break
+            time.sleep(0.2)
+        call("DELETE", base + "/jobs/" + cancel_id)
+        st, view_c, _, _ = _wait_ready(base, cancel_id, timeout=30)
+        fake.slow = 0.0
+
+        # 取消是"当前块跑完后停下"，所以最终完成了几块要以作业终态为准
+        # （读 done_now 那一刻和取消生效之间还可能再完成一块 —— 这正是要按
+        # 实际完成结算的原因，测试也必须按终态断言，否则就是测一个竞态）
+        done_final = (view_c or {}).get("done", 0)
+        total4 = sum(len(x["text"]) for x in chunks4)
+        st, usage_c, _, _ = call("GET", base + "/usage", token="KEY-CCC")
+        cc = {k["id"]: k for k in (usage_c or {}).get("keys", [])}.get("k-c", {})
+        expected = sum(len(x["text"]) for x in chunks4[:done_final])
+        c.ok("取消后只计已完成的 %d 块 = %d 字（提交了 %d 字）"
+             % (done_final, expected, total4),
+             cc.get("used_chars") == expected, (cc, view_c))
+        c.ok("取消的任务没有被按整篇收费", 0 <= cc.get("used_chars", 0) < total4,
+             (cc.get("used_chars"), total4))
+        c.ok("取消后占用也释放了", cc.get("reserved_chars") == 0, cc)
+
+        print("\n【v1.7.0 在跑的作业占用额度：同一把密钥并发提交不会把总额度撑爆】")
+        write_keys([
+            {"id": "k-d", "name": "D 站", "key": "KEY-DDD", "quota_chars": 20, "enabled": True, "created": 10},
+        ])
+        for _ in range(20):
+            st, hb5, _, _ = call("GET", base + "/voice/health", token=None)
+            if (hb5 or {}).get("keys") == 1:
+                break
+            time.sleep(0.1)
+        fake.slow = 1.5
+        st, body, _, _ = call("POST", base + "/jobs", {
+            "client_id": "resv-1", "model": model, "source": "site-a",
+            "response_format": "mp3",
+            "chunks": [{"text": "十二个字的第三块内容", "max_tokens": 400}]}, token="KEY-DDD")
+        c.ok("第一单（10 字）受理", st == 200, (st, body))
+        st, body2, _, _ = call("POST", base + "/jobs", {
+            "client_id": "resv-2", "model": model, "source": "site-a",
+            "response_format": "mp3",
+            "chunks": [{"text": "十二个字的第四块内容", "max_tokens": 400}]}, token="KEY-DDD")
+        c.ok("第二单（10 字）把剩余额度占满，仍受理", st == 200, (st, body2))
+        st, body3, _, _ = call("POST", base + "/jobs", {
+            "client_id": "resv-3", "model": model, "source": "site-a",
+            "response_format": "mp3",
+            "chunks": [{"text": "再来一块", "max_tokens": 400}]}, token="KEY-DDD")
+        c.ok("第三单在占用期间被 429 拒（不会出现「看着拦得住、实际拦不住」）",
+             st == 429 and "在跑的作业占用" in json.dumps(body3, ensure_ascii=False), (st, body3))
+        _wait_ready(base, body.get("job_id"), timeout=90)
+        _wait_ready(base, body2.get("job_id"), timeout=90)
+        fake.slow = 0.0
+        st, usage_d, _, _ = call("GET", base + "/usage", token="KEY-DDD")
+        cd = {k["id"]: k for k in (usage_d or {}).get("keys", [])}.get("k-d", {})
+        first_chars = len("十二个字的第三块内容")
+        c.ok("两单跑完后按各自实际字数结算（共 %d 字）" % (first_chars * 2),
+             cd.get("used_chars") == first_chars * 2, cd)
+        c.ok("结算后占用归零", cd.get("reserved_chars") == 0, cd)
+
+        print("\n【v1.7.0 手动清零：普通密钥不能清自己的额度，管理密钥可以】")
+        st, body, _, _ = call("POST", base + "/usage/reset", {"key_id": "k-d"}, token="KEY-DDD")
+        c.ok("用普通调用密钥请求清零 → 403（否则额度只是建议）", st == 403, (st, body))
+        st, body, _, _ = call("POST", base + "/usage/reset", {"key_id": "k-d"},
+                              token=None, headers={"X-TtsVoice-Admin": "wrong-admin"})
+        c.ok("管理密钥写错 → 403", st == 403, (st, body))
+        st, body, _, _ = call("POST", base + "/usage/reset", {"key_id": "k-d"},
+                              token=None, headers={"X-TtsVoice-Admin": ADMIN})
+        cd2 = {k["id"]: k for k in (body or {}).get("keys", [])}.get("k-d", {})
+        c.ok("带管理密钥清零 → 200 且该密钥已用归零",
+             st == 200 and cd2.get("used_chars") == 0, (st, cd2))
+        c.ok("清零只动统计，不动密钥本身（额度还在）",
+             cd2.get("quota_chars") == 20 and cd2.get("enabled") is True, cd2)
+        st, body, _, _ = call("POST", base + "/usage/reset", {"all": True},
+                              token=None, headers={"X-TtsVoice-Admin": ADMIN})
+        tot = (body or {}).get("total") or {}
+        c.ok("清空全部 → 200 且总量归零",
+             st == 200 and tot.get("chars") == 0 and tot.get("requests") == 0, (st, tot))
 
     finally:
         r.stop()

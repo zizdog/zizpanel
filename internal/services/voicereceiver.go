@@ -111,7 +111,9 @@ type VoiceKey struct {
 // VoiceKeyView 是"密钥 + 实时用量"的合并视图（面板列表用）。
 type VoiceKeyView struct {
 	VoiceKey
-	UsedChars      int64            `json:"used_chars"`
+	UsedChars int64 `json:"used_chars"`
+	// ReservedChars 是"在跑的作业占用的额度"（v1.7.0）；剩余额度已经把它扣掉了。
+	ReservedChars  int64            `json:"reserved_chars"`
 	RemainingChars int64            `json:"remaining_chars"`
 	Unlimited      bool             `json:"unlimited"`
 	TodayChars     int64            `json:"today_chars"`
@@ -625,7 +627,20 @@ func (m *Manager) verifyReceiverKey(ctx context.Context, key string) (bool, stri
 // plist 只负责告诉接收端那个文件在哪。这样"加密钥/改额度"不需要重启服务。
 func (m *Manager) applyReceiverPlist(ctx context.Context, result *InstallResult,
 	p receiverPaths, host string) error {
-	plist := receiverPlist(p, m.opt.UserName, host)
+	// 管理密钥：已有就原样保留，没有才生成（换掉不会影响网站，但会让面板
+	// 暂时管不了"清零用量"）。与调用密钥分开是故意的 —— 调用密钥在网站手里。
+	adminToken := m.existingReceiverAdminToken(p)
+	if adminToken == "" {
+		h, err := randomHex(16)
+		if err != nil {
+			return err
+		}
+		adminToken = "zpa-" + h
+		result.step(ctx, "已生成管理密钥（面板用它清零用量；网站插件拿不到）")
+	} else {
+		result.step(ctx, "沿用原有管理密钥")
+	}
+	plist := receiverPlist(p, m.opt.UserName, host, adminToken)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("写入 plist 失败: %w", err)
 	}
@@ -658,6 +673,29 @@ func (m *Manager) existingReceiverHost(p receiverPaths) string {
 			v = strings.TrimPrefix(v, "<string>")
 			v = strings.TrimSuffix(v, "</string>")
 			if v == "127.0.0.1" || v == "0.0.0.0" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// existingReceiverAdminToken 从已有 plist 里读回管理密钥；读不到返回 ""。
+//
+// 与调用密钥不同：管理密钥只在面板与接收端之间使用，网站插件拿不到，
+// 所以**重新部署时必须原样保留**（换掉不影响网站，但会让面板管不了用量重置）。
+func (m *Manager) existingReceiverAdminToken(p receiverPaths) string {
+	b, err := os.ReadFile(p.Plist)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(b), "\n")
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) == "<string>--admin-token</string>" && i+1 < len(lines) {
+			v := strings.TrimSpace(lines[i+1])
+			v = strings.TrimPrefix(v, "<string>")
+			v = strings.TrimSuffix(v, "</string>")
+			if v != "" {
 				return v
 			}
 		}
@@ -805,6 +843,36 @@ func (m *Manager) receiverToken() (string, error) {
 	return m.existingReceiverToken(p), nil
 }
 
+// ResetVoiceUsage 让接收端清零用量（v1.7.0）。
+//
+// keyID 为空且 all=true 时清空全部。**必须带管理密钥** —— 普通调用密钥
+// （网站手里的那把）不能重置自己的额度，否则额度只是建议。
+func (m *Manager) ResetVoiceUsage(ctx context.Context, keyID string, all bool) (map[string]any, error) {
+	p := m.receiverPaths()
+	admin := m.existingReceiverAdminToken(p)
+	if admin == "" {
+		return nil, fmt.Errorf("接收端还没有管理密钥（--admin-token）。" +
+			"请在应用市场重新部署一次接收端，之后再清零用量")
+	}
+	body, err := json.Marshal(map[string]any{"key_id": keyID, "all": all})
+	if err != nil {
+		return nil, err
+	}
+	code, out, err := m.receiverCall(ctx, http.MethodPost, "/usage/reset", body,
+		map[string]string{"X-TtsVoice-Admin": admin, "Content-Type": "application/json"})
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("接收端返回 %d：%s", code, receiverErrorMessage(code, out))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return nil, fmt.Errorf("接收端响应无法解析：%v", err)
+	}
+	return doc, nil
+}
+
 // VoiceUsage 读接收端的 /usage（各密钥额度/已用 + 全局合计）。
 func (m *Manager) VoiceUsage(ctx context.Context) (map[string]any, error) {
 	code, body, err := m.receiverCall(ctx, http.MethodGet, "/usage", nil, nil)
@@ -881,6 +949,7 @@ func (m *Manager) VoiceKeysView(ctx context.Context) (map[string]any, error) {
 		view := VoiceKeyView{
 			VoiceKey:       k,
 			UsedChars:      num(u, "used_chars"),
+			ReservedChars:  num(u, "reserved_chars"),
 			RemainingChars: num(u, "remaining_chars"),
 			Unlimited:      k.QuotaChars <= 0,
 			TodayChars:     num(u, "today_chars"),
@@ -892,7 +961,10 @@ func (m *Manager) VoiceKeysView(ctx context.Context) (map[string]any, error) {
 			LastUsed:       num(u, "last_used"),
 		}
 		if k.QuotaChars > 0 {
-			view.RemainingChars = k.QuotaChars - view.UsedChars
+			// 剩余必须把"在跑的作业占用的额度"也扣掉：v1.7.0 起额度检查是按
+			// 已用+占用算的，这里少扣一次占用，界面就会显示"还有额度"、
+			// 提交却被 429 拒 —— 这正是不该出现的那类误导。
+			view.RemainingChars = k.QuotaChars - view.UsedChars - view.ReservedChars
 			if view.RemainingChars < 0 {
 				view.RemainingChars = 0
 			}
@@ -1078,7 +1150,7 @@ func (m *Manager) VoiceSourceDelete(ctx context.Context, source string) error {
 }
 
 // receiverPlist 生成系统级 LaunchDaemon 定义。
-func receiverPlist(p receiverPaths, user, host string) string {
+func receiverPlist(p receiverPaths, user, host, adminToken string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1110,6 +1182,10 @@ func receiverPlist(p receiverPaths, user, host string) string {
              （老 plist 里的 --token 仍被接收端接受，重新部署时会被迁移进这个文件。） -->
         <string>--keys-file</string>
         <string>%s</string>
+        <!-- v1.7.0：管理密钥。只有面板持有它（网站插件看不到），用于"清零用量"
+             这类管理操作 —— 如果能用普通调用密钥清零自己的额度，额度就形同虚设。 -->
+        <string>--admin-token</string>
+        <string>%s</string>
         <!-- 上游 Qwen 服务只监听 127.0.0.1，由本代理对外提供鉴权 -->
         <string>--upstream</string>
         <string>%s</string>
@@ -1131,8 +1207,8 @@ func receiverPlist(p receiverPaths, user, host string) string {
     <string>%s</string>
 </dict>
 </plist>
-`, receiverLabel, user, p.Script, p.Samples, p.Jobs, host, receiverPort, p.Keys, qwenUpstream,
-		p.Dir, p.OutLog, p.ErrLog)
+`, receiverLabel, user, p.Script, p.Samples, p.Jobs, host, receiverPort, p.Keys, adminToken,
+		qwenUpstream, p.Dir, p.OutLog, p.ErrLog)
 }
 
 // waitJSONBool 轮询某个 URL，直到 JSON 响应里指定字段为 true。

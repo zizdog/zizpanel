@@ -26,7 +26,8 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
     GET  /health                    → 同上
     GET  /voice/status              → 上游模型驻留状态（v1.2.0 新增，只读）
                                       回答"网站下一个请求要不要等冷加载"
-    GET  /usage                     → 各密钥的额度/已用/今日/近 7 天 + 总量（v1.6.0）
+    GET  /usage                     → 各密钥的额度/已用(含在跑作业占用)/今日/近 7 天 + 总量
+    POST /usage/reset               → 清零用量（需 X-TtsVoice-Admin，v1.7.0）
     POST /voice                     Header: X-TtsVoice-Token / X-TtsVoice-Name
                                            / X-TtsVoice-Source（v1.5.0 新增）
                                     Body: 音频二进制
@@ -77,10 +78,14 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
 
     · **多密钥**：每个网站（或每个调用方）一把密钥，面板里"添加密钥"即可，
       按 mtime **热加载**，加/停/删都不需要重启正在跑合成的服务。
-    · **每密钥额度（单位：字）**：`quota_chars`，0 = 不限。按**提交文本的
-      字符数**计费（`len(text)`，中文 1 字算 1、含标点）。超额返回
-      **429** 且 error 以 `quota exceeded:` 开头（与 403 密钥错误区分开，
-      否则调用方会把"额度用完"当成"密钥错"去重试）。
+    · **每密钥额度（单位：字）**：`quota_chars`，0 = 不限。按**实际合成完成的
+      块**计费（`len(text)`，中文 1 字算 1、含标点）。超额返回 **429** 且 error 以
+      `quota exceeded:` 开头（与 403 密钥错误区分开，否则调用方会把"额度用完"
+      当成"密钥错"去重试）。
+      **计费口径（v1.7.0 改过）**：提交时只**占额度**（防止同一把密钥并发提交
+      把总额度撑爆），作业到终态（完成/失败/取消）时按**已经合成完的块**结算，
+      没跑到的部分自动退回 —— 生成失败或中途取消不该按整篇收费。
+      直连 `/v1/audio/speech` 只在响应 2xx 时计费。
     · **用量统计**：usage.json 按密钥累计 chars / requests / jobs / audio_bytes，
       另存最近 60 天的按天明细；`GET /usage` 返回每个密钥的额度、已用、剩余、
       今日、近 7 天，以及全局合计与 30 天曲线。
@@ -88,6 +93,9 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
     · 幂等重放（同一 client_id）不重复扣额度。
     · `--token` 仍可用（兼容已部署的 plist）；面板重新部署接收端时会把它
       迁移成 keys.json 里的一条 default 记录，之后密钥完全由文件管理。
+    · **手动清零**：`POST /usage/reset`（body：`{"key_id":"…"}` 或 `{"all":true}`）
+      需要 `X-TtsVoice-Admin: <--admin-token>`。普通调用密钥**不能**清零自己的额度，
+      否则额度就只是建议；管理密钥由面板在部署时生成并写进 plist，网站拿不到。
 
 【v1.6.1 访问日志】每次请求一行（健康检查与 /jobs 轮询除外），含状态码、
 方法、路径、用到的密钥 id 与来源 IP，比如：
@@ -143,7 +151,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
@@ -915,6 +923,24 @@ class UsageStore:
         for day in sorted(days.keys())[:-USAGE_DAYS_KEEP]:
             days.pop(day, None)
 
+    def reset(self, key_id=None):
+        """
+        清零用量（v1.7.0）。
+
+        key_id 为空 = 清空**所有**密钥的用量。
+        只删统计，不动密钥表与样本 —— "重置额度"不该顺手把配置也改了。
+        在跑的作业占用不受影响：它们到终态时仍会按实际完成的字数记账
+        （也就是从零重新开始计）。
+        """
+        with self.lock:
+            keys = self.doc.setdefault("keys", {})
+            if key_id:
+                keys.pop(key_id, None)
+            else:
+                self.doc["keys"] = {}
+            self._save()
+        return bool(key_id)
+
     def chars(self, key_id):
         """已用字符数（累计）。"""
         entry = (self.doc.get("keys") or {}).get(key_id)
@@ -933,10 +959,13 @@ class UsageStore:
         out = []
         seen = set()
 
-        def build(key_id, name, quota):
+        def build(key_id, name, quota, reserved=0):
             entry = (self.doc.get("keys") or {}).get(key_id) or {}
             days = entry.get("days") or {}
             used = int(entry.get("chars") or 0)
+            # 在跑的作业占用的额度要算进"剩余"，否则面板会显示还有额度、
+            # 实际提交却被 429 拒（v1.7.0）
+            reserved = max(0, int(reserved or 0))
             today_chars = int((days.get(today) or {}).get("chars") or 0)
             week_chars = sum(int((v or {}).get("chars") or 0)
                              for d, v in days.items() if d >= week_ago)
@@ -945,7 +974,8 @@ class UsageStore:
                 "name": name,
                 "quota_chars": quota,
                 "used_chars": used,
-                "remaining_chars": (max(0, quota - used) if quota > 0 else 0),
+                "reserved_chars": reserved,
+                "remaining_chars": (max(0, quota - used - reserved) if quota > 0 else 0),
                 "unlimited": quota <= 0,
                 "today_chars": today_chars,
                 "week_chars": week_chars,
@@ -967,7 +997,13 @@ class UsageStore:
                 quota = max(0, int(k.get("quota_chars") or 0))
             except (TypeError, ValueError):
                 quota = 0
-            item = build(key_id, str(k.get("name") or key_id), quota)
+            reserved = 0
+            if JOB_MANAGER is not None:
+                try:
+                    reserved = JOB_MANAGER.outstanding_chars(key_id)
+                except Exception:
+                    reserved = 0
+            item = build(key_id, str(k.get("name") or key_id), quota, reserved)
             item["enabled"] = bool(k.get("enabled", True))
             out.append(item)
 
@@ -1036,11 +1072,14 @@ def key_authed(handler):
     return "", "密钥不匹配"
 
 
-def quota_check(key_id, chars):
+def quota_check(key_id, chars, reserved=0):
     """
     额度检查。返回 (错误信息, 剩余额度)：
       错误信息非空 = 超额（调用方返回 429）
       剩余额度为 0 表示不限量
+
+    reserved 是"已经在跑的作业占用的字数"（v1.7.0）。必须算进去，
+    否则同一把密钥连提多个任务、每个都在额度内，合起来就超了。
     """
     quota = KEYSTORE.quota(key_id) if KEYSTORE else 0
 
@@ -1048,12 +1087,17 @@ def quota_check(key_id, chars):
         return "", 0
 
     used = USAGE.chars(key_id)
-    remaining = max(0, quota - used)
+    reserved = max(0, int(reserved or 0))
+    remaining = max(0, quota - used - reserved)
 
     if chars > remaining:
-        return ("额度不足：本密钥额度 %d 字，已用 %d 字，本次需要 %d 字，"
-                "剩余 %d 字。请在面板「调用密钥」里调整额度，或换一个密钥。"
-                % (quota, used, chars, remaining)), 0
+        detail = "已用 %d 字" % used
+        if reserved:
+            detail += "，在跑的作业占用 %d 字" % reserved
+        return ("额度不足：本密钥额度 %d 字，%s，本次需要 %d 字，剩余 %d 字。"
+                "（任务失败或中途取消时，只按**实际合成完成**的字数计费，"
+                "没跑到的部分会自动退回。）请在面板「调用密钥」里调整额度、"
+                "清零用量，或换一个密钥。" % (quota, detail, chars, remaining)), 0
 
     return "", remaining
 
@@ -1114,8 +1158,73 @@ class JobManager:
 
     def save(self, job):
         job["updated"] = int(time.time())
+        # 结算钩子挂在 save 上，而不是散在 9 个改状态的地方：
+        # 作业有三种终态（ready/failed/cancelled）、还有取消/超时清理/恢复三条路径，
+        # 逐个改必然漏掉一条，而漏掉的后果是"该扣的没扣"或"该退的没退"。
+        self.settle_if_terminal(job)
         atomic_write(self.json_path(job["job_id"]),
                      json.dumps(job, ensure_ascii=False).encode("utf-8"))
+
+    def settle_if_terminal(self, job):
+        """
+        作业到达终态时按**实际合成完成的块**结算额度（v1.7.0）。
+
+        为什么不是提交时就扣满：合成会失败、会被取消、会停机重启。用户提交 1000 字、
+        跑到第 3 块就失败，却按 1000 字收费，那是把"我们的失败"算在用户头上。
+        所以：提交时**占额度**（防止并发超支），终态时按已完成的块结算，
+        没跑到的那部分原样退回。
+
+        只处理"新格式"的作业（有 key/chars 字段）：v1.6 的老作业在提交时就已经
+        扣过费了，再去结算会重复计费。
+        """
+        if job.get("charged") or "key" not in job:
+            return
+
+        if job.get("status") not in (JOB_READY, JOB_FAILED, JOB_CANCELLED):
+            return
+
+        chunks = job.get("chunks") or []
+        try:
+            done = max(0, min(int(job.get("done") or 0), len(chunks)))
+        except (TypeError, ValueError):
+            done = 0
+
+        consumed = sum(count_chars(str((chunks[i] or {}).get("text") or ""))
+                       for i in range(done))
+        try:
+            submitted = max(consumed, int(job.get("chars") or 0))
+        except (TypeError, ValueError):
+            submitted = consumed
+
+        job["charged"] = True
+        job["charged_chars"] = consumed
+
+        key_id = str(job.get("key") or "default")
+        if USAGE is not None:
+            USAGE.record(key_id, chars=consumed, jobs=1)
+
+        if consumed < submitted:
+            log("作业 %s %s：按实际完成的 %d/%d 字结算（退回 %d 字）"
+                % (job.get("job_id"), job.get("status"), consumed, submitted,
+                   submitted - consumed))
+
+    def outstanding_chars(self, key_id):
+        """
+        该密钥**在跑的作业占用的额度**（已提交、还没到终态）。
+
+        没有这一步，同一把密钥连提 3 个任务、每个都在额度内，合起来就超了 ——
+        额度会变成"看起来拦得住、实际拦不住"。
+        """
+        total = 0
+        for j in self.list_jobs():
+            if j.get("key") != key_id or j.get("charged"):
+                continue
+            if j.get("status") in (JOB_QUEUED, JOB_RUNNING):
+                try:
+                    total += int(j.get("chars") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return total
 
     def list_jobs(self):
         out = []
@@ -1146,8 +1255,14 @@ class JobManager:
         return sum(1 for j in self.list_jobs()
                    if j.get("status") in (JOB_QUEUED, JOB_RUNNING))
 
-    def submit(self, payload):
-        """校验并落盘一个新任务；返回 job dict。校验失败抛 ValueError。"""
+    def submit(self, payload, key_id="default"):
+        """
+        校验并落盘一个新任务；返回 job dict。校验失败抛 ValueError。
+
+        key_id 与 chars 会写进 job：额度按**实际合成完成的块**结算
+        （v1.7.0），所以作业自己必须记住"是谁提交的、一共多少字"，
+        否则中途失败/取消时没人知道该退多少。
+        """
         client_id = str(payload.get("client_id") or "").strip()
         if client_id:
             existing = self.find_by_client_id(client_id)
@@ -1229,6 +1344,11 @@ class JobManager:
             "created": now,
             "updated": now,
             "chunks": chunks,
+            # v1.7.0：额度结算用。key 是提交者，chars 是这次提交的总字数，
+            # charged 表示"到终态时已经结算过"（避免恢复/清理时重复扣）。
+            "key": key_id,
+            "chars": sum(count_chars(c["text"]) for c in chunks),
+            "charged": False,
         }
         os.makedirs(self.chunk_dir(job_id), exist_ok=True)
         self.save(job)
@@ -1791,6 +1911,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/jobs":
             return self._jobs_create()
 
+        if path == "/usage/reset":
+            return self._usage_reset()
+
         if path in ("/voice", "/voice/upload"):
             return self._receive_voice()
 
@@ -1953,13 +2076,15 @@ class Handler(BaseHTTPRequestHandler):
                     chars += count_chars(str(c.get("text") or ""))
 
         if not existing and chars > 0:
-            qerr, _ = quota_check(key_id, chars)
+            reserved = JOB_MANAGER.outstanding_chars(key_id)
+            qerr, _ = quota_check(key_id, chars, reserved)
             if qerr:
-                log("拒绝提交作业：%s（key=%s，%d 字）" % (qerr, key_id, chars))
+                log("拒绝提交作业：%s（key=%s，%d 字，占用 %d 字）"
+                    % (qerr, key_id, chars, reserved))
                 return self._fail_jobs(429, "quota exceeded: %s" % qerr)
 
         try:
-            job = JOB_MANAGER.submit(payload)
+            job = JOB_MANAGER.submit(payload, key_id)
         except QueueFullError:
             return self._fail_jobs(429, "queue full")
         except ValueError as exc:
@@ -1969,7 +2094,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._fail_jobs(500, "internal error: %s" % exc)
 
         if not existing:
-            USAGE.record(key_id, chars=chars, requests=1, jobs=1)
+            # v1.7.0：提交时**不扣字数额度**（只占用），字数在作业到终态时按
+            # 实际完成的块结算；这里只记一次请求。
+            USAGE.record(key_id, requests=1)
 
         return self._json(200, {
             "ok": True,
@@ -2117,6 +2244,58 @@ class Handler(BaseHTTPRequestHandler):
             resp["truncated"] = True
 
         return self._json(200, resp)
+
+    # ---------- ③ 用量重置（v1.7.0，仅面板可用）----------
+
+    def _usage_reset(self):
+        """
+        清零用量。**必须带管理密钥**（--admin-token）。
+
+        为什么不能只认普通调用密钥：额度是给调用方设的约束，如果能用调用密钥
+        把自己的已用量清零，额度就只是"建议"了。管理密钥只在面板手里
+        （写在 plist 里，root 可读，网站插件拿不到）。
+        """
+        admin = (ARGS.admin_token or "")
+
+        if not admin:
+            return self._fail(503, "接收端没有配置管理密钥（--admin-token），"
+                                   "无法重置用量。请在应用市场重新部署一次接收端。")
+
+        presented = (self.headers.get("X-TtsVoice-Admin") or "").strip()
+        if not presented or not hmac.compare_digest(presented, admin):
+            log("拒绝重置用量：管理密钥不匹配（来自 %s）" % self.client_address[0])
+            return self._fail(403, "管理密钥不匹配")
+
+        body, err = self._read_body(64 * 1024)
+        if body is None:
+            return self._fail(400, err)
+
+        key_id = ""
+        reset_all = False
+        if body:
+            try:
+                doc = json.loads(body.decode("utf-8", "replace"))
+            except ValueError as exc:
+                return self._fail(400, "invalid json: %s" % exc)
+            if isinstance(doc, dict):
+                key_id = str(doc.get("key_id") or "").strip()
+                reset_all = bool(doc.get("all"))
+
+        if not key_id and not reset_all:
+            return self._fail(400, "要指定 key_id，或传 {\"all\": true} 清空全部")
+
+        if reset_all:
+            USAGE.reset(None)
+            log("已清空**全部**密钥的用量统计（来自 %s）" % self.client_address[0])
+            msg = "已清空全部用量统计"
+        else:
+            USAGE.reset(key_id)
+            log("已清零密钥 %s 的用量统计（来自 %s）" % (key_id, self.client_address[0]))
+            msg = "已清零密钥 %s 的用量统计" % key_id
+
+        items, total = USAGE.view()
+        return self._json(200, {"ok": True, "message": msg,
+                                "keys": items, "total": total})
 
     # ---------- ①b 各来源列表 / 删除（v1.5.0，面板"各来源"用）----------
 
@@ -2276,7 +2455,8 @@ class Handler(BaseHTTPRequestHandler):
                 model_state = upstream_models()
 
             if speech_chars > 0:
-                qerr, _ = quota_check(key_id, speech_chars)
+                qerr, _ = quota_check(key_id, speech_chars,
+                                      JOB_MANAGER.outstanding_chars(key_id))
                 if qerr:
                     log("拒绝合成：%s（key=%s，%d 字）" % (qerr, key_id, speech_chars))
                     return self._fail(429, "quota exceeded: %s" % qerr)
@@ -2356,6 +2536,9 @@ def main():
                         help="多密钥 + 额度的 JSON（面板写、本服务按 mtime 热加载）")
     parser.add_argument("--usage-file", default="",
                         help="用量统计落盘路径（默认与 keys-file 同目录的 usage.json）")
+    parser.add_argument("--admin-token", default="",
+                        help="管理密钥：只有它（面板持有）能调用用量重置等管理接口；"
+                             "普通调用密钥不能重置自己的额度，否则额度形同虚设")
     parser.add_argument("--upstream", default="http://127.0.0.1:8880",
                         help="上游 TTS 服务地址（默认 http://127.0.0.1:8880）")
     parser.add_argument("--jobs-dir", default=os.path.expanduser("~/tts/jobs"),
@@ -2400,6 +2583,8 @@ def main():
         % (os.path.abspath(ARGS.keys_file), len(enabled),
            "，另有兼容 --token" if ARGS.token else ""))
     log("  用量统计: %s" % os.path.abspath(ARGS.usage_file))
+    log("  管理接口: %s" % ("已启用（用量重置需要 --admin-token）" if ARGS.admin_token
+                            else "★ 未配置 --admin-token：用量重置不可用（在面板里重新部署接收端即可）"))
     log("  鉴权    : %s" % ("已启用" if (enabled or ARGS.token) else "★ 未启用"))
     log("")
     log("  插件里这样填：")

@@ -22,7 +22,7 @@ func TestReceiverPlistHostIsConfigurable(t *testing.T) {
 		Plist: "/Library/LaunchDaemons/com.zizdog.voicereceiver.plist",
 	}
 
-	local := receiverPlist(p, "zizdog", "127.0.0.1")
+	local := receiverPlist(p, "zizdog", "127.0.0.1", "zpa-testtoken0123456789abcdef")
 	if !strings.Contains(local, "<string>127.0.0.1</string>") {
 		t.Error("本机部署应能写成 127.0.0.1（只给同机的网站用，不暴露到局域网）")
 	}
@@ -30,14 +30,15 @@ func TestReceiverPlistHostIsConfigurable(t *testing.T) {
 		t.Error("传了 127.0.0.1 就不该同时出现 0.0.0.0")
 	}
 
-	lan := receiverPlist(p, "zizdog", "0.0.0.0")
+	lan := receiverPlist(p, "zizdog", "0.0.0.0", "zpa-testtoken0123456789abcdef")
 	if !strings.Contains(lan, "<string>0.0.0.0</string>") {
 		t.Error("mini 部署仍应是 0.0.0.0")
 	}
 
 	// 脚本路径、样本/作业目录、密钥表路径都要写进去（模板改动不能碰坏这些）
 	for _, want := range []string{p.Script, p.Samples, p.Jobs, p.Keys,
-		"com.zizdog.voicereceiver", "--jobs-dir", "--keys-file", qwenUpstream} {
+		"com.zizdog.voicereceiver", "--jobs-dir", "--keys-file", "--admin-token",
+		"zpa-testtoken0123456789abcdef", qwenUpstream} {
 		if !strings.Contains(local, want) {
 			t.Errorf("plist 里缺少 %q", want)
 		}
@@ -89,7 +90,7 @@ func TestExistingReceiverHostReadsPlist(t *testing.T) {
 		Plist: dir + "/com.zizdog.voicereceiver.plist",
 	}
 	write := func(host string) {
-		plist := receiverPlist(p, "zizdog", host)
+		plist := receiverPlist(p, "zizdog", host, "zpa-testtoken0123456789abcdef")
 		if err := os.WriteFile(p.Plist, []byte(plist), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -326,7 +327,7 @@ func TestEnsureVoiceKeysMigratesLegacyToken(t *testing.T) {
 	m, p := newKeyTestManager(t)
 
 	legacy := "ttsv-legacytoken0123456789abcdef"
-	plist := receiverPlist(p, "zizdog", "127.0.0.1")
+	plist := receiverPlist(p, "zizdog", "127.0.0.1", "zpa-testtoken0123456789abcdef")
 	// 手工塞一个老式 --token 进去，模拟"还没迁移的机器"
 	plist = strings.Replace(plist, "        <string>--keys-file</string>",
 		"        <string>--token</string>\n        <string>"+legacy+"</string>\n"+

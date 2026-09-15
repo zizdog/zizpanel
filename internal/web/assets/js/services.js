@@ -652,6 +652,31 @@ export function ServicesView(content, ctx = {}) {
               } catch (e) { toast(e.message, 'err', 8000); }
             },
           }));
+        }
+
+        // 清零：所有行都能清（含"服务配置里的兼容密钥"和已删除密钥留下的历史）——
+        // 它只动统计，不动密钥、额度与样本。
+        if (row.used_chars > 0 || row.requests > 0) {
+          actions.push(h('button.btn.btn-sm', {
+            text: '清零',
+            title: '把这把密钥的已用字数清零（从 0 重新计），密钥与额度都不变',
+            onclick: async () => {
+              if (!await confirmBox(
+                `把「${row.name || row.id}」的用量清零？\n\n`
+                + `当前已用 ${fmtChars(row.used_chars)} 字、${fmtChars(row.requests)} 次调用，`
+                + '清零后从 0 重新计（额度不变）。\n'
+                + '按天曲线也会一并清空；**正在跑的作业**完成后仍会按实际完成的字数记进来。',
+                { title: '清零用量', okText: '确认清零' })) return;
+              try {
+                await api.voiceUsageReset(row.id);
+                toast('已清零', 'ok');
+                await load();
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }));
+        }
+
+        if (!row.legacy && !row.deleted) {
           actions.push(h('button.btn.btn-sm.btn-danger', {
             text: '删除',
             onclick: async () => {
@@ -695,6 +720,9 @@ export function ServicesView(content, ctx = {}) {
           h('td', { text: fmtChars(row.used_chars) + ' 字' }),
           h('td', [
             h('div', { text: remaining }),
+            (row.reserved_chars > 0)
+              ? h('div.sub', { title: '已提交、还在合成的作业占用的字数', text: `（占用中 ${fmtChars(row.reserved_chars)} 字）` })
+              : null,
             (!row.unlimited && !row.deleted)
               ? h('div', {
                   style: {
@@ -729,12 +757,31 @@ export function ServicesView(content, ctx = {}) {
             ]),
         h('div.hint', {
           style: { marginTop: '12px' },
-          text: '额度按提交文本的字符数扣减（中文 1 字算 1，含标点）。'
+          text: '额度按**实际合成完成**的字数计（中文 1 字算 1，含标点）：提交时先占用额度'
+            + '（防止同一把密钥并发提交把总额度撑爆），作业完成/失败/取消时按已完成的块结算，'
+            + '没跑到的部分自动退回 —— 生成失败或中途取消不会按整篇收费。'
             + '额度用完时接收端返回 429（quota exceeded），与该密钥无效的 403 区分开。'
-            + '密钥与额度改动立即生效，不用重启接收端。',
+            + '需要重新开始计时，用行内的「清零」（密钥与额度不变）。'
+            + '密钥、额度、清零都立即生效，不用重启接收端。',
         }),
         h('div', { style: { marginTop: '14px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
           h('button.btn.btn-sm.btn-primary', { text: '➕ 添加密钥', onclick: addKey }),
+          h('button.btn.btn-sm', {
+            text: '🧹 清零全部用量',
+            title: '把所有密钥的已用字数/调用次数一起清零（密钥与额度不变）',
+            onclick: async () => {
+              if (!await confirmBox(
+                '把所有密钥的用量统计清零？\n\n'
+                + `当前累计 ${fmtChars(total.chars)} 字、${fmtChars(total.requests)} 次调用。\n`
+                + '密钥、额度、音色样本都不受影响；按天曲线会一并清空。',
+                { title: '清零全部用量', okText: '确认清零' })) return;
+              try {
+                await api.voiceUsageReset('');
+                toast('已清零全部用量', 'ok');
+                await load();
+              } catch (e) { toast(e.message, 'err', 8000); }
+            },
+          }),
           h('button.btn.btn-sm', { text: '🔄 刷新', onclick: load }),
         ]),
         data.usage_error

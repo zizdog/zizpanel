@@ -100,6 +100,34 @@ func (s *Server) handleVoiceKeyUpdate(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"key": key})
 }
 
+// handleVoiceUsageReset POST /api/v1/voice/receiver/usage/reset
+// body: {key_id} 或 {all: true}
+//
+// 清零是**管理动作**：接收端要求 X-TtsVoice-Admin（管理密钥写在 plist 里，
+// 只有面板拿得到）。网站手里的调用密钥清不了自己的额度 —— 否则额度只是建议。
+func (s *Server) handleVoiceUsageReset(w http.ResponseWriter, r *http.Request) {
+	req := struct {
+		KeyID string `json:"key_id"`
+		All   bool   `json:"all"`
+	}{}
+	if r.ContentLength > 0 {
+		if err := decode(r, &req); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if strings.TrimSpace(req.KeyID) == "" && !req.All {
+		fail(w, http.StatusBadRequest, "要指定 key_id，或传 all=true 清空全部")
+		return
+	}
+	res, err := s.svcManager().ResetVoiceUsage(r.Context(), strings.TrimSpace(req.KeyID), req.All)
+	if err != nil {
+		fail(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	ok(w, res)
+}
+
 // handleVoiceKeyDelete DELETE /api/v1/voice/receiver/keys/{id}
 //
 // 删除后该密钥立刻失效（接收端热加载），历史用量仍保留在统计里 ——

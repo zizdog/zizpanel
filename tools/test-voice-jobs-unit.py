@@ -429,6 +429,77 @@ def main():
     u2 = m.UsageStore(upath)
     c.ok("重新加载（模拟重启）后用量还在", u2.chars("k-a") == 15, u2.chars("k-a"))
 
+    print("\n【v1.7.0 按实际完成的块结算（失败/取消不按整篇收）】")
+    sdir = os.path.join(work, "settle-jobs")
+    os.makedirs(sdir, exist_ok=True)
+    mgr2 = m.JobManager(sdir, "http://127.0.0.1:1")
+    m.USAGE = m.UsageStore(os.path.join(kdir, "usage2.json"))
+    c3 = [{"text": "一二三", "max_tokens": 400},
+          {"text": "四五六", "max_tokens": 400},
+          {"text": "七八九", "max_tokens": 400}]   # 每块 3 字，共 9 字
+
+    job = {"job_id": "j-1700000000-aaaaaa", "status": m.JOB_QUEUED, "key": "k-s",
+           "chars": 9, "charged": False, "done": 0, "chunks": c3, "updated": 0}
+    mgr2.save(job)
+    c.ok("未到终态不结算（只是占用）", m.USAGE.chars("k-s") == 0, m.USAGE.chars("k-s"))
+    c.ok("在跑的作业算进占用", mgr2.outstanding_chars("k-s") == 9, mgr2.outstanding_chars("k-s"))
+
+    job["status"] = m.JOB_READY
+    job["done"] = 3
+    mgr2.save(job)
+    c.ok("完成 → 按全部 9 字结算", m.USAGE.chars("k-s") == 9, m.USAGE.chars("k-s"))
+    c.ok("结算后不再算占用", mgr2.outstanding_chars("k-s") == 0, mgr2.outstanding_chars("k-s"))
+    mgr2.save(job)
+    c.ok("重复 save 不会重复扣（charged 标记）", m.USAGE.chars("k-s") == 9, m.USAGE.chars("k-s"))
+
+    job2 = {"job_id": "j-1700000001-bbbbbb", "status": m.JOB_RUNNING, "key": "k-s",
+            "chars": 9, "charged": False, "done": 0, "chunks": c3, "updated": 0}
+    mgr2.save(job2)
+    job2["status"] = m.JOB_CANCELLED
+    job2["done"] = 2       # 只跑完两块就取消
+    mgr2.save(job2)
+    c.ok("取消 → 只计已完成的 2 块 = 6 字", m.USAGE.chars("k-s") == 15, m.USAGE.chars("k-s"))
+
+    job3 = {"job_id": "j-1700000002-cccccc", "status": m.JOB_RUNNING, "key": "k-s",
+            "chars": 9, "charged": False, "done": 0, "chunks": c3, "updated": 0}
+    mgr2.save(job3)
+    job3["status"] = m.JOB_FAILED
+    job3["done"] = 0
+    mgr2.save(job3)
+    c.ok("失败且一块没完成 → 一个字都不扣", m.USAGE.chars("k-s") == 15, m.USAGE.chars("k-s"))
+
+    old_job = {"job_id": "j-1700000003-dddddd", "status": m.JOB_READY, "done": 3,
+               "chunks": c3, "updated": 0}     # v1.6 的老作业：没有 key/chars
+    mgr2.save(old_job)
+    c.ok("v1.6 的老作业不被补结算（它提交时已经扣过费了）",
+         m.USAGE.chars("k-s") == 15 and m.USAGE.chars("default") == 0,
+         (m.USAGE.chars("k-s"), m.USAGE.chars("default")))
+
+    print("\n【v1.7.0 额度检查要把「在跑的占用」算进去】")
+    m.USAGE.record("k-q", chars=8)
+    write_keys([{"id": "k-q", "name": "Q", "key": "KEY-Q", "quota_chars": 10, "enabled": True}])
+    os.utime(kpath, None)
+    err, _ = m.quota_check("k-q", 2)
+    c.ok("已用 8 / 额度 10：再提 2 字可以", err == "", err)
+    err, _ = m.quota_check("k-q", 2, 1)
+    c.ok("有 1 字在跑占用时：再提 2 字就超了", err != "" and "在跑的作业占用" in err, err)
+    err, _ = m.quota_check("k-q", 3)
+    c.ok("已用 8 / 额度 10：提 3 字超了（错误里带三个数字）",
+         err != "" and all(x in err for x in ("额度 10 字", "已用 8 字", "本次需要 3 字")), err)
+
+    print("\n【v1.7.0 手动清零】")
+    m.USAGE.record("k-q", chars=5, requests=2, jobs=1, audio_bytes=100)
+    m.USAGE.record("k-other", chars=7)
+    m.USAGE.reset("k-q")
+    c.ok("清零单个密钥：它归零、别的密钥不受影响",
+         m.USAGE.chars("k-q") == 0 and m.USAGE.chars("k-other") == 7,
+         (m.USAGE.chars("k-q"), m.USAGE.chars("k-other")))
+    m.USAGE.reset(None)
+    c.ok("清零全部", m.USAGE.chars("k-other") == 0, m.USAGE.chars("k-other"))
+    u4 = m.UsageStore(os.path.join(kdir, "usage2.json"))
+    c.ok("清零已落盘（重启后不会复活）", u4.chars("k-q") == 0 and u4.chars("k-other") == 0,
+         (u4.chars("k-q"), u4.chars("k-other")))
+
     print("\n【v1.6.0 按天明细只留最近 60 天】")
     u3 = m.UsageStore(os.path.join(kdir, "usage-prune.json"))
     old_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 400 * 86400))

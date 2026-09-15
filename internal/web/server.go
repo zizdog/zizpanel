@@ -263,6 +263,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("PATCH /api/v1/voice/receiver/keys/{id}", s.requireAuth(s.handleVoiceKeyUpdate))
 	root.HandleFunc("DELETE /api/v1/voice/receiver/keys/{id}", s.requireAuth(s.handleVoiceKeyDelete))
 	root.HandleFunc("GET /api/v1/voice/receiver/usage", s.requireAuth(s.handleVoiceUsage))
+	// 清零用量（管理动作，接收端要求管理密钥，见 handleVoiceUsageReset）
+	root.HandleFunc("POST /api/v1/voice/receiver/usage/reset", s.requireAuth(s.handleVoiceUsageReset))
 	// 音色来源（receiver v1.5.0）：列表 / 替换 / 删除，见 api_voice_sources.go
 	root.HandleFunc("GET /api/v1/voice/receiver/sources", s.requireAuth(s.handleVoiceSources))
 	root.HandleFunc("POST /api/v1/voice/receiver/sources", s.requireAuth(s.handleVoiceSourceUpload))

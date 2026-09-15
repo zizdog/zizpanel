@@ -204,6 +204,9 @@ export const api = {
   voiceKeyDelete: (id) =>
     request('DELETE', `${API_BASE}/voice/receiver/keys/${encodeURIComponent(id)}`),
   voiceUsage: () => request('GET', `${API_BASE}/voice/receiver/usage`),
+  // 清零用量（管理动作：接收端要求管理密钥，网站手里的调用密钥清不了自己的额度）
+  voiceUsageReset: (keyId) => request('POST', `${API_BASE}/voice/receiver/usage/reset`,
+    keyId ? { key_id: keyId } : { all: true }),
 
   // ---- 音色来源（receiver v1.5.0）----
   // 每个网站一份自己的参考音频，避免多站点互相覆盖（这正是"合成返回 0 字节"的根因之一）。
