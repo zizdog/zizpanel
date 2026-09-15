@@ -42,6 +42,12 @@ func (s *Server) detectDocker() (string, string) {
 
 // svcManager 构造服务管理器。
 func (s *Server) svcManager() *services.Manager {
+	// 顺手对一次路径：面板可能在"Homebrew 还不存在"的那一刻就写下了配置
+	// （全新机器就是这样），装好 Homebrew 之后前缀若不修正，
+	// 站点/数据库/日志会一直在找 /usr/local 下的东西。
+	// 这里很便宜（两次 stat），而且只有真的变了才写文件。
+	_ = s.Cfg.ReconcilePaths()
+
 	sock, _ := s.detectDocker()
 	if sock == "" {
 		// 没探测到可连的 socket 时，保留用户配置的路径：

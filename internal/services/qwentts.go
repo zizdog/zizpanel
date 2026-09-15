@@ -158,6 +158,14 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		return fmt.Errorf("无法确定运行该服务的真实用户")
 	}
 
+	// ---- 0a. 依赖链：命令行开发者工具 → Homebrew → python@3.11 ----
+	// 全新 macOS 上三样都没有：/usr/bin/python3 只是占位程序（跑它会弹图形对话框）、
+	// 没有 brew、更没有 python@3.11。这一整套（venv + pip + mlx-audio）全都要它们。
+	// EnsureHomebrew 会先装 CLT 再装 brew；缺什么装什么，已就绪就秒过。
+	if err := m.EnsureHomebrew(ctx, result); err != nil {
+		return err
+	}
+
 	// ---- 0. 前置检查：这两个不够会在装到一半时失败，且失败原因很难懂 ----
 	if err := m.checkQwenPreconditions(ctx, result); err != nil {
 		return err

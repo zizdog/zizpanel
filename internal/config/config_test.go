@@ -335,3 +335,86 @@ func TestRepairRuntimeAccessReportsUnfixableForeignOwner(t *testing.T) {
 		t.Errorf("警告里应给出可直接照抄的 chown 指令，实际: %v", warnings)
 	}
 }
+
+// TestReconcilePathsFixesStaleBrewPrefix 锁住"面板先于 Homebrew 存在"留下的错路径。
+//
+// 真机（抹机后的 mini）复现：全新机器上先装面板、后装 Homebrew，于是
+// config.json 里 BrewPrefix 被写成 /usr/local（因为 /opt/homebrew 那时还不存在），
+// **而且再也不会自我修正** —— Homebrew 明明装好了，任务却报
+// `env: /usr/local/bin/brew: No such file or directory`。
+//
+// 这个测试把候选前缀指到临时目录（而不是真的去动 /opt/homebrew），
+// 所以它验证的是"重新探测 + 写回"这套逻辑本身，而不是这台机器装了什么。
+func TestReconcilePathsFixesStaleBrewPrefix(t *testing.T) {
+	root := isolate(t)
+	// 造一个"已经装好的 Homebrew"（只要 bin/brew 存在即可）
+	prefix := filepath.Join(t.TempDir(), "fakebrew")
+	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prefix, "bin", "brew"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := brewPrefixes
+	brewPrefixes = func() []string { return []string{prefix, "/usr/local"} }
+	defer func() { brewPrefixes = old }()
+
+	// 模拟"旧配置"：前缀是错的（当年还没有 Homebrew，退回了 /usr/local）
+	c := Default()
+	c.BrewPrefix = "/usr/local"
+	c.BrewBin = "/usr/local/bin/brew"
+	c.NginxBin = "/usr/local/bin/nginx"
+	c.VhostDir = "/usr/local/etc/nginx/vhosts"
+	c.PmaDir = "/usr/local/share/phpmyadmin"
+	c.path = filepath.Join(root, "data", "config.json")
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if !c.ReconcilePaths() {
+		t.Fatal("前缀过期时 ReconcilePaths 应报告有变化")
+	}
+	if c.BrewPrefix != prefix {
+		t.Fatalf("前缀未修正：%s（期望 %s）", c.BrewPrefix, prefix)
+	}
+	// 派生路径必须**一起**改：只改前缀不改派生路径，症状是"某个功能莫名找不到文件"
+	for name, got := range map[string]string{
+		"BrewBin":  c.BrewBin,
+		"NginxBin": c.NginxBin,
+		"VhostDir": c.VhostDir,
+		"PmaDir":   c.PmaDir,
+	} {
+		if !strings.HasPrefix(got, prefix) {
+			t.Errorf("%s 没有跟着前缀一起改：%s", name, got)
+		}
+	}
+	// 必须写回文件，否则下次启动又是错的
+	b, err := os.ReadFile(c.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Config
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.BrewPrefix != prefix {
+		t.Errorf("修正结果没有写回 config.json：%s", back.BrewPrefix)
+	}
+
+	// 幂等：已经正确时不再报告变化（避免每次请求都写盘）
+	if c.ReconcilePaths() {
+		t.Error("已经正确时不应报告变化")
+	}
+
+	// 机器上完全没有 Homebrew 时不能瞎改用户配置（他可能填了自定义前缀）
+	brewPrefixes = func() []string { return []string{filepath.Join(t.TempDir(), "nope")} }
+	c2 := Default()
+	c2.BrewPrefix = "/custom/prefix"
+	c2.path = filepath.Join(root, "data", "config2.json")
+	if c2.ReconcilePaths() {
+		t.Error("探测不到 Homebrew 时不应改动配置")
+	}
+	if c2.BrewPrefix != "/custom/prefix" {
+		t.Errorf("探测不到时不该改前缀，实际 %s", c2.BrewPrefix)
+	}
+}

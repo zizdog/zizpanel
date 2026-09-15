@@ -205,6 +205,8 @@ RELEASE_KEY ?= .release-key/zizpanel-ed25519.key
 RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSION)
 # 可选：把更新说明写进这个文件，会被放进清单里展示给用户
 NOTES_FILE ?= RELEASE_NOTES.md
+# 自建国内镜像（`make publish-mirror` 用）。面板里的"升级源"也填这个地址。
+MIRROR_BASE_URL ?= https://zizdog.com/zizpanel
 
 .PHONY: upgrade-e2e
 upgrade-e2e: ## 在线升级真实演练（需要本机已安装面板；会真的升级并重启面板）
@@ -284,7 +286,12 @@ release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwi
 		echo "==> 跳过签名（没有私钥）。清单可用于手动上传流程。"; \
 		rm -f $(RELDIR)/manifest.json.sig; \
 	fi
-	@rm -f $(DIST)/host-zizpanel
+	@# 留一份"GitHub 版清单"：GitHub Release 那边要的是指向 GitHub 的 url，
+	@# 而国内镜像要的是指向镜像的 url —— 同一批包、两份清单，都签同一个私钥。
+	@cp $(RELDIR)/manifest.json $(RELDIR)/manifest-github.json
+	@cp $(RELDIR)/manifest.json.sig $(RELDIR)/manifest-github.json.sig 2>/dev/null || true
+	@# 保留 host-zizpanel：`make mirror-manifest` 还要用它给"镜像版清单"签名。
+	@# 真正的清理放在 mirror-manifest 末尾（或 make clean）。
 	@echo ""
 	@echo "发布产物："
 	@ls -lh $(RELDIR)
@@ -293,6 +300,38 @@ release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwi
 	@shasum -a 256 $(RELDIR)/*.tar.gz | sed 's|$(RELDIR)/||'
 	@echo ""
 	@echo "面板「在线升级」需要把 manifest.json 与 manifest.json.sig 一起放到升级源目录。"
+
+.PHONY: mirror-manifest
+mirror-manifest: ## 重新生成"指向自建镜像"的清单（发布到国内镜像用；签名后一并上传）
+	@# 为什么需要单独一步：make release 产出的清单里的 url 指向 GitHub Releases，
+	@# 而国内无代理时 GitHub 直连不通 —— 面板能读到清单却下不动包。
+	@# 这个目标把 url 换成自建镜像，签名不变（同一把发布私钥）。
+	@test -x $(DIST)/host-zizpanel || (echo "先跑 make release（mirror-manifest 需要 host-zizpanel 来签名）"; exit 1)
+	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release"; exit 1)
+	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
+		--base-url "$(MIRROR_BASE_URL)" --notes-file "$(NOTES_FILE)"
+	@set -e; \
+	if [ -f "$(RELEASE_KEY)" ]; then \
+		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \
+			--in $(RELDIR)/manifest.json --out $(RELDIR)/manifest.json.sig; \
+		echo "==> 已签名（镜像版清单）"; \
+		rm -f $(DIST)/host-zizpanel; \
+	else \
+		echo "!! 没有 $(RELEASE_KEY)，无法签名"; exit 1; \
+	fi
+
+.PHONY: publish-mirror
+publish-mirror: mirror-manifest ## 生成镜像版清单并打印"上传到国内镜像"的命令（不自动上传）
+	@echo ""
+	@echo "把下面这些文件放到 $(MIRROR_BASE_URL) ："
+	@echo "  manifest.json  manifest.json.sig  install.sh"
+	@echo "  zizpanel_$(VERSION)_darwin_arm64.tar.gz  zizpanel_$(VERSION)_darwin_amd64.tar.gz"
+	@echo "  zizpanel_latest_darwin_arm64.tar.gz  zizpanel_latest_darwin_amd64.tar.gz"
+	@echo ""
+	@echo "同时建 download/$(VERSION)/ 与 download/latest/ 放同样的包（install.sh 的固定 URL 用），"
+	@echo "并在站点根放指向 latest 的符号链接。例："
+	@echo "  scp $(RELDIR)/manifest.json* $(RELDIR)/zizpanel_*_darwin_*.tar.gz install.sh \\"
+	@echo "      <user>@<host>:<站点根>/zizpanel/"
 
 # ---------------------------------------------------------------- 版本号 --
 .PHONY: bump

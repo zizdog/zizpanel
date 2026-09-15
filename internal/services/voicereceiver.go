@@ -479,6 +479,15 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	if m.opt.UserName == "" {
 		return fmt.Errorf("无法确定运行该服务的真实用户")
 	}
+
+	// ---- 0. 命令行开发者工具 ----
+	// 接收端脚本用 /usr/bin/python3 跑；全新 macOS 上那只是个占位程序
+	// （跑它会弹"安装开发者工具"）。不先装 CLT，plist 注册出来的服务起不来，
+	// 而报错只会在 launchd 日志里，联想不到是"缺开发者工具"。
+	if err := m.EnsureCLT(ctx, result); err != nil {
+		return err
+	}
+
 	p := m.receiverPaths()
 
 	// ---- 1. 目录与脚本 ----

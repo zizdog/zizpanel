@@ -585,3 +585,36 @@ func TestBrewInstallScriptCandidatesPrefersOfficial(t *testing.T) {
 		}
 	}
 }
+
+// TestFreshMacNeedsCLTBeforeTTS 锁住"装 TTS 之前必须先确保命令行开发者工具"。
+//
+// 真机（抹机后的 mini）实测：全新 macOS 上 /usr/bin/python3 只是占位程序，
+// 跑它只会打印 "xcode-select: note: No developer tools were found, requesting install."
+// 并弹出图形对话框。而 Qwen3 TTS（python venv + pip）与音色接收端（/usr/bin/python3）
+// 都要真 Python —— 不先装 CLT，它们会以"看不懂的方式"失败。
+func TestFreshMacNeedsCLTBeforeTTS(t *testing.T) {
+	// 接收端只要真 python3（/usr/bin/python3）→ 确保 CLT 即可
+	b, err := os.ReadFile("voicereceiver.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "m.EnsureCLT(ctx, result)") {
+		t.Error("voicereceiver.go 必须在安装前调用 EnsureCLT（接收端脚本靠 /usr/bin/python3）")
+	}
+	// Qwen 还要 brew 里的 python@3.11 → 需要 EnsureHomebrew（它内部会先装 CLT）
+	b, err = os.ReadFile("qwentts.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "m.EnsureHomebrew(ctx, result)") {
+		t.Error("qwentts.go 必须先 EnsureHomebrew（CLT → brew → python@3.11 一整条链）")
+	}
+	// EnsureHomebrew 也要走同一条路（不能各写一份 CLT 检查）
+	b, err = os.ReadFile("homebrew.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(b), "m.installCLT(") != 1 {
+		t.Error("installCLT 只应被 EnsureCLT 调用一次，避免两套判定漂移")
+	}
+}

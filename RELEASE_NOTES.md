@@ -1,4 +1,148 @@
-v0.8.6 · 全原生穿透/反代工具（frps / frpc / Lucky / Orbien 服务端+客户端）+ 内置默认音色 + 多密钥额度与用量
+v0.9.0 · Homebrew 装上了但面板找不到它："面板先于 Homebrew 存在"写下的错路径不会自我修正
+
+**真机（抹机后的 mini）进展**：0.8.10 的临时免密 sudo 生效了 ——
+Homebrew 的官方安装脚本这次**真的把 brew 装进 /opt/homebrew**（实机确认
+`/opt/homebrew/bin/brew --version` → `Homebrew 7.0.2`），
+安装结束后的 sudoers 也干净（`/etc/sudoers.d/` 里只剩面板自己那条）。
+
+**但它紧接着报了另一个错**：
+
+```
+Homebrew 装完了但执行不了：env: /usr/local/bin/brew: No such file or directory
+```
+
+根因不在 Homebrew，在**面板自己**：`BrewPrefix` 是面板**第一次启动那一刻**
+探测出来的 —— 全新机器上那一刻 `/opt/homebrew` 还不存在，于是它退回了
+`/usr/local`，并且**把这个值持久化进了 `config.json`**。
+之后不管装多少次 Homebrew，配置里的路径都不会自我修正。
+
+**修法（0.9.0）**：
+- `Config.ReconcilePaths()`：每次加载配置时做一次很便宜的校正
+  （两次 `stat`，只认真实存在的 `bin/brew`），有变化才写回文件；
+- 由 Homebrew 前缀推导出来的路径（`BrewBin / NginxBin / NginxConf / VhostDir /
+  PHPEtc / MySQLBin / PmaDir`）**一起**改 —— 只改前缀不改派生路径，
+  症状会是"某个功能莫名找不到文件"，更难查；
+- 用户手工填了自定义前缀、而且那个前缀**真实可用**时，**不动它**；
+- 机器上完全没装 Homebrew 时不瞎改（返回 false，不写盘）。
+- `config.Load` 与面板每次构造服务管理器时都会走这一步。
+
+有单测锁住"过期前缀 + 派生路径 + 写回文件 + 幂等 + 不瞎改"这五种情形。
+
+---
+
+v0.8.10 · Homebrew 的卡点找到了：官方安装脚本硬编码 /usr/bin/sudo，PATH 垫片拦不住
+
+**这一版是"上一版没解决、在真机上再试一次并找到根因"的结果。**
+
+0.8.9 我加了一个 `sudo` 垫片（往 PATH 里塞一个脚本），以为能拦下降权后那几步 root 操作。
+真机复跑后，任务日志里那一行**一个字符都没变**：
+
+```
+==> /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0755 /opt/homebrew
+sudo: a terminal is required to read the password
+```
+
+原因：**Homebrew 官方安装脚本硬编码调用 `/usr/bin/sudo`**（它自己的 `execute_sudo()`），
+根本不看 PATH。而且它开头就用 `sudo -n -l mkdir` 探一次权限，不通就直接
+`abort "Need sudo access on macOS"`。
+
+**修法（0.8.10）**：安装期间**临时**给面板用户免密 sudo，装完立即撤销：
+- 写在专用文件 `/etc/sudoers.d/zizpanel-homebrew-install`，不碰用户自己的 sudoers；
+- 权限 0440 + root 拥有；**先 `visudo -c` 校验再启用**（写坏 sudoers 会让整个系统的 sudo 失效）；
+- 授权内容绑定到具体安装用户（不是"所有人"）；
+- 无论成功失败都 `defer` 撤销，撤销时用 `sudo -k` 清掉已缓存的时间戳；
+- 授权与撤销都写进任务步骤，用户看得见"这期间发生了什么"。
+
+事实前提：面板用户本来就是管理员、本来就拥有 `(ALL) ALL`（真机 `sudo -n -l` 确认），
+这里改的只是"安装期间不必输密码"，**不改变长期提权策略**。
+
+垫片保留为第二道保险（让 `sudo -u <user>` 保持"降权"的本意），
+`HOMEBREW_ALLOW_ROOT=1` 作为第三道。三道都不成立时才会失败，且失败时会
+把安装脚本**输出末尾 800 字**带进任务日志。
+
+---
+
+v0.8.9 · 全新安装跑通了：Homebrew 在"面板里没人能输密码"的环境下也能装 + CLT 走分片并行下载 + README 重写
+
+**这一版是抹机后的 mini 上真机跑出来的结论**，三处都是"只在真机上才会暴露"的问题：
+
+**1. Homebrew 安装必失败**（真机复现两次）
+- 现象：CLT 装好之后，Homebrew 安装脚本走到
+  `/usr/bin/sudo /usr/bin/install -d -o root -g wheel /opt/homebrew` 就死，
+  报 `sudo: a terminal is required to read the password`，任务里只剩一句"安装 Homebrew 失败"。
+- 根因是三个条件同时成立：Homebrew **拒绝以 root 运行**（必须降权）、
+  降权后它自己又有几步要 root、而面板是 LaunchDaemon **没有终端可以输密码**。
+- 修法：安装期间放一个只对安装脚本生效的 `sudo` 垫片（`brewSudoShim`）——
+  带 `-u` 的调用拿掉 `-u` 原样执行（脚本本意就是降权），
+  不带 `-u` 的清掉 `HOME` 后以面板用户执行（建目录这类操作结果一样），
+  再叠加 Homebrew 自己的 `AllowRoot`；**装完立即删除**。
+  不动的系统的 sudoers，不改变用户机器的提权策略。
+- 失败时把安装脚本**输出末尾 800 字**带进任务步骤（以前只有一句"失败"）。
+
+**2. CLT 大包下载会抖动，断一次就前功尽弃**
+- 真机实测：576 MB 单连接约 460 KB/s，中途出现 `curl: (56) Recv failure: Connection reset by peer`，
+  而那一次重试是**从 0 开始**（已经下掉的 200 多 MB 全废）。
+- 修法：镜像上把大包切成 32 MB 分片（`clt/index.json` 的 `parts`），
+  面板**4 路并行 + 逐片校验 + 断点续传**：已下好且大小正确的分片直接跳过，
+  断一片只重下那一片；拼回后仍然核对**整体** sha256（分片校验说明不了顺序对不对）。
+  清单没给 `parts` 的包自动退回单文件下载，所以镜像可以分阶段升级。
+
+**3. README 重写**
+- 之前 1700 多行，把设计论证、测试策略、80 多条坑清单全塞在一起，
+  第一次来的人找不到"我该执行哪一行"。
+- 现在 `README.md` **只讲安装与使用**：开头就是那一行安装命令，
+  然后明确写出"安装过程中可能需要点一次哪里"（CLT 弹窗、可选的可信证书）。
+- 开发过程、设计取舍、测试策略、坑清单全部搬到 `DEVELOPMENT.md`。
+
+---
+
+v0.8.8 · 全新安装不再需要代理、也不需要在 Mac 上点任何弹窗：命令行开发者工具改走镜像整包安装
+
+**问题（抹机 mini 实测）**：0.8.7 之前"无界面装 CLT"依赖苹果自己的通道，
+而这条通道在国内无代理时不通 ——
+`softwareupdate -i "Command Line Tools for Xcode-16.2"` **15 分钟只下了 1 MB 然后停住**
+（`swdist.apple.com` 通但极慢，`updates.cdn-apple.com` 的 DNS 还被解析到假地址
+`198.18.0.67`）；失败后回退到 `xcode-select --install`，那是个**图形对话框**，
+无人值守的远程安装就永远停在那里。而全新 macOS 上 TTS 两件套都要真 Python
+（接收端 plist 是 `/usr/bin/python3`，Qwen3 TTS 要 venv + pip）——
+于是"输入一次密码后全程自动完成"在最后一步断掉。
+
+**修法**：把苹果**原始**的 CLT 安装包放到项目自己的国内镜像上，按
+**镜像整包 → softwareupdate → 弹窗** 的顺序安装，三条路都试过才算失败：
+- 清单 `https://zizdog.com/zizpanel/clt/index.json`：每项给
+  `name` / `path`（或 `dir`）/ `max_os`（**上限**）/ `pkgs` / `bytes` / `sha256`。
+  面板按 `sysctl -n kern.osrelease` 推 macOS 主版本（24 → 15）来挑，**排在前面的优先**，
+  所以"在哪台机器上成功过的条目"往前排。
+- 只下白名单里的两个包：`CLTools_Executables.pkg`（604 MB，`python3`/`clang`/`git`）
+  与 `CLTools_macOSNMOS_SDK.pkg`（55 MB，macOS SDK）。苹果同一产品里还有
+  `SwiftBackDeploy` / `LMOS_SDK` / `DevSDK_Remove_*`，全下要多 105 MB。
+- `sha256` 校验（清单提供就校验）、`curl -fL --retry-all-errors`、
+  失败删半成品、装完删 `/tmp` 里的包（省 660 MB）。
+- 成功判定改成**真的跑一次 `/usr/bin/python3`**：全新 macOS 上这个路径**存在**，
+  只是跑起来会打印一句提示并弹对话框 —— 只看 `xcode-select -p` 会误判成功。
+- 两条苹果路径的**真实输出**都写进任务步骤（以前只写"没成功"，
+  真机上完全无法判断是 DNS、证书还是传输中断）。
+- 自建镜像照同样的目录结构放文件即可；`ZIZPANEL_CLT_MIRROR=<地址>` 可覆盖内置地址。
+
+**更正 0.8.7 的一处不实描述**：0.8.7 的说明里写了"真机验证了无界面装 CLT 有效"，
+那是**只有放标记文件 + `softwareupdate -l` 能看到条目**被验证了，
+安装本身在真机上没有走通过。已在 v0.8.7 段落里划掉并注明原因。
+
+---
+
+v0.8.7 · 全原生穿透/反代工具（frps / frpc / Lucky / Orbien 服务端+客户端）+ 内置默认音色 + 多密钥额度与用量
+
+**全新机器上的真依赖：TTS 两件套需要命令行开发者工具**（抹机后的 mini 实测发现）
+- 全新 macOS 上 `/usr/bin/python3` **只是个占位程序**：跑它只会打印
+  "xcode-select: note: No developer tools were found, requesting install." 并弹图形对话框。
+  而音色接收端的 plist 就是 `/usr/bin/python3`，Qwen3 TTS 也要真 Python（venv + pip）。
+- 所以：**接收端安装前 `EnsureCLT`**（CLT 就够）；**Qwen3 TTS 安装前 `EnsureHomebrew`**
+  （CLT → brew → python@3.11 一整条链）。以前在全新机器上会以"看不懂的方式"失败。
+- ~~真机验证了"无界面装 CLT"这条路在 macOS 15.7.9 上有效~~ ——
+  **更正（0.8.8）**：这只在"能连上苹果 CDN"的机器上成立。抹机后的 mini 上，
+  `softwareupdate -i "Command Line Tools for Xcode-16.2"` **15 分钟只下了 1 MB
+  然后停住**，最后回退到会弹图形对话框的 `xcode-select --install`，
+  全新安装就卡在那里。0.8.8 起改为**镜像整包 → softwareupdate → 弹窗**。
 
 **修掉一个"按钮点开就坏"的问题**：Lucky 的「📝 编辑配置文件」之前指向 `lucky.conf`，
 而它的配置其实是**加密的** `lucky_*.lkcf`（真机快照核实：`~/lucky` 下没有 lucky.conf）。

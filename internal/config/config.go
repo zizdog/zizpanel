@@ -219,23 +219,87 @@ func Default() *Config {
 		UserHome:            home,
 		UserUID:             lookupUID(u),
 		WWWRoot:             filepath.Join(home, "www"),
-		BrewPrefix:          brew,
-		BrewBin:             filepath.Join(brew, "bin", "brew"),
-		NginxBin:            filepath.Join(brew, "bin", "nginx"),
-		NginxConf:           filepath.Join(brew, "etc", "nginx", "nginx.conf"),
-		VhostDir:            filepath.Join(brew, "etc", "nginx", "vhosts"),
 		LogRoot:             filepath.Join(home, "www", "_logs"),
 		PHPSvc:              "php@8.3",
 		PHPVer:              "8.3",
-		PHPEtc:              filepath.Join(brew, "etc", "php", "8.3"),
 		MySQLSvc:            "mysql@8.4",
-		MySQLBin:            filepath.Join(brew, "opt", "mysql@8.4", "bin", "mysql"),
-		PmaDir:              filepath.Join(brew, "share", "phpmyadmin"),
 		DockerSocket:        "/var/run/docker.sock",
 	}
+	c.applyBrewPrefix(brew)
 	c.TLSCert = filepath.Join(c.DataDir, "tls", "panel.crt")
 	c.TLSKey = filepath.Join(c.DataDir, "tls", "panel.key")
 	return c
+}
+
+// brewPrefixes 是 Homebrew 前缀的候选路径。
+//
+// 顺序有含义：Apple Silicon 用 /opt/homebrew，Intel 或自定义安装用 /usr/local。
+// 两个都不在时才退回 /opt/homebrew（错误信息里会显示这个"期望路径"）。
+//
+// 变量而不是常量：单测要能把它指到临时目录，
+// 否则"重新探测前缀"这段逻辑只能靠真机验证（而它正是真机上才暴露的 bug）。
+var brewPrefixes = func() []string {
+	return []string{"/opt/homebrew", "/usr/local"}
+}
+
+// detectBrewPrefix 找到**真的装了** Homebrew 的前缀；都没有则返回 ""。
+//
+// 为什么必须真的去 stat `bin/brew`：`Default()` 在"面板刚启动"时求值，
+// 而**全新机器上面板是先于 Homebrew 存在的** —— 那一刻 /opt/homebrew 还没有，
+// 于是前缀被写成 /usr/local 并**持久化进 config.json**；
+// 之后面板在任务里装好 Homebrew，配置里的路径却永远是错的。
+// 真机（抹机后的 mini）就是这么复现的：Homebrew 明明装好了，
+// 任务却报 `env: /usr/local/bin/brew: No such file or directory`。
+func detectBrewPrefix() string {
+	for _, p := range brewPrefixes() {
+		if st, err := os.Stat(filepath.Join(p, "bin", "brew")); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// applyBrewPrefix 把由 Homebrew 前缀推导出来的路径统一写进配置。
+//
+// 抽成一个函数的原因：这些路径散落在站点、数据库、日志、phpMyAdmin 等十几处，
+// 一旦"前缀变了但派生路径没跟着变"，症状会是"某个功能莫名找不到文件"。
+func (c *Config) applyBrewPrefix(brew string) {
+	c.BrewPrefix = brew
+	c.BrewBin = filepath.Join(brew, "bin", "brew")
+	c.NginxBin = filepath.Join(brew, "bin", "nginx")
+	c.NginxConf = filepath.Join(brew, "etc", "nginx", "nginx.conf")
+	c.VhostDir = filepath.Join(brew, "etc", "nginx", "vhosts")
+	c.PHPEtc = filepath.Join(brew, "etc", "php", "8.3")
+	c.MySQLBin = filepath.Join(brew, "opt", "mysql@8.4", "bin", "mysql")
+	c.PmaDir = filepath.Join(brew, "share", "phpmyadmin")
+}
+
+// ReconcilePaths 修正"配置里记着、但机器上已经变了"的路径，返回是否有变化。
+//
+// 现存问题（真机复现）：配置在**面板刚启动**那一刻生成，
+// 那时 Homebrew 可能还没装，前缀被写成 /usr/local 并持久化；
+// 之后无论装多少次 Homebrew 都不会自我修正。
+// 这里在每次读取配置时做一次便宜的校正（两次 stat），
+// 有变化才写回文件（避免无谓的磁盘写入与权限变更）。
+func (c *Config) ReconcilePaths() bool {
+	if c == nil {
+		return false
+	}
+	want := detectBrewPrefix()
+	if want == "" {
+		// 没装 Homebrew：不要瞎改用户的配置（他可能手工填了自定义前缀）
+		return false
+	}
+	// 用户的配置已经指向一个**真实存在**的安装 → 尊重它，不动
+	if st, err := os.Stat(filepath.Join(c.BrewPrefix, "bin", "brew")); err == nil && !st.IsDir() {
+		return false
+	}
+	if want == c.BrewPrefix && c.BrewBin == filepath.Join(want, "bin", "brew") {
+		return false
+	}
+	c.applyBrewPrefix(want)
+	_ = c.Save()
+	return true
 }
 
 // Load 读取配置文件；不存在则返回错误 ErrNotInstalled。
@@ -255,6 +319,10 @@ func Load(path string) (*Config, error) {
 	}
 	c.path = path
 	c.fill()
+	// 修正在"面板先于 Homebrew 存在"那一刻写下的 /usr/local 前缀。
+	// 放在 Load 里而不是各个调用点：每个功能都去关心"brew 前缀对不对"
+	// 是重复的，而且总有人忘记。
+	c.ReconcilePaths()
 	return c, nil
 }
 
