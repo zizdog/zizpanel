@@ -487,15 +487,20 @@ export function AppsView(content, ctx = {}) {
         out.push(h('a.btn.btn-sm', { href: direct, target: '_blank', rel: 'noopener', text: '直连端口', title: '绕过面板直接访问：' + direct }));
       }
     } else if (direct) {
-      // 子路径不可用（应用需要自己设 base path）：主入口仍是**面板内的子路径**尝试，
-      // 端口直连只作为次要入口，并明确标注它用的是哪台机器的哪个端口。
+      // 子路径不可用（应用需要自己设 base path，或前端路由不认这个前缀）。
+      //
+      // 既然"子路径不可用"是**人工实测/探测**得出的结论（PreferDirect 或探测失败），
+      // 主入口就必须是**端口直连** —— 否则用户点「打开」拿到的是一个已知打不开的
+      // 子路径，与 AppUI.PreferDirect 的字段文档（"「打开」直接给端口直连，
+      // 子路径降级成次要入口"）自相矛盾。子路径保留成"试试"按钮，
+      // 万一以后上游支持了或探测结论变了，仍有一条入口。
       out.push(h('a.btn.btn-sm.btn-primary', {
-        href: path, target: '_blank', rel: 'noopener', text: '打开',
-        title: why || '子路径可能不可用',
+        href: direct, target: '_blank', rel: 'noopener', text: '打开',
+        title: '直连应用端口：' + direct + (why ? '（' + why + '）' : ''),
       }));
       out.push(h('a.btn.btn-sm', {
-        href: direct, target: '_blank', rel: 'noopener', text: '直连端口',
-        title: '绕过面板直接访问应用端口：' + direct,
+        href: path, target: '_blank', rel: 'noopener', text: '试试子路径',
+        title: why || '子路径可能不可用',
       }));
     } else {
       out.push(h('a.btn.btn-sm', {

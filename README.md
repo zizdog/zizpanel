@@ -1086,6 +1086,10 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 - **容器运行时**：Docker 运行时（Colima）—— 其余 Docker 应用的前提，可一键安装
 - **运维工具（Docker）**：Uptime Kuma、MinIO、n8n、Gitea、Stirling PDF、
   IT-Tools、File Browser、MetaTube、Squoosh
+- **内网穿透 / 反向代理（全部原生）**：Lucky、Orbien 服务端、Orbien 客户端、
+  frps、frpc —— 五个条目**没有一个走 Homebrew，也没有一个走 Docker**，
+  统一由面板的通用二进制安装器（`internal/services/binary_release.go`）
+  下载官方 `darwin-arm64` 产物、写系统级 launchd 托管
 
 > Pic Smaller 已移除：其目录条目的镜像 `joyqi/sfz` 在 Docker Hub 上并不存在，
 > 该项目也没有官方镜像。保留一个点了必然失败的条目比没有更糟。
@@ -1105,16 +1109,22 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
    `brew services start` 失败，只留下一条 label 指向不存在 plist 的"托管"记录 ——
    市场说已安装、服务管理里永远起不来。这种情况**宁可退到 Docker**，也不留假成功。
 2. **原生二进制**：只有官方 GitHub release 的 `darwin-arm64` 产物、没有 formula 时，
-   面板目前**没有**"下载 release 二进制 → 写 launchd plist"的通用安装器
-   （`internal/upgrade` 那套只服务面板自身升级）。**不要为单个应用临时发明安装器**；
-   这类应用先走 Docker，等通用安装器做出来再换（`metatube-server` 就是这种：
-   上游发了 `metatube-server-darwin-arm64.zip`，但目录里没有对应的安装路径）。
+   用面板自研的通用二进制安装器（`internal/services/binary_release.go`，2026-09 补上）。
+   它下载官方 tarball → 解压 → **用 `file(1)` 复核确实是 arm64**（不是就中止）→
+   写系统级 launchd → 等端口真的监听 → 登记进服务管理；卸载走「面板安装器」那条路。
+   门槛仍然是"**一项能力服务多个应用**"：只给一个应用写一套专属流程依旧不做
+   （`metatube-server` 仍留在 Docker，等它的上游发行方式或需求变化再说）。
 3. **Docker（兜底）**：镜像必须**自带 `linux/arm64`**。用
    `docker manifest inspect <image>:<tag>` 看 platforms 列表，必须出现
    `linux/arm64`；compose 里**绝不写 `platform:`**，也不靠 Rosetta 转译
    （转译慢、占内存，违背"原生优先"）。`internal/services` 里有一条测试
    （`TestCatalogComposeNeverPinsPlatform`）锁死这一条。端口按既有写法绑
    `<host>:<container>`（0.0.0.0），健康检查路径要能在源码/healthcheck 里找到出处。
+
+> macOS 上 Docker 跑在 Colima 的 Linux 虚拟机里，容器看到的是**虚拟机**的网络，
+> 不是 Mac 的（`--network host` 也只等于虚拟机自己的 host）。所以端口转发 /
+> 反向代理 / DDNS / 内网穿透这类"贴着网络栈"的工具（Lucky、Orbien）在 macOS 上
+> **必须原生跑** —— 放进容器等于把转发器和被转发的服务塞进两个网络命名空间。
 
 本轮 4 个新条目的判定结果（证据都写在 `internal/services/catalog.go` 的条目注释里）：
 
@@ -1125,11 +1135,77 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 | MetaTube Server | Docker | 官方镜像 `ghcr.io/metatube-community/metatube-server:latest` → `linux/amd64、linux/arm64`（上游另有 darwin-arm64 release 二进制，见上第 2 条） |
 | Squoosh | Docker（社区镜像） | 上游**没有**官方镜像（仓库里没有 Dockerfile）；社区 `pjmeca/squoosh:1.1.0` → `linux/amd64、linux/arm64、linux/arm/v7` |
 
+第二批（内网穿透 / 反向代理，2026-09，**五个条目全部原生：不用 Homebrew，也不走 Docker**）：
+
+| 应用 | 路线 | 依据（实测输出摘要） | 默认端口 |
+|---|---|---|---|
+| frps | 原生（官方 darwin-arm64 产物 + **SHA-256 校验**） | v0.71.0 资产 `frp_0.71.0_darwin_arm64.tar.gz`（12,680,181 B）；实测 `shasum -a 256` = `45be02b1…dabcc6`，与官方 `frp_sha256_checksums.txt` 一致；解压出的 `frps` 用 `file` 报 `Mach-O 64-bit executable arm64`、`frps --version` = `0.71.0` | 7000（bindPort，协议口）⚠️ / 7500（Dashboard） |
+| frpc | 原生（**与 frps 同一个 tarball**，只挑 `frpc`） | 同一个 asset 里 `frp_x/frpc` 也是 `Mach-O arm64`；`PickBinary` 只解压它，不会多装一个 frps | 无协议口（主动外连）；7400 = admin UI |
+| Lucky | 原生（官方 darwin-arm64 产物） | GitHub API v2.27.2 资产里有 `lucky_2.27.2_darwin_arm64.tar.gz`（13,529,298 B）；实测解压后 `file` 报 `Mach-O 64-bit executable arm64`，运行日志 `LuckyWeb Http Listen on http://:16601`；`brew info lucky` **无** formula | 16601（HTTP/HTTPS 同端口） |
+| Orbien 服务端 | 原生（官方 darwin-arm64 产物） | GitHub API v3.6.0 资产里有 `orbien-server_3.6.0_darwin_arm64.tar.gz`（2,478,257 B）；实测 `file` 报 `Mach-O 64-bit executable arm64`，运行后 `0.0.0.0:9527`（控制）与 `0.0.0.0:8020`（Dashboard）在听；`brew info orbien` **无** formula | 8020（Dashboard）/ 9527（控制） |
+| Orbien 客户端 | 原生（官方 darwin-arm64 产物） | v3.6.0 资产 `orbien_3.6.0_darwin_arm64.tar.gz`（2,104,350 B）；实测解压出的 `orbien` 用 `file` 报 `Mach-O 64-bit executable arm64`，`orbien --help` 输出 `orbien client`（CLI 客户端，二进制名 `orbien`） | 无（主动外连）；管理界面见服务端 8020 |
+
+> **为什么不把这些放进 Docker（上游其实都有 arm64 镜像）**：`lucky`、
+> `snowdreamtech/frpc`、`ghcr.io/orbien-org/orbien`（客户端）、
+> `ghcr.io/orbien-org/orbien-server`（服务端）都自带 `linux/arm64`（实测
+> `docker manifest inspect`）。本项目的选择仍是原生，两条理由：
+> ① **服务端要动态入站端口** —— 容器化就得把一整段端口预先 `-p` 出来；
+> ② **客户端的活是"把本机服务暴露出去"** —— 原生下 `127.0.0.1` 直接可用，
+> 容器里 `127.0.0.1` 是容器自己，每条隧道都得改写成 `host.docker.internal`
+> （见下条），正好卡在它的主用途上。想统一容器化的人可以自己按上游文档换，
+> 代价就是这两点；面板不拦着，只是不默认这么做。
+
+> **每个条目都能可视化配置**，两条路都通：
+> ① **应用自带的 Web UI**（市场卡片的「打开」直接给端口直连）：
+>    Lucky `http://<地址>:16601`、Orbien Dashboard `http://<地址>:8020`、
+>    frps Dashboard `http://<地址>:7500`、frpc admin UI `http://<地址>:7400`。
+>    frps / frpc 的用户名口令是面板随机生成、显示在安装结果里的；
+>    Lucky 首次访问要走它自己的初始化，Orbien 服务端是 `admin` + 随机口令。
+> ② **服务管理 → 详情 → 「📝 编辑配置文件」**：面板直接编辑安装目录里的
+>    `frps.toml` / `frpc.toml` / `lucky.conf` / `orbien-server.toml` / `orbien.toml`，
+>    保存后提示并一键「重启服务」生效。读写复用既有的
+>    `/api/v1/files/read|write`（没有第二套文件读写），
+>    白名单里额外放行的只是这几个应用的**安装目录**，不是整个家目录。
+>
+> 健康检查也接到了界面上：Lucky / Orbien 服务端 / frps / frpc 注册进服务管理时
+> 会带上 `http://127.0.0.1:<界面端口><HealthPath>`，健康列不再是"未配置"。
+> frps 的存活判断仍看协议口 7000（dashboard 起得来不代表 `bindPort` 绑上了），
+> 界面入口与健康检查才走 7500 —— 两个端口各有各的用途，条目里分成
+> `Port` 与 `UIPort` 两个字段。
+
+> ⚠️ **frps 的 7000 端口在 macOS 上通常被「隔空播放接收器」占着**（本机实测
+> `ControlCenter` 在听 7000）。面板的安装前检查会**如实**报出这个冲突并拒绝安装，
+> 直到用户关掉隔空播放接收器（系统设置 → 通用 → 隔空投送与接力），
+> 或把 `~/frps/frps.toml` 的 `bindPort` 改成空闲端口（可在服务详情里直接编辑）。
+> 这是"看真实状态"的正常表现，不是误报 —— 条目里也把这条写在了说明与安装提示里。
+
+> 下载来源（实测于 2026-09，不要照抄成"直连超时"）：`github.com` 的 release
+> 下载**可达但很慢** —— lucky 的 12.9MB 产物用 `/usr/bin/curl` 直连花了
+> **293 秒**（约 46KB/s，几乎顶到面板设的 `--max-time 300`），同一份产物经
+> `ghfast.top` 只要 **21 秒**。（`api.github.com` 一直很快，所以"能查 API"
+> 不能推断"能下产物"。）因此 `binary_release.go` **先试官方地址**，慢了/失败了
+> 才退到加速镜像（`ghfast.top` / `gh-proxy.com`，**第三方**）—— 默认来源仍是官方。
+>
+> **完整性校验的现状（如实说）**：frp 是这五个里**唯一**提供 checksums 的上游
+> （`frp_sha256_checksums.txt`），所以 frps / frpc 会下载 12.7MB 的 tarball 后
+> 与官方清单逐字节核对，**不一致就中止安装并明确报错**（单测
+> `TestReleaseBinaryChecksumRejectsMismatch` 直接喂错哈希证明它真的会拦）。
+> 清单优先从**官方**地址取（只有 1.6KB，慢链路也秒下），再退镜像 ——
+> "tarball 来自镜像、清单来自官方"时校验才有真实意义；若官方完全不可达、
+> 清单也只能从同一个镜像取，这一步就退化成"防传输损坏"而非"防镜像作恶"，
+> 安装日志里会把清单来源写出来。
+> Lucky / Orbien 的上游 release 里**没有** checksums 文件，面板只能做
+> `file(1)` 的架构复核，无法校验内容 —— 介意这一点的用户可以自行下载产物
+> 放进安装目录（自动下载全失败时面板会用它，且仍会走架构复核与 sha256 校验）。
+
 > 网络实测：本机 `registry-1.docker.io` / `hub.docker.com` 直连超时，
 > Docker Hub 上的 manifest 只能经镜像站读同一份 image index
 > （`docker manifest inspect docker.1ms.run/<image>:<tag>`）；`ghcr.io` 可直连。
 > 所以有官方 ghcr 镜像的项目（IT-Tools、MetaTube）优先写 ghcr 地址。
 > 选镜像前先确认该仓库能从本机真的拉到。
+> 上面那句 `host.docker.internal` 只在**用户自己**把这些应用容器化时适用：
+> Colima 自带该别名（实测容器里 `wget http://host.docker.internal:<port>/` 能打到 Mac），
+> 但面板自带的市场条目不再使用它。
 
 ### Qwen3 TTS：只有一个模型（1.7B-Base-8bit，音色克隆）
 
@@ -1227,6 +1303,28 @@ Colima 基于 Lima，纯命令行、原生 aarch64，无 GUI 也能跑。
 > （本机 127.0.0.1 不会被悄悄改成 0.0.0.0），并把原来的共享密钥**迁移**成
 > 密钥表里的第一条（网站不用改配置）。
 > 没升级时「各来源」会明确提示"接收端版本过旧"，不会假装列表是空的。
+
+**v1.7.1：内置默认音色（装完就能用）**。
+
+以前"没上传过音色就用不了"：每个新站点、每台新装的机器都得先自己录一段，
+否则合成直接被拒（接收端报 `voice sample not found for source '…'`）。现在：
+
+1. 面板二进制里**内嵌一份音色样本**（7.68 秒 / 24kHz / 单声道 / 16bit PCM，
+   用户提供的"龙安灵心"）与它实际念的那句**参考文字**。
+2. 在面板里安装/重新部署接收端时，自动写到 `<样本目录>/default/ref.wav`，
+   参考文字写到同目录的 `ref.txt` —— **全新安装的机器装完就有可用音色**。
+3. **没指定音色的调用会走它**：`POST /jobs` 不带 `ref_audio`、`source` 省略或为
+   `default` 时，接收端就用这份样本（并自动带上 `ref.txt` 里的参考文字，
+   克隆时参考文字对得上，音色更像）。
+4. **不覆盖你自己的东西**：只有当 `default/ref.wav` 不存在、或存在且带
+   `builtin-voice.json` 标记（说明是面板自己放的）时才写。用户自己上传过 default
+   样本的机器，升级时不会被悄悄换掉 —— 面板会明确打印"保留了你自己上传的样本"。
+5. 「各来源」里这一行会标成「内置默认音色，含参考文字」，可替换、可删除。
+
+> 给调用方的三种写法（等价）：`{}`、`{"source":"default"}`、
+> 或显式 `{"ref_audio":"<样本目录>/default/ref.wav"}`。
+> **带 `ref_audio` 时以它为准**（显式优先），所以插件若一直传自己的路径，
+> 就不会用到内置默认音色。
 
 **v1.6.0：多密钥 + 每密钥额度（单位：字）+ 用量统计**。
 

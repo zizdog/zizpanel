@@ -52,5 +52,11 @@ func InstallerArtifactExists(userHome, appID string) bool {
 	case "voicereceiver":
 		return fileExists(filepath.Join(home, "tts", "voice-receiver", "receiver.py"))
 	}
+	// "官方 release 原生二进制"类（Lucky / Orbien 服务端与客户端 / frps / frpc）：
+	// 产物路径就是安装器注册表里的 <家目录>/<RootDir>/<Binary>，直接查表 ——
+	// 在这里再抄一份路径，加新条目时漏掉的话市场会一直显示"未安装"。
+	if spec, ok := releaseBinaryApps[appID]; ok {
+		return fileExists(filepath.Join(home, spec.RootDir, spec.Binary))
+	}
 	return false
 }

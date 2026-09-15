@@ -113,7 +113,7 @@ func rewritableContentType(ct string) bool {
 // 传入的 App 必须带 UI（Slug / Port）；调用方负责校验。
 func Handler(app services.App) http.Handler {
 	ui := app.UI
-	upstream := &url.URL{Scheme: "http", Host: "127.0.0.1:" + itoa(app.Port)}
+	upstream := &url.URL{Scheme: "http", Host: "127.0.0.1:" + itoa(app.WebPort())}
 	// SelfBase：应用自己已经带上级路径，任何改写都是画蛇添足（会双重加前缀）
 	var rw *rewriter
 	if !ui.SelfBase {
@@ -181,7 +181,7 @@ func Handler(app services.App) http.Handler {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = io.WriteString(w, "<h1>502 应用没有响应</h1><p>面板无法连接 "+ui.Slug+
-				"（127.0.0.1:"+itoa(app.Port)+"）："+esc(err.Error())+"</p>"+
+				"（127.0.0.1:"+itoa(app.WebPort())+"）："+esc(err.Error())+"</p>"+
 				"<p>这个应用可能没有启动。请到「服务管理」看它的状态，或到「应用市场」重新部署。</p>")
 		},
 	}
@@ -198,7 +198,7 @@ func esc(s string) string { return html.EscapeString(s) }
 func Slugs() []services.App {
 	var out []services.App
 	for _, a := range services.Catalog() {
-		if a.UI == nil || a.UI.SelfConf || a.Port <= 0 {
+		if a.UI == nil || a.UI.SelfConf || a.WebPort() <= 0 {
 			continue
 		}
 		out = append(out, a)

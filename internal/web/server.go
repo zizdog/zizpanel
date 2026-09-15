@@ -16,7 +16,6 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/auth"
 	"github.com/zizdog/zizpanel/internal/config"
-	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/logs"
 	"github.com/zizdog/zizpanel/internal/logx"
 	"github.com/zizdog/zizpanel/internal/services"
@@ -59,10 +58,6 @@ type Server struct {
 	mktDocker     string
 	mktDockerV    string
 	mktDockerAt   time.Time
-
-	// fileMgr 是文件管理器（惰性初始化，因为根目录列表来自配置）
-	fileMgr  *files.Manager
-	fileOnce sync.Once
 
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog

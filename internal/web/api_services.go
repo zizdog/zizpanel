@@ -87,6 +87,16 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// serviceDetail 在服务记录之外，额外带上"目录条目声明的配置文件路径"。
+//
+// 为什么不在 Service 表里加字段：配置路径是目录（代码里）的静态属性，不是运行时状态；
+// 存进库只会多一份会漂的副本。这里按 launchd label / 名字现查目录，返回时摊平
+// （嵌入 *Service，JSON 里字段仍是平的，前端不用改读法）。
+type serviceDetail struct {
+	*services.View
+	ConfigPath string `json:"config_path,omitempty"`
+}
+
 func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	mgr := s.svcManager()
@@ -95,7 +105,12 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err.Error())
 		return
 	}
-	ok(w, v)
+	// 只透出路径；真正的读写仍走既有的 /api/v1/files/read|write（白名单不变）。
+	detail := serviceDetail{View: v}
+	if app, ok := services.FindAppByService(v.Service); ok {
+		detail.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
+	}
+	ok(w, detail)
 }
 
 // ---------- 服务操作 ----------
@@ -561,8 +576,8 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			a.ServiceLabel = realLabel
 		}
 		portURL, proxyURL := "", ""
-		if a.Port > 0 && lanIP != "" {
-			portURL = fmt.Sprintf("http://%s:%d/", lanIP, a.Port)
+		if a.WebPort() > 0 && lanIP != "" {
+			portURL = fmt.Sprintf("http://%s:%d/", lanIP, a.WebPort())
 		}
 		if a.UI != nil && a.UI.Slug != "" && lanIP != "" {
 			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
@@ -669,9 +684,9 @@ func (s *Server) handleMarketPreflight(w http.ResponseWriter, r *http.Request) {
 
 // handleMarketInstall 安装应用。
 //
-// 大多数条目走通用的 brew / compose 安装流程；但有四个项目用的是
-// 本项目自研的安装器（要建虚拟环境、改 nginx、注册系统级守护进程等），
-// 通用流程做不了，所以在这里按 ID 分流。
+// 大多数条目走通用的 brew / compose 安装流程；但有一批项目用的是
+// 本项目自研的安装器（要建虚拟环境、改 nginx、注册系统级守护进程、
+// 下载官方 darwin-arm64 release 产物等），通用流程做不了，所以在这里按 ID 分流。
 func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	switch id {
@@ -689,6 +704,14 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	case "docker-runtime":
 		s.handleInstallDockerRuntime(w, r)
+		return
+	}
+
+	// 官方 release 原生二进制（Lucky / Orbien 服务端 / frps / frpc / Orbien 客户端）：
+	// 参数不同但流程同一套，所以共用一个处理器，按目录 ID 分流。
+	// 用安装器的注册表判断而不是在这里再抄一份 ID 列表 —— 抄的那份一定会漏。
+	if services.IsReleaseBinaryApp(id) {
+		s.handleInstallReleaseBinary(w, r)
 		return
 	}
 
@@ -858,6 +881,29 @@ func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
 		"install_iopaint", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "iopaint", Steps: []string{}}
 			if err := s.svcManager().InstallIOPaint(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
+}
+
+// handleInstallReleaseBinary 部署"官方 release 原生二进制"类应用。
+//
+// 目前服务 Lucky / Orbien 服务端 / frps / frpc / Orbien 客户端（见
+// services.IsReleaseBinaryApp 与 releaseBinaryApps）。与其它安装器一样走任务中心：
+// 下载 + 解压 + 注册系统级服务不是秒级动作，而且用户需要看到下载来源
+// （官方还是加速镜像）、sha256 校验结果与最终的验证结论。
+func (s *Server) handleInstallReleaseBinary(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found {
+		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
+		return
+	}
+	s.launchTask(w, r, "install", id, "安装 "+app.Name,
+		"market_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: id, Name: app.Name, Steps: []string{}}
+			if err := s.svcManager().InstallReleaseBinary(ctx, id, res); err != nil {
 				return res, err
 			}
 			return res, nil

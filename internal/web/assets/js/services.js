@@ -1002,6 +1002,14 @@ export function ServicesView(content, ctx = {}) {
           text: '✏️ 编辑配置',
           onclick: (ev) => { m.close(); newServiceModal(load, cur); },
         }),
+        // 面板安装的应用（frps / frpc / Lucky / Orbien 服务端与客户端）把配置文件
+        // 放在安装目录里，服务详情通过 config_path 拿到路径。这里只加"编辑器入口"：
+        // 读写复用既有的 /api/v1/files/read|write，不新造一套文件读写。
+        cur.config_path ? h('button.btn.btn-sm', {
+          text: '📝 编辑配置文件',
+          title: '直接编辑 ' + cur.config_path + '（保存后需要重启服务才生效）',
+          onclick: () => configFileModal(cur, load),
+        }) : null,
         // 音色接收端专有：调用密钥（多密钥 + 额度 + 用量）
         cur.launch_label === RECEIVER_LABEL ? h('button.btn.btn-sm', {
           text: '🔑 调用密钥',
@@ -1056,6 +1064,110 @@ export function ServicesView(content, ctx = {}) {
     ]);
 
     const m = modal({ title: `服务：${cur.display_name}`, wide: true, body });
+  }
+
+  // ---------- 编辑配置文件 ----------
+  //
+  // 为什么需要：frps / frpc / Lucky / Orbien 这些应用确实"在面板里跑"，
+  // 但它们的配置不是几张表单能覆盖的（token、隧道、反代规则、证书…）。
+  // 面板只做两件事：给出文件路径、提供一个文本框；读写走**既有的**文件接口
+  // （GET /api/v1/files/read、POST /api/v1/files/write），
+  // 白名单与越界校验完全复用，不新造一套文件读写。
+  //
+  // 保存后**不自动重启**：配置里往往有端口/token，改错了要能先看一眼再重启，
+  // 所以保存只提示"重启后生效"，重启交给旁边那颗显式按钮。
+  function configFileModal(s, reload) {
+    const path = s.config_path;
+    const box = h('div', [h('div.empty', [h('p', { text: '正在读取配置文件…' })])]);
+    const m = modal({ title: `配置文件：${s.display_name}`, wide: true, body: box });
+    let editor = null;
+    let saved = '';
+
+    const body = () => h('div', [
+      h('div.hint', { text: '文件：' + path }),
+      editor,
+      h('div', { style: { marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('button.btn.btn-sm.btn-primary', { text: '💾 保存', onclick: save }),
+        h('button.btn.btn-sm', { text: '🔄 重启服务', title: '保存后必须重启才生效', onclick: restart }),
+        h('button.btn.btn-sm', { text: '↻ 重新读取', onclick: loadFile }),
+        h('span.sub', { style: { marginLeft: 'auto' }, text: '保存后需重启服务生效' }),
+      ]),
+    ]);
+
+    async function loadFile() {
+      clear(box);
+      appendAll(box, h('div.empty', [h('p', { text: '正在读取配置文件…' })]));
+      let res;
+      try {
+        res = await api.fileRead(path);
+      } catch (e) {
+        clear(box);
+        appendAll(box, h('div.empty', [
+          h('div.big', { text: '⚠️' }),
+          h('h4', { text: '读取失败' }),
+          h('p', { text: e.message }),
+          h('p.hint', {
+            text: '文件：' + path + '。若服务还没启动过、配置尚未生成，' +
+              '先启动一次服务再回来编辑。',
+          }),
+        ]));
+        return;
+      }
+      if (res.binary || res.too_large) {
+        clear(box);
+        appendAll(box, h('div.empty', [
+          h('div.big', { text: '🔒' }),
+          h('h4', { text: res.binary ? '这是二进制文件' : '文件过大' }),
+          h('p', {
+            text: res.binary
+              ? '为避免破坏文件，不提供在线编辑。'
+              : '超过在线编辑上限（2MB），请下载后用本地工具处理。',
+          }),
+        ]));
+        return;
+      }
+      editor = h('textarea.input', {
+        value: res.content ?? '',
+        spellcheck: 'false',
+        style: {
+          width: '100%', minHeight: '360px', fontFamily: 'var(--mono)',
+          fontSize: '13px', lineHeight: '20px', whiteSpace: 'pre', overflow: 'auto',
+        },
+      });
+      saved = editor.value;
+      clear(box);
+      appendAll(box, body());
+    }
+
+    async function save() {
+      if (!editor) return;
+      if (editor.value === saved) { toast('内容没有变化', 'warn'); return; }
+      const t = toast('保存中…', 'info', 0);
+      try {
+        await api.fileWrite(path, editor.value);
+        saved = editor.value;
+        t.remove();
+        toast('已保存。请点「🔄 重启服务」让它生效', 'ok', 9000);
+      } catch (e) {
+        t.remove();
+        toast('保存失败：' + e.message, 'err', 12000);
+      }
+    }
+
+    async function restart() {
+      const t = toast(`重启「${s.display_name}」中…`, 'info', 0);
+      try {
+        await api.serviceAction(s.name, 'restart');
+        t.remove();
+        toast(`「${s.display_name}」已重启`, 'ok');
+        if (typeof reload === 'function') reload();
+      } catch (e) {
+        t.remove();
+        toast('重启失败：' + e.message + '。请到「日志」里看原因', 'err', 14000);
+      }
+    }
+
+    loadFile();
   }
 
   // ---------- 扫描可纳管服务 ----------

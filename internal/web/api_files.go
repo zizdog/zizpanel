@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/files"
+	"github.com/zizdog/zizpanel/internal/services"
 )
 
 // ============================================================================
@@ -24,25 +25,56 @@ import (
 //  因此即使前端被绕过也无法访问白名单之外的路径。
 // ============================================================================
 
-// fileManager 惰性构造文件管理器。
+// fileManager 构造文件管理器。
+//
+// 每次调用重新构造（不再 sync.Once 缓存）：根目录里包含"面板安装的应用配置文件
+// 所在目录"，而用户完全可能在面板运行期间**刚装完** Lucky / frps ——
+// 缓存住旧根目录的后果是「📝 编辑配置文件」报"路径不在允许访问的范围内"，
+// 只有重启面板才好。构造只是几次 os.Stat，代价可以忽略。
 func (s *Server) fileManager() *files.Manager {
-	s.fileOnce.Do(func() {
-		roots := s.Cfg.FileRoots
-		if len(roots) == 0 {
-			roots = []string{
-				s.Cfg.WWWRoot,
-				s.Cfg.DataDir,
-				s.Cfg.LogDir,
-				s.Cfg.WorkDir,
-			}
+	roots := s.Cfg.FileRoots
+	if len(roots) == 0 {
+		roots = []string{
+			s.Cfg.WWWRoot,
+			s.Cfg.DataDir,
+			s.Cfg.LogDir,
+			s.Cfg.WorkDir,
 		}
-		s.fileMgr = files.NewManager(files.Options{
-			Roots:    roots,
-			UserName: s.Cfg.User,
-			UserHome: s.Cfg.UserHome,
-		})
+	}
+	roots = append(roots, s.appConfigRoots()...)
+	return files.NewManager(files.Options{
+		Roots:    roots,
+		UserName: s.Cfg.User,
+		UserHome: s.Cfg.UserHome,
 	})
-	return s.fileMgr
+}
+
+// appConfigRoots 返回"面板安装的应用的配置文件所在目录"。
+//
+// 为什么需要：Lucky / Orbien / frps 装在用户家目录下（~/lucky、~/orbien、~/frps），
+// 默认的文件管理器白名单（网站目录 + 面板数据/日志/工作目录）覆盖不到，
+// 于是服务详情里的「📝 编辑配置文件」会被 files.Manager 正当地拒绝。
+// 这里只把**这些应用的安装目录**加进白名单，不是整个家目录 ——
+// 越界校验、软链接解析仍然全部由 files.Manager 负责，没有第二套读写。
+func (s *Server) appConfigRoots() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range services.Catalog() {
+		if a.ConfigPath == "" {
+			continue
+		}
+		p := services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir)
+		if p == "" {
+			continue
+		}
+		dir := filepath.Dir(p)
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return out
 }
 
 func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {

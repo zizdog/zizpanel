@@ -225,7 +225,7 @@ func appProxyEntries() []appEntry {
 	apps := appproxy.Slugs()
 	out := make([]appEntry, 0, len(apps))
 	for _, a := range apps {
-		out = append(out, appEntry{Slug: a.UI.Slug, Name: a.Name, Port: a.Port})
+		out = append(out, appEntry{Slug: a.UI.Slug, Name: a.Name, Port: a.WebPort()})
 	}
 	return out
 }
@@ -258,10 +258,10 @@ func (s *Server) handleAppProxyProbe(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	for _, a := range appproxy.Slugs() {
 		it := map[string]any{
-			"id": a.ID, "slug": a.UI.Slug, "port": a.Port,
+			"id": a.ID, "slug": a.UI.Slug, "port": a.WebPort(),
 			"path": "/" + a.UI.Slug + "/",
 		}
-		direct := probePage("http://127.0.0.1:"+fmt.Sprint(a.Port)+"/", true)
+		direct := probePage("http://127.0.0.1:"+fmt.Sprint(a.WebPort())+"/", true)
 		it["direct_ok"] = direct.ok
 		it["direct_code"] = direct.code
 
@@ -278,7 +278,7 @@ func (s *Server) handleAppProxyProbe(w http.ResponseWriter, r *http.Request) {
 			// 原因优先级：应用没在跑（最可操作）> 代理侧的问题。
 			// 否则会出现"应用根本没启动，界面却说 HTTP 404"这种带偏方向的说法。
 			if !direct.ok {
-				it["reason"] = "应用没有响应（127.0.0.1:" + fmt.Sprint(a.Port) + "）：" + direct.reason
+				it["reason"] = "应用没有响应（127.0.0.1:" + fmt.Sprint(a.WebPort()) + "）：" + direct.reason
 			} else {
 				it["reason"] = firstNonEmpty(viaNginx.reason, viaPanel.reason)
 			}

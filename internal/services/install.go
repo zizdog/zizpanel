@@ -460,19 +460,13 @@ func (m *Manager) AdoptCandidate(ctx context.Context, label, displayName, icon s
 	// 如果这个 label 在应用目录里有对应条目，继承它的端口与健康检查地址 ——
 	// 否则纳管后状态显示为"运行中"但健康列永远是"未检查"，价值大打折扣。
 	port, healthURL, category, description := 0, "", "custom", "由面板纳管的 launchd 服务（"+label+"）"
-	for _, a := range Catalog() {
-		if a.AdoptLabel != label {
-			continue
-		}
-		port = a.Port
-		if a.HealthPath != "" && a.Port > 0 {
-			healthURL = fmt.Sprintf("http://127.0.0.1:%d%s", a.Port, a.HealthPath)
-		}
+	if a, ok := catalogEntryForLabel(label); ok {
+		port = a.WebPort()
+		healthURL = healthURLFor(a)
 		category = a.Category
 		if a.Name != "" {
 			description = a.Summary
 		}
-		break
 	}
 
 	svc := &Service{
@@ -540,6 +534,56 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// catalogEntryForLabel 按 launchd label 在应用目录里找条目。
+//
+// 两个字段都认：AdoptLabel（纯纳管类，如 ollama）与 ServiceLabel（面板自研安装器
+// 注册的，如 com.zizdog.lucky / com.zizdog.frps）。
+// 只认 AdoptLabel 是历史遗留 —— 后果是面板自己装出来的服务纳管后健康列永远
+// "未配置"，而目录里其实写着 HealthPath（真机上 Lucky 就这么显示过）。
+func catalogEntryForLabel(label string) (App, bool) {
+	if label == "" {
+		return App{}, false
+	}
+	for _, a := range Catalog() {
+		if a.AdoptLabel == label || a.ServiceLabel == label {
+			return a, true
+		}
+	}
+	return App{}, false
+}
+
+// FindAppByService 按服务记录找出对应的目录条目（label / 名称 / ID 三种写法都认）。
+//
+// 给 web 层用：服务详情要知道"这个服务在目录里声明的配置文件是哪个"，
+// 才能给出「📝 编辑配置文件」入口。找不到目录条目时返回 false（纯自定义服务）。
+func FindAppByService(svc *Service) (App, bool) {
+	if svc == nil {
+		return App{}, false
+	}
+	keys := []string{svc.LaunchLabel, svc.Name, svc.DisplayName}
+	for _, a := range Catalog() {
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			if a.ServiceLabel == k || a.AdoptLabel == k || a.ID == k || a.Name == k {
+				return a, true
+			}
+		}
+	}
+	return App{}, false
+}
+
+// healthURLFor 由目录条目拼出健康检查地址（没有健康路径/端口时返回空）。
+//
+// 用 WebPort() 而不是 Port：frps 的 Port 是协议口 7000，健康检查必须打 dashboard 7500。
+func healthURLFor(a App) string {
+	if a.HealthPath == "" || a.WebPort() <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d%s", a.WebPort(), a.HealthPath)
+}
+
 // RegisterInstalledService 把面板刚装好的服务登记进「服务管理」。
 //
 // 为什么必须自动做：用户点一次"部署"，期望的是**装完就能在服务管理里看到它**
@@ -550,10 +594,38 @@ func fileExists(p string) bool {
 // 是经过验证的代码），而不是另写一套入库逻辑：
 // 两份实现迟早会不一致，而服务记录不一致会让状态显示对不上。
 //
-// 幂等：已登记过（同 label）就直接返回，重复部署不会产生重复条目。
+// 幂等：已登记过（同 label）就直接返回，重复部署不会产生重复条目；
+// 但"已登记却缺健康检查地址"会在这里补上 —— 否则旧版本装出来的记录
+// （health.url 为空、界面显示"未配置"）永远修不好，只能让用户手工删了重装。
 func (m *Manager) RegisterInstalledService(ctx context.Context, label, displayName, icon, category string, port int) error {
 	if label == "" {
 		return fmt.Errorf("缺少服务 label")
+	}
+	if app, ok := catalogEntryForLabel(label); ok {
+		if hp := app.WebPort(); hp > 0 {
+			port = hp
+		}
+		// 已存在就不再登记，但要把健康检查地址与目录**对齐**：
+		//   · 目录说该有（healthURLFor 非空）→ 补上/更新；
+		//   · 目录说**不该有**（HealthPath 为空，例如 Lucky 的「安全入口」会让任何
+		//     路径都 404）→ 把旧记录里那条会误导的健康地址**清掉**。
+		// 只补不清的话，策略一改，老记录会永远带着一条假红灯。
+		hu := healthURLFor(app)
+		if list, err := m.repo.List(ctx); err == nil {
+			for _, s := range list {
+				if s.LaunchLabel != label {
+					continue
+				}
+				if s.HealthURL == hu && (port <= 0 || s.Port == port) {
+					return nil
+				}
+				s.HealthURL = hu
+				if port > 0 {
+					s.Port = port
+				}
+				return m.repo.Update(ctx, s)
+			}
+		}
 	}
 	// 已存在就不再登记 —— 这是"两个 Qwen3 TTS"那次事故的直接教训
 	if list, err := m.repo.List(ctx); err == nil {

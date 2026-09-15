@@ -118,11 +118,22 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 	case "docker-runtime":
 		return m.uninstallDockerRuntime(ctx, removeData, result)
 	}
+	// "官方 release 原生二进制"类应用（Lucky / Orbien）：同一套安装器，
+	// 用注册表查而不是在这里再抄一遍 switch，免得加了新应用忘记补卸载。
+	if _, ok := releaseBinaryApps[app.PanelInstaller]; ok {
+		return m.UninstallReleaseBinary(ctx, app.PanelInstaller, removeData, result)
+	}
 	return fmt.Errorf("「%s」没有对应的卸载实现（PanelInstaller=%q）", app.Name, app.PanelInstaller)
 }
 
 // installerPlan 按安装器给出卸载计划。
 func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
+	// "官方 release 原生二进制"类应用（Lucky / Orbien 服务端与客户端 / frps / frpc）：
+	// 一次注册表判断覆盖全部 —— 加了新条目不用回来补 case（漏补的后果是
+	// 市场里的卸载按钮报"没有卸载实现"，而东西确实是面板装的）。
+	if plan, ok := m.releaseBinaryPlan(app.PanelInstaller); ok {
+		return plan
+	}
 	p := UninstallPlan{Kind: "installer"}
 	switch app.PanelInstaller {
 	case "qwen3tts":

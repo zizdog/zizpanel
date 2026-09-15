@@ -51,6 +51,13 @@ var prettyFormula = map[string]string{
 	"uptime-kuma":   "Uptime Kuma",
 	"stirling-pdf":  "Stirling PDF",
 	"tailscale":     "Tailscale",
+	// 内网穿透/反代类（2026-09 新增目录条目）：不列在这里的话，
+	// 服务管理里会显示成 com-zizdog-lucky / homebrew.mxcl.frps 这种标签。
+	"lucky":         "Lucky",
+	"orbien":        "Orbien",
+	"orbien-client": "Orbien 客户端",
+	"frps":          "frp 服务端 (frps)",
+	"frpc":          "frp 客户端 (frpc)",
 }
 
 // labelPrefixes 是各来源给 launchd 标签加的前缀。剥掉它们才能看到"软件名"。

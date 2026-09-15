@@ -35,6 +35,22 @@ type App struct {
 	HealthExact string `json:"health_exact"`
 	LogPath     string `json:"log_path"`
 
+	// UIPort 是"网页界面"端口，**只在它不等于 Port 时**填写。
+	//
+	// 为什么需要两个端口：frps 的 Port 是协议口 bindPort(7000)，它会和 macOS 的
+	// 「隔空播放接收器」抢端口 —— 安装前检查必须查 7000 才有意义；而用户真正要打开的
+	// 是 dashboard(7500)，健康检查与反向代理也都该指向它。合成一个字段只能二选一：
+	// 要么丢掉 7000 的冲突检查（装完起不来），要么把「打开」指到一个说 frp 协议口
+	// 的地址（浏览器直接报错）。
+	// 留 0 表示与 Port 相同（绝大多数条目都是这样）。
+	UIPort int `json:"ui_port,omitempty"`
+	// ConfigPath 是这个应用的配置文件名（**相对它自己的安装目录**，如 frps.toml）。
+	//
+	// 非空时，服务详情里会多一个「📝 编辑配置文件」入口：面板直接读写这个文件，
+	// 复用既有的 /api/v1/files/read 与 /api/v1/files/write（不新写一套文件读写）。
+	// 绝对路径由 services.ConfigFilePath 解析（原生装在用户家目录、compose 装在 work/compose）。
+	ConfigPath string `json:"config_path,omitempty"`
+
 	// Native 安装：brew 包名
 	BrewFormula string `json:"brew_formula"`
 	// ServiceLabel 是面板自研安装器注册的 launchd label。
@@ -71,6 +87,41 @@ type App struct {
 	// （phpMyAdmin 就是这种：nginx alias + php-fpm，没有自己的守护进程）。
 	// 有了它，市场就不会把"launchd 里找不到服务"当成异常去吓用户。
 	NoDaemon bool `json:"no_daemon,omitempty"`
+}
+
+// WebPort 返回"网页界面 / 健康检查 / 反向代理"应当指向的端口。
+//
+// 绝大多数条目 UIPort 为 0，等价于 Port；frps 这种"协议口与界面口不同"的条目
+// 填了 UIPort，于是安装前检查仍查协议口、界面入口走 dashboard。
+func (a App) WebPort() int {
+	if a.UIPort > 0 {
+		return a.UIPort
+	}
+	return a.Port
+}
+
+// ConfigFilePath 解析目录条目声明的配置文件的**绝对路径**（没有则返回空串）。
+//
+// 目录是静态数据（拿不到 UserHome / WorkDir），所以路径按安装位置在运行期拼出来：
+//   - compose 类应用：装到 <workDir>/compose/<appID>/（见 installViaCompose）；
+//   - 面板自研的 release 二进制类：装到 <userHome>/<RootDir>/（见 binaryReleasePaths）。
+//
+// 用途只有一个：服务详情里的「编辑配置文件」入口要知道读哪个文件 ——
+// 读写的鉴权/白名单仍由既有的 files.Manager 负责。
+func ConfigFilePath(app App, userHome, workDir string) string {
+	if app.ConfigPath == "" {
+		return ""
+	}
+	if app.Kind == KindCompose || app.Kind == KindDocker {
+		if workDir == "" {
+			return ""
+		}
+		return filepath.Join(workDir, "compose", app.ID, app.ConfigPath)
+	}
+	if spec, ok := releaseBinaryApps[app.PanelInstaller]; ok && userHome != "" {
+		return filepath.Join(userHome, spec.RootDir, app.ConfigPath)
+	}
+	return ""
 }
 
 // AppUI 描述一个应用的网页界面，以及"把它挂到子路径下"需要知道的事。
@@ -474,10 +525,13 @@ func Catalog() []App {
 		//   ② **只能 Docker 时，镜像必须自带 linux/arm64**：
 		//      compose 里绝不写 `platform: linux/amd64`，也不靠 Rosetta 转译 ——
 		//      转译既慢又占内存，与"原生优先"的初衷相悖；
-		//   ③ 面板**没有**"下载 GitHub release 二进制 → 写 launchd plist"的通用
-		//      安装器（`internal/upgrade` 那套只服务面板自身升级）。所以
-		//      "有官方 arm64 二进制但没有 brew formula"的应用先走 Docker，
-		//      **不要为单个应用临时发明一套安装器**。
+		//   ③ 2026-09 之前面板**没有**"下载 GitHub release 二进制 → 写 launchd
+		//      plist"的通用安装器，所以"有官方 arm64 二进制但没有 brew formula"
+		//      的应用只能先走 Docker（metatube-server 就是这样）。
+		//      **2026-09 起这条已经补上**：见 binary_release.go（服务 Lucky 与
+		//      Orbien 两个条目，不是给单个应用临时发明的）。现在这类应用的
+		//      判断顺序是：brew formula → 官方 darwin-arm64 产物 + 该安装器 →
+		//      多架构 Docker（且镜像必须自带 linux/arm64）。
 		//
 		// 为什么每条 Docker 条目都把 arm64 证据写进注释：这条规则只能靠"查过"
 		// 来保证，写下来下次换镜像/换 tag 时才有对照。实测命令：
@@ -577,6 +631,191 @@ func Catalog() []App {
 				"没看到就去「服务管理 → File Browser → 日志」找 `randomly generated password`，登录后请立刻改掉。",
 			DocsURL: "https://filebrowser.org",
 		},
+		// ---------------- 内网穿透 / 反向代理（全部原生） ----------------
+		//
+		// 2026-09 新增。四条**没有一条走 Docker**，选路理由与证据逐条写在下面：
+		//   · frps / frpc：homebrew-core 有 formula，且 formula 里真的有
+		//     `service do` 块（`brew info --json=v2` 的 service 字段非 null，
+		//     2026-09 实测）—— 这正是 filebrowser 缺的那一块，有它就能走
+		//     通用的 brew 原生路径。
+		//   · lucky / orbien：没有 formula，但有官方 darwin-arm64 预编译产物，
+		//     由 binary_release.go 那套通用安装器装（见该文件顶部说明）。
+		{
+			ID: "frps", Name: "frps（frp 服务端）", Icon: "🔌",
+			// dashboard 与协议口是两个端口，所以这里必须用**端口直连**：
+			// 反代会指向 UIPort(7500)，而 PreferDirect 让「打开」按钮直接给 7500。
+			UI: &AppUI{
+				Slug: "frps",
+				Note: "frps 的 dashboard 在 7500（协议口是 7000）；" +
+					"面板默认给端口直连 http://<地址>:7500",
+				PreferDirect: true,
+			},
+			Summary: "把内网服务暴露到公网（服务端，带 Web Dashboard）",
+			Description: "fatedier/frp 的服务端，配合 frpc 把内网机器上的端口映射到公网。" +
+				"**走原生（不走 Docker），且不碰 Homebrew**：直接下载官方 release 的 " +
+				"darwin-arm64 产物（frp_0.71.0_darwin_arm64.tar.gz）解压到 ~/frps，" +
+				"由系统级 launchd 托管；这条路径与 Lucky / Orbien 共用同一个安装器" +
+				"（internal/services/binary_release.go）。" +
+				"**frp 是这里唯一提供 SHA-256 校验清单的上游**" +
+				"（frp_sha256_checksums.txt）：面板会把下载到的 tarball 与官方清单比对，" +
+				"不一致就中止安装 —— 这正好补上了加速镜像（第三方）这个环节的信任缺口。" +
+				"面板生成的 ~/frps/frps.toml 里：" +
+				"bindPort = 7000（协议口）、auth.token 随机生成、dashboard 在 7500 " +
+				"（webServer 监听 0.0.0.0，user/password 随机生成并显示在安装结果里）。" +
+				"⚠️ macOS 的「隔空播放接收器」默认占着 7000 —— 安装前检查会**如实**报冲突，" +
+				"不会假装能装。同机的 frpc 必须用同一个 auth.token 才连得上。",
+			Category: "tool", Kind: KindNative,
+			// 面板自研安装器（release 二进制 + launchd），不是 brew：
+			// 用户明确要求不碰 brew（Homebrew 的 7000 默认配置还会绕过面板的可视化配置）。
+			PanelInstaller: "frps", ServiceLabel: "com.zizdog.frps",
+			Port: 7000, UIPort: 7500, HealthPath: "/",
+			ConfigPath: "frps.toml",
+			PostInstallHint: "① 若 7000 被 macOS 隔空播放接收器占着，先在「系统设置 → 通用 → " +
+				"隔空投送与接力」里关掉它，或点「📝 编辑配置文件」把 bindPort 改成空闲端口后重启服务。" +
+				"② 公网暴露前确认 auth.token 已设置（面板已随机生成，不是空口令）。" +
+				"③ 同机的 frpc 必须填同一个 token，serverPort 填 7000。",
+			DocsURL: "https://github.com/fatedier/frp",
+		},
+		{
+			ID: "frpc", Name: "frpc（frp 客户端）", Icon: "🧷",
+			// frpc 的 admin UI 是它自己监听的 7400（协议上它是主动往外连的客户端，
+			// 但 webServer 会开一个本地面板），直连与子路径都指向它。
+			UI: &AppUI{
+				Slug:         "frpc",
+				Note:         "frpc 的 admin UI 在 7400；面板默认给端口直连 http://<地址>:7400",
+				PreferDirect: true,
+			},
+			Summary: "把本机端口映射到 frps（客户端，带 admin UI）",
+			Description: "fatedier/frp 的客户端：连上 frps，把指定的本地端口暴露出去。" +
+				"**走原生（不走 Docker）**：与 frps 共用官方 release 的同一个 tarball" +
+				"（frp_0.71.0_darwin_arm64.tar.gz，里面 frps / frpc 各一个二进制，" +
+				"面板只挑出 frpc），解压到 ~/frpc 并用系统级 launchd 托管。" +
+				"为什么客户端也不进容器：它的活就是「把**这台 Mac 上**的服务暴露出去」，" +
+				"原生下 [[proxies]] 的 localIP 直接写 127.0.0.1；" +
+				"Docker 下容器里的 127.0.0.1 指向容器自己，每条隧道都得改写成 " +
+				"host.docker.internal —— 正好卡在它的主用途上。" +
+				"面板生成的 ~/frpc/frpc.toml 里：serverAddr = 127.0.0.1、" +
+				"serverPort = 7000、auth.token（**优先自动复用本机 frps 的 token**）、" +
+				"admin UI 在 7400（user/password 随机生成并显示在安装结果里）。" +
+				"[[proxies]] 默认给一条**注释掉的**示例，本地目标写 127.0.0.1:<port>。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "frpc", ServiceLabel: "com.zizdog.frpc",
+			// 7400 是它唯一监听的端口（admin UI），所以健康检查也查它。
+			Port: 7400, HealthPath: "/",
+			ConfigPath: "frpc.toml",
+			PostInstallHint: "① serverAddr/serverPort 默认指向本机的 frps（127.0.0.1:7000）；" +
+				"换成公网 frps 就改成它的 IP。② auth.token 必须与 frps 一致 —— " +
+				"面板安装时会尽量自动复用本机 frps 的 token；不同机器请从对端安装结果里抄。" +
+				"③ 在 [[proxies]] 里加要暴露的端口（localIP 写 127.0.0.1）。" +
+				"改完点「📝 编辑配置文件」，保存后按提示重启服务生效。",
+			DocsURL: "https://github.com/fatedier/frp",
+		},
+		{
+			ID: "lucky", Name: "Lucky（反代 / DDNS / 端口转发）", Icon: "🍀",
+			// Lucky 的页面用**相对**路径引资源（实测 index.html 里是
+			// `./static/js/lucky_index-*.js`、`./logo.svg`、`./manifest.webmanifest`），
+			// 挂子路径理论可行；但面板**没有**在真机上验证过它的 API 路径，
+			// 所以按既有约定把端口直连设为首选入口，子路径降级成次要入口。
+			UI: &AppUI{
+				Slug: "lucky",
+				Note: "Lucky 用相对路径引资源，子路径代理未在真机实测；" +
+					"面板默认给端口直连（http://<地址>:16601）",
+				PreferDirect: true,
+			},
+			Summary: "反向代理 / DDNS / 端口转发 / SSL 申请，带 Web 界面",
+			Description: "一个 Go 写的网络小工具集合：反向代理、DDNS、端口转发、WebDAV、" +
+				"STUN 内网穿透、ACL、SSL 证书申请与续期，全部在一个 Web 界面里配置。" +
+				"**走原生（不走 Docker）**：官方 release 有 darwin-arm64 产物" +
+				"（lucky_2.27.2_darwin_arm64.tar.gz，实测 file 报告 Mach-O arm64），" +
+				"面板解压到 ~/lucky 并用系统级 launchd 托管。" +
+				"为什么不用 Docker：macOS 上 Docker 跑在 Colima 的 Linux 虚拟机里，" +
+				"容器看到的是虚拟机的网络而不是 Mac 的（`--network host` 也只等于虚拟机自己的 host），" +
+				"而 Lucky 做的正是端口转发/反代/DDNS —— 把转发器和被转发的服务放进两个" +
+				"网络命名空间，等于这个工具在 macOS 上白装。" +
+				"网页界面在 16601（HTTP 与 HTTPS 同端口）；首次访问要走 Lucky 自己的初始化" +
+				"（设置账号口令），面板不预置口令。配置与数据都在 ~/lucky 下（主配置 " +
+				"lucky.conf，名字来自上游源码 config/config.go 的默认值）。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "lucky", ServiceLabel: "com.zizdog.lucky",
+			// 刻意**不做 HTTP 健康检查**（HealthPath 留空 = 只由 launchd/端口判断存活）。
+			// 原因：Lucky 的 Web UI 可以被用户自己设成「安全入口」（随机路径）或加 IP 白名单，
+			// 那时它对**任何**路径（包括 127.0.0.1 上的 `/`）都返回 404 而不是 403 ——
+			// 服务完全正常，HTTP 健康检查却会红。真机实测：用户配过 Lucky 之后
+			// `/`、`/login`、`/api/base` 全 404，而端口在听、模块全部 started。
+			// 与其给一个会误导的红灯，不如如实说"不做 HTTP 健康检查"。
+			Port: 16601,
+			// Lucky 的配置由它自己的 Web UI 维护，面板不生成；这里只声明文件名，
+			// 让服务详情能直接打开它编辑（改完重启服务生效）。
+			ConfigPath: "lucky.conf",
+			DocsURL:    "https://github.com/gdy666/lucky",
+		},
+		{
+			ID: "orbien", Name: "Orbien（内网穿透平台）", Icon: "🛰️",
+			// Dashboard 的 index.html 用**绝对**路径引资源（/assets/index-*.js），
+			// 子路径下必须改写；面板没有在真机上验证它的其余接口路径，
+			// 所以同样把端口直连设为首选入口。
+			UI: &AppUI{
+				Slug: "orbien",
+				Rewrites: []UIRewrite{
+					{From: "/assets/", To: "/{slug}/assets/"},
+					{From: "/favicon.ico", To: "/{slug}/favicon.ico"},
+				},
+				Note: "Orbien Dashboard 用绝对路径引资源（/assets/…），" +
+					"子路径改写未在真机实测；面板默认给端口直连（http://<地址>:8020）",
+				PreferDirect: true,
+			},
+			Summary: "Rust 写的轻量内网穿透，带 Web Dashboard",
+			Description: "轻量内网穿透平台：传输层支持 TCP / QUIC / KCP / WebSocket，" +
+				"代理支持 TCP / UDP / HTTP / HTTPS / SOCKS5，自带 Web Dashboard " +
+				"（HTTP Basic 鉴权）。**走原生（不走 Docker）**：官方 release 有 " +
+				"darwin-arm64 产物（orbien-server_3.6.0_darwin_arm64.tar.gz，实测 " +
+				"file 报告 Mach-O arm64，运行日志确认 0.0.0.0:9527 与 0.0.0.0:8020 在听），" +
+				"面板解压到 ~/orbien 并用系统级 launchd 托管。" +
+				"为什么不用 Docker：与 Lucky 同理 —— 内网穿透贴着宿主机网络栈，" +
+				"放进 Colima 的 Linux 虚拟机里看到的就不是 Mac 的局域网了。" +
+				"面板会生成 ~/orbien/orbien-server.toml：控制端口 9527（客户端连这里）、" +
+				"Dashboard 8020（用户名 admin，口令随机生成并显示在安装结果里）。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "orbien", ServiceLabel: "com.zizdog.orbien",
+			Port: 8020, HealthPath: "/",
+			ConfigPath: "orbien-server.toml",
+			PostInstallHint: "客户端请用同版本（v3.6.0）：面板市场里的「Orbien 客户端（CLI）」、" +
+				"上游的 Orbien-Desktop（GUI，dmg）或 orbien CLI。服务端地址填 <本机地址>:9527。" +
+				"Dashboard 口令在安装结果里，也可以点「📝 编辑配置文件」改 " +
+				"[dashboard] 的 password 后重启服务。",
+			DocsURL: "https://github.com/orbien-org/orbien",
+		},
+		{
+			ID: "orbien-client", Name: "Orbien 客户端（CLI）", Icon: "🛰️",
+			// 客户端没有自己的 Web 界面（就是上游的 orbien CLI），所以不给 UI 入口 ——
+			// 不渲染一个点开必然打不开的按钮。它的可视化配置入口是服务详情里的
+			// 「📝 编辑配置文件」（orbien.toml），要看图表请开服务端的 Dashboard(8020)。
+			Summary: "连上 Orbien 服务端，把本机端口穿透出去（客户端）",
+			Description: "Orbien 的**客户端**（上游 CLI：`orbien -c orbien.toml`）。" +
+				"**走原生（不走 Docker）**：官方 release 有 darwin-arm64 产物" +
+				"（orbien_3.6.0_darwin_arm64.tar.gz，2,104,350 B；实测解压出的 " +
+				"`orbien` 用 file 报 Mach-O arm64、`orbien --help` 输出 \"orbien client\"），" +
+				"面板解压到 ~/orbien-client 并用系统级 launchd 托管。" +
+				"为什么客户端也不进容器：它的活是「把**这台 Mac 上**的服务暴露出去」，" +
+				"原生下 [[tunnels]] 的 service 直接写 127.0.0.1:<port>；" +
+				"Docker 下容器里的 127.0.0.1 指向容器自己，每条隧道都得改写成 " +
+				"host.docker.internal —— 正好卡在它的主用途上。" +
+				"面板生成的 ~/orbien-client/orbien.toml 里：server = 127.0.0.1:9527" +
+				"（本机服务端；换公网服务器就改这里），并给一条注释掉的 [[tunnels]] 示例。" +
+				"客户端是**主动往外连**的，不监听任何端口，所以没有端口/健康检查；" +
+				"状态按 launchd 服务（com.zizdog.orbien-client）在不在跑判断。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "orbien-client", ServiceLabel: "com.zizdog.orbien-client",
+			Port:       0,
+			ConfigPath: "orbien.toml",
+			PostInstallHint: "① server 默认指向本机的 Orbien 服务端（127.0.0.1:9527）；" +
+				"穿透到公网服务器就改成 <服务器IP>:9527。" +
+				"② 服务端启用了 auth.token 时，客户端也要填同一个值。" +
+				"③ 在 [[tunnels]] 里加要暴露的端口：service 写 127.0.0.1:<本地端口>，" +
+				"remotePort 写服务端上的端口。改完点「📝 编辑配置文件」保存后重启服务生效。" +
+				"隧道是否连上、流量多大，在服务端的 Dashboard（http://<服务端地址>:8020）里看。",
+			DocsURL: "https://github.com/orbien-org/orbien",
+		},
 		// ---------------- 一键建站（Category: site） ----------------
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",
@@ -630,8 +869,10 @@ func Catalog() []App {
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 上游 release（metatube-community/metatube-server-releases v1.4.0）
-			// 确实提供 metatube-server-darwin-arm64.zip，但面板没有"下载二进制并注册
-			// launchd"的通用安装器，所以这里用**官方** ghcr 镜像（不是第三方转存）。
+			// 确实提供 metatube-server-darwin-arm64.zip，但**本轮没有**把它切到原生：
+			// 通用的 release 二进制安装器（binary_release.go）目前只处理 .tar.gz
+			// （Lucky / Orbien 的产物都是 tar.gz），要收 .zip 得先扩它 —— 那是另一件事，
+			// 不属于"新增目录条目"。在切换之前这里用**官方** ghcr 镜像（不是第三方转存）。
 			// arm64 证据（ghcr.io 直查）：
 			//   docker manifest inspect ghcr.io/metatube-community/metatube-server:latest
 			//   → linux/amd64、linux/arm64（另有两个 unknown/unknown 的 attestation）
