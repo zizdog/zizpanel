@@ -854,6 +854,17 @@ def main():
         st, body, _, _ = call("POST", base + "/jobs", q, token="KEY-OFF")
         c.ok("已停用的密钥 → 403（停用要真的生效）", st == 403, (st, body))
 
+        # v1.6.1 访问日志：被拒的请求必须留下痕迹。
+        # 起因是一次真实事故：插件报「接收端拒绝：HTTP 200」，而接收端这边
+        # 一条日志都没有 —— 只能靠"没有日志"反推"请求没到这台机器"。
+        time.sleep(0.3)
+        with open(r.log_path, "r", encoding="utf-8", errors="replace") as fh:
+            tail = fh.read()[-4000:]
+        c.ok("被拒的请求写进了访问日志（含状态码/路径/密钥/IP）",
+             ("POST /jobs → 403" in tail) and ("ip=127.0.0.1" in tail), tail[-300:])
+        c.ok("被拒的原因也在日志里",
+             "密钥已被停用" in tail or "密钥不匹配" in tail, tail[-300:])
+
         print("\n【v1.6.0 额度：按提交文本的字数计，超额 429 且与 403 区分开】")
         big = {**q, "client_id": "quota-big",
                "chunks": [{"text": "这是一段超过十个字的文本", "max_tokens": 400}]}

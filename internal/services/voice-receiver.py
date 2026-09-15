@@ -89,6 +89,16 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
     · `--token` 仍可用（兼容已部署的 plist）；面板重新部署接收端时会把它
       迁移成 keys.json 里的一条 default 记录，之后密钥完全由文件管理。
 
+【v1.6.1 访问日志】每次请求一行（健康检查与 /jobs 轮询除外），含状态码、
+方法、路径、用到的密钥 id 与来源 IP，比如：
+
+    POST /voice → 403 key=- ip=192.168.1.1 ｜ 密钥不匹配
+
+  加它的直接原因：插件报过一次"接收端拒绝：HTTP 200"，而接收端这边一条
+  日志都没有 —— 只能靠"没有日志"反推"请求根本没到这台机器"（真因是插件把
+  服务器地址填错了，请求打到了别处）。有了访问日志，"到没到、被谁拒的"
+  一眼就能看出来。
+
 【v1.3.0 新增 /jobs/*】把「任务队列 + 逐块合成」搬到本机（契约见网站侧
 usr/plugins/TtsVoice/SPEC-TO-MINI-job-queue.md），这样**浏览器/网站关掉任务也能跑完**：
 
@@ -133,7 +143,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
@@ -1545,6 +1555,8 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
+        self._access_log(code, payload)
+
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1607,7 +1619,41 @@ class Handler(BaseHTTPRequestHandler):
         统一鉴权：返回 (key_id, error)。key_id 非空 = 通过。
         v1.6.0 起密钥表（keys.json）是唯一事实来源，--token 只作兼容回退。
         """
-        return key_authed(self)
+        key_id, err = key_authed(self)
+        # 记在实例上，供访问日志标注"这条请求用的是哪把密钥"
+        self._key_id = key_id or "-"
+        return key_id, err
+
+    def _access_log(self, code, payload):
+        """
+        访问日志：一次请求一行（健康检查与 /jobs 轮询除外）。
+
+        为什么必须有：真实事故里插件报「接收端拒绝：HTTP 200」，
+        而接收端这边**一条日志都没有** —— 于是只能靠"没有日志"反推
+        "请求根本没到这台机器"（最后查明是插件把服务器地址填错了）。
+        有这条日志就能一眼看出：请求到没到、带的是哪把密钥、被哪条规则拒的。
+        """
+        path = self.path.split("?")[0]
+
+        if path in ("/voice/health", "/health"):
+            return  # 健康检查会被轮询，记它只会把日志淹掉
+
+        polling = path.startswith("/jobs/") and self.command == "GET"
+        if code < 300 and (polling or (self.command == "GET"
+                                       and path not in ("/voice/sources", "/usage", "/jobs"))):
+            return  # 成功的查询/轮询不记，只记"有副作用"的与"被拒的"
+
+        reason = ""
+        if isinstance(payload, dict):
+            for k in ("error", "msg", "message"):
+                v = payload.get(k)
+                if isinstance(v, str) and v.strip():
+                    reason = " ".join(v.split())
+                    break
+
+        log("%s %s → %d key=%s ip=%s%s"
+            % (self.command, path, code, getattr(self, "_key_id", "-"),
+               self.client_address[0], (" ｜ " + reason[:200]) if reason else ""))
 
     def log_message(self, fmt, *args):
         """默认实现会往 stderr 打每个请求，这里压掉，只留我们自己的 log()"""
