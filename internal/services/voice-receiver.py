@@ -780,7 +780,7 @@ class JobManager:
         voice = str(payload.get("voice") or "").strip()
         ref_audio = str(payload.get("ref_audio") or "").strip()
         # v1.5.0：来源标识。取参考音频的优先级（交接文档 §3.5）：
-        #   显式 ref_audio → <dir>/<source>/ref.wav → <dir>/ref.wav（老数据）
+        #   显式 ref_audio → <dir>/<source>/ref.wav（没有旧版回退）
         source = sanitize_source(payload.get("source"))
         # 两个都给会「静默按其中一个生效」，最难排查 —— 仍然直接拒
         if voice and ref_audio:
