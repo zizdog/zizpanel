@@ -91,12 +91,12 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh
+	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@echo "==> Python 工具语法检查"
 	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"
@@ -213,8 +213,16 @@ NAS_HOST       ?= 192.168.1.8
 NAS_USER       ?= zizdog
 # NAS_ROOT 是 NAS 上 zizpanel 镜像目录（容器 /usr/share/nginx/html 的 zizpanel 子目录）
 NAS_ROOT       ?= /vol2/zizpanel-mirror/zizpanel
+# NAS_APPS_ROOT 是**应用安装包**镜像目录（与面板镜像同级）：
+#   <NAS_APPS_ROOT>/<应用>/<版本>/<文件名> —— 见 tools/sync-nas-apps.sh
+NAS_APPS_ROOT  ?= /vol2/zizpanel-mirror/apps
+# APPS_MIRROR_URL 是应用包镜像的对外基址（= 面板设置里的"镜像基址"）。
+# sync-apps 上传后用它验收；面板也按这个基址取包。
+APPS_MIRROR_URL ?= https://mirror.zizdog.com:8888
 # 口令不写进仓库（铁律 7）。发布时用 make publish-nas NAS_PASS='...' 传入。
 NAS_PASS       ?=
+# 传给 sync-apps 的额外参数，例如 SYNC_ARGS='--dry-run' 或 SYNC_ARGS='--app lucky'
+SYNC_ARGS      ?=
 
 .PHONY: upgrade-e2e
 upgrade-e2e: ## 在线升级真实演练（需要本机已安装面板；会真的升级并重启面板）
@@ -387,6 +395,12 @@ publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS
 		 ls -l download/$(VERSION) | head -4"
 	@echo ""
 	@echo "验证（从这台机器）：curl -sI $(NAS_MIRROR_URL)/manifest.json"
+
+.PHONY: sync-apps
+sync-apps: ## 把应用安装包同步到 NAS 镜像（apps/<应用>/<版本>/<文件名>；需要 NAS_PASS）
+	@NAS_HOST="$(NAS_HOST)" NAS_USER="$(NAS_USER)" NAS_ROOT="$(NAS_APPS_ROOT)" \
+	 NAS_PASS="$(NAS_PASS)" MIRROR_BASE_URL="$(APPS_MIRROR_URL)" \
+	 bash tools/sync-nas-apps.sh $(SYNC_ARGS)
 
 # ---------------------------------------------------------------- 版本号 --
 .PHONY: bump

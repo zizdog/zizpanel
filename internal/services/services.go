@@ -143,6 +143,13 @@ type Options struct {
 	HelperBin string
 	// BrewBin 是 brew 路径（brew services 类服务需要）
 	BrewBin string
+	// MirrorBase 是应用包镜像基址（来自 Config.MirrorBase）。
+	// 非空 = 镜像站是**唯一来源**：安装前先检查资源在不在，缺了就明确失败、
+	// 不回退公网（见 mirror.go）；空 = 关闭镜像（应急用）。
+	MirrorBase string
+	// MirrorProbeSeconds 是镜像资源探测超时（秒，来自 Config.MirrorProbeSeconds）；
+	// <=0 按 4 秒处理。
+	MirrorProbeSeconds int
 	// DockerSocket 是 Docker socket 路径，为空表示 Docker 不可用
 	DockerSocket string
 	// UserHome 是真实用户家目录（用于找 LaunchAgents 与日志）

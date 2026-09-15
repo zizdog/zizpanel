@@ -46,6 +46,24 @@ type Config struct {
 	MySQLUser     string `json:"mysql_user"`
 	MySQLPassword string `json:"mysql_password"`
 
+	// ---------- 应用包镜像（自建 NAS） ----------
+	// MirrorBase 是应用包镜像基址，例如 https://mirror.zizdog.com:8888。
+	//
+	// 为什么要有它：面板要下的东西来自很多不同上游（GitHub Release、Homebrew、
+	// PyPI、huggingface、苹果 CLT 包……），各自维护一套"国内加速源"既散又容易过期。
+	// 统一指向自建镜像后，从哪下、下什么、怎么校验都由我们自己控制。
+	//
+	// 语义（用户明确要求："先检查镜像的资源能不能访问，不能再走其它"）：
+	// 有值时镜像是**唯一来源** —— 安装前先检查，镜像上没有就明确失败并说清
+	// 怎么补（make sync-apps），**不回退**到 GitHub/公网；
+	// 留空才回到各来源内置的公网/国内镜像（仅用于镜像站故障时应急）。
+	MirrorBase string `json:"mirror_base"`
+	// MirrorProbeSeconds 是"镜像上有没有这个资源"的单次探测超时（秒）。
+	//
+	// 必须短：镜像不可达时不能让每次安装都白等。默认 4 秒 —— 局域网/同城镜像
+	// 正常在 100ms 内应答，4 秒足够区分"慢"和"不通"，又不会把安装拖得很难看。
+	MirrorProbeSeconds int `json:"mirror_probe_seconds"`
+
 	// ---------- 在线升级 ----------
 	// UpgradeSource 是升级源地址（放 manifest.json / manifest.json.sig 的目录）。
 	// 留空表示不启用网络升级，此时只能用手动上传升级包那条离线路径。
@@ -142,6 +160,11 @@ func root() string {
 }
 
 // DefaultConfigPath 返回默认配置文件路径（受 ZIZPANEL_ROOT 影响）。
+// DefaultMirrorBase 是应用包镜像的默认基址（自建 NAS，经 mirror.zizdog.com 反代）。
+//
+// 面板里所有安装过程都先检查它：有就用（并且只用它），没有就明确失败。
+const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
+
 func DefaultConfigPath() string {
 	return filepath.Join(root(), "data", "config.json")
 }
@@ -203,10 +226,14 @@ func Default() *Config {
 		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
 		AppProxy: true,
 		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）
-		AppProxyAuth:  true,
-		SessionHours:  72,
-		LoginMaxFail:  5,
-		LoginLockMins: 15,
+		AppProxyAuth: true,
+		// 应用包镜像：默认指向自建 NAS。面板所有安装过程先检查这里，
+		// 镜像上没有的资源会明确失败（不回退公网）。留空 = 关闭镜像（应急用）。
+		MirrorBase:         DefaultMirrorBase,
+		MirrorProbeSeconds: 4,
+		SessionHours:       72,
+		LoginMaxFail:       5,
+		LoginLockMins:      15,
 		// 终端默认关闭；文件管理器默认只开放网站目录与面板目录
 		TerminalEnabled:     false,
 		TerminalIdleMins:    30,
@@ -444,6 +471,9 @@ func (c *Config) fill() {
 	}
 	if c.LoginLockMins <= 0 {
 		c.LoginLockMins = d.LoginLockMins
+	}
+	if c.MirrorProbeSeconds <= 0 {
+		c.MirrorProbeSeconds = d.MirrorProbeSeconds
 	}
 	if c.AccessMode == "" {
 		c.AccessMode = d.AccessMode

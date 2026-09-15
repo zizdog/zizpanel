@@ -1,3 +1,33 @@
+v0.9.4 · 应用包镜像：安装前先检查镜像站，镜像上没有就明确失败（不再走 GitHub）
+
+**需求（用户明确要求）**："所有安装过程先检查 https://mirror.zizdog.com:8888 的资源能不能访问，不能再走其它。"
+
+- 新增「应用包镜像基址」配置（设置页可改可清空，默认 `https://mirror.zizdog.com:8888`）+
+  探测超时（默认 4 秒）。**留空 = 关闭镜像**（回到内置的公网/国内镜像，仅用于镜像站故障时应急）。
+- 布局固定为 `<基址>/apps/<应用>/<版本>/<文件名>`，同目录放 `manifest.json`（sha256/大小）。
+- 安装 Lucky / frps / frpc / Orbien 之前先 HEAD 包与清单：**缺任何一个就明确失败**并提示
+  `make sync-apps`，不回退 GitHub —— 回退会让"这台机器到底能不能装"变得不可预测。
+- 校验改用镜像清单里的 sha256（比原来只对 frp 校验更严：Lucky / Orbien 上游没有 checksums 文件）。
+- 新增 `tools/sync-nas-apps.sh` + `make sync-apps` + `cmd/zizpanel-assets`：把 5 个应用包同步到
+  NAS；应用与版本从代码注册表导出，不手抄。脚本已纳入 `make check` 门禁（bash -n / 多字节变量 / shellcheck）。
+- `internal/services/mirror_test.go`：5 条测试锁住布局、镜像唯一性、缺资源时的报错文案与 sha256 校验。
+
+**尚未接入**：pip / HF / brew 三个来源仍走内置的国内镜像 —— 等 NAS 上把 `/pypi`、`/hf`、
+`/brew` 反代配好再接（接早了会让 Qwen / IOPaint 直接装不上）。
+**尚未部署**：本机与 mini 都还是 0.9.2，镜像功能要下次发布才生效。
+
+v0.9.3 · 应用市场：卸载（保留数据）之后必须能重装
+
+- 根因：后端把"磁盘上有安装产物"也算成已安装，于是卸载（保留数据）之后卡片永远停在
+  "已安装·服务未注册"，既没有「安装」入口也没法重装（用户原话："卸载完成后连安装的
+  入口都没有，用户怎么重装"）。
+- 修法：`installed` 只认服务记录 / launchd plist / brew formula；产物单独用 `artifacts` 报出来，
+  卡片对"残留数据"给「安装」+「删除残留数据」；卸载任务的成败显式提示并立即刷新列表。
+- 回归测试：`TestMarketResidualDataOffersReinstall`（新增）、
+  `TestMarketDetectsOrphanInstall`（旧断言正是这条 bug 的规则化，已改锁新契约）。
+
+---
+
 v0.9.1 · 模型下载卡住的真因：这台网络会解析出"不可达但也不拒绝"的 IPv6 地址
 
 **现象（抹机后的 mini）**：Qwen3 TTS 的 14 个模型文件下载反复失败，报

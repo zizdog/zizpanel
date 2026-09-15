@@ -471,15 +471,31 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	// 递归改归属：安装目录由真实用户拥有，服务以该用户身份运行才写得进配置
 	_ = chownTree(m.opt.UserName, p.Root)
 
-	// ---- 1. 下载官方产物 ----
+	// ---- 0.9 先检查镜像上有没有这个包（用户明确要求）----
+	//
+	// 镜像基址配置了就**必须先通过这一步**：按需求镜像是唯一来源，
+	// 镜像上没有就明确失败并告诉他怎么补（`make sync-apps`），
+	// 而不是静默回退到 GitHub —— 回退会让"这台机器到底能不能装"变得不可预测。
+	if err := m.preflightMirrorAsset(ctx, spec, result); err != nil {
+		return err
+	}
+
+	// ---- 1. 下载产物 ----
 	if err := m.downloadReleaseBinary(ctx, spec, p, result); err != nil {
 		return err
 	}
 
-	// ---- 1.5 校验内容（上游提供 sha256 清单时**必须**做，失败即中止） ----
+	// ---- 1.5 校验内容，失败即中止 ----
 	// 放在解压之前：宁可下载完立刻失败，也不要把一个校验不通过的 tarball
 	// 解压出来、chmod、再交给 launchd 去执行。
-	if err := m.verifyReleaseChecksum(ctx, spec, p, result); err != nil {
+	//
+	// 镜像模式下用**镜像清单**里的 sha256（比原来只对 frp 校验更严：
+	// Lucky / Orbien 上游根本没有 checksums 文件，原来等于不校验）。
+	if m.MirrorEnabled() {
+		if err := m.verifyMirrorChecksum(ctx, spec, p, result); err != nil {
+			return err
+		}
+	} else if err := m.verifyReleaseChecksum(ctx, spec, p, result); err != nil {
 		return err
 	}
 
@@ -1068,7 +1084,12 @@ func IsReleaseBinaryApp(id string) bool {
 // 探测本身失败/超时都只当"这个源不可用"（速度 0），不会让安装失败。
 func (m *Manager) orderDownloadURLs(ctx context.Context, spec releaseBinaryApp,
 	result *InstallResult) []string {
-	urls := spec.downloadURLs()
+	// 镜像模式下只有一个候选（镜像），不需要测速排序 —— 而且**不许**回退公网，
+	// 所以这里直接返回，连"官方源"都不放进候选列表。
+	urls := m.downloadURLsFor(spec)
+	if m.MirrorEnabled() {
+		return urls
+	}
 	if len(urls) < 2 {
 		return urls
 	}

@@ -62,6 +62,10 @@ func (s *Server) svcManager() *services.Manager {
 		UserName:     s.Cfg.User,
 		UID:          s.Cfg.UserUID,
 		WorkDir:      s.Cfg.WorkDir,
+		// 应用包镜像基址：面板里所有安装过程都从这里取资源（见 services/mirror.go）。
+		// svcManager() 每次都按当前 Cfg 新建，所以设置页保存后立刻生效。
+		MirrorBase:         s.Cfg.MirrorBase,
+		MirrorProbeSeconds: s.Cfg.MirrorProbeSeconds,
 	})
 }
 

@@ -337,6 +337,14 @@ export function SettingsView(content) {
     const sessionHours = h('input.input', { type: 'number', value: s.session_hours, min: 1, max: 720 });
     const maxFail = h('input.input', { type: 'number', value: s.login_max_fail, min: 1, max: 50 });
     const lockMins = h('input.input', { type: 'number', value: s.login_lock_mins, min: 1, max: 1440 });
+    // 应用包镜像（自建 NAS）：面板里所有安装过程都先检查它。
+    // 留空 = 关闭镜像、各来源回到内置的公网/国内镜像（仅用于镜像站故障时应急）。
+    const mirrorInput = h('input.input', {
+      value: s.mirror_base || '',
+      placeholder: '例如 https://mirror.zizdog.com:8888（留空 = 关闭镜像）',
+      style: { flex: '1 1 320px' },
+    });
+    const mirrorProbe = h('input.input', { type: 'number', value: s.mirror_probe_seconds || 4, min: 1, max: 60 });
 
     const save = h('button.btn.btn-primary', {
       text: '保存设置',
@@ -352,6 +360,8 @@ export function SettingsView(content) {
             session_hours: Number(sessionHours.value),
             login_max_fail: Number(maxFail.value),
             login_lock_mins: Number(lockMins.value),
+            mirror_base: mirrorInput.value.trim(),
+            mirror_probe_seconds: Number(mirrorProbe.value) || 4,
           };
           const saved = await api.saveSettings(patch);
           const entry = (saved && saved.panel_entry) || patch.panel_suffix;
@@ -413,6 +423,22 @@ export function SettingsView(content) {
             h('div.field', [h('label', { text: '登录会话有效期（小时）' }), sessionHours]),
             h('div.field', [h('label', { text: '连续失败几次锁定账号' }), maxFail]),
             h('div.field', [h('label', { text: '锁定时长（分钟）' }), lockMins]),
+          ]),
+          // 应用包镜像：面板里所有安装过程都先检查它（见 services/mirror.go）。
+          // 语义是"唯一来源"，不是"加速源之一" —— 所以文案里说清失败时不会回退。
+          h('div.field', [
+            h('label', { text: '应用包镜像基址' }),
+            mirrorInput,
+            h('div.hint', {
+              html: '安装 Lucky / frps / frpc / Orbien 这类应用时，面板先检查 ' +
+                '<code class="code">&lt;基址&gt;/apps/&lt;应用&gt;/&lt;版本&gt;/&lt;文件名&gt;</code> 在不在；' +
+                '镜像上没有就明确失败并提示如何同步，<b>不会</b>偷偷回退到 GitHub。<br>' +
+                '留空 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）。',
+            }),
+          ]),
+          h('div.row', [
+            h('div.field', [h('label', { text: '镜像资源探测超时（秒）' }), mirrorProbe]),
+            h('div.hint', { style: { alignSelf: 'center' }, text: '镜像不可达时不让安装白等；局域网/同城镜像正常在 100ms 内应答。' }),
           ]),
           save,
         ]),

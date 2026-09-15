@@ -294,6 +294,10 @@ func (s *Server) settingsView() map[string]any {
 		// 升级源也要回传：设置页要能显示当前值并允许清空。
 		// 少了它，用户在页面上既看不到、也清不掉在线升级写进去的地址。
 		"upgrade_source": s.Cfg.UpgradeSource,
+		// 应用包镜像：设置页要能看见当前值、能改、能清空
+		// （清空 = 关闭镜像、回到公网来源，仅用于镜像站故障时应急）。
+		"mirror_base":          s.Cfg.MirrorBase,
+		"mirror_probe_seconds": s.Cfg.MirrorProbeSeconds,
 		// 数据库连接（面板管理 MySQL 用）。密码回传是为了让设置页能显示
 		// "已填写"状态并允许修改；面板本身是登录后才能访问的后台。
 		"mysql_host":     s.Cfg.MySQLHost,
@@ -330,6 +334,13 @@ type settingsReq struct {
 	// 地址。UI 测试里"未配置升级源时给出明确提示"那条正是这样失败的：
 	// 清空输入框后接口回退到内存里的旧值，于是永远走不到"未配置"分支。
 	UpgradeSource *string `json:"upgrade_source"`
+
+	// MirrorBase 是应用包镜像基址（<base>/apps/<app>/<版本>/<文件名> 与 /pypi、/hf、/brew）。
+	// 传空串 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）；
+	// 有值时镜像是**唯一来源**：安装前先检查，缺资源就明确失败、不回退公网。
+	MirrorBase *string `json:"mirror_base"`
+	// MirrorProbeSeconds 是镜像资源探测超时（秒，1~60）。
+	MirrorProbeSeconds *int `json:"mirror_probe_seconds"`
 
 	// MySQL 连接（面板管理数据库用）
 	MySQLHost     *string `json:"mysql_host"`
@@ -423,6 +434,24 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.UpgradeSource = src
+	}
+	if req.MirrorBase != nil {
+		base := strings.TrimRight(strings.TrimSpace(*req.MirrorBase), "/")
+		// 空串是合法的（= 关闭镜像）。非空只做最基本的形状校验：真正的可用性
+		// 由安装前的那次探测负责 —— 在保存时发网络请求会把设置页卡住。
+		if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+			fail(w, http.StatusBadRequest, "镜像基址必须以 http:// 或 https:// 开头（留空表示关闭镜像）")
+			return
+		}
+		cfg.MirrorBase = base
+	}
+	if req.MirrorProbeSeconds != nil {
+		sec := *req.MirrorProbeSeconds
+		if sec < 1 || sec > 60 {
+			fail(w, http.StatusBadRequest, "镜像探测超时应在 1~60 秒之间")
+			return
+		}
+		cfg.MirrorProbeSeconds = sec
 	}
 	// 终端设置变更后需要重建管理器才生效（它是惰性单例）
 	resetTerm := false

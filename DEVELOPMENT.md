@@ -496,3 +496,53 @@ ZizPanel 设计成**不接管**已有的环境：
     `python script.py` 下不执行（实测）。
     教训：**同一个 URL 用两个客户端表现不同时，先怀疑解析/连接策略，别先怀疑服务端**；
     以及"修好了"要用**真机复测**证明，而不是"这段解释听起来对"。
+
+---
+
+## 应用包镜像（apps/）
+
+**需求（2026-09-16，用户明确要求）**："所有安装过程先检查镜像站的资源能不能访问，不能再走其它。"
+
+布局（`internal/services/mirror.go`、`tools/sync-nas-apps.sh`、`cmd/zizpanel-assets` 三方一致）：
+
+```
+<镜像基址>/apps/<应用 ID>/<版本>/<原始文件名>
+<镜像基址>/apps/<应用 ID>/<版本>/manifest.json      # 每个包的 sha256/大小
+```
+
+- 镜像基址在「面板设置 → 应用包镜像基址」里配（`Config.MirrorBase`，默认
+  `https://mirror.zizdog.com:8888`）。**留空 = 关闭镜像**（各来源回到内置的公网/国内镜像，
+  仅用于镜像站故障时应急）。
+- **语义是"唯一来源"，不是"加速源之一"**：安装前先 HEAD 包与清单
+  （`preflightMirrorAsset`），缺任何一个就明确失败并提示 `make sync-apps`，
+  **不回退 GitHub**。回退会让"这台机器到底能不能装"变得不可预测 —— 这正是用户要求避免的。
+- 校验用**镜像清单**里的 sha256（`verifyMirrorChecksum`）。比原来只对 frp 校验更严：
+  Lucky / Orbien 上游根本没有 checksums 文件。
+- 探测超时 `Config.MirrorProbeSeconds`（默认 4 秒）：镜像不可达时不让安装白等。
+
+### 新增一个应用到镜像
+
+1. 在 `internal/services/binary_release.go` 的 `releaseBinaryApps` 里加条目（唯一事实来源）；
+2. `make sync-apps SYNC_ARGS=--dry-run` 看计划（应用/版本/文件名都从注册表导出），
+   确认后 `make sync-apps NAS_PASS='...'` 真同步；
+3. NAS 上确认 `<apps-root>/<应用>/<版本>/` 下有包与 `manifest.json`。
+
+**不要**在同步脚本里手抄版本号：脚本从注册表读，手抄的那份一定会漏，
+而漏掉的后果是"镜像上没有这个包"，按设计那会**直接让安装失败**。
+
+### 还没接镜像的来源（下一步）
+
+`mirrorSubPath()` 已备好约定：pip → `<基址>/pypi/simple`、HF → `<基址>/hf`、
+brew → `<基址>/brew`。**在 NAS 上把这三条反代配好之前不要接**：接早了就等于
+"NAS 上没有就让 Qwen / IOPaint 装不上"。它们当前仍走内置的国内镜像
+（清华 pypi / hf-mirror / 阿里云 brew）。
+
+### 典型坑：**"磁盘上有产物"不等于"已安装"**（2026-09-16 用户反馈，有测试锁死）
+
+应用市场原来把 `InstallerArtifactExists`（磁盘上有产物）直接算成 `installed=true`。
+后果：卸载时没勾"删除数据"（或用户手动删了服务、目录还在）之后，卡片永久停在
+"已安装·服务未注册"，前端只给「重新部署」，**没有「安装」入口 —— 用户无法重装**。
+现在：`installed` 只认服务记录 / launchd 里的 plist / brew formula；产物单独用
+`artifacts` 报出来，前端显示「残留数据」+「安装」+「删除残留数据」。
+回归测试：`TestMarketResidualDataOffersReinstall`、
+`TestMarketDetectsOrphanInstall`（旧断言正是这条 bug 的规则化，已改锁新契约）。
