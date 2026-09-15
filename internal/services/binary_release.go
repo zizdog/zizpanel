@@ -189,7 +189,8 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		// Lucky 的配置由它自己的 Web UI 首次初始化时创建，名字来自上游源码
 		// （config/config.go: filePath = "lucky.conf"）。面板不生成，只声明路径，
 		// 让服务详情能直接打开它。
-		ConfigFile: "lucky.conf",
+		// 不设 ConfigFile：Lucky 的配置是加密的 .lkcf，没有可手改的文本配置，
+		// 可视化配置走它自己的 Web UI（16601）。
 		// 上游 release 里**没有** checksums 文件，所以无法做内容校验（如实说明），
 		// 只有 file(1) 的架构复核。
 		Notes: []string{

@@ -733,8 +733,8 @@ func Catalog() []App {
 				"而 Lucky 做的正是端口转发/反代/DDNS —— 把转发器和被转发的服务放进两个" +
 				"网络命名空间，等于这个工具在 macOS 上白装。" +
 				"网页界面在 16601（HTTP 与 HTTPS 同端口）；首次访问要走 Lucky 自己的初始化" +
-				"（设置账号口令），面板不预置口令。配置与数据都在 ~/lucky 下（主配置 " +
-				"lucky.conf，名字来自上游源码 config/config.go 的默认值）。",
+				"（设置账号口令），面板不预置口令。配置以加密的 lucky_*.lkcf 存在 ~/lucky 下，" +
+				"**不要手改**；备份整个目录即可。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "lucky", ServiceLabel: "com.zizdog.lucky",
 			// 刻意**不做 HTTP 健康检查**（HealthPath 留空 = 只由 launchd/端口判断存活）。
@@ -744,10 +744,12 @@ func Catalog() []App {
 			// `/`、`/login`、`/api/base` 全 404，而端口在听、模块全部 started。
 			// 与其给一个会误导的红灯，不如如实说"不做 HTTP 健康检查"。
 			Port: 16601,
-			// Lucky 的配置由它自己的 Web UI 维护，面板不生成；这里只声明文件名，
-			// 让服务详情能直接打开它编辑（改完重启服务生效）。
-			ConfigPath: "lucky.conf",
-			DocsURL:    "https://github.com/gdy666/lucky",
+			// 刻意**不设 ConfigPath**：Lucky 的配置是**加密的** `lucky_*.lkcf`，
+			// 没有可手改的文本配置 —— 拿文本编辑器打开只会是一堆二进制。
+			// （真机快照核实：~/lucky 下只有 lucky_base.lkcf / lucky_ddns.lkcf 等，
+			//   没有 lucky.conf；之前这里按上游源码猜了个文件名，等于给一个点开就坏的按钮。）
+			// 它的可视化配置就是自带的 Web UI（16601）。
+			DocsURL: "https://github.com/gdy666/lucky",
 		},
 		{
 			ID: "orbien", Name: "Orbien（内网穿透平台）", Icon: "🛰️",

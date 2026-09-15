@@ -327,7 +327,9 @@ func TestConfigFilePathResolvesPerInstallLayout(t *testing.T) {
 	for _, tc := range []struct{ id, want string }{
 		{"frps", "/Users/tester/frps/frps.toml"},
 		{"frpc", "/Users/tester/frpc/frpc.toml"},
-		{"lucky", "/Users/tester/lucky/lucky.conf"},
+		// lucky 刻意没有 ConfigPath：它的配置是加密的 lucky_*.lkcf，
+		// 拿文本编辑器打开没有意义（真机快照核实过，没有 lucky.conf）。
+		// 可视化配置走 Lucky 自己的 Web UI（16601）。
 		{"orbien", "/Users/tester/orbien/orbien-server.toml"},
 		{"orbien-client", "/Users/tester/orbien-client/orbien.toml"},
 	} {
@@ -338,6 +340,9 @@ func TestConfigFilePathResolvesPerInstallLayout(t *testing.T) {
 		if got := ConfigFilePath(app, userHome, workDir); got != tc.want {
 			t.Errorf("%s 配置路径 = %q，期望 %q", tc.id, got, tc.want)
 		}
+	}
+	if app, _ := FindApp("lucky"); ConfigFilePath(app, userHome, workDir) != "" {
+		t.Error("Lucky 不该有可编辑的文本配置（加密 lkcf），编辑按钮会点开一堆二进制")
 	}
 	// 没有声明 ConfigPath 的条目不该凭空得到一个路径
 	none, _ := FindApp("uptime-kuma")
