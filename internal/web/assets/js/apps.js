@@ -69,7 +69,11 @@ export function AppsView(content, ctx = {}) {
       // 顶部只保留"一键 LNMP"：它是个**组合动作**（装三个包 + 四处收尾工作），
       // 在列表里没有对应的单个条目。其余项目都已进应用目录，
       // 各自卡片上的按钮就是入口 —— 顶部重复放一遍只会让人不知道该点哪。
-      h('button.btn.btn-sm.btn-primary', { text: '⚡ 一键安装 LNMP 环境', onclick: installLNMP }),
+      h('button.btn.btn-sm.btn-primary', {
+        text: '⚡ 一键安装 LNMP 环境',
+        title: '没装 Homebrew 时会先在面板里把 Homebrew 与命令行开发者工具装上（全程在面板内完成）',
+        onclick: installLNMP,
+      }),
       h('button.btn.btn-sm', { text: '⚙️ 服务管理', onclick: () => { location.hash = '#/services'; } }),
       // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
       // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。

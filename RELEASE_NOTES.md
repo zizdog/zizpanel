@@ -1,4 +1,16 @@
-v0.8.4 · 全原生穿透/反代工具（frps / frpc / Lucky / Orbien 服务端+客户端）+ 内置默认音色 + 多密钥额度与用量
+v0.8.5 · 全原生穿透/反代工具（frps / frpc / Lucky / Orbien 服务端+客户端）+ 内置默认音色 + 多密钥额度与用量
+
+**全新安装后"全部在面板里完成"的最后一个缺口补上了**：全新 macOS 上既没有 Homebrew
+也没有命令行开发者工具（CLT），以前点「网站环境」只会得到一句"请先安装 Homebrew" ——
+把用户赶回命令行。现在面板会**自己在任务里装好这两样**：
+- CLT 优先走**无界面**路径（`softwareupdate` 静默安装，历史技巧：先放
+  `.com.apple.dt.CommandLineTools.installondemand.in-progress`）；这条路在新版 macOS 上
+  不一定还有效，所以保留回退：`xcode-select --install` + **明确提示"请点弹窗里的安装"**
+  并轮询等待（最多 30 分钟），而不是死等。
+- Homebrew 安装脚本从 raw.githubusercontent.com 下载（大陆直连不通）→ 官方优先 + 加速镜像兜底；
+  安装时用国内 git 镜像（USTC/TUNA）+ `NONINTERACTIVE=1`（否则它会等"按回车继续"，
+  在面板任务里就是永远卡住）。装完**真的跑一次 `brew --version`** 验证。
+- 命令行开发者工具与 Homebrew 的解析/候选源都有单测锁死。
 
 **国内网络专项（实测无代理环境）**：GitHub Release 直连**完全不通**（20 秒 0 字节），
 自建镜像 3.7 秒下 2MB。据此改了三处：

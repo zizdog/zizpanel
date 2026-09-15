@@ -51,8 +51,14 @@ var LNMPPorts = map[string]int{
 // 每一步都追加到 result.Steps，前端按顺序展示 —— 这个流程动辄十几分钟，
 // 用户必须能看到"现在到哪了"，否则会以为卡死。
 func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error {
+	// 全新 macOS 上没有 Homebrew，而 LNMP 三件套全靠它。
+	// 以前这里只会拒绝（"请先安装 Homebrew"），把用户赶回命令行 ——
+	// 与"装完面板后所有操作都在面板里完成"矛盾。现在缺什么装什么（含前置的 CLT）。
 	if _, err := os.Stat(m.opt.BrewBin); err != nil {
-		return fmt.Errorf("未安装 Homebrew，无法自动安装 LNMP。请先安装 Homebrew")
+		result.step(ctx, "没有 Homebrew，先在面板里把它装上（含命令行开发者工具）")
+		if err := m.EnsureHomebrew(ctx, result); err != nil {
+			return err
+		}
 	}
 	// 写 /Library/LaunchDaemons 需要 root。正式安装的面板由 LaunchDaemon
 	// 以 root 运行；本地调试实例不是，这时明确拒绝而不是半途而废。

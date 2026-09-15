@@ -540,3 +540,48 @@ func TestBrewEnvInjectsChinaMirrors(t *testing.T) {
 		t.Error("用户自己设的 HOMEBREW_API_DOMAIN 应被尊重，不能被默认值覆盖")
 	}
 }
+
+// TestParseCLTLabel 锁住"从 softwareupdate -l 输出里认出命令行工具条目"。
+//
+// 这段解析最容易写错又最难复现：真机上输出是英文/本地化混排，
+// 而它决定"无界面静默安装"这条路能不能走通（走不通就要用户点弹窗）。
+func TestParseCLTLabel(t *testing.T) {
+	cases := []struct{ name, out, want string }{
+		{"带 Label 前缀",
+			"Software Update Tool\n\nFinding available software\n* Label: Command Line Tools for Xcode-16.2\n",
+			"Command Line Tools for Xcode-16.2"},
+		{"没有 Label 前缀",
+			"* Command Line Tools for Xcode-15.4\n",
+			"Command Line Tools for Xcode-15.4"},
+		{"Title 形式（另一种版本）",
+			"   Title: Command Line Tools for Xcode 16.1, Version: 16.1, Size: 700000KiB\n",
+			"Command Line Tools for Xcode 16.1"},
+		{"只有普通更新：认不出来",
+			"* macOS Sonoma 14.5-23F79\n* Safari 17.5\n",
+			""},
+		{"空输出", "", ""},
+	}
+	for _, c := range cases {
+		if got := parseCLTLabel(c.out); got != c.want {
+			t.Errorf("%s：parseCLTLabel = %q，期望 %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestBrewInstallScriptCandidatesPrefersOfficial 锁住"安装脚本官方优先、镜像兜底"。
+//
+// 中国大陆无代理时 raw.githubusercontent.com 直连不通，只留官方地址等于装不上 Homebrew。
+func TestBrewInstallScriptCandidatesPrefersOfficial(t *testing.T) {
+	got := brewInstallScriptCandidates()
+	if len(got) < 2 {
+		t.Fatalf("应当有官方 + 至少一个镜像，实际 %v", got)
+	}
+	if got[0] != brewInstallScriptURL {
+		t.Errorf("第一个应为官方地址，实际 %s", got[0])
+	}
+	for _, u := range got[1:] {
+		if !strings.Contains(u, "raw.githubusercontent.com") {
+			t.Errorf("镜像应当是加速前缀 + 官方路径，实际 %s", u)
+		}
+	}
+}
