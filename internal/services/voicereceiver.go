@@ -1,12 +1,14 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,9 +165,19 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	// ---- 3. 系统级服务 ----
 	// 监听地址：只接受 127.0.0.1 / 0.0.0.0 两个值（其他值交给 Python 报错没有意义，
 	// 而且这里要写进 root 拥有的 plist，宁可先校验）。
+	//
+	// 没显式指定时**沿用已有 plist 里的地址**：重新部署是升级 receiver.py 的正常
+	// 操作（面板的"部署"按钮默认不传 host），如果这时回落 0.0.0.0，就会把一台
+	// 本来只监听 127.0.0.1 的机器悄悄暴露到局域网 —— 用户点的是"升级"，
+	// 得到的却是"扩大了暴露范围"。
 	bindHost := strings.TrimSpace(opt.Host)
 	if bindHost == "" {
-		bindHost = "0.0.0.0"
+		if existing := m.existingReceiverHost(p); existing != "" {
+			bindHost = existing
+			result.step(ctx, "沿用原有监听地址 "+bindHost+"（重新部署不改变暴露范围）")
+		} else {
+			bindHost = "0.0.0.0"
+		}
 	}
 	if bindHost != "0.0.0.0" && bindHost != "127.0.0.1" {
 		return fmt.Errorf("监听地址只支持 0.0.0.0（对局域网开放）或 127.0.0.1（仅本机）")
@@ -403,12 +415,199 @@ func (m *Manager) existingReceiverToken(p receiverPaths) string {
 			v := strings.TrimSpace(lines[i+1])
 			v = strings.TrimPrefix(v, "<string>")
 			v = strings.TrimSuffix(v, "</string>")
-			if strings.HasPrefix(v, "ttsv-") {
+			// 这里曾经要求 v 以 "ttsv-" 开头 —— 那是面板自动生成密钥的格式，
+			// 但用户完全可以自定义密钥（ValidateReceiverToken 允许）。
+			// 自定义密钥读回来就成了空串：换密钥会"又生成一个"、来源管理也
+			// 无法鉴权。密钥就是 --token 的那个值，不该按前缀猜。
+			if v != "" {
 				return v
 			}
 		}
 	}
 	return ""
+}
+
+// ============================================================================
+//  音色来源（receiver v1.5.0）
+//
+//  背景：v1.4.0 的接收端把所有站点的样本都写成同一个 <dir>/ref.wav，
+//  后传的覆盖先传的 —— 多站点共用一份样本时，用户听到的是"别的站的音色"，
+//  而且没有任何提示。v1.5.0 改成 <dir>/<source>/ref.wav。
+//
+//  面板这边**不自己解析/转码音频**，只做两件事：
+//    · 列来源：问接收端 GET /voice/sources（单一事实来源，口径不会漂）
+//    · 换/删来源：把文件转给接收端 POST /voice（校验与归一化只有一处实现）
+//  密钥从 plist 里读（与"更改共享密钥"同一处），用户不需要再填一次。
+// ============================================================================
+
+// VoiceSource 是一条来源记录（对应接收端 /voice/sources 的一项）。
+type VoiceSource struct {
+	Source   string  `json:"source"`
+	Path     string  `json:"path"`
+	Size     int64   `json:"size"`
+	Duration float64 `json:"duration"`
+	SHA256   string  `json:"sha256"`
+	Modified int64   `json:"modified"`
+	LastUsed int64   `json:"last_used"`
+	Legacy   bool    `json:"legacy"`
+}
+
+// SanitizeVoiceSource 与 receiver.py 的 sanitize_source() 保持同一套规则。
+//
+// 两处必须一致：面板用它拼删除请求的路径，接收端用它拼目录名。
+// 不一致会出现"面板删的是 A、接收端理解成 B"。
+func SanitizeVoiceSource(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "default"
+	}
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	return out
+}
+
+func (m *Manager) receiverBaseURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", receiverPort)
+}
+
+// receiverToken 读当前接收端密钥；未部署时返回错误（而不是空串 ——
+// 空串在接收端语义里是"不鉴权"，会把"没部署"伪装成"权限正常"）。
+func (m *Manager) receiverToken() (string, error) {
+	p := m.receiverPaths()
+	if _, err := os.Stat(p.Plist); err != nil {
+		return "", fmt.Errorf("接收端还没部署过（找不到 %s）", p.Plist)
+	}
+	return m.existingReceiverToken(p), nil
+}
+
+// receiverCall 调一次接收端接口，返回状态码与响应体。
+func (m *Manager) receiverCall(ctx context.Context, method, path string, body []byte,
+	headers map[string]string) (int, []byte, error) {
+	token, err := m.receiverToken()
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, m.receiverBaseURL()+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	if token != "" {
+		req.Header.Set("X-TtsVoice-Token", token)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	client := &http.Client{Timeout: 180 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("接收端不可达（%s）：%v。请先在服务管理里确认它在运行",
+			m.receiverBaseURL(), err)
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, out, nil
+}
+
+// receiverErrorMessage 从接收端的错误体里取出人话。
+// 它返回 {"ok":false,"error":"…"}（/jobs 口径）或 {"ok":false,"msg":"…"}。
+func receiverErrorMessage(code int, body []byte) string {
+	var m map[string]any
+	if json.Unmarshal(body, &m) == nil {
+		for _, k := range []string{"error", "msg", "message"} {
+			if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+				return s
+			}
+		}
+	}
+	text := strings.TrimSpace(string(body))
+	if len(text) > 300 {
+		text = text[:300] + "…"
+	}
+	if text == "" {
+		text = http.StatusText(code)
+	}
+	return text
+}
+
+// VoiceSources 列出各来源（转发接收端的 /voice/sources）。
+func (m *Manager) VoiceSources(ctx context.Context) ([]VoiceSource, error) {
+	code, body, err := m.receiverCall(ctx, http.MethodGet, "/voice/sources", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if code == http.StatusNotFound {
+		return nil, fmt.Errorf("接收端版本过旧（没有 /voice/sources）。" +
+			"请在应用市场重新部署「音色样本接收端」，把它升到 v1.5.0")
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("接收端返回 %d：%s", code, receiverErrorMessage(code, body))
+	}
+	var doc struct {
+		Dir     string        `json:"dir"`
+		Sources []VoiceSource `json:"sources"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("接收端响应无法解析：%v", err)
+	}
+	return doc.Sources, nil
+}
+
+// VoiceSourceUpload 上传/替换一个来源的样本，返回接收端的响应。
+//
+// 校验与归一化都在接收端做（只有一处实现），这里只负责带上来源与文件名。
+func (m *Manager) VoiceSourceUpload(ctx context.Context, source, filename, contentType string,
+	data []byte) (map[string]any, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("上传的文件是空的")
+	}
+	headers := map[string]string{
+		"X-TtsVoice-Source": SanitizeVoiceSource(source),
+		"Content-Type":      contentType,
+	}
+	if filename != "" {
+		headers["X-TtsVoice-Name"] = filename
+	}
+	code, body, err := m.receiverCall(ctx, http.MethodPost, "/voice", data, headers)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	_ = json.Unmarshal(body, &doc)
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("接收端拒绝了这次上传（%d）：%s",
+			code, receiverErrorMessage(code, body))
+	}
+	if doc == nil {
+		return nil, fmt.Errorf("接收端响应无法解析")
+	}
+	return doc, nil
+}
+
+// VoiceSourceDelete 删除一个来源（转发接收端的 DELETE /voice/sources/<source>）。
+func (m *Manager) VoiceSourceDelete(ctx context.Context, source string) error {
+	src := SanitizeVoiceSource(source)
+	code, body, err := m.receiverCall(ctx, http.MethodDelete,
+		"/voice/sources/"+url.PathEscape(src), nil, nil)
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("接收端返回 %d：%s", code, receiverErrorMessage(code, body))
+	}
+	return nil
 }
 
 // receiverPlist 生成系统级 LaunchDaemon 定义。

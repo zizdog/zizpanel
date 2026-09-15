@@ -10,6 +10,7 @@ receiver.py 的 /jobs 相关单元测试（进程内，快）。
 """
 
 import importlib.util
+import argparse
 import json
 import os
 import shutil
@@ -97,6 +98,10 @@ def main():
 
     mgr = m.JobManager(jobs, "http://127.0.0.1:1")   # 上游故意不可达：不跑 worker
 
+    # v1.5.0：submit 的 source 解析要用全局 ARGS（脚本里由 argparse 填），
+    # 单元测试必须自己指向临时目录，否则会去读**真实的** ~/tts/voice-samples。
+    m.ARGS = argparse.Namespace(dir=samples, jobs_dir=jobs, token="", upstream="")
+
     def submit(payload):
         return mgr.submit(payload)
 
@@ -114,7 +119,10 @@ def main():
             c.ok(label, False, "没有报错")
 
     expect_error("voice 与 ref_audio 同时给被拒", {**base, "ref_audio": ref}, "exactly one")
-    expect_error("两个都不给被拒", {"model": "m", "chunks": base["chunks"]}, "exactly one")
+    # v1.5.0：两个都不给 = 按 source=default 解析。**不做旧版回退**（不读根目录
+    # 那份 v1.4.0 老文件），所以这里必须是明确的 400，而不是悄悄用旧文件。
+    expect_error("两个都不给且 default 没有样本 → 报错（不回退旧根目录文件）",
+                 {"model": "m", "chunks": base["chunks"]}, "voice sample not found")
     expect_error("缺 model 被拒", {"voice": "v", "chunks": base["chunks"]}, "model")
     expect_error("chunks 为空被拒", {**base, "chunks": []}, "chunks")
     expect_error("chunks 不是数组被拒", {**base, "chunks": "x"}, "chunks")
@@ -127,6 +135,58 @@ def main():
                  "ref_audio not found")
     expect_error("超过 2000 块被拒",
                  {**base, "chunks": [{"text": "x", "max_tokens": 1}] * 2001}, "too many")
+
+    # ================= v1.5.0 =================
+    print("\n【v1.5.0 sanitize_source：来源标识是目录名，不能带路径语义】")
+    # 这组用例与 Go 侧 TestSanitizeVoiceSource 必须一致（两份实现，一套期望）
+    c.ok("路径穿越被换成连字符（首尾连字符也去掉）",
+         m.sanitize_source("../../etc/passwd") == "etc-passwd",
+         m.sanitize_source("../../etc/passwd"))
+    c.ok("空 / 纯符号 → default",
+         m.sanitize_source("") == "default" and m.sanitize_source("///") == "default"
+         and m.sanitize_source(None) == "default",
+         (m.sanitize_source(""), m.sanitize_source("///"), m.sanitize_source(None)))
+    c.ok("刻意不复用 safe_name：点号不保留（a.wav → a-wav）",
+         m.sanitize_source("a.wav") == "a-wav", m.sanitize_source("a.wav"))
+    c.ok("长度截到 64", len(m.sanitize_source("x" * 200)) == 64)
+    c.ok("纯中文站点名被换成连字符后回落 default（不产生不可见目录名）",
+         m.sanitize_source("我的站") == "default", m.sanitize_source("我的站"))
+    c.ok("非 ASCII 段被削掉、ASCII 段保留",
+         m.sanitize_source("站点-a") == "a", m.sanitize_source("站点-a"))
+
+    print("\n【v1.5.0 sniff_audio：用内容而不是扩展名判断】")
+    c.ok("RIFF → wav", m.sniff_audio(b"RIFF\x00\x00\x00\x00WAVE") == "wav")
+    c.ok("ID3 → mp3", m.sniff_audio(b"ID3\x04\x00\x00\x00\x00") == "mp3")
+    c.ok("裸 mp3 帧（0xFF 0xFB）→ mp3", m.sniff_audio(b"\xff\xfb\x90\x00rest") == "mp3")
+    c.ok("ftyp → m4a", m.sniff_audio(b"\x00\x00\x00\x20ftypM4A ") == "m4a")
+    c.ok("fLaC / OggS 认得", m.sniff_audio(b"fLaC\x00\x00") == "flac"
+         and m.sniff_audio(b"OggS\x00\x02") == "ogg")
+    c.ok("纯文本 → 空（会被 400 拒掉）", m.sniff_audio(b"hello world..... ") == "")
+    c.ok("空输入 → 空", m.sniff_audio(b"") == "")
+
+    print("\n【v1.5.0 /jobs 的来源解析（显式 ref_audio → <dir>/<source>/ref.wav → 老根目录）】")
+    src_dir = os.path.join(samples, "site-a")
+    os.makedirs(src_dir, exist_ok=True)
+    src_ref = os.path.join(src_dir, "ref.wav")
+    with open(src_ref, "wb") as fh:
+        fh.write(b"RIFFsite-a")
+
+    ja = submit({"model": "m", "source": "site-a", "chunks": base["chunks"]})
+    c.ok("只给 source → 用 <dir>/<source>/ref.wav", ja["ref_audio"] == src_ref,
+         ja.get("ref_audio"))
+    c.ok("source 记进 job（面板的「最后使用」靠它）", ja["source"] == "site-a", ja.get("source"))
+
+    explicit = submit({"model": "m", "source": "site-a", "ref_audio": ref,
+                       "chunks": base["chunks"]})
+    c.ok("显式 ref_audio 优先于 source", explicit["ref_audio"] == ref, explicit.get("ref_audio"))
+
+    expect_error("指定了没有样本的来源被拒（错误里要有查找路径）",
+                 {"model": "m", "source": "site-zzz", "chunks": base["chunks"]},
+                 "voice sample not found")
+
+    c.ok("source 里的脏字符在路径解析前就被洗掉",
+         m.source_ref_path("../../etc") == os.path.join(samples, "etc", "ref.wav"),
+         m.source_ref_path("../../etc"))
 
     print("\n【幂等与队列上限】")
     j1 = submit({**base, "client_id": "c1"})

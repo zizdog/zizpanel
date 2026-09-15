@@ -237,6 +237,44 @@ def call(method, url, body=None, token=TOKEN, timeout=60, headers=None):
             return exc.code, None, raw, dict(exc.headers)
 
 
+def call_raw(method, url, raw, token=TOKEN, timeout=60, headers=None,
+             content_type="application/octet-stream"):
+    """直接发二进制体（/voice 上传用；call() 会把 body 当 JSON 编码）。"""
+    req = urllib.request.Request(url, data=raw, method=method)
+    req.add_header("Content-Type", content_type)
+    if token:
+        req.add_header("X-TtsVoice-Token", token)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            try:
+                return resp.status, json.loads(body), body, dict(resp.headers)
+            except ValueError:
+                return resp.status, None, body, dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        try:
+            return exc.code, json.loads(body), body, dict(exc.headers)
+        except ValueError:
+            return exc.code, None, body, dict(exc.headers)
+
+
+def receiver_version():
+    """
+    从脚本里读 VERSION（而不是在测试里写死）。
+
+    版本号写死在断言里，升级时就变成"盯着改"的负担，还容易漏 ——
+    版本检查应该比对**脚本自身**，脚本升了测试自动跟上。
+    """
+    with open(RECEIVER, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("VERSION = "):
+                return line.split("=", 1)[1].strip().strip('"\'')
+    return ""
+
+
 def _wait_ready(base, job_id, timeout=60):
     """轮询到 ready/failed，返回最后一次 (status, body, raw, headers)。"""
     import time as _t
@@ -292,7 +330,9 @@ def main():
         print("\n【⑨ 回归：/v1/*、/voice、/voice/health、/voice/status 不变】")
         st, body, _, _ = call("GET", base + "/voice/health", token=None)
         c.ok("/voice/health 200", st == 200, (st, body))
-        c.ok("health.version = 1.4.0", body and body.get("version") == "1.4.0", body)
+        c.ok("health.version 与脚本 VERSION 一致",
+             body and body.get("version") == receiver_version(),
+             (body, receiver_version()))
         c.ok("health 字段齐全（dir/writable/auth/upstream）",
              bool(body and all(k in body for k in ("dir", "writable", "auth", "upstream"))), body)
 
@@ -308,6 +348,135 @@ def main():
         st, body, _, _ = call("POST", base + "/voice", body=None, token=None,
                               headers={"X-TtsVoice-Name": "t.wav"})
         c.ok("上传无密钥 403", st == 403, st)
+
+        # ---------- ⑩ v1.5.0：上传的来源隔离 / 内容校验 / 归一化 ----------
+        print("\n【⑩ v1.5.0 上传：样本按来源落盘，且必须真是音频】")
+
+        def upload(raw, source=None, name=None, token=TOKEN):
+            headers = {}
+            if source is not None:
+                headers["X-TtsVoice-Source"] = source
+            if name is not None:
+                headers["X-TtsVoice-Name"] = name
+            return call_raw("POST", base + "/voice", raw, token=token, headers=headers)
+
+        def secs(n):
+            """n 秒的合法 24kHz/16bit/单声道 wav。"""
+            return wav_wrap(b"\x01\x02" * int(24000 * n))
+
+        st, body_a, _, _ = upload(secs(2.0), source="site-a", name="voice-a.mp3")
+        c.ok("上传音频 → 200", st == 200, (st, body_a))
+        c.ok("回应 source = site-a", (body_a or {}).get("source") == "site-a", body_a)
+        c.ok("回应 format=wav 且 duration≈2s",
+             (body_a or {}).get("format") == "wav"
+             and abs((body_a or {}).get("duration", 0) - 2.0) < 0.15, body_a)
+        c.ok("落盘在 <dir>/site-a/ref.wav（不再写根目录）",
+             (body_a or {}).get("path") == os.path.join(samples, "site-a", "ref.wav"), body_a)
+        c.ok("回应带 64 位 sha256（对归一化后的字节）",
+             len((body_a or {}).get("sha256") or "") == 64, body_a)
+        c.ok("name 回显上传时的文件名", (body_a or {}).get("name") == "voice-a.mp3", body_a)
+
+        st, body_short, _, _ = upload(secs(1.2), source="site-a", name="voice-a2.wav")
+        c.ok("同来源再传 = 单来源替换（200）", st == 200, (st, body_short))
+        c.ok("1–3 秒样本 → 200 但带 warning（偏短提示）",
+             bool((body_short or {}).get("warning")), body_short)
+        c.ok("替换后目录里只有 ref.wav 一个文件（不留 .part/临时文件）",
+             sorted(os.listdir(os.path.join(samples, "site-a"))) == ["ref.wav"],
+             os.listdir(os.path.join(samples, "site-a")))
+        c.ok("替换后 duration 变成 ≈1.2s",
+             abs((body_short or {}).get("duration", 0) - 1.2) < 0.15, body_short)
+
+        st, body_b, _, _ = upload(secs(2.0), source="site-b", name="b.wav")
+        c.ok("第二个来源与第一个共存",
+             st == 200 and os.path.isfile(os.path.join(samples, "site-b", "ref.wav")),
+             (st, body_b))
+
+        st, body_bad, _, _ = upload("这明显不是音频，只是一段文字。".encode("utf-8"),
+                                    source="site-c", name="x.wav")
+        c.ok("非音频内容 → 400（而不是先落盘再让上游解不开）", st == 400, (st, body_bad))
+        c.ok("400 的说明能看懂（提到音频/格式）",
+             "音频" in json.dumps(body_bad, ensure_ascii=False), body_bad)
+        c.ok("被拒的上传没有留下 site-c 目录",
+             not os.path.exists(os.path.join(samples, "site-c")))
+
+        st, body_short2, _, _ = upload(wav_wrap(b"\x00" * 4000), source="site-d", name="tiny.wav")
+        c.ok("不足 1 秒 → 400 且提示太短",
+             st == 400 and "太短" in json.dumps(body_short2, ensure_ascii=False), (st, body_short2))
+
+        st, body_long, _, _ = upload(secs(20.0), source="site-e", name="long.wav")
+        c.ok("超过 12 秒 → 截断到 12 秒并标记 truncated",
+             st == 200 and (body_long or {}).get("truncated") is True
+             and abs((body_long or {}).get("duration", 0) - 12.0) < 0.2, (st, body_long))
+
+        st, body_sources, _, _ = call("GET", base + "/voice/sources")
+        c.ok("GET /voice/sources 200", st == 200, (st, body_sources))
+        srcs = {x["source"]: x for x in (body_sources or {}).get("sources", [])}
+        c.ok("列表含 site-a / site-b / site-e", {"site-a", "site-b", "site-e"} <= set(srcs), sorted(srcs))
+        c.ok("v1.4.0 残留的根目录 ref.wav 也被列出来（标记 legacy）",
+             srcs.get("default", {}).get("legacy") is True
+             and srcs.get("default", {}).get("path") == ref, srcs.get("default"))
+        c.ok("条目字段齐全（size/duration/sha256/modified/last_used）",
+             all(k in srcs.get("site-a", {})
+                 for k in ("size", "duration", "sha256", "modified", "last_used", "path")),
+             srcs.get("site-a"))
+        c.ok("/voice/sources 无密钥 403",
+             call("GET", base + "/voice/sources", token=None)[0] == 403)
+
+        # 不做旧版兼容：给 default 上传只写 <dir>/default/ref.wav，
+        # **不会**去动根目录那份 v1.4.0 老文件（残留就让它明明白白地留着）。
+        ref_before = open(ref, "rb").read()
+        st, body_def, _, _ = upload(secs(2.0), source="default", name="d.wav")
+        c.ok("default 上传只写子目录，不碰根目录残留",
+             st == 200 and (body_def or {}).get("path") == os.path.join(samples, "default", "ref.wav")
+             and open(ref, "rb").read() == ref_before
+             and "legacy_path" not in (body_def or {}),
+             (st, body_def))
+        st, body_sources2, _, _ = call("GET", base + "/voice/sources")
+        defaults = [x for x in (body_sources2 or {}).get("sources", []) if x["source"] == "default"]
+        c.ok("两份 default（子目录 + 残留）各自一行，都能看见",
+             len(defaults) == 2 and any(x["legacy"] for x in defaults)
+             and any(not x["legacy"] for x in defaults),
+             [(x["source"], x["legacy"], x["path"]) for x in defaults])
+        c.ok("删掉 default 会把子目录与残留文件一起删（清理入口）",
+             call("DELETE", base + "/voice/sources/default")[0] == 200
+             and not os.path.exists(os.path.join(samples, "default"))
+             and not os.path.exists(ref), True)
+        # 后面的用例还要用这份根目录样本当 ref_audio（显式 ref_audio 仍允许），补回来
+        with open(ref, "wb") as fh:
+            fh.write(b"RIFFfakedata")
+
+        st, body_del, _, _ = call("DELETE", base + "/voice/sources/site-b")
+        c.ok("DELETE 来源 → 200 且目录被删",
+             st == 200 and not os.path.exists(os.path.join(samples, "site-b")), (st, body_del))
+        st, _, _, _ = call("DELETE", base + "/voice/sources/site-b")
+        c.ok("重复删除 → 200（幂等）", st == 200, st)
+        st, _, _, _ = call("DELETE", base + "/voice/sources/..%2F..%2Fetc")
+        c.ok("路径穿越被洗掉（200，且没有越界删除）", st == 200, st)
+        st, _, _, _ = call("DELETE", base + "/voice/sources/site-b", token=None)
+        c.ok("DELETE 无密钥 403", st == 403, st)
+
+        # ---------- ⑪ v1.5.0：/jobs 带 source ----------
+        print("\n【⑪ v1.5.0 /jobs：source 解析与回传】")
+        model = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+
+        st, body_src, _, _ = call("POST", base + "/jobs", {
+            "client_id": "src-1", "model": model, "source": "site-a",
+            "response_format": "mp3",
+            "chunks": [{"text": "用 site-a 的音色。", "max_tokens": 400}]})
+        c.ok("只给 source（不给 ref_audio）→ 200", st == 200, (st, body_src))
+        jid_src = (body_src or {}).get("job_id")
+
+        st, view_src, _, _ = call("GET", base + "/jobs/" + (jid_src or ""))
+        c.ok("GET /jobs/{id} 回传 source = site-a",
+             st == 200 and (view_src or {}).get("source") == "site-a", (st, view_src))
+        _wait_ready(base, jid_src, timeout=60)   # 别把任务留在队列里影响后面
+
+        st, body_nosrc, _, _ = call("POST", base + "/jobs", {
+            "client_id": "src-2", "model": model, "source": "no-such-source",
+            "chunks": [{"text": "x", "max_tokens": 400}]})
+        c.ok("来源没有样本 → 400 且给出查找过的路径",
+             st == 400 and "voice sample not found" in json.dumps(body_nosrc),
+             (st, body_nosrc))
 
         # ---------- ① 提交任务 ----------
         print("\n【① 提交一个 2 块任务（克隆模式）】")
@@ -463,7 +632,10 @@ def main():
         c.ok("voice 与 ref_audio 同时给 → 400", st == 400, (st, body))
         st, body, _, _ = call("POST", base + "/jobs", {
             "model": "m", "chunks": [{"text": "x", "max_tokens": 400}]})
-        c.ok("两个都不给 → 400", st == 400, (st, body))
+        # v1.5.0：不给 ref_audio/voice 时按 source=default 解析；此时 default 没有样本
+        # （根目录那份 v1.4.0 残留不参与解析），所以必须是 400 —— 不回退旧文件。
+        c.ok("voice/ref_audio 都不给且 default 无样本 → 400（不回退旧根目录文件）",
+             st == 400 and "voice sample not found" in json.dumps(body), (st, body))
         st, body, _, _ = call("POST", base + "/jobs", {
             "model": "m", "voice": "v", "chunks": []})
         c.ok("chunks 为空 → 400", st == 400, (st, body))

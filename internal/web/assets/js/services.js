@@ -8,7 +8,7 @@
 //   - 应用市场先做"安装前检查"，把缺依赖/端口冲突一次说清
 
 import { api, sseServiceLogs } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
+import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
 
@@ -479,6 +479,165 @@ export function ServicesView(content, ctx = {}) {
     });
   }
 
+  // ---------------------------------------------------------------------
+  //  音色接收端：各来源（receiver v1.5.0）
+  //
+  //  每个网站一份参考音频，落在 <dir>/<source>/ref.wav。
+  //  以前所有站点共用 <dir>/ref.wav，后传的覆盖先传的 —— 用户听到的是
+  //  别的站的音色，界面上完全看不出来（而且非 wav 字节被改名成 .wav 后
+  //  上游会返回 0 字节，就是那次"合成失败"的根因）。
+  //
+  //  这份列表直接来自接收端的 /voice/sources：解析/转码只在接收端做一次，
+  //  面板不重复实现一套"什么算合法音频"的判断。
+  // ---------------------------------------------------------------------
+  async function voiceSourcesModal(parentModal) {
+    const box = h('div', [
+      h('div.empty', [h('div.big', { text: '🎙' }), h('p', { text: '正在读取各来源…' })]),
+    ]);
+    const m = modal({ title: '音色来源（每个网站一份参考音频）', wide: true, body: box });
+
+    function fmtTime(sec) {
+      if (!sec) return '未使用';
+      const d = new Date(sec * 1000);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    // 选文件 → 上传（同一个入口用于"替换"与"新增"）
+    function pickAndUpload(source, label) {
+      const input = h('input', { type: 'file', accept: 'audio/*', style: { display: 'none' } });
+      input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const t = toast(`正在上传「${label}」…`, 'info', 60000);
+        try {
+          const res = await api.uploadVoiceSource(source, file);
+          const warn = res && res.warning;
+          toast(warn ? `已保存，但要注意：${warn}` : `已保存「${label}」的音色（${Number(res?.duration || 0).toFixed(1)} 秒）`,
+            warn ? 'warn' : 'ok', warn ? 8000 : 4200);
+          if (res && res.truncated) toast('原音频超过 12 秒，已自动截断', 'warn', 6000);
+          await load();
+        } catch (e) {
+          toast(e.message, 'err', 9000);
+        } finally {
+          t.remove?.();
+          input.value = '';
+        }
+      });
+      document.body.appendChild(input);
+      input.click();
+      setTimeout(() => input.remove(), 60000);
+    }
+
+    async function addSource() {
+      const src = await promptBox({
+        title: '新增音色来源',
+        label: '来源标识（建议用网站域名或站点 slug，只能用字母数字 - _）',
+        placeholder: '例如 zizdog-cn',
+        hint: '每个来源各自保存一份 ref.wav；网站调用合成时带上同一个标识即可。',
+      });
+      if (!src) return;
+      const clean = String(src).trim();
+      if (!clean) return;
+      pickAndUpload(clean, clean);
+    }
+
+    async function load() {
+      clear(box);
+      let list = [];
+      let err = null;
+      try {
+        const r = await api.voiceSources();
+        list = r.sources || [];
+      } catch (e) {
+        err = e;
+      }
+
+      if (err) {
+        appendAll(box, h('div.empty', [
+          h('div.big', { text: '⚠️' }),
+          h('p', { text: err.message }),
+          h('div.hint', { text: '这个页面需要接收端 v1.5.0。旧版本请在「应用市场 → 音色样本接收端」重新部署一次。' }),
+        ]));
+        return;
+      }
+
+      const rows = list.map((s) => h('tr', [
+        h('td', [
+          h('strong', { text: s.source }),
+          s.legacy
+            ? h('span.sub', { text: '  （v1.4.0 残留，已不再使用，可删除）' })
+            : null,
+        ]),
+        h('td', [
+          s.duration > 0
+            ? h('span', { text: `${Number(s.duration).toFixed(1)} 秒 / ${bytes(s.size)}` })
+            : h('span', {
+                style: { color: 'var(--danger)' },
+                title: '读不出时长：这份文件多半不是合法 wav（例如把 mp3 改名成 .wav 传上来的）',
+                text: `⚠️ 无法解析 / ${bytes(s.size)}`,
+              }),
+        ]),
+        h('td', { text: (s.sha256 || '').slice(0, 8) + '…', title: s.sha256 || '' }),
+        h('td', { text: fmtTime(s.last_used) }),
+        h('td', { style: { display: 'flex', gap: '6px' } }, [
+          h('button.btn.btn-sm', {
+            text: '替换',
+            title: '上传新的参考音频（会做校验并转成 24kHz 单声道 wav）',
+            onclick: () => pickAndUpload(s.source, s.source),
+          }),
+          h('button.btn.btn-sm.btn-danger', {
+            text: '删除',
+            onclick: async () => {
+              const extra = s.legacy
+                ? '\n\n这是 v1.4.0 留在根目录的残留文件，v1.5.0 已经不再读它 —— 删掉不影响任何网站。'
+                : '';
+              if (!await confirmBox(
+                `删除来源「${s.source}」的音色样本${s.legacy ? '（v1.4.0 残留）' : ''}？\n\n`
+                + '之后该来源的合成请求会返回 400（voice sample not found），直到重新上传。\n'
+                + '如果网站还在用这个来源，合成会立刻失败。' + extra,
+                { title: '删除音色来源', danger: true, okText: '确认删除' })) return;
+              try {
+                await api.deleteVoiceSource(s.source);
+                toast(`已删除「${s.source}」`, 'ok');
+                await load();
+              } catch (e) { toast(e.message, 'err'); }
+            },
+          }),
+        ]),
+      ]));
+
+      appendAll(box,
+        h('div.hint', {
+          style: { marginBottom: '10px' },
+          text: '每个来源一份独立的参考音频（<样本目录>/<来源>/ref.wav）。'
+            + '上传时会校验是不是真音频，并统一转成 ≤12 秒、24kHz、单声道的 wav —— '
+            + '上游按扩展名选解码器，改名的假 wav 会让合成返回空音频。',
+        }),
+        list.length
+          ? h('table.table', [
+              h('thead', [h('tr', [
+                h('th', { text: '来源标识' }), h('th', { text: '时长 / 大小' }),
+                h('th', { text: 'sha256' }), h('th', { text: '最后使用' }), h('th', { text: '操作' }),
+              ])]),
+              h('tbody', rows),
+            ])
+          : h('div.empty', [
+              h('div.big', { text: '📭' }),
+              h('h4', { text: '还没有任何来源的音色样本' }),
+              h('p', { text: '可以点下面的按钮先上传一份，也可以等网站自己上传。' }),
+            ]),
+        h('div', { style: { marginTop: '14px', display: 'flex', gap: '8px' } }, [
+          h('button.btn.btn-sm.btn-primary', { text: '➕ 上传新来源', onclick: addSource }),
+          h('button.btn.btn-sm', { text: '🔄 刷新', onclick: load }),
+        ]),
+      );
+    }
+
+    await load();
+    return m;
+  }
+
   async function openDetail(s) {
     let data;
     try {
@@ -524,6 +683,12 @@ export function ServicesView(content, ctx = {}) {
           text: '🔑 更改共享密钥',
           title: '重新生成或指定「网站 ↔ 接收端」之间的共享密钥',
           onclick: () => changeReceiverToken(m),
+        }) : null,
+        // 音色接收端专有：各来源（每站一份参考音频）
+        cur.launch_label === RECEIVER_LABEL ? h('button.btn.btn-sm', {
+          text: '🎙 各来源',
+          title: '查看 / 替换 / 删除各网站的音色样本（receiver v1.5.0）',
+          onclick: () => voiceSourcesModal(m),
         }) : null,
         h('button.btn.btn-sm', {
           text: '🚫 从面板移除',

@@ -27,7 +27,13 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
     GET  /voice/status              → 上游模型驻留状态（v1.2.0 新增，只读）
                                       回答"网站下一个请求要不要等冷加载"
     POST /voice                     Header: X-TtsVoice-Token / X-TtsVoice-Name
+                                           / X-TtsVoice-Source（v1.5.0 新增）
                                     Body: 音频二进制
+                                    落盘：<dir>/<source>/ref.wav（校验 + 归一化之后）
+    GET  /voice/sources             Header: X-TtsVoice-Token
+                                    → 列出各来源（v1.5.0 新增，面板"各来源"用）
+    DELETE /voice/sources/{source}  Header: X-TtsVoice-Token
+                                    → 删除某个来源（幂等）
     ANY  /v1/...                    Header: Authorization: Bearer <token>
                                           或 X-TtsVoice-Token: <token>
                                     → 原样转发到 upstream
@@ -43,6 +49,28 @@ TtsVoice 音色样本接收端 + 带鉴权的 TTS 反向代理（跑在 TTS 主�
 ③ 退化判定的字节率按格式走（wav 48000 且先减 44 字节头）。
 **不做变速**：变速由网站用 ffmpeg 在下载后做，这里再变会双重变速。
 见 usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md。
+
+【v1.5.0 音色来源隔离】修掉一个真实故障：以前所有站点都写同一个
+<dir>/ref.wav，后传的覆盖先传的；更糟的是**非 wav 字节被命名成 .wav**
+交给上游，mlx-audio 按扩展名选解码器 → 解码失败 → 上游返回 200 + 0 字节
+→ 网站只看到 IncompleteRead(0 bytes read)。现在：
+
+    POST /voice   多一个 X-TtsVoice-Source 头（缺省 default），样本落到
+                  <dir>/<source>/ref.wav；先按**内容**校验（ffprobe 解码 /
+                  魔数），不能解码的直接 400 并说明原因；再归一化成
+                  ≤12s / 24kHz / 单声道 / PCM s16le WAV，原子替换。
+                  <1s → 400；1–3s → 200 但带 warning（太短音色不像本人）。
+                  **不做旧版兼容**：不再给根目录 ref.wav 写副本。v1.4.0 留在
+                  根目录的那份若还在，只在 /voice/sources 里作为"旧版残留"
+                  列出来（不参与解析），可以在面板里删掉。
+    POST /jobs    payload 多一个可选 source（缺省 default），参考音频顺序：
+                  显式 ref_audio → <dir>/<source>/ref.wav
+                  （**不**读根目录那份 v1.4.0 老文件：插件还在开发期，
+                   不为旧版本保留隐式回退，免得"用的是谁的音色"说不清）
+                  job 记录 source，GET /jobs/{id} 原样返回，日志也打出来。
+
+  没有 ffmpeg 时不假装成功：只接受已是 24kHz/16bit/单声道的 wav，其余
+  明确报错让用户去装 ffmpeg（宁可用不了，也不要再产出一个解码不了的文件）。
 
 【v1.3.0 新增 /jobs/*】把「任务队列 + 逐块合成」搬到本机（契约见网站侧
 usr/plugins/TtsVoice/SPEC-TO-MINI-job-queue.md），这样**浏览器/网站关掉任务也能跑完**：
@@ -77,19 +105,35 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import wave
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
+
+# ---------------- 音色样本规范化（v1.5.0）----------------
+#
+# 上游 mlx-audio 按**扩展名**选解码器：给它一个叫 .wav 的 mp3，它会用
+# miniaudio 的 wav 解码器去开，失败后**返回 200 但 0 字节**。所以样本
+# 必须在接收端就转成真正的 wav，不能靠改名。
+DEFAULT_SOURCE = "default"      # 不带 X-TtsVoice-Source 时的来源标识
+REF_FILENAME = "ref.wav"        # 每个来源目录里的固定文件名
+LEGACY_REF = "ref.wav"          # v1.4.0 及以前的根目录单文件（仍要能读）
+NORM_RATE = 24000               # 归一化采样率：与上游 wav 输出一致
+NORM_CHANNELS = 1
+MIN_VOICE_SECONDS = 1.0         # 短于这个直接拒（1 秒以下克隆出来的音色不像本人）
+WARN_VOICE_SECONDS = 3.0        # 1~3 秒可用但要提醒
+MAX_VOICE_SECONDS = 12.0        # 超过就截断到 12 秒
 
 # 单次上传上限（参考音频裁完只有几百 KB，20MB 足够宽松）
 MAX_BYTES = 20 * 1024 * 1024
@@ -211,6 +255,247 @@ def safe_name(raw):
         stem = "ref"
 
     return (stem[:64] + ext)
+
+
+# ---------------- 音色来源（v1.5.0）----------------
+
+
+def sanitize_source(raw):
+    """
+    把 X-TtsVoice-Source / payload.source 洗成一个安全的目录名。
+
+    **刻意不复用 safe_name()**：那个函数是为"文件名"写的（保点号、补扩展名），
+    用它洗来源会出现 `a.wav` 这种来源名，还会留下 `.` / `..` 这类
+    路径语义字符。来源标识只需要当目录名，字符集收紧到字母数字 _ -，
+    其余一律换成连字符，再去掉首尾连字符，长度截到 64。
+
+    这条规则与面板 Go 侧的 services.SanitizeVoiceSource() 必须逐字一致：
+    不一致会出现"面板删 A、接收端理解成 B"。两边的单测用例是同一组。
+    """
+    src = re.sub(r"[^A-Za-z0-9_-]", "-", (raw or "").strip()).strip("-")
+
+    if not src:
+        return DEFAULT_SOURCE
+
+    return src[:64]
+
+
+def source_dir(source):
+    return os.path.join(ARGS.dir, sanitize_source(source))
+
+
+def source_ref_path(source):
+    return os.path.join(source_dir(source), REF_FILENAME)
+
+
+def legacy_ref_path():
+    return os.path.join(ARGS.dir, LEGACY_REF)
+
+
+def _first_existing(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+
+_TOOLS = {"checked": False, "ffmpeg": "", "ffprobe": ""}
+
+
+def tool_path(name):
+    """
+    找 ffmpeg / ffprobe。
+
+    显式列 /opt/homebrew/bin 与 /usr/local/bin：launchd 起的服务 PATH 由 plist
+    给（面板写的那份已包含），但从终端手动跑时 PATH 可能不含 Homebrew，
+    而这两个工具又恰好只装在 Homebrew 下。
+    """
+    if not _TOOLS["checked"]:
+        _TOOLS["ffmpeg"] = shutil.which("ffmpeg") or _first_existing(
+            "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
+        _TOOLS["ffprobe"] = shutil.which("ffprobe") or _first_existing(
+            "/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe")
+        _TOOLS["checked"] = True
+        log("音频工具：ffmpeg=%s ffprobe=%s" % (_TOOLS["ffmpeg"] or "（缺失）",
+                                            _TOOLS["ffprobe"] or "（缺失）"))
+    return _TOOLS.get(name) or ""
+
+
+# 魔数只用来给"这明显不是音频"一个更好懂的错误信息；
+# 真正的判据是 ffprobe 能不能解码（魔数对得上的坏文件照样要拒）。
+AUDIO_MAGIC = (
+    (b"RIFF", "wav"),
+    (b"ID3", "mp3"),
+    (b"fLaC", "flac"),
+    (b"OggS", "ogg"),
+    (b"FORM", "aiff"),
+    (b"\x1aE\xdf\xa3", "webm"),
+    (b"ADIF", "aac"),
+    (b"MAC ", "ape"),
+)
+
+
+def sniff_audio(head):
+    for magic, fmt in AUDIO_MAGIC:
+        if head.startswith(magic):
+            return fmt
+
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "mp3"          # 无 ID3 的裸 mp3 / ADTS 帧
+
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "m4a"
+
+    return ""
+
+
+def wav_info(path):
+    """
+    内置 wav 解析（不依赖 ffprobe）：返回 dict 或 None。
+    duration 用 data 块长度 / 字节率算，不信任头里的时长字段
+    （头部时长在流式写入的文件里经常是 0 或 0xFFFFFFFF）。
+    """
+    try:
+        with wave.open(path, "rb") as fh:
+            frames = fh.getnframes()
+            rate = fh.getframerate()
+            channels = fh.getnchannels()
+            width = fh.getsampwidth()
+            comp = fh.getcomptype()
+    except Exception:
+        return None
+
+    if not rate or comp != "NONE":
+        return None
+
+    return {
+        "format": "wav",
+        "codec": "pcm_s%dle" % (width * 8),
+        "duration": float(frames) / float(rate),
+        "rate": rate,
+        "channels": channels,
+        "width": width,
+    }
+
+
+def probe_audio(path):
+    """
+    用 ffprobe 真解一次；问不到就退回内置 wav 解析。
+    返回 (info, err)：info 为 dict（含 duration/format/codec/rate/channels），
+    err 为给用户看的中文原因（info 为 None 时才有值）。
+    """
+    ffprobe = tool_path("ffprobe")
+
+    if not ffprobe:
+        info = wav_info(path)
+        if info:
+            return info, ""
+        return None, ("本机没找到 ffprobe，只能校验 wav。请装 ffmpeg"
+                      "（brew install ffmpeg）后重试，或直接上传 24kHz/16bit/单声道 wav。")
+
+    cmd = [ffprobe, "-v", "error", "-select_streams", "a:0",
+           "-show_entries", "stream=codec_name,channels,sample_rate:format=duration,format_name",
+           "-of", "json", path]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        return None, "调用 ffprobe 失败：%s" % exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        detail = detail[-1] if detail else "未知原因"
+        return None, "无法解码这个文件（不是有效的音频？）：%s" % detail
+
+    try:
+        doc = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None, "ffprobe 输出无法解析"
+
+    streams = doc.get("streams") or []
+    if not streams:
+        return None, "文件里没有音频流（是不是传了图片或纯文本？）"
+
+    stream = streams[0]
+    try:
+        duration = float((doc.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    if duration <= 0:
+        # 少见的容器不给时长：退回内置解析（wav 时有效）
+        wav = wav_info(path)
+        if wav:
+            duration = wav["duration"]
+
+    try:
+        rate = int(stream.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0
+
+    return {
+        "format": (doc.get("format") or {}).get("format_name") or "",
+        "codec": stream.get("codec_name") or "",
+        "duration": duration,
+        "rate": rate,
+        "channels": int(stream.get("channels") or 0),
+        "width": 2,
+    }, ""
+
+
+def normalize_voice(src, dst):
+    """
+    把任意解码得开的音频归一化成 <=MAX_VOICE_SECONDS / NORM_RATE / 单声道 /
+    PCM s16le WAV。返回 (info, err)，info 是归一化**之后**的实测信息。
+
+    没有 ffmpeg 时不假装成功：只有本来就是目标格式的 wav 才直接放行，
+    其余明确报错 —— 再产出一次"解码不了的文件"正是 v1.5.0 要修的东西。
+    """
+    ffmpeg = tool_path("ffmpeg")
+
+    if not ffmpeg:
+        info = wav_info(src)
+        if info and info["width"] == 2 and info["rate"] == NORM_RATE \
+                and info["channels"] == NORM_CHANNELS:
+            if info["duration"] <= MAX_VOICE_SECONDS:
+                shutil.copyfile(src, dst)
+                return info, ""
+            # 超长也要截断 —— 没有 ffmpeg 就做不完整，是"能用"变"不可用"的偷懒，
+            # 所以这里用标准库截（本来就是目标格式，不需要转码）。
+            # 锚点：不截断的话上游会拿到 20 秒参考音频，合成会慢且不稳定。
+            with wave.open(src, "rb") as reader:
+                keep = int(MAX_VOICE_SECONDS * NORM_RATE)
+                frames = reader.readframes(min(keep, reader.getnframes()))
+            with wave.open(dst, "wb") as writer:
+                writer.setnchannels(NORM_CHANNELS)
+                writer.setsampwidth(2)
+                writer.setframerate(NORM_RATE)
+                writer.writeframes(frames)
+            return (wav_info(dst) or info), ""
+        return None, ("本机没找到 ffmpeg，无法转码。请装 ffmpeg（brew install ffmpeg）"
+                      "后重试，或上传 %dkHz/16bit/单声道 wav。" % (NORM_RATE // 1000))
+
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+           "-i", src,
+           "-t", "%.3f" % MAX_VOICE_SECONDS,
+           "-ac", str(NORM_CHANNELS), "-ar", str(NORM_RATE),
+           "-c:a", "pcm_s16le", "-f", "wav", dst]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except Exception as exc:
+        return None, "调用 ffmpeg 失败：%s" % exc
+
+    if proc.returncode != 0 or not os.path.exists(dst):
+        detail = (proc.stderr or "").strip().splitlines()
+        detail = detail[-1] if detail else "未知原因"
+        return None, "转码失败：%s" % detail
+
+    info = wav_info(dst)
+    if not info:
+        return None, "转码后的文件不是合法 wav（ffmpeg 未按预期输出）"
+
+    return info, ""
 
 
 def upstream_models(timeout=15):
@@ -494,11 +779,25 @@ class JobManager:
 
         voice = str(payload.get("voice") or "").strip()
         ref_audio = str(payload.get("ref_audio") or "").strip()
-        # 必须恰好给一个：两个都给会「静默按其中一个生效」，最难排查
-        if bool(voice) == bool(ref_audio):
+        # v1.5.0：来源标识。取参考音频的优先级（交接文档 §3.5）：
+        #   显式 ref_audio → <dir>/<source>/ref.wav → <dir>/ref.wav（老数据）
+        source = sanitize_source(payload.get("source"))
+        # 两个都给会「静默按其中一个生效」，最难排查 —— 仍然直接拒
+        if voice and ref_audio:
             raise ValueError("exactly one of voice / ref_audio is required")
         if ref_audio and not os.path.exists(ref_audio):
             raise ValueError("ref_audio not found: %s" % ref_audio)
+        if not voice and not ref_audio:
+            # 只给 source（或什么都没给，即 default）：按来源解析样本。
+            # 不做旧版回退（不读根目录那份 v1.4.0 老文件）—— 插件还在开发期，
+            # 与其猜"该用哪份"，不如明确报错让调用方先上传。
+            candidate = source_ref_path(source)
+            if os.path.exists(candidate):
+                ref_audio = candidate
+            else:
+                raise ValueError(
+                    "voice sample not found for source '%s' (looked at %s); "
+                    "upload one first" % (source, candidate))
 
         chunks_in = payload.get("chunks")
         if not isinstance(chunks_in, list) or not chunks_in:
@@ -533,6 +832,9 @@ class JobManager:
             "model": model,
             "voice": voice,
             "ref_audio": ref_audio,
+            # v1.5.0：来源标识要存进 job —— 面板"各来源"里的"最后使用时间"
+            # 就是靠它反查（否则只能看文件 mtime，那是上传时间不是使用时间）
+            "source": source,
             "ref_text": str(payload.get("ref_text") or ""),
             "response_format": str(payload.get("response_format") or "mp3") or "mp3",
             # 采样参数随任务下发（v1.4.0）：缺省就是那组默认值，见 DEFAULT_SAMPLING
@@ -550,7 +852,8 @@ class JobManager:
         os.makedirs(self.chunk_dir(job_id), exist_ok=True)
         self.save(job)
         self.wake.set()
-        log("作业已入队 %s（%d 块，model=%s）" % (job_id, len(chunks), model))
+        log("作业已入队 %s（%d 块，model=%s，来源=%s，样本=%s）"
+            % (job_id, len(chunks), model, source, ref_audio or ("voice:" + voice)))
         return job
 
     # ---------- 取消 ----------
@@ -978,6 +1281,10 @@ class Handler(BaseHTTPRequestHandler):
                 "upstream": ARGS.upstream,
             })
 
+        # ---------- /voice/sources（v1.5.0：面板"各来源"页）----------
+        if path == "/voice/sources":
+            return self._voice_sources()
+
         # ---------- /jobs/*（v1.3.0）----------
         # 统一用 X-TtsVoice-Token 鉴权（与 /voice 同一把 token）
         if path == "/jobs":
@@ -1060,6 +1367,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = self.path.split("?", 1)[0].rstrip("/")
 
+        if path.startswith("/voice/sources/"):
+            return self._voice_source_delete(path)
+
         if path.startswith("/jobs/"):
             return self._jobs_delete(path)
 
@@ -1087,6 +1397,8 @@ class Handler(BaseHTTPRequestHandler):
             "attempts": job.get("attempts") or [],
             "error": job.get("error") or "",
             "model": job.get("model", ""),
+            # v1.5.0：来源标识随任务一起回传，网站与面板都据此判断用的是哪份音色
+            "source": job.get("source") or DEFAULT_SOURCE,
             "created": job.get("created", 0),
             "updated": job.get("updated", 0),
             "cold": bool(job.get("cold")),
@@ -1241,46 +1553,223 @@ class Handler(BaseHTTPRequestHandler):
         if not data:
             return self._fail(400, "请求体为空")
 
+        # v1.5.0：来源隔离。name 只用于回显（用户传的原始文件名），
+        # 落盘文件名固定是 ref.wav，来源决定落在哪个子目录。
         name = safe_name(self.headers.get("X-TtsVoice-Name"))
-        target = os.path.join(ARGS.dir, name)
+        source = sanitize_source(self.headers.get("X-TtsVoice-Source"))
+        out_dir = source_dir(source)
+        target = os.path.join(out_dir, REF_FILENAME)
+
+        head = data[:16]
+        sniffed = sniff_audio(head)
+
+        if not sniffed:
+            return self._fail(400, "这个文件不像音频（开头不是 wav/mp3/m4a/flac/ogg 等已知格式）。"
+                                   "请上传真正的音频文件，不要改扩展名来糊弄 —— "
+                                   "上游按扩展名选解码器，改名的假 wav 会让合成返回空音频。")
 
         try:
-            os.makedirs(ARGS.dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
         except OSError as exc:
             log("创建目录失败：%s" % exc)
             return self._fail(500, "创建目录失败：%s" % exc)
 
-        # 先写临时文件再原子替换：避免被读到半个文件
-        tmp = target + ".part"
+        # 原始字节先落到目标目录里的临时文件（同一文件系统，后面 os.replace 才是原子的）
+        raw = os.path.join(out_dir, ".upload-%d.%s" % (os.getpid(), sniffed or "bin"))
+        part = target + ".part"
 
         try:
-            with open(tmp, "wb") as fh:
+            with open(raw, "wb") as fh:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
-
-            os.replace(tmp, target)
         except OSError as exc:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-
-            log("写入失败：%s" % exc)
+            log("写入上传临时文件失败：%s" % exc)
             return self._fail(500, "写入失败：%s" % exc)
 
-        digest = hashlib.sha256(data).hexdigest()
+        try:
+            info, perr = probe_audio(raw)
+            if not info:
+                return self._fail(400, perr)
 
-        log("已接收 %s（%d 字节，sha256 %s…）" % (name, len(data), digest[:12]))
+            # 归一化：真正的判据在这一步 —— ffmpeg 解得开才叫音频
+            norm, nerr = normalize_voice(raw, part)
+            if not norm:
+                return self._fail(400, nerr)
 
-        return self._json(200, {
+            duration = float(norm.get("duration") or 0.0)
+            # 「是否截断」要看**原始**时长：归一化之后的时长恒为 ≤12s，
+            # 拿它判会把每个超长样本都判成没截断（第一版就是这么错的）。
+            truncated = float(info.get("duration") or 0.0) > MAX_VOICE_SECONDS + 0.05
+
+            if duration < MIN_VOICE_SECONDS:
+                return self._fail(400, "参考音频太短（%.1f 秒，至少要 %.1f 秒）："
+                                       "太短的样本克隆出来的音色不像本人。"
+                                       % (duration, MIN_VOICE_SECONDS))
+
+            os.replace(part, target)
+        except OSError as exc:
+            log("写入失败：%s" % exc)
+            return self._fail(500, "写入失败：%s" % exc)
+        finally:
+            for p in (raw, part):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+
+        with open(target, "rb") as fh:
+            norm_bytes = fh.read()
+
+        digest = hashlib.sha256(norm_bytes).hexdigest()
+        warning = ""
+        if duration < WARN_VOICE_SECONDS:
+            warning = ("样本只有 %.1f 秒，偏短（建议 %.0f 秒以上），克隆音色可能不太像本人。"
+                       % (duration, WARN_VOICE_SECONDS))
+        if truncated:
+            warning = ((warning + " ") if warning else "") + \
+                "原音频超过 %.0f 秒，已截断到 %.0f 秒。" % (MAX_VOICE_SECONDS, MAX_VOICE_SECONDS)
+
+        log("已接收来源 %s 的音色样本 %s→%s（%d 字节原始 %s，归一化后 %.1fs / %dHz / %dch，sha256 %s…）"
+            % (source, name, target, len(data), sniffed or "?",
+               duration, NORM_RATE, NORM_CHANNELS, digest[:12]))
+
+        resp = {
             "ok": True,
             "path": os.path.abspath(target),
             "name": name,
-            "size": len(data),
+            "source": source,
+            "format": "wav",
+            "duration": round(duration, 3),
+            "size": len(norm_bytes),
             "sha256": digest,
-        })
+        }
+        if warning:
+            resp["warning"] = warning
+        if truncated:
+            resp["truncated"] = True
+
+        return self._json(200, resp)
+
+    # ---------- ①b 各来源列表 / 删除（v1.5.0，面板"各来源"用）----------
+
+    def _voice_sources(self):
+        """
+        列出 <dir>/<source>/ref.wav 各来源。
+
+        v1.4.0 留在根目录的 ref.wav 也列出来（source=default、legacy=true），
+        但它**只是残留**：v1.5.0 不再读它（解析只认 <dir>/<source>/ref.wav）。
+        列出来是为了"磁盘上还有什么"看得见、并且能在面板里删掉 ——
+        藏起来会让用户以为那份坏文件已经没了。
+
+        last_used 从作业记录里反查：**样本的使用时间**才是用户关心的
+        （mtime 只是上传时间），而 job 里存了 source。
+        """
+        if not self._token_ok():
+            return self._fail(403, "密钥不匹配")
+
+        last_used = {}
+
+        try:
+            entries = sorted(os.listdir(ARGS.jobs_dir))
+        except OSError:
+            entries = []
+
+        for entry in entries:
+            if not entry.endswith(".json"):
+                continue
+
+            try:
+                with open(os.path.join(ARGS.jobs_dir, entry), "r", encoding="utf-8") as fh:
+                    job = json.load(fh)
+            except (OSError, ValueError):
+                continue
+
+            src = sanitize_source(job.get("source"))
+            when = int(job.get("created") or job.get("updated") or 0)
+
+            if when > last_used.get(src, 0):
+                last_used[src] = when
+
+        items = []
+
+        def add(src, path, legacy=False):
+            try:
+                st = os.stat(path)
+            except OSError:
+                return
+
+            info = wav_info(path) or {}
+            digest = ""
+            try:
+                with open(path, "rb") as fh:
+                    digest = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                pass
+
+            items.append({
+                "source": src,
+                "path": path,
+                "size": st.st_size,
+                "duration": round(float(info.get("duration") or 0.0), 3),
+                "sha256": digest,
+                "modified": int(st.st_mtime),
+                "last_used": int(last_used.get(src, 0)),
+                "legacy": bool(legacy),
+            })
+
+        try:
+            subs = sorted(os.listdir(ARGS.dir))
+        except OSError:
+            subs = []
+
+        for sub in subs:
+            if sub.startswith("."):
+                continue
+            path = os.path.join(ARGS.dir, sub, REF_FILENAME)
+            if os.path.isfile(path):
+                add(sub, path)
+
+        legacy = legacy_ref_path()
+        if os.path.isfile(legacy):
+            # v1.4.0 的残留文件：列出来（能在面板里删掉），但**不参与解析** ——
+            # 它和 <dir>/default/ref.wav 可能同时存在，那时的两行是两份不同的文件。
+            add(DEFAULT_SOURCE, legacy, legacy=True)
+
+        items.sort(key=lambda i: (i["source"], i["legacy"]))
+        return self._json(200, {"ok": True, "dir": os.path.abspath(ARGS.dir),
+                                "sources": items})
+
+    def _voice_source_delete(self, path):
+        """DELETE /voice/sources/{source}：删掉该来源目录（幂等）。"""
+        if not self._token_ok():
+            return self._fail(403, "密钥不匹配")
+
+        raw = path[len("/voice/sources/"):]
+        source = sanitize_source(unquote(raw))
+        target = source_dir(source)
+        removed = []
+
+        # 只删自己拼出来的绝对路径，且必须是 ARGS.dir 的直接子目录 ——
+        # 双保险：sanitize_source 已去掉路径语义字符，这里再确认一次前缀。
+        if os.path.isdir(target) and os.path.dirname(target) == os.path.abspath(ARGS.dir):
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(target)
+
+        if source == DEFAULT_SOURCE:
+            legacy = legacy_ref_path()
+            if os.path.isfile(legacy):
+                try:
+                    os.remove(legacy)
+                    removed.append(legacy)
+                except OSError as exc:
+                    return self._fail(500, "删除失败：%s" % exc)
+
+        if removed:
+            log("已删除来源 %s 的音色样本：%s" % (source, "、".join(removed)))
+
+        return self._json(200, {"ok": True, "source": source, "removed": removed})
 
     # ---------- ② 转发到 Qwen 服务 ----------
 

@@ -197,6 +197,35 @@ export const api = {
   // 更换音色接收端共享密钥。token 留空 = 让面板生成一个新的随机密钥。
   changeReceiverToken: (token) => request('POST', `${API_BASE}/voice/receiver/token`, { token: token || '' }),
 
+  // ---- 音色来源（receiver v1.5.0）----
+  // 每个网站一份自己的参考音频，避免多站点互相覆盖（这正是"合成返回 0 字节"的根因之一）。
+  voiceSources: () => request('GET', `${API_BASE}/voice/receiver/sources`),
+  deleteVoiceSource: (source) =>
+    request('DELETE', `${API_BASE}/voice/receiver/sources?source=${encodeURIComponent(source)}`),
+  // 上传必须走 multipart（文件 + 来源），request() 会把 body 当 JSON 编码，所以单独实现。
+  uploadVoiceSource: async (source, file) => {
+    const fd = new FormData();
+    fd.append('source', source);
+    fd.append('file', file);
+    const headers = { Accept: 'application/json' };
+    const csrf = readCookie('zp_csrf');
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    let res;
+    try {
+      res = await fetch(apiURL('voice/receiver/sources'), {
+        method: 'POST', headers, body: fd, credentials: 'same-origin',
+      });
+    } catch {
+      throw new ApiError('无法连接面板服务，请检查网络或面板是否在运行', 0);
+    }
+    const text = await res.text();
+    let data = null;
+    if (text) { try { data = JSON.parse(text); } catch { /* 非 JSON */ } }
+    if (!res.ok) throw new ApiError((data && data.msg) || `${res.status} ${res.statusText}`, res.status);
+    if (data && data.ok === false) throw new ApiError(data.msg || '上传失败', res.status);
+    return data ? data.data : null;
+  },
+
   // Qwen3 TTS 的模型状态。
   // 2026-09-14 起只有一个模型（1.7B-Base-8bit，音色克隆）：网站侧预置音色下线。
   // switch 现在等于"加载到内存"，unload 是"释放内存"（下次请求会自动重新加载）。

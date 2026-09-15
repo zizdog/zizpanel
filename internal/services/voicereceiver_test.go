@@ -120,3 +120,77 @@ func TestQwenWarmPolicyIsSingleModel(t *testing.T) {
 		t.Errorf("清单里唯一的模型必须就是默认模型，实际 %s", QwenModels[0].Name)
 	}
 }
+
+// TestSanitizeVoiceSource 锁住"来源标识会变成目录名"这件事。
+//
+// 它与 receiver.py 的 sanitize_source() 是**同一套规则的两份实现**
+// （面板用它拼删除请求的路径，接收端用它拼目录名）。规则一旦分叉，
+// 会出现"面板删 A、接收端理解成 B"，所以这里逐条对齐 Python 侧的用例：
+// tools/test-voice-jobs-unit.py 里的 sanitize_source 断言必须是同一组期望。
+func TestSanitizeVoiceSource(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"zizdog-cn", "zizdog-cn"},
+		{"site_a", "site_a"},
+		{"../../etc/passwd", "etc-passwd"}, // 路径语义字符被换成连字符
+		{"", "default"},                    // 空 → default
+		{"///", "default"},                 // 纯符号 → default
+		{"a.wav", "a-wav"},                 // 刻意不复用 safe_name：点号不保留
+		{"我的站", "default"},                 // 纯非 ASCII → default
+		{"站点-a", "a"},                      // 非 ASCII 段被削掉，保留 ASCII 段
+	}
+	for _, c := range cases {
+		if got := SanitizeVoiceSource(c.in); got != c.want {
+			t.Errorf("SanitizeVoiceSource(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+
+	long := strings.Repeat("x", 200)
+	if got := SanitizeVoiceSource(long); len(got) != 64 {
+		t.Errorf("来源标识要截到 64 字符，实际 %d", len(got))
+	}
+}
+
+// TestExistingReceiverTokenAcceptsCustomToken 锁住"自定义密钥也要能读回来"。
+//
+// 曾经的实现要求密钥以 ttsv- 开头（那是面板自动生成的格式）。用户自定义的
+// 密钥读回来会变成空串：换密钥时会"又生成一个"（网站立刻失联），
+// 音色来源管理也无法通过接收端鉴权 —— 两种症状都不指向真正的原因。
+func TestExistingReceiverTokenAcceptsCustomToken(t *testing.T) {
+	dir := t.TempDir()
+	plist := dir + "/com.zizdog.voicereceiver.plist"
+
+	write := func(body string) {
+		if err := os.WriteFile(plist, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Manager{}
+
+	custom := `<array>
+	<string>--token</string>
+	<string>my-custom-key-123</string>
+	<string>--host</string>
+	<string>127.0.0.1</string>
+</array>`
+	write(custom)
+	if got := m.existingReceiverToken(receiverPaths{Plist: plist}); got != "my-custom-key-123" {
+		t.Errorf("自定义密钥应原样读回，实际 %q", got)
+	}
+
+	write(`<array>
+	<string>--token</string>
+	<string>ttsv-abc123</string>
+</array>`)
+	if got := m.existingReceiverToken(receiverPaths{Plist: plist}); got != "ttsv-abc123" {
+		t.Errorf("面板生成的密钥仍要能读回，实际 %q", got)
+	}
+
+	// 未启用鉴权（空密钥）时不能返回一个"看起来像密钥"的东西
+	write(`<array>
+	<string>--token</string>
+	<string></string>
+</array>`)
+	if got := m.existingReceiverToken(receiverPaths{Plist: plist}); got != "" {
+		t.Errorf("空密钥应返回空串，实际 %q", got)
+	}
+}
