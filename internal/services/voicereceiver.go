@@ -3,7 +3,9 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +45,34 @@ import (
 
 //go:embed voice-receiver.py
 var voiceReceiverPy []byte
+
+// 内置默认音色（v1.7.1）。
+//
+// 为什么要有它：以前"没上传过音色就用不了"—— 每个新站点、每台新装的机器都得先
+// 自己录一段，否则合成直接被拒。现在装完接收端就自带一份可用的默认音色，
+// 没指定音色的调用方（插件、curl、别的程序）直接就能用。
+//
+// 合规：这份样本由用户提供（"龙安灵心"，7.68 秒，24kHz/单声道/16bit PCM），
+// 已确认可用于本项目；ref.txt 是它实际念的那句话，克隆时给对参考文字更稳。
+//
+//go:embed assets/default-voice.wav
+var defaultVoiceWav []byte
+
+// defaultVoiceRefText 是内置音色的参考文字（音频里念的那句话，逐字）。
+const defaultVoiceRefText = "今天过得怎么样，不管发生了什么，开心的还是难受的，都跟我说说吧，我一直都在这里陪着你呢呢。"
+
+// defaultVoiceSource 是内置音色所在的来源标识：调用方不指定音色时就走它。
+const defaultVoiceSource = "default"
+
+// builtinVoiceMarker 记录"这个 default 样本是我们自己放的"，用于升级时更新它
+// 而**不覆盖用户自己上传的 default 样本**。
+const builtinVoiceMarker = "builtin-voice.json"
+
+// 与 receiver.py 的文件名约定逐字对齐（两边不一致就会出现"面板写了、接收端没读"）
+const (
+	REF_FILENAME      = "ref.wav"
+	REF_TEXT_FILENAME = "ref.txt"
+)
 
 const (
 	receiverLabel = "com.zizdog.voicereceiver"
@@ -478,6 +508,13 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	}
 	_ = chownTree(m.opt.UserName, p.Dir)
 
+	// ---- 1b. 内置默认音色 ----
+	// 装完就有可用音色：全新机器不必先录一段（没指定音色的调用直接用 default）。
+	if err := m.provisionDefaultVoice(ctx, result, p); err != nil {
+		return err
+	}
+	_ = chownTree(m.opt.UserName, p.Samples)
+
 	// ---- 2. 密钥表 ----
 	// v1.6.0：密钥与额度由 keys.json 管理（接收端热加载）。这里做两件事：
 	//   a) 表还不存在 → 用现有 plist 的 --token 建一条 default（迁移，网站不中断）
@@ -619,6 +656,109 @@ func (m *Manager) verifyReceiverKey(ctx context.Context, key string) (bool, stri
 		return false, "错误密钥也能访问，鉴权没有真正生效"
 	}
 	return true, ""
+}
+
+// ============================================================================
+//  内置默认音色（v1.7.1）
+//
+//  目标：全新安装面板 → 在面板里装接收端 → **不配置任何音色**也能直接合成。
+//  做法：安装/重新部署接收端时，把内置样本写到 <样本目录>/default/ref.wav，
+//  并把它的参考文字写成 ref.txt（接收端在调用方没给 ref_text 时读它）。
+//
+//  不覆盖用户的东西：只有当 default 样本不存在、或者存在且**是我们自己放的**
+//  （有 builtin-voice.json 标记且 sha 对得上）时才写。用户自己上传过 default
+//  样本的机器，升级时不会被悄悄换掉。
+// ============================================================================
+
+// builtinVoiceInfo 是标记文件的内容。
+type builtinVoiceInfo struct {
+	Source  string `json:"source"`
+	SHA256  string `json:"sha256"`
+	Size    int    `json:"size"`
+	RefText string `json:"ref_text"`
+	Updated int64  `json:"updated"`
+}
+
+// builtinVoiceSHA 返回内置样本的 sha256（十六进制）。
+func builtinVoiceSHA() string {
+	sum := sha256.Sum256(defaultVoiceWav)
+	return hex.EncodeToString(sum[:])
+}
+
+// provisionDefaultVoice 保证 <样本目录>/default/ref.wav 可用。
+//
+// 返回一段给用户看的说明（会进任务日志）。
+func (m *Manager) provisionDefaultVoice(ctx context.Context, result *InstallResult, p receiverPaths) error {
+	dir := filepath.Join(p.Samples, defaultVoiceSource)
+	target := filepath.Join(dir, REF_FILENAME)
+	refTextPath := filepath.Join(dir, REF_TEXT_FILENAME)
+	markerPath := filepath.Join(dir, builtinVoiceMarker)
+
+	wantSHA := builtinVoiceSHA()
+
+	// 已有样本：是我们放的才更新，用户自己传的一律不碰
+	if _, err := os.Stat(target); err == nil {
+		var info builtinVoiceInfo
+		marked := false
+		if b, rerr := os.ReadFile(markerPath); rerr == nil {
+			if json.Unmarshal(b, &info) == nil && info.Source == defaultVoiceSource {
+				marked = true
+			}
+		}
+		if !marked {
+			result.step(ctx, "保留了你自己上传的 default 音色样本（内置默认音色不会覆盖它）")
+			return nil
+		}
+		if info.SHA256 == wantSHA {
+			result.step(ctx, "内置默认音色已是最新（default/ref.wav）")
+			return nil
+		}
+		result.step(ctx, "内置默认音色已更新（替换掉旧的内置样本）")
+	} else {
+		result.step(ctx, "写入内置默认音色（default/ref.wav），没指定音色的调用可以直接用")
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建默认音色目录失败: %w", err)
+	}
+	// 原子写：先 .part 再 rename，避免被读到半个文件
+	tmp := target + ".part"
+	if err := os.WriteFile(tmp, defaultVoiceWav, 0o644); err != nil {
+		return fmt.Errorf("写入内置音色失败: %w", err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return fmt.Errorf("安装内置音色失败: %w", err)
+	}
+	// 参考文字：接收端在调用方没给 ref_text 时读它
+	if err := os.WriteFile(refTextPath, []byte(defaultVoiceRefText+"\n"), 0o644); err != nil {
+		return fmt.Errorf("写入内置音色参考文字失败: %w", err)
+	}
+	info := builtinVoiceInfo{
+		Source:  defaultVoiceSource,
+		SHA256:  wantSHA,
+		Size:    len(defaultVoiceWav),
+		RefText: defaultVoiceRefText,
+		Updated: time.Now().Unix(),
+	}
+	body, _ := json.MarshalIndent(info, "", "  ")
+	if err := os.WriteFile(markerPath, body, 0o644); err != nil {
+		return fmt.Errorf("写入内置音色标记失败: %w", err)
+	}
+	if m.opt.UserName != "" {
+		if err := chownTree(m.opt.UserName, filepath.Join(p.Samples, defaultVoiceSource)); err != nil {
+			return fmt.Errorf("设置默认音色归属失败: %w", err)
+		}
+	}
+	// 验证真的落盘且可读（不看退出码看文件）
+	got, err := os.ReadFile(target)
+	if err != nil || len(got) != len(defaultVoiceWav) {
+		return fmt.Errorf("内置音色写入后校验失败（读到 %d 字节，期望 %d）", len(got), len(defaultVoiceWav))
+	}
+	sum := sha256.Sum256(got)
+	if hex.EncodeToString(sum[:]) != wantSHA {
+		return fmt.Errorf("内置音色写入后 sha256 不一致")
+	}
+	return nil
 }
 
 // applyReceiverPlist 写 plist 并（重新）装载守护进程。
@@ -786,8 +926,13 @@ func (m *Manager) existingReceiverToken(p receiverPaths) string {
 
 // VoiceSource 是一条来源记录（对应接收端 /voice/sources 的一项）。
 type VoiceSource struct {
-	Source   string  `json:"source"`
-	Path     string  `json:"path"`
+	Source string `json:"source"`
+	Path   string `json:"path"`
+	// HasRefText/RefText：该来源目录里有没有 ref.txt（内置默认音色带一份）
+	HasRefText bool   `json:"has_ref_text"`
+	RefText    string `json:"ref_text"`
+	// Builtin：这是面板内置的默认音色（安装接收端时写进去的）
+	Builtin  bool    `json:"builtin"`
 	Size     int64   `json:"size"`
 	Duration float64 `json:"duration"`
 	SHA256   string  `json:"sha256"`
@@ -1100,6 +1245,17 @@ func (m *Manager) VoiceSources(ctx context.Context) ([]VoiceSource, error) {
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("接收端响应无法解析：%v", err)
+	}
+	// 标注哪一条是面板内置的默认音色（安装接收端时写的，带 builtin-voice.json 标记）
+	marker := filepath.Join(m.receiverPaths().Samples, defaultVoiceSource, builtinVoiceMarker)
+	if _, err := os.Stat(marker); err == nil {
+		for i := range doc.Sources {
+			// 只标**内置的那一份**：v1.4.0 残留的根目录 ref.wav 也记在 default
+			// 名下（legacy=true），它跟内置音色是两回事，不能也标成"内置"。
+			if doc.Sources[i].Source == defaultVoiceSource && !doc.Sources[i].Legacy {
+				doc.Sources[i].Builtin = true
+			}
+		}
 	}
 	return doc.Sources, nil
 }

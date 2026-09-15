@@ -880,6 +880,15 @@ export function ServicesView(content, ctx = {}) {
       const rows = list.map((s) => h('tr', [
         h('td', [
           h('strong', { text: s.source }),
+          s.builtin
+            ? h('span.sub', {
+                title: '面板自带的默认音色：没指定音色的调用（插件、脚本、其它程序）会用它',
+                text: '  （内置默认音色' + (s.has_ref_text ? '，含参考文字' : '') + '）',
+              })
+            : null,
+          (!s.builtin && s.has_ref_text)
+            ? h('span.sub', { text: '  （含参考文字）' })
+            : null,
           s.legacy
             ? h('span.sub', { text: '  （v1.4.0 残留，已不再使用，可删除）' })
             : null,

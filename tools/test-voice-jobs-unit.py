@@ -500,6 +500,23 @@ def main():
     c.ok("清零已落盘（重启后不会复活）", u4.chars("k-q") == 0 and u4.chars("k-other") == 0,
          (u4.chars("k-q"), u4.chars("k-other")))
 
+    print("\n【v1.7.1 ref.txt：调用方没给参考文字就用来源目录里的】")
+    wdir = os.path.join(samples, "withtext")
+    os.makedirs(wdir, exist_ok=True)
+    with open(os.path.join(wdir, "ref.wav"), "wb") as fh:
+        fh.write(b"RIFF")
+    with open(os.path.join(wdir, "ref.txt"), "w", encoding="utf-8") as fh:
+        fh.write("  这是参考文字。\n")      # 前后空白要去掉
+    j_txt = submit({"model": "m", "source": "withtext", "chunks": base["chunks"]})
+    c.ok("没给 ref_text → 用 ref.txt（并去掉首尾空白）",
+         j_txt.get("ref_text") == "这是参考文字。", j_txt.get("ref_text"))
+    j_exp = submit({"model": "m", "source": "withtext", "ref_text": "显式给的",
+                    "chunks": base["chunks"]})
+    c.ok("显式 ref_text 优先于 ref.txt", j_exp.get("ref_text") == "显式给的", j_exp.get("ref_text"))
+    j_none = submit({"model": "m", "source": "site-a", "chunks": base["chunks"]})
+    c.ok("该来源没有 ref.txt → ref_text 为空（不发这个字段）",
+         j_none.get("ref_text") == "", j_none.get("ref_text"))
+
     print("\n【v1.6.0 按天明细只留最近 60 天】")
     u3 = m.UsageStore(os.path.join(kdir, "usage-prune.json"))
     old_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 400 * 86400))

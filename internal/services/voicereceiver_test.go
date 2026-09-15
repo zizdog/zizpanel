@@ -1,6 +1,10 @@
 package services
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,3 +386,132 @@ func TestVoiceKeyIDValidation(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// ---------------------------------------------------------------------------
+//  v1.7.1 内置默认音色
+// ---------------------------------------------------------------------------
+
+func TestBuiltinDefaultVoiceProvisioned(t *testing.T) {
+	m, p := newKeyTestManager(t)
+	var result InstallResult
+	ctx := context.Background()
+
+	if err := m.provisionDefaultVoice(ctx, &result, p); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(p.Samples, defaultVoiceSource, REF_FILENAME)
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("应写入 default 音色：%v", err)
+	}
+	if len(got) != len(defaultVoiceWav) {
+		t.Errorf("写入的字节数不对：%d != %d", len(got), len(defaultVoiceWav))
+	}
+	sum := sha256.Sum256(got)
+	if hex.EncodeToString(sum[:]) != builtinVoiceSHA() {
+		t.Error("写入的音色与内嵌样本 sha256 不一致")
+	}
+	// 参考文字（接收端读它）
+	txt, err := os.ReadFile(filepath.Join(p.Samples, defaultVoiceSource, REF_TEXT_FILENAME))
+	if err != nil {
+		t.Fatalf("应写入 ref.txt：%v", err)
+	}
+	if strings.TrimSpace(string(txt)) != defaultVoiceRefText {
+		t.Errorf("ref.txt 内容不对：%q", strings.TrimSpace(string(txt)))
+	}
+	// 参考文字必须与音频对得上（用户给的那句话，逐字）
+	if !strings.Contains(defaultVoiceRefText, "我一直都在这里陪着你") {
+		t.Error("内置参考文字被改坏了")
+	}
+	// 幂等
+	var again InstallResult
+	if err := m.provisionDefaultVoice(ctx, &again, p); err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := os.ReadFile(target)
+	if string(got2) != string(got) {
+		t.Error("重复部署不该改动内容")
+	}
+}
+
+func TestBuiltinDefaultVoiceDoesNotClobberUserSample(t *testing.T) {
+	m, p := newKeyTestManager(t)
+	ctx := context.Background()
+
+	// 用户自己上传过 default 样本：没有我们的标记
+	dir := filepath.Join(p.Samples, defaultVoiceSource)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mine := []byte("用户自己的样本，不是内置的")
+	target := filepath.Join(dir, REF_FILENAME)
+	if err := os.WriteFile(target, mine, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var result InstallResult
+	if err := m.provisionDefaultVoice(ctx, &result, p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != string(mine) {
+		t.Error("用户自己上传的 default 样本被内置音色覆盖了 —— 这是最不能犯的错")
+	}
+	if !strings.Contains(strings.Join(result.Steps, " "), "保留") {
+		t.Errorf("应当明确告知保留了用户的样本，实际步骤：%v", result.Steps)
+	}
+}
+
+func TestBuiltinDefaultVoiceUpdatesWhenBuiltinChanges(t *testing.T) {
+	m, p := newKeyTestManager(t)
+	ctx := context.Background()
+
+	// 模拟"上一版内置音色"：有标记但 sha 不同
+	dir := filepath.Join(p.Samples, defaultVoiceSource)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, REF_FILENAME)
+	if err := os.WriteFile(target, []byte("旧的内置样本"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := builtinVoiceInfo{Source: defaultVoiceSource, SHA256: "deadbeef", Size: 1,
+		RefText: "旧的参考文字", Updated: 1}
+	b, _ := json.Marshal(old)
+	if err := os.WriteFile(filepath.Join(dir, builtinVoiceMarker), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var result InstallResult
+	if err := m.provisionDefaultVoice(ctx, &result, p); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(target)
+	sum := sha256.Sum256(got)
+	if hex.EncodeToString(sum[:]) != builtinVoiceSHA() {
+		t.Error("内置音色升级后应被替换成新版本")
+	}
+}
+
+func TestBuiltinVoiceAssetIsUsableWav(t *testing.T) {
+	// 内置样本必须是接收端直接能用的格式：WAV / 24kHz / 单声道 / 16bit。
+	// 不是的话安装时得转码，而接收端所在的机器不一定有 ffmpeg。
+	if len(defaultVoiceWav) < 44 || string(defaultVoiceWav[0:4]) != "RIFF" ||
+		string(defaultVoiceWav[8:12]) != "WAVE" {
+		t.Fatal("内置音色不是合法的 WAV")
+	}
+	if string(defaultVoiceWav[12:16]) != "fmt " {
+		t.Fatal("内置音色缺少 fmt 块")
+	}
+	channels := int(defaultVoiceWav[22]) | int(defaultVoiceWav[23])<<8
+	rate := int(defaultVoiceWav[24]) | int(defaultVoiceWav[25])<<8 |
+		int(defaultVoiceWav[26])<<16 | int(defaultVoiceWav[27])<<24
+	bits := int(defaultVoiceWav[34]) | int(defaultVoiceWav[35])<<8
+	if channels != 1 || rate != 24000 || bits != 16 {
+		t.Errorf("内置音色应为 24kHz/单声道/16bit，实际 %dHz/%dch/%dbit", rate, channels, bits)
+	}
+	if len(defaultVoiceWav) < 48000 {
+		t.Error("内置音色太短（不足 1 秒），接收端会拒收")
+	}
+}

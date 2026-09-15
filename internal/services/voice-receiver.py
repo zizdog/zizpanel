@@ -151,7 +151,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 # 只接受这几种扩展名，避免变成任意文件投放点
 ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}
@@ -163,6 +163,7 @@ ALLOWED_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"
 # 必须在接收端就转成真正的 wav，不能靠改名。
 DEFAULT_SOURCE = "default"      # 不带 X-TtsVoice-Source 时的来源标识
 REF_FILENAME = "ref.wav"        # 每个来源目录里的固定文件名
+REF_TEXT_FILENAME = "ref.txt"   # 参考文字（可选，v1.7.1；内置默认音色带一份）
 LEGACY_REF = "ref.wav"          # v1.4.0 及以前的根目录单文件（仍要能读）
 NORM_RATE = 24000               # 归一化采样率：与上游 wav 输出一致
 NORM_CHANNELS = 1
@@ -325,6 +326,27 @@ def source_ref_path(source):
 
 def legacy_ref_path():
     return os.path.join(ARGS.dir, LEGACY_REF)
+
+
+def source_ref_text_path(source):
+    """来源目录里可选的参考文字文件（ref.txt）。"""
+    return os.path.join(source_dir(source), REF_TEXT_FILENAME)
+
+
+def source_ref_text(source):
+    """
+    读该来源的参考文字；没有/读不到返回空串。
+
+    为什么放在来源目录里而不是写死在代码里：内置默认音色要带它的参考文字，
+    而用户自己上传的来源将来也可以带一份（改文件即可，不用改接收端）。
+    """
+    path = source_ref_text_path(source)
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def _first_existing(*paths):
@@ -1295,6 +1317,13 @@ class JobManager:
                     "voice sample not found for source '%s' (looked at %s); "
                     "upload one first" % (source, candidate))
 
+        # 参考文字（v1.7.1）：调用方没给就用来源目录里的 ref.txt。
+        # 内置默认音色带一份 ref.txt（音频实际念的那句话）—— 克隆时给对参考文字
+        # 明显更稳，而"用内置音色"的调用方（比如没上传过音色的网站）不会知道它。
+        ref_text = str(payload.get("ref_text") or "")
+        if not ref_text:
+            ref_text = source_ref_text(source)
+
         chunks_in = payload.get("chunks")
         if not isinstance(chunks_in, list) or not chunks_in:
             raise ValueError("chunks is required")
@@ -1331,7 +1360,7 @@ class JobManager:
             # v1.5.0：来源标识要存进 job —— 面板"各来源"里的"最后使用时间"
             # 就是靠它反查（否则只能看文件 mtime，那是上传时间不是使用时间）
             "source": source,
-            "ref_text": str(payload.get("ref_text") or ""),
+            "ref_text": ref_text,
             "response_format": str(payload.get("response_format") or "mp3") or "mp3",
             # 采样参数随任务下发（v1.4.0）：缺省就是那组默认值，见 DEFAULT_SAMPLING
             "sampling": normalize_sampling(payload.get("sampling")),
@@ -1353,8 +1382,9 @@ class JobManager:
         os.makedirs(self.chunk_dir(job_id), exist_ok=True)
         self.save(job)
         self.wake.set()
-        log("作业已入队 %s（%d 块，model=%s，来源=%s，样本=%s）"
-            % (job_id, len(chunks), model, source, ref_audio or ("voice:" + voice)))
+        log("作业已入队 %s（%d 块，model=%s，来源=%s，样本=%s，参考文字=%d 字）"
+            % (job_id, len(chunks), model, source, ref_audio or ("voice:" + voice),
+               count_chars(ref_text)))
         return job
 
     # ---------- 取消 ----------
@@ -2355,9 +2385,13 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+            ref_text_path = os.path.join(os.path.dirname(path), REF_TEXT_FILENAME)
             items.append({
                 "source": src,
                 "path": path,
+                "has_ref_text": os.path.isfile(ref_text_path),
+                "ref_text": (open(ref_text_path, "r", encoding="utf-8").read().strip()
+                             if os.path.isfile(ref_text_path) else ""),
                 "size": st.st_size,
                 "duration": round(float(info.get("duration") or 0.0), 3),
                 "sha256": digest,
