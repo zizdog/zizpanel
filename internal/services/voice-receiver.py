@@ -500,6 +500,38 @@ def probe_audio(path):
     }, ""
 
 
+
+# ---------------------------------------------------------------- 上游格式兜底 --
+# 为什么必须强制 wav：上游 mlx-audio 在**没带 response_format**（或要 mp3）时，
+# 会走 ffmpeg 编码路径，而没装 ffmpeg 时它返回的是"HTTP 200 + 空 body/异常断连"，
+# 客户端只看到 `IncompleteRead(0 bytes read)` —— 完全推不到"缺 ffmpeg"。
+# 真机实测（抹机后的 mini，无 ffmpeg）：
+#   不带 response_format → IncompleteRead(0 bytes read)
+#   带 response_format=wav → HTTP 200，183KB 合法 wav
+# wav 不需要 ffmpeg，而且是接收端**内部**的中间格式（拼接与最终交付都支持），
+# 所以这里统一兜底成 wav。
+SPEECH_DEFAULT_FORMAT = "wav"
+
+
+def force_wav_format(body):
+    """把 /v1/audio/speech 请求体里的 response_format 兜底成 wav。
+
+    只在**没写**或**明确写了 mp3**时改；写别的（如 flac）说明客户端有明确意图，
+    保持原样让它自己拿到上游的错误。返回 (新body, 是否改过)。
+    """
+    try:
+        req = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return body, False
+    if not isinstance(req, dict):
+        return body, False
+    fmt = str(req.get("response_format") or "").strip().lower()
+    if fmt in ("", "mp3"):
+        req["response_format"] = SPEECH_DEFAULT_FORMAT
+        return json.dumps(req, ensure_ascii=False).encode("utf-8"), True
+    return body, False
+
+
 def normalize_voice(src, dst):
     """
     把任意解码得开的音频归一化成 <=MAX_VOICE_SECONDS / NORM_RATE / 单声道 /
@@ -2475,6 +2507,12 @@ class Handler(BaseHTTPRequestHandler):
         requested_model = ""
         model_state = None
         speech_chars = 0
+
+        # 直连的合成请求：没带 response_format 时兜底成 wav。
+        # 不这么做的话，客户端（网站插件或直接调用者）会遇到"HTTP 200 却读不到 body"，
+        # 而真实原因是上游没装 ffmpeg、编不出 mp3（详见 force_wav_format 的注释）。
+        if self.path.split("?", 1)[0].rstrip("/") == "/v1/audio/speech" and body:
+            body, _forced = force_wav_format(body)
 
         if self.path.split("?", 1)[0].rstrip("/") == "/v1/audio/speech" and body:
             try:

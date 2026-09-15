@@ -208,6 +208,11 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	} else {
 		result.step(ctx, "虚拟环境已存在，跳过创建")
 	}
+	// 2b) 强制 IPv4：这个网络上 IPv6 地址**不可达但会挂住**（不是立刻失败）。
+	if err := m.installIPv4Sitecustomize(ctx, p, result); err != nil {
+		// 不致命：下不动模型时下载步骤会如实报错，而不是在这里假装成功
+		result.step(ctx, "警告：未能写入 IPv4 优先补丁（"+err.Error()+"），下载可能变慢")
+	}
 
 	// ---- 3. 安装 mlx-audio[server] ----
 	// [server] 这个 extra 是最容易漏的一步：不带它只有库、没有 HTTP 服务。
@@ -929,3 +934,64 @@ func (m *Manager) StartQwenKeepWarm(ctx context.Context) {
 		}
 	}
 }
+
+// qwenIPv4Sitecustomize 是写进 venv 的 sitecustomize.py 内容。
+//
+// 为什么需要它（真机实测）：这台网络环境下 hf-mirror.com 会解析出 IPv6 地址，
+// 而那条 IPv6 路径**不可达却也不立刻拒绝** —— python 客户端就一直挂在 connect 上，
+// 最终报 `Error: Local entry not found. [Errno 60] Operation timed out`。
+// 同一个 URL 用 curl 走 IPv4 是 5 MB/s，用强制 IPv4 的 python 一次下全 14 个文件。
+//
+// 为什么写 sitecustomize 而不是设 PYTHONSTARTUP：
+//   - PYTHONSTARTUP 只在**交互式**解释器里生效（实测：`python script.py` 下不执行）；
+//   - sitecustomize 是 site 模块在启动时自动 import 的，对 `hf` CLI 这种
+//     控制台入口脚本**一定生效**，而且 venv 自己的 site-packages 里放一份
+//     只影响这个 venv，不动系统 Python。
+const qwenIPv4Sitecustomize = `"""由 ZizPanel 生成：让这个虚拟环境优先使用 IPv4。
+
+这台机器所处的网络里，某些域名会解析出**不可达但不会立刻拒绝**的 IPv6 地址，
+Python 客户端会一直挂在 connect 上直到超时（症状是
+"Local entry not found ... Operation timed out"）。
+把 getaddrinfo 限制到 AF_INET 可以绕开，实测下载速度与稳定性都正常。
+"""
+
+import socket
+
+_orig = socket.getaddrinfo
+
+
+def _zizpanel_v4(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _zizpanel_v4
+`
+
+// installIPv4Sitecustomize 把 IPv4 优先补丁写进 venv 的 site-packages。
+//
+// 刻意不做成"失败就算了"的静默降级：写不进去时要留下痕迹（调用方会写进任务步骤），
+// 因为它的症状是"下载变慢/超时"，没有痕迹的话下次又得从头排查。
+func (m *Manager) installIPv4Sitecustomize(ctx context.Context, p qwenPaths, result *InstallResult) error {
+	sp := filepath.Join(p.Venv, "lib", "python3.11", "site-packages")
+	if st, err := os.Stat(sp); err != nil || !st.IsDir() {
+		return fmt.Errorf("找不到 %s", sp)
+	}
+	dst := filepath.Join(sp, "sitecustomize.py")
+	// 已经是我们写的那份就不重复写（保持幂等，重装时不会来回改文件）
+	if b, err := os.ReadFile(dst); err == nil && strings.Contains(string(b), "_zizpanel_v4") {
+		return nil
+	}
+	if err := os.WriteFile(dst, []byte(qwenIPv4Sitecustomize), 0o644); err != nil {
+		return err
+	}
+	if m.opt.UserName != "" {
+		_ = chownTree(m.opt.UserName, dst)
+	}
+	if result != nil {
+		result.step(ctx, "已写入 IPv4 优先补丁（绕开不可达的 IPv6 地址）")
+	}
+	return nil
+}
+
+// qwenIPv4SitecustomizeForTest 把补丁内容暴露给测试（仅测试使用）。
+func qwenIPv4SitecustomizeForTest() string { return qwenIPv4Sitecustomize }

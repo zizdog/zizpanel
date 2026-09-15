@@ -207,6 +207,14 @@ RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSI
 NOTES_FILE ?= RELEASE_NOTES.md
 # 自建国内镜像（`make publish-mirror` 用）。面板里的"升级源"也填这个地址。
 MIRROR_BASE_URL ?= https://zizdog.com/zizpanel
+# NAS 镜像（飞牛 fnOS 192.168.1.8）。URL 是给面板"升级源"填的地址。
+NAS_MIRROR_URL ?= http://192.168.1.8:8090/zizpanel
+NAS_HOST       ?= 192.168.1.8
+NAS_USER       ?= zizdog
+# NAS_ROOT 是 NAS 上 zizpanel 镜像目录（容器 /usr/share/nginx/html 的 zizpanel 子目录）
+NAS_ROOT       ?= /vol2/zizpanel-mirror/zizpanel
+# 口令不写进仓库（铁律 7）。发布时用 make publish-nas NAS_PASS='...' 传入。
+NAS_PASS       ?=
 
 .PHONY: upgrade-e2e
 upgrade-e2e: ## 在线升级真实演练（需要本机已安装面板；会真的升级并重启面板）
@@ -301,13 +309,16 @@ release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwi
 	@echo ""
 	@echo "面板「在线升级」需要把 manifest.json 与 manifest.json.sig 一起放到升级源目录。"
 
+.PHONY: host-zizpanel
+host-zizpanel: ## 构建本机版（只用来给清单签名；make release 也会用到它）
+	@go build -trimpath -o $(DIST)/host-zizpanel ./cmd/zizpanel
+
 .PHONY: mirror-manifest
-mirror-manifest: ## 重新生成"指向自建镜像"的清单（发布到国内镜像用；签名后一并上传）
+mirror-manifest: host-zizpanel ## 重新生成"指向自建镜像"的清单（发布到国内镜像用；签名后一并上传）
 	@# 为什么需要单独一步：make release 产出的清单里的 url 指向 GitHub Releases，
 	@# 而国内无代理时 GitHub 直连不通 —— 面板能读到清单却下不动包。
 	@# 这个目标把 url 换成自建镜像，签名不变（同一把发布私钥）。
-	@test -x $(DIST)/host-zizpanel || (echo "先跑 make release（mirror-manifest 需要 host-zizpanel 来签名）"; exit 1)
-	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release"; exit 1)
+	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
 		--base-url "$(MIRROR_BASE_URL)" --notes-file "$(NOTES_FILE)"
 	@set -e; \
@@ -332,6 +343,50 @@ publish-mirror: mirror-manifest ## 生成镜像版清单并打印"上传到国�
 	@echo "并在站点根放指向 latest 的符号链接。例："
 	@echo "  scp $(RELDIR)/manifest.json* $(RELDIR)/zizpanel_*_darwin_*.tar.gz install.sh \\"
 	@echo "      <user>@<host>:<站点根>/zizpanel/"
+
+.PHONY: mirror-nas
+mirror-nas: host-zizpanel ## 生成"指向 NAS 镜像"的清单（url 用 download/<版本>/ 布局）并签名
+	@# 为什么要单独一份：GitHub/线上镜像把包平铺在同一层，而 NAS 镜像按
+	@# download/<版本>/ 分目录。签名覆盖 manifest 原始字节，**事后改 url 会让签名失效**，
+	@# 所以只能在生成时用另一套 url 模板、另签一次。
+	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
+	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
+		--base-url "$(NAS_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
+	@set -e; \
+	if [ -f "$(RELEASE_KEY)" ]; then \
+		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \
+			--in $(RELDIR)/manifest.json --out $(RELDIR)/manifest.json.sig; \
+		echo "==> 已签名（NAS 版清单，版本 $(VERSION)）"; \
+	else \
+		echo "!! 没有 $(RELEASE_KEY)，无法签名"; exit 1; \
+	fi
+	@echo ""
+	@echo "同步到 NAS（本机可直连 192.168.1.8，用 ssh 推送）："
+	@echo "  make publish-nas"
+
+.PHONY: publish-nas
+publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS_PASS，或用 ssh 密钥）
+	@test -n "$(NAS_PASS)" || { echo "需要 NAS 口令：make publish-nas NAS_PASS='...'"; exit 1; }
+	@command -v sshpass >/dev/null 2>&1 || { echo "需要 sshpass（brew install hudochenkov/sshpass/sshpass）"; exit 1; }
+	@echo "==> 上传 install.sh / 清单 / 发布包到 $(NAS_HOST):$(NAS_ROOT)"
+	@sshpass -p '$(NAS_PASS)' rsync -az --no-perms --no-owner --no-group \
+		-e "ssh -o StrictHostKeyChecking=accept-new" \
+		$(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz \
+		$(RELDIR)/zizpanel_$(VERSION)_darwin_amd64.tar.gz \
+		$(RELDIR)/zizpanel_latest_darwin_arm64.tar.gz \
+		$(RELDIR)/zizpanel_latest_darwin_amd64.tar.gz \
+		$(RELDIR)/manifest.json $(RELDIR)/manifest.json.sig install.sh \
+		$(NAS_USER)@$(NAS_HOST):$(NAS_ROOT)/
+	@sshpass -p '$(NAS_PASS)' ssh -o StrictHostKeyChecking=accept-new $(NAS_USER)@$(NAS_HOST) \
+		"set -e; cd $(NAS_ROOT); \
+		 mkdir -p download/$(VERSION) download/latest; \
+		 cp -f zizpanel_$(VERSION)_darwin_arm64.tar.gz zizpanel_$(VERSION)_darwin_amd64.tar.gz download/$(VERSION)/; \
+		 cp -f zizpanel_latest_darwin_arm64.tar.gz zizpanel_latest_darwin_amd64.tar.gz download/latest/; \
+		 ln -sfn download/$(VERSION)/zizpanel_$(VERSION)_darwin_arm64.tar.gz zizpanel_$(VERSION)_darwin_arm64.tar.gz; \
+		 ln -sfn download/$(VERSION)/zizpanel_$(VERSION)_darwin_amd64.tar.gz zizpanel_$(VERSION)_darwin_amd64.tar.gz; \
+		 ls -l download/$(VERSION) | head -4"
+	@echo ""
+	@echo "验证（从这台机器）：curl -sI $(NAS_MIRROR_URL)/manifest.json"
 
 # ---------------------------------------------------------------- 版本号 --
 .PHONY: bump

@@ -43,6 +43,25 @@ def sha256_of(path):
     return h.hexdigest()
 
 
+def asset_url(tpl, version, arch, name):
+    """按模板拼出某个架构的下载地址。
+
+    模板支持三个占位符，**都是可选的**：
+        {version} {arch} {name}
+    不写任何占位符就等价于"基址 + 文件名"（旧行为，保持不变）。
+
+    为什么需要占位符：自建镜像（比如 NAS）把包放在 `download/<版本>/` 下，
+    而 GitHub Release / 现有线上镜像把包平铺在同一层。签名覆盖整个 manifest
+    的原始字节，所以"事后改 url"会让签名失效 —— 只能在**生成时**用不同模板
+    产出两个文件，各签各的。
+    """
+    if not any(k in tpl for k in ("{version}", "{arch}", "{name}")):
+        return f"{tpl.rstrip('/')}/{name}"
+    return (tpl.replace("{version}", version)
+               .replace("{arch}", arch)
+               .replace("{name}", name))
+
+
 def build_manifest(version, rel_dir, base_url, notes=""):
     assets = {}
     for arch in ARCHES:
@@ -51,7 +70,7 @@ def build_manifest(version, rel_dir, base_url, notes=""):
         if not os.path.exists(path):
             raise SystemExit(f"缺少发布包：{path}")
         assets[f"darwin_{arch}"] = {
-            "url": f"{base_url.rstrip('/')}/{name}",
+            "url": asset_url(base_url, version, arch, name),
             "sha256": sha256_of(path),
             "size": os.path.getsize(path),
         }
@@ -69,7 +88,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
     ap.add_argument("--dir", required=True, help="发布包所在目录")
-    ap.add_argument("--base-url", required=True, help="发布包对外可下载的地址前缀")
+    ap.add_argument("--base-url", required=True,
+                    help="发布包地址前缀，或含 {version}/{arch}/{name} 占位符的模板")
     ap.add_argument("--notes-file", default="", help="可选的更新说明文件")
     args = ap.parse_args()
 

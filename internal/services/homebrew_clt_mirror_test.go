@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -538,5 +539,73 @@ func TestBrewSudoGrantIsTemporaryAndSafe(t *testing.T) {
 	// 授权内容必须限定到安装用户，不能写成"所有人 NOPASSWD: ALL"
 	if !strings.Contains(src, `m.opt.UserName + " ALL=(root) NOPASSWD: ALL\n"`) {
 		t.Error("免密授权必须绑定到具体安装用户")
+	}
+}
+
+// TestQwenIPv4PatchIsValidPython 锁住"IPv4 优先补丁"的内容。
+//
+// 真机实测：这个网络里 hf-mirror.com 会解析出**不可达但不会立刻拒绝**的 IPv6
+// 地址，Python 客户端一直挂在 connect 上，最终
+// `Error: Local entry not found. [Errno 60] Operation timed out`；
+// 同一个 URL 用 curl 走 IPv4 是 5 MB/s。改成 IPv4 优先后 14 个文件一次下全。
+//
+// 选 sitecustomize 而不是 PYTHONSTARTUP 的原因也在测试里钉住：
+// PYTHONSTARTUP **只在交互式解释器里生效**（实测 `python script.py` 下不执行），
+// 而 sitecustomize 是 site 模块启动时自动 import 的，对 `hf` 这种入口脚本一定生效。
+func TestQwenIPv4PatchIsValidPython(t *testing.T) {
+	b, err := os.ReadFile("qwentts.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		"qwenIPv4Sitecustomize",
+		`"sitecustomize.py"`,
+		"socket.AF_INET",
+		"m.installIPv4Sitecustomize(ctx, p, result)",
+		"lib\", \"python3.11\", \"site-packages\"",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("qwentts.go 缺少 %q", want)
+		}
+	}
+	// 补丁本身必须是合法 Python（能编译），否则 import 时会静默失败
+	// —— 而 sitecustomize 导入失败只打一句警告，非常容易被忽略。
+	body := qwenIPv4SitecustomizeForTest()
+	if body == "" {
+		t.Fatal("取不到补丁内容")
+	}
+	if !strings.Contains(body, "_zizpanel_v4") {
+		t.Error("补丁里应留下可识别的函数名（幂等判断也依赖它）")
+	}
+	// 真的用 Python 编译一遍：sitecustomize 导入失败只打一句警告，
+	// 很容易被忽略，所以这里必须"能编译"而不是"看起来像 Python"。
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("没有 python3，跳过语法校验")
+	}
+	f := filepath.Join(t.TempDir(), "sitecustomize.py")
+	if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(py, "-m", "py_compile", f).CombinedOutput(); err != nil {
+		t.Errorf("补丁不是合法 Python：%v\n%s", err, out)
+	}
+	// 而且必须真的会把 getaddrinfo 限制到 IPv4（在子进程里验证一次）
+	prog := filepath.Join(t.TempDir(), "check.py")
+	if err := os.WriteFile(prog, []byte(
+		"import socket,sys\n"+
+			"sys.path.insert(0, "+strconv.Quote(filepath.Dir(f))+")\n"+
+			"import sitecustomize\n"+
+			"s=socket.getaddrinfo('localhost',80,socket.AF_INET)\n"+
+			"print('AF_INET' if all(i[0]==socket.AF_INET for i in s) else 'MIXED')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(py, prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("运行补丁失败：%v %s", err, out)
+	}
+	if !strings.Contains(string(out), "AF_INET") {
+		t.Errorf("补丁没有把解析限制到 IPv4：%s", out)
 	}
 }

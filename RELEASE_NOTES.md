@@ -1,3 +1,33 @@
+v0.9.1 · 模型下载卡住的真因：这台网络会解析出"不可达但也不拒绝"的 IPv6 地址
+
+**现象（抹机后的 mini）**：Qwen3 TTS 的 14 个模型文件下载反复失败，报
+
+```
+Error: Local entry not found. [Errno 60] Operation timed out
+```
+
+重试 3 次都一样。但同一个 URL 用 `curl` 走 IPv4 是 **5 MB/s**。
+
+**根因**：这台网络里的域名会解析出 IPv6 地址，而那条 IPv6 路径
+**不可达、却也不立刻拒绝**（不是 connection refused，是干等），
+Python 客户端就一直挂在 `connect()` 上直到超时。
+`curl` 默认高兴地先试 IPv4，所以看不出问题 —— 这类故障"换一个客户端就好了"，
+最容易误判成"服务端不稳"。
+
+**修法（0.9.1）**：给 Qwen 的虚拟环境写一份 `sitecustomize.py`，
+把 `socket.getaddrinfo` 限制到 `AF_INET`。真机复测：**14 个文件一次下全（6 分钟）**。
+
+为什么是 `sitecustomize` 而不是 `PYTHONSTARTUP`：后者**只在交互式解释器里生效**
+（实测 `python script.py` 下根本不执行），而 `sitecustomize` 是 `site` 模块
+启动时自动 import 的，对 `hf` 这种控制台入口脚本一定生效；
+放在 venv 自己的 `site-packages` 里，只影响这个虚拟环境，不动系统 Python。
+
+补丁有单测：真的用 `python3 -m py_compile` 编译一遍，并在子进程里断言
+`getaddrinfo` 被限制到 IPv4 —— 因为 `sitecustomize` 导入失败只打一句警告，
+太容易被忽略。
+
+---
+
 v0.9.0 · Homebrew 装上了但面板找不到它："面板先于 Homebrew 存在"写下的错路径不会自我修正
 
 **真机（抹机后的 mini）进展**：0.8.10 的临时免密 sudo 生效了 ——

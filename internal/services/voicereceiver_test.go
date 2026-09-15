@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -616,5 +617,56 @@ func TestFreshMacNeedsCLTBeforeTTS(t *testing.T) {
 	}
 	if strings.Count(string(b), "m.installCLT(") != 1 {
 		t.Error("installCLT 只应被 EnsureCLT 调用一次，避免两套判定漂移")
+	}
+}
+
+// TestForceWavFormatFallback 锁住"上游没装 ffmpeg 时不能靠 mp3 路径"。
+//
+// 真机（抹机后的 mini）实测：上游 mlx-audio 在**没带 response_format** 时
+// 走 ffmpeg 编码路径，而没装 ffmpeg 时返回"HTTP 200 + 断连"，
+// 客户端只看到 `IncompleteRead(0 bytes read)` —— 完全推不到"缺 ffmpeg"。
+// 同一个请求带上 response_format=wav 就 200 且给出合法 wav（183KB）。
+// 所以接收端必须兜底：没写、或写了 mp3，都改成 wav；
+// 写了其它格式（客户端有明确意图）则保持原样。
+//
+// 这个测试直接跑 receiver.py 里的纯函数（用 python3 子进程），
+// 不启服务、不碰上游。
+func TestForceWavFormatFallback(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("没有 python3")
+	}
+	prog := `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("rec", "voice-receiver.py")
+m = importlib.util.module_from_spec(spec)
+# 只加载模块级定义，不启动服务（文件末尾才有 __main__ 分支）
+spec.loader.exec_module(m)
+cases = [
+    ({"model": "x", "input": "你好"}, "wav"),
+    ({"model": "x", "input": "你好", "response_format": "mp3"}, "wav"),
+    ({"model": "x", "input": "你好", "response_format": "wav"}, "wav"),
+    ({"model": "x", "input": "你好", "response_format": "flac"}, "flac"),
+]
+bad = 0
+for body, want in cases:
+    raw = json.dumps(body).encode()
+    out, changed = m.force_wav_format(raw)
+    got = json.loads(out.decode()).get("response_format")
+    if got != want:
+        print("FAIL want=%s got=%s" % (want, got)); bad += 1
+# 非法 JSON 必须原样返回，不能抛异常把转发路径打断
+raw = b"not-json"
+out, changed = m.force_wav_format(raw)
+if out != raw or changed:
+    print("FAIL 非法 JSON 应当原样返回"); bad += 1
+print("BAD=%d" % bad)
+sys.exit(1 if bad else 0)
+`
+	cmd := exec.Command(py, "-c", prog)
+	cmd.Dir = "."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("force_wav_format 行为不符合预期：%v\n%s", err, out)
 	}
 }
