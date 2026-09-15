@@ -84,6 +84,13 @@ func TestMarketUsesRealBrewLabel(t *testing.T) {
 //
 // 这种"孤儿态"以前既不在服务管理里，也不给纳管按钮（因为 installed=false），
 // 用户什么都点不了。现在要能识别出来，并给出可执行的出口。
+//
+// ⚠️ 2026-09-16 修正：这里**曾经**断言 installed=true（理由："有安装产物就该算
+// 已安装，否则市场显示「安装」，用户会重装一遍已有的东西"）。那条规则正是
+// "卸载后卡片停在已安装、连安装入口都没有"的根因 —— 用户的原话是
+// "卸载完成后连安装的入口都没有，用户怎么重装"。
+// 现在的契约：installed 只认服务记录 / launchd 里的 plist / brew formula，
+// 产物单独用 artifacts 报出来；前端据此显示「残留数据」+「安装」。
 func TestMarketDetectsOrphanInstall(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
@@ -99,8 +106,9 @@ func TestMarketDetectsOrphanInstall(t *testing.T) {
 	}
 
 	it := marketItem(t, ts, cookies, "iopaint")
-	if it["installed"] != true {
-		t.Error("有安装产物就该算已安装（否则市场显示「安装」，用户会重装一遍已有的东西）")
+	if it["installed"] != false {
+		t.Error("只有产物、服务与记录都不在时**不能**算已安装 —— 否则卡片停在「已安装」，" +
+			"用户没有「安装」入口也就无法重装（2026-09-16 用户反馈）")
 	}
 	if it["artifacts"] != true {
 		t.Error("应报告 artifacts=true（前端据此区分「没装」与「装了但服务没注册」）")
@@ -110,5 +118,52 @@ func TestMarketDetectsOrphanInstall(t *testing.T) {
 	}
 	if it["adopted"] != false {
 		t.Error("没登记就不该说已纳管")
+	}
+}
+
+// TestMarketResidualDataOffersReinstall 是 2026-09-16 用户反馈的回归。
+//
+// 场景：在应用市场里卸载了一个面板装的应用，但**没有**勾"同时删除数据/产物"
+// （Lucky 这类会把安装目录留在 ~/lucky），或者用户手动删了服务、目录却还在。
+// 旧代码据此把卡片永久钉在"已安装·服务未注册"上，用户的原话是
+// "卸载完成后连安装的入口都没有，用户怎么重装"。
+//
+// 契约（前端 primaryButton / uninstallButtons 依赖这三条）：
+//  1. installed=false —— 回到可安装态，卡片给「安装」；
+//  2. artifacts=true  —— 如实说磁盘上还有残留，并说明"安装会复用它们"；
+//  3. uninstall.kind=installer 且列出 data_paths —— 前端据此给「删除残留数据」。
+func TestMarketResidualDataOffersReinstall(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+
+	// 复刻 Lucky 卸载（保留数据）之后的磁盘状态：~/lucky/lucky 还在，
+	// 但 /Library/LaunchDaemons/com.zizdog.lucky.plist 与面板记录都不在。
+	exe := filepath.Join(srv.Cfg.UserHome, "lucky", "lucky")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	it := marketItem(t, ts, cookies, "lucky")
+	if it["installed"] != false {
+		t.Error("卸载（保留数据）之后市场必须回到可安装态 —— 否则卡片停在「已安装」，" +
+			"用户没有任何重装入口")
+	}
+	if it["artifacts"] != true {
+		t.Error("残留产物要如实报出来（前端据此显示「残留数据」并说明安装会复用它们）")
+	}
+	if it["service_in_launchd"] != false {
+		t.Errorf("plist 不在时 service_in_launchd 应为 false，实际 %v", it["service_in_launchd"])
+	}
+
+	plan, _ := it["uninstall"].(map[string]any)
+	if got := asString(plan["kind"]); got != "installer" {
+		t.Errorf("残留态仍要给出 installer 卸载计划（前端据此提供「删除残留数据」），实际 %q", got)
+	}
+	if paths, _ := plan["data_paths"].([]any); len(paths) == 0 {
+		t.Error("卸载计划要列出残留数据路径，用户才知道会删什么")
 	}
 }

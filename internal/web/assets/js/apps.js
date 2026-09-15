@@ -352,6 +352,70 @@ export function AppsView(content, ctx = {}) {
     }
   }
 
+  // residualOf 判断"没装、但磁盘上还留着上次卸载保留下来的产物/数据"。
+  //
+  // 为什么必须与"已安装"分开（2026-09-16 用户反馈的原始需求）：
+  // 以前后端把"磁盘上有产物"直接算成已安装，于是卸载（保留数据）之后卡片永远停在
+  // "已安装·服务未注册"：既没有「安装」入口、也没法重装。用户的原话是
+  // "卸载完成后连安装的入口都没有，用户怎么重装"。
+  // 现在后端只把产物报成 artifacts，"已安装"只认服务记录/plist/formula，
+  // 于是这种状态会如实落到下面的「残留数据」+「安装」。
+  function residualOf(a) { return !!a.artifacts && !a.installed; }
+
+  // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
+  // 判定顺序（改之前先读完这段）：
+  //   有任务在跑              → 查看进度（点回任务中心，而不是再点一次）
+  //   残留态（产物还在、没装） → **安装**（安装器幂等，会复用残留产物）
+  //   已纳管                  → 查看服务
+  //   已装且服务在 launchd 里  → 纳管（兜底入口）
+  //   已装但服务没注册        → 重新部署（孤儿态修复：重建 plist 并登记）
+  //   其它                    → 安装
+  function primaryButton(a) {
+    const running = taskCenter.findByTarget(a.id);
+    if (running) {
+      return h('button.btn.btn-sm.btn-primary', {
+        text: '⟳ 查看进度',
+        title: '这个应用有正在进行的任务，点开看实时进度',
+        onclick: () => taskCenter.openTask(running.id),
+      });
+    }
+    if (residualOf(a)) {
+      return h('button.btn.btn-sm.btn-primary', {
+        text: '安装',
+        disabled: !a.available,
+        title: '磁盘上还有上次卸载保留的数据/产物；安装会复用它们，不会重复下载',
+        onclick: () => openInstaller(a),
+      });
+    }
+    if (a.adopted) {
+      return h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } });
+    }
+    if (a.installed && a.service_label && a.service_in_launchd) {
+      // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
+      // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
+      // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
+      return h('button.btn.btn-sm.btn-primary', {
+        text: '纳管',
+        title: '把这个已在运行的服务登记到「服务管理」',
+        onclick: () => adoptApp(a),
+      });
+    }
+    if (a.site_app) return null; // 建站类的入口由 siteInstallButtons 提供
+    if (a.panel_installer && a.artifacts && !a.service_in_launchd) {
+      // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
+      return h('button.btn.btn-sm.btn-primary', {
+        text: '重新部署',
+        title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
+        onclick: () => openInstaller(a),
+      });
+    }
+    return h('button.btn.btn-sm.btn-primary', {
+      text: '安装',
+      disabled: !a.available,
+      onclick: () => openInstaller(a),
+    });
+  }
+
   function appCard(a) {
     return h('div', {
       style: {
@@ -400,6 +464,14 @@ export function AppsView(content, ctx = {}) {
                 title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
               }))
             : null)),
+        // 残留数据：没装、但磁盘上还有上次卸载保留的产物/数据。
+        // 必须与"已安装"分开显示 —— 以前这种状态被判成已安装，卡片停在旧状态、
+        // 连安装入口都没有（2026-09-16 用户反馈）。
+        residualOf(a) ? h('span.pill.warn', {
+          text: '残留数据',
+          title: '这个应用当前没有安装，但磁盘上还有上次卸载保留的产物/数据；' +
+            '点「安装」会复用它们，只想清干净就点「删除残留数据」',
+        }) : null,
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
       ]),
       a.description ? h('div', {
@@ -407,42 +479,7 @@ export function AppsView(content, ctx = {}) {
         text: a.description,
       }) : null,
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
-        // 按钮状态：
-        //   有任务在跑     → 查看进度（点回任务中心的进度窗，而不是再点一次安装）
-        //   已纳管        → 查看服务
-        //   已装但未纳管   → **纳管**（这是兜底入口，之前缺失，用户找不到已装的应用）
-        //   未安装        → 安装
-        taskCenter.findByTarget(a.id)
-          ? h('button.btn.btn-sm.btn-primary', {
-            text: '⟳ 查看进度',
-            title: '这个应用有正在进行的任务，点开看实时进度',
-            onclick: () => taskCenter.openTask(taskCenter.findByTarget(a.id).id),
-          })
-          : (a.adopted
-            ? h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } })
-            : (a.installed && a.service_label && a.service_in_launchd
-              // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
-              // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
-              // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
-              ? h('button.btn.btn-sm.btn-primary', {
-                text: '纳管',
-                title: '把这个已在运行的服务登记到「服务管理」',
-                onclick: () => adoptApp(a),
-              })
-              : (a.site_app
-                ? null // 建站类的入口由 siteInstallButtons 提供
-                : (a.panel_installer && a.artifacts && !a.service_in_launchd
-                // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
-                ? h('button.btn.btn-sm.btn-primary', {
-                  text: '重新部署',
-                  title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
-                  onclick: () => openInstaller(a),
-                })
-                : h('button.btn.btn-sm.btn-primary', {
-                  text: '安装',
-                  disabled: !a.available,
-                  onclick: () => openInstaller(a),
-                }))))),
+        primaryButton(a),
         ...openButtons(a),
         ...siteInstallButtons(a),
         ...uninstallButtons(a),
@@ -587,13 +624,18 @@ export function AppsView(content, ctx = {}) {
 
   function uninstallButtons(a) {
     const plan = a.uninstall || {};
-    if (!a.installed) return [];
+    const residual = residualOf(a);
+    // 残留态也要有删除入口：按新语义它显示为"未安装"，「卸载」按钮就没了，
+    // 那样用户永远清不掉上次卸载保留的产物/数据（2026-09-16 用户反馈）。
+    if (!a.installed && !residual) return [];
     if (plan.kind === 'service' || plan.kind === 'installer') {
       return [h('button.btn.btn-sm.btn-danger', {
-        text: '卸载',
-        title: plan.blocked || '卸载「' + a.name + '」（会列出具体删除内容并要求确认）',
-        disabled: !!plan.blocked,
-        onclick: () => doUninstall(a, plan),
+        text: residual ? '删除残留数据' : '卸载',
+        title: residual
+          ? '这个应用当前没有安装；只删除磁盘上的残留产物/数据'
+          : (plan.blocked || '卸载「' + a.name + '」（会列出具体删除内容并要求确认）'),
+        disabled: !!plan.blocked && !residual,
+        onclick: () => doUninstall(a, plan, residual),
       })];
     }
     if (plan.kind === 'forget') {
@@ -610,32 +652,38 @@ export function AppsView(content, ctx = {}) {
   //
   // 确认框里逐条列出步骤与可选删除的路径 —— 卸载不可逆，
   // 一句"确定卸载吗"是不够的（用户有权知道模型/样本/任务会不会一起没）。
-  async function doUninstall(a, plan) {
+  async function doUninstall(a, plan, residual = false) {
     const remove = h('input', { type: 'checkbox' });
     const lines = (plan.steps || []).map((s) => h('li', { text: s }));
+    const paths = plan.data_paths || [];
     const body = h('div', [
-      h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
-      h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } }, lines),
-      plan.keep_note ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
-      (plan.data_paths || []).length
+      residual
+        ? h('div', {
+          style: { marginBottom: '8px' },
+          text: '「' + a.name + '」当前没有安装（服务和面板记录都不在），这一步只删除磁盘上的残留产物/数据，不可恢复。',
+        })
+        : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
+      residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } }, lines),
+      (residual || !plan.keep_note) ? null : h('div.hint', { text: '会保留：' + plan.keep_note }),
+      (!residual && paths.length)
         ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } }, [
           remove,
           h('span', { text: '同时删除数据/产物（不可恢复）：' }),
         ])
         : null,
-      (plan.data_paths || []).length
+      paths.length
         ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
-          (plan.data_paths || []).map((p) => h('li.mono', { text: p })))
+          paths.map((p) => h('li.mono', { text: p })))
         : null,
     ]);
     const okGo = await new Promise((resolve) => {
       const m = modal({
-        title: '卸载 ' + a.name,
+        title: (residual ? '删除残留数据 · ' : '卸载 ') + a.name,
         body,
         footer: (close) => [
           h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
           h('button.btn.btn-danger', {
-            text: '确认卸载',
+            text: residual ? '删除残留数据' : '确认卸载',
             onclick: () => { close(); resolve(true); },
           }),
         ],
@@ -643,12 +691,27 @@ export function AppsView(content, ctx = {}) {
       });
     });
     if (!okGo) return;
+    // 残留清理的语义就是"删掉产物"，所以直接 remove_data=1，不再让用户勾选。
+    const wipe = residual ? true : remove.checked;
     taskCenter.start({
       kind: 'uninstall',
       target: a.id,
-      title: '卸载 ' + a.name,
-      start: () => api.marketUninstall(a.id, remove.checked),
-      onDone: () => load(),
+      title: (residual ? '删除残留数据 ' : '卸载 ') + a.name,
+      start: () => api.marketUninstall(a.id, wipe),
+      // 结果必须显式说出来：用户反馈过"卸载完没有任何提示，卡片还停在旧状态，
+      // 看起来像什么都没发生"。任务中心的进度窗给过程，这里给结论。
+      onDone: (m) => {
+        if (m && m.status && m.status !== 'succeeded') {
+          toast((residual ? '删除残留数据失败：' : '卸载失败：') + (m.error || m.status), 'err', 12000);
+        } else {
+          toast(
+            residual
+              ? '已删除「' + a.name + '」的残留数据'
+              : '已卸载「' + a.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'),
+            'ok', 9000);
+        }
+        load();
+      },
     });
   }
 

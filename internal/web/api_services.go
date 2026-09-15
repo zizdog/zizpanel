@@ -543,13 +543,17 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if !isInstalled && a.BrewFormula != "" {
 			isInstalled = brewSet[a.BrewFormula]
 		}
-		// 面板自研安装器：磁盘上有产物也算"已安装"（否则孤儿态会显示成"未安装"）
+		// 面板自研安装器：磁盘上有产物**不等于已安装**。
+		//
+		// 2026-09-16 用户反馈：卸载时没勾「同时删除数据/产物」（或手动删了服务、
+		// 目录还在）之后，卡片被"有产物就算已安装"这条判据永久钉在"已安装"上：
+		// 没有「安装」入口、残留数据也清不掉 —— 用户无法重装。
+		// 现在产物只作为**残留数据**如实报给界面（artifacts=true 且 installed=false），
+		// 重装入口交给「安装」：安装器本身是幂等的，会复用残留产物、不会重复下载。
+		// 「已安装」的证据只有三种：面板服务记录、launchd 里的 plist/作业、brew formula。
 		artifacts := false
 		if a.PanelInstaller != "" {
 			artifacts = services.InstallerArtifactExists(s.Cfg.UserHome, a.PanelInstaller)
-			if artifacts {
-				isInstalled = true
-			}
 		}
 		// 服务此刻是否真在 launchd 里（决定能不能"纳管"）
 		serviceInLaunchd := false
