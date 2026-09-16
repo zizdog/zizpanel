@@ -11,8 +11,12 @@
 #    · 部署前 `verify` 比对 —— 指纹一致才跳过，并打印那个标记的时间与版本。
 #  任何改动（改文件、加文件、删文件、切版本号）都会让指纹变化，从而**强制重跑**。
 #
-#  指纹刻意覆盖：git status（增删改）、git diff HEAD（已跟踪文件的改动内容）、
-#  未跟踪文件的内容哈希。不用 `git stash`/`git write-tree`：那会动仓库状态。
+#  指纹取的是**工作树里每个文件的内容哈希**（已跟踪 + 未跟踪，各自带路径），
+#  刻意**不掺 HEAD/diff**：
+#    · 干净树的 `git status`/`git diff` 都是空的 —— 只哈希它们会得到"空输入的哈希"
+#      （e3b0c442…），于是**不同的干净提交会撞成同一个指纹**，标记会跨版本误判；
+#    · 掺 HEAD 又会造成"check 完一提交，标记立刻失效"（内容没变却被判成变了）。
+#  按内容取指纹同时解决这两点：提交前后内容不变 → 指纹不变；改一个字节 → 指纹必变。
 # ============================================================================
 set -euo pipefail
 
@@ -26,13 +30,14 @@ STAMP="$REPO_ROOT/.zp-check-stamp"
 fingerprint() {
   cd "$REPO_ROOT"
   {
-    git status --porcelain=v1 --untracked-files=all
-    git diff HEAD
-    # 未跟踪文件的内容也要算进去（否则"新加了一个文件"不会让指纹变化）
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
+    # 已跟踪文件（含被删除的：跳过不存在的路径，删除本身会改变文件列表）
+    while IFS= read -r -d '' f; do
       [ -f "$f" ] && shasum -a 256 "$f"
-    done < <(git ls-files --others --exclude-standard | LC_ALL=C sort)
+    done < <(git ls-files -z)
+    # 未跟踪文件（排除 .gitignore：标记文件自己必须在这里被排除，否则自指）
+    while IFS= read -r -d '' f; do
+      [ -f "$f" ] && shasum -a 256 "$f"
+    done < <(git ls-files --others --exclude-standard -z | LC_ALL=C sort -z)
   } | shasum -a 256 | awk '{print $1}'
 }
 
