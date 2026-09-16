@@ -298,14 +298,19 @@ func TestUninstallPlanSeesLegacyNativeInstall(t *testing.T) {
 }
 
 // TestUninstallAppRemovesLegacyNativeAndComposeLeftovers 锁住"点一下就能清干净"。
+//
+// 2026-09-16 用户要求把 Lucky / frps / Orbien 服务端从面板移除，但用户机器上
+// 可能已经装了 —— 那种机器必须仍然删得掉，否则就是最坏状态：
+// 界面上没了、磁盘上还在跑、用户无处可点。
+// 用 frps 当样例正是这个场景：它已经不在目录里，只能按 ID 找残留。
 func TestUninstallAppRemovesLegacyNativeAndComposeLeftovers(t *testing.T) {
 	home := t.TempDir()
 	work := t.TempDir()
 	m := &Manager{opt: Options{UserHome: home, UserName: "tester", WorkDir: work}}
 
-	// 一个 compose 应用的目录 + 一份"旧版原生安装"的残留，同时存在
-	composeProj := filepath.Join(work, "compose", "lucky")
-	legacy := filepath.Join(home, "lucky")
+	// 一个已移除条目留下的两种残留：compose 项目目录 + 旧版原生安装目录
+	composeProj := filepath.Join(work, "compose", "frps")
+	legacy := filepath.Join(home, "frps")
 	for _, d := range []string{composeProj, legacy} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -314,12 +319,12 @@ func TestUninstallAppRemovesLegacyNativeAndComposeLeftovers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(composeProj, "docker-compose.yml"), []byte("services:\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(legacy, "lucky"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(legacy, "frps"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := m.UninstallApp(context.Background(), "lucky", true, &InstallResult{Steps: []string{}}); err != nil {
-		t.Fatalf("清理残留失败：%v", err)
+	if err := m.UninstallApp(context.Background(), "frps", true, &InstallResult{Steps: []string{}}); err != nil {
+		t.Fatalf("已移除条目的残留应仍能清理：%v", err)
 	}
 	for _, d := range []string{composeProj, legacy} {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {

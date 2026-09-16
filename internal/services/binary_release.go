@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,18 +22,17 @@ import (
 //  Homebrew formula，或者**官方 darwin-arm64 预编译产物**。后一条路原本不存在，
 //  README「应用市场」第 2 条当时写的是"先走 Docker，等通用安装器做出来再换"。
 //
-//  现在这套安装器服务**五个**条目（见 releaseBinaryApps）：
-//    Lucky（反代/DDNS）、Orbien 服务端与 CLI 客户端、
-//    frps 与 frpc（frp 两端 —— 用户明确要求不碰 Homebrew）。
-//  它们的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
+//  现在这套安装器服务**两个**条目（见 releaseBinaryApps）：
+//    frpc（frp 客户端）与 orbien-client（Orbien CLI 客户端）。
+//  2026-09-16 用户要求**彻底移除**三个条目：Lucky、Orbien 服务端、frps。
+//  它们已从 releaseBinaryApps 与 catalog.go 中删除；不要再加回来。
+//  剩下这两个的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
 //  （理由见 catalog.go 里各条目的注释：Colima 里跑的是 Linux 虚拟机，容器看到的
-//  是虚拟机的网络，不是 Mac 的 —— 端口转发/反代/内网穿透这类"贴着网络栈"的工具
-//  放进容器就是错的）。这就是"一项能力服务多个应用"的那条通用路径，
-//  而不是给单个应用临时发明的流程。
+//  是虚拟机的网络，不是 Mac 的 —— 内网穿透这类"贴着网络栈"的工具放进容器就是错的）。
 //
 //  安装流程（每个应用只有参数不同）：
 //    建目录 → curl 下载官方 tarball（官方直连失败时退到加速镜像）
-//    → **有官方 sha256 清单就核对**（frp 有；Lucky / Orbien 上游没有）
+//    → **有官方 sha256 清单就核对**（frp 有；Orbien 上游没有）
 //    → tar 解压（含"一个 tarball 里只挑需要的二进制"）
 //    → **/usr/bin/file 复核二进制确实是 arm64**（不是就报错退出，
 //      这条是"绝不用 Rosetta / 绝不放行 amd64"在运行期的兜底）
@@ -46,11 +44,11 @@ import (
 //  与 IOPaint / Qwen3 TTS / 音色接收端一致 —— Mac mini 无人登录时也要在跑。
 //
 //  为什么还要有加速镜像：本机实测（2026-09）官方 release 地址**可达但很慢** ——
-//  lucky 的 12.9MB 产物直连花了 293 秒（约 46KB/s，几乎顶到 --max-time 300），
+//  12.9MB 的产物直连花了 293 秒（约 46KB/s，几乎顶到 --max-time 300），
 //  同一份产物经 ghfast.top 只要 21 秒。所以顺序是"官方优先"，慢过头或失败才退镜像。
 //  代价要写清楚：加速镜像（ghfast.top / gh-proxy.com）是**第三方**服务，
 //  它转发的就是我们随后以 root 执行的二进制。frp 有官方 sha256 清单可核对；
-//  lucky / orbien 的 release 里**没有** checksums 文件，那两个条目只能做架构复核。
+//  Orbien 客户端的 release 里**没有** checksums 文件，只能做架构复核。
 //  不接受的用户可以自己下载产物放进安装目录 —— 所有自动地址都失败时面板会
 //  直接用它（下载先落 .part 再改名，不会覆盖你放好的文件；有清单的条目**仍然会校验**）。
 // ============================================================================
@@ -111,8 +109,6 @@ func (a releaseBinaryApp) webPort() int {
 }
 
 const (
-	orbienLabel       = "com.zizdog.orbien"
-	frpsLabel         = "com.zizdog.frps"
 	frpcLabel         = "com.zizdog.frpc"
 	orbienClientLabel = "com.zizdog.orbien-client"
 )
@@ -166,69 +162,19 @@ func orderBySpeed(urls []string, speeds []int64) []string {
 // releaseBinaryApps 是被本安装器服务的应用表。
 //
 // 判定顺序（README「应用市场」第 2 条）：官方 release 有 darwin_arm64 产物、
-// 且**没有** brew formula（或者用户明确要求不碰 brew，frps 就是这样）。
+// 且**没有** brew formula。
 // 这里只放"一项能力服务多个应用"的通用参数，不为单个应用发明专属流程。
 var releaseBinaryApps = map[string]releaseBinaryApp{
-	// 注意：**lucky 已经改走 Docker**（2026-09-16 用户要求），所以它不在这里。
-	// 它的 compose 条目在 catalog.go。留在这里的后果很隐蔽：
-	// 市场的安装入口按 IsReleaseBinaryApp(id) 分流，注册表里有它就会**绕过**
-	// compose 安装器，直接去 GitHub 下 darwin 二进制（真机复现：任务日志里
-	// 出现 lucky_2.27.2_darwin_arm64.tar.gz 的镜像检查，而目录条目明明是 compose）。
-	"orbien": {
-		ID: "orbien", Label: orbienLabel, Name: "Orbien（内网穿透平台）", Icon: "🛰️",
-		Category: "tool", RootDir: "orbien",
-		// arm64 证据：GitHub API 的 v3.6.0 资产列表里有 orbien-server_3.6.0_darwin_arm64.tar.gz；
-		// 面板安装时还会用 /usr/bin/file 复核（见 verifyArm64Binary）。
-		Repo: "orbien-org/orbien", Tag: "v3.6.0", Asset: "orbien-server_3.6.0_darwin_arm64.tar.gz",
-		Binary: "orbien-server",
-		Args:   []string{"-c", "{root}/orbien-server.toml"},
-		Port:   8020, HealthPath: "/",
-		// orbien 的 tarball **自带**一份上游示例 orbien-server.toml（[dashboard] 是
-		// 注释掉的），解压后正好落在这个路径上。所以这里不是"存在就保留"，
-		// 而是靠 marker 区分"面板生成的"与"上游示例"（见 ensureReleaseConfig）。
-		ConfigFile: "orbien-server.toml",
-		ConfigSeed: orbienServerConfigSeed,
-		Notes: []string{
-			"控制端口是 9527（客户端连这里）；8020 是 Dashboard，用 HTTP Basic 鉴权。",
-			"客户端用同版本（v3.6.0）：面板市场里的「Orbien 客户端（CLI）」、" +
-				"上游 Orbien-Desktop（GUI）或 orbien CLI，服务端地址填 <本机地址>:9527。",
-			"面板生成的配置**没有**设置 auth.token（上游示例里它也是注释掉的）；" +
-				"要启用鉴权请自己在配置里加上，并让客户端用同一个值。",
-		},
-	},
-	"frps": {
-		ID: "frps", Label: frpsLabel, Name: "frp 服务端 (frps)", Icon: "🔌",
-		Category: "tool", RootDir: "frps",
-		// arm64 证据：v0.71.0 的资产里有 frp_0.71.0_darwin_arm64.tar.gz
-		// （12,680,181 B，实测 shasum -a 256 = 45be02b1…dabcc6，与官方清单一致）；
-		// 安装时既核对 sha256，也用 file(1) 复核架构。
-		Repo: "fatedier/frp", Tag: "v0.71.0", Asset: "frp_0.71.0_darwin_arm64.tar.gz",
-		Binary: "frps",
-		// tarball 里同时有 frps / frpc / 上游示例 frps.toml：只取 frps，避免多装一个
-		// 用不到的 frpc，也避免上游示例覆盖面板要生成的同名配置。
-		TarStrip: 1, PickBinary: true,
-		Args: []string{"-c", "{root}/frps.toml"},
-		// Port 是 bindPort（协议口，会被 macOS 隔空播放接收器占用 → 安装前检查查它）；
-		// UIPort 是 dashboard（用户真正打开的界面、健康检查也查它）。
-		Port: 7000, UIPort: 7500, HealthPath: "/",
-		ConfigFile: "frps.toml",
-		ConfigSeed: frpsConfigSeed,
-		// frp 是这里唯一提供 SHA-256 清单的上游：下载后必须与官方
-		// frp_sha256_checksums.txt 一致，否则中止安装（见 verifyReleaseChecksum）。
-		ChecksumAsset: frpChecksumAsset,
-		Notes: []string{
-			"frps.toml 已生成：bindPort=7000（协议口）、dashboard 在 7500、auth.token 随机。",
-			"同机的 frpc 必须填这里显示的 auth.token，serverPort 填 7000，否则连不上。",
-			"⚠️ 若 7000 被 macOS「隔空播放接收器」占着，安装前检查会如实报冲突：" +
-				"先在「系统设置 → 通用 → 隔空投送与接力」里关掉它，或把 frps.toml 的 " +
-				"bindPort 改成空闲端口（可在服务详情里直接编辑）。",
-		},
-	},
+	// 2026-09-16 用户要求彻底移除 Lucky / Orbien 服务端 / frps 三个条目，
+	// 只保留两个客户端。它们的配置与安装目录**不再由面板管理**；
+	// 想把某个条目加回来时注意：市场的安装入口按 IsReleaseBinaryApp(id) 分流，
+	// 注册表与 catalog.go 必须同时有，否则会出现"条目是 compose、
+	// 实际却走 release 安装器去 GitHub 下 darwin 二进制"这种隐蔽错配。
 	"frpc": {
 		ID: "frpc", Label: frpcLabel, Name: "frp 客户端 (frpc)", Icon: "🧷",
 		Category: "tool", RootDir: "frpc",
-		// 与 frps **同一个** tarball（里面 frps / frpc 各一个二进制），只是挑不同的成员、
-		// 装到不同目录 —— 所以两端的版本永远一致，不会出现 v0.71 服务端配 v0.70 客户端。
+		// 与 frps **同一个**上游 tarball（里面 frps / frpc 各一个二进制），只挑 frpc 那一个成员。
+		// 面板不提供 frps，但用官方包解出的客户端版本自然与主流服务端一致。
 		Repo: "fatedier/frp", Tag: "v0.71.0", Asset: "frp_0.71.0_darwin_arm64.tar.gz",
 		Binary:   "frpc",
 		TarStrip: 1, PickBinary: true,
@@ -239,8 +185,9 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		ConfigSeed:    frpcConfigSeed,
 		ChecksumAsset: frpChecksumAsset,
 		Notes: []string{
-			"frpc.toml 已生成：serverAddr=127.0.0.1、serverPort=7000、admin UI 在 7400。",
-			"auth.token 已尽量自动复用本机 frps 的 token；frps 在别的机器时请自行改成同值。",
+			"frpc.toml 已生成：admin UI 在 7400。",
+			"⚠️ serverAddr / serverPort / auth.token 都要改成你自己 frps 的值 —— " +
+				"面板不再提供 frps，生成的 token 是随机的，不改连不上。",
 			"[[proxies]] 里现在只有一条注释示例 —— 不加隧道的话它连上了也没有任何转发。",
 		},
 	},
@@ -280,49 +227,19 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 // 模板 + 占位符既省一份重复逻辑，也让人一眼看清写进磁盘的到底是什么。
 const (
 	panelConfigMarker = "由 ZizPanel 生成"
-
-	frpsConfigSeed = `# ` + panelConfigMarker + `。改完在「服务管理 → frp 服务端」里重启服务生效，
-# 也可以直接在服务详情里点「📝 编辑配置文件」修改本文件。
-bindPort = 7000
-
-# 与 frpc 共用的鉴权 token。不设 = 完全不鉴权（等于把穿透入口敞开），
-# 所以面板默认生成一个随机值；同机的 frpc 必须填同一个。
-auth.method = "token"
-auth.token = "{token}"
-
-# 可视化配置入口：dashboard。地址 http://<本机地址>:7500
-webServer.addr = "0.0.0.0"
-webServer.port = 7500
-webServer.user = "{user}"
-webServer.password = "{password}"
-`
-
-	orbienServerConfigSeed = `# ` + panelConfigMarker + `。改完重启服务生效（服务管理 → Orbien → 重启）。
-# 控制端口：客户端（面板里的「Orbien 客户端」/ 桌面端 / orbien CLI）连这里。
-listen = "0.0.0.0:9527"
-
-# Web Dashboard（HTTP Basic 鉴权）。
-[dashboard]
-addr = "0.0.0.0"
-port = 8020
-user = "admin"
-password = "{password}"
-
-# 需要 HTTP/HTTPS 入口或 QUIC/KCP 传输时再按上游文档打开下面几项：
-# httpGwPort = 80
-# httpsGwPort = 443
-# quicPort = 9528
-# kcpPort = 9529
-`
 )
 
 // frpcConfigSeed 是 frpc（客户端）的 frpc.toml 模板。
 //
-// serverAddr 默认 127.0.0.1：原生安装下 frps 与本机 frpc 在同一台 Mac 上，
-// 直接就能连（Docker 下才需要 host.docker.internal）。
-// 换成公网 frps 时用户改这一行即可。
+// 面板**不再提供 frps 服务端**（2026-09-16 用户要求移除），所以这里的
+// serverAddr/serverPort 是占位值：请改成你自己的 frps 地址与端口。
 const frpcConfigSeed = `# ` + panelConfigMarker + `。改完在「服务管理 → frp 客户端」里重启服务生效，
 # 也可以直接在服务详情里点「📝 编辑配置文件」修改本文件。
+#
+# ⚠️ 两个必须改的地方：
+#   ① serverAddr / serverPort —— 指向你自己的 frps 服务端（面板不再提供 frps）。
+#   ② auth.token —— 必须与 frps 的 auth.token 完全一致，否则 frps 会拒绝登录。
+#      下面这个是面板随机生成的，**不是**你服务端的 token，请务必替换。
 serverAddr = "127.0.0.1"
 serverPort = 7000
 
@@ -334,7 +251,7 @@ serverPort = 7000
 loginFailExit = false
 
 # 必须与 frps 的 auth.token 一致，否则 frps 会拒绝登录。
-# 面板安装时若本机已有 frps，会自动复用它的 token。
+# 面板不提供 frps，所以这里生成的随机值需要你改成服务端的 token。
 auth.method = "token"
 auth.token = "{token}"
 
@@ -356,11 +273,11 @@ webServer.password = "{password}"
 
 // orbienClientConfigSeed 是 orbien（CLI 客户端）的 orbien.toml 模板。
 //
-// server 默认 127.0.0.1:9527（本机服务端）；换成公网服务端时改这一行。
-// 客户端没有 Web 界面，所以模板里没有 webServer 段。
+// 面板**不再提供 Orbien 服务端**（2026-09-16 用户要求移除），所以这里的 server
+// 是占位值：请改成你自己的 Orbien 服务端地址。客户端没有 Web 界面。
 const orbienClientConfigSeed = `# ` + panelConfigMarker + `。改完在「服务管理 → Orbien 客户端」里重启服务生效，
 # 也可以直接在服务详情里点「📝 编辑配置文件」修改本文件。
-# Orbien 服务端地址（默认连本机的服务端；换公网服务器就改成 <IP>:9527）。
+# ⚠️ Orbien 服务端地址：面板不再提供服务端，请改成你自己的 <IP>:9527。
 server = "127.0.0.1:9527"
 
 # 服务端启用了 auth.token 才需要填，并且必须与服务端一致。
@@ -375,15 +292,8 @@ server = "127.0.0.1:9527"
 # remotePort = 9000
 `
 
-// Orbien / frps 默认端口（写在这里是为了让配置生成与目录条目引用同一组数字）。
-const (
-	orbienControlPort   = 9527
-	orbienDashboardPort = 8020
-
-	frpsBindPort     = 7000
-	frpsWebPort      = 7500
-	frpChecksumAsset = "frp_sha256_checksums.txt"
-)
+// frp 的官方校验清单文件名（frpc 安装时用它核对下载产物）。
+const frpChecksumAsset = "frp_sha256_checksums.txt"
 
 // releaseURL 是官方下载地址。
 func (a releaseBinaryApp) releaseURL() string {
@@ -504,8 +414,6 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 		}
 		if generated {
 			secrets = s
-		} else if spec.ID == "orbien" {
-			result.step(ctx, "已保留现有配置 "+p.Config+"（dashboard 口令见该文件，面板不覆盖）")
 		} else {
 			result.step(ctx, "已保留现有配置 "+p.Config+"（面板不覆盖你的改动）")
 		}
@@ -871,20 +779,19 @@ func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 	return args
 }
 
-// ensureReleaseConfig 生成"release 二进制"类应用的服务端配置。
+// ensureReleaseConfig 生成"release 二进制"类应用的配置文件。
 //
 // 已有**面板生成**的配置时原样保留（用户可能自己改过端口/口令，重装不该把它抹掉），
 // 其余情况（没有文件 / 只有上游示例 / 上游换了示例内容）一律写面板这份。
-// 为什么靠 marker 而不是"存在即保留"：orbien 的 tarball 自带一份上游示例配置，
-// 解压后正好落在目标路径上；按"存在即保留"处理的话，面板永远写不进 dashboard
-// 配置，用户装完只有控制端口、没有界面，而且没有任何报错。
+// 为什么靠 marker 而不是"存在即保留"：orbien 客户端的 tarball 自带一份上游示例配置，
+// 解压后正好落在目标路径上；按"存在即保留"处理的话，面板永远写不进自己的配置，
+// 用户装完只有默认值、没有界面入口，而且没有任何报错。
 func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePaths) (configSeedSecrets, bool, error) {
 	if b, rerr := os.ReadFile(p.Config); rerr == nil &&
 		strings.Contains(string(b), panelConfigMarker) {
 		return configSeedSecrets{}, false, nil
 	}
-	// 生成 frps 配置时把 auth.token 记下来给 frpc 复用（同一台机器上的两端）。
-	s, err := generateConfigSecrets(spec.ConfigSeed, m.frpsTokenForClient())
+	s, err := generateConfigSecrets(spec.ConfigSeed, "")
 	if err != nil {
 		return configSeedSecrets{}, false, err
 	}
@@ -892,29 +799,6 @@ func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePath
 		return configSeedSecrets{}, false, err
 	}
 	return s, true, nil
-}
-
-// frpsAuthTokenRe 从面板生成的 frps.toml 里取 auth.token。
-var frpsAuthTokenRe = regexp.MustCompile(`(?m)^\s*auth\.token\s*=\s*"([^"]+)"`)
-
-// frpsTokenForClient 尽量返回本机 frps 的 auth.token，让同机的 frpc 装完即通。
-//
-// 取不到就返回空（frps 装在别的机器 / 还没装 / 用户改成了别的写法），
-// 调用方会自己生成一个随机 token，并在安装结果里说明"两端必须一致"。
-// 只认面板生成的配置：用户手写的配置格式未必是这一行，硬猜会把错值抄过去。
-func (m *Manager) frpsTokenForClient() string {
-	spec, ok := releaseBinaryApps["frps"]
-	if !ok || spec.ConfigFile == "" || m.opt.UserHome == "" {
-		return ""
-	}
-	b, err := os.ReadFile(filepath.Join(m.opt.UserHome, spec.RootDir, spec.ConfigFile))
-	if err != nil || !strings.Contains(string(b), panelConfigMarker) {
-		return ""
-	}
-	if mm := frpsAuthTokenRe.FindStringSubmatch(string(b)); len(mm) == 2 {
-		return mm[1]
-	}
-	return ""
 }
 
 // credentialBlock 生成安装结果里的"可复制凭据区块"。
@@ -1120,12 +1004,10 @@ func (m *Manager) releaseBinaryPlan(id string) (UninstallPlan, bool) {
 		DataPaths: []string{p.Root},
 	}
 	switch id {
-	case "orbien", "orbien-client":
-		plan.KeepNote = "默认保留安装目录（二进制与配置，配置里可能有 dashboard 口令）"
-	case "lucky":
-		plan.KeepNote = "默认保留安装目录（二进制与全部 Lucky 配置）"
-	case "frps", "frpc":
-		plan.KeepNote = "默认保留安装目录（二进制与配置 frps.toml / frpc.toml，配置里有 token）"
+	case "orbien-client":
+		plan.KeepNote = "默认保留安装目录（二进制与 orbien.toml，配置里可能有服务端 token）"
+	case "frpc":
+		plan.KeepNote = "默认保留安装目录（二进制与 frpc.toml，配置里有 token）"
 	}
 	return plan, true
 }

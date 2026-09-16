@@ -139,12 +139,10 @@ func TestMarketResidualDataOffersReinstall(t *testing.T) {
 
 	// 复刻"卸载（保留数据）之后的磁盘状态，服务与记录都不在、只剩产物"。
 	//
-	// 注意 lucky 已经**改走 Docker**（2026-09-16 用户要求），它的产物是
-	// compose 项目目录（<WorkDir>/compose/lucky），不再是 ~/lucky 下的二进制。
-	// 这里用 frps 复刻**原生 release 二进制**那条路径 —— 它的语义与原来完全一样
-	// （注册表里的 panel installer + 家目录下的安装产物），
-	// 而 compose 残留那条路径由 TestMarketComposeResidualOffersReinstall 覆盖。
-	exe := filepath.Join(srv.Cfg.UserHome, "frps", "frps")
+	// 用 orbien-client 复刻**原生 release 二进制**那条路径（注册表里的 panel installer
+	// + 家目录下的安装产物）；compose 残留那条路径由
+	// TestMarketComposeResidualOffersReinstall 覆盖。
+	exe := filepath.Join(srv.Cfg.UserHome, "orbien-client", "orbien")
 	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +150,7 @@ func TestMarketResidualDataOffersReinstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	it := marketItem(t, ts, cookies, "frps")
+	it := marketItem(t, ts, cookies, "orbien-client")
 	if it["installed"] != false {
 		t.Error("卸载（保留数据）之后市场必须回到可安装态 —— 否则卡片停在「已安装」，" +
 			"用户没有任何重装入口")
@@ -173,9 +171,8 @@ func TestMarketResidualDataOffersReinstall(t *testing.T) {
 	}
 }
 
-// TestMarketComposeResidualOffersReinstall 覆盖 compose 应用（Lucky 2026-09-16
-// 改成 Docker 版之后）的残留态：卸载（保留数据）后磁盘上只剩
-// <WorkDir>/compose/<app>，服务记录与容器都不在。
+// TestMarketComposeResidualOffersReinstall 覆盖 compose 应用的残留态：
+// 卸载（保留数据）后磁盘上只剩 <WorkDir>/compose/<app>，服务记录与容器都不在。
 //
 // 契约与原生类完全一致（这也是用户反馈的那件事）：
 //  1. installed=false —— 回到可安装态，卡片给「安装」；
@@ -186,7 +183,7 @@ func TestMarketComposeResidualOffersReinstall(t *testing.T) {
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
 
-	dir := filepath.Join(srv.Cfg.WorkDir, "compose", "lucky")
+	dir := filepath.Join(srv.Cfg.WorkDir, "compose", "uptime-kuma")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +191,7 @@ func TestMarketComposeResidualOffersReinstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	it := marketItem(t, ts, cookies, "lucky")
+	it := marketItem(t, ts, cookies, "uptime-kuma")
 	if it["installed"] != false {
 		t.Error("compose 应用卸载后必须回到可安装态")
 	}

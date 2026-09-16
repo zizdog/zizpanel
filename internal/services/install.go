@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -127,7 +129,7 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	env := m.brewEnv()
+	env := m.brewEnv(ctx, firstFormulaOf(args))
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 && m.opt.UserName != "" {
 		// 注意： sudo 默认会**清空环境**（env_reset），所以镜像变量不能只放在
@@ -157,6 +159,132 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 	return text, nil
 }
 
+// brewMirrorBase 是一个 Homebrew 二进制瓶镜像的基址（API 与瓶文件共用基址）。
+type brewMirrorBase struct {
+	Name string
+	Base string
+}
+
+// brewMirrorCandidates 是国内可用的 Homebrew 瓶镜像，**顺序即优先级**。
+//
+// 为什么不是写死某一家：各家镜像的**路径布局、限速与可用性都会变**，
+// 2026-09-16 实测（同一台 Mac、同一个 php@8.3 瓶，走 8MB 分片测速）：
+//
+//	中科大   <base>/v2/homebrew/core/…/blobs/sha256:<hex>   206   5.1 MB/s
+//	阿里云   同一路径 404（不提供 OCI 布局）
+//	清华     同一路径 404
+//	ghcr.io  官方直连                                       约 91 KB/s（实测 21 分钟没装完 php@8.3）
+//
+// 所以顺序改成 中科大 → 清华 → 阿里云：中科大同时提供 API 清单与 OCI 瓶路径，
+// 实测比官方快约 56 倍；阿里云留着是因为它的 API 稳定（清单可用），
+// 只是瓶路径不通 —— 那种情况 brew 会自行回落官方域，不会比不设更差。
+var brewMirrorCandidates = []brewMirrorBase{
+	{Name: "中科大", Base: "https://mirrors.ustc.edu.cn/homebrew-bottles"},
+	{Name: "清华大学", Base: "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"},
+	{Name: "阿里云", Base: "https://mirrors.aliyun.com/homebrew/homebrew-bottles"},
+}
+
+// brewBottleCapable 判断某家镜像是否提供 OCI 瓶路径（<base>/v2/…）。
+//
+// 只有这类镜像才适合设 HOMEBREW_BOTTLE_DOMAIN：Homebrew 是把清单里的
+// ghcr.io 域**替换**成这个域去取瓶文件的（官方文档称之为"legacy flat-file mirror"
+// 之外的用法，见 bottle.rb 的 custom_bottle_domain 分支）。
+// 不提供 /v2/ 的镜像（如阿里云）设了也取不到，只会让 brew 白试一次再回落 ——
+// 所以宁可退回一家 API 可用但没有 /v2/ 的，也不要让用户等那次超时。
+func brewMirrorSupportsOCI(ctx context.Context, base string) bool {
+	// 用一个稳定的公开瓶做 HEAD：nginx 在各家都有 arm64_sequoia 瓶。
+	const probe = "/v2/homebrew/core/nginx/blobs/sha256:972063bdf74564fc0e5f3a0e8b0f5b6b5e0a5f2b7f0f2c4a5b6c7d8e9f0a1b2c"
+	pctx, cancel := context.WithTimeout(ctx, brewMirrorProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodHead, strings.TrimRight(base, "/")+probe, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<12))
+	// 404 = 这家没有 OCI 布局；401/403 也可能出现在不支持时，一并当作不可用。
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
+}
+
+// brewMirrorProbeTimeout 是探测单个镜像的超时。
+//
+// 短是刻意的：探测只是"换条路"的准备工作，不该让用户为它等太久；
+// 局域网/国内镜像正常在 1 秒内应答。
+const brewMirrorProbeTimeout = 4 * time.Second
+
+// brewMirrorWorks 判断某个镜像的 API 是否能在 4 秒内给出指定 formula 的清单。
+//
+// 只做一次 HEAD/GET：能拿到 200 就认为这家可用。真正的 sha256 是否最新
+// 由 brew 自己判断（取不到时它仍会回落公网），这里只负责"别选一家完全不可达的"。
+func brewMirrorWorks(ctx context.Context, base, formula string) bool {
+	if base == "" || formula == "" {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, brewMirrorProbeTimeout)
+	defer cancel()
+	url := strings.TrimRight(base, "/") + "/api/formula/" + formula + ".json"
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	return resp.StatusCode == http.StatusOK
+}
+
+// brewBottleDomain 选一个**真的能取到瓶文件**的镜像域做 HOMEBREW_BOTTLE_DOMAIN。
+//
+// 语义很重要：Homebrew 把清单里的 ghcr.io 域替换成这个域去取瓶，所以这个域
+// 必须提供 OCI 布局（<base>/v2/…）。候选里排在前面的镜像未必支持（实测阿里云 404），
+// 所以这里逐个探测，第一个支持的胜出。
+//
+// 全都不支持时返回 ""：**不设**比设一个取不到的更好 —— 设了会让 brew 先白试一次
+// （甚至撞上 4 秒超时），最后仍然回落 ghcr.io，用户只是多等。
+func brewBottleDomain(ctx context.Context) string {
+	for _, c := range brewMirrorCandidates {
+		if brewMirrorSupportsOCI(ctx, c.Base) {
+			return c.Base
+		}
+	}
+	return ""
+}
+
+// probeBrewMirrors 选出这次 brew 要用的 API 域与瓶域。
+//
+// 抽成独立方法是为了**可测试**：默认实现会发真实网络请求，而单测不该碰真实服务
+// （AGENTS.md 第三节）。测试通过 m.mirrorProbeOverride 注入一个假实现。
+//
+// 优先级：自建 NAS 镜像（<mirror>/brew）→ 公共镜像按序探测 → 都不行则不设瓶域。
+func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (apiDomain, bottleDomain string) {
+	if m.mirrorProbeOverride != nil {
+		return m.mirrorProbeOverride(ctx, probeFormula)
+	}
+	// 自建镜像优先：布局是 <mirror>/brew（api 在 <mirror>/brew/api，瓶在 <mirror>/brew/v2/…），
+	// 由 NAS 那一侧负责同步上游瓶文件。
+	if base := strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/"); base != "" {
+		nasBase := base + "/brew"
+		if brewMirrorSupportsOCI(ctx, nasBase) {
+			return nasBase + "/api", nasBase
+		}
+	}
+	chosen := brewMirrorCandidates[0]
+	for _, c := range brewMirrorCandidates {
+		if brewMirrorWorks(ctx, c.Base, probeFormula) {
+			chosen = c
+			break
+		}
+	}
+	return chosen.Base + "/api", brewBottleDomain(ctx)
+}
+
 // brewEnv 返回跑 brew 时要注入的环境变量。
 //
 // 为什么必须显式注入：install.sh 只把镜像写进用户 shell 的 rc 文件，而**面板是
@@ -164,20 +292,26 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 // brew 仍然走官方源（formulae.brew.sh / ghcr.io）。国内无代理时那条路基本不通，
 // 表现是"点安装后长时间没进度"，而且看起来像面板卡死。
 //
-// 默认用阿里云的 API/瓶源（国内实测 0.17s 响应）；已经设过的以用户设置为准
-// （尊重用户自己的镜像选择，不覆盖）。
-func (m *Manager) brewEnv() []string {
+// 镜像优先级（用户自己设过的**一律以用户为准**，不覆盖）：
+//  1. **自建 NAS 镜像**（Cfg.MirrorBase，如 https://mirror.zizdog.com:8888）的
+//     `/brew` 子路径 —— 用户明确要求"LNMP 的包也留一份在 NAS 上、优先调用"；
+//  2. 中科大 / 清华 / 阿里云（按实测速度排序，见 brewMirrorCandidates）；
+//  3. 都不行就不设 bottle 域，让 brew 回落官方（不会比不设更差）。
+//
+// probeFormula 是这次要装的第一个包（用它的清单做探针）；空表示不探测。
+func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 	pick := func(key, def string) string {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
 		return def
 	}
+
+	apiDomain, bottleDomain := m.probeBrewMirrors(ctx, probeFormula)
+
 	return []string{
-		"HOMEBREW_API_DOMAIN=" + pick("HOMEBREW_API_DOMAIN",
-			"https://mirrors.aliyun.com/homebrew/homebrew-bottles/api"),
-		"HOMEBREW_BOTTLE_DOMAIN=" + pick("HOMEBREW_BOTTLE_DOMAIN",
-			"https://mirrors.aliyun.com/homebrew/homebrew-bottles"),
+		"HOMEBREW_API_DOMAIN=" + pick("HOMEBREW_API_DOMAIN", apiDomain),
+		"HOMEBREW_BOTTLE_DOMAIN=" + pick("HOMEBREW_BOTTLE_DOMAIN", bottleDomain),
 		// 自动更新会在每次 brew 命令前拉一遍仓库元数据：国内很慢，而且我们
 		// 不需要它（面板自己管安装）。
 		"HOMEBREW_NO_AUTO_UPDATE=1",
@@ -613,7 +747,7 @@ func FindAppByService(svc *Service) (App, bool) {
 
 // healthURLFor 由目录条目拼出健康检查地址（没有健康路径/端口时返回空）。
 //
-// 用 WebPort() 而不是 Port：frps 的 Port 是协议口 7000，健康检查必须打 dashboard 7500。
+// 用 WebPort() 而不是 Port：有些条目的协议口与界面口不同，健康检查必须打界面口。
 func healthURLFor(a App) string {
 	if a.HealthPath == "" || a.WebPort() <= 0 {
 		return ""
@@ -690,4 +824,25 @@ func (m *Manager) RegisterInstalledService(ctx context.Context, label, displayNa
 		return m.repo.Update(ctx, svc)
 	}
 	return nil
+}
+
+// firstFormulaOf 从 brew 的参数里取"首个 formula 名"，用于镜像探测。
+//
+// 只做最小解析：跳过 install/reinstall/upgrade 这类动作词与 -开头 的选项，
+// 取第一个普通参数。取不到就返回空（brewEnv 会跳过探测、直接用第一家镜像）。
+//
+// 为什么不用它做别的：brew 的参数组合很多，这里只需要一个"探针包名"，
+// 真正的参数解析交给 brew 自己 —— 多写一份解析只会多一份会走样的实现。
+func firstFormulaOf(args []string) string {
+	for _, a := range args {
+		if a == "" || strings.HasPrefix(a, "-") {
+			continue
+		}
+		switch a {
+		case "install", "reinstall", "upgrade", "uninstall", "list", "info", "services", "start", "stop", "restart":
+			continue
+		}
+		return a
+	}
+	return ""
 }

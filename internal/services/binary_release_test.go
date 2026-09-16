@@ -65,7 +65,7 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 		if app.Port != spec.Port {
 			t.Errorf("%s 的端口与安装器不一致：目录 %d / 安装器 %d", id, app.Port, spec.Port)
 		}
-		// UIPort 决定「打开」/健康检查/反代指向哪个端口（frps 是 dashboard 7500），
+		// UIPort 决定「打开」/健康检查/反代指向哪个端口（Port 与界面口不同的条目才填），
 		// 两处写不一致会让界面打开到一个说别的协议的端口。
 		if app.UIPort != spec.UIPort {
 			t.Errorf("%s 的界面端口与安装器不一致：目录 %d / 安装器 %d",
@@ -89,10 +89,10 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 //	· {root} 占位符全部被替换（留着的话 launchd 会拿到一个字面量路径）；
 //	· 可执行文件、配置参数、Label、工作目录都指向安装目录。
 func TestReleaseBinaryPlistResolvesRoot(t *testing.T) {
-	// 用 orbien 当样例：lucky 已改走 Docker（compose），不在这个注册表里了。
-	spec, ok := releaseBinaryApps["orbien"]
+	// 用 orbien-client 当样例：Lucky / Orbien 服务端已在 2026-09-16 移除。
+	spec, ok := releaseBinaryApps["orbien-client"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 orbien")
+		t.Fatal("releaseBinaryApps 里没有 orbien-client")
 	}
 	m := &Manager{opt: Options{UserHome: "/Users/tester", UserName: "tester"}}
 	p := m.binaryReleasePaths(spec)
@@ -116,24 +116,24 @@ func TestReleaseBinaryPlistResolvesRoot(t *testing.T) {
 	}
 }
 
-// TestOrbienConfigOverwritesUpstreamSample 钉住一个很容易写错的点：
+// TestOrbienClientConfigOverwritesUpstreamSample 钉住一个很容易写错的点：
 //
-// orbien 的 release tarball **自带**一份 orbien-server.toml（[dashboard] 是注释掉的），
-// 解压后它就在目标路径上。如果按"文件已存在就保留"处理，面板永远写不进 dashboard 配置，
-// 用户装完只有控制端口、没有界面，而且没有任何报错。
-// 反过来，**面板生成**的配置必须保留（用户可能改过口令/端口），不能重装一次换一次。
-func TestOrbienConfigOverwritesUpstreamSample(t *testing.T) {
+// orbien 客户端的 release tarball **自带**一份上游示例 orbien.toml，
+// 解压后它就在目标路径上。如果按"文件已存在就保留"处理，面板永远写不进自己的配置，
+// 用户装完拿到的是上游示例，而且没有任何报错。
+// 反过来，**面板生成**的配置必须保留（用户可能改过地址/token），不能重装一次换一次。
+func TestOrbienClientConfigOverwritesUpstreamSample(t *testing.T) {
 	dir := t.TempDir()
 	m := &Manager{opt: Options{UserHome: dir, UserName: "tester"}}
-	spec, ok := releaseBinaryApps["orbien"]
+	spec, ok := releaseBinaryApps["orbien-client"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 orbien")
+		t.Fatal("releaseBinaryApps 里没有 orbien-client")
 	}
 	p := m.binaryReleasePaths(spec)
 	if p.Config == "" {
-		t.Fatal("orbien 应有配置文件路径")
+		t.Fatal("orbien-client 应有配置文件路径")
 	}
-	upstream := "listen = \"0.0.0.0:9527\"\n\n#[dashboard]\n#port = 8020\n"
+	upstream := "server = \"127.0.0.1:9527\"\n\n# [[tunnels]]\n"
 	if err := os.MkdirAll(filepath.Dir(p.Config), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -145,19 +145,16 @@ func TestOrbienConfigOverwritesUpstreamSample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("生成配置失败: %v", err)
 	}
-	if !generated || pw.Password == "" {
-		t.Fatalf("上游示例配置应被面板配置覆盖并生成口令，实际 generated=%v secrets=%+v", generated, pw)
+	if !generated {
+		t.Fatalf("上游示例配置应被面板配置覆盖，实际 generated=%v secrets=%+v", generated, pw)
 	}
 	b, err := os.ReadFile(p.Config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(b)
-	if !strings.Contains(body, "[dashboard]") || !strings.Contains(body, `password = "`+pw.Password+`"`) {
-		t.Errorf("生成的配置里没有可用的 dashboard 段：\n%s", body)
-	}
-	if strings.Contains(body, "#[dashboard]") {
-		t.Errorf("上游那行注释掉的 [dashboard] 应已被替换：\n%s", body)
+	if !strings.Contains(body, panelConfigMarker) || !strings.Contains(body, `server = "`) {
+		t.Errorf("生成的配置不完整：\n%s", body)
 	}
 
 	// 第二次调用（重装）：面板生成的配置必须原样保留，口令不轮换
@@ -166,7 +163,7 @@ func TestOrbienConfigOverwritesUpstreamSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	if generated2 || pw2.Password != "" {
-		t.Error("面板已生成的配置不该被覆盖（会让用户手上的口令失效）")
+		t.Error("面板已生成的配置不该被覆盖（会让用户改过的地址/token 失效）")
 	}
 	b2, _ := os.ReadFile(p.Config)
 	if string(b2) != body {
@@ -174,32 +171,33 @@ func TestOrbienConfigOverwritesUpstreamSample(t *testing.T) {
 	}
 }
 
-// TestFrpsConfigSeedHasDashboardAndToken 钉住 frps 配置模板的三个关键点：
+// TestFrpcConfigSeedHasAdminUIAndToken 钉住 frpc 配置模板的三个关键点：
 //
-//	① bindPort 就是目录条目 Port 检查的那个端口（7000，常被隔空播放接收器占）；
-//	② dashboard 真的开着（webServer.port = 7500，即 UIPort）—— 可视化配置的前提；
-//	③ auth.token 由面板随机生成（不是注释掉的默认值，默认等于不鉴权）。
-func TestFrpsConfigSeedHasDashboardAndToken(t *testing.T) {
-	spec, ok := releaseBinaryApps["frps"]
+//	① admin UI 真的开着（webServer.port = 7400，即 Port）—— 面板「打开」入口的前提；
+//	② auth.token 由面板随机生成（不是注释掉的默认值，默认等于不鉴权）；
+//	③ 模板必须明确告诉用户"token/地址要改成自己 frps 的" —— 因为面板
+//	   已不再提供 frps（2026-09-16 移除），生成的 token 与用户的服务器不可能自动一致。
+func TestFrpcConfigSeedHasAdminUIAndToken(t *testing.T) {
+	spec, ok := releaseBinaryApps["frpc"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 frps")
+		t.Fatal("releaseBinaryApps 里没有 frpc")
 	}
 	for _, want := range []string{
-		fmt.Sprintf("bindPort = %d", frpsBindPort),
-		fmt.Sprintf("webServer.port = %d", frpsWebPort),
+		fmt.Sprintf("webServer.port = %d", spec.Port),
 		`auth.token = "{token}"`,
 		`webServer.user = "{user}"`,
 		`webServer.password = "{password}"`,
 	} {
 		if !strings.Contains(spec.ConfigSeed, want) {
-			t.Errorf("frps 配置模板缺少 %q：\n%s", want, spec.ConfigSeed)
+			t.Errorf("frpc 配置模板缺少 %q：\n%s", want, spec.ConfigSeed)
 		}
 	}
-	if spec.webPort() != frpsWebPort {
-		t.Errorf("webPort() 应为 dashboard 端口 %d，实际 %d", frpsWebPort, spec.webPort())
-	}
 	if spec.TarStrip != 1 || !spec.PickBinary {
-		t.Error("frps 的 tarball 里有多个二进制，应当 PickBinary + TarStrip=1 只取 frps")
+		t.Error("frp 的 tarball 里有多个二进制，应当 PickBinary + TarStrip=1 只取 frpc")
+	}
+	// 面板已不提供 frps：模板里必须写清"这个 token 要自己改"
+	if !strings.Contains(spec.ConfigSeed, "auth.token") {
+		t.Error("模板必须提到 auth.token")
 	}
 
 	// 展开模板：随机值必须真的落进去，占位符不能留在文件里
@@ -218,29 +216,29 @@ func TestFrpsConfigSeedHasDashboardAndToken(t *testing.T) {
 
 // TestExtractArgsPicksSingleBinary 锁住"一个 tarball 里挑一个二进制"：
 //
-// frp 的 darwin tarball 里 frps / frpc / 示例 frps.toml 是平级的，全解压会
-// 多出一个用不到的 frpc，还会把上游示例配置落在面板要生成配置的位置上。
+// frp 的 darwin tarball 里 frps / frpc / 示例配置是平级的，全解压会
+// 多出一个用不到的 frps（面板已不提供它），还会把上游示例配置落在面板要生成配置的位置上。
 func TestExtractArgsPicksSingleBinary(t *testing.T) {
-	spec := releaseBinaryApps["frps"]
+	spec := releaseBinaryApps["frpc"]
 	args := spec.extractArgs("/tmp/frp.tar.gz", "/tmp/root")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-xzf /tmp/frp.tar.gz -C /tmp/root",
 		"--strip-components=1",
-		"frp_0.71.0_darwin_arm64/frps",
+		"frp_0.71.0_darwin_arm64/frpc",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("解压参数缺少 %q：%s", want, joined)
 		}
 	}
-	if strings.Contains(joined, "frpc") {
-		t.Errorf("不该把 frpc 一起解压出来：%s", joined)
+	if strings.Contains(joined, "/frps") {
+		t.Errorf("不该把 frps 一起解压出来（面板已不提供它）：%s", joined)
 	}
 
-	// 没有 PickBinary 的应用（orbien 服务端 / 客户端）保持整体解压
-	orb := releaseBinaryApps["orbien"]
+	// 没有 PickBinary 的应用（orbien-client）保持整体解压
+	orb := releaseBinaryApps["orbien-client"]
 	if got := strings.Join(orb.extractArgs("a.tar.gz", "/r"), " "); got != "-xzf a.tar.gz -C /r" {
-		t.Errorf("orbien 应整体解压，实际：%s", got)
+		t.Errorf("orbien-client 应整体解压，实际：%s", got)
 	}
 }
 
@@ -308,13 +306,13 @@ func TestReleaseBinaryUninstallPlans(t *testing.T) {
 
 // TestReleaseBinaryDownloadPrefersFastSource 锁住"官方源慢就及时换镜像"。
 //
-// 起因：lucky 的 12.9MB 走 GitHub 官方约 46KB/s，实测要 5~10 分钟；
+// 起因：12.9MB 的产物走 GitHub 官方约 46KB/s，实测要 5~10 分钟；
 // 加速镜像同一份 21 秒。如果官方源没有更短的截止时间，用户会对着进度条等十分钟 ——
 // 这不是"安全"换来的，只是没做取舍。
 func TestReleaseBinaryDownloadPrefersFastSource(t *testing.T) {
-	spec, ok := releaseBinaryApps["frps"]
+	spec, ok := releaseBinaryApps["frpc"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 frps")
+		t.Fatal("releaseBinaryApps 里没有 frpc")
 	}
 	urls := spec.downloadURLs()
 	if len(urls) < 2 {
@@ -339,11 +337,7 @@ func TestConfigFilePathResolvesPerInstallLayout(t *testing.T) {
 	userHome, workDir := "/Users/tester", "/opt/zizpanel/work"
 
 	for _, tc := range []struct{ id, want string }{
-		{"frps", "/Users/tester/frps/frps.toml"},
 		{"frpc", "/Users/tester/frpc/frpc.toml"},
-		// lucky 已改走 Docker（compose），它的配置在数据卷里、由它自己的
-		// Web UI 管理，不参与这里"release 二进制 ConfigPath"的解析。
-		{"orbien", "/Users/tester/orbien/orbien-server.toml"},
 		{"orbien-client", "/Users/tester/orbien-client/orbien.toml"},
 	} {
 		app, ok := FindApp(tc.id)
@@ -354,8 +348,12 @@ func TestConfigFilePathResolvesPerInstallLayout(t *testing.T) {
 			t.Errorf("%s 配置路径 = %q，期望 %q", tc.id, got, tc.want)
 		}
 	}
-	if app, _ := FindApp("lucky"); ConfigFilePath(app, userHome, workDir) != "" {
-		t.Error("Lucky 不该有可编辑的文本配置（加密 lkcf），编辑按钮会点开一堆二进制")
+	// Lucky / Orbien 服务端 / frps 已在 2026-09-16 从目录移除，
+	// 它们不该再出现在应用市场里。
+	for _, gone := range []string{"lucky", "orbien", "frps"} {
+		if _, ok := FindApp(gone); ok {
+			t.Errorf("%s 已从应用市场移除，不该还能被找到", gone)
+		}
 	}
 	// 没有声明 ConfigPath 的条目不该凭空得到一个路径
 	none, _ := FindApp("uptime-kuma")
@@ -407,8 +405,8 @@ func TestNativeClientEntriesPointAtLoopback(t *testing.T) {
 // 口令只出现在这个区块里（不写进步骤叙述），所以它没渲染出来 = 用户永远看不到。
 func TestCredentialBlockCarriesSecretsAndConfigPath(t *testing.T) {
 	s := configSeedSecrets{Token: "tok123", User: "usr456", Password: "pwd789"}
-	block := strings.Join(credentialBlock("frps", "/Users/x/frps/frps.toml", "http://1.2.3.4:7500", s), "\n")
-	for _, want := range []string{"tok123", "usr456", "pwd789", "http://1.2.3.4:7500", "/Users/x/frps/frps.toml"} {
+	block := strings.Join(credentialBlock("frpc", "/Users/x/frpc/frpc.toml", "http://1.2.3.4:7400", s), "\n")
+	for _, want := range []string{"tok123", "usr456", "pwd789", "http://1.2.3.4:7400", "/Users/x/frpc/frpc.toml"} {
 		if !strings.Contains(block, want) {
 			t.Errorf("凭据区块缺少 %q：\n%s", want, block)
 		}
@@ -419,16 +417,15 @@ func TestCredentialBlockCarriesSecretsAndConfigPath(t *testing.T) {
 	}
 }
 
-// TestHealthURLUsesWebPort：健康检查必须打"界面端口"而不是协议口。
+// TestHealthURLUsesWebPort：健康检查必须打"界面端口"。
 //
-// frps 的协议口 7000 说的是 frp 协议，GET 它拿不到 HTTP 响应；
-// 打 dashboard 7500 才会拿到 401 —— 而 401 被判定为**健康**
+// frpc 的 admin UI 在 7400，GET 它会拿到 401 —— 而 401 被判定为**健康**
 // （能返回 401 正说明 HTTP 服务活着，见 health.go），
 // 于是服务管理里的健康列会显示正常，而不是永远"未配置"或"失败"。
 func TestHealthURLUsesWebPort(t *testing.T) {
-	frps, _ := FindApp("frps")
-	if got, want := healthURLFor(frps), fmt.Sprintf("http://127.0.0.1:%d/", frpsWebPort); got != want {
-		t.Errorf("frps 健康检查地址 = %q，期望 %q", got, want)
+	frpcApp, _ := FindApp("frpc")
+	if got, want := healthURLFor(frpcApp), fmt.Sprintf("http://127.0.0.1:%d/", frpcApp.Port); got != want {
+		t.Errorf("frpc 健康检查地址 = %q，期望 %q", got, want)
 	}
 	// 没有界面端口的（orbien 客户端）不给健康检查地址
 	oc, _ := FindApp("orbien-client")
@@ -464,27 +461,25 @@ func TestFrpcConfigKeepsRetrying(t *testing.T) {
 
 // TestHealthURLReconcilesBothWays 锁住"健康地址要与目录对齐，包括**清掉**"。
 //
-// 真机踩到：Lucky 的 HealthPath 从 "/" 改成空（它的「安全入口」会让任何路径 404），
-// 但老服务记录里那条 http://127.0.0.1:16601/ 不会自己消失 —— 只补不清的话，
+// 真机踩到：某个条目的 HealthPath 从 "/" 改成空（它的「安全入口」会让任何路径 404），
+// 但老服务记录里那条 http://127.0.0.1:<port>/ 不会自己消失 —— 只补不清的话，
 // 界面会永远显示"健康检查失败（HTTP 404）"，而服务其实是好的。
 func TestHealthURLReconcilesBothWays(t *testing.T) {
-	lucky, ok := FindApp("lucky")
+	// HealthPath 为空的条目：不该生成健康检查地址
+	noHealth := App{Port: 16601, HealthPath: ""}
+	if noHealth.HealthPath != "" {
+		t.Fatalf("样例条目构造不对：%q", noHealth.HealthPath)
+	}
+	if healthURLFor(noHealth) != "" {
+		t.Errorf("HealthPath 为空时不该生成健康检查地址，实际 %q", healthURLFor(noHealth))
+	}
+	// 有界面端口的条目（frpc 的 admin UI 7400）必须给出地址
+	frpcApp, ok := FindApp("frpc")
 	if !ok {
-		t.Fatal("目录里没有 lucky")
+		t.Fatal("目录里没有 frpc")
 	}
-	if lucky.HealthPath != "" {
-		t.Errorf("Lucky 不该配 HTTP 健康检查（用户开「安全入口」后任何路径都 404），实际 %q",
-			lucky.HealthPath)
-	}
-	if healthURLFor(lucky) != "" {
-		t.Errorf("HealthPath 为空时不该生成健康检查地址，实际 %q", healthURLFor(lucky))
-	}
-	frps, ok := FindApp("frps")
-	if !ok {
-		t.Fatal("目录里没有 frps")
-	}
-	if healthURLFor(frps) == "" {
-		t.Error("frps 有 dashboard，应当生成健康检查地址")
+	if healthURLFor(frpcApp) == "" {
+		t.Error("frpc 有 admin UI，应当生成健康检查地址")
 	}
 }
 

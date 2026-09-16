@@ -73,6 +73,11 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 	reachable, detail := probeTarget(ctx, rule.Target)
 	vhost := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
 	_, statErr := os.Stat(vhost)
+	// 域名兜底块是否存在：界面要能看出"域名限制到底有没有生效"，
+	// 否则用户只能靠"不带 Host 试探"才能发现限制被 nginx 的默认 server 吃掉了。
+	reject := filepath.Join(s.Cfg.VhostDir, proxies.RejectVhostName(rule.Listen)+".conf")
+	_, rejectErr := os.Stat(reject)
+	domainGuard := len(proxies.SplitDomains(rule.Domains)) > 0
 	return map[string]any{
 		"rule":           rule,
 		"id":             rule.ID,
@@ -94,6 +99,9 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"target_detail":  detail,
 		"config_written": statErr == nil,
 		"config_path":    vhost,
+		"domain_guard":   domainGuard,
+		"reject_written": rejectErr == nil,
+		"reject_path":    reject,
 	}
 }
 
@@ -213,7 +221,13 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, "规则已保存但 nginx 配置应用失败："+err.Error())
 		return
 	}
-	s.audit(r, "proxy_create", created.Name, fmt.Sprintf("%d → %s", created.Listen, created.Target), true, "")
+	detail := fmt.Sprintf("%d → %s", created.Listen, created.Target)
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		// 兜底拒绝块只是"域名对不上时拒绝"的加固，主规则已经生效，
+		// 所以这里不把整个请求判失败，但要如实写进审计让用户看得见。
+		detail += "（域名兜底块写入失败: " + err.Error() + "）"
+	}
+	s.audit(r, "proxy_create", created.Name, detail, true, "")
 	ok(w, s.proxyView(r.Context(), created))
 }
 
@@ -263,7 +277,11 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.audit(r, "proxy_update", saved.Name, fmt.Sprintf("%d → %s", saved.Listen, saved.Target), true, "")
+	detail := fmt.Sprintf("%d → %s", saved.Listen, saved.Target)
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		detail += "（域名兜底块写入失败: " + err.Error() + "）"
+	}
+	s.audit(r, "proxy_update", saved.Name, detail, true, "")
 	ok(w, s.proxyView(r.Context(), saved))
 }
 
@@ -292,7 +310,11 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.audit(r, "proxy_delete", cur.Name, fmt.Sprintf("%d → %s", cur.Listen, cur.Target), true, "")
+	detail := fmt.Sprintf("%d → %s", cur.Listen, cur.Target)
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		detail += "（域名兜底块写入失败: " + err.Error() + "）"
+	}
+	s.audit(r, "proxy_delete", cur.Name, detail, true, "")
 	ok(w, map[string]any{"msg": "已删除规则「" + cur.Name + "」并移除它的 nginx 配置"})
 }
 
@@ -338,6 +360,9 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 	if saved.Enabled {
 		action = "已启用"
 	}
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		action += "（域名兜底块写入失败: " + err.Error() + "）"
+	}
 	s.audit(r, "proxy_toggle", saved.Name, action, true, "")
 	ok(w, s.proxyView(r.Context(), saved))
 }
@@ -377,6 +402,60 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 func (s *Server) removeProxyConfig(ctx context.Context, rule *proxies.Rule) error {
 	if err := s.deleteVhost(ctx, rule.VhostName()); err != nil {
 		return err
+	}
+	return s.nginxReload(ctx)
+}
+
+// syncRejectBlocks 把"兜底拒绝块"与当前规则集对齐。
+//
+// 每次增删改/启停规则后都要调用：只有这样才能保证
+//   - 端口上出现了带域名的规则 → 立刻补上 default_server 拒绝块；
+//   - 该端口再没有带域名的规则 → 把拒绝块删掉（否则会把通配规则一起打死）。
+//
+// 判定用的是**数据库里的**规则集，而不是调用方内存里那条：调用方都应先落库、再调用。
+// 唯一的例外是"删掉域名"的更新 —— 那种情况下数据库还是旧值，会多留一个兜底块；
+// 表现为"该域名仍被保护"，不会把请求漏给后端，属于安全侧的多余，下次改动即收敛。
+func (s *Server) syncRejectBlocks(ctx context.Context) error {
+	list, err := s.proxyRepo().List(ctx)
+	if err != nil {
+		return err
+	}
+	need := map[int]bool{}
+	for _, r := range list {
+		if r.Enabled && len(proxies.SplitDomains(r.Domains)) > 0 {
+			need[r.Listen] = true
+		}
+	}
+
+	changed := false
+	for port := range need {
+		content := proxies.GenerateReject(port, s.proxyLogDir())
+		if err := s.writeVhost(ctx, proxies.RejectVhostName(port), content); err != nil {
+			return fmt.Errorf("写端口 %d 的兜底拒绝块失败：%w", port, err)
+		}
+		changed = true
+	}
+	// 清掉已经不需要的兜底块（扫目录，避免依赖内存里的端口集合）
+	entries, derr := os.ReadDir(s.Cfg.VhostDir)
+	if derr == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasPrefix(name, "proxy-reject-") || !strings.HasSuffix(name, ".conf") {
+				continue
+			}
+			portStr := strings.TrimSuffix(strings.TrimPrefix(name, "proxy-reject-"), ".conf")
+			port, perr := strconv.Atoi(portStr)
+			if perr != nil || need[port] {
+				continue
+			}
+			if err := s.deleteVhost(ctx, strings.TrimSuffix(name, ".conf")); err != nil {
+				return fmt.Errorf("删除端口 %s 的兜底拒绝块失败：%w", portStr, err)
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
 	}
 	return s.nginxReload(ctx)
 }

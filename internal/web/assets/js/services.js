@@ -1002,7 +1002,7 @@ export function ServicesView(content, ctx = {}) {
           text: '✏️ 编辑配置',
           onclick: (ev) => { m.close(); newServiceModal(load, cur); },
         }),
-        // 面板安装的应用（frps / frpc / Lucky / Orbien 服务端与客户端）把配置文件
+        // 面板安装的应用（frpc / Orbien 客户端）把配置文件
         // 放在安装目录里，服务详情通过 config_path 拿到路径。这里只加"编辑器入口"：
         // 读写复用既有的 /api/v1/files/read|write，不新造一套文件读写。
         cur.config_path ? h('button.btn.btn-sm', {
@@ -1068,7 +1068,7 @@ export function ServicesView(content, ctx = {}) {
 
   // ---------- 编辑配置文件 ----------
   //
-  // 为什么需要：frps / frpc / Lucky / Orbien 这些应用确实"在面板里跑"，
+  // 为什么需要：frpc / Orbien 客户端这类应用确实"在面板里跑"，
   // 但它们的配置不是几张表单能覆盖的（token、隧道、反代规则、证书…）。
   // 面板只做两件事：给出文件路径、提供一个文本框；读写走**既有的**文件接口
   // （GET /api/v1/files/read、POST /api/v1/files/write），

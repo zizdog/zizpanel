@@ -226,3 +226,77 @@ func (r *Rule) Generate(logDir string) (string, error) {
 	b.WriteString("\t}\n}\n")
 	return b.String(), nil
 }
+
+// RejectVhostName 是某个端口上「兜底拒绝」配置的文件名。
+//
+// 命名与规则文件用同一前缀，保证仍落在 vhosts/ 的包含范围内，
+// 且不会和站点文件（<域名>.conf）撞名。
+func RejectVhostName(port int) string { return fmt.Sprintf("proxy-reject-%d", port) }
+
+// RejectPorts 返回"需要兜底拒绝块"的端口集合。
+//
+// 判定条件只有一条：该端口上存在**已启用且带域名**的规则。
+// 端口上全是通配规则（domains 为空）时不返回它 —— 用户的意图本来就是
+// "这个端口随便什么域名都反代"，给这种端口加拒绝块会把规则一起打死。
+//
+// 抽成独立函数是为了让它能被单测直接钉住：真正的写盘路径要走提权助手，
+// 单测碰不得（见 AGENTS.md「测试不许碰生产配置」）。
+func RejectPorts(rules []*Rule) map[int]bool {
+	need := map[int]bool{}
+	for _, r := range rules {
+		if r == nil || !r.Enabled {
+			continue
+		}
+		if len(SplitDomains(r.Domains)) > 0 {
+			need[r.Listen] = true
+		}
+	}
+	return need
+}
+
+// OrphanRejectPorts 从 vhosts 目录的文件名里挑出"已经不需要"的兜底块端口。
+//
+// need 是需要保留的端口集合；返回的是应当删除的端口。
+// 名字对不上 `proxy-reject-<数字>.conf` 的一律忽略（可能来自别的工具或手工创建，
+// 面板没有权力删不属于自己的文件）。
+func OrphanRejectPorts(names []string, need map[int]bool) []int {
+	var out []int
+	for _, name := range names {
+		if !strings.HasPrefix(name, "proxy-reject-") || !strings.HasSuffix(name, ".conf") {
+			continue
+		}
+		portStr := strings.TrimSuffix(strings.TrimPrefix(name, "proxy-reject-"), ".conf")
+		port, err := strconv.Atoi(portStr)
+		if err != nil || need[port] {
+			continue
+		}
+		out = append(out, port)
+	}
+	return out
+}
+
+// GenerateReject 生成某端口的兜底 server 块。
+//
+// 为什么必须有它：nginx 在"某个端口上只有一个 server 块"时会把它当作**默认 server**，
+// 于是 server_name 形同虚设 —— 任何 Host（以及没有 Host 的请求）都会被转发到后端。
+// 2026-09-16 实测：规则写 domains=lede.zizdog.com，但不带 Host 头访问同样返回 200，
+// 等于域名限制从来没有生效。这里显式声明 default_server 并直接 444（不响应即断开），
+// 让"域名对不上"在 nginx 层就被拒绝，而不是把请求漏给后端。
+//
+// 只在**该端口存在带域名的规则**时才生成：如果端口上全是通配规则（domains 为空），
+// 用户的意图本来就是"这个端口随便什么域名都反代"，兜底块会把这类规则一起打死。
+func GenerateReject(port int, logDir string) string {
+	var b strings.Builder
+	b.WriteString("# 由 ZizPanel「反向代理」生成 —— 请勿手工编辑（会被面板覆盖）\n")
+	b.WriteString("server {\n")
+	fmt.Fprintf(&b, "\tlisten      %d default_server;\n", port)
+	b.WriteString("\tserver_name _;\n")
+	b.WriteString("\n\t# 域名对不上就断开，不把请求漏给后端\n")
+	b.WriteString("\treturn 444;\n")
+	if logDir != "" {
+		fmt.Fprintf(&b, "\n\taccess_log %s/proxy-reject-%d.access.log;\n", logDir, port)
+		fmt.Fprintf(&b, "\terror_log  %s/proxy-reject-%d.error.log;\n", logDir, port)
+	}
+	b.WriteString("}\n")
+	return b.String()
+}

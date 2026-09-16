@@ -640,35 +640,6 @@ func Catalog() []App {
 		//   · lucky / orbien：没有 formula，但有官方 darwin-arm64 预编译产物，
 		//     由 binary_release.go 那套通用安装器装（见该文件顶部说明）。
 		{
-			ID: "frps", Name: "frps（frp 服务端）", Icon: "🔌",
-			// dashboard 与协议口是两个端口，所以这里必须用**端口直连**：
-			// 反代会指向 UIPort(7500)，而 PreferDirect 让「打开」按钮直接给 7500。
-			UI: &AppUI{
-				Slug: "frps",
-				Note: "frps 的 dashboard 在 7500（协议口是 7000）；" +
-					"面板默认给端口直连 http://<地址>:7500",
-				PreferDirect: true,
-			},
-			Summary: "把内网服务暴露到公网（服务端，带 Web Dashboard）",
-			Description: "fatedier/frp 的服务端，配合 frpc 把内网机器上的端口映射到公网。" +
-				"**走原生（不走 Docker），且不碰 Homebrew**：下载官方 release 的 " +
-				"darwin-arm64 产物解压到 ~/frps，由系统级 launchd 托管，" +
-				"并与官方 SHA-256 校验清单比对。" +
-				"协议口 7000、Dashboard 7500；7000 常被 macOS「隔空播放接收器」占用，" +
-				"安装前检查会如实报冲突。",
-			Category: "tool", Kind: KindNative,
-			// 面板自研安装器（release 二进制 + launchd），不是 brew：
-			// 用户明确要求不碰 brew（Homebrew 的 7000 默认配置还会绕过面板的可视化配置）。
-			PanelInstaller: "frps", ServiceLabel: "com.zizdog.frps",
-			Port: 7000, UIPort: 7500, HealthPath: "/",
-			ConfigPath: "frps.toml",
-			PostInstallHint: "① 若 7000 被 macOS 隔空播放接收器占着，先在「系统设置 → 通用 → " +
-				"隔空投送与接力」里关掉它，或点「📝 编辑配置文件」把 bindPort 改成空闲端口后重启服务。" +
-				"② 公网暴露前确认 auth.token 已设置（面板已随机生成，不是空口令）。" +
-				"③ 同机的 frpc 必须填同一个 token，serverPort 填 7000。",
-			DocsURL: "https://github.com/fatedier/frp",
-		},
-		{
 			ID: "frpc", Name: "frpc（frp 客户端）", Icon: "🧷",
 			// frpc 的 admin UI 是它自己监听的 7400（协议上它是主动往外连的客户端，
 			// 但 webServer 会开一个本地面板），直连与子路径都指向它。
@@ -678,81 +649,22 @@ func Catalog() []App {
 				PreferDirect: true,
 			},
 			Summary: "把本机端口映射到 frps（客户端，带 admin UI）",
-			Description: "fatedier/frp 的客户端：连上 frps，把本机端口映射出去。" +
-				"**走原生（不走 Docker）**：与 frps 共用官方 darwin-arm64 tarball，" +
-				"解压到 ~/frpc 并用系统级 launchd 托管 —— 客户端要暴露的是" +
+			Description: "fatedier/frp 的客户端：连上你自己的 frps，把本机端口映射出去。" +
+				"**走原生（不走 Docker）**：官方 darwin-arm64 tarball 解压到 ~/frpc " +
+				"并用系统级 launchd 托管 —— 客户端要暴露的是" +
 				"**这台 Mac 上**的服务，放进容器后 127.0.0.1 会指向容器自己。" +
-				"serverPort 7000、admin UI 7400，auth.token 优先自动复用本机 frps 的。",
+				"admin UI 在 7400。**面板不提供 frps**，服务端地址与 token 请自己填。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "frpc", ServiceLabel: "com.zizdog.frpc",
 			// 7400 是它唯一监听的端口（admin UI），所以健康检查也查它。
 			Port: 7400, HealthPath: "/",
 			ConfigPath: "frpc.toml",
-			PostInstallHint: "① serverAddr/serverPort 默认指向本机的 frps（127.0.0.1:7000）；" +
-				"换成公网 frps 就改成它的 IP。② auth.token 必须与 frps 一致 —— " +
-				"面板安装时会尽量自动复用本机 frps 的 token；不同机器请从对端安装结果里抄。" +
+			PostInstallHint: "① serverAddr/serverPort 要改成你自己 frps 的地址与端口" +
+				"（面板不提供 frps，模板里 127.0.0.1:7000 只是占位）。" +
+				"② auth.token 必须与你 frps 的完全一致 —— 模板里那个是面板随机生成的占位值。" +
 				"③ 在 [[proxies]] 里加要暴露的端口（localIP 写 127.0.0.1）。" +
 				"改完点「📝 编辑配置文件」，保存后按提示重启服务生效。",
 			DocsURL: "https://github.com/fatedier/frp",
-		},
-		{
-			ID: "lucky", Name: "Lucky（反代 / DDNS / 端口转发）", Icon: "🍀",
-			UI: &AppUI{
-				Slug: "lucky",
-				Note: "Lucky 的后台可以在它自己的设置里改成「安全入口」（随机路径）或加 IP 白名单，" +
-					"那时子路径与直连的根路径都会 404；面板默认给端口直连（http://<地址>:16601）",
-				// 直连端口是首选：Lucky 的 Web UI 可能被用户设成安全入口/白名单，
-				// 那时任何路径都 404，子路径入口点开就是一个错误页。
-				PreferDirect: true,
-			},
-			Summary: "反向代理 / DDNS / 端口转发 / SSL 申请，带 Web 界面",
-			Description: "一个 Go 写的网络小工具集合：反向代理、DDNS、端口转发、WebDAV、" +
-				"SSL 申请等，网页界面在 16601。**改用 Docker 跑**（用户 2026-09-16 决定）：" +
-				"官方镜像 gdy666/lucky 实测自带 linux/arm64，不是 amd64 转译。" +
-				"**代价**：反代/转发的目标在 Colima 虚拟机网络里，连 Mac 本机服务" +
-				"要写宿主机地址；首次访问需自行设账号口令。",
-			Category: "tool", Kind: KindCompose, Port: 16601,
-			// 刻意**不做 HTTP 健康检查**（HealthPath 留空 = 只看容器/端口）。
-			// 原因：Lucky 的 Web UI 可以被用户自己设成「安全入口」（随机路径）或加 IP 白名单，
-			// 那时它对**任何**路径（包括 127.0.0.1 上的 `/`）都返回 404 而不是 403 ——
-			// 服务完全正常，HTTP 健康检查却会红。真机实测过这一点。
-			Requires: []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
-			ComposeYAML: composeTemplate("lucky", "gdy666/lucky:latest", 16601, 16601, `
-    volumes:
-      - ./data:/goodluck
-    restart: unless-stopped`),
-			DocsURL: "https://github.com/gdy666/lucky",
-		},
-		{
-			ID: "orbien", Name: "Orbien（内网穿透平台）", Icon: "🛰️",
-			// Dashboard 的 index.html 用**绝对**路径引资源（/assets/index-*.js），
-			// 子路径下必须改写；面板没有在真机上验证它的其余接口路径，
-			// 所以同样把端口直连设为首选入口。
-			UI: &AppUI{
-				Slug: "orbien",
-				Rewrites: []UIRewrite{
-					{From: "/assets/", To: "/{slug}/assets/"},
-					{From: "/favicon.ico", To: "/{slug}/favicon.ico"},
-				},
-				Note: "Orbien Dashboard 用绝对路径引资源（/assets/…），" +
-					"子路径改写未在真机实测；面板默认给端口直连（http://<地址>:8020）",
-				PreferDirect: true,
-			},
-			Summary: "Rust 写的轻量内网穿透，带 Web Dashboard",
-			Description: "Rust 写的轻量内网穿透：传输支持 TCP/QUIC/KCP/WebSocket，" +
-				"代理支持 TCP/UDP/HTTP/HTTPS/SOCKS5，带 Web Dashboard（Basic 鉴权）。" +
-				"**走原生（不走 Docker）**：官方 darwin-arm64 产物解压到 ~/orbien，" +
-				"由系统级 launchd 托管 —— 穿透要贴宿主机网络栈，容器里看不到 Mac 局域网。" +
-				"控制口 9527、Dashboard 8020（口令随机生成）。",
-			Category: "tool", Kind: KindNative,
-			PanelInstaller: "orbien", ServiceLabel: "com.zizdog.orbien",
-			Port: 8020, HealthPath: "/",
-			ConfigPath: "orbien-server.toml",
-			PostInstallHint: "客户端请用同版本（v3.6.0）：面板市场里的「Orbien 客户端（CLI）」、" +
-				"上游的 Orbien-Desktop（GUI，dmg）或 orbien CLI。服务端地址填 <本机地址>:9527。" +
-				"Dashboard 口令在安装结果里，也可以点「📝 编辑配置文件」改 " +
-				"[dashboard] 的 password 后重启服务。",
-			DocsURL: "https://github.com/orbien-org/orbien",
 		},
 		{
 			ID: "orbien-client", Name: "Orbien 客户端（CLI）", Icon: "🛰️",
@@ -763,13 +675,16 @@ func Catalog() []App {
 			Description: "Orbien 的**客户端**（上游 CLI）。**走原生（不走 Docker）**：" +
 				"官方 darwin-arm64 产物解压到 ~/orbien-client，由系统级 launchd 托管 ——" +
 				"原生下 [[tunnels]] 的 service 直接写 127.0.0.1，容器里会指向容器自己。" +
-				"客户端主动外连、不监听端口，server 默认 127.0.0.1:9527。",
+				"客户端主动外连、不监听端口。**面板不提供服务端**，地址请自己填。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "orbien-client", ServiceLabel: "com.zizdog.orbien-client",
 			Port:       0,
 			ConfigPath: "orbien.toml",
-			PostInstallHint: "① server 默认指向本机的 Orbien 服务端（127.0.0.1:9527）；" +
-				"穿透到公网服务器就改成 <服务器IP>:9527。" +
+			PostInstallHint: "① server 要改成你自己的 Orbien 服务端地址" +
+				"（面板不提供服务端，模板里 127.0.0.1:9527 只是占位）。" +
+				"② 服务端启用了 auth.token 时，客户端也要填同一个值。" +
+				"③ 在 [[tunnels]] 里加要暴露的端口：service 写 127.0.0.1:<本地端口>，" +
+				"remotePort 写服务端上的端口。改完点「📝 编辑配置文件」保存后重启服务生效。" +
 				"② 服务端启用了 auth.token 时，客户端也要填同一个值。" +
 				"③ 在 [[tunnels]] 里加要暴露的端口：service 写 127.0.0.1:<本地端口>，" +
 				"remotePort 写服务端上的端口。改完点「📝 编辑配置文件」保存后重启服务生效。" +

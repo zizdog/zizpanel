@@ -127,3 +127,48 @@ func TestVhostNameHasPrefix(t *testing.T) {
 		t.Error("vhost 文件名必须带 proxy- 前缀，避免与站点配置撞名")
 	}
 }
+
+// TestGenerateRejectBlocksUnmatchedHost 锁住「域名限制真的生效」这件事。
+//
+// 背景（2026-09-16 真机实测）：规则写了 domains=lede.zizdog.com，但**不带 Host 头
+// 访问同样返回 200**。原因是 nginx 把"该端口上唯一的 server 块"当作默认 server，
+// 于是 server_name 形同虚设 —— 任何 Host 都会被打到后端。
+// 修法是给该端口生成一个显式 default_server 兜底块并直接 444。
+//
+// 这条测试盯的是"兜底块必须存在且必须拒绝"，缺任何一个都会让域名限制
+// 退化成"什么域名都反代"，而那正是用户看不出来的那种失效。
+func TestGenerateRejectBlocksUnmatchedHost(t *testing.T) {
+	got := GenerateReject(18092, "/tmp/logs")
+
+	for _, want := range []string{
+		"listen      18092 default_server;", // 必须是 default_server，否则抢不到默认位
+		"server_name _;",
+		"return 444;", // 444 = 不响应直接断开，不把请求漏给后端
+		"/tmp/logs/proxy-reject-18092.access.log",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("兜底拒绝块缺少 %q：\n%s", want, got)
+		}
+	}
+	// 兜底块绝不能反代：一旦带 proxy_pass，它就从"拒绝"变成了"又一条通配规则"
+	if strings.Contains(got, "proxy_pass") {
+		t.Errorf("兜底拒绝块不允许出现 proxy_pass：\n%s", got)
+	}
+}
+
+// TestRejectVhostNameFitsInclude 锁住兜底块的文件名仍落在 vhosts 包含范围内。
+//
+// 面板的 nginx 配置只 include `vhosts/*.conf`：名字里多一个斜杠或少了后缀，
+// 生成的兜底块就不会被加载 —— 表现为"文件写了、域名限制照样不生效"。
+func TestRejectVhostNameFitsInclude(t *testing.T) {
+	name := RejectVhostName(8080)
+	if name != "proxy-reject-8080" {
+		t.Fatalf("兜底块文件名应为 proxy-reject-<port>，实际 %q", name)
+	}
+	if strings.ContainsAny(name, "/\\") {
+		t.Error("文件名不能含路径分隔符，否则不会落在 vhosts/ 目录里")
+	}
+	if !strings.HasPrefix(name, "proxy-") {
+		t.Error("必须与规则文件共用 proxy- 前缀，避免和站点 <域名>.conf 撞名")
+	}
+}

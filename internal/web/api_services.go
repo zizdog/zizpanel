@@ -740,7 +740,7 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 官方 release 原生二进制（Orbien 服务端 / frps / frpc / Orbien 客户端）：
+	// 官方 release 原生二进制（frpc / Orbien 客户端）：
 	// 参数不同但流程同一套，所以共用一个处理器，按目录 ID 分流。
 	//
 	// **判定必须以目录条目为准**：注册表里还留着某个 ID，而目录已经把它改成
@@ -921,7 +921,7 @@ func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
 
 // handleInstallReleaseBinary 部署"官方 release 原生二进制"类应用。
 //
-// 目前服务 Lucky / Orbien 服务端 / frps / frpc / Orbien 客户端（见
+// 目前服务 frpc 与 Orbien 客户端（见
 // services.IsReleaseBinaryApp 与 releaseBinaryApps）。与其它安装器一样走任务中心：
 // 下载 + 解压 + 注册系统级服务不是秒级动作，而且用户需要看到下载来源
 // （官方还是加速镜像）、sha256 校验结果与最终的验证结论。

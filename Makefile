@@ -221,7 +221,7 @@ NAS_APPS_ROOT  ?= /vol2/zizpanel-mirror/apps
 APPS_MIRROR_URL ?= https://mirror.zizdog.com:8888
 # 口令不写进仓库（铁律 7）。发布时用 make publish-nas NAS_PASS='...' 传入。
 NAS_PASS       ?=
-# 传给 sync-apps 的额外参数，例如 SYNC_ARGS='--dry-run' 或 SYNC_ARGS='--app lucky'
+# 传给 sync-apps 的额外参数，例如 SYNC_ARGS='--dry-run' 或 SYNC_ARGS='--app frpc'
 SYNC_ARGS      ?=
 
 .PHONY: upgrade-e2e

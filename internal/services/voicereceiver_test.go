@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -523,12 +525,22 @@ func TestBuiltinVoiceAssetIsUsableWav(t *testing.T) {
 // 读不到那个 rc；sudo 又会清空环境。结果面板装 nginx/PHP/MySQL 时 brew 走官方源，
 // 国内无代理基本不通，界面表现是"点了安装长时间没进度"，看着像面板卡死。
 func TestBrewEnvInjectsChinaMirrors(t *testing.T) {
-	m := &Manager{}
-	env := m.brewEnv()
+	// ⚠️ 必须清掉**运行环境里**可能存在的 HOMEBREW_API_DOMAIN / HOMEBREW_BOTTLE_DOMAIN。
+	// 开发机/CI 上常为了加速而导出这两个变量（本机实测就导出的是阿里云），
+	// 而 brewEnv 的契约是"用户设过的以用户为准" —— 不清掉的话，
+	// 这个测试断言的就成了"运行环境的值"，而不是被测代码的行为。
+	t.Setenv("HOMEBREW_API_DOMAIN", "")
+	t.Setenv("HOMEBREW_BOTTLE_DOMAIN", "")
+
+	// 注入假探测：不许打真实网络（单测纪律）。这里模拟"自建镜像可用"。
+	m := &Manager{mirrorProbeOverride: func(ctx context.Context, probeFormula string) (string, string) {
+		return "https://mirror.example.com:8888/brew/api", "https://mirror.example.com:8888/brew"
+	}}
+	env := m.brewEnv(context.Background(), "php@8.3")
 	joined := strings.Join(env, "\n")
 	for _, want := range []string{
-		"HOMEBREW_API_DOMAIN=https://mirrors.aliyun.com/homebrew/homebrew-bottles/api",
-		"HOMEBREW_BOTTLE_DOMAIN=https://mirrors.aliyun.com/homebrew/homebrew-bottles",
+		"HOMEBREW_API_DOMAIN=https://mirror.example.com:8888/brew/api",
+		"HOMEBREW_BOTTLE_DOMAIN=https://mirror.example.com:8888/brew",
 		"HOMEBREW_NO_AUTO_UPDATE=1",
 	} {
 		if !strings.Contains(joined, want) {
@@ -537,8 +549,122 @@ func TestBrewEnvInjectsChinaMirrors(t *testing.T) {
 	}
 	// 用户已经设过的以用户为准（不覆盖）
 	t.Setenv("HOMEBREW_API_DOMAIN", "https://example.com/api")
-	if got := strings.Join(m.brewEnv(), "\n"); !strings.Contains(got, "https://example.com/api") {
+	if got := strings.Join(m.brewEnv(context.Background(), "php@8.3"), "\n"); !strings.Contains(got, "https://example.com/api") {
 		t.Error("用户自己设的 HOMEBREW_API_DOMAIN 应被尊重，不能被默认值覆盖")
+	}
+}
+
+// TestBrewEnvPrefersSelfHostedMirror 锁住用户的要求：
+// **LNMP 的包也要走自建 NAS 镜像，并且优先调用**。
+//
+// 自建镜像不可用时必须能落到公共镜像 —— 否则 NAS 一挂，LNMP 就装不上。
+func TestBrewEnvPrefersSelfHostedMirror(t *testing.T) {
+	// 同上：先清掉运行环境里的同名变量，否则断言的是环境而不是代码。
+	t.Setenv("HOMEBREW_API_DOMAIN", "")
+	t.Setenv("HOMEBREW_BOTTLE_DOMAIN", "")
+
+	// 自建镜像可用 → 用它（api 与瓶都指向它）
+	ok := &Manager{mirrorProbeOverride: func(ctx context.Context, f string) (string, string) {
+		return "https://mirror.zizdog.com:8888/brew/api", "https://mirror.zizdog.com:8888/brew"
+	}}
+	got := strings.Join(ok.brewEnv(context.Background(), "nginx"), "\n")
+	if !strings.Contains(got, "HOMEBREW_BOTTLE_DOMAIN=https://mirror.zizdog.com:8888/brew") {
+		t.Errorf("自建镜像可用时应优先用它做瓶域：\n%s", got)
+	}
+
+	// 自建镜像不可用 → 落到公共镜像（这里由注入模拟），不能留空导致走官方
+	fallback := &Manager{mirrorProbeOverride: func(ctx context.Context, f string) (string, string) {
+		return "https://mirrors.ustc.edu.cn/homebrew-bottles/api",
+			"https://mirrors.ustc.edu.cn/homebrew-bottles"
+	}}
+	got2 := strings.Join(fallback.brewEnv(context.Background(), "nginx"), "\n")
+	if !strings.Contains(got2, "HOMEBREW_API_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-bottles/api") {
+		t.Errorf("自建镜像不可用时该落到公共镜像：\n%s", got2)
+	}
+	if !strings.Contains(got2, "HOMEBREW_BOTTLE_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-bottles") {
+		t.Errorf("公共镜像的瓶域也要设上（实测中科大 5.1MB/s）：\n%s", got2)
+	}
+}
+
+// TestFirstFormulaOf 锁住"从 brew 参数里认出探针包名"。
+//
+// 这个解析只服务于"用哪个镜像"的探测：探错了包名最多是探测失败（回落到第一家），
+// 不会影响真正安装的参数 —— 所以它必须足够保守，宁可返回空。
+func TestFirstFormulaOf(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"install", "php@8.3"}, "php@8.3"},
+		{[]string{"install", "--formula", "nginx"}, "nginx"}, // -开头 的跳过
+		{[]string{"reinstall", "mysql@8.4"}, "mysql@8.4"},
+		{[]string{"services", "start", "nginx"}, "nginx"},
+		{[]string{"install"}, ""},   // 没有包名
+		{[]string{"--version"}, ""}, // 只有选项
+	}
+	for _, c := range cases {
+		if got := firstFormulaOf(c.args); got != c.want {
+			t.Errorf("firstFormulaOf(%v) = %q，期望 %q", c.args, got, c.want)
+		}
+	}
+}
+
+// TestBrewMirrorWorksProbe 锁住镜像探测本身。
+//
+// 为什么值得单独测：这个探测决定"用哪家镜像"，而选错的后果很隐蔽 ——
+// 镜像清单旧了会让 brew 取不到瓶文件、静默回落到 ghcr.io（91KB/s），
+// 表现成"一键装 LNMP 特别慢/像卡死"。这里钉住"能拿到清单才算可用"。
+func TestBrewMirrorWorksProbe(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/formula/nginx.json", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"nginx"}`))
+	})
+	// php@8.3 故意不给 → 模拟"清单里没有这个包"的镜像
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	if !brewMirrorWorks(context.Background(), ts.URL, "nginx") {
+		t.Error("能从镜像 API 拿到清单时应判定为可用")
+	}
+	if brewMirrorWorks(context.Background(), ts.URL, "php@8.3") {
+		t.Error("镜像 API 没有这个 formula（404）时不该判定为可用")
+	}
+	if brewMirrorWorks(context.Background(), "", "nginx") {
+		t.Error("基址为空时不该判定为可用")
+	}
+	// 不可达的地址：必须如实返回 false，而不是挂住
+	if brewMirrorWorks(context.Background(), "http://127.0.0.1:1", "nginx") {
+		t.Error("不可达的镜像不该判定为可用")
+	}
+}
+
+// TestBrewMirrorSupportsOCI 锁住"只有提供 OCI 布局的镜像才配当瓶域"。
+//
+// 背景（2026-09-16 实测）：阿里云的 API 清单可用，但 <base>/v2/… 返回 404，
+// 而 Homebrew 是拿这个域去替换清单里的 ghcr.io 的。把 404 的域设进去，
+// 用户只会多等一次失败再回落官方域（实测官方域 91KB/s）。
+func TestBrewMirrorSupportsOCI(t *testing.T) {
+	mux := http.NewServeMux()
+	// 支持 OCI 的镜像：任意 sha 都给 206
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/blobs/sha256:") {
+			w.WriteHeader(http.StatusPartialContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	if !brewMirrorSupportsOCI(context.Background(), ts.URL) {
+		t.Error("提供 /v2/…/blobs/sha256: 的镜像应被判定为可当瓶域")
+	}
+	// 不支持 OCI 的镜像：一律 404
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts2.Close()
+	if brewMirrorSupportsOCI(context.Background(), ts2.URL) {
+		t.Error("一律 404 的镜像不该被判定为可当瓶域")
 	}
 }
 

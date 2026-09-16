@@ -136,7 +136,15 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData bool, result *InstallResult) error {
 	app, ok := FindApp(appID)
 	if !ok {
-		return fmt.Errorf("目录里没有这个应用: %s", appID)
+		// 条目已经从应用市场移除（2026-09-16 移除了 Lucky / frps / Orbien 服务端），
+		// 但用户机器上可能**已经装了** —— 那台机器必须仍然删得掉。
+		// 否则就是最坏状态：界面上没了、磁盘上还在跑，而用户无处可点。
+		//
+		// 刻意**不填** PanelInstaller：那会让流程走进"用安装器正规卸载"的分支，
+		// 而那个分支要读服务记录、要动 launchd，对一个已经不在目录里的条目并不合适。
+		// PanelInstaller 留空 → 落入下面的"残留清理"分支，按 ID 删掉磁盘上真实存在的目录，
+		// 并摘掉按命名约定推出的 launchd 服务。
+		app = App{ID: appID, Name: appID}
 	}
 	// 没有 PanelInstaller 的应用（compose / docker 类，或"旧版原生安装的残留"）：
 	// 清理动作就是删掉磁盘上真实存在的那些目录。
@@ -146,7 +154,10 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 	// 两边都对不上，用户点哪都没有反应（2026-09-16 用户原话"lucky 根本没被卸载掉"）。
 	if app.PanelInstaller == "" {
 		targets := []string{}
-		if app.Kind == KindCompose || app.Kind == KindDocker {
+		// 条目还在目录里时按它声明的 Kind 判断；条目**已从目录移除**时（!ok）
+		// 我们不知道它当初是 compose 还是原生，就把两种位置都查一遍 ——
+		// 这正是用户最需要的那种清理，漏查一种就等于"点了删不掉"。
+		if !ok || app.Kind == KindCompose || app.Kind == KindDocker {
 			targets = append(targets, filepath.Join(m.composeDir(), app.ID))
 		}
 		if d := m.legacyNativeDir(app); d != "" {

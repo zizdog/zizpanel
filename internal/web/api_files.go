@@ -28,7 +28,7 @@ import (
 // fileManager 构造文件管理器。
 //
 // 每次调用重新构造（不再 sync.Once 缓存）：根目录里包含"面板安装的应用配置文件
-// 所在目录"，而用户完全可能在面板运行期间**刚装完** Lucky / frps ——
+// 所在目录"，而用户完全可能在面板运行期间**刚装完** frpc ——
 // 缓存住旧根目录的后果是「📝 编辑配置文件」报"路径不在允许访问的范围内"，
 // 只有重启面板才好。构造只是几次 os.Stat，代价可以忽略。
 func (s *Server) fileManager() *files.Manager {
@@ -51,7 +51,7 @@ func (s *Server) fileManager() *files.Manager {
 
 // appConfigRoots 返回"面板安装的应用的配置文件所在目录"。
 //
-// 为什么需要：Lucky / Orbien / frps 装在用户家目录下（~/lucky、~/orbien、~/frps），
+// 为什么需要：frpc / Orbien 客户端装在用户家目录下（~/frpc、~/orbien-client），
 // 默认的文件管理器白名单（网站目录 + 面板数据/日志/工作目录）覆盖不到，
 // 于是服务详情里的「📝 编辑配置文件」会被 files.Manager 正当地拒绝。
 // 这里只把**这些应用的安装目录**加进白名单，不是整个家目录 ——

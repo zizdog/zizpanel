@@ -430,7 +430,7 @@ export function SettingsView(content) {
             h('label', { text: '应用包镜像基址' }),
             mirrorInput,
             h('div.hint', {
-              html: '安装 Lucky / frps / frpc / Orbien 这类应用时，面板先检查 ' +
+              html: '安装 frpc / Orbien 客户端这类应用时，面板先检查 ' +
                 '<code class="code">&lt;基址&gt;/apps/&lt;应用&gt;/&lt;版本&gt;/&lt;文件名&gt;</code> 在不在；' +
                 '镜像上没有就明确失败并提示如何同步，<b>不会</b>偷偷回退到 GitHub。<br>' +
                 '留空 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）。',

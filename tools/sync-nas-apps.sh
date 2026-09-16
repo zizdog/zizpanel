@@ -14,7 +14,7 @@
 #  用法：
 #    bash tools/sync-nas-apps.sh --dry-run          # 只打印计划，不下载不上传
 #    NAS_PASS='...' bash tools/sync-nas-apps.sh     # 真同步（需要 sshpass）
-#    只同步一个应用：加 --app lucky
+#    只同步一个应用：加 --app frpc
 #
 #  环境变量：NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS / MIRROR_BASE_URL
 #  ⚠️ 口令只从环境变量进、只交给 sshpass，绝不写进任何文件、也不打印。

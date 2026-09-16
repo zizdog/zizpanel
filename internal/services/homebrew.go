@@ -253,7 +253,7 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 		defer func() { _ = os.RemoveAll(shimDir) }()
 	}
 	result.step(ctx, "开始安装 Homebrew（国内镜像下通常几分钟）")
-	env := append(m.brewEnv(),
+	env := append(m.brewEnv(ctx, "brew"),
 		"HOMEBREW_BREW_GIT_REMOTE=https://mirrors.ustc.edu.cn/brew.git",
 		"HOMEBREW_CORE_GIT_REMOTE=https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
 		// AllowRoot + 垫片 + 临时免密 sudo 是同一个目的的三道保险：

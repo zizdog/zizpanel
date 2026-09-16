@@ -135,6 +135,10 @@ type Manager struct {
 	// 实测就这么发生过：断言"服务不可用时应降级"的测试，因为本机恰好
 	// 有另一个项目在跑 Qwen 而失败，测出来的根本不是被测代码的行为。
 	qwenPortOverride int
+	// mirrorProbeOverride 仅供测试：替换 brew 镜像探测（它会发真实网络请求）。
+	// 没有它的话，每个碰 brewEnv 的单测都会去访问阿里云/中科大，既慢又依赖外网 ——
+	// 违反"单测不许碰真实服务"。
+	mirrorProbeOverride func(ctx context.Context, probeFormula string) (apiDomain, bottleDomain string)
 }
 
 // Options 是管理器需要的环境信息。
