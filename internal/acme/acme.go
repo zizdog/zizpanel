@@ -137,6 +137,11 @@ type Manager struct {
 	// 国内 DNS 有时要几分钟才生效，可以调大 DNSTimeout。
 	DNSTimeout time.Duration
 	DNSPolling time.Duration
+	// DNS01Resolvers 覆盖 dns-01 预检用的递归解析器，**必须是 IP 字面量**。
+	// 留空时用 DefaultDNS01Resolvers（见 resolvers.go）。
+	// 为什么不许写主机名：lego 默认值就是主机名，解析它要走系统解析器，
+	// 在"路由器通告了不可达 IPv6 DNS"的网络里会让签发直接 i/o timeout（真机踩过）。
+	DNS01Resolvers []string
 	// EABKid / EABHmacKey 是 External Account Binding 凭据。
 	// ZeroSSL 这类 CA 强制要求 EAB，没有它注册账户会被拒。
 	EABKid     string
