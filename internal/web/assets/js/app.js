@@ -72,17 +72,52 @@ export function panelPath(sub = '') {
   return entry.replace(/\/+$/, '/') + String(sub).replace(/^\/+/, '');
 }
 
-// ---------------- 主题 ----------------
+// ---------------- 主题（三态：light / dark / auto） ----------------
+//
+// 用户 2026-09-17 反馈："之前的夜间模式 3 态，现在没有自动模式了"。
+// 以前这里把"跟随系统"当成了**首次访问时的一次性推导**（把系统偏好落成一个具体值
+// 存进 localStorage），于是存下来之后就跟系统脱钩了 —— 系统换了主题，面板不跟。
+// 现在把 auto 当成**真正的第三态**存起来：
+//   · 'light' / 'dark'：用户手动固定；
+//   · 'auto'（或没有存过）：跟随系统，且系统主题变化时**实时**跟随。
+const THEME_KEY = 'zp-theme';
+const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+function themePref() {
+  const v = localStorage.getItem(THEME_KEY);
+  return v === 'light' || v === 'dark' ? v : 'auto';
+}
+
+// resolvedTheme 把偏好折算成真正生效的主题（auto → 当前系统主题）。
+function resolvedTheme() {
+  const p = themePref();
+  return p === 'auto' ? (darkQuery.matches ? 'dark' : 'light') : p;
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = resolvedTheme();
+}
+
 function initTheme() {
-  const saved = localStorage.getItem('zp-theme');
-  const theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-  document.documentElement.dataset.theme = theme;
+  applyTheme();
+  // 只有 auto 需要监听：固定主题时系统变化不该影响面板。
+  darkQuery.addEventListener('change', () => { if (themePref() === 'auto') applyTheme(); });
+}
+
+// 主题按钮的图标与提示按**偏好**（而不是折算后的主题）显示 —— 否则"跟随系统"
+// 会看起来像手动固定成了当前那个主题，用户就再也找不到 auto 了。
+function themeButtonFace() {
+  const p = themePref();
+  if (p === 'light') return { icon: '☀️', title: '主题：浅色（点击切换：深色）' };
+  if (p === 'dark') return { icon: '🌙', title: '主题：深色（点击切换：跟随系统）' };
+  return { icon: '🌗', title: `主题：跟随系统（当前 ${resolvedTheme() === 'dark' ? '深色' : '浅色'}，点击切换：浅色）` };
 }
 
 function toggleTheme() {
-  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem('zp-theme', next);
+  const order = ['light', 'dark', 'auto'];
+  const next = order[(order.indexOf(themePref()) + 1) % order.length];
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme();
 }
 
 // ---------------- 启动 ----------------
@@ -321,7 +356,7 @@ function renderApp() {
       text: user.totp_enabled ? '2FA 已开启' : '2FA 未开启',
       title: '两步验证状态，可在「面板设置」中调整',
     }),
-    h('button.btn.btn-ghost.btn-icon', { text: document.documentElement.dataset.theme === 'light' ? '🌙' : '☀️', title: '切换主题', onclick: () => { toggleTheme(); renderApp(); } }),
+    (() => { const f = themeButtonFace(); return h('button.btn.btn-ghost.btn-icon', { text: f.icon, title: f.title, onclick: () => { toggleTheme(); renderApp(); } }); })(),
     h('button.btn.btn-ghost.btn-icon', { text: '⟳', title: '刷新', onclick: () => render() }),
     h('button.btn.btn-ghost.btn-icon', { text: '⏻', title: '退出登录', onclick: doLogout }),
   ]);

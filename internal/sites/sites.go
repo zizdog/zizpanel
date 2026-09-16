@@ -419,7 +419,9 @@ func fastcgiParamPairs() []string {
 		"DOCUMENT_URI $document_uri",
 		"DOCUMENT_ROOT $document_root",
 		"SERVER_PROTOCOL $server_protocol",
-		"REQUEST_SCHEME $scheme",
+		// REQUEST_SCHEME / HTTPS 走 $zp_* —— 它们会把"来自面板反代的
+		// X-Forwarded-Proto"折算进来（见 schemeTrustBlock 的说明）。
+		"REQUEST_SCHEME $zp_scheme",
 		"SERVER_SOFTWARE nginx/$nginx_version",
 		"REMOTE_ADDR $remote_addr",
 		"REMOTE_PORT $remote_port",
@@ -431,7 +433,7 @@ func fastcgiParamPairs() []string {
 		// HTTPS 变量在非 SSL 连接下为空，用 if_not_empty 避免警告。
 		// 放在清单末尾而不是循环外特判：这样它就是**同一份参数清单**的一部分，
 		// 默认站点/phpMyAdmin 用的 FastCGIParamsBlock 也会带上它。
-		"HTTPS $https if_not_empty",
+		"HTTPS $zp_https if_not_empty",
 	}
 }
 
@@ -440,10 +442,30 @@ func fastcgiParamPairs() []string {
 // 但内联进 vhost 以便每个站点独立选择 PHP 版本。
 func fastcgiParams() string {
 	var b strings.Builder
+	b.WriteString(schemeTrustBlock())
 	for _, p := range fastcgiParamPairs() {
 		b.WriteString("\t\tfastcgi_param " + p + ";\n")
 	}
 	return b.String()
+}
+
+// schemeTrustBlock 让"TLS 在面板反代那一层终止"的站点知道客户端其实是 https。
+//
+// 为什么需要（用户 2026-09-17 的架构诉求，也是 Lucky 的默认做法）：证书只在反代规则上，
+// 站点只跑明文 HTTP —— 此时 PHP 看到的 `$scheme`/`$https` 是 http，WordPress / Typecho
+// 会以为自己不是 HTTPS，于是生成 `http://…` 链接、甚至跳转循环。
+//
+// 折算规则刻意**只信任来自回环**的 X-Forwarded-Proto：面板的反代是从 127.0.0.1
+// 连到站点的，而外部客户端直连时 `$remote_addr` 是它自己的地址，**伪造不了**这个头。
+// 直连 443 的站点行为不变（$zp_scheme 仍等于 $scheme）。
+func schemeTrustBlock() string {
+	return "\t\t# 反代终止 TLS 时（站点只跑明文）：折算 HTTPS / REQUEST_SCHEME。\n" +
+		"\t\t# 只信任**来自回环**的 X-Forwarded-Proto —— 外部客户端伪造不了（$remote_addr 不是 127.0.0.1）。\n" +
+		"\t\tset $zp_scheme $scheme;\n" +
+		"\t\tif ($remote_addr = 127.0.0.1) { set $zp_scheme $http_x_forwarded_proto; }\n" +
+		"\t\tif ($zp_scheme != \"https\") { set $zp_scheme \"http\"; }\n" +
+		"\t\tset $zp_https \"\";\n" +
+		"\t\tif ($zp_scheme = \"https\") { set $zp_https \"on\"; }\n"
 }
 
 // ---------- PHP 版本与 FastCGI 地址 ----------

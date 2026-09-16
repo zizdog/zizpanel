@@ -386,3 +386,36 @@ func makeSelfSigned(t *testing.T, dir string) (string, string) {
 	}
 	return cert, key
 }
+
+// TestPHPSiteTrustsLoopbackForwardedProto 锁住"Lucky 式"反代下的 HTTPS 判定。
+//
+// 架构：证书只在面板的反代规则上，站点只跑明文 HTTP。此时 PHP 看到的 $scheme/$https
+// 是 http，WordPress/Typecho 会生成 http:// 链接。所以站点 vhost 必须把**来自回环**的
+// X-Forwarded-Proto 折算成 HTTPS/REQUEST_SCHEME（外部客户端伪造不了：$remote_addr 不是回环）。
+func TestPHPSiteTrustsLoopbackForwardedProto(t *testing.T) {
+	s := &Site{Domain: "trust.test", Root: "/tmp/trust.test", PHPVersion: "8.3", Rewrite: "none", Enabled: true}
+	conf, err := s.Generate(Options{LogDir: "/tmp/zplogs", FastCGIPass: "127.0.0.1:9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"set $zp_scheme $scheme;",
+		`if ($remote_addr = 127.0.0.1) { set $zp_scheme $http_x_forwarded_proto; }`,
+		`if ($zp_scheme != "https") { set $zp_scheme "http"; }`,
+		`set $zp_https "";`,
+		`if ($zp_scheme = "https") { set $zp_https "on"; }`,
+		"fastcgi_param REQUEST_SCHEME $zp_scheme;",
+		"fastcgi_param HTTPS $zp_https if_not_empty;",
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("vhost 里缺少 %q（反代终止 TLS 时 PHP 会误判为 http）：\n%s", want, conf)
+		}
+	}
+	// 不能再出现裸 $scheme / $https —— 那等于没有折算。
+	if strings.Contains(conf, "fastcgi_param REQUEST_SCHEME $scheme;") {
+		t.Error("REQUEST_SCHEME 仍用 $scheme（没有折算反代传来的协议）")
+	}
+	if strings.Contains(conf, "fastcgi_param HTTPS $https") {
+		t.Error("HTTPS 仍用 $https（没有折算反代传来的协议）")
+	}
+}
