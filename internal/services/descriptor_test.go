@@ -202,13 +202,15 @@ func TestTarballDescriptorsMatchRegistry(t *testing.T) {
 	}
 }
 
-// TestTarballRailOnlyContainsMigratedApps 锁住"这一轮只迁了三个"。
+// TestTarballRailOnlyContainsMigratedApps 锁住"tarball 轨上有哪些应用"。
 //
 // 目标 rail 是 tarball 的应用必须都真的有描述符；反过来，描述符里 rail=tarball
 // 的也必须都在参数表里（否则 web 分流与执行器会对不上）。
+//
+// 2026-09-17 新增 alist（它从未进过 homebrew-core，只能走官方 release 产物）。
 func TestTarballRailOnlyContainsMigratedApps(t *testing.T) {
 	got := descriptorIDsForRail(RailTarball)
-	want := []string{"ddns-go", "frpc", "orbien-client"}
+	want := []string{"alist", "ddns-go", "frpc", "orbien-client"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("tarball 轨的应用 = %v，期望 %v", got, want)
 	}
@@ -1051,5 +1053,52 @@ func TestReleaseBinaryIsThinDelegateOverDescriptor(t *testing.T) {
 	// 参数表必须由描述符回填展示字段，避免同一个事实写两遍。
 	if !strings.Contains(string(reg), "releaseBinaryApps[id] = spec") {
 		t.Error("releaseBinaryApps 的展示字段应由描述符回填（单一事实来源）")
+	}
+}
+
+// TestPlistArgumentsAreNotPathJoined 锁住"plist 的参数不做路径拼接"。
+//
+// 真机事故（2026-09-17 Mac mini，Alist）：renderPlist 用 ec.path() 渲染每个参数，
+// 于是 `server` 被拼成 `<root>/server`、`--data` 被拼成 `<root>/--data`；launchd
+// 拉起后进程立刻退出，日志是
+// `Error: unknown command "/Users/zizdog/alist/server" for "alist"`，端口从未监听。
+//
+// 这个坑此前没暴露，是因为 tarball 轨"写 plist"这一步从未在真机上跑过：
+// frpc / ddns-go 的 plist 是旧安装器写的，而幂等闸门让它们没有被重写。
+func TestPlistArgumentsAreNotPathJoined(t *testing.T) {
+	spec, ok := releaseBinaryApps["alist"]
+	if !ok {
+		t.Fatal("releaseBinaryApps 里没有 alist")
+	}
+	d, ok := FindDescriptor("alist")
+	if !ok {
+		t.Fatal("没有 alist 的描述符")
+	}
+	ec := &ExecConfig{
+		Spec: d,
+		pathVars: map[string]string{
+			"{root}": "/Users/x/alist",
+			"{home}": "/Users/x",
+			"{user}": "x",
+		},
+	}
+	body, err := ec.renderPlist(WritePlistAction{Args: plistArgs(spec)})
+	if err != nil {
+		t.Fatalf("渲染 plist 失败: %v", err)
+	}
+	for _, want := range []string{
+		"<string>/Users/x/alist/alist</string>",
+		"<string>server</string>",
+		"<string>--data</string>",
+		"<string>/Users/x/alist/data</string>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("plist 里应有 %q，实际：\n%s", want, body)
+		}
+	}
+	for _, bad := range []string{"/Users/x/alist/server", "/Users/x/alist/--data"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("plist 里不应出现被拼成路径的参数 %q：\n%s", bad, body)
+		}
 	}
 }

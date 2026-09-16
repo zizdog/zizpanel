@@ -45,6 +45,7 @@ var tarballDescriptors = []string{
 	"frpc",
 	"orbien-client",
 	"ddns-go",
+	"alist",
 }
 
 // descriptorsByID / descriptorOrder 是描述符注册表
@@ -170,7 +171,10 @@ func tarballDescriptor(id string, spec releaseBinaryApp) (AppDescriptor, error) 
 	steps := tarballInstallSteps(spec, main)
 	keepNote := tarballKeepNote(spec)
 
-	bind := "127.0.0.1"
+	bind := spec.BindAddress
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
 	if spec.Port <= 0 {
 		bind = ""
 	}

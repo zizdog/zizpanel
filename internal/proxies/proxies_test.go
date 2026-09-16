@@ -41,7 +41,9 @@ func TestRuleGenerateBasic(t *testing.T) {
 
 // TestRuleGenerateDefaultsPortAndPreserveHost 锁住两个容易写错的细节：
 //  1. 目标没写端口时，Host 头**不能**带上 :80/:443（带了会让后端按错误 Host 分站）；
-//  2. PreserveHost 打开时透传原始 Host。
+//  2. PreserveHost 打开时透传原始 Host —— 且必须用 **$http_host**（带端口），
+//     不能用 $host（端口会被丢掉）：公网只放行 8889、多个站点共用这一个端口时，
+//     丢掉端口会让 WordPress / Typecho 这类应用把浏览器重定向到没放行的 443。
 func TestRuleGenerateDefaultsPortAndPreserveHost(t *testing.T) {
 	r := &Rule{ID: 1, Name: "x", Listen: 8081, Target: "http://example.com", Enabled: true}
 	got, err := r.Generate("")
@@ -57,14 +59,30 @@ func TestRuleGenerateDefaultsPortAndPreserveHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got2, "proxy_set_header Host $host;") {
-		t.Errorf("PreserveHost 打开时应透传原始 Host：\n%s", got2)
+	if !strings.Contains(got2, "proxy_set_header Host $http_host;") {
+		t.Errorf("PreserveHost 打开时应用 $http_host 透传原始 Host（含端口）：\n%s", got2)
+	}
+	if strings.Contains(got2, "proxy_set_header Host $host;") {
+		t.Errorf("不能用 $host：它会把端口丢掉，后端生成的绝对 URL 会指向没放行的端口：\n%s", got2)
 	}
 	// 非默认端口要带上
 	r3 := &Rule{ID: 3, Name: "z", Listen: 8083, Target: "https://example.com:8443", Enabled: true}
 	got3, _ := r3.Generate("")
 	if !strings.Contains(got3, "proxy_set_header Host example.com:8443;") {
 		t.Errorf("非默认端口应写进 Host 头：\n%s", got3)
+	}
+}
+
+// TestStandardHeadersKeepPortInForwardedHost 锁住 X-Forwarded-Host 也带端口。
+func TestStandardHeadersKeepPortInForwardedHost(t *testing.T) {
+	r := &Rule{ID: 4, Name: "h", Listen: 8889, Domains: "wp.example.com",
+		Target: "https://127.0.0.1:443", Enabled: true, PreserveHost: true, StandardHeaders: true}
+	got, err := r.Generate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "proxy_set_header X-Forwarded-Host $http_host;") {
+		t.Errorf("X-Forwarded-Host 也必须是 $http_host（带端口）：\n%s", got)
 	}
 }
 

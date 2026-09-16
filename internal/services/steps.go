@@ -989,6 +989,19 @@ func (ec *ExecConfig) path(p string) string {
 	return p
 }
 
+// expandArg 只把 {root} / {home} / {user} 这类占位符换成字面量，**不做路径拼接**。
+//
+// 为什么 plist 的参数不能用 path()：参数里既有路径也有非路径（`server`、`--data`、
+// `-c`、`:9876`、`-l`）。path() 会把"不以 / 或 ~ 开头"的值一律拼到 {root} 前面，
+// 于是 `server` 变成 `<root>/server`、`--data` 变成 `<root>/--data`。
+//
+// 真机复现（2026-09-17，Mac mini，Alist）：launchd 把 `<root>/server` 当成子命令，
+// 进程立刻退出 —— 日志 `Error: unknown command "/Users/zizdog/alist/server" for "alist"`，
+// 端口从未监听。这个坑此前没暴露，是因为 tarball 轨写 plist 这一步**从未在真机上
+// 真正跑过**：frpc / ddns-go 的服务都是旧安装器写的，而幂等闸门让它们没有被重写。
+// 需要路径的参数在描述符里已经写成 `{root}/xxx`，替换即可。
+func (ec *ExecConfig) expandArg(s string) string { return expandVars(s, ec.pathVars) }
+
 // expandVars 做字面量替换（不引入模板引擎：值里带 {root} 也不会被二次展开）。
 func expandVars(s string, vars map[string]string) string {
 	if s == "" || len(vars) == 0 {
@@ -1684,7 +1697,7 @@ func (ec *ExecConfig) renderPlist(a WritePlistAction) (string, error) {
 	var argLines strings.Builder
 	for _, arg := range a.Args {
 		argLines.WriteString("        <string>")
-		argLines.WriteString(xmlEscape(ec.path(arg)))
+		argLines.WriteString(xmlEscape(ec.expandArg(arg)))
 		argLines.WriteString("</string>\n")
 	}
 	var envXML strings.Builder
@@ -1692,7 +1705,7 @@ func (ec *ExecConfig) renderPlist(a WritePlistAction) (string, error) {
 		envXML.WriteString("        <key>")
 		envXML.WriteString(xmlEscape(e.Name))
 		envXML.WriteString("</key>\n        <string>")
-		envXML.WriteString(xmlEscape(ec.path(e.Value)))
+		envXML.WriteString(xmlEscape(ec.expandArg(e.Value)))
 		envXML.WriteString("</string>\n")
 	}
 	out := strings.NewReplacer(

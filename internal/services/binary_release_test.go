@@ -20,7 +20,10 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 		t.Fatal("releaseBinaryApps 为空")
 	}
 	for id, spec := range releaseBinaryApps {
-		if !strings.Contains(spec.Asset, "darwin_arm64") {
+		// 上游命名不统一：frp / ddns-go / orbien 用下划线（darwin_arm64），
+		// Alist 用连字符（darwin-arm64）。判据是"确实是 macOS arm64 产物"，
+		// 所以两种写法都接受 —— 但不接受任何 amd64 / 其它平台的写法。
+		if !strings.Contains(spec.Asset, "darwin_arm64") && !strings.Contains(spec.Asset, "darwin-arm64") {
 			t.Errorf("%s 的产物 %q 不是 darwin-arm64", id, spec.Asset)
 		}
 		if !strings.HasPrefix(spec.Tag, "v") {
@@ -509,5 +512,93 @@ func TestOrderBySpeed(t *testing.T) {
 	got = orderBySpeed(urls, []int64{0})
 	if len(got) != 2 {
 		t.Errorf("长度应保持，实际 %v", got)
+	}
+}
+
+// TestPortHasListenerRequiresRealListener 锁住 tarball 轨的幂等跳过判据：
+// 光有服务记录 / plist 不算"现在是好的"，**端口真的在监听**才跳过。
+//
+// 为什么：tarball 轨的登记发生在验收**之前**，所以一次失败的安装同样会留下
+// 记录与 plist —— 只凭它们判定，用户再点安装会永远得到"已装跳过"，没有任何
+// 恢复入口（2026-09-17 mini 的 Alist 真机就是这种状态）。
+func TestPortHasListenerRequiresRealListener(t *testing.T) {
+	m, _ := sandboxIdempotentManager(t)
+	m.portCheckOverride = func(port int) (bool, []string, error) {
+		if port == 5244 {
+			return true, []string{"alist"}, nil
+		}
+		return false, nil, nil
+	}
+	if !m.portHasListener(5244) {
+		t.Error("端口有监听时必须返回 true")
+	}
+	if m.portHasListener(9999) {
+		t.Error("端口没有监听时必须返回 false（否则失败过的安装永远无法重试）")
+	}
+	if m.portHasListener(0) {
+		t.Error("端口 0 必须返回 false（纯出站客户端由调用方另行判断）")
+	}
+}
+
+// TestAlistInitialPasswordScrapeGoesToCredentialsOnly 锁住 Alist 的初始口令收尾：
+// 口令从**首次启动日志**里抓出来，只进 InstallResult.Credentials（凭据区），
+// 绝不进任务步骤文本（步骤会进任务日志 / SSE / 审计）。
+func TestAlistInitialPasswordScrapeGoesToCredentialsOnly(t *testing.T) {
+	m, _ := sandboxIdempotentManager(t)
+	d, ok := FindDescriptor("alist")
+	if !ok {
+		t.Fatal("没有 alist 的描述符")
+	}
+	root := filepath.Join(m.opt.UserHome, d.Paths.RootDir)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logBody := "time=\"2026-09-17 01:00:00\" level=info msg=\"Successfully created the admin user " +
+		"and the initial password is: Ab3xY9Zq\"\n" +
+		"time=\"2026-09-17 01:00:00\" level=info msg=\"start HTTP server @ 0.0.0.0:5244\"\n"
+	if err := os.WriteFile(filepath.Join(root, d.Paths.OutLog), []byte(logBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := &InstallResult{App: "alist", Steps: []string{}}
+	m.appendAlistInitialPassword(d, res)
+
+	got := ""
+	for _, c := range res.Credentials {
+		if c.Key == "alist_admin_password" {
+			got = c.Value
+		}
+	}
+	if got != "Ab3xY9Zq" {
+		t.Fatalf("应从日志里抓出初始口令 Ab3xY9Zq，实际 %q（凭据=%+v）", got, res.Credentials)
+	}
+	joined := strings.Join(res.Steps, "\n")
+	if strings.Contains(joined, "Ab3xY9Zq") {
+		t.Errorf("口令不得出现在任务步骤文本里（步骤会进日志/SSE/审计）：\n%s", joined)
+	}
+	if !strings.Contains(joined, "凭据区") {
+		t.Errorf("步骤里要指向凭据区，实际：\n%s", joined)
+	}
+
+	// 幂等：再调一次不会重复追加凭据。
+	before := len(res.Credentials)
+	m.appendAlistInitialPassword(d, res)
+	if len(res.Credentials) != before {
+		t.Errorf("重复调用不该重复追加凭据：%d → %d", before, len(res.Credentials))
+	}
+}
+
+// TestAlistInitialPasswordMissingIsHonest 锁住"抓不到就如实说，不编造口令"。
+func TestAlistInitialPasswordMissingIsHonest(t *testing.T) {
+	m, _ := sandboxIdempotentManager(t)
+	d, _ := FindDescriptor("alist")
+	res := &InstallResult{App: "alist", Steps: []string{}}
+	m.appendAlistInitialPassword(d, res)
+	if len(res.Credentials) != 0 {
+		t.Errorf("日志里没有那行时不得凭空造出口令，实际 %+v", res.Credentials)
+	}
+	joined := strings.Join(res.Steps, "\n")
+	if !strings.Contains(joined, "没有在启动日志里找到初始口令") {
+		t.Errorf("要如实说明没抓到，实际：\n%s", joined)
 	}
 }

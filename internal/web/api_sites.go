@@ -861,6 +861,158 @@ func (s *Server) siteSSLView(site *sites.Site) map[string]any {
 	return v
 }
 
+// handleSiteConfSave 直接保存站点 vhost（「配置」页手工编辑后点保存）。
+//
+// 与 handleSiteUpdate 的分工：后者从**面板的站点模型**重新生成配置；这里保存的是
+// 用户手写的整份文件 —— nginx 真正加载的就是磁盘上这一份。用户明确要求
+// （2026-09-17）："站点管理中应该能直接编辑配置文件，我要改默认端口"。
+//
+// 安全网一条都不能少（每一层都对应一个真机踩过的坑）：
+//  1. helper 写入前跑 `nginx -t`，不通过就不落盘（见 writeVhost）；
+//  2. reload 失败 → 回滚成写入前的内容；
+//  3. reload 成功但**新配置里的 listen 端口一个都不应答** → 同样回滚 ——
+//     nginx 读配置失败（日志/证书打不开）时 `nginx -s reload` 的退出码依然是 0，
+//     "命令返回 0"不等于"配置生效"。
+//
+// 不复用 verifySiteServed：它探的是**站点模型里**的 80/443 并要求 403，
+// 而"把站点统一收到 8889"正是这个页面的主要用途，那样会把正确的手工改动误判成失败。
+func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
+	domain := r.PathValue("domain")
+	ctx := r.Context()
+	if _, err := s.siteMgr().Get(ctx, domain); err != nil {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		fail(w, http.StatusBadRequest, "配置内容不能为空（要停用站点请改 enabled 开关或删除站点）")
+		return
+	}
+	snap := s.snapshotVhost(domain)
+	if err := siteWriteVhostFn(s, ctx, domain, req.Content); err != nil {
+		// helper 自己已经做了 nginx -t 且没有落盘（失败即回滚文件），
+		// 所以这里不需要再回滚一次 —— 只把 nginx 的原文交回界面。
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 与 applySite 同一处理：nginx -t 会以 root 创建日志文件，
+	// 而 nginx master 以真实用户运行，属主不对会 reload 失败（且退出码仍是 0）。
+	if s.Cfg.User != "" && os.Geteuid() == 0 {
+		_ = chownTreeTo(s.siteLogDir(), s.Cfg.User)
+	}
+	if err := siteReloadFn(s, ctx); err != nil {
+		err = s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+			fmt.Errorf("配置已写入但 nginx 重载失败: %w", err))
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ports := siteListenPorts(req.Content)
+	if len(ports) > 0 {
+		alive := false
+		var lastErr error
+		deadline := time.Now().Add(siteVerifyWait)
+		for !alive && time.Now().Before(deadline) {
+			for _, p := range ports {
+				scheme := "http"
+				if p.SSL {
+					scheme = "https"
+				}
+				if _, _, perr := siteProbeFn(ctx, scheme, domain, p.Port, siteVhostProbePath, siteProbeTimeout); perr == nil {
+					alive = true
+					break
+				} else {
+					lastErr = perr
+				}
+			}
+			if alive {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+			case <-time.After(siteVerifyEvery):
+				continue
+			}
+			break
+		}
+		if !alive {
+			names := make([]string, 0, len(ports))
+			for _, p := range ports {
+				names = append(names, strconv.Itoa(p.Port))
+			}
+			err := s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+				fmt.Errorf("配置已写入并重载，但新配置里的监听端口（%s）没有任何一个能应答：%v。"+
+					"已回滚成修改前的内容", strings.Join(names, "、"), lastErr))
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	ok(w, map[string]any{"content": req.Content, "conf_path": filepath.Join(s.Cfg.VhostDir, domain+".conf")})
+}
+
+// siteListenPort 是一条 listen 指令解析出来的结果。
+type siteListenPort struct {
+	Port int
+	SSL  bool
+}
+
+// siteListenPorts 从 vhost 内容里提取全部 listen 端口（用于"改完真的在服务吗"的复核）。
+//
+// 按"listen 这个单词 + 到下一个分号"扫描，而不是按行：nginx 的写法有
+// `listen 80;` / `listen 443 ssl;` / `listen 127.0.0.1:8889;` / `listen [::]:80;`，
+// 也可能写在同一行的花括号里（`server { listen 8892; }`）—— 只认"行首 listen"
+// 会漏掉整类写法，而漏掉的后果是**跳过复核**，正是"报告成功但其实没生效"。
+// 前置字符必须是分隔符，避免匹配到 `ssl_listen` 这类以 listen 结尾的标识符。
+// 解析不出端口的（例如 `listen unix:/tmp/x.sock;`）直接跳过 —— 那些不该被探。
+func siteListenPorts(content string) []siteListenPort {
+	var out []siteListenPort
+	seen := map[int]bool{}
+	for i := 0; i+len("listen") <= len(content); i++ {
+		if content[i:i+len("listen")] != "listen" {
+			continue
+		}
+		if i > 0 {
+			switch content[i-1] {
+			case ' ', '\t', '\n', '\r', ';', '{', '}':
+			default:
+				continue
+			}
+		}
+		rest := content[i+len("listen"):]
+		semi := strings.IndexByte(rest, ';')
+		if semi < 0 {
+			break
+		}
+		fields := strings.Fields(rest[:semi])
+		if len(fields) == 0 {
+			continue
+		}
+		addr := fields[0]
+		if k := strings.LastIndex(addr, ":"); k >= 0 {
+			addr = addr[k+1:]
+		}
+		port, err := strconv.Atoi(addr)
+		if err != nil || port <= 0 || port > 65535 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		ssl := false
+		for _, f := range fields[1:] {
+			if f == "ssl" {
+				ssl = true
+			}
+		}
+		out = append(out, siteListenPort{Port: port, SSL: ssl})
+	}
+	return out
+}
+
 type siteUpdateReq struct {
 	Aliases    *string `json:"aliases"`
 	PHPVersion *string `json:"php_version"`

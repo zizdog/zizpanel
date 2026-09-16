@@ -6,7 +6,7 @@
 #    "对于应用市场，应该有能用高效的工作流，如果以后每加一个应用都要一点一点
 #     慢慢调试，那这个应用市场就没什么实用价值了。"
 #
-#  默认行为：审**全部** 27 个在售应用（真的去探镜像站、上游、registry manifest、
+#  默认行为：审**全部**在售应用（数量以代码注册表为准；真的去探镜像站、上游、registry manifest、
 #  sha256），一张表告诉你哪个应用缺什么。有缺口就非零退出。
 #
 #  用法：
@@ -59,7 +59,7 @@ trap 'rm -f "$BIN"' EXIT
 echo "==> 构建 zizpanel-assets" >&2
 go build -o "$BIN" ./cmd/zizpanel-assets
 
-echo "==> 审计应用市场（全部 27 个条目；--only 可只审一个）" >&2
+echo "==> 审计应用市场（全部在售条目；--only 可只审一个）" >&2
 set +e
 if [ ${#PASSTHRU[@]} -gt 0 ]; then
   "$BIN" audit "${PASSTHRU[@]}"

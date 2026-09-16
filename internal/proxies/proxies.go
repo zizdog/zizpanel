@@ -515,7 +515,17 @@ func (r *Rule) Generate(logDir string) (string, error) {
 
 	// Host 头：默认改成目标主机（多数后端按 Host 分站，透传原始 Host 会 404）。
 	if r.PreserveHost {
-		b.WriteString("\t\tproxy_set_header Host $host;\n")
+		// 刻意用 **$http_host** 而不是 $host：$host 会把端口丢掉，而"透传原始
+		// Host"的语义就是让后端看到客户端真正请求的 authority。
+		//
+		// 丢端口的后果在"一个公网端口承载多个站点"（Lucky 式 :8889）下是致命的：
+		// 后端（WordPress / Typecho / 任何按自身地址生成绝对 URL 的应用）会以为
+		// 自己在默认端口上，于是把浏览器重定向到**没有放行**的 443 —— 站点直接
+		// 打不开。真机复现（2026-09-17 mini，用户报障）：wp.zizdog.com 经 8889
+		// 反代，WP 302 到 https://wp.zizdog.com/wp-admin/install.php（无端口）。
+		//
+		// $http_host 在客户端没带端口时就等于 $host，所以老规则的行为不变。
+		b.WriteString("\t\tproxy_set_header Host $http_host;\n")
 	} else {
 		host, port, err := r.TargetHostPort()
 		if err != nil {
@@ -554,7 +564,9 @@ func (r *Rule) Generate(logDir string) (string, error) {
 	// 一键补齐的常用请求头（Lucky 风格预设）。默认关，老规则的输出逐字不变。
 	if r.StandardHeaders {
 		b.WriteString("\t\t# 常用请求头（一键补齐）\n")
-		b.WriteString("\t\tproxy_set_header X-Forwarded-Host $host;\n")
+		// 同 Host 头：X-Forwarded-Host 也要保留端口，否则应用读它拼出来的
+		// 绝对地址同样会丢端口（见上面 PreserveHost 分支的说明）。
+		b.WriteString("\t\tproxy_set_header X-Forwarded-Host $http_host;\n")
 		b.WriteString("\t\tproxy_set_header X-Forwarded-Port $server_port;\n")
 		b.WriteString("\t\tproxy_set_header REMOTE-HOST $remote_addr;\n")
 	}

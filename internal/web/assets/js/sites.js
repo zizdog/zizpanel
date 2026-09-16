@@ -724,40 +724,92 @@ export function SitesView(content, ctx = {}) {
     }
 
     function tabConf() {
-      const showGenerated = h('button.btn.btn-sm.btn-primary', { text: '面板生成的配置' });
-      const showActual = h('button.btn.btn-sm', { text: '磁盘上的实际配置' });
-      const box = h('pre.logbox', { style: { maxHeight: '420px' }, text: '' });
-      const setMode = (gen) => {
-        showGenerated.className = 'btn btn-sm' + (gen ? ' btn-primary' : '');
-        showActual.className = 'btn btn-sm' + (gen ? '' : ' btn-primary');
-        box.textContent = gen
-          ? (data.generated || '（生成失败：' + (data.generate_err || '未知原因') + '）')
-          : (data.conf || '（配置文件不存在，请点「重建全部配置」）');
-      };
-      showGenerated.addEventListener('click', () => setMode(true));
-      showActual.addEventListener('click', () => setMode(false));
-      setMode(true);
+      // 用户明确要求（2026-09-17）：
+      //   ① 站点管理里要能**直接编辑**配置文件（他要改默认端口，原来只能看）；
+      //   ② 「面板生成的配置」与「磁盘上的实际配置」两个按钮是重复的，去掉；
+      //   ③ 保存后**自动重载生效**。
+      // 所以这里只剩一个编辑器：编辑的就是磁盘上那份（nginx 真正加载的），
+      // 保存走 siteConfSave（后端 nginx -t → reload → 复核端口 → 失败回滚）。
+      const editor = h('textarea.input', {
+        spellcheck: 'false',
+        style: {
+          width: '100%', minHeight: '420px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: '12.5px', lineHeight: '1.5', whiteSpace: 'pre', resize: 'vertical',
+        },
+      });
+      let original = data.conf || '';
+      editor.value = original;
+      const dirty = () => editor.value !== original;
+
+      const status = h('span.hint', { text: '' });
+      const saveBtn = h('button.btn.btn-sm.btn-primary', {
+        text: '💾 保存并重载',
+        onclick: async () => {
+          saveBtn.disabled = true;
+          status.textContent = '正在写入并校验（nginx -t）…';
+          try {
+            await api.siteConfSave(domain, editor.value);
+            original = editor.value;
+            status.textContent = '';
+            toast('配置已保存并重载生效', 'ok');
+            const fresh = await api.site(domain);
+            data.conf = fresh.conf; data.generated = fresh.generated;
+            if (!dirty()) editor.value = data.conf || '';
+            load();
+          } catch (e) {
+            // 失败时**保留用户写的内容**（不要用磁盘上的旧内容盖掉他的编辑），
+            // 并如实说明后端已回滚、站点仍是旧配置。
+            status.textContent = '保存失败（已回滚，站点仍在用修改前的配置）：' + e.message;
+            toast(e.message, 'err', 20000);
+          } finally {
+            saveBtn.disabled = false;
+          }
+        },
+      });
 
       return h('div', [
-        h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap' } }, [
-          showGenerated, showActual,
+        h('div', { style: { display: 'flex', gap: '8px', marginBottom: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+          saveBtn,
           h('button.btn.btn-sm', {
-            text: '🔄 重新生成并应用',
+            text: '↩ 撤销未保存的修改',
+            onclick: () => { editor.value = original; status.textContent = ''; },
+          }),
+          h('button.btn.btn-sm', {
+            // 把编辑器内容换成"面板按当前站点设置生成的内容"（只填充、不保存）：
+            // 想看模板长什么样 / 想从模板改起时用，不改变"直接编辑磁盘文件"的语义。
+            text: '🔄 载入面板生成的配置',
+            title: '只填进编辑器，不保存；想恢复成面板模板时用',
+            onclick: () => {
+              editor.value = data.generated || '';
+              status.textContent = '已载入面板生成的配置（尚未保存，点「保存并重载」才生效）';
+            },
+          }),
+          h('button.btn.btn-sm', {
+            text: '⚙️ 重新生成并应用',
+            title: '按面板里的站点设置（别名 / PHP 版本 / 伪静态 / 自定义配置）重新生成整份配置并重载',
             onclick: async () => {
               try {
                 await api.siteUpdate(domain, {});
                 toast('已重新生成并重载', 'ok');
                 const fresh = await api.site(domain);
                 data.conf = fresh.conf; data.generated = fresh.generated;
-                setMode(false);
+                original = data.conf || '';
+                editor.value = original;
+                status.textContent = '';
                 load();
               } catch (e) { toast(e.message, 'err', 12000); }
             },
           }),
+          status,
         ]),
-        box,
-        h('div.hint', { style: { marginTop: '10px' }, text: `配置文件路径：${data.conf_path}` }),
-        h('div.hint', { text: '注意：直接在服务器上手工修改该文件，会在面板下次保存时被覆盖。持久化的改动用「自定义配置」字段。' }),
+        editor,
+        h('div.hint', { style: { marginTop: '10px' }, text: `配置文件路径：${data.conf_path}（就是上面编辑的这一份，nginx 加载的也是它）` }),
+        h('div.hint', {
+          text: '直接改这一份并保存 → 后端先跑 `nginx -t`，通过后重载，并复核新配置里的监听端口真的在应答；' +
+            '任何一步失败都会自动回滚，站点不会变成打不开。' +
+            '注意：点站点其它页签的「保存」（面板按模板重新生成）会覆盖这里的手工改动 —— ' +
+            '想让改动在面板里持久化，请把要保留的片段写进站点设置里的「自定义配置」。',
+        }),
       ]);
     }
 

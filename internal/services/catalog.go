@@ -104,7 +104,12 @@ func (a App) WebPort() int {
 //
 // 目录是静态数据（拿不到 UserHome / WorkDir），所以路径按安装位置在运行期拼出来：
 //   - compose 类应用：装到 <workDir>/compose/<appID>/（见 installViaCompose）；
-//   - 面板自研的 release 二进制类：装到 <userHome>/<RootDir>/（见 binaryReleasePaths）。
+//   - 面板自研的 release 二进制类：装到 <userHome>/<RootDir>/（见 binaryReleasePaths）；
+//   - 配置文件**不在上述两类位置**的应用（brew 类）：目录里直接写绝对路径或 `~/`
+//     开头的路径，这里原样解析 —— 例如 Miniflux 的配置位置由 formula 的 service 块
+//     写死在 /opt/homebrew/etc/miniflux.conf，Syncthing 的在
+//     ~/Library/Application Support/Syncthing/config.xml。这两条路径面板改不了，
+//     只能如实声明；不声明的话服务详情里就没有「📝 编辑配置文件」入口。
 //
 // 用途只有一个：服务详情里的「编辑配置文件」入口要知道读哪个文件 ——
 // 读写的鉴权/白名单仍由既有的 files.Manager 负责。
@@ -117,6 +122,17 @@ func ConfigFilePath(app App, userHome, workDir string) string {
 			return ""
 		}
 		return filepath.Join(workDir, "compose", app.ID, app.ConfigPath)
+	}
+	// 绝对路径（含 ~/ 展开）：brew 类应用的配置文件位置由 formula 决定，
+	// 不在家目录下的安装目录里。
+	if filepath.IsAbs(app.ConfigPath) {
+		return app.ConfigPath
+	}
+	if strings.HasPrefix(app.ConfigPath, "~/") {
+		if userHome == "" {
+			return ""
+		}
+		return filepath.Join(userHome, strings.TrimPrefix(app.ConfigPath, "~/"))
 	}
 	if spec, ok := releaseBinaryApps[app.PanelInstaller]; ok && userHome != "" {
 		return filepath.Join(userHome, spec.RootDir, app.ConfigPath)
@@ -561,6 +577,35 @@ func Catalog() []App {
 			Port:     0,
 			DocsURL:  "https://ffmpeg.org",
 		},
+		// PostgreSQL 放在「基础环境」是**用户 2026-09-17 的决定**，理由与 MySQL 不同：
+		//   · MySQL 是「网站环境」的一部分（一键 LNMP 装它，Typecho / WordPress 用它）；
+		//   · PostgreSQL 目前只服务于自托管应用（Miniflux 必须要它），
+		//     不属于网站栈，所以归到「基础环境」，与 mysql84 一样是
+		//     **独立可安装、可启停、可卸载**的条目。
+		//
+		// 为什么不把它塞进 Miniflux 的安装事务（研究与真机结论都支持）：
+		//   · brew 的 postgresql@17 是**一个 cluster 一个数据目录**
+		//     （/opt/homebrew/var/postgresql@17）。若 PG 由 Miniflux 的安装流程顺带装，
+		//     就会出现"Miniflux 装失败该不该卸 PG"的两难 —— 卸掉会伤到别的依赖方，
+		//     不卸就留一个孤儿；更糟的是 cluster 的归属会随安装顺序漂移。
+		//   · 独立条目则安装 / 启停 / 卸载各自幂等、与应用解耦；卸载 Miniflux
+		//     不会碰这个 cluster（数据保留语义见 uninstall 计划）。
+		{
+			ID: "postgresql17", Name: "PostgreSQL 17", Icon: "🐘",
+			Summary: "关系型数据库（自托管应用用，例如 Miniflux）",
+			Description: "PostgreSQL 17（brew formula postgresql@17）。给需要它的自托管应用用，" +
+				"目前是 Miniflux（装 Miniflux 时会自动确认并安装它）。" +
+				"brew 安装时**已经自动 initdb 建好 cluster**（数据目录 /opt/homebrew/var/postgresql@17），" +
+				"本机连接走 trust 认证，超级用户就是当前登录用户。" +
+				"卸载本条目**不会**删除数据目录（面板默认保留你的数据）。",
+			Category: "other", Kind: KindNative, ServiceLabel: "sh.brew.postgresql@17",
+			// PostgreSQL 说的是自己的线路协议、不是 HTTP：不能做 HTTP 健康检查，
+			// 否则会永远显示"不健康"（与 PHP-FPM 同理）。留空 = 只按进程与端口判断。
+			Port: 5432, HealthPath: "",
+			BrewFormula: "postgresql@17",
+			LogPath:     "/opt/homebrew/var/log/postgresql@17.log",
+			DocsURL:     "https://www.postgresql.org",
+		},
 
 		// ---------------- AI 服务（原生，用 Metal 加速） ----------------
 		{
@@ -980,6 +1025,114 @@ func Catalog() []App {
 				"~/ddns-go/ddns-go.yaml，保存后点「🔄 重启服务」生效 —— 不必再打开网页。",
 			DocsURL: "https://github.com/jeessy2/ddns-go",
 		},
+
+		// ---------------- 自托管应用（原生，2026-09-17 新增） ----------------
+		//
+		// 这三个是用户 2026-09-17 选定的"先上三个轻的"。选路结论（都核对过证据，
+		// 不要凭猜改）：
+		//   · Miniflux：homebrew-core 有 formula **且有 service 块**（2.3.3），
+		//     但它**只支持 PostgreSQL** —— 所以它需要一个数据库，见 postgresql17 条目。
+		//   · Syncthing：用户明确要"formula，不是 cask"—— 正确。官方 service 块就是
+		//     `syncthing --no-browser --no-restart`（无头设计），cask 才是菜单栏 App。
+		//   · Alist：**从未进过 homebrew-core**（formulae.brew.sh/api/formula/alist.json
+		//     是 404，homebrew-core 提交历史为空），所以走官方 darwin-arm64 release
+		//     产物，由 binary_release.go 那套通用 tarball 安装器托管。
+		{
+			ID: "miniflux", Name: "Miniflux（RSS 阅读器）", Icon: "📰",
+			// Miniflux **支持**子路径（BASE_URL 带上路径即可），但面板这一轮不代写
+			// 它的 BASE_URL：装完直接给端口直连。要挂到域名下面，用面板的
+			// 「反向代理」指向 127.0.0.1:8087，并把 BASE_URL 改成那个地址。
+			UI: &AppUI{
+				Slug:         "miniflux",
+				PreferDirect: true,
+				Note: "Miniflux 默认监听 8087（不是上游默认的 8080 —— 8080 被 IOPaint 占着）。" +
+					"「打开」给端口直连 http://<本机地址>:8087；要挂域名/HTTPS 请在面板" +
+					"「反向代理」里加规则指向 127.0.0.1:8087，并把配置里的 BASE_URL 改成对应地址。",
+			},
+			Summary: "极简自托管 RSS 阅读器（需要 PostgreSQL）",
+			Description: "自托管的 RSS 阅读器：没有广告、没有推荐算法，界面干净、键盘操作友好。" +
+				"**必须要有 PostgreSQL**（上游 README 明确写 Works only with PostgreSQL）：" +
+				"装它的时候面板会先确保 postgresql@17 已安装并启动，再自动建库建账号、" +
+				"写好配置、跑完数据库迁移，最后随机生成管理员口令。" +
+				"管理员口令只在安装结果里出现一次，请自行保存（之后可在服务详情里改配置）。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "miniflux",
+			BrewFormula:    "miniflux",
+			// 8087：上游默认 8080，而 8080 已经被 IOPaint 占用（真机核对）。
+			Port: 8087, HealthPath: "/healthz",
+			// 配置写在 formula 的 service 块写死的位置（/opt/homebrew/etc/miniflux.conf），
+			// 所以这里声明**绝对路径**（ConfigFilePath 已支持绝对路径 + ~/ 前缀）。
+			ConfigPath: "/opt/homebrew/etc/miniflux.conf",
+			LogPath:    "/opt/homebrew/var/log/miniflux.log",
+			// 只提示不自动装 —— 但 miniflux 的安装器自己**会**装它（先确保 PG 就绪），
+			// 这条声明的价值是"安装前检查里能看见这层依赖"，以及卸载计划里说清
+			// "PG 不会被一起卸掉"。
+			Requires: []Requirement{{Type: "brew_formula", Value: "postgresql@17",
+				Hint: "brew install postgresql@17（Miniflux 只能用 PostgreSQL；装 Miniflux 时会自动装好并建库）"}},
+			PostInstallHint: "用「打开」进 http://<本机地址>:8087 登录（用户名 admin，口令见安装结果）。" +
+				"要换域名/HTTPS：在面板「反向代理」里加一条指向 127.0.0.1:8087 的规则，" +
+				"再把 /opt/homebrew/etc/miniflux.conf 里的 BASE_URL 改成新地址并重启服务。",
+			DocsURL: "https://miniflux.app",
+		},
+		{
+			ID: "syncthing", Name: "Syncthing（文件同步）", Icon: "🔄",
+			// 上游默认把 GUI 绑在 127.0.0.1:8384，局域网里根本打不开。
+			// 面板的安装器会**在设好随机口令的前提下**把 GUI 监听到 0.0.0.0:8384
+			// （两者必须同时做：非回环 + 无口令 = 局域网里任何人都能控制同步）。
+			UI: &AppUI{
+				Slug:         "syncthing",
+				Websocket:    true,
+				PreferDirect: true,
+				Note: "GUI 在 8384。「打开」给端口直连 http://<本机地址>:8384；" +
+					"用户名口令由面板在安装时随机生成（见安装结果），可在 GUI 设置里改。" +
+					"Syncthing 的 GUI 不支持挂在子路径下（它用绝对路径 /rest/*），" +
+					"所以子路径入口只作备用。",
+			},
+			Summary: "去中心化文件同步（不经过云盘）",
+			Description: "在多台设备之间直接同步文件，不经过任何云服务，支持版本历史与" +
+				"选择性同步。**走原生（不走 Docker）**：homebrew 的 formula 自带 service 块，" +
+				"官方就是按无头方式设计的（cask 那个才是菜单栏 App）。" +
+				"面板会把 GUI 从上游默认的 127.0.0.1:8384 改成 0.0.0.0:8384，" +
+				"**并同时设置随机用户名口令** —— 否则等于把远程控制台无口令暴露在局域网里。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "syncthing",
+			BrewFormula:    "syncthing",
+			Port:           8384, HealthPath: "/rest/noauth/health",
+			// 配置文件在 ~/Library/Application Support/Syncthing/config.xml。
+			ConfigPath: "~/Library/Application Support/Syncthing/config.xml",
+			LogPath:    "/opt/homebrew/var/log/syncthing.log",
+			PostInstallHint: "① 在 GUI 里登录后，先用面板给的设备 ID 在两台机器上互相添加设备。" +
+				"② 局域网内同步需要 macOS 的「本地网络」权限（系统设置 → 隐私与安全性 → 本地网络）；" +
+				"被拒绝了就在那里打开它，或在面板设置里允许免授权访问内网段。",
+			DocsURL: "https://syncthing.net",
+		},
+		{
+			ID: "alist", Name: "Alist（文件列表）", Icon: "📂",
+			UI: &AppUI{
+				Slug:         "alist",
+				PreferDirect: true,
+				Note: "Alist 的 Web 界面在 5244。「打开」给端口直连 http://<本机地址>:5244；" +
+					"初始管理员口令由 Alist 在**首次启动时**随机生成并写进它自己的日志，" +
+					"面板会把这一条从日志里抓出来放进安装结果（抓不到时会说明）。",
+			},
+			Summary: "把网盘、对象存储、本地目录挂成一个网页文件站",
+			Description: "支持 40+ 存储后端（阿里云盘、OneDrive、Google Drive、S3、WebDAV、" +
+				"本地目录……），统一成一个可浏览、可分享的网页文件列表，并提供 WebDAV 接口。" +
+				"**走原生（不走 Docker）**：官方 alist-darwin-arm64.tar.gz 解压到 ~/alist，" +
+				"由系统级 launchd 托管。" +
+				"⚠️ 上游只发布 md5 校验清单（没有 sha256），所以这一步只能做架构复核 + md5 互证，" +
+				"面板不假装自己校验过 sha256。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "alist", ServiceLabel: "com.zizdog.alist",
+			Port: 5244, HealthPath: "/",
+			ConfigPath: "data/config.json",
+			PostInstallHint: "① 用 admin + 安装结果里的初始口令登录，登录后立刻在" +
+				"「个人资料」里改口令。② 初始口令只在首次启动的日志里出现一次；" +
+				"忘了就 SSH 执行 `~/alist/alist admin set <新口令>`。" +
+				"③ 添加存储（网盘/本地目录）在「管理 → 存储」里做。",
+			DocsURL: "https://alistgo.com",
+		},
+
 		// ---------------- 一键建站（Category: site） ----------------
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",

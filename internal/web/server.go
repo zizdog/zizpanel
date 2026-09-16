@@ -206,6 +206,7 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/sites/{domain}", s.requireAuth(s.handleSiteDelete))
 	root.HandleFunc("POST /api/v1/sites/{domain}/ssl", s.requireAuth(s.handleSiteSSL))
 	root.HandleFunc("DELETE /api/v1/sites/{domain}/ssl", s.requireAuth(s.handleSiteSSLDisable))
+	root.HandleFunc("POST /api/v1/sites/{domain}/conf", s.requireAuth(s.handleSiteConfSave))
 	root.HandleFunc("GET /api/v1/sites/{domain}/check", s.requireAuth(s.handleSiteCheck))
 	root.HandleFunc("GET /api/v1/sites/{domain}/log", s.requireAuth(s.handleSiteLog))
 

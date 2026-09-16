@@ -161,6 +161,10 @@ export const api = {
   siteSSL: (domain, payload) => request('POST', `${API_BASE}/sites/${encodeURIComponent(domain)}/ssl`, payload),
   siteSSLDisable: (domain) => request('DELETE', `${API_BASE}/sites/${encodeURIComponent(domain)}/ssl`),
   siteCheck: (domain) => request('GET', `${API_BASE}/sites/${encodeURIComponent(domain)}/check`),
+  // 直接保存磁盘上的 vhost（站点「配置」页的编辑器用）。后端写完会跑 nginx -t、
+  // 重载、并复核新配置里的监听端口真的在应答；任何一步失败都会回滚并返回原因。
+  siteConfSave: (domain, content) =>
+    request('POST', `${API_BASE}/sites/${encodeURIComponent(domain)}/conf`, { content }),
   siteLog: (domain, kind = 'access', lines = 200) =>
     request('GET', `${API_BASE}/sites/${encodeURIComponent(domain)}/log?kind=${kind}&lines=${lines}`),
 

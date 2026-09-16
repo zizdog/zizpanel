@@ -921,6 +921,17 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	case "docker-runtime":
 		s.handleInstallDockerRuntime(w, r)
 		return
+	case "miniflux":
+		// Miniflux 只能配 PostgreSQL，而且建库/写配置/迁移/建管理员这一串
+		// 通用 brew 流程做不了，所以走自研安装器（见 services/miniflux.go）。
+		s.handleInstallMiniflux(w, r)
+		return
+	case "syncthing":
+		// Syncthing 需要把 GUI 从上游默认的 127.0.0.1:8384 改成局域网可访问
+		// **并同时设上随机口令**（否则等于无口令暴露远程控制台），
+		// 通用 brew 流程做不到，所以走自研安装器（见 services/syncthing.go）。
+		s.handleInstallSyncthing(w, r)
+		return
 	}
 
 	app, found := services.FindApp(id)

@@ -448,6 +448,12 @@ func TestTarballInstallSkipsWhenAlreadyInstalled(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
+			// 2026-09-17 起，"已装跳过"多了一条**真实存活**判据：端口在监听才跳过
+			// （登记发生在验收之前，失败的安装同样会留下记录/plist）。真机上
+			// 已装好的服务当然在监听，所以这里把端口检查伪造成"在听"。
+			m.portCheckOverride = func(port int) (bool, []string, error) {
+				return port == app.Port && app.Port > 0, []string{"sandbox"}, nil
+			}
 
 			res := &InstallResult{App: id, Name: app.Name, Steps: []string{}}
 			if err := m.InstallReleaseBinary(ctx, id, res); err != nil {
@@ -555,4 +561,48 @@ func TestTarballInstallGateNotSkippedWithoutRealEvidence(t *testing.T) {
 			t.Errorf("没有面板记录时要提示去「纳管」：\n%s", strings.Join(res.Steps, "\n"))
 		}
 	})
+}
+
+// TestTarballInstallDoesNotSkipWhenPortIsNotListening 锁住 2026-09-17 新增的
+// **恢复路径**：tarball 轨的登记发生在验收之前，一次失败的安装（例如 plist 参数
+// 写错、端口从未监听）同样会留下服务记录与 plist。若只看记录就跳过，用户再点
+// 「安装」永远得到"已装跳过"，没有任何恢复入口（mini 真机的 Alist 就是这样）。
+//
+// 判据：端口没在监听 → **不跳过**，继续走安装流程（安装本身可安全重复）。
+// 在单测的非 root 环境里，继续安装会停在"需要以 root 运行"——那正是
+// "没有走跳过分支"的证据。
+func TestTarballInstallDoesNotSkipWhenPortIsNotListening(t *testing.T) {
+	m, repo := sandboxIdempotentManager(t)
+	ctx := context.Background()
+	app, ok := FindApp("alist")
+	if !ok {
+		t.Fatal("应用目录里没有 alist")
+	}
+	d, ok := FindDescriptor("alist")
+	if !ok {
+		t.Fatal("没有 alist 的描述符")
+	}
+	if app.Port <= 0 {
+		t.Fatal("这个测试针对有端口的应用（alist 应当有端口）")
+	}
+	if err := repo.Create(ctx, &Service{
+		Name: app.ID, DisplayName: app.Name, Kind: app.Kind,
+		LaunchLabel: d.Service.Label, Port: app.Port, Managed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.portCheckOverride = func(int) (bool, []string, error) { return false, nil, nil }
+
+	res := &InstallResult{App: app.ID, Name: app.Name, Steps: []string{}}
+	err := m.InstallReleaseBinary(ctx, app.ID, res)
+	if err == nil {
+		t.Fatal("端口没在监听时不得当作'已装跳过'（那样失败过的安装永远无法重试）")
+	}
+	joined := strings.Join(res.Steps, "\n")
+	if !strings.Contains(joined, "并没有在监听") {
+		t.Errorf("步骤里要写清为什么这次没有跳过，实际：\n%s", joined)
+	}
+	if !strings.Contains(joined, "不跳过") {
+		t.Errorf("步骤里要出现「不跳过」字样，实际：\n%s", joined)
+	}
 }

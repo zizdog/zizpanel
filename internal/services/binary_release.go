@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -21,8 +22,9 @@ import (
 //  Homebrew formula，或者**官方 darwin-arm64 预编译产物**。后一条路原本不存在，
 //  README「应用市场」第 2 条当时写的是"先走 Docker，等通用安装器做出来再换"。
 //
-//  现在这套安装器服务**三个**条目（见 releaseBinaryApps）：
-//    frpc（frp 客户端）、orbien-client（Orbien CLI 客户端）与 ddns-go（动态域名解析）。
+//  现在这套安装器服务**四个**条目（见 releaseBinaryApps）：
+//    frpc（frp 客户端）、orbien-client（Orbien CLI 客户端）、ddns-go（动态域名解析）
+//    与 alist（文件列表，2026-09-17 新增 —— 它从未进过 homebrew-core，只能走这条路）。
 //  2026-09-16 用户要求**彻底移除**三个条目：Lucky、Orbien 服务端、frps。
 //  它们已从 releaseBinaryApps 与 catalog.go 中删除；不要再加回来。
 //  这三个的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
@@ -94,6 +96,15 @@ type releaseBinaryApp struct {
 	UIPort int
 	// HealthPath 交给面板做 HTTP 健康检查（空表示只按端口判断）
 	HealthPath string
+	// BindAddress 是应用**自己真正监听**的地址（"127.0.0.1" / "0.0.0.0"）。
+	//
+	// 为什么必须声明而不是一律猜回环：描述符的 Urls.AdvertisedURL 会据此决定
+	// 广告哪个地址 —— 只绑回环的服务广告成 LAN 地址就是"点了必然打不开的按钮"，
+	// 反过来绑 0.0.0.0 的服务只广告 127.0.0.1 又会让用户以为只能用本机。
+	// 空 = 127.0.0.1（这条轨上 frpc / ddns-go / orbien 都是这个默认：
+	// frpc 的 admin UI 只绑回环；ddns-go 用 -l :9876 绑通配，但它已经在目录里
+	// 显式给了 PreferDirect 的端口直连入口，不受这里的广告地址影响）。
+	BindAddress string
 	// ConfigFile 是安装目录里的配置文件名（空 = 这个应用没有独立配置文件）。
 	// 面板服务详情里的「📝 编辑配置文件」按它定位（见 catalog.App.ConfigPath）。
 	ConfigFile string
@@ -268,6 +279,46 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 				"再到「DNS服务商」里添加服务商与要更新的域名。",
 			"② 之后日常：在「服务管理 → DDNS-Go」点「📝 编辑配置文件」改 ddns-go.yaml，" +
 				"保存后点「🔄 重启服务」——不必再开网页。",
+		},
+	},
+	"alist": {
+		ID: "alist", Label: "com.zizdog.alist", Name: "Alist（文件列表）", Icon: "📂",
+		Category: "tool", RootDir: "alist",
+		// 为什么走 release 产物而不是 brew：**alist 从未进过 homebrew-core**。
+		// 2026-09-17 逐条核对过：`brew info alist` → "No available formula"；
+		// formulae.brew.sh/api/formula/alist.json → 404；homebrew-core 的提交历史里
+		// 与 alist 相关的提交是**空数组**（不是"被删掉了"）。唯一的三方 tap 停在
+		// 2024-01 且已死。上游 AlistGo/alist 仍在更新（v3.64.0，2026-09-03）。
+		// arm64 证据：v3.64.0 资产里有 alist-darwin-arm64.tar.gz（43,021,495 B）；
+		// 2026-09-17 实下核对：tarball 内**只有平级的 alist 一个成员**（无顶层目录），
+		// file(1) 报 Mach-O 64-bit executable arm64，`alist --help` 输出正常。
+		Repo: "AlistGo/alist", Tag: "v3.64.0", Asset: "alist-darwin-arm64.tar.gz",
+		Binary: "alist",
+		// tarball 只有 alist 一个成员且平级 → TarStrip=0；PickBinary 仍然开着，
+		// 上游以后若在包里加 README/LICENSE 也不会摊进安装目录。
+		TarStrip: 0, PickBinary: true,
+		// --data 写死到安装目录下的 data/：不写的话 Alist 会在**当前工作目录**
+		// 下建 data/（launchd 的 WorkingDirectory 不是我们想要的），
+		// 面板的「📝 编辑配置文件」也会定位不到。
+		Args: []string{"server", "--data", "{root}/data"},
+		Port: 5244, HealthPath: "/",
+		// Alist 默认监听 0.0.0.0:5244（实测：日志 "start HTTP server @ 0.0.0.0:5244"），
+		// 所以广告地址必须是 LAN 地址 —— 否则用户看到 127.0.0.1:5244 会以为
+		// 只能本机用（见 releaseBinaryApp.BindAddress 的注释）。
+		BindAddress: "0.0.0.0",
+		// Alist 自己在首次启动时创建 data/config.json（并写入 jwt_secret 等）。
+		// 面板**不**写这个文件（ConfigSeed 为空），只是告诉面板它在哪里，
+		// 让服务详情里的「📝 编辑配置文件」能定位到它。
+		ConfigFile: "data/config.json",
+		// 上游 release **只有 md5.txt，没有 sha256 清单**，所以 ChecksumAsset 留空：
+		// 这条轨在 ChecksumAsset 为空时的行为是"如实说明只做了架构复核 + md5 互证"，
+		// 而不是假装校验过 sha256（见 tarballDescriptor 里的 else 分支）。
+		Notes: []string{
+			"安装目录：~/alist（二进制、data/、日志都在这里）。",
+			"初始管理员口令由 Alist 首次启动时随机生成 —— 面板已从启动日志里抓出来放在上面的凭据区块里；" +
+				"忘了口令就在终端执行 ~/alist/alist admin set <新口令>。",
+			"⚠️ Alist 上游只发布 md5 校验清单，没有 sha256：这一步的内容校验是" +
+				"「架构复核（file -b）+ 与上游 md5 互证」，强度弱于有 sha256 清单的应用（frpc / ddns-go）。",
 		},
 	},
 }
@@ -489,8 +540,24 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	// 这里返回 false，继续走下面的正常安装，由 registerAppService 如实报错。
 	if app, found := FindApp(id); found {
 		if res, done := m.installedSkipResult(ctx, app); done {
-			adoptInstallResult(result, res)
-			return nil
+			// "装过"不等于"现在是好的"：tarball 轨的**登记发生在验收之前**
+			// （见 tarballInstallSteps 的顺序说明），所以一次失败的安装同样会留下
+			// 记录与 plist —— 只凭它们判定，就会把"再点一次安装"永远挡在门外。
+			// 2026-09-17 mini 真机的 Alist 就是这样：plist 参数写错、端口从未监听，
+			// 而市场永远显示"已安装"，用户没有任何恢复入口。
+			//
+			// 所以这里补一条**真实存活**判据：端口真的在监听才跳过。
+			// 没有端口可查的应用（orbien 客户端是纯出站连接）保持原判据不变。
+			if app.Port <= 0 || m.portHasListener(app.Port) {
+				adoptInstallResult(result, res)
+				return nil
+			}
+			if result != nil {
+				result.Steps = append(result.Steps,
+					fmt.Sprintf("检测到「%s」已登记，但端口 %d 并没有在监听 —— 本次**不跳过**，"+
+						"继续按描述符重新安装（下载会命中已缓存的文件，服务会先 bootout 再注册）",
+						app.Name, app.Port))
+			}
 		}
 	}
 	if os.Geteuid() != 0 {
@@ -499,7 +566,87 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	if m.opt.UserName == "" || m.opt.UserHome == "" {
 		return fmt.Errorf("无法确定运行该服务的真实用户与家目录")
 	}
-	return m.OrchestrateTarballInstall(ctx, d, result)
+	if err := m.OrchestrateTarballInstall(ctx, d, result); err != nil {
+		return err
+	}
+	// Alist 的初始管理员口令是**它自己**在首次启动时随机生成、并打进启动日志的
+	// （上游没有"由外部指定初始口令"的参数；`alist admin set` 需要把口令放进 argv，
+	// 而本项目有过 argv 泄漏真凭据的事故，不采用）。所以只能在安装完成后从日志里抓，
+	// 抓不到就如实说明、绝不编造口令。
+	if d.ID == "alist" {
+		m.appendAlistInitialPassword(d, result)
+	}
+	return nil
+}
+
+// alistInitialPasswordRe 匹配 Alist 首次启动时的那行日志。
+//
+// 上游原文（v3.64.0 实测）：Successfully created the admin user and the initial password is: b1bvB58Z
+// 注意这行是 logrus 的 `msg="…"` 字段，口令后面紧跟一个引号 —— 所以字符集
+// 严格限定为字母数字（Alist 生成的就是 [A-Za-z0-9]{8}），否则会把引号一起抓进来。
+var alistInitialPasswordRe = regexp.MustCompile(`initial password is:\s*([A-Za-z0-9]+)`)
+
+// appendAlistInitialPassword 把 Alist 日志里的初始口令搬进安装结果的**凭据区**。
+//
+// 为什么值得单写一段：Alist 装好之后用户第一件事就是登录，而初始口令只出现
+// 在服务日志里 —— 让用户自己去翻 launchd 日志才算"装好了但用不了"。
+//
+// 口令**只进 InstallResult.Credentials**（面板 UI 的凭据区），不进任务步骤文本：
+// 步骤会进任务日志 / SSE / 审计，口令出现在那里等于多一份长期留存。
+// 这里只读日志、不写任何东西；日志里没有那行时明说"没抓到"，绝不编造。
+func (m *Manager) appendAlistInitialPassword(d AppDescriptor, result *InstallResult) {
+	if result == nil {
+		return
+	}
+	for _, c := range result.Credentials {
+		if c.Key == "alist_admin_password" {
+			return
+		}
+	}
+	p := m.binaryReleasePathsFor(d)
+	password := ""
+	for _, f := range []string{p.OutLog, p.ErrLog} {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if mm := alistInitialPasswordRe.FindSubmatch(data); len(mm) == 2 {
+			password = string(mm[1])
+			break
+		}
+	}
+	spec := releaseBinaryApps[d.ID]
+	uiURL := fmt.Sprintf("http://%s:%d", m.primaryIP(), spec.webPort())
+	if password == "" {
+		result.Steps = append(result.Steps,
+			"没有在启动日志里找到初始口令（"+p.OutLog+"）——可能是这次重装保留了已有 data/ 目录，口令还是上一次那个。",
+			"如果登录不上，请在终端执行：~/alist/alist admin set <新口令>")
+		return
+	}
+	result.Credentials = append(result.Credentials, Credential{
+		Key: "alist_admin_password", Value: password,
+		Label: "Alist 初始管理员口令（由 Alist 首次启动时生成，在界面里改过之后就失效）",
+	})
+	result.Steps = append(result.Steps,
+		"Alist 首次启动时生成了一个初始管理员口令（用户名 admin），已放进本次安装的凭据区。",
+		"界面地址 "+uiURL+"；登录后请立刻在「个人资料」里改口令。")
+	if p.Config != "" {
+		result.Steps = append(result.Steps,
+			"配置文件 "+p.Config+"（服务详情里可「📝 编辑配置文件」）")
+	}
+}
+
+// portHasListener 判断某个端口此刻真的有进程在监听。
+//
+// 用途：tarball 轨的幂等跳过判据（见 InstallReleaseBinary）。用端口而不是
+// launchd 状态，理由与 assertReady 一致 —— launchd "已加载"不代表进程活着
+// （KeepAlive 会不停重启一个起不来的进程），端口才是"真的在提供能力"的证据。
+func (m *Manager) portHasListener(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	info, err := m.checkPort(port)
+	return err == nil && info.InUse
 }
 
 // adoptInstallResult 把幂等跳过的结果原样搬进调用方传入的 result。

@@ -175,6 +175,17 @@ type Manager struct {
 	// 这条约束能在毫秒级被验证，而不是靠人工等半小时。
 	iopaintWeightTimeoutOverride time.Duration
 	iopaintStallTimeoutOverride  time.Duration
+	// minifluxExecOverride 仅供测试：替换 Miniflux 安装流程里"以真实用户身份执行命令"
+	// 的动作（pg_isready / psql / miniflux -migrate）。没有它，单测会去执行真实的
+	// PostgreSQL 客户端与 miniflux 二进制（违反"单测不许碰真实服务"），结论也会
+	// 随开发机装没装 postgresql@17 而变化。
+	minifluxExecOverride func(ctx context.Context, timeout time.Duration, stdin, name string, args ...string) (string, error)
+	// minifluxHTTPOverride 仅供测试：替换 /healthz 与 /v1/me 的 HTTP 探测。
+	// 没有它，单测会真的去连本机 8087（开发机上可能恰好有别的服务在听）。
+	minifluxHTTPOverride func(ctx context.Context, url, user, password string) (int, error)
+	// minifluxHealthTimeoutOverride 仅供测试：把"等 /healthz 就绪"的 60 秒缩短。
+	// 否则"健康检查失败=如实报错"这条分支的单测要真的轮询满 60 秒。
+	minifluxHealthTimeoutOverride time.Duration
 }
 
 // Options 是管理器需要的环境信息。

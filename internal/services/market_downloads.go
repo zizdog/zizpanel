@@ -14,7 +14,7 @@ package services
 //  三层结构（见 docs/新增应用工作流.md）：
 //    第 1 层  本文件            —— 声明（填空的地方）
 //    第 2 层  MarketInvariantProblems  —— 静态门禁（不联网，进 go test / make check）
-//    第 3 层  cmd/zizpanel-assets audit —— 在线审计（一条命令审全部 27 个）
+//    第 3 层  cmd/zizpanel-assets audit —— 在线审计（一条命令审全部在售条目）
 //    第 4 层  文档              —— 操作手册
 //
 //  三条不许违反的原则：
@@ -291,7 +291,7 @@ func dockerImagePoint(image string, timeout time.Duration, nas MarketNAS, note s
 }
 
 // ---------------------------------------------------------------------------
-//  声明本体：27 个在售条目，逐个列全部网络下载点。
+//  声明本体：全部在售条目，逐个列全部网络下载点（条数以 Catalog() 为准，别在这里写死）。
 // ---------------------------------------------------------------------------
 
 var marketDownloadApps = []MarketApp{
@@ -578,6 +578,23 @@ var marketDownloadApps = []MarketApp{
 		},
 		Downloads: []MarketDownloadPoint{
 			brewBottlePoint("mysql@8.4", 30*time.Minute, "brew install mysql@8.4"),
+		},
+	},
+
+	// ---------------- 基础环境里的数据库（PostgreSQL） ----------------
+
+	{
+		// 与 mysql84 完全对称的独立条目：**不跟任何应用绑定安装**。
+		// 为什么不做成 Miniflux 的附属（会随安装顺序漂移、卸载语义两难）见
+		// catalog.go 里 postgresql17 条目的注释。
+		ID: "postgresql17", Kind: KindNative, BrewFormula: "postgresql@17", ServiceLabel: "sh.brew.postgresql@17",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "sh.brew.postgresql@17",
+			LabelSource: "目录 ServiceLabel；formula 的 service 块存在（postgres -D /opt/homebrew/var/postgresql@17），" +
+				"运行期由 brewServiceInfo 读真实 label（历史经验：本机 brew 写的是 sh.brew.<formula>）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("postgresql@17", 30*time.Minute, "brew install postgresql@17"),
 		},
 	},
 
@@ -885,6 +902,81 @@ var marketDownloadApps = []MarketApp{
 				},
 				ARM64: "上游资产名自带 darwin_arm64；实测 file(1) 报 Mach-O 64-bit executable arm64（仓库注释记录）",
 				Note:  "与 frpc 同一条回落链",
+			},
+		},
+	},
+
+	// ---------------- 自托管应用（原生，2026-09-17 新增） ----------------
+
+	{
+		ID: "miniflux", Kind: KindNative, BrewFormula: "miniflux", PanelInstaller: "miniflux",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.miniflux",
+			LabelSource: "目录没有 ServiceLabel（面板安装器自己 brew services start 后按 brewServiceInfo 读真实 label）；" +
+				"formula 的 service 块实测存在（miniflux -c /opt/homebrew/etc/miniflux.conf）",
+			CatalogGap: "目录条目**没有**声明 ServiceLabel —— 与 ollama 同一类情况：" +
+				"安装器装完直接读 brew 的真实 label 并登记，不靠目录猜。" +
+				"要补的是 catalog.go 里给 miniflux 加 ServiceLabel（本轮刻意不动，避免与 brew 实际写法漂移）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("miniflux", 30*time.Minute, "brew install miniflux"),
+			// 第二个下载点：Miniflux **只能**用 PostgreSQL，安装器会先确保它。
+			// 如实单列，而不是藏在"依赖会自动装"这句话里 —— 审计要能看见这两次网络下载。
+			brewBottlePoint("postgresql@17", 30*time.Minute,
+				"brew install postgresql@17（Miniflux 的数据库，安装器会先确保它已安装并启动）"),
+		},
+	},
+
+	{
+		ID: "syncthing", Kind: KindNative, BrewFormula: "syncthing", PanelInstaller: "syncthing",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.syncthing",
+			LabelSource: "目录没有 ServiceLabel（面板安装器 brew services start 后按 brewServiceInfo 读真实 label）；" +
+				"formula 的 service 块实测存在（syncthing --no-browser --no-restart，官方就是无头设计）",
+			CatalogGap: "同 miniflux：ServiceLabel 由安装器在运行期从 brew 读取后登记，目录里没写死",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("syncthing", 30*time.Minute, "brew install syncthing"),
+		},
+	},
+
+	{
+		ID: "alist", Kind: KindNative, PanelInstaller: "alist", ServiceLabel: "com.zizdog.alist",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "com.zizdog.alist",
+			LabelSource: "目录 ServiceLabel（与 releaseBinaryApps 注册表里的 Label 一致）",
+		},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 alist-darwin-arm64.tar.gz",
+				Upstream: MarketUpstream{
+					ID:   "github.com/AlistGo/alist@v3.64.0/alist-darwin-arm64.tar.gz",
+					URL:  "https://github.com/AlistGo/alist/releases/download/v3.64.0/alist-darwin-arm64.tar.gz",
+					Repo: "AlistGo/alist", Tag: "v3.64.0", Asset: "alist-darwin-arm64.tar.gz",
+					Size: 43021495,
+					Note: "实测 43,021,495 B（2026-09-17 从 ghfast.top 下载整包实算 sha256；" +
+						"本站 ≠ 上游声明，是**本机实测**）。直连 github.com 在本机 25s 0 字节（与 frpc 同一现象），" +
+						"所以实际会落到加速镜像；候选顺序：镜像站（无测速直下）→ 官方 + ghfast.top + gh-proxy.com 按实测速度重排",
+				},
+				NAS:      nasMirrored("apps/alist/v3.64.0/alist-darwin-arm64.tar.gz"),
+				Timeout:  150 * time.Second,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset: "上游 md5.txt（**只有 md5**）+ 镜像 manifest.json",
+					// 上游没有 sha256 清单 → 这条轨的 ChecksumAsset 留空（不做 sha256 校验），
+					// 只做 verify_arm64 的架构复核。这里把我们实算出来的 sha256 写下来，
+					// 供镜像站/在线审计核对（镜像 manifest.json 里就是这个值）。
+					SHA256: "5f3cd409b1ba5c25d240ccb93bb77fa8a8e8cabbd21a467849ac90443e8f8140",
+					Source: "2026-09-17 本机把整包从 ghfast.top 下下来实算 sha256；" +
+						"同时与上游 md5.txt 的 md5 591823b7f114d4b4d79af268e1e9bdac 互证一致（两条独立算法都吻合）",
+					Note: "⚠️ 明确的强度缺口：上游只发布 md5.txt，没有 sha256 清单 → " +
+						"binary_release.go 那条轨（ChecksumAsset 为空）**不做内容校验**，" +
+						"只有 file(1) 的架构复核 + 与上游 md5 的互证。镜像站上有 manifest.json（sha256）时会按它校验",
+				},
+				ARM64: "上游资产名自带 darwin-arm64；实测解压出的 alist 用 file(1) 报 Mach-O 64-bit executable arm64，" +
+					"`alist --help` 正常输出（本机实测）",
+				Note: "与 frpc / ddns-go 同一条回落链；tarball 内只有平级的 alist 一个成员（无顶层目录）",
 			},
 		},
 	},

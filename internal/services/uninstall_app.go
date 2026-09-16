@@ -208,6 +208,10 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		return m.UninstallBaseDependency(ctx, app, result)
 	case "docker-runtime":
 		return m.uninstallDockerRuntime(ctx, removeData, result)
+	case "miniflux":
+		return m.uninstallMiniflux(ctx, removeData, result)
+	case "syncthing":
+		return m.uninstallSyncthing(ctx, removeData, result)
 	}
 	// "官方 release 原生二进制"类应用（Lucky / Orbien）：同一套安装器，
 	// 用注册表查而不是在这里再抄一遍 switch，免得加了新应用忘记补卸载。
@@ -277,6 +281,31 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 			"brew uninstall ffmpeg",
 		}
 		p.KeepNote = "需要时可随时从应用市场重新安装；面板安装脚本与 LNMP / Qwen TTS 部署也会自动补装"
+	case "miniflux":
+		// 铁律：卸载应用**不删数据**。Miniflux 库里是订阅源与已读状态，
+		// 删掉不可恢复，所以 PostgreSQL 与库一律保留，并在确认框里写清楚。
+		p.Steps = []string{
+			"停止并删除 launchd 服务（miniflux）",
+			"从「服务管理」移除记录",
+			"brew uninstall miniflux",
+			"⚠️ 保留 PostgreSQL（postgresql@17）与 miniflux 数据库（订阅与已读状态都在库里）",
+			"⚠️ 保留配置文件 " + filepath.Join(m.brewPrefix(), "etc", "miniflux.conf"),
+		}
+		p.KeepNote = "PostgreSQL 与 miniflux 数据库**都保留**（你的订阅数据在里面），配置文件也保留；" +
+			"面板不会替你删数据。要彻底删除数据库请在终端执行：" +
+			"psql -h 127.0.0.1 -U <你的登录用户名> -d postgres -c 'DROP DATABASE miniflux'"
+	case "syncthing":
+		// 同步目录在用户指定的位置（面板不知道），这里只谈"身份与索引"。
+		p.Steps = []string{
+			"停止并删除 launchd 服务（syncthing）",
+			"从「服务管理」移除记录",
+			"brew uninstall syncthing",
+			"⚠️ 默认保留 " + filepath.Join(m.opt.UserHome, "Library", "Application Support", "Syncthing") +
+				"（设备密钥、配对信息与同步索引；勾选「删除数据」才会删）",
+		}
+		p.DataPaths = []string{filepath.Join(m.opt.UserHome, "Library", "Application Support", "Syncthing")}
+		p.KeepNote = "默认保留 Syncthing 的数据目录（设备身份与同步索引在里面）；" +
+			"删掉它等于重置本机身份，重新同步要重新配对设备。**同步目录本身不在这个目录里**，不受影响。"
 	default:
 		p.Blocked = "这个应用没有卸载实现"
 	}
