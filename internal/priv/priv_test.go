@@ -312,3 +312,108 @@ func TestHomebrewPrefixDetected(t *testing.T) {
 		t.Fatalf("nginx 配置路径异常: %s", NginxConf())
 	}
 }
+
+// TestEnsureNginxRuntimeDirsCreatesLogDirs 锁住"nginx 日志目录必须存在"。
+//
+// 真机事故（2026-09-16）：全新装出来的 nginx 没有 <brew>/var/log/nginx，
+// 于是 `nginx -t` 报 "could not open error log file"，**任何** vhost 都写不进去；
+// 反代规则保存时被如实拦下（"配置语法错误，已回滚"），而用户完全联想不到
+// 是缺一个日志目录。所以补目录必须是面板的职责，并在这里钉住。
+func TestEnsureNginxRuntimeDirsCreatesLogDirs(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ZIZPANEL_BREW_PREFIX", root)
+	t.Setenv("ZIZPANEL_USER", "")
+
+	// 造一份**真实形状**的 nginx.conf（brew 默认配置里的路径指令都在）
+	confDir := filepath.Join(root, "etc", "nginx")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf := `pid        ` + filepath.Join(root, "var", "run", "nginx.pid") + `;
+error_log  ` + filepath.Join(root, "var", "log", "nginx", "error.log") + `;
+http {
+    access_log  ` + filepath.Join(root, "var", "log", "nginx", "access.log") + `;
+    client_body_temp_path ` + filepath.Join(root, "var", "run", "nginx", "client_body_temp") + `;
+    proxy_temp_path       ` + filepath.Join(root, "var", "run", "nginx", "proxy_temp") + `;
+}
+`
+	if err := os.WriteFile(filepath.Join(confDir, "nginx.conf"), []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msg, err := ensureNginxRuntimeDirs()
+	if err != nil {
+		t.Fatalf("补目录失败：%v", err)
+	}
+	if msg == "" {
+		t.Error("第一次调用应当报告有改动（调用方据此 reload）")
+	}
+	for _, d := range []string{
+		filepath.Join(root, "var", "log", "nginx"),
+		filepath.Join(root, "var", "log", "nginx", "proxy"),
+		filepath.Join(root, "var", "run"), // nginx.pid 要写这里
+		filepath.Join(root, "var", "run", "nginx", "client_body_temp"),
+		filepath.Join(root, "var", "run", "nginx", "proxy_temp"),
+	} {
+		if st, serr := os.Stat(d); serr != nil || !st.IsDir() {
+			t.Errorf("目录应存在：%s（err=%v）", d, serr)
+		}
+	}
+	// 幂等：第二次不该再报告改动
+	msg2, err := ensureNginxRuntimeDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg2 != "" {
+		t.Errorf("第二次调用不该报告改动，实际 %q", msg2)
+	}
+}
+
+// TestEnsureVhostsIncludeIsIdempotent 锁住"vhosts/*.conf 必须被加载"。
+//
+// 真机事故（2026-09-16）：`brew reinstall nginx` 把 nginx.conf 还原成 brew 默认版，
+// 面板的两条 include（conf.d 与 vhosts）一起丢了。于是站点/反代配置**写进去了、
+// 文件也在**，nginx 却根本不加载 —— 用户看到的是"配置明明有，访问却不通"。
+// 之前只有 LNMP 安装流程补这条，修复/重装 nginx 之后就丢了，所以改为启动自愈。
+func TestEnsureVhostsIncludeIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ZIZPANEL_BREW_PREFIX", root)
+	confDir := filepath.Join(root, "etc", "nginx")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 brew 默认版：**没有** vhosts include
+	conf := "events {}\\nhttp {\\n    server {\\n        listen 80;\\n    }\\n}\\n"
+	confPath := filepath.Join(confDir, "nginx.conf")
+	if err := os.WriteFile(confPath, []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, _, _ := VhostsIncluded(); ok {
+		t.Fatal("前提错误：这份配置本来不该包含 vhosts")
+	}
+	if err := EnsureVhostsInclude(); err != nil {
+		t.Fatalf("补 include 失败：%v", err)
+	}
+	ok, msg, err := VhostsIncluded()
+	if err != nil || !ok {
+		t.Fatalf("补完后应当包含 vhosts，实际 ok=%v msg=%q err=%v", ok, msg, err)
+	}
+	// 备份要留下（改用户配置前必须能回退）
+	if _, err := os.Stat(confPath + ".zizpanel.bak"); err != nil {
+		t.Errorf("改 nginx.conf 前应当备份：%v", err)
+	}
+	// 幂等：再跑一次不该重复插入
+	first, _ := os.ReadFile(confPath)
+	if err := EnsureVhostsInclude(); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := os.ReadFile(confPath)
+	if string(first) != string(second) {
+		t.Error("重复调用不该再改文件（幂等）")
+	}
+	// vhosts 目录要建出来
+	if st, serr := os.Stat(filepath.Join(confDir, "vhosts")); serr != nil || !st.IsDir() {
+		t.Errorf("vhosts 目录应被创建：%v", serr)
+	}
+}

@@ -546,3 +546,28 @@ brew → `<基址>/brew`。**在 NAS 上把这三条反代配好之前不要接*
 `artifacts` 报出来，前端显示「残留数据」+「安装」+「删除残留数据」。
 回归测试：`TestMarketResidualDataOffersReinstall`、
 `TestMarketDetectsOrphanInstall`（旧断言正是这条 bug 的规则化，已改锁新契约）。
+
+91. **`brew reinstall nginx` 会静默丢掉面板的两条 include** →
+    真机事故（2026-09-16）：为了修 nginx 我把 `etc/nginx` 弄坏后 `brew reinstall`，
+    配置被还原成 brew 默认版，**`include conf.d/*.conf;` 与 `include vhosts/*.conf;` 一起没了**。
+    后果是"配置明明写进去了、文件也在，nginx 就是不加载" —— 站点与反代全部 404，
+    而服务是好的、`nginx -t` 也是 ok 的（因为默认配置本身合法）。更难查的是第二个坑：
+    同时存在两个 nginx master（旧的占 8080），旧 master 退出时清空了共享 pid 文件，
+    于是 `nginx -s reload` 一直报 `invalid PID number ""`，面板的重载路径也跟着失效。
+    修法：`EnsureVhostsInclude`（补 include，幂等 + 先备份）与 `ensureNginxRuntimeDirs`
+    （从 nginx.conf 解析出所有需要的目录并补齐）都纳入**每次启动自愈**；
+    另外只对具体目录 chown，**绝不 `chown -R` 到上层**（那次就是这么把 etc 弄坏的）。
+    教训：**"配置文件在" 不等于 "配置被加载"** —— 排查这类问题要先看 nginx.conf
+    到底 include 了哪些目录，而不是反复检查 vhost 文件内容。
+
+92. **"镜像上没有这个包"不该让用户装不上** →
+    最初的镜像语义是"镜像是唯一来源，缺资源就明确失败"（用户当时的要求）。
+    真机上很快就暴露出代价：镜像站临时挂掉、或这台机器不在能访问镜像的网络里，
+    安装就**彻底做不了**，哪怕公网源完全可用。用户随后补充要求：
+    "能用这个地址的尽量用，但每次调用都要判断通不通，不通走国内其它路线"。
+    修法：改成**镜像优先 + 按资源探测 + 自动回落**（`downloadURLsFor` /
+    `preflightMirrorAsset` 返回"这次走不走镜像"，据此决定用哪套校验），
+    并把"这次没走镜像、为什么"写进任务步骤。
+    教训：**"统一管控"和"可用性"要分开设计** ——
+    管控是策略（优先走哪里），可用性是底线（绝不能装不上）；
+    把策略做成硬约束，就会在策略的基础设施抖动时变成故障。

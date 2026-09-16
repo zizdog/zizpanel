@@ -37,7 +37,7 @@ export function DashboardView(content, ctx = {}) {
   }
 
   const topGrid = h('div.grid.grid-4', [
-    metricCard('cpu', 'CPU 使用率', '🧠'),
+    metricCard('cpu', 'CPU 使用率', '💻'),
     metricCard('mem', '内存使用', '💾'),
     metricCard('disk', '磁盘占用', '🗄️'),
     metricCard('net', '网络吞吐', '🌊', { bar: false }),

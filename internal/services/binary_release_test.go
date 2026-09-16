@@ -44,6 +44,17 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 			t.Errorf("安装器里的 %s 不在应用目录里（市场里看不到它）", id)
 			continue
 		}
+		// 有些应用已经**改走 Docker**（如 lucky，2026-09-16 用户要求改成容器版），
+		// 它们不再由 release 二进制安装器负责，注册表里也不再登记 ——
+		// 所以"不在目录里/不是 installer"对它们来说是正常状态。
+		// 只有当目录条目**仍然**声明了 PanelInstaller 或 native 安装路径时，
+		// 才要求两边完全对齐。
+		if app.Kind == KindCompose || app.Kind == KindDocker {
+			if app.PanelInstaller != "" {
+				t.Errorf("%s 走 Docker 时不该再声明 PanelInstaller（实际 %q）", id, app.PanelInstaller)
+			}
+			continue
+		}
 		if app.PanelInstaller != id {
 			t.Errorf("%s 的 PanelInstaller 应为 %q，实际 %q", id, id, app.PanelInstaller)
 		}
@@ -78,17 +89,20 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 //	· {root} 占位符全部被替换（留着的话 launchd 会拿到一个字面量路径）；
 //	· 可执行文件、配置参数、Label、工作目录都指向安装目录。
 func TestReleaseBinaryPlistResolvesRoot(t *testing.T) {
-	spec, ok := releaseBinaryApps["lucky"]
+	// 用 orbien 当样例：lucky 已改走 Docker（compose），不在这个注册表里了。
+	spec, ok := releaseBinaryApps["orbien"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 lucky")
+		t.Fatal("releaseBinaryApps 里没有 orbien")
 	}
 	m := &Manager{opt: Options{UserHome: "/Users/tester", UserName: "tester"}}
 	p := m.binaryReleasePaths(spec)
 	got := releaseBinaryPlist(spec, p, "tester")
 
+	// 这里只断言"每个应用都该有"的东西：可执行文件、Label、UserName、工作目录，
+	// 以及 **Args 里的占位符被替换**。具体是 -cd 还是 -c 由各应用自己的 Args 决定，
+	// 写死某一个应用的参数会让这个测试在换样例应用时假失败。
 	for _, want := range []string{
 		"<string>" + p.Binary + "</string>",
-		"<string>-cd</string>",
 		"<string>" + p.Root + "</string>",
 		"<string>" + spec.Label + "</string>",
 		"<string>tester</string>", // UserName：服务以真实用户身份运行
@@ -223,10 +237,10 @@ func TestExtractArgsPicksSingleBinary(t *testing.T) {
 		t.Errorf("不该把 frpc 一起解压出来：%s", joined)
 	}
 
-	// 没有 PickBinary 的应用（lucky / orbien）保持整体解压
-	lucky := releaseBinaryApps["lucky"]
-	if got := strings.Join(lucky.extractArgs("a.tar.gz", "/r"), " "); got != "-xzf a.tar.gz -C /r" {
-		t.Errorf("lucky 应整体解压，实际：%s", got)
+	// 没有 PickBinary 的应用（orbien 服务端 / 客户端）保持整体解压
+	orb := releaseBinaryApps["orbien"]
+	if got := strings.Join(orb.extractArgs("a.tar.gz", "/r"), " "); got != "-xzf a.tar.gz -C /r" {
+		t.Errorf("orbien 应整体解压，实际：%s", got)
 	}
 }
 
@@ -298,9 +312,9 @@ func TestReleaseBinaryUninstallPlans(t *testing.T) {
 // 加速镜像同一份 21 秒。如果官方源没有更短的截止时间，用户会对着进度条等十分钟 ——
 // 这不是"安全"换来的，只是没做取舍。
 func TestReleaseBinaryDownloadPrefersFastSource(t *testing.T) {
-	spec, ok := releaseBinaryApps["lucky"]
+	spec, ok := releaseBinaryApps["frps"]
 	if !ok {
-		t.Fatal("releaseBinaryApps 里没有 lucky")
+		t.Fatal("releaseBinaryApps 里没有 frps")
 	}
 	urls := spec.downloadURLs()
 	if len(urls) < 2 {
@@ -327,9 +341,8 @@ func TestConfigFilePathResolvesPerInstallLayout(t *testing.T) {
 	for _, tc := range []struct{ id, want string }{
 		{"frps", "/Users/tester/frps/frps.toml"},
 		{"frpc", "/Users/tester/frpc/frpc.toml"},
-		// lucky 刻意没有 ConfigPath：它的配置是加密的 lucky_*.lkcf，
-		// 拿文本编辑器打开没有意义（真机快照核实过，没有 lucky.conf）。
-		// 可视化配置走 Lucky 自己的 Web UI（16601）。
+		// lucky 已改走 Docker（compose），它的配置在数据卷里、由它自己的
+		// Web UI 管理，不参与这里"release 二进制 ConfigPath"的解析。
 		{"orbien", "/Users/tester/orbien/orbien-server.toml"},
 		{"orbien-client", "/Users/tester/orbien-client/orbien.toml"},
 	} {

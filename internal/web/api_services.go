@@ -559,6 +559,19 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if a.PanelInstaller != "" {
 			artifacts = services.InstallerArtifactExists(s.Cfg.UserHome, a.PanelInstaller)
 		}
+		// 旧版**原生安装**的残留：应用从注册表里拿掉（如 Lucky 改成 Docker 版）之后，
+		// 家目录下那份安装还在。不报出来的话卡片显示"未安装"却没有任何清理入口 ——
+		// 2026-09-16 用户实测："lucky 根本没被卸载掉"。
+		if !artifacts {
+			artifacts = services.LegacyNativeArtifactExists(s.Cfg.UserHome, a.ID, string(a.Kind))
+		}
+		// compose / docker 类应用的产物是**项目目录**（<WorkDir>/compose/<id>）。
+		// 卸载（保留数据）之后目录还在、服务记录不在 —— 与原生类一样必须
+		// 如实报 artifacts=true，否则卡片显示"未安装"却没有任何清理入口，
+		// 那份数据永远删不掉（2026-09-16 用户反馈的同一类问题）。
+		if !artifacts && (a.Kind == services.KindCompose || a.Kind == services.KindDocker) {
+			artifacts = services.ComposeArtifactExists(s.Cfg.WorkDir, a.ID)
+		}
 		// 服务此刻是否真在 launchd 里（决定能不能"纳管"）
 		serviceInLaunchd := false
 		for _, l := range cand {
@@ -721,17 +734,22 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 官方 release 原生二进制（Lucky / Orbien 服务端 / frps / frpc / Orbien 客户端）：
-	// 参数不同但流程同一套，所以共用一个处理器，按目录 ID 分流。
-	// 用安装器的注册表判断而不是在这里再抄一份 ID 列表 —— 抄的那份一定会漏。
-	if services.IsReleaseBinaryApp(id) {
-		s.handleInstallReleaseBinary(w, r)
-		return
-	}
-
 	app, found := services.FindApp(id)
 	if !found {
 		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
+		return
+	}
+
+	// 官方 release 原生二进制（Orbien 服务端 / frps / frpc / Orbien 客户端）：
+	// 参数不同但流程同一套，所以共用一个处理器，按目录 ID 分流。
+	//
+	// **判定必须以目录条目为准**：注册表里还留着某个 ID，而目录已经把它改成
+	// compose（Lucky 就是这样，2026-09-16 用户要求改 Docker 版）时，
+	// 只看注册表会绕过 compose 安装器去 GitHub 下 darwin 二进制 ——
+	// 真机复现：任务日志里出现 lucky_2.27.2_darwin_arm64.tar.gz 的镜像检查，
+	// 而目录条目明明是 compose，用户看到的就是"装不上"。
+	if services.IsReleaseBinaryApp(id) && app.Kind != services.KindCompose && app.Kind != services.KindDocker {
+		s.handleInstallReleaseBinary(w, r)
 		return
 	}
 	if app.AdoptLabel != "" {

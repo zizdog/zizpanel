@@ -790,8 +790,22 @@ func composeBin() (string, []string, bool) {
 			return p, []string{"compose"}, true
 		}
 	}
+	// 只有 v1 独立二进制的情况（Colima 装出来的就是这种：
+	// 插件目录里是 docker-compose 的软链，`docker compose` 子命令反而没有）。
+	//
+	// 这里必须**显式补上 brew 与 /usr/local 的绝对路径**：面板是 LaunchDaemon，
+	// 它的 PATH 不含 /opt/homebrew/bin 时 LookPath 会找不到 ——
+	// 真机就这么失败过：日志里一句 `docker: unknown command: docker compose`，
+	// 而机器上 `docker-compose` 明明装好了。
+	candidates := []string{}
 	if p, err := exec.LookPath("docker-compose"); err == nil {
-		return p, nil, true
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates, "/opt/homebrew/bin/docker-compose", "/usr/local/bin/docker-compose")
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil, true
+		}
 	}
 	return "", nil, false
 }

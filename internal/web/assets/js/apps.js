@@ -394,11 +394,20 @@ export function AppsView(content, ctx = {}) {
       // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
       // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
       // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
-      return h('button.btn.btn-sm.btn-primary', {
-        text: '纳管',
-        title: '把这个已在运行的服务登记到「服务管理」',
-        onclick: () => adoptApp(a),
-      });
+      return h('div', { style: { display: 'flex', gap: '6px' } }, [
+        h('button.btn.btn-sm.btn-primary', {
+          text: '纳管',
+          title: '把这个已在运行的服务登记到「服务管理」',
+          onclick: () => adoptApp(a),
+        }),
+        // 「重装」入口：用户 2026-09-16 明确要求。
+        // 安装器本身是幂等的（会复用已下载的产物、保留数据），所以重装 = 再跑一次安装。
+        h('button.btn.btn-sm', {
+          text: '重装',
+          title: '重新跑一遍安装（会复用已下载的产物、保留数据，不会重复下载）',
+          onclick: () => reinstallApp(a),
+        }),
+      ]);
     }
     if (a.site_app) return null; // 建站类的入口由 siteInstallButtons 提供
     if (a.panel_installer && a.artifacts && !a.service_in_launchd) {
@@ -474,9 +483,13 @@ export function AppsView(content, ctx = {}) {
         }) : null,
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
       ]),
-      a.description ? h('div', {
+      // 卡片上只放**一句话**（summary）。以前把整段 description 铺在卡片里，
+      // 一个条目的文字比按钮还多，用户要滚动半天才能看完一个应用（2026-09-16 反馈）。
+      // 完整说明不丢：鼠标悬停给 title，想细看可以点「文档」。
+      (a.summary || a.description) ? h('div', {
         style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.55' },
-        text: a.description,
+        title: a.description || '',
+        text: a.summary || a.description,
       }) : null,
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
         primaryButton(a),
@@ -612,7 +625,14 @@ export function AppsView(content, ctx = {}) {
               target: d,
               title: '一键建站 ' + a.name + '（' + d + '）',
               start: () => api.marketInstallSite(a.id, { domain: d, php: php.value.trim() || '8.3' }),
-              onDone: () => load(),
+              onDone: (m) => {
+                if (m && m.status && m.status !== 'succeeded') {
+                  toast('建站失败：' + (m.error || m.status), 'err', 12000);
+                } else {
+                  toast('「' + a.name + '」已建站完成', 'ok', 9000);
+                }
+                refreshSilently();
+              },
             });
           },
         }),
@@ -727,7 +747,7 @@ export function AppsView(content, ctx = {}) {
     try {
       await api.serviceForget(name);
       toast('已取消纳管', 'ok');
-      load();
+      refreshSilently();
     } catch (e) {
       toast('取消失败：' + e.message, 'err', 9000);
     }
@@ -751,6 +771,24 @@ export function AppsView(content, ctx = {}) {
       case 'phpmyadmin': installPhpMyAdmin(a.id); return;
     }
     preflight(a);
+  }
+
+  // ---------- 重装 ----------
+  //
+  // 重装与安装走**同一条安装器**（它是幂等的：已下载的产物会复用、
+  // 已存在的配置与数据不动），所以这里做的只是"把后果说清楚再跑一次"。
+  // 用户明确要求有这个入口（2026-09-16）：装了但想修、或想更新配置时，
+  // 以前只能先卸载再装，中间那段时间服务是停的。
+  async function reinstallApp(a) {
+    const okGo = await confirmBox(
+      '重新部署「' + a.name + '」？\n\n' +
+      '· 会重新跑一遍安装流程（下载/解压/重建服务定义）\n' +
+      '· **已下载的产物会复用**，不会重复下载\n' +
+      '· 已存在的配置与数据**保留**\n' +
+      '· 服务会重启一次',
+      { title: '重装 ' + a.name, okText: '开始重装' });
+    if (!okGo) return;
+    doInstall(a);
   }
 
   // ---------- 安装前检查 ----------
@@ -834,7 +872,32 @@ export function AppsView(content, ctx = {}) {
       target: a.id,
       title: `安装 ${a.name}`,
       start: () => api.marketInstall(a.id),
+      // 装完必须**立刻**把卡片状态刷新过来（用户 2026-09-16 要求：
+      // "安装、卸载后面板中的软件状态要及时更新"）。以前只靠任务状态变化重画，
+      // 而任务结束时市场数据还是旧的，卡片就停留在"可安装"。
+      onDone: (m) => {
+        if (m && m.status && m.status !== 'succeeded') {
+          toast('安装失败：' + (m.error || m.status), 'err', 12000);
+        } else {
+          toast('「' + a.name + '」已安装', 'ok', 8000);
+        }
+        refreshSilently();
+      },
     });
+  }
+
+  // refreshSilently 重新拉一次市场数据并重画卡片，**不显示"正在读取"占位**。
+  //
+  // 为什么要单独一个：load() 会先 clear(grid) 再显示 loading 占位，
+  // 任务刚结束时调用它，用户会看到整页闪一下白 —— 而他要的只是"状态更新"。
+  async function refreshSilently() {
+    try {
+      cache = await api.market();
+    } catch {
+      return; // 拉不到就保持旧画面，不要把一个空网格拍给用户
+    }
+    renderHead();
+    renderGrid();
   }
 
   // 任务状态变化（开始/结束）时重画卡片：正在安装的应用，按钮要变成「查看进度」。

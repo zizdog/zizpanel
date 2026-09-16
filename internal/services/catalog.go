@@ -261,9 +261,9 @@ func Catalog() []App {
 				},
 			},
 			Summary: "AI 擦除水印与杂物，支持批量与视频",
-			Description: "上传图片 → 涂抹要去掉的水印 → 擦除。使用 LaMa 模型并启用 " +
-				"Apple Silicon MPS 加速，单进程、模型仅约 200MB。" +
-				"界面里可切换更强模型（如 PowerPaint），但 MAT / ZITS / LDM 在 M 系列上不支持 MPS。",
+			Description: "上传图片、涂抹要去掉的水印即可擦除；走原生安装，用 LaMa 模型并启用 " +
+				"Apple Silicon MPS 加速，模型约 200MB。可切换更强模型，" +
+				"但 MAT / ZITS / LDM 在 M 系列上不支持 MPS。",
 			Category: "tool", Kind: KindNative, PanelInstaller: "iopaint", ServiceLabel: "com.zizdog.iopaint",
 			Port:    8080,
 			DocsURL: "https://github.com/Sanster/IOPaint",
@@ -271,11 +271,10 @@ func Catalog() []App {
 		{
 			ID: "qwen3tts", Name: "Qwen3 TTS（语音合成）", Icon: "🗣️",
 			Summary: "本地语音合成，支持音色克隆",
-			Description: "按 TtsVoice 插件的部署契约安装：Python 3.11 环境 + mlx-audio[server] " +
-				"+ 1.7B-Base-8bit 模型（约 2.9GB，用于音色克隆）。" +
-				"网站侧插件现在只支持「自定义音色」，预置音色已下线，所以只需要这一个模型。" +
-				"可选择是否加鉴权；加了鉴权时 Qwen 只监听本机，" +
-				"对外由音色接收端（8899）提供带密钥的反向代理。",
+			Description: "按 TtsVoice 插件契约原生安装：Python 3.11 + mlx-audio[server] " +
+				"+ 1.7B-Base-8bit 模型（约 2.9GB，用于音色克隆），网站插件只支持" +
+				"「自定义音色」，故只需这一个模型。" +
+				"加鉴权后 Qwen 只监听本机，对外由音色接收端（8899）带密钥反代。",
 			Category: "ai", Kind: KindNative, PanelInstaller: "qwen3tts", ServiceLabel: "com.zizdog.qwen3tts",
 			Port:       8880,
 			HealthPath: audioHealth,
@@ -285,8 +284,8 @@ func Catalog() []App {
 			ID: "voicereceiver", Name: "TtsVoice 音色接收端", Icon: "🔐",
 			Summary: "接收音色样本 + 带鉴权的反向代理",
 			Description: "给网站插件用的对外入口：接收上传的音色样本（落到本机，" +
-				"因为上游只认本地文件路径），并把 /v1/* 转发给只监听本机的 8880。" +
-				"支持指定共享密钥或自动生成。GET /voice/status 可查上游模型驻留状态。",
+				"因为上游只认本地文件路径），并把 /v1/* 反代给只监听本机的 8880。" +
+				"共享密钥可指定或自动生成。",
 			Category: "ai", Kind: KindNative, PanelInstaller: "voicereceiver", ServiceLabel: "com.zizdog.voicereceiver",
 			Port: 8899,
 			// 契约来源是网站侧插件目录里的 HANDOFF-TO-MINI.md。
@@ -300,8 +299,8 @@ func Catalog() []App {
 			UI:       &AppUI{Slug: "phpmyadmin", SelfConf: true},
 			NoDaemon: true,
 			Summary:  "数据库管理界面（推荐入口）",
-			Description: "面板自研的库表管理功能有限，日常的库/表/权限/导入导出建议用 phpMyAdmin。" +
-				"装好后接入 nginx 默认站点，访问 http://<本机地址>/phpmyadmin/。" +
+			Description: "面板自研的库表管理功能有限，日常的库/表/权限/导入导出建议用它。" +
+				"装好后接入 nginx 默认站点，访问 http://<本机地址>/phpmyadmin/；" +
 				"面板内置那套保留为应急入口。",
 			Category: "tool", Kind: KindNative, PanelInstaller: "phpmyadmin", BrewFormula: "phpmyadmin",
 			Port:       0,
@@ -379,8 +378,8 @@ func Catalog() []App {
 		{
 			ID: "docker-runtime", Name: "Docker 运行时（Colima）", Icon: "🐳",
 			Summary: "容器引擎，Docker 类应用的前提",
-			Description: "Colima 在轻量 Linux 虚拟机里跑 Docker 引擎，原生支持 Apple Silicon。" +
-				"装好后开机自动启动，无需登录桌面。停止它会让所有容器一起停掉。",
+			Description: "Colima 在轻量 Linux 虚拟机里跑 Docker 引擎，原生支持 Apple Silicon，" +
+				"装好后开机自启、无需登录桌面；停止它会让所有容器一起停掉。",
 			Category: "runtime", Kind: KindColima, PanelInstaller: "docker-runtime",
 			// BrewFormula 用于判断"装没装"；ServiceLabel 用于判断"纳没纳管"。
 			// 两者都要给，否则市场会显示"已安装·未纳管"并给出一个点了会报错的纳管按钮。
@@ -545,9 +544,9 @@ func Catalog() []App {
 			// 纯前端应用：所有逻辑在浏览器里跑，没有后端 API，只有静态资源前缀要改写。
 			UI:      &AppUI{Slug: "it-tools"},
 			Summary: "几十个开发者常用小工具，纯前端",
-			Description: "JSON 格式化、Base64/URL 编解码、UUID 与哈希生成、时间戳转换、" +
-				"正则测试、JWT 解析、CIDR 计算等常用小工具合集。" +
-				"全部逻辑在浏览器里本地执行，输入内容不上传。装好后访问 http://<本机地址>:8083。",
+			Description: "JSON 格式化、Base64/URL 编解码、UUID/哈希、时间戳、正则、" +
+				"JWT、CIDR 等开发者小工具合集。走 Docker，纯前端本地执行、" +
+				"输入不上传，端口 8083。",
 			Category: "tool", Kind: KindCompose, Port: 8083,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
@@ -571,10 +570,10 @@ func Catalog() []App {
 				Note:     "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
 			},
 			Summary: "在浏览器里管理服务器上的文件",
-			Description: "浏览、上传、下载、重命名、删除与分享目录，支持多用户与细粒度权限。" +
-				"面板自带的文件管理器限定在白名单目录（网站目录、面板数据/日志/工作目录），" +
-				"File Browser 没有这个限制，适合当成日常入口。" +
-				"默认管理 compose 目录下的 data/（可在 Docker → Compose 里改挂载目录）。",
+			Description: "浏览器里浏览、上传、下载、分享文件，支持多用户与细粒度权限；" +
+				"它不像面板自带文件管理器那样限定白名单目录。" +
+				"因 Homebrew 版没有 service 定义，仍走 Docker，端口 8081，" +
+				"默认管理 compose 目录下的 data/。",
 			Category: "tool", Kind: KindCompose, Port: 8081,
 			// 官方镜像的 healthcheck 打的就是 /health（见仓库 docker/common/healthcheck.sh），
 			// 不是猜测的路径。
@@ -652,18 +651,11 @@ func Catalog() []App {
 			},
 			Summary: "把内网服务暴露到公网（服务端，带 Web Dashboard）",
 			Description: "fatedier/frp 的服务端，配合 frpc 把内网机器上的端口映射到公网。" +
-				"**走原生（不走 Docker），且不碰 Homebrew**：直接下载官方 release 的 " +
-				"darwin-arm64 产物（frp_0.71.0_darwin_arm64.tar.gz）解压到 ~/frps，" +
-				"由系统级 launchd 托管；这条路径与 Lucky / Orbien 共用同一个安装器" +
-				"（internal/services/binary_release.go）。" +
-				"**frp 是这里唯一提供 SHA-256 校验清单的上游**" +
-				"（frp_sha256_checksums.txt）：面板会把下载到的 tarball 与官方清单比对，" +
-				"不一致就中止安装 —— 这正好补上了加速镜像（第三方）这个环节的信任缺口。" +
-				"面板生成的 ~/frps/frps.toml 里：" +
-				"bindPort = 7000（协议口）、auth.token 随机生成、dashboard 在 7500 " +
-				"（webServer 监听 0.0.0.0，user/password 随机生成并显示在安装结果里）。" +
-				"⚠️ macOS 的「隔空播放接收器」默认占着 7000 —— 安装前检查会**如实**报冲突，" +
-				"不会假装能装。同机的 frpc 必须用同一个 auth.token 才连得上。",
+				"**走原生（不走 Docker），且不碰 Homebrew**：下载官方 release 的 " +
+				"darwin-arm64 产物解压到 ~/frps，由系统级 launchd 托管，" +
+				"并与官方 SHA-256 校验清单比对。" +
+				"协议口 7000、Dashboard 7500；7000 常被 macOS「隔空播放接收器」占用，" +
+				"安装前检查会如实报冲突。",
 			Category: "tool", Kind: KindNative,
 			// 面板自研安装器（release 二进制 + launchd），不是 brew：
 			// 用户明确要求不碰 brew（Homebrew 的 7000 默认配置还会绕过面板的可视化配置）。
@@ -686,18 +678,11 @@ func Catalog() []App {
 				PreferDirect: true,
 			},
 			Summary: "把本机端口映射到 frps（客户端，带 admin UI）",
-			Description: "fatedier/frp 的客户端：连上 frps，把指定的本地端口暴露出去。" +
-				"**走原生（不走 Docker）**：与 frps 共用官方 release 的同一个 tarball" +
-				"（frp_0.71.0_darwin_arm64.tar.gz，里面 frps / frpc 各一个二进制，" +
-				"面板只挑出 frpc），解压到 ~/frpc 并用系统级 launchd 托管。" +
-				"为什么客户端也不进容器：它的活就是「把**这台 Mac 上**的服务暴露出去」，" +
-				"原生下 [[proxies]] 的 localIP 直接写 127.0.0.1；" +
-				"Docker 下容器里的 127.0.0.1 指向容器自己，每条隧道都得改写成 " +
-				"host.docker.internal —— 正好卡在它的主用途上。" +
-				"面板生成的 ~/frpc/frpc.toml 里：serverAddr = 127.0.0.1、" +
-				"serverPort = 7000、auth.token（**优先自动复用本机 frps 的 token**）、" +
-				"admin UI 在 7400（user/password 随机生成并显示在安装结果里）。" +
-				"[[proxies]] 默认给一条**注释掉的**示例，本地目标写 127.0.0.1:<port>。",
+			Description: "fatedier/frp 的客户端：连上 frps，把本机端口映射出去。" +
+				"**走原生（不走 Docker）**：与 frps 共用官方 darwin-arm64 tarball，" +
+				"解压到 ~/frpc 并用系统级 launchd 托管 —— 客户端要暴露的是" +
+				"**这台 Mac 上**的服务，放进容器后 127.0.0.1 会指向容器自己。" +
+				"serverPort 7000、admin UI 7400，auth.token 优先自动复用本机 frps 的。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "frpc", ServiceLabel: "com.zizdog.frpc",
 			// 7400 是它唯一监听的端口（admin UI），所以健康检查也查它。
@@ -712,43 +697,30 @@ func Catalog() []App {
 		},
 		{
 			ID: "lucky", Name: "Lucky（反代 / DDNS / 端口转发）", Icon: "🍀",
-			// Lucky 的页面用**相对**路径引资源（实测 index.html 里是
-			// `./static/js/lucky_index-*.js`、`./logo.svg`、`./manifest.webmanifest`），
-			// 挂子路径理论可行；但面板**没有**在真机上验证过它的 API 路径，
-			// 所以按既有约定把端口直连设为首选入口，子路径降级成次要入口。
 			UI: &AppUI{
 				Slug: "lucky",
-				Note: "Lucky 用相对路径引资源，子路径代理未在真机实测；" +
-					"面板默认给端口直连（http://<地址>:16601）",
+				Note: "Lucky 的后台可以在它自己的设置里改成「安全入口」（随机路径）或加 IP 白名单，" +
+					"那时子路径与直连的根路径都会 404；面板默认给端口直连（http://<地址>:16601）",
+				// 直连端口是首选：Lucky 的 Web UI 可能被用户设成安全入口/白名单，
+				// 那时任何路径都 404，子路径入口点开就是一个错误页。
 				PreferDirect: true,
 			},
 			Summary: "反向代理 / DDNS / 端口转发 / SSL 申请，带 Web 界面",
 			Description: "一个 Go 写的网络小工具集合：反向代理、DDNS、端口转发、WebDAV、" +
-				"STUN 内网穿透、ACL、SSL 证书申请与续期，全部在一个 Web 界面里配置。" +
-				"**走原生（不走 Docker）**：官方 release 有 darwin-arm64 产物" +
-				"（lucky_2.27.2_darwin_arm64.tar.gz，实测 file 报告 Mach-O arm64），" +
-				"面板解压到 ~/lucky 并用系统级 launchd 托管。" +
-				"为什么不用 Docker：macOS 上 Docker 跑在 Colima 的 Linux 虚拟机里，" +
-				"容器看到的是虚拟机的网络而不是 Mac 的（`--network host` 也只等于虚拟机自己的 host），" +
-				"而 Lucky 做的正是端口转发/反代/DDNS —— 把转发器和被转发的服务放进两个" +
-				"网络命名空间，等于这个工具在 macOS 上白装。" +
-				"网页界面在 16601（HTTP 与 HTTPS 同端口）；首次访问要走 Lucky 自己的初始化" +
-				"（设置账号口令），面板不预置口令。配置以加密的 lucky_*.lkcf 存在 ~/lucky 下，" +
-				"**不要手改**；备份整个目录即可。",
-			Category: "tool", Kind: KindNative,
-			PanelInstaller: "lucky", ServiceLabel: "com.zizdog.lucky",
-			// 刻意**不做 HTTP 健康检查**（HealthPath 留空 = 只由 launchd/端口判断存活）。
+				"SSL 申请等，网页界面在 16601。**改用 Docker 跑**（用户 2026-09-16 决定）：" +
+				"官方镜像 gdy666/lucky 实测自带 linux/arm64，不是 amd64 转译。" +
+				"**代价**：反代/转发的目标在 Colima 虚拟机网络里，连 Mac 本机服务" +
+				"要写宿主机地址；首次访问需自行设账号口令。",
+			Category: "tool", Kind: KindCompose, Port: 16601,
+			// 刻意**不做 HTTP 健康检查**（HealthPath 留空 = 只看容器/端口）。
 			// 原因：Lucky 的 Web UI 可以被用户自己设成「安全入口」（随机路径）或加 IP 白名单，
 			// 那时它对**任何**路径（包括 127.0.0.1 上的 `/`）都返回 404 而不是 403 ——
-			// 服务完全正常，HTTP 健康检查却会红。真机实测：用户配过 Lucky 之后
-			// `/`、`/login`、`/api/base` 全 404，而端口在听、模块全部 started。
-			// 与其给一个会误导的红灯，不如如实说"不做 HTTP 健康检查"。
-			Port: 16601,
-			// 刻意**不设 ConfigPath**：Lucky 的配置是**加密的** `lucky_*.lkcf`，
-			// 没有可手改的文本配置 —— 拿文本编辑器打开只会是一堆二进制。
-			// （真机快照核实：~/lucky 下只有 lucky_base.lkcf / lucky_ddns.lkcf 等，
-			//   没有 lucky.conf；之前这里按上游源码猜了个文件名，等于给一个点开就坏的按钮。）
-			// 它的可视化配置就是自带的 Web UI（16601）。
+			// 服务完全正常，HTTP 健康检查却会红。真机实测过这一点。
+			Requires: []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			ComposeYAML: composeTemplate("lucky", "gdy666/lucky:latest", 16601, 16601, `
+    volumes:
+      - ./data:/goodluck
+    restart: unless-stopped`),
 			DocsURL: "https://github.com/gdy666/lucky",
 		},
 		{
@@ -767,16 +739,11 @@ func Catalog() []App {
 				PreferDirect: true,
 			},
 			Summary: "Rust 写的轻量内网穿透，带 Web Dashboard",
-			Description: "轻量内网穿透平台：传输层支持 TCP / QUIC / KCP / WebSocket，" +
-				"代理支持 TCP / UDP / HTTP / HTTPS / SOCKS5，自带 Web Dashboard " +
-				"（HTTP Basic 鉴权）。**走原生（不走 Docker）**：官方 release 有 " +
-				"darwin-arm64 产物（orbien-server_3.6.0_darwin_arm64.tar.gz，实测 " +
-				"file 报告 Mach-O arm64，运行日志确认 0.0.0.0:9527 与 0.0.0.0:8020 在听），" +
-				"面板解压到 ~/orbien 并用系统级 launchd 托管。" +
-				"为什么不用 Docker：与 Lucky 同理 —— 内网穿透贴着宿主机网络栈，" +
-				"放进 Colima 的 Linux 虚拟机里看到的就不是 Mac 的局域网了。" +
-				"面板会生成 ~/orbien/orbien-server.toml：控制端口 9527（客户端连这里）、" +
-				"Dashboard 8020（用户名 admin，口令随机生成并显示在安装结果里）。",
+			Description: "Rust 写的轻量内网穿透：传输支持 TCP/QUIC/KCP/WebSocket，" +
+				"代理支持 TCP/UDP/HTTP/HTTPS/SOCKS5，带 Web Dashboard（Basic 鉴权）。" +
+				"**走原生（不走 Docker）**：官方 darwin-arm64 产物解压到 ~/orbien，" +
+				"由系统级 launchd 托管 —— 穿透要贴宿主机网络栈，容器里看不到 Mac 局域网。" +
+				"控制口 9527、Dashboard 8020（口令随机生成）。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "orbien", ServiceLabel: "com.zizdog.orbien",
 			Port: 8020, HealthPath: "/",
@@ -793,19 +760,10 @@ func Catalog() []App {
 			// 不渲染一个点开必然打不开的按钮。它的可视化配置入口是服务详情里的
 			// 「📝 编辑配置文件」（orbien.toml），要看图表请开服务端的 Dashboard(8020)。
 			Summary: "连上 Orbien 服务端，把本机端口穿透出去（客户端）",
-			Description: "Orbien 的**客户端**（上游 CLI：`orbien -c orbien.toml`）。" +
-				"**走原生（不走 Docker）**：官方 release 有 darwin-arm64 产物" +
-				"（orbien_3.6.0_darwin_arm64.tar.gz，2,104,350 B；实测解压出的 " +
-				"`orbien` 用 file 报 Mach-O arm64、`orbien --help` 输出 \"orbien client\"），" +
-				"面板解压到 ~/orbien-client 并用系统级 launchd 托管。" +
-				"为什么客户端也不进容器：它的活是「把**这台 Mac 上**的服务暴露出去」，" +
-				"原生下 [[tunnels]] 的 service 直接写 127.0.0.1:<port>；" +
-				"Docker 下容器里的 127.0.0.1 指向容器自己，每条隧道都得改写成 " +
-				"host.docker.internal —— 正好卡在它的主用途上。" +
-				"面板生成的 ~/orbien-client/orbien.toml 里：server = 127.0.0.1:9527" +
-				"（本机服务端；换公网服务器就改这里），并给一条注释掉的 [[tunnels]] 示例。" +
-				"客户端是**主动往外连**的，不监听任何端口，所以没有端口/健康检查；" +
-				"状态按 launchd 服务（com.zizdog.orbien-client）在不在跑判断。",
+			Description: "Orbien 的**客户端**（上游 CLI）。**走原生（不走 Docker）**：" +
+				"官方 darwin-arm64 产物解压到 ~/orbien-client，由系统级 launchd 托管 ——" +
+				"原生下 [[tunnels]] 的 service 直接写 127.0.0.1，容器里会指向容器自己。" +
+				"客户端主动外连、不监听端口，server 默认 127.0.0.1:9527。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "orbien-client", ServiceLabel: "com.zizdog.orbien-client",
 			Port:       0,
@@ -822,10 +780,9 @@ func Catalog() []App {
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",
 			Summary: "轻量博客程序，一键装好并配好伪静态",
-			Description: "国内最常用的轻量博客程序之一（PHP + MySQL）。" +
-				"面板会自动：下载官方最新版 → 解压到 ~/www/<域名> → 建库建用户 → " +
-				"写 config.inc.php → 建站点并套用 Typecho 伪静态。" +
-				"完成后打开 http://<域名>/install.php 走完最后一步（数据库信息已预填）。",
+			Description: "轻量博客程序（PHP + MySQL）。面板会自动下载官方最新版、" +
+				"解压到 ~/www/<域名>、建库建用户、写 config.inc.php 并套用 Typecho 伪静态。" +
+				"完成后到 http://<域名>/install.php 走完最后一步（数据库信息已预填）。",
 			Category: "site", Kind: KindNative, Port: 0,
 			SiteApp: &SiteAppSpec{
 				DownloadURL: "https://github.com/typecho/typecho/releases/latest/download/typecho.zip",
@@ -842,9 +799,9 @@ func Catalog() []App {
 		{
 			ID: "wordpress", Name: "WordPress", Icon: "🌐",
 			Summary: "最流行的建站程序，一键装好并配好伪静态",
-			Description: "面板会自动：下载官方中文版 → 解压到 ~/www/<域名> → 建库建用户 → " +
-				"生成 wp-config.php → 建站点并套用 WordPress 伪静态。" +
-				"完成后打开 http://<域名>/wp-admin/install.php 填站点标题与管理员账号即可。",
+			Description: "最流行的建站程序（PHP + MySQL）。面板会自动下载官方中文版、" +
+				"解压到 ~/www/<域名>、建库建用户、生成 wp-config.php 并套用 WordPress 伪静态。" +
+				"完成后到 http://<域名>/wp-admin/install.php 填站点标题与管理员账号即可。",
 			Category: "site", Kind: KindNative, Port: 0,
 			SiteApp: &SiteAppSpec{
 				// 用官方中文站（国内可达性明显好于 wordpress.org）
@@ -906,10 +863,9 @@ func Catalog() []App {
 				},
 			},
 			Summary: "浏览器里的图片压缩，本地 wasm 完成",
-			Description: "PNG / JPEG / WebP / AVIF 等格式的压缩与尺寸调整，编解码全在浏览器里用 " +
-				"wasm 完成，图片不上传。装好后访问 http://<本机地址>:8085。" +
-				"注意：上游没有官方镜像（仓库里没有 Dockerfile），这里用的是社区镜像，" +
-				"只做静态文件托管，没有服务端逻辑。",
+			Description: "PNG / JPEG / WebP / AVIF 压缩与尺寸调整，编解码全在浏览器里用 " +
+				"wasm 完成，图片不上传。⚠️ 上游没有官方镜像，这里用社区镜像 " +
+				"pjmeca/squoosh:1.1.0（固定版本），只托管静态文件、无服务端逻辑；端口 8085。",
 			Category: "tool", Kind: KindCompose, Port: 8085,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},

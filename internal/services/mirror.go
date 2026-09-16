@@ -193,37 +193,76 @@ func (m *Manager) checkMirrorURL(ctx context.Context, url string) error {
 	}
 }
 
-// downloadURLsFor 返回这个应用**允许使用**的下载地址。
+// downloadURLsFor 返回这个应用**允许使用**的下载地址，**镜像优先**。
 //
-// 镜像生效时只有一个候选（用户要求："先检查镜像站的资源能不能访问，不能再走其它"）。
-// 镜像关掉时才回到原来的"官方 + 第三方加速"列表。
-func (m *Manager) downloadURLsFor(spec releaseBinaryApp) []string {
+// 语义（2026-09-16 用户明确要求）：
+//  1. 配了镜像基址时，第一个候选永远是镜像上的包（省流量、速度快）；
+//  2. 镜像**探测不通**（站点挂了/不在同一网络）时，自动回落到原来的
+//     "官方 + 国内第三方加速"列表 —— 绝不能因为镜像挂了就装不上；
+//  3. 没配镜像基址时就是原来的列表。
+//
+// 探测是**按资源**做的（HEAD 那个具体文件），不是只探站点根：
+// 站点活着但缺这个包时，也要能回落到公网，否则用户会卡在"镜像上没有这个资源"。
+func (m *Manager) downloadURLsFor(ctx context.Context, spec releaseBinaryApp) []string {
+	fallback := spec.downloadURLs()
 	if !m.MirrorEnabled() {
-		return spec.downloadURLs()
+		return fallback
 	}
-	return []string{m.appAssetURL(spec.ID, spec.Tag, spec.Asset)}
+	mirrorURL := m.appAssetURL(spec.ID, spec.Tag, spec.Asset)
+	if err := m.checkMirrorURL(ctx, mirrorURL); err != nil {
+		// 不可达/缺包：回落。把原因留给调用方记进任务日志（这里只返回列表）。
+		return fallback
+	}
+	return append([]string{mirrorURL}, fallback...)
+}
+
+// mirrorReachable 探测镜像站是否可用（只探站点根，用于"整条链路"级别的判断）。
+//
+// 与 checkMirrorURL 的分工：那个探**具体资源**（用来决定某个包从哪下），
+// 这个探**站点本身**（用来决定 pip / HF 这类"整条链路"要不要走镜像）。
+func (m *Manager) mirrorReachable(ctx context.Context) bool {
+	if !m.MirrorEnabled() {
+		return false
+	}
+	return m.checkMirrorURL(ctx, m.mirrorBase()+"/") == nil
 }
 
 // preflightMirrorAsset 下载前确认镜像上真的有这个包与它的清单。
 //
-// 这是用户要求的那一步"先检查"。检查不过就中止安装（不回退），
-// 错误里带上具体路径与补救命令。
-func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryApp, result *InstallResult) error {
+// 这是用户要求的那一步"先检查"。**返回 true 表示这次会走镜像**
+// （包与清单都在），false 表示要回落到公网源。
+//
+// 为什么改成"回落"而不是"直接失败"（2026-09-16 用户补充要求）：
+// 镜像站可能临时挂掉、或者这台机器根本不在能访问镜像的网络里。
+// 那时**装不上**才是更糟的结果，所以缺资源/不可达一律回落，
+// 并把原因写进任务步骤（用户看得见"这次没走镜像、为什么"）。
+func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryApp, result *InstallResult) bool {
 	if !m.MirrorEnabled() {
-		return nil
+		return false
 	}
 	pkg := m.appAssetURL(spec.ID, spec.Tag, spec.Asset)
+	man := m.appManifestURL(spec.ID, spec.Tag)
 	if result != nil {
-		result.step(ctx, "检查镜像资源："+pkg)
+		result.step(ctx, "先检查镜像资源："+pkg)
 	}
 	if err := m.checkMirrorURL(ctx, pkg); err != nil {
-		return fmt.Errorf("「%s」不能安装：%w", spec.Name, err)
+		if result != nil {
+			result.step(ctx, "镜像上没有这个包，改用公网源："+err.Error())
+		}
+		return false
 	}
-	// 清单也要在：它是校验 sha256 的唯一来源（镜像模式下不访问上游）。
-	if err := m.checkMirrorURL(ctx, m.appManifestURL(spec.ID, spec.Tag)); err != nil {
-		return fmt.Errorf("「%s」不能安装：%w", spec.Name, err)
+	// 清单也要在：它是镜像模式下校验 sha256 的唯一来源。
+	// 包在、清单不在时同样回落（否则会拿不到期望值而中止）。
+	if err := m.checkMirrorURL(ctx, man); err != nil {
+		if result != nil {
+			result.step(ctx, "镜像上缺 sha256 清单，改用公网源："+err.Error())
+		}
+		return false
 	}
-	return nil
+	if result != nil {
+		result.step(ctx, "镜像可用，将从镜像站下载（省流量、更快）")
+	}
+	return true
 }
 
 // verifyMirrorChecksum 用镜像清单里的 sha256 核对下载到的产物。

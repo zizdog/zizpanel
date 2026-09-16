@@ -370,6 +370,25 @@ func (m *Manager) downloadQwenModel(ctx context.Context, p qwenPaths, result *In
 	return nil
 }
 
+// qwenHFEndpoint 按"优先级 + 可用性"挑 HuggingFace 端点。
+//
+// 顺序（2026-09-16 用户要求："能用镜像的尽量用，模型文件也一样"）：
+//  1. 面板设置里的镜像基址 + /hf —— 自建镜像站的 HuggingFace 反代/缓存。
+//     模型动辄 2~3GB，走同城镜像省流量也快得多。
+//     但**必须探通**（HEAD <base>/hf/），不通就跳过；
+//  2. 内置的 hf-mirror.com（国内公共镜像，实测可用）。
+//
+// 探测失败不报错：模型下载本来就有 3 次重试，这里只决定"用哪个端点"。
+func (m *Manager) qwenHFEndpoint(ctx context.Context) string {
+	if m.MirrorEnabled() {
+		base := m.mirrorSubPath("hf")
+		if err := m.checkMirrorURL(ctx, base+"/"); err == nil {
+			return base
+		}
+	}
+	return qwenHFMirror
+}
+
 // downloadOneQwenModel 下载单个模型并处理续传重试。
 func (m *Manager) downloadOneQwenModel(ctx context.Context, hf string, mdl QwenModel, result *InstallResult) error {
 	if modelDownloaded(m.opt.UserHome, mdl.Name) {
@@ -377,9 +396,12 @@ func (m *Manager) downloadOneQwenModel(ctx context.Context, hf string, mdl QwenM
 		return nil
 	}
 
+	// 端点每次下载前重新判断：镜像站可能中途挂掉，也可能刚配好。
+	hfEndpoint := m.qwenHFEndpoint(ctx)
 	result.Steps = append(result.Steps,
 		"正在下载 "+mdl.Label+"（约 2GB / 14 个文件，视网络 5~15 分钟）")
-	env := []string{"HF_ENDPOINT=" + qwenHFMirror, "HF_HUB_DISABLE_XET=1"}
+	result.Steps = append(result.Steps, "模型来源："+hfEndpoint)
+	env := []string{"HF_ENDPOINT=" + hfEndpoint, "HF_HUB_DISABLE_XET=1"}
 
 	// 重试：2GB 下载中途遇到 "Connection reset by peer" 很常见（实测就遇到一次），
 	// 而 huggingface 的下载是**可续传**的 —— 已经下好的分片不会重下。

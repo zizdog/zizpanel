@@ -253,3 +253,77 @@ func TestServicePlanKeepNoteMatchesKind(t *testing.T) {
 		t.Errorf("原生服务的保留说明里要写明 brew 包不会被卸载，实际：%s", plan.KeepNote)
 	}
 }
+
+// TestUninstallPlanSeesLegacyNativeInstall 锁住"注册表里没有了、磁盘上还在"的卸载。
+//
+// 真机事故（2026-09-16，用户原话"lucky 根本没被卸载掉"）：Lucky 从原生二进制
+// 改成 Docker 版之后，注册表里不再有它，而卸载计划只按注册表判断 ——
+// 已经装在 ~/lucky 的那份既没有卸载入口也删不掉，卡片还显示"已安装"。
+//
+// 契约：卸载计划必须**以磁盘状态为准**，给出可删的残留目录。
+func TestUninstallPlanSeesLegacyNativeInstall(t *testing.T) {
+	home := t.TempDir()
+	work := t.TempDir()
+	m := &Manager{opt: Options{UserHome: home, UserName: "tester", WorkDir: work}}
+
+	// 复刻"旧版原生安装的残留"：~/<app>/<可执行文件>
+	dir := filepath.Join(home, "frps")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "frps"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// frps 已经不在注册表的前提下，计划也必须给出 installer + 可删路径
+	plan := m.PlanUninstallFor(context.Background(), App{ID: "frps", Name: "frps", Kind: KindCompose}, nil)
+	if plan.Kind != "installer" {
+		t.Fatalf("有原生残留时必须给 installer 计划，实际 %q（Blocked=%q）", plan.Kind, plan.Blocked)
+	}
+	if len(plan.DataPaths) == 0 || plan.DataPaths[0] != dir {
+		t.Errorf("计划要列出真实存在的残留目录 %s，实际 %v", dir, plan.DataPaths)
+	}
+
+	// 目录里只有数据文件、没有可执行文件时**不算**安装残留（避免误删用户数据目录）
+	plain := filepath.Join(home, "someapp")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plain, "data.db"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.legacyNativeDir(App{ID: "someapp"}); got != "" {
+		t.Errorf("只有数据文件时不该判定为安装残留，实际 %q", got)
+	}
+}
+
+// TestUninstallAppRemovesLegacyNativeAndComposeLeftovers 锁住"点一下就能清干净"。
+func TestUninstallAppRemovesLegacyNativeAndComposeLeftovers(t *testing.T) {
+	home := t.TempDir()
+	work := t.TempDir()
+	m := &Manager{opt: Options{UserHome: home, UserName: "tester", WorkDir: work}}
+
+	// 一个 compose 应用的目录 + 一份"旧版原生安装"的残留，同时存在
+	composeProj := filepath.Join(work, "compose", "lucky")
+	legacy := filepath.Join(home, "lucky")
+	for _, d := range []string{composeProj, legacy} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(composeProj, "docker-compose.yml"), []byte("services:\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "lucky"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.UninstallApp(context.Background(), "lucky", true, &InstallResult{Steps: []string{}}); err != nil {
+		t.Fatalf("清理残留失败：%v", err)
+	}
+	for _, d := range []string{composeProj, legacy} {
+		if _, err := os.Stat(d); !os.IsNotExist(err) {
+			t.Errorf("%s 应该被删掉（残留清理要真的清干净）", d)
+		}
+	}
+}

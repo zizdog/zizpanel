@@ -153,6 +153,14 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/account/sessions", s.requireAuth(s.handleListSessions))
 
 	// ---------- 站点管理 ----------
+	// ---- 反向代理（独立功能）----
+	root.HandleFunc("GET /api/v1/proxies", s.requireAuth(s.handleProxyList))
+	root.HandleFunc("POST /api/v1/proxies", s.requireAuth(s.handleProxyCreate))
+	root.HandleFunc("POST /api/v1/proxies/test", s.requireAuth(s.handleProxyTest))
+	root.HandleFunc("POST /api/v1/proxies/{id}", s.requireAuth(s.handleProxyUpdate))
+	root.HandleFunc("POST /api/v1/proxies/{id}/toggle", s.requireAuth(s.handleProxyToggle))
+	root.HandleFunc("DELETE /api/v1/proxies/{id}", s.requireAuth(s.handleProxyDelete))
+
 	root.HandleFunc("GET /api/v1/sites", s.requireAuth(s.handleSiteList))
 	root.HandleFunc("POST /api/v1/sites", s.requireAuth(s.handleSiteCreate))
 	root.HandleFunc("POST /api/v1/sites/reload", s.requireAuth(s.handleSiteReload))

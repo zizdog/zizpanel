@@ -111,7 +111,6 @@ func (a releaseBinaryApp) webPort() int {
 }
 
 const (
-	luckyLabel        = "com.zizdog.lucky"
 	orbienLabel       = "com.zizdog.orbien"
 	frpsLabel         = "com.zizdog.frps"
 	frpcLabel         = "com.zizdog.frpc"
@@ -170,34 +169,11 @@ func orderBySpeed(urls []string, speeds []int64) []string {
 // 且**没有** brew formula（或者用户明确要求不碰 brew，frps 就是这样）。
 // 这里只放"一项能力服务多个应用"的通用参数，不为单个应用发明专属流程。
 var releaseBinaryApps = map[string]releaseBinaryApp{
-	"lucky": {
-		ID: "lucky", Label: luckyLabel, Name: "Lucky（反代 / DDNS / 端口转发）", Icon: "🍀",
-		Category: "tool", RootDir: "lucky",
-		// arm64 证据：GitHub API 的 v2.27.2 资产列表里有 lucky_2.27.2_darwin_arm64.tar.gz；
-		// 面板安装时还会用 /usr/bin/file 复核（见 verifyArm64Binary）。
-		Repo: "gdy666/lucky", Tag: "v2.27.2", Asset: "lucky_2.27.2_darwin_arm64.tar.gz",
-		Binary: "lucky",
-		// -cd <root>：把配置目录固定在安装目录（默认是"可执行文件所在目录"，
-		//   在 launchd 下会落到 /opt 之类的意外位置）；
-		// -ds：关掉 lucky 自带的"服务模式"，避免它自己去注册一个服务与我们的
-		//   LaunchDaemon 抢同一个程序。
-		Args: []string{"-cd", "{root}", "-ds"},
-		// HealthPath 刻意留空：Lucky 的 Web UI 可能被用户设成「安全入口」或加 IP 白名单，
-		// 那时它对任何路径都返回 404（而服务是好的）—— 不做 HTTP 健康检查才不会误导。
-		// 详见目录条目里的同一条注释。
-		Port: 16601,
-		// Lucky 的配置由它自己的 Web UI 首次初始化时创建，名字来自上游源码
-		// （config/config.go: filePath = "lucky.conf"）。面板不生成，只声明路径，
-		// 让服务详情能直接打开它。
-		// 不设 ConfigFile：Lucky 的配置是加密的 .lkcf，没有可手改的文本配置，
-		// 可视化配置走它自己的 Web UI（16601）。
-		// 上游 release 里**没有** checksums 文件，所以无法做内容校验（如实说明），
-		// 只有 file(1) 的架构复核。
-		Notes: []string{
-			"首次登录请在浏览器里完成 Lucky 自己的初始化（设置账号与密码），面板不预置口令。",
-			"配置与数据都在安装目录里（主配置 lucky.conf），备份整个目录即可。",
-		},
-	},
+	// 注意：**lucky 已经改走 Docker**（2026-09-16 用户要求），所以它不在这里。
+	// 它的 compose 条目在 catalog.go。留在这里的后果很隐蔽：
+	// 市场的安装入口按 IsReleaseBinaryApp(id) 分流，注册表里有它就会**绕过**
+	// compose 安装器，直接去 GitHub 下 darwin 二进制（真机复现：任务日志里
+	// 出现 lucky_2.27.2_darwin_arm64.tar.gz 的镜像检查，而目录条目明明是 compose）。
 	"orbien": {
 		ID: "orbien", Label: orbienLabel, Name: "Orbien（内网穿透平台）", Icon: "🛰️",
 		Category: "tool", RootDir: "orbien",
@@ -476,9 +452,9 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	// 镜像基址配置了就**必须先通过这一步**：按需求镜像是唯一来源，
 	// 镜像上没有就明确失败并告诉他怎么补（`make sync-apps`），
 	// 而不是静默回退到 GitHub —— 回退会让"这台机器到底能不能装"变得不可预测。
-	if err := m.preflightMirrorAsset(ctx, spec, result); err != nil {
-		return err
-	}
+	// 先试镜像；不行就回落公网。返回值告诉后面"这次走的是不是镜像"
+	// （决定用哪套校验：镜像清单的 sha256，还是上游的 checksums）。
+	usedMirror := m.preflightMirrorAsset(ctx, spec, result)
 
 	// ---- 1. 下载产物 ----
 	if err := m.downloadReleaseBinary(ctx, spec, p, result); err != nil {
@@ -489,9 +465,10 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	// 放在解压之前：宁可下载完立刻失败，也不要把一个校验不通过的 tarball
 	// 解压出来、chmod、再交给 launchd 去执行。
 	//
-	// 镜像模式下用**镜像清单**里的 sha256（比原来只对 frp 校验更严：
-	// Lucky / Orbien 上游根本没有 checksums 文件，原来等于不校验）。
-	if m.MirrorEnabled() {
+	// 走镜像时用**镜像清单**里的 sha256（比只对 frp 校验更严：
+	// Lucky / Orbien 上游根本没有 checksums 文件，原来等于不校验）；
+	// 走公网时用上游自己的 checksums（有就校验）。
+	if usedMirror {
 		if err := m.verifyMirrorChecksum(ctx, spec, p, result); err != nil {
 			return err
 		}
@@ -1084,10 +1061,16 @@ func IsReleaseBinaryApp(id string) bool {
 // 探测本身失败/超时都只当"这个源不可用"（速度 0），不会让安装失败。
 func (m *Manager) orderDownloadURLs(ctx context.Context, spec releaseBinaryApp,
 	result *InstallResult) []string {
-	// 镜像模式下只有一个候选（镜像），不需要测速排序 —— 而且**不许**回退公网，
-	// 所以这里直接返回，连"官方源"都不放进候选列表。
-	urls := m.downloadURLsFor(spec)
-	if m.MirrorEnabled() {
+	// 候选列表已经"镜像优先"了（见 downloadURLsFor）：镜像上的包在第一位，
+	// 镜像不可达时回落官方的顺序由它决定。
+	urls := m.downloadURLsFor(ctx, spec)
+	if m.MirrorEnabled() && len(urls) > 0 && strings.HasPrefix(urls[0], m.mirrorBase()) {
+		// 镜像可用：**直接用它**，不做测速排序。
+		// 理由：镜像就在同城/局域网（实测 5 MB/s 级），测速反而多花几秒；
+		// 而且把公网源排在镜像前面就违背了"尽量省流量"的初衷。
+		if result != nil {
+			result.step(ctx, "下载源：镜像 "+urls[0])
+		}
 		return urls
 	}
 	if len(urls) < 2 {

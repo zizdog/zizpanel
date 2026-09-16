@@ -96,6 +96,38 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 				"要真正删除，请在终端里自行处理。",
 		}
 	}
+	// 残留的**原生 release 安装**：应用已经不在注册表里（例如 Lucky 改成 Docker 版之后
+	// 从 releaseBinaryApps 移除），但旧的原生目录/plist 还在磁盘上。
+	//
+	// 2026-09-16 用户实测到的严重问题：这种情况下 PlanUninstall 返回 "none"，
+	// 市场既卸不掉它、也不给任何入口 —— 用户原话"lucky 根本没被卸载掉"。
+	// 卸载计划必须**以磁盘状态为准**，不能只看代码注册表。
+	// 判据顺序：先把**磁盘上真实存在的东西**都收进来，再决定有没有可清理的对象。
+	// 只按其中一种形态判断会出现"卡片说未安装、但东西还在"的漏洞
+	// （Lucky 同时存在过 ~/lucky 与 compose 项目目录两种情况）。
+	paths := []string{}
+	if d := filepath.Join(m.composeDir(), app.ID); dirExists(d) {
+		paths = append(paths, d)
+	}
+	if d := m.legacyNativeDir(app); d != "" {
+		paths = append(paths, d)
+	}
+	if len(paths) > 0 {
+		steps := []string{"停止并删除这个应用残留的 launchd 服务（如果有）"}
+		for _, d := range paths {
+			steps = append(steps, "删除残留目录 "+d)
+		}
+		return UninstallPlan{
+			Kind:      "installer",
+			Steps:     steps,
+			DataPaths: paths,
+			KeepNote:  "删除的是磁盘上真实存在的残留产物；之后可以用「安装」装当前版本",
+		}
+	}
+	// 残留态（**没有服务记录**，但磁盘上还有这个应用的 compose 目录）：
+	// 卸载（保留数据）或手工删了容器之后就会落到这里。不给计划的话，
+	// 卡片会显示成"未安装"却**没有任何清理入口**，那份数据永远清不掉 ——
+	// 与 2026-09-16 用户反馈的"卸载后连安装入口都没有"是同一类问题。
 	return UninstallPlan{Kind: "none", Blocked: "没有找到可卸载的对象（可能是 brew 装的核心组件）"}
 }
 
@@ -105,6 +137,50 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 	app, ok := FindApp(appID)
 	if !ok {
 		return fmt.Errorf("目录里没有这个应用: %s", appID)
+	}
+	// 没有 PanelInstaller 的应用（compose / docker 类，或"旧版原生安装的残留"）：
+	// 清理动作就是删掉磁盘上真实存在的那些目录。
+	//
+	// 必须在这里处理，否则市场里「删除残留数据」会报"没有对应的卸载实现" ——
+	// 而 Lucky 从原生改成 Docker 版那次事故正是这样：旧的原生目录与新公式
+	// 两边都对不上，用户点哪都没有反应（2026-09-16 用户原话"lucky 根本没被卸载掉"）。
+	if app.PanelInstaller == "" {
+		targets := []string{}
+		if app.Kind == KindCompose || app.Kind == KindDocker {
+			targets = append(targets, filepath.Join(m.composeDir(), app.ID))
+		}
+		if d := m.legacyNativeDir(app); d != "" {
+			targets = append(targets, d)
+		}
+		// 残留的 launchd 服务也要停掉：只删目录不摘服务的话，
+		// launchd 会一直尝试重启一个已经不存在的二进制（KeepAlive）。
+		label := app.ServiceLabel
+		if label == "" {
+			label = "com.zizdog." + app.ID
+		}
+		if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", label+".plist")); err == nil {
+			if result != nil {
+				result.step(ctx, "停止并删除残留的 launchd 服务 "+label)
+			}
+			_ = m.removeService(ctx, label, filepath.Join("/Library/LaunchDaemons", label+".plist"))
+		}
+		removed := 0
+		for _, d := range targets {
+			if !dirExists(d) {
+				continue
+			}
+			if result != nil {
+				result.step(ctx, "删除 "+d)
+			}
+			if err := os.RemoveAll(d); err != nil {
+				return fmt.Errorf("删除 %s 失败: %w", d, err)
+			}
+			removed++
+		}
+		if removed == 0 {
+			return fmt.Errorf("「%s」没有可清理的残留（磁盘上找不到它的目录）", app.Name)
+		}
+		return nil
 	}
 	switch app.PanelInstaller {
 	case "qwen3tts":
@@ -346,4 +422,59 @@ func (m *Manager) removeTree(ctx context.Context, path string, result *InstallRe
 		return fmt.Errorf("删除 %s 失败: %w", path, err)
 	}
 	return nil
+}
+
+// ComposeArtifactExists 报告某个 compose 应用的**项目目录**是否还在。
+//
+// 为什么单独一个导出函数：市场列表（web 层）要据此把"没装但有残留"
+// 如实报出来，而它不该知道 compose 目录怎么拼（那是 services 的内部约定）。
+func ComposeArtifactExists(workDir, appID string) bool {
+	if workDir == "" || appID == "" {
+		return false
+	}
+	return dirExists(filepath.Join(workDir, "compose", appID))
+}
+
+// legacyNativeDir 返回"这个应用在用户家目录下**残留的**原生安装目录"。
+//
+// 为什么需要它（真机事故，2026-09-16）：Lucky 从"原生 release 二进制"改成
+// Docker 版之后，注册表里不再有它，而 `installerPlan` 只按注册表判断 ——
+// 于是已经装在 ~/lucky 的那份**既没有卸载入口、也删不掉**，
+// 市场卡片还显示"已安装"（launchd plist 在）。用户的原话是"lucky 根本没被卸载掉"。
+//
+// 判据刻意保守：
+//   - 只认 `~/<appID>` 这一层（与原生安装器的 RootDir 约定一致，不递归扫）；
+//   - 目录里必须有**可执行文件**才算残留（避免把同名数据目录当安装）；
+//   - compose 应用不参与（它们的产物是 WorkDir/compose/<id>）。
+func (m *Manager) legacyNativeDir(app App) string {
+	if m.opt.UserHome == "" || app.ID == "" {
+		return ""
+	}
+	dir := filepath.Join(m.opt.UserHome, app.ID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr == nil && info.Mode()&0o111 != 0 {
+			return dir
+		}
+	}
+	return ""
+}
+
+// LegacyNativeArtifactExists 报告"这个应用在用户家目录下是否还有残留的原生安装目录"。
+//
+// 导出给 web 层用（市场列表要据此把"没装但有残留"如实报出来），
+// 内部复用同一套判据，避免两处判断漂移。
+func LegacyNativeArtifactExists(userHome, appID, kind string) bool {
+	if userHome == "" || appID == "" {
+		return false
+	}
+	m := &Manager{opt: Options{UserHome: userHome}}
+	return m.legacyNativeDir(App{ID: appID}) != ""
 }

@@ -137,6 +137,14 @@ export const api = {
   totpDisable: (password) => request('POST', `${API_BASE}/account/totp/disable`, { password }),
   sessions: () => request('GET', `${API_BASE}/account/sessions`),
 
+  // ---- 反向代理（独立功能）----
+  proxies: () => request('GET', `${API_BASE}/proxies`),
+  proxyCreate: (payload) => request('POST', `${API_BASE}/proxies`, payload),
+  proxyUpdate: (id, payload) => request('POST', `${API_BASE}/proxies/${id}`, payload),
+  proxyToggle: (id) => request('POST', `${API_BASE}/proxies/${id}/toggle`, {}),
+  proxyDelete: (id) => request('DELETE', `${API_BASE}/proxies/${id}`),
+  proxyTest: (target) => request('POST', `${API_BASE}/proxies/test`, { target }),
+
   // ---- 站点管理 ----
   sites: () => request('GET', `${API_BASE}/sites`),
   siteCreate: (payload) => request('POST', `${API_BASE}/sites`, payload),

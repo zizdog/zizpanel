@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -31,6 +32,14 @@ func Root() string {
 
 // HomebrewPrefix 探测 Homebrew 安装前缀。
 func HomebrewPrefix() string {
+	// 环境变量优先：单元测试必须能把它指到临时目录。
+	//
+	// 这不是为了好测而加的钩子 —— 没有它，任何"确保某个 brew 目录存在"的测试
+	// 都会去写真实的 /opt/homebrew，而 make check 的一条铁律就是
+	// **测试不许碰用户真实环境**（历史事故：测试把真实的 LaunchAgents plist 覆盖成空）。
+	if v := strings.TrimSpace(os.Getenv("ZIZPANEL_BREW_PREFIX")); v != "" {
+		return v
+	}
 	if _, err := os.Stat("/opt/homebrew/bin/brew"); err == nil {
 		return "/opt/homebrew"
 	}
@@ -1005,15 +1014,33 @@ func EnsureNginxContexts(upgradeMapContent string) (string, error) {
 	if msg != "" {
 		parts = append(parts, msg)
 	}
+	// nginx 的工作目录必须存在，否则 **任何** 配置校验都会失败。
+	//
+	// 真机实测（2026-09-16）：全新装出来的 nginx 没有 /opt/homebrew/var/log/nginx，
+	// 于是 `nginx -t` 直接报
+	//   nginx: [alert] could not open error log file: open() "/opt/homebrew/var/log/nginx/error.log" failed
+	// 反代规则因此写不进去（面板如实回了"配置语法错误，已回滚"），
+	// 而用户看到的是"规则保存不了"，完全联想不到是缺一个日志目录。
+	// 这几个目录由面板负责补齐（nginx 以真实用户运行，所以要改归属）。
+	if logMsg, lerr := ensureNginxRuntimeDirs(); lerr != nil {
+		return "", lerr
+	} else if logMsg != "" {
+		parts = append(parts, logMsg)
+	}
 	// 记录改动前的状态，用于判断是否真的需要重载 nginx
 	before, _, _ := ConfDIncluded()
+	beforeVhost, _, _ := VhostsIncluded()
 	beforeMap, _ := os.ReadFile(filepath.Join(NginxConfD(), "upgrade-map.conf"))
 	if err := EnsureUpgradeMap(upgradeMapContent); err != nil {
 		return "", err
 	}
+	if err := EnsureVhostsInclude(); err != nil {
+		return "", err
+	}
 	after, _, _ := ConfDIncluded()
+	afterVhost, _, _ := VhostsIncluded()
 	afterMap, _ := os.ReadFile(filepath.Join(NginxConfD(), "upgrade-map.conf"))
-	changed := migrated || before != after || string(beforeMap) != string(afterMap)
+	changed := migrated || before != after || beforeVhost != afterVhost || string(beforeMap) != string(afterMap)
 
 	if !changed {
 		return "nginx 环境已就绪（无变化，未重载）", nil
@@ -1278,4 +1305,196 @@ func MkcertIssue(hosts []string, outCert, outKey string) (string, error) {
 func netIPOK(s string) bool {
 	re := regexp.MustCompile(`^[0-9a-fA-F:.]+$`)
 	return re.MatchString(s) && strings.ContainsAny(s, ":. ")
+}
+
+// ensureNginxRuntimeDirs 确保 nginx 运行所需的**所有目录**都存在。
+//
+// 为什么必须做（真机 2026-09-16 连环踩到）：
+//   - 缺 <brew>/var/log/nginx     → `nginx -t` 报 could not open error log file
+//   - 缺 <brew>/var/run           → 报 open() nginx.pid failed (13: Permission denied)
+//   - 缺 <brew>/var/run/nginx/client_body_temp 等 → 报 mkdir() ... failed
+//
+// 三者任一缺失，**任何** vhost 都写不进去；面板只会如实回一句
+// "配置语法错误，已回滚"，用户完全看不出是缺目录。
+//
+// 实现上**不写死路径**，而是从 nginx.conf 里把路径类指令（error_log /
+// access_log / pid / *_temp_path / *_temp）解析出来，逐个确保目录存在。
+// 这样用户改了 nginx.conf 或换了前缀，面板依然能自愈。
+// 返回给人看的改动说明（无改动返回空串），调用方据此决定是否 reload。
+func ensureNginxRuntimeDirs() (string, error) {
+	dirs, err := nginxRequiredDirs(NginxConf())
+	if err != nil {
+		return "", err
+	}
+	// 面板反代规则自己的日志目录（nginx.conf 里不会出现，由面板约定）
+	dirs = append(dirs, filepath.Join(HomebrewPrefix(), "var", "log", "nginx", "proxy"))
+
+	changed := []string{}
+	for _, d := range dedupeStrings(dirs) {
+		if _, serr := os.Stat(d); serr == nil {
+			continue
+		}
+		if merr := os.MkdirAll(d, 0o755); merr != nil {
+			return "", fmt.Errorf("创建 nginx 运行时目录 %s 失败: %w", d, merr)
+		}
+		changed = append(changed, d)
+	}
+	if len(changed) == 0 {
+		return "", nil
+	}
+	// 归属真实用户：nginx 以该用户身份跑，目录属主不对写不进日志/pid。
+	// 只 chown 我们自己新建的那些目录，不做递归 —— 递归 chown 会误伤
+	// （真实事故：一条 `chown -R` 把 brew 的 etc 目录也改成了 root，配置全废）。
+	if u := strings.TrimSpace(os.Getenv("ZIZPANEL_USER")); u != "" && u != "root" {
+		if uid, gid, uerr := lookupIDs(u); uerr == nil {
+			for _, d := range changed {
+				_ = os.Chown(d, uid, gid)
+			}
+		}
+	}
+	return fmt.Sprintf("已补齐 nginx 运行时目录 %d 个（%s）", len(changed), strings.Join(changed, "、")), nil
+}
+
+// nginxRequiredDirs 从 nginx.conf 里解析出所有需要的目录。
+//
+// 覆盖 brew 默认配置里出现过的全部路径类指令：
+//
+//	error_log /var/log/nginx/error.log;      → 目录
+//	access_log ...;                          → 目录
+//	pid /var/run/nginx.pid;                  → 目录
+//	client_body_temp_path /var/run/nginx/client_body_temp;  → 该目录本身
+//	proxy_temp_path /var/run/nginx/proxy_temp;              → 该目录本身
+//
+// 解析失败（读不到文件）时返回错误；读到但没有任何路径指令时返回空列表
+// —— 那说明用户用了完全自定义的布局，面板不该瞎猜。
+func nginxRequiredDirs(confPath string) ([]string, error) {
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s 失败: %w", confPath, err)
+	}
+	// "path" / "log" 类指令：最后一个参数是文件，取它的目录
+	fileDirective := regexp.MustCompile(`(?m)^\s*(?:error_log|access_log|pid)\s+([^;\s]+)`)
+	// "*_temp_path" 类：参数本身就是目录
+	dirDirective := regexp.MustCompile(`(?m)^\s*\w*_temp_path\s+([^;\s]+)`)
+	// "*_temp" 类（新式写法）：参数是目录
+	plainTempDirective := regexp.MustCompile(`(?m)^\s*(?:client_body_temp|proxy_temp|fastcgi_temp|uwsgi_temp|scgi_temp)\s+([^;\s]+)`)
+
+	var out []string
+	push := func(p string) {
+		p = strings.Trim(p, `"'`)
+		if p == "" || !filepath.IsAbs(p) {
+			return // 相对路径由 nginx 的 prefix 决定，面板不猜
+		}
+		if p == "off" || p == "/dev/stderr" || p == "/dev/stdout" || p == "stderr" {
+			return
+		}
+		out = append(out, p)
+	}
+	for _, m := range fileDirective.FindAllStringSubmatch(string(b), -1) {
+		push(filepath.Dir(m[1]))
+	}
+	for _, re := range []*regexp.Regexp{dirDirective, plainTempDirective} {
+		for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+			push(m[1])
+		}
+	}
+	return out, nil
+}
+
+// dedupeStrings 去重并保持顺序。
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// lookupIDs 把用户名解析成 (uid, gid)。
+func lookupIDs(name string) (int, int, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return 0, 0, err
+	}
+	uid, uerr := strconv.Atoi(u.Uid)
+	if uerr != nil {
+		return 0, 0, uerr
+	}
+	gid, gerr := strconv.Atoi(u.Gid)
+	if gerr != nil {
+		return 0, 0, gerr
+	}
+	return uid, gid, nil
+}
+
+// VhostsIncluded 检查 nginx.conf 是否 include 了 vhosts/*.conf。
+func VhostsIncluded() (bool, string, error) {
+	return includePresent(VhostDir())
+}
+
+// EnsureVhostsInclude 确保 nginx.conf 加载了 vhosts 目录。
+//
+// 为什么必须由面板保证（真机 2026-09-16 事故）：
+// 站点与反向代理的配置都写在 `<brew>/etc/nginx/vhosts/` 下，而
+// **`brew reinstall nginx` 会把 nginx.conf 还原成 brew 默认版** ——
+// 那时 include 就没了，用户看到的是"配置明明写进去了，访问却 404/连不上"
+// （运维上最难查的一类：文件在、服务在、就是不生效）。
+// 之前只有 LNMP 安装流程会补这条 include，修复/重装 nginx 之后就丢了。
+func EnsureVhostsInclude() error {
+	vhostDir := VhostDir()
+	if err := os.MkdirAll(vhostDir, 0o755); err != nil {
+		return fmt.Errorf("创建 vhosts 目录失败: %w", err)
+	}
+	ok, _, err := VhostsIncluded()
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	// 插到 http 块末尾（最后一个 } 之前）
+	b, rerr := os.ReadFile(NginxConf())
+	if rerr != nil {
+		return fmt.Errorf("读取 nginx.conf 失败: %w", rerr)
+	}
+	text := string(b)
+	i := strings.LastIndex(strings.TrimRight(text, "\n"), "}")
+	if i < 0 {
+		return fmt.Errorf("nginx.conf 结构异常（找不到 http 块结束符），拒绝修改")
+	}
+	insert := "\n    # 由 ZizPanel 添加：加载站点与反向代理配置\n" +
+		"    include " + vhostDir + "/*.conf;\n"
+	text = text[:i] + insert + text[i:]
+	if _, err := os.Stat(NginxConfBackupPath()); err != nil {
+		_ = os.WriteFile(NginxConfBackupPath(), b, 0o644)
+	}
+	tmp := NginxConf() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil {
+		return fmt.Errorf("写入 nginx.conf 失败: %w", err)
+	}
+	if err := os.Rename(tmp, NginxConf()); err != nil {
+		return fmt.Errorf("替换 nginx.conf 失败: %w", err)
+	}
+	return nil
+}
+
+// includePresent 检查 nginx.conf 里是否 include 了某个目录下的 *.conf。
+func includePresent(dir string) (bool, string, error) {
+	b, err := os.ReadFile(NginxConf())
+	if err != nil {
+		return false, "", err
+	}
+	pattern := dir + "/*.conf"
+	for _, ln := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(ln)
+		if !strings.HasPrefix(t, "#") && strings.Contains(t, pattern) {
+			return true, "已包含 " + pattern, nil
+		}
+	}
+	return false, "nginx.conf 未 include " + pattern, nil
 }

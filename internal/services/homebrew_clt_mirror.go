@@ -122,12 +122,36 @@ func (it cltIndexItem) filesBase(mirror string) string {
 	return strings.TrimSuffix(mirror, "/") + "/clt/" + strings.Trim(it.Dir, "/")
 }
 
-// cltMirrorBase 返回镜像基址（环境变量优先，方便沙箱测试）。
+// cltMirrorBase 返回 CLT 镜像基址（环境变量优先，方便沙箱测试）。
+//
+// 注意：这是**静态兜底**基址；真正"先探通不通"的优先级由
+// cltMirrorBaseFor(ctx) 决定 —— 面板里配的镜像站能用就优先用它。
 func cltMirrorBase() string {
 	if v := strings.TrimSpace(os.Getenv("ZIZPANEL_CLT_MIRROR")); v != "" {
 		return strings.TrimSuffix(v, "/")
 	}
 	return cltMirrorBaseDefault
+}
+
+// cltMirrorBaseFor 按"优先级 + 可用性"挑 CLT 镜像基址。
+//
+// 顺序（2026-09-16 用户要求："能用这个地址的尽量用"）：
+//  1. 面板设置里的镜像基址（自建 NAS，省流量、同城速度）—— 但**必须探通**
+//     （HEAD 它的 clt/index.json），不通就跳过；
+//  2. 环境变量 ZIZPANEL_CLT_MIRROR（测试/临时覆盖）；
+//  3. 内置的静态镜像常量。
+//
+// 探测失败不报错：CLT 安装有三条路（镜像 → softwareupdate → 弹窗），
+// 这里只是挑"镜像那条路走哪个基址"，挑不出来就交给后面的路。
+func (m *Manager) cltMirrorBaseFor(ctx context.Context) string {
+	if m.MirrorEnabled() {
+		base := m.mirrorBase()
+		probe := base + "/clt/index.json"
+		if err := m.checkMirrorURL(ctx, probe); err == nil {
+			return base
+		}
+	}
+	return cltMirrorBase()
 }
 
 // macMajorVersion 解析 Darwin 主版本（23 → 14、24 → 15、25 → 26）。
@@ -182,7 +206,7 @@ func cltNeededPkgs(item cltIndexItem) []string {
 // installCLTFromMirror 走镜像路径装 CLT。返回 error 表示"这条路也不行"，
 // 调用方会回退到苹果自己的两条路。
 func (m *Manager) installCLTFromMirror(ctx context.Context, result *InstallResult) error {
-	base := cltMirrorBase()
+	base := m.cltMirrorBaseFor(ctx)
 	indexURL := base + "/clt/index.json"
 	result.step(ctx, "从镜像获取命令行开发者工具清单："+indexURL)
 
@@ -396,7 +420,7 @@ func (m *Manager) fetchCLTPkg(ctx context.Context, result *InstallResult, item c
 	parts := item.partsFor(name)
 	if len(parts) == 0 {
 		// 单文件路径：curl 自己带 --retry，失败删半成品
-		n, err := m.downloadToFile(ctx, item.filesBase(cltMirrorBase())+"/"+name, dst,
+		n, err := m.downloadToFile(ctx, item.filesBase(m.cltMirrorBaseFor(ctx))+"/"+name, dst,
 			45*time.Minute, result, "下载 "+name)
 		if err != nil {
 			return 0, err
@@ -414,7 +438,7 @@ func (m *Manager) fetchCLTPkg(ctx context.Context, result *InstallResult, item c
 	if err := os.MkdirAll(partDir, 0o755); err != nil {
 		return 0, err
 	}
-	base := item.filesBase(cltMirrorBase())
+	base := item.filesBase(m.cltMirrorBaseFor(ctx))
 	if err := m.fetchParts(ctx, result, base, name, partDir, parts); err != nil {
 		return 0, err
 	}

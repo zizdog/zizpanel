@@ -47,39 +47,62 @@ func TestMirrorAssetURLs(t *testing.T) {
 	}
 }
 
-// TestReleaseBinaryDownloadURLsAreMirrorOnly 是用户需求的核心断言：
-// 镜像生效时**只有一个**下载候选，且不能是任何第三方地址。
-func TestReleaseBinaryDownloadURLsAreMirrorOnly(t *testing.T) {
-	spec, ok := releaseBinaryApps["lucky"]
+// TestReleaseBinaryDownloadURLsPreferMirror 是用户需求的核心断言：
+// **镜像优先**，且镜像不可达时要能回落到原来的公网候选（不能因为镜像挂了就装不上）。
+func TestReleaseBinaryDownloadURLsPreferMirror(t *testing.T) {
+	// 用 frps 当样例：lucky 已改走 Docker（compose），不在这个注册表里。
+	spec, ok := releaseBinaryApps["frps"]
 	if !ok {
-		t.Fatal("注册表里应有 lucky")
-	}
-	m := &Manager{opt: Options{MirrorBase: "https://mirror.example.com:8888"}}
-	urls := m.downloadURLsFor(spec)
-	if len(urls) != 1 {
-		t.Fatalf("镜像生效时只允许一个下载地址，实际 %d 个：%v", len(urls), urls)
-	}
-	if want := m.appAssetURL(spec.ID, spec.Tag, spec.Asset); urls[0] != want {
-		t.Errorf("下载地址应是镜像地址：\n got %s\nwant %s", urls[0], want)
-	}
-	for _, bad := range []string{"github.com", "ghfast.top", "gh-proxy.com"} {
-		if strings.Contains(urls[0], bad) {
-			t.Errorf("镜像模式下不能出现第三方地址 %q：%s", bad, urls[0])
-		}
-	}
-	if !strings.Contains(urls[0], "/apps/lucky/"+spec.Tag+"/") {
-		t.Errorf("地址要走 apps/<app>/<版本>/ 布局：%s", urls[0])
+		t.Fatal("注册表里应有 frps")
 	}
 
-	// 关掉镜像时保持原行为（应急路径：官方 + 第三方加速）
-	off := (&Manager{}).downloadURLsFor(spec)
+	// 1) 镜像上有这个包 → 镜像排在第一位
+	mux := http.NewServeMux()
+	okPath := "/apps/" + spec.ID + "/" + spec.Tag + "/" + spec.Asset
+	mux.HandleFunc(okPath, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	m := &Manager{opt: Options{MirrorBase: ts.URL}}
+	urls := m.downloadURLsFor(context.Background(), spec)
+	if len(urls) < 2 {
+		t.Fatalf("镜像可用时也应保留公网回落候选，实际 %v", urls)
+	}
+	if want := m.appAssetURL(spec.ID, spec.Tag, spec.Asset); urls[0] != want {
+		t.Errorf("镜像可用时第一位应是镜像：\n got %s\nwant %s", urls[0], want)
+	}
+	if !strings.Contains(urls[0], "/apps/"+spec.ID+"/"+spec.Tag+"/") {
+		t.Errorf("地址要走 apps/<app>/<版本>/ 布局：%s", urls[0])
+	}
+	if !strings.HasPrefix(urls[1], "https://github.com/") {
+		t.Errorf("第二位应是官方源（回落顺序不变），实际 %s", urls[1])
+	}
+
+	// 2) 镜像上没有这个包（404）→ 直接回落公网，第一位不是镜像
+	mux2 := http.NewServeMux()
+	mux2.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	ts2 := httptest.NewServer(mux2)
+	defer ts2.Close()
+	m2 := &Manager{opt: Options{MirrorBase: ts2.URL}}
+	fallback := m2.downloadURLsFor(context.Background(), spec)
+	if strings.HasPrefix(fallback[0], ts2.URL) {
+		t.Errorf("镜像上缺包时不该把镜像排在第一位：%v", fallback)
+	}
+	if !strings.HasPrefix(fallback[0], "https://github.com/") {
+		t.Errorf("回落时应从官方源开始，实际 %s", fallback[0])
+	}
+
+	// 3) 关掉镜像 → 原行为（官方 + 第三方加速）
+	off := (&Manager{}).downloadURLsFor(context.Background(), spec)
 	if len(off) < 2 || !strings.HasPrefix(off[0], "https://github.com/") {
 		t.Errorf("关闭镜像时应回到原有候选列表（官方优先），实际 %v", off)
 	}
 }
 
-// TestCheckMirrorURLTellsHowToFix 镜像上没有资源时必须明确失败**并说清怎么补**，
-// 因为按需求不回退公网 —— 用户得知道该去 NAS 上做什么。
+// TestCheckMirrorURLTellsHowToFix 镜像上没有资源时，报错必须**说清怎么补**。
+//
+// （这个函数本身只负责"如实报告"，是否回退由调用方决定：安装流程会回落到公网，
+// 但错误信息仍要告诉用户"镜像上缺这个包、可以怎么补"，否则他永远不知道镜像漏了。）
 func TestCheckMirrorURLTellsHowToFix(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/apps/lucky/v2.27.2/ok.tar.gz", func(w http.ResponseWriter, r *http.Request) {
@@ -104,31 +127,53 @@ func TestCheckMirrorURLTellsHowToFix(t *testing.T) {
 	}
 }
 
-// TestPreflightMirrorAssetRequiresPackageAndManifest：
-// 包在、清单不在也要拦下（清单是校验 sha256 的唯一来源，缺了就没法校验）。
-func TestPreflightMirrorAssetRequiresPackageAndManifest(t *testing.T) {
-	spec := releaseBinaryApps["lucky"]
+// TestPreflightMirrorAssetFallsBackWithoutManifest：
+// 包在、清单不在时 **不阻塞安装**，而是回落公网（清单是镜像校验 sha256 的来源，
+// 缺了它只是没法用镜像校验，不该让用户装不上）。
+func TestPreflightMirrorAssetFallsBackWithoutManifest(t *testing.T) {
+	spec := releaseBinaryApps["frps"]
 	mux := http.NewServeMux()
-	mux.HandleFunc("/apps/lucky/"+spec.Tag+"/"+spec.Asset, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/apps/frps/"+spec.Tag+"/"+spec.Asset, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 	m := &Manager{opt: Options{MirrorBase: ts.URL}}
+	res := &InstallResult{Steps: []string{}}
 
-	err := m.preflightMirrorAsset(context.Background(), spec, &InstallResult{Steps: []string{}})
-	if err == nil {
-		t.Fatal("有包但没清单时必须拦下（否则安装无法校验）")
+	if used := m.preflightMirrorAsset(context.Background(), spec, res); used {
+		t.Error("包在但清单不在时不该判定为走镜像（拿不到期望 sha256）")
 	}
-	if !strings.Contains(err.Error(), "make sync-apps") {
-		t.Errorf("错误要给出补救办法，实际：%v", err)
+	joined := strings.Join(res.Steps, "\n")
+	if !strings.Contains(joined, "改用公网源") {
+		t.Errorf("要如实告诉用户这次改走了公网源、为什么，实际步骤：%q", joined)
+	}
+}
+
+// TestPreflightMirrorAssetUsesMirrorWhenBothPresent：包与清单都在 → 走镜像。
+func TestPreflightMirrorAssetUsesMirrorWhenBothPresent(t *testing.T) {
+	spec := releaseBinaryApps["frps"]
+	mux := http.NewServeMux()
+	for _, p := range []string{
+		"/apps/frps/" + spec.Tag + "/" + spec.Asset,
+		"/apps/frps/" + spec.Tag + "/manifest.json",
+	} {
+		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	}
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	m := &Manager{opt: Options{MirrorBase: ts.URL}}
+	res := &InstallResult{Steps: []string{}}
+	if used := m.preflightMirrorAsset(context.Background(), spec, res); !used {
+		t.Errorf("包与清单都在时应走镜像，步骤：%q", strings.Join(res.Steps, "\n"))
 	}
 }
 
 // TestVerifyMirrorChecksum 用镜像清单核对产物：对得上就过，清单里没有这个包就中止。
 func TestVerifyMirrorChecksum(t *testing.T) {
 	dir := t.TempDir()
-	asset := "lucky_2.27.2_darwin_arm64.tar.gz"
+	// 用 frps 当样例：lucky 已改走 Docker（compose），不在 release 注册表里。
+	asset := "frp_0.71.0_darwin_arm64.tar.gz"
 	path := filepath.Join(dir, asset)
 	payload := []byte("fake tarball for test\n")
 	if err := os.WriteFile(path, payload, 0o644); err != nil {
@@ -137,19 +182,19 @@ func TestVerifyMirrorChecksum(t *testing.T) {
 	sum := sha256.Sum256(payload)
 
 	body, _ := json.Marshal(mirrorManifest{
-		App: "lucky", Version: "v2.27.2",
+		App: "frps", Version: "v0.71.0",
 		Assets: []mirrorAsset{{Name: asset, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(payload))}},
 	})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/apps/lucky/v2.27.2/manifest.json", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/apps/frps/v0.71.0/manifest.json", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(body)
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	spec := releaseBinaryApps["lucky"]
+	spec := releaseBinaryApps["frps"]
 	m := &Manager{opt: Options{MirrorBase: ts.URL}}
-	res := &InstallResult{App: "lucky", Steps: []string{}}
+	res := &InstallResult{App: "frps", Steps: []string{}}
 	if err := m.verifyMirrorChecksum(context.Background(), spec, binaryReleasePaths{Asset: path}, res); err != nil {
 		t.Fatalf("清单里的 sha256 与实际文件一致时应通过，实际：%v", err)
 	}
@@ -178,13 +223,14 @@ func TestVerifyMirrorChecksum(t *testing.T) {
 // TestMirrorChecksumRejectsMismatch 坏文件必须被拦住（镜像清单模式下同样如此）。
 func TestMirrorChecksumRejectsMismatch(t *testing.T) {
 	dir := t.TempDir()
-	asset := "lucky_2.27.2_darwin_arm64.tar.gz"
+	// 用 frps 当样例：lucky 已改走 Docker（compose），不在 release 注册表里。
+	asset := "frp_0.71.0_darwin_arm64.tar.gz"
 	path := filepath.Join(dir, asset)
 	if err := os.WriteFile(path, []byte("tampered\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := json.Marshal(mirrorManifest{
-		App: "lucky", Version: "v2.27.2",
+		App: "frps", Version: "v0.71.0",
 		Assets: []mirrorAsset{{Name: asset, SHA256: strings.Repeat("ab", 32)}},
 	})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,7 +239,7 @@ func TestMirrorChecksumRejectsMismatch(t *testing.T) {
 	defer ts.Close()
 
 	m := &Manager{opt: Options{MirrorBase: ts.URL}}
-	err := m.verifyMirrorChecksum(context.Background(), releaseBinaryApps["lucky"],
+	err := m.verifyMirrorChecksum(context.Background(), releaseBinaryApps["frps"],
 		binaryReleasePaths{Asset: path}, &InstallResult{Steps: []string{}})
 	if err == nil {
 		t.Fatal("sha256 不一致必须中止安装")

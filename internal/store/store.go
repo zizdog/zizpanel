@@ -121,6 +121,26 @@ CREATE TABLE IF NOT EXISTS sites (
 );
 
 -- 服务注册表：裸装与 Docker 统一抽象
+-- 反向代理规则（独立的「反向代理」功能）
+--
+-- 为什么要单独一张表：站点表（sites）的模型是"域名 + 根目录 + PHP"，
+-- 而反代规则里很多根本没有站点目录（只是把端口/域名转到别的机器）。
+-- 硬塞进站点表会出现"必须填一个并不存在的根目录"这种别扭。
+CREATE TABLE IF NOT EXISTS proxies (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL,
+    listen        INTEGER NOT NULL,
+    domains       TEXT    NOT NULL DEFAULT '',
+    path          TEXT    NOT NULL DEFAULT '',
+    target        TEXT    NOT NULL,
+    preserve_host INTEGER NOT NULL DEFAULT 0,
+    websocket     INTEGER NOT NULL DEFAULT 1,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    remark        TEXT    NOT NULL DEFAULT '',
+    created_at    TEXT    NOT NULL DEFAULT '',
+    updated_at    TEXT    NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS services (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT    NOT NULL UNIQUE,   -- 英文标识，如 stt

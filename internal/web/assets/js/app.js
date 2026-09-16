@@ -8,6 +8,7 @@ import { h, clear, toast, $, modal, bytes, duration, esc } from './ui.js';
 import { DashboardView, SettingsView } from './views.js';
 import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
+import { ReverseProxyView } from './reverseproxy.js';
 import { ServicesView } from './services.js';
 import { AppsView } from './apps.js';
 import { FilesView } from './files.js';
@@ -37,6 +38,7 @@ export const NAV = [
   { id: 'system', title: '系统设置', icon: '🛠️', view: SystemSettingsView },
   { group: '网站' },
   { id: 'sites', title: '网站管理', icon: '🌐', view: SitesView },
+  { id: 'proxy', title: '反向代理', icon: '🔀', view: ReverseProxyView },
   { id: 'database', title: '数据库', icon: '🗄️', view: DatabaseView },
   { group: '服务器' },
   { id: 'services', title: '服务管理', icon: '⚙️', view: ServicesView },
