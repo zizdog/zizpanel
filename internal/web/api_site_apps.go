@@ -59,6 +59,9 @@ type siteInstallResult struct {
 	DBUser    string   `json:"db_user"`
 	DBPass    string   `json:"db_pass"`
 	Steps     []string `json:"steps"`
+	// Message 是收尾说明（一句话告诉用户"还差哪一步"）。前端优先展示它，
+	// 因为 Steps 里那句警告很容易被淹没（真机 2026-09-17：用户反代成功后看到 500 就懵了）。
+	Message string `json:"message,omitempty"`
 }
 
 // sitePackageFetchFn 下载并校验固定版本源码包。
@@ -323,6 +326,14 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	default:
 		step("首页探测：HTTP %d（%.0f 字节）", code, float64(len(body)))
 	}
+	// ⚠️ 必须把"这一步还没做完"说清楚（真机 2026-09-17 用户报障：te.zizdog.com 反代成功、
+	// 站点却 500「Database Query Error」）。根因是**面板预置了 config.inc.php**（省掉手填数据库），
+	// 而 Typecho/WordPress 看到该文件就认为"已经装好了" —— 于是首页直接去查还不存在的表，
+	// 表现成 500，而不是自动跳到安装向导。用户不知道要去 /install.php，就会以为站点坏了。
+	step("⚠️ 还差最后一步：打开 %s 走完安装向导（数据库信息已预填）。"+
+		"**在向导完成之前，访问站点首页会显示 500/数据库错误**，这是应用以为已安装导致的，不是配置坏了。",
+		res.FinishURL)
+	res.Message = fmt.Sprintf("「%s」文件与数据库已就绪 —— 请打开 %s 完成安装向导", app.Name, res.FinishURL)
 	return res, nil
 }
 
