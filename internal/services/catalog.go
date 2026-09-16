@@ -288,6 +288,11 @@ func Catalog() []App {
 				"共享密钥可指定或自动生成。",
 			Category: "ai", Kind: KindNative, PanelInstaller: "voicereceiver", ServiceLabel: "com.zizdog.voicereceiver",
 			Port: 8899,
+			// 接收端有免鉴权的 GET /health（实测 200；/jobs 等才要密钥）。
+			// 这里原先**没配** HealthPath —— 后果是面板"纳管了却不监测"：
+			// 服务列表里它的 health 永远是 checked=false/ok=false，
+			// 用户看到的就是"TTS 没在管理/不知道死活"（2026-09-16 用户反馈）。
+			HealthPath: "/health",
 			// 契约来源是网站侧插件目录里的 HANDOFF-TO-MINI.md。
 			// 这里原先错填成 phpmyadmin.net（复制粘贴残留），会把人引到无关文档。
 			DocsURL: "https://github.com/Blaizzy/mlx-audio",

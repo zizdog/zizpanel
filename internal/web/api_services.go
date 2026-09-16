@@ -73,6 +73,10 @@ func (s *Server) svcManager() *services.Manager {
 
 func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 	mgr := s.svcManager()
+	// 先把**已存在**的服务记录的健康地址与目录对齐（幂等、只在不一致时写库）。
+	// 不这么做的话，目录里后补的 HealthPath 永远传不到已装的记录上 ——
+	// 表现是"面板纳管了却不监测"（2026-09-16 用户反馈 TTS 像是没被管理）。
+	_, _ = mgr.ReconcileHealthURLs(r.Context())
 	withHealth := r.URL.Query().Get("health") != "0"
 	list, err := mgr.List(r.Context(), withHealth)
 	if err != nil {

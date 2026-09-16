@@ -846,3 +846,44 @@ func firstFormulaOf(args []string) string {
 	}
 	return ""
 }
+
+// ReconcileHealthURLs 让**已存在**的服务记录的健康检查地址与目录条目对齐。
+//
+// 为什么需要：HealthURL 原先只在安装/登记时写一次。目录里后来补了 HealthPath
+// （例如 voicereceiver 的 /health）也不会传到老记录上 —— 界面表现就是
+// "面板纳管了却不监测"：服务列表里它永远 checked=false / ok=false，
+// 用户看到的就是"TTS 没在管理、不知道死活"（2026-09-16 用户反馈）。
+//
+// 两个方向都要对齐：该补的补上，**目录里已清掉的也要清掉** ——
+// 只补不清会让界面永远显示"健康检查失败"，而服务其实是好的（见
+// TestHealthURLReconcilesBothWays 记录的那次真机问题）。
+//
+// 幂等且廉价：只在不一致时写库，返回改动条数。
+func (m *Manager) ReconcileHealthURLs(ctx context.Context) (int, error) {
+	list, err := m.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	changed := 0
+	for _, s := range list {
+		if s.LaunchLabel == "" {
+			continue
+		}
+		app, ok := catalogEntryForLabel(s.LaunchLabel)
+		if !ok {
+			continue
+		}
+		want := healthURLFor(app)
+		if s.HealthURL == want {
+			continue
+		}
+		before := s.HealthURL
+		s.HealthURL = want
+		if err := m.repo.Update(ctx, s); err != nil {
+			s.HealthURL = before
+			continue
+		}
+		changed++
+	}
+	return changed, nil
+}

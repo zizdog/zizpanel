@@ -332,3 +332,71 @@ func TestUninstallAppRemovesLegacyNativeAndComposeLeftovers(t *testing.T) {
 		}
 	}
 }
+
+// TestReconcileHealthURLsFixesOldRecords 锁住"老服务记录也能被修好"。
+//
+// 真机反馈（2026-09-16）：TtsVoice 音色接收端被面板纳管着，但服务列表里
+// 它的 health 永远是 checked=false/ok=false —— 因为 HealthURL 只在
+// **安装时**写一次，目录里后来补的 HealthPath 传不到老记录上。
+// 用户看到的就成了"面板不管理 TTS 了"。这个和解必须能把老记录补上，
+// 也必须能把目录里已清掉的地址清掉（只补不清会让界面永远红）。
+func TestReconcileHealthURLsFixesOldRecords(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{repo: NewRepository(st)}
+	ctx := context.Background()
+
+	find := func() *Service {
+		list, lerr := m.repo.List(ctx)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		for _, s := range list {
+			if s.LaunchLabel == "com.zizdog.voicereceiver" {
+				return s
+			}
+		}
+		return nil
+	}
+
+	// 复刻一条"装得早、没有健康地址"的接收端记录
+	app, ok := FindApp("voicereceiver")
+	if !ok {
+		t.Fatal("目录里没有 voicereceiver")
+	}
+	want := healthURLFor(app)
+	if want == "" {
+		t.Fatal("voicereceiver 应当声明了 HealthPath（否则这个测试没意义）")
+	}
+	rec := &Service{
+		Name: "com-zizdog-voicereceiver", DisplayName: app.Name,
+		Kind: KindNative, LaunchLabel: "com.zizdog.voicereceiver",
+		Port: app.Port, HealthURL: "", // ← 老记录就是这样
+	}
+	if err := m.repo.Create(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := m.ReconcileHealthURLs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("老记录该被补上健康地址，实际没有改动")
+	}
+	got := find()
+	if got == nil {
+		t.Fatal("记录不见了")
+	}
+	if got.HealthURL != want {
+		t.Errorf("健康地址应补成 %q，实际 %q", want, got.HealthURL)
+	}
+
+	// 幂等：再跑一次不该有改动
+	if n2, err := m.ReconcileHealthURLs(ctx); err != nil || n2 != 0 {
+		t.Errorf("第二次和解应无改动，实际 changed=%d err=%v", n2, err)
+	}
+}
