@@ -309,29 +309,27 @@ func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryAp
 // 为什么不是上游的 checksum 文件：一是镜像模式下不再访问任何其它来源，
 // 二是 Lucky / Orbien 上游根本没有 checksums 文件 —— 镜像清单覆盖全部条目，
 // 比原来（只对 frp 校验）更严。
+//
+// 期望值的取法走 mirrorChecksumFor（steps.go 里描述符执行器的钩子用的是同一个）——
+// "清单在哪、怎么取、取不到怎么报错"只有一份实现，避免两处漂移。
 func (m *Manager) verifyMirrorChecksum(ctx context.Context, spec releaseBinaryApp,
 	p binaryReleasePaths, result *InstallResult) error {
 
-	url := m.appManifestURL(spec.ID, spec.Tag)
-	mm, err := m.fetchMirrorManifest(ctx, spec.ID, spec.Tag)
+	want, err := m.mirrorChecksumFor(ctx, spec)
 	if err != nil {
-		return fmt.Errorf("校验失败，已中止安装：%w"+
-			"（清单由同步工具生成：在能访问上游的机器上执行 `make sync-apps`）", err)
-	}
-	want := mm.sha256For(spec.Asset)
-	if want == "" {
-		return fmt.Errorf("镜像清单里没有 %s 的 sha256（%s）。已中止安装；"+
-			"请重新执行 `make sync-apps` 让清单与包一致", spec.Asset, url)
+		return err
 	}
 	got, err := fileSHA256(p.Asset)
 	if err != nil {
 		return fmt.Errorf("计算 %s 的 sha256 失败: %w", p.Asset, err)
 	}
-	if err := matchChecksum(spec.Asset, want, got, "镜像清单 "+url, p.Root); err != nil {
+	source := "镜像清单 " + m.appManifestURL(spec.ID, spec.Tag)
+	if err := matchChecksum(spec.Asset, want, got, source, p.Root); err != nil {
 		return err
 	}
 	if result != nil {
-		result.step(ctx, fmt.Sprintf("SHA-256 校验通过：%s 与镜像清单一致（来源：%s）", spec.Asset, url))
+		result.step(ctx, fmt.Sprintf("SHA-256 校验通过：%s 与镜像清单一致（来源：%s）",
+			spec.Asset, source))
 	}
 	return nil
 }

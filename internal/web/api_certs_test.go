@@ -179,10 +179,16 @@ func (f *fakeACME) snapshot() (issued []acme.IssueRequest, renewed, deleted []st
 // stubSiteApply 把 applySite 的"写 vhost / reload / 复核探针"三步换成假实现。
 //
 // probeCode 是探针模拟返回的状态码；返回的 *int 记录写 vhost 的次数。
+//
+// 同时把复核窗口压到毫秒级：生产窗口是 6 秒，单测**不许真睡**那么久
+// （探针恒为 404 的用例会一直轮询到窗口耗尽）。
 func stubSiteApply(t *testing.T, probeCode string) (*int, *probeCall) {
 	t.Helper()
 	prevWrite, prevReload, prevProbe := siteWriteVhostFn, siteReloadFn, siteProbeFn
+	prevRead, prevDelete := siteReadVhostFn, siteDeleteVhostFn
+	prevWait, prevEvery := siteVerifyWait, siteVerifyEvery
 	writes := 0
+	deletes := 0
 	call := &probeCall{}
 	siteWriteVhostFn = func(_ *Server, _ context.Context, _, _ string) error {
 		writes++
@@ -193,8 +199,19 @@ func stubSiteApply(t *testing.T, probeCode string) (*int, *probeCall) {
 		call.scheme, call.domain, call.port, call.path = scheme, domain, port, path
 		return probeCode, "", nil
 	}
+	// 回滚要读旧内容/删新建文件：默认让"旧文件不存在"，测试需要时再自行覆盖。
+	siteReadVhostFn = func(_ *Server, _ string) ([]byte, error) { return nil, os.ErrNotExist }
+	siteDeleteVhostFn = func(_ *Server, _ context.Context, _ string) error {
+		deletes++
+		return nil
+	}
+	call.deletes = &deletes
+	siteVerifyWait = 120 * time.Millisecond
+	siteVerifyEvery = time.Millisecond
 	t.Cleanup(func() {
 		siteWriteVhostFn, siteReloadFn, siteProbeFn = prevWrite, prevReload, prevProbe
+		siteReadVhostFn, siteDeleteVhostFn = prevRead, prevDelete
+		siteVerifyWait, siteVerifyEvery = prevWait, prevEvery
 	})
 	return &writes, call
 }
@@ -202,6 +219,8 @@ func stubSiteApply(t *testing.T, probeCode string) (*int, *probeCall) {
 type probeCall struct {
 	scheme, domain, path string
 	port                 int
+	// deletes 记录回滚时删除 vhost 的次数（本次新建的文件才会走删除）。
+	deletes *int
 }
 
 // seedSite 在沙箱数据库里建一个站点（只落库，不碰 nginx）。

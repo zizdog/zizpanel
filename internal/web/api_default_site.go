@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,13 +66,29 @@ func (s *Server) handleDefaultSiteApply(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// defaultProbeFn / defaultVerifyWait / defaultVerifyEvery 是默认站点复核的
+// 可注入步骤与轮询窗口（与 applySite 的 siteVerifyWait 同一套思路）。
+//
+// 为什么默认站点也要轮询：它和站点 vhost 一样是"写盘 → reload → 请求级复核"，
+// `nginx -s reload` 同样是异步的 —— 写完立刻取首页，很可能还是旧的占位页/旧配置，
+// 一次性判定会把一次正常重载误报成失败。
+var (
+	defaultProbeFn     = fetchLocal
+	defaultVerifyWait  = 6 * time.Second
+	defaultVerifyEvery = 200 * time.Millisecond
+)
+
 // applyDefaultVhost 生成并应用一份**完整的**默认站点配置。
 //
 // 复用同一套写盘通道（helper 写 + nginx -t + 失败回滚 + reload + 真实复核），
 // 不新造第二套"写 nginx 配置"的实现。
+//
+// 失败时撤销本次写入（还原旧的 000-default.conf，或删掉本次新建的），
+// 避免"接口报错、磁盘上却留着一份没生效的新默认站点"。
 func (s *Server) applyDefaultVhost(ctx context.Context) error {
 	content := s.buildDefaultVhost()
-	if err := s.writeVhost(ctx, "000-default", content); err != nil {
+	snap := s.snapshotVhost("000-default")
+	if err := siteWriteVhostFn(s, ctx, "000-default", content); err != nil {
 		return fmt.Errorf("写入默认站点配置失败（已自动回滚）: %w", err)
 	}
 	// 日志目录的归属必须在 reload 之前修好。
@@ -83,21 +100,56 @@ func (s *Server) applyDefaultVhost(ctx context.Context) error {
 	if s.Cfg.User != "" && os.Geteuid() == 0 {
 		_ = chownTreeTo(filepath.Join(s.Cfg.WWWRoot, "_logs"), s.Cfg.User)
 	}
-	if err := s.nginxReload(ctx); err != nil {
-		return fmt.Errorf("配置已写入，但 nginx 重载失败: %w", err)
+	if err := siteReloadFn(s, ctx); err != nil {
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+			fmt.Errorf("配置已写入，但 nginx 重载失败: %w", err))
 	}
 	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败时会在错误日志里写 [emerg]
-	// 而 `-s reload` 依然返回 0。所以这里**按真实结果复核**：本机首页应当能拿到
-	// 我们刚写的那张占位页。拿不到就如实报错，并给出最可能的原因。
-	if code, body := fetchLocal("http://127.0.0.1/"); code != http.StatusOK ||
-		!strings.Contains(body, sites.LocalhostIndexMarker) {
-		return fmt.Errorf(
-			"配置已写入，但 nginx 没有真正生效（本机首页返回 %d）。"+
-				"最常见的原因是 %s 的日志文件归属/权限不对（nginx worker 打不开 access_log 时"+
-				"reload 会失败但退出码仍是 0）。请到「日志中心 → nginx error_log」看 [emerg] 行。",
-			code, filepath.Join(s.Cfg.WWWRoot, "_logs"))
+	// 而 `-s reload` 依然返回 0。所以这里**轮询**复核：本机首页应当能拿到
+	// 我们刚写的那张占位页。等满窗口仍拿不到才判失败，并如实给出排查检查点。
+	deadline := time.Now().Add(defaultVerifyWait)
+	tries := 0
+	var lastCode int
+	for {
+		tries++
+		var body string
+		lastCode, body = defaultProbeFn("http://127.0.0.1/")
+		// 必须同时满足"200"和"内容是我们刚写的占位页"：200 也可能来自别的
+		// 默认 server（内容对不上就说明这份配置没被加载）。
+		if lastCode == http.StatusOK && strings.Contains(body, sites.LocalhostIndexMarker) {
+			return nil
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(defaultVerifyEvery):
+			continue
+		}
+		break
 	}
-	return nil
+	return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, s.defaultVhostTimeoutError(lastCode, tries))
+}
+
+// defaultVhostTimeoutError 是"等了整个窗口默认站点仍没生效"时的错误。
+func (s *Server) defaultVhostTimeoutError(lastCode, tries int) error {
+	logDir := filepath.Join(s.Cfg.WWWRoot, "_logs")
+	vhostPath := filepath.Join(s.Cfg.VhostDir, "000-default.conf")
+	pidPath := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid")
+	errLog := filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log")
+	msg := fmt.Sprintf("默认站点配置已写入，nginx 重载也已发出，但 %s 内新配置仍未生效"+
+		"（共探测 %d 次，最后一次本机首页返回 %d）。请依次检查："+
+		"① `nginx -t` 是否通过；"+
+		"② nginx 进程与权限：`ps -o user,pid,command -p $(cat %s)` 里的用户能否读 %s 与日志目录 %s；"+
+		"③ vhost 是否在 include 目录：%s 应存在且被 %s 的 include 覆盖；"+
+		"④ 全局 error_log 末几行：`tail -n 20 %s`（面板「日志中心 → nginx 主错误日志」）看有没有 [emerg]。",
+		humanWait(defaultVerifyWait), tries, lastCode, pidPath, vhostPath, logDir,
+		vhostPath, s.Cfg.NginxConf, errLog)
+	if tail := s.nginxErrorLogTail(5); tail != "" {
+		msg += "\n（nginx error_log 末几行）\n" + tail
+	}
+	return errors.New(msg)
 }
 
 // buildDefaultVhost 生成完整的默认站点配置（幂等：内容只由代码决定）。

@@ -1044,9 +1044,12 @@ var (
 // 为什么要等：`nginx -s reload` 只是给 master 发信号，新监听端口 / 新 server
 // 块生效有很短的延迟；写完立刻探测会把一次正常重载误判成失败。
 // 同时日志是 worker 在响应之后写的，读大小前留一点落盘时间。
+//
+// 与站点侧同一口径：轮询间隔取 200ms（150–250ms 区间），总窗口 6 秒；
+// 两者都可注入，单测压到毫秒级（不许真睡 6 秒）。
 var (
 	proxyVerifyWait  = 6 * time.Second
-	proxyVerifyEvery = 300 * time.Millisecond
+	proxyVerifyEvery = 200 * time.Millisecond
 	proxyLogSettle   = 150 * time.Millisecond
 )
 
@@ -1307,12 +1310,24 @@ func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) e
 		if !chk.LogGrew {
 			why += "，且该规则自己的访问日志 " + chk.LogPath + " 没有任何新增"
 		}
-		return fmt.Errorf(
-			"规则「%s」的配置已写入、nginx 重载命令也返回成功，但复核发现**新配置没有生效**：%s。"+
+		msg := fmt.Sprintf(
+			"规则「%s」的配置已写入，nginx 重载也已发出，但 %s 内新配置仍未生效"+
+				"（复核发现新配置没有生效）：%s。"+
 				"最常见的原因是日志文件属主是 root（写 vhost 时以 root 跑过 `nginx -t`，"+
 				"它会在 %s 下创建 root 属主的日志），以真实用户运行的 nginx 打不开它们 → "+
-				"reload 失败而退出码仍是 0。请到「日志中心 → nginx error_log」看 [emerg] 行",
-			rule.Name, why, filepath.Dir(chk.LogPath))
+				"reload 失败而退出码仍是 0。请依次检查："+
+				"① `nginx -t` 是否通过；"+
+				"② `ps -o user,pid,command -p $(cat %s)` 里的用户能否读 %s；"+
+				"③ vhost %s 是否被 %s 的 include 覆盖；"+
+				"④ 全局 error_log：`tail -n 20 %s` 看有没有 [emerg]。",
+			rule.Name, humanWait(proxyVerifyWait), why, filepath.Dir(chk.LogPath),
+			filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid"), chk.LogPath,
+			filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf"), s.Cfg.NginxConf,
+			filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log"))
+		if tail := s.nginxErrorLogTail(5); tail != "" {
+			msg += "\n（nginx error_log 末几行）\n" + tail
+		}
+		return errors.New(msg)
 	}
 	// HTTPS 规则还要证明"端口上真的端出了这份证书"，光有 HTTP 响应不够。
 	if err := s.verifyProxyTLSServed(ctx, rule); err != nil {
@@ -1488,10 +1503,14 @@ func (s *Server) waitProxyGone(ctx context.Context, rule *proxies.Rule) error {
 		prev = cur
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf(
-				"规则「%s」的 nginx 配置已删除、重载命令也返回成功，但复核发现**它仍在生效**："+
-					"再请求 127.0.0.1:%d%s 后，它自己的访问日志 %s 仍在增长（最后一次响应 %s）。"+
-					"这通常意味着 nginx 没有真正重载（日志属主是 root 时 reload 会失败但退出码仍是 0）",
-				rule.Name, rule.Listen, proxyProbePath(rule), logPath, describeProxyProbe(last, rule))
+				"规则「%s」的 nginx 配置已删除、重载命令也返回成功，但等待 %s 后复核发现"+
+					"**它仍在生效**（每次请求后它自己的访问日志 %s 仍在增长，最后一次响应 %s）。"+
+					"这通常意味着 nginx 没有真正重载（日志属主是 root 时 reload 会失败但退出码仍是 0）。"+
+					"请检查：`nginx -t`、`ps -o user,pid,command -p $(cat %s)` 的运行用户权限、"+
+					"以及全局 error_log（`tail -n 20 %s`）里的 [emerg]。",
+				rule.Name, humanWait(proxyVerifyWait), logPath, describeProxyProbe(last, rule),
+				filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid"),
+				filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log"))
 		}
 	}
 }
@@ -1545,6 +1564,10 @@ func isDuplicateDefaultServer(err error) bool {
 }
 
 // applyProxy 生成并应用一条规则的 nginx 配置。
+//
+// 与 applySite 一样：失败时撤销本次写入的 vhost（还原旧内容 / 删掉本次新建的）。
+// 反代的调用方（创建/更新/启停/绑证书）都靠这一点才能做到
+// "接口非 2xx = 这次没做成、重试不会被上一次的残留挡住"。
 func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if !rule.Enabled {
 		return s.removeProxyConfig(ctx, rule)
@@ -1553,12 +1576,16 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if err != nil {
 		return err
 	}
+	snap := s.snapshotVhost(rule.VhostName())
 	// 复用站点的写盘通道：它经提权助手做原子写 + nginx -t 校验 + 失败回滚
 	if err := proxyWriteVhostFn(s, ctx, rule.VhostName(), content); err != nil {
 		return err
 	}
 	// **写盘之后、reload 之前**把日志树交还真实用户，并在 reload 后做请求级复核。
-	return s.reloadProxyAndVerify(ctx, rule)
+	if err := s.reloadProxyAndVerify(ctx, rule); err != nil {
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn, err)
+	}
+	return nil
 }
 
 // syncForwarder 让一条规则的回环转发器与当前配置对齐，并把分配到的端口写回
@@ -1627,11 +1654,18 @@ func (s *Server) reconcileForwarders(ctx context.Context) {
 }
 
 // removeProxyConfig 移除一条规则的配置文件并 reload。
+//
+// 复核发现"删了却仍在生效"时**把文件还原回去**：那时记录还在、配置却没了，
+// 是最典型的不一致状态；还原后重试删除才是干净的。
 func (s *Server) removeProxyConfig(ctx context.Context, rule *proxies.Rule) error {
-	if err := s.deleteVhost(ctx, rule.VhostName()); err != nil {
+	snap := s.snapshotVhost(rule.VhostName())
+	if err := siteDeleteVhostFn(s, ctx, rule.VhostName()); err != nil {
 		return err
 	}
-	return s.reloadProxyAndVerifyGone(ctx, rule)
+	if err := s.reloadProxyAndVerifyGone(ctx, rule); err != nil {
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn, err)
+	}
+	return nil
 }
 
 // syncRejectBlocks 把"兜底拒绝块"与当前规则集对齐。

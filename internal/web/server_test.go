@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -62,6 +63,14 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	// 从而**不去**把它改回真机的 /opt/homebrew。
 	cfg.BrewPrefix = dir + "/brew"
 	cfg.BrewBin = cfg.BrewPrefix + "/bin/brew"
+	// VhostDir / NginxConf 必须跟着 BrewPrefix 一起沙箱化。
+	//
+	// 复核通道会**读**旧 vhost 内容（失败时要还原它），而 config.Default()
+	// 解析出来的 VhostDir 仍指向真机 /opt/homebrew/etc/nginx/vhosts ——
+	// 不隔离的话，一次 `go test` 就可能读写用户的真实 nginx 配置
+	// （2026-09-14 正是这种漏沙箱化把生产的 000-default.conf 改坏、面板 502）。
+	cfg.VhostDir = filepath.Join(cfg.BrewPrefix, "etc", "nginx", "vhosts")
+	cfg.NginxConf = filepath.Join(cfg.BrewPrefix, "etc", "nginx", "nginx.conf")
 	prevDetectBrew := config.SetBrewPrefixDetectorForTest(func() string { return cfg.BrewPrefix })
 	t.Cleanup(func() { config.SetBrewPrefixDetectorForTest(prevDetectBrew) })
 	_ = os.MkdirAll(cfg.BrewPrefix+"/bin", 0o755)
@@ -174,6 +183,22 @@ func TestTestServerSandboxedAwayFromRealHomebrew(t *testing.T) {
 	for _, real := range []string{"/opt/homebrew", "/usr/local"} {
 		if got == real || strings.HasPrefix(got, real+"/") {
 			t.Fatalf("BrewPrefix = %s 指向真实 Homebrew：测试会写到用户真实的 php-fpm/nginx 配置上", got)
+		}
+	}
+	// VhostDir / NginxConf 同样不能指向真实 nginx：复核失败回滚会读/写 vhost，
+	// 漏隔离就会直接改用户的 000-default.conf（2026-09-14 的事故形态）。
+	for name, p := range map[string]string{
+		"VhostDir":  srv.Cfg.VhostDir,
+		"NginxConf": srv.Cfg.NginxConf,
+	} {
+		if p == "" {
+			t.Errorf("%s 不该为空", name)
+			continue
+		}
+		for _, real := range []string{"/opt/homebrew", "/usr/local"} {
+			if p == real || strings.HasPrefix(p, real+"/") {
+				t.Fatalf("%s = %s 指向真实 nginx：测试会改到用户的 nginx 配置", name, p)
+			}
 		}
 	}
 	// 关键：ReconcilePaths（svcManager 每次都会调）不能把沙箱前缀改回真机。

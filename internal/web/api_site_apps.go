@@ -110,19 +110,52 @@ func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
-func (s *Server) installSiteApp(ctx context.Context, app services.App, domain string, req siteInstallReq) (*siteInstallResult, error) {
+// siteInstallArtifacts 记录"本次一键建站**真正创建出来**的东西"。
+//
+// 失败清理只碰这里记着的东西，且必须满足"本次创建 **且** 为空/无数据"：
+//   - 已有目录、已有数据库、已有账号一律不动（绝不删用户已有数据）；
+//   - 数据库只有在**本次创建**且**表数为 0** 时才允许删；
+//   - 目录只有在本次创建且**为空**时才允许删（解压出来的源码会保留）；
+//   - 站点记录由这里删除；本次写入的 vhost 由 applySite 自己回滚。
+//
+// 只有这样才能保证"失败了还能干净地再点一次"：不会被
+// database exists / 站点已存在 这类上一次的残留永久挡住。
+type siteInstallArtifacts struct {
+	domain      string
+	dirCreated  bool
+	dbCreated   bool
+	dbName      string
+	userCreated bool
+	dbUser      string
+	siteCreated bool
+}
+
+func (s *Server) installSiteApp(ctx context.Context, app services.App, domain string, req siteInstallReq) (res *siteInstallResult, err error) {
 	spec := app.SiteApp
-	res := &siteInstallResult{App: app.ID, Domain: domain}
+	res = &siteInstallResult{App: app.ID, Domain: domain}
 	step := func(format string, a ...any) {
 		msg := fmt.Sprintf(format, a...)
 		res.Steps = append(res.Steps, msg)
 		services.EmitProgress(ctx, tasks.LevelStep, msg)
 	}
+	art := &siteInstallArtifacts{domain: domain}
+	defer func() {
+		if err == nil {
+			return
+		}
+		// 清理用 WithoutCancel：任务超时/用户关页面时 ctx 会被取消，
+		// 但残留（空库、空目录、站点记录）必须清掉，否则重试被自己挡住。
+		s.rollbackSiteInstall(context.WithoutCancel(ctx), art, step)
+	}()
 
 	// ---------- ① 目录 ----------
 	dir, err := sites.SiteDir(s.Cfg.WWWRoot, domain)
 	if err != nil {
 		return res, err
+	}
+	// 先看这个目录是不是本来就存在 —— 只清理**本次创建**的目录。
+	if _, serr := os.Stat(dir); os.IsNotExist(serr) {
+		art.dirCreated = true
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return res, fmt.Errorf("创建站点目录失败: %w", err)
@@ -216,10 +249,13 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		if err := c.CreateDatabase(ctx, dbName, "utf8mb4", "utf8mb4_unicode_ci"); err != nil {
 			return res, fmt.Errorf("创建数据库失败: %w", err)
 		}
+		// 库里的一切都是本次创建的：失败清理时只要确认它还是空的就删掉。
+		art.dbCreated, art.dbName = true, dbName
 		if err := c.CreateUser(ctx, dbUser, "localhost", dbPass,
 			[]string{"ALL"}, []string{dbName}); err != nil {
 			return res, fmt.Errorf("创建数据库用户失败: %w", err)
 		}
+		art.userCreated, art.dbUser = true, dbUser
 		res.DBName, res.DBUser, res.DBPass = dbName, dbUser, dbPass
 		step("已建库 %s 与用户 %s（密码随机生成，见下方结果）", dbName, dbUser)
 
@@ -257,14 +293,11 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	if err := s.siteMgr().Create(ctx, site); err != nil {
 		return res, fmt.Errorf("创建站点记录失败: %w", err)
 	}
+	art.siteCreated = true
 	if err := s.applySite(ctx, site); err != nil {
-		// D23：站点记录已经落库，但 vhost 没生成。不回滚的话用户会看到
-		// 「网站管理里有这个站、却打不开」，而且换域名重试还会被"已存在"挡住。
-		if derr := s.siteMgr().Delete(ctx, domain); derr != nil {
-			step("（警告）回滚站点记录失败：%v，请到「网站管理」手动删除 %s", derr, domain)
-		} else {
-			step("生成 nginx 配置失败，已回滚站点记录 %s（可换域名或排障后重试）", domain)
-		}
+		// D23：站点记录已经落库，但 vhost 没生成（或没生效）。这里只返回错误，
+		// 真正的回滚（站点记录 / 空数据库 / 空目录）由上面的 defer 统一做 ——
+		// 与"下载失败""解压失败"等更早的失败走同一条清理路径，不会再漏。
 		return res, fmt.Errorf("生成 nginx 配置失败: %w", err)
 	}
 	step("已创建站点并套用「%s」伪静态", spec.Rewrite)
@@ -275,9 +308,8 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 			step("（警告）调整目录归属失败：%v", err)
 		}
 	}
-	if err := siteReloadFn(s, ctx); err != nil {
-		step("（警告）nginx 重载失败：%v", err)
-	}
+	// 不再重复 reload：applySite 内部已经是"写 vhost → reload → 请求级复核"，
+	// 这里再发一次 reload 既没有新配置可加载，又会让首页探测撞上异步重载的中间态。
 
 	// ---------- ⑥ 复核首页 ----------
 	scheme := "http"
@@ -292,6 +324,109 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		step("首页探测：HTTP %d（%.0f 字节）", code, float64(len(body)))
 	}
 	return res, nil
+}
+
+// rollbackSiteInstall 清理本次一键建站留下的残留。
+//
+// 铁律：**只清理本次创建、且确认为空的产物**。
+//   - 站点记录：本次建的 → 删；
+//   - 数据库：本次建的 **且表数 = 0** → 删；有表 → 保留并明确提示；
+//   - 数据库账号：本次建的，且库已经删掉 → 删（否则留着，避免库还在用、账号没了）；
+//   - 目录：本次建的 **且为空** → 删；有源码 → 保留并提示（重试会复用）。
+//
+// 本次写入的 vhost 由 applySite 自己回滚（见 rollbackVhostWrite），
+// 这里不再重复处理，避免两处各删一次。
+func (s *Server) rollbackSiteInstall(ctx context.Context, art *siteInstallArtifacts, step func(string, ...any)) {
+	if art == nil {
+		return
+	}
+	if art.siteCreated {
+		if derr := s.siteMgr().Delete(ctx, art.domain); derr != nil {
+			step("（警告）回滚站点记录失败：%v，请到「网站管理」手动删除 %s 后再重试", derr, art.domain)
+		} else {
+			art.siteCreated = false
+			step("生成 nginx 配置失败，已回滚站点记录 %s（可换域名或排障后重试）", art.domain)
+		}
+	}
+	if art.dbCreated {
+		s.rollbackSiteInstallDB(ctx, art, step)
+	}
+	if art.dirCreated {
+		s.rollbackSiteInstallDir(art, step)
+	}
+}
+
+// rollbackSiteInstallDB 删除"本次创建的空数据库"（有表一律保留）。
+//
+// 这正是真机 2026-09-16 那次的根因：一键建站首轮失败留下空库，
+// 用户重试被 `ERROR 1007 ... database exists` **永久挡住**。
+func (s *Server) rollbackSiteInstallDB(ctx context.Context, art *siteInstallArtifacts, step func(string, ...any)) {
+	if art.dbName == "" {
+		return
+	}
+	c, err := s.mysqlClient()
+	if err != nil {
+		step("（警告）本次创建了数据库 %s，但清理时连不上 MySQL（%v）："+
+			"请到「数据库」页确认并手动删除，否则重试会被 \"database exists\" 挡住", art.dbName, err)
+		return
+	}
+	tables, terr := c.ListTables(ctx, art.dbName)
+	if terr != nil {
+		// 查不到就不敢删 —— 宁可留一个空库让用户手工处理，也不能误删有数据的库。
+		step("（警告）无法确认数据库 %s 是否为空（%v）：为安全起见**未删除**，"+
+			"请在「数据库」页确认后处理", art.dbName, terr)
+		return
+	}
+	if len(tables) > 0 {
+		step("（注意）数据库 %s 里已有 %d 张表，可能已有数据：**保留未删**。"+
+			"确认无用后请到「数据库」页删除，再重试建站", art.dbName, len(tables))
+		return
+	}
+	if derr := c.DropDatabase(ctx, art.dbName); derr != nil {
+		step("（警告）删除本次创建的空数据库 %s 失败：%v；"+
+			"重试建站可能被 \"database exists\" 挡住，请到「数据库」页手动删除", art.dbName, derr)
+		return
+	}
+	step("已删除本次创建的空数据库 %s（重试不会被 \"database exists\" 挡住）", art.dbName)
+	if !art.userCreated || art.dbUser == "" {
+		return
+	}
+	if uerr := c.DropUser(ctx, art.dbUser, "localhost"); uerr != nil {
+		step("（警告）删除本次创建的数据库账号 %s 失败：%v；请到「数据库 → 账号与权限」手动删除",
+			art.dbUser, uerr)
+		return
+	}
+	// 账号都没了，面板里那条"可回显口令"的记录也必须一起清掉，
+	// 否则用户会看到一个已经不存在的账号的口令。
+	if ferr := s.ForgetDBPassword(ctx, art.dbUser, "localhost"); ferr != nil {
+		step("（警告）数据库账号 %s 已删除，但面板没能清掉它的口令记录：%v", art.dbUser, ferr)
+	}
+	step("已删除本次创建的数据库账号 %s", art.dbUser)
+}
+
+// rollbackSiteInstallDir 只删除"本次创建且为空"的站点目录。
+//
+// 解压出来的源码不是空目录 → 保留并提示。重试时 copyTree 会覆盖同名文件，
+// 不会因为目录已存在而失败。
+func (s *Server) rollbackSiteInstallDir(art *siteInstallArtifacts, step func(string, ...any)) {
+	dir, err := sites.SiteDir(s.Cfg.WWWRoot, art.domain)
+	if err != nil {
+		return
+	}
+	entries, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		return // 已经不在了/读不到：没有可清理的
+	}
+	if len(entries) > 0 {
+		step("站点目录 %s 里已有 %d 个条目（源码/文件），**保留未删**；重试建站会直接复用该目录",
+			dir, len(entries))
+		return
+	}
+	if rerr := os.Remove(dir); rerr != nil {
+		step("（警告）删除本次创建的空目录 %s 失败：%v", dir, rerr)
+		return
+	}
+	step("已删除本次创建的空目录 %s", dir)
 }
 
 // ---------- 小工具 ----------

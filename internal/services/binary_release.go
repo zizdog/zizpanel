@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -398,6 +397,10 @@ func (a releaseBinaryApp) downloadURLs() []string {
 }
 
 // binaryReleasePaths 是这套安装器用到的全部路径。
+//
+// 它现在是**从描述符推导**出来的（见 binaryReleasePathsFor），不是另一份独立的
+// 路径计算 —— 两份路径计算漂移正是"编辑配置文件按钮指向一个不存在的文件"
+// 这类问题的根因。
 type binaryReleasePaths struct {
 	Root   string
 	Binary string
@@ -408,7 +411,32 @@ type binaryReleasePaths struct {
 	Plist  string
 }
 
+// binaryReleasePathsFor 按描述符算出全部路径。
+func (m *Manager) binaryReleasePathsFor(d AppDescriptor) binaryReleasePaths {
+	root := descriptorRoot(m.opt.UserHome, d)
+	p := binaryReleasePaths{
+		Root:   root,
+		Binary: filepath.Join(root, d.Paths.Binary),
+		Plist:  d.Service.PlistPath,
+		OutLog: filepath.Join(root, d.Paths.OutLog),
+		ErrLog: filepath.Join(root, d.Paths.ErrLog),
+	}
+	if len(d.Artifacts) > 0 {
+		p.Asset = filepath.Join(root, d.Artifacts[0].Name)
+	}
+	if d.Paths.ConfigFile != "" {
+		p.Config = filepath.Join(root, d.Paths.ConfigFile)
+	}
+	return p
+}
+
+// binaryReleasePaths（老签名，按参数表查）内部改用描述符。
 func (m *Manager) binaryReleasePaths(a releaseBinaryApp) binaryReleasePaths {
+	if d, ok := FindDescriptor(a.ID); ok {
+		return m.binaryReleasePathsFor(d)
+	}
+	// 描述符没注册（理论上不会发生）时退回按参数表算：宁可给出一条正确路径，
+	// 也不要在这里 panic 掉整个面板。
 	root := filepath.Join(m.opt.UserHome, a.RootDir)
 	p := binaryReleasePaths{
 		Root:   root,
@@ -424,289 +452,77 @@ func (m *Manager) binaryReleasePaths(a releaseBinaryApp) binaryReleasePaths {
 	return p
 }
 
+// descriptorRoot 解析安装根目录（相对真实用户家目录）。
+func descriptorRoot(userHome string, d AppDescriptor) string {
+	root := d.Paths.RootDir
+	if strings.HasPrefix(root, "/") {
+		return root
+	}
+	return filepath.Join(userHome, root)
+}
+
 // InstallReleaseBinary 部署一个"官方 release 原生二进制"应用并注册为系统级服务。
+//
+// 2026-09-17 模块化改造：这个函数**已经不再自己实现流程**，它是一层兼容壳 ——
+//
+//	· 参数表（releaseBinaryApps）与流程（steps DSL）都在描述符里
+//	  （见 descriptor.go / steps.go / tarball_descriptor.go）；
+//	· 这里的全部工作是"做前置校验 → 装配执行器 → 执行步骤"。
+//
+// 为什么要保留这个函数名：internal/web 的 install 分流、uninstall_app.go 的
+// 卸载分流、以及一批单测都按它接线；对外契约（202 + task_id + SSE + 进度）
+// 一个字都不能变（用户明确要求）。改的只是"实现放在哪"。
 func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *InstallResult) error {
-	spec, ok := releaseBinaryApps[id]
-	if !ok {
+	d, ok := FindDescriptor(id)
+	if !ok || d.Rail != RailTarball {
 		return fmt.Errorf("没有 %s 的原生二进制安装器", id)
 	}
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("部署 %s 需要以 root 运行", spec.Name)
+		return fmt.Errorf("部署 %s 需要以 root 运行", d.Name)
 	}
 	if m.opt.UserName == "" || m.opt.UserHome == "" {
 		return fmt.Errorf("无法确定运行该服务的真实用户与家目录")
 	}
-
-	p := m.binaryReleasePaths(spec)
-	if err := os.MkdirAll(p.Root, 0o755); err != nil {
-		return fmt.Errorf("创建 %s 失败: %w", p.Root, err)
-	}
-	// 递归改归属：安装目录由真实用户拥有，服务以该用户身份运行才写得进配置
-	_ = chownTree(m.opt.UserName, p.Root)
-
-	// ---- 0.9 先检查镜像上有没有这个包（用户明确要求）----
-	//
-	// 镜像基址配置了就**必须先通过这一步**：按需求镜像是唯一来源，
-	// 镜像上没有就明确失败并告诉他怎么补（`make sync-apps`），
-	// 而不是静默回退到 GitHub —— 回退会让"这台机器到底能不能装"变得不可预测。
-	// 先试镜像；不行就回落公网。返回值告诉后面"这次走的是不是镜像"
-	// （决定用哪套校验：镜像清单的 sha256，还是上游的 checksums）。
-	usedMirror := m.preflightMirrorAsset(ctx, spec, result)
-
-	// ---- 1. 下载产物 ----
-	if err := m.downloadReleaseBinary(ctx, spec, p, result); err != nil {
-		return err
-	}
-
-	// ---- 1.5 校验内容，失败即中止 ----
-	// 放在解压之前：宁可下载完立刻失败，也不要把一个校验不通过的 tarball
-	// 解压出来、chmod、再交给 launchd 去执行。
-	//
-	// 走镜像时用**镜像清单**里的 sha256（比只对 frp 校验更严：
-	// Lucky / Orbien 上游根本没有 checksums 文件，原来等于不校验）；
-	// 走公网时用上游自己的 checksums（有就校验）。
-	if usedMirror {
-		if err := m.verifyMirrorChecksum(ctx, spec, p, result); err != nil {
-			return err
-		}
-	} else if err := m.verifyReleaseChecksum(ctx, spec, p, result); err != nil {
-		return err
-	}
-
-	// ---- 2. 解压 ----
-	// 重装场景：先停掉旧实例再覆盖二进制 —— macOS 上覆写正在执行的 Mach-O
-	// 可能让那个进程直接被系统杀掉（Killed: 9）。这里失败也无所谓：
-	// 本来就没装过时 bootout 必然报错，后面 bootstrap 才是决定性的那一步。
-	_, _ = m.runRoot(ctx, 20*time.Second, "/bin/launchctl", "bootout", "system/"+spec.Label)
-	result.step(ctx, "解压 "+spec.Asset)
-	if out, err := m.runAsUser(ctx, 3*time.Minute, "/usr/bin/tar",
-		spec.extractArgs(p.Asset, p.Root)...); err != nil {
-		return fmt.Errorf("解压失败: %v（%s）", err, tailText(out, 300))
-	}
-
-	// ---- 3. 复核二进制架构（绝不放行 amd64）----
-	if err := m.verifyArm64Binary(ctx, p.Binary); err != nil {
-		return err
-	}
-	if err := os.Chmod(p.Binary, 0o755); err != nil {
-		return fmt.Errorf("设置可执行权限失败: %w", err)
-	}
-
-	// ---- 4. 应用配置文件 ----
-	var secrets configSeedSecrets
-	if p.Config != "" && spec.ConfigSeed != "" {
-		s, generated, err := m.ensureReleaseConfig(spec, p)
-		if err != nil {
-			return err
-		}
-		if generated {
-			secrets = s
-		} else {
-			result.step(ctx, "已保留现有配置 "+p.Config+"（面板不覆盖你的改动）")
-		}
-	}
-
-	// ---- 5. 归属与权限 ----
-	_ = chownTree(m.opt.UserName, p.Root)
-
-	// ---- 6. 注册系统级 LaunchDaemon ----
-	plist := releaseBinaryPlist(spec, p, m.opt.UserName)
-	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
-		return fmt.Errorf("写入 plist 失败: %w", err)
-	}
-	if err := os.Rename(p.Plist+".tmp", p.Plist); err != nil {
-		return fmt.Errorf("安装 plist 失败: %w", err)
-	}
-	if err := m.bootstrapService(ctx, spec.Label, p.Plist); err != nil {
-		return err
-	}
-	result.step(ctx, "已注册为系统级后台服务（开机自启、不依赖用户登录）")
-
-	// ---- 6.5 先登记进服务管理，再验收（失败也要能看到它）----
-	//
-	// 顺序是刻意的（2026-09-17 审计）：原来登记在验收之后，而验收只写一条
-	// Warning 就放过去。一旦把验收改成如实失败（见 waitReleaseBinaryReady），
-	// 登记留在后面就会留下「任务失败、服务管理里又找不到它」的半成品。
-	// 服务记录用 UIPort（frps 的 dashboard 7500），这样「打开」/健康检查都指向界面；
-	// 协议口 7000 仍由下面的存活判断与安装前检查覆盖。
-	// 登记失败**不**让整个部署失败（刻意接受的降级）：launchd 服务本身是好的、
-	// 软件能用，只是面板列表里暂时没有它（可手工纳管）。理由同 Qwen：让一个
-	// 「其实能用」的服务报失败、逼用户重装，造成的损失更大。下面的就绪验收
-	// 仍会如实判定它到底起没起来，并把登记结果写进失败信息。
-	registered := true
-	if err := m.RegisterInstalledService(ctx, spec.Label, spec.Name, spec.Icon, spec.Category, spec.webPort()); err != nil {
-		registered = false
-		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
-	}
-
-	// ---- 7. 验证：服务真的活着才算成功 ----
-	// 用 Port（协议口）判断存活：dashboard 起得来不代表 bindPort 绑上了，
-	// 而后者才是 frps 能不能用的关键（7000 常被隔空播放接收器占着）。
-	if err := m.waitReleaseBinaryReady(ctx, spec, p, registered, result); err != nil {
-		return err
-	}
-
-	host := m.primaryIP()
-	result.Address = host
-
-	if spec.HealthPath != "" {
-		result.step(ctx, fmt.Sprintf("Web 界面：http://%s:%d", host, spec.webPort()))
-	}
-	result.step(ctx, "", "安装目录："+p.Root, "日志："+p.OutLog,
-		"配置文件："+p.Config)
-	if block := credentialBlock(spec.Name, p.Config, fmt.Sprintf("http://%s:%d", host, spec.webPort()), secrets); len(block) > 0 {
-		result.Steps = append(result.Steps, block...)
-	}
-	if len(spec.Notes) > 0 {
-		result.Steps = append(result.Steps, "")
-		result.step(ctx, spec.Notes...)
-	}
-	return nil
+	return m.OrchestrateTarballInstall(ctx, d, result)
 }
 
 // waitReleaseBinaryReady 等 release 二进制服务真的就绪。**超时返回错误，不是警告。**
 //
-// 2026-09-17 审计：原来 60 秒内端口没监听只写一条 Warning，任务照样报成功 ——
-// 于是「装完了但用不了」和「任务完成 ✅」同时出现在界面上。现在如实失败，
-// 并附上进程错误日志（p.ErrLog）的尾部若干行。
-//
-// 两类条目分开判断：
+// 2026-09-17 模块化改造：就绪判定的实现搬进了描述符执行器
+// （ExecConfig.assertReady，见 steps.go），这里只保留**兼容入口** ——
+// 判定语义一个字都没变：
 //   - Port > 0（frpc 7400 / ddns-go 9876）：端口在监听是「服务真的活着」最强的
-//     证据（结构体字段注释也写着「比 launchd 状态更可信」）。
+//     证据（比 launchd 状态更可信）；
 //   - Port == 0（orbien 客户端是纯出站连接，不监听任何端口）：没有端口可等，
-//     只能看 launchd 有没有把这个作业真的拉起来。这不是「降级放行」，而是这类应用
-//     唯一正确的判据 —— 原来的 waitPort(0, 60s) 必然超时，每次安装都误报一次。
+//     只能看 launchd 有没有把这个作业真的拉起来（原来的 waitPort(0, 60s)
+//     必然超时，每次安装都误报一次）。
+//
+// 失败**如实返回 error**，并附上进程错误日志尾部 —— 绝不再出现
+// 「装完了但用不了」和「任务完成 ✅」同时显示在界面上的情况。
 func (m *Manager) waitReleaseBinaryReady(ctx context.Context, spec releaseBinaryApp,
 	p binaryReleasePaths, registered bool, result *InstallResult) error {
 
-	port := spec.Port
-	expect := fmt.Sprintf("TCP 端口 %d 开始监听", port)
-	if port <= 0 {
-		expect = "launchd 把这个作业真正拉起来（该应用不监听任何端口）"
+	d, ok := FindDescriptor(spec.ID)
+	if !ok {
+		return fmt.Errorf("没有 %s 的描述符（面板内部错误）", spec.ID)
 	}
-	state := "二进制、配置与 launchd 服务都已就位，服务也已登记进服务管理"
-	if !registered {
-		state = "二进制、配置与 launchd 服务都已就位（但登记进服务管理失败）"
-	}
-	missing := "但服务实际上不可用，管理界面与它自己的功能现在都连不上"
-	if port <= 0 {
-		missing = "但 launchd 也没能把它跑起来，它实际上不可用"
-	}
-	result.step(ctx, "等待服务就绪（"+expect+"）")
-
-	return assertReady(ctx, readySpec{
-		What:    spec.Name,
-		Expect:  expect,
-		Timeout: releaseBinaryReadyTimeout,
-		Probe: func(ctx context.Context) readyVerdict {
-			if port > 0 {
-				if readyWaitPort(ctx, port, releaseBinaryReadyTimeout) {
-					return readyVerdict{OK: true,
-						Actual: fmt.Sprintf("已就绪，监听 %d 端口", port)}
-				}
-				return readyVerdict{Actual: fmt.Sprintf(
-					"连 127.0.0.1:%d 一直失败，端口始终没有监听", port)}
-			}
-			return waitLaunchdRunning(ctx, spec.Label, releaseBinaryReadyTimeout)
+	ec := &ExecConfig{
+		Ctx:    ctx,
+		Spec:   d,
+		Result: result,
+		Runner: &plistOnlyRunner{},
+		pathVars: map[string]string{
+			"{root}": p.Root, "{home}": "", "{user}": "",
 		},
+		registered: registered,
+	}
+	return ec.assertReady(AssertReadyAction{
+		What:    spec.Name,
 		LogPath: p.ErrLog,
-		State:   state,
-		Missing: missing,
 		Remedy: "按下面的日志尾部里的报错修好后重新部署；" +
 			"也可以在「服务管理」里点「重启服务」再试" +
 			"（配置文件在 " + p.Config + "）",
-		Result: result,
 	})
-}
-
-// downloadReleaseBinary 依次尝试官方地址与加速镜像。
-func (m *Manager) downloadReleaseBinary(ctx context.Context, spec releaseBinaryApp,
-	p binaryReleasePaths, result *InstallResult) error {
-
-	// 已经有解压好的二进制时也要重下：升级/修复都走同一条路，
-	// 而"文件存在就跳过"会让用户永远修不好一个坏掉的二进制。
-	urls := m.orderDownloadURLs(ctx, spec, result)
-	// 先下到 .part 再改名：这样失败时**不会**破坏用户自己放进来的产物
-	// （下面"全部失败就看磁盘上有没有现成文件"那条退路要靠它成立）。
-	tmp := p.Asset + ".part"
-	var lastErr error
-	for i, u := range urls {
-		label := "官方地址"
-		if i > 0 {
-			label = "加速镜像（第三方）"
-		}
-		// 官方源给**更短的截止时间**：它只是"存在且可信"，不一定快。
-		// 实测（2026-09-15，同一台机器）：lucky 12.9MB 走 GitHub 官方约 46KB/s，
-		// 5~10 分钟才下完；加速镜像同一份只要 21 秒。让用户对着进度条等 10 分钟
-		// 是不可接受的 —— 150 秒没下完就明确告知并换镜像，而不是死等。
-		maxTime := "300"
-		if i == 0 {
-			maxTime = "150"
-		}
-		result.step(ctx, "下载 "+spec.Asset+"（"+label+"，上限 "+maxTime+" 秒）")
-		started := time.Now()
-		out, err := m.runAsUser(ctx, 15*time.Minute, "/usr/bin/curl",
-			// --speed-limit/--speed-time：防的是"连上了但完全不走数据"的停滞
-			// （不再有进度却也不报错）。慢但没停滞的下载由上面的 --max-time 兜底。
-			"-fL", "--retry", "1", "--connect-timeout", "20", "--max-time", maxTime,
-			"--speed-limit", "1024", "--speed-time", "30",
-			"-o", tmp, u)
-		elapsed := time.Since(started).Seconds()
-		if err == nil {
-			if rerr := os.Rename(tmp, p.Asset); rerr != nil {
-				return fmt.Errorf("下载完成但保存到 %s 失败: %w", p.Asset, rerr)
-			}
-			size := int64(0)
-			if fi, serr := os.Stat(p.Asset); serr == nil {
-				size = fi.Size()
-			}
-			// 把"实际用了多久、多快"写进任务日志：慢的时候用户能看出是网络问题，
-			// 我们事后也能一眼判断"该不该再调超时"。
-			result.step(ctx, fmt.Sprintf("下载完成：%s（%.1f 秒，约 %s/s）",
-				humanBytes(size), elapsed, humanBytes(int64(float64(size)/max64(elapsed, 0.1)))))
-			return nil
-		}
-		lastErr = fmt.Errorf("%s 失败: %v（%s）", u, err, tailText(out, 200))
-		if i == 0 {
-			result.step(ctx, fmt.Sprintf("官方地址 %.0f 秒没下完（速度太慢或不可达），改用加速镜像（第三方）。%s",
-				elapsed, tailText(out, 160)))
-		} else {
-			result.step(ctx, "下载失败，换下一个地址："+tailText(out, 200))
-		}
-		_ = os.Remove(tmp)
-	}
-	// 自动下载全失败：如果磁盘上已经有这个产物（用户按提示手动放好的），
-	// 就用它继续 —— 否则错误信息里那句"手动下载放到 <root>"就是一句空话。
-	// 文件是不是真的可用由后面的解压与 file(1) 复核负责，坏了会明确报错。
-	if fileExists(p.Asset) {
-		result.step(ctx, "所有自动下载地址都失败，改用磁盘上已有的 "+p.Asset)
-		return nil
-	}
-	return fmt.Errorf("下载 %s 失败（官方与 %d 个镜像都试过）：%v。"+
-		"可在网络可达时手动下载该文件放到 %s，再重新点安装",
-		spec.Asset, len(urls)-1, lastErr, p.Root)
-}
-
-// verifyArm64Binary 用 file(1) 复核二进制确实是 arm64。
-//
-// 为什么值得单独一步：Asset 名里有 darwin_arm64 并不等于内容一定是 arm64 ——
-// 上游改过一次命名/挂错产物，用户就会在 macOS 上得到一个跑不起来的服务，
-// 而且报错信息（launchd 的 "Bad CPU type"）完全指不到"下错架构"。
-// 这一步让失败发生在安装阶段，并且原因明确。
-func (m *Manager) verifyArm64Binary(ctx context.Context, bin string) error {
-	if _, err := os.Stat(bin); err != nil {
-		return fmt.Errorf("解压后没有找到可执行文件 %s：%w", bin, err)
-	}
-	out, err := m.runRoot(ctx, 10*time.Second, "/usr/bin/file", "-b", bin)
-	if err != nil {
-		return fmt.Errorf("复核二进制架构失败: %v（%s）", err, tailText(out, 200))
-	}
-	if !strings.Contains(out, "arm64") {
-		return fmt.Errorf("下载到的 %s 不是 arm64 原生二进制（file 报告：%s）。"+
-			"面板只允许原生 arm64（不跑 Rosetta 转译），已中止安装",
-			filepath.Base(bin), strings.TrimSpace(out))
-	}
-	return nil
 }
 
 // configSeedSecrets 是生成配置时替换进模板的随机凭据。
@@ -772,45 +588,6 @@ func writeConfigSeed(path, seed string, s configSeedSecrets) error {
 	return nil
 }
 
-// verifyReleaseChecksum 用上游的 SHA-256 清单核对下载到的产物。
-//
-// 为什么必须有：这套安装器在官方地址太慢时会退到**第三方加速镜像**，
-// 而镜像转发的正是随后以 root 执行的二进制。frp 是唯一提供 checksums 的上游
-// （frp_sha256_checksums.txt），所以它也是唯一能做内容校验的条目 ——
-// 有校验却不做，等于白拿的安全收益。
-//
-// 顺序上先试**官方**清单地址（文件只有 1.6KB，慢链路也能秒下），再退镜像：
-// 这样"tarball 来自镜像、清单来自官方"时校验才有真实意义。
-// 局限要说清：如果官方地址完全不可达、清单也只能从同一个镜像取，这一步退化成
-// "防传输损坏"而非"防镜像作恶"——安装日志里会把清单来源写出来。
-func (m *Manager) verifyReleaseChecksum(ctx context.Context, spec releaseBinaryApp,
-	p binaryReleasePaths, result *InstallResult) error {
-
-	if spec.ChecksumAsset == "" {
-		return nil
-	}
-	list, source, err := m.fetchChecksumList(ctx, spec, p.Root)
-	if err != nil {
-		// 下不到清单就**中止**：静默跳过等于把"有校验"变成"看运气"。
-		return fmt.Errorf("无法取得官方校验清单 %s: %w。校验失败，已中止安装"+
-			"（可稍后网络正常时重试）", spec.ChecksumAsset, err)
-	}
-	want, err := checksumFor(list, spec.Asset)
-	if err != nil {
-		return fmt.Errorf("%v。已中止安装（清单来源：%s）", err, source)
-	}
-	got, err := fileSHA256(p.Asset)
-	if err != nil {
-		return fmt.Errorf("计算 %s 的 sha256 失败: %w", p.Asset, err)
-	}
-	if err := matchChecksum(spec.Asset, want, got, source, p.Root); err != nil {
-		return err
-	}
-	result.step(ctx, fmt.Sprintf("SHA-256 校验通过：%s 与官方 %s 一致（清单来源：%s）",
-		spec.Asset, spec.ChecksumAsset, source))
-	return nil
-}
-
 // matchChecksum 是校验的判定本身（纯函数，便于单测证明"坏文件真的会被拦住"）。
 //
 // 拆出来的原因：verifyReleaseChecksum 要下载、要 root、要跑 curl，没法在单测里
@@ -841,6 +618,11 @@ func (a releaseBinaryApp) checksumURLs() []string {
 }
 
 // fetchChecksumList 下载并返回清单内容，同时返回"来源"用于如实写进日志。
+//
+// 顺序上先试**官方**清单地址（文件只有 1.6KB，慢链路也能秒下），再退镜像：
+// 这样"tarball 来自镜像、清单来自官方"时校验才有真实意义。
+// 局限要说清：如果官方地址完全不可达、清单也只能从同一个镜像取，这一步退化成
+// "防传输损坏"而非"防镜像作恶"——安装日志里会把清单来源写出来。
 func (m *Manager) fetchChecksumList(ctx context.Context, spec releaseBinaryApp, root string) (string, string, error) {
 	urls := spec.checksumURLs()
 	tmp := filepath.Join(root, spec.ChecksumAsset+".part")
@@ -950,16 +732,8 @@ func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 // 例外是 PreserveExistingConfig（ddns-go）：那个应用的配置由它自己的网页界面重写，
 // marker 活不过第一次保存，所以对它判据退化成"文件存在即保留"（详见字段注释）。
 func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePaths) (configSeedSecrets, bool, error) {
-	if b, rerr := os.ReadFile(p.Config); rerr == nil {
-		// 应用自己会重写配置的条目（ddns-go）：只要文件在就一律保留。
-		// 它的网页界面保存一次就会把面板的 marker 注释抹掉，按 marker 判断的话
-		// 重装会把用户填好的 DNS 服务商密钥当成"上游示例"覆盖掉。
-		if spec.PreserveExistingConfig {
-			return configSeedSecrets{}, false, nil
-		}
-		if strings.Contains(string(b), panelConfigMarker) {
-			return configSeedSecrets{}, false, nil
-		}
+	if configKeepsExisting(spec.PreserveExistingConfig, p.Config) {
+		return configSeedSecrets{}, false, nil
 	}
 	s, err := generateConfigSecrets(spec.ConfigSeed, "")
 	if err != nil {
@@ -969,6 +743,27 @@ func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePath
 		return configSeedSecrets{}, false, err
 	}
 	return s, true, nil
+}
+
+// configKeepsExisting 是"要不要保留磁盘上这份配置"的**唯一判据**
+// （老 ensureReleaseConfig 的判据，逐字保留；执行器的 ensure_config 步骤
+// 也调它 —— 两份判据漂移会让重装一次冲掉一次用户配置）。
+//
+//   - preserveExisting（ddns-go）：**文件存在即保留**。它的网页界面保存时会
+//     整体重写 YAML，面板写的 marker 注释活不过第一次保存；按 marker 判断的话，
+//     重装会把用户填好的 DNS 服务商密钥与域名直接冲掉。
+//   - 其余（frpc / orbien-client）：含面板 marker 才保留（用户可能自己改过端口/
+//     口令）；否则视为"上游示例配置"，必须被面板这份覆盖 —— 否则面板永远写不进
+//     自己的配置，用户装完只有默认值、没有界面入口，而且没有任何报错。
+func configKeepsExisting(preserveExisting bool, path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	if preserveExisting {
+		return true
+	}
+	return strings.Contains(string(b), panelConfigMarker)
 }
 
 // credentialBlock 生成安装结果里的"可复制凭据区块"。
@@ -1054,29 +849,49 @@ func xmlEscape(s string) string {
 	return r.Replace(s)
 }
 
-// UninstallReleaseBinary 停止并删除服务，按需删除安装目录。
-func (m *Manager) UninstallReleaseBinary(ctx context.Context, id string, removeData bool, result *InstallResult) error {
-	spec, ok := releaseBinaryApps[id]
-	if !ok {
-		return fmt.Errorf("没有 %s 的卸载实现", id)
-	}
-	p := m.binaryReleasePaths(spec)
-	if result != nil {
-		result.step(ctx, "停止并删除服务 "+spec.Label)
-	}
-	if err := m.removeService(ctx, spec.Label, p.Plist); err != nil {
-		return err
-	}
-	if removeData {
-		return m.removeTree(ctx, p.Root, result)
-	}
-	if result != nil {
-		result.step(ctx, "保留 "+p.Root+"（二进制与配置；需要彻底清理请勾选删除数据）")
-	}
-	return nil
-}
+// plistOnlyRunner 是"只算不碰"的兼容入口（渲染 plist、走就绪判定）用的空 Runner。
+//
+// 它不碰文件系统、不碰 launchd、不发网络请求 —— 那正是单测不该做的事。
+// 就绪判定用到的三个探针（WaitPort / LaunchRunning / HTTPGet）走的仍是
+// ready.go 里的包级注入点，所以 ready_test.go 的桩照常生效。
+type plistOnlyRunner struct{}
 
-// humanBytes 只用于任务日志（"12.9 MB"比"13529298"好读得多）。
+func (plistOnlyRunner) Stat(string) (bool, bool, error)             { return false, false, nil }
+func (plistOnlyRunner) MkdirAll(string, os.FileMode) error          { return nil }
+func (plistOnlyRunner) WriteFile(string, []byte, os.FileMode) error { return nil }
+func (plistOnlyRunner) ReadFile(string) ([]byte, error)             { return nil, os.ErrNotExist }
+func (plistOnlyRunner) Size(string) int64                           { return -1 }
+func (plistOnlyRunner) Chmod(string, os.FileMode) error             { return nil }
+func (plistOnlyRunner) Rename(string, string) error                 { return nil }
+func (plistOnlyRunner) Remove(string) error                         { return nil }
+func (plistOnlyRunner) RemoveAll(string) error                      { return nil }
+func (plistOnlyRunner) SHA256(string) (string, error)               { return "", nil }
+func (plistOnlyRunner) ChownTree(string, string) error              { return nil }
+func (plistOnlyRunner) CopyTree(string, string) error               { return nil }
+func (plistOnlyRunner) FileType(context.Context, string) (string, error) {
+	return "", nil
+}
+func (plistOnlyRunner) RunAsUser(context.Context, time.Duration, string, ...string) (string, error) {
+	return "", nil
+}
+func (plistOnlyRunner) RunAsUserEnv(context.Context, time.Duration, []string, string, ...string) (string, error) {
+	return "", nil
+}
+func (plistOnlyRunner) RunRoot(context.Context, time.Duration, string, ...string) (string, error) {
+	return "", nil
+}
+func (plistOnlyRunner) Bootout(context.Context, string) error           { return nil }
+func (plistOnlyRunner) Bootstrap(context.Context, string, string) error { return nil }
+func (plistOnlyRunner) WaitPort(ctx context.Context, port int, timeout time.Duration) bool {
+	// 走 ready.go 的包级注入点：单测用它替换真实探针（不许联网、不许等真实时间）。
+	return readyWaitPort(ctx, port, timeout)
+}
+func (plistOnlyRunner) LaunchRunning(label string) (bool, string) { return readyLaunchRunning(label) }
+func (plistOnlyRunner) HTTPGet(ctx context.Context, url string, timeout time.Duration) (int, error) {
+	return httpProbeStatus(ctx, url, timeout)
+}
+func (plistOnlyRunner) PrimaryIP(context.Context) string { return "" }
+
 func humanBytes(n int64) string {
 	if n <= 0 {
 		return "0 B"
@@ -1110,49 +925,6 @@ func IsReleaseBinaryApp(id string) bool {
 	return ok
 }
 
-// orderDownloadURLs 先量一下各候选源的速度，再按快慢排序。
-//
-// 探测本身失败/超时都只当"这个源不可用"（速度 0），不会让安装失败。
-func (m *Manager) orderDownloadURLs(ctx context.Context, spec releaseBinaryApp,
-	result *InstallResult) []string {
-	// 候选列表已经"镜像优先"了（见 downloadURLsFor）：镜像上的包在第一位，
-	// 镜像不可达时回落官方的顺序由它决定。
-	urls := m.downloadURLsFor(ctx, spec)
-	if m.MirrorEnabled() && len(urls) > 0 && strings.HasPrefix(urls[0], m.mirrorBase()) {
-		// 镜像可用：**直接用它**，不做测速排序。
-		// 理由：镜像就在同城/局域网（实测 5 MB/s 级），测速反而多花几秒；
-		// 而且把公网源排在镜像前面就违背了"尽量省流量"的初衷。
-		if result != nil {
-			result.step(ctx, "下载源：镜像 "+urls[0])
-		}
-		return urls
-	}
-	if len(urls) < 2 {
-		return urls
-	}
-	// 只探前 256KB，6 秒上限：足够区分"通/不通/慢/快"，又不会把安装拖长
-	probeArgs := func(u string) []string {
-		return []string{"-sL", "-r", "0-262143", "--max-time", "6",
-			"-o", "/dev/null", "-w", "%{speed_download}", u}
-	}
-	speeds := make([]int64, 0, len(urls))
-	desc := make([]string, 0, len(urls))
-	for _, u := range urls {
-		out, err := m.runAsUser(ctx, 20*time.Second, "/usr/bin/curl", probeArgs(u)...)
-		sp := int64(0)
-		if err == nil {
-			if v, perr := strconv.ParseFloat(strings.TrimSpace(out), 64); perr == nil {
-				sp = int64(v)
-			}
-		}
-		speeds = append(speeds, sp)
-		desc = append(desc, fmt.Sprintf("%s %.0f KB/s", hostOf(u), float64(sp)/1024))
-	}
-	ordered := orderBySpeed(urls, speeds)
-	result.step(ctx, "下载源实测："+strings.Join(desc, "；")+"（按快的优先）")
-	return ordered
-}
-
 // hostOf 取 URL 的主机名，用于日志（不要把完整 URL 塞进一行日志）。
 func hostOf(raw string) string {
 	if u, err := url.Parse(raw); err == nil && u.Host != "" {
@@ -1161,25 +933,24 @@ func hostOf(raw string) string {
 	return raw
 }
 
-// releaseBinaryPlan 给出安装器类应用的卸载计划。
+// UninstallReleaseBinary 停止并删除服务，按需删除安装目录。
+//
+// 实现体是 m.UninstallByDescriptor（见 tarball_descriptor.go）——
+// 老函数名保留是为了 internal/services/uninstall_app.go 的分流与既有单测，
+// 流程只有一份。
+func (m *Manager) UninstallReleaseBinary(ctx context.Context, id string, removeData bool, result *InstallResult) error {
+	d, ok := FindDescriptor(id)
+	if !ok || d.Rail != RailTarball {
+		return fmt.Errorf("没有 %s 的卸载实现", id)
+	}
+	return m.UninstallByDescriptor(ctx, d, removeData, result)
+}
+
+// releaseBinaryPlan 给出安装器类应用的卸载计划（实现见 uninstallPlanForDescriptor）。
 func (m *Manager) releaseBinaryPlan(id string) (UninstallPlan, bool) {
-	spec, ok := releaseBinaryApps[id]
-	if !ok {
+	d, ok := FindDescriptor(id)
+	if !ok || d.Rail != RailTarball {
 		return UninstallPlan{}, false
 	}
-	p := m.binaryReleasePaths(spec)
-	plan := UninstallPlan{
-		Kind:      "installer",
-		Steps:     []string{"停止并删除 launchd 服务 " + spec.Label, "从「服务管理」移除记录"},
-		DataPaths: []string{p.Root},
-	}
-	switch id {
-	case "orbien-client":
-		plan.KeepNote = "默认保留安装目录（二进制与 orbien.toml，配置里可能有服务端 token）"
-	case "frpc":
-		plan.KeepNote = "默认保留安装目录（二进制与 frpc.toml，配置里有 token）"
-	case "ddns-go":
-		plan.KeepNote = "默认保留安装目录（二进制与 ddns-go.yaml，配置里有 DNS 服务商的 API Token/密钥）"
-	}
-	return plan, true
+	return m.uninstallPlanForDescriptor(d)
 }

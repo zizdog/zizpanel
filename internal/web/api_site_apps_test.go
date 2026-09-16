@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,15 +86,24 @@ func stubSitePackageFetch(t *testing.T, label string, payload []byte) {
 func stubSiteApplySteps(t *testing.T, writeErr error) {
 	t.Helper()
 	prevWrite, prevReload, prevProbe := siteWriteVhostFn, siteReloadFn, siteProbeFn
+	prevRead, prevDelete := siteReadVhostFn, siteDeleteVhostFn
+	prevWait, prevEvery := siteVerifyWait, siteVerifyEvery
 	prevHome := siteHomeProbeFn
 	siteWriteVhostFn = func(_ *Server, _ context.Context, _, _ string) error { return writeErr }
 	siteReloadFn = func(_ *Server, _ context.Context) error { return nil }
 	siteProbeFn = func(_ context.Context, _, _ string, _ int, _ string, _ time.Duration) (string, string, error) {
 		return "403", "", nil
 	}
+	// 回滚通道也换成假的：单测不许碰真实 vhost 目录、不许调提权助手。
+	siteReadVhostFn = func(_ *Server, _ string) ([]byte, error) { return nil, os.ErrNotExist }
+	siteDeleteVhostFn = func(_ *Server, _ context.Context, _ string) error { return nil }
+	siteVerifyWait = 120 * time.Millisecond
+	siteVerifyEvery = time.Millisecond
 	siteHomeProbeFn = func(_ context.Context, _ string) (int, string) { return 200, "200" }
 	t.Cleanup(func() {
 		siteWriteVhostFn, siteReloadFn, siteProbeFn = prevWrite, prevReload, prevProbe
+		siteReadVhostFn, siteDeleteVhostFn = prevRead, prevDelete
+		siteVerifyWait, siteVerifyEvery = prevWait, prevEvery
 		siteHomeProbeFn = prevHome
 	})
 }
@@ -255,5 +265,114 @@ func TestSiteInstallUnregisteredAppKeepsCatalogFallback(t *testing.T) {
 	}
 	if _, serr := os.Stat(filepath.Join(res.Dir, "index.php")); serr != nil {
 		t.Errorf("站点目录里应解压出 index.php，实际：%v", serr)
+	}
+}
+
+// ============================================================================
+//  一键建站失败后的残留清理（真机 2026-09-16 缺陷）
+//
+//  真机现象：首轮建站因为"探测太早"失败，却留下两个空数据库
+//  （wp_zpverify_*），用户重试被 `ERROR 1007 ... database exists` 永久挡住。
+//  下面两个用例锁死清理规则：**只清理本次创建且为空/无数据的产物**。
+// ============================================================================
+
+// fakeMySQLClientReportingTables 造一个假 mysql：把每次调用的参数与 stdin
+// 记进 logPath，并在查询 information_schema.TABLES 时返回 tables 行。
+//
+// 这样既不需要真实 MySQL，又能断言"有表的库到底有没有被删"。
+func fakeMySQLClientReportingTables(t *testing.T, srv *Server, logPath string, tables int) {
+	t.Helper()
+	binDir := filepath.Join(srv.Cfg.BrewPrefix, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rows := ""
+	for i := 0; i < tables; i++ {
+		rows += fmt.Sprintf("t%d\tInnoDB\t0\t0\tutf8mb4_general_ci\t\t2026-01-01 00:00:00\\n", i)
+	}
+	script := "#!/bin/sh\n" +
+		"{\n  echo \"ARGV: $@\"\n  cat\n} >> " + logPath + "\n" +
+		"case \"$*\" in\n" +
+		"  *information_schema.TABLES*) printf '" + rows + "' ;;\n" +
+		"esac\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "mysql"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stubSiteHomeProbe 把一键建站的首页探测换成假实现（不真发请求）。
+func stubSiteHomeProbe(t *testing.T) {
+	t.Helper()
+	prev := siteHomeProbeFn
+	siteHomeProbeFn = func(context.Context, string) (int, string) { return 200, "200" }
+	t.Cleanup(func() { siteHomeProbeFn = prev })
+}
+
+// TestSiteInstallCleansUpEmptyDBAndRetrySucceeds：本次创建的空库必须删掉，
+// 站点记录与 vhost 也必须回滚 —— 重试要能干净成功。
+func TestSiteInstallCleansUpEmptyDBAndRetrySucceeds(t *testing.T) {
+	srv, _ := newTestServer(t)
+	fakeMySQLClient(t, srv)
+	st := stubSiteApplyChannel(t, "404") // 首次：nginx 还没加载新配置
+	stubSiteHomeProbe(t)
+	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+
+	app := typechoAppWithDB(t)
+	domain := "cleanup.test"
+	res, err := srv.installSiteApp(context.Background(), app, domain, siteInstallReq{})
+	if err == nil {
+		t.Fatal("复核超时时一键建站必须失败（不许谎报成功）")
+	}
+	steps := strings.Join(res.Steps, "\n")
+	if !strings.Contains(steps, "已回滚站点记录") {
+		t.Errorf("失败后应回滚站点记录，实际步骤：%q", steps)
+	}
+	if !strings.Contains(steps, "已删除本次创建的空数据库") {
+		t.Errorf("失败后应删除本次创建的空数据库，否则重试被 database exists 挡住：%q", steps)
+	}
+	if !strings.Contains(steps, "保留未删") {
+		t.Errorf("解压出的源码目录不是空的 → 必须保留并提示，实际步骤：%q", steps)
+	}
+	if _, gerr := srv.siteMgr().Get(context.Background(), domain); gerr == nil {
+		t.Fatal("失败后站点记录必须被删除")
+	}
+
+	// 第二次：nginx 已经接管新配置 → 残留已清理，必须干净成功。
+	st.setCode("403")
+	res2, err2 := srv.installSiteApp(context.Background(), app, domain, siteInstallReq{})
+	if err2 != nil {
+		t.Fatalf("残留已清理，重试必须成功：%v（步骤：%s）", err2, strings.Join(res2.Steps, "\n"))
+	}
+	if _, gerr := srv.siteMgr().Get(context.Background(), domain); gerr != nil {
+		t.Fatalf("重试成功后站点记录应存在：%v", gerr)
+	}
+}
+
+// TestSiteInstallKeepsDatabaseWithTablesOnFailure：库里有表时**绝不删除**，
+// 只给出明确提示 —— 绝不能为了"重试干净"而删掉用户数据。
+func TestSiteInstallKeepsDatabaseWithTablesOnFailure(t *testing.T) {
+	srv, _ := newTestServer(t)
+	mysqlLog := filepath.Join(srv.Cfg.BrewPrefix, "mysql-calls.log")
+	fakeMySQLClientReportingTables(t, srv, mysqlLog, 1) // 这个库里有 1 张表
+	stubSiteApplyChannel(t, "404")                      // 首次：nginx 还没加载新配置
+	stubSiteHomeProbe(t)
+	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+
+	app := typechoAppWithDB(t)
+	res, err := srv.installSiteApp(context.Background(), app, "keepdb.test", siteInstallReq{})
+	if err == nil {
+		t.Fatal("复核超时时必须失败")
+	}
+	steps := strings.Join(res.Steps, "\n")
+	if !strings.Contains(steps, "保留未删") {
+		t.Errorf("有表的库必须保留并明确提示，实际步骤：%q", steps)
+	}
+	if strings.Contains(steps, "已删除本次创建的空数据库") {
+		t.Errorf("有表的库绝不能被删，实际步骤：%q", steps)
+	}
+	calls, _ := os.ReadFile(mysqlLog)
+	if strings.Contains(string(calls), "DROP DATABASE") {
+		t.Errorf("有表的库不该执行 DROP DATABASE，实际调用：\n%s", string(calls))
 	}
 }

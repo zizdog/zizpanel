@@ -154,6 +154,10 @@ func (s *Server) nginxReload(ctx context.Context) error {
 // 宁可在保存时明确失败（"PHP 8.4 没在运行"），也不要写出一份
 // 指向空气的 vhost —— 那种情况下站点是 502，用户得翻 nginx 错误日志
 // 才能知道是 PHP 版本没起来。
+//
+// 失败时**撤销本次写入的 vhost**（还原成写入前的内容，或删掉本次新建的）：
+// 只有这样，"接口返回非 2xx"才真的等于"这次没做成"，
+// 用户再点一次也不会撞上 "store 里 ssl_enabled=true、nginx 却没在服务" 的自相矛盾状态。
 func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	pass := ""
 	if site.PHPVersion != "" {
@@ -170,6 +174,7 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err != nil {
 		return err
 	}
+	snap := s.snapshotVhost(site.Domain)
 	if err := siteWriteVhostFn(s, ctx, site.Domain, content); err != nil {
 		return err
 	}
@@ -184,22 +189,27 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 		_ = chownTreeTo(s.siteLogDir(), s.Cfg.User)
 	}
 	if err := siteReloadFn(s, ctx); err != nil {
-		return fmt.Errorf("配置已写入但 nginx 重载失败: %w", err)
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+			fmt.Errorf("配置已写入但 nginx 重载失败: %w", err))
 	}
 	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败（例如日志/证书文件打不开）
 	// 时会在错误日志里写 [emerg]，而 `nginx -s reload` **退出码依然是 0**。
 	// 不复核的话，"面板说创建成功、用户打开是 404/502"就是必然结果。
 	if err := s.verifySiteServed(ctx, site); err != nil {
-		return err
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, err)
 	}
 	return nil
 }
 
-// siteWriteVhostFn / siteReloadFn / siteProbeFn 是 applySite 的三个可注入步骤。
+// siteWriteVhostFn / siteReloadFn / siteProbeFn / siteDeleteVhostFn 是
+// "写 vhost → reload → 复核"这条通道的可注入步骤。
 //
-// 为什么做成包级变量：applySite 的收尾复核必须能被单测覆盖，而单测
-// **不允许调用提权助手、不允许真发网络请求**。生产环境这三个变量指向
+// 为什么做成包级变量：这条通道的收尾复核与失败回滚必须能被单测覆盖，而单测
+// **不允许调用提权助手、不允许真发网络请求**。生产环境这些变量指向
 // 真实实现，行为与直接调用完全一致。
+//
+// siteWriteVhostFn 同时被 applyDefaultVhost 与失败回滚（还原旧内容）复用：
+// 只保留一种"把 vhost 写进 nginx 目录"的写法，避免回滚走一条没人测过的路径。
 var (
 	siteWriteVhostFn = func(s *Server, ctx context.Context, domain, content string) error {
 		return s.writeVhost(ctx, domain, content)
@@ -209,7 +219,32 @@ var (
 	}
 	// siteProbeFn 的签名与 sites_check.go 的 curlSite 一致（用 --resolve 钉到 127.0.0.1）。
 	siteProbeFn = curlSite
+	// siteDeleteVhostFn 删除一份 vhost（回滚"本次新建的"文件时用）。
+	siteDeleteVhostFn = func(s *Server, ctx context.Context, name string) error {
+		return s.deleteVhost(ctx, name)
+	}
+	// siteReadVhostFn 读取一份 vhost 的当前内容（回滚要还原它，就必须先读出来）。
+	siteReadVhostFn = func(s *Server, path string) ([]byte, error) {
+		return os.ReadFile(path)
+	}
 )
+
+// siteVerifyWait / siteVerifyEvery 控制"等新配置生效"的轮询窗口。
+//
+// 为什么必须等：`nginx -s reload` 只是给 master 发信号，新 worker 接管旧 worker
+// 之间的**旧配置仍然在应答**（真机 2026-09-16：写完立刻探测拿到 404，随后独立
+// 复测同一请求返回期望的 403 —— 配置从头到尾都是对的，只是探测太早）。
+// 所以窗口内的 404/000/"403 与期望不符" 一律视为**还没生效**，不是失败。
+//
+// 做成变量：单测必须能把它压到毫秒级（不许真睡 5 秒）。
+var (
+	siteVerifyWait  = 6 * time.Second
+	siteVerifyEvery = 200 * time.Millisecond
+)
+
+// siteProbeTimeout 是单次探针的超时。不能太长：复核要在窗口内轮询多次，
+// 单次探测挂满整个窗口就等于只测了一次。
+const siteProbeTimeout = 4 * time.Second
 
 // siteVhostProbePath 是"配置是否真的生效"的探测路径。
 //
@@ -232,35 +267,108 @@ const siteVhostProbePath = "/.zp-vhost-probe"
 //
 // 注意用 curlSite（--resolve 钉到 127.0.0.1），所以域名没有 DNS 解析也能测；
 // 也不能改成直接 fetchLocal("<域名>/")：那会走真实 DNS。
+//
+// **轮询**而不是一次性判定：`nginx -s reload` 是异步的，旧 worker 在新配置
+// 生效前仍会用旧配置应答。窗口内拿到 404/000/别的状态码只说明"还没轮到新配置"，
+// 不是失败；只有窗口耗尽仍拿不到 403 才算失败。
 func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
 	scheme, port := "http", 80
 	if site.SSLEnabled {
 		scheme, port = "https", 443
 	}
-	code, _, err := siteProbeFn(ctx, scheme, site.Domain, port, siteVhostProbePath, 8*time.Second)
-	if err == nil && code == "403" {
-		return nil
+	deadline := time.Now().Add(siteVerifyWait)
+	var (
+		lastCode string
+		lastErr  error
+		tries    int
+	)
+	for {
+		tries++
+		code, _, err := siteProbeFn(ctx, scheme, site.Domain, port, siteVhostProbePath, siteProbeTimeout)
+		lastCode, lastErr = code, err
+		if err == nil && code == "403" {
+			return nil
+		}
+		// 请求上下文结束（用户关掉页面/任务被取消）：不再等，如实上报。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			lastErr = ctxErr
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			lastErr = ctx.Err()
+		case <-time.After(siteVerifyEvery):
+			continue
+		}
+		break
 	}
+	return s.siteVerifyTimeoutError(site, scheme, port, tries, lastCode, lastErr)
+}
 
-	// 失败时给出最可能的原因，而不是一句"配置没生效"。
+// siteVerifyTimeoutError 是"等了整个窗口仍没生效"时的错误：必须能指导排查。
+//
+// 只写"复核失败"等于让用户自己猜；这里把四个检查点直接写进错误里，
+// 并把 nginx 全局 error_log 的末几行**附在消息里**（用户不必再去翻日志中心）。
+func (s *Server) siteVerifyTimeoutError(site *sites.Site, scheme string, port, tries int,
+	code string, perr error) error {
 	logDir := s.siteLogDir()
-	base := fmt.Sprintf(
-		"站点 %s 的配置已写入且 nginx 重载命令成功，但复核发现**新配置没有生效**"+
-			"（探测 %s://%s:%d%s 期望 403，实际 %s）",
-		site.Domain, scheme, site.Domain, port, siteVhostProbePath, describeProbeCode(code, err))
+	vhostPath := filepath.Join(s.Cfg.VhostDir, site.Domain+".conf")
+	pidPath := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid")
+	errLog := filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log")
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "站点 %s 的配置已写入，nginx 重载也已发出，但 %s 内新配置仍未生效"+
+		"（共探测 %d 次，最后一次 %s://%s:%d%s 期望 403，实际 %s）。"+
+		"先别急着改配置：这类情况多半是 nginx 没有真正加载新配置，而不是配置写错了。请依次检查：",
+		site.Domain, humanWait(siteVerifyWait), tries,
+		scheme, site.Domain, port, siteVhostProbePath, describeProbeCode(code, perr))
+	b.WriteString("① `nginx -t` 是否通过（面板「网站管理」页可直接校验配置）；")
+	fmt.Fprintf(&b, "② nginx 进程与权限：`ps -o user,pid,command -p $(cat %s)` 里的用户"+
+		"能不能读 %s 与日志目录 %s；", pidPath, vhostPath, logDir)
+	fmt.Fprintf(&b, "③ vhost 是否真的在 include 目录里：%s 应存在，且被 %s 的 include 覆盖；",
+		vhostPath, s.Cfg.NginxConf)
+	fmt.Fprintf(&b, "④ 全局 error_log 末几行：`tail -n 20 %s`（面板「日志中心 → nginx 主错误日志」）"+
+		"看有没有 [emerg]。", errLog)
+	if tail := s.nginxErrorLogTail(5); tail != "" {
+		b.WriteString("\n（nginx error_log 末几行）\n")
+		b.WriteString(tail)
+	}
 	switch code {
 	case "404":
-		return fmt.Errorf("%s。404 说明请求落到了默认站点：最常见的原因是 %s 里的日志文件"+
+		fmt.Fprintf(&b, "\n404 说明请求落到了默认站点：最常见的原因是 %s 里的日志文件"+
 			"归属/权限不对（nginx worker 打不开 access_log 时 reload 会失败但退出码仍是 0），"+
-			"或 vhost 文件没写进 conf.d。请到「日志中心 → nginx error_log」看 [emerg] 行",
-			base, logDir)
+			"或 vhost 文件没写进 conf.d。", logDir)
 	case "000", "":
-		return fmt.Errorf("%s。连不上 nginx：确认 nginx 正在运行、%d 端口在监听%s",
-			base, port, errSuffix(err))
+		fmt.Fprintf(&b, "\n连不上 nginx：确认 nginx 正在运行、%d 端口在监听%s。", port, errSuffix(perr))
 	default:
-		return fmt.Errorf("%s。该状态码不是站点 vhost 的隐藏文件规则给出的，"+
-			"通常意味着自定义配置（extra_conf）覆盖了 `location ~ /\\.`，请检查后重试", base)
+		b.WriteString("\n该状态码不是站点 vhost 的隐藏文件规则给出的，" +
+			"通常意味着自定义配置（extra_conf）覆盖了 `location ~ /\\.`，请检查后重试。")
 	}
+	return errors.New(b.String())
+}
+
+// humanWait 把等待窗口写成"6 秒"/"0.2 秒"，用于错误文案。
+func humanWait(d time.Duration) string {
+	if d >= time.Second && d%time.Second == 0 {
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	}
+	return fmt.Sprintf("%.1f 秒", d.Seconds())
+}
+
+// nginxErrorLogTail 读取 nginx 全局 error_log 的末几行（读不到返回空串）。
+//
+// 复核超时的错误里直接**附上**这几行：用户不必先去日志中心翻，
+// 而 [emerg] 那一行往往就是"reload 退出码是 0 但配置没加载"的全部原因。
+func (s *Server) nginxErrorLogTail(lines int) string {
+	path := filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log")
+	tail, _, err := tailFile(path, lines)
+	if err != nil || strings.TrimSpace(tail) == "" {
+		return ""
+	}
+	return tail
 }
 
 func describeProbeCode(code string, err error) string {
@@ -278,6 +386,79 @@ func errSuffix(err error) string {
 		return ""
 	}
 	return "（" + err.Error() + "）"
+}
+
+// ============================================================================
+//  vhost 写入的回滚
+//
+//  为什么需要：复核失败时如果只在数据库里回滚、不管磁盘上的 vhost，
+//  就会出现"接口说没做成、nginx 里却留着一份新配置（或旧记录配新配置）"。
+//  更糟的是重试时被上一次的残留挡住。这里保存写入前的字节，
+//  失败时原样写回；本次新建的文件则删掉。
+// ============================================================================
+
+// vhostSnapshot 是一份 vhost 文件被本次写入覆盖之前的样子。
+type vhostSnapshot struct {
+	name    string
+	existed bool   // 写入前文件是否存在（false = 回滚时应删除）
+	prev    []byte // 写入前的内容
+	unknown bool   // 读旧内容失败（不是"不存在"）：回滚不安全，宁可不做
+}
+
+// snapshotVhost 读取 vhost 的当前内容作为回滚依据。
+//
+// 三种情况必须分开，混在一起会**删掉用户的旧配置**：
+//   - 文件不存在 → 本次是新建，回滚删除；
+//   - 读到了内容 → 回滚原样写回；
+//   - 读失败（权限/IO）→ 回滚不安全，标记 unknown，回滚时如实报告而不是删文件。
+func (s *Server) snapshotVhost(name string) vhostSnapshot {
+	path := filepath.Join(s.Cfg.VhostDir, name+".conf")
+	b, err := siteReadVhostFn(s, path)
+	if err == nil {
+		return vhostSnapshot{name: name, existed: true, prev: b}
+	}
+	if os.IsNotExist(err) {
+		return vhostSnapshot{name: name}
+	}
+	return vhostSnapshot{name: name, unknown: true}
+}
+
+// rollbackVhostWrite 撤销本次对 vhost 的写入，并尽力让 nginx 与磁盘重新对齐。
+//
+// writeFn / reloadFn 由调用方给（站点侧 = siteWriteVhostFn/siteReloadFn，
+// 反代侧 = proxyWriteVhostFn/proxyReloadFn），这样回滚走的是与写入**完全相同**
+// 的那条通道，不会出现"回滚路径没人测过、真机才发现调不动"的情况。
+//
+// 回滚后再发一次 reload：复核失败只说明"没等到生效"，并不保证 nginx 当前
+// 加载的是哪一份；把文件还原后再 reload 一次，至少让"磁盘 = nginx 正在用的"
+// 重新成立。reload 失败只记日志 —— 绝不能覆盖真正的失败原因。
+func (s *Server) rollbackVhostWrite(ctx context.Context, snap vhostSnapshot,
+	writeFn func(*Server, context.Context, string, string) error,
+	reloadFn func(*Server, context.Context) error, cause error) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	path := filepath.Join(s.Cfg.VhostDir, snap.name+".conf")
+	if snap.unknown {
+		return fmt.Errorf("%w（另外：写入前读不到 %s 的旧内容，为避免删掉旧配置**未自动回滚**；"+
+			"请手工检查/还原这个文件）", cause, path)
+	}
+	var rerr error
+	if snap.existed {
+		rerr = writeFn(s, rctx, snap.name, string(snap.prev))
+	} else {
+		rerr = siteDeleteVhostFn(s, rctx, snap.name)
+	}
+	if rerr != nil {
+		return fmt.Errorf("%w（另外：撤销本次写入 %s 也失败了：%v；"+
+			"磁盘上可能仍留着这次写入的配置，请手工删除/还原后重试）", cause, path, rerr)
+	}
+	if reloadFn != nil {
+		if rerr := reloadFn(s, rctx); rerr != nil {
+			s.Log.Warn("回滚 %s 后重载 nginx 失败（磁盘已还原，nginx 可能仍在用内存里的旧配置）: %v",
+				snap.name, rerr)
+		}
+	}
+	return cause
 }
 
 // ensureSiteRoot 创建站点根目录。
@@ -511,10 +692,19 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.applySite(r.Context(), site); err != nil {
-		// 回滚：删掉刚建的记录，避免出现"数据库有、nginx 没有"的不一致状态
-		_ = mgr.Delete(r.Context(), site.Domain)
-		s.audit(r, "site_create", site.Domain, "创建失败: "+err.Error(), false, "")
-		fail(w, http.StatusInternalServerError, "创建站点失败: "+err.Error())
+		// 回滚：删掉刚建的记录，避免出现"数据库有、nginx 没有"的不一致状态。
+		// 本次写入的 vhost 已由 applySite 自己撤销（见 rollbackVhostWrite）。
+		// 回滚失败要**如实说出来**：否则用户重试会被"站点已存在"挡住却不知道为什么。
+		if derr := mgr.Delete(r.Context(), site.Domain); derr != nil {
+			msg := "创建站点失败: " + err.Error() +
+				"（另外：回滚站点记录失败：" + derr.Error() +
+				"，请到「网站管理」手动删除 " + site.Domain + " 后重试）"
+			s.audit(r, "site_create", site.Domain, msg, false, "")
+			fail(w, http.StatusInternalServerError, msg)
+			return
+		}
+		s.audit(r, "site_create", site.Domain, "创建失败（已回滚，可直接重试）: "+err.Error(), false, "")
+		fail(w, http.StatusInternalServerError, "创建站点失败: "+err.Error()+"（已回滚本次写入，可直接重试）")
 		return
 	}
 
@@ -920,6 +1110,10 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 记下写入前的站点记录：SSL 绑定失败时必须把 store 恢复原样，
+	// 否则会出现"面板说绑了、store 里 ssl_enabled=true，nginx 却没在服务"。
+	before := *site
+
 	site.SSLEnabled = true
 	site.SSLCert = certPath
 	site.SSLKey = keyPath
@@ -933,7 +1127,16 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 	// acme 来源同样走 applySite —— 因此自动获得"写 vhost → reload →
 	// 403 探针复核"这条完整链路，不会出现"面板说绑定成功、站点其实没生效"。
 	if err := s.applySite(r.Context(), site); err != nil {
-		fail(w, http.StatusInternalServerError, "证书已签发但应用配置失败: "+err.Error())
+		// applySite 已撤销本次写入的 vhost；这里把 store 里的 SSL 字段也退回去，
+		// 让"接口非 2xx = 这次没做成"在数据库、磁盘、界面三处保持一致。
+		rbMsg := ""
+		if uerr := mgr.Update(r.Context(), &before); uerr != nil {
+			rbMsg = "（另外：回滚 SSL 字段失败：" + uerr.Error() +
+				"，请到「网站管理 → " + domain + " → SSL」确认状态后重试）"
+		}
+		s.audit(r, "site_ssl", domain, "绑定失败: "+err.Error()+rbMsg, false, "")
+		fail(w, http.StatusInternalServerError,
+			"证书已签发但应用配置失败（已回滚，可直接重试）: "+err.Error()+rbMsg)
 		return
 	}
 
@@ -955,6 +1158,7 @@ func (s *Server) handleSiteSSLDisable(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, err.Error())
 		return
 	}
+	before := *site
 	site.SSLEnabled = false
 	site.SSLCert = ""
 	site.SSLKey = ""
@@ -965,7 +1169,14 @@ func (s *Server) handleSiteSSLDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.applySite(r.Context(), site); err != nil {
-		fail(w, http.StatusInternalServerError, "已关闭 SSL 但应用配置失败: "+err.Error())
+		// 同上：vhost 由 applySite 撤销，store 字段在这里退回"仍然启用 SSL"。
+		rbMsg := ""
+		if uerr := mgr.Update(r.Context(), &before); uerr != nil {
+			rbMsg = "（另外：回滚 SSL 字段失败：" + uerr.Error() + "）"
+		}
+		s.audit(r, "site_ssl_disable", domain, "关闭失败: "+err.Error()+rbMsg, false, "")
+		fail(w, http.StatusInternalServerError,
+			"关闭 SSL 应用配置失败（已回滚，SSL 仍然启用）: "+err.Error()+rbMsg)
 		return
 	}
 	s.audit(r, "site_ssl_disable", domain, "关闭 SSL", true, "")
