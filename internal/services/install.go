@@ -31,6 +31,20 @@ type InstallResult struct {
 	// 是为了让前端能把它做成可复制的独立区块，而不是埋在日志里。
 	Token   string `json:"token,omitempty"`
 	Address string `json:"address,omitempty"`
+	// Credentials 是"装完必须让用户看一眼"的凭据（例如面板刚给 MySQL 设的
+	// root 口令）。复用服务凭据弹窗的同一份结构（Credential），前端只需一套渲染。
+	//
+	// 安全约定（硬要求）：这是**唯一**允许出现口令的地方。
+	// 任务步骤、实时日志、审计里都不许出现 —— 那些地方会被长期保存/转发。
+	Credentials []Credential `json:"credentials,omitempty"`
+
+	// mysqlFreshInit 记录"这次是不是我们把 MySQL 数据目录初始化出来的"
+	// （--initialize-insecure ⇒ root 必定是空口令）。
+	//
+	// 为什么必须是本次初始化才敢改 root 口令：数据目录本来就存在的机器上，
+	// root 的口令可能正被别的程序使用，替用户改它属于破坏性操作。
+	// 不导出：这是内部判断依据，不该出现在 API 响应里。
+	mysqlFreshInit bool
 }
 
 // Install 安装一个应用市场里的应用并纳入管理。
@@ -112,6 +126,20 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		return nil, fmt.Errorf("服务已安装但写入注册表失败: %w", err)
 	}
 	res.Service = svc
+
+	// MySQL 的 root 凭据闭环（限时询问 → 随机 → 写回面板配置 → 自检）。
+	//
+	// 为什么放在**登记服务之后**：万一这一步失败，MySQL 也已经出现在
+	// 「服务管理」里，用户有地方看日志、重启、改配置 —— 否则会变成
+	// "装好了但面板里找不到"的僵尸状态（真机上踩过这个坑）。
+	// 失败时返回 res（而不是 nil）：任务结果里的"一次性凭据区块"必须能到达
+	// 用户，写配置失败时那是口令唯一的记录。
+	if isMySQLFormula(app.BrewFormula) {
+		if err := m.ensureMySQLRootCredential(ctx, res); err != nil {
+			return res, err
+		}
+	}
+
 	res.Message = fmt.Sprintf("「%s」已安装并纳入管理", app.Name)
 	if app.PostInstallHint != "" {
 		res.Message += "。" + app.PostInstallHint
@@ -184,50 +212,23 @@ var brewMirrorCandidates = []brewMirrorBase{
 	{Name: "阿里云", Base: "https://mirrors.aliyun.com/homebrew/homebrew-bottles"},
 }
 
-// brewBottleCapable 判断某家镜像是否提供 OCI 瓶路径（<base>/v2/…）。
-//
-// 只有这类镜像才适合设 HOMEBREW_BOTTLE_DOMAIN：Homebrew 是把清单里的
-// ghcr.io 域**替换**成这个域去取瓶文件的（官方文档称之为"legacy flat-file mirror"
-// 之外的用法，见 bottle.rb 的 custom_bottle_domain 分支）。
-// 不提供 /v2/ 的镜像（如阿里云）设了也取不到，只会让 brew 白试一次再回落 ——
-// 所以宁可退回一家 API 可用但没有 /v2/ 的，也不要让用户等那次超时。
-func brewMirrorSupportsOCI(ctx context.Context, base string) bool {
-	// 用一个稳定的公开瓶做 HEAD：nginx 在各家都有 arm64_sequoia 瓶。
-	const probe = "/v2/homebrew/core/nginx/blobs/sha256:972063bdf74564fc0e5f3a0e8b0f5b6b5e0a5f2b7f0f2c4a5b6c7d8e9f0a1b2c"
-	pctx, cancel := context.WithTimeout(ctx, brewMirrorProbeTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(pctx, http.MethodHead, strings.TrimRight(base, "/")+probe, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<12))
-	// 404 = 这家没有 OCI 布局；401/403 也可能出现在不支持时，一并当作不可用。
-	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent
-}
-
 // brewMirrorProbeTimeout 是探测单个镜像的超时。
 //
 // 短是刻意的：探测只是"换条路"的准备工作，不该让用户为它等太久；
-// 局域网/国内镜像正常在 1 秒内应答。
+// 国内镜像正常在 1 秒内应答。
 const brewMirrorProbeTimeout = 4 * time.Second
 
 // brewMirrorWorks 判断某个镜像的 API 是否能在 4 秒内给出指定 formula 的清单。
 //
-// 只做一次 HEAD/GET：能拿到 200 就认为这家可用。真正的 sha256 是否最新
-// 由 brew 自己判断（取不到时它仍会回落公网），这里只负责"别选一家完全不可达的"。
+// 只确认"这家能给出清单"；真正的瓶是否可下由 brewMirrorSupportsOCI 判断。
 func brewMirrorWorks(ctx context.Context, base, formula string) bool {
 	if base == "" || formula == "" {
 		return false
 	}
 	pctx, cancel := context.WithTimeout(ctx, brewMirrorProbeTimeout)
 	defer cancel()
-	url := strings.TrimRight(base, "/") + "/api/formula/" + formula + ".json"
-	req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet,
+		strings.TrimRight(base, "/")+"/api/formula/"+formula+".json", nil)
 	if err != nil {
 		return false
 	}
@@ -238,6 +239,92 @@ func brewMirrorWorks(ctx context.Context, base, formula string) bool {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	return resp.StatusCode == http.StatusOK
+}
+
+// bottleTags 是本机可能用到的 Homebrew 瓶 tag，按新到旧排列。
+//
+// 探测时必须拿它去清单里找**真实存在**的瓶 —— 不能硬编码 sha256：
+// 之前那个常量是我编的，HEAD 永远 404，导致 NAS/镜像分支永不成立、
+// 静默回落 ghcr.io（用户"装了 21 分钟"的真因，2026-09-16 NAS 侧实测确认）。
+var bottleTags = []string{"arm64_sequoia", "arm64_tahoe", "arm64_sonoma", "arm64_ventura"}
+
+// brewMirrorSupportsOCI 判断某家镜像**真的能取到瓶文件**。
+//
+// 刻意贴近 Homebrew 自身行为，而不是拍一个固定 URL：
+//  1. GET <base>/api/formula/<formula>.json，按本机 tag 取真实 version 与 sha256；
+//  2. 依次试 brew 实际会用的两种瓶路径：
+//     legacy 平铺 <base>/<formula>-<version>.<tag>.bottle.tar.gz
+//     （自定义 HOMEBREW_BOTTLE_DOMAIN 时 Homebrew 7 走的就是这条）
+//     OCI 布局 <base>/v2/homebrew/core/<formula>/blobs/sha256:<hex>
+//  3. 任一返回 200/206 即认为可用。
+//
+// 这样镜像内容一变（升级、清老瓶）探测不会失效，也不需要维护常量。
+func brewMirrorSupportsOCI(ctx context.Context, base string) bool {
+	return brewMirrorSupportsOCIFor(ctx, base, "nginx")
+}
+
+func brewMirrorSupportsOCIFor(ctx context.Context, base, formula string) bool {
+	if base == "" || formula == "" {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, brewMirrorProbeTimeout)
+	defer cancel()
+	base = strings.TrimRight(base, "/")
+
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, base+"/api/formula/"+formula+".json", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var man struct {
+		Versions struct {
+			Stable string `json:"stable"`
+		} `json:"versions"`
+		Bottle struct {
+			Stable struct {
+				Files map[string]struct {
+					SHA256 string `json:"sha256"`
+				} `json:"files"`
+			} `json:"stable"`
+		} `json:"bottle"`
+	}
+	if json.Unmarshal(body, &man) != nil || man.Versions.Stable == "" {
+		return false
+	}
+	for _, tag := range bottleTags {
+		f, ok := man.Bottle.Stable.Files[tag]
+		if !ok || f.SHA256 == "" {
+			continue
+		}
+		cands := []string{
+			base + "/" + formula + "-" + man.Versions.Stable + "." + tag + ".bottle.tar.gz",
+			base + "/v2/homebrew/core/" + formula + "/blobs/sha256:" + f.SHA256,
+		}
+		for _, u := range cands {
+			hreq, herr := http.NewRequestWithContext(pctx, http.MethodHead, u, nil)
+			if herr != nil {
+				continue
+			}
+			hresp, herr := http.DefaultClient.Do(hreq)
+			if herr != nil {
+				continue
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(hresp.Body, 1<<12))
+			_ = hresp.Body.Close()
+			if hresp.StatusCode == http.StatusOK || hresp.StatusCode == http.StatusPartialContent {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // brewBottleDomain 选一个**真的能取到瓶文件**的镜像域做 HOMEBREW_BOTTLE_DOMAIN。
@@ -267,11 +354,26 @@ func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (ap
 	if m.mirrorProbeOverride != nil {
 		return m.mirrorProbeOverride(ctx, probeFormula)
 	}
+	// 一次会话只探一次：探测是"选条路"，不该在每次 brew 调用上都重做一遍。
+	// key 用 probeFormula（不同包的清单可用性可能不同，但同一轮安装里
+	// 主要就是那几个包，命中率很高）。
+	if m.mirrorProbeCache != nil {
+		if v, ok := m.mirrorProbeCache[probeFormula]; ok {
+			parts := strings.SplitN(v, "\x00", 2)
+			if len(parts) == 2 {
+				return parts[0], parts[1]
+			}
+		}
+	}
 	// 自建镜像优先：布局是 <mirror>/brew（api 在 <mirror>/brew/api，瓶在 <mirror>/brew/v2/…），
 	// 由 NAS 那一侧负责同步上游瓶文件。
 	if base := strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/"); base != "" {
 		nasBase := base + "/brew"
 		if brewMirrorSupportsOCI(ctx, nasBase) {
+			if m.mirrorProbeCache == nil {
+				m.mirrorProbeCache = map[string]string{}
+			}
+			m.mirrorProbeCache[probeFormula] = nasBase + "/api" + "\x00" + nasBase
 			return nasBase + "/api", nasBase
 		}
 	}
@@ -282,7 +384,22 @@ func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (ap
 			break
 		}
 	}
-	return chosen.Base + "/api", brewBottleDomain(ctx)
+	api, bottle := chosen.Base+"/api", brewBottleDomain(ctx)
+	if m.mirrorProbeCache == nil {
+		m.mirrorProbeCache = map[string]string{}
+	}
+	m.mirrorProbeCache[probeFormula] = api + "\x00" + bottle
+	return api, bottle
+}
+
+// BrewCapture 以真实用户身份跑一条只读 brew 命令并把输出原样返回。
+//
+// 为什么需要导出：面板要**直接渲染 brew 的真实状态**（`brew services list`、
+// `brew outdated`…），而不是继续维护自己那张会漂移的服务表 ——
+// "日志说装了、市场看不到、服务管理也没有"就是两套真相来源造成的。
+// 只读命令，不做任何写操作；写操作仍走各自的安装/卸载流程。
+func (m *Manager) BrewCapture(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	return m.brewRun(ctx, timeout, args...)
 }
 
 // brewEnv 返回跑 brew 时要注入的环境变量。
@@ -336,12 +453,33 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 
 	// 2) 交给 brew services 托管（它会写 LaunchAgent 并启动）
 	//    先停再起，避免"已运行但不在 brew 管理下"的状态导致 start 报错
+	//
+	// 2a) MySQL 特有：数据目录为空时先初始化。
+	//     不做这一步的话，brew services start 出来的 mysqld 会因为数据目录为空
+	//     直接退出（tools/system-services.sh 里 prepare_mysql 就是干这个的）。
+	//     initMySQLDataDir 自身幂等：数据目录非空就直接返回。
+	if isMySQLFormula(app.BrewFormula) {
+		if err := m.initMySQLDataDir(ctx, res); err != nil {
+			return err
+		}
+	}
 	res.step(ctx, "注册为后台服务并启动")
 	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", app.BrewFormula); err != nil {
 		// 部分 formula 不支持 services（没有 service 定义），这时给出提示但不当作致命错误
 		res.Warning = fmt.Sprintf("已安装，但 brew services 启动失败：%v。"+
 			"可以手工前台运行，或在面板里补充启动方式", err)
 	}
+
+	// 2b) PHP-FPM 特有：装完立刻把它配置成**只监听自己专属的端点**，然后重启生效。
+	//
+	// 这一步与一键 LNMP 共用同一份实现（php_endpoint.go 的 ensurePHPListenEndpoint），
+	// 因为"两条安装路径各自实现一遍"正是本项目踩过的坑：通用路径改了 www.conf，
+	// 一键 LNMP 却还在让 fpm 听 9000，用户随后装第二个版本就互相抢端口。
+	// 失败**如实报**（进 Warning + Steps），不谎报成功。
+	// 端点没配好**不该**让"应用已装上"这件事变成失败：包已经装好，用户可以在
+	// 「🐘 PHP 环境」里重试，Warning 里已经写清了怎么补；流程必须继续往下走
+	// （登记服务），否则用户连重启它的入口都找不到。
+	_ = m.ensurePHPListenEndpoint(ctx, app.BrewFormula, res)
 
 	// 3) 读取真实的 launchd label 与日志路径
 	label, plist, logPath := m.brewServiceInfo(ctx, app.BrewFormula)
@@ -426,10 +564,15 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("创建目录失败: %w", err)
 	}
-	// compose 项目目录归属真实用户，方便用户自己维护
+	// compose 项目目录归属真实用户，方便用户自己维护。
+	// **必须递归**（D29）：非 root 的容器（n8n 用 uid 1000 挂 ./data）要在
+	// 项目目录下建目录、写文件，只 chown 顶层会让它的数据目录变成 root 属主，
+	// 容器直接写不进去。顶层仍单独 chown 一次，保证 chownTree 遇到异常条目时
+	// 顶层归属不会漏。
 	if m.opt.UserName != "" {
 		if uid, gid, err := lookupUser(m.opt.UserName); err == nil {
 			_ = os.Chown(dir, uid, gid)
+			_ = chownTree(m.opt.UserName, dir)
 		}
 	}
 
@@ -443,11 +586,46 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 	}
 	res.step(ctx, "已生成 "+composeFile)
 
+	// 让用户看得见"数据落在哪、镜像走哪条路"（D13 的教训就是面板说一个路径、
+	// 数据却在另一个路径；D18 是"装了但不知道走的哪个源"）。
+	res.step(ctx, "数据目录："+m.ColimaDataPathHint(app.ID))
+	res.step(ctx, m.DockerMirrorRuntimeNote(ctx))
+	if warn := m.colimaWorkDirMountWarning(); warn != "" {
+		res.step(ctx, "⚠️ "+warn)
+	}
+	// 新机器上守护进程**一个加速源都没有**（registry-mirrors 过去只在用户点
+	// "保存"时才写），而 registry-1.docker.io 在国内直连超时 —— 这时拉取必然
+	// 失败。所以在真正拉取之前先自动配上；只在"一个源都没有"时才动运行时，
+	// 免得每次装应用都重启一遍容器。
+	if len(m.effectiveMirrors(ctx)) == 0 && m.ColimaInstalled() {
+		res.step(ctx, "检测到 Docker 守护进程还没有加速源（新机器的默认状态），正在自动配置…")
+		if len(m.EnsureDockerMirrorsForRuntime(ctx, res)) > 0 {
+			res.step(ctx, "正在重启 Docker 运行时让加速源生效（会短暂中断已有容器，约 30-60 秒）…")
+			if _, err := m.runColima(ctx, colimaStartTimeout, "restart"); err != nil {
+				res.step(ctx, "⚠️ 重启运行时失败："+firstMeaningfulLine(err.Error())+
+					"；仍会继续拉取，但可能超时")
+			} else {
+				res.step(ctx, m.DockerMirrorRuntimeNote(ctx))
+			}
+		}
+	}
+	if imgs := composeImagesOf(app.ComposeYAML); len(imgs) > 0 {
+		res.step(ctx, "镜像来源逐条核对（加速源只覆盖 Docker Hub；非 Hub 镜像由守护进程直连该 registry）：")
+		for _, ln := range m.ProbeComposeImageSources(ctx, imgs) {
+			res.step(ctx, ln)
+		}
+	}
+
 	// 启动（首次会拉镜像，给足超时）
 	res.step(ctx, "正在拉取镜像并启动容器（首次可能需要几分钟）")
 	drv := newComposeDriver(m.opt, &Service{ComposeFile: composeFile, Name: app.ID})
 	if _, err := drv.run(ctx, 20*time.Minute, "up", "-d"); err != nil {
 		return err
+	}
+	// 容器启动时 docker 会在项目目录下创建 ./data 这类目录（root 属主），
+	// 再递归改一次归属，让 uid 1000 的容器真能写进去（D29）。
+	if m.opt.UserName != "" {
+		_ = chownTree(m.opt.UserName, dir)
 	}
 	res.step(ctx, "容器已启动")
 	res.Service = &Service{ComposeFile: composeFile}
@@ -720,6 +898,19 @@ func catalogEntryForLabel(label string) (App, bool) {
 			return a, true
 		}
 	}
+	// 兜底：按 brew formula 后缀反查。
+	//
+	// 目录条目只能写**一种** ServiceLabel，但磁盘上同一台机器会混用两套 Homebrew
+	// 前缀（`sh.brew.php@8.3` 与 `homebrew.mxcl.nginx` 并存），系统级改造还可能
+	// 换成自研前缀（本机 nginx 的 LaunchDaemon 就是 `cn.zizdog.nginx`）。
+	// 只认精确匹配的后果：按真实标签登记/纳管回来的记录丢掉端口、分类与健康地址，
+	// 界面显示"未配置"—— 这就是历史上反复出现的那类问题。
+	// 后缀匹配是安全的：`sh.brew.php@8.3` 只会命中 BrewFormula=php@8.3 的那条。
+	for _, a := range Catalog() {
+		if a.BrewFormula != "" && strings.HasSuffix(label, "."+a.BrewFormula) {
+			return a, true
+		}
+	}
 	return App{}, false
 }
 
@@ -886,4 +1077,32 @@ func (m *Manager) ReconcileHealthURLs(ctx context.Context) (int, error) {
 		changed++
 	}
 	return changed, nil
+}
+
+// phpVersionFromFormula 从 brew formula 名里取出 PHP 版本号。
+//
+// "php@8.4" → ("8.4", true)；"php"（无版本后缀，Homebrew 的默认别名）与其它
+// formula → ("", false)。刻意不认 "php"：它的实际版本随 Homebrew 漂移，
+// 面板不该替用户猜一个版本号去改 www.conf。
+func phpVersionFromFormula(formula string) (string, bool) {
+	const p = "php@"
+	if !strings.HasPrefix(formula, p) {
+		return "", false
+	}
+	v := strings.TrimSpace(strings.TrimPrefix(formula, p))
+	if v == "" {
+		return "", false
+	}
+	return v, true
+}
+
+// appendWarning 把一条告警追加进已有的 Warning（多条用换行分隔）。
+//
+// 为什么需要：result.Warning 是单字符串字段，多步都可能写它；直接赋值会让
+// 前一条被后一条悄悄覆盖（本项目历史上就有"登记失败被后续告警吞掉"的坑）。
+func appendWarning(cur, add string) string {
+	if strings.TrimSpace(cur) == "" {
+		return add
+	}
+	return cur + "\n" + add
 }

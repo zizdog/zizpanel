@@ -20,7 +20,7 @@ const TEST_SITE = process.env.ZP_TEST_SITE || 'zptest-demo.test';
 //   make uitest-live 要登录**真实**面板，必须由 Makefile 通过 ZP_PASS 传入真实口令
 //   （真实口令存在被 gitignore 的 .panel-credential.local 里）。
 // 之前这里硬编码着真实口令，等于把生产口令提交进版本库，已改掉。
-const PASSWORD = process.env.ZP_PASS || 'PanelTestPw-9x!';
+const PASSWORD = process.env.ZP_PASS || 'zizpanel-test-fixture-pass';
 const outDir = process.argv[3] || '/tmp/zp-shots';
 mkdirSync(outDir, { recursive: true });
 
@@ -443,11 +443,20 @@ try {
   });
 
   await step('查看服务日志（SSE 实时流）', async () => {
-    const logBtn = page.locator('.content button:has-text("日志")').first();
-    if (!(await logBtn.count())) {
+    // 2026-09-16：「日志」按钮从服务卡片搬进了「应用管理」面板（市场卡片与服务管理
+    // 点开的是同一个面板；市场上的两个入口「详情」「查看服务」已合并成「⚙️ 管理」）。
+    // 所以先开面板再点日志 —— 这里必须跟着走，
+    // 否则这一步会因为找不到按钮而**静默跳过**，SSE 那条防线就名存实亡了。
+    const detailBtn = page.locator('.content button:has-text("⚙️ 管理")').first();
+    if (!(await detailBtn.count())) {
       // 没有服务卡片时跳过
       return;
     }
+    await detailBtn.click();
+    await page.waitForSelector('.modal', { timeout: 8000 });
+    await page.waitForTimeout(600);
+    const logBtn = page.locator('.modal button:has-text("日志")').first();
+    if (!(await logBtn.count())) throw new Error('应用管理面板里没有「日志」按钮');
     // 有些服务本来就没有可跟踪的日志文件（例如 brew 的 mysql8.4 把日志写在别处），
     // 此时后端对日志流返回 400，浏览器会如实记一条控制台错误 —— 这是**预期内**的。
     // 要断言的是界面没有因此撒谎：不能一边被服务端拒绝、一边说"正在重连…"
@@ -470,6 +479,9 @@ try {
       if (pill.includes('重连') && body.includes('无法建立')) {
         throw new Error('服务端已拒绝连接，界面却说正在重连（浏览器不会重连）');
       }
+      // 先关日志弹窗，再关它下面那层「应用管理」面板（Esc 一次只关最上面一层）。
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(400);
       await page.keyboard.press('Escape');
       await page.waitForTimeout(500);
     } finally {
@@ -478,7 +490,7 @@ try {
   });
 
   await step('服务详情显示完整信息', async () => {
-    const detailBtn = page.locator('.content button:has-text("详情")').first();
+    const detailBtn = page.locator('.content button:has-text("⚙️ 管理")').first();
     if (!(await detailBtn.count())) return;
     await detailBtn.click();
     await page.waitForSelector('.modal .kv', { timeout: 8000 });
@@ -486,6 +498,9 @@ try {
     await shot('32-service-detail');
     const body = await page.locator('.modal-body').innerText();
     if (!body.includes('运行状态')) throw new Error('详情缺少运行状态');
+    // 管理面板就是市场卡片点开的同一个面板（servicePanel.openServicePanel）：
+    // 这里顺带断言它的"操作"区有启停按钮，防止"面板退化成只读信息页"。
+    if (!/启动|停止/.test(body)) throw new Error('管理面板里没有启停按钮');
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
   });

@@ -43,26 +43,41 @@ type DockerMirror struct {
 	Name string `json:"name"`
 	// Note 是实测结论/注意事项（内置列表里逐条写清楚，别让用户猜）
 	Note string `json:"note,omitempty"`
+	// Rank 是**实测能力等级**，越小越优先；它是自动配置时的排序主键，
+	// 延迟只是次键。为什么不能只看延迟：延迟只反映 `/v2/` 应答快慢，
+	// **完全不能说明它能不能把层数据拉下来**（2026-09-16 实测）：
+	//
+	//	0 = 清单 + 层数据都能拉（含社区镜像）→ 可以放在第一位
+	//	1 = 只服务白名单/官方镜像：社区镜像会 403，dockerd 会换下一个源
+	//	2 = **不能写进自动配置**：清单能取，但层数据要么 404 要么直接挂住。
+	//	    关键原因：docker **只对 manifest 做多源回落**，层数据一旦选定
+	//	    这个源就只会失败/卡死，不会自动换源 —— 把它写进去等于给每次
+	//	    拉取埋一个坑。
+	Rank int `json:"rank,omitempty"`
 }
+
+// DockerMirrorRankUnusable 是"实测不能进自动配置"的 Rank。
+const DockerMirrorRankUnusable = 2
 
 // BuiltinDockerMirrors 是内置候选。
 //
-// 顺序 = 界面顺序；注释里的结论来自 2026-09-14 在**本机与 mini 两台**
-// 同时实测（curl `<url>/v2/`）：两台机器的结果一致。
+// 顺序 = 界面顺序，也是**自动配置时的优先顺序**（Rank 相同时再按延迟排）。
+// 注释里的结论来自 2026-09-16 两台机器的实测（curl `<url>/v2/` +
+// 从 Colima 虚拟机里真拉镜像）；**每条都标了 Rank，改之前请先复测**。
 var BuiltinDockerMirrors = []DockerMirror{
-	{URL: "https://docker.m.daocloud.io", Name: "DaoCloud", Note: "两台机器实测 401/约 130ms —— 当前最快"},
-	{URL: "https://docker.1ms.run", Name: "1ms.run", Note: "两台机器实测 401/约 200ms"},
-	{URL: "https://docker.1panel.live", Name: "1Panel", Note: "两台机器实测 200/约 0.8-1.1s"},
-	{URL: "https://docker.aityp.com", Name: "aityp", Note: "实测 401，但延迟波动大（0.25-2s）"},
-	{URL: "https://dockerproxy.net", Name: "dockerproxy.net", Note: "实测 200，延迟约 0.9-1.7s"},
-	{URL: "https://hub.rat.dev", Name: "rat.dev", Note: "实测 302 跳转，能不能拉取决于跳转目标"},
-	{URL: "https://docker.nju.edu.cn", Name: "南京大学", Note: "实测 403（限制来源），校园网外基本不可用"},
-	{URL: "https://docker.mirrors.ustc.edu.cn", Name: "中科大", Note: "实测超时（该站已停止对外服务）"},
-	{URL: "https://hub-mirror.c.163.com", Name: "网易 163", Note: "实测超时（已停止服务）"},
-	{URL: "https://mirror.baidubce.com", Name: "百度云", Note: "实测超时（已停止服务）"},
-	{URL: "https://docker.kubesre.xyz", Name: "kubesre", Note: "实测超时"},
-	{URL: "https://dockerpull.org", Name: "dockerpull.org", Note: "实测超时"},
-	{URL: "https://registry.dockermirror.com", Name: "dockermirror", Note: "实测 525（TLS 握手失败）"},
+	{URL: "https://dockerproxy.net", Name: "dockerproxy.net", Rank: 0, Note: "实测可用作镜像：社区镜像也整层拉得下来（pjmeca/squoosh:1.1.0 40 秒），uptime-kuma 145.8MiB 50 秒 —— 当前唯一验证过「零鉴权 + 层数据可下」的源"},
+	{URL: "https://docker.m.daocloud.io", Name: "DaoCloud", Rank: 1, Note: "两台机器实测 401/约 130ms、官方镜像很快（alpine 10 秒）；但**按白名单拒绝部分社区镜像**（实测 pjmeca/squoosh 返回 403 DENIED），此时 docker 会换下一个源"},
+	{URL: "https://docker.1panel.live", Name: "1Panel", Rank: DockerMirrorRankUnusable, Note: "实测 200/约 0.8-2.4s，但**docker 客户端会挂住**（清单之后层数据 300 秒 0 进度）—— 不进自动配置，仅作手工备用"},
+	{URL: "https://docker.1ms.run", Name: "1ms.run", Rank: DockerMirrorRankUnusable, Note: "实测 401/约 200ms 能取清单，但**层数据取不到**（registry 侧一律 BLOB_UNKNOWN/404）—— 不进自动配置"},
+	{URL: "https://docker.aityp.com", Name: "aityp", Rank: 1, Note: "实测 401，但延迟波动大（0.25-2s）"},
+	{URL: "https://hub.rat.dev", Name: "rat.dev", Rank: 1, Note: "实测 302 跳转，能不能拉取决于跳转目标"},
+	{URL: "https://docker.nju.edu.cn", Name: "南京大学", Rank: 1, Note: "实测 403（限制来源），校园网外基本不可用"},
+	{URL: "https://docker.mirrors.ustc.edu.cn", Name: "中科大", Rank: 1, Note: "实测超时（该站已停止对外服务）"},
+	{URL: "https://hub-mirror.c.163.com", Name: "网易 163", Rank: 1, Note: "实测超时（已停止服务）"},
+	{URL: "https://mirror.baidubce.com", Name: "百度云", Rank: 1, Note: "实测超时（已停止服务）"},
+	{URL: "https://docker.kubesre.xyz", Name: "kubesre", Rank: 1, Note: "实测超时"},
+	{URL: "https://dockerpull.org", Name: "dockerpull.org", Rank: 1, Note: "实测超时"},
+	{URL: "https://registry.dockermirror.com", Name: "dockermirror", Rank: 1, Note: "实测 525（TLS 握手失败）"},
 }
 
 // DockerMirrorProbe 是一条探测结果。
@@ -418,6 +433,12 @@ func (m *Manager) SetDockerMirrors(ctx context.Context, mirrors []string) error 
 		if a.OK != b.OK {
 			return a.OK // 可用的排前面
 		}
+		// 主键是实测能力等级（见 DockerMirror.Rank）：延迟只说明 /v2/ 应答快，
+		// 不代表层数据拉得下来。用户手填的地址按 Rank 1 参与排序。
+		ra, rb := DockerMirrorRank(clean[i]), DockerMirrorRank(clean[j])
+		if ra != rb {
+			return ra < rb
+		}
 		if a.LatencyMs != b.LatencyMs {
 			return a.LatencyMs < b.LatencyMs
 		}
@@ -439,7 +460,19 @@ func (m *Manager) SetDockerMirrors(ctx context.Context, mirrors []string) error 
 		}
 		emit(ctx, tasks.LevelStep, "已备份原配置到 "+backup)
 	}
-	updated := upsertColimaMirrors(string(b), clean)
+	// 用 setColimaDockerOption 而不是 upsertColimaMirrors：后者会把整个
+	// `docker:` 段重写成只剩 registry-mirrors，把用户自己配的
+	// insecure-registries / features 无声抹掉（见 docker_mirror_nas.go 的说明）。
+	updated := setColimaDockerOption(string(b), configuredMirrorsKey, clean)
+	var insecure []string
+	for _, mir := range clean {
+		if h := insecureRegistryHostFor(mir); h != "" {
+			insecure = append(insecure, h)
+		}
+	}
+	if len(insecure) > 0 {
+		updated = setColimaDockerOption(updated, "insecure-registries", insecure)
+	}
 	if err := os.WriteFile(cfgPath, []byte(updated), 0o644); err != nil {
 		return fmt.Errorf("写入 %s 失败：%w", cfgPath, err)
 	}

@@ -152,6 +152,17 @@ type AppUI struct {
 	// SelfConf 表示**安装器自己已经写了 nginx location**（如 phpMyAdmin 的 alias），
 	// 面板不要再生成代理，只提供「打开」入口。
 	SelfConf bool `json:"self_conf,omitempty"`
+	// ConsoleOnly 表示这个网页界面是**应用自带的控制台**（frpc 的 admin UI 这类），
+	// 不是本面板提供的"使用入口"。
+	//
+	// 用户明确要求（2026-09-16）：不要在设计里让用户跳到 frpc:7400 / Orbien:8020
+	// 这种自带控制台网页去管理 —— 那是应用自己的东西，不是面板的职责。
+	// 这类应用在「应用市场」与「服务管理」里只给两个动作：
+	// 「📝 编辑配置文件」+「🔄 重启服务」，用户完全不必 SSH、也不必开外部网页。
+	//
+	// 别和 PreferDirect 混了：n8n / Gitea / Stirling 是**应用本体**，用户就是要
+	// 打开它，只是子路径挂不上、得走端口直连 —— 那些仍然保留「打开」。
+	ConsoleOnly bool `json:"console_only,omitempty"`
 	// Headers 是反代时要附加（或覆盖）的响应头。
 	//
 	// 为什么需要：有些前端不是"路径不对"，而是**缺安全头就跑不起来** ——
@@ -265,7 +276,12 @@ func Catalog() []App {
 				"Apple Silicon MPS 加速，模型约 200MB。可切换更强模型，" +
 				"但 MAT / ZITS / LDM 在 M 系列上不支持 MPS。",
 			Category: "tool", Kind: KindNative, PanelInstaller: "iopaint", ServiceLabel: "com.zizdog.iopaint",
-			Port:    8080,
+			Port: 8080,
+			// IOPaint 的**视频**去水印路径要 ffmpeg 拆帧/合帧（市场描述里的"支持视频"
+			// 就是它）；图片路径不需要。面板不直接调用 ffmpeg，所以这里只作提示 +
+			// 部署时一并装好 —— 装上不会有副作用（它本来就是基础环境）。
+			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
+				Hint: "brew install ffmpeg（IOPaint 的视频处理需要它，安装时会一并安装）"}},
 			DocsURL: "https://github.com/Sanster/IOPaint",
 		},
 		{
@@ -278,7 +294,13 @@ func Catalog() []App {
 			Category: "ai", Kind: KindNative, PanelInstaller: "qwen3tts", ServiceLabel: "com.zizdog.qwen3tts",
 			Port:       8880,
 			HealthPath: audioHealth,
-			DocsURL:    "https://github.com/Blaizzy/mlx-audio",
+			// ffmpeg 是它的**硬依赖**：mlx_audio 编码 mp3 必须靠它，缺了就会返回
+			// HTTP 200 + 0 字节 body（2026-09-16 事故的确切成因）。用目录既有的
+			// Requires 机制声明 —— 安装前检查会提示，部署时由
+			// EnsureBaseDependencies 一并装好，不需要前端配合新字段。
+			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
+				Hint: "brew install ffmpeg（TTS 编码 mp3 必需，部署时会一并安装）"}},
+			DocsURL: "https://github.com/Blaizzy/mlx-audio",
 		},
 		{
 			ID: "voicereceiver", Name: "TtsVoice 音色接收端", Icon: "🔐",
@@ -293,6 +315,11 @@ func Catalog() []App {
 			// 服务列表里它的 health 永远是 checked=false/ok=false，
 			// 用户看到的就是"TTS 没在管理/不知道死活"（2026-09-16 用户反馈）。
 			HealthPath: "/health",
+			// 接收端自己就用 ffmpeg / ffprobe（样本真解码校验 + 转码与归一），
+			// 同时它是上游 Qwen 编码 mp3 的必经环节。用目录既有的 Requires 声明，
+			// 安装前检查会提示，部署时由 EnsureBaseDependencies 一并装好。
+			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
+				Hint: "brew install ffmpeg（样本校验与音频转码必需，部署时会一并安装）"}},
 			// 契约来源是网站侧插件目录里的 HANDOFF-TO-MINI.md。
 			// 这里原先错填成 phpmyadmin.net（复制粘贴残留），会把人引到无关文档。
 			DocsURL: "https://github.com/Blaizzy/mlx-audio",
@@ -337,15 +364,60 @@ func Catalog() []App {
 		{
 			ID: "php83", Name: "PHP 8.3 (FPM)", Icon: "🐘",
 			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
-			Description: "以 FastCGI 方式监听 127.0.0.1:9000，由 nginx 转发 PHP 请求。" +
+			Description: "以 FastCGI 方式监听 自己专属的 Unix socket 端点，由 nginx 转发 PHP 请求。" +
 				"面板的站点配置默认指向这个地址；多版本 PHP 可以再装其它版本共存。",
 			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.3",
-			Port: 9000,
+			Port: 0,
 			// PHP-FPM 说的是 FastCGI 协议，不是 HTTP —— 不能做 HTTP 健康检查，
 			// 否则会永远显示不健康。留空表示"只按进程与端口判断"。
 			HealthPath:  "",
 			BrewFormula: "php@8.3",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.3.log",
+			DocsURL:     "https://www.php.net",
+		},
+		{
+			ID: "php81", Name: "PHP 8.1 (FPM)", Icon: "🐘",
+			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
+			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
+				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.1.sock），" +
+				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
+				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
+			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.1",
+			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
+			Port:        0,
+			HealthPath:  "",
+			BrewFormula: "php@8.1",
+			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.1.log",
+			DocsURL:     "https://www.php.net",
+		},
+		{
+			ID: "php82", Name: "PHP 8.2 (FPM)", Icon: "🐘",
+			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
+			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
+				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.2.sock），" +
+				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
+				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
+			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.2",
+			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
+			Port:        0,
+			HealthPath:  "",
+			BrewFormula: "php@8.2",
+			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.2.log",
+			DocsURL:     "https://www.php.net",
+		},
+		{
+			ID: "php84", Name: "PHP 8.4 (FPM)", Icon: "🐘",
+			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
+			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
+				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.4.sock），" +
+				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
+				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
+			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.4",
+			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
+			Port:        0,
+			HealthPath:  "",
+			BrewFormula: "php@8.4",
+			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.4.log",
 			DocsURL:     "https://www.php.net",
 		},
 		{
@@ -358,6 +430,43 @@ func Catalog() []App {
 			BrewFormula: "mysql@8.4",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.mysql@8.4.log",
 			DocsURL:     "https://dev.mysql.com",
+		},
+
+		// ---------------- 基础环境（原生安装，命令行工具） ----------------
+		//
+		// ffmpeg 是"基础环境"，不属于任何单个应用，但很多功能都靠它：
+		//   · Qwen3 TTS 用 mlx_audio 编码 mp3 **必须**有它；
+		//   · 音色接收端用 ffprobe 真解码校验上传样本、用 ffmpeg 转码与归一；
+		//   · IOPaint 的视频处理、后续的音视频功能也要用。
+		//
+		// 为什么值得单独一个条目（用户明确要求"有单独安装入口，作为一个独立软件"）：
+		// 2026-09-16 真机事故就是它被弄丢（头号嫌疑是卸载流程里的 brew autoremove
+		// 把共享依赖一起带走）。服务照样启动、健康检查全绿，只有合成 mp3 时返回
+		// HTTP 200 + 0 字节 body —— 用户所有 TTS 作业全败却看不出问题在哪。
+		// 有独立条目，用户才能主动查、主动装、主动补。
+		//
+		// 它是纯命令行工具：UI 必须留空（给了 UI 市场就会渲染一个点开必然打不开的
+		// 「打开」按钮），也不该有常驻进程与端口。
+		// PanelInstaller 指向面板自己的安装器（handleMarketInstall 按 ID 分流）：
+		// 走它而不是通用 brew 流程，是因为 ffmpeg **没有 brew service** ——
+		// 通用流程会去 `brew services start ffmpeg`，得到一个"启动了但启动失败"的
+		// 假警告，还会在服务管理里留下一条永远没有状态的假记录。
+		{
+			ID: "ffmpeg", Name: "FFmpeg（音视频工具）", Icon: "🎬",
+			Summary: "音视频转码基础工具（TTS 编码 mp3 依赖它）",
+			Description: "面板的基础环境之一：Qwen TTS 用 mlx_audio 编码 mp3 必须靠它，" +
+				"音色接收端用 ffprobe 校验上传的音色样本、用 ffmpeg 做转码与响度归一，" +
+				"后续的音视频功能也都要用。" +
+				"缺了它的典型症状是「合成接口返回 HTTP 200 但 body 是 0 字节」——" +
+				"服务看起来一切正常，用户却一个作业都跑不成。" +
+				"没有网页界面，装好后供面板与其它应用在后台调用。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "ffmpeg",
+			BrewFormula:    "ffmpeg",
+			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
+			NoDaemon: true,
+			Port:     0,
+			DocsURL:  "https://ffmpeg.org",
 		},
 
 		// ---------------- AI 服务（原生，用 Metal 加速） ----------------
@@ -392,6 +501,26 @@ func Catalog() []App {
 			DocsURL: "https://github.com/abiosoft/colima",
 		},
 		// ---------------- 运维工具（Docker） ----------------
+		//
+		// arm64 证据（2026-09-16 逐条实测；铁律②要求"镜像必须自带 linux/arm64"）：
+		//   Hub 上的条目经自建 NAS 镜像站读**同一份 image index**（镜像站是
+		//   registry:2 pull-through，拿到就是 Hub 原始 index，不是第三方转存）：
+		//     GET <mirror>/docker/v2/<repo>/manifests/<tag>
+		//   · louislam/uptime-kuma:1                → linux/amd64 + linux/arm64
+		//   · gitea/gitea:latest                    → linux/amd64 + linux/arm64
+		//   · stirlingtools/stirling-pdf:latest      → linux/amd64 + linux/arm64
+		//   · filebrowser/filebrowser:latest         → linux/amd64 + linux/arm64 + arm/v7
+		//   · pjmeca/squoosh:1.1.0                   → linux/amd64 + linux/arm64 + arm/v7
+		//   · n8nio/n8n:latest                       → linux/amd64 + linux/arm64
+		//   非 Hub 的单独查（加速源不覆盖它们，实测均可直连）：
+		//   · quay.io/minio/minio:latest             → linux/amd64 + linux/arm64
+		//   · ghcr.io/corentinth/it-tools:latest     → linux/amd64 + linux/arm64
+		//   · ghcr.io/metatube-community/metatube-server:latest
+		//                                            → linux/amd64 + linux/arm64
+		//   ⚠️ 唯一一个**镜像站上游缺件**的：pjmeca/squoosh —— docker.m.daocloud.io
+		//      明确拒绝它（DENIED / not in the allowlist），docker.1panel.live 能服务。
+		//      所以面板自动配加速源时**必须配多个**、靠 docker 逐条回落，只配一个
+		//      daocloud 会让 squoosh 装不上（见 docker_mirror_nas.go 顶部说明）。
 		{
 			ID: "uptime-kuma", Name: "Uptime Kuma", Icon: "📡",
 			UI: &AppUI{
@@ -470,7 +599,20 @@ func Catalog() []App {
 			Category:    "tool", Kind: KindCompose, Port: 5678,
 			HealthPath: "/healthz",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
-			ComposeYAML: composeTemplate("n8n", "docker.n8n.io/n8nio/n8n:latest", 5678, 5678, `
+			// 为什么用 Docker Hub 的 `n8nio/n8n` 而不是它自己的 `docker.n8n.io/n8nio/n8n`
+			// （2026-09-16 实测后改，别改回去）：
+			//   · `docker.n8n.io/v2/n8nio/n8n/manifests/latest` 返回 401，而
+			//     WWW-Authenticate 的 realm 指向 **auth.docker.io** —— 也就是说
+			//     n8n 自己的 registry 把鉴权委托给了 Docker Hub，而 auth.docker.io
+			//     在国内直连超时 → **拉不动**（域名 401 只说明"活着"，不代表能用）。
+			//   · 更关键的是 **registry-mirrors 只对 Docker Hub 生效**：配了 NAS /
+			//     公共加速源也救不了非 Hub 的域名。所以走 Hub 才是能加速的那条路。
+			//   · 这是**同一个官方项目**（n8n 官方把 Hub 的 n8nio/n8n 作为发布渠道，
+			//     不是第三方转存）。
+			// arm64 证据（经自建 NAS 镜像站读同一份 index，2026-09-16 实测）：
+			//   GET <mirror>/docker/v2/n8nio/n8n/manifests/latest
+			//   → linux/amd64、linux/arm64；arm64 子清单 15 层共 282.9MB
+			ComposeYAML: composeTemplate("n8n", "n8nio/n8n:latest", 5678, 5678, `
     environment:
       - N8N_SECURE_COOKIE=false
       - GENERIC_TIMEZONE=Asia/Shanghai
@@ -652,6 +794,10 @@ func Catalog() []App {
 				Slug:         "frpc",
 				Note:         "frpc 的 admin UI 在 7400；面板默认给端口直连 http://<地址>:7400",
 				PreferDirect: true,
+				// 7400 是 frpc 自带的 admin 控制台，不是面板的使用入口 ——
+				// 用户明确不要在面板里跳过去（见 AppUI.ConsoleOnly）。
+				// 市场与服务管理只给「📝 编辑配置文件」+「🔄 重启服务」。
+				ConsoleOnly: true,
 			},
 			Summary: "把本机端口映射到 frps（客户端，带 admin UI）",
 			Description: "fatedier/frp 的客户端：连上你自己的 frps，把本机端口映射出去。" +
@@ -689,12 +835,57 @@ func Catalog() []App {
 				"（面板不提供服务端，模板里 127.0.0.1:9527 只是占位）。" +
 				"② 服务端启用了 auth.token 时，客户端也要填同一个值。" +
 				"③ 在 [[tunnels]] 里加要暴露的端口：service 写 127.0.0.1:<本地端口>，" +
-				"remotePort 写服务端上的端口。改完点「📝 编辑配置文件」保存后重启服务生效。" +
-				"② 服务端启用了 auth.token 时，客户端也要填同一个值。" +
-				"③ 在 [[tunnels]] 里加要暴露的端口：service 写 127.0.0.1:<本地端口>，" +
-				"remotePort 写服务端上的端口。改完点「📝 编辑配置文件」保存后重启服务生效。" +
-				"隧道是否连上、流量多大，在服务端的 Dashboard（http://<服务端地址>:8020）里看。",
+				"remotePort 写服务端上的端口。" +
+				"④ 这个客户端**没有网页界面**（纯 CLI）：改完点「📝 编辑配置文件」保存，" +
+				"再重启服务生效；隧道是否连上、流量多大，在服务端的 Dashboard" +
+				"（http://<服务端地址>:8020）里看。",
 			DocsURL: "https://github.com/orbien-org/orbien",
+		},
+		// ---------------- 动态域名解析（DDNS，原生） ----------------
+		//
+		// 2026-09-16 新增 ddns-go。选路理由（真机核对过，不要凭猜改）：
+		//   · homebrew-core 有 ddns-go formula，但**没有 service 块** ——
+		//     `brew info --json=v2 ddns-go` 的 service 字段为 null，
+		//     `brew services start ddns-go` 直接报 "has not implemented #plist,
+		//     #service or provided a locatable service file"。
+		//     所以走 brew 只会得到一个"装了但没有任何守护进程"的包，
+		//     与「有守护进程、要监听 9876」矛盾。
+		//   · 官方 release 有 darwin-arm64 产物（ddns-go_6.17.7_darwin_arm64.tar.gz），
+		//     且有 checksums.txt 可核对 sha256，于是交给 binary_release.go 那套
+		//     通用安装器（与 frpc / Orbien 客户端同一条路，不新造流程）。
+		{
+			ID: "ddns-go", Name: "DDNS-Go（动态域名解析）", Icon: "🌐",
+			// 方案 A：**保留一次「打开」** —— 首次要在它自己的网页界面里添加
+			// DNS 服务商与域名（那是应用自带能力，面板无法代填 AccessKey）。
+			// 所以**不设** ConsoleOnly（设了就按"自带控制台不算使用入口"把「打开」藏掉）。
+			//
+			// PreferDirect 与 frpc 同一写法：默认给端口直连 http://<地址>:9876。
+			// 已在真机核对过直连可用（未登录 GET / 是 307 → /login，浏览器正常进登录页）；
+			// 子路径入口只作备用 —— 它的前端资源与接口是相对路径（./static、baseURL './'），
+			// 在面板的子路径反代下是否完全可用**没有真机验证过**，不拿它当首选。
+			UI: &AppUI{
+				Slug:         "ddns-go",
+				PreferDirect: true,
+				Note: "首次配置（添加 DNS 服务商与域名）要在 ddns-go 自己的网页界面里做：" +
+					"面板默认给端口直连 http://<地址>:9876，子路径入口仅作备用。",
+			},
+			Summary: "动态公网 IP 变化时自动更新到 DNS 解析（Cloudflare / 阿里云 / DNSPod …）",
+			Description: "把变化的公网 IP 自动更新到你的域名解析，支持 Cloudflare、阿里云、" +
+				"腾讯云、DNSPod、华为云、百度云等。**走原生（不走 Docker）**：官方 darwin-arm64 " +
+				"预编译产物解压到 ~/ddns-go，由系统级 launchd 托管（homebrew 的 formula " +
+				"没有 service 块，不能用 brew services 托管）。",
+			Category: "tool", Kind: KindNative,
+			PanelInstaller: "ddns-go", ServiceLabel: "com.zizdog.ddns-go",
+			// 9876 是它网页界面端口，也是唯一监听端口（装机实测：启动后 *:9876 LISTEN）。
+			Port: 9876, HealthPath: "/",
+			ConfigPath: "ddns-go.yaml",
+			// 方案 A 的两步（用户 2026-09-16 定下的规矩：日常不跳网页）：
+			PostInstallHint: "① 首次：点「打开」进 http://<本机地址>:9876 ，先设置 ddns-go 的" +
+				"用户名口令，再到「DNS服务商」里添加服务商（Cloudflare / 阿里云 / 腾讯云 / " +
+				"DNSPod / 华为云 / 百度云 等）与要更新的域名。" +
+				"② 之后日常：在「服务管理 → DDNS-Go」里用「📝 编辑配置文件」改 " +
+				"~/ddns-go/ddns-go.yaml，保存后点「🔄 重启服务」生效 —— 不必再打开网页。",
+			DocsURL: "https://github.com/jeessy2/ddns-go",
 		},
 		// ---------------- 一键建站（Category: site） ----------------
 		{

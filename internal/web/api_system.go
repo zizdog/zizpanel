@@ -81,6 +81,30 @@ func (s *Server) sendSample(w http.ResponseWriter, f http.Flusher) {
 	f.Flush()
 }
 
+// handleSystemDeps 返回"基础依赖"（ffmpeg / ffprobe 等）的只读状态。
+//
+// 为什么需要这个接口：2026-09-16 的事故里 ffmpeg **静默消失**了
+// （被 brew autoremove 之类带走，头号嫌疑是卸载流程），而它的缺席不会让任何
+// 健康检查变红 —— 表现只是 TTS 合成返回 HTTP 200 + 0 字节 body，
+// 用户看到的是"所有作业全败"，却完全推不到"缺 ffmpeg"。
+// 有了它，前端可以把"缺 ffmpeg"直接标出来，并给出一键补装/手工命令的入口。
+//
+// 只读：不装任何东西（补装走安装任务，见 services.EnsureBaseDependencies）。
+func (s *Server) handleSystemDeps(w http.ResponseWriter, r *http.Request) {
+	list := s.svcManager().BaseDependencyStatuses(r.Context())
+	missing := 0
+	for _, d := range list {
+		if !d.Satisfied {
+			missing++
+		}
+	}
+	ok(w, map[string]any{
+		"list":          list,
+		"missing":       missing,
+		"all_satisfied": missing == 0,
+	})
+}
+
 // handleProcesses 返回占资源最高的进程列表。
 //
 // CPU 百分比用采样差值计算（见 sysinfo.ProcSampler）。为了让连续刷新都能拿到
@@ -298,13 +322,19 @@ func (s *Server) settingsView() map[string]any {
 		// （清空 = 关闭镜像、回到公网来源，仅用于镜像站故障时应急）。
 		"mirror_base":          s.Cfg.MirrorBase,
 		"mirror_probe_seconds": s.Cfg.MirrorProbeSeconds,
+		// 仅走 NAS（离线）模式：设置页要能看见并切换它。
+		// 打开后各安装器禁止回落外网，缺资源就明确失败（见 services/mirror.go）。
+		"offline_only": s.Cfg.OfflineOnly,
 		// 数据库连接（面板管理 MySQL 用）。密码回传是为了让设置页能显示
 		// "已填写"状态并允许修改；面板本身是登录后才能访问的后台。
 		"mysql_host":     s.Cfg.MySQLHost,
 		"mysql_port":     s.Cfg.MySQLPort,
 		"mysql_socket":   s.Cfg.MySQLSocket,
 		"mysql_user":     s.Cfg.MySQLUser,
-		"mysql_password": s.Cfg.MySQLPassword,
+		"mysql_password": s.Cfg.MySQLPasswordValue(),
+		// 装 MySQL 时"限时询问 root 口令"的秒数（0/缺省按 60）。
+		// 回传它是为了让运维能把它调成 1 秒＝全自动（无人值守安装）。
+		"mysql_input_timeout_seconds": s.Cfg.MySQLInputTimeoutSeconds,
 	}
 }
 
@@ -337,10 +367,14 @@ type settingsReq struct {
 
 	// MirrorBase 是应用包镜像基址（<base>/apps/<app>/<版本>/<文件名> 与 /pypi、/hf、/brew）。
 	// 传空串 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）；
-	// 有值时镜像是**唯一来源**：安装前先检查，缺资源就明确失败、不回退公网。
+	// 有值时镜像是**优先来源**：先用镜像，缺元件或不可达时回落到公网源
+	// （见 services/mirror.go 文件头；"唯一来源"是更早一版的需求，已作废）。
 	MirrorBase *string `json:"mirror_base"`
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，1~60）。
 	MirrorProbeSeconds *int `json:"mirror_probe_seconds"`
+	// OfflineOnly = 仅走 NAS（离线）模式：禁止任何外网回落，缺资源即明确失败。
+	// 用于"整机断外网/隔离网络/迁移到新 Mac"，见 services/mirror.go。
+	OfflineOnly *bool `json:"offline_only"`
 
 	// MySQL 连接（面板管理数据库用）
 	MySQLHost     *string `json:"mysql_host"`
@@ -348,6 +382,9 @@ type settingsReq struct {
 	MySQLSocket   *string `json:"mysql_socket"`
 	MySQLUser     *string `json:"mysql_user"`
 	MySQLPassword *string `json:"mysql_password"`
+	// MySQLInputTimeoutSeconds：装 MySQL 时限时询问 root 口令的秒数。
+	// 1~600；1 秒等价于"全自动生成"（无人值守场景）。
+	MySQLInputTimeoutSeconds *int `json:"mysql_input_timeout_seconds"`
 
 	// Web 终端（默认关闭，需显式开启）
 	TerminalEnabled     *bool   `json:"terminal_enabled"`
@@ -453,6 +490,15 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.MirrorProbeSeconds = sec
 	}
+	// 仅走 NAS（离线）模式。
+	//
+	// 允许"离线模式 + 空镜像基址"保存吗？**允许但要求界面提示**：
+	// 这个组合是自相矛盾的（没有镜像可用还禁止外网），安装时会明确失败并
+	// 告诉用户去填 mirror_base。这里不直接拒绝，是因为用户可能先开离线、
+	// 再填基址（两步操作），中途拦下来反而更难用。
+	if req.OfflineOnly != nil {
+		cfg.OfflineOnly = *req.OfflineOnly
+	}
 	// 终端设置变更后需要重建管理器才生效（它是惰性单例）
 	resetTerm := false
 	if req.TerminalEnabled != nil {
@@ -501,7 +547,17 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		cfg.MySQLUser = strings.TrimSpace(*req.MySQLUser)
 	}
 	if req.MySQLPassword != nil {
-		cfg.MySQLPassword = *req.MySQLPassword
+		// 走带锁的 setter：设置页与数据库页会并发读写这一项，
+		// 直接赋值会和 Save() 里的 json 序列化构成数据竞争。
+		cfg.SetMySQLPassword(*req.MySQLPassword)
+	}
+	if req.MySQLInputTimeoutSeconds != nil {
+		sec := *req.MySQLInputTimeoutSeconds
+		if sec < 1 || sec > 600 {
+			fail(w, http.StatusBadRequest, "限时询问秒数应在 1~600 之间（1 秒＝不询问、直接自动生成）")
+			return
+		}
+		cfg.MySQLInputTimeoutSeconds = sec
 	}
 
 	if err := cfg.Save(); err != nil {

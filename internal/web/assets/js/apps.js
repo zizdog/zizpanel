@@ -10,12 +10,44 @@ import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
 import { registerCleanup, panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
+// 「应用管理」面板与启停/重启的唯一实现在 servicePanel.js —— 服务管理页点开的
+// 是**同一个**面板（这是用户 2026-09-16 的核心要求：同一个应用的能力不分散在
+// 两个页面）。卡片上通往它的入口**只有一个**「⚙️ 管理」：用户明确说原来的
+// 「详情」与「查看服务」内容一样，"统一保留一个管理就行了"，所以那两个按钮都删了。
+// 配置文件编辑器（configFileModal）住在 services.js，由面板内部复用，这里不再直接用。
+import { openServicePanel, marketQuickActions } from './servicePanel.js';
 
 let cache = null;
 // proxyState 是 /api/v1/market/proxies 的探测结果（slug → {proxy_ok, reason}）。
 // 有界面的应用给两个入口：子路径 /<slug>/ 与直连端口；哪个能用由探测说了算，
 // 而不是"我们配了就假设它能打开"。
 let proxyState = null;
+// svcState 是"这轮市场数据对应的服务状态"（服务名 → state），来自一次
+// api.services(false)（**不带健康检查**，所以很快）。
+//
+// 为什么市场页也要拉它：卡片上的第一颗动作按钮要在「启动」与「停止」之间选一个。
+// 以前市场卡片只有"编辑配置 + 重启"，服务管理页才有启停 —— 用户的原话是
+// "能作的也就是：停止重启这些，直接放在软件页面不就行了？"。
+// 拿不到状态时（还没加载完 / 这个应用没有服务记录）退化成「启动」：
+// 后端对一个已经在跑的服务执行 start 是幂等的，不会因此谎报状态。
+let svcState = {};
+let svcStateLoaded = false;
+
+// loadServiceStates 拉一次全部服务的状态（不带健康检查），并重画卡片。
+// 失败就保持空表 —— 宁可按"未知"渲染，也不让整个市场页打不开。
+async function loadServiceStates() {
+  try {
+    const res = await api.services(false);
+    const next = {};
+    for (const s of (res && res.list) || []) {
+      if (s && s.name) next[s.name] = s.state || null;
+    }
+    svcState = next;
+    svcStateLoaded = true;
+  } catch {
+    svcStateLoaded = false;
+  }
+}
 
 export function AppsView(content, ctx = {}) {
   clear(content);
@@ -44,6 +76,11 @@ export function AppsView(content, ctx = {}) {
       ]));
       return;
     }
+    // 服务状态**后台补**（用来决定卡片上首颗按钮是「启动」还是「停止」）：
+    // 市场数据一到就先画，不让状态查询挡住页面 ——
+    // 以前市场页"打开较慢"的教训就是别在首屏串行等慢接口。
+    // 拿不到状态时按钮退化成「启动」（后端 start 幂等，不会谎报）。
+    loadServiceStates().then(() => { if (cache) renderGrid(); });
     // 探测是"能不能打开"的依据，但它要跑十几条网络请求（含 8 秒超时）。
     // **不在打开页面时自动跑** —— 用户反馈"应用市场打开较慢，其它页面都是秒开"。
     // 改为：结果缓存在内存里；点「检测可用性」时才真跑；生成入口后刷新一次。
@@ -52,6 +89,17 @@ export function AppsView(content, ctx = {}) {
     }
     renderHead();
     renderGrid();
+  }
+
+  // stateOfApp 取这个应用在服务记录里的状态（给卡片上的启停按钮用）。
+  //
+  // 键要把三种写法都试一遍：面板记录名不一定是目录 ID（frpc 的记录名是
+  // com.zizdog.frpc），与后端 FindAppByService 认的写法保持一致。
+  function stateOfApp(a) {
+    for (const k of [(a.uninstall && a.uninstall.service) || '', a.service_label || '', a.id || '']) {
+      if (k && svcState[k]) return svcState[k];
+    }
+    return null;
   }
 
   function renderHead() {
@@ -279,8 +327,13 @@ export function AppsView(content, ctx = {}) {
 
   // adoptApp 把一个已安装但未登记的服务纳管进来。
   //
+  // 2026-09-16 起市场卡片**不再**直接给「纳管」按钮：用户要求已安装应用的
+  // 主按钮统一成「重装」，而「纳管」是另一个语义（登记一个已经在跑的服务）。
+  // 这个实现保留在这里，因为 api.adopt 仍被「服务管理 → 扫描可纳管服务」使用，
+  // 两处的行为必须一致；以后若要把纳管放回面板，直接用这个函数即可。
+  //
   // 这是"自动纳管的兜底"：面板启动时会自动登记目录里已知的服务，
-  // 但如果服务是后装的、或标签不在目录里，就得靠这个按钮。
+  // 但如果服务是后装的、或标签不在目录里，就得靠它。
   function adoptApp(a) {
     const label = a.service_label || a.adopt_label;
     if (!label) { toast('这个应用没有可纳管的服务标签', 'warn'); return; }
@@ -363,13 +416,30 @@ export function AppsView(content, ctx = {}) {
   function residualOf(a) { return !!a.artifacts && !a.installed; }
 
   // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
+  //
   // 判定顺序（改之前先读完这段）：
   //   有任务在跑              → 查看进度（点回任务中心，而不是再点一次）
   //   残留态（产物还在、没装） → **安装**（安装器幂等，会复用残留产物）
-  //   已纳管                  → 查看服务
-  //   已装且服务在 launchd 里  → 纳管（兜底入口）
-  //   已装但服务没注册        → 重新部署（孤儿态修复：重建 plist 并登记）
+  //   一键建站类              → 空（入口是卡片上的「一键建站」）
+  //   已安装                  → **重装**（安装器幂等，保留数据）
   //   其它                    → 安装
+  //
+  // 2026-09-16 收敛（用户原话："截止 0.11.0 软件市场的显示有问题……Qwen3 TTS、
+  // frpc、Orbien 客户端这几个不显示重装，查看服务 应改为 重装"）：
+  // 改之前同一件"重装"被拆成三种文案 —— 已纳管给「查看服务」、已装且在 launchd
+  // 给「纳管 + 重装」、已装但没服务才给「重装」。偏偏用户最常重装的那几个
+  // （Qwen3 TTS / 接收端 / frpc / Orbien 都是"已纳管"）显示的是「查看服务」，
+  // 于是重装入口等于不存在。现在主按钮只由 **a.installed** 决定：装了就给「重装」。
+  //
+  // 为什么删掉「查看服务」：它和「⚙️ 管理」打开的是**同一个**面板
+  // （servicePanel.js 的 openServicePanel）。用户明确说"原来的详情和查看服务
+  // 内容一样，统一保留一个管理就行了"——两个通向同一面板的按钮只会让人
+  // 不知道该点哪个。
+  //
+  // 为什么删掉「纳管」兜底：它只在"服务确实在 launchd 里、但面板没有记录"时出现，
+  // 属于**另一个语义**（把已运行的服务登记进来），不是重装。用户要求主按钮统一，
+  // 而登记能力并没有丢：「服务管理 → 扫描可纳管服务」走的是同一个 api.adopt。
+  // （adoptApp 的实现保留在本文件里，两处语义必须一致。）
   function primaryButton(a) {
     const running = taskCenter.findByTarget(a.id);
     if (running) {
@@ -387,35 +457,21 @@ export function AppsView(content, ctx = {}) {
         onclick: () => openInstaller(a),
       });
     }
-    if (a.adopted) {
-      return h('button.btn.btn-sm', { text: '查看服务', onclick: () => { location.hash = '#/services'; } });
-    }
-    if (a.installed && a.service_label && a.service_in_launchd) {
-      // 「纳管」只在**服务确实在 launchd 里**时才给 —— 否则点下去必然报
-      // "找不到 xxx 的 plist，且该服务未在 launchd 中加载"，
-      // 用户看到的就是一个点了没用的按钮（这正是用户反馈的问题之一）。
-      return h('div', { style: { display: 'flex', gap: '6px' } }, [
-        h('button.btn.btn-sm.btn-primary', {
-          text: '纳管',
-          title: '把这个已在运行的服务登记到「服务管理」',
-          onclick: () => adoptApp(a),
-        }),
-        // 「重装」入口：用户 2026-09-16 明确要求。
-        // 安装器本身是幂等的（会复用已下载的产物、保留数据），所以重装 = 再跑一次安装。
-        h('button.btn.btn-sm', {
-          text: '重装',
-          title: '重新跑一遍安装（会复用已下载的产物、保留数据，不会重复下载）',
-          onclick: () => reinstallApp(a),
-        }),
-      ]);
-    }
-    if (a.site_app) return null; // 建站类的入口由 siteInstallButtons 提供
-    if (a.panel_installer && a.artifacts && !a.service_in_launchd) {
-      // 孤儿态：产物还在、服务没了 → 重新部署（安装器是幂等的，会重建 plist）
-      return h('button.btn.btn-sm.btn-primary', {
-        text: '重新部署',
-        title: '安装产物还在，但服务没在 launchd 里；重新部署会重建服务定义并登记到服务管理',
-        onclick: () => openInstaller(a),
+    // 一键建站类应用装出来是**网站**（目录 + 数据库 + vhost），入口在卡片上的
+    // 「一键建站」；重装要走建站流程而不是安装器，所以主按钮留空。
+    if (a.site_app) return null;
+    // 已安装 → 主按钮统一「重装」。
+    //
+    // 判据只看 a.installed（后端给的是：面板服务记录 / launchd 里的作业 /
+    // brew formula 三者之一），**不看** adopted / service_in_launchd / no_daemon ——
+    // 命令行工具（ffmpeg）与纳管服务（qwen3tts）在这颗按钮上的语义完全一样：
+    // 再跑一遍幂等的安装器（已下载的产物会复用、数据保留）。
+    // 以前按这三种状态给三种文案，正是用户看到的"有的显示查看服务、有的没有重装"。
+    if (a.installed) {
+      return h('button.btn.btn-sm', {
+        text: '重装',
+        title: '重新跑一遍安装（会复用已下载的产物、保留数据，不会重复下载）',
+        onclick: () => reinstallApp(a),
       });
     }
     return h('button.btn.btn-sm.btn-primary', {
@@ -467,10 +523,16 @@ export function AppsView(content, ctx = {}) {
             // nginx alias + php-fpm，装完就是一个网页入口）。对它报"服务未注册"
             // 是纯粹的误导 —— 用户反馈过这个。（2026-09-14）
             ? (a.no_daemon
-              ? h('span.pill.ok', { text: '已安装·网页入口', title: '这个应用没有常驻进程，装完就是一个网页入口' })
+              // no_daemon 只说明"没有常驻进程"，**不等于**"是网页入口"：
+              // phpMyAdmin（nginx alias）是网页入口，而 ffmpeg 是命令行工具。
+              // 以前一律写「网页入口」，ffmpeg 就会被标成"已安装·网页入口"
+              // （用户 2026-09-16 截图反馈）。所以按**有没有界面**分开说。
+              ? (hasPanelUI(a) || (a.ui && a.ui.self_conf)
+                ? h('span.pill.ok', { text: '已安装·网页入口', title: '这个应用没有常驻进程，装完就是一个网页入口' })
+                : h('span.pill.ok', { text: '已安装·命令行', title: '这个应用是命令行工具（没有常驻进程，也没有网页界面）' }))
               : h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
                 text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
-                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用「重新部署」可修复',
+                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用卡片上的「重装」可修复（会重建服务定义）',
               }))
             : null)),
         // 残留数据：没装、但磁盘上还有上次卸载保留的产物/数据。
@@ -493,7 +555,22 @@ export function AppsView(content, ctx = {}) {
       }) : null,
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
         primaryButton(a),
+        // 界面入口（有面板托管界面的应用才有）。
         ...openButtons(a),
+        // 已安装应用的常用动作：启动/停止、重启、刷新、⚙️ 管理。
+        // 用户要求（2026-09-16）：卡片上直接给常用动作，**不需要先跳到服务管理页**；
+        // 而「⚙️ 管理」打开的是与服务管理页**同一个**面板 ——
+        // 配置文件的编辑、凭据、日志、卸载都在那里面，不是两套按钮。
+        // 2026-09-16 起卡片上只有这一颗"进面板"的按钮（原来的「详情」「查看服务」
+        // 合并成它），主按钮则统一是「重装」/「安装」。
+        ...marketQuickActions(a, {
+          state: stateOfApp(a),
+          onDone: refreshSilently,
+          // 让「⚙️ 管理」走 openAppDetail：它会把市场页的界面探测结果
+          // （proxyState）一起带进面板，面板里的「打开界面」才能和卡片上的
+          // 「打开」给同一个结论（子路径还是端口直连）。
+          onManage: () => openAppDetail(a),
+        }),
         ...siteInstallButtons(a),
         ...uninstallButtons(a),
         a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
@@ -508,7 +585,7 @@ export function AppsView(content, ctx = {}) {
   // 探测（/api/v1/market/proxies）说不行，就把直连作为首选入口，
   // 并在 title 里说清原因 —— 而不是给一个点开是白屏的按钮。
   function openButtons(a) {
-    if (!a.ui || !a.ui.slug || !a.installed) return [];
+    if (!hasPanelUI(a) || !a.installed) return [];
     const st = (proxyState?.items || []).find((x) => x.slug === a.ui.slug) || {};
     const path = '/' + a.ui.slug + '/';
     const direct = a.port_url || '';
@@ -565,6 +642,48 @@ export function AppsView(content, ctx = {}) {
     return out;
   }
 
+  // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
+  //
+  // 2026-09-16 改版：以前卡片上按应用类型分两套按钮 ——
+  // 有面板界面的给「打开」，没有的给「📝 编辑配置文件 + 🔄 重启服务」，
+  // 而「停止/启动」只在服务管理页有。用户的原话是"能作的也就是：停止重启这些，
+  // 直接放在软件页面不就行了？折腾什么？"，再加上 frpc 的配置入口在市场、
+  // TTS 接收端的在服务管理 —— 同一个应用的能力被拆到了两个页面。
+  //
+  // 现在只有一个入口：**应用管理面板**（servicePanel.js）。卡片上给常用动作
+  // （启停/重启/刷新）+「⚙️ 管理」，服务管理页点开的也是同一个面板。
+  // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / ui.slug /
+  // ui.console_only / 凭据接口是否为空），这里不再按应用 ID 写任何分支。
+
+  // hasPanelUI 判断"这个应用有没有**本面板提供**的网页使用入口"。
+  //
+  // 与 a.ui 的区别：frpc 有 UI（它自己的 7400 控制台，目录里标了
+  // console_only），但那不是面板的使用入口 —— 用户明确不要在面板里跳过去。
+  // 只有 IOPaint / Uptime Kuma / phpMyAdmin 这类"面板自己托管/代理"的界面
+  // 才保留「打开」。servicePanel.js 的 uiButtonFor 用的是**同一条判据**。
+  function hasPanelUI(a) {
+    return !!(a.ui && a.ui.slug && !a.ui.console_only);
+  }
+
+  // openAppDetail 打开「应用管理」面板 —— 市场卡片上唯一的"进面板"入口。
+  //
+  // 面板是**唯一的应用操作入口**，这里只负责把市场这份数据递进去，并告诉它
+  // 两件事：① 打开界面时用探测结果（proxyState，决定子路径还是端口直连）；
+  // ② 动作完成后刷新卡片。服务记录由面板自己按名字去查
+  // （市场条目里的 config_path 只是文件名，绝对路径只有服务记录才有）。
+  //
+  // 2026-09-16：卡片上的「⚙️ 管理」按钮通过 marketQuickActions 的 onManage
+  // 回调走到这里 —— 保留这条路径而不是让按钮直接 openServicePanel，
+  // 就是为了 proxyState 不丢（否则面板里的「打开界面」会和卡片上的「打开」不一致）。
+  function openAppDetail(a, opts = {}) {
+    return openServicePanel({
+      market: a,
+      proxyState,
+      onDone: refreshSilently,
+      ...opts,
+    });
+  }
+
   // uninstallButtons 给"面板装的"应用一个卸载入口。
   //
   // 为什么必须分三类（见 services.UninstallPlan）：
@@ -592,7 +711,7 @@ export function AppsView(content, ctx = {}) {
 
   async function openSiteInstall(a) {
     const domain = h('input.input', { placeholder: '例如：blog.test', value: '' });
-    const php = h('input.input', { value: '8.3' });
+    const php = h('input.input', { value: '8.2' });
     const note = h('div.hint', {
       text: '面板会自动：下载官方源码 → 解压到 ~/www/<域名> → 建库建用户 → 写配置文件 → ' +
         '建站点并套用「' + (a.site_app.rewrite || '') + '」伪静态。',
@@ -624,7 +743,7 @@ export function AppsView(content, ctx = {}) {
               kind: 'site-install',
               target: d,
               title: '一键建站 ' + a.name + '（' + d + '）',
-              start: () => api.marketInstallSite(a.id, { domain: d, php: php.value.trim() || '8.3' }),
+              start: () => api.marketInstallSite(a.id, { domain: d, php: php.value.trim() || '8.2' }),
               onDone: (m) => {
                 if (m && m.status && m.status !== 'succeeded') {
                   toast('建站失败：' + (m.error || m.status), 'err', 12000);
@@ -756,10 +875,12 @@ export function AppsView(content, ctx = {}) {
   // openInstaller 按应用打开对应的部署对话框。
   //
   // 抽出来是因为有**两个入口**要用它：
-  //   · 「安装」——没装过的应用；
-  //   · 「重新部署」——装了但服务没注册的孤儿态（plist 丢了等）。
+  //   · 「安装」——没装过的应用，以及"残留数据"（artifacts && !installed）；
+  //   · 「重装」——已安装的应用（见 reinstallApp；它确认完也走这里）。
   // 安装器本身是幂等的：重跑会重建 venv/服务定义/plist 并登记到服务管理，
-  // 所以"重新部署"就是最合理的修复动作，不需要另写一套修复逻辑。
+  // 所以"重装"就是最合理的修复动作，不需要另写一套修复逻辑。
+  // （2026-09-16 起不再有单独的「重新部署」按钮：它与「重装」是同一个安装器，
+  // 用户要求已安装应用的主按钮统一成「重装」，所以那个文案已删。）
   function openInstaller(a) {
     // 用面板自研安装器的项目要收集选项（例如 Qwen 的"要不要鉴权"、
     // 密钥从哪来），所以直接打开对应对话框，而不是走通用安装流程。
@@ -781,7 +902,7 @@ export function AppsView(content, ctx = {}) {
   // 以前只能先卸载再装，中间那段时间服务是停的。
   async function reinstallApp(a) {
     const okGo = await confirmBox(
-      '重新部署「' + a.name + '」？\n\n' +
+      '重装「' + a.name + '」？\n\n' +
       '· 会重新跑一遍安装流程（下载/解压/重建服务定义）\n' +
       '· **已下载的产物会复用**，不会重复下载\n' +
       '· 已存在的配置与数据**保留**\n' +
@@ -879,7 +1000,13 @@ export function AppsView(content, ctx = {}) {
         if (m && m.status && m.status !== 'succeeded') {
           toast('安装失败：' + (m.error || m.status), 'err', 12000);
         } else {
-          toast('「' + a.name + '」已安装', 'ok', 8000);
+          // 装完把"下一步"直接说出来。用户最常问的就是"装完我该干嘛"。
+          // 2026-09-16 起配置入口只有一个：卡片上的「⚙️ 管理」→ 面板里的
+          // 「📝 编辑配置文件」+ 启停按钮在同一屏，不再需要两个页面来回找。
+          const next = a.config_path
+            ? '：点卡片上的「⚙️ 管理」，在面板里改「📝 编辑配置文件」并重启服务生效'
+            : '';
+          toast('「' + a.name + '」已安装' + next, 'ok', 10000);
         }
         refreshSilently();
       },

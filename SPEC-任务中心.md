@@ -109,7 +109,81 @@ DELETE /api/v1/services/{name}/uninstall  # 同上
   卡片上若该应用有进行中的任务，按钮变成「查看进度」。
 - 进度窗用 `modal()`，`onClose` **不取消任务**（关闭＝收起窗口）。
 
-## 三、非目标（本轮不做）
+## 三、任务输入（限时询问：如 MySQL root 口令）
+
+> 为什么有这一节：**"先装完、之后再让用户去某个页面补上"一定会留下不一致的窗口**。
+> 2026-09-16 mini 的事故就是这样 —— 面板以为 root 无口令、MySQL 要口令，
+> 之后每次库操作都是 `1045`（详见 `DEVELOPMENT.md` 坑 #95）。
+> 所以安装 MySQL 时必须**当场**把 root 口令问清楚：限时询问，超时自动生成。
+
+### 后端行为
+
+- `tasks.Task.WaitInput(ctx, req, timeout) (value string, ok bool)`：
+  超时/任务被中断都返回 `ok=false`（**超时是正常路径**，业务自己给默认值继续，
+  绝不卡住安装）；`ok=true` 且 `value==""` 表示"用户明确留空"。
+- `POST /api/v1/tasks/{id}/input` 投递；只有**正在等该 key** 的任务接受，
+  晚到 / key 不对 / 任务已结束一律 `409` 并带可读原因（**不静默丢弃**：
+  静默丢弃会让用户以为已经提交，而任务早已用默认值继续）。
+- 口令只走投递通道，**不进日志、不进步骤、不进审计**；
+  唯一允许出现的地方是任务结果里的一次性凭据区块（`result.credentials`）。
+
+### 契约
+
+`TaskMeta` 新增两个字段（`GET /api/v1/tasks/{id}`、`GET /api/v1/tasks` 的列表项、
+SSE 的 `meta`/`status` 事件都会带）：
+
+```json
+{
+  "input_required": {                       // 任务此刻在等输入；没在等时字段不出现
+    "key": "mysql_root_password",
+    "label": "MySQL root 口令",
+    "hint": "留空或超时＝自动生成强随机口令。口令只写进面板配置（0600），不进日志、不进审计。",
+    "secret": true,                         // true → 前端用 type=password 渲染
+    "timeout_seconds": 60,
+    "deadline": "2026-09-16T17:05:00+08:00" // 以它为准倒计时（别用本地收到的时刻自己算）
+  },
+  "input_result": "timeout"                 // submitted | timeout | canceled（空＝还没问过）
+}
+```
+
+**绝不包含用户输入过的值** —— 这个结构会在每次 `GET`/SSE 里反复下发。
+
+SSE 新增一个事件（其它事件不变）：
+
+```
+event: input_required
+data: {"input_required": {...}, "input_result": ""}      # 开始等待
+data: {"input_required": null,  "input_result": "timeout"}   # 落定：null ⇒ 收起输入框
+```
+
+同时会有一条 `level: "input"` 的普通日志行承载给用户看的提示文案
+（前端可以把它渲染成加粗提示，但**不要靠解析它拿结构化信息**）。
+
+投递接口：
+
+```
+POST /api/v1/tasks/{id}/input
+     body: {"key": "mysql_root_password", "value": "用户输入的口令"}
+     200 → data: {"accepted": true, "key": "mysql_root_password"}   # 不回显 value
+     400 → 缺 key
+     404 → 任务不存在
+     409 → 任务不在等待该 key / 已超时 / 已提交过（msg 里说明具体原因）
+```
+
+### 前端要做的事
+
+1. 收到 `input_required`（非 null）→ 在进度窗里显示输入框 + 倒计时，
+   按 `deadline` 计时（不要自己从 0 开始数）。
+2. 用户点确定 → `POST …/input`。成功后**不要**本地清空就完事：
+   等落定事件（`input_required: null`）再收起输入框，避免"提交失败但框没了"。
+3. 倒计时归零 → 前端应显示"已超时，任务会自动生成并继续"，
+   并**停止**提交（再提交会 409）；任务那边会自己往下走，无需刷新。
+4. 任务结束/中断 → 收起输入框。
+5. 口令的"再查"：装完写进面板配置（0600），
+   建议在「数据库」页提供一个**常驻**的连接设置入口（现在只有连接失败时才显示那个表单），
+   一次性凭据区块只负责"装完立刻能看见"。
+
+## 四、非目标（本轮不做）
 
 - 不做安装队列的串行化（并发安装各自独立；仅禁止**同一个 target** 重复启动）。
 - 不做任务持久化（见上）。

@@ -638,33 +638,65 @@ func TestBrewMirrorWorksProbe(t *testing.T) {
 	}
 }
 
-// TestBrewMirrorSupportsOCI 锁住"只有提供 OCI 布局的镜像才配当瓶域"。
+// TestBrewMirrorSupportsOCI 锁住"只有真能取到瓶的镜像才配当瓶域"。
 //
-// 背景（2026-09-16 实测）：阿里云的 API 清单可用，但 <base>/v2/… 返回 404，
-// 而 Homebrew 是拿这个域去替换清单里的 ghcr.io 的。把 404 的域设进去，
-// 用户只会多等一次失败再回落官方域（实测官方域 91KB/s）。
+// 背景（2026-09-16 真机教训）：这里原先硬编码了一个**编造的** sha256 去 HEAD，
+// 结果永远 404 → 镜像分支永不成立 → brew 静默回落 ghcr.io（用户"装了 21 分钟"）。
+// 现在改成：先读 <base>/api/formula/<f>.json 拿真实版本与标签，再按 brew 实际会用的
+// 两种瓶路径去探测。这条测试同时锁住"必须有清单""瓶必须真的能取到"。
 func TestBrewMirrorSupportsOCI(t *testing.T) {
-	mux := http.NewServeMux()
-	// 支持 OCI 的镜像：任意 sha 都给 206
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	manifest := `{"versions":{"stable":"1.31.5"},
+		"bottle":{"stable":{"files":{"arm64_sequoia":{"sha256":"deadbeefcafe"}}}}}`
+
+	// 1) 清单在 + 瓶可下（206）→ 可用
+	ok := http.NewServeMux()
+	ok.HandleFunc("/api/formula/nginx.json", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(manifest))
+	})
+	ok.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, ".bottle.tar.gz") || strings.Contains(r.URL.Path, "/blobs/sha256:") {
+			w.WriteHeader(http.StatusPartialContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ts := httptest.NewServer(ok)
+	defer ts.Close()
+	if !brewMirrorSupportsOCI(context.Background(), ts.URL) {
+		t.Error("清单在且瓶能取到时，应判定为可当瓶域")
+	}
+
+	// 2) 只有瓶、没有清单（旧实现会误判为可用）→ 不可用
+	noManifest := http.NewServeMux()
+	noManifest.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/sha256:") {
 			w.WriteHeader(http.StatusPartialContent)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-	if !brewMirrorSupportsOCI(context.Background(), ts.URL) {
-		t.Error("提供 /v2/…/blobs/sha256: 的镜像应被判定为可当瓶域")
-	}
-	// 不支持 OCI 的镜像：一律 404
-	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	ts2 := httptest.NewServer(noManifest)
 	defer ts2.Close()
 	if brewMirrorSupportsOCI(context.Background(), ts2.URL) {
-		t.Error("一律 404 的镜像不该被判定为可当瓶域")
+		t.Error("拿不到清单时不该判定为可用（探测要靠清单里的真实 sha，不能拍固定 URL）")
+	}
+
+	// 3) 清单在但瓶取不到（404）→ 不可用（正是阿里云那种"有清单没 /v2"）
+	noBottle := http.NewServeMux()
+	noBottle.HandleFunc("/api/formula/nginx.json", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(manifest))
+	})
+	noBottle.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ts3 := httptest.NewServer(noBottle)
+	defer ts3.Close()
+	if brewMirrorSupportsOCI(context.Background(), ts3.URL) {
+		t.Error("清单在但瓶 404 时不该判定为可用")
+	}
+
+	if brewMirrorSupportsOCI(context.Background(), "") {
+		t.Error("基址为空时不该判定为可用")
 	}
 }
 

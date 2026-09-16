@@ -72,10 +72,14 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 	}
 
 	info := s.captureAudit(r)
-	t := s.Tasks.Start(kind, target, title, func(ctx context.Context, log tasks.LogFunc) (any, error) {
-		// 业务代码不依赖 tasks 包，进度通过 ctx 传进 services 层
-		ctx = services.WithProgress(ctx, log)
-		res, err := run(ctx, log)
+	// 用 StartWithTask：安装流程要能"限时询问用户输入"（如 MySQL root 口令），
+	// 而输入通道就是任务对象本身（*tasks.Task 满足 services.InputProvider）。
+	t := s.Tasks.StartWithTask(kind, target, title, func(ctx context.Context, t *tasks.Task) (any, error) {
+		// 业务代码不依赖任务中心的内部结构，进度与"限时询问"都通过 ctx 传进
+		// services 层。
+		ctx = services.WithProgress(ctx, t.LogFunc())
+		ctx = services.WithInput(ctx, t)
+		res, err := run(ctx, t.LogFunc())
 		if err != nil {
 			s.auditAs(info, auditAction, target, "失败: "+err.Error(), false, "")
 		} else {
@@ -157,6 +161,42 @@ func (s *Server) handleTaskGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleTaskInput 接收用户在任务里提交的输入（目前只有 MySQL root 口令）。
+//
+// 安全约定（硬要求）：
+//   - 值只交给正在等它的那个任务，**不回显、不写审计、不进日志**；
+//   - 审计只记录"提交了哪个 key"，因为审计是长期保存且广可见的；
+//   - 只有确实在等这个 key 的任务才收，晚到的/多余的提交明确报错（见 SubmitInput）。
+func (s *Server) handleTaskInput(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	key := strings.TrimSpace(req.Key)
+	if key == "" {
+		fail(w, http.StatusBadRequest, "缺少 key（要回答的是哪一个输入）")
+		return
+	}
+	t := s.Tasks.Get(r.PathValue("id"))
+	if t == nil {
+		fail(w, http.StatusNotFound, "任务不存在（面板重启后不再保留历史任务）")
+		return
+	}
+	if err := t.SubmitInput(key, req.Value); err != nil {
+		// 409：任务在，但此刻不接受这个输入。如实说明原因，绝不静默吞掉 ——
+		// 用户会以为"我填了"，而任务其实已经用默认值继续了。
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.audit(r, "task_input", t.Meta().Target, "提交任务输入 "+key, true, "")
+	// 响应里不含任何值：不回显是这一段的硬要求。
+	ok(w, map[string]any{"accepted": true, "key": key})
+}
+
 // handleTaskCancel 中断任务。
 func (s *Server) handleTaskCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -201,6 +241,10 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 	// 会丢。重复的行由下面的 cursor 去重（seq <= cursor 的直接跳过）。
 	subID, ch := t.Subscribe()
 	defer t.Unsubscribe(subID)
+	// 状态订阅（等输入的开始/落定）与日志是两条通道：日志有序号可续传，
+	// 状态没有序号，混在一起会让 Last-Event-ID 的语义变含糊。
+	stateID, stateCh := t.SubscribeState()
+	defer t.UnsubscribeState(stateID)
 
 	lines, cursor, _, oldest := t.Snapshot(after, 3000)
 
@@ -290,6 +334,24 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 
 		case <-flushTimer.C:
 			if !flush() {
+				return
+			}
+
+		case _, open := <-stateCh:
+			if !open {
+				return
+			}
+			// 先把攒着的日志发出去：输入请求与它前面那句提示文案（Level=Input）
+			// 的顺序不能颠倒，否则前端会先看到输入框、再看到"请在 60 秒内…"。
+			if !flush() {
+				return
+			}
+			// input_required 为 null = 这次等待已经落定（提交/超时/任务被中断），
+			// 前端据此收起输入框；input_result 说明是哪种结局。
+			if !send("input_required", map[string]any{
+				"input_required": t.PendingInput(),
+				"input_result":   t.InputResult(),
+			}, cursor) {
 				return
 			}
 

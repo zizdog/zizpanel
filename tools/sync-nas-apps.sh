@@ -169,11 +169,16 @@ print(json.dumps({
 }, ensure_ascii=False, indent=2))
 PY
 
-  sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=accept-new \
-    "$NAS_USER@$NAS_HOST" "mkdir -p '$dest'" >/dev/null
+  # ⚠️ ssh 的 -n 与两条 </dev/null 都不能省。
+  # 这段循环是 `while read ... done <<< "$PLAN"`，而 ssh 默认**会把 stdin 读走**。
+  # 实测（2026-09-16，注册表里 2 个应用）：需要真上传的那个一旦调用 ssh，
+  # 后面待同步的应用整段被吃掉，脚本却报"成功"—— 因为第一个应用确实传上去了，
+  # 汇总里 `失败：0`，看不出少传了一个。加 -n 后同样的循环 3 个应用全都跑到。
+  sshpass -p "$NAS_PASS" ssh -n -o StrictHostKeyChecking=accept-new \
+    "$NAS_USER@$NAS_HOST" "mkdir -p '$dest'" </dev/null >/dev/null
   sshpass -p "$NAS_PASS" rsync -az --no-perms --no-owner --no-group \
     -e "ssh -o StrictHostKeyChecking=accept-new" \
-    "$dir/" "$NAS_USER@$NAS_HOST:$dest/" >/dev/null
+    "$dir/" "$NAS_USER@$NAS_HOST:$dest/" </dev/null >/dev/null
 
   code="$(http_code "$public")"
   if [ "$code" = "200" ]; then

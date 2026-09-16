@@ -45,6 +45,12 @@ type Config struct {
 	MySQLSocket   string `json:"mysql_socket"`
 	MySQLUser     string `json:"mysql_user"`
 	MySQLPassword string `json:"mysql_password"`
+	// MySQLInputTimeoutSeconds 是"装 MySQL 时限时询问 root 口令"的等待秒数。
+	//
+	// 为什么要可配：默认 60 秒是"用户就在屏幕前"的合理值；批处理/无人值守
+	// 场景下用户可以调小（1 秒＝等于全自动生成）。超时不是失败 ——
+	// 到点自动生成强随机口令并继续，见 services/lnmp_mysql_credentials.go。
+	MySQLInputTimeoutSeconds int `json:"mysql_input_timeout_seconds"`
 
 	// ---------- 应用包镜像（自建 NAS） ----------
 	// MirrorBase 是应用包镜像基址，例如 https://mirror.zizdog.com:8888。
@@ -53,16 +59,36 @@ type Config struct {
 	// PyPI、huggingface、苹果 CLT 包……），各自维护一套"国内加速源"既散又容易过期。
 	// 统一指向自建镜像后，从哪下、下什么、怎么校验都由我们自己控制。
 	//
-	// 语义（用户明确要求："先检查镜像的资源能不能访问，不能再走其它"）：
-	// 有值时镜像是**唯一来源** —— 安装前先检查，镜像上没有就明确失败并说清
-	// 怎么补（make sync-apps），**不回退**到 GitHub/公网；
-	// 留空才回到各来源内置的公网/国内镜像（仅用于镜像站故障时应急）。
+	// 语义（用户原话："对所有能用到的模型、软件，如 ffmpeg，
+	// 都要以 NAS 镜像优先，不通再走别的！"）：
+	// 有值时镜像是**优先来源** —— 安装前先检查镜像上有没有这个资源，
+	// 有就从镜像下（并把地址写进任务日志）；镜像上缺件或不可达时**自动回落**
+	// 到各来源内置的公网/国内镜像，而不是让安装失败。
+	// 留空 = 完全不用镜像（应急用）。
+	//
+	// 注意：这与本字段更早一版的注释（"唯一来源、不回退"）相反，那是过期的
+	// 需求描述，代码从来不是那样跑的（真按"唯一来源"跑会在镜像站抖一下时
+	// 就让用户装不上东西）。以这里为准。
 	MirrorBase string `json:"mirror_base"`
 	// MirrorProbeSeconds 是"镜像上有没有这个资源"的单次探测超时（秒）。
 	//
 	// 必须短：镜像不可达时不能让每次安装都白等。默认 4 秒 —— 局域网/同城镜像
 	// 正常在 100ms 内应答，4 秒足够区分"慢"和"不通"，又不会把安装拖得很难看。
 	MirrorProbeSeconds int `json:"mirror_probe_seconds"`
+
+	// OfflineOnly 打开后进入**仅走 NAS（离线）模式**：所有安装过程只用镜像站上的
+	// 资源，**禁止任何外网回落**；缺资源就明确失败并要求补到 NAS 上。
+	//
+	// 与 MirrorBase 的关系（两者语义不同，别混）：
+	//   MirrorBase 非空 + OfflineOnly=false → "镜像优先 + 探不通回落公网"（默认）；
+	//   MirrorBase 非空 + OfflineOnly=true  → "只用镜像，缺件即失败"；
+	//   MirrorBase 为空 + OfflineOnly=true  → 自相矛盾（没有镜像可用），
+	//     此时各安装器必须**明确报错**，而不是悄悄走公网。
+	//
+	// 为什么需要它：用户的真实场景是"整机断外网/迁移到隔离网络"，那时
+	// "静默回落公网"会变成"装到一半卡死"，比直接失败更糟 —— 用户不知道自己在等什么。
+	// 这个开关就是"宁可明确失败，也不要静默变慢"。
+	OfflineOnly bool `json:"offline_only"`
 
 	// ---------- 在线升级 ----------
 	// UpgradeSource 是升级源地址（放 manifest.json / manifest.json.sig 的目录）。
@@ -130,7 +156,7 @@ type Config struct {
 	NginxConf  string `json:"nginx_conf"`
 	VhostDir   string `json:"vhost_dir"`
 	LogRoot    string `json:"log_root"`
-	PHPSvc     string `json:"php_svc"` // 默认 PHP 服务名，如 php@8.3
+	PHPSvc     string `json:"php_svc"` // 默认 PHP 服务名，如 php@8.2
 	PHPVer     string `json:"php_ver"`
 	PHPEtc     string `json:"php_etc"`
 	MySQLSvc   string `json:"mysql_svc"`
@@ -162,7 +188,7 @@ func root() string {
 // DefaultConfigPath 返回默认配置文件路径（受 ZIZPANEL_ROOT 影响）。
 // DefaultMirrorBase 是应用包镜像的默认基址（自建 NAS，经 mirror.zizdog.com 反代）。
 //
-// 面板里所有安装过程都先检查它：有就用（并且只用它），没有就明确失败。
+// 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 
 func DefaultConfigPath() string {
@@ -227,8 +253,9 @@ func Default() *Config {
 		AppProxy: true,
 		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）
 		AppProxyAuth: true,
-		// 应用包镜像：默认指向自建 NAS。面板所有安装过程先检查这里，
-		// 镜像上没有的资源会明确失败（不回退公网）。留空 = 关闭镜像（应急用）。
+		// 应用包镜像：默认指向自建 NAS。面板所有安装过程**优先**从这里下，
+		// 镜像上缺件/不可达时自动回落公网源（保证"镜像抖一下就装不上"不会发生）。
+		// 留空 = 关闭镜像（应急用）。
 		MirrorBase:         DefaultMirrorBase,
 		MirrorProbeSeconds: 4,
 		SessionHours:       72,
@@ -242,15 +269,17 @@ func Default() *Config {
 		MySQLPort:           3306,
 		MySQLSocket:         "/tmp/mysql.sock",
 		MySQLUser:           "root",
-		User:                u,
-		UserHome:            home,
-		UserUID:             lookupUID(u),
-		WWWRoot:             filepath.Join(home, "www"),
-		LogRoot:             filepath.Join(home, "www", "_logs"),
-		PHPSvc:              "php@8.3",
-		PHPVer:              "8.3",
-		MySQLSvc:            "mysql@8.4",
-		DockerSocket:        "/var/run/docker.sock",
+		// 60 秒：够用户看清楚提示并输入，又不至于让"人不在"的安装白等太久。
+		MySQLInputTimeoutSeconds: 60,
+		User:                     u,
+		UserHome:                 home,
+		UserUID:                  lookupUID(u),
+		WWWRoot:                  filepath.Join(home, "www"),
+		LogRoot:                  filepath.Join(home, "www", "_logs"),
+		PHPSvc:                   "php@8.2",
+		PHPVer:                   "8.2",
+		MySQLSvc:                 "mysql@8.4",
+		DockerSocket:             "/var/run/docker.sock",
 	}
 	c.applyBrewPrefix(brew)
 	c.TLSCert = filepath.Join(c.DataDir, "tls", "panel.crt")
@@ -277,13 +306,33 @@ var brewPrefixes = func() []string {
 // 之后面板在任务里装好 Homebrew，配置里的路径却永远是错的。
 // 真机（抹机后的 mini）就是这么复现的：Homebrew 明明装好了，
 // 任务却报 `env: /usr/local/bin/brew: No such file or directory`。
-func detectBrewPrefix() string {
+// 变量而不是函数：单测必须能把它指到 t.TempDir()（用 SetBrewPrefixDetectorForTest）。
+// 否则 `ReconcilePaths` 会在测试里把沙箱前缀**改回真机的 /opt/homebrew**，
+// 于是"PHP 多版本"这类会改 www.conf 的功能就会在 `go test` 时
+// 写用户真实的 /opt/homebrew/etc/php/<版本>/php-fpm.d/www.conf。
+// 本项目已经因为"测试漏沙箱化"把生产 nginx 配置改坏过一次，不再犯第二次。
+var detectBrewPrefix = detectBrewPrefixReal
+
+// detectBrewPrefixReal 是生产环境的实现（见上面的说明）。
+func detectBrewPrefixReal() string {
 	for _, p := range brewPrefixes() {
 		if st, err := os.Stat(filepath.Join(p, "bin", "brew")); err == nil && !st.IsDir() {
 			return p
 		}
 	}
 	return ""
+}
+
+// SetBrewPrefixDetectorForTest 替换 Homebrew 前缀探测，返回值供测试恢复原实现。
+//
+// **只给测试用。** 测试服务器（internal/web）会把它指向 t.TempDir()，
+// 否则任何"按 brew 前缀推导路径"的功能都会在测试里落到真机上。
+func SetBrewPrefixDetectorForTest(fn func() string) func() string {
+	prev := detectBrewPrefix
+	if fn != nil {
+		detectBrewPrefix = fn
+	}
+	return prev
 }
 
 // applyBrewPrefix 把由 Homebrew 前缀推导出来的路径统一写进配置。
@@ -296,7 +345,7 @@ func (c *Config) applyBrewPrefix(brew string) {
 	c.NginxBin = filepath.Join(brew, "bin", "nginx")
 	c.NginxConf = filepath.Join(brew, "etc", "nginx", "nginx.conf")
 	c.VhostDir = filepath.Join(brew, "etc", "nginx", "vhosts")
-	c.PHPEtc = filepath.Join(brew, "etc", "php", "8.3")
+	c.PHPEtc = filepath.Join(brew, "etc", "php", "8.2")
 	c.MySQLBin = filepath.Join(brew, "opt", "mysql@8.4", "bin", "mysql")
 	c.PmaDir = filepath.Join(brew, "share", "phpmyadmin")
 }
@@ -512,6 +561,10 @@ func (c *Config) fill() {
 	if c.MySQLUser == "" {
 		c.MySQLUser = d.MySQLUser
 	}
+	// 老配置没有这个字段（0）：补默认，否则"限时询问"会变成 0 秒＝立刻超时。
+	if c.MySQLInputTimeoutSeconds <= 0 {
+		c.MySQLInputTimeoutSeconds = d.MySQLInputTimeoutSeconds
+	}
 	if c.WorkDir == "" {
 		c.WorkDir = d.WorkDir
 	}
@@ -563,6 +616,24 @@ func (c *Config) EnsureDirs() error {
 		}
 	}
 	return nil
+}
+
+// SetMySQLPassword 更新面板持有的 MySQL 口令（带写锁）。
+//
+// 为什么要有它：改口令的请求与读配置的请求是并发的（设置页读、数据库页写），
+// 直接赋值会和 Save() 里的 json 序列化构成数据竞争。
+// 面板运行在 root 下，这里出错没有第二次机会，所以宁可多一把锁。
+func (c *Config) SetMySQLPassword(pw string) {
+	c.mu.Lock()
+	c.MySQLPassword = pw
+	c.mu.Unlock()
+}
+
+// MySQLPasswordValue 读取面板持有的 MySQL 口令（带读锁）。
+func (c *Config) MySQLPasswordValue() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MySQLPassword
 }
 
 // Save 原子写回配置文件（先写临时文件再 rename，避免半截文件）。

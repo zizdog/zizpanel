@@ -182,6 +182,20 @@ func (c *Client) query(ctx context.Context, sqlText string) ([]string, error) {
 // 密码通过 MYSQL_PWD 环境变量传递而不是 -p 参数：
 // 命令行参数在同机的 `ps` 输出里可见，环境变量只有同用户能读。
 func (c *Client) run(ctx context.Context, extra []string) ([]string, error) {
+	return c.exec(ctx, extra, "")
+}
+
+// runSQL 把一条 SQL 从 **stdin** 送进 mysql CLI（argv 里只有连接参数）。
+//
+// 为什么需要它：CREATE USER / ALTER USER 的口令必须作为字符串字面量出现在
+// SQL 里（MySQL 不支持占位符），而 `-e` 会把整条语句放进 argv ——
+// 同机任何用户 `ps` 一下就能看到明文口令。面板本身就是本机常驻进程，
+// 这个窗口是真实存在的。改走 stdin 之后 argv 里只剩连接参数。
+func (c *Client) runSQL(ctx context.Context, sqlText string) ([]string, error) {
+	return c.exec(ctx, nil, sqlText)
+}
+
+func (c *Client) exec(ctx context.Context, extra []string, stdin string) ([]string, error) {
 	bin := filepath.Join(c.opt.BinDir, "mysql")
 	if _, err := os.Stat(bin); err != nil {
 		return nil, fmt.Errorf("未找到 mysql 客户端: %s", bin)
@@ -192,6 +206,9 @@ func (c *Client) run(ctx context.Context, extra []string) ([]string, error) {
 	args := c.baseArgs()
 	args = append(args, extra...)
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	if c.opt.Password != "" {
 		cmd.Env = append(os.Environ(), "MYSQL_PWD="+c.opt.Password)
 	}
@@ -200,7 +217,7 @@ func (c *Client) run(ctx context.Context, extra []string) ([]string, error) {
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-			return nil, formatMySQLError(string(ee.Stderr))
+			return nil, formatMySQLError(string(ee.Stderr), c.opt.Password != "", c.opt.User)
 		}
 		return nil, fmt.Errorf("执行 mysql 命令失败: %w", err)
 	}
@@ -226,17 +243,59 @@ func (c *Client) baseArgs() []string {
 		"-P", strconv.Itoa(orDefaultInt(c.opt.Port, 3306)))
 }
 
+// ErrAuth 表示"认证失败（1045）"这一类错误。
+//
+// 为什么要一个哨兵错误而不是让上层匹配文案：上层要据此区分
+//   - 口令不对/为空（面板配置与服务器不一致 → 要引导用户去改配置）
+//   - 服务没起来（那是另一件事）
+//
+// 用 strings.Contains 匹配自己写的中文文案，改一次文案就会静默失效。
+var ErrAuth = errors.New("认证失败")
+
 // formatMySQLError 把 mysql CLI 的报错转成可读信息。
-func formatMySQLError(s string) error {
+//
+// passwordSent 是"这次连接有没有带口令"。两种 1045 的补救动作完全不同，
+// 所以必须区分开：
+//   - using password: NO  → 面板持有的口令是**空的**，而服务器要口令。
+//     也就是"面板以为无密码、MySQL 其实要密码"的不一致。
+//     2026-09-16 真机（mini）就是这样：面板把 root 改成了随机口令却没记住，
+//     之后所有库操作都是这句话，用户完全不知道发生了什么。
+//   - using password: YES → 带了口令但服务器不认（口令不对）。
+func formatMySQLError(s string, passwordSent bool, userName string) error {
 	s = strings.TrimSpace(s)
-	// 常见错误给出更有用的提示
+	who := orDefault(userName, "root")
 	switch {
 	case strings.Contains(s, "Access denied"):
-		return fmt.Errorf("认证失败：请检查数据库 root 密码是否正确（可在面板设置里更新）。原始信息：%s", s)
+		if !passwordSent {
+			return fmt.Errorf("%w：面板连接 MySQL 时没有带口令（面板持有的口令为空），"+
+				"但服务器要求口令 —— 两者不一致，所以**不能**据此认为 %s 没有密码。"+
+				"请到「数据库 → 连接设置」填入正确的 %s 口令（填完保存即可）。%s原始信息：%s",
+				ErrAuth, who, who, RecoveryGuide(who), s)
+		}
+		return fmt.Errorf("%w：面板持有的口令被服务器拒绝（口令不正确，或与这个账号不匹配）。"+
+			"请在「数据库 → 连接设置」更新 %s 的口令。%s原始信息：%s",
+			ErrAuth, who, RecoveryGuide(who), s)
 	case strings.Contains(s, "Can't connect"), strings.Contains(s, "Connection refused"):
 		return errors.New("无法连接 MySQL：请确认数据库服务正在运行")
 	}
 	return errors.New(s)
+}
+
+// RecoveryGuide 是"确实想不起 MySQL 口令"时的恢复向导（纯文本）。
+//
+// 为什么放在这里：页面提示、接口报错、安装自检三处都要给出同一份指引，
+// 各写一份迟早走样（本项目最典型的教训是"日志说一套、实现做一套"）。
+//
+// **面板绝不自动执行这段动作**：它要停掉 mysqld 并跳过权限表，属于破坏性操作，
+// 必须由用户明确决定。这里只提供可复制、可回滚的命令。
+func RecoveryGuide(user string) string {
+	if user == "" {
+		user = "root"
+	}
+	return fmt.Sprintf("若确实想不起口令，可在终端恢复（会短暂停掉 MySQL，请先确认没有正在写的业务）："+
+		"① 停掉 mysqld；② 用 `mysqld_safe --skip-grant-tables --skip-networking` 启动；"+
+		"③ 连上后执行 `FLUSH PRIVILEGES; ALTER USER '%s'@'localhost' IDENTIFIED BY '新口令';`；"+
+		"④ 恢复成正常启动；⑤ 把新口令填回「数据库 → 连接设置」（面板不会替你执行这组命令）。", user)
 }
 
 func orDefault(v, def string) string {
@@ -388,6 +447,12 @@ type DBUser struct {
 	Privileges  []string `json:"privileges"`
 	IsLocked    bool     `json:"is_locked"`
 	HasPassword bool     `json:"has_password"`
+	// AuthPlugin 是认证插件（mysql.user.plugin）。
+	//
+	// 为什么要回传它：HasPassword 只反映 authentication_string 是否为空，
+	// 而 auth_socket 这类插件**本来就不需要口令** —— 只看 "无密码" 会把
+	// "这个账号用 socket 认证"误读成"这个账号谁都能连"。界面据此区分文案。
+	AuthPlugin string `json:"auth_plugin"`
 	// Databases 该账号有权限的库（汇总）
 	Databases []string `json:"databases"`
 	// System 为 true 表示是 MySQL 自带账号
@@ -405,7 +470,8 @@ func (c *Client) ListUsers(ctx context.Context) ([]DBUser, error) {
 	// 先从 mysql.user 拿账号基础信息（MySQL 8 用 authentication_string 判断是否有密码）
 	sqlText := `SELECT User, Host,
        IF(account_locked='Y','1','0'),
-       IF(LENGTH(IFNULL(authentication_string,''))>0,'1','0')
+       IF(LENGTH(IFNULL(authentication_string,''))>0,'1','0'),
+       IFNULL(plugin,'')
 FROM mysql.user ORDER BY User, Host;`
 	lines, err := c.query(ctx, sqlText)
 	if err != nil {
@@ -438,13 +504,14 @@ FROM information_schema.SCHEMA_PRIVILEGES ORDER BY GRANTEE;`
 	var out []DBUser
 	for _, ln := range lines {
 		f := strings.Split(ln, "\t")
-		if len(f) < 4 {
+		if len(f) < 5 {
 			continue
 		}
 		u := DBUser{
 			User: f[0], Host: f[1],
 			IsLocked:    f[2] == "1",
 			HasPassword: f[3] == "1",
+			AuthPlugin:  f[4],
 			System:      systemUsers[f[0]],
 		}
 		key := "'" + u.User + "'@'" + u.Host + "'"

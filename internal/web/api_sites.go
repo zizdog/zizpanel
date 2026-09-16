@@ -14,6 +14,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/priv"
 	"github.com/zizdog/zizpanel/internal/sites"
+	"github.com/zizdog/zizpanel/internal/tlsx"
 )
 
 // ============================================================================
@@ -145,13 +146,22 @@ func (s *Server) nginxReload(ctx context.Context) error {
 
 // applySite 生成并应用一个站点的配置。
 //
-// 顺序很关键：先生成内容 → 让 helper 写入并校验 → reload。
+// 顺序很关键：先生成内容 → 让 helper 写入并校验 → reload → **按真实结果复核**。
 // helper 在写入前会做 nginx -t，不通过会回滚文件，
 // 因此这里不需要额外处理"配置已写坏"的情况。
+//
+// PHP 端点用 ResolveEndpoint：它要求该端点**真的在监听**。
+// 宁可在保存时明确失败（"PHP 8.4 没在运行"），也不要写出一份
+// 指向空气的 vhost —— 那种情况下站点是 502，用户得翻 nginx 错误日志
+// 才能知道是 PHP 版本没起来。
 func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	pass := ""
 	if site.PHPVersion != "" {
-		pass = sites.ResolveFastCGI(s.Cfg.BrewPrefix, site.PHPVersion)
+		resolved, err := sites.ResolveEndpoint(s.Cfg.BrewPrefix, site.PHPVersion)
+		if err != nil {
+			return err
+		}
+		pass = resolved
 	}
 	content, err := site.Generate(sites.Options{
 		LogDir:      s.siteLogDir(),
@@ -160,13 +170,114 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err != nil {
 		return err
 	}
-	if err := s.writeVhost(ctx, site.Domain, content); err != nil {
+	if err := siteWriteVhostFn(s, ctx, site.Domain, content); err != nil {
 		return err
 	}
-	if err := s.nginxReload(ctx); err != nil {
+	// 写 vhost 的 helper 会以 root 跑 `nginx -t`，而 nginx **在校验时就会创建
+	// access_log/error_log** —— 于是日志文件是 root 属主；而已启动的 nginx master
+	// 以真实用户运行，reload 时打不开它们：
+	//   [emerg] open() "/Users/zizdog/www/_logs/xxx.access.log" failed (13: Permission denied)
+	// 结果是**配置根本没加载**（站点 404），而 reload 命令仍返回 0。
+	// 所以 reload 之前把日志目录交还真实用户（与"整理默认站点"同一套做法）。
+	// 真机 2026-09-17：mini 上 nginx 已改成以真实用户运行，这条路径必须先修。
+	if s.Cfg.User != "" && os.Geteuid() == 0 {
+		_ = chownTreeTo(s.siteLogDir(), s.Cfg.User)
+	}
+	if err := siteReloadFn(s, ctx); err != nil {
 		return fmt.Errorf("配置已写入但 nginx 重载失败: %w", err)
 	}
+	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败（例如日志/证书文件打不开）
+	// 时会在错误日志里写 [emerg]，而 `nginx -s reload` **退出码依然是 0**。
+	// 不复核的话，"面板说创建成功、用户打开是 404/502"就是必然结果。
+	if err := s.verifySiteServed(ctx, site); err != nil {
+		return err
+	}
 	return nil
+}
+
+// siteWriteVhostFn / siteReloadFn / siteProbeFn 是 applySite 的三个可注入步骤。
+//
+// 为什么做成包级变量：applySite 的收尾复核必须能被单测覆盖，而单测
+// **不允许调用提权助手、不允许真发网络请求**。生产环境这三个变量指向
+// 真实实现，行为与直接调用完全一致。
+var (
+	siteWriteVhostFn = func(s *Server, ctx context.Context, domain, content string) error {
+		return s.writeVhost(ctx, domain, content)
+	}
+	siteReloadFn = func(s *Server, ctx context.Context) error {
+		return s.nginxReload(ctx)
+	}
+	// siteProbeFn 的签名与 sites_check.go 的 curlSite 一致（用 --resolve 钉到 127.0.0.1）。
+	siteProbeFn = curlSite
+)
+
+// siteVhostProbePath 是"配置是否真的生效"的探测路径。
+//
+// 为什么是这个点开头的路径：每个站点 vhost（internal/sites 生成）都带这条规则
+//
+//	location ~ /\. { deny all; access_log off; log_not_found off; }
+//
+// 正则 location 的优先级高于 `location /`，所以**只要该站点的 vhost 真的被
+// nginx 加载了**，这个请求必定返回 403。而如果 vhost 没加载，请求会落到默认
+// 站点（000-default）—— 它没有这条规则，`try_files $uri $uri/ =404` 会返回 404。
+//
+// 于是"403 = 配置生效 / 404 = 配置没生效"是一个与站点自身内容无关的硬判据：
+//   - 不受"站点根目录还没有 index 文件"影响（那种情况首页也是 404，
+//     但那是站点内容问题，不是配置没加载）；
+//   - 不受反向代理上游是否健康影响（正则规则在上游之前命中）；
+//   - 不需要往用户站点目录里写探针文件。
+const siteVhostProbePath = "/.zp-vhost-probe"
+
+// verifySiteServed 在 reload 之后按真实请求复核"这份 vhost 真的生效了"。
+//
+// 注意用 curlSite（--resolve 钉到 127.0.0.1），所以域名没有 DNS 解析也能测；
+// 也不能改成直接 fetchLocal("<域名>/")：那会走真实 DNS。
+func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
+	scheme, port := "http", 80
+	if site.SSLEnabled {
+		scheme, port = "https", 443
+	}
+	code, _, err := siteProbeFn(ctx, scheme, site.Domain, port, siteVhostProbePath, 8*time.Second)
+	if err == nil && code == "403" {
+		return nil
+	}
+
+	// 失败时给出最可能的原因，而不是一句"配置没生效"。
+	logDir := s.siteLogDir()
+	base := fmt.Sprintf(
+		"站点 %s 的配置已写入且 nginx 重载命令成功，但复核发现**新配置没有生效**"+
+			"（探测 %s://%s:%d%s 期望 403，实际 %s）",
+		site.Domain, scheme, site.Domain, port, siteVhostProbePath, describeProbeCode(code, err))
+	switch code {
+	case "404":
+		return fmt.Errorf("%s。404 说明请求落到了默认站点：最常见的原因是 %s 里的日志文件"+
+			"归属/权限不对（nginx worker 打不开 access_log 时 reload 会失败但退出码仍是 0），"+
+			"或 vhost 文件没写进 conf.d。请到「日志中心 → nginx error_log」看 [emerg] 行",
+			base, logDir)
+	case "000", "":
+		return fmt.Errorf("%s。连不上 nginx：确认 nginx 正在运行、%d 端口在监听%s",
+			base, port, errSuffix(err))
+	default:
+		return fmt.Errorf("%s。该状态码不是站点 vhost 的隐藏文件规则给出的，"+
+			"通常意味着自定义配置（extra_conf）覆盖了 `location ~ /\\.`，请检查后重试", base)
+	}
+}
+
+func describeProbeCode(code string, err error) string {
+	if code == "" {
+		if err != nil {
+			return "无响应（" + err.Error() + "）"
+		}
+		return "无响应"
+	}
+	return code
+}
+
+func errSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "（" + err.Error() + "）"
 }
 
 // ensureSiteRoot 创建站点根目录。
@@ -218,85 +329,33 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// detectPHPVersions 探测本机已安装的 PHP 版本。
+// detectPHPVersions 探测本机已安装的 PHP 版本，并补齐运行时状态。
 //
-// 关键处理：按"实际运行的 FPM 地址"去重，而不是按 formula 名逐个列出。
+// 已安装版本的发现逻辑在 sites.DiscoverPHPVersions（按 Homebrew 实际安装情况推导，
+// 不写死列表）。这里只做两件本层才做得了的事：
 //
-// 踩过的坑：Homebrew 的 `php` 是版本别名（当前指向 8.4），
-// 而用户可能同时装了 php@8.3 并让 8.3 占着 9000 端口。
-// 按 formula 名列出时，界面会出现两个都声称监听 9000 的版本；
-// 用户选了"8.4"但实际由 9000 上的 8.3 处理，
-// 表现为"我明明选了 8.4，跑的却是 8.3" —— 极难排查。
+//  1. 探测端点是否真的在监听（界面上"运行中/未运行"必须是真的）；
+//  2. 用一次真实请求探测端点背后实际运行的版本（X-Powered-By）。
 //
-// 因此这里：
-//  1. 以 fastcgi 地址为主键去重
-//  2. 额外探测该地址上真实运行的版本（X-Powered-By），让不一致直接可见
+// 为什么不再按 formula 名逐个列出、也不再按端点去重：
+// 旧实现里每个版本都被解析成 127.0.0.1:9000，于是 php@8.3 与 php@8.4 会在
+// 去重后**只剩一个**，用户根本看不到第二个版本、更谈不上按站点选它。
+// 现在每个版本有唯一端点（sites.PreferredEndpoint），去重不再需要，
+// "两个版本共用端点"这种情况反而要**显式暴露**出来（PHPVersion.Conflict）。
 func (s *Server) detectPHPVersions(ctx context.Context) []sites.PHPVersion {
-	optDir := filepath.Join(s.Cfg.BrewPrefix, "opt")
-	entries, err := os.ReadDir(optDir)
-	if err != nil {
-		return []sites.PHPVersion{}
-	}
-
-	byPass := map[string]sites.PHPVersion{}
-	var order []string
-
-	for _, e := range entries {
-		name := e.Name()
-		if name != "php" && !strings.HasPrefix(name, "php@") {
-			continue
+	out := sites.DiscoverPHPVersions(s.Cfg.BrewPrefix)
+	for i := range out {
+		if out[i].Pass != "" {
+			out[i].Running = sites.EndpointLive(out[i].Pass)
 		}
-		version := "8.3"
-		if v, ok := strings.CutPrefix(name, "php@"); ok {
-			version = v
-		} else if name == "php" {
-			// php 是版本别名：解析软链接拿到真实版本号
-			if link, err := os.Readlink(filepath.Join(optDir, name)); err == nil {
-				base := filepath.Base(link)
-				if v, ok := strings.CutPrefix(base, "php@"); ok {
-					version = v
-				} else if base != "php" {
-					version = base
-				}
-			}
-		}
-		if version == "" {
-			continue
-		}
-
-		pass := sites.ResolveFastCGI(s.Cfg.BrewPrefix, version)
-		pv := sites.PHPVersion{
-			Version:   version,
-			Service:   name,
-			Binary:    filepath.Join(optDir, name, "bin", "php"),
-			FPMConf:   filepath.Join(s.Cfg.BrewPrefix, "etc", "php", version, "php-fpm.d", "www.conf"),
-			Pass:      pass,
-			IsDefault: name == s.Cfg.PHPSvc,
-		}
-		if port := sites.ParsePort(pass); port > 0 {
-			pv.Running = isPortListening(ctx, port)
-		} else if strings.HasPrefix(pass, "unix:") {
-			_, err := os.Stat(strings.TrimPrefix(pass, "unix:"))
-			pv.Running = err == nil
-		}
-
-		// 同一 fastcgi 地址只保留一个条目：
-		// 运行中的优先；都运行时优先带 @ 版本号的那个（信息更明确）
-		if prev, exists := byPass[pass]; exists {
-			takeNew := (pv.Running && !prev.Running) ||
-				(pv.Running == prev.Running && !strings.Contains(prev.Service, "@") && strings.Contains(pv.Service, "@"))
-			if takeNew {
-				byPass[pass] = pv
-			}
-			continue
-		}
-		byPass[pass] = pv
-		order = append(order, pass)
-	}
-
-	out := make([]sites.PHPVersion, 0, len(order))
-	for _, pass := range order {
-		out = append(out, byPass[pass])
+		// "默认版本"标记：配置里 PHPSvc 指向的就是默认（例如 php@8.3）。
+		//
+		// 注意不能只在 out[i].IsDefault 为 true 时才判断 —— DiscoverPHPVersions
+		// 是按版本号去重的，`php` 别名与 `php@8.4` 会合并成一条，
+		// 保留下来的那条未必叫 php，光看名字会漏掉真正的默认版本。
+		out[i].IsDefault = s.Cfg.PHPSvc == out[i].Service ||
+			s.Cfg.PHPSvc == "php@"+out[i].Version ||
+			(s.Cfg.PHPSvc == "php" && out[i].Service == "php")
 	}
 	s.probePHPVersions(ctx, out)
 	return out
@@ -540,9 +599,15 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	confPath := filepath.Join(s.Cfg.VhostDir, domain+".conf")
 	conf, _ := os.ReadFile(confPath)
+	// 这里用 ResolveConfigEndpoint 而不是 ResolveEndpoint：
+	// 详情页即使 FPM 没在跑也要能显示"配置里写的是哪个端点"，
+	// 并把错误原文交给界面展示（而不是只给一个空白）。
 	pass := ""
+	passErr := ""
 	if site.PHPVersion != "" {
-		pass = sites.ResolveFastCGI(s.Cfg.BrewPrefix, site.PHPVersion)
+		var rerr error
+		pass, rerr = sites.ResolveConfigEndpoint(s.Cfg.BrewPrefix, site.PHPVersion)
+		passErr = errString(rerr)
 	}
 	generated, genErr := site.Generate(sites.Options{
 		LogDir: s.siteLogDir(), FastCGIPass: pass,
@@ -554,12 +619,56 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 		"generated":    generated,
 		"generate_err": errString(genErr),
 		"fastcgi_pass": pass,
+		"fastcgi_err":  passErr,
 		"log_dir":      s.siteLogDir(),
 		"access_log":   filepath.Join(s.siteLogDir(), domain+".access.log"),
 		"error_log":    filepath.Join(s.siteLogDir(), domain+".error.log"),
 		"presets":      sites.RewritePresets,
 		"php_versions": s.detectPHPVersions(r.Context()),
+		// 证书来源/到期/剩余天数的完整字段（前端据此显示"哪来的、还剩几天"）。
+		"ssl": s.siteSSLView(site),
 	})
+}
+
+// siteSSLView 汇总站点证书的展示字段。
+//
+// 到期时间优先取自**真实证书文件**（tlsx.CertExpiry），而不是数据库里的
+// ssl_expires 字符串：文件才是 nginx 实际加载的东西；数据库字段可能是
+// 上一次写入时的快照（例如 acme 续期后还没重新保存站点记录）。
+// 读不到文件时退回数据库字段，days_left 用 -1 表示"无法判断"，不猜。
+func (s *Server) siteSSLView(site *sites.Site) map[string]any {
+	v := map[string]any{
+		"enabled":        site.SSLEnabled,
+		"provider":       site.SSLProvider,
+		"provider_label": sslProviderLabel(site.SSLProvider),
+		"cert_path":      site.SSLCert,
+		"key_path":       site.SSLKey,
+		"expires":        site.SSLExpires,
+		"not_after":      "",
+		"days_left":      -1,
+		"renew_hint":     "",
+	}
+	if !site.SSLEnabled || site.SSLCert == "" {
+		return v
+	}
+	// 用 tlsx（纯 Go）直接读证书文件：文件才是 nginx 实际加载的东西，
+	// 而数据库里的 ssl_expires 只是上一次写入时的快照（acme 续期后可能还没更新）。
+	if notAfter, err := tlsx.CertExpiry(site.SSLCert); err == nil && !notAfter.IsZero() {
+		days := int(time.Until(notAfter).Hours() / 24)
+		v["not_after"] = notAfter.Format(time.RFC3339)
+		v["expires"] = notAfter.Format("2006-01-02 15:04:05")
+		v["days_left"] = days
+		switch {
+		case days < 0:
+			v["renew_hint"] = "证书已过期，请立即续期或重新绑定"
+		case days <= certRenewThresholdDays:
+			v["renew_hint"] = fmt.Sprintf("证书将在 %d 天内到期", days)
+		}
+		return v
+	}
+	// 读不到文件（被删了/权限不对）—— 如实标出来，不要显示成"正常"。
+	v["renew_hint"] = "无法读取证书文件（可能已被删除或权限不足）"
+	return v
 }
 
 type siteUpdateReq struct {
@@ -698,20 +807,34 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 // ---------- SSL ----------
 
 type siteSSLReq struct {
-	Provider string   `json:"provider"` // self / mkcert / manual
+	Provider string   `json:"provider"` // self / mkcert / manual / acme
 	Cert     string   `json:"cert"`
 	Key      string   `json:"key"`
 	ExtraSAN []string `json:"extra_san"`
 	Enable   bool     `json:"enable"`
+
+	// CertPrimary 指定要绑定的 ACME 证书（primary 名）。
+	// 不给时按站点域名/别名自动匹配（见 matchCertForSite）。
+	CertPrimary string `json:"cert_primary"`
+	// Domain 是 cert_primary 的容错写法：允许前端直接给一个域名，
+	// 由面板去证书库里找覆盖它的那一张。
+	Domain string `json:"domain"`
 }
 
-// handleSiteSSL 为站点签发/配置证书。
-//
-// 目前支持两种自动签发：
+// handleSiteSSL 为站点签发/配置证书。支持四种来源：
 //   - self   ：openssl 自签（无需任何外部依赖，浏览器会提示不受信任）
 //   - mkcert ：使用 mkcert 的本地 CA（在已信任 mkcert CA 的机器上无提示）
+//   - manual ：用户粘贴证书与私钥
+//   - acme   ：直接引用 internal/acme 已签发的证书（Let's Encrypt 等）
 //
-// Let's Encrypt 需要公网域名与 80 端口可达，计划在后续阶段接入 lego。
+// acme 来源**不在这里签发**：签发要等 CA 完成 DNS/HTTP 校验，是几十秒到
+// 几分钟的长任务，必须走任务中心（POST /api/v1/certs）。这里只按域名匹配
+// 已有证书，匹配不到就明确提示先去证书页申请 —— 同步接口挂几分钟既违反
+// "长任务必须走任务中心"的约定，用户也看不到任何进度。
+//
+// 关键点：站点写回的是 acme 引擎自己的路径 `<DataDir>/certs/<primary>/...`，
+// **不是复制一份到 site-certs**。因为续期是原地覆盖同一份文件，
+// 站点 vhost 里的 ssl_certificate 一个字都不用改就能用上新证书。
 func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -726,53 +849,75 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	certDir := filepath.Join(s.Cfg.DataDir, "site-certs", domain)
-	if err := os.MkdirAll(certDir, 0o755); err != nil {
-		fail(w, http.StatusInternalServerError, "创建证书目录失败: "+err.Error())
-		return
-	}
-	certPath := filepath.Join(certDir, "fullchain.pem")
-	keyPath := filepath.Join(certDir, "privkey.pem")
+	var (
+		certPath string
+		keyPath  string
+		expires  string
+	)
 
 	switch req.Provider {
-	case "self":
-		if _, err := s.callHelper(r.Context(), "site-cert-self",
-			"--domain", domain, "--cert", certPath, "--key", keyPath); err != nil {
-			fail(w, http.StatusInternalServerError, "签发自签证书失败: "+err.Error())
+	case "self", "mkcert", "manual":
+		// 这三个来源都把证书复制/生成到站点自己的目录里（与 acme 分开存放，
+		// 避免"面板的证书库"和"站点私有证书"混在一起）。
+		certDir := filepath.Join(s.Cfg.DataDir, "site-certs", domain)
+		if err := os.MkdirAll(certDir, 0o755); err != nil {
+			fail(w, http.StatusInternalServerError, "创建证书目录失败: "+err.Error())
 			return
 		}
-	case "mkcert":
-		if _, err := s.callHelper(r.Context(), "mkcert-issue",
-			"--hosts", strings.Join(append([]string{domain}, req.ExtraSAN...), ","),
-			"--cert", certPath, "--key", keyPath); err != nil {
-			fail(w, http.StatusInternalServerError,
-				"mkcert 签发失败: "+err.Error()+"（可先执行 brew install mkcert nss && mkcert -install）")
+		certPath = filepath.Join(certDir, "fullchain.pem")
+		keyPath = filepath.Join(certDir, "privkey.pem")
+		switch req.Provider {
+		case "self":
+			if _, err := s.callHelper(r.Context(), "site-cert-self",
+				"--domain", domain, "--cert", certPath, "--key", keyPath); err != nil {
+				fail(w, http.StatusInternalServerError, "签发自签证书失败: "+err.Error())
+				return
+			}
+		case "mkcert":
+			if _, err := s.callHelper(r.Context(), "mkcert-issue",
+				"--hosts", strings.Join(append([]string{domain}, req.ExtraSAN...), ","),
+				"--cert", certPath, "--key", keyPath); err != nil {
+				fail(w, http.StatusInternalServerError,
+					"mkcert 签发失败: "+err.Error()+"（可先执行 brew install mkcert nss && mkcert -install）")
+				return
+			}
+		case "manual":
+			if req.Cert == "" || req.Key == "" {
+				fail(w, http.StatusBadRequest, "手工模式需要提供证书与私钥内容")
+				return
+			}
+			if err := os.WriteFile(certPath, []byte(req.Cert), 0o644); err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if err := os.WriteFile(keyPath, []byte(req.Key), 0o600); err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		// 读取证书到期时间，便于前端提示续期
+		if res, err := s.callHelper(r.Context(), "site-cert-info", certPath); err == nil {
+			if data, okk := res["data"].(map[string]any); okk {
+				expires, _ = data["expires"].(string)
+			}
+		}
+	case "acme":
+		cert, err := s.matchCertForSite(site, req)
+		if err != nil {
+			// 400 而不是 500：这是"还没申请证书"这种可预期的用户状态。
+			fail(w, http.StatusBadRequest, err.Error())
 			return
 		}
-	case "manual":
-		if req.Cert == "" || req.Key == "" {
-			fail(w, http.StatusBadRequest, "手工模式需要提供证书与私钥内容")
-			return
-		}
-		if err := os.WriteFile(certPath, []byte(req.Cert), 0o644); err != nil {
-			fail(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := os.WriteFile(keyPath, []byte(req.Key), 0o600); err != nil {
-			fail(w, http.StatusInternalServerError, err.Error())
+		certPath, keyPath = cert.CertPath, cert.KeyPath
+		expires = cert.NotAfter.Format("2006-01-02 15:04:05")
+		if !dirExists(filepath.Dir(certPath)) || !fileExists(certPath) || !fileExists(keyPath) {
+			fail(w, http.StatusBadRequest,
+				"证书记录存在但文件缺失（"+certPath+"）：请在「证书」页重新申请或续期后再绑定")
 			return
 		}
 	default:
 		fail(w, http.StatusBadRequest, "不支持的证书来源: "+req.Provider)
 		return
-	}
-
-	// 读取证书到期时间，便于前端提示续期
-	expires := ""
-	if res, err := s.callHelper(r.Context(), "site-cert-info", certPath); err == nil {
-		if data, okk := res["data"].(map[string]any); okk {
-			expires, _ = data["expires"].(string)
-		}
 	}
 
 	site.SSLEnabled = true
@@ -785,13 +930,20 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// acme 来源同样走 applySite —— 因此自动获得"写 vhost → reload →
+	// 403 探针复核"这条完整链路，不会出现"面板说绑定成功、站点其实没生效"。
 	if err := s.applySite(r.Context(), site); err != nil {
 		fail(w, http.StatusInternalServerError, "证书已签发但应用配置失败: "+err.Error())
 		return
 	}
 
-	s.audit(r, "site_ssl", domain, "签发证书 provider="+req.Provider+" 到期="+expires, true, "")
-	ok(w, map[string]any{"site": site, "cert": certPath, "key": keyPath, "expires": expires})
+	s.audit(r, "site_ssl", domain, "绑定证书 provider="+req.Provider+" 到期="+expires, true, "")
+	ok(w, map[string]any{
+		"site": site, "cert": certPath, "key": keyPath, "expires": expires,
+		// 前端可直接用这些字段显示"哪来的/还剩几天"，不用自己去解析证书。
+		"provider_label": sslProviderLabel(req.Provider),
+		"days_left":      siteSSLDaysLeft(certPath),
+	})
 }
 
 // handleSiteSSLDisable 关闭 SSL。
@@ -975,23 +1127,6 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// isPortListening 判断 TCP 端口是否在监听。
-func isPortListening(ctx context.Context, port int) bool {
-	if port <= 0 {
-		return false
-	}
-	// 直接尝试连接，比调用 lsof 更快、也不需要权限
-	ctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-	defer cancel()
-	d := netDialer()
-	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
 // Shutdown 在面板退出时清理资源。
 //
 // 必须关掉终端会话：它们持有真实的 shell 子进程，
@@ -1021,6 +1156,11 @@ func (s *Server) Startup(ctx context.Context) {
 	}
 
 	s.ensureNginxEnvOnStart(ctx)
+
+	// 证书自动续期：登记到面板既有的调度器里（每日检查一次，实现见 api_certs.go）。
+	// 这里只登记，不做立即续期 —— 真正决定签发的门槛是 NeedsRenewal，
+	// 启动路径上不该引入额外的网络等待。
+	s.startCertRenewal(ctx)
 
 	// 空闲终端会话回收：
 	// WebSocket 断开时会关闭会话，但网络异常（客户端崩溃、断网）

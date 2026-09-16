@@ -66,6 +66,32 @@ func (s *Server) svcManager() *services.Manager {
 		// svcManager() 每次都按当前 Cfg 新建，所以设置页保存后立刻生效。
 		MirrorBase:         s.Cfg.MirrorBase,
 		MirrorProbeSeconds: s.Cfg.MirrorProbeSeconds,
+		// 仅走 NAS（离线）模式：打开后各安装器禁止回落外网
+		// （见 internal/services/mirror.go 的 MirrorOfflineOnly）。
+		OfflineOnly: s.Cfg.OfflineOnly,
+		// MySQL root 凭据闭环：读面板当前持有的凭据、把新口令写回 config.json。
+		//
+		// 为什么从这里注入而不是让 services 自己读配置：凭据只有一份来源
+		// （config.json，0600），services 不该再造一份。安装流程结束后
+		// 「数据库」页面看到的必须就是这里写进去的那一份。
+		MySQLCredential: func() services.MySQLCredential {
+			return services.MySQLCredential{
+				Host:     s.Cfg.MySQLHost,
+				Port:     s.Cfg.MySQLPort,
+				Socket:   s.Cfg.MySQLSocket,
+				User:     s.Cfg.MySQLUser,
+				Password: s.Cfg.MySQLPasswordValue(),
+			}
+		},
+		SetMySQLRootPassword: func(pw string) error {
+			// 先改内存再落盘；落盘失败时**不回滚**内存值 ——
+			// 回滚会让"已经改好的 MySQL"与"面板手里的口令"立刻不一致，
+			// 用户连补救的入口都没有了。错误原样上抛，调用方会把它写进
+			// 任务步骤与告警（并保留一次性凭据区块）。
+			s.Cfg.SetMySQLPassword(pw)
+			return s.Cfg.Save()
+		},
+		MySQLInputTimeout: time.Duration(s.Cfg.MySQLInputTimeoutSeconds) * time.Second,
 	})
 }
 
@@ -125,6 +151,103 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 		detail.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
 	}
 	ok(w, detail)
+}
+
+// handleBrewOverview 直接返回 **brew 的真实状态**（只读）。
+//
+// 设计立场（用户 2026-09-16 的批评）：面板过去自己维护"装了什么/在不在跑"，
+// 与 brew 的真实状态漂移，于是出现"日志说装了、市场看不到、服务管理也没有"。
+// 这里把 brew 当**唯一真相来源**直接读出来给前端渲染：
+//
+//	· brew services list --json   → 服务到底起没起、pid、退出码
+//	· brew outdated --json=v2     → 哪些能升级（面板此前完全没有这个能力）
+//	· brew list --versions        → 本机装了哪些 formula 及版本
+//
+// 只读、不改任何状态；失败如实把错误放进对应字段，不谎报。
+func (s *Server) handleBrewOverview(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	mgr := s.svcManager()
+	out := map[string]any{}
+
+	captureJSON := func(key string, args ...string) {
+		txt, err := mgr.BrewCapture(ctx, 40*time.Second, args...)
+		if err != nil {
+			out[key] = map[string]any{"error": err.Error()}
+			return
+		}
+		var v any
+		if json.Unmarshal([]byte(txt), &v) != nil {
+			out[key] = map[string]any{"raw": strings.TrimSpace(txt)}
+			return
+		}
+		out[key] = v
+	}
+	captureJSON("services", "services", "list", "--json")
+	captureJSON("outdated", "outdated", "--json=v2")
+
+	// installed 用文本形式（brew list --versions 最快，且不需要解析大 JSON）
+	if txt, err := mgr.BrewCapture(ctx, 40*time.Second, "list", "--versions"); err != nil {
+		out["installed_error"] = err.Error()
+	} else {
+		var list []map[string]string
+		for _, line := range strings.Split(strings.TrimSpace(txt), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 2 {
+				list = append(list, map[string]string{"name": f[0], "version": strings.Join(f[1:], " ")})
+			}
+		}
+		out["installed"] = list
+	}
+	ok(w, out)
+}
+
+// handleServiceCredentials 返回面板管理的应用配置里的登录凭据。
+//
+// 为什么需要：面板给 frpc 这类应用**随机生成** admin UI 的用户名/口令，
+// 只在安装任务日志里出现过一次 —— 用户事后想登录 7400（或 Orbien 的 8020）
+// 只能自己去翻配置文件（2026-09-16 用户反馈"安装的时候也没让设置啊"）。
+// 这里把凭据从**面板自己生成的那个配置文件**里解析出来，服务详情里直接可看。
+//
+// 只读、且只对"面板管理的应用"开放（按服务记录找到目录条目再定位配置文件）。
+func (s *Server) handleServiceCredentials(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	v, err := s.svcManager().Get(r.Context(), name)
+	if err != nil {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	app, okk := services.FindAppByService(v.Service)
+	if !okk {
+		fail(w, http.StatusNotFound, "这个服务不是面板管理的应用，没有可解析的凭据")
+		return
+	}
+	path := services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
+	if path == "" {
+		fail(w, http.StatusNotFound, "这个应用没有可读取的配置文件")
+		return
+	}
+	b, rerr := os.ReadFile(path)
+	if rerr != nil {
+		fail(w, http.StatusNotFound, "读取配置失败："+rerr.Error())
+		return
+	}
+	// 地址必须用**服务所在机器**的，不能用请求里的客户端 IP。
+	// 后者是浏览器的地址（真机踩到：显示成用户自己电脑的 192.168.1.179）。
+	// 同时给出"本机"与"局域网"两个地址：在本机上用 127.0.0.1 更稳妥
+	// （en0 未必是当前在用的网卡）。
+	ui, uiLocal := "", ""
+	if app.Port > 0 {
+		uiLocal = fmt.Sprintf("http://127.0.0.1:%d", app.Port)
+		if ip := s.svcManager().PrimaryIP(); ip != "" && !strings.HasPrefix(ip, "<") {
+			ui = fmt.Sprintf("http://%s:%d", ip, app.Port)
+		}
+	}
+	ok(w, map[string]any{
+		"config_path": path,
+		"ui":          ui,
+		"ui_local":    uiLocal,
+		"credentials": services.ExtractCredentials(string(b)),
+	})
 }
 
 // ---------- 服务操作 ----------
@@ -428,10 +551,17 @@ func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) 
 	name := r.PathValue("name")
 	s.launchTask(w, r, "uninstall", name, "卸载服务 "+name,
 		"service_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{Steps: []string{}}
 			if err := s.svcManager().Uninstall(ctx, name); err != nil {
-				return nil, err
+				return res, err
 			}
-			return map[string]any{"msg": "服务已卸载"}, nil
+			res.Steps = append(res.Steps, "服务已卸载")
+			// 卸载后护栏：卸载流程（尤其 brew uninstall / autoremove）可能把
+			// 作为共享依赖的 ffmpeg 一起带走，而那是"200 + 空 body"事故的起点。
+			// 这是通用服务卸载，不知道用户有意删了哪个 formula，所以传空串：
+			// 缺什么就补什么。
+			s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, "")
+			return res, nil
 		})
 }
 
@@ -542,7 +672,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 				if l == "" {
 					continue
 				}
-				if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", l+".plist")); err == nil {
+				if _, err := os.Stat(filepath.Join(launchDaemonsDir, l+".plist")); err == nil {
 					isInstalled = true
 					break
 				}
@@ -673,10 +803,17 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 	case "service":
 		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
 			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				res := &services.InstallResult{Steps: []string{}}
 				if err := s.svcManager().Uninstall(ctx, plan.Service); err != nil {
-					return nil, err
+					return res, err
 				}
-				return map[string]any{"msg": "已卸载 " + app.Name}, nil
+				res.Steps = append(res.Steps, "已卸载 "+app.Name)
+				// 卸载后护栏：brew 的清理动作可能把共享依赖（ffmpeg）一起带走，
+				// 而那种"静默消失"正是 TTS 全败事故的起点。见 basedep.go。
+				// 传 app.BrewFormula：如果是用户主动卸载了提供基础依赖的那个包
+				// （例如 ffmpeg 本身），护栏只报告后果、不自动装回去。
+				s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, app.BrewFormula)
+				return res, nil
 			})
 	case "installer":
 		if plan.Blocked != "" {
@@ -689,6 +826,20 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 				if err := s.svcManager().UninstallApp(ctx, app.ID, removeData, res); err != nil {
 					return res, err
 				}
+				// 卸载成功后必须**同时**把服务记录删掉：只删文件与 plist 的话，
+				// 用户在「服务管理」里还会看到它，观感就是"根本没卸掉"
+				// （2026-09-16 用户反馈）。按 label 删，label 从目录条目取。
+				if app.ServiceLabel != "" {
+					if n, ferr := s.svcManager().ForgetByLabel(ctx, app.ServiceLabel); ferr == nil && n > 0 {
+						res.Steps = append(res.Steps,
+							fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, app.ServiceLabel))
+					}
+				}
+				// 卸载后护栏：phpMyAdmin 这类会跑 `brew uninstall`，而 brew 的
+				// autoremove 有可能把作为共享依赖的 ffmpeg 一起带走 ——
+				// 那种"静默消失"（TTS 返回 200 + 空 body）必须在这里被抓住并补回。
+				// 传 app.BrewFormula：用户主动卸载 ffmpeg 条目时不自动装回去。
+				s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, app.BrewFormula)
 				return res, nil
 			})
 	default:
@@ -733,6 +884,9 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	case "phpmyadmin":
 		s.handleInstallPhpMyAdmin(w, r)
 		return
+	case "ffmpeg":
+		s.handleInstallBaseDependency(w, r)
+		return
 	case "docker-runtime":
 		s.handleInstallDockerRuntime(w, r)
 		return
@@ -776,7 +930,7 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 // 而且任务挂在 r.Context() 上 —— 一刷新就把 brew 杀了。现在交给任务中心，
 // 立刻返回 task_id，进度走 SSE（见 SPEC-任务中心.md）。
 func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "lnmp", "一键安装 LNMP 环境（nginx / PHP 8.3 / MySQL 8.4）",
+	s.launchTask(w, r, "install", "lnmp", "一键安装 LNMP 环境（nginx / PHP 8.2 / MySQL 8.4）",
 		"install_lnmp", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "lnmp", Steps: []string{}}
 			if err := s.svcManager().InstallLNMP(ctx, res); err != nil {
@@ -794,6 +948,25 @@ func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request)
 			if err := s.svcManager().InstallPhpMyAdmin(ctx, res); err != nil {
 				return res, err
 			}
+			return res, nil
+		})
+}
+
+// handleInstallBaseDependency 单独安装基础依赖（目前只有 ffmpeg 这一条）。
+//
+// 为什么不走通用 brew 流程：ffmpeg 是**纯命令行工具**，没有 brew service。
+// 通用流程会去 `brew services start ffmpeg`，得到一个"已安装，但启动失败"的
+// 假警告，还会在服务管理里留下一条永远没有状态的假记录。
+// 这里只做一件事：EnsureBaseDependencies（幂等：已装则跳过并说明）。
+func (s *Server) handleInstallBaseDependency(w http.ResponseWriter, r *http.Request) {
+	s.launchTask(w, r, "install", "ffmpeg", "安装 FFmpeg（音视频工具）",
+		"install_basedep", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "ffmpeg", Steps: []string{}}
+			if err := s.svcManager().EnsureBaseDependencies(ctx, res); err != nil {
+				return res, err
+			}
+			res.Steps = append(res.Steps,
+				"FFmpeg 已就绪：TTS 编码 mp3、音色样本校验与后续音视频功能都会用到它")
 			return res, nil
 		})
 }
@@ -1061,11 +1234,20 @@ func checkPortHelper(ctx context.Context, port int) (string, error) {
 }
 
 // adoptTargetExists 判断纳管目标服务是否存在于本机。
+// launchDaemonsDir 是本机系统级 LaunchDaemons 目录。
+//
+// 抽成变量是为了**测试可沙箱化**：单测必须能把它指向临时目录。
+// 2026-09-16 踩到：`TestMarketResidualDataOffersReinstall` 断言"残留态
+// installed=false"，而它经 adoptTargetExists 去 stat **真实**的
+// /Library/LaunchDaemons —— 用户机器上真的装了 frpc/orbien-client 的 plist 后，
+// 这条测试就必然失败。单测不该依赖真机装了什么。
+var launchDaemonsDir = "/Library/LaunchDaemons"
+
 func adoptTargetExists(home, label string) bool {
 	if label == "" {
 		return false
 	}
-	if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", label+".plist")); err == nil {
+	if _, err := os.Stat(filepath.Join(launchDaemonsDir, label+".plist")); err == nil {
 		return true
 	}
 	if home != "" {

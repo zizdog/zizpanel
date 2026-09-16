@@ -305,7 +305,7 @@ func TestBackupScriptContainsTargets(t *testing.T) {
 		}
 	}
 	// 凭证必须从 .env.local 读取，不能硬编码在脚本里
-	if strings.Contains(s, "PanelTestPw-9x!") {
+	if strings.Contains(s, "zizpanel-test-fixture-pass") {
 		t.Fatal("备份脚本不应包含明文密码")
 	}
 	if !strings.Contains(s, ".env.local") {

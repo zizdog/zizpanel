@@ -29,7 +29,7 @@ func TestCreateUserValidatesInput(t *testing.T) {
 	if _, err := m.CreateUser(ctx, "zizdog", "short", true); !errors.Is(err, ErrWeakPassword) {
 		t.Fatalf("短密码应返回 ErrWeakPassword，实际 %v", err)
 	}
-	u, err := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true)
+	u, err := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true)
 	if err != nil {
 		t.Fatalf("创建用户失败: %v", err)
 	}
@@ -37,10 +37,10 @@ func TestCreateUserValidatesInput(t *testing.T) {
 		t.Fatalf("用户属性异常: %+v", u)
 	}
 	// 密码必须是 bcrypt 哈希，绝不能是明文
-	if u.PasswordHash == "PanelTestPw-9x!" || len(u.PasswordHash) < 50 {
+	if u.PasswordHash == "zizpanel-test-fixture-pass" || len(u.PasswordHash) < 50 {
 		t.Fatalf("密码未被正确哈希: %q", u.PasswordHash)
 	}
-	if _, err := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true); !errors.Is(err, ErrUserExists) {
+	if _, err := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true); !errors.Is(err, ErrUserExists) {
 		t.Fatalf("重复用户名应返回 ErrUserExists，实际 %v", err)
 	}
 }
@@ -48,7 +48,7 @@ func TestCreateUserValidatesInput(t *testing.T) {
 func TestLoginSuccessAndFailure(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	if _, err := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true); err != nil {
+	if _, err := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -61,7 +61,7 @@ func TestLoginSuccessAndFailure(t *testing.T) {
 		t.Fatalf("不存在用户应返回同样的错误，实际 %v", err)
 	}
 
-	res, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "", "192.168.1.9", "UA")
+	res, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "", "192.168.1.9", "UA")
 	if err != nil {
 		t.Fatalf("正确密码登录失败: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestLoginSuccessAndFailure(t *testing.T) {
 func TestAccountLocksAfterMaxFailures(t *testing.T) {
 	m, _ := newTestManager(t) // maxFail = 3
 	ctx := context.Background()
-	if _, err := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true); err != nil {
+	if _, err := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
@@ -109,7 +109,7 @@ func TestAccountLocksAfterMaxFailures(t *testing.T) {
 		}
 	}
 	// 达到阈值后，即使密码正确也应被锁定
-	if _, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "", "1.2.3.4", "t"); !errors.Is(err, ErrAccountLocked) {
+	if _, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "", "1.2.3.4", "t"); !errors.Is(err, ErrAccountLocked) {
 		t.Fatalf("应返回账号已锁定，实际 %v", err)
 	}
 	// 手动解锁后恢复
@@ -117,7 +117,7 @@ func TestAccountLocksAfterMaxFailures(t *testing.T) {
 	if err := m.Unlock(ctx, u.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "", "1.2.3.4", "t"); err != nil {
+	if _, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "", "1.2.3.4", "t"); err != nil {
 		t.Fatalf("解锁后应能登录: %v", err)
 	}
 }
@@ -125,7 +125,7 @@ func TestAccountLocksAfterMaxFailures(t *testing.T) {
 func TestTOTPLoginFlow(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	u, err := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true)
+	u, err := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestTOTPLoginFlow(t *testing.T) {
 	}
 
 	// 第一步：只给密码 → 必须要求验证码，且不能下发会话
-	res, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "", "127.0.0.1", "t")
+	res, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "", "127.0.0.1", "t")
 	if err != nil {
 		t.Fatalf("第一步登录失败: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestTOTPLoginFlow(t *testing.T) {
 	}
 
 	// 第二步：带验证码 → 成功
-	res2, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", TOTPCodeAt(secret, time.Now()), "127.0.0.1", "t")
+	res2, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", TOTPCodeAt(secret, time.Now()), "127.0.0.1", "t")
 	if err != nil {
 		t.Fatalf("带验证码登录失败: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestTOTPLoginFlow(t *testing.T) {
 		t.Fatal("两步验证通过后应下发会话")
 	}
 	// 错误验证码必须被拒绝
-	if _, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "000000", "127.0.0.1", "t"); err == nil {
+	if _, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "000000", "127.0.0.1", "t"); err == nil {
 		t.Fatal("错误验证码不应通过")
 	}
 }
@@ -175,7 +175,7 @@ func TestTOTPLoginFlow(t *testing.T) {
 func TestTOTPChallengeCannotBeReplayed(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	u, _ := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true)
+	u, _ := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true)
 	secret, _ := NewTOTPSecret()
 
 	ch := m.IssueTOTPChallenge(u.ID)
@@ -204,8 +204,8 @@ func TestTOTPChallengeCannotBeReplayed(t *testing.T) {
 func TestSessionRevokedOnPasswordChange(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	u, _ := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true)
-	res, err := m.Login(ctx, "zizdog", "PanelTestPw-9x!", "", "127.0.0.1", "t")
+	u, _ := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true)
+	res, err := m.Login(ctx, "zizdog", "zizpanel-test-fixture-pass", "", "127.0.0.1", "t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestSessionRevokedOnPasswordChange(t *testing.T) {
 	if err := m.ChangePassword(ctx, u.ID, "wrong", "NewPassword123"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("旧密码错误应被拒绝，实际 %v", err)
 	}
-	if err := m.ChangePassword(ctx, u.ID, "PanelTestPw-9x!", "NewPassword123"); err != nil {
+	if err := m.ChangePassword(ctx, u.ID, "zizpanel-test-fixture-pass", "NewPassword123"); err != nil {
 		t.Fatalf("改密码失败: %v", err)
 	}
 	// 所有会话必须立即失效
@@ -236,11 +236,11 @@ func TestSessionRevokedOnPasswordChange(t *testing.T) {
 func TestCannotDeleteLastUser(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	u, _ := m.CreateUser(ctx, "only", "PanelTestPw-9x!", true)
+	u, _ := m.CreateUser(ctx, "only", "zizpanel-test-fixture-pass", true)
 	if err := m.DeleteUser(ctx, u.ID); err == nil {
 		t.Fatal("不允许删除最后一个账号")
 	}
-	if _, err := m.CreateUser(ctx, "second", "PanelTestPw-9x!", false); err != nil {
+	if _, err := m.CreateUser(ctx, "second", "zizpanel-test-fixture-pass", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.DeleteUser(ctx, u.ID); err != nil {
@@ -251,7 +251,7 @@ func TestCannotDeleteLastUser(t *testing.T) {
 func TestExpiredSessionRejected(t *testing.T) {
 	m, _ := newTestManager(t)
 	ctx := context.Background()
-	u, _ := m.CreateUser(ctx, "zizdog", "PanelTestPw-9x!", true)
+	u, _ := m.CreateUser(ctx, "zizdog", "zizpanel-test-fixture-pass", true)
 	tok, _, err := m.NewSession(ctx, u.ID, "127.0.0.1", "t")
 	if err != nil {
 		t.Fatal(err)

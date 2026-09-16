@@ -21,6 +21,10 @@ const PRIVILEGES = [
   'CREATE ROUTINE', 'ALTER ROUTINE', 'EVENT', 'TRIGGER', 'REFERENCES',
 ];
 
+// MASK 是口令列的默认遮罩：口令只有用户点「👁」时才写进 DOM，
+// 隐藏状态下节点里只有这几个圆点（不是把口令藏在 data-* 属性里）。
+const MASK = '••••••••';
+
 export function DatabaseView(content, ctx = {}) {
   clear(content);
   tab = 'databases';
@@ -46,7 +50,7 @@ export function DatabaseView(content, ctx = {}) {
       // 连不上时**必须给出可操作的东西**，而不是只报一句"无法连接"。
       // 面板早先只认某个项目约定文件里的密码，换台机器就永远连不上，
       // 用户完全不知道该改哪里。这里直接让他填，填完就能连。
-      body.append(credentialsForm(e.message));
+      body.append(connectionForm({ msg: e.message }));
       return;
     }
     renderHead();
@@ -65,11 +69,17 @@ export function DatabaseView(content, ctx = {}) {
     return panelPath('phpmyadmin/');
   }
 
-  // credentialsForm 连接失败时显示的凭据表单。
+  // connectionForm 是「MySQL 连接设置」表单（保存后重新加载页面数据）。
   //
-  // 为什么把"密码"也回显：面板是登录后才能访问的后台，用户需要看到
-  // 自己填过什么才能改。真正的保护在登录鉴权，不在这里。
-  function credentialsForm(msg) {
+  // 为什么做成**常驻入口**（而不是只在连不上时才出现）：一键 LNMP / MySQL 安装的
+  // root 口令是限时询问的（不填/超时＝自动生成）；万一"写回面板配置"失败，
+  // 那一步的提示会让用户"复制任务结果里的一次性凭据，并在「数据库 → 连接设置」
+  // 手工填入"。若这个表单只在连接失败时才渲染，面板连得上时用户根本找不到地方
+  // 核对/更正口令 —— 那条指引就没有落点。
+  //
+  // 为什么把"密码"也回显：面板是登录后才能访问的后台，用户需要看到自己填过什么
+  // 才能改。真正的保护在登录鉴权，不在这里。
+  function connectionForm({ msg = '', onSaved = null } = {}) {
     const cfg = state.session?.config || {};
     const host = h('input.input', { value: cfg.mysql_host || '127.0.0.1' });
     const port = h('input.input', { value: String(cfg.mysql_port || 3306) });
@@ -90,7 +100,7 @@ export function DatabaseView(content, ctx = {}) {
             mysql_password: pass.value,
           });
           toast('已保存，正在重试连接…', 'ok');
-          await load();
+          if (onSaved) onSaved(); else await load();
         } catch (err) {
           toast('保存失败：' + err.message, 'err', 9000);
         } finally {
@@ -99,8 +109,9 @@ export function DatabaseView(content, ctx = {}) {
         }
       },
     });
-    return h('div', { style: { maxWidth: '560px', margin: '0 auto' } }, [
-      h('div.empty', [
+    const parts = [];
+    if (msg) {
+      parts.push(h('div.empty', [
         h('div.big', { text: '🔌' }),
         h('h4', { text: '无法连接 MySQL' }),
         h('p', { style: { color: 'var(--text-mute)', fontSize: '12px' }, text: msg }),
@@ -110,7 +121,15 @@ export function DatabaseView(content, ctx = {}) {
                 'root 是空密码（直接点保存即可）；如果你之前给 root 设过密码，' +
                 '请在下面填写。',
         }),
-      ]),
+      ]));
+    }
+    parts.push(
+      h('div.hint', {
+        style: { marginBottom: '10px', lineHeight: '1.7' },
+        text: '一键安装 MySQL 时面板会限时询问 root 口令：不填或超时会自动生成一个强随机口令，' +
+              '正常情况下已经写在这里。如果那次安装提示"写入面板配置失败"，' +
+              '请从那次任务结果里复制一次性口令填到下面。',
+      }),
       h('div.field', [h('label', { text: '主机' }), host]),
       h('div.field', [h('label', { text: '端口' }), port]),
       h('div.field', [h('label', { text: 'Socket' }), socket,
@@ -120,9 +139,21 @@ export function DatabaseView(content, ctx = {}) {
         h('div.hint', { text: '空密码就留空' })]),
       h('div', { style: { display: 'flex', gap: '8px', marginTop: '12px' } }, [
         save,
-        h('button.btn', { text: '⟳ 仅重试', onclick: load }),
+        h('button.btn', { text: '⟳ 仅重试', onclick: () => load() }),
       ]),
-    ]);
+    );
+    return h('div', { style: { maxWidth: '560px', margin: msg ? '0 auto' : '' } }, parts);
+  }
+
+  // connectionModal 打开常驻的「连接设置」弹窗。保存成功后关窗并重载数据库页，
+  // 让"能不能连上"立刻有结论（而不是让用户自己再点一次重试）。
+  function connectionModal() {
+    const m = modal({
+      title: 'MySQL 连接设置',
+      body: connectionForm({
+        onSaved: () => { m.close(); load(); },
+      }),
+    });
   }
 
   function renderHead() {
@@ -141,16 +172,25 @@ export function DatabaseView(content, ctx = {}) {
       rel: 'noopener',
       title: '库表与权限管理的推荐入口（需先登录面板）；面板内置工具作为应急备用',
     });
+    // 常驻「连接设置」：安装时生成/失败回填口令的唯一落点（见 connectionForm 注释）。
+    const connBtn = h('button.btn.btn-sm', {
+      id: 'db-conn-settings',
+      text: '🔌 连接设置',
+      title: '查看/修改面板连接 MySQL 用的主机、账号与密码；安装时的一次性 root 口令填在这里',
+      onclick: connectionModal,
+    });
     if (!cache?.connected) {
       appendAll(headBox,
         h('span.pill.danger', { text: '未连接' }),
         h('button.btn.btn-sm', { text: '⟳ 重试', onclick: load }),
+        connBtn,
         pmaBtn,
       );
       return;
     }
     appendAll(headBox,
       pmaBtn,
+      connBtn,
       h('span.pill.ok', { text: 'MySQL ' + (cache.version || '') }),
       h('span.pill', { text: `${(cache.databases || []).length} 个库` }),
       h('span.pill', { text: `${(cache.users || []).length} 个账号` }),
@@ -189,7 +229,8 @@ export function DatabaseView(content, ctx = {}) {
           style: { marginTop: '12px', padding: '10px 12px', background: 'var(--panel-2)', borderRadius: '6px', fontSize: '12.5px', maxWidth: '560px', textAlign: 'left' },
           text: cache.hint,
         }) : null,
-        h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center' } }, [
+        h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
+          h('button.btn', { text: '⚙️ 连接设置', onclick: connectionModal }),
           h('button.btn', { text: '去服务管理启动 MySQL', onclick: () => { location.hash = '#/services'; } }),
           h('button.btn.btn-primary', { text: '重试连接', onclick: load }),
         ]),
@@ -355,11 +396,23 @@ export function DatabaseView(content, ctx = {}) {
         h('button.btn.btn-primary.btn-sm', { text: '+ 新建账号', onclick: () => createUserModal(dbNames) }),
         h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
       ]),
+      cache.credentials_error
+        ? h('div', {
+          style: { marginBottom: '12px', padding: '10px 12px', background: 'var(--warn-soft)', borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.7' },
+          text: '⚠️ ' + cache.credentials_error,
+        })
+        : null,
+      h('div.hint', {
+        style: { marginBottom: '10px', lineHeight: '1.7' },
+        text: '说明：MySQL 里只存口令的哈希，无法还原原文。面板能显示口令，是因为它在创建/改口令时把明文自己存了一份；'
+          + '不是面板创建、也没有被面板改过口令的账号会显示「外部设置，不可回显」，请用「重设密码」设一个新口令。',
+      }),
       users.length
         ? h('div', { style: { overflowX: 'auto' } }, [
           h('table.table', [
             h('thead', [h('tr', [
-              h('th', { text: '账号' }), h('th', { text: '可访问的库' }), h('th', { text: '状态' }), h('th', { text: '操作' }),
+              h('th', { text: '账号' }), h('th', { text: '可访问的库' }), h('th', { text: '状态' }),
+              h('th', { text: '密码' }), h('th', { text: '操作' }),
             ])]),
             h('tbody', users.map((u) => h('tr', [
               h('td', [
@@ -375,6 +428,7 @@ export function DatabaseView(content, ctx = {}) {
                 u.is_locked ? h('span.pill.danger', { text: '已锁定' }) : h('span.pill.ok', { text: '正常' }),
                 u.has_password ? null : h('span.pill.warn', { style: { marginLeft: '4px' }, text: '无密码' }),
               ]),
+              h('td', passwordCell(u)),
               h('td', [
                 h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, [
                   h('button.btn.btn-sm', { text: '授权', onclick: () => viewGrants(u) }),
@@ -394,6 +448,101 @@ export function DatabaseView(content, ctx = {}) {
     );
   }
 
+  // passwordCell 渲染「密码」列。
+  //
+  // 诚实原则（本功能的红线）：
+  //   MySQL 里只存口令的哈希，任何面板都无法从数据库反推原文。
+  //   面板之所以能显示口令，只因为它**自己在创建/改口令时把明文存了下来**。
+  //   · password_known=true  → 默认打码，一键显示/复制；
+  //   · password_known=false → 明确显示「外部设置，不可回显」+「重设密码」，
+  //     **绝不**显示空串或编一个值冒充。
+  //
+  // 安全：口令只在闭包里，隐藏时 DOM 里只有圆点；
+  // 不写进 URL / localStorage / console / data-* 属性。
+  function passwordCell(u) {
+    const wrap = h('div', { style: { display: 'flex', gap: '4px', alignItems: 'center', flexWrap: 'wrap' } });
+    if (!u.password_known) {
+      appendAll(wrap,
+        h('span', {
+          style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+          text: '外部设置，不可回显',
+          title: '这个账号不是面板创建的（或由面板旧版本创建）。MySQL 里只有口令哈希，无法还原原文。要改口令请点「重设密码」。',
+        }),
+        h('button.btn.btn-sm', { text: '重设密码', onclick: () => changePassword(u) }),
+      );
+      return wrap;
+    }
+    // 已知但为空：面板创建时就没设口令。这是"已知为空"，不是"未知"。
+    if (!u.password) {
+      appendAll(wrap, h('span.pill.warn', {
+        text: '空密码（无口令）',
+        title: '这个账号没有口令，任何能连到 MySQL 的程序都能用它登录。建议点「改密码」设一个。',
+      }));
+      return wrap;
+    }
+    let revealed = false;
+    const value = h('span.mono', {
+      style: { fontSize: '12px', letterSpacing: '1px' },
+      text: MASK,
+    });
+    const toggle = h('button.btn.btn-sm', {
+      text: '👁',
+      title: '显示 / 隐藏口令',
+      onclick: () => {
+        revealed = !revealed;
+        value.textContent = revealed ? u.password : MASK;
+        value.style.letterSpacing = revealed ? '0' : '1px';
+        toggle.textContent = revealed ? '🙈' : '👁';
+      },
+    });
+    const copy = h('button.btn.btn-sm', {
+      text: '📋',
+      title: '复制口令到剪贴板',
+      // 复制走闭包里的口令；即使处于打码状态也能复制。
+      // 剪贴板不可用时先显示再选中（降级路径，照抄 tasks.js）。
+      onclick: () => copySecret(u.password, () => {
+        if (!revealed) { revealed = true; value.textContent = u.password; value.style.letterSpacing = '0'; toggle.textContent = '🙈'; }
+        return value;
+      }),
+    });
+    appendAll(wrap, value, toggle, copy,
+      u.panel_account ? h('span.pill', {
+        style: { marginLeft: '2px' },
+        text: '面板连接用',
+        title: '这是面板连接 MySQL 自己使用的账号；改它的口令会同步写回面板配置（见「🔌 连接设置」）。',
+      }) : null);
+    return wrap;
+  }
+
+  // copySecret 复制口令。剪贴板 API 不可用（非 HTTPS / 非 localhost）或写入失败时，
+  // 降级为"把口令显示出来并选中"，让用户按 ⌘/Ctrl+C —— 与 tasks.js 的处理一致。
+  function copySecret(secret, reveal) {
+    if (!secret) { toast('没有可复制的内容', 'warn'); return; }
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      selectText(reveal());
+      toast('当前环境不支持自动复制，已显示并选中，请按 ⌘/Ctrl+C 复制', 'warn', 8000);
+      return;
+    }
+    navigator.clipboard.writeText(secret)
+      .then(() => toast('口令已复制到剪贴板', 'ok'))
+      .catch(() => {
+        selectText(reveal());
+        toast('复制失败，已显示并选中，请按 ⌘/Ctrl+C 复制', 'warn', 8000);
+      });
+  }
+
+  // selectText 是复制按钮的降级路径：把节点里的文本选中。
+  function selectText(el) {
+    if (!el || typeof document.createRange !== 'function' || typeof window.getSelection !== 'function') return;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch { /* 选中失败不是致命问题，用户还可以手动选中 */ }
+  }
+
   function createUserModal(dbNames) {
     const name = h('input.input', { placeholder: '例如 appuser' });
     const host = h('input.input', { value: 'localhost', placeholder: 'localhost' });
@@ -410,6 +559,36 @@ export function DatabaseView(content, ctx = {}) {
         privBoxes[p] = cb;
         return h('label', { style: { display: 'flex', gap: '5px', alignItems: 'center', fontSize: '12.5px' } }, [cb, h('span', { text: p })]);
       }));
+
+    // 创建按钮先建出来：失败/部分失败时要能禁用它，避免用户重复点导致重复建号。
+    const createBtn = h('button.btn.btn-primary', {
+      text: '创建账号',
+      onclick: async () => {
+        const selected = allDBs.checked ? ['*'] : Array.from(dbSelect.selectedOptions).map((o) => o.value);
+        const privs = Object.entries(privBoxes).filter(([, cb]) => cb.checked).map(([k]) => k);
+        if (!name.value.trim()) { toast('请填写用户名', 'warn'); return; }
+        if (!selected.length) { toast('请至少选择一个数据库', 'warn'); return; }
+        if (!privs.length) { toast('请至少选择一个权限', 'warn'); return; }
+        try {
+          const r = await api.databaseUserCreate({
+            user: name.value.trim(), host: host.value.trim() || 'localhost',
+            password: pwd.value, privileges: privs, databases: selected,
+          });
+          if (r.warning) {
+            // 账号在 MySQL 里已经建好了，只是面板没能保存口令用于回显。
+            // **不关窗**：这个口令此后在列表里看不到，必须让用户当场复制走。
+            createBtn.disabled = true;
+            createBtn.textContent = '已创建（口令未能保存）';
+            toast('账号已创建，但面板未能保存口令供日后回显：' + r.warning
+              + '｜请立即复制这个密码：' + pwd.value, 'warn', 0);
+            load();
+            return;
+          }
+          toast(r.msg + '，新密码：' + pwd.value + '（已保存，之后可在「账号与权限」列表里点 👁 查看）', 'ok', 15000);
+          close(); load();
+        } catch (e) { toast(e.message, 'err', 12000); }
+      },
+    });
 
     const m = modal({
       title: '新建数据库账号',
@@ -433,25 +612,7 @@ export function DatabaseView(content, ctx = {}) {
       ]),
       footer: (close) => [
         h('button.btn', { text: '取消', onclick: close }),
-        h('button.btn.btn-primary', {
-          text: '创建账号',
-          onClick: null,
-          onclick: async () => {
-            const selected = allDBs.checked ? ['*'] : Array.from(dbSelect.selectedOptions).map((o) => o.value);
-            const privs = Object.entries(privBoxes).filter(([, cb]) => cb.checked).map(([k]) => k);
-            if (!name.value.trim()) { toast('请填写用户名', 'warn'); return; }
-            if (!selected.length) { toast('请至少选择一个数据库', 'warn'); return; }
-            if (!privs.length) { toast('请至少选择一个权限', 'warn'); return; }
-            try {
-              const r = await api.databaseUserCreate({
-                user: name.value.trim(), host: host.value.trim() || 'localhost',
-                password: pwd.value, privileges: privs, databases: selected,
-              });
-              toast(r.msg, 'ok', 10000);
-              close(); load();
-            } catch (e) { toast(e.message, 'err', 12000); }
-          },
-        }),
+        createBtn,
       ],
     });
     setTimeout(() => name.focus(), 60);
@@ -521,12 +682,23 @@ export function DatabaseView(content, ctx = {}) {
       title: `重置密码：${u.user}@${u.host}`,
       label: '新密码（至少 8 位）',
       value: randomPassword(),
-      hint: '重置后使用该账号的程序需要同步更新配置，否则会连接失败。',
+      hint: u.panel_account
+        ? '这是面板连接 MySQL 自己用的账号：新口令会同时写回面板配置（见「🔌 连接设置」），否则面板会连不上。'
+        : '重置后使用该账号的程序需要同步更新配置，否则会连接失败。',
     });
     if (!pwd) return;
     try {
       const r = await api.databaseUserPassword(u.user, u.host, pwd);
-      toast(r.msg + '，新密码：' + pwd, 'ok', 15000);
+      if (r.warning) {
+        // 口令已在 MySQL 生效，但面板没能保存它用于回显 —— 此后列表里看不到，
+        // 必须让用户当场记下来。
+        toast(r.msg + '。⚠️ ' + r.warning + '｜新密码：' + pwd, 'warn', 0);
+      } else {
+        toast(r.msg + '，新密码：' + pwd + '（已保存，之后可在列表里点 👁 查看）', 'ok', 15000);
+      }
+      // 重新拉一次 GET /api/v1/database：让列表里的密码列反映**面板实际保存的**值，
+      // 而不是只改内存里那一行（否则刷新页面又会变回去）。
+      await load();
     } catch (e) { toast(e.message, 'err', 10000); }
   }
 

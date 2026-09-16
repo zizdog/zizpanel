@@ -22,13 +22,22 @@ import (
 //  Homebrew formula，或者**官方 darwin-arm64 预编译产物**。后一条路原本不存在，
 //  README「应用市场」第 2 条当时写的是"先走 Docker，等通用安装器做出来再换"。
 //
-//  现在这套安装器服务**两个**条目（见 releaseBinaryApps）：
-//    frpc（frp 客户端）与 orbien-client（Orbien CLI 客户端）。
+//  现在这套安装器服务**三个**条目（见 releaseBinaryApps）：
+//    frpc（frp 客户端）、orbien-client（Orbien CLI 客户端）与 ddns-go（动态域名解析）。
 //  2026-09-16 用户要求**彻底移除**三个条目：Lucky、Orbien 服务端、frps。
 //  它们已从 releaseBinaryApps 与 catalog.go 中删除；不要再加回来。
-//  剩下这两个的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
+//  这三个的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
 //  （理由见 catalog.go 里各条目的注释：Colima 里跑的是 Linux 虚拟机，容器看到的
 //  是虚拟机的网络，不是 Mac 的 —— 内网穿透这类"贴着网络栈"的工具放进容器就是错的）。
+//
+//  ddns-go 为什么也走这条路（而不是 AGENTS.md 铁律 8 里优先的 brew formula）：
+//  homebrew-core 里**有** ddns-go 这个 formula，但它**没有 service 块**
+//  （2026-09-16 在 Mac mini 上实测：`brew info --json=v2 ddns-go` 的 service 字段是
+//  null，`brew services start ddns-go` 直接报
+//  "has not implemented #plist, #service or provided a locatable service file"）。
+//  也就是说 brew 只能把包装上，**给不出任何 launchd 守护进程** —— 用户会得到一个
+//  "装了但从来没在跑、:9876 也打不开"的面板条目。所以这里改用官方 release 产物，
+//  由通用安装器写系统级 LaunchDaemon（上游 release 里还有 checksums.txt 可核对 sha256）。
 //
 //  安装流程（每个应用只有参数不同）：
 //    建目录 → curl 下载官方 tarball（官方直连失败时退到加速镜像）
@@ -92,6 +101,16 @@ type releaseBinaryApp struct {
 	// ConfigSeed 是首次安装时写入配置文件的模板；{token} / {user} / {password}
 	// 会被替换成随机值（见 ensureReleaseConfig）。空表示由应用专属逻辑生成。
 	ConfigSeed string
+	// PreserveExistingConfig 表示这个应用的配置文件由**应用自己维护**
+	// （ddns-go 的网页界面点"保存"时会整体重写 YAML），面板写进去的 marker 注释
+	// 活不过第一次保存。
+	//
+	// 为什么必须单独标出来：默认规则是"有面板 marker 就保留、否则当上游示例覆盖"，
+	// 对 frpc / orbien 成立（那两个应用的配置只有人会改，marker 一直在）。
+	// 但 ddns-go 保存一次后 marker 就没了，重装时会被当成"上游示例"覆盖 ——
+	// 那等于把用户填好的 DNS 服务商密钥与域名直接冲掉。所以这类应用改成
+	// "文件存在就一律保留"（判据见 ensureReleaseConfig）。
+	PreserveExistingConfig bool
 	// ChecksumAsset 是上游提供的 SHA-256 清单文件名（空 = 上游不提供，无法校验）。
 	// frp 是这套安装器里唯一提供校验清单的上游；Lucky / Orbien 的 release 里没有，
 	// 那它们就只能靠 file(1) 的架构复核（见 README 的如实说明）。
@@ -111,6 +130,9 @@ func (a releaseBinaryApp) webPort() int {
 const (
 	frpcLabel         = "com.zizdog.frpc"
 	orbienClientLabel = "com.zizdog.orbien-client"
+	// releaseBinaryReadyTimeout 是「等这个服务真正起来」的上限。
+	// 超时即**如实失败**（见 waitReleaseBinaryReady）。
+	releaseBinaryReadyTimeout = 60 * time.Second
 )
 
 // gitHubReleaseMirrors 是 GitHub release 的加速前缀（拼接在完整官方 URL 前面）。
@@ -213,6 +235,42 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 			"隧道连接状态与流量在服务端的 Dashboard（http://<服务端地址>:8020）里看。",
 		},
 	},
+	"ddns-go": {
+		ID: "ddns-go", Label: "com.zizdog.ddns-go", Name: "DDNS-Go（动态域名解析）", Icon: "🌐",
+		Category: "tool", RootDir: "ddns-go",
+		// arm64 证据：v6.17.7 的资产里有 ddns-go_6.17.7_darwin_arm64.tar.gz（4,386,545 B，
+		// sha256 9dac9d82…），tarball 内是平级的 ddns-go / README.md / README_EN.md / LICENSE
+		// （2026-09-16 实下核对过目录结构），file(1) 报 Mach-O 64-bit executable arm64。
+		Repo: "jeessy2/ddns-go", Tag: "v6.17.7", Asset: "ddns-go_6.17.7_darwin_arm64.tar.gz",
+		Binary: "ddns-go",
+		// tarball **没有**顶层目录（4 个成员平级），所以 TarStrip=0；
+		// PickBinary 只解压 ddns-go 那一个，不把 README / LICENSE 摊进安装目录。
+		TarStrip: 0, PickBinary: true,
+		// -c 写死到安装目录：ddns-go 的默认值是 $HOME/.ddns_go_config.yaml ——
+		// 那会把它的配置散落在用户家目录根下，面板的「📝 编辑配置文件」也就定位不到
+		// （面板按 <home>/<RootDir>/<ConfigFile> 解析）。
+		// -l 显式写 :9876：上游默认也是它，但写出来才不会因为上游改默认而静默失联。
+		Args: []string{"-c", "{root}/ddns-go.yaml", "-l", ":9876"},
+		// 9876 是它的网页界面端口，也是它唯一监听的端口。
+		// HealthPath 用 "/"：实测未登录时 GET / 返回 307 → /login，
+		// 而面板的健康判定把 2xx/3xx 都算健康（见 health.go），能稳定反映"服务活着"。
+		Port: 9876, HealthPath: "/",
+		ConfigFile: "ddns-go.yaml",
+		ConfigSeed: ddnsGoConfigSeed,
+		// ddns-go 的网页界面保存时会整体重写 YAML，面板 marker 会被抹掉 ——
+		// 所以判据必须是"文件存在就保留"，否则重装会冲掉用户的 DNS 密钥（见字段注释）。
+		PreserveExistingConfig: true,
+		// 上游 release 里有 checksums.txt，且其中一行就是这份 darwin_arm64 产物 ——
+		// 有清单就必须核对（回落到第三方加速镜像时这是唯一的内容校验）。
+		ChecksumAsset: "checksums.txt",
+		Notes: []string{
+			"ddns-go.yaml 已生成：现在只是一份带说明的骨架，首次配置在它自己的网页界面里做。",
+			"① 首次：打开 http://<本机地址>:9876，先设 ddns-go 的用户名口令，" +
+				"再到「DNS服务商」里添加服务商与要更新的域名。",
+			"② 之后日常：在「服务管理 → DDNS-Go」点「📝 编辑配置文件」改 ddns-go.yaml，" +
+				"保存后点「🔄 重启服务」——不必再开网页。",
+		},
+	},
 }
 
 // frpsConfigSeed / orbienServerConfigSeed 是面板生成配置文件的模板。
@@ -290,6 +348,35 @@ server = "127.0.0.1:9527"
 # protocol = "tcp"
 # service = "127.0.0.1:8880"
 # remotePort = 9000
+`
+
+// ddnsGoConfigSeed 是 ddns-go 的配置骨架。
+//
+// 为什么只写注释、不预填 DNS 字段：ddns-go 的完整配置（服务商 ID/Secret、域名、
+// webhook、登录口令哈希）是它自己的网页界面在"保存"时生成的，面板凭空拼一份
+// 完整 YAML 反而容易拼错字段名；而**只有注释**的 YAML 是合法的 ——
+// yaml.Unmarshal 得到全零 Config，ddns-go 照常起来（真机实测：正常监听 :9876，
+// GET / 307 跳 /login），随后第一次保存会把它覆写成完整配置。
+//
+// 为什么必须让这个文件先存在：服务详情里的「📝 编辑配置文件」按
+// <home>/ddns-go/ddns-go.yaml 定位，文件不存在时点开就是一个"读文件失败"。
+// 用户第一次打开面板就能看到这份说明，而不是先去网页配置一轮才发现按钮点不开。
+const ddnsGoConfigSeed = `# ` + panelConfigMarker + `（ddns-go 配置骨架）。改完在
+# 「服务管理 → DDNS-Go」里点「🔄 重启服务」生效，也可以直接点「📝 编辑配置文件」修改本文件。
+#
+# ── 首次配置（只需做一次）──────────────────────────────────────────────
+# 打开 http://<本机地址>:9876 ，在 ddns-go 自己的网页界面里：
+#   ① 先设置 ddns-go 的登录用户名与口令（这是它自己的登录，不是 ZizPanel 的）；
+#   ② 到「DNS服务商」添加服务商：Cloudflare / 阿里云 / 腾讯云 / DNSPod /
+#      华为云 / 百度云 等，填 AccessKey / API Token；
+#   ③ 填要更新的域名（如 home.example.com）。
+# 保存后 ddns-go 会把**完整配置**写回本文件（覆盖现在这份骨架），
+# 之后日常改配置就直接改这个文件，不必再打开网页。
+#
+# ── 说明 ───────────────────────────────────────────────────────────────
+# ddns-go 每 300 秒检查一次公网 IP（启动参数 -f 可改），只有 IP 变化时才调 DNS 接口。
+# 想改监听端口或检查频率：改的是启动参数，不是这个文件 —— 那要改 launchd 的
+# plist（/Library/LaunchDaemons/com.zizdog.ddns-go.plist）。
 `
 
 // frp 的官方校验清单文件名（frpc 安装时用它核对下载产物）。
@@ -435,23 +522,32 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	}
 	result.step(ctx, "已注册为系统级后台服务（开机自启、不依赖用户登录）")
 
-	// ---- 7. 验证：端口真的在监听才算成功 ----
+	// ---- 6.5 先登记进服务管理，再验收（失败也要能看到它）----
+	//
+	// 顺序是刻意的（2026-09-17 审计）：原来登记在验收之后，而验收只写一条
+	// Warning 就放过去。一旦把验收改成如实失败（见 waitReleaseBinaryReady），
+	// 登记留在后面就会留下「任务失败、服务管理里又找不到它」的半成品。
+	// 服务记录用 UIPort（frps 的 dashboard 7500），这样「打开」/健康检查都指向界面；
+	// 协议口 7000 仍由下面的存活判断与安装前检查覆盖。
+	// 登记失败**不**让整个部署失败（刻意接受的降级）：launchd 服务本身是好的、
+	// 软件能用，只是面板列表里暂时没有它（可手工纳管）。理由同 Qwen：让一个
+	// 「其实能用」的服务报失败、逼用户重装，造成的损失更大。下面的就绪验收
+	// 仍会如实判定它到底起没起来，并把登记结果写进失败信息。
+	registered := true
+	if err := m.RegisterInstalledService(ctx, spec.Label, spec.Name, spec.Icon, spec.Category, spec.webPort()); err != nil {
+		registered = false
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
+	}
+
+	// ---- 7. 验证：服务真的活着才算成功 ----
 	// 用 Port（协议口）判断存活：dashboard 起得来不代表 bindPort 绑上了，
 	// 而后者才是 frps 能不能用的关键（7000 常被隔空播放接收器占着）。
-	result.step(ctx, fmt.Sprintf("等待服务就绪（端口 %d）", spec.Port))
-	if !waitPort(ctx, spec.Port, 60*time.Second) {
-		result.Warning = fmt.Sprintf("服务已注册，但 60 秒内 %d 端口未监听。请看日志：%s",
-			spec.Port, p.ErrLog)
-		result.step(ctx, "警告："+result.Warning)
+	if err := m.waitReleaseBinaryReady(ctx, spec, p, registered, result); err != nil {
+		return err
 	}
 
 	host := m.primaryIP()
 	result.Address = host
-	// 服务记录用 UIPort（frps 的 dashboard 7500），这样「打开」/健康检查都指向界面；
-	// 协议口 7000 仍由上面的存活判断与安装前检查覆盖。
-	if err := m.RegisterInstalledService(ctx, spec.Label, spec.Name, spec.Icon, spec.Category, spec.webPort()); err != nil {
-		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
-	}
 
 	if spec.HealthPath != "" {
 		result.step(ctx, fmt.Sprintf("Web 界面：http://%s:%d", host, spec.webPort()))
@@ -466,6 +562,61 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 		result.step(ctx, spec.Notes...)
 	}
 	return nil
+}
+
+// waitReleaseBinaryReady 等 release 二进制服务真的就绪。**超时返回错误，不是警告。**
+//
+// 2026-09-17 审计：原来 60 秒内端口没监听只写一条 Warning，任务照样报成功 ——
+// 于是「装完了但用不了」和「任务完成 ✅」同时出现在界面上。现在如实失败，
+// 并附上进程错误日志（p.ErrLog）的尾部若干行。
+//
+// 两类条目分开判断：
+//   - Port > 0（frpc 7400 / ddns-go 9876）：端口在监听是「服务真的活着」最强的
+//     证据（结构体字段注释也写着「比 launchd 状态更可信」）。
+//   - Port == 0（orbien 客户端是纯出站连接，不监听任何端口）：没有端口可等，
+//     只能看 launchd 有没有把这个作业真的拉起来。这不是「降级放行」，而是这类应用
+//     唯一正确的判据 —— 原来的 waitPort(0, 60s) 必然超时，每次安装都误报一次。
+func (m *Manager) waitReleaseBinaryReady(ctx context.Context, spec releaseBinaryApp,
+	p binaryReleasePaths, registered bool, result *InstallResult) error {
+
+	port := spec.Port
+	expect := fmt.Sprintf("TCP 端口 %d 开始监听", port)
+	if port <= 0 {
+		expect = "launchd 把这个作业真正拉起来（该应用不监听任何端口）"
+	}
+	state := "二进制、配置与 launchd 服务都已就位，服务也已登记进服务管理"
+	if !registered {
+		state = "二进制、配置与 launchd 服务都已就位（但登记进服务管理失败）"
+	}
+	missing := "但服务实际上不可用，管理界面与它自己的功能现在都连不上"
+	if port <= 0 {
+		missing = "但 launchd 也没能把它跑起来，它实际上不可用"
+	}
+	result.step(ctx, "等待服务就绪（"+expect+"）")
+
+	return assertReady(ctx, readySpec{
+		What:    spec.Name,
+		Expect:  expect,
+		Timeout: releaseBinaryReadyTimeout,
+		Probe: func(ctx context.Context) readyVerdict {
+			if port > 0 {
+				if readyWaitPort(ctx, port, releaseBinaryReadyTimeout) {
+					return readyVerdict{OK: true,
+						Actual: fmt.Sprintf("已就绪，监听 %d 端口", port)}
+				}
+				return readyVerdict{Actual: fmt.Sprintf(
+					"连 127.0.0.1:%d 一直失败，端口始终没有监听", port)}
+			}
+			return waitLaunchdRunning(ctx, spec.Label, releaseBinaryReadyTimeout)
+		},
+		LogPath: p.ErrLog,
+		State:   state,
+		Missing: missing,
+		Remedy: "按下面的日志尾部里的报错修好后重新部署；" +
+			"也可以在「服务管理」里点「重启服务」再试" +
+			"（配置文件在 " + p.Config + "）",
+		Result: result,
+	})
 }
 
 // downloadReleaseBinary 依次尝试官方地址与加速镜像。
@@ -761,20 +912,29 @@ func fileSHA256(path string) (string, error) {
 //
 // 默认是 `-xzf <asset> -C <root>`（tar 的选项必须在成员名前，所以这里返回
 // "-xzf asset -C root [--strip-components=N] [member]" 的全部参数）。
-// PickBinary 时只解压 Binary 那一个成员，并剥掉 tarball 的顶层目录 ——
-// frp 的 tarball 里 frps / frpc / 示例 frps.toml 是平级的，只挑需要的那一个。
+// PickBinary 时只解压 Binary 那一个成员；成员名要不要带"顶层目录"取决于
+// TarStrip：
+//   - TarStrip > 0：tarball 里有一层顶层目录（frp 的 tarball 是
+//     frp_0.71.0_darwin_arm64/…），tar 的成员匹配按归档内的完整路径，
+//     所以成员名必须是 <顶层目录>/<binary>；
+//   - TarStrip == 0：tarball 里就是平级的成员（ddns-go 的 tarball 是
+//     ddns-go / README.md / README_EN.md / LICENSE），成员名就是 <binary>。
+//
+// 这条区分是真机踩出来的：ddns-go 的产物没有顶层目录，如果沿用"成员名一定带
+// 顶层目录（用 asset 名去掉 .tar.gz 猜）"的老写法，tar 会去找一个不存在的
+// ddns-go_6.17.7_darwin_arm64/ddns-go，解压直接失败。
 func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 	args := []string{"-xzf", asset, "-C", root}
 	if a.PickBinary && a.Binary != "" {
+		member := a.Binary
 		if a.TarStrip > 0 {
 			args = append(args, fmt.Sprintf("--strip-components=%d", a.TarStrip))
+			top := strings.TrimSuffix(filepath.Base(a.Asset), ".tar.gz")
+			if top != filepath.Base(a.Asset) && top != "" {
+				member = top + "/" + a.Binary
+			}
 		}
-		top := strings.TrimSuffix(filepath.Base(a.Asset), ".tar.gz")
-		if top != filepath.Base(a.Asset) && top != "" {
-			args = append(args, top+"/"+a.Binary)
-		} else {
-			args = append(args, a.Binary)
-		}
+		args = append(args, member)
 	}
 	return args
 }
@@ -786,10 +946,20 @@ func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 // 为什么靠 marker 而不是"存在即保留"：orbien 客户端的 tarball 自带一份上游示例配置，
 // 解压后正好落在目标路径上；按"存在即保留"处理的话，面板永远写不进自己的配置，
 // 用户装完只有默认值、没有界面入口，而且没有任何报错。
+//
+// 例外是 PreserveExistingConfig（ddns-go）：那个应用的配置由它自己的网页界面重写，
+// marker 活不过第一次保存，所以对它判据退化成"文件存在即保留"（详见字段注释）。
 func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePaths) (configSeedSecrets, bool, error) {
-	if b, rerr := os.ReadFile(p.Config); rerr == nil &&
-		strings.Contains(string(b), panelConfigMarker) {
-		return configSeedSecrets{}, false, nil
+	if b, rerr := os.ReadFile(p.Config); rerr == nil {
+		// 应用自己会重写配置的条目（ddns-go）：只要文件在就一律保留。
+		// 它的网页界面保存一次就会把面板的 marker 注释抹掉，按 marker 判断的话
+		// 重装会把用户填好的 DNS 服务商密钥当成"上游示例"覆盖掉。
+		if spec.PreserveExistingConfig {
+			return configSeedSecrets{}, false, nil
+		}
+		if strings.Contains(string(b), panelConfigMarker) {
+			return configSeedSecrets{}, false, nil
+		}
 	}
 	s, err := generateConfigSecrets(spec.ConfigSeed, "")
 	if err != nil {
@@ -1008,6 +1178,8 @@ func (m *Manager) releaseBinaryPlan(id string) (UninstallPlan, bool) {
 		plan.KeepNote = "默认保留安装目录（二进制与 orbien.toml，配置里可能有服务端 token）"
 	case "frpc":
 		plan.KeepNote = "默认保留安装目录（二进制与 frpc.toml，配置里有 token）"
+	case "ddns-go":
+		plan.KeepNote = "默认保留安装目录（二进制与 ddns-go.yaml，配置里有 DNS 服务商的 API Token/密钥）"
 	}
 	return plan, true
 }

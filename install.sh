@@ -11,7 +11,9 @@
 #     ZIZPANEL_VERSION          指定版本，如 0.1.0（默认 latest）
 #     ZIZPANEL_ROOT             安装根目录（默认 /opt/zizpanel）
 #     ZIZPANEL_LISTEN           面板监听地址（默认 :8443）
-#     ZIZPANEL_SKIP_DEPS=1      跳过 Homebrew 依赖安装
+#     ZIZPANEL_MIRROR_BASE      自建 NAS 镜像基址（brew 基础依赖镜像优先用它，
+#                               如 https://mirror.zizdog.com:8888）
+#     ZIZPANEL_SKIP_DEPS=1      跳过 Homebrew 依赖安装（含基础依赖 ffmpeg）
 #     ZIZPANEL_SKIP_FIREWALL=1  跳过防火墙处理
 #
 # 国内网络：默认从 GitHub Releases 下载；**不通时会自动改用内置镜像**（见下）。
@@ -51,6 +53,22 @@ ZIZPANEL_SERVER_MODE="${ZIZPANEL_SERVER_MODE:-0}"
 # 放在安装脚本里会长时间没有输出，容易让人以为卡死。
 # 不传这个参数时面板仍可用，LNMP 可以在面板「应用市场」里逐个安装。
 ZIZPANEL_WITH_LNMP="${ZIZPANEL_WITH_LNMP:-0}"
+# ---------------------------------------------------------- 基础依赖（ffmpeg）--
+# ffmpeg 是"装了面板就该有"的基础环境，所以由安装脚本直接装上；
+# 为什么是基础环境而不是某个应用的私有依赖，见 ensure_base_deps 的注释
+# （2026-09-16 真机事故：它被弄丢后 TTS 合成返回 HTTP 200 + 0 字节 body，
+#  所有作业全败而健康检查全绿）。
+# 这份清单与面板 Go 侧 internal/services/basedep.go 的 baseDependencies 对应。
+BASEDEP_FORMULAS=(ffmpeg)
+# DEFAULT_MIRROR_BASE 是自建 NAS 镜像的默认基址（与面板 config.DefaultMirrorBase 一致）。
+# 装面板时若用户没有单独配置，也先拿它探一次：不通只是一次 4 秒探测，
+# 通了能省很多下载时间（用户明确要求"镜像优先"）。
+DEFAULT_MIRROR_BASE="${ZIZPANEL_MIRROR_BASE_DEFAULT:-https://mirror.zizdog.com:8888}"
+# 用户**自己**在环境里设过的 brew 镜像必须尊重。必须在 setup_homebrew 之前抓一份：
+# 那一步会在 GitHub 不可达时自己 export HOMEBREW_*，之后再去读就分不清
+# "用户设的"和"脚本设的"了（见 choose_brew_mirror）。
+ENV_HOMEBREW_API_DOMAIN="${HOMEBREW_API_DOMAIN:-}"
+ENV_HOMEBREW_BOTTLE_DOMAIN="${HOMEBREW_BOTTLE_DOMAIN:-}"
 PANEL_LABEL="cn.zizpanel.panel"
 HELPER_NAME="zizpanel-helper"
 BIN_DIR="$ZIZPANEL_ROOT/bin"
@@ -456,6 +474,143 @@ install_lnmp() {
   return 0
 }
 
+# ---------------------------------------------------- 基础依赖（ffmpeg）安装 --
+#
+# 为什么 ffmpeg 属于"装了面板就该有"的基础环境，而不是等某个功能报错再补：
+#   2026-09-16 真机事故：mini 被抹掉重装后，面板重装了 Qwen TTS，但整条安装链里
+#   没有 ffmpeg。mlx_audio 编码 mp3 必须靠 ffmpeg —— 没有它时
+#   POST /v1/audio/speech 仍然返回 **HTTP 200，但 body 是 0 字节**；网站的接收端
+#   逐块 urlopen(...).read() 抛 IncompleteRead(0 bytes read)，用户**所有** TTS
+#   作业全败，而面板上所有健康检查都是绿的（最难查的那种故障）。
+#   手动 brew install ffmpeg 后立刻恢复。
+#   它同时是后续音视频功能（转码、时长探测、缩略图）的公共前提，所以按基础环境管：
+#   装面板时就装上，而不是等某个应用踩到才补。
+
+# brew_api_ok <base> <formula>：4 秒内能拿到 formula 清单就算这家镜像可用。
+#
+# 只探清单、不探瓶路径是**刻意的**：瓶的路径布局各家不同（中科大提供 OCI 布局，
+# 阿里云/清华 404），而 brew 在瓶取不到时会自行回落官方域 ——
+# "不设"与"设一个取不到的"结果一样，只是白等一次探测。
+brew_api_ok() {
+  [ -n "${1:-}" ] || return 1
+  curl -fsS --max-time 4 -o /dev/null \
+    "${1%/}/api/formula/${2:-ffmpeg}.json" 2>/dev/null
+}
+
+# choose_brew_mirror [formula]：给这次 brew install 选镜像，选中结果写进
+# HOMEBREW_API_DOMAIN / HOMEBREW_BOTTLE_DOMAIN 与 BREW_MIRROR_NAME。
+#
+# 优先级与面板 Go 侧的 probeBrewMirrors / brewMirrorCandidates 严格一致：
+#   1. 自建 NAS 镜像的 <base>/brew 子路径 —— 用户明确要求"镜像优先"；
+#      基址来源：ZIZPANEL_MIRROR_BASE → 面板已有配置里的 mirror_base → 内置默认；
+#   2. 中科大 → 清华 → 阿里云（2026-09-16 实测中科大最快，阿里云只保证 API 可用）；
+#   3. 都不通就**不设**，让 brew 回落官方源（比设一个取不到的好）。
+# 返回 0 = 选中了镜像；1 = 都没通（调用方应如实说明走的是官方源）。
+choose_brew_mirror() {
+  local formula="${1:-ffmpeg}" nas="" entry name base
+  BREW_MIRROR_NAME=""
+
+  # 用户显式设过就一律以用户为准（与面板 Go 侧 brewEnv 的 pick() 语义一致）
+  if [ -n "$ENV_HOMEBREW_API_DOMAIN" ] || [ -n "$ENV_HOMEBREW_BOTTLE_DOMAIN" ]; then
+    BREW_MIRROR_NAME="环境变量已指定（API=${ENV_HOMEBREW_API_DOMAIN:-未设}，BOTTLE=${ENV_HOMEBREW_BOTTLE_DOMAIN:-未设}）"
+    HOMEBREW_API_DOMAIN="$ENV_HOMEBREW_API_DOMAIN"
+    HOMEBREW_BOTTLE_DOMAIN="$ENV_HOMEBREW_BOTTLE_DOMAIN"
+    export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
+    return 0
+  fi
+
+  nas="${ZIZPANEL_MIRROR_BASE:-}"
+  if [ -z "$nas" ] && [ -f "$DATA_DIR/config.json" ]; then
+    # 升级/重装时沿用面板里配置过的镜像。只做一次最小的键值提取，
+    # 不引入 python/jq 依赖（这一步可能发生在 CLT 还没装好的机器上）。
+    nas="$(sed -n 's/.*"mirror_base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "$DATA_DIR/config.json" 2>/dev/null | head -1)"
+  fi
+  [ -n "$nas" ] || nas="$DEFAULT_MIRROR_BASE"
+  if brew_api_ok "$nas/brew" "$formula"; then
+    HOMEBREW_API_DOMAIN="${nas%/}/brew/api"
+    HOMEBREW_BOTTLE_DOMAIN="${nas%/}/brew"
+    export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
+    BREW_MIRROR_NAME="自建 NAS 镜像（${HOMEBREW_BOTTLE_DOMAIN}）"
+    return 0
+  fi
+
+  for entry in \
+    "中科大|https://mirrors.ustc.edu.cn/homebrew-bottles" \
+    "清华大学|https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles" \
+    "阿里云|https://mirrors.aliyun.com/homebrew/homebrew-bottles"; do
+    name="${entry%%|*}"
+    base="${entry##*|}"
+    if brew_api_ok "$base" "$formula"; then
+      HOMEBREW_API_DOMAIN="$base/api"
+      HOMEBREW_BOTTLE_DOMAIN="$base"
+      export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
+      BREW_MIRROR_NAME="国内镜像 ${name}（${base}）"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ensure_base_deps：幂等地装上缺失的基础依赖（目前只有 ffmpeg）。
+#
+# 两条纪律：
+#   · **幂等**：已装就明确说"跳过"，不再 brew install 一遍；
+#   · **如实**：失败必须报出来并给出可照抄的命令。ffmpeg 缺失恰好是
+#     **不会自己报错**的那种故障（200 + 空 body），所以更不能在这里谎报成功。
+# 返回 1 表示没装好（调用方决定是提示还是失败）。
+ensure_base_deps() {
+  [ ${#BASEDEP_FORMULAS[@]} -gt 0 ] || return 0
+
+  local missing=() f
+  for f in "${BASEDEP_FORMULAS[@]}"; do
+    brew_has "$f" || missing+=("$f")
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    ok "基础依赖已安装，跳过：${BASEDEP_FORMULAS[*]}（TTS 编码 mp3 与后续音视频功能需要它）"
+    return 0
+  fi
+
+  warn "缺少基础依赖：${missing[*]}"
+  info "  它为什么算基础依赖：TTS 用 mlx_audio 编码 mp3 必须靠 ffmpeg；"
+  info "  没有它时合成接口会返回 HTTP 200 但 body 是 0 字节（用户只看到作业全败），"
+  info "  后续的音视频功能也要用它。"
+
+  local envs=(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1)
+  if choose_brew_mirror "${missing[0]}"; then
+    info "  镜像：${BREW_MIRROR_NAME}"
+    [ -n "${HOMEBREW_API_DOMAIN:-}" ] && envs+=("HOMEBREW_API_DOMAIN=$HOMEBREW_API_DOMAIN")
+    [ -n "${HOMEBREW_BOTTLE_DOMAIN:-}" ] && envs+=("HOMEBREW_BOTTLE_DOMAIN=$HOMEBREW_BOTTLE_DOMAIN")
+  else
+    warn "  自建镜像与国内镜像都没探测通：让 Homebrew 走官方源（国内可能很慢）"
+  fi
+
+  local log="/tmp/zizpanel-basedep-install.log"
+  # shellcheck disable=SC2024
+  # 重定向由当前（root）shell 打开，日志留给用户排障（与 install_lnmp 一致）
+  if ! sudo -u "$REAL_USER" -H /usr/bin/env "${envs[@]}" \
+      "$(brew_prefix)/bin/brew" install "${missing[@]}" >"$log" 2>&1; then
+    warn "基础依赖安装失败，日志末尾："
+    tail -20 "$log" 2>/dev/null | while IFS= read -r line; do
+      printf '    %s\n' "$line"
+    done
+    warn "缺 ffmpeg 会让 TTS 合成 mp3 返回 200 + 空 body（用户只看到作业全败）。"
+    warn "可稍后在面板「应用市场 → FFmpeg（音视频工具）」重装，或手工执行："
+    warn "  brew install ${missing[*]}"
+    return 1
+  fi
+
+  # 不看退出码就下结论：brew 返回 0 也要再确认包真的在里面
+  for f in "${missing[@]}"; do
+    if ! brew_has "$f"; then
+      warn "brew install ${f} 报告完成，但 brew list 里仍看不到它 —— 如实报为失败"
+      return 1
+    fi
+  done
+  ok "基础依赖已安装：${missing[*]}"
+  return 0
+}
+
 # ------------------------------------------------------------ 安装依赖组件 --
 install_deps() {
   title "检查系统依赖"
@@ -480,6 +635,15 @@ install_deps() {
   if [ "${ZIZPANEL_SKIP_DEPS:-0}" = "1" ]; then
     warn "已跳过依赖安装（ZIZPANEL_SKIP_DEPS=1）"
     return 0
+  fi
+
+  # ---- 基础依赖（ffmpeg）：面板一装好就有，不留给某个功能按需补 ----
+  # 放在 LNMP 之前：它小得多、且是 TTS 等功能的公共前提（用户原话：
+  # "面板安装就应该安装 ffmpeg 这是基础环境"）。
+  # 失败不中断安装（面板本身没有 ffmpeg 也能跑），但必须**如实**提示 ——
+  # 缺它时的症状是"TTS 返回 200 + 空 body"，用户自己绝对查不出来。
+  if ! ensure_base_deps; then
+    warn "基础依赖没装好：面板可用，但 TTS 编码 mp3 与音视频功能会失败（原因见上）。"
   fi
 
   # 汇总缺失的关键组件，一次性提示，避免反复打断

@@ -39,7 +39,11 @@ import (
 //  这样同型号机器第二次安装几乎不会踩到已经失败的条目。
 // ============================================================================
 
-// cltMirrorBaseDefault 是内置镜像地址（面板升级也用它，见配置里的 upgrade_source）。
+// cltMirrorBaseDefault 是 CLT 的静态兜底基址（自建 NAS 的"面板发布目录"
+// 对外地址就是 <mirror>:8888/zizpanel，与这个常量同一份内容）。
+//
+// 注意：它**不是**在线升级的源。在线升级读的是 Cfg.UpgradeSource，
+// 默认留空（不启用网络升级）。原注释写"面板升级也用它"是错的，已纠正。
 const cltMirrorBaseDefault = "https://zizdog.com/zizpanel"
 
 // cltInstallPkgs 是真正需要安装的组件：CLTools_Executables.pkg（576 MB，真正的
@@ -102,6 +106,14 @@ type cltPart struct {
 	File string `json:"file"`
 	// Size 是分片字节数（最后一片可能更小）。
 	Size int64 `json:"size"`
+	// SHA256 可选：这一片自己的 sha256（十六进制，大小写都行）。给了就逐片校验，
+	// 坏片只重下那一片；不给就只校验大小，靠整体 sha256 兜底。
+	//
+	// 为什么值得多这几个字节：只校验大小时，"大小正好但内容坏掉"的分片会被
+	// 当成"已下好"永久跳过 —— 每次重试都拿同一片坏的拼包，最后卡在整体
+	// sha256 不一致上，而报错里看不出是哪一片。镜像侧生成清单时顺手算一下就行
+	// （见 tools/sync-clt-mirror.sh），代价是清单增大几十行。
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // partsFor 返回某个包的分片列表（没配置就返回 nil，表示走单文件下载）。
@@ -133,22 +145,41 @@ func cltMirrorBase() string {
 	return cltMirrorBaseDefault
 }
 
+// cltMirrorSubdirs 是镜像站上 CLT 清单可能的**子目录后缀**，按优先级排列。
+//
+// 为什么有不止一个：镜像站把 CLT 与面板发布包放在同一个"面板镜像目录"里，
+// 而那个目录在 NAS 上的对外前缀是 `/zizpanel`（实测 2026-09-16：
+//
+//	<base>/zizpanel/clt/index.json → 200，且与 <base>/clt/index.json 期望的
+//	内容 sha256 完全一致；而 <base>/clt/index.json → 404）。
+//
+// 空串是"CLT 直接挂在镜像根下"的布局（最初的设想，保留兼容）。
+//
+// 只认其中一个的代价很实在：NAS 上整套 CLT 包（含 32MB 分片）都在，代码却去探
+// 一个 404 的路径，于是**每次都静默跳过 NAS**、落到公网静态源 ——
+// 这正是"逻辑写了但等于没写"的典型。
+var cltMirrorSubdirs = []string{"", "/zizpanel"}
+
 // cltMirrorBaseFor 按"优先级 + 可用性"挑 CLT 镜像基址。
 //
 // 顺序（2026-09-16 用户要求："能用这个地址的尽量用"）：
 //  1. 面板设置里的镜像基址（自建 NAS，省流量、同城速度）—— 但**必须探通**
-//     （HEAD 它的 clt/index.json），不通就跳过；
+//     （HEAD 它的 clt/index.json，见 cltMirrorSubdirs 的两种布局），不通就跳过；
 //  2. 环境变量 ZIZPANEL_CLT_MIRROR（测试/临时覆盖）；
 //  3. 内置的静态镜像常量。
+//
+// 返回的基址结尾**不含** `/clt`：调用方（filesBase）会自己接 `/clt/<dir>` 或
+// 条目里的 path，所以这里返回 `base + "/zizpanel"` 这种"前缀"才对得上。
 //
 // 探测失败不报错：CLT 安装有三条路（镜像 → softwareupdate → 弹窗），
 // 这里只是挑"镜像那条路走哪个基址"，挑不出来就交给后面的路。
 func (m *Manager) cltMirrorBaseFor(ctx context.Context) string {
 	if m.MirrorEnabled() {
 		base := m.mirrorBase()
-		probe := base + "/clt/index.json"
-		if err := m.checkMirrorURL(ctx, probe); err == nil {
-			return base
+		for _, sub := range cltMirrorSubdirs {
+			if err := m.checkMirrorURL(ctx, base+sub+"/clt/index.json"); err == nil {
+				return base + sub
+			}
 		}
 	}
 	return cltMirrorBase()
@@ -183,6 +214,55 @@ func pickCLTItem(items []cltIndexItem, macMajor int) (cltIndexItem, bool) {
 		return it, true
 	}
 	return cltIndexItem{}, false
+}
+
+// cltMaxOSLabel 把一条清单条目的适用上限写成人能看的样子。
+func cltMaxOSLabel(maxOS int) string {
+	if maxOS == 0 {
+		return "不限"
+	}
+	return fmt.Sprintf("macOS %d", maxOS)
+}
+
+// cltMaxOSSummary 列出去重后的适用上限，例如 "macOS 15、macOS 不限"。
+// 用来在"没有适配条目"时报出**镜像里到底有什么**，而不是只说"没有"。
+func cltMaxOSSummary(items []cltIndexItem) string {
+	seen := map[int]bool{}
+	var vals []string
+	for _, it := range items {
+		if seen[it.MaxOS] {
+			continue
+		}
+		seen[it.MaxOS] = true
+		vals = append(vals, cltMaxOSLabel(it.MaxOS))
+	}
+	if len(vals) == 0 {
+		return "（清单里一条可用条目都没有）"
+	}
+	return strings.Join(vals, "、")
+}
+
+// cltNoApplicableItemError 造一条"镜像里没有这台系统版本的包"的错误。
+//
+// 为什么要专门写清楚：这条路失败后 installCLT 会回落到苹果 CDN，而苹果 CDN
+// 在国内慢到"看起来像卡死"（真机实测 15 分钟只下 1 MB）。如果这里只写一句
+// "清单里没有适用的包集合"，用户和事后排查的人都不知道**接下来为什么慢**，
+// 只会以为面板挂了。所以这条错误必须写全四件事：
+//   - 当前系统版本（macOS 主版本，来自 kern.osrelease）；
+//   - 镜像里实际有哪些适用上限（对方补条目时也就知道差在哪）；
+//   - 接下来会走哪条路（苹果 CDN / 弹窗）；
+//   - 这条路的真实代价（可能长时间没有进度）。
+//
+// 这不是"网络不通"：镜像清单拿到了、解析成功了，只是没有这台系统版本的条目。
+// 两件事必须区分，否则运维会去查网络，而问题在清单。
+func cltNoApplicableItemError(items []cltIndexItem, macMajor int) error {
+	return fmt.Errorf(
+		"镜像清单里没有适配 macOS %d 的条目（镜像里可用的适用上限只有 %s）—— "+
+			"这不是网络问题，是镜像本身没放这台系统版本的 CLT 包；"+
+			"接下来回落到苹果 CDN 下载（softwareupdate / 弹窗），"+
+			"国内网络实测极慢（曾 15 分钟只下 1 MB，然后停住），可能长时间没有进度，"+
+			"请耐心等待；或请镜像维护者补一条适用于 macOS %d 的条目",
+		macMajor, cltMaxOSSummary(items), macMajor)
 }
 
 // cltNeededPkgs 把清单条目收敛成"确实要下、要装"的那几个包。
@@ -221,12 +301,17 @@ func (m *Manager) installCLTFromMirror(ctx context.Context, result *InstallResul
 	macMajor := macMajorVersion(darwinMajorVersion())
 	item, ok := pickCLTItem(idx.Items, macMajor)
 	if !ok {
-		return fmt.Errorf("镜像清单里没有适用于 macOS %d 的包集合", macMajor)
+		return cltNoApplicableItemError(idx.Items, macMajor)
 	}
 	pkgs := cltNeededPkgs(item)
 	if len(pkgs) == 0 {
 		return fmt.Errorf("镜像清单条目 %q 里没有需要的包", item.Name)
 	}
+	// 把"用了哪一条、它的适用上限是什么、本机是什么版本"写进任务步骤。
+	// 用户看到的版本号与代码判断的依据必须一致，否则"为什么这台机器走了慢路"
+	// 在日志里完全对不上。
+	result.step(ctx, fmt.Sprintf("选用镜像条目 %q（适用上限 %s，本机 macOS %d）",
+		item.Name, cltMaxOSLabel(item.MaxOS), macMajor))
 
 	dir := "/tmp/zizpanel-clt"
 	_ = os.MkdirAll(dir, 0o755)
@@ -400,9 +485,13 @@ func lastLines(s string, n int) string {
 //  为什么值得单独写：CLT 的 576 MB 包是整条"全新安装"链路里最大的一次传输。
 //  真机实测（mini，无代理）单连接只有 200 KB/s 左右 —— 50 分钟，而且中途断一次
 //  就要从 0 开始。镜像上把包切成 32 MB 的分片之后：
-//    - **并行**：实测总吞吐明显高于单连接；
+//    - **并行**：4 路并行时单连接被限速的链路上总吞吐更高；
+//      （2026-09-16 复测：zizdog.com 这个源是**整条链路**限速，4 路并行
+//      单连接 110 KB/s × 4 ≈ 456 KB/s，与单连接 483~522 KB/s 基本持平 ——
+//      并发不是万灵药，但它也不会更差，且换源后可能有用。）
 //    - **续传**：已下载并校验通过的分片直接跳过，重试任务的代价从"整包"变成"一片"；
-//    - **早失败**：每片单独校验，坏片只重下那一片。
+//    - **早失败**：每片都校验大小；清单里给了分片 sha256 时再校验内容，
+//      坏片只重下那一片，不会等 600 MB 拼完才发现。
 //
 //  清单没给 parts 时自动退回单文件下载（见 fetchCLTPkg），所以镜像可以分阶段升级。
 // ============================================================================
@@ -450,6 +539,12 @@ func (m *Manager) fetchCLTPkg(ctx context.Context, result *InstallResult, item c
 	if wantSHA != "" {
 		if got := sha256OfFile(dst); got != wantSHA {
 			_ = os.Remove(dst)
+			// 关键：整体不一致说明**至少有一片是坏的**，这时必须把分片一起丢掉。
+			// 留着它们，下次重试时 fetchParts 会按"大小对得上"全部跳过，于是每次
+			// 都在同一份坏数据上失败，用户看到的是"重试多少次都一样"。
+			// （清单给了分片 sha256 时坏片会在 fetchParts 里被逮到；这里是不给
+			// 分片 sha256 的旧清单的兜底，两条路都不能留下会骗过续传的残片。）
+			_ = os.RemoveAll(partDir)
 			return 0, fmt.Errorf("分片拼接后校验不一致（期望 %s，实际 %s）", wantSHA, got)
 		}
 	}
@@ -457,7 +552,8 @@ func (m *Manager) fetchCLTPkg(ctx context.Context, result *InstallResult, item c
 	return n, nil
 }
 
-// fetchParts 并行下载分片，逐个校验大小；已有的分片（大小对得上）直接跳过。
+// fetchParts 并行下载分片，逐个校验大小（清单给了分片 sha256 时再校验内容）；
+// 已有的分片（大小对、有 sha256 时内容也对）直接跳过。
 //
 // 并发上限 + 每片一个 goroutine：用通道收集错误，**第一个错误就返回**，
 // 但不会杀掉已经跑起来的下载（它们最多多下几十 MB，比"等下完再发现失败"划算）。
@@ -482,8 +578,16 @@ func (m *Manager) fetchParts(ctx context.Context, result *InstallResult,
 			defer wg.Done()
 			for j := range jobs {
 				dst := filepath.Join(partDir, j.part.File)
+				wantSHA := strings.ToLower(strings.TrimSpace(j.part.SHA256))
 				if st, serr := os.Stat(dst); serr == nil && st.Size() == j.part.Size {
-					continue // 续传：这一片上次已经下好了
+					// 续传：大小对、且（清单给了 sha256 时）内容也对，才算"下好了"。
+					// 只看大小会让"大小正好但内容坏掉"的分片被永久跳过 —— 每次重试
+					// 都拿同一片坏的拼包，最后卡在整体 sha256 不一致上，而报错里
+					// 看不出是哪一片。所以这里必须验内容，坏片先删掉再下。
+					if wantSHA == "" || sha256OfFile(dst) == wantSHA {
+						continue
+					}
+					_ = os.Remove(dst)
 				}
 				if _, derr := m.downloadToFile(ctx, base+"/"+j.part.File, dst,
 					20*time.Minute, nil, "分片 "+j.part.File); derr != nil {
@@ -491,8 +595,18 @@ func (m *Manager) fetchParts(ctx context.Context, result *InstallResult,
 					return
 				}
 				if st, serr := os.Stat(dst); serr != nil || st.Size() != j.part.Size {
+					_ = os.Remove(dst) // 不留注定会被"续传"跳过的残片
 					errs <- fmt.Errorf("分片 %s 大小不对（期望 %d）", j.part.File, j.part.Size)
 					return
+				}
+				// 逐片内容校验：坏片只重下这一片，而不是等整包拼完。
+				if wantSHA != "" {
+					if got := sha256OfFile(dst); got != wantSHA {
+						_ = os.Remove(dst) // 同上：坏片必须删，否则下次续传会跳过它
+						errs <- fmt.Errorf("分片 %s 校验不一致（期望 %s，实际 %s）",
+							j.part.File, wantSHA, got)
+						return
+					}
 				}
 			}
 		}()

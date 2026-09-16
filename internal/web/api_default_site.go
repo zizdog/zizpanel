@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/appproxy"
+	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/sites"
 )
 
 // ============================================================================
@@ -34,44 +36,16 @@ import (
 //    · 应用界面代理（`/iopaint/` 等）照旧保留：它们是给用户浏览器用的。
 // ============================================================================
 
-const localhostIndexHTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>localhost</title>
-  <style>
-    body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 15vh auto; max-width: 32rem;
-           padding: 0 1.5rem; color: #222; line-height: 1.8; }
-    code { background: #f2f2f4; padding: .1rem .35rem; border-radius: .25rem; }
-    .muted { color: #888; font-size: .9rem; }
-  </style>
-</head>
-<body>
-  <h1>localhost</h1>
-  <p>这是本机 Web 服务的默认站点。它只放这一张占位页，用来接住没匹配到具体域名的请求。</p>
-  <p class="muted">面板不在这个端口上：请用面板自己的地址（HTTPS + 安全后缀）访问。<br>
-  需要管理数据库？在面板里打开 phpMyAdmin（需先登录面板）。</p>
-</body>
-</html>
-`
-
 // handleDefaultSiteApply 整理默认站点：建占位页 + 重写 000-default.conf。
 //
 // 秒级动作（写两个文件 + nginx -t + reload），按项目约定同步返回。
 func (s *Server) handleDefaultSiteApply(w http.ResponseWriter, r *http.Request) {
-	dir := filepath.Join(s.Cfg.WWWRoot, "localhost")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fail(w, http.StatusInternalServerError, "创建 "+dir+" 失败: "+err.Error())
+	index, _, err := sites.EnsureLocalhostPlaceholder(s.Cfg.WWWRoot)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	index := filepath.Join(dir, "index.html")
-	if _, err := os.Stat(index); os.IsNotExist(err) {
-		if err := os.WriteFile(index, []byte(localhostIndexHTML), 0o644); err != nil {
-			fail(w, http.StatusInternalServerError, "写入 index.html 失败: "+err.Error())
-			return
-		}
-	}
+	dir := filepath.Dir(index)
 	// 归属交给面板运行用户，别留下 root 属主的站点目录
 	if s.Cfg.User != "" && os.Geteuid() == 0 {
 		if err := chownTreeTo(dir, s.Cfg.User); err != nil {
@@ -79,33 +53,8 @@ func (s *Server) handleDefaultSiteApply(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	content := s.buildDefaultVhost()
-	if err := s.writeVhost(r.Context(), "000-default", content); err != nil {
-		fail(w, http.StatusInternalServerError, "写入默认站点配置失败（已自动回滚）: "+err.Error())
-		return
-	}
-	// 日志目录的归属必须在 reload 之前修好。
-	//
-	// 真机事故（mini，2026-09-14）：vhost 里的 access_log 指向 ~/www/_logs/，
-	// 而那个目录被之前的操作留成了 root 属主 —— nginx 的 worker 以普通用户运行，
-	// 打不开日志文件，于是 **reload 时报 [emerg] 却仍然返回退出码 0**：
-	// 面板以为成功、nginx 继续用旧配置，表现成"点了没反应"。
-	if s.Cfg.User != "" && os.Geteuid() == 0 {
-		_ = chownTreeTo(filepath.Join(s.Cfg.WWWRoot, "_logs"), s.Cfg.User)
-	}
-	if err := s.nginxReload(r.Context()); err != nil {
-		fail(w, http.StatusInternalServerError, "配置已写入，但 nginx 重载失败: "+err.Error())
-		return
-	}
-	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败时会在错误日志里写 [emerg]
-	// 而 `-s reload` 依然返回 0。所以这里**按真实结果复核**：本机首页应当能拿到
-	// 我们刚写的那张占位页。拿不到就如实报错，并给出最可能的原因。
-	if code, body := fetchLocal("http://127.0.0.1/"); code != http.StatusOK || !strings.Contains(body, "这是本机 Web 服务的默认站点") {
-		fail(w, http.StatusInternalServerError, fmt.Sprintf(
-			"配置已写入，但 nginx 没有真正生效（本机首页返回 %d）。"+
-				"最常见的原因是 %s 的日志文件归属/权限不对（nginx worker 打不开 access_log 时"+
-				"reload 会失败但退出码仍是 0）。请到「日志中心 → nginx error_log」看 [emerg] 行。",
-			code, filepath.Join(s.Cfg.WWWRoot, "_logs")))
+	if err := s.applyDefaultVhost(r.Context()); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.audit(r, "default_site_apply", "nginx", "整理默认站点（去 /_panel、phpMyAdmin 限本机）", true, "")
@@ -116,16 +65,73 @@ func (s *Server) handleDefaultSiteApply(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// applyDefaultVhost 生成并应用一份**完整的**默认站点配置。
+//
+// 复用同一套写盘通道（helper 写 + nginx -t + 失败回滚 + reload + 真实复核），
+// 不新造第二套"写 nginx 配置"的实现。
+func (s *Server) applyDefaultVhost(ctx context.Context) error {
+	content := s.buildDefaultVhost()
+	if err := s.writeVhost(ctx, "000-default", content); err != nil {
+		return fmt.Errorf("写入默认站点配置失败（已自动回滚）: %w", err)
+	}
+	// 日志目录的归属必须在 reload 之前修好。
+	//
+	// 真机事故（mini，2026-09-14）：vhost 里的 access_log 指向 ~/www/_logs/，
+	// 而那个目录被之前的操作留成了 root 属主 —— nginx 的 worker 以普通用户运行，
+	// 打不开日志文件，于是 **reload 时报 [emerg] 却仍然返回退出码 0**：
+	// 面板以为成功、nginx 继续用旧配置，表现成"点了没反应"。
+	if s.Cfg.User != "" && os.Geteuid() == 0 {
+		_ = chownTreeTo(filepath.Join(s.Cfg.WWWRoot, "_logs"), s.Cfg.User)
+	}
+	if err := s.nginxReload(ctx); err != nil {
+		return fmt.Errorf("配置已写入，但 nginx 重载失败: %w", err)
+	}
+	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败时会在错误日志里写 [emerg]
+	// 而 `-s reload` 依然返回 0。所以这里**按真实结果复核**：本机首页应当能拿到
+	// 我们刚写的那张占位页。拿不到就如实报错，并给出最可能的原因。
+	if code, body := fetchLocal("http://127.0.0.1/"); code != http.StatusOK ||
+		!strings.Contains(body, sites.LocalhostIndexMarker) {
+		return fmt.Errorf(
+			"配置已写入，但 nginx 没有真正生效（本机首页返回 %d）。"+
+				"最常见的原因是 %s 的日志文件归属/权限不对（nginx worker 打不开 access_log 时"+
+				"reload 会失败但退出码仍是 0）。请到「日志中心 → nginx error_log」看 [emerg] 行。",
+			code, filepath.Join(s.Cfg.WWWRoot, "_logs"))
+	}
+	return nil
+}
+
 // buildDefaultVhost 生成完整的默认站点配置（幂等：内容只由代码决定）。
 func (s *Server) buildDefaultVhost() string {
 	wwwRoot := s.Cfg.WWWRoot
 	localhostDir := filepath.Join(wwwRoot, "localhost")
 	defaultDir := filepath.Join(wwwRoot, "_default") // 仅作为 error_page 的落点，不再对外
 	phpmyadmin := filepath.Join(s.Cfg.BrewPrefix, "share", "phpmyadmin")
-	fpm := filepath.Join(s.Cfg.BrewPrefix, "etc", "nginx", "includes", "php-fpm.conf")
+
+	// PHP 端点必须**按机器/版本解析**，不能 include 一份写死 127.0.0.1:9000
+	// 的片段：面板的多版本设计里每个 php@x.y 听自己专属的 Unix socket，
+	// 9000 上根本没人听 —— 真机现象是"点一次「整理默认站点」，默认站点从
+	// 可用变成 502"。端点解析与参数文本都来自 internal/sites（与一键 LNMP、
+	// phpMyAdmin 入口共用同一份，见 sites.PreferredFastCGIPass / FastCGIParamsBlock）。
+	pass, phpVersion := sites.PreferredFastCGIPass(s.Cfg.BrewPrefix)
+	phpParams := sites.FastCGIParamsBlock()
 
 	var b strings.Builder
-	b.WriteString("# 默认站点（由 ZizPanel 生成 —— 请勿手工编辑，面板会整份重写）\n")
+	writePHPLocationBody := func(indent string) {
+		if pass == "" {
+			b.WriteString(indent + "# 本机没有可用 PHP 端点：默认站点暂不解析 PHP。\n")
+			b.WriteString(indent + "# 到「网站管理 → 🐘 PHP 环境」修好端点后，再点一次「整理默认站点」。\n")
+			return
+		}
+		b.WriteString(indent + "fastcgi_pass " + pass + ";\n")
+		for _, line := range strings.Split(phpParams, "\n") {
+			b.WriteString(indent + line + "\n")
+		}
+	}
+
+	// 头两行是**统一标记**（D44）：services 侧靠它判断"这份默认站点是不是面板的"。
+	// 以前两份生成器各写各的标记，互相认不出来 —— 现在都写 services 导出的这一份。
+	b.WriteString(services.DefaultVhostMarker + "\n")
+	b.WriteString(services.DefaultVhostKindFull + "\n")
 	b.WriteString("# 作用：接住没匹配到具体域名的请求，并提供两个受控入口：\n")
 	b.WriteString("#   · /phpmyadmin/  **只允许 127.0.0.1**：面板登录后反代过来才能用，外部直连 403\n")
 	b.WriteString("#   · /<应用>/      应用界面代理（见「应用市场 → 打开」），转发给面板统一改写\n")
@@ -134,7 +140,9 @@ func (s *Server) buildDefaultVhost() string {
 	b.WriteString("    listen       80 default_server;\n")
 	b.WriteString("    server_name  _;\n\n")
 	fmt.Fprintf(&b, "    root   %s;\n", localhostDir)
-	b.WriteString("    index  index.html index.php;\n\n")
+	// index.php 放在前面：用户要求"默认站点有一个 index.php"，而"整理默认站点"
+	// 会把这份模板整份重写 —— 顺序写反了就会让 PHP 版默认站点退回旧的静态 index.html。
+	b.WriteString("    index  index.php index.html;\n\n")
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", filepath.Join(wwwRoot, "_logs"))
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", filepath.Join(wwwRoot, "_logs"))
 
@@ -151,30 +159,28 @@ func (s *Server) buildDefaultVhost() string {
 	}
 
 	b.WriteString("    location / {\n        try_files $uri $uri/ =404;\n    }\n\n")
-	fmt.Fprintf(&b, "    location ~ \\.php$ {\n        include %s;\n    }\n\n", fpm)
+	b.WriteString("    # PHP：" + phpVersion + " 的专属 FastCGI 端点（多版本共存，不写死 9000）\n")
+	b.WriteString("    location ~ \\.php$ {\n")
+	writePHPLocationBody("        ")
+	b.WriteString("    }\n\n")
 
 	// phpMyAdmin：仍然由 nginx + php-fpm 直接服务（它是个 PHP 站点，不是反代），
 	// 但**只允许本机**：面板登录后把请求反代到这里，外部直连一律 403。
 	//
-	// 注意 location 的写法：**不能带尾斜杠**。`alias` 与 `try_files` 一起用时，
-	// nginx 会用 `$uri` 去拼 alias（而不是"剥掉 location 前缀后的部分"），
+	// 入口内容**不在这里手写**：收敛到 services.PMAEntryBlock（唯一实现）——
+	// 与一键 LNMP 补的最小默认站点、以及"往已有默认站点插入"共用同一份，
+	// 安全指令（allow/deny/301）与卸载标记不可能再漂移（D10/D14）。
+	//
+	// 注意 location 的写法在生成器里：**不能带尾斜杠**。`alias` 与 `try_files`
+	// 一起用时，nginx 会用 `$uri` 去拼 alias（而不是"剥掉 location 前缀后的部分"），
 	// 写成 `location ^~ /phpmyadmin/` 会去找 `<alias>/phpmyadmin/index.php`，
 	// 落到目录索引上 → **403 directory index is forbidden**（真机踩过）。
-	// 下面这种"无尾斜杠 location + alias + try_files 回落到 /phpmyadmin/index.php"
-	// 是这台机器上一直跑通的写法。
-	b.WriteString("    # phpMyAdmin：只允许本机（面板登录后反代）—— 外部直连一律 403\n")
-	b.WriteString("    location = /phpmyadmin {\n        return 301 /phpmyadmin/;\n    }\n")
-	b.WriteString("    location ^~ /phpmyadmin {\n")
-	b.WriteString("        allow 127.0.0.1;\n")
-	b.WriteString("        allow ::1;\n")
-	b.WriteString("        deny all;\n")
-	b.WriteString("        alias " + phpmyadmin + ";\n")
-	b.WriteString("        index index.php;\n")
-	b.WriteString("        try_files $uri $uri/ /phpmyadmin/index.php$is_args$args;\n\n")
-	b.WriteString("        location ~ \\.php$ {\n")
-	fmt.Fprintf(&b, "            include %s;\n", fpm)
-	b.WriteString("        }\n")
-	b.WriteString("    }\n")
+	// 生成器用的是这台机器上一直跑通的"无尾斜杠 location + alias + try_files 回落"。
+	b.WriteString(services.PMAEntryBlock(services.PMAEntryOptions{
+		Share:       phpmyadmin,
+		FastCGIPass: pass,
+		PHPVersion:  phpVersion,
+	}))
 	_ = defaultDir
 	b.WriteString("}\n")
 	return b.String()

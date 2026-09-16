@@ -12,6 +12,10 @@ import {
   h, clear, toast, modal, confirmBox, $,
 } from './ui.js';
 import { state, registerCleanup } from './app.js';
+// 站点 SSL Tab 里的「使用 Let's Encrypt 证书」整块 UI 放在 certs.js：
+// 证书库与站点是两套生命周期，把它做成一个"自包含 + 自己异步填充"的组件，
+// sites.js 只负责挂上去，避免两个页面对证书数据各写一份渲染逻辑。
+import { acmeSslSection } from './certs.js';
 
 let cache = null; // 站点列表数据（含预设与 PHP 版本）
 
@@ -58,14 +62,35 @@ export function SitesView(content, ctx = {}) {
   function renderStatus() {
     clear(statusBar);
     const c = cache || {};
-    const phpRunning = (c.php_versions || []).filter((p) => p.running).length;
-    statusBar.append(
+    const phps = c.php_versions || [];
+    const phpRunning = phps.filter((p) => p.running).length;
+    // "需要修复"= 该版本还没被面板配置成独立端点（仍写着 Homebrew 出厂的 9000）。
+    // 多版本共用 9000 正是"第二个版本起不来"的原因，必须在列表页就能看见。
+    const phpNeedFix = phps.filter((p) => !p.listen_ok).length;
+    // 用数组拼再展开：原生 Element.append 会把 null 渲染成文本 "null"
+    // （工具栏上真的显示过一个 null，见 ui.js 的注释）。
+    const bar = [
       h('span.pill', { text: `共 ${(c.list || []).length} 个站点` }),
       h('span.pill' + (phpRunning > 0 ? '.ok' : '.warn'), {
-        text: `PHP-FPM 运行中 ${phpRunning} 个`,
-        title: (c.php_versions || []).map((p) => `${p.version} (${p.pass}) ${p.running ? '运行中' : '未运行'}`).join('\n'),
+        text: `PHP-FPM 运行中 ${phpRunning}/${phps.length} 个`,
+        title: phps.map((p) => `${p.version} ${p.running ? '运行中' : '未运行'} · ${p.pass || p.listen_err || '端点未解析'}`).join('\n'),
       }),
+    ];
+    if (phpNeedFix) {
+      bar.push(h('span.pill.warn', {
+        text: `⚠️ ${phpNeedFix} 个 PHP 版本未配置独立端点`,
+        title: phps.filter((p) => !p.listen_ok)
+          .map((p) => `PHP ${p.version}：${p.conflict || `当前 ${p.pass || '未解析'}，应为 ${p.preferred_pass}`}`)
+          .join('\n'),
+      }));
+    }
+    bar.push(
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      h('button.btn.btn-sm', {
+        text: '🐘 PHP 环境',
+        title: '查看已安装的 PHP 版本、各自的 FastCGI 端点与运行状态；一键修复端点',
+        onclick: phpEnvModal,
+      }),
       h('button.btn.btn-sm', {
         text: '🧪 校验 nginx 配置',
         onclick: async () => {
@@ -102,6 +127,7 @@ export function SitesView(content, ctx = {}) {
       }),
       h('button.btn.btn-primary.btn-sm', { text: '+ 新建站点', onclick: newSiteModal }),
     );
+    statusBar.append(...bar);
   }
 
   function renderList() {
@@ -164,6 +190,114 @@ export function SitesView(content, ctx = {}) {
     return p ? p.label : (name || '无');
   }
 
+  // ---------- PHP 版本选项 ----------
+  //
+  // 版本下拉框的数据源是后端按 Homebrew 实际安装情况推导出来的列表
+  // （GET /api/v1/php → cache.php_versions），既不是写死的，也不是自由文本。
+  // 标签里必须把"没配好 / 没在跑"直接写出来：这两种状态都会让站点 502，
+  // 而用户在"我明明选了 8.4"的时候根本想不到是端点没配或 fpm 没起来。
+  function phpOptionLabel(p) {
+    const tags = [];
+    if (!p.listen_ok) tags.push('⚠️端点未配置');
+    if (!p.running) tags.push('未运行');
+    if (p.conflict) tags.push('⚠️端点冲突');
+    const suffix = tags.length ? `（${tags.join('，')}）` : '';
+    const pass = p.pass || p.preferred_pass || '';
+    return `PHP ${p.version}${suffix}${p.is_default ? ' ← 默认' : ''}${pass ? ' · ' + pass : ''}`;
+  }
+
+  // phpFixButton 生成"把该版本改成独立端点并重启"的按钮。
+  async function fixPHPEndpoint(version, reload) {
+    if (!await confirmBox(
+      `将把 PHP ${version} 的 php-fpm 配置改成它专属的 Unix socket 端点，并重启该服务。\n\n`
+      + '为什么要改：Homebrew 的每个 PHP 版本出厂都监听 127.0.0.1:9000，'
+      + '两个版本同时跑必然抢端口，后起的那个起不来。\n\n'
+      + '面板会先备份原配置（www.conf.zizpanel.bak）再改写。继续？',
+      { title: `修复 PHP ${version} 监听端点` },
+    )) return;
+    try {
+      const r = await api.phpFixListen(version, true);
+      toast(r.msg || `PHP ${version} 已就绪`, 'ok');
+      if (reload) reload();
+      load();
+    } catch (e) {
+      toast(e.message, 'err', 16000);
+    }
+  }
+
+  // ---------- PHP 环境面板 ----------
+  // 把"装了哪些版本、各自听在哪、跑没跑、要不要修"一次说清，
+  // 并且**每个版本一个修复按钮** —— 多版本共存的排障全靠这一屏。
+  async function phpEnvModal() {
+    const box = h('div', [h('div.empty', [h('div.big', { text: '🐘' }), h('p', { text: '正在读取 PHP 版本…' })])]);
+    modal({ title: 'PHP 多版本环境', wide: true, body: box });
+
+    // data 用可变对象包一层：修复后要重新拉一次列表再重绘，
+    // 直接给参数赋值在闭包里容易看漏（阅读时以为还是最初那份数据）。
+    const state2 = {};
+    try {
+      state2.data = await api.phpList();
+    } catch (e) {
+      clear(box);
+      box.append(h('div.empty', [h('div.big', { text: '⚠️' }), h('p', { text: e.message })]));
+      return;
+    }
+    const render = () => {
+      clear(box);
+      const data = state2.data || {};
+      const list = data.list || [];
+      if (!list.length) {
+        box.append(h('div.empty', [
+          h('div.big', { text: '📦' }),
+          h('h4', { text: '没有检测到 PHP' }),
+          h('p', { text: '请先到「应用市场」安装 PHP（默认装 8.2；也可选 8.3 / 8.4）。' }),
+        ]));
+        return;
+      }
+      box.append(
+        h('div.hint', {
+          style: { marginBottom: '12px' },
+          text: data.note || '每个 PHP 版本使用独立的 Unix socket 端点。',
+        }),
+        h('table.table', [
+          h('thead', [h('tr', [
+            h('th', { text: '版本' }), h('th', { text: 'FastCGI 端点' }),
+            h('th', { text: '运行状态' }), h('th', { text: '配置' }), h('th', { text: '操作' }),
+          ])]),
+          h('tbody', list.map((p) => h('tr', [
+            h('td', [h('strong', { text: 'PHP ' + p.version }),
+              p.is_default ? h('span.pill.brand', { style: { marginLeft: '6px' }, text: '默认' }) : null]),
+            h('td.mono', { style: { fontSize: '11.5px' }, text: p.pass || '（未解析）' }),
+            h('td', p.running
+              ? h('span.pill.ok', { text: '运行中' })
+              : h('span.pill.danger', { text: '未运行', title: '该端点上没有进程监听；选了这个版本的站点会 502' })),
+            h('td', p.listen_ok
+              ? h('span.pill.ok', { text: '已是独立端点' })
+              : h('span.pill.warn', {
+                text: '需要修复',
+                title: p.listen_err || p.conflict || `当前 ${p.pass}，应为 ${p.preferred_pass}`,
+              })),
+            h('td', [
+              p.listen_ok && p.running ? h('span', { style: { fontSize: '12px', color: 'var(--text-dim)' }, text: '无需处理' })
+                : h('button.btn.btn-sm.btn-primary', {
+                  text: p.listen_ok ? '↻ 重启服务' : '🔧 修复端点并重启',
+                  onclick: async () => {
+                    await fixPHPEndpoint(p.version, async () => {
+                      try { state2.data = await api.phpList(); } catch (e) { /* 拉取失败就保留旧数据 */ }
+                      render();
+                    });
+                  },
+                }),
+            ]),
+          ]))),
+        ]),
+        h('div.hint', { style: { marginTop: '12px' }, text: `套接字目录：${data.socket_dir || ''}` }),
+        h('div.hint', { text: '注意：改写配置后必须重启对应的 php-fpm 才会生效；面板会在重启后确认端点真的有人在监听，否则如实报错。' }),
+      );
+    };
+    render();
+  }
+
   // ---------- 新建站点 ----------
   function newSiteModal() {
     const presets = cache?.presets || [];
@@ -175,14 +309,24 @@ export function SitesView(content, ctx = {}) {
     const remark = h('input.input', { placeholder: '可选，便于自己识别' });
     const preset = h('select.select', presets.map((p) =>
       h('option', { value: p.name, text: p.label, selected: p.name === 'generic' })));
+    // PHP 版本：只能从**已安装的版本**里选（后端按 Homebrew 实际安装情况列出），
+    // 加一个"纯静态"选项。没有已安装版本时给出引导，而不是让人以为可以手填。
     const php = h('select.select', [
       h('option', { value: '', text: '纯静态（不解析 PHP）' }),
       ...phps.map((p) => h('option', {
         value: p.version,
-        text: `PHP ${p.version}${p.running ? '' : '（未运行）'}${p.is_default ? ' ← 当前默认' : ''}`,
+        text: phpOptionLabel(p),
         selected: p.is_default,
       })),
     ]);
+    if (!phps.length) {
+      php.append(h('option', { value: '', text: '（本机还没有安装任何 PHP，请先到「应用市场」安装）' }));
+    }
+    const phpHint = h('div.hint', {
+      text: phps.length
+        ? phps.map((p) => `PHP ${p.version} ${p.running ? '运行中' : '未运行'} · ${p.pass || '端点未解析'}`).join('；')
+        : '本机未检测到已安装的 PHP 版本。',
+    });
     const proxy = h('input.input', { placeholder: '可选，如 http://127.0.0.1:3000（填了就是反向代理站点）' });
     const presetHint = h('div.hint', { text: '' });
     const rootPreview = h('code.code', { text: '' });
@@ -235,7 +379,8 @@ export function SitesView(content, ctx = {}) {
         h('div.field', [h('label', { text: '附加域名' }), aliases]),
         h('div.field', [h('label', { text: '运行目录' }), rootPreview, h('div.hint', { text: '目录会自动创建（已在 ~/www 下）' })]),
         h('div.field', [h('label', { text: '路由 / 伪静态' }), preset, presetHint]),
-        h('div.field', [h('label', { text: 'PHP 版本' }), php, h('div.hint', { text: '选择"纯静态"时，nginx 会拒绝执行该站点下的 PHP 文件' })]),
+        h('div.field', [h('label', { text: 'PHP 版本' }), php, phpHint,
+          h('div.hint', { text: '选择"纯静态"时，nginx 会拒绝执行该站点下的 PHP 文件' })]),
         h('div.field', [
           h('label', { text: '反向代理（可选）' }),
           proxy,
@@ -328,14 +473,56 @@ export function SitesView(content, ctx = {}) {
     function tabRouter() {
       const preset = h('select.select', presets.map((p) =>
         h('option', { value: p.name, text: p.label, selected: p.name === site.rewrite })));
-      const php = h('select.select', [
+      // 已安装版本 + 纯静态。若站点现存版本已经不在列表里（例如被卸载了），
+      // 仍然把它显示出来，否则用户一保存就把它悄悄改成了别的版本。
+      const curPHP = phps.find((p) => p.version === site.php_version);
+      const phpOptions = [
         h('option', { value: '', text: '纯静态（不解析 PHP）', selected: !site.php_version }),
         ...phps.map((p) => h('option', {
           value: p.version,
-          text: `PHP ${p.version}${p.running ? '' : '（未运行）'} · ${p.pass}`,
+          text: phpOptionLabel(p),
           selected: p.version === site.php_version,
         })),
-      ]);
+      ];
+      if (site.php_version && !curPHP) {
+        phpOptions.push(h('option', {
+          value: site.php_version,
+          text: `PHP ${site.php_version}（已不在本机已安装列表中）`,
+          selected: true,
+        }));
+      }
+      const php = h('select.select', phpOptions);
+
+      // 该站点当前 PHP 端点的健康提示：没配好 / 没在跑 / 端点冲突。
+      // 这三种状态都会让站点 502，必须在用户保存前就说清楚。
+      const phpc = phps.find((p) => p.version === site.php_version);
+      const phpWarn = h('div');
+      if (site.php_version && !site.proxy_pass) {
+        const problems = [];
+        if (data.fastcgi_err) problems.push(data.fastcgi_err);
+        if (phpc && phpc.conflict) problems.push(phpc.conflict);
+        if (phpc && !phpc.listen_ok) {
+          problems.push(`PHP ${site.php_version} 还没被面板配置成独立端点（当前 ${phpc.pass || '未解析'}，应为 ${phpc.preferred_pass}）`);
+        }
+        if (phpc && !phpc.running) {
+          problems.push(`PHP ${site.php_version} 的 php-fpm 没有在监听（端点 ${phpc.pass || '未解析'}），本站会返回 502`);
+        }
+        if (problems.length) {
+          phpWarn.append(...[
+            ...problems.map((t) => h('div', {
+              style: {
+                padding: '7px 10px', marginBottom: '6px', background: 'var(--danger-soft)',
+                borderRadius: '6px', fontSize: '12.5px',
+              },
+              text: '• ' + t,
+            })),
+            h('button.btn.btn-sm.btn-primary', {
+              text: `🔧 修复 PHP ${site.php_version} 端点（会重启该版本 fpm）`,
+              onclick: () => fixPHPEndpoint(site.php_version),
+            }),
+          ]);
+        }
+      }
       const proxy = h('input.input', { value: site.proxy_pass || '', placeholder: '留空为普通站点；填写则整站反代' });
       const extra = h('textarea.textarea', {
         value: site.extra_conf || '',
@@ -373,7 +560,12 @@ export function SitesView(content, ctx = {}) {
       return h('div', [
         h('div.field', [h('label', { text: '路由 / 伪静态模板' }), preset, hint]),
         h('div.field', [h('label', { text: 'PHP 版本' }), php,
-          h('div.hint', { text: phps.some((p) => p.running) ? '只解析该版本 FPM 监听的地址；版本未运行会返回 502' : '未检测到运行中的 PHP-FPM，请先启动相应服务' })]),
+          h('div.hint', {
+            text: phps.length
+              ? '每个版本监听各自的 FastCGI 端点（Unix socket），因此多版本可以共存。版本未运行或端点未配置都会返回 502。'
+              : '本机未检测到已安装的 PHP 版本，请先到「应用市场」安装。',
+          }),
+          phpWarn]),
         h('div.field', [
           h('label', { text: '反向代理目标' }),
           proxy,
@@ -387,6 +579,8 @@ export function SitesView(content, ctx = {}) {
 
     function tabSSL() {
       const box = h('div');
+      // 证书申请成功后要整块重画（状态行、按钮都会变），所以把"挂载点"包一层。
+      const acmeSection = () => acmeSslSection(site, { onApplied: () => { render(); load(); } });
       const render = () => {
         clear(box);
         const cur = site.ssl_enabled;
@@ -421,6 +615,7 @@ export function SitesView(content, ctx = {}) {
               }),
             ]),
           );
+          box.append(acmeSection());
           return;
         }
         box.append(
@@ -433,8 +628,9 @@ export function SitesView(content, ctx = {}) {
           h('div.hint', { style: { marginTop: '12px' } }, [
             h('div', { text: '• mkcert：使用本机 mkcert CA 签发。若已在系统信任该 CA，浏览器不会提示。' }),
             h('div', { text: '• 自签证书：无需任何依赖，浏览器会提示不受信任（点"继续访问"即可）。' }),
-            h('div', { text: '• Let\'s Encrypt 自动签发需要公网域名且 80 端口可达，将在后续版本提供。' }),
+            h('div', { text: "• 需要浏览器信任的正式证书：用下面的「使用 Let's Encrypt 证书」——先在「SSL 证书」页申请，再回来选。" }),
           ]),
+          acmeSection(),
         );
       };
 

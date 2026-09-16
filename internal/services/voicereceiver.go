@@ -81,6 +81,9 @@ const (
 	receiverTokenPrefix = "ttsv-"
 	// 与 Qwen 一致：代理对外的端口，上游在 127.0.0.1:8880
 	qwenUpstream = "http://127.0.0.1:8880"
+	// receiverReadyTimeout 是「等 /voice/health 返回期望值」的上限。
+	// 超时即**如实失败**（见 waitReceiverReady）。
+	receiverReadyTimeout = 20 * time.Second
 )
 
 // receiverPaths 是接收端的目录约定（与文档一致）。
@@ -488,6 +491,20 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 		return err
 	}
 
+	// ---- 0b. 基础依赖：ffmpeg / ffprobe ----
+	//
+	// 接收端自己就用它们：ffprobe 真解码校验上传的音色样本（只看魔数会把
+	// "扩展名对得上的坏文件"放过去），ffmpeg 做转码与归一化。它同时是上游
+	// Qwen 编码 mp3 的前提 —— 2026-09-16 事故里上游没有 ffmpeg，合成返回
+	// HTTP 200 + 空 body，接收端每一块都抛 IncompleteRead(0 bytes read)，
+	// 用户所有 TTS 作业全败。这里缺了就明确失败，不进入"只能收 wav"的
+	// 静默退化（那种退化用户根本看不出来）。
+	// 先按目录里声明的 Requires 提示一句，再真的装（见 basedep.go）。
+	m.AnnounceAppDependencies(ctx, "voicereceiver", result)
+	if err := m.EnsureBaseDependencies(ctx, result); err != nil {
+		return fmt.Errorf("缺少基础依赖（音频校验/转码必需），已中止部署：%w", err)
+	}
+
 	p := m.receiverPaths()
 
 	// ---- 1. 目录与脚本 ----
@@ -581,31 +598,35 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 		return err
 	}
 
-	// ---- 4. 验证：只认真的返回了 auth:true，并且**真拿密钥调一次** ----
-	// 只看 auth:true 不够：健康检查是"配置层面"的回答。这里再用密钥打一次
-	// /jobs（200）+ 用错误密钥打一次（403），才算鉴权真的生效。
-	wantAuth := !opt.NoAuth && (enabled > 0)
-	if !waitJSONBoolValue(ctx, fmt.Sprintf("http://127.0.0.1:%d/voice/health", receiverPort),
-		"auth", wantAuth, 20*time.Second) {
-		result.Warning = fmt.Sprintf("接收端已注册，但 /voice/health 未返回 auth:true。请看日志：%s", p.ErrLog)
-		result.step(ctx, "警告："+result.Warning)
-		return nil
+	// ---- 4. 先登记进服务管理，再验收 ----
+	//
+	// 顺序是刻意的（2026-09-17 审计）：原来登记在验收**之后**，而验收失败只写
+	// 一条 Warning 就 return nil —— 两个后果叠在一起：服务没起来却报「成功」，
+	// 而且失败时紧接着 return，服务**根本没登记**：用户在服务管理里看不到它，
+	// 自然也拿不到管理密钥（密钥回显在下面第 5 节）。先登记再验收，任何失败都能
+	// 如实说「已登记但未就绪」，用户有地方可查、可重启、可重新签发密钥。
+	// 登记失败**不**让整个部署失败（刻意接受的降级）：launchd 服务本身是好的、
+	// 网站也能调它，只是面板列表里暂时没有它（可手工纳管）。理由同 Qwen：
+	// 让一个「其实能用」的服务报失败、逼用户重装，造成的损失更大。下面的
+	// 就绪验收仍会如实判定它到底起没起来，并把登记结果写进失败信息。
+	registered := true
+	if err := m.RegisterInstalledService(ctx, receiverLabel, "TtsVoice 音色接收端", "🔐", "ai", receiverPort); err != nil {
+		registered = false
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
 	}
-	result.step(ctx, "接收端已就绪并启用鉴权")
+
+	// ---- 4b. 验收：只认真的返回了期望的 auth 值，并且**真拿密钥调一次** ----
+	// 只看 HTTP 200/字段存在都不够：健康检查是"配置层面"的回答。下面还会用密钥
+	// 真打一次 /jobs（200）+ 用错误密钥打一次（403），才算鉴权真的生效。
+	wantAuth := !opt.NoAuth && (enabled > 0)
+	if err := m.waitReceiverReady(ctx, p, wantAuth, registered, result); err != nil {
+		return err
+	}
 
 	if primaryKey != "" {
-		ok, detail := m.verifyReceiverKey(ctx, primaryKey)
-		if !ok {
-			result.Warning = "接收端起来了，但用密钥访问 /jobs 没通过：" + detail +
-				"。请看日志 " + p.ErrLog
-			result.step(ctx, "警告："+result.Warning)
-			return nil
+		if err := m.assertReceiverKeyUsable(ctx, p, primaryKey, registered, result); err != nil {
+			return err
 		}
-		result.step(ctx, "已用密钥实测 /jobs（200），并确认错误密钥被拒（403）")
-	}
-
-	if err := m.RegisterInstalledService(ctx, receiverLabel, "TtsVoice 音色接收端", "🔐", "ai", receiverPort); err != nil {
-		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"）")
 	}
 
 	// ---- 5. 把网站那边要的两样东西直接列出来 ----
@@ -638,7 +659,100 @@ func (m *Manager) InstallVoiceReceiver(ctx context.Context, result *InstallResul
 	)
 	result.Token = primaryKey
 	result.Address = host
+
+	// ---- 6. 收尾验收：用服务进程的 PATH 真的跑一次 ffmpeg / ffprobe ----
+	//
+	// 与 Qwen TTS 同一套理由：接收端是在自己的进程里调这两个命令的，
+	// "brew 说装好了"不等于"服务进程能用"。缺了会让样本校验静默退化、
+	// 转码失败，而界面上的健康检查照样是绿的。
+	if problems := m.VerifyBaseDependencies(ctx); len(problems) > 0 {
+		msg := "基础依赖验收未通过：" + describeDependencyProblems(problems) +
+			"。接收端已注册，但样本校验与音频转码会失败；修好后请重新部署，" +
+			"或手工执行 `brew install ffmpeg`"
+		result.Warning = msg
+		result.step(ctx, "错误："+msg)
+		return fmt.Errorf("%s", msg)
+	}
+	result.step(ctx, "已确认 ffmpeg / ffprobe 可执行（样本校验与转码依赖它们）")
 	return nil
+}
+
+// waitReceiverReady 等接收端 /voice/health 如实报告期望的鉴权状态。
+// **超时返回错误，不是警告。**
+//
+// 2026-09-17 审计：原来这里 20 秒没返回期望值只写一条 Warning 就 return nil，
+// 而且它 return 得**太早** —— 登记在 return 之后，于是失败时服务根本没登记，
+// 用户在服务管理里看不到它、也拿不到密钥。现在跑在登记之后（见调用点第 4 节），
+// 并且如实失败。
+func (m *Manager) waitReceiverReady(ctx context.Context, p receiverPaths,
+	wantAuth, registered bool, result *InstallResult) error {
+
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/voice/health", receiverPort)
+	want := fmt.Sprintf(`"auth": %v`, wantAuth)
+	state := "接收端已登记进服务管理（可在「服务管理 → TtsVoice 音色接收端 → 详情」" +
+		"查看状态与调用密钥）"
+	if !registered {
+		state = "接收端已写入并加载 launchd，但登记进服务管理失败，" +
+			"可在「可纳管」里手动加入"
+	}
+	wait := readyWaitJSONBool
+	return assertReady(ctx, readySpec{
+		What:    "TtsVoice 音色接收端",
+		Expect:  fmt.Sprintf("%s 在 %s 内返回 %s", healthURL, receiverReadyTimeout, want),
+		Timeout: receiverReadyTimeout,
+		Probe: func(ctx context.Context) readyVerdict {
+			if wait(ctx, healthURL, "auth", wantAuth, receiverReadyTimeout) {
+				return readyVerdict{OK: true,
+					Actual: "已就绪，健康检查如实报告了鉴权状态"}
+			}
+			return readyVerdict{Actual: fmt.Sprintf(
+				"%s 没有返回 %s（接收端没起来，或鉴权配置没生效 —— "+
+					"没鉴权的接收端等于一个谁都能投放文件的入口）", healthURL, want)}
+		},
+		LogPath: p.ErrLog,
+		State:   state,
+		Missing: "但接收端实际上不可用，网站的上传与合成请求现在都会失败",
+		Remedy: "按下面的日志尾部里的报错修好后重新部署；" +
+			"服务已登记，也可以在「服务管理」里点「重启服务」再试",
+		Result: result,
+	})
+}
+
+// assertReceiverKeyUsable 用真实密钥打一次 /jobs，确认鉴权真的生效。
+// **失败返回错误，不是警告。**
+//
+// 理由同 waitReceiverReady（历史教训）：launchctl 的退出码与 /voice/health 的
+// auth:true 都谎报过成功。如果这里只写一条 Warning 就 return nil，用户会拿到一个
+// 「任务完成 ✅」但网站每次调用都被拒的接收端。
+func (m *Manager) assertReceiverKeyUsable(ctx context.Context, p receiverPaths,
+	key string, registered bool, result *InstallResult) error {
+
+	verify := readyVerifyReceiverKey
+	state := "接收端已登记进服务管理"
+	if !registered {
+		state = "接收端已写入并加载 launchd（但登记进服务管理失败）"
+	}
+	return assertReady(ctx, readySpec{
+		What:   "接收端鉴权",
+		Expect: "用共享密钥访问 /jobs 返回 200，且错误密钥被拒（非 200）",
+		// 这不是等待型检查，是即时真实调用，所以没有「等待多久」可写
+		// （assertReady 在 Timeout<=0 时不拼「已等待」）。
+		Probe: func(ctx context.Context) readyVerdict {
+			ok, detail := verify(ctx, m, key)
+			if ok {
+				return readyVerdict{OK: true,
+					Actual: "已就绪：用密钥实测 /jobs（200），并确认错误密钥被拒（403）"}
+			}
+			return readyVerdict{Actual: "用密钥访问 /jobs 没通过：" + detail}
+		},
+		LogPath: p.ErrLog,
+		State:   state,
+		Missing: "但鉴权事实上没有生效，网站拿着这把密钥也拿不到结果",
+		Remedy: "按下面的日志尾部里的报错修好后重新部署；" +
+			"也可以在「服务管理 → TtsVoice 音色接收端 → 详情 → 🔑 调用密钥」" +
+			"重新签发一把后重试",
+		Result: result,
+	})
 }
 
 // verifyReceiverKey 用指定密钥真打一次 /jobs，并确认错误密钥被拒。
@@ -1389,7 +1503,8 @@ func receiverPlist(p receiverPaths, user, host, adminToken string) string {
 func waitJSONBoolValue(ctx context.Context, url, field string, want bool, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if out, err := runCurlCtx(ctx, url, 4); err == nil {
+		// runCurlCtx 现在还返回 HTTP 状态码（phpMyAdmin 那边需要），这里只用 body
+		if out, _, err := runCurlCtx(ctx, url, 4); err == nil {
 			var m map[string]any
 			if json.Unmarshal([]byte(out), &m) == nil {
 				if v, ok := m[field].(bool); ok && v == want {

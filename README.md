@@ -1,90 +1,110 @@
 # ZizPanel
 
-macOS 上的网站与服务管理面板（类宝塔），原生支持 Apple Silicon。
-装完后用浏览器远程管理这台 Mac，不需要再开终端。
-
-- 一条命令安装，面板自身**零运行时依赖**（单个 Go 二进制，前端内嵌）
-- 开机自启、崩溃自动重启、断电恢复
-- 网站（nginx/PHP/MySQL）、数据库、文件、计划任务、日志、审计
-- 应用市场：原生优先，需要容器时才用 Docker
-- 内置国内镜像：无代理也能装、能升级
-
----
+macOS 上的网站与服务管理面板（类宝塔），原生支持 Apple Silicon。装完用浏览器远程管这台 Mac，
+不用再开终端。单条命令安装，面板自身零运行时依赖（一个 Go 二进制，前端内嵌），
+开机自启、崩溃自动拉起。
 
 ## 一、安装
 
-在目标 Mac 上打开「终端」，粘贴**这一行**（会要求输入一次开机密码）：
+在目标 Mac 的「终端」里粘贴这一行（会要求输入一次开机密码）：
 
 ```bash
-curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
+curl -fsSL http://192.168.1.8:8090/zizpanel/install.sh | sudo bash -s -- --download-base http://192.168.1.8:8090/zizpanel
 ```
 
-> GitHub 能直连的话也可以用
-> `curl -fsSL https://raw.githubusercontent.com/zizdog/zizpanel/main/install.sh | sudo bash`。
-> **国内网络推荐用上面那条**：GitHub 在国内无代理时基本下不动，
-> 镜像脚本会自动从国内源下载。
+上面这条走内网 NAS 镜像；公网可用内置镜像 `https://zizdog.com/zizpanel`（内容与 NAS 一致）。
+给另一台机器装、手上没有 NAS 时，在开发机上跑 `make serve-install`：它会构建发布包并打印
+目标机要执行的 `curl … | sudo bash` 命令。仓库只在本地，不推远程仓库、不发 GitHub。
 
-装完终端会打印访问地址，形如：
+### 安装时用户需要手动做什么
 
-```
-远程访问   https://192.168.1.100:8443
-本机访问   https://127.0.0.1:8443
-```
-
-第一次打开会进入初始化向导，设置管理员账号即可使用。
-
-### 安装过程中可能出现的一两次点击（**正常情况下不需要**）
-
-安装脚本会尽量无人值守。只有下面两种情况会打断你，点了就行：
-
-| 情况 | 你会看到什么 | 怎么做 |
+| 时机 | 你会看到 | 怎么做 |
 |---|---|---|
-| 这台 Mac 从没装过「命令行开发者工具」（CLT） | macOS 弹出「安装命令行开发者工具」对话框 | 点「安装」→ 同意许可。**面板自己也会尝试静默装**（走国内镜像下载苹果原包），弹窗这条路只是兜底 |
-| 想消除浏览器的证书警告（可选） | 首次访问提示"证书不受信任" | 见下面「三、证书」；不想管就点「继续前往」 |
+| macOS 从没装过「命令行开发者工具」（CLT） | 弹出「安装命令行开发者工具」对话框 | 点「安装」→ 同意许可。面板自己也会先试静默装（走镜像），弹窗只是兜底 |
+| 第一次打开面板 | 「首次初始化」页 | 设置管理员账号（用户名 + 密码），以后用它登录 |
+| 浏览器提示证书不受信任 | 「您的连接不是私密连接」 | 点「继续前往」即可；想彻底消除见「五、证书」 |
 
-**Homebrew 与 Python 不需要你手动装**：面板会自己在任务里装
-（CLT → Homebrew → Python），在「应用市场 → 网站环境 / TTS」里点一下就有进度。
-你只需要在它弹窗时点一次「安装」。
+Homebrew、Python、ffmpeg 都不用手动装：面板会自己在任务里按 CLT → Homebrew → 基础依赖的顺序装，
+进度在「任务中心」实时可见。
 
-> 如果安装脚本提示"Homebrew 未能自动安装"，**面板本身仍然可用**，
-> 只是「网站管理 / 数据库」暂时不能建站点 —— 进面板后到
-> 「应用市场 → 网站环境」点安装即可（那里有实时进度，失败可重试）。
+### 可选参数
 
-### 装到第二台 Mac（可选）
+| 参数 / 变量 | 说明 |
+|---|---|
+| `--server-mode` | 装完顺带把机器配成长期在线的服务器（关睡眠、阻断自动更新重启、开 SSH） |
+| `--with-lnmp` | 装完顺带装 nginx + PHP + MySQL（国内网络下要十几到几十分钟） |
+| `--download-base <地址>` | 指定二进制下载源 |
+| `--listen <地址>` | 监听地址，默认 `:8443` |
+| `ZIZPANEL_ROOT` | 安装根目录，默认 `/opt/zizpanel`（可装到外置盘） |
+| `ZIZPANEL_SERVER_MODE=1` | 等价于 `--server-mode` |
 
-工作电脑上开一个只读安装源：
+离线安装：发布包在 NAS 的 `http://192.168.1.8:8090/zizpanel/download/latest/`，
+解开后 `cd` 进去执行 `sudo bash install.sh`。
+
+## 二、使用
+
+### 打开面板
+
+安装结束终端会打印访问地址。面板带一个随机**安全后缀**（仿宝塔「安全入口」），
+不知道后缀的人连登录页都看不到，地址形如 `https://<本机IP>:8443/<后缀>/`。
+忘了后缀就在机器上执行 `zizpanel status`，输出的「本机访问 / 远程访问」是带后缀的完整地址。
+局域网用 `https://<本机IP>:8443/<后缀>/`，在本机直连就把 IP 换成 `127.0.0.1`。
+具体后缀不在文档里写死（它本身就是一道门），见机器上的 `zizpanel status` 输出。
+
+面板是**单管理员**模型：改用户名/密码、开启两步验证（TOTP）、查看并强制关闭登录会话，
+都在「面板设置 → 账号与两步验证」。
+
+### 左侧导航
+
+- **总览**：`仪表盘`（负载/磁盘/站点概览）、`系统设置`（电源与睡眠、系统更新阻断、
+  崩溃报告与 Spotlight、远程登录 SSH，含「一键设为服务器模式」）
+- **网站**：`网站管理`、`反向代理`、`SSL 证书`、`数据库`
+- **服务器**：`服务管理`、`应用市场`、`Docker`
+- **运维**：`文件管理`、`Web 终端`、`计划任务`、`日志中心`
+- **系统**：`操作审计`、`面板设置`
+
+### 建站
+
+「网站管理 → 新建站点」：填域名、运行目录、PHP 版本，选「路由 / 伪静态模板」
+（Typecho、WordPress 等预设），也可以直接填一个反代地址。建好后到站点详情的
+「SSL 证书」页启用 HTTPS。每个站点有「诊断」，一次跑完 HTTP 探测、PHP 探针、
+证书检查与错误日志。
+
+### 应用市场
+
+分类：**网站环境**（Nginx、PHP 8.1/8.2/8.3/8.4、MySQL 8.4）、**AI 服务**
+（Qwen3 TTS、TtsVoice 音色接收端）、**运维工具**（phpMyAdmin、IOPaint（图片去水印）、
+Uptime Kuma、n8n、Gitea、MinIO 等）、**一键建站**（Typecho、WordPress）。
+
+- 顶部「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + MySQL 并做收尾配置。
+- 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
+- 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物），需要容器时才用 Docker，
+  且镜像必须原生支持 arm64。
+
+### 任务中心
+
+安装、卸载、建站、证书申请、Docker 部署、系统设置动作这类**几分钟到十几分钟**的操作
+都是后台任务：提交后立刻返回，进度走 SSE，顶栏「任务中心」有徽标。
+**关掉窗口任务不会中断**，随时能从顶栏重新打开看；任务需要输入时会弹输入框。
+
+### 在线升级
+
+「面板设置 → 关于与运维 → 在线升级」：
+
+1. 升级源填 `http://192.168.1.8:8090/zizpanel`（放着 `manifest.json` 与
+   `manifest.json.sig` 的目录）
+2. 「检查更新」→「下载并准备升级」→「立即升级」
+
+面板会验签、试运行自检、原子替换；新版本起不来会自动回滚到升级前的版本。
+没有外网或升级源不通时，用同一页的「离线升级（上传发布包）」。
+
+## 三、常用命令
 
 ```bash
-make serve-install
-```
-
-它会构建发布包、探测局域网 IP，并打印目标机要执行的 `curl … | sudo bash` 命令。
-完整流程见 [`Mac-mini部署指南.md`](Mac-mini部署指南.md)。
-
-### 从发布包离线安装
-
-```bash
-tar -xzf zizpanel_0.8.8_darwin_arm64.tar.gz
-cd zizpanel_0.8.8_darwin_arm64
-sudo bash install.sh
-```
-
----
-
-## 二、安装后
-
-### 升级
-
-面板里点：「设置 → 关于与运维 → 在线升级」→ 检查更新 → 升级。
-面板会下载、验签、自检、原子替换，失败自动回滚（独立看门狗比对**版本号**，
-不是"HTTP 200"）。国内用户把升级源填 `https://zizdog.com/zizpanel` 即可。
-
-### 常用命令
-
-```bash
-zizpanel status                       # 运行状态与访问地址
+zizpanel status                       # 运行状态与访问地址（带安全后缀）
 zizpanel info                         # 打印环境路径（排障用）
 sudo zizpanel gen-cert                # 重新生成自签证书
+sudo zizpanel reset-password admin    # 重置密码（交互输入，不回显）
 sudo launchctl kickstart -k system/cn.zizpanel.panel   # 重启面板
 tail -f /opt/zizpanel/logs/panel-$(date +%Y%m%d).log   # 查看日志
 
@@ -101,74 +121,10 @@ sudo zizpanel reset-password admin          # 交互输入，不回显
 printf '%s' '新密码' | sudo zizpanel reset-password admin --stdin   # 脚本里用这个
 ```
 
-重置后所有会话立即失效，需要用新密码重新登录。
+重置后所有会话立即失效。别写成 `sudo zizpanel reset-password admin 'p#ss'` ——
+`#`、`$`、`*`、空格都可能被 shell 吃掉。
 
-> 别写成 `sudo zizpanel reset-password admin 'p#ss'`：`#`、`$`、`*`、空格
-> 都可能被 shell 吃掉。用交互模式或 `--stdin`。
-
----
-
-## 三、证书
-
-安装脚本会优先用 **mkcert** 签发本机受信证书；但 `mkcert -install`
-需要一次图形界面授权，SSH / 远程会话里做不到，脚本会跳过并告知。
-
-在 Mac 的图形界面里执行一次，之后不再有任何提示：
-
-```bash
-mkcert -install
-sudo launchctl kickstart -k system/cn.zizpanel.panel
-```
-
-或者手动信任：「钥匙串访问」→ 系统 → 拖入
-`~/Library/Application Support/mkcert/rootCA.pem` → 双击 → 信任 → 「始终信任」。
-
-不做也行，只是浏览器首次会多一次「继续前往」。
-
----
-
-## 四、访问入口与账号
-
-| 入口 | 地址 |
-|---|---|
-| 直接访问 | `https://<本机IP>:8443` |
-| 本机直连 | `https://127.0.0.1:8443` |
-
-面板是**单管理员**模型，账号在「面板设置 → 账号与安全」里管理：
-改用户名/密码、开启两步验证（TOTP）、查看并强制关闭登录会话。
-
-安全设计（摘要）：密码 bcrypt(cost 12)；会话令牌只存 SHA-256 哈希；
-CSRF 只认请求头；连续失败按账号锁定；用户不存在时也跑一次 bcrypt
-（响应时间不可区分）；远程访问默认 `any`，可切 `local` / `whitelist`；
-默认**不信任** `X-Forwarded-For`（除非你确实挂在反代后面）。
-
----
-
-## 五、可用的环境变量与参数
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ZIZPANEL_ROOT` | `/opt/zizpanel` | 安装根目录（可装到外置盘） |
-| `ZIZPANEL_LISTEN` | `:8443` | 监听地址，如 `:9000` 或 `127.0.0.1:8443` |
-| `ZIZPANEL_VERSION` | `latest` | 指定版本 |
-| `ZIZPANEL_DOWNLOAD_BASE` | GitHub Releases | 二进制下载源（国内建议 `https://zizdog.com/zizpanel`） |
-| `ZIZPANEL_INSTALL_BREW` | `1` | 设为 `0` 跳过自动安装 Homebrew |
-| `ZIZPANEL_SKIP_DEPS` | - | 设为 `1` 跳过依赖检查 |
-| `ZIZPANEL_SKIP_FIREWALL` | - | 设为 `1` 跳过防火墙配置 |
-| `ZIZPANEL_SERVER_MODE` | - | 设为 `1` 等价于 `--server-mode` |
-| `ZIZPANEL_NO_SSH` | - | 配合 `--server-mode`：设为 `1` 则不开启 SSH |
-
-| 参数 | 说明 |
-|------|------|
-| `--server-mode` | 装完顺带配好服务器模式（禁睡眠/关自动更新重启/崩溃报告不弹窗/开 SSH） |
-| `--with-lnmp` | 装完顺带装 nginx + PHP + MySQL（国内网络下较久） |
-| `--download-base <地址>` | 指定下载源 |
-| `--listen <地址>` | 指定监听地址 |
-| `--help` | 打印用法 |
-
----
-
-## 六、目录结构
+## 四、目录结构
 
 ```
 /opt/zizpanel/
@@ -180,68 +136,32 @@ CSRF 只认请求头；连续失败按账号锁定；用户不存在时也跑一
 │   ├── panel.db           SQLite（用户/站点/服务/审计/会话）
 │   └── tls/               HTTPS 证书
 ├── logs/                  按天滚动的日志
-├── run/                   运行时文件
-├── work/                  compose 文件、服务数据、备份
+├── run/  work/            运行时文件、compose 与备份
 ├── tools/                 随包分发的辅助脚本
 └── uninstall.sh           卸载脚本
 ```
 
 界面与静态资源全部通过 Go `embed` 打进主程序，**升级只需换一个二进制**。
 
----
+## 五、证书
 
-## 七、国内网络
-
-中国大陆无代理时 GitHub 直连基本不通，所以：
-
-- `install.sh` 会先探真实下载地址，官方不通就**自动改用内置镜像**
-  （`https://zizdog.com/zizpanel`）。
-- 面板升级源填 `https://zizdog.com/zizpanel`。
-- 面板装 Homebrew 时会注入国内镜像并关掉自动更新；装 Python 依赖走清华 PyPI，
-  模型走 `hf-mirror.com`。
-- 应用市场的 GitHub 产物会**先测各源速度再按快的排**。
-
-### 镜像优先：能走镜像就走镜像，不通自动回落
-
-面板设置里的「镜像基址」（默认 `https://mirror.zizdog.com:8888`）是**第一优先**，
-凡是镜像上有的资源都从它取：
-
-| 资源 | 镜像路径 | 不通时回落 |
-|---|---|---|
-| 应用市场安装包（frps/frpc/orbien/lucky…） | `/apps/<应用>/<版本>/<文件名>` | GitHub 官方 → 国内加速前缀（按测速排序） |
-| 命令行开发者工具 CLT | `/clt/index.json` + `/clt/<产品号>/*.pkg` | 苹果 softwareupdate → 弹窗 |
-| **AI 模型（Qwen3 TTS，约 2.9GB）** | `/hf/<HF 路径>`（镜像按需缓存并转发到 hf-mirror.com） | 直连 `hf-mirror.com` |
-
-判定是**按具体资源**做的（对那个文件发 HEAD），不是只探站点根 —— 所以
-"镜像站活着但缺这个包"也会回落，不会让你卡在装不上。
-每次下载都会在任务步骤里写明**这次用了哪个源、为什么没用镜像**。
-
-> 镜像上的模型是**按需缓存**的：第一次请求要去上游取（慢），之后本地直出（快）。
-> 所以第一次装 Qwen 时若镜像这条路很慢，面板会自动回落到 `hf-mirror.com`，不会卡死。
-
-自建镜像只需要照这个目录放文件：
-
-```
-<镜像>/
-  install.sh             一键安装脚本
-  manifest.json          升级清单（url 指向镜像自己）
-  manifest.json.sig      Ed25519 签名
-  download/<版本>/…       该版本的包
-  download/latest/…      最新包（固定 URL）
-  clt/index.json         命令行开发者工具清单
-  clt/<产品号>/*.pkg      苹果原始 CLT 包
-```
-
----
-
-## 八、开发
-
-改这个项目请看 **[`DEVELOPMENT.md`](DEVELOPMENT.md)**：设计取舍、测试策略、
-发布流程、真机验证记录，以及 80 多条"踩过的坑与修法"清单。
+安装时若有 mkcert，脚本会用它签发本机受信证书；但 `mkcert -install` 需要一次图形界面授权，
+SSH / 远程会话里做不到，脚本会跳过并告知。在图形界面里执行一次即可，之后不再有提示：
 
 ```bash
-make dev          # 本地构建
-make run-local    # 在 /tmp/zizpanel-dev 调试启动（固定后缀 dev）
-make check        # 提交前必须真绿
-make release      # 打发布包 + 签名清单
+mkcert -install
+sudo launchctl kickstart -k system/cn.zizpanel.panel
 ```
+
+不做也行，只是浏览器首次访问多一次「继续前往」。
+
+## 六、镜像与国内网络
+
+发布件与应用包都走自建镜像，仓库不发布到 GitHub、不推任何远程仓库：
+
+- 面板发布件（`install.sh`、升级清单、发布包）：NAS `http://192.168.1.8:8090/zizpanel`
+- 面板设置里的「应用包镜像基址」默认 `https://mirror.zizdog.com:8888`（NAS 的公网入口，
+  内容与局域网地址一致）
+
+镜像优先，且按具体资源判断——镜像上没有的包会回落，不会卡住。装 Homebrew 会注入国内镜像，
+Python 依赖走国内 PyPI，AI 模型走 `hf-mirror.com`。

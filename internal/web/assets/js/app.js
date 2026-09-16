@@ -9,6 +9,7 @@ import { DashboardView, SettingsView } from './views.js';
 import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
 import { ReverseProxyView } from './reverseproxy.js';
+import { CertsView } from './certs.js';
 import { ServicesView } from './services.js';
 import { AppsView } from './apps.js';
 import { FilesView } from './files.js';
@@ -39,6 +40,9 @@ export const NAV = [
   { group: '网站' },
   { id: 'sites', title: '网站管理', icon: '🌐', view: SitesView },
   { id: 'proxy', title: '反向代理', icon: '🔀', view: ReverseProxyView },
+  // 证书与站点同级而不是塞进站点详情：一张泛域名证书常被多个站点共用，
+  // 而且"先申请证书、后建站"也是常见顺序，挂在站点下面会找不到入口。
+  { id: 'certs', title: 'SSL 证书', icon: '🔐', view: CertsView },
   { id: 'database', title: '数据库', icon: '🗄️', view: DatabaseView },
   { group: '服务器' },
   { id: 'services', title: '服务管理', icon: '⚙️', view: ServicesView },

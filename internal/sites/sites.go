@@ -215,8 +215,9 @@ func rewriteLocation(name string) string {
 // Options 控制配置生成的行为。
 type Options struct {
 	LogDir string // access/error 日志目录
-	// FastCGIPass 是 PHP 版本的 fastcgi 目标，如 127.0.0.1:9000。
-	// 由调用方根据 PHP 版本解析后传入（见 ResolveFastCGI）。
+	// FastCGIPass 是 PHP 版本的 fastcgi 目标，如 unix:/opt/homebrew/var/run/php-fpm-8.3.sock
+	// 或 127.0.0.1:9000。由调用方按站点所选的 PHP 版本解析后传入
+	// （见 ResolveEndpoint：每个版本一个唯一端点，解析不到会报错）。
 	FastCGIPass string
 }
 
@@ -396,11 +397,13 @@ map $http_upgrade $connection_upgrade {
 // FastCGIParams 对外暴露 FastCGI 参数片段（供测试与文档使用）。
 func FastCGIParams() string { return fastcgiParams() }
 
-// fastcgiParams 返回 PHP 转发所需的 FastCGI 参数。
-// 与 /opt/homebrew/etc/nginx/conf.d/php-fpm.conf 的内容保持一致，
-// 但内联进 vhost 以便每个站点独立选择 PHP 版本。
-func fastcgiParams() string {
-	params := []string{
+// fastcgiParamPairs 是 FastCGI 参数的唯一来源（name + value 列表）。
+//
+// **只有这一份**：站点的 vhost（Generate）、默认站点与 phpMyAdmin 入口
+// 都从这里派生，避免"一处改了另一处没改"（真机上就出现过 9000 与专属
+// socket 两个版本并存的问题）。
+func fastcgiParamPairs() []string {
+	return []string{
 		"QUERY_STRING $query_string",
 		"REQUEST_METHOD $request_method",
 		"CONTENT_TYPE $content_type",
@@ -419,13 +422,21 @@ func fastcgiParams() string {
 		"SERVER_NAME $server_name",
 		"REDIRECT_STATUS 200",
 		"HTTP_AUTHORIZATION $http_authorization",
+		// HTTPS 变量在非 SSL 连接下为空，用 if_not_empty 避免警告。
+		// 放在清单末尾而不是循环外特判：这样它就是**同一份参数清单**的一部分，
+		// 默认站点/phpMyAdmin 用的 FastCGIParamsBlock 也会带上它。
+		"HTTPS $https if_not_empty",
 	}
+}
+
+// fastcgiParams 返回 PHP 转发所需的 FastCGI 参数（**已带站点 vhost 的缩进**）。
+// 与 /opt/homebrew/etc/nginx/conf.d/php-fpm.conf 的内容保持一致，
+// 但内联进 vhost 以便每个站点独立选择 PHP 版本。
+func fastcgiParams() string {
 	var b strings.Builder
-	for _, p := range params {
+	for _, p := range fastcgiParamPairs() {
 		b.WriteString("\t\tfastcgi_param " + p + ";\n")
 	}
-	// HTTPS 变量在非 SSL 连接下为空，用 if_not_empty 避免警告
-	b.WriteString("\t\tfastcgi_param HTTPS $https if_not_empty;\n")
 	return b.String()
 }
 
@@ -437,53 +448,149 @@ type PHPVersion struct {
 	Service   string `json:"service"`  // php@8.3
 	Binary    string `json:"binary"`   // /opt/homebrew/opt/php@8.3/bin/php
 	FPMConf   string `json:"fpm_conf"` // php-fpm 配置文件
-	Pass      string `json:"pass"`     // fastcgi 目标，如 127.0.0.1:9000
+	Pass      string `json:"pass"`     // fastcgi 目标，如 unix:/opt/homebrew/var/run/php-fpm-8.3.sock
 	Running   bool   `json:"running"`
 	IsDefault bool   `json:"is_default"`
+	// PreferredPass 是面板为该版本**分配**的端点（Unix socket）。
+	// 与 Pass 不一致，就说明 www.conf 还没被面板改过（典型是出厂的 9000）。
+	PreferredPass string `json:"preferred_pass"`
+	// ListenOK 表示 www.conf 里的 listen 已经等于面板分配的端点。
+	// false 且有 ListenErr 时，界面应引导用户点"修复监听端点"。
+	ListenOK bool `json:"listen_ok"`
+	// ListenErr 是解析 www.conf 失败的原因（版本、文件、原因都在里面）。
+	// 非空时 Pass 为空 —— 宁可为空，也不给出一个猜出来的地址。
+	ListenErr string `json:"listen_err,omitempty"`
+	// Conflict 非空表示该版本与另一个版本共用同一个端点
+	// （多版本共存的直接故障：两个版本抢一个地址）。
+	Conflict string `json:"conflict,omitempty"`
 	// ActualVersion 是通过实际请求探测到的版本。
 	// 与 Version 不一致时说明"配置与实际运行的不是同一个版本"。
 	ActualVersion string `json:"actual_version,omitempty"`
 }
 
-// ResolveFastCGI 把 PHP 版本号（如 "8.3"）解析为 fastcgi_pass 目标。
+// DiscoverPHPVersions 从 Homebrew 的实际安装情况推导已安装的 PHP 版本。
 //
-// 解析顺序：
-//  1. 读取该版本 php-fpm.d/www.conf 里的 listen 指令（最权威）
-//  2. 读不到时按约定回退到 127.0.0.1:9000（Homebrew 默认）
-func ResolveFastCGI(brewPrefix, version string) string {
-	if version == "" {
-		return ""
+// 为什么不能写死列表：用户可能只装了 php@8.3，也可能装了 8.2/8.3/8.4，
+// 甚至全新版本（8.5）。写死列表的后果是"装了却选不到"，
+// 所以以 <brew>/opt/php* 里真实存在的东西为准。
+//
+// 返回的条目**按版本号升序**，保证界面顺序稳定。
+// 注意：这里不做"端点是否在监听"的判断（那是调用方的运行时探测）；
+// 它只回答"这台机器上装了哪些版本、各自配在哪个端点上"。
+func DiscoverPHPVersions(brewPrefix string) []PHPVersion {
+	optDir := filepath.Join(brewPrefix, "opt")
+	entries, err := os.ReadDir(optDir)
+	if err != nil {
+		return []PHPVersion{}
 	}
-	conf := filepath.Join(brewPrefix, "etc", "php", version, "php-fpm.d", "www.conf")
-	if b, err := readFileString(conf); err == nil {
-		for _, ln := range strings.Split(b, "\n") {
-			ln = strings.TrimSpace(ln)
-			if strings.HasPrefix(ln, ";") {
-				continue
-			}
-			if v, ok := strings.CutPrefix(ln, "listen"); ok {
-				v = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "="))
-				if v != "" {
-					return normalizeListen(v)
+	seen := map[string]bool{}
+	var out []PHPVersion
+	for _, e := range entries {
+		name := e.Name()
+		if name != "php" && !strings.HasPrefix(name, "php@") {
+			continue
+		}
+		version := ""
+		if v, ok := strings.CutPrefix(name, "php@"); ok {
+			version = v
+		} else {
+			// `php` 是版本别名（当前指 8.4）：解析软链接拿到真实版本号，
+			// 否则会出现一个叫 "php" 的条目，用户根本不知道那是哪个版本。
+			if link, err := os.Readlink(filepath.Join(optDir, name)); err == nil {
+				base := filepath.Base(link)
+				if v, ok := strings.CutPrefix(base, "php@"); ok {
+					version = v
+				} else if base != "php" {
+					version = base
 				}
 			}
 		}
+		if !rePHPVersion.MatchString(version) {
+			continue // 拿不到版本号就不列出来（列出来也没法配）
+		}
+		// php 与 php@8.4 会解析到同一个版本号，按版本号去重（保留 php@x.y 那一条）
+		if seen[version] {
+			continue
+		}
+		seen[version] = true
+
+		pv := PHPVersion{
+			Version:   version,
+			Service:   name,
+			Binary:    filepath.Join(optDir, name, "bin", "php"),
+			FPMConf:   FPMConfPath(brewPrefix, version),
+			IsDefault: name == "php",
+		}
+		if pref, err := PreferredEndpoint(brewPrefix, version); err == nil {
+			pv.PreferredPass = pref
+		}
+		if ep, err := ResolveConfigEndpoint(brewPrefix, version); err != nil {
+			pv.ListenErr = err.Error()
+		} else {
+			pv.Pass = ep
+			pv.ListenOK = EndpointIsPreferred(brewPrefix, version, ep)
+		}
+		out = append(out, pv)
 	}
-	return "127.0.0.1:9000"
+	sortPHPVersions(out)
+
+	// 标记"两个版本共用同一个端点"——这是多版本共存里最该被看见的故障。
+	//
+	// 注意要**两边都标**：只标后一个会让用户以为前一个是正常的。
+	byEndpoint := map[string][]int{}
+	for i := range out {
+		if out[i].Pass == "" {
+			continue
+		}
+		byEndpoint[out[i].Pass] = append(byEndpoint[out[i].Pass], i)
+	}
+	for ep, idxs := range byEndpoint {
+		if len(idxs) < 2 {
+			continue
+		}
+		names := make([]string, 0, len(idxs))
+		for _, i := range idxs {
+			names = append(names, out[i].Version)
+		}
+		for _, i := range idxs {
+			out[i].Conflict = fmt.Sprintf("PHP %s 共用端点 %s（多个版本抢一个地址，只有一个能起来）",
+				strings.Join(names, "、"), ep)
+		}
+	}
+	return out
 }
 
-// normalizeListen 把 unix socket 路径原样返回，TCP 地址去掉多余空格。
-func normalizeListen(v string) string {
-	v = strings.TrimSpace(v)
-	if strings.HasPrefix(v, "/") { // unix:/path 或 /path
-		v = strings.TrimPrefix(v, "unix:")
-		return "unix:" + v
+// sortPHPVersions 按 major/minor 数值升序排列（8.2 < 8.3 < 8.4 < 8.10）。
+//
+// 为什么不直接字符串排序：字符串排序会把 8.10 排到 8.2 前面。
+func sortPHPVersions(list []PHPVersion) {
+	less := func(a, b string) bool {
+		am, aerr := phpMinor(a)
+		bm, berr := phpMinor(b)
+		if aerr != nil || berr != nil {
+			return a < b
+		}
+		amaj, _ := strconv.Atoi(strings.Split(a, ".")[0])
+		bmaj, _ := strconv.Atoi(strings.Split(b, ".")[0])
+		if amaj != bmaj {
+			return amaj < bmaj
+		}
+		return am < bm
 	}
-	if strings.HasPrefix(v, "unix:") {
-		return v
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && less(list[j].Version, list[j-1].Version); j-- {
+			list[j], list[j-1] = list[j-1], list[j]
+		}
 	}
-	return v
 }
+
+// PHP 端点的解析与分配全部在 phpfpm.go 里（ResolveEndpoint / EnsureListen）。
+//
+// 历史提醒：这里原来有一个 ResolveFastCGI，读不到 www.conf 时会**静默回退
+// 127.0.0.1:9000**。那正是"多版本 PHP 互相抢端口"的根源 —— 每个版本被解析成
+// 同一个地址，面板还以为自己按站点指定了版本；等到两个版本真的同时跑起来，
+// 后起的那个 fpm 根本 bind 不上，站点请求全被先起的版本处理。
+// 现在改成：解析不到就报错（错误里带版本号、文件路径与原因），绝不猜端口。
 
 // ---------- 存储层 ----------
 
@@ -710,14 +817,6 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
-}
-
-func readFileString(p string) (string, error) {
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
 // SiteDir 返回域名的默认站点目录（~/www/<domain>）。

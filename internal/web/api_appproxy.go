@@ -8,11 +8,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/appproxy"
+	"github.com/zizdog/zizpanel/internal/sites"
 )
 
 // ============================================================================
@@ -191,26 +194,28 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 	// 与其在旧内容上做补丁，不如让"默认站点"只有**一个生成函数**
 	// （buildDefaultVhost，它内部用的就是带标记的 appProxyBlock）：
 	// 内容永远自洽，历史遗留的无标记块也在这一次重写里被清掉。
-	res, err := s.callHelper(r.Context(), "vhost-read", defaultVhost)
+	//
+	// 写盘 + reload 一律走「整理默认站点」的那条合规通道（applyDefaultVhost）：
+	// 它内部做 写盘（helper 内含 nginx -t）→ **把日志树 chown 给真实用户** →
+	// reload → **请求级复核**（首页真的返回含标记的占位页）。
+	// 以前这里自己 writeVhost + nginxReload 就返回成功：`www/_logs` 属主不对时
+	// reload 会 [emerg] 失败却仍然返回退出码 0，配置根本没被加载，而面板照样报
+	// "已生成 N 个入口" —— 市场里所有带界面的应用都会中招。
+	//
+	// 默认站点首页是那条通道的复核判据，所以先确保占位页存在（缺了才建，
+	// 用户改过的一个字不动），并把站点目录的归属交给真实用户。
+	index, _, err := sites.EnsureLocalhostPlaceholder(s.Cfg.WWWRoot)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "读取 nginx 配置失败: "+err.Error())
+		fail(w, http.StatusInternalServerError, "创建默认站点占位页失败: "+err.Error())
 		return
 	}
-	content := ""
-	if data, ok := res["data"].(map[string]any); ok {
-		content, _ = data["content"].(string)
+	if s.Cfg.User != "" && os.Geteuid() == 0 {
+		if err := chownTreeTo(filepath.Dir(index), s.Cfg.User); err != nil {
+			s.Log.Warn("调整 %s 归属失败（站点可能仍是 root 属主）：%v", filepath.Dir(index), err)
+		}
 	}
-	if strings.TrimSpace(content) == "" {
-		// 读不到也照样能写（helper 会做 nginx -t 与回滚），但先记一笔便于排查
-		s.Log.Warn("读不到 %s.conf 的现有内容，将直接整份重写", defaultVhost)
-	}
-	updated := s.buildDefaultVhost()
-	if err := s.writeVhost(r.Context(), defaultVhost, updated); err != nil {
-		fail(w, http.StatusInternalServerError, "写入 nginx 配置失败（已自动回滚）: "+err.Error())
-		return
-	}
-	if err := s.nginxReload(r.Context()); err != nil {
-		fail(w, http.StatusInternalServerError, "配置已写入，但 nginx 重载失败: "+err.Error())
+	if err := s.applyDefaultVhost(r.Context()); err != nil {
+		fail(w, http.StatusInternalServerError, "生成应用入口失败（默认站点配置已自动回滚）: "+err.Error())
 		return
 	}
 	s.audit(r, "app_proxy_apply", "nginx", fmt.Sprintf("生成 %d 个应用子路径入口", len(entries)), true, "")

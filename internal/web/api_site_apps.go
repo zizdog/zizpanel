@@ -46,15 +46,33 @@ type siteInstallReq struct {
 }
 
 type siteInstallResult struct {
-	App       string   `json:"app"`
-	Domain    string   `json:"domain"`
-	Dir       string   `json:"dir"`
-	URL       string   `json:"url"`
+	App    string `json:"app"`
+	Domain string `json:"domain"`
+	Dir    string `json:"dir"`
+	URL    string `json:"url"`
+	// Version / Source 如实告诉用户"装的是哪个固定版本、实际走的哪个源"
+	// （NAS 镜像 / 官方源）。留空表示这个应用还没登记固定版本。
+	Version   string   `json:"version,omitempty"`
+	Source    string   `json:"source,omitempty"`
 	FinishURL string   `json:"finish_url"`
 	DBName    string   `json:"db_name"`
 	DBUser    string   `json:"db_user"`
 	DBPass    string   `json:"db_pass"`
 	Steps     []string `json:"steps"`
+}
+
+// sitePackageFetchFn 下载并校验固定版本源码包。
+//
+// 默认实现走 services.Manager 的"NAS 优先 → 回落官方 → SHA256 校验"
+// （见 services/site_sources.go）；单测注入假实现，绝不联网（AGENTS.md 第三节）。
+var sitePackageFetchFn = func(s *Server, ctx context.Context, appID, dest string,
+	logf func(string)) (services.SiteSource, string, error) {
+	return s.svcManager().DownloadSitePackage(ctx, appID, dest, logf)
+}
+
+// siteHomeProbeFn 探测站点首页（单测注入假实现，不真发请求）。
+var siteHomeProbeFn = func(ctx context.Context, url string) (int, string) {
+	return probeHTTP(ctx, url)
 }
 
 // handleSiteAppInstall 一键建站（长任务：下载 + 解压 + 建库 + 建站点）。
@@ -80,7 +98,10 @@ func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.PHP == "" {
-		req.PHP = "8.3"
+		// 默认 PHP 版本与「一键 LNMP」装的版本保持一致（用户 2026-09-17：默认 8.2）。
+		// 不写死成别的：站点向导里能选的版本来自本机实际安装列表，
+		// 这里只是"用户没填"时的兜底，兜错会让新建的站点 502。
+		req.PHP = "8.2"
 	}
 
 	s.launchTask(w, r, "site-install", domain, "一键建站 "+app.Name+"（"+domain+"）",
@@ -110,23 +131,48 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	step("站点目录：%s", dir)
 
 	// ---------- ② 下载 + 解压 ----------
-	urls := append([]string{spec.DownloadURL}, spec.MirrorURLs...)
-	archive := filepath.Join(os.TempDir(), "zizpanel-site-"+app.ID+"-"+fmt.Sprint(time.Now().Unix())+"."+spec.Archive)
-	defer func() { _ = os.Remove(archive) }()
-	var lastErr error
-	downloaded := false
-	for _, u := range urls {
-		step("下载 %s", u)
-		if err := downloadFile(ctx, u, archive); err != nil {
-			lastErr = err
-			step("  失败：%v", err)
-			continue
-		}
-		downloaded = true
-		break
+	//
+	// 固定版本 + NAS 优先 + 强制 SHA256（见 services/site_sources.go）。
+	// 原实现直接 curl 目录条目里的地址、不校验哈希；审计还发现 Typecho 那个
+	// 写死的 jsdelivr 备用地址早已 404 —— 一旦 GitHub 不通就完全装不上。
+	logf := func(msg string) { step("%s", msg) }
+	pinned, hasPinned := services.SiteSourceFor(app.ID)
+	archiveName := "zizpanel-site-" + app.ID + "-" + fmt.Sprint(time.Now().Unix())
+	if hasPinned {
+		archiveName += filepath.Ext(pinned.File)
+	} else {
+		archiveName += "." + spec.Archive
 	}
-	if !downloaded {
-		return res, fmt.Errorf("下载源码失败（试过 %d 个地址）：%v", len(urls), lastErr)
+	archive := filepath.Join(os.TempDir(), archiveName)
+	defer func() { _ = os.Remove(archive) }()
+
+	if hasPinned {
+		// 已登记固定版本：只走实测过的地址（NAS 镜像 → 官方 → 加速），
+		// 每个地址下完都核对真实 sha256，绝不把 404/坏文件当成"可用备源"。
+		fetched, label, err := sitePackageFetchFn(s, ctx, app.ID, archive, logf)
+		if err != nil {
+			return res, err
+		}
+		res.Version, res.Source = fetched.Version, label
+		step("源码包已就绪：%s %s ← %s", fetched.Name, fetched.Version, label)
+	} else {
+		// 未登记固定版本的站点应用：保持原行为（目录条目里的官方 + 备用地址）。
+		urls := append([]string{spec.DownloadURL}, spec.MirrorURLs...)
+		var lastErr error
+		downloaded := false
+		for _, u := range urls {
+			step("下载 %s", u)
+			if err := downloadFile(ctx, u, archive); err != nil {
+				lastErr = err
+				step("  失败：%v", err)
+				continue
+			}
+			downloaded = true
+			break
+		}
+		if !downloaded {
+			return res, fmt.Errorf("下载源码失败（试过 %d 个地址）：%v", len(urls), lastErr)
+		}
 	}
 	if st, err := os.Stat(archive); err != nil || st.Size() < 1024 {
 		return res, fmt.Errorf("下载到的文件不完整（%d 字节）", sizeOf(archive))
@@ -176,6 +222,16 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		}
 		res.DBName, res.DBUser, res.DBPass = dbName, dbUser, dbPass
 		step("已建库 %s 与用户 %s（密码随机生成，见下方结果）", dbName, dbUser)
+
+		// 口令在 MySQL 接受 CREATE USER 的那一刻就真实生效了。后面的写站点配置、
+		// 建站点记录、applySite 任何一步失败都会提前 return —— 如果只在最后才记，
+		// 这个已存在的账号口令就永远找不回来了。所以先记，后续失败还能在密码列里找回。
+		// source=site-install 让前端能标明这条口令的来源。
+		if err := s.RememberDBPassword(context.WithoutCancel(ctx), dbUser, "localhost", dbPass, DBCredSourceSiteInstall); err != nil {
+			// 账号已在 MySQL 里真实存在 → 不要因此中断建站；但要如实留痕。
+			// **警告文本里绝不能出现口令**（install.go 的既有约定：口令只允许出现在 result.Credentials）。
+			step("（警告）数据库账号已创建，但面板未能保存口令以便日后在「账号与权限」里回显：%v", err)
+		}
 	}
 
 	// ---------- ④ 写配置文件 ----------
@@ -202,6 +258,13 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		return res, fmt.Errorf("创建站点记录失败: %w", err)
 	}
 	if err := s.applySite(ctx, site); err != nil {
+		// D23：站点记录已经落库，但 vhost 没生成。不回滚的话用户会看到
+		// 「网站管理里有这个站、却打不开」，而且换域名重试还会被"已存在"挡住。
+		if derr := s.siteMgr().Delete(ctx, domain); derr != nil {
+			step("（警告）回滚站点记录失败：%v，请到「网站管理」手动删除 %s", derr, domain)
+		} else {
+			step("生成 nginx 配置失败，已回滚站点记录 %s（可换域名或排障后重试）", domain)
+		}
 		return res, fmt.Errorf("生成 nginx 配置失败: %w", err)
 	}
 	step("已创建站点并套用「%s」伪静态", spec.Rewrite)
@@ -212,7 +275,7 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 			step("（警告）调整目录归属失败：%v", err)
 		}
 	}
-	if err := s.nginxReload(ctx); err != nil {
+	if err := siteReloadFn(s, ctx); err != nil {
 		step("（警告）nginx 重载失败：%v", err)
 	}
 
@@ -220,7 +283,7 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	scheme := "http"
 	res.URL = scheme + "://" + domain + "/"
 	res.FinishURL = res.URL + strings.TrimPrefix(spec.FinishPath, "/")
-	code, body := probeHTTP(ctx, res.URL)
+	code, body := siteHomeProbeFn(ctx, res.URL)
 	switch {
 	case code == 0:
 		step("（警告）首页探测不到响应 —— 通常是因为这个域名还没做本地解析。"+
@@ -282,10 +345,20 @@ func randomPassword(n int) string {
 	return s[:n]
 }
 
+// downloadFile 用 curl 下一个文件（未登记固定版本的站点应用的回落路径）。
+//
+// 超时是**显式**加的：审计发现原实现只有外层 5 分钟的 ctx、curl 自己没有
+// --max-time，卡住时用户要干等 5 分钟而且看不到任何进度。
+//
+//	--connect-timeout 15   连不上就快点换下一个源
+//	--max-time 540         单次尝试最多 9 分钟（外层 ctx 10 分钟兜底）
+//	--speed-limit/-time    低于 1KB/s 持续 60 秒即判定停滞，不等满 --max-time
 func downloadFile(ctx context.Context, url, dest string) error {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "/usr/bin/curl", "-fsSL", "--retry", "2", "--connect-timeout", "15", "-o", dest, url)
+	cmd := exec.CommandContext(cctx, "/usr/bin/curl", "-fsSL", "--retry", "2",
+		"--connect-timeout", "15", "--max-time", "540",
+		"--speed-limit", "1024", "--speed-time", "60", "-o", dest, url)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v（%s）", err, strings.TrimSpace(string(out)))

@@ -234,6 +234,30 @@ CREATE TABLE IF NOT EXISTS certificates (
     status     TEXT NOT NULL DEFAULT '',
     message    TEXT NOT NULL DEFAULT ''
 );
+
+-- 数据库凭据：面板自己下发过的数据库账号口令的**唯一**保存处。
+--
+-- 为什么需要这张表（这是本功能能诚实存在的唯一前提）：
+--   MySQL 里存的是口令的哈希（mysql.user.authentication_string），
+--   **任何面板都无法从数据库反推出原文**。宝塔之所以能"显示密码"，
+--   是因为它在创建库/账号时把明文自己存了下来。面板要诚实地做到同一件事，
+--   也必须自己存 —— 而且**只存面板自己下发过的**：别人手工建的账号这里没有记录，
+--   页面必须显示"不可回显"，绝不假装知道。
+--
+-- 唯一键 (user, host)：与 mysql.user 的账号身份一一对应；改口令就是 UPSERT 覆盖，
+-- 不会留下旧口令。注意 SQLite 的 TEXT 主键是区分大小写的，而 MySQL 的用户名
+-- 也区分大小写（主机名不区分），所以这里按原样保存，不额外做大小写折叠，
+-- 避免把两个真实存在的不同账号合并成一条。
+CREATE TABLE IF NOT EXISTS db_credentials (
+    user       TEXT NOT NULL,
+    host       TEXT NOT NULL,
+    password   TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'panel',   -- 谁写的：panel / site-install / import
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (user, host)
+);
+CREATE INDEX IF NOT EXISTS idx_db_credentials_user ON db_credentials(user);
 `
 
 func (s *Store) migrate(ctx context.Context) error {

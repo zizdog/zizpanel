@@ -147,7 +147,8 @@ func (c *Client) CreateUser(ctx context.Context, user, host, password string, pr
 	stmts = append(stmts, "FLUSH PRIVILEGES")
 
 	for _, s := range stmts {
-		if _, err := c.run(ctx, []string{"-e", s}); err != nil {
+		// 同样走 stdin：CREATE USER 的语句里带明文口令。
+		if _, err := c.runSQL(ctx, s); err != nil {
 			return fmt.Errorf("执行失败（%s）: %w", firstWord(s), err)
 		}
 	}
@@ -174,6 +175,22 @@ func (c *Client) DropUser(ctx context.Context, user, host string) error {
 }
 
 // SetUserPassword 修改账号密码。
+//
+// 这里**刻意不再执行 FLUSH PRIVILEGES**（旧实现有），原因是真机事故：
+//
+//	ALTER USER 本身是 DDL，会立刻更新内存里的权限表，不需要再 FLUSH
+//	（只有直接用 DML 改 mysql.user 表才需要）。而 `FLUSH PRIVILEGES`
+//	会**重新发起一次连接**，带的还是面板手里那份旧口令。当被改的正是
+//	面板自己用的账号（root）时，这次连接必然 1045 ——
+//	于是 ALTER 已经生效、调用方却收到"认证失败"，既不会把新口令写回面板配置，
+//	也没机会把新口令告诉用户。
+//
+// 2026-09-16 mini 上的证据（binlog）：16:35:50 有且仅有一条
+// `ALTER USER 'root'@'localhost' IDENTIFIED WITH 'caching_sha2_password' AS '...'`
+// error_code=0；同一秒面板的审计记录 db_user_password 却是 1045
+// `using password: NO`（来自紧随其后的 FLUSH）。从此面板永久连不上 MySQL。
+//
+// 所以：改口令这件事必须"一次调用只连一次"，改完由调用方用**新口令**自检。
 func (c *Client) SetUserPassword(ctx context.Context, user, host, password string) error {
 	if err := ValidateUserName(user); err != nil {
 		return err
@@ -189,11 +206,8 @@ func (c *Client) SetUserPassword(ctx context.Context, user, host, password strin
 		return err
 	}
 	userIdent := fmt.Sprintf("'%s'@'%s'", strings.ReplaceAll(user, "'", "''"), host)
-	if _, err := c.run(ctx, []string{"-e",
-		fmt.Sprintf("ALTER USER %s IDENTIFIED BY '%s'", userIdent, escPwd)}); err != nil {
-		return err
-	}
-	_, err = c.run(ctx, []string{"-e", "FLUSH PRIVILEGES"})
+	// 走 stdin 而不是 -e：这条语句里有明文口令，放进 argv 会被同机 ps 看到。
+	_, err = c.runSQL(ctx, fmt.Sprintf("ALTER USER %s IDENTIFIED BY '%s'", userIdent, escPwd))
 	return err
 }
 

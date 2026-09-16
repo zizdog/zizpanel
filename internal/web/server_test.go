@@ -16,9 +16,27 @@ import (
 	"github.com/zizdog/zizpanel/internal/sysinfo"
 )
 
+// shortTempDir 造一个**足够短**的临时目录。
+//
+// 为什么不用 t.TempDir()：macOS 上它形如
+// /var/folders/jd/<40 个随机字符>/T/TestXxx/001，前缀就有 60+ 字符。
+// 而 PHP 多版本的沙箱 brew 前缀下会绑定 Unix domain socket（sun_path 上限 104），
+// 真机上 /opt/homebrew/var/run/php-fpm-8.3.sock 只有 41 字符，
+// 用 t.TempDir() 会让测试先撞上"路径过长"而不是被测逻辑。
+// 仍然是隔离的临时目录，测试结束即删除。
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "zpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	cfg := config.Default()
 	// ⚠️ 用户的真实家目录必须被隔离。config.Default() 会用 os.UserHomeDir()
 	// 解析出**真实**家目录，而市场/服务等处理器会往 Cfg.UserHome 下探测甚至写文件：
@@ -33,10 +51,34 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	cfg.RunDir = dir + "/run"
 	cfg.WorkDir = dir + "/work"
 	cfg.BinDir = dir + "/bin"
+	// Homebrew 前缀也必须沙箱化。
+	//
+	// 为什么：这一批新接口（PHP 多版本）会读**并写**
+	// /opt/homebrew/etc/php/<版本>/php-fpm.d/www.conf。如果测试里前缀还是真机的，
+	// 一次 `go test ./internal/web/` 就会改掉用户真实的 php-fpm 配置 ——
+	// 性质等同于 2026-09-14 那次"测试覆盖真实 LaunchAgent plist"的事故。
+	// detectBrewPrefix 是变量（见 config 包注释），这里把它钉到临时目录；
+	// 目录里放一个 bin/brew 只是为了让 ReconcilePaths 认定"这个前缀是有效的"，
+	// 从而**不去**把它改回真机的 /opt/homebrew。
+	cfg.BrewPrefix = dir + "/brew"
+	cfg.BrewBin = cfg.BrewPrefix + "/bin/brew"
+	prevDetectBrew := config.SetBrewPrefixDetectorForTest(func() string { return cfg.BrewPrefix })
+	t.Cleanup(func() { config.SetBrewPrefixDetectorForTest(prevDetectBrew) })
+	_ = os.MkdirAll(cfg.BrewPrefix+"/bin", 0o755)
+	_ = os.WriteFile(cfg.BrewPrefix+"/bin/brew", []byte("#!/bin/sh\nexit 0\n"), 0o755)
 	cfg.TLSCert = dir + "/tls/panel.crt"
 	cfg.TLSKey = dir + "/tls/panel.key"
 	cfg.TLSEnable = false
 	cfg.Secret = strings.Repeat("a", 64)
+	// 系统级 LaunchDaemons 目录也必须沙箱化：adoptTargetExists 会 stat 它，
+	// 而真机上装了 frpc / orbien-client 的 plist 会让"市场残留态"相关测试
+	// 假失败（2026-09-16 实际发生）。单测不该依赖真机装了什么。
+	prevLaunchDaemonsDir := launchDaemonsDir
+	launchDaemonsDir = dir + "/LaunchDaemons"
+	if err := os.MkdirAll(launchDaemonsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { launchDaemonsDir = prevLaunchDaemonsDir })
 	cfg.AccessMode = "any"
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -106,6 +148,36 @@ func TestTestServerSandboxedAwayFromRealHome(t *testing.T) {
 	}
 }
 
+// TestTestServerSandboxedAwayFromRealHomebrew 是 Homebrew 前缀版的同一条护栏。
+//
+// 为什么需要：PHP 多版本功能会读写 <brew>/etc/php/<版本>/php-fpm.d/www.conf
+// 与 <brew>/opt/php*。测试服务器若还用真机前缀，`go test` 会直接改用户
+// 真实的 php-fpm 配置（== 2026-09-14 覆盖真实 plist 那类事故的翻版）。
+//
+// 这里断言两件事：
+//  1. 测试服务器的 BrewPrefix 不在 /opt/homebrew、/usr/local 里；
+//  2. config 包的前缀探测在测试期间返回的也是沙箱路径
+//     —— 否则 ReconcilePaths 会把前缀改回真机（它就是这么写的）。
+func TestTestServerSandboxedAwayFromRealHomebrew(t *testing.T) {
+	srv, _ := newTestServer(t)
+	got := srv.Cfg.BrewPrefix
+	if got == "" {
+		t.Fatal("测试服务器的 BrewPrefix 不该为空")
+	}
+	for _, real := range []string{"/opt/homebrew", "/usr/local"} {
+		if got == real || strings.HasPrefix(got, real+"/") {
+			t.Fatalf("BrewPrefix = %s 指向真实 Homebrew：测试会写到用户真实的 php-fpm/nginx 配置上", got)
+		}
+	}
+	// 关键：ReconcilePaths（svcManager 每次都会调）不能把沙箱前缀改回真机。
+	// 直接调一次并断言前缀原样不动 —— 这比"读一下探测器"更贴近真实故障路径。
+	srv.Cfg.ReconcilePaths()
+	if srv.Cfg.BrewPrefix != got {
+		t.Fatalf("ReconcilePaths 把 BrewPrefix 从 %s 改成了 %s："+
+			"沙箱失效，测试会落到真实 Homebrew 上", got, srv.Cfg.BrewPrefix)
+	}
+}
+
 // doJSON 发起 JSON 请求。默认自动带上 cookie 与 CSRF 头（模拟正常前端行为）。
 // 传 skipCSRF=true 可刻意不带 CSRF 头，用于验证防护是否生效。
 func doJSONOpt(t *testing.T, ts *httptest.Server, method, path string, body any, cookies []*http.Cookie, skipCSRF bool) (*http.Response, map[string]any, []*http.Cookie) {
@@ -169,7 +241,7 @@ func TestFullSetupLoginAndAuthorizedRequest(t *testing.T) {
 
 	// 4) 正常初始化
 	res, out, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("初始化失败 %d: %v", res.StatusCode, out)
 	}
@@ -199,7 +271,7 @@ func TestFullSetupLoginAndAuthorizedRequest(t *testing.T) {
 func TestCSRFProtection(t *testing.T) {
 	_, ts := newTestServer(t)
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatal("初始化失败")
 	}
@@ -239,7 +311,7 @@ func TestCSRFProtection(t *testing.T) {
 func TestLoginWrongPasswordAndLogout(t *testing.T) {
 	_, ts := newTestServer(t)
 	doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/login",
 		map[string]string{"username": "admin", "password": "wrong"}, nil)
@@ -252,7 +324,7 @@ func TestLoginWrongPasswordAndLogout(t *testing.T) {
 
 	// 正确登录并登出
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/login",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("登录失败 %d", res.StatusCode)
 	}
@@ -270,7 +342,7 @@ func TestLoginWrongPasswordAndLogout(t *testing.T) {
 func TestAccessControlBlocksForeignIP(t *testing.T) {
 	srv, ts := newTestServer(t)
 	doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 切到白名单模式，只允许 Tailscale 网段（不含本机回环之外的任何地址）
 	srv.Cfg.AccessMode = "whitelist"
@@ -378,7 +450,7 @@ func parseIPForTest(s string) net.IP { return net.ParseIP(s) }
 func TestServiceRoutesAreRegistered(t *testing.T) {
 	_, ts := newTestServer(t)
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatal("初始化失败")
 	}
@@ -422,7 +494,7 @@ func TestServiceRoutesAreRegistered(t *testing.T) {
 func TestSessionCookieSecureFlagFollowsRequestScheme(t *testing.T) {
 	_, ts := newTestServer(t)
 	doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	cases := []struct {
 		name       string
@@ -435,7 +507,7 @@ func TestSessionCookieSecureFlagFollowsRequestScheme(t *testing.T) {
 	}
 	for _, c := range cases {
 		req, err := http.NewRequest("POST", ts.URL+"/api/v1/login",
-			strings.NewReader(`{"username":"admin","password":"PanelTestPw-9x!"}`))
+			strings.NewReader(`{"username":"admin","password":"zizpanel-test-fixture-pass"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -471,7 +543,7 @@ func TestSessionCookieSecureFlagFollowsRequestScheme(t *testing.T) {
 func TestCronRoutesAreRegistered(t *testing.T) {
 	_, ts := newTestServer(t)
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatal("初始化失败")
 	}

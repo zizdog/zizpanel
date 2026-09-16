@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -284,20 +285,65 @@ func TestBaseArgsPrefersSocket(t *testing.T) {
 }
 
 func TestFormatMySQLError(t *testing.T) {
-	// 认证失败应给出可操作的提示
-	err := formatMySQLError("ERROR 1045 (28000): Access denied for user 'root'@'localhost'")
+	// 带了口令仍被拒：说明口令不对，应引导去改配置
+	err := formatMySQLError("ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)", true, "root")
 	if !strings.Contains(err.Error(), "认证失败") {
 		t.Fatalf("认证错误提示不友好: %v", err)
 	}
+	if !strings.Contains(err.Error(), "连接设置") {
+		t.Errorf("应指出去哪里改口令: %v", err)
+	}
 	// 连接失败同理
-	err2 := formatMySQLError("ERROR 2002 (HY000): Can't connect to local MySQL server")
+	err2 := formatMySQLError("ERROR 2002 (HY000): Can't connect to local MySQL server", false, "root")
 	if !strings.Contains(err2.Error(), "无法连接") {
 		t.Fatalf("连接错误提示不友好: %v", err2)
 	}
 	// 其它错误原样返回，不掩盖信息
-	err3 := formatMySQLError("ERROR 1064 (42000): You have an error in your SQL syntax")
+	err3 := formatMySQLError("ERROR 1064 (42000): You have an error in your SQL syntax", false, "root")
 	if !strings.Contains(err3.Error(), "1064") {
 		t.Fatalf("其它错误应保留原始信息: %v", err3)
+	}
+}
+
+// TestFormatMySQLErrorDistinguishesNoPassword 是本轮故障的核心断言：
+// "面板没带口令"与"面板带错口令"必须给出**不同**的解释，
+// 而且都要明确说"不能据此认为 root 没有密码"。
+//
+// 2026-09-16 真机原话就是被一句泛泛的"请检查密码"误导的。
+func TestFormatMySQLErrorDistinguishesNoPassword(t *testing.T) {
+	raw := "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: NO)"
+	err := formatMySQLError(raw, false, "root")
+	msg := err.Error()
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("1045 必须能用 errors.Is 判成 ErrAuth（上层据此区分服务没起来）: %v", err)
+	}
+	for _, want := range []string{"没有带口令", "两者不一致", "不能", "连接设置", raw} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("提示里缺少 %q：\n%s", want, msg)
+		}
+	}
+	// 恢复向导必须给出可操作命令（用户可能真的想不起口令）
+	if !strings.Contains(msg, "skip-grant-tables") {
+		t.Errorf("应给出忘记口令时的恢复向导：\n%s", msg)
+	}
+	// 带了口令的那种不许说"面板没有口令"
+	withPw := formatMySQLError(
+		"ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)", true, "root")
+	if strings.Contains(withPw.Error(), "没有带口令") {
+		t.Errorf("带了口令的错误不该说成'没有带口令'：%v", withPw)
+	}
+}
+
+func TestRecoveryGuideIsActionable(t *testing.T) {
+	g := RecoveryGuide("root")
+	for _, want := range []string{"skip-grant-tables", "FLUSH PRIVILEGES", "ALTER USER", "连接设置"} {
+		if !strings.Contains(g, want) {
+			t.Errorf("恢复向导缺少 %q：%s", want, g)
+		}
+	}
+	// 缺省账号也要能用（调用方可能传空串）
+	if !strings.Contains(RecoveryGuide(""), "root") {
+		t.Error("账号为空时应回退到 root")
 	}
 }
 

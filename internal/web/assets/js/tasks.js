@@ -26,6 +26,13 @@ const MAX_DOM_LINES = 2500;
 const STATE = {
   metas: new Map(),      // id -> TaskMeta
   lines: new Map(),      // id -> Line[]
+  // id -> InputRequest：任务**此刻**在等用户输入（见 SPEC「任务输入」）。
+  //
+  // 为什么不直接读 metas[id].input_required：列表轮询（GET /tasks）返回的是
+  // 请求发起那一刻的快照，可能比 SSE 的"开始等待"事件更旧；直接覆盖会把刚弹出来的
+  // 输入框抹掉。这里只接受"权威来源"（SSE 的 input_required 事件、status/meta
+  // 快照、REST 详情）的写入，并且只在**落定**（input_result 非空）时删除。
+  inputs: new Map(),
   lastSeq: new Map(),    // id -> 已收到的最大 seq（去重用）
   oldest: new Map(),     // id -> 服务端缓冲里最老的一行 seq（>1 = 更早的行已滚出）
   fallback: new Set(),   // 已经用 REST 兜底拉过历史的任务（每个任务只兜一次）
@@ -44,8 +51,11 @@ const STATUS_LABEL = { running: '运行中', succeeded: '成功', failed: '失�
 const STATUS_PILL = { running: 'brand', succeeded: 'ok', failed: 'danger', canceled: 'warn' };
 
 // 日志级别配色。step 加粗、out 常规、err 红、ok 绿、warn 黄、cmd 灰。
+// input = 后端给"任务在等输入"配的那条提示文案（结构信息走 input_required 事件，
+// 绝不解析这行文字）。
 const LEVEL_STYLE = {
   step: { fontWeight: '650', color: '#e6ebf5' },
+  input: { fontWeight: '650', color: '#fbbf24' },
   out: { color: '#c8d0e0' },
   err: { color: '#f87171' },
   ok: { color: '#4ade80' },
@@ -137,10 +147,50 @@ function addLines(id, lines) {
   if (added) emit('lines', { id });
 }
 
+/**
+ * syncInput 把一份任务快照里的输入状态并进 STATE.inputs。
+ *
+ * 规则（与 SPEC 的契约一一对应）：
+ *   - `input_required` 非空 ⇒ 任务此刻在等这个 key；
+ *   - `input_required` 缺席且 `input_result` 非空 ⇒ 这次等待已落定
+ *     （submitted / timeout / canceled），收框；
+ *   - 两个都没有 ⇒ **不动**（可能只是快照比"开始等待"更旧）。
+ */
+function syncInput(m) {
+  if (!m || !m.id) return;
+  if (m.input_required) STATE.inputs.set(m.id, m.input_required);
+  else if (m.input_result) STATE.inputs.delete(m.id);
+}
+
+/**
+ * mergeInputState 处理 SSE 的 input_required 事件。
+ *
+ * 只改"输入相关"的两个字段，其余（result/status/line_count…）保持原样 ——
+ * 状态事件与输入事件是两条独立通道，顺序不保证，整体覆盖会互相踩掉。
+ */
+function mergeInputState(id, payload) {
+  if (!id || !payload) return;
+  const cur = STATE.metas.get(id);
+  if (!cur) {
+    // 极少数情况下"开始等待"事件先于 meta/status 到达：只记输入状态，
+    // 不凭一条输入事件造出半个任务；meta 到了自然会渲染出来。
+    if (payload.input_required) STATE.inputs.set(id, payload.input_required);
+    return;
+  }
+  const next = Object.assign({}, cur);
+  if (payload.input_required) next.input_required = payload.input_required;
+  else delete next.input_required;
+  if (payload.input_result) next.input_result = payload.input_result;
+  STATE.metas.set(id, next);
+  syncInput(next);
+  emit('meta', { id });
+}
+
 /** upsertMeta 只处理"实时"来源（SSE status / POST 返回值），失败会弹一次 toast。 */
 function upsertMeta(m) {
   if (!m || !m.id) return;
   STATE.metas.set(m.id, m);
+  syncInput(m);
   if (!isRunning(m)) {
     // 结束的任务没有后续数据了：缓一下收完尾巴日志再关连接，
     // 否则 EventSource 会对着一个已经结束的流无限重连。
@@ -167,6 +217,7 @@ function applyList(list) {
     seen.add(m.id);
     const prev = STATE.metas.get(m.id);
     STATE.metas.set(m.id, m);
+    syncInput(m);
     // 列表也可能第一次告诉我们"某个任务已经结束了"（例如任务跑得比一次刷新还快），
     // 这时同样要给完成提示，否则用户永远等不到结果。
     if (prev && isRunning(prev) && !isRunning(m)) { notifyFinished(m); scheduleCloseStream(m.id); }
@@ -183,6 +234,7 @@ function applyList(list) {
     STATE.lastSeq.delete(id);
     STATE.oldest.delete(id);
     STATE.fallback.delete(id);
+    STATE.inputs.delete(id);
     closeStream(id);
   }
   // 页面加载 / 切回时，把仍在跑的任务的流接上（徽标与进度靠它保持实时）。
@@ -257,6 +309,15 @@ function ensureStream(id) {
     try { meta2 = JSON.parse(e.data); } catch { return; }
     upsertMeta(meta2);
   });
+  // 限时输入的开始 / 落定。**结构以这条事件为准**，绝不去解析 level:"input" 的日志行
+  // （那行只是给用户看的提示文案，改一次字就崩）。
+  //   data: {"input_required": {…}, "input_result": ""}        开始等待
+  //   data: {"input_required": null, "input_result": "timeout"} 落定 → 收框
+  es.addEventListener('input_required', (e) => {
+    let payload = null;
+    try { payload = JSON.parse(e.data); } catch { return; }
+    mergeInputState(id, payload);
+  });
   es.addEventListener('open', () => { r.state = 'live'; emit('stream', { id }); });
   es.onerror = () => {
     // EventSource 会自动重连并带上 Last-Event-ID（服务端据此续发），
@@ -303,7 +364,13 @@ async function fetchHistory(id) {
     if (Array.isArray(d.lines)) addLines(id, d.lines);
     if (d.task) {
       const prev = STATE.metas.get(id) || {};
-      STATE.metas.set(id, Object.assign({}, prev, d.task));
+      const merged = Object.assign({}, prev, d.task);
+      // 详情是**权威快照**：`input_required` 缺席就是"此刻没在等"，必须把 prev 里的
+      // 旧值删掉（Object.assign 只覆盖不删除）。是否清 STATE.inputs 由 input_result
+      // 决定：没有 input_result 的旧快照不会把已经弹出的输入框抹掉。
+      if (!d.task.input_required) delete merged.input_required;
+      syncInput(d.task);
+      STATE.metas.set(id, merged);
       if (prev && isRunning(prev) && !isRunning(d.task)) notifyFinished(d.task);
       emit('meta', { id });
     }
@@ -391,6 +458,9 @@ function openList() {
       }) : null,
     ]),
     h('span', { class: statusPillCls(t.status), text: statusLabel(t.status) }),
+    // 在等输入的任务要一眼能认出来：徽标只说"有几个在跑"，用户关掉进度窗后
+    // 若不知道有人在等他，限时输入就会静默超时。
+    STATE.inputs.has(t.id) ? h('span.pill.warn', { text: '⏳ 等待输入' }) : null,
   ]);
 
   function render() {
@@ -428,7 +498,8 @@ function openList() {
   // 只在内容真的变了时重画，避免轮询把正在选中的文字/滚动位置冲掉。
   const update = () => {
     const sig = STATE.listErr + '#' + sortedMetas()
-      .map((t) => [t.id, t.status, t.line_count, t.last, t.elapsed_ms].join('|')).join(';');
+      .map((t) => [t.id, t.status, t.line_count, t.last, t.elapsed_ms,
+        STATE.inputs.has(t.id) ? 'in' : ''].join('|')).join(';');
     if (sig === signature) return;
     signature = sig;
     render();
@@ -478,6 +549,9 @@ function openTask(id) {
 
   const resultBox = h('div.tc-result');
 
+  // ---- 限时输入（如 MySQL root 口令）的挂载点 ----
+  const inputBox = h('div.tc-input');
+
   // 服务端真的有行被环形缓冲丢掉时，如实说一句 —— 假装日志是完整的最误导人。
   const trimHint = h('div.hint', { style: { display: 'none', marginBottom: '8px', color: 'var(--warn)' } });
 
@@ -509,7 +583,172 @@ function openTask(id) {
     text: '关闭窗口不会中断任务：它在后台继续跑，随时可以点顶栏的「任务中心」重新打开。',
   });
 
-  const body = h('div', [head, errBox, resultBox, trimHint, logWrap, hint]);
+  const body = h('div', [head, errBox, inputBox, resultBox, trimHint, logWrap, hint]);
+
+  // ---- 限时输入（如 MySQL root 口令）：倒计时、提交、落定后收框 ----
+  //
+  // 关键取舍（都是"看起来能用、实际会误导人"的坑）：
+  //   · 倒计时以服务端 deadline 为准，不是"收到事件后从 0 开始数"；
+  //   · 归零后**停止提交**（再提交必然 409），并明确说"任务会自动生成并继续"；
+  //   · 提交成功后**不立刻收框**，等 input_required→null 的落定事件 —— 否则一旦
+  //     任务已经用默认值继续，用户会以为是自己填的生效了；
+  //   · 提交失败原样显示后端的 msg（409 的原因各不相同），绝不统一写成"提交失败"。
+  let inputUi = null; // 当前挂载的输入控件；null = 没在显示
+
+  const INPUT_RESULT_TEXT = {
+    submitted: '✓ 已提交，任务已继续。',
+    timeout: '⏱ 已超时，任务会自动生成并继续（不需要刷新页面）。生成的凭据会显示在本任务的安装结果里。',
+    canceled: '已取消：任务被中断，你输入的内容没有被使用。',
+  };
+
+  // inputDeadlineMs 以服务端的 deadline 为准；只有它缺失/不可解析时才用
+  // timeout_seconds 兜底（正常路径不该走到这里）。
+  function inputDeadlineMs(req, now) {
+    const t = Date.parse((req && req.deadline) || '');
+    if (!Number.isNaN(t)) return t;
+    return now + (Number(req && req.timeout_seconds) || 0) * 1000;
+  }
+
+  function remainingText(ms) {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    if (s >= 60) return `${Math.floor(s / 60)} 分 ${String(s % 60).padStart(2, '0')} 秒`;
+    return `${s} 秒`;
+  }
+
+  // tickInput 由 updateStatus 每秒调用一次（耗时本来就在走字，不额外起定时器）。
+  function tickInput() {
+    const ui = inputUi;
+    if (!ui) return;
+    const left = ui.deadline - Date.now();
+    if (!ui.expired && left <= 0) {
+      ui.expired = true;
+      ui.field.disabled = true;
+      ui.submit.disabled = true;
+      ui.count.textContent = '已超时';
+      ui.note.textContent = '已超时，任务会自动生成并继续（不需要刷新页面）。';
+      ui.note.style.display = '';
+      return;
+    }
+    if (!ui.expired) ui.count.textContent = '剩余 ' + remainingText(left);
+  }
+
+  function mountInput(req) {
+    clear(inputBox);
+    const isSecret = !!req.secret;
+    const field = h('input.input', {
+      // secret:true → 密码框（type=password）；不回显任何"当前值"（后端也不会给）。
+      type: isSecret ? 'password' : 'text',
+      autocomplete: 'off',
+      spellcheck: 'false',
+      placeholder: isSecret ? '留空＝自动生成强随机口令' : '',
+      style: { flex: '1', minWidth: '200px' },
+    });
+    const count = h('span.tc-input-count', {
+      style: { fontSize: '12px', color: 'var(--text-dim)', whiteSpace: 'nowrap' },
+      text: '',
+    });
+    const err = h('div.tc-input-err', {
+      style: {
+        display: 'none', marginTop: '8px', color: 'var(--danger)',
+        fontSize: '12px', lineHeight: '1.6', whiteSpace: 'pre-wrap',
+      },
+    });
+    const note = h('div.tc-input-note', {
+      style: { display: 'none', marginTop: '8px', color: 'var(--warn)', fontSize: '12px' },
+    });
+    const submit = h('button.btn.btn-primary', { text: '提交', onclick: () => submitInput() });
+    field.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submitInput(); }
+    });
+    const reqKey = req.key || 'input';
+    inputUi = {
+      key: reqKey,
+      deadline: inputDeadlineMs(req, Date.now()),
+      expired: false,
+      busy: false,
+      field,
+      submit,
+      count,
+      note,
+      err,
+    };
+    inputBox.appendChild(h('div.tc-input-card', {
+      style: {
+        marginBottom: '12px', padding: '12px', background: 'var(--brand-soft)',
+        border: '1px solid var(--brand)', borderRadius: '6px',
+      },
+    }, [
+      h('div', { style: { fontWeight: '600', marginBottom: '7px' }, text: '⌨️ ' + (req.label || reqKey) }),
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+        [field, submit, count]),
+      req.hint ? h('div.hint', { style: { marginTop: '6px' }, text: req.hint }) : null,
+      // 这是"限时输入"而不是"必须回答"：不填也会继续，必须让人一眼看见。
+      h('div.hint', {
+        style: { marginTop: '4px' },
+        text: '限时输入：不填也没关系 —— 倒计时结束后任务会自动生成并继续，不需要刷新页面。',
+      }),
+      note, err,
+    ]));
+    tickInput();
+  }
+
+  function unmountInput(meta) {
+    const ui = inputUi;
+    inputUi = null;
+    clear(inputBox);
+    if (!ui) return;
+    // 落定 / 任务结束：收框，但留一句结局说明（超时要明确说"会自动继续"）。
+    const result = (meta && meta.input_result) || (ui.expired ? 'timeout' : '');
+    const text = INPUT_RESULT_TEXT[result];
+    if (text) {
+      inputBox.appendChild(h('div.hint.tc-input-result', {
+        style: { marginBottom: '10px', color: 'var(--warn)' },
+        text,
+      }));
+    }
+  }
+
+  async function submitInput() {
+    const ui = inputUi;
+    if (!ui || ui.busy || ui.expired) return;
+    ui.busy = true;
+    ui.err.style.display = 'none';
+    ui.submit.disabled = true;
+    ui.submit.textContent = '提交中…';
+    const value = ui.field.value; // 只在内存里交给后端：不写 URL / DOM 数据属性 / localStorage，也不打印
+    try {
+      await api.taskInput(id, ui.key, value);
+      // 成功也**不收框**：等落定事件（input_required → null）再收。
+      // 顺手清掉输入框里的值，避免口令在 DOM 里长时间停留。
+      ui.field.value = '';
+      ui.submit.textContent = '已提交，等待任务继续…';
+      ui.note.textContent = '已提交，等待任务确认…（口令不会出现在日志或审计里）';
+      ui.note.style.display = '';
+    } catch (e) {
+      // 后端 msg **原样**显示：409 可能是"已超时""已提交过""不在等这个 key"，
+      // 统一改写成"提交失败"会把真正原因吞掉。
+      const msg = (e && e.message) || String(e);
+      ui.err.textContent = msg;
+      ui.err.style.display = '';
+      ui.submit.textContent = '提交';
+      ui.busy = false;
+      ui.submit.disabled = ui.expired;
+      toast(msg, 'err', 12000);
+    }
+  }
+
+  function renderInput(meta) {
+    const req = STATE.inputs.get(id);
+    if (req && isRunning(meta)) {
+      // 刷新页面后重建窗口时，STATE.inputs 已经由 GET /tasks（或 SSE meta）填好，
+      // 所以这里能直接把待输入状态恢复出来。
+      if (!inputUi || inputUi.key !== (req.key || 'input')) mountInput(req);
+      else { inputUi.deadline = inputDeadlineMs(req, Date.now()); tickInput(); }
+      return;
+    }
+    // 任务结束 / 输入已落定 → 收起输入框
+    if (inputUi) unmountInput(meta);
+  }
 
   // 复制的是**这个窗口**的日志：从 STATE 里现取，而不是读 DOM ——
   // 超出 MAX_DOM_LINES 的老节点已经被丢掉，而用户期望复制到完整历史。
@@ -559,6 +798,9 @@ function openTask(id) {
     onClose: () => {
       clearInterval(timer);
       unsub();
+      // 关窗时清掉输入框里可能还留着的口令：它只该活在这一次提交里。
+      if (inputUi) { inputUi.field.value = ''; inputUi = null; }
+      clear(inputBox);
       openWindows.delete(id);
     },
   });
@@ -632,6 +874,7 @@ function openTask(id) {
       trimHint.style.display = 'none';
     }
     renderResult(meta);
+    renderInput(meta);
   }
 
   const unsub = onChange((kind, payload) => {
@@ -662,43 +905,106 @@ function lineEl(ln) {
   return h('div', { style, text });
 }
 
-// ---------------- 结果区块（token / address）----------------
+// ---------------- 结果区块（token / address / 凭据）----------------
 
+// resultBlock 渲染任务成功后的结果。
+//
+// 为什么凭据必须在这里渲染（缺陷 D11）：services/install.go 的约定是
+// `result.credentials` 是**唯一允许出现口令的地方**；而 LNMP 在"写回面板配置失败"
+// 时的提示是"请立刻复制本次任务结果里的一次性凭据，并在「数据库 → 连接设置」手工填入"。
+// 以前这里只认 token/address、两者都没有就 return null —— 用户根本看不到那块内容，
+// 那条指引就成了死路。一键建站的 db_pass 同理（它不在 credentials[] 里）。
+//
+// 安全红线：凭据只渲染在任务结果里（文本节点），不进 URL、不 console.log、
+// 不写 DOM 的 data 属性、不进 localStorage。
 function resultBlock(r) {
   const rows = [];
-  if (r.token) rows.push({ label: '共享密钥', value: String(r.token), copy: '📋 复制密钥', ok: '密钥已复制' });
-  if (r.address) rows.push({ label: '访问地址', value: String(r.address), copy: '📋 复制地址', ok: '地址已复制' });
+  const push = (label, value, copyLabel, okMsg) => {
+    if (value === null || value === undefined || value === '') return;
+    rows.push({ label, value: String(value), copyLabel, okMsg });
+  };
+
+  push('共享密钥', r.token, '📋 复制密钥', '密钥已复制');
+  push('访问地址', r.address, '📋 复制地址', '地址已复制');
+
+  // credentials[]：后端定义的"装完必须让用户看一眼"的一次性凭据。
+  const creds = Array.isArray(r.credentials) ? r.credentials : [];
+  for (const c of creds) {
+    if (!c) continue;
+    // label 是给人看的说明；没有 label 就退回键名（两种后端都给过）。
+    push(c.label || c.key || '凭据', c.value, '📋 复制', '已复制');
+  }
+
+  // 一键建站（WordPress / Typecho）的库口令走 siteInstallResult.db_pass。
+  const dbPass = r.db_pass;
+  push('数据库口令', dbPass, '📋 复制口令', '口令已复制');
+
   if (!rows.length) return null;
-  return h('div', {
+
+  const hasSecret = !!(dbPass || creds.some((c) => c && c.value));
+  return h('div.tc-result-card', {
     style: {
       marginBottom: '12px', padding: '12px', background: 'var(--warn-soft)',
       borderRadius: '6px', border: '1px solid var(--border)',
     },
   }, [
-    h('div', { style: { fontWeight: '600', marginBottom: '8px' }, text: '⚠️ 请记录以下信息（只在这里显示）' }),
-    ...rows.map((row) => h('div', { style: { marginBottom: '8px' } }, [
-      h('div', { style: { fontSize: '11.5px', color: 'var(--text-dim)', marginBottom: '3px' }, text: row.label }),
-      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-        h('code', { style: { fontSize: '13px', userSelect: 'all', wordBreak: 'break-all' }, text: row.value }),
-        h('button.btn.btn-sm', { text: row.copy, onclick: () => copyText(row.value, row.ok) }),
-      ]),
-    ])),
+    h('div', {
+      style: { fontWeight: '600', marginBottom: '8px' },
+      text: hasSecret
+        ? '🔑 请立刻复制保存（凭据只出现在任务结果里：不写日志、不进审计）'
+        : '⚠️ 请记录以下信息（只在这里显示）',
+    }),
+    ...rows.map((row) => {
+      // 值只进文本节点；复制按钮把 <code> 传下去，剪贴板不可用/被拒时降级为"选中文本"。
+      const code = h('code.tc-cred-value', {
+        style: { fontSize: '13px', userSelect: 'all', wordBreak: 'break-all' },
+        text: row.value,
+      });
+      return h('div', { style: { marginBottom: '8px' } }, [
+        h('div', { style: { fontSize: '11.5px', color: 'var(--text-dim)', marginBottom: '3px' }, text: row.label }),
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          code,
+          h('button.btn.btn-sm.tc-copy', { text: row.copyLabel, onclick: () => copyText(row.value, row.okMsg, code) }),
+        ]),
+      ]);
+    }),
+    dbPass ? h('div.hint', {
+      style: { marginTop: '2px' },
+      text: '数据库口令：一键建站生成的库账号口令，同时写在站点目录里的配置文件'
+        + '（WordPress：wp-config.php；Typecho：config.inc.php），随时可以查。',
+    }) : null,
     r.warning ? h('div', { style: { color: 'var(--warn)', fontSize: '12px' }, text: '⚠️ ' + r.warning }) : null,
   ]);
 }
 
-function copyText(text, okMsg) {
+function copyText(text, okMsg, el) {
   const s = String(text == null ? '' : text);
   if (!s) { toast('没有可复制的内容', 'warn'); return; }
   if (!navigator.clipboard || !navigator.clipboard.writeText) {
-    // 非 HTTPS / 非 localhost 下 navigator.clipboard 是 undefined，
-    // 这时候要如实告诉用户"手动选中复制"，而不是静默失败。
-    toast('当前环境不支持自动复制，请手动选中复制', 'warn');
+    // 非 HTTPS / 非 localhost 下 navigator.clipboard 是 undefined：
+    // 降级为"选中这段文本"让用户按 ⌘/Ctrl+C，而不是只说一句"不支持"就结束。
+    selectText(el);
+    toast('当前环境不支持自动复制，已选中文本，请按 ⌘/Ctrl+C 复制', 'warn', 8000);
     return;
   }
   navigator.clipboard.writeText(s)
     .then(() => toast(okMsg || '已复制', 'ok'))
-    .catch(() => toast('复制失败，请手动选中复制', 'warn'));
+    .catch(() => {
+      selectText(el);
+      toast('复制失败，已选中文本，请按 ⌘/Ctrl+C 复制', 'warn', 8000);
+    });
+}
+
+/** selectText 是复制按钮的降级路径：把节点里的文本框选起来。 */
+function selectText(el) {
+  if (!el || typeof document.createRange !== 'function' || typeof window.getSelection !== 'function') return;
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch { /* 选中失败也不阻断：用户还能手动三击选中 */ }
 }
 
 // ---------------- 对外入口 ----------------

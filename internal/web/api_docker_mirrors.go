@@ -27,7 +27,7 @@ func (s *Server) handleDockerMirrors(w http.ResponseWriter, r *http.Request) {
 	st := s.svcManager().DockerMirrorStatus(r.Context())
 	ok(w, map[string]any{
 		"state":      st,
-		"candidates": services.BuiltinDockerMirrors,
+		"candidates": s.svcManager().DockerMirrorCandidates(),
 	})
 }
 
@@ -47,7 +47,7 @@ func (s *Server) handleDockerMirrorProbe(w http.ResponseWriter, r *http.Request)
 	}
 	urls := req.URLs
 	if len(urls) == 0 {
-		for _, c := range services.BuiltinDockerMirrors {
+		for _, c := range s.svcManager().DockerMirrorCandidates() {
 			urls = append(urls, c.URL)
 		}
 		st := s.svcManager().DockerMirrorStatus(r.Context())

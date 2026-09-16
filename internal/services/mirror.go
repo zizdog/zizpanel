@@ -14,22 +14,27 @@ import (
 // ============================================================================
 //  应用包镜像（自建 NAS）
 //
-//  需求（2026-09-16，用户明确要求）：
-//    "所有安装过程先检查 https://mirror.zizdog.com:8888 的资源能不能访问，
-//      不能再走其它。"
+//  政策（用户原话，2026-09-16 最终版）：
+//    "对所有能用到的模型、软件，如 ffmpeg，都要以 NAS 镜像优先，不通再走别的！"
 //
-//  也就是说镜像不是"加速源之一"，而是**唯一来源**：
-//    · 镜像上有 → 用镜像（地址写进任务日志，用户看得见到底从哪下的）；
-//    · 镜像上没有/不可达 → **明确失败**，并说清缺哪个路径、怎么补，
-//      绝不静默回退到 GitHub。回退会让"这台机器到底能不能装"变成不可预测，
-//      也违背"统一在 NAS 上管控"的初衷。
+//  也就是说镜像的语义是**优先来源，不是唯一来源**：
+//    · 镜像上有 → **一定**用镜像（地址写进任务日志，用户看得见到底从哪下的）；
+//    · 镜像上缺这个资源 / 镜像站不可达 → **自动回落**既有的公网源，
+//      并把"这次没走镜像、为什么"写进任务步骤（见 preflightMirrorAsset）。
+//
+//  ⚠️ 历史坑：本文件与 config.go 的注释一度写的是"唯一来源、不回退、
+//  没有就明确失败"（那是更早一版的需求）。代码后来按用户要求改成了"优先+回落"，
+//  注释却没跟着改 —— 文档说一套、代码做一套，是最容易让下一个人改错的一类不一致。
+//  现在两处注释都以本节为准；**行为**在各类下载点上统一为"优先+回落"。
 //
 //  布局（与 tools/sync-nas-apps.sh 严格一致）：
 //    <base>/apps/<app-id>/<version>/<原始文件名>
 //    <base>/apps/<app-id>/<version>/manifest.json   ← 每个包的 sha256/大小
 //
-//  其它来源统一走同一台镜像的子路径（NAS 侧反代）：
-//    pip → <base>/pypi/simple、HF → <base>/hf、brew → <base>/brew
+//  其它来源统一走同一台镜像的子路径（NAS 侧反代，见 NAS 上 zizpanel-mirror
+//  容器的 nginx.conf）：
+//    HF → <base>/hf、brew → <base>/brew、CLT → <base>/zizpanel/clt
+//    （pypi 目前 NAS 上没有，见交付说明）
 //
 //  镜像基址来自面板设置（Config.MirrorBase → Options.MirrorBase），
 //  留空表示**关闭镜像**（应急用；那时各来源回到内置的公网/国内镜像）。
@@ -92,7 +97,10 @@ func (m *Manager) mirrorBase() string {
 	return strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/")
 }
 
-// MirrorEnabled 表示当前是否强制走镜像（界面/日志用）。
+// MirrorEnabled 表示当前是否启用"镜像优先"（界面/日志用）。
+//
+// 注意语义：启用 != 只用镜像。启用后镜像**优先**，但它缺件或不可达时
+// 各来源会回落到自己的公网/国内源（见文件头注释）。留空 = 完全不用镜像。
 func (m *Manager) MirrorEnabled() bool { return m.mirrorBase() != "" }
 
 // appAssetURL 拼应用包在镜像上的地址：<base>/apps/<appID>/<version>/<asset>。
@@ -169,8 +177,9 @@ func (m *Manager) fetchMirrorManifest(ctx context.Context, appID, version string
 
 // checkMirrorURL 检查镜像上的一个地址是否可用（HEAD）。
 //
-// 返回的 error 是**给用户看**的：说清"缺什么"和"怎么补"。因为按需求镜像
-// 是唯一来源、不回退公网，用户必须知道该去 NAS 上做什么才能把包补上。
+// 返回的 error 是**给用户看**的：说清"缺什么"和"怎么补"（404 时提示
+// `make sync-apps`）。调用方据此决定**回落到公网源**还是跳过镜像，
+// 所以这里的措辞不要写成"安装失败"，那与"优先+回落"的语义不符。
 func (m *Manager) checkMirrorURL(ctx context.Context, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
@@ -225,6 +234,36 @@ func (m *Manager) mirrorReachable(ctx context.Context) bool {
 		return false
 	}
 	return m.checkMirrorURL(ctx, m.mirrorBase()+"/") == nil
+}
+
+// probeMirrorFile 探镜像上一个**具体文件**是否可用，并返回它的大小
+// （上游没给 Content-Length 时返回 -1）。
+//
+// 与 checkMirrorURL 是同一件事（HEAD + 同样的短超时），只是多要一个长度：
+// 模型权重动辄 200MB~3GB，任务日志要把"多大、下到哪了"如实写出来，
+// 只说"通/不通"不够；调用方也用它来拒绝 0 字节的假文件。
+func (m *Manager) probeMirrorFile(ctx context.Context, url string) (int64, error) {
+	if m.mirrorFileProbeOverride != nil {
+		return m.mirrorFileProbeOverride(ctx, url)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return -1, fmt.Errorf("镜像地址不合法（%s）：%w", url, err)
+	}
+	cl := &http.Client{Timeout: m.mirrorProbeTimeout()}
+	res, err := cl.Do(req)
+	if err != nil {
+		return -1, fmt.Errorf("镜像站访问不了（%s）：%v", url, err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	switch res.StatusCode {
+	case http.StatusOK:
+		return res.ContentLength, nil
+	case http.StatusNotFound:
+		return -1, fmt.Errorf("镜像上没有这个文件（HTTP 404，%s）", url)
+	default:
+		return -1, fmt.Errorf("镜像返回 HTTP %d（%s）", res.StatusCode, url)
+	}
 }
 
 // preflightMirrorAsset 下载前确认镜像上真的有这个包与它的清单。
@@ -293,6 +332,79 @@ func (m *Manager) verifyMirrorChecksum(ctx context.Context, spec releaseBinaryAp
 	}
 	if result != nil {
 		result.step(ctx, fmt.Sprintf("SHA-256 校验通过：%s 与镜像清单一致（来源：%s）", spec.Asset, url))
+	}
+	return nil
+}
+
+// ============================================================================
+//  离线模式（仅走 NAS，禁止外网回落）
+//
+//  设置项：Config.OfflineOnly → Options.OfflineOnly。
+//
+//  与"镜像优先"的区别（两个语义都要在，别用一个替代另一个）：
+//    · 镜像优先（默认）：能用镜像就用；缺件/不可达**回落公网** —— 好处是
+//      镜像站抖一下也不会让用户装不上，代价是"到底走的哪条路"不稳定。
+//    · 离线模式（本开关）：只用镜像；缺件**明确失败**并列出缺哪个文件 ——
+//      用于"整机断外网 / 隔离网络 / 迁移到新 Mac"这类场景。那时回落公网
+//      只会变成"装到一半卡死"，比直接失败更糟：用户不知道自己在等什么。
+//
+//  ⚠️ 各安装器**必须显式接线**才会遵守这个开关 —— 这个函数只是一个判断，
+//  不会自动拦截任何东西。需要接线的清单见交付说明里的"接线清单"。
+//  ============================================================================
+
+// MirrorOfflineOnly 报告当前是否处于"仅走 NAS（离线）模式"。
+//
+// 各安装器在下决心回落公网之前**必须**先问它：
+//
+//	if m.MirrorOfflineOnly(ctx) {
+//	    return m.offlineOnlyFail("Homebrew 瓶 "+formula, mirrorURL)
+//	}
+//
+// 参数 ctx 目前不参与判断，保留它是为了将来能在需要时做一次镜像可达性探测
+// 而不改调用方签名（签名稳定比省一个参数重要）。
+func (m *Manager) MirrorOfflineOnly(ctx context.Context) bool {
+	_ = ctx
+	return m.opt.OfflineOnly
+}
+
+// offlineOnlyFail 生成"离线模式下缺资源"的统一错误。
+//
+// 三个必须说清的点（用户的真实诉求是"缺什么、去哪补"）：
+//  1. 这是**离线模式**主动拒绝，不是网络故障 —— 免得用户去查网络；
+//  2. 缺的是**哪个资源**、镜像上应该在哪（resource 与 mirrorURL）；
+//  3. 怎么补：用 tools/build-offline-bundle.sh 打包，或关掉这个开关。
+func (m *Manager) offlineOnlyFail(resource, mirrorURL string) error {
+	where := mirrorURL
+	if where == "" {
+		where = "（镜像基址为空：设置里的 mirror_base 没填）"
+	}
+	return fmt.Errorf(
+		"离线模式（仅走 NAS）已开启，禁止回落外网，但镜像上没有这个资源：%s\n"+
+			"  镜像上应存在的位置：%s\n"+
+			"  补法：在能访问上游的机器上执行 "+
+			"`bash tools/build-offline-bundle.sh --app <应用> --upload` 把它打进 NAS 离线包；"+
+			"或在「设置 → 访问与安全」里关闭「仅走 NAS（离线）」",
+		resource, where)
+}
+
+// MirrorOfflinePreflight 是给安装器用的"离线模式缺件检查"。
+//
+// 语义：离线模式下**先确认镜像上真的有这个资源**（HEAD，走 probeMirrorFile
+// 以便单测注入、并顺带拿到大小），
+//   - 有 → 返回 nil，调用方继续按镜像地址下载；
+//   - 没有/不可达 → 返回**面向用户**的明确错误（不做任何公网回落）。
+//
+// 非离线模式下它什么都不做（返回 nil），让调用方保留原有的"优先+回落"逻辑。
+// 这样接线只需要两行，不会改变默认行为 —— 这正是本次刻意收敛改动范围的原因。
+func (m *Manager) MirrorOfflinePreflight(ctx context.Context, resource, mirrorURL string) error {
+	if !m.MirrorOfflineOnly(ctx) {
+		return nil
+	}
+	if m.mirrorBase() == "" {
+		return m.offlineOnlyFail(resource, "")
+	}
+	if _, err := m.probeMirrorFile(ctx, mirrorURL); err != nil {
+		return m.offlineOnlyFail(resource+"（探测失败："+err.Error()+"）", mirrorURL)
 	}
 	return nil
 }

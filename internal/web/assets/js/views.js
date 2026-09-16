@@ -345,6 +345,20 @@ export function SettingsView(content) {
       style: { flex: '1 1 320px' },
     });
     const mirrorProbe = h('input.input', { type: 'number', value: s.mirror_probe_seconds || 4, min: 1, max: 60 });
+    // 仅走 NAS（离线）模式：整机断外网 / 隔离网络 / 迁移到新 Mac 时打开。
+    // 打开后各安装器**禁止回落外网**，缺资源就明确失败并列出缺哪个文件。
+    // 刻意与 mirror_base 放在同一张卡片里：两者一起看才不会被误解成
+    // "配了镜像就离线了" —— 默认是"镜像优先 + 缺件回落公网"，只有这个勾才是硬离线。
+    const offlineOnly = h('input', { type: 'checkbox', checked: !!s.offline_only });
+    const offlineEmptyMirrorHint =
+      '⚠️ 现在开着离线模式，但镜像基址是空的 —— 这个组合下任何安装都会明确失败，请先填上面的镜像基址。';
+    const offlineWarn = h('div.hint', { style: { color: '#d97706' }, text: '' });
+    const syncOfflineWarn = () => {
+      offlineWarn.textContent = (offlineOnly.checked && !mirrorInput.value.trim()) ? offlineEmptyMirrorHint : '';
+    };
+    offlineOnly.addEventListener('change', syncOfflineWarn);
+    mirrorInput.addEventListener('input', syncOfflineWarn);
+    syncOfflineWarn();
 
     const save = h('button.btn.btn-primary', {
       text: '保存设置',
@@ -362,6 +376,7 @@ export function SettingsView(content) {
             login_lock_mins: Number(lockMins.value),
             mirror_base: mirrorInput.value.trim(),
             mirror_probe_seconds: Number(mirrorProbe.value) || 4,
+            offline_only: offlineOnly.checked,
           };
           const saved = await api.saveSettings(patch);
           const entry = (saved && saved.panel_entry) || patch.panel_suffix;
@@ -425,16 +440,28 @@ export function SettingsView(content) {
             h('div.field', [h('label', { text: '锁定时长（分钟）' }), lockMins]),
           ]),
           // 应用包镜像：面板里所有安装过程都先检查它（见 services/mirror.go）。
-          // 语义是"唯一来源"，不是"加速源之一" —— 所以文案里说清失败时不会回退。
+          // 语义是"镜像**优先**、缺件回落公网"；要"禁止回落"必须再勾下面的
+          // 「仅走 NAS（离线）」—— 两件事分开，文案必须写清，否则用户会以为
+          // 配了镜像就等于离线（那是这个页面最容易被误读的地方）。
           h('div.field', [
             h('label', { text: '应用包镜像基址' }),
             mirrorInput,
             h('div.hint', {
-              html: '安装 frpc / Orbien 客户端这类应用时，面板先检查 ' +
+              html: '安装 frpc / DDNS-Go 这类应用时，面板先检查 ' +
                 '<code class="code">&lt;基址&gt;/apps/&lt;应用&gt;/&lt;版本&gt;/&lt;文件名&gt;</code> 在不在；' +
-                '镜像上没有就明确失败并提示如何同步，<b>不会</b>偷偷回退到 GitHub。<br>' +
+                '在就从镜像下（并在任务日志里写明来源）。' +
+                '镜像上缺这个包、或镜像站暂时不可达时，<b>默认</b>会回落到内置的公网/国内源 —— ' +
+                '要禁止回落请勾下面的「仅走 NAS（离线）」。<br>' +
                 '留空 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）。',
             }),
+          ]),
+          h('div.row', [
+            h('label', [h('span', { text: '仅走 NAS（离线）：禁止任何外网回落，缺资源即明确失败' })]),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+              offlineOnly,
+              h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: '用于整机断外网 / 隔离网络 / 迁移到新 Mac。打开后装不了的应用会明确报出缺哪个文件，而不是悄悄去连外网（那样只会"装到一半卡死"）。' }),
+            ]),
+            offlineWarn,
           ]),
           h('div.row', [
             h('div.field', [h('label', { text: '镜像资源探测超时（秒）' }), mirrorProbe]),

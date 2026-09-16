@@ -159,6 +159,32 @@ export const api = {
   siteLog: (domain, kind = 'access', lines = 200) =>
     request('GET', `${API_BASE}/sites/${encodeURIComponent(domain)}/log?kind=${kind}&lines=${lines}`),
 
+  // ---- SSL 证书（ACME 自动申请）----
+  //
+  // 为什么这些接口要单独一组（而不是塞进 sites）：
+  // 证书是**独立于站点**的资源 —— 一张 `*.example.com` 可以被多个站点复用，
+  // 也可能先申请、后建站。站点侧只是"引用"它（见 siteSSL 的 provider=acme）。
+  //
+  // 列表接口按契约**不含私钥内容**，面板也从不提供读取私钥的接口；
+  // 申请时提交的 DNS 凭据只在这一次 POST 里发送，前端不保存、不回显。
+  //
+  // 申请/续期都是**异步任务**：后端立刻返回 {task_id}，进度走任务中心
+  // （见 tasks.js 的 taskCenter.start），前端不再自己轮询。
+  certs: () => request('GET', `${API_BASE}/certs`),
+  certApply: (payload) => request('POST', `${API_BASE}/certs`, payload),
+  certRenew: (primary) => request('POST', `${API_BASE}/certs/${enc(primary)}/renew`, {}),
+  certDelete: (primary) => request('DELETE', `${API_BASE}/certs/${enc(primary)}`),
+  // DNS 服务商清单：只返回名称与所需环境变量键名，绝不回显用户填过的值。
+  certDnsProviders: () => request('GET', `${API_BASE}/certs/dns-providers`),
+
+  // ---- PHP 多版本 ----
+  // phpList：列出本机已安装的 PHP 版本（含各自端点与运行状态）。
+  // 版本下拉框的数据源，不再写死、也不是自由文本。
+  phpList: () => request('GET', `${API_BASE}/php`),
+  // phpFixListen：让某个版本监听在它独有的端点上（改 www.conf + 重启 fpm）。
+  phpFixListen: (version, restart = true) =>
+    request('POST', `${API_BASE}/php/fix-listen`, { version, restart }),
+
   // ---- 服务管理 ----
   services: (health = true) => request('GET', `${API_BASE}/services?health=${health ? 1 : 0}`),
   service: (name) => request('GET', `${API_BASE}/services/${encodeURIComponent(name)}`),
@@ -170,6 +196,10 @@ export const api = {
     request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/${action}`, {}),
   serviceLogs: (name, lines = 300) =>
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/logs?lines=${lines}`),
+  // 面板给应用随机生成的登录凭据（从它自己的配置文件里解析）。
+  // 没有这个接口时，用户装完 frpc/Orbien 根本不知道 admin UI 的账号口令。
+  serviceCredentials: (name) =>
+    request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/credentials`),
 
   // ---- 任务中心（安装/卸载的实时进度）----
   //
@@ -179,6 +209,11 @@ export const api = {
   task: (id, after = 0, limit = 800) =>
     request('GET', `${API_BASE}/tasks/${encodeURIComponent(id)}?after=${after}&limit=${limit}`),
   taskCancel: (id) => request('POST', `${API_BASE}/tasks/${encodeURIComponent(id)}/cancel`, {}),
+  // 提交任务的限时输入（如 MySQL root 口令）。
+  // 值只在这一个请求里发送：后端不回显、不写日志、不进审计，前端也不保存它
+  // （不写 localStorage、不写 URL、不 console.log）。
+  taskInput: (id, key, value) =>
+    request('POST', `${API_BASE}/tasks/${encodeURIComponent(id)}/input`, { key, value }),
   // 进度用 SSE。URL 必须走 apiURL 拼相对路径：面板可能挂在 /_panel 子路径下。
   taskStreamURL: (id) => apiURL(`tasks/${encodeURIComponent(id)}/stream`),
 

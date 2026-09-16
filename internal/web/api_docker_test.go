@@ -216,7 +216,7 @@ func newDockerTestServerWithSrv(t *testing.T, sock string) (*Server, *httptest.S
 	t.Cleanup(ts.Close)
 
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("初始化失败 %d", res.StatusCode)
 	}
@@ -536,7 +536,7 @@ func TestDockerNetworkPruneSkipsBuiltinAndUsed(t *testing.T) {
 func TestSettingsCanClearUpgradeSource(t *testing.T) {
 	_, ts := newTestServer(t)
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatal("初始化失败")
 	}

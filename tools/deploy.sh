@@ -26,7 +26,36 @@ NAS_ROOT="${NAS_ROOT:-/vol2/zizpanel-mirror/zizpanel}"
 MIRROR_URL="${MIRROR_URL:-http://192.168.1.8:8090/zizpanel}"
 ZP_USER="${ZP_USER:-admin}"
 : "${ZP_PASS:?需要面板口令：ZP_PASS='...'}"
-: "${NAS_PASS:?需要 NAS 口令：NAS_PASS='...'}"
+
+# NAS 登录方式：**优先 SSH 密钥**，密钥不通才要 NAS_PASS。
+# 为什么不再强制口令：本机对 NAS 早有密钥，强制口令会让一条命令的部署在
+# 没口令时直接 `:?` 退出（而口令在仓库里是禁止的，见 AGENTS.md 铁律 7）。
+# 探测必须用 BatchMode=yes：否则 ssh 会挂在那里等输密码，看上去像卡死。
+NAS_KEY_AUTH=0
+if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+     "$NAS_USER@$NAS_HOST" true >/dev/null 2>&1; then
+  NAS_KEY_AUTH=1
+fi
+if [ "$NAS_KEY_AUTH" != "1" ]; then
+  : "${NAS_PASS:?SSH 密钥登不上 NAS，需要 NAS 口令：NAS_PASS='...'}"
+fi
+
+# nas_sh '<远端命令>'：按探测结果选密钥 / sshpass / expect 三种方式之一
+nas_sh() {
+  if [ "$NAS_KEY_AUTH" = "1" ]; then
+    ssh -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" "$1"
+  elif command -v sshpass >/dev/null 2>&1; then
+    sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" "$1"
+  else
+    # 用 expect 提供密码（macOS 自带 /usr/bin/expect）
+    command -v expect >/dev/null 2>&1 || { echo "需要 sshpass 或 expect"; exit 1; }
+    expect <<EOF >/dev/null
+set timeout 300
+spawn ssh -o StrictHostKeyChecking=accept-new $NAS_USER@$NAS_HOST "$1"
+expect { -re "(?i)password:" { send "$NAS_PASS\r"; exp_continue } eof }
+EOF
+  fi
+}
 
 LOCAL_URL="https://127.0.0.1:8443/jab5c63"
 MINI_URL="https://192.168.1.4:8443/6zfxgccj"
@@ -45,19 +74,26 @@ else
 fi
 
 # ---------------------------------------------------------------- 上传 --
-# 一条 tar 流：只握一次手。sshpass 可用就用它，否则用 expect（macOS 自带）。
+# 一条 tar 流：只握一次手。登录方式见上面的 nas_sh（密钥优先）。
 step "推送到 NAS（单流 tar，版本 ${VERSION}）"
 FILES=(manifest.json manifest.json.sig install.sh
   "zizpanel_${VERSION}_darwin_arm64.tar.gz" "zizpanel_${VERSION}_darwin_amd64.tar.gz"
   zizpanel_latest_darwin_arm64.tar.gz zizpanel_latest_darwin_amd64.tar.gz)
 TAR_LIST=()
 for f in "${FILES[@]}"; do [ -e "$RELDIR/$f" ] && TAR_LIST+=("$f"); done
-TAR_CMD="cd '$REPO_ROOT/$RELDIR' && tar cf - ${TAR_LIST[*]} | ssh -o StrictHostKeyChecking=accept-new $NAS_USER@$NAS_HOST 'cd $NAS_ROOT && tar xf -'"
-if command -v sshpass >/dev/null 2>&1; then
-  sshpass -p "$NAS_PASS" sh -c "$TAR_CMD"
+# 注意：tar 在**本机**读，ssh 只负责接收 —— 不要再套一层 `sh -c`，
+# 那样子进程的 stdin 不是数据流，tar 会读到空。
+if [ "$NAS_KEY_AUTH" = "1" ]; then
+  tar cf - -C "$REPO_ROOT/$RELDIR" "${TAR_LIST[@]}" \
+    | ssh -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" "cd $NAS_ROOT && tar xf -"
+elif command -v sshpass >/dev/null 2>&1; then
+  tar cf - -C "$REPO_ROOT/$RELDIR" "${TAR_LIST[@]}" \
+    | sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" "cd $NAS_ROOT && tar xf -"
 else
-  # 用 expect 提供密码（macOS 自带 /usr/bin/expect）
   command -v expect >/dev/null 2>&1 || { echo "需要 sshpass 或 expect"; exit 1; }
+  # expect 路径仍需把整条管道交给 sh -c：expect 只能给"它自己 spawn 的那个 ssh"喂密码，
+  # 而这里的 ssh 在管道右端，所以要让它成为 spawn 的直接子进程。
+  TAR_CMD="cd '$REPO_ROOT/$RELDIR' && tar cf - ${TAR_LIST[*]} | ssh -o StrictHostKeyChecking=accept-new $NAS_USER@$NAS_HOST 'cd $NAS_ROOT && tar xf -'"
   expect <<EOF >/dev/null
 set timeout 900
 spawn sh -c "$TAR_CMD"
@@ -67,15 +103,7 @@ fi
 
 # 远端铺 download/<版本>/ 与 latest 链接（一次 ssh）
 LAYOUT="cd $NAS_ROOT && mkdir -p download/$VERSION download/latest && cp -f zizpanel_${VERSION}_darwin_*.tar.gz download/$VERSION/ && ln -sfn ../$VERSION/zizpanel_${VERSION}_darwin_arm64.tar.gz download/latest/zizpanel_latest_darwin_arm64.tar.gz && ln -sfn ../$VERSION/zizpanel_${VERSION}_darwin_amd64.tar.gz download/latest/zizpanel_latest_darwin_amd64.tar.gz && ln -sfn download/$VERSION/zizpanel_${VERSION}_darwin_arm64.tar.gz zizpanel_${VERSION}_darwin_arm64.tar.gz && ln -sfn download/$VERSION/zizpanel_${VERSION}_darwin_amd64.tar.gz zizpanel_${VERSION}_darwin_amd64.tar.gz"
-if command -v sshpass >/dev/null 2>&1; then
-  sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" "$LAYOUT"
-else
-  expect <<EOF >/dev/null
-set timeout 300
-spawn ssh -o StrictHostKeyChecking=accept-new $NAS_USER@$NAS_HOST "$LAYOUT"
-expect { -re "(?i)password:" { send "$NAS_PASS\r"; exp_continue } eof }
-EOF
-fi
+nas_sh "$LAYOUT"
 
 # ---------------------------------------------------------------- 升级 --
 # 两台**并行**升级，不再一台等完再等另一台。

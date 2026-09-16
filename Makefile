@@ -91,13 +91,17 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
 	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
+	@# 真实口令不许进仓库 —— 这条坑复发过两次（v0.3.1 基线 + 第九轮新增文件），
+	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
+	@echo "==> 真实凭据泄漏检查"
+	@bash tools/check-no-real-credentials.sh
 	@echo "==> Python 工具语法检查"
 	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"
 	@# 前端语法必须用真正的 ES 解析器校验：`node --check` 对"对象字面量少一个 }"
@@ -439,3 +443,29 @@ logs: ## 实时查看面板日志
 clean: ## 清理构建产物
 	@rm -rf $(DIST) $(LOCAL_ROOT)
 	@echo "已清理"
+
+# --------------------------------------------------- 应用市场审计（第 3 层） --
+#
+# 用户的原话："如果以后每加一个应用都要一点一点慢慢调试，那这个应用市场就
+# 没什么实用价值了。" 这两个 target 就是那个"高效工作流"的入口：
+#
+#   make market-audit            # 一条命令审全部 27 个应用（联网，有缺口非零退出）
+#   make market-audit ARGS="--only squoosh"   # 加新应用时只审一个
+#   make market-audit ARGS="--json"           # 机器可读
+#   make market-audit-offline    # 静态门禁（不联网，秒级；等价于 TestMarket 那组单测）
+#
+# 静态门禁本身已经在 `make check` 里生效（走 go test 的 TestMarketInvariantsHold /
+# TestMarketDeclarationsCoverCatalogExactly），所以这里不把它并进 check ——
+# check 是硬门禁，而在线审计会因为真实缺口（比如镜像站上还没同步某个包）红灯，
+# 那份红灯是**体检报告**，不是"代码写错了"。
+.PHONY: market-audit
+market-audit: ## 应用市场审计：一条命令审全部应用（在线，有缺口非零退出）
+	@tools/market-audit.sh $(ARGS)
+
+.PHONY: market-audit-offline
+market-audit-offline: ## 应用市场静态门禁：只查声明完整性/不变量（不联网）
+	@tools/market-audit.sh --offline
+
+.PHONY: market-audit-verify
+market-audit-verify: ## 真机安装验收（会真的装软件）：ARGS="<base_url> <user> <pass>"
+	@tools/market-audit.sh --install -- $(ARGS)

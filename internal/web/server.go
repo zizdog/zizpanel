@@ -72,6 +72,16 @@ type Server struct {
 	// （面板重启后"正在安装"本身就是假的，见 SPEC-任务中心.md）。
 	Tasks *tasks.Manager
 
+	// ---- ACME 证书（见 api_certs.go）----
+	//
+	// acmeMgr 惰性构造：构造它要读 DataDir，而绝大多数面板请求用不到证书功能；
+	// acmeOverride 是单测注入点（假实现，绝不联网、不碰真实 CA）。
+	acmeMu       sync.Mutex
+	acmeMgr      acmeManager
+	acmeOverride acmeManager
+	// acmeCredMu 保护 DNS 凭据文件（DataDir 下 0600）的读写。
+	acmeCredMu sync.Mutex
+
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time
@@ -129,6 +139,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/system/info", s.requireAuth(s.handleSystemInfo))
 	root.HandleFunc("GET /api/v1/system/stream", s.requireAuth(s.handleSystemStream))
 	root.HandleFunc("GET /api/v1/system/processes", s.requireAuth(s.handleProcesses))
+	// 基础依赖（ffmpeg / ffprobe）状态：曾经静默消失过（被 brew autoremove 带走），
+	// 表现是 TTS 返回 200 + 空 body —— 必须能一眼看到缺没缺（见 basedep.go）。
+	root.HandleFunc("GET /api/v1/system/deps", s.requireAuth(s.handleSystemDeps))
 
 	// 系统设置（macOS 服务器化）：状态探测 + 一键动作（动作走任务中心）
 	root.HandleFunc("GET /api/v1/system/settings", s.requireAuth(s.handleSystemSettings))
@@ -143,6 +156,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/tasks/{id}", s.requireAuth(s.handleTaskGet))
 	root.HandleFunc("GET /api/v1/tasks/{id}/stream", s.requireAuth(s.handleTaskStream))
 	root.HandleFunc("POST /api/v1/tasks/{id}/cancel", s.requireAuth(s.handleTaskCancel))
+	// 任务输入：安装过程中"限时询问"的通道（如 MySQL root 口令）。
+	// 只有正在等待该 key 的任务才接受，见 tasks.Task.SubmitInput。
+	root.HandleFunc("POST /api/v1/tasks/{id}/input", s.requireAuth(s.handleTaskInput))
 
 	root.HandleFunc("POST /api/v1/account/password", s.requireAuth(s.handleChangePassword))
 	// 改用户名：要当前密码确认，但不吊销会话（会话按 user_id 关联）
@@ -171,6 +187,23 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/sites/{domain}/ssl", s.requireAuth(s.handleSiteSSLDisable))
 	root.HandleFunc("GET /api/v1/sites/{domain}/check", s.requireAuth(s.handleSiteCheck))
 	root.HandleFunc("GET /api/v1/sites/{domain}/log", s.requireAuth(s.handleSiteLog))
+
+	// ---------- ACME 证书 ----------
+	// 证书文件由 internal/acme 落在 <DataDir>/certs/<primary>/；
+	// 站点侧通过 handleSiteSSL 的 provider=acme 直接引用同一份路径（续期同路径覆盖）。
+	root.HandleFunc("GET /api/v1/certs", s.requireAuth(s.handleCertsList))
+	root.HandleFunc("POST /api/v1/certs", s.requireAuth(s.handleCertsIssue))
+	// 必须注册在 {primary} 之前也无所谓（Go 1.22 mux 按最具体匹配），
+	// 但放在一起更清楚：这是一条独立路径，不是某张证书的子资源。
+	root.HandleFunc("GET /api/v1/certs/dns-providers", s.requireAuth(s.handleCertDNSProviders))
+	root.HandleFunc("POST /api/v1/certs/{primary}/renew", s.requireAuth(s.handleCertRenew))
+	root.HandleFunc("DELETE /api/v1/certs/{primary}", s.requireAuth(s.handleCertDelete))
+
+	// ---------- PHP 多版本 ----------
+	// 已安装的 PHP 版本清单（界面用它渲染"PHP 版本"下拉框）
+	root.HandleFunc("GET /api/v1/php", s.requireAuth(s.handlePHPList))
+	// 让某个版本真正监听在它独有的端点上（改 www.conf + 重启 fpm）
+	root.HandleFunc("POST /api/v1/php/fix-listen", s.requireAuth(s.handlePHPFixListen))
 
 	// ---------- 数据库管理 ----------
 	root.HandleFunc("GET /api/v1/database", s.requireAuth(s.handleDatabaseOverview))
@@ -238,6 +271,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/services/{name}", s.requireAuth(s.handleServiceUpdate))
 	root.HandleFunc("DELETE /api/v1/services/{name}", s.requireAuth(s.handleServiceDelete))
 	root.HandleFunc("POST /api/v1/services/{name}/{action}", s.requireAuth(s.handleServiceAction))
+	root.HandleFunc("GET /api/v1/services/{name}/credentials", s.requireAuth(s.handleServiceCredentials))
+	// brew 的真实状态（服务/可升级/已装），面板直接渲染它，不再只信自己的记录表。
+	root.HandleFunc("GET /api/v1/brew/overview", s.requireAuth(s.handleBrewOverview))
 	root.HandleFunc("GET /api/v1/services/{name}/logs", s.requireAuth(s.handleServiceLogs))
 	root.HandleFunc("GET /api/v1/services/{name}/logs/stream", s.requireAuth(s.handleServiceLogStream))
 	root.HandleFunc("DELETE /api/v1/services/{name}/uninstall", s.requireAuth(s.handleServiceUninstall))

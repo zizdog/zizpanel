@@ -42,7 +42,7 @@ func startStubTask(t *testing.T, srv *Server, target string, release <-chan stru
 func TestTasksListAndDetail(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	done := make(chan struct{})
 	close(done)
@@ -115,7 +115,7 @@ func TestTasksListAndDetail(t *testing.T) {
 func TestTaskDetailNotFound(t *testing.T) {
 	_, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	res, out, _ := doJSON(t, ts, "GET", "/api/v1/tasks/t-不存在", nil, cookies)
 	if res.StatusCode != 404 {
 		t.Errorf("不存在的任务应 404，实际 %d", res.StatusCode)
@@ -130,7 +130,7 @@ func TestTaskDetailNotFound(t *testing.T) {
 func TestTaskStreamSendsMetaLinesAndStatus(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	release := make(chan struct{})
 	task := startStubTask(t, srv, "stream-app", release)
@@ -185,7 +185,7 @@ func TestTaskStreamSendsMetaLinesAndStatus(t *testing.T) {
 func TestTaskStreamResumesFromLastEventID(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	task := startStubTask(t, srv, "resume-app", nil)
 	select {
@@ -226,7 +226,7 @@ func TestTaskStreamResumesFromLastEventID(t *testing.T) {
 func TestTaskCancelEndpoint(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	release := make(chan struct{})
 	defer close(release)
@@ -260,7 +260,7 @@ func TestTaskCancelEndpoint(t *testing.T) {
 func TestInstallEndpointIsAsyncAndGuarded(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 未知应用：同步 400（不该为此建任务）
 	res, _, _ := doJSON(t, ts, "POST", "/api/v1/market/不存在的应用/install", nil, cookies)
@@ -290,7 +290,7 @@ func TestInstallEndpointIsAsyncAndGuarded(t *testing.T) {
 func TestServiceUninstallIsAsync(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 不存在的服务名 → 任务会失败，但接口本身必须是 202 + task_id
 	res, out, _ := doJSON(t, ts, "DELETE", "/api/v1/services/不存在的服务/uninstall", nil, cookies)
@@ -425,7 +425,7 @@ func itoa(n int) string {
 func TestComposeUpIsAsync(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/docker/compose/不存在的项目/actions?action=up", nil, cookies)
 	if res.StatusCode != 202 {
@@ -464,7 +464,7 @@ func TestComposeUpIsAsync(t *testing.T) {
 func TestForgetMissingServiceIs404(t *testing.T) {
 	_, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	res, out, _ := doJSON(t, ts, "DELETE", "/api/v1/services/no-such-service-here", nil, cookies)
 	if res.StatusCode != 404 {
@@ -473,4 +473,174 @@ func TestForgetMissingServiceIs404(t *testing.T) {
 	if !strings.Contains(asString(out["msg"]), "不存在") {
 		t.Errorf("404 的说明应写清「服务不存在」，实际 %q", out["msg"])
 	}
+}
+
+// ============================================================================
+//  任务输入通道（安装时限时询问：如 MySQL root 口令）
+//
+//  这些测试只用测试自己造的任务，不触发任何真实安装、也不碰真实 MySQL。
+// ============================================================================
+
+// TestTaskInputEndpointAndSSEEvent 覆盖前端契约：
+//   - SSE 里出现 `input_required` 事件，带 key/label/倒计时/截止时间；
+//   - POST /api/v1/tasks/{id}/input 能投递；
+//   - 落定后再发一次 `input_required`（值为 null）让前端收起输入框；
+//   - 晚到的/答错题的任务输入明确报错（不静默吞掉）。
+func TestTaskInputEndpointAndSSEEvent(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	const secret = "Secret-From-UI-123456"
+	got := make(chan string, 1)
+	task := srv.Tasks.StartWithTask("install", "mysql84", "安装 MySQL 8.4",
+		func(ctx context.Context, tk *tasks.Task) (any, error) {
+			v, ok := tk.WaitInput(ctx, tasks.InputRequest{
+				Key: "mysql_root_password", Label: "MySQL root 口令", Secret: true,
+			}, 20*time.Second)
+			if !ok {
+				return nil, nil
+			}
+			got <- v
+			// 刻意不把值放进返回值：任务的 result 会随 GET/SSE 反复下发。
+			return map[string]any{"saved": true}, nil
+		})
+	// 等任务真的在等输入，再连 SSE —— 这样 meta 事件里就带着 input_required。
+	waitTaskPending(t, task)
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/tasks/"+task.ID()+"/stream", nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	res, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	// ① 首次 meta 事件里应带结构化的 input_required（前端据此渲染输入框+倒计时）
+	events := readSSE(t, res.Body, 1, nil)
+	if events[0].name != "meta" {
+		t.Fatalf("第一个事件应为 meta，实际 %q", events[0].name)
+	}
+	if !strings.Contains(events[0].data, `"input_required"`) ||
+		!strings.Contains(events[0].data, `"mysql_root_password"`) {
+		t.Fatalf("meta 里应带 input_required，实际 %s", events[0].data)
+	}
+	if !strings.Contains(events[0].data, `"deadline"`) || !strings.Contains(events[0].data, `"timeout_seconds"`) {
+		t.Errorf("input_required 应带 deadline 与 timeout_seconds（前端要显示倒计时）：%s", events[0].data)
+	}
+
+	// ② 投递口令
+	res2, out2, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+task.ID()+"/input",
+		map[string]any{"key": "mysql_root_password", "value": secret}, cookies)
+	if res2.StatusCode != 200 {
+		t.Fatalf("投递应 200，实际 %d: %v", res2.StatusCode, out2)
+	}
+	// 响应里绝不能回显值
+	if body, _ := json.Marshal(out2); strings.Contains(string(body), secret) {
+		t.Error("投递接口的响应里回显了口令")
+	}
+	select {
+	case v := <-got:
+		if v != secret {
+			t.Fatalf("任务收到的值不对: %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("任务没收到输入")
+	}
+
+	// ③ 落定事件：input_required 应为 null，input_result 说明结局
+	events = readSSEUntil(t, res.Body, "input_required", 20, nil)
+	last := events[len(events)-1]
+	if !strings.Contains(last.data, `"input_required":null`) {
+		t.Errorf("落定后应下发 input_required:null（前端据此收起输入框），实际 %s", last.data)
+	}
+	if !strings.Contains(last.data, `"submitted"`) {
+		t.Errorf("input_result 应为 submitted，实际 %s", last.data)
+	}
+	if strings.Contains(last.data, secret) {
+		t.Errorf("SSE 事件里出现了口令：%s", last.data)
+	}
+
+	// ④ 再投一次：任务已经不在等这个 key（甚至可能已经结束）→ 必须报错
+	res3, _, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+task.ID()+"/input",
+		map[string]any{"key": "mysql_root_password", "value": "again"}, cookies)
+	if res3.StatusCode == 200 {
+		t.Error("重复投递不该成功")
+	}
+
+	// ⑤ 不存在的任务 / 缺 key：明确报错
+	res4, _, _ := doJSON(t, ts, "POST", "/api/v1/tasks/t-nope/input",
+		map[string]any{"key": "mysql_root_password", "value": "x"}, cookies)
+	if res4.StatusCode != 404 {
+		t.Errorf("不存在的任务应 404，实际 %d", res4.StatusCode)
+	}
+	res5, _, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+task.ID()+"/input",
+		map[string]any{"value": "x"}, cookies)
+	if res5.StatusCode != 400 {
+		t.Errorf("缺 key 应 400，实际 %d", res5.StatusCode)
+	}
+
+	select {
+	case <-task.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("收到输入后任务应继续跑完")
+	}
+	// ⑥ 任务详情（GET）里也绝不能有口令
+	res6, out6, _ := doJSON(t, ts, "GET", "/api/v1/tasks/"+task.ID(), nil, cookies)
+	if res6.StatusCode != 200 {
+		t.Fatalf("详情应 200，实际 %d", res6.StatusCode)
+	}
+	body, _ := json.Marshal(out6)
+	if strings.Contains(string(body), secret) {
+		t.Error("GET /api/v1/tasks/{id} 的返回里出现了口令")
+	}
+}
+
+// TestTaskInputWrongKeyRejected 答错题（key 不匹配）必须报错并保留仍可提交。
+func TestTaskInputWrongKeyRejected(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	task := srv.Tasks.StartWithTask("install", "mysql84", "安装 MySQL 8.4",
+		func(ctx context.Context, tk *tasks.Task) (any, error) {
+			tk.WaitInput(ctx, tasks.InputRequest{Key: "mysql_root_password", Label: "口令"}, 20*time.Second)
+			return nil, nil
+		})
+	waitTaskPending(t, task)
+
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+task.ID()+"/input",
+		map[string]any{"key": "wrong_key", "value": "x"}, cookies)
+	if res.StatusCode != 409 {
+		t.Fatalf("答错题应 409，实际 %d: %v", res.StatusCode, out)
+	}
+	if !strings.Contains(asString(out["msg"]), "mysql_root_password") {
+		t.Errorf("报错要说明当前在等哪个 key，实际 %q", out["msg"])
+	}
+	// 正确的 key 仍然可以提交
+	res2, _, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+task.ID()+"/input",
+		map[string]any{"key": "mysql_root_password", "value": "pw-123456789"}, cookies)
+	if res2.StatusCode != 200 {
+		t.Errorf("正确的 key 应被接受，实际 %d", res2.StatusCode)
+	}
+	select {
+	case <-task.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("任务应结束")
+	}
+}
+
+// waitTaskPending 等任务进入"等待输入"状态。
+func waitTaskPending(t *testing.T, task *tasks.Task) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if task.PendingInput() != nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("任务没有进入等待输入状态")
 }

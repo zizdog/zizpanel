@@ -16,20 +16,20 @@ import (
 func TestRenameUserHappyPathAndLogin(t *testing.T) {
 	srv, ts := newTestServer(t)
 	res, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatal("初始化失败")
 	}
 
 	// 改名前：旧名能登录
 	res, _, _ = doJSON(t, ts, "POST", "/api/v1/login",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Fatalf("改名前旧名应能登录，实际 %d", res.StatusCode)
 	}
 
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/account/username",
-		map[string]string{"username": "zizdog", "password": "PanelTestPw-9x!"}, cookies)
+		map[string]string{"username": "zizdog", "password": "zizpanel-test-fixture-pass"}, cookies)
 	if res.StatusCode != 200 {
 		t.Fatalf("改名应 200，实际 %d: %v", res.StatusCode, out)
 	}
@@ -39,12 +39,12 @@ func TestRenameUserHappyPathAndLogin(t *testing.T) {
 
 	// ★ 硬证据：旧名登录必须失败、新名必须成功
 	res, _, _ = doJSON(t, ts, "POST", "/api/v1/login",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode == 200 {
 		t.Error("改名后旧用户名不该还能登录")
 	}
 	res, _, _ = doJSON(t, ts, "POST", "/api/v1/login",
-		map[string]string{"username": "zizdog", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "zizdog", "password": "zizpanel-test-fixture-pass"}, nil)
 	if res.StatusCode != 200 {
 		t.Errorf("改名后新用户名应能登录，实际 %d", res.StatusCode)
 	}
@@ -73,7 +73,7 @@ func TestRenameUserHappyPathAndLogin(t *testing.T) {
 func TestRenameUserRejections(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 造第二个账号，用来测"重名"。直接插库：面板本身没有多用户管理界面。
 	if _, err := srv.Store.DB().Exec(
@@ -84,10 +84,10 @@ func TestRenameUserRejections(t *testing.T) {
 	cases := []struct{ name, user, pwd, wantMsg string }{
 		{"缺密码", "newname", "", "当前密码"},
 		{"密码错", "newname", "wrong-password", "用户名或密码错误"},
-		{"重名", "taken", "PanelTestPw-9x!", "已被占用"},
-		{"太短", "ab", "PanelTestPw-9x!", "用户名不合法"},
-		{"非法字符", "bad name!", "PanelTestPw-9x!", "用户名不合法"},
-		{"与当前相同", "admin", "PanelTestPw-9x!", "相同"},
+		{"重名", "taken", "zizpanel-test-fixture-pass", "已被占用"},
+		{"太短", "ab", "zizpanel-test-fixture-pass", "用户名不合法"},
+		{"非法字符", "bad name!", "zizpanel-test-fixture-pass", "用户名不合法"},
+		{"与当前相同", "admin", "zizpanel-test-fixture-pass", "相同"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

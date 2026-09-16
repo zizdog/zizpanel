@@ -27,7 +27,7 @@ import (
 func seedAudit(t *testing.T, srv *Server, ts *httptest.Server) []*http.Cookie {
 	t.Helper()
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 	if _, err := srv.Store.DB().Exec(`DELETE FROM audit_logs`); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestAuditLikeWildcardEscaped(t *testing.T) {
 func TestAuditRejectsBadParams(t *testing.T) {
 	_, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	cases := []struct{ path, wantMsg string }{
 		{"/api/v1/audit?ok=maybe", "ok"},

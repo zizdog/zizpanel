@@ -202,6 +202,10 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		return m.uninstallIOPaint(ctx, removeData, result)
 	case "phpmyadmin":
 		return m.UninstallPhpMyAdmin(ctx, removeData, result)
+	case "ffmpeg":
+		// 基础依赖也允许单独卸载，但由 UninstallBaseDependency 把后果写清楚
+		// （用户要求"明确提示即可，不要禁止"）。
+		return m.UninstallBaseDependency(ctx, app, result)
 	case "docker-runtime":
 		return m.uninstallDockerRuntime(ctx, removeData, result)
 	}
@@ -264,6 +268,15 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 			p.Blocked = "还有 " + fmt.Sprint(len(users)) + " 个 Docker 应用在用这个运行时（" +
 				strings.Join(users, "、") + "），请先卸载它们"
 		}
+	case "ffmpeg":
+		// 基础依赖也能单独卸载（用户要求"明确提示即可，不要禁止"）。
+		// 卸载计划必须把后果写在这里 —— 确认框会逐条展示，用户按下去之前就看得见。
+		p.Steps = []string{
+			"⚠️ FFmpeg 是面板的基础依赖，卸载后 TTS 编码 mp3 会返回 HTTP 200 + 0 字节 body",
+			"音色接收端的样本校验/转码、以及后续的音视频功能也会失效",
+			"brew uninstall ffmpeg",
+		}
+		p.KeepNote = "需要时可随时从应用市场重新安装；面板安装脚本与 LNMP / Qwen TTS 部署也会自动补装"
 	default:
 		p.Blocked = "这个应用没有卸载实现"
 	}

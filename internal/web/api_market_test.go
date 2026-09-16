@@ -40,7 +40,7 @@ func marketItem(t *testing.T, ts *httptest.Server, cookies []*http.Cookie, id st
 func TestMarketUsesRealBrewLabel(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 复刻本机实况：Homebrew 把 plist 写成 sh.brew.*（不是 homebrew.mxcl.*）
 	home := srv.Cfg.UserHome
@@ -94,7 +94,7 @@ func TestMarketUsesRealBrewLabel(t *testing.T) {
 func TestMarketDetectsOrphanInstall(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 造出 IOPaint 的安装产物，但不注册任何服务、也不放 plist
 	exe := filepath.Join(srv.Cfg.UserHome, "iopaint", ".venv", "bin", "iopaint")
@@ -135,7 +135,7 @@ func TestMarketDetectsOrphanInstall(t *testing.T) {
 func TestMarketResidualDataOffersReinstall(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 复刻"卸载（保留数据）之后的磁盘状态，服务与记录都不在、只剩产物"。
 	//
@@ -181,7 +181,7 @@ func TestMarketResidualDataOffersReinstall(t *testing.T) {
 func TestMarketComposeResidualOffersReinstall(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "PanelTestPw-9x!"}, nil)
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	dir := filepath.Join(srv.Cfg.WorkDir, "compose", "uptime-kuma")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

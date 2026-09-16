@@ -72,6 +72,40 @@ type Line struct {
 	Text  string    `json:"text"`
 }
 
+// LevelInput 是"任务正在等用户输入"这一行的级别。
+//
+// 用独立的级别而不是复用 step：前端需要把它渲染成带输入框/倒计时的交互行，
+// 而不是一条普通文字 —— 靠文案去认（"请在 60 秒内…"）在改文案时必然失效。
+const LevelInput = "input"
+
+// InputRequest 描述"任务卡在等用户输入"这件事。
+//
+// 约定：**这里永远不放用户已经输入的值**。它的用途是让前端渲染输入框与
+// 倒计时（GET /api/v1/tasks/{id} 与 SSE 都会带它），值只走 SubmitInput →
+// 业务层，绝不回显。
+type InputRequest struct {
+	// Key 是这次输入的标识（如 mysql_root_password）。投递时必须原样带回，
+	// 防止"回答的是上一个问题"（任务里可能连续问多个 key）。
+	Key string `json:"key"`
+	// Label 是输入框的标题（人看的）
+	Label string `json:"label"`
+	// Hint 是输入框下面的说明（可以写"留空＝自动生成"）
+	Hint string `json:"hint,omitempty"`
+	// Secret 为 true 时前端应该用密码框（type=password）渲染
+	Secret bool `json:"secret"`
+	// TimeoutSeconds 是等待时长；前端据此显示倒计时。
+	TimeoutSeconds int `json:"timeout_seconds"`
+	// Deadline 是等待截止时刻（RFC3339）。前端以它为准而不是自己算，
+	// 因为"任务开始等"到"前端收到事件"之间本来就有延迟。
+	Deadline time.Time `json:"deadline"`
+}
+
+// pendingInput 是一次正在等待的输入。
+type pendingInput struct {
+	req InputRequest
+	ch  chan string
+}
+
 // Meta 是任务的元信息（列表页与进度窗标题都用它）。
 type Meta struct {
 	ID        string    `json:"id"`
@@ -89,6 +123,12 @@ type Meta struct {
 	Last string `json:"last"`
 	// Error 是失败原因（status=failed 时有值）。
 	Error string `json:"error"`
+	// InputRequired 非 nil 表示任务此刻正在等用户输入（见 InputRequest）。
+	// **不含用户输入过的值**：只描述"在等什么"。
+	InputRequired *InputRequest `json:"input_required,omitempty"`
+	// InputResult 是最近一次等待的结局：submitted / timeout / canceled。
+	// 前端据此判断"倒计时结束后任务会自己继续"（timeout）还是"用户已提交"。
+	InputResult string `json:"input_result,omitempty"`
 	// Result 是业务返回值（*services.InstallResult），只在成功后有值。
 	// 用 any 是为了不反向依赖 services 包。
 	Result any `json:"result,omitempty"`
@@ -121,6 +161,18 @@ type Task struct {
 	total int64
 	subs  map[int]chan Line
 	subID int
+	// input 是当前正在等待的用户输入（nil = 没在等）。
+	// 一次只允许等一个：并发等两个 key 会让"这个值是回答哪个问题"变得不确定。
+	input *pendingInput
+	// inputResult 是最近一次等待的结局（submitted/timeout/canceled）。
+	inputResult string
+	// stateSubs 是"任务状态变化"的通知通道（开始等输入 / 输入已落定 / 任务结束）。
+	//
+	// 为什么不能只靠日志行通知：输入请求是有结构的（key/倒计时/截止时间），
+	// 塞进日志文本就得让前端去解析字符串 —— 那种契约改一次文案就崩。
+	// 这里只发"变了"这一个信号，SSE 处理器接到后把当前 Meta 推给前端。
+	stateSubs  map[int]chan struct{}
+	stateSubID int
 }
 
 // newTask 建立任务对象（不启动）。id 由 Manager 生成。
@@ -134,6 +186,7 @@ func newTask(id, kind, target, title string) *Task {
 		done:      make(chan struct{}),
 		status:    StatusRunning,
 		subs:      map[int]chan Line{},
+		stateSubs: map[int]chan struct{}{},
 		nextSeq:   1,
 	}
 }
@@ -231,6 +284,155 @@ func (t *Task) Unsubscribe(id int) {
 	}
 }
 
+// SubscribeState 订阅"任务状态变化"通知（目前用于等输入的开始/结束）。
+//
+// 与 Subscribe 分开的理由：日志行有序号（断点续传靠它），而状态变化没有；
+// 混在一起会让 Last-Event-ID 的语义变得含糊。通道缓冲 16 个足够 ——
+// 一次等输入最多产生"开始/落定"两个信号，满了就丢（丢掉也无所谓：
+// SSE 处理器每次都会读当前 Meta，本来就不是增量数据）。
+func (t *Task) SubscribeState() (int, <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stateSubID++
+	id := t.stateSubID
+	ch := make(chan struct{}, 16)
+	t.stateSubs[id] = ch
+	return id, ch
+}
+
+// UnsubscribeState 注销状态订阅者并关闭通道。
+func (t *Task) UnsubscribeState(id int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ch, ok := t.stateSubs[id]; ok {
+		delete(t.stateSubs, id)
+		close(ch)
+	}
+}
+
+// notifyStateLocked 通知所有状态订阅者（必须在持锁时调用，绝不阻塞）。
+func (t *Task) notifyStateLocked() {
+	for _, ch := range t.stateSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// PendingInput 返回当前正在等待的输入请求；没在等待时返回 nil。
+//
+// 返回副本：调用方（HTTP 处理器）拿到后会先解锁再序列化，
+// 直接给指针会让它在锁外读到被 WaitInput 改写的字段。
+func (t *Task) PendingInput() *InputRequest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.input == nil {
+		return nil
+	}
+	cp := t.input.req
+	return &cp
+}
+
+// InputResult 返回最近一次等待的结局（submitted/timeout/canceled，空=还没问过）。
+func (t *Task) InputResult() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.inputResult
+}
+
+// WaitInput 请求用户输入，最多等 timeout。
+//
+// 返回值：
+//   - provided=true  → 用户提交了值。**空串也是有效的提交**（语义是"我留空，
+//     你按提示自动生成"），调用方必须自己区分""与"没提交"。
+//   - provided=false → 超时或任务被中断。调用方必须自己给出默认值并继续。
+//
+// 为什么超时不返回错误：装 MySQL 这类流程不能因为用户没坐在屏幕前就失败或
+// 永久卡住（真机痛点：用户去泡杯咖啡回来发现安装停在"请等待"）。
+// 超时是**正常路径**，不是异常。
+func (t *Task) WaitInput(ctx context.Context, req InputRequest, timeout time.Duration) (string, bool) {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	req.TimeoutSeconds = int(timeout / time.Second)
+	req.Deadline = time.Now().Add(timeout)
+
+	ch := make(chan string, 1)
+	t.mu.Lock()
+	if t.status != StatusRunning {
+		t.mu.Unlock()
+		return "", false
+	}
+	t.input = &pendingInput{req: req, ch: ch}
+	t.inputResult = ""
+	t.notifyStateLocked()
+	t.mu.Unlock()
+
+	// 无论走哪条分支，退出前都要清掉"正在等待"并广播一次 ——
+	// 否则前端会一直显示一个已经没人听的输入框。
+	defer func() {
+		t.mu.Lock()
+		t.input = nil
+		t.notifyStateLocked()
+		t.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case v := <-ch:
+		// SubmitInput 已经写过 submitted，这里只是兜底（两条路径都写同一个值）。
+		t.setInputResult("submitted")
+		return v, true
+	case <-timer.C:
+		t.setInputResult("timeout")
+		return "", false
+	case <-ctx.Done():
+		t.setInputResult("canceled")
+		return "", false
+	}
+}
+
+// setInputResult 记录等待结局（带锁）。
+func (t *Task) setInputResult(v string) {
+	t.mu.Lock()
+	t.inputResult = v
+	t.mu.Unlock()
+}
+
+// SubmitInput 投递一次用户输入。
+//
+// 只在"任务正在等这个 key"时接受，否则返回可读错误 ——
+// **绝不静默丢弃**：静默丢弃会让用户以为已经提交，而任务其实早已用默认值继续了；
+// 这种"我明明填了"的错觉比直接报错难查得多。
+func (t *Task) SubmitInput(key, value string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.status != StatusRunning {
+		return fmt.Errorf("任务已经结束，无法再提交输入")
+	}
+	p := t.input
+	if p == nil {
+		return fmt.Errorf("任务当前不在等待输入（多半已经超时并自动继续了）")
+	}
+	if p.req.Key != key {
+		return fmt.Errorf("任务当前等待的是 %q，不接受 %q", p.req.Key, key)
+	}
+	select {
+	case p.ch <- value:
+	default:
+		return fmt.Errorf("该输入已经提交过了")
+	}
+	// 立刻落定：防止同一个 key 被提交两次（第二次会走"不在等待输入"分支）。
+	t.input = nil
+	t.inputResult = "submitted"
+	t.notifyStateLocked()
+	return nil
+}
+
 // Meta 返回当前元信息快照。
 func (t *Task) Meta() Meta {
 	t.mu.Lock()
@@ -260,6 +462,13 @@ func (t *Task) metaLocked() Meta {
 		Result:     t.result,
 		FinishedAt: t.finishedAt,
 	}
+	// 只暴露"在等什么"，**不放用户已经输入的值**：Meta 会被 GET 任务与 SSE
+	// 反复下发，值一旦进去就等于把口令写进了每一份快照。
+	if t.input != nil {
+		req := t.input.req
+		m.InputRequired = &req
+	}
+	m.InputResult = t.inputResult
 	if n := len(t.lines); n > 0 {
 		m.Last = t.lines[n-1].Text
 	}
@@ -320,6 +529,19 @@ func NewManager() *Manager { return &Manager{} }
 // **与 HTTP 请求无关**，所以用户关窗口/刷新/换页面都不会打断安装。
 // 中断只能通过 Cancel。
 func (m *Manager) Start(kind, target, title string, fn func(ctx context.Context, log LogFunc) (any, error)) *Task {
+	return m.StartWithTask(kind, target, title, func(ctx context.Context, t *Task) (any, error) {
+		return fn(ctx, t.LogFunc())
+	})
+}
+
+// StartWithTask 与 Start 相同，但把**任务对象本身**交给执行体。
+//
+// 为什么需要它：需要"限时询问用户输入"的任务（装 MySQL 时问 root 口令）
+// 必须拿到任务对象才能开输入通道（tasks.Task 满足 services.InputProvider）。
+// 不用"闭包捕获 t"那种写法：`t := m.Start(..., func(){ 用 t })` 里 t 还没赋值，
+// 编译期就过不去；退化成 var t + 稍后赋值则会和 goroutine 抢同一个变量（数据竞争，
+// 还可能让输入通道静默变成 nil ⇒ 提示不出现、口令被默默自动生成）。
+func (m *Manager) StartWithTask(kind, target, title string, fn func(ctx context.Context, t *Task) (any, error)) *Task {
 	id := fmt.Sprintf("t-%d-%d", time.Now().UnixMilli(), m.seq.Add(1))
 	t := newTask(id, kind, target, title)
 
@@ -358,7 +580,7 @@ func (m *Manager) Start(kind, target, title string, fn func(ctx context.Context,
 			}
 		}()
 
-		result, err := fn(ctx, t.LogFunc())
+		result, err := fn(ctx, t)
 		switch {
 		case err != nil && ctx.Err() == context.Canceled:
 			// 被中断时子进程通常返回 "signal: killed"，那不是真失败，

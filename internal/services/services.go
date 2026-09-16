@@ -139,6 +139,37 @@ type Manager struct {
 	// 没有它的话，每个碰 brewEnv 的单测都会去访问阿里云/中科大，既慢又依赖外网 ——
 	// 违反"单测不许碰真实服务"。
 	mirrorProbeOverride func(ctx context.Context, probeFormula string) (apiDomain, bottleDomain string)
+	// mirrorProbeCache 缓存探测结果：一次会话只探一次。
+	//
+	// 为什么必须有：brewEnv 会被**每次 brew 调用**用到（brew list --versions、
+	// 每个 install …），而一次 LNMP 安装有几十次调用。每次探测最多 4 秒 × 3 个候选，
+	// 加起来就是用户感受到的"怎么这么慢" —— 而且这是在**安装之前**白白等掉的。
+	mirrorProbeCache map[string]string
+	// depExecOverride 仅供测试：替换"基础依赖能否真的跑起来"的执行动作。
+	// 没有它，VerifyBaseDependencies 的单测会去执行测试机上真实的 ffmpeg，
+	// 结论随机器而变（见 basedep.go）。
+	depExecOverride func(path string) string
+	// mysqlAdminOverride 仅供测试：替换"连 MySQL / 改 root 口令"的动作。
+	// 没有它，凭据闭环的单测会去连本机真实运行的 MySQL —— 那既违反
+	// "单测不许碰真实服务"，结论也会随开发机装没装 MySQL 而变。
+	mysqlAdminOverride mysqlAdmin
+	// mysqlProbeWaitOverride 仅供测试：把"等 MySQL 起来"的时长调小。
+	// 否则"服务没起来"这条分支的测试要真的等 30 秒。
+	mysqlProbeWaitOverride time.Duration
+	// mirrorFileProbeOverride 仅供测试：替换"镜像上有没有这个**具体文件**"的 HEAD 探测。
+	// 没有它，碰镜像文件探测的单测会去访问真实镜像站（违反"单测不许碰真实服务"）。
+	mirrorFileProbeOverride func(ctx context.Context, url string) (int64, error)
+	// iopaintWaitPortOverride 仅供测试：替换"等 IOPaint 端口就绪"。
+	// 真机实现要轮询 180 秒，单测既不可能真等、也不该真去开一个端口。
+	iopaintWaitPortOverride func(ctx context.Context, port int, timeout time.Duration) bool
+	// iopaintFetchOverride 仅供测试：替换真实的 HTTP 下载（单测不许联网）。
+	// 有了它才能构造"下载停滞 / 被截断 / md5 不符"这些真机上很难复现的场景。
+	iopaintFetchOverride func(ctx context.Context, url, dest string, onProgress fetchProgressFunc) error
+	// iopaintWeightTimeoutOverride / iopaintStallTimeoutOverride 仅供测试：
+	// 把"30 分钟总超时 / 90 秒停滞判定"缩短，好让"超时=如实失败，而不是永远 running"
+	// 这条约束能在毫秒级被验证，而不是靠人工等半小时。
+	iopaintWeightTimeoutOverride time.Duration
+	iopaintStallTimeoutOverride  time.Duration
 }
 
 // Options 是管理器需要的环境信息。
@@ -148,12 +179,16 @@ type Options struct {
 	// BrewBin 是 brew 路径（brew services 类服务需要）
 	BrewBin string
 	// MirrorBase 是应用包镜像基址（来自 Config.MirrorBase）。
-	// 非空 = 镜像站是**唯一来源**：安装前先检查资源在不在，缺了就明确失败、
-	// 不回退公网（见 mirror.go）；空 = 关闭镜像（应急用）。
+	// 非空 = 镜像是**优先来源**：安装前先检查资源在不在，在就从镜像下、
+	// 缺件或不可达则回落到公网源（见 mirror.go）；空 = 关闭镜像（应急用）。
 	MirrorBase string
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，来自 Config.MirrorProbeSeconds）；
 	// <=0 按 4 秒处理。
 	MirrorProbeSeconds int
+	// OfflineOnly 为 true 时进入**仅走 NAS（离线）模式**（来自
+	// Config.OfflineOnly）：各安装器必须先用 MirrorOfflineOnly(ctx) 判断，
+	// **禁止任何外网回落**，缺资源就明确失败。见 mirror.go 的说明。
+	OfflineOnly bool
 	// DockerSocket 是 Docker socket 路径，为空表示 Docker 不可用
 	DockerSocket string
 	// UserHome 是真实用户家目录（用于找 LaunchAgents 与日志）
@@ -164,6 +199,40 @@ type Options struct {
 	UID int
 	// WorkDir 是面板工作目录（compose 文件放在 <WorkDir>/compose 下）
 	WorkDir string
+	// LookPath 覆盖"命令是否存在"的探测，仅供测试注入（nil = 用默认实现）。
+	//
+	// 为什么需要它：基础依赖探测（basedep.go）默认会看真实文件系统，
+	// 而"这台机器有没有 ffmpeg"不该决定单测的结论 ——
+	// 开发机装了、CI 没装，"缺/不缺"两条路径就会有一条测不到。
+	LookPath func(command string) (string, error)
+
+	// ---------- MySQL root 凭据闭环 ----------
+	//
+	// 为什么放在 Options 里：安装流程要知道"面板当前持有的 MySQL 凭据是什么"，
+	// 并在设置完口令后把它写回 config.json。这两件事属于**面板配置**的能力
+	// （由 web 层注入），services 不自己造一份凭据存储 ——
+	// 两份存储必然不同步，而"面板以为的口令"与"MySQL 实际的口令"不一致
+	// 正是 2026-09-16 mini 那次把面板锁在门外的根因。
+	//
+	// MySQLCredential 读面板当前持有的凭据（nil = 未接入，安装流程会如实说明并跳过闭环）
+	MySQLCredential func() MySQLCredential
+	// SetMySQLRootPassword 把新口令写回 config.json（nil = 未接入；
+	// 它返回错误必须被当成严重问题：MySQL 已经改了而面板没记住＝立刻锁死）
+	SetMySQLRootPassword func(password string) error
+	// MySQLInputTimeout 是"限时询问 root 口令"的等待时长；<=0 按 60 秒。
+	MySQLInputTimeout time.Duration
+}
+
+// MySQLCredential 是"面板持有的 MySQL 超级账号凭据"（来自 config.json）。
+//
+// 刻意不复用 mysql.Options：那里的 Password 是"这次连接用哪个口令"，
+// 这里描述的是"面板认为服务器上的口令是什么"，语义不同。
+type MySQLCredential struct {
+	Host     string
+	Port     int
+	Socket   string
+	User     string
+	Password string
 }
 
 // NewManager 创建服务管理器。
@@ -387,6 +456,35 @@ func (m *Manager) Uninstall(ctx context.Context, name string) error {
 func (m *Manager) Adopt(ctx context.Context, s *Service) error {
 	s.Managed = false
 	return m.repo.Create(ctx, s)
+}
+
+// ForgetByLabel 按 launchd label 把服务记录从注册表里删掉（不触碰系统）。
+//
+// 为什么需要：市场卸载的 **installer 那条路**（frpc / Orbien 客户端 / IOPaint
+// / Qwen3 TTS 这类面板自己装的应用）只删了文件与 plist，**没有删服务记录** ——
+// 于是用户在市场里卸载完，切到「服务管理」它还在，看着像"没卸掉"
+// （2026-09-16 用户反馈："用户在面板卸载一个软件，服务管理也应该消失"）。
+//
+// 返回删掉的条数；label 为空直接返回 0（避免误删）。
+func (m *Manager) ForgetByLabel(ctx context.Context, label string) (int, error) {
+	if strings.TrimSpace(label) == "" {
+		return 0, nil
+	}
+	list, err := m.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range list {
+		if s.LaunchLabel != label {
+			continue
+		}
+		if err := m.repo.Delete(ctx, s.Name); err != nil {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // ForgetName 从注册表移除（不触碰系统）。

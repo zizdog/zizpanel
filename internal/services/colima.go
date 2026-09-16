@@ -258,8 +258,16 @@ func (d *colimaDriver) Status(ctx context.Context) (State, error) {
 
 func (d *colimaDriver) Start(ctx context.Context) error {
 	m := &Manager{opt: d.opt}
-	// 冷启动要拉起虚拟机，实测 20-60 秒；给足时间，别用普通服务的超时。
-	if _, err := m.runColima(ctx, 5*time.Minute, "start"); err != nil {
+	// 先把 compose 数据目录的挂载补进配置（D13）：挂载不是 colima 的"固定配置"，
+	// 可以在已有虚拟机上 stop→start 生效，**不需要重建 VM**。放在 start 之前，
+	// 是因为已经跑着的实例上 `colima start` 是空操作（源码：already running,
+	// ignoring），改完不重启等于没改。
+	if err := m.ApplyColimaWorkDirMount(ctx); err != nil {
+		return fmt.Errorf("配置 compose 数据目录挂载失败: %w", err)
+	}
+	// 冷启动要拉起虚拟机；首次还要下 317MiB 的 guest 镜像（公网实测约 71 分钟，
+	// 已从自建镜像站预热则几秒），所以超时按 colimaStartTimeout（90 分钟）给。
+	if _, err := m.runColima(ctx, colimaStartTimeout, "start"); err != nil {
 		return fmt.Errorf("启动 Docker 运行时失败: %w", err)
 	}
 	return nil
@@ -517,19 +525,37 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 		result.step(ctx, "开机自启已存在，保持不动")
 	}
 
-	// ---- 3. 起虚拟机 ----
+	// ---- 3. 首次启动前先解决两个"必然卡住"的文件 ----
+	//
+	//  order 很重要：这两件事都必须在**首次 colima start 之前**写进配置，
+	//  否则第一次拉取仍然没有加速源、第一次启动仍然没有挂载表。
+	//  ① guest 镜像：Colima 从 GitHub 下 317MiB，公网实测约 71 分钟，
+	//     而旧代码只给 5 分钟超时 → 必然被掐断。这里先按 Colima 自己的
+	//     缓存命名规则从自建镜像站预热，命中缓存就一个字节都不用下。
+	//  ② 加速源 + 挂载：见 EnsureDockerMirrorsForRuntime / ApplyColimaWorkDirMount。
+	if note := m.PrewarmColimaGuestImage(ctx, result); note != "" {
+		result.step(ctx, note)
+	}
+	m.EnsureDockerMirrorsForRuntime(ctx, result)
+	if err := m.ApplyColimaWorkDirMount(ctx); err != nil {
+		return fmt.Errorf("配置 compose 数据目录挂载失败: %w", err)
+	}
+
+	// ---- 4. 起虚拟机 ----
 	// 已经跑着时 start 是幂等的，不会重复建 VM。
-	if _, err := m.runColima(ctx, 5*time.Minute, "start"); err != nil {
-		result.Warning = "运行时已安装，但启动失败：" + firstMeaningfulLine(err.Error())
-		return nil
+	// 失败必须**报错**、不能只写 Warning：运行时是 9 个 Docker 应用的前提，
+	// 报"装好了"而实际没起来就是典型的谎报成功。
+	if _, err := m.runColima(ctx, colimaStartTimeout, "start"); err != nil {
+		return fmt.Errorf("Docker 虚拟机启动失败：%w（guest 镜像若需从公网下载约 317MiB，"+
+			"国内实测可能需要 1 小时以上；可用镜像站的 colima 目录预热后重试）", err)
 	}
 	result.step(ctx, "Docker 虚拟机已启动")
+	m.logColimaGuestSource(ctx)
 
-	// ---- 4. 验证：真的调一次 Docker API ----
+	// ---- 5. 验证：真的调一次 Docker API ----
 	sock := filepath.Join(m.opt.UserHome, ".colima", "default", "docker.sock")
 	if !waitFile(sock, 60*time.Second) {
-		result.Warning = "已安装并启动，但 60 秒内未出现 Docker socket（" + sock + "），请查看运行时日志"
-		return nil
+		return fmt.Errorf("虚拟机已启动，但 60 秒内未出现 Docker socket（%s）—— 运行时不可用，请查看运行时日志", sock)
 	}
 	client := newDockerClient(sock)
 	ver := ""
@@ -541,10 +567,12 @@ func (m *Manager) InstallColimaRuntime(ctx context.Context, result *InstallResul
 		time.Sleep(time.Second)
 	}
 	if ver == "" {
-		result.Warning = "Docker socket 已就绪，但引擎 API 无响应，请查看运行时日志"
-		return nil
+		return fmt.Errorf("Docker socket 已就绪，但引擎 API 无响应 —— 运行时不可用，请查看运行时日志")
 	}
 	result.step(ctx, "Docker 引擎已就绪（Server "+ver+"）")
+
+	// ---- 6. 把"镜像到底走哪条路"写进日志（D18）----
+	result.step(ctx, m.DockerMirrorRuntimeNote(ctx))
 	result.Message = "Docker 运行时安装完成，现在可以安装 Docker 类应用了"
 	return nil
 }

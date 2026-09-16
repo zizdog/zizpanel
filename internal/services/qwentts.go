@@ -97,6 +97,9 @@ const (
 	qwenHFMirror  = "https://hf-mirror.com"
 	qwenMinDiskGB = 10
 	qwenMinMemGB  = 15
+	// qwenReadyTimeout 是「等 Qwen 端口监听」的上限。首次加载模型要十几秒，
+	// 取 90 秒给慢机器留余量；超时即**如实失败**（见 waitQwenReady）。
+	qwenReadyTimeout = 90 * time.Second
 )
 
 // QwenLabel 是 Qwen 服务的 launchd 标签。别的包（如 web 的服务操作）
@@ -166,6 +169,24 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		return err
 	}
 
+	// ---- 0b. 基础依赖：ffmpeg ----
+	//
+	// 这一步是 2026-09-16 事故的**确切发生点**：mini 被抹机后由面板重装 Qwen TTS，
+	// 整条安装链里没有 ffmpeg（这个文件当时全文搜不到它）。mlx_audio 编码 mp3
+	// 必须靠 ffmpeg，于是装出来的服务"能启动、能回 wav、一合成 mp3 就返回
+	// HTTP 200 + 0 字节 body" —— 接收端只看到 IncompleteRead(0 bytes read)，
+	// 用户所有 TTS 作业全败，而安装任务**显示成功**、健康检查全绿。
+	// （Qwen 日志里 "RuntimeError: ffmpeg not found!" 出现 601 次。）
+	//
+	// 所以放在最前面、并要求致命失败：装不上 ffmpeg 就中止，绝不再交付
+	// 一个"看起来装好了"的半残服务。
+	// 先按目录里声明的 Requires 提示一句"需要 ffmpeg"，再真的装（两个动作分开，
+	// 是为了任务日志里"为什么需要"出现在"正在安装"之前）。
+	m.AnnounceAppDependencies(ctx, "qwen3tts", result)
+	if err := m.EnsureBaseDependencies(ctx, result); err != nil {
+		return fmt.Errorf("缺少基础依赖（TTS 编码 mp3 必需），已中止部署：%w", err)
+	}
+
 	// ---- 0. 前置检查：这两个不够会在装到一半时失败，且失败原因很难懂 ----
 	if err := m.checkQwenPreconditions(ctx, result); err != nil {
 		return err
@@ -231,15 +252,27 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		return err
 	}
 
-	// ---- 6. 验证：等端口起来（首次加载模型要十几秒）----
-	result.step(ctx, "正在等待服务加载模型（首次约十几秒）")
-	if !waitPort(ctx, qwenPort, 90*time.Second) {
-		result.Warning = fmt.Sprintf("服务已注册，但 %d 秒内 %d 端口未监听。"+
-			"可查看日志：%s", 90, qwenPort, p.ErrLog)
-		result.step(ctx, "警告："+result.Warning)
-		return nil
+	// ---- 6. 先登记进服务管理，再验收 ----
+	//
+	// 顺序是刻意的（2026-09-17 审计）：原来登记在验收**之后**，而验收失败
+	// 只写一条 Warning 就 return nil。一旦把验收改成如实失败（见 waitQwenReady），
+	// 登记留在后面就会留下「任务失败、服务管理里又找不到它」的查不下去的半成品。
+	// 先登记，失败时错误信息才能如实说「服务已登记，但端口没监听」。
+	// 登记失败**不**让整个部署失败：launchd 服务本身是好的、网站也连得上，
+	// 只是面板列表里暂时没有它（可在「可纳管」里手工加入）。这是刻意接受的降级，
+	// 理由：「能用但没登记」比「能用却报失败、让用户重装」更不容易造成损失；
+	// 下面的就绪验收仍会如实判定服务到底起没起来，并把登记结果写进失败信息。
+	registered := true
+	if err := m.RegisterInstalledService(ctx, qwenLabel, "Qwen3 TTS", "🗣️", "ai", qwenPort); err != nil {
+		registered = false
+		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
 	}
-	result.step(ctx, fmt.Sprintf("Qwen3 TTS 已就绪，监听 %d 端口", qwenPort))
+
+	// ---- 6b. 验证：端口真的在监听才算成功（首次加载模型要十几秒）----
+	result.step(ctx, "正在等待服务加载模型（首次约十几秒）")
+	if err := m.waitQwenReady(ctx, p, registered, result); err != nil {
+		return err
+	}
 
 	// 预热模型。首次加载需 20-30 秒，放在这里做掉，
 	// 网站上第一次请求就能直接出声，而不是让用户等半分钟以为坏了。
@@ -248,10 +281,23 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		result.step(ctx, fmt.Sprintf("已加载 %d 个模型，音色克隆可立即使用", n))
 	}
 
-	// 自动登记进服务管理（用户不必再手工纳管）
-	if err := m.RegisterInstalledService(ctx, qwenLabel, "Qwen3 TTS", "🗣️", "ai", qwenPort); err != nil {
-		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
+	// ---- 6c. 收尾验收：用**服务进程的 PATH** 真的跑一次 ffmpeg ----
+	//
+	// EnsureBaseDependencies 已经装过它，但"brew 说装好了"不等于"服务进程能用"：
+	// 动态库坏了、没链接上、或者服务进程的 PATH 里没有 Homebrew 都可能发生 ——
+	// 真机事故里最难查的正是这种"文件在、跑不通"的状态（服务照常启动，
+	// 只在合成 mp3 时才以"200 + 空 body"的形式暴露）。
+	// 所以这里按服务 plist 的 PATH 实跑 `ffmpeg -version`；失败就明确报错，
+	// 宁可任务显示失败，也不要交付一个一合成 mp3 就返回空 body 的服务。
+	if problems := m.VerifyBaseDependencies(ctx); len(problems) > 0 {
+		msg := "基础依赖验收未通过：" + describeDependencyProblems(problems) +
+			"。服务已注册，但合成 mp3 会失败（HTTP 200 + 空 body）；" +
+			"修好后请重新部署，或手工执行 `brew install ffmpeg`"
+		result.Warning = msg
+		result.step(ctx, "错误："+msg)
+		return fmt.Errorf("%s", msg)
 	}
+	result.step(ctx, "已确认 ffmpeg / ffprobe 可执行（mlx_audio 编码 mp3 依赖它）")
 
 	// ---- 7. 把插件要填的东西直接列出来 ----
 	// 这一步是"部署"和"能用"之间的差距：光装好服务，用户还得回去翻手册
@@ -263,14 +309,12 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		// 加了鉴权就必须有反代 —— 此时 Qwen 只监听 127.0.0.1，
 		// 网站**只能**通过 8899 访问。所以顺手把它一起装好，
 		// 否则用户会得到一个"装好了但连不上"的服务。
-		result.step(ctx, "",
-			"已选择加鉴权 → 继续部署对外入口（带共享密钥的反向代理）")
-		if err := m.InstallVoiceReceiver(ctx, result, ReceiverOptions{Token: opt.Token}); err != nil {
-			result.Warning = "Qwen 已就绪，但反向代理部署失败：" + err.Error() +
-				"（此时 8880 只监听本机，网站连不上，请重试）"
-			result.step(ctx, "警告："+result.Warning)
-		}
-		return nil
+		//
+		// 反代失败必须让**整个部署失败**（2026-09-17 审计，第 4 处同族缺陷）：
+		// 原来这里只写一条 Warning 就 return nil，任务显示「✅ 完成」，
+		// 而网站因为反代没起来根本连不上 —— 这正是我们在清的那一族
+		// 「能谎报成功」。详见 finishQwenAuthEntry。
+		return m.finishQwenAuthEntry(ctx, result, opt.Token, m.InstallVoiceReceiver)
 	}
 
 	result.Steps = append(result.Steps,
@@ -292,6 +336,82 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		"⚠️ 当前 8880 对全网开放且无鉴权：同内网任何人都能白用这块 GPU。",
 		"   如需音色克隆，再点「部署音色接收端」并把密钥留空即可。",
 	)
+	return nil
+}
+
+// waitQwenReady 等 Qwen 服务端口就绪。**超时返回错误，不是警告。**
+//
+// 2026-09-17 审计：原来这里 90 秒没起来只写一条 Warning 就 return nil ——
+// 任务于是显示「任务完成 ✅」，而 8880 根本没监听：qwen3tts 装完不能用，
+// 并且**连带 TtsVoice 全站失联**（网站只连这个端口）。这个早退还顺带跳过了
+// 后面的 ffmpeg 验收与 Address 回填。
+//
+// 现在改成如实失败，并把「装好了什么 / 还差什么 / 能做什么」写进错误里
+// （写法照抄 iopaint.go 的 waitIOPaintReady）。
+func (m *Manager) waitQwenReady(ctx context.Context, p qwenPaths, registered bool, result *InstallResult) error {
+	wait := readyWaitPort
+	state := "Python 环境、模型权重与 launchd 服务都已就位，服务也已登记进服务管理"
+	if !registered {
+		state = "Python 环境、模型权重与 launchd 服务都已就位" +
+			"（但登记进服务管理失败，可在「可纳管」里手动加入）"
+	}
+	return assertReady(ctx, readySpec{
+		What: "Qwen3 TTS 服务",
+		Expect: fmt.Sprintf("TCP 端口 %d 开始监听（网站与 TtsVoice 都只连这个端口）",
+			qwenPort),
+		Timeout: qwenReadyTimeout,
+		Probe: func(ctx context.Context) readyVerdict {
+			if wait(ctx, qwenPort, qwenReadyTimeout) {
+				return readyVerdict{OK: true,
+					Actual: fmt.Sprintf("已就绪，监听 %d 端口", qwenPort)}
+			}
+			return readyVerdict{Actual: fmt.Sprintf(
+				"连 127.0.0.1:%d 一直失败，端口始终没有监听", qwenPort)}
+		},
+		LogPath: p.ErrLog,
+		State:   state,
+		Missing: "但服务实际上不可用，网站与 TtsVoice 现在都连不上它。" +
+			"注意：模型权重已下载完成，所以这**不是**「还在下载模型」",
+		Remedy: "按下面的日志尾部里的报错修好后重新部署；" +
+			"也可以先在「服务管理」里点「重启服务」或执行 " +
+			"`sudo launchctl kickstart -k system/" + qwenLabel + "` 再重试",
+		Result: result,
+	})
+}
+
+// finishQwenAuthEntry 在「加鉴权」时部署对外入口（音色接收端反代），
+// 并把它失败时的后果**如实升级为整个部署失败**。
+//
+// 为什么这不是「可接受的降级」：加鉴权时 Qwen 只绑定 127.0.0.1，对外访问
+// **只能**经过这个反代。反代没起来 = 网站（TtsVoice）连不上，服务等于还没装成。
+// 让任务报成功只会让用户对着绿灯排查半天（2026-09-17 审计的第 4 处同族缺陷）。
+//
+// 为什么不套 assertReady：这不是「轮询等某个探针就绪」，而是一个子安装动作
+// 本身失败（InstallVoiceReceiver 内部已经做过它自己的就绪验收，并会返回带
+// 日志尾部的错误）。这里做的是「把它的失败升级为整单失败」，并把
+// 「哪一步成了 / 哪一步没成 / 用户能怎么办」讲清楚。
+//
+// deploy 作为参数传入而不是直接调 m.InstallVoiceReceiver：单测需要在不触发
+// 真实安装（要 root、要真 launchd）的前提下，锁死「失败必须升级」这条约束。
+func (m *Manager) finishQwenAuthEntry(ctx context.Context, result *InstallResult, token string,
+	deploy func(context.Context, *InstallResult, ReceiverOptions) error) error {
+
+	result.step(ctx, "",
+		"已选择加鉴权 → 继续部署对外入口（带共享密钥的反向代理）")
+	if err := deploy(ctx, result, ReceiverOptions{Token: token}); err != nil {
+		rp := m.receiverPaths()
+		msg := "反向代理（音色接收端）部署失败，已中止 Qwen3 TTS 部署：" + err.Error() +
+			"。当前状态：Qwen3 TTS 本身已就绪，并已登记为系统级 launchd 服务；" +
+			"但它只监听 127.0.0.1，对外入口没有起来，所以网站（TtsVoice）现在" +
+			"连不上 8880，服务等于还不能用。" +
+			"可以：① 按上面的报错处理后直接重试部署（每一步都是幂等的，已就绪的部分会跳过）；" +
+			"② 查看接收端日志 " + rp.ErrLog + " 里的报错；" +
+			"③ 如果你确实不需要鉴权，可以在部署时改选「不启用鉴权」——" +
+			"此时 Qwen 会绑定 0.0.0.0 让网站直连，但同内网任何人都能白用这块 GPU"
+		result.Warning = msg
+		result.step(ctx, "错误："+msg)
+		return fmt.Errorf("%s", msg)
+	}
 	return nil
 }
 
@@ -321,11 +441,18 @@ func (m *Manager) checkQwenPreconditions(ctx context.Context, result *InstallRes
 // pipInstall 装 pip 与 mlx-audio[server]。
 func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallResult) error {
 	pip := filepath.Join(p.Venv, "bin", "pip")
+	// pip 索引按"NAS 优先、探不通回落清华"现算（见 pypi_mirror.go），
+	// 选择与原因由它写进任务日志 —— 与 brew/HF 的"优先+回落"是同一套语义。
+	pipIdx, err := m.pipMirrorArgs(ctx, result)
+	if err != nil {
+		return err
+	}
 	// 先升级 pip：旧 pip 解析 mlx-audio 的依赖树可能失败
-	if out, err := m.runAsUser(ctx, 5*time.Minute, pip, "install", "-U", "pip", "-i", qwenPipMirror); err != nil {
+	if out, err := m.runAsUser(ctx, 5*time.Minute, pip,
+		append([]string{"install", "-U", "pip"}, pipIdx...)...); err != nil {
 		return fmt.Errorf("升级 pip 失败: %v（%s）", err, tailText(out, 300))
 	}
-	result.step(ctx, "pip 已升级（走清华源）")
+	result.step(ctx, "pip 已升级")
 
 	// 判断是否已装：重复执行时不该再花十几分钟重装
 	out, _ := m.runAsUser(ctx, time.Minute, pip, "list")
@@ -334,7 +461,8 @@ func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallRe
 		return nil
 	}
 	result.step(ctx, "正在安装 mlx-audio[server]（依赖较多，请耐心等待）")
-	if out, err := m.runAsUser(ctx, 40*time.Minute, pip, "install", "mlx-audio[server]", "-i", qwenPipMirror); err != nil {
+	if out, err := m.runAsUser(ctx, 40*time.Minute, pip,
+		append([]string{"install", "mlx-audio[server]"}, pipIdx...)...); err != nil {
 		return fmt.Errorf("安装 mlx-audio[server] 失败: %v（%s）", err, tailText(out, 500))
 	}
 	result.step(ctx, "mlx-audio[server] 安装完成")
@@ -463,7 +591,12 @@ func modelDownloaded(userHome, model string) bool {
 // 与手册的关键差异：这里用 LaunchDaemon + UserName，而不是
 // LaunchAgents。理由见文件头。
 func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *InstallResult, auth bool) error {
-	plist := qwenPlist(p, m.opt.UserName, auth)
+	// 端点按"NAS 优先"现算后写进 plist：安装期下载模型时已经算过一次，
+	// 但**服务进程**日后自己补拉模型（缓存被动过、换模型）时用的是 plist 里的值。
+	// 原来这里写死 hf-mirror.com —— 与安装期的选择不一致，等于面板配了 NAS
+	// 镜像、服务自己却永远走公网，属于"镜像优先"漏掉的一处。
+	hfEndpoint := m.qwenHFEndpoint(ctx)
+	plist := qwenPlist(p, m.opt.UserName, auth, hfEndpoint)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("写入 plist 失败: %w", err)
 	}
@@ -474,13 +607,16 @@ func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *I
 	if err := m.bootstrapService(ctx, qwenLabel, p.Plist); err != nil {
 		return err
 	}
+	result.step(ctx, "服务进程的 HuggingFace 端点："+hfEndpoint)
 	result.Steps = append(result.Steps,
 		"已注册为系统级后台服务（开机自启、不依赖用户登录）")
 	return nil
 }
 
 // qwenPlist 生成 LaunchDaemon 定义。
-func qwenPlist(p qwenPaths, user string, auth bool) string {
+//
+// hfEndpoint 由调用方按"NAS 优先"现算（m.qwenHFEndpoint）—— 见 installQwenService。
+func qwenPlist(p qwenPaths, user string, auth bool, hfEndpoint string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -530,7 +666,7 @@ func qwenPlist(p qwenPaths, user string, auth bool) string {
     <string>%s</string>
 </dict>
 </plist>
-`, qwenLabel, user, p.Python, qwenBindHost(auth), qwenPort, p.Root, qwenHFMirror, p.OutLog, p.ErrLog)
+`, qwenLabel, user, p.Python, qwenBindHost(auth), qwenPort, p.Root, hfEndpoint, p.OutLog, p.ErrLog)
 }
 
 // execCommandCtx 是 os/exec 的薄封装，便于本文件单独测试。
@@ -583,6 +719,13 @@ func atoiSafe(s string) int {
 }
 
 // primaryIP 返回本机局域网地址，用于拼给插件填的 URL。
+// PrimaryIP 导出给 web 层用：拼"服务实际跑在哪台机器上"的地址。
+//
+// 为什么不能让 web 层直接用请求里的客户端 IP：那是**浏览器**的地址，
+// 不是服务所在机器的地址 —— 2026-09-16 真机踩到，凭据弹窗里显示成了
+// 用户自己电脑的 192.168.1.179，而服务其实装在被管的那台机器上。
+func (m *Manager) PrimaryIP() string { return m.primaryIP() }
+
 func (m *Manager) primaryIP() string {
 	out := runOutput("/usr/sbin/ipconfig", "getifaddr", "en0")
 	if ip := strings.TrimSpace(out); ip != "" {

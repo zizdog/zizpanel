@@ -22,3 +22,6 @@ ZizPanel-当前状态.md
 
 # —— 历史下载包（二进制产物）——
 macos-lnmp-setup-v104.zip
+
+# —— 手工编译的 CLI（cmd/zizpanel-assets 的 15MB 产物，仓库里不放二进制）——
+/zizpanel-assets
