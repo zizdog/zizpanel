@@ -8,14 +8,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
 // 本文件是证书/账户的落盘层。关键约束：
 //
 //   - 私钥 privkey.pem 权限 0600：它不是「面板数据」，而是任何能读到它的进程
-//     都能冒充该站点 TLS 身份的最高敏感材料。0600 + 目录 0700 保证只有运行
-//     面板的用户（root 安装场景下就是 root）能读。
+//     都能冒充该站点 TLS 身份的最高敏感材料。0600 + 目录 0700 保证只有证书目录的
+//     属主（= DataDir 的属主）能读。
+//     注意：macOS 上 homebrew 的 nginx 是**以普通用户**运行的（LaunchAgent），
+//     而面板以 root 运行 —— root 写出的 0700/0600 文件 nginx 读不到，
+//     `nginx -t` 会报 Permission denied，连接 443 直接失败（mini 真机踩过）。
+//     所以 saveCert 结束时把属主对齐 DataDir（见 alignOwnerWithDataDir），
+//     既让 nginx 读得到，又不必把私钥放宽成全局可读。
 //   - 私钥内容绝不进日志、绝不进错误信息：日志会被任务中心持久化并展示给所有
 //     面板用户，错误信息也可能被原样回显；一旦写进去等于把密钥公开。
 //   - 写入用「临时文件 + rename」：nginx 可能在任意时刻读取 fullchain.pem，
@@ -121,7 +127,68 @@ func (m *Manager) saveCert(plan issuePlan, c *Cert, res *obtainedCert, req Issue
 	if err := writeFileAtomic(filepath.Join(dir, fileRenewal), data, keyFileMode); err != nil {
 		return err
 	}
+
+	// 让 nginx 读得到（见文件头关于 homebrew nginx 以普通用户运行的说明）。
+	m.alignOwnerWithDataDir()
 	return nil
+}
+
+// alignOwnerWithDataDir 把证书根目录及其内容改成与 DataDir 相同的属主。
+//
+// 为什么必须做（2026-09-16 mini 真机）：面板以 root 运行、nginx 以普通用户运行，
+// root 建出的 0700 目录 / 0600 私钥 nginx 读不到 —— `nginx -t` 报
+// `cannot load certificate ... Permission denied`，站点 SSL 绑定的 403 探针
+// 如实报"配置没生效"。本机 nginx 恰好是 root 起的，所以这个坑只在 mini 暴露。
+//
+// 为什么对齐 DataDir 而不是 chmod 放宽：DataDir 在安装时已经交给面板用户，
+// 对齐它即可让同用户的 nginx 读到，同时私钥仍然是 0600（不是全局可读）。
+//
+// 失败只告警不报错：签发与落盘已经成功，属主问题会在绑定站点时被 403 探针
+// 如实挡下 —— 那才是"能不能用"的判定点，这里不该把已成功的签发判成失败。
+func (m *Manager) alignOwnerWithDataDir() {
+	fi, err := os.Stat(m.dataDir)
+	if err != nil {
+		m.emit("警告：读不到数据目录属主（%v），证书文件属主未调整（nginx 可能读不到证书）", err)
+		return
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	uid, gid := int(st.Uid), int(st.Gid)
+
+	// certs/ 本身也要能被穿过；先目录后文件。
+	root := m.certsRoot()
+	if _, err := os.Stat(root); err != nil {
+		return
+	}
+	if err := os.Chown(root, uid, gid); err != nil {
+		m.emit("警告：调整 %s 属主失败（%v）", root, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		m.emit("警告：读取证书目录失败（%v）", err)
+		return
+	}
+	for _, e := range entries {
+		p := filepath.Join(root, e.Name())
+		if err := os.Chown(p, uid, gid); err != nil {
+			m.emit("警告：调整 %s 属主失败（%v）", p, err)
+			continue
+		}
+		if !e.IsDir() {
+			continue
+		}
+		sub, err := os.ReadDir(p)
+		if err != nil {
+			continue
+		}
+		for _, f := range sub {
+			if err := os.Chown(filepath.Join(p, f.Name()), uid, gid); err != nil {
+				m.emit("警告：调整 %s 属主失败（%v）", filepath.Join(p, f.Name()), err)
+			}
+		}
+	}
 }
 
 // renewalRecord 是续期所需的原始请求。
