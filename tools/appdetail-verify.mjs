@@ -78,6 +78,15 @@ page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
 // ---------- 2. 假数据：字段与后端 JSON 一一对应 ----------
 const MARKET = {
   docker: { available: true, version: '28.0.0', socket: '/var/run/docker.sock' },
+  // 板块顺序与中文名由后端给出（services.MarketSections → GET /api/v1/market 的 sections）。
+  // 前端**不该**自带分类中文名 —— 这一轮用户要求把最后一个板块从「其它」
+  // 改名为「基础环境」，所以下面直接断言前端渲染出来的标题就是后端给的那份。
+  sections: [
+    { key: 'site', label: '一键建站' },
+    { key: 'ai', label: 'AI 服务' },
+    { key: 'tool', label: '运维工具' },
+    { key: 'other', label: '基础环境', fallback: true },
+  ],
   list: [
     {
       id: 'frpc', name: 'frpc（frp 客户端）', icon: '🧷', category: 'tool', kind: 'native',
@@ -167,6 +176,20 @@ const MARKET = {
       service_label: 'com.zizdog.slowapp',
       uninstall: { kind: 'installer', service: 'com.zizdog.slowapp', steps: ['停止服务'] },
     },
+    {
+      // 一键建站类（category: site）：用来证明市场第一个板块「一键建站」确实渲染出来。
+      id: 'typecho', name: 'Typecho', icon: '📝', category: 'site', kind: 'native',
+      summary: '轻量博客程序', description: '一键装好并配好伪静态。', port: 0,
+      installed: false, adopted: false, available: true,
+      site_app: { rewrite: 'typecho', finish_path: '/install.php', needs_db: true, notes: [] },
+    },
+    {
+      // KindColima 的归类比对：它必须出现在「Docker」筛选档里（它就是 Docker 引擎）。
+      // category: runtime 没有专属板块 → 落在兜底板块「基础环境」。
+      id: 'docker-runtime', name: 'Docker 运行时（Colima）', icon: '🐳', category: 'runtime', kind: 'colima',
+      summary: '容器引擎，Docker 类应用的前提', description: 'Colima 容器运行时。', port: 0,
+      installed: false, adopted: false, available: true, panel_installer: 'docker-runtime',
+    },
   ],
 };
 
@@ -200,6 +223,11 @@ const CREDS = {
 
 await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
   window.__calls = [];
+  // 网站管理页的假数据：默认"一个站点都没有"（要验空站点列表时的大按钮），
+  // 测试里把它换成"有一个站点"再渲染一次（要验工具条上的次级按钮）。
+  window.__sitesPayload = {
+    list: [], presets: [], php_versions: [], www_root: '/Users/zizdog/www',
+  };
   window.fetch = async (url, init = {}) => {
     const u = String(url);
     const method = (init.method || 'GET').toUpperCase();
@@ -212,6 +240,7 @@ await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
     if (u.includes('/session')) return done({ user: { username: 'admin' }, config: { panel_entry: '/' } });
     if (u.includes('/market/proxies')) return done({ enabled: true, items: [] });
     if (/\/market(\?|$)/.test(u)) return done(MARKET);
+    if (/\/sites(\?|$)/.test(u)) return done(window.__sitesPayload);
     const m = u.match(/\/services\/([^/?]+)\/credentials/);
     if (m) {
       const name = decodeURIComponent(m[1]);
@@ -239,7 +268,10 @@ await page.goto(base + 'index.html', { waitUntil: 'domcontentloaded' });
 // ---------- 3. 渲染两个页面，采集按钮清单 ----------
 const result = await page.evaluate(async () => {
   const root = document.getElementById('root');
+  // 先清掉上一轮/上次运行留下的筛选记忆，保证"默认是全部"这一条可测。
+  try { localStorage.removeItem('zp-market-kind-filter'); } catch { /* 无 localStorage 也没关系 */ }
   const { AppsView } = await import('./apps.js');
+  const { SitesView } = await import('./sites.js');
   const { ServicesView } = await import('./services.js');
   const { openServicePanel } = await import('./servicePanel.js');
 
@@ -285,7 +317,14 @@ const result = await page.evaluate(async () => {
   const closeModal = () => { const m = document.querySelector('.modal-mask'); if (m) m.remove(); };
   const settle = () => new Promise((r) => setTimeout(r, 120));
 
-  const out = { market: {}, service: {}, panelFromMarket: {}, panelFromService: {}, timeout: {} };
+  const out = { market: {}, sites: {}, service: {}, panelFromMarket: {}, panelFromService: {}, timeout: {} };
+  // 网站管理页 LNMP 按钮的引用（见 ①c / ①e）；DOM 节点不进 out。
+  let lnmpListBtn = null;
+
+  // 采集市场板块标题（顺序有意义：兜底板块「基础环境」必须在最后）。
+  const sectionTitles = (box) => Array.from(box.querySelectorAll('.section-title'))
+    .map((e) => (e.textContent || '').trim()).filter(Boolean);
+  const cardNamesNow = (box) => Array.from(box.querySelectorAll('.grid > div')).map(cardName);
 
   // ---- ① 应用市场 ----
   const appsBox = document.createElement('div');
@@ -297,6 +336,17 @@ const result = await page.evaluate(async () => {
   out.market.cardNames = acards.map(cardName);
   out.market.buttons = {};
   for (const c of acards) out.market.buttons[cardName(c)] = btns(c);
+  // 板块标题与头部按钮：用来验「其它」已改名「基础环境」（且在最后），
+  // 以及市场顶部**不再有**「一键 LNMP」入口（它搬到了网站管理）。
+  out.market.sectionTitles = sectionTitles(appsBox);
+  const headBox = appsBox.querySelector('#apps-head');
+  out.market.headButtons = headBox
+    ? Array.from(headBox.querySelectorAll('button, a.btn')).map((b) => (b.textContent || '').trim()).filter(Boolean)
+    : null;
+  // 筛选下拉：默认「全部」，三个选项。
+  const filter = appsBox.querySelector('#apps-head select');
+  out.market.filterOptions = filter ? Array.from(filter.options).map((o) => o.textContent) : null;
+  out.market.filterDefault = filter ? filter.value : null;
   // 点开每个应用卡片上的「⚙️ 管理」（面板按钮已改名），逐个采面板快照。
   for (const c of acards) {
     const name = cardName(c);
@@ -307,7 +357,67 @@ const result = await page.evaluate(async () => {
     out.panelFromMarket[name] = panelSnapshot();
     closeModal();
   }
+
+  // ---- ①b 筛选：只看原生 / 只看 Docker（纯前端过滤，按 Kind） ----
+  if (filter) {
+    filter.value = 'native';
+    filter.dispatchEvent(new Event('change'));
+    await settle();
+    out.market.nativeCards = cardNamesNow(appsBox);
+    out.market.nativeSections = sectionTitles(appsBox);
+
+    filter.value = 'docker';
+    filter.dispatchEvent(new Event('change'));
+    await settle();
+    out.market.dockerCards = cardNamesNow(appsBox);
+    out.market.dockerSections = sectionTitles(appsBox);
+    // 选择要能保留：重新渲染一个全新的 AppsView（模拟刷新/切页面回来），
+    // 仍然停在 Docker 档（走 localStorage）；降级路径不会抛异常。
+    out.market.savedFilter = (() => { try { return localStorage.getItem('zp-market-kind-filter'); } catch { return null; } })();
+
+    const appsBox2 = document.createElement('div');
+    root.appendChild(appsBox2);
+    AppsView(appsBox2, {});
+    await settle(); await settle();
+    const filter2 = appsBox2.querySelector('#apps-head select');
+    out.market.persistedFilter = filter2 ? filter2.value : null;
+    out.market.persistedCards = cardNamesNow(appsBox2);
+    // 复原成「全部」，别让后续采集受筛选影响。
+    if (filter2) { filter2.value = ''; filter2.dispatchEvent(new Event('change')); }
+    await settle();
+    appsBox2.remove();
+  }
   appsBox.remove();
+
+  // ---- ①c 网站管理：一键 LNMP 入口的新位置 ----
+  //  空站点列表 → 中间的大按钮；有站点 → 工具条上的次级按钮。
+  const sitesBox = document.createElement('div');
+  root.appendChild(sitesBox);
+  SitesView(sitesBox, {});
+  await settle(); await settle();
+  out.sites.emptyButtons = btns(sitesBox);
+  // 说明文案必须如实写清"装什么 + 多久 + 长任务"。
+  const lnmpBtn = Array.from(sitesBox.querySelectorAll('button')).find((b) => (b.textContent || '').includes('LNMP'));
+  out.sites.hint = lnmpBtn ? (lnmpBtn.getAttribute('title') || '') : '';
+  sitesBox.remove();
+
+  window.__sitesPayload = {
+    list: [{ domain: 'demo.test', root: '/Users/zizdog/www/demo.test', conf_exists: true, enabled: true, php_version: '8.2', rewrite: 'generic', ssl_enabled: false }],
+    presets: [{ name: 'generic', label: '通用', description: '通用规则' }],
+    php_versions: [{ version: '8.2', running: true, listen_ok: true, pass: '/tmp/php82.sock', is_default: true }],
+    www_root: '/Users/zizdog/www',
+  };
+  const sitesBox2 = document.createElement('div');
+  root.appendChild(sitesBox2);
+  SitesView(sitesBox2, {});
+  await settle(); await settle();
+  out.sites.listButtons = btns(sitesBox2);
+  // 留一个引用（**不能放进 out**：DOM 节点无法从 page.evaluate 序列化回来）：
+  // 最后点击它，证明点下去走的是既有异步接口
+  // （POST /api/v1/market/install-lnmp → 202 + task_id），而不是同步请求。
+  lnmpListBtn = Array.from(sitesBox2.querySelectorAll('button'))
+    .find((b) => (b.textContent || '').includes('LNMP')) || null;
+  sitesBox2.remove();
 
   // ---- ② 服务管理 ----
   const svcBox = document.createElement('div');
@@ -340,6 +450,15 @@ const result = await page.evaluate(async () => {
   out.timeout.elapsedMs = Date.now() - t0;
   out.timeout.panel = panelSnapshot();
   closeModal();
+
+  // ---- ①e 点一下 LNMP 按钮：必须调用既有的异步接口 ----
+  //  用户明确要求"不要改成同步请求"：后端立刻返回 task_id（202），
+  //  进度交给任务中心。这里断言请求真的发到了 /market/install-lnmp 且是 POST。
+  if (lnmpListBtn) {
+    lnmpListBtn.click();
+    await settle();
+  }
+  out.sites.lnmpPostCall = window.__calls.find((c) => c.includes('/market/install-lnmp')) || null;
 
   out.calls = window.__calls.slice();
   return out;
@@ -418,6 +537,20 @@ console.log(`    结论  ${same ? '✓ 完全一致（同一个面板组件 serv
 console.log('\n=== 后端收到的请求（用于确认面板自己补查了服务记录）===');
 for (const c of result.calls) console.log('  ' + c);
 
+console.log('\n══════════ ⑦ 三处界面调整（LNMP 入口 / 筛选 / 板块改名）══════════');
+console.log(`  市场板块顺序：${show(result.market.sectionTitles)}`);
+console.log(`  市场顶部按钮：${show(result.market.headButtons)}`);
+console.log(`  筛选选项：${show(result.market.filterOptions)}  默认值="${result.market.filterDefault}"`);
+console.log(`  「原生」档卡片：${show(result.market.nativeCards)}`);
+console.log(`  「原生」档板块：${show(result.market.nativeSections)}`);
+console.log(`  「Docker」档卡片：${show(result.market.dockerCards)}`);
+console.log(`  「Docker」档板块：${show(result.market.dockerSections)}`);
+console.log(`  重渲染后筛选保留：${result.market.persistedFilter === 'docker' ? 'Docker ✓' : (result.market.persistedFilter || '(空)') + ' ✗'}`);
+console.log(`  网站管理（无站点）按钮：${show(result.sites.emptyButtons)}`);
+console.log(`  网站管理（有站点）按钮：${show(result.sites.listButtons)}`);
+console.log(`  LNMP 按钮 title：${result.sites.hint || '（空）'}`);
+console.log(`  LNMP 点击发出的请求：${result.sites.lnmpPostCall || '（无）'}`);
+
 // ---------- 断言 ----------
 for (const [slug, name, installed] of WANT) {
   const i = infoOf(name);
@@ -442,6 +575,54 @@ check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups
 check('超时兜底：面板一定落定（无"读取中"）', !/读取中|正在读取/.test(to.panelText || ''), to.status);
 check('超时兜底：在硬上限内落定', result.timeout.elapsedMs < 12000, result.timeout.elapsedMs + 'ms');
 check('市场 / 服务管理打开的是同一个面板', same);
+
+// ---------- 三处界面调整（用户本轮明确要求） ----------
+//
+// ① 一键 LNMP 入口搬到「网站管理」、市场里移除；
+// ② 市场顶部加「全部 / 原生 / Docker」筛选（按 Kind，纯前端，选择保留）；
+// ③ 市场最后一个板块「其它」改名「基础环境」（中文名只有后端一处定义）。
+const secTitles = result.market.sectionTitles || [];
+check('市场最后一个板块是「基础环境」', secTitles[secTitles.length - 1] === '基础环境', show(secTitles));
+check('市场不再出现旧板块名「其它」', !secTitles.includes('其它'), show(secTitles));
+check('市场板块顺序照后端来（一键建站 → AI 服务 → 运维工具 → 基础环境）',
+  JSON.stringify(secTitles) === JSON.stringify(['一键建站', 'AI 服务', '运维工具', '基础环境']), show(secTitles));
+check('市场顶部不再有「一键 LNMP」入口',
+  !(result.market.headButtons || []).some((t) => t.includes('LNMP')), show(result.market.headButtons));
+check('筛选下拉是「全部 / 原生 / Docker」三选一',
+  JSON.stringify(result.market.filterOptions) === JSON.stringify(['全部', '原生', 'Docker']),
+  show(result.market.filterOptions));
+check('筛选默认「全部」', result.market.filterDefault === '', String(result.market.filterDefault));
+// 原生档：原生应用在，compose 的 Uptime Kuma 与 KindColima 的 Docker 运行时都不在
+check('「原生」档只留原生应用（frpc/Nginx 在，Kuma/Colima 不在）',
+  (result.market.nativeCards || []).includes('frpc（frp 客户端）')
+  && (result.market.nativeCards || []).includes('Nginx')
+  && !(result.market.nativeCards || []).includes('Uptime Kuma')
+  && !(result.market.nativeCards || []).includes('Docker 运行时（Colima）'),
+  show(result.market.nativeCards));
+// Docker 档：compose + KindColima 都在（Colima 归 Docker 档），原生不在
+check('「Docker」档含 compose 与 KindColima（Colima 归 Docker 档）',
+  (result.market.dockerCards || []).includes('Uptime Kuma')
+  && (result.market.dockerCards || []).includes('Docker 运行时（Colima）')
+  && !(result.market.dockerCards || []).includes('frpc（frp 客户端）'),
+  show(result.market.dockerCards));
+check('筛选选择写入 localStorage', result.market.savedFilter === 'docker', String(result.market.savedFilter));
+check('重渲染后筛选选择保留（仍停在 Docker 档）',
+  result.market.persistedFilter === 'docker'
+  && (result.market.persistedCards || []).includes('Uptime Kuma'),
+  `value=${result.market.persistedFilter} cards=${show(result.market.persistedCards)}`);
+
+// 网站管理页的 LNMP 入口：空站点给大按钮，有站点给工具条次级按钮。
+check('网站管理（空站点）：有「一键 LNMP」入口',
+  (result.sites.emptyButtons || []).some((t) => t.includes('LNMP')), show(result.sites.emptyButtons));
+check('网站管理（有站点）：工具条上仍有「一键 LNMP」',
+  (result.sites.listButtons || []).some((t) => t.includes('LNMP')), show(result.sites.listButtons));
+check('LNMP 按钮文案说清装什么（nginx / PHP / MySQL / phpMyAdmin）',
+  ['nginx', 'PHP', 'MySQL', 'phpMyAdmin'].every((w) => result.sites.hint.includes(w)), result.sites.hint);
+check('LNMP 按钮文案提示耗时与长任务特性（分钟级 + 不中断/任务中心）',
+  /分钟/.test(result.sites.hint) && /(中断|任务中心)/.test(result.sites.hint), result.sites.hint);
+check('LNMP 按钮走既有异步接口 POST /market/install-lnmp（不是同步请求）',
+  /^POST .*\/market\/install-lnmp/.test(result.sites.lnmpPostCall || ''),
+  String(result.sites.lnmpPostCall));
 
 console.log('\n══════════ 断言结果 ══════════');
 let failed = 0;

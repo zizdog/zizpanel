@@ -120,10 +120,7 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 			"socket":    sock,
 			"version":   ver,
 		},
-		"categories": map[string]string{
-			"lnmp": "网站环境", "ai": "AI 服务", "tool": "运维工具",
-			"custom": "自定义", "other": "其它",
-		},
+		"categories": services.CategoryLabels(),
 	})
 }
 
@@ -567,6 +564,36 @@ func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) 
 
 // ---------- 应用市场 ----------
 
+// marketHiddenApps 是从应用市场列表里**刻意隐藏**的目录条目（ID → 为什么隐藏）。
+//
+// 为什么需要它：用户要求「一键 LNMP」的入口放在「网站管理」，市场里不要再出现，
+// 避免同一个动作有两处入口、用户不知道该点哪。后端能力
+// （POST /api/v1/market/install-lnmp）与目录条目本身都保留，只是不渲染成市场卡片。
+//
+// 当前 Catalog() 里并没有 ID=lnmp 的条目（LNMP 是组合动作、不是 App，见
+// internal/services/catalog.go 里「网站环境」那一段的说明），所以这条排除目前
+// 是**防御性**的：将来若有人把 lnmp 当成一个条目加进目录，它会立刻在这里被挡下，
+// 不必再改一遍市场渲染逻辑；同时也把"为什么不显示"写在了代码里，而不是靠记忆。
+var marketHiddenApps = map[string]string{
+	"lnmp": "一键 LNMP 的入口在「网站管理」（sites.js），不在应用市场，避免两处重复",
+}
+
+// marketVisibleApps 从目录里挑出要展示在市场里的条目：去掉 marketHiddenApps
+// 里刻意隐藏的那些（理由见该变量的说明）。
+//
+// 单独抽成一个函数是为了**可测试**：当前目录里没有 ID=lnmp 的条目，
+// 把这段逻辑写在 handleMarketList 里就只能等"将来真加了条目"才验证得到。
+func marketVisibleApps(apps []services.App) []services.App {
+	out := make([]services.App, 0, len(apps))
+	for _, a := range apps {
+		if _, hidden := marketHiddenApps[a.ID]; hidden {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	// 「已安装」必须看两个来源，缺一不可：
@@ -640,7 +667,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		Uninstall services.UninstallPlan `json:"uninstall"`
 	}
 	lanIP := s.lanIP()
-	apps := services.Catalog()
+	apps := marketVisibleApps(services.Catalog())
 	out := make([]item, 0, len(apps))
 	for _, a := range apps {
 		// 先看面板记录（ID / 名称 / label 三种写法都认），
@@ -773,8 +800,12 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 
 	sock, ver := s.cachedDocker()
 	ok(w, map[string]any{
-		"list":   out,
-		"docker": map[string]any{"available": sock != "", "socket": sock, "version": ver},
+		"list": out,
+		// sections 是市场板块的**顺序与中文名**（services.MarketSections）。
+		// 前端按它渲染板块标题，自己不再写一份分类中文名 ——
+		// 用户要求「其它」改名「基础环境」，改名只改 catalog.go 一处。
+		"sections": services.MarketSections(),
+		"docker":   map[string]any{"available": sock != "", "socket": sock, "version": ver},
 	})
 }
 

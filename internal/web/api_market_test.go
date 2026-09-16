@@ -253,3 +253,70 @@ func TestMarketComposeResidualOffersReinstall(t *testing.T) {
 		t.Error("要列出残留的 compose 目录路径，用户才知道会删什么")
 	}
 }
+
+// ============================================================================
+//  市场板块：最后一个板块是「基础环境」（单一来源）
+// ============================================================================
+
+// TestMarketExposesSectionsForBaseEnvironment 锁住两个接口契约：
+//  1. GET /api/v1/market 必须返回 sections —— 它是市场板块顺序与中文名的
+//     唯一数据源（前端 apps.js 不再自带分类中文名）；最后一个板块是兜底板块
+//     「基础环境」（原「其它」），且位置上确实在最后；
+//  2. 一键 LNMP 不作为市场条目出现（它的入口在「网站管理」，避免两处重复）。
+func TestMarketExposesSectionsForBaseEnvironment(t *testing.T) {
+	_, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/market", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("市场应 200，实际 %d", res.StatusCode)
+	}
+	data, _ := out["data"].(map[string]any)
+
+	secs, _ := data["sections"].([]any)
+	if len(secs) == 0 {
+		t.Fatal("市场接口必须返回 sections（前端不再自带分类中文名，缺了它只能退化成「全部应用」）")
+	}
+	last, _ := secs[len(secs)-1].(map[string]any)
+	if got := asString(last["label"]); got != "基础环境" {
+		t.Errorf("最后一个板块应为「基础环境」，实际 %q", got)
+	}
+	if last["fallback"] != true {
+		t.Errorf("最后一个板块应是兜底板块（fallback=true），实际 %v", last["fallback"])
+	}
+	for _, it := range secs {
+		m, _ := it.(map[string]any)
+		if asString(m["label"]) == "其它" {
+			t.Error("市场板块不该再出现旧名「其它」（用户要求改名为「基础环境」）")
+		}
+	}
+
+	list, _ := data["list"].([]any)
+	for _, it := range list {
+		m, _ := it.(map[string]any)
+		if asString(m["id"]) == "lnmp" {
+			t.Error("一键 LNMP 不该作为市场条目出现（入口在「网站管理」），见 marketHiddenApps")
+		}
+	}
+}
+
+// TestMarketVisibleAppsHidesHiddenIDs 覆盖"刻意排除"那段逻辑本身。
+//
+// 当前目录里没有 ID=lnmp 的条目，所以 handleMarketList 那条排除是**防御性**的；
+// 直接测 marketVisibleApps 才能在今天就证明它真的会把 lnmp 挡下，
+// 而不是等将来有人把 lnmp 加进目录才发现漏了。
+func TestMarketVisibleAppsHidesHiddenIDs(t *testing.T) {
+	got := marketVisibleApps([]services.App{{ID: "lnmp"}, {ID: "nginx"}, {ID: "php82"}})
+	if len(got) != 2 {
+		t.Fatalf("lnmp 必须从市场列表里被排除（入口在网站管理），实际 %d 个: %+v", len(got), got)
+	}
+	for _, a := range got {
+		if a.ID == "lnmp" {
+			t.Fatalf("lnmp 不该出现在市场可见条目里: %+v", got)
+		}
+	}
+	if reason := marketHiddenApps["lnmp"]; reason == "" {
+		t.Error("marketHiddenApps 里必须写清 lnmp 被隐藏的原因（代码就是注释）")
+	}
+}

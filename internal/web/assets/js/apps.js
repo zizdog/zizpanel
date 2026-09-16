@@ -33,6 +33,65 @@ let proxyState = null;
 let svcState = {};
 let svcStateLoaded = false;
 
+// ---------------- 分类筛选（全部 / 原生 / Docker） ----------------
+//
+// 用户要求："应用市场加「全部 / 原生 / Docker」下拉筛选，用于快速只看某一类。"
+// 只在前端过滤：市场数据本来就在手里（一次 GET /api/v1/market），
+// 再加一个接口只会多一次往返、切换筛选还更慢。
+//
+// 选择要能保留（刷新浏览器、切页面再回来都不丢），所以存 localStorage。
+// localStorage 在隐私模式 / 被禁用时会直接抛异常，因此读写都包 try：
+// 存不了就退化成"仅本次会话生效"，功能降级但**不报错**（不谎报"已记住"）。
+const KIND_FILTER_KEY = 'zp-market-kind-filter';
+const KIND_FILTERS = ['', 'native', 'docker'];
+
+function readKindFilter() {
+  try {
+    const v = localStorage.getItem(KIND_FILTER_KEY);
+    return KIND_FILTERS.includes(v) ? v : '';
+  } catch { return ''; }
+}
+
+function saveKindFilter(v) {
+  try { localStorage.setItem(KIND_FILTER_KEY, v); } catch { /* 存不了就算了 */ }
+}
+
+let kindFilter = readKindFilter();
+
+// kindGroupOf 把一个应用归到筛选档。
+//
+// KindColima（Colima 容器运行时）归到 **Docker** 档：它本身就是 Docker 引擎，
+// 用户想看"Docker 类"时一定也想看到它；单独给它一档会让下拉变成四项，
+// 而"原生 / Docker"问的是**怎么装**，Colima 显然是 Docker 那一侧。
+// 未知 Kind 归原生档（当前目录里不存在这种条目）。
+function kindGroupOf(a) {
+  if (a.kind === 'compose' || a.kind === 'docker' || a.kind === 'colima') return 'docker';
+  return 'native';
+}
+
+// kindFilterSelect 生成筛选下拉。放在函数里是因为头部每次刷新都会重画。
+//
+// onChange 由 AppsView 传进来（`renderGrid`）—— 这个函数在模块作用域，
+// 拿不到视图闭包里的 renderGrid；直接在里面调用会抛 ReferenceError
+// （下拉能改、localStorage 也写了，但列表纹丝不动）。
+function kindFilterSelect(onChange) {
+  const sel = h('select.select', {
+    style: { width: 'auto' },
+    title: '只看某一类应用：原生 = Homebrew / 官方 darwin 二进制；'
+      + 'Docker = 容器应用与 Colima 容器运行时',
+  }, [
+    h('option', { value: '', text: '全部', selected: kindFilter === '' }),
+    h('option', { value: 'native', text: '原生', selected: kindFilter === 'native' }),
+    h('option', { value: 'docker', text: 'Docker', selected: kindFilter === 'docker' }),
+  ]);
+  sel.addEventListener('change', () => {
+    kindFilter = KIND_FILTERS.includes(sel.value) ? sel.value : '';
+    saveKindFilter(kindFilter);
+    if (typeof onChange === 'function') onChange();
+  });
+  return sel;
+}
+
 // loadServiceStates 拉一次全部服务的状态（不带健康检查），并重画卡片。
 // 失败就保持空表 —— 宁可按"未知"渲染，也不让整个市场页打不开。
 async function loadServiceStates() {
@@ -113,15 +172,16 @@ export function AppsView(content, ctx = {}) {
         text: docker.available ? `Docker ${docker.version || '已就绪'}` : 'Docker 未安装',
         title: docker.available ? 'Docker socket: ' + docker.socket : 'Docker 类应用需要先安装 Docker（推荐 OrbStack）',
       }),
+      // 「全部 / 原生 / Docker」筛选（按 Kind 在前端过滤，选择记在 localStorage）。
+      kindFilterSelect(renderGrid),
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
-      // 顶部只保留"一键 LNMP"：它是个**组合动作**（装三个包 + 四处收尾工作），
-      // 在列表里没有对应的单个条目。其余项目都已进应用目录，
-      // 各自卡片上的按钮就是入口 —— 顶部重复放一遍只会让人不知道该点哪。
-      h('button.btn.btn-sm.btn-primary', {
-        text: '⚡ 一键安装 LNMP 环境',
-        title: '没装 Homebrew 时会先在面板里把 Homebrew 与命令行开发者工具装上（全程在面板内完成）',
-        onclick: installLNMP,
-      }),
+      // 「一键安装 LNMP 环境」已从这里**搬到「网站管理」页**（用户要求：它属于网站板块）。
+      // 为什么市场里不再保留这个入口：LNMP 是**组合动作**（nginx + PHP + MySQL
+      // + 默认站点 / vhosts / 系统级守护进程等收尾工作），不是单个可安装条目；
+      // 同一件事在两处给入口只会让用户不知道该点哪。
+      // 后端能力（POST /api/v1/market/install-lnmp）与目录条目都保留；目录里
+      // 本来也没有 ID=lnmp 的 App（见 catalog.go「网站环境」段的说明），所以市场
+      // 不会渲染出它的卡片；万一将来有人加进去，web 层的 marketHiddenApps 会挡下。
       h('button.btn.btn-sm', { text: '⚙️ 服务管理', onclick: () => { location.hash = '#/services'; } }),
       // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
       // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
@@ -170,19 +230,8 @@ export function AppsView(content, ctx = {}) {
     renderGrid();
   }
 
-  // installLNMP 一键装 nginx + PHP + MySQL，并做四件包管理管不到的收尾工作。
-  //
-  // 这一步可能跑十几分钟，所以它**不再**是"同步请求 + 事后打印步骤"：
-  // 后端立刻返回 task_id，进度由任务中心（tasks.js）用 SSE 实时展示。
-  // 关掉进度窗、切页面都不会中断安装 —— 任务跑在 context.Background() 上。
-  function installLNMP() {
-    taskCenter.start({
-      kind: 'install',
-      target: 'lnmp',
-      title: '一键安装 LNMP 环境',
-      start: () => api.installLNMP(),
-    });
-  }
+  // installLNMP 已搬到「网站管理」页（sites.js）：它是网站板块的环境准备动作。
+  // 这里只留一行注释说明去向，免得下次有人以为市场漏了这个入口。
 
   // randomToken 生成与后端同格式的密钥：ttsv- + 32 位十六进制
   function randomToken() {
@@ -374,32 +423,61 @@ export function AppsView(content, ctx = {}) {
 
   function renderGrid() {
     clear(grid);
-    const list = cache?.list || [];
-    if (!list.length) {
+    const all = cache?.list || [];
+    if (!all.length) {
       appendAll(grid, h('div.empty', [h('div.big', { text: '🧩' }), h('h4', { text: '应用目录为空' })]));
       return;
     }
 
-    // 按分类分组展示
-    const groups = [
-      { key: 'site', label: '一键建站' },
-      { key: 'ai', label: 'AI 服务' },
-      { key: 'tool', label: '运维工具' },
-      { key: 'other', label: '其它' },
-    ];
-    for (const g of groups) {
-      const items = list.filter((a) => (a.category || 'other') === g.key);
+    // 先按「全部 / 原生 / Docker」筛选（纯前端，见 kindGroupOf）。
+    const list = kindFilter ? all.filter((a) => kindGroupOf(a) === kindFilter) : all;
+    if (!list.length) {
+      appendAll(grid, h('div.empty', [
+        h('div.big', { text: '🔍' }),
+        h('h4', { text: '这一类暂时没有应用' }),
+        h('p', { text: '把上方的筛选切回「全部」就能看到全部应用。' }),
+      ]));
+      return;
+    }
+
+    // 分类板块的**顺序与中文名全部来自后端**（GET /api/v1/market 的 sections，
+    // 单一来源在 internal/services/catalog.go 的 MarketSections）。
+    // 前端不再自带一份分类中文名 —— 用户要求把最后一个板块「其它」改名为
+    // 「基础环境」，改名只改 catalog.go 一处，这里自动跟着变，不会再漂。
+    const sections = cache?.sections || [];
+    if (!sections.length) {
+      // 后端没给 sections（旧版本 / 接口异常）时的降级：不按分类分板块，
+      // 但**必须把应用都显示出来**，不能因为拿不到板块定义就留一片空白。
+      appendAll(grid,
+        h('div.section-title', { text: '全部应用' }),
+        h('div.grid.grid-3', list.map((a) => appCard(a))),
+      );
+      return;
+    }
+
+    const namedKeys = sections.filter((s) => !s.fallback).map((s) => s.key);
+    const fallback = sections.find((s) => s.fallback);
+    const covered = new Set();
+    for (const s of sections) {
+      const items = s.fallback
+        // 兜底板块收纳所有没有专属板块的分类（当前的 lnmp / runtime 都落在这里，
+        // 也就是 nginx / PHP / MySQL / Colima 容器运行时 —— 它们正是「基础环境」）。
+        ? list.filter((a) => !namedKeys.includes(a.category || 'other'))
+        : list.filter((a) => (a.category || 'other') === s.key);
       if (!items.length) continue;
-      appendAll(grid, 
-        h('div.section-title', { style: { marginTop: grid.childElementCount ? '20px' : '0' }, text: g.label }),
+      items.forEach((a) => covered.add(a));
+      appendAll(grid,
+        h('div.section-title', { style: { marginTop: grid.childElementCount ? '20px' : '0' }, text: s.label }),
         h('div.grid.grid-3', items.map((a) => appCard(a))),
       );
     }
-    // 兜底：没有分类的也显示出来
-    const rest = list.filter((a) => !['site', 'ai', 'tool', 'other'].includes(a.category || 'other'));
+    // 保险：后端万一没给兜底板块，把剩下的条目并进最后一个已有板块，
+    // 保证任何应用都不会"因为板块定义缺失而从页面上消失"。
+    const rest = list.filter((a) => !covered.has(a));
     if (rest.length) {
-      appendAll(grid, 
-        h('div.section-title', { style: { marginTop: '20px' }, text: '其它' }),
+      const title = fallback ? fallback.label : (sections[sections.length - 1].label || '');
+      appendAll(grid,
+        h('div.section-title', { style: { marginTop: '20px' }, text: title }),
         h('div.grid.grid-3', rest.map((a) => appCard(a))),
       );
     }

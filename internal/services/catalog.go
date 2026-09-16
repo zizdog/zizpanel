@@ -247,6 +247,81 @@ type CheckResult struct {
 	FixCmd  string `json:"fix_cmd"`
 }
 
+// ============================================================================
+// 应用分类：key 与中文显示名的**唯一来源**
+//
+// App.Category 存的是下面这些 **key**；中文名只在本文件里定义一次。
+//
+// 为什么必须集中定义：应用市场页曾经在前端硬编码了一份分类中文名
+// （apps.js 里的 `{ key: 'other', label: '其它' }`），与后端漂移了也没人发现。
+// 用户要求把市场最后一个板块「其它」改名为「基础环境」—— 如果前端再抄一份，
+// 下次改名还会漂。现在板块顺序与显示名都由 MarketSections() 给出，
+// 前端只按 key 分组、不再写任何分类中文名。
+// ============================================================================
+const (
+	CategorySite    = "site"    // 一键建站
+	CategoryAI      = "ai"      // AI 服务
+	CategoryTool    = "tool"    // 运维工具
+	CategoryLNMP    = "lnmp"    // 网站环境（服务管理里 nginx / PHP / MySQL 的归类）
+	CategoryRuntime = "runtime" // 容器运行时（Docker 运行时 Colima）
+	// CategoryOther 同时是**兜底分类**：目录里没有专属板块的分类
+	// （lnmp / runtime / 以及将来新增的）都会被它收下。
+	// 所以它的显示名取"最能描述这一整类"的 —— 用户 2026-09 要求显示为「基础环境」。
+	CategoryOther = "other"
+)
+
+// categoryLabels 是分类 key → 中文显示名的唯一字典。
+//
+// 只在本包内使用；导出的是副本（CategoryLabels），避免调用方改动它。
+var categoryLabels = map[string]string{
+	CategorySite:    "一键建站",
+	CategoryAI:      "AI 服务",
+	CategoryTool:    "运维工具",
+	CategoryLNMP:    "网站环境",
+	CategoryRuntime: "容器运行时",
+	CategoryOther:   "基础环境",
+	"custom":        "自定义",
+}
+
+// MarketSection 描述应用市场里的一个板块。
+type MarketSection struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	// Fallback 为 true 表示这是**兜底板块**：收纳所有没有专属板块的分类。
+	Fallback bool `json:"fallback,omitempty"`
+}
+
+// MarketSections 返回应用市场板块的**顺序与显示名**，是前端的唯一数据源。
+//
+// 两个硬约束：
+//  1. 显示名来自 categoryLabels（与 CategoryLabels 同源）——"改一处、到处生效"；
+//  2. 兜底板块必须排在**最后**（用户明确要求「基础环境」仍在最后一个板块）。
+//     它收纳的是没有专属板块的分类，排在中间会让后面的板块与它混在一起。
+func MarketSections() []MarketSection {
+	keys := []string{CategorySite, CategoryAI, CategoryTool, CategoryOther}
+	out := make([]MarketSection, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, MarketSection{
+			Key:      k,
+			Label:    categoryLabels[k],
+			Fallback: k == CategoryOther,
+		})
+	}
+	return out
+}
+
+// CategoryLabels 返回分类 key → 中文显示名的副本（服务列表接口用）。
+//
+// 与 MarketSections 共用 categoryLabels：应用市场改名时，服务管理那边
+// 同一个分类的显示名自动跟着变，不会只改一处。
+func CategoryLabels() map[string]string {
+	out := make(map[string]string, len(categoryLabels))
+	for k, v := range categoryLabels {
+		out[k] = v
+	}
+	return out
+}
+
 // Catalog 返回内置应用目录。
 //
 // 选品原则：优先"这台机器上真的用得上、且能自动装起来"的。
@@ -348,6 +423,17 @@ func Catalog() []App {
 		},
 
 		// ---------------- 网站环境（LNMP，原生安装） ----------------
+		//
+		// ⚠️ 这里只有**单个组件**（nginx / 各版本 PHP / MySQL），
+		// **没有** "lnmp" 这个条目 —— 「一键 LNMP」是一个组合动作
+		// （装三个包 + 默认站点 / vhosts 目录 / MySQL 初始化 / 系统级守护进程
+		// 等收尾工作，见 internal/services/lnmp.go），不是"一个可安装的应用"。
+		//
+		// 所以它本来就不会渲染成应用市场的卡片（市场只遍历 Catalog()）；
+		// 它的界面入口在「网站管理」页（站点为空时的大按钮 / 站点非空时的
+		// 工具条按钮，见 sites.js），后端能力仍是 POST /api/v1/market/install-lnmp。
+		// 市场上还刻意留了一条防御性排除（internal/web 的 marketHiddenApps），
+		// 万一将来有人真把 lnmp 加进目录，也不会在市场里冒出一张重复入口的卡片。
 		//
 		// 为什么这三条必须存在：面板最核心的功能是"网站管理"与"数据库"，
 		// 而它们依赖 nginx / PHP-FPM / MySQL。早期版本的安装脚本只提示

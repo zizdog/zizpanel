@@ -12,6 +12,9 @@ import {
   h, clear, toast, modal, confirmBox, $,
 } from './ui.js';
 import { state, registerCleanup } from './app.js';
+// 任务中心：LNMP 是长任务（十几分钟），提交后立刻返回 task_id，进度走 SSE。
+// 这里**不自己写进度轮询**，也绝不改成同步请求 —— 用户一刷新就把 brew 杀了。
+import { taskCenter } from './tasks.js';
 // 站点 SSL Tab 里的「使用 Let's Encrypt 证书」整块 UI 放在 certs.js：
 // 证书库与站点是两套生命周期，把它做成一个"自包含 + 自己异步填充"的组件，
 // sites.js 只负责挂上去，避免两个页面对证书数据各写一份渲染逻辑。
@@ -21,6 +24,42 @@ let cache = null; // 站点列表数据（含预设与 PHP 版本）
 
 // 站点详情面板当前所在的 Tab
 let detailTab = 'basic';
+
+// ---------------- 一键 LNMP 入口 ----------------
+//
+// 为什么这个入口在「网站管理」而不在「应用市场」（用户明确要求）：
+// LNMP 是网站功能的地基（新建站点、伪静态、SSL、数据库都依赖 nginx / PHP / MySQL），
+// 用户往往是在这一页才发现"环境还没装"；应用市场里放的是**单个应用**，
+// 而 LNMP 是组合动作（三件套 + 默认站点 / vhosts / 系统级守护进程等收尾），
+// 不是一张可安装的卡片（目录里也没有 ID=lnmp 的条目，见 services/catalog.go）。
+//
+// 文案要求（用户原话）：说清"会安装 nginx + PHP + MySQL + phpMyAdmin 等"，
+// 并**如实提示耗时与长任务特性** —— 十几分钟、关掉窗口不中断、进度在任务中心。
+const LNMP_HINT = '一键 LNMP 会安装 nginx + PHP 8.2 + MySQL 8.4 + phpMyAdmin（数据库管理界面），'
+  + '并完成默认站点、vhosts 目录、MySQL 初始化、系统级守护进程等收尾工作。'
+  + '全程约十几分钟（取决于网络与 Homebrew 下载/编译速度）。'
+  + '提交后立刻返回任务号，进度在「任务中心」实时显示 —— 关掉窗口、切换页面都不会中断安装。';
+
+function startLNMP() {
+  taskCenter.start({
+    kind: 'install',
+    // target 用 'lnmp'：与后端任务（POST /api/v1/market/install-lnmp → 202 + task_id）
+    // 保持一致，市场/任务中心的「查看进度」也按这个值找运行中的任务。
+    target: 'lnmp',
+    title: '一键安装 LNMP 环境',
+    start: () => api.installLNMP(),
+  });
+}
+
+// lnmpButton 生成 LNMP 入口按钮。big=true 用于站点列表为空时的**大按钮**，
+// 其余情况（列表非空）在工具条上给一个**次级按钮** —— 同一页不同时给两个大入口。
+function lnmpButton(big) {
+  return h('button.btn' + (big ? '.btn-primary' : '.btn-sm'), {
+    text: '⚡ 一键安装 LNMP 环境',
+    title: LNMP_HINT,
+    onclick: startLNMP,
+  });
+}
 
 export function SitesView(content, ctx = {}) {
   clear(content);
@@ -62,6 +101,7 @@ export function SitesView(content, ctx = {}) {
   function renderStatus() {
     clear(statusBar);
     const c = cache || {};
+    const list = c.list || [];
     const phps = c.php_versions || [];
     const phpRunning = phps.filter((p) => p.running).length;
     // "需要修复"= 该版本还没被面板配置成独立端点（仍写着 Homebrew 出厂的 9000）。
@@ -86,6 +126,9 @@ export function SitesView(content, ctx = {}) {
     }
     bar.push(
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      // LNMP 入口：站点非空时放工具条上的**次级按钮**；空列表时改用中间的大按钮
+      // （见 renderList 的空态），两处不同时出现，避免重复入口。
+      ...(list.length ? [lnmpButton(false)] : []),
       h('button.btn.btn-sm', {
         text: '🐘 PHP 环境',
         title: '查看已安装的 PHP 版本、各自的 FastCGI 端点与运行状态；一键修复端点',
@@ -137,9 +180,13 @@ export function SitesView(content, ctx = {}) {
       listBox.append(h('div.empty', [
         h('div.big', { text: '🌐' }),
         h('h4', { text: '还没有站点' }),
-        h('p', { text: '点击右上角「新建站点」，输入一个域名即可开始。' }),
-        h('div', { style: { marginTop: '16px' } }, [
-          h('button.btn.btn-primary', { text: '新建第一个站点', onclick: newSiteModal }),
+        h('p', { text: '新建站点需要 nginx + PHP + MySQL。环境还没装的话，用「一键 LNMP」一次装好；' +
+          '环境已就绪的话，直接新建站点即可。' }),
+        // 空列表时 LNMP 是**大按钮**（用户要求：醒目但不过度）：
+        // 没有环境的话，先建站点也跑不起来，所以它排在最前面。
+        h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
+          lnmpButton(true),
+          h('button.btn', { text: '新建第一个站点', onclick: newSiteModal }),
         ]),
       ]));
       return;
