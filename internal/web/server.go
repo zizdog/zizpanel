@@ -175,6 +175,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/proxies/test", s.requireAuth(s.handleProxyTest))
 	root.HandleFunc("POST /api/v1/proxies/{id}", s.requireAuth(s.handleProxyUpdate))
 	root.HandleFunc("POST /api/v1/proxies/{id}/toggle", s.requireAuth(s.handleProxyToggle))
+	// 反向代理的 HTTPS：与站点侧 /sites/{domain}/ssl 对称。
+	// acme 来源直接引用 <DataDir>/certs/<primary>/（续期同路径覆盖），
+	// self/mkcert/manual 落到 <DataDir>/proxy-certs/<规则>/。
+	root.HandleFunc("POST /api/v1/proxies/{id}/ssl", s.requireAuth(s.handleProxySSL))
+	root.HandleFunc("DELETE /api/v1/proxies/{id}/ssl", s.requireAuth(s.handleProxySSLDisable))
 	root.HandleFunc("DELETE /api/v1/proxies/{id}", s.requireAuth(s.handleProxyDelete))
 
 	root.HandleFunc("GET /api/v1/sites", s.requireAuth(s.handleSiteList))

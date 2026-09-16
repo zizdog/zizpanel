@@ -144,6 +144,11 @@ export const api = {
   proxyToggle: (id) => request('POST', `${API_BASE}/proxies/${id}/toggle`, {}),
   proxyDelete: (id) => request('DELETE', `${API_BASE}/proxies/${id}`),
   proxyTest: (target) => request('POST', `${API_BASE}/proxies/test`, { target }),
+  // HTTPS：与站点侧 siteSSL 对称（同一套 provider 取值：
+  // self / mkcert / manual / acme）。acme 只是"引用证书库里那张"，
+  // 申请仍走「SSL 证书」页的任务中心。
+  proxySSL: (id, payload) => request('POST', `${API_BASE}/proxies/${id}/ssl`, payload),
+  proxySSLDisable: (id) => request('DELETE', `${API_BASE}/proxies/${id}/ssl`),
 
   // ---- 站点管理 ----
   sites: () => request('GET', `${API_BASE}/sites`),

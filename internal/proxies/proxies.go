@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -45,8 +46,24 @@ type Rule struct {
 	// 不代理 WebSocket 基本等于半残，而"忘了开"是很难自查的问题。
 	Websocket bool `json:"websocket"`
 	// Enabled 为 false 时不生成配置（相当于停用，但规则留着）。
-	Enabled bool      `json:"enabled"`
-	Remark  string    `json:"remark"`
+	Enabled bool   `json:"enabled"`
+	Remark  string `json:"remark"`
+
+	// ---- HTTPS ----
+	//
+	// 字段命名与站点侧（sites.Site）逐字一致，这样证书来源、按域名匹配证书、
+	// 到期展示这些能力可以整套复用，不需要为反代再造一套概念。
+	//
+	// SSLProvider 的取值与站点侧相同：self / mkcert / manual / acme。
+	// acme 存的是**面板证书库的路径**（<DataDir>/certs/<primary>/...），
+	// 续期是同路径覆盖，所以这里绝不复制作副本。
+	SSLEnabled  bool   `json:"ssl_enabled"`
+	SSLCert     string `json:"ssl_cert"`
+	SSLKey      string `json:"ssl_key"`
+	SSLProvider string `json:"ssl_provider"`
+	// SSLExpires 只用于展示（真实到期时间以证书文件为准，见 proxySSLView）。
+	SSLExpires string `json:"ssl_expires"`
+
 	Created time.Time `json:"created_at"`
 	Updated time.Time `json:"updated_at"`
 }
@@ -61,6 +78,9 @@ func (r *Rule) Validate() error {
 	r.Path = strings.TrimSpace(r.Path)
 	r.Target = strings.TrimSpace(r.Target)
 	r.Remark = strings.TrimSpace(r.Remark)
+	r.SSLCert = strings.TrimSpace(r.SSLCert)
+	r.SSLKey = strings.TrimSpace(r.SSLKey)
+	r.SSLProvider = strings.ToLower(strings.TrimSpace(r.SSLProvider))
 
 	if r.Name == "" {
 		return fmt.Errorf("请填规则名称（只用于你自己识别，例如「NAS 镜像站」）")
@@ -77,6 +97,20 @@ func (r *Rule) Validate() error {
 	for _, d := range SplitDomains(r.Domains) {
 		if strings.ContainsAny(d, " /:\\") {
 			return fmt.Errorf("域名里有非法字符：%q（多个域名用逗号分隔，不要带 http:// 和端口）", d)
+		}
+	}
+	// HTTPS：只校验"有没有路径、是不是绝对路径"。
+	//
+	// 刻意不在这里 stat 证书文件：Validate 会被仓库层每次保存调用，
+	// 而"文件是否真的存在/能不能被 nginx 读"由应用配置时的请求级复核判定
+	// （见 internal/web/api_proxies.go 的 verifyProxyTLSServed）——
+	// 那是唯一有硬证据的判定点。
+	if r.SSLEnabled {
+		if r.SSLCert == "" || r.SSLKey == "" {
+			return fmt.Errorf("已启用 HTTPS 但缺少证书或私钥；请先到「SSL 证书」页申请，或在证书来源里选一张")
+		}
+		if !filepath.IsAbs(r.SSLCert) || !filepath.IsAbs(r.SSLKey) {
+			return fmt.Errorf("启用 HTTPS 时证书与私钥必须是绝对路径（当前 cert=%q key=%q）", r.SSLCert, r.SSLKey)
 		}
 	}
 	return nil
@@ -131,6 +165,28 @@ func (r *Rule) TargetHostPort() (string, int, error) {
 	return host, port, nil
 }
 
+// SSLProviderLabel 把证书来源翻译成界面可读的中文。
+//
+// 放在 proxies 包里是为了让"站点侧"与"反向代理侧"共用同一套文案
+// （web 包的 sslProviderLabel 直接委托到这里），避免同一个 provider
+// 在两个页面显示成两个名字。
+func SSLProviderLabel(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "self":
+		return "自签证书"
+	case "mkcert":
+		return "mkcert 本地 CA"
+	case "manual":
+		return "手工上传"
+	case "acme":
+		return "ACME 自动证书（Let's Encrypt 等）"
+	case "":
+		return "未配置"
+	default:
+		return provider
+	}
+}
+
 // SplitDomains 把逗号/空格分隔的域名列表拆开并去掉空项。
 func SplitDomains(s string) []string {
 	f := strings.FieldsFunc(s, func(r rune) bool {
@@ -160,6 +216,9 @@ func (r *Rule) VhostName() string { return fmt.Sprintf("proxy-%d", r.ID) }
 //     少一个都会让后端拿到错误的客户端信息；
 //   - WebSocket 需要 http 上下文里的 upgrade map，那个由面板保证存在
 //     （见 sites.UpgradeMapName），这里只负责引用。
+//
+// **未启用 SSL 时输出与加 HTTPS 之前逐字一致**（有黄金测试钉住）：
+// 历史规则不能被这次改动影响，否则一次升级就会改掉用户在用的所有反代配置。
 func (r *Rule) Generate(logDir string) (string, error) {
 	if err := r.Validate(); err != nil {
 		return "", err
@@ -176,8 +235,28 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		b.WriteString("# 规则：" + r.Name + "\n")
 	}
 	b.WriteString("server {\n")
-	fmt.Fprintf(&b, "\tlisten      %d;\n", r.Listen)
+	if r.SSLEnabled {
+		// 注意：nginx 对"同一端口上只要有 listen ... ssl，就要求该端口**每个**
+		// server 块都有 ssl_certificate"。所以兜底拒绝块也必须带证书，
+		// 见 GenerateRejectWithCert。
+		fmt.Fprintf(&b, "\tlisten      %d ssl;\n", r.Listen)
+	} else {
+		fmt.Fprintf(&b, "\tlisten      %d;\n", r.Listen)
+	}
 	fmt.Fprintf(&b, "\tserver_name %s;\n", serverName)
+
+	if r.SSLEnabled {
+		b.WriteString("\n\t# HTTPS（证书来源：" + SSLProviderLabel(r.SSLProvider) + "；acme 续期同路径覆盖，无需改这里）\n")
+		fmt.Fprintf(&b, "\tssl_certificate     %s;\n", r.SSLCert)
+		fmt.Fprintf(&b, "\tssl_certificate_key %s;\n", r.SSLKey)
+		b.WriteString("\tssl_protocols       TLSv1.2 TLSv1.3;\n")
+		b.WriteString("\tssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;\n")
+		b.WriteString("\tssl_prefer_server_ciphers off;\n")
+		b.WriteString("\tssl_session_cache   shared:SSL:10m;\n")
+		b.WriteString("\tssl_session_timeout 1d;\n")
+		b.WriteString("\tssl_stapling        off;\n")
+	}
+
 	b.WriteString("\n\t# 反代目标的真实地址（日志里用得上）\n")
 	fmt.Fprintf(&b, "\t# target: %s\n", r.Target)
 
@@ -291,6 +370,52 @@ func GenerateReject(port int, logDir string) string {
 	b.WriteString("server {\n")
 	fmt.Fprintf(&b, "\tlisten      %d default_server;\n", port)
 	b.WriteString("\tserver_name _;\n")
+	b.WriteString("\n\t# 域名对不上就断开，不把请求漏给后端\n")
+	b.WriteString("\treturn 444;\n")
+	if logDir != "" {
+		fmt.Fprintf(&b, "\n\taccess_log %s/proxy-reject-%d.access.log;\n", logDir, port)
+		fmt.Fprintf(&b, "\terror_log  %s/proxy-reject-%d.error.log;\n", logDir, port)
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// GenerateRejectWithCert 生成带证书行的兜底 server 块。
+//
+// 为什么需要它（2026-09-16 用 nginx 1.31.5 在本机 /tmp 沙箱实测）：
+// nginx 的规则是"同一 listen 端口上只要有**一个** server 块写了 `ssl`，
+// 那么该端口上**每个** server 块都必须能取到 ssl_certificate"，否则
+// `nginx -t` 直接 [emerg]：
+//
+//	no "ssl_certificate" is defined for the "listen ... ssl" directive
+//
+// 而反代的兜底拒绝块（proxy-reject-<port>.conf）默认不含证书。于是"给某端口
+// 开 HTTPS"这件事必须同时改两个文件，中间态很容易被 nginx 判死。两种形态：
+//
+//   - ssl=true ：最终形态 `listen <port> ssl default_server;` + 证书。
+//   - ssl=false：切换过程中的**中性形态** `listen <port> default_server;` + 证书。
+//     实测"带证书行的非 SSL server"在任何组合下都合法（端口上没有 ssl 时
+//     证书行只是没用上），所以先写它、再改规则 vhost，就不会出现非法中间态。
+//
+// certPath/keyPath 为空时退回完全不带证书的旧形态（保证非 SSL 端口输出逐字不变）。
+func GenerateRejectWithCert(port int, logDir, certPath, keyPath string, ssl bool) string {
+	if certPath == "" || keyPath == "" {
+		return GenerateReject(port, logDir)
+	}
+	var b strings.Builder
+	b.WriteString("# 由 ZizPanel「反向代理」生成 —— 请勿手工编辑（会被面板覆盖）\n")
+	b.WriteString("server {\n")
+	if ssl {
+		fmt.Fprintf(&b, "\tlisten      %d ssl default_server;\n", port)
+	} else {
+		fmt.Fprintf(&b, "\tlisten      %d default_server;\n", port)
+	}
+	b.WriteString("\tserver_name _;\n")
+	// 兜底块的证书只为满足 nginx「同端口 server 块都要有证书」的要求；
+	// 它永远 return 444，不会真的把一个正常请求当成该证书的站点来服务。
+	b.WriteString("\n\t# 仅用于满足 nginx：同端口有 ssl 时每个 server 块都要有证书\n")
+	fmt.Fprintf(&b, "\tssl_certificate     %s;\n", certPath)
+	fmt.Fprintf(&b, "\tssl_certificate_key %s;\n", keyPath)
 	b.WriteString("\n\t# 域名对不上就断开，不把请求漏给后端\n")
 	b.WriteString("\treturn 444;\n")
 	if logDir != "" {

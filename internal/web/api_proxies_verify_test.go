@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -86,7 +87,15 @@ func testProxyRule(id int64, listen int, domains string) *proxies.Rule {
 // 2026-09-14 正是因为这种漏沙箱化把生产的 000-default.conf 改坏、面板 502。
 func newProxyTestServer(t *testing.T) *Server {
 	t.Helper()
-	srv, _ := newTestServer(t)
+	srv, _ := newProxyTestServerTS(t)
+	return srv
+}
+
+// newProxyTestServerTS 与 newProxyTestServer 相同，但额外返回 httptest 服务器，
+// 供需要走真实 HTTP 路由（鉴权 / CSRF / 路径参数）的接口测试使用。
+func newProxyTestServerTS(t *testing.T) (*Server, *httptest.Server) {
+	t.Helper()
+	srv, ts := newTestServer(t)
 	dir := filepath.Join(srv.Cfg.BrewPrefix, "etc", "nginx", "vhosts")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -97,7 +106,7 @@ func newProxyTestServer(t *testing.T) *Server {
 		}
 	}
 	srv.Cfg.VhostDir = dir
-	return srv
+	return srv, ts
 }
 
 // appendToFile 模拟"这条规则自己的 nginx 访问日志长出了一行"。

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/acme"
+	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/scheduler"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -267,7 +268,7 @@ func (s *Server) certView(c *acme.Cert, now time.Time) certView {
 		CertPath:       c.CertPath,
 		KeyPath:        c.KeyPath,
 		UpdatedAt:      fmtCertTime(c.UpdatedAt),
-		ReferencedBy:   s.sitesUsingCert(c),
+		ReferencedBy:   s.certReferencedBy(c),
 		RenewThreshold: certRenewThresholdDays,
 		Status:         certStatusIssued,
 	}
@@ -679,10 +680,10 @@ func (s *Server) handleCertDelete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "证书不存在: "+err.Error())
 		return
 	}
-	if refs := s.sitesUsingCert(cert); len(refs) > 0 {
+	if refs := s.certReferencedBy(cert); len(refs) > 0 {
 		fail(w, http.StatusConflict,
-			"证书 "+cert.Primary+" 正被站点使用："+strings.Join(refs, "、")+
-				"；请先在这些站点里改用其它证书或关闭 SSL，再删除")
+			"证书 "+cert.Primary+" 正被使用："+strings.Join(refs, "、")+
+				"；请先在这些站点/规则里改用其它证书或关闭 SSL，再删除")
 		return
 	}
 	if err := mgr.Delete(cert.Primary); err != nil {
@@ -1216,6 +1217,24 @@ func ensureWellKnownLink(siteRoot, target string) string {
 // 长任务，必须走任务中心（POST /api/v1/certs）；站点 SSL 这个接口是同步的，
 // 让它挂几分钟既违反"长任务必须走任务中心"的约定，用户也看不到进度。
 func (s *Server) matchCertForSite(site *sites.Site, req siteSSLReq) (*acme.Cert, error) {
+	names := []string{strings.ToLower(site.Domain)}
+	for _, a := range site.AliasList() {
+		names = append(names, strings.ToLower(a))
+	}
+	return s.matchCertForNames(names, req.CertPrimary, req.Domain, site.Domain)
+}
+
+// matchCertForNames 是"按域名匹配证书"的共用内核（站点侧与反向代理侧都用它）。
+//
+// 匹配顺序（先精确、后宽松）：
+//  1. 请求显式指定的 cert_primary / domain；
+//  2. names 里的域名等于某证书的 primary；
+//  3. names 里的域名出现在某证书的 SAN 列表里（含 *.example.com 通配）。
+//
+// label 只用于拼"没匹配到"的错误信息（站点侧是域名，反代侧是规则的域名列表）。
+// 抽出来的原因：反代需要同一套能力，但两边"域名从哪来"完全不同；共用内核
+// 可以保证"同名证书在两处匹配结果一致"，也避免复制出错。
+func (s *Server) matchCertForNames(names []string, certPrimary, domain, label string) (*acme.Cert, error) {
 	list, err := s.certManager().List()
 	if err != nil {
 		return nil, fmt.Errorf("读取证书列表失败: %w", err)
@@ -1224,9 +1243,9 @@ func (s *Server) matchCertForSite(site *sites.Site, req siteSSLReq) (*acme.Cert,
 		return nil, fmt.Errorf("还没有任何 ACME 证书：请先到「证书」页申请（DNS-01 或 HTTP-01）后再回来绑定")
 	}
 
-	want := strings.ToLower(strings.TrimSpace(req.CertPrimary))
+	want := strings.ToLower(strings.TrimSpace(certPrimary))
 	if want == "" {
-		want = strings.ToLower(strings.TrimSpace(req.Domain))
+		want = strings.ToLower(strings.TrimSpace(domain))
 	}
 	if want != "" {
 		for _, c := range list {
@@ -1236,12 +1255,14 @@ func (s *Server) matchCertForSite(site *sites.Site, req siteSSLReq) (*acme.Cert,
 		}
 	}
 
-	names := []string{strings.ToLower(site.Domain)}
-	for _, a := range site.AliasList() {
-		names = append(names, strings.ToLower(a))
+	all := make([]string, 0, len(names)+1)
+	for _, n := range names {
+		if n = strings.ToLower(strings.TrimSpace(n)); n != "" {
+			all = append(all, n)
+		}
 	}
 	if want != "" {
-		names = append(names, want)
+		all = append(all, want)
 	}
 
 	// 优先 SAN 里精确命中的
@@ -1250,7 +1271,7 @@ func (s *Server) matchCertForSite(site *sites.Site, req siteSSLReq) (*acme.Cert,
 			continue
 		}
 		for _, d := range certDomainList(c) {
-			for _, n := range names {
+			for _, n := range all {
 				if strings.EqualFold(d, n) {
 					return c, nil
 				}
@@ -1263,18 +1284,28 @@ func (s *Server) matchCertForSite(site *sites.Site, req siteSSLReq) (*acme.Cert,
 			continue
 		}
 		for _, d := range certDomainList(c) {
-			for _, n := range names {
+			for _, n := range all {
 				if wildcardMatches(d, n) {
 					return c, nil
 				}
 			}
 		}
 	}
-	if want != "" && want != strings.ToLower(site.Domain) {
-		return nil, fmt.Errorf("找不到证书 %q：请到「证书」页确认 primary（或先申请）", req.CertPrimary)
+	if want != "" && want != strings.ToLower(label) {
+		return nil, fmt.Errorf("找不到证书 %q：请到「证书」页确认 primary（或先申请）", certPrimary)
 	}
 	return nil, fmt.Errorf("没有覆盖域名 %s 的 ACME 证书：请先到「证书」页申请，"+
-		"申请成功后回到这里选择来源「ACME 自动证书」即可绑定", site.Domain)
+		"申请成功后回到这里选择来源「ACME 自动证书」即可绑定", label)
+}
+
+// certReferencedBy 汇总所有引用该证书的资源（站点 + 反向代理规则）。
+//
+// 证书删除保护与列表页的"被谁引用"都要看两类引用：只查站点会让一条正在被
+// 反代规则使用的证书被删掉 —— 那会让 vhost 里的 ssl_certificate 指向不存在的
+// 文件，nginx 下次 reload 直接 [emerg]，影响的是整台机器上所有站点。
+func (s *Server) certReferencedBy(c *acme.Cert) []string {
+	refs := s.sitesUsingCert(c)
+	return append(refs, s.proxiesUsingCert(c)...)
 }
 
 // sitesUsingCert 返回正在引用该证书的站点域名列表。
@@ -1302,27 +1333,31 @@ func (s *Server) sitesUsingCert(c *acme.Cert) []string {
 	return out
 }
 
-// reloadSitesUsingCert 让引用了这张证书的站点重新生成 vhost 并重载 nginx。
+// reloadSitesUsingCert 让引用了这张证书的站点/反向代理规则重新生成 vhost 并重载 nginx。
 //
 // 为什么必须做：续期是**同路径覆盖**证书文件，而 nginx 只在 reload 时重新读盘；
 // 不 reload 的话证书文件换了、线上还是旧证书（浏览器继续提示即将过期）。
+//
+// 注意这里必须**同时**覆盖反向代理规则：反代侧 acme 来源引用的是同一份
+// <DataDir>/certs/<primary>/ 路径，续期后同样需要重载才会生效。
 func (s *Server) reloadSitesUsingCert(ctx context.Context, c *acme.Cert, log tasks.LogFunc) error {
-	refs := s.sitesUsingCert(c)
+	refs := s.certReferencedBy(c)
 	if len(refs) == 0 {
 		if log != nil {
-			log(tasks.LevelOut, "没有站点引用这张证书，无需重载 nginx")
+			log(tasks.LevelOut, "没有站点或反向代理规则引用这张证书，无需重载 nginx")
 		}
 		return nil
 	}
 	if log != nil {
-		log(tasks.LevelStep, "重载引用该证书的站点: "+strings.Join(refs, "、"))
+		log(tasks.LevelStep, "重载引用该证书的站点/规则: "+strings.Join(refs, "、"))
 	}
+	var failed []string
+
 	mgr := s.siteMgr()
 	list, err := mgr.List(ctx)
 	if err != nil {
 		return fmt.Errorf("读取站点列表失败: %w", err)
 	}
-	var failed []string
 	for _, st := range list {
 		if st == nil || !st.SSLEnabled || st.SSLCert == "" {
 			continue
@@ -1343,8 +1378,33 @@ func (s *Server) reloadSitesUsingCert(ctx context.Context, c *acme.Cert, log tas
 			log(tasks.LevelOK, "站点 "+st.Domain+" 已重载新证书")
 		}
 	}
+
+	proxiesList, perr := s.proxyRepo().List(ctx)
+	if perr != nil {
+		return fmt.Errorf("读取反向代理规则失败: %w", perr)
+	}
+	for _, rule := range proxiesList {
+		if rule == nil || !rule.Enabled || !rule.SSLEnabled || rule.SSLCert == "" {
+			continue
+		}
+		if filepath.Clean(rule.SSLCert) != filepath.Clean(c.CertPath) {
+			continue
+		}
+		// applyProxy 同样写 vhost → reload → 请求级复核（含取回真实证书比对）。
+		if err := s.applyProxy(ctx, rule); err != nil {
+			failed = append(failed, "反向代理「"+rule.Name+"」: "+err.Error())
+			if log != nil {
+				log(tasks.LevelErr, "反向代理规则 "+rule.Name+" 重载失败: "+err.Error())
+			}
+			continue
+		}
+		if log != nil {
+			log(tasks.LevelOK, "反向代理规则 "+rule.Name+" 已重载新证书")
+		}
+	}
+
 	if len(failed) > 0 {
-		return fmt.Errorf("%d 个站点重载失败: %s", len(failed), strings.Join(failed, "；"))
+		return fmt.Errorf("%d 个站点/规则重载失败: %s", len(failed), strings.Join(failed, "；"))
 	}
 	return nil
 }
@@ -1596,21 +1656,11 @@ func fileExists(p string) bool {
 }
 
 // sslProviderLabel 把证书来源翻译成界面可读的中文。
+//
+// 直接委托到 proxies.SSLProviderLabel：站点侧与反向代理侧必须显示同一个
+// 名字，否则同一张 "acme" 证书在两页会叫成两个东西。
 func sslProviderLabel(provider string) string {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "self":
-		return "自签证书"
-	case "mkcert":
-		return "mkcert 本地 CA"
-	case "manual":
-		return "手工上传"
-	case "acme":
-		return "ACME 自动证书（Let's Encrypt 等）"
-	case "":
-		return "未配置"
-	default:
-		return provider
-	}
+	return proxies.SSLProviderLabel(provider)
 }
 
 // siteSSLDaysLeft 从证书文件读剩余天数；读不到返回 -1（表示"无法判断"，不猜）。

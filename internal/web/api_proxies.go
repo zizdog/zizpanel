@@ -2,6 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -10,10 +13,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/acme"
 	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/sites"
+	"github.com/zizdog/zizpanel/internal/tlsx"
 )
 
 // ============================================================================
@@ -108,7 +114,80 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"domain_guard":   domainGuard,
 		"reject_written": rejectErr == nil,
 		"reject_path":    reject,
+		// HTTPS：既要能被列表行直接读（ssl_enabled 等平铺字段），
+		// 也要有一份"证书文件实际内容"的汇总（ssl.days_left / ssl.domains）。
+		"ssl_enabled":  rule.SSLEnabled,
+		"ssl_cert":     rule.SSLCert,
+		"ssl_key":      rule.SSLKey,
+		"ssl_provider": rule.SSLProvider,
+		"ssl_expires":  rule.SSLExpires,
+		"ssl":          s.proxySSLView(rule),
 	}
+}
+
+// proxySSLView 汇总反代规则证书的展示字段（与站点侧 siteSSLView 同一套口径）。
+//
+// 到期时间优先取自**真实证书文件**：文件才是 nginx 实际加载的东西，
+// 数据库里的 ssl_expires 只是上一次写入时的快照（acme 续期后可能还没更新）。
+// 读不到文件时如实标出 renew_hint，绝不显示成"正常"。
+func (s *Server) proxySSLView(rule *proxies.Rule) map[string]any {
+	v := map[string]any{
+		"enabled":        rule.SSLEnabled,
+		"provider":       rule.SSLProvider,
+		"provider_label": proxies.SSLProviderLabel(rule.SSLProvider),
+		"cert_path":      rule.SSLCert,
+		"key_path":       rule.SSLKey,
+		"expires":        rule.SSLExpires,
+		"not_after":      "",
+		"days_left":      -1,
+		"domains":        []string{},
+		"renew_hint":     "",
+	}
+	if !rule.SSLEnabled || rule.SSLCert == "" {
+		return v
+	}
+	if names := certDomainNames(rule.SSLCert); len(names) > 0 {
+		v["domains"] = names
+	}
+	if notAfter, err := tlsx.CertExpiry(rule.SSLCert); err == nil && !notAfter.IsZero() {
+		days := int(time.Until(notAfter).Hours() / 24)
+		v["not_after"] = notAfter.Format(time.RFC3339)
+		v["expires"] = notAfter.Format("2006-01-02 15:04:05")
+		v["days_left"] = days
+		switch {
+		case days < 0:
+			v["renew_hint"] = "证书已过期，请立即续期或重新绑定"
+		case days <= certRenewThresholdDays:
+			v["renew_hint"] = fmt.Sprintf("证书将在 %d 天内到期", days)
+		}
+		return v
+	}
+	v["renew_hint"] = "无法读取证书文件（可能已被删除或权限不足）"
+	return v
+}
+
+// certDomainNames 读取证书覆盖的域名（SAN，缺省退回 CN）。
+//
+// 纯 Go 解析，不起 openssl 子进程：列表页每次刷新都要显示证书域名，
+// 不值得为它 fork。
+func certDomainNames(certPath string) []string {
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	names := append([]string{}, crt.DNSNames...)
+	if len(names) == 0 && crt.Subject.CommonName != "" {
+		names = append(names, crt.Subject.CommonName)
+	}
+	return names
 }
 
 func (s *Server) nginxInstalled() bool {
@@ -161,6 +240,17 @@ type proxyReq struct {
 	Websocket    *bool   `json:"websocket"`
 	Enabled      *bool   `json:"enabled"`
 	Remark       *string `json:"remark"`
+
+	// HTTPS 字段。**签发/选择证书不走这个接口**，走
+	// POST /api/v1/proxies/{id}/ssl（与站点侧的 SSL Tab 对称）。
+	// 这里带上它们是为了：
+	//   - 前端"关闭 HTTPS"时能一次性把 ssl_enabled=false 落库；
+	//   - 允许高级用法直接指定已有证书路径。
+	SSLEnabled  *bool   `json:"ssl_enabled"`
+	SSLCert     *string `json:"ssl_cert"`
+	SSLKey      *string `json:"ssl_key"`
+	SSLProvider *string `json:"ssl_provider"`
+	SSLExpires  *string `json:"ssl_expires"`
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -191,6 +281,29 @@ func (req proxyReq) apply(rule *proxies.Rule) {
 	if req.Remark != nil {
 		rule.Remark = *req.Remark
 	}
+	if req.SSLCert != nil {
+		rule.SSLCert = *req.SSLCert
+	}
+	if req.SSLKey != nil {
+		rule.SSLKey = *req.SSLKey
+	}
+	if req.SSLProvider != nil {
+		rule.SSLProvider = *req.SSLProvider
+	}
+	if req.SSLExpires != nil {
+		rule.SSLExpires = *req.SSLExpires
+	}
+	if req.SSLEnabled != nil {
+		rule.SSLEnabled = *req.SSLEnabled
+		// 关闭 HTTPS 时把证书字段一并清空：留着旧路径会让"已关闭"的规则
+		// 在数据库里看起来还引用着某张证书（证书页也据此判断能否删除）。
+		if !*req.SSLEnabled {
+			rule.SSLCert = ""
+			rule.SSLKey = ""
+			rule.SSLProvider = ""
+			rule.SSLExpires = ""
+		}
+	}
 }
 
 // handleProxyCreate 新建规则：先校验、查冲突、再落库并应用。
@@ -214,6 +327,10 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, fmt.Sprintf(
 			"和已有规则「%s」（同端口 %d、同域名/路径）冲突：nginx 只会用先加载的那一条，"+
 				"请改端口、域名或路径", other.Name, other.Listen))
+		return
+	}
+	if err := s.checkProxySSLPortMix(r.Context(), rule); err != nil {
+		fail(w, http.StatusConflict, err.Error())
 		return
 	}
 	created, err := s.proxyRepo().Create(r.Context(), rule)
@@ -270,11 +387,28 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 			"和规则「%s」（同端口 %d、同域名/路径）冲突，nginx 只会用先加载的那一条", other.Name, other.Listen))
 		return
 	}
+	if err := s.checkProxySSLPortMix(r.Context(), &next); err != nil {
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
 	// 先按新配置写盘（含 nginx -t 校验、失败回滚），成功后才更新数据库 ——
 	// 反过来的话，配置写失败会留下"数据库说已改、文件还是旧的"的不一致。
 	next.ID = cur.ID
+	// SSL 开关切换时，该端口的域名兜底块必须先进入"带证书的中性形态"，
+	// 否则中间态会被 nginx 判成 [emerg]（见 stabilizeProxyReject）。
+	if next.SSLEnabled != cur.SSLEnabled && next.Enabled {
+		cert, key := next.SSLCert, next.SSLKey
+		if cert == "" || key == "" {
+			cert, key = cur.SSLCert, cur.SSLKey
+		}
+		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cert, key); err != nil {
+			fail(w, http.StatusBadGateway, "切换 HTTPS 时调整域名兜底块失败："+err.Error())
+			return
+		}
+	}
 	if err := s.applyProxy(r.Context(), &next); err != nil {
-		_ = s.applyProxy(r.Context(), cur) // 回滚成旧配置
+		_ = s.applyProxy(r.Context(), cur)  // 回滚成旧配置
+		_ = s.syncRejectBlocks(r.Context()) // 兜底块也回到数据库描述的状态
 		fail(w, http.StatusBadGateway, "应用新配置失败（已回滚）："+err.Error())
 		return
 	}
@@ -363,6 +497,10 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 	next := *cur
 	next.Enabled = !cur.Enabled
 	if next.Enabled {
+		if err := s.checkProxySSLPortMix(r.Context(), &next); err != nil {
+			fail(w, http.StatusConflict, err.Error())
+			return
+		}
 		if err := s.applyProxy(r.Context(), &next); err != nil {
 			fail(w, http.StatusBadGateway, "启用失败："+err.Error())
 			return
@@ -404,6 +542,343 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	}
 	reachable, detail := probeTarget(r.Context(), strings.TrimSpace(req.Target))
 	ok(w, map[string]any{"ok": reachable, "detail": detail})
+}
+
+// ============================================================================
+//  反向代理 SSL
+//
+//  与「网站管理」的 SSL Tab 是同一套体验，只是入口挂到反代规则上：
+//    self / mkcert / manual 三种来源把证书放到 <DataDir>/proxy-certs/<规则>/；
+//    acme **直接引用面板证书库路径**（<DataDir>/certs/<primary>/fullchain.pem），
+//    绝不复制 —— 续期是同路径覆盖，复制一份会让续期后线上还是旧证书。
+//
+//  写盘 → reload → 请求级复核与站点侧一致：复核不通过一律非 2xx。
+// ============================================================================
+
+// proxySSLReq 是 POST /api/v1/proxies/{id}/ssl 的请求体。
+//
+// 字段与站点侧 siteSSLReq 刻意保持一致（provider/cert/key/extra_san/
+// cert_primary/domain），这样前端只需要维护一套交互，后端也能复用匹配逻辑。
+type proxySSLReq struct {
+	Provider string   `json:"provider"` // self / mkcert / manual / acme
+	Cert     string   `json:"cert"`
+	Key      string   `json:"key"`
+	ExtraSAN []string `json:"extra_san"`
+
+	// CertPrimary 指定要绑定的 ACME 证书（primary 名）。
+	// 不给时按规则域名自动匹配（见 matchCertForProxy）。
+	CertPrimary string `json:"cert_primary"`
+	// Domain 是 cert_primary 的容错写法：前端直接给一个域名也能匹配。
+	Domain string `json:"domain"`
+}
+
+// proxyCertHosts 返回给自签 / mkcert 用的域名列表。
+//
+// 规则可以没有域名（匹配该端口上所有 Host）。那种情况下没有可放进 SAN 的名字，
+// 用 127.0.0.1 兜底（自签与 mkcert 都能签 IP），至少不生成一张空 SAN 的证书。
+func proxyCertHosts(rule *proxies.Rule) []string {
+	domains := proxies.SplitDomains(rule.Domains)
+	if len(domains) == 0 {
+		return []string{"127.0.0.1"}
+	}
+	return domains
+}
+
+// proxyCertDir 是 self/mkcert/manual 三种来源的证书目录。
+//
+// 用 VhostName()（proxy-<id>）而不是规则名：规则名是中文且可能重复，
+// 做目录名既危险又不稳。
+func (s *Server) proxyCertDir(rule *proxies.Rule) string {
+	return filepath.Join(s.Cfg.DataDir, "proxy-certs", rule.VhostName())
+}
+
+// alignProxyCertOwner 把证书目录的属主对齐到 DataDir 的属主。
+//
+// 与 internal/acme/store.go 的 alignOwnerWithDataDir 是同一个真机坑：
+// macOS 上 homebrew 的 nginx 以**普通用户**运行，而面板以 root 运行 ——
+// root 用 0600 写出的私钥 nginx 读不到（`nginx -t` 报 Permission denied，
+// 443 直接连不上）。对齐 DataDir 属主即可让同用户的 nginx 读到，同时私钥
+// 仍是 0600，而不是放宽成全局可读。
+//
+// 失败只告警不报错：绑定是否真的成功由随后的请求级 TLS 复核判定
+// （会取回真实证书比对），属主不对一定会在那里被如实挡下。
+func (s *Server) alignProxyCertOwner(dir string) {
+	if dir == "" || os.Geteuid() != 0 {
+		return
+	}
+	fi, err := os.Stat(s.Cfg.DataDir)
+	if err != nil {
+		s.Log.Warn("读不到数据目录属主（%v），反代证书属主未调整（nginx 可能读不到证书）", err)
+		return
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	uid, gid := int(st.Uid), int(st.Gid)
+	if err := os.Chown(dir, uid, gid); err != nil {
+		s.Log.Warn("调整 %s 属主失败：%v", dir, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if err := os.Chown(filepath.Join(dir, e.Name()), uid, gid); err != nil {
+			s.Log.Warn("调整 %s 属主失败：%v", filepath.Join(dir, e.Name()), err)
+		}
+	}
+}
+
+// handleProxySSL 为一条反代规则签发/绑定证书。四种来源与站点侧完全一致。
+//
+// 顺序：先把新配置写进 nginx（含请求级复核），成功后才落库 ——
+// 与 handleProxyUpdate 同一取舍，避免出现"数据库说开了 HTTPS、nginx 其实没生效"。
+// 失败时会尽力把兜底块恢复成数据库描述的状态，并返回非 2xx。
+func (s *Server) handleProxySSL(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "规则 id 不合法")
+		return
+	}
+	repo := s.proxyRepo()
+	cur, err := repo.Get(r.Context(), id)
+	if errors.Is(err, proxies.ErrNotFound) {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !s.nginxInstalled() {
+		fail(w, http.StatusConflict, "HTTPS 由 nginx 提供：请先到「应用市场 → 网站环境」安装 nginx")
+		return
+	}
+	var req proxySSLReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var (
+		certPath string
+		keyPath  string
+		expires  string
+	)
+	switch req.Provider {
+	case "self", "mkcert", "manual":
+		certDir := s.proxyCertDir(cur)
+		if err := os.MkdirAll(certDir, 0o755); err != nil {
+			fail(w, http.StatusInternalServerError, "创建证书目录失败: "+err.Error())
+			return
+		}
+		certPath = filepath.Join(certDir, "fullchain.pem")
+		keyPath = filepath.Join(certDir, "privkey.pem")
+		hosts := proxyCertHosts(cur)
+		switch req.Provider {
+		case "self":
+			if _, err := s.callHelper(r.Context(), "site-cert-self",
+				"--domain", hosts[0], "--cert", certPath, "--key", keyPath); err != nil {
+				fail(w, http.StatusInternalServerError, "签发自签证书失败: "+err.Error())
+				return
+			}
+		case "mkcert":
+			allHosts := append(append([]string{}, hosts...), req.ExtraSAN...)
+			if _, err := s.callHelper(r.Context(), "mkcert-issue",
+				"--hosts", strings.Join(allHosts, ","),
+				"--cert", certPath, "--key", keyPath); err != nil {
+				fail(w, http.StatusInternalServerError,
+					"mkcert 签发失败: "+err.Error()+"（可先执行 brew install mkcert nss && mkcert -install）")
+				return
+			}
+		case "manual":
+			if strings.TrimSpace(req.Cert) == "" || strings.TrimSpace(req.Key) == "" {
+				fail(w, http.StatusBadRequest, "手工模式需要提供证书与私钥内容")
+				return
+			}
+			if err := os.WriteFile(certPath, []byte(req.Cert), 0o644); err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if err := os.WriteFile(keyPath, []byte(req.Key), 0o600); err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		// nginx 以真实用户运行，root 写出的 0600 私钥它读不到 → 对齐属主。
+		s.alignProxyCertOwner(certDir)
+		notAfter, cerr := tlsx.CertExpiry(certPath)
+		if cerr != nil || notAfter.IsZero() {
+			fail(w, http.StatusBadRequest, "证书文件无法解析（"+certPath+"）："+errString(cerr)+
+				"；请确认粘贴的是 PEM 格式的证书（fullchain）")
+			return
+		}
+		expires = notAfter.Format("2006-01-02 15:04:05")
+	case "acme":
+		cert, merr := s.matchCertForProxy(cur, req)
+		if merr != nil {
+			// 400 而不是 500：这是"还没申请证书"这种可预期的用户状态。
+			fail(w, http.StatusBadRequest, merr.Error())
+			return
+		}
+		certPath, keyPath = cert.CertPath, cert.KeyPath
+		expires = cert.NotAfter.Format("2006-01-02 15:04:05")
+		if !dirExists(filepath.Dir(certPath)) || !fileExists(certPath) || !fileExists(keyPath) {
+			fail(w, http.StatusBadRequest,
+				"证书记录存在但文件缺失（"+certPath+"）：请在「证书」页重新申请或续期后再绑定")
+			return
+		}
+	default:
+		fail(w, http.StatusBadRequest, "不支持的证书来源: "+req.Provider)
+		return
+	}
+
+	next := *cur
+	next.SSLEnabled = true
+	next.SSLCert = certPath
+	next.SSLKey = keyPath
+	next.SSLProvider = req.Provider
+	next.SSLExpires = expires
+	if err := next.Validate(); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.checkProxySSLPortMix(r.Context(), &next); err != nil {
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
+	// 兜底块先进入"带证书的中性形态"：同时改规则 vhost 与兜底块时，
+	// 中间态若被 nginx 判 [emerg] 会让整个切换必然失败（见 stabilizeProxyReject）。
+	if err := s.stabilizeProxyReject(r.Context(), next.Listen, next.SSLCert, next.SSLKey); err != nil {
+		fail(w, http.StatusBadGateway, "调整域名兜底块失败："+err.Error())
+		return
+	}
+	if err := s.applyProxy(r.Context(), &next); err != nil {
+		_ = s.syncRejectBlocks(r.Context()) // 兜底块回到数据库描述的状态
+		fail(w, http.StatusBadGateway, "证书已就绪，但 nginx 配置应用失败（未生效）："+err.Error())
+		return
+	}
+	saved, err := repo.Update(r.Context(), &next)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		s.rejectGuardFailed(w, r, "proxy_ssl", saved.Name,
+			"规则「"+saved.Name+"」的证书已绑定并生效", err)
+		return
+	}
+	s.audit(r, "proxy_ssl", saved.Name, "绑定证书 provider="+req.Provider+" 到期="+expires, true, "")
+	view := s.proxyView(r.Context(), saved)
+	ok(w, map[string]any{
+		"msg":            "HTTPS 已启用",
+		"rule":           saved,
+		"cert":           certPath,
+		"key":            keyPath,
+		"expires":        expires,
+		"provider":       req.Provider,
+		"provider_label": proxies.SSLProviderLabel(req.Provider),
+		"days_left":      siteSSLDaysLeft(certPath),
+		"ssl":            view["ssl"],
+	})
+}
+
+// handleProxySSLDisable 关闭一条反代规则的 HTTPS。
+//
+// 与站点侧不同：关掉 SSL 后规则**仍然监听原端口**（只是回到 HTTP），
+// 不做"额外在 80 上 301"那种隐式行为（理由见 handleProxySSL 上方的说明）。
+func (s *Server) handleProxySSLDisable(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "规则 id 不合法")
+		return
+	}
+	repo := s.proxyRepo()
+	cur, err := repo.Get(r.Context(), id)
+	if errors.Is(err, proxies.ErrNotFound) {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	next := *cur
+	next.SSLEnabled = false
+	next.SSLCert = ""
+	next.SSLKey = ""
+	next.SSLProvider = ""
+	next.SSLExpires = ""
+	if err := next.Validate(); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if cur.SSLEnabled {
+		// 中性形态：兜底块先带证书，规则 vhost 改回非 SSL 后再收敛掉证书行。
+		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cur.SSLCert, cur.SSLKey); err != nil {
+			fail(w, http.StatusBadGateway, "关闭 HTTPS 时调整域名兜底块失败："+err.Error())
+			return
+		}
+	}
+	if next.Enabled {
+		if err := s.applyProxy(r.Context(), &next); err != nil {
+			_ = s.applyProxy(r.Context(), cur)  // 回滚成仍启用 SSL 的配置
+			_ = s.syncRejectBlocks(r.Context()) // 兜底块也回到数据库描述的状态
+			fail(w, http.StatusBadGateway, "关闭 HTTPS 失败（已回滚）："+err.Error())
+			return
+		}
+	}
+	saved, err := repo.Update(r.Context(), &next)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.syncRejectBlocks(r.Context()); err != nil {
+		s.rejectGuardFailed(w, r, "proxy_ssl_disable", saved.Name,
+			"规则「"+saved.Name+"」已关闭 HTTPS", err)
+		return
+	}
+	s.audit(r, "proxy_ssl_disable", saved.Name, "关闭 HTTPS", true, "")
+	ok(w, s.proxyView(r.Context(), saved))
+}
+
+// matchCertForProxy 为一条反代规则找到要用的 ACME 证书。
+//
+// 复用与站点侧同一套匹配逻辑（matchCertForNames）：显式 cert_primary/domain
+// 优先，其次按规则域名精确命中，再退到通配。匹配不到就明确报错并指路，
+// **不在这里就地签发**（签发是几十秒到几分钟的长任务，必须走任务中心）。
+func (s *Server) matchCertForProxy(rule *proxies.Rule, req proxySSLReq) (*acme.Cert, error) {
+	names := proxies.SplitDomains(rule.Domains)
+	label := strings.Join(names, "、")
+	if label == "" {
+		label = "该端口上的任意域名"
+	}
+	return s.matchCertForNames(names, req.CertPrimary, req.Domain, label)
+}
+
+// proxiesUsingCert 返回正在引用该证书的反向代理规则（给证书页展示与删除保护用）。
+//
+// 判定同样用**证书路径**而不是域名：acme 续期是同路径覆盖，只有路径能精确
+// 对应"哪个 vhost 里写着 ssl_certificate <这份文件>"。
+func (s *Server) proxiesUsingCert(c *acme.Cert) []string {
+	if c == nil || c.CertPath == "" {
+		return []string{}
+	}
+	list, err := s.proxyRepo().List(context.Background())
+	if err != nil {
+		return []string{}
+	}
+	var out []string
+	for _, r := range list {
+		if r == nil || !r.SSLEnabled || r.SSLCert == "" {
+			continue
+		}
+		if filepath.Clean(r.SSLCert) == filepath.Clean(c.CertPath) {
+			out = append(out, "反向代理「"+r.Name+"」")
+		}
+	}
+	return out
 }
 
 // ============================================================================
@@ -568,9 +1043,21 @@ func proxyProbeHost(rule *proxies.Rule) string {
 	return "_"
 }
 
+// probeProxyScheme 是复核该发 HTTP 还是 HTTPS。
+//
+// 启用 SSL 的规则只监听 TLS，用 http:// 探测只会拿到 "000"（连接被重置），
+// 从而把一条正常规则误判成"没生效"。
+func probeProxyScheme(rule *proxies.Rule) string {
+	if rule.SSLEnabled {
+		return "https"
+	}
+	return "http"
+}
+
 // probeProxyOnce 向规则的监听端口发一次请求（Host 由调用方指定）。
 func (s *Server) probeProxyOnce(ctx context.Context, rule *proxies.Rule, host string) proxyProbe {
-	code, body, err := proxyProbeFn(ctx, "http", host, rule.Listen, proxyProbePath(rule), proxyProbeTimeout)
+	code, body, err := proxyProbeFn(ctx, probeProxyScheme(rule), host, rule.Listen,
+		proxyProbePath(rule), proxyProbeTimeout)
 	return proxyProbe{code: code, body: body, err: err}
 }
 
@@ -680,7 +1167,105 @@ func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) e
 				"reload 失败而退出码仍是 0。请到「日志中心 → nginx error_log」看 [emerg] 行",
 			rule.Name, why, filepath.Dir(chk.LogPath))
 	}
+	// HTTPS 规则还要证明"端口上真的端出了这份证书"，光有 HTTP 响应不够。
+	if err := s.verifyProxyTLSServed(ctx, rule); err != nil {
+		return err
+	}
 	return s.verifyProxyDomainGuard(ctx, rule)
+}
+
+// ---- HTTPS 复核：真实取回对端证书 ----
+
+// tlsPeerInfo 是对端在 TLS 握手里**实际端出来**的证书信息。
+type tlsPeerInfo struct {
+	NotAfter time.Time
+	DNSNames []string
+	Subject  string
+}
+
+// proxyTLSPeerFn 取回该端口上真实提供的证书。
+//
+// 生产实现用 Go 的 crypto/tls 直接拨号。刻意 InsecureSkipVerify：
+// 这里要证明的是"nginx 有没有把这份证书端出来"，不是链路可信性 ——
+// 自签证书同样必须能通过复核，所以不能校验证书链。
+var proxyTLSPeerFn = probeTLSPeerCert
+
+func probeTLSPeerCert(ctx context.Context, port int, serverName string, timeout time.Duration) (tlsPeerInfo, error) {
+	var out tlsPeerInfo
+	if port <= 0 {
+		return out, fmt.Errorf("监听端口无效：%d", port)
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp",
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		&tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         serverName,
+			MinVersion:         tls.VersionTLS12,
+		})
+	if err != nil {
+		return out, err
+	}
+	defer func() { _ = conn.Close() }()
+	st := conn.ConnectionState()
+	if len(st.PeerCertificates) == 0 {
+		return out, errors.New("TLS 握手成功但没有拿到对端证书")
+	}
+	leaf := st.PeerCertificates[0]
+	return tlsPeerInfo{NotAfter: leaf.NotAfter, DNSNames: leaf.DNSNames, Subject: leaf.Subject.String()}, nil
+}
+
+// proxyTLSServerName 选一个能命中该规则的 SNI。
+//
+// `_` 不是合法主机名（internal/proxies 在没有域名时就是这么写 server_name），
+// 拿它做 SNI 没有意义：此时让 nginx 用它自己的默认 server 应答，
+// 而"没有域名的规则"正是该端口的默认 server（这类端口不会生成兜底拒绝块）。
+func proxyTLSServerName(rule *proxies.Rule) string {
+	h := strings.TrimSpace(proxyProbeHost(rule))
+	if h == "" || h == "_" || strings.Contains(h, "*") {
+		return "localhost"
+	}
+	return h
+}
+
+// verifyProxyTLSServed 复核"HTTPS 真的起来了，而且端出来的就是我们配的那份证书"。
+//
+// 判据不是"端口能连上"，而是：
+//  1. 配置里写的证书文件能被解析（读不到就别谈生效）；
+//  2. 对该端口做一次真实 TLS 握手，拿回对端 leaf 证书；
+//  3. 对端证书的 NotAfter 必须与配置文件的 NotAfter 一致 —— 这能抓到
+//     "ssl_certificate 没生效 / 加载的还是旧证书 / 请求落在了别的 server 块"。
+//
+// 这是"失败不许谎报"的落点：证书文件写进去了、`nginx -s reload` 退出码是 0，
+// 都不等于能握手成功。
+func (s *Server) verifyProxyTLSServed(ctx context.Context, rule *proxies.Rule) error {
+	if !rule.SSLEnabled {
+		return nil
+	}
+	want, err := tlsx.CertExpiry(rule.SSLCert)
+	if err != nil {
+		return fmt.Errorf("规则「%s」已启用 HTTPS，但证书文件读不到（%s）：%v。"+
+			"nginx 会因此加载失败或起不来，请先在「SSL 证书」页重新签发/续期",
+			rule.Name, rule.SSLCert, err)
+	}
+	info, derr := proxyTLSPeerFn(ctx, rule.Listen, proxyTLSServerName(rule), proxyProbeTimeout)
+	if derr != nil {
+		return fmt.Errorf("规则「%s」的 HTTPS 复核失败：在 127.0.0.1:%d 上做 TLS 握手时 %v。"+
+			"最常见的原因是 nginx 没有真正重载（证书文件属主是 root 时，以普通用户运行的 nginx "+
+			"读不到它 → reload 失败但退出码仍是 0），或该端口上的默认 server 抢先应答了。"+
+			"请到「日志中心 → nginx error_log」看 [emerg] 行",
+			rule.Name, rule.Listen, derr)
+	}
+	if !info.NotAfter.Equal(want) {
+		return fmt.Errorf("规则「%s」的 HTTPS 复核失败：配置里写的是 %s（到期 %s），"+
+			"但 127.0.0.1:%d 实际端出来的证书到期时间是 %s —— 说明这份 ssl_certificate 没有生效",
+			rule.Name, rule.SSLCert, want.Format("2006-01-02 15:04:05"),
+			rule.Listen, info.NotAfter.Format("2006-01-02 15:04:05"))
+	}
+	return nil
 }
 
 // reloadProxyAndVerifyGone 是反代**删除/停用**后的统一收尾。
@@ -817,6 +1402,7 @@ func (s *Server) syncRejectBlocks(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	specs := proxyRejectSpecs(list)
 	need := map[int]bool{}
 	// rep[port] 存该端口上任意一条带域名的启用规则，供复核构造探测请求。
 	rep := map[int]*proxies.Rule{}
@@ -830,8 +1416,12 @@ func (s *Server) syncRejectBlocks(ctx context.Context) error {
 	}
 
 	changed := false
-	for port := range need {
-		content := proxies.GenerateReject(port, s.proxyLogDir())
+	for port, sp := range specs {
+		if sp.SSL && (sp.Cert == "" || sp.Key == "") {
+			return fmt.Errorf("端口 %d 上有已启用 HTTPS 的规则，但数据库里没有证书路径："+
+				"nginx 要求同一端口上每个 server 块都有证书，无法为域名兜底块提供证书", port)
+		}
+		content := proxies.GenerateRejectWithCert(port, s.proxyLogDir(), sp.Cert, sp.Key, sp.SSL)
 		if err := s.writeVhost(ctx, proxies.RejectVhostName(port), content); err != nil {
 			if isDuplicateDefaultServer(err) {
 				// 这个端口已经有别的 default_server 了（典型就是 000-default.conf
@@ -869,6 +1459,98 @@ func (s *Server) syncRejectBlocks(ctx context.Context) error {
 		return nil
 	}
 	return s.reloadRejectBlocksAndVerify(ctx, need, rep)
+}
+
+// proxyRejectSpec 描述某端口上"域名兜底拒绝块"该长什么样。
+type proxyRejectSpec struct {
+	SSL  bool   // 该端口上是否至少有已启用的 HTTPS 规则
+	Cert string // SSL=true 时兜底块要带的证书（否则 nginx [emerg]）
+	Key  string
+}
+
+// proxyRejectSpecs 从规则集推导出每个端口的兜底块形态。
+//
+// 抽成纯函数是为了让单测能直接钉住"SSL 端口必须带证书"这条判据
+// （真机实测：同一端口上只要有一个 server 块写了 ssl，所有 server 块
+// 都必须有 ssl_certificate，否则 `nginx -t` 直接 [emerg]）。
+func proxyRejectSpecs(rules []*proxies.Rule) map[int]proxyRejectSpec {
+	out := map[int]proxyRejectSpec{}
+	for _, r := range rules {
+		if r == nil || !r.Enabled || len(proxies.SplitDomains(r.Domains)) == 0 {
+			continue
+		}
+		sp := out[r.Listen]
+		if r.SSLEnabled {
+			sp.SSL = true
+			if sp.Cert == "" {
+				sp.Cert, sp.Key = r.SSLCert, r.SSLKey
+			}
+		}
+		out[r.Listen] = sp
+	}
+	return out
+}
+
+// stabilizeProxyReject 在 SSL 开关切换的写盘之前，把该端口的兜底块改成
+// "listen <port> default_server;" + 证书行的中性形态。
+//
+// 为什么需要（真机 nginx 1.31.5 实测）：SSL 开/关都要同时改两个文件
+// （规则 vhost 与兜底块），而写每个文件都会跑一次 `nginx -t`。中间态里
+// "有 ssl 的 server + 没证书的 server"会被判 [emerg] 并回滚，导致切换永远失败。
+// 带证书行的非 SSL server 在任何组合下都合法，所以先落它、再改规则 vhost。
+func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, keyPath string) error {
+	if certPath == "" || keyPath == "" {
+		return nil
+	}
+	list, err := s.proxyRepo().List(ctx)
+	if err != nil {
+		return err
+	}
+	if !proxies.RejectPorts(list)[port] {
+		return nil // 这个端口不需要兜底块（例如全是通配规则）
+	}
+	content := proxies.GenerateRejectWithCert(port, s.proxyLogDir(), certPath, keyPath, false)
+	return s.writeVhost(ctx, proxies.RejectVhostName(port), content)
+}
+
+// checkProxySSLPortMix 拦住"同一端口上 HTTP 与 HTTPS 混用"。
+//
+// 为什么必须拦：nginx 的同一 listen 端口只有一种协议 —— 只要有一个 server 块
+// 写了 `ssl`，整个端口就按 TLS 处理，另一个"以为自己是 HTTP"的规则会静默失效
+// （客户端用 http:// 访问会握手失败）。这种失效用户完全看不出来，所以宁可在
+// 保存时明确拒绝，也不写出一份"两条都显示已启用、只有一条能用"的配置。
+//
+// 同时拦住"端口 80 + HTTPS"：80 由面板默认站点（000-default.conf）占着
+// default_server，而它没有证书 —— 一旦该端口出现 ssl，nginx 会直接 [emerg]。
+func (s *Server) checkProxySSLPortMix(ctx context.Context, rule *proxies.Rule) error {
+	if rule == nil || !rule.Enabled {
+		return nil // 停用的规则不写配置，不会造成混用
+	}
+	if rule.SSLEnabled && rule.Listen == 80 {
+		return fmt.Errorf("端口 80 是面板默认站点的 HTTP 端口，不能作为 HTTPS 端口：" +
+			"请把监听端口改成 443 或其它端口（nginx 要求同端口的每个 server 块都有证书）")
+	}
+	list, err := s.proxyRepo().List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, other := range list {
+		if other == nil || other.ID == rule.ID || !other.Enabled || other.Listen != rule.Listen {
+			continue
+		}
+		if other.SSLEnabled == rule.SSLEnabled {
+			continue
+		}
+		mode, want := "HTTP", "HTTPS"
+		if rule.SSLEnabled {
+			mode, want = "HTTPS", "HTTP"
+		}
+		return fmt.Errorf("端口 %d 上已有%s规则「%s」，而这条是%s：nginx 的同一端口不能同时跑 "+
+			"HTTP 与 HTTPS（只要有一个 server 块启用 ssl，整个端口就变成 TLS）。"+
+			"请把这条规则改到别的端口，或先停用/删除「%s」",
+			rule.Listen, mode, other.Name, want, other.Name)
+	}
+	return nil
 }
 
 // reloadRejectBlocksAndVerify 让兜底拒绝块生效，并复核"域名限制真的落实了"。

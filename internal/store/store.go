@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -137,6 +138,14 @@ CREATE TABLE IF NOT EXISTS proxies (
     websocket     INTEGER NOT NULL DEFAULT 1,
     enabled       INTEGER NOT NULL DEFAULT 1,
     remark        TEXT    NOT NULL DEFAULT '',
+    -- 反向代理的 HTTPS（2026-09 新增）。
+    -- 默认全关：老规则升级后 ssl_enabled=0，vhost 输出与加这个功能之前逐字一致。
+    -- 列名与 sites 表一致，便于复用同一套证书逻辑。
+    ssl_enabled   INTEGER NOT NULL DEFAULT 0,
+    ssl_cert      TEXT    NOT NULL DEFAULT '',
+    ssl_key       TEXT    NOT NULL DEFAULT '',
+    ssl_provider  TEXT    NOT NULL DEFAULT '',   -- self/mkcert/manual/acme
+    ssl_expires   TEXT    NOT NULL DEFAULT '',
     created_at    TEXT    NOT NULL DEFAULT '',
     updated_at    TEXT    NOT NULL DEFAULT ''
 );
@@ -266,8 +275,69 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("数据库迁移失败: %w\nSQL: %s", err, firstLine(stmt))
 		}
 	}
+	// 增量迁移：老库的 proxies 表是上面 CREATE TABLE IF NOT EXISTS 建不出来的
+	// （表已存在时整条语句被忽略），所以新增列必须显式 ALTER TABLE 补。
+	//
+	// 为什么必须向后兼容：用户已经有一批在用的反代规则，升级面板时不能因为
+	// 多了几列就让规则失效或让启动报错。ADD COLUMN 带 NOT NULL DEFAULT 会给
+	// 已有行填默认值 —— ssl_enabled=0 正是"老规则默认关 SSL"。
+	if err := s.ensureColumns(ctx, "proxies", map[string]string{
+		"ssl_enabled":  "INTEGER NOT NULL DEFAULT 0",
+		"ssl_cert":     "TEXT NOT NULL DEFAULT ''",
+		"ssl_key":      "TEXT NOT NULL DEFAULT ''",
+		"ssl_provider": "TEXT NOT NULL DEFAULT ''",
+		"ssl_expires":  "TEXT NOT NULL DEFAULT ''",
+	}); err != nil {
+		return err
+	}
 	// 记录 schema 版本，后续增量迁移用
-	return s.setMeta(ctx, "schema_version", "1")
+	return s.setMeta(ctx, "schema_version", "2")
+}
+
+// ensureColumns 给已存在的表补齐缺失的列（SQLite 的 ADD COLUMN）。
+//
+// 只做"加列"，不改类型、不删列：迁移要能在任何老库上重复执行而不出错，
+// 且绝不能动用户已有数据。列名/定义都来自本包内的常量，不经用户输入，无注入面。
+func (s *Store) ensureColumns(ctx context.Context, table string, cols map[string]string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("解析 %s 表结构失败: %w", table, err)
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+	}
+	_ = rows.Close()
+
+	// 固定顺序执行，避免 map 迭代顺序让"失败的库"每次停在不同列上。
+	names := make([]string, 0, len(cols))
+	for n := range cols {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if have[n] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx,
+			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, n, cols[n])); err != nil {
+			return fmt.Errorf("迁移 %s.%s 失败: %w", table, n, err)
+		}
+	}
+	return nil
 }
 
 // splitStatements 按分号切分 SQL。表结构里不含字符串字面量中的分号，

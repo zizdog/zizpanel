@@ -13,8 +13,44 @@
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
+// 证书列表的归一化与"按域名挑证书"直接复用「SSL 证书」页的纯函数：
+// 反代与站点两侧必须用同一套匹配规则，否则同一个域名在两个页面会选到不同证书。
+import { normalizeCerts, pickCertForDomain } from './certs.js';
 
 let cache = null;
+
+// SSL_PROVIDERS 是证书来源选项，取值与站点侧完全一致（self/mkcert/manual/acme）。
+// ACME 放第一位并标注"推荐"：它是唯一能被浏览器直接信任的来源，
+// 而另外三种（自签/mkcert/手工）都依赖用户自己的信任链。
+const SSL_PROVIDERS = [
+  { value: 'acme', label: "面板证书库（ACME / Let's Encrypt，推荐）" },
+  { value: 'mkcert', label: 'mkcert 本地 CA（本机信任时不提示）' },
+  { value: 'self', label: '自签证书（浏览器会提示不受信任）' },
+  { value: 'manual', label: '粘贴自有证书' },
+];
+
+// sslSummary 把后端给的证书摘要拼成一行可读文字（来源 / 覆盖域名 / 到期 / 剩余）。
+// 字段缺失时逐项跳过，不编造——没有的信息宁可不说。
+function sslSummary(it) {
+  const s = (it && it.ssl) || {};
+  const parts = ['HTTPS 已启用 · ' + (s.provider_label || s.provider || '证书')];
+  const domains = Array.isArray(s.domains) ? s.domains.filter(Boolean) : [];
+  if (domains.length) parts.push('覆盖 ' + domains.join(', '));
+  if (s.expires) parts.push('到期 ' + s.expires);
+  if (s.days_left != null && s.days_left >= 0) parts.push('剩余 ' + s.days_left + ' 天');
+  else if (s.days_left != null && s.days_left < 0) parts.push('已过期');
+  if (s.renew_hint) parts.push('⚠️ ' + s.renew_hint);
+  return parts.join(' · ');
+}
+
+// sslTitle 是锁标志的悬浮说明（换行分隔，便于看清路径）。
+function sslTitle(it) {
+  const s = (it && it.ssl) || {};
+  const lines = [sslSummary(it)];
+  if (s.cert_path) lines.push('证书：' + s.cert_path);
+  if (s.key_path) lines.push('私钥：' + s.key_path);
+  return lines.join('\n');
+}
 
 export function ReverseProxyView(content, ctx = {}) {
   clear(content);
@@ -104,6 +140,9 @@ export function ReverseProxyView(content, ctx = {}) {
           ? h('span.pill.ok', { text: '目标可达', title: it.target_detail })
           : h('span.pill.warn', { text: '目标不可达', title: it.target_detail }),
         it.websocket ? h('span.pill', { text: 'WS' }) : null,
+        it.ssl_enabled
+          ? h('span.pill.ok', { text: '🔒 HTTPS', title: sslTitle(it) })
+          : null,
         h('div.spacer'),
       ]),
       h('div.mono', {
@@ -112,6 +151,7 @@ export function ReverseProxyView(content, ctx = {}) {
         h('div', { text: '监听 :' + it.listen + (domains.length ? '  ' + domains.join(', ') : '  (所有域名)') + (it.path ? '  ' + it.path + '*' : '') }),
         h('div', { text: '→  ' + it.target }),
       ]),
+      it.ssl_enabled && it.ssl ? h('div.hint', { text: sslSummary(it) }) : null,
       it.remark ? h('div.hint', { text: it.remark }) : null,
       it.target_detail && !it.target_ok ? h('div.hint', { style: { color: 'var(--danger)' }, text: it.target_detail }) : null,
       h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
@@ -164,8 +204,15 @@ export function ReverseProxyView(content, ctx = {}) {
   //
   // 校验顺序刻意做成"先测连通再保存"：反代最常见的失败就是目标写错，
   // 而保存成功、nginx 也 reload 成功、访问却 502 —— 那时候用户要自己去猜。
+  //
+  // HTTPS 区块与「网站管理 → SSL 证书」是同一套体验，但出于两点差异单独实现：
+  //   · 反代规则只是**引用**证书，acme 证书的申请仍走「SSL 证书」页的任务中心；
+  //   · 保存分两步：先保存规则本身，再调 /proxies/{id}/ssl 绑定证书。
+  //     任何一步失败都按后端原文提示，不吞掉，也不谎报"HTTPS 已启用"。
   function editRule(it) {
     const isNew = !it;
+    const cur = (it && it.ssl) || {};
+    const hadSSL = !!cur.enabled;
     const f = {
       name: h('input.input', { value: it?.name || '', placeholder: '例如：NAS 镜像站' }),
       listen: h('input.input', { type: 'number', value: it?.listen ?? 8090, min: '1', max: '65535' }),
@@ -176,7 +223,120 @@ export function ReverseProxyView(content, ctx = {}) {
       ws: h('input', { type: 'checkbox', checked: it ? !!it.websocket : true }),
       enabled: h('input', { type: 'checkbox', checked: it ? !!it.enabled : true }),
       remark: h('input.input', { value: it?.remark || '', placeholder: '备注（可留空）' }),
+      // ---- HTTPS ----
+      sslOn: h('input', { type: 'checkbox', checked: hadSSL, id: 'zp-proxy-ssl-on' }),
+      sslProvider: h('select.select', { id: 'zp-proxy-ssl-provider' },
+        SSL_PROVIDERS.map((p) => h('option', { value: p.value, text: p.label }))),
+      // 已有证书时才有意义：勾上就重新签发/重新应用（例如 mkcert 重签、换加密方式）。
+      sslReissue: h('input', { type: 'checkbox', checked: false, id: 'zp-proxy-ssl-reissue' }),
     };
+    f.sslProvider.value = SSL_PROVIDERS.some((p) => p.value === cur.provider) ? cur.provider : 'acme';
+
+    const certSel = h('select.select', { id: 'zp-proxy-ssl-cert' });
+    const certHint = h('div.hint', { text: '正在读取证书…' });
+    const acmeRow = h('div.field', { id: 'zp-proxy-ssl-acme' }, [
+      h('label', { text: '选择证书（面板证书库）' }),
+      certSel,
+      certHint,
+    ]);
+    const manualCert = h('textarea.textarea', {
+      placeholder: '-----BEGIN CERTIFICATE-----\n…', style: { minHeight: '96px' },
+    });
+    const manualKey = h('textarea.textarea', {
+      placeholder: '-----BEGIN PRIVATE KEY-----\n…', style: { minHeight: '96px' },
+    });
+    const manualRow = h('div', { id: 'zp-proxy-ssl-manual', style: { display: 'none' } }, [
+      h('div.field', [h('label', { text: '证书（含链）' }), manualCert]),
+      h('div.field', [h('label', { text: '私钥' }), manualKey,
+        hadSSL && cur.provider === 'manual'
+          ? h('div.hint', { text: '已经保存过一份手工证书；不改的话留空即可沿用。' })
+          : null]),
+    ]);
+    const reissueRow = h('label', {
+      style: { display: hadSSL ? 'flex' : 'none', gap: '8px', alignItems: 'center', marginBottom: '8px' },
+    }, [f.sslReissue, h('span', { text: '重新签发 / 重新应用证书（默认复用已绑定的那张，不重签）' })]);
+    const sslDetail = h('div', { id: 'zp-proxy-ssl-detail', style: { marginTop: '8px' } }, [
+      h('div.field', [h('label', { text: '证书来源' }), f.sslProvider,
+        h('div.hint', {
+          text: 'ACME 证书请在「SSL 证书」页申请（申请/续期是后台任务），这里只负责引用；'
+            + '引用的是证书库路径，续期后同路径覆盖，规则不用改。',
+        })]),
+      acmeRow, manualRow, reissueRow,
+      hadSSL
+        ? h('div.hint', { text: '当前已启用：' + sslSummary(it) })
+        : null,
+    ]);
+
+    // ---- 证书列表：懒加载 + 按规则域名预选 ----
+    let certsCache = null;
+    let certsErr = '';
+    async function loadCerts() {
+      if (certsCache) return certsCache;
+      try {
+        const all = normalizeCerts(await api.certs());
+        // 申请失败的条目没有证书文件，绝不能出现在"可绑定"列表里。
+        certsCache = all.filter((c) => c.status !== 'failed');
+      } catch (e) {
+        certsErr = e.message;
+        certsCache = [];
+      }
+      return certsCache;
+    }
+    function renderCertHint() {
+      if (certsErr) {
+        certHint.textContent = '读取证书失败：' + certsErr;
+        certHint.style.color = 'var(--danger)';
+        return;
+      }
+      certHint.style.color = '';
+      const c = (certsCache || []).find((x) => x.primary === certSel.value);
+      if (!c) { certHint.textContent = ''; return; }
+      const parts = ['覆盖：' + c.domains.join(', ')];
+      if (c.notAfter) parts.push('到期：' + c.notAfter);
+      if (c.daysLeft != null) parts.push('剩余 ' + c.daysLeft + ' 天');
+      if (c.issuer) parts.push('签发机构：' + c.issuer);
+      certHint.textContent = parts.join(' · ');
+    }
+    certSel.addEventListener('change', renderCertHint);
+
+    async function renderCerts() {
+      certHint.style.color = '';
+      certHint.textContent = '正在读取证书…';
+      const certs = await loadCerts();
+      // clear 必须放在 await 之后：开关/来源被快速切换时会有两次并发渲染，
+      // 两次都"先清后填"会叠加成 6 个选项（真被验证脚本抓到过）。
+      clear(certSel);
+      if (certsErr) { renderCertHint(); return; }
+      if (!certs.length) {
+        certHint.style.color = 'var(--warn)';
+        certHint.textContent = '面板里还没有可用证书：请先到「SSL 证书」页申请一张（http-01 或 dns-01），再回来选。';
+        return;
+      }
+      const firstDomain = (f.domains.value.split(/[\s,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)[0]) || '';
+      const byDomain = pickCertForDomain(certs, firstDomain);
+      // 编辑已有 SSL 时优先按现有证书路径预选，避免"什么都没改却换了证书"。
+      const byPath = cur.cert_path ? certs.find((c) => c.certPath === cur.cert_path) : null;
+      const picked = byPath || byDomain;
+      certs.forEach((c) => certSel.append(h('option', {
+        value: c.primary,
+        text: `${c.primary}（${c.domains.join(', ')}）` + (c.daysLeft != null ? ` · 剩余 ${c.daysLeft} 天` : ''),
+        selected: !!picked && c.primary === picked.primary,
+      })));
+      renderCertHint();
+    }
+
+    function renderSSL() {
+      const on = f.sslOn.checked;
+      sslDetail.style.display = on ? '' : 'none';
+      if (!on) return;
+      const p = f.sslProvider.value;
+      acmeRow.style.display = p === 'acme' ? '' : 'none';
+      manualRow.style.display = p === 'manual' ? '' : 'none';
+      if (p === 'acme') renderCerts();
+    }
+    f.sslOn.addEventListener('change', renderSSL);
+    f.sslProvider.addEventListener('change', renderSSL);
+
     const testOut = h('div.hint', { text: '' });
     const row = (label, node, hint) => h('div', { style: { marginBottom: '10px' } }, [
       h('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginBottom: '4px' }, text: label }),
@@ -196,6 +356,16 @@ export function ReverseProxyView(content, ctx = {}) {
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' } },
         [f.enabled, h('span', { text: '启用' })]),
       row('备注', f.remark),
+      h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
+          f.sslOn, h('span', { style: { fontWeight: '600' }, text: '启用 HTTPS（由 nginx 直接终止 TLS）' }),
+        ]),
+        h('div.hint', {
+          text: '同一端口的规则不能 HTTP/HTTPS 混用（nginx 一个端口只有一种协议）；'
+            + '80 端口不能开 HTTPS（面板默认站点占着它）。',
+        }),
+        sslDetail,
+      ]),
       testOut,
     ]);
 
@@ -224,6 +394,22 @@ export function ReverseProxyView(content, ctx = {}) {
         h('button.btn.btn-primary', {
           text: isNew ? '创建' : '保存',
           onclick: async () => {
+            const sslOn = f.sslOn.checked;
+            const provider = f.sslProvider.value;
+            const manualC = manualCert.value.trim();
+            const manualK = manualKey.value.trim();
+            // 开 HTTPS 且需要新取证书时，先在前端做"缺什么"的拦截，
+            // 避免规则先建好、证书却没绑上（那样用户会以为 HTTPS 生效了）。
+            const needNew = sslOn && (!hadSSL || provider !== cur.provider || f.sslReissue.checked);
+            if (needNew && provider === 'acme' && !certSel.value) {
+              toast('请选择一张证书；如果列表为空，请先到「SSL 证书」页申请', 'warn', 12000);
+              return;
+            }
+            if (needNew && provider === 'manual' && (!manualC || !manualK)) {
+              toast('手工模式需要同时粘贴证书与私钥', 'warn', 12000);
+              return;
+            }
+
             const payload = {
               name: f.name.value.trim(),
               listen: Number(f.listen.value) || 0,
@@ -235,21 +421,55 @@ export function ReverseProxyView(content, ctx = {}) {
               enabled: f.enabled.checked,
               remark: f.remark.value.trim(),
             };
+            // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
+            if (hadSSL && !sslOn) payload.ssl_enabled = false;
+
+            let saved = null;
             try {
-              if (isNew) await api.proxyCreate(payload);
-              else await api.proxyUpdate(it.id, payload);
-              toast(isNew ? '规则已创建' : '规则已保存', 'ok');
-              close();
-              load();
+              saved = isNew ? await api.proxyCreate(payload) : await api.proxyUpdate(it.id, payload);
             } catch (e) {
               // 后端的校验/冲突信息是给用户看的，原样弹出来
               toast(e.message, 'err', 12000);
+              return;
             }
+
+            // 第二步：绑定证书。provider 与证书都没变时跳过，避免每次改备注都重签。
+            let needSSL = sslOn && (
+              !hadSSL
+              || provider !== cur.provider
+              || f.sslReissue.checked
+              || (provider === 'manual' && (manualC || manualK))
+            );
+            if (sslOn && !needSSL && provider === 'acme') {
+              const c = (certsCache || []).find((x) => x.primary === certSel.value);
+              if (c && c.certPath && cur.cert_path && c.certPath !== cur.cert_path) needSSL = true;
+            }
+            if (needSSL) {
+              const savedId = (saved && saved.id) || it?.id;
+              const sslPayload = { provider };
+              if (provider === 'acme') sslPayload.cert_primary = certSel.value;
+              if (provider === 'manual') { sslPayload.cert = manualC; sslPayload.key = manualK; }
+              try {
+                await api.proxySSL(savedId, sslPayload);
+                toast('HTTPS 已启用', 'ok');
+              } catch (e) {
+                // 规则本身已保存，但证书没绑定成功 —— 必须如实说清楚，
+                // 否则用户会以为已经在用 HTTPS 了。
+                toast('规则已保存，但 HTTPS 未生效：' + e.message, 'err', 16000);
+                close();
+                load();
+                return;
+              }
+            }
+            toast(isNew ? '规则已创建' : '规则已保存', 'ok');
+            close();
+            load();
           },
         }),
       ],
     });
     void m;
+    renderSSL();
     setTimeout(() => f.name.focus(), 60);
   }
 

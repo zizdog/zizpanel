@@ -76,6 +76,9 @@ export const taskCenter = {
   // 只做 import 目标的替换，业务代码一行不动。
   if (rel === 'certs.js') body = body.replace(/from '\.\/tasks\.js'/g, "from '__tasks__'");
   if (rel === 'sites.js') body = body.replace(/from '\.\/app\.js'/g, "from '__shell__'");
+  // 反向代理页的 HTTPS 区块也要在本脚本里被真实加载（它 import 了 certs.js 的
+  // 证书匹配纯函数，所以这里必须让它走真实的 certs.js，而不是替身）。
+  if (rel === 'reverseproxy.js') body = body.replace(/from '\.\/app\.js'/g, "from '__shell__'");
   res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
   res.end(body);
 });
@@ -141,7 +144,37 @@ const SITE = (domain) => ({
 });
 const SITES = [SITE('www.demo.test'), SITE('sub.api.test'), SITE('nope.test')];
 
-await page.addInitScript(({ CERTS, PROVIDERS, SITES }) => {
+// 反向代理规则：一条已启用 HTTPS（用于验证列表锁标志 + 证书域名/到期展示），
+// 一条纯 HTTP（用于验证"没开 SSL 就不该出现锁标志"）。
+const PROXIES = [
+  {
+    id: 21, name: 'NAS 镜像站', listen: 8090, domains: 'nas.zizdog.com', path: '',
+    target: 'http://192.168.1.8:8090', preserve_host: false, websocket: true,
+    enabled: true, remark: '', port_listening: true, target_ok: true,
+    target_detail: '可达 192.168.1.8:8090（3ms）',
+    ssl_enabled: true,
+    ssl_cert: '/opt/zizpanel/certs/nas.zizdog.com/fullchain.pem',
+    ssl_key: '/opt/zizpanel/certs/nas.zizdog.com/privkey.pem',
+    ssl_provider: 'acme', ssl_expires: '2026-12-01 00:00:00',
+    ssl: {
+      enabled: true, provider: 'acme', provider_label: "ACME 自动证书（Let's Encrypt 等）",
+      cert_path: '/opt/zizpanel/certs/nas.zizdog.com/fullchain.pem',
+      key_path: '/opt/zizpanel/certs/nas.zizdog.com/privkey.pem',
+      expires: '2026-12-01 00:00:00', not_after: '2026-12-01T00:00:00Z',
+      days_left: 72, domains: ['nas.zizdog.com'], renew_hint: '',
+    },
+  },
+  {
+    id: 22, name: '内网面板', listen: 8443, domains: '', path: '',
+    target: 'https://127.0.0.1:8443', preserve_host: true, websocket: true,
+    enabled: true, remark: '', port_listening: false, target_ok: true,
+    target_detail: '可达 127.0.0.1:8443（1ms）',
+    ssl_enabled: false, ssl_cert: '', ssl_key: '', ssl_provider: '', ssl_expires: '',
+    ssl: { enabled: false, provider: '', provider_label: '未配置', domains: [], days_left: -1 },
+  },
+];
+
+await page.addInitScript(({ CERTS, PROVIDERS, SITES, PROXIES }) => {
   window.__fetches = [];
   window.__taskCalls = [];
   window.__taskError = '';
@@ -172,6 +205,36 @@ await page.addInitScript(({ CERTS, PROVIDERS, SITES }) => {
     if (m && method === 'POST') return done({ task_id: 'task-retry-1', title: '重试申请证书' });
     m = p.match(/^\/api\/v1\/certs\/([^/]+)$/);
     if (m && method === 'DELETE') return done(null);
+    // ---- 反向代理 ----
+    if (p === '/api/v1/proxies' && method === 'GET') {
+      return done({ list: window.__proxies || PROXIES, nginx: { installed: true, config: '/opt/homebrew/etc/nginx/nginx.conf' } });
+    }
+    if (p === '/api/v1/proxies' && method === 'POST') {
+      // 新建规则：返回 proxyView 形状 —— 前端要靠响应里的 id 继续调 SSL 接口。
+      const created = Object.assign({
+        port_listening: true, target_ok: true, target_detail: '可达',
+        enabled: true, preserve_host: false, websocket: true,
+        ssl_enabled: false, ssl_cert: '', ssl_key: '', ssl_provider: '', ssl_expires: '',
+        ssl: { enabled: false, provider: '', provider_label: '未配置', domains: [], days_left: -1 },
+      }, body || {}, { id: 7 });
+      window.__proxies = [created].concat(window.__proxies || PROXIES);
+      return done(created);
+    }
+    let pm = p.match(/^\/api\/v1\/proxies\/(\d+)\/ssl$/);
+    if (pm && method === 'POST') {
+      return done({
+        msg: 'HTTPS 已启用',
+        cert: '/opt/zizpanel/certs/demo.test/fullchain.pem',
+        key: '/opt/zizpanel/certs/demo.test/privkey.pem',
+        expires: '2026-12-01 00:00:00', provider: 'acme',
+        provider_label: "ACME 自动证书（Let's Encrypt 等）", days_left: 72,
+        ssl: { enabled: true, provider: 'acme', domains: ['demo.test'], days_left: 72 },
+      });
+    }
+    pm = p.match(/^\/api\/v1\/proxies\/(\d+)$/);
+    if (pm && method === 'POST') {
+      return done({ id: Number(pm[1]), port_listening: true, target_ok: true, ssl_enabled: false, ssl: {} });
+    }
     if (p === '/api/v1/sites' && method === 'GET') {
       return done({ list: SITES, php_versions: [], presets: [] });
     }
@@ -184,7 +247,7 @@ await page.addInitScript(({ CERTS, PROVIDERS, SITES }) => {
     if (p === '/api/v1/sites' && method === 'POST') return done(null, false, 404);
     return done(null, false, 404);
   };
-}, { CERTS, PROVIDERS, SITES });
+}, { CERTS, PROVIDERS, SITES, PROXIES });
 
 await page.goto(base + 'index.html', { waitUntil: 'domcontentloaded' });
 
@@ -434,6 +497,91 @@ const result = await page.evaluate(async () => {
     providersWeird: certs.normalizeProviders([{ nope: 1 }, 'cloudflare', null]).length,
   };
 
+  // ================= ⑩ 反向代理：列表锁标志 + HTTPS 区块 + 绑定证书 =================
+  // 这一节验证用户明确要求的能力："反向代理面板的内容也要能调用证书"。
+  // 关键点是**两步保存**：先 POST /proxies 建规则，拿到 id 后再
+  // POST /proxies/{id}/ssl 绑定证书 —— 两步都必须真的发生，且请求体符合契约。
+  const { ReverseProxyView } = await import('./reverseproxy.js');
+  const pbox = document.createElement('div');
+  root.appendChild(pbox);
+  ReverseProxyView(pbox);
+  await waitFor(() => btnByText(pbox, '➕ 新建规则'));
+  await sleep(60);
+  out.proxyPills = pillsOf(pbox);
+  out.proxyPillTitles = Array.from(pbox.querySelectorAll('.pill')).map((p) => p.getAttribute('title') || '');
+  out.proxyText = (pbox.innerText || '').replace(/\s+/g, ' ').trim();
+  out.proxyLockPillCount = (out.proxyPills || []).filter((x) => x.text.includes('🔒 HTTPS')).length;
+
+  const newBtn = await waitFor(() => btnByText(pbox, '➕ 新建规则'));
+  out.proxyNewButtonFound = !!newBtn;
+  if (!newBtn) {
+    throw new Error('反向代理页没有渲染出「新建规则」按钮：' + (pbox.innerText || '').slice(0, 200));
+  }
+  newBtn.click();
+  const pmodal = await waitFor(() => modals().find((m) => (m.querySelector('.modal-head h3')?.textContent || '').includes('反向代理规则')));
+  out.proxyHasSSLSwitch = !!pmodal.querySelector('#zp-proxy-ssl-on');
+  out.sslDetailHiddenBefore = (pmodal.querySelector('#zp-proxy-ssl-detail')?.style.display || '') === 'none';
+
+  pmodal.querySelector('input[placeholder="例如：NAS 镜像站"]').value = '演示反代';
+  pmodal.querySelector('input[placeholder="http://192.168.1.8:8090"]').value = 'http://127.0.0.1:9000';
+  pmodal.querySelector('input[placeholder^="留空 = 该端口上所有域名"]').value = 'demo.test';
+
+  document.getElementById('zp-proxy-ssl-on').checked = true;
+  document.getElementById('zp-proxy-ssl-on').dispatchEvent(new Event('change'));
+  document.getElementById('zp-proxy-ssl-provider').value = 'acme';
+  document.getElementById('zp-proxy-ssl-provider').dispatchEvent(new Event('change'));
+  const pcert = await waitFor(() => {
+    const s = document.getElementById('zp-proxy-ssl-cert');
+    return s && s.options.length > 0 ? s : null;
+  });
+  out.sslDetailVisibleAfter = (pmodal.querySelector('#zp-proxy-ssl-detail')?.style.display || '') !== 'none';
+  out.sslAcmeVisible = (document.getElementById('zp-proxy-ssl-acme')?.style.display || '') !== 'none';
+  out.sslManualHidden = (document.getElementById('zp-proxy-ssl-manual')?.style.display || 'none') === 'none';
+  out.sslCertOptions = Array.from(pcert.options).map((o) => o.value);
+  out.sslCertSelected = pcert.value;
+  out.sslCertHint = (document.querySelector('#zp-proxy-ssl-acme .hint')?.textContent || '').trim();
+
+  // 切到"粘贴自有证书"：手工区出现、证书库区隐藏（两个来源互斥）。
+  document.getElementById('zp-proxy-ssl-provider').value = 'manual';
+  document.getElementById('zp-proxy-ssl-provider').dispatchEvent(new Event('change'));
+  out.sslManualVisibleAfterSwitch = (document.getElementById('zp-proxy-ssl-manual')?.style.display || '') !== 'none';
+  out.sslAcmeHiddenAfterSwitch = (document.getElementById('zp-proxy-ssl-acme')?.style.display || 'none') === 'none';
+  document.getElementById('zp-proxy-ssl-provider').value = 'acme';
+  document.getElementById('zp-proxy-ssl-provider').dispatchEvent(new Event('change'));
+  await waitFor(() => (document.getElementById('zp-proxy-ssl-cert') || {}).options
+    && document.getElementById('zp-proxy-ssl-cert').options.length > 0);
+
+  btnByText(pmodal, '创建').click();
+  await waitFor(() => window.__fetches.some((f) => f.method === 'POST' && f.path === '/api/v1/proxies'));
+  await waitFor(() => window.__fetches.some((f) => f.method === 'POST' && /\/proxies\/\d+\/ssl$/.test(f.path)));
+  const isCreate = (f) => f.method === 'POST' && f.path === '/api/v1/proxies';
+  const isSSL = (f) => f.method === 'POST' && /\/proxies\/\d+\/ssl$/.test(f.path);
+  out.proxyCreateBody = (window.__fetches.find(isCreate) || {}).body;
+  out.proxySSLPath = (window.__fetches.find(isSSL) || {}).path;
+  out.proxySSLBody = (window.__fetches.find(isSSL) || {}).body;
+  out.proxyModalClosed = !!(await waitFor(() => modals().length === 0));
+  closeAllModals();
+
+  // ---- 关闭 HTTPS：编辑一条已启用 SSL 的规则，保存必须带 ssl_enabled:false，
+  //      且**不再**调 /ssl（关就是关，不能顺手又绑一张）。
+  await waitFor(() => Array.from(pbox.querySelectorAll('button'))
+    .filter((b) => (b.textContent || '').trim() === '✏️ 编辑').length >= 2);
+  const editBtns = Array.from(pbox.querySelectorAll('button'))
+    .filter((b) => (b.textContent || '').trim() === '✏️ 编辑');
+  editBtns[1].click(); // [0] 是刚创建的无 SSL 规则，[1] 是预置的 NAS（SSL 已开）
+  const emodal = await waitFor(() => modals().find((m) => (m.querySelector('.modal-head h3')?.textContent || '').includes('反向代理规则')));
+  out.editSSLOnChecked = document.getElementById('zp-proxy-ssl-on').checked;
+  out.editCurrentSSLHint = (emodal.innerText || '').includes('当前已启用');
+  document.getElementById('zp-proxy-ssl-on').checked = false;
+  document.getElementById('zp-proxy-ssl-on').dispatchEvent(new Event('change'));
+  out.sslDetailHiddenAfterUncheck = (emodal.querySelector('#zp-proxy-ssl-detail')?.style.display || 'none') === 'none';
+  const sslPostsBefore = window.__fetches.filter(isSSL).length;
+  btnByText(emodal, '保存').click();
+  await waitFor(() => window.__fetches.some((f) => f.method === 'POST' && f.path === '/api/v1/proxies/21'));
+  out.proxyDisableBody = (window.__fetches.find((f) => f.method === 'POST' && f.path === '/api/v1/proxies/21') || {}).body;
+  out.proxyDisableNoSSLPost = window.__fetches.filter(isSSL).length === sslPostsBefore;
+  closeAllModals();
+
   out.calls = window.__fetches.map((f) => f.method + ' ' + f.path);
   out.taskError = window.__taskError;
   return out;
@@ -632,6 +780,70 @@ check('归一化垃圾输入返回空数组而不是抛异常',
   JSON.stringify(nm));
 check('只保留能识别的条目（certs 垃圾 4 条 → 1 条合法；providers 3 条 → 1 条合法）',
   nm.certsWeird === 1 && nm.providersWeird === 1, JSON.stringify(nm));
+
+// ⑨ 反向代理 HTTPS
+console.log('\n══════════ ⑨ 反向代理 HTTPS ══════════');
+console.log('  列表文本：' + (result.proxyText || '').slice(0, 220));
+console.log('  锁标志：' + JSON.stringify(result.proxyPills || []));
+console.log('  HTTPS 开关存在：' + result.proxyHasSSLSwitch
+  + '；打开前详情隐藏=' + result.sslDetailHiddenBefore + '；打开后可见=' + result.sslDetailVisibleAfter);
+console.log('  证书下拉：' + JSON.stringify(result.sslCertOptions || []) + ' → 预选 ' + result.sslCertSelected);
+console.log('  证书说明：' + (result.sslCertHint || '').slice(0, 160));
+console.log('  切到「粘贴自有证书」：手工区可见=' + result.sslManualVisibleAfterSwitch
+  + '，证书库区隐藏=' + result.sslAcmeHiddenAfterSwitch);
+console.log('  创建规则请求体：' + JSON.stringify(result.proxyCreateBody));
+console.log('  绑定证书：' + result.proxySSLPath + ' 请求体=' + JSON.stringify(result.proxySSLBody));
+console.log('  保存后弹窗关闭：' + result.proxyModalClosed);
+console.log('  关闭 HTTPS：开关初始选中=' + result.editSSLOnChecked
+  + '，请求体=' + JSON.stringify(result.proxyDisableBody)
+  + '，未再调 /ssl=' + result.proxyDisableNoSSLPost);
+
+check('规则列表显示锁标志（已启用 HTTPS 的规则有 🔒，纯 HTTP 的没有）',
+  result.proxyLockPillCount === 1, JSON.stringify(result.proxyPills));
+check('锁标志的悬浮说明给出证书路径',
+  (result.proxyPillTitles || []).some((x) => /certs\/nas\.zizdog\.com\/fullchain\.pem/.test(x)),
+  JSON.stringify(result.proxyPillTitles || []));
+check('列表行显示证书覆盖域名与到期/剩余天数',
+  /覆盖 nas\.zizdog\.com/.test(result.proxyText || '') && /2026-12-01/.test(result.proxyText || ''),
+  (result.proxyText || '').slice(0, 240));
+check('编辑表单里有「启用 HTTPS」开关', result.proxyHasSSLSwitch === true);
+check('HTTPS 详情默认隐藏，打开开关后才出现', result.sslDetailHiddenBefore === true && result.sslDetailVisibleAfter === true,
+  `before=${result.sslDetailHiddenBefore} after=${result.sslDetailVisibleAfter}`);
+check('证书来源选 acme 时出现证书库下拉、手工粘贴区隐藏',
+  result.sslAcmeVisible === true && result.sslManualHidden === true,
+  JSON.stringify({ acme: result.sslAcmeVisible, manualHidden: result.sslManualHidden }));
+check('证书下拉来自证书接口（3 张已签发证书）',
+  JSON.stringify(result.sslCertOptions || []) === JSON.stringify(['demo.test', 'api.test', 'old.test']),
+  JSON.stringify(result.sslCertOptions));
+check('按规则域名自动预选证书（demo.test）', result.sslCertSelected === 'demo.test', result.sslCertSelected);
+check('证书说明给出到期/剩余天数',
+  /到期：2026-10-01/.test(result.sslCertHint || '') && /剩余 12 天/.test(result.sslCertHint || ''),
+  result.sslCertHint);
+check('切到「粘贴自有证书」后两个来源互斥',
+  result.sslManualVisibleAfterSwitch === true && result.sslAcmeHiddenAfterSwitch === true,
+  JSON.stringify({ manual: result.sslManualVisibleAfterSwitch, acmeHidden: result.sslAcmeHiddenAfterSwitch }));
+check('保存先创建规则，且创建请求体不带 ssl_enabled（证书由专用接口绑定）',
+  !!result.proxyCreateBody && !('ssl_enabled' in result.proxyCreateBody)
+  && result.proxyCreateBody.target === 'http://127.0.0.1:9000'
+  && result.proxyCreateBody.domains === 'demo.test',
+  JSON.stringify(result.proxyCreateBody));
+check('创建成功后紧接着 POST /api/v1/proxies/7/ssl 绑定证书',
+  result.proxySSLPath === '/api/v1/proxies/7/ssl', String(result.proxySSLPath));
+check('绑定请求体符合站点侧同构契约（provider=acme + cert_primary）',
+  !!result.proxySSLBody && result.proxySSLBody.provider === 'acme'
+  && result.proxySSLBody.cert_primary === 'demo.test',
+  JSON.stringify(result.proxySSLBody));
+check('绑定成功后弹窗自动关闭', result.proxyModalClosed === true);
+check('编辑已开 SSL 的规则时开关处于选中态并提示当前状态',
+  result.editSSLOnChecked === true && result.editCurrentSSLHint === true,
+  JSON.stringify({ checked: result.editSSLOnChecked, hint: result.editCurrentSSLHint }));
+check('关掉开关后 HTTPS 详情隐藏（不再是"看着开着其实没关"）',
+  result.sslDetailHiddenAfterUncheck === true, String(result.sslDetailHiddenAfterUncheck));
+check('关闭 HTTPS 走主接口且请求体带 ssl_enabled=false',
+  !!result.proxyDisableBody && result.proxyDisableBody.ssl_enabled === false,
+  JSON.stringify(result.proxyDisableBody));
+check('关闭 HTTPS 时不再调 /ssl（不会顺手重绑一张证书）',
+  result.proxyDisableNoSSLPost === true, String(result.proxyDisableNoSSLPost));
 
 console.log('\n══════════ 断言结果 ══════════');
 let failed = 0;
