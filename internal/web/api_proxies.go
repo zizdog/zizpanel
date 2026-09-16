@@ -405,6 +405,11 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, err.Error())
 		return
 	}
+	// 与**站点 vhost** 的冲突：规则还没写盘，所以 selfFile 传空。
+	if err := s.checkProxyAgainstSiteVhosts(rule, ""); err != nil {
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
 	created, err := s.proxyRepo().Create(r.Context(), rule)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, err.Error())
@@ -477,6 +482,11 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.checkProxySSLPortMix(r.Context(), &next); err != nil {
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
+	// 与**站点 vhost** 的冲突（跳过这份规则自己的文件）。
+	if err := s.checkProxyAgainstSiteVhosts(&next, fmt.Sprintf("proxy-%d.conf", id)); err != nil {
 		fail(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -1824,14 +1834,21 @@ func (s *Server) checkProxySSLPortMix(ctx context.Context, rule *proxies.Rule) e
 		if other.SSLEnabled == rule.SSLEnabled {
 			continue
 		}
-		mode, want := "HTTP", "HTTPS"
-		if rule.SSLEnabled {
-			mode, want = "HTTPS", "HTTP"
+		// other 与 rule 的 SSL 一定不同（相同的上面 continue 了），两者的模式互为反面。
+		//
+		// ⚠️ 这里曾经把两个标签写反（赋值与打印顺序对不上）：用户明明"新规则没开
+		// HTTPS、已有规则是 HTTPS"，弹出来的却是「已有HTTP规则…而这条是HTTPS」——
+		// 正好把人往反方向带（2026-09-17 用户实测报障）。
+		// 这条是 HTTPS ⇒ 那条是 HTTP；这条是 HTTP ⇒ 那条是 HTTPS。
+		otherMode, myMode := "HTTP", "HTTPS"
+		if !rule.SSLEnabled {
+			otherMode, myMode = "HTTPS", "HTTP"
 		}
 		return fmt.Errorf("端口 %d 上已有%s规则「%s」，而这条是%s：nginx 的同一端口不能同时跑 "+
-			"HTTP 与 HTTPS（只要有一个 server 块启用 ssl，整个端口就变成 TLS）。"+
-			"请把这条规则改到别的端口，或先停用/删除「%s」",
-			rule.Listen, mode, other.Name, want, other.Name)
+			"HTTP 与 HTTPS（只要有一个 server 块启用 ssl，整个端口就变成 TLS）。\n"+
+			"三条出路：① 让这条也启用 HTTPS（同一端口必须同为 TLS；域名有证书时这条最简单）；"+
+			"② 把这条规则改到别的端口；③ 先停用/删除「%s」",
+			rule.Listen, otherMode, other.Name, myMode, other.Name)
 	}
 	return nil
 }

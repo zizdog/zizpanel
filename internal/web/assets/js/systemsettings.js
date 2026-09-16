@@ -54,6 +54,20 @@ export function SystemSettingsView(content, ctx = {}) {
   const diagBody = h('dl.kv');
   const remoteBody = h('dl.kv');
 
+  // ---------- 内网段预授权（可选、可一键撤销；见后端 lan_preauth.go）----------
+  const lanStatus = h('div');
+  const lanToggle = h('input', { type: 'checkbox' });
+  const lanInput = h('input.input', {
+    type: 'text',
+    placeholder: '例如 192.168.1.0/24（多个用逗号分隔）',
+  });
+  const lanMsg = h('div');
+  const lanSaveBtn = h('button.btn.btn-sm.btn-primary', { text: '保存', onclick: () => submitLAN(lanToggle.checked) });
+  const lanRollbackBtn = h('button.btn.btn-sm', { text: '撤销', onclick: () => submitLAN(false) });
+  // 用户手动改过输入框之后，刷新状态不再覆盖它（否则会把正在编辑的内容冲掉）。
+  let lanTouched = false;
+  lanInput.addEventListener('input', () => { lanTouched = true; });
+
   const refreshBtn = h('button.btn.btn-sm', { text: '⟳ 刷新状态', onclick: () => load(true) });
 
   appendAll(content,
@@ -91,6 +105,47 @@ export function SystemSettingsView(content, ctx = {}) {
         h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
           actionBtn('server-mode', 'btn-primary'),
         ]),
+      ]),
+    ]),
+
+    // ---------- 允许免授权访问内网段（可选、可一键撤销）----------
+    //
+    // 为什么单独一张卡：这是**降低隐私门强度**的可选项，必须在界面上把代价
+    // 写清楚（对所有程序生效、需重启），并且状态要显示磁盘上的真实值。
+    h('div.card', [
+      h('div.card-head', [
+        h('h3', { text: '允许免授权访问内网段' }),
+        h('div.spacer'),
+        h('span.sub', { text: '可选 · 会削弱 macOS「本地网络」隐私门 · 需重启' }),
+      ]),
+      h('div.card-body', [
+        h('p.hint', {
+          text: 'macOS 15 的「本地网络」隐私门会拦住没拿到授权的程序访问局域网。' +
+            'Homebrew 的 nginx 是 ad-hoc 签名、标识随升级变化，无头服务器上没人点授权弹窗，' +
+            '所以它的局域网反代会 502。开启这一项会写入 Apple 官方的预授权键' +
+            '（com.apple.network.local-network 的两个 CIDR 数组，系统域与真实用户域各一份），' +
+            '让系统把这个网段当成"不是本地网络"。',
+        }),
+        h('p.hint', [
+          '代价：这个网段在本机上对',
+          h('strong', { text: '所有程序' }),
+          '都不再受这道隐私门限制（不是只对 nginx 或面板）。改动必须重启后才生效，' +
+            '撤销后也要再重启一次才完全恢复。',
+        ]),
+        lanStatus,
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '12px 0 6px' } }, [
+          lanToggle,
+          h('span', { text: '写入预授权（勾选后点「保存」写入；取消勾选后点「保存」= 删除）' }),
+        ]),
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' } }, [
+          h('span.hint', { text: '网段（CIDR，逗号分隔）' }),
+          lanInput,
+        ]),
+        h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
+          lanSaveBtn,
+          lanRollbackBtn,
+        ]),
+        lanMsg,
       ]),
     ]),
 
@@ -338,6 +393,116 @@ export function SystemSettingsView(content, ctx = {}) {
       ['SSH 状态', st.ssh_listening ? '正在监听' : '未监听'],
       ['自动登录用户', st.auto_login ? st.auto_login : '未开启（安全）'],
     ].forEach(([k, v]) => remoteBody.append(h('dt', { text: k }), h('dd', { text: v })));
+
+    // ---------- 内网段预授权 ----------
+    renderLAN(st);
+  }
+
+  // renderLAN 把后端探测到的真实状态画成状态行（不靠"上次点过按钮"的记忆）。
+  function renderLAN(st) {
+    const lp = st.lan_preauth || {};
+    clear(lanStatus);
+    clear(lanMsg);
+    // 默认值：已设置就显示当前网段，否则显示自动推导出来的默认网段。
+    if (!lanTouched && !lanInput.value) {
+      lanInput.value = (lp.cidrs && lp.cidrs.length)
+        ? lp.cidrs.join(', ')
+        : (lp.detected_cidr || '');
+    }
+    if (!lp.supported) {
+      lanToggle.disabled = true;
+      lanStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill.warn', { text: '本机不支持' }),
+        h('span.sub', { text: '找不到 /usr/bin/defaults，无法读写这个偏好域。' }),
+      ]));
+      return;
+    }
+    lanToggle.disabled = false;
+    if (!lp.readable) {
+      // 读不到就直说读不到 —— 不猜一个状态给用户。
+      lanStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill.danger', { text: '状态读取失败' }),
+        h('span.sub', { text: lp.read_error || '读不到当前状态。' }),
+      ]));
+      return;
+    }
+    let pill;
+    if (lp.enabled) {
+      lanToggle.checked = true;
+      pill = lp.reboot_required
+        ? h('span.pill.warn', { text: '已写入 · 重启后生效' })
+        : h('span.pill.danger', { text: '已生效 · 该网段对所有程序放行' });
+    } else if (lp.partial) {
+      lanToggle.checked = true;
+      pill = h('span.pill.warn', { text: '不完整 · 只写进了一个域' });
+    } else if (lp.reboot_required) {
+      // 磁盘上已经没有设置，但文件是本次开机后改的 → 要重启才恢复隐私门。
+      lanToggle.checked = false;
+      pill = h('span.pill.warn', { text: '已撤销 · 重启后恢复隐私门' });
+    } else {
+      lanToggle.checked = false;
+      pill = h('span.pill.ok', { text: '未开启 · 仍受隐私门保护' });
+    }
+    const row = [pill];
+    if (lp.cidrs && lp.cidrs.length) row.push(h('span.mono', { text: lp.cidrs.join(', ') }));
+    lanStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, row));
+    if (lp.reboot_note) lanStatus.append(h('div.hint', { text: lp.reboot_note }));
+    else if (lp.note) lanStatus.append(h('div.hint', { text: lp.note }));
+    if (lp.warning) lanStatus.append(h('div.hint', { text: '⚠️ ' + lp.warning }));
+  }
+
+  // submitLAN 写入（enabled=true）或撤销（enabled=false）。
+  //
+  // 纪律：只有后端真的返回成功才提示"已写入/已撤销"；失败时如实显示错误，
+  // 并且**不**去刷新状态（避免把错误信息冲掉）。
+  async function submitLAN(enable) {
+    if (enable) {
+      const cidrs = (lanInput.value || '').trim();
+      if (!cidrs) {
+        showLANMsg('请先填一个网段（CIDR），例如 192.168.1.0/24。');
+        lanInput.focus();
+        return;
+      }
+    }
+    const yes = await confirmBox(
+      enable
+        ? '会写入 Apple 官方预授权键（系统域 + 真实用户域），让该网段对所有程序都不再受' +
+          '「本地网络」隐私门限制，而且必须重启后才生效。确定写入？'
+        : '会删除两个域的预授权键；撤销后要重启一次才能完全恢复隐私门。确定撤销？',
+      {
+        title: enable ? '允许免授权访问内网段' : '撤销内网段预授权',
+        danger: true,
+        okText: enable ? '写入' : '撤销',
+      },
+    );
+    if (!yes) return;
+    setLANBusy(true);
+    try {
+      const st = await api.systemSettingsLANPreauth({
+        enabled: enable,
+        cidrs: enable ? lanInput.value.trim() : '',
+      });
+      toast(enable ? '已写入预授权，重启后生效' : '已撤销预授权，重启后恢复隐私门', 'ok');
+      // 直接渲染后端返回的**真实状态**：它带着"刚写入 → 必须重启"的强制标记。
+      // 这里不再重新探测一次，免得 cfprefsd 还没落盘时把"需重启"读丢。
+      renderLAN({ lan_preauth: st });
+    } catch (e) {
+      showLANMsg((enable ? '写入失败：' : '撤销失败：') + (e && e.message ? e.message : e));
+    } finally {
+      setLANBusy(false);
+    }
+  }
+
+  function showLANMsg(text) {
+    clear(lanMsg);
+    lanMsg.append(h('div', { style: { marginTop: '10px' } }, [
+      h('span.pill.danger', { text: '⚠️ ' + text }),
+    ]));
+  }
+
+  function setLANBusy(busy) {
+    lanSaveBtn.disabled = busy;
+    lanRollbackBtn.disabled = busy;
   }
 
   // 注意：**不**订阅任务中心的进度变化来刷新状态。

@@ -962,7 +962,7 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
-// handleInstallLNMP 一键安装 LNMP 环境。
+// handleInstallLNMP 一键 LNMP（nginx + PHP + MySQL 的组合动作）。
 //
 // 这是个"组合动作"：会 brew 安装三个包，并做四件包管理管不到的收尾工作
 // （nginx 改 listen 80、建 vhosts/include、初始化 MySQL、注册系统级守护进程）。
@@ -972,7 +972,7 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 // 而且任务挂在 r.Context() 上 —— 一刷新就把 brew 杀了。现在交给任务中心，
 // 立刻返回 task_id，进度走 SSE（见 SPEC-任务中心.md）。
 func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "lnmp", "一键安装 LNMP 环境（nginx / PHP 8.2 / MySQL 8.4）",
+	s.launchTask(w, r, "install", "lnmp", "一键 LNMP（nginx / PHP 8.2 / MySQL 8.4）",
 		"install_lnmp", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "lnmp", Steps: []string{}}
 			if err := s.svcManager().InstallLNMP(ctx, res); err != nil {

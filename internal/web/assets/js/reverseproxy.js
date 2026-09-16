@@ -160,6 +160,24 @@ export function ReverseProxyView(content, ctx = {}) {
         ? h('span.pill.ok', { text: 'nginx 已安装' })
         : h('span.pill.danger', { text: '需要先安装 nginx' }),
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      // 「修复 nginx 环境」从「网站管理」搬到这里（用户要求）：它补的正是**反向代理**
+      // 依赖的两样东西（conf.d 的加载 + WebSocket 升级用的 $connection_upgrade map），
+      // 放在站点列表里既找不着、名字也说不清它干什么。名字改成直白的
+      // 「补齐 nginx 全局配置」，title 里写清具体补什么、且只补缺失部分。
+      ng.installed
+        ? h('button.btn.btn-sm', {
+          text: '🧩 补齐 nginx 全局配置',
+          title: '确保 nginx.conf 里加载 conf.d/*.conf，并定义 WebSocket 升级所需的 $connection_upgrade map。\n'
+            + '反向代理（尤其是带 WebSocket 的界面）依赖它；只补齐缺失的部分，不改你已有的配置。',
+          onclick: async () => {
+            try {
+              const r = await api.nginxRepair();
+              toast(r.msg || '已补齐', 'ok');
+              load();
+            } catch (e) { toast(e.message, 'err', 9000); }
+          },
+        })
+        : null,
       h('button.btn.btn-sm.btn-primary', {
         text: '➕ 新建规则',
         disabled: !ng.installed,

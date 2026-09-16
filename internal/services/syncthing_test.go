@@ -648,3 +648,61 @@ func TestInstallSyncthingRequiresHomebrew(t *testing.T) {
 		t.Errorf("没有 Homebrew 时不该执行任何命令，实际有调用记录：%s", marker)
 	}
 }
+
+// TestInstallSyncthingRestartsServiceBeforeAuthProbe 锁住 2026-09-17 mini 真机缺陷：
+//
+// 面板改完 config.xml 后必须**重启服务**再自检。Syncthing v2 不会热加载 GUI 的
+// 监听地址与凭据 —— 只写文件的话进程仍绑 127.0.0.1:8384（真机日志
+// `GUI and API listening (address=127.0.0.1:8384)`），自检端点返回 404，
+// 首次安装必然失败（实测：任务 1m0s 后 failed；手动重启服务后功能全部正常）。
+//
+// 判据：brew 调用序列里必须出现 stop + start，且 start **在自检之前**。
+func TestInstallSyncthingRestartsServiceBeforeAuthProbe(t *testing.T) {
+	m, rec, marker := newSyncthingHarness(t, true, 200, 204)
+	writeSyncthingConfig(t, m, syncthingTestConfig)
+	// 用 auth 探针记录"自检发生时已经执行过哪些 brew 调用"。
+	probeAt := -1
+	oldAuth := syncthingAuthProbe
+	syncthingAuthProbe = func(_ context.Context, user, password string) (int, error) {
+		if probeAt < 0 {
+			probeAt = len(brewCallsOf(t, marker))
+		}
+		return rec.auth(context.Background(), user, password)
+	}
+	t.Cleanup(func() { syncthingAuthProbe = oldAuth })
+
+	res := &InstallResult{App: "syncthing", Name: "Syncthing（文件同步）", Steps: []string{}}
+	if err := m.InstallSyncthing(context.Background(), res); err != nil {
+		t.Fatalf("安装应成功，实际: %v", err)
+	}
+	all := strings.Join(brewCallsOf(t, marker), "\n")
+	if !strings.Contains(all, "services stop syncthing") {
+		t.Errorf("改完配置后必须先停服务（Syncthing 不热加载），实际 brew 调用：\n%s", all)
+	}
+	if !strings.Contains(all, "services start syncthing") {
+		t.Errorf("改完配置后必须重新启动服务，实际 brew 调用：\n%s", all)
+	}
+	if probeAt < 0 {
+		t.Fatal("没有观察到凭据自检探测")
+	}
+	before := strings.Join(brewCallsOf(t, marker)[:probeAt], "\n")
+	if !strings.Contains(before, "services start syncthing") {
+		t.Errorf("重启必须发生在自检**之前**，实际自检时的调用：\n%s", before)
+	}
+}
+
+// brewCallsOf 读出假 brew 记录的调用行。
+func brewCallsOf(t *testing.T, marker string) []string {
+	t.Helper()
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		return nil
+	}
+	out := []string{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) != "" {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+	return out
+}

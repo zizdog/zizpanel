@@ -23,6 +23,9 @@ import (
 // handleSystemSettings 返回系统设置的当前真实状态。
 func (s *Server) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 	st := sysconfig.Probe(r.Context())
+	// 内网段预授权单独走可注入的探针（见 api_systemsettings_lan.go），
+	// 这样它的状态探测与写入动作都能在单测里换成假实现，绝不碰真实偏好域。
+	st.LANPreauth = withLANWarning(lanPreauthProbeFn(r.Context()))
 	ok(w, st)
 }
 

@@ -617,16 +617,36 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 				Credential{Key: "syncthing_gui_password", Value: password,
 					Label: "Syncthing 界面口令（面板随机生成，请自行保存）"})
 
-			// ---- 6. 等它自己重载配置并真的接受新凭据 ----
-			res.step(ctx, "等待 Syncthing 重载配置并自检新凭据（POST "+syncthingAPIBase+
+			// ---- 6. 重启服务让新配置生效，再自检凭据 ----
+			//
+			// Syncthing v2 **不会热加载** GUI 的监听地址与凭据：只改 config.xml
+			// （它还会自己写回文件）并不改变正在跑的那个进程的监听 socket。
+			// 真机复现（2026-09-17 mini，全新安装）：文件已经写成
+			// `<address>0.0.0.0:8384</address>` + bcrypt `<password>`，而进程日志
+			// 仍是 `GUI and API listening (address=127.0.0.1:8384)`，自检端点
+			// `/rest/noauth/auth/password` 返回 **404**（不是 403）→ 第一次安装
+			// 必然在自检处失败（而"失败了要能重试"这件事本身也不该靠人肉）。
+			//
+			// 用 stop + start 而不是 `brew services restart`：面板跑 brew 的上下文
+			// 里 restart 在有的机器上会落到不对的 launchd 域（真机实测普通 SSH 下
+			// `Could not enable service: 125`），而 stop/start 这两条在本项目里
+			// 已经到处在用、行为确定。stop 失败不算错（本来就没在跑）。
+			res.step(ctx, "重启 Syncthing 让它加载新的监听地址与凭据")
+			if _, err := m.brewRun(ctx, 2*time.Minute, "services", "stop", syncthingFormula); err != nil {
+				res.step(ctx, "（停止旧实例时 brew 报错，继续启动：+"+err.Error()+"）")
+			}
+			if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", syncthingFormula); err != nil {
+				return fmt.Errorf("配置已改好但重启 Syncthing 失败: %w%s", err, m.syncthingLogTailNote(password))
+			}
+			res.step(ctx, "等待 Syncthing 用新配置起来并自检新凭据（POST "+syncthingAPIBase+
 				"/rest/noauth/auth/password 期望 204，最多 "+syncthingAuthTimeout.String()+"）")
 			if !m.waitSyncthingAuth(ctx, syncthingGUIUser, password) {
-				return fmt.Errorf("配置已改动，但 Syncthing 在 %s 内没有用新凭据通过校验"+
+				return fmt.Errorf("配置已改动并重启过，但 Syncthing 在 %s 内没有用新凭据通过校验"+
 					"（POST %s/rest/noauth/auth/password 未返回 204）%s。"+
 					"界面地址与凭据已经写进 %s，本次生成的口令仍在上方的一次性凭据区块里："+
-					"可在终端执行 brew services restart %s 后再试",
+					"可在终端执行 brew services stop %s && brew services start %s 后再试",
 					syncthingAuthTimeout, syncthingAPIBase, m.syncthingLogTailNote(password),
-					cfgPath, syncthingFormula)
+					cfgPath, syncthingFormula, syncthingFormula)
 			}
 			res.step(ctx, "新凭据自检通过（POST "+syncthingAPIBase+
 				"/rest/noauth/auth/password 返回 204）")

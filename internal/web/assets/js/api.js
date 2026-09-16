@@ -377,6 +377,10 @@ export const api = {
   systemSettings: () => request('GET', `${API_BASE}/system/settings`),
   systemSettingsAction: (action) =>
     request('POST', `${API_BASE}/system/settings/${enc(action)}`, {}),
+  // 内网段预授权：秒级同步接口（写 defaults + 读回复核），
+  // payload = { enabled, cidrs }；成功返回的是**重新探测到**的状态。
+  systemSettingsLANPreauth: (payload) =>
+    request('POST', `${API_BASE}/system/settings/lan-preauth`, payload),
 
   // ---- nginx 环境 ----
   nginxTest: () => request('POST', `${API_BASE}/system/nginx/test`, {}),

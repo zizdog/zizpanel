@@ -46,7 +46,7 @@ function startLNMP() {
     // target 用 'lnmp'：与后端任务（POST /api/v1/market/install-lnmp → 202 + task_id）
     // 保持一致，市场/任务中心的「查看进度」也按这个值找运行中的任务。
     target: 'lnmp',
-    title: '一键安装 LNMP 环境',
+    title: '一键 LNMP',
     start: () => api.installLNMP(),
   });
 }
@@ -55,7 +55,7 @@ function startLNMP() {
 // 其余情况（列表非空）在工具条上给一个**次级按钮** —— 同一页不同时给两个大入口。
 function lnmpButton(big) {
   return h('button.btn' + (big ? '.btn-primary' : '.btn-sm'), {
-    text: '⚡ 一键安装 LNMP 环境',
+    text: '⚡ 一键 LNMP',
     title: LNMP_HINT,
     onclick: startLNMP,
   });
@@ -111,10 +111,6 @@ export function SitesView(content, ctx = {}) {
     // （工具栏上真的显示过一个 null，见 ui.js 的注释）。
     const bar = [
       h('span.pill', { text: `共 ${(c.list || []).length} 个站点` }),
-      h('span.pill' + (phpRunning > 0 ? '.ok' : '.warn'), {
-        text: `PHP-FPM 运行中 ${phpRunning}/${phps.length} 个`,
-        title: phps.map((p) => `${p.version} ${p.running ? '运行中' : '未运行'} · ${p.pass || p.listen_err || '端点未解析'}`).join('\n'),
-      }),
     ];
     if (phpNeedFix) {
       bar.push(h('span.pill.warn', {
@@ -129,29 +125,23 @@ export function SitesView(content, ctx = {}) {
       // LNMP 入口：站点非空时放工具条上的**次级按钮**；空列表时改用中间的大按钮
       // （见 renderList 的空态），两处不同时出现，避免重复入口。
       ...(list.length ? [lnmpButton(false)] : []),
+      // 「PHP-FPM 运行中 x/y 个」原来是一个独立药丸，与这个按钮说的是同一件事 ——
+      // 用户要求合并：状态直接写进按钮文案，点开就是 PHP 环境面板。
       h('button.btn.btn-sm', {
-        text: '🐘 PHP 环境',
-        title: '查看已安装的 PHP 版本、各自的 FastCGI 端点与运行状态；一键修复端点',
+        text: phps.length ? `🐘 PHP 环境 · ${phpRunning}/${phps.length} 运行中` : '🐘 PHP 环境',
+        title: '查看已安装的 PHP 版本、各自的 FastCGI 端点与运行状态；一键修复端点\n'
+          + phps.map((p) => `${p.version} ${p.running ? '运行中' : '未运行'} · ${p.pass || p.listen_err || '端点未解析'}`).join('\n'),
         onclick: phpEnvModal,
       }),
       h('button.btn.btn-sm', {
-        text: '🧪 校验 nginx 配置',
+        text: '🧪 校验 nginx',
+        title: '对 nginx 配置跑一次语法校验（nginx -t）',
         onclick: async () => {
           try {
             const r = await api.nginxTest();
             if (r.ok) toast('nginx 配置校验通过', 'ok');
             else toast('配置有问题：' + r.output, 'err', 12000);
           } catch (e) { toast(e.message, 'err'); }
-        },
-      }),
-      h('button.btn.btn-sm', {
-        text: '🔧 修复 nginx 环境',
-        title: '补齐反向代理所需的 WebSocket 升级 map 与 conf.d 加载',
-        onclick: async () => {
-          try {
-            const r = await api.nginxRepair();
-            toast(r.msg || '已修复', 'ok');
-          } catch (e) { toast(e.message, 'err', 9000); }
         },
       }),
       h('button.btn.btn-sm', {

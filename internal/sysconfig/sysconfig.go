@@ -107,6 +107,11 @@ type State struct {
 	Portable     bool        `json:"portable"`
 	Tailscale    bool        `json:"tailscale"`
 	IsRoot       bool        `json:"is_root"`
+	// LANPreauth 是「允许免授权访问内网段」的当前状态（见 lan_preauth.go）。
+	//
+	// 它在 web 层填充（handler 通过可注入的探针调用 DetectLANPreauth），
+	// 这样状态探测与动作可以分别注入假实现，单测绝不碰真实偏好域。
+	LANPreauth LANPreauthState `json:"lan_preauth"`
 	// ProtectedDirs 是 macOS 隐私保护目录（文档/下载/桌面…）的可读性。
 	//
 	// 为什么要探测（用户反馈）：把 ~/Documents 挂进 File Browser 容器后
@@ -149,6 +154,20 @@ type runner struct {
 	log LogFunc
 }
 
+// runCommand 是"执行一条命令并取回合并输出"的唯一入口。
+//
+// 抽成包级变量有两个原因：
+//  1. 本包新增的「内网段预授权」（lan_preauth.go）要写 macOS 偏好域，
+//     单测必须能断言**拼出来的 argv**（含用户域的 sudo -u 真实用户），
+//     而绝不能真的执行 defaults —— 那会改到真实偏好。
+//  2. 执行路径集中在一处，不会出现"另一条自己拼 exec.Command 的旁路"。
+//
+// 生产实现就是 exec.CommandContext(...).CombinedOutput()，行为与改造前一致。
+var runCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return string(out), err
+}
+
 // run 执行一条命令，把命令本身与输出都写进日志（用户要看到"到底跑了什么"）。
 func (r *runner) run(ctx context.Context, name string, args ...string) (string, error) {
 	line := name
@@ -160,7 +179,7 @@ func (r *runner) run(ctx context.Context, name string, args ...string) (string, 
 	}
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, name, args...).CombinedOutput()
+	out, err := runCommand(cctx, name, args...)
 	text := strings.TrimSpace(string(out))
 	if text != "" && r.log != nil {
 		for _, l := range strings.Split(text, "\n") {
@@ -180,7 +199,10 @@ func firstLine(text string, err error) string {
 		}
 		return t
 	}
-	return err.Error()
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // ---------- 探测 ----------

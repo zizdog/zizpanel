@@ -404,8 +404,8 @@ try {
     await page.waitForTimeout(500);
   });
 
-  await privStep('校验 nginx 配置', async () => {
-    await page.click('button:has-text("校验 nginx 配置")');
+  await privStep('校验 nginx', async () => {
+    await page.click('button:has-text("校验 nginx")');
     await page.waitForSelector('.toast', { timeout: 15000 });
     await page.waitForTimeout(800);
     const toastText = await page.locator('.toast').first().innerText();
@@ -517,7 +517,7 @@ try {
     // 找一个可用的"安装"按钮（不是已安装、不是不可用）。
     //
     // `:text-is()` 是**精确**匹配，不能写成 `:has-text("安装")`：
-    // 市场页顶部还有一颗「⚡ 一键安装 LNMP 环境」，同样含"安装"二字，
+    // 市场页顶部还有一颗「⚡ 一键 LNMP」，但这里的 `安装` 精确匹配本就排除它；
     // 而且是页面里第一个匹配项 —— 用宽松匹配会点开 LNMP 向导，
     // 于是"未显示检查项"失败，看起来像市场坏了，其实只是点错了按钮。
     const btn = page.locator('.content button:text-is("安装")').first();

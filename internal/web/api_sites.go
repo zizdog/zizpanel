@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/priv"
+	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tlsx"
 )
@@ -894,6 +895,19 @@ func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "配置内容不能为空（要停用站点请改 enabled 开关或删除站点）")
 		return
 	}
+	// 保存前先拦"同端口 + 同 server_name"的冲突：nginx 只加载其中一份、另一份静默失效，
+	// 用户会看到"站点指向了别的站"（真机事故见 checkVhostCollisionWithFiles 的注释）。
+	if hit, err := checkVhostCollisionWithFiles(s.Cfg.VhostDir, req.Content, domain+".conf"); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if hit.FileName != "" {
+		fail(w, http.StatusConflict, fmt.Sprintf(
+			"配置里的 %s 与 %s 冲突：两者都在监听 %d 且 server_name=%s。"+
+				"nginx 只会加载其中一份（被忽略的那份会**静默失效**，站点会指向别的站）。\n"+
+				"请改端口或域名；如果 %s 是反代规则，也可以先在「反向代理」里停用/删除它。",
+			domain+".conf", hit.FileName, hit.Port, hit.Name, hit.FileName))
+		return
+	}
 	snap := s.snapshotVhost(domain)
 	if err := siteWriteVhostFn(s, ctx, domain, req.Content); err != nil {
 		// helper 自己已经做了 nginx -t 且没有落盘（失败即回滚文件），
@@ -960,6 +974,157 @@ func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 type siteListenPort struct {
 	Port int
 	SSL  bool
+}
+
+// isNginxTokenBoundary 判断某个下标是不是 nginx 指令词的边界（前一个字符是分隔符）。
+//
+// 用途：按"指令词 + 到分号/花括号"扫描时，避免匹配到 `ssl_listen` 这类以指令词
+// 结尾的标识符。抽成函数是为了 server_name / listen 两处用同一个判据。
+func isNginxTokenBoundary(s string, i int) bool {
+	if i <= 0 {
+		return true
+	}
+	switch s[i-1] {
+	case ' ', '\t', '\n', '\r', ';', '{', '}':
+		return true
+	}
+	return false
+}
+
+// siteServerBlocks 返回内容里每一个 `server { … }` 块的原文（花括号配对）。
+//
+// 为什么按块而不是全文件扫描：同一份 vhost 里通常有 80 与 443 两个 server 块，
+// 它们各自有自己的 server_name。把"全文件的端口 × 全文件的名字"做笛卡尔积会
+// 造出根本不存在的组合（a.com:443），进而产生**误报**式的冲突拦截。
+func siteServerBlocks(content string) []string {
+	var out []string
+	for i := 0; i+len("server") <= len(content); i++ {
+		if content[i:i+len("server")] != "server" || !isNginxTokenBoundary(content, i) {
+			continue
+		}
+		j := i + len("server")
+		for j < len(content) && (content[j] == ' ' || content[j] == '\t' || content[j] == '\n' || content[j] == '\r') {
+			j++
+		}
+		if j >= len(content) || content[j] != '{' {
+			continue
+		}
+		depth, end := 0, -1
+		for k := j; k < len(content); k++ {
+			switch content[k] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = k
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			break
+		}
+		out = append(out, content[i:end+1])
+		i = end
+	}
+	return out
+}
+
+// siteServerNames 抽出内容里全部 server_name（跳过 `_` / 正则 / 变量）。
+func siteServerNames(content string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i := 0; i+len("server_name") <= len(content); i++ {
+		if content[i:i+len("server_name")] != "server_name" || !isNginxTokenBoundary(content, i) {
+			continue
+		}
+		rest := content[i+len("server_name"):]
+		semi := strings.IndexByte(rest, ';')
+		if semi < 0 {
+			break
+		}
+		for _, f := range strings.Fields(rest[:semi]) {
+			if f == "" || f == "_" || strings.HasPrefix(f, "~") || strings.HasPrefix(f, "$") || seen[f] {
+				continue
+			}
+			seen[f] = true
+			out = append(out, f)
+		}
+		i += len("server_name") + semi
+	}
+	return out
+}
+
+// vhostIdentity 是一份 vhost 里"nginx 用来选虚拟主机"的一条身份：端口 + server_name。
+type vhostIdentity struct {
+	Port     int
+	Name     string
+	FileName string
+}
+
+// vhostIdentities 逐 server 块抽出 (端口, server_name) 组合。
+func vhostIdentities(content, fileName string) []vhostIdentity {
+	var out []vhostIdentity
+	for _, block := range siteServerBlocks(content) {
+		ports := siteListenPorts(block)
+		if len(ports) == 0 {
+			continue
+		}
+		for _, name := range siteServerNames(block) {
+			for _, p := range ports {
+				out = append(out, vhostIdentity{Port: p.Port, Name: name, FileName: fileName})
+			}
+		}
+	}
+	return out
+}
+
+// collideVhosts 在两组身份里找"同端口 + 同 server_name"的冲突，返回第一条。
+func collideVhosts(mine, others []vhostIdentity) (vhostIdentity, bool) {
+	for _, m := range mine {
+		for _, o := range others {
+			if m.Port == o.Port && m.Name == o.Name {
+				return vhostIdentity{Port: m.Port, Name: m.Name, FileName: o.FileName}, true
+			}
+		}
+	}
+	return vhostIdentity{}, false
+}
+
+// checkVhostCollisionWithFiles 检查"这份配置的 (端口, server_name)"是否与 vhosts 目录里
+// **别的** .conf 重复（selfFile 是要保存/更新的那份，跳过它自己）。
+//
+// 为什么必须拦：同一端口上重复的 server_name，nginx 只会加载其中一份（按 include
+// 顺序），另一份**静默失效**，`nginx -t` 只给一行 warning。真机事故（2026-09-17）：
+// 用户把 wp.zizdog.com 的 vhost 存成 `listen 8889 ssl` + 同名，撞上反代规则 9
+// （也是 8889 + 同名）；proxy-9.conf 字典序在前，于是站点那份被忽略、443 上又没有
+// wp 的 server 块 → 8889 的流量落到了 blog.zizdog.com，用户看到"我的站变成了别的站"。
+func checkVhostCollisionWithFiles(vhostDir, content, selfFile string) (vhostIdentity, error) {
+	mine := vhostIdentities(content, selfFile)
+	if len(mine) == 0 {
+		return vhostIdentity{}, nil
+	}
+	entries, err := os.ReadDir(vhostDir)
+	if err != nil {
+		// 读不到目录就不阻断保存（保存本身还会被 nginx -t 兜住）。
+		return vhostIdentity{}, nil
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == selfFile || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(vhostDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if hit, ok := collideVhosts(mine, vhostIdentities(string(b), e.Name())); ok {
+			return hit, nil
+		}
+	}
+	return vhostIdentity{}, nil
 }
 
 // siteListenPorts 从 vhost 内容里提取全部 listen 端口（用于"改完真的在服务吗"的复核）。
@@ -1580,4 +1745,42 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 		return
 	}
 	s.Log.Info("nginx 环境检查: %s", msg)
+}
+
+// checkProxyAgainstSiteVhosts 检查一条反代规则是否与 vhosts 目录里已有文件
+// （站点 vhost / 别的规则）在"同端口 + 同 server_name"上冲突。
+//
+// 与 checkVhostCollisionWithFiles 同一判据、反方向调用：那边是"保存站点配置时"，
+// 这边是"新建/修改反代规则时"。两边都要拦，否则谁先谁后决定了哪一份被静默忽略。
+func (s *Server) checkProxyAgainstSiteVhosts(rule *proxies.Rule, selfFile string) error {
+	if rule == nil || rule.Listen <= 0 {
+		return nil
+	}
+	names := proxies.SplitDomains(rule.Domains)
+	if len(names) == 0 {
+		return nil
+	}
+	mine := make([]vhostIdentity, 0, len(names))
+	for _, n := range names {
+		mine = append(mine, vhostIdentity{Port: rule.Listen, Name: n})
+	}
+	entries, err := os.ReadDir(s.Cfg.VhostDir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == selfFile || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
+		}
+		b, rerr := os.ReadFile(filepath.Join(s.Cfg.VhostDir, e.Name()))
+		if rerr != nil {
+			continue
+		}
+		if hit, ok := collideVhosts(mine, vhostIdentities(string(b), e.Name())); ok {
+			return fmt.Errorf("与 %s 冲突：两者都在监听 %d 且 server_name=%s。"+
+				"nginx 只会加载其中一份（另一份**静默失效**）。请改端口或域名，"+
+				"或先在「网站管理」里把那个站点的端口改掉", hit.FileName, hit.Port, hit.Name)
+		}
+	}
+	return nil
 }

@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/proxies"
 )
 
 // ============================================================================
@@ -131,5 +135,119 @@ func TestSiteConfSaveRejectsEmptyContentAndUnknownSite(t *testing.T) {
 	res2, _, _ := doJSON(t, ts, "POST", "/api/v1/sites/nosuch.test/conf", map[string]any{"content": "server {}\n"}, cookies)
 	if res2.StatusCode != http.StatusNotFound {
 		t.Fatalf("不存在的站点必须 404，实际 %d", res2.StatusCode)
+	}
+}
+
+// ============================================================================
+//  vhost「同端口 + 同 server_name」冲突拦截（真机事故 2026-09-17）
+//
+//  用户把 wp.zizdog.com 的 vhost 存成 `listen 8889 ssl` + 同名，撞上反代规则
+//  proxy-9（也是 8889 + 同名）；proxy-9.conf 字典序在前，于是**站点那份被
+//  nginx 静默忽略**，8889 的流量落到 blog.zizdog.com。这一组测试锁住"保存时
+//  就要拦下来并说清后果"，而不是让用户自己去看一行 warning。
+// ============================================================================
+
+func TestVhostIdentitiesPerServerBlock(t *testing.T) {
+	conf := `server {
+    listen 80;
+    server_name a.test b.test;
+}
+server {
+    listen 443 ssl;
+    server_name a.test;
+}
+server {
+    listen 8889 ssl default_server;
+    server_name _;
+}`
+	got := vhostIdentities(conf, "x.conf")
+	want := map[string]bool{
+		"80|a.test": true, "80|b.test": true, "443|a.test": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("身份数 = %d（%+v），期望 %d —— 不应把 80 的域名配到 443，也要跳过 server_name _", len(got), got, len(want))
+	}
+	for _, id := range got {
+		key := fmt.Sprintf("%d|%s", id.Port, id.Name)
+		if !want[key] {
+			t.Errorf("多出/错误的身份 %s", key)
+		}
+	}
+}
+
+func TestSiteConfSaveRejectsServerNameCollision(t *testing.T) {
+	srv, ts, cookies := ensureSiteForConfTest(t, "collide.test")
+	stubSiteApplyChannel(t, "403")
+	// 模拟"已有的反代规则文件"：同端口 + 同 server_name。
+	if err := os.MkdirAll(srv.Cfg.VhostDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proxyConf := "server {\n    listen 8899 ssl;\n    server_name collide.test;\n}\n"
+	if err := os.WriteFile(filepath.Join(srv.Cfg.VhostDir, "proxy-9.conf"), []byte(proxyConf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := "server {\n    listen 8899 ssl;\n    server_name collide.test;\n}\n"
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/sites/collide.test/conf", map[string]any{"content": body}, cookies)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("同端口同 server_name 必须 409，实际 %d：%v", res.StatusCode, out)
+	}
+	msg := fmt.Sprint(out)
+	for _, want := range []string{"proxy-9.conf", "8899", "collide.test", "静默失效"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息里应写清 %q，实际：%v", want, out)
+		}
+	}
+}
+
+func TestSiteConfSaveAllowsDifferentPortOrName(t *testing.T) {
+	srv, ts, cookies := ensureSiteForConfTest(t, "ok.test")
+	stubSiteApplyChannel(t, "403")
+	if err := os.MkdirAll(srv.Cfg.VhostDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proxyConf := "server {\n    listen 8899 ssl;\n    server_name other.test;\n}\n"
+	if err := os.WriteFile(filepath.Join(srv.Cfg.VhostDir, "proxy-9.conf"), []byte(proxyConf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 同端口不同域名 → 允许（nginx 正常按 SNI/Host 分流）
+	body := "server {\n    listen 8899 ssl;\n    server_name ok.test;\n}\n"
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/sites/ok.test/conf", map[string]any{"content": body}, cookies)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("同端口不同域名应允许保存，实际 %d：%v", res.StatusCode, out)
+	}
+}
+
+// TestProxySSLPortMixMessageNamesTheRightSide 锁住错误信息的**方向**。
+//
+// 真机报障（2026-09-17，用户）：他在 8889 上新建一条**没开 HTTPS** 的规则，
+// 已有规则（wp.zizdog.com）是 HTTPS，面板却弹「端口 8889 上已有HTTP规则
+// 「wp.zizdog.com」，而这条是HTTPS」—— 正好说反，把人往错误方向带。
+func TestProxySSLPortMixMessageNamesTheRightSide(t *testing.T) {
+	srv, _ := newTestServer(t)
+	repo := srv.proxyRepo()
+	ctx := context.Background()
+	// 已有一条 HTTPS 规则占着 8889。
+	httpsRule := &proxies.Rule{Name: "wp.zizdog.com", Listen: 8889, Domains: "wp.zizdog.com",
+		Target: "https://127.0.0.1:443", Enabled: true, Websocket: true, SSLEnabled: true,
+		SSLProvider: "manual", SSLCert: "/tmp/zp-test.crt", SSLKey: "/tmp/zp-test.key"}
+	if _, err := repo.Create(ctx, httpsRule); err != nil {
+		t.Fatal(err)
+	}
+	// 新规则：同端口但没开 HTTPS。
+	plain := &proxies.Rule{Name: "te", Listen: 8889, Domains: "te.zizdog.com",
+		Target: "https://127.0.0.1:443", Enabled: true, Websocket: true, SSLEnabled: false}
+	err := srv.checkProxySSLPortMix(ctx, plain)
+	if err == nil {
+		t.Fatal("同端口 HTTP/HTTPS 混用必须被拦下")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "已有HTTPS规则「wp.zizdog.com」，而这条是HTTP") {
+		t.Errorf("信息必须写对方向（已有的是 HTTPS、这条是 HTTP），实际：%s", msg)
+	}
+	if strings.Contains(msg, "已有HTTP规则") {
+		t.Errorf("方向写反了（这正是用户遇到的 bug），实际：%s", msg)
+	}
+	if !strings.Contains(msg, "让这条也启用 HTTPS") {
+		t.Errorf("应把最省事的出路（给这条也开 HTTPS）写在最前面，实际：%s", msg)
 	}
 }
