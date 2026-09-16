@@ -396,6 +396,12 @@ publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS
 	@echo ""
 	@echo "验证（从这台机器）：curl -sI $(NAS_MIRROR_URL)/manifest.json"
 
+.PHONY: deploy
+deploy: ## 一条命令发布：release + 推 NAS（单流）+ 并行升级两台 + 验证（需要 ZP_PASS/NAS_PASS）
+	@ZP_PASS='$(ZP_PASS)' NAS_PASS='$(NAS_PASS)' \
+	 SKIP_CHECK='$(SKIP_CHECK)' SKIP_BUILD='$(SKIP_BUILD)' \
+	 bash tools/deploy.sh
+
 .PHONY: sync-apps
 sync-apps: ## 把应用安装包同步到 NAS 镜像（apps/<应用>/<版本>/<文件名>；需要 NAS_PASS）
 	@NAS_HOST="$(NAS_HOST)" NAS_USER="$(NAS_USER)" NAS_ROOT="$(NAS_APPS_ROOT)" \
