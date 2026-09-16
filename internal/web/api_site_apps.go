@@ -573,15 +573,25 @@ require_once ABSPATH . 'wp-settings.php';
 }
 
 func writeTypechoConfig(dir, dbName, dbUser, dbPass string) error {
+	// ⚠️ Typecho **1.2 起换了配置格式**：数据库不再由那些 __TYPECHO_DB_* 常量 +
+	// Common::init() 配置（1.1 的做法），必须显式 `new \Typecho\Db(...)` +
+	// addServer(...) + `\Typecho\Db::set(...)`。
+	//
+	// 真机事故（2026-09-17 mini，te.zizdog.com 一键建站）：面板原来只写 1.1 那套，
+	// 于是 1.2 上 `Common::init()` 不会注册数据库 → 站点首页 500
+	// （`Missing Database Object`，install.php:23）、**安装向导永远走不完**
+	// （数据库 0 张表）。权威写法来自 Typecho 自己的 install.php
+	// `install_config_file()`（它就是这么生成 config.inc.php 的）。
+	//
+	// 两套都写上、按类是否存在分支：既支持最新版，也不砸掉还在用 1.1 的老站。
 	content := fmt.Sprintf(`<?php
 /** 由 ZizPanel 一键建站生成 —— 数据库信息已填好 */
 define('__TYPECHO_ROOT_DIR__', dirname(__FILE__));
 define('__TYPECHO_PLUGIN_DIR__', '/usr/plugins');
-
+define('__TYPECHO_THEME_DIR__', '/usr/themes');
 define('__TYPECHO_ADMIN_DIR__', '/admin/');
-@set_include_path(get_include_path() . PATH_SEPARATOR . __TYPECHO_ROOT_DIR__ . '/var' . PATH_SEPARATOR . __TYPECHO_ROOT_DIR__ . '/var/Typecho');
 
-/** 初始化数据库 */
+// ---- Typecho 1.1 的常量写法（新版不再读，留着不冲突）----
 define('__TYPECHO_DB_ADAPTER__', 'Pdo_Mysql');
 define('__TYPECHO_DB_HOST__', 'localhost');
 define('__TYPECHO_DB_PORT__', 3306);
@@ -591,9 +601,29 @@ define('__TYPECHO_DB_CHAR__', 'utf8mb4');
 define('__TYPECHO_DB_DATABASE__', '%s');
 define('__TYPECHO_DB_PREFIX__', 'typecho_');
 
+@set_include_path(get_include_path() . PATH_SEPARATOR . __TYPECHO_ROOT_DIR__ . '/var' . PATH_SEPARATOR . __TYPECHO_ROOT_DIR__ . '/var/Typecho');
+
 require_once __TYPECHO_ROOT_DIR__ . '/var/Typecho/Common.php';
-Typecho_Common::init();
-`, dbUser, dbPass, dbName)
+
+if (class_exists('\Typecho\Db')) {
+	// ---- Typecho 1.2+：必须显式注册数据库连接 ----
+	\Typecho\Common::init();
+	$db = new \Typecho\Db('Pdo_Mysql', 'typecho_');
+	$db->addServer(array(
+		'host' => 'localhost',
+		'port' => 3306,
+		'user' => '%s',
+		'password' => '%s',
+		'charset' => 'utf8mb4',
+		'database' => '%s',
+		'engine' => 'InnoDB',
+	), \Typecho\Db::READ | \Typecho\Db::WRITE);
+	\Typecho\Db::set($db);
+} elseif (class_exists('Typecho_Common')) {
+	// ---- Typecho 1.1：常量 + 下划线类 ----
+	Typecho_Common::init();
+}
+`, dbUser, dbPass, dbName, dbUser, dbPass, dbName)
 
 	// Typecho 的正常流程由安装向导生成 config.inc.php；预置一个可以省掉手填，
 	// 但必须写在根目录且可写（安装向导会覆盖它）。

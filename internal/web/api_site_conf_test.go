@@ -287,3 +287,42 @@ func TestProxySSLPortMixAllowsSameModeOnSamePort(t *testing.T) {
 		t.Fatalf("停用的规则不写配置，不该被混用判定拦下，实际: %v", err)
 	}
 }
+
+// TestTypechoConfigInitsNamespacedCommon 锁住一键建站的 Typecho 配置模板。
+//
+// 真机事故（2026-09-17 mini，te.zizdog.com）：面板生成的 config.inc.php 用的是
+// Typecho **1.1 时代**的 `Typecho_Common::init()`，而最新版（1.2+）只有命名空间类
+// `\Typecho\Common` —— 那一行静默不执行 → Db 单例没初始化 → 站点首页 500
+// （`Missing Database Object`）、安装向导永远走不完（数据库 0 张表）。
+// 判据：模板必须**同时**能覆盖两种 API（class_exists 分支），且不能只写下划线那种。
+func TestTypechoConfigInitsNamespacedCommon(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeTypechoConfig(dir, "db1", "user1", "pass1"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "config.inc.php"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := string(b)
+	// Typecho 1.2+ 必须显式注册连接（权威写法来自它自己的 install_config_file()）。
+	for _, want := range []string{
+		`class_exists('\Typecho\Db')`,
+		`\Typecho\Common::init()`,
+		`new \Typecho\Db('Pdo_Mysql', 'typecho_')`,
+		`$db->addServer(array(`,
+		`'engine' => 'InnoDB'`,
+		`\Typecho\Db::set($db)`,
+		// 1.1 的兜底分支也要在（老站不能砸）。
+		"Typecho_Common::init()",
+	} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("Typecho 配置里缺少 %q（真机事故：1.2 上只写 1.1 常量会导致 Missing Database Object + 向导走不完），实际：\n%s", want, conf)
+		}
+	}
+	for _, want := range []string{"__TYPECHO_DB_USER__", "__TYPECHO_DB_PASSWORD__", "__TYPECHO_DB_DATABASE__"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("配置里缺少 %s", want)
+		}
+	}
+}
