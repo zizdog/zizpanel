@@ -25,3 +25,5 @@ macos-lnmp-setup-v104.zip
 
 # —— 手工编译的 CLI（cmd/zizpanel-assets 的 15MB 产物，仓库里不放二进制）——
 /zizpanel-assets
+# make check 的工作树指纹标记（tools/check-stamp.sh）
+.zp-check-stamp

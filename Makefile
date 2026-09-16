@@ -32,6 +32,10 @@ CGO_ENABLED ?= 0
 
 DIST    := dist
 RELDIR  := $(DIST)/release
+# ARCHS 是要打入发布包的架构。默认双架构（正式发布别漏 amd64）；
+# `make deploy` 会传 ARCHS=arm64 —— 本机与 mini 都是 Apple Silicon，
+# 另一份包纯属浪费（构建时间 + 上传体积翻倍）。
+ARCHS   ?= arm64 amd64
 LOCAL_PORT ?= 18443
 LOCAL_ROOT ?= /tmp/zizpanel-dev
 # 本地调试实例的安全后缀：固定值，方便 uitest 直接访问。
@@ -125,6 +129,7 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory remote-test
 	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
 	@$(MAKE) --no-print-directory server-mode-test
+	@bash tools/check-stamp.sh write
 	@echo "全部检查通过 ✅"
 
 .PHONY: install-test
@@ -243,7 +248,10 @@ keys: ## 生成发布用 Ed25519 密钥对（只做一次；私钥务必离线�
 	@echo "     请立即把 $(RELEASE_KEY) 备份到离线介质。"
 
 .PHONY: release
-release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwin/amd64）
+release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；ARCHS="arm64" 只发本机架构）
+	@# ARCHS：`make deploy` 只发 arm64（本机与 mini 都是 Apple Silicon）—— 少构建一次、
+	@# 上传体积减半；手动 `make release` 做正式发布时保持默认双架构，别漏 amd64。
+	@echo "==> 目标架构：$(ARCHS)"
 	@mkdir -p $(RELDIR)
 	@# 先构建一个本机版本：它既用来推导公钥，也用来给清单签名。
 	@# 这样"签名私钥"与"面板内嵌公钥"必然配对 —— 靠人工填公钥迟早会不一致。
@@ -258,7 +266,7 @@ release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwi
 		echo "    已安装的面板会拒绝从网络升级（可改用手动上传升级包）。"; \
 		echo "    执行 make keys 生成发布密钥。"; \
 	fi; \
-	for arch in arm64 amd64; do \
+	for arch in $(ARCHS); do \
 		echo "==> 构建 darwin/$$arch"; \
 		GOOS=darwin GOARCH=$$arch go build -trimpath \
 			-ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" \
@@ -293,11 +301,10 @@ release: clean ## 产出可分发压缩包 + 签名清单（darwin/arm64 + darwi
 		rm -rf $(DIST)/tmp-$$arch; \
 	done
 	@# 同时产出一份"通用"名字的最新包，便于固定 URL 下载
-	@cp $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz $(RELDIR)/zizpanel_latest_darwin_arm64.tar.gz 2>/dev/null || true
-	@cp $(RELDIR)/zizpanel_$(VERSION)_darwin_amd64.tar.gz $(RELDIR)/zizpanel_latest_darwin_amd64.tar.gz 2>/dev/null || true
+	@for a in $(ARCHS); do cp $(RELDIR)/zizpanel_$(VERSION)_darwin_$$a.tar.gz $(RELDIR)/zizpanel_latest_darwin_$$a.tar.gz 2>/dev/null || true; done
 	@# 生成清单：面板"检查更新"读的就是它。清单里带每个架构的 URL 与 SHA-256。
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
-		--base-url "$(RELEASE_BASE_URL)" --notes-file "$(NOTES_FILE)"
+		--arches "$(ARCHS)" --base-url "$(RELEASE_BASE_URL)" --notes-file "$(NOTES_FILE)"
 	@set -e; \
 	if [ -f "$(RELEASE_KEY)" ]; then \
 		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \
@@ -363,7 +370,7 @@ mirror-nas: host-zizpanel ## 生成"指向 NAS 镜像"的清单（url 用 downlo
 	@# 所以只能在生成时用另一套 url 模板、另签一次。
 	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
-		--base-url "$(NAS_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
+		--arches "$(ARCHS)" --base-url "$(NAS_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
 	@set -e; \
 	if [ -f "$(RELEASE_KEY)" ]; then \
 		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \

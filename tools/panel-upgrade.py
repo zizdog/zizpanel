@@ -69,8 +69,12 @@ print("== stage:", st, (r.get("data") or {}).get("message", r.get("msg", "")))
 st, r = call("POST", "/api/v1/system/upgrade/apply", {})
 print("== apply:", st, (r.get("data") or {}).get("message", r.get("msg", "")))
 print("== 等新版本回来…")
-for i in range(1, 91):
-    time.sleep(2)
+# 轮询节奏：面板重启通常 4~15s 就回来，前 20 次走 0.5s（早发现早结束），
+# 之后退到 2s 等慢启动的情形。总窗口仍是 ~90 轮（≈3 分钟），没有放宽判定。
+for i in range(1, 151):
+    time.sleep(0.5 if i <= 20 else 2)
+    if i % 2 == 1 and i > 20:
+        continue
     h = health()
     v = (h or {}).get("version")
     if v and v.startswith(WANT):

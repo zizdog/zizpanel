@@ -32,7 +32,7 @@ import os
 import sys
 
 # 必须与 internal/upgrade 支持的架构键一致
-ARCHES = ("arm64", "amd64")
+ARCHES = ("arm64", "amd64")  # 默认；可用 --arches 覆盖（部署时只发本机架构，见 tools/deploy.sh）
 
 
 def sha256_of(path):
@@ -62,9 +62,9 @@ def asset_url(tpl, version, arch, name):
                .replace("{name}", name))
 
 
-def build_manifest(version, rel_dir, base_url, notes=""):
+def build_manifest(version, rel_dir, base_url, notes="", arches=ARCHES):
     assets = {}
-    for arch in ARCHES:
+    for arch in arches:
         name = f"zizpanel_{version}_darwin_{arch}.tar.gz"
         path = os.path.join(rel_dir, name)
         if not os.path.exists(path):
@@ -91,6 +91,10 @@ def main():
     ap.add_argument("--base-url", required=True,
                     help="发布包地址前缀，或含 {version}/{arch}/{name} 占位符的模板")
     ap.add_argument("--notes-file", default="", help="可选的更新说明文件")
+    # 只发本机架构时用它（两台机器都是 arm64）：少构建一次、上传体积减半。
+    # 默认仍是双架构 —— 手动 `make release` 做正式发布时不要漏掉 amd64。
+    ap.add_argument("--arches", default=",".join(ARCHES),
+                    help="逗号或空格分隔的架构列表，默认 arm64,amd64")
     args = ap.parse_args()
 
     notes = ""
@@ -98,7 +102,11 @@ def main():
         with open(args.notes_file, encoding="utf-8") as f:
             notes = f.read().strip()
 
-    manifest = build_manifest(args.version, args.dir, args.base_url, notes)
+    arches = tuple(a for a in args.arches.replace(",", " ").split() if a)
+    for a in arches:
+        if a not in ARCHES:
+            raise SystemExit(f"未知架构 {a!r}（只支持 {', '.join(ARCHES)}）")
+    manifest = build_manifest(args.version, args.dir, args.base_url, notes, arches)
 
     out = os.path.join(args.dir, "manifest.json")
     tmp = out + ".tmp"

@@ -167,6 +167,21 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 
 ---
 
+### 发布提速（2026-09-17，用户："每次发布新版都太耗时了"）
+
+实测三段各自的耗时，以及现在的做法：
+
+| 段 | 之前 | 现在 | 做法 |
+|---|---|---|---|
+| `make check` | 5–7 min（每次都跑） | 同一棵树**跳过** | `tools/check-stamp.sh`：check 成功时把**工作树指纹**（含未跟踪文件内容）写进 `dist/.check-stamp`；`make deploy` 先 `verify`，指纹一致才跳过并打印"哪个版本、什么时候跑的" |
+| `make release` | 双架构，16s | **只 arm64**，8s | `ARCHS`（默认 `arm64 amd64`，`make deploy` 传 `arm64`）—— 本机与 mini 都是 Apple Silicon |
+| 上传 NAS | 4 个包 ≈96MB | **1 个包 23MB** | 只传版本包；`latest` 与 `download/<版本>/` 的副本/软链由远端 LAYOUT 造 |
+| 升级等待 | 每轮 sleep 2s | 前 20 轮 0.5s，之后 2s | `tools/panel-upgrade.py`；总窗口不变（≈3 min） |
+
+**实测：一次 `make deploy` 从 ~1.5–2 min 降到 17s**（含构建 8s、上传 23MB、两台并行升级 4s、版本核对）。
+⚠️ 两条纪律不能忘：① `ARCHS=arm64` 只适合"本机 + mini"这种全 arm64 部署，**正式发布仍建议双架构**（`make release` 默认就是）；
+② check 标记是**便利**不是安全边界 —— 手动 `bash tools/check-stamp.sh write` 等价于 `SKIP_CHECK=1`，只在你自己确认过的情况下用。
+
 ## 九、已修复的典型坑（只增不减）
 
 > 都是在真机踩到并修复的，回归测试会拦住复发。原文 #91/#92 各重复一次，此处已合并；

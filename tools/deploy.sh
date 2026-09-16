@@ -62,13 +62,27 @@ MINI_URL="https://192.168.1.4:8443/6zfxgccj"
 
 step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
 
+# 部署只发本机架构：本机与 mini 都是 Apple Silicon（arm64）。
+# 之前把 arm64+amd64 的「版本包 + latest 包」共 4 个 ≈96MB 全传一遍，
+# 而 amd64 这台机器上永远用不到 —— 现在 2 个 ≈46MB。
+ARCHS="${ARCHS:-arm64}"
+
 # ---------------------------------------------------------------- 构建 --
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  step "make check（门禁）"
-  [ "${SKIP_CHECK:-0}" = "1" ] || make check
-  step "make release + mirror-nas（构建 + 签 NAS 版清单）"
-  make release >/dev/null
-  make mirror-nas >/dev/null
+  # 门禁：同一棵树上重复跑 make check 没有新信息（5~7 分钟）。
+  # 但"跳过"必须是**可核对的事实**而不是手写的 SKIP_CHECK —— 所以比对
+  # make check 成功时写下的指纹（tools/check-stamp.sh）。
+  if [ "${SKIP_CHECK:-0}" = "1" ]; then
+    step "跳过 make check（SKIP_CHECK=1）"
+  elif stamp_msg="$(bash tools/check-stamp.sh verify 2>&1)"; then
+    step "跳过 make check：${stamp_msg}"
+  else
+    step "make check（门禁）—— ${stamp_msg}"
+    make check
+  fi
+  step "make release + mirror-nas（构建 ARCHS=${ARCHS} + 签 NAS 版清单）"
+  make release ARCHS="$ARCHS" >/dev/null
+  make mirror-nas ARCHS="$ARCHS" >/dev/null
 else
   step "跳过构建（SKIP_BUILD=1），复用 $RELDIR"
 fi
@@ -76,9 +90,12 @@ fi
 # ---------------------------------------------------------------- 上传 --
 # 一条 tar 流：只握一次手。登录方式见上面的 nas_sh（密钥优先）。
 step "推送到 NAS（单流 tar，版本 ${VERSION}）"
-FILES=(manifest.json manifest.json.sig install.sh
-  "zizpanel_${VERSION}_darwin_arm64.tar.gz" "zizpanel_${VERSION}_darwin_amd64.tar.gz"
-  zizpanel_latest_darwin_arm64.tar.gz zizpanel_latest_darwin_amd64.tar.gz)
+# 只传**版本的**包（latest 与 download/<版本>/ 的软链/副本由下面的 LAYOUT 在 NAS 上造）。
+# 以前连两份 latest 副本一起传，等于白传一份同样的 46MB。
+FILES=(manifest.json manifest.json.sig install.sh)
+for a in $ARCHS; do
+  FILES+=("zizpanel_${VERSION}_darwin_${a}.tar.gz")
+done
 TAR_LIST=()
 for f in "${FILES[@]}"; do [ -e "$RELDIR/$f" ] && TAR_LIST+=("$f"); done
 # 注意：tar 在**本机**读，ssh 只负责接收 —— 不要再套一层 `sh -c`，
@@ -101,8 +118,16 @@ expect { -re "(?i)password:" { send "$NAS_PASS\r"; exp_continue } eof }
 EOF
 fi
 
-# 远端铺 download/<版本>/ 与 latest 链接（一次 ssh）
-LAYOUT="cd $NAS_ROOT && mkdir -p download/$VERSION download/latest && cp -f zizpanel_${VERSION}_darwin_*.tar.gz download/$VERSION/ && ln -sfn ../$VERSION/zizpanel_${VERSION}_darwin_arm64.tar.gz download/latest/zizpanel_latest_darwin_arm64.tar.gz && ln -sfn ../$VERSION/zizpanel_${VERSION}_darwin_amd64.tar.gz download/latest/zizpanel_latest_darwin_amd64.tar.gz && ln -sfn download/$VERSION/zizpanel_${VERSION}_darwin_arm64.tar.gz zizpanel_${VERSION}_darwin_arm64.tar.gz && ln -sfn download/$VERSION/zizpanel_${VERSION}_darwin_amd64.tar.gz zizpanel_${VERSION}_darwin_amd64.tar.gz"
+# 远端铺 download/<版本>/ 与 latest 链接（一次 ssh）。
+# 必须**按实际发布的架构**逐个铺：以前这里写的是 `zizpanel_${VERSION}_darwin_*.tar.gz`
+# 通配，只发 arm64 时 cp 找不到 amd64 包 → `set -e` 直接失败（这个坑本轮实测踩到，
+# 当时 NAS 上还留着旧 amd64 包才没暴露）。
+LAYOUT="cd $NAS_ROOT && mkdir -p download/$VERSION download/latest"
+for a in $ARCHS; do
+  LAYOUT="$LAYOUT && cp -f zizpanel_${VERSION}_darwin_${a}.tar.gz download/$VERSION/"
+  LAYOUT="$LAYOUT && ln -sfn ../$VERSION/zizpanel_${VERSION}_darwin_${a}.tar.gz download/latest/zizpanel_latest_darwin_${a}.tar.gz"
+  LAYOUT="$LAYOUT && ln -sfn download/$VERSION/zizpanel_${VERSION}_darwin_${a}.tar.gz zizpanel_${VERSION}_darwin_${a}.tar.gz"
+done
 nas_sh "$LAYOUT"
 
 # ---------------------------------------------------------------- 升级 --
