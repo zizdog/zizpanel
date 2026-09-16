@@ -380,8 +380,9 @@ func TestReinstallAfterUninstallKeepDataIsNotSkipped(t *testing.T) {
 	}
 }
 
-// TestPresentServiceLabelIsSandboxed 说明并锁住"没有记录、但服务真在 launchd 里"
-// 的处理：同样算已安装（卡片按 plist/brew 已经这么显示了），并提示用户去纳管。
+// TestAlreadyInLaunchdWithoutRecordIsTreatedAsInstalled 说明并锁住"没有记录、
+// 但服务真在 launchd 里"的处理：同样算已安装（卡片按 plist/brew 已经这么显示了），
+// 并提示用户去纳管。
 func TestAlreadyInLaunchdWithoutRecordIsTreatedAsInstalled(t *testing.T) {
 	m, repo := sandboxIdempotentManager(t)
 	ctx := context.Background()
@@ -406,4 +407,152 @@ func TestAlreadyInLaunchdWithoutRecordIsTreatedAsInstalled(t *testing.T) {
 	if list, _ := repo.List(ctx); len(list) != 0 {
 		t.Errorf("这一步只跳过、不写记录（纳管由用户点），实际 %d 条", len(list))
 	}
+}
+
+// ============================================================================
+//  tarball 轨（frpc / orbien-client / ddns-go）的幂等门禁
+//
+//  0.11.10 的幂等只覆盖 (KindNative && BrewFormula != "") 与 KindCompose；
+//  tarball 类（KindNative 但无 BrewFormula，走 release-binary 路径）不在内。
+//  真机后果：对已装的 frpc / ddns-go 再点「安装」会**重跑整条安装流程**
+//  （下载 / 解包 / bootout / bootstrap），既慢又会重启用户正在用的隧道服务。
+//
+//  下面这组测试把它钉死：已安装 → 短路成"已装跳过"且**不执行任何安装命令**；
+//  但"磁盘上有产物"或"注册表里是别的应用"仍必须走正常流程（真冲突如实失败）。
+// ============================================================================
+
+// TestTarballInstallSkipsWhenAlreadyInstalled 是 P1 的回归锁：
+// 已安装的 tarball 应用再安装 → 终态成功、Message 写明"已经装过了，本次跳过"，
+// 且安装目录不会被创建、launchd 定义不会被写（证明安装步骤一步都没跑）。
+func TestTarballInstallSkipsWhenAlreadyInstalled(t *testing.T) {
+	ids := descriptorIDsForRail(RailTarball)
+	if len(ids) == 0 {
+		t.Fatal("tarball 轨上没有任何应用，说明注册表接线坏了")
+	}
+	for _, id := range ids {
+		t.Run(id, func(t *testing.T) {
+			m, repo := sandboxIdempotentManager(t)
+			ctx := context.Background()
+			app, ok := FindApp(id)
+			if !ok {
+				t.Fatalf("应用目录里没有 %s", id)
+			}
+			d, ok := FindDescriptor(id)
+			if !ok {
+				t.Fatalf("没有 %s 的描述符", id)
+			}
+			// 复刻真机：上一次安装登记出来的服务记录（label 就是它自己的）。
+			if err := repo.Create(ctx, &Service{
+				Name: app.ID, DisplayName: app.Name, Kind: app.Kind,
+				LaunchLabel: d.Service.Label, Port: app.Port, Managed: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			res := &InstallResult{App: id, Name: app.Name, Steps: []string{}}
+			if err := m.InstallReleaseBinary(ctx, id, res); err != nil {
+				t.Fatalf("已安装的 tarball 应用再点安装必须是良性终态，实际报错: %v", err)
+			}
+			if !strings.Contains(res.Message, "已经装过") || !strings.Contains(res.Message, "跳过") {
+				t.Errorf("终态说明要写明已安装/跳过，实际 %q", res.Message)
+			}
+			joined := strings.Join(res.Steps, "\n")
+			if !strings.Contains(joined, "没有重复执行安装命令") {
+				t.Errorf("步骤里要说明没有重复安装，实际步骤：\n%s", joined)
+			}
+			// "不执行任何安装命令"的硬证据：EnsureDir 没建目录、没有产物落盘、
+			// 没有 plist 写进（沙箱的）launchd 目录。
+			root := filepath.Join(m.opt.UserHome, d.Paths.RootDir)
+			if _, err := os.Stat(root); !os.IsNotExist(err) {
+				t.Errorf("幂等跳过不该创建安装目录（说明安装步骤真的跑了）：%s", root)
+			}
+			if entries, _ := os.ReadDir(launchDaemonsDirs[0]); len(entries) != 0 {
+				t.Errorf("幂等跳过不该写 launchd 定义，实际 %v", entries)
+			}
+			for _, banned := range []string{"先检查镜像资源", "下载 ", "解压 ", "装载并启动服务", "停止旧实例"} {
+				if strings.Contains(joined, banned) {
+					t.Errorf("幂等跳过的步骤里不该出现安装动作 %q：\n%s", banned, joined)
+				}
+			}
+			if res.Service == nil {
+				t.Error("幂等跳过也要把已有服务记录带回结果（界面据此显示已安装）")
+			}
+		})
+	}
+}
+
+// TestTarballInstallGateIsWiredToSharedIdempotency 是结构性断言：
+// tarball 轨的安装入口必须复用 install_idempotent.go 的判定，
+// 而不是另造一套（另造一套的下场就是这次 P1：tarball 轨漏在门禁外）。
+func TestTarballInstallGateIsWiredToSharedIdempotency(t *testing.T) {
+	src, err := os.ReadFile("binary_release.go")
+	if err != nil {
+		t.Fatalf("读不到 binary_release.go：%v", err)
+	}
+	if !strings.Contains(string(src), "m.installedSkipResult(ctx, app)") {
+		t.Error("InstallReleaseBinary 必须复用 installedSkipResult（否则 tarball 轨又不在幂等门禁内）")
+	}
+}
+
+// TestTarballInstallGateNotSkippedWithoutRealEvidence 锁住两条不能动的边界：
+//  1. 磁盘上留着上次"卸载（保留数据）"的产物 ≠ 已安装 —— 否则卸载后无法重装；
+//  2. 注册表里一条与本应用无关的记录不能张冠李戴地当成功（真冲突要如实处理）。
+func TestTarballInstallGateNotSkippedWithoutRealEvidence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("磁盘产物不算已安装", func(t *testing.T) {
+		m, _ := sandboxIdempotentManager(t)
+		app, ok := FindApp("frpc")
+		if !ok {
+			t.Fatal("目录里没有 frpc")
+		}
+		d, _ := FindDescriptor("frpc")
+		root := filepath.Join(m.opt.UserHome, d.Paths.RootDir)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, d.Artifacts[0].Name), []byte("kept"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, done := m.installedSkipResult(ctx, app); done {
+			t.Fatal("只有磁盘产物不能判成已安装 —— 否则卸载（保留数据）后无法重装")
+		}
+	})
+
+	t.Run("别的应用的记录不算已安装", func(t *testing.T) {
+		m, repo := sandboxIdempotentManager(t)
+		app, ok := FindApp("frpc")
+		if !ok {
+			t.Fatal("目录里没有 frpc")
+		}
+		if err := repo.Create(ctx, &Service{
+			Name: "nginx", DisplayName: "Nginx", Kind: KindNative,
+			LaunchLabel: "homebrew.mxcl.nginx", Port: 80, Managed: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, done := m.installedSkipResult(ctx, app); done {
+			t.Fatal("别的应用的记录不能被误判成 frpc 已安装（不许张冠李戴）")
+		}
+	})
+
+	t.Run("launchd 里真有它的 plist 才算已安装", func(t *testing.T) {
+		m, _ := sandboxIdempotentManager(t)
+		app, ok := FindApp("frpc")
+		if !ok {
+			t.Fatal("目录里没有 frpc")
+		}
+		d, _ := FindDescriptor("frpc")
+		plist := filepath.Join(launchDaemonsDirs[0], d.Service.Label+".plist")
+		if err := os.WriteFile(plist, []byte("<plist/>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, done := m.installedSkipResult(ctx, app)
+		if !done {
+			t.Fatal("launchd 里真有它的 plist 时应判已安装（与 brew/compose 同一语义）")
+		}
+		if !strings.Contains(strings.Join(res.Steps, "\n"), "纳管") {
+			t.Errorf("没有面板记录时要提示去「纳管」：\n%s", strings.Join(res.Steps, "\n"))
+		}
+	})
 }

@@ -268,16 +268,19 @@ func (m *Manager) probeMirrorFile(ctx context.Context, url string) (int64, error
 
 // preflightMirrorAsset 下载前确认镜像上真的有这个包与它的清单。
 //
-// 这是用户要求的那一步"先检查"。**返回 true 表示这次会走镜像**
-// （包与清单都在），false 表示要回落到公网源。
+// 这是用户要求的那一步"先检查"。**返回值就是它刚刚 HEAD 成功的那个包地址**
+// （空串表示这次要回落到公网源）—— 必须是地址而不是 bool：调用方要把它
+// 插进下载候选列表，只回 bool 会让地址永远进不去，出现"日志说走镜像、
+// curl 打 GitHub"（2026-09-17 真机 P0）。返回**探测过的那个地址**（而不是让
+// 调用方另拼一份）也保证了"探的"与"下的"不可能指向两个地方。
 //
 // 为什么改成"回落"而不是"直接失败"（2026-09-16 用户补充要求）：
 // 镜像站可能临时挂掉、或者这台机器根本不在能访问镜像的网络里。
 // 那时**装不上**才是更糟的结果，所以缺资源/不可达一律回落，
 // 并把原因写进任务步骤（用户看得见"这次没走镜像、为什么"）。
-func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryApp, result *InstallResult) bool {
+func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryApp, result *InstallResult) string {
 	if !m.MirrorEnabled() {
-		return false
+		return ""
 	}
 	pkg := m.appAssetURL(spec.ID, spec.Tag, spec.Asset)
 	man := m.appManifestURL(spec.ID, spec.Tag)
@@ -288,7 +291,7 @@ func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryAp
 		if result != nil {
 			result.step(ctx, "镜像上没有这个包，改用公网源："+err.Error())
 		}
-		return false
+		return ""
 	}
 	// 清单也要在：它是镜像模式下校验 sha256 的唯一来源。
 	// 包在、清单不在时同样回落（否则会拿不到期望值而中止）。
@@ -296,12 +299,12 @@ func (m *Manager) preflightMirrorAsset(ctx context.Context, spec releaseBinaryAp
 		if result != nil {
 			result.step(ctx, "镜像上缺 sha256 清单，改用公网源："+err.Error())
 		}
-		return false
+		return ""
 	}
 	if result != nil {
-		result.step(ctx, "镜像可用，将从镜像站下载（省流量、更快）")
+		result.step(ctx, "镜像可用，将从镜像站下载（省流量、更快）："+pkg)
 	}
-	return true
+	return pkg
 }
 
 // verifyMirrorChecksum 用镜像清单里的 sha256 核对下载到的产物。

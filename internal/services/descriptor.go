@@ -116,7 +116,11 @@ type Artifact struct {
 	Name string `json:"name"`
 	// Version 是写死的版本（不许跟 latest 漂：上游改名/换架构时会静默装错东西）。
 	Version string `json:"version"`
-	// URLs 是按优先级排列的下载地址：镜像第一，其余官方优先、加速镜像兜底。
+	// URLs 是按优先级排列的**公网**下载地址（官方优先、加速镜像兜底）。
+	//
+	// 镜像站地址不写死在这里：镜像基址是执行期设置，由 MirrorPreflight 钩子
+	// 在执行时注入到候选列表第一位（见 steps.go 的 DownloadAction）。
+	// 写死会让"设置改了、描述符还是旧的"，也会让探测到的地址与下载用的地址漂移。
 	URLs []string `json:"urls"`
 	// Kind 决定 extract 怎么解。
 	Kind ArtifactKind `json:"kind"`

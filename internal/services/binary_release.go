@@ -477,6 +477,22 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	if !ok || d.Rail != RailTarball {
 		return fmt.Errorf("没有 %s 的原生二进制安装器", id)
 	}
+	// 幂等门禁（与 brew / compose 同一份判定，见 install_idempotent.go）：
+	// 已经装过的 tarball 应用再点一次「安装」，必须直接短路成"已装跳过"，
+	// **不执行任何安装命令** —— 否则会重跑下载/解包/bootout/bootstrap，
+	// 既慢又会重启用户正在用的隧道服务（真机 frpc / ddns-go 复现）。
+	//
+	// 位置刻意放在 root / 用户校验**之前**：跳过是纯读判定（面板注册表 +
+	// launchd plist），不需要 root；已经装好的机器上再点一次不该被权限校验挡住。
+	// 判定只看真实注册证据（记录 / plist），不看磁盘产物，所以"卸载（保留数据）
+	// 后重装"不会被误跳过；真冲突（记录属于别的应用、plist 标签对不上）时
+	// 这里返回 false，继续走下面的正常安装，由 registerAppService 如实报错。
+	if app, found := FindApp(id); found {
+		if res, done := m.installedSkipResult(ctx, app); done {
+			adoptInstallResult(result, res)
+			return nil
+		}
+	}
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("部署 %s 需要以 root 运行", d.Name)
 	}
@@ -484,6 +500,28 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 		return fmt.Errorf("无法确定运行该服务的真实用户与家目录")
 	}
 	return m.OrchestrateTarballInstall(ctx, d, result)
+}
+
+// adoptInstallResult 把幂等跳过的结果原样搬进调用方传入的 result。
+//
+// 为什么是"搬进"而不是让 InstallReleaseBinary 返回新的 *InstallResult：
+// 老签名（error-only + 就地写 result）是 internal/web 与任务中心依赖的契约，
+// 不许改。就地写字段既保住签名，又让任务终态带上"已经装过了，本次跳过"。
+func adoptInstallResult(dst, src *InstallResult) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.App != "" {
+		dst.App = src.App
+	}
+	if src.Name != "" {
+		dst.Name = src.Name
+	}
+	dst.Message = src.Message
+	dst.Steps = append(dst.Steps, src.Steps...)
+	if src.Service != nil {
+		dst.Service = src.Service
+	}
 }
 
 // waitReleaseBinaryReady 等 release 二进制服务真的就绪。**超时返回错误，不是警告。**

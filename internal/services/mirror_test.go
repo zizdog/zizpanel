@@ -146,8 +146,8 @@ func TestPreflightMirrorAssetFallsBackWithoutManifest(t *testing.T) {
 	m := &Manager{opt: Options{MirrorBase: ts.URL}}
 	res := &InstallResult{Steps: []string{}}
 
-	if used := m.preflightMirrorAsset(context.Background(), spec, res); used {
-		t.Error("包在但清单不在时不该判定为走镜像（拿不到期望 sha256）")
+	if got := m.preflightMirrorAsset(context.Background(), spec, res); got != "" {
+		t.Errorf("包在但清单不在时不该判定为走镜像（拿不到期望 sha256），实际返回 %q", got)
 	}
 	joined := strings.Join(res.Steps, "\n")
 	if !strings.Contains(joined, "改用公网源") {
@@ -169,8 +169,15 @@ func TestPreflightMirrorAssetUsesMirrorWhenBothPresent(t *testing.T) {
 	defer ts.Close()
 	m := &Manager{opt: Options{MirrorBase: ts.URL}}
 	res := &InstallResult{Steps: []string{}}
-	if used := m.preflightMirrorAsset(context.Background(), spec, res); !used {
+	got := m.preflightMirrorAsset(context.Background(), spec, res)
+	if got == "" {
 		t.Errorf("包与清单都在时应走镜像，步骤：%q", strings.Join(res.Steps, "\n"))
+	}
+	// 返回的必须就是**它探测过的那个包地址** —— 只有这样执行器把它插到
+	// 候选第一位时，"探的"与"下的"才不可能指向两个地方。
+	want := ts.URL + "/apps/frpc/" + spec.Tag + "/" + spec.Asset
+	if got != want {
+		t.Errorf("预检必须返回它 HEAD 成功的那个地址：got %q，want %q", got, want)
 	}
 }
 

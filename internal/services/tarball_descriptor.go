@@ -265,8 +265,12 @@ func tarballInstallSteps(spec releaseBinaryApp, main Artifact) []InstallStep {
 		DownloadAction{Artifact: main, MirrorPreflight: true},
 	}
 	if spec.ChecksumAsset != "" {
-		// 清单很小（1.6KB），单独下一步：这样"tarball 来自镜像、清单来自官方"
-		// 时校验才有真实意义（见 verifyReleaseChecksum 的注释）。
+		// 清单很小（1.6KB），单独下一步，只在**回落公网**时才会真的下载它 ——
+		// 那时它是唯一的内容校验来源（见 verify_sha256 的上游清单分支）。
+		//
+		// SkipWhenMirrorUsed：走镜像时 sha256 以**镜像清单**为准（覆盖更全），
+		// 上游这份清单用不到 —— 跳过它，否则"镜像优先"里又塞回一次公网访问，
+		// GitHub 不可达时还会让整个安装失败（老实现走镜像时从不取上游清单）。
 		steps = append(steps, DownloadAction{
 			Artifact: Artifact{
 				Name:    spec.ChecksumAsset,
@@ -274,6 +278,7 @@ func tarballInstallSteps(spec releaseBinaryApp, main Artifact) []InstallStep {
 				URLs:    spec.checksumURLs(),
 				Kind:    ArtifactBinary,
 			},
+			SkipWhenMirrorUsed: true,
 		})
 	}
 	steps = append(steps, VerifySHA256Action{
@@ -457,13 +462,25 @@ func (m *Manager) OrchestrateTarballInstall(ctx context.Context, d AppDescriptor
 			"{home}": m.opt.UserHome,
 			"{user}": m.opt.UserName,
 		},
+		// 镜像是执行期才知道配没配的（设置项），所以候选地址在**执行期**注入，
+		// 而不是把镜像地址写死进描述符（写死就无法跟随设置变更，也会让
+		// "探测到的地址"与"下载用的地址"有机会漂移）。
+		MirrorBase: m.mirrorBase(),
 	}
 
 	// ---- 钩子：镜像预检 + 内容校验 + 服务登记 ----
-	ec.MirrorPreflight = func(a Artifact) bool {
-		used := m.preflightMirrorAsset(ctx, spec, result)
-		ec.mirrorUsed = used
-		return used
+	ec.MirrorPreflight = func(a Artifact) string {
+		// 预检探的是 spec.Asset（主产物），返回的也是它 HEAD 成功的地址；
+		// 把它交给执行器插到候选第一位 —— 这样"日志说走镜像"与"curl 实际
+		// 打的地址"由同一个字符串决定，不可能再各说各话。
+		//
+		// 只为注册表里的主产物接线（tarballInstallSteps 只给主产物加了
+		// MirrorPreflight）。别的产物真要求了预检就回落公网候选，
+		// 而不是拿主产物的地址去顶替（那会下载到错的包）。
+		if a.Name != spec.Asset {
+			return ""
+		}
+		return m.preflightMirrorAsset(ctx, spec, result)
 	}
 	ec.VerifyMirror = func(a Artifact) (string, string, error) {
 		sha, err := m.mirrorChecksumFor(ctx, spec)

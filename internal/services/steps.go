@@ -236,11 +236,14 @@ func (a EnsureDirAction) Exec(ec *ExecConfig) error {
 // DownloadAction 下载一份产物。
 //
 // 语义与老实现（downloadReleaseBinary）逐条对齐：
-//   - **镜像优先**：MirrorPreflight 返回 true（镜像上有包与清单）时，
-//     候选地址里镜像排第一且不再测速（它就在局域网，测速反而多花几秒）；
-//   - 官方地址给**更短的截止时间**（150 秒）：它只是"存在且可信"，不一定快。
-//     实测（2026-09）官方约 46KB/s、加速镜像约 640KB/s，让用户对着进度条等
-//     10 分钟不可接受 —— 慢过头就换镜像，而不是死等；
+//   - **镜像优先**：MirrorPreflight 为 true 时先探镜像；镜像上有包与清单
+//     （MirrorPreflight 钩子返回镜像地址）时，**把那个地址插到候选列表第一位**
+//     再下载 —— 不是只记一个 bool（0.12.4 的 P0 就是只记 bool、地址没进候选表，
+//     于是日志说"走镜像"、curl 实际打 GitHub）；镜像排第一后不再测速
+//     （它就在局域网，测速反而多花几秒）；
+//   - 截止时间按**来源**给，不按位置：镜像/官方地址 150 秒（镜像在同城本该秒级，
+//     官方"存在且可信"但不一定快），第三方加速镜像 300 秒。实测官方约 46KB/s、
+//     加速镜像约 640KB/s，让用户对着进度条等 10 分钟不可接受 —— 慢过头就换源；
 //   - 先下到 `<dest>.part` 再改名：失败时**不会**破坏用户自己放进来的产物
 //     （下面那条退路要靠它成立）；
 //   - 全部地址失败时，若磁盘上已有这个文件就**用它继续**，并如实写一条步骤 ——
@@ -253,6 +256,15 @@ type DownloadAction struct {
 	DestDir string `json:"dest_dir,omitempty"`
 	// MirrorPreflight 为 true 时先探镜像上有没有这个包与清单（默认 false）。
 	MirrorPreflight bool `json:"mirror_preflight,omitempty"`
+	// SkipWhenMirrorUsed 为 true 时：若本次安装里已经有产物**真的从镜像站下到**
+	// （在当前步骤序列中，只有主产物会先于它下载），就跳过这一步。
+	//
+	// 为什么需要：上游校验清单（frp_sha256_checksums.txt / checksums.txt）只存在于
+	// GitHub，镜像站上没有。而走镜像时内容校验用的是**镜像清单**（manifest.json，
+	// 覆盖更全），这份上游清单根本用不到 —— 硬下它等于在"镜像优先"里又塞回一次
+	// 公网访问，GitHub 不可达时还会让整个安装失败。跳过它才是老实现的语义
+	// （老代码 usedMirror 时直接走 verifyMirrorChecksum，从不取上游清单）。
+	SkipWhenMirrorUsed bool `json:"skip_when_mirror_used,omitempty"`
 	// ExpectSHA256 非空时，本步直接按它校验（镜像清单里的 sha256 就是这么来的）。
 	ExpectSHA256 string `json:"expect_sha256,omitempty"`
 	// ChecksumSource 是 ExpectSHA256 的来源描述（只写进日志，便于事后判断
@@ -268,6 +280,13 @@ func (a DownloadAction) Describe(ec *ExecConfig) string {
 // Exec 实现 InstallStep。
 func (a DownloadAction) Exec(ec *ExecConfig) error {
 	dest := ec.path(a.destPath())
+	// 走镜像时上游校验清单用不到（镜像清单才是 sha256 来源）：跳过它，
+	// 免得"镜像优先"又退化成一次公网访问。判定看本次安装是否真的从镜像下到过。
+	if a.SkipWhenMirrorUsed && ec.mirrorDownloadedAny() {
+		ec.Result.step(ec.Ctx, "主产物已从镜像站下到，跳过 "+a.Artifact.Name+
+			" 的下载（sha256 以镜像清单为准，不再访问公网源）")
+		return nil
+	}
 	// 镜像预检只在步骤显式要求、且执行器接入了的时候做：
 	// 不要求预检的步骤（校验清单这类小文件）不该因为没接入就失败。
 	// 要求了却没接入则**明确报错**（静默跳过会让"镜像优先"变成一句空话）。
@@ -276,7 +295,12 @@ func (a DownloadAction) Exec(ec *ExecConfig) error {
 			return fmt.Errorf("下载 %s 失败：这一步要求先做镜像预检，但执行器没有接入"+
 				"（面板内部错误）", a.Artifact.Name)
 		}
-		ec.MirrorPreflight(a.Artifact)
+		// 预检返回的是**它刚刚 HEAD 成功的那个地址**（不是另拼一份）——
+		// 用它当候选第一位，探测与实际下载就不可能指向两个地方。
+		// 返回空串 = 镜像不可用/缺件，保持产物自带的公网候选顺序。
+		if mirrorURL := ec.MirrorPreflight(a.Artifact); mirrorURL != "" {
+			a.Artifact = a.Artifact.withMirrorFirst(mirrorURL)
+		}
 	}
 	return ec.download(a, dest)
 }
@@ -286,6 +310,27 @@ func (a DownloadAction) destPath() string {
 		return "{root}/" + a.Artifact.Name
 	}
 	return strings.TrimRight(a.DestDir, "/") + "/" + a.Artifact.Name
+}
+
+// withMirrorFirst 返回一份"把镜像地址排到候选第一位"的产物副本。
+//
+// 为什么要去重：描述符里已经可能写了一份镜像候选（见 Artifact.URLs 的注释），
+// 执行期预检拿到的地址若与它相同，直接追加会变成"同一个地址下载两次"。
+// 用副本而不是改原描述符：描述符是注册表里的共享值，就地改会污染后续安装
+// （不同安装可能配了不同的镜像基址）。
+func (a Artifact) withMirrorFirst(mirrorURL string) Artifact {
+	if mirrorURL == "" {
+		return a
+	}
+	urls := make([]string, 0, len(a.URLs)+1)
+	urls = append(urls, mirrorURL)
+	for _, u := range a.URLs {
+		if u != mirrorURL {
+			urls = append(urls, u)
+		}
+	}
+	a.URLs = urls
+	return a
 }
 
 // ---------- 步骤：verify_sha256 ----------
@@ -883,8 +928,13 @@ type ExecConfig struct {
 	secrets     configSeedSecrets
 	secretLines []string
 	registered  bool
-	// mirrorUsed 记录"这次的包是不是从镜像站下的"（决定用哪套内容校验）。
-	mirrorUsed bool
+	// mirrorDownloaded 记录"哪些产物这次是**真的从镜像站下到**的"（按产物 Name）。
+	//
+	// 为什么是集合而不是一个 bool：一次安装里有多个 download 步骤（主产物 +
+	// 上游校验清单）。用一个 bool 时后一个步骤会把前一个的清掉，导致主产物
+	// 明明来自镜像、校验却去取上游清单（0.12.4 的一处隐蔽错位）。
+	// 语义仍是"只有真的从镜像下成功才算"（失败回落到公网就不算）。
+	mirrorDownloaded map[string]bool
 	// pathVars 是 {root} 这类占位符的取值。
 	pathVars map[string]string
 
@@ -893,7 +943,12 @@ type ExecConfig struct {
 	// 为什么用钩子而不是让步骤直接调 Manager：执行器要保持"可用假 Runner 单测"，
 	// 而镜像探测/清单校验/服务登记都是 Manager 的能力（涉及网络与数据库）。
 	// 钩子为 nil 时明确报错，**不静默跳过**（静默跳过正是"谎报成功"的来源）。
-	MirrorPreflight   func(a Artifact) bool
+	//
+	// MirrorPreflight：探镜像上有没有这个产物。返回**它实际 HEAD 成功的地址**
+	// （空串 = 镜像不可用/缺件，回落到产物自带地址）。返回值必须是地址而不是
+	// bool —— 只回 bool 时地址永远进不了候选列表，就会出现"日志说走镜像、
+	// curl 打 GitHub"（2026-09-17 真机 P0）。
+	MirrorPreflight   func(a Artifact) string
 	VerifyMirror      func(a Artifact) (sha string, source string, err error)
 	FetchChecksumList func(a Artifact) (sha string, source string, err error)
 	RegisterService   func(label, name, icon, category string, port int) error
@@ -1006,7 +1061,7 @@ func execStep(ec *ExecConfig, st InstallStep) error {
 				kind = art.Checksum.Kind
 			}
 			switch {
-			case ec.mirrorUsed && ec.VerifyMirror != nil:
+			case ec.mirrorUsed(art.Name) && ec.VerifyMirror != nil:
 				// 走镜像时用**镜像清单**的 sha256：镜像清单覆盖全部条目，
 				// 比"只有 frp 有上游清单"更严（Lucky / Orbien 上游根本没有清单）。
 				var err error
@@ -1067,6 +1122,27 @@ func (ec *ExecConfig) isMirrorURL(u string) bool {
 	return strings.HasPrefix(u, strings.TrimRight(base, "/")+"/")
 }
 
+// markMirrorDownload 记下"这个产物这次是不是真的从镜像站下到的"。
+//
+// 只有下载成功那一刻才调用，且由**实际用的候选地址**判定 ——
+// 这样"镜像就在候选里但下载失败、回落到了官方"不会被谎报成走了镜像。
+func (ec *ExecConfig) markMirrorDownload(asset string, fromMirror bool) {
+	if ec.mirrorDownloaded == nil {
+		ec.mirrorDownloaded = map[string]bool{}
+	}
+	if fromMirror {
+		ec.mirrorDownloaded[asset] = true
+		return
+	}
+	delete(ec.mirrorDownloaded, asset)
+}
+
+// mirrorUsed 报告某个产物这次是不是真的从镜像站下到的（决定用哪套 sha256）。
+func (ec *ExecConfig) mirrorUsed(asset string) bool { return ec.mirrorDownloaded[asset] }
+
+// mirrorDownloadedAny 报告本次安装是否已经有产物真的从镜像站下到。
+func (ec *ExecConfig) mirrorDownloadedAny() bool { return len(ec.mirrorDownloaded) > 0 }
+
 // mirrorChecksumFor 从镜像清单里取某个产物的 sha256（老 verifyMirrorChecksum 的核心）。
 //
 // 抽出来的原因：执行器需要的是"期望值 + 来源"，而不是"下载 + 校验 + 写日志"
@@ -1107,16 +1183,8 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 	}
 	part := dest + ".part"
 	var lastErr error
-	for i, u := range urls {
-		label := "备用地址"
-		if i == 0 {
-			label = "首选地址"
-		}
-		// 官方源给更短的截止时间：它只是"存在且可信"，不一定快。
-		maxTime := 300
-		if i == 0 {
-			maxTime = 150
-		}
+	for _, u := range urls {
+		label, maxTime := ec.downloadSource(u)
 		ec.Result.step(ec.Ctx, fmt.Sprintf("下载 %s（%s %s，上限 %d 秒）",
 			a.Artifact.Name, label, hostOf(u), maxTime))
 		fromMirror := ec.isMirrorURL(u)
@@ -1135,8 +1203,9 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 				return fmt.Errorf("下载完成但保存到 %s 失败: %w", dest, rerr)
 			}
 			// 这次到底走没走镜像：决定后面用哪套 sha256 校验
-			// （镜像清单 vs 上游 checksums）。只有**真的从镜像下到了**才算。
-			ec.mirrorUsed = fromMirror
+			// （镜像清单 vs 上游 checksums）。只有**真的从镜像下到了**才算 ——
+			// 镜像在候选里但下载失败、回落到了官方，不许记成走了镜像。
+			ec.markMirrorDownload(a.Artifact.Name, fromMirror)
 			size := ec.Runner.Size(dest)
 			// 把"实际用了多久、多快"写进任务日志：慢的时候用户能看出是网络问题，
 			// 我们事后也能一眼判断"该不该再调超时"。
@@ -1158,6 +1227,26 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 	return fmt.Errorf("下载 %s 失败（%d 个地址都试过）：%v。"+
 		"可在网络可达时手动下载该文件放到 %s，再重新点安装",
 		a.Artifact.Name, len(urls), lastErr, filepath.Dir(dest))
+}
+
+// downloadSource 给出某个候选地址的**来源标签**与**截止时间**。
+//
+// 标签必须与实际地址一致（用户就是靠任务日志判断"这次到底走没走镜像"）：
+//   - 镜像站地址 → "镜像站"，150 秒（同城/局域网，正常秒级完成；失败要快速回落）；
+//   - 官方 GitHub → "官方地址"，150 秒（"存在且可信"但不一定快，实测约 46KB/s）；
+//   - 其余（第三方加速镜像）→ "加速镜像（第三方）"，300 秒（实测约 640KB/s）。
+//
+// 为什么按**来源**而不是候选位置判定：老实现按 i==0 判定，镜像排到第一位后
+// 官方地址（位置变成 1）会拿到 300 秒，与"官方给更短截止时间"的语义相反。
+func (ec *ExecConfig) downloadSource(u string) (label string, maxTime int) {
+	switch {
+	case ec.isMirrorURL(u):
+		return "镜像站", 150
+	case hostOf(u) == "github.com":
+		return "官方地址", 150
+	default:
+		return "加速镜像（第三方）", 300
+	}
 }
 
 // verifySHA256 按给定期望值校验产物内容。

@@ -435,7 +435,11 @@ func TestURLAdvertisingFollowsBindAddress(t *testing.T) {
 //  ④ DSL 执行器：下载 / 校验 / 解压 / 落盘
 // ---------------------------------------------------------------------------
 
-// mirrorTestDescriptor 造一个"产物带镜像候选"的描述符。
+// mirrorTestDescriptor 造一个"产物带公网候选"的描述符。
+//
+// 刻意**不**把镜像地址写进 URL 列表：生产里镜像基址是执行期设置，
+// 镜像候选由 MirrorPreflight 钩子在执行期注入（0.12.4 的 P0 正是
+// 描述符里没有镜像、预检又只回了一个 bool，地址永远进不了候选表）。
 func mirrorTestDescriptor() AppDescriptor {
 	return AppDescriptor{
 		ID: "fake", Name: "假应用", Rail: RailTarball, Kind: KindNative, Port: 7400,
@@ -443,8 +447,8 @@ func mirrorTestDescriptor() AppDescriptor {
 		Artifacts: []Artifact{{
 			Name: "fake_1.0.0_darwin_arm64.tar.gz", Version: "v1.0.0",
 			URLs: []string{
-				"http://mirror.local/apps/fake/v1.0.0/fake_1.0.0_darwin_arm64.tar.gz",
 				"https://github.com/x/y/releases/download/v1.0.0/fake_1.0.0_darwin_arm64.tar.gz",
+				"https://ghfast.top/https://github.com/x/y/releases/download/v1.0.0/fake_1.0.0_darwin_arm64.tar.gz",
 			},
 			Kind: ArtifactTarGz,
 		}},
@@ -453,6 +457,10 @@ func mirrorTestDescriptor() AppDescriptor {
 
 // TestDownloadPrefersMirrorAndFallsBack 锁住"镜像优先、失败回落、并把
 // 这次走的是不是镜像记下来（决定用哪套 sha256）"。
+//
+// 走 DownloadAction.Exec（而不是直接调 ec.download）：镜像地址只能由
+// MirrorPreflight 钩子在执行期注入，直接调 download 会绕过这段接线 ——
+// 那正是这个 P0 当年逃过测试的原因。
 func TestDownloadPrefersMirrorAndFallsBack(t *testing.T) {
 	d := mirrorTestDescriptor()
 	attempts := 0
@@ -475,27 +483,27 @@ func TestDownloadPrefersMirrorAndFallsBack(t *testing.T) {
 	}
 	ec, _ := testExec(t, d, f)
 	ec.MirrorBase = "http://mirror.local"
-	ec.MirrorPreflight = func(Artifact) bool { return true }
-	ec.pathVars["{mirror}"] = "http://mirror.local"
+	// 钩子返回的地址就是描述符里没有的那一个：它必须出现在真实命令行里。
+	mirrorURL := "http://mirror.local/apps/fake/v1.0.0/" + d.Artifacts[0].Name
+	ec.MirrorPreflight = func(Artifact) string { return mirrorURL }
 
-	dest := ec.path("{root}/" + d.Artifacts[0].Name)
-	if err := ec.download(DownloadAction{Artifact: d.Artifacts[0], MirrorPreflight: true}, dest); err != nil {
+	if err := (DownloadAction{Artifact: d.Artifacts[0], MirrorPreflight: true}).Exec(ec); err != nil {
 		t.Fatalf("镜像失败后应回落到官方地址：%v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("应尝试两次（镜像 + 官方），实际 %d", attempts)
 	}
-	if ec.mirrorUsed {
+	if ec.mirrorUsed(d.Artifacts[0].Name) {
 		t.Error("这次是从官方地址下到的，mirrorUsed 不该为 true（它决定用镜像清单校验）")
 	}
-	if !strings.Contains(f.cmds[0], "http://mirror.local/apps/fake/") {
-		t.Errorf("镜像地址必须排第一：%s", f.cmds[0])
+	if !strings.Contains(f.cmds[0], mirrorURL) {
+		t.Errorf("镜像地址必须排第一且真的出现在 curl 命令行里：%s", f.cmds[0])
 	}
-	if !strings.Contains(f.cmds[0], "--max-time 150") {
-		t.Errorf("首选地址应给 150 秒的短截止时间：%s", f.cmds[0])
+	if strings.Contains(f.cmds[0], "github.com") {
+		t.Errorf("首选命令不该是 GitHub —— 预检说镜像可用就必须打镜像：%s", f.cmds[0])
 	}
-	if !strings.Contains(f.cmds[1], "github.com") || !strings.Contains(f.cmds[1], "--max-time 300") {
-		t.Errorf("备用地址应是官方地址且给 300 秒：%s", f.cmds[1])
+	if !strings.Contains(f.cmds[1], "github.com") || !strings.Contains(f.cmds[1], "--max-time 150") {
+		t.Errorf("备用地址应是官方地址且给 150 秒：%s", f.cmds[1])
 	}
 	steps := strings.Join(ec.Result.Steps, "\n")
 	if !strings.Contains(steps, "下载失败，换下一个地址") {
@@ -503,6 +511,200 @@ func TestDownloadPrefersMirrorAndFallsBack(t *testing.T) {
 	}
 	if !strings.Contains(steps, "下载完成") {
 		t.Errorf("成功必须写进任务日志：\n%s", steps)
+	}
+}
+
+// TestDownloadStepUsesPreflightMirrorURLInRealCommand 是 P0 的**回归锁**：
+//
+// 真机（mini，2026-09-17）日志写着"镜像可用，将从镜像站下载"，实际执行的却
+// 是 GitHub 命令。原因：MirrorPreflight 钩子的返回值被丢掉，镜像地址从未进入
+// 候选列表。这条测试断言**真实 curl 命令行里的 URL**（不是日志文案），
+// 并覆盖"镜像→官方→加速镜像"的完整回落阶梯与按来源给的截止时间。
+func TestDownloadStepUsesPreflightMirrorURLInRealCommand(t *testing.T) {
+	d := mirrorTestDescriptor()
+	main := d.Artifacts[0]
+	mirrorURL := "https://mirror.zizdog.com:8888/apps/fake/v1.0.0/" + main.Name
+
+	seen := []string{}
+	f := &fakeRunner{
+		runHook: func(name string, args []string) (string, error) {
+			if name != "/usr/bin/curl" {
+				return "", nil
+			}
+			// -o 前一个参数是 URL；-o 后一个是落盘路径。
+			u := args[len(args)-1]
+			seen = append(seen, u)
+			if u == mirrorURL {
+				return "mirror down", fmt.Errorf("exit status 22")
+			}
+			if strings.HasPrefix(u, "https://github.com/") {
+				return "github slow", fmt.Errorf("exit status 28")
+			}
+			// 最后是加速镜像：成功。
+			dest := args[len(args)-2]
+			return "", os.WriteFile(dest, []byte("payload"), 0o644)
+		},
+	}
+	ec, _ := testExec(t, d, f)
+	ec.MirrorBase = "https://mirror.zizdog.com:8888"
+	ec.MirrorPreflight = func(Artifact) string { return mirrorURL }
+
+	if err := (DownloadAction{Artifact: main, MirrorPreflight: true}).Exec(ec); err != nil {
+		t.Fatalf("应逐级回落到加速镜像后成功：%v", err)
+	}
+	// ① 真实命令行必须按 镜像 → 官方 → 加速镜像 顺序尝试。
+	if len(seen) != 3 {
+		t.Fatalf("应尝试 3 个地址（镜像/官方/加速镜像），实际 %d：%v", len(seen), seen)
+	}
+	if seen[0] != mirrorURL {
+		t.Errorf("第一条命令必须是镜像地址（预检说可用），实际 %s", seen[0])
+	}
+	if !strings.Contains(seen[1], "github.com/x/y") {
+		t.Errorf("镜像失败后应回落官方地址，实际 %s", seen[1])
+	}
+	if !strings.Contains(seen[2], "ghfast.top") {
+		t.Errorf("官方失败后应回落加速镜像，实际 %s", seen[2])
+	}
+	// ② 截止时间按来源：镜像/官方 150 秒，加速镜像 300 秒。
+	if !strings.Contains(f.cmds[0], "--max-time 150") {
+		t.Errorf("镜像站应给 150 秒：%s", f.cmds[0])
+	}
+	if !strings.Contains(f.cmds[1], "--max-time 150") {
+		t.Errorf("官方地址应给 150 秒：%s", f.cmds[1])
+	}
+	if !strings.Contains(f.cmds[2], "--max-time 300") {
+		t.Errorf("加速镜像应给 300 秒：%s", f.cmds[2])
+	}
+	// ③ 日志标签必须与实际地址一致：说"镜像站"的那一行必须写的是镜像主机，
+	//    不许出现"镜像站 github.com"这类自相矛盾的日志。
+	joinedSteps := strings.Join(ec.Result.Steps, "\n")
+	if !strings.Contains(joinedSteps, "镜像站 mirror.zizdog.com:8888") {
+		t.Errorf("任务日志里应有一条写明「镜像站 <镜像主机>」：\n%s", joinedSteps)
+	}
+	if strings.Contains(joinedSteps, "镜像站 github.com") {
+		t.Errorf("日志把 GitHub 标成了镜像站（说镜像、走 GitHub 的翻版）：\n%s", joinedSteps)
+	}
+	// ④ 实际是从加速镜像下到的：mirrorUsed 必须为 false（不能用镜像清单校验）。
+	if ec.mirrorUsed(main.Name) {
+		t.Error("最终是从加速镜像下到的，mirrorUsed 不该为 true")
+	}
+}
+
+// TestDownloadStepMarksMirrorUsedOnlyOnMirrorSuccess：镜像真的下成功时，
+// mirrorUsed 必须为 true（后续 verify_sha256 据此改用镜像清单）。
+func TestDownloadStepMarksMirrorUsedOnlyOnMirrorSuccess(t *testing.T) {
+	d := mirrorTestDescriptor()
+	main := d.Artifacts[0]
+	mirrorURL := "https://mirror.example.com/apps/fake/" + main.Name
+	f := &fakeRunner{
+		runHook: func(name string, args []string) (string, error) {
+			if name != "/usr/bin/curl" {
+				return "", nil
+			}
+			dest := args[len(args)-2]
+			return "", os.WriteFile(dest, []byte("payload"), 0o644)
+		},
+	}
+	ec, _ := testExec(t, d, f)
+	ec.MirrorBase = "https://mirror.example.com"
+	ec.MirrorPreflight = func(Artifact) string { return mirrorURL }
+
+	if err := (DownloadAction{Artifact: main, MirrorPreflight: true}).Exec(ec); err != nil {
+		t.Fatalf("镜像可用时下载应成功：%v", err)
+	}
+	if !ec.mirrorUsed(main.Name) {
+		t.Error("真的从镜像下到了，mirrorUsed 必须为 true（否则会去取上游清单）")
+	}
+}
+
+// TestChecksumDownloadSkippedOnlyWhenMirrorUsed：上游校验清单只存在于 GitHub，
+// 走镜像时 sha256 以镜像清单为准 —— 这一步必须跳过，否则"镜像优先"里又塞回
+// 一次公网访问，GitHub 不可达时还会让整个安装失败。回落公网时必须照常下载。
+func TestChecksumDownloadSkippedOnlyWhenMirrorUsed(t *testing.T) {
+	d := mirrorTestDescriptor()
+	main := d.Artifacts[0]
+	checksum := Artifact{
+		Name: "checksums.txt",
+		URLs: []string{"https://github.com/x/y/releases/download/v1.0.0/checksums.txt"},
+		Kind: ArtifactBinary,
+	}
+	mirrorURL := "https://mirror.example.com/apps/fake/" + main.Name
+
+	cases := []struct {
+		name        string
+		mirrorURL   string
+		curlMirror  bool
+		wantCurls   int
+		wantSkipped bool
+	}{
+		{"镜像可用时跳过上游清单", mirrorURL, true, 1, true},
+		{"镜像不可用时照常下清单", "", false, 2, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			curlCount := 0
+			mirrorHits := 0
+			f := &fakeRunner{runHook: func(name string, args []string) (string, error) {
+				if name != "/usr/bin/curl" {
+					return "", nil
+				}
+				curlCount++
+				if args[len(args)-1] == mirrorURL {
+					mirrorHits++
+				}
+				dest := args[len(args)-2]
+				return "", os.WriteFile(dest, []byte("payload"), 0o644)
+			}}
+			ec, _ := testExec(t, d, f)
+			ec.Spec.Steps = []InstallStep{
+				DownloadAction{Artifact: main, MirrorPreflight: true},
+				DownloadAction{Artifact: checksum, SkipWhenMirrorUsed: true},
+			}
+			if tc.mirrorURL != "" {
+				ec.MirrorBase = "https://mirror.example.com"
+			}
+			// 预检钩子始终接线：返回空串 = 预检过、镜像不可用，回落公网。
+			ec.MirrorPreflight = func(Artifact) string { return tc.mirrorURL }
+			if err := ExecuteInstall(ec); err != nil {
+				t.Fatalf("安装步骤应成功：%v", err)
+			}
+			if curlCount != tc.wantCurls {
+				t.Errorf("curl 次数应为 %d，实际 %d（命令：%v）", tc.wantCurls, curlCount, f.cmds)
+			}
+			joined := strings.Join(ec.Result.Steps, "\n")
+			skipped := strings.Contains(joined, "跳过 checksums.txt 的下载")
+			if skipped != tc.wantSkipped {
+				t.Errorf("是否跳过上游清单 = %v，期望 %v：\n%s", skipped, tc.wantSkipped, joined)
+			}
+			if tc.curlMirror && mirrorHits != 1 {
+				t.Errorf("主产物应只从镜像下一次，实际镜像命中 %d 次", mirrorHits)
+			}
+		})
+	}
+}
+
+// TestTarballOrchestratorInjectsMirrorURL 是 P0 的结构性锁（与行为测试互补）：
+// 执行器的装配处必须（a）把镜像基址传进去（否则 isMirrorURL 永远 false、
+// mirrorUsed 永远不成立）、（b）让预检钩子返回**地址**而不是 bool。
+//
+// 只记 bool 的写法（`ec.mirrorUsed = used`）必须彻底消失 —— 它正是
+// "日志说走镜像、curl 实际打 GitHub"的根因，而且没有任何编译错误会提醒。
+func TestTarballOrchestratorInjectsMirrorURL(t *testing.T) {
+	src, err := os.ReadFile("tarball_descriptor.go")
+	if err != nil {
+		t.Fatalf("读不到 tarball_descriptor.go：%v", err)
+	}
+	text := string(src)
+	for _, want := range []string{
+		"MirrorBase: m.mirrorBase()",
+		"return m.preflightMirrorAsset(ctx, spec, result)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("tarball 执行器装配处缺少 %q（镜像地址进不了候选列表）", want)
+		}
+	}
+	if strings.Contains(text, "ec.mirrorUsed = ") {
+		t.Error("预检钩子不许再只记 bool：镜像地址必须被插进候选列表")
 	}
 }
 
