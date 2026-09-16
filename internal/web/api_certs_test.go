@@ -37,11 +37,55 @@ type fakeACME struct {
 	renewed []string
 	deleted []string
 
+	// 失败申请条目（见 internal/acme/attempt.go）。
+	attempts       map[string]*acme.Attempt
+	attemptOrder   []string
+	deletedAttempt []string
+
 	issueErr error
 	renewErr error
 }
 
-func newFakeACME() *fakeACME { return &fakeACME{certs: map[string]*acme.Cert{}} }
+func newFakeACME() *fakeACME {
+	return &fakeACME{certs: map[string]*acme.Cert{}, attempts: map[string]*acme.Attempt{}}
+}
+
+func (f *fakeACME) putAttempt(a *acme.Attempt) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.attempts[a.Primary]; !ok {
+		f.attemptOrder = append(f.attemptOrder, a.Primary)
+	}
+	f.attempts[a.Primary] = a
+}
+
+func (f *fakeACME) Attempts() ([]*acme.Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*acme.Attempt, 0, len(f.attemptOrder))
+	for _, p := range f.attemptOrder {
+		out = append(out, f.attempts[p])
+	}
+	return out, nil
+}
+
+func (f *fakeACME) LoadAttempt(primary string) (*acme.Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.attempts[primary]
+	if !ok {
+		return nil, fmt.Errorf("申请记录 %s 不存在", primary)
+	}
+	return a, nil
+}
+
+func (f *fakeACME) DeleteAttempt(primary string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.attempts, primary)
+	f.deletedAttempt = append(f.deletedAttempt, primary)
+	return nil
+}
 
 func (f *fakeACME) put(c *acme.Cert) {
 	f.mu.Lock()
@@ -95,6 +139,8 @@ func (f *fakeACME) Issue(_ context.Context, req acme.IssueRequest) (*acme.Cert, 
 		f.order = append(f.order, c.Primary)
 	}
 	f.certs[c.Primary] = c
+	// 真实引擎成功后会清掉同主域名的失败条目（让位给正式证书），假实现保持一致。
+	delete(f.attempts, c.Primary)
 	return c, nil
 }
 
@@ -484,6 +530,207 @@ func TestCertRenewUnknownCertIs404(t *testing.T) {
 	res, _, _ := doJSON(t, ts, "POST", "/api/v1/certs/nope.test/renew", nil, cookies)
 	if res.StatusCode != http.StatusNotFound {
 		t.Fatalf("不存在的证书应 404，实际 %d", res.StatusCode)
+	}
+}
+
+// ---------- 失败申请条目：保存 / 列表可区分 / 一键重试 / 可删除 ----------
+
+// seedAttempt 造一条「申请失败、可重试」的条目（dns-01 + cloudflare）。
+func seedAttempt(f *fakeACME, primary string) *acme.Attempt {
+	a := &acme.Attempt{
+		Primary:     primary,
+		Domains:     []string{primary, "www." + primary},
+		Email:       "ops@example.com",
+		Challenge:   acme.ChallengeDNS01,
+		CA:          acme.CALetsEncrypt,
+		DNSProvider: "cloudflare",
+		CreatedAt:   time.Now().Add(-2 * time.Hour),
+		UpdatedAt:   time.Now().Add(-time.Hour),
+		Failures:    2,
+		LastError:   "向 CA 申请证书失败: provider rejected token ***",
+	}
+	f.putAttempt(a)
+	return a
+}
+
+// TestCertsListDistinguishesIssuedAndFailed：列表要能区分「已签发」与「失败/待重试」，
+// 失败条目带上次错误与时间；同一主域名同时有正式证书时只显示证书行（不重复、不误导）。
+func TestCertsListDistinguishesIssuedAndFailed(t *testing.T) {
+	srv, ts := newTestServer(t)
+	fake := newFakeACME()
+	srv.acmeOverride = fake
+
+	fake.put(&acme.Cert{
+		Primary: "ok.test", Domains: []string{"ok.test"}, Issuer: "Fake CA",
+		CertPath:  filepath.Join(srv.Cfg.DataDir, "certs", "ok.test", "fullchain.pem"),
+		KeyPath:   filepath.Join(srv.Cfg.DataDir, "certs", "ok.test", "privkey.pem"),
+		NotAfter:  time.Now().Add(60 * 24 * time.Hour),
+		Challenge: acme.ChallengeHTTP01, CA: acme.CALetsEncrypt, UpdatedAt: time.Now(),
+	})
+	seedAttempt(fake, "bad.test")
+	// 同主域名既有正式证书又有失败记录：列表只出"已签发"这一条，上次失败作为附加信息。
+	seedAttempt(fake, "ok.test")
+
+	cookies := loginTestPanel(t, ts)
+	res, body, _ := doJSON(t, ts, "GET", "/api/v1/certs", nil, cookies)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/certs 返回 %d: %v", res.StatusCode, body)
+	}
+	list, _ := apiData(t, body)["list"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("应列出 2 条（1 已签发 + 1 失败），实际 %v", body)
+	}
+	by := map[string]map[string]any{}
+	for _, it := range list {
+		m, _ := it.(map[string]any)
+		by[fmt.Sprint(m["primary"])] = m
+	}
+
+	issued, ok := by["ok.test"]
+	if !ok {
+		t.Fatalf("列表里缺少 ok.test: %v", body)
+	}
+	if issued["status"] != "issued" {
+		t.Errorf("已签发证书 status 应为 issued: %v", issued)
+	}
+	if _, has := issued["days_left"]; !has {
+		t.Errorf("已签发证书应带 days_left: %v", issued)
+	}
+	if s, _ := issued["last_error"].(string); s == "" {
+		t.Errorf("同主域名有失败记录时，证书行应带上次错误: %v", issued)
+	}
+
+	failed, ok := by["bad.test"]
+	if !ok {
+		t.Fatalf("失败条目没有出现在列表里: %v", body)
+	}
+	if failed["status"] != "failed" {
+		t.Errorf("失败条目 status 应为 failed: %v", failed)
+	}
+	if s, _ := failed["last_error"].(string); !strings.Contains(s, "***") {
+		t.Errorf("失败条目应带脱敏后的错误文本: %v", failed)
+	}
+	if failed["last_error_at"] == "" || failed["updated_at"] == "" {
+		t.Errorf("失败条目应带最后失败时间: %v", failed)
+	}
+	if failed["dns_provider"] != "cloudflare" {
+		t.Errorf("失败条目应保存 DNS 服务商名字（用于预填）: %v", failed)
+	}
+	if failed["email"] != "ops@example.com" {
+		t.Errorf("失败条目应保存邮箱: %v", failed)
+	}
+	if failed["challenge"] != "dns-01" || failed["ca"] != acme.CALetsEncrypt {
+		t.Errorf("失败条目应保存校验方式与 CA: %v", failed)
+	}
+	if _, has := failed["days_left"]; has {
+		t.Errorf("失败条目不应有 days_left（根本没有到期时间）: %v", failed)
+	}
+	if _, has := failed["dns"]; has {
+		t.Errorf("失败条目不该带 dns 凭据容器: %v", failed)
+	}
+	for _, k := range []string{"env", "token", "secret", "api_key", "access_key"} {
+		if _, has := failed[k]; has {
+			t.Errorf("失败条目出现了疑似凭据字段 %q: %v", k, failed)
+		}
+	}
+}
+
+// TestCertRetryReissuesFromSavedAttemptWithoutUserInput：重试必须用保存的条目 +
+// 服务端已存凭据重签，请求体为空（用户不重填任何东西），成功后失败条目让位给正式证书。
+func TestCertRetryReissuesFromSavedAttemptWithoutUserInput(t *testing.T) {
+	srv, ts := newTestServer(t)
+	fake := newFakeACME()
+	srv.acmeOverride = fake
+
+	const token = "cf-retry-secret-token-0987654321"
+	if err := srv.storeDNSEnv("cloudflare", map[string]string{"CLOUDFLARE_DNS_API_TOKEN": token}); err != nil {
+		t.Fatalf("预置 DNS 凭据失败: %v", err)
+	}
+	seedAttempt(fake, "api.test")
+
+	cookies := loginTestPanel(t, ts)
+	// 请求体为 nil：用户不需要重填；DNS 凭据也绝不经过浏览器。
+	res, body, _ := doJSON(t, ts, "POST", "/api/v1/certs/api.test/retry", nil, cookies)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("重试应返回 202（任务中心），实际 %d: %v", res.StatusCode, body)
+	}
+	tk := waitTaskDone(t, srv, taskIDFrom(t, body))
+	if tk.Status() != tasks.StatusSucceeded {
+		t.Fatalf("重试任务应成功，实际 %s", tk.Status())
+	}
+	issued, _, _ := fake.snapshot()
+	if len(issued) != 1 {
+		t.Fatalf("引擎应收到 1 次 Issue，实际 %d", len(issued))
+	}
+	got := issued[0]
+	if strings.Join(got.Domains, ",") != "api.test,www.api.test" {
+		t.Fatalf("重试应沿用保存的域名，实际 %v", got.Domains)
+	}
+	if got.Challenge != acme.ChallengeDNS01 || got.CA != acme.CALetsEncrypt {
+		t.Fatalf("重试应沿用保存的校验方式/CA，实际 %v / %v", got.Challenge, got.CA)
+	}
+	if got.DNS == nil || got.DNS.Name != "cloudflare" {
+		t.Fatalf("重试应带上保存的 DNS 服务商: %+v", got.DNS)
+	}
+	if got.DNS.Env["CLOUDFLARE_DNS_API_TOKEN"] != token {
+		t.Fatal("重试没有用服务端已保存的凭据")
+	}
+
+	// 成功后：失败条目让位给正式证书。
+	res, body, _ = doJSON(t, ts, "GET", "/api/v1/certs", nil, cookies)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("重试后列表返回 %d: %v", res.StatusCode, body)
+	}
+	list, _ := apiData(t, body)["list"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("重试成功后应只剩 1 条（正式证书），实际 %v", body)
+	}
+	item, _ := list[0].(map[string]any)
+	if item["status"] != "issued" {
+		t.Fatalf("重试成功后该条目应为 issued: %v", item)
+	}
+}
+
+// TestCertRetryGuards：没有失败记录 → 404；已有正式证书 → 409（不能拿失败条目覆盖它）。
+func TestCertRetryGuards(t *testing.T) {
+	srv, ts := newTestServer(t)
+	fake := newFakeACME()
+	srv.acmeOverride = fake
+	cookies := loginTestPanel(t, ts)
+
+	res, _, _ := doJSON(t, ts, "POST", "/api/v1/certs/nope.test/retry", nil, cookies)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("没有失败记录时应 404，实际 %d", res.StatusCode)
+	}
+
+	fake.put(&acme.Cert{Primary: "done.test", Domains: []string{"done.test"}, NotAfter: time.Now().Add(time.Hour)})
+	seedAttempt(fake, "done.test")
+	res, body, _ := doJSON(t, ts, "POST", "/api/v1/certs/done.test/retry", nil, cookies)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("已签发证书的重试应 409，实际 %d: %v", res.StatusCode, body)
+	}
+}
+
+// TestCertDeleteRemovesFailedAttempt：失败条目必须能删掉，否则会永远留在列表里。
+func TestCertDeleteRemovesFailedAttempt(t *testing.T) {
+	srv, ts := newTestServer(t)
+	fake := newFakeACME()
+	srv.acmeOverride = fake
+	seedAttempt(fake, "bad.test")
+	cookies := loginTestPanel(t, ts)
+
+	res, body, _ := doJSON(t, ts, "DELETE", "/api/v1/certs/bad.test", nil, cookies)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("删除失败记录应 200，实际 %d: %v", res.StatusCode, body)
+	}
+	if _, err := fake.LoadAttempt("bad.test"); err == nil {
+		t.Fatal("失败记录没有被删除")
+	}
+	fake.mu.Lock()
+	got := append([]string(nil), fake.deletedAttempt...)
+	fake.mu.Unlock()
+	if len(got) != 1 || got[0] != "bad.test" {
+		t.Fatalf("应调用一次 DeleteAttempt(bad.test)，实际 %v", got)
 	}
 }
 

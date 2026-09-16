@@ -173,6 +173,9 @@ export const api = {
   certs: () => request('GET', `${API_BASE}/certs`),
   certApply: (payload) => request('POST', `${API_BASE}/certs`, payload),
   certRenew: (primary) => request('POST', `${API_BASE}/certs/${enc(primary)}/renew`, {}),
+  // certRetry：用服务端保存的失败条目 + 已存凭据重签，**请求体为空**——
+  // 用户不需要重新填域名/校验方式/DNS 服务商，浏览器也不参与任何凭据。
+  certRetry: (primary) => request('POST', `${API_BASE}/certs/${enc(primary)}/retry`, {}),
   certDelete: (primary) => request('DELETE', `${API_BASE}/certs/${enc(primary)}`),
   // DNS 服务商清单：只返回名称与所需环境变量键名，绝不回显用户填过的值。
   certDnsProviders: () => request('GET', `${API_BASE}/certs/dns-providers`),

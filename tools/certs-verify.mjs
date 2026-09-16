@@ -89,26 +89,33 @@ page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
 
 // ---------- 2. 假数据：字段与后端契约一一对应 ----------
 // 证书列表：故意包含 3 种到期状态（<15 天 / 充裕 / 已过期），
-// 以及 http-01 与 dns-01 两种验证方式。
+// http-01 与 dns-01 两种验证方式，以及一条 status=failed 的「申请失败、可重试」条目。
 const CERTS = [
   {
     primary: 'demo.test', domains: ['demo.test', 'www.demo.test'], issuer: "Let's Encrypt",
     not_after: '2026-10-01T00:00:00Z', days_left: 12, challenge: 'http-01', ca: 'letsencrypt',
-    needs_renewal: true,
+    needs_renewal: true, status: 'issued',
     cert_path: '/opt/zizpanel/certs/demo.test/fullchain.pem',
     key_path: '/opt/zizpanel/certs/demo.test/privkey.pem', // 契约里列表只含路径，不含私钥内容
   },
   {
     primary: 'api.test', domains: ['api.test', '*.api.test'], issuer: 'ZeroSSL',
     not_after: '2026-11-18T00:00:00Z', days_left: 60, challenge: 'dns-01', ca: 'zerossl',
-    needs_renewal: false,
+    needs_renewal: false, status: 'issued',
     cert_path: '/opt/zizpanel/certs/api.test/fullchain.pem',
     key_path: '/opt/zizpanel/certs/api.test/privkey.pem',
   },
   {
     primary: 'old.test', domains: ['old.test'], issuer: "Let's Encrypt",
     not_after: '2026-09-13T00:00:00Z', days_left: -3, challenge: 'http-01', ca: 'letsencrypt',
-    needs_renewal: true,
+    needs_renewal: true, status: 'issued',
+  },
+  {
+    // 失败条目：没有证书/私钥，只有可重试的申请信息（**凭据值绝不出现在这里**）。
+    primary: 'fail.test', domains: ['fail.test', 'www.fail.test'], status: 'failed',
+    email: 'ops@example.com', challenge: 'dns-01', ca: 'letsencrypt', dns_provider: 'cloudflare',
+    failures: 2, last_error: '向 CA 申请证书失败: provider rejected token ***',
+    created_at: '2026-09-19T10:00:00Z', updated_at: '2026-09-20T10:00:00Z', last_error_at: '2026-09-20T10:00:00Z',
   },
 ];
 
@@ -161,6 +168,8 @@ await page.addInitScript(({ CERTS, PROVIDERS, SITES }) => {
     if (p === '/api/v1/certs/dns-providers') return done(PROVIDERS);
     let m = p.match(/^\/api\/v1\/certs\/([^/]+)\/renew$/);
     if (m && method === 'POST') return done({ task_id: 'task-renew-1', title: '续期证书' });
+    m = p.match(/^\/api\/v1\/certs\/([^/]+)\/retry$/);
+    if (m && method === 'POST') return done({ task_id: 'task-retry-1', title: '重试申请证书' });
     m = p.match(/^\/api\/v1\/certs\/([^/]+)$/);
     if (m && method === 'DELETE') return done(null);
     if (p === '/api/v1/sites' && method === 'GET') {
@@ -332,6 +341,36 @@ const result = await page.evaluate(async () => {
   await waitFor(() => window.__fetches.some((f) => f.method === 'DELETE'));
   out.deleteCalls = window.__fetches.filter((f) => f.method === 'DELETE').map((f) => f.path);
 
+  // ================= ⑦ 失败条目：状态 / 一键重试 / 预填 =================
+  const failRow = Array.from(box.querySelectorAll('tbody tr'))
+    .find((tr) => (tr.textContent || '').includes('fail.test'));
+  out.failRowText = (failRow.innerText || '').replace(/\s+/g, ' ').trim();
+  out.failRowPills = pillsOf(failRow);
+  out.failRowActions = Array.from(failRow.querySelectorAll('button')).map((b) => (b.textContent || '').trim());
+  out.failRowShowsDays = /剩余|已过期/.test(failRow.innerText || '');
+
+  // 一键重试：走任务中心，POST 请求体为空（用户不重填、凭据不经浏览器）。
+  btnByText(failRow, '🔁 重试').click();
+  await waitFor(() => window.__fetches.some((f) => f.method === 'POST' && f.path === '/api/v1/certs/fail.test/retry'));
+  out.retryCall = window.__taskCalls.find((t) => t.target === 'cert:fail.test');
+  out.retryBody = (window.__fetches.find((f) => f.method === 'POST' && f.path === '/api/v1/certs/fail.test/retry') || {}).body;
+  closeAllModals();
+
+  // 修改后重试：对话框预填上次的域名/邮箱/CA/校验方式，并预选 DNS 服务商。
+  btnByText(failRow, '✏️ 修改后重试').click();
+  await waitFor(() => modals().find((m) => (m.querySelector('.modal-head h3')?.textContent || '').includes('修改后重新申请证书')));
+  await waitFor(() => (document.getElementById('zp-dns-provider') || {}).options
+    && document.getElementById('zp-dns-provider').options.length >= 3);
+  out.prefill = {
+    domains: document.getElementById('zp-cert-domains').value,
+    email: document.getElementById('zp-cert-email').value,
+    ca: document.getElementById('zp-cert-ca').value,
+    challenge: document.getElementById('zp-cert-challenge').value,
+    provider: document.getElementById('zp-dns-provider').value,
+    hint: (document.querySelector('#zp-dns-fields .hint')?.textContent || '').trim(),
+  };
+  closeAllModals();
+
   // ================= ⑦ 站点侧：SSL Tab 里按域名预选证书 =================
   const { SitesView } = await import('./sites.js');
   const sbox = document.createElement('div');
@@ -372,6 +411,8 @@ const result = await page.evaluate(async () => {
   };
   out.wildcardCase = await oneCase('sub.api.test');
   out.noMatchCase = await oneCase('nope.test');
+  // 失败条目绝不能进入"可应用证书"下拉：它根本没有证书文件。
+  out.failOnlyCase = await oneCase('fail.test');
 
   // ================= ⑨ 后端未落地 / 数据形状不符时不白屏 =================
   // 这是用户明确点名要回答的问题：接口 404/500、或返回的 JSON 形状和契约不同时，
@@ -460,7 +501,7 @@ if (result.taskError) console.log('  [taskError] ' + result.taskError);
 
 // ---------- 断言 ----------
 // ① 列表：剩余天数 + <30 天醒目提示
-check('列表渲染 3 张证书', (result.rows || []).length === 3, JSON.stringify((result.rows || []).map((r) => r.text)));
+check('列表渲染 4 条（3 张证书 + 1 条失败记录）', (result.rows || []).length === 4, JSON.stringify((result.rows || []).map((r) => r.text)));
 check('表头包含「主域名/覆盖域名/签发机构/到期时间/验证方式/CA」',
   ['主域名', '覆盖域名', '签发机构', '到期时间', '验证方式', 'CA'].every((x) => (result.headers || []).includes(x)),
   (result.headers || []).join(','));
@@ -542,6 +583,28 @@ check('续期走任务中心（target=cert:api.test）', result.renewCall && res
 check('续期 POST 到 /api/v1/certs/api.test/renew',
   (result.renewPaths || []).includes('/api/v1/certs/api.test/renew'), JSON.stringify(result.renewPaths));
 
+// ⑦ 失败条目：状态 + 一键重试 + 预填
+const failTxt = result.failRowText || '';
+check('失败条目显示「申请失败，可重试」', /申请失败，可重试/.test(failTxt), failTxt);
+check('失败条目带上次错误（脱敏痕迹）', /申请证书失败.*\*\*\*/.test(failTxt), failTxt);
+check('失败条目不出示到期天数（没有到期时间）', result.failRowShowsDays === false, failTxt);
+check('失败条目有「重试」「修改后重试」「删除」',
+  ['🔁 重试', '✏️ 修改后重试', '删除'].every((t) => (result.failRowActions || []).includes(t)),
+  JSON.stringify(result.failRowActions));
+check('顶部统计失败数量并提供重试说明',
+  (result.headerPills || []).some((p) => /申请失败（可重试）/.test(p.text)), JSON.stringify(result.headerPills));
+check('一键重试走任务中心（target=cert:fail.test）',
+  result.retryCall && result.retryCall.target === 'cert:fail.test', JSON.stringify(result.retryCall));
+check('重试 POST 到 /api/v1/certs/fail.test/retry 且请求体为空（用户不重填）',
+  (result.calls || []).includes('POST /api/v1/certs/fail.test/retry')
+  && Object.keys(result.retryBody || {}).length === 0, JSON.stringify(result.retryBody));
+const pf = result.prefill || {};
+check('「修改后重试」预填域名', pf.domains === 'fail.test\nwww.fail.test', JSON.stringify(pf));
+check('「修改后重试」预填邮箱 / CA / 校验方式',
+  pf.email === 'ops@example.com' && pf.ca === 'letsencrypt' && pf.challenge === 'dns-01', JSON.stringify(pf));
+check('「修改后重试」预选 DNS 服务商并说明凭据已在服务端',
+  pf.provider === 'cloudflare' && /已保存在服务端/.test(pf.hint || ''), JSON.stringify(pf));
+
 // ⑦ 站点侧
 check('站点详情里确实挂了「使用 Let\'s Encrypt 证书」这块（有证书下拉）',
   !!result.siteSelected, result.siteSelected);
@@ -557,6 +620,8 @@ check('无匹配域名时不再给"必然报警告"的主按钮（应用按钮�
 check('无匹配域名时给出「去申请」引导',
   result.noMatchCase.hasGoApply === true && /没有与该域名匹配的证书/.test(result.noMatchCase.text),
   result.noMatchCase.text.slice(0, 160));
+check('失败条目不会进入站点「可应用证书」下拉（主按钮禁用）',
+  result.failOnlyCase.applyDisabled === true, JSON.stringify(result.failOnlyCase));
 
 // ⑧ 接口未落地 / 形状不符
 check('证书接口失败时页面是可读错误态（不白屏）',

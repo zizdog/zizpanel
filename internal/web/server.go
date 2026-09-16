@@ -197,6 +197,8 @@ func (s *Server) routes() http.Handler {
 	// 但放在一起更清楚：这是一条独立路径，不是某张证书的子资源。
 	root.HandleFunc("GET /api/v1/certs/dns-providers", s.requireAuth(s.handleCertDNSProviders))
 	root.HandleFunc("POST /api/v1/certs/{primary}/renew", s.requireAuth(s.handleCertRenew))
+	// 失败条目的「一键重试」：用保存的条目 + 服务端已存凭据重签，用户不必重填。
+	root.HandleFunc("POST /api/v1/certs/{primary}/retry", s.requireAuth(s.handleCertRetry))
 	root.HandleFunc("DELETE /api/v1/certs/{primary}", s.requireAuth(s.handleCertDelete))
 
 	// ---------- PHP 多版本 ----------

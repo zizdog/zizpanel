@@ -89,19 +89,35 @@ export function normalizeCerts(data) {
     let domains = Array.isArray(c.domains) ? c.domains.map(str).filter(Boolean)
       : splitDomains(c.domains);
     if (!domains.length) domains = [primary];
+    // status 缺省视为 issued：老后端（或只回证书的兼容接口）不该被当成失败条目。
+    // 只认 "failed" 这一个明确值 —— 其它任何写法都按已签发处理，避免误报。
+    const status = str(c.status || c.state).toLowerCase() === 'failed' ? 'failed' : 'issued';
     const notAfter = str(c.not_after || c.notAfter || c.expires || c.expiry);
     const given = c.days_left != null ? Number(c.days_left)
       : (c.daysLeft != null ? Number(c.daysLeft) : NaN);
-    const daysLeft = Number.isFinite(given) ? given : daysLeftFrom(notAfter);
+    // 失败条目没有到期时间：days_left 必须视为"未知"而不是 0，
+    // 否则会被当成"今天到期/已过期"，还会被顶部统计算进"30 天内到期"。
+    const daysLeft = status === 'failed'
+      ? null
+      : (Number.isFinite(given) ? given : daysLeftFrom(notAfter));
     return {
       primary,
       domains,
+      status,
       issuer: str(c.issuer || c.ca_name),
       notAfter,
       daysLeft,
       challenge: str(c.challenge),
       ca: str(c.ca),
       needsRenewal: !!(c.needs_renewal || c.needsRenewal),
+      // 失败条目用于展示与「预填申请表单」；lastError 已由后端脱敏。
+      // 注意 dnsProvider 只有服务商**名字**，凭据值从不出现在这里。
+      lastError: str(c.last_error || c.lastError),
+      lastErrorAt: str(c.last_error_at || c.lastErrorAt),
+      failures: Number(c.failures) || 0,
+      email: str(c.email),
+      dnsProvider: str(c.dns_provider || c.dnsProvider),
+      createdAt: str(c.created_at || c.createdAt),
       // cert_path / key_path 只是磁盘路径（契约里就没有私钥正文）。
       // 界面目前不展示它们，留着是为了排查问题时能对得上后端日志；
       // 任何情况下前端都不请求、不缓存、不回显私钥内容。
@@ -250,12 +266,18 @@ export function CertsView(content) {
 
   function renderHead(certs) {
     clear(headBox);
-    const expiring = certs.filter((c) => c.daysLeft != null && c.daysLeft < 30).length;
+    const issued = certs.filter((c) => c.status !== 'failed');
+    const failed = certs.filter((c) => c.status === 'failed');
+    const expiring = issued.filter((c) => c.daysLeft != null && c.daysLeft < 30).length;
     const running = taskCenter.findByTarget
       ? certs.filter((c) => taskCenter.findByTarget('cert:' + c.primary)).length
       : 0;
     appendAll(headBox,
-      h('span.pill', { text: `共 ${certs.length} 张证书` }),
+      h('span.pill', { text: `共 ${issued.length} 张证书` }),
+      failed.length ? h('span.pill.danger', {
+        text: `⚠️ ${failed.length} 个申请失败（可重试）`,
+        title: '失败条目已保留域名 / 校验方式 / DNS 服务商；点该行的「重试」即可，不需要重新填写',
+      }) : null,
       expiring ? h('span.pill.warn', { text: `⚠️ ${expiring} 张 30 天内到期`, title: '续期窗口是到期前 30 天，点该行的「续期」即可' }) : null,
       running ? h('span.pill.brand', { text: `⟳ ${running} 个任务进行中` }) : null,
       h('button.btn.btn-sm', { id: 'zp-cert-refresh', text: '⟳ 刷新', onclick: load }),
@@ -278,10 +300,33 @@ export function CertsView(content) {
       return;
     }
 
-    const tbody = h('tbody', certs.map((c) => h('tr', [
+    const tbody = h('tbody', certs.map((c) => (c.status === 'failed' ? failedRow(c) : issuedRow(c))));
+
+    appendAll(listBox, h('div', { style: { overflowX: 'auto' } }, [
+      h('table.table', [
+        h('thead', [h('tr', [
+          h('th', { text: '主域名' }), h('th', { text: '覆盖域名' }), h('th', { text: '签发机构' }),
+          h('th', { text: '到期时间' }), h('th', { text: '验证方式' }), h('th', { text: 'CA' }), h('th', { text: '操作' }),
+        ])]),
+        tbody,
+      ]),
+    ]));
+  }
+
+  // issuedRow 是已签发证书的行；failedRow 是「申请失败、可重试」的行。
+  // 两行共用同一套表头（多了 status 字段区分），前端只需要一套列布局。
+  function issuedRow(c) {
+    return h('tr', [
       h('td', [
         h('div', { style: { fontWeight: '600' }, text: c.primary }),
         c.needsRenewal ? h('div', { style: { marginTop: '3px' } }, [h('span.pill.warn', { text: '需要续期' })]) : null,
+        // 已签发的证书 + 上次重签失败：旧证书仍在服役，只加一个可解释的小徽标。
+        c.lastError ? h('div', { style: { marginTop: '3px' } }, [
+          h('span.pill.danger', {
+            text: '上次申请失败',
+            title: c.lastError + (c.lastErrorAt ? '（' + c.lastErrorAt + '）' : ''),
+          }),
+        ]) : null,
       ]),
       h('td', [
         h('div', {
@@ -302,17 +347,67 @@ export function CertsView(content) {
         h('button.btn.btn-sm', { text: '🔄 续期', onclick: () => renew(c) }),
         h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: () => remove(c) }),
       ])),
-    ])));
+    ]);
+  }
 
-    appendAll(listBox, h('div', { style: { overflowX: 'auto' } }, [
-      h('table.table', [
-        h('thead', [h('tr', [
-          h('th', { text: '主域名' }), h('th', { text: '覆盖域名' }), h('th', { text: '签发机构' }),
-          h('th', { text: '到期时间' }), h('th', { text: '验证方式' }), h('th', { text: 'CA' }), h('th', { text: '操作' }),
-        ])]),
-        tbody,
+  function failedRow(c) {
+    const err = c.lastError || '（没有记录具体的错误信息，详情见任务中心）';
+    return h('tr', [
+      h('td', [
+        h('div', { style: { fontWeight: '600' }, text: c.primary }),
+        h('div', { style: { marginTop: '3px', display: 'flex', gap: '5px', flexWrap: 'wrap' } }, [
+          h('span.pill.danger', { text: '申请失败，可重试' }),
+          c.failures > 1 ? h('span.pill.warn', { text: `已失败 ${c.failures} 次` }) : null,
+        ]),
       ]),
-    ]));
+      h('td', [
+        h('div', {
+          style: { fontSize: '12px', color: 'var(--text-dim)', maxWidth: '260px', wordBreak: 'break-all' },
+          text: c.domains.join(', '),
+        }),
+      ]),
+      h('td', { text: '—' }),
+      h('td', [
+        h('div', { style: { fontSize: '12px' }, text: c.lastErrorAt || c.updatedAt || '—' }),
+        h('div', {
+          style: {
+            fontSize: '11.5px', color: 'var(--danger)', maxWidth: '320px', marginTop: '3px', wordBreak: 'break-word',
+          },
+          title: err,
+          text: err,
+        }),
+      ]),
+      h('td', c.challenge
+        ? h('span.pill', { text: c.challenge, title: c.challenge === 'dns-01' ? 'DNS TXT 校验，支持泛域名' : 'HTTP 文件校验，需要 80 端口可达' })
+        : h('span', { text: '—' })),
+      h('td', { text: c.ca || '—' }),
+      h('td', h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } }, [
+        h('button.btn.btn-sm.btn-primary', {
+          text: '🔁 重试',
+          title: '用保存的域名 / 校验方式 / DNS 服务商 + 服务端已存凭据直接重签，不需要重新填写',
+          onclick: () => retry(c),
+        }),
+        h('button.btn.btn-sm', {
+          text: '✏️ 修改后重试',
+          title: '打开申请表单并预填上次的内容，改完再提交',
+          onclick: () => applyModal(prefillFrom(c)),
+        }),
+        h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: () => remove(c) }),
+      ])),
+    ]);
+  }
+
+  // prefillFrom 把失败条目转成申请表单的预填值。
+  // 只带域名 / 邮箱 / CA / 校验方式 / DNS 服务商**名字**（没有凭据值）。
+  function prefillFrom(c) {
+    return {
+      prefilled: true,
+      domains: c.domains.join('\n'),
+      email: c.email,
+      ca: c.ca,
+      challenge: c.challenge,
+      dnsProvider: c.dnsProvider,
+    };
   }
 
   function renew(c) {
@@ -326,18 +421,34 @@ export function CertsView(content) {
     });
   }
 
+  // retry 用保存的失败条目直接重签：请求体为空，凭据全部在服务端。
+  function retry(c) {
+    taskCenter.start({
+      kind: 'cert',
+      target: 'cert:' + c.primary,
+      title: `重试申请证书 ${c.primary}`,
+      start: () => api.certRetry(c.primary),
+      onDone: (m) => { if (m.status === 'succeeded') load(); },
+    });
+  }
+
   async function remove(c) {
+    const failed = c.status === 'failed';
     const ok = await confirmBox(
-      `删除证书「${c.primary}」？\n\n`
-      + `覆盖域名：${c.domains.join(', ')}\n`
-      + '删除后引用它的站点会失去 HTTPS（这些站点会回落到只监听 80 端口）。\n'
-      + '证书与私钥文件会从磁盘移除；需要时可以重新申请。',
-      { title: '删除证书', danger: true, okText: '删除证书' },
+      failed
+        ? `删除失败的申请记录「${c.primary}」？\n\n`
+          + `覆盖域名：${c.domains.join(', ')}\n`
+          + '删除后这条记录不再出现在列表里；需要时可以在「申请证书」里重新申请。'
+        : `删除证书「${c.primary}」？\n\n`
+          + `覆盖域名：${c.domains.join(', ')}\n`
+          + '删除后引用它的站点会失去 HTTPS（这些站点会回落到只监听 80 端口）。\n'
+          + '证书与私钥文件会从磁盘移除；需要时可以重新申请。',
+      { title: failed ? '删除申请记录' : '删除证书', danger: true, okText: failed ? '删除记录' : '删除证书' },
     );
     if (!ok) return;
     try {
       await api.certDelete(c.primary);
-      toast('证书已删除', 'ok');
+      toast(failed ? '失败申请记录已删除' : '证书已删除', 'ok');
       load();
     } catch (e) {
       toast('删除失败：' + e.message, 'err', 10000);
@@ -346,16 +457,24 @@ export function CertsView(content) {
 
   // ---------------- 申请表单 ----------------
 
-  function applyModal(presetDomains = '') {
+  function applyModal(preset = null) {
+    // preset 兼容两种调用：字符串（只预填域名）或对象（失败条目「修改后重试」）。
+    // 对象里**没有凭据**：只有域名/邮箱/CA/校验方式/DNS 服务商名字。
+    const pre = typeof preset === 'string' ? { domains: preset } : (preset || {});
     const domains = h('textarea.textarea', {
       id: 'zp-cert-domains',
       placeholder: 'example.com\nwww.example.com\n*.example.com',
-      value: presetDomains,
+      value: pre.domains || '',
       style: { minHeight: '92px' },
     });
-    const email = h('input.input', { id: 'zp-cert-email', type: 'email', placeholder: 'you@example.com', autocomplete: 'email' });
+    const email = h('input.input', {
+      id: 'zp-cert-email', type: 'email', placeholder: 'you@example.com', autocomplete: 'email', value: pre.email || '',
+    });
     const caSel = h('select.select', { id: 'zp-cert-ca' }, CA_OPTIONS.map((o) => h('option', { value: o.value, text: o.label })));
     const chalSel = h('select.select', { id: 'zp-cert-challenge' }, CHALLENGE_OPTIONS.map((o) => h('option', { value: o.value, text: o.label })));
+    // 预填 CA / 校验方式：只在该值确实在选项里时才选，否则保持默认（避免空选择）。
+    if (pre.ca && CA_OPTIONS.some((o) => o.value === pre.ca)) caSel.value = pre.ca;
+    if (pre.challenge && CHALLENGE_OPTIONS.some((o) => o.value === pre.challenge)) chalSel.value = pre.challenge;
     const chalHint = h('div.hint');
     const emailHint = h('div.hint', { text: '用于证书到期提醒与 CA 账号注册，建议填真实邮箱。' });
 
@@ -386,6 +505,12 @@ export function CertsView(content) {
       clear(fieldsBox);
       const p = providersCache.find((x) => x.name === provSel.value);
       if (!p) return;
+      // 从失败条目预填时：凭据已经在服务端，说明"留空即沿用"，避免用户以为必须重填。
+      if (pre.dnsProvider && pre.dnsProvider === provSel.value) {
+        appendAll(fieldsBox, h('div.hint', {
+          text: `「${p.label || provSel.value}」的凭据已保存在服务端（接口不回显）；这次不改凭据的话，下面留空即可沿用。`,
+        }));
+      }
       if (!p.fields.length) {
         appendAll(fieldsBox, h('div.hint', {
           text: `${p.label} 没有声明额外环境变量；若申请失败，请查看任务日志里 CA 的报错。`,
@@ -447,6 +572,10 @@ export function CertsView(content) {
       }
       provHint.textContent = '选择服务商后，下面会按它需要的环境变量动态生成输入框。';
       providersCache.forEach((p) => provSel.append(h('option', { value: p.name, text: p.label })));
+      // 预填失败条目里的服务商（只有后端清单里确实有它时才选，否则保持默认第一个）。
+      if (pre.dnsProvider && providersCache.some((p) => p.name === pre.dnsProvider)) {
+        provSel.value = pre.dnsProvider;
+      }
       renderProviderFields();
     }
 
@@ -482,6 +611,11 @@ export function CertsView(content) {
     const submit = h('button.btn.btn-primary', { id: 'zp-cert-submit', text: '提交申请（后台任务）' });
 
     const body = h('div', [
+      pre.prefilled ? h('div.hint', {
+        style: { color: 'var(--warn)', marginBottom: '8px' },
+        text: '已按上次失败的申请预填域名 / 邮箱 / 校验方式 / DNS 服务商；'
+          + 'DNS 凭据保存在服务端，不改的话留空即可沿用。改完点下面的按钮重新提交。',
+      }) : null,
       h('div.field', [h('label', { text: '域名' }), domains,
         h('div.hint', { text: '多个域名用换行或逗号分隔；第一个非泛域名会作为这张证书的主域名（也是列表里的标识）。' })]),
       h('div.field', [h('label', { text: '邮箱' }), email, emailHint]),
@@ -493,7 +627,7 @@ export function CertsView(content) {
     ]);
 
     const m = modal({
-      title: '申请 SSL 证书',
+      title: pre.prefilled ? '修改后重新申请证书' : '申请 SSL 证书',
       wide: true,
       body,
       footer: (close) => [
@@ -596,16 +730,20 @@ export function acmeSslSection(site = {}, { onApplied } = {}) {
       ]));
   }
 
-  function renderEmpty() {
+  function renderEmpty(hadFailed) {
     clear(statusBox); clear(body);
     appendAll(statusBox, h('span.pill.warn', { text: '还没有可用于该站点的证书' }));
     appendAll(body,
       h('div.hint', {
-        text: `面板里还没有申请过任何证书。点下面的「去申请」到证书页申请一张覆盖 ${domain || '该域名'} 的证书，`
-          + '申请完成后回到这里选用即可。',
+        text: hadFailed
+          // 有失败条目时不能说"还没申请过"——那是谎报，也会让用户找不到重试入口。
+          ? `面板里有申请失败的记录，但还没有可用的证书。到证书页点「重试」即可（域名 / 校验方式 / DNS 服务商已保存），`
+            + `或重新申请一张覆盖 ${domain || '该域名'} 的证书。`
+          : `面板里还没有申请过任何证书。点下面的「去申请」到证书页申请一张覆盖 ${domain || '该域名'} 的证书，`
+            + '申请完成后回到这里选用即可。',
       }),
       h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
-        h('button.btn.btn-sm.btn-primary', { text: '➕ 去申请证书', onclick: () => { location.hash = '#/certs'; } }),
+        h('button.btn.btn-sm.btn-primary', { text: hadFailed ? '🔁 去证书页重试' : '➕ 去申请证书', onclick: () => { location.hash = '#/certs'; } }),
         h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
       ]));
   }
@@ -687,14 +825,16 @@ export function acmeSslSection(site = {}, { onApplied } = {}) {
 
   async function load() {
     renderLoading();
-    let certs;
+    let all;
     try {
-      certs = normalizeCerts(await api.certs());
+      all = normalizeCerts(await api.certs());
     } catch (e) {
       renderError(e.message);
       return;
     }
-    if (!certs.length) { renderEmpty(); return; }
+    // 失败条目不能出现在"可应用的证书"里：它根本没有证书文件。
+    const certs = all.filter((c) => c.status !== 'failed');
+    if (!certs.length) { renderEmpty(all.length > 0); return; }
     renderCerts(certs);
   }
 

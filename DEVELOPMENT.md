@@ -170,7 +170,7 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 ## 九、已修复的典型坑（只增不减）
 
 > 都是在真机踩到并修复的，回归测试会拦住复发。原文 #91/#92 各重复一次，此处已合并；
-> 编号保持原样，末尾 #105–#107 为新增。
+> 编号保持原样，末尾 #105–#107 为第九轮新增，#108–#111 为后续轮次新增。
 
 1. **Apple Silicon 上 `sysctl kern.cp_time` 已移除** → CPU 使用率恒为 0。改用 `top -l 1 -n 0` 解析，`kern.cp_time` 仅兜底。
 2. **`ps` 的 `%CPU` 不可信** → 面板 fork `top` 的那一刻自己被显示成 73.7%（实际 0.0%）。改用两次 `cputime` 采样差值。
@@ -278,3 +278,7 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 105. **真实面板口令长期硬编码在测试夹具里**（本轮新增，门禁锁死）→ 自 v0.3.1 基线起、**9 个已跟踪文件**带着真实口令，仓库曾公开发布过。`af2b887` 只清理了一部分，`tools/uitest.mjs` 甚至留了「已改掉」的**假注释而值没改**；第九轮又发现 3 个新文件带着同一个口令。**教训：靠注释和记性不算数，必须做成门禁；且门禁要扫「将要提交的文件」（tracked + untracked 非忽略），只扫 `git ls-files` 会漏掉新增文件。** 口令一旦提交过就必须轮换（改历史不算修好）。
 106. **`tools/deploy.sh` 原来强制要求 `NAS_PASS`**（本轮新增）→ 本机对 NAS 早有 SSH 密钥登录（`ssh -o BatchMode=yes` 可通），导致"一条命令部署"在没口令时直接退出。现在改成**密钥优先、口令兜底**；探测**必须带 `BatchMode=yes`**，否则 ssh 会挂在那里等输入、看起来像卡死。
 107. **面板写操作要 CSRF 双提交**（本轮新增）→ 从可读的 `zp_csrf` cookie 取值放到 `X-CSRF-Token` 头，否则接口返回 403「CSRF 校验失败」。手工用 `curl` 调 `/api/v1/*` 的写接口时必须带。
+108. **dns-01 在"IPv6 DNS 不可达"的网络里必然失败**（2026-09-16 mini，有测试锁死）→ 申请证书报 `DNS call error: read udp [fd58:...]->[fd58:cbf6:7fb8::1]:53: i/o timeout`。根因：lego 的默认递归解析器是 `google-public-dns-a.google.com:53` 这类**主机名**，用它之前要先做一次系统解析；而路由器通告的 IPv6 DNS 不可达 → UDP 直接超时（mini 的 `/etc/resolv.conf` 只有 macOS 注释，lego 因此回落到它自己的主机名默认值）。修法：dns-01 时显式传 **IPv4 字面量**解析器（`internal/acme/resolvers.go`：223.5.5.5 / 223.6.6.6 / 119.29.29.29 / 1.1.1.1 / 8.8.8.8），过滤器只接受 IP 字面量，主机名一律丢弃并告警；可用 `Manager.DNS01Resolvers` 覆盖。门禁：`TestDefaultDNS01ResolversAreIPLiterals`、`TestDNS01Resolvers`。教训：**默认值是主机名，就会把一条本地网络故障变成签发故障。**
+109. **泛解析 CNAME 让 dns-01 永远失败**（同机，有测试锁死）→ 面板日志显示"正在写入 TXT 记录"→"记录已提交"，任务却以 `403 :: unauthorized :: No TXT record found at _acme-challenge.<域名>` 失败；用腾讯云 API 逐秒盯记录列表，域里始终**没有** `_acme-challenge` 记录。根因：该域有泛解析 `* CNAME lede.zizdog.com`，lego 的 dns-01 支持 CNAME 委派，于是把 TXT 写到了 CNAME 目标 `lede.zizdog.com`；而 **Let's Encrypt 不跟随由泛解析产生的 CNAME**，它直接查 `_acme-challenge.<域名>` → 空（可逆实验证实：手工在该挑战名插 TXT，权威 NS 立刻正常返回 —— **显式记录能覆盖泛解析 CNAME**）。修法：dns-01 默认设 `LEGO_DISABLE_CNAME_SUPPORT=1`（TXT 写回挑战名本身），需要 CNAME 委派的用户把 `Manager.DNS01FollowCNAME` 设为 true。门禁：`TestCNAMEPolicyDisablesFollowByDefault`、`TestCNAMEPolicyUnsetsWhenItWasUnset`、`TestCNAMEPolicyFollowLeavesEnvUntouched`。教训：**"记录已提交"不等于"CA 看得到"。**
+110. **ACME 证书属主导致 nginx 读不到证书**（同机，站点 SSL 绑定返回 500，有测试锁死）→ 接口报"配置已写入、nginx reload 成功，但复核发现新配置没有生效（探测期望 403、实际 000）"；443 不在监听；以 zizdog 身份 `nginx -t` 得 `cannot load certificate ... Permission denied`。根因：面板以 root 运行，写出的证书目录是 **0700 root、私钥 0600 root**；而 macOS 上 homebrew 的 nginx 是**以普通用户**（LaunchAgent）运行的 —— **本机 nginx 恰好是 root 起的，所以只在 mini 暴露**（又一次"一台机器的结论不能当普遍规律"）。修法：`saveCert` 落盘后把证书根目录及内容 `chown` 成与 `DataDir` 相同的属主（`alignOwnerWithDataDir`），**不把私钥放宽**（仍 0600）；失败只告警，由绑定站点时的 403 探针如实挡下。门禁：`TestAlignOwnerWithDataDirKeepsModes`、`TestAlignOwnerWithDataDirWarnsWhenDataDirMissing`。
+111. **ACME 引擎日志只进面板日志，任务中心只显示"申请失败"**（同轮，可观测性）→ 排查 dns-01 失败时，真正有用的"正在写入 TXT 记录 / 等待 DNS 传播"两行只在面板文件日志里，任务窗口只有一句"申请失败"，用户只能登机器翻日志。修法：签发任务的引擎日志**同时**作为任务步骤下发（`certManagerForIssue`，按需新建实例、不污染共享 `Manager`；续期仍走 `certManagerForRenew`）。教训：**失败信息必须出现在用户正在看的地方。**

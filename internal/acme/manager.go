@@ -27,11 +27,19 @@ import (
 //
 // 覆盖策略：只有在 CA 成功签发之后才写文件，因此申请失败时旧证书原样保留，
 // 线上 TLS 不会因为一次失败的重签而中断。
+//
+// 失败时会把本次申请（域名 / 校验方式 / CA / DNS 服务商名字 / 已脱敏的错误）
+// 存成一条可重试的条目（见 attempt.go），用户下次不必重新填表。
 func (m *Manager) Issue(ctx context.Context, req IssueRequest) (*Cert, error) {
 	// lego 的全局 logger 无法按 Manager 区分，这里把日志出口指向本次调用者。
 	setLogf(m.logf)
 	plan, err := m.prepare(req)
 	if err != nil {
+		// 连计划都没通过校验也要留一条可重试记录：用户不必重新填一遍表单。
+		// 加锁是为了和并发的 Issue/Renew 串行化条目的读-改-写（Failures 累加）。
+		m.mu.Lock()
+		m.recordRequestFailure(req, err)
+		m.mu.Unlock()
 		return nil, err
 	}
 	m.mu.Lock()
@@ -123,6 +131,8 @@ func (m *Manager) Delete(primary string) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("删除证书目录 %s 失败: %w", primary, err)
 	}
+	// 连同该主域名的失败申请记录一起清掉：用户删掉这个域名，就是不想再看到它。
+	m.clearAttempt(primary)
 	m.emit("已删除证书 %s", primary)
 	return nil
 }
@@ -148,24 +158,34 @@ func (m *Manager) issue(ctx context.Context, plan issuePlan, req IssueRequest) (
 			err = safeWrap(err, "申请证书失败")
 		}
 		m.emit("申请失败：%v", err)
+		m.recordIssueFailure(plan, err)
 		return nil, err
 	}
 	if len(res.fullchain) == 0 || len(res.key) == 0 {
-		return nil, errors.New("CA 返回的证书或私钥为空")
+		err := errors.New("CA 返回的证书或私钥为空")
+		m.recordIssueFailure(plan, err)
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("任务已取消: %w", err)
+		err = fmt.Errorf("任务已取消: %w", err)
+		m.recordIssueFailure(plan, err)
+		return nil, err
 	}
 
 	c, err := m.buildCert(plan, res)
 	if err != nil {
+		m.recordIssueFailure(plan, err)
 		return nil, err
 	}
 	if err := m.saveCert(plan, c, res, planRequest(plan, req)); err != nil {
-		return nil, fmt.Errorf("证书已签发但保存失败: %w", err)
+		err = fmt.Errorf("证书已签发但保存失败: %w", err)
+		m.recordIssueFailure(plan, err)
+		return nil, err
 	}
 	m.emit("已保存证书到 %s（到期时间 %s）",
 		m.certDir(c.Primary), c.NotAfter.Format("2006-01-02 15:04:05"))
+	// 成功：失败条目让位给正式证书（同一主域名不再同时出现两条）。
+	m.clearAttempt(c.Primary)
 	return c, nil
 }
 

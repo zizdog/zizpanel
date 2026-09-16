@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,12 +53,18 @@ const (
 // 为什么要接口：单测必须能在**不联网、不碰真实 CA** 的前提下验证
 // handler 的校验/落库/回显逻辑，所以测试注入假实现。
 // 生产实现就是 *acme.Manager —— 方法签名与冻结的接口逐字一致。
+//
+// Attempt* 是「失败申请条目」这套新能力（见 internal/acme/attempt.go）：
+// 列表要能读出失败条目，重试要用它的域名/校验方式，删除要能删掉它。
 type acmeManager interface {
 	Issue(ctx context.Context, req acme.IssueRequest) (*acme.Cert, error)
 	Renew(ctx context.Context, primary string) (*acme.Cert, error)
 	List() ([]*acme.Cert, error)
 	Load(primary string) (*acme.Cert, error)
 	Delete(primary string) error
+	Attempts() ([]*acme.Attempt, error)
+	LoadAttempt(primary string) (*acme.Attempt, error)
+	DeleteAttempt(primary string) error
 }
 
 // certManager 返回 ACME 管理器（惰性构造）。
@@ -98,16 +105,30 @@ func (s *Server) acmeHTTP01WebRoot() string {
 
 // ---------- HTTP 接口 ----------
 
+// 证书列表项的状态取值。契约（前端按这两个字符串分支）：
+//
+//	issued —— 已成功签发，有磁盘上的 fullchain/privkey 与 meta.json
+//	failed —— 申请失败 / 待重试，只有一条可重试的申请记录（没有私钥、没有证书）
+const (
+	certStatusIssued = "issued"
+	certStatusFailed = "failed"
+)
+
 // certView 是列表/详情里的证书视图。
 //
 // **绝不含私钥内容**：只有路径、元信息与统计。
+//
+// 已签发与失败条目共用这一个结构（前端一套渲染逻辑），由 Status 区分：
+//   - issued：cert_* / not_* / days_left 等字段有效；
+//   - failed：days_left 省略，带 last_error / updated_at / dns_provider / email，
+//     前端据此把行标成「申请失败，可重试」并提供重试按钮。
 type certView struct {
 	Primary        string   `json:"primary"`
 	Domains        []string `json:"domains"`
 	Issuer         string   `json:"issuer"`
 	NotBefore      string   `json:"not_before"`
 	NotAfter       string   `json:"not_after"`
-	DaysLeft       int      `json:"days_left"`
+	DaysLeft       *int     `json:"days_left,omitempty"`
 	Challenge      string   `json:"challenge"`
 	CA             string   `json:"ca"`
 	NeedsRenewal   bool     `json:"needs_renewal"`
@@ -118,9 +139,20 @@ type certView struct {
 	UpdatedAt      string   `json:"updated_at"`
 	ReferencedBy   []string `json:"referenced_sites"` // 哪些站点正在用它（删除前的安全提示）
 	RenewThreshold int      `json:"renew_threshold_days"`
+
+	// Status 是 issued / failed（见上面的常量）。
+	Status string `json:"status"`
+	// 失败信息（已脱敏）。仅失败条目，或「已签发证书 + 上次重签失败」时出现。
+	LastError   string `json:"last_error,omitempty"`
+	LastErrorAt string `json:"last_error_at,omitempty"`
+	Failures    int    `json:"failures,omitempty"`
+	// 失败条目用于预填申请表单；**只有服务商名字，没有凭据值**。
+	Email       string `json:"email,omitempty"`
+	DNSProvider string `json:"dns_provider,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
 }
 
-// handleCertsList 列出全部证书。
+// handleCertsList 列出全部证书与失败申请条目。
 func (s *Server) handleCertsList(w http.ResponseWriter, r *http.Request) {
 	mgr := s.certManager()
 	list, err := mgr.List()
@@ -128,14 +160,44 @@ func (s *Server) handleCertsList(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "读取证书列表失败: "+err.Error())
 		return
 	}
+	// 失败条目读不出来时**不能**只回已签发的：那会让用户以为失败记录消失了。
+	attempts, err := mgr.Attempts()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "读取失败申请记录失败: "+err.Error())
+		return
+	}
 	now := time.Now()
-	views := make([]certView, 0, len(list))
+	issued := make(map[string]bool, len(list))
+	views := make([]certView, 0, len(list)+len(attempts))
 	for _, c := range list {
 		if c == nil {
 			continue
 		}
+		issued[strings.ToLower(c.Primary)] = true
 		views = append(views, s.certView(c, now))
 	}
+	// 已签发的证书优先：同主域名的失败记录不再单独成行，只把上次错误附在证书行上
+	// （重签失败时旧证书仍在服役，把整行显示成"失败"会误导用户）。
+	byPrimary := make(map[string]*acme.Attempt, len(attempts))
+	for _, a := range attempts {
+		if a != nil && a.Primary != "" {
+			byPrimary[strings.ToLower(a.Primary)] = a
+		}
+	}
+	for i := range views {
+		if a := byPrimary[strings.ToLower(views[i].Primary)]; a != nil {
+			views[i].LastError = a.LastError
+			views[i].LastErrorAt = fmtCertTime(a.UpdatedAt)
+		}
+	}
+	for _, a := range attempts {
+		if a == nil || issued[strings.ToLower(a.Primary)] {
+			continue
+		}
+		views = append(views, certAttemptView(a))
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].Primary < views[j].Primary })
+
 	// EAB 只回"有没有配"，**绝不回显值**（它等价于凭据）。
 	eab, eabErr := s.loadEAB(acme.CAZeroSSL)
 	hasEAB := eabErr == nil && eab.Kid != "" && eab.HMAC != ""
@@ -155,15 +217,50 @@ func (s *Server) handleCertsList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// certAttemptView 把一条失败申请记录组装成列表视图。
+//
+// 不含私钥 / 证书路径（它们根本不存在）；域名、校验方式、CA、DNS 服务商名字
+// 足够前端预填「申请证书」对话框并一键重试。
+func certAttemptView(a *acme.Attempt) certView {
+	if a == nil {
+		return certView{Status: certStatusFailed, ReferencedBy: []string{}}
+	}
+	domains := make([]string, 0, len(a.Domains))
+	for _, d := range a.Domains {
+		if d = strings.TrimSpace(d); d != "" {
+			domains = append(domains, d)
+		}
+	}
+	if len(domains) == 0 && a.Primary != "" {
+		domains = []string{a.Primary}
+	}
+	return certView{
+		Primary:      a.Primary,
+		Domains:      domains,
+		Challenge:    string(a.Challenge),
+		CA:           a.CA,
+		UpdatedAt:    fmtCertTime(a.UpdatedAt),
+		CreatedAt:    fmtCertTime(a.CreatedAt),
+		Status:       certStatusFailed,
+		LastError:    a.LastError,
+		LastErrorAt:  fmtCertTime(a.UpdatedAt),
+		Failures:     a.Failures,
+		Email:        a.Email,
+		DNSProvider:  a.DNSProvider,
+		ReferencedBy: []string{},
+	}
+}
+
 // certView 组装证书视图（含"哪些站点在用"）。
 func (s *Server) certView(c *acme.Cert, now time.Time) certView {
+	days := certDaysLeft(c, now)
 	v := certView{
 		Primary:        c.Primary,
 		Domains:        certDomainList(c),
 		Issuer:         c.Issuer,
 		NotBefore:      fmtCertTime(c.NotBefore),
 		NotAfter:       fmtCertTime(c.NotAfter),
-		DaysLeft:       certDaysLeft(c, now),
+		DaysLeft:       &days,
 		Challenge:      string(c.Challenge),
 		CA:             c.CA,
 		NeedsRenewal:   acme.NeedsRenewal(c, now, certRenewThresholdDays),
@@ -172,6 +269,7 @@ func (s *Server) certView(c *acme.Cert, now time.Time) certView {
 		UpdatedAt:      fmtCertTime(c.UpdatedAt),
 		ReferencedBy:   s.sitesUsingCert(c),
 		RenewThreshold: certRenewThresholdDays,
+		Status:         certStatusIssued,
 	}
 	if c.CertPath != "" {
 		if _, err := os.Stat(c.CertPath); err == nil {
@@ -444,16 +542,140 @@ func (s *Server) handleCertRenew(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
+// handleCertRetry 用「上次失败的申请记录 + 服务端已保存的凭据」重签，
+// 用户**不需要重新填任何东西**。
+//
+// 与首次申请一样走任务中心（长任务）：日志/步骤完全一致，便于对照排查。
+// 请求体里不接受、也不需要任何凭据 —— DNS token / EAB 全部来自服务端
+// （DataDir 下 0600 的 credentials.json），浏览器从不参与。
+func (s *Server) handleCertRetry(w http.ResponseWriter, r *http.Request) {
+	primary := strings.TrimSpace(r.PathValue("primary"))
+	mgr := s.certManager()
+	att, err := mgr.LoadAttempt(primary)
+	if err != nil {
+		fail(w, http.StatusNotFound, "失败申请记录不存在: "+err.Error())
+		return
+	}
+	primary = att.Primary // 用记录里的规范名
+
+	// 已有正式证书时不再按失败条目重签：那会把已签发的证书覆盖成另一组域名，
+	// 属于用户没要求的动作。更换域名走「重新申请」，同一组域名走「续期」。
+	if _, err := mgr.Load(primary); err == nil {
+		fail(w, http.StatusConflict, "证书 "+primary+" 已签发，无需重试；如需更换域名请重新申请，续期请用「续期」")
+		return
+	}
+
+	issue, err := s.issueRequestFromAttempt(att)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ZeroSSL 续期/重试要注入 EAB（与 handleCertRenew 同一套判断）。
+	var eab eabCreds
+	if isZeroSSL(issue.CA) {
+		eab, err = s.loadEAB(acme.CAZeroSSL)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "读取 ZeroSSL EAB 凭据失败: "+err.Error())
+			return
+		}
+		if eab.Kid == "" || eab.HMAC == "" {
+			fail(w, http.StatusBadRequest, "记录使用 ZeroSSL，但面板里没有保存 EAB 凭据："+
+				"请重新申请一次并填入 EAB Key ID / HMAC Key")
+			return
+		}
+	}
+
+	var prepNotes []string
+	if issue.Challenge == acme.ChallengeHTTP01 {
+		prepNotes = s.prepareHTTP01WebRoot(issue.Domains)
+	}
+
+	issueReq := issue // 闭包捕获副本
+	eabKid, eabHMAC := eab.Kid, eab.HMAC
+	dnsName := att.DNSProvider
+	s.launchTask(w, r, "cert-retry", "cert:"+primary, "重试申请证书 "+primary, "cert_retry",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			for _, n := range prepNotes {
+				log(tasks.LevelWarn, n)
+			}
+			log(tasks.LevelStep, fmt.Sprintf("按上次失败的记录重试：%s（验证方式 %s，CA %s）",
+				strings.Join(issueReq.Domains, ", "), issueReq.Challenge,
+				orDefault(issueReq.CA, "由 ACME 引擎决定（默认 Let's Encrypt）")))
+			if issueReq.Challenge == acme.ChallengeDNS01 {
+				// 只说"用服务端保存的某服务商凭据"，绝不打印名字以外的任何值。
+				log(tasks.LevelOut, "DNS 凭据使用服务端已保存的 "+dnsName+" 凭据（不经过浏览器）")
+			}
+			cert, err := s.certManagerForIssue(eabKid, eabHMAC, log).Issue(ctx, issueReq)
+			if err != nil {
+				log(tasks.LevelErr, "重试失败: "+err.Error())
+				return nil, err
+			}
+			log(tasks.LevelOK, "证书已签发: "+cert.CertPath+"（到期 "+fmtCertTime(cert.NotAfter)+"）")
+			if rerr := s.reloadSitesUsingCert(ctx, cert, log); rerr != nil {
+				log(tasks.LevelWarn, "证书已签发，但有站点重载失败: "+rerr.Error())
+			}
+			return certSummary(cert), nil
+		})
+}
+
+// issueRequestFromAttempt 把失败条目还原成一次签发请求。
+//
+// DNS 凭据**不在条目里**：这里只拿服务商名字，再用服务端已保存的凭据组装
+// DNSProviderSpec。凭据缺失时当场报错（400），而不是让用户在任务中心里
+// 看到一个更含糊的失败。
+func (s *Server) issueRequestFromAttempt(a *acme.Attempt) (acme.IssueRequest, error) {
+	if a == nil || len(a.Domains) == 0 {
+		return acme.IssueRequest{}, fmt.Errorf("申请记录里没有域名，无法重试：请在「证书」页重新申请")
+	}
+	challenge := a.Challenge
+	if challenge == "" {
+		challenge = acme.ChallengeHTTP01
+	}
+	req := acme.IssueRequest{
+		Domains:   append([]string(nil), a.Domains...),
+		Email:     a.Email,
+		Challenge: challenge,
+		CA:        a.CA,
+	}
+	if challenge == acme.ChallengeDNS01 {
+		if strings.TrimSpace(a.DNSProvider) == "" {
+			return acme.IssueRequest{}, fmt.Errorf("申请记录里没有 DNS 服务商，无法自动重试：请在「证书」页重新申请一次")
+		}
+		spec, err := s.resolveDNSChallenge(&certDNSReq{Name: a.DNSProvider})
+		if err != nil {
+			return acme.IssueRequest{}, fmt.Errorf(
+				"重试需要 DNS 凭据，但服务端没有可用的 %s 凭据（%w）：请在「申请证书」里重新填写一次",
+				a.DNSProvider, err)
+		}
+		req.DNS = spec
+	}
+	return req, nil
+}
+
 // handleCertDelete 删除一张证书。
 //
 // 同步执行（就是删目录）。**被站点引用时拒绝删除**：证书文件被删掉后，
 // nginx 下一次 reload 会直接失败（ssl_certificate 找不到），
 // 那会让站点在用户毫无察觉的情况下打不开 —— 宁可在这里明确拦住。
+//
+// 没有正式证书时，也允许删掉「失败申请条目」：否则失败的记录会永远留在列表里，
+// 用户既用不上也去不掉。
 func (s *Server) handleCertDelete(w http.ResponseWriter, r *http.Request) {
-	primary := r.PathValue("primary")
+	primary := strings.TrimSpace(r.PathValue("primary"))
 	mgr := s.certManager()
 	cert, err := mgr.Load(primary)
 	if err != nil {
+		if att, aerr := mgr.LoadAttempt(primary); aerr == nil {
+			if derr := mgr.DeleteAttempt(att.Primary); derr != nil {
+				s.audit(r, "cert_delete", att.Primary, "删除失败申请记录失败: "+derr.Error(), false, "")
+				fail(w, http.StatusInternalServerError, "删除失败申请记录失败: "+derr.Error())
+				return
+			}
+			s.audit(r, "cert_delete", att.Primary, "删除失败申请记录（该申请未签发成功）", true, "")
+			ok(w, map[string]any{"msg": "失败申请记录已删除", "primary": att.Primary})
+			return
+		}
 		fail(w, http.StatusNotFound, "证书不存在: "+err.Error())
 		return
 	}
