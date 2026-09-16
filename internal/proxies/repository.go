@@ -21,15 +21,17 @@ type Repository struct{ st *store.Store }
 func NewRepository(st *store.Store) *Repository { return &Repository{st: st} }
 
 const ruleCols = `id,name,listen,domains,path,target,preserve_host,websocket,enabled,remark,
-	ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,created_at,updated_at`
+	ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,
+	tls_name,standard_headers,created_at,updated_at`
 
 func scanRule(sc interface{ Scan(...any) error }) (*Rule, error) {
 	var r Rule
-	var preserve, ws, enabled, sslEnabled int
+	var preserve, ws, enabled, sslEnabled, stdHeaders int
 	var created, updated string
 	if err := sc.Scan(&r.ID, &r.Name, &r.Listen, &r.Domains, &r.Path, &r.Target,
 		&preserve, &ws, &enabled, &r.Remark,
 		&sslEnabled, &r.SSLCert, &r.SSLKey, &r.SSLProvider, &r.SSLExpires,
+		&r.TLSName, &stdHeaders,
 		&created, &updated); err != nil {
 		return nil, err
 	}
@@ -37,6 +39,7 @@ func scanRule(sc interface{ Scan(...any) error }) (*Rule, error) {
 	r.Websocket = ws == 1
 	r.Enabled = enabled == 1
 	r.SSLEnabled = sslEnabled == 1
+	r.StandardHeaders = stdHeaders == 1
 	r.Created = parseTime(created)
 	r.Updated = parseTime(updated)
 	return &r, nil
@@ -95,12 +98,14 @@ func (r *Repository) Create(ctx context.Context, rule *Rule) (*Rule, error) {
 	now := nowStr()
 	res, err := r.st.DB().ExecContext(ctx,
 		`INSERT INTO proxies (name,listen,domains,path,target,preserve_host,websocket,enabled,remark,
-		 ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,created_at,updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,
+		 tls_name,standard_headers,created_at,updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rule.Name, rule.Listen, rule.Domains, rule.Path, rule.Target,
 		boolInt(rule.PreserveHost), boolInt(rule.Websocket), boolInt(rule.Enabled),
 		rule.Remark,
 		boolInt(rule.SSLEnabled), rule.SSLCert, rule.SSLKey, rule.SSLProvider, rule.SSLExpires,
+		rule.TLSName, boolInt(rule.StandardHeaders),
 		now, now)
 	if err != nil {
 		return nil, fmt.Errorf("保存反向代理规则失败: %w", err)
@@ -117,11 +122,13 @@ func (r *Repository) Update(ctx context.Context, rule *Rule) (*Rule, error) {
 	res, err := r.st.DB().ExecContext(ctx,
 		`UPDATE proxies SET name=?,listen=?,domains=?,path=?,target=?,preserve_host=?,
 		 websocket=?,enabled=?,remark=?,
-		 ssl_enabled=?,ssl_cert=?,ssl_key=?,ssl_provider=?,ssl_expires=?,updated_at=? WHERE id=?`,
+		 ssl_enabled=?,ssl_cert=?,ssl_key=?,ssl_provider=?,ssl_expires=?,
+		 tls_name=?,standard_headers=?,updated_at=? WHERE id=?`,
 		rule.Name, rule.Listen, rule.Domains, rule.Path, rule.Target,
 		boolInt(rule.PreserveHost), boolInt(rule.Websocket), boolInt(rule.Enabled),
 		rule.Remark,
 		boolInt(rule.SSLEnabled), rule.SSLCert, rule.SSLKey, rule.SSLProvider, rule.SSLExpires,
+		rule.TLSName, boolInt(rule.StandardHeaders),
 		nowStr(), rule.ID)
 	if err != nil {
 		return nil, fmt.Errorf("更新反向代理规则失败: %w", err)

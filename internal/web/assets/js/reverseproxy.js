@@ -90,6 +90,14 @@ export function ReverseProxyView(content, ctx = {}) {
   function renderHead() {
     clear(headBox);
     const ng = cache?.nginx || {};
+    // 反向代理由 nginx 执行；没装时只给按钮加 title 太隐蔽（用户点不动却不知道为什么），
+    // 所以在页面上直接给一条横幅。
+    if (!ng.installed) {
+      appendAll(headBox, h('div.banner.banner-warn', [
+        h('strong', { text: '反向代理需要 nginx：' }),
+        h('span', { text: '请先到「应用市场 → 网站环境」安装 nginx，装完刷新本页即可新建规则。' }),
+      ]));
+    }
     appendAll(headBox,
       ng.installed
         ? h('span.pill.ok', { text: 'nginx 已安装' })
@@ -221,6 +229,12 @@ export function ReverseProxyView(content, ctx = {}) {
       target: h('input.input', { value: it?.target || '', placeholder: 'http://192.168.1.8:8090' }),
       preserve: h('input', { type: 'checkbox', checked: !!it?.preserve_host }),
       ws: h('input', { type: 'checkbox', checked: it ? !!it.websocket : true }),
+      // 一键补齐常用请求头（Lucky 风格预设）。老规则没这个字段 → 默认关，
+      // 生成结果与升级前逐字一致；新建规则默认勾上。
+      stdHeaders: h('input', { type: 'checkbox', checked: it ? !!it.standard_headers : true }),
+      // HTTPS 上游的 SNI（proxy_ssl_name）。留空自动推导：目标是域名用它本身，
+      // 目标是 IP 用本条规则的第一个域名。
+      tlsName: h('input.input', { value: it?.tls_name || '', placeholder: '留空自动；目标是 https://<IP> 时建议填上游域名' }),
       enabled: h('input', { type: 'checkbox', checked: it ? !!it.enabled : true }),
       remark: h('input.input', { value: it?.remark || '', placeholder: '备注（可留空）' }),
       // ---- HTTPS ----
@@ -353,8 +367,11 @@ export function ReverseProxyView(content, ctx = {}) {
         [f.preserve, h('span', { text: '把原始 Host 透传给目标（默认关：多数后端按目标 Host 分站，透传会 404）' })]),
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
         [f.ws, h('span', { text: '代理 WebSocket（带界面的服务建议开，关掉会"能打开但用不了"）' })]),
+      h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
+        [f.stdHeaders, h('span', { text: '一键补齐常用请求头（X-Forwarded-Host / X-Forwarded-Port / REMOTE-HOST）' })]),
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' } },
         [f.enabled, h('span', { text: '启用' })]),
+      row('HTTPS 上游 SNI（可选）', f.tlsName, '目标是 https:// 时，nginx 默认不发 SNI，可能落到上游的默认 server'),
       row('备注', f.remark),
       h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
@@ -420,6 +437,8 @@ export function ReverseProxyView(content, ctx = {}) {
               websocket: f.ws.checked,
               enabled: f.enabled.checked,
               remark: f.remark.value.trim(),
+              standard_headers: f.stdHeaders.checked,
+              tls_name: f.tlsName.value.trim(),
             };
             // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
             if (hadSSL && !sslOn) payload.ssl_enabled = false;

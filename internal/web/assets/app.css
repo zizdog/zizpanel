@@ -381,3 +381,20 @@ button, input, select, textarea { font: inherit; color: inherit; }
   transition: border-color .15s, background .15s;
 }
 .files-drop.active { border-color: var(--brand); background: var(--brand-soft); color: var(--text); }
+
+/* 页面级警示横幅：用于"缺少前置依赖"这类必须让用户看见、不能只靠 title 悬浮提示的状态。
+   例：反向代理页在没装 nginx 时提示"先去应用市场装 nginx"。 */
+.banner-warn {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+.banner-warn strong { color: var(--warn); }

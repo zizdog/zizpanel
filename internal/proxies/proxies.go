@@ -64,6 +64,21 @@ type Rule struct {
 	// SSLExpires 只用于展示（真实到期时间以证书文件为准，见 proxySSLView）。
 	SSLExpires string `json:"ssl_expires"`
 
+	// ---- HTTPS 上游（TLS 到目标这一段）----
+
+	// TLSName 是发往 HTTPS 上游的 SNI（对应 nginx 的 proxy_ssl_name）。
+	//
+	// 为什么需要它：nginx 对 `proxy_pass https://…` **默认不发 SNI**，而上游
+	// （例如另一台面板/另一台 nginx）通常有多个 443 server 块 —— 没有 SNI 就会
+	// 落到 default server，表现是"反代配好了，打开的却是另一个站点/另一张证书"。
+	// 留空时自动推导：目标是域名就用它本身；目标是 IP 就用本条规则的第一个域名。
+	TLSName string `json:"tls_name"`
+	// StandardHeaders 为 true 时补齐"一键常用请求头"（对齐 Lucky 的预设）：
+	// X-Forwarded-Host / X-Forwarded-Port / REMOTE-HOST。
+	// 面板本来就默认发 Host / X-Real-IP / X-Forwarded-For / X-Forwarded-Proto，
+	// 所以这里只补"还缺的那几个"，老规则（false）的输出保持逐字不变。
+	StandardHeaders bool `json:"standard_headers"`
+
 	Created time.Time `json:"created_at"`
 	Updated time.Time `json:"updated_at"`
 }
@@ -282,9 +297,36 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		}
 		fmt.Fprintf(&b, "\t\tproxy_set_header Host %s;\n", hostHeader)
 	}
+	// HTTPS 上游：必须显式发 SNI（见 Rule.TLSName 的说明）。
+	if u, uerr := url.Parse(r.Target); uerr == nil && strings.EqualFold(u.Scheme, "https") {
+		name := strings.TrimSpace(r.TLSName)
+		if name == "" {
+			if host, _, herr := r.TargetHostPort(); herr == nil && net.ParseIP(host) == nil {
+				name = host
+			} else if ds := SplitDomains(r.Domains); len(ds) > 0 {
+				// 目标是 IP：上游多半按域名分站，用本条规则匹配的第一个域名当 SNI
+				name = ds[0]
+			}
+		}
+		b.WriteString("\t\t# HTTPS 上游：不发 SNI 会落到上游的默认 server（打开的可能是另一个站点）\n")
+		b.WriteString("\t\tproxy_ssl_server_name on;\n")
+		if name != "" {
+			fmt.Fprintf(&b, "\t\tproxy_ssl_name %s;\n", name)
+		}
+		// 上游常用自签 / staging 证书；需要校验链路时再手动打开。
+		b.WriteString("\t\tproxy_ssl_verify off;\n")
+	}
+
 	b.WriteString("\t\tproxy_set_header X-Real-IP $remote_addr;\n")
 	b.WriteString("\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
 	b.WriteString("\t\tproxy_set_header X-Forwarded-Proto $scheme;\n")
+	// 一键补齐的常用请求头（Lucky 风格预设）。默认关，老规则的输出逐字不变。
+	if r.StandardHeaders {
+		b.WriteString("\t\t# 常用请求头（一键补齐）\n")
+		b.WriteString("\t\tproxy_set_header X-Forwarded-Host $host;\n")
+		b.WriteString("\t\tproxy_set_header X-Forwarded-Port $server_port;\n")
+		b.WriteString("\t\tproxy_set_header REMOTE-HOST $remote_addr;\n")
+	}
 	b.WriteString("\t\tproxy_http_version 1.1;\n")
 
 	if r.Websocket {

@@ -251,6 +251,10 @@ type proxyReq struct {
 	SSLKey      *string `json:"ssl_key"`
 	SSLProvider *string `json:"ssl_provider"`
 	SSLExpires  *string `json:"ssl_expires"`
+
+	// HTTPS 上游 SNI（留空自动推导）与"一键常用请求头"。
+	TLSName         *string `json:"tls_name"`
+	StandardHeaders *bool   `json:"standard_headers"`
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -292,6 +296,12 @@ func (req proxyReq) apply(rule *proxies.Rule) {
 	}
 	if req.SSLExpires != nil {
 		rule.SSLExpires = *req.SSLExpires
+	}
+	if req.TLSName != nil {
+		rule.TLSName = *req.TLSName
+	}
+	if req.StandardHeaders != nil {
+		rule.StandardHeaders = *req.StandardHeaders
 	}
 	if req.SSLEnabled != nil {
 		rule.SSLEnabled = *req.SSLEnabled
