@@ -27,15 +27,29 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 未跟踪文件进入自己的指纹，形成自指。
 STAMP="$REPO_ROOT/.zp-check-stamp"
 
+# doc_only 判断"这个文件是不是**只当文档、不进发布产物**"。
+#
+# Markdown 不进发布包（包里只有二进制 + install.sh + RUNTIME_TOOLS），改文档不该让你
+# 重跑 3.5 分钟的门禁。**唯一例外是 RELEASE_NOTES.md** —— 它是 manifest.json 里的
+# 更新说明，会随包发布，所以它必须留在指纹里。
+doc_only() {
+  case "$1" in
+    *.md) [ "$(basename "$1")" = "RELEASE_NOTES.md" ] && return 1 || return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 fingerprint() {
   cd "$REPO_ROOT"
   {
     # 已跟踪文件（含被删除的：跳过不存在的路径，删除本身会改变文件列表）
     while IFS= read -r -d '' f; do
+      doc_only "$f" && continue
       [ -f "$f" ] && shasum -a 256 "$f"
     done < <(git ls-files -z)
     # 未跟踪文件（排除 .gitignore：标记文件自己必须在这里被排除，否则自指）
     while IFS= read -r -d '' f; do
+      doc_only "$f" && continue
       [ -f "$f" ] && shasum -a 256 "$f"
     done < <(git ls-files --others --exclude-standard -z | LC_ALL=C sort -z)
   } | shasum -a 256 | awk '{print $1}'
