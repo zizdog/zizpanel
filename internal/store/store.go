@@ -290,6 +290,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		// HTTPS 上游的 SNI 与"一键常用请求头"（详见 proxies.Rule）。
 		"tls_name":         "TEXT NOT NULL DEFAULT ''",
 		"standard_headers": "INTEGER NOT NULL DEFAULT 0",
+		"redirect_http":    "INTEGER NOT NULL DEFAULT 0",
 	}); err != nil {
 		return err
 	}

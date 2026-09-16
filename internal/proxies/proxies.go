@@ -73,6 +73,14 @@ type Rule struct {
 	// 落到 default server，表现是"反代配好了，打开的却是另一个站点/另一张证书"。
 	// 留空时自动推导：目标是域名就用它本身；目标是 IP 就用本条规则的第一个域名。
 	TLSName string `json:"tls_name"`
+	// RedirectHTTP 为 true 时，把"明文 HTTP 打到本端口"的请求 301 跳到
+	// https://{host}:{本端口}（对齐 Lucky 的同端口跳转行为）。
+	//
+	// 实现用 nginx 官方的 error_page 497：客户端把明文 HTTP 发到 TLS 端口时，
+	// nginx 先判 400（内部码 497），再按这条规则改写成 301。这样**同一个端口**
+	// 既能收 TLS，也能把明文引导到 TLS —— 不需要 stream/ssl_preread 分流，
+	// 也就不必动 nginx.conf 的顶层结构。
+	RedirectHTTP bool `json:"redirect_http"`
 	// StandardHeaders 为 true 时补齐"一键常用请求头"（对齐 Lucky 的预设）：
 	// X-Forwarded-Host / X-Forwarded-Port / REMOTE-HOST。
 	// 面板本来就默认发 Host / X-Real-IP / X-Forwarded-For / X-Forwarded-Proto，
@@ -270,6 +278,12 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		b.WriteString("\tssl_session_cache   shared:SSL:10m;\n")
 		b.WriteString("\tssl_session_timeout 1d;\n")
 		b.WriteString("\tssl_stapling        off;\n")
+		if r.RedirectHTTP {
+			// 明文 HTTP 打到 TLS 端口 → 301 到同端口的 https（Lucky 同款行为）。
+			// 必须放在 server 级：497 是"明文进了 ssl 端口"的内部错误码。
+			b.WriteString("\n\t# 明文 HTTP 自动跳 HTTPS（同端口）\n")
+			b.WriteString("\terror_page 497 =301 https://$host:$server_port$request_uri;\n")
+		}
 	}
 
 	b.WriteString("\n\t# 反代目标的真实地址（日志里用得上）\n")

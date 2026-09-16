@@ -106,6 +106,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		// SNI 与常用请求头开关悄悄清掉）。
 		"tls_name":         rule.TLSName,
 		"standard_headers": rule.StandardHeaders,
+		"redirect_http":    rule.RedirectHTTP,
 		"created_at":       rule.Created,
 		"updated_at":       rule.Updated,
 		"port_listening":   listening,
@@ -259,6 +260,7 @@ type proxyReq struct {
 	// HTTPS 上游 SNI（留空自动推导）与"一键常用请求头"。
 	TLSName         *string `json:"tls_name"`
 	StandardHeaders *bool   `json:"standard_headers"`
+	RedirectHTTP    *bool   `json:"redirect_http"`
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -306,6 +308,9 @@ func (req proxyReq) apply(rule *proxies.Rule) {
 	}
 	if req.StandardHeaders != nil {
 		rule.StandardHeaders = *req.StandardHeaders
+	}
+	if req.RedirectHTTP != nil {
+		rule.RedirectHTTP = *req.RedirectHTTP
 	}
 	if req.SSLEnabled != nil {
 		rule.SSLEnabled = *req.SSLEnabled

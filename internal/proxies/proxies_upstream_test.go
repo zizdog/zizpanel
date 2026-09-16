@@ -87,3 +87,27 @@ func TestStandardHeadersPreset(t *testing.T) {
 		}
 	}
 }
+
+// TestRedirectHTTP497：明文打到 TLS 端口时要 301 跳同端口的 https（Lucky 同款行为）。
+func TestRedirectHTTP497(t *testing.T) {
+	r := Rule{Name: "r", Listen: 8889, Domains: "blog.zizdog.com", Target: "http://127.0.0.1:80",
+		Enabled: true, SSLEnabled: true, SSLCert: "/tmp/c.pem", SSLKey: "/tmp/k.pem", RedirectHTTP: true}
+	out, err := r.Generate("/tmp/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "error_page 497 =301 https://$host:$server_port$request_uri;"
+	if !strings.Contains(out, want) {
+		t.Fatalf("缺少 497 跳转：\n%s", out)
+	}
+
+	// 关掉时必须没有（默认关，老规则/不需要跳转的规则输出不变）
+	r.RedirectHTTP = false
+	off, err := r.Generate("/tmp/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(off, "error_page 497") {
+		t.Fatalf("关闭时不该有 497：\n%s", off)
+	}
+}

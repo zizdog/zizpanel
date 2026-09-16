@@ -243,6 +243,8 @@ export function ReverseProxyView(content, ctx = {}) {
         SSL_PROVIDERS.map((p) => h('option', { value: p.value, text: p.label }))),
       // 已有证书时才有意义：勾上就重新签发/重新应用（例如 mkcert 重签、换加密方式）。
       sslReissue: h('input', { type: 'checkbox', checked: false, id: 'zp-proxy-ssl-reissue' }),
+      // 明文 HTTP 打到本端口时 301 跳 https（Lucky 同款行为），新建规则默认开。
+      redirectHTTP: h('input', { type: 'checkbox', checked: it ? !!it.redirect_http : true }),
     };
     f.sslProvider.value = SSL_PROVIDERS.some((p) => p.value === cur.provider) ? cur.provider : 'acme';
 
@@ -377,6 +379,8 @@ export function ReverseProxyView(content, ctx = {}) {
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
           f.sslOn, h('span', { style: { fontWeight: '600' }, text: '启用 HTTPS（由 nginx 直接终止 TLS）' }),
         ]),
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } },
+          [f.redirectHTTP, h('span', { text: '明文 HTTP 自动 301 跳 HTTPS（同端口，例如 http://域名:8889 → https://域名:8889）' })]),
         h('div.hint', {
           text: '同一端口的规则不能 HTTP/HTTPS 混用（nginx 一个端口只有一种协议）；'
             + '80 端口不能开 HTTPS（面板默认站点占着它）。',
@@ -439,6 +443,7 @@ export function ReverseProxyView(content, ctx = {}) {
               remark: f.remark.value.trim(),
               standard_headers: f.stdHeaders.checked,
               tls_name: f.tlsName.value.trim(),
+              redirect_http: f.redirectHTTP.checked,
             };
             // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
             if (hadSSL && !sslOn) payload.ssl_enabled = false;
