@@ -266,7 +266,13 @@ func (s *Site) Generate(opt Options) (string, error) {
 		b.WriteString("\tlocation ^~ /.well-known/acme-challenge/ {\n")
 		b.WriteString("\t\troot " + s.Root + ";\n")
 		b.WriteString("\t}\n")
-		b.WriteString("\n\tlocation / {\n\t\treturn 301 https://$host$request_uri;\n\t}\n")
+		// 301 必须用 $http_host（**保留端口**）而不是 $host（会丢端口）。
+		//
+		// 真机报障（2026-09-17 用户）：站点被反代时，客户端访问的是
+		// https://<域名>:8889；若这里跳到不带端口的 https://<域名>/，而公网只放行了
+		// 8889，浏览器就直接打不开了。$http_host 在客户端本来就没带端口时等于 $host，
+		// 所以直连 443 的站点行为不变。
+		b.WriteString("\n\tlocation / {\n\t\treturn 301 https://$http_host$request_uri;\n\t}\n")
 		b.WriteString("}\n\n")
 		b.WriteString("server {\n")
 		b.WriteString("\tlisten      443 ssl;\n")

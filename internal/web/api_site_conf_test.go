@@ -251,3 +251,39 @@ func TestProxySSLPortMixMessageNamesTheRightSide(t *testing.T) {
 		t.Errorf("应把最省事的出路（给这条也开 HTTPS）写在最前面，实际：%s", msg)
 	}
 }
+
+// TestProxySSLPortMixAllowsSameModeOnSamePort 锁住"同端口同模式"必须放行。
+//
+// 这条是用户 2026-09-17 卡住的那一步：8889 上已有三条 HTTPS 规则，他新建一条
+// **也要 HTTPS** 的规则却保存不了 —— 真正的 bug 在前端（创建请求里没带证书，
+// 后端看来它是一条 HTTP 规则）。这里锁住后端本身对"同为 HTTPS"是放行的，
+// 免得以后有人把保护改成"同端口只能有一条"。
+func TestProxySSLPortMixAllowsSameModeOnSamePort(t *testing.T) {
+	srv, _ := newTestServer(t)
+	repo := srv.proxyRepo()
+	ctx := context.Background()
+	if _, err := repo.Create(ctx, &proxies.Rule{
+		Name: "wp", Listen: 8889, Domains: "wp.zizdog.com", Target: "https://127.0.0.1:443",
+		Enabled: true, Websocket: true, SSLEnabled: true, SSLProvider: "acme",
+		SSLCert: "/tmp/a.crt", SSLKey: "/tmp/a.key",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 另一条 HTTPS 规则，同端口、不同域名 —— 这是 nginx 的标准用法，必须允许。
+	other := &proxies.Rule{
+		Name: "te", Listen: 8889, Domains: "te.zizdog.com", Target: "https://127.0.0.1:443",
+		Enabled: true, Websocket: true, SSLEnabled: true, SSLProvider: "acme",
+		SSLCert: "/tmp/a.crt", SSLKey: "/tmp/a.key",
+	}
+	if err := srv.checkProxySSLPortMix(ctx, other); err != nil {
+		t.Fatalf("同端口同模式（都 HTTPS）必须放行，实际: %v", err)
+	}
+	// 停用的规则也不参与混用判定（这就是 self/mkcert 的出路：先停用建好、绑证书、再启用）。
+	disabled := &proxies.Rule{
+		Name: "tmp", Listen: 8889, Domains: "tmp.zizdog.com", Target: "http://127.0.0.1:80",
+		Enabled: false, Websocket: true,
+	}
+	if err := srv.checkProxySSLPortMix(ctx, disabled); err != nil {
+		t.Fatalf("停用的规则不写配置，不该被混用判定拦下，实际: %v", err)
+	}
+}

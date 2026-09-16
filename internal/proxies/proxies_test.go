@@ -190,3 +190,35 @@ func TestRejectVhostNameFitsInclude(t *testing.T) {
 		t.Error("必须与规则文件共用 proxy- 前缀，避免和站点 <域名>.conf 撞名")
 	}
 }
+
+// TestPreserveHostAlsoRewritesPortlessUpstreamLocation 锁住 2026-09-17 用户报障：
+//
+// 站点被反代（TLS 在这一层终止）时，上游应用可能按**自己保存的、不带端口的**站点
+// 地址生成绝对跳转（WordPress siteurl）。公网只放行 8889，跳到 https://<域名>/
+// 就是打不开。所以 PreserveHost 打开时，除了 Host 头用 $http_host，还要把
+// **本规则域名的**绝对 Location 改写成客户端真正请求的 authority（带端口）。
+// 跨域跳转必须保持原样。
+func TestPreserveHostAlsoRewritesPortlessUpstreamLocation(t *testing.T) {
+	r := &Rule{ID: 7, Name: "wp", Listen: 8889, Domains: "wp.zizdog.com",
+		Target: "https://127.0.0.1:443", Enabled: true, Websocket: true,
+		PreserveHost: true, SSLEnabled: true, SSLProvider: "manual",
+		SSLCert: "/tmp/c", SSLKey: "/tmp/k"}
+	got, err := r.Generate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `proxy_redirect ~^https?://wp\.zizdog\.com(:[0-9]+)?(/.*)$ $scheme://$http_host$2;`
+	if !strings.Contains(got, want) {
+		t.Errorf("缺少按客户端 authority 改写 Location 的 proxy_redirect：\n%s", got)
+	}
+	// 同端口上的另一条规则若没开 PreserveHost，就不该有这行（避免意外的跨站改写）。
+	r2 := &Rule{ID: 8, Name: "nas", Listen: 8889, Domains: "site2.zizdog.com",
+		Target: "http://192.168.1.8:8081", Enabled: true, Websocket: true}
+	got2, err := r2.Generate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got2, "proxy_redirect") {
+		t.Errorf("没开 PreserveHost 的规则不该注入 proxy_redirect：\n%s", got2)
+	}
+}

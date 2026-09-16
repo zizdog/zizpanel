@@ -280,7 +280,7 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	ok(w, map[string]any{"state": st, "cost_ms": cost})
+	ok(w, map[string]any{"state": st, "cost_ms": cost, "warning": st.Warning})
 }
 
 // ---------- 日志与日志流 ----------

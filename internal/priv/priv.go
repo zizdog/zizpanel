@@ -160,6 +160,13 @@ func run(name string, args ...string) cmdResult {
 	return cmdResult{stdout: so.String(), stderr: se.String(), err: err}
 }
 
+// runFn 是所有外部命令的注入口（默认就是 run）。
+//
+// 为什么需要：launchd 的域解析与"操作后验证"逻辑必须能脱离真实 launchctl 测试，
+// 否则唯一能证明"bootout 失败时不再谎报成功"的办法就是去真机上停一个真实服务。
+// 参考 internal/services/ready.go 的 readyWaitPort：生产路径不变，测试替换后恢复。
+var runFn = run
+
 func runTimeout(d time.Duration, name string, args ...string) cmdResult {
 	cmd := exec.Command(name, args...)
 	var so, se bytes.Buffer
@@ -558,29 +565,476 @@ func flushDNS() error {
 // ---------- launchd ----------
 
 // LaunchState 描述一个 launchd 任务的状态。
+//
+// 向后兼容：字段只增不减（面板与 helper 的 JSON 契约）。
+// ProbedDomains 是本次查询实际探测过的域，便于诊断
+// "为什么状态说未加载"（真机上 brew 的 user/gui 域之争全靠它定位）。
 type LaunchState struct {
-	Label    string `json:"label"`
-	Loaded   bool   `json:"loaded"`
-	Running  bool   `json:"running"`
-	PID      int    `json:"pid"`
-	ExitCode int    `json:"exit_code"`
-	Domain   string `json:"domain"`
+	Label         string   `json:"label"`
+	Loaded        bool     `json:"loaded"`
+	Running       bool     `json:"running"`
+	PID           int      `json:"pid"`
+	ExitCode      int      `json:"exit_code"`
+	Domain        string   `json:"domain"`
+	ProbedDomains []string `json:"probed_domains,omitempty"`
 }
 
-// launchDomain 判断标签属于系统守护进程还是用户代理。
-// LaunchDaemon（/Library/LaunchDaemons）需要 system 域且以 root 运行；
-// LaunchAgent（~/Library/LaunchAgents）需要 gui/<uid> 域。
-func launchDomain(label string) string {
-	if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", label+".plist")); err == nil {
-		return "system"
+// launchctlBin 返回 launchctl 的可执行路径。
+//
+// 支持 ZIZPANEL_LAUNCHCTL 覆盖：web 层的端到端回归测试需要把整条
+// "面板 → services → priv → launchctl" 通路指到一个假 launchctl 上，
+// 才能真正验证"底层失败时 HTTP 不许返回 2xx"，而不是只测一层假接口。
+// 与 ZIZPANEL_ROOT / ZIZPANEL_BREW_PREFIX 同类：生产默认值永远是系统路径。
+func launchctlBin() string {
+	if v := strings.TrimSpace(os.Getenv("ZIZPANEL_LAUNCHCTL")); v != "" {
+		return v
 	}
-	// 用户代理：找到 plist 所属用户
-	for _, home := range userHomes() {
-		if _, err := os.Stat(filepath.Join(home, "Library/LaunchAgents", label+".plist")); err == nil {
-			return "gui/" + uidOfHome(home)
+	return "/bin/launchctl"
+}
+
+// launchctl 通过 runFn 执行一次 launchctl 调用（便于单测注入）。
+func launchctl(args ...string) cmdResult {
+	return runFn(launchctlBin(), args...)
+}
+
+var (
+	// userHomesFn 返回所有用户主目录（默认读 /Users）。
+	userHomesFn = userHomes
+	// uidOfHomeFn 通过 home 目录反查 uid。
+	uidOfHomeFn = uidOfHome
+	// fileExistsFn 是 os.Stat 的布尔包装（测试可脱离真实 plist 文件）。
+	fileExistsFn = func(p string) bool {
+		_, err := os.Stat(p)
+		return err == nil
+	}
+	// launchDomainsFn 返回 label 的候选域（默认按 plist 位置推断）。
+	//
+	// 抽成变量：单测必须能在不依赖真实 plist / 真实用户目录的前提下
+	// 指定候选域，否则"user/501 与 gui/501 都探测"这条逻辑根本无法锁死。
+	launchDomainsFn = launchDomainCandidates
+)
+
+// launchDomainCandidates 返回该 label 可能所在的 launchd 域，按优先级排序。
+//
+// 真机事故（Mac mini，面板 0.12.9）：`sh.brew.syncthing` 由面板的
+// `sudo -n -u zizdog brew services ...` 加载，作业落在 **user/501** 域；
+// 而旧代码只看 plist 路径就断定 gui/501。结果：
+//   - stop 打偏域，bootout 报错 → 旧状态查询把"查不到"当"未加载" → HTTP 200 谎报成功；
+//   - start 往 gui/501 bootstrap → `Bootstrap failed: 125: Domain does not support
+//     specified action`（无图形会话时 gui 域不可用）。
+//
+// 所以用户代理必须同时认 user/<uid> 与 gui/<uid>，并且 user 在前
+// （面板自己的 brew 调用就落在这里）。找不到 plist 时也要探测所有候选域：
+// plist 被删掉但作业还挂在 launchd 里是真实存在的情况，漏掉它同样会谎报成功。
+func launchDomainCandidates(label string) []string {
+	if fileExistsFn(filepath.Join("/Library/LaunchDaemons", label+".plist")) {
+		return []string{"system"}
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	foundPlist := false
+	for _, home := range userHomesFn() {
+		if !fileExistsFn(filepath.Join(home, "Library", "LaunchAgents", label+".plist")) {
+			continue
+		}
+		foundPlist = true
+		uid := uidOfHomeFn(home)
+		add("user/" + uid)
+		add("gui/" + uid)
+	}
+	if foundPlist {
+		return out
+	}
+	// 没有 plist：system 优先，然后各用户的 user/gui 域。
+	add("system")
+	for _, home := range userHomesFn() {
+		uid := uidOfHomeFn(home)
+		add("user/" + uid)
+		add("gui/" + uid)
+	}
+	if len(out) == 0 {
+		add("system")
+	}
+	return out
+}
+
+// launchQuery 是一次 `launchctl print <domain>/<label>` 的结论。
+type launchQuery struct {
+	state LaunchState
+	// found=true：该域里确实有这个作业。
+	found bool
+	// inconclusive=true：查询失败且失败原因不是"没有这个作业"
+	// （权限不足、域不支持该动作、launchctl 起不来……）。
+	// 这种结果绝不能当成"未加载"。
+	inconclusive bool
+	// detail 是无法判定时的原始输出，用于如实上报。
+	detail string
+}
+
+// queryLaunchDomain 查询一个域里的作业。
+func queryLaunchDomain(domain, label string) launchQuery {
+	base := LaunchState{Label: label, Domain: domain, ExitCode: -1}
+	r := launchctl("print", domain+"/"+label)
+	if r.err == nil {
+		base.Loaded = true
+		parseLaunchPrint(&base, r.stdout)
+		return launchQuery{state: base, found: true}
+	}
+	out := r.combined()
+	if out == "" && r.err != nil {
+		out = r.err.Error()
+	}
+	if launchOutputSaysMissing(out) {
+		return launchQuery{state: base}
+	}
+	return launchQuery{state: base, inconclusive: true, detail: out}
+}
+
+// parseLaunchPrint 解析 `launchctl print` 输出。
+//
+// 输出形如：
+//
+//	state = running
+//	pid = 1234
+//	last exit code = 0
+func parseLaunchPrint(st *LaunchState, stdout string) {
+	for _, ln := range strings.Split(stdout, "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(ln, "pid = "):
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "pid = "))); err == nil {
+				st.PID = v
+				st.Running = true
+			}
+		case strings.HasPrefix(ln, "state = "):
+			if strings.TrimSpace(strings.TrimPrefix(ln, "state = ")) == "running" {
+				st.Running = true
+			}
+		case strings.HasPrefix(ln, "last exit code = "):
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "last exit code = "))); err == nil {
+				st.ExitCode = v
+			}
 		}
 	}
-	return "system"
+}
+
+// launchOutputSaysMissing 判断 launchctl 的输出是否**明确**表示"这个域里没有该作业"。
+//
+// 真机实测（macOS，非 root 与 root 都一样）：
+//
+//	launchctl print gui/501/<不存在>  → exit 113
+//	  Bad request.
+//	  Could not find service "x" in domain for user gui: 501
+//	launchctl print gui/999/<不存在>  → exit 112
+//	  Bad request.
+//	  Could not find domain for user gui: 999
+//
+// 只有上面这类答复才算"未加载"。权限/域能力类的错误
+// （Operation not permitted、Domain does not support specified action、
+// Bootstrap failed…）必须当作"无法判定"，否则就会重演
+// "bootout 报错 → 被当成未加载 → 谎报成功"。
+func launchOutputSaysMissing(out string) bool {
+	low := strings.ToLower(out)
+	if strings.TrimSpace(low) == "" {
+		return false
+	}
+	for _, s := range []string{
+		"could not find service",
+		"service not found",
+		"could not find specified service",
+		"no such process",
+	} {
+		if strings.Contains(low, s) {
+			return true
+		}
+	}
+	// 域本身不存在：这个候选域里当然没有该作业，可以安全地算"没有"。
+	// 注意不能把 "Domain does not support specified action" 混进来 ——
+	// 那是"域不支持该动作"，必须当错误（125 就是这么报的）。
+	return strings.Contains(low, "could not find domain")
+}
+
+// launchResolve 按优先级探测候选域，返回作业真正所在域的状态。
+//
+//	(state, nil) 且 Loaded=false：所有候选域都成功查过，确实没有这个作业。
+//	error：至少一个候选域给不出确定答复（权限/域能力问题），
+//	       这时绝不允许假装"未加载"。
+func launchResolve(label string, domains []string) (LaunchState, error) {
+	var inconclusive []string
+	for _, d := range domains {
+		q := queryLaunchDomain(d, label)
+		if q.found {
+			st := q.state
+			st.ProbedDomains = domains
+			// 兜底：`launchctl print` 对**按需拉起**的服务可能不给 pid 行
+			// （实测 php-fpm 报 `state = spawn scheduled`，没有 pid = ），
+			// 但 `launchctl list` 里它明明有 PID 而且在监听端口。
+			// 少了这个兜底，这类服务会被误判成"未运行"，界面上显示异常。
+			if !st.Running {
+				if pid := pidFromLaunchctlList(label); pid > 0 {
+					st.PID = pid
+					st.Running = true
+				}
+			}
+			return st, nil
+		}
+		if q.inconclusive {
+			inconclusive = append(inconclusive, d+": "+q.detail)
+		}
+	}
+	st := LaunchState{Label: label, ExitCode: -1, ProbedDomains: domains}
+	if len(domains) > 0 {
+		st.Domain = domains[0]
+	}
+	if len(inconclusive) > 0 {
+		return st, fmt.Errorf("无法查询 %s 的 launchd 状态（%s），不能当成未加载",
+			label, strings.Join(inconclusive, "；"))
+	}
+	return st, nil
+}
+
+// LaunchStatus 查询任务状态。
+//
+// 与旧实现的区别：旧代码只查一个域、且**任何**查询错误都返回
+// Loaded=false —— "查不到"与"查不了"被混为一谈，是谎报成功的根源。
+func LaunchStatus(label string) (LaunchState, error) {
+	if !reLabel.MatchString(label) {
+		return LaunchState{}, fmt.Errorf("label 含非法字符: %q", label)
+	}
+	return launchResolve(label, launchDomainsFn(label))
+}
+
+// pidFromLaunchctlList 从 `launchctl list` 里取某个 label 的 PID。
+//
+// 输出是三列：PID  Status  Label，未运行时 PID 是 "-"。
+func pidFromLaunchctlList(label string) int {
+	r := launchctl("list")
+	if r.err != nil {
+		return 0
+	}
+	for _, ln := range strings.Split(r.stdout, "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 3 || f[2] != label {
+			continue
+		}
+		if pid, err := strconv.Atoi(f[0]); err == nil {
+			return pid
+		}
+	}
+	return 0
+}
+
+// LaunchLoad 加载并启动任务。
+//
+// 规则：
+//   - 作业已加载在任一候选域 → kickstart 到**那个**域（再 bootstrap 会报已加载）；
+//   - 未加载 → 按候选顺序 bootstrap，user/<uid> 在前、gui/<uid> 兜底；
+//   - 每次 bootstrap 之后都必须用一次**新的查询**确认真的加载了。
+func LaunchLoad(label string) error {
+	if !reLabel.MatchString(label) {
+		return fmt.Errorf("label 含非法字符: %q", label)
+	}
+	plist, err := findPlist(label)
+	if err != nil {
+		return err
+	}
+	domains := launchDomainsFn(label)
+
+	st, rerr := launchResolve(label, domains)
+	if rerr != nil {
+		return fmt.Errorf("加载 %s 失败：%v", label, rerr)
+	}
+	if st.Loaded {
+		return launchKick(label, st.Domain)
+	}
+
+	var errs []string
+	for _, d := range domains {
+		r := launchctl("bootstrap", d, plist)
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("bootstrap %s: %s", d, r.combined()))
+			continue
+		}
+		// 命令成功不等于真的加载：必须复核终态。
+		after, verr := launchResolve(label, domains)
+		if verr != nil {
+			return fmt.Errorf("加载 %s 失败：bootstrap %s 返回成功，但无法确认状态（%v）",
+				label, d, verr)
+		}
+		if !after.Loaded {
+			return fmt.Errorf("加载 %s 失败：bootstrap %s 返回成功，但 launchd 里查不到该作业", label, d)
+		}
+		return nil
+	}
+	if len(errs) == 0 {
+		errs = append(errs, "没有可用的 launchd 域")
+	}
+	return fmt.Errorf("加载 %s 失败: %s", label, strings.Join(errs, "；"))
+}
+
+// bootout 之后的等待参数。
+//
+// 真机教训（install.sh 的 wait_service_stopped 为同一件事写过注释）：
+// `launchctl bootout` 是**异步**的 —— 命令一返回，作业可能还在卸载中，
+// 这期间 `print` 仍能看到它（state = SIGTERMed）。若不等待就断言"还在"，
+// 就会把一次成功的停止报成失败（谎报失败）。
+//
+// 抽成变量是为了单测：hermetic 测试把它设为 0，异步用例再显式设小值。
+var (
+	launchUnloadWait = 3 * time.Second
+	launchUnloadPoll = 250 * time.Millisecond
+)
+
+// waitLaunchGone 在 launchUnloadWait 内轮询，直到作业从该域消失。
+//
+//	gone=true  → 明确查不到（成功卸载）
+//	gone=false → 超时仍在，或查询无法判定（last 里带着原因）
+func waitLaunchGone(domain, label string) (bool, launchQuery) {
+	deadline := time.Now().Add(launchUnloadWait)
+	for {
+		q := queryLaunchDomain(domain, label)
+		if !q.found && !q.inconclusive {
+			return true, q
+		}
+		if !time.Now().Before(deadline) {
+			return false, q
+		}
+		time.Sleep(launchUnloadPoll)
+	}
+}
+
+// LaunchUnload 停止并卸载任务。
+//
+// 关键不变量：只有在**成功查询**确认该作业已从所有候选域消失后才返回 nil。
+// 这正是旧实现丢掉的东西 —— bootout 报错后它去查状态，而状态查询又把
+// "查询失败"当"未加载"，于是什么都没做也报成功。
+func LaunchUnload(label string) error {
+	if !reLabel.MatchString(label) {
+		return fmt.Errorf("label 含非法字符: %q", label)
+	}
+	domains := launchDomainsFn(label)
+
+	st, err := launchResolve(label, domains)
+	if err != nil {
+		return fmt.Errorf("停止 %s 失败：%v", label, err)
+	}
+	if !st.Loaded {
+		// 经成功查询确认本来就没加载：幂等的空操作成功。
+		return nil
+	}
+
+	// 逐个卸载**真正加载了它**的域，并等待它从该域消失。
+	// 旧代码只打一个域，打偏就什么都不做还报成功。
+	var failures []string
+	for _, d := range domains {
+		q := queryLaunchDomain(d, label)
+		if q.inconclusive {
+			failures = append(failures, fmt.Sprintf("无法查询 %s: %s", d, q.detail))
+			continue
+		}
+		if !q.found {
+			continue
+		}
+		r := launchctl("bootout", d+"/"+label)
+		gone, last := waitLaunchGone(d, label)
+		if gone {
+			continue
+		}
+		switch {
+		case last.inconclusive:
+			failures = append(failures,
+				fmt.Sprintf("bootout %s/%s 后无法确认状态: %s", d, label, last.detail))
+		case r.err != nil:
+			failures = append(failures, fmt.Sprintf("bootout %s/%s: %s", d, label, r.combined()))
+		default:
+			failures = append(failures, fmt.Sprintf("%s/%s 在 bootout 后仍存在", d, label))
+		}
+	}
+
+	// 终态验证：每个候选域都必须查不到它，才算真的停掉。
+	for _, d := range domains {
+		q := queryLaunchDomain(d, label)
+		if q.inconclusive {
+			return fmt.Errorf("停止 %s 失败：无法确认 %s 里是否还有该作业（%s）", label, d, q.detail)
+		}
+		if q.found {
+			pid := ""
+			if q.state.PID > 0 {
+				pid = fmt.Sprintf("（pid %d）", q.state.PID)
+			}
+			return fmt.Errorf("停止 %s 失败：它仍加载在 %s%s", label, d, pid)
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("停止 %s 失败: %s", label, strings.Join(failures, "；"))
+	}
+	return nil
+}
+
+// LaunchKickstart 重启任务（-k 表示先杀掉正在运行的实例）。
+func LaunchKickstart(label string) error {
+	if !reLabel.MatchString(label) {
+		return fmt.Errorf("label 含非法字符: %q", label)
+	}
+	domains := launchDomainsFn(label)
+	st, err := launchResolve(label, domains)
+	if err != nil {
+		return fmt.Errorf("重启 %s 失败：%v", label, err)
+	}
+	if st.Loaded {
+		return launchKick(label, st.Domain)
+	}
+	// 未加载时 kickstart 一定失败：先按 load 的规则加载，再 kickstart。
+	if lerr := LaunchLoad(label); lerr != nil {
+		return lerr
+	}
+	st2, rerr := launchResolve(label, domains)
+	if rerr != nil {
+		return fmt.Errorf("重启 %s 失败：加载后无法确认状态（%v）", label, rerr)
+	}
+	if !st2.Loaded {
+		return fmt.Errorf("重启 %s 失败：加载后 launchd 里仍查不到该作业", label)
+	}
+	return launchKick(label, st2.Domain)
+}
+
+// launchKick 在指定域里 kickstart 并复核。
+func launchKick(label, domain string) error {
+	r := launchctl("kickstart", "-k", domain+"/"+label)
+	if r.err != nil {
+		return fmt.Errorf("重启 %s 失败: %s", label, r.combined())
+	}
+	// 命令成功不等于真的生效：kickstart 之后它必须仍加载在该域里。
+	q := queryLaunchDomain(domain, label)
+	if q.inconclusive {
+		return fmt.Errorf("重启 %s 后无法确认状态（%s）", label, q.detail)
+	}
+	if !q.found {
+		return fmt.Errorf("重启 %s 后 launchd 里查不到该作业（域 %s）", label, domain)
+	}
+	return nil
+}
+
+// findPlist 定位 plist 文件。
+func findPlist(label string) (string, error) {
+	sys := filepath.Join("/Library/LaunchDaemons", label+".plist")
+	if fileExistsFn(sys) {
+		return sys, nil
+	}
+	for _, home := range userHomesFn() {
+		p := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+		if fileExistsFn(p) {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("找不到 plist 文件: %s", label)
 }
 
 func userHomes() []string {
@@ -606,138 +1060,6 @@ func uidOfHome(home string) string {
 		return strings.TrimSpace(r.stdout)
 	}
 	return "501"
-}
-
-// LaunchStatus 查询任务状态。
-func LaunchStatus(label string) (LaunchState, error) {
-	if !reLabel.MatchString(label) {
-		return LaunchState{}, fmt.Errorf("label 含非法字符: %q", label)
-	}
-	st := LaunchState{Label: label, Domain: launchDomain(label), ExitCode: -1}
-	r := run("/bin/launchctl", "print", st.Domain+"/"+label)
-	if r.err != nil {
-		return st, nil // 未加载
-	}
-	st.Loaded = true
-	// launchctl print 输出形如：
-	//   state = running
-	//   pid = 1234
-	//   last exit code = 0
-	for _, ln := range strings.Split(r.stdout, "\n") {
-		ln = strings.TrimSpace(ln)
-		switch {
-		case strings.HasPrefix(ln, "pid = "):
-			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "pid = "))); err == nil {
-				st.PID = v
-				st.Running = true
-			}
-		case strings.HasPrefix(ln, "state = "):
-			if strings.TrimSpace(strings.TrimPrefix(ln, "state = ")) == "running" {
-				st.Running = true
-			}
-		case strings.HasPrefix(ln, "last exit code = "):
-			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "last exit code = "))); err == nil {
-				st.ExitCode = v
-			}
-		}
-	}
-
-	// 兜底：`launchctl print` 对**按需拉起**的服务可能不给 pid 行
-	// （实测 php-fpm 报 `state = spawn scheduled`，没有 pid = ），
-	// 但 `launchctl list` 里它明明有 PID 而且在监听端口。
-	// 少了这个兜底，这类服务会被误判成"未运行"，界面上显示异常。
-	if !st.Running {
-		if pid := pidFromLaunchctlList(label); pid > 0 {
-			st.PID = pid
-			st.Running = true
-		}
-	}
-	return st, nil
-}
-
-// pidFromLaunchctlList 从 `launchctl list` 里取某个 label 的 PID。
-//
-// 输出是三列：PID  Status  Label，未运行时 PID 是 "-"。
-func pidFromLaunchctlList(label string) int {
-	r := run("/bin/launchctl", "list")
-	if r.err != nil {
-		return 0
-	}
-	for _, ln := range strings.Split(r.stdout, "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 3 || f[2] != label {
-			continue
-		}
-		if pid, err := strconv.Atoi(f[0]); err == nil {
-			return pid
-		}
-	}
-	return 0
-}
-
-// LaunchLoad 加载并启动任务。
-func LaunchLoad(label string) error {
-	if !reLabel.MatchString(label) {
-		return fmt.Errorf("label 含非法字符: %q", label)
-	}
-	plist, domain, err := findPlist(label)
-	if err != nil {
-		return err
-	}
-	// 已加载时用 kickstart 重新拉起
-	if st, _ := LaunchStatus(label); st.Loaded {
-		return LaunchKickstart(label)
-	}
-	r := run("/bin/launchctl", "bootstrap", domain, plist)
-	if r.err != nil {
-		return fmt.Errorf("加载 %s 失败: %s", label, r.combined())
-	}
-	return nil
-}
-
-// LaunchUnload 停止并卸载任务。
-func LaunchUnload(label string) error {
-	if !reLabel.MatchString(label) {
-		return fmt.Errorf("label 含非法字符: %q", label)
-	}
-	domain := launchDomain(label)
-	r := run("/bin/launchctl", "bootout", domain+"/"+label)
-	if r.err != nil {
-		// 未加载时 bootout 会报错，这不算失败
-		if st, _ := LaunchStatus(label); !st.Loaded {
-			return nil
-		}
-		return fmt.Errorf("停止 %s 失败: %s", label, r.combined())
-	}
-	return nil
-}
-
-// LaunchKickstart 重启任务（-k 表示先杀掉正在运行的实例）。
-func LaunchKickstart(label string) error {
-	if !reLabel.MatchString(label) {
-		return fmt.Errorf("label 含非法字符: %q", label)
-	}
-	domain := launchDomain(label)
-	r := run("/bin/launchctl", "kickstart", "-k", domain+"/"+label)
-	if r.err != nil {
-		return fmt.Errorf("重启 %s 失败: %s", label, r.combined())
-	}
-	return nil
-}
-
-// findPlist 定位 plist 文件并推断所属域。
-func findPlist(label string) (path, domain string, err error) {
-	sys := filepath.Join("/Library/LaunchDaemons", label+".plist")
-	if _, e := os.Stat(sys); e == nil {
-		return sys, "system", nil
-	}
-	for _, home := range userHomes() {
-		p := filepath.Join(home, "Library/LaunchAgents", label+".plist")
-		if _, e := os.Stat(p); e == nil {
-			return p, "gui/" + uidOfHome(home), nil
-		}
-	}
-	return "", "", fmt.Errorf("找不到 plist 文件: %s", label)
 }
 
 // ---------- 端口 ----------

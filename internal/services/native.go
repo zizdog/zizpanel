@@ -389,7 +389,12 @@ func (d *nativeDriver) Uninstall(ctx context.Context) error {
 	label := d.svc.LaunchLabel
 	plist, _ := d.plistPath()
 	if label != "" {
-		_ = priv.LaunchUnload(label)
+		// 卸载失败必须上报，不能吞掉：作业还挂在 launchd 里就把 plist 删了，
+		// 结果是"服务还在跑、面板里却查不到它"，而且再也没法用 launchctl
+		// 卸载（plist 已不存在）—— 只会留下一个无法管理的孤儿服务。
+		if uerr := priv.LaunchUnload(label); uerr != nil {
+			return fmt.Errorf("卸载 %s 失败: %w", label, uerr)
+		}
 	}
 	if plist != "" {
 		if err := os.Remove(plist); err != nil && !os.IsNotExist(err) {

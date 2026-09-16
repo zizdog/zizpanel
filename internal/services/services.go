@@ -88,6 +88,9 @@ type State struct {
 	ExitCode int `json:"exit_code"`
 	// Endpoint 实际访问地址（若已知）
 	Endpoint string `json:"endpoint"`
+	// Warning 是"操作完成但结果没被确认"的如实说明（例如启动请求已发出、8 秒内
+	// 还没看到它跑起来）。界面必须显示它，否则用户会把"没确认"当成"已经好了"。
+	Warning string `json:"warning,omitempty"`
 }
 
 // Health 是健康检查结果。
@@ -422,16 +425,44 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	}
 	// 等待状态稳定（最多 8 秒）
 	want := action != "stop"
+	var last State
 	for i := 0; i < 16; i++ {
 		time.Sleep(500 * time.Millisecond)
 		st, serr := drv.Status(ctx)
-		if serr == nil && st.Running == want {
-			return st, nil
+		if serr == nil {
+			last = st
+			if st.Running == want {
+				return st, nil
+			}
 		}
 	}
-	st, _ := drv.Status(ctx)
+	if last.Status == "" {
+		last = State{Status: "unknown"}
+	}
 	_ = s
-	return st, nil
+	if !want {
+		// stop 等不到"不再运行"是**真失败**，必须如实报错。
+		//
+		// 真机报障（2026-09-17 用户）：面板点「停止」返回 200 ok:true，而同一个 PID
+		// 仍在 *:8384 上监听 —— 这就是本项目最忌讳的"能谎报成功"。根因（launchd 域判断
+		// 错误）已在 priv 层修掉；这里补上**结果层**的最后一道：命令返回不代表状态到了。
+		detail := ""
+		if last.PID > 0 {
+			detail = fmt.Sprintf("（pid %d 仍在运行）", last.PID)
+		}
+		if last.Detail != "" {
+			detail += "：" + last.Detail
+		}
+		return last, fmt.Errorf("已请求停止，但 8 秒内它仍在运行%s。"+
+			"可能是被 KeepAlive 反复拉起、进程拒绝退出，或它根本不受 launchd 管理；"+
+			"请打开「📜 日志」看原因，或在终端执行 lsof -nP -iTCP:<端口> -sTCP:LISTEN 确认是谁在占用",
+			detail)
+	}
+	// start / restart 等不到"已运行"**不一定是失败**（有的服务启动慢、状态上报滞后），
+	// 所以仍然返回成功 —— 但必须让界面显示"还没确认"，不能让用户以为已经好了。
+	last.Warning = appendWarning(last.Warning,
+		"已请求启动，但 8 秒内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）")
+	return last, nil
 }
 
 // Logs 读取服务日志。

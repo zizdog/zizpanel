@@ -304,8 +304,14 @@ func (m *Manager) apply(ctx context.Context, j *Job) error {
 	label := j.LabelName()
 	plistPath := j.PlistPath2()
 
-	// 先卸载旧任务，避免重复加载导致 launchd 报错
-	_ = priv.LaunchUnload(label)
+	// 先卸载旧任务，避免重复加载导致 launchd 报错。
+	//
+	// 卸载失败必须上报，不能吞掉：作业还挂在 launchd 里时 bootstrap 会失败，
+	// 而吞掉错误后接着 kickstart 的是**旧 plist 里的命令** —— 用户看到
+	// "任务已保存"，实际跑的却还是上一版（与 launchctl 谎报成功同源的坑）。
+	if uerr := priv.LaunchUnload(label); uerr != nil {
+		return fmt.Errorf("卸载旧任务失败（新配置没有生效）: %w", uerr)
+	}
 
 	content := j.BuildPlist(c, m.logPathFor(j))
 	tmp := plistPath + ".tmp"
@@ -334,7 +340,11 @@ func (m *Manager) apply(ctx context.Context, j *Job) error {
 // remove 从 launchd 移除任务并删除 plist。
 func (m *Manager) remove(ctx context.Context, j *Job) error {
 	label := j.LabelName()
-	_ = priv.LaunchUnload(label)
+	// 卸载失败必须上报：任务记录删了、作业还挂在 launchd 里继续定时执行，
+	// 就是"界面上消失了但系统里还在跑"的谎报成功。
+	if uerr := priv.LaunchUnload(label); uerr != nil {
+		return fmt.Errorf("从 launchd 卸载任务失败: %w", uerr)
+	}
 	plistPath := j.PlistPath2()
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除 plist 失败: %w", err)

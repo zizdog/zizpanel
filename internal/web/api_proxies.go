@@ -1847,7 +1847,9 @@ func (s *Server) checkProxySSLPortMix(ctx context.Context, rule *proxies.Rule) e
 		return fmt.Errorf("端口 %d 上已有%s规则「%s」，而这条是%s：nginx 的同一端口不能同时跑 "+
 			"HTTP 与 HTTPS（只要有一个 server 块启用 ssl，整个端口就变成 TLS）。\n"+
 			"三条出路：① 让这条也启用 HTTPS（同一端口必须同为 TLS；域名有证书时这条最简单）；"+
-			"② 把这条规则改到别的端口；③ 先停用/删除「%s」",
+			"② 把这条规则改到别的端口；③ 先停用/删除「%s」。\n"+
+			"提示：证书来源选「面板证书库」或「粘贴自有证书」时，勾上 HTTPS 会**连证书一起保存**；"+
+			"选「自签 / mkcert」时证书要现生成，可以先**取消勾选「启用」**建好规则 → 绑上 HTTPS → 再启用。",
 			rule.Listen, otherMode, other.Name, myMode, other.Name)
 	}
 	return nil

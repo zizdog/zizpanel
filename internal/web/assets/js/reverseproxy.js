@@ -560,6 +560,35 @@ export function ReverseProxyView(content, ctx = {}) {
             // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
             if (hadSSL && !sslOn) payload.ssl_enabled = false;
 
+            // 这次要**启用/更换 HTTPS**：必须把证书信息一起放进主接口的 payload。
+            //
+            // 真机报障（2026-09-17 用户）：启用 HTTPS 原本是"先建规则 → 再调
+            // /proxies/{id}/ssl 绑证书"两步，而第一步的 payload 里没有任何 ssl 字段，
+            // 后端看来它是一条 **HTTP** 规则 —— 当同一端口上已有 HTTPS 规则时
+            // （mini 的 8889 上 wp/site2/panel2 都是 HTTPS），会被"同端口不能混用
+            // HTTP/HTTPS"的保护直接 409，第二步永远没机会跑，用户怎么点都保存不了。
+            //
+            // 面板证书库里的 cert_path/key_path 就是 /ssl 会写进库的那一份，所以这里
+            // 提前带上，主接口写出的就是一条**合法的 HTTPS 规则**（nginx -t 也才过得去）。
+            if (sslOn && needNew) {
+              if (provider === 'acme') {
+                const c = (certsCache || []).find((x) => x.primary === certSel.value);
+                if (c && c.certPath && c.keyPath) {
+                  payload.ssl_enabled = true;
+                  payload.ssl_provider = 'acme';
+                  payload.ssl_cert = c.certPath;
+                  payload.ssl_key = c.keyPath;
+                }
+              } else if (provider === 'manual' && manualC && manualK) {
+                payload.ssl_enabled = true;
+                payload.ssl_provider = 'manual';
+                payload.ssl_cert = manualC;
+                payload.ssl_key = manualK;
+              }
+              // self / mkcert 的证书是 /ssl 那一步现生成的，这里没有可用路径 ——
+              // 那种情况后端会拦下并给出"先建成停用 → 绑好证书 → 再启用"的出路。
+            }
+
             let saved = null;
             try {
               saved = isNew ? await api.proxyCreate(payload) : await api.proxyUpdate(it.id, payload);

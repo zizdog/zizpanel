@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -526,6 +527,21 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		//
 		// $http_host 在客户端没带端口时就等于 $host，所以老规则的行为不变。
 		b.WriteString("\t\tproxy_set_header Host $http_host;\n")
+
+		// 上游返回的绝对 Location 里如果**丢了端口**，按客户端真正请求的 authority 改写。
+		//
+		// 为什么还需要它（Host 头已经带端口了）：应用往往会按**自己保存的站点地址**
+		// 生成绝对跳转（WordPress 的 siteurl、Typecho 的站点地址）。那份配置一旦是
+		// 不带端口的（典型：站点以前直连 443，或安装向导是在别的入口完成的），
+		// 浏览器就会被送到 https://<域名>/ —— 而公网只放行了 8889，直接打不开。
+		// 真机报障（2026-09-17）：wp.zizdog.com 就出现过这种"跳到无端口地址"。
+		//
+		// 只改写**本规则自己域名**的绝对地址；跨域跳转（SSO / CDN / 支付回调）不碰。
+		// 端口与路径照原样保留（$2 是路径，端口统一用客户端的）。
+		for _, d := range SplitDomains(r.Domains) {
+			fmt.Fprintf(&b, "\t\tproxy_redirect ~^https?://%s(:[0-9]+)?(/.*)$ $scheme://$http_host$2;\n",
+				regexp.QuoteMeta(d))
+		}
 	} else {
 		host, port, err := r.TargetHostPort()
 		if err != nil {

@@ -202,8 +202,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card-head .spacer { flex: 1; }
 .card-head .sub { font-size: 11.5px; color: var(--text-mute); }
 .card-body { padding: 16px; }
-.card-body.tight { padding: 0; }
-.card-body .hint{padding:1rem;}
+.card-body.tight { padding: 1em; }
+.card-body .hint{padding:0;}
 
 .grid { display: grid; gap: var(--gap); }
 .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 1rem;}

@@ -166,7 +166,7 @@ func TestGenerateSSLSite(t *testing.T) {
 	}
 	must := []string{
 		"listen      443 ssl;",
-		"return 301 https://$host$request_uri;",
+		"return 301 https://$http_host$request_uri;",
 		"ssl_certificate     /tmp/ssl.test.crt;",
 		"ssl_certificate_key /tmp/ssl.test.key;",
 		"ssl_protocols       TLSv1.2 TLSv1.3;",

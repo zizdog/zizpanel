@@ -218,14 +218,19 @@ export async function doServiceAction(name, action, m = {}, onDone) {
   const labels = { start: '启动', stop: '停止', restart: '重启' };
   const t = toast(`${labels[action] || action}「${label}」中…`, 'info', 0);
   let failed = false;
+  let warning = '';
   try {
-    await api.serviceAction(name, action);
+    const resp = await api.serviceAction(name, action);
+    warning = (resp && resp.warning) || '';
   } catch (e) {
     failed = true;
     toast(`${labels[action] || action}失败：${e.message}。可打开「⚙️ 管理 → 📜 日志」看原因`, 'err', 14000);
   }
   t.remove();
-  if (!failed) toast(`「${label}」已${labels[action] || action}`, 'ok');
+  // 后端说"操作完成但结果没被确认"时（例如启动后 8 秒还没看到它跑起来），
+  // 必须原样告诉用户，不能报一个干净的"已启动" —— 那正是谎报成功。
+  if (!failed && warning) toast(`「${label}」已请求${labels[action] || action}：${warning}`, 'warn', 14000);
+  else if (!failed) toast(`「${label}」已${labels[action] || action}`, 'ok');
   // 不论成败都刷新一次：后端可能已经改了状态却返回了错误（历史上 launchctl
   // 的退出码就谎报过成功），界面必须显示的是**系统里的真实状态**而不是我们的预期。
   if (typeof onDone === 'function') onDone();
