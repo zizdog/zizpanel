@@ -244,12 +244,17 @@ func TestLaunchStatusProbesUserAndGUIDomains(t *testing.T) {
 			wantDomain: "user/501", // 未加载时报第一个候选域
 		},
 		{
-			name: "所有候选域都无法查询（125）→ 必须报错，不能当成未加载",
+			// 真机 2026-09-17（mini，headless：没有图形登录会话）：两个候选域都回
+			// `Could not print domain: 125: Domain does not support specified action`
+			// —— 那是"域不存在"，等于**这个域里没有该作业**，必须判为未加载。
+			// 曾经把它当"查不了"→ stop 假失败（服务其实停了）、start 起不来。
+			name: "两个域都不存在（headless 125）→ 判为未加载，不报错",
 			printErr: map[string]string{
 				"user/501": "Could not print domain: 125: Domain does not support specified action",
 				"gui/501":  "Could not print domain: 125: Domain does not support specified action",
 			},
-			wantErr: true,
+			wantLoaded: false,
+			wantDomain: "user/501",
 		},
 		{
 			name:     "一个域说没有、另一个域查不了 → 不能断定未加载",

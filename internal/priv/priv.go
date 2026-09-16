@@ -756,9 +756,27 @@ func launchOutputSaysMissing(out string) bool {
 		}
 	}
 	// 域本身不存在：这个候选域里当然没有该作业，可以安全地算"没有"。
-	// 注意不能把 "Domain does not support specified action" 混进来 ——
-	// 那是"域不支持该动作"，必须当错误（125 就是这么报的）。
-	return strings.Contains(low, "could not find domain")
+	//
+	// 三种真实措辞都要认（2026-09-17 mini 真机）：
+	//   · `Could not find domain: …`（域不存在）
+	//   · `Could not print domain: 125: Domain does not support specified action`
+	//     —— **headless 机器上 `gui/<uid>` 域不存在时，`launchctl print gui/501/x`
+	//     报的就是这一句**（没有图形登录会话）。把这一句当"查不了"是本轮踩到的
+	//     回归：stop 会假失败（服务其实停了）、start 直接起不来 —— 而"服务器模式"
+	//     的机器本来就没有图形会话，这个域永远不存在。
+	//
+	// ⚠️ 必须**同时**匹配 125 那句：同样是 `Could not print domain:` 前缀，
+	// `Could not print domain: 1: Operation not permitted` 是**权限问题**，
+	// 那是真的"查不了"，必须如实报错（不能混成"没有"）。
+	//
+	// 另外仍然**不能**把单独的 "Domain does not support specified action" 混进来：
+	// 它在 bootstrap/bootout **动作**上是"该域不支持这个动作"，必须如实报错
+	// （见 LaunchLoad/LaunchUnload 的动作分支，那里的判定不走这个函数）。
+	if strings.Contains(low, "could not find domain") {
+		return true
+	}
+	return strings.Contains(low, "could not print domain") &&
+		strings.Contains(low, "domain does not support specified action")
 }
 
 // launchResolve 按优先级探测候选域，返回作业真正所在域的状态。
