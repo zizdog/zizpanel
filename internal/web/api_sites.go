@@ -1136,6 +1136,11 @@ func (s *Server) Shutdown() {
 	if s.termMgr != nil {
 		s.termMgr.CloseAll()
 	}
+	// 关掉所有回环转发器：面板都退出了，还留着监听端口只会让 nginx 把请求
+	// 转进一个没有人处理的 socket（表现为挂起而不是干脆的 502）。
+	if s.forwarders != nil {
+		s.forwarders.StopAll()
+	}
 }
 
 // Startup 在面板启动时做一次环境准备与自愈。
@@ -1156,6 +1161,11 @@ func (s *Server) Startup(ctx context.Context) {
 	}
 
 	s.ensureNginxEnvOnStart(ctx)
+
+	// 把回环转发器对齐到数据库里的反代规则（macOS 15 本地网络隐私门的修法）。
+	// 必须在任何 nginx reload 之前把监听器起好，否则重启后的第一次请求会打到
+	// 一个还没人听的回环端口上。
+	s.reconcileForwarders(ctx)
 
 	// 证书自动续期：登记到面板既有的调度器里（每日检查一次，实现见 api_certs.go）。
 	// 这里只登记，不做立即续期 —— 真正决定签发的门槛是 NeedsRenewal，

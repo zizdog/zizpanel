@@ -87,8 +87,100 @@ type Rule struct {
 	// 所以这里只补"还缺的那几个"，老规则（false）的输出保持逐字不变。
 	StandardHeaders bool `json:"standard_headers"`
 
+	// ---- 局域网出口（macOS 15「本地网络」隐私门的修法）----
+	//
+	// 背景（真机事实）：macOS 15 会给访问局域网的进程加一道隐私门。Homebrew 的
+	// nginx（ad-hoc 签名、标识随二进制 UUID 变）访问 192.168.x.x 会被拦，无头
+	// 服务器上没人点弹窗 → 直接 "No route to host"，反代全部 502。而面板自己
+	// （Go、linker-signed、标识 a.out）从来没被拦过。
+	//
+	// 产品级修法：把局域网出口收回面板 —— 面板在 127.0.0.1:<ForwardPort> 起一个
+	// TCP 转发器，nginx 只连回环（回环不受此门限制），由面板去连局域网目标。
+	//
+	// LANForward 是三态字符串：
+	//   auto —— 目标是回环地址 → 直连；目标是私有/链路本地地址 → 走面板转发；
+	//           公网域名/IP → 直连。域名解析不了或解析到私有地址也按私有处理
+	//           （转发到公网目标的代价只是一跳，远小于被隐私门拦成 502）。
+	//   on   —— 强制走面板转发（含公网目标，用户自选）。
+	//   off  —— 强制 nginx 直连（保留旧行为，给"我就是要 nginx 直连"的人）。
+	//
+	// 空字符串按 auto 处理；但**渲染是否转发看的是 ForwardPort**（见 Forwarding），
+	// 所以直接构造的 Rule{}（ForwardPort=0）仍渲染成直连 —— 这保证了
+	// "目标是公网/回环时输出与升级前逐字一致"的黄金测试不被破坏。
+	LANForward string `json:"lan_forward"`
+	// ForwardPort 是转发器实际监听的**回环**端口（127.0.0.1:<port>）。
+	// 由 Manager 分配并落库；重启后优先复用同一个值，否则 nginx 里的
+	// proxy_pass 会指向一个没人听的端口。0 = 这条规则不经过面板转发。
+	ForwardPort int `json:"forward_port"`
+
 	Created time.Time `json:"created_at"`
 	Updated time.Time `json:"updated_at"`
+}
+
+// LANForward 三态取值。
+const (
+	LANForwardAuto = "auto"
+	LANForwardOn   = "on"
+	LANForwardOff  = "off"
+)
+
+// LANForwardMode 返回归一化后的三态值（空 / 未知一律按 auto）。
+func (r *Rule) LANForwardMode() string {
+	switch strings.ToLower(strings.TrimSpace(r.LANForward)) {
+	case LANForwardOn:
+		return LANForwardOn
+	case LANForwardOff:
+		return LANForwardOff
+	default:
+		return LANForwardAuto
+	}
+}
+
+// LANForwardLabel 把三态翻译成界面可读的中文。
+func LANForwardLabel(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case LANForwardOn:
+		return "经面板转发"
+	case LANForwardOff:
+		return "nginx 直连"
+	default:
+		return "自动"
+	}
+}
+
+// Forwarding 报告这条规则**渲染时**是否走面板回环转发。
+//
+// 判据刻意只看 ForwardPort 是否已分配（由 Manager 依据 lan_forward + 目标网段
+// 决定并把结果写回端口），而不是在这里做 DNS：
+//   - 生成器保持纯函数、不碰网络，单测才能在无网络环境下钉住输出；
+//   - ForwardPort=0 时输出与升级前逐字一致（黄金测试的硬要求）。
+//
+// mode=off 时即使数据库里残留了旧端口也不转发（关掉转发必须真的直连）。
+func (r *Rule) Forwarding() bool {
+	if r == nil {
+		return false
+	}
+	return r.ForwardPort > 0 && r.LANForwardMode() != LANForwardOff
+}
+
+// NeedsForward 判断这条规则是否需要面板回环转发（含 DNS 解析，lookup 为 nil 时用系统解析）。
+//
+// 这是给 Manager 用的"该不该起监听"判据；渲染只认 Forwarding()。
+func (r *Rule) NeedsForward(lookup func(host string) ([]string, error)) bool {
+	if r == nil {
+		return false
+	}
+	switch r.LANForwardMode() {
+	case LANForwardOff:
+		return false
+	case LANForwardOn:
+		return true
+	}
+	host, _, err := r.TargetHostPort()
+	if err != nil {
+		return false
+	}
+	return ClassifyTarget(host, lookup) == ScopePrivate
 }
 
 // Validate 校验一条规则，返回**给用户看**的错误。
@@ -116,6 +208,17 @@ func (r *Rule) Validate() error {
 	}
 	if r.Path != "" && !strings.HasPrefix(r.Path, "/") {
 		return fmt.Errorf("路径前缀要以 / 开头，例如 /api（当前是 %q）", r.Path)
+	}
+	// 局域网出口：只认三态。写错时不静默按 auto 处理 —— 那样用户以为"强制直连"
+	// 生效了，实际却在转发，是最难查的一类偏差。
+	switch strings.ToLower(strings.TrimSpace(r.LANForward)) {
+	case "", LANForwardAuto, LANForwardOn, LANForwardOff:
+	default:
+		return fmt.Errorf("局域网出口只能是 auto（自动）/ on（经面板转发）/ off（nginx 直连），当前是 %q", r.LANForward)
+	}
+	r.LANForward = r.LANForwardMode()
+	if r.ForwardPort < 0 || r.ForwardPort > 65535 {
+		return fmt.Errorf("回环转发端口不合法：%d（应为 0~65535，0 表示不使用转发）", r.ForwardPort)
 	}
 	for _, d := range SplitDomains(r.Domains) {
 		if strings.ContainsAny(d, " /:\\") {
@@ -186,6 +289,104 @@ func (r *Rule) TargetHostPort() (string, int, error) {
 		port = n
 	}
 	return host, port, nil
+}
+
+// TargetScope 表示反代目标所在的网段，决定 lan_forward=auto 时要不要走面板转发。
+type TargetScope string
+
+const (
+	// ScopeLoopback：回环地址（127/8、::1）。nginx 连它不经过本地网络隐私门。
+	ScopeLoopback TargetScope = "loopback"
+	// ScopePrivate：RFC1918（10/8、172.16/12、192.168/16）、链路本地
+	// （169.254/16、fe80::/10）、唯一本地 IPv6（fc00::/7）、以及**判不出来**的
+	// 情况（域名解析失败/解析出怪东西）。按私有处理 = 走转发，是安全侧。
+	ScopePrivate TargetScope = "private"
+	// ScopePublic：公网地址。nginx 直连即可（转发也通，只是多一跳）。
+	ScopePublic TargetScope = "public"
+)
+
+// ClassifyTarget 判断主机名/IP 属于哪个网段。
+//
+// 规则（与 lan_forward=auto 的语义一一对应）：
+//   - 回环字面量 → loopback；
+//   - 私有 / 链路本地 / 未指定（0.0.0.0）字面量 → private；
+//   - 其它 IP 字面量 → public；
+//   - 域名 → 解析：失败或解析出 0 条 → private（保守：转发的代价只是一跳，
+//     而被 macOS 隐私门拦掉是整条规则 502）；只要解析出任何私有/链路本地 → private；
+//     全是回环 → loopback；否则 public。
+//
+// lookup 为 nil 时用系统的 net.LookupHost。单测通过传入假解析器避免碰网络。
+func ClassifyTarget(host string, lookup func(string) ([]string, error)) TargetScope {
+	h := normalizeHost(host)
+	if h == "" {
+		return ScopePrivate
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ipScope(ip)
+	}
+	if lookup == nil {
+		lookup = net.LookupHost
+	}
+	ips, err := lookup(h)
+	if err != nil || len(ips) == 0 {
+		return ScopePrivate
+	}
+	allLoopback := true
+	for _, s := range ips {
+		ip := net.ParseIP(strings.TrimSpace(s))
+		if ip == nil {
+			return ScopePrivate
+		}
+		switch ipScope(ip) {
+		case ScopePrivate:
+			return ScopePrivate
+		case ScopePublic:
+			allLoopback = false
+		}
+	}
+	if allLoopback {
+		return ScopeLoopback
+	}
+	return ScopePublic
+}
+
+// ipScope 是单个 IP 的网段判定。
+func ipScope(ip net.IP) TargetScope {
+	switch {
+	case ip.IsLoopback():
+		return ScopeLoopback
+	case ip.IsPrivate(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsUnspecified():
+		// IsPrivate 覆盖 RFC1918 与 fc00::/7；IsLinkLocalUnicast 覆盖
+		// 169.254/16 与 fe80::/10；未指定地址（0.0.0.0/::）判不出来，按私有。
+		return ScopePrivate
+	default:
+		return ScopePublic
+	}
+}
+
+// normalizeHost 去掉 IPv6 方括号、结尾的点与大小写差异。
+func normalizeHost(host string) string {
+	h := strings.TrimSpace(host)
+	h = strings.TrimPrefix(h, "[")
+	h = strings.TrimSuffix(h, "]")
+	h = strings.TrimSuffix(h, ".")
+	return strings.ToLower(h)
+}
+
+// ForwardProxyPass 返回转发模式下 proxy_pass 的目标。
+//
+// 关键：**scheme 必须跟真实目标一致**（https 目标写出 https://127.0.0.1:<port>）。
+// 原因：转发器只是 TCP 透传，TLS 由 nginx 自己做。如果 https 上游被写成
+// `proxy_pass http://127.0.0.1:<port>`，nginx 会对着转发器发**明文** HTTP，
+// 而转发器把这段明文原样送到 TLS 上游 → 握手直接失败。写成 https:// 时，
+// nginx 的 TLS 握手（含 proxy_ssl_name 指定的 SNI）原样穿过转发器到上游，
+// 这才是"TLS 原样透传"。
+func (r *Rule) ForwardProxyPass() string {
+	scheme := "http"
+	if u, err := url.Parse(r.Target); err == nil && strings.EqualFold(u.Scheme, "https") {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://127.0.0.1:%d", scheme, r.ForwardPort)
 }
 
 // SSLProviderLabel 把证书来源翻译成界面可读的中文。
@@ -286,15 +487,31 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		}
 	}
 
+	// 强制转发但端口还没分配：不能静默退回直连（那正是"以为在转发、其实直连"
+	// 的假成功），明确报错让调用方先跑 Ensure/Reconcile。
+	if r.LANForwardMode() == LANForwardOn && r.ForwardPort <= 0 {
+		return "", fmt.Errorf("规则「%s」选择了「经面板转发」，但回环端口还没有分配；请重新保存这条规则（转发器可能没起来）", r.Name)
+	}
+
 	b.WriteString("\n\t# 反代目标的真实地址（日志里用得上）\n")
-	fmt.Fprintf(&b, "\t# target: %s\n", r.Target)
+	if r.Forwarding() {
+		// 保留真实目标：nginx 里看到的只是回环地址，排查时必须知道它实际去哪。
+		fmt.Fprintf(&b, "\t# target: %s（经面板转发）\n", r.Target)
+	} else {
+		fmt.Fprintf(&b, "\t# target: %s\n", r.Target)
+	}
 
 	prefix := r.Path
 	if prefix == "" {
 		prefix = "/"
 	}
 	fmt.Fprintf(&b, "\n\tlocation %s {\n", prefix)
-	fmt.Fprintf(&b, "\t\tproxy_pass %s;\n", strings.TrimRight(r.Target, "/"))
+	if r.Forwarding() {
+		// 只连回环：回环不受 macOS 15「本地网络」隐私门限制，由面板负责出局域网。
+		fmt.Fprintf(&b, "\t\tproxy_pass %s;\n", r.ForwardProxyPass())
+	} else {
+		fmt.Fprintf(&b, "\t\tproxy_pass %s;\n", strings.TrimRight(r.Target, "/"))
+	}
 
 	// Host 头：默认改成目标主机（多数后端按 Host 分站，透传原始 Host 会 404）。
 	if r.PreserveHost {

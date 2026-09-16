@@ -22,7 +22,7 @@ func NewRepository(st *store.Store) *Repository { return &Repository{st: st} }
 
 const ruleCols = `id,name,listen,domains,path,target,preserve_host,websocket,enabled,remark,
 	ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,
-	tls_name,standard_headers,redirect_http,created_at,updated_at`
+	tls_name,standard_headers,redirect_http,lan_forward,forward_port,created_at,updated_at`
 
 func scanRule(sc interface{ Scan(...any) error }) (*Rule, error) {
 	var r Rule
@@ -32,6 +32,7 @@ func scanRule(sc interface{ Scan(...any) error }) (*Rule, error) {
 		&preserve, &ws, &enabled, &r.Remark,
 		&sslEnabled, &r.SSLCert, &r.SSLKey, &r.SSLProvider, &r.SSLExpires,
 		&r.TLSName, &stdHeaders, &redirectHTTP,
+		&r.LANForward, &r.ForwardPort,
 		&created, &updated); err != nil {
 		return nil, err
 	}
@@ -41,6 +42,9 @@ func scanRule(sc interface{ Scan(...any) error }) (*Rule, error) {
 	r.SSLEnabled = sslEnabled == 1
 	r.StandardHeaders = stdHeaders == 1
 	r.RedirectHTTP = redirectHTTP == 1
+	// 老库/手工写入的行可能是空串：按契约"默认 auto"补齐，而不是把控制权
+	// 交给一个未定义取值（Generate 对空串也是按 auto 的）。
+	r.LANForward = r.LANForwardMode()
 	r.Created = parseTime(created)
 	r.Updated = parseTime(updated)
 	return &r, nil
@@ -100,13 +104,14 @@ func (r *Repository) Create(ctx context.Context, rule *Rule) (*Rule, error) {
 	res, err := r.st.DB().ExecContext(ctx,
 		`INSERT INTO proxies (name,listen,domains,path,target,preserve_host,websocket,enabled,remark,
 		 ssl_enabled,ssl_cert,ssl_key,ssl_provider,ssl_expires,
-		 tls_name,standard_headers,redirect_http,created_at,updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 tls_name,standard_headers,redirect_http,lan_forward,forward_port,created_at,updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		rule.Name, rule.Listen, rule.Domains, rule.Path, rule.Target,
 		boolInt(rule.PreserveHost), boolInt(rule.Websocket), boolInt(rule.Enabled),
 		rule.Remark,
 		boolInt(rule.SSLEnabled), rule.SSLCert, rule.SSLKey, rule.SSLProvider, rule.SSLExpires,
 		rule.TLSName, boolInt(rule.StandardHeaders), boolInt(rule.RedirectHTTP),
+		rule.LANForwardMode(), forwardPortOrZero(rule.ForwardPort),
 		now, now)
 	if err != nil {
 		return nil, fmt.Errorf("保存反向代理规则失败: %w", err)
@@ -124,12 +129,13 @@ func (r *Repository) Update(ctx context.Context, rule *Rule) (*Rule, error) {
 		`UPDATE proxies SET name=?,listen=?,domains=?,path=?,target=?,preserve_host=?,
 		 websocket=?,enabled=?,remark=?,
 		 ssl_enabled=?,ssl_cert=?,ssl_key=?,ssl_provider=?,ssl_expires=?,
-		 tls_name=?,standard_headers=?,redirect_http=?,updated_at=? WHERE id=?`,
+		 tls_name=?,standard_headers=?,redirect_http=?,lan_forward=?,forward_port=?,updated_at=? WHERE id=?`,
 		rule.Name, rule.Listen, rule.Domains, rule.Path, rule.Target,
 		boolInt(rule.PreserveHost), boolInt(rule.Websocket), boolInt(rule.Enabled),
 		rule.Remark,
 		boolInt(rule.SSLEnabled), rule.SSLCert, rule.SSLKey, rule.SSLProvider, rule.SSLExpires,
 		rule.TLSName, boolInt(rule.StandardHeaders), boolInt(rule.RedirectHTTP),
+		rule.LANForwardMode(), forwardPortOrZero(rule.ForwardPort),
 		nowStr(), rule.ID)
 	if err != nil {
 		return nil, fmt.Errorf("更新反向代理规则失败: %w", err)
@@ -138,6 +144,32 @@ func (r *Repository) Update(ctx context.Context, rule *Rule) (*Rule, error) {
 		return nil, ErrNotFound
 	}
 	return r.Get(ctx, rule.ID)
+}
+
+// SetForwardPort 只更新一条规则的回环转发端口。
+//
+// 单独一个方法（而不是走 Update）是因为"端口分配结果落库"发生在转发器起来
+// 之后、而 nginx 配置写入之前；这条 UPDATE 不碰其它字段，避免把内存里可能
+// 尚未校验过的改动顺手写进去。port<=0 表示不使用转发。
+func (r *Repository) SetForwardPort(ctx context.Context, id int64, port int) error {
+	res, err := r.st.DB().ExecContext(ctx,
+		`UPDATE proxies SET forward_port=?, updated_at=? WHERE id=?`,
+		forwardPortOrZero(port), nowStr(), id)
+	if err != nil {
+		return fmt.Errorf("保存回环转发端口失败: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// forwardPortOrZero 把非法端口归一成 0（表示不使用转发）。
+func forwardPortOrZero(p int) int {
+	if p < 0 || p > 65535 {
+		return 0
+	}
+	return p
 }
 
 // Delete 删除一条规则。

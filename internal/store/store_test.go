@@ -203,6 +203,8 @@ func TestProxiesSSLColumnsMigrateBackwardCompatible(t *testing.T) {
 	want := map[string]bool{
 		"ssl_enabled": false, "ssl_cert": false, "ssl_key": false,
 		"ssl_provider": false, "ssl_expires": false,
+		// 局域网出口（macOS 15 本地网络隐私门）：老规则默认 auto、端口 0。
+		"lan_forward": false, "forward_port": false,
 	}
 	rows, err := st.DB().QueryContext(ctx, "PRAGMA table_info(proxies)")
 	if err != nil {
@@ -230,9 +232,11 @@ func TestProxiesSSLColumnsMigrateBackwardCompatible(t *testing.T) {
 
 	var name, domains, cert, provider string
 	var sslEnabled int
+	var lanForward string
+	var forwardPort int
 	if err := st.DB().QueryRowContext(ctx,
-		`SELECT name,domains,ssl_enabled,ssl_cert,ssl_provider FROM proxies WHERE listen=8090`).
-		Scan(&name, &domains, &sslEnabled, &cert, &provider); err != nil {
+		`SELECT name,domains,ssl_enabled,ssl_cert,ssl_provider,lan_forward,forward_port FROM proxies WHERE listen=8090`).
+		Scan(&name, &domains, &sslEnabled, &cert, &provider, &lanForward, &forwardPort); err != nil {
 		t.Fatalf("老规则读取失败: %v", err)
 	}
 	if name != "老规则" || domains != "lede.zizdog.com" {
@@ -240,6 +244,11 @@ func TestProxiesSSLColumnsMigrateBackwardCompatible(t *testing.T) {
 	}
 	if sslEnabled != 0 || cert != "" || provider != "" {
 		t.Fatalf("老规则的 SSL 必须默认为关闭且为空: enabled=%d cert=%q provider=%q", sslEnabled, cert, provider)
+	}
+	// 老规则的局域网出口必须是 auto、端口 0：目标是公网/回环时生成的 vhost
+	// 与升级前逐字一致（有 proxies 包的黄金测试钉住）。
+	if lanForward != "auto" || forwardPort != 0 {
+		t.Fatalf("老规则的局域网出口默认值不对: lan_forward=%q forward_port=%d", lanForward, forwardPort)
 	}
 
 	// 3) 再打开一次（迁移必须幂等：ALTER TABLE 不能重复执行）。

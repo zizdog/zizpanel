@@ -94,11 +94,18 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// 反代目标网段判定用的 DNS 解析器必须钉住：否则带域名目标的测试会去查
+	// 真实 DNS（单测不许碰真实网络）。这里统一返回一个公网地址 —— 对测试来说
+	// 等价于"不需要经面板转发"，因此测试不会意外绑上 47000+ 的回环端口。
+	prevLookup := proxyLookupHostFn
+	proxyLookupHostFn = func(string) ([]string, error) { return []string{"93.184.216.34"}, nil }
+	t.Cleanup(func() { proxyLookupHostFn = prevLookup })
 	am := auth.New(st, cfg.Secret, 72, 5, 15)
 	srv, err := New(cfg, st, am, sysinfo.NewCollector(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(srv.forwarders.StopAll)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	return srv, ts

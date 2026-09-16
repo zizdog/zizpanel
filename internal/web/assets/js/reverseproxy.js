@@ -52,6 +52,63 @@ function sslTitle(it) {
   return lines.join('\n');
 }
 
+// fmtBytes 把字节数变成人读的单位（只用于列表展示，不参与任何判定）。
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return v + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let x = v / 1024;
+  let i = 0;
+  while (x >= 1024 && i < units.length - 1) { x /= 1024; i += 1; }
+  return x.toFixed(x >= 100 ? 0 : 1) + ' ' + units[i];
+}
+
+// lanForwardPill 显示这条规则的「局域网出口」状态。
+//
+// 三种情况必须能一眼分开：真的在转发（回环端口在听）、明确选了 nginx 直连、
+// 以及"自动判定结果显示目标是局域网却不在转发"（= 有 502 风险，标红）。
+function lanForwardPill(it) {
+  // 停用的规则不写 nginx 配置、转发器也已停掉：不拿"未在转发"去吓用户。
+  if (!it.enabled) return null;
+  if (it.forward_active) {
+    return h('span.pill.ok', {
+      text: '经面板转发 :' + (it.forward_port || '?'),
+      title: '面板在回环上转发到 ' + (it.forward_upstream || it.target) + '；nginx 只连 127.0.0.1，不受 macOS 本地网络授权影响',
+    });
+  }
+  if (it.lan_forward === 'off') {
+    return h('span.pill' + (it.target_scope === 'private' ? '.danger' : ''), {
+      text: it.target_scope === 'private' ? 'nginx 直连（局域网，有风险）' : 'nginx 直连',
+      title: it.target_scope === 'private'
+        ? '目标是局域网地址，nginx 直连可能被 macOS 15「本地网络」授权拦成 502'
+        : 'nginx 直接连目标（旧行为）',
+    });
+  }
+  if (it.target_scope === 'private') {
+    return h('span.pill.danger', {
+      text: '局域网目标未在转发',
+      title: '这条规则的目标是局域网地址，但转发器没有在听：查看下面的转发错误或重新保存规则',
+    });
+  }
+  return null;
+}
+
+// lanDirectWarning 是"局域网目标 + nginx 直连"时的显眼提示。
+//
+// 这是本功能存在的理由：macOS 15 会拦 Homebrew 的 nginx 访问局域网，而无头
+// 服务器上没人点弹窗 —— 症状是反代全部 502，而用户完全看不出原因。
+function lanDirectWarning(it) {
+  if (!it.lan_direct_warning) return null;
+  return h('div.banner.banner-warn', [
+    h('strong', { text: '⚠️ 可能因 macOS 授权失效而 502：' }),
+    h('span', {
+      text: '目标 ' + it.target + ' 是局域网地址，但这条规则选择了 nginx 直连。'
+        + 'macOS 15 的「本地网络」隐私门会拦 Homebrew 的 nginx（无头服务器没人点弹窗授权）。'
+        + '建议把「局域网出口」改成「自动」或「经面板转发」。',
+    }),
+  ]);
+}
+
 export function ReverseProxyView(content, ctx = {}) {
   clear(content);
 
@@ -151,6 +208,7 @@ export function ReverseProxyView(content, ctx = {}) {
         it.ssl_enabled
           ? h('span.pill.ok', { text: '🔒 HTTPS', title: sslTitle(it) })
           : null,
+        lanForwardPill(it),
         h('div.spacer'),
       ]),
       h('div.mono', {
@@ -158,7 +216,21 @@ export function ReverseProxyView(content, ctx = {}) {
       }, [
         h('div', { text: '监听 :' + it.listen + (domains.length ? '  ' + domains.join(', ') : '  (所有域名)') + (it.path ? '  ' + it.path + '*' : '') }),
         h('div', { text: '→  ' + it.target }),
+        it.forward_active
+          ? h('div', {
+            text: '→  经面板转发 127.0.0.1:' + it.forward_port
+              + '（活跃 ' + (it.forward_active_conns || 0) + ' / 累计 ' + (it.forward_total_conns || 0) + ' 条连接'
+              + '，出 ' + fmtBytes(it.forward_bytes_in) + ' / 入 ' + fmtBytes(it.forward_bytes_out) + '）',
+          })
+          : null,
       ]),
+      lanDirectWarning(it),
+      it.forward_last_error
+        ? h('div.hint', {
+          style: { color: 'var(--danger)' },
+          text: '最近一次转发错误（累计 ' + (it.forward_error_count || 0) + ' 次）：' + it.forward_last_error,
+        })
+        : null,
       it.ssl_enabled && it.ssl ? h('div.hint', { text: sslSummary(it) }) : null,
       it.remark ? h('div.hint', { text: it.remark }) : null,
       it.target_detail && !it.target_ok ? h('div.hint', { style: { color: 'var(--danger)' }, text: it.target_detail }) : null,
@@ -235,6 +307,13 @@ export function ReverseProxyView(content, ctx = {}) {
       // HTTPS 上游的 SNI（proxy_ssl_name）。留空自动推导：目标是域名用它本身，
       // 目标是 IP 用本条规则的第一个域名。
       tlsName: h('input.input', { value: it?.tls_name || '', placeholder: '留空自动；目标是 https://<IP> 时建议填上游域名' }),
+      // 「局域网出口」三态。默认自动：目标是局域网时由面板回环转发，
+      // 其余直连 —— 这样老规则升级后配置不用动，也不会因为授权门 502。
+      lanForward: h('select.select', { id: 'zp-proxy-lan-forward' }, [
+        h('option', { value: 'auto', text: '自动（推荐）：目标是局域网时经面板转发，其余 nginx 直连' }),
+        h('option', { value: 'on', text: '经面板转发：把局域网出口收回面板（修 macOS 本地网络授权）' }),
+        h('option', { value: 'off', text: 'nginx 直连：保持旧行为（局域网目标可能 502）' }),
+      ]),
       enabled: h('input', { type: 'checkbox', checked: it ? !!it.enabled : true }),
       remark: h('input.input', { value: it?.remark || '', placeholder: '备注（可留空）' }),
       // ---- HTTPS ----
@@ -247,6 +326,7 @@ export function ReverseProxyView(content, ctx = {}) {
       redirectHTTP: h('input', { type: 'checkbox', checked: it ? !!it.redirect_http : true }),
     };
     f.sslProvider.value = SSL_PROVIDERS.some((p) => p.value === cur.provider) ? cur.provider : 'acme';
+    f.lanForward.value = ['auto', 'on', 'off'].includes(it?.lan_forward) ? it.lan_forward : 'auto';
 
     const certSel = h('select.select', { id: 'zp-proxy-ssl-cert' });
     const certHint = h('div.hint', { text: '正在读取证书…' });
@@ -374,6 +454,19 @@ export function ReverseProxyView(content, ctx = {}) {
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' } },
         [f.enabled, h('span', { text: '启用' })]),
       row('HTTPS 上游 SNI（可选）', f.tlsName, '目标是 https:// 时，nginx 默认不发 SNI，可能落到上游的默认 server'),
+      row('局域网出口', f.lanForward,
+        'macOS 15 的「本地网络」隐私门会拦 Homebrew 的 nginx 访问局域网（无头服务器没人点弹窗）→ 反代 502。'
+        + '「自动」会在目标是局域网时改由面板从回环转发；「nginx 直连」保留旧行为。'),
+      // 回环端口是面板分配的结果，只读展示（表单里不能改）。
+      it && (it.forward_port || it.forward_last_error)
+        ? h('div.hint', {
+          text: '当前：' + (it.forward_active
+            ? '正在经面板转发 127.0.0.1:' + it.forward_port
+              + '（活跃 ' + (it.forward_active_conns || 0) + ' / 累计 ' + (it.forward_total_conns || 0) + ' 条连接）'
+            : (it.forward_port ? '已分配回环端口 ' + it.forward_port + '，但当前没有在监听' : '没有使用面板转发'))
+            + (it.forward_last_error ? '；最近一次转发错误：' + it.forward_last_error : ''),
+        })
+        : null,
       row('备注', f.remark),
       h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
@@ -444,6 +537,7 @@ export function ReverseProxyView(content, ctx = {}) {
               standard_headers: f.stdHeaders.checked,
               tls_name: f.tlsName.value.trim(),
               redirect_http: f.redirectHTTP.checked,
+              lan_forward: f.lanForward.value,
             };
             // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
             if (hadSSL && !sslOn) payload.ssl_enabled = false;

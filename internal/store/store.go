@@ -146,6 +146,11 @@ CREATE TABLE IF NOT EXISTS proxies (
     ssl_key       TEXT    NOT NULL DEFAULT '',
     ssl_provider  TEXT    NOT NULL DEFAULT '',   -- self/mkcert/manual/acme
     ssl_expires   TEXT    NOT NULL DEFAULT '',
+    -- 「局域网出口」三态与回环转发端口（2026-09 新增，macOS 15 本地网络隐私门）。
+    -- 默认 auto：老规则升级后由面板判断"要不要经面板转发"，目标是公网/回环时
+    -- 生成的 nginx 配置与升级前逐字一致。
+    lan_forward   TEXT    NOT NULL DEFAULT 'auto',   -- auto/on/off
+    forward_port  INTEGER NOT NULL DEFAULT 0,        -- 0 = 不使用转发
     created_at    TEXT    NOT NULL DEFAULT '',
     updated_at    TEXT    NOT NULL DEFAULT ''
 );
@@ -291,11 +296,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		"tls_name":         "TEXT NOT NULL DEFAULT ''",
 		"standard_headers": "INTEGER NOT NULL DEFAULT 0",
 		"redirect_http":    "INTEGER NOT NULL DEFAULT 0",
+		// 「局域网出口」：老规则默认 auto（见 proxies.Rule.LANForward）。
+		"lan_forward":  "TEXT NOT NULL DEFAULT 'auto'",
+		"forward_port": "INTEGER NOT NULL DEFAULT 0",
 	}); err != nil {
 		return err
 	}
 	// 记录 schema 版本，后续增量迁移用
-	return s.setMeta(ctx, "schema_version", "2")
+	return s.setMeta(ctx, "schema_version", "3")
 }
 
 // ensureColumns 给已存在的表补齐缺失的列（SQLite 的 ADD COLUMN）。

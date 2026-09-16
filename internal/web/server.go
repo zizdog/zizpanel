@@ -18,6 +18,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/logs"
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
@@ -72,6 +73,15 @@ type Server struct {
 	// （面板重启后"正在安装"本身就是假的，见 SPEC-任务中心.md）。
 	Tasks *tasks.Manager
 
+	// forwarders 是「局域网出口」的回环 TCP 转发器管理器（见 api_proxies.go）。
+	//
+	// 为什么它属于面板而不是 nginx：macOS 15 的「本地网络」隐私门会拦 Homebrew
+	// 的 nginx（ad-hoc 签名，标识随二进制 UUID 变），无头服务器没人点弹窗 →
+	// nginx 连局域网直接 "No route to host"，反代全部 502；而面板自己
+	// （Go、linker-signed）从来没被拦过。所以把局域网出口收回面板：
+	// 转发器在 127.0.0.1 上听，nginx 只连回环。
+	forwarders *proxies.Manager
+
 	// ---- ACME 证书（见 api_certs.go）----
 	//
 	// acmeMgr 惰性构造：构造它要读 DataDir，而绝大多数面板请求用不到证书功能；
@@ -110,6 +120,12 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		static:      sub,
 		startAt:     time.Now(),
 	}
+	// 转发器的解析器走 web 包的可注入变量（proxyLookupHostFn），
+	// 这样单测能把域名解析钉成假数据，绝不碰真实网络。
+	s.forwarders = proxies.NewManager(proxies.ManagerOptions{
+		Logf:       func(format string, args ...any) { s.Log.Warn(format, args...) },
+		LookupHost: func(host string) ([]string, error) { return proxyLookupHostFn(host) },
+	})
 	s.handler = s.routes()
 	return s, nil
 }

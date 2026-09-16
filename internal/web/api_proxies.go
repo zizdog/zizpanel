@@ -51,6 +51,30 @@ func (s *Server) proxyRepo() *proxies.Repository {
 	return proxies.NewRepository(s.Store)
 }
 
+// proxyLookupHostFn 是"目标是公网还是局域网"判定用的 DNS 解析器。
+//
+// 做成变量有两个原因：
+//  1. 单测必须能钉住域名解析结果 —— 否则一次 `go test` 就会去查真实 DNS；
+//  2. 生产里它就是 net.LookupHost，行为与面板其它探测一致。
+//
+// 注意：这里只用于**判定与提示**。真正决定"要不要起转发器"的是
+// Manager.NeedsForward（它用注入到 Manager 里的同一个解析器）。
+var proxyLookupHostFn = net.LookupHost
+
+// proxyProbeTargetFn 是"面板自己能不能直连目标"的探针。
+//
+// 做成变量是为了让 directLANBlockedAdvice 可单测：那条判据要证明
+// "面板连得上、只有 nginx 连不上"，而真去连一个局域网地址在单测里是不允许的。
+var proxyProbeTargetFn = probeTarget
+
+// proxyLANForwardAdvice 是"nginx 直连局域网目标失败"时给用户的话。
+//
+// 必须写清楚三件事：是什么（macOS 15 本地网络授权）、为什么无头服务器救不了
+// （没人点弹窗）、怎么修（改成经面板转发，或手工授权）。写不清就是让用户在
+// 502 面前瞎猜 —— 而这正是这个功能存在的理由。
+const proxyLANForwardAdvice = "nginx 连不上局域网目标（macOS 15 本地网络授权）：无头服务器无法弹窗授权；" +
+	"建议把本规则改为『经面板转发』（推荐），或到 系统设置 → 隐私与安全性 → 本地网络 里给 nginx 授权"
+
 // handleProxyList 列出全部规则，并带上每条规则的实时状态。
 //
 // 状态里最要紧的是 `port_listening`：规则"已启用"不等于 nginx 真的在听
@@ -82,7 +106,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		listening = portListening(ctx, rule.Listen)
 	}
 	host, port, _ := rule.TargetHostPort()
-	reachable, detail := probeTarget(ctx, rule.Target)
+	reachable, detail := proxyProbeTargetFn(ctx, rule.Target)
 	vhost := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
 	_, statErr := os.Stat(vhost)
 	// 域名兜底块是否存在：界面要能看出"域名限制到底有没有生效"，
@@ -90,6 +114,11 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 	reject := filepath.Join(s.Cfg.VhostDir, proxies.RejectVhostName(rule.Listen)+".conf")
 	_, rejectErr := os.Stat(reject)
 	domainGuard := len(proxies.SplitDomains(rule.Domains)) > 0
+
+	// 局域网出口状态：三态 + 是否真的在转发 + 实时连接/流量 + 最近一次转发错误。
+	// 目标是私有网段却在直连时，界面必须显眼提示"可能因 macOS 授权失效而 502"。
+	fwd, fwdListening := s.forwarders.Status(rule.ID)
+	scope := s.forwarders.TargetScope(rule.Target)
 	return map[string]any{
 		"rule":          rule,
 		"id":            rule.ID,
@@ -127,6 +156,21 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"ssl_provider": rule.SSLProvider,
 		"ssl_expires":  rule.SSLExpires,
 		"ssl":          s.proxySSLView(rule),
+		// ---- 局域网出口 ----
+		"lan_forward":          rule.LANForwardMode(),
+		"lan_forward_label":    proxies.LANForwardLabel(rule.LANForwardMode()),
+		"forward_port":         rule.ForwardPort,
+		"forward_active":       fwdListening,
+		"forward_upstream":     fwd.Upstream,
+		"forward_active_conns": fwd.ActiveConns,
+		"forward_total_conns":  fwd.TotalConns,
+		"forward_bytes_in":     fwd.BytesIn,
+		"forward_bytes_out":    fwd.BytesOut,
+		"forward_last_error":   fwd.LastError,
+		"forward_error_count":  fwd.ErrorCount,
+		"target_scope":         string(scope),
+		// 直连 + 局域网目标 = 随时可能被 macOS 隐私门拦成 502。
+		"lan_direct_warning": scope == proxies.ScopePrivate && !fwdListening && rule.Enabled,
 	}
 }
 
@@ -261,6 +305,12 @@ type proxyReq struct {
 	TLSName         *string `json:"tls_name"`
 	StandardHeaders *bool   `json:"standard_headers"`
 	RedirectHTTP    *bool   `json:"redirect_http"`
+
+	// 局域网出口三态：auto / on / off。
+	//
+	// 刻意**不接受** forward_port 输入：它是转发器分配出来的回环端口，
+	// 让前端能随便指定会让 nginx 指向一个没人听的端口（或撞上别的服务）。
+	LANForward *string `json:"lan_forward"`
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -312,6 +362,9 @@ func (req proxyReq) apply(rule *proxies.Rule) {
 	if req.RedirectHTTP != nil {
 		rule.RedirectHTTP = *req.RedirectHTTP
 	}
+	if req.LANForward != nil {
+		rule.LANForward = *req.LANForward
+	}
 	if req.SSLEnabled != nil {
 		rule.SSLEnabled = *req.SSLEnabled
 		// 关闭 HTTPS 时把证书字段一并清空：留着旧路径会让"已关闭"的规则
@@ -357,8 +410,25 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 先起回环转发器（如果需要），再生成 nginx 配置：proxy_pass 里的端口是
+	// 转发器分配出来的，顺序反了就会写成一个没人听的端口。
+	if err := s.syncForwarder(created); err != nil {
+		s.forwarders.Stop(created.ID)
+		_ = s.proxyRepo().Delete(r.Context(), created.ID)
+		fail(w, http.StatusBadGateway, "规则已保存但回环转发器无法启动："+err.Error())
+		return
+	}
+	if created.ForwardPort > 0 {
+		if err := s.proxyRepo().SetForwardPort(r.Context(), created.ID, created.ForwardPort); err != nil {
+			s.forwarders.Stop(created.ID)
+			_ = s.proxyRepo().Delete(r.Context(), created.ID)
+			fail(w, http.StatusInternalServerError, "回环转发端口落库失败："+err.Error())
+			return
+		}
+	}
 	if err := s.applyProxy(r.Context(), created); err != nil {
 		// 配置写不进去就把记录删掉，避免留下一条"看着在、其实没生效"的规则
+		s.forwarders.Stop(created.ID)
 		_ = s.proxyRepo().Delete(r.Context(), created.ID)
 		fail(w, http.StatusBadGateway, "规则已保存但 nginx 配置应用失败："+err.Error())
 		return
@@ -413,6 +483,12 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 	// 先按新配置写盘（含 nginx -t 校验、失败回滚），成功后才更新数据库 ——
 	// 反过来的话，配置写失败会留下"数据库说已改、文件还是旧的"的不一致。
 	next.ID = cur.ID
+	// 转发器先对齐（起/停/换目标；含不需要转发时把 ForwardPort 清 0），
+	// 这样紧接着生成的 proxy_pass 才会用对端口。
+	if err := s.syncForwarder(&next); err != nil {
+		fail(w, http.StatusBadGateway, "回环转发器无法启动（配置未改动）："+err.Error())
+		return
+	}
 	// SSL 开关切换时，该端口的域名兜底块必须先进入"带证书的中性形态"，
 	// 否则中间态会被 nginx 判成 [emerg]（见 stabilizeProxyReject）。
 	if next.SSLEnabled != cur.SSLEnabled && next.Enabled {
@@ -421,12 +497,14 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 			cert, key = cur.SSLCert, cur.SSLKey
 		}
 		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cert, key); err != nil {
+			_ = s.syncForwarder(cur) // 转发器退回旧状态
 			fail(w, http.StatusBadGateway, "切换 HTTPS 时调整域名兜底块失败："+err.Error())
 			return
 		}
 	}
 	if err := s.applyProxy(r.Context(), &next); err != nil {
 		_ = s.applyProxy(r.Context(), cur)  // 回滚成旧配置
+		_ = s.syncForwarder(cur)            // 转发器也跟着回滚（含端口）
 		_ = s.syncRejectBlocks(r.Context()) // 兜底块也回到数据库描述的状态
 		fail(w, http.StatusBadGateway, "应用新配置失败（已回滚）："+err.Error())
 		return
@@ -471,6 +549,8 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 规则没了，回环监听器也必须跟着消失：留着就是"删了规则却还开着端口"。
+	s.forwarders.Stop(id)
 	detail := fmt.Sprintf("%d → %s", cur.Listen, cur.Target)
 	if err := s.syncRejectBlocks(r.Context()); err != nil {
 		s.rejectGuardFailed(w, r, "proxy_delete", cur.Name,
@@ -520,7 +600,14 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusConflict, err.Error())
 			return
 		}
+		// 启用时先起转发器（可能在停用期间被停掉了），再写配置。
+		if err := s.syncForwarder(&next); err != nil {
+			fail(w, http.StatusBadGateway, "启动回环转发器失败："+err.Error())
+			return
+		}
 		if err := s.applyProxy(r.Context(), &next); err != nil {
+			// 配置没写成 → 转发器也不能留着（否则会有一个监听器对应一条"没启用"的规则）
+			s.forwarders.Stop(next.ID)
 			fail(w, http.StatusBadGateway, "启用失败："+err.Error())
 			return
 		}
@@ -529,6 +616,8 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusBadGateway, "停用失败："+err.Error())
 			return
 		}
+		// 停用就关掉监听器（ForwardPort 保留，重新启用时复用同一个端口）。
+		s.forwarders.Stop(next.ID)
 	}
 	saved, err := repo.Update(r.Context(), &next)
 	if err != nil {
@@ -773,6 +862,11 @@ func (s *Server) handleProxySSL(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, "调整域名兜底块失败："+err.Error())
 		return
 	}
+	// 证书操作会重写整份 vhost，这里顺手确认转发器还在（幂等，通常零成本）。
+	if err := s.syncForwarder(&next); err != nil {
+		fail(w, http.StatusBadGateway, "回环转发器无法启动："+err.Error())
+		return
+	}
 	if err := s.applyProxy(r.Context(), &next); err != nil {
 		_ = s.syncRejectBlocks(r.Context()) // 兜底块回到数据库描述的状态
 		fail(w, http.StatusBadGateway, "证书已就绪，但 nginx 配置应用失败（未生效）："+err.Error())
@@ -841,6 +935,10 @@ func (s *Server) handleProxySSLDisable(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if next.Enabled {
+		if err := s.syncForwarder(&next); err != nil {
+			fail(w, http.StatusBadGateway, "回环转发器无法启动："+err.Error())
+			return
+		}
 		if err := s.applyProxy(r.Context(), &next); err != nil {
 			_ = s.applyProxy(r.Context(), cur)  // 回滚成仍启用 SSL 的配置
 			_ = s.syncRejectBlocks(r.Context()) // 兜底块也回到数据库描述的状态
@@ -1103,6 +1201,21 @@ func proxyProbeServed(p proxyProbe, listen int) bool {
 
 // describeProxyProbe 给复核失败一个可读的现场描述。
 func describeProxyProbe(p proxyProbe, rule *proxies.Rule) string {
+	msg := describeProxyProbePlain(p, rule)
+	code := strings.TrimSpace(p.code)
+	if code == "502" || code == "504" {
+		if directToLAN(rule) {
+			// 这是 macOS 15「本地网络」隐私门的典型症状：nginx 连不上局域网，
+			// 而面板（Go、linker-signed）能连上。把"是什么 + 怎么修"写在错误里。
+			msg += "。" + proxyLANForwardAdvice
+		}
+	}
+	return msg
+}
+
+// describeProxyProbePlain 是不含"局域网授权"建议的现场描述（供已经自己拼
+// 建议文案的调用方使用，避免同一句话出现两遍）。
+func describeProxyProbePlain(p proxyProbe, rule *proxies.Rule) string {
 	code := strings.TrimSpace(p.code)
 	if code == "" || code == "000" {
 		if p.err != nil {
@@ -1117,6 +1230,21 @@ func describeProxyProbe(p proxyProbe, rule *proxies.Rule) string {
 		return "HTTP " + code + "（nginx 已命中该反代规则，但目标 " + rule.Target + " 没响应）"
 	}
 	return "HTTP " + code
+}
+
+// directToLAN 判断"这条规则是 nginx 直连模式、且目标是局域网地址"。
+//
+// 只在 502/504 的诊断路径上调用：它可能需要一次 DNS 解析，而失败现场本来
+// 就没有性能要求。解析不了按私有处理（与 lan_forward=auto 的语义一致）。
+func directToLAN(rule *proxies.Rule) bool {
+	if rule == nil || rule.Forwarding() {
+		return false
+	}
+	host, _, err := rule.TargetHostPort()
+	if err != nil {
+		return false
+	}
+	return proxies.ClassifyTarget(host, proxyLookupHostFn) == proxies.ScopePrivate
 }
 
 // proxyServeCheck 是一次"规则是否真的生效"复核的完整证据。
@@ -1190,7 +1318,44 @@ func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) e
 	if err := s.verifyProxyTLSServed(ctx, rule); err != nil {
 		return err
 	}
+	// 配置确实生效了，但"生效"不等于"能用"：nginx 返回 502/504 说明它连不上上游。
+	// 直连模式 + 局域网目标 + **面板自己能连上** ⇒ 这不是上游挂了，而是
+	// macOS 15 的本地网络隐私门只拦了 nginx。这时必须明确报错并给出修法，
+	// 否则用户只会看到一个"已生效"的规则和一个永远 502 的页面。
+	if advice := s.directLANBlockedAdvice(ctx, rule, chk.Probe); advice != "" {
+		return errors.New(advice)
+	}
 	return s.verifyProxyDomainGuard(ctx, rule)
+}
+
+// directLANBlockedAdvice 在"只可能是 macOS 本地网络授权把 nginx 拦了"时返回诊断文本。
+//
+// 判据（缺一不可，避免把"上游本身没起来"误诊成授权问题）：
+//  1. 规则是 nginx 直连模式（没有走面板转发）；
+//  2. 探测拿到 502/504（nginx 命中了规则但连不上上游）；
+//  3. 目标是私有/链路本地地址；
+//  4. 面板自己能直连目标 —— 面板从不受这道门限制，所以这条硬证据说明
+//     "只有 nginx 连不上"，而不是服务没起。
+func (s *Server) directLANBlockedAdvice(ctx context.Context, rule *proxies.Rule, p proxyProbe) string {
+	if rule == nil || rule.Forwarding() {
+		return ""
+	}
+	code := strings.TrimSpace(p.code)
+	if code != "502" && code != "504" {
+		return ""
+	}
+	if _, _, err := rule.TargetHostPort(); err != nil {
+		return ""
+	}
+	if s.forwarders.TargetScope(rule.Target) != proxies.ScopePrivate {
+		return ""
+	}
+	if ok, _ := proxyProbeTargetFn(ctx, rule.Target); !ok {
+		return "" // 面板也连不上 → 上游本身没起来，交给 target_ok 展示
+	}
+	return fmt.Sprintf("规则「%s」的配置已写入并被 nginx 加载，但请求 127.0.0.1:%d%s 得到 %s —— "+
+		"面板自己可以直连 %s，只有 nginx 连不上。%s",
+		rule.Name, rule.Listen, proxyProbePath(rule), describeProxyProbePlain(p, rule), rule.Target, proxyLANForwardAdvice)
 }
 
 // ---- HTTPS 复核：真实取回对端证书 ----
@@ -1394,6 +1559,71 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	}
 	// **写盘之后、reload 之前**把日志树交还真实用户，并在 reload 后做请求级复核。
 	return s.reloadProxyAndVerify(ctx, rule)
+}
+
+// syncForwarder 让一条规则的回环转发器与当前配置对齐，并把分配到的端口写回
+// rule.ForwardPort。
+//
+// **必须在 applyProxy / Generate 之前调用**：生成的 proxy_pass 用的是
+// rule.ForwardPort，而端口由管理器分配（优先复用数据库里的旧值，重启后
+// nginx 配置才不会指向一个没人听的端口）。
+//
+// 不需要转发（off / 公网 / 回环目标）时它会停掉监听器并把 ForwardPort 清 0，
+// 渲染随之退回直连 —— 这样"关掉转发"是真的关掉，而不是留个半死不活的监听器。
+func (s *Server) syncForwarder(rule *proxies.Rule) error {
+	if rule == nil {
+		return nil
+	}
+	if !rule.Enabled {
+		s.forwarders.Stop(rule.ID)
+		return nil
+	}
+	if _, err := s.forwarders.Ensure(rule); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reconcileForwarders 在面板启动时把转发器对齐到数据库里的规则。
+//
+// 三件事：
+//  1. 该起的起（enabled 且需要转发）、该停的停（停用/删除/不再需要转发）；
+//  2. 端口分配结果落库（重启后优先复用同一个端口）；
+//  3. 端口变了就重写对应 vhost —— 否则 nginx 里的 proxy_pass 会指向旧端口，
+//     表现为"转发器起来了、规则却是 502"。
+func (s *Server) reconcileForwarders(ctx context.Context) {
+	list, err := s.proxyRepo().List(ctx)
+	if err != nil {
+		s.Log.Warn("读取反向代理规则失败，跳过回环转发器对齐: %v", err)
+		return
+	}
+	changed := s.forwarders.Reconcile(list)
+	if len(changed) == 0 {
+		return
+	}
+	changedSet := make(map[int64]bool, len(changed))
+	for _, id := range changed {
+		changedSet[id] = true
+	}
+	for _, rule := range list {
+		if !changedSet[rule.ID] {
+			continue
+		}
+		if err := s.proxyRepo().SetForwardPort(ctx, rule.ID, rule.ForwardPort); err != nil {
+			s.Log.Warn("保存规则 %d 的回环转发端口失败: %v", rule.ID, err)
+		}
+		if !rule.Enabled {
+			continue
+		}
+		if err := s.applyProxy(ctx, rule); err != nil {
+			// nginx 没装/没起来时不要让整个启动失败：转发器已经起了，
+			// 下一次保存规则会重新写 vhost。如实记一笔。
+			s.Log.Warn("回环转发端口变化后重写规则 %d 的 nginx 配置失败: %v", rule.ID, err)
+		}
+	}
+	if len(changed) > 0 {
+		s.Log.Info("已对齐回环转发器：%d 条规则的端口有变化", len(changed))
+	}
 }
 
 // removeProxyConfig 移除一条规则的配置文件并 reload。
