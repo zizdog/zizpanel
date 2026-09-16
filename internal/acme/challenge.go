@@ -162,6 +162,44 @@ func restoreEnv(saved []savedEnvVar) {
 	}
 }
 
+// envDisableCNAME 是 lego 用来关掉"跟随 CNAME 委派"的环境变量。
+//
+// 2026-09-16 真机故障（mini，用户域名 zizdog.com）：该域有泛解析
+// `* CNAME lede.zizdog.com`，lego 于是把挑战 TXT 写到 CNAME 目标
+// `lede.zizdog.com` 上，而 **Let's Encrypt 不跟随由泛解析产生的 CNAME** ——
+// 它直接查 `_acme-challenge.<域名>`，那里什么都没有，于是报
+// `urn:ietf:params:acme:error:unauthorized :: No TXT record found at ...`，
+// 而面板日志里显示的是"记录已提交"，看起来像是 DNS 没生效，极难排查。
+// 关掉跟随之后 TXT 写在挑战名本身上；**显式记录会覆盖泛解析 CNAME**
+// （真机验证：权威 NS 会正常返回该 TXT）。
+const envDisableCNAME = "LEGO_DISABLE_CNAME_SUPPORT"
+
+// applyCNAMEPolicy 决定本次 dns-01 是否跟随 CNAME 委派，返回还原函数。
+//
+// 默认**不跟随**：泛解析 CNAME 在 Let's Encrypt 侧本来就无效，跟随只会把记录
+// 写到 CA 不看的地方，失败信息还误导人。真正要做 CNAME 委派的用户
+// （把 `_acme-challenge` 显式指到另一个区/另一套工具）把 Manager.DNS01FollowCNAME
+// 设为 true 即可。
+func (m *Manager) applyCNAMEPolicy() func() {
+	if m.DNS01FollowCNAME {
+		m.emit("dns-01：按配置跟随 CNAME 委派（TXT 会写到 CNAME 的目标名上）")
+		return func() {}
+	}
+	prev, had := os.LookupEnv(envDisableCNAME)
+	if err := os.Setenv(envDisableCNAME, "1"); err != nil {
+		// 设置失败时不假装成功：如实告警，让用户知道本次会按 lego 默认跟随 CNAME。
+		m.emit("警告：无法设置 %s（%v），本次将按 lego 默认跟随 CNAME", envDisableCNAME, err)
+		return func() {}
+	}
+	return func() {
+		if had {
+			_ = os.Setenv(envDisableCNAME, prev)
+		} else {
+			_ = os.Unsetenv(envDisableCNAME)
+		}
+	}
+}
+
 // validateEnvKey 校验环境变量名，避免奇怪键名被透传给 os.Setenv。
 func validateEnvKey(k string) error {
 	if strings.TrimSpace(k) == "" {

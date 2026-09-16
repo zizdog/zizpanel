@@ -142,6 +142,10 @@ type Manager struct {
 	// 为什么不许写主机名：lego 默认值就是主机名，解析它要走系统解析器，
 	// 在"路由器通告了不可达 IPv6 DNS"的网络里会让签发直接 i/o timeout（真机踩过）。
 	DNS01Resolvers []string
+	// DNS01FollowCNAME 为 true 时按 lego 默认行为**跟随** CNAME 委派
+	// （把 TXT 写到 CNAME 目标上）。默认 false：泛解析 CNAME 会让 TXT 写到
+	// CA 不看的地方，必然以 "No TXT record found" 失败（真机踩过，见 challenge.go）。
+	DNS01FollowCNAME bool
 	// EABKid / EABHmacKey 是 External Account Binding 凭据。
 	// ZeroSSL 这类 CA 强制要求 EAB，没有它注册账户会被拒。
 	EABKid     string

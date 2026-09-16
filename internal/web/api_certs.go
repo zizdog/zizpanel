@@ -298,7 +298,7 @@ func (s *Server) handleCertsIssue(w http.ResponseWriter, r *http.Request) {
 					log(tasks.LevelOut, "已使用服务端保存的 ZeroSSL EAB 凭据")
 				}
 			}
-			cert, err := s.certManagerWithCreds(eabKid, eabHMAC).Issue(ctx, issueReq)
+			cert, err := s.certManagerForIssue(eabKid, eabHMAC, log).Issue(ctx, issueReq)
 			if err != nil {
 				log(tasks.LevelErr, "申请失败: "+err.Error())
 				return nil, err
@@ -355,6 +355,27 @@ func (s *Server) certManagerWithCreds(eabKid, eabHMAC string) acmeManager {
 	}
 	m := acme.New(s.Cfg.DataDir, s.acmeHTTP01WebRoot(), func(msg string) {
 		s.Log.Info("[acme] %s", msg)
+	})
+	m.RenewalDays = certRenewThresholdDays
+	m.EABKid, m.EABHmacKey = eabKid, eabHMAC
+	return m
+}
+
+// certManagerForIssue 返回本次签发专用的引擎实例，并把引擎日志**同时**送进任务中心。
+//
+// 为什么必须进任务中心：TXT 记录到底有没有写进 DNS、正在等传播、还是被 CA 拒绝，
+// 只有引擎日志里有。2026-09-16 排查 dns-01 失败时，任务窗口只显示"申请失败"，
+// 真正有用的两行（"正在为 … 写入 TXT 记录"、"记录已提交，等待 DNS 解析生效"）
+// 只进了面板日志 —— 用户看任务中心根本看不到，只能登机器翻日志。
+// 这里按需新建实例（引擎无状态，见 certManagerWithCreds 的说明），
+// 不把任务级 logger 设到共享实例上。
+func (s *Server) certManagerForIssue(eabKid, eabHMAC string, log tasks.LogFunc) acmeManager {
+	if s.acmeOverride != nil {
+		return s.acmeOverride
+	}
+	m := acme.New(s.Cfg.DataDir, s.acmeHTTP01WebRoot(), func(msg string) {
+		s.Log.Info("[acme] %s", msg)
+		log(tasks.LevelStep, msg)
 	})
 	m.RenewalDays = certRenewThresholdDays
 	m.EABKid, m.EABHmacKey = eabKid, eabHMAC

@@ -238,6 +238,10 @@ func (m *Manager) legoObtain(ctx context.Context, plan issuePlan) (*obtainedCert
 		// 凭据以进程环境变量的形式注入（lego provider 只从环境变量读），
 		// 签发结束必须还原，避免污染面板进程的其它逻辑。
 		defer restore()
+		// 默认不跟随 CNAME：泛解析 `* CNAME target` 会把 TXT 写到 target 上，
+		// 而 Let's Encrypt 不跟随泛解析 CNAME → 必然 "No TXT record found"。
+		restoreCNAME := m.applyCNAMEPolicy()
+		defer restoreCNAME()
 		// 预检用的递归解析器必须显式给 IPv4 字面量：lego 的默认值是
 		// google-public-dns-a.google.com:53 这种主机名，解析它要走系统解析器，
 		// 而路由器通告的 IPv6 DNS 一旦不可达，整条签发就挂在 i/o timeout 上
