@@ -102,6 +102,10 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"websocket":      rule.Websocket,
 		"enabled":        rule.Enabled,
 		"remark":         rule.Remark,
+		// 列表/编辑表单要能读回这两个字段（漏了会让"编辑规则"把已保存的
+		// SNI 与常用请求头开关悄悄清掉）。
+		"tls_name":         rule.TLSName,
+		"standard_headers": rule.StandardHeaders,
 		"created_at":     rule.Created,
 		"updated_at":     rule.Updated,
 		"port_listening": listening,
