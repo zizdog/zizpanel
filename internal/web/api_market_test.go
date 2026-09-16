@@ -80,6 +80,53 @@ func TestMarketUsesRealBrewLabel(t *testing.T) {
 	}
 }
 
+// TestMarketCardMatchesPanelRecordForRealMachineApps 锁住"卡片已安装 ↔ 任务说已安装"的一致性。
+//
+// 真机（2026-09-16）就是这里对不上：卡片按面板记录显示「已安装」，
+// 用户再点一次安装，任务却以 failed 结束（端口被自己占用 / 服务名已存在）。
+// 现在安装任务会走幂等分支返回「已安装（跳过）」；这条测试确保卡片的
+// installed 判定仍然是"有面板记录就算已安装"，两端不会再互相矛盾。
+//
+// 用真机上那 8 个应用的**原始记录名**复刻现场（nginx/mysql 的记录名是标签
+// 归一化出来的，PHP 的记录名就是目录 ID）。
+func TestMarketCardMatchesPanelRecordForRealMachineApps(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	repo := services.NewRepository(srv.Store)
+	records := []struct {
+		name  string
+		label string
+		kind  services.Kind
+	}{
+		{"homebrew-mxcl-nginx", "homebrew.mxcl.nginx", services.KindNative},
+		{"sh-brew-mysql8-4", "sh.brew.mysql@8.4", services.KindNative},
+		{"ollama", "homebrew.mxcl.ollama", services.KindNative},
+		{"uptime-kuma", "", services.KindCompose},
+		{"php81", "homebrew.mxcl.php@8.1", services.KindNative},
+		{"php83", "homebrew.mxcl.php@8.3", services.KindNative},
+	}
+	for _, r := range records {
+		if err := repo.Create(t.Context(), &services.Service{
+			Name: r.name, DisplayName: r.name, Kind: r.kind, LaunchLabel: r.label, Managed: true,
+		}); err != nil {
+			t.Fatalf("准备记录 %s 失败: %v", r.name, err)
+		}
+	}
+
+	for _, id := range []string{"nginx", "mysql84", "ollama", "uptime-kuma", "php81", "php83"} {
+		it := marketItem(t, ts, cookies, id)
+		if it["installed"] != true {
+			t.Errorf("%s 有面板记录，市场卡片必须显示已安装"+
+				"（否则会出现「卡片说没装、任务说已装」的矛盾）：%v", id, it["installed"])
+		}
+		if it["adopted"] != true {
+			t.Errorf("%s 已登记，市场必须显示已纳管，实际 %v", id, it["adopted"])
+		}
+	}
+}
+
 // TestMarketDetectsOrphanInstall 第 6 项：安装产物还在、服务没注册。
 //
 // 这种"孤儿态"以前既不在服务管理里，也不给纳管按钮（因为 installed=false），

@@ -63,6 +63,20 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		return m.AdoptApp(ctx, appID)
 	}
 
+	// 幂等：已经装过的应用再点一次「安装」，必须是"已安装（跳过）"这种良性终态，
+	// 而不是 failed。真机（2026-09-16）的 8 个失败场景（nginx / mysql84 / ollama /
+	// uptime-kuma 的"端口被自己占用"、php81-84 的"服务名已存在"）都是这一条。
+	// 判定与提示见 install_idempotent.go。
+	//
+	// 只对**这个函数真正会安装的那两类**生效（brew 原生 / compose）：
+	// 纳管类、面板安装器类、一键建站类在 web 层已经分流，不该被这里的判定
+	// 改变它们的语义（例如 WordPress 走到这里是"暂不支持自动安装"）。
+	if (app.Kind == KindNative && app.BrewFormula != "") || app.Kind == KindCompose {
+		if res, done := m.installedSkipResult(ctx, app); done {
+			return res, nil
+		}
+	}
+
 	// 先做预检查：避免装到一半才发现缺依赖
 	pf := m.Preflight(ctx, app)
 	if !pf.Ready {
@@ -122,10 +136,13 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		svc.ComposeFile = res.Service.ComposeFile
 	}
 
-	if err := m.repo.Create(ctx, svc); err != nil {
+	// 写入注册表。同名记录已存在且就是这个应用时按幂等成功处理 ——
+	// 不再报"服务已安装但写入注册表失败: 服务名 php83 已存在"（真机 4 个 PHP 版本）。
+	stored, err := m.registerAppService(ctx, app, svc)
+	if err != nil {
 		return nil, fmt.Errorf("服务已安装但写入注册表失败: %w", err)
 	}
-	res.Service = svc
+	res.Service = stored
 
 	// MySQL 的 root 凭据闭环（限时询问 → 随机 → 写回面板配置 → 自检）。
 	//

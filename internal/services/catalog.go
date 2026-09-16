@@ -229,6 +229,13 @@ type Preflight struct {
 	Checks   []CheckResult `json:"checks"`
 	PortFree bool          `json:"port_free"`
 	PortNote string        `json:"port_note"`
+	// AlreadyInstalled 表示"这个应用已经装好了"：注册表里有它的记录，
+	// 或者它的端口正被它自己的服务占用。界面据此把按钮显示成"已安装"，
+	// 而不是给出一个点下去只会被跳过的「安装」。
+	//
+	// 为什么单独一个字段：端口被自己占用时 PortFree 是 true、PortNote 也不是
+	// 冲突描述，只看这两个字段分不清"端口空闲"与"已安装"。
+	AlreadyInstalled bool `json:"already_installed"`
 }
 
 // CheckResult 是单条检查结果。
@@ -1022,6 +1029,19 @@ func FindApp(id string) (App, bool) {
 	return App{}, false
 }
 
+// checkPort 探测端口占用。
+//
+// 抽成方法是为了**可测试**：默认实现会执行真实的 lsof，而单测不该依赖
+// "测试机上恰好有东西在听某个端口"（结论会随机器变）。测试通过
+// m.portCheckOverride 注入假实现（与 mirrorProbeOverride 同一个理由）。
+func (m *Manager) checkPort(port int) (priv.PortInfo, error) {
+	if m.portCheckOverride != nil {
+		inUse, holders, err := m.portCheckOverride(port)
+		return priv.PortInfo{Port: port, InUse: inUse, Holders: holders}, err
+	}
+	return priv.CheckPort(strconv.Itoa(port))
+}
+
 // Preflight 检查一个应用能否安装。
 //
 // 为什么必须做预检查：用户点了"安装"再等几分钟才发现缺 Docker / 缺 brew，
@@ -1046,19 +1066,40 @@ func (m *Manager) Preflight(ctx context.Context, app App) Preflight {
 		return pf
 	}
 
+	// 已经有面板记录 → 这不是"待安装"，而是"已经装过了"。
+	// 界面据此把它显示成"已安装（跳过）"，与安装任务的终态保持一致。
+	if m.installedRecordFor(ctx, app) != nil {
+		pf.AlreadyInstalled = true
+	}
+
 	// 端口占用检查
 	if app.Port > 0 {
-		if info, err := priv.CheckPort(strconv.Itoa(app.Port)); err == nil {
+		if info, err := m.checkPort(app.Port); err == nil {
 			if info.InUse {
-				// 已被本面板管理的服务占用不算冲突
-				names, _ := m.repo.CountByPort(ctx, app.Port, "")
-				if len(names) > 0 {
-					pf.PortFree = false
-					pf.PortNote = fmt.Sprintf("端口 %d 已被面板管理的服务占用：%s", app.Port, strings.Join(names, ", "))
+				// 占用者是不是**这个应用自己**的服务？
+				//
+				// 这是 2026-09-16 真机上 4 个"重复安装报 failed"的直接成因：
+				// nginx(80) / mysql84(3306) / ollama(11434) / uptime-kuma(3001)
+				// 本来就在跑、端口被它自己占着，旧代码却一律判成冲突。
+				// 自己占自己的端口不是冲突，是"已安装"。
+				//
+				// 真冲突（占用者是别的服务/进程）仍然失败，并点名占用者 ——
+				// 见下面的两个分支，行为与过去一致。
+				if self := m.selfPortOccupiers(ctx, app); len(self) > 0 {
+					pf.PortFree = true
+					pf.AlreadyInstalled = true
+					pf.PortNote = fmt.Sprintf("端口 %d 已被本应用自己的服务占用（%s）——已经装过了，不会重复安装",
+						app.Port, strings.Join(self, ", "))
 				} else {
-					pf.PortFree = false
-					pf.PortNote = fmt.Sprintf("端口 %d 已被其它进程占用：%s",
-						app.Port, strings.Join(info.Holders, ", "))
+					names, _ := m.repo.CountByPort(ctx, app.Port, "")
+					if len(names) > 0 {
+						pf.PortFree = false
+						pf.PortNote = fmt.Sprintf("端口 %d 已被面板管理的服务占用：%s", app.Port, strings.Join(names, ", "))
+					} else {
+						pf.PortFree = false
+						pf.PortNote = fmt.Sprintf("端口 %d 已被其它进程占用：%s",
+							app.Port, strings.Join(info.Holders, ", "))
+					}
 				}
 			} else {
 				pf.PortFree = true
@@ -1080,7 +1121,8 @@ func (m *Manager) Preflight(ctx context.Context, app App) Preflight {
 			pf.Ready = false
 		}
 	}
-	// 端口冲突但冲突方是面板管理的服务时，视为可安装（用户可以改端口）
+	// 真端口冲突（占用者是别的服务/进程）不可安装，错误里会点名占用者。
+	// "被自己占用"在上面已经判成 PortFree=true + AlreadyInstalled=true，不会到这里。
 	if !pf.PortFree {
 		pf.Ready = false
 	}

@@ -145,6 +145,11 @@ type Manager struct {
 	// 每个 install …），而一次 LNMP 安装有几十次调用。每次探测最多 4 秒 × 3 个候选，
 	// 加起来就是用户感受到的"怎么这么慢" —— 而且这是在**安装之前**白白等掉的。
 	mirrorProbeCache map[string]string
+	// portCheckOverride 仅供测试：替换 lsof 端口探测，返回"是否占用 + 占用者"。
+	//
+	// 没有它，"端口被别的进程占用"这条分支只能依赖测试机上恰好有东西在听 ——
+	// 结论随机器而变，而且真的去查了系统端口（违反"单测不许碰真实服务"）。
+	portCheckOverride func(port int) (inUse bool, holders []string, err error)
 	// depExecOverride 仅供测试：替换"基础依赖能否真的跑起来"的执行动作。
 	// 没有它，VerifyBaseDependencies 的单测会去执行测试机上真实的 ffmpeg，
 	// 结论随机器而变（见 basedep.go）。

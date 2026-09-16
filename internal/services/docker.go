@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -840,9 +841,23 @@ func (d *composeDriver) run(ctx context.Context, timeout time.Duration, args ...
 	}
 	// compose 的镜像层进度是逐行输出的，必须流式 ——
 	// 「正在拉取镜像」这一句话对用户毫无信息量，层进度才是真实进展。
+	started := time.Now()
 	out, err := streamCmd(ctx, cmd)
 	if err != nil {
-		return out, fmt.Errorf("compose 命令失败: %s", truncate(strings.TrimSpace(out), 400))
+		// 必须把**失败原因**写出来。曾经这里只贴最后 400 字节层进度，
+		// 于是"拉镜像超过 20 分钟被中止"在任务里显示成一句看不出所以然的
+		// "compose 命令失败: … Downloading 128MB"，用户会以为是镜像本身有问题
+		// （2026-09-16 mini 真机：n8n / stirling-pdf 恰好都在 ~1202s 失败）。
+		reason := err.Error()
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			reason = fmt.Sprintf("超过 %s 上限被中止（镜像层没拉完；可稍后重试，或先手动 docker pull 提高命中率）",
+				timeout)
+		case errors.Is(ctx.Err(), context.Canceled):
+			reason = "任务被取消"
+		}
+		return out, fmt.Errorf("compose 命令失败（用时 %s，%s）: %s",
+			time.Since(started).Round(time.Second), reason, truncate(strings.TrimSpace(out), 400))
 	}
 	return out, nil
 }
