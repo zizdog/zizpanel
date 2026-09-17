@@ -9,6 +9,7 @@ import {
   levelOf, Sparkline, $,
 } from './ui.js';
 import { state, NAV, panelPath } from './app.js';
+import { taskCenter } from './tasks.js';
 
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
@@ -122,6 +123,7 @@ export function DashboardView(content, ctx = {}) {
       return;
     }
     clear(svcBody);
+    checkBaseEnv(list);
     if (!list.length) {
       svcBody.append(h('div.empty', [
         h('div.big', { text: '⚙️' }),
@@ -152,12 +154,78 @@ export function DashboardView(content, ctx = {}) {
     );
   }
 
+  // ---------- 基础环境未安装的一次性引导 ----------
+  //
+  // 为什么放在仪表盘最上面、而且必须有：安装器现在**什么都不问**（用户逐条要求：
+  // 账号/后缀/SSH/内网预授权/端口全部移出安装流程），于是"网站管理需要
+  // nginx + PHP + MySQL"这件事必须在面板里主动说一次 —— 否则用户第一次进来
+  // 看到的是一个"什么都不能干"的面板（真机反馈原话："第一次进入面板，并没有提示我安装基础环境？"）。
+  //
+  // 刻意**不做硬门禁**：镜像不可用时不让人进门，比不提示更糟。所以是"提示 + 一键装 + 稍后"。
+  const baseEnvNotice = h('div');
+  function baseEnvReady() {
+    // 只认"用户点了稍后"这一个持久标记。
+    // 刻意**不再缓存"已就绪"**：服务列表每次进仪表盘都要拉，判定本身零成本；
+    // 而缓存会把"这次读不到数据"当成"已就绪"永久跳过提示（第一版就这么坑了自己）。
+    return localStorage.getItem('zp-baseenv-dismissed') === '1';
+  }
+  function startBaseEnv() {
+    taskCenter.start({
+      kind: 'install',
+      // target 与后端任务保持一致（POST /api/v1/market/install-lnmp → 202 + task_id），
+      // 这样「任务中心」能按同一个值找到运行中的任务（见 sites.js 的同款用法）。
+      target: 'lnmp',
+      title: '一键 LNMP（基础环境）',
+      start: () => api.installLNMP(),
+    });
+    baseEnvNotice.replaceChildren();
+  }
+  function renderBaseEnvNotice() {
+    baseEnvNotice.append(h('div.card', {
+      style: { borderLeft: '4px solid #e6a23c', marginBottom: '14px' },
+    }, [
+      h('div.card-body', [
+        h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 基础环境还没安装' }),
+        h('div.hint', {
+          text: '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。'
+            + '点右边按钮会先自动装好「命令行开发者工具 + Homebrew」（走国内镜像，不弹 Apple 的窗口），'
+            + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。',
+        }),
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('button.btn.btn-primary', { text: '⚡ 安装基础环境（一键 LNMP）', onclick: startBaseEnv }),
+          h('button.btn.btn-sm', {
+            text: '稍后',
+            title: '也可以在「应用 → 基础环境」里自己挑着装',
+            onclick: () => {
+              localStorage.setItem('zp-baseenv-dismissed', '1');
+              baseEnvNotice.replaceChildren();
+            },
+          }),
+        ]),
+      ]),
+    ]));
+  }
+  function checkBaseEnv(services) {
+    if (baseEnvReady()) return;
+    // 判定口径：服务记录里**有** nginx / PHP / MySQL 之一就算装过基础环境。
+    // 用仪表盘**已经在拉**的服务列表判断（不额外请求 /market —— 那个接口在全新机器上
+    // 要逐条探测，实测能让首屏多等十几秒，而提示不该拖慢仪表盘）。
+    const baseRe = /^(nginx|php|mysql|mariadb|percona)/i;
+    const hasBase = (services || []).some((s) => baseRe.test(String(s.name || ''))
+      || baseRe.test(String(s.display_name || '')));
+    if (hasBase) return;   // 已装过：什么都不显示（下次进来重新判断，不缓存）
+    renderBaseEnvNotice();
+  }
+
   content.append(
+    baseEnvNotice,
     topGrid,
     h('div.grid.grid-2', [sysCard, charts]),
     procCard,
     servicesCard,
   );
+
+
 
   // ---------- 服务状态与数据更新 ----------
   loadServices();

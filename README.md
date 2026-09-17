@@ -12,7 +12,7 @@ macOS 上的网站与服务管理面板（类宝塔），原生支持 Apple Sili
 curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 ```
 
-安装过程**只问两件事**：**监听端口**（默认 8443）与一句安装确认。
+安装过程**不问任何配置**：监听端口默认 **8443**，你只需要在"确认安装"那一步回车（`ZP_YES=1` 则完全不问）。
 **管理员账号、面板路径后缀、SSH、内网预授权都不在安装期问** —— 它们都在面板里点一下就能做，
 而且账号与后缀本来就是"面板首次访问时设置 / 系统设置里随时改"的东西：
 
@@ -34,7 +34,7 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 | 时机 | 你会看到 | 怎么做 |
 |---|---|---|
-| 安装脚本问你端口 | 终端里唯一的技术提问 | 直接回车 = 8443；想换端口就输入 |
+| 想换监听端口 | 安装器默认 8443、不提问 | 装之前给 `ZP_PORT=9000`；装之后改 `/opt/zizpanel/data/config.json` 的 `listen` 再 `sudo launchctl kickstart -k system/cn.zizpanel.panel`（运行中改端口会失联，所以设置页不提供该开关） |
 | 浏览器提示证书不受信任 | 「您的连接不是私密连接」 | 点「继续前往」即可；想彻底消除见「五、证书」 |
 | 需要 CLI/开发工具链（CLT）时 | 在面板「基础环境」里点安装 | 面板走**镜像整包**静默安装（632MB 分片），不会弹 Apple 的对话框 |
 
@@ -47,7 +47,7 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 | 参数 / 变量 | 说明 |
 |---|---|
 | `ZP_USER` / `ZP_PASS` | 管理员用户名 / 登录口令（**安装期建账号用，可选**；不设则留给面板初始化向导） |
-| `ZP_SUFFIX` / `ZP_PORT` | 面板路径后缀（可选，默认不启用）/ 监听端口 |
+| `ZP_SUFFIX` / `ZP_PORT` | 面板路径后缀（可选，默认不启用）/ 监听端口（可选，默认 8443） |
 | `ZP_YES=1` | 所有提问都用默认答案（默认答案保证能装成功） |
 | `ZP_SSH=1` | 安装期就开 SSH（不设时不动 SSH，留给面板） |
 | `ZP_LAN_PREAUTH=1` / `ZP_LAN_CIDR` | 安装完写入「免授权访问内网段」（不设时不做；需重启生效） |

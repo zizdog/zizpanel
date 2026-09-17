@@ -191,10 +191,13 @@ try {
   });
 
   await step('深色主题截图', async () => {
-    await page.click('button[title="切换主题"]');
+    // 主题按钮的 title 是**动态**文案（"主题：浅色（点击切换：深色）"等），
+    // 旧写法 button[title="切换主题"] 永远匹配不到 → 这步会 30 秒超时（2026-09-17 抓到）。
+    const themeBtn = page.locator('button[title^="主题："]').first();
+    await themeBtn.click();
     await page.waitForTimeout(600);
     await shot('03-dashboard-dark');
-    await page.click('button[title="切换主题"]');
+    await themeBtn.click();
   });
 
   await step('切换到系统设置页', async () => {
