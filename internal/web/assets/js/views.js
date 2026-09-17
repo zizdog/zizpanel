@@ -189,7 +189,9 @@ export function DashboardView(content, ctx = {}) {
         h('div.hint', {
           text: '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。'
             + '点击按钮会先自动装好「命令行开发者工具 + Homebrew」，'
-            + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。',
+            + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。'
+            + '装 MySQL 时会问一次 root 口令（60 秒不答自动生成）——**可以不干预**，'
+            + '装完到「数据库 → 账号与权限」里直接改密码即可。',
         }),
         h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
           h('button.btn.btn-primary', { text: '⚡ 安装基础环境（一键 LNMP）', onclick: startBaseEnv }),

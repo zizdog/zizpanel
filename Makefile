@@ -113,12 +113,12 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh
+	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@# 真实口令不许进仓库 —— 这条坑复发过两次（v0.3.1 基线 + 第九轮新增文件），
 	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
