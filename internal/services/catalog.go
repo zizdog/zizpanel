@@ -374,14 +374,23 @@ type CheckResult struct {
 // 前端只按 key 分组、不再写任何分类中文名。
 // ============================================================================
 const (
-	CategorySite    = "site"    // 一键建站
-	CategoryAI      = "ai"      // AI 服务
-	CategoryTool    = "tool"    // 运维工具
-	CategoryLNMP    = "lnmp"    // 网站环境（服务管理里 nginx / PHP / MySQL 的归类）
+	CategorySite = "site" // 一键建站
+	CategoryAI   = "ai"   // AI 服务
+	CategoryTool = "tool" // 运维工具
+	// CategoryLNMP 是「网站环境」：应用市场的一个专属板块，同时是服务管理里
+	// nginx / PHP / MySQL / PostgreSQL 的归类。**一个 key 管两处**，不再另造
+	// 一个同义 key（两个 key 同一个中文名必然漂）。
+	//
+	// 为什么 PostgreSQL 也在这里（2026-09-19 产品负责人拍板）：它虽然目前只服务
+	// 自托管应用（Miniflux），但和 MySQL 一样是**数据库组件**，与 nginx/PHP 同属
+	// "网站/应用运行环境"，不该再混在「基础环境」里（那是 CLT/Homebrew/ffmpeg
+	// 这类跨应用、与网站无关的运行依赖）。
+	CategoryLNMP    = "lnmp"    // 网站环境（nginx / PHP / MySQL / PostgreSQL）
 	CategoryRuntime = "runtime" // 容器运行时（Docker 运行时 Colima）
 	// CategoryOther 同时是**兜底分类**：目录里没有专属板块的分类
-	// （lnmp / runtime / 以及将来新增的）都会被它收下。
-	// 所以它的显示名取"最能描述这一整类"的 —— 用户 2026-09 要求显示为「基础环境」。
+	// （runtime / 以及将来新增的）都会被它收下。
+	// 显示名取"最能描述这一整类"的 —— 用户 2026-09 要求显示为「基础环境」，
+	// 2026-09-19 起它只收纳**跨应用依赖**（CLT / Homebrew / ffmpeg、Colima 运行时）。
 	CategoryOther = "other"
 )
 
@@ -408,12 +417,15 @@ type MarketSection struct {
 
 // MarketSections 返回应用市场板块的**顺序与显示名**，是前端的唯一数据源。
 //
-// 两个硬约束：
+// 三个硬约束：
 //  1. 显示名来自 categoryLabels（与 CategoryLabels 同源）——"改一处、到处生效"；
 //  2. 兜底板块必须排在**最后**（用户明确要求「基础环境」仍在最后一个板块）。
-//     它收纳的是没有专属板块的分类，排在中间会让后面的板块与它混在一起。
+//     它收纳的是没有专属板块的分类，排在中间会让后面的板块与它混在一起；
+//  3. 「网站环境」（CategoryLNMP）必须是一个**专属板块**：nginx / PHP / MySQL /
+//     PostgreSQL 属于网站环境层，不能再落进「基础环境」兜底板块
+//     （那是 CLT/Homebrew/ffmpeg 这类跨应用运行依赖的地盘，2026-09-19 拆分）。
 func MarketSections() []MarketSection {
-	keys := []string{CategorySite, CategoryAI, CategoryTool, CategoryOther}
+	keys := []string{CategorySite, CategoryAI, CategoryTool, CategoryLNMP, CategoryOther}
 	out := make([]MarketSection, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, MarketSection{
@@ -539,7 +551,13 @@ func Catalog() []App {
 
 		// ---------------- 网站环境（LNMP，原生安装） ----------------
 		//
-		// ⚠️ 这里只有**单个组件**（nginx / 各版本 PHP / MySQL），
+		// 2026-09-19 起这是应用市场里的一个**专属板块**「网站环境」
+		// （category key = CategoryLNMP，见 MarketSections）：nginx / 各版本 PHP /
+		// MySQL / PostgreSQL 都归它。它与「基础环境」（CLT/Homebrew/ffmpeg 这类
+		// 跨应用运行依赖）是两层，探测与安装都分开
+		// （见 baseenv.go 的 BaseEnvStatus / EnsureBaseEnvironment）。
+		//
+		// ⚠️ 这里只有**单个组件**（nginx / 各版本 PHP / MySQL / PostgreSQL），
 		// **没有** "lnmp" 这个条目 —— 「一键 LNMP」是一个组合动作
 		// （装三个包 + 默认站点 / vhosts 目录 / MySQL 初始化 / 系统级守护进程
 		// 等收尾工作，见 internal/services/lnmp.go），不是"一个可安装的应用"。
@@ -615,9 +633,16 @@ func Catalog() []App {
 			DocsURL:     "https://dev.mysql.com",
 		},
 
-		// ---------------- 基础环境（原生安装，命令行工具） ----------------
+		// ---------------- 基础环境（原生安装，跨应用运行依赖） ----------------
 		//
-		// ffmpeg 是"基础环境"，不属于任何单个应用，但很多功能都靠它：
+		// 2026-09-19 产品负责人拆分了「基础环境」与「网站环境」两层：
+		//   · 本板块（基础环境 / CategoryOther 兜底）= 运行依赖层：
+		//     CLT → Homebrew → ffmpeg（python3 随 CLT 来，不单列）；
+		//   · 「网站环境」（CategoryLNMP）= nginx / PHP / MySQL / PostgreSQL。
+		// 所以这里只剩 ffmpeg 这类**跨应用、与网站无关**的依赖
+		// （Colima 容器运行时没有专属板块，也落在本兜底板块）。
+		//
+		// ffmpeg 不属于任何单个应用，但很多功能都靠它：
 		//   · Qwen3 TTS 用 mlx_audio 编码 mp3 **必须**有它；
 		//   · 音色接收端用 ffprobe 真解码校验上传样本、用 ffmpeg 转码与归一；
 		//   · IOPaint 的视频处理、后续的音视频功能也要用。
@@ -643,7 +668,7 @@ func Catalog() []App {
 				"缺了它的典型症状是「合成接口返回 HTTP 200 但 body 是 0 字节」——" +
 				"服务看起来一切正常，用户却一个作业都跑不成。" +
 				"没有网页界面，装好后供面板与其它应用在后台调用。",
-			Category: "tool", Kind: KindNative,
+			Category: CategoryOther, Kind: KindNative,
 			PanelInstaller: "ffmpeg",
 			BrewFormula:    "ffmpeg",
 			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
@@ -651,13 +676,13 @@ func Catalog() []App {
 			Port:     0,
 			DocsURL:  "https://ffmpeg.org",
 		},
-		// PostgreSQL 放在「基础环境」是**用户 2026-09-17 的决定**，理由与 MySQL 不同：
-		//   · MySQL 是「网站环境」的一部分（一键 LNMP 装它，Typecho / WordPress 用它）；
-		//   · PostgreSQL 目前只服务于自托管应用（Miniflux 必须要它），
-		//     不属于网站栈，所以归到「基础环境」，与 mysql84 一样是
-		//     **独立可安装、可启停、可卸载**的条目。
+		// PostgreSQL 归「网站环境」（CategoryLNMP）是**产品负责人 2026-09-19 的拆分**：
+		//   · 它是数据库组件，与 MySQL 同类；网站环境层 = nginx / PHP / MySQL /
+		//     PostgreSQL / phpMyAdmin，统一收在「网站环境」板块；
+		//   · 「基础环境」只留 CLT / Homebrew / ffmpeg 这类跨应用运行依赖
+		//     （它曾按 2026-09-17 的旧决定放在这里，本次拆分把它移出）。
 		//
-		// 为什么不把它塞进 Miniflux 的安装事务（研究与真机结论都支持）：
+		// 安装 / 启停 / 卸载仍是独立的（不塞进 Miniflux 的安装事务）：
 		//   · brew 的 postgresql@17 是**一个 cluster 一个数据目录**
 		//     （/opt/homebrew/var/postgresql@17）。若 PG 由 Miniflux 的安装流程顺带装，
 		//     就会出现"Miniflux 装失败该不该卸 PG"的两难 —— 卸掉会伤到别的依赖方，
@@ -672,7 +697,7 @@ func Catalog() []App {
 				"brew 安装时**已经自动 initdb 建好 cluster**（数据目录 /opt/homebrew/var/postgresql@17），" +
 				"本机连接走 trust 认证，超级用户就是当前登录用户。" +
 				"卸载本条目**不会**删除数据目录（面板默认保留你的数据）。",
-			Category: "other", Kind: KindNative, ServiceLabel: "sh.brew.postgresql@17",
+			Category: CategoryLNMP, Kind: KindNative, ServiceLabel: "sh.brew.postgresql@17",
 			// PostgreSQL 说的是自己的线路协议、不是 HTTP：不能做 HTTP 健康检查，
 			// 否则会永远显示"不健康"（与 PHP-FPM 同理）。留空 = 只按进程与端口判断。
 			Port: 5432, HealthPath: "",

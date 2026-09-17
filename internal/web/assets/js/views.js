@@ -123,7 +123,6 @@ export function DashboardView(content, ctx = {}) {
       return;
     }
     clear(svcBody);
-    checkBaseEnv(list);
     if (!list.length) {
       svcBody.append(h('div.empty', [
         h('div.big', { text: '⚙️' }),
@@ -154,75 +153,136 @@ export function DashboardView(content, ctx = {}) {
     );
   }
 
-  // ---------- 基础环境未安装的一次性引导 ----------
+  // ---------- 运行依赖（基础环境）未就绪的引导 ----------
   //
-  // 为什么放在仪表盘最上面、而且必须有：安装器现在**什么都不问**（用户逐条要求：
-  // 账号/后缀/SSH/内网预授权/端口全部移出安装流程），于是"网站管理需要
-  // nginx + PHP + MySQL"这件事必须在面板里主动说一次 —— 否则用户第一次进来
-  // 看到的是一个"什么都不能干"的面板（真机反馈原话："第一次进入面板，并没有提示我安装基础环境？"）。
+  // 2026-09 产品拆分：这条横幅只管**跨应用运行依赖** ——
+  // 命令行开发者工具(CLT) → Homebrew → ffmpeg。它跟"网站环境"
+  // （nginx + PHP + MySQL + phpMyAdmin）是**两层**，老文案把这一步叫"一键 LNMP"
+  // 是标签在骗人：点「安装基础环境」不会装 nginx/PHP/MySQL。
   //
+  // 判据**只认后端** GET /api/v1/system/base-env（data 形如
+  // {clt_ok, brew_ok, deps_ok, ready, missing[]}），不再用服务列表去猜。
+  // 旧面板没有这个接口时 request() 抛 404 —— 必须**如实说"读不到"**，
+  // 既不静默也不假装已就绪（铁律：能谎报成功比没做更糟）。
+  //
+  // 为什么还放在仪表盘最上面、且保留：安装器**什么都不问**，用户第一次进来
+  // 如果缺依赖会看到"什么都装不了"的面板，所以必须主动说一次。
   // 刻意**不做硬门禁**：镜像不可用时不让人进门，比不提示更糟。所以是"提示 + 一键装 + 稍后"。
   const baseEnvNotice = h('div');
-  function baseEnvReady() {
-    // 只认"用户点了稍后"这一个持久标记。
-    // 刻意**不再缓存"已就绪"**：服务列表每次进仪表盘都要拉，判定本身零成本；
-    // 而缓存会把"这次读不到数据"当成"已就绪"永久跳过提示（第一版就这么坑了自己）。
+
+  // baseEnvDismissed 只认"用户点了稍后"这一个持久标记。
+  // 刻意**不缓存"已就绪"**：缓存会把"这次读不到"当成"已就绪"永久跳过提示。
+  function baseEnvDismissed() {
     return localStorage.getItem('zp-baseenv-dismissed') === '1';
   }
+
+  // missingList 取出后端 missing 里缺的项（文案用）。
+  // 后端漏给 missing 时按三个布尔量兜底 —— 仍然是"如实列出缺什么"，
+  // 绝不因为字段缺失就写"已就绪"。
+  function missingList(data) {
+    const arr = Array.isArray(data && data.missing) ? data.missing.filter(Boolean) : [];
+    if (arr.length) return arr.map((x) => String(x));
+    const out = [];
+    if (data && data.clt_ok === false) out.push('命令行开发者工具');
+    if (data && data.brew_ok === false) out.push('Homebrew');
+    if (data && data.deps_ok === false) out.push('ffmpeg');
+    return out;
+  }
+
   function startBaseEnv() {
     taskCenter.start({
       kind: 'install',
-      // target 与后端任务保持一致（POST /api/v1/market/install-lnmp → 202 + task_id），
+      // target 与后端任务保持一致（POST /api/v1/system/base-env/install → 202 + task_id），
       // 这样「任务中心」能按同一个值找到运行中的任务（见 sites.js 的同款用法）。
-      target: 'lnmp',
-      title: '一键 LNMP（基础环境）',
-      start: () => api.installLNMP(),
+      target: 'base-env',
+      title: '安装基础环境',
+      start: () => api.installBaseEnv(),
     });
     baseEnvNotice.replaceChildren();
   }
-  function renderBaseEnvNotice(hasStaleRecords) {
+
+  function dismissBaseEnv() {
+    localStorage.setItem('zp-baseenv-dismissed', '1');
+    baseEnvNotice.replaceChildren();
+  }
+
+  // 运行依赖有缺项：逐项列出缺什么。
+  function renderBaseEnvMissing(data) {
+    const missing = missingList(data);
+    const known = missing.length > 0;
+    // 只有后端明确说 CLT 已就绪时才加这句（否则就是在替后端编状态）。
+    const cltNote = (data && data.clt_ok === true) ? '（命令行开发者工具已就绪）' : '';
+    // 后端 ready=false 却没给 missing（契约异常）：如实说"未就绪但不知道缺哪项"，
+    // **不要**替它列成"三个都缺"（那是在编状态）。
+    const head = known
+      ? '⚠ 缺少运行依赖：' + missing.join('、') + cltNote
+      : '⚠ 运行依赖未就绪（后端未返回具体缺项）';
     baseEnvNotice.append(h('div.card', {
       style: { borderLeft: '4px solid #e6a23c', marginBottom: '14px' },
     }, [
       h('div.card-body', [
-        h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 基础环境还没安装' }),
+        h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: head }),
         h('div.hint', {
-          text: (hasStaleRecords
-            ? '检测到 nginx/PHP/MySQL 的记录，但**它们都没有在运行**（可能已被卸载或未启动）。'
-            : '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。')
-            + '点击按钮会先自动装好「命令行开发者工具 + Homebrew」，'
-            + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。'
-            + '装 MySQL 时会问一次 root 口令（60 秒不答自动生成）——**可以不干预**，'
-            + '装完到「数据库 → 账号与权限」里直接改密码即可。',
+          text: '这里说的是**跨应用的运行依赖**：命令行开发者工具（CLT）→ Homebrew → ffmpeg。'
+            + '凡是走 Homebrew 安装的应用都依赖它们（python3 随命令行开发者工具一起装好，不需要单独安装）。'
+            + '**这一步不含网站环境**（nginx / PHP / MySQL / phpMyAdmin）——'
+            + '需要网站环境请到「网站管理」点「⚡ 一键 LNMP」，它会先确保这里的运行依赖再装那套。'
+            + '这一步不装 MySQL，所以**不会询问 root 口令**。'
+            + '全程约几分钟，进度在「任务中心」实时可见、关掉页面也不中断。',
         }),
         h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-          h('button.btn.btn-primary', { text: '⚡ 安装基础环境（一键 LNMP）', onclick: startBaseEnv }),
+          h('button.btn.btn-primary', { text: '⚡ 安装基础环境', onclick: startBaseEnv }),
           h('button.btn.btn-sm', {
             text: '稍后',
-            title: '也可以在「应用 → 基础环境」里自己挑着装',
-            onclick: () => {
-              localStorage.setItem('zp-baseenv-dismissed', '1');
-              baseEnvNotice.replaceChildren();
-            },
+            title: '暂时不装：刷新页面后若依赖仍缺失会再次提示',
+            onclick: dismissBaseEnv,
           }),
         ]),
       ]),
     ]));
   }
-  function checkBaseEnv(services) {
-    if (baseEnvReady()) return;
-    // 判定口径：服务记录里**有** nginx / PHP / MySQL 之一就算装过基础环境。
-    // 用仪表盘**已经在拉**的服务列表判断（不额外请求 /market —— 那个接口在全新机器上
-    // 要逐条探测，实测能让首屏多等十几秒，而提示不该拖慢仪表盘）。
-    const baseRe = /^(nginx|php|mysql|mariadb|percona)/i;
-    const base = (services || []).filter((s) => baseRe.test(String(s.name || ''))
-      || baseRe.test(String(s.display_name || '')));
-    // **判据（必须说清，界面上也写了）**：机器上**真的在跑**的 nginx / PHP / MySQL。
-    // 不是"面板数据库里有没有记录" —— 真机事故：卸载基础环境后记录还在，
-    // 横幅被误判成"已就绪"，用户什么提示都看不到，还以为面板坏了。
-    const live = base.some((s) => (s.state || {}).running);
-    if (live) return;
-    renderBaseEnvNotice(base.length > 0);
+
+  // 读不到状态（接口 404 / 网络错误）：如实说读不到，并给「重试」。
+  // 此时**不显示安装按钮** —— 连缺什么都不知道，给一个"安装"入口就是在暗示结论。
+  function renderBaseEnvUnknown(message) {
+    baseEnvNotice.append(h('div.card', {
+      style: { borderLeft: '4px solid #d9534f', marginBottom: '14px' },
+    }, [
+      h('div.card-body', [
+        h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 无法读取运行依赖状态（接口不可用）' }),
+        h('div.hint', {
+          text: '面板没能从后端拿到「命令行开发者工具 / Homebrew / ffmpeg」的就绪状态：'
+            + String(message || '未知错误')
+            + '。在读到真实状态之前，这里不会显示"已就绪"，也不会替你决定要不要安装。',
+        }),
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('button.btn.btn-sm', { text: '⟳ 重试', onclick: () => { void checkBaseEnv(); } }),
+          h('button.btn.btn-sm', {
+            text: '稍后',
+            title: '暂时忽略：刷新页面后会重试读取',
+            onclick: dismissBaseEnv,
+          }),
+        ]),
+      ]),
+    ]));
+  }
+
+  // checkBaseEnv 拉一次运行依赖状态并据此渲染（或按 ready===true 保持不显示）。
+  // 与 loadServices 解耦：服务列表接口挂了也不该让这条提示变成"沉默的空白"。
+  async function checkBaseEnv() {
+    baseEnvNotice.replaceChildren();
+    if (baseEnvDismissed()) return;
+    let data = null;
+    try {
+      data = await api.baseEnv();
+    } catch (e) {
+      renderBaseEnvUnknown((e && e.message) || String(e));
+      return;
+    }
+    // 只认 ready === true 才是"不显示"。undefined / 字段缺失一律当"没就绪"处理，
+    // 免得后端换契约时界面默默变回"假装一切正常"。
+    if (data && data.ready === true) return;
+    renderBaseEnvMissing(data || {});
   }
 
   content.append(
@@ -237,6 +297,8 @@ export function DashboardView(content, ctx = {}) {
 
   // ---------- 服务状态与数据更新 ----------
   loadServices();
+  // 运行依赖横幅独立于服务列表拉取（见 checkBaseEnv 的注释）。
+  void checkBaseEnv();
 
   function update(s) {
     state.metrics = s;

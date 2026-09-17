@@ -2,6 +2,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -105,6 +106,15 @@ type Server struct {
 	// acmeCredMu 保护 DNS 凭据文件（DataDir 下 0600）的读写。
 	acmeCredMu sync.Mutex
 
+	// ---- 基础环境（运行依赖层，见 api_system.go）----
+	//
+	// baseEnvProbeOverride / baseEnvInstallOverride 是单测注入点：
+	// 默认探测会执行 /usr/bin/xcode-select 并 stat 真实 Homebrew 前缀，
+	// 默认安装会真的调用 EnsureHomebrew（可能联网跑 brew 安装脚本）——
+	// 结论与副作用都会随测试机而变，违反"单测不许碰真实环境"。
+	baseEnvProbeOverride   func(ctx context.Context) services.BaseEnvStatus
+	baseEnvInstallOverride func(ctx context.Context, res *services.InstallResult) error
+
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time
@@ -171,6 +181,13 @@ func (s *Server) routes() http.Handler {
 	// 基础依赖（ffmpeg / ffprobe）状态：曾经静默消失过（被 brew autoremove 带走），
 	// 表现是 TTS 返回 200 + 空 body —— 必须能一眼看到缺没缺（见 basedep.go）。
 	root.HandleFunc("GET /api/v1/system/deps", s.requireAuth(s.handleSystemDeps))
+	// 基础环境（运行依赖层：CLT → Homebrew → ffmpeg）状态与一键安装。
+	//
+	// 它和「网站环境（LNMP）」是两层：base-env 只管运行依赖，安装任务绝不装
+	// nginx / PHP / MySQL（那走 POST /api/v1/market/install-lnmp）。
+	// 见 services/baseenv.go 与 api_system.go 的 handleSystemBaseEnv。
+	root.HandleFunc("GET /api/v1/system/base-env", s.requireAuth(s.handleSystemBaseEnv))
+	root.HandleFunc("POST /api/v1/system/base-env/install", s.requireAuth(s.handleSystemBaseEnvInstall))
 
 	// 系统设置（macOS 服务器化）：状态探测 + 一键动作（动作走任务中心）
 	root.HandleFunc("GET /api/v1/system/settings", s.requireAuth(s.handleSystemSettings))

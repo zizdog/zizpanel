@@ -59,15 +59,22 @@ export const NAV = [
   { id: 'files', title: '文件管理', icon: '📁', view: FilesView },
   { id: 'terminal', title: 'Web 终端', icon: '🖥️', view: TerminalView },
   { id: 'cron', title: '计划任务', icon: '⏰', view: CronView },
+  // 「日志」独立成一个版块（2026-09 用户要求）：原来「操作审计」是侧栏顶级项，
+  // 与「日志中心」分居两处；审计本质就是"谁在什么时候做了什么"的历史日志，
+  // 放在同一个版块里才找得到。**路由不变**：两者都是普通 NAV 项，
+  // #/logs 与 #/audit 照旧可用（老书签/文档不 404），audit.js 页面本身不动。
+  { group: '日志' },
   { id: 'logs', title: '日志中心', icon: '📜', view: LogsView },
-  { group: '系统' },
   { id: 'audit', title: '操作审计', icon: '🧾', view: AuditView },
+  { group: '系统' },
+  // 2026-09 用户要求：顺序上**面板设置在前、检查更新紧随其后**（先"设置面板"，
+  // 再"看有没有新版本"）。只调顺序：路由别名（#/about、#/upgrade、#/settings/about）
+  // 与徽标/主动检测/一键更新逻辑都不变（见 ROUTE_TARGET）。
+  { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
   // 2026-09-21：原来这里是「面板设置 → 关于与运维」的第 4 个 Tab。用户要求把它
   // 整块提到侧边栏并改名「检查更新」——"有没有新版本"是随时想知道的状态，
   // 埋在两级点击之后没人看得到，也就没人升级。
-  // 旧的页内 Tab 链接（#/settings/about）与可能的 #/about 都必须继续可用：见 ROUTE_TARGET。
   { id: 'update', title: '检查更新', icon: '⬆️', view: UpdateView },
-  { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
 ];
 
 const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n]));

@@ -35,12 +35,26 @@ let detailTab = 'basic';
 //
 // 文案要求（用户原话）：说清"会安装 nginx + PHP + MySQL + phpMyAdmin 等"，
 // 并**如实提示耗时与长任务特性** —— 十几分钟、关掉窗口不中断、进度在任务中心。
-const LNMP_HINT = '一键 LNMP 会安装 nginx + PHP 8.2 + MySQL 8.4 + phpMyAdmin（数据库管理界面），'
+const LNMP_HINT = '一键 LNMP 会先确保运行依赖（命令行开发者工具 CLT / Homebrew），'
+  + '再安装 nginx + PHP 8.2 + MySQL 8.4 + phpMyAdmin（数据库管理界面），'
   + '并完成默认站点、vhosts 目录、MySQL 初始化、系统级守护进程等收尾工作。'
   + '全程约十几分钟（取决于网络与 Homebrew 下载/编译速度）。'
   + '提交后立刻返回任务号，进度在「任务中心」实时显示 —— 关掉窗口、切换页面都不会中断安装。'
   + '\n\n装 MySQL 时会问一次 root 口令（任务中心里，60 秒不回答就自动生成强随机口令）——'
   + '**可以不干预**：装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。';
+
+// ---------------- 网站环境状态（现实判据）----------------
+//
+// 2026-09 产品把"运行依赖"（CLT / Homebrew / ffmpeg，跨应用）与"网站环境"
+// （nginx + PHP + MySQL + phpMyAdmin，只服务本站）拆成两层。本页只管后者。
+//
+// 判据是**现实**，不是"面板数据库里有没有服务/站点记录"：
+//   · 服务列表 GET /api/v1/services 里同名条目 state.running 为真；
+//   · PHP 额外认 sites 接口的真实探测（php_versions[].running）——
+//     真机实测：php-fpm 明明在跑，服务列表里却可能没有 php 条目，只认服务列表会误报。
+// 读不到状态时**如实说读不到**，绝不把"读不到"当成"已就绪"。
+const WEB_ENV_PARTS = ['nginx', 'PHP', 'MySQL'];
+
 
 function startLNMP() {
   taskCenter.start({
@@ -67,6 +81,11 @@ export function SitesView(content, ctx = {}) {
   clear(content);
 
   const listBox = h('div');
+  // 网站环境状态行：本页的定位只跟 nginx/PHP/MySQL/phpMyAdmin 有关，
+  // 与首页横幅的"运行依赖（CLT/Homebrew/ffmpeg）"是两层，必须分开说清。
+  const webEnvLine = h('div.hint', {
+    style: { marginBottom: '8px', fontSize: '12px', lineHeight: '1.7' },
+  });
   const statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
 
   const toolbar = h('div.card-head', [
@@ -78,9 +97,54 @@ export function SitesView(content, ctx = {}) {
   content.append(
     h('div.card', [
       toolbar,
-      h('div.card-body.tight', [listBox]),
+      h('div.card-body.tight', [webEnvLine, listBox]),
     ]),
   );
+
+  // refreshWebEnv 拉服务列表（health=0，只要状态不要逐条探测）判断网站环境。
+  // 失败时**如实说读不到**，不沿用上一次的结论、更不假装就绪。
+  async function refreshWebEnv() {
+    clear(webEnvLine);
+    webEnvLine.textContent = '网站环境：读取中…';
+    let list = [];
+    try {
+      const res = await api.services(false);
+      list = (res && res.list) || [];
+    } catch (e) {
+      webEnvLine.textContent = '网站环境：无法读取服务状态（' + e.message + '）';
+      return;
+    }
+    // svcRunning 只在同名条目命中且 state.running 为真时算就绪
+    //（PHP 允许多版本共存，任意一个版本在跑即可）。
+    const svcRunning = (re) => list.some((s) => (re.test(String(s.name || ''))
+      || re.test(String(s.display_name || ''))) && !!((s.state || {}).running));
+    // PHP 的真实探测（比"服务记录"准）：sites 接口的 php_versions 直接给出 fpm 是否在跑。
+    const phpLive = ((cache && cache.php_versions) || []).some((p) => p && p.running);
+    const checks = {
+      nginx: () => svcRunning(/^nginx/i),
+      PHP: () => phpLive || svcRunning(/^php/i),
+      MySQL: () => svcRunning(/^(mysql|mariadb|percona)/i),
+    };
+    const missing = WEB_ENV_PARTS.filter((label) => !checks[label]());
+    clear(webEnvLine);
+    webEnvLine.append(
+      h('span', { text: '网站环境：' }),
+      missing.length
+        ? h('span.pill.warn', { text: '未就绪' })
+        : h('span.pill.ok', { text: '已就绪' }),
+      h('span', {
+        // 用"未检测到运行中的"而不是"未运行"：面板没看见 ≠ 一定没在跑
+        //（例如本机有一份不归面板管的 nginx）。只报"检测到了什么"，不替现实下结论。
+        text: '（' + (missing.length ? '未检测到运行中的：' + missing.join('、') : 'nginx / PHP / MySQL 均在运行') + '）',
+      }),
+      h('div', {
+        style: { marginTop: '3px' },
+        text: '「⚡ 一键 LNMP」会先确保运行依赖（命令行开发者工具 CLT / Homebrew）'
+          + '再装 nginx + PHP + MySQL + phpMyAdmin。运行依赖（含 ffmpeg）是所有 brew 应用的公共底座，'
+          + '与网站无关，缺了会在首页提示。',
+      }),
+    );
+  }
 
   async function load() {
     clear(listBox);
@@ -94,10 +158,14 @@ export function SitesView(content, ctx = {}) {
         h('h4', { text: '读取站点失败' }),
         h('p', { text: e.message }),
       ]));
+      // 站点接口挂了也要给网站环境状态：PHP 那条只能退回服务列表（cache 里没有 php_versions）。
+      void refreshWebEnv();
       return;
     }
     renderStatus();
     renderList();
+    // 放在 sites 之后：refreshWebEnv 会读 cache.php_versions 做 PHP 的真实判据。
+    void refreshWebEnv();
   }
 
   function renderStatus() {

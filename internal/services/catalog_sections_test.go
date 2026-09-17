@@ -66,38 +66,116 @@ func TestCategoryLabelsShareOneSource(t *testing.T) {
 	}
 }
 
-// TestLNMPIsNotAMarketCard 锁住「一键 LNMP」的定位：它是组合动作，不是目录条目。
+// TestWebsiteEnvIsItsOwnSection 锁住 2026-09-19 的「基础环境 / 网站环境」两层拆分：
 //
-// 用户要求把这个入口放在「网站管理」；市场里不能再出现一张 lnmp 卡片。
-// web 层还有一条防御性排除（internal/web 的 marketHiddenApps），
-// 这条测试保证目录本身也不会冒出 ID=lnmp 的条目。
-func TestLNMPIsNotAMarketCard(t *testing.T) {
-	if app, ok := FindApp("lnmp"); ok {
-		t.Fatalf("目录里不该有 ID=lnmp 的条目（一键 LNMP 是组合动作，入口在网站管理），实际: %+v", app)
+//   - 「网站环境」（CategoryLNMP）必须是一个**专属板块**（不是兜底板块）；
+//   - nginx / PHP / MySQL / PostgreSQL 全部归它 —— 一个都不能再落进「基础环境」；
+//   - 「基础环境」（兜底板块）只收纳没有专属板块的分类，且里面**不能有理应是
+//     网站环境层的组件**（否则市场会把 Web 服务器/数据库混进"跨应用依赖"里）。
+//
+// 这是"目录 ↔ 板块声明双向一致"的那条反漂移门禁：
+// 目录改了分类、或 MarketSections 漏了某个 key，这里立刻红。
+func TestWebsiteEnvIsItsOwnSection(t *testing.T) {
+	// 反向：声明里必须有 lnmp 板块，且它不是兜底板块、显示为「网站环境」。
+	secs := MarketSections()
+	var webenv MarketSection
+	var hasWebenv bool
+	named := map[string]bool{}
+	for _, s := range secs {
+		if !s.Fallback {
+			named[s.Key] = true
+		}
+		if s.Key == CategoryLNMP {
+			webenv, hasWebenv = s, true
+		}
 	}
-	// lnmp / runtime 没有专属板块，应当落到兜底板块（基础环境）：
-	// 分别是 nginx / PHP / MySQL 与 Colima 容器运行时。
+	if !hasWebenv {
+		t.Fatalf("MarketSections 里必须有 %q 板块（nginx / PHP / MySQL / PostgreSQL 的归属）", CategoryLNMP)
+	}
+	if webenv.Fallback {
+		t.Errorf("%s 不该是兜底板块（它收纳的是明确的网站环境组件）", CategoryLNMP)
+	}
+	if webenv.Label != "网站环境" {
+		t.Errorf("%s 板块应显示为「网站环境」，实际 %q", CategoryLNMP, webenv.Label)
+	}
+
+	// 正向：网站环境层的四个组件必须都在这个分类里。
+	websiteEnvIDs := []string{"nginx", "php82", "php84", "mysql84", "postgresql17"}
+	for _, id := range websiteEnvIDs {
+		app, found := FindApp(id)
+		if !found {
+			t.Fatalf("目录里找不到 %s", id)
+		}
+		if app.Category != CategoryLNMP {
+			t.Errorf("%s（%s）的分类应为 %q（网站环境），实际 %q —— "+
+				"归错会落进「基础环境」兜底板块，用户会在跨应用依赖里看到 Web 服务器",
+				app.ID, app.Name, CategoryLNMP, app.Category)
+		}
+	}
+
+	// 兜底板块的收纳口径必须与板块声明一致：任何"没有专属板块"的分类才落进去，
+	// 而网站环境组件因为有了专属板块，绝不能再出现在兜底里。
+	fallback := secs[len(secs)-1]
+	if !fallback.Fallback {
+		t.Fatalf("最后一个板块必须是兜底板块，实际 %s", fallback.Key)
+	}
+	for _, a := range Catalog() {
+		inFallback := !named[a.Category]
+		if inFallback {
+			for _, id := range websiteEnvIDs {
+				if a.ID == id {
+					t.Errorf("%s 落进了兜底板块（%s）—— 网站环境组件必须在「网站环境」专属板块里",
+						a.ID, fallback.Label)
+				}
+			}
+		}
+	}
+}
+
+// TestFallbackSectionIsCrossAppDependenciesOnly 锁住 2026-09-19 拆分的另一半：
+// 「基础环境」兜底板块里只剩**跨应用运行依赖**（CLT/Homebrew/ffmpeg 这类），
+// 不能混进网站组件（nginx/PHP/MySQL/PostgreSQL）。
+//
+// 为什么单独一条：这条是"用户看到的市场分类是否真的分成两层"的直接门禁 ——
+// 前一条只验证分类字段，这条验证**兜底板块最终装了什么**。
+func TestFallbackSectionIsCrossAppDependenciesOnly(t *testing.T) {
 	named := map[string]bool{}
 	for _, s := range MarketSections() {
 		if !s.Fallback {
 			named[s.Key] = true
 		}
 	}
-	lnmp, runtime := 0, 0
+	// ffmpeg 是跨应用运行依赖，必须在兜底板块里（2026-09-19 起它从「运维工具」移回）。
+	ffmpeg, found := FindApp("ffmpeg")
+	if !found {
+		t.Fatal("目录里找不到 ffmpeg")
+	}
+	if named[ffmpeg.Category] {
+		t.Errorf("ffmpeg 不该归到有专属板块的分类 %q —— 它是「基础环境」的跨应用依赖",
+			ffmpeg.Category)
+	}
+	// 兜底板块里出现过的分类只允许是"跨应用依赖类"的：
+	// other（基础环境本身）/ runtime（容器运行时，所有 Docker 应用的前提）。
+	allowed := map[string]bool{CategoryOther: true, CategoryRuntime: true}
 	for _, a := range Catalog() {
-		switch a.Category {
-		case CategoryLNMP:
-			lnmp++
-		case CategoryRuntime:
-			runtime++
+		if named[a.Category] {
+			continue // 有专属板块，不落兜底
 		}
-		if named[a.Category] && (a.Category == CategoryLNMP || a.Category == CategoryRuntime) {
-			t.Errorf("分类 %s 不该有专属板块（它应归「基础环境」兜底板块）", a.Category)
+		if !allowed[a.Category] {
+			t.Errorf("%s 的分类 %q 没有专属板块、又不在允许的跨应用依赖分类里 —— "+
+				"要么给它建板块（MarketSections），要么把它归到「基础环境」", a.ID, a.Category)
 		}
 	}
-	// 目录里确实有这两类条目，否则上面的断言就是空的（测试会假绿）。
-	if lnmp == 0 || runtime == 0 {
-		t.Fatalf("目录里应当同时有 %s(%d) 与 %s(%d) 两类条目，否则基础环境板块的归类没有被真正验证",
-			CategoryLNMP, lnmp, CategoryRuntime, runtime)
+}
+
+// TestLNMPIsNotAMarketCard 锁住「一键 LNMP」的定位：它是组合动作，不是目录条目。
+//
+// 2026-09-19 拆分后它的四个组件归「网站环境」板块，但 ID=lnmp 本身仍不能是
+// 一张市场卡片：它的入口在「网站管理」（sites.js），市场里不能再出现重复入口。
+// web 层还有一条防御性排除（internal/web 的 marketHiddenApps），
+// 这条测试保证目录本身也不会冒出 ID=lnmp 的条目。
+func TestLNMPIsNotAMarketCard(t *testing.T) {
+	if app, ok := FindApp("lnmp"); ok {
+		t.Fatalf("目录里不该有 ID=lnmp 的条目（一键 LNMP 是组合动作，入口在网站管理），实际: %+v", app)
 	}
 }

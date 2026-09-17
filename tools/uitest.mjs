@@ -190,24 +190,153 @@ try {
     if (!host.includes('macOS')) throw new Error('未显示操作系统信息');
   });
 
-  await step('仪表盘：没装基础环境时必须出现「基础环境」引导横幅', async () => {
-    // 为什么用桩数据：横幅只在"服务列表里没有 nginx/PHP/MySQL"时出现，而开发机
-    // 通常已经装了 —— 不桩的话这条断言在开发机上永远不成立（第一版就在这里白跑三次）。
-    // 桩掉 /api/v1/services，响应按 request() 的解包约定包成 {ok,data}；其它接口照常。
-    const stub = (route) => route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ ok: true, data: { list: [] } }),
+  // ---------- 运行依赖横幅（回归：2026-09 把"运行依赖"与"网站环境"拆成两层）----------
+  //
+  // 老横幅把「安装基础环境」写成「一键 LNMP」，标签在骗人：点它其实只装
+  // 命令行开发者工具(CLT) + Homebrew + ffmpeg，不装 nginx/PHP/MySQL。
+  // 新判据走 GET /api/v1/system/base-env，不再拿服务列表猜。
+  //
+  // 这条断言**全部走桩**：确定性、不依赖本机装了什么、绝不真的安装任何东西 ——
+  // install-lnmp 也桩住，万一前端回退成调它，桩会拦住真实安装并让我们抓到。
+  await step('运行依赖横幅：判据走 /system/base-env，按钮只调 base-env/install（桩数据）', async () => {
+    const installCalls = [];
+    const lnmpCalls = [];
+
+    // 每次重载前清掉「稍后」标记，否则上次手工点过就再也看不到横幅（会漏测）。
+    await page.evaluate(() => localStorage.removeItem('zp-baseenv-dismissed'));
+
+    // 假任务的进度流：立刻回一条"成功"并结束 —— 否则假任务会一直重连一个不存在的流刷 404。
+    await page.route('**/api/v1/tasks**', (route) => {
+      const m = route.request().url().match(/\/api\/v1\/tasks\/([^/?]+)\/stream/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '安装基础环境', status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '安装基础环境', status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+      });
     });
-    await page.route('**/api/v1/services*', stub);
+    // 桩住真实安装入口：断言"没被调用"的同时，保证即使被误调用也不会真装东西。
+    await page.route('**/api/v1/system/base-env/install', (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
+      installCalls.push(route.request().url());
+      return route.fulfill({
+        status: 202, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-base-env-1', title: '安装基础环境' } }),
+      });
+    });
+    await page.route('**/api/v1/market/install-lnmp', (route) => {
+      lnmpCalls.push(route.request().url());
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-lnmp-should-not-run', title: '一键 LNMP' } }),
+      });
+    });
+
+    const stubBaseEnv = (status, data) => (route) => route.fulfill({
+      status,
+      contentType: 'application/json',
+      body: JSON.stringify(status === 200 ? { ok: true, data } : { ok: false, msg: 'UI 测试桩：接口不可用' }),
+    });
+    const reloadAndAwaitBaseEnv = async () => {
+      await Promise.all([
+        page.waitForResponse((r) => /\/api\/v1\/system\/base-env$/.test(r.url())
+          && r.request().method() === 'GET'),
+        page.reload({ waitUntil: 'domcontentloaded' }),
+      ]);
+      await page.waitForSelector('.content', { timeout: 10000 });
+    };
+    const closeAllModals = async () => {
+      for (let i = 0; i < 4; i++) {
+        const masks = page.locator('.modal-mask');
+        if (!(await masks.count())) break;
+        const x = masks.last().locator('button.modal-close').first();
+        if (await x.count()) await x.click().catch(() => {});
+        await page.waitForTimeout(200);
+      }
+    };
+
+    // ① 缺依赖（ready:false + missing）→ 必须**逐项列出缺什么**，按钮是「安装基础环境」
+    await page.route('**/api/v1/system/base-env',
+      stubBaseEnv(200, { clt_ok: true, brew_ok: false, deps_ok: false, ready: false, missing: ['Homebrew', 'ffmpeg'] }));
     try {
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      await page.waitForSelector('text=基础环境还没安装', { timeout: 15000 });
-      await shot('03-dashboard-baseenv');
+      await reloadAndAwaitBaseEnv();
+      await page.waitForSelector('text=缺少运行依赖', { timeout: 15000 });
+      const txt = await page.locator('.content').innerText();
+      const want = '缺少运行依赖：Homebrew、ffmpeg（命令行开发者工具已就绪）';
+      if (!txt.includes(want)) {
+        throw new Error('横幅没有逐项列出缺什么（应含「' + want + '」）：\n' + txt.slice(0, 400));
+      }
+      if (/缺少运行依赖[^\n]*nginx/.test(txt) || /缺少运行依赖[^\n]*MySQL/.test(txt)) {
+        throw new Error('运行依赖横幅里又提到 nginx/MySQL 了（两层又混了）');
+      }
+      if (!txt.includes('不会询问 root 口令')) {
+        throw new Error('没有说明"这一步不装 MySQL、不询问 root 口令"');
+      }
+      if (!(await page.locator('button:has-text("安装基础环境")').count())) {
+        throw new Error('缺少「⚡ 安装基础环境」按钮');
+      }
+      await shot('03a-baseenv-missing');
+
+      // ② 点按钮 → POST base-env/install 恰好一次，且**没有** install-lnmp
+      await page.locator('button:has-text("安装基础环境")').first().click();
+      await page.locator('.modal-mask').last().waitFor({ timeout: 10000 });
+      await page.waitForTimeout(400);
+      if (installCalls.length !== 1) {
+        throw new Error('POST /system/base-env/install 调用次数应为 1，实际 ' + installCalls.length
+          + '（' + JSON.stringify(installCalls) + '）');
+      }
+      if (lnmpCalls.length !== 0) {
+        throw new Error('点「安装基础环境」却调用了 install-lnmp（标签与动作不符）：' + JSON.stringify(lnmpCalls));
+      }
+      await shot('03b-baseenv-install-task');
+      await closeAllModals();
     } finally {
-      await page.unroute('**/api/v1/services*');
-      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.unroute('**/api/v1/system/base-env');
     }
+
+    // ③ ready:true → 横幅不出现
+    await page.route('**/api/v1/system/base-env',
+      stubBaseEnv(200, { clt_ok: true, brew_ok: true, deps_ok: true, ready: true, missing: [] }));
+    try {
+      await reloadAndAwaitBaseEnv();
+      await page.waitForTimeout(600);
+      const txt = await page.locator('.content').innerText();
+      if (txt.includes('缺少运行依赖')) throw new Error('ready:true 时仍出现缺依赖横幅');
+      if (txt.includes('无法读取运行依赖状态')) throw new Error('ready:true 时出现"读不到状态"提示');
+    } finally {
+      await page.unroute('**/api/v1/system/base-env');
+    }
+
+    // ④ 接口 404（旧面板）→ 如实提示"无法读取"，既不能沉默、也不能假装就绪
+    const prevExpectHTTPError = expectHTTPError;
+    expectHTTPError = true; // 这次的 404 是断言对象，不是前端故障
+    await page.route('**/api/v1/system/base-env', stubBaseEnv(404, null));
+    try {
+      await reloadAndAwaitBaseEnv();
+      await page.waitForSelector('text=无法读取运行依赖状态', { timeout: 15000 });
+      const txt = await page.locator('.content').innerText();
+      if (txt.includes('缺少运行依赖')) {
+        throw new Error('接口 404 时却显示了"缺少运行依赖"（等于凭空编状态）');
+      }
+      await shot('03c-baseenv-unavailable');
+    } finally {
+      await page.unroute('**/api/v1/system/base-env');
+      expectHTTPError = prevExpectHTTPError;
+    }
+
+    // 收尾：撤掉本步骤的桩，别影响后面的步骤（后面的仪表盘会走真实接口）。
+    await page.unroute('**/api/v1/system/base-env/install');
+    await page.unroute('**/api/v1/market/install-lnmp');
+    await page.unroute('**/api/v1/tasks**');
+    await page.evaluate(() => localStorage.removeItem('zp-baseenv-dismissed'));
   });
 
   await step('深色主题截图', async () => {
@@ -1531,6 +1660,65 @@ try {
       throw new Error(`离开终端页后仍有 ${now.length} 个会话挂着（会占满会话上限，` +
         '最终让终端打不开）：' + JSON.stringify(now.map((x) => x.id)));
     }
+  });
+
+  // ---------- 侧栏：「操作审计」归属「日志」版块（回归：2026-09 信息架构调整）----------
+  //
+  // 需求：audit 原来是侧栏顶级项，现在必须落在「日志」分组里（与「日志中心」并列），
+  // 全站只有一个「操作审计」入口（不能和「检查更新」页重复），且 #/audit 仍可打开。
+  // 分组在 DOM 里是**扁平的兄弟节点**（div.nav-group 后面跟若干 div.nav-item），
+  // 所以"归属哪个分组"只能靠相对位置判断，不能用父子选择器。
+  await step('侧栏「操作审计」在「日志」版块下，且 #/audit 仍可打开（唯一入口）', async () => {
+    const navCount = await page.locator('.nav-item:has-text("操作审计")').count();
+    if (navCount !== 1) throw new Error(`侧栏「操作审计」入口应恰好 1 个，实际 ${navCount}`);
+
+    // readGroup 从 nav 的扁平兄弟节点里取出某个分组标题下的 nav-item 文案。
+    const readGroup = (title) => page.evaluate((t) => {
+      const nav = document.querySelector('nav.nav');
+      if (!nav) return null;
+      const nodes = Array.from(nav.children);
+      const gi = nodes.findIndex((n) => n.classList.contains('nav-group') && n.textContent.trim() === t);
+      if (gi < 0) return { found: false, items: [] };
+      const items = [];
+      for (let i = gi + 1; i < nodes.length; i++) {
+        if (nodes[i].classList.contains('nav-group')) break;
+        if (nodes[i].classList.contains('nav-item')) items.push(nodes[i].textContent.trim());
+      }
+      return { found: true, items };
+    }, title);
+
+    const group = await readGroup('日志');
+    if (!group) throw new Error('侧栏 nav 不存在');
+    if (!group.found) throw new Error('侧栏里找不到「日志」分组标题');
+    if (!group.items.some((t) => t.includes('日志中心'))) {
+      throw new Error('「日志」分组里没有「日志中心」：' + JSON.stringify(group.items));
+    }
+    if (!group.items.some((t) => t.includes('操作审计'))) {
+      throw new Error('「操作审计」不在「日志」分组里（该分组实际为：' + JSON.stringify(group.items) + '）');
+    }
+    const li = group.items.findIndex((t) => t.includes('日志中心'));
+    const ai = group.items.findIndex((t) => t.includes('操作审计'));
+    if (ai < li) throw new Error('「操作审计」应排在「日志中心」之后：' + JSON.stringify(group.items));
+
+    // 「系统」分组：面板设置在前，检查更新**紧随其后**（顺序被改回去就红）。
+    const sys = await readGroup('系统');
+    if (!sys || !sys.found) throw new Error('侧栏里找不到「系统」分组标题');
+    const si = sys.items.findIndex((t) => t.includes('面板设置'));
+    const ui = sys.items.findIndex((t) => t.includes('检查更新'));
+    if (si < 0) throw new Error('「系统」分组里没有「面板设置」：' + JSON.stringify(sys.items));
+    if (ui < 0) throw new Error('「系统」分组里没有「检查更新」：' + JSON.stringify(sys.items));
+    if (!(si < ui)) throw new Error('「面板设置」应排在「检查更新」之前：' + JSON.stringify(sys.items));
+    if (ui !== si + 1) throw new Error('「检查更新」应紧随「面板设置」之后：' + JSON.stringify(sys.items));
+    await shot('52b-nav-logs-group');
+
+    // 老书签（带 hash 直接打开）必须仍落在审计页，而不是回仪表盘/404
+    const auditURL = base.replace(/\/+$/, '') + '/#/audit';
+    await page.goto(auditURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.card-head h3:has-text("操作审计")', { timeout: 15000 });
+    if (await page.locator('.nav-item:has-text("操作审计")').count() !== 1) {
+      throw new Error('#/audit 打开后侧栏「操作审计」入口数不为 1');
+    }
+    await shot('52c-audit-direct-hash');
   });
 
   // ---------- 操作审计（P1）----------

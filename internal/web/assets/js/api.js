@@ -106,6 +106,14 @@ export const api = {
   systemInfo: () => request('GET', `${API_BASE}/system/info`),
   processes: (sort = 'cpu', limit = 12) =>
     request('GET', `${API_BASE}/system/processes?sort=${sort}&limit=${limit}`),
+  // ---- 运行依赖（基础环境）----
+  //
+  // 与"网站环境"（nginx + PHP + MySQL + phpMyAdmin）是**两层**，别再混用：
+  // 这里只报"跨应用运行依赖"——命令行开发者工具(CLT) → Homebrew → ffmpeg。
+  // 判据完全来自后端（不拿服务列表猜）：data = {clt_ok, brew_ok, deps_ok, ready, missing[]}。
+  // 旧面板没有这两个接口 → request() 会抛 status=404 的 ApiError，调用方必须如实提示。
+  baseEnv: () => request('GET', `${API_BASE}/system/base-env`),
+  installBaseEnv: () => request('POST', `${API_BASE}/system/base-env/install`, {}),
   // 审计：列表（带检索与游标分页）、筛选项、导出。
   // audit() 保留原样给仪表盘用（它只关心最近的记录）。
   audit: (limit = 60) => request('GET', `${API_BASE}/audit?limit=${limit}`),

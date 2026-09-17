@@ -138,6 +138,11 @@ type Manager struct {
 	// 实测就这么发生过：断言"服务不可用时应降级"的测试，因为本机恰好
 	// 有另一个项目在跑 Qwen 而失败，测出来的根本不是被测代码的行为。
 	qwenPortOverride int
+	// baseEnvCLTProbe 仅供测试：替换"命令行开发者工具装没装"的探测。
+	// 默认实现会执行 /usr/bin/xcode-select -p（见 cltInstalled），结论会随
+	// 测试机是否装了 CLT 而变 —— 那正是"单测不许碰真实环境"禁止的
+	// （见 baseenv.go 的 BaseEnvStatus）。
+	baseEnvCLTProbe func(ctx context.Context) bool
 	// mirrorProbeOverride 仅供测试：替换 brew 镜像探测（它会发真实网络请求）。
 	// 没有它的话，每个碰 brewEnv 的单测都会去访问阿里云/中科大，既慢又依赖外网 ——
 	// 违反"单测不许碰真实服务"。

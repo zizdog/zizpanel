@@ -688,8 +688,9 @@ export function AppsView(content, ctx = {}) {
 
     // 分类板块的**顺序与中文名全部来自后端**（GET /api/v1/market 的 sections，
     // 单一来源在 internal/services/catalog.go 的 MarketSections）。
-    // 前端不再自带一份分类中文名 —— 用户要求把最后一个板块「其它」改名为
-    // 「基础环境」，改名只改 catalog.go 一处，这里自动跟着变，不会再漂。
+    // 前端**不写死任何分类中文名** —— 2026-09 起后端把 nginx/PHP/MySQL 归到
+    // 「网站环境」、把命令行工具/容器运行时归到兜底板块：这类改名的字面量只存在于
+    // 后端一处，这里自动跟着变，不会再漂。
     // 空板块会被跳过（例如站点应用搬去「一键建站」后 site 板块在这里为空）。
     const sections = cache?.sections || [];
     if (!sections.length) {
@@ -707,8 +708,9 @@ export function AppsView(content, ctx = {}) {
     const covered = new Set();
     for (const s of sections) {
       const items = s.fallback
-        // 兜底板块收纳所有没有专属板块的分类（当前的 lnmp / runtime 都落在这里，
-        // 也就是 nginx / PHP / MySQL / Colima 容器运行时 —— 它们正是「基础环境」）。
+        // 兜底板块收纳所有没有专属板块的分类（后端当前给的是命令行工具/容器运行时等
+        // 「跨应用运行依赖」；nginx/PHP/MySQL 已有专属的「网站环境」板块）。
+        // 前端不假设兜底里一定是什么 —— 一律照后端给出的 label 渲染。
         ? list.filter((a) => !namedKeys.includes(a.category || 'other'))
         : list.filter((a) => (a.category || 'other') === s.key);
       if (!items.length) continue;

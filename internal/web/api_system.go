@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/zizdog/zizpanel/internal/config"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/auth"
+	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 func goVersion() string { return runtime.Version() }
@@ -103,6 +106,56 @@ func (s *Server) handleSystemDeps(w http.ResponseWriter, r *http.Request) {
 		"missing":       missing,
 		"all_satisfied": missing == 0,
 	})
+}
+
+// handleSystemBaseEnv 返回「基础环境（运行依赖层）」的只读状态。
+//
+// 契约（与前端约定，逐字）：
+//
+//	GET /api/v1/system/base-env → 200
+//	data = {"clt_ok":bool,"brew_ok":bool,"deps_ok":bool,"ready":bool,"missing":["Homebrew","ffmpeg"]}
+//
+// 探测口径以现实为准（不读面板数据库/服务记录），见 services.BaseEnvStatus：
+// CLT = cltInstalled；brew = <前缀>/bin/brew 是否存在；ffmpeg = BaseDependencyStatuses。
+//
+// 为什么单独一个接口而不是复用 /system/deps：**基础环境与网站环境是两层**。
+// 首页横幅过去把两层混在一起（按钮叫「一键 LNMP」却连 CLT/brew/ffmpeg 一起装），
+// 用户看不出"缺的到底是哪一层、点一下会装什么"。现在 base-env 只管运行依赖层。
+func (s *Server) handleSystemBaseEnv(w http.ResponseWriter, r *http.Request) {
+	ok(w, s.baseEnvStatus(r.Context()))
+}
+
+// baseEnvStatus 走可注入的探测（单测注入点见 server.go 的 baseEnvProbeOverride）。
+func (s *Server) baseEnvStatus(ctx context.Context) services.BaseEnvStatus {
+	if s.baseEnvProbeOverride != nil {
+		return s.baseEnvProbeOverride(ctx)
+	}
+	return s.svcManager().BaseEnvStatus(ctx)
+}
+
+// handleSystemBaseEnvInstall 安装「基础环境（运行依赖层）」：Homebrew → ffmpeg。
+//
+// 走任务中心（202 + task_id，进度走 SSE），与其它安装接口同形：
+//
+//	POST /api/v1/system/base-env/install → 202
+//	data = {"task_id":"…","title":"安装基础环境"}
+//
+// **绝不安装 nginx / PHP / MySQL**：那些属于「网站环境」（一键 LNMP，
+// POST /api/v1/market/install-lnmp），用户装 ffmpeg 不该被顺带装上一个 Web 服务器。
+// 失败如实返回 error（services.EnsureBaseEnvironment 不做任何"谎报成功"的降级）。
+func (s *Server) handleSystemBaseEnvInstall(w http.ResponseWriter, r *http.Request) {
+	s.launchTask(w, r, "install", "base-env", "安装基础环境",
+		"install_base_env", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: "base-env", Steps: []string{}}
+			run := s.baseEnvInstallOverride
+			if run == nil {
+				run = s.svcManager().EnsureBaseEnvironment
+			}
+			if err := run(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
 }
 
 // handleProcesses 返回占资源最高的进程列表。
