@@ -300,9 +300,13 @@ func probeGitMirror(ctx context.Context, repoURL string) time.Duration {
 // 把 **--depth=1 的浅克隆包**（31MB → 压缩 9.1MB）放到镜像上：局域网 60 MB/s、1 秒下完，
 // 解出来就是可用的 brew 前缀（Homebrew 的前缀本身就是这个仓库），**完全不需要 git clone**。
 func brewSeedCandidates() []string {
+	// **公网镜像优先**：这个面板是要发给公众用的，192.168.1.8 只是作者家里的 NAS ——
+	// 公众用户永远连不上，放在第一顺位等于让每个人都先白等一次连接超时。
+	// 公网入口本身也走同一台 NAS（10 MB/s，9.5MB ≈ 1 秒），局域网用户并不会慢；
+	// 作者自己的局域网再把 LAN 地址作为第二顺位（连上就 60 MB/s）。
 	return []string{
-		"http://192.168.1.8:8090/brew-seed/brew-shallow.tar.gz",        // 局域网 NAS（最快）
-		"https://mirror.zizdog.com:8888/brew-seed/brew-shallow.tar.gz", // 公网镜像入口
+		"https://mirror.zizdog.com:8888/brew-seed/brew-shallow.tar.gz", // 公网镜像入口（默认）
+		"http://192.168.1.8:8090/brew-seed/brew-shallow.tar.gz",        // 局域网 NAS（更快，仅作者内网可达）
 	}
 }
 
