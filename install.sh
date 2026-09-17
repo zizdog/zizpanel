@@ -1689,23 +1689,35 @@ zp_random_hex() {
 # 用户在真终端上敲一个回车就能把安装悄悄取消掉（真发生过）。
 # 分开之后：超时按"接受默认值"处理，EOF 只在**非交互**场景下才终止。
 zp_read() {
-  local prompt="$1" def="$2" __var="$3" secret="${4:-0}" line="" rc=0
+  local prompt="$1" def="$2" __var="$3" secret="${4:-0}" line="" rc=0 attempt=0
   if [ -n "$def" ]; then
     printf '%s%s%s %s[%s]%s: ' "$C_BOLD" "$prompt" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET"
   else
     printf '%s%s%s: ' "$C_BOLD" "$prompt" "$C_RESET"
   fi
-  if [ "$secret" = "1" ]; then
-    IFS= read -r -s -t 180 -u "$ZP_TTY_FD" line || rc=$?
-    printf '\n'
-  else
-    IFS= read -r -t 180 -u "$ZP_TTY_FD" line || rc=$?
-  fi
-  if [ "$rc" -gt 128 ]; then
-    return 2
-  elif [ "$rc" -ne 0 ]; then
+  # 重试循环：`read -t` 在真终端上会被信号打断（窗口大小变化、Ctrl-Z 之类），
+  # 此时 bash 返回 >128 而**没有读到任何输入**。如果把它当成"超时/EOF"直接返回，
+  # 用户就会看到"敲了回车但脚本跳到下一题/取消了" —— 这是必须避免的。
+  # 处理方式：被打断就重试（最多 3 次），其它非零值才算 EOF。
+  while :; do
+    rc=0
+    if [ "$secret" = "1" ]; then
+      IFS= read -r -s -t 180 -u "$ZP_TTY_FD" line || rc=$?
+      printf '\n'
+    else
+      IFS= read -r -t 180 -u "$ZP_TTY_FD" line || rc=$?
+    fi
+    [ "$rc" -eq 0 ] && break
+    if [ "$rc" -gt 128 ] && [ "$rc" -ne 142 ]; then
+      # >128 且不是 142（142 = 128+14，read 自身的超时约定）→ 被信号打断，重试
+      attempt=$((attempt + 1))
+      if [ "$attempt" -le 2 ]; then
+        continue
+      fi
+      return 2
+    fi
     return 1
-  fi
+  done
   line="${line%$'\r'}"
   [ -n "$line" ] || line="$def"
   printf -v "$__var" '%s' "$line"
