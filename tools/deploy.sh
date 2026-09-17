@@ -58,11 +58,16 @@ EOF
 }
 
 LOCAL_URL="https://127.0.0.1:8443/jab5c63"
-MINI_URL="https://192.168.1.4:8443/6zfxgccj"
+
+# 🛑 2026-09-17 用户明确要求：1.0.0 起 Mac mini 是**生产环境**，本脚本/本机**只升级本机**。
+# 历史：这里曾有 MINI_URL（局域网 + 后缀）与"并行升级两台"—— 那会让一次 `make deploy`
+# 直接动用户的生产面板，已按新规**整段删除**。生产机的升级由用户自己在面板里点「在线升级」。
+# 教训记在 DEVELOPMENT.md：**"测试环境"变成生产环境时，要把工具里的目标一起删掉**，
+# 否则下一个会话/下一个 agent 会照着旧脚本继续动生产。
 
 step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
 
-# 部署只发本机架构：本机与 mini 都是 Apple Silicon（arm64）。
+# 部署只发本机架构（本机是 Apple Silicon / arm64）。
 # 之前把 arm64+amd64 的「版本包 + latest 包」共 4 个 ≈96MB 全传一遍，
 # 而 amd64 这台机器上永远用不到 —— 现在 2 个 ≈46MB。
 ARCHS="${ARCHS:-arm64}"
@@ -131,23 +136,18 @@ done
 nas_sh "$LAYOUT"
 
 # ---------------------------------------------------------------- 升级 --
-# 两台**并行**升级，不再一台等完再等另一台。
-step "并行升级两台机器"
+# 只升级**本机**（生产机不许碰，见文件顶部说明）。
+step "升级本机"
 python3 tools/panel-upgrade.py "$LOCAL_URL" "$ZP_USER" "$ZP_PASS" "$MIRROR_URL" "$VERSION" > /tmp/zp-deploy-local.log 2>&1 &
 P1=$!
-python3 tools/panel-upgrade.py "$MINI_URL" "$ZP_USER" "$ZP_PASS" "$MIRROR_URL" "$VERSION" > /tmp/zp-deploy-mini.log 2>&1 &
-P2=$!
-wait $P1 || true; wait $P2 || true
+wait $P1 || true
 echo "  --- 本机 ---"; tail -2 /tmp/zp-deploy-local.log
-echo "  --- mini ---"; tail -2 /tmp/zp-deploy-mini.log
 
 # ---------------------------------------------------------------- 验证 --
 step "验证真实版本"
 # 注意带面板安全后缀：面板界面与接口都在 /<suffix>/ 之下，
 # 不带后缀会 404（这里踩过一次，验证输出成了"(读不到)"）。
-for u in "$LOCAL_URL" "$MINI_URL"; do
-  printf "  %-44s " "$u"
-  curl -sS -k -m 10 "$u/api/v1/health" 2>/dev/null | grep -oE '"version":"[^"]+"' || echo "(读不到)"
-done
+printf "  %-44s " "$LOCAL_URL"
+curl -sS -k -m 10 "$LOCAL_URL/api/v1/health" 2>/dev/null | grep -oE '"version":"[^"]+"' || echo "(读不到)"
 echo
-echo "完成。"
+echo "完成（生产机未触碰）。"
