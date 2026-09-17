@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -291,6 +292,88 @@ func probeGitMirror(ctx context.Context, repoURL string) time.Duration {
 	return time.Since(started)
 }
 
+// brewSeedCandidates 是 "Homebrew 浅克隆包" 的候选地址（局域网 NAS 优先）。
+//
+// 为什么必须有它（2026-09-18 生产机事故）：Homebrew 官方安装脚本会对 brew.git 做
+// **全量历史 clone**（几百 MB），而国内镜像对 git-upload-pack 的大历史传输会被限速到
+// 近乎 0 —— 用户卡在 "Downloading and installing Homebrew..." 十几分钟、吞吐近零。
+// 把 **--depth=1 的浅克隆包**（31MB → 压缩 9.1MB）放到镜像上：局域网 60 MB/s、1 秒下完，
+// 解出来就是可用的 brew 前缀（Homebrew 的前缀本身就是这个仓库），**完全不需要 git clone**。
+func brewSeedCandidates() []string {
+	return []string{
+		"http://192.168.1.8:8090/brew-seed/brew-shallow.tar.gz",        // 局域网 NAS（最快）
+		"https://mirror.zizdog.com:8888/brew-seed/brew-shallow.tar.gz", // 公网镜像入口
+	}
+}
+
+// brewPrefixForSeed 返回本机应该把 brew 铺到哪个前缀（Apple Silicon / Intel 不同）。
+func brewPrefixForSeed() string {
+	if runtime.GOARCH == "arm64" {
+		return "/opt/homebrew"
+	}
+	return "/usr/local"
+}
+
+// tryBrewSeed 试着用镜像上的浅克隆包把 brew 前缀铺好；成功返回 true。
+// 失败一律如实返回 false（调用方回落 git clone 路径），每个来源都打印地址/用时/原因。
+func (m *Manager) tryBrewSeed(ctx context.Context, result *InstallResult) bool {
+	prefix := brewPrefixForSeed()
+	if st, err := os.Stat(filepath.Join(prefix, "bin", "brew")); err == nil && !st.IsDir() {
+		return true // 已经有 brew 了
+	}
+	pkg := filepath.Join(os.TempDir(), "zizpanel-brew-seed.tar.gz")
+	stage := filepath.Join(os.TempDir(), "zizpanel-brew-seed")
+	for _, u := range brewSeedCandidates() {
+		result.step(ctx, "尝试从镜像获取 Homebrew 种子包（浅克隆，约 9.5MB）："+u)
+		started := time.Now()
+		if _, err := m.runRoot(ctx, 3*time.Minute, "/usr/bin/curl",
+			"-fsSL", "--connect-timeout", "8", "--max-time", "150", "-o", pkg, u); err != nil {
+			result.step(ctx, fmt.Sprintf("  ↳ 失败（用时 %.1fs）：%v", time.Since(started).Seconds(), err))
+			continue
+		}
+		_ = os.RemoveAll(stage)
+		if err := os.MkdirAll(stage, 0o755); err != nil {
+			result.step(ctx, "  ↳ 失败：无法创建临时目录")
+			continue
+		}
+		if _, err := m.runRoot(ctx, 2*time.Minute, "/usr/bin/tar", "-xzf", pkg, "-C", stage); err != nil {
+			result.step(ctx, fmt.Sprintf("  ↳ 失败：解包出错 %v", err))
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(stage, "homebrew", "bin", "brew")); err != nil || st.IsDir() {
+			result.step(ctx, "  ↳ 失败：种子包里没有 bin/brew（可能不是完整包）")
+			continue
+		}
+		if _, err := os.Stat(prefix); err == nil {
+			result.step(ctx, "清理上次半装的 "+prefix)
+			if err := os.RemoveAll(prefix); err != nil {
+				result.step(ctx, fmt.Sprintf("  ↳ 失败：无法清理 %s：%v", prefix, err))
+				continue
+			}
+		}
+		if err := os.MkdirAll(prefix, 0o755); err != nil {
+			result.step(ctx, fmt.Sprintf("  ↳ 失败：无法创建 %s：%v", prefix, err))
+			continue
+		}
+		if _, err := m.runRoot(ctx, 2*time.Minute, "/usr/bin/tar", "-xzf", pkg, "-C", prefix, "--strip-components=1"); err != nil {
+			result.step(ctx, fmt.Sprintf("  ↳ 失败：铺到 %s 出错 %v", prefix, err))
+			continue
+		}
+		if m.opt.UserName != "" {
+			_, _ = m.runRoot(ctx, time.Minute, "/usr/sbin/chown", "-R", m.opt.UserName+":admin", prefix)
+		}
+		if st, err := os.Stat(filepath.Join(prefix, "bin", "brew")); err != nil || st.IsDir() {
+			result.step(ctx, "  ↳ 失败：铺好后仍找不到 bin/brew")
+			continue
+		}
+		result.step(ctx, fmt.Sprintf("  ↳ 成功（用时 %.1fs）：Homebrew 已从镜像种子包就绪", time.Since(started).Seconds()))
+		_ = os.Remove(pkg)
+		_ = os.RemoveAll(stage)
+		return true
+	}
+	return false
+}
+
 // pickBrewGitMirror 在候选里**挑延迟最低**的一个（不是"第一个能通的"）。
 //
 // 为什么要比延迟：能通不代表能用 —— 清华能通（1.86s），但它会把 clone 排进队列
@@ -350,6 +433,21 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 		return err
 	}
 
+	// 2) **种子优先**：能从镜像（局域网 NAS → 公网镜像）拿到浅克隆包，就完全不做 git clone
+	//    （clone 几百 MB 全量历史在国内镜像上会被限速到近乎 0 —— 真机卡死的根因）。
+	if m.tryBrewSeed(ctx, result) {
+		if m.reconcileBrewBin() {
+			result.step(ctx, "已按实际安装位置修正 brew 路径："+m.opt.BrewBin)
+		}
+		ver, err := m.brewRun(ctx, time.Minute, "--version")
+		if err != nil {
+			return fmt.Errorf("Homebrew 种子包已铺好但执行不了：%s", truncate(strings.TrimSpace(ver), 300))
+		}
+		result.step(ctx, "Homebrew 安装完成："+strings.SplitN(strings.TrimSpace(ver), "\n", 2)[0])
+		return nil
+	}
+
+	// 2b) 种子不可用：回落到"下载官方/镜像安装脚本 + git clone"（保留兜底）
 	// 2) 下载安装脚本（官方不通就走镜像）
 	scriptPath := "/tmp/zizpanel-brew-install.sh"
 	var lastErr error

@@ -245,28 +245,56 @@ try {
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(1200);
     await shot('05-settings');
+    // 2026-09-21：「关于与运维」整块已搬到侧栏「检查更新」，设置页不该再有这个 Tab。
+    if (await page.locator('button:has-text("关于与运维")').count()) {
+      throw new Error('面板设置里仍有「关于与运维」Tab（应已迁移到侧栏「检查更新」）');
+    }
   });
 
-  await step('切换设置内的三个 Tab', async () => {
-    for (const t of ['账号与两步验证', '关于与运维', '访问与安全']) {
+  await step('切换设置内的两个 Tab', async () => {
+    for (const t of ['账号与两步验证', '访问与安全']) {
       await page.click(`button:has-text("${t}")`);
       await page.waitForTimeout(700);
       await shot('06-settings-' + t);
     }
   });
 
-  // ---------- 在线升级 ----------
-  await step('在线升级卡片显示真实状态', async () => {
-    await page.click('button:has-text("关于与运维")');
-    await page.waitForTimeout(1200);
-    const txt = await page.locator('.content').innerText();
-    for (const need of ['在线升级', '当前版本', '内嵌发布公钥', '检查更新']) {
-      if (!txt.includes(need)) throw new Error(`在线升级卡片缺少「${need}」`);
+  // ---------- 检查更新（原「关于与运维」，2026-09-21 提到侧栏）----------
+  await step('侧栏「检查更新」可打开，且页内没有「操作审计」', async () => {
+    if (!(await page.locator('.nav-item:has-text("检查更新")').count())) {
+      throw new Error('侧栏缺少「检查更新」入口');
     }
+    await page.click('.nav-item:has-text("检查更新")');
+    await page.waitForTimeout(1500);
+    const txt = await page.locator('.content').innerText();
+    for (const need of ['在线升级', '当前版本', '内嵌发布公钥', '立即检测', '一键更新']) {
+      if (!txt.includes(need)) throw new Error(`检查更新页缺少「${need}」`);
+    }
+    // 操作审计是侧栏的独立页面，这里不能再出现第二份（用户明确要求去重）。
+    if (txt.includes('操作审计')) throw new Error('检查更新页不应出现「操作审计」');
     // 当前版本必须和 session 里报告的一致，避免卡片显示了一个假的版本
     const ver = await page.locator('#zp-up-ver').innerText();
     if (!/^v\d+\.\d+\.\d+/.test(ver)) throw new Error('版本号显示异常: ' + ver);
-    await shot('07-upgrade-card');
+    await shot('07-update-page');
+  });
+
+  await step('旧 hash 别名仍到「检查更新」（老书签不能 404）', async () => {
+    const raw = page.url().split('#')[0];
+    for (const h of ['#/settings/about', '#/about']) {
+      await page.goto(raw + h, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(1200);
+      const active = (await page.locator('.nav-item.active').innerText().catch(() => '')).trim();
+      const body = await page.locator('.content').innerText();
+      if (!active.includes('检查更新') || !body.includes('在线升级')) {
+        throw new Error(`旧 hash ${h} 没有落到「检查更新」（active=${active}）`);
+      }
+    }
+    // 顺带确认设置页留下了迁移指路入口（老用户按旧位置找得到）
+    await page.goto(raw + '#/settings', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+    if (!(await page.locator('.content').innerText()).includes('已迁移的功能')) {
+      throw new Error('面板设置页缺少「已迁移的功能」指路入口');
+    }
   });
 
   await step('升级源留空时自动走候选源（不再报“尚未配置升级源地址”）', async () => {
@@ -274,26 +302,167 @@ try {
     // （用户显式源 → 同网段 NAS → https://zizdog.com/zizpanel → mirror → GitHub），
     // 每个候选内部都要通过验签才算命中。所以这里断言的是"给出了结论"，
     // 而不是某个具体状态码 —— 有更新/已是最新/全部候选不可达都是正常结果。
+    await page.click('.nav-item:has-text("检查更新")');
+    await page.waitForTimeout(800);
     await page.fill('input[placeholder^="https://example.com"]', '');
     expectHTTPError = true;
     try {
-      await page.click('button:has-text("检查更新")');
-      await page.waitForTimeout(2000);
+      await page.click('button:has-text("立即检测")');
+      await page.waitForTimeout(2500);
       const body = await page.locator('.content').innerText();
       if (body.includes('尚未配置升级源地址')) {
         throw new Error('仍在报「尚未配置升级源地址」——候选源没有生效');
       }
-      if (!/候选|升级源|已是最新|新版本|失败/.test(body)) {
+      if (!/候选|升级源|已是最新|新版本|失败|未/.test(body)) {
         throw new Error('检查更新没有给出任何结论：' + body.slice(0, 200));
       }
     } finally {
       expectHTTPError = false;
     }
-    await shot('07-upgrade-no-source');
-    // 把 Tab 还原：后续步骤假设停留在「访问与安全」页，
-    // 测试步骤之间不能互相踩状态（这一条我自己刚踩过）。
-    await page.click('button:has-text("访问与安全")');
-    await page.waitForTimeout(600);
+    await shot('07-update-no-source');
+  });
+
+  // ---------- 主动检测 / 徽标 / 一键更新（用户 2026-09-21 的第 4、5 条）----------
+  // 全部用 page.route 桩伪造升级接口，**绝不真实升级**（apply 会重启面板）。
+  await step('发现新版本：页内醒目提示 + 侧栏徽标（刷新后仍在）', async () => {
+    const json = (route, data, status = 200) => route.fulfill({
+      status, contentType: 'application/json', body: JSON.stringify({ ok: true, data }),
+    });
+    await page.route('**/api/v1/system/upgrade**', (route) => {
+      const u = new URL(route.request().url());
+      const m = route.request().method();
+      if (u.pathname.endsWith('/upgrade/check') && m === 'POST') {
+        return json(route, { current: '0.0.1', latest: '9.9.9', has_update: true, effective_source: 'ui-test-stub' });
+      }
+      if (u.pathname.endsWith('/upgrade') && m === 'GET') {
+        return json(route, {
+          current_version: '0.0.1', arch: 'darwin_arm64', build_time: '2026-01-01T00:00:00Z',
+          can_remote: true, pubkey: 'stub', can_apply: false, is_root: false, plain_http: false,
+          source: '', effective_source: 'ui-test-stub', staged: false, staged_version: '', notes: '',
+          state: { status: 'idle' },
+        });
+      }
+      return route.continue();
+    });
+    try {
+      // 当前停在 #/update；整页刷新才会重挂载 View 并跑启动自动检测
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2500);
+      const dot = page.locator('[data-testid="zp-update-badge"]');
+      if (!(await dot.count()) || !(await dot.first().isVisible())) {
+        throw new Error('发现新版本后侧栏「检查更新」没有出现徽标');
+      }
+      const txt = await page.locator('.content').innerText();
+      if (!txt.includes('发现新版本')) throw new Error('检查更新页没有醒目提示新版本');
+      await shot('07c-update-available');
+      // 刷新后徽标仍在（检测结果落 localStorage，不是内存态）
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      if (!(await page.locator('[data-testid="zp-update-badge"]').first().isVisible())) {
+        throw new Error('刷新后侧栏徽标丢了（检测结果没有持久化）');
+      }
+    } finally {
+      await page.unroute('**/api/v1/system/upgrade**');
+      await page.evaluate(() => localStorage.removeItem('zp-upgrade-check'));
+    }
+  });
+
+  await step('升级成功提示会自动消失（回归：「成功绿条永不消失」）', async () => {
+    const fresh = new Date().toISOString();
+    // 桩要模拟真实语义：dismiss 之后服务端终态被清成 idle，再 GET 就不该又是 success
+    // —— 否则前端重渲染时会把同一个 success 再读回来，看起来像"没消失"。
+    let dismissed = false;
+    const json = (route, data, status = 200) => route.fulfill({
+      status, contentType: 'application/json', body: JSON.stringify({ ok: true, data }),
+    });
+    await page.route('**/api/v1/system/upgrade**', (route) => {
+      const u = new URL(route.request().url());
+      const m = route.request().method();
+      if (u.pathname.endsWith('/upgrade/check') && m === 'POST') {
+        return json(route, { current: '1.0.0', latest: '1.0.0', has_update: false });
+      }
+      if (u.pathname.endsWith('/upgrade/dismiss') && m === 'POST') { dismissed = true; return json(route, { status: 'idle' }); }
+      if (u.pathname.endsWith('/upgrade') && m === 'GET') {
+        return json(route, {
+          current_version: '1.0.0', arch: 'darwin_arm64', build_time: 'x', can_remote: true, pubkey: 'stub',
+          can_apply: false, is_root: false, plain_http: false, source: '', effective_source: 'stub',
+          staged: false, staged_version: '', notes: '',
+          state: dismissed
+            ? { status: 'idle' }
+            : { status: 'success', to: '1.0.0', message: '升级成功', finished_at: fresh },
+        });
+      }
+      return route.continue();
+    });
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      if (!(await page.locator('text=升级成功：').count())) {
+        throw new Error('刚刚完成的成功态应当显示横幅');
+      }
+      await page.waitForTimeout(9000); // 自动消失 7s + 余量
+      if (await page.locator('text=升级成功：').count()) {
+        throw new Error('成功提示 9 秒后仍未消失（回归 bug 复发）');
+      }
+      await shot('07d-success-auto-dismissed');
+    } finally {
+      await page.unroute('**/api/v1/system/upgrade**');
+      await page.evaluate(() => localStorage.removeItem('zp-upgrade-check'));
+    }
+  });
+
+  await step('「一键更新」一次点击走完 stage → apply → 整页刷新', async () => {
+    const calls = [];
+    let applied = false;
+    const json = (route, data, status = 200) => route.fulfill({
+      status, contentType: 'application/json', body: JSON.stringify({ ok: true, data }),
+    });
+    await page.route('**/api/v1/system/upgrade**', (route) => {
+      const u = new URL(route.request().url());
+      const m = route.request().method();
+      if (u.pathname.endsWith('/upgrade/check') && m === 'POST') {
+        return json(route, { current: '1.0.0', latest: '9.9.9', has_update: true, effective_source: 'stub' });
+      }
+      if (u.pathname.endsWith('/upgrade/stage') && m === 'POST') { calls.push('stage'); return json(route, { staged: true, version: '9.9.9' }); }
+      if (u.pathname.endsWith('/upgrade/apply') && m === 'POST') { calls.push('apply'); applied = true; return json(route, { status: 'applying' }, 202); }
+      if (u.pathname.endsWith('/upgrade/dismiss') && m === 'POST') return json(route, { status: 'idle' });
+      if (u.pathname.endsWith('/upgrade') && m === 'GET') {
+        return json(route, {
+          current_version: '1.0.0', arch: 'darwin_arm64', build_time: 'x', can_remote: true, pubkey: 'stub',
+          can_apply: true, is_root: true, plain_http: false, source: '', effective_source: 'stub',
+          staged: false, staged_version: '', notes: '',
+          state: applied
+            ? { status: 'success', to: '9.9.9', message: '升级成功', finished_at: new Date().toISOString() }
+            : { status: 'idle' },
+        });
+      }
+      return route.continue();
+    });
+    await page.route('**/api/v1/health', (route) => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { status: 'ok' } }),
+    }));
+    let navs = 0;
+    const onNav = (f) => { if (f === page.mainFrame()) navs += 1; };
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      const btn = page.locator('[data-testid="zp-oneclick-update"]');
+      if (!(await btn.count())) throw new Error('缺少「一键更新」按钮');
+      page.on('framenavigated', onNav);
+      navs = 0;
+      await btn.first().click();
+      await page.waitForTimeout(12000); // stage → apply → 等 status=success + health 200 → reload
+      page.off('framenavigated', onNav);
+      const si = calls.indexOf('stage');
+      const ai = calls.indexOf('apply');
+      if (si < 0 || ai < 0) throw new Error('一键更新没有走完 stage→apply：' + JSON.stringify(calls));
+      if (si > ai) throw new Error('调用顺序错误（apply 在 stage 之前）：' + JSON.stringify(calls));
+      if (navs < 1) throw new Error('升级成功后没有整页刷新');
+    } finally {
+      await page.unroute('**/api/v1/system/upgrade**');
+      await page.unroute('**/api/v1/health');
+      await page.evaluate(() => localStorage.removeItem('zp-upgrade-check'));
+    }
   });
 
   await step('用户名表单可用（只验证校验，不改真实账号）', async () => {
@@ -301,8 +470,10 @@ try {
     // 登录（下一轮运行也一样）。成功路径由 Go 测试覆盖，那里有硬证据：
     // 改名后旧用户名登录失败、新用户名登录成功、会话不受影响。
     //
-    // 用户名卡片在「账号与两步验证」Tab 里，而上一步骤停在「关于与运维」，
-    // 所以要先切回来（曾漏这一步，测试报"缺少入口"，其实是找错了 Tab）。
+    // 用户名卡片在「面板设置 → 账号与两步验证」Tab 里；上一步骤停在「检查更新」
+    // 独立页，所以先回到面板设置再切 Tab（2026-09-21 迁移后新增这一步）。
+    await page.click('.nav-item:has-text("面板设置")');
+    await page.waitForTimeout(800);
     await page.click('button:has-text("账号与两步验证")');
     await page.waitForTimeout(1000);
     const btn = page.locator('button:has-text("修改用户名")');
@@ -373,6 +544,9 @@ try {
     const navItems = page.locator('.nav-item');
     const n = await navItems.count();
     const placeholders = [];
+    // 「检查更新」现在挂在侧栏：点开它会触发一次真实的 POST /upgrade/check
+    // （无外网时可能是 502）。那是被探测页面的正常行为，不该记成前端故障。
+    expectHTTPError = true;
     for (let i = 0; i < n; i++) {
       const label = (await navItems.nth(i).innerText()).trim();
       if (!label) continue;
@@ -381,6 +555,7 @@ try {
       const txt = await page.locator('.content').innerText();
       if (txt.includes('正在开发中')) placeholders.push(label);
     }
+    expectHTTPError = false;
     if (placeholders.length) {
       throw new Error('仍有占位页: ' + placeholders.join(' / '));
     }

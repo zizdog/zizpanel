@@ -18,6 +18,7 @@ import { LogsView } from './logs.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { AuditView } from './audit.js';
+import { UpdateView, startUpgradeWatcher, hasUpdate } from './update.js';
 import { taskCenter } from './tasks.js';
 
 // ---------------- 全局状态 ----------------
@@ -61,6 +62,11 @@ export const NAV = [
   { id: 'logs', title: '日志中心', icon: '📜', view: LogsView },
   { group: '系统' },
   { id: 'audit', title: '操作审计', icon: '🧾', view: AuditView },
+  // 2026-09-21：原来这里是「面板设置 → 关于与运维」的第 4 个 Tab。用户要求把它
+  // 整块提到侧边栏并改名「检查更新」——"有没有新版本"是随时想知道的状态，
+  // 埋在两级点击之后没人看得到，也就没人升级。
+  // 旧的页内 Tab 链接（#/settings/about）与可能的 #/about 都必须继续可用：见 ROUTE_TARGET。
+  { id: 'update', title: '检查更新', icon: '⬆️', view: UpdateView },
   { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
 ];
 
@@ -77,6 +83,17 @@ const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n
 // "#/services 落到已安装 Tab"，而不是靠人肉点。运行时没有别的调用方。
 const ROUTE_TARGET = {
   services: { id: 'apps', tab: 'installed' },
+  // 「关于与运维」已从「面板设置」的页内 Tab 提成独立页（侧栏「检查更新」）。
+  // 页内 Tab 时代的链接有两种写法，一个都不能 404：
+  //   #/settings/about  —— 旧写法（版块 + Tab），见下面的 SUB_ROUTE_TARGET
+  //   #/about / #/upgrade —— 文档/书签里可能直接引用的单段写法
+  about: { id: 'update' },
+  upgrade: { id: 'update' },
+};
+
+// 两段式 hash（#/<版块>/<Tab>）的别名表，键是 "版块/Tab"。
+const SUB_ROUTE_TARGET = {
+  'settings/about': { id: 'update' },
 };
 
 // routeFor 解析 hash：#/<版块> 或 #/<版块>/<页内 Tab>（如 #/apps/docker）。
@@ -88,7 +105,7 @@ export function routeFor(hash = location.hash) {
   const m = String(hash || '').match(/^#\/([a-z0-9_-]+)(?:\/([a-z0-9_-]+))?/i);
   const id = m ? m[1] : 'dashboard';
   const sub = (m && m[2]) ? m[2] : '';
-  const t = ROUTE_TARGET[id];
+  const t = ROUTE_TARGET[id] || (sub ? SUB_ROUTE_TARGET[`${id}/${sub}`] : null);
   return t ? { ...t } : { id, tab: sub };
 }
 
@@ -349,12 +366,24 @@ function renderApp() {
   NAV.forEach((n) => {
     if (n.group) { nav.appendChild(h('div.nav-group', { text: n.group })); return; }
     const active = n.id === item.id;
+    // 「检查更新」上的小红点：发现新版本时挂在侧栏上，**刷新后仍然在**
+    // （检测结果落在 localStorage，见 update.js 的 updateInfo()）。
+    const dot = n.id === 'update'
+      ? h('span.badge.zp-update-dot', {
+        dataset: { testid: 'zp-update-badge' },
+        text: '新',
+        title: '发现新版本，点击查看',
+        style: { background: 'var(--danger)', color: '#fff', border: '1px solid transparent' },
+        hidden: !hasUpdate(),
+      })
+      : null;
     nav.appendChild(h(`div.nav-item${active ? '.active' : ''}`, {
       onclick: () => { location.hash = '#/' + n.id; document.body.classList.remove('nav-open'); },
     }, [
       h('span.ico', { text: n.icon }),
       h('span', { text: n.title }),
       n.phase ? h('span.badge', { text: n.phase }) : null,
+      dot,
     ]));
   });
 
@@ -406,6 +435,11 @@ function renderApp() {
   // 初始化完成后徽标要画在"当前这个"按钮上。
   taskCenter.init();
 
+  // 新版本主动检测：进面板时自动测一次，之后每 6 小时一次（幂等，页面可见时才跑）。
+  // 结果变化会派发 zp:update-state，由下面的监听原地同步侧栏小红点。
+  startUpgradeWatcher();
+  syncUpdateBadge();
+
   // 渲染前先清理上一个页面的长连接（SSE / 定时器），避免叠加泄漏
   runCleanup();
 
@@ -423,6 +457,16 @@ function renderApp() {
   view(content, { item, topbar, pageTitle, onLeave: registerCleanup, tab: target.tab });
   document.title = `${item.title} · ZizPanel`;
 }
+
+// syncUpdateBadge 原地亮/灭侧栏「检查更新」的小红点。
+//
+// 为什么不靠重渲染外壳：renderApp() 会把页面打回默认状态（正在填的表单会丢）。
+// update.js 检测完只派发一个事件，这里负责把徽标改掉。
+function syncUpdateBadge() {
+  const show = hasUpdate();
+  document.querySelectorAll('.zp-update-dot').forEach((el) => { el.hidden = !show; });
+}
+window.addEventListener('zp:update-state', syncUpdateBadge);
 
 // ---------------- 页面级资源清理 ----------------
 // View 通过 ctx.onLeave(fn) 注册清理函数；切换路由时统一执行。
