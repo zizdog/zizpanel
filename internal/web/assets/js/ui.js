@@ -79,7 +79,15 @@ export const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel
 // ---------------- Toast ----------------
 
 export function toast(message, type = 'info', timeout = 4200) {
-  const box = document.getElementById('toasts');
+  // 反馈通道本身不能失败：所有写操作（启停/卸载/升级…）的失败提示都走这里。
+  // 一旦它抛异常（例如 #toasts 不在 DOM 里），调用方 catch 里的那句提示就跟着
+  // 一起没了 —— 用户看到的正是"点了没反应"（见 DEVELOPMENT.md 坑 154）。
+  // 缺容器就现场补一个，保证提示一定看得见。
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = h('div#toasts.toasts');
+    (document.body || document.documentElement).appendChild(box);
+  }
   const icon = { ok: '✅', err: '⛔', warn: '⚠️', info: 'ℹ️' }[type] || 'ℹ️';
   const node = h(`div.toast.${type === 'info' ? '' : type}`, [
     h('span', { text: icon }),

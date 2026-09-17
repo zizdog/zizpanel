@@ -215,7 +215,11 @@ uitest-live: ## 对本机真实安装实例跑完整 UI 验证（含建站等特
 	 set -a; . ./$(CRED_FILE); set +a; node tools/uitest.mjs "$$BASE" $(SHOTS)
 
 .PHONY: smoke
-smoke: run-local uitest ## 启动本地实例并做 UI 验证（特权步骤跳过，用 uitest-live 补全）
+smoke: run-local ## 启动本地实例并做 UI 验证（特权步骤跳过，用 uitest-live 补全）
+	@# ⚠️ 必须**无论成败都 stop-local**：以前写成 `smoke: run-local uitest`，
+	# uitest 一失败 make 就中断，调试实例被留在用户机器上（真机发生过，
+	# 遗留进程监听 127.0.0.1:18443 好几轮才被发现）。
+	@node tools/uitest.mjs; rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
 
 # ---------------------------------------------------------------- 发布打包 --
 # install.sh 在目标机上会用到这些脚本（入口接管 / 服务器模式 / 自检工具）。

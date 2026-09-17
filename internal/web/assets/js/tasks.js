@@ -1029,50 +1029,46 @@ function init() {
   return initPromise;
 }
 
+// SUBMIT_TIMEOUT_MS 是"提交任务"这一步的硬上限。
+//
+// 为什么必须有（本 bug 的根因之一，见 DEVELOPMENT.md 坑 154）：后端对这个接口是
+// **立刻回 202 + task_id**（正常毫秒级），可一旦请求迟迟不落定（面板进程假死 /
+// 连接被中间层挂住 / 半开连接），原来那句 `await run()` 会一直等下去 —— 确认框
+// 已经关掉、进度窗又永远不会出现，用户看到的就是**点了没反应**：没有 toast、
+// 没有报错、也没有真的卸载。写操作的失败必须可见，绝不允许静默。
+// 同样的上限在面板首屏查询里早就有（servicePanel.js 的 PANEL_QUERY_TIMEOUT_MS）。
+const SUBMIT_TIMEOUT_MS = 20000;
+
+// submitTimeoutMs 允许测试收紧（tools/uitest.mjs 要在几秒内确定性地验证"超时要说话"）。
+// setSubmitTimeoutMs(ms)：ms 为正数时生效；不传 / 非正数 = 恢复默认。
+let submitTimeoutMs = SUBMIT_TIMEOUT_MS;
+function setSubmitTimeoutMs(ms) {
+  const n = Number(ms);
+  submitTimeoutMs = (Number.isFinite(n) && n > 0) ? n : SUBMIT_TIMEOUT_MS;
+  return submitTimeoutMs;
+}
+
+/** idOf 从后端各种返回形状里取出任务编号（历史上有过 task_id / task.id / id 三种）。 */
+function idOf(res) {
+  if (!res) return '';
+  return res.task_id || (res.task && res.task.id) || res.id || '';
+}
+
 /**
- * start({kind, target, title, start}) 提交一个任务。
- *
- * start 是调用方给的 Promise（`() => api.installXxx()`）：后端现在立刻返回
- * `{ok:true, data:{task_id, title}}`，进度靠任务中心看。失败（4xx）时给出 toast，
- * 不抛异常 —— 调用方不需要写 try/catch。
+ * adopt 把"已经确认创建成功"的任务接进任务中心：登记 meta、接流、刷新列表、开进度窗。
+ * 正常提交与"迟到但最终成功"的提交共用这一份（后者见 start 的超时分支）——
+ * 同一个动作只有一条实现，不会出现"补开的那条路少做了一步"。
  */
-async function start({ kind, target, title, start: run, onDone } = {}) {
-  if (typeof run !== 'function') { toast('内部错误：缺少任务执行函数', 'err'); return null; }
-
-  // 同一个 target 已经在跑：后端也会拒绝（并发安装各自独立，仅禁止重复启动同一个），
-  // 这里直接把用户带到那个任务的进度窗，而不是让他看到一个 409 错误。
-  const running = findByTarget(target);
-  if (running) {
-    toast(`「${running.title || title || target}」正在进行中`, 'warn');
-    openTask(running.id);
-    return running.id;
-  }
-
-  let res = null;
-  try {
-    res = await run();
-  } catch (e) {
-    toast((title ? title + '：' : '') + ((e && e.message) || String(e)), 'err', 9000);
-    return null;
-  }
-
-  const id = res && (res.task_id || (res.task && res.task.id) || res.id);
-  if (!id) {
-    // 后端还没切到异步版本：如实说，绝不假装任务已经启动（那会让用户以为在装，
-    // 实际什么都没发生）。
-    toast((title || '任务') + '：服务端没有返回任务编号（后端可能尚未启用任务中心）', 'warn', 10000);
-    return null;
-  }
-
+function adopt(id, res, { kind, target, title, onDone } = {}) {
   const meta = Object.assign({
     id,
     kind: kind || 'install',
     target: target || '',
-    title: (res.task && res.task.title) || res.title || title || '任务',
+    title: (res && res.task && res.task.title) || (res && res.title) || title || '任务',
     status: 'running',
     started_at: new Date().toISOString(),
     line_count: 0,
-  }, res.task || {}, { _localAt: Date.now() });
+  }, (res && res.task) || {}, { _localAt: Date.now() });
 
   STATE.metas.set(id, meta);
   ensureStream(id);
@@ -1094,4 +1090,89 @@ async function start({ kind, target, title, start: run, onDone } = {}) {
   return id;
 }
 
-export const taskCenter = { button, init, openList, openTask, start, findByTarget, onChange };
+/**
+ * start({kind, target, title, start, onDone, timeoutMs}) 提交一个任务。
+ *
+ * start 是调用方给的 Promise（`() => api.installXxx()`）：后端立刻返回
+ * `{ok:true, data:{task_id, title}}`，进度靠任务中心看。返回任务编号；
+ * **提交失败一律不在界面上沉默**：给出带原因的 toast 并返回 null。不抛异常
+ * （调用方不需要写 try/catch），但应当检查返回值再决定要不要刷新界面。
+ *
+ * timeoutMs 只给测试用（默认 SUBMIT_TIMEOUT_MS）：提交超过这个时间还没落定，
+ * 就如实说"没收到确认"，绝不假装成功。
+ */
+async function start({ kind, target, title, start: run, onDone, timeoutMs } = {}) {
+  if (typeof run !== 'function') { toast('内部错误：缺少任务执行函数', 'err'); return null; }
+
+  // 同一个 target 已经在跑：后端也会拒绝（并发安装各自独立，仅禁止重复启动同一个），
+  // 这里直接把用户带到那个任务的进度窗，而不是让他看到一个 409 错误。
+  const running = findByTarget(target);
+  if (running) {
+    toast(`「${running.title || title || target}」正在进行中`, 'warn');
+    openTask(running.id);
+    return running.id;
+  }
+
+  // 先把请求真的发出去；同步抛错也要落定成"可见的失败"，不能悬着。
+  let submit;
+  try {
+    submit = Promise.resolve(run());
+  } catch (e) {
+    toast((title ? title + '：' : '') + ((e && e.message) || String(e)), 'err', 9000);
+    return null;
+  }
+
+  const budget = (Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0)
+    ? Number(timeoutMs) : submitTimeoutMs;
+  const TIMEOUT = Symbol('submit-timeout');
+  let timer = null;
+  const guard = new Promise((resolve) => { timer = setTimeout(() => resolve(TIMEOUT), budget); });
+
+  let res = null;
+  let fail = null;
+  try {
+    res = await Promise.race([submit, guard]);
+  } catch (e) {
+    fail = e;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (fail) {
+    toast((title ? title + '：' : '') + ((fail && fail.message) || String(fail)), 'err', 9000);
+    return null;
+  }
+
+  if (res === TIMEOUT) {
+    // 请求没落定：**绝不能**当成成功（那是谎报），也绝不能沉默（那正是本 bug）。
+    toast((title || '任务') +
+      `：提交后 ${Math.max(1, Math.round(budget / 1000))} 秒内没有收到面板确认（请求被挂住了）。` +
+      '请点顶栏「任务中心」确认它有没有真的开始；没有就再试一次。', 'err', 15000);
+    refresh(); // 后端可能其实已经建好了任务：列表是权威的，让它有机会显示出来
+    // 迟到的结果也必须有归宿：真的建了任务就补开进度窗并如实说明 ——
+    // 否则这个任务永远"没人管"（用户以为没开始，其实它在后台跑）。
+    submit.then((late) => {
+      const lateId = idOf(late);
+      if (!lateId) return;
+      toast((title || '任务') + '：它其实已经创建（提交只是回得慢），正在打开进度窗', 'warn', 9000);
+      adopt(lateId, late, { kind, target, title, onDone });
+    }).catch((e) => {
+      toast((title ? title + '：' : '') + '提交最终失败：' + ((e && e.message) || String(e)), 'err', 12000);
+    });
+    return null;
+  }
+
+  const id = idOf(res);
+  if (!id) {
+    // 后端还没切到异步版本：如实说，绝不假装任务已经启动（那会让用户以为在装，
+    // 实际什么都没发生）。
+    toast((title || '任务') + '：服务端没有返回任务编号（后端可能尚未启用任务中心）', 'warn', 10000);
+    return null;
+  }
+
+  return adopt(id, res, { kind, target, title, onDone });
+}
+
+export const taskCenter = {
+  button, init, openList, openTask, start, findByTarget, onChange, setSubmitTimeoutMs,
+};

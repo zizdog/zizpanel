@@ -472,6 +472,185 @@ try {
     if (!txt.includes('运行中')) throw new Error('未显示任何运行中的服务');
   });
 
+  // ---------- 卸载：点下去必须有可见反馈（回归：坑 154）----------
+  //
+  // 用户报障："点某条已安装服务的「🗑 卸载」，没有任何反馈，也没有真的卸载"。
+  // 这条断言**全部走桩**（page.route），确定性、不依赖本机装了什么、绝不真卸载：
+  //   ① 桩三条 managed=true 的服务 → 「⚙️ 管理」里出现「🗑 卸载」（这是唯一会
+  //      出现这颗按钮的判据，见 servicePanel.servicePanelActions ⑧）；
+  //   ② 点它 → 必须出现确认框（不是"点了没反应"）；
+  //   ③ 确认（桩 202）→ 必须出现任务进度窗，且 DELETE 真的发出去了；
+  //   ④ 后端失败（桩 500）→ 必须出现**带原因**的 toast，且不能弹出进度窗（谎报成功）；
+  //   ⑤ 请求被挂住（桩为迟到 4 秒）→ 超时也必须说话；迟到的 202 到达后任务要被接管。
+  //
+  // 为什么三条服务：taskCenter 对"同一个 target 已在跑"会直接复用旧任务，
+  // 三个场景各用自己的名字才不会互相短路。
+  await step('卸载：点按钮必须有确认框 / 任务窗 / 明确错误（桩数据，不碰真实服务）', async () => {
+    const FAKES = [
+      { name: 'uitest-svc-ok', display_name: 'UITEST 卸载·正常', kind: 'native', managed: true, state: { running: true, status: 'running' } },
+      { name: 'uitest-svc-fail', display_name: 'UITEST 卸载·失败', kind: 'native', managed: true, state: { running: true, status: 'running' } },
+      { name: 'uitest-svc-slow', display_name: 'UITEST 卸载·被挂住', kind: 'native', managed: true, state: { running: true, status: 'running' } },
+    ];
+    const uninstallCalls = [];
+
+    // 桩返回的 5xx / 假 task id（SSE 会 404）都是断言对象，不是前端故障。
+    expectHTTPError = true;
+
+    const clearToasts = () => page.evaluate(() => {
+      document.querySelectorAll('.toasts .toast').forEach((n) => n.remove());
+    });
+
+    const closeAllModals = async () => {
+      for (let i = 0; i < 5; i++) {
+        const masks = page.locator('.modal-mask');
+        if (!(await masks.count())) break;
+        const x = masks.last().locator('button.modal-close').first();
+        if (await x.count()) await x.click().catch(() => {});
+        await page.waitForTimeout(250);
+      }
+    };
+
+    // 打开某条桩服务的「⚙️ 管理」面板，返回那颗「🗑 卸载」
+    const openUninstallBtn = async (displayName) => {
+      const card = page.locator('#installed-grid > div', { hasText: displayName }).first();
+      await card.waitFor({ timeout: 15000 });
+      await card.locator('button:has-text("管理")').click();
+      const btn = page.locator('.modal-mask button:has-text("🗑 卸载")').last();
+      await btn.waitFor({ timeout: 8000 });
+      return btn;
+    };
+
+    // 服务列表 / 详情 / 凭据 / 卸载接口
+    await page.route('**/api/v1/services**', async (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      const un = path.match(/^services\/([^/]+)\/uninstall$/);
+      if (req.method() === 'DELETE' && un) {
+        const name = decodeURIComponent(un[1]);
+        uninstallCalls.push(name);
+        if (name === 'uitest-svc-fail') {
+          return route.fulfill({
+            status: 500, contentType: 'application/json',
+            body: JSON.stringify({ ok: false, msg: 'UITEST 桩：服务不存在' }),
+          });
+        }
+        const body = JSON.stringify({ ok: true, data: { task_id: 'uitest-task-' + name, title: '卸载 ' + name } });
+        if (name === 'uitest-svc-slow') await new Promise((r) => setTimeout(r, 4000));
+        return route.fulfill({ status: 202, contentType: 'application/json', body });
+      }
+      if (req.method() === 'GET' && (path === 'services' || path === 'services/health')) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: FAKES } }) });
+      }
+      if (req.method() === 'GET' && /^services\/[^/]+$/.test(path)) {
+        const f = FAKES.find((x) => path === 'services/' + x.name) || FAKES[0];
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: f }) });
+      }
+      if (req.method() === 'GET' && /credentials$/.test(path)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { credentials: [] } }) });
+      }
+      return route.continue();
+    });
+    // 市场目录：给空目录，「已安装」就只剩上面那三条桩服务
+    await page.route('**/api/v1/market**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [] } }),
+    }));
+    // 假任务的进度流：立刻回一条"成功"并结束。**必须**这么做 —— 否则假任务会一直
+    // 挂在客户端里重连一个不存在的流，测试收尾后还在往 errors 里刷 404。
+    await page.route('**/api/v1/tasks**', (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      const m = path.match(/^tasks\/([^/]+)\/stream$/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '卸载 ' + id, status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '卸载 ' + id, status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+      });
+    });
+
+    await closeAllModals();
+    await page.click('.nav-item:has-text("应用")');
+    await page.waitForTimeout(2000);
+
+    // ② 点「🗑 卸载」→ 必须出现确认框
+    await (await openUninstallBtn('UITEST 卸载·正常')).click();
+    const confirm = page.locator('.modal-mask', { hasText: '卸载服务' }).last();
+    await confirm.locator('button:has-text("确认卸载")').waitFor({ timeout: 8000 });
+    await shot('46a-uninstall-confirm');
+
+    // ③ 确认（桩 202）→ 必须出现任务进度窗，且 DELETE 真的发出去了
+    await confirm.locator('button:has-text("确认卸载")').click();
+    await page.locator('.modal-mask', { hasText: '关闭窗口（后台继续）' }).last().waitFor({ timeout: 10000 });
+    if (!uninstallCalls.includes('uitest-svc-ok')) {
+      throw new Error('点了确认卸载，但 DELETE 没有发出去：' + JSON.stringify(uninstallCalls));
+    }
+    await shot('46b-uninstall-task-window');
+    await closeAllModals();
+    await clearToasts();
+
+    // ④ 后端失败（桩 500）→ 必须出现带原因的 toast，且**不能**弹进度窗
+    await (await openUninstallBtn('UITEST 卸载·失败')).click();
+    await page.locator('.modal-mask button:has-text("确认卸载")').last().click();
+    const errToast = page.locator('.toasts .toast.err').first();
+    await errToast.waitFor({ timeout: 8000 });
+    const errText = await errToast.innerText();
+    if (!/UITEST 桩：服务不存在/.test(errText)) {
+      throw new Error('卸载失败没有把原因显示出来：' + errText);
+    }
+    if (await page.locator('.modal-mask', { hasText: '关闭窗口（后台继续）' }).count()) {
+      throw new Error('卸载提交失败了，却弹出了任务进度窗（谎报成功）');
+    }
+    await shot('46c-uninstall-fail-visible');
+    await closeAllModals();
+    await clearToasts();
+
+    // ⑤ 请求被挂住：把提交超时收紧到 1.2s（默认 20s），让这条断言几秒内确定完成。
+    await page.evaluate(async () => {
+      const { taskCenter } = await import('./js/tasks.js');
+      taskCenter.setSubmitTimeoutMs(1200);
+    });
+    await (await openUninstallBtn('UITEST 卸载·被挂住')).click();
+    await page.locator('.modal-mask button:has-text("确认卸载")').last().click();
+    const slowToast = page.locator('.toasts .toast.err').first();
+    await slowToast.waitFor({ timeout: 8000 });
+    const slowText = await slowToast.innerText();
+    if (!/没有收到面板确认|请求被挂住/.test(slowText)) {
+      throw new Error('提交被挂住时没有给出超时提示（界面静默了）：' + slowText);
+    }
+    await shot('46d-uninstall-timeout-visible');
+    // 迟到 4 秒的 202 到达后，任务必须被接管（补开进度窗），不能成为"没人管的任务"
+    await page.locator('.modal-mask', { hasText: '关闭窗口（后台继续）' }).last().waitFor({ timeout: 12000 });
+    if (!uninstallCalls.includes('uitest-svc-slow')) {
+      throw new Error('超时场景里 DELETE 没有被发出：' + JSON.stringify(uninstallCalls));
+    }
+    await shot('46e-uninstall-late-adopted');
+
+    // 收尾：恢复默认超时、撤掉所有桩（后面的步骤必须看到真实数据）
+    await page.evaluate(async () => {
+      const { taskCenter } = await import('./js/tasks.js');
+      taskCenter.setSubmitTimeoutMs();
+    });
+    await closeAllModals();
+    await clearToasts();
+    await page.unroute('**/api/v1/services**');
+    await page.unroute('**/api/v1/market**');
+    await page.unroute('**/api/v1/tasks**');
+    expectHTTPError = false;
+    // 撤掉桩之后必须让页面重新拉一次**真实**数据：否则后面的步骤会在这张桩卡片上操作。
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(800);
+    await page.click('.nav-item:has-text("应用")');
+    await page.waitForTimeout(2500);
+  });
+
   await step('查看服务日志（SSE 实时流）', async () => {
     // 2026-09-16：「日志」按钮从服务卡片搬进了「应用管理」面板（市场卡片与服务管理
     // 点开的是同一个面板；市场上的两个入口「详情」「查看服务」已合并成「⚙️ 管理」）。

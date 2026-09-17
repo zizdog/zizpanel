@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,6 +218,57 @@ func (m *Manager) reconcileBrewBin() bool {
 	return false
 }
 
+// brewGitMirror 是一组"brew 仓库 + core 仓库"的国内 git 镜像。
+type brewGitMirror struct{ Brew, Core string }
+
+// brewGitMirrorCandidates 按优先级列出候选镜像。
+//
+// 为什么必须**探测再选**（2026-09-18 生产机事故）：原来把 brew 仓库写死成
+// mirrors.ustc.edu.cn/brew.git，而该地址当天对 `git fetch` 返回 **403** →
+// Homebrew 安装脚本重试 5 次后整体失败（CLT 已装好、卡在 brew 这一步），
+// 日志里只有一句"安装 Homebrew 失败"，用户完全看不出是镜像站的问题。
+// 现在逐个探测（`info/refs?service=git-upload-pack` 与 git 走同一条路），
+// 谁先通就用谁；一个都不通就**不设这两个变量**，交给 brew 用官方源兜底。
+func brewGitMirrorCandidates() []brewGitMirror {
+	return []brewGitMirror{
+		{
+			Brew: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git",
+			Core: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
+		},
+		{
+			Brew: "https://mirrors.ustc.edu.cn/brew.git",
+			Core: "https://mirrors.ustc.edu.cn/homebrew-core.git",
+		},
+	}
+}
+
+// probeGitMirror 探测一个 git 仓库地址是否可用（HTTP 2xx）。
+func probeGitMirror(ctx context.Context, repoURL string) bool {
+	c := &http.Client{Timeout: 6 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(repoURL, "/")+"/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// pickBrewGitMirror 选出第一个可用的镜像；(false) 表示都不通。
+func (m *Manager) pickBrewGitMirror(ctx context.Context) (brewGitMirror, bool) {
+	for _, cand := range brewGitMirrorCandidates() {
+		if probeGitMirror(ctx, cand.Brew) && probeGitMirror(ctx, cand.Core) {
+			return cand, true
+		}
+	}
+	return brewGitMirror{}, false
+}
+
 func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) error {
 	if result == nil {
 		result = &InstallResult{Steps: []string{}}
@@ -298,9 +351,18 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 		defer func() { _ = os.RemoveAll(shimDir) }()
 	}
 	result.step(ctx, "开始安装 Homebrew（国内镜像下通常几分钟）")
-	env := append(m.brewEnv(ctx, "brew"),
-		"HOMEBREW_BREW_GIT_REMOTE=https://mirrors.ustc.edu.cn/brew.git",
-		"HOMEBREW_CORE_GIT_REMOTE=https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
+	env := m.brewEnv(ctx, "brew")
+	// 仓库镜像**探测后择优**：写死单一镜像一旦 403/下线，整条安装链就断在 brew 这一步
+	// （2026-09-18 生产机事故：USTC 403 → brew 重试 5 次 → "安装 Homebrew 失败"）。
+	if mir, ok := m.pickBrewGitMirror(ctx); ok {
+		result.step(ctx, "Homebrew 仓库镜像："+mir.Brew)
+		env = append(env,
+			"HOMEBREW_BREW_GIT_REMOTE="+mir.Brew,
+			"HOMEBREW_CORE_GIT_REMOTE="+mir.Core)
+	} else {
+		result.step(ctx, "国内 brew 仓库镜像都不可用，改用官方源（可能较慢）")
+	}
+	env = append(env,
 		// AllowRoot + 垫片 + 临时免密 sudo 是同一个目的的三道保险：
 		// 三道都不成立时才会真正失败，而那种情况会**如实报出来**（不谎报成功）。
 		"HOMEBREW_ALLOW_ROOT=1",

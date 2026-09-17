@@ -1139,22 +1139,35 @@ export function forgetButton(m, onDone) {
 
 // uninstallButton 卸载面板托管的应用（managed=true 的收尾动作）。
 export function uninstallButton(s, onDone) {
+  const label = (s && (s.display_name || s.name)) || '这个服务';
   return h('button.btn.btn-danger.btn-sm', {
     text: '🗑 卸载',
     title: '停止并删除由面板安装的服务（会先说明会做什么并要求确认）',
     onclick: async () => {
-      if (!await confirmBox(
-        `将卸载「${s.display_name || s.name}」。\n\n` +
-        (s.kind === 'compose'
-          ? '这会停止并删除容器与网络（具名数据卷会保留）。'
-          : '这会卸载软件包并删除其后台服务配置。'),
-        { title: '卸载服务', danger: true, okText: '确认卸载' })) return;
-      // 卸载是异步任务（可能跑几分钟）：进度与结果在任务中心的进度窗里看。
-      taskCenter.start({
-        kind: 'uninstall', target: s.name, title: `卸载 ${s.display_name || s.name}`,
-        start: () => api.serviceUninstall(s.name),
-      });
-      if (typeof onDone === 'function') onDone();
+      try {
+        if (!await confirmBox(
+          `将卸载「${label}」。\n\n` +
+          (s.kind === 'compose'
+            ? '这会停止并删除容器与网络（具名数据卷会保留）。'
+            : '这会卸载软件包并删除其后台服务配置。'),
+          { title: '卸载服务', danger: true, okText: '确认卸载' })) return;
+        // 卸载是异步任务（可能跑几分钟）：进度与结果在任务中心的进度窗里看。
+        //
+        // 必须 await 这次提交：提交本身没成功（后端拒绝 / 网络不通 / 请求被挂住）
+        // 时 taskCenter.start 会弹出**带原因**的 toast 并返回 null ——
+        // 那种情况下既不能再触发 onDone（会刷出一个"什么都没发生"的界面），
+        // 更不能沉默。写操作的失败必须可见，这条是本 bug（坑 154）的教训。
+        const taskId = await taskCenter.start({
+          kind: 'uninstall', target: s.name, title: `卸载 ${label}`,
+          start: () => api.serviceUninstall(s.name),
+        });
+        if (!taskId) return; // 失败原因已由 taskCenter.start 弹出来了
+        if (typeof onDone === 'function') onDone();
+      } catch (e) {
+        // 兜底：确认框/渲染层自己抛异常时也必须说话 —— async 点击处理器里的异常
+        // 会变成 unhandled rejection，用户那边就是"点了没反应"。
+        toast('卸载「' + label + '」失败：' + ((e && e.message) || e), 'err', 12000);
+      }
     },
   });
 }
@@ -1164,61 +1177,76 @@ export function uninstallButton(s, onDone) {
 export function marketUninstallButton(mi, onDone) {
   const plan = mi.uninstall || {};
   const residual = !!mi.artifacts && !mi.installed;
+  // 计划被 blocked（例如"还有 1 个 Docker 应用在用这个运行时"）时**不能**用
+  // disabled：禁用的按钮点下去什么都不发生（原因还只在悬浮提示里），用户看到的
+  // 就是"点了没反应"—— 这正是本 bug 的形态。保持可点，点了把原因说出来。
+  const blocked = !!plan.blocked && !residual;
   return h('button.btn.btn-sm.btn-danger', {
     text: residual ? '删除残留数据' : '卸载',
-    disabled: !!plan.blocked && !residual,
+    'aria-disabled': blocked ? 'true' : null,
+    style: blocked ? { opacity: '.72' } : null,
     title: residual ? '只删除磁盘上的残留产物/数据' : (plan.blocked || '卸载「' + mi.name + '」'),
     onclick: async () => {
-      const remove = h('input', { type: 'checkbox' });
-      const paths = plan.data_paths || [];
-      const okGo = await new Promise((resolve) => {
-        modal({
-          title: (residual ? '删除残留数据 · ' : '卸载 ') + mi.name,
-          body: h('div', [
-            residual
-              ? h('div', {
-                style: { marginBottom: '8px' },
-                text: '这个应用当前没有安装，这一步只删除磁盘上的残留产物/数据，不可恢复。',
-              })
-              : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
-            residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } },
-              (plan.steps || []).map((x) => h('li', { text: x }))),
-            (!residual && plan.keep_note) ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
-            (!residual && paths.length)
-              ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } },
-                [remove, h('span', { text: '同时删除数据/产物（不可恢复）：' })])
-              : null,
-            paths.length
-              ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
-                paths.map((x) => h('li.mono', { text: x })))
-              : null,
-          ]),
-          footer: (close) => [
-            h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
-            h('button.btn.btn-danger', {
-              text: residual ? '删除残留数据' : '确认卸载',
-              onclick: () => { close(); resolve(true); },
-            }),
-          ],
-          onClose: () => resolve(false),
+      try {
+        if (blocked) {
+          toast('现在不能卸载「' + mi.name + '」：' + plan.blocked, 'warn', 14000);
+          return;
+        }
+        const remove = h('input', { type: 'checkbox' });
+        const paths = plan.data_paths || [];
+        const okGo = await new Promise((resolve) => {
+          modal({
+            title: (residual ? '删除残留数据 · ' : '卸载 ') + mi.name,
+            body: h('div', [
+              residual
+                ? h('div', {
+                  style: { marginBottom: '8px' },
+                  text: '这个应用当前没有安装，这一步只删除磁盘上的残留产物/数据，不可恢复。',
+                })
+                : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
+              residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } },
+                (plan.steps || []).map((x) => h('li', { text: x }))),
+              (!residual && plan.keep_note) ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
+              (!residual && paths.length)
+                ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } },
+                  [remove, h('span', { text: '同时删除数据/产物（不可恢复）：' })])
+                : null,
+              paths.length
+                ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
+                  paths.map((x) => h('li.mono', { text: x })))
+                : null,
+            ]),
+            footer: (close) => [
+              h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
+              h('button.btn.btn-danger', {
+                text: residual ? '删除残留数据' : '确认卸载',
+                onclick: () => { close(); resolve(true); },
+              }),
+            ],
+            onClose: () => resolve(false),
+          });
         });
-      });
-      if (!okGo) return;
-      const wipe = residual ? true : remove.checked;
-      taskCenter.start({
-        kind: 'uninstall', target: mi.id,
-        title: (residual ? '删除残留数据 ' : '卸载 ') + mi.name,
-        start: () => api.marketUninstall(mi.id, wipe),
-        onDone: (task) => {
-          if (task && task.status && task.status !== 'succeeded') {
-            toast((residual ? '删除残留数据失败：' : '卸载失败：') + (task.error || task.status), 'err', 12000);
-          } else {
-            toast(residual ? '已删除「' + mi.name + '」的残留数据'
-              : '已卸载「' + mi.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'), 'ok', 9000);
-          }
-          if (typeof onDone === 'function') onDone();
-        },
-      });
+        if (!okGo) return;
+        const wipe = residual ? true : remove.checked;
+        await taskCenter.start({
+          kind: 'uninstall', target: mi.id,
+          title: (residual ? '删除残留数据 ' : '卸载 ') + mi.name,
+          start: () => api.marketUninstall(mi.id, wipe),
+          onDone: (task) => {
+            if (task && task.status && task.status !== 'succeeded') {
+              toast((residual ? '删除残留数据失败：' : '卸载失败：') + (task.error || task.status), 'err', 12000);
+            } else {
+              toast(residual ? '已删除「' + mi.name + '」的残留数据'
+                : '已卸载「' + mi.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'), 'ok', 9000);
+            }
+            if (typeof onDone === 'function') onDone();
+          },
+        });
+      } catch (e) {
+        // 同上：任何一步失败都要有一句带原因的话，绝不静默。
+        toast((residual ? '删除残留数据' : '卸载') + '「' + mi.name + '」失败：' +
+          ((e && e.message) || e), 'err', 12000);
+      }
     },
   });
 }
