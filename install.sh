@@ -41,7 +41,7 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
@@ -332,6 +332,33 @@ detect_source() {
   exit 1
 }
 
+
+# zp_curl_progress <输出文件> <URL> [总字节数]：带**可见进度**的下载。
+#
+# 为什么要自己轮询：curl 的 --progress-bar 只在 stderr 是终端时才画，而
+# `curl -fsSL install.sh | sudo bash` 这种用法下用户实测"只看到一行说明、没有进度条"。
+# 这里每秒打印一次"已下载 X MB"，与 TTY 无关，进度**一定看得见**。
+zp_curl_progress() {
+  local out="$1" url="$2" total="${3:-0}" pid rc=0 sz mb
+  /usr/bin/curl -fsL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 300 \
+    -o "$out" "$url" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sz="$(/usr/bin/stat -f%z "$out" 2>/dev/null || echo 0)"
+    mb="$(awk -v b="$sz" 'BEGIN{printf "%.1f", b/1048576}')"
+    if [ "$total" -gt 0 ]; then
+      printf '\r  ⬇ 已下载 %s / %s MB（%d%%）   ' "$mb" \
+        "$(awk -v b="$total" 'BEGIN{printf "%.1f", b/1048576}')" "$(( sz * 100 / total ))"
+    else
+      printf '\r  ⬇ 已下载 %s MB   ' "$mb"
+    fi
+    sleep 1
+  done
+  wait "$pid" || rc=$?
+  printf '\r\033[K'
+  return "$rc"
+}
+
 download_binaries() {
   TMP_DIR="$(mktemp -d)"
   local arch="arm64"
@@ -339,9 +366,17 @@ download_binaries() {
   local file="zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz"
   local url="$ZIZPANEL_DOWNLOAD_BASE/download/$ZIZPANEL_VERSION/$file"
 
-  info "下载面板安装包（约 24 MB；国内镜像下通常 30–60 秒，下面是实时进度条）"
+  # 让用户知道自己**正在装什么版本**：默认 ZIZPANEL_VERSION=latest，真实版本在清单里。
+  local shown_ver="$ZIZPANEL_VERSION"
+  if [ "$shown_ver" = "latest" ]; then
+    shown_ver="$(/usr/bin/curl -fsSL --max-time 15 "${ZIZPANEL_DOWNLOAD_BASE%/}/manifest.json" 2>/dev/null \
+      | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+    [ -n "$shown_ver" ] || shown_ver="（清单未取到，下载后确认）"
+  fi
+  info "即将安装：ZizPanel ${shown_ver}（架构 ${arch}）"
+  info "下载面板安装包（约 24 MB；国内镜像下通常 30–60 秒，下面有实时进度）"
   info "下载：$url"
-  if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
+  if ! zp_curl_progress "$TMP_DIR/pkg.tar.gz" "$url"; then
     # 自动换到下一个候选源（镜像优先，官方兜底）：用户不必知道镜像地址
     local -a fallbacks=("$BUILTIN_MIRROR" "${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}" "$GITHUB_RELEASE_BASE")
     local fb
@@ -353,7 +388,7 @@ download_binaries() {
       warn "从 $ZIZPANEL_DOWNLOAD_BASE 下载失败，改用：$fb"
       url="$fb/download/$ZIZPANEL_VERSION/$file"
       info "下载：$url"
-      if curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
+      if zp_curl_progress "$TMP_DIR/pkg.tar.gz" "$url"; then
         ZIZPANEL_DOWNLOAD_BASE="$fb"
         done_ok=1
         break
@@ -372,6 +407,9 @@ download_binaries() {
   # SCRIPT_DIR 变成用户当前目录（如 /Users/zizdog），那里没有 tools/ → 整段复制被跳过 →
   # 面板装完后「远程登录」报"找不到 server-mode.sh"、「一键 LNMP」也拿不到 system-services.sh。
   info "下载完成，正在解压与校验…"
+  if v="$("$TMP_DIR/zizpanel" version 2>/dev/null | head -1)"; then
+    info "安装包版本确认：${v}"
+  fi
   SCRIPT_DIR="$TMP_DIR"
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"
@@ -1435,7 +1473,11 @@ finish() {
   [ -n "$suffix" ] || suffix="$PANEL_SUFFIX_INPUT"
 
   printf '\n'
-  printf '  %s🦊 ZizPanel 已就绪%s\n\n' "$C_BOLD" "$C_RESET"
+  printf '  %s🦊 ZizPanel 已就绪%s\n' "$C_BOLD" "$C_RESET"
+  if v="$("$BIN_DIR/zizpanel" version 2>/dev/null | head -1)"; then
+    printf '  面板版本   %s%s%s\n' "$C_BOLD" "$v" "$C_RESET"
+  fi
+  printf '\n'
   if [ -n "$suffix" ]; then
     printf '  远程访问   %s%s://%s:%s/%s/%s\n' "$C_GREEN" "$scheme" "$ip" "$port" "$suffix" "$C_RESET"
     printf '  本机访问   %s%s://127.0.0.1:%s/%s/%s\n' "$C_BLUE" "$scheme" "$port" "$suffix" "$C_RESET"

@@ -19,7 +19,10 @@
 #    · `--dry-run` 只打印每一步，不做任何修改 —— 可以在任何机器上安全预演。
 #    · 幂等：已经卸过的东西不会报错，会如实说"本来就没有"。
 # =============================================================================
-set -euo pipefail
+# ⚠️ 刻意**不用 set -e**：脚本里有多处 `cmd && ok "…"` 形式，只要 cmd 返回非 0
+# 就会让整行失败 —— 配 set -e 就是**静默中止**（真机事故：用户看到"卸载完成"，
+# 实际什么都没删，服务与 Homebrew 全在）。改为每一步显式判断并在结尾**大声报错**。
+set -uo pipefail
 
 PANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
 PANEL_LABEL="cn.zizpanel.panel"
@@ -102,21 +105,26 @@ backup_everything() {
   local p
   for p in "${BREW_PREFIXES[@]}"; do
     if [ -d "$p/var/mysql" ]; then
-      tar -czf "$BACKUP_DIR/mysql-var.tar.gz" -C "$p" var/mysql 2>/dev/null \
-        && ok "MySQL 数据 → mysql-var.tar.gz（$(du -sh "$BACKUP_DIR/mysql-var.tar.gz" | awk '{print $1}')）" \
-        || warn "MySQL 数据备份失败（继续，但请自行确认）"
+      if tar -czf "$BACKUP_DIR/mysql-var.tar.gz" -C "$p" var/mysql 2>/dev/null; then
+        ok "MySQL 数据 → mysql-var.tar.gz（$(du -sh "$BACKUP_DIR/mysql-var.tar.gz" | awk '{print $1}')）"
+      else
+        warn "MySQL 数据备份失败（继续，但请自行确认）"
+      fi
     fi
     if [ -d "$p/etc/nginx" ]; then
-      tar -czf "$BACKUP_DIR/nginx-etc.tar.gz" -C "$p" etc/nginx 2>/dev/null \
-        && ok "nginx 配置 → nginx-etc.tar.gz"
+      if tar -czf "$BACKUP_DIR/nginx-etc.tar.gz" -C "$p" etc/nginx 2>/dev/null; then
+        ok "nginx 配置 → nginx-etc.tar.gz"
+      fi
     fi
     if [ -x "$p/bin/brew" ]; then
-      "$p/bin/brew" bundle dump --file="$BACKUP_DIR/Brewfile" --force 2>/dev/null \
-        && ok "已装软件清单 → Brewfile（之后可 brew bundle install 一键装回）"
+      if "$p/bin/brew" bundle dump --file="$BACKUP_DIR/Brewfile" --force 2>/dev/null; then
+        ok "已装软件清单 → Brewfile（之后可 brew bundle install 一键装回）"
+      fi
     fi
   done
-  [ -f "$PANEL_ROOT/data/config.json" ] && cp -f "$PANEL_ROOT/data/config.json" "$BACKUP_DIR/panel-config.json" \
-    && ok "面板配置 → panel-config.json"
+  if [ -f "$PANEL_ROOT/data/config.json" ] && cp -f "$PANEL_ROOT/data/config.json" "$BACKUP_DIR/panel-config.json"; then
+    ok "面板配置 → panel-config.json"
+  fi
   cp -f "$HOME/.zprofile" "$BACKUP_DIR/zprofile.bak" 2>/dev/null || true
   ok "备份目录：$BACKUP_DIR"
 }
@@ -401,10 +409,31 @@ main() {
     remove_panel_data
   fi
 
+  local failed=0
   if [ "$DRY" != "1" ]; then
     verify "$MODE"
+    # 硬校验：该消失的东西还在 → **明确报错**（这是本轮事故的教训：
+    # 卸载脚本"看起来成功"比失败更糟）
+    if [ "$MODE" != "1" ]; then
+      if command -v brew >/dev/null 2>&1; then
+        bad "Homebrew 仍在：$(command -v brew) —— 卸载**没有完成**"; failed=1
+      fi
+      if [ -d /Library/Developer/CommandLineTools ]; then
+        bad "命令行开发者工具仍在 —— 卸载**没有完成**"; failed=1
+      fi
+      if ls /Library/LaunchDaemons/homebrew.mxcl.*.plist >/dev/null 2>&1; then
+        bad "基础环境的服务定义仍在（/Library/LaunchDaemons/homebrew.mxcl.*.plist）"; failed=1
+      fi
+    fi
+    if [ "$MODE" = "2" ] && [ -d "$PANEL_ROOT" ]; then
+      bad "面板目录仍在：$PANEL_ROOT —— 卸载**没有完成**"; failed=1
+    fi
   fi
   summary
+  if [ "$failed" = "1" ]; then
+    printf '  %s上面有未完成的项：请把输出整段发给开发者%s\n\n' "$C_RED" "$C_RESET"
+    exit 1
+  fi
 }
 
 main "$@"
