@@ -354,9 +354,33 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 
 	tarPath := filepath.Join(s.Cfg.WorkDir, "upgrade", "download",
 		fmt.Sprintf("zizpanel_%s_%s.tar.gz", m.Version, upgrade.AssetKey(runtime.GOOS, runtime.GOARCH)))
-	if _, err := upgrade.DownloadTarball(ctx, ref.URL, tarPath, ref.SHA256); err != nil {
-		s.stageFailed(st, err.Error())
-		fail(w, http.StatusBadGateway, "下载升级包失败："+err.Error())
+	// 局域网抓包：清单来自权威源（保证"有没有更新"判断正确），但**包**优先从 NAS 取 ——
+	// 实测快两个数量级（92 MB/s vs ～0.5 MB/s）。DownloadTarball 会按清单里的 SHA-256 校验，
+	// NAS 上是旧包/坏包时校验必然失败 → 自动回落到清单里的原始地址。
+	tryURLs := []string{ref.URL}
+	if upgrade.OnNASSubnet() {
+		if lan := upgrade.LANAssetURL(ref.URL); lan != "" {
+			tryURLs = append([]string{lan}, tryURLs...)
+			st.Stage = fmt.Sprintf("正在下载 v%s 安装包（优先局域网镜像）", m.Version)
+			_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+		}
+	}
+	var lastErr error
+	for _, u := range tryURLs {
+		if _, err := upgrade.DownloadTarball(ctx, u, tarPath, ref.SHA256); err == nil {
+			lastErr = nil
+			break
+		} else {
+			lastErr = err
+			if len(tryURLs) > 1 {
+				st.Stage = fmt.Sprintf("局域网镜像那份没通过校验或不可达（%v），回落到原地址", err)
+				_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+			}
+		}
+	}
+	if lastErr != nil {
+		s.stageFailed(st, lastErr.Error())
+		fail(w, http.StatusBadGateway, "下载升级包失败："+lastErr.Error())
 		return
 	}
 

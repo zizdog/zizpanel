@@ -41,13 +41,17 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.2"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
 ZIZPANEL_LISTEN="${ZIZPANEL_LISTEN:-}"
+# ZIZPANEL_LISTEN_EXPLICIT=1 表示端口是"人给的"（ZP_PORT/--port），不是默认 8443 ——
+# 只影响提示语（安装界面不再提问端口，用户要求"默认 8443 不提问"）。
+ZIZPANEL_LISTEN_EXPLICIT=""
 if [ -z "$ZIZPANEL_LISTEN" ] && [ -n "${ZP_PORT:-}" ]; then
   ZIZPANEL_LISTEN=":$ZP_PORT"
+  ZIZPANEL_LISTEN_EXPLICIT=1
 fi
 ZIZPANEL_LISTEN="${ZIZPANEL_LISTEN:-:8443}"
 # 本机访问路径：新面板会接管旧面板，并在该路径提供入口
@@ -1877,24 +1881,18 @@ collect_basic_info() {
     info "面板路径后缀未启用（安全加强默认关闭）：装好后可在面板「系统设置」里随时开启。"
   fi
 
-  # ---- 监听端口 ----
-  local def_port="${ZIZPANEL_LISTEN##*:}"
-  if zp_input_ok; then
-    local port_ans=""
-    zp_ask "面板监听端口（1-65535）" "$def_port" port_ans
-    case "$port_ans" in
-      ''|*[!0-9]*) warn "端口必须是数字，沿用 $def_port" ;;
-      *)
-        if [ "$port_ans" -ge 1 ] 2>/dev/null && [ "$port_ans" -le 65535 ] 2>/dev/null; then
-          ZIZPANEL_LISTEN=":$port_ans"
-        else
-          warn "端口 $port_ans 超出范围，沿用 $def_port"
-        fi
-        ;;
-    esac
-  fi
-
+  # ---- 监听端口：**不问，默认 8443** ----
+  #
+  # 🛑 2026-09-17 用户明确要求："默认 8443 不提问"。安装界面到此**没有任何技术提问**。
+  # 想换端口：装之前用 ZP_PORT=9000 或 --port 9000；装之后改
+  # `/opt/zizpanel/data/config.json` 里的 `listen` 再 `sudo launchctl kickstart -k system/cn.zizpanel.panel`
+  # （面板运行中改端口会立刻失联，所以设置页刻意不提供这个开关 —— 见 server 的 handleSaveSettings 注释）。
   local final_port="${ZIZPANEL_LISTEN##*:}"
+  if [ -n "${ZIZPANEL_LISTEN_EXPLICIT:-}" ]; then
+    info "监听端口：${final_port}（来自 ZP_PORT/--port）"
+  else
+    info "监听端口：${final_port}（默认值；想改就在装之前给 ZP_PORT=端口）"
+  fi
   printf '\n'
   printf '  %s将要安装：%s\n' "$C_BOLD" "$C_RESET"
   if [ -n "$ADMIN_USERNAME" ]; then
@@ -2378,6 +2376,7 @@ parse_args() {
       --listen|--port)
         shift
         ZIZPANEL_LISTEN="${1:-:8443}"
+        ZIZPANEL_LISTEN_EXPLICIT=1
         ;;
       --user)
         shift

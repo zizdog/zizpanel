@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -130,16 +131,48 @@ func CandidateSources(configured string) []string {
 		out = append(out, raw)
 	}
 
-	if configured != "" && configured != DefaultSource {
+	// 用户/安装脚本配置的源**永远排第一** —— 包括"它就等于默认公网主源"的情况。
+	//
+	// 为什么改（2026-09-17）：以前当 configured == DefaultSource 时会跳过它、让同网段的
+	// NAS 排在最前，好处是局域网快 100 倍，代价是**清单也来自 NAS** —— 而 NAS 清单可能滞后
+	// （坑 149），于是"某次只推公网、忘了同步 NAS"会让同网段机器静默停在旧版本。
+	// 现在清单一律取自权威源；局域网提速改由**包**承担：见 LANAssetURL（按清单里的
+	// SHA-256 从 NAS 抓包，校不过就回落到原地址）。
+	if configured != "" {
 		add(configured)
 	}
+	add(DefaultSource)
 	if OnNASSubnet() {
 		add(NASSource)
 	}
-	add(DefaultSource)
 	add(MirrorSource)
 	add(GitHubSource)
 	return out
+}
+
+// LANAssetURL 把清单里的包地址映射成"局域网 NAS 上的同一个文件"，用于快速抓包。
+//
+// 只映射**包**、不映射清单：清单是信任链的起点，必须来自权威源；而包有 SHA-256 兜底 ——
+// 调用方（DownloadTarball）下完会按清单声明的摘要校验，NAS 上是旧包/坏包时校验必然失败，
+// 于是自然回落到清单里的原始地址。这样同时拿到"清单正确"与"局域网速度"
+// （实测 NAS 92 MB/s vs 公网 zizdog.com ～0.5 MB/s）。
+//
+// 只认路径里的 `/download/...` 段（面板发布件在 NAS 与公网是同一套目录布局，
+// 见 tools/deploy.sh 的 LAYOUT）；认不出来就返回空串，调用方保持原地址。
+func LANAssetURL(assetURL string) string {
+	u, err := url.Parse(strings.TrimSpace(assetURL))
+	if err != nil {
+		return ""
+	}
+	idx := strings.Index(u.Path, "/download/")
+	if idx < 0 {
+		return ""
+	}
+	lan := strings.TrimRight(NASSource, "/") + u.Path[idx:]
+	if lan == strings.TrimRight(strings.TrimSpace(assetURL), "/") {
+		return ""
+	}
+	return lan
 }
 
 // ManifestFetcher 负责"把清单原文与签名拉下来"。

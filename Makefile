@@ -95,15 +95,20 @@ test-short: ## 只跑单测（跳过真实系统采集）
 
 .PHONY: check
 check: ## 提交前检查：格式 + shell 校验 + vet + 测试
-	@echo "==> 版本号来源检查（注释里的历史版本不许遮蔽 var Version）"
+	@echo "==> 版本号来源检查（注释里的历史版本不许遮蔽 var Version；install.sh 的 SCRIPT_VERSION 必须一致）"
 	@real="$(VERSION)"; loose=$$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
+	 scriptv=$$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)".*/\1/p' install.sh | head -1); \
 	 if [ -z "$$real" ]; then echo "!! 从 var Version 取不到版本号"; exit 1; fi; \
 	 if [ "$$loose" != "$$real" ]; then \
 	   echo "!! version.go 里'第一个版本号'($$loose) 与 var Version ($$real) 不一致："; \
 	   echo "   注释里的 x.y.z 会骗过按行取版本的脚本/工具（包名与二进制会错版本）。"; \
-	   echo "   把注释里的版本写成不含 x.y.z 的样子（例如 1.0.0 → 1_0_0 或加引号说明）。"; \
 	   exit 1; \
-	 fi; echo "   ok：版本号 $$real"
+	 fi; \
+	 if [ "$$scriptv" != "$$real" ]; then \
+	   echo "!! install.sh 的 SCRIPT_VERSION ($$scriptv) 与面板版本 ($$real) 不一致："; \
+	   echo "   安装横幅会显示假版本号。执行 make bump（它现在会同时改两处）。"; \
+	   exit 1; \
+	 fi; echo "   ok：版本号 $$real（version.go 与 install.sh 一致）"
 	@echo "==> gofmt 检查"
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi

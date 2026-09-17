@@ -49,13 +49,16 @@ func TestCandidateSourcesOrder(t *testing.T) {
 	t.Run("显式配置优先", func(t *testing.T) {
 		withLocalIPs(t, "192.168.1.4") // 在 NAS 网段
 		assertSourceOrder(t, CandidateSources(custom),
-			[]string{custom, NASSource, DefaultSource, MirrorSource, GitHubSource})
+			[]string{custom, DefaultSource, NASSource, MirrorSource, GitHubSource})
 	})
 
-	t.Run("同网段时 NAS 排在公网主源之前", func(t *testing.T) {
+	t.Run("清单永远先试公网主源，NAS 只作回落（局域网提速由抓包承担）", func(t *testing.T) {
+		// 2026-09-17 改：以前同网段时 NAS 排在公网之前（快 100 倍），但**清单**也来自 NAS，
+		// 而 NAS 清单可能滞后（坑 149）→ 只推公网、忘了同步 NAS 时，同网段机器会静默停在旧版本。
+		// 现在清单先问权威源；NAS 排在后面作局域网/离线回落；包走 LANAssetURL（按 SHA-256 抓包）。
 		withLocalIPs(t, "192.168.1.4")
 		assertSourceOrder(t, CandidateSources(""),
-			[]string{NASSource, DefaultSource, MirrorSource, GitHubSource})
+			[]string{DefaultSource, NASSource, MirrorSource, GitHubSource})
 	})
 
 	t.Run("不同网段时 NAS 不出现", func(t *testing.T) {
@@ -69,12 +72,12 @@ func TestCandidateSourcesOrder(t *testing.T) {
 		}
 	})
 
-	t.Run("配置成默认主源时 NAS 仍优先", func(t *testing.T) {
-		// install.sh / 前端会把默认主源写进 config.json。若因此把公网
-		// 排到 NAS 前面，局域网机器就永远用不上快 100 倍的通道。
+	t.Run("配置成默认主源时也不把它挪到 NAS 后面", func(t *testing.T) {
+		// install.sh / 前端会把默认主源写进 config.json。以前这种情况会让 NAS 排第一
+		// （清单也来自 NAS → 可能滞后）。现在按配置来：配置的就是第一个，NAS 作回落。
 		withLocalIPs(t, "192.168.1.4")
 		assertSourceOrder(t, CandidateSources(DefaultSource),
-			[]string{NASSource, DefaultSource, MirrorSource, GitHubSource})
+			[]string{DefaultSource, NASSource, MirrorSource, GitHubSource})
 	})
 
 	t.Run("去重且去掉尾部斜杠", func(t *testing.T) {
@@ -293,5 +296,27 @@ func TestConfiguredSourceUsedFirstWhenReachable(t *testing.T) {
 	}
 	if len(tried) != 1 {
 		t.Fatalf("配置的源可用时不该再试其它候选，实际访问了 %v", tried)
+	}
+}
+
+// TestLANAssetURL 锁定"公网清单 + 局域网抓包"的地址映射规则。
+//
+// 这是 2026-09-17 那次调整的关键：清单来自权威源（保证版本判断正确），
+// 包按 SHA-256 从 NAS 抓（保证局域网速度），映不出来就老实用原地址。
+func TestLANAssetURL(t *testing.T) {
+	pub := "https://zizdog.com/zizpanel/download/1.0.2/zizpanel_1.0.2_darwin_arm64.tar.gz"
+	want := NASSource + "/download/1.0.2/zizpanel_1.0.2_darwin_arm64.tar.gz"
+	if got := LANAssetURL(pub); got != want {
+		t.Fatalf("映射结果不对\n got: %s\nwant: %s", got, want)
+	}
+	// 认不出来的地址一律返回空串（调用方保持原地址），绝不乱猜
+	for _, bad := range []string{"", "https://example.com/whatever.tar.gz", "https://zizdog.com/zizpanel/manifest.json"} {
+		if got := LANAssetURL(bad); got != "" {
+			t.Fatalf("不该映射的地址返回了 %q（输入 %q）", got, bad)
+		}
+	}
+	// 已经是 NAS 地址时返回空串：避免对同一条地址白试两次
+	if got := LANAssetURL(want); got != "" {
+		t.Fatalf("NAS 地址不该再映射，得到 %q", got)
 	}
 }

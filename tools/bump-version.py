@@ -22,6 +22,10 @@ import sys
 from pathlib import Path
 
 VERSION_GO = Path(__file__).resolve().parent.parent / "internal" / "version" / "version.go"
+# install.sh 顶部还有一份 SCRIPT_VERSION（安装横幅显示"安装脚本 vX.Y.Z"）。
+# 它必须跟着涨：2026-09-17 实测它停在 1.0.0 而面板已经 1.0.1，用户看到的版本号是假的。
+# 同一份事实有两个来源 → 必须由同一个脚本一起改，并在 make check 里互相校验。
+INSTALL_SH = Path(__file__).resolve().parent.parent / "install.sh"
 PATCH_MAX = 10
 
 
@@ -47,6 +51,13 @@ def write_version(new: str) -> None:
     text = VERSION_GO.read_text(encoding="utf-8")
     text = re.sub(r'(var Version = ")[^"]+(")', rf"\g<1>{new}\g<2>", text, count=1)
     VERSION_GO.write_text(text, encoding="utf-8")
+
+    # install.sh 的 SCRIPT_VERSION 同步（缺了它安装横幅会显示旧版本号，而没有任何报错）
+    sh = INSTALL_SH.read_text(encoding="utf-8")
+    sh2, n = re.subn(r'(SCRIPT_VERSION=")[^"]+(")', rf"\g<1>{new}\g<2>", sh, count=1)
+    if n != 1:
+        raise SystemExit(f"在 {INSTALL_SH} 里找不到 SCRIPT_VERSION=... —— 版本号会被改一半，已中止")
+    INSTALL_SH.write_text(sh2, encoding="utf-8")
 
 
 def main() -> int:
