@@ -41,7 +41,7 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
@@ -339,6 +339,7 @@ download_binaries() {
   local file="zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz"
   local url="$ZIZPANEL_DOWNLOAD_BASE/download/$ZIZPANEL_VERSION/$file"
 
+  info "下载面板安装包（约 24 MB；国内镜像下通常 30–60 秒，下面是实时进度条）"
   info "下载：$url"
   if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
     # 自动换到下一个候选源（镜像优先，官方兜底）：用户不必知道镜像地址
@@ -370,6 +371,7 @@ download_binaries() {
   # **真机实测踩到**：`curl … | sudo bash` 时 BASH_SOURCE[0] 是 "bash" → dirname 是 "." →
   # SCRIPT_DIR 变成用户当前目录（如 /Users/zizdog），那里没有 tools/ → 整段复制被跳过 →
   # 面板装完后「远程登录」报"找不到 server-mode.sh"、「一键 LNMP」也拿不到 system-services.sh。
+  info "下载完成，正在解压与校验…"
   SCRIPT_DIR="$TMP_DIR"
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"

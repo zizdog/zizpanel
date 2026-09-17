@@ -180,14 +180,16 @@ export function DashboardView(content, ctx = {}) {
     });
     baseEnvNotice.replaceChildren();
   }
-  function renderBaseEnvNotice() {
+  function renderBaseEnvNotice(hasStaleRecords) {
     baseEnvNotice.append(h('div.card', {
       style: { borderLeft: '4px solid #e6a23c', marginBottom: '14px' },
     }, [
       h('div.card-body', [
         h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 基础环境还没安装' }),
         h('div.hint', {
-          text: '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。'
+          text: (hasStaleRecords
+            ? '检测到 nginx/PHP/MySQL 的记录，但**它们都没有在运行**（可能已被卸载或未启动）。'
+            : '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。')
             + '点击按钮会先自动装好「命令行开发者工具 + Homebrew」，'
             + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。'
             + '装 MySQL 时会问一次 root 口令（60 秒不答自动生成）——**可以不干预**，'
@@ -213,10 +215,14 @@ export function DashboardView(content, ctx = {}) {
     // 用仪表盘**已经在拉**的服务列表判断（不额外请求 /market —— 那个接口在全新机器上
     // 要逐条探测，实测能让首屏多等十几秒，而提示不该拖慢仪表盘）。
     const baseRe = /^(nginx|php|mysql|mariadb|percona)/i;
-    const hasBase = (services || []).some((s) => baseRe.test(String(s.name || ''))
+    const base = (services || []).filter((s) => baseRe.test(String(s.name || ''))
       || baseRe.test(String(s.display_name || '')));
-    if (hasBase) return;   // 已装过：什么都不显示（下次进来重新判断，不缓存）
-    renderBaseEnvNotice();
+    // **判据（必须说清，界面上也写了）**：机器上**真的在跑**的 nginx / PHP / MySQL。
+    // 不是"面板数据库里有没有记录" —— 真机事故：卸载基础环境后记录还在，
+    // 横幅被误判成"已就绪"，用户什么提示都看不到，还以为面板坏了。
+    const live = base.some((s) => (s.state || {}).running);
+    if (live) return;
+    renderBaseEnvNotice(base.length > 0);
   }
 
   content.append(

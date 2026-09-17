@@ -166,7 +166,35 @@ remove_panel_data() {
   fi
 }
 
+# 清理基础环境的 launchd 服务定义。
+#
+# 为什么单独一步（2026-09-17 生产机事故）：LNMP 的服务标签**不是** cn.zizpanel.*，
+# 而是 brew 自己的 homebrew.mxcl.*（php/mysql）与面板给 nginx 建的 cn.zizdog.nginx —
+# 第一版脚本只清 cn.zizpanel.*，于是二进制删了、**服务定义还挂着**，
+# 面板仍显示"运行中"，而数据库页连不上。
+remove_lnmp_labels() {
+  title "清理基础环境的服务定义（brew 与 nginx 的 launchd 作业）"
+  local l f
+  # ⚠️ 只清**确实属于基础环境**的标签：brew 自己的（homebrew.mxcl.* / sh.brew.*）
+  # 与面板给 nginx 建的那一个。**绝不动**你自己的服务
+  # （本机实测存在 com.zizdog.colima / frpc / orbien-client / voicereceiver / qwen3tts 等）。
+  for l in $(launchctl list 2>/dev/null | awk '{print $3}' \
+      | grep -E '^(homebrew\.mxcl\.|sh\.brew\.|cn\.zizdog\.nginx$)' || true); do
+    run launchctl bootout "system/$l" >/dev/null 2>&1 || true
+    ok "已停止基础环境服务 $l"
+  done
+  for f in /Library/LaunchDaemons/homebrew.mxcl.*.plist /Library/LaunchDaemons/sh.brew.*.plist \
+           /Library/LaunchDaemons/cn.zizdog.nginx.plist \
+           "$HOME"/Library/LaunchAgents/homebrew.mxcl.*.plist "$HOME"/Library/LaunchAgents/sh.brew.*.plist; do
+    [ -e "$f" ] || continue
+    info "将删除服务定义：$f"
+    run rm -f "$f"
+  done
+  ok "基础环境的服务定义已清理（你自己的 com.zizdog.* 服务不受影响）"
+}
+
 remove_base_env() { # Homebrew + CLT + 面板装出来的 nginx/PHP/MySQL
+  remove_lnmp_labels
   title "卸载基础环境（Homebrew / 命令行开发者工具 / nginx / PHP / MySQL）"
   local p
   if command -v brew >/dev/null 2>&1; then
