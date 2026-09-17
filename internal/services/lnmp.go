@@ -384,8 +384,22 @@ func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult) e
 	return nil
 }
 
-// installSystemDaemons 把三个服务注册成系统级 LaunchDaemon。
+// installSystemDaemons 把 LNMP 三件套注册成系统级 LaunchDaemon。
 func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResult) error {
+	return m.installSystemDaemonsFor(ctx, result, LNMPFormulas, 10*time.Minute)
+}
+
+// installSystemDaemonsFor 把**任意** formula 列表注册成系统级 LaunchDaemon。
+//
+// 为什么把 formula 列表提成参数：除了一键 LNMP，单个安装的应用（postgresql /
+// ollama / php@8.x）以及 miniflux、syncthing（它们自带安装器）都需要同一件事 ——
+// 无头 macOS 开机不加载 ~/Library/LaunchAgents（坑 130），常驻服务必须落到
+// 系统域。复用这把已在真机上验证过的脚本，而不是再写一份 Go 版。
+func (m *Manager) installSystemDaemonsFor(ctx context.Context, result *InstallResult,
+	formulas []string, timeout time.Duration) error {
+	if len(formulas) == 0 {
+		return fmt.Errorf("没有要注册的服务（formula 列表为空）")
+	}
 	// 脚本**内置在二进制里**（见 system_services.go 的说明）：在线升级只换
 	// 二进制、不发 tools/**，所以"从磁盘找脚本"在升级过的机器上必然失败 ——
 	// mini 上就是这么卡住的。这里改成先从内置内容落盘，再执行。
@@ -396,7 +410,7 @@ func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResul
 	if isTemp {
 		defer func() { _ = os.Remove(script) }()
 	}
-	args := append([]string{script}, LNMPFormulas...)
+	args := append([]string{script}, formulas...)
 	// 显式带上 HOME/USER：面板由 LaunchDaemon 以 root 启动，环境里**没有 HOME**。
 	// 脚本里任何一处 `$HOME` 在 set -u 下都会当场退出（真机踩过：line 105:
 	// HOME: unbound variable → 一键安装卡在最后一步）。脚本自己也补了兜底，
@@ -407,8 +421,12 @@ func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResul
 	}
 	if m.opt.UserName != "" {
 		env = append(env, "USER="+m.opt.UserName, "LOGNAME="+m.opt.UserName)
+		// 脚本判断"服务以谁的身份运行"时优先看 SUDO_USER，而面板**自己就是 root**
+		// （没有 sudo），无头机器上 /dev/console 的属主又是 root —— 只靠它们会得到
+		// "无法确定真实用户"（mini 真机实测：整批迁移全线失败）。显式传一份。
+		env = append(env, "ZIZPANEL_REAL_USER="+m.opt.UserName)
 	}
-	out, err := m.runRootEnv(ctx, 10*time.Minute, env, "/bin/bash", args...)
+	out, err := m.runRootEnv(ctx, timeout, env, "/bin/bash", args...)
 	if err != nil {
 		// 把脚本的真实输出带上：它逐项打印了每个服务是"已加载"还是失败原因，
 		// 只回一句"注册失败"对用户毫无帮助（"报错看不懂"就是这么来的）。

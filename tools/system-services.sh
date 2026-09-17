@@ -50,12 +50,36 @@ done
 [ ${#FORMULAS[@]} -gt 0 ] || FORMULAS=("${DEFAULT_FORMULAS[@]}")
 
 # 真实用户：服务要以它身份运行（不是 root）
+#
+# 优先级（真机教训 2026-09-17，坑 133）：
+#   ① SUDO_USER           —— 人工 `sudo bash system-services.sh` 的场景
+#   ② ZIZPANEL_REAL_USER  —— 面板传进来的（面板自己已经是 root，没有 sudo，
+#                            所以 SUDO_USER 永远是空的）
+#   ③ USER / LOGNAME      —— 面板 export 的真实用户（非 root 才认）
+#   ④ /dev/console 属主    —— 兜底
+# 只认 ①+④ 不够：**无头 Mac**（服务器模式，重启后停在登录界面、没人登录图形界面）
+# 上 SUDO_USER 为空、/dev/console 的属主是 root，脚本会以"无法确定真实用户"退出 ——
+# 而那正是本脚本最主要的目标场景（mini 真机实测：整批迁移全线失败）。
 REAL_USER="${SUDO_USER:-}"
+if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+  REAL_USER="${ZIZPANEL_REAL_USER:-}"
+fi
+if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+  case "${USER:-}" in ""|root) ;; *) REAL_USER="$USER" ;; esac
+fi
+if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+  case "${LOGNAME:-}" in ""|root) ;; *) REAL_USER="$LOGNAME" ;; esac
+fi
 if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
   REAL_USER="$(stat -f '%Su' /dev/console 2>/dev/null || echo "")"
 fi
 [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ] || {
-  echo "无法确定真实用户，请用 sudo 执行" >&2; exit 1; }
+  echo "无法确定真实用户：请用 sudo 执行，或显式设置 ZIZPANEL_REAL_USER=<用户名>" >&2; exit 1; }
+# 用户必须真实存在：写进 plist 的 UserName 不存在时 launchd 会拒绝加载，
+# 而那时的报错完全指不到原因。
+if ! id -u "$REAL_USER" >/dev/null 2>&1; then
+  echo "用户 $REAL_USER 在本机不存在（ZIZPANEL_REAL_USER / SUDO_USER 传错了？）" >&2; exit 1
+fi
 
 BREW_PREFIX="/opt/homebrew"
 [ -x "$BREW_PREFIX/bin/brew" ] || BREW_PREFIX="/usr/local"

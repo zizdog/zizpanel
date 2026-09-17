@@ -264,6 +264,26 @@ func cmdServe(args []string) error {
 		}
 	}
 
+	// 常驻服务（数据库 / Web 服务 / 同步守护 / 推理后端 / PHP-FPM）的**一次性迁移**：
+	// 过去它们由 brew services 装成用户级 LaunchAgent，而无头 macOS 开机根本不加载
+	// ~/Library/LaunchAgents（坑 130）—— 重启后一个都不会自己回来。这里把机器上
+	// 已经存在的用户级 agent 搬到系统域（幂等，已是系统级的直接跳过）。
+	//
+	// 放后台跑、不阻塞启动：每个服务都要 bootout → 写 plist → bootstrap → 等端口，
+	// 串起来可能几十秒；而且失败也只是"那个服务仍需手工启动"，不该拦住面板本身。
+	// 结果写日志（用户可在面板日志里看到到底搬了哪些、哪个失败了）。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		n, errs := svcMgr.MigrateSystemDaemons(ctx)
+		if n > 0 {
+			log.Info("已把 %d 个常驻服务迁移为系统级 LaunchDaemon（重启后不再依赖登录）", n)
+		}
+		for _, e := range errs {
+			log.Warn("迁移常驻服务到系统级失败：%s", e)
+		}
+	}()
+
 	srv, err := web.New(cfg, st, am, col)
 	if err != nil {
 		return err

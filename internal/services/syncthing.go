@@ -556,9 +556,11 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 	}
 
 	// ---- 3. 交给 brew services 托管并启动（3 分钟） ----
-	res.step(ctx, "注册为后台服务并启动（brew services start "+syncthingFormula+"）")
-	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", syncthingFormula); err != nil {
-		return fmt.Errorf("brew services start %s 失败: %w%s",
+	// 用 StartBrewService 而不是裸 brew services：已系统化的服务再跑
+	// `brew services start` 会写出第二份用户级 plist，把服务拉成两份抢端口。
+	res.step(ctx, "注册为后台服务并启动（"+syncthingFormula+"）")
+	if err := m.StartBrewService(ctx, syncthingFormula); err != nil {
+		return fmt.Errorf("启动 %s 失败: %w%s",
 			syncthingFormula, err, m.syncthingLogTailNote())
 	}
 
@@ -632,10 +634,14 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 			// `Could not enable service: 125`），而 stop/start 这两条在本项目里
 			// 已经到处在用、行为确定。stop 失败不算错（本来就没在跑）。
 			res.step(ctx, "重启 Syncthing 让它加载新的监听地址与凭据")
-			if _, err := m.brewRun(ctx, 2*time.Minute, "services", "stop", syncthingFormula); err != nil {
-				res.step(ctx, "（停止旧实例时 brew 报错，继续启动：+"+err.Error()+"）")
+			// 仍用 stop + start（而不是 restart）：面板跑 brew 的上下文里 restart
+			// 在有的机器上会落到不对的 launchd 域（真机实测普通 SSH 下 125）。
+			// 两个动作都按"服务在哪个域"自动选路（系统域走 launchctl）。
+			// stop 失败不算错（本来就没在跑）。
+			if err := m.StopBrewService(ctx, syncthingFormula); err != nil {
+				res.step(ctx, "（停止旧实例时报错，继续启动：+"+err.Error()+"）")
 			}
-			if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", syncthingFormula); err != nil {
+			if err := m.StartBrewService(ctx, syncthingFormula); err != nil {
 				return fmt.Errorf("配置已改好但重启 Syncthing 失败: %w%s", err, m.syncthingLogTailNote(password))
 			}
 			res.step(ctx, "等待 Syncthing 用新配置起来并自检新凭据（POST "+syncthingAPIBase+
@@ -651,6 +657,30 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 			res.step(ctx, "新凭据自检通过（POST "+syncthingAPIBase+
 				"/rest/noauth/auth/password 返回 204）")
 		}
+	}
+
+	// ---- 6.5 装成系统级服务（开机自启） ----
+	//
+	// 无头 macOS 开机不加载 ~/Library/LaunchAgents（坑 130）：不搬迁的话
+	// 用户重启机器后 Syncthing 不会自己起来，同步就断在那里。
+	systemized := true
+	if app, ok := FindApp("syncthing"); ok && systemDaemonNeeded(app) {
+		if _, _, err := systemDaemonEnsureFn(m, ctx, app, res); err != nil {
+			systemized = false
+			res.Warning = appendWarning(res.Warning,
+				"Syncthing 没能装成系统级服务（重启后不会自动起来）："+err.Error())
+			res.step(ctx, "警告：Syncthing 仍以用户级服务运行（重启后需手动启动）")
+		}
+	}
+	if systemized {
+		// 搬迁会重启服务：必须重新探一次，不能沿用搬迁前的结论。
+		// 这里用免鉴权的就绪探针（配置 + /rest/noauth/health）：凭据自检刚刚
+		// 已经做过，而"换了 launchd 域"不会改配置里那份 bcrypt 口令。
+		if !m.waitSyncthingReady(ctx, cfgPath) {
+			return fmt.Errorf("装成系统级服务后 Syncthing 没有恢复就绪（GET %s/rest/noauth/health 未返回 200）%s",
+				syncthingAPIBase, m.syncthingLogTailNote(""))
+		}
+		res.step(ctx, "系统级服务复核通过：重启机器后 Syncthing 会自动起来")
 	}
 
 	// ---- 7. 登记进「服务管理」（真实 label 优先） ----
@@ -703,15 +733,20 @@ func (m *Manager) uninstallSyncthing(ctx context.Context, removeData bool, resul
 		plist = filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", label+".plist")
 	}
 
-	// 先让 brew 自己停：brew services 起的是 gui/<uid> 域的用户代理，
-	// `brew services stop` 会停掉进程并摘掉它自己写的 plist（比手工 bootout
-	// system/<label> 可靠）。失败不致命 —— removeService 才是决定性的那一步。
+	// 系统化之后 plist 在 /Library/LaunchDaemons：探测到的用户级路径已经不存在，
+	// 直接用它会让 removeService 删空气、把系统级守护进程留在机器上。
+	if sys := SystemDaemonPlistPath(label); fileExists(sys) {
+		plist = sys
+	}
+
+	// 先停服务：按"它在哪个域"自动选路（系统域走 launchctl，用户级走 brew services）。
+	// 失败不致命 —— removeService 才是决定性的那一步。
 	if strings.TrimSpace(m.opt.BrewBin) != "" && fileExists(m.opt.BrewBin) && m.brewHas(ctx, syncthingFormula) {
 		if result != nil {
-			result.step(ctx, "停止 Syncthing 服务（brew services stop "+syncthingFormula+"）")
+			result.step(ctx, "停止 Syncthing 服务（"+syncthingFormula+"）")
 		}
-		if _, err := m.brewRun(ctx, 3*time.Minute, "services", "stop", syncthingFormula); err != nil && result != nil {
-			result.step(ctx, "⚠️ brew services stop 失败，继续清理："+err.Error())
+		if err := m.StopBrewService(ctx, syncthingFormula); err != nil && result != nil {
+			result.step(ctx, "⚠️ 停止服务失败，继续清理："+err.Error())
 		}
 	}
 	// removeService：停 + 摘 launchd 定义 + 删面板记录（顺序不能反）。

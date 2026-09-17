@@ -361,6 +361,9 @@ exit 0
 
 func newSyncthingHarness(t *testing.T, installed bool, healthCode, authCode int) (*Manager, *syncthingRecorder, string) {
 	t.Helper()
+	// 面板在真实机器上是 root，系统化会成功；单测跑在普通用户下，
+	// 用注入点模拟"系统化成功"，这样"顺利路径不该有告警"才是有效断言。
+	stubSystemDaemonEnsure(t, nil)
 	m, _ := sandboxIdempotentManager(t)
 	// 让 brewServiceInfo 拿到沙箱里的 plist，AdoptCandidate 因此短路，
 	// 不会去跑真实 launchctl（单测不许碰真实服务）。

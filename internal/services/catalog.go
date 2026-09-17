@@ -87,6 +87,15 @@ type App struct {
 	// （phpMyAdmin 就是这种：nginx alias + php-fpm，没有自己的守护进程）。
 	// 有了它，市场就不会把"launchd 里找不到服务"当成异常去吓用户。
 	NoDaemon bool `json:"no_daemon,omitempty"`
+	// SystemDaemon 表示这个应用**必须开机就在**（数据库 / Web 服务 / 同步守护 /
+	// 推理后端 / 站点赖以运行的 PHP-FPM），因此要装成**系统级 LaunchDaemon**
+	// （以真实用户身份运行），而不是 brew 默认的用户级 LaunchAgent。
+	//
+	// 为什么必须区分（坑 130，2026-09-17 mini 真机 5 次重启验证）：无头 macOS
+	// （服务器模式、没人进图形会话）开机**不会**加载 ~/Library/LaunchAgents，
+	// 用户级服务重启后一个都不会自己回来。判断标准是"面板对用户的承诺是否
+	// 依赖它开机就在"，不要凭感觉加；见 internal/services/systemdaemon.go 顶部。
+	SystemDaemon bool `json:"system_daemon,omitempty"`
 }
 
 // WebPort 返回"网页界面 / 健康检查 / 反向代理"应当指向的端口。
@@ -481,8 +490,10 @@ func Catalog() []App {
 			// 否则会永远显示不健康。留空表示"只按进程与端口判断"。
 			HealthPath:  "",
 			BrewFormula: "php@8.3",
-			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.3.log",
-			DocsURL:     "https://www.php.net",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.3.log",
+			DocsURL:      "https://www.php.net",
 		},
 		{
 			ID: "php81", Name: "PHP 8.1 (FPM)", Icon: "🐘",
@@ -496,8 +507,10 @@ func Catalog() []App {
 			Port:        0,
 			HealthPath:  "",
 			BrewFormula: "php@8.1",
-			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.1.log",
-			DocsURL:     "https://www.php.net",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.1.log",
+			DocsURL:      "https://www.php.net",
 		},
 		{
 			ID: "php82", Name: "PHP 8.2 (FPM)", Icon: "🐘",
@@ -511,8 +524,10 @@ func Catalog() []App {
 			Port:        0,
 			HealthPath:  "",
 			BrewFormula: "php@8.2",
-			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.2.log",
-			DocsURL:     "https://www.php.net",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.2.log",
+			DocsURL:      "https://www.php.net",
 		},
 		{
 			ID: "php84", Name: "PHP 8.4 (FPM)", Icon: "🐘",
@@ -526,8 +541,10 @@ func Catalog() []App {
 			Port:        0,
 			HealthPath:  "",
 			BrewFormula: "php@8.4",
-			LogPath:     "~/Library/Logs/homebrew.mxcl.php@8.4.log",
-			DocsURL:     "https://www.php.net",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.4.log",
+			DocsURL:      "https://www.php.net",
 		},
 		{
 			ID: "mysql84", Name: "MySQL 8.4", Icon: "🐬",
@@ -603,8 +620,10 @@ func Catalog() []App {
 			// 否则会永远显示"不健康"（与 PHP-FPM 同理）。留空 = 只按进程与端口判断。
 			Port: 5432, HealthPath: "",
 			BrewFormula: "postgresql@17",
-			LogPath:     "/opt/homebrew/var/log/postgresql@17.log",
-			DocsURL:     "https://www.postgresql.org",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			LogPath:      "/opt/homebrew/var/log/postgresql@17.log",
+			DocsURL:      "https://www.postgresql.org",
 		},
 
 		// ---------------- AI 服务（原生，用 Metal 加速） ----------------
@@ -616,6 +635,8 @@ func Catalog() []App {
 			Category: "ai", Kind: KindNative,
 			Port: 11434, HealthPath: "/api/tags",
 			BrewFormula: "ollama", LogPath: "~/.ollama/ollama.log",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon:    true,
 			PostInstallHint: "安装后执行 ollama pull qwen2.5:7b 下载一个模型即可开始使用",
 			Requires: []Requirement{
 				{Type: "brew_formula", Value: "ollama", Hint: "brew install ollama"},
@@ -1057,7 +1078,9 @@ func Catalog() []App {
 				"管理员口令只在安装结果里出现一次，请自行保存（之后可在服务详情里改配置）。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "miniflux",
-			BrewFormula:    "miniflux",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			BrewFormula:  "miniflux",
 			// 8087：上游默认 8080，而 8080 已经被 IOPaint 占用（真机核对）。
 			Port: 8087, HealthPath: "/healthz",
 			// 配置写在 formula 的 service 块写死的位置（/opt/homebrew/etc/miniflux.conf），
@@ -1096,8 +1119,10 @@ func Catalog() []App {
 				"**并同时设置随机用户名口令** —— 否则等于把远程控制台无口令暴露在局域网里。",
 			Category: "tool", Kind: KindNative,
 			PanelInstaller: "syncthing",
-			BrewFormula:    "syncthing",
-			Port:           8384, HealthPath: "/rest/noauth/health",
+			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
+			SystemDaemon: true,
+			BrewFormula:  "syncthing",
+			Port:         8384, HealthPath: "/rest/noauth/health",
 			// 配置文件在 ~/Library/Application Support/Syncthing/config.xml。
 			ConfigPath: "~/Library/Application Support/Syncthing/config.xml",
 			LogPath:    "/opt/homebrew/var/log/syncthing.log",

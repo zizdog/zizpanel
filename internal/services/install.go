@@ -506,6 +506,23 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 	if plist == "" && m.opt.UserHome != "" {
 		plist = filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", label+".plist")
 	}
+
+	// 4) 必须常驻的应用：改造成系统级 LaunchDaemon（UserName=真实用户）。
+	//
+	// 为什么安装路径上就要做，而不是等启动迁移：用户装完立刻重启机器是最常见的
+	// 验证动作，而用户级 agent 在无头机器上开机根本不会加载（坑 130）——
+	// "装完就好了"不能依赖"下次面板启动时再搬"。
+	if systemDaemonNeeded(app) {
+		sysLabel, sysPlist, err := systemDaemonEnsureFn(m, ctx, app, res)
+		if err != nil {
+			// 包已经装好、服务在用户域也能跑：**如实降级**并写清代价，绝不谎报成功。
+			res.Warning = appendWarning(res.Warning,
+				"已安装，但没能装成系统级服务（重启后不会自动起来）："+err.Error())
+		} else {
+			label, plist = sysLabel, sysPlist
+		}
+	}
+
 	res.Service = &Service{
 		LaunchLabel: label,
 		PlistPath:   plist,

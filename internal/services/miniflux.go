@@ -482,9 +482,12 @@ func (m *Manager) InstallMiniflux(ctx context.Context, res *InstallResult) error
 	}
 
 	// ---- 8. 启动服务 ----
-	res.step(ctx, "注册为后台服务并启动（brew services start "+minifluxFormula+"）")
-	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", minifluxFormula); err != nil {
-		return fmt.Errorf("brew services start %s 失败: %w", minifluxFormula, err)
+	// 用 StartBrewService 而不是裸 brew services：服务一旦已经系统化（上一次
+	// 安装搬到 /Library/LaunchDaemons 了），`brew services start` 会写出**第二份**
+	// 用户级 plist 并把服务拉成两份抢端口。
+	res.step(ctx, "注册为后台服务并启动（"+minifluxFormula+"）")
+	if err := m.StartBrewService(ctx, minifluxFormula); err != nil {
+		return fmt.Errorf("启动 %s 失败: %w", minifluxFormula, err)
 	}
 
 	// ---- 9. 健康检查（失败就是失败，绝不写"已安装"） ----
@@ -502,6 +505,33 @@ func (m *Manager) InstallMiniflux(ctx context.Context, res *InstallResult) error
 		return fmt.Errorf("%s", msg)
 	}
 	res.step(ctx, "健康检查通过：http://127.0.0.1:"+strconv.Itoa(minifluxPort)+"/healthz 返回 200")
+
+	// ---- 9.5 装成系统级服务（开机自启） ----
+	//
+	// 无头 macOS 开机**不会**加载 ~/Library/LaunchAgents（坑 130），所以
+	// Miniflux 与它依赖的 PostgreSQL 都必须落到系统域，否则用户重启机器后
+	// 面板显示"已安装"、服务却一个都没起来。
+	systemized := true
+	for _, id := range []string{"postgresql17", "miniflux"} {
+		app, found := FindApp(id)
+		if !found || !systemDaemonNeeded(app) {
+			continue
+		}
+		if _, _, err := systemDaemonEnsureFn(m, ctx, app, res); err != nil {
+			systemized = false
+			res.Warning = appendWarning(res.Warning,
+				app.Name+"没能装成系统级服务（重启后不会自动起来）："+err.Error())
+			res.step(ctx, "警告："+app.Name+"仍以用户级服务运行（重启后需手动启动）")
+		}
+	}
+	if systemized {
+		// 搬迁会重启服务：结论必须重新测，不能沿用搬迁前的健康检查。
+		if !m.waitMinifluxHealthy(ctx, m.minifluxHealthTimeout()) {
+			return fmt.Errorf("装成系统级服务后 Miniflux 没有恢复健康"+
+				"（http://127.0.0.1:%d/healthz 未返回 200）；看日志 %s", minifluxPort, m.minifluxLogPath())
+		}
+		res.step(ctx, "系统级服务复核通过：重启机器后 Miniflux 与 PostgreSQL 会自动起来")
+	}
 
 	// ---- 10. 凭据自检（失败只告警，不推翻已起来的服务） ----
 	if err := m.verifyMinifluxCredentials(ctx, res, confPath, adminPassword, adminFromConfig); err != nil {
@@ -540,9 +570,9 @@ func (m *Manager) ensureMinifluxPostgres(ctx context.Context, res *InstallResult
 		res.step(ctx, minifluxPostgresFormula+" 已安装（跳过 brew install）")
 	}
 	// formula 的 postinstall 已经 initdb 建好集群；**绝不重复 initdb**（会清掉数据）。
-	res.step(ctx, "启动 PostgreSQL（brew services start "+minifluxPostgresFormula+"）")
-	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "start", minifluxPostgresFormula); err != nil {
-		return fmt.Errorf("brew services start %s 失败: %w；日志：%s",
+	res.step(ctx, "启动 PostgreSQL（"+minifluxPostgresFormula+"）")
+	if err := m.StartBrewService(ctx, minifluxPostgresFormula); err != nil {
+		return fmt.Errorf("启动 %s 失败: %w；日志：%s",
 			minifluxPostgresFormula, err, m.minifluxPostgresLogPath())
 	}
 	res.step(ctx, "等待 PostgreSQL 接受连接（pg_isready -h 127.0.0.1 -p 5432，最多 60 秒）")

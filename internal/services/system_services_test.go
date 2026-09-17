@@ -169,3 +169,49 @@ func TestSystemServicesScriptRunsWithoutHOME(t *testing.T) {
 		t.Fatalf("脚本在无 HOME 环境下失败: %v\n%s", err, text)
 	}
 }
+
+// TestSystemServicesScriptFindsUserWithoutSudoUser 锁住**无头机器上的真实用户推断**。
+//
+// 真机事故（mini 2026-09-17，坑 133）：面板自己就是 root（没有 sudo），无头 Mac
+// 上 /dev/console 的属主又是 root —— 脚本只认 SUDO_USER 与 /dev/console 时会以
+// "无法确定真实用户"退出，整批迁移全线失败（日志里七条失败一模一样），
+// 而那正是这把脚本最主要的目标场景。现在按 SUDO_USER → ZIZPANEL_REAL_USER →
+// USER/LOGNAME → 控制台属主 依次推断。
+func TestSystemServicesScriptFindsUserWithoutSudoUser(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("只验证 macOS（脚本用的是 dscl / launchctl）")
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("取不到当前用户: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "system-services.sh")
+	if err := os.WriteFile(script, []byte(embeddedSystemServices), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(user string) (string, error) {
+		cmd := exec.Command("/usr/bin/env", "-i",
+			"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+			// 刻意**不设** SUDO_USER / USER / LOGNAME：面板以 root 被 launchd 拉起时
+			// 环境里就是没有它们，而 /dev/console 的属主在无头机器上是 root。
+			"ZIZPANEL_REAL_USER="+user,
+			"/bin/bash", script, "--dry-run", "zizpanel-nonexistent-formula")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	text, _ := run(u.Username)
+	if strings.Contains(text, "无法确定真实用户") {
+		t.Fatalf("给了 ZIZPANEL_REAL_USER 仍报「无法确定真实用户」（无头机器上就是这个失败）：\n%s", text)
+	}
+	if !strings.Contains(text, "运行身份: "+u.Username) {
+		t.Fatalf("脚本没有采用 ZIZPANEL_REAL_USER：\n%s", text)
+	}
+
+	// 用户不存在时必须**拒绝**：写进 plist 的 UserName 不存在时 launchd 会拒绝
+	// 加载，而那时的报错完全指不到原因。
+	badText, _ := run("zizpanel-no-such-user-xyz")
+	if !strings.Contains(badText, "不存在") {
+		t.Fatalf("传了不存在的用户却没有拒绝：\n%s", badText)
+	}
+}

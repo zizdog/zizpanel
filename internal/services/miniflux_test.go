@@ -261,6 +261,9 @@ exit 0
 
 func newMinifluxHarness(t *testing.T, minifluxInstalled, pgInstalled bool) (*Manager, *minifluxRecorder, string) {
 	t.Helper()
+	// 面板在真实机器上是 root，系统化会成功；单测跑在普通用户下，
+	// 用注入点模拟"系统化成功"，这样"顺利路径不该有告警"才是有效断言。
+	stubSystemDaemonEnsure(t, nil)
 	m, _ := sandboxIdempotentManager(t)
 	marker := filepath.Join(t.TempDir(), "brew-calls")
 	// 让 brewServiceInfo 能推出 homebrew.mxcl.miniflux；plist 真写进沙箱家目录，

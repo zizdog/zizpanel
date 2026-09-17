@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/priv"
 )
 
 // ============================================================================
@@ -452,10 +454,26 @@ func (m *Manager) removeService(ctx context.Context, label, plist string) error 
 func (m *Manager) stopLaunchdService(ctx context.Context, label, plist string) error {
 	// 先走正常停止（服务可能正在跑）；失败也继续 —— 目标状态是"没有它"，
 	// 后面删 plist 才是决定性的那一步。
-	_, _ = m.runRoot(ctx, 30*time.Second, "/bin/launchctl", "bootout", "system/"+label)
-	if plist != "" {
-		if err := os.Remove(plist); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("删除 %s 失败: %w", plist, err)
+	//
+	// 用 priv.LaunchUnload 而不是裸 `bootout system/<label>`：作业可能在
+	// user/<uid> 或 gui/<uid> 域里（系统化迁移前后都可能），只打 system 域
+	// 会留下停不掉的孤儿进程（卸载后它还占着端口）。
+	if label != "" {
+		_ = priv.LaunchUnload(label)
+	}
+	// 两个位置都要清：系统化之后 plist 在 /Library/LaunchDaemons，
+	// 而迁移前/历史上装的用户级 agent 在 ~/Library/LaunchAgents —— 只删一个，
+	// 另一个会让服务在重启后又回来。
+	paths := []string{plist, SystemDaemonPlistPath(label)}
+	if label != "" {
+		paths = append(paths, m.systemDaemonUserPlist(label))
+	}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删除 %s 失败: %w", p, err)
 		}
 	}
 	return nil

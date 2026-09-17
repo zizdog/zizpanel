@@ -136,10 +136,11 @@ func (m *Manager) restartPHPFPM(ctx context.Context, formula string) error {
 	if err := priv.LaunchKickstart(label); err == nil {
 		return nil
 	}
-	// kickstart 失败（未装载，或用户级域权限不足）时退回 brew services restart：
-	// 它会重新 bootstrap 再拉起，但一旦失败就必须如实冒泡，绝不吞掉。
-	if _, err := m.brewRun(ctx, 3*time.Minute, "services", "restart", formula); err != nil {
-		return fmt.Errorf("launchctl kickstart %s 与 brew services restart 都失败: %w", label, err)
+	// kickstart 失败（未装载，或用户级域权限不足）时退回按域自动选路的重启：
+	// 已系统化的用 launchctl bootstrap，未系统化的才用 brew services restart。
+	// 一旦失败就必须如实冒泡，绝不吞掉。
+	if err := m.RestartBrewService(ctx, formula); err != nil {
+		return fmt.Errorf("launchctl kickstart %s 与重启服务都失败: %w", label, err)
 	}
 	return nil
 }
