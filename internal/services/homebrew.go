@@ -176,9 +176,54 @@ func (m *Manager) EnsureCLT(ctx context.Context, result *InstallResult) error {
 }
 
 // EnsureHomebrew 保证 Homebrew 可用；缺什么装什么。已经是好的就直接返回。
+
+// ============================================================================
+//  brew 路径校正（2026-09-17 生产机真机事故）
+//
+//  现象：一键 LNMP 里"命令行开发者工具 + Homebrew"都装成功了，最后一步却失败：
+//        env: /usr/local/bin/brew: No such file or directory
+//        任务失败：Homebrew 装完了但执行不了
+//  根因：**全新机器上配置是在"Homebrew 还不存在"时写下的**（那时按 Intel 路径
+//        存了 /usr/local/bin/brew），而 Apple Silicon 上 Homebrew 装到
+//        /opt/homebrew/bin/brew。装完之后没人重新探测，于是"装完了却执行不了"。
+//  修法：装完（以及进来时）按候选位置**重新探测真的那个**，改写 m.opt.BrewBin。
+//        服务侧所有由 brew 推导的路径（php 前缀、services 等）都来自 m.opt.BrewBin，
+//        所以改这一个字段就够了；配置文件的持久化由 web 层每个请求的
+//        Config.ReconcilePaths() 负责（它检测到真装了 /opt/homebrew 就会改写并保存）。
+// ============================================================================
+
+// brewBinCandidates 是 Homebrew 可能装到的位置：Apple Silicon 优先，其次 Intel。
+// 变量而不是函数常量：单测要能把它指到 t.TempDir()（否则测试会依赖真机的 /opt/homebrew，
+// 违反"单测不许碰真实环境"）。
+var brewBinCandidates = func() []string {
+	return []string{"/opt/homebrew/bin/brew", "/usr/local/bin/brew"}
+}
+
+// reconcileBrewBin 在配置里的 brew 路径不存在时，找**真的装了**的那个并改用它。
+// 返回是否做了修正。
+func (m *Manager) reconcileBrewBin() bool {
+	if m.opt.BrewBin != "" {
+		if st, err := os.Stat(m.opt.BrewBin); err == nil && !st.IsDir() {
+			return false
+		}
+	}
+	for _, c := range brewBinCandidates() {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			m.opt.BrewBin = c
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) error {
 	if result == nil {
 		result = &InstallResult{Steps: []string{}}
+	}
+	// 先按实际安装位置校正一次：配置里可能写着 Intel 的 /usr/local/bin/brew，
+	// 而机器上装的是 /opt/homebrew/bin/brew（Apple Silicon）——见文件末尾的说明。
+	if m.reconcileBrewBin() {
+		result.step(ctx, "已按实际安装位置修正 brew 路径："+m.opt.BrewBin)
 	}
 	if _, err := os.Stat(m.opt.BrewBin); err == nil {
 		result.step(ctx, "Homebrew 已安装："+m.opt.BrewBin)
@@ -274,7 +319,11 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 		return fmt.Errorf("安装 Homebrew 失败（输出末尾）：%s", truncate(strings.TrimSpace(out), 800))
 	}
 
-	// 4) 验证真的可用（不看退出码，跑一次 brew --version）
+	// 4) **先校正路径再验证**：安装脚本按 Apple Silicon 规范装到 /opt/homebrew，
+	//    配置里却可能还是 /usr/local —— 不校正就会误报"装完了但执行不了"。
+	if m.reconcileBrewBin() {
+		result.step(ctx, "已按实际安装位置修正 brew 路径："+m.opt.BrewBin)
+	}
 	ver, err := m.brewRun(ctx, time.Minute, "--version")
 	if err != nil {
 		return fmt.Errorf("Homebrew 装完了但执行不了：%s", truncate(strings.TrimSpace(ver), 300))

@@ -188,7 +188,7 @@ export function DashboardView(content, ctx = {}) {
         h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 基础环境还没安装' }),
         h('div.hint', {
           text: '「网站管理 / 数据库 / 一键建站」需要 nginx + PHP + MySQL。'
-            + '点右边按钮会先自动装好「命令行开发者工具 + Homebrew」（走国内镜像，不弹 Apple 的窗口），'
+            + '点击按钮会先自动装好「命令行开发者工具 + Homebrew」，'
             + '再装 nginx + PHP + MySQL；全程约十几分钟，进度在「任务中心」实时可见、关掉页面也不中断。',
         }),
         h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
