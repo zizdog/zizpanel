@@ -14,10 +14,9 @@ import { AppsView } from './apps.js';
 import { FilesView } from './files.js';
 import { TerminalView } from './terminal.js';
 import { CronView } from './cron.js';
-import { LogsView } from './logs.js';
+import { LogsHubView } from './logshub.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
-import { AuditView } from './audit.js';
 import { UpdateView, startUpgradeWatcher, hasUpdate } from './update.js';
 import { taskCenter } from './tasks.js';
 
@@ -33,10 +32,10 @@ export const state = {
 export const NAV = [
   { group: '总览' },
   { id: 'dashboard', title: '仪表盘', icon: '📊', view: DashboardView },
-  // 「系统监控」已改成「系统设置」：监控内容和仪表盘高度重复，
-  // 而"把 macOS 配成服务器"（电源/更新阻断/SSH/索引）原来只在装机脚本里能做一次。
-  // 重复的指标（系统负载、Swap）已经并入仪表盘，没有丢信息。
-  { id: 'system', title: '系统设置', icon: '🛠️', view: SystemSettingsView },
+  // 「系统监控」已改成「mac设置」（2026-09 用户要求把显示名从「系统设置」改成
+  // 「mac设置」：原名与「面板设置」并列时歧义太大）。**只改显示名**，
+  // 路由 id 仍是 'system'，`#/system` 与所有旧链接照旧可用。
+  { id: 'system', title: 'mac设置', icon: '🛠️', view: SystemSettingsView },
   { group: '网站' },
   { id: 'sites', title: '网站管理', icon: '🌐', view: SitesView },
   { id: 'proxy', title: '反向代理', icon: '🔀', view: ReverseProxyView },
@@ -59,18 +58,12 @@ export const NAV = [
   { id: 'files', title: '文件管理', icon: '📁', view: FilesView },
   { id: 'terminal', title: 'Web 终端', icon: '🖥️', view: TerminalView },
   { id: 'cron', title: '计划任务', icon: '⏰', view: CronView },
-  // 「日志」独立成一个版块（2026-09 用户要求）：原来「操作审计」是侧栏顶级项，
-  // 与「日志中心」分居两处；审计本质就是"谁在什么时候做了什么"的历史日志，
-  // 放在同一个版块里才找得到。**路由不变**：两者都是普通 NAV 项，
-  // #/logs 与 #/audit 照旧可用（老书签/文档不 404），audit.js 页面本身不动。
-  { group: '日志' },
-  { id: 'logs', title: '日志中心', icon: '📜', view: LogsView },
-  { id: 'audit', title: '操作审计', icon: '🧾', view: AuditView },
   { group: '系统' },
-  // 2026-09 用户要求：顺序上**面板设置在前、检查更新紧随其后**（先"设置面板"，
-  // 再"看有没有新版本"）。只调顺序：路由别名（#/about、#/upgrade、#/settings/about）
-  // 与徽标/主动检测/一键更新逻辑都不变（见 ROUTE_TARGET）。
+  // 2026-09 用户要求：顺序上「面板设置 → 日志 → 检查更新」。
+  // 「日志」把原「日志中心」与「操作审计」合并成一页两个 Tab（见 logshub.js）：
+  // 侧栏只剩一个入口，旧的 #/logs 与 #/audit 仍分别落到对应 Tab（见 ROUTE_TARGET）。
   { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
+  { id: 'logs', title: '日志', icon: '📜', view: LogsHubView },
   // 2026-09-21：原来这里是「面板设置 → 关于与运维」的第 4 个 Tab。用户要求把它
   // 整块提到侧边栏并改名「检查更新」——"有没有新版本"是随时想知道的状态，
   // 埋在两级点击之后没人看得到，也就没人升级。
@@ -90,6 +83,10 @@ const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n
 // "#/services 落到已安装 Tab"，而不是靠人肉点。运行时没有别的调用方。
 const ROUTE_TARGET = {
   services: { id: 'apps', tab: 'installed' },
+  // 2026-09：「日志中心」与「操作审计」合并成侧栏「日志」一页两个 Tab。
+  // 旧 hash `#/audit` 必须继续可用 → 落到 logs 版块并直接切到「操作审计」Tab；
+  // `#/logs` 不需要别名（id 本来就是 logs），默认落第一个 Tab。
+  audit: { id: 'logs', tab: 'audit' },
   // 「关于与运维」已从「面板设置」的页内 Tab 提成独立页（侧栏「检查更新」）。
   // 页内 Tab 时代的链接有两种写法，一个都不能 404：
   //   #/settings/about  —— 旧写法（版块 + Tab），见下面的 SUB_ROUTE_TARGET

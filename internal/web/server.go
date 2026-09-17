@@ -115,6 +115,14 @@ type Server struct {
 	baseEnvProbeOverride   func(ctx context.Context) services.BaseEnvStatus
 	baseEnvInstallOverride func(ctx context.Context, res *services.InstallResult) error
 
+	// svcManagerOverride 仅供单测：替换服务管理器的构造。
+	//
+	// 为什么需要它：`DELETE /api/v1/services/{name}`（只删记录）的语义硬要求是
+	// **绝不触碰运行时**，而"是否触碰运行时"的唯一入口就是有没有构造 Manager
+	// （构造会探测 Docker socket、ReconcilePaths 写配置）。单测把这里替换成
+	// 一个会记账的假实现，就能断言删除通路根本没有走到运行时那一步。
+	svcManagerOverride func(*Server) *services.Manager
+
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time

@@ -902,6 +902,11 @@ func newComposeDriver(opt Options, s *Service) *composeDriver {
 
 func (d *composeDriver) Kind() Kind { return KindCompose }
 
+// composeBinFn 指向 composeBin；单测可替换它来构造"本机根本没有 compose 命令"
+// 的场景。真机上只要装了 compose 就走不到那条分支 —— 而它恰恰是 2026-09-17
+// "Docker/Colima 全删掉后卸载报错、记录删不掉"那个缺陷的现场，必须有确定的覆盖。
+var composeBinFn = composeBin
+
 // composeBin 查找可用的 compose 命令。
 //
 // 依次尝试：docker compose（插件，v2，推荐）→ docker-compose（v1 独立二进制）。
@@ -937,10 +942,10 @@ func composeBin() (string, []string, bool) {
 
 // run 执行 compose 命令。
 func (d *composeDriver) run(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
-	bin, prefix, ok := composeBin()
+	bin, prefix, ok := composeBinFn()
 	if !ok {
-		return "", fmt.Errorf("未找到 docker compose 命令。" +
-			"请先安装 Docker（OrbStack / Colima / Docker Desktop 任一即可）")
+		return "", MarkRuntimeUnavailable(fmt.Errorf("未找到 docker compose 命令。" +
+			"请先安装 Docker（OrbStack / Colima / Docker Desktop 任一即可）"))
 	}
 	if d.svc.ComposeFile == "" {
 		return "", fmt.Errorf("该 compose 服务未配置 compose 文件路径")
@@ -1093,9 +1098,9 @@ func (d *composeDriver) Logs(ctx context.Context, lines int) (string, error) {
 // LogStream 用 `compose logs -f` 子进程实现。
 // 这是唯一合适的方式：compose 的日志来自多个容器，轮询无法正确合并顺序。
 func (d *composeDriver) LogStream(ctx context.Context) (<-chan string, error) {
-	bin, prefix, ok := composeBin()
+	bin, prefix, ok := composeBinFn()
 	if !ok {
-		return nil, fmt.Errorf("未找到 docker compose 命令")
+		return nil, MarkRuntimeUnavailable(fmt.Errorf("未找到 docker compose 命令"))
 	}
 	full := append([]string{}, prefix...)
 	full = append(full, "-f", d.svc.ComposeFile, "logs", "-f", "--tail", "50", "--no-color")

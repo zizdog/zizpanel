@@ -1,4 +1,7 @@
-// systemsettings.js —— 「系统设置」页：把 macOS 本身配成一台服务器。
+// systemsettings.js —— 「mac设置」页：把 macOS 本身配成一台服务器。
+//
+// 显示名 2026-09 从「系统设置」改成「mac设置」（与「面板设置」并列时原名歧义太大）；
+// 路由 id 仍是 'system'，页内标题/文档标题都跟着 NAV 的 title 走。
 //
 // 这一页取代了原来的「系统监控」页（用户判断：监控页和仪表盘内容高度重复）。
 // 重复的指标已经并进仪表盘，这里只做**监控页做不到的事**：改 macOS 的设置。
@@ -243,7 +246,7 @@ export function SystemSettingsView(content, ctx = {}) {
         ? '恢复系统更新会撤掉 hosts 阻断段，并把自动更新偏好打开 —— 这台机器之后可能自己下载更新。确定？'
         : action === 'disable-autologin'
           ? '关闭自动登录后，重启需要手动输入密码才能进桌面。如果这是无人值守的机器，确定？'
-          : '会修改系统设置（pmset / hosts / 偏好文件）。确定继续？';
+          : '会修改 mac 设置（pmset / hosts / 偏好文件）。确定继续？';
       const yes = await confirmBox(msg, {
         title: meta.title,
         danger: !!meta.danger,
@@ -293,7 +296,7 @@ export function SystemSettingsView(content, ctx = {}) {
     // ---------- 主机状态 ----------
     const rows = [
       ['机型', st.model || '—'],
-      ['面板权限', st.is_root ? 'root（可以改系统设置）' : '非 root —— 系统设置将无法生效'],
+      ['面板权限', st.is_root ? 'root（可以改 mac 设置）' : '非 root —— mac 设置将无法生效'],
       ['远程登录 SSH', st.ssh_listening ? `正在监听 ${st.ssh_port} 端口` : `未监听（${st.ssh_port} 端口没人听）`],
       ['自动登录', st.auto_login ? st.auto_login : '未开启'],
       ['Tailscale', st.tailscale ? '已安装' : '未安装'],

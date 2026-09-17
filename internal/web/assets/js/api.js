@@ -379,7 +379,7 @@ export const api = {
     return u.toString();
   },
 
-  // ---- 系统设置（把 macOS 配成服务器）----
+  // ---- mac 设置（把 macOS 配成服务器；页面显示名从「系统设置」改来）----
   // 探测是只读的，随时可刷新；动作一律走任务中心（返回 task_id），
   // 因为其中「一键设为服务器模式」要跑十几条命令、动 hosts 与 pmset。
   systemSettings: () => request('GET', `${API_BASE}/system/settings`),

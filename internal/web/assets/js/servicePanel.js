@@ -952,9 +952,16 @@ export async function openServicePanel(o = {}) {
 
     // ⑧ 收尾：managed=false 只给「取消纳管」，managed=true 才给「卸载」。
     //    这条判据来自**服务记录**，不来自应用 ID —— 非面板管理的服务不出现卸载。
+    //
+    // 2026-09 真机缺陷：用户删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，
+    // 而卸载必然失败（"未找到 docker compose 命令"）→ 记录永远删不掉、被卡死。
+    // 现在**任何托管记录都额外给一个"只删记录"出口**；运行时不可用时它就是唯一
+    // 能真正成功的收尾动作，文案如实写「取消纳管（仅删除记录）」并说明未停止容器。
     if (s) {
+      const rt = runtimeDownOf(s);
       if (s.managed) {
         out.push(uninstallButton(s, afterAction));
+        out.push(forgetButton(s, afterAction, { recordOnly: true, runtimeDown: rt.down, reason: rt.reason }));
       } else if (mi && (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service')) {
         // 记录是「纳管」（managed=false），但**目录**说这个应用是面板自己装的
         // （uninstall.kind = installer/service）→ 以目录为准，给真正的「卸载」。
@@ -966,7 +973,7 @@ export async function openServicePanel(o = {}) {
         // 卸载统一收进这个面板，只看记录就会只剩「取消纳管」——
         // 于是面板装的应用**在界面上永远卸不掉**（点了"取消纳管"东西还在）。
         // 两个都留着：它们语义不同（卸载 = 删应用；取消纳管 = 只删记录）。
-        out.push(marketUninstallButton(mi, afterAction));
+        out.push(marketUninstallButton(mi, afterAction, s));
         out.push(forgetButton(s, afterAction));
       } else {
         out.push(forgetButton(s, afterAction));
@@ -1113,26 +1120,101 @@ export async function openServicePanel(o = {}) {
   return m;
 }
 
-// forgetButton 取消纳管：只删面板记录，不动系统上的服务（managed=false 的收尾动作）。
-export function forgetButton(m, onDone) {
+// runtimeDownOf 判断"这条记录的运行时现在还可用吗"。
+//
+// 为什么必须有（2026-09 真机缺陷）：用户把 Colima/Docker 删掉后，compose 记录
+// 的驱动直接不可用 —— 后端把原因放在 driver_error、状态是 unavailable。这时
+// 「卸载」永远失败（"未找到 docker compose 命令"），如果界面上只有这一个出口，
+// 记录就永远删不掉、用户被卡死。判据只认后端给的真实字段，不猜。
+function runtimeDownOf(s) {
+  const reason = (s && s.driver_error) || '';
+  const status = String((s && s.state && s.state.status) || '');
+  return { down: !!reason || status === 'unavailable', reason: reason || '运行时不可用' };
+}
+
+// forgetRecord 走"只删记录"接口（DELETE /api/v1/services/{name}，后端只从面板
+// 移除记录、不触碰系统）。**404 必须如实降级**：旧面板没有这个能力时明确说
+// "该版本面板不支持，请升级"，绝不假装已经删掉。
+async function forgetRecord(name, label, opts = {}) {
+  try {
+    await api.serviceForget(name);
+    toast(opts.runtimeDown
+      ? '已删除面板记录（未停止容器：' + (opts.reason || '运行时不可用') + '）'
+      : '已删除面板记录（未停止、未删除任何容器或文件）', 'ok', 12000);
+    if (typeof opts.onDone === 'function') opts.onDone();
+    return true;
+  } catch (e) {
+    const status = e && e.status;
+    if (status === 404 || status === 405) {
+      toast('该版本面板不支持"只删除记录"（' + ((e && e.message) || status) + '），请升级面板后再试', 'err', 15000);
+    } else {
+      toast('删除记录失败：' + ((e && e.message) || e), 'err', 12000);
+    }
+    return false;
+  }
+}
+
+// recordOnlyModal 是"卸载失败"时的兜底对话框：把原因说清，并给一个**可直接点**的
+// 「只删除记录」出口。卸载失败不能只丢一句 toast 就完了（用户没有下一步）。
+function recordOnlyModal(opts) {
+  const { label, name, error, runtimeDown, reason, onDone } = opts;
+  const bodyLines = [
+    h('div', { style: { marginBottom: '8px' }, text: '卸载「' + label + '」没有成功：' + error }),
+  ];
+  if (runtimeDown) {
+    bodyLines.push(h('div', { text: '容器没法停（运行时不存在），可以只把这条记录从面板里去掉 —— 容器与磁盘数据不会被动。' }));
+    bodyLines.push(h('div.hint', { text: '未停止容器：' + (reason || '运行时不可用') + '。这一步只删除面板记录，不碰磁盘上的项目文件/数据卷。' }));
+  } else {
+    bodyLines.push(h('div', { text: '可以只把这条记录从面板里去掉。' }));
+    bodyLines.push(h('div.hint', { text: '注意：删记录不会停止或删除任何容器/文件 —— 如果容器还在运行，它会保持原样（容器可能还在）。' }));
+  }
+  modal({
+    title: '只删除记录 · ' + label,
+    body: h('div', bodyLines),
+    footer: (close) => [
+      h('button.btn', { text: '关闭', onclick: close }),
+      h('button.btn.btn-primary', {
+        text: '只删除记录',
+        onclick: async () => { close(); await forgetRecord(name, label, { runtimeDown, reason, onDone }); },
+      }),
+    ],
+  });
+}
+
+// forgetButton 取消纳管 / 只删除记录：只删面板记录，不动系统上的服务。
+//
+// opts.recordOnly=true 时用于**面板托管**的记录（managed=true）—— 这是"任何服务记录
+// 都有一个只删记录出口"的保证；opts.runtimeDown=true 时（compose 运行时不可用）
+// 文案直接写成「取消纳管（仅删除记录）」并如实说明没有停止任何容器。
+export function forgetButton(m, onDone, opts = {}) {
   const name = serviceNameOf(m);
   const label = m.display_name || m.name || name;
+  const recordOnly = !!opts.recordOnly;
+  const runtimeDown = !!opts.runtimeDown;
+  const reason = opts.reason || '运行时不可用';
+  const text = recordOnly
+    ? (runtimeDown ? '取消纳管（仅删除记录）' : '仅删除面板记录')
+    : '取消纳管';
   return h('button.btn.btn-sm', {
-    text: '取消纳管',
-    title: '只把这个服务从面板记录里移除，不动系统上的任何东西',
+    text,
+    title: recordOnly
+      ? '只把这条记录从面板移除，不停止、不删除任何容器或文件'
+      : '只把这个服务从面板记录里移除，不动系统上的任何东西',
     onclick: async () => {
-      if (!await confirmBox(
-        '把「' + label + '」从面板记录里移除？\n\n' +
-        '面板不会卸载你自己安装的软件（不跑 brew uninstall、不删文件），只是不再管它。' +
-        '以后想再管它，可以用「扫描可纳管服务」重新纳管。',
-        { title: '取消纳管', okText: '取消纳管' })) return;
-      try {
-        await api.serviceForget(name);
-        toast('已取消纳管', 'ok');
-        if (typeof onDone === 'function') onDone();
-      } catch (e) {
-        toast('取消失败：' + e.message, 'err', 9000);
-      }
+      const msg = recordOnly
+        ? ('把「' + label + '」从面板记录里移除？\n\n'
+          + (runtimeDown
+            ? ('运行时不可用（' + reason + '），所以**没有**停止任何容器，也不会删除磁盘上的项目文件与数据卷。\n'
+              + '只把这条记录从面板移除 —— 未停止容器。')
+            : '只删除面板记录：面板不会停止或删除任何容器/文件（如果它们还在运行，会保持原样）。'))
+        : ('把「' + label + '」从面板记录里移除？\n\n' +
+          '面板不会卸载你自己安装的软件（不跑 brew uninstall、不删文件），只是不再管它。' +
+          '以后想再管它，可以用「扫描可纳管服务」重新纳管。');
+      if (!await confirmBox(msg, {
+        title: recordOnly ? '仅删除记录' : '取消纳管',
+        okText: '确认删除记录',
+      })) return;
+      await forgetRecord(name, label, { runtimeDown, reason, onDone });
     },
   });
 }
@@ -1157,12 +1239,33 @@ export function uninstallButton(s, onDone) {
         // 时 taskCenter.start 会弹出**带原因**的 toast 并返回 null ——
         // 那种情况下既不能再触发 onDone（会刷出一个"什么都没发生"的界面），
         // 更不能沉默。写操作的失败必须可见，这条是本 bug（坑 154）的教训。
+        //
+        // 2026-09 追加：卸载失败（尤其 compose 运行时被删掉）**必须给出下一步** ——
+        // 弹一个带「只删除记录」按钮的对话框，而不是只留一句错误让用户卡死。
+        const rt = runtimeDownOf(s);
         const taskId = await taskCenter.start({
           kind: 'uninstall', target: s.name, title: `卸载 ${label}`,
           start: () => api.serviceUninstall(s.name),
+          onDone: (task) => {
+            if (task && task.status && task.status !== 'succeeded') {
+              const r2 = runtimeDownOf(s);
+              recordOnlyModal({
+                label, name: s.name, error: task.error || task.status,
+                runtimeDown: r2.down, reason: r2.reason, onDone,
+              });
+              return; // 刷新交给对话框里的"只删除记录"成功后自己做
+            }
+            if (typeof onDone === 'function') onDone();
+          },
         });
-        if (!taskId) return; // 失败原因已由 taskCenter.start 弹出来了
-        if (typeof onDone === 'function') onDone();
+        if (!taskId) {
+          // 提交就没成功：taskCenter 已弹带原因的 toast，这里补上可直接点的出口。
+          recordOnlyModal({
+            label, name: s.name, error: '卸载任务没能提交（原因见上方提示）',
+            runtimeDown: rt.down, reason: rt.reason, onDone,
+          });
+          return;
+        }
       } catch (e) {
         // 兜底：确认框/渲染层自己抛异常时也必须说话 —— async 点击处理器里的异常
         // 会变成 unhandled rejection，用户那边就是"点了没反应"。
@@ -1174,9 +1277,14 @@ export function uninstallButton(s, onDone) {
 
 // marketUninstallButton 从市场卸载（面板自研安装器 / compose 应用走这里）。
 // 确认框逐条列出会做什么、以及可选的"同时删除数据"路径 —— 卸载不可逆。
-export function marketUninstallButton(mi, onDone) {
+//
+// svc 是可选的**服务记录**：卸载失败时用它做"只删除记录"的兜底出口
+// （记录名/展示名以记录为准；没有记录时没有可删的记录，就只如实报错）。
+export function marketUninstallButton(mi, onDone, svc = null) {
   const plan = mi.uninstall || {};
   const residual = !!mi.artifacts && !mi.installed;
+  const recordName = (svc && svc.name) || mi.id;
+  const recordLabel = (svc && (svc.display_name || svc.name)) || mi.name;
   // 计划被 blocked（例如"还有 1 个 Docker 应用在用这个运行时"）时**不能**用
   // disabled：禁用的按钮点下去什么都不发生（原因还只在悬浮提示里），用户看到的
   // 就是"点了没反应"—— 这正是本 bug 的形态。保持可点，点了把原因说出来。
@@ -1236,7 +1344,18 @@ export function marketUninstallButton(mi, onDone) {
           start: () => api.marketUninstall(mi.id, wipe),
           onDone: (task) => {
             if (task && task.status && task.status !== 'succeeded') {
-              toast((residual ? '删除残留数据失败：' : '卸载失败：') + (task.error || task.status), 'err', 12000);
+              const err = task.error || task.status;
+              toast((residual ? '删除残留数据失败：' : '卸载失败：') + err, 'err', 12000);
+              // 卸载失败时给出"只删记录"的下一步（compose 运行时不在时尤其关键）。
+              // 只有确实存在服务记录时才提供 —— 没有记录就没有可删的东西。
+              if (svc && svc.name) {
+                const rt = runtimeDownOf(svc);
+                recordOnlyModal({
+                  label: recordLabel, name: recordName, error: err,
+                  runtimeDown: rt.down, reason: rt.reason, onDone,
+                });
+                return;
+              }
             } else {
               toast(residual ? '已删除「' + mi.name + '」的残留数据'
                 : '已卸载「' + mi.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'), 'ok', 9000);

@@ -42,6 +42,9 @@ func (s *Server) detectDocker() (string, string) {
 
 // svcManager 构造服务管理器。
 func (s *Server) svcManager() *services.Manager {
+	if s.svcManagerOverride != nil { // 单测注入点，见 server.go 的字段说明
+		return s.svcManagerOverride(s)
+	}
 	// 顺手对一次路径：面板可能在"Homebrew 还不存在"的那一刻就写下了配置
 	// （全新机器就是这样），装好 Homebrew 之后前缀若不修正，
 	// 站点/数据库/日志会一直在找 /usr/local 下的东西。
@@ -526,21 +529,37 @@ func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
 	ok(w, cur)
 }
 
-// handleServiceDelete 从面板移除服务记录（不触碰系统）。
+// handleServiceDelete 只删面板记录，绝不触碰运行时。
+//
+// 语义硬要求（2026-09-17 真机缺陷）：用户把本机 Docker/Colima 全删掉后，
+// managed=true 的 compose 记录走「卸载」会先 `docker compose down` 而失败，
+// 于是那条记录**永远删不掉**。这条通路就是那种情况下的唯一出口：
+// 它只删 services 表里的一行，绝不调用 docker / brew / launchctl 去停任何东西。
+// 纳管的本机现有服务同样只删记录，真实服务照旧运行。
+//
+// 为什么**刻意不经 svcManager()**：构造管理器会探测 Docker socket、并
+// ReconcilePaths() 顺手写配置。这条通路的语义是"记录与运行时彻底解耦"，
+// 所以直接落到 serviceRepo —— 最短、也最容易证明不碰运行时的路径。
 func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	mgr := s.svcManager()
-	if err := mgr.Forget(r.Context(), name); err != nil {
+	if err := s.serviceRepo.Delete(r.Context(), name); err != nil {
 		// 记录不存在是 404（客户端用错名字），不是 500（服务端故障）
 		if errors.Is(err, services.ErrServiceNotFound) {
-			fail(w, http.StatusNotFound, err.Error())
+			fail(w, http.StatusNotFound,
+				"服务 "+name+" 不在面板记录里（服务不存在或已被移除）")
 			return
 		}
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.audit(r, "service_forget", name, "从面板移除服务（不影响系统）", true, "")
-	ok(w, map[string]any{"msg": "已从面板移除。系统上的服务本身没有被改动。"})
+	ok(w, map[string]any{
+		"removed": true,
+		// runtime_touched 必须**如实**：这条通路只删了 services 表里的一行，
+		// 没有执行任何 docker / brew / launchctl 命令，也没有停任何服务。
+		"runtime_touched": false,
+		"msg":             "已从面板移除。系统上的服务本身没有被改动。",
+	})
 }
 
 // handleServiceUninstall 卸载托管服务。
@@ -550,7 +569,7 @@ func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) 
 		"service_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{Steps: []string{}}
 			if err := s.svcManager().Uninstall(ctx, name); err != nil {
-				return res, err
+				return res, uninstallFailure(err, name)
 			}
 			res.Steps = append(res.Steps, "服务已卸载")
 			// 卸载后护栏：卸载流程（尤其 brew uninstall / autoremove）可能把
@@ -560,6 +579,23 @@ func (s *Server) handleServiceUninstall(w http.ResponseWriter, r *http.Request) 
 			s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, "")
 			return res, nil
 		})
+}
+
+// uninstallFailure 把卸载失败整理成用户能据以行动的说明。
+//
+// 唯一特殊处理：**运行时不可用**（docker/compose 命令缺失）时，明确告诉用户
+// "没有停止任何容器、系统一点没动"，并指出还有「取消纳管」（只删记录）这条路 ——
+// 否则用户会以为卸载失败＝记录也删不掉（2026-09-17 真机缺陷：
+// Docker 全删掉后，managed=true 的 compose 记录只能走卸载，于是永远删不掉）。
+//
+// 成功路径完全不受影响：这里只在**已经有错误**时改写文案，不改任何行为。
+func uninstallFailure(err error, name string) error {
+	if !services.IsRuntimeUnavailable(err) {
+		return err
+	}
+	return fmt.Errorf("%w（说明：本机没有可用的容器运行时，本次没有停止任何容器、"+
+		"系统上的服务一点没动；如果你只是想清掉面板里的这条记录，请用「取消纳管」——"+
+		"DELETE /api/v1/services/%s 只删记录、不需要 Docker）", err, name)
 }
 
 // ---------- 应用市场 ----------

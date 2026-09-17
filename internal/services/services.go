@@ -23,10 +23,39 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// RuntimeUnavailableError 标记"本机没有可用的容器运行时，命令根本没执行"。
+//
+// 它的 Error() **原样返回底层文案**（用户已经看到的那句话不变），只是让 HTTP 层
+// 能用 errors.As 认出这种情况，补上更精准的说明（"没有停止任何容器"、
+// "可以只删记录"）—— 见 web 层 handleServiceUninstall。
+//
+// 为什么需要它（2026-09-17 真机缺陷）：用户把本机 Docker/Colima 全删掉后，
+// 面板里 managed=true 的 compose 记录走「卸载」只会报一句"未找到 docker compose
+// 命令"，用户既不知道"东西其实一点没动"，也不知道"记录还可以只删掉"。
+type RuntimeUnavailableError struct{ Err error }
+
+func (e *RuntimeUnavailableError) Error() string { return e.Err.Error() }
+func (e *RuntimeUnavailableError) Unwrap() error { return e.Err }
+
+// MarkRuntimeUnavailable 给错误打上"运行时不可用"的标记；nil 原样返回。
+func MarkRuntimeUnavailable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &RuntimeUnavailableError{Err: err}
+}
+
+// IsRuntimeUnavailable 判断错误是否属于"运行时不可用，命令根本没执行"。
+func IsRuntimeUnavailable(err error) bool {
+	var e *RuntimeUnavailableError
+	return errors.As(err, &e)
+}
 
 // Kind 是服务的类型。
 type Kind string
@@ -279,12 +308,14 @@ func (m *Manager) DriverFor(s *Service) (Driver, error) {
 		return newNativeDriver(m.opt, s), nil
 	case KindDocker:
 		if m.opt.DockerSocket == "" {
-			return nil, fmt.Errorf("Docker 不可用：未检测到 %s", "/var/run/docker.sock")
+			return nil, MarkRuntimeUnavailable(
+				fmt.Errorf("Docker 不可用：未检测到 %s", "/var/run/docker.sock"))
 		}
 		return newDockerDriver(m.opt, s), nil
 	case KindCompose:
 		if m.opt.DockerSocket == "" {
-			return nil, fmt.Errorf("Docker 不可用，无法管理 compose 项目")
+			return nil, MarkRuntimeUnavailable(
+				fmt.Errorf("Docker 不可用，无法管理 compose 项目"))
 		}
 		return newComposeDriver(m.opt, s), nil
 	case KindColima:
@@ -539,7 +570,12 @@ func (m *Manager) ForgetByLabel(ctx context.Context, label string) (int, error) 
 	return n, nil
 }
 
-// ForgetName 从注册表移除（不触碰系统）。
+// Forget 从注册表移除（不触碰系统）。
+//
+// 注意：HTTP 的「只删记录」通路（DELETE /api/v1/services/{name}）**刻意不用它**，
+// 而是直接落 Repository.Delete —— 构造 Manager 会探测 Docker socket 并
+// ReconcilePaths 写配置，那条通路的语义要求"连运行时的边都不沾"（见
+// web 层 handleServiceDelete）。
 func (m *Manager) Forget(ctx context.Context, name string) error {
 	return m.repo.Delete(ctx, name)
 }

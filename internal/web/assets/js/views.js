@@ -347,7 +347,7 @@ export function DashboardView(content, ctx = {}) {
       ['操作系统', `macOS ${s.os || '?'} (${s.arch})`],
       ['处理器', s.cpu_model || '-'],
       ['运行时长', duration(s.uptime)],
-      // 系统负载与 Swap 原先只出现在「系统监控」页；那一页已改造成「系统设置」，
+      // 系统负载与 Swap 原先只出现在「系统监控」页；那一页已改造成「mac设置」，
       // 于是把这两项搬进仪表盘，避免页面改造反而丢掉信息。
       ['系统负载 (1/5/15)', `${s.load_1.toFixed(2)} / ${s.load_5.toFixed(2)} / ${s.load_15.toFixed(2)}`],
       ['Swap 使用', s.swap_total ? `${bytes(s.swap_used)} / ${bytes(s.swap_total)}` : '未启用'],
@@ -965,7 +965,7 @@ export function ComingSoonView(content, ctx = {}) {
           h('span.pill.ok', { text: '两步验证 TOTP' }),
           h('span.pill.ok', { text: '访问策略（IP 白名单）' }),
           h('span.pill.ok', { text: '实时系统监控（仪表盘）' }),
-          h('span.pill.ok', { text: 'macOS 系统设置' }),
+          h('span.pill.ok', { text: 'mac 设置' }),
           h('span.pill.ok', { text: '操作审计' }),
           h('span.pill.ok', { text: '内存级登录限流' }),
         ]),

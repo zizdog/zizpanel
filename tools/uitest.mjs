@@ -349,15 +349,23 @@ try {
     await themeBtn.click();
   });
 
-  await step('切换到系统设置页', async () => {
-    await page.click('.nav-item:has-text("系统设置")');
+  await step('切换到 mac设置页（旧名「系统设置」）', async () => {
+    // 侧栏显示名 2026-09 从「系统设置」改成「mac设置」（与「面板设置」消歧）；
+    // 路由 id 仍是 system。
+    if (await page.locator('.nav-item:has-text("系统设置")').count()) {
+      throw new Error('侧栏已不应再有「系统设置」，应为「mac设置」');
+    }
+    await page.click('.nav-item:has-text("mac设置")');
     await page.waitForTimeout(2600);
     await shot('04-system-settings');
+    // 页内标题（顶栏 h2）必须同步改名，不能只改侧栏。
+    const h2 = (await page.locator('.topbar h2').innerText()).trim();
+    if (h2 !== 'mac设置') throw new Error(`页内标题应为「mac设置」，实际「${h2}」`);
     const txt = await page.locator('.content').innerText();
     // 这一页取代了原来的「系统监控」（与仪表盘重复）。内容必须真的渲染出来：
     // 服务器模式、电源策略、更新阻断 —— 少一个都说明接口或页面挂了。
     for (const need of ['一键设为服务器模式', '电源与睡眠', '系统更新阻断', '远程访问与登录']) {
-      if (!txt.includes(need)) throw new Error(`系统设置页缺少「${need}」`);
+      if (!txt.includes(need)) throw new Error(`mac设置页缺少「${need}」`);
     }
   });
 
@@ -1006,6 +1014,129 @@ try {
     await page.waitForTimeout(2500);
   });
 
+  // ---------- compose 记录 + 运行时不可用：必须有"只删记录"的出口（2026-09 真机缺陷）----------
+  //
+  // 用户真机：删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，点卸载报
+  // "未找到 docker compose 命令" → 记录永远删不掉。这条断言**全部走桩**：
+  //   ① 记录带 driver_error（运行时不可用）→ 面板里必须出现「取消纳管（仅删除记录）」；
+  //   ② 点「卸载」→ 桩 500 → 必须弹出一个带「只删除记录」按钮的对话框；
+  //   ③ 对话框必须如实说明"未停止容器"；
+  //   ④ 点「只删除记录」→ 必须真的调用 DELETE /services/{name}（只删记录，不碰运行时）。
+  await step('compose 记录运行时不可用：有「取消纳管（仅删除记录）」出口，卸载失败可一键只删记录', async () => {
+    const NAME = 'uitest-compose-gone';
+    const LABEL = 'UITEST compose·运行时没了';
+    const FAKE = {
+      name: NAME, display_name: LABEL,
+      kind: 'compose', managed: true,
+      driver_error: 'Docker 不可用，无法管理 compose 项目',
+      state: { status: 'unavailable', running: false },
+      compose_file: '/tmp/uitest-compose/docker-compose.yml',
+      work_dir: '/tmp/uitest-compose', port: 0,
+    };
+    const uninstallCalls = [];
+    const forgetCalls = [];
+    expectHTTPError = true; // 桩的 500 是断言对象，不是前端故障
+
+    await page.route('**/api/v1/services**', async (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      if (req.method() === 'DELETE' && path === `services/${NAME}/uninstall`) {
+        uninstallCalls.push(path);
+        return route.fulfill({
+          status: 500, contentType: 'application/json',
+          body: JSON.stringify({ ok: false, msg: '未找到 docker compose 命令。请先安装 Docker…' }),
+        });
+      }
+      if (req.method() === 'DELETE' && path === `services/${NAME}`) {
+        forgetCalls.push(path);
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: {} }) });
+      }
+      if (req.method() === 'GET' && (path === 'services' || path === 'services/health')) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [FAKE] } }) });
+      }
+      if (req.method() === 'GET' && path === `services/${NAME}`) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: FAKE }) });
+      }
+      if (req.method() === 'GET' && /credentials$/.test(path)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { credentials: [] } }) });
+      }
+      return route.continue();
+    });
+    await page.route('**/api/v1/market**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [] } }),
+    }));
+    await page.route('**/api/v1/tasks**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+    }));
+
+    const closeModals = async () => {
+      for (let i = 0; i < 5; i++) {
+        const masks = page.locator('.modal-mask');
+        if (!(await masks.count())) break;
+        const x = masks.last().locator('button.modal-close').first();
+        if (await x.count()) await x.click().catch(() => {});
+        await page.waitForTimeout(250);
+      }
+    };
+
+    try {
+      await page.click('.nav-item:has-text("应用")');
+      await page.waitForTimeout(2000);
+
+      // 打开这条 compose 记录的「⚙️ 管理」面板
+      const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
+      await card.waitFor({ timeout: 15000 });
+      await card.locator('button:has-text("管理")').click();
+      const recordOnly = page.locator('.modal-mask button:has-text("取消纳管（仅删除记录）")').last();
+      await recordOnly.waitFor({ timeout: 8000 });
+      await shot('31a-compose-record-only-entry');
+
+      // 点「🗑 卸载」→ 确认 → 桩 500 → 必须弹可点出口的对话框
+      await page.locator('.modal-mask button:has-text("🗑 卸载")').last().click();
+      const confirm = page.locator('.modal-mask', { hasText: '卸载服务' }).last();
+      await confirm.locator('button:has-text("确认卸载")').waitFor({ timeout: 8000 });
+      await confirm.locator('button:has-text("确认卸载")').click();
+
+      const fallback = page.locator('.modal-mask', { hasText: '只删除记录' }).last();
+      await fallback.waitFor({ timeout: 10000 });
+      const ftext = await fallback.innerText();
+      if (!ftext.includes('未停止容器')) {
+        throw new Error('卸载失败对话框没有如实说明"未停止容器"：\n' + ftext.slice(0, 300));
+      }
+      if (!ftext.includes('只删除记录')) throw new Error('卸载失败对话框没有「只删除记录」按钮');
+      await shot('31b-compose-uninstall-failed-fallback');
+
+      // 点「只删除记录」→ 必须真的调用 DELETE /services/{name}
+      await fallback.locator('button:has-text("只删除记录")').last().click();
+      await page.waitForTimeout(1200);
+      if (!forgetCalls.includes(`services/${NAME}`)) {
+        throw new Error('点了「只删除记录」但 DELETE /services/{name} 没有发出去：' + JSON.stringify(forgetCalls));
+      }
+      if (!uninstallCalls.includes(`services/${NAME}/uninstall`)) {
+        throw new Error('点「卸载」时 DELETE .../uninstall 没有发出去：' + JSON.stringify(uninstallCalls));
+      }
+      const okToast = page.locator('.toasts .toast.ok').last();
+      await okToast.waitFor({ timeout: 8000 });
+      const okText = await okToast.innerText();
+      if (!okText.includes('未停止容器')) {
+        throw new Error('删除记录成功的提示没有如实说"未停止容器"：' + okText);
+      }
+      await shot('31c-compose-record-deleted');
+    } finally {
+      await closeModals();
+      await page.unroute('**/api/v1/services**');
+      await page.unroute('**/api/v1/market**');
+      await page.unroute('**/api/v1/tasks**');
+      expectHTTPError = false;
+      // 让页面重新拉真实数据，后面步骤不要停在这张桩卡片上
+      await page.click('.nav-item:has-text("仪表盘")');
+      await page.waitForTimeout(700);
+      await page.click('.nav-item:has-text("应用")');
+      await page.waitForTimeout(2200);
+    }
+  });
+
   await step('查看服务日志（SSE 实时流）', async () => {
     // 2026-09-16：「日志」按钮从服务卡片搬进了「应用管理」面板（市场卡片与服务管理
     // 点开的是同一个面板；市场上的两个入口「详情」「查看服务」已合并成「⚙️ 管理」）。
@@ -1567,13 +1698,17 @@ try {
     expectHTTPError = false;
   });
 
-  // ---------- 日志中心（P4）----------
-  await step('打开日志中心', async () => {
-    await page.click('.nav-item:has-text("日志中心")');
+  // ---------- 日志（P4；2026-09 与操作审计合并为一页两个 Tab）----------
+  await step('打开日志页（默认落在「日志」Tab）', async () => {
+    await page.click('.nav-item:has-text("日志")');
     await page.waitForTimeout(2500);
     await shot('60-logs');
+    // 合并页的第一个 Tab 是日志块：默认块必须是它（data-tab 是稳定锚点）。
+    if (await page.locator('button[data-tab="logs"].btn-primary').count() !== 1) {
+      throw new Error('日志页默认没有落在「日志」Tab');
+    }
     const txt = await page.locator('.content').innerText();
-    if (!txt.includes('日志文件')) throw new Error('日志中心未渲染: ' + txt.slice(0, 120));
+    if (!txt.includes('日志文件')) throw new Error('日志页未渲染: ' + txt.slice(0, 120));
     // 不允许出现字面量 null
     const junk = await page.evaluate(() => {
       let n = 0;
@@ -1586,7 +1721,7 @@ try {
       walk(document.querySelector('.content'));
       return n;
     });
-    if (junk > 0) throw new Error('日志中心出现了 ' + junk + ' 处字面量 null');
+    if (junk > 0) throw new Error('日志页出现了 ' + junk + ' 处字面量 null');
   });
 
   await step('选择日志并实时尾随', async () => {
@@ -1662,15 +1797,32 @@ try {
     }
   });
 
-  // ---------- 侧栏：「操作审计」归属「日志」版块（回归：2026-09 信息架构调整）----------
+  // ---------- 侧栏信息架构 + 「日志」合并页（回归：2026-09 三条调整）----------
   //
-  // 需求：audit 原来是侧栏顶级项，现在必须落在「日志」分组里（与「日志中心」并列），
-  // 全站只有一个「操作审计」入口（不能和「检查更新」页重复），且 #/audit 仍可打开。
+  // 需求（本轮）：
+  //   ① 侧栏「系统设置」改名「mac设置」（路由 id 仍是 system，只改显示名）；
+  //   ② 「日志中心」+「操作审计」合并成侧栏唯一「日志」项，页内两个 Tab；
+  //   ③ 这个「日志」放在「系统」分组里、夹在「面板设置」与「检查更新」之间。
   // 分组在 DOM 里是**扁平的兄弟节点**（div.nav-group 后面跟若干 div.nav-item），
   // 所以"归属哪个分组"只能靠相对位置判断，不能用父子选择器。
-  await step('侧栏「操作审计」在「日志」版块下，且 #/audit 仍可打开（唯一入口）', async () => {
-    const navCount = await page.locator('.nav-item:has-text("操作审计")').count();
-    if (navCount !== 1) throw new Error(`侧栏「操作审计」入口应恰好 1 个，实际 ${navCount}`);
+  await step('侧栏：mac设置改名 / 唯一「日志」项夹在面板设置与检查更新之间', async () => {
+    // ① 不再有「系统设置」，只有「mac设置」
+    if (await page.locator('.nav-item:has-text("系统设置")').count()) {
+      throw new Error('侧栏仍有「系统设置」，应已改名「mac设置」');
+    }
+    if (await page.locator('.nav-item:has-text("mac设置")').count() !== 1) {
+      throw new Error('侧栏「mac设置」入口应恰好 1 个');
+    }
+    // ② 侧栏只有一个「日志」项；不再有独立的「日志中心」/「操作审计」导航项
+    if (await page.locator('.nav-item:has-text("日志")').count() !== 1) {
+      throw new Error('侧栏「日志」入口应恰好 1 个');
+    }
+    if (await page.locator('.nav-item:has-text("日志中心")').count()) {
+      throw new Error('侧栏不应再有「日志中心」独立项');
+    }
+    if (await page.locator('.nav-item:has-text("操作审计")').count()) {
+      throw new Error('侧栏不应再有「操作审计」独立项（已并入「日志」页）');
+    }
 
     // readGroup 从 nav 的扁平兄弟节点里取出某个分组标题下的 nav-item 文案。
     const readGroup = (title) => page.evaluate((t) => {
@@ -1687,43 +1839,57 @@ try {
       return { found: true, items };
     }, title);
 
-    const group = await readGroup('日志');
-    if (!group) throw new Error('侧栏 nav 不存在');
-    if (!group.found) throw new Error('侧栏里找不到「日志」分组标题');
-    if (!group.items.some((t) => t.includes('日志中心'))) {
-      throw new Error('「日志」分组里没有「日志中心」：' + JSON.stringify(group.items));
-    }
-    if (!group.items.some((t) => t.includes('操作审计'))) {
-      throw new Error('「操作审计」不在「日志」分组里（该分组实际为：' + JSON.stringify(group.items) + '）');
-    }
-    const li = group.items.findIndex((t) => t.includes('日志中心'));
-    const ai = group.items.findIndex((t) => t.includes('操作审计'));
-    if (ai < li) throw new Error('「操作审计」应排在「日志中心」之后：' + JSON.stringify(group.items));
-
-    // 「系统」分组：面板设置在前，检查更新**紧随其后**（顺序被改回去就红）。
+    // ③「系统」分组里顺序必须是 面板设置 → 日志 → 检查更新（紧邻）。若要改成
+    // 检查更新 → 日志 → 面板设置，只需调整 app.js 的 NAV 顺序，这条断言会立刻提醒。
     const sys = await readGroup('系统');
     if (!sys || !sys.found) throw new Error('侧栏里找不到「系统」分组标题');
     const si = sys.items.findIndex((t) => t.includes('面板设置'));
+    const li = sys.items.findIndex((t) => t.includes('日志'));
     const ui = sys.items.findIndex((t) => t.includes('检查更新'));
     if (si < 0) throw new Error('「系统」分组里没有「面板设置」：' + JSON.stringify(sys.items));
+    if (li < 0) throw new Error('「系统」分组里没有「日志」：' + JSON.stringify(sys.items));
     if (ui < 0) throw new Error('「系统」分组里没有「检查更新」：' + JSON.stringify(sys.items));
-    if (!(si < ui)) throw new Error('「面板设置」应排在「检查更新」之前：' + JSON.stringify(sys.items));
-    if (ui !== si + 1) throw new Error('「检查更新」应紧随「面板设置」之后：' + JSON.stringify(sys.items));
-    await shot('52b-nav-logs-group');
-
-    // 老书签（带 hash 直接打开）必须仍落在审计页，而不是回仪表盘/404
-    const auditURL = base.replace(/\/+$/, '') + '/#/audit';
-    await page.goto(auditURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('.card-head h3:has-text("操作审计")', { timeout: 15000 });
-    if (await page.locator('.nav-item:has-text("操作审计")').count() !== 1) {
-      throw new Error('#/audit 打开后侧栏「操作审计」入口数不为 1');
+    if (!(si < li && li < ui)) {
+      throw new Error('「系统」分组顺序应为 面板设置 → 日志 → 检查更新：' + JSON.stringify(sys.items));
     }
-    await shot('52c-audit-direct-hash');
+    if (ui !== si + 2) {
+      throw new Error('「日志」应夹在「面板设置」与「检查更新」之间且紧邻：' + JSON.stringify(sys.items));
+    }
+    await shot('52b-nav-system-group');
+
+    // ② 旧 hash #/logs：默认落第一个 Tab（日志）
+    await page.goto(base.replace(/\/+$/, '') + '/#/logs', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('button[data-tab="logs"]', { timeout: 15000 });
+    await page.waitForTimeout(800);
+    if (await page.locator('button[data-tab="logs"].btn-primary').count() !== 1) {
+      throw new Error('#/logs 直开没有落在「日志」Tab');
+    }
+    if (!(await page.locator('.content').innerText()).includes('日志文件')) {
+      throw new Error('#/logs 直开后日志块没有渲染');
+    }
+    await shot('52c-logs-hash');
+
+    // ④ 旧 hash #/audit：必须切到「操作审计」Tab，且审计内容渲染出来
+    await page.goto(base.replace(/\/+$/, '') + '/#/audit', { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.card-head h3:has-text("操作审计")', { timeout: 15000 });
+    await page.waitForTimeout(800);
+    if (await page.locator('button[data-tab="audit"].btn-primary').count() !== 1) {
+      throw new Error('#/audit 直开没有切到「操作审计」Tab');
+    }
+    // ⑤ 全站只有一个「操作审计」入口：侧栏没有独立项（上面已断言），
+    //    唯一的入口是合并页里这个 Tab 按钮。
+    if (await page.locator('button[data-tab="audit"]').count() !== 1) {
+      throw new Error('「操作审计」入口（Tab 按钮）应恰好 1 个');
+    }
+    await shot('52d-audit-hash');
   });
 
   // ---------- 操作审计（P1）----------
   await step('操作审计页：筛选、加载更多、导出入口', async () => {
-    await page.click('.nav-item:has-text("操作审计")');
+    // 合并后没有独立的导航项：先进「日志」页，再切到「操作审计」Tab。
+    await page.click('.nav-item:has-text("日志")');
+    await page.waitForSelector('button[data-tab="audit"]', { timeout: 15000 });
+    await page.click('button[data-tab="audit"]');
     await page.waitForSelector('.card-head h3:has-text("操作审计")', { timeout: 15000 });
     await page.waitForTimeout(2000);
     await shot('53-audit');

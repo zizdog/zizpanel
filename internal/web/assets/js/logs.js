@@ -26,6 +26,10 @@ function stopFollow() {
   }
 }
 
+// stopLogsFollow 供「日志」合并页（logshub.js）在切走日志 Tab 时调用：
+// Tab 内部切换不会触发路由级 cleanup，不显式停就会留一条 SSE 在后台。
+export function stopLogsFollow() { stopFollow(); }
+
 export function LogsView(content, ctx = {}) {
   clear(content);
   currentKey = '';
