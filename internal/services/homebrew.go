@@ -240,43 +240,88 @@ type brewGitMirror struct{ Brew, Core string }
 // 现在逐个探测（`info/refs?service=git-upload-pack` 与 git 走同一条路），
 // 谁先通就用谁；一个都不通就**不设这两个变量**，交给 brew 用官方源兜底。
 func brewGitMirrorCandidates() []brewGitMirror {
+	// 顺序=候选集合；**真正选谁由"延迟最优"决定**（见 pickBrewGitMirror）。
+	//
+	// 2026-09-18 真机教训：之前把清华排第一，结果它把 clone 放进队列
+	// （`remote: Waiting in queue... (Position: 1055)`）→ 用户看到 brew 卡在
+	// "Downloading and installing Homebrew..." 十几分钟，等于装不上。
+	// 实测连接延迟：USTC 0.26s / 阿里云 0.28s / 腾讯 0.34s / 北外 1.15s / 清华 1.86s。
 	return []brewGitMirror{
-		{
-			Brew: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git",
-			Core: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
-		},
 		{
 			Brew: "https://mirrors.ustc.edu.cn/brew.git",
 			Core: "https://mirrors.ustc.edu.cn/homebrew-core.git",
 		},
+		{
+			Brew: "https://mirrors.aliyun.com/homebrew/brew.git",
+			Core: "https://mirrors.aliyun.com/homebrew/homebrew-core.git",
+		},
+		{
+			Brew: "https://mirrors.cloud.tencent.com/homebrew/brew.git",
+			Core: "https://mirrors.cloud.tencent.com/homebrew/homebrew-core.git",
+		},
+		{
+			Brew: "https://mirrors.bfsu.edu.cn/git/homebrew/brew.git",
+			Core: "https://mirrors.bfsu.edu.cn/git/homebrew/homebrew-core.git",
+		},
+		{
+			Brew: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git",
+			Core: "https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git",
+		},
 	}
 }
 
-// probeGitMirror 探测一个 git 仓库地址是否可用（HTTP 2xx）。
-func probeGitMirror(ctx context.Context, repoURL string) bool {
-	c := &http.Client{Timeout: 6 * time.Second}
+// probeGitMirror 探测一个 git 仓库地址是否可用，返回耗时（不可用为 0）。
+func probeGitMirror(ctx context.Context, repoURL string) time.Duration {
+	c := &http.Client{Timeout: 4 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(repoURL, "/")+"/info/refs?service=git-upload-pack", nil)
 	if err != nil {
-		return false
+		return 0
 	}
+	started := time.Now()
 	resp, err := c.Do(req)
 	if err != nil {
-		return false
+		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0
+	}
+	return time.Since(started)
 }
 
-// pickBrewGitMirror 选出第一个可用的镜像；(false) 表示都不通。
+// pickBrewGitMirror 在候选里**挑延迟最低**的一个（不是"第一个能通的"）。
+//
+// 为什么要比延迟：能通不代表能用 —— 清华能通（1.86s），但它会把 clone 排进队列
+// （Position 1055），brew 于是卡在 "Downloading and installing Homebrew..." 十几分钟。
+// 比延迟能自然把这类"慢/排队"的镜像排到最后。两个地址（brew 与 core）都要通才算数；
+// 都不通返回 false（调用方不设变量，交给官方源兜底）。
 func (m *Manager) pickBrewGitMirror(ctx context.Context) (brewGitMirror, bool) {
+	var best brewGitMirror
+	var bestCost time.Duration
 	for _, cand := range brewGitMirrorCandidates() {
-		if probeGitMirror(ctx, cand.Brew) && probeGitMirror(ctx, cand.Core) {
-			return cand, true
+		b := probeGitMirror(ctx, cand.Brew)
+		if b == 0 {
+			continue
+		}
+		co := probeGitMirror(ctx, cand.Core)
+		if co == 0 {
+			continue
+		}
+		cost := b + co
+		if cost > 3*time.Second {
+			// 太慢的不用（排队/限速的镜像通常就长这样）
+			continue
+		}
+		if bestCost == 0 || cost < bestCost {
+			best, bestCost = cand, cost
 		}
 	}
-	return brewGitMirror{}, false
+	if bestCost == 0 {
+		return brewGitMirror{}, false
+	}
+	return best, true
 }
 
 func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) error {
@@ -379,7 +424,7 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 	// 仓库镜像**探测后择优**：写死单一镜像一旦 403/下线，整条安装链就断在 brew 这一步
 	// （2026-09-18 生产机事故：USTC 403 → brew 重试 5 次 → "安装 Homebrew 失败"）。
 	if mir, ok := m.pickBrewGitMirror(ctx); ok {
-		result.step(ctx, "Homebrew 仓库镜像："+mir.Brew)
+		result.step(ctx, "Homebrew 仓库镜像（按延迟择优）："+mir.Brew)
 		env = append(env,
 			"HOMEBREW_BREW_GIT_REMOTE="+mir.Brew,
 			"HOMEBREW_CORE_GIT_REMOTE="+mir.Core)

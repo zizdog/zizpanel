@@ -727,20 +727,26 @@ func TestParseCLTLabel(t *testing.T) {
 	}
 }
 
-// TestBrewInstallScriptCandidatesPrefersOfficial 锁住"安装脚本官方优先、镜像兜底"。
+// TestBrewInstallScriptCandidatesMirrorFirst 锁住"安装脚本**镜像优先、官方兜底**"。
 //
-// 中国大陆无代理时 raw.githubusercontent.com 直连不通，只留官方地址等于装不上 Homebrew。
-func TestBrewInstallScriptCandidatesPrefersOfficial(t *testing.T) {
+// 2026-09-18 用户真机反馈后反转的：原测试锁的是"官方优先"（本函数名原为
+// PrefersOfficial），而 raw.githubusercontent.com 在国内会长时间无响应，
+// 用户看到的是"下载 Homebrew 安装脚本"那一步静默卡很久 —— 默认就该走国内镜像。
+func TestBrewInstallScriptCandidatesMirrorFirst(t *testing.T) {
 	got := brewInstallScriptCandidates()
 	if len(got) < 2 {
-		t.Fatalf("应当有官方 + 至少一个镜像，实际 %v", got)
+		t.Fatalf("应当有镜像 + 官方兜底，实际 %v", got)
 	}
-	if got[0] != brewInstallScriptURL {
-		t.Errorf("第一个应为官方地址，实际 %s", got[0])
+	if got[0] != brewInstallScriptMirror {
+		t.Errorf("第一个应为国内镜像 %s，实际 %s", brewInstallScriptMirror, got[0])
 	}
-	for _, u := range got[1:] {
+	if got[len(got)-1] != brewInstallScriptURL {
+		t.Errorf("最后一个应为官方兜底 %s，实际 %s", brewInstallScriptURL, got[len(got)-1])
+	}
+	// 中间那些是"加速前缀 + 官方路径"
+	for _, u := range got[1 : len(got)-1] {
 		if !strings.Contains(u, "raw.githubusercontent.com") {
-			t.Errorf("镜像应当是加速前缀 + 官方路径，实际 %s", u)
+			t.Errorf("加速镜像应当是加速前缀 + 官方路径，实际 %s", u)
 		}
 	}
 }
