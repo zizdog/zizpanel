@@ -95,7 +95,8 @@ func (s *Server) rollbackLANPreauth(w http.ResponseWriter, r *http.Request, ctx 
 	st := withLANWarning(lanPreauthProbeFn(ctx))
 	if before.SystemSet || before.UserSet {
 		st.RebootRequired = true
-		st.RebootNote = "撤销已写入；这次改动要重启后才完全恢复隐私门。"
+		st.RebootNote = "撤销已写入；重启后该网段不再豁免。注意：系统里已经登记或授权过的程序" +
+			"（例如手动点过「允许」的）不会被这次撤销清除，仍可访问该网段。"
 	}
 	s.audit(r, "sysconfig_lan_preauth_rollback", "lan",
 		"已撤销（"+strings.Join(before.CIDRs, ", ")+"）", true, "")

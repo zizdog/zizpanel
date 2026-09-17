@@ -45,14 +45,15 @@ const (
 	lanEthernetKey = "AllowedEthernetLocalNetworkAddresses"
 	lanWiFiKey     = "AllowedWiFiLocalNetworkAddresses"
 
-	// lanSystemPlist 是系统域最可能落盘的 plist 路径，仅用于"改动是否在本次开机
-	// 之后"的 mtime 判断（写入本身不指定路径，见下面的 Apple 官方命令）。
+	// lanSystemPlist 是**机器级**偏好文件 —— 也是这套设置真正生效的地方。
 	//
-	// Apple TN3179 给的原命令是
-	//     sudo defaults write com.apple.network.local-network <key> -array <cidr>
-	// 并明确说"As these defaults affect the entire system, you must set them
-	// using sudo"。面板本身就是 root，所以系统域直接跑裸域名；root 的 defaults
-	// 落点在这两个候选之一，判断 mtime 时两个都看。
+	// ⚠️ 真机教训（2026-09-17 mini，本轮 A/B 实测）：作为 root 执行
+	//     defaults write com.apple.network.local-network <key> -array <cidr>
+	// **写的是 root 自己的用户域**（落盘到 /var/root/Library/Preferences/…），
+	// **不会**碰机器级的 /Library/Preferences/…plist。而 OS 读的是机器级那一份：
+	// 实测"只留下机器级文件、删掉 root 与用户域 + 重启"之后，免授权仍然生效 ——
+	// 也就是说按裸域名写的版本**根本没写对地方**，撤销也撤不干净。
+	// 所以读写都必须用**显式路径**（defaults 接受不带 .plist 后缀的绝对路径）。
 	lanSystemPlist = "/Library/Preferences/com.apple.network.local-network.plist"
 	// lanRootUserPlist 是"root 的裸域名落到自己家目录"时的候选路径。
 	lanRootUserPlist = "/var/root/Library/Preferences/com.apple.network.local-network.plist"
@@ -67,7 +68,8 @@ const (
 // 所以不要写 Markdown 的 ** —— 用户会看到字面星号）。
 const LANPreauthWarning = "这会在这个网段上关掉 macOS「本地网络」隐私门，而且是对所有程序生效" +
 	"（不只是 nginx 或面板）：网段里的任意机器都能被本机上的任意 App 直接访问。" +
-	"改动必须重启后才生效，撤销后也要再重启一次才完全恢复。"
+	"改动必须重启后才生效；撤销同样是重启后才不再豁免，但撤销不会清除系统里" +
+	"已经登记或授权过的程序（例如手动点过「允许」的），它们仍然能访问该网段。"
 
 // LANPreauthState 是「允许免授权访问内网段」的当前真实状态。
 type LANPreauthState struct {
@@ -85,6 +87,9 @@ type LANPreauthState struct {
 	// SystemCIDRs / UserCIDRs：两个域各自读到的 CIDR。
 	SystemCIDRs []string `json:"system_cidrs"`
 	UserCIDRs   []string `json:"user_cidrs"`
+	// LegacyCIDRs：旧版本按裸域名写错位置、落在 **root 用户域**（/var/root）里的残留。
+	// 它不生效，但会让"读到什么"和"实际生效什么"各说各话 —— 撤销会清掉它。
+	LegacyCIDRs []string `json:"legacy_cidrs,omitempty"`
 	// CIDRs：两个域的并集（给界面显示"当前放行哪些网段"）。
 	CIDRs []string `json:"cidrs"`
 	// DetectedCIDR：从主网卡自动推导出来的默认网段（用户没选时用）。
@@ -136,6 +141,9 @@ type lanTarget struct {
 	SudoUser string
 	// PlistPaths 是该域可能落盘的 plist 路径（用于判断"是否本次开机后改过"）。
 	PlistPaths []string
+	// CleanupOnly 表示这个目标**只在撤销/探测时参与**，应用时不写。
+	// 用于清掉旧版本按裸域名写错位置留下的 /var/root 副本。
+	CleanupOnly bool
 }
 
 // lanTargets 返回要同时写入的两个域（顺序固定：系统域在前）。
@@ -148,12 +156,12 @@ type lanTarget struct {
 // "用户域"用 `sudo -n -u <真实用户>` 降权，把同一份设置写进真实用户的域 ——
 // 真机 A/B 的结论是两个域都要写（坑 #115）。
 func lanTargets() []lanTarget {
+	// 机器级：**必须用显式路径**（裸域名在 root 下会落到 /var/root，写不到这里）。
+	plain := strings.TrimSuffix(lanSystemPlist, ".plist")
 	targets := []lanTarget{{
-		Label:  "系统域",
-		Domain: lanPrefDomain,
-		// root 的裸域名要么落系统域，要么落 root 自己的家目录 —— 两个都作为
-		// mtime 候选，避免把"刚改过、还没重启"误判成"已生效"。
-		PlistPaths: []string{lanSystemPlist, lanRootUserPlist},
+		Label:      "系统域",
+		Domain:     plain,
+		PlistPaths: []string{lanSystemPlist},
 	}}
 	user := strings.TrimSpace(panelUserFn())
 	ut := lanTarget{Label: "用户域", Domain: lanPrefDomain}
@@ -167,7 +175,13 @@ func lanTargets() []lanTarget {
 			ut.PlistPaths = []string{filepath.Join(home, "Library", "Preferences", lanPrefDomain+".plist")}
 		}
 	}
-	return append(targets, ut)
+	targets = append(targets, ut)
+	// 历史遗留：旧版本按裸域名写、落到 root 用户域的那一份。它不生效，但留着会让人
+	// （和面板自己）误判状态，所以撤销时一并清掉；应用时**不**再写它。
+	legacy := lanTarget{Label: "root 用户域（历史遗留）", Domain: lanPrefDomain, CleanupOnly: true,
+		PlistPaths: []string{lanRootUserPlist}}
+	targets = append(targets, legacy)
+	return targets
 }
 
 // lanCommand 拼出一次 defaults 调用的完整 argv（程序名 + 参数）。
@@ -494,10 +508,15 @@ func DetectLANPreauth(ctx context.Context) LANPreauthState {
 			}
 		}
 		got = dedupeSorted(got)
-		if t.Label == "系统域" {
+		switch {
+		case t.Label == "系统域":
 			st.SystemCIDRs = got
 			st.SystemSet = len(got) > 0
-		} else {
+		case t.CleanupOnly:
+			if len(got) > 0 {
+				st.LegacyCIDRs = got
+			}
+		default:
 			st.UserCIDRs = got
 			st.UserSet = len(got) > 0
 		}
@@ -514,6 +533,12 @@ func DetectLANPreauth(ctx context.Context) LANPreauthState {
 		st.Note = "只有一个域读到了设置（不完整）—— 建议重新「应用」，或点「撤销」清干净。"
 	default:
 		st.Note = "未设置：这个网段仍然受 macOS「本地网络」隐私门限制。"
+	}
+	if len(st.LegacyCIDRs) > 0 {
+		// 旧版本按裸域名写过 root 用户域：它不影响生效状态，但必须告诉用户"这里有残留"，
+		// 而且撤销会顺手清掉（否则"读到的状态"和"真正生效的状态"会各说各话）。
+		st.Note += "（检测到 root 用户域里有旧版本写入的残留 " + strings.Join(st.LegacyCIDRs, ", ") +
+			"，它不生效；点「撤销」会一并清掉）"
 	}
 	return st
 }
@@ -539,6 +564,9 @@ func ApplyLANPreauth(ctx context.Context, rawCIDRs string, log LogFunc) error {
 	r := &runner{log: log}
 	targets := lanTargets()
 	for _, t := range targets {
+		if t.CleanupOnly {
+			continue // 只写真正生效的两个位置；遗留位置由撤销负责清理
+		}
 		for _, key := range []string{lanEthernetKey, lanWiFiKey} {
 			if err := lanRun(ctx, r, t, "write", key, cidrs); err != nil {
 				return err
@@ -586,12 +614,12 @@ func RollbackLANPreauth(ctx context.Context, log LogFunc) error {
 	if !st.Readable {
 		return fmt.Errorf("复核失败：删完读不回来（%s）", st.ReadError)
 	}
-	if st.SystemSet || st.UserSet {
-		return fmt.Errorf("复核失败：仍有预授权没删掉（系统域=%v、用户域=%v）",
-			st.SystemSet, st.UserSet)
+	if st.SystemSet || st.UserSet || len(st.LegacyCIDRs) > 0 {
+		return fmt.Errorf("复核失败：仍有预授权没删掉（系统域=%v、用户域=%v、遗留=%v）",
+			st.SystemSet, st.UserSet, st.LegacyCIDRs)
 	}
 	if log != nil {
-		log(levelOK, "已删除系统域与用户域的预授权；重启后隐私门完全恢复")
+		log(levelOK, "已删除系统域与用户域的预授权；重启后该网段不再豁免（已单独登记/授权过的程序不受影响）")
 	}
 	return nil
 }

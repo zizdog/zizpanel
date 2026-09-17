@@ -129,8 +129,8 @@ export function SystemSettingsView(content, ctx = {}) {
         h('p.hint', [
           '代价：这个网段在本机上对',
           h('strong', { text: '所有程序' }),
-          '都不再受这道隐私门限制（不是只对 nginx 或面板）。改动必须重启后才生效，' +
-            '撤销后也要再重启一次才完全恢复。',
+          '都不再受这道隐私门限制（不是只对 nginx 或面板）。改动必须重启后才生效；' +
+            '撤销同样是重启后才不再豁免，但不会清除系统里已登记或授权过的程序（例如手动点过「允许」的）。',
         ]),
         lanStatus,
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '12px 0 6px' } }, [
@@ -468,7 +468,8 @@ export function SystemSettingsView(content, ctx = {}) {
       enable
         ? '会写入 Apple 官方预授权键（系统域 + 真实用户域），让该网段对所有程序都不再受' +
           '「本地网络」隐私门限制，而且必须重启后才生效。确定写入？'
-        : '会删除两个域的预授权键；撤销后要重启一次才能完全恢复隐私门。确定撤销？',
+        : '会删除两个域的预授权键；重启后该网段不再豁免。注意：已登记/授权过的程序（例如手动点过' +
+          '「允许」的）不会被清除。确定撤销？',
       {
         title: enable ? '允许免授权访问内网段' : '撤销内网段预授权',
         danger: true,

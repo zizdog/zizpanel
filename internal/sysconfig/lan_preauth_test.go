@@ -320,14 +320,20 @@ func TestLANCommandUserDomainUsesRealUserViaSudo(t *testing.T) {
 func TestLANTargetsUserDomainCarriesSudoUserOnlyWhenRoot(t *testing.T) {
 	setupLANTest(t, true, "zizdog")
 	targets := lanTargets()
-	if len(targets) != 2 {
-		t.Fatalf("应有两个目标域，实际 %d", len(targets))
+	if len(targets) != 3 {
+		t.Fatalf("应有三个目标（机器级 / 用户域 / 遗留清理），实际 %d", len(targets))
 	}
 	if targets[0].SudoUser != "" {
 		t.Errorf("系统域不该走 sudo，实际 %q", targets[0].SudoUser)
 	}
-	if targets[0].Domain != lanPrefDomain {
-		t.Errorf("系统域应使用 Apple 官方裸域名，实际 %q", targets[0].Domain)
+	// ⚠️ 真机教训（2026-09-17）：root 执行**裸域名** defaults 会落到 /var/root
+	// （root 的用户域），写不到机器级的 /Library/Preferences —— 而生效的是后者。
+	// 所以这里必须断言用的是**显式路径**。
+	if want := strings.TrimSuffix(lanSystemPlist, ".plist"); targets[0].Domain != want {
+		t.Errorf("系统域必须用显式路径 %q（裸域名在 root 下写不到机器级域），实际 %q", want, targets[0].Domain)
+	}
+	if targets[2].CleanupOnly != true {
+		t.Errorf("第三个目标应是 CleanupOnly 的历史遗留清理目标，实际 %+v", targets[2])
 	}
 	if targets[1].SudoUser != "zizdog" {
 		t.Errorf("root 运行时用户域必须以 zizdog 降权，实际 %q", targets[1].SudoUser)
@@ -336,9 +342,13 @@ func TestLANTargetsUserDomainCarriesSudoUserOnlyWhenRoot(t *testing.T) {
 		!strings.Contains(targets[1].PlistPaths[0], "/Users/zizdog/Library/Preferences/") {
 		t.Errorf("用户域 plist 路径不对：%v", targets[1].PlistPaths)
 	}
-	// 系统域的 mtime 候选要同时覆盖 /Library 与 root 家目录两个可能落点。
-	if len(targets[0].PlistPaths) < 2 {
-		t.Errorf("系统域应有两个 plist 候选（/Library 与 /var/root），实际 %v", targets[0].PlistPaths)
+	// 机器级目标只有一个落点（显式路径）；root 家目录那一份已拆成独立的遗留清理目标，
+	// 不再混进"系统域"的 mtime 候选 —— 混在一起正是旧版本误判状态的来源。
+	if len(targets[0].PlistPaths) != 1 || targets[0].PlistPaths[0] != lanSystemPlist {
+		t.Errorf("系统域的 plist 候选应只有 %s，实际 %v", lanSystemPlist, targets[0].PlistPaths)
+	}
+	if len(targets[2].PlistPaths) != 1 || targets[2].PlistPaths[0] != lanRootUserPlist {
+		t.Errorf("遗留目标的 plist 应是 %s，实际 %v", lanRootUserPlist, targets[2].PlistPaths)
 	}
 }
 
@@ -434,10 +444,10 @@ func TestApplyLANPreauthWritesBothKeysBothDomainsAndVerifies(t *testing.T) {
 	if err := ApplyLANPreauth(context.Background(), "192.168.1.0/24", log); err != nil {
 		t.Fatalf("应用应成功：%v", err)
 	}
-	// 两个域 × 两个键都要写。
+	// 真正生效的两个位置 × 两个键都要写：机器级用显式路径，用户域用裸域名。
 	for _, tgt := range []struct{ user, domain string }{
-		{"root", lanPrefDomain},   // 系统域：面板以 root 执行
-		{"zizdog", lanPrefDomain}, // 用户域：sudo -u zizdog
+		{"root", strings.TrimSuffix(lanSystemPlist, ".plist")}, // 机器级：面板以 root 执行
+		{"zizdog", lanPrefDomain},                              // 用户域：sudo -u zizdog
 	} {
 		for _, key := range []string{lanEthernetKey, lanWiFiKey} {
 			if !fake.has(tgt.user, tgt.domain, key) {
@@ -448,6 +458,12 @@ func TestApplyLANPreauthWritesBothKeysBothDomainsAndVerifies(t *testing.T) {
 	// 用户域的写入必须以真实用户身份执行。
 	if !hasSudoUserCall(fake.calls, "zizdog") {
 		t.Fatalf("用户域写入没有以 zizdog 身份执行：%v", fake.calls)
+	}
+	// 遗留目标（root 用户域）**不该**再被写 —— 它不生效，写它只会让状态更难判断。
+	for _, key := range []string{lanEthernetKey, lanWiFiKey} {
+		if fake.has("root", lanPrefDomain, key) {
+			t.Errorf("不该再写 root 用户域（历史遗留位置）：key=%s", key)
+		}
 	}
 	// 复核：重新探测应显示已启用。
 	st := DetectLANPreauth(context.Background())
@@ -461,7 +477,7 @@ func TestApplyLANPreauthWritesBothKeysBothDomainsAndVerifies(t *testing.T) {
 
 func TestApplyLANPreauthFailsOnWriteError(t *testing.T) {
 	fake := setupLANTest(t, true, "zizdog")
-	fake.failWrites[fdKey("root", lanPrefDomain, lanEthernetKey)] = errors.New("write permission denied")
+	fake.failWrites[fdKey("root", strings.TrimSuffix(lanSystemPlist, ".plist"), lanEthernetKey)] = errors.New("write permission denied")
 	err := ApplyLANPreauth(context.Background(), "192.168.1.0/24", nil)
 	if err == nil {
 		t.Fatal("写入失败必须返回真实错误，绝不能报成功")
