@@ -44,7 +44,13 @@ import (
 //
 // 注意：它**不是**在线升级的源。在线升级读的是 Cfg.UpgradeSource，
 // 默认留空（不启用网络升级）。原注释写"面板升级也用它"是错的，已纠正。
-const cltMirrorBaseDefault = "https://zizdog.com/zizpanel"
+// 2026-09-17 用户定的分工：**大件一律走快镜像**。zizdog.com（腾讯云北京 VPS）
+// 只当"安装脚本 + 面板本体/在线升级"的源（数据量小）；CLT 整包 632MB，
+// 实测 zizdog.com 只有 298–654 KB/s 且整条链路限速（见下方注释里的复测），
+// 所以默认基址改成自建 NAS 镜像（5.6–8.9 MB/s）。NAS 对 /zizpanel/ 有**按需回源**
+// （nginx @pull → zizdog.com），首次取完即缓存，之后走本地。
+// 注意：它**不是**在线升级的源（升级源是 Cfg.UpgradeSource）。
+const cltMirrorBaseDefault = "https://mirror.zizdog.com:8888/zizpanel"
 
 // cltInstallPkgs 是真正需要安装的组件：CLTools_Executables.pkg（576 MB，真正的
 // 工具链，`/usr/bin/python3`、`clang`、`git` 都在里面）与 CLTools_macOSNMOS_SDK.pkg

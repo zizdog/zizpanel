@@ -60,10 +60,16 @@ type State struct {
 	//   → 用户后来准备了新版本 → 点"立即升级"时读到的是**上一次**的 success
 	//   → 状态被改写成 success，于是拒绝执行，提示"还没有已准备好的升级包"。
 	// 把结论与具体的 RunID 绑定，才能确认"这条结论是这一次的"。
-	RunID      string    `json:"run_id,omitempty"`
-	From       string    `json:"from,omitempty"`
-	To         string    `json:"to,omitempty"`
-	Source     string    `json:"source,omitempty"` // remote / upload
+	RunID  string `json:"run_id,omitempty"`
+	From   string `json:"from,omitempty"`
+	To     string `json:"to,omitempty"`
+	Source string `json:"source,omitempty"` // remote / upload
+	// SourceBase 记录最近一次探测**实际命中**的升级源地址。
+	//
+	// 为什么必须落盘：候选顺序是动态的（同网段会先走 NAS，见 source.go），
+	// 用户/前端/CLI 需要知道这次到底用了哪个源，否则排障时只能猜；
+	// 而检查更新会跨面板重启，内存里存不住。空串 = 还没成功探测过。
+	SourceBase string    `json:"source_base,omitempty"`
 	Stage      string    `json:"stage,omitempty"`
 	Message    string    `json:"message,omitempty"`
 	Error      string    `json:"error,omitempty"`

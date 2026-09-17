@@ -7,7 +7,10 @@
 package version
 
 // Version 是当前面板版本。语义化版本：主版本.次版本.修订号
-var Version = "0.14.4"
+//
+// 1.0.0：第一个正式版。递增规则不变（见 tools/bump-version.py）：
+// 修订号 +1 到 10 后进位并归零，即 1.0.0 → … → 1.0.10 → 1.1.0。
+var Version = "1.0.0"
 
 // Commit 与 BuildTime 由构建脚本通过 -ldflags 注入，源码运行时为空。
 var (

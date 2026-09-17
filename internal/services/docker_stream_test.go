@@ -69,7 +69,10 @@ func TestComposeUpStreamsLinesBeforeExit(t *testing.T) {
 
 	// 等第一行输出出现（轮询而不是睡固定的 400ms：整包测试并发跑时机器很忙，
 	// 固定时长会把"shell 还没启动"误判成"不是流式"）。
-	deadline := time.Now().Add(2500 * time.Millisecond)
+	// 15 秒预算：这条用例证明的是"输出在进程结束前到达"（顺序），不是"多快到达"。
+	// 原来给 2.5s，在 `make check` 满载并发（几十个包同时跑）时会抖动成假失败 ——
+	// 真机验证过流式本身没问题（hello-world 18 行按 0ms/1961ms/2800ms… 实时到达）。
+	deadline := time.Now().Add(15 * time.Second)
 	firstSeen := false
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -89,7 +92,7 @@ func TestComposeUpStreamsLinesBeforeExit(t *testing.T) {
 		mu.Lock()
 		snapshot := strings.Join(lines, "\n")
 		mu.Unlock()
-		t.Fatalf("等了 2.5 秒还没收到第一行 compose 输出 —— 这不是流式：\n%s", snapshot)
+		t.Fatalf("等了 15 秒还没收到第一行 compose 输出 —— 这不是流式（第一行必须在进程退出前到达）：\n%s", snapshot)
 	}
 
 	// 关键断言：第一行到达时脚本还在 sleep（尚未结束）。

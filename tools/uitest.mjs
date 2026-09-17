@@ -246,17 +246,23 @@ try {
     await shot('07-upgrade-card');
   });
 
-  await step('未配置升级源时给出明确提示', async () => {
+  await step('升级源留空时自动走候选源（不再报“尚未配置升级源地址”）', async () => {
+    // 2026-09-17 起语义变了：升级源为空时**不再 400**，而是按候选链逐个试
+    // （用户显式源 → 同网段 NAS → https://zizdog.com/zizpanel → mirror → GitHub），
+    // 每个候选内部都要通过验签才算命中。所以这里断言的是"给出了结论"，
+    // 而不是某个具体状态码 —— 有更新/已是最新/全部候选不可达都是正常结果。
     await page.fill('input[placeholder^="https://example.com"]', '');
-    // 这一步**故意**触发 400（未配置升级源），这类 4xx 是断言对象而非故障，
-    // 用现成的 expectHTTPError 开关把它从"控制台错误"里排除。
     expectHTTPError = true;
     try {
       await page.click('button:has-text("检查更新")');
-      await page.waitForSelector('.toast', { timeout: 10000 });
-      await page.waitForTimeout(400);
-      const t = await page.locator('.toast').first().innerText();
-      if (!t.includes('升级源')) throw new Error('提示不明确: ' + t);
+      await page.waitForTimeout(2000);
+      const body = await page.locator('.content').innerText();
+      if (body.includes('尚未配置升级源地址')) {
+        throw new Error('仍在报「尚未配置升级源地址」——候选源没有生效');
+      }
+      if (!/候选|升级源|已是最新|新版本|失败/.test(body)) {
+        throw new Error('检查更新没有给出任何结论：' + body.slice(0, 200));
+      }
     } finally {
       expectHTTPError = false;
     }

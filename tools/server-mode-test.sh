@@ -169,6 +169,28 @@ else
   pass "SSH 已开启时跳过，不重复操作"
 fi
 
+# ---------------------------------------------------------------- --ssh-only --
+# install.sh 的"本机安装是否开 SSH"用的就是 --ssh-only：用户只答应了开 SSH，
+# **没有**答应关睡眠/禁自动更新，所以那几步必须一个都不碰。
+step "--ssh-only 只动 SSH，不碰电源/更新/Spotlight"
+: > "$STATE"
+run_mode --ssh-only
+if grep -q "enable system/com.openssh.sshd" "$LOG" && grep -q "ssh.plist" "$LOG"; then
+  pass "--ssh-only 仍然真正开启了 SSH（enable + bootstrap）"
+else
+  fail "--ssh-only 没有开启 SSH"
+fi
+if grep -qE "pmset" "$LOG"; then
+  fail "--ssh-only 却改了电源设置（用户没有答应这件事）"
+else
+  pass "--ssh-only 完全不碰 pmset"
+fi
+if grep -qE "com.apple.SoftwareUpdate|mdutil|com.apple.CrashReporter" "$LOG"; then
+  fail "--ssh-only 却改了系统更新/Spotlight/崩溃报告设置"
+else
+  pass "--ssh-only 完全不碰系统更新、Spotlight、崩溃报告设置"
+fi
+
 # ----------------------------------------------------------------- --no-ssh --
 step "--no-ssh 时必须完全不碰 SSH"
 : > "$STATE"

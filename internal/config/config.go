@@ -92,7 +92,12 @@ type Config struct {
 
 	// ---------- 在线升级 ----------
 	// UpgradeSource 是升级源地址（放 manifest.json / manifest.json.sig 的目录）。
-	// 留空表示不启用网络升级，此时只能用手动上传升级包那条离线路径。
+	//
+	// 语义（2026-09 改造后）：这里存的是**用户显式选择的源**。
+	// 留空不再等于"不能升级"，而是"按 internal/upgrade 的候选顺序自动选源"
+	// （同网段 NAS → 公网主源 → 备用镜像 → GitHub 兜底，见 CandidateSources）。
+	// 只有用户在设置页/接口显式填过地址，才会被写进这里；
+	// "检查更新"不会再把它自动写成一个候选，否则每台机器都会被钉死在一个源上。
 	UpgradeSource string `json:"upgrade_source"`
 	// UpgradeNotes 缓存最近一次检查更新拿到的发布说明，供界面展示。
 	UpgradeNotes string `json:"upgrade_notes"`
@@ -191,6 +196,16 @@ func root() string {
 // 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 
+// DefaultUpgradeSource 是在线升级的**公网主源**（用户要求"以后探测以公网 zizdog.com 为主"）。
+//
+// 它与 internal/upgrade.CandidateSources 里的默认候选是同一个值
+// （那里直接引用本常量，保证不会漂移）。注意语义：
+//   - 它只是默认配置值，不代表"用户显式选了它"；
+//   - 候选顺序里同网段的 NAS 会排在它前面（局域网快约 100 倍）；
+//   - UpgradeSource 被显式清空后，候选列表会照常包含它 —— 清空配置
+//     不等于禁用网络升级，只等于"让面板自己按优先级选"。
+const DefaultUpgradeSource = "https://zizdog.com/zizpanel"
+
 func DefaultConfigPath() string {
 	return filepath.Join(root(), "data", "config.json")
 }
@@ -258,9 +273,17 @@ func Default() *Config {
 		// 留空 = 关闭镜像（应急用）。
 		MirrorBase:         DefaultMirrorBase,
 		MirrorProbeSeconds: 4,
-		SessionHours:       72,
-		LoginMaxFail:       5,
-		LoginLockMins:      15,
+		// 在线升级：默认指向公网主源 zizdog.com。
+		//
+		// 只在这里（新建配置的默认值）设，**不放进 fill()**：
+		// fill() 是"老配置补默认"用的，若在那里补，用户显式清空的值会被
+		// 重新填回来 —— 那样"清空升级源"就永远做不到，设置页也永远清不掉
+		// （这个坑真机上出现过）。所以：配置文件里显式写了什么就是什么，
+		// 只有整个字段缺失的老配置才会继承这个默认值。
+		UpgradeSource: DefaultUpgradeSource,
+		SessionHours:  72,
+		LoginMaxFail:  5,
+		LoginLockMins: 15,
 		// 终端默认关闭；文件管理器默认只开放网站目录与面板目录
 		TerminalEnabled:     false,
 		TerminalIdleMins:    30,

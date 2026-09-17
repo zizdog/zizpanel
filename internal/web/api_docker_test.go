@@ -19,6 +19,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
 	"github.com/zizdog/zizpanel/internal/tasks"
+	"github.com/zizdog/zizpanel/internal/upgrade"
 	"github.com/zizdog/zizpanel/internal/version"
 )
 
@@ -817,13 +818,24 @@ func TestSettingsCanClearUpgradeSource(t *testing.T) {
 		t.Fatalf("升级源应被清空，实际 %q", got)
 	}
 
-	// 3) 清空后"检查更新"必须明确报"未配置"，而不是回退到某个幽灵地址
+	// 3) 清空后"检查更新"不应再报 400「尚未配置升级源地址」。
+	//
+	// 空源现在的语义是"按候选顺序自动选源"（同网段 NAS → 公网主源 →
+	// 备用镜像 → GitHub 兜底，见 internal/upgrade/source.go），
+	// 所以"没配源"不再是错误。测试环境没有内嵌发布公钥，
+	// 请求会在联网之前 fail closed 返回 409 —— 关键是不能再是 400。
 	res, out, _ = doJSON(t, ts, "POST", "/api/v1/system/upgrade/check", map[string]any{}, cookies)
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("未配置升级源时检查更新应 400，实际 %d: %v", res.StatusCode, out)
+	if res.StatusCode == http.StatusBadRequest {
+		t.Fatalf("清空升级源后检查更新不应再报 400，实际 %d: %v", res.StatusCode, out)
 	}
-	if msg := asString(out["msg"]); !strings.Contains(msg, "升级源") {
-		t.Errorf("提示应包含'升级源'，实际: %s", msg)
+	if upgrade.HasPublicKey() {
+		t.Fatalf("测试环境不应配置发布公钥：否则这条检查会真的去联网")
+	}
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("没有公钥时应 fail closed 返回 409，实际 %d: %v", res.StatusCode, out)
+	}
+	if msg := asString(out["msg"]); !strings.Contains(msg, "公钥") {
+		t.Errorf("提示应说明缺少发布公钥，实际: %s", msg)
 	}
 
 	// 4) 非法地址必须被拒（避免把设置页卡在一个打不开的地址上）

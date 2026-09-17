@@ -9,19 +9,30 @@ macOS 上的网站与服务管理面板（类宝塔），原生支持 Apple Sili
 在目标 Mac 的「终端」里粘贴这一行（会要求输入一次开机密码）：
 
 ```bash
-curl -fsSL http://192.168.1.8:8090/zizpanel/install.sh | sudo bash -s -- --download-base http://192.168.1.8:8090/zizpanel
+curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 ```
 
-上面这条走内网 NAS 镜像；公网可用内置镜像 `https://zizdog.com/zizpanel`（内容与 NAS 一致）。
-给另一台机器装、手上没有 NAS 时，在开发机上跑 `make serve-install`：它会构建发布包并打印
-目标机要执行的 `curl … | sudo bash` 命令。仓库只在本地，不推远程仓库、不发 GitHub。
+安装过程会依次问你：**管理员用户名**、**登录口令**（不回显）、**面板路径后缀**、**监听端口**；
+如果是在这台机器上直接安装，还会问**是否开启 SSH**（远程连过来安装时不会问）。
+最后会问是否开启「免授权访问内网段」（可选，默认不开）。
+
+全自动安装（CI 或无人值守）：加 `ZP_YES=1` 和 `ZP_PASS=...`，或者
+`ZP_USER` / `ZP_SUFFIX` / `ZP_PORT` 一起给，脚本一个问题都不问。
+**没有终端又不给 `ZP_PASS` 时，脚本会自动生成一个随机初始口令并打印一次**（请立即保存），
+绝不会因为"没人回答"而卡住或装不上。
+
+给另一台机器装、手上有 NAS 时可以用内网镜像（更快，内容与公网一致）：
+`make serve-install` 会构建发布包并打印目标机要执行的 `curl … | sudo bash` 命令。
+仓库只在本地，不推远程仓库、不发 GitHub。
 
 ### 安装时用户需要手动做什么
 
 | 时机 | 你会看到 | 怎么做 |
 |---|---|---|
 | macOS 从没装过「命令行开发者工具」（CLT） | 弹出「安装命令行开发者工具」对话框 | 点「安装」→ 同意许可。面板自己也会先试静默装（走镜像），弹窗只是兜底 |
-| 第一次打开面板 | 「首次初始化」页 | 设置管理员账号（用户名 + 密码），以后用它登录 |
+| 安装脚本问你用户名 / 口令 / 后缀 / 端口 | 终端里的提问（口令不回显） | 直接回车 = 用方括号里的默认值；想全程不回答见上面的 `ZP_YES=1` |
+| 安装脚本问你「是否开启 SSH」 | 只有**本机直接安装**时才问 | 想从别的电脑连上来运维就选是；选否以后也能在面板「系统设置 → 远程登录」开 |
+| 安装完问「允许免授权访问内网段」 | 只在你选是时才写，且**需要重启才生效** | 不急着重启：面板的 Plan B（回环转发器）已经能让局域网反代正常工作 |
 | 浏览器提示证书不受信任 | 「您的连接不是私密连接」 | 点「继续前往」即可；想彻底消除见「五、证书」 |
 
 Homebrew、Python、ffmpeg 都不用手动装：面板会自己在任务里按 CLT → Homebrew → 基础依赖的顺序装，
@@ -31,12 +42,20 @@ Homebrew、Python、ffmpeg 都不用手动装：面板会自己在任务里按 C
 
 | 参数 / 变量 | 说明 |
 |---|---|
+| `ZP_USER` / `ZP_PASS` | 管理员用户名 / 登录口令（不设则在有终端时询问） |
+| `ZP_SUFFIX` / `ZP_PORT` | 面板路径后缀 / 监听端口 |
+| `ZP_YES=1` | 所有提问都用默认答案（默认答案保证能装成功） |
+| `ZP_SSH=1` / `ZP_SSH=0` | 明确开/不开 SSH（不设时：本机安装才问） |
+| `ZP_LAN_PREAUTH=1` / `ZP_LAN_CIDR` | 安装完开启「免授权访问内网段」及其网段 |
+| `--dry-run` / `ZIZPANEL_DRY_RUN=1` | 只演练整条流程，不做任何修改 |
 | `--server-mode` | 装完顺带把机器配成长期在线的服务器（关睡眠、阻断自动更新重启、开 SSH） |
 | `--with-lnmp` | 装完顺带装 nginx + PHP + MySQL（国内网络下要十几到几十分钟） |
-| `--download-base <地址>` | 指定二进制下载源 |
+| `--download-base <地址>` | 指定二进制下载源（默认公网 `https://zizdog.com/zizpanel`，探测不通才回落） |
 | `--listen <地址>` | 监听地址，默认 `:8443` |
 | `ZIZPANEL_ROOT` | 安装根目录，默认 `/opt/zizpanel`（可装到外置盘） |
 | `ZIZPANEL_SERVER_MODE=1` | 等价于 `--server-mode` |
+
+> `ZP_*` 与 `ZIZPANEL_*` 两组变量等价（例如 `ZP_SUFFIX` = `ZIZPANEL_PANEL_SUFFIX`）。
 
 离线安装：发布包在 NAS 的 `http://192.168.1.8:8090/zizpanel/download/latest/`，
 解开后 `cd` 进去执行 `sudo bash install.sh`。
@@ -91,8 +110,9 @@ Uptime Kuma、n8n、Gitea、MinIO 等）、**一键建站**（Typecho、WordPres
 
 「面板设置 → 关于与运维 → 在线升级」：
 
-1. 升级源填 `http://192.168.1.8:8090/zizpanel`（放着 `manifest.json` 与
-   `manifest.json.sig` 的目录）
+1. 升级源默认已填好公网 `https://zizdog.com/zizpanel`（放着 `manifest.json` 与
+   `manifest.json.sig` 的目录）。面板会按「你填的源 → 同网段 NAS → zizdog.com →
+   镜像 → GitHub」的顺序探测，装面板时脚本已把可用源写进配置。
 2. 「检查更新」→「下载并准备升级」→「立即升级」
 
 面板会验签、试运行自检、原子替换；新版本起不来会自动回滚到升级前的版本。
@@ -159,9 +179,11 @@ sudo launchctl kickstart -k system/cn.zizpanel.panel
 
 发布件与应用包都走自建镜像，仓库不发布到 GitHub、不推任何远程仓库：
 
-- 面板发布件（`install.sh`、升级清单、发布包）：NAS `http://192.168.1.8:8090/zizpanel`
+- 面板发布件（`install.sh`、升级清单、发布包）：**公网 `https://zizdog.com/zizpanel`**
+  （任何网络都能用）；同一份内容也在 NAS `http://192.168.1.8:8090/zizpanel`，只作局域网加速/回落
 - 面板设置里的「应用包镜像基址」默认 `https://mirror.zizdog.com:8888`（NAS 的公网入口，
   内容与局域网地址一致）
 
-镜像优先，且按具体资源判断——镜像上没有的包会回落，不会卡住。装 Homebrew 会注入国内镜像，
+**镜像优先，且按具体资源判断**：每一项都先探镜像、探不通才回落官方源，不会卡住。
+装 Homebrew 会注入国内镜像（安装脚本本身也走中科大镜像），
 Python 依赖走国内 PyPI，AI 模型走 `hf-mirror.com`。

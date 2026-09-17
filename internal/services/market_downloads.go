@@ -374,12 +374,16 @@ var marketDownloadApps = []MarketApp{
 				Label:   "EnsureCLT：镜像整包 / softwareupdate / 弹窗 三条路",
 				Upstream: MarketUpstream{
 					ID:  "Command Line Tools 16.2（clt/index.json 清单）",
-					URL: "https://zizdog.com/zizpanel/clt/index.json",
+					URL: "https://mirror.zizdog.com:8888/zizpanel/clt/index.json",
 					// 这一条声明的 Size **故意留 0**：URL 指向的是 index.json（清单本身只有
 					// 1374 B），661,802,053 是它声明的**载荷总字节**（两个 pkg 之和）。
 					// 把载荷体积挂在清单 URL 上，审计会报"体积变了"的假警报 ——
 					// 体积写进 Note，别挂在错误的 URL 上。
 					Note: "镜像整包走 <base>/clt/index.json（先 <base>/clt，再 <base>/zizpanel/clt，都不通回落静态常量 zizdog.com）；" +
+						// 2026-09-17 用户定的分工：zizdog.com 只当**安装脚本与面板本体/在线升级**的源（数据量小）；
+						// 市场里的软件、CLT（632MB）这类大件一律走**快镜像**（mirror.zizdog.com:8888 = NAS，
+						// 实测 5.6–8.9MB/s；NAS 对 /zizpanel/ 有按需回源，首次取完即缓存）。
+						// 实测：<mirror>/zizpanel/clt/index.json = 200（<mirror>/clt/index.json 是 404）。" +
 						"清单 bytes=661,802,053（含 CLTools_Executables.pkg 604,642,024 + CLTools_macOSNMOS_SDK.pkg）；" +
 						"镜像路失败还有 softwareupdate -l(3 min) / softwareupdate -i(40 min) / xcode-select --install 弹窗(1 min + 轮询 30 min) 两条退路",
 				},

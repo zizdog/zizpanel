@@ -36,10 +36,39 @@ import (
 
 const (
 	maxUploadBytes = 256 << 20 // 上传包上限 256 MB
-	// 升级线程与状态判断之间的互斥。用文件状态 + 进程内锁双保险：
-	// 进程内锁防并发点击，文件状态防"重启后重复升级"。
+
+	// 单个候选源的超时预算（候选列表见 upgrade.CandidateSources）：
+	//   check 外层 30s → 单候选 6s。清单只有 ~32KB，即使按 0.3MB/s 也在 1s 内；
+	//     6s 足够区分"慢"与"不通"，公网候选最坏 4 个 × 6s 正好用满外层预算。
+	//   stage 外层 15min → 单候选保持 20s（与 upgrade 包的 manifestTimeout 一致）。
+	//     stage 的时间主要花在下载几十 MB 的升级包上（downloadTimeout=10min），
+	//     找清单这一步不该、也不需要为它省时间。
+	upgradeCheckPerSourceTimeout = 6 * time.Second
+	upgradeStagePerSourceTimeout = 20 * time.Second
 )
 
+// upgradeManifestFetcher 是"下载清单原文 + 签名"的实现。
+//
+// 生产路径为 nil：upgrade.FetchManifestAny 会回落到真实 HTTP 实现。
+// web 包的单测把它换成假实现以避免联网（单测不许碰真实网络），
+// 而验签/解析仍由 upgrade 包在 FetchManifestAny 里统一完成 ——
+// 注入的只是下载动作，注入不了"跳过验签"。
+var upgradeManifestFetcher upgrade.ManifestFetcher
+
+// resolveUpgradeSources 由"显式传入的源 / 配置里的源"得到候选列表。
+//
+// 显式传入优先；都没传时用配置值（可能是用户清空后的空串，那是合法的，
+// 表示"按默认候选顺序自动选源"，不再是错误）。
+func (s *Server) resolveUpgradeSources(requested string) []string {
+	configured := strings.TrimSpace(requested)
+	if configured == "" {
+		configured = s.Cfg.UpgradeSource
+	}
+	return upgrade.CandidateSources(configured)
+}
+
+// upgradeMu 是升级线程与状态判断之间的互斥。用文件状态 + 进程内锁双保险：
+// 进程内锁防并发点击，文件状态防"重启后重复升级"。
 var upgradeMu sync.Mutex
 
 // upgradeOptions 由当前配置推导出升级所需的环境。
@@ -92,6 +121,13 @@ func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 	st := upgrade.LoadState(s.Cfg.WorkDir)
 	staged, stagedVersion := s.stagedInfo()
 
+	// plain_http 用"最近实际用过的源"判断，没有过成功记录时退回配置值。
+	// 局域网 NAS 是 http 私有地址，不该被当成"明文公网"来吓唬用户。
+	plainHTTP := upgrade.IsPlainHTTPToPublicHost(s.Cfg.UpgradeSource)
+	if strings.TrimSpace(s.Cfg.UpgradeSource) == "" {
+		plainHTTP = upgrade.IsPlainHTTPToPublicHost(st.SourceBase)
+	}
+
 	ok(w, map[string]any{
 		"current_version": version.Version,
 		"current_full":    version.Full(),
@@ -102,14 +138,21 @@ func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 		"state":           st,
 		"staged":          staged,
 		"staged_version":  stagedVersion,
-		"source":          s.Cfg.UpgradeSource,
+		// source 是**配置里保存的源**（空串 = 用户没显式配过，按候选自动选）。
+		// 设置页的输入框读的就是它，所以语义必须保持"用户填过的值"。
+		"source": s.Cfg.UpgradeSource,
+		// effective_source 是**最近一次探测实际命中的源**（见 State.SourceBase）：
+		// 候选顺序是动态的（同网段先走 NAS），前端/CLI 靠它才能知道真实用了哪个。
+		"effective_source": st.SourceBase,
+		// candidates 是当前机器上的候选顺序（含是否插入 NAS），供排障展示。
+		"candidates": upgrade.CandidateSources(s.Cfg.UpgradeSource),
 		// 能不能从网络升级
 		"can_remote": upgrade.HasPublicKey(),
 		"pubkey":     upgrade.PublicKeyFingerprint(),
 		// 能不能升级（只有 root 才行）
 		"can_apply":  os.Geteuid() == 0,
 		"is_root":    os.Geteuid() == 0,
-		"plain_http": upgrade.IsPlainHTTPToPublicHost(s.Cfg.UpgradeSource),
+		"plain_http": plainHTTP,
 		"notes":      s.Cfg.UpgradeNotes,
 	})
 }
@@ -140,6 +183,14 @@ type upgradeCheckReq struct {
 }
 
 // handleUpgradeCheck 拉取远端清单、验签、比较版本。
+//
+// 源的选择分两种情形（都不再报 400「尚未配置升级源地址」）：
+//   - 调用方**显式传了** source：用它，并且写回配置（用户的选择要记住）；
+//   - 没传：用配置里保存的源（可能是空串 = 没配过），交给
+//     upgrade.CandidateSources 按优先级依次试。
+//
+// 关键：没有显式传源时**绝不写回配置**。若把候选/默认源存进去，每台机器
+// 就被钉死在一个源上，同网段的 NAS 快通道再也排不到前面（见 upgrade/source.go）。
 func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 	var req upgradeCheckReq
 	if r.ContentLength > 0 {
@@ -149,29 +200,24 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	source := strings.TrimSpace(req.Source)
-	if source == "" {
-		source = s.Cfg.UpgradeSource
-	}
-	if source == "" {
-		fail(w, http.StatusBadRequest, "尚未配置升级源地址。请填写发布目录地址，或改用手动上传升级包。")
-		return
-	}
-	// 存下来，下次不用再填
-	if source != s.Cfg.UpgradeSource {
-		s.Cfg.UpgradeSource = source
+	requested := strings.TrimSpace(req.Source)
+	if requested != "" && requested != s.Cfg.UpgradeSource {
+		// 只有用户显式给的地址才写回配置
+		s.Cfg.UpgradeSource = requested
 		if err := s.Cfg.Save(); err != nil {
 			s.Log.Warn("保存升级源失败: %v", err)
 		}
 	}
+	sources := s.resolveUpgradeSources(requested)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	// fail closed：没有公钥就不发请求，也不给任何"跳过验证"的开关
-	m, _, err := upgrade.FetchManifest(ctx, source)
+	// fail closed + 多候选认证：每个候选都必须通过验签才会被采用
+	m, usedBase, err := upgrade.FetchManifestAny(ctx, sources, upgradeCheckPerSourceTimeout, upgradeManifestFetcher)
 	if err != nil {
-		s.audit(r, "upgrade_check", source, "失败: "+err.Error(), false, "")
+		s.Log.Warn("升级检查失败（候选顺序：%v）：%v", sources, err)
+		s.audit(r, "upgrade_check", strings.Join(sources, " "), "失败: "+err.Error(), false, "")
 		if errors.Is(err, upgrade.ErrNoPublicKey) {
 			fail(w, http.StatusConflict,
 				"面板没有内嵌发布公钥，无法验证升级包签名，因此拒绝从网络升级。"+
@@ -181,6 +227,7 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, "检查更新失败："+err.Error())
 		return
 	}
+	s.Log.Info("升级检查命中源 %s（候选顺序：%v）", usedBase, sources)
 
 	newer, err := upgrade.IsNewer(m.Version, version.Version)
 	if err != nil {
@@ -192,8 +239,14 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 	s.Cfg.UpgradeNotes = m.Notes
 	_ = s.Cfg.Save()
 
-	s.audit(r, "upgrade_check", "v"+m.Version,
-		fmt.Sprintf("当前 v%s，远端 v%s", version.Version, m.Version), true, "")
+	// 记录"这次实际命中了哪个源"。候选是动态排序的，不落盘的话
+	// 刷新一次页面就再也说不清刚才到底走的 NAS 还是公网。
+	st := upgrade.LoadState(s.Cfg.WorkDir)
+	st.SourceBase = usedBase
+	_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+
+	s.audit(r, "upgrade_check", usedBase,
+		fmt.Sprintf("命中 %s；当前 v%s，远端 v%s", usedBase, version.Version, m.Version), true, "")
 
 	resp := map[string]any{
 		"current":    version.Version,
@@ -201,8 +254,13 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 		"has_update": newer,
 		"notes":      m.Notes,
 		"published":  m.PublishedAt,
-		"source":     source,
-		"plain_http": upgrade.IsPlainHTTPToPublicHost(source),
+		// source 保留原键名，语义 = 这次**实际命中**的源（向后兼容）
+		"source": usedBase,
+		// effective_source 与 source 同值，用统一命名暴露"实际用了哪个源"
+		"effective_source": usedBase,
+		// configured_source = 配置里保存的值（空串表示没显式配过，走默认候选）
+		"configured_source": s.Cfg.UpgradeSource,
+		"plain_http":        upgrade.IsPlainHTTPToPublicHost(usedBase),
 	}
 	if refErr == nil {
 		resp["asset"] = ref
@@ -237,33 +295,35 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer upgradeMu.Unlock()
 
-	source := strings.TrimSpace(req.Source)
-	if source == "" {
-		source = s.Cfg.UpgradeSource
-	}
-	if source == "" {
-		fail(w, http.StatusBadRequest, "尚未配置升级源地址")
-		return
-	}
+	// 与 check 相同：显式传源优先，否则按候选顺序自动选。
+	// 这里**不写回配置** —— stage 只是"这一次用哪个源下载"，
+	// 持久化用户选择是 check/设置页的职责。
+	sources := s.resolveUpgradeSources(strings.TrimSpace(req.Source))
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 	defer cancel()
 
+	// 保留上一次"实际命中的源"：万一这次探测失败，status 里仍能显示
+	// 最近一次真正用过的地址，而不是被清空。
 	st := &upgrade.State{
-		Status:    upgrade.StatusChecking,
-		Source:    "remote",
-		From:      version.Version,
-		StartedAt: time.Now(),
-		Stage:     "正在获取发布清单",
+		Status:     upgrade.StatusChecking,
+		Source:     "remote",
+		SourceBase: upgrade.LoadState(s.Cfg.WorkDir).SourceBase,
+		From:       version.Version,
+		StartedAt:  time.Now(),
+		Stage:      "正在获取发布清单",
 	}
 	_ = upgrade.SaveState(s.Cfg.WorkDir, st)
 
-	m, _, err := upgrade.FetchManifest(ctx, source)
+	m, usedBase, err := upgrade.FetchManifestAny(ctx, sources, upgradeStagePerSourceTimeout, upgradeManifestFetcher)
 	if err != nil {
+		s.Log.Warn("升级暂存获取清单失败（候选顺序：%v）：%v", sources, err)
 		s.stageFailed(st, "获取清单失败: "+err.Error())
 		fail(w, http.StatusBadGateway, "获取发布清单失败："+err.Error())
 		return
 	}
+	st.SourceBase = usedBase
+	s.Log.Info("升级暂存命中源 %s（候选顺序：%v）", usedBase, sources)
 	newer, err := upgrade.IsNewer(m.Version, version.Version)
 	if err != nil {
 		s.stageFailed(st, err.Error())
@@ -306,8 +366,14 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.audit(r, "upgrade_stage", "v"+m.Version, "已下载并暂存，等待应用", true, "")
-	ok(w, map[string]any{"staged": true, "version": st.To, "state": st})
+	s.audit(r, "upgrade_stage", "v"+m.Version,
+		fmt.Sprintf("命中源 %s；已下载并暂存，等待应用", usedBase), true, "")
+	ok(w, map[string]any{
+		"staged":           true,
+		"version":          st.To,
+		"state":            st,
+		"effective_source": usedBase,
+	})
 }
 
 func (s *Server) stageFailed(st *upgrade.State, msg string) {

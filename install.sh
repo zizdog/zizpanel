@@ -3,24 +3,36 @@
 #  ZizPanel 一键安装脚本（macOS）
 #
 #  用法（任意 Mac，无需先装任何东西）：
-#     curl -fsSL https://你的地址/install.sh | sudo bash
+#     curl -fsSL <镜像地址>/install.sh | sudo bash
 #     或者下载后：sudo bash install.sh
 #
-#  可用环境变量覆盖：
-#     ZIZPANEL_DOWNLOAD_BASE   二进制下载地址前缀（默认 GitHub Releases）
-#     ZIZPANEL_VERSION          指定版本，如 0.1.0（默认 latest）
-#     ZIZPANEL_ROOT             安装根目录（默认 /opt/zizpanel）
-#     ZIZPANEL_LISTEN           面板监听地址（默认 :8443）
-#     ZIZPANEL_MIRROR_BASE      自建 NAS 镜像基址（brew 基础依赖镜像优先用它，
-#                               如 https://mirror.zizdog.com:8888）
-#     ZIZPANEL_SKIP_DEPS=1      跳过 Homebrew 依赖安装（含基础依赖 ffmpeg）
-#     ZIZPANEL_SKIP_FIREWALL=1  跳过防火墙处理
+#  交互：有终端时会依次询问管理员用户名、登录口令、面板后缀、监听端口、
+#        是否开启 SSH、是否开启「免授权访问内网段」（后两项按场景跳过）。
+#        没有终端（curl | bash、CI、管道）或设了 ZP_YES=1 时不问任何问题，
+#        一律走默认值/环境变量，绝不阻塞。
 #
-# 国内网络：默认从 GitHub Releases 下载；**不通时会自动改用内置镜像**（见下）。
+#  可用环境变量覆盖（ZP_* 是 ZIZPANEL_* 的简写别名，两者等价）：
+#     ZP_USER / ZIZPANEL_ADMIN_USER        管理员用户名（默认：本机短名或 admin）
+#     ZP_PASS / ZIZPANEL_ADMIN_PASSWORD    登录口令（不设则交互询问；无终端必须设）
+#     ZP_SUFFIX / ZIZPANEL_PANEL_SUFFIX    面板路径后缀（默认随机 8 位）
+#     ZP_PORT / ZIZPANEL_LISTEN            监听端口，默认 8443
+#     ZP_YES=1                             全程不提问，全用默认值
+#     ZP_SSH=1|0                           是否开启 SSH（不设时：本机安装才问）
+#     ZP_LAN_PREAUTH=1|0                   是否开启「免授权访问内网段」（默认 0）
+#     ZP_LAN_CIDR                          免授权网段，如 192.168.1.0/24（默认自动探测）
+#     ZIZPANEL_DOWNLOAD_BASE               二进制下载源（默认走镜像，见下）
+#     ZIZPANEL_MIRROR_BASE / ZIZPANEL_MIRROR_BASE_DEFAULT
+#                                          镜像站基址（默认 https://mirror.zizdog.com:8888）
+#     ZIZPANEL_SERVER_MODE=1               装完顺带配成服务器模式（含开 SSH）
+#     ZIZPANEL_NO_SSH=1                    服务器模式里不开 SSH
+#     ZIZPANEL_SKIP_DEPS=1                 跳过 Homebrew 依赖安装（含 ffmpeg）
+#     ZIZPANEL_SKIP_FIREWALL=1             跳过防火墙处理
+#     ZIZPANEL_DRY_RUN=1                   只打印将要做的事，不做任何修改
 #
-# 国内网络：默认从 GitHub Releases 下载。若直连很慢/不通，用自建镜像：
-#     curl -fsSL https://zizdog.com/zizpanel/install.sh | \
-#       sudo bash -s -- --download-base https://zizdog.com/zizpanel
+#  下载点（全部"镜像优先 + 探测不通再回落"，基址集中定义见下方 MIRROR_* 常量）：
+#     · 面板二进制  → 镜像 /zizpanel/download/... → GitHub Releases（最后兜底）
+#     · 应用包/brew → 镜像 /brew（NAS 优先）→ 国内公共镜像 → 官方源
+#     · pip / HF / Docker 由面板侧按同一套镜像语义处理（不在本脚本内）
 #
 #  设计要点：
 #   1. 幂等：重复执行不会破坏已有数据与配置，会保留 panel.db 与 config.json
@@ -29,22 +41,29 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="1.0.0"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
+ZIZPANEL_LISTEN="${ZIZPANEL_LISTEN:-}"
+if [ -z "$ZIZPANEL_LISTEN" ] && [ -n "${ZP_PORT:-}" ]; then
+  ZIZPANEL_LISTEN=":$ZP_PORT"
+fi
 ZIZPANEL_LISTEN="${ZIZPANEL_LISTEN:-:8443}"
 # 本机访问路径：新面板会接管旧面板，并在该路径提供入口
 PANEL_PATH="${ZIZPANEL_PANEL_PATH:-/_panel}"
 ZIZPANEL_VERSION="${ZIZPANEL_VERSION:-latest}"
-# 下载源：默认 GitHub Releases；可换成自己的服务器
-ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE:-https://github.com/zizdog/zizpanel/releases}"
-# BUILTIN_MIRROR 是内置的国内镜像（同一个项目的自建源）。
+# 下载源（**镜像优先**，官方源只作最后兜底）：候选顺序见 detect_source。
+# 为什么不在这里直接写镜像：镜像固定为下面两个常量，用户另有指定时才覆盖。
+ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE:-}"
+# BUILTIN_MIRROR 是内置的国内镜像（同一个项目的自建源，即 NAS 的公网入口）。
 #
 # 为什么要有它：中国大陆无代理时 GitHub Release **完全不通**（2026-09 实测：
 # 20 秒 0 字节），而"从 GitHub 下载"和"从源码构建"两条路都绕不开 GitHub。
 # 有了它，用户只要能从任意一个地方拿到 install.sh，安装就能自动完成。
 BUILTIN_MIRROR="${ZIZPANEL_BUILTIN_MIRROR:-https://zizdog.com/zizpanel}"
+# 官方源（GitHub Releases）：**只做最后兜底**，国内直连通常会卡。
+GITHUB_RELEASE_BASE="${ZIZPANEL_GITHUB_BASE:-https://github.com/zizdog/zizpanel/releases}"
 # 服务器模式：安装面板的同时把系统配置成适合长期无人值守运行
 # 可通过 --server-mode 参数或 ZIZPANEL_SERVER_MODE=1 开启
 ZIZPANEL_SERVER_MODE="${ZIZPANEL_SERVER_MODE:-0}"
@@ -53,17 +72,85 @@ ZIZPANEL_SERVER_MODE="${ZIZPANEL_SERVER_MODE:-0}"
 # 放在安装脚本里会长时间没有输出，容易让人以为卡死。
 # 不传这个参数时面板仍可用，LNMP 可以在面板「应用市场」里逐个安装。
 ZIZPANEL_WITH_LNMP="${ZIZPANEL_WITH_LNMP:-0}"
+
+# ------------------------------------------------------------ 交互输入变量 --
+# 全部支持 ZP_* 简写别名（用户原话里用的就是 ZP_*），两者等价。
+ADMIN_USERNAME="${ZIZPANEL_ADMIN_USER:-${ZP_USER:-}}"
+ADMIN_PASSWORD="${ZIZPANEL_ADMIN_PASSWORD:-${ZP_PASS:-}}"
+PANEL_SUFFIX_INPUT="${ZIZPANEL_PANEL_SUFFIX:-${ZP_SUFFIX:-}}"
+# ZP_YES / ZIZPANEL_YES：全程不提问
+ZIZPANEL_YES="${ZIZPANEL_YES:-${ZP_YES:-0}}"
+# ZP_SSH：1 开 / 0 关；空表示"按场景决定"（本机安装才问）
+ZIZPANEL_SSH="${ZIZPANEL_SSH:-${ZP_SSH:-}}"
+# ZP_LAN_PREAUTH：装完是否开启「免授权访问内网段」；空表示交互询问
+ZIZPANEL_LAN_PREAUTH="${ZIZPANEL_LAN_PREAUTH:-${ZP_LAN_PREAUTH:-}}"
+LAN_CIDR_INPUT="${ZIZPANEL_LAN_CIDR:-${ZP_LAN_CIDR:-}}"
+# ZIZPANEL_DRY_RUN=1：只演练，不做任何修改（用于验证交互与默认值，不装任何东西）
+ZIZPANEL_DRY_RUN="${ZIZPANEL_DRY_RUN:-0}"
+# ADMIN_PASSWORD_GENERATED=1 表示口令是脚本自动生成的（无终端场景）：
+# 安装结果里必须显著打印一次，之后不再显示。
+ADMIN_PASSWORD_GENERATED=0
+# PANEL_UPGRADE_SOURCE 是探测后真正写进 config.json 的在线升级源（main 里填）。
+# 空串 = 公网与 NAS 都不可用：宁可不写，也不写一个探不通的地址。
+PANEL_UPGRADE_SOURCE=""
+
 # ---------------------------------------------------------- 基础依赖（ffmpeg）--
+
 # ffmpeg 是"装了面板就该有"的基础环境，所以由安装脚本直接装上；
 # 为什么是基础环境而不是某个应用的私有依赖，见 ensure_base_deps 的注释
 # （2026-09-16 真机事故：它被弄丢后 TTS 合成返回 HTTP 200 + 0 字节 body，
 #  所有作业全败而健康检查全绿）。
 # 这份清单与面板 Go 侧 internal/services/basedep.go 的 baseDependencies 对应。
 BASEDEP_FORMULAS=(ffmpeg)
+# ============================================================================
+#  镜像地址：**集中在这一处定义**（用户明确要求"放在镜像上的内容尽量统一"）。
+#
+#  换镜像只需要改这几个常量（或用同名环境变量覆盖），脚本里不许再出现
+#  散落的镜像域名；探测/回落的顺序也由下面这几个数组唯一决定。
+#
+#  路径约定（与 NAS 上的实际布局、以及 Go 侧 mirror.go / homebrew_clt_mirror.go
+#  的语义严格一致，不另造一套）：
+#    <MIRROR>/zizpanel/download/<版本>/     面板发布包（Makefile: NAS_ROOT/zizpanel）
+#    <MIRROR>/zizpanel/clt/index.json        Command Line Tools 清单与载荷
+#    <MIRROR>/brew/api/formula/<f>.json      Homebrew bottles API
+#    <MIRROR>/brew/v2/...                    Homebrew bottles（OCI 布局）
+#    <MIRROR>/apps/<app>/<版本>/             应用市场安装包
+#    <MIRROR>/pypi/  <MIRROR>/hf/            pip / HuggingFace（面板侧使用）
+# ============================================================================
+
 # DEFAULT_MIRROR_BASE 是自建 NAS 镜像的默认基址（与面板 config.DefaultMirrorBase 一致）。
-# 装面板时若用户没有单独配置，也先拿它探一次：不通只是一次 4 秒探测，
-# 通了能省很多下载时间（用户明确要求"镜像优先"）。
+# 它就是"指定的那一个镜像"：brew、CLT、应用包、面板发布件都挂在它下面。
 DEFAULT_MIRROR_BASE="${ZIZPANEL_MIRROR_BASE_DEFAULT:-https://mirror.zizdog.com:8888}"
+# 面板发布件在镜像上的子目录（NAS_ROOT 的对外前缀）。
+MIRROR_PANEL_SUBDIR="/zizpanel"
+# 局域网直连的 NAS 镜像（同城/RFC1918 内比公网入口快约 26 倍，见 AGENTS.md 四）。
+# 放在候选里但**只探通就用**：不在同一局域网时探测会很快失败，不影响安装。
+NAS_LAN_MIRROR="http://192.168.1.8:8090"
+
+# 面板**在线升级源** —— 写进 config.json 的 `upgrade_source` 字段。
+# 用户明确要求："以后升级探测不应该再是本机了，应该是公网的 zizdog.com"。
+# 公网优先（任何网络都能用），NAS 局域网地址只作回落加速。
+# 实测（2026-09-17）：https://zizdog.com/zizpanel/manifest.json (+.sig) → 200；
+# NAS 上同一份在 <NAS>/zizpanel/manifest.json → 200，而 <NAS>/manifest.json → 404。
+PANEL_UPGRADE_SOURCE_PUBLIC="${ZIZPANEL_UPGRADE_SOURCE:-https://zizdog.com/zizpanel}"
+PANEL_UPGRADE_SOURCE_LAN="${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}"
+# 升级源是否可用以"清单 + 签名都在"为准（只有清单没有签名，面板会拒绝升级）。
+UPGRADE_MANIFEST_PATH="/manifest.json"
+
+# 国内公共 Homebrew 镜像（Go 侧 brewMirrorCandidates 同一份顺序与地址）。
+BREW_PUBLIC_MIRRORS=(
+  "中科大|https://mirrors.ustc.edu.cn/homebrew-bottles"
+  "清华大学|https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
+  "阿里云|https://mirrors.aliyun.com/homebrew/homebrew-bottles"
+)
+# Homebrew 官方安装脚本镜像。NAS 上**没有**这份脚本（实测 404），所以只能走
+# 中科大镜像（与官方同步、实测 200/0.18s）或 GitHub raw。USTC 的 brew.git /
+# homebrew-core.git 也在这里一起定义，避免散落在 setup_homebrew 里。
+BREW_INSTALL_SCRIPT_MIRROR="https://mirrors.ustc.edu.cn/misc/brew-install.sh"
+BREW_GIT_REMOTE_MIRROR="https://mirrors.ustc.edu.cn/brew.git"
+BREW_CORE_GIT_REMOTE_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git"
+# CLT（Command Line Tools）清单在镜像上的相对路径（cltMirrorSubdirs 同一约定）。
+CLT_MIRROR_SUBDIRS=("" "/zizpanel")
 # 用户**自己**在环境里设过的 brew 镜像必须尊重。必须在 setup_homebrew 之前抓一份：
 # 那一步会在 GitHub 不可达时自己 export HOMEBREW_*，之后再去读就分不清
 # "用户设的"和"脚本设的"了（见 choose_brew_mirror）。
@@ -89,6 +176,8 @@ APPS_DIR="${ZIZPANEL_APPS_DIR:-/Applications}"
 LINK_DIR="${ZIZPANEL_LINK_DIR:-/usr/local/bin}"
 PLIST_PATH="$PLIST_DIR/$PANEL_LABEL.plist"
 SUDOERS_PATH="$SUDOERS_DIR/zizpanel"
+# PANEL_PORT 在 main 里由 panel_port() 填好；这里的空值只是给 shellcheck 的声明。
+PANEL_PORT=""
 TMP_DIR=""
 # 脚本所在目录（用于定位随包分发的工具脚本）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
@@ -111,6 +200,10 @@ warn()  { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 err()   { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 title() { printf '\n%s━━━ %s ━━━%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 die()   { err "$*"; exit 1; }
+
+# dry_run：干跑模式。所有"会真的改系统"的动作都要先过这一关。
+# 放在最前面定义：它被大量函数使用，且实现必须只有一个（避免各处各写一套判断）。
+dry_run() { [ "$ZIZPANEL_DRY_RUN" = "1" ]; }
 
 cleanup() {
   [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
@@ -197,24 +290,31 @@ detect_source() {
   # 注意：这里探的是**真实的 tarball 地址**，不是目录 —— 目录 HEAD 在 nginx 下
   # 常常 403，会造成"明明镜像可用却判定不可达"。而且必须**逐个候选源都试一遍**：
   # 官方不通时直接走"源码构建"是错的（普通用户机器上根本没有 Go 工具链），
-  # 正确做法是接着试内置镜像。
+  # 正确做法是接着试下一个镜像。
+  #
+  # 顺序 = "镜像优先"：用户指定 → 自建 NAS 公网入口 → 局域网 NAS → GitHub。
+  # GitHub 放在最后只作兜底：国内无代理时它 20 秒 0 字节（2026-09 实测）。
   local arch="arm64" base
   [ "$(uname -m)" = "x86_64" ] && arch="amd64"
-  for base in "$ZIZPANEL_DOWNLOAD_BASE" "$BUILTIN_MIRROR"; do
+  local file="zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz"
+  local -a bases=()
+  if [ -n "$ZIZPANEL_DOWNLOAD_BASE" ]; then
+    bases+=("${ZIZPANEL_DOWNLOAD_BASE%/}")
+  fi
+  bases+=("$BUILTIN_MIRROR" "${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}" "$GITHUB_RELEASE_BASE")
+  for base in "${bases[@]}"; do
     [ -n "$base" ] || continue
     base="${base%/}"
-    if curl -fsSI --max-time 10 \
-        "$base/download/$ZIZPANEL_VERSION/zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz" \
-        >/dev/null 2>&1; then
-      if [ "$base" != "${ZIZPANEL_DOWNLOAD_BASE%/}" ]; then
-        warn "官方源不可达，改用内置镜像：$base"
+    if curl -fsSI --max-time 10 "$base/download/$ZIZPANEL_VERSION/$file" >/dev/null 2>&1; then
+      if [ -n "$ZIZPANEL_DOWNLOAD_BASE" ] && [ "$base" != "${ZIZPANEL_DOWNLOAD_BASE%/}" ]; then
+        warn "指定的下载源不可达，改用镜像：$base"
       fi
       ZIZPANEL_DOWNLOAD_BASE="$base"
       SOURCE_KIND="download"
       return 0
     fi
   done
-  warn "下载源都不可达（官方与内置镜像），尝试从源码构建"
+  warn "下载源都不可达（自建镜像与官方源），尝试从源码构建"
 
   # 3) 用 Go 从源码构建
   if command -v go >/dev/null 2>&1; then
@@ -224,7 +324,7 @@ detect_source() {
 
   err "无法获取面板程序，请选择其一："
   err "  1) 把 dist/ 目录与 install.sh 放在一起（离线安装）"
-  err "  2) 检查网络能否访问 $ZIZPANEL_DOWNLOAD_BASE"
+  err "  2) 检查网络能否访问 ${bases[0]:-<镜像>}"
   err "  3) 安装 Go 后重试：brew install go"
   exit 1
 }
@@ -238,17 +338,25 @@ download_binaries() {
 
   info "下载：$url"
   if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
-    # 自动退到内置镜像：用户不必知道镜像地址，curl 一条命令就行
-    if [ "$ZIZPANEL_DOWNLOAD_BASE" != "$BUILTIN_MIRROR" ]; then
-      warn "从 $ZIZPANEL_DOWNLOAD_BASE 下载失败，改用内置镜像重试"
-      url="$BUILTIN_MIRROR/download/$ZIZPANEL_VERSION/$file"
+    # 自动换到下一个候选源（镜像优先，官方兜底）：用户不必知道镜像地址
+    local -a fallbacks=("$BUILTIN_MIRROR" "${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}" "$GITHUB_RELEASE_BASE")
+    local fb
+    local done_ok=0
+    for fb in "${fallbacks[@]}"; do
+      [ -n "$fb" ] || continue
+      fb="${fb%/}"
+      [ "$fb" = "$ZIZPANEL_DOWNLOAD_BASE" ] && continue
+      warn "从 $ZIZPANEL_DOWNLOAD_BASE 下载失败，改用：$fb"
+      url="$fb/download/$ZIZPANEL_VERSION/$file"
       info "下载：$url"
-      if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
-        die "下载失败（官方与内置镜像都不通）。可改用离线安装：把 dist/ 与 install.sh 放在同一目录"
+      if curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/pkg.tar.gz" "$url"; then
+        ZIZPANEL_DOWNLOAD_BASE="$fb"
+        done_ok=1
+        break
       fi
-      ZIZPANEL_DOWNLOAD_BASE="$BUILTIN_MIRROR"
-    else
-      die "下载失败。请检查网络，或改用离线安装（把 dist/ 与 install.sh 放在同一目录）"
+    done
+    if [ "$done_ok" != "1" ]; then
+      die "下载失败（自建镜像与官方源都不通）。可改用离线安装：把 dist/ 与 install.sh 放在同一目录"
     fi
   fi
   if ! tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"; then
@@ -256,7 +364,8 @@ download_binaries() {
   fi
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"
-  [ -x "$SOURCE_BIN" ] || die "安装包中缺少 zizpanel 可执行文件"
+  [ -x "$SOURCE_BIN" ] || die "安装包中缺少 zizpanel 可执行文件（来源：${ZIZPANEL_DOWNLOAD_BASE}）"
+  [ -f "$SOURCE_HELPER" ] || die "安装包中缺少 ${HELPER_NAME}（来源：${ZIZPANEL_DOWNLOAD_BASE}）"
   ok "下载完成"
 }
 
@@ -281,6 +390,8 @@ build_from_source() {
   ) || die "构建失败，请检查 Go 环境"
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"
+  [ -x "$SOURCE_BIN" ] || die "构建命令返回成功，但 $SOURCE_BIN 不存在 —— 如实报为失败"
+  [ -x "$SOURCE_HELPER" ] || die "构建命令返回成功，但 $SOURCE_HELPER 不存在 —— 如实报为失败"
   ok "构建完成"
 }
 
@@ -322,15 +433,17 @@ brew_has() {
 # 于是"一条命令装完"会在最开头就卡住，而用户看到的提示只是一个打不开的网址。
 #
 # 这里做三件事：
-#   1. 先探测 GitHub 是否可达，可达就走官方源（最可信）
-#   2. 不可达时改用国内镜像：安装脚本走 USTC 镜像，
-#      并同时把 brew/core 与 bottles 都指向镜像
+#   1. **镜像优先**：先探国内镜像的安装脚本（USTC，与官方同步）；
+#      镜像不通才回落 GitHub 官方源（用户明确要求"放在镜像上的尽量统一"）
+#   2. 同时把 brew/core 与 bottles 都指向镜像（NAS 优先，见 choose_brew_mirror）
 #   3. 把镜像配置**写进用户的 shell 配置**，否则下次开终端又变回官方源
 #
 # 安全说明：镜像只替换"从哪里下载"，脚本内容与官方一致（USTC 同步自 GitHub）。
 # 我们不做"从 gitee 拉第三方脚本"这种事 —— 那种脚本会以你的身份提权执行。
 GITHUB_RAW_OK=""
 
+# 探测 Homebrew 官方安装脚本是否可达（**只作为兜底候选**）。
+# 为什么仍然保留：镜像偶尔会同步滞后或临时不可用，此时官方源是唯一出路。
 probe_github_raw() {
   [ -n "$GITHUB_RAW_OK" ] && return 0
   if curl -fsSI --max-time 8 https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh >/dev/null 2>&1; then
@@ -349,8 +462,8 @@ write_brew_mirrors() {
   fi
   {
     printf '\n# >>> ZizPanel brew mirror (自动生成，可整段删除) >>>\n'
-    printf 'export HOMEBREW_API_DOMAIN="%s"\n' "$BREW_API_DOMAIN"
-    printf 'export HOMEBREW_BOTTLE_DOMAIN="%s"\n' "$BREW_BOTTLE_DOMAIN"
+    printf 'export HOMEBREW_API_DOMAIN="%s"\n' "$HOMEBREW_API_DOMAIN"
+    printf 'export HOMEBREW_BOTTLE_DOMAIN="%s"\n' "$HOMEBREW_BOTTLE_DOMAIN"
     printf '# <<< ZizPanel brew mirror <<<\n'
   } >> "$rc" || return 1
   # 文件属主必须是真实用户，否则用户自己的 shell 读不了
@@ -366,23 +479,36 @@ setup_homebrew() {
     return 1
   fi
 
-  probe_github_raw
-  local installer_url
-  if [ "$GITHUB_RAW_OK" = "1" ]; then
-    info "GitHub 可达，使用 Homebrew 官方安装源"
-    installer_url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
-    BREW_API_DOMAIN=""; BREW_BOTTLE_DOMAIN=""
-  else
-    info "GitHub 不可达，改用国内镜像安装 Homebrew"
-    info "  安装脚本：mirrors.ustc.edu.cn（与官方同步）"
-    installer_url="https://mirrors.ustc.edu.cn/misc/brew-install.sh"
-    BREW_API_DOMAIN="https://mirrors.aliyun.com/homebrew/homebrew-bottles/api"
-    BREW_BOTTLE_DOMAIN="https://mirrors.aliyun.com/homebrew/homebrew-bottles"
-    export HOMEBREW_BREW_GIT_REMOTE="https://mirrors.ustc.edu.cn/brew.git"
-    # 注意：core 的仓库镜像用 TUNA —— USTC 的 homebrew-core.git 实测返回 404
-    export HOMEBREW_CORE_GIT_REMOTE="https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git"
-    export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
+  # 安装脚本：**镜像优先**。USTC 的 brew-install.sh 与官方同步（实测 200/0.18s），
+  # 官方 raw.githubusercontent.com 只在前者不可达时兜底（国内经常完全不通）。
+  local installer_url="$BREW_INSTALL_SCRIPT_MIRROR" installer_src="国内镜像 mirrors.ustc.edu.cn（与官方同步）"
+  if ! curl -fsSI --max-time 8 "$installer_url" >/dev/null 2>&1; then
+    probe_github_raw
+    if [ "$GITHUB_RAW_OK" = "1" ]; then
+      warn "Homebrew 安装脚本镜像不可达，回落 GitHub 官方源"
+      installer_url="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+      installer_src="GitHub 官方源"
+    else
+      warn "Homebrew 安装脚本（镜像与官方源）都不可达，稍后可手工安装"
+      return 1
+    fi
   fi
+  info "Homebrew 安装脚本来源：${installer_src}"
+
+  # 无论走哪条安装脚本，brew/core 与 bottles 都指向国内镜像：
+  # 瓶子（真正的下载量大头）用 NAS 优先，探不通再退各家公共镜像。
+  # 这里探 ffmpeg（基础依赖，清单里一定有它），不探 git —— git formula
+  # 在新版 Homebrew 里已不在 taps 清单，探它会得到"镜像不可用"的假结论。
+  if choose_brew_mirror "ffmpeg"; then
+    info "  brew 部件镜像：${BREW_MIRROR_NAME}"
+  else
+    # 镜像都没探通：此时**不要**设 HOMEBREW_*，让 brew 走官方源（比设一个取不到的好）
+    warn "  自建镜像与国内镜像都没探测通：brew 走官方源（国内可能很慢）"
+    HOMEBREW_API_DOMAIN=""; HOMEBREW_BOTTLE_DOMAIN=""
+  fi
+  export HOMEBREW_BREW_GIT_REMOTE="$BREW_GIT_REMOTE_MIRROR"
+  # 注意：core 的仓库镜像用 TUNA —— USTC 的 homebrew-core.git 实测返回 404
+  export HOMEBREW_CORE_GIT_REMOTE="$BREW_CORE_GIT_REMOTE_MIRROR"
   # 安装过程禁止交互与自动更新，否则会卡在"按回车继续"
   export NONINTERACTIVE=1
   export HOMEBREW_NO_AUTO_UPDATE=1
@@ -413,7 +539,7 @@ setup_homebrew() {
   # 立即让当前进程也能看到 brew
   export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-  if [ -n "$BREW_API_DOMAIN" ]; then
+  if [ -n "$HOMEBREW_API_DOMAIN" ]; then
     if write_brew_mirrors "$REAL_HOME"; then
       ok "已把国内镜像写入 $REAL_HOME 的 shell 配置（下次开终端仍然生效）"
     else
@@ -519,6 +645,9 @@ choose_brew_mirror() {
     return 0
   fi
 
+  # NAS 候选：先用户配置/内置默认，再局域网直连地址（同城快 26 倍，见 AGENTS.md）。
+  # 全都**探通才用**；一个都不通就落到下面的公共镜像。
+  local nas_candidates=()
   nas="${ZIZPANEL_MIRROR_BASE:-}"
   if [ -z "$nas" ] && [ -f "$DATA_DIR/config.json" ]; then
     # 升级/重装时沿用面板里配置过的镜像。只做一次最小的键值提取，
@@ -526,19 +655,22 @@ choose_brew_mirror() {
     nas="$(sed -n 's/.*"mirror_base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       "$DATA_DIR/config.json" 2>/dev/null | head -1)"
   fi
-  [ -n "$nas" ] || nas="$DEFAULT_MIRROR_BASE"
-  if brew_api_ok "$nas/brew" "$formula"; then
-    HOMEBREW_API_DOMAIN="${nas%/}/brew/api"
-    HOMEBREW_BOTTLE_DOMAIN="${nas%/}/brew"
-    export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
-    BREW_MIRROR_NAME="自建 NAS 镜像（${HOMEBREW_BOTTLE_DOMAIN}）"
-    return 0
-  fi
+  nas_candidates+=("${nas:-$DEFAULT_MIRROR_BASE}")
+  [ -n "$nas" ] || nas_candidates+=("$NAS_LAN_MIRROR")
+  for nas in "${nas_candidates[@]}"; do
+    [ -n "$nas" ] || continue
+    if brew_api_ok "$nas/brew" "$formula"; then
+      HOMEBREW_API_DOMAIN="${nas%/}/brew/api"
+      HOMEBREW_BOTTLE_DOMAIN="${nas%/}/brew"
+      export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
+      BREW_MIRROR_NAME="自建 NAS 镜像（${HOMEBREW_BOTTLE_DOMAIN}）"
+      return 0
+    fi
+  done
 
-  for entry in \
-    "中科大|https://mirrors.ustc.edu.cn/homebrew-bottles" \
-    "清华大学|https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles" \
-    "阿里云|https://mirrors.aliyun.com/homebrew/homebrew-bottles"; do
+  # 国内公共镜像：地址与顺序集中定义在文件头的 BREW_PUBLIC_MIRRORS
+  # （与 Go 侧 brewMirrorCandidates 严格一致，别在两处各写一份）。
+  for entry in "${BREW_PUBLIC_MIRRORS[@]}"; do
     name="${entry%%|*}"
     base="${entry##*|}"
     if brew_api_ok "$base" "$formula"; then
@@ -550,6 +682,80 @@ choose_brew_mirror() {
     fi
   done
   return 1
+}
+
+# ---------------------------------------------------- CLT（命令行开发者工具）--
+# 为什么要单独探一次：Homebrew 安装过程中会去装 CLT（576 MB + 55 MB），
+# 那是整条安装链里最大的一笔下载。CLT 载荷放在镜像的
+# <mirror>/zizpanel/clt/<产品号>/ 下（清单 <mirror>/zizpanel/clt/index.json，
+# 与 Go 侧 cltMirrorSubdirs 同一约定；实测 <mirror>/clt/index.json 是 404）。
+#
+# install.sh **不自己装 CLT**（那件事由 Homebrew 安装器负责，它的安装脚本本身
+# 已经走镜像）；这里只做两件事：
+#   1) 判断镜像上到底有没有 CLT 清单，并把它报出来（"没有日志"本身就是信息）；
+#   2) 把 <mirror>/zizpanel 作为 ZIZPANEL_CLT_MIRROR 写进 plist 环境变量 ——
+#      面板 Go 侧的 cltMirrorBase() 读的正是这个变量，这样面板后续补装 CLT 时
+#      用同一个基址，不必再对 404 的路径探一遍。
+CLT_MIRROR_BASE=""
+
+probe_clt_mirror() {
+  local base="$1" sub url
+  for sub in "${CLT_MIRROR_SUBDIRS[@]}"; do
+    url="${base%/}${sub}/clt/index.json"
+    if curl -fsSI --max-time 6 "$url" >/dev/null 2>&1; then
+      CLT_MIRROR_BASE="${base%/}${sub}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# clt_mirror_note：只读探测 + 如实汇报（探不到就说探不到，不假装有镜像）。
+clt_mirror_note() {
+  local base="${ZIZPANEL_MIRROR_BASE:-$DEFAULT_MIRROR_BASE}"
+  if probe_clt_mirror "$base"; then
+    ok "CLT 镜像可用：${CLT_MIRROR_BASE}/clt/index.json（面板补装 CLT 时会用它）"
+  elif [ -z "${ZIZPANEL_MIRROR_BASE:-}" ] && probe_clt_mirror "$NAS_LAN_MIRROR$MIRROR_PANEL_SUBDIR"; then
+    ok "CLT 镜像可用（局域网 NAS）：${CLT_MIRROR_BASE}/clt/index.json"
+  else
+    warn "镜像上没有 CLT 清单：CLT 由 Homebrew 安装器负责（走 softwareupdate 或弹窗），"
+    warn "  镜像路径：${base%/}/zizpanel/clt/index.json"
+  fi
+}
+
+# ------------------------------------------------------------ 在线升级源 --
+# 用户明确要求："以后升级探测不应该再是本机了，应该是公网的 zizdog.com。"
+#
+# 顺序：先用户显式指定的 ZIZPANEL_UPGRADE_SOURCE，再公网 zizdog.com，
+# 最后局域网 NAS（NAS 只在同一局域网可达，所以只能作回落/加速）。
+# 判据是"清单 + 签名都在"：只有清单没有签名时面板会拒绝升级，
+# 把它当可用源写进配置，用户会看到一个查不出原因的失败。
+probe_upgrade_source() {
+  local cand
+  for cand in "$PANEL_UPGRADE_SOURCE_PUBLIC" "$PANEL_UPGRADE_SOURCE_LAN"; do
+    [ -n "$cand" ] || continue
+    cand="${cand%/}"
+    if curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}" >/dev/null 2>&1 &&
+       curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}.sig" >/dev/null 2>&1; then
+      PANEL_UPGRADE_SOURCE="$cand"
+      return 0
+    fi
+  done
+  PANEL_UPGRADE_SOURCE=""
+  return 1
+}
+
+# upgrade_source_note：只读探测并如实汇报（探不到就说探不到，界面里再让用户填）。
+upgrade_source_note() {
+  if probe_upgrade_source; then
+    if [ "$PANEL_UPGRADE_SOURCE" = "${PANEL_UPGRADE_SOURCE_PUBLIC%/}" ]; then
+      ok "在线升级源：${PANEL_UPGRADE_SOURCE}（公网 zizdog.com，已确认清单与签名都在）"
+    else
+      warn "公网升级源不可达，回落局域网 NAS：${PANEL_UPGRADE_SOURCE}"
+    fi
+  else
+    warn "公网与局域网升级源都没探通（面板仍可用，升级源留空，可在「面板设置 → 在线升级」里手工填写）"
+  fi
 }
 
 # ensure_base_deps：幂等地装上缺失的基础依赖（目前只有 ffmpeg）。
@@ -614,9 +820,17 @@ ensure_base_deps() {
 # ------------------------------------------------------------ 安装依赖组件 --
 install_deps() {
   title "检查系统依赖"
+  if dry_run; then
+    info "（干跑）将检查并（按需）安装：Homebrew / ffmpeg，以及可选的 nginx+PHP+MySQL"
+    info "（干跑）Homebrew 安装脚本来源：${BREW_INSTALL_SCRIPT_MIRROR}（镜像优先，不通才回落官方）"
+    return 0
+  fi
 
   if ! has_brew; then
     warn "未检测到 Homebrew。面板本身不依赖它，但网站管理（nginx/PHP/MySQL）需要。"
+    # CLT 是 Homebrew 的前置，也是整条链里最大的一笔下载：装它之前先探一次镜像，
+    # 并把结论如实报出来（探不到就说探不到，绝不假装有镜像）。
+    clt_mirror_note
     if [ "${ZIZPANEL_INSTALL_BREW:-1}" = "1" ]; then
       setup_homebrew || warn "Homebrew 未能自动安装，可稍后在面板里重试或手工安装"
     else
@@ -682,6 +896,19 @@ install_deps() {
 install_binaries() {
   title "安装面板程序"
 
+  # 绝不允许"空源路径"走到 install(1)：那只会得到一句
+  # `install: : No such file or directory`，把真正的失败原因（没找到可用的
+  # 二进制来源）藏起来。这里显式挡住并说清试过哪些地址。
+  if [ -z "$SOURCE_BIN" ] || [ ! -x "$SOURCE_BIN" ]; then
+    err "没有可安装的面板程序（内部错误：来源为空或不可执行）。"
+    err "已尝试的来源："
+    err "  · 本地二进制：${SCRIPT_DIR}/dist、${SCRIPT_DIR}/../dist、${SCRIPT_DIR}"
+    err "  · 下载：${ZIZPANEL_DOWNLOAD_BASE:-<未选定>} → $BUILTIN_MIRROR → ${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR} → $GITHUB_RELEASE_BASE"
+    err "  · 源码构建：需要本机有 go"
+    die "无法获取面板程序，安装中止（没有改动任何东西）"
+  fi
+
+  if dry_run; then info "（干跑）将安装主程序与提权助手到 ${BIN_DIR}、建立 ${LINK_DIR}/zizpanel 软链"; return 0; fi
   local was_installed=0
   [ -f "$DATA_DIR/config.json" ] && was_installed=1
 
@@ -824,6 +1051,7 @@ start_service() {
 install_daemon() {
   title "注册后台服务（开机自启）"
 
+  if dry_run; then info "（干跑）将写 ${PLIST_PATH} 并 bootstrap 服务 ${PANEL_LABEL}"; return 0; fi
   # 先停掉旧的，避免升级时二进制被占用
   launchctl bootout "system/$PANEL_LABEL" 2>/dev/null || true
 
@@ -870,12 +1098,35 @@ install_daemon() {
              否则会把网站根目录算成 /var/root/www，导致站点全部找不到 -->
         <key>ZIZPANEL_USER</key>
         <string>$REAL_USER</string>
+        <!-- CLT（命令行开发者工具）镜像基址：面板 Go 侧 cltMirrorBase() 读它，
+             这样面板补装 CLT 时走与安装脚本同一个镜像，不必再对 404 路径探一遍。
+             探不到时留空（不写这一项），面板自己会回落到内置静态源。 -->
+__PLIST_CLT_ENV__
     </dict>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
 </plist>
 PLIST
+  # CLT 镜像项按"探到才写"处理：探不到就整项删掉（普通字符串替换，
+  # 不用 sed -i —— 它的 GNU/BSD 两套写法容易踩坑）。
+  if [ -n "$CLT_MIRROR_BASE" ]; then
+    local tmp_clt="$tmp_plist.clt"
+    {
+      printf '        <key>ZIZPANEL_CLT_MIRROR</key>\n'
+      printf '        <string>%s</string>\n' "$CLT_MIRROR_BASE"
+    } > "$tmp_clt"
+    # awk 读进文件再替换：避免把满是斜杠的地址塞进 sed 表达式
+    awk -v repl="$tmp_clt" '
+      /__PLIST_CLT_ENV__/ { while ((getline l < repl) > 0) print l; next }
+      { print }
+    ' "$tmp_plist" > "$tmp_plist.new" && mv -f "$tmp_plist.new" "$tmp_plist"
+    rm -f "$tmp_clt"
+    info "已把 CLT 镜像写入 plist 环境变量：$CLT_MIRROR_BASE"
+  else
+    grep -v '__PLIST_CLT_ENV__' "$tmp_plist" > "$tmp_plist.new" 2>/dev/null \
+      && mv -f "$tmp_plist.new" "$tmp_plist"
+  fi
 
   chmod 0644 "$tmp_plist"
   if [ "$(id -u)" -eq 0 ]; then
@@ -918,6 +1169,7 @@ PLIST
 install_sudoers() {
   title "配置面板提权权限"
 
+  if dry_run; then info "（干跑）将写入 ${SUDOERS_PATH}（只授权受限提权助手）"; return 0; fi
   # 只授权 helper 这一个程序，且 helper 内部只做白名单操作。
   # 绝不授权 /bin/bash、/usr/bin/* 之类的通用命令。
   # 必须写临时文件再 mv：目标文件是 0440 只读，直接重定向会在重装时报 Permission denied
@@ -951,6 +1203,7 @@ SUDOERS
 setup_nginx_env() {
   title "准备 nginx 环境"
 
+  if dry_run; then info "（干跑）将补齐 nginx 的 conf.d include 与 WebSocket 升级 map"; return 0; fi
   if [ ! -x "$BIN_DIR/$HELPER_NAME" ]; then
     warn "提权助手不可用，跳过 nginx 环境准备"
     return 0
@@ -975,6 +1228,7 @@ setup_nginx_env() {
 CERT_STATE="none"
 
 setup_cert() {
+  if dry_run; then info "（干跑）将生成/复用 TLS 证书：$DATA_DIR/tls/panel.crt"; return 0; fi
   title "准备 HTTPS 证书"
 
   local mkcert_bin=""
@@ -1061,6 +1315,7 @@ setup_firewall() {
   [ "${ZIZPANEL_SKIP_FIREWALL:-0}" = "1" ] && return 0
   title "处理系统防火墙"
 
+  if dry_run; then info "（干跑）将把面板加入防火墙允许列表（若防火墙开启）"; return 0; fi
   local fw_state
   fw_state="$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null || echo "")"
   if echo "$fw_state" | grep -q "disabled"; then
@@ -1083,6 +1338,7 @@ setup_firewall() {
 # 这一步会发现"进程活着但端口没起来""TLS 证书错误"之类的问题。
 verify_running() {
   title "校验面板是否可访问"
+  if dry_run; then info "（干跑）将轮询 https://127.0.0.1:${PANEL_PORT}/api/v1/health 直到 200"; return 0; fi
   local port="${ZIZPANEL_LISTEN##*:}"
   local url="https://127.0.0.1:${port}/api/v1/health"
   # 诊断日志：探活失败时用户最需要知道"卡在哪一步"，而不是只看到"未就绪"
@@ -1092,7 +1348,20 @@ verify_running() {
   local diag="$LOG_DIR/install-check.log"
   local waited=0
   local st="" code="000" holder=""
+  # 先确保日志目录存在，再往它里面写。
+  # 真机/沙箱都踩过：升级路径下 logs/ 可能还不存在（第一次安装才建），
+  # 于是这里的每一次 `>> "$diag"` 都失败并刷出同一行 `No such file or directory`
+  # （30 秒轮询最多刷 30 行，把真正有用的诊断埋掉）。
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
   : > "$diag" 2>/dev/null || true
+  # 目录都建不出来就把诊断改成"不落盘、只打印"，绝不再反复重试同一条失败命令。
+  local diag_writable=0
+  [ -w "$diag" ] && diag_writable=1
+  # diag_note <文本>：写诊断日志（不可写时静默跳过，不刷屏）
+  diag_note() {
+    [ "$diag_writable" = "1" ] && printf '%s\n' "$1" >> "$diag"
+    return 0
+  }
 
   while [ "$waited" -lt 30 ]; do
     # 必须显式传 --config：安装脚本可能以 root 运行，
@@ -1106,12 +1375,12 @@ verify_running() {
         rm -f "$diag" 2>/dev/null || true
         return 0
       fi
-      echo "[${waited}s] 进程运行中，HTTP 状态码=$code" >> "$diag"
+      diag_note "[${waited}s] 进程运行中，HTTP 状态码=$code"
     else
-      echo "[${waited}s] 进程未运行（${st}）" >> "$diag"
+      diag_note "[${waited}s] 进程未运行（${st}）"
       # 未运行时记录端口占用，便于判断是"没起来"还是"端口被占"
       holder="$(/usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | awk '{print $1" pid "$2}' | tr '\n' ' ')"
-      [ -n "$holder" ] && echo "[${waited}s] 端口 $port 被占用：$holder" >> "$diag"
+      [ -n "$holder" ] && diag_note "[${waited}s] 端口 $port 被占用：$holder"
     fi
     sleep 1
     waited=$((waited + 1))
@@ -1142,13 +1411,28 @@ finish() {
 
   local scheme="https"
   local port="${ZIZPANEL_LISTEN##*:}"
+  # 后缀以面板配置为准（升级时用户填的后缀不会覆盖原有值）
+  local suffix
+  suffix="$(zcfg_get panel_suffix)"
+  [ -n "$suffix" ] || suffix="$PANEL_SUFFIX_INPUT"
 
   printf '\n'
   printf '  %s🦊 ZizPanel 已就绪%s\n\n' "$C_BOLD" "$C_RESET"
-  printf '  远程访问   %s%s://%s:%s%s\n' "$C_GREEN" "$scheme" "$ip" "$port" "$C_RESET"
-  printf '  本机访问   %s%s://127.0.0.1:%s%s\n' "$C_BLUE" "$scheme" "$port" "$C_RESET"
+  if [ -n "$suffix" ]; then
+    printf '  远程访问   %s%s://%s:%s/%s/%s\n' "$C_GREEN" "$scheme" "$ip" "$port" "$suffix" "$C_RESET"
+    printf '  本机访问   %s%s://127.0.0.1:%s/%s/%s\n' "$C_BLUE" "$scheme" "$port" "$suffix" "$C_RESET"
+  else
+    printf '  远程访问   %s%s://%s:%s%s\n' "$C_GREEN" "$scheme" "$ip" "$port" "$C_RESET"
+    printf '  本机访问   %s%s://127.0.0.1:%s%s\n' "$C_BLUE" "$scheme" "$port" "$C_RESET"
+  fi
   printf '\n'
-  printf '  首次打开会进入初始化向导，请设置管理员账号。\n'
+  if [ -n "$ADMIN_USERNAME" ] && [ -n "$suffix" ]; then
+    printf '  管理员账号 %s%s%s（口令是你刚才设置的那个，本脚本不保存、不回显）\n' \
+      "$C_BOLD" "$ADMIN_USERNAME" "$C_RESET"
+    printf '  安全后缀   %s%s%s（忘了就执行 zizpanel status）\n' "$C_BOLD" "$suffix" "$C_RESET"
+  else
+    printf '  首次打开会进入初始化向导，请设置管理员账号。\n'
+  fi
   if [ "$CERT_STATE" = "mkcert-trusted" ]; then
     printf '  %s证书已受系统信任，浏览器不会提示。%s\n' "$C_GREEN" "$C_RESET"
   elif [ "$CERT_STATE" = "mkcert-untrusted" ]; then
@@ -1176,6 +1460,7 @@ finish() {
 # 留着不占空间，却能在新面板出问题时立刻切回去。
 takeover_legacy_panel() {
   title "接管面板入口"
+  if dry_run; then info "（干跑）将接管 nginx 入口 ${PANEL_PATH} 指向面板端口"; return 0; fi
 
   local port="${ZIZPANEL_LISTEN##*:}"
   local vhost_dir
@@ -1264,6 +1549,11 @@ takeover_legacy_panel() {
 
 # --------------------------------------------------------------- 卸载脚本 --
 write_uninstaller() {
+  if dry_run; then
+    info "（干跑）将生成卸载脚本 $ZIZPANEL_ROOT/uninstall.sh"
+    return 0
+  fi
+
   cat > "$ZIZPANEL_ROOT/uninstall.sh" <<'UNINSTALL'
 #!/usr/bin/env bash
 # ZizPanel 卸载脚本（由安装脚本生成）
@@ -1347,6 +1637,740 @@ UNINSTALL
   chmod 0755 "$ZIZPANEL_ROOT/uninstall.sh"
 }
 
+# ============================================================================
+#  交互输入（用户明确要求："充分考虑互动与交互环节"）
+#
+#  四条纪律：
+#   1. **绝不在管道里卡住**：每个 read 都是"能读就读、读不到用默认"。
+#      判据是 zp_input_ok（/dev/tty 可打开 + 没设 ZP_YES + 不是沙箱/干跑），
+#      不是简单的 [ -t 0 ]（curl | bash 时 stdin 是管道，但用户其实有终端）。
+#   2. 环境变量优先：设了就**不问**（脚本化安装必须一次也不阻塞）。
+#   3. 口令永不写进命令行参数、永不落到日志/交互记录：走 stdin（setup --stdin）。
+#   4. 非交互时缺必填项（管理员口令）就**明确报错**，绝不悄悄用一个默认口令。
+# ============================================================================
+
+# ZP_TTY_FD 是交互读入的文件描述符；打不开 /dev/tty 时为空。
+ZP_TTY_FD=""
+if { true >/dev/tty; } 2>/dev/null; then
+  exec 3</dev/tty 2>/dev/null && ZP_TTY_FD=3
+fi
+
+# zp_input_ok：现在能不能问用户。
+#
+# 只取决于"有没有可用的终端"与"用户是否要求不提问"。
+# **不**看沙箱/干跑：干跑也该照常提问（它只是不写系统），
+# 沙箱测试的 stdin 是 /dev/null，问也读不到，会自动走默认值路径。
+zp_input_ok() {
+  [ "$ZIZPANEL_YES" = "1" ] && return 1
+  [ -n "$ZP_TTY_FD" ] || return 1
+  return 0
+}
+
+# zp_random_hex <字节数>：随机十六进制串（优先 /dev/urandom，退回 openssl）。
+# 为什么不用 ${RANDOM}：bash 的 RANDOM 只有 15 位，拼出来的"安全后缀"可枚举。
+zp_random_hex() {
+  local n="${1:-4}" out=""
+  if [ -r /dev/urandom ]; then
+    out="$(LC_ALL=C od -An -tx1 -N "$n" /dev/urandom 2>/dev/null | tr -d ' \n')"
+  fi
+  if [ -z "$out" ] && command -v openssl >/dev/null 2>&1; then
+    out="$(openssl rand -hex "$n" 2>/dev/null || true)"
+  fi
+  [ -n "$out" ] || out="$$$(date +%s)"
+  printf '%s' "$out"
+}
+
+# zp_read <提示> <默认值> <变量名> [是否秘密]
+# 返回 0 = 读到输入（空行也算，取默认值）
+#      1 = 读到 EOF（终端/输入被关闭）
+#      2 = 超时（用户在 180 秒内没有回答）
+#
+# 为什么要把 EOF 与超时分清楚：两者若都当成"取消"，
+# 用户在真终端上敲一个回车就能把安装悄悄取消掉（真发生过）。
+# 分开之后：超时按"接受默认值"处理，EOF 只在**非交互**场景下才终止。
+zp_read() {
+  local prompt="$1" def="$2" __var="$3" secret="${4:-0}" line="" rc=0
+  if [ -n "$def" ]; then
+    printf '%s%s%s %s[%s]%s: ' "$C_BOLD" "$prompt" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET"
+  else
+    printf '%s%s%s: ' "$C_BOLD" "$prompt" "$C_RESET"
+  fi
+  if [ "$secret" = "1" ]; then
+    IFS= read -r -s -t 180 -u "$ZP_TTY_FD" line || rc=$?
+    printf '\n'
+  else
+    IFS= read -r -t 180 -u "$ZP_TTY_FD" line || rc=$?
+  fi
+  if [ "$rc" -gt 128 ]; then
+    return 2
+  elif [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  line="${line%$'\r'}"
+  [ -n "$line" ] || line="$def"
+  printf -v "$__var" '%s' "$line"
+  return 0
+}
+
+# zp_ask <提示> <默认值> <变量名>：默认值可被回车接受；读不到就用默认值。
+# 返回 zp_read 的码，让调用方自己决定"读不到"该怎么办。
+zp_ask() {
+  local prompt="$1" def="$2" __var="$3"
+  zp_read "$prompt" "$def" "$__var" 0
+}
+
+# zp_confirm <提示> <默认 y|n>：返回 0=是，1=否，2=读不到（EOF）。
+# 回车 = 默认；y/Y/yes/是 → 是；不认识的回答按默认（不反复追问，避免卡住）。
+#
+# 读不到（EOF）**不**当成"否"：调用方必须显式处理，
+# 否则真终端上一敲回车就把安装取消了。非交互场景由调用方把 EOF 当"取消"。
+zp_confirm() {
+  local prompt="$1" def="${2:-y}" ans="" rc=0
+  local hint="[Y/n]"
+  [ "$def" = "n" ] && hint="[y/N]"
+  zp_read "$prompt $hint" "" ans 0 || rc=$?
+  ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+  case "$ans" in
+    y|yes|是|1) return 0 ;;
+    n|no|否|0)  return 1 ;;
+    "") [ "$def" = "y" ] && return 0; return 1 ;;
+    *)  [ "$def" = "y" ] && return 0; return 1 ;;
+  esac
+}
+
+# zp_yes <提示> <默认 y|n>：给"确实要问一句"的地方用。
+# EOF（终端被关掉）按默认值处理 —— 交互场景下不该因为读不到就把整件事取消。
+zp_yes() {
+  local rc=0
+  zp_confirm "$1" "${2:-y}" || rc=$?
+  [ "$rc" -eq 0 ]
+}
+
+# zp_normalize_suffix：与 Go 侧 config.NormalizePanelSuffix 同一套规则
+# （去斜杠与空白、只留小写字母数字下划线连字符、最长 32 位）。
+# 放在安装脚本里做，是为了让用户**在装完之前**就知道后缀长什么样。
+zp_normalize_suffix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' \t\r\n/' \
+    | LC_ALL=C tr -cd 'a-z0-9_-' | cut -c1-32
+}
+
+# zp_random_suffix：与 Go 侧 RandomPanelSuffix 同一字符集（去掉 i/l/o/0/1）。
+zp_random_suffix() {
+  local alphabet="abcdefghjkmnpqrstuvwxyz23456789" hex i c out=""
+  hex="$(zp_random_hex 16)"
+  hex="$(printf '%s' "$hex" | tr -cd '0-9a-f')"
+  while [ ${#hex} -lt 16 ]; do hex="${hex}0"; done
+  for i in 0 1 2 3 4 5 6 7; do
+    c=$(( 16#${hex:$((i*2)):2} % 31 ))
+    out="${out}${alphabet:$c:1}"
+  done
+  printf '%s' "$out"
+}
+
+# zp_read_quiet <提示> <变量名>：读口令（不回显），返回 1 = EOF/超时。
+zp_read_quiet() {
+  local prompt="$1" __var="$2"
+  zp_read "$prompt" "" "$__var" 1
+}
+
+# collect_basic_info：语言/确认 → 用户名 → 口令 → 后缀 → 端口。
+collect_basic_info() {
+  title "安装选项"
+
+  if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
+    info "干跑模式：只显示将要做的事，不写系统、不装软件"
+  fi
+
+  if zp_input_ok; then
+    info "接下来会问你几个问题（口令不会回显）。直接回车 = 用方括号里的默认值。"
+    info "想全程不回答：Ctrl-C 后用 ZP_YES=1 重跑。"
+    printf '\n'
+    # 语言/确认：默认中文，回车即继续。"英文"也接受 —— 但这轮只影响确认语，
+    # 不做半套语言切换（半套比不切更容易误导）。
+    local ans=""
+    zp_ask "安装界面语言（回车 = 中文）" "中文" ans
+    case "$ans" in
+      en|EN|En|english|English|英文) warn "本轮仍以中文输出（英文界面尚未提供，已在报告中列为待办）" ;;
+    esac
+    if ! zp_yes "确认在这台机器上安装 ZizPanel？" "y"; then
+      info "已取消，未做任何修改。"
+      exit 0
+    fi
+  fi
+
+  # ---- 管理员用户名 ----
+  local def_user="${REAL_USER:-admin}"
+  [ "$def_user" = "root" ] && def_user="admin"
+  if [ -z "$ADMIN_USERNAME" ]; then
+    if zp_input_ok; then
+      zp_ask "管理员用户名" "$def_user" ADMIN_USERNAME
+    else
+      ADMIN_USERNAME="$def_user"
+    fi
+  fi
+
+  # ---- 登录口令 ----
+  #
+  # 三种来源，按优先级：
+  #   1. ZP_PASS / ZIZPANEL_ADMIN_PASSWORD —— 显式指定（自动化安装用）；
+  #   2. 有终端 → 交互输入两次（不回显）；
+  #   3. 无终端（最常见：curl | sudo bash）→ **自动生成强随机口令**，
+  #      并在安装结果里显著打印一次。
+  # 第 3 条是硬要求：`curl … | sudo bash` 的 stdin 是管道，没有终端可问，
+  # 这时必须"能装成功"，绝不能因为没人回答就报错退出。
+  if [ -z "$ADMIN_PASSWORD" ]; then
+    if zp_input_ok; then
+      local attempt p1 p2
+      for attempt in 1 2 3; do
+        if ! zp_read_quiet "设置登录口令（不回显，至少 8 位）" p1; then
+          die "读取口令失败（终端已关闭）"
+        fi
+        if ! zp_read_quiet "再输入一次确认" p2; then
+          die "读取口令失败（终端已关闭）"
+        fi
+        if [ "$p1" != "$p2" ]; then
+          warn "两次输入不一致，请重来"
+          continue
+        fi
+        ADMIN_PASSWORD="$p1"
+        break
+      done
+      if [ -z "$ADMIN_PASSWORD" ]; then
+        die "三次都没能设置成功，安装已取消（什么都没改）"
+      fi
+    else
+      # 无终端：生成 20 位随机口令（大小写+数字+符号的组合里取十六进制+固定符号）。
+      # 为什么要带符号：面板不限制口令字符集，长随机串已经足够，
+      # 这里只保证"人眼可抄写、能过 8 位门禁"。
+      local rnd1 rnd2
+      rnd1="$(zp_random_hex 10)"
+      rnd2="$(zp_random_hex 10)"
+      ADMIN_PASSWORD="zp-${rnd1}-${rnd2}"
+      ADMIN_PASSWORD_GENERATED=1
+      info "当前没有终端可以询问口令：已自动生成一个随机初始口令，安装完成后会显著打印一次。"
+      info "（想自己指定就用 ZP_PASS='你的口令' 重跑；无终端时问不了人。）"
+    fi
+  fi
+  # 提前校验：口令太短会让面板在**装完之后**才报错，用户得重装一遍。
+  # 这里跟 auth.CreateUser 的规则保持一致（这条长度门禁可在这里挡住）。
+  if [ "${#ADMIN_PASSWORD}" -lt 8 ]; then
+    die "登录口令至少 8 位（当前 ${#ADMIN_PASSWORD} 位）"
+  fi
+
+  # ---- 面板后缀 ----
+  local def_suffix=""
+  if [ -f "$DATA_DIR/config.json" ]; then
+    def_suffix="$(zcfg_get panel_suffix)"
+  fi
+  if [ -z "$PANEL_SUFFIX_INPUT" ]; then
+    if zp_input_ok; then
+      [ -n "$def_suffix" ] || def_suffix="$(zp_random_suffix)"
+      zp_ask "面板路径后缀（安全入口，只允许小写字母/数字/-/_）" "$def_suffix" PANEL_SUFFIX_INPUT
+    else
+      PANEL_SUFFIX_INPUT="$def_suffix"
+    fi
+  fi
+  PANEL_SUFFIX_INPUT="$(zp_normalize_suffix "$PANEL_SUFFIX_INPUT")"
+  if [ -z "$PANEL_SUFFIX_INPUT" ]; then
+    PANEL_SUFFIX_INPUT="$(zp_random_suffix)"
+    warn "后缀为空或含非法字符，已改用随机后缀：$PANEL_SUFFIX_INPUT"
+  fi
+
+  # ---- 监听端口 ----
+  local def_port="${ZIZPANEL_LISTEN##*:}"
+  if zp_input_ok; then
+    local port_ans=""
+    zp_ask "面板监听端口（1-65535）" "$def_port" port_ans
+    case "$port_ans" in
+      ''|*[!0-9]*) warn "端口必须是数字，沿用 $def_port" ;;
+      *)
+        if [ "$port_ans" -ge 1 ] 2>/dev/null && [ "$port_ans" -le 65535 ] 2>/dev/null; then
+          ZIZPANEL_LISTEN=":$port_ans"
+        else
+          warn "端口 $port_ans 超出范围，沿用 $def_port"
+        fi
+        ;;
+    esac
+  fi
+
+  local final_port="${ZIZPANEL_LISTEN##*:}"
+  printf '\n'
+  printf '  %s将要安装：%s\n' "$C_BOLD" "$C_RESET"
+  printf '    管理员用户名   %s\n' "$ADMIN_USERNAME"
+  if [ "$ADMIN_PASSWORD_GENERATED" = "1" ]; then
+    # 自动生成的口令必须让用户看得见（否则他永远登不进去）。
+    # 只在**终端**上打印一次；不写日志、不进 argv、不进任何文件。
+    printf '    初始登录口令   %s%s%s（自动生成，只显示这一次，请立即保存）\n' \
+      "$C_BOLD" "$ADMIN_PASSWORD" "$C_RESET"
+  else
+    printf '    登录口令       %s（不回显、不写日志）\n' "$(printf '%*s' 8 '' | tr ' ' '*')"
+  fi
+  printf '    面板后缀       %s\n' "$PANEL_SUFFIX_INPUT"
+  printf '    监听端口       %s\n' "$final_port"
+  printf '    安装目录       %s\n' "$ZIZPANEL_ROOT"
+  if [ "$(id -u)" -eq 0 ]; then
+    printf '    安装用户       %s\n' "$REAL_USER"
+  fi
+  printf '\n'
+}
+
+# ---------------------------------------------------------- 安装本机判定 --
+# 判据（用户明确要求）：
+#   · 通过 SSH 从别的电脑连过来（SSH_CONNECTION/SSH_CLIENT/SSH_TTY 非空）
+#     → 不要再问"是否开启 SSH"：远程访问本来就通着；
+#   · 在本机直接跑（Terminal.app / iTerm / 系统镜像终端）→ 才问。
+#
+# 为什么要多个信号：`curl | sudo bash` 里 sudo 会重置一部分环境，
+# 单看 SSH_CONNECTION 在某些配置下会漏判。所以再加两条"本机"正向证据：
+#   · TERM_PROGRAM / __CFBundleIdentifier —— macOS 终端 App 才会设；
+#   · 当前用户 == 控制台登录用户（本机图形登录），而 SSH 会话通常是别人。
+is_remote_session() {
+  # 返回 0 = 远程（从别的电脑连过来）
+  [ -n "${SSH_CONNECTION:-}" ] && return 0
+  [ -n "${SSH_CLIENT:-}" ] && return 0
+  [ -n "${SSH_TTY:-}" ] && return 0
+  # 明确的本机终端证据（这些变量只在本机终端 App 里存在）
+  [ -n "${TERM_PROGRAM:-}" ] && return 1
+  [ -n "${TERM_SESSION_ID:-}" ] && return 1
+  [ -n "${__CFBundleIdentifier:-}" ] && return 1
+  # 兜底：谁登录在控制台（物理/图形控制台）。当前用户就是它 → 本机操作。
+  local console_user=""
+  console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo "")"
+  if [ -n "$console_user" ] && [ "$console_user" != "root" ] && [ "$console_user" = "${REAL_USER:-}" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------- 是否开启 SSH --
+setup_ssh_choice() {
+  title "远程访问（SSH）"
+
+  local tool="$ZIZPANEL_ROOT/server-mode.sh"
+  if [ ! -x "$tool" ]; then
+    local src_tool="$SCRIPT_DIR/tools/server-mode.sh"
+    [ -x "$src_tool" ] && tool="$src_tool"
+  fi
+
+  if [ -z "$ZIZPANEL_SSH" ]; then
+    if is_remote_session; then
+      info "检测到你是通过 SSH 从别的电脑连过来的：远程访问已经可用，不再询问是否开启 SSH。"
+      return 0
+    fi
+    if ! zp_input_ok; then
+      info "非交互模式：不开启 SSH（需要时用 --ssh 或 ZP_SSH=1，或面板「系统设置 → 远程登录」）"
+      return 0
+    fi
+    printf '\n'
+    info "你是在这台机器上直接安装。开启「远程登录（SSH）」后，可以从别的电脑 ssh 连上来运维。"
+    if zp_yes "现在开启 SSH（远程登录）？" "y"; then
+      ZIZPANEL_SSH=1
+    else
+      ZIZPANEL_SSH=0
+    fi
+  fi
+
+  case "$ZIZPANEL_SSH" in
+    1|on|yes) ;;
+    0|off|no) info "已按你的选择不开启 SSH（以后可在面板「系统设置 → 远程登录」或重跑本脚本时开启）"; return 0 ;;
+    *) warn "无法识别的 ZP_SSH/ZIZPANEL_SSH 值：${ZIZPANEL_SSH}（按不开启处理）"; return 0 ;;
+  esac
+
+  if [ ! -x "$tool" ]; then
+    warn "找不到 server-mode.sh，无法自动开启 SSH"
+    warn "请在 系统设置 → 通用 → 共享 → 远程登录 手工打开"
+    return 0
+  fi
+
+  info "开启 SSH（复用 tools/server-mode.sh --ssh-only，只动 SSH，不改电源/更新设置）…"
+  if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
+    info "（干跑）将执行：sudo bash $tool --ssh-only"
+    return 0
+  fi
+  if bash "$tool" --ssh-only; then
+    ok "SSH 已开启（22 端口正在监听）"
+  else
+    warn "SSH 自动开启失败。请在 系统设置 → 通用 → 共享 → 远程登录 手工打开"
+  fi
+  return 0
+}
+
+# ============================================================================
+#  配置预写（面板后缀 / 监听端口）
+#
+#  为什么安装脚本要自己写 config.json：面板的 config.Bootstrap 会在首次启动时
+#  随机生成后缀 —— 那样用户在安装时填的后缀就白填了，而且没人知道随机值是什么。
+#  这里先把最小配置写好（只覆盖后缀与监听），其余字段（secret/install_id/
+#  各类路径）仍然由面板启动时的 Bootstrap 补齐，绝不与它打架。
+#  已有配置 = 升级/重装：**原样保留**，一个字都不覆盖。
+# ============================================================================
+
+# zcfg_get <键>：从已有配置里取一个字符串字段（不引入 jq/python 依赖）。
+#
+# 模式里**不**给键名套双引号（写成 ["]\{0,1\} 形式太脆）—— 直接匹配键名即可：
+# 键名不会出现在别处（例如 mirror_base 与 "mirror_base" 只差引号，都匹配得到）。
+# 历史坑：写成 "s/.*"$1"[[:space:]]..." 时，$1 前后的双引号会把整段引号串切断，
+# 后面的 \( 变成未加引号的分组括号，bash 直接报语法错误（整脚本跑不起来）。
+zcfg_get() {
+  [ -f "$DATA_DIR/config.json" ] || return 0
+  sed -n "s/.*$1[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$DATA_DIR/config.json" 2>/dev/null | head -1
+}
+
+# zp_json_escape：把 shell 字符串转义成 JSON 字符串字面量（含首尾引号）。
+# 用 python3 转义一次是刻意的：口令里可能有引号或反斜杠，手写转义迟早出错。
+# python3 由 Command Line Tools 提供（Homebrew 安装的前置），这里一定可用；
+# 万一不可用就退回一个"老实的"转义（先反斜杠、再双引号）。
+zp_json_escape() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))' <<<"$1"
+    return 0
+  fi
+  local s="$1"
+  # shellcheck disable=SC1003
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# write_raw_config：把"安装时确定的最小配置"写进 config.json。
+# 用 python3 生成合法 JSON（手写字符串拼接在口令含引号时会写出坏 JSON，
+# 而坏 JSON 的后果是面板起不来）；没有 python3 时退回 sed 精确注入。
+write_raw_config() {
+  if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
+    info "（干跑）将写入 $DATA_DIR/config.json：panel_suffix=${PANEL_SUFFIX_INPUT} listen=${ZIZPANEL_LISTEN} upgrade_source=${PANEL_UPGRADE_SOURCE:-<未探测到可用源>}"
+    return 0
+  fi
+  if [ -f "$DATA_DIR/config.json" ]; then
+    local have
+    have="$(zcfg_get panel_suffix)"
+    [ -n "$have" ] && ok "已保留原有面板后缀（${have}）与配置（升级模式）"
+    return 0
+  fi
+
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+
+  # 四个字段：面板后缀、监听、镜像基址、在线升级源。
+  # 升级源为空串也照写（空 = 面板里没配升级源，界面会让用户自己填）；
+  # 关键是**不写错** —— 写一个探不通的地址会让用户在升级页看到莫名其妙的失败。
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$DATA_DIR/config.json" "$PANEL_SUFFIX_INPUT" "$ZIZPANEL_LISTEN" \
+        "$DEFAULT_MIRROR_BASE" "$PANEL_UPGRADE_SOURCE" <<'CONFIG_PYEOF'
+import json, os, sys
+path, suffix, listen, mirror_base, upgrade_source = sys.argv[1:6]
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        cfg = {}
+cfg["panel_suffix"] = suffix
+cfg["listen"] = listen
+cfg["mirror_base"] = mirror_base
+cfg["upgrade_source"] = upgrade_source
+tmp = path + ".install.tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+CONFIG_PYEOF
+    then
+      [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && chown "${REAL_USER}:staff" "$DATA_DIR/config.json" 2>/dev/null
+      ok "已写入面板后缀、监听端口、镜像基址与升级源：$DATA_DIR/config.json"
+      return 0
+    fi
+    warn "python3 写配置失败，退回 sed 注入"
+  fi
+
+  # 兜底：sed 精确替换（只碰这四个键，不动其它字段）。
+  # 注意：模式里**不给键名套双引号** —— 键名已足够唯一，套引号会把整段
+  # 引号串切断（历史坑：\( 变成未加引号的分组括号，bash 直接语法错误）。
+  local sed_inplace=(-i "")
+  sed --version >/dev/null 2>&1 && sed_inplace=(-i)
+  if [ ! -f "$DATA_DIR/config.json" ]; then
+    printf '{\n  "panel_suffix": "%s",\n  "listen": "%s",\n  "mirror_base": "%s",\n  "upgrade_source": "%s"\n}\n' \
+      "$PANEL_SUFFIX_INPUT" "$ZIZPANEL_LISTEN" "$DEFAULT_MIRROR_BASE" "$PANEL_UPGRADE_SOURCE" \
+      > "$DATA_DIR/config.json"
+  else
+    sed "${sed_inplace[@]}" \
+      -e "s|panel_suffix\([[:space:]]*:[[:space:]]*\)\"[^\"]*\"|panel_suffix\1\"$PANEL_SUFFIX_INPUT\"|" \
+      -e "s|listen\([[:space:]]*:[[:space:]]*\)\"[^\"]*\"|listen\1\"$ZIZPANEL_LISTEN\"|" \
+      -e "s|mirror_base\([[:space:]]*:[[:space:]]*\)\"[^\"]*\"|mirror_base\1\"$DEFAULT_MIRROR_BASE\"|" \
+      "$DATA_DIR/config.json"
+    if grep -q 'upgrade_source' "$DATA_DIR/config.json" 2>/dev/null; then
+      sed "${sed_inplace[@]}" \
+        -e "s|upgrade_source\([[:space:]]*:[[:space:]]*\)\"[^\"]*\"|upgrade_source\1\"$PANEL_UPGRADE_SOURCE\"|" \
+        "$DATA_DIR/config.json"
+    else
+      # 补一行：插在 listen 那一行之后（没有 listen 就不插，避免写出坏 JSON）
+      sed "${sed_inplace[@]}" \
+        -e "/listen\([[:space:]]*:[[:space:]]*\)\"[^\"]*\",/a\\
+  \"upgrade_source\": \"$PANEL_UPGRADE_SOURCE\",
+" "$DATA_DIR/config.json"
+    fi
+  fi
+  chmod 0600 "$DATA_DIR/config.json" 2>/dev/null || true
+  [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && chown "${REAL_USER}:staff" "$DATA_DIR/config.json" 2>/dev/null
+  ok "已写入面板后缀、监听端口、镜像基址与升级源（sed 兜底路径）"
+  return 0
+}
+
+# ============================================================================
+#  管理员账号（用面板**已有的** POST /api/v1/setup 接口创建）
+#
+#  注意：这一步不在安装脚本里另建账号表 —— 只调用面板自己的初始化接口，
+#  口令通过 stdin 传给 `zizpanel setup --stdin`（不出现在 argv、不进 ps 输出）。
+#  已有账号（升级/重装）时**绝不覆盖**：那是用户的数据。
+# ============================================================================
+create_admin_account() {
+  title "创建管理员账号"
+  if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
+    info "（干跑）将创建管理员账号：$ADMIN_USERNAME"
+    return 0
+  fi
+
+  local base="https://127.0.0.1:${PANEL_PORT}" st
+  st="$(curl -fsSk --max-time 8 "$base/api/v1/setup/status" 2>/dev/null || true)"
+  case "$st" in
+    *'"needs_setup":false'*)
+      ok "面板已有管理员账号，保持原样（升级模式，不覆盖账号与数据）"
+      return 0
+      ;;
+    *'"needs_setup":true'*)
+      ;;
+    *)
+      warn "读不到初始化状态（${st:-无响应}），跳过账号创建"
+      warn "请用浏览器打开面板，在首次初始化向导里创建管理员账号。"
+      return 0
+      ;;
+  esac
+
+  if [ -z "$ADMIN_USERNAME" ] || [ -z "$ADMIN_PASSWORD" ]; then
+    warn "没有可用的管理员用户名/口令，跳过；请用浏览器首次初始化向导创建账号"
+    return 0
+  fi
+
+  # 口令放进 JSON 请求体（走 stdin 交给 curl），**不放 argv** ——
+  # argv 会出现在 ps 输出与审计里。
+  local jar="$TMP_DIR/setup-cookies.txt" out=""
+  if out="$(printf '{"username":%s,"password":%s}' \
+        "$(zp_json_escape "$ADMIN_USERNAME")" "$(zp_json_escape "$ADMIN_PASSWORD")" \
+      | curl -fsSk --max-time 20 -c "$jar" -o - \
+        -X POST -H 'Content-Type: application/json' --data-binary @- \
+        "$base/api/v1/setup" 2>&1)"; then
+    ok "管理员账号已创建：$ADMIN_USERNAME"
+    return 0
+  fi
+  warn "创建管理员账号失败：$(printf '%s' "$out" | head -c 300)"
+  warn "不改任何东西，请用浏览器打开面板，在首次初始化向导里创建账号。"
+  return 0
+}
+
+# ============================================================================
+#  「允许免授权访问内网段」（安装完成后的可选动作）
+#
+#  背景见 internal/sysconfig/lan_preauth.go（坑 #114/#115，两台机器真机验证）：
+#  macOS 15 的「本地网络」隐私门会拦 nginx 的局域网反代；官方另有一扇可编程
+#  预授权门（com.apple.network.local-network 域的两个键）。面板「系统设置」里
+#  已经有这个开关，本脚本只是把同一件事搬到安装收尾，并**优先调用面板的
+#  HTTP 接口**（POST /api/v1/system/settings/lan-preauth，与界面同一条代码路径）。
+# ============================================================================
+
+# 三件事必须**逐字**说清（用户原话的第 3 条）。
+# 抽成一个函数是刻意的：选"是"与选"否"两条分支都要说到，
+# 分成两处手写，迟早有一处漏一句。
+lan_preauth_notice() {
+  printf '\n'
+  printf '  %s关于「允许免授权访问内网段」，请先看清三件事：%s\n' "$C_BOLD" "$C_RESET"
+  printf '    ① 这个改动%s需要重启电脑才生效%s（重启前一切照旧）。\n' "$C_BOLD" "$C_RESET"
+  printf '    ② %s不必现在重启%s——面板的 %sPlan B（回环转发器）%s已经能让局域网反代正常工作，\n' \
+    "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+  printf '       重启可以等你方便的时候再做。\n'
+  printf '    ③ 你以后也能在%s面板「系统设置」里手动打开%s这个选项。\n' "$C_BOLD" "$C_RESET"
+  printf '\n'
+}
+
+# 调面板接口写预授权。成功（HTTP 2xx）返回 0 并把响应体写进 LAN_API_OUT。
+# 面板侧的实现见 internal/web/api_systemsettings_lan.go（与界面同一条路径）。
+LAN_API_OUT=""
+lan_preauth_api_apply() {
+  local cidrs="$1" jar="$TMP_DIR/lan-cookies.txt" token body
+  rm -f "$jar"
+  # 1) 登录拿会话（口令走 stdin 的 JSON，不放 argv）
+  if ! curl -fsSk --max-time 10 -c "$jar" -o /dev/null \
+      -X POST -H 'Content-Type: application/json' \
+      --data-binary "$(printf '{"username":%s,"password":%s}' \
+        "$(zp_json_escape "$ADMIN_USERNAME")" "$(zp_json_escape "$ADMIN_PASSWORD")")" \
+      "https://127.0.0.1:${PANEL_PORT}/api/v1/login" 2>/dev/null; then
+    return 1
+  fi
+  # 2) CSRF 双提交：从 cookie jar 里取 zp_csrf，放进 X-CSRF-Token 头
+  token="$(awk '$6=="zp_csrf"{print $7}' "$jar" 2>/dev/null | tail -1)"
+  [ -n "$token" ] || return 1
+  # 3) 写入
+  body="$(printf '{"enabled":true,"cidrs":%s}' "$(zp_json_escape "$cidrs")")"
+  if LAN_API_OUT="$(curl -fsSk --max-time 20 -b "$jar" -o - \
+      -X POST -H 'Content-Type: application/json' \
+      -H "X-CSRF-Token: $token" \
+      --data-binary "$body" \
+      "https://127.0.0.1:${PANEL_PORT}/api/v1/system/settings/lan-preauth" 2>/dev/null)"; then
+    return 0
+  fi
+  return 1
+}
+
+# 自动探测本机局域网网段（与 Go 侧 DetectPrimaryCIDR 同一思路：物理 en* 优先，
+# 只用 ipaddress 做"网络地址归一"这一步 —— 手写位运算在 shell 里容易错）。
+lan_detect_cidr() {
+  local out iface ip mask cidr
+  command -v python3 >/dev/null 2>&1 || return 1
+  if [ -x /sbin/ifconfig ]; then
+    for iface in $(/sbin/ifconfig -l 2>/dev/null); do
+      case "$iface" in lo*|utun*|awdl*|llw*|bridge*|ap*|anpi*|gif*|stf*|vmenet*|p2p*) continue ;; esac
+      out="$(/sbin/ifconfig "$iface" 2>/dev/null || true)"
+      ip="$(printf '%s\n' "$out" | awk '/inet /{print $2; exit}')"
+      [ -n "$ip" ] || continue
+      case "$ip" in 127.*) continue ;; esac
+      mask="$(printf '%s\n' "$out" | awk '/inet /{for(i=1;i<=NF;i++) if($i=="netmask") print $(i+1); exit}')"
+      [ -n "$mask" ] || continue
+      # 0xffffff00 → 255.255.255.0（Apple 默认十六进制），也支持点分十进制
+      case "$mask" in
+        0x*)
+          local hex="${mask#0x}"
+          while [ ${#hex} -lt 8 ]; do hex="0${hex}"; done
+          mask="$(printf '%d.%d.%d.%d' \
+            "$(( 16#${hex:0:2} ))" "$(( 16#${hex:2:2} ))" \
+            "$(( 16#${hex:4:2} ))" "$(( 16#${hex:6:2} ))")"
+          ;;
+      esac
+      cidr="$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))' \
+        "$ip/$mask" 2>/dev/null || true)"
+      [ -n "$cidr" ] && { printf '%s' "$cidr"; return 0; }
+    done
+  fi
+  return 1
+}
+
+# 校验/规范化 CIDR 列表（逗号或空格分隔），输出规范化后的列表。
+lan_normalize_cidrs() {
+  local raw="$1"
+  printf '%s' "$raw" | tr ',;' '  ' | tr -s ' \t' ' ' | sed 's/^ //; s/ $//'
+}
+
+# readback：写完必须读回来核对（与 Go 侧 ApplyLANPreauth 同一条纪律：
+# 读不回来 / 对不上就不许说"成功"）。
+lan_readback_ok() {
+  local want="$1" sysplist="/Library/Preferences/com.apple.network.local-network"
+  local user_plist="$REAL_HOME/Library/Preferences/com.apple.network.local-network"
+  local sys_out="" user_out=""
+  [ "$ZIZPANEL_DRY_RUN" = "1" ] && return 0
+  sys_out="$(defaults read "$sysplist" AllowedEthernetLocalNetworkAddresses 2>/dev/null || true)"
+  user_out="$(sudo -n -u "$REAL_USER" defaults read "$user_plist" AllowedEthernetLocalNetworkAddresses 2>/dev/null || true)"
+  case "$sys_out" in *"$want"*) ;; *) return 1 ;; esac
+  case "$user_out" in *"$want"*) ;; *) return 1 ;; esac
+  return 0
+}
+
+# 非 API 兜底：直接按 Apple TN3179 写 defaults（与 lan_preauth.go 的
+# lanTargets/lanCommand 同一份命令形状：系统域用显式 plist 路径，用户域降权写）。
+lan_preauth_defaults() {
+  local cidrs="$1" sysplist="/Library/Preferences/com.apple.network.local-network"
+  local user_plist="$REAL_HOME/Library/Preferences/com.apple.network.local-network"
+  local c
+  for c in $cidrs; do
+    if ! defaults write "$sysplist" AllowedEthernetLocalNetworkAddresses -array $cidrs 2>/dev/null; then
+      return 1
+    fi
+    if ! defaults write "$sysplist" AllowedWiFiLocalNetworkAddresses -array $cidrs 2>/dev/null; then
+      return 1
+    fi
+    if ! sudo -n -u "$REAL_USER" defaults write "$user_plist" AllowedEthernetLocalNetworkAddresses -array $cidrs 2>/dev/null; then
+      return 1
+    fi
+    if ! sudo -n -u "$REAL_USER" defaults write "$user_plist" AllowedWiFiLocalNetworkAddresses -array $cidrs 2>/dev/null; then
+      return 1
+    fi
+    break  # 四个键一次写完整份列表，不需要按每个 CIDR 重复
+  done
+  return 0
+}
+
+# 安装收尾询问 + 应用。
+prompt_lan_preauth() {
+  title "局域网访问（可选）"
+
+  local decided="$ZIZPANEL_LAN_PREAUTH"
+  if [ -z "$decided" ]; then
+    if zp_input_ok; then
+      printf '\n'
+      info "macOS 的「本地网络」隐私门会拦局域网反代（无头机器上没人点弹窗，表现为 502）。"
+      info "面板里有一个可选开关：「允许免授权访问内网段」——写一条官方预授权，重启后生效。"
+      if zp_yes "现在开启「允许免授权访问内网段」？" "n"; then
+        decided="1"
+      else
+        decided="0"
+      fi
+    else
+      decided="0"
+    fi
+  fi
+
+  if [ "$decided" != "1" ] && [ "$decided" != "true" ] && [ "$decided" != "yes" ]; then
+    lan_preauth_notice
+    info "没有开启（保持默认关闭）。以后可以随时在面板「系统设置」里手动打开。"
+    return 0
+  fi
+
+  # 选"是"：先把三件事说清楚（用户明确要求），再动手
+  lan_preauth_notice
+
+  local cidrs="$LAN_CIDR_INPUT"
+  if [ -z "$cidrs" ]; then
+    cidrs="$(lan_detect_cidr || true)"
+  fi
+  if [ -z "$cidrs" ] && zp_input_ok; then
+    zp_ask "请填写要免授权的网段（CIDR）" "192.168.1.0/24" cidrs
+  fi
+  cidrs="$(lan_normalize_cidrs "$cidrs")"
+  if [ -z "$cidrs" ]; then
+    warn "没能自动探测出局域网段，也没有可用的输入。"
+    warn "请在面板「系统设置 → 局域网访问」里手工填写网段后打开（同样需要重启才生效）。"
+    return 0
+  fi
+  info "要免授权的网段：$cidrs"
+
+  if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
+    info "（干跑）将调用面板接口 POST /api/v1/system/settings/lan-preauth（enabled=true, cidrs=${cidrs}）"
+    info "（干跑）接口不可用时改用：defaults write /Library/Preferences/com.apple.network.local-network …"
+    return 0
+  fi
+
+  # 1) 优先走面板**已有的**接口（与界面同一条代码路径）
+  if lan_preauth_api_apply "$cidrs"; then
+    ok "已通过面板接口写入预授权（$(printf '%s' "$LAN_API_OUT" | head -c 200)…）"
+    if lan_readback_ok "${cidrs%%,*}"; then
+      ok "读回复核通过：系统域与用户域都已写入"
+    else
+      warn "接口返回成功，但 defaults 读回复核没通过 —— 请以面板「系统设置」里的状态为准"
+    fi
+  else
+    warn "面板接口不可用（可能还没起来或未登录），改用脚本内 defaults 直接写入"
+    if lan_preauth_defaults "$cidrs" && lan_readback_ok "${cidrs%%,*}"; then
+      ok "已写入预授权（系统域 + 用户域），读回复核通过"
+    else
+      warn "写入或复核失败。请在面板「系统设置 → 局域网访问」里手工打开（会显示真实状态与错误）"
+      return 0
+    fi
+  fi
+
+  printf '\n'
+  printf '  %s请记住：这个改动要重启电脑才生效，但不急 —— Plan B 已经在工作。%s\n' "$C_BOLD" "$C_RESET"
+  printf '  想马上生效就重启；不方便就先这样，有空再重启。\n'
+  printf '\n'
+  return 0
+}
+
 # --------------------------------------------------------------- 参数解析 --
 # 支持 --server-mode 等参数，也支持环境变量（便于 curl | bash 场景）
 parse_args() {
@@ -1361,9 +2385,45 @@ parse_args() {
       --no-server-mode)
         ZIZPANEL_SERVER_MODE=0
         ;;
-      --listen)
+      --listen|--port)
         shift
         ZIZPANEL_LISTEN="${1:-:8443}"
+        ;;
+      --user)
+        shift
+        ADMIN_USERNAME="${1:-}"
+        [ -n "$ADMIN_USERNAME" ] || die "--user 后面要跟管理员用户名"
+        ;;
+      --password)
+        # 注意：命令行参数会出现在 ps 输出与 shell 历史里。
+        # 保留它是为了自动化安装（沙箱/真机回归），人工安装请用交互输入或 ZP_PASS。
+        shift
+        ADMIN_PASSWORD="${1:-}"
+        [ -n "$ADMIN_PASSWORD" ] || die "--password 后面要跟登录口令"
+        warn "在命令行上传口令会被 ps 与 shell 历史看到，自动化之外建议交互输入"
+        ;;
+      --suffix)
+        shift
+        PANEL_SUFFIX_INPUT="${1:-}"
+        [ -n "$PANEL_SUFFIX_INPUT" ] || die "--suffix 后面要跟面板后缀"
+        ;;
+      --ssh)
+        ZIZPANEL_SSH=1
+        ;;
+      --no-ssh)
+        ZIZPANEL_SSH=0
+        ;;
+      --lan-preauth)
+        ZIZPANEL_LAN_PREAUTH=1
+        ;;
+      --no-lan-preauth)
+        ZIZPANEL_LAN_PREAUTH=0
+        ;;
+      --yes|-y)
+        ZIZPANEL_YES=1
+        ;;
+      --dry-run)
+        ZIZPANEL_DRY_RUN=1
         ;;
       --download-base|--mirror)
         # 国内直连 GitHub Releases 经常很慢甚至不通，所以升级/安装都要能指向自建镜像。
@@ -1376,7 +2436,7 @@ parse_args() {
         ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE%/}"
         ;;
       -h|--help)
-        sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
       *)
@@ -1412,11 +2472,12 @@ setup_server_mode() {
     fi
   fi
 
-  # 服务器模式默认会开启 SSH。若不想开，设 ZIZPANEL_NO_SSH=1。
+  # 服务器模式默认会开启 SSH。若不想开，设 ZIZPANEL_NO_SSH=1，
+  # 或者在交互里对"是否开启 SSH"回答 n（那会把 ZIZPANEL_SSH=0）。
   # 之所以做成显式开关：开 SSH 会改变这台机器的网络暴露面，
   # 这种事必须让用户能拒绝，而不是替他决定。
   local ssh_args=()
-  if [ "${ZIZPANEL_NO_SSH:-0}" = "1" ]; then
+  if [ "${ZIZPANEL_NO_SSH:-0}" = "1" ] || [ "$ZIZPANEL_SSH" = "0" ]; then
     ssh_args+=(--no-ssh)
   fi
   bash "$tool" "${ssh_args[@]+"${ssh_args[@]}"}" \
@@ -1434,8 +2495,33 @@ main() {
   require_root
   check_macos
   resolve_real_user
+  PANEL_PORT="$(panel_port)"
+
+  # ---- 先问清楚（口径：环境变量 > 交互 > 默认值） ----
+  # 放在最前面：用户还没等太久就拿到反馈，且口令/后缀有问题时不会白装一半。
+  collect_basic_info
+
+  # 在线升级源的探测放在最前面：它只做几次 HEAD 请求，很快，
+  # 而且结果要写进 config.json（write_raw_config 会用它）。
+  title "面板在线升级源"
+  upgrade_source_note
+
+  # 选定安装来源（本地 dist / 镜像下载 / 源码构建）。
+  # **必须在 dry_run 判断之外**：干跑也要看到它会选哪条路，
+  # 真正安装更是全靠这一步。曾经误放进 dry_run 块里，导致真实安装
+  # 时 SOURCE_KIND 为空、SOURCE_BIN 为空，最后报出
+  # `install: : No such file or directory`（排障时极难看出根因）。
   detect_source
-  install_deps
+
+  if dry_run; then
+    # 干跑必须**把整条计划走完**（不是只打印几行就返回）：
+    # SSH 提问与「免授权访问内网段」提示都是用户明确要求的分支，
+    # 干跑的意义就是能在不碰系统的前提下把它们演练一遍。
+    title "干跑：将要执行的动作"
+    info "下载源候选（公网 zizdog.com 优先）：${ZIZPANEL_DOWNLOAD_BASE:+$ZIZPANEL_DOWNLOAD_BASE → }$BUILTIN_MIRROR → ${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR} → $GITHUB_RELEASE_BASE"
+    info "镜像基址：${DEFAULT_MIRROR_BASE}（brew/CLT/应用包都挂它下面；公网优先，NAS 只作回落加速）"
+    install_deps
+  fi
 
   case "$SOURCE_KIND" in
     local)    info "安装方式：本地二进制（离线）" ;;
@@ -1443,7 +2529,25 @@ main() {
     build)    build_from_source ;;
   esac
 
+  # 把后缀与监听端口先写进配置：面板启动时就不会再随机一个后缀出来，
+  # 用户填的东西才会真的生效（已有配置一律保留，见 write_raw_config）。
+  write_raw_config
+
   install_binaries
+
+  # 补齐配置：预写的那份只有 4 个键，其余默认值（www_root / access_mode 等）
+  # 只在 Go 侧定义。这里调**刚装好的**面板二进制把它补齐并落盘，避免磁盘上
+  # 出现"看起来缺一大半"的配置（也避免安装脚本里手抄一份默认值）。
+  # 老二进制没有这个子命令时如实说明，绝不假装补齐了。
+  if ! dry_run; then
+    if "$BIN_DIR/zizpanel" reconcile-config --config "$DATA_DIR/config.json" >/dev/null 2>&1; then
+      info "配置字段已补齐：$DATA_DIR/config.json"
+    else
+      warn "本版本面板二进制不支持 reconcile-config，其余字段将在首次启动时于内存中补默认值"
+      warn "（磁盘上暂时只有安装脚本写入的字段；升级到含该子命令的版本后会自动补齐）"
+    fi
+  fi
+
   install_sudoers
   install_daemon
   setup_nginx_env
@@ -1451,10 +2555,17 @@ main() {
   setup_firewall
   takeover_legacy_panel
   setup_server_mode
+  # 本机直接安装才问 SSH（远程 SSH 连过来时问它是多余的，见 is_remote_session）
+  setup_ssh_choice
   write_uninstaller
 
   verify_running
+  # 面板起来之后再建账号：走面板自己的初始化接口，不另建一套账号表
+  create_admin_account
+  # 安装收尾的可选动作：免授权访问内网段（选"是"才写入，且必须说清要重启）
+  prompt_lan_preauth
   finish
+  return 0
 }
 
 main "$@"

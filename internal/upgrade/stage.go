@@ -96,8 +96,11 @@ func IsPlainHTTPToPublicHost(raw string) bool {
 	return true
 }
 
-// FetchManifest 下载并**验签**清单。这是信任链的起点。
-func FetchManifest(ctx context.Context, baseURL string) (*Manifest, []byte, error) {
+// FetchManifestRaw 下载清单与签名原文，但**不做验签/解析**。
+//
+// 把"下载"与"验签"拆成两步，是为了让多候选回落（FetchManifestAny）在每次
+// 候选下载后统一走同一份验签实现，而不是让下载函数各自决定信不信。
+func FetchManifestRaw(ctx context.Context, baseURL string) ([]byte, []byte, error) {
 	src := Source{BaseURL: baseURL}
 	base, err := src.Normalize()
 	if err != nil {
@@ -119,7 +122,15 @@ func FetchManifest(ctx context.Context, baseURL string) (*Manifest, []byte, erro
 	if err != nil {
 		return nil, nil, fmt.Errorf("下载清单签名失败: %w", err)
 	}
+	return data, sig, nil
+}
 
+// FetchManifest 下载并**验签**清单。这是信任链的起点。
+func FetchManifest(ctx context.Context, baseURL string) (*Manifest, []byte, error) {
+	data, sig, err := FetchManifestRaw(ctx, baseURL)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := VerifyManifest(data, sig); err != nil {
 		return nil, nil, err
 	}

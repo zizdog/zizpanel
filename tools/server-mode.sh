@@ -22,6 +22,8 @@
 #    --keep-security      保留 macOS 安全响应自动更新（推荐，默认行为）
 #    --no-spotlight       同时关闭系统卷的 Spotlight 索引
 #    --no-ssh             不开启「远程登录（SSH）」（默认会开启）
+#    --ssh-only           只处理 SSH，不碰电源/更新/Spotlight 设置
+#                         （install.sh 的"本机安装是否开 SSH"用它，避免顺手改用户的电源策略）
 #    --with-tailscale     顺带安装 Tailscale（远程访问用，需联网）
 #    --help               显示帮助
 # =============================================================================
@@ -32,6 +34,10 @@ KEEP_SECURITY=1
 NO_SPOTLIGHT=0
 WITH_TAILSCALE=0
 ENABLE_SSH=1
+# SSH_ONLY=1 时只做"开启 SSH"这一件事。
+# 为什么需要它：install.sh 会在本机安装时单独问一句"要不要开 SSH"，
+# 那时用户只答应了开 SSH，**没有**答应关睡眠/禁自动更新 —— 不能顺手改。
+SSH_ONLY=0
 # SSH 的最终结果：ok / failed / skipped / dry-run。
 # 汇总必须读它，不能只看"--no-ssh 没传"，否则失败时汇总会谎报成功。
 SSH_RESULT=""
@@ -51,7 +57,8 @@ while [ $# -gt 0 ]; do
     --no-spotlight)   NO_SPOTLIGHT=1; shift ;;
     --with-tailscale) WITH_TAILSCALE=1; shift ;;
     --no-ssh)         ENABLE_SSH=0; shift ;;
-    -h|--help)        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --ssh-only)       SSH_ONLY=1; shift ;;
+    -h|--help)        sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
@@ -106,7 +113,13 @@ printf '%s│   Mac 服务器模式配置                          │%s\n' "$C_
 printf '%s│   目标：长期无人值守稳定运行                   │%s\n' "$C_BOLD" "$C_RESET"
 printf '%s╰──────────────────────────────────────────────╯%s\n' "$C_BOLD" "$C_RESET"
 [ "$DRY_RUN" = "1" ] && warn "这是 dry-run，不会做任何修改"
+[ "$SSH_ONLY" = "1" ] && info "只处理 SSH（--ssh-only）：电源/更新/Spotlight 设置一律不动"
 
+# ---------------------------------------------------------------------------
+# 第 1–4 步（睡眠/自动更新/崩溃报告/Spotlight）在 --ssh-only 时整段跳过。
+# 这是 install.sh"本机安装是否开 SSH"那个提问的落地方式：用户只答应了开 SSH。
+# ---------------------------------------------------------------------------
+if [ "$SSH_ONLY" != "1" ]; then
 # ---------------------------------------------------------------------------
 title "1/5 关闭睡眠（服务器睡眠等于服务离线）"
 # ---------------------------------------------------------------------------
@@ -188,6 +201,7 @@ else
   info "但关闭后系统设置里的搜索与邮件搜索也会失效。"
   info "如果这台机器只当服务器用，建议加 --no-spotlight 关闭。"
 fi
+fi  # SSH_ONLY != 1 的块结束
 
 # ---------------------------------------------------------------------------
 title "5/5 远程访问（SSH / Tailscale）"

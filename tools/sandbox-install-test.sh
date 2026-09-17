@@ -20,6 +20,36 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 固定沙箱路径（不用 mktemp）：出问题时可以事后直接进目录查看现场。
 # 每次运行前清空，避免上一次的残留影响结果。
 SANDBOX="${ZIZPANEL_SANDBOX_DIR:-/tmp/zizpanel-sandbox-test}"
+
+# ---------------------------------------------------------------- 互斥锁 --
+# 为什么必须有：两个 sandbox-install-test 同时跑（例如 `make check` 与单独一次
+# `make install-test` 撞在一起）会共用同一个沙箱目录与 18444 端口，互相把对方的
+# 文件删掉、把端口抢走。结果是**幻影失败**：报"升级清掉了用户数据""卸载脚本不存在"，
+# 而代码其实没问题 —— 2026-09-17 真的为此误判过一次，两边各看到不同的失败项
+# （7 项 / 3 项 / 5 项），追了很久。
+# 锁用 mkdir（原子操作）；拿不到锁就**明确报错退出**，不给出一份不可信的结论。
+LOCK_DIR="$SANDBOX.lock"
+take_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+  fi
+  local other=""
+  other="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '')"
+  if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+    printf '%s\n' "${C_RED:-}✗ 另一次沙箱安装测试正在运行（pid ${other}），共用沙箱 $SANDBOX 会互相踩踏。${C_RESET:-}"
+    printf '%s\n' "  等它结束，或用独立沙箱：ZIZPANEL_SANDBOX_DIR=/tmp/zp-\$\$ make install-test"
+    exit 2
+  fi
+  # 残留锁（进程已不在）：清掉重试一次
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || { echo "无法获取沙箱锁：$LOCK_DIR"; exit 2; }
+  printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+  return 0
+}
+take_lock
+release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+
 rm -rf "$SANDBOX"
 mkdir -p "$SANDBOX"
 
@@ -39,13 +69,23 @@ INSTALL_SH="${ZIZPANEL_INSTALL_SH:-$REPO/install.sh}"
 FAILURES=0
 
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+C_YELLOW=$'\033[33m'
 pass() { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
 fail() { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$1"; FAILURES=$((FAILURES + 1)); }
 step() { printf '\n%s▸ %s%s\n' "$C_BOLD" "$1" "$C_RESET"; }
 
 cleanup() {
+  release_lock
   if [ "${KEEP_SANDBOX:-0}" = "1" ]; then
     echo "沙箱已保留（进程未杀）：$SANDBOX"
+    return 0
+  fi
+  # 失败时保留沙箱：install-1.log / install-2.log 是排障的唯一凭据，
+  # 恰恰在最需要它们的时候被删掉过一次（真发生过：失败现场连日志都没了）。
+  # 需要清理时用 KEEP_SANDBOX=0 + 手动 rm，或先看日志。
+  if [ "${FAILURES:-0}" -ne 0 ]; then
+    echo "${C_YELLOW}测试有失败，沙箱已保留以便排障：$SANDBOX${C_RESET}"
+    echo "  安装日志：$SANDBOX/install-1.log  $SANDBOX/install-2.log"
     return 0
   fi
   if [ -f "$SANDBOX/root/run/panel.pid" ]; then
@@ -408,16 +448,24 @@ fi
 [ -f "$SANDBOX/root/data/config.json" ] && pass "数据按预期保留（卸载不删数据）" || fail "数据被意外删除"
 
 step "彻底卸载（--purge）"
-# 重新安装一次再 purge
-bash "$INSTALL_SH" > /dev/null 2>&1 || true
-if ZIZPANEL_SANDBOX=1 bash "$SANDBOX/root/uninstall.sh" --purge > "$SANDBOX/uninstall2.log" 2>&1; then
+# 重新安装一次再 purge。
+# 安装日志写进沙箱；purge 日志另存一份到固定路径 —— 因为 --purge 成功时会
+# 把沙箱删掉，失败时 sandbox 里那份也常常跟着没（排障时最需要它）。
+bash "$INSTALL_SH" > "$SANDBOX/install-3.log" 2>&1 || true
+PURGE_LOG="/tmp/zizpanel-purge.log"
+if ZIZPANEL_SANDBOX=1 bash "$SANDBOX/root/uninstall.sh" --purge > "$PURGE_LOG" 2>&1; then
   if [ ! -d "$SANDBOX/root" ]; then
     pass "--purge 彻底删除安装目录"
   else
     fail "--purge 后目录仍存在"
   fi
 else
-  fail "--purge 执行失败"
+  fail "--purge 执行失败（日志：${PURGE_LOG}）"
+  sed 's/^/      /' "$PURGE_LOG" 2>/dev/null | tail -15
+  if [ -f "$SANDBOX/install-3.log" ]; then
+    printf '      重新安装日志（$SANDBOX/install-3.log）末尾：\n'
+    tail -15 "$SANDBOX/install-3.log" | sed 's/^/      /'
+  fi
 fi
 
 # ---------------------------------------------------------------- 汇总 --

@@ -66,6 +66,13 @@ func main() {
 		err = cmdStatus(rest)
 	case "info":
 		err = cmdInfo(rest)
+	case "reconcile-config":
+		// 安装脚本用：把"安装时预写的最小配置"补齐成完整配置并落盘。
+		// 为什么需要它：config.Load 只在**内存里**补默认值（fill/ReconcilePaths），
+		// 不写回磁盘，于是安装脚本预写的 config.json 会长期只有安装时那几个键，
+		// 配置文件看起来"缺一大半"（www_root / access_mode 都读不到）。
+		// Bootstrap 只在"文件不存在"时 Save，所以也不能靠它。
+		err = cmdReconcileConfig(rest)
 	case "reset-password", "passwd":
 		err = cmdResetPassword(rest)
 	case "hash-password":
@@ -124,6 +131,7 @@ func usage() {
   zizpanel serve                   启动面板服务（前台运行，由 launchd 托管）
   zizpanel status                  查看运行状态与访问地址
   zizpanel info                    打印环境路径与配置摘要
+  zizpanel reconcile-config        补齐配置文件缺失字段并落盘（安装脚本用）
   zizpanel reset-password <用户名>  重置账号密码（忘记密码时使用）
   zizpanel hash-password <密码>     生成 bcrypt 哈希（手工配置用）
   zizpanel gen-cert                重新生成自签 HTTPS 证书
@@ -445,6 +453,41 @@ func cmdInfo(args []string) error {
 	fmt.Printf("MySQL    : svc=%s bin=%s\n", cfg.MySQLSvc, cfg.MySQLBin)
 	fmt.Printf("Docker   : socket=%s\n", cfg.DockerSocket)
 	fmt.Printf("面板版本 : %s\n", version.Full())
+	return nil
+}
+
+// ---------- reconcile-config ----------
+//
+// 安装脚本用：把预写的最小配置补齐成完整配置并落盘。
+//
+// 背景：config.Load 只在内存里补默认值（fill / ReconcilePaths），不写回磁盘；
+// config.Bootstrap 又只在"文件不存在"时 Save。于是安装脚本先写一个只有
+// panel_suffix / listen / mirror_base / upgrade_source 的 config.json 之后，
+// 磁盘上那份会长期"看起来缺一大半"（www_root、access_mode 都读不到）——
+// 排障时很容易误判成"安装脚本写坏了配置"。
+//
+// 这个子命令只做一件事：Load（= 老配置 + 默认值 + 路径自愈）后立刻 Save。
+// 它**不覆盖**配置里已有的值，所以对用户配置是安全的、可重复执行的。
+// 放在主程序里（而不是安装脚本里手写 JSON）是因为默认值只在 Go 侧定义一份：
+// 两处各写一份，迟早会不一致。
+func cmdReconcileConfig(args []string) error {
+	fs := flag.NewFlagSet("reconcile-config", flag.ContinueOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "配置文件路径")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		return err
+	}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("配置已补齐：%s（panel_suffix=%s listen=%s upgrade_source=%s）\n",
+		*cfgPath, cfg.PanelSuffix, cfg.Listen, cfg.UpgradeSource)
 	return nil
 }
 
