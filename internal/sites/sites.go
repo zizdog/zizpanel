@@ -146,6 +146,9 @@ var RewritePresets = []RewritePreset{
 	{Name: "typecho", Label: "Typecho", Description: "官方推荐的 try_files 写法，兼容性最好。"},
 	{Name: "wordpress", Label: "WordPress", Description: "WordPress 标准伪静态，固定链接可自定义。"},
 	{Name: "laravel", Label: "Laravel / Lumen", Description: "入口在 public/ 子目录，需要把运行目录指到 public。", PublicDir: "public"},
+	// FreshRSS 只允许暴露它自己的 p/ 目录（上级目录里的 data/ 是用户的全部订阅数据，
+	// 上游明确要求不能进 web 根）——所以这里的 PublicDir 不是"可选优化"，是安全边界。
+	{Name: "freshrss", Label: "FreshRSS", Description: "入口在 p/ 子目录（FreshRSS 的数据目录 data/ 不能暴露在 web 根下）。", PublicDir: "p"},
 	{Name: "thinkphp", Label: "ThinkPHP", Description: "入口在 public/ 子目录，兼容 pathinfo 路由。", PublicDir: "public"},
 	{Name: "discuz", Label: "Discuz!", Description: "兼容 Discuz 的 rewrite 规则。"},
 	{Name: "empirecms", Label: "帝国 CMS", Description: "兼容帝国 CMS 的 rewrite 规则。"},
@@ -180,6 +183,10 @@ func rewriteLocation(name string) string {
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$args;\n\t}"
 	case "laravel":
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
+	case "freshrss":
+		// FreshRSS 自己的 nginx 示例就是"文件优先、其余交给 index.php"，
+		// 与 typecho 同形；用 $is_args$args 保参数（它的路由带 query）。
+		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php$is_args$args;\n\t}"
 	case "thinkphp":
 		// ThinkPHP 的路由兼容：不存在的文件交给 index.php，并保留 pathinfo
 		return "\tlocation / {\n" +

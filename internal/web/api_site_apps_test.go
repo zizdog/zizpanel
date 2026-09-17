@@ -149,6 +149,56 @@ func fakeMySQLClient(t *testing.T, srv *Server) {
 	}
 }
 
+// TestSiteInstallAppliesPublicDirFromRewritePreset 锁住"一键建站的 docroot 必须按伪静态
+// 预设落到 PublicDir 子目录"。
+//
+// 真机事故（2026-09-17 mini，FreshRSS）：installSiteApp 直接把站点 Root 设成源码目录，
+// 而它声明的伪静态 `freshrss` 的 PublicDir 是 `p` —— 于是 nginx docroot 停在源码根：
+//
+//	· 安装向导 /i/ 变成无限 301（源码根的 index.php 相对跳转到 p/）；
+//	· **FreshRSS 的订阅数据目录 data/ 与源码同级 → 可被 HTTP 直接读出**
+//	  （实测 /data/tos.example.html 返回 200），而任务中心还报 succeeded。
+//
+// handleSiteCreate 与"改伪静态"两条路一直套 PublicDir，只有这条路漏了 —— 这条测试专门锁它。
+func TestSiteInstallAppliesPublicDirFromRewritePreset(t *testing.T) {
+	srv, _ := newTestServer(t)
+	fakeMySQLClient(t, srv)
+	stubSiteApplySteps(t, nil)
+	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "freshrss", 2048))
+
+	app := typechoAppWithDB(t) // 复用 typecho 的下载/解压打桩，只改伪静态与 ID
+	app.ID = "freshrss"
+	app.Name = "FreshRSS"
+	app.SiteApp.Rewrite = "freshrss"
+
+	domain := "freshrss.test"
+	if _, err := srv.installSiteApp(context.Background(), app, domain, siteInstallReq{}); err != nil {
+		t.Fatalf("建站应成功：%v", err)
+	}
+	site, err := srv.siteMgr().Get(context.Background(), domain)
+	if err != nil {
+		t.Fatalf("站点记录应存在：%v", err)
+	}
+	if !strings.HasSuffix(filepath.ToSlash(site.Root), "/p") {
+		t.Errorf("docroot 必须落在伪静态预设的 PublicDir（p）里，实际 %q —— "+
+			"停在源码根会把 data/（用户数据）暴露到 web 根下", site.Root)
+	}
+
+	// 没有 PublicDir 的预设（typecho）不能被误加子目录。
+	app2 := typechoAppWithDB(t)
+	domain2 := "plain.test"
+	if _, err := srv.installSiteApp(context.Background(), app2, domain2, siteInstallReq{}); err != nil {
+		t.Fatalf("建站应成功：%v", err)
+	}
+	site2, err := srv.siteMgr().Get(context.Background(), domain2)
+	if err != nil {
+		t.Fatalf("站点记录应存在：%v", err)
+	}
+	if strings.HasSuffix(filepath.ToSlash(site2.Root), "/p") || strings.HasSuffix(filepath.ToSlash(site2.Root), "/public") {
+		t.Errorf("typecho 的预设没有 PublicDir，Root 不该多出子目录：%q", site2.Root)
+	}
+}
+
 // TestSiteInstallRemembersDBPassword 是"一键建站口令可回显"那条需求的护栏：
 // CREATE USER 成功后必须把口令交给 RememberDBPassword，且能被 RecallDBPassword 读回。
 func TestSiteInstallRemembersDBPassword(t *testing.T) {

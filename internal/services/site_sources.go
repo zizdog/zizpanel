@@ -72,6 +72,19 @@ var siteSources = map[string]SiteSource{
 			"https://github.com/typecho/typecho/releases/download/v1.3.0/typecho.zip",
 		},
 	},
+	"freshrss": {
+		App: "freshrss", Name: "FreshRSS", Version: "1.30.0",
+		File:   "FreshRSS-1.30.0.tar.gz",
+		SHA256: "c58e045272c8b051da700559e2a8bb9205084285ee0a25a3efb504012e48483e",
+		Size:   4807475,
+		Upstreams: []string{
+			// 上游 **releases 一直没有资产**（1.26.3~1.30.0 连续 8 个版本 assets 为空），
+			// 只能拿源码归档；gh-proxy 放前面是因为国内可达性明显更好，
+			// 而 codeload 是同一份字节的官方直连（两条链路都实算过 sha256，一致）。
+			"https://gh-proxy.com/https://github.com/FreshRSS/FreshRSS/archive/refs/tags/1.30.0.tar.gz",
+			"https://codeload.github.com/FreshRSS/FreshRSS/tar.gz/refs/tags/1.30.0",
+		},
+	},
 	"wordpress": {
 		App: "wordpress", Name: "WordPress", Version: "7.1",
 		File:   "wordpress-7.1-zh_CN.zip",

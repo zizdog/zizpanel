@@ -1007,6 +1007,98 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
+		ID: "freshrss", Kind: KindNative,
+		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空（一键建站，产出是网站不是服务）"},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 FreshRSS 1.30.0 源码包（gh-proxy 主址）",
+				Upstream: MarketUpstream{
+					ID:   "github.com/FreshRSS/FreshRSS@1.30.0/source.tar.gz",
+					URL:  "https://gh-proxy.com/https://github.com/FreshRSS/FreshRSS/archive/refs/tags/1.30.0.tar.gz",
+					Size: 4807475,
+					Note: "实测 4,807,475 B；sha256 c58e045272c8b051da700559e2a8bb9205084285ee0a25a3efb504012e48483e" +
+						"（codeload 直连与 gh-proxy 两条路下到的字节完全相同）",
+				},
+				NAS: nasMissing("镜像站上没有 FreshRSS 源码包（apps/freshrss/... 不存在）。它是**缺口**：" +
+					"GitHub 不可达就装不上；建议同步到 apps/freshrss/1.30.0/source.tar.gz 并把候选顺序改成 镜像 → 主址 → 备址"),
+				Timeout:  9 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					SHA256: "c58e045272c8b051da700559e2a8bb9205084285ee0a25a3efb504012e48483e",
+					Source: "2026-09-17 本机把归档整包下下来实算 sha256；gh-proxy 与 codeload 两条独立链路" +
+						"下到的字节完全相同（4,807,475 B），所以这个值不是「我以为」而是实测值。" +
+						"注意：站点轨（api_site_apps.go）当前只做「文件 > 1024 B」的健全性检查，" +
+						"**不做**内容校验 —— 值在此登记供镜像站与在线审计核对",
+					Note: "固定版本 + 实测 sha256；镜像站补包后应把它写进 manifest.json 并让安装器按它校验",
+				},
+				ARM64: "PHP 站点源码（tar.gz），与架构无关；原生跑在面板已有的 nginx + php-fpm 上",
+				Note:  "上游 releases 连续 8 个版本 assets 为空，只能拿源码归档；固定 1.30.0 而不是 master，才能校验内容",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 FreshRSS 1.30.0 源码包（codeload 备址）",
+				Upstream: MarketUpstream{
+					ID:   "codeload.github.com/FreshRSS/FreshRSS@1.30.0",
+					URL:  "https://codeload.github.com/FreshRSS/FreshRSS/tar.gz/refs/tags/1.30.0",
+					Size: 4807475,
+					Note: "与主址字节相同（实测）",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必两条都镜像"),
+				Timeout:        9 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只会少一条退路（主址是 gh-proxy，国内可达性较好）",
+				Checksum: MarketChecksum{
+					SHA256: "c58e045272c8b051da700559e2a8bb9205084285ee0a25a3efb504012e48483e",
+					Source: "与主址同一份字节（2026-09-17 两条链路实算比对一致）",
+				},
+				ARM64: "PHP 站点源码（tar.gz），与架构无关",
+			},
+		},
+	},
+
+	{
+		ID: "portainer", Kind: KindCompose, ComposeImage: "portainer/portainer-ce:lts",
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("portainer/portainer-ce:lts", 20*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据：Docker Hub 的 index 里有 linux/arm64（另有 amd64/armv7/ppc64le）；"+
+					"本机到 Docker Hub 直连超时，证据经 docker.1ms.run 镜像站读同一份 index（诚实标注：未现场读 manifest）"),
+		},
+	},
+
+	{
+		ID: "homepage", Kind: KindCompose, ComposeImage: "ghcr.io/gethomepage/homepage:v2.3.0",
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("ghcr.io/gethomepage/homepage:v2.3.0", 20*time.Minute,
+				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io 可直连（本机实测），"+
+					"arm64 层与 amd64 同 index 已确认"),
+				"arm64 证据：ghcr.io 的 index 里同时有 amd64 与 arm64（:v2.3.0 与 :latest 都确认过）"),
+		},
+	},
+
+	{
+		ID: "trilium", Kind: KindCompose, ComposeImage: "triliumnext/trilium:v0.105.0",
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("triliumnext/trilium:v0.105.0", 20*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据：Docker Hub 的 OCI index 里同时有 linux/arm64 与 linux/amd64"+
+					"（2026-09-17 经本机 Colima 的加速源 dockerproxy.net 读同一份 index，arm64 层 digest "+
+					"sha256:621b7323fcccf7a5…）；且在 Mac mini 的 Colima 虚机（Ubuntu 24.04 aarch64）上 "+
+					"docker compose up -d 真的跑起来：docker image inspect 报 os=linux arch=arm64、"+
+					"容器 healthy、宿主 8091 在听 —— 是实测，不是「应该可以」"),
+		},
+		Note: "镜像改名（2026-09-17 核实）：上游把镜像从 triliumnext/notes 改成了 triliumnext/trilium。" +
+			"notes:latest 已冻结在 v0.95.0（镜像构建时间 2025-06-15），trilium:latest = v0.105.0（2026-08-19）；" +
+			"两者都自带 linux/arm64，但只有后者是当前版（上游仓库里的 docker-compose.yml 仍写 notes，是改名后没同步）。" +
+			"声明按约定只写 latest；顺带核实 triliumnext/trilium:v0.105.0 这个 tag **确实存在**" +
+			"（镜像源 HTTP 200），而 0.105.0 / v0.105 不存在 —— 需要可复现安装时可以钉住 v0.105.0。",
+	},
+
+	{
 		ID: "wordpress", Kind: KindNative,
 		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空"},
 		Downloads: []MarketDownloadPoint{

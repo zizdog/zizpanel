@@ -1153,6 +1153,167 @@ func Catalog() []App {
 			DocsURL: "https://typecho.org",
 		},
 		{
+			ID: "freshrss", Name: "FreshRSS", Icon: "📰",
+			Summary: "自托管 RSS 阅读器（原生：nginx + PHP + SQLite）",
+			Description: "多用户 RSS 聚合阅读器。**原生安装**（不用 Docker）：面板把官方源码装到 " +
+				"~/www/<域名>、套用 FreshRSS 的伪静态，数据库直接用 **SQLite**（不需要 MySQL）。" +
+				"装完到 http://<域名>/i/ 走完向导（数据库类型选 SQLite）即可。",
+			Category: "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 上游 releases **一直没有资产**（1.26.3~1.30.0 连续 8 个版本 assets 为空），
+				// 只能拿源码归档。固定 1.30.0 而不是 rolling master：只有固定版本才能把
+				// sha256/字节数写进镜像清单（滚动地址无法校验，安装器就只能"下完即信"）。
+				DownloadURL: "https://gh-proxy.com/https://github.com/FreshRSS/FreshRSS/archive/refs/tags/1.30.0.tar.gz",
+				MirrorURLs:  []string{"https://codeload.github.com/FreshRSS/FreshRSS/tar.gz/refs/tags/1.30.0"},
+				Archive:     "tar.gz", StripTopDir: true,
+				// 入口必须指向 p/：FreshRSS 的全部个人数据在 data/（与 p/ 同级），
+				// 指错目录等于把订阅数据放进 web 根。
+				Rewrite: "freshrss", FinishPath: "/i/", NeedsDB: false,
+				Notes: []string{
+					"安装向导里「数据库类型」选 **SQLite**（不需要填 MySQL 的库名/账号）",
+					"站点入口已被面板指向 <站点目录>/p —— 不要改回站点根目录",
+					"向导里自己设置管理员账号与口令（FreshRSS 没有默认口令）",
+				},
+			},
+			DocsURL: "https://freshrss.org",
+		},
+		{
+			ID: "portainer", Name: "Portainer CE", Icon: "🐳",
+			UI: &AppUI{
+				Slug:         "portainer",
+				Note:         "Portainer 的界面是 **HTTPS**（自签证书），子路径支持不保证 —— 建议用「直链」打开 https://<本机地址>:9443",
+				PreferDirect: true,
+			},
+			Summary: "Docker 图形化管理（容器 / 镜像 / 卷 / 网络）",
+			Description: "用网页管理本机的 Docker 资源。**安全提醒**：它需要挂载 Docker socket，" +
+				"等于把 Docker 的完全控制权交给这个界面 —— 只在局域网用，绝不要暴露到公网。" +
+				"界面走 HTTPS（自签证书，浏览器要点一次「继续访问」），端口 9443；" +
+				"HTTP 入口被面板映射到宿主 **9001**（让开 PHP-FPM 占用的 9000），会跳到 9443；" +
+				"面板的健康检查与「直链」用的是 9001。",
+			// 宿主机用 9001 映射容器里的 9000：**9000 在本项目里是 PHP-FPM 的保留端口**
+			// （站点 vhost 的 fastcgi_pass 指向它，且静态门禁不许默认站点出现写死的 9000）。
+			Category: "tool", Kind: KindCompose, Port: 9001,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			ComposeYAML: `services:
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    ports:
+      # 宿主 9001 → 容器 9000（让开本机的 PHP-FPM 9000）；9443 是它的 HTTPS 界面
+      - "9001:9000"
+      - "9443:9443"
+    volumes:
+      # 这里必须写 **VM 内**的 /var/run/docker.sock：Colima 下 compose 的 bind 源是
+      # 在 Linux VM 里解析的，宿主的 ~/.colima/default/docker.sock 在 VM 里是
+      # virtiofs，挂进去用不了（真机实测）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+    restart: unless-stopped
+`,
+			PostInstallHint: "首次打开 https://<本机地址>:9443 时必须在 5 分钟内设置管理员口令" +
+				"（超时要重启容器重来）；自签证书会提示不安全，点「继续访问」即可。",
+			DocsURL: "https://www.portainer.io",
+		},
+		{
+			ID: "homepage", Name: "Homepage", Icon: "🏠",
+			UI: &AppUI{
+				Slug:         "homepage",
+				PreferDirect: true,
+				Note:         "Homepage 的界面按根路径设计（子路径实测不保证可用），建议用「直链」",
+			},
+			Summary: "自建导航首页 / 服务仪表盘",
+			Description: "把本机的服务、书签、常用链接汇总成一个首页。端口 **3010**（避开 Gitea 的 3000）。" +
+				"配置文件在应用目录的 config/ 下（services.yaml / settings.yaml / widgets.yaml），" +
+				"可在「管理」里直接编辑。要显示容器状态需要额外挂 Docker socket —— 面板刻意**没有**默认挂上" +
+				"（那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。",
+			Category: "tool", Kind: KindCompose, Port: 3010,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			ComposeYAML: `services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:v2.3.0
+    container_name: homepage
+    ports:
+      - "3010:3000"
+    environment:
+      # 官方要求必须设置，否则启动后直接 host validation failed（页面打不开）。
+      # 静态 compose 装的时候还不知道用户会用哪个地址访问，所以这里放开；
+      # 这台机器只在内网用，是可接受的取舍 —— 要收紧就改成
+      # "192.168.1.4:3010,localhost:3010" 这种显式清单。
+      HOMEPAGE_ALLOWED_HOSTS: "*"
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
+`,
+			PostInstallHint: "首次打开是空首页：在 <应用目录>/config/services.yaml 里加服务卡片" +
+				"（「管理 → 编辑配置文件」可直接改，改完点重启）。",
+			DocsURL: "https://gethomepage.dev",
+		},
+		{
+			// Trilium（上游 TriliumNext Notes）为什么**只能走 Docker**：
+			//   · Homebrew 里只有 cask `trilium-notes`（Electron GUI），无头/服务器机器用不了；
+			//   · 官方服务端产物只有 Linux（TriliumNotes-Server-*-linux-arm64.tar.xz），
+			//     没有 darwin-arm64 → 原生无头不可行；
+			//   · 镜像 triliumnext/trilium 自带 linux/arm64（不写 platform、不转译）。
+			// 端口为什么是 8091：容器默认 8080，而 **8080 在本项目里是 IOPaint 的保留端口**
+			// （iopaint 条目 Port=8080；mini 真机实测 8080 正被 Python/IOPaint 监听）。
+			ID: "trilium", Name: "Trilium Notes", Icon: "🌳",
+			// 子路径：上游没有一等公民的子路径支持（discussion #7090 还在讨论，
+			// issue #8500「server does not work with custom path」），面板只能硬挂
+			// 绝对路径改写 —— 不确定可用就以「直链」为主，并如实说明理由。
+			UI: &AppUI{
+				Slug:         "trilium",
+				PreferDirect: true,
+				Note: "Trilium 上游没有官方的子路径支持（TriliumNext/Notes discussion #7090 / issue #8500），" +
+					"面板只做绝对路径改写、不保证它的前端路由认子路径 —— 建议用「直链」" +
+					"http://<本机地址>:8091（子路径未实测）",
+			},
+			Summary: "自托管个人知识库 / 笔记（全文搜索、关系图、脚本）",
+			Description: "TriliumNext Notes 服务端：层级化笔记 + 富文本/代码/Mermaid、全文搜索与关系图。" +
+				"**走 Docker**：Homebrew 只有 Electron GUI cask，官方服务端产物只有 Linux；" +
+				"镜像自带 linux/arm64，不转译。数据在应用目录 data/；端口 **8091**（让开 IOPaint 的 8080）。",
+			Category: "tool", Kind: KindCompose, Port: 8091,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 上游 compose（develop 分支 docker-compose.yml）的等价物，三处**故意不同**：
+			//   ① 镜像名：上游仓库文件还写 triliumnext/notes，但那是**冻结的旧镜像**
+			//      （notes:latest = v0.95.0 / 2025-06-15）；官方文档现在用的是
+			//      triliumnext/trilium（latest = v0.105.0 / 2026-08-19），所以用后者；
+			//   ② 端口：8080 → 8091（让开 IOPaint）；
+			//   ③ 去掉 /etc/timezone、/etc/localtime 两个挂载：宿主是 macOS（没有
+			//      /etc/timezone），而 Colima 下 bind 源是在 Linux VM 里解析的，
+			//      挂 VM 的 /etc 文件收益很小；要统一时区用 TZ 环境变量。
+			ComposeYAML: `services:
+  trilium:
+    image: triliumnext/trilium:v0.105.0
+    container_name: trilium
+    ports:
+      # 宿主 8091 → 容器 8080：8080 已被 IOPaint 占用（本项目保留端口）
+      - "8091:8080"
+    environment:
+      # 容器内数据目录（官方 compose 也显式设它）；挂载点见下
+      - TRILIUM_DATA_DIR=/home/node/trilium-data
+      # 官方 docker 文档：容器（entrypoint）需要以 root 启动，且**不支持** --user；
+      # 要改数据文件属主就用官方推荐的 USER_UID/USER_GID。
+      # macOS 首个管理员用户是 501:20；面板用户不是 501 时改成 id -u / id -g 的值。
+      # 已知上游 issue TriliumNext/Notes#331：某些版本根本不读这两个变量；本机在
+      # notes:0.95.0 与 trilium:0.105.0 上实测**生效**（容器内 node 进程 uid=501、
+      # 宿主侧数据文件属主 501:20），所以保留；万一不生效也只是容器以 root 跑。
+      - USER_UID=501
+      - USER_GID=20
+    volumes:
+      # 数据落在应用目录的 data/（document.db + config.ini + log/）；
+      # 面板装完后就是 <WorkDir>/compose/trilium/data/
+      - ./data:/home/node/trilium-data
+    restart: unless-stopped
+`,
+			PostInstallHint: "首次打开 http://<本机地址>:8091/ 会进入初始化向导：创建管理员账号与口令" +
+				"（服务端没有默认口令，不设就进不去）。**不要直接开 /setup** —— 本镜像（v0.105.0）里" +
+				"该服务端路由会 500（assets/views 没打进镜像），根路径的页面会自己引导初始化。",
+			DocsURL: "https://docs.triliumnotes.org/user-guide/setup/server/installation/docker",
+		},
+		{
 			ID: "wordpress", Name: "WordPress", Icon: "🌐",
 			Summary: "最流行的建站程序，一键装好并配好伪静态",
 			Description: "最流行的建站程序（PHP + MySQL）。面板会自动下载官方中文版、" +

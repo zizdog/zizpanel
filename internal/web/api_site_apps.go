@@ -175,7 +175,21 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	pinned, hasPinned := services.SiteSourceFor(app.ID)
 	archiveName := "zizpanel-site-" + app.ID + "-" + fmt.Sprint(time.Now().Unix())
 	if hasPinned {
-		archiveName += filepath.Ext(pinned.File)
+		// 临时文件名是给 extractArchive **按后缀判格式**用的：
+		// filepath.Ext("FreshRSS-1.30.0.tar.gz") 只给出 ".gz"，解压器会以
+		// "不认识的压缩格式" 失败（FreshRSS 就是这样）。所以复合后缀要保住，
+		// 实在认不出来就退回目录声明的归档类型。
+		lower := strings.ToLower(pinned.File)
+		switch {
+		case strings.HasSuffix(lower, ".tar.gz"):
+			archiveName += ".tar.gz"
+		case strings.HasSuffix(lower, ".tgz"):
+			archiveName += ".tgz"
+		case strings.HasSuffix(lower, ".zip"):
+			archiveName += ".zip"
+		default:
+			archiveName += "." + spec.Archive
+		}
 	} else {
 		archiveName += "." + spec.Archive
 	}
@@ -288,8 +302,19 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	}
 
 	// ---------- ⑤ 建站点（带伪静态）----------
+	//
+	// 站点记录里的 Root 是**运行目录**（nginx docroot），不是源码目录：
+	// 伪静态预设声明了 PublicDir 时必须落进那个子目录。少这一步的后果不只是 404 ——
+	// FreshRSS 的订阅数据在同级的 data/ 里，docroot 停在源码根就等于**把用户数据
+	// 放进 web 根**（2026-09-17 mini 真机实测：/data/tos.example.html 可被 HTTP 读出，
+	// 而任务中心还报 succeeded，是典型的"谎报成功"）。
+	// handleSiteCreate 与"改伪静态"两条路一直是套 PublicDir 的，只有一键建站这条漏了。
+	runRoot := dir
+	if p, okk := sites.RewritePresetByName(spec.Rewrite); okk && p.PublicDir != "" {
+		runRoot = filepath.Join(dir, p.PublicDir)
+	}
 	site := &sites.Site{
-		Domain: domain, Root: dir, PHPVersion: req.PHP,
+		Domain: domain, Root: runRoot, PHPVersion: req.PHP,
 		Rewrite: spec.Rewrite, Enabled: true,
 		Remark: app.Name + " 一键建站",
 	}
