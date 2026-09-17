@@ -427,9 +427,10 @@ try {
     await shot('27-site-deleted');
   });
 
-  // ---------- 服务管理（P3）----------
-  await step('打开服务管理', async () => {
-    await page.click('.nav-item:has-text("服务管理")');
+  // ---------- 「我的应用」（P3；2026-09-17 起「服务管理」与「应用市场」合并成
+  // 一个「应用」版块，两个 Tab；老 hash #/services 会自动落到「我的应用」）----------
+  await step('打开我的应用', async () => {
+    await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(2500);
     await shot('30-services');
     const txt = await page.locator('.content').innerText();
@@ -506,7 +507,10 @@ try {
   });
 
   await step('打开应用市场', async () => {
-    await page.click('.nav-item:has-text("应用市场")');
+    // 导航里已经没有「应用市场」这个版块了：点「应用」再切到市场 Tab
+    await page.click('.nav-item:has-text("应用")');
+    await page.waitForTimeout(800);
+    await page.click('[data-tab="market"]');
     await page.waitForTimeout(2000);
     await shot('33-market');
     const txt = await page.locator('.content').innerText();

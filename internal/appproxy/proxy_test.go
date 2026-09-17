@@ -200,3 +200,72 @@ func portOf(t *testing.T, raw string) int {
 	}
 	return n
 }
+
+// TestHomepageRewritesCoverNextjsAssetPaths 锁住用户反馈的「/homepage/ 无样式」。
+//
+// Homepage 是 Next.js 构建产物，HTML 里是根绝对路径 `/_next/static/…`、`/api/…`；
+// 不改写就会打到站点根 404，页面没有样式。这里直接拿目录里的真实规则跑一遍，
+// 规则被删/写错时测试立刻红。
+func TestHomepageRewritesCoverNextjsAssetPaths(t *testing.T) {
+	app, ok := services.FindApp("homepage")
+	if !ok || app.UI == nil {
+		t.Fatal("目录里没有 homepage 的 UI 声明")
+	}
+	if app.UI.PreferDirect {
+		t.Error("Homepage 加前缀后子路径可用（2026-09-17 mini 实测），不该再标 PreferDirect")
+	}
+	rw := newRewriter(app.UI.Slug, app.UI.Rewrites)
+	html := `<script src="/_next/static/chunks/main-abc.js"></script>` +
+		`<link rel="stylesheet" href="/_next/static/css/app.css">` +
+		`<link rel="manifest" href="/site.webmanifest">` +
+		`<link rel="apple-touch-icon" href="/apple-touch-icon.png">` +
+		`<link rel="icon" href="/favicon-32x32.png">` +
+		`<script>fetch("/api/widgets")</script>`
+	got := string(rw.body([]byte(html)))
+	for _, want := range []string{
+		`src="/homepage/_next/static/chunks/main-abc.js"`,
+		`href="/homepage/_next/static/css/app.css"`,
+		`href="/homepage/site.webmanifest"`,
+		`href="/homepage/apple-touch-icon.png"`,
+		`href="/homepage/favicon-32x32.png"`,
+		`fetch("/homepage/api/widgets")`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Homepage 子路径改写后应包含 %q，实际：%s", want, got)
+		}
+	}
+}
+
+// TestAlistRewritesTargetInlinedBasePath 锁住 Alist 子路径 404 的针对性改写。
+//
+// 根因（去混淆前端 bundle 得出）：Alist 把 base_path 内联在 HTML 里
+// （window.ALIST.base_path），前端拿它拼 API 地址；bundle 里没有 `"/api/`
+// 这样的字面量，所以通用改写一定无效，必须**针对性改写 base_path 本身**。
+//
+// 状态（2026-09-17 真机验证，mini / 0.14.1）：改写后页面内联 base_path 变成
+// `/alist/`、`/alist/api/public/settings` 由 404 变 **200**、
+// `/alist/static/manifest.json` = 200 —— 子路径可用，所以**不再**标 PreferDirect
+// （那颗 ⚠️ 会误导用户以为子路径坏；Note 必须同时说明两个入口都能用）。
+func TestAlistRewritesTargetInlinedBasePath(t *testing.T) {
+	app, ok := services.FindApp("alist")
+	if !ok || app.UI == nil {
+		t.Fatal("目录里没有 alist 的 UI 声明")
+	}
+	if app.UI.PreferDirect {
+		t.Error("Alist 的子路径已在真机验证可用（0.14.1：/alist/api/public/settings = 200），" +
+			"不该再标 PreferDirect；如有新的反证请附上真机证据再改回来")
+	}
+	if !strings.Contains(app.UI.Note, "5244") || !strings.Contains(app.UI.Note, "/alist/") {
+		t.Errorf("Alist 的 Note 要说清两个入口都可用（5244 直连与 /alist/ 子路径），实际：%s", app.UI.Note)
+	}
+	rw := newRewriter(app.UI.Slug, app.UI.Rewrites)
+	body := `window.ALIST={base_path: '/', settings: {}};` +
+		`<script src="/static/js/app.abc.js"></script>`
+	got := string(rw.body([]byte(body)))
+	if !strings.Contains(got, `base_path: '/alist/'`) {
+		t.Errorf("内联的 base_path 没有被改写到子路径：%s", got)
+	}
+	if !strings.Contains(got, `src="/alist/static/js/app.abc.js"`) {
+		t.Errorf("/static/ 没有被改写到子路径：%s", got)
+	}
+}

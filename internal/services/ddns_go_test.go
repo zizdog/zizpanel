@@ -78,15 +78,19 @@ func TestDDNSGoEntryIsWired(t *testing.T) {
 	}
 
 	// 方案 A：必须保留「打开」（首次配置要用它自己的网页界面），
-	// 所以不能是 ConsoleOnly；日常不跳网页靠 PreferDirect + 编辑配置文件。
+	// 所以不能是 ConsoleOnly。
+	//
+	// PreferDirect **不设**（2026-09-17 修正）：只读排查证实它的子路径其实是好的 ——
+	// 未登录 GET / 返回 307，Location 已被面板正确改写；前端资源走相对路径。
+	// 原先标 PreferDirect 属于过度保守（会在按钮上挂一个没有依据的 ⚠️）。
 	if app.UI == nil {
 		t.Fatal("ddns-go 必须有 UI 入口（方案 A 的首次配置要在 :9876 完成）")
 	}
 	if app.UI.ConsoleOnly {
 		t.Error("方案 A 要保留一次「打开」，不能设 ConsoleOnly: true")
 	}
-	if !app.UI.PreferDirect {
-		t.Error("ddns-go 的「打开」应首选端口直连（PreferDirect: true）")
+	if app.UI.PreferDirect {
+		t.Error("ddns-go 的子路径已验证可用，不该再标 PreferDirect（过度保守会给按钮挂无依据的警告）")
 	}
 	if app.UI.Slug != "ddns-go" {
 		t.Errorf("UI slug 应为 ddns-go，实际 %q", app.UI.Slug)

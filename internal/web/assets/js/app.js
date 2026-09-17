@@ -10,7 +10,6 @@ import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
 import { ReverseProxyView } from './reverseproxy.js';
 import { CertsView } from './certs.js';
-import { ServicesView } from './services.js';
 import { AppsView } from './apps.js';
 import { FilesView } from './files.js';
 import { TerminalView } from './terminal.js';
@@ -45,8 +44,14 @@ export const NAV = [
   { id: 'certs', title: 'SSL 证书', icon: '🔐', view: CertsView },
   { id: 'database', title: '数据库', icon: '🗄️', view: DatabaseView },
   { group: '服务器' },
-  { id: 'services', title: '服务管理', icon: '⚙️', view: ServicesView },
-  { id: 'apps', title: '应用市场', icon: '🧩', view: AppsView },
+  // 2026-09-17 信息架构合并：原来的「服务管理」与「应用市场」两个导航项合成
+  // **一个「应用」版块**，页内两个 Tab（我的应用 / 应用市场）。
+  //   · 真机量化（mini）：服务管理 31 行，31 行全都也出现在应用市场，独有内容 0 行；
+  //     而且服务管理内部有 4 对重复（php81/…/php84 各有两条记录指向同一 launchd 标签）。
+  //     两个入口展示同一批东西，用户只会问"我该点哪个"。
+  //   · `#/services` 这类老书签/文档里的链接**必须继续可用**：见 ROUTE_TARGET
+  //     的别名表 —— 它落到同一个 AppsView，并自动切到「我的应用」Tab。
+  { id: 'apps', title: '应用', icon: '🧩', view: AppsView },
   { id: 'docker', title: 'Docker', icon: '🐳', view: DockerView },
   { group: '运维' },
   { id: 'files', title: '文件管理', icon: '📁', view: FilesView },
@@ -59,6 +64,26 @@ export const NAV = [
 ];
 
 const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n]));
+
+// ROUTE_TARGET 是"旧路由 → 合并后的落点"的别名表。
+//
+// 为什么必须有它：`#/services` 写在文档、书签、以及别的页面（数据库页的
+// "去服务管理启动 MySQL"、Docker 页的"去服务管理"、仪表盘的快捷卡）里。
+// 合并导航后如果它变成 404/仪表盘，用户会以为功能没了。
+//   services → apps 版块，并**自动切到「我的应用」Tab**（那里就是原服务管理的清单）。
+//
+// 这个函数导出只有一个原因：tools/appdetail-verify.mjs 用它断言
+// "#/services 落到我的应用 Tab"，而不是靠人肉点。运行时没有别的调用方。
+const ROUTE_TARGET = {
+  services: { id: 'apps', tab: 'mine' },
+};
+
+export function routeFor(hash = location.hash) {
+  const m = String(hash || '').match(/^#\/([a-z0-9_-]+)/i);
+  const id = m ? m[1] : 'dashboard';
+  const t = ROUTE_TARGET[id];
+  return t ? { ...t } : { id, tab: '' };
+}
 
 // panelPath 拼"面板内的路径"，例如 panelPath('phpmyadmin/') → "/jab5c63/phpmyadmin/"。
 //
@@ -308,8 +333,9 @@ function renderSetup() {
 // ---------------- 主界面 ----------------
 
 function renderApp() {
-  const route = currentRoute();
-  const item = NAV_BY_ID[route] || NAV_BY_ID.dashboard;
+  // 路由先过别名表：`#/services` 会落到 apps 版块的「我的应用」Tab（见 ROUTE_TARGET）。
+  const target = routeFor();
+  const item = NAV_BY_ID[target.id] || NAV_BY_ID.dashboard;
 
   const nav = h('nav.nav');
   NAV.forEach((n) => {
@@ -386,7 +412,7 @@ function renderApp() {
   // 只有浏览器里一片"正在读取…"。这是 2026-09-14 修掉的真坑。
   // 教训：形参个数不是"能力声明"，别拿它做路由判断。
   const view = item.view;
-  view(content, { item, topbar, pageTitle, onLeave: registerCleanup });
+  view(content, { item, topbar, pageTitle, onLeave: registerCleanup, tab: target.tab });
   document.title = `${item.title} · ZizPanel`;
 }
 
@@ -411,11 +437,6 @@ async function doLogout() {
   runCleanup();
   location.hash = '';
   renderLogin();
-}
-
-function currentRoute() {
-  const m = location.hash.match(/^#\/([a-z0-9_-]+)/i);
-  return m ? m[1] : 'dashboard';
 }
 
 function render() {

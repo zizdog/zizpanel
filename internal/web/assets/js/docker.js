@@ -1,7 +1,7 @@
 // docker.js —— Docker 管理页。
 //
-// 与「服务管理」的分工（刻意如此，避免两个页面互相打架）：
-//   · 服务管理 管**服务生命周期**：把某个容器/compose 项目当作一条服务来启停、看日志、健康检查。
+// 与「应用 → 我的应用」的分工（刻意如此，避免两个页面互相打架）：
+//   · 我的应用 管**服务生命周期**：把某个容器/compose 项目当作一条服务来启停、看日志、健康检查。
 //   · 本页 管**Docker 本身**：这台机器上有哪些容器/镜像/卷/网络、镜像拉取与清理、
 //     compose 文件的编辑与部署、以及从零创建一个容器。
 //   两个页面会在同一批对象上出现（已纳管的 docker/compose 服务），所以这里
@@ -144,7 +144,7 @@ function renderUnavailable(container, info) {
       h('div.hint', { text: 'macOS 上 Docker 引擎不是系统自带的，需要一个 Linux 虚拟机来承载。推荐按这个顺序处理：' }),
       h('ol', { style: { paddingLeft: '20px', lineHeight: '2', color: 'var(--text-dim)', fontSize: '13px' } }, [
         h('li', { text: '打开「应用市场」，安装「Docker 运行时（Colima）」，装完会自动开机自启。' }),
-        h('li', { text: '回到「服务管理」，确认 docker-runtime 处于运行中（首次启动约需 40 秒）。' }),
+        h('li', { text: '回到「应用 → 我的应用」，确认 docker-runtime 处于运行中（首次启动约需 40 秒）。' }),
         h('li', { text: '回到本页点「刷新」。' }),
       ]),
       h('div', { style: { display: 'flex', gap: '8px', marginTop: '14px' } }, [

@@ -206,8 +206,13 @@ type MarketApp struct {
 	PanelInstaller string
 	ServiceLabel   string
 	NoDaemon       bool
-	// ComposeImage 是 compose 里 `image:` 那一行（compose 条目必填）。
+	// ComposeImage 是**单容器** compose 里 `image:` 那一行。
+	// 多容器 compose（Activepieces / Immich）改用 ComposeImages 列全部镜像。
+	// 两者至少有一个（Kind==KindCompose 时），且必须与目录 compose 里的镜像集合一致。
 	ComposeImage string
+	// ComposeImages 是多容器 compose 的全部镜像；单容器条目留空、用 ComposeImage。
+	// 反漂移比对会把两边归一化成集合，并额外要求每个镜像都有一条 docker_image 下载点。
+	ComposeImages []string
 	// Runtime 说明运行期怎么被管。
 	Runtime MarketRuntime
 	// Downloads 是全部网络下载点，**按执行顺序**。
@@ -683,14 +688,18 @@ var marketDownloadApps = []MarketApp{
 	// ---------------- 运维工具（Docker compose） ----------------
 
 	{
-		ID: "uptime-kuma", Kind: KindCompose, ComposeImage: "louislam/uptime-kuma:1",
+		ID: "uptime-kuma", Kind: KindCompose, ComposeImage: "louislam/uptime-kuma:2",
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose（docker compose 管）"},
 		Downloads: []MarketDownloadPoint{
-			dockerImagePoint("louislam/uptime-kuma:1", 20*time.Minute,
+			dockerImagePoint("louislam/uptime-kuma:2", 20*time.Minute,
 				nasMirrored("docker"),
-				"arm64 证据：Docker Hub 的 index 里有 linux/arm64（实测 arm64 层合计 145.8 MiB）；"+
-					"compose 里不写 platform（铁律②）"),
+				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+					"tag `:2` 有 linux/amd64、linux/arm64、linux/arm/v7；"+
+					"同时核实 **`:v2` 这个 tag 不存在（manifest 404）**，`latest` 也不是 v2 —— 只能用 `:2`。"+
+					"1.x 已停止维护（应用自己会告警 \"1.23.17 is a v1 tag\"），compose 里不写 platform（铁律②）"),
 		},
+		Note: "v1 → v2 会**自动迁移数据库**（不可逆），目录 Description 与 UI.Note 里都写了提醒；" +
+			"原有的 5 条子路径改写是照 v1 调的，v2 是否仍适用**未重测**。",
 	},
 
 	{
@@ -702,19 +711,6 @@ var marketDownloadApps = []MarketApp{
 					"quay.io /v2/ 实测 401 / 0.69 s 直连可达，arm64 层合计 54.9 MiB。"+
 					"（诚实标注：只实测了 registry 端点可达性与层大小，**没有实测完整 pull 的吞吐**）"),
 				"arm64 证据：quay.io 的 index 里有 linux/arm64（实测层合计 54.9 MiB）"),
-		},
-	},
-
-	{
-		ID: "n8n", Kind: KindCompose, ComposeImage: "n8nio/n8n:latest",
-		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
-		Downloads: []MarketDownloadPoint{
-			dockerImagePoint("n8nio/n8n:latest", 20*time.Minute,
-				nasMirrored("docker"),
-				"arm64 证据：经自建镜像站读同一份 index（<mirror>/docker/v2/n8nio/n8n/manifests/latest）"+
-					"→ linux/amd64、linux/arm64；arm64 子清单 15 层共 282.9 MB（2026-09-16 实测，catalog 注释记录）。"+
-					"原本用的是 docker.n8n.io/n8nio/n8n:latest，它的鉴权 realm 指向国内超时的 auth.docker.io 且"+
-					"registry-mirrors 不生效 —— 已改为 Hub 上的同一官方项目（并发代理在 catalog.go 里改的，声明同步跟上）"),
 		},
 	},
 
@@ -1099,6 +1095,76 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
+		// Activepieces：3 容器（app 兼任 worker + PostgreSQL/pgvector + Redis），
+		// 下载点必须逐一列全（反漂移会比对声明镜像集合与目录 compose 里的集合）。
+		ID: "activepieces", Kind: KindCompose,
+		ComposeImages: []string{
+			"ghcr.io/activepieces/activepieces:0.91.0",
+			"pgvector/pgvector:0.8.0-pg14",
+			"library/redis:7.0.7",
+		},
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("ghcr.io/activepieces/activepieces:0.91.0", 20*time.Minute,
+				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io 本机实测可直连"+
+					"（docker manifest inspect 直接成功），arm64 层大小未实测。（诚实标注：未实测完整 pull 的吞吐）"),
+				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/activepieces/activepieces:0.91.0` 直查）："+
+					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
+			dockerImagePoint("pgvector/pgvector:0.8.0-pg14", 20*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+					"linux/amd64、linux/arm64（另两个 unknown/unknown attestation）"),
+			dockerImagePoint("library/redis:7.0.7", 20*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 manifest list）："+
+					"linux/amd64、linux/arm64/v8、linux/arm/v5、linux/arm/v7、386、mips64le、ppc64le、s390x。"+
+					"compose 里写规范形式 library/redis:7.0.7（等价官方 redis:7.0.7）"),
+		},
+		Note: "宿主端口 8090（8080 是 IOPaint 的保留端口）；PG/Redis **不发布宿主端口**。" +
+			"AP_ENCRYPTION_KEY 用 16 字节 hex（32 个字符）——源码 `Buffer.from(secret,'binary')` + aes-256-cbc " +
+			"要求密钥恰好 32 字符，给 64 个 hex 字符会 Invalid key length（见 catalog.go 条目注释）。" +
+			"AP_FRONTEND_URL 面板拿不到 LAN IP，模板里是 ${AP_FRONTEND_URL:-http://127.0.0.1:8090}，" +
+			"要对外用 webhook 需自行改 .env。",
+	},
+
+	{
+		// Immich：官方 4 容器，下载点逐一列全。
+		ID: "immich", Kind: KindCompose,
+		ComposeImages: []string{
+			"ghcr.io/immich-app/immich-server:release",
+			"ghcr.io/immich-app/immich-machine-learning:release",
+			"ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0",
+			"valkey/valkey:9",
+		},
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("ghcr.io/immich-app/immich-server:release", 30*time.Minute,
+				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连"+
+					"（docker manifest inspect 直接成功）。immich-server 体积较大，30 min 超时未实测完整 pull。"),
+				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/immich-server:release` 直查）："+
+					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
+			dockerImagePoint("ghcr.io/immich-app/immich-machine-learning:release", 30*time.Minute,
+				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连。"+
+					"首次启动还要从外部下载 ML 模型权重，那部分不在这个镜像里。"),
+				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/immich-machine-learning:release` 直查）："+
+					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
+			dockerImagePoint("ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0", 20*time.Minute,
+				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连"+
+					"（docker manifest inspect 直接成功）。与 Immich 官方 compose 用的是同一个 tag。"),
+				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0` 直查）："+
+					"index 里有 linux/amd64 与 linux/arm64"),
+			dockerImagePoint("valkey/valkey:9", 20*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+					"linux/amd64、linux/arm64、linux/arm/v7、ppc64le"),
+		},
+		Note: "官方 4 容器；DB_PASSWORD 由安装时随机生成（hex 32 字节），重装复用不重新生成 —— " +
+			"数据库初始化后再换口令会直接连不上（这是本条目最危险的一点，单测锁死）。" +
+			"官方明确非 Linux 宿主 strongly discouraged；macOS 无硬件转码（只能 CPU 软转），" +
+			"首次启动要下 ML 模型 —— 三条都写进了目录 Description。",
+	},
+
+	{
 		ID: "wordpress", Kind: KindNative,
 		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空"},
 		Downloads: []MarketDownloadPoint{
@@ -1162,6 +1228,34 @@ func MarketAppFor(id string) (MarketApp, bool) {
 		}
 	}
 	return MarketApp{}, false
+}
+
+// declaredComposeImages 把声明里的镜像归一化成一个**有序集合**
+// （单容器的 ComposeImage 与多容器的 ComposeImages 统一处理）。
+func (m MarketApp) declaredComposeImages() []string {
+	if len(m.ComposeImages) > 0 {
+		out := make([]string, len(m.ComposeImages))
+		copy(out, m.ComposeImages)
+		sort.Strings(out)
+		return out
+	}
+	if m.ComposeImage != "" {
+		return []string{m.ComposeImage}
+	}
+	return nil
+}
+
+// equalStringSlices 比较两个已排序的字符串切片是否逐元素相同。
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // MarketIDs 返回全部应用 ID（按目录顺序，用于 --only 的报错提示）。
@@ -1285,20 +1379,35 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 		}
 	}
 
-	// compose 条目：镜像必须与目录里的 compose 文件一致，且不许出现 platform。
+	// compose 条目：镜像集合必须与目录里的 compose 文件一致，且不许出现 platform。
+	// 支持多容器 compose（Activepieces 3 容器 / Immich 4 容器）：声明用
+	// ComposeImages 列出**全部**镜像，并**每个镜像一条 docker_image 下载点** ——
+	// 少一条就等于"有一个容器没有任何下载点声明"，审计会把它的 arm64 证据漏掉。
 	imgs := composeImagesOf(app.ComposeYAML)
 	switch {
 	case m.Kind == KindCompose:
-		if len(imgs) != 1 {
-			add("%s: 目录的 compose 里有 %d 个 image（期望恰好 1 个）：%v", m.ID, len(imgs), imgs)
-		} else if m.ComposeImage != imgs[0] {
-			add("%s: 声明的 ComposeImage=%q，目录 compose 里是 %q", m.ID, m.ComposeImage, imgs[0])
+		declaredImgs := m.declaredComposeImages()
+		if len(declaredImgs) == 0 {
+			add("%s: compose 条目必须在声明里列出镜像（单容器用 ComposeImage，多容器用 ComposeImages）", m.ID)
+		} else if !equalStringSlices(declaredImgs, imgs) {
+			add("%s: 声明的镜像集合 %v 与目录 compose 里的 %v 不一致", m.ID, declaredImgs, imgs)
 		}
 		if strings.Contains(app.ComposeYAML, "platform:") {
 			add("%s: compose 里出现了 `platform:`（铁律②：不许写 platform，更不许 linux/amd64）", m.ID)
 		}
-	case m.ComposeImage != "":
-		add("%s: 声明了 ComposeImage 但目录不是 compose 条目", m.ID)
+		pointed := map[string]bool{}
+		for _, d := range m.Downloads {
+			if d.Purpose == MarketFetchDockerImage {
+				pointed[d.Upstream.ID] = true
+			}
+		}
+		for _, img := range imgs {
+			if !pointed[img] {
+				add("%s: compose 里的镜像 %q 没有对应的 docker_image 下载点声明", m.ID, img)
+			}
+		}
+	case len(m.ComposeImages) > 0 || m.ComposeImage != "":
+		add("%s: 声明了 ComposeImage/ComposeImages 但目录不是 compose 条目", m.ID)
 	}
 
 	// ---- 服务语义：必须显式回答（launchd / container / site / none）----

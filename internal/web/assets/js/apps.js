@@ -1,42 +1,51 @@
-// apps.js —— 应用市场页面。
+// apps.js —— 「应用」页：我的应用（合并去重后的清单）+ 应用市场（可安装目录）。
 //
-// 核心思路：把"能不能装"和"装什么"分开。
+// 2026-09-17 信息架构合并（用户："服务管理/apps 合并，执行你的建议（推荐 A）"）：
+//   原来的「服务管理」与「应用市场」两个导航项合成**一个「应用」版块**，页内两个 Tab：
+//     · 我的应用 —— 市场里已安装的条目 + 面板服务记录，按归一化 key 合并去重，
+//                   一行一条（实现住在 services.js 的 renderMyApps）；
+//     · 应用市场 —— 可安装 / 可更新的目录条目（本文件的卡片网格）。
+//   老链接 `#/services` 由 app.js 的 ROUTE_TARGET 落到本页并切到「我的应用」Tab。
+//
+// 市场这一侧的核心思路：把"能不能装"和"装什么"分开。
 //   - 用户点安装时，先跑一次安装前检查（依赖、端口），把问题一次说清
 //   - 检查通过才真正安装；安装是**异步任务**，提交后进度交给「任务中心」，
 //     用户可以关窗口、切页面，随时从顶栏重新打开看进度（见 tasks.js）
-//   - 已经装过的应用显示"已安装"，可以一键跳到服务管理页
+//   - 已经装过的应用显示"已安装"，常用动作（打开/直链/启停/重启/刷新/管理）
+//     直接摆在卡片上；安装生命周期动作（重装 / 卸载 / 文档）收进「⚙️ 管理」面板
 
 import { api } from './api.js';
 import { h, clear, toast, modal, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
-// 「应用管理」面板与启停/重启的唯一实现在 servicePanel.js —— 服务管理页点开的
+// 「我的应用」Tab 的实现（合并去重清单）住在 services.js —— 它是原服务管理页
+// 的继承者，数据字段（服务记录）也主要来自那一侧。
+import { renderMyApps } from './services.js';
+// 「应用管理」面板与启停/重启的唯一实现在 servicePanel.js —— 「我的应用」行点开的
 // 是**同一个**面板（这是用户 2026-09-16 的核心要求：同一个应用的能力不分散在
 // 两个页面）。卡片上通往它的入口**只有一个**「⚙️ 管理」：用户明确说原来的
 // 「详情」与「查看服务」内容一样，"统一保留一个管理就行了"，所以那两个按钮都删了。
 // 配置文件编辑器（configFileModal）住在 services.js，由面板内部复用，这里不再直接用。
 //
-// openDirectActions / hasPanelUI 也来自 servicePanel.js：卡片上的「打开 / 直链」
-// 与服务卡片、管理面板**必须**是同一份实现（用户 2026-09-17："打开/直链/刷新/
-// 重启/停止/管理"这组固定语义，两处不能各写一套）。
-import { openServicePanel, marketQuickActions, openDirectActions, hasPanelUI } from './servicePanel.js';
+// openDirectActions / subpathWarning / hasPanelUI 也来自 servicePanel.js：卡片上的
+// 「打开 / 直链」与服务行、管理面板**必须**是同一份实现（用户 2026-09-17："打开/
+// 直链/刷新/重启/停止/管理"这组固定语义，两处不能各写一套）。subpathWarning 是
+// 按钮下方那行"为什么不支持子路径"的小字（用户第四条抱怨：只有 ⚠️ 没有解释）。
+import { openServicePanel, marketQuickActions, openDirectActions, hasPanelUI, subpathWarning } from './servicePanel.js';
 
 let cache = null;
+// svcList 是这轮市场数据对应**完整服务记录**（api.services(true)，带健康检查）。
+// 「我的应用」Tab 用它做合并去重、状态/端口/健康、以及管理面板的 svc 入参。
+let svcList = [];
 // proxyState 是 /api/v1/market/proxies 的探测结果（slug → {proxy_ok, reason}）。
 // 它只服务于顶部「检测可用性 / 生成 nginx 入口」两个工具，**不再**决定「打开 /
 // 直链」的归属：那个探测不带面板会话，子路径在面板端口上返回 401，proxy_ok
 // 几乎恒为 false —— 用它决定归属会让 it-tools 这类应用的「打开」错变成端口直连。
 let proxyState = null;
-// svcState 是"这轮市场数据对应的服务状态"（服务名 → state），来自一次
-// api.services(false)（**不带健康检查**，所以很快）。
-//
-// 为什么市场页也要拉它：卡片上的第一颗动作按钮要在「启动」与「停止」之间选一个。
-// 以前市场卡片只有"编辑配置 + 重启"，服务管理页才有启停 —— 用户的原话是
-// "能作的也就是：停止重启这些，直接放在软件页面不就行了？"。
-// 拿不到状态时（还没加载完 / 这个应用没有服务记录）退化成「启动」：
-// 后端对一个已经在跑的服务执行 start 是幂等的，不会因此谎报状态。
+// svcState 是"这轮市场数据对应的服务状态"（服务名 → state），由 svcList 派生。
+// 市场卡片的首颗动作按钮要在「启动」与「停止」之间选一个；拿不到状态时退化成
+// 「启动」（后端对一个已经在跑的服务执行 start 是幂等的，不会因此谎报状态）。
 let svcState = {};
-let svcStateLoaded = false;
 
 // ---------------- 分类筛选（全部 / 原生 / Docker） ----------------
 //
@@ -80,7 +89,7 @@ function kindGroupOf(a) {
 // 拿不到视图闭包里的 renderGrid；直接在里面调用会抛 ReferenceError
 // （下拉能改、localStorage 也写了，但列表纹丝不动）。
 function kindFilterSelect(onChange) {
-  const sel = h('select.select', {
+  const sel = h('select#apps-kind-filter.select', {
     style: { width: 'auto' },
     title: '只看某一类应用：原生 = Homebrew / 官方 darwin 二进制；'
       + 'Docker = 容器应用与 Colima 容器运行时',
@@ -97,65 +106,112 @@ function kindFilterSelect(onChange) {
   return sel;
 }
 
-// loadServiceStates 拉一次全部服务的状态（不带健康检查），并重画卡片。
-// 失败就保持空表 —— 宁可按"未知"渲染，也不让整个市场页打不开。
-async function loadServiceStates() {
-  try {
-    const res = await api.services(false);
-    const next = {};
-    for (const s of (res && res.list) || []) {
-      if (s && s.name) next[s.name] = s.state || null;
-    }
-    svcState = next;
-    svcStateLoaded = true;
-  } catch {
-    svcStateLoaded = false;
-  }
+// ---------------------------------------------------------------------------
+//  页内 Tab（用户 2026-09-17：服务管理 + 应用市场 → 一个「应用」版块）
+// ---------------------------------------------------------------------------
+
+// INSTALL_FILTERS 是应用市场的安装状态筛选，默认「未安装」——
+// 市场这一栏的用途是"还能装什么"；已安装应用的常用动作在「我的应用」里。
+const INSTALL_FILTERS = [
+  { id: '', label: '全部' },
+  { id: 'missing', label: '未安装' },
+  { id: 'installed', label: '已安装' },
+];
+let installFilter = 'missing';
+
+function installFilterSelect(onChange) {
+  const sel = h('select#apps-install-filter.select', {
+    style: { width: 'auto' },
+    title: '按安装状态筛选：未安装 = 还能装的；已安装 = 装过的（常用动作在「我的应用」里）',
+  }, INSTALL_FILTERS.map((f) => h('option', { value: f.id, text: f.label, selected: installFilter === f.id })));
+  sel.addEventListener('change', () => {
+    installFilter = INSTALL_FILTERS.some((f) => f.id === sel.value) ? sel.value : 'missing';
+    if (typeof onChange === 'function') onChange();
+  });
+  return sel;
 }
+
+// isInstalled 是"已安装 / 已纳管"的唯一判据（市场卡片按钮、安装筛选共用）。
+function isInstalled(a) { return !!(a && (a.installed || a.adopted)); }
 
 export function AppsView(content, ctx = {}) {
   clear(content);
 
-  const grid = h('div');
-  const head = h('div.card-head', [
-    h('h3', { text: '应用市场' }),
-    h('div.spacer'),
-    h('div', { id: 'apps-head', style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
-  ]);
+  // 默认落在「我的应用」；`#/services`（app.js 的 ROUTE_TARGET）显式给 tab='mine'，
+  // 老书签因此仍然落在原服务管理的那份清单上。
+  let active = ctx && ctx.tab === 'market' ? 'market' : 'mine';
+  let loadError = null;
+  let marketGrid = null;
+  let marketHead = null;
 
-  appendAll(content, 
-    h('div.card', [head, h('div.card-body', [grid])]),
-  );
-  const headBox = head.querySelector('#apps-head');
+  const tabBar = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '14px', flexWrap: 'wrap' } });
+  const body = h('div');
+  appendAll(content, tabBar, body);
 
-  async function load() {
-    clear(grid);
-    appendAll(grid, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取应用目录…' })]));
-    try {
-      cache = await api.market();
-    } catch (e) {
-      clear(grid);
-      appendAll(grid, h('div.empty', [
-        h('div.big', { text: '⚠️' }), h('h4', { text: '读取失败' }), h('p', { text: e.message }),
-      ]));
+  function renderTabBar() {
+    clear(tabBar);
+    for (const t of [{ id: 'mine', title: '我的应用' }, { id: 'market', title: '应用市场' }]) {
+      tabBar.appendChild(h(`button.btn.btn-sm${active === t.id ? '.btn-primary' : ''}`, {
+        dataset: { tab: t.id },
+        text: t.title,
+        onclick: () => { if (active === t.id) return; active = t.id; renderTabBar(); renderBody(); },
+      }));
+    }
+  }
+
+  function renderBody() {
+    clear(body);
+    if (active === 'mine') renderMineTab();
+    else renderMarketTab();
+  }
+
+  function renderMineTab() {
+    if (loadError && !cache) {
+      appendAll(body, h('div.card', [h('div.card-body', [h('div.empty', [
+        h('div.big', { text: '⚠️' }), h('h4', { text: '读取失败' }), h('p', { text: loadError.message || String(loadError) }),
+      ])])]));
       return;
     }
-    // 服务状态**后台补**（用来决定卡片上首颗按钮是「启动」还是「停止」）：
-    // 市场数据一到就先画，不让状态查询挡住页面 ——
-    // 以前市场页"打开较慢"的教训就是别在首屏串行等慢接口。
-    // 拿不到状态时按钮退化成「启动」（后端 start 幂等，不会谎报）。
-    loadServiceStates().then(() => { if (cache) renderGrid(); });
+    // 合并去重、每行按钮、可纳管扫描都在 services.js 的 renderMyApps 里
+    // （它同时握着市场条目与服务记录，见那边文件头的说明）。
+    renderMyApps(body, { market: cache, list: svcList, onReload: load });
+  }
+
+  // rebuildSvcState 从完整服务记录派生"服务名 → state"（市场卡片首颗按钮用）。
+  function rebuildSvcState() {
+    const next = {};
+    for (const s of svcList) if (s && s.name) next[s.name] = s.state || null;
+    svcState = next;
+  }
+
+  // fetchAll 一次拉齐两边的数据：市场目录 + 服务记录（带健康检查）。
+  // 两者**并行**，且一个失败不影响另一个（服务记录拉不到时「我的应用」只显示
+  // 市场里的已安装条目，如实降级，不谎报）。
+  //
+  // 注意：这里用的是 api.services(true)（**带健康检查**，比市场自己以前用的
+  // false 慢一点），因为「我的应用」每行要给出健康检查结果。两个请求并行发出，
+  // 首屏等待没有叠加。
+  async function fetchAll() {
+    const [mkt, svc] = await Promise.allSettled([api.market(), api.services(true)]);
+    if (mkt.status === 'fulfilled') { cache = mkt.value; loadError = null; }
+    else if (!cache) loadError = mkt.reason;
+    if (svc.status === 'fulfilled') svcList = (svc.value && svc.value.list) || [];
+    rebuildSvcState();
+  }
+
+  async function load() {
+    clear(body);
+    appendAll(body, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取应用目录…' })]));
+    await fetchAll();
     // 探测是"能不能打开"的依据，但它要跑十几条网络请求（含 8 秒超时）。
     // **不在打开页面时自动跑** —— 用户反馈"应用市场打开较慢，其它页面都是秒开"。
     // 改为：结果缓存在内存里；点「检测可用性」时才真跑；生成入口后刷新一次。
-    if (!proxyState) {
-      proxyState = { enabled: true, items: [], _stale: true };
-    }
-    renderHead();
-    renderGrid();
+    if (!proxyState) proxyState = { enabled: true, items: [], _stale: true };
+    renderTabBar();
+    renderBody();
   }
 
-  // stateOfApp 取这个应用在服务记录里的状态（给卡片上的启停按钮用）。
+  // stateOfApp 取这个应用在服务记录里的状态（给市场卡片上的启停按钮用）。
   //
   // 键要把三种写法都试一遍：面板记录名不一定是目录 ID（frpc 的记录名是
   // com.zizdog.frpc），与后端 FindAppByService 认的写法保持一致。
@@ -166,18 +222,42 @@ export function AppsView(content, ctx = {}) {
     return null;
   }
 
+  // ---------- 应用市场 Tab ----------
+  function renderMarketTab() {
+    const grid = h('div');
+    const head = h('div.card-head', [
+      h('h3', { text: '应用市场' }),
+      h('div.spacer'),
+      h('div#apps-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
+    ]);
+    appendAll(body, h('div.card', [head, h('div.card-body', [grid])]));
+    marketGrid = grid;
+    marketHead = head.querySelector('#apps-head');
+    if (loadError && !cache) {
+      appendAll(marketGrid, h('div.empty', [
+        h('div.big', { text: '⚠️' }), h('h4', { text: '读取失败' }), h('p', { text: loadError.message || String(loadError) }),
+      ]));
+      return;
+    }
+    renderHead();
+    renderGrid();
+  }
+
   function renderHead() {
-    clear(headBox);
+    if (!marketHead) return;
+    clear(marketHead);
     const docker = cache?.docker || {};
-    const installed = (cache?.list || []).filter((a) => a.installed).length;
-    appendAll(headBox, 
+    const installed = (cache?.list || []).filter(isInstalled).length;
+    appendAll(marketHead,
       h('span.pill', { text: `共 ${(cache?.list || []).length} 个应用` }),
       installed > 0 ? h('span.pill.ok', { text: `已安装 ${installed}` }) : null,
       h('span.pill' + (docker.available ? '.ok' : '.warn'), {
         text: docker.available ? `Docker ${docker.version || '已就绪'}` : 'Docker 未安装',
         title: docker.available ? 'Docker socket: ' + docker.socket : 'Docker 类应用需要先安装 Docker（推荐 OrbStack）',
       }),
-      // 「全部 / 原生 / Docker」筛选（按 Kind 在前端过滤，选择记在 localStorage）。
+      // 安装状态筛选（默认「未安装」）+ 「全部 / 原生 / Docker」筛选（按 Kind，
+      // 选择记在 localStorage）。两个下拉都只做前端过滤，切换不重新请求。
+      installFilterSelect(renderGrid),
       kindFilterSelect(renderGrid),
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
       // 「一键安装 LNMP 环境」已从这里**搬到「网站管理」页**（用户要求：它属于网站板块）。
@@ -187,7 +267,8 @@ export function AppsView(content, ctx = {}) {
       // 后端能力（POST /api/v1/market/install-lnmp）与目录条目都保留；目录里
       // 本来也没有 ID=lnmp 的 App（见 catalog.go「网站环境」段的说明），所以市场
       // 不会渲染出它的卡片；万一将来有人加进去，web 层的 marketHiddenApps 会挡下。
-      h('button.btn.btn-sm', { text: '⚙️ 服务管理', onclick: () => { location.hash = '#/services'; } }),
+      // 原来的「⚙️ 服务管理」按钮已删：那一页就是本页的「我的应用」Tab，
+      // 页内 Tab 已经给了入口，再放一颗按钮只会让人以为是两个页面。
       // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
       // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
       proxyState && proxyState.enabled
@@ -379,44 +460,12 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // adoptApp 把一个已安装但未登记的服务纳管进来。
-  //
-  // 市场卡片**不再**直接给「纳管」按钮：它是另一个语义（登记一个已经在跑的
-  // 服务），而卡片的按钮集合是固定的那六颗（打开/直链/刷新/重启/停止/管理，
-  // 2026-09-17 用户要求）。
-  // 这个实现保留在这里，因为 api.adopt 仍被「服务管理 → 扫描可纳管服务」使用，
-  // 两处的行为必须一致；以后若要把纳管放回面板，直接用这个函数即可。
-  //
-  // 这是"自动纳管的兜底"：面板启动时会自动登记目录里已知的服务，
-  // 但如果服务是后装的、或标签不在目录里，就得靠它。
-  function adoptApp(a) {
-    const label = a.service_label || a.adopt_label;
-    if (!label) { toast('这个应用没有可纳管的服务标签', 'warn'); return; }
-    modal({
-      title: `纳管「${a.name}」`,
-      body: h('div', { style: { fontSize: '12.5px', lineHeight: '1.8' } }, [
-        h('p', { text: `将把本机正在运行的 ${label} 登记到「服务管理」。` }),
-        h('p', { style: { color: 'var(--text-mute)' },
-          text: '面板只做启停与查看，不会卸载它、也不会改动它的启动方式。' }),
-      ]),
-      footer: (close) => [
-        h('button.btn', { text: '取消', onclick: close }),
-        h('button.btn.btn-primary', {
-          text: '确认纳管',
-          onclick: async () => {
-            close();
-            try {
-              await api.adopt({ label, display_name: a.name, icon: a.icon, port: a.port, category: a.category });
-              toast(`已纳管「${a.name}」`, 'ok');
-              load();
-            } catch (e) {
-              toast(e.message, 'err', 12000);
-            }
-          },
-        }),
-      ],
-    });
-  }
+  // adoptApp（纳管一个已在跑的服务）已删除（2026-09-17 合并时）：
+  // 唯一的纳管入口是「我的应用 → 🔍 扫描可纳管服务」，实现住在 services.js 的
+  // renderMyApps（openAdoptable）。市场卡片本来就不给「纳管」按钮 —— 卡片的
+  // 按钮集合是固定那六颗（打开/直链/启停/重启/刷新/管理），而纳管是另一个语义
+  // （登记一个已经存在的服务），不该混进应用的生命周期动作里。
+  // 保留两份"确认纳管"弹窗只会在文案与行为上慢慢分叉，所以这里整段删掉。
 
   function installPhpMyAdmin(appId) {
     taskCenter.start({
@@ -428,20 +477,30 @@ export function AppsView(content, ctx = {}) {
   }
 
   function renderGrid() {
-    clear(grid);
+    if (!marketGrid) return;
+    clear(marketGrid);
     const all = cache?.list || [];
     if (!all.length) {
-      appendAll(grid, h('div.empty', [h('div.big', { text: '🧩' }), h('h4', { text: '应用目录为空' })]));
+      appendAll(marketGrid, h('div.empty', [h('div.big', { text: '🧩' }), h('h4', { text: '应用目录为空' })]));
       return;
     }
 
-    // 先按「全部 / 原生 / Docker」筛选（纯前端，见 kindGroupOf）。
-    const list = kindFilter ? all.filter((a) => kindGroupOf(a) === kindFilter) : all;
+    // 先按安装状态（默认「未安装」）与「全部 / 原生 / Docker」筛选
+    // （纯前端，见 isInstalled / kindGroupOf）。
+    let list = all;
+    if (installFilter === 'missing') list = list.filter((a) => !isInstalled(a));
+    else if (installFilter === 'installed') list = list.filter(isInstalled);
+    if (kindFilter) list = list.filter((a) => kindGroupOf(a) === kindFilter);
+
     if (!list.length) {
-      appendAll(grid, h('div.empty', [
+      appendAll(marketGrid, h('div.empty', [
         h('div.big', { text: '🔍' }),
-        h('h4', { text: '这一类暂时没有应用' }),
-        h('p', { text: '把上方的筛选切回「全部」就能看到全部应用。' }),
+        h('h4', { text: installFilter === 'missing' ? '没有可安装的新应用了' : '这一类暂时没有应用' }),
+        h('p', {
+          text: installFilter === 'missing'
+            ? '目录里的应用都已经安装。把筛选切到「已安装」可以看它们的常用动作，或切到「全部」。'
+            : '把上方的筛选切回「全部」就能看到全部应用。',
+        }),
       ]));
       return;
     }
@@ -454,7 +513,7 @@ export function AppsView(content, ctx = {}) {
     if (!sections.length) {
       // 后端没给 sections（旧版本 / 接口异常）时的降级：不按分类分板块，
       // 但**必须把应用都显示出来**，不能因为拿不到板块定义就留一片空白。
-      appendAll(grid,
+      appendAll(marketGrid,
         h('div.section-title', { text: '全部应用' }),
         h('div.grid.grid-3', list.map((a) => appCard(a))),
       );
@@ -472,8 +531,8 @@ export function AppsView(content, ctx = {}) {
         : list.filter((a) => (a.category || 'other') === s.key);
       if (!items.length) continue;
       items.forEach((a) => covered.add(a));
-      appendAll(grid,
-        h('div.section-title', { style: { marginTop: grid.childElementCount ? '20px' : '0' }, text: s.label }),
+      appendAll(marketGrid,
+        h('div.section-title', { style: { marginTop: marketGrid.childElementCount ? '20px' : '0' }, text: s.label }),
         h('div.grid.grid-3', items.map((a) => appCard(a))),
       );
     }
@@ -482,7 +541,7 @@ export function AppsView(content, ctx = {}) {
     const rest = list.filter((a) => !covered.has(a));
     if (rest.length) {
       const title = fallback ? fallback.label : (sections[sections.length - 1].label || '');
-      appendAll(grid,
+      appendAll(marketGrid,
         h('div.section-title', { style: { marginTop: '20px' }, text: title }),
         h('div.grid.grid-3', rest.map((a) => appCard(a))),
       );
@@ -625,12 +684,12 @@ export function AppsView(content, ctx = {}) {
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
         primaryButton(a),
         // 界面入口：打开 / 直链 —— **同一份实现**在 servicePanel.js 的
-        // openDirectActions（服务卡片与管理面板也用它）。只有已安装、
+        // openDirectActions（「我的应用」行与管理面板也用它）。只有已安装、
         // 且确实有面板托管界面的应用才有（frpc 这类自带控制台不算）。
         ...(a.installed ? openDirectActions(a) : []),
         // 已安装应用的常用动作：启动/停止、重启、刷新、⚙️ 管理。
-        // 用户要求（2026-09-16）：卡片上直接给常用动作，**不需要先跳到服务管理页**；
-        // 而「⚙️ 管理」打开的是与服务管理页**同一个**面板 ——
+        // 用户要求（2026-09-16）：卡片上直接给常用动作，**不需要先跳到别的页面**；
+        // 而「⚙️ 管理」打开的是与「我的应用」行**同一个**面板 ——
         // 配置文件的编辑、凭据、日志、重装、文档、卸载都在那里面，不是两套按钮。
         // 2026-09-17 起卡片上只有这一组固定语义的按钮（打开/直链/启停/重启/刷新/管理），
         // 「重装」「文档」也从卡片收进了这个面板。
@@ -650,11 +709,16 @@ export function AppsView(content, ctx = {}) {
           ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' })
           : null,
       ]),
+      // prefer_direct（人工实测子路径不可用）时，按钮下方给一行**始终可见**的
+      // 说明 —— 用户 2026-09-17 第四条抱怨：Miniflux / Syncthing / Alist / ddns-go
+      // 显示「⚠️ 打开」却没有任何解释。只有 ⚠️ 与 title 不够，不悬浮就看不到。
+      // 与服务行、管理面板同一份实现（servicePanel.subpathWarning）。
+      subpathWarning(a),
     ]);
   }
 
   // openButtons 已删除（2026-09-17）：卡片上的「打开 / 直链」现在直接调用
-  // servicePanel.js 的 openDirectActions —— 与服务卡片、管理面板同一份实现。
+  // servicePanel.js 的 openDirectActions —— 与「我的应用」行、管理面板同一份实现。
   // 旧的这份按 /api/v1/market/proxies 的探测结果决定"打开=子路径还是端口直连"，
   // 而那个探测不带面板会话（子路径返回 401 → proxy_ok 几乎恒为 false），
   // 结果把 it-tools 这类应用的「打开」错变成了端口直连、子路径降级成「试试子路径」。
@@ -664,16 +728,16 @@ export function AppsView(content, ctx = {}) {
   //
   // 2026-09-16 改版：以前卡片上按应用类型分两套按钮 ——
   // 有面板界面的给「打开」，没有的给「📝 编辑配置文件 + 🔄 重启服务」，
-  // 而「停止/启动」只在服务管理页有。用户的原话是"能作的也就是：停止重启这些，
+  // 而「停止/启动」当时只在服务管理页有。用户的原话是"能作的也就是：停止重启这些，
   // 直接放在软件页面不就行了？折腾什么？"，再加上 frpc 的配置入口在市场、
   // TTS 接收端的在服务管理 —— 同一个应用的能力被拆到了两个页面。
   //
   // 现在只有一个入口：**应用管理面板**（servicePanel.js）。卡片上给常用动作
-  // （打开/直链/启停/重启/刷新）+「⚙️ 管理」，服务管理页点开的也是同一个面板。
+  // （打开/直链/启停/重启/刷新）+「⚙️ 管理」，「我的应用」行点开的也是同一个面板。
   // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / ui.slug /
   // ui.console_only / 凭据接口是否为空），这里不再按应用 ID 写任何分支。
   //
-  // hasPanelUI 从 servicePanel.js 导入（与面板、服务卡片**同一条判据**）；
+  // hasPanelUI 从 servicePanel.js 导入（与面板、「我的应用」行**同一条判据**）；
   // openButtons 已删、openAppDetail 不再传 proxyState ——「打开 / 直链」的归属
   // 由数据（ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关。
 
@@ -892,7 +956,7 @@ export function AppsView(content, ctx = {}) {
   //
   // 重装的确认框与调度都收进了 servicePanel.js 的 reinstallButton（管理面板里
   // 那颗「重装」）；本文件只提供"用哪套安装器"这一步（上面的 openInstaller）。
-  // 这样"重装"这个动作在两个入口（市场卡片 → 管理、服务管理 → 管理）只有一份
+  // 这样"重装"这个动作在两个入口（市场卡片 → 管理、「我的应用」行 → 管理）只有一份
   // 文案与一份确认语义，而应用自己的选项框仍然保留。
 
   // ---------- 安装前检查 ----------
@@ -996,18 +1060,16 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // refreshSilently 重新拉一次市场数据并重画卡片，**不显示"正在读取"占位**。
+  // refreshSilently 重新拉一次市场数据 + 服务记录并原地重画当前 Tab，
+  // **不显示"正在读取"占位**。
   //
-  // 为什么要单独一个：load() 会先 clear(grid) 再显示 loading 占位，
+  // 为什么要单独一个：load() 会先 clear(body) 再显示 loading 占位，
   // 任务刚结束时调用它，用户会看到整页闪一下白 —— 而他要的只是"状态更新"。
+  // 注意两边都要重拉：装的/卸的东西同时改变市场条目的 installed 与服务记录，
+  // 只刷新市场会让「我的应用」停在旧状态（安装后不进清单）。
   async function refreshSilently() {
-    try {
-      cache = await api.market();
-    } catch {
-      return; // 拉不到就保持旧画面，不要把一个空网格拍给用户
-    }
-    renderHead();
-    renderGrid();
+    await fetchAll();
+    renderBody();
   }
 
   // 任务状态变化（开始/结束）时重画卡片：正在安装的应用，按钮要变成「查看进度」。
@@ -1016,7 +1078,7 @@ export function AppsView(content, ctx = {}) {
   // 清理掉的只是"这个页面要不要重画"。
   registerCleanup(taskCenter.onChange((kind) => {
     if (kind === 'lines' || !cache) return;
-    renderGrid();
+    renderBody();
   }));
   load();
 }

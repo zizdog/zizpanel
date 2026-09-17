@@ -1,20 +1,25 @@
-// appdetail-verify.mjs —— 端到端验证「应用管理面板」在市场与服务管理两处是同一个，
-// 以及卡片按钮清单完全由数据决定（用户 2026-09-16 那一轮需求的证据脚本）。
+// appdetail-verify.mjs —— 端到端验证「应用管理面板」在**唯一**的「应用」页两处
+// （我的应用 / 应用市场）是同一个，卡片/行的按钮清单完全由数据决定。
 //
 // 为什么这么搭：
 //   · 真 acorn（tools/check-js-syntax.mjs）只能证明语法合法，证明不了"点开是同一个面板"，
 //     所以这里用 Playwright 加载**真实的** apps.js / services.js / servicePanel.js；
 //   · app.js 是应用外壳（会 boot、拉会话、渲染登录页），在这里只会捣乱，
 //     所以用 importmap 把它换成一个最小替身（只提供 state / panelPath /
-//     registerCleanup）—— **被验证的三个文件本身一个字符都没有改**；
+//     registerCleanup / routeFor）—— **被验证的三个文件本身一个字符都没有改**；
 //   · 后端用假 fetch：要验的是"按钮由数据决定"，所以给几个代表性应用就够。
 //
-// 这一轮（截止 0.11.0 的显示问题）要证明的四件事：
-//   ① 已安装应用的主按钮是「重装」，不再有「查看服务」；
-//   ② 卡片上通往管理面板的入口只有**一个**「⚙️ 管理」（「详情」与「查看服务」合并）；
-//   ③ 服务状态刷新按钮的文案是「⟳ 刷新」（原来是「刷新状态」）；
-//   ④ ffmpeg（no_daemon 命令行工具）不再显示"读取中…/未在服务管理里"，
-//      而且面板**根本不去查**不存在的服务记录；即使请求永不返回也有硬超时终态。
+// 历史需求（仍然锁着）：已安装应用卡片上只有「打开/直链/启停/重启/刷新/管理」，
+// 「重装/卸载/文档」收进「⚙️ 管理」面板；刷新按钮文案是「⟳ 刷新」；ffmpeg
+// （no_daemon）不显示"读取中/未在服务管理里"，面板也不去查不存在的记录。
+//
+// 2026-09-17 信息架构合并（服务管理 + 应用市场 → 一个「应用」版块，页内两个 Tab）
+// 新增的验收：
+//   ① 「我的应用」里 php82 **只有一行**（两条服务记录 + 市场条目按归一化 key 合并）；
+//   ② 同一行既有「打开 / 直链」又有「⚙️ 管理」（市场元数据与服务记录都在）；
+//   ③ prefer_direct 的行与管理面板都显示"该应用不支持子路径…"那行**可见**小字；
+//   ④ `#/services` 经 app.js 的别名落到同一个页面并自动切到「我的应用」Tab；
+//   ⑤ 应用市场安装筛选默认「未安装」；纯纳管服务有端口时管理面板给出拼接的「直链」。
 //
 // 用法： export PATH=/opt/homebrew/bin:$PATH; node tools/appdetail-verify.mjs
 import { chromium } from 'playwright';
@@ -181,6 +186,19 @@ const MARKET = {
       uninstall: { kind: 'forget', service: 'nginx', steps: ['从「服务管理」中删除这条记录'] },
     },
     {
+      // 2026-09-17 合并验收：真机上 php81/82/83/84 每套在服务记录里都是**两条**
+      // （php82 与 sh-brew-php8-2，launchd 标签一个 homebrew.mxcl.php@8.2、
+      // 一个 sh.brew.php8-2）。合并后「我的应用」里必须只剩**一行**。
+      // 这条市场条目故意带 ui.slug + port_url：用来断言合并后的同一行既有
+      // 「打开 / 直链」又有「管理」（两边的元数据都拿到了）。
+      id: 'php82', name: 'PHP 8.2 (FPM)', icon: '🐘', category: 'lnmp', kind: 'native',
+      summary: 'PHP 8.2 运行环境', description: 'brew 装的 PHP 8.2（FPM）。', port: 9000,
+      installed: true, adopted: true, available: true,
+      service_label: 'homebrew.mxcl.php@8.2', service_in_launchd: true,
+      ui: { slug: 'php82' }, port_url: 'http://192.168.1.4:9000/',
+      uninstall: { kind: 'forget', service: 'php82', steps: ['从「服务管理」中删除这条记录'] },
+    },
+    {
       // 超时兜底验证：它的服务查询**永不返回**。面板必须在硬超时后落定成终态，
       // 而不是永远停在「正在读取服务状态…」。用户反馈的"卡在读取中"就是这一类。
       id: 'slow-app', name: 'Slow App（超时兜底验证）', icon: '🐢', category: 'tool', kind: 'native',
@@ -221,6 +239,12 @@ const SERVICES = {
     SV({ name: 'com.zizdog.voicereceiver', display_name: 'TtsVoice 音色接收端', icon: '🔐', kind: 'native', port: 8899, category: 'ai', launch_label: 'com.zizdog.voicereceiver', config_path: '/Users/zizdog/voicereceiver/receiver.toml' }),
     SV({ name: 'uptime-kuma', display_name: 'Uptime Kuma', icon: '📡', kind: 'compose', port: 3001, compose_file: '/Users/zizdog/compose/uptime-kuma/docker-compose.yml', container: 'uptime-kuma' }),
     SV({ name: 'nginx', display_name: 'Nginx（brew）', icon: '🌐', kind: 'native', port: 8080, category: 'lnmp', managed: false, launch_label: 'homebrew.mxcl.nginx', health: { checked: false } }),
+    // 真机重复对的复刻：同一套 PHP 8.2 有两条服务记录、两套 launchd 标签写法
+    // （点分前缀 + @ 的 homebrew.mxcl.php@8.2，与连字符写法 sh.brew.php8-2）。
+    // 一条在跑、一条停着；**字段故意错开**（plist 路径只在被丢弃那条上）——
+    // 合并后必须只剩一行，状态取在跑的那条、plist 路径补自另一条。
+    SV({ name: 'php82', display_name: 'PHP 8.2 (FPM)', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'homebrew.mxcl.php@8.2', config_path: '/opt/homebrew/etc/php/8.2/php-fpm.d/www.conf', log_path: '/opt/homebrew/var/log/php-fpm.log', state: { running: true, status: 'running', detail: 'pid 1234' } }),
+    SV({ name: 'sh-brew-php8-2', display_name: 'PHP 8.2', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'sh.brew.php8-2', plist_path: '/Users/zizdog/Library/LaunchAgents/homebrew.mxcl.php@8.2.plist', health: { checked: false }, state: { running: false, status: 'stopped', detail: '未在运行' } }),
   ],
 };
 
@@ -285,8 +309,10 @@ const result = await page.evaluate(async () => {
   try { localStorage.removeItem('zp-market-kind-filter'); } catch { /* 无 localStorage 也没关系 */ }
   const { AppsView } = await import('./apps.js');
   const { SitesView } = await import('./sites.js');
-  const { ServicesView } = await import('./services.js');
-  const { openServicePanel } = await import('./servicePanel.js');
+  const { openServicePanel, appKeyOf } = await import('./servicePanel.js');
+  // 「应用」页外壳：只借 routeFor 验 `#/services` 的别名（app.js 被服务端换成
+  // 最小替身，NAV 为空，但路由函数一字未改）。
+  const { routeFor } = await import('./app.js');
 
   // 禁用状态也要看：用户的原话是"点了没用的按钮比没有按钮更糟"，
   // 所以清单里把 disabled 标出来（禁用是**如实说明**，不是漏做）。
@@ -321,16 +347,23 @@ const result = await page.evaluate(async () => {
     const statusLine = (body.firstElementChild?.textContent || '').trim();
     const panelText = (body.innerText || '').trim();
     const buttons = btns(scope);
+    // 「打开 / 直链」的 href 与 title 也要采：合并后纯纳管服务（没有 port_url）
+    // 的直链是用 location.hostname + 端口拼出来的，title 里必须说明这一点。
+    const links = Array.from(scope.querySelectorAll('a.btn')).map((a) => ({
+      text: (a.textContent || '').trim(),
+      href: a.getAttribute('href') || '',
+      title: a.getAttribute('title') || '',
+    }));
     // scope 里的节点是 clone 出来临时挂的，用完必须摘掉：
     // 否则它们会留在文档里，被下一次 document.querySelectorAll 采到，
     // 于是"服务管理点开的面板"实际上一直采的是上一次市场的面板（第一版就栽在这）。
     scope.remove();
-    return { title, status: statusLine.slice(0, 160), panelText: panelText.slice(0, 400), buttons };
+    return { title, status: statusLine.slice(0, 160), panelText: panelText.slice(0, 1200), buttons, links };
   };
   const closeModal = () => { const m = document.querySelector('.modal-mask'); if (m) m.remove(); };
   const settle = () => new Promise((r) => setTimeout(r, 120));
 
-  const out = { market: {}, sites: {}, service: {}, panelFromMarket: {}, panelFromService: {}, timeout: {} };
+  const out = { market: {}, sites: {}, myapps: {}, route: {}, panelFromMarket: {}, panelFromService: {}, timeout: {} };
   // 网站管理页 LNMP 按钮的引用（见 ①c / ①e）；DOM 节点不进 out。
   let lnmpListBtn = null;
 
@@ -340,11 +373,20 @@ const result = await page.evaluate(async () => {
   const cardNamesNow = (box) => Array.from(box.querySelectorAll('.grid > div')).map(cardName);
 
   // ---- ① 应用市场 ----
+  // 合并后应用市场是第二个 Tab（默认落在「我的应用」）；这里显式打开市场 Tab。
   const appsBox = document.createElement('div');
   root.appendChild(appsBox);
-  AppsView(appsBox, {});
+  AppsView(appsBox, { tab: 'market' });
   await settle();
   await settle(); // 服务状态是后台补的，等它回来再采按钮
+  // 安装状态筛选（用户要求的「全部 / 未安装 / 已安装」，默认「未安装」）：
+  // 先采默认视图（应只有未安装的应用），再切到「全部」做后面的卡片断言。
+  const installSel = appsBox.querySelector('#apps-install-filter');
+  out.market.installFilterOptions = installSel ? Array.from(installSel.options).map((o) => o.textContent) : null;
+  out.market.installFilterDefault = installSel ? installSel.value : null;
+  out.market.defaultInstallCards = Array.from(appsBox.querySelectorAll('.grid > div')).map(cardName);
+  if (installSel) { installSel.value = ''; installSel.dispatchEvent(new Event('change')); }
+  await settle();
   const acards = Array.from(appsBox.querySelectorAll('.grid > div'));
   out.market.cardNames = acards.map(cardName);
   out.market.buttons = {};
@@ -363,8 +405,8 @@ const result = await page.evaluate(async () => {
   out.market.headButtons = headBox
     ? Array.from(headBox.querySelectorAll('button, a.btn')).map((b) => (b.textContent || '').trim()).filter(Boolean)
     : null;
-  // 筛选下拉：默认「全部」，三个选项。
-  const filter = appsBox.querySelector('#apps-head select');
+  // 筛选下拉：Kind 筛选默认「全部」，三个选项（安装状态筛选见上面的 installSel）。
+  const filter = appsBox.querySelector('#apps-kind-filter');
   out.market.filterOptions = filter ? Array.from(filter.options).map((o) => o.textContent) : null;
   out.market.filterDefault = filter ? filter.value : null;
   // 点开每个应用卡片上的「⚙️ 管理」（面板按钮已改名），逐个采面板快照。
@@ -397,9 +439,9 @@ const result = await page.evaluate(async () => {
 
     const appsBox2 = document.createElement('div');
     root.appendChild(appsBox2);
-    AppsView(appsBox2, {});
+    AppsView(appsBox2, { tab: 'market' });
     await settle(); await settle();
-    const filter2 = appsBox2.querySelector('#apps-head select');
+    const filter2 = appsBox2.querySelector('#apps-kind-filter');
     out.market.persistedFilter = filter2 ? filter2.value : null;
     out.market.persistedCards = cardNamesNow(appsBox2);
     // 复原成「全部」，别让后续采集受筛选影响。
@@ -439,18 +481,33 @@ const result = await page.evaluate(async () => {
     .find((b) => (b.textContent || '').includes('LNMP')) || null;
   sitesBox2.remove();
 
-  // ---- ② 服务管理 ----
+  // ---- ② 我的应用（合并后的 Tab：市场已安装 + 服务记录，去重后一行一条） ----
   const svcBox = document.createElement('div');
   root.appendChild(svcBox);
-  ServicesView(svcBox, {});
+  AppsView(svcBox, { tab: 'mine' });
   await settle();
-  const scards = Array.from(svcBox.querySelectorAll('.grid > div'));
-  out.service.cardNames = scards.map(cardName);
-  out.service.buttons = {};
-  for (const c of scards) out.service.buttons[cardName(c)] = btns(c);
-  for (const c of scards) {
-    const name = cardName(c);
-    const manage = Array.from(c.querySelectorAll('button')).find((b) => b.textContent.includes('管理'));
+  await settle();
+  const mrows = Array.from(svcBox.querySelectorAll('[data-app-key]'));
+  out.myapps.keys = mrows.map((r) => r.getAttribute('data-app-key'));
+  out.myapps.names = mrows.map((r) => r.getAttribute('data-app-name'));
+  out.myapps.toolbarButtons = btns(svcBox.querySelector('#myapps-toolbar'));
+  out.myapps.buttons = {};
+  out.myapps.links = {};
+  out.myapps.text = {};
+  for (const r of mrows) {
+    const name = r.getAttribute('data-app-name');
+    out.myapps.buttons[name] = btns(r);
+    out.myapps.links[name] = Array.from(r.querySelectorAll('a.btn'))
+      .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
+    out.myapps.text[name] = (r.textContent || '').trim();
+  }
+  // 去重的直接证据：同一个 key 只能出现一次；php82 只能有一行。
+  out.myapps.keyCounts = out.myapps.keys.reduce((m, k) => { m[k] = (m[k] || 0) + 1; return m; }, {});
+  out.myapps.php82Rows = mrows.filter((r) => (r.textContent || '').includes('PHP 8.2')).length;
+  // 从每一行的「⚙️ 管理」点开面板，采快照（与市场卡片那次对照）。
+  for (const r of mrows) {
+    const name = r.getAttribute('data-app-name');
+    const manage = Array.from(r.querySelectorAll('button')).find((b) => b.textContent.includes('管理'));
     if (!manage) continue;
     manage.click();
     await settle(); await settle();
@@ -458,6 +515,30 @@ const result = await page.evaluate(async () => {
     closeModal();
   }
   svcBox.remove();
+
+  // ---- ②b `#/services` 别名：同一个页面，自动落到「我的应用」Tab ----
+  out.route = { services: routeFor('#/services'), apps: routeFor('#/apps'), dashboard: routeFor('') };
+  const aliasBox = document.createElement('div');
+  root.appendChild(aliasBox);
+  AppsView(aliasBox, { tab: out.route.services.tab });
+  await settle(); await settle();
+  out.route.activeTab = Array.from(aliasBox.querySelectorAll('[data-tab]'))
+    .find((b) => b.classList.contains('btn-primary'))?.getAttribute('data-tab') || null;
+  out.route.rows = Array.from(aliasBox.querySelectorAll('[data-app-key]')).length;
+  aliasBox.remove();
+
+  // ---- ②c 归一化 key 本身（直接测函数，不依赖 fixture 的渲染布局）----
+  out.keys = {
+    phpDot: appKeyOf({ launch_label: 'homebrew.mxcl.php@8.2' }),
+    phpDash: appKeyOf({ launch_label: 'sh.brew.php8-2' }),
+    phpName: appKeyOf({ name: 'php82' }),
+    phpPlain: appKeyOf({ name: 'php8.2' }),
+    stirlingMarket: appKeyOf({ id: 'stirling-pdf', name: 'Stirling PDF' }),
+    stirlingSvc: appKeyOf({ name: 'stirling-pdf' }),
+    frpcMarket: appKeyOf({ service_label: 'com.zizdog.frpc' }),
+    frpcSvc: appKeyOf({ launch_label: 'com.zizdog.frpc' }),
+    cnfjSvc: appKeyOf({ name: 'com-zizdog-frpc' }),
+  };
 
   // ---- ③ 超时兜底：服务查询永不返回，面板必须在硬超时后落定 ----
   const slow = {
@@ -521,8 +602,8 @@ const panelOf = (name) => (result.panelFromMarket[name] || {}).buttons || [];
 
 console.log('══════════ ① 应用市场：卡片上的按钮 ══════════');
 for (const [n, b] of Object.entries(result.market.buttons)) console.log(`  ${n}\n      ${show(b)}`);
-console.log('\n══════════ ② 服务管理：卡片上的按钮 ══════════');
-for (const [n, b] of Object.entries(result.service.buttons)) console.log(`  ${n}\n      ${show(b)}`);
+console.log('\n══════════ ② 我的应用（合并去重后的一行一条）══════════');
+for (const [n, b] of Object.entries(result.myapps.buttons)) console.log(`  ${n}\n      ${show(b)}`);
 
 console.log('\n══════════ ③ 覆盖矩阵（用户点名的应用）══════════');
 console.log('  卡片标题'.padEnd(26) + '首按钮'.padEnd(12) + '卡片重装?  面板重装?  卡片文档?');
@@ -535,7 +616,7 @@ for (const [slug, name, installed] of WANT) {
 console.log('\n══════════ ③b 打开 / 直链：语义固定（用户 2026-09-17 的"it-tools 反了"）══════════');
 console.log(`  IT-Tools 卡片链接   ${show(result.market.links['IT-Tools（开发者工具箱）'])}`);
 console.log(`  Uptime Kuma 卡片链接 ${show(result.market.links['Uptime Kuma'])}`);
-console.log(`  服务管理 Uptime Kuma ${show(result.service.buttons['Uptime Kuma'])}`);
+console.log(`  我的应用 Uptime Kuma ${show(result.myapps.buttons['Uptime Kuma'])}`);
 
 console.log('\n══════════ ④ ffmpeg 那条 bug 的证明 ══════════');
 const ff = infoOf('FFmpeg（音视频工具）');
@@ -543,7 +624,7 @@ const ffPanel = result.panelFromMarket['FFmpeg（音视频工具）'] || {};
 console.log(`  卡片按钮：${show(ff.buttons)}`);
 console.log(`  面板状态行：${ffPanel.status || '（没打开）'}`);
 console.log(`  面板按钮：${show(ffPanel.buttons)}`);
-console.log(`  面板里出现「未在服务管理里」？ ${(ffPanel.panelText || '').includes('未在服务管理里') ? '是 ✗' : '否 ✓'}`);
+console.log(`  面板里出现「未纳管 / 面板里没有服务记录」？ ${/未纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || '') ? '是 ✗' : '否 ✓'}`);
 console.log(`  面板里出现「读取中」？        ${(ffPanel.panelText || '').includes('读取中') ? '是 ✗' : '否 ✓'}`);
 const ffLookups = result.calls.filter((c) => /\/services\/ffmpeg(\?|$)/.test(c));
 console.log(`  面板是否查过不存在的服务记录？ ${ffLookups.length ? '查了 ✗ ' + ffLookups.join(', ') : '没查 ✓（no_daemon 直接走终态）'}`);
@@ -571,16 +652,35 @@ for (const c of result.calls) console.log('  ' + c);
 console.log('\n══════════ ⑦ 三处界面调整（LNMP 入口 / 筛选 / 板块改名）══════════');
 console.log(`  市场板块顺序：${show(result.market.sectionTitles)}`);
 console.log(`  市场顶部按钮：${show(result.market.headButtons)}`);
-console.log(`  筛选选项：${show(result.market.filterOptions)}  默认值="${result.market.filterDefault}"`);
+console.log(`  Kind 筛选：${show(result.market.filterOptions)}  默认值="${result.market.filterDefault}"`);
+console.log(`  安装筛选：${show(result.market.installFilterOptions)}  默认值="${result.market.installFilterDefault}"`);
+console.log(`  默认（未安装）视图卡片：${show(result.market.defaultInstallCards)}`);
 console.log(`  「原生」档卡片：${show(result.market.nativeCards)}`);
 console.log(`  「原生」档板块：${show(result.market.nativeSections)}`);
 console.log(`  「Docker」档卡片：${show(result.market.dockerCards)}`);
 console.log(`  「Docker」档板块：${show(result.market.dockerSections)}`);
-console.log(`  重渲染后筛选保留：${result.market.persistedFilter === 'docker' ? 'Docker ✓' : (result.market.persistedFilter || '(空)') + ' ✗'}`);
+console.log(`  重渲染后 Kind 筛选保留：${result.market.persistedFilter === 'docker' ? 'Docker ✓' : (result.market.persistedFilter || '(空)') + ' ✗'}`);
 console.log(`  网站管理（无站点）按钮：${show(result.sites.emptyButtons)}`);
 console.log(`  网站管理（有站点）按钮：${show(result.sites.listButtons)}`);
 console.log(`  LNMP 按钮 title：${result.sites.hint || '（空）'}`);
 console.log(`  LNMP 点击发出的请求：${result.sites.lnmpPostCall || '（无）'}`);
+
+console.log('\n══════════ ⑧ 合并去重 + 子路径提示 + 旧 hash 别名 ══════════');
+console.log(`  我的应用 key：${show(result.myapps.keys)}`);
+console.log(`  php82 行数：${result.myapps.php82Rows}（应为 1）`);
+console.log(`  每个 key 出现次数：${JSON.stringify(result.myapps.keyCounts)}`);
+console.log(`  PHP 8.2 (FPM) 行按钮：${show(result.myapps.buttons['PHP 8.2 (FPM)'])}`);
+console.log(`  PHP 8.2 (FPM) 行链接：${show(result.myapps.links['PHP 8.2 (FPM)'])}`);
+console.log(`  PHP 8.2 (FPM) 行文本：${(result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 220)}`);
+console.log(`  Uptime Kuma 行文本：${(result.myapps.text['Uptime Kuma'] || '').slice(0, 220)}`);
+console.log(`  Uptime Kuma 管理面板文本含提示？ ${(result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径') ? '是 ✓' : '否 ✗'}`);
+console.log(`  routeFor('#/services') = ${JSON.stringify(result.route.services)}`);
+console.log(`  routeFor('#/apps')     = ${JSON.stringify(result.route.apps)}`);
+console.log(`  #/services 渲染后的激活 Tab：${result.route.activeTab}（行数 ${result.route.rows}）`);
+console.log(`  我的应用工具条：${show(result.myapps.toolbarButtons)}`);
+console.log(`  归一化 key：${JSON.stringify(result.keys)}`);
+console.log(`  Qwen3 TTS 面板链接：${show((result.panelFromService['Qwen3 TTS（语音合成）']?.links || []).map((l) => l.text + ' → ' + l.href))}`);
+console.log(`  Qwen3 TTS 面板直链 title：${(result.panelFromService['Qwen3 TTS（语音合成）']?.links || []).find((l) => l.text === '直链')?.title || '（无）'}`);
 
 // ---------- 断言 ----------
 // 2026-09-17 用户要求：卡片上每个应用只保留「打开 / 直链 / 刷新 / 重启 / 停止 /
@@ -622,9 +722,9 @@ check('Uptime Kuma（prefer_direct）：「直链」是端口 3001',
   kumaLinks.includes('直链 → http://192.168.1.4:3001/'), show(kumaLinks));
 check('Uptime Kuma：「打开」不再降级成"试试子路径"',
   !kumaLinks.some((l) => l.includes('试试子路径')), show(kumaLinks));
-// 服务管理页用的是**同一份** openDirectActions（市场条目与 port_url 都对上号）。
-const kumaSvc = result.service.buttons['Uptime Kuma'] || [];
-check('服务管理：Uptime Kuma 也有「⚠️ 打开 + 直链」（同一份实现）',
+// 「我的应用」行用的是**同一份** openDirectActions（市场条目与 port_url 都对上号）。
+const kumaSvc = result.myapps.buttons['Uptime Kuma'] || [];
+check('我的应用：Uptime Kuma 也有「⚠️ 打开 + 直链」（同一份实现）',
   kumaSvc.includes('⚠️ 打开') && kumaSvc.includes('直链'), show(kumaSvc));
 // console_only（frpc 的自带控制台）两个入口都不给。
 const frpcBtns = infoOf('frpc（frp 客户端）').buttons;
@@ -637,13 +737,96 @@ check('IT-Tools：卡片上没有「文档」，管理面板里有',
   `card=${show(infoOf('IT-Tools（开发者工具箱）').buttons)} panel=${show(panelOf('IT-Tools（开发者工具箱）'))}`);
 check('Ollama（未安装）：卡片上保留「文档」（没有管理入口可去）',
   infoOf('Ollama').docs, show(infoOf('Ollama').buttons));
-check('ffmpeg 面板不显示「未在服务管理里」', !(ffPanel.panelText || '').includes('未在服务管理里'));
+check('ffmpeg 面板不显示「未纳管 / 面板里没有服务记录」（它是 CLI 工具，不是"没纳管"）',
+  !/未纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || ''));
 check('ffmpeg 面板不显示「读取中」', !(ffPanel.panelText || '').includes('读取中'));
 check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', (ffPanel.status || '').includes('命令行工具（无常驻进程）'), ffPanel.status);
 check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups.join(', '));
 check('超时兜底：面板一定落定（无"读取中"）', !/读取中|正在读取/.test(to.panelText || ''), to.status);
 check('超时兜底：在硬上限内落定', result.timeout.elapsedMs < 12000, result.timeout.elapsedMs + 'ms');
-check('市场 / 服务管理打开的是同一个面板', same);
+check('市场 / 我的应用打开的是同一个面板', same);
+
+// ---------- ⑧ 合并去重 + 子路径提示 + 旧 hash 别名（用户 2026-09-17 的四条要求）----------
+// 「服务管理/apps 合并」的核心价值就是去重，所以断言必须落在"php82 只有一行"上，
+// 而不是"页面上出现过 php82"这种弱断言。
+check('我的应用：php82 只有一行（两条服务记录 + 市场条目合并成一条）',
+  result.myapps.php82Rows === 1, `实际 ${result.myapps.php82Rows} 行`);
+check('我的应用：每个归一化 key 只出现一次',
+  Object.values(result.myapps.keyCounts || {}).every((n) => n === 1),
+  JSON.stringify(result.myapps.keyCounts));
+const phpBtns = result.myapps.buttons['PHP 8.2 (FPM)'] || [];
+check('我的应用：php82 同一行既有「打开 / 直链」又有「⚙️ 管理」',
+  phpBtns.includes('打开') && phpBtns.includes('直链') && phpBtns.some((t) => t.includes('管理')),
+  show(phpBtns));
+const phpLinks = result.myapps.links['PHP 8.2 (FPM)'] || [];
+check('我的应用：php82 行的市场元数据没丢（打开 /php82/、直链端口 9000）',
+  phpLinks.includes('打开 → /php82/') && phpLinks.includes('直链 → http://192.168.1.4:9000/'),
+  show(phpLinks));
+check('我的应用：php82 行状态取"在跑的那条记录"（运行中）',
+  (result.myapps.text['PHP 8.2 (FPM)'] || '').includes('运行中'),
+  (result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 140));
+check('我的应用：php82 行如实标出被合并掉的记录条数',
+  (result.myapps.text['PHP 8.2 (FPM)'] || '').includes('已合并 1 条记录'),
+  (result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 240));
+check('去重：被丢弃记录的字段（plist 路径）并进了保留的那条',
+  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').includes('homebrew.mxcl.php@8.2.plist'),
+  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').slice(0, 400));
+// prefer_direct 的**可见**文案（用户第四条：只有 ⚠️ 没有任何解释）
+const kumaRowText = result.myapps.text['Uptime Kuma'] || '';
+check('我的应用：Uptime Kuma（prefer_direct）行显示"不支持子路径"小字 + ui.note 原文',
+  kumaRowText.includes('该应用不支持子路径') && kumaRowText.includes('Uptime Kuma 官方不支持子路径'),
+  kumaRowText.slice(0, 240));
+check('管理面板里同样显示"不支持子路径"小字',
+  (result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径'),
+  (result.panelFromService['Uptime Kuma']?.panelText || '').slice(0, 240));
+// 旧 hash 必须继续可用（老书签/文档里到处是 #/services）
+check('routeFor("#/services") 落到 apps 版块的「我的应用」Tab',
+  result.route.services.id === 'apps' && result.route.services.tab === 'mine',
+  JSON.stringify(result.route.services));
+check('#/apps 走默认（同一版块，tab 由 AppsView 定为「我的应用」）',
+  result.route.apps.id === 'apps' && result.route.apps.tab === '', JSON.stringify(result.route.apps));
+check('#/services 渲染出的页面激活 Tab 是「我的应用」且有行',
+  result.route.activeTab === 'mine' && result.route.rows > 0,
+  `tab=${result.route.activeTab} rows=${result.route.rows}`);
+// 应用市场默认「未安装」
+check('应用市场安装筛选是「全部 / 未安装 / 已安装」，默认「未安装」',
+  JSON.stringify(result.market.installFilterOptions) === JSON.stringify(['全部', '未安装', '已安装'])
+  && result.market.installFilterDefault === 'missing',
+  `${show(result.market.installFilterOptions)} default=${result.market.installFilterDefault}`);
+check('市场默认视图只列未安装应用（Ollama 在，frpc 不在）',
+  (result.market.defaultInstallCards || []).includes('Ollama')
+  && !(result.market.defaultInstallCards || []).includes('frpc（frp 客户端）'),
+  show(result.market.defaultInstallCards));
+
+// ---------- ⑨ 去重规则本身 + 直链兜底 + 可纳管入口 ----------
+check('归一化：php@8.2 / php8-2 / php82 / php8.2 收敛成同一个 key（=php82）',
+  new Set([result.keys.phpDot, result.keys.phpDash, result.keys.phpName, result.keys.phpPlain]).size === 1
+  && result.keys.phpDot === 'php82',
+  JSON.stringify(result.keys));
+check('归一化：市场展示名（Stirling PDF）与服务记录名（stirling-pdf）同 key',
+  result.keys.stirlingMarket === result.keys.stirlingSvc && result.keys.stirlingMarket === 'stirlingpdf',
+  JSON.stringify(result.keys));
+check('归一化：com.zizdog.* 前缀的不同写法同 key',
+  result.keys.frpcMarket === result.keys.frpcSvc && result.keys.cnfjSvc === result.keys.frpcSvc,
+  JSON.stringify(result.keys));
+check('我的应用工具条：有「🔍 扫描可纳管服务」与「+ 注册服务」（可纳管功能没丢）',
+  (result.myapps.toolbarButtons || []).includes('🔍 扫描可纳管服务')
+  && (result.myapps.toolbarButtons || []).includes('+ 注册服务'),
+  show(result.myapps.toolbarButtons));
+const kumaBtns = result.myapps.buttons['Uptime Kuma'] || [];
+check('我的应用：Uptime Kuma 行的按钮就是那组固定语义（顺序也对）',
+  JSON.stringify(kumaBtns) === JSON.stringify(['⚠️ 打开', '直链', '停止', '重启', '⟳ 刷新', '⚙️ 管理']),
+  show(kumaBtns));
+const qwenPanel = result.panelFromService['Qwen3 TTS（语音合成）'] || {};
+const qwenDirect = (qwenPanel.links || []).find((l) => l.text === '直链');
+check('管理面板：纯纳管服务（无 port_url）有端口 → 给出拼接的「直链」，title 说明局限',
+  !!qwenDirect && qwenDirect.href === 'http://127.0.0.1:8880/' && /拼出来/.test(qwenDirect.title),
+  JSON.stringify(qwenDirect));
+const orbienPanel = result.panelFromService['Orbien 客户端（CLI）'] || {};
+check('管理面板：既没有界面也没有端口 → 不给打开按钮，只给一行原因',
+  (orbienPanel.panelText || '').includes('没有可用的打开入口')
+  && !(orbienPanel.buttons || []).some((t) => t === '打开' || t === '直链'),
+  `buttons=${show(orbienPanel.buttons)} text=${(orbienPanel.panelText || '').slice(0, 120)}`);
 
 // ---------- 三处界面调整（用户本轮明确要求） ----------
 //

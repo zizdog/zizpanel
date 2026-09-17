@@ -1,75 +1,107 @@
-// services.js —— 服务管理页面。
+// services.js —— 「应用」页「我的应用」Tab + 服务侧的共享组件。
+//
+// 2026-09-17 信息架构合并：原来的「服务管理」整页（ServicesView）变成了
+// 「应用 → 我的应用」Tab（renderMyApps，见下），导航里不再有单独的服务管理页。
+// 这个文件现在负责：
+//   - 我的应用清单（市场已安装条目 + 服务记录，合并去重，一行一条）
+//   - 共享组件：日志弹窗 / 注册服务表单 / 凭据 / 配置文件编辑器 / 应用专属功能入口
 //
 // 交互设计要点：
-//   - 卡片视图按分类分组，一眼看清"哪些在跑、哪些挂了"
+//   - 每行一眼看清"这个应用在不在跑、健康不健康"
 //   - 状态灯的颜色直接反映真实状态（面板每次都实时查询系统）
 //   - 纳管服务与托管服务在界面上有明确区分：前者不能卸载
 //   - 日志用 SSE 实时推送，不靠前端轮询
-//   - 应用市场先做"安装前检查"，把缺依赖/端口冲突一次说清
 
 import { api, sseServiceLogs } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
-// 说明：服务页以前还 import registerCleanup 注册一个空清理函数；
-// 2026-09-16 把那行空注册删掉了（它什么都不做，留着只会让人以为这里有清理逻辑）。
-// 详情面板与"启停/重启/取消纳管"的唯一实现在 servicePanel.js；应用市场页也用它。
 // 依赖方向：apps.js → servicePanel.js ↔ services.js（两模块互取函数，但都只在
 // 渲染/点击时才调用，不在模块初始化时求值，所以没有初始化顺序问题）。
-// openDirectActions 也是从 servicePanel.js 来的：服务卡片上的「打开 / 直链」与
-// 市场卡片、管理面板**必须**是同一份实现（用户 2026-09-17 的固定语义要求）。
-import { openServicePanel, serviceActions, openDirectActions, serviceNameOf } from './servicePanel.js';
+// 「打开 / 直链」「启停 / 重启 / 刷新」「状态措辞」全部来自 servicePanel.js ——
+// 与市场卡片、管理面板**同一份实现**（用户 2026-09-17 的固定语义要求）。
+// mergeAppEntries 是这一轮合并新增的：按归一化 key 去重，逻辑只此一份。
+import {
+  openServicePanel, openDirectActions,
+  mergeAppEntries, statusLine, subpathWarning, marketQuickActions,
+} from './servicePanel.js';
 
-// 服务记录（GET /api/v1/services）**不带**目录里的界面信息（ui.slug / port_url /
-// docs_url）—— 那些只在市场条目（GET /api/v1/market）里。服务卡片要给出
-// 「打开 / 直链」、管理面板要给「重装 / 文档」，就得把两者对上号。
-// 这里在 load() 时顺手拉一次市场目录，按"市场条目认的服务名"建索引（只读、很便宜）。
-// 拉不到时索引为 null：卡片照常渲染，只是少那两颗按钮（如实降级，不谎报）。
-let marketByService = null;
+// 「我的应用」的状态筛选（全部 / 运行中 / 已停止 / 异常 / 仅健康检查失败）。
+// 放模块级：Tab 切换、动作后重画都不该把用户的筛选选择丢掉。
+let stateFilter = 'all';
 
-function indexMarket(list) {
-  const map = new Map();
-  for (const m of list || []) {
-    for (const k of [serviceNameOf(m), m.service_label, m.name, m.id]) {
-      if (k && !map.has(k)) map.set(k, m);
+// ============================================================================
+//  「我的应用」Tab —— 合并后唯一的应用/服务清单（一行一条，去重）
+// ============================================================================
+//
+// 这一节原来是「服务管理」整页（ServicesView）。2026-09-17 用户要求把
+// 「服务管理 + 应用市场」合并成**一个「应用」版块**：导航只剩一项，页内两个 Tab。
+// 于是原来的整页变成了「我的应用」Tab 的内容，并补上三件它以前做不到的事：
+//   ① 把**市场里已安装的条目**与**面板服务记录**按归一化 key 合并去重
+//      （真机上 php81/82/83/84 各显示两行，同一个服务两组按钮）；
+//   ② 每行给出状态（复用 servicePanel.statusLine 的**同一套措辞**）、端口、
+//      健康检查结果，以及那组固定语义的按钮
+//      （打开 / 直链 / 停止(启动) / 重启 / ⟳ 刷新 / ⚙️ 管理）；
+//   ③ prefer_direct 的应用在按钮下方给一行**始终可见**的说明（用户第四条抱怨）。
+//
+// 数据由调用方（apps.js 的 AppsView）一次拉好递进来，本函数自己不发起请求：
+//   opts.market    GET /api/v1/market 的**整个响应**（取 .list 里已安装/已纳管的）
+//   opts.list      GET /api/v1/services?health=1 的 list（服务记录）
+//   opts.onReload  需要整体重拉时的回调（注册服务后、纳管/取消纳管后等）
+export function renderMyApps(container, opts = {}) {
+  const marketList = () => (opts.market && opts.market.list) || [];
+  const svcList = () => (Array.isArray(opts.list) ? opts.list : []);
+  const reload = () => {
+    if (typeof opts.onReload === 'function') opts.onReload();
+    else renderAll();
+  };
+
+  // afterAction 是启停/重启/刷新动作完成后的回调。
+  // 只拿到一条新记录时就地替换、重画这一屏（不整页重拉 —— 整页要重查所有服务，
+  // 含 colima/compose 这类偏慢的，而用户此刻只关心这一个）；
+  // 拿不到具体记录（纳管 / 取消纳管）才让调用方整体重拉。
+  function afterAction(fresh) {
+    if (fresh && fresh.name && Array.isArray(opts.list)) {
+      const i = opts.list.findIndex((x) => x && x.name === fresh.name);
+      if (i >= 0) opts.list[i] = fresh; else opts.list.push(fresh);
+      renderAll();
+      return;
     }
+    reload();
   }
-  return map;
-}
 
-// marketAppFor 找一条服务记录对应的市场条目（找不到返回 null）。
-function marketAppFor(s) {
-  if (!marketByService || !s) return null;
-  for (const k of [s.name, s.launch_label, s.display_name]) {
-    if (k && marketByService.has(k)) return marketByService.get(k);
-  }
-  return null;
-}
-
-// 页面上缓存的列表数据
-let cache = null;
-let filter = 'all';
-
-export function ServicesView(content, ctx = {}) {
-  clear(content);
-
-  const cards = h('div');
   const toolbar = h('div.card-head', [
-    h('h3', { text: '服务' }),
+    h('h3', { text: '我的应用' }),
     h('div.spacer'),
-    h('div', { id: 'svc-toolbar', style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
+    h('div#myapps-toolbar', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
   ]);
+  const listBox = h('div');
+  appendAll(container, h('div.card', [toolbar, h('div.card-body', [listBox])]));
+  const toolbarBox = toolbar.querySelector('#myapps-toolbar');
 
-  appendAll(content, 
-    h('div.card', [toolbar, h('div.card-body', [cards])]),
-  );
+  function renderAll() { renderToolbar(); renderRows(); }
 
-  const toolbarBox = toolbar.querySelector('#svc-toolbar');
+  // entriesNow 每次都重新合并：动作更新的是服务记录数组，合并结果必须跟着变。
+  function entriesNow() { return mergeAppEntries(marketList(), svcList()); }
+
+  function matchesFilter(e) {
+    if (stateFilter === 'all') return true;
+    const st = (e.svc && e.svc.state) || {};
+    const health = (e.svc && e.svc.health) || {};
+    if (stateFilter === 'running') return !!st.running;
+    if (stateFilter === 'stopped') {
+      return !st.running && st.status !== 'error' && st.status !== 'unavailable';
+    }
+    if (stateFilter === 'problem') {
+      return st.status === 'error' || st.status === 'unavailable' || (health.checked && !health.ok);
+    }
+    if (stateFilter === 'unhealthy') return !!(health.checked && !health.ok);
+    return true;
+  }
 
   function renderToolbar() {
-    clear(toolbarBox);
-    const list = (cache?.list || []);
-    const running = list.filter((s) => s.state?.running).length;
-    const unhealthy = list.filter((s) => s.health?.checked && !s.health.ok).length;
-
+    const rows = entriesNow();
+    const svcs = svcList();
+    const running = svcs.filter((s) => s.state && s.state.running).length;
+    const unhealthy = svcs.filter((s) => s.health && s.health.checked && !s.health.ok).length;
     const filters = [
       { id: 'all', label: '全部' },
       { id: 'running', label: '运行中' },
@@ -77,260 +109,163 @@ export function ServicesView(content, ctx = {}) {
       { id: 'problem', label: '异常' },
       { id: 'unhealthy', label: '仅健康检查失败' },
     ];
-    appendAll(toolbarBox, 
-      h('span.pill' + (running > 0 ? '.ok' : ''), { text: `${running}/${list.length} 运行中` }),
-      // 做成可点的：用户看到"有失败"的第一反应是"哪些？怎么办？"，
-      // 所以点它直接筛出失败的服务（卡片里还有具体原因与下一步）。
+    clear(toolbarBox);
+    appendAll(toolbarBox,
+      h('span.pill' + (running > 0 ? '.ok' : ''), {
+        text: `${running}/${svcs.length} 服务运行中`,
+        title: '面板服务记录里正在运行的条数（没有常驻进程的应用不计入）',
+      }),
+      h('span.pill', {
+        text: `共 ${rows.length} 个应用`,
+        title: '市场已安装条目 + 服务记录合并去重后的一行一条数',
+      }),
+      // 可点的：用户看到"有失败"的第一反应是"哪些？怎么办？"，
+      // 所以点它直接筛出失败的服务（行里还有具体原因与下一步）。
       unhealthy > 0 ? h('button.btn.btn-sm.btn-danger', {
         text: `⚠ ${unhealthy} 个健康检查失败`,
         title: '点这里只看失败的服务',
-        onclick: () => { filter = 'unhealthy'; renderToolbar(); renderCards(); },
+        onclick: () => { stateFilter = 'unhealthy'; renderAll(); },
       }) : null,
-      h('div', { style: { display: 'flex', gap: '4px' } }, filters.map((f) =>
-        h(`button.btn.btn-sm${filter === f.id ? '.btn-primary' : ''}`, {
+      h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, filters.map((f) =>
+        h(`button.btn.btn-sm${stateFilter === f.id ? '.btn-primary' : ''}`, {
           text: f.label,
-          onclick: () => { filter = f.id; renderToolbar(); renderCards(); },
+          onclick: () => { stateFilter = f.id; renderAll(); },
         }))),
-      h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      h('button.btn.btn-sm', {
+        text: '⟳ 刷新',
+        title: '重新读取市场目录与服务状态',
+        onclick: reload,
+      }),
       h('button.btn.btn-sm', {
         text: '🔍 扫描可纳管服务',
         title: '找出本机上已经在运行的 launchd 服务，接入面板管理',
-        onclick: scanAdoptable,
+        onclick: () => openAdoptable(afterAction),
       }),
-      h('button.btn.btn-primary.btn-sm', { text: '+ 注册服务', onclick: () => newServiceModal(load) }),
+      h('button.btn.btn-primary.btn-sm', { text: '+ 注册服务', onclick: () => newServiceModal(reload) }),
     );
   }
 
-  async function load() {
-    clear(cards);
-    appendAll(cards, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在查询服务状态…' })]));
-    // 服务状态与市场目录**并行**拉：市场目录只用来给卡片补界面信息
-    // （ui.slug / port_url / docs_url），失败就不补 —— 不能让一个辅助请求
-    // 把整个服务页拖垮或渲染成错误页。
-    const [svcRes, mktRes] = await Promise.all([
-      api.services(true).catch((e) => ({ error: e })),
-      api.market().catch(() => null),
-    ]);
-    if (!svcRes || svcRes.error) {
-      clear(cards);
-      appendAll(cards, h('div.empty', [
-        h('div.big', { text: '⚠️' }),
-        h('h4', { text: '读取服务失败' }),
-        h('p', { text: (svcRes && svcRes.error && svcRes.error.message) || '未知错误' }),
-      ]));
-      return;
-    }
-    cache = svcRes;
-    marketByService = mktRes ? indexMarket(mktRes.list) : null;
-    renderToolbar();
-    renderCards();
-  }
-
-  function stateOf(s) {
-    const st = s.state || {};
-    if (st.running) return { cls: 'ok', text: '运行中' };
-    if (st.status === 'error') return { cls: 'danger', text: '异常' };
-    if (st.status === 'unavailable') return { cls: 'warn', text: '环境不可用' };
-    if (st.status === 'not-installed') return { cls: 'warn', text: '未安装' };
-    if (st.status === 'unknown') return { cls: '', text: '未知' };
-    return { cls: '', text: '已停止' };
-  }
-
-  /**
-   * healthHint 见模块级定义（提到模块级是因为应用详情面板也要用同一套话术）。
-   */
-
-  function matchesFilter(s) {
-    if (filter === 'all') return true;
-    const st = s.state || {};
-    if (filter === 'running') return !!st.running;
-    if (filter === 'stopped') return !st.running && st.status !== 'error' && st.status !== 'unavailable';
-    if (filter === 'problem') {
-      return st.status === 'error' || st.status === 'unavailable' ||
-        (s.health && s.health.checked && !s.health.ok);
-    }
-    if (filter === 'unhealthy') {
-      return !!(s.health && s.health.checked && !s.health.ok);
-    }
-    return true;
-  }
-
-  function renderCards() {
-    clear(cards);
-    const list = (cache?.list || []).filter(matchesFilter);
-    if (!list.length) {
-      appendAll(cards, h('div.empty', [
-        h('div.big', { text: '⚙️' }),
-        h('h4', { text: (cache?.list || []).length ? '没有符合筛选条件的服务' : '还没有纳管任何服务' }),
-        h('p', { text: '可以从「应用市场」安装新服务，或扫描本机已在运行的服务接入管理。' }),
+  function renderRows() {
+    clear(listBox);
+    const all = entriesNow();
+    const rows = all.filter(matchesFilter);
+    if (!rows.length) {
+      appendAll(listBox, h('div.empty', [
+        h('div.big', { text: '🧩' }),
+        h('h4', { text: all.length ? '没有符合筛选条件的应用' : '还没有已安装的应用' }),
+        h('p', { text: '到「应用市场」Tab 安装新应用，或扫描本机已在运行的服务接入管理。' }),
         h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center' } }, [
-          h('button.btn.btn-primary', { text: '打开应用市场', onclick: () => { location.hash = '#/apps'; } }),
-          h('button.btn', { text: '扫描可纳管服务', onclick: scanAdoptable }),
+          h('button.btn', { text: '扫描可纳管服务', onclick: () => openAdoptable(afterAction) }),
         ]),
       ]));
       return;
     }
-
-    const grid = h('div.grid.grid-3', list.map((s) => serviceCard(s)));
-    appendAll(cards, grid);
+    appendAll(listBox, h('div', {
+      style: { display: 'flex', flexDirection: 'column', gap: '8px' },
+    }, rows.map(appRow)));
   }
 
-  function serviceCard(s) {
-    const st = stateOf(s);
-    const state = s.state || {};
-    const health = s.health || {};
+  // appRow 渲染**一行** —— 这一行同时握着市场条目（m）与服务记录（s），
+  // 所以「打开 / 直链 / 文档 / 安装器语义」与「状态 / 配置路径 / 日志 / plist」
+  // 不会再分散在两个页面、两组按钮里。
+  function appRow(e) {
+    const m = e.market;
+    const s = e.svc;
+    const line = statusLine(s && s.state, m);
+    const health = (s && s.health) || {};
+    const name = (s && (s.display_name || s.name)) || (m && m.name) || e.key;
+    const icon = (s && s.icon) || (m && m.icon) || '🧩';
+    const port = (s && s.port) || (m && m.port) || 0;
+    const subtitle = (m && m.summary) || (s && s.description) || '';
 
-    const healthPill = (() => {
-      if (!health.checked) return null;
-      if (health.ok) {
-        return h('span.pill.ok', { text: '健康', title: health.message + `（${health.latency_ms}ms）` });
-      }
-      return h('span.pill.danger', { text: '健康检查失败', title: health.message });
-    })();
+    // 固定语义按钮组：打开 / 直链（openDirectActions）+ 停止(启动)/重启/⟳ 刷新
+    // （serviceActions，经 marketQuickActions 统一给）+ ⚙️ 管理。
+    // 启停判据由 marketQuickActions 决定：有服务记录就一定给，否则看
+    // adopted / service_in_launchd（跟市场卡片完全同一条规则）。
+    const actions = [
+      ...openDirectActions(m, { svc: s }),
+      ...marketQuickActions(m, {
+        svc: s,
+        onDone: afterAction,
+        onManage: () => openServicePanel({ market: m, svc: s, onDone: () => afterAction() }),
+      }),
+    ];
+
+    const pills = [
+      h('span.pill' + (line.cls ? '.' + line.cls : ''), { text: line.text, title: line.title || '' }),
+      port > 0 ? h('span.pill', { text: ':' + port }) : null,
+      s ? h('span.pill' + (s.managed ? '.brand' : ''), {
+        text: s.managed ? '面板托管' : '仅纳管',
+        title: s.managed ? '面板负责完整生命周期，可卸载' : '由你自己安装，面板只做启停与查看，不会卸载',
+      }) : null,
+      health.checked
+        ? (health.ok
+          ? h('span.pill.ok', { text: '健康', title: (health.message || '') + '（' + (health.latency_ms || 0) + 'ms）' })
+          : h('span.pill.danger', { text: '健康检查失败', title: health.message || '' }))
+        : null,
+      s && s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
+      // 装了但面板里没有服务记录（孤儿态）时 statusLine 已经如实说「未纳管」，
+      // 这里不再补第二颗同义 pill —— 合并后的行本来就要短，重复说两遍只会更乱。
+      // 去重的证据：同一 launchd 服务在面板里有多条记录时，这里如实说出合并了几条，
+      // 免得用户以后在数据库里看到两条记录却不知道为什么界面只有一行。
+      s && Array.isArray(s.merged_from) && s.merged_from.length
+        ? h('span.pill', {
+          text: '已合并 ' + s.merged_from.length + ' 条记录',
+          title: '同一个服务在面板记录里有多条（launchd 标签相同）：' + s.merged_from.join('、'),
+        })
+        : null,
+    ];
 
     return h('div', {
+      dataset: { appKey: e.key, appName: name },
       style: {
-        background: 'var(--panel-2)', border: '1px solid var(--border)',
-        borderRadius: 'var(--radius)', padding: '15px 16px', display: 'flex', flexDirection: 'column', gap: '10px',
+        background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+        padding: '12px 14px', display: 'flex', gap: '12px', alignItems: 'flex-start', flexWrap: 'wrap',
       },
     }, [
-      // 标题行
-      h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '10px' } }, [
-        h('div', {
-          style: {
-            width: '38px', height: '38px', borderRadius: '10px', display: 'grid', placeItems: 'center',
-            background: 'var(--panel)', fontSize: '20px', flex: '0 0 auto',
-          },
-          text: s.icon || '⚙️',
-        }),
-        h('div', { style: { flex: 1, minWidth: 0 } }, [
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px' } }, [
-            h('span.dot' + (st.cls ? '.' + st.cls : ''), { title: st.text }),
-            h('span', { style: { fontWeight: '620', fontSize: '14px' }, text: s.display_name || s.name }),
-          ]),
-          h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '2px' }, text: s.description || s.name }),
-        ]),
-      ]),
-
-      // 状态标签行
-      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
-        h('span.pill' + (st.cls ? '.' + st.cls : ''), { text: st.text, title: state.detail || '' }),
-        s.port > 0 ? h('span.pill', { text: ':' + s.port }) : null,
-        h('span.pill' + (s.managed ? '.brand' : ''), {
-          text: s.managed ? '面板托管' : '仅纳管',
-          title: s.managed ? '面板负责完整生命周期，可卸载' : '由你自己安装，面板只做启停与查看，不会卸载',
-        }),
-        healthPill,
-        s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
-      ]),
-
-      // 需要身份验证（401/403）时，卡片上给一行**说明**：
-      // 后端已经把它判为健康（Stirling PDF 这类应用装完就是要设账号密码，
-      // 401 说明它活得好好的），但用户会疑惑"明明要登录，怎么显示健康"，
-      // 所以把原因摆出来，而不是只藏在标签的 title 里。
-      (health.checked && health.ok && (health.code === 401 || health.code === 403))
-        ? h('div', {
-          style: { fontSize: '11.5px', color: 'var(--text-mute)' },
-          text: '健康检查：' + health.message + '（' + (health.latency_ms || 0) + 'ms）',
-        }) : null,
-
-      // 健康检查失败：把"是什么、为什么、怎么办"都摆出来
-      (health.checked && !health.ok) ? h('div', {
+      h('div', {
         style: {
-          background: 'var(--panel)', border: '1px solid var(--danger, #d9534f)',
-          borderRadius: '8px', padding: '10px 12px', display: 'grid', gap: '6px',
+          width: '34px', height: '34px', borderRadius: '9px', display: 'grid', placeItems: 'center',
+          background: 'var(--panel)', fontSize: '18px', flex: '0 0 auto',
         },
+        text: icon,
+      }),
+      h('div', { style: { flex: '1 1 260px', minWidth: '220px' } }, [
+        h('div', { style: { fontWeight: '620', fontSize: '14px' }, text: name }),
+        subtitle ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '2px' }, text: subtitle }) : null,
+        h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' } }, pills),
+        // 健康检查失败：把"是什么、为什么、怎么办"摆出来（与旧服务卡片同一套话术）。
+        // 「重新检查」不再单独给一颗按钮 —— 这一行的「⟳ 刷新」就是重新查这一条。
+        (health.checked && !health.ok)
+          ? h('div', { style: { marginTop: '6px', fontSize: '11.5px', color: 'var(--danger)' } }, [
+            h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
+            h('button.btn.btn-sm', {
+              style: { marginTop: '4px' },
+              text: '改检查地址',
+              title: '改完再点这一行的「⟳ 刷新」重新检查',
+              onclick: () => newServiceModal(reload, s),
+            }),
+          ])
+          : null,
+      ]),
+      h('div', {
+        style: { display: 'flex', gap: '5px', flexWrap: 'wrap', justifyContent: 'flex-end', flex: '1 1 320px' },
       }, [
-        h('div', { style: { fontSize: '12.5px', fontWeight: '620' }, text: '健康检查失败：' + (health.message || '未知原因') }),
-        h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', wordBreak: 'break-all' }, text: '检查地址：' + (health.url || '（未配置）') }),
-        h('div', { style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.6' }, text: healthHint(health) }),
-        h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
-          h('button.btn.btn-sm.btn-primary', { text: '重新检查', onclick: () => recheckHealth(s) }),
-          h('button.btn.btn-sm', { text: '查看日志', onclick: () => openLogs(s) }),
-          h('button.btn.btn-sm', { text: '改检查地址', onclick: () => newServiceModal(load, s) }),
-        ]),
-      ]) : null,
-
-      // 状态详情
-      state.detail ? h('div', {
-        style: { fontSize: '11.5px', color: 'var(--text-mute)', lineHeight: '1.5' },
-        text: state.detail,
-      }) : null,
-
-      // 操作
-      //
-      // 这一排就是用户 2026-09-17 定的固定集合：打开 / 直链 / 刷新 / 重启 /
-      // 停止（启动）/ 管理。三份实现全部来自 servicePanel.js：
-      //   · openDirectActions —— 打开（/<slug>/）与直链（port_url），
-      //     **与应用市场卡片、管理面板同一份**；
-      //   · serviceActions   —— 启停/重启/刷新，与市场卡片同一份；
-      //   · 管理              —— 打开与市场卡片点开的**同一个**面板。
-      // 服务记录本身没有 ui.slug / port_url（那些只在市场条目里），所以先用
-      // marketAppFor 对上号；对不上（不是目录里的应用）就少这两颗按钮。
-      h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap', marginTop: 'auto', paddingTop: '4px' } }, [
-        ...openDirectActions(marketAppFor(s)),
-        ...serviceActions(s, { onDone: (fresh) => {
-          // 单个动作完成后只更新这一条并重画，不整页重载（整页要重查全部服务，
-          // 含 colima/compose 这类偏慢的，而用户此刻只关心这一个）。
-          if (fresh && fresh.name) {
-            const list = (cache && cache.list) || [];
-            const i = list.findIndex((x) => x.name === s.name);
-            if (i >= 0) list[i] = fresh;
-          } else {
-            load();
-            return;
-          }
-          renderToolbar();
-          renderCards();
-        } }),
-        // 「取消纳管」与「卸载」都收进管理面板（用户 2026-09-17："重装、卸载、
-        // 文档等放进管理的弹出页面里"）。面板按 s.managed 决定给哪一颗：
-        // managed=false → forgetButton（取消纳管），managed=true → uninstallButton
-        // （卸载）。卡片上不再摆它们，卸载能力一颗没少。
-        h('button.btn.btn-sm', {
-          text: '⚙️ 管理',
-          title: '状态 / 启停 / 配置 / 日志 / 凭据 / 重装 / 文档 / 卸载 —— 与应用市场卡片上的是同一个面板',
-          // 把市场条目一起递进面板：管理面板要给出「重装 / 文档 / 打开 / 直链」，
-          // 这些字段只在市场条目里（服务记录没有 ui.slug / port_url / docs_url）。
-          onclick: () => openServicePanel({ market: marketAppFor(s), svc: s, onDone: load }),
-        }),
+        ...actions,
+        subpathWarning(m),
       ]),
     ]);
   }
 
-  // recheckHealth 重查单个服务的健康状态。
+  // ---------- 扫描可纳管服务（原服务管理页的扫描弹窗，功能一字未减） ----------
   //
-  // 只请求这一个服务（GET /services/{name} 会带上最新的 health），
-  // 然后原地更新列表里的那一条并重画 —— 不整页重载，因为整页要重新
-  // 查询所有服务（含 colima/compose 这类偏慢的），而用户此刻只关心这一个。
-  async function recheckHealth(s) {
-    const t = toast(`正在重新检查「${s.display_name || s.name}」…`, 'info', 0);
-    try {
-      const fresh = await api.service(s.name);
-      const list = (cache && cache.list) || [];
-      const i = list.findIndex((x) => x.name === s.name);
-      if (i >= 0) list[i] = fresh;
-      t.remove();
-      const hl = fresh.health || {};
-      if (!hl.checked) {
-        toast('该服务没有配置健康检查地址', 'warn', 8000);
-      } else if (hl.ok) {
-        toast(`「${fresh.display_name || s.name}」健康检查已通过`, 'ok');
-      } else {
-        toast(`仍然失败：${hl.message || '未知原因'}`, 'warn', 9000);
-      }
-      renderToolbar();
-      renderCards();
-    } catch (e) {
-      t.remove();
-      toast('重新检查失败：' + e.message, 'err', 9000);
-    }
-  }
-
-  // ---------- 扫描可纳管服务 ----------
-  async function scanAdoptable() {
-    const box = h('div', [h('div.empty', [h('div.big', { text: '🔍' }), h('p', { text: '正在扫描本机的 launchd 服务…' })])]);
-    const m = modal({ title: '扫描可纳管服务', wide: true, body: box });
+  // 2026-09-17：合并后它挂在「我的应用」的工具条上（用户要求"可纳管放进我的应用"）。
+  // 纳管成功后 onDone(afterAction) 会重画这一屏。
+  async function openAdoptable(onDone) {
+    const box = h('div', [
+      h('div.empty', [h('div.big', { text: '🔍' }), h('p', { text: '正在扫描本机的 launchd 服务…' })]),
+    ]);
+    modal({ title: '扫描可纳管服务', wide: true, body: box });
 
     let list = [];
     try {
@@ -352,8 +287,11 @@ export function ServicesView(content, ctx = {}) {
       return;
     }
 
-    appendAll(box, 
-      h('div.hint', { style: { marginBottom: '12px' }, text: '以下是本机正在使用的 launchd 服务。纳管后可以在面板里查看状态、启停、看日志；面板不会卸载它们。' }),
+    appendAll(box,
+      h('div.hint', {
+        style: { marginBottom: '12px' },
+        text: '以下是本机正在使用的 launchd 服务。纳管后可以在面板里查看状态、启停、看日志；面板不会卸载它们。',
+      }),
       h('table.table', [
         h('thead', [h('tr', [
           h('th', { text: '名称' }), h('th', { text: '状态' }), h('th', { text: '可执行文件' }), h('th', { text: '操作' }),
@@ -363,14 +301,17 @@ export function ServicesView(content, ctx = {}) {
             h('div', { style: { fontWeight: '550' }, text: c.label }),
             h('div', { style: { fontSize: '11px', color: 'var(--text-mute)' }, text: c.plist_path }),
           ]),
-          // 状态措辞要分清三种情况：正在跑 / 已加载但按需启动（没有进程是正常的）/
+          // 状态措辞分三种：正在跑 / 已加载但按需启动（没有进程是正常的）/
           // 根本没加载。macOS 上很多作业是按需触发的（系统 cron 就是），
           // 一律写成"已停止"会让人以为服务坏了。
           h('td', [
             c.running
               ? h('span.pill.ok', { text: '运行中' })
               : (c.loaded
-                ? h('span.pill', { text: '待触发（按需运行）', title: '已加载到 launchd，但没有常驻进程 —— 这类作业在需要时才被拉起，属正常状态' })
+                ? h('span.pill', {
+                  text: '待触发（按需运行）',
+                  title: '已加载到 launchd，但没有常驻进程 —— 这类作业在需要时才被拉起，属正常状态',
+                })
                 : h('span.pill.warn', { text: '未加载' })),
           ]),
           h('td.mono', { style: { fontSize: '11px' }, text: c.program || '—' }),
@@ -385,7 +326,7 @@ export function ServicesView(content, ctx = {}) {
                 toast(`已纳管 ${c.label}`, 'ok');
                 ev.target.closest('tr').style.opacity = '0.4';
                 btn.textContent = '已纳管';
-                load();
+                if (typeof onDone === 'function') onDone();
               } catch (e) {
                 toast(e.message, 'err', 9000);
                 btn.disabled = false;
@@ -398,7 +339,7 @@ export function ServicesView(content, ctx = {}) {
     );
   }
 
-  load();
+  renderAll();
 }
 
 // ============================================================================

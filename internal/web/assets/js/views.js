@@ -103,7 +103,7 @@ export function DashboardView(content, ctx = {}) {
       h('h3', { text: '服务状态' }),
       h('div.spacer'),
       h('button.btn.btn-ghost.btn-sm', {
-        text: '服务管理', onclick: () => go('services'),
+        text: '我的应用', onclick: () => go('services'),
       }),
     ]),
     svcBody,
@@ -125,7 +125,7 @@ export function DashboardView(content, ctx = {}) {
     if (!list.length) {
       svcBody.append(h('div.empty', [
         h('div.big', { text: '⚙️' }),
-        h('p', { text: '还没有登记服务，可到「应用市场」安装，或在「服务管理」里纳管本机已有服务。' }),
+        h('p', { text: '还没有登记服务，可到「应用」的「应用市场」安装，或在「我的应用」里纳管本机已有服务。' }),
       ]));
       return;
     }
@@ -143,7 +143,7 @@ export function DashboardView(content, ctx = {}) {
     });
     if (list.length > rows.length) {
       rows.push(h('tr', [h('td', { colspan: 3 }, [
-        h('span.hint', { text: `另有 ${list.length - rows.length} 个服务，见「服务管理」` }),
+        h('span.hint', { text: `另有 ${list.length - rows.length} 个服务，见「应用 → 我的应用」` }),
       ])]));
     }
     svcBody.append(

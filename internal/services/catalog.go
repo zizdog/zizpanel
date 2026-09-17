@@ -44,6 +44,15 @@ type App struct {
 	// 的地址（浏览器直接报错）。
 	// 留 0 表示与 Port 相同（绝大多数条目都是这样）。
 	UIPort int `json:"ui_port,omitempty"`
+	// DirectPort 是「打开 / 直链」按钮应当指向的宿主端口，**只在它不等于 WebPort()
+	// 时**填写（留 0 表示用 WebPort()）。
+	//
+	// 为什么不能直接用 UIPort 兼这个职责：UIPort 同时喂健康检查（healthURLFor）
+	// 与反向代理目标。MinIO 就是反例 —— 它的 S3 API 在 9010、控制台在 9011，
+	// 健康检查必须打 9010 的 /minio/health/live（200），而用户要打开的界面是 9011。
+	// 把 UIPort 挪到 9011 会让健康检查变成 404，于是"服务健康"永远红灯。
+	// 所以入口 URL 单独一个字段：它只影响 api_services.go 生成的 port_url。
+	DirectPort int `json:"direct_port,omitempty"`
 	// ConfigPath 是这个应用的配置文件名（**相对它自己的安装目录**，如 frps.toml）。
 	//
 	// 非空时，服务详情里会多一个「📝 编辑配置文件」入口：面板直接读写这个文件，
@@ -65,6 +74,17 @@ type App struct {
 	PanelInstaller string `json:"panel_installer,omitempty"`
 	// Compose 安装：compose 文件内容
 	ComposeYAML string `json:"compose_yaml"`
+	// ComposeSecrets 声明 compose 应用在**安装时**要随机生成的环境变量密钥。
+	//
+	// 为什么需要它：compose 条目过去只能是一份静态 YAML，任何密钥都写死在模板里
+	// （Activepieces 的 AP_JWT_SECRET / Immich 的 DB_PASSWORD 都是这种），
+	// 而"全网同一个默认口令"是最危险的一种默认。声明式写法的完整契约见
+	// ComposeSecret 与 install.go 的 prepareComposeProject：
+	//   · 每次安装只为**不存在的**变量生成一次随机值，写进 <compose 目录>/.env（0600）；
+	//   · ComposeYAML 里用 ${VAR} 引用，docker compose 自动读同目录 .env；
+	//   · 明文只进安装结果的 Credentials 区块，**绝不**进任务步骤/日志/审计；
+	//   · 重装/升级先读已有 .env，有值就复用（否则 Immich 的 DB 口令一变数据库就连不上）。
+	ComposeSecrets []ComposeSecret `json:"compose_secrets,omitempty"`
 	// 手工安装提示（无法自动安装时给出命令）
 	ManualHint string `json:"manual_hint"`
 
@@ -108,6 +128,49 @@ func (a App) WebPort() int {
 	}
 	return a.Port
 }
+
+// EntryPort 返回「打开 / 直链」按钮应当指向的宿主端口。
+//
+// 绝大多数条目与 WebPort() 相同；只有"界面端口 ≠ 健康检查端口"的条目
+// （目前只有 MinIO）用 DirectPort 单独指定。**不要**用它去做健康检查或反代 ——
+// 那两件事必须用 WebPort()，理由见 DirectPort 字段的注释。
+func (a App) EntryPort() int {
+	if a.DirectPort > 0 {
+		return a.DirectPort
+	}
+	return a.WebPort()
+}
+
+// ComposeSecret 声明 compose 应用的一个**安装时随机密钥**。
+//
+// 它只描述"要生成什么"，不携带任何值：值在安装时由 crypto/rand 现生成，
+// 写进 <compose 目录>/.env（0600），并且只出现在安装结果的 Credentials 区块里。
+type ComposeSecret struct {
+	// Env 是环境变量名：既是 .env 里的键，也是 ComposeYAML 里 ${Env} 引用的名字。
+	Env string `json:"env"`
+	// Encoding 是生成方式，必须是下面三个常量之一：
+	//   SecretHex      —— N 字节随机数的 hex（2N 个字符；Activepieces 的
+	//                     AP_ENCRYPTION_KEY 要求**恰好 32 个字符**，见条目注释）
+	//   SecretBase64   —— N 字节随机数的 URL-safe base64（不含 +/=，能直接进 .env）
+	//   SecretPassword —— N 个随机字符（A-Za-z0-9，刻意不含 shell/.env 敏感字符）
+	Encoding string `json:"encoding"`
+	// Bytes 是随机字节数（hex / base64），或字符数（password）。
+	Bytes int `json:"bytes"`
+	// Label 是给用户看的说明（会出现在凭据区块里）；留空则显示 Env。
+	Label string `json:"label,omitempty"`
+}
+
+const (
+	// SecretHex 生成 N 字节随机数的 hex 表示。
+	SecretHex = "hex"
+	// SecretBase64 生成 N 字节随机数的 URL-safe base64（无填充）。
+	SecretBase64 = "base64"
+	// SecretPassword 生成 N 个字母数字字符（不含 shell / .env 敏感字符）。
+	SecretPassword = "password"
+)
+
+// composeSecretMinBytes 是生成长度的下限（防止有人填 0 / 负数得到空口令）。
+const composeSecretMinBytes = 8
 
 // ConfigFilePath 解析目录条目声明的配置文件的**绝对路径**（没有则返回空串）。
 //
@@ -666,18 +729,23 @@ func Catalog() []App {
 					{From: "/apple-touch-icon.png", To: "/{slug}/apple-touch-icon.png"},
 					{From: "/manifest.json", To: "/{slug}/manifest.json"},
 				},
-				Note: "Uptime Kuma 官方不支持子路径（改写到页面前端路由后是 Page Not Found，实测于 mini）",
+				Note: "Uptime Kuma 官方不支持子路径（改写到页面前端路由后是 Page Not Found，实测于 mini）；" +
+					"下面这 5 条改写是**照 v1 调的**，v2 前端路由改版后是否仍成立需要重新实测。" +
+					"另：v1 → v2 会**自动迁移数据库**，请先看 Description 里的升级提醒。",
 				// 真机实测：/uptime-kuma/ 能返回页面、资源全 200，但正文是
 				// "Page Not Found" —— 它的 Vue 路由不认这个前缀，只有官方
 				// 那套改 entrypoint 的社区方案才能挂子路径，面板不做那种侵入。
 				PreferDirect: true,
 			},
-			Summary:     "自托管服务监控与告警",
-			Description: "监控网站与服务的可用性，支持多种通知渠道（Telegram / Bark / 邮件等）。",
-			Category:    "tool", Kind: KindCompose, Port: 3001,
+			Summary: "自托管服务监控与告警",
+			Description: "监控网站与服务的可用性，支持多种通知渠道（Telegram / Bark / 邮件等）。" +
+				"镜像用官方滚动 tag louislam/uptime-kuma:2（1.x 已停维护）。" +
+				"⚠️ v1→v2 会**自动迁移数据库**（不可逆），请先备份 ./data；" +
+				"子路径改写是按 v1 调的、v2 未重测。",
+			Category: "tool", Kind: KindCompose, Port: 3001,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
-			ComposeYAML: composeTemplate("uptime-kuma", "louislam/uptime-kuma:1", 3001, 3001, `
+			ComposeYAML: composeTemplate("uptime-kuma", "louislam/uptime-kuma:2", 3001, 3001, `
     volumes:
       - ./data:/app/data
     restart: unless-stopped`),
@@ -691,13 +759,22 @@ func Catalog() []App {
 				PreferDirect: true,
 			},
 			Summary: "S3 兼容的对象存储",
-			// 刻意避开 9000：那是 PHP-FPM 的固定端口（站点 vhost 都指向
-			// 127.0.0.1:9000），MinIO 默认也用 9000，两者会真的抢端口 ——
-			// 在装了 PHP 的机器上 MinIO 会直接起不来。
-			// PHP 的 9000 是约定不能动，所以让路的是 MinIO。
+			// 端口因果（2026-09-17 用户真机反馈后改，别再改回去）：
+			//   · **宿主 9000 永远留给 PHP-FPM**（站点 vhost 的 fastcgi_pass 指向它），
+			//     所以 MinIO 的 S3 API 只能映射到宿主 9010（容器内 9000）。
+			//   · 控制台**容器内**就是 9001。原先映射成宿主 9011，结果 MinIO
+			//     自己宣告的 9001 在宿主上是 **Portainer 的 HTTP 口** —— 用户点
+			//     MinIO 的直链/别名跳到 9001 看到的是 Portainer 的超时页。
+			//     根因不是改写，是端口被另一个应用占了。现在 MinIO 控制台改成
+			//     9001:9001（它宣告什么、宿主上就是什么），Portainer 让出 9001 改到 9002。
 			Description: "自建对象存储，适合存放图片、备份、模型文件。" +
-				"API 用 9010、控制台用 9011（避开 PHP-FPM 占用的 9000）。",
+				"API 用 9010、控制台用 9001（都避开 PHP-FPM 占用的 9000）。" +
+				"控制台地址是 http://<本机地址>:9001，S3 客户端连的是 9010。",
 			Category: "tool", Kind: KindCompose, Port: 9010,
+			// 健康检查打 S3 API 的 /minio/health/live（9010 才是 200）；
+			// 但「打开 / 直链」要给控制台（9001）——
+			// 直接把 WebPort 挪到 9001 会让健康检查变 404，所以用 DirectPort。
+			DirectPort: 9001,
 			HealthPath: "/minio/health/live",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
 			ComposeYAML: `services:
@@ -705,9 +782,11 @@ func Catalog() []App {
     image: quay.io/minio/minio:latest
     container_name: minio
     ports:
-      # 宿主机改用 9010/9011：9000 留给 PHP-FPM
+      # 宿主机：9000 留给 PHP-FPM，所以 S3 API 用 9010、控制台用 9001。
+      # 控制台容器内外都是 9001 —— 让 MinIO 自己宣告的 9001 在宿主上就是它，
+      # 避免"跳到 9001 看到 Portainer"（Portainer 已让到 9002）。
       - "9010:9000"
-      - "9011:9001"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -716,43 +795,10 @@ func Catalog() []App {
       - ./data:/data
     restart: unless-stopped
 `,
-			PostInstallHint: "默认账号密码均为 minioadmin，请登录后立即修改。控制台：http://127.0.0.1:9001",
-			DocsURL:         "https://min.io",
-		},
-		{
-			ID: "n8n", Name: "n8n", Icon: "🔗",
-			UI: &AppUI{
-				Slug:         "n8n",
-				Websocket:    true,
-				Note:         "n8n 需要在环境变量里设 N8N_PATH=/n8n/ 才能用子路径（面板只做改写，不保证可用）",
-				PreferDirect: true,
-			},
-			Summary:     "可视化自动化工作流",
-			Description: "用节点拖拽的方式编排自动化流程，可以对接 HTTP / 数据库 / AI 接口。",
-			Category:    "tool", Kind: KindCompose, Port: 5678,
-			HealthPath: "/healthz",
-			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
-			// 为什么用 Docker Hub 的 `n8nio/n8n` 而不是它自己的 `docker.n8n.io/n8nio/n8n`
-			// （2026-09-16 实测后改，别改回去）：
-			//   · `docker.n8n.io/v2/n8nio/n8n/manifests/latest` 返回 401，而
-			//     WWW-Authenticate 的 realm 指向 **auth.docker.io** —— 也就是说
-			//     n8n 自己的 registry 把鉴权委托给了 Docker Hub，而 auth.docker.io
-			//     在国内直连超时 → **拉不动**（域名 401 只说明"活着"，不代表能用）。
-			//   · 更关键的是 **registry-mirrors 只对 Docker Hub 生效**：配了 NAS /
-			//     公共加速源也救不了非 Hub 的域名。所以走 Hub 才是能加速的那条路。
-			//   · 这是**同一个官方项目**（n8n 官方把 Hub 的 n8nio/n8n 作为发布渠道，
-			//     不是第三方转存）。
-			// arm64 证据（经自建 NAS 镜像站读同一份 index，2026-09-16 实测）：
-			//   GET <mirror>/docker/v2/n8nio/n8n/manifests/latest
-			//   → linux/amd64、linux/arm64；arm64 子清单 15 层共 282.9MB
-			ComposeYAML: composeTemplate("n8n", "n8nio/n8n:latest", 5678, 5678, `
-    environment:
-      - N8N_SECURE_COOKIE=false
-      - GENERIC_TIMEZONE=Asia/Shanghai
-    volumes:
-      - ./data:/home/node/.n8n
-    restart: unless-stopped`),
-			DocsURL: "https://n8n.io",
+			PostInstallHint: "默认账号密码均为 minioadmin，请登录后立即修改。" +
+				"**控制台**：http://<本机地址>:9001（面板的「打开 / 直链」指向这里）；" +
+				"S3 API：http://<本机地址>:9010。",
+			DocsURL: "https://min.io",
 		},
 		{
 			ID: "gitea", Name: "Gitea", Icon: "🍵",
@@ -780,8 +826,10 @@ func Catalog() []App {
 		{
 			ID: "stirling-pdf", Name: "Stirling PDF", Icon: "📄",
 			UI: &AppUI{
-				Slug:         "stirling-pdf",
-				Note:         "Stirling 需要自己在配置里设 base path，面板只能硬挂；探测不通过时请用端口直连",
+				Slug: "stirling-pdf",
+				Note: "Stirling 需要自己在配置里设 base path，面板只能硬挂；探测不通过时请用端口直连 8082。" +
+					"**首次使用要先自己注册账号**：它默认开启登录，初始账号为空，打开 / 会 302 到 /login，" +
+					"请点「Sign up」自己开一个号（面板健康检查拿到的 401 是它正常的鉴权响应，不代表故障）。",
 				PreferDirect: true,
 			},
 			Summary:     "本地 PDF 工具箱",
@@ -793,6 +841,15 @@ func Catalog() []App {
     volumes:
       - ./data:/configs
     restart: unless-stopped`),
+			// 真机现象（2026-09-17 只读排查）：容器在跑但 RestartCount=184，
+			// dmesg 实证是 **Colima VM OOM**（VM 只有 1.9GiB）—— Stirling 的
+			// 图像/OCR 处理很吃内存，被内核 OOM 杀掉后 compose 不断重启它。
+			// 这不是面板的 bug，如实写进提示里，别让用户以为是"装坏了"。
+			PostInstallHint: "① 首次打开 http://<本机地址>:8082 会跳到登录页 —— 请点「Sign up」" +
+				"自己注册一个管理员账号（默认开启登录且初始账号为空，不注册进不去）。" +
+				"② 它做 OCR / 图片转换时很吃内存：Colima 虚拟机内存不足时容器会被内核 OOM 杀掉，" +
+				"表现为容器反复重启（docker ps 里 RESTARTS 不断增大）。遇到这种情况请给 Colima " +
+				"分配更多内存后重启运行时。",
 			DocsURL: "https://github.com/Stirling-Tools/Stirling-PDF",
 		},
 
@@ -992,15 +1049,13 @@ func Catalog() []App {
 			// DNS 服务商与域名（那是应用自带能力，面板无法代填 AccessKey）。
 			// 所以**不设** ConsoleOnly（设了就按"自带控制台不算使用入口"把「打开」藏掉）。
 			//
-			// PreferDirect 与 frpc 同一写法：默认给端口直连 http://<地址>:9876。
-			// 已在真机核对过直连可用（未登录 GET / 是 307 → /login，浏览器正常进登录页）；
-			// 子路径入口只作备用 —— 它的前端资源与接口是相对路径（./static、baseURL './'），
-			// 在面板的子路径反代下是否完全可用**没有真机验证过**，不拿它当首选。
+			// 2026-09-17：原先标了 PreferDirect（担心子路径不可用），只读排查证实
+			// 子路径其实是**好的** —— 未登录 GET / 返回 307，Location 已被面板正确
+			// 改写；它自己的前端资源走相对路径。那块 ⚠️ 属于过度保守，已去掉。
 			UI: &AppUI{
-				Slug:         "ddns-go",
-				PreferDirect: true,
-				Note: "首次配置（添加 DNS 服务商与域名）要在 ddns-go 自己的网页界面里做：" +
-					"面板默认给端口直连 http://<地址>:9876，子路径入口仅作备用。",
+				Slug: "ddns-go",
+				Note: "首次配置（添加 DNS 服务商与域名）要在 ddns-go 自己的网页界面里做。" +
+					"子路径（/ddns-go/）与端口直连 http://<地址>:9876 都能用。",
 			},
 			Summary: "动态公网 IP 变化时自动更新到 DNS 解析（Cloudflare / 阿里云 / DNSPod …）",
 			Description: "把变化的公网 IP 自动更新到你的域名解析，支持 Cloudflare、阿里云、" +
@@ -1108,9 +1163,20 @@ func Catalog() []App {
 		{
 			ID: "alist", Name: "Alist（文件列表）", Icon: "📂",
 			UI: &AppUI{
-				Slug:         "alist",
-				PreferDirect: true,
-				Note: "Alist 的 Web 界面在 5244。「打开」给端口直连 http://<本机地址>:5244；" +
+				Slug: "alist",
+				// 子路径根因（去混淆 Alist 前端 bundle 得到）：
+				// Alist 把 base_path 内联在 HTML 里（`window.ALIST = {..., base_path: '/'}`），
+				// 前端拿它拼 API baseURL（bundle 里没有 `"/api/` 这样的字面量，
+				// 所以通用的 `/api/` 改写规则一定无效）。这里做两条**针对性**改写：
+				// base_path 本身，以及静态资源前缀 `/static/`。
+				// ✅ 2026-09-17 真机验证（mini，0.14.1）：改写后页面内联的 base_path 变成
+				// `/alist/`，`/alist/api/public/settings` 从 404 变 **200**、
+				// `/alist/static/manifest.json` = 200，所以子路径可用，不再标 PreferDirect。
+				Rewrites: []UIRewrite{
+					{From: "base_path: '/'", To: "base_path: '/{slug}/'"},
+					{From: "/static/", To: "/{slug}/static/"},
+				},
+				Note: "Alist 的 Web 界面在 5244（直链）或面板的 /alist/ 子路径（两条都可用）。" +
 					"初始管理员口令由 Alist 在**首次启动时**随机生成并写进它自己的日志，" +
 					"面板会把这一条从日志里抓出来放进安装结果（抓不到时会说明）。",
 			},
@@ -1188,11 +1254,14 @@ func Catalog() []App {
 			Description: "用网页管理本机的 Docker 资源。**安全提醒**：它需要挂载 Docker socket，" +
 				"等于把 Docker 的完全控制权交给这个界面 —— 只在局域网用，绝不要暴露到公网。" +
 				"界面走 HTTPS（自签证书，浏览器要点一次「继续访问」），端口 9443；" +
-				"HTTP 入口被面板映射到宿主 **9001**（让开 PHP-FPM 占用的 9000），会跳到 9443；" +
-				"面板的健康检查与「直链」用的是 9001。",
-			// 宿主机用 9001 映射容器里的 9000：**9000 在本项目里是 PHP-FPM 的保留端口**
-			// （站点 vhost 的 fastcgi_pass 指向它，且静态门禁不许默认站点出现写死的 9000）。
-			Category: "tool", Kind: KindCompose, Port: 9001,
+				"HTTP 入口映射到宿主 **9002**（9000 是 PHP-FPM 的保留端口，9001 已让给 MinIO 控制台），" +
+				"访问后会跳到 9443；面板的健康检查与「直链」用的是 9002。",
+			// 宿主端口为什么是 9002：**9000 在本项目里是 PHP-FPM 的保留端口**
+			// （站点 vhost 的 fastcgi_pass 指向它）；而 9001 之前被 Portainer 占着，
+			// 与 MinIO 控制台（容器内 9001）在宿主侧撞车 —— 用户点 MinIO 的直链
+			// 跳到 9001 看到 Portainer 的超时页就是这么来的。现在 9001 还给 MinIO，
+			// Portainer 用 9002。
+			Category: "tool", Kind: KindCompose, Port: 9002,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			ComposeYAML: `services:
@@ -1200,8 +1269,9 @@ func Catalog() []App {
     image: portainer/portainer-ce:lts
     container_name: portainer
     ports:
-      # 宿主 9001 → 容器 9000（让开本机的 PHP-FPM 9000）；9443 是它的 HTTPS 界面
-      - "9001:9000"
+      # 宿主 9002 → 容器 9000（9000 留给 PHP-FPM、9001 让给 MinIO 控制台）；
+      # 9443 是它的 HTTPS 界面。
+      - "9002:9000"
       - "9443:9443"
     volumes:
       # 这里必须写 **VM 内**的 /var/run/docker.sock：Colima 下 compose 的 bind 源是
@@ -1211,16 +1281,35 @@ func Catalog() []App {
       - ./data:/data
     restart: unless-stopped
 `,
-			PostInstallHint: "首次打开 https://<本机地址>:9443 时必须在 5 分钟内设置管理员口令" +
-				"（超时要重启容器重来）；自签证书会提示不安全，点「继续访问」即可。",
+			PostInstallHint: "① 首次打开 https://<本机地址>:9443 时必须在 **5 分钟内**设置管理员口令，" +
+				"超时会被锁定、只能重启容器重来。" +
+				"② 较新的 Portainer（≥2.45）在**每次启动**时都会生成一个一次性 **setup_token**：" +
+				"用 `docker logs portainer 2>&1 | grep -i setup` 取（它在 `====` 横幅中间、64 位十六进制），" +
+				"粘进 setup 页面才能继续。口令重启后 5 分钟内有效，token 每次启动都会换新的。" +
+				"③ 自签证书会提示不安全，点「继续访问」即可。" +
+				"④ 如果打开后看到的是「…timed out for security purposes」页面，说明已经超时锁定：" +
+				"`docker restart portainer` 后立刻重新打开，并在 5 分钟内完成设置。",
 			DocsURL: "https://www.portainer.io",
 		},
 		{
 			ID: "homepage", Name: "Homepage", Icon: "🏠",
 			UI: &AppUI{
-				Slug:         "homepage",
-				PreferDirect: true,
-				Note:         "Homepage 的界面按根路径设计（子路径实测不保证可用），建议用「直链」",
+				Slug: "homepage",
+				// 用户反馈（2026-09-17 真机）：/homepage/ 打开后**无样式** ——
+				// Homepage 是 Next.js 构建产物，HTML 里是根绝对路径
+				// `/_next/static/…`、`/api/…`，不改写就会打到站点根 404。
+				// 下面这几条把它们拉回 /homepage/ 前缀。去掉 PreferDirect：
+				// 加前缀后这些路径实测 200（见 mini 验证记录）。
+				Rewrites: []UIRewrite{
+					{From: "/_next/", To: "/{slug}/_next/"},
+					{From: "/api/", To: "/{slug}/api/"},
+					{From: "/site.webmanifest", To: "/{slug}/site.webmanifest"},
+					{From: "/safari-pinned-tab.svg", To: "/{slug}/safari-pinned-tab.svg"},
+					{From: "/apple-touch-icon.png", To: "/{slug}/apple-touch-icon.png"},
+					{From: "/favicon-16x16.png", To: "/{slug}/favicon-16x16.png"},
+					{From: "/favicon-32x32.png", To: "/{slug}/favicon-32x32.png"},
+					{From: "/homepage.ico", To: "/{slug}/homepage.ico"},
+				},
 			},
 			Summary: "自建导航首页 / 服务仪表盘",
 			Description: "把本机的服务、书签、常用链接汇总成一个首页。端口 **3010**（避开 Gitea 的 3000）。" +
@@ -1312,6 +1401,206 @@ func Catalog() []App {
 				"（服务端没有默认口令，不设就进不去）。**不要直接开 /setup** —— 本镜像（v0.105.0）里" +
 				"该服务端路由会 500（assets/views 没打进镜像），根路径的页面会自己引导初始化。",
 			DocsURL: "https://docs.triliumnotes.org/user-guide/setup/server/installation/docker",
+		},
+		{
+			// Activepieces 为什么走 Docker：没有 homebrew formula，官方也没有
+			// darwin-arm64 服务端产物（发布渠道只有 npm 包与容器镜像），
+			// 镜像自带 linux/arm64（证据见下）。
+			ID: "activepieces", Name: "Activepieces", Icon: "🪄",
+			UI: &AppUI{
+				Slug: "activepieces",
+				// 它没有子路径支持：前端按根路径构建，AP_FRONTEND_URL 只影响
+				// webhook/回调地址，不能把界面挂到 /activepieces/ —— 如实标直连。
+				PreferDirect: true,
+				Note: "Activepieces 官方不支持子路径（AP_FRONTEND_URL 只决定 webhook/回调地址，" +
+					"不能把界面挂到 /activepieces/）；请用「直链」http://<本机地址>:8090。",
+			},
+			Summary: "可视化自动化工作流（开源 Zapier 替代）",
+			Description: "用节点拖拽编排自动化流程，连接大量 SaaS / HTTP / 数据库 / AI 接口。" +
+				"**走 Docker（3 容器）**：app（API+worker）、PostgreSQL(pgvector)、Redis，宿主端口 8090。" +
+				"AP_JWT_SECRET / AP_ENCRYPTION_KEY / 数据库口令安装时随机生成，只在安装结果的凭据区块出现。",
+			Category: "tool", Kind: KindCompose, Port: 8090,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// arm64 证据（2026-09-17 本机 `docker manifest inspect` 直查 ghcr.io）：
+			//   ghcr.io/activepieces/activepieces:0.91.0 → linux/amd64、linux/arm64
+			//   （另有两个 unknown/unknown 的 attestation）
+			//   pgvector/pgvector:0.8.0-pg14 → Docker Hub 多架构（含 linux/arm64）
+			//   redis:7.0.7 → Docker Hub 多架构（含 linux/arm64/v8）；
+			//   compose 里写成规范形式 library/redis:7.0.7（等价 redis，静态门禁要求带仓库前缀）
+			//
+			// 为什么用 WORKER_AND_APP：镜像的 docker-entrypoint.sh 里这个值就是默认值，
+			// 同一个容器同时跑 API 与一个 worker —— 单机自用足够；官方 compose 起
+			// 5 个 worker 副本是给生产横向扩展用的，在迷你机上没有收益。
+			//
+			// AP_ENCRYPTION_KEY 为什么是 **16 字节（32 个 hex 字符）**而不是 32 字节：
+			//   源码 packages/server/api/src/app/helper/encryption.ts 用
+			//   `Buffer.from(secret, 'binary')` 取密钥、算法是 `aes-256-cbc`。
+			//   'binary'（latin1）一个字符 = 一字节，所以密钥**必须恰好 32 个字符**；
+			//   给 64 个 hex 字符会变成 64 字节 → createCipheriv 抛 Invalid key length。
+			//   官方文档也写 "32-character (16 bytes) hexadecimal key / openssl rand -hex 16"。
+			//   AP_JWT_SECRET 官方用 `openssl rand -hex 32`（64 字符），照办。
+			//
+			// AP_FRONTEND_URL 为什么带默认值：面板在安装时**拿不到**用户会用哪个地址
+			//   访问（可能是 LAN IP，也可能是隧道域名），只能给一个安全默认值
+			//   http://127.0.0.1:8090；要对外用 webhook/触发器时，请在应用目录的 .env
+			//   里把它改成真实可达地址再重启容器（见 PostInstallHint）。
+			ComposeYAML: `services:
+  activepieces:
+    image: ghcr.io/activepieces/activepieces:0.91.0
+    container_name: activepieces
+    ports:
+      # 宿主 8090 → 容器 80：8080 是本项目 IOPaint 的保留端口
+      - "8090:80"
+    environment:
+      AP_CONTAINER_TYPE: WORKER_AND_APP
+      # 面板不知道用户用哪个地址访问，默认只适用于本机；局域网/隧道访问请改 .env
+      AP_FRONTEND_URL: ${AP_FRONTEND_URL:-http://127.0.0.1:8090}
+      AP_ENCRYPTION_KEY: ${AP_ENCRYPTION_KEY}
+      AP_JWT_SECRET: ${AP_JWT_SECRET}
+      AP_POSTGRES_HOST: activepieces-postgres
+      AP_POSTGRES_PORT: "5432"
+      AP_POSTGRES_DATABASE: activepieces
+      AP_POSTGRES_USERNAME: postgres
+      AP_POSTGRES_PASSWORD: ${AP_POSTGRES_PASSWORD}
+      AP_REDIS_HOST: activepieces-redis
+      AP_REDIS_PORT: "6379"
+    volumes:
+      - ./data:/usr/src/app/cache
+    depends_on:
+      - activepieces-postgres
+      - activepieces-redis
+    restart: unless-stopped
+  activepieces-postgres:
+    image: pgvector/pgvector:0.8.0-pg14
+    container_name: activepieces-postgres
+    # 不发布宿主端口：库只在 compose 网络内被 app 访问
+    environment:
+      POSTGRES_DB: activepieces
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${AP_POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+  activepieces-redis:
+    image: library/redis:7.0.7
+    container_name: activepieces-redis
+    # 不发布宿主端口：只在 compose 网络内被 app 访问
+    volumes:
+      - ./redis:/data
+    restart: unless-stopped
+`,
+			ComposeSecrets: []ComposeSecret{
+				{Env: "AP_ENCRYPTION_KEY", Encoding: SecretHex, Bytes: 16,
+					Label: "Activepieces 连接加密密钥（加密已保存的第三方凭据；必须恰好 32 个 hex 字符）"},
+				{Env: "AP_JWT_SECRET", Encoding: SecretHex, Bytes: 32,
+					Label: "Activepieces JWT 签名密钥"},
+				{Env: "AP_POSTGRES_PASSWORD", Encoding: SecretHex, Bytes: 32,
+					Label: "Activepieces 数据库口令（用户 postgres / 库 activepieces）"},
+			},
+			PostInstallHint: "① 首次打开 http://<本机地址>:8090 注册第一个账号，它就是平台管理员" +
+				"（Activepieces 不预设默认口令）。" +
+				"② 安装结果里的凭据区块有数据库口令与两个密钥，请自行留存；重装不会重新生成。" +
+				"③ 要用**外部 webhook/触发器**时，把 <应用目录>/.env 里的 AP_FRONTEND_URL 改成" +
+				"外部可达的地址（如 http://192.168.1.4:8090 或你的隧道域名），再重启容器 —— " +
+				"否则生成的回调地址会指向 127.0.0.1，外部触发打不进来。",
+			DocsURL: "https://www.activepieces.com/docs/install/options/docker-compose",
+		},
+		{
+			// Immich 为什么走 Docker：官方只发布容器镜像；没有 brew formula、
+			// 也没有 darwin-arm64 服务端产物。四个镜像都自带 linux/arm64（证据见下）。
+			ID: "immich", Name: "Immich", Icon: "📷",
+			UI: &AppUI{
+				Slug: "immich",
+				// 官方不支持子路径（前端按根路径构建）；如实标直连。
+				PreferDirect: true,
+				Note: "Immich 官方不支持子路径（前端按根路径构建）；请用「直链」" +
+					"http://<本机地址>:2283，手机 App 里也填这个地址。" +
+					"⚠️ 官方明确非 Linux 宿主 strongly discouraged（macOS 只能靠 Colima 虚拟机跑）；" +
+					"macOS **没有硬件转码**（无 QSV/VAAPI/NVENC 直通），视频只能 CPU 软转、很吃 CPU；" +
+					"首次启动要下载人脸/CLIP 模型到 model-cache/，期间搜索不可用。" +
+					"DB_PASSWORD 重装会复用 .env 旧值、绝不重新生成 —— 数据库初始化后换口令会直接连不上。",
+			},
+			Summary: "自托管照片 / 视频备份（Google Photos 替代）",
+			Description: "本地优先的照片与视频备份、浏览、相册共享、人脸/语义搜索。" +
+				"**走 Docker（官方 4 容器）**，宿主端口 2283，DB_PASSWORD 安装时随机生成。" +
+				"⚠️ 官方明确非 Linux 宿主 strongly discouraged；macOS **没有硬件转码**（只能 CPU 软转）；" +
+				"首次启动要下载 ML 模型。",
+			Category: "tool", Kind: KindCompose, Port: 2283,
+			// 官方健康端点：GET /api/server/ping → 200 {"res":"pong"}
+			HealthPath: "/api/server/ping",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// arm64 证据（2026-09-17 本机 `docker manifest inspect` 直查）：
+			//   ghcr.io/immich-app/immich-server:release            → linux/amd64、linux/arm64
+			//   ghcr.io/immich-app/immich-machine-learning:release  → linux/amd64、linux/arm64
+			//   ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0 → linux/amd64、linux/arm64
+			//   valkey/valkey:9 （经自建 NAS 镜像站读同一份 index）  → linux/amd64、linux/arm64
+			//   （ghcr 三个各另有 unknown/unknown 的 attestation）
+			//
+			// 与官方 compose 的三处**故意差异**（都是本项目约定，别改回去）：
+			//   ① 容器名加 immich- 前缀：官方用 postgres / redis 这种通用名，
+			//      在同一台机器上和别的 compose 项目会撞名；
+			//   ② 用明确的 environment 而不是 env_file：静态模板里只需要 DB_PASSWORD
+			//      一个随机值，其余写死即可，少一个"用户忘了配 .env 就起不来"的坑；
+			//   ③ 去掉 /etc/localtime 挂载：宿主是 macOS，Colima 下 bind 源在 Linux VM
+			//      里解析，挂 VM 的 /etc 文件收益很小（与 trilium 同一处理）。
+			ComposeYAML: `services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    ports:
+      - "2283:2283"
+    environment:
+      DB_HOSTNAME: immich-postgres
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: immich-redis
+    volumes:
+      # 上传目录（官方 UPLOAD_LOCATION）
+      - ./data:/data
+    depends_on:
+      - immich-redis
+      - immich-postgres
+    restart: always
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    volumes:
+      # 机器学习模型缓存（官方 model-cache）
+      - ./model-cache:/cache
+    restart: always
+  immich-redis:
+    image: valkey/valkey:9
+    container_name: immich-redis
+    restart: always
+  immich-postgres:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0
+    container_name: immich-postgres
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      # 数据库数据目录（官方 DB_DATA_LOCATION）
+      - ./postgres:/var/lib/postgresql/data
+    shm_size: 128mb
+    restart: always
+`,
+			ComposeSecrets: []ComposeSecret{
+				{Env: "DB_PASSWORD", Encoding: SecretHex, Bytes: 32,
+					Label: "Immich 数据库口令（用户 postgres / 库 immich）"},
+			},
+			PostInstallHint: "① 首次打开 http://<本机地址>:2283 注册第一个管理员账号（官方不设默认口令）。" +
+				"② 手机 App 里把服务器地址填成同一个 URL 即可开始备份。" +
+				"③ 首次启动 immich-machine-learning 会下载人脸/CLIP 模型到 model-cache/，" +
+				"期间搜索/人脸识别不可用，别以为是装坏了。" +
+				"④ macOS **没有硬件转码**：视频转码走 CPU、很慢且吃满 CPU；" +
+				"对转码性能有要求的话建议把 Immich 放在 Linux 机器上。" +
+				"⑤ **不要重新生成 DB_PASSWORD**：数据库初始化后再换口令会直接连不上。" +
+				"重装/升级会复用 .env 里的旧口令，面板不会替你改它。",
+			DocsURL: "https://docs.immich.app/install/docker-compose",
 		},
 		{
 			ID: "wordpress", Name: "WordPress", Icon: "🌐",
@@ -1842,6 +2131,23 @@ func isSystemLabel(label string) bool {
 // 其它任意第三方服务仍然走手动纳管 —— 自动接管一个我们不了解的服务，
 // 会在面板里显示成一条信息不全、状态不准的记录，反而更误导。
 func (m *Manager) AutoRegisterKnown(ctx context.Context) int {
+	// 先把已有记录按「label 家族」建成集合：同一家族只允许一条记录。
+	//
+	// 真机现象（2026-09-17 用户反馈）：同一个 php-fpm 在服务管理里出现两条 ——
+	// `php82` 与 `homebrew-mxcl-php8-2`。根因是两处的 label 写法互为别名
+	// （`homebrew.mxcl.` / `sh.brew.` 是两套前缀，`.` 与 `-` 只是归一化差异），
+	// 而 RegisterInstalledService 的幂等判定只看**完全相等**的 label，
+	// 于是同一家族被登记了两遍。前端会做展示去重，但源头也要修。
+	knownFamily := map[string]bool{}
+	if m.repo != nil {
+		if list, err := m.repo.List(ctx); err == nil {
+			for _, s := range list {
+				if fam := labelFamily(s.LaunchLabel); fam != "" {
+					knownFamily[fam] = true
+				}
+			}
+		}
+	}
 	n := 0
 	for _, a := range Catalog() {
 		if a.ServiceLabel == "" {
@@ -1854,6 +2160,10 @@ func (m *Manager) AutoRegisterKnown(ctx context.Context) int {
 		if a.Kind == KindColima {
 			continue
 		}
+		fam := labelFamily(a.ServiceLabel)
+		if fam != "" && knownFamily[fam] {
+			continue
+		}
 		if !m.launchServicePresent(ctx, a.ServiceLabel) {
 			continue
 		}
@@ -1863,9 +2173,40 @@ func (m *Manager) AutoRegisterKnown(ctx context.Context) int {
 		}
 		if err := m.RegisterInstalledService(ctx, a.ServiceLabel, a.Name, icon, a.Category, a.Port); err == nil {
 			n++
+			if fam != "" {
+				// 同一次循环里也要防住：万一目录里还有同家族的另一个条目。
+				knownFamily[fam] = true
+			}
 		}
 	}
 	return n
+}
+
+// labelFamily 把一个 launchd 标签 / 服务记录名归一化成"家族键"，
+// 用来判断两条记录是不是**同一个东西**。
+//
+// 归一化规则（照着真机上真实出现的两种写法来）：
+//   - `homebrew.mxcl.` 与 `sh.brew.` 互为别名，都剥掉（点号形态与连字符形态都认）；
+//   - 其余交给 NormalizeName：`.` / `_` / 空格 → `-`，`@` 直接丢弃
+//     （所以标签 `homebrew.mxcl.php@8.2` 与记录名 `homebrew-mxcl-php8-2`
+//     归一化后都是 `php8-2`）。
+//
+// 只用于**去重**判定，不参与任何展示：展示名仍走 FriendlyName。
+func labelFamily(label string) string {
+	s := strings.ToLower(strings.TrimSpace(label))
+	if s == "" {
+		return ""
+	}
+	for _, p := range []string{
+		"homebrew.mxcl.", "sh.brew.", // 标签形态
+		"homebrew-mxcl-", "sh-brew-", // 记录名形态（NormalizeName 之后）
+	} {
+		if strings.HasPrefix(s, p) {
+			s = strings.TrimPrefix(s, p)
+			break
+		}
+	}
+	return NormalizeName(s)
 }
 
 // launchServicePresent 判断某个 launchd 服务在本机是否存在。

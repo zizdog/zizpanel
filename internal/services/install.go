@@ -2,6 +2,9 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -594,31 +597,11 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 		return fmt.Errorf("未找到 docker compose 命令。请确认 Docker 安装完整（OrbStack 自带 compose）")
 	}
 
-	dir := filepath.Join(m.composeDir(), app.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("创建目录失败: %w", err)
+	composeFile, err := m.prepareComposeProject(ctx, app, res)
+	if err != nil {
+		return err
 	}
-	// compose 项目目录归属真实用户，方便用户自己维护。
-	// **必须递归**（D29）：非 root 的容器（n8n 用 uid 1000 挂 ./data）要在
-	// 项目目录下建目录、写文件，只 chown 顶层会让它的数据目录变成 root 属主，
-	// 容器直接写不进去。顶层仍单独 chown 一次，保证 chownTree 遇到异常条目时
-	// 顶层归属不会漏。
-	if m.opt.UserName != "" {
-		if uid, gid, err := lookupUser(m.opt.UserName); err == nil {
-			_ = os.Chown(dir, uid, gid)
-			_ = chownTree(m.opt.UserName, dir)
-		}
-	}
-
-	composeFile := filepath.Join(dir, "docker-compose.yml")
-	content := app.ComposeYAML
-	if content == "" {
-		return fmt.Errorf("「%s」缺少 compose 定义，无法自动安装", app.Name)
-	}
-	if err := os.WriteFile(composeFile, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("写入 compose 文件失败: %w", err)
-	}
-	res.step(ctx, "已生成 "+composeFile)
+	dir := filepath.Dir(composeFile)
 
 	// 让用户看得见"数据落在哪、镜像走哪条路"（D13 的教训就是面板说一个路径、
 	// 数据却在另一个路径；D18 是"装了但不知道走的哪个源"）。
@@ -669,6 +652,292 @@ func (m *Manager) installViaCompose(ctx context.Context, app App, res *InstallRe
 	// 而不是去「服务管理 → 日志」里翻 —— 那对不熟悉的人太难了。
 	m.scrapeGeneratedCredentials(ctx, app, res)
 	return nil
+}
+
+// composeEnvFileName 是 compose 项目目录里的密钥文件名。
+//
+// 用 docker compose 的默认约定 `.env`：compose 会自动读**项目目录**
+// （即 compose 文件所在目录，也是 composeDriver 设置的 cmd.Dir）下的它，
+// 所以 ComposeYAML 里的 ${VAR} 不需要额外 --env-file 参数。
+const composeEnvFileName = ".env"
+
+// prepareComposeProject 为一次 compose 安装准备磁盘内容：
+// 建项目目录 → 生成/复用 .env（0600）→ 写 docker-compose.yml，返回 compose 文件路径。
+//
+// 为什么从 installViaCompose 里抽出来单独一个函数：这一半是**确定性、可单测**的
+// （不碰 docker），另一半才是真的把容器拉起来。密钥的幂等与脱敏是本项目最容易
+// 伤到用户的一条（Immich 的 DB 口令一变、数据库立刻连不上），必须有单测
+// 直接锁住"这一半"，而不是靠一次真机安装去碰运气。
+func (m *Manager) prepareComposeProject(ctx context.Context, app App, res *InstallResult) (string, error) {
+	if strings.TrimSpace(app.ComposeYAML) == "" {
+		return "", fmt.Errorf("「%s」缺少 compose 定义，无法自动安装", app.Name)
+	}
+	dir := filepath.Join(m.composeDir(), app.ID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("创建目录失败: %w", err)
+	}
+	// compose 项目目录归属真实用户，方便用户自己维护。
+	// **必须递归**（D29）：非 root 的容器（n8n 用 uid 1000 挂 ./data）要在
+	// 项目目录下建目录、写文件，只 chown 顶层会让它的数据目录变成 root 属主，
+	// 容器直接写不进去。顶层仍单独 chown 一次，保证 chownTree 遇到异常条目时
+	// 顶层归属不会漏。
+	if m.opt.UserName != "" {
+		if uid, gid, err := lookupUser(m.opt.UserName); err == nil {
+			_ = os.Chown(dir, uid, gid)
+			_ = chownTree(m.opt.UserName, dir)
+		}
+	}
+
+	// 1) 随机密钥：先读已有 .env，有值就复用；缺的才生成。
+	creds, envChanged, err := ensureComposeEnv(dir, app)
+	if err != nil {
+		return "", err
+	}
+	if len(creds) > 0 {
+		// 明文**只**进 Credentials（安装结果里那一次展示）。
+		// 安全约定（硬要求）：步骤、日志、审计里都不许出现，见 InstallResult.Credentials。
+		res.Credentials = append(res.Credentials, creds...)
+		envPath := filepath.Join(dir, composeEnvFileName)
+		if envChanged {
+			res.step(ctx, "已生成随机密钥并写入 "+envPath+
+				"（权限 0600；明文只在下方凭据区块里出现，不进日志）")
+		} else {
+			res.step(ctx, "复用已有的密钥文件 "+envPath+
+				"（重装/升级不会重新生成 —— 否则数据库口令一变就连不上）")
+		}
+	}
+
+	// 2) compose 文件（里面的密钥都是 ${VAR} 引用，不落明文）
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	if err := os.WriteFile(composeFile, []byte(app.ComposeYAML), 0o644); err != nil {
+		return "", fmt.Errorf("写入 compose 文件失败: %w", err)
+	}
+	res.step(ctx, "已生成 "+composeFile)
+	return composeFile, nil
+}
+
+// ensureComposeEnv 保证 <dir>/.env 里每个声明的密钥都有值，返回**全部**声明的
+// 当前值（新生成的与复用的都算）+ "这次有没有写盘"。
+//
+// 幂等契约（必须有单测锁住）：已有非空值一律复用，绝不重新生成 ——
+// Immich 的 DB_PASSWORD 一变，已初始化的数据库立刻连不上。
+func ensureComposeEnv(dir string, app App) (creds []Credential, changed bool, err error) {
+	if len(app.ComposeSecrets) == 0 {
+		return nil, false, nil
+	}
+	envPath := filepath.Join(dir, composeEnvFileName)
+	raw := ""
+	if b, rerr := os.ReadFile(envPath); rerr == nil {
+		raw = string(b)
+	} else if !os.IsNotExist(rerr) {
+		return nil, false, fmt.Errorf("读取 %s 失败: %w", envPath, rerr)
+	}
+	existing := parseComposeEnv(raw)
+
+	fresh := map[string]string{}
+	for _, s := range app.ComposeSecrets {
+		env := strings.TrimSpace(s.Env)
+		if env == "" {
+			continue
+		}
+		if v, ok := existing[env]; ok && strings.TrimSpace(v) != "" {
+			// 复用旧值：这是"重装不能换口令"的唯一实现点。
+			creds = append(creds, composeSecretCredential(s, v))
+			continue
+		}
+		v, gerr := generateSecretValue(s)
+		if gerr != nil {
+			return nil, false, fmt.Errorf("为 %s 生成随机值失败: %w", env, gerr)
+		}
+		fresh[env] = v
+		creds = append(creds, composeSecretCredential(s, v))
+	}
+
+	out, changed := mergeComposeEnv(raw, app.ComposeSecrets, fresh)
+	if !changed {
+		// 内容没变就别写盘（保住 mtime，也让"重装 .env 一字未动"可断言）；
+		// 但权限仍要纠正一次：老版本/用户手工建的文件可能是 0644。
+		_ = os.Chmod(envPath, 0o600)
+		return creds, false, nil
+	}
+	if err := os.WriteFile(envPath, []byte(out), 0o600); err != nil {
+		return nil, false, fmt.Errorf("写入 %s 失败: %w", envPath, err)
+	}
+	// WriteFile 只在**新建**时应用 0600，已存在的文件权限不变 → 显式 chmod。
+	if err := os.Chmod(envPath, 0o600); err != nil {
+		return nil, false, fmt.Errorf("设置 %s 权限失败: %w", envPath, err)
+	}
+	return creds, true, nil
+}
+
+// parseComposeEnv 解析 .env（KEY=VALUE，忽略空行、# 注释与可选的 export 前缀）。
+func parseComposeEnv(text string) map[string]string {
+	out := map[string]string{}
+	for _, ln := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		t = strings.TrimPrefix(t, "export ")
+		k, v, ok := strings.Cut(t, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		out[k] = strings.Trim(strings.TrimSpace(v), `"'`)
+	}
+	return out
+}
+
+// mergeComposeEnv 把新生成的密钥并进已有 .env 文本：
+//   - 已存在的同名行**原地替换**（保住用户的排版与其它未被面板管理的键）；
+//   - 不存在的键**追加**在末尾；
+//   - 没有任何要写的值时返回 changed=false（调用方据此不写盘）。
+func mergeComposeEnv(raw string, secrets []ComposeSecret, add map[string]string) (string, bool) {
+	if len(add) == 0 {
+		return raw, false
+	}
+	managed := map[string]bool{}
+	for _, s := range secrets {
+		if env := strings.TrimSpace(s.Env); env != "" {
+			managed[env] = true
+		}
+	}
+	lines := strings.Split(raw, "\n")
+	handled := map[string]bool{}
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		t = strings.TrimPrefix(t, "export ")
+		k, _, ok := strings.Cut(t, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v, want := add[k]
+		if !want || !managed[k] {
+			continue
+		}
+		lines[i] = k + "=" + v
+		handled[k] = true
+	}
+	var extra []string
+	for _, s := range secrets {
+		env := strings.TrimSpace(s.Env)
+		if v, ok := add[env]; ok && !handled[env] {
+			extra = append(extra, env+"="+v)
+		}
+	}
+	out := strings.Join(lines, "\n")
+	if len(extra) > 0 {
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += strings.Join(extra, "\n") + "\n"
+	}
+	return out, true
+}
+
+// generateSecretValue 按声明生成一个随机值。
+func generateSecretValue(s ComposeSecret) (string, error) {
+	n := s.Bytes
+	if n < composeSecretMinBytes {
+		n = composeSecretMinBytes
+	}
+	switch s.Encoding {
+	case SecretHex:
+		b := make([]byte, n)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(b), nil
+	case SecretBase64:
+		b := make([]byte, n)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		// RawURLEncoding：不含 + / =，能原样进 .env 与 URL
+		return base64.RawURLEncoding.EncodeToString(b), nil
+	case SecretPassword:
+		const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+		out := make([]byte, n)
+		buf := make([]byte, n)
+		// 拒绝采样，避免取模偏置。limit 用 int：byte 装不下 256，
+		// 一旦字母表长度整除 256 就会溢出成 0 → 死循环。
+		limit := 256 - (256 % len(alphabet))
+		for i := 0; i < n; {
+			if _, err := rand.Read(buf); err != nil {
+				return "", err
+			}
+			for _, c := range buf {
+				if int(c) >= limit {
+					continue
+				}
+				out[i] = alphabet[int(c)%len(alphabet)]
+				i++
+				if i == n {
+					break
+				}
+			}
+		}
+		return string(out), nil
+	default:
+		return "", fmt.Errorf("未知的密钥生成方式 %q（必须是 hex / base64 / password）", s.Encoding)
+	}
+}
+
+// composeSecretCredential 把一个密钥值包成给用户看的凭据条目。
+func composeSecretCredential(s ComposeSecret, value string) Credential {
+	label := strings.TrimSpace(s.Label)
+	if label == "" {
+		label = s.Env
+	}
+	return Credential{Key: s.Env, Value: value, Label: label}
+}
+
+// ComposeSecretProblems 校验目录里的 compose 密钥声明是否自洽（空 = 没问题）。
+//
+// 静态门禁用：声明了密钥却不在 compose 里 ${} 引用、Encoding 写错、
+// 长度小于下限，都会让"随机密钥"这个能力静默失效（生成了却没人用，
+// 或生成一个空口令），必须在测试里拦住。
+func ComposeSecretProblems(app App) []string {
+	var problems []string
+	seen := map[string]bool{}
+	for i, s := range app.ComposeSecrets {
+		where := fmt.Sprintf("%s.compose_secrets[%d]", app.ID, i)
+		env := strings.TrimSpace(s.Env)
+		if env == "" {
+			problems = append(problems, where+": Env 为空")
+			continue
+		}
+		if seen[env] {
+			problems = append(problems, where+": Env "+env+" 重复声明")
+		}
+		seen[env] = true
+		switch s.Encoding {
+		case SecretHex, SecretBase64, SecretPassword:
+		default:
+			problems = append(problems, where+": Encoding 必须是 hex / base64 / password，实际 "+s.Encoding)
+		}
+		if s.Bytes < composeSecretMinBytes {
+			problems = append(problems,
+				fmt.Sprintf("%s: Bytes=%d 太小（至少 %d）", where, s.Bytes, composeSecretMinBytes))
+		}
+		if !strings.Contains(app.ComposeYAML, "${"+env+"}") &&
+			!strings.Contains(app.ComposeYAML, "${"+env+":") {
+			problems = append(problems, where+": ComposeYAML 里没有 ${"+env+"} 引用 —— "+
+				"生成了也没有容器读它")
+		}
+	}
+	if len(app.ComposeSecrets) > 0 && app.Kind != KindCompose && app.Kind != KindDocker {
+		problems = append(problems, app.ID+": 只有 compose/docker 应用能用 ComposeSecrets")
+	}
+	return problems
 }
 
 // generatedCredRe 匹配"首次启动随机生成的管理员密码"这类日志。

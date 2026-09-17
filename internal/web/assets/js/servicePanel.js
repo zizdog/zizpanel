@@ -101,6 +101,196 @@ export function hasPanelUI(m) {
   return !!(m && m.ui && m.ui.slug && !m.ui.console_only);
 }
 
+// ---------------------------------------------------------------------------
+//  合并「我的应用」：市场条目 + 服务记录 → 一行一条（去重）
+// ---------------------------------------------------------------------------
+
+// KNOWN_LABEL_PREFIXES 是已知的 launchd 标签前缀。
+//
+// 真机（mini，2026-09-17）上同一套 PHP 有两套命名：
+//   · 目录里声明的   homebrew.mxcl.php@8.2
+//   · 面板记录里的   sh.brew.php@8.2
+// 记录**名**还会被压成 homebrew-mxcl-php8-2 / sh-brew-php8-2 这类写法。
+// 归一化必须同时吃掉"前缀"与"分隔符"两种差异，否则同一个服务会渲染成两行 ——
+// 而两行各带一组按钮，用户点哪一行都不知道对不对。
+const KNOWN_LABEL_PREFIXES = [
+  'homebrew.mxcl.', 'homebrew-mxcl-', 'sh.brew.', 'sh-brew-',
+  'cn.zizdog.', 'cn-zizdog-', 'com.zizdog.', 'com-zizdog-',
+];
+
+// appKeyOf 把一个应用 / 服务归一化成一个去重 key。
+//
+// 规则（顺序固定，改动前先读上面那段真机结论）：
+//   ① 取"标识类字段"：launch_label（服务记录）→ service_label（市场条目）→
+//      id（市场条目的 slug）→ uninstall.service → name；
+//      绝不能只看 name —— 市场条目的 name 是**展示名**（"Stirling PDF"、带空格），
+//      而服务记录的名字是 slug（stirling-pdf）。拿展示名做 key 会让同一个 compose
+//      应用在「我的应用」里出现两行（一行来自市场、一行来自服务记录）。
+//   ② 统一小写；
+//   ③ 去掉一个已知前缀（只去一次，避免把服务名里本来就有的一段吃掉）；
+//   ④ 把 @ . - _ 与空白全部删掉 —— 于是
+//        homebrew.mxcl.php@8.2 / sh.brew.php8-2 / php82 / php8.2 / php8-2
+//      全部收敛成 php82；"Stirling PDF" 与 stirling-pdf 也收敛成 stirlingpdf。
+//
+// 为什么是"删掉"而不是"统一成某一个字符"：真机上点号、连字符、@ 和"什么都没有"
+// 四种写法都出现过；只把 `-` 映射成 `.` 仍然会漏掉 `php82` 这种无分隔符的写法。
+// 过合并的风险（foo-bar 与 foobar 被并成一条）在本项目的服务命名里不存在；
+// 万一将来出现，由 tools/appdetail-verify.mjs 的归一化断言暴露，而不是悄悄并掉。
+export function appKeyOf(x) {
+  if (!x) return '';
+  const raw = x.launch_label || x.service_label
+    || (typeof x.id === 'string' ? x.id : '')
+    || (x.uninstall && x.uninstall.service)
+    || x.name || '';
+  let k = String(raw).trim().toLowerCase();
+  for (const p of KNOWN_LABEL_PREFIXES) {
+    if (k.startsWith(p)) { k = k.slice(p.length); break; }
+  }
+  return k.replace(/[@._\s-]/g, '');
+}
+
+// SVC_MERGE_FIELDS：被丢弃那条服务记录的"有效信息"要补进保留的那条。
+// 只补**保留那条为空**的字段，绝不覆盖已有的真实值。
+const SVC_MERGE_FIELDS = [
+  'port', 'launch_label', 'plist_path', 'config_path', 'log_path', 'work_dir',
+  'start_cmd', 'compose_file', 'container', 'image', 'category', 'health_url',
+  'display_name', 'icon', 'description',
+];
+
+function blank(v) { return v === undefined || v === null || v === '' || v === 0; }
+
+// svcInfoScore 决定同 key 的多条服务记录里保留哪条：
+// managed=true 最优先（它才有完整生命周期），其次"确实在跑"的那条，
+// 再看谁带的路径 / 命令更全。分数相同则保留先出现的那条（API 顺序稳定）。
+function svcInfoScore(s) {
+  let n = 0;
+  if (s.managed) n += 100;
+  if (s.state && s.state.running) n += 50;
+  for (const k of ['config_path', 'log_path', 'plist_path', 'work_dir', 'start_cmd', 'compose_file', 'container']) {
+    if (!blank(s[k])) n += 3;
+  }
+  if (!blank(s.port)) n += 1;
+  return n;
+}
+
+// pickAndMergeSvc 从同 key 的服务记录里挑一条，并把其余记录的字段补进来。
+// 状态 / 端口 / 日志路径 / plist 路径按"非空者优先、运行中优先"合并。
+function pickAndMergeSvc(pool) {
+  if (!pool || !pool.length) return null;
+  let best = pool[0];
+  for (const s of pool.slice(1)) if (svcInfoScore(s) > svcInfoScore(best)) best = s;
+  const out = { ...best };
+  for (const other of pool) {
+    if (other === best) continue;
+    for (const k of SVC_MERGE_FIELDS) if (blank(out[k]) && !blank(other[k])) out[k] = other[k];
+    const os = other.state || {};
+    if (!out.state || (out.state.running !== true && os.running === true)) {
+      if (other.state) out.state = other.state;
+    }
+    const oh = other.health || {};
+    if (!out.health || (out.health.checked !== true && oh.checked === true)) {
+      if (other.health) out.health = other.health;
+    }
+    if (other.managed && !out.managed) out.managed = true;
+  }
+  // 记下被合并掉的记录名：出问题时一眼能看出"另一条去哪了"（只活在内存里）。
+  out.merged_from = pool.filter((s) => s !== best).map((s) => s.name);
+  return out;
+}
+
+// marketRank 决定同 key 的市场条目里保留哪条：优先带界面 / 直链 / 文档元数据的，
+// 再优先已安装的 —— 那些字段是安装器与「打开 / 文档」按钮的依据。
+function marketRank(a) {
+  return (hasPanelUI(a) ? 4 : 0) + (a.port_url ? 2 : 0) + (a.docs_url ? 1 : 0) + (a.installed ? 8 : 0);
+}
+
+function entryNameOf(e) {
+  return (e.svc && (e.svc.display_name || e.svc.name))
+    || (e.market && e.market.name) || e.key;
+}
+
+function compareEntries(a, b) {
+  const rank = (e) => {
+    const st = e.svc && e.svc.state;
+    if (st && st.running) return 0;
+    if (st && (st.status === 'error' || st.status === 'unavailable')) return 1;
+    if (e.svc) return 2;
+    return 3; // 只有市场条目（无常驻进程 / 没有服务记录）
+  };
+  const d = rank(a) - rank(b);
+  if (d) return d;
+  return String(entryNameOf(a)).localeCompare(String(entryNameOf(b)), 'zh-Hans-CN');
+}
+
+// mergeAppEntries 把"市场目录（只取已安装 / 已纳管的）"与"服务记录"合并去重。
+//
+// 返回 [{ key, market, svc }]：两个字段都可能为 null，但不会同时为 null。
+// 关键点：**两个都留着** —— openServicePanel({market, svc}) 正是要这两份数据
+// （市场给 ui / port_url / docs_url / 安装器语义，服务记录给状态 / 绝对配置路径 / 日志）。
+//
+// 保留哪条：
+//   · market 侧 —— marketRank 最高的（优先市场目录里能对上的那条记录，用户要求）；
+//   · svc   侧 —— svcInfoScore 最高的（managed=true → 在跑 → 信息更全）。
+// 被丢弃那条的有效信息由 pickAndMergeSvc 合并进来。
+export function mergeAppEntries(marketList, svcList) {
+  const entries = new Map();
+  const ensure = (key) => {
+    if (!key) return null;
+    if (!entries.has(key)) entries.set(key, { key, market: null, svc: null, _svcPool: [] });
+    return entries.get(key);
+  };
+  for (const a of marketList || []) {
+    // 未安装的条目留在「应用市场」Tab；「我的应用」只收已安装 / 已纳管的。
+    if (!a || (!a.installed && !a.adopted)) continue;
+    const e = ensure(appKeyOf(a));
+    if (!e) continue;
+    if (!e.market || marketRank(a) > marketRank(e.market)) e.market = a;
+  }
+  for (const s of svcList || []) {
+    if (!s || !s.name) continue;
+    const e = ensure(appKeyOf(s));
+    if (e) e._svcPool.push(s);
+  }
+  for (const e of entries.values()) {
+    e.svc = pickAndMergeSvc(e._svcPool);
+    delete e._svcPool;
+  }
+  return [...entries.values()].sort(compareEntries);
+}
+
+// portDirectURL 用**当前访问面板的主机名** + 服务端口拼一个直链。
+//
+// 后端不返回局域网 IP，所以只能用 location.hostname：从 127.0.0.1 / 局域网 IP /
+// 隧道域名访问时，拼出来的是各自那条路，通常可用。但服务可能只监听 127.0.0.1，
+// 或这个端口根本不是 HTTP 界面 —— 所以调用方必须在 title 里如实写上这层不确定性
+// （见 openDirectActions 的 synthesized 分支）。协议固定 http://：面板自己可能是
+// https，而应用端口不是。
+export function portDirectURL(port) {
+  const p = Number(port) || 0;
+  if (!p) return '';
+  const host = (typeof location !== 'undefined' && location.hostname) || '';
+  if (!host) return '';
+  return 'http://' + host + ':' + p + '/';
+}
+
+// subpathWarning 把"这个应用的子路径实测不可用"渲染成按钮下方的一行小字。
+//
+// 用户 2026-09-17 的第四条抱怨：Miniflux / Syncthing / Alist / ddns-go 显示
+// 「⚠️ 打开」却没有任何解释。只在按钮上加 title 不够 —— 不悬浮就看不到，
+// 用户只会以为按钮坏了。所以给一行**始终可见**的说明，管理面板里同样渲染。
+// ui.note 为空时用一句兜底，绝不把"为什么"留空。
+export function subpathWarning(m) {
+  if (!hasPanelUI(m)) return null;
+  const ui = m.ui || {};
+  if (!ui.prefer_direct) return null;
+  const note = String(ui.note || '').trim() || '该应用实测不能挂在子路径下';
+  return h('div', {
+    style: { flexBasis: '100%', fontSize: '11.5px', lineHeight: '1.6', color: 'var(--warn, #fbbf24)' },
+    title: '子路径入口 /' + (ui.slug || '') + '/ —— ' + note,
+    text: '⚠️ 该应用不支持子路径：' + note + '；请用「直链」',
+  });
+}
+
 // vendorImage 取 Docker 目录条目里的镜像名（在面板里显示"官方镜像是什么"）。
 function vendorImage(m) {
   const yaml = (m && m.compose_yaml) || '';
@@ -110,7 +300,7 @@ function vendorImage(m) {
 
 // resolvePanelData 把调用方给的东西补全成"面板能完整渲染"的数据。
 //
-// market —— 市场条目（可能没有）；svc —— 服务记录（可能没有，服务管理页总是有）。
+// market —— 市场条目（可能没有）；svc —— 服务记录（可能没有，「我的应用」行总是有）。
 async function resolvePanelData(market, svc) {
   const m = market || null;
   let s = svc || null;
@@ -127,7 +317,7 @@ async function resolvePanelData(market, svc) {
   // **本来就没有守护进程**，目录里也没有 service_label —— 它不可能有服务记录。
   // 这种情况**不去查**（省掉注定 404 的请求，也不会把"没有记录"渲染成异常态）。
   // 判据全部来自数据：no_daemon 且没有任何服务标识。
-  // 注意 m 可能为 null（服务管理页点开面板时只给 svc）—— 必须先判 m，
+  // 注意 m 可能为 null（从「我的应用」行点开面板时可能只给 svc）—— 必须先判 m，
   // 否则这里会抛 TypeError，把整次渲染推进兜底分支（凭据/界面按钮就没了）。
   const noServiceByIdentity = !!(m && m.no_daemon)
     && !m.service_label
@@ -166,7 +356,7 @@ async function resolvePanelData(market, svc) {
 
 // serviceActions 生成"启停/重启/刷新"三颗按钮（首颗是启动还是停止看状态）。
 //
-// 状态从哪来：服务管理页把它已经加载好的 state 塞进 `m.state`；
+// 状态从哪来：「我的应用」行把服务记录（含 state）直接递进来（opts.svc）；
 // 市场卡片**没有** state（不能在渲染时逐张请求），于是退化成"启动" ——
 // 后端对一个已在跑的服务执行 start 是幂等的，所以不会出现"在跑却让你启动"
 // 那种谎报；只是首屏少一次状态同步，点「⟳ 刷新」即可确认。
@@ -236,14 +426,14 @@ export async function doServiceAction(name, action, m = {}, onDone) {
   if (typeof onDone === 'function') onDone();
 }
 
-// marketQuickActions 给**应用市场卡片**的那一排常用动作。
+// marketQuickActions 给**应用市场卡片 / 「我的应用」行**的那一排常用动作。
 //
-// 用户要求"已安装的应用，卡片上直接给出常用动作，不需要先跳到服务管理页"。
-// 这里放卡片上真正好用的几个：启停/重启/刷新 + 管理。
+// 用户要求"已安装的应用，卡片上直接给出常用动作，不需要先跳到别的页面"。
+// 这里放真正好用的几个：启停/重启/刷新 + 管理。
 // 「📝 编辑配置文件」「📜 日志」「🔑 凭据」「重装」「文档」「卸载」都在管理面板里 ——
 // 它们要么需要服务记录（市场条目只有配置**文件名**，绝对路径只能从服务记录拿），
 // 要么需要一个更宽的弹窗才看得清；卡片宽度不适合摊开一个编辑器。
-// 关键点：点「管理」打开的就是**与服务管理里同一个面板**，用户没有被搬走。
+// 关键点：点「管理」打开的就是**与「我的应用」行同一个面板**，用户没有被搬走。
 //
 // 2026-09-16 起卡片上**只有这一颗**"进面板"的按钮：以前同时有卡片主按钮
 // 「查看服务」（apps.js 的 primaryButton）与这里的「⚙️ 详情」，两者打开的是
@@ -255,28 +445,35 @@ export async function doServiceAction(name, action, m = {}, onDone) {
 // 有它卡片上的首颗按钮才是对的（在跑→「停止」，没跑→「启动」）；
 // 没有就退化成「启动」，后端对已在跑的服务执行 start 是幂等的。
 // opts.onManage：由调用方接管"开管理面板"（应用市场传的是 apps.js 的
-// openAppDetail）。为什么要让调用方接管：市场页手里有完整的目录条目，
-// 面板里的「重装」要用调用方那套安装器上下文（`onReinstall`）——否则重装
-// 就会退化成不计应用选项的通用安装。服务管理页不开这个按钮，所以给不给
-// onManage 都不影响它。
+// openAppDetail，「我的应用」行传的是带 svc 的 openServicePanel）。为什么要让
+// 调用方接管：市场页手里有完整的目录条目，面板里的「重装」要用调用方那套安装器
+// 上下文（`onReinstall`）——否则重装就会退化成不计应用选项的通用安装。
+// 不传 onManage 时退回 `openServicePanel({market, svc})`，行为一致。
 //
 // 「打开 / 直链」**不在这里**：它们由 openDirectActions 单独给，卡片渲染时
 // 与这一排动作并排（apps.js / services.js 都调用同一份）。
-export function marketQuickActions(m, { state, onDone, onManage } = {}) {
-  const installed = !!(m && (m.installed || m.adopted));
+//
+// opts.svc：合并后的「我的应用」行会同时递进服务记录。有它时以服务记录为准：
+//   · 启停按钮一定给（有真实记录就能管，不再依赖 adopted / service_in_launchd 推断）；
+//   · 目标对象用服务记录（面板接口只认它的 name），状态直接用 s.state。
+// 市场卡片不传 svc，行为与以前完全一样。
+export function marketQuickActions(m, { state, onDone, onManage, svc = null } = {}) {
+  const s = svc || null;
+  const installed = !!(m && (m.installed || m.adopted)) || !!s;
   if (!installed) return [];
-  // 卡片上的启停按钮只在"**服务确实可管**"时给：有面板记录（adopted）或
-  // 服务已在 launchd 里。装了但服务没注册的孤儿态（plist 丢了 / 装到一半）点启停
-  // 只会报"找不到服务"；而 CLI 工具（ffmpeg 这类 no_daemon）**本来就没有服务**，
-  // 给它启停按钮同样是点了必然报错。这两种状态该用的按钮在「⚙️ 管理」里
-  // （面板里有「重装」），所以这里只留「⚙️ 管理」，让用户先看清状态。
-  const canControl = !!(m.adopted || m.service_in_launchd);
+  // 卡片上的启停按钮只在"**服务确实可管**"时给：有服务记录（svc）、有面板记录
+  // （adopted）或服务已在 launchd 里。装了但服务没注册的孤儿态（plist 丢了 /
+  // 装到一半）点启停只会报"找不到服务"；而 CLI 工具（ffmpeg 这类 no_daemon）
+  // **本来就没有服务**，给它启停按钮同样是点了必然报错。这两种状态该用的按钮在
+  // 「⚙️ 管理」里（面板里有「重装」），所以这里只留「⚙️ 管理」。
+  const canControl = !!s || !!(m && (m.adopted || m.service_in_launchd));
+  const target = s || (state ? { ...m, state } : m);
   return [
-    ...(canControl ? serviceActions(state ? { ...m, state } : m, { onDone }) : []),
+    ...(canControl ? serviceActions(target, { onDone }) : []),
     h('button.btn.btn-sm', {
       text: '⚙️ 管理',
-      title: '状态 / 启停 / 配置 / 日志 / 凭据 / 重装 / 文档 / 卸载 —— 都在这里，不用跳去服务管理页',
-      onclick: () => (typeof onManage === 'function' ? onManage() : openServicePanel({ market: m, onDone })),
+      title: '状态 / 启停 / 配置 / 日志 / 凭据 / 重装 / 文档 / 卸载 —— 都在这里，不用跳到别的页面',
+      onclick: () => (typeof onManage === 'function' ? onManage() : openServicePanel({ market: m, svc: s, onDone })),
     }),
   ];
 }
@@ -312,7 +509,11 @@ function raceDeadline(p, ms, label) {
 //   · no_daemon 且面板托管界面 → 网页入口（本来就没有常驻进程）
 //   · no_daemon 且没有界面     → 命令行工具（本来就没有常驻进程）
 //   · 其余（已安装但没纳管）    → 未纳管（有服务可纳管，只是还没登记）
-function statusLine(st, m) {
+//
+// 2026-09-17 导出：合并后的「我的应用」每一行的状态 pill 也走这一份措辞 ——
+// 服务行、市场卡片、管理面板三处的状态文案必须同一套（用户要求"复用现有
+// statusLine 那套措辞"），所以它不再是本文件的私有函数。
+export function statusLine(st, m) {
   if (st) {
     if (st.running) return { cls: 'ok', text: '运行中', title: st.detail || '' };
     if (st.status === 'error') return { cls: 'danger', text: '异常', title: st.detail || '' };
@@ -324,7 +525,7 @@ function statusLine(st, m) {
   if (m && m.no_daemon) {
     const webUI = hasPanelUI(m) || !!(m.ui && m.ui.self_conf);
     return webUI
-      ? { cls: '', text: '网页入口（无常驻进程）', title: '这个应用没有守护进程，装完就是一个网页入口，服务管理里不会有它' }
+      ? { cls: '', text: '网页入口（无常驻进程）', title: '这个应用没有守护进程，装完就是一个网页入口，「我的应用」里不会有常驻服务记录' }
       : { cls: '', text: '命令行工具（无常驻进程）', title: '这个应用是命令行工具：没有守护进程、也没有网页界面，供面板或其它应用在后台调用' };
   }
   return { cls: '', text: '未纳管', title: '面板里还没有这条服务的记录，所以拿不到配置文件路径与日志' };
@@ -346,55 +547,88 @@ function statusLine(st, m) {
 // "IT-Tools 反了"（打开变成 192.168.1.4:8083、子路径降级成"试试"）就是它。
 // 探测结果只服务于面板顶部的「检测可用性 / 生成 nginx 入口」工具，不再参与这里。
 //
-// 调用方（三处必须一致）：apps.js 的市场卡片、services.js 的服务卡片、
+// 调用方（三处必须一致）：apps.js 的市场卡片、services.js 的「我的应用」行、
 // 本文件的「应用管理」面板。console_only（frpc 这类应用自带的控制台）不渲染：
-// 用户明确不要在面板里跳过去（2026-09-16）。没有界面（没有 slug）返回空数组。
+// 用户明确不要在面板里跳过去（2026-09-16）。没有界面（没有 slug）时：
+//   · 只有在**真有服务记录 + 有端口**时给一颗「直链」（用 location.hostname + 端口拼，
+//     title 里如实写明这是拼出来的、可能不适用）；
+//   · 市场条目自己声明了 port（Ollama 的 11434 这类）但目录里没有界面 —— 不给，
+//     因为那多半是 API 端口，点了必然打不开；这就是"不给点开必然打不开的按钮"。
 //
-// 没有 port_url 时**不给**一颗点开打不开的「直链」—— 原因写进「打开」的 title
-// （例如 phpMyAdmin：由面板直接托管，没有可直连的端口）。
-export function openDirectActions(m) {
-  if (!hasPanelUI(m)) return [];
-  const slug = (m.ui && m.ui.slug) || '';
-  const direct = m.port_url || '';
-  const note = (m.ui && m.ui.note) || '';
+// @param {object} m   市场条目（可以为 null —— 纯纳管的第三方服务就没有市场条目）
+// @param {object} [opts]
+// @param {object} [opts.svc]     服务记录（补齐端口，并在没有 port_url 时拼直链）
+// @param {boolean}[opts.explain] true → 连"为什么没有打开入口"也渲染成一行小字
+//                                （管理弹窗里用；卡片上不摆这句，免得占地方）
+export function openDirectActions(m, opts = {}) {
+  const svc = opts.svc || null;
+  const explain = !!opts.explain;
+  const ui = (m && m.ui) || null;
+  const slug = (ui && ui.slug) || '';
+  const panelUI = !!(ui && ui.slug && !ui.console_only);
+  const port = (svc && svc.port) || (m && m.port) || 0;
+  const explicit = (m && m.port_url) || '';
+  const direct = explicit || portDirectURL(port);
+  const synthesized = !explicit && !!direct;
+  const note = (ui && ui.note) || '';
+
+  const directButton = () => h('a.btn.btn-sm', {
+    href: direct, target: '_blank', rel: 'noopener', text: '直链',
+    title: synthesized
+      ? '按当前访问地址与端口拼出来的：' + direct +
+        '（面板拿不到局域网 IP，也不保证这个端口就是网页界面，可能不适用）'
+      : '绕过面板、直接访问应用自己的端口：' + direct,
+  });
+
+  // 应用自带的控制台（console_only，例如 frpc 的 admin UI）：用户明确不要在面板里
+  // 跳过去，所以两个入口都不给。只有市场条目才会带 ui，这条判据不影响纯纳管服务。
+  if (m && ui && ui.console_only) return [];
+
+  // 没有面板界面：见函数头的说明。
+  if (!panelUI) {
+    if (svc && direct) return [directButton()];
+    if (explain) {
+      return [h('span', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        title: m
+          ? '这个应用在目录里没有界面（没有 ui.slug），也没有可用的端口，拼不出打开地址'
+          : '这条服务记录没有端口，也没有面板界面，拼不出打开地址',
+        text: '没有可用的打开入口',
+      })];
+    }
+    return [];
+  }
 
   // SelfConf（phpMyAdmin）：它的 nginx location 由安装器自己写、且只允许本机，
   // 所以唯一能用的入口是**面板自己**那条（要求先登录面板）。
   // 用相对路径会打到面板 SPA 的回落上（返回 200 却是面板首页，极具误导性），
   // 所以这里走 panelPath（面板入口 + /<slug>/）。
-  if (m.ui.self_conf) {
+  if (ui.self_conf) {
     const out = [h('a.btn.btn-sm.btn-primary', {
       href: panelPath((slug || 'phpmyadmin') + '/'), target: '_blank', rel: 'noopener', text: '打开',
       title: '经面板打开（需先登录面板）' +
         (direct ? '；也可以直连：' + direct
           : '；这个应用由面板直接托管，没有可直连的端口，所以没有「直链」'),
     })];
-    if (direct) {
-      out.push(h('a.btn.btn-sm', {
-        href: direct, target: '_blank', rel: 'noopener', text: '直链', title: '绕过面板直接访问：' + direct,
-      }));
-    }
+    if (direct) out.push(directButton());
     return out;
   }
 
   const path = '/' + slug + '/';
   // prefer_direct 是**人工实测**的结论（自动探测发现不了"资源全 200、但前端路由
-  // 不认这个前缀"）：只加警示，不改按钮归属。
-  const warn = !!m.ui.prefer_direct;
+  // 不认这个前缀"）：只加警示，不改按钮归属。除了 ⚠️ 与 title，调用方还会用
+  // subpathWarning() 在按钮下方渲染一行始终可见的说明（用户第四条要求）。
+  const warn = !!ui.prefer_direct;
   const why = warn ? (note || '这个应用实测不支持子路径') : note;
   const out = [h('a.btn.btn-sm.btn-primary', {
     href: path, target: '_blank', rel: 'noopener',
     text: warn ? '⚠️ 打开' : '打开',
     title: '经面板的 /' + slug + '/ 打开' +
       (why ? '。' + why : '') +
-      (warn ? '。点开可能是空白页，请用旁边的「直链」' : ''),
+      (warn ? '。点开可能是空白页，请用旁边的「直链」' : '') +
+      (direct ? '' : '。没有可用的端口直连地址，所以没有「直链」'),
   })];
-  if (direct) {
-    out.push(h('a.btn.btn-sm', {
-      href: direct, target: '_blank', rel: 'noopener', text: '直链',
-      title: '绕过面板、直接访问应用自己的端口：' + direct,
-    }));
-  }
+  if (direct) out.push(directButton());
   return out;
 }
 
@@ -405,7 +639,7 @@ export function openDirectActions(m) {
 // 选项框，例如 Qwen 的"要不要鉴权"），所以调用方通过 `onReinstall` 把**现有的
 // 重装动作**（apps.js 的 openInstaller）递进来，行为与卡片上原来那颗「重装」
 // 完全一致，后端接口一行没改。
-// 没有安装器上下文时（服务管理页只拿得到市场条目）退回同一个后端安装接口：
+// 没有安装器上下文时（例如从市场卡片点开）退回同一个后端安装接口：
 // 安装器本身是幂等的（已下载的产物复用、配置与数据保留），语义相同。
 //
 // 只在**真的可重装**时给这颗按钮：卸载计划是 installer / service 两类
@@ -521,9 +755,12 @@ export async function openServicePanel(o = {}) {
     const canControl = !!s || !!(mi && (mi.adopted || mi.service_in_launchd));
     if (canControl) out.push(...serviceActions(s || mi, { onDone: afterAction }));
 
-    // ③ 界面：打开 / 直链 —— 与市场卡片、服务卡片**同一份实现**（openDirectActions）。
+    // ③ 界面：打开 / 直链 —— 与市场卡片、「我的应用」行**同一份实现**（openDirectActions）。
     //    frpc 这类应用自带的控制台（console_only）不在这里渲染，用户明确不要。
-    if (mi) out.push(...openDirectActions(mi));
+    //    这里把服务记录一起递进去（svc）：纯纳管的第三方服务没有市场条目、
+    //    也没有 port_url，只有端口 —— 那就用 location.hostname + 端口拼一颗「直链」，
+    //    并在 title 里说明这是拼出来的。两者都没有时 explain 会渲染一行"为什么没有"。
+    out.push(...openDirectActions(mi, { svc: s, explain: true }));
 
     // ③b 重装：卡片上不再直接给这颗按钮，统一收进管理面板（用户 2026-09-17 要求）。
     //     有安装器上下文时走调用方那套（保留应用自己的选项框），否则退回通用安装接口。
@@ -547,7 +784,7 @@ export async function openServicePanel(o = {}) {
         text: '📝 编辑配置文件',
         disabled: true,
         title: '配置文件是 ' + mi.config_path + '，但面板里还没有这条服务的记录，' +
-          '拿不到它的绝对路径。先点「纳管」（或在服务管理里启动一次）再来编辑。',
+          '拿不到它的绝对路径。先点「纳管」（或在「我的应用」里启动一次）再来编辑。',
       }));
     }
 
@@ -578,8 +815,24 @@ export async function openServicePanel(o = {}) {
     // ⑧ 收尾：managed=false 只给「取消纳管」，managed=true 才给「卸载」。
     //    这条判据来自**服务记录**，不来自应用 ID —— 非面板管理的服务不出现卸载。
     if (s) {
-      if (s.managed === false) out.push(forgetButton(s, afterAction));
-      else if (s.managed) out.push(uninstallButton(s, afterAction));
+      if (s.managed) {
+        out.push(uninstallButton(s, afterAction));
+      } else if (mi && (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service')) {
+        // 记录是「纳管」（managed=false），但**目录**说这个应用是面板自己装的
+        // （uninstall.kind = installer/service）→ 以目录为准，给真正的「卸载」。
+        //
+        // 为什么必须以目录为准（2026-09-17 真机复验）：PanelInstaller 类应用
+        // （Miniflux / Qwen3 TTS / IOPaint / phpMyAdmin / Alist / frpc / ddns-go…）
+        // 登记时走的是 RegisterInstalledService，记录落在「纳管」上。合并页面之前，
+        // 市场卡片上还有一颗基于**目录卸载计划**的「卸载」，所以还能卸；合并后
+        // 卸载统一收进这个面板，只看记录就会只剩「取消纳管」——
+        // 于是面板装的应用**在界面上永远卸不掉**（点了"取消纳管"东西还在）。
+        // 两个都留着：它们语义不同（卸载 = 删应用；取消纳管 = 只删记录）。
+        out.push(marketUninstallButton(mi, afterAction));
+        out.push(forgetButton(s, afterAction));
+      } else {
+        out.push(forgetButton(s, afterAction));
+      }
     } else if (mi) {
       if (mi.uninstall?.kind === 'forget') {
         out.push(forgetButton(mi, afterAction));
@@ -624,12 +877,14 @@ export async function openServicePanel(o = {}) {
         ((s && s.port) || (mi && mi.port)) > 0 ? pill('', ':' + ((s && s.port) || mi.port)) : null,
         s ? pill(s.managed ? 'brand' : '', s.managed ? '面板托管' : '仅纳管',
           s.managed ? '面板负责完整生命周期，可卸载' : '由你自己安装，面板只做启停与查看，不会卸载') : null,
-        // 「未在服务管理里」只对"**本该有服务**却查不到记录"的应用说。
+        // 「面板里没有服务记录」只对"**本该有服务**却查不到记录"的应用说。
         // no_daemon 的应用（ffmpeg / phpMyAdmin）本来就没有守护进程，报这一句
         // 是纯粹的误导 —— 用户 2026-09-16 反馈的正是 ffmpeg 上这句。
         // 它们的状态由上面的 statusLine 如实说成"命令行工具/网页入口（无常驻进程）"。
+        // 2026-09-17 合并后不再写"未在服务管理里"：那个页面已经不存在了（它就是
+        // 「我的应用」Tab），对一个不存在的页面报"不在里面"只会让人困惑。
         (!s && mi && (mi.installed || mi.adopted) && !mi.no_daemon)
-          ? pill('warn', '未在服务管理里',
+          ? pill('warn', '面板里没有服务记录',
             '这个应用装在机器上，但面板里还没有对应的服务记录，所以拿不到配置文件路径与日志')
           : null,
         health.checked
@@ -652,6 +907,9 @@ export async function openServicePanel(o = {}) {
     // ---- 操作 ----
     clear(actionBox);
     appendAll(actionBox, ...renderActions(res));
+    // 子路径实测不可用（prefer_direct）时，按钮下方补一行**始终可见**的说明 ——
+    // 用户第四条抱怨就是"⚠️ 打开没有任何提示"。与「我的应用」行、市场卡片同一份。
+    appendAll(actionBox, subpathWarning(mi));
 
     // ---- 详情 ----
     // 只 push 有值的行：以前写死一串字段并打印 cur.category 这类可能为空的项，

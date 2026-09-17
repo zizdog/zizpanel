@@ -37,7 +37,7 @@ func httpHealth(ctx context.Context, s *Service) Health {
 	start := time.Now()
 	args := []string{
 		"-sS", "-k", "--max-time", strconv.Itoa(int(timeout.Seconds())),
-		"-o", "-", "-w", "\n__ZP_HTTP__%{http_code}",
+		"-o", "-", "-w", "\n__ZP_HTTP__%{http_code}\n__ZP_REDIR__%{redirect_url}",
 		s.HealthURL,
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/curl", args...)
@@ -52,9 +52,22 @@ func httpHealth(ctx context.Context, s *Service) Health {
 	if err != nil && strings.TrimSpace(stderr.String()) != "" {
 		body = strings.TrimSpace(stderr.String())
 	}
+	// 先取 redirect_url 再取 http_code：`-w` 的输出顺序是
+	// <body> "\n__ZP_HTTP__<code>\n__ZP_REDIR__<url>"，`body[:i]` 截断会把
+	// 后面的标记一起切掉，所以必须**从后往前**解析。
+	redirect := ""
+	if i := strings.LastIndex(body, "__ZP_REDIR__"); i >= 0 {
+		rest := body[i+len("__ZP_REDIR__"):]
+		if j := strings.IndexAny(rest, "\r\n"); j >= 0 {
+			rest = rest[:j]
+		}
+		redirect = strings.TrimSpace(rest)
+		body = body[:i]
+	}
 	code := 0
 	if i := strings.LastIndex(body, "__ZP_HTTP__"); i >= 0 {
-		if n, e := strconv.Atoi(strings.TrimSpace(body[i+len("__ZP_HTTP__"):])); e == nil {
+		rest := strings.TrimRight(body[i+len("__ZP_HTTP__"):], "\r\n")
+		if n, e := strconv.Atoi(strings.TrimSpace(rest)); e == nil {
 			code = n
 		}
 		body = body[:i]
@@ -65,6 +78,30 @@ func httpHealth(ctx context.Context, s *Service) Health {
 		h.OK = false
 		h.Message = humanizeCurlError(err, body)
 		return h
+	}
+
+	// 「安全超时锁定」必须判成**不健康**。
+	//
+	// 真机反馈（2026-09-17）：Portainer 锁定时 GET / 返回 307 → /timeout.html，
+	// 而通用规则是"2xx/3xx 都算健康" → 面板对一个已经打不开、只剩
+	// "…timed out for security purposes" 页的实例报 health.ok=true ——
+	// 这正是本仓库最忌讳的"谎报成功"。所以这里单独把这种 3xx 挑出来：
+	// 目标里含 timeout.html，或正文里直接出现锁定文案（未跟随重定向时是兜底）。
+	if code >= 300 && code < 400 {
+		lowerRedirect := strings.ToLower(redirect)
+		lowerBody := strings.ToLower(body)
+		if strings.Contains(lowerRedirect, "timeout.html") ||
+			strings.Contains(lowerBody, "timed out for security purposes") {
+			h.OK = false
+			if app, ok := FindAppByService(s); ok && app.ID == "portainer" {
+				h.Message = fmt.Sprintf("HTTP %d：Portainer 已因超时锁定（跳到 %s）；"+
+					"重启容器即可重新进入 setup 页（口令设置窗口 5 分钟）", code, redirect)
+			} else {
+				h.Message = fmt.Sprintf("HTTP %d：该服务已因安全超时锁定（跳到 %s）；"+
+					"需要按它自己的方式重新解锁", code, redirect)
+			}
+			return h
+		}
 	}
 
 	if want := strings.TrimSpace(s.HealthExpect); want != "" {

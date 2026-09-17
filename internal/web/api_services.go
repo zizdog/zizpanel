@@ -764,8 +764,10 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			a.ServiceLabel = realLabel
 		}
 		portURL, proxyURL := "", ""
-		if a.WebPort() > 0 && lanIP != "" {
-			portURL = fmt.Sprintf("http://%s:%d/", lanIP, a.WebPort())
+		// 直链端口用 EntryPort()：它可以与健康检查端口不同（MinIO 就是这种 ——
+		// 健康检查必须打 9010 的 S3 API，而用户要打开的是 9001 控制台）。
+		if p := a.EntryPort(); p > 0 && lanIP != "" {
+			portURL = fmt.Sprintf("http://%s:%d/", lanIP, p)
 		}
 		if a.UI != nil && a.UI.Slug != "" && lanIP != "" {
 			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
@@ -824,6 +826,16 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	app, found := services.FindApp(id)
+	if !found {
+		// 条目可能已经**从目录下架**（2026-09-17 移除 n8n），但用户机器上
+		// 还留着它的 compose 项目目录/镜像。只要卸载计划给出 installer
+		// （残留清理）就照常放行；没有可清理对象时仍按原来的 400 处理。
+		// 这就是"界面上没了、磁盘上还在、用户无处可点"的反面。
+		if plan := s.svcManager().PlanUninstall(r.Context(), id); plan.Kind == "installer" {
+			app = services.App{ID: id, Name: id}
+			found = true
+		}
+	}
 	if !found {
 		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
 		return

@@ -56,9 +56,40 @@ type UninstallPlan struct {
 func (m *Manager) PlanUninstall(ctx context.Context, appID string) UninstallPlan {
 	app, ok := FindApp(appID)
 	if !ok {
-		return UninstallPlan{Kind: "none", Blocked: "目录里没有这个应用"}
+		// 条目可能已经**从目录下架**（2026-09-17 移除 n8n），但用户机器上
+		// 可能还留着它的 compose 项目目录 —— 那台机器必须仍然给得出清理计划，
+		// 否则就是"界面上没了、磁盘上还在、用户无处可点"。
+		// 用一个最小 App（只有 ID）继续走 PlanUninstallFor 的残留分支。
+		app = App{ID: appID, Name: appID}
 	}
 	return m.PlanUninstallFor(ctx, app, m.findServiceRecord(ctx, app))
+}
+
+// legacyComposeImages 记录**已从目录下架**、但机器上可能还有 compose 目录的应用镜像。
+//
+// 为什么需要：卸载计划里应当写清"哪些镜像可以手动删掉释放空间"（面板不自动
+// `docker rmi`，怕误删被别的项目共用的层）。条目还在目录里时镜像从 ComposeYAML
+// 现取；下架之后没有来源，只能在这里留一份。
+var legacyComposeImages = map[string][]string{
+	// 2026-09-17 下架（用户已手动卸载并明确要求移除）。
+	"n8n": {"n8nio/n8n:latest"},
+}
+
+// composeImagesForPlan 返回卸载计划里要提示的镜像列表（可能为空）。
+func composeImagesForPlan(app App) []string {
+	if imgs := composeImagesOf(app.ComposeYAML); len(imgs) > 0 {
+		return imgs
+	}
+	return legacyComposeImages[app.ID]
+}
+
+// composeImageNote 把镜像列表拼成一句给用户看的提示。
+func composeImageNote(imgs []string) string {
+	if len(imgs) == 0 {
+		return ""
+	}
+	return "面板**不自动删除镜像**（避免误删共用层）；要释放空间可手动执行：docker rmi " +
+		strings.Join(imgs, " ")
 }
 
 // PlanUninstallFor 与 PlanUninstall 相同，但用调用方已经查好的记录。
@@ -77,6 +108,11 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 			steps = []string{
 				"docker compose down（删除容器与网络）",
 				"从「服务管理」中删除这条记录",
+			}
+			// 把镜像名也写进计划：卸载不删镜像（怕误删共用层），但用户
+			// 有权知道"哪些镜像还占着磁盘、怎么清"。
+			if note := composeImageNote(composeImagesForPlan(app)); note != "" {
+				keep = keep + "；" + note
 			}
 		}
 		return UninstallPlan{Kind: "service", Service: rec.Name, Steps: steps, KeepNote: keep}
@@ -119,11 +155,17 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 		for _, d := range paths {
 			steps = append(steps, "删除残留目录 "+d)
 		}
+		keep := "删除的是磁盘上真实存在的残留产物；之后可以用「安装」装当前版本"
+		// 下架条目（n8n）的镜像名也在这里如实写出来 —— 否则用户删完目录，
+		// 镜像还静静占着几百 MB，而他完全不知道。
+		if note := composeImageNote(composeImagesForPlan(app)); note != "" {
+			steps = append(steps, note)
+		}
 		return UninstallPlan{
 			Kind:      "installer",
 			Steps:     steps,
 			DataPaths: paths,
-			KeepNote:  "删除的是磁盘上真实存在的残留产物；之后可以用「安装」装当前版本",
+			KeepNote:  keep,
 		}
 	}
 	// 残留态（**没有服务记录**，但磁盘上还有这个应用的 compose 目录）：
@@ -192,6 +234,13 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		}
 		if removed == 0 {
 			return fmt.Errorf("「%s」没有可清理的残留（磁盘上找不到它的目录）", app.Name)
+		}
+		// 目录删掉了，但镜像还在。**不自动删镜像**（怕误删被别的项目共用的层），
+		// 只把名字如实告诉用户 —— 下架条目（n8n）靠 legacyComposeImages 提供。
+		if result != nil {
+			if imgs := composeImagesForPlan(app); len(imgs) > 0 {
+				result.step(ctx, "镜像未删除（面板不自动 docker rmi）："+strings.Join(imgs, " "))
+			}
 		}
 		return nil
 	}
