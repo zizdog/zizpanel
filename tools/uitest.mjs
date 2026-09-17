@@ -190,6 +190,26 @@ try {
     if (!host.includes('macOS')) throw new Error('未显示操作系统信息');
   });
 
+  await step('仪表盘：没装基础环境时必须出现「基础环境」引导横幅', async () => {
+    // 为什么用桩数据：横幅只在"服务列表里没有 nginx/PHP/MySQL"时出现，而开发机
+    // 通常已经装了 —— 不桩的话这条断言在开发机上永远不成立（第一版就在这里白跑三次）。
+    // 桩掉 /api/v1/services，响应按 request() 的解包约定包成 {ok,data}；其它接口照常。
+    const stub = (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { list: [] } }),
+    });
+    await page.route('**/api/v1/services*', stub);
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('text=基础环境还没安装', { timeout: 15000 });
+      await shot('03-dashboard-baseenv');
+    } finally {
+      await page.unroute('**/api/v1/services*');
+      await page.reload({ waitUntil: 'domcontentloaded' });
+    }
+  });
+
   await step('深色主题截图', async () => {
     // 主题按钮的 title 是**动态**文案（"主题：浅色（点击切换：深色）"等），
     // 旧写法 button[title="切换主题"] 永远匹配不到 → 这步会 30 秒超时（2026-09-17 抓到）。
