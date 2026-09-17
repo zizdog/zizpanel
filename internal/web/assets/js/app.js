@@ -44,13 +44,14 @@ export const NAV = [
   { id: 'certs', title: 'SSL 证书', icon: '🔐', view: CertsView },
   { id: 'database', title: '数据库', icon: '🗄️', view: DatabaseView },
   { group: '服务器' },
-  // 2026-09-17 信息架构合并：原来的「服务管理」与「应用市场」两个导航项合成
-  // **一个「应用」版块**，页内两个 Tab（我的应用 / 应用市场）。
+  // 2026-09-17 信息架构：原来的「服务管理」与「应用市场」两个导航项合成
+  // **一个「应用」版块**（侧栏只有这一项），页内四个一级 Tab：
+  // **已安装（默认）/ 应用市场 / docker / 一键建站**（用户第二版要求）。
   //   · 真机量化（mini）：服务管理 31 行，31 行全都也出现在应用市场，独有内容 0 行；
   //     而且服务管理内部有 4 对重复（php81/…/php84 各有两条记录指向同一 launchd 标签）。
-  //     两个入口展示同一批东西，用户只会问"我该点哪个"。
   //   · `#/services` 这类老书签/文档里的链接**必须继续可用**：见 ROUTE_TARGET
-  //     的别名表 —— 它落到同一个 AppsView，并自动切到「我的应用」Tab。
+  //     的别名表 —— 它落到同一个 AppsView，并自动切到「已安装」Tab；
+  //     `#/apps/docker` 这类带 Tab 的 hash 也能直接指定页内 Tab（见 routeFor）。
   { id: 'apps', title: '应用', icon: '🧩', view: AppsView },
   { id: 'docker', title: 'Docker', icon: '🐳', view: DockerView },
   { group: '运维' },
@@ -68,21 +69,27 @@ const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n
 // ROUTE_TARGET 是"旧路由 → 合并后的落点"的别名表。
 //
 // 为什么必须有它：`#/services` 写在文档、书签、以及别的页面（数据库页的
-// "去服务管理启动 MySQL"、Docker 页的"去服务管理"、仪表盘的快捷卡）里。
+// "去已安装启动 MySQL"、Docker 页的"去服务管理"、仪表盘的快捷卡）里。
 // 合并导航后如果它变成 404/仪表盘，用户会以为功能没了。
-//   services → apps 版块，并**自动切到「我的应用」Tab**（那里就是原服务管理的清单）。
+//   services → apps 版块，并**自动切到「已安装」Tab**（那里就是原服务管理的清单）。
 //
 // 这个函数导出只有一个原因：tools/appdetail-verify.mjs 用它断言
-// "#/services 落到我的应用 Tab"，而不是靠人肉点。运行时没有别的调用方。
+// "#/services 落到已安装 Tab"，而不是靠人肉点。运行时没有别的调用方。
 const ROUTE_TARGET = {
-  services: { id: 'apps', tab: 'mine' },
+  services: { id: 'apps', tab: 'installed' },
 };
 
+// routeFor 解析 hash：#/<版块> 或 #/<版块>/<页内 Tab>（如 #/apps/docker）。
+//
+// 第二段只对"有页内 Tab 的页面"有意义（目前只有「应用」的
+// installed / market / docker / sites），其它页面拿到 tab 也不会用。
+// 老 hash `#/apps`（无第二段）tab 为空串，由 AppsView 落回默认的「已安装」。
 export function routeFor(hash = location.hash) {
-  const m = String(hash || '').match(/^#\/([a-z0-9_-]+)/i);
+  const m = String(hash || '').match(/^#\/([a-z0-9_-]+)(?:\/([a-z0-9_-]+))?/i);
   const id = m ? m[1] : 'dashboard';
+  const sub = (m && m[2]) ? m[2] : '';
   const t = ROUTE_TARGET[id];
-  return t ? { ...t } : { id, tab: '' };
+  return t ? { ...t } : { id, tab: sub };
 }
 
 // panelPath 拼"面板内的路径"，例如 panelPath('phpmyadmin/') → "/jab5c63/phpmyadmin/"。
@@ -333,7 +340,8 @@ function renderSetup() {
 // ---------------- 主界面 ----------------
 
 function renderApp() {
-  // 路由先过别名表：`#/services` 会落到 apps 版块的「我的应用」Tab（见 ROUTE_TARGET）。
+  // 路由先过别名表：`#/services` 会落到 apps 版块的「已安装」Tab（见 ROUTE_TARGET）；
+  // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
   const target = routeFor();
   const item = NAV_BY_ID[target.id] || NAV_BY_ID.dashboard;
 

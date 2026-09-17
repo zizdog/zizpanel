@@ -93,7 +93,10 @@ func httpHealth(ctx context.Context, s *Service) Health {
 		if strings.Contains(lowerRedirect, "timeout.html") ||
 			strings.Contains(lowerBody, "timed out for security purposes") {
 			h.OK = false
-			if app, ok := FindAppByService(s); ok && app.ID == "portainer" {
+			// Portainer 条目已从目录下架（2026-09-17 用户要求删除），但用户机器上
+			// 多半还装着它 —— 不能因为目录里没有它就丢掉这条可操作的提示，
+			// 否则同一台机器上的这个已装实例健康失败时会退化成一句通用文案。
+			if isPortainerService(s) {
 				h.Message = fmt.Sprintf("HTTP %d：Portainer 已因超时锁定（跳到 %s）；"+
 					"重启容器即可重新进入 setup 页（口令设置窗口 5 分钟）", code, redirect)
 			} else {
@@ -134,6 +137,25 @@ func httpHealth(ctx context.Context, s *Service) Health {
 	h.OK = code >= 200 && code < 400
 	h.Message = fmt.Sprintf("HTTP %d", code)
 	return h
+}
+
+// isPortainerService 判断一条服务记录是不是 Portainer。
+//
+// 为什么不能只用 FindAppByService：Portainer 条目已从目录下架，而用户机器上
+// 可能还装着它（用户明确要求只删条目、不动容器/数据）。按名字与显示名兜底，
+// 目录里将来若重新上架也照样命中。
+func isPortainerService(s *Service) bool {
+	if s == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(s.Name), "portainer") ||
+		strings.EqualFold(strings.TrimSpace(s.DisplayName), "Portainer CE") {
+		return true
+	}
+	if app, ok := FindAppByService(s); ok && app.ID == "portainer" {
+		return true
+	}
+	return false
 }
 
 // humanizeCurlError 把 curl 的失败转成用户能理解的话。

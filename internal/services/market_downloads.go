@@ -278,20 +278,28 @@ func pipPoint(pkg string, timeout time.Duration, label, note string) MarketDownl
 }
 
 // dockerImagePoint 造一个容器镜像下载点。
+//
+// 2026-09-17 起 Docker 类条目都是**推荐项目**（面板不再代安装），但这些镜像
+// 仍然要同步到镜像站：用户会从那份预配置 compose 自己 `docker compose up -d`，
+// 镜像先从镜像站拉。所以声明保留，只是 Note 里写清新语义。
 func dockerImagePoint(image string, timeout time.Duration, nas MarketNAS, note string) MarketDownloadPoint {
 	return MarketDownloadPoint{
 		Purpose: MarketFetchDockerImage,
 		Label:   "docker compose up -d（拉 " + image + "）",
 		Upstream: MarketUpstream{
-			ID:   image,
-			Note: "installViaCompose 写入 <WorkDir>/compose/<id>/docker-compose.yml 后 docker compose up -d",
+			ID: image,
+			Note: "用户取用镜像站 <base>/compose/<id>/docker-compose.yml，" +
+				"改完自行 docker compose up -d（面板自 2026-09-17 起不再代装；" +
+				"安装接口对这些条目返回 4xx 并给出该地址）",
 		},
 		NAS:      nas,
 		Timeout:  timeout,
 		Required: true,
 		Checksum: MarketChecksum{Asset: "镜像 manifest 的 digest（docker 按 digest 校验每一层，无需另存 sha256）"},
 		ARM64:    note,
-		Note:     "compose 文件里绝不写 `platform:`（铁律②，测试锁死）；arm64 由镜像自带",
+		Note: "compose 文件里绝不写 `platform:`（铁律②，测试锁死）；arm64 由镜像自带。" +
+			"**该条目是推荐项目**：镜像仍供拉取/镜像准备，但面板不再自动安装 —— " +
+			"这条 Note 与 compose 参考文件一起说清新语义",
 	}
 }
 
@@ -703,18 +711,6 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
-		ID: "minio", Kind: KindCompose, ComposeImage: "quay.io/minio/minio:latest",
-		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
-		Downloads: []MarketDownloadPoint{
-			dockerImagePoint("quay.io/minio/minio:latest", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 是 Docker Hub 的 pull-through，不覆盖 quay.io；"+
-					"quay.io /v2/ 实测 401 / 0.69 s 直连可达，arm64 层合计 54.9 MiB。"+
-					"（诚实标注：只实测了 registry 端点可达性与层大小，**没有实测完整 pull 的吞吐**）"),
-				"arm64 证据：quay.io 的 index 里有 linux/arm64（实测层合计 54.9 MiB）"),
-		},
-	},
-
-	{
 		ID: "gitea", Kind: KindCompose, ComposeImage: "gitea/gitea:latest",
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
@@ -1050,17 +1046,6 @@ var marketDownloadApps = []MarketApp{
 				},
 				ARM64: "PHP 站点源码（tar.gz），与架构无关",
 			},
-		},
-	},
-
-	{
-		ID: "portainer", Kind: KindCompose, ComposeImage: "portainer/portainer-ce:lts",
-		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
-		Downloads: []MarketDownloadPoint{
-			dockerImagePoint("portainer/portainer-ce:lts", 20*time.Minute,
-				nasMirrored("docker"),
-				"arm64 证据：Docker Hub 的 index 里有 linux/arm64（另有 amd64/armv7/ppc64le）；"+
-					"本机到 Docker Hub 直连超时，证据经 docker.1ms.run 镜像站读同一份 index（诚实标注：未现场读 manifest）"),
 		},
 	},
 
@@ -1404,6 +1389,17 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 		for _, img := range imgs {
 			if !pointed[img] {
 				add("%s: compose 里的镜像 %q 没有对应的 docker_image 下载点声明", m.ID, img)
+			}
+		}
+		// Docker 推荐项目（2026-09-17 起所有 compose 条目）：镜像仍然要同步，
+		// 但**声明必须写清新语义** —— 否则审计/清点报告会继续把它当成"可安装应用"，
+		// 而安装接口对这些条目是明确拒绝的。两边说法必须一致。
+		if app.DockerReference {
+			for _, d := range m.Downloads {
+				if d.Purpose == MarketFetchDockerImage && !strings.Contains(d.Note, "推荐项目") {
+					add("%s: 是推荐 Docker 项目，docker_image 下载点的 Note 必须写清"+
+						"「镜像仍供拉取，但面板不再自动安装」（当前 Note=%q）", m.ID, d.Note)
+				}
 			}
 		}
 	case len(m.ComposeImages) > 0 || m.ComposeImage != "":

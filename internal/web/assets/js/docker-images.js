@@ -10,6 +10,7 @@
 
 import { api } from './api.js';
 import { h, clear, toast, confirmBox, bytes } from './ui.js';
+import { taskCenter } from './tasks.js';
 
 // 错误提示统一用 toast(msg, 'err')，而不是字面的 'error'。
 //
@@ -103,7 +104,8 @@ export async function renderImages(container, ctx) {
           }, [allToggle, h('span', { text: '显示中间层镜像' })]),
         ]),
         h('div.hint', {
-          text: '拉取大镜像（几百 MB 以上）可能花几分钟，期间按钮保持禁用；完成后列表会自动刷新。'
+          text: '拉取过程（每个镜像层的下载/解压进度）在「任务中心」里逐行实时可见，'
+            + '关掉窗口不会中断；完成后列表会自动刷新。'
             + '中间层镜像即 <none>:<none> 的悬空层，默认隐藏。',
         }),
       ]),
@@ -225,30 +227,24 @@ export async function renderImages(container, ctx) {
       pullInput.focus();
       return;
     }
-    if (pullBtn.disabled) return; // 禁用态兜底：避免慢网络下并发发起多次拉取
-    // 拉取慢是常态，必须有"正在进行"的反馈，否则用户会重复点击。
-    pullBtn.disabled = true;
-    pullBtn.textContent = '拉取中…';
-    pullInput.disabled = true;
-    try {
-      const r = await api.dockerImagePull(image);
-      if (disposed) return;
-      const msg = (r && r.message) ? `已拉取 ${image} · ${r.message}` : `已拉取 ${image}`;
-      toast(msg, 'ok', 8000);
-      pullInput.value = '';
-      ctx.refresh();
-    } catch (e) {
-      if (disposed) return;
-      // 拉取失败的原因（镜像名写错 / 仓库鉴权 / 网络不通）通常是一大段，
-      // 默认 4.2 秒根本读不完，这里给到 12 秒。
-      toast(e.message, 'err', 12000);
-    } finally {
-      // 成功时 ctx.refresh() 会重建整个分区，此时按钮已是游离节点；
-      // 恢复文案只是保持一致，不依赖它，所以不用判断 disposed。
-      pullBtn.disabled = false;
-      pullBtn.textContent = '拉取';
-      pullInput.disabled = false;
-    }
+    // 拉取走任务中心：后端立刻返回 202 + task_id，镜像层的下载/解压进度逐行进任务日志，
+    // 关掉窗口也不会中断（任务不挂在 HTTP 请求的 ctx 上）。
+    // 这里**不能** await 完再弹"成功"——那样整个拉取期间界面没有任何真实进展可看。
+    taskCenter.start({
+      kind: 'docker-image-pull',
+      target: 'docker:image:' + image,
+      title: '拉取镜像 ' + image,
+      start: () => api.dockerImagePull(image),
+      onDone: (m) => {
+        if (disposed) return;
+        if (m && m.status === 'succeeded') {
+          const msg = (m.result && m.result.message) ? `已拉取 ${image} · ${m.result.message}` : `已拉取 ${image}`;
+          toast(msg, 'ok', 8000);
+          pullInput.value = '';
+        }
+        ctx.refresh();
+      },
+    });
   }
 
   // pruning 是 confirmBox 期间的重入锁：确认框是异步的，没有它会弹出多个框。

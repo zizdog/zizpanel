@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zizdog/zizpanel/internal/services"
@@ -318,5 +319,94 @@ func TestMarketVisibleAppsHidesHiddenIDs(t *testing.T) {
 	}
 	if reason := marketHiddenApps["lnmp"]; reason == "" {
 		t.Error("marketHiddenApps 里必须写清 lnmp 被隐藏的原因（代码就是注释）")
+	}
+}
+
+// TestMarketDockerReferenceContract 锁住"推荐 Docker 项目"给前端的稳定契约。
+//
+// 用户 2026-09-17 的决策：Docker 类条目不再是"可安装应用"，而是"面板建议的项目"。
+// 前端据此把卡片放进 docker Tab 并隐藏安装按钮，所以接口必须稳定给出：
+//   - docker_reference（App 上的字段，json 名）与 docker_recommended（前端已认的别名）；
+//   - compose_yaml —— 预配置 compose 的**内容**（用于"复制"）；
+//   - compose_url / compose_env_url / compose_readme_url —— 镜像站上的下载/查看地址。
+func TestMarketDockerReferenceContract(t *testing.T) {
+	_, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	for _, id := range []string{"it-tools", "filebrowser", "activepieces", "immich"} {
+		it := marketItem(t, ts, cookies, id)
+		if it["docker_reference"] != true {
+			t.Errorf("%s 是推荐 Docker 项目，接口必须给 docker_reference=true，实际 %v", id, it["docker_reference"])
+		}
+		if it["docker_recommended"] != true {
+			t.Errorf("%s 缺少 docker_recommended 别名（前端 apps.js 的 isDockerRec 认这个名字），实际 %v",
+				id, it["docker_recommended"])
+		}
+		yaml := asString(it["compose_yaml"])
+		if !strings.Contains(yaml, "image:") || !strings.Contains(yaml, "services:") {
+			t.Errorf("%s 的 compose_yaml 不是一份可用的 compose（前端的「复制」按钮要用它）：%q", id, yaml)
+		}
+		if got := asString(it["compose_url"]); !strings.HasSuffix(got, "/compose/"+id+"/docker-compose.yml") {
+			t.Errorf("%s 的 compose_url 应指向镜像站 /compose/%s/docker-compose.yml，实际 %q", id, id, got)
+		}
+		if got := asString(it["compose_env_url"]); !strings.HasSuffix(got, "/compose/"+id+"/.env.example") {
+			t.Errorf("%s 的 compose_env_url 应指向镜像站 /compose/%s/.env.example，实际 %q", id, id, got)
+		}
+		if got := asString(it["compose_readme_url"]); !strings.HasSuffix(got, "/compose/README.md") {
+			t.Errorf("%s 缺少总索引地址 compose_readme_url，实际 %q", id, got)
+		}
+	}
+}
+
+// TestMarketDockerReferenceInstallRefused 锁住"安装接口明确拒绝"。
+//
+// 必须是 4xx + 人话（说清是推荐项目、compose 在哪、Docker 页有 Compose 面板），
+// 而不是静默失败、更不是谎报成功。
+func TestMarketDockerReferenceInstallRefused(t *testing.T) {
+	_, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	for _, id := range []string{"it-tools", "uptime-kuma"} {
+		res, out, _ := doJSON(t, ts, "POST", "/api/v1/market/"+id+"/install", nil, cookies)
+		if res.StatusCode < 400 || res.StatusCode >= 500 {
+			t.Fatalf("%s 的安装请求必须返回 4xx（而不是 2xx 假成功或 5xx），实际 %d（%v）",
+				id, res.StatusCode, out["msg"])
+		}
+		msg := asString(out["msg"])
+		if !strings.Contains(msg, "推荐") || !strings.Contains(msg, "compose") {
+			t.Errorf("%s 的拒绝错误要说清「这是推荐项目、请取用 compose 文件」，实际：%q", id, msg)
+		}
+	}
+}
+
+// TestMarketDeletedEntriesAreGone 锁住这一轮下架：minio / portainer 不再出现在市场。
+//
+// 注意语义：删除的是**条目**（不再推荐/不在市场），不是卸载 —— mini 上两个容器
+// 与数据都还在，所以这里只断言接口不再列出它们。
+func TestMarketDeletedEntriesAreGone(t *testing.T) {
+	_, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/market", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("市场应 200，实际 %d", res.StatusCode)
+	}
+	list, _ := out["data"].(map[string]any)["list"].([]any)
+	for _, it := range list {
+		m, _ := it.(map[string]any)
+		switch asString(m["id"]) {
+		case "minio", "portainer":
+			t.Errorf("%s 已按用户要求删除，市场里不该再出现", m["id"])
+		}
+	}
+	// 下架不等于卸载：卸载计划仍要能说出它们的镜像名（services 层有
+	// legacyComposeImages 的锁，这里只确认市场声明也删干净了）。
+	for _, id := range []string{"minio", "portainer"} {
+		if _, ok := services.MarketAppFor(id); ok {
+			t.Errorf("%s 的市场下载点声明也要删干净（反漂移门禁是双向的）", id)
+		}
 	}
 }

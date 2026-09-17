@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -32,6 +33,13 @@ import (
 type fakeDaemon struct {
 	mu       sync.Mutex
 	requests []string
+
+	// containers 覆盖 /containers/json 的返回（nil = 用默认那台 uptime-kuma）。
+	// 让单个测试能造出"带 compose 项目标签的容器"，而不必改默认响应。
+	containers []map[string]any
+	// logs 覆盖 /containers/{name}/logs 的返回（空 = 用默认那一行）。
+	// 用它造"日志里有初始随机口令"的场景（File Browser 就是这种）。
+	logs string
 }
 
 func (f *fakeDaemon) record(r *http.Request) {
@@ -49,6 +57,31 @@ func (f *fakeDaemon) sawPath(substr string) bool {
 		}
 	}
 	return false
+}
+
+// setContainers / setLogs 在测试发起请求之前改假守护进程的返回。
+func (f *fakeDaemon) setContainers(list []map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.containers = list
+}
+
+func (f *fakeDaemon) setLogs(text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = text
+}
+
+func (f *fakeDaemon) containerList() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.containers
+}
+
+func (f *fakeDaemon) logText() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logs
 }
 
 func (f *fakeDaemon) handler() http.Handler {
@@ -69,6 +102,10 @@ func (f *fakeDaemon) handler() http.Handler {
 			writeJSON(w, 200, map[string]any{"Version": "29.5.2", "ApiVersion": "1.51"})
 
 		case path == "/containers/json":
+			if override := f.containerList(); override != nil {
+				writeJSON(w, 200, override)
+				return
+			}
 			writeJSON(w, 200, []map[string]any{{
 				"Id": "abc123def4567890", "Names": []string{"/uptime-kuma"},
 				"Image": "louislam/uptime-kuma:1", "State": "running",
@@ -84,7 +121,21 @@ func (f *fakeDaemon) handler() http.Handler {
 			})
 
 		case path == "/images/create":
-			writeJSON(w, 200, map[string]any{"status": "Downloaded newer image for " + r.URL.Query().Get("fromImage")})
+			// 真实的 /images/create 是**边拉边推**的多行 JSON 进度流。
+			// 这里刻意分多行、带层进度：拉取必须逐行进任务日志，
+			// 如果退回"读完整段响应再返回最后一行"，这些中间行就看不到了。
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"status":"Pulling from ` + r.URL.Query().Get("fromImage") + `","id":"7"}` + "\n"))
+			_, _ = w.Write([]byte(`{"status":"Pulling fs layer","progressDetail":{},"id":"abc123def456"}` + "\n"))
+			_, _ = w.Write([]byte(`{"status":"Downloading","progressDetail":{"current":1048576,"total":50331648},"id":"abc123def456"}` + "\n"))
+			_, _ = w.Write([]byte(`{"status":"Pull complete","progressDetail":{},"id":"abc123def456"}` + "\n"))
+			_, _ = w.Write([]byte(`{"status":"Status: Downloaded newer image for ` + r.URL.Query().Get("fromImage") + `"}` + "\n"))
+
+		case strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
+			// 镜像详情：默认"本地没有"（404），这样创建容器会走"先拉取"这条路 ——
+			// 正是本地缺镜像时用户会遇到、也必须看到过程的场景。
+			writeJSON(w, 404, map[string]any{"message": "No such image: " + strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/json")})
 
 		case strings.HasPrefix(path, "/images/"):
 			// 关键：带 `/` 的镜像名必须以**还原后**的形式到达这里。
@@ -125,6 +176,10 @@ func (f *fakeDaemon) handler() http.Handler {
 		case strings.HasSuffix(path, "/logs"):
 			w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 			w.WriteHeader(200)
+			if text := f.logText(); text != "" {
+				_, _ = w.Write([]byte(text))
+				return
+			}
 			_, _ = w.Write([]byte("2026-09-14T00:00:00Z hello from container\n"))
 
 		case path == "/containers/json" || strings.HasPrefix(path, "/containers/"):
@@ -292,22 +347,29 @@ func asString(v any) string {
 // 这是这套路由最容易错的地方：Go 1.22 的 `{id}` 路径参数**不跨 /**，
 // 所以 `library/redis` 这种名字必须靠 `{path...}` + URL 编码。
 // 一旦写错，表现是"删镜像报 404"，而且很难看出原因。
+//
+// 注意（2026-09 起）：拉取已经是**异步任务**（202 + task_id），
+// 所以"请求有没有带对镜像名"要在任务跑完后从假守护进程的请求记录里核。
 func TestDockerImageNameWithSlashRoutes(t *testing.T) {
 	sock, fake := startFakeDocker(t)
-	ts, cookies := newDockerTestServer(t, sock)
+	srv, ts, cookies := newDockerTestServerWithSrv(t, sock)
 
 	// 拉取：带斜杠的镜像名走请求体，不受路由影响
-	res, _, _ := doJSON(t, ts, "POST", "/api/v1/docker/images/pull",
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/docker/images/pull",
 		map[string]string{"image": "library/redis:7"}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("拉取应 200，实际 %d", res.StatusCode)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("拉取是长任务，应立刻 202，实际 %d: %v", res.StatusCode, out)
+	}
+	task := waitDockerTask(t, srv, out)
+	if task.Status() != tasks.StatusSucceeded {
+		t.Fatalf("拉取任务应成功，实际 %s：%s", task.Status(), task.Meta().Error)
 	}
 	if !fake.sawPath("fromImage=library%2Fredis%3A7") {
 		t.Errorf("拉取请求没带上正确的镜像名，实际请求：%v", fake.requests)
 	}
 
 	// 删除：带斜杠的镜像名走路径，必须还原成 library/redis:7
-	res, out, _ := doJSON(t, ts, "DELETE", "/api/v1/docker/images/library%2Fredis%3A7", nil, cookies)
+	res, out, _ = doJSON(t, ts, "DELETE", "/api/v1/docker/images/library%2Fredis%3A7", nil, cookies)
 	if res.StatusCode != 200 {
 		t.Fatalf("删除带斜杠镜像名应 200，实际 %d: %v", res.StatusCode, out)
 	}
@@ -317,9 +379,12 @@ func TestDockerImageNameWithSlashRoutes(t *testing.T) {
 }
 
 // TestDockerContainerCreateValidatesPorts 端口映射的畸形输入必须被拦住并说明原因。
+//
+// 参数错误全部发生在**提交任务之前**（仍是 400）；只有合法输入才会变成
+// 202 + task_id（本地缺镜像时任务会先拉取，再由假守护进程创建容器）。
 func TestDockerContainerCreateValidatesPorts(t *testing.T) {
-	sock, _ := startFakeDocker(t)
-	ts, cookies := newDockerTestServer(t, sock)
+	sock, fake := startFakeDocker(t)
+	srv, ts, cookies := newDockerTestServerWithSrv(t, sock)
 
 	cases := []struct {
 		name string
@@ -347,13 +412,202 @@ func TestDockerContainerCreateValidatesPorts(t *testing.T) {
 		})
 	}
 
-	// 正常路径必须能过
+	// 正常路径：202 + task_id，任务负责"缺镜像先拉、再创建"
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/docker/containers",
 		map[string]any{"image": "nginx:alpine", "name": "my-nginx",
 			"ports": []string{"8080:80", "127.0.0.1:5353:53/udp"}}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("合法输入应 200，实际 %d: %v", res.StatusCode, out)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("合法输入应 202（长任务），实际 %d: %v", res.StatusCode, out)
 	}
+	task := waitDockerTask(t, srv, out)
+	if task.Status() != tasks.StatusSucceeded {
+		t.Fatalf("创建容器任务应成功，实际 %s：%s", task.Status(), task.Meta().Error)
+	}
+	if !fake.sawPath("POST /containers/create") {
+		t.Errorf("任务应该真的去创建容器，实际请求：%v", fake.requests)
+	}
+	// 本地没有镜像（假守护进程的 /images/{ref}/json 返回 404）时要先拉取 ——
+	// 这正是用户最需要看到过程的那条路。
+	if !fake.sawPath("fromImage=nginx%3Aalpine") {
+		t.Errorf("本地缺镜像时应先拉取，实际请求：%v", fake.requests)
+	}
+}
+
+// TestDockerImagePullIsTaskAndStreamsUpstreamProgress 是本轮改动的核心契约：
+//
+//	拉镜像 = 202 + task_id；任务的日志里能看到**逐行**的上游拉取进度
+//	（层状态 + 下载字节数），而不是结束时贴一段尾巴。
+//
+// 同时锁住"命令标签从实际请求派生"：这里走的是 Docker API，不是 CLI，
+// 所以标签必须是 POST /images/create fromImage=…，不能写成 `docker pull`。
+func TestDockerImagePullIsTaskAndStreamsUpstreamProgress(t *testing.T) {
+	sock, _ := startFakeDocker(t)
+	srv, ts, cookies := newDockerTestServerWithSrv(t, sock)
+
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/docker/images/pull",
+		map[string]string{"image": "library/redis:7"}, cookies)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("拉取应立刻 202，实际 %d: %v", res.StatusCode, out)
+	}
+	data, _ := out["data"].(map[string]any)
+	taskID := taskIDFrom(t, out)
+	if taskID == "" {
+		t.Fatalf("202 响应里必须有 task_id，实际 %v", out)
+	}
+	if asString(data["title"]) == "" {
+		t.Error("202 响应里应带标题（任务中心列表直接显示它）")
+	}
+	task := waitDockerTask(t, srv, out)
+	if task.Status() != tasks.StatusSucceeded {
+		t.Fatalf("拉取任务应成功，实际 %s：%s", task.Status(), task.Meta().Error)
+	}
+
+	logs := taskLinesText(t, task)
+	for _, want := range []string{
+		"step:拉取镜像 library/redis:7",
+		// 命令标签从实际请求派生（AGENTS.md 的既有约定）
+		"cmd:# POST /images/create fromImage=library/redis:7",
+		// 模拟的上游拉取行：层状态必须逐行出现
+		"out:abc123def456: Pulling fs layer",
+		"out:abc123def456: Downloading 1.0 MB/48.0 MB (2%)",
+		"out:abc123def456: Pull complete",
+		"out:Status: Downloaded newer image for library/redis:7",
+		"ok:镜像 library/redis:7 拉取完成",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("任务日志里缺少 %q\n实际日志：\n%s", want, logs)
+		}
+	}
+
+	// 参数错误仍然当场 400：不能先给 202、再让用户在任务日志里等一句报错。
+	res, _, _ = doJSON(t, ts, "POST", "/api/v1/docker/images/pull",
+		map[string]string{"image": "   "}, cookies)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("空镜像名应 400，实际 %d", res.StatusCode)
+	}
+	res, _, _ = doJSON(t, ts, "POST", "/api/v1/docker/images/pull",
+		map[string]string{"image": "bad image"}, cookies)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("带空白的镜像名应 400，实际 %d", res.StatusCode)
+	}
+}
+
+// TestDockerContainerLogsFullLogs 是"完整日志"这条能力：lines=0 表示 tail=all。
+//
+// 为什么必须有它：File Browser 这类镜像的初始 admin 口令只在**首次启动**时
+// 打进日志一次，只取尾部几百行会把它翻没 —— 而那串口令只在日志里有。
+func TestDockerContainerLogsFullLogs(t *testing.T) {
+	sock, fake := startFakeDocker(t)
+	ts, cookies := newDockerTestServer(t, sock)
+
+	// 默认（不传 lines）：只看尾部 300 行
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/docker/containers/logs?name=filebrowser", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("读日志应 200，实际 %d: %v", res.StatusCode, out)
+	}
+	if !fake.sawPath("tail=300") {
+		t.Errorf("默认应只取尾部 300 行，实际请求：%v", fake.requests)
+	}
+
+	// lines=0：显式要完整日志 → Docker 的 tail=all
+	res, _, _ = doJSON(t, ts, "GET", "/api/v1/docker/containers/logs?name=filebrowser&lines=0", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("读完整日志应 200，实际 %d", res.StatusCode)
+	}
+	if !fake.sawPath("tail=all") {
+		t.Errorf("lines=0 应翻译成 Docker 的 tail=all，实际请求：%v", fake.requests)
+	}
+}
+
+// TestDockerComposeContainersAndInitialPasswordScrape 锁住"部署完成后能一眼拿到
+// 容器日志，并且初始口令会被捞出来"这条链路。
+//
+// 目录里的 File Browser 就是靠这条：它的随机 admin 口令只打在首次启动日志里
+// （见 catalog.go 的 PostInstallHint）。这里用假守护进程造出同样的场景：
+// 一个带 com.docker.compose.project 标签的容器 + 一行 "randomly generated password"。
+func TestDockerComposeContainersAndInitialPasswordScrape(t *testing.T) {
+	sock, fake := startFakeDocker(t)
+	srv, _, _ := newDockerTestServerWithSrv(t, sock)
+
+	fake.setContainers([]map[string]any{{
+		"Id": "fb1234567890abcd", "Names": []string{"/filebrowser"},
+		"Image": "filebrowser/filebrowser:latest", "State": "running",
+		"Status": "Up 3 seconds", "Created": 1757000000,
+		"Labels": map[string]string{"com.docker.compose.project": "filebrowser"},
+	}})
+	fake.setLogs("2026-09-14T00:00:00Z User 'admin' initialized with randomly generated password: zNhlM0V4cDQCsuD2\n")
+
+	mgr := srv.svcManager()
+
+	// 只挑本项目：别的项目名不该匹配到它
+	if got := mgr.DockerComposeProjectContainers(context.Background(), "other-project"); len(got) != 0 {
+		t.Errorf("别的项目不该匹配到这个容器，实际 %v", got)
+	}
+	list := mgr.DockerComposeProjectContainers(context.Background(), "filebrowser")
+	if len(list) != 1 {
+		t.Fatalf("应找到 1 个容器，实际 %d: %v", len(list), list)
+	}
+	if list[0].Name != "filebrowser" || list[0].State != "running" {
+		t.Errorf("容器信息不对：%+v", list[0])
+	}
+
+	creds := mgr.DockerScrapeStartupCredentials(context.Background(), list)
+	var user, pass string
+	for _, c := range creds {
+		switch c.Key {
+		case "username":
+			user = c.Value
+		case "password":
+			pass = c.Value
+		}
+	}
+	if user != "admin" || pass != "zNhlM0V4cDQCsuD2" {
+		t.Fatalf("应从容器日志里捞出初始账号口令，实际 %v", creds)
+	}
+
+	// 安全约定（硬要求，见 InstallResult.Credentials）：明文口令**只**进
+	// 结果的 credentials，任务日志（会被长期保存/转发）里一个字都不许有。
+	var mu sync.Mutex
+	var emitted []string
+	ctx := services.WithProgress(context.Background(), func(level, text string) {
+		mu.Lock()
+		defer mu.Unlock()
+		emitted = append(emitted, level+":"+text)
+	})
+	if got := mgr.DockerScrapeStartupCredentials(ctx, list); len(got) != 2 {
+		t.Fatalf("带上进度接收器时也应返回 2 条凭据，实际 %v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	joined := strings.Join(emitted, "\n")
+	if !strings.Contains(joined, "用户名 admin") {
+		t.Errorf("日志里应有一句「捞到了初始口令」的提示，实际：\n%s", joined)
+	}
+	if strings.Contains(joined, pass) {
+		t.Errorf("明文口令绝不能出现在任务日志里（只允许进结果的 credentials）：\n%s", joined)
+	}
+}
+
+// waitTaskDone 从 202 响应里取出 task_id，等到任务结束并返回它。
+//
+// 复用本包已有的 waitTaskDone（api_certs_test.go）与 taskIDFrom，避免两套等待逻辑。
+func waitDockerTask(t *testing.T, srv *Server, out map[string]any) *tasks.Task {
+	t.Helper()
+	return waitTaskDone(t, srv, taskIDFrom(t, out))
+}
+
+// taskLinesText 把任务日志拼成 "level:text" 逐行文本，方便做精确断言。
+func taskLinesText(t *testing.T, task *tasks.Task) string {
+	t.Helper()
+	lines, _, _, _ := task.Snapshot(0, 5000)
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString(l.Level)
+		b.WriteString(":")
+		b.WriteString(l.Text)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // TestDockerBuiltinNetworkProtected 内置网络不能被删（删了会破坏默认网络行为）。

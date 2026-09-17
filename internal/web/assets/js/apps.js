@@ -1,145 +1,154 @@
-// apps.js —— 「应用」页：我的应用（合并去重后的清单）+ 应用市场（可安装目录）。
+// apps.js —— 「应用」页：四个一级 Tab（已安装 / 应用市场 / docker / 一键建站）。
 //
-// 2026-09-17 信息架构合并（用户："服务管理/apps 合并，执行你的建议（推荐 A）"）：
-//   原来的「服务管理」与「应用市场」两个导航项合成**一个「应用」版块**，页内两个 Tab：
-//     · 我的应用 —— 市场里已安装的条目 + 面板服务记录，按归一化 key 合并去重，
-//                   一行一条（实现住在 services.js 的 renderMyApps）；
-//     · 应用市场 —— 可安装 / 可更新的目录条目（本文件的卡片网格）。
-//   老链接 `#/services` 由 app.js 的 ROUTE_TARGET 落到本页并切到「我的应用」Tab。
+// 2026-09-17 用户第二版信息架构（原话："做 4 个一级菜单：已安装，应用市场，
+// docker，一键建站；默认显示已安装；应用市场里的显示始终显示全部……恢复之前的
+// 卡片展示样式！重要！"）：
+//   · 「已安装」（默认）—— 市场已安装条目 + 服务记录按归一化 key 合并去重后，
+//     **一张卡片一个应用**（实现住在 services.js 的 renderInstalledApps）。
+//     卡片上只留一颗「打开」（规则见下），启停/重启/刷新/管理保留。
+//   · 「应用市场」—— **一个列表显示全部**可安装的原生应用（brew / 官方二进制 /
+//     面板安装器），**不再**按已安装/未安装分成两部分，也不再默认只显示未安装。
+//     docker 类与站点应用不在这里（各有自己的 Tab）。
+//   · 「docker」—— 纯展示面板建议的 docker 项目：默认端口 + 需要的镜像 +
+//     预配置 compose 文件（含随机密钥与端口说明）。**不提供任何安装动作**。
+//   · 「一键建站」—— site_app 类条目（typecho / wordpress / freshrss），
+//     表单与流程与上一轮完全一致。
+//   侧栏仍然只有「应用」一项；hash 能直接指定 Tab（`#/apps/docker`），
+//   老 hash `#/services` 落到「已安装」（见 app.js 的 ROUTE_TARGET / routeFor）。
 //
-// 市场这一侧的核心思路：把"能不能装"和"装什么"分开。
+// 卡片样式：四个 Tab 全部走 `.grid.grid-3` + servicePanel.appCardShell ——
+// 就是改动前应用市场那套卡片（图标 + 名称 + summary + pill + 一排按钮）。
+// 合并页面那一轮换成的"行"（services.js 的 appRow）已按用户要求删除。
+//
+// 市场这一侧的核心思路不变：把"能不能装"和"装什么"分开。
 //   - 用户点安装时，先跑一次安装前检查（依赖、端口），把问题一次说清
 //   - 检查通过才真正安装；安装是**异步任务**，提交后进度交给「任务中心」，
 //     用户可以关窗口、切页面，随时从顶栏重新打开看进度（见 tasks.js）
-//   - 已经装过的应用显示"已安装"，常用动作（打开/直链/启停/重启/刷新/管理）
-//     直接摆在卡片上；安装生命周期动作（重装 / 卸载 / 文档）收进「⚙️ 管理」面板
+//   - 已经装过的应用显示「已安装」pill + 「打开」，常用动作（打开/启停/重启/刷新/
+//     管理）直接摆在卡片上；安装生命周期动作（重装 / 卸载 / 文档 / 直链）收进
+//     「⚙️ 管理」面板
 
 import { api } from './api.js';
 import { h, clear, toast, modal, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
-// 「我的应用」Tab 的实现（合并去重清单）住在 services.js —— 它是原服务管理页
-// 的继承者，数据字段（服务记录）也主要来自那一侧。
-import { renderMyApps } from './services.js';
-// 「应用管理」面板与启停/重启的唯一实现在 servicePanel.js —— 「我的应用」行点开的
-// 是**同一个**面板（这是用户 2026-09-16 的核心要求：同一个应用的能力不分散在
-// 两个页面）。卡片上通往它的入口**只有一个**「⚙️ 管理」：用户明确说原来的
-// 「详情」与「查看服务」内容一样，"统一保留一个管理就行了"，所以那两个按钮都删了。
-// 配置文件编辑器（configFileModal）住在 services.js，由面板内部复用，这里不再直接用。
+// 「已安装」Tab 的实现（合并去重清单、一张卡片一个应用）住在 services.js ——
+// 它是原服务管理页的继承者，数据字段（服务记录）也主要来自那一侧。
+import { renderInstalledApps } from './services.js';
+// 「应用管理」面板、卡片外壳、唯一那颗「打开」与启停/重启的唯一实现都在
+// servicePanel.js —— 四个 Tab 的卡片与「已安装」卡片点开的是**同一个**面板
+// （用户 2026-09-16 的核心要求：同一个应用的能力不分散在两个页面）。
 //
-// openDirectActions / subpathWarning / hasPanelUI 也来自 servicePanel.js：卡片上的
-// 「打开 / 直链」与服务行、管理面板**必须**是同一份实现（用户 2026-09-17："打开/
-// 直链/刷新/重启/停止/管理"这组固定语义，两处不能各写一套）。subpathWarning 是
-// 按钮下方那行"为什么不支持子路径"的小字（用户第四条抱怨：只有 ⚠️ 没有解释）。
-import { openServicePanel, marketQuickActions, openDirectActions, hasPanelUI, subpathWarning } from './servicePanel.js';
+// appCardShell  四个 Tab 共用的卡片 DOM（用户要求"卡片样式统一"）
+// openOnlyAction / openTargetOf / portAccessWarning
+//               卡片上那颗「打开」的**唯一**判定与"不支持子路径"的逐字提示
+//               （用户 2026-09-17 第六条：只显示打开、不显示直链；不支持子路径的
+//                用 ip:端口打开并提示"该应用不支持子路径，请用端口访问，或自行配置反代。"）
+// dedupeMarketEntries 市场/docker 列表按归一化 key 去重（与「已安装」的去重同一套规则）
+// hasPanelUI    与面板同一条"有没有面板托管的界面"判据
+import {
+  openServicePanel, marketQuickActions, hasPanelUI, appCardShell,
+  openOnlyAction, portAccessWarning, dedupeMarketEntries, appKeyOf,
+} from './servicePanel.js';
 
 let cache = null;
 // svcList 是这轮市场数据对应**完整服务记录**（api.services(true)，带健康检查）。
-// 「我的应用」Tab 用它做合并去重、状态/端口/健康、以及管理面板的 svc 入参。
+// 「已安装」Tab 用它做合并去重、状态/端口/健康，以及管理面板的 svc 入参。
 let svcList = [];
 // proxyState 是 /api/v1/market/proxies 的探测结果（slug → {proxy_ok, reason}）。
-// 它只服务于顶部「检测可用性 / 生成 nginx 入口」两个工具，**不再**决定「打开 /
-// 直链」的归属：那个探测不带面板会话，子路径在面板端口上返回 401，proxy_ok
-// 几乎恒为 false —— 用它决定归属会让 it-tools 这类应用的「打开」错变成端口直连。
+// 它只服务于「应用市场」顶部「检测可用性 / 生成 nginx 入口」两个工具，**不再**
+// 决定「打开」的地址：那个探测不带面板会话，子路径在面板端口上返回 401，
+// proxy_ok 几乎恒为 false。用它决定地址会让 it-tools 这类应用的「打开」错变成端口直连。
 let proxyState = null;
 // svcState 是"这轮市场数据对应的服务状态"（服务名 → state），由 svcList 派生。
 // 市场卡片的首颗动作按钮要在「启动」与「停止」之间选一个；拿不到状态时退化成
 // 「启动」（后端对一个已经在跑的服务执行 start 是幂等的，不会因此谎报状态）。
 let svcState = {};
 
-// ---------------- 分类筛选（全部 / 原生 / Docker） ----------------
-//
-// 用户要求："应用市场加「全部 / 原生 / Docker」下拉筛选，用于快速只看某一类。"
-// 只在前端过滤：市场数据本来就在手里（一次 GET /api/v1/market），
-// 再加一个接口只会多一次往返、切换筛选还更慢。
-//
-// 选择要能保留（刷新浏览器、切页面再回来都不丢），所以存 localStorage。
-// localStorage 在隐私模式 / 被禁用时会直接抛异常，因此读写都包 try：
-// 存不了就退化成"仅本次会话生效"，功能降级但**不报错**（不谎报"已记住"）。
-const KIND_FILTER_KEY = 'zp-market-kind-filter';
-const KIND_FILTERS = ['', 'native', 'docker'];
-
-function readKindFilter() {
-  try {
-    const v = localStorage.getItem(KIND_FILTER_KEY);
-    return KIND_FILTERS.includes(v) ? v : '';
-  } catch { return ''; }
-}
-
-function saveKindFilter(v) {
-  try { localStorage.setItem(KIND_FILTER_KEY, v); } catch { /* 存不了就算了 */ }
-}
-
-let kindFilter = readKindFilter();
-
-// kindGroupOf 把一个应用归到筛选档。
-//
-// KindColima（Colima 容器运行时）归到 **Docker** 档：它本身就是 Docker 引擎，
-// 用户想看"Docker 类"时一定也想看到它；单独给它一档会让下拉变成四项，
-// 而"原生 / Docker"问的是**怎么装**，Colima 显然是 Docker 那一侧。
-// 未知 Kind 归原生档（当前目录里不存在这种条目）。
-function kindGroupOf(a) {
-  if (a.kind === 'compose' || a.kind === 'docker' || a.kind === 'colima') return 'docker';
-  return 'native';
-}
-
-// kindFilterSelect 生成筛选下拉。放在函数里是因为头部每次刷新都会重画。
-//
-// onChange 由 AppsView 传进来（`renderGrid`）—— 这个函数在模块作用域，
-// 拿不到视图闭包里的 renderGrid；直接在里面调用会抛 ReferenceError
-// （下拉能改、localStorage 也写了，但列表纹丝不动）。
-function kindFilterSelect(onChange) {
-  const sel = h('select#apps-kind-filter.select', {
-    style: { width: 'auto' },
-    title: '只看某一类应用：原生 = Homebrew / 官方 darwin 二进制；'
-      + 'Docker = 容器应用与 Colima 容器运行时',
-  }, [
-    h('option', { value: '', text: '全部', selected: kindFilter === '' }),
-    h('option', { value: 'native', text: '原生', selected: kindFilter === 'native' }),
-    h('option', { value: 'docker', text: 'Docker', selected: kindFilter === 'docker' }),
-  ]);
-  sel.addEventListener('change', () => {
-    kindFilter = KIND_FILTERS.includes(sel.value) ? sel.value : '';
-    saveKindFilter(kindFilter);
-    if (typeof onChange === 'function') onChange();
-  });
-  return sel;
-}
-
 // ---------------------------------------------------------------------------
-//  页内 Tab（用户 2026-09-17：服务管理 + 应用市场 → 一个「应用」版块）
+//  一级 Tab（用户 2026-09-17：已安装 / 应用市场 / docker / 一键建站）
 // ---------------------------------------------------------------------------
-
-// INSTALL_FILTERS 是应用市场的安装状态筛选，默认「未安装」——
-// 市场这一栏的用途是"还能装什么"；已安装应用的常用动作在「我的应用」里。
-const INSTALL_FILTERS = [
-  { id: '', label: '全部' },
-  { id: 'missing', label: '未安装' },
-  { id: 'installed', label: '已安装' },
+//
+// 数组顺序就是默认顺序：`已安装` 在最前，AppsView 在 ctx.tab 没给或给了未知值时
+// 落回它。每个 Tab 有稳定的 data-tab 值（也是 hash 里的第二段：`#/apps/docker`）。
+const APP_TABS = [
+  { id: 'installed', title: '已安装' },
+  { id: 'market', title: '应用市场' },
+  { id: 'docker', title: 'docker' },
+  { id: 'sites', title: '一键建站' },
 ];
-let installFilter = 'missing';
+const APP_TAB_IDS = new Set(APP_TABS.map((t) => t.id));
 
-function installFilterSelect(onChange) {
-  const sel = h('select#apps-install-filter.select', {
-    style: { width: 'auto' },
-    title: '按安装状态筛选：未安装 = 还能装的；已安装 = 装过的（常用动作在「我的应用」里）',
-  }, INSTALL_FILTERS.map((f) => h('option', { value: f.id, text: f.label, selected: installFilter === f.id })));
-  sel.addEventListener('change', () => {
-    installFilter = INSTALL_FILTERS.some((f) => f.id === sel.value) ? sel.value : 'missing';
-    if (typeof onChange === 'function') onChange();
-  });
-  return sel;
+// ---------------------------------------------------------------------------
+//  docker 推荐项目：字段判定（字段名以后端接口为准，见下）
+// ---------------------------------------------------------------------------
+//
+// 后端（internal/web/api_services.go 的 market item + services.App）给的稳定契约：
+//   · docker_reference（App 上的字段）/ docker_recommended（market item 的别名）为 true
+//     → 这是"面板推荐的 Docker 项目"：卡片进 docker Tab，**不给安装动作**；
+//   · compose_yaml           → 预配置 compose 文件的内容（卡片上「复制 compose 配置」）；
+//   · compose_url            → 镜像站上同一份文件的下载/查看地址（卡片上「打开 compose 文件」）；
+//   · compose_env_url        → 变量样例 .env.example 的地址（卡片上「变量样例」）；
+//   · compose_readme_url     → 全部推荐项目的总索引（顶部提示里的链接）。
+// 这里仍然多认几个历史/备用写法（docker_rec / recommended_docker / compose /
+// compose_file_content …），是为了**接口字段变更时不至于把条目漏出 docker Tab**；
+// 兜底再按 kind=compose/docker 归类（当前目录里所有 compose 条目都是推荐项目，
+// 有 Go 侧测试锁住）。**不含 colima** —— 那是 Docker 运行时本身，要留在应用市场
+// 让人能安装，不是"推荐项目"。
+function isDockerRec(a) {
+  if (!a) return false;
+  for (const k of ['docker_reference', 'docker_recommended', 'docker_rec', 'recommended_docker']) {
+    if (typeof a[k] === 'boolean') return a[k];
+  }
+  if (a.docker === true) return true;
+  return a.kind === 'compose' || a.kind === 'docker';
 }
 
-// isInstalled 是"已安装 / 已纳管"的唯一判据（市场卡片按钮、安装筛选共用）。
+function composeTextOf(a) {
+  return (a && (a.compose_yaml || a.compose || a.compose_content || a.compose_file_content)) || '';
+}
+
+function composeURLOf(a) {
+  return (a && (a.compose_url || a.compose_file_url || a.compose_download_url || a.compose_yaml_url)) || '';
+}
+
+function composeEnvURLOf(a) {
+  return (a && (a.compose_env_url || a.env_url)) || '';
+}
+
+// composeReadmeURLOf 取"全部推荐项目的总索引"地址：后端在每条推荐项目上都带同一个值，
+// 取第一条非空的即可（docker Tab 顶部提示里给一个总入口）。
+function composeReadmeURLOf(list) {
+  for (const a of list || []) {
+    const u = a && (a.compose_readme_url || a.compose_index_url);
+    if (u) return u;
+  }
+  return '';
+}
+
+// dockerImagesOf 取"这个项目需要哪些镜像"：接口给的清单优先，
+// 没有就从 compose 内容的 image: 行解析（面板只展示，不替用户判断镜像版本）。
+function dockerImagesOf(a) {
+  const direct = a && (a.images || a.docker_images || a.required_images);
+  if (Array.isArray(direct) && direct.length) return direct.map((x) => String(x));
+  const out = [];
+  const re = /^\s*image:\s*["']?([^"'\s#]+)/gm;
+  let m;
+  while ((m = re.exec(composeTextOf(a))) !== null) {
+    if (!out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+// isInstalled 是"已安装 / 已纳管"的唯一判据（市场卡片 pill、安装按钮共用）。
 function isInstalled(a) { return !!(a && (a.installed || a.adopted)); }
 
 export function AppsView(content, ctx = {}) {
   clear(content);
 
-  // 默认落在「我的应用」；`#/services`（app.js 的 ROUTE_TARGET）显式给 tab='mine'，
-  // 老书签因此仍然落在原服务管理的那份清单上。
-  let active = ctx && ctx.tab === 'market' ? 'market' : 'mine';
+  // 默认落在「已安装」；`#/services`（app.js 的 ROUTE_TARGET）显式给 tab='installed'，
+  // `#/apps/docker` 这类 hash 给 tab='docker'。未知值一律落回「已安装」。
+  let active = (ctx && APP_TAB_IDS.has(ctx.tab)) ? ctx.tab : 'installed';
   let loadError = null;
   let marketGrid = null;
   let marketHead = null;
@@ -150,7 +159,7 @@ export function AppsView(content, ctx = {}) {
 
   function renderTabBar() {
     clear(tabBar);
-    for (const t of [{ id: 'mine', title: '我的应用' }, { id: 'market', title: '应用市场' }]) {
+    for (const t of APP_TABS) {
       tabBar.appendChild(h(`button.btn.btn-sm${active === t.id ? '.btn-primary' : ''}`, {
         dataset: { tab: t.id },
         text: t.title,
@@ -161,21 +170,24 @@ export function AppsView(content, ctx = {}) {
 
   function renderBody() {
     clear(body);
-    if (active === 'mine') renderMineTab();
+    if (active === 'installed') renderInstalledTab();
+    else if (active === 'docker') renderDockerTab();
+    else if (active === 'sites') renderSitesTab();
     else renderMarketTab();
   }
 
-  function renderMineTab() {
+  function renderInstalledTab() {
     if (loadError && !cache) {
       appendAll(body, h('div.card', [h('div.card-body', [h('div.empty', [
         h('div.big', { text: '⚠️' }), h('h4', { text: '读取失败' }), h('p', { text: loadError.message || String(loadError) }),
       ])])]));
       return;
     }
-    // 合并去重、每行按钮、可纳管扫描都在 services.js 的 renderMyApps 里
+    // 合并去重、卡片动作、可纳管扫描都在 services.js 的 renderInstalledApps 里
     // （它同时握着市场条目与服务记录，见那边文件头的说明）。
-    renderMyApps(body, { market: cache, list: svcList, onReload: load });
+    renderInstalledApps(body, { market: cache, list: svcList, onReload: load });
   }
+
 
   // rebuildSvcState 从完整服务记录派生"服务名 → state"（市场卡片首颗按钮用）。
   function rebuildSvcState() {
@@ -185,11 +197,11 @@ export function AppsView(content, ctx = {}) {
   }
 
   // fetchAll 一次拉齐两边的数据：市场目录 + 服务记录（带健康检查）。
-  // 两者**并行**，且一个失败不影响另一个（服务记录拉不到时「我的应用」只显示
+  // 两者**并行**，且一个失败不影响另一个（服务记录拉不到时「已安装」只显示
   // 市场里的已安装条目，如实降级，不谎报）。
   //
   // 注意：这里用的是 api.services(true)（**带健康检查**，比市场自己以前用的
-  // false 慢一点），因为「我的应用」每行要给出健康检查结果。两个请求并行发出，
+  // false 慢一点），因为「已安装」每张卡片要给出健康检查结果。两个请求并行发出，
   // 首屏等待没有叠加。
   async function fetchAll() {
     const [mkt, svc] = await Promise.allSettled([api.market(), api.services(true)]);
@@ -222,6 +234,24 @@ export function AppsView(content, ctx = {}) {
     return null;
   }
 
+  // svcOfApp 找这个市场条目对应的服务记录（卡片上的「打开」在没给 port_url 时
+  // 要靠它拿服务端口）。按归一化 key 对齐 —— 与合并去重同一套规则。
+  function svcOfApp(a) {
+    const key = appKeyOf(a);
+    if (!key) return null;
+    for (const s of svcList) if (s && s.name && appKeyOf(s) === key) return s;
+    return null;
+  }
+
+  // marketApps 是「应用市场」Tab 的条目：**全部**可安装的原生应用。
+  //
+  //   · 不再按已安装/未安装切成两块（用户："始终显示全部"）；
+  //   · docker 推荐项目去「docker」Tab，站点应用去「一键建站」Tab（各自有 Tab）。
+  //   · 按归一化 key 去重后渲染（与「已安装」Tab 同一套去重规则）。
+  function marketApps() {
+    return dedupeMarketEntries((cache?.list || []).filter((a) => a && !isDockerRec(a) && !a.site_app));
+  }
+
   // ---------- 应用市场 Tab ----------
   function renderMarketTab() {
     const grid = h('div');
@@ -246,19 +276,13 @@ export function AppsView(content, ctx = {}) {
   function renderHead() {
     if (!marketHead) return;
     clear(marketHead);
-    const docker = cache?.docker || {};
-    const installed = (cache?.list || []).filter(isInstalled).length;
+    const all = marketApps();
+    const installed = all.filter(isInstalled).length;
     appendAll(marketHead,
-      h('span.pill', { text: `共 ${(cache?.list || []).length} 个应用` }),
+      h('span.pill', { text: `共 ${all.length} 个应用` }),
       installed > 0 ? h('span.pill.ok', { text: `已安装 ${installed}` }) : null,
-      h('span.pill' + (docker.available ? '.ok' : '.warn'), {
-        text: docker.available ? `Docker ${docker.version || '已就绪'}` : 'Docker 未安装',
-        title: docker.available ? 'Docker socket: ' + docker.socket : 'Docker 类应用需要先安装 Docker（推荐 OrbStack）',
-      }),
-      // 安装状态筛选（默认「未安装」）+ 「全部 / 原生 / Docker」筛选（按 Kind，
-      // 选择记在 localStorage）。两个下拉都只做前端过滤，切换不重新请求。
-      installFilterSelect(renderGrid),
-      kindFilterSelect(renderGrid),
+      // 安装状态筛选（全部/未安装/已安装，默认未安装）与「原生/Docker」分类筛选
+      // 都已删除：用户明确要求市场**始终显示全部**，docker 类也搬去了 docker Tab。
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
       // 「一键安装 LNMP 环境」已从这里**搬到「网站管理」页**（用户要求：它属于网站板块）。
       // 为什么市场里不再保留这个入口：LNMP 是**组合动作**（nginx + PHP + MySQL
@@ -267,7 +291,7 @@ export function AppsView(content, ctx = {}) {
       // 后端能力（POST /api/v1/market/install-lnmp）与目录条目都保留；目录里
       // 本来也没有 ID=lnmp 的 App（见 catalog.go「网站环境」段的说明），所以市场
       // 不会渲染出它的卡片；万一将来有人加进去，web 层的 marketHiddenApps 会挡下。
-      // 原来的「⚙️ 服务管理」按钮已删：那一页就是本页的「我的应用」Tab，
+      // 原来的「⚙️ 服务管理」按钮已删：那一页就是本页的「已安装」Tab，
       // 页内 Tab 已经给了入口，再放一颗按钮只会让人以为是两个页面。
       // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
       // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
@@ -286,6 +310,169 @@ export function AppsView(content, ctx = {}) {
         })
         : null,
     );
+  }
+
+  // ---------- docker Tab：纯展示面板建议的 docker 项目 ----------
+  //
+  // 用户 2026-09-17 的原始要求（"一，关于 docker 应用"）：docker 容器不该放在
+  // 应用中心、不该写得那么"重"；这里只列出**面板建议的项目**，不添加任何功能，
+  // 就是纯卡片展示。这些推荐项目在 NAS 镜像里提供现成内容供拉取，compose 里给出
+  // **预配置文件**供用户参考，用户简单编辑后即可自己运行 —— 所以这个 Tab 里
+  // **没有任何安装/部署/启停按钮**（"但不提供安装"）。
+  function renderDockerTab() {
+    const docker = cache?.docker || {};
+    const list = dockerRecApps();
+    const grid = h('div#docker-grid.grid.grid-3', list.map(dockerCard));
+    const head = h('div.card-head', [
+      h('h3', { text: 'docker 推荐项目' }),
+      h('div.spacer'),
+      h('div#docker-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill', { text: `共 ${list.length} 个项目` }),
+        h('span.pill' + (docker.available ? '.ok' : '.warn'), {
+          text: docker.available ? `Docker ${docker.version || '已就绪'}` : 'Docker 运行时未就绪',
+          title: docker.available
+            ? 'Docker socket: ' + (docker.socket || '')
+            : '这些 compose 文件可以直接取用；要真正跑起来需要一个 Docker 运行时（可用「应用市场」里的 Colima / OrbStack）',
+        }),
+        h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      ]),
+    ]);
+    const box = h('div.card-body');
+    appendAll(box, dockerCallout());
+    if (!list.length) {
+      appendAll(box, h('div.empty', [
+        h('div.big', { text: '🐳' }),
+        h('h4', { text: '暂时没有推荐项目' }),
+        h('p', { text: '面板目录里还没有标记为 docker 推荐项目的条目。' }),
+      ]));
+    } else {
+      appendAll(box, grid);
+    }
+    appendAll(body, h('div.card', [head, box]));
+  }
+
+  // dockerCallout 是"已在醒目处提醒提供预配置 compose 文件"的那一条（用户要求）。
+  // 用 warn-soft 底 + 边框，放在列表最上方；文案是纯文本，不使用 Markdown 记号。
+  function dockerCallout() {
+    const docker = cache?.docker || {};
+    // 镜像站上"全部推荐项目"的总索引（后端 compose_readme_url，每条同一个值）。
+    const readme = composeReadmeURLOf(cache?.list || []);
+    return h('div#docker-callout', {
+      style: {
+        background: 'var(--warn-soft)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)', padding: '12px 14px', marginBottom: '14px',
+        fontSize: '12.5px', lineHeight: '1.8',
+      },
+    }, [
+      h('div', { text: '📦 面板已为下面每个项目提供预配置的 docker compose 文件（含随机密钥与端口说明），可直接取用/改完自己跑。' }),
+      h('div.hint', {
+        text: docker.available
+          ? '这些只是推荐项目清单：面板不代为安装、不管启停。取走 compose 文件后由你自己执行。'
+          : '这些只是推荐项目清单：面板不代为安装、不管启停。当前还没有可用的 Docker 运行时，'
+            + '取走 compose 文件后请先准备好运行时再执行。',
+      }),
+      readme
+        ? h('div', { style: { marginTop: '4px' } }, [
+          h('a', { href: readme, target: '_blank', rel: 'noopener', text: '查看全部推荐项目的 compose 说明 ↗' }),
+        ])
+        : null,
+    ]);
+  }
+
+  function dockerRecApps() {
+    return dedupeMarketEntries((cache?.list || []).filter(isDockerRec));
+  }
+
+  // dockerCard 是一张纯展示卡片：图标 / 名称 / 描述 / 默认端口 / 需要的镜像 /
+  // compose 文件的操作。**没有安装、部署、启停、卸载按钮**。
+  function dockerCard(a) {
+    const images = dockerImagesOf(a);
+    const url = composeURLOf(a);
+    const envURL = composeEnvURLOf(a);
+    const text = composeTextOf(a);
+    const pills = [
+      a.port > 0 ? h('span.pill', { text: '默认端口 :' + a.port }) : null,
+      images.length ? h('span.pill.brand', { text: `${images.length} 个镜像` }) : null,
+    ];
+    const extra = [];
+    // 需要哪些镜像：接口给了就用接口的，没给就从 compose 的 image: 行解析。
+    // 两者都拿不到时如实说明"以 compose 文件为准"，不编造清单。
+    extra.push(h('div', { style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.6' } }, [
+      h('span', { text: '需要镜像：' }),
+      images.length
+        ? h('span.mono', { style: { wordBreak: 'break-all' }, text: images.join('、') })
+        : h('span', { text: '（接口未提供，以 compose 文件里的 image: 为准）' }),
+    ]));
+    const actions = [];
+    if (text) {
+      actions.push(h('button.btn.btn-sm.btn-primary', {
+        text: '复制 compose 配置',
+        title: '复制这个项目的预配置 docker-compose.yml 内容，自己改完即可运行',
+        onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(text);
+            toast(`已复制「${a.name}」的 compose 配置`, 'ok');
+          } catch { toast('复制失败（浏览器限制），请从文件 URL 打开后手动复制', 'warn', 9000); }
+        },
+      }));
+    }
+    if (url) {
+      actions.push(h('a.btn.btn-sm', {
+        href: url, target: '_blank', rel: 'noopener', text: '打开 compose 文件',
+        title: '打开/下载面板为这个项目准备好的 compose 文件：' + url,
+      }));
+    }
+    if (envURL) {
+      actions.push(h('a.btn.btn-sm', {
+        href: envURL, target: '_blank', rel: 'noopener', text: '变量样例',
+        title: '打开/下载 .env.example：复制成 .env 后按里面的说明改（含端口与数据目录等变量）',
+      }));
+    }
+    if (!actions.length) {
+      // 接口没给内容/地址时把位置留出来，并如实说明（绝不摆一颗点了没用的按钮）。
+      actions.push(h('span', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        text: '接口还没有提供这个项目的 compose 文件内容/地址',
+      }));
+    }
+    return appCardShell({
+      icon: a.icon, name: a.name, subtitle: a.summary,
+      pills, text: a.description || '', extra, actions,
+    });
+  }
+
+  // ---------- 一键建站 Tab ----------
+  //
+  // site_app 类条目（typecho / wordpress / freshrss）单独一栏：它们的"安装"
+  // 是一整套建站流程（下载源码 → 建库 → 写配置 → 建 vhost + 伪静态），
+  // 表单与流程住在下面的 openSiteInstall，与上一轮一字未改。
+  function renderSitesTab() {
+    const list = dedupeMarketEntries((cache?.list || []).filter((a) => a && a.site_app));
+    const head = h('div.card-head', [
+      h('h3', { text: '一键建站' }),
+      h('div.spacer'),
+      h('div#sites-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill', { text: `共 ${list.length} 个建站程序` }),
+        h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      ]),
+    ]);
+    const box = h('div.card-body');
+    if (!list.length) {
+      appendAll(box, h('div.empty', [
+        h('div.big', { text: '🌐' }),
+        h('h4', { text: '暂时没有可一键建站的程序' }),
+        h('p', { text: '面板目录里还没有 site_app 类型的条目。' }),
+      ]));
+    } else {
+      // 卡片外壳与市场 / docker / 已安装同一套；按钮由 appCard 的 site_app 分支给
+      // （「一键建站」+ 有 docs_url 时的「文档」）。
+      appendAll(box, h('div.hint', {
+        style: { marginBottom: '14px' },
+        text: '填一个域名即可：面板会自动下载官方源码、建库建用户、写配置文件、'
+          + '建站点并套用伪静态。域名创建后不可修改。',
+      }), h('div#sites-grid.grid.grid-3', list.map(appCard)));
+    }
+    appendAll(body, h('div.card', [head, box]));
   }
 
   // doProbe 手动触发一次可用性探测（打开页面时不再自动跑，见 load() 的说明）。
@@ -461,10 +648,10 @@ export function AppsView(content, ctx = {}) {
   }
 
   // adoptApp（纳管一个已在跑的服务）已删除（2026-09-17 合并时）：
-  // 唯一的纳管入口是「我的应用 → 🔍 扫描可纳管服务」，实现住在 services.js 的
-  // renderMyApps（openAdoptable）。市场卡片本来就不给「纳管」按钮 —— 卡片的
-  // 按钮集合是固定那六颗（打开/直链/启停/重启/刷新/管理），而纳管是另一个语义
-  // （登记一个已经存在的服务），不该混进应用的生命周期动作里。
+  // 唯一的纳管入口是「已安装 → 🔍 扫描可纳管服务」，实现住在 services.js 的
+  // renderInstalledApps（openAdoptable）。市场卡片本来就不给「纳管」按钮 ——
+  // 卡片上的按钮集合只由数据决定（打开 / 启停 / 重启 / 刷新 / 管理），
+  // 而纳管是另一个语义（登记一个已经存在的服务），不该混进应用的生命周期动作里。
   // 保留两份"确认纳管"弹窗只会在文案与行为上慢慢分叉，所以这里整段删掉。
 
   function installPhpMyAdmin(appId) {
@@ -476,31 +663,20 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
+  // renderGrid 重画「应用市场」的卡片网格。
+  //
+  // 数据是 marketApps()：**全部**可安装的原生应用（已安装的与未安装的**同时**
+  // 显示在一个列表里，不再分两块、也不再默认只显示未安装）。docker 类与站点
+  // 应用各有自己的 Tab，不在这里。
   function renderGrid() {
     if (!marketGrid) return;
     clear(marketGrid);
-    const all = cache?.list || [];
-    if (!all.length) {
-      appendAll(marketGrid, h('div.empty', [h('div.big', { text: '🧩' }), h('h4', { text: '应用目录为空' })]));
-      return;
-    }
-
-    // 先按安装状态（默认「未安装」）与「全部 / 原生 / Docker」筛选
-    // （纯前端，见 isInstalled / kindGroupOf）。
-    let list = all;
-    if (installFilter === 'missing') list = list.filter((a) => !isInstalled(a));
-    else if (installFilter === 'installed') list = list.filter(isInstalled);
-    if (kindFilter) list = list.filter((a) => kindGroupOf(a) === kindFilter);
-
+    const list = marketApps();
     if (!list.length) {
       appendAll(marketGrid, h('div.empty', [
-        h('div.big', { text: '🔍' }),
-        h('h4', { text: installFilter === 'missing' ? '没有可安装的新应用了' : '这一类暂时没有应用' }),
-        h('p', {
-          text: installFilter === 'missing'
-            ? '目录里的应用都已经安装。把筛选切到「已安装」可以看它们的常用动作，或切到「全部」。'
-            : '把上方的筛选切回「全部」就能看到全部应用。',
-        }),
+        h('div.big', { text: '🧩' }),
+        h('h4', { text: '应用目录为空' }),
+        h('p', { text: 'docker 项目在「docker」Tab，一键建站在「一键建站」Tab。' }),
       ]));
       return;
     }
@@ -509,6 +685,7 @@ export function AppsView(content, ctx = {}) {
     // 单一来源在 internal/services/catalog.go 的 MarketSections）。
     // 前端不再自带一份分类中文名 —— 用户要求把最后一个板块「其它」改名为
     // 「基础环境」，改名只改 catalog.go 一处，这里自动跟着变，不会再漂。
+    // 空板块会被跳过（例如站点应用搬去「一键建站」后 site 板块在这里为空）。
     const sections = cache?.sections || [];
     if (!sections.length) {
       // 后端没给 sections（旧版本 / 接口异常）时的降级：不按分类分板块，
@@ -560,25 +737,19 @@ export function AppsView(content, ctx = {}) {
 
   // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
   //
+  // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
+  //
   // 判定顺序（改之前先读完这段）：
   //   有任务在跑              → 查看进度（点回任务中心，而不是再点一次）
   //   残留态（产物还在、没装） → **安装**（安装器幂等，会复用残留产物）
-  //   一键建站类              → 空（入口是卡片上的「一键建站」）
-  //   已安装                  → **空**（卡片只留常用动作；安装生命周期收进「⚙️ 管理」）
-  //   其它                    → 安装
+  //   其它（未安装）          → 安装
   //
-  // 2026-09-16 收敛（用户原话："截止 0.11.0 软件市场的显示有问题……Qwen3 TTS、
-  // frpc、Orbien 客户端这几个不显示重装，查看服务 应改为 重装"）：
-  // 改之前同一件"重装"被拆成三种文案 —— 已纳管给「查看服务」、已装且在 launchd
-  // 给「纳管 + 重装」、已装但没服务才给「重装」。偏偏用户最常重装的那几个
-  // （Qwen3 TTS / 接收端 / frpc / Orbien 都是"已纳管"）显示的是「查看服务」，
-  // 于是重装入口等于不存在。当时主按钮只由 **a.installed** 决定：装了就给「重装」。
-  //
-  // 2026-09-17 再收敛（用户原话："每个应用只保留，打开、直链、刷新、重启、停止、
-  // 管理……重装、卸载、文档等放进管理的弹出页面里"）：卡片上**不再**直接摆「重装」，
-  // 它和「卸载 / 取消纳管 / 文档」一起收进「⚙️ 管理」面板（见 servicePanel.js 的
-  // reinstallButton / uninstallButton / docLink）。所以已安装应用这里返回空，
-  // 卡片剩下的就是那组固定语义的常用动作。安装入口（未安装 / 残留态）不受影响。
+  // 2026-09-17 收敛：这个函数现在**只服务未安装/残留态的卡片**。
+  //   · 已安装的卡片给「打开」+ 启停/重启/刷新/管理（见下面的 installed 分支，
+  //     「已安装」Tab 里则由 services.js 的 installedCard 给同一组）；
+  //   · 站点应用的入口是卡片上的「一键建站」（siteInstallButtons）；
+  //   · 「重装 / 卸载 / 文档」全部收进「⚙️ 管理」面板（servicePanel.js 的
+  //     reinstallButton / marketUninstallButton / docLink），卡片上不再出现。
   function primaryButton(a) {
     const running = taskCenter.findByTarget(a.id);
     if (running) {
@@ -588,57 +759,73 @@ export function AppsView(content, ctx = {}) {
         onclick: () => taskCenter.openTask(running.id),
       });
     }
-    if (residualOf(a)) {
-      return h('button.btn.btn-sm.btn-primary', {
-        text: '安装',
-        disabled: !a.available,
-        title: '磁盘上还有上次卸载保留的数据/产物；安装会复用它们，不会重复下载',
-        onclick: () => openInstaller(a),
-      });
-    }
-    // 一键建站类应用装出来是**网站**（目录 + 数据库 + vhost），入口在卡片上的
-    // 「一键建站」；重装要走建站流程而不是安装器，所以主按钮留空。
-    if (a.site_app) return null;
-    // 已安装 → 卡片上不再有主按钮（安装生命周期动作都在「⚙️ 管理」面板里）。
-    if (a.installed) return null;
     return h('button.btn.btn-sm.btn-primary', {
       text: '安装',
       disabled: !a.available,
+      title: residualOf(a)
+        ? '磁盘上还有上次卸载保留的数据/产物；安装会复用它们，不会重复下载'
+        : '',
       onclick: () => openInstaller(a),
     });
   }
 
+  // docLink 官方文档入口（未安装应用与站点应用留在卡片上 —— 它们没有「⚙️ 管理」
+  // 入口可去；已安装应用的文档收在管理面板里，见 servicePanel.js 的 docLink）。
+  function docLink(url) {
+    return h('a.btn.btn-sm', { href: url, target: '_blank', rel: 'noopener', text: '文档' });
+  }
+
+  // appCard 渲染「应用市场」与「一键建站」的条目卡片 ——
+  // 卡片外壳走 servicePanel.appCardShell（四个 Tab 同一套 DOM）。
+  //
+  // 三种形态（全部由数据决定，没有按应用 ID 的分支）：
+  //   · 站点应用       → 「一键建站」+（有文档时）「文档」
+  //   · 已安装 / 已纳管 → 「已安装」pill + **一颗「打开」**（用户第六条：
+  //                       "只显示打开，不显示直链"）+ 启停/重启/刷新/⚙️ 管理
+  //   · 未安装         → 「安装」+（残留态时）「删除残留数据」+（有文档时）「文档」
   function appCard(a) {
-    return h('div', {
-      style: {
-        background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
-        padding: '15px 16px', display: 'flex', flexDirection: 'column', gap: '10px',
-      },
-    }, [
-      h('div', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start' } }, [
-        h('div', {
-          style: {
-            width: '38px', height: '38px', borderRadius: '10px', display: 'grid', placeItems: 'center',
-            background: 'var(--panel)', fontSize: '20px', flex: '0 0 auto',
-          },
-          text: a.icon || '🧩',
-        }),
-        h('div', { style: { flex: 1, minWidth: 0 } }, [
-          h('div', { style: { fontWeight: '620', fontSize: '14px' }, text: a.name }),
-          h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '2px' }, text: a.summary }),
-        ]),
-      ]),
-      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+    const installed = isInstalled(a);
+    const actions = [];
+    if (a.site_app) {
+      actions.push(...siteInstallButtons(a));
+      if (a.docs_url) actions.push(docLink(a.docs_url));
+    } else if (installed) {
+      // 「打开」的地址判定在 servicePanel.openTargetOf：支持子路径走子路径，
+      // 不支持走端口直连（port_url，或 location.hostname + 端口拼）。
+      // 不支持子路径时，卡片下方会有一行逐字提示（portAccessWarning）。
+      actions.push(...openOnlyAction(a, { svc: svcOfApp(a) }));
+      // 常用动作：启动/停止、重启、⟳ 刷新、⚙️ 管理（**同一份** serviceActions
+      // 实现）。「⚙️ 管理」打开的是与「已安装」卡片**同一个**面板 ——
+      // 配置文件编辑、凭据、日志、重装、文档、直链、卸载都在那里面。
+      actions.push(...marketQuickActions(a, {
+        state: stateOfApp(a),
+        onDone: refreshSilently,
+        // 让「⚙️ 管理」走 openAppDetail：面板里的「重装」要用本页的安装器
+        // 上下文（onReinstall，保留 Qwen 那类应用自己的选项框）。
+        onManage: () => openAppDetail(a),
+      }));
+    } else {
+      actions.push(primaryButton(a));
+      actions.push(...uninstallButtons(a));
+      if (a.docs_url) actions.push(docLink(a.docs_url));
+    }
+    const subtitle = a.summary || '';
+    return appCardShell({
+      icon: a.icon,
+      name: a.name,
+      subtitle,
+      subtitleTitle: a.description || '',
+      pills: [
         a.port > 0 ? h('span.pill', { text: ':' + a.port }) : null,
         a.kind === 'native' ? h('span.pill.brand', { text: '原生' }) : null,
         a.kind === 'compose' ? h('span.pill.brand', { text: 'Docker' }) : null,
         // 原生 brew 服务：记录在、但 plist 不在 = 服务其实没注册（ollama 就是这样，
-        // 用户看到"已安装"却在服务管理里启动失败）。这一条要显式说出来。
+        // 用户看到"已安装"却在服务里启动失败）。这一条要显式说出来。
         (a.kind === 'native' && a.service_label && a.installed && !a.service_in_launchd)
           ? h('span.pill.warn', {
             text: '已安装·服务未注册',
             title: '这个 brew 服务还没在 launchd 里注册（plist 不存在）。' +
-              '到「服务管理」点一次启动即可自动注册（面板会用 brew services start 补上）',
+              '到「已安装」Tab 点一次启动即可自动注册（面板会用 brew services start 补上）',
           })
           : (a.adopted ? h('span.pill.ok', { text: '已纳管' })
           : (a.installed
@@ -671,58 +858,22 @@ export function AppsView(content, ctx = {}) {
             '点「安装」会复用它们，只想清干净就点「删除残留数据」',
         }) : null,
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
-      ]),
-      // 卡片上只放**一句话**（summary）。以前把整段 description 铺在卡片里，
-      // 一个条目的文字比按钮还多，用户要滚动半天才能看完一个应用（2026-09-16 反馈）。
-      // 完整说明不丢：鼠标悬停给 title；已安装应用点「⚙️ 管理」里有「文档」，
-      // 未安装应用卡片上直接给「文档」（它们没有管理入口）。
-      (a.summary || a.description) ? h('div', {
-        style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.55' },
-        title: a.description || '',
-        text: a.summary || a.description,
-      }) : null,
-      h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
-        primaryButton(a),
-        // 界面入口：打开 / 直链 —— **同一份实现**在 servicePanel.js 的
-        // openDirectActions（「我的应用」行与管理面板也用它）。只有已安装、
-        // 且确实有面板托管界面的应用才有（frpc 这类自带控制台不算）。
-        ...(a.installed ? openDirectActions(a) : []),
-        // 已安装应用的常用动作：启动/停止、重启、刷新、⚙️ 管理。
-        // 用户要求（2026-09-16）：卡片上直接给常用动作，**不需要先跳到别的页面**；
-        // 而「⚙️ 管理」打开的是与「我的应用」行**同一个**面板 ——
-        // 配置文件的编辑、凭据、日志、重装、文档、卸载都在那里面，不是两套按钮。
-        // 2026-09-17 起卡片上只有这一组固定语义的按钮（打开/直链/启停/重启/刷新/管理），
-        // 「重装」「文档」也从卡片收进了这个面板。
-        ...marketQuickActions(a, {
-          state: stateOfApp(a),
-          onDone: refreshSilently,
-          // 让「⚙️ 管理」走 openAppDetail：面板里的「重装」要用本页的安装器
-          // 上下文（onReinstall，保留 Qwen 那类应用自己的选项框）。
-          onManage: () => openAppDetail(a),
-        }),
-        ...siteInstallButtons(a),
-        ...uninstallButtons(a),
-        // 文档：**已安装**应用不再直接摆在卡片上（收进「⚙️ 管理」面板，见
-        // servicePanel.js 的 docLink）；未安装应用没有「管理」入口，文档
-        // 必须留在卡片上，否则用户就找不到这个应用的官方文档了。
-        !a.installed && a.docs_url
-          ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' })
-          : null,
-      ]),
-      // prefer_direct（人工实测子路径不可用）时，按钮下方给一行**始终可见**的
-      // 说明 —— 用户 2026-09-17 第四条抱怨：Miniflux / Syncthing / Alist / ddns-go
-      // 显示「⚠️ 打开」却没有任何解释。只有 ⚠️ 与 title 不够，不悬浮就看不到。
-      // 与服务行、管理面板同一份实现（servicePanel.subpathWarning）。
-      subpathWarning(a),
-    ]);
+      ],
+      // 卡片上只放**一句话**摘要 + 一段描述（两段不重复）。
+      // 完整说明仍然在 title 与「⚙️ 管理」面板里，不会丢。
+      text: (a.description && a.description !== subtitle) ? a.description : '',
+      textTitle: a.description || '',
+      actions,
+      // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
+      warning: installed ? portAccessWarning(a, { svc: svcOfApp(a) }) : null,
+    });
   }
 
-  // openButtons 已删除（2026-09-17）：卡片上的「打开 / 直链」现在直接调用
-  // servicePanel.js 的 openDirectActions —— 与「我的应用」行、管理面板同一份实现。
-  // 旧的这份按 /api/v1/market/proxies 的探测结果决定"打开=子路径还是端口直连"，
-  // 而那个探测不带面板会话（子路径返回 401 → proxy_ok 几乎恒为 false），
-  // 结果把 it-tools 这类应用的「打开」错变成了端口直连、子路径降级成「试试子路径」。
-  // 新规则见 openDirectActions 的说明：两颗按钮的语义固定，prefer_direct 只加警示。
+  // openDirectActions（旧的"打开 / 直链"两颗按钮）在卡片上已不再使用：
+  //   用户 2026-09-17 第六条要求卡片**只显示「打开」**，不支持子路径时改用
+  //   ip:端口打开并显示那句逐字提示 —— 判定收敛到 servicePanel.openTargetOf /
+  //   openOnlyAction / portAccessWarning。管理面板里仍然给「打开 + 直链」两颗
+  //   （这是上一轮用户明确要的），实现仍在 openDirectActions，一行未改。
 
   // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
   //
@@ -733,13 +884,14 @@ export function AppsView(content, ctx = {}) {
   // TTS 接收端的在服务管理 —— 同一个应用的能力被拆到了两个页面。
   //
   // 现在只有一个入口：**应用管理面板**（servicePanel.js）。卡片上给常用动作
-  // （打开/直链/启停/重启/刷新）+「⚙️ 管理」，「我的应用」行点开的也是同一个面板。
+  // （打开/启停/重启/刷新）+「⚙️ 管理」，「已安装」卡片点开的也是同一个面板。
   // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / ui.slug /
   // ui.console_only / 凭据接口是否为空），这里不再按应用 ID 写任何分支。
   //
-  // hasPanelUI 从 servicePanel.js 导入（与面板、「我的应用」行**同一条判据**）；
-  // openButtons 已删、openAppDetail 不再传 proxyState ——「打开 / 直链」的归属
-  // 由数据（ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关。
+  // hasPanelUI 从 servicePanel.js 导入（与面板、「已安装」卡片**同一条判据**）；
+  // openAppDetail 不传 proxyState ——卡片上那颗「打开」的地址由数据
+  // （ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关；
+  // 管理面板里的「打开 / 直链」仍由 openDirectActions 给（两颗都给）。
 
   // openAppDetail 打开「应用管理」面板 —— 市场卡片上唯一的"进面板"入口。
   //
@@ -956,7 +1108,7 @@ export function AppsView(content, ctx = {}) {
   //
   // 重装的确认框与调度都收进了 servicePanel.js 的 reinstallButton（管理面板里
   // 那颗「重装」）；本文件只提供"用哪套安装器"这一步（上面的 openInstaller）。
-  // 这样"重装"这个动作在两个入口（市场卡片 → 管理、「我的应用」行 → 管理）只有一份
+  // 这样"重装"这个动作在两个入口（市场卡片 → 管理、「已安装」卡片 → 管理）只有一份
   // 文案与一份确认语义，而应用自己的选项框仍然保留。
 
   // ---------- 安装前检查 ----------
@@ -1066,7 +1218,7 @@ export function AppsView(content, ctx = {}) {
   // 为什么要单独一个：load() 会先 clear(body) 再显示 loading 占位，
   // 任务刚结束时调用它，用户会看到整页闪一下白 —— 而他要的只是"状态更新"。
   // 注意两边都要重拉：装的/卸的东西同时改变市场条目的 installed 与服务记录，
-  // 只刷新市场会让「我的应用」停在旧状态（安装后不进清单）。
+  // 只刷新市场会让「已安装」停在旧状态（安装后不进清单）。
   async function refreshSilently() {
     await fetchAll();
     renderBody();

@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // userHomeDir 返回当前进程对应的真实用户家目录。
@@ -85,6 +87,47 @@ func (c *dockerClient) do(ctx context.Context, method, path string, query url.Va
 			resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return body, resp.StatusCode, nil
+}
+
+// doStream 发起一次 API 请求并返回**未读完的响应体**（调用方负责 Close）。
+//
+// 为什么需要它：POST /images/create 的响应是"边拉边推"的 JSON 进度流，
+// 用 do() 会把它整段攒在内存里、直到拉取结束才拿到 —— 用户在整个拉取期间
+// 看不到任何进展（正是任务中心要消灭的那种"请等待"）。错误状态码在这里
+// 就地读一小段并转成 error，避免调用方拿到一个只能读一次的 body。
+func (c *dockerClient) doStream(ctx context.Context, method, path string, query url.Values) (io.ReadCloser, int, error) {
+	u := "http://docker" + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("Docker API 不可达: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, resp.StatusCode, fmt.Errorf("Docker API 返回 %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp.Body, resp.StatusCode, nil
+}
+
+// imageExists 报告本地是否已有该镜像（GET /images/{ref}/json）。
+//
+// 用它决定"创建容器前要不要先拉镜像"：/containers/create 在本地没有镜像时
+// 直接报 No such image，**不会自己拉**，用户看到的是一句看不出所以然的失败；
+// 先拉再建才能把"这次为什么要等"讲清楚。
+//
+// 任何错误（404 不存在、socket 断了）都返回 false：让调用方走"尝试拉取"
+// 这条路，拉取失败时给出的错误才是真正有用的那条。
+func (c *dockerClient) imageExists(ctx context.Context, ref string) bool {
+	_, _, err := c.do(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil)
+	return err == nil
 }
 
 // dockerContainer 是 /containers/json 返回的条目（只取需要的字段）。
@@ -186,6 +229,10 @@ func (c *dockerClient) containerAction(ctx context.Context, name, action string,
 }
 
 // containerLogs 读取容器日志（stdout+stderr，带时间戳便于排障）。
+//
+// tail > 0 只取最后 tail 行；tail <= 0 表示**完整日志**（Docker 的 tail=all）。
+// 为什么需要"完整"：容器首次启动时打出的初始口令（File Browser 的 admin 密码
+// 就是这一类）往往在很久以前，只取尾部会把它翻没 —— 而那串口令只在日志里有。
 func (c *dockerClient) containerLogs(ctx context.Context, name string, tail int) (string, error) {
 	q := url.Values{}
 	q.Set("stdout", "1")
@@ -194,7 +241,7 @@ func (c *dockerClient) containerLogs(ctx context.Context, name string, tail int)
 	if tail > 0 {
 		q.Set("tail", fmt.Sprint(tail))
 	} else {
-		q.Set("tail", "200")
+		q.Set("tail", "all")
 	}
 	body, _, err := c.do(ctx, "GET", "/containers/"+url.PathEscape(name)+"/logs", q)
 	if err != nil {
@@ -308,41 +355,113 @@ func (c *dockerClient) listImages(ctx context.Context, all bool) ([]dockerImage,
 	return out, nil
 }
 
-// pullImage 拉取镜像。
+// dockerPullEvent 是 POST /images/create 进度流里的一行 JSON。
 //
-// 走 POST /images/create 并**读完整个响应流**：Docker 是边拉边推 JSON 进度，
-// 只发请求不读流的话连接会被中断，进度也就无从判断成败。
-// 因此这里把最后一条有意义的 status/error 摘出来给上层。
+// 字段名与 Docker API 一致：status/id/progressDetail/error/errorDetail。
+// 层进度（Downloading / Extracting 的字节数）就在 progressDetail 里 ——
+// 把它解析出来才能给用户"真的在下载"的证据，而不是一句"正在拉取"。
+type dockerPullEvent struct {
+	Status         string `json:"status"`
+	ID             string `json:"id"`
+	ProgressDetail struct {
+		Current int64 `json:"current"`
+		Total   int64 `json:"total"`
+	} `json:"progressDetail"`
+	Error       string `json:"error"`
+	ErrorDetail struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
+// formatDockerPullEvent 把一条进度事件渲染成一行人类可读文本。
+//
+// 注意**不丢原始 status**：Docker 会推 "Pulling fs layer"、"Download complete"、
+// "Digest: sha256:…"、"Status: Downloaded newer image for …" 这些没有进度的行，
+// 它们正是判断"卡在哪一步"的关键。
+func formatDockerPullEvent(ev dockerPullEvent) string {
+	status := strings.TrimSpace(ev.Status)
+	if status == "" {
+		return ""
+	}
+	line := status
+	if id := strings.TrimSpace(ev.ID); id != "" {
+		line = id + ": " + status
+	}
+	switch {
+	case ev.ProgressDetail.Total > 0:
+		cur, total := ev.ProgressDetail.Current, ev.ProgressDetail.Total
+		line += fmt.Sprintf(" %s/%s (%d%%)", humanBytes(cur), humanBytes(total), cur*100/total)
+	case ev.ProgressDetail.Current > 0:
+		line += " " + humanBytes(ev.ProgressDetail.Current)
+	}
+	return line
+}
+
+// pullImage 拉取镜像，并**逐行**把 Docker 的进度流推给任务中心。
+//
+// 走 POST /images/create 并边读边发：Docker 是边拉边推 JSON 事件，
+// 过去这里用 do() 把整段响应读进内存、只在结束时返回最后一条 status ——
+// 于是"拉取中"这个动作在任务日志里是一片空白，用户只能猜是不是卡住了。
+//
+// 返回值仍是"最后一条有意义的 status"（保持既有调用方与测试的语义），
+// 但完整过程已经实时外发；emit 在没有进度接收器（非任务路径）时是空操作。
 func (c *dockerClient) pullImage(ctx context.Context, ref string) (string, error) {
 	q := url.Values{}
 	q.Set("fromImage", ref)
-	body, code, err := c.do(ctx, "POST", "/images/create", q)
+
+	// 命令标签如实记录**实际发出的请求**：这里走 Docker API，不经过 CLI，
+	// 所以不写成 `docker pull`（用户复制去执行是另一回事）。
+	emit(ctx, tasks.LevelStep, "拉取镜像 "+ref)
+	emit(ctx, tasks.LevelCmd, "# POST /images/create fromImage="+ref)
+
+	body, _, err := c.doStream(ctx, http.MethodPost, "/images/create", q)
 	if err != nil {
-		return string(body), err
+		emit(ctx, tasks.LevelErr, err.Error())
+		return "", err
 	}
-	if code != http.StatusOK {
-		return string(body), fmt.Errorf("拉取镜像返回 %d", code)
-	}
-	// 响应是若干行 JSON，最后一行通常是 "Status: Downloaded newer image ..."
+	defer func() { _ = body.Close() }()
+
+	sc := bufio.NewScanner(body)
+	// 单行可能很大（层很多的镜像、被压缩成一行的 JSON）：默认 64KB 就报错，
+	// 报错会让我们在拉到一半时误判成功/失败。
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
 	last := ""
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
-		var ev struct {
-			Status string `json:"status"`
-			Error  string `json:"error"`
+		var ev dockerPullEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			// 不是 JSON 也照样给用户看：宁可多一行噪音，也不静默吞掉输出。
+			emit(ctx, tasks.LevelOut, line)
+			continue
 		}
-		if json.Unmarshal([]byte(line), &ev) == nil {
-			if ev.Error != "" {
-				return ev.Error, fmt.Errorf("拉取失败: %s", ev.Error)
+		if msg := ev.Error; msg != "" || ev.ErrorDetail.Message != "" {
+			if ev.ErrorDetail.Message != "" {
+				msg = ev.ErrorDetail.Message
 			}
-			if ev.Status != "" {
-				last = ev.Status
-			}
+			emit(ctx, tasks.LevelErr, "拉取失败: "+msg)
+			return msg, fmt.Errorf("拉取失败: %s", msg)
+		}
+		if text := formatDockerPullEvent(ev); text != "" {
+			emit(ctx, tasks.LevelOut, text)
+			last = ev.Status
 		}
 	}
+	// 流半路断掉（网络中断 / 被中断）**不能报成功**：
+	// 报成功会让用户以为镜像已经就位，后续创建容器时才发现没有。
+	if err := sc.Err(); err != nil {
+		if ctx.Err() != nil {
+			return last, fmt.Errorf("拉取被中断: %w", ctx.Err())
+		}
+		return last, fmt.Errorf("读取拉取进度失败: %w", err)
+	}
+	if last == "" {
+		last = "完成"
+	}
+	emit(ctx, tasks.LevelOK, "镜像 "+ref+" 拉取完成（"+last+"）")
 	return last, nil
 }
 
@@ -688,6 +807,11 @@ func (d *dockerDriver) Restart(ctx context.Context) error {
 }
 
 func (d *dockerDriver) Logs(ctx context.Context, lines int) (string, error) {
+	// 服务管理页的"日志"是固定行数预览；0/负数在这里兜底成 200，
+	// 把"tail<=0 = 完整日志"这个约定留给 Docker 页的显式请求（见 Manager.DockerContainerLogs）。
+	if lines <= 0 {
+		lines = 200
+	}
 	return d.client.containerLogs(ctx, d.target(), lines)
 }
 

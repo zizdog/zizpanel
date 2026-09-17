@@ -1,52 +1,54 @@
-// services.js —— 「应用」页「我的应用」Tab + 服务侧的共享组件。
+// services.js —— 「应用」页「已安装」Tab + 服务侧的共享组件。
 //
-// 2026-09-17 信息架构合并：原来的「服务管理」整页（ServicesView）变成了
-// 「应用 → 我的应用」Tab（renderMyApps，见下），导航里不再有单独的服务管理页。
+// 2026-09-17 信息架构（第二版，用户："服务管理/apps 合并"之后又要四个一级菜单）：
+// 原来的「服务管理」整页（ServicesView）现在是「应用 → 已安装」Tab
+// （renderInstalledApps，见下），导航里不再有单独的服务管理页。
 // 这个文件现在负责：
-//   - 我的应用清单（市场已安装条目 + 服务记录，合并去重，一行一条）
+//   - 已安装清单（市场已安装条目 + 服务记录，合并去重，**一张卡片一个应用**）
 //   - 共享组件：日志弹窗 / 注册服务表单 / 凭据 / 配置文件编辑器 / 应用专属功能入口
 //
 // 交互设计要点：
-//   - 每行一眼看清"这个应用在不在跑、健康不健康"
+//   - 每张卡片一眼看清"这个应用在不在跑、健康不健康"
 //   - 状态灯的颜色直接反映真实状态（面板每次都实时查询系统）
 //   - 纳管服务与托管服务在界面上有明确区分：前者不能卸载
+//   - 卡片上只给一颗「打开」（判定见 servicePanel.openTargetOf）；「直链」在管理面板里
 //   - 日志用 SSE 实时推送，不靠前端轮询
 
 import { api, sseServiceLogs } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
 // 依赖方向：apps.js → servicePanel.js ↔ services.js（两模块互取函数，但都只在
 // 渲染/点击时才调用，不在模块初始化时求值，所以没有初始化顺序问题）。
-// 「打开 / 直链」「启停 / 重启 / 刷新」「状态措辞」全部来自 servicePanel.js ——
-// 与市场卡片、管理面板**同一份实现**（用户 2026-09-17 的固定语义要求）。
-// mergeAppEntries 是这一轮合并新增的：按归一化 key 去重，逻辑只此一份。
+// 卡片外壳、唯一那颗「打开」、「启停 / 重启 / 刷新」「状态措辞」全部来自
+// servicePanel.js —— 与市场 / docker / 建站卡片、管理面板**同一份实现**。
+// mergeAppEntries（去重）与 appCardShell（卡片 DOM）逻辑都只此一份。
 import {
-  openServicePanel, openDirectActions,
-  mergeAppEntries, statusLine, subpathWarning, marketQuickActions,
+  openServicePanel, openOnlyAction, portAccessWarning, appCardShell,
+  mergeAppEntries, statusLine, marketQuickActions,
 } from './servicePanel.js';
 
-// 「我的应用」的状态筛选（全部 / 运行中 / 已停止 / 异常 / 仅健康检查失败）。
+// 「已安装」的状态筛选（全部 / 运行中 / 已停止 / 异常 / 仅健康检查失败）。
 // 放模块级：Tab 切换、动作后重画都不该把用户的筛选选择丢掉。
 let stateFilter = 'all';
 
 // ============================================================================
-//  「我的应用」Tab —— 合并后唯一的应用/服务清单（一行一条，去重）
+//  「已安装」Tab —— 市场已安装条目 + 服务记录，合并去重后一张卡片一个应用
 // ============================================================================
 //
-// 这一节原来是「服务管理」整页（ServicesView）。2026-09-17 用户要求把
-// 「服务管理 + 应用市场」合并成**一个「应用」版块**：导航只剩一项，页内两个 Tab。
-// 于是原来的整页变成了「我的应用」Tab 的内容，并补上三件它以前做不到的事：
+// 这一节原来是「服务管理」整页（ServicesView），合并那一轮变成页内 Tab（一行一条）。
+// 2026-09-17 用户要求恢复卡片展示、并把 Tab 改名为「已安装」：
 //   ① 把**市场里已安装的条目**与**面板服务记录**按归一化 key 合并去重
 //      （真机上 php81/82/83/84 各显示两行，同一个服务两组按钮）；
-//   ② 每行给出状态（复用 servicePanel.statusLine 的**同一套措辞**）、端口、
-//      健康检查结果，以及那组固定语义的按钮
-//      （打开 / 直链 / 停止(启动) / 重启 / ⟳ 刷新 / ⚙️ 管理）；
-//   ③ prefer_direct 的应用在按钮下方给一行**始终可见**的说明（用户第四条抱怨）。
+//   ② 每张卡片给出状态（复用 servicePanel.statusLine 的**同一套措辞**）、端口、
+//      健康检查结果，以及常用动作
+//      （打开 / 停止(启动) / 重启 / ⟳ 刷新 / ⚙️ 管理）；
+//   ③ 卡片上**只给「打开」**（不支持子路径时指向端口，并显示那句逐字提示）；
+//      「直链」仍然在「⚙️ 管理」面板里 —— 这是上一轮用户明确要的，不能删。
 //
 // 数据由调用方（apps.js 的 AppsView）一次拉好递进来，本函数自己不发起请求：
 //   opts.market    GET /api/v1/market 的**整个响应**（取 .list 里已安装/已纳管的）
 //   opts.list      GET /api/v1/services?health=1 的 list（服务记录）
 //   opts.onReload  需要整体重拉时的回调（注册服务后、纳管/取消纳管后等）
-export function renderMyApps(container, opts = {}) {
+export function renderInstalledApps(container, opts = {}) {
   const marketList = () => (opts.market && opts.market.list) || [];
   const svcList = () => (Array.isArray(opts.list) ? opts.list : []);
   const reload = () => {
@@ -69,13 +71,13 @@ export function renderMyApps(container, opts = {}) {
   }
 
   const toolbar = h('div.card-head', [
-    h('h3', { text: '我的应用' }),
+    h('h3', { text: '已安装' }),
     h('div.spacer'),
-    h('div#myapps-toolbar', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
+    h('div#installed-toolbar', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
   ]);
   const listBox = h('div');
   appendAll(container, h('div.card', [toolbar, h('div.card-body', [listBox])]));
-  const toolbarBox = toolbar.querySelector('#myapps-toolbar');
+  const toolbarBox = toolbar.querySelector('#installed-toolbar');
 
   function renderAll() { renderToolbar(); renderRows(); }
 
@@ -117,10 +119,10 @@ export function renderMyApps(container, opts = {}) {
       }),
       h('span.pill', {
         text: `共 ${rows.length} 个应用`,
-        title: '市场已安装条目 + 服务记录合并去重后的一行一条数',
+        title: '市场已安装条目 + 服务记录合并去重后的卡片数（一个应用一张卡片）',
       }),
       // 可点的：用户看到"有失败"的第一反应是"哪些？怎么办？"，
-      // 所以点它直接筛出失败的服务（行里还有具体原因与下一步）。
+      // 所以点它直接筛出失败的服务（卡片里还有具体原因与下一步）。
       unhealthy > 0 ? h('button.btn.btn-sm.btn-danger', {
         text: `⚠ ${unhealthy} 个健康检查失败`,
         title: '点这里只看失败的服务',
@@ -160,15 +162,17 @@ export function renderMyApps(container, opts = {}) {
       ]));
       return;
     }
-    appendAll(listBox, h('div', {
-      style: { display: 'flex', flexDirection: 'column', gap: '8px' },
-    }, rows.map(appRow)));
+    // 卡片网格（与市场 / docker / 建站 Tab 同一套：.grid.grid-3 + appCardShell）。
+    appendAll(listBox, h('div#installed-grid.grid.grid-3', rows.map(installedCard)));
   }
 
-  // appRow 渲染**一行** —— 这一行同时握着市场条目（m）与服务记录（s），
-  // 所以「打开 / 直链 / 文档 / 安装器语义」与「状态 / 配置路径 / 日志 / plist」
-  // 不会再分散在两个页面、两组按钮里。
-  function appRow(e) {
+  // installedCard 渲染**一张卡片** —— 这张卡片同时握着市场条目（m）与服务记录
+  // （s），所以「打开 / 安装器语义」与「状态 / 配置路径 / 日志 / plist」不会再
+  // 分散在两个页面、两组按钮里。
+  //
+  // 卡片结构走 servicePanel.appCardShell（与市场 / docker / 建站 Tab 同一套 DOM，
+  // 用户要求"恢复之前的卡片展示样式"）。
+  function installedCard(e) {
     const m = e.market;
     const s = e.svc;
     const line = statusLine(s && s.state, m);
@@ -177,13 +181,19 @@ export function renderMyApps(container, opts = {}) {
     const icon = (s && s.icon) || (m && m.icon) || '🧩';
     const port = (s && s.port) || (m && m.port) || 0;
     const subtitle = (m && m.summary) || (s && s.description) || '';
+    // 卡片上的长描述只在与 summary 不同时才渲染（否则同一句话出现两遍）。
+    const longText = (m && m.description) || '';
+    const text = longText && longText !== subtitle ? longText : '';
 
-    // 固定语义按钮组：打开 / 直链（openDirectActions）+ 停止(启动)/重启/⟳ 刷新
-    // （serviceActions，经 marketQuickActions 统一给）+ ⚙️ 管理。
+    // 卡片上的动作组：**只有一颗「打开」**（用户 2026-09-17："只显示打开，
+    // 不显示直链"）+ 停止(启动)/重启/⟳ 刷新（serviceActions，经 marketQuickActions
+    // 统一给）+ ⚙️ 管理。
+    // 「打开」的判定在 servicePanel.openTargetOf：支持子路径走子路径，不支持走
+    // 端口直连；「直链」仍然住在「⚙️ 管理」面板里，卡片上不再出现。
     // 启停判据由 marketQuickActions 决定：有服务记录就一定给，否则看
     // adopted / service_in_launchd（跟市场卡片完全同一条规则）。
     const actions = [
-      ...openDirectActions(m, { svc: s }),
+      ...openOnlyAction(m, { svc: s }),
       ...marketQuickActions(m, {
         svc: s,
         onDone: afterAction,
@@ -205,9 +215,9 @@ export function renderMyApps(container, opts = {}) {
         : null,
       s && s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
       // 装了但面板里没有服务记录（孤儿态）时 statusLine 已经如实说「未纳管」，
-      // 这里不再补第二颗同义 pill —— 合并后的行本来就要短，重复说两遍只会更乱。
+      // 这里不再补第二颗同义 pill —— 卡片本来就要短，重复说两遍只会更乱。
       // 去重的证据：同一 launchd 服务在面板里有多条记录时，这里如实说出合并了几条，
-      // 免得用户以后在数据库里看到两条记录却不知道为什么界面只有一行。
+      // 免得用户以后在数据库里看到两条记录却不知道为什么界面只有一张卡片。
       s && Array.isArray(s.merged_from) && s.merged_from.length
         ? h('span.pill', {
           text: '已合并 ' + s.merged_from.length + ' 条记录',
@@ -216,50 +226,37 @@ export function renderMyApps(container, opts = {}) {
         : null,
     ];
 
-    return h('div', {
+    // 健康检查失败：把"是什么、为什么、怎么办"摆出来（与旧服务卡片同一套话术）。
+    // 「重新检查」不再单独给一颗按钮 —— 卡片上的「⟳ 刷新」就是重新查这一条。
+    const extra = (health.checked && !health.ok)
+      ? [h('div', { style: { fontSize: '11.5px', color: 'var(--danger)' } }, [
+        h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
+        h('button.btn.btn-sm', {
+          style: { marginTop: '4px' },
+          text: '改检查地址',
+          title: '改完再点这张卡片上的「⟳ 刷新」重新检查',
+          onclick: () => newServiceModal(reload, s),
+        }),
+      ])]
+      : [];
+
+    return appCardShell({
+      icon,
+      name,
+      subtitle,
+      pills,
+      text,
+      extra,
+      actions,
+      // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
+      warning: portAccessWarning(m, { svc: s }),
       dataset: { appKey: e.key, appName: name },
-      style: {
-        background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
-        padding: '12px 14px', display: 'flex', gap: '12px', alignItems: 'flex-start', flexWrap: 'wrap',
-      },
-    }, [
-      h('div', {
-        style: {
-          width: '34px', height: '34px', borderRadius: '9px', display: 'grid', placeItems: 'center',
-          background: 'var(--panel)', fontSize: '18px', flex: '0 0 auto',
-        },
-        text: icon,
-      }),
-      h('div', { style: { flex: '1 1 260px', minWidth: '220px' } }, [
-        h('div', { style: { fontWeight: '620', fontSize: '14px' }, text: name }),
-        subtitle ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '2px' }, text: subtitle }) : null,
-        h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' } }, pills),
-        // 健康检查失败：把"是什么、为什么、怎么办"摆出来（与旧服务卡片同一套话术）。
-        // 「重新检查」不再单独给一颗按钮 —— 这一行的「⟳ 刷新」就是重新查这一条。
-        (health.checked && !health.ok)
-          ? h('div', { style: { marginTop: '6px', fontSize: '11.5px', color: 'var(--danger)' } }, [
-            h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
-            h('button.btn.btn-sm', {
-              style: { marginTop: '4px' },
-              text: '改检查地址',
-              title: '改完再点这一行的「⟳ 刷新」重新检查',
-              onclick: () => newServiceModal(reload, s),
-            }),
-          ])
-          : null,
-      ]),
-      h('div', {
-        style: { display: 'flex', gap: '5px', flexWrap: 'wrap', justifyContent: 'flex-end', flex: '1 1 320px' },
-      }, [
-        ...actions,
-        subpathWarning(m),
-      ]),
-    ]);
+    });
   }
 
   // ---------- 扫描可纳管服务（原服务管理页的扫描弹窗，功能一字未减） ----------
   //
-  // 2026-09-17：合并后它挂在「我的应用」的工具条上（用户要求"可纳管放进我的应用"）。
+  // 2026-09-17：合并后它挂在「已安装」Tab 的工具条上（可纳管属于"本机已有的服务"）。
   // 纳管成功后 onDone(afterAction) 会重画这一屏。
   async function openAdoptable(onDone) {
     const box = h('div', [

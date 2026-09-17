@@ -113,6 +113,14 @@ exit 0
 func TestInstallSkipsWhenAppAlreadyInstalled(t *testing.T) {
 	for _, c := range realMachineAlreadyInstalled() {
 		t.Run(c.id, func(t *testing.T) {
+			// compose 条目（uptime-kuma）自 2026-09-17 起是"推荐 Docker 项目"：
+			// 面板**不再安装**它们，Install 会在最前面明确拒绝（见 install.go）。
+			// 所以"重复安装 → 已安装跳过"这个场景对它不再适用；它的
+			// Preflight 语义仍由 TestPreflightPortHeldByOwnServiceIsNotAConflict 覆盖，
+			// 幂等判定本身由 TestComposeIdempotencyStillHolds 用合成条目覆盖。
+			if app, ok := FindApp(c.id); ok && app.DockerReference {
+				t.Skip("推荐 Docker 项目不再由面板安装（Install 明确拒绝）")
+			}
 			m, repo := sandboxIdempotentManager(t)
 			ctx := context.Background()
 
@@ -159,6 +167,58 @@ func TestInstallSkipsWhenAppAlreadyInstalled(t *testing.T) {
 				t.Errorf("重复安装不该产生重复记录，实际 %d 条", len(list))
 			}
 		})
+	}
+}
+
+// TestComposeIdempotencyStillHolds 保住"重复安装幂等"里 compose 那一支的覆盖。
+//
+// 目录里所有 compose 条目现在都是推荐项目（不再安装），所以这条路走不到
+// Install；但 installedSkipResult 是 brew / compose / tarball 轨**共用**的判定，
+// 它的通用语义不能因为"没有可安装的 compose 条目"就失去测试。这里用合成条目直测。
+func TestComposeIdempotencyStillHolds(t *testing.T) {
+	m, repo := sandboxIdempotentManager(t)
+	ctx := context.Background()
+
+	app := App{ID: "demo-compose", Name: "Demo Compose", Kind: KindCompose, Port: 3001}
+	if err := repo.Create(ctx, &Service{
+		Name: app.ID, DisplayName: app.Name, Kind: KindCompose, Port: app.Port, Managed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, done := m.installedSkipResult(ctx, app)
+	if !done {
+		t.Fatal("注册表里有记录时必须判成已安装（幂等跳过），而不是继续走安装")
+	}
+	if !strings.Contains(res.Message, "已经装过") || !strings.Contains(res.Message, "跳过") {
+		t.Errorf("终态说明要写明已安装/跳过，实际 %q", res.Message)
+	}
+	if !strings.Contains(strings.Join(res.Steps, "\n"), "没有重复执行安装命令") {
+		t.Errorf("步骤里要说明没有重复安装，实际步骤：\n%s", strings.Join(res.Steps, "\n"))
+	}
+	// 没有记录时必须继续装（证明上面的 done 不是"永远 true"）。
+	m2, _ := sandboxIdempotentManager(t)
+	if _, done := m2.installedSkipResult(ctx, app); done {
+		t.Error("没有任何记录时不该判成已安装")
+	}
+}
+
+// TestDockerReferenceInstallRejected 锁住产品决策：推荐 Docker 项目**不可安装**。
+//
+// web 层返回 4xx（见 api_services.go 的 handleMarketInstall），这里锁 services 层
+// 的纵深防御 —— Install() 是导出方法，任何直调都必须被拒绝，而不是偷偷跑 compose。
+func TestDockerReferenceInstallRejected(t *testing.T) {
+	m, _ := sandboxIdempotentManager(t)
+	ctx := context.Background()
+	for _, a := range Catalog() {
+		if !a.DockerReference {
+			continue
+		}
+		if _, err := m.Install(ctx, a.ID); err == nil {
+			t.Errorf("%s 是推荐 Docker 项目，Install 必须返回明确错误，实际成功", a.ID)
+		} else if !strings.Contains(err.Error(), "推荐") {
+			t.Errorf("%s 的拒绝错误要写清「这是推荐项目、不代安装」，实际：%v", a.ID, err)
+		}
 	}
 }
 

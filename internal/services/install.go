@@ -54,13 +54,26 @@ type InstallResult struct {
 //
 // 支持两种安装方式：
 //   - KindNative + BrewFormula：brew install 后交给 brew services 托管
-//   - KindCompose：写 compose 文件后 docker compose up -d
+//   - 面板自研安装器（PanelInstaller 非空）：web 层分流到各自的安装器
+//
+// **KindCompose 不再走这里**：Docker 类条目自 2026-09-17 起都是
+// DockerReference（推荐项目），面板只提供预配置 compose 参考文件、不代安装；
+// 误调到这里会立刻返回明确错误（见下面的 DockerReference 判断）。
 //
 // 纳管类应用（AdoptLabel 非空）不走这里，见 AdoptApp。
 func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, error) {
 	app, ok := FindApp(appID)
 	if !ok {
 		return nil, fmt.Errorf("应用市场中找不到 %s", appID)
+	}
+	// 推荐 Docker 项目不安装（用户 2026-09-17 的要求）。
+	//
+	// web 层已经在 handleMarketInstall 里返回 4xx 拒绝，这里再挡一次是**纵深防御**：
+	// Install() 是导出方法，任务中心、未来的调用方、甚至测试都可能直接调它 ——
+	// 只在 HTTP 层挡，等于把这条产品决策挂在"调用方一定会走那个 handler"上。
+	if app.DockerReference {
+		return nil, fmt.Errorf("「%s」是面板推荐的 Docker 项目，面板不再代你安装；"+
+			"请取用预配置的 compose 文件（应用 → docker 页可复制）自行运行", app.Name)
 	}
 	if app.AdoptLabel != "" {
 		return m.AdoptApp(ctx, appID)

@@ -73,6 +73,11 @@ func (m *Manager) PlanUninstall(ctx context.Context, appID string) UninstallPlan
 var legacyComposeImages = map[string][]string{
 	// 2026-09-17 下架（用户已手动卸载并明确要求移除）。
 	"n8n": {"n8nio/n8n:latest"},
+	// 2026-09-17 下架（用户明确要求删除条目）：**条目下架 != 卸载**，
+	// 这台机器上两个应用都还装着。卸载计划必须仍然说得出它们的镜像名，
+	// 否则用户删完 compose 目录后镜像还占着几百 MB 而计划里一个字都不提。
+	"minio":     {"quay.io/minio/minio:latest"},
+	"portainer": {"portainer/portainer-ce:lts"},
 }
 
 // composeImagesForPlan 返回卸载计划里要提示的镜像列表（可能为空）。

@@ -18,10 +18,15 @@
 //     所以 POST 立刻返回 task_id，进度（镜像层下载）在任务中心里实时看。
 //     关掉窗口不影响部署，随时能从顶栏「任务中心」重新打开。
 //     stop / restart 是秒级动作，仍然同步返回。
+//
+//  5. **部署完成给出「日志」入口**。很多镜像的初始登录信息只打在容器日志里
+//     （File Browser 首次启动会随机生成 admin 口令），所以部署结束的弹窗直接
+//     列出本项目下的容器，每个都能一键打开完整日志 —— 用户不必猜测去哪找。
 
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
 import { taskCenter } from './tasks.js';
+import { openContainerLogs } from './docker-containers.js';
 
 // 与后端 validComposeName 保持一致：字母数字与 . _ -，不以点开头。
 // 前端先拦一道只是为了让用户更早看到问题；权威校验在后端。
@@ -212,8 +217,14 @@ export async function renderCompose(container, ctx) {
         target: 'compose:' + name,
         title: `部署 Docker Compose 项目 ${name}`,
         start: () => api.dockerComposeAction(name, 'up'),
-        // 部署成功后项目会被登记到服务管理，列表要跟着刷新
-        onDone: async () => { await load(); ctx.refresh && ctx.refresh(); },
+        // 部署成功后项目会被登记到服务管理，列表要跟着刷新；
+        // 再弹一个"部署完成"结果：列出容器并给每个容器一个「日志」入口
+        //（初始登录信息只在容器日志里，例如 File Browser 的随机 admin 口令）。
+        onDone: async (m) => {
+          await load();
+          ctx.refresh && ctx.refresh();
+          showDeployResult(name, m);
+        },
       });
       return;
     }
@@ -228,6 +239,52 @@ export async function renderCompose(container, ctx) {
       showOutput(name, action, e.message);
       toast(`${name}：${action} 失败`, 'err');
     }
+  }
+
+  /**
+   * showDeployResult 在部署成功后列出项目下的容器，并给每个容器一个「日志」入口。
+   *
+   * 为什么需要它（用户原话："很多 docker 项目的登录信息都在日志里！如 filebrowser"）：
+   * File Browser 首次启动会把随机生成的 admin 口令打进容器日志，而用户在 Docker 页
+   * 点完「部署」不会想到去别处翻日志，于是永远登不进去。容器列表来自后端部署任务的
+   * 结果（按 com.docker.compose.project 标签筛的），所以不依赖"猜容器名"。
+   *
+   * 没有容器信息（任务失败 / 列容器失败 / compose 里没有服务）时**什么都不弹**：
+   * 弹一个空表格只会让人以为部署没生效（任务窗本来就会如实报成功或失败）。
+   */
+  function showDeployResult(name, meta) {
+    const r = (meta && meta.result) || {};
+    const containers = Array.isArray(r.containers) ? r.containers : [];
+    if (!containers.length) return;
+
+    const rows = containers.map((c) => h('tr', [
+      h('td', [
+        h('div', { style: { fontWeight: '600' }, text: c.name || '—' }),
+        h('div.hint', { text: c.status || '' }),
+      ]),
+      h('td', [h('span', { text: c.image || '—', title: c.image || '' })]),
+      h('td', [h('span.pill' + (String(c.state) === 'running' ? '.ok' : ''), { text: c.state || 'unknown' })]),
+      h('td', [h('button.btn.btn-ghost.btn-sm', { text: '日志', onclick: () => openContainerLogs(c.name) })]),
+    ]));
+
+    const dlg = modal({
+      title: `部署完成 · ${name}`,
+      wide: true,
+      body: h('div', [
+        h('div.hint', {
+          style: { marginBottom: '10px' },
+          text: '下面这些容器属于本项目。首次启动生成的初始登录信息（例如 File Browser 的 admin 随机口令）'
+            + '就打在容器日志里，点「日志」看完整日志即可。',
+        }),
+        h('table.table', [
+          h('thead', [h('tr', [
+            h('th', { text: '容器' }), h('th', { text: '镜像' }), h('th', { text: '状态' }), h('th', { text: '日志' }),
+          ])]),
+          h('tbody', rows),
+        ]),
+      ]),
+      footer: [h('button.btn.btn-primary', { text: '关闭', onclick: () => dlg.close() })],
+    });
   }
 
   /** showOutput 把 compose 的原始输出显示出来。 */

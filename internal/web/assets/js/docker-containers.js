@@ -2,16 +2,25 @@
 //
 // 这是 Docker 页最重要的分区：日常要做的就是"看看现在跑着什么、起停一下、翻日志"。
 //
-// 两个刻意的设计：
+// 四个刻意的设计：
 //
 //  1. **默认显示全部容器**（含已停止的）。只看运行中的会让人以为"我的容器不见了"，
 //     而实际最常见的困惑正是"我创建的那个容器怎么没了"（其实是退出了）。
 //
 //  2. **日志用抽屉而不是新页面**：排查问题时需要在列表和日志之间反复看，
 //     弹一个盖住全屏的 modal 会让人没法对照容器列表。
+//
+//  3. **日志默认读"完整日志"**，并且能自动刷新。很多镜像的初始登录信息
+//     （File Browser 的 admin 随机口令就是典型）**只在首次启动时打进日志一次**，
+//     只取尾部几百行会把它翻没，用户就永远登不进去。openContainerLogs 因此
+//     导出给 docker-compose.js 的"部署完成"结果复用，不另写一套弹窗。
+//
+//  4. **创建容器走任务中心**：本地没有镜像时后端会先拉镜像，
+//     这一步可能几分钟，层进度必须逐行可见，也不能被"用户刷新页面"杀掉。
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll, bytes } from './ui.js';
+import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
+import { taskCenter } from './tasks.js';
 
 // statePill 把容器状态映射成一个带颜色的 pill。
 //
@@ -104,7 +113,7 @@ export async function renderContainers(container, ctx) {
         actions.append(h('button.btn.btn-primary.btn-sm', { text: '启动', onclick: () => act(name, 'start') }));
       }
       actions.append(
-        h('button.btn.btn-ghost.btn-sm', { text: '日志', onclick: () => showLogs(name) }),
+        h('button.btn.btn-ghost.btn-sm', { text: '日志', onclick: () => openContainerLogs(name) }),
         h('button.btn.btn-ghost.btn-sm', { text: '详情', onclick: () => showDetail(name) }),
         h('button.btn.btn-danger.btn-sm', { text: '删除', onclick: () => remove(name, running) }),
       );
@@ -166,43 +175,6 @@ export async function renderContainers(container, ctx) {
     } catch (e) {
       toast(e.message, 'err');
     }
-  }
-
-  async function showLogs(name) {
-    const box = h('pre', {
-      style: {
-        maxHeight: '60vh', overflow: 'auto', margin: '0', padding: '10px',
-        background: 'var(--bg-soft, rgba(127,127,127,.08))', borderRadius: '6px',
-        fontSize: '12px', lineHeight: '1.55', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-      },
-      text: '正在读取日志…',
-    });
-
-    const m = modal({
-      title: `日志 · ${name}`,
-      wide: true,
-      body: h('div', [
-        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' } }, [
-          h('span.hint', { text: '按需读取，不实时跟随；点「重新读取」刷新。' }),
-        ]),
-        box,
-      ]),
-      footer: [
-        h('button.btn.btn-ghost', { text: '重新读取', onclick: () => loadLogs() }),
-        h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() }),
-      ],
-    });
-
-    async function loadLogs() {
-      box.textContent = '正在读取日志…';
-      try {
-        const res = await api.dockerContainerLogs(name, 500);
-        box.textContent = (res && res.logs) ? res.logs : '（没有日志输出）';
-      } catch (e) {
-        box.textContent = '读取失败：' + e.message;
-      }
-    }
-    loadLogs();
   }
 
   async function showDetail(name) {
@@ -318,16 +290,24 @@ export async function renderContainers(container, ctx) {
         image.focus();
         return;
       }
-      try {
-        const res = await api.dockerContainerCreate(spec);
-        toast(`已创建 ${spec.name || shortID(res && res.id)}${spec.auto_start ? ' 并已启动' : ''}`, 'ok');
-        m.close();
-        await load();
-        ctx.refresh && ctx.refresh();
-      } catch (e) {
-        // 后端在"创建成功但启动失败"时会带上这个提示，此时容器是存在的
-        toast(e.message, 'err');
-      }
+      // 创建走任务中心：本地没有这个镜像时后端会先拉取（可能几分钟），
+      // 拉取的层进度要逐行可见，也不能因为用户刷新页面被杀掉。
+      // start() 只等"任务提交"这一步（后端立刻回 202），不等任务跑完；
+      // 拿不到 task_id（例如参数被 400 拦下）就**不关表单**，用户还能改完重试。
+      const id = await taskCenter.start({
+        kind: 'docker-container-create',
+        target: 'docker:container:' + (spec.name || spec.image),
+        title: '创建容器 ' + (spec.name || spec.image),
+        start: () => api.dockerContainerCreate(spec),
+        onDone: async (m) => {
+          if (m && m.status === 'succeeded') {
+            toast(`已创建 ${spec.name || (m.result && m.result.id) || spec.image}${spec.auto_start ? ' 并已启动' : ''}`, 'ok');
+          }
+          await load();
+          ctx.refresh && ctx.refresh();
+        },
+      });
+      if (id) m.close();
     }
   }
 
@@ -344,4 +324,176 @@ export async function renderContainers(container, ctx) {
   );
 
   await load();
+}
+
+// ---------------------------------------------------------------------------
+//  容器日志弹窗
+//
+//  导出是因为 docker-compose.js 的"部署完成"结果也要用同一套弹窗：
+//  部署完直接点容器看日志，不用先切到「容器」分区再找。
+// ---------------------------------------------------------------------------
+
+// LOG_TAIL_LINES 是"普通模式"一次读的行数：够一次排障看，又不会把整份日志塞进 DOM。
+const LOG_TAIL_LINES = 2000;
+
+// LOG_FOLLOW_MS 是自动刷新的间隔：docker 日志的常见节奏（秒级）够用。
+const LOG_FOLLOW_MS = 2000;
+
+/** diffTail 返回 newTail 相对 oldTail 新增的行；对不齐时返回 null。 */
+function diffTail(oldTail, newTail) {
+  const oldLines = String(oldTail == null ? '' : oldTail).replace(/\n+$/, '').split('\n');
+  const newLines = String(newTail == null ? '' : newTail).replace(/\n+$/, '').split('\n');
+  if (!oldLines[0] && oldLines.length === 1) return newLines.join('\n');
+  if (!newLines[0] && newLines.length === 1) return '';
+  const anchor = oldLines[oldLines.length - 1];
+  if (!anchor) return null;
+  // 从后往前找锚点：日志里重复行很常见，取最后一次出现的位置才不会漏行。
+  for (let i = newLines.length - 1; i >= 0; i--) {
+    if (newLines[i] === anchor) return newLines.slice(i + 1).join('\n');
+  }
+  return null;
+}
+
+/** tailOf 取一段日志的尾部窗口（自动刷新时按行对齐用）。 */
+function tailOf(text) {
+  const lines = String(text == null ? '' : text).replace(/\n+$/, '').split('\n');
+  return lines.slice(-400).join('\n');
+}
+
+/**
+ * openContainerLogs(name) 打开某个容器的日志。
+ *
+ * 三个刻意的取舍：
+ *   · **打开就是完整日志**（后端 lines=0 → Docker 的 tail=all）。初始口令这类
+ *     "只在首次启动出现一次"的信息在最早的几行里，只取尾部会把它翻没。
+ *     日志特别多的容器可以勾「仅看最近 2000 行」少传一些。
+ *   · **自动刷新是显式开关**（默认关）：每 2 秒拉一次尾部并**追加**新增行，
+ *     用户往上翻时不会被拽回底部。
+ *   · 对不齐（日志刷得太快、尾部窗口滚过去了）时**如实说**并回退成"显示最近 300 行"，
+ *     绝不拼出一份看起来连续、其实缺行的日志。
+ */
+export function openContainerLogs(name) {
+  let full = true;     // true = 完整日志（Docker tail=all）
+  let follow = false;  // 自动刷新
+  let timer = null;
+  let lastTail = '';   // 上一次的尾部文本，用于算"新增了哪几行"
+  let disposed = false;
+
+  const box = h('pre', {
+    style: {
+      maxHeight: '60vh', overflow: 'auto', margin: '0', padding: '10px',
+      background: 'var(--bg-soft, rgba(127,127,127,.08))', borderRadius: '6px',
+      fontSize: '12px', lineHeight: '1.55', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+    },
+    text: '正在读取日志…',
+  });
+  const status = h('span.hint', { text: '' });
+  const followBox = h('input', { type: 'checkbox' });
+  const tailOnlyBox = h('input', { type: 'checkbox' });
+
+  const m = modal({
+    title: `日志 · ${name}`,
+    wide: true,
+    body: h('div', [
+      h('div', { style: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } }, [
+        h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '13px' } }, [
+          followBox, h('span', { text: '自动刷新（每 2 秒追加新行）' }),
+        ]),
+        h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '13px' } }, [
+          tailOnlyBox, h('span', { text: `仅看最近 ${LOG_TAIL_LINES} 行` }),
+        ]),
+        status,
+      ]),
+      h('div.hint', {
+        style: { marginBottom: '8px' },
+        text: '默认读完整日志：首次启动生成的初始登录信息（例如 File Browser 的 admin 随机口令）就在最早的几行里。'
+          + '日志是纯文本、可能含口令，截图或转发前请留意；完整日志最多显示 8MB，超出部分会被截断。',
+      }),
+      box,
+    ]),
+    footer: [h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() })],
+    onClose: () => { disposed = true; stopFollow(); },
+  });
+
+  function stickToBottom() {
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function stopFollow() {
+    follow = false;
+    followBox.checked = false;
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  async function load({ keepFollow } = {}) {
+    status.textContent = '正在读取…';
+    try {
+      // lines=0 是后端约定的"要完整日志"（Docker 的 tail=all）。
+      const res = await api.dockerContainerLogs(name, full ? 0 : LOG_TAIL_LINES);
+      if (disposed) return;
+      const text = (res && res.logs) ? res.logs : '（没有日志输出）';
+      box.textContent = text;
+      lastTail = tailOf(text);
+      const n = String(text).split('\n').length;
+      status.textContent = full
+        ? `完整日志 · ${n} 行（最多 8MB）`
+        : `最近 ${LOG_TAIL_LINES} 行 · 共 ${n} 行`;
+      stickToBottom();
+    } catch (e) {
+      if (disposed) return;
+      box.textContent = '读取失败：' + e.message;
+      status.textContent = '读取失败';
+      stopFollow();
+      return;
+    }
+    // 首屏/手动切换时不自动开启跟随：用户没点开关就不该有定时器在跑。
+    if (!keepFollow) stopFollow();
+  }
+
+  async function poll() {
+    if (disposed || !follow) return;
+    let res;
+    try {
+      res = await api.dockerContainerLogs(name, 300);
+    } catch {
+      status.textContent = '自动刷新失败（连接不上面板？）';
+      return;
+    }
+    if (disposed || !follow) return;
+    const text = (res && res.logs) ? res.logs : '';
+    const added = diffTail(lastTail, text);
+    if (added === null) {
+      box.textContent = text || '（没有日志输出）';
+      lastTail = tailOf(text);
+      status.textContent = '日志刷得太快，尾部对不上；已改为显示最近 300 行';
+      stickToBottom();
+      return;
+    }
+    lastTail = tailOf(text);
+    if (added) {
+      const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+      box.textContent += (box.textContent && !box.textContent.endsWith('\n') ? '\n' : '') + added;
+      if (atBottom) stickToBottom();
+    }
+    status.textContent = `自动刷新中 · ${box.textContent.split('\n').length} 行`;
+  }
+
+  followBox.addEventListener('change', () => {
+    follow = followBox.checked;
+    if (follow) {
+      if (!timer) timer = setInterval(poll, LOG_FOLLOW_MS);
+      status.textContent = '自动刷新中…';
+      poll();
+    } else {
+      stopFollow();
+    }
+  });
+
+  // 「仅看最近 N 行」：大日志不想一次性传完时的退路（勾上就重读）。
+  tailOnlyBox.addEventListener('change', () => {
+    full = !tailOnlyBox.checked;
+    load({ keepFollow: follow });
+  });
+
+  load();
 }

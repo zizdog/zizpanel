@@ -3,8 +3,10 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -106,7 +108,23 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 						registered = true
 					}
 				}
-				return map[string]any{"name": name, "action": "up", "output": out, "registered": registered}, nil
+
+				// 把项目下的容器列出来（前端据此给每个容器一个「日志」入口），
+				// 并从刚启动的容器日志里捞"首次启动随机生成的账号口令"——
+				// File Browser 这类镜像的初始口令只在日志里，用户点完部署不会
+				// 想到去翻日志，于是永远登不进去（用户原话见任务说明）。
+				// 口令只进结果的 credentials（唯一允许出现明文的地方），日志里不写。
+				containers := mgr.DockerComposeProjectContainers(ctx, name)
+				if len(containers) > 0 {
+					services.EmitProgress(ctx, tasks.LevelStep,
+						fmt.Sprintf("项目 %s 下共 %d 个容器：%s", name, len(containers), containerNames(containers)))
+				}
+				creds := scrapeStartupCredentials(ctx, mgr, containers)
+
+				return map[string]any{
+					"name": name, "action": "up", "output": out, "registered": registered,
+					"containers": containers, "credentials": creds,
+				}, nil
 			})
 		return
 	}
@@ -121,6 +139,44 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 	s.audit(r, "docker_compose_"+action, name, "成功", true, "")
 
 	ok(w, map[string]any{"name": name, "action": action, "output": out})
+}
+
+// startupCredWait 是"等容器把首启日志打出来"的时长。
+//
+// 与 install.go 的 scrapeGeneratedCredentials 同因：compose up -d 返回时容器才刚起来，
+// 初始口令那一行可能还没落盘。1.5 秒足够，对一次动辄几分钟的部署可以忽略。
+const startupCredWait = 1500 * time.Millisecond
+
+// scrapeStartupCredentials 在部署成功后等一小会儿，再扫容器日志找初始口令。
+//
+// 没有运行中的容器就**不等**（没有日志可扫，白等 1.5 秒）。
+// 扫描失败不影响部署结论：这是附加信息，不是部署成功与否的一部分。
+func scrapeStartupCredentials(ctx context.Context, mgr *services.Manager, containers []services.DockerProjectContainer) []services.Credential {
+	running := false
+	for _, c := range containers {
+		if c.State == "running" {
+			running = true
+			break
+		}
+	}
+	if !running {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-time.After(startupCredWait):
+	}
+	return mgr.DockerScrapeStartupCredentials(ctx, containers)
+}
+
+// containerNames 把容器列表拼成一行（日志与提示里用）。
+func containerNames(list []services.DockerProjectContainer) string {
+	names := make([]string, 0, len(list))
+	for _, c := range list {
+		names = append(names, c.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
 // handleDockerComposeDelete 删除项目目录（会先 down，避免留下孤儿容器）。

@@ -258,6 +258,23 @@ export function mergeAppEntries(marketList, svcList) {
   return [...entries.values()].sort(compareEntries);
 }
 
+// dedupeMarketEntries 把市场目录按归一化 key 去重（同 key 保留 marketRank 最高的那条）。
+//
+// 用户要求"两部分都按去重后的应用来渲染"：市场列表本身也可能出现同一个应用的
+// 两条目录条目（不同写法），渲染前统一收敛 —— 否则同一张能力会被画成两张卡片。
+// 「已安装」Tab 的去重仍然走 mergeAppEntries（它要同时握着 market 与 svc 两份数据）。
+export function dedupeMarketEntries(list) {
+  const byKey = new Map();
+  for (const a of list || []) {
+    if (!a) continue;
+    const k = appKeyOf(a);
+    if (!k) continue;
+    const cur = byKey.get(k);
+    if (!cur || marketRank(a) > marketRank(cur)) byKey.set(k, a);
+  }
+  return [...byKey.values()];
+}
+
 // portDirectURL 用**当前访问面板的主机名** + 服务端口拼一个直链。
 //
 // 后端不返回局域网 IP，所以只能用 location.hostname：从 127.0.0.1 / 局域网 IP /
@@ -288,6 +305,127 @@ export function subpathWarning(m) {
     style: { flexBasis: '100%', fontSize: '11.5px', lineHeight: '1.6', color: 'var(--warn, #fbbf24)' },
     title: '子路径入口 /' + (ui.slug || '') + '/ —— ' + note,
     text: '⚠️ 该应用不支持子路径：' + note + '；请用「直链」',
+  });
+}
+
+// ---------------------------------------------------------------------------
+//  卡片外壳：四个 Tab（已安装 / 应用市场 / docker / 一键建站）共用同一套 DOM
+// ---------------------------------------------------------------------------
+//
+// 用户 2026-09-17 明确要求"恢复之前的卡片展示样式"：改动前的应用市场用的是
+// `.grid.grid-3` 下的卡片网格（图标 + 名称 + summary + pill + 一排按钮）。
+// 「服务管理 + 应用市场合并」那一轮把它换成了"行"，用户不接受 —— 这一轮四个 Tab
+// 全部回到卡片，而且**共用这一个函数**：结构、间距、pill、按钮排布只有一份，
+// 不会出现"已安装的卡片和市场里的卡片长得不一样"。
+//
+// 调用方（apps.js 的市场/docker/建站卡片、services.js 的已安装卡片）只负责
+// 把数据折算成 props，不自己拼 DOM。
+export function appCardShell({
+  icon, name, subtitle, subtitleTitle = '', pills = [], text = '', textTitle = '',
+  extra = [], actions = [], warning = null, dataset = null,
+}) {
+  return h('div', {
+    dataset: dataset || undefined,
+    style: {
+      background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+      padding: '15px 16px', display: 'flex', flexDirection: 'column', gap: '10px',
+    },
+  }, [
+    h('div', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start' } }, [
+      h('div', {
+        style: {
+          width: '38px', height: '38px', borderRadius: '10px', display: 'grid', placeItems: 'center',
+          background: 'var(--panel)', fontSize: '20px', flex: '0 0 auto',
+        },
+        text: icon || '🧩',
+      }),
+      h('div', { style: { flex: 1, minWidth: 0 } }, [
+        h('div', { style: { fontWeight: '620', fontSize: '14px' }, text: name }),
+        subtitle ? h('div', {
+          style: { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '2px' },
+          title: subtitleTitle || '', text: subtitle,
+        }) : null,
+      ]),
+    ]),
+    pills.length ? h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, pills) : null,
+    // 一句话说明（summary 之外的长描述）。以前把整段 description 铺在卡片里，
+    // 文字比按钮还多；现在卡片只放一段，完整说明仍然在 title 与「⚙️ 管理」里。
+    text ? h('div', {
+      style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.55' },
+      title: textTitle || '', text,
+    }) : null,
+    ...extra,
+    h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } },
+      actions.filter(Boolean)),
+    warning,
+  ]);
+}
+
+// openTargetOf 计算卡片上的「打开」按钮该指向哪里 —— 用户 2026-09-17 第六条的
+// **唯一**判定（改这里之前先读完用户原话）：
+//
+//   支持子路径（有 ui.slug、不是自带控制台、且不是人工实测 prefer_direct）
+//       → "/<slug>/"（相对路径，127.0.0.1 / 局域网 IP / 隧道域名下都通）；
+//   不支持子路径 → 端口直连：优先接口给的 port_url，没有就用
+//       http://<当前访问面板的主机名>:<服务端口>/ 拼；
+//   两者都没有（纯纳管服务没有端口、no_daemon 命令行工具）→ 没有打开入口。
+//
+// 例外一：console_only（frpc 这类应用自带的控制台）**不给**任何打开入口 ——
+//   用户 2026-09-16 明确不要在面板里跳过去（与 openDirectActions 同一判据）。
+// 例外二：self_conf（phpMyAdmin 的 nginx location 只挂在面板那条路上）必须走
+//   panelPath；用相对路径会打到 SPA 的回落页（200，但内容是面板首页）。
+//
+// 返回 { href, subpath, port, direct, title } 或 null。
+// 管理面板里的「打开 / 直链」仍然用 openDirectActions（两颗都给、prefer_direct
+// 只加警示）—— 这条规则只服务于"卡片上只留一颗「打开」"的那两个 Tab。
+export function openTargetOf(m, opts = {}) {
+  const svc = opts.svc || null;
+  const ui = (m && m.ui) || null;
+  const slug = (ui && ui.slug) || '';
+  if (ui && ui.console_only) return null;
+  const port = (svc && svc.port) || (m && m.port) || 0;
+  const explicit = (m && m.port_url) || '';
+  const direct = explicit || portDirectURL(port);
+  if (ui && ui.self_conf && slug) {
+    const href = panelPath(slug + '/');
+    return { href, subpath: true, port, direct, title: '经面板打开（需先登录面板）：' + href };
+  }
+  if (hasPanelUI(m) && !(ui && ui.prefer_direct)) {
+    return { href: '/' + slug + '/', subpath: true, port, direct, title: '经面板的 /' + slug + '/ 打开' };
+  }
+  if (!direct) return null;
+  return {
+    href: direct, subpath: false, port, direct,
+    title: '该应用不支持子路径，直接访问它的端口：' + direct,
+  };
+}
+
+// openOnlyAction 渲染卡片上那**唯一**的「打开」按钮 ——
+// 用户 2026-09-17："对于已经安装的软件，只显示打开，不显示直链"。
+// 没有可用入口（console_only / 没有界面也没有端口）时返回空数组，
+// 绝不给出一个点开必然打不开的按钮。
+export function openOnlyAction(m, opts = {}) {
+  const t = openTargetOf(m, opts);
+  if (!t) return [];
+  return [h('a.btn.btn-sm.btn-primary', {
+    href: t.href, target: '_blank', rel: 'noopener', text: '打开', title: t.title,
+  })];
+}
+
+// PORT_ACCESS_WARNING 是用户要求的**逐字**提示（不要改写、不要加前后缀）。
+export const PORT_ACCESS_WARNING = '该应用不支持子路径，请用端口访问，或自行配置反代。';
+
+// portAccessWarning 把上面那句话渲染成卡片上**始终可见**的一行小字。
+// 只在「打开」真的指向端口直连（openTargetOf 的 subpath=false）时给；
+// 支持子路径的卡片不给，没有打开入口的卡片也不给（那时问题不是"子路径"，而是
+// "这个应用根本没有网页界面"）。管理面板里仍然用 subpathWarning（它带 ui.note 原文）。
+export function portAccessWarning(m, opts = {}) {
+  const t = openTargetOf(m, opts);
+  if (!t || t.subpath) return null;
+  return h('div', {
+    style: { flexBasis: '100%', fontSize: '11.5px', lineHeight: '1.6', color: 'var(--warn, #fbbf24)' },
+    title: '打开地址是 ' + t.href,
+    text: PORT_ACCESS_WARNING,
   });
 }
 

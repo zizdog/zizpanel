@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -95,6 +96,10 @@ func (m *Manager) DockerContainerAction(ctx context.Context, name, action string
 }
 
 // DockerContainerLogs 读取容器日志。
+//
+// tail == 0 是"要**完整**日志"（Docker 的 tail=all）：容器首次启动打出的初始
+// 口令（File Browser 的 admin 密码）在很久以前，只取尾部会把它翻没。
+// 其余越界值兜底成 300，避免调用方手滑传个天文数字。
 func (m *Manager) DockerContainerLogs(ctx context.Context, name string, tail int) (string, error) {
 	c, err := m.dockerClientOrErr()
 	if err != nil {
@@ -103,7 +108,7 @@ func (m *Manager) DockerContainerLogs(ctx context.Context, name string, tail int
 	if name == "" {
 		return "", fmt.Errorf("缺少容器名")
 	}
-	if tail <= 0 || tail > 5000 {
+	if tail < 0 || tail > 5000 {
 		tail = 300
 	}
 	return c.containerLogs(ctx, name, tail)
@@ -137,6 +142,9 @@ func (m *Manager) DockerInspectContainer(ctx context.Context, name string) (map[
 //
 // 创建与启动分两步是刻意的：Docker 的 create 只建不跑，这样"创建成功但启动失败"
 // （端口被占用、命令不存在）能被准确区分并报给用户，而不是笼统一个失败。
+//
+// 本地没有镜像时**先拉取**并把层进度实时外发：/containers/create 不会自己拉，
+// 直接失败只会得到一句 "No such image"，用户既不知道为什么，也看不到过程。
 func (m *Manager) DockerCreateContainer(ctx context.Context, spec DockerCreateSpec) (string, error) {
 	if strings.TrimSpace(spec.Image) == "" {
 		return "", fmt.Errorf("必须指定镜像")
@@ -148,20 +156,124 @@ func (m *Manager) DockerCreateContainer(ctx context.Context, spec DockerCreateSp
 	if err != nil {
 		return "", err
 	}
+
+	if c.imageExists(ctx, spec.Image) {
+		emit(ctx, tasks.LevelStep, "本地已有镜像 "+spec.Image)
+	} else {
+		emit(ctx, tasks.LevelStep, "本地没有镜像 "+spec.Image+"，先拉取（这一步可能要几分钟）")
+		if _, perr := c.pullImage(ctx, spec.Image); perr != nil {
+			return "", fmt.Errorf("拉取镜像失败: %w", perr)
+		}
+	}
+
+	what := "创建容器"
+	if spec.Name != "" {
+		what += " " + spec.Name
+	}
+	emit(ctx, tasks.LevelStep, what)
+
 	id, err := c.createContainer(ctx, spec)
 	if err != nil {
+		emit(ctx, tasks.LevelErr, err.Error())
 		return "", err
 	}
+	emit(ctx, tasks.LevelOut, "容器已创建："+shortID(id))
+
 	if spec.AutoStart {
 		target := spec.Name
 		if target == "" {
 			target = id
 		}
+		emit(ctx, tasks.LevelStep, "启动容器 "+target)
 		if err := c.containerAction(ctx, target, "start", 0); err != nil {
+			emit(ctx, tasks.LevelErr, err.Error())
 			return id, fmt.Errorf("容器已创建（%s）但启动失败：%w", shortID(id), err)
 		}
 	}
 	return id, nil
+}
+
+// DockerProjectContainer 是某个 compose 项目下的一个容器（部署结果里给前端用）。
+//
+// 刻意只给"看日志/认容器"需要的字段：部署结果会被写进任务结果并渲染出来，
+// 塞进 Labels 之类的内部结构既没用、也容易把口令一类的东西漏出去。
+type DockerProjectContainer struct {
+	Name   string `json:"name"`
+	Image  string `json:"image"`
+	State  string `json:"state"`
+	Status string `json:"status"`
+}
+
+// DockerComposeProjectContainers 列出某个 compose 项目下的容器。
+//
+// 按容器标签 com.docker.compose.project 匹配，而不是按容器名：
+// 容器名可以由 yml 里的 container_name 任意指定，标签是 compose 自己写的。
+// 出错时返回空列表而不报错：这是"部署完之后顺手给的附加信息"，
+// 不该因为它把一个已经成功的部署判成失败。
+func (m *Manager) DockerComposeProjectContainers(ctx context.Context, project string) []DockerProjectContainer {
+	c, err := m.dockerClientOrErr()
+	if err != nil {
+		return nil
+	}
+	list, err := c.listContainers(ctx, true)
+	if err != nil {
+		return nil
+	}
+	out := []DockerProjectContainer{}
+	for _, ct := range list {
+		if !strings.EqualFold(strings.TrimSpace(ct.Labels["com.docker.compose.project"]), project) {
+			continue
+		}
+		out = append(out, DockerProjectContainer{
+			Name: ct.PrimaryName(), Image: ct.Image, State: ct.State, Status: ct.Status,
+		})
+	}
+	return out
+}
+
+// DockerScrapeStartupCredentials 从刚启动的容器日志里捞"首次启动随机生成的账号口令"。
+//
+// 为什么值得做（用户原话："很多 docker 项目的登录信息都在日志里！如 filebrowser"）：
+// File Browser 这类镜像的初始口令**只在首次启动时打进日志一次**，用户在 Docker 页
+// 点完「部署」通常不会想到去翻日志，于是永远登不进去。这里把命中的凭据放进部署
+// 结果（任务窗的结果卡片会渲染成可复制的凭据区块），让它一眼可见。
+//
+// 识别规则复用 install.go 的 generatedCredRe：同一套规则，避免两处口径不一致。
+// 捞不到不算失败 —— 有些应用本来就不生成随机口令。
+//
+// 安全约定（硬要求，见 InstallResult.Credentials）：明文口令**只**进返回的
+// Credentials，日志/审计里一个字都不写 —— 任务日志会被长期保存与转发。
+func (m *Manager) DockerScrapeStartupCredentials(ctx context.Context, containers []DockerProjectContainer) []Credential {
+	c, err := m.dockerClientOrErr()
+	if err != nil || len(containers) == 0 {
+		return nil
+	}
+	out := []Credential{}
+	for _, ct := range containers {
+		if ct.State != "running" {
+			continue
+		}
+		// 只取尾部若干行：口令打在启动那一小段里，没必要把整份日志读进来。
+		logs, err := c.containerLogs(ctx, ct.Name, 200)
+		if err != nil || logs == "" {
+			continue
+		}
+		match := generatedCredRe.FindStringSubmatch(logs)
+		if len(match) != 3 {
+			continue
+		}
+		user, pass := match[1], match[2]
+		// 只提示"捞到了"，不带口令值：口令走凭据区块（结果卡片）那一条路。
+		emit(ctx, tasks.LevelOK, "容器 "+ct.Name+" 的日志里有初始登录信息（用户名 "+user+"）——"+
+			"口令已放进本次任务的结果里，请立刻复制保存。")
+		emit(ctx, tasks.LevelWarn, "这串口令只在首次启动时生成一次，登录后请立刻改掉；"+
+			"也可以在「容器」分区点该容器的「日志」看完整日志。")
+		out = append(out,
+			Credential{Key: "username", Value: user, Label: ct.Name + " 用户名"},
+			Credential{Key: "password", Value: pass, Label: ct.Name + " 初始口令（首次启动随机生成）"},
+		)
+	}
+	return out
 }
 
 func shortID(id string) string {

@@ -665,6 +665,21 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// Uninstall 是"这个应用该怎么卸载"的说明（步骤 + 可选删除的产物路径）。
 		// 给界面在确认框里如实展示 —— 卸载不可逆，用户必须知道具体会删什么。
 		Uninstall services.UninstallPlan `json:"uninstall"`
+
+		// ---- Docker 推荐项目（App.DockerReference）给前端的稳定契约 ----
+		//
+		// DockerRecommended 是 App.DockerReference 的**别名**：前端 apps.js 的
+		// isDockerRec() 已经认这个字段名，而 App 上按用户要求叫 docker_reference
+		// （json:"docker_reference"）。两个都发，前端任认一个都不会漏。
+		DockerRecommended bool `json:"docker_recommended,omitempty"`
+		// ComposeURL 是镜像站上**预配置 compose 文件**的下载/查看地址
+		// （<mirror_base>/compose/<id>/docker-compose.yml）；没配镜像基址时为空。
+		// compose 的**内容**走 App.ComposeYAML（json:"compose_yaml"，用于"复制"）。
+		ComposeURL string `json:"compose_url,omitempty"`
+		// ComposeEnvURL 是变量样例 .env.example 的地址（复制成 .env 再改）。
+		ComposeEnvURL string `json:"compose_env_url,omitempty"`
+		// ComposeReadmeURL 是全部推荐项目的总索引（镜像站 /compose/README.md）。
+		ComposeReadmeURL string `json:"compose_readme_url,omitempty"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -784,6 +799,15 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			PortURL: portURL, ProxyURL: proxyURL,
 			Uninstall: s.svcManager().PlanUninstallFor(ctx, a, rec)}
+		if a.DockerReference {
+			// 推荐项目的稳定契约：标记 + compose 内容（App.ComposeYAML → compose_yaml）
+			// + 镜像站地址。front 端据此把卡片放进 docker Tab 并隐藏安装按钮。
+			base := s.Cfg.MirrorBase
+			it.DockerRecommended = true
+			it.ComposeURL = services.ComposeYAMLURL(base, a.ID)
+			it.ComposeEnvURL = services.ComposeEnvExampleURL(base, a.ID)
+			it.ComposeReadmeURL = services.ComposeReferenceIndexURL(base)
+		}
 		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
 			if dockerSock == "" {
 				it.Available = false
@@ -907,6 +931,20 @@ func (s *Server) handleMarketPreflight(w http.ResponseWriter, r *http.Request) {
 	ok(w, mgr.Preflight(r.Context(), app))
 }
 
+// dockerReferenceInstallMessage 是安装接口拒绝"推荐 Docker 项目"时返回的人话错误。
+//
+// 为什么要有单独一条：这些条目过去能一键安装，现在面板不再代装。用户点「安装」
+// 必须**立刻**知道三件事：为什么不行、compose 文件在哪、接下来该怎么做。
+// 只回一句 "not supported" 等于把问题丢回给用户。
+func dockerReferenceInstallMessage(app services.App, mirrorBase string) string {
+	msg := "「" + app.Name + "」是面板推荐的 Docker 项目：面板不再代你安装。" +
+		"请到「应用 → docker」页复制预配置的 compose 文件，改完自己跑。"
+	if url := services.ComposeYAMLURL(mirrorBase, app.ID); url != "" {
+		msg += "镜像站上也有一份可直接下载：" + url + "。"
+	}
+	return msg + "Docker 页有 Compose 面板。"
+}
+
 // handleMarketInstall 安装应用。
 //
 // 大多数条目走通用的 brew / compose 安装流程；但有一批项目用的是
@@ -949,6 +987,18 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	app, found := services.FindApp(id)
 	if !found {
 		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
+		return
+	}
+
+	// 推荐 Docker 项目：**明确拒绝安装**（4xx + 人话），不再代用户跑 compose。
+	//
+	// 为什么必须在这里、且在 launchTask 之前挡住：过去这些条目能一键安装，
+	// 现在语义变了（用户 2026-09-17："不提供安装，这个功能应该给会用 docker 的人用"）。
+	// 静默失败或谎报成功是这个仓库最忌讳的事，所以直接返回 409 并告诉用户
+	// compose 文件在哪、Docker 页有 Compose 面板。
+	// 注意：这条要放在 release-binary 分流**之前** —— 推荐项目只可能是 compose。
+	if app.DockerReference {
+		fail(w, http.StatusConflict, dockerReferenceInstallMessage(app, s.Cfg.MirrorBase))
 		return
 	}
 

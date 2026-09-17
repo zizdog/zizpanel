@@ -231,7 +231,7 @@ export function DatabaseView(content, ctx = {}) {
         }) : null,
         h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
           h('button.btn', { text: '⚙️ 连接设置', onclick: connectionModal }),
-          h('button.btn', { text: '去「我的应用」启动 MySQL', onclick: () => { location.hash = '#/services'; } }),
+          h('button.btn', { text: '去「应用 → 已安装」启动 MySQL', onclick: () => { location.hash = '#/services'; } }),
           h('button.btn.btn-primary', { text: '重试连接', onclick: load }),
         ]),
       ]));

@@ -27,6 +27,16 @@ type App struct {
 	Category    string `json:"category"`
 	// Kind 决定用哪种方式安装与管理
 	Kind Kind `json:"kind"`
+	// DockerReference 为 true 表示这是一个「推荐的 Docker 项目」：
+	// 面板**不代用户安装**（安装接口会明确拒绝并给出 compose 地址），只在应用市场
+	// 的 docker Tab 里列出，并提供预配置的 compose 参考文件（内容 + 镜像站下载地址）。
+	//
+	// 为什么不直接看 Kind==KindCompose：Kind 描述"历史上用哪种方式装"，
+	// 而这个字段描述"面板现在对它承担什么承诺"。两者语义不同，不要合并。
+	// 目前目录里**所有** KindCompose 条目都是 true，并有测试锁住
+	// （见 compose_reference_test.go 的 TestAllComposeEntriesAreDockerReferences）。
+	// 前端的稳定契约：true → 卡片进 docker Tab，隐藏安装按钮。
+	DockerReference bool `json:"docker_reference,omitempty"`
 	// AdoptLabel 非空表示这是一个"纳管"应用：不安装，只把已存在的服务接进来
 	AdoptLabel string `json:"adopt_label"`
 
@@ -48,9 +58,11 @@ type App struct {
 	// 时**填写（留 0 表示用 WebPort()）。
 	//
 	// 为什么不能直接用 UIPort 兼这个职责：UIPort 同时喂健康检查（healthURLFor）
-	// 与反向代理目标。MinIO 就是反例 —— 它的 S3 API 在 9010、控制台在 9011，
-	// 健康检查必须打 9010 的 /minio/health/live（200），而用户要打开的界面是 9011。
-	// 把 UIPort 挪到 9011 会让健康检查变成 404，于是"服务健康"永远红灯。
+	// 与反向代理目标。MinIO（2026-09-17 已从目录下架）就是反例 —— 它的 S3 API
+	// 在 9010、控制台在 9001，健康检查必须打 9010 的 /minio/health/live（200），
+	// 而用户要打开的界面是 9001。把 UIPort 挪到 9001 会让健康检查变成 404，
+	// 于是"服务健康"永远红灯。**当前目录里没有条目用它**（唯一使用者 MinIO 已下架），
+	// 但字段与 EntryPort() 保留：那是通用能力，不是 MinIO 专用。
 	// 所以入口 URL 单独一个字段：它只影响 api_services.go 生成的 port_url。
 	DirectPort int `json:"direct_port,omitempty"`
 	// ConfigPath 是这个应用的配置文件名（**相对它自己的安装目录**，如 frps.toml）。
@@ -72,7 +84,14 @@ type App struct {
 	// 流程做不了），值即安装器标识，web 层据此分流。
 	// 有了它，目录校验就不该再要求这类条目必须有 BrewFormula。
 	PanelInstaller string `json:"panel_installer,omitempty"`
-	// Compose 安装：compose 文件内容
+	// ComposeYAML 是**预配置 compose 参考文件**的内容（DockerReference 条目直接
+	// 通过 GET /api/v1/services（市场列表）的 `compose_yaml` 字段给前端"复制"）。
+	//
+	// 它过去是"安装时写进 <WorkDir>/compose/<id>/docker-compose.yml 的内容"；
+	// 2026-09-17 起 Docker 类条目不再由面板安装，它只剩参考用途 ——
+	// 同一份内容也会由 `cmd/zizpanel-assets compose` 生成、由
+	// `tools/sync-nas-compose.sh` 发布到镜像站 /compose/<id>/docker-compose.yml。
+	// 里面用 ${DATA_ROOT:-.} 之类的变量让用户自己决定数据目录（配合 .env.example）。
 	ComposeYAML string `json:"compose_yaml"`
 	// ComposeSecrets 声明 compose 应用在**安装时**要随机生成的环境变量密钥。
 	//
@@ -131,8 +150,9 @@ func (a App) WebPort() int {
 
 // EntryPort 返回「打开 / 直链」按钮应当指向的宿主端口。
 //
-// 绝大多数条目与 WebPort() 相同；只有"界面端口 ≠ 健康检查端口"的条目
-// （目前只有 MinIO）用 DirectPort 单独指定。**不要**用它去做健康检查或反代 ——
+// 绝大多数条目与 WebPort() 相同；只有"界面端口 ≠ 健康检查端口"的条目用
+// DirectPort 单独指定（历史上只有 MinIO 这样，它已于 2026-09-17 下架）。
+// **不要**用它去做健康检查或反代 ——
 // 那两件事必须用 WebPort()，理由见 DirectPort 字段的注释。
 func (a App) EntryPort() int {
 	if a.DirectPort > 0 {
@@ -742,63 +762,29 @@ func Catalog() []App {
 				"镜像用官方滚动 tag louislam/uptime-kuma:2（1.x 已停维护）。" +
 				"⚠️ v1→v2 会**自动迁移数据库**（不可逆），请先备份 ./data；" +
 				"子路径改写是按 v1 调的、v2 未重测。",
-			Category: "tool", Kind: KindCompose, Port: 3001,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 3001,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
-			ComposeYAML: composeTemplate("uptime-kuma", "louislam/uptime-kuma:2", 3001, 3001, `
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped`),
-			DocsURL: "https://github.com/louislam/uptime-kuma",
-		},
-		{
-			ID: "minio", Name: "MinIO", Icon: "🪣",
-			UI: &AppUI{
-				Slug:         "minio",
-				Note:         "MinIO 控制台需要在容器环境变量里设 MINIO_BROWSER_REDIRECT_URL 才能用子路径（面板只做改写，不保证可用）",
-				PreferDirect: true,
-			},
-			Summary: "S3 兼容的对象存储",
-			// 端口因果（2026-09-17 用户真机反馈后改，别再改回去）：
-			//   · **宿主 9000 永远留给 PHP-FPM**（站点 vhost 的 fastcgi_pass 指向它），
-			//     所以 MinIO 的 S3 API 只能映射到宿主 9010（容器内 9000）。
-			//   · 控制台**容器内**就是 9001。原先映射成宿主 9011，结果 MinIO
-			//     自己宣告的 9001 在宿主上是 **Portainer 的 HTTP 口** —— 用户点
-			//     MinIO 的直链/别名跳到 9001 看到的是 Portainer 的超时页。
-			//     根因不是改写，是端口被另一个应用占了。现在 MinIO 控制台改成
-			//     9001:9001（它宣告什么、宿主上就是什么），Portainer 让出 9001 改到 9002。
-			Description: "自建对象存储，适合存放图片、备份、模型文件。" +
-				"API 用 9010、控制台用 9001（都避开 PHP-FPM 占用的 9000）。" +
-				"控制台地址是 http://<本机地址>:9001，S3 客户端连的是 9010。",
-			Category: "tool", Kind: KindCompose, Port: 9010,
-			// 健康检查打 S3 API 的 /minio/health/live（9010 才是 200）；
-			// 但「打开 / 直链」要给控制台（9001）——
-			// 直接把 WebPort 挪到 9001 会让健康检查变 404，所以用 DirectPort。
-			DirectPort: 9001,
-			HealthPath: "/minio/health/live",
-			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
+			// host 网络（2026-09-17 mini 实测：Colima/Lima 会把 VM 内监听的端口自动
+			// 转发到 Mac 宿主，host 网络下没有 ports: 也能从宿主访问）。Uptime Kuma
+			// 是单容器、无交互，容器内默认就监听 3001，与面板保留端口
+			// （80 nginx / 8080 IOPaint / 9000 PHP-FPM）都不冲突，所以直接用 host。
+			// 换端口：设 UPTIME_KUMA_PORT（见 .env.example），**不要**再加 ports:。
 			ComposeYAML: `services:
-  minio:
-    image: quay.io/minio/minio:latest
-    container_name: minio
-    ports:
-      # 宿主机：9000 留给 PHP-FPM，所以 S3 API 用 9010、控制台用 9001。
-      # 控制台容器内外都是 9001 —— 让 MinIO 自己宣告的 9001 在宿主上就是它，
-      # 避免"跳到 9001 看到 Portainer"（Portainer 已让到 9002）。
-      - "9010:9000"
-      - "9001:9001"
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: uptime-kuma
+    # host 网络：容器内 3001 直接就是 VM 内端口，Colima 自动转发到 Mac 宿主。
+    network_mode: host
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      # 想换端口就改 .env 里的 UPTIME_KUMA_PORT（默认 3001），不要再加 ports:。
+      UPTIME_KUMA_PORT: ${UPTIME_KUMA_PORT:-3001}
     volumes:
-      - ./data:/data
+      # 数据目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）
+      - ${DATA_ROOT:-.}/data:/app/data
     restart: unless-stopped
 `,
-			PostInstallHint: "默认账号密码均为 minioadmin，请登录后立即修改。" +
-				"**控制台**：http://<本机地址>:9001（面板的「打开 / 直链」指向这里）；" +
-				"S3 API：http://<本机地址>:9010。",
-			DocsURL: "https://min.io",
+			DocsURL: "https://github.com/louislam/uptime-kuma",
 		},
 		{
 			ID: "gitea", Name: "Gitea", Icon: "🍵",
@@ -809,15 +795,18 @@ func Catalog() []App {
 			},
 			Summary:     "轻量自建 Git 服务",
 			Description: "资源占用极小的 Git 托管（含 Web 界面、Issue、CI 入口）。",
-			Category:    "tool", Kind: KindCompose, Port: 3000,
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 3000,
 			HealthPath: "/api/healthz",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
 			ComposeYAML: composeTemplate("gitea", "gitea/gitea:latest", 3000, 3000, `
+    # 为什么不用 host 网络：Gitea 容器内还监听 22（Git over SSH），
+    # host 网络会让它去抢 Colima VM 的 SSH 端口 —— 保留端口映射（宿主 3000）。
     environment:
       - USER_UID=1000
       - USER_GID=1000
     volumes:
-      - ./data:/data
+      # 数据目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）
+      - ${DATA_ROOT:-.}/data:/data
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped`),
@@ -834,12 +823,15 @@ func Catalog() []App {
 			},
 			Summary:     "本地 PDF 工具箱",
 			Description: "合并、拆分、压缩、OCR、转图片等 PDF 操作，全部在本机完成，不上传云端。",
-			Category:    "tool", Kind: KindCompose, Port: 8082,
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8082,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker"}},
 			ComposeYAML: composeTemplate("stirling-pdf", "stirlingtools/stirling-pdf:latest", 8082, 8080, `
+    # 为什么不用 host 网络：容器内监听 8080，而 8080 是面板给 IOPaint 保留的端口，
+    # host 网络会直接抢不到 —— 保留端口映射（宿主 8082）。
     volumes:
-      - ./data:/configs
+      # 数据目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）
+      - ${DATA_ROOT:-.}/data:/configs
     restart: unless-stopped`),
 			// 真机现象（2026-09-17 只读排查）：容器在跑但 RestartCount=184，
 			// dmesg 实证是 **Colima VM OOM**（VM 只有 1.9GiB）—— Stirling 的
@@ -884,7 +876,7 @@ func Catalog() []App {
 			Description: "JSON 格式化、Base64/URL 编解码、UUID/哈希、时间戳、正则、" +
 				"JWT、CIDR 等开发者小工具合集。走 Docker，纯前端本地执行、" +
 				"输入不上传，端口 8083。",
-			Category: "tool", Kind: KindCompose, Port: 8083,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8083,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 官方镜像（README 里给的就是 corentinth/it-tools 与 ghcr.io/corentinth/it-tools
@@ -894,6 +886,8 @@ func Catalog() []App {
 			//   docker manifest inspect ghcr.io/corentinth/it-tools:latest
 			//   → linux/amd64、linux/arm64（另有两个 unknown/unknown 的 attestation）
 			ComposeYAML: composeTemplate("it-tools", "ghcr.io/corentinth/it-tools:latest", 8083, 80, `
+    # 为什么不用 host 网络：镜像里的 nginx 固定监听 80，而 80 被面板自带的 nginx
+    # 占着 —— host 网络下它起不来，故保留端口映射（宿主 8083）。
     restart: unless-stopped`),
 			DocsURL: "https://github.com/CorentinTh/it-tools",
 		},
@@ -911,7 +905,7 @@ func Catalog() []App {
 				"它不像面板自带文件管理器那样限定白名单目录。" +
 				"因 Homebrew 版没有 service 定义，仍走 Docker，端口 8081，" +
 				"默认管理 compose 目录下的 data/。",
-			Category: "tool", Kind: KindCompose, Port: 8081,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8081,
 			// 官方镜像的 healthcheck 打的就是 /health（见仓库 docker/common/healthcheck.sh），
 			// 不是猜测的路径。
 			HealthPath: "/health",
@@ -943,22 +937,28 @@ func Catalog() []App {
     # 直接退出（set -e）。容器内以 root 运行即可，与目录里其它镜像一致。
     user: "0:0"
     # 子路径：镜像的 /init.sh 会把参数透传给 filebrowser，所以这一行就能生效
-    command: ["-b", "/filebrowser"]
-    ports:
-      - "8081:80"
+    # host 网络（2026-09-17 mini 实测：Colima/Lima 会把 VM 内监听的端口自动转发到
+    # Mac 宿主，host 网络下没有 ports: 也能从宿主访问）。镜像默认监听 80，会和
+    # 面板自带的 nginx 抢端口，所以用 -a/-p 显式改到 8081（容器内端口就是 VM 内端口）。
+    # 不要再加 ports:（host 网络下会被 docker 静默忽略）。
+    network_mode: host
+    command: ["-b", "/filebrowser", "-a", "0.0.0.0", "-p", "${FILEBROWSER_PORT:-8081}"]
     volumes:
       # 只挂这几个常用目录（界面上就是 /srv 下的 5 个条目）。
       # 想改挂载：Docker → Compose → filebrowser → 编辑 yml → 重新部署。
       # ⚠️ macOS 的「文档/下载/桌面」等目录受隐私保护（TCC）：没给 Colima
       #    （以及面板）授予「完全磁盘访问权限」时，容器里是空的、终端里会报
       #    Operation not permitted。
-      - ~/Documents:/srv/文档
-      - ~/Downloads:/srv/下载
-      - ~/Music:/srv/音乐
-      - ~/Movies:/srv/影片
-      - ~/Desktop:/srv/桌面
-      - ./config:/config
-      - ./database:/database
+      # 用 ${HOME} 而不是 ~ ：2026-09-17 实测波浪号在 compose 里的展开随版本变化，
+      # 老版本会把它当相对路径，挂载变成 <项目目录>/~/Documents（容器里是空的）。
+      - ${HOME}/Documents:/srv/文档
+      - ${HOME}/Downloads:/srv/下载
+      - ${HOME}/Music:/srv/音乐
+      - ${HOME}/Movies:/srv/影片
+      - ${HOME}/Desktop:/srv/桌面
+      # 配置与索引：DATA_ROOT 决定放哪（默认 . 即本 compose 文件所在目录）
+      - ${DATA_ROOT:-.}/config:/config
+      - ${DATA_ROOT:-.}/database:/database
     restart: unless-stopped
 `,
 			// 首次启动会自动生成 admin 密码并打在容器日志里；面板部署完会把它捞出来
@@ -1244,54 +1244,6 @@ func Catalog() []App {
 			DocsURL: "https://freshrss.org",
 		},
 		{
-			ID: "portainer", Name: "Portainer CE", Icon: "🐳",
-			UI: &AppUI{
-				Slug:         "portainer",
-				Note:         "Portainer 的界面是 **HTTPS**（自签证书），子路径支持不保证 —— 建议用「直链」打开 https://<本机地址>:9443",
-				PreferDirect: true,
-			},
-			Summary: "Docker 图形化管理（容器 / 镜像 / 卷 / 网络）",
-			Description: "用网页管理本机的 Docker 资源。**安全提醒**：它需要挂载 Docker socket，" +
-				"等于把 Docker 的完全控制权交给这个界面 —— 只在局域网用，绝不要暴露到公网。" +
-				"界面走 HTTPS（自签证书，浏览器要点一次「继续访问」），端口 9443；" +
-				"HTTP 入口映射到宿主 **9002**（9000 是 PHP-FPM 的保留端口，9001 已让给 MinIO 控制台），" +
-				"访问后会跳到 9443；面板的健康检查与「直链」用的是 9002。",
-			// 宿主端口为什么是 9002：**9000 在本项目里是 PHP-FPM 的保留端口**
-			// （站点 vhost 的 fastcgi_pass 指向它）；而 9001 之前被 Portainer 占着，
-			// 与 MinIO 控制台（容器内 9001）在宿主侧撞车 —— 用户点 MinIO 的直链
-			// 跳到 9001 看到 Portainer 的超时页就是这么来的。现在 9001 还给 MinIO，
-			// Portainer 用 9002。
-			Category: "tool", Kind: KindCompose, Port: 9002,
-			HealthPath: "/",
-			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
-			ComposeYAML: `services:
-  portainer:
-    image: portainer/portainer-ce:lts
-    container_name: portainer
-    ports:
-      # 宿主 9002 → 容器 9000（9000 留给 PHP-FPM、9001 让给 MinIO 控制台）；
-      # 9443 是它的 HTTPS 界面。
-      - "9002:9000"
-      - "9443:9443"
-    volumes:
-      # 这里必须写 **VM 内**的 /var/run/docker.sock：Colima 下 compose 的 bind 源是
-      # 在 Linux VM 里解析的，宿主的 ~/.colima/default/docker.sock 在 VM 里是
-      # virtiofs，挂进去用不了（真机实测）。
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/data
-    restart: unless-stopped
-`,
-			PostInstallHint: "① 首次打开 https://<本机地址>:9443 时必须在 **5 分钟内**设置管理员口令，" +
-				"超时会被锁定、只能重启容器重来。" +
-				"② 较新的 Portainer（≥2.45）在**每次启动**时都会生成一个一次性 **setup_token**：" +
-				"用 `docker logs portainer 2>&1 | grep -i setup` 取（它在 `====` 横幅中间、64 位十六进制），" +
-				"粘进 setup 页面才能继续。口令重启后 5 分钟内有效，token 每次启动都会换新的。" +
-				"③ 自签证书会提示不安全，点「继续访问」即可。" +
-				"④ 如果打开后看到的是「…timed out for security purposes」页面，说明已经超时锁定：" +
-				"`docker restart portainer` 后立刻重新打开，并在 5 分钟内完成设置。",
-			DocsURL: "https://www.portainer.io",
-		},
-		{
 			ID: "homepage", Name: "Homepage", Icon: "🏠",
 			UI: &AppUI{
 				Slug: "homepage",
@@ -1316,7 +1268,7 @@ func Catalog() []App {
 				"配置文件在应用目录的 config/ 下（services.yaml / settings.yaml / widgets.yaml），" +
 				"可在「管理」里直接编辑。要显示容器状态需要额外挂 Docker socket —— 面板刻意**没有**默认挂上" +
 				"（那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。",
-			Category: "tool", Kind: KindCompose, Port: 3010,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 3010,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			ComposeYAML: `services:
@@ -1325,14 +1277,17 @@ func Catalog() []App {
     container_name: homepage
     ports:
       - "3010:3000"
+    # 为什么不用 host 网络：容器内监听 3000，而 Gitea 的宿主映射也用 3000，
+    # 两者不能同时存在 —— 保留端口映射（宿主 3010）。
     environment:
       # 官方要求必须设置，否则启动后直接 host validation failed（页面打不开）。
-      # 静态 compose 装的时候还不知道用户会用哪个地址访问，所以这里放开；
-      # 这台机器只在内网用，是可接受的取舍 —— 要收紧就改成
-      # "192.168.1.4:3010,localhost:3010" 这种显式清单。
-      HOMEPAGE_ALLOWED_HOSTS: "*"
+      # 这里放开是因为面板装的时候还不知道用户会用哪个地址访问；
+      # 只在内网用是可接受的取舍 —— 要收紧就在 .env 里写
+      # HOMEPAGE_ALLOWED_HOSTS=192.168.1.4:3010,localhost:3010 这种显式清单。
+      HOMEPAGE_ALLOWED_HOSTS: "${HOMEPAGE_ALLOWED_HOSTS:-*}"
     volumes:
-      - ./config:/app/config
+      # 配置目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）
+      - ${DATA_ROOT:-.}/config:/app/config
     restart: unless-stopped
 `,
 			PostInstallHint: "首次打开是空首页：在 <应用目录>/config/services.yaml 里加服务卡片" +
@@ -1362,7 +1317,7 @@ func Catalog() []App {
 			Description: "TriliumNext Notes 服务端：层级化笔记 + 富文本/代码/Mermaid、全文搜索与关系图。" +
 				"**走 Docker**：Homebrew 只有 Electron GUI cask，官方服务端产物只有 Linux；" +
 				"镜像自带 linux/arm64，不转译。数据在应用目录 data/；端口 **8091**（让开 IOPaint 的 8080）。",
-			Category: "tool", Kind: KindCompose, Port: 8091,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8091,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 上游 compose（develop 分支 docker-compose.yml）的等价物，三处**故意不同**：
@@ -1378,7 +1333,8 @@ func Catalog() []App {
     image: triliumnext/trilium:v0.105.0
     container_name: trilium
     ports:
-      # 宿主 8091 → 容器 8080：8080 已被 IOPaint 占用（本项目保留端口）
+      # 宿主 8091 → 容器 8080：8080 已被 IOPaint 占用（本项目保留端口），
+      # 所以不能改用 host 网络 —— 保留端口映射。
       - "8091:8080"
     environment:
       # 容器内数据目录（官方 compose 也显式设它）；挂载点见下
@@ -1392,9 +1348,11 @@ func Catalog() []App {
       - USER_UID=501
       - USER_GID=20
     volumes:
-      # 数据落在应用目录的 data/（document.db + config.ini + log/）；
-      # 面板装完后就是 <WorkDir>/compose/trilium/data/
-      - ./data:/home/node/trilium-data
+      # 数据目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）；
+      # 想统一放到别处就设 DATA_ROOT=${HOME}/docker/trilium（见 .env.example；
+      # 别用 ~，它在不同 compose 版本里展开行为不一致）。
+      # document.db + config.ini + log/ 都在这个目录里。
+      - ${DATA_ROOT:-.}/data:/home/node/trilium-data
     restart: unless-stopped
 `,
 			PostInstallHint: "首次打开 http://<本机地址>:8091/ 会进入初始化向导：创建管理员账号与口令" +
@@ -1419,7 +1377,7 @@ func Catalog() []App {
 			Description: "用节点拖拽编排自动化流程，连接大量 SaaS / HTTP / 数据库 / AI 接口。" +
 				"**走 Docker（3 容器）**：app（API+worker）、PostgreSQL(pgvector)、Redis，宿主端口 8090。" +
 				"AP_JWT_SECRET / AP_ENCRYPTION_KEY / 数据库口令安装时随机生成，只在安装结果的凭据区块出现。",
-			Category: "tool", Kind: KindCompose, Port: 8090,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8090,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// arm64 证据（2026-09-17 本机 `docker manifest inspect` 直查 ghcr.io）：
@@ -1450,7 +1408,9 @@ func Catalog() []App {
     image: ghcr.io/activepieces/activepieces:0.91.0
     container_name: activepieces
     ports:
-      # 宿主 8090 → 容器 80：8080 是本项目 IOPaint 的保留端口
+      # 宿主 8090 → 容器 80：8080 是本项目 IOPaint 的保留端口。
+      # 这里**不能**用 host 网络：三个容器之间靠 compose 网络的服务名互相寻址
+      # （AP_POSTGRES_HOST=activepieces-postgres 等），host 网络下没有这套 DNS。
       - "8090:80"
     environment:
       AP_CONTAINER_TYPE: WORKER_AND_APP
@@ -1466,7 +1426,7 @@ func Catalog() []App {
       AP_REDIS_HOST: activepieces-redis
       AP_REDIS_PORT: "6379"
     volumes:
-      - ./data:/usr/src/app/cache
+      - ${DATA_ROOT:-.}/data:/usr/src/app/cache
     depends_on:
       - activepieces-postgres
       - activepieces-redis
@@ -1480,14 +1440,14 @@ func Catalog() []App {
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${AP_POSTGRES_PASSWORD}
     volumes:
-      - ./postgres:/var/lib/postgresql/data
+      - ${DATA_ROOT:-.}/postgres:/var/lib/postgresql/data
     restart: unless-stopped
   activepieces-redis:
     image: library/redis:7.0.7
     container_name: activepieces-redis
     # 不发布宿主端口：只在 compose 网络内被 app 访问
     volumes:
-      - ./redis:/data
+      - ${DATA_ROOT:-.}/redis:/data
     restart: unless-stopped
 `,
 			ComposeSecrets: []ComposeSecret{
@@ -1526,7 +1486,7 @@ func Catalog() []App {
 				"**走 Docker（官方 4 容器）**，宿主端口 2283，DB_PASSWORD 安装时随机生成。" +
 				"⚠️ 官方明确非 Linux 宿主 strongly discouraged；macOS **没有硬件转码**（只能 CPU 软转）；" +
 				"首次启动要下载 ML 模型。",
-			Category: "tool", Kind: KindCompose, Port: 2283,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 2283,
 			// 官方健康端点：GET /api/server/ping → 200 {"res":"pong"}
 			HealthPath: "/api/server/ping",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
@@ -1540,15 +1500,21 @@ func Catalog() []App {
 			// 与官方 compose 的三处**故意差异**（都是本项目约定，别改回去）：
 			//   ① 容器名加 immich- 前缀：官方用 postgres / redis 这种通用名，
 			//      在同一台机器上和别的 compose 项目会撞名；
-			//   ② 用明确的 environment 而不是 env_file：静态模板里只需要 DB_PASSWORD
-			//      一个随机值，其余写死即可，少一个"用户忘了配 .env 就起不来"的坑；
+			//   ② 用明确的 environment 而不是 env_file：模板里只需要 DB_PASSWORD
+			//      一个密钥，其余写死即可；密钥由用户在 .env 里填（见 .env.example），
+			//      少一个"用户忘了配 .env 就起不来"的坑；
 			//   ③ 去掉 /etc/localtime 挂载：宿主是 macOS，Colima 下 bind 源在 Linux VM
-			//      里解析，挂 VM 的 /etc 文件收益很小（与 trilium 同一处理）。
+			//      里解析，挂 VM 的 /etc 文件收益很小（与 trilium 同一处理）；
+			//   ④ 数据目录统一走 ${DATA_ROOT:-.}：默认就在 compose 文件旁边，
+			//      想集中放就把 DATA_ROOT 指到 ${HOME}/docker/immich（见 .env.example）。
 			ComposeYAML: `services:
   immich-server:
     image: ghcr.io/immich-app/immich-server:release
     container_name: immich-server
     ports:
+      # 宿主 2283 → 容器 2283。**不能**用 host 网络：四个容器靠 compose 网络的
+      # 服务名互访（DB_HOSTNAME=immich-postgres / REDIS_HOSTNAME=immich-redis），
+      # host 网络下没有这套 DNS。
       - "2283:2283"
     environment:
       DB_HOSTNAME: immich-postgres
@@ -1558,7 +1524,7 @@ func Catalog() []App {
       REDIS_HOSTNAME: immich-redis
     volumes:
       # 上传目录（官方 UPLOAD_LOCATION）
-      - ./data:/data
+      - ${DATA_ROOT:-.}/data:/data
     depends_on:
       - immich-redis
       - immich-postgres
@@ -1568,7 +1534,7 @@ func Catalog() []App {
     container_name: immich-machine-learning
     volumes:
       # 机器学习模型缓存（官方 model-cache）
-      - ./model-cache:/cache
+      - ${DATA_ROOT:-.}/model-cache:/cache
     restart: always
   immich-redis:
     image: valkey/valkey:9
@@ -1584,7 +1550,7 @@ func Catalog() []App {
       POSTGRES_INITDB_ARGS: "--data-checksums"
     volumes:
       # 数据库数据目录（官方 DB_DATA_LOCATION）
-      - ./postgres:/var/lib/postgresql/data
+      - ${DATA_ROOT:-.}/postgres:/var/lib/postgresql/data
     shm_size: 128mb
     restart: always
 `,
@@ -1628,7 +1594,7 @@ func Catalog() []App {
 			Description: "MetaTube 的 API 服务端：聚合 20+ 元数据提供方，供 Emby / Jellyfin 的 " +
 				"MetaTube 插件调用，按番号抓取封面、简介、演员等信息。" +
 				"装好后把插件里的服务地址填成 http://<本机地址>:8084。",
-			Category: "tool", Kind: KindCompose, Port: 8084,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8084,
 			// 项目自带 Web 首页（GET / 返回 app 与 version 的 JSON，见 route/route.go），
 			// 拿它当探活路径既真实又不受后续 API 变更影响。
 			HealthPath: "/",
@@ -1645,6 +1611,8 @@ func Catalog() []App {
 			// Dockerfile 的默认值一致），因此不挂卷；要持久化自行加 DSN 与卷。
 			ComposeYAML: composeTemplate("metatube-server",
 				"ghcr.io/metatube-community/metatube-server:latest", 8084, 8080, `
+    # 为什么不用 host 网络：容器内监听 8080，与 IOPaint 的保留端口冲突 ——
+    # 保留端口映射（宿主 8084）。
     restart: unless-stopped`),
 			PostInstallHint: "默认不鉴权（TOKEN 为空）：只建议在局域网内使用。" +
 				"要让局域网外访问，请在 compose 里加 TOKEN 环境变量，并让客户端带上同一个值。",
@@ -1672,7 +1640,7 @@ func Catalog() []App {
 			Description: "PNG / JPEG / WebP / AVIF 压缩与尺寸调整，编解码全在浏览器里用 " +
 				"wasm 完成，图片不上传。⚠️ 上游没有官方镜像，这里用社区镜像 " +
 				"pjmeca/squoosh:1.1.0（固定版本），只托管静态文件、无服务端逻辑；端口 8085。",
-			Category: "tool", Kind: KindCompose, Port: 8085,
+			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8085,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 唯一一个没有官方镜像的条目，如实标注并固定版本号：
@@ -1687,6 +1655,8 @@ func Catalog() []App {
 			//   docker manifest inspect docker.1ms.run/pjmeca/squoosh:1.1.0
 			//   → linux/amd64、linux/arm64、linux/arm/v7
 			ComposeYAML: composeTemplate("squoosh", "pjmeca/squoosh:1.1.0", 8085, 80, `
+    # 为什么不用 host 网络：镜像里的 nginx 固定监听 80，与面板自带 nginx 冲突 ——
+    # 保留端口映射（宿主 8085）。
     restart: unless-stopped`),
 			DocsURL: "https://github.com/GoogleChromeLabs/squoosh",
 		},

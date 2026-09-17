@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -122,6 +124,11 @@ func (s *Server) handleDockerContainerAction(w http.ResponseWriter, r *http.Requ
 	ok(w, map[string]any{"action": action, "name": name})
 }
 
+// handleDockerContainerLogs 读取容器日志。
+//
+// lines=0 是**显式的"要完整日志"**（Docker 的 tail=all）：容器首次启动时打出的
+// 初始口令（File Browser 的 admin 密码就是这一类）往往在很久以前，只取尾部会把它
+// 翻没。参数缺省时仍只取 300 行，保证"点一下日志"不会把 8MB 文本灌进浏览器。
 func (s *Server) handleDockerContainerLogs(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	if name == "" {
@@ -130,7 +137,7 @@ func (s *Server) handleDockerContainerLogs(w http.ResponseWriter, r *http.Reques
 	}
 	tail := 300
 	if v := r.URL.Query().Get("lines"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			tail = n
 		}
 	}
@@ -326,20 +333,28 @@ func (s *Server) handleDockerContainerCreate(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// 参数校验全部做完之后再提交任务：参数错误要当场 400 说清楚，
+	// 而不是先给一个 202、再让用户在任务日志里等一条"必须指定镜像名"。
 	mgr := s.svcManager()
-	id, err := mgr.DockerCreateContainer(r.Context(), spec)
-	if err != nil {
-		// 创建成功但启动失败时 id 非空，提示要区分开
-		s.audit(r, "docker_container_create", spec.Name, err.Error(), false, "")
-		if id != "" {
-			fail(w, http.StatusInternalServerError, err.Error()+"（容器已创建，可在列表里手动启动）")
-			return
-		}
-		s.dockerFail(w, err)
-		return
+	target := spec.Name
+	if target == "" {
+		target = spec.Image
 	}
-	s.audit(r, "docker_container_create", spec.Name, "镜像="+spec.Image, true, "")
-	ok(w, map[string]any{"id": id, "name": spec.Name, "started": spec.AutoStart})
+	// 创建容器可能先拉镜像（本地没有时），镜像层进度必须逐行可见；
+	// 而且它挂在任务中心才不会被"用户刷新页面"杀掉。
+	s.launchTask(w, r, "docker-container-create", "docker:container:"+target,
+		"创建容器 "+target, "docker_container_create",
+		func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			id, err := mgr.DockerCreateContainer(ctx, spec)
+			if err != nil {
+				// 创建成功但启动失败时 id 非空，提示要区分开
+				if id != "" {
+					return nil, fmt.Errorf("%s（容器已创建，可在列表里手动启动）", err.Error())
+				}
+				return nil, err
+			}
+			return map[string]any{"id": id, "name": spec.Name, "started": spec.AutoStart}, nil
+		})
 }
 
 // ---------- 镜像 ----------
@@ -358,6 +373,11 @@ func (s *Server) handleDockerImages(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"list": list})
 }
 
+// handleDockerImagePull 拉取镜像。
+//
+// 走任务中心（202 + task_id）：拉一个几百 MB 的镜像要几分钟，Docker 的层进度
+// （Downloading/Extracting 的字节数）现在**逐行**进任务日志，关掉窗口也不中断。
+// 拉取本身在 services 层流式读 /images/create 的进度流，这里只负责提交任务。
 func (s *Server) handleDockerImagePull(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Image string `json:"image"`
@@ -366,15 +386,26 @@ func (s *Server) handleDockerImagePull(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	mgr := s.svcManager()
-	msg, err := mgr.DockerPullImage(r.Context(), strings.TrimSpace(req.Image))
-	if err != nil {
-		s.audit(r, "docker_image_pull", req.Image, err.Error(), false, "")
-		s.dockerFail(w, err)
+	image := strings.TrimSpace(req.Image)
+	// 参数错误在提交任务之前拦住：否则用户先拿到一个 202，
+	// 再在任务日志里等一句"必须指定镜像名"。
+	if image == "" {
+		fail(w, http.StatusBadRequest, "必须指定镜像名")
 		return
 	}
-	s.audit(r, "docker_image_pull", req.Image, msg, true, "")
-	ok(w, map[string]any{"image": req.Image, "message": msg})
+	if strings.ContainsAny(image, " \t\n") {
+		fail(w, http.StatusBadRequest, "镜像名不能包含空白字符")
+		return
+	}
+	s.launchTask(w, r, "docker-image-pull", "docker:image:"+image, "拉取镜像 "+image,
+		"docker_image_pull", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			mgr := s.svcManager()
+			msg, err := mgr.DockerPullImage(ctx, image)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"image": image, "message": msg}, nil
+		})
 }
 
 func (s *Server) handleDockerImageRemove(w http.ResponseWriter, r *http.Request) {

@@ -1,5 +1,6 @@
-// appdetail-verify.mjs —— 端到端验证「应用管理面板」在**唯一**的「应用」页两处
-// （我的应用 / 应用市场）是同一个，卡片/行的按钮清单完全由数据决定。
+// appdetail-verify.mjs —— 端到端验证「应用」页四个一级 Tab（已安装 / 应用市场 /
+// docker / 一键建站）与「应用管理面板」在**唯一**入口下是同一个，卡片按钮清单
+// 完全由数据决定。
 //
 // 为什么这么搭：
 //   · 真 acorn（tools/check-js-syntax.mjs）只能证明语法合法，证明不了"点开是同一个面板"，
@@ -9,17 +10,22 @@
 //     registerCleanup / routeFor）—— **被验证的三个文件本身一个字符都没有改**；
 //   · 后端用假 fetch：要验的是"按钮由数据决定"，所以给几个代表性应用就够。
 //
-// 历史需求（仍然锁着）：已安装应用卡片上只有「打开/直链/启停/重启/刷新/管理」，
-// 「重装/卸载/文档」收进「⚙️ 管理」面板；刷新按钮文案是「⟳ 刷新」；ffmpeg
+// 历史需求（仍然锁着）：已安装卡片上只有「打开」+ 启停/重启/刷新/管理，
+// 「重装/卸载/文档/直链」收进「⚙️ 管理」面板；刷新按钮文案是「⟳ 刷新」；ffmpeg
 // （no_daemon）不显示"读取中/未在服务管理里"，面板也不去查不存在的记录。
 //
-// 2026-09-17 信息架构合并（服务管理 + 应用市场 → 一个「应用」版块，页内两个 Tab）
-// 新增的验收：
-//   ① 「我的应用」里 php82 **只有一行**（两条服务记录 + 市场条目按归一化 key 合并）；
-//   ② 同一行既有「打开 / 直链」又有「⚙️ 管理」（市场元数据与服务记录都在）；
-//   ③ prefer_direct 的行与管理面板都显示"该应用不支持子路径…"那行**可见**小字；
-//   ④ `#/services` 经 app.js 的别名落到同一个页面并自动切到「我的应用」Tab；
-//   ⑤ 应用市场安装筛选默认「未安装」；纯纳管服务有端口时管理面板给出拼接的「直链」。
+// 2026-09-17 第二版信息架构（四个一级 Tab）新增的验收：
+//   ① 四个 Tab 存在（已安装 / 应用市场 / docker / 一键建站）且默认选中「已安装」，
+//      `#/services` 与 `#/apps/docker` 都能落到对的 Tab；
+//   ② 卡片网格（`.grid` 下的卡片）而不是行；
+//   ③ 已安装卡片**只有「打开」、没有「直链」**；
+//   ④ 不支持子路径的卡片上有那句**逐字**提示
+//      "该应用不支持子路径，请用端口访问，或自行配置反代。"；
+//   ⑤ 应用市场是**一个列表**，同一时刻既有已安装也有未安装条目
+//      （没有安装状态筛选 / 分类筛选下拉）；
+//   ⑥ docker Tab 里**没有任何安装按钮**，且有"预配置 docker compose 文件"的醒目提示，
+//      且每张卡片给出默认端口 / 需要的镜像 / compose 文件的操作；
+//   ⑦ 去重仍然生效：php82 只有一张卡片（两条服务记录 + 市场条目合并成一条）。
 //
 // 用法： export PATH=/opt/homebrew/bin:$PATH; node tools/appdetail-verify.mjs
 import { chromium } from 'playwright';
@@ -127,13 +133,21 @@ const MARKET = {
     },
     {
       // 2026-09-17 用户点名的"反了"：IT-Tools 有面板子路径（ui.slug，且**没有**
-      // prefer_direct），「打开」必须给 /it-tools/、「直链」给端口 8083 ——
-      // 不能因为 /market/proxies 的探测（不带面板会话，子路径 401）翻过来。
+      // prefer_direct），「打开」必须给 /it-tools/；卡片上不再有「直链」。
+      // 它是 docker 推荐项目（docker_rec + 接口给的 images / compose_url）：
+      // 只在「docker」Tab 出现，应用市场里不再有它。
       id: 'it-tools', name: 'IT-Tools（开发者工具箱）', icon: '🧰', category: 'tool', kind: 'compose',
       summary: '几十个开发者常用小工具，纯前端', description: '开发者小工具合集。',
       port: 8083, installed: true, adopted: true, available: true,
       service_label: 'it-tools', service_in_launchd: false, port_url: 'http://192.168.1.4:8083/',
       compose_yaml: 'services:\n  it-tools:\n    image: ghcr.io/corentinth/it-tools:latest\n',
+      // 后端真实字段：App.DockerReference → docker_reference；
+      // market item 还有别名 docker_recommended（见 api_services.go）。
+      docker_reference: true,
+      images: ['ghcr.io/corentinth/it-tools:latest'],
+      compose_url: 'http://192.168.1.8:8090/compose/it-tools/docker-compose.yml',
+      compose_env_url: 'http://192.168.1.8:8090/compose/it-tools/.env.example',
+      compose_readme_url: 'http://192.168.1.8:8090/compose/README.md',
       ui: { slug: 'it-tools' },
       docs_url: 'https://github.com/CorentinTh/it-tools',
       uninstall: { kind: 'service', service: 'it-tools', steps: ['docker compose down（删除容器与网络）'], keep_note: 'compose 应用只删容器与网络，**具名卷（数据）保留**' },
@@ -144,8 +158,19 @@ const MARKET = {
       port: 3001, installed: true, adopted: true, available: true,
       service_label: 'uptime-kuma', service_in_launchd: false, port_url: 'http://192.168.1.4:3001/',
       compose_yaml: 'services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:1\n',
+      // 只有内容、没有下载地址：docker 卡片上必须给「复制 compose 配置」（不能是空操作）。
+      // 标记走 market item 的别名 docker_recommended（前端两个字段都要认）。
+      docker_recommended: true,
       ui: { slug: 'uptime-kuma', prefer_direct: true, note: 'Uptime Kuma 官方不支持子路径' },
       uninstall: { kind: 'service', service: 'uptime-kuma', steps: ['docker compose down（删除容器与网络）'], keep_note: 'compose 应用只删容器与网络，**具名卷（数据）保留**' },
+    },
+    {
+      // docker 推荐项目：接口**既没给标记也没给 compose 内容/地址**（只靠 kind=compose
+      // 兜底进 docker Tab）。卡片上必须把位置留出来并如实说明，而且**仍然不许出现
+      // 任何安装按钮**（用户："不提供安装"）。
+      id: 'n8n-docker', name: 'n8n（推荐 compose 项目）', icon: '🔗', category: 'tool', kind: 'compose',
+      summary: '工作流自动化（推荐用 compose 自己跑）', description: '面板只提供预配置 compose 文件。',
+      port: 5678, installed: false, adopted: false, available: true,
     },
     {
       // 用户点名的那条 bug：命令行工具、故意没有守护进程（目录里 NoDaemon、没有
@@ -168,6 +193,7 @@ const MARKET = {
       installed: true, adopted: false, available: true,
       service_label: 'com.zizdog.stirling-pdf', service_in_launchd: false,
       panel_installer: 'binary-release', config_path: 'stirling.toml',
+      docs_url: 'https://docs.stirlingpdf.com',
       uninstall: { kind: 'installer', service: 'com.zizdog.stirling-pdf', steps: ['停止并删除 launchd 服务'], data_paths: ['/Users/zizdog/stirling-pdf'] },
     },
     {
@@ -208,11 +234,19 @@ const MARKET = {
       uninstall: { kind: 'installer', service: 'com.zizdog.slowapp', steps: ['停止服务'] },
     },
     {
-      // 一键建站类（category: site）：用来证明市场第一个板块「一键建站」确实渲染出来。
+      // 一键建站类（category: site）：只在「一键建站」Tab 出现（市场里不再有）。
       id: 'typecho', name: 'Typecho', icon: '📝', category: 'site', kind: 'native',
       summary: '轻量博客程序', description: '一键装好并配好伪静态。', port: 0,
       installed: false, adopted: false, available: true,
       site_app: { rewrite: 'typecho', finish_path: '/install.php', needs_db: true, notes: [] },
+    },
+    {
+      // 用户点名的一键建站程序之二：WordPress。
+      id: 'wordpress', name: 'WordPress', icon: '📰', category: 'site', kind: 'native',
+      summary: '最流行的建站程序', description: '一键装好并配好伪静态。', port: 0,
+      installed: false, adopted: false, available: true,
+      docs_url: 'https://wordpress.org',
+      site_app: { rewrite: 'wordpress', finish_path: '/wp-admin/install.php', needs_db: true, notes: [] },
     },
     {
       // KindColima 的归类比对：它必须出现在「Docker」筛选档里（它就是 Docker 引擎）。
@@ -302,10 +336,11 @@ await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
 
 await page.goto(base + 'index.html', { waitUntil: 'domcontentloaded' });
 
-// ---------- 3. 渲染两个页面，采集按钮清单 ----------
+// ---------- 3. 渲染四个 Tab（+ 网站管理页），采集卡片与按钮清单 ----------
 const result = await page.evaluate(async () => {
   const root = document.getElementById('root');
-  // 先清掉上一轮/上次运行留下的筛选记忆，保证"默认是全部"这一条可测。
+  // 这里**故意**清一次旧的筛选记忆（zp-market-kind-filter / 安装状态筛选已经随
+  // 改版删除，如果哪天有人把它加回来，下面的"没有筛选下拉"断言会立刻发现）。
   try { localStorage.removeItem('zp-market-kind-filter'); } catch { /* 无 localStorage 也没关系 */ }
   const { AppsView } = await import('./apps.js');
   const { SitesView } = await import('./sites.js');
@@ -363,53 +398,66 @@ const result = await page.evaluate(async () => {
   const closeModal = () => { const m = document.querySelector('.modal-mask'); if (m) m.remove(); };
   const settle = () => new Promise((r) => setTimeout(r, 120));
 
-  const out = { market: {}, sites: {}, myapps: {}, route: {}, panelFromMarket: {}, panelFromService: {}, timeout: {} };
+  const out = {
+    tabs: {}, market: {}, installed: {}, docker: {}, sites: {}, route: {},
+    panelFromMarket: {}, panelFromService: {}, timeout: {},
+  };
   // 网站管理页 LNMP 按钮的引用（见 ①c / ①e）；DOM 节点不进 out。
   let lnmpListBtn = null;
 
   // 采集市场板块标题（顺序有意义：兜底板块「基础环境」必须在最后）。
   const sectionTitles = (box) => Array.from(box.querySelectorAll('.section-title'))
     .map((e) => (e.textContent || '').trim()).filter(Boolean);
-  const cardNamesNow = (box) => Array.from(box.querySelectorAll('.grid > div')).map(cardName);
+  const linkList = (scope) => Array.from(scope.querySelectorAll('a.btn'))
+    .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
+  // 页内 Tab 条：当前选中项的 data-tab（btn-primary 是选中态）。
+  const activeTabOf = (box) => Array.from(box.querySelectorAll('[data-tab]'))
+    .find((b) => b.classList.contains('btn-primary'))?.getAttribute('data-tab') || null;
+  // 卡片上的"已安装"判据：pill 文案里有「已安装」或「已纳管」。
+  const looksInstalled = (c) => /已安装|已纳管/.test(c.textContent || '');
 
-  // ---- ① 应用市场 ----
-  // 合并后应用市场是第二个 Tab（默认落在「我的应用」）；这里显式打开市场 Tab。
+  // ---- ① 四个一级 Tab：存在、默认「已安装」 ----
+  const tabBox = document.createElement('div');
+  root.appendChild(tabBox);
+  AppsView(tabBox, {});
+  await settle(); await settle();
+  out.tabs.labels = Array.from(tabBox.querySelectorAll('[data-tab]')).map((b) => (b.textContent || '').trim());
+  out.tabs.ids = Array.from(tabBox.querySelectorAll('[data-tab]')).map((b) => b.getAttribute('data-tab'));
+  out.tabs.defaultActive = activeTabOf(tabBox);
+  // 默认 Tab 渲染出来的是**卡片网格**（不是行）：#installed-grid 的 class 与卡片数。
+  out.tabs.gridClass = tabBox.querySelector('#installed-grid')?.className || '';
+  out.tabs.gridCards = tabBox.querySelectorAll('#installed-grid > div').length;
+  tabBox.remove();
+
+  // ---- ①a 应用市场：**一个列表**，同一时刻既有已安装也有未安装 ----
   const appsBox = document.createElement('div');
   root.appendChild(appsBox);
   AppsView(appsBox, { tab: 'market' });
   await settle();
   await settle(); // 服务状态是后台补的，等它回来再采按钮
-  // 安装状态筛选（用户要求的「全部 / 未安装 / 已安装」，默认「未安装」）：
-  // 先采默认视图（应只有未安装的应用），再切到「全部」做后面的卡片断言。
-  const installSel = appsBox.querySelector('#apps-install-filter');
-  out.market.installFilterOptions = installSel ? Array.from(installSel.options).map((o) => o.textContent) : null;
-  out.market.installFilterDefault = installSel ? installSel.value : null;
-  out.market.defaultInstallCards = Array.from(appsBox.querySelectorAll('.grid > div')).map(cardName);
-  if (installSel) { installSel.value = ''; installSel.dispatchEvent(new Event('change')); }
-  await settle();
   const acards = Array.from(appsBox.querySelectorAll('.grid > div'));
   out.market.cardNames = acards.map(cardName);
   out.market.buttons = {};
-  for (const c of acards) out.market.buttons[cardName(c)] = btns(c);
-  // 「打开 / 直链」的 href 也要采：文字相同但地址错了照样是 bug
-  // （用户 2026-09-17 报的"it-tools 反了"就是地址被探测翻过来了）。
   out.market.links = {};
+  out.market.text = {};
   for (const c of acards) {
-    out.market.links[cardName(c)] = Array.from(c.querySelectorAll('a.btn'))
-      .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
+    const name = cardName(c);
+    out.market.buttons[name] = btns(c);
+    out.market.links[name] = linkList(c);
+    out.market.text[name] = (c.textContent || '').trim();
   }
-  // 板块标题与头部按钮：用来验「其它」已改名「基础环境」（且在最后），
-  // 以及市场顶部**不再有**「一键 LNMP」入口（它搬到了网站管理）。
+  // 同一时刻两张清单混在一个 Tab 里：已安装的（frpc/IT-Tools 之外的原生）与
+  // 未安装的（Ollama/Colima）必须同时出现。
+  out.market.installedCards = acards.filter(looksInstalled).map(cardName);
+  // 安装状态筛选 / 分类筛选两个下拉都必须**不存在**（用户："始终显示全部"）。
+  out.market.hasInstallFilter = !!appsBox.querySelector('#apps-install-filter');
+  out.market.hasKindFilter = !!appsBox.querySelector('#apps-kind-filter');
   out.market.sectionTitles = sectionTitles(appsBox);
   const headBox = appsBox.querySelector('#apps-head');
   out.market.headButtons = headBox
     ? Array.from(headBox.querySelectorAll('button, a.btn')).map((b) => (b.textContent || '').trim()).filter(Boolean)
     : null;
-  // 筛选下拉：Kind 筛选默认「全部」，三个选项（安装状态筛选见上面的 installSel）。
-  const filter = appsBox.querySelector('#apps-kind-filter');
-  out.market.filterOptions = filter ? Array.from(filter.options).map((o) => o.textContent) : null;
-  out.market.filterDefault = filter ? filter.value : null;
-  // 点开每个应用卡片上的「⚙️ 管理」（面板按钮已改名），逐个采面板快照。
+  // 点开每个应用卡片上的「⚙️ 管理」，逐个采面板快照（与「已安装」卡片那次对照）。
   for (const c of acards) {
     const name = cardName(c);
     const manage = Array.from(c.querySelectorAll('button')).find((b) => b.textContent.includes('管理'));
@@ -419,39 +467,9 @@ const result = await page.evaluate(async () => {
     out.panelFromMarket[name] = panelSnapshot();
     closeModal();
   }
-
-  // ---- ①b 筛选：只看原生 / 只看 Docker（纯前端过滤，按 Kind） ----
-  if (filter) {
-    filter.value = 'native';
-    filter.dispatchEvent(new Event('change'));
-    await settle();
-    out.market.nativeCards = cardNamesNow(appsBox);
-    out.market.nativeSections = sectionTitles(appsBox);
-
-    filter.value = 'docker';
-    filter.dispatchEvent(new Event('change'));
-    await settle();
-    out.market.dockerCards = cardNamesNow(appsBox);
-    out.market.dockerSections = sectionTitles(appsBox);
-    // 选择要能保留：重新渲染一个全新的 AppsView（模拟刷新/切页面回来），
-    // 仍然停在 Docker 档（走 localStorage）；降级路径不会抛异常。
-    out.market.savedFilter = (() => { try { return localStorage.getItem('zp-market-kind-filter'); } catch { return null; } })();
-
-    const appsBox2 = document.createElement('div');
-    root.appendChild(appsBox2);
-    AppsView(appsBox2, { tab: 'market' });
-    await settle(); await settle();
-    const filter2 = appsBox2.querySelector('#apps-kind-filter');
-    out.market.persistedFilter = filter2 ? filter2.value : null;
-    out.market.persistedCards = cardNamesNow(appsBox2);
-    // 复原成「全部」，别让后续采集受筛选影响。
-    if (filter2) { filter2.value = ''; filter2.dispatchEvent(new Event('change')); }
-    await settle();
-    appsBox2.remove();
-  }
   appsBox.remove();
 
-  // ---- ①c 网站管理：一键 LNMP 入口的新位置 ----
+  // ---- ①b 网站管理：一键 LNMP 入口的新位置 ----
   //  空站点列表 → 中间的大按钮；有站点 → 工具条上的次级按钮。
   const sitesBox = document.createElement('div');
   root.appendChild(sitesBox);
@@ -481,31 +499,38 @@ const result = await page.evaluate(async () => {
     .find((b) => (b.textContent || '').includes('LNMP')) || null;
   sitesBox2.remove();
 
-  // ---- ② 我的应用（合并后的 Tab：市场已安装 + 服务记录，去重后一行一条） ----
+  // ---- ② 已安装 Tab：合并去重后**一张卡片一个应用** ----
   const svcBox = document.createElement('div');
   root.appendChild(svcBox);
-  AppsView(svcBox, { tab: 'mine' });
+  AppsView(svcBox, { tab: 'installed' });
   await settle();
   await settle();
-  const mrows = Array.from(svcBox.querySelectorAll('[data-app-key]'));
-  out.myapps.keys = mrows.map((r) => r.getAttribute('data-app-key'));
-  out.myapps.names = mrows.map((r) => r.getAttribute('data-app-name'));
-  out.myapps.toolbarButtons = btns(svcBox.querySelector('#myapps-toolbar'));
-  out.myapps.buttons = {};
-  out.myapps.links = {};
-  out.myapps.text = {};
-  for (const r of mrows) {
+  out.installed.activeTab = activeTabOf(svcBox);
+  out.installed.gridClass = svcBox.querySelector('#installed-grid')?.className || '';
+  const mcards = Array.from(svcBox.querySelectorAll('#installed-grid > div'));
+  // 卡片网格的证据：卡片数 = 网格直接子元素数 = [data-app-key] 总数（没有额外的行清单）。
+  out.installed.gridChildren = svcBox.querySelectorAll('#installed-grid > div').length;
+  out.installed.keysTotal = svcBox.querySelectorAll('[data-app-key]').length;
+  out.installed.keys = mcards.map((r) => r.getAttribute('data-app-key'));
+  out.installed.names = mcards.map((r) => r.getAttribute('data-app-name'));
+  out.installed.toolbarButtons = btns(svcBox.querySelector('#installed-toolbar'));
+  out.installed.buttons = {};
+  out.installed.links = {};
+  out.installed.text = {};
+  for (const r of mcards) {
     const name = r.getAttribute('data-app-name');
-    out.myapps.buttons[name] = btns(r);
-    out.myapps.links[name] = Array.from(r.querySelectorAll('a.btn'))
-      .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
-    out.myapps.text[name] = (r.textContent || '').trim();
+    out.installed.buttons[name] = btns(r);
+    out.installed.links[name] = linkList(r);
+    out.installed.text[name] = (r.textContent || '').trim();
   }
-  // 去重的直接证据：同一个 key 只能出现一次；php82 只能有一行。
-  out.myapps.keyCounts = out.myapps.keys.reduce((m, k) => { m[k] = (m[k] || 0) + 1; return m; }, {});
-  out.myapps.php82Rows = mrows.filter((r) => (r.textContent || '').includes('PHP 8.2')).length;
-  // 从每一行的「⚙️ 管理」点开面板，采快照（与市场卡片那次对照）。
-  for (const r of mrows) {
+  // 去重的直接证据：同一个 key 只能出现一次；php82 只能有一张卡片。
+  out.installed.keyCounts = out.installed.keys.reduce((m, k) => { m[k] = (m[k] || 0) + 1; return m; }, {});
+  out.installed.php82Cards = mcards.filter((r) => (r.textContent || '').includes('PHP 8.2')).length;
+  // 「只显示打开、不显示直链」：任何一张已安装卡片都不许出现「直链」。
+  out.installed.anyDirect = mcards.some((r) => btns(r).some((t) => t.includes('直链')));
+  out.installed.withOpen = mcards.filter((r) => btns(r).some((t) => t === '打开')).map((r) => r.getAttribute('data-app-name'));
+  // 从每一张卡片的「⚙️ 管理」点开面板，采快照（与市场卡片那次对照）。
+  for (const r of mcards) {
     const name = r.getAttribute('data-app-name');
     const manage = Array.from(r.querySelectorAll('button')).find((b) => b.textContent.includes('管理'));
     if (!manage) continue;
@@ -516,18 +541,63 @@ const result = await page.evaluate(async () => {
   }
   svcBox.remove();
 
-  // ---- ②b `#/services` 别名：同一个页面，自动落到「我的应用」Tab ----
-  out.route = { services: routeFor('#/services'), apps: routeFor('#/apps'), dashboard: routeFor('') };
+  // ---- ②b docker Tab：纯展示，**没有任何安装动作** ----
+  const dockerBox = document.createElement('div');
+  root.appendChild(dockerBox);
+  AppsView(dockerBox, { tab: 'docker' });
+  await settle(); await settle();
+  out.docker.activeTab = activeTabOf(dockerBox);
+  // 醒目提示必须包含"预配置的 docker compose 文件"（口径见 apps.js 的 dockerCallout）。
+  out.docker.callout = (dockerBox.querySelector('#docker-callout')?.textContent || '').trim();
+  out.docker.calloutLinks = Array.from((dockerBox.querySelector('#docker-callout') || document.createElement('div')).querySelectorAll('a'))
+    .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
+  const dcards = Array.from(dockerBox.querySelectorAll('#docker-grid > div'));
+  out.docker.names = dcards.map(cardName);
+  out.docker.buttons = {};
+  out.docker.links = {};
+  out.docker.text = {};
+  for (const c of dcards) {
+    const name = cardName(c);
+    out.docker.buttons[name] = btns(c);
+    out.docker.links[name] = linkList(c);
+    out.docker.text[name] = (c.textContent || '').trim();
+  }
+  out.docker.headButtons = btns(dockerBox.querySelector('#docker-head'));
+  dockerBox.remove();
+
+  // ---- ②c 一键建站 Tab：site_app 类条目（typecho / wordpress / freshrss） ----
+  const siteTabBox = document.createElement('div');
+  root.appendChild(siteTabBox);
+  AppsView(siteTabBox, { tab: 'sites' });
+  await settle(); await settle();
+  out.sites.tabActive = activeTabOf(siteTabBox);
+  const stcards = Array.from(siteTabBox.querySelectorAll('#sites-grid > div'));
+  out.sites.cards = stcards.map(cardName);
+  out.sites.buttons = {};
+  for (const c of stcards) out.sites.buttons[cardName(c)] = btns(c);
+  siteTabBox.remove();
+
+  // ---- ②d hash → Tab：`#/services` 落「已安装」，`#/apps/<tab>` 直接指定 ----
+  out.route.services = routeFor('#/services');
+  out.route.apps = routeFor('#/apps');
+  out.route.docker = routeFor('#/apps/docker');
+  out.route.sites = routeFor('#/apps/sites');
+  out.route.dashboard = routeFor('');
   const aliasBox = document.createElement('div');
   root.appendChild(aliasBox);
   AppsView(aliasBox, { tab: out.route.services.tab });
   await settle(); await settle();
-  out.route.activeTab = Array.from(aliasBox.querySelectorAll('[data-tab]'))
-    .find((b) => b.classList.contains('btn-primary'))?.getAttribute('data-tab') || null;
-  out.route.rows = Array.from(aliasBox.querySelectorAll('[data-app-key]')).length;
+  out.route.activeTab = activeTabOf(aliasBox);
+  out.route.cards = aliasBox.querySelectorAll('#installed-grid > div').length;
   aliasBox.remove();
+  const dockerAliasBox = document.createElement('div');
+  root.appendChild(dockerAliasBox);
+  AppsView(dockerAliasBox, { tab: out.route.docker.tab });
+  await settle(); await settle();
+  out.route.dockerActiveTab = activeTabOf(dockerAliasBox);
+  dockerAliasBox.remove();
 
-  // ---- ②c 归一化 key 本身（直接测函数，不依赖 fixture 的渲染布局）----
+  // ---- ②e 归一化 key 本身（直接测函数，不依赖 fixture 的渲染布局）----
   out.keys = {
     phpDot: appKeyOf({ launch_label: 'homebrew.mxcl.php@8.2' }),
     phpDash: appKeyOf({ launch_label: 'sh.brew.php8-2' }),
@@ -552,7 +622,7 @@ const result = await page.evaluate(async () => {
   out.timeout.panel = panelSnapshot();
   closeModal();
 
-  // ---- ①e 点一下 LNMP 按钮：必须调用既有的异步接口 ----
+  // ---- ③b 点一下 LNMP 按钮：必须调用既有的异步接口 ----
   //  用户明确要求"不要改成同步请求"：后端立刻返回 task_id（202），
   //  进度交给任务中心。这里断言请求真的发到了 /market/install-lnmp 且是 POST。
   if (lnmpListBtn) {
@@ -573,14 +643,15 @@ const show = (arr) => (arr || []).join('  |  ') || '（无）';
 const checks = [];
 const check = (label, cond, extra = '') => checks.push({ label, ok: !!cond, extra });
 
-// 用户点名要覆盖的应用：slug → 卡片标题
+// 市场里用户点名要覆盖的应用：slug → 卡片标题。
+// docker 推荐项目（it-tools / uptime-kuma / n8n）已搬去 docker Tab，不在这里。
 const WANT = [
   ['qwen3tts', 'Qwen3 TTS（语音合成）', true],
   ['voicereceiver', 'TtsVoice 音色接收端', true],
   ['frpc', 'frpc（frp 客户端）', true],
   ['orbien-client', 'Orbien 客户端（CLI）', true],
   ['ffmpeg', 'FFmpeg（音视频工具）', true],
-  ['uptime-kuma', 'Uptime Kuma', true],
+  ['stirling-pdf', 'Stirling PDF', true],
   ['ollama', 'Ollama', false],
 ];
 const infoOf = (name) => {
@@ -600,10 +671,41 @@ const infoOf = (name) => {
 // 面板里的按钮（从市场卡片的「⚙️ 管理」点开时采到的快照）。
 const panelOf = (name) => (result.panelFromMarket[name] || {}).buttons || [];
 
-console.log('══════════ ① 应用市场：卡片上的按钮 ══════════');
+console.log('══════════ ① 四个一级 Tab + 卡片网格 ══════════');
+console.log(`  Tab（顺序）：${show(result.tabs.labels)}`);
+console.log(`  Tab（data-tab）：${show(result.tabs.ids)}  默认选中=${result.tabs.defaultActive}`);
+console.log(`  已安装网格 class：${result.tabs.gridClass}  卡片数=${result.tabs.gridCards}`);
+
+console.log('\n══════════ ①a 应用市场：一个列表（同时含已安装与未安装）══════════');
 for (const [n, b] of Object.entries(result.market.buttons)) console.log(`  ${n}\n      ${show(b)}`);
-console.log('\n══════════ ② 我的应用（合并去重后的一行一条）══════════');
-for (const [n, b] of Object.entries(result.myapps.buttons)) console.log(`  ${n}\n      ${show(b)}`);
+console.log(`  已安装的卡片：${show(result.market.installedCards)}`);
+console.log(`  还有安装筛选下拉？ ${result.market.hasInstallFilter ? '有 ✗' : '没有 ✓'}；分类筛选下拉？ ${result.market.hasKindFilter ? '有 ✗' : '没有 ✓'}`);
+console.log(`  板块顺序：${show(result.market.sectionTitles)}`);
+console.log(`  市场顶部按钮：${show(result.market.headButtons)}`);
+
+console.log('\n══════════ ② 已安装 Tab：去重后的卡片网格 ══════════');
+for (const [n, b] of Object.entries(result.installed.buttons)) console.log(`  ${n}\n      ${show(b)}`);
+console.log(`  key：${show(result.installed.keys)}`);
+console.log(`  php82 卡片数：${result.installed.php82Cards}（应为 1）`);
+console.log(`  每个 key 出现次数：${JSON.stringify(result.installed.keyCounts)}`);
+console.log(`  卡片网格 class：${result.installed.gridClass}；网格里的卡片=${result.installed.gridChildren}，[data-app-key] 总数=${result.installed.keysTotal}`);
+console.log(`  PHP 8.2 (FPM) 卡片链接：${show(result.installed.links['PHP 8.2 (FPM)'])}`);
+console.log(`  Uptime Kuma 卡片链接：${show(result.installed.links['Uptime Kuma'])}`);
+console.log(`  Uptime Kuma 卡片文本：${(result.installed.text['Uptime Kuma'] || '').slice(0, 260)}`);
+console.log(`  有「打开」的卡片：${show(result.installed.withOpen)}`);
+console.log(`  任何卡片出现过「直链」？ ${result.installed.anyDirect ? '是 ✗' : '否 ✓'}`);
+console.log(`  已安装工具条：${show(result.installed.toolbarButtons)}`);
+
+console.log('\n══════════ ②b docker Tab：纯展示，没有安装动作 ══════════');
+console.log(`  激活 Tab=${result.docker.activeTab}`);
+console.log(`  醒目提示：${(result.docker.callout || '').slice(0, 200)}`);
+for (const [n, b] of Object.entries(result.docker.buttons)) console.log(`  ${n}\n      按钮 ${show(b)}\n      链接 ${show(result.docker.links[n])}`);
+console.log(`  docker 顶部按钮：${show(result.docker.headButtons)}`);
+console.log(`  n8n 卡片文本：${(result.docker.text['n8n（推荐 compose 项目）'] || '').slice(0, 220)}`);
+
+console.log('\n══════════ ②c 一键建站 Tab ══════════');
+console.log(`  激活 Tab=${result.sites.tabActive}  卡片：${show(result.sites.cards)}`);
+for (const [n, b] of Object.entries(result.sites.buttons)) console.log(`  ${n}\n      ${show(b)}`);
 
 console.log('\n══════════ ③ 覆盖矩阵（用户点名的应用）══════════');
 console.log('  卡片标题'.padEnd(26) + '首按钮'.padEnd(12) + '卡片重装?  面板重装?  卡片文档?');
@@ -612,11 +714,6 @@ for (const [slug, name, installed] of WANT) {
   const panelReinstall = panelOf(name).some((t) => t.includes('重装'));
   console.log(`  ${name.padEnd(24)}${i.primary.padEnd(12)}${(i.reinstall ? '有✗' : '无✓').padEnd(10)}${(panelReinstall ? '有✓' : '无✗').padEnd(12)}${i.docs ? '有✗' : '无✓'}  (${slug})`);
 }
-
-console.log('\n══════════ ③b 打开 / 直链：语义固定（用户 2026-09-17 的"it-tools 反了"）══════════');
-console.log(`  IT-Tools 卡片链接   ${show(result.market.links['IT-Tools（开发者工具箱）'])}`);
-console.log(`  Uptime Kuma 卡片链接 ${show(result.market.links['Uptime Kuma'])}`);
-console.log(`  我的应用 Uptime Kuma ${show(result.myapps.buttons['Uptime Kuma'])}`);
 
 console.log('\n══════════ ④ ffmpeg 那条 bug 的证明 ══════════');
 const ff = infoOf('FFmpeg（音视频工具）');
@@ -640,51 +737,34 @@ const svcFrpc = Object.entries(result.panelFromService).find(([k]) => k.includes
 const mktFrpc = result.panelFromMarket['frpc（frp 客户端）'];
 const same = JSON.stringify(svcFrpc?.buttons) === JSON.stringify(mktFrpc?.buttons)
   && (svcFrpc?.title === mktFrpc?.title);
-console.log(`  frpc：「应用市场 → ⚙️ 管理」与「服务管理 → ⚙️ 管理」`);
+console.log(`  frpc：「应用市场 → ⚙️ 管理」与「已安装 → ⚙️ 管理」`);
 console.log(`    标题  ${mktFrpc?.title}  ⇄  ${svcFrpc?.title}`);
 console.log(`    市场按钮  ${show(mktFrpc?.buttons)}`);
-console.log(`    服务按钮  ${show(svcFrpc?.buttons)}`);
+console.log(`    已安装按钮  ${show(svcFrpc?.buttons)}`);
 console.log(`    结论  ${same ? '✓ 完全一致（同一个面板组件 servicePanel.openServicePanel）' : '✗ 不一致'}`);
 
 console.log('\n=== 后端收到的请求（用于确认面板自己补查了服务记录）===');
 for (const c of result.calls) console.log('  ' + c);
 
-console.log('\n══════════ ⑦ 三处界面调整（LNMP 入口 / 筛选 / 板块改名）══════════');
-console.log(`  市场板块顺序：${show(result.market.sectionTitles)}`);
-console.log(`  市场顶部按钮：${show(result.market.headButtons)}`);
-console.log(`  Kind 筛选：${show(result.market.filterOptions)}  默认值="${result.market.filterDefault}"`);
-console.log(`  安装筛选：${show(result.market.installFilterOptions)}  默认值="${result.market.installFilterDefault}"`);
-console.log(`  默认（未安装）视图卡片：${show(result.market.defaultInstallCards)}`);
-console.log(`  「原生」档卡片：${show(result.market.nativeCards)}`);
-console.log(`  「原生」档板块：${show(result.market.nativeSections)}`);
-console.log(`  「Docker」档卡片：${show(result.market.dockerCards)}`);
-console.log(`  「Docker」档板块：${show(result.market.dockerSections)}`);
-console.log(`  重渲染后 Kind 筛选保留：${result.market.persistedFilter === 'docker' ? 'Docker ✓' : (result.market.persistedFilter || '(空)') + ' ✗'}`);
+console.log('\n══════════ ⑦ hash → Tab / LNMP 入口 / 板块改名 ══════════');
+console.log(`  routeFor('#/services')   = ${JSON.stringify(result.route.services)}`);
+console.log(`  routeFor('#/apps')       = ${JSON.stringify(result.route.apps)}`);
+console.log(`  routeFor('#/apps/docker')= ${JSON.stringify(result.route.docker)}`);
+console.log(`  routeFor('#/apps/sites') = ${JSON.stringify(result.route.sites)}`);
+console.log(`  #/services 渲染后的激活 Tab：${result.route.activeTab}（卡片数 ${result.route.cards}）`);
+console.log(`  #/apps/docker 渲染后的激活 Tab：${result.route.dockerActiveTab}`);
 console.log(`  网站管理（无站点）按钮：${show(result.sites.emptyButtons)}`);
 console.log(`  网站管理（有站点）按钮：${show(result.sites.listButtons)}`);
 console.log(`  LNMP 按钮 title：${result.sites.hint || '（空）'}`);
 console.log(`  LNMP 点击发出的请求：${result.sites.lnmpPostCall || '（无）'}`);
-
-console.log('\n══════════ ⑧ 合并去重 + 子路径提示 + 旧 hash 别名 ══════════');
-console.log(`  我的应用 key：${show(result.myapps.keys)}`);
-console.log(`  php82 行数：${result.myapps.php82Rows}（应为 1）`);
-console.log(`  每个 key 出现次数：${JSON.stringify(result.myapps.keyCounts)}`);
-console.log(`  PHP 8.2 (FPM) 行按钮：${show(result.myapps.buttons['PHP 8.2 (FPM)'])}`);
-console.log(`  PHP 8.2 (FPM) 行链接：${show(result.myapps.links['PHP 8.2 (FPM)'])}`);
-console.log(`  PHP 8.2 (FPM) 行文本：${(result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 220)}`);
-console.log(`  Uptime Kuma 行文本：${(result.myapps.text['Uptime Kuma'] || '').slice(0, 220)}`);
-console.log(`  Uptime Kuma 管理面板文本含提示？ ${(result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径') ? '是 ✓' : '否 ✗'}`);
-console.log(`  routeFor('#/services') = ${JSON.stringify(result.route.services)}`);
-console.log(`  routeFor('#/apps')     = ${JSON.stringify(result.route.apps)}`);
-console.log(`  #/services 渲染后的激活 Tab：${result.route.activeTab}（行数 ${result.route.rows}）`);
-console.log(`  我的应用工具条：${show(result.myapps.toolbarButtons)}`);
 console.log(`  归一化 key：${JSON.stringify(result.keys)}`);
 console.log(`  Qwen3 TTS 面板链接：${show((result.panelFromService['Qwen3 TTS（语音合成）']?.links || []).map((l) => l.text + ' → ' + l.href))}`);
 console.log(`  Qwen3 TTS 面板直链 title：${(result.panelFromService['Qwen3 TTS（语音合成）']?.links || []).find((l) => l.text === '直链')?.title || '（无）'}`);
 
 // ---------- 断言 ----------
-// 2026-09-17 用户要求：卡片上每个应用只保留「打开 / 直链 / 刷新 / 重启 / 停止 /
-// 管理」这一组固定语义动作；「重装 / 卸载 / 文档」全部收进「⚙️ 管理」面板。
+// 用户 2026-09-17 第六条（逐字提示）—— 断言直接比对这一句，改文案必须同步改断言。
+const EXACT_SUBPATH_HINT = '该应用不支持子路径，请用端口访问，或自行配置反代。';
+
 for (const [slug, name, installed] of WANT) {
   const i = infoOf(name);
   if (installed) {
@@ -699,44 +779,205 @@ for (const [slug, name, installed] of WANT) {
   }
 }
 // 有服务可管的已安装应用，刷新按钮文案必须是「⟳ 刷新」
-for (const name of ['Qwen3 TTS（语音合成）', 'TtsVoice 音色接收端', 'frpc（frp 客户端）', 'Orbien 客户端（CLI）', 'Uptime Kuma']) {
+for (const name of ['Qwen3 TTS（语音合成）', 'TtsVoice 音色接收端', 'frpc（frp 客户端）', 'Orbien 客户端（CLI）']) {
   const i = infoOf(name);
   check(`${name}：刷新按钮文案是「⟳ 刷新」`, i.refresh && !i.buttons.some((t) => t.includes('刷新状态')), show(i.buttons));
 }
-// ---------- 打开 / 直链：两颗按钮语义固定，不再按探测结果调换 ----------
-// 用户原话："打开用 https://panel.zizdog.com:8888/it-tools/ 这种，直链用
-// https://192.168.1.4:3000，it-tools 就反了"。所以：
-//   · 打开 = 面板反代子路径 /<slug>/（相对路径），任何应用都一样；
-//   · 直链 = port_url（端口直连）；
-//   · prefer_direct（人工实测子路径不可用）只在「打开」上加 ⚠️ 与 title，
-//     **不**把「打开」换成直连。
-const itLinks = result.market.links['IT-Tools（开发者工具箱）'] || [];
-check('IT-Tools：「打开」是面板子路径 /it-tools/',
-  itLinks.includes('打开 → /it-tools/'), show(itLinks));
-check('IT-Tools：「直链」是端口 8083',
-  itLinks.includes('直链 → http://192.168.1.4:8083/'), show(itLinks));
-const kumaLinks = result.market.links['Uptime Kuma'] || [];
-check('Uptime Kuma（prefer_direct）：「打开」仍是面板子路径 /uptime-kuma/，带 ⚠️',
-  kumaLinks.includes('⚠️ 打开 → /uptime-kuma/'), show(kumaLinks));
-check('Uptime Kuma（prefer_direct）：「直链」是端口 3001',
-  kumaLinks.includes('直链 → http://192.168.1.4:3001/'), show(kumaLinks));
-check('Uptime Kuma：「打开」不再降级成"试试子路径"',
-  !kumaLinks.some((l) => l.includes('试试子路径')), show(kumaLinks));
-// 「我的应用」行用的是**同一份** openDirectActions（市场条目与 port_url 都对上号）。
-const kumaSvc = result.myapps.buttons['Uptime Kuma'] || [];
-check('我的应用：Uptime Kuma 也有「⚠️ 打开 + 直链」（同一份实现）',
-  kumaSvc.includes('⚠️ 打开') && kumaSvc.includes('直链'), show(kumaSvc));
+
+// ---------- ① 四个一级 Tab：存在、默认「已安装」、hash 能指定 ----------
+check('四个一级 Tab 的文案与顺序是「已安装 / 应用市场 / docker / 一键建站」',
+  JSON.stringify(result.tabs.labels) === JSON.stringify(['已安装', '应用市场', 'docker', '一键建站']),
+  show(result.tabs.labels));
+check('四个 Tab 有稳定的 data-tab（installed / market / docker / sites）',
+  JSON.stringify(result.tabs.ids) === JSON.stringify(['installed', 'market', 'docker', 'sites']),
+  show(result.tabs.ids));
+check('默认选中的是「已安装」（data-tab=installed）',
+  result.tabs.defaultActive === 'installed', String(result.tabs.defaultActive));
+check('#/services 落到「已安装」（routeFor + 渲染后的激活 Tab）',
+  result.route.services.id === 'apps' && result.route.services.tab === 'installed'
+  && result.route.activeTab === 'installed',
+  `${JSON.stringify(result.route.services)} active=${result.route.activeTab}`);
+check('#/apps 不带 Tab（由 AppsView 落回「已安装」）',
+  result.route.apps.id === 'apps' && result.route.apps.tab === '', JSON.stringify(result.route.apps));
+check('#/apps/docker 与 #/apps/sites 能直接指定页内 Tab',
+  result.route.docker.id === 'apps' && result.route.docker.tab === 'docker'
+  && result.route.sites.id === 'apps' && result.route.sites.tab === 'sites',
+  `${JSON.stringify(result.route.docker)} ${JSON.stringify(result.route.sites)}`);
+check('#/apps/docker 渲染后的激活 Tab 是 docker',
+  result.route.dockerActiveTab === 'docker', String(result.route.dockerActiveTab));
+
+// ---------- ② 卡片网格（不是行） ----------
+check('已安装 Tab 渲染的是 .grid.grid-3 卡片网格',
+  /(^|\s)grid(\s|$)/.test(result.installed.gridClass) && /(^|\s)grid-3(\s|$)/.test(result.installed.gridClass),
+  result.installed.gridClass);
+check('已安装 Tab 的每个 [data-app-key] 就是网格里的一张卡片（没有额外的行清单）',
+  result.installed.gridChildren > 0 && result.installed.gridChildren === result.installed.keysTotal,
+  `grid=${result.installed.gridChildren} keys=${result.installed.keysTotal}`);
+check('默认 Tab（已安装）也是卡片网格（不是行）',
+  /grid-3/.test(result.tabs.gridClass) && result.tabs.gridCards > 0,
+  `${result.tabs.gridClass} cards=${result.tabs.gridCards}`);
+check('应用市场的卡片挂在 .grid 下', (result.market.cardNames || []).length > 0, show(result.market.cardNames));
+check('docker 的卡片挂在 .grid 下', (result.docker.names || []).length > 0, show(result.docker.names));
+check('一键建站的卡片挂在 .grid 下', (result.sites.cards || []).length > 0, show(result.sites.cards));
+
+// ---------- ③ 已安装卡片只有「打开」、没有「直链」 ----------
+check('已安装：任何卡片都没有「直链」按钮（用户第六条）', !result.installed.anyDirect,
+  show(Object.entries(result.installed.buttons).filter(([, b]) => b.some((t) => t.includes('直链')))));
+check('已安装：至少有一张卡片给了「打开」', (result.installed.withOpen || []).length > 0, show(result.installed.withOpen));
+const phpBtns = result.installed.buttons['PHP 8.2 (FPM)'] || [];
+check('已安装：php82 卡片是「打开 + 启停/重启/刷新/管理」（没有直链）',
+  JSON.stringify(phpBtns) === JSON.stringify(['打开', '停止', '重启', '⟳ 刷新', '⚙️ 管理']),
+  show(phpBtns));
+const phpLinks = result.installed.links['PHP 8.2 (FPM)'] || [];
+check('已安装：php82 支持子路径 → 「打开」是 /php82/',
+  phpLinks.includes('打开 → /php82/'), show(phpLinks));
+const stirlingBtns = result.market.buttons['Stirling PDF'] || [];
+check('应用市场：已安装卡片也只有「打开」（没有直链）',
+  stirlingBtns.includes('打开') && !stirlingBtns.includes('直链'), show(stirlingBtns));
+
+// ---------- ④ 不支持子路径 → 逐字提示 + 端口地址 ----------
+const kumaCard = result.installed.text['Uptime Kuma'] || '';
+check('已安装：Uptime Kuma（prefer_direct）卡片上有那句逐字提示',
+  kumaCard.includes(EXACT_SUBPATH_HINT), kumaCard.slice(0, 300));
+const kumaLinks = result.installed.links['Uptime Kuma'] || [];
+check('已安装：Uptime Kuma 不支持子路径 → 「打开」指向 port_url 的端口',
+  kumaLinks.includes('打开 → http://192.168.1.4:3001/'), show(kumaLinks));
+const stirlingText = result.installed.text['Stirling PDF'] || '';
+check('已安装：没有面板界面但有端口（Stirling PDF）也走端口打开 + 逐字提示',
+  stirlingText.includes(EXACT_SUBPATH_HINT)
+  && (result.installed.links['Stirling PDF'] || []).includes('打开 → http://127.0.0.1:8080/'),
+  `${show(result.installed.links['Stirling PDF'])} | ${stirlingText.slice(0, 200)}`);
+check('已安装：支持子路径的卡片**不**显示那句提示（php82）',
+  !(result.installed.text['PHP 8.2 (FPM)'] || '').includes(EXACT_SUBPATH_HINT),
+  (result.installed.text['PHP 8.2 (FPM)'] || '').slice(0, 240));
+// 管理面板里仍然保留「打开 + 直链」两颗（上一轮用户明确要的，不能删）。
+// 面板里的「打开」沿用 openDirectActions 的固定语义：仍是子路径 /uptime-kuma/
+// （prefer_direct 只加 ⚠️ 警示），「直链」给端口 —— 卡片上那颗「打开」才改走端口。
+const kumaPanelLinks = result.panelFromService['Uptime Kuma']?.links || [];
+check('管理面板：Uptime Kuma 仍然有「打开 + 直链」两颗（直链没被删掉）',
+  kumaPanelLinks.some((l) => l.text.includes('打开') && l.href === '/uptime-kuma/')
+  && kumaPanelLinks.some((l) => l.text === '直链' && l.href === 'http://192.168.1.4:3001/'),
+  show(kumaPanelLinks.map((l) => l.text + ' → ' + l.href)));
+check('管理面板里同样显示"不支持子路径"小字',
+  (result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径'),
+  (result.panelFromService['Uptime Kuma']?.panelText || '').slice(0, 240));
+check('已安装：IT-Tools 支持子路径 → 「打开」是 /it-tools/',
+  (result.installed.links['IT-Tools（开发者工具箱）'] || []).includes('打开 → /it-tools/'),
+  show(result.installed.links['IT-Tools（开发者工具箱）']));
+
 // console_only（frpc 的自带控制台）两个入口都不给。
 const frpcBtns = infoOf('frpc（frp 客户端）').buttons;
 check('frpc（console_only）：不给「打开 / 直链」',
   !frpcBtns.some((t) => t.includes('打开') || t.includes('直链')), show(frpcBtns));
 // 文档：已安装应用在管理面板里，未安装应用留在卡片上（否则没有入口）。
-check('IT-Tools：卡片上没有「文档」，管理面板里有',
-  !infoOf('IT-Tools（开发者工具箱）').docs
-  && panelOf('IT-Tools（开发者工具箱）').includes('文档'),
-  `card=${show(infoOf('IT-Tools（开发者工具箱）').buttons)} panel=${show(panelOf('IT-Tools（开发者工具箱）'))}`);
+check('Stirling PDF（已安装）：卡片上没有「文档」，管理面板里有',
+  !infoOf('Stirling PDF').docs && panelOf('Stirling PDF').includes('文档'),
+  `card=${show(infoOf('Stirling PDF').buttons)} panel=${show(panelOf('Stirling PDF'))}`);
 check('Ollama（未安装）：卡片上保留「文档」（没有管理入口可去）',
   infoOf('Ollama').docs, show(infoOf('Ollama').buttons));
+
+// ---------- ⑤ 应用市场：一个列表，同时有已安装与未安装 ----------
+const mktNames = result.market.cardNames || [];
+check('应用市场同时列出已安装（frpc）与未安装（Ollama）的条目',
+  mktNames.includes('frpc（frp 客户端）') && mktNames.includes('Ollama'), show(mktNames));
+check('应用市场里确实有「已安装」pill 的卡片（不是只显示未安装）',
+  (result.market.installedCards || []).includes('frpc（frp 客户端）'), show(result.market.installedCards));
+check('应用市场没有安装状态筛选 / 分类筛选两个下拉（始终显示全部）',
+  !result.market.hasInstallFilter && !result.market.hasKindFilter,
+  `install=${result.market.hasInstallFilter} kind=${result.market.hasKindFilter}`);
+check('未安装的 Ollama 卡片是「安装 + 文档」',
+  JSON.stringify(result.market.buttons['Ollama']) === JSON.stringify(['安装', '文档']),
+  show(result.market.buttons['Ollama']));
+check('docker 推荐项目不出现在应用市场（it-tools / Uptime Kuma / n8n）',
+  !mktNames.includes('IT-Tools（开发者工具箱）') && !mktNames.includes('Uptime Kuma')
+  && !mktNames.includes('n8n（推荐 compose 项目）'),
+  show(mktNames));
+check('站点应用不出现在应用市场（typecho / wordpress）',
+  !mktNames.includes('Typecho') && !mktNames.includes('WordPress'), show(mktNames));
+check('Docker 运行时（Colima）留在应用市场（它是运行时，要能安装，不是推荐项目）',
+  mktNames.includes('Docker 运行时（Colima）'), show(mktNames));
+check('市场板块顺序（站点/docker 空板块被跳过）',
+  JSON.stringify(result.market.sectionTitles) === JSON.stringify(['AI 服务', '运维工具', '基础环境']),
+  show(result.market.sectionTitles));
+check('市场最后一个板块仍是「基础环境」，且不再出现旧名「其它」',
+  result.market.sectionTitles.at(-1) === '基础环境' && !result.market.sectionTitles.includes('其它'),
+  show(result.market.sectionTitles));
+check('市场顶部不再有「一键 LNMP」入口',
+  !(result.market.headButtons || []).some((t) => t.includes('LNMP')), show(result.market.headButtons));
+
+// ---------- ⑥ docker Tab：纯展示、没有安装动作、有醒目提示 ----------
+check('docker Tab 有「预配置的 docker compose 文件」的醒目提示（含随机密钥说明）',
+  (result.docker.callout || '').includes('预配置的 docker compose 文件')
+  && (result.docker.callout || '').includes('随机密钥'),
+  (result.docker.callout || '').slice(0, 200));
+const dockerBad = /安装|部署|启停|停止|启动|重启|卸载|删除|管理/;
+const dockerOffenders = Object.entries(result.docker.buttons).filter(([, b]) => b.some((t) => dockerBad.test(t)));
+check('docker Tab 的卡片上没有任何安装/部署/启停/卸载按钮',
+  dockerOffenders.length === 0, JSON.stringify(dockerOffenders));
+check('docker Tab 顶部也没有安装动作（只有刷新）',
+  JSON.stringify(result.docker.headButtons) === JSON.stringify(['⟳ 刷新']),
+  show(result.docker.headButtons));
+check('docker Tab 列出接口标记的推荐项目（it-tools / Uptime Kuma / n8n）',
+  ['IT-Tools（开发者工具箱）', 'Uptime Kuma', 'n8n（推荐 compose 项目）'].every((n) => (result.docker.names || []).includes(n)),
+  show(result.docker.names));
+check('docker 卡片给出默认端口（it-tools 8083）',
+  (result.docker.text['IT-Tools（开发者工具箱）'] || '').includes('默认端口 :8083'),
+  (result.docker.text['IT-Tools（开发者工具箱）'] || '').slice(0, 200));
+check('docker 卡片给出需要的镜像（接口给的 images 优先）',
+  (result.docker.text['IT-Tools（开发者工具箱）'] || '').includes('ghcr.io/corentinth/it-tools:latest'),
+  (result.docker.text['IT-Tools（开发者工具箱）'] || '').slice(0, 240));
+check('docker 卡片：有 compose 内容 → 「复制 compose 配置」',
+  (result.docker.buttons['Uptime Kuma'] || []).includes('复制 compose 配置'),
+  show(result.docker.buttons['Uptime Kuma']));
+check('docker 卡片：有 compose 地址 → 「打开 compose 文件」指向接口给的 URL',
+  (result.docker.links['IT-Tools（开发者工具箱）'] || [])
+    .includes('打开 compose 文件 → http://192.168.1.8:8090/compose/it-tools/docker-compose.yml'),
+  show(result.docker.links['IT-Tools（开发者工具箱）']));
+check('docker 卡片：有 compose_env_url → 「变量样例」（.env.example）',
+  (result.docker.links['IT-Tools（开发者工具箱）'] || [])
+    .includes('变量样例 → http://192.168.1.8:8090/compose/it-tools/.env.example'),
+  show(result.docker.links['IT-Tools（开发者工具箱）']));
+check('docker 顶部提示给出全部推荐项目的总索引（compose_readme_url）',
+  (result.docker.calloutLinks || [])
+    .includes('查看全部推荐项目的 compose 说明 ↗ → http://192.168.1.8:8090/compose/README.md'),
+  show(result.docker.calloutLinks));
+check('docker 卡片：接口没给 compose 内容/地址时留出位置并如实说明（n8n）',
+  (result.docker.text['n8n（推荐 compose 项目）'] || '').includes('接口还没有提供这个项目的 compose 文件内容/地址'),
+  (result.docker.text['n8n（推荐 compose 项目）'] || '').slice(0, 240));
+
+// ---------- ⑦ 一键建站 Tab ----------
+check('一键建站 Tab 列出 site_app 条目（Typecho / WordPress）',
+  (result.sites.cards || []).includes('Typecho') && (result.sites.cards || []).includes('WordPress'),
+  show(result.sites.cards));
+check('一键建站卡片给「一键建站」按钮（WordPress 还有「文档」），没有「安装」',
+  JSON.stringify(result.sites.buttons['Typecho']) === JSON.stringify(['一键建站'])
+  && JSON.stringify(result.sites.buttons['WordPress']) === JSON.stringify(['一键建站', '文档']),
+  `typecho=${show(result.sites.buttons['Typecho'])} wordpress=${show(result.sites.buttons['WordPress'])}`);
+check('一键建站 Tab 渲染后的激活 Tab 是 sites',
+  result.sites.tabActive === 'sites', String(result.sites.tabActive));
+
+// ---------- ⑧ 去重 + 同一个面板 ----------
+check('已安装：php82 只有一张卡片（两条服务记录 + 市场条目合并成一条）',
+  result.installed.php82Cards === 1, `实际 ${result.installed.php82Cards} 张`);
+check('已安装：每个归一化 key 只出现一次',
+  Object.values(result.installed.keyCounts || {}).every((n) => n === 1),
+  JSON.stringify(result.installed.keyCounts));
+check('已安装：php82 卡片状态取"在跑的那条记录"（运行中）',
+  (result.installed.text['PHP 8.2 (FPM)'] || '').includes('运行中'),
+  (result.installed.text['PHP 8.2 (FPM)'] || '').slice(0, 140));
+check('已安装：php82 卡片如实标出被合并掉的记录条数',
+  (result.installed.text['PHP 8.2 (FPM)'] || '').includes('已合并 1 条记录'),
+  (result.installed.text['PHP 8.2 (FPM)'] || '').slice(0, 240));
+check('去重：被丢弃记录的字段（plist 路径）并进了保留的那条',
+  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').includes('homebrew.mxcl.php@8.2.plist'),
+  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').slice(0, 400));
+check('已安装工具条：有「🔍 扫描可纳管服务」与「+ 注册服务」（可纳管功能没丢）',
+  (result.installed.toolbarButtons || []).includes('🔍 扫描可纳管服务')
+  && (result.installed.toolbarButtons || []).includes('+ 注册服务'),
+  show(result.installed.toolbarButtons));
+check('市场 / 已安装打开的是同一个面板', same);
+
+// ---------- ⑨ ffmpeg / 超时 / 归一化 / 管理面板 ----------
 check('ffmpeg 面板不显示「未纳管 / 面板里没有服务记录」（它是 CLI 工具，不是"没纳管"）',
   !/未纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || ''));
 check('ffmpeg 面板不显示「读取中」', !(ffPanel.panelText || '').includes('读取中'));
@@ -744,61 +985,6 @@ check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', (ffPan
 check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups.join(', '));
 check('超时兜底：面板一定落定（无"读取中"）', !/读取中|正在读取/.test(to.panelText || ''), to.status);
 check('超时兜底：在硬上限内落定', result.timeout.elapsedMs < 12000, result.timeout.elapsedMs + 'ms');
-check('市场 / 我的应用打开的是同一个面板', same);
-
-// ---------- ⑧ 合并去重 + 子路径提示 + 旧 hash 别名（用户 2026-09-17 的四条要求）----------
-// 「服务管理/apps 合并」的核心价值就是去重，所以断言必须落在"php82 只有一行"上，
-// 而不是"页面上出现过 php82"这种弱断言。
-check('我的应用：php82 只有一行（两条服务记录 + 市场条目合并成一条）',
-  result.myapps.php82Rows === 1, `实际 ${result.myapps.php82Rows} 行`);
-check('我的应用：每个归一化 key 只出现一次',
-  Object.values(result.myapps.keyCounts || {}).every((n) => n === 1),
-  JSON.stringify(result.myapps.keyCounts));
-const phpBtns = result.myapps.buttons['PHP 8.2 (FPM)'] || [];
-check('我的应用：php82 同一行既有「打开 / 直链」又有「⚙️ 管理」',
-  phpBtns.includes('打开') && phpBtns.includes('直链') && phpBtns.some((t) => t.includes('管理')),
-  show(phpBtns));
-const phpLinks = result.myapps.links['PHP 8.2 (FPM)'] || [];
-check('我的应用：php82 行的市场元数据没丢（打开 /php82/、直链端口 9000）',
-  phpLinks.includes('打开 → /php82/') && phpLinks.includes('直链 → http://192.168.1.4:9000/'),
-  show(phpLinks));
-check('我的应用：php82 行状态取"在跑的那条记录"（运行中）',
-  (result.myapps.text['PHP 8.2 (FPM)'] || '').includes('运行中'),
-  (result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 140));
-check('我的应用：php82 行如实标出被合并掉的记录条数',
-  (result.myapps.text['PHP 8.2 (FPM)'] || '').includes('已合并 1 条记录'),
-  (result.myapps.text['PHP 8.2 (FPM)'] || '').slice(0, 240));
-check('去重：被丢弃记录的字段（plist 路径）并进了保留的那条',
-  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').includes('homebrew.mxcl.php@8.2.plist'),
-  (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').slice(0, 400));
-// prefer_direct 的**可见**文案（用户第四条：只有 ⚠️ 没有任何解释）
-const kumaRowText = result.myapps.text['Uptime Kuma'] || '';
-check('我的应用：Uptime Kuma（prefer_direct）行显示"不支持子路径"小字 + ui.note 原文',
-  kumaRowText.includes('该应用不支持子路径') && kumaRowText.includes('Uptime Kuma 官方不支持子路径'),
-  kumaRowText.slice(0, 240));
-check('管理面板里同样显示"不支持子路径"小字',
-  (result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径'),
-  (result.panelFromService['Uptime Kuma']?.panelText || '').slice(0, 240));
-// 旧 hash 必须继续可用（老书签/文档里到处是 #/services）
-check('routeFor("#/services") 落到 apps 版块的「我的应用」Tab',
-  result.route.services.id === 'apps' && result.route.services.tab === 'mine',
-  JSON.stringify(result.route.services));
-check('#/apps 走默认（同一版块，tab 由 AppsView 定为「我的应用」）',
-  result.route.apps.id === 'apps' && result.route.apps.tab === '', JSON.stringify(result.route.apps));
-check('#/services 渲染出的页面激活 Tab 是「我的应用」且有行',
-  result.route.activeTab === 'mine' && result.route.rows > 0,
-  `tab=${result.route.activeTab} rows=${result.route.rows}`);
-// 应用市场默认「未安装」
-check('应用市场安装筛选是「全部 / 未安装 / 已安装」，默认「未安装」',
-  JSON.stringify(result.market.installFilterOptions) === JSON.stringify(['全部', '未安装', '已安装'])
-  && result.market.installFilterDefault === 'missing',
-  `${show(result.market.installFilterOptions)} default=${result.market.installFilterDefault}`);
-check('市场默认视图只列未安装应用（Ollama 在，frpc 不在）',
-  (result.market.defaultInstallCards || []).includes('Ollama')
-  && !(result.market.defaultInstallCards || []).includes('frpc（frp 客户端）'),
-  show(result.market.defaultInstallCards));
-
-// ---------- ⑨ 去重规则本身 + 直链兜底 + 可纳管入口 ----------
 check('归一化：php@8.2 / php8-2 / php82 / php8.2 收敛成同一个 key（=php82）',
   new Set([result.keys.phpDot, result.keys.phpDash, result.keys.phpName, result.keys.phpPlain]).size === 1
   && result.keys.phpDot === 'php82',
@@ -809,14 +995,6 @@ check('归一化：市场展示名（Stirling PDF）与服务记录名（stirlin
 check('归一化：com.zizdog.* 前缀的不同写法同 key',
   result.keys.frpcMarket === result.keys.frpcSvc && result.keys.cnfjSvc === result.keys.frpcSvc,
   JSON.stringify(result.keys));
-check('我的应用工具条：有「🔍 扫描可纳管服务」与「+ 注册服务」（可纳管功能没丢）',
-  (result.myapps.toolbarButtons || []).includes('🔍 扫描可纳管服务')
-  && (result.myapps.toolbarButtons || []).includes('+ 注册服务'),
-  show(result.myapps.toolbarButtons));
-const kumaBtns = result.myapps.buttons['Uptime Kuma'] || [];
-check('我的应用：Uptime Kuma 行的按钮就是那组固定语义（顺序也对）',
-  JSON.stringify(kumaBtns) === JSON.stringify(['⚠️ 打开', '直链', '停止', '重启', '⟳ 刷新', '⚙️ 管理']),
-  show(kumaBtns));
 const qwenPanel = result.panelFromService['Qwen3 TTS（语音合成）'] || {};
 const qwenDirect = (qwenPanel.links || []).find((l) => l.text === '直链');
 check('管理面板：纯纳管服务（无 port_url）有端口 → 给出拼接的「直链」，title 说明局限',
@@ -827,41 +1005,6 @@ check('管理面板：既没有界面也没有端口 → 不给打开按钮，�
   (orbienPanel.panelText || '').includes('没有可用的打开入口')
   && !(orbienPanel.buttons || []).some((t) => t === '打开' || t === '直链'),
   `buttons=${show(orbienPanel.buttons)} text=${(orbienPanel.panelText || '').slice(0, 120)}`);
-
-// ---------- 三处界面调整（用户本轮明确要求） ----------
-//
-// ① 一键 LNMP 入口搬到「网站管理」、市场里移除；
-// ② 市场顶部加「全部 / 原生 / Docker」筛选（按 Kind，纯前端，选择保留）；
-// ③ 市场最后一个板块「其它」改名「基础环境」（中文名只有后端一处定义）。
-const secTitles = result.market.sectionTitles || [];
-check('市场最后一个板块是「基础环境」', secTitles[secTitles.length - 1] === '基础环境', show(secTitles));
-check('市场不再出现旧板块名「其它」', !secTitles.includes('其它'), show(secTitles));
-check('市场板块顺序照后端来（一键建站 → AI 服务 → 运维工具 → 基础环境）',
-  JSON.stringify(secTitles) === JSON.stringify(['一键建站', 'AI 服务', '运维工具', '基础环境']), show(secTitles));
-check('市场顶部不再有「一键 LNMP」入口',
-  !(result.market.headButtons || []).some((t) => t.includes('LNMP')), show(result.market.headButtons));
-check('筛选下拉是「全部 / 原生 / Docker」三选一',
-  JSON.stringify(result.market.filterOptions) === JSON.stringify(['全部', '原生', 'Docker']),
-  show(result.market.filterOptions));
-check('筛选默认「全部」', result.market.filterDefault === '', String(result.market.filterDefault));
-// 原生档：原生应用在，compose 的 Uptime Kuma 与 KindColima 的 Docker 运行时都不在
-check('「原生」档只留原生应用（frpc/Nginx 在，Kuma/Colima 不在）',
-  (result.market.nativeCards || []).includes('frpc（frp 客户端）')
-  && (result.market.nativeCards || []).includes('Nginx')
-  && !(result.market.nativeCards || []).includes('Uptime Kuma')
-  && !(result.market.nativeCards || []).includes('Docker 运行时（Colima）'),
-  show(result.market.nativeCards));
-// Docker 档：compose + KindColima 都在（Colima 归 Docker 档），原生不在
-check('「Docker」档含 compose 与 KindColima（Colima 归 Docker 档）',
-  (result.market.dockerCards || []).includes('Uptime Kuma')
-  && (result.market.dockerCards || []).includes('Docker 运行时（Colima）')
-  && !(result.market.dockerCards || []).includes('frpc（frp 客户端）'),
-  show(result.market.dockerCards));
-check('筛选选择写入 localStorage', result.market.savedFilter === 'docker', String(result.market.savedFilter));
-check('重渲染后筛选选择保留（仍停在 Docker 档）',
-  result.market.persistedFilter === 'docker'
-  && (result.market.persistedCards || []).includes('Uptime Kuma'),
-  `value=${result.market.persistedFilter} cards=${show(result.market.persistedCards)}`);
 
 // 网站管理页的 LNMP 入口：空站点给大按钮，有站点给工具条次级按钮。
 check('网站管理（空站点）：有「一键 LNMP」入口',
