@@ -565,6 +565,37 @@ const ZPF_LINE_HEIGHT = 20;
 const ZPF_PAD = '10px 12px';
 const ZPF_CSS_ID = 'zpf-editor-style';
 
+// ---------------- 编辑器配色（跟随面板 / Monokai） ----------------
+//
+// 编辑器是面板里唯一的"长时间盯着的代码界面"，所以给它一套**独立于面板主题**的配色。
+// 两档：跟随面板（默认，行为与以前完全一致）/ Monokai（经典取值，深色）。
+// 选择要持久化 —— 每次打开文件都要重选一次的话这个开关就等于没有。
+// 键名刻意与面板主题 'zp-theme'、应用市场筛选 'zp-market-kind-filter' 区分开，
+// 互不覆盖：改编辑器配色不该把面板切到深色，反之亦然。
+const ZPF_THEME_KEY = 'zp-file-editor-theme';
+const ZPF_THEME_PANEL = 'panel';     // 跟随面板（浅色/深色都走原来的规则）
+const ZPF_THEME_MONOKAI = 'monokai';
+
+function readEditorTheme() {
+  // localStorage 在隐私模式/被禁用时会抛异常，读不到就退回默认值
+  try {
+    return localStorage.getItem(ZPF_THEME_KEY) === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
+  } catch { return ZPF_THEME_PANEL; }
+}
+
+function saveEditorTheme(v) {
+  try { localStorage.setItem(ZPF_THEME_KEY, v); } catch { /* 存不了就算了，本次会话仍然生效 */ }
+}
+
+/**
+ * applyEditorThemeTo(el, v) —— 把配色作用到弹窗根节点。
+ * 只加/去一个类，样式全在 ensureEditorStyle() 注入的 CSS 里。
+ * 不动 :root，所以面板主题不受影响，同页面其它弹窗也不会被带成黑底。
+ */
+function applyEditorThemeTo(el, v) {
+  if (el) el.classList.toggle('zpf-monokai', v === ZPF_THEME_MONOKAI);
+}
+
 function zpfTextStyle() {
   return {
     fontFamily: 'var(--mono)',
@@ -881,6 +912,70 @@ function ensureEditorStyle() {
     ':root[data-theme="light"] .zpf-typ { color: #0f766e; }',
     ':root[data-theme="light"] .zpf-vr, :root[data-theme="light"] .zpf-attr { color: #a16207; }',
     ':root[data-theme="light"] .zpf-tag, :root[data-theme="light"] .zpf-imp { color: #b91c1c; }',
+
+    // ---------------- Monokai（只作用于编辑器弹窗） ----------------
+    //
+    // 面板全局只有浅色/深色两套，编辑器要的是第三套**互不干扰**的配色，所以不去动
+    // :root，而是挂在编辑器自己的弹窗根节点 .zpf-monokai 上。用户没选 Monokai 时
+    // 这条规则完全不参与匹配，浅色/深色下的观感与以前逐像素一致。
+    //
+    // 重定义面板变量而不是逐个覆盖内联样式：编辑器的背景、行号槽、查找条背景的内联
+    // 样式里写的都是 var(--xxx)（见 editorModal），变量在这里被重定义后它们自动跟着变；
+    // 面板对这些元素没有 !important，且正文文字在编辑器里本来就由高亮层画，
+    // 所以只用 .zpf-monokai 这一个类就能整套换色。
+    '.zpf-monokai {',
+    '  --bg-soft: #272822; --panel: #272822; --panel-2: #34352c;',
+    '  --border: #49483e; --border-soft: #3b3c33; --text: #f8f8f2; --text-mute: #b9b9ae;',
+    '  background: #272822; border-color: #49483e;',
+    '}',
+    '.zpf-monokai .modal-head, .zpf-monokai .modal-foot { border-color: #3b3c33; }',
+    '.zpf-monokai .modal-head h3, .zpf-monokai .hint { color: #f8f8f2; }',
+    '.zpf-monokai .modal-close { color: #b9b9ae; }',
+    '.zpf-monokai .modal-close:hover { color: #f8f8f2; }',
+    // 工具栏/查找条里的 input、下拉都是 var(--bg-soft) 底色 + 面板默认的深色文字，
+    // Monokai 下 --bg-soft 变成 #272822，文字却还是深色 —— 实测"配色"下拉成了
+    // 近黑底上的近黑字，基本看不见。这里把文字/占位符一起提亮。
+    '.zpf-monokai .select, .zpf-monokai .input { color: #f8f8f2; }',
+    '.zpf-monokai .input::placeholder { color: #9a9a90; }',
+    '.zpf-monokai .select option { background: #272822; color: #f8f8f2; }',
+    '.zpf-monokai .zpf-editor { background: #272822; border-color: #49483e; }',
+    '.zpf-monokai .zpf-code, .zpf-monokai .zpf-hitbox, .zpf-monokai .zpf-lines { color: #f8f8f2; }',
+    '.zpf-monokai .zpf-ta { caret-color: #f8f8f2; }',
+    '.zpf-monokai .zpf-ta.zpf-plain { color: #f8f8f2 !important; -webkit-text-fill-color: #f8f8f2; }',
+    '.zpf-monokai .zpf-ta::selection { background: rgba(73, 72, 62, .85); }',
+    '.zpf-monokai .zpf-hit { background: rgba(230, 219, 116, .35); }',
+    '.zpf-monokai .zpf-hit-cur { background: rgba(249, 38, 114, .55); box-shadow: 0 0 0 1px rgba(249, 38, 114, .9); }',
+    // 经典 Monokai 取值：注释 #75715e / 字符串 #e6db74 / 关键字 #f92672 /
+    // 数字 #ae81ff / 函数名 #a6e22e / 类型·类名 #66d9ef。
+    //
+    // 这里必须带 `:root`：上面的浅色规则是 `:root[data-theme="light"] .zpf-kw`，
+    // 选择器权重 (0,3,0) 比 `.zpf-monokai .zpf-kw` 的 (0,2,0) 高，浅色面板下会直接
+    // 把 Monokai 的配色顶掉（真机验证时就是这样：字全是浅色主题的颜色）。
+    // 补一个 :root 让权重相同，靠"后写的那条赢"取胜。
+    ':root .zpf-monokai .zpf-com { color: #75715e; }',
+    ':root .zpf-monokai .zpf-str { color: #e6db74; }',
+    ':root .zpf-monokai .zpf-num { color: #ae81ff; }',
+    ':root .zpf-monokai .zpf-kw, :root .zpf-monokai .zpf-at, :root .zpf-monokai .zpf-sec { color: #f92672; }',
+    ':root .zpf-monokai .zpf-fn, :root .zpf-monokai .zpf-key { color: #a6e22e; }',
+    ':root .zpf-monokai .zpf-typ { color: #66d9ef; }',
+    ':root .zpf-monokai .zpf-vr, :root .zpf-monokai .zpf-attr { color: #fd971f; }',
+    ':root .zpf-monokai .zpf-tag, :root .zpf-monokai .zpf-imp { color: #f92672; }',
+    ':root .zpf-monokai .zpf-hd { color: #a6e22e; }',
+    ':root .zpf-monokai .zpf-link { color: #66d9ef; }',
+    ':root .zpf-monokai .zpf-b { color: #ae81ff; }',
+
+    // ---------------- 弹窗最小化（ui.js modal({minimizable:true})） ----------------
+    //
+    // 正文/页脚由 ui.js 用 display:none 隐藏（DOM 不销毁，编辑内容与光标都在），
+    // 这里只负责"看起来收成了右下角一条标题栏"。
+    // 遮罩整层藏掉：不然一条细窗口底下压着一层半透明全屏黑幕，页面上什么都看不清。
+    '.modal-mask.zp-min { background: transparent; backdrop-filter: none; pointer-events: none; }',
+    // 收起时必须固定定位并指定宽度：弹窗本来是 grid 居中项，宽度由 max-width 决定，
+    // 不给宽度就会撑成整行。position:fixed 会脱离 grid 容器，right/bottom 才生效。
+    '.modal.zp-min { position: fixed; right: 20px; bottom: 20px; width: min(420px, calc(100vw - 40px)); height: auto !important; max-height: none !important; z-index: 300; pointer-events: auto; cursor: pointer; }',
+    '.zp-min-status { font-size: 12px; color: var(--text-mute); margin-right: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }',
+    '.zp-min-status.zpf-dirty { color: var(--warn); font-weight: 600; }',
+    '.zp-min-btn { font-size: 15px; padding: 0 6px; }',
   ].join('\n');
   document.head.appendChild(st);
 }
@@ -970,10 +1065,15 @@ function editorModal(entry, res) {
   let dirty = false;
   let dense = false;   // 代码过密（token 超预算）→ 永久退回纯文本，避免每次输入都要重绘几万个 span
   let maximized = false;
+  let collapsed = false;  // 最小化（收成右下角一条标题栏），由下面的 restoreView() 维护
   let firstFocus = true;
   let rafId = 0;
   let lastHint = '';
   let m = null;
+
+  // 最小化时编辑器整体 display:none。高亮层/命中层的滚动同步依赖 clientHeight，
+  // 隐藏状态下算出来的都是 0，所以这类计算要先问一句"看得见吗"。
+  function boxHidden() { return collapsed; }
 
   function setHint(msg) {
     if (msg === lastHint) return;
@@ -1013,6 +1113,10 @@ function editorModal(entry, res) {
   }
 
   function render() {
+    // 最小化期间不重绘，也不做滚动同步：编辑器是 display:none，clientHeight 全是 0，
+    // 这时候算出来的命中窗口和 transform 都是错的，只是在浪费 CPU。
+    // 内容本来就在 textarea 的 value 里，还原时 restoreView() 会重新走一遍完整版。
+    if (boxHidden()) return;
     const text = editor.value;
     const tooBig = text.length > HL_MAX_CHARS;
     const overlay = !!lang && !tooBig && !dense;
@@ -1260,6 +1364,9 @@ function editorModal(entry, res) {
    * 再整篇镜像一份、每次滚动都重排，就是白白的双倍开销。
    */
   function paintHits() {
+    // 最小化时编辑器是 display:none，clientHeight 为 0：这时候画命中只会画出一个
+    // 一行的窗口（错误的色块位置）。直接跳过，还原时由 restoreView() 重画。
+    if (boxHidden()) { hitLayer.style.display = 'none'; return; }
     if (!findOpen || !findInput.value || !matches.length) {
       hitLayer.style.display = 'none';
       clear(hitInner);
@@ -1506,7 +1613,20 @@ function editorModal(entry, res) {
     text: '⛶ 屏幕全屏', title: '调用系统全屏，Esc 退出',
     onclick: toggleFullscreen,
   });
+  // 配色选择：两档（跟随面板 / Monokai），选择存 localStorage（见 ZPF_THEME_KEY）。
+  // 排在工具栏最前面，避免被右侧的查找/全屏按钮挤到换行之外看不见。
+  const themeSel = h('select.select', {
+    title: '编辑器配色（选择会记住）',
+    style: { width: 'auto', fontSize: '12.5px', padding: '5px 26px 5px 8px' },
+    onchange: () => applyEditorTheme(themeSel.value),
+  }, [
+    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板' }),
+    h('option', { value: ZPF_THEME_MONOKAI, text: '配色：Monokai' }),
+  ]);
+  themeSel.value = readEditorTheme();
+
   const toolbar = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } }, [
+    themeSel,
     h('code.code', { text: entry.path }),
     stat,
     langPill,
@@ -1530,9 +1650,23 @@ function editorModal(entry, res) {
     try {
       await api.fileWrite(entry.path, editor.value);
       dirty = false;
+      syncStatus();
       toast('已保存', 'ok');
       return true;
     } catch (e) { toast(e.message, 'err', 10000); return false; }
+  }
+
+  // 未保存时才拦一道。ui.js 的 onRequestClose 对"关闭按钮 / 遮罩 / Esc"三条路径一视同仁，
+  // 而我们下面把后两条关掉了，所以实际只有关闭按钮会走到这里。
+  function confirmDiscard() {
+    return !dirty || confirm('有未保存的修改，确定关闭？');
+  }
+
+  // 未保存提示写进标题栏（最小化后它是唯一还看得见的区域），否则收起来之后
+  // 用户完全不知道里面还有没保存的改动。
+  function syncStatus() {
+    // m 可能还没赋值（本函数只在 modal() 之后被调用，这里只是兜底）
+    m?.setStatus(dirty ? '● 未保存' : '');
   }
 
   m = modal({
@@ -1542,13 +1676,23 @@ function editorModal(entry, res) {
     footer: () => [
       h('button.btn', {
         text: '取消',
-        onclick: () => { if (!dirty || confirm('有未保存的修改，确定关闭？')) m.close(); },
+        // 已保存（或没改过）时直接关，走不到确认框；有改动才问
+        onclick: () => { if (confirmDiscard()) m.close(); },
       }),
       h('button.btn.btn-primary', {
         text: '保存',
         onclick: async () => { if (await writeBack()) m.close(); },
       }),
     ],
+    // ① 只能通过关闭按钮关闭：Esc 与点遮罩都不关。
+    //    为什么只给文件编辑器：其它弹窗都是"填错就重来"的短表单，点遮罩放弃是符合
+    //    直觉的；编辑器里可能是十几分钟的改动，误触一下就没了的代价太大。
+    closeOnEsc: false,
+    closeOnBackdrop: false,
+    onRequestClose: confirmDiscard,
+    // ② 最小化：点标题栏的「—」收成右下角一条标题栏，再点还原。
+    minimizable: true,
+    onMinimize: (on) => { collapsed = on; if (!on) restoreView(); },
     onClose: () => {
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
@@ -1562,9 +1706,41 @@ function editorModal(entry, res) {
     },
   });
 
+  /**
+   * applyEditorTheme(v) —— 切编辑器配色并把选择记下来。
+   * 用户没选 Monokai 时（默认）面板原来的浅色/深色规则原样生效。
+   */
+  function applyEditorTheme(v) {
+    const val = v === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
+    applyEditorThemeTo(m.el, val);
+    saveEditorTheme(val);
+    themeSel.value = val;
+  }
+
+  /**
+   * restoreView() —— 从"最小化"还原之后把视图对齐回来。
+   *
+   * 最小化只是给编辑区 display:none，textarea 的 value / 光标 / 滚动位置都是浏览器
+   * 自己保着的，所以这里不需要（也不能）重建 DOM。但有两件事必须补：
+   *   ① 还原后编辑器重新获得焦点，用户接着敲字不用再点一下；
+   *   ② 高亮层与行号槽是 transform 平移的，隐藏期间没同步过，要重画一次。
+   */
+  function restoreView() {
+    // 之前 render() 在最小化期间被跳过，这里补一次完整重绘（含行号、命中层、滚动同步）
+    render();
+    editor.focus();
+    // 还原后可见高度变了，命中层的可视窗口要按新尺寸重画
+    if (findOpen) requestAnimationFrame(() => { paintHits(); syncScroll(); });
+  }
+
+  // 初始配色：读 localStorage，打开文件就应用，不需要用户每次重选
+  applyEditorTheme(themeSel.value);
+  syncStatus();
+
   editor.addEventListener('input', () => {
     dirty = true;
     stat.textContent = `${editor.value.length} 字符（已修改）`;
+    syncStatus(); // 标题栏的"● 未保存"提示（最小化后这是唯一看得见的地方）
     scheduleRender();
   });
   editor.addEventListener('scroll', syncScroll);

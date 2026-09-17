@@ -94,30 +94,127 @@ export function toast(message, type = 'info', timeout = 4200) {
 // ---------------- 弹窗 ----------------
 
 /**
- * modal({title, body, footer, wide}) -> {close, el}
+ * modal({title, body, footer, wide, onClose, onRequestClose, closeOnEsc, closeOnBackdrop,
+ *        minimizable, statusText, onMinimize}) -> {close, el, minimize, setStatus, isMinimized}
  * body 可以是 Node 或返回 Node 的函数。
+ *
+ * 下面这组参数是**加法式**扩展，默认值等于旧行为，所以现有调用方（确认框、各页面的
+ * 表单弹窗……）一个都不会变：Esc 关、点遮罩关、标题栏只有一颗 ×。只有显式传了
+ * false / true 的调用方（目前只有文件编辑器 editorModal）才会看到新行为。
+ *
+ *   closeOnEsc      默认 true。false → 不监听 Esc（文件编辑器要求"只能点关闭按钮"）。
+ *   closeOnBackdrop 默认 true。false → 点遮罩不关（同上）。
+ *   onRequestClose  返回 false 时**拦下这次关闭**（关闭按钮、遮罩、Esc 都走这条路径）。
+ *                   文件编辑器用它做"有未保存修改"的确认；旧调用方不传即无影响。
+ *   minimizable     默认 false。true → 标题栏多一颗「—」，点它把弹窗收成右下角一条
+ *                   标题栏（正文和页脚一起隐藏，DOM 不销毁，所以编辑内容/光标/滚动
+ *                   位置都在）。再点一次（或点那条标题栏）还原。
+ *   statusText      收起/展开都显示在标题栏上的状态提示（编辑器用"● 未保存"）。
+ *   onMinimize      最小化状态变化时回调 (on:boolean)，调用方借此同步自己的视图。
+ *
+ * 为什么"只能关闭按钮关闭"和最小化只给文件编辑器：其它弹窗都是短表单，
+ * 点遮罩就能放弃正好符合预期；而编辑器里可能有几分钟的编辑成果，误触遮罩/Esc
+ * 就丢掉代价太大，所以它的关闭路径必须收敛到唯一的按钮上并经过未保存确认。
  */
-export function modal({ title, body, footer, wide = false, onClose } = {}) {
+export function modal({
+  title, body, footer, wide = false, onClose,
+  onRequestClose, closeOnEsc = true, closeOnBackdrop = true,
+  minimizable = false, statusText = '', onMinimize,
+} = {}) {
   const mask = h('div.modal-mask');
-  const close = () => { mask.remove(); document.removeEventListener('keydown', onKey); if (onClose) onClose(); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  document.addEventListener('keydown', onKey);
-  mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+  const close = () => {
+    mask.remove();
+    document.removeEventListener('keydown', onKey);
+    if (onClose) onClose();
+  };
+  const onKey = (e) => { if (e.key === 'Escape') requestClose(); };
+  // requestClose 是"用户要求关闭"的唯一入口（关闭按钮、遮罩、Esc 都走它），
+  // 这样未保存确认之类的拦截逻辑对三条路径一视同仁。
+  const requestClose = () => {
+    if (onRequestClose && onRequestClose() === false) return;
+    close();
+  };
+  if (closeOnEsc) document.addEventListener('keydown', onKey);
+  mask.addEventListener('mousedown', (e) => { if (closeOnBackdrop && e.target === mask) requestClose(); });
 
-  const box = h(`div.modal${wide ? '.wide' : ''}`, [
-    h('div.modal-head', [
-      h('h3', { text: title || '' }),
-      h('div.spacer'),
-      h('button.modal-close', { text: '×', title: '关闭 (Esc)', onclick: close }),
-    ]),
-    h('div.modal-body', typeof body === 'function' ? body() : body),
-    footer ? h('div.modal-foot', typeof footer === 'function' ? footer(close) : footer) : null,
+  const head = h('div.modal-head', [
+    h('h3', { text: title || '', title: title || '' }),
+    h('div.spacer'),
   ]);
+
+  const bodyNode = h('div.modal-body', typeof body === 'function' ? body() : body);
+  const footNode = footer ? h('div.modal-foot', typeof footer === 'function' ? footer(close) : footer) : null;
+
+  const box = h(`div.modal${wide ? '.wide' : ''}`, [head, bodyNode, footNode]);
   mask.appendChild(box);
+
+  let minimized = false;
+  let minBtn = null;
+  let statusNode = null;
+
+  function syncMinButtons() {
+    if (minBtn) {
+      minBtn.textContent = minimized ? '▢' : '—';
+      minBtn.title = minimized ? '还原窗口' : '最小化为标题栏（内容与光标保留）';
+    }
+    box.classList.toggle('zp-min', minimized);
+    if (statusNode) statusNode.style.display = minimizable ? '' : 'none';
+  }
+
+  function minimize(on) {
+    minimized = !!on;
+    // 正文/页脚只是 display:none，DOM 一个节点都不删 —— 所以编辑内容、光标位置、
+    // 滚动位置全都由浏览器继续保着，还原后接着写就行。
+    //
+    // 顺序很重要：必须先让正文重新可见，再通知调用方（onMinimize）。文件编辑器在
+    // 回调里要 editor.focus() —— 对 display:none 的元素调 focus() 会被浏览器忽略，
+    // 先通知后显示的话，还原后焦点就丢了。
+    bodyNode.style.display = minimized ? 'none' : '';
+    if (footNode) footNode.style.display = minimized ? 'none' : '';
+    mask.classList.toggle('zp-min', minimized);
+    syncMinButtons();
+    if (onMinimize) onMinimize(minimized);
+  }
+
+  if (minimizable) {
+    // 最小化状态必须有明显提示：收起后留下的就是这条标题栏（带标题 + 未保存状态），
+    // 不会让人以为窗口已经关掉了。
+    statusNode = h('span.zp-min-status', { text: statusText });
+    minBtn = h('button.modal-close.zp-min-btn', {
+      text: '—',
+      title: '最小化为标题栏（内容与光标保留）',
+      onclick: () => minimize(!minimized),
+    });
+    head.appendChild(statusNode);
+    head.appendChild(minBtn);
+    // 收起时整条标题栏都是"还原"热区（宝塔就是这个手感）。
+    // 必须排除最小化按钮自己：点它已经切换过状态了，如果不排除，这次点击会继续冒泡
+    // 到这里，把刚收起的窗口立刻又还原（表现为"最小化按钮点了没反应"）。
+    head.addEventListener('click', (e) => {
+      if (!minimized) return;
+      if (minBtn && minBtn.contains(e.target)) return;
+      minimize(false);
+    });
+  }
+
+  head.appendChild(h('button.modal-close', {
+    text: '×',
+    title: closeOnEsc ? '关闭 (Esc)' : '关闭',
+    onclick: requestClose,
+  }));
+
   document.body.appendChild(mask);
   const firstInput = box.querySelector('input, textarea, select');
   if (firstInput) setTimeout(() => firstInput.focus(), 40);
-  return { close, el: box };
+
+  /** setStatus(text) —— 更新标题栏上的状态提示（文件编辑器用它显示"● 未保存"）。 */
+  const setStatus = (text) => {
+    if (!statusNode) return;
+    statusNode.textContent = String(text || '');
+    statusNode.classList.toggle('zpf-dirty', !!text);
+  };
+
+  return { close, el: box, minimize, setStatus, isMinimized: () => minimized };
 }
 
 /** confirmBox(msg, {title, danger}) -> Promise<boolean> */

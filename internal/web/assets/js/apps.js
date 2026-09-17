@@ -7,20 +7,25 @@
 //   - 已经装过的应用显示"已安装"，可以一键跳到服务管理页
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
-import { registerCleanup, panelPath } from './app.js';
+import { h, clear, toast, modal, appendAll } from './ui.js';
+import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
 // 「应用管理」面板与启停/重启的唯一实现在 servicePanel.js —— 服务管理页点开的
 // 是**同一个**面板（这是用户 2026-09-16 的核心要求：同一个应用的能力不分散在
 // 两个页面）。卡片上通往它的入口**只有一个**「⚙️ 管理」：用户明确说原来的
 // 「详情」与「查看服务」内容一样，"统一保留一个管理就行了"，所以那两个按钮都删了。
 // 配置文件编辑器（configFileModal）住在 services.js，由面板内部复用，这里不再直接用。
-import { openServicePanel, marketQuickActions } from './servicePanel.js';
+//
+// openDirectActions / hasPanelUI 也来自 servicePanel.js：卡片上的「打开 / 直链」
+// 与服务卡片、管理面板**必须**是同一份实现（用户 2026-09-17："打开/直链/刷新/
+// 重启/停止/管理"这组固定语义，两处不能各写一套）。
+import { openServicePanel, marketQuickActions, openDirectActions, hasPanelUI } from './servicePanel.js';
 
 let cache = null;
 // proxyState 是 /api/v1/market/proxies 的探测结果（slug → {proxy_ok, reason}）。
-// 有界面的应用给两个入口：子路径 /<slug>/ 与直连端口；哪个能用由探测说了算，
-// 而不是"我们配了就假设它能打开"。
+// 它只服务于顶部「检测可用性 / 生成 nginx 入口」两个工具，**不再**决定「打开 /
+// 直链」的归属：那个探测不带面板会话，子路径在面板端口上返回 401，proxy_ok
+// 几乎恒为 false —— 用它决定归属会让 it-tools 这类应用的「打开」错变成端口直连。
 let proxyState = null;
 // svcState 是"这轮市场数据对应的服务状态"（服务名 → state），来自一次
 // api.services(false)（**不带健康检查**，所以很快）。
@@ -376,8 +381,9 @@ export function AppsView(content, ctx = {}) {
 
   // adoptApp 把一个已安装但未登记的服务纳管进来。
   //
-  // 2026-09-16 起市场卡片**不再**直接给「纳管」按钮：用户要求已安装应用的
-  // 主按钮统一成「重装」，而「纳管」是另一个语义（登记一个已经在跑的服务）。
+  // 市场卡片**不再**直接给「纳管」按钮：它是另一个语义（登记一个已经在跑的
+  // 服务），而卡片的按钮集合是固定的那六颗（打开/直链/刷新/重启/停止/管理，
+  // 2026-09-17 用户要求）。
   // 这个实现保留在这里，因为 api.adopt 仍被「服务管理 → 扫描可纳管服务」使用，
   // 两处的行为必须一致；以后若要把纳管放回面板，直接用这个函数即可。
   //
@@ -499,7 +505,7 @@ export function AppsView(content, ctx = {}) {
   //   有任务在跑              → 查看进度（点回任务中心，而不是再点一次）
   //   残留态（产物还在、没装） → **安装**（安装器幂等，会复用残留产物）
   //   一键建站类              → 空（入口是卡片上的「一键建站」）
-  //   已安装                  → **重装**（安装器幂等，保留数据）
+  //   已安装                  → **空**（卡片只留常用动作；安装生命周期收进「⚙️ 管理」）
   //   其它                    → 安装
   //
   // 2026-09-16 收敛（用户原话："截止 0.11.0 软件市场的显示有问题……Qwen3 TTS、
@@ -507,17 +513,13 @@ export function AppsView(content, ctx = {}) {
   // 改之前同一件"重装"被拆成三种文案 —— 已纳管给「查看服务」、已装且在 launchd
   // 给「纳管 + 重装」、已装但没服务才给「重装」。偏偏用户最常重装的那几个
   // （Qwen3 TTS / 接收端 / frpc / Orbien 都是"已纳管"）显示的是「查看服务」，
-  // 于是重装入口等于不存在。现在主按钮只由 **a.installed** 决定：装了就给「重装」。
+  // 于是重装入口等于不存在。当时主按钮只由 **a.installed** 决定：装了就给「重装」。
   //
-  // 为什么删掉「查看服务」：它和「⚙️ 管理」打开的是**同一个**面板
-  // （servicePanel.js 的 openServicePanel）。用户明确说"原来的详情和查看服务
-  // 内容一样，统一保留一个管理就行了"——两个通向同一面板的按钮只会让人
-  // 不知道该点哪个。
-  //
-  // 为什么删掉「纳管」兜底：它只在"服务确实在 launchd 里、但面板没有记录"时出现，
-  // 属于**另一个语义**（把已运行的服务登记进来），不是重装。用户要求主按钮统一，
-  // 而登记能力并没有丢：「服务管理 → 扫描可纳管服务」走的是同一个 api.adopt。
-  // （adoptApp 的实现保留在本文件里，两处语义必须一致。）
+  // 2026-09-17 再收敛（用户原话："每个应用只保留，打开、直链、刷新、重启、停止、
+  // 管理……重装、卸载、文档等放进管理的弹出页面里"）：卡片上**不再**直接摆「重装」，
+  // 它和「卸载 / 取消纳管 / 文档」一起收进「⚙️ 管理」面板（见 servicePanel.js 的
+  // reinstallButton / uninstallButton / docLink）。所以已安装应用这里返回空，
+  // 卡片剩下的就是那组固定语义的常用动作。安装入口（未安装 / 残留态）不受影响。
   function primaryButton(a) {
     const running = taskCenter.findByTarget(a.id);
     if (running) {
@@ -538,20 +540,8 @@ export function AppsView(content, ctx = {}) {
     // 一键建站类应用装出来是**网站**（目录 + 数据库 + vhost），入口在卡片上的
     // 「一键建站」；重装要走建站流程而不是安装器，所以主按钮留空。
     if (a.site_app) return null;
-    // 已安装 → 主按钮统一「重装」。
-    //
-    // 判据只看 a.installed（后端给的是：面板服务记录 / launchd 里的作业 /
-    // brew formula 三者之一），**不看** adopted / service_in_launchd / no_daemon ——
-    // 命令行工具（ffmpeg）与纳管服务（qwen3tts）在这颗按钮上的语义完全一样：
-    // 再跑一遍幂等的安装器（已下载的产物会复用、数据保留）。
-    // 以前按这三种状态给三种文案，正是用户看到的"有的显示查看服务、有的没有重装"。
-    if (a.installed) {
-      return h('button.btn.btn-sm', {
-        text: '重装',
-        title: '重新跑一遍安装（会复用已下载的产物、保留数据，不会重复下载）',
-        onclick: () => reinstallApp(a),
-      });
-    }
+    // 已安装 → 卡片上不再有主按钮（安装生命周期动作都在「⚙️ 管理」面板里）。
+    if (a.installed) return null;
     return h('button.btn.btn-sm.btn-primary', {
       text: '安装',
       disabled: !a.available,
@@ -610,7 +600,7 @@ export function AppsView(content, ctx = {}) {
                 : h('span.pill.ok', { text: '已安装·命令行', title: '这个应用是命令行工具（没有常驻进程，也没有网页界面）' }))
               : h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
                 text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
-                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；用卡片上的「重装」可修复（会重建服务定义）',
+                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；点「⚙️ 管理」里的「重装」可修复（会重建服务定义）',
               }))
             : null)),
         // 残留数据：没装、但磁盘上还有上次卸载保留的产物/数据。
@@ -625,7 +615,8 @@ export function AppsView(content, ctx = {}) {
       ]),
       // 卡片上只放**一句话**（summary）。以前把整段 description 铺在卡片里，
       // 一个条目的文字比按钮还多，用户要滚动半天才能看完一个应用（2026-09-16 反馈）。
-      // 完整说明不丢：鼠标悬停给 title，想细看可以点「文档」。
+      // 完整说明不丢：鼠标悬停给 title；已安装应用点「⚙️ 管理」里有「文档」，
+      // 未安装应用卡片上直接给「文档」（它们没有管理入口）。
       (a.summary || a.description) ? h('div', {
         style: { fontSize: '11.5px', color: 'var(--text-dim)', lineHeight: '1.55' },
         title: a.description || '',
@@ -633,92 +624,41 @@ export function AppsView(content, ctx = {}) {
       }) : null,
       h('div', { style: { display: 'flex', gap: '6px', marginTop: 'auto', paddingTop: '4px', flexWrap: 'wrap' } }, [
         primaryButton(a),
-        // 界面入口（有面板托管界面的应用才有）。
-        ...openButtons(a),
+        // 界面入口：打开 / 直链 —— **同一份实现**在 servicePanel.js 的
+        // openDirectActions（服务卡片与管理面板也用它）。只有已安装、
+        // 且确实有面板托管界面的应用才有（frpc 这类自带控制台不算）。
+        ...(a.installed ? openDirectActions(a) : []),
         // 已安装应用的常用动作：启动/停止、重启、刷新、⚙️ 管理。
         // 用户要求（2026-09-16）：卡片上直接给常用动作，**不需要先跳到服务管理页**；
         // 而「⚙️ 管理」打开的是与服务管理页**同一个**面板 ——
-        // 配置文件的编辑、凭据、日志、卸载都在那里面，不是两套按钮。
-        // 2026-09-16 起卡片上只有这一颗"进面板"的按钮（原来的「详情」「查看服务」
-        // 合并成它），主按钮则统一是「重装」/「安装」。
+        // 配置文件的编辑、凭据、日志、重装、文档、卸载都在那里面，不是两套按钮。
+        // 2026-09-17 起卡片上只有这一组固定语义的按钮（打开/直链/启停/重启/刷新/管理），
+        // 「重装」「文档」也从卡片收进了这个面板。
         ...marketQuickActions(a, {
           state: stateOfApp(a),
           onDone: refreshSilently,
-          // 让「⚙️ 管理」走 openAppDetail：它会把市场页的界面探测结果
-          // （proxyState）一起带进面板，面板里的「打开界面」才能和卡片上的
-          // 「打开」给同一个结论（子路径还是端口直连）。
+          // 让「⚙️ 管理」走 openAppDetail：面板里的「重装」要用本页的安装器
+          // 上下文（onReinstall，保留 Qwen 那类应用自己的选项框）。
           onManage: () => openAppDetail(a),
         }),
         ...siteInstallButtons(a),
         ...uninstallButtons(a),
-        a.docs_url ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' }) : null,
+        // 文档：**已安装**应用不再直接摆在卡片上（收进「⚙️ 管理」面板，见
+        // servicePanel.js 的 docLink）；未安装应用没有「管理」入口，文档
+        // 必须留在卡片上，否则用户就找不到这个应用的官方文档了。
+        !a.installed && a.docs_url
+          ? h('a.btn.btn-sm', { href: a.docs_url, target: '_blank', rel: 'noopener', text: '文档' })
+          : null,
       ]),
     ]);
   }
 
-  // openButtons 给"有界面且已装"的应用两个入口：子路径与直连端口。
-  //
-  // 为什么主按钮可能指向直连：有些应用必须自己设 base path 才能挂子路径
-  // （n8n / Gitea / MinIO / Stirling 都是），硬挂会白屏。
-  // 探测（/api/v1/market/proxies）说不行，就把直连作为首选入口，
-  // 并在 title 里说清原因 —— 而不是给一个点开是白屏的按钮。
-  function openButtons(a) {
-    if (!hasPanelUI(a) || !a.installed) return [];
-    const st = (proxyState?.items || []).find((x) => x.slug === a.ui.slug) || {};
-    const path = '/' + a.ui.slug + '/';
-    const direct = a.port_url || '';
-    // SelfConf（phpMyAdmin）：它的 location 由安装器直接写进 nginx，
-    // 面板不反代，所以只能用 nginx 的**绝对地址** —— 用相对路径会打到
-    // 面板自己的 SPA 回落上（返回 200 却是面板首页，极具误导性）。
-    if (a.ui.self_conf) {
-      // SelfConf 的应用（phpMyAdmin）：它的 nginx location 只允许本机，
-      // 所以唯一能用的入口是**面板自己**那条（要求先登录面板）。
-      // 用户反馈过这里给出的是局域网地址 http://192.168.1.4/phpmyadmin/ → 403。
-      return [h('a.btn.btn-sm.btn-primary', {
-        href: panelPath('phpmyadmin/'), target: '_blank', rel: 'noopener', text: '打开',
-        title: '经面板打开（需先登录面板；面板会反代到本机的 phpMyAdmin）',
-      })];
-    }
-    // prefer_direct 是**人工实测**的结论（自动探测发现不了"资源全 200 但
-    // 前端路由不认这个前缀"的情况），所以它的优先级高于探测结果。
-    // 尚未探测过（_stale）时按"能用"对待 —— 否则没点过检测的用户会看到所有应用
-    // 都被降级成"直连端口"（这不是我们想给的默认结论）。
-    const probed = !proxyState?._stale;
-    const proxyOK = !a.ui.prefer_direct && (probed ? !!st.proxy_ok : true);
-    const why = a.ui.prefer_direct ? (a.ui.note || '这个应用不支持子路径') : (st.reason || a.ui.note || '');
-    const out = [];
-    if (proxyOK) {
-      out.push(h('a.btn.btn-sm.btn-primary', {
-        href: path, target: '_blank', rel: 'noopener', text: '打开',
-        title: '经面板的 /' + a.ui.slug + '/ 打开（所有入口都通：80 端口、面板端口、隧道）',
-      }));
-      if (direct) {
-        out.push(h('a.btn.btn-sm', { href: direct, target: '_blank', rel: 'noopener', text: '直连端口', title: '绕过面板直接访问：' + direct }));
-      }
-    } else if (direct) {
-      // 子路径不可用（应用需要自己设 base path，或前端路由不认这个前缀）。
-      //
-      // 既然"子路径不可用"是**人工实测/探测**得出的结论（PreferDirect 或探测失败），
-      // 主入口就必须是**端口直连** —— 否则用户点「打开」拿到的是一个已知打不开的
-      // 子路径，与 AppUI.PreferDirect 的字段文档（"「打开」直接给端口直连，
-      // 子路径降级成次要入口"）自相矛盾。子路径保留成"试试"按钮，
-      // 万一以后上游支持了或探测结论变了，仍有一条入口。
-      out.push(h('a.btn.btn-sm.btn-primary', {
-        href: direct, target: '_blank', rel: 'noopener', text: '打开',
-        title: '直连应用端口：' + direct + (why ? '（' + why + '）' : ''),
-      }));
-      out.push(h('a.btn.btn-sm', {
-        href: path, target: '_blank', rel: 'noopener', text: '试试子路径',
-        title: why || '子路径可能不可用',
-      }));
-    } else {
-      out.push(h('a.btn.btn-sm', {
-        href: path, target: '_blank', rel: 'noopener', text: '打开',
-        title: why || '应用可能没有启动',
-      }));
-    }
-    return out;
-  }
+  // openButtons 已删除（2026-09-17）：卡片上的「打开 / 直链」现在直接调用
+  // servicePanel.js 的 openDirectActions —— 与服务卡片、管理面板同一份实现。
+  // 旧的这份按 /api/v1/market/proxies 的探测结果决定"打开=子路径还是端口直连"，
+  // 而那个探测不带面板会话（子路径返回 401 → proxy_ok 几乎恒为 false），
+  // 结果把 it-tools 这类应用的「打开」错变成了端口直连、子路径降级成「试试子路径」。
+  // 新规则见 openDirectActions 的说明：两颗按钮的语义固定，prefer_direct 只加警示。
 
   // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
   //
@@ -729,35 +669,29 @@ export function AppsView(content, ctx = {}) {
   // TTS 接收端的在服务管理 —— 同一个应用的能力被拆到了两个页面。
   //
   // 现在只有一个入口：**应用管理面板**（servicePanel.js）。卡片上给常用动作
-  // （启停/重启/刷新）+「⚙️ 管理」，服务管理页点开的也是同一个面板。
+  // （打开/直链/启停/重启/刷新）+「⚙️ 管理」，服务管理页点开的也是同一个面板。
   // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / ui.slug /
   // ui.console_only / 凭据接口是否为空），这里不再按应用 ID 写任何分支。
-
-  // hasPanelUI 判断"这个应用有没有**本面板提供**的网页使用入口"。
   //
-  // 与 a.ui 的区别：frpc 有 UI（它自己的 7400 控制台，目录里标了
-  // console_only），但那不是面板的使用入口 —— 用户明确不要在面板里跳过去。
-  // 只有 IOPaint / Uptime Kuma / phpMyAdmin 这类"面板自己托管/代理"的界面
-  // 才保留「打开」。servicePanel.js 的 uiButtonFor 用的是**同一条判据**。
-  function hasPanelUI(a) {
-    return !!(a.ui && a.ui.slug && !a.ui.console_only);
-  }
+  // hasPanelUI 从 servicePanel.js 导入（与面板、服务卡片**同一条判据**）；
+  // openButtons 已删、openAppDetail 不再传 proxyState ——「打开 / 直链」的归属
+  // 由数据（ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关。
 
   // openAppDetail 打开「应用管理」面板 —— 市场卡片上唯一的"进面板"入口。
   //
   // 面板是**唯一的应用操作入口**，这里只负责把市场这份数据递进去，并告诉它
-  // 两件事：① 打开界面时用探测结果（proxyState，决定子路径还是端口直连）；
+  // 两件事：① 重装走本页的安装器（onReinstall，保留应用自己的选项框）；
   // ② 动作完成后刷新卡片。服务记录由面板自己按名字去查
   // （市场条目里的 config_path 只是文件名，绝对路径只有服务记录才有）。
   //
   // 2026-09-16：卡片上的「⚙️ 管理」按钮通过 marketQuickActions 的 onManage
   // 回调走到这里 —— 保留这条路径而不是让按钮直接 openServicePanel，
-  // 就是为了 proxyState 不丢（否则面板里的「打开界面」会和卡片上的「打开」不一致）。
+  // 就是为了把本页的安装器上下文（onReinstall）带进面板。
   function openAppDetail(a, opts = {}) {
     return openServicePanel({
       market: a,
-      proxyState,
       onDone: refreshSilently,
+      onReinstall: () => openInstaller(a),
       ...opts,
     });
   }
@@ -839,30 +773,27 @@ export function AppsView(content, ctx = {}) {
     return m;
   }
 
+  // uninstallButtons 只保留**残留态**的「删除残留数据」入口。
+  //
+  // 2026-09-17（用户原话："每个应用只保留，打开、直链、刷新、重启、停止、管理……
+  // 重装、卸载、文档等放进管理的弹出页面里"）：已安装应用的「卸载 / 取消纳管」
+  // 不再摆在卡片上 —— 它们已经（并继续）住在「⚙️ 管理」面板里：
+  //   · managed=true          → 面板里的「🗑 卸载」（uninstallButton）
+  //   · managed=false         → 面板里的「取消纳管」（forgetButton）
+  //   · 市场安装器 / compose  → 面板里的「卸载」（marketUninstallButton，逐条列出会删什么）
+  // 三类语义都在 servicePanel.js 里由数据决定，一处都不会丢。
+  //
+  // 残留态（artifacts && !installed）**必须留在卡片上**：这时应用没装、
+  // 面板里也不是"已安装"形态，如果连这张卡都没有删除入口，用户就永远清不掉
+  // 上次卸载保留下来的产物/数据（2026-09-16 用户反馈过）。
   function uninstallButtons(a) {
+    if (!residualOf(a)) return [];
     const plan = a.uninstall || {};
-    const residual = residualOf(a);
-    // 残留态也要有删除入口：按新语义它显示为"未安装"，「卸载」按钮就没了，
-    // 那样用户永远清不掉上次卸载保留的产物/数据（2026-09-16 用户反馈）。
-    if (!a.installed && !residual) return [];
-    if (plan.kind === 'service' || plan.kind === 'installer') {
-      return [h('button.btn.btn-sm.btn-danger', {
-        text: residual ? '删除残留数据' : '卸载',
-        title: residual
-          ? '这个应用当前没有安装；只删除磁盘上的残留产物/数据'
-          : (plan.blocked || '卸载「' + a.name + '」（会列出具体删除内容并要求确认）'),
-        disabled: !!plan.blocked && !residual,
-        onclick: () => doUninstall(a, plan, residual),
-      })];
-    }
-    if (plan.kind === 'forget') {
-      return [h('button.btn.btn-sm', {
-        text: '取消纳管',
-        title: '只把这个服务从面板记录里移除，不动系统上的任何东西',
-        onclick: () => doForget(a, plan),
-      })];
-    }
-    return [];
+    return [h('button.btn.btn-sm.btn-danger', {
+      text: '删除残留数据',
+      title: '这个应用当前没有安装；只删除磁盘上的残留产物/数据',
+      onclick: () => doUninstall(a, plan, true),
+    })];
   }
 
   // doUninstall 先弹一个"会做什么"的确认框，再交给任务中心。
@@ -932,33 +863,18 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // doForget 取消纳管：只删面板记录，不动系统。
-  async function doForget(a, plan) {
-    const okGo = await confirmBox(
-      '把「' + a.name + '」从面板记录里移除？\n\n' +
-      '面板不会卸载你自己安装的软件（不跑 brew uninstall、不删文件），' +
-      '只是不再管它。要真正删除请在终端里自行处理。',
-      { title: '取消纳管', okText: '取消纳管' });
-    if (!okGo) return;
-    const name = plan.service || a.id;
-    try {
-      await api.serviceForget(name);
-      toast('已取消纳管', 'ok');
-      refreshSilently();
-    } catch (e) {
-      toast('取消失败：' + e.message, 'err', 9000);
-    }
-  }
+  // doForget（取消纳管）已删除（2026-09-17）：卡片上不再直接给「取消纳管」，
+  // 它住在「⚙️ 管理」面板里（servicePanel.js 的 forgetButton，按 s.managed===false
+  // 决定出现），实现只有那一份。卡片上唯一保留的残留态动作是「删除残留数据」。
 
   // openInstaller 按应用打开对应的部署对话框。
   //
   // 抽出来是因为有**两个入口**要用它：
   //   · 「安装」——没装过的应用，以及"残留数据"（artifacts && !installed）；
-  //   · 「重装」——已安装的应用（见 reinstallApp；它确认完也走这里）。
+  //   · 「重装」——已安装的应用，从「⚙️ 管理」面板里的「重装」进来
+  //     （servicePanel.js 的 reinstallButton 负责确认框，确认后回调到这里）。
   // 安装器本身是幂等的：重跑会重建 venv/服务定义/plist 并登记到服务管理，
   // 所以"重装"就是最合理的修复动作，不需要另写一套修复逻辑。
-  // （2026-09-16 起不再有单独的「重新部署」按钮：它与「重装」是同一个安装器，
-  // 用户要求已安装应用的主按钮统一成「重装」，所以那个文案已删。）
   function openInstaller(a) {
     // 用面板自研安装器的项目要收集选项（例如 Qwen 的"要不要鉴权"、
     // 密钥从哪来），所以直接打开对应对话框，而不是走通用安装流程。
@@ -974,21 +890,10 @@ export function AppsView(content, ctx = {}) {
 
   // ---------- 重装 ----------
   //
-  // 重装与安装走**同一条安装器**（它是幂等的：已下载的产物会复用、
-  // 已存在的配置与数据不动），所以这里做的只是"把后果说清楚再跑一次"。
-  // 用户明确要求有这个入口（2026-09-16）：装了但想修、或想更新配置时，
-  // 以前只能先卸载再装，中间那段时间服务是停的。
-  async function reinstallApp(a) {
-    const okGo = await confirmBox(
-      '重装「' + a.name + '」？\n\n' +
-      '· 会重新跑一遍安装流程（下载/解压/重建服务定义）\n' +
-      '· **已下载的产物会复用**，不会重复下载\n' +
-      '· 已存在的配置与数据**保留**\n' +
-      '· 服务会重启一次',
-      { title: '重装 ' + a.name, okText: '开始重装' });
-    if (!okGo) return;
-    doInstall(a);
-  }
+  // 重装的确认框与调度都收进了 servicePanel.js 的 reinstallButton（管理面板里
+  // 那颗「重装」）；本文件只提供"用哪套安装器"这一步（上面的 openInstaller）。
+  // 这样"重装"这个动作在两个入口（市场卡片 → 管理、服务管理 → 管理）只有一份
+  // 文案与一份确认语义，而应用自己的选项框仍然保留。
 
   // ---------- 安装前检查 ----------
   async function preflight(a) {

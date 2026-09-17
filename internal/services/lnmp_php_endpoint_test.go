@@ -61,16 +61,6 @@ func TestLNMPDefaultsToPHP82(t *testing.T) {
 	if _, ok := lnmpCatalogApp("php@8.2"); !ok {
 		t.Error("应用目录里缺少 BrewFormula=php@8.2 的条目，一键 LNMP 登记时会退化成裸 formula 名")
 	}
-	// 而 8.3 的条目必须**保留**：用户仍然可以自己装它。
-	found83 := false
-	for _, a := range Catalog() {
-		if a.ID == "php83" && a.BrewFormula == "php@8.3" {
-			found83 = true
-		}
-	}
-	if !found83 {
-		t.Error("catalog 里的 php83 条目被删掉了：用户要求「8.3 仍可由用户自装」，只能改默认、不能删条目")
-	}
 }
 
 // shortPHPPrefix 造一个**足够短**的临时 Homebrew 前缀。

@@ -107,7 +107,14 @@ type DockerMirrorState struct {
 	Effective []string `json:"effective"`
 	// NeedRestart 为真表示"配置与生效不一致，需要重启运行时"
 	NeedRestart bool `json:"need_restart"`
-	// HubDirect 是 Docker Hub 官方地址的探测结果（用户抱怨的"慢"就是它）
+	// HubDirect 是 Docker Hub 官方地址的探测结果（用户抱怨的"慢"就是它）。
+	//
+	// ⚠️ 语义已变（2026-09-17）：本结构不再**主动**探测它 —— 官方源探测的超时上限
+	// 是 8 秒，而这是 GET /api/v1/docker/mirrors 的主路径，同步探它会让用户点进
+	// 「加速源」后干等 8 秒才看到页面（用户原话："点击后要等很久，应该立即加载"）。
+	// 现在只有用户主动点「检测」才会探测，结果由 web 层的内存缓存填回这里
+	// （见 internal/web/api_docker_mirrors.go 的 cachedDockerMirrorProbe）；
+	// 从没检测过时这个字段就是空的 —— 空表示"没测过"，不表示"官方源不通"。
 	HubDirect *DockerMirrorProbe `json:"hub_direct,omitempty"`
 	// Note 是给用户的说明（例如"这台机器的运行时面板改不了"）
 	Note string `json:"note,omitempty"`
@@ -195,6 +202,14 @@ func shortErr(err error) string {
 // ---------- 现状 ----------
 
 // DockerMirrorStatus 汇总"配置里写的 / 守护进程实际生效的 / 运行时是谁"。
+//
+// **本函数不做任何网络探测**（2026-09-17 起的约定）：它是
+// GET /api/v1/docker/mirrors 的主路径，必须立刻返回，页面才能立即渲染。
+// 探测一律由用户在「加速源」页点「检测」触发（POST .../mirrors/probe），
+// 结果由 web 层缓存并填回 HubDirect（见 DockerMirrorState.HubDirect 的说明）。
+//
+// 唯一还会执行的命令是 `docker info`（读守护进程实际生效的镜像源列表）——
+// 它是本页要展示的**事实**，且实测约 30ms；拿不到时返回空列表，不编造。
 func (m *Manager) DockerMirrorStatus(ctx context.Context) DockerMirrorState {
 	st := DockerMirrorState{Runtime: "unknown"}
 	runtime, cfgPath, supported, note := m.dockerMirrorTarget()
@@ -205,9 +220,6 @@ func (m *Manager) DockerMirrorStatus(ctx context.Context) DockerMirrorState {
 	st.Effective = m.effectiveMirrors(ctx)
 	// 顺序无关，按集合比较 —— 否则"只是顺序不同"也会被说成需要重启
 	st.NeedRestart = !sameStringSet(st.Configured, st.Effective)
-	if p := probeOneMirror(ctx, "https://registry-1.docker.io"); true {
-		st.HubDirect = &p
-	}
 	return st
 }
 

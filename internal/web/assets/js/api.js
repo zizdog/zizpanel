@@ -393,8 +393,12 @@ export const api = {
   // library/redis、my_proj_db），不编码会把路径拆断。后端用的是 `{path...}`
   // 通配参数，所以编码后的 %2F 会被正确还原。
   dockerInfo: () => request('GET', `${API_BASE}/docker/info`),
-  // Docker 镜像加速源（换源）：现状 / 检测可用性 / 保存并重启运行时
+  // Docker 镜像加速源（换源）：现状 / 上次检测缓存 / 检测可用性 / 保存并重启运行时
+  //
+  // dockerMirrorCached 是**只读**接口：返回上次检测的结果与检测时间，
+  // 绝不触发探测 —— 页面靠它立即渲染（点进「加速源」不再自动等一轮探测）。
   dockerMirrors: () => request('GET', `${API_BASE}/docker/mirrors`),
+  dockerMirrorCached: () => request('GET', `${API_BASE}/docker/mirrors/cached`),
   dockerMirrorProbe: (urls) => request('POST', `${API_BASE}/docker/mirrors/probe`, urls ? { urls } : {}),
   dockerMirrorSave: (mirrors) => request('POST', `${API_BASE}/docker/mirrors`, { mirrors }),
   dockerContainers: (all = true) => request('GET', `${API_BASE}/docker/containers?all=${all ? 1 : 0}`),

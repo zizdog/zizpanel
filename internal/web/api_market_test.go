@@ -48,15 +48,15 @@ func TestMarketUsesRealBrewLabel(t *testing.T) {
 	if err := os.MkdirAll(agents, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []string{"sh.brew.php@8.3", "sh.brew.mysql@8.4"} {
+	for _, n := range []string{"sh.brew.php@8.2", "sh.brew.mysql@8.4"} {
 		if err := os.WriteFile(filepath.Join(agents, n+".plist"), []byte("<plist/>"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	php := marketItem(t, ts, cookies, "php83")
-	if got := asString(php["service_label"]); got != "sh.brew.php@8.3" {
-		t.Errorf("php83 的纳管标签应是磁盘上真实的 sh.brew.php@8.3，实际 %q"+
+	php := marketItem(t, ts, cookies, "php82")
+	if got := asString(php["service_label"]); got != "sh.brew.php@8.2" {
+		t.Errorf("php82 的纳管标签应是磁盘上真实的 sh.brew.php@8.2，实际 %q"+
 			"（用 homebrew.mxcl.* 会让纳管必然失败）", got)
 	}
 	if php["service_in_launchd"] != true {
@@ -69,14 +69,14 @@ func TestMarketUsesRealBrewLabel(t *testing.T) {
 	// 把它登记进面板记录（模拟纳管之后），市场必须说"已纳管"
 	repo := services.NewRepository(srv.Store)
 	if err := repo.Create(t.Context(), &services.Service{
-		Name: "sh-brew-php8-3", DisplayName: "PHP 8.3", Kind: services.KindNative,
-		LaunchLabel: "sh.brew.php@8.3", Category: "lnmp",
+		Name: "sh-brew-php8-2", DisplayName: "PHP 8.2", Kind: services.KindNative,
+		LaunchLabel: "sh.brew.php@8.2", Category: "lnmp",
 	}); err != nil {
 		t.Fatalf("登记服务失败: %v", err)
 	}
-	php = marketItem(t, ts, cookies, "php83")
+	php = marketItem(t, ts, cookies, "php82")
 	if php["adopted"] != true {
-		t.Error("已登记的 php83 在市场里应显示已纳管（否则会给一个点了报「已经纳管过了」的按钮）")
+		t.Error("已登记的 php82 在市场里应显示已纳管（否则会给一个点了报「已经纳管过了」的按钮）")
 	}
 }
 
@@ -104,8 +104,8 @@ func TestMarketCardMatchesPanelRecordForRealMachineApps(t *testing.T) {
 		{"sh-brew-mysql8-4", "sh.brew.mysql@8.4", services.KindNative},
 		{"ollama", "homebrew.mxcl.ollama", services.KindNative},
 		{"uptime-kuma", "", services.KindCompose},
-		{"php81", "homebrew.mxcl.php@8.1", services.KindNative},
-		{"php83", "homebrew.mxcl.php@8.3", services.KindNative},
+		{"php82", "homebrew.mxcl.php@8.2", services.KindNative},
+		{"php84", "homebrew.mxcl.php@8.4", services.KindNative},
 	}
 	for _, r := range records {
 		if err := repo.Create(t.Context(), &services.Service{
@@ -115,7 +115,7 @@ func TestMarketCardMatchesPanelRecordForRealMachineApps(t *testing.T) {
 		}
 	}
 
-	for _, id := range []string{"nginx", "mysql84", "ollama", "uptime-kuma", "php81", "php83"} {
+	for _, id := range []string{"nginx", "mysql84", "ollama", "uptime-kuma", "php82", "php84"} {
 		it := marketItem(t, ts, cookies, id)
 		if it["installed"] != true {
 			t.Errorf("%s 有面板记录，市场卡片必须显示已安装"+

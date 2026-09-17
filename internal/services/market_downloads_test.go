@@ -39,8 +39,8 @@ func TestMarketDeclarationsCoverCatalogExactly(t *testing.T) {
 		}
 	}
 
-	if len(catalog) != 27 {
-		t.Logf("注意：目录现在有 %d 个条目（写这份声明时是 27 个）—— "+
+	if len(catalog) != 25 {
+		t.Logf("注意：目录现在有 %d 个条目（写这份声明时是 25 个）—— "+
 			"数量变化本身不是错误，但每一个新条目都必须有声明", len(catalog))
 	}
 }

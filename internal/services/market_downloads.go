@@ -527,28 +527,6 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
-		ID: "php83", Kind: KindNative, BrewFormula: "php@8.3", ServiceLabel: "homebrew.mxcl.php@8.3",
-		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.php@8.3",
-			LabelSource: "目录 ServiceLabel（磁盘上实测是 sh.brew.php@8.3，靠 formula 后缀兜底匹配）",
-		},
-		Downloads: []MarketDownloadPoint{
-			brewBottlePoint("php@8.3", 30*time.Minute, "brew install php@8.3"),
-		},
-	},
-
-	{
-		ID: "php81", Kind: KindNative, BrewFormula: "php@8.1", ServiceLabel: "homebrew.mxcl.php@8.1",
-		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.php@8.1",
-			LabelSource: "目录 ServiceLabel",
-		},
-		Downloads: []MarketDownloadPoint{
-			brewBottlePoint("php@8.1", 30*time.Minute, "brew install php@8.1"),
-		},
-	},
-
-	{
 		ID: "php82", Kind: KindNative, BrewFormula: "php@8.2", ServiceLabel: "homebrew.mxcl.php@8.2",
 		Runtime: MarketRuntime{
 			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.php@8.2",

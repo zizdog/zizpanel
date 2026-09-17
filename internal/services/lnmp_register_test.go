@@ -213,7 +213,7 @@ func TestCatalogEntryForLabelFallsBackToBrewFormula(t *testing.T) {
 		"homebrew.mxcl.nginx": "nginx",
 		"sh.brew.mysql@8.4":   "mysql84",
 		// 另一套前缀
-		"homebrew.mxcl.php@8.3": "php83", // 8.3 条目保留：用户仍可自装
+		"homebrew.mxcl.php@8.4": "php84", // 8.4 条目保留，前缀与目录写的不一致时靠 formula 后缀兜底
 		"sh.brew.php@8.2":       "php82", // 默认版本
 
 		// 系统级改造后的自研前缀（本机 nginx 真的长这样）

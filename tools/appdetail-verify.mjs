@@ -121,6 +121,19 @@ const MARKET = {
       uninstall: { kind: 'installer', service: 'com.zizdog.voicereceiver', steps: ['停止并删除 launchd 服务'], data_paths: ['/Users/zizdog/voicereceiver'] },
     },
     {
+      // 2026-09-17 用户点名的"反了"：IT-Tools 有面板子路径（ui.slug，且**没有**
+      // prefer_direct），「打开」必须给 /it-tools/、「直链」给端口 8083 ——
+      // 不能因为 /market/proxies 的探测（不带面板会话，子路径 401）翻过来。
+      id: 'it-tools', name: 'IT-Tools（开发者工具箱）', icon: '🧰', category: 'tool', kind: 'compose',
+      summary: '几十个开发者常用小工具，纯前端', description: '开发者小工具合集。',
+      port: 8083, installed: true, adopted: true, available: true,
+      service_label: 'it-tools', service_in_launchd: false, port_url: 'http://192.168.1.4:8083/',
+      compose_yaml: 'services:\n  it-tools:\n    image: ghcr.io/corentinth/it-tools:latest\n',
+      ui: { slug: 'it-tools' },
+      docs_url: 'https://github.com/CorentinTh/it-tools',
+      uninstall: { kind: 'service', service: 'it-tools', steps: ['docker compose down（删除容器与网络）'], keep_note: 'compose 应用只删容器与网络，**具名卷（数据）保留**' },
+    },
+    {
       id: 'uptime-kuma', name: 'Uptime Kuma', icon: '📡', category: 'tool', kind: 'compose',
       summary: '自托管服务监控与告警', description: '监控网站与服务的可用性。',
       port: 3001, installed: true, adopted: true, available: true,
@@ -336,6 +349,13 @@ const result = await page.evaluate(async () => {
   out.market.cardNames = acards.map(cardName);
   out.market.buttons = {};
   for (const c of acards) out.market.buttons[cardName(c)] = btns(c);
+  // 「打开 / 直链」的 href 也要采：文字相同但地址错了照样是 bug
+  // （用户 2026-09-17 报的"it-tools 反了"就是地址被探测翻过来了）。
+  out.market.links = {};
+  for (const c of acards) {
+    out.market.links[cardName(c)] = Array.from(c.querySelectorAll('a.btn'))
+      .map((a) => (a.textContent || '').trim() + ' → ' + (a.getAttribute('href') || ''));
+  }
   // 板块标题与头部按钮：用来验「其它」已改名「基础环境」（且在最后），
   // 以及市场顶部**不再有**「一键 LNMP」入口（它搬到了网站管理）。
   out.market.sectionTitles = sectionTitles(appsBox);
@@ -490,9 +510,14 @@ const infoOf = (name) => {
     viewService: b.some((t) => t.includes('查看服务')),
     manageCount: b.filter((t) => t.includes('管理')).length,
     refresh: b.some((t) => t.includes('刷新')),
+    // 2026-09-17：重装 / 文档 / 卸载**不再**摆卡片上，它们收进「⚙️ 管理」面板。
     reinstall: b.some((t) => t.includes('重装')),
+    docs: b.some((t) => t === '文档'),
+    uninstall: b.some((t) => t.includes('卸载') || t.includes('取消纳管') || t.includes('删除残留')),
   };
 };
+// 面板里的按钮（从市场卡片的「⚙️ 管理」点开时采到的快照）。
+const panelOf = (name) => (result.panelFromMarket[name] || {}).buttons || [];
 
 console.log('══════════ ① 应用市场：卡片上的按钮 ══════════');
 for (const [n, b] of Object.entries(result.market.buttons)) console.log(`  ${n}\n      ${show(b)}`);
@@ -500,11 +525,17 @@ console.log('\n══════════ ② 服务管理：卡片上的按
 for (const [n, b] of Object.entries(result.service.buttons)) console.log(`  ${n}\n      ${show(b)}`);
 
 console.log('\n══════════ ③ 覆盖矩阵（用户点名的应用）══════════');
-console.log('  卡片标题'.padEnd(26) + '主按钮'.padEnd(8) + '查看服务?  管理数  ⟳刷新?  重装?');
+console.log('  卡片标题'.padEnd(26) + '首按钮'.padEnd(12) + '卡片重装?  面板重装?  卡片文档?');
 for (const [slug, name, installed] of WANT) {
   const i = infoOf(name);
-  console.log(`  ${name.padEnd(24)}${i.primary.padEnd(8)}${(i.viewService ? '有✗' : '无✓').padEnd(10)}${String(i.manageCount).padEnd(8)}${(i.refresh ? '是' : '否').padEnd(8)}${i.reinstall ? '是' : '否'}  (${slug})`);
+  const panelReinstall = panelOf(name).some((t) => t.includes('重装'));
+  console.log(`  ${name.padEnd(24)}${i.primary.padEnd(12)}${(i.reinstall ? '有✗' : '无✓').padEnd(10)}${(panelReinstall ? '有✓' : '无✗').padEnd(12)}${i.docs ? '有✗' : '无✓'}  (${slug})`);
 }
+
+console.log('\n══════════ ③b 打开 / 直链：语义固定（用户 2026-09-17 的"it-tools 反了"）══════════');
+console.log(`  IT-Tools 卡片链接   ${show(result.market.links['IT-Tools（开发者工具箱）'])}`);
+console.log(`  Uptime Kuma 卡片链接 ${show(result.market.links['Uptime Kuma'])}`);
+console.log(`  服务管理 Uptime Kuma ${show(result.service.buttons['Uptime Kuma'])}`);
 
 console.log('\n══════════ ④ ffmpeg 那条 bug 的证明 ══════════');
 const ff = infoOf('FFmpeg（音视频工具）');
@@ -552,12 +583,16 @@ console.log(`  LNMP 按钮 title：${result.sites.hint || '（空）'}`);
 console.log(`  LNMP 点击发出的请求：${result.sites.lnmpPostCall || '（无）'}`);
 
 // ---------- 断言 ----------
+// 2026-09-17 用户要求：卡片上每个应用只保留「打开 / 直链 / 刷新 / 重启 / 停止 /
+// 管理」这一组固定语义动作；「重装 / 卸载 / 文档」全部收进「⚙️ 管理」面板。
 for (const [slug, name, installed] of WANT) {
   const i = infoOf(name);
   if (installed) {
-    check(`${name}：主按钮是「重装」`, i.primary === '重装', `实际「${i.primary}」`);
-    check(`${name}：不再有「查看服务」`, !i.viewService);
-    check(`${name}：只有一个「⚙️ 管理」`, i.manageCount === 1, `实际 ${i.manageCount} 个`);
+    check(`${name}：卡片上不再有「重装」（收进 ⚙️ 管理）`, !i.reinstall, show(i.buttons));
+    check(`${name}：卡片上不再有「文档」（收进 ⚙️ 管理）`, !i.docs, show(i.buttons));
+    check(`${name}：卡片上不再有「卸载 / 取消纳管」（收进 ⚙️ 管理）`, !i.uninstall, show(i.buttons));
+    check(`${name}：卡片上有「⚙️ 管理」`, i.manageCount === 1, `实际 ${i.manageCount} 个`);
+    check(`${name}：管理面板里有「重装」`, panelOf(name).some((t) => t.includes('重装')), show(panelOf(name)));
   } else {
     check(`${name}：未安装 → 主按钮「安装」`, i.primary === '安装', `实际「${i.primary}」`);
     check(`${name}：未安装 → 没有「管理」`, i.manageCount === 0, `实际 ${i.manageCount} 个`);
@@ -568,6 +603,40 @@ for (const name of ['Qwen3 TTS（语音合成）', 'TtsVoice 音色接收端', '
   const i = infoOf(name);
   check(`${name}：刷新按钮文案是「⟳ 刷新」`, i.refresh && !i.buttons.some((t) => t.includes('刷新状态')), show(i.buttons));
 }
+// ---------- 打开 / 直链：两颗按钮语义固定，不再按探测结果调换 ----------
+// 用户原话："打开用 https://panel.zizdog.com:8888/it-tools/ 这种，直链用
+// https://192.168.1.4:3000，it-tools 就反了"。所以：
+//   · 打开 = 面板反代子路径 /<slug>/（相对路径），任何应用都一样；
+//   · 直链 = port_url（端口直连）；
+//   · prefer_direct（人工实测子路径不可用）只在「打开」上加 ⚠️ 与 title，
+//     **不**把「打开」换成直连。
+const itLinks = result.market.links['IT-Tools（开发者工具箱）'] || [];
+check('IT-Tools：「打开」是面板子路径 /it-tools/',
+  itLinks.includes('打开 → /it-tools/'), show(itLinks));
+check('IT-Tools：「直链」是端口 8083',
+  itLinks.includes('直链 → http://192.168.1.4:8083/'), show(itLinks));
+const kumaLinks = result.market.links['Uptime Kuma'] || [];
+check('Uptime Kuma（prefer_direct）：「打开」仍是面板子路径 /uptime-kuma/，带 ⚠️',
+  kumaLinks.includes('⚠️ 打开 → /uptime-kuma/'), show(kumaLinks));
+check('Uptime Kuma（prefer_direct）：「直链」是端口 3001',
+  kumaLinks.includes('直链 → http://192.168.1.4:3001/'), show(kumaLinks));
+check('Uptime Kuma：「打开」不再降级成"试试子路径"',
+  !kumaLinks.some((l) => l.includes('试试子路径')), show(kumaLinks));
+// 服务管理页用的是**同一份** openDirectActions（市场条目与 port_url 都对上号）。
+const kumaSvc = result.service.buttons['Uptime Kuma'] || [];
+check('服务管理：Uptime Kuma 也有「⚠️ 打开 + 直链」（同一份实现）',
+  kumaSvc.includes('⚠️ 打开') && kumaSvc.includes('直链'), show(kumaSvc));
+// console_only（frpc 的自带控制台）两个入口都不给。
+const frpcBtns = infoOf('frpc（frp 客户端）').buttons;
+check('frpc（console_only）：不给「打开 / 直链」',
+  !frpcBtns.some((t) => t.includes('打开') || t.includes('直链')), show(frpcBtns));
+// 文档：已安装应用在管理面板里，未安装应用留在卡片上（否则没有入口）。
+check('IT-Tools：卡片上没有「文档」，管理面板里有',
+  !infoOf('IT-Tools（开发者工具箱）').docs
+  && panelOf('IT-Tools（开发者工具箱）').includes('文档'),
+  `card=${show(infoOf('IT-Tools（开发者工具箱）').buttons)} panel=${show(panelOf('IT-Tools（开发者工具箱）'))}`);
+check('Ollama（未安装）：卡片上保留「文档」（没有管理入口可去）',
+  infoOf('Ollama').docs, show(infoOf('Ollama').buttons));
 check('ffmpeg 面板不显示「未在服务管理里」', !(ffPanel.panelText || '').includes('未在服务管理里'));
 check('ffmpeg 面板不显示「读取中」', !(ffPanel.panelText || '').includes('读取中'));
 check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', (ffPanel.status || '').includes('命令行工具（无常驻进程）'), ffPanel.status);

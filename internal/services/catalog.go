@@ -159,7 +159,8 @@ func ConfigFilePath(app App, userHome, workDir string) string {
 //
 // 为什么要有 Note：子路径不是万能的 —— 有些应用必须自己在配置里设置
 // root_url / base path，光靠改写会坏。这种情况如实写出来，
-// 面板探测到代理不可用时会把「直连端口」作为首选入口，而不是假装能打开。
+// 界面会在「打开」（子路径）上加 ⚠️ 与这段实话，并让「直链」承担真正的入口
+// （而不是把「打开」偷偷换成直连，或不给任何提示地给一个点开白屏的地址）。
 type AppUI struct {
 	// Slug 是挂在面板与 nginx 上的子路径（不带斜杠），例如 iopaint
 	Slug string `json:"slug"`
@@ -197,8 +198,14 @@ type AppUI struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	// PreferDirect 表示"这个应用挂子路径实测不可用（或需要它自己先配置 base path）"。
 	//
-	// 与 Note 的区别：Note 只是说明，PreferDirect 会改变界面行为 ——
-	// 「打开」按钮直接给端口直连，子路径降级成次要入口（"试试子路径"）。
+	// 与 Note 的区别：Note 只是说明，PreferDirect 会改变界面呈现 ——
+	// 「打开」（面板子路径 /<slug>/）仍然保留，但按钮上加 ⚠️ 并把 Note 里的实话
+	// 写进 title，提示用户改用旁边的「直链」（端口直连）。
+	//
+	// **不要**再用它（或 /api/v1/market/proxies 的探测结果）去调换「打开」与
+	// 「直链」的归属：用户 2026-09-17 明确要求这两颗按钮语义固定（打开＝子路径，
+	// 直链＝port_url），而且那个探测不带面板会话（子路径返回 401），proxy_ok
+	// 几乎恒为 false —— 拿它决定归属会把 it-tools 这类应用的「打开」错变成直连。
 	// 为什么需要人工标一项：自动探测只能发现"资源 404"这类问题，
 	// 发现不了"资源都 200、但前端路由不认这个路径"（Uptime Kuma 就是这样：
 	// 页面标题都对、请求全 200，正文却是 Page Not Found）。
@@ -478,39 +485,6 @@ func Catalog() []App {
 			BrewFormula: "nginx",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.nginx.log",
 			DocsURL:     "https://nginx.org",
-		},
-		{
-			ID: "php83", Name: "PHP 8.3 (FPM)", Icon: "🐘",
-			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
-			Description: "以 FastCGI 方式监听 自己专属的 Unix socket 端点，由 nginx 转发 PHP 请求。" +
-				"面板的站点配置默认指向这个地址；多版本 PHP 可以再装其它版本共存。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.3",
-			Port: 0,
-			// PHP-FPM 说的是 FastCGI 协议，不是 HTTP —— 不能做 HTTP 健康检查，
-			// 否则会永远显示不健康。留空表示"只按进程与端口判断"。
-			HealthPath:  "",
-			BrewFormula: "php@8.3",
-			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
-			SystemDaemon: true,
-			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.3.log",
-			DocsURL:      "https://www.php.net",
-		},
-		{
-			ID: "php81", Name: "PHP 8.1 (FPM)", Icon: "🐘",
-			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
-			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
-				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.1.sock），" +
-				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
-				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.1",
-			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
-			Port:        0,
-			HealthPath:  "",
-			BrewFormula: "php@8.1",
-			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
-			SystemDaemon: true,
-			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.1.log",
-			DocsURL:      "https://www.php.net",
 		},
 		{
 			ID: "php82", Name: "PHP 8.2 (FPM)", Icon: "🐘",

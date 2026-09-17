@@ -60,6 +60,19 @@ type Server struct {
 	mktDockerV    string
 	mktDockerAt   time.Time
 
+	// ---- Docker 加速源「上次检测」的内存缓存（带时间戳）----
+	//
+	// 为什么放在 Server 而不是 services.Manager：svcManager() **每次请求都新建**
+	// Manager（设置页保存后立刻生效，见 api_services.go），缓存挂在 Manager 上
+	// 活不过一次请求。也不落库：这只是"上次检测结果"的展示数据，面板重启后
+	// 重新检测一次即可，为它建表属于过度设计（用户明确要求别这么做）。
+	//
+	// 只由用户主动点「检测」写入（POST /api/v1/docker/mirrors/probe），
+	// 读接口 GET /api/v1/docker/mirrors/cached 绝不触发探测。
+	dockerMirrorMu      sync.Mutex
+	dockerMirrorProbes  []services.DockerMirrorProbe
+	dockerMirrorChecked time.Time
+
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog
 	logOnce sync.Once
@@ -385,8 +398,13 @@ func (s *Server) routes() http.Handler {
 	// 一键建站（Typecho / WordPress …）：建目录 + 建库 + 建站点 + 伪静态
 	root.HandleFunc("POST /api/v1/market/{id}/install-site", s.requireAuth(s.handleSiteAppInstall))
 
-	// Docker 镜像加速源（换源）：现状 / 检测可用性 / 保存并重启
+	// Docker 镜像加速源（换源）：现状 / 上次检测的缓存 / 检测可用性 / 保存并重启
+	//
+	// `/mirrors/cached` 与 `/mirrors` 都是字面量模式，Go 1.22 的 ServeMux
+	// 按"最具体"匹配，不会互相抢。缓存接口是**只读**的：页面靠它立即渲染，
+	// 探测只由用户点「检测」触发（见 api_docker_mirrors.go 的文件头说明）。
 	root.HandleFunc("GET /api/v1/docker/mirrors", s.requireAuth(s.handleDockerMirrors))
+	root.HandleFunc("GET /api/v1/docker/mirrors/cached", s.requireAuth(s.handleDockerMirrorCached))
 	root.HandleFunc("POST /api/v1/docker/mirrors/probe", s.requireAuth(s.handleDockerMirrorProbe))
 	root.HandleFunc("POST /api/v1/docker/mirrors", s.requireAuth(s.handleDockerMirrorSave))
 

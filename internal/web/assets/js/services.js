@@ -12,8 +12,37 @@ import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from 
 // 说明：服务页以前还 import registerCleanup 注册一个空清理函数；
 // 2026-09-16 把那行空注册删掉了（它什么都不做，留着只会让人以为这里有清理逻辑）。
 // 详情面板与"启停/重启/取消纳管"的唯一实现在 servicePanel.js；应用市场页也用它。
-// 依赖方向是**单向**的：apps.js → servicePanel.js → services.js，没有环。
-import { openServicePanel, serviceActions, forgetButton } from './servicePanel.js';
+// 依赖方向：apps.js → servicePanel.js ↔ services.js（两模块互取函数，但都只在
+// 渲染/点击时才调用，不在模块初始化时求值，所以没有初始化顺序问题）。
+// openDirectActions 也是从 servicePanel.js 来的：服务卡片上的「打开 / 直链」与
+// 市场卡片、管理面板**必须**是同一份实现（用户 2026-09-17 的固定语义要求）。
+import { openServicePanel, serviceActions, openDirectActions, serviceNameOf } from './servicePanel.js';
+
+// 服务记录（GET /api/v1/services）**不带**目录里的界面信息（ui.slug / port_url /
+// docs_url）—— 那些只在市场条目（GET /api/v1/market）里。服务卡片要给出
+// 「打开 / 直链」、管理面板要给「重装 / 文档」，就得把两者对上号。
+// 这里在 load() 时顺手拉一次市场目录，按"市场条目认的服务名"建索引（只读、很便宜）。
+// 拉不到时索引为 null：卡片照常渲染，只是少那两颗按钮（如实降级，不谎报）。
+let marketByService = null;
+
+function indexMarket(list) {
+  const map = new Map();
+  for (const m of list || []) {
+    for (const k of [serviceNameOf(m), m.service_label, m.name, m.id]) {
+      if (k && !map.has(k)) map.set(k, m);
+    }
+  }
+  return map;
+}
+
+// marketAppFor 找一条服务记录对应的市场条目（找不到返回 null）。
+function marketAppFor(s) {
+  if (!marketByService || !s) return null;
+  for (const k of [s.name, s.launch_label, s.display_name]) {
+    if (k && marketByService.has(k)) return marketByService.get(k);
+  }
+  return null;
+}
 
 // 页面上缓存的列表数据
 let cache = null;
@@ -75,17 +104,24 @@ export function ServicesView(content, ctx = {}) {
   async function load() {
     clear(cards);
     appendAll(cards, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在查询服务状态…' })]));
-    try {
-      cache = await api.services(true);
-    } catch (e) {
+    // 服务状态与市场目录**并行**拉：市场目录只用来给卡片补界面信息
+    // （ui.slug / port_url / docs_url），失败就不补 —— 不能让一个辅助请求
+    // 把整个服务页拖垮或渲染成错误页。
+    const [svcRes, mktRes] = await Promise.all([
+      api.services(true).catch((e) => ({ error: e })),
+      api.market().catch(() => null),
+    ]);
+    if (!svcRes || svcRes.error) {
       clear(cards);
       appendAll(cards, h('div.empty', [
         h('div.big', { text: '⚠️' }),
         h('h4', { text: '读取服务失败' }),
-        h('p', { text: e.message }),
+        h('p', { text: (svcRes && svcRes.error && svcRes.error.message) || '未知错误' }),
       ]));
       return;
     }
+    cache = svcRes;
+    marketByService = mktRes ? indexMarket(mktRes.list) : null;
     renderToolbar();
     renderCards();
   }
@@ -223,11 +259,16 @@ export function ServicesView(content, ctx = {}) {
 
       // 操作
       //
-      // 启停/重启三颗按钮来自 servicePanel.js 的 serviceActions() —— **与
-      // 应用市场卡片、应用详情面板是同一份实现**。以前这里和 openDetail 里
-      // 各写一份 act()，改了一处另一处就是旧的（用户看到的"有的地方能重启、
-      // 有的地方只有跳转"就是这么来的）。
+      // 这一排就是用户 2026-09-17 定的固定集合：打开 / 直链 / 刷新 / 重启 /
+      // 停止（启动）/ 管理。三份实现全部来自 servicePanel.js：
+      //   · openDirectActions —— 打开（/<slug>/）与直链（port_url），
+      //     **与应用市场卡片、管理面板同一份**；
+      //   · serviceActions   —— 启停/重启/刷新，与市场卡片同一份；
+      //   · 管理              —— 打开与市场卡片点开的**同一个**面板。
+      // 服务记录本身没有 ui.slug / port_url（那些只在市场条目里），所以先用
+      // marketAppFor 对上号；对不上（不是目录里的应用）就少这两颗按钮。
       h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap', marginTop: 'auto', paddingTop: '4px' } }, [
+        ...openDirectActions(marketAppFor(s)),
         ...serviceActions(s, { onDone: (fresh) => {
           // 单个动作完成后只更新这一条并重画，不整页重载（整页要重查全部服务，
           // 含 colima/compose 这类偏慢的，而用户此刻只关心这一个）。
@@ -242,16 +283,16 @@ export function ServicesView(content, ctx = {}) {
           renderToolbar();
           renderCards();
         } }),
-        // 取消纳管（managed=false）与管理面板都只有一份实现：
-        // forgetButton 来自 servicePanel.js，管理面板就是市场卡片点开的同一个。
-        // 按钮文案 2026-09-16 从「详情」改为「管理」：用户明确说市场卡片的
-        // 「详情」与「查看服务」内容一样，"统一保留一个管理就行了"，
-        // 所以市场与服务管理两处现在都叫「管理」。
-        s.managed === false ? forgetButton(s, load) : null,
+        // 「取消纳管」与「卸载」都收进管理面板（用户 2026-09-17："重装、卸载、
+        // 文档等放进管理的弹出页面里"）。面板按 s.managed 决定给哪一颗：
+        // managed=false → forgetButton（取消纳管），managed=true → uninstallButton
+        // （卸载）。卡片上不再摆它们，卸载能力一颗没少。
         h('button.btn.btn-sm', {
           text: '⚙️ 管理',
-          title: '状态 / 启停 / 配置 / 日志 / 凭据 / 卸载 —— 与应用市场卡片上的是同一个面板',
-          onclick: () => openServicePanel({ svc: s, onDone: load }),
+          title: '状态 / 启停 / 配置 / 日志 / 凭据 / 重装 / 文档 / 卸载 —— 与应用市场卡片上的是同一个面板',
+          // 把市场条目一起递进面板：管理面板要给出「重装 / 文档 / 打开 / 直链」，
+          // 这些字段只在市场条目里（服务记录没有 ui.slug / port_url / docs_url）。
+          onclick: () => openServicePanel({ market: marketAppFor(s), svc: s, onDone: load }),
         }),
       ]),
     ]);

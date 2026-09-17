@@ -47,9 +47,7 @@ func realMachineAlreadyInstalled() []struct {
 		{"mysql84", "sh-brew-mysql8-4", "sh.brew.mysql@8.4", 3306, KindNative},
 		{"ollama", "ollama", "homebrew.mxcl.ollama", 11434, KindNative},
 		{"uptime-kuma", "uptime-kuma", "", 3001, KindCompose},
-		{"php81", "php81", "homebrew.mxcl.php@8.1", 0, KindNative},
 		{"php82", "php82", "homebrew.mxcl.php@8.2", 0, KindNative},
-		{"php83", "php83", "homebrew.mxcl.php@8.3", 0, KindNative},
 		{"php84", "php84", "homebrew.mxcl.php@8.4", 0, KindNative},
 	}
 }
@@ -283,26 +281,26 @@ func TestRegisterAppServiceIsIdempotentForSameApp(t *testing.T) {
 	m, repo := sandboxIdempotentManager(t)
 	ctx := context.Background()
 
-	app, ok := FindApp("php83")
+	app, ok := FindApp("php82")
 	if !ok {
-		t.Fatal("目录里没有 php83")
+		t.Fatal("目录里没有 php82")
 	}
 	// 已存在的记录与目录条目一致（同 label/同应用）
 	if err := repo.Create(ctx, &Service{
-		Name: "php83", DisplayName: app.Name, Kind: KindNative,
+		Name: "php82", DisplayName: app.Name, Kind: KindNative,
 		LaunchLabel: app.ServiceLabel, Managed: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	stored, err := m.registerAppService(ctx, app, &Service{
-		Name: "php83", DisplayName: app.Name, Kind: KindNative,
+		Name: "php82", DisplayName: app.Name, Kind: KindNative,
 		LaunchLabel: app.ServiceLabel, Managed: true,
 	})
 	if err != nil {
 		t.Fatalf("同名且同应用的记录必须幂等成功，实际报错: %v", err)
 	}
-	if stored == nil || stored.Name != "php83" {
+	if stored == nil || stored.Name != "php82" {
 		t.Fatalf("幂等成功也应返回已有记录，实际 %+v", stored)
 	}
 	if list, _ := repo.List(ctx); len(list) != 1 {
@@ -315,12 +313,12 @@ func TestRegisterAppServiceIsIdempotentForSameApp(t *testing.T) {
 		t.Fatal("目录里没有 php84")
 	}
 	_, err = m.registerAppService(ctx, other, &Service{
-		Name: "php83", DisplayName: other.Name, Kind: KindNative,
+		Name: "php82", DisplayName: other.Name, Kind: KindNative,
 	})
 	if err == nil {
 		t.Fatal("同名记录属于别的应用时必须报冲突，不能当成「已安装」")
 	}
-	if !strings.Contains(err.Error(), "php83") {
+	if !strings.Contains(err.Error(), "php82") {
 		t.Errorf("冲突错误里要点名占用的记录名，实际：%v", err)
 	}
 }

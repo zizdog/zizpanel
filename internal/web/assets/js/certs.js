@@ -229,6 +229,10 @@ export function CertsView(content) {
 
   const headBox = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } });
   const listBox = h('div');
+  // 自动续期是在**面板进程内**的每日任务（不是 launchd 计划任务），
+  // 因此"几点检查、提前多少天"必须让用户看得见 —— 否则用户无法判断
+  // 它到底有没有在工作（后端一直在返回这两个值，以前前端没显示）。
+  const renewBox = h('div.hint', { text: '⏰ 自动续期：读取中…' });
 
   content.append(h('div.card', [
     h('div.card-head', [
@@ -239,7 +243,7 @@ export function CertsView(content) {
     h('div.card-body.tight', [h('div.hint', {
       text: '在面板里自动申请并续期 HTTPS 证书。申请与续期都是后台任务，'
         + '进度看右上角的「任务中心」；申请好后到「网站管理 → 站点 → SSL 证书」里选用。',
-    })]),
+    }), renewBox]),
     h('div.card-body.tight', [listBox]),
   ]));
 
@@ -248,7 +252,17 @@ export function CertsView(content) {
     appendAll(listBox, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取证书…' })]));
     let certs;
     try {
-      certs = normalizeCerts(await api.certs());
+      const raw = await api.certs();
+      certs = normalizeCerts(raw);
+      // 这两项来自后端 /api/v1/certs 的元信息（renew_daily_at / renew_threshold_days）。
+      // 老后端没这两个字段时退化成一句通用说明，不显示"未知"这种废话。
+      const daily = str(raw && raw.renew_daily_at);
+      const days = Number(raw && raw.renew_threshold_days);
+      renewBox.textContent = daily
+        ? '⏰ 自动续期：' + daily + (days > 0 ? '；剩余有效期不足 ' + days + ' 天时自动重签' : '')
+          + '（失败会写进任务中心与操作审计；也可以在下面每一行点「🔄 续期」手动触发）'
+        : '⏰ 自动续期：面板内置每日任务会在证书到期前自动重签，'
+          + '失败会写进任务中心与操作审计。';
     } catch (e) {
       clear(listBox);
       appendAll(listBox, h('div.empty', [

@@ -88,9 +88,7 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"miniflux":     true,
 		"syncthing":    true,
 		"ollama":       true,
-		"php81":        true,
 		"php82":        true,
-		"php83":        true,
 		"php84":        true,
 	}
 	got := map[string]bool{}
