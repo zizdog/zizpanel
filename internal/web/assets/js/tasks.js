@@ -583,7 +583,27 @@ function openTask(id) {
     text: '关闭窗口不会中断任务：它在后台继续跑，随时可以点顶栏的「任务中心」重新打开。',
   });
 
-  const body = h('div', [head, errBox, inputBox, resultBox, trimHint, logWrap, hint]);
+  // ---- 一键 LNMP 的固定提示条（用户明确要求"在这个界面上显著说明"）----
+  //
+  // MySQL root 口令是在**这个窗口里**弹输入框问的（60 秒不答自动生成），
+  // 所以"可以不干预"这句话必须出现在同一个窗口里，而不是只写在按钮的悬浮说明里。
+  const lnmpHint = h('div', {
+    style: {
+      display: 'none', marginBottom: '10px', padding: '9px 12px',
+      borderLeft: '3px solid var(--warn)', background: 'rgba(230,162,60,.12)',
+      borderRadius: 'var(--radius-sm)', fontSize: '12.5px', lineHeight: '1.7',
+    },
+    text: 'MySQL root 口令：可以不干预 —— 稍后弹出的输入框 60 秒不回答会自动生成一个强随机口令；'
+      + '装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。',
+  });
+
+  const body = h('div', [head, errBox, inputBox, resultBox, trimHint, lnmpHint, logWrap, hint]);
+
+  // 只在「一键 LNMP」这个任务上显示口令提示（标题由后端给出，形如
+  // 「一键 LNMP（nginx / PHP 8.2 / MySQL 8.4）」；有的快照只带 target）。
+  if (/LNMP/i.test(String(initial.title || '')) || String(initial.target || '') === 'lnmp') {
+    lnmpHint.style.display = 'block';
+  }
 
   // ---- 限时输入（如 MySQL root 口令）：倒计时、提交、落定后收框 ----
   //

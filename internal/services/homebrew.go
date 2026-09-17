@@ -398,12 +398,24 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 	}
 	args := append([]string{"-n", "-u", m.opt.UserName, "/usr/bin/env"}, env...)
 	args = append(args, "/bin/bash", scriptPath)
-	cmd := exec.CommandContext(ctx, "/usr/bin/sudo", args...)
+	// 先说清"接下来会安静几分钟"：brew 的安装脚本在 `git fetch brew.git`（几百 MB）
+	// 期间**一行都不打印**，任务窗看起来就像卡死（真机反馈）。这句话是给用户的预期管理；
+	// 真正的实时心跳需要线程安全的 step 发射器（见 tools/../DEVELOPMENT 坑 156 的待办）。
+	result.step(ctx, "开始安装 Homebrew：此步会先拉取 brew.git 仓库（几百 MB），通常几分钟；"+
+		"brew 在这段时间不打印日志，属正常现象，请勿关闭")
+	installStart := time.Now()
+	// 硬上限：镜像半死/网络黑洞时不能无限等 —— 25 分钟后**如实报错**，
+	// 用户能据此换镜像重试，而不是看着"运行中"发呆。
+	runCtx, cancel := context.WithTimeout(ctx, 25*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "/usr/bin/sudo", args...)
 	cmd.Env = append(os.Environ(), "HOME="+m.opt.UserHome)
-	out, err := streamCmd(ctx, cmd)
+	out, err := streamCmd(runCtx, cmd)
 	if err != nil {
-		return fmt.Errorf("安装 Homebrew 失败（输出末尾）：%s", truncate(strings.TrimSpace(out), 800))
+		return fmt.Errorf("安装 Homebrew 失败（用时 %s，输出末尾）：%s",
+			time.Since(installStart).Round(time.Second), truncate(strings.TrimSpace(out), 800))
 	}
+	result.step(ctx, "Homebrew 安装脚本执行完成（用时 "+time.Since(installStart).Round(time.Second).String()+"）")
 
 	// 4) **先校正路径再验证**：安装脚本按 Apple Silicon 规范装到 /opt/homebrew，
 	//    配置里却可能还是 /usr/local —— 不校正就会误报"装完了但执行不了"。

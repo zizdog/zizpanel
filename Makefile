@@ -219,7 +219,7 @@ smoke: run-local ## 启动本地实例并做 UI 验证（特权步骤跳过，�
 	@# ⚠️ 必须**无论成败都 stop-local**：以前写成 `smoke: run-local uitest`，
 	# uitest 一失败 make 就中断，调试实例被留在用户机器上（真机发生过，
 	# 遗留进程监听 127.0.0.1:18443 好几轮才被发现）。
-	@node tools/uitest.mjs; rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
+	@node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS); rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
 
 # ---------------------------------------------------------------- 发布打包 --
 # install.sh 在目标机上会用到这些脚本（入口接管 / 服务器模式 / 自检工具）。
