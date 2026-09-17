@@ -18,8 +18,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/logx"
 	"github.com/zizdog/zizpanel/internal/priv"
 )
+
+// reconcileLog 记录"服务记录 ↔ 应用目录"对齐动作（改了什么、为什么清空）。
+//
+// 为什么必须留日志：这类对齐会**改用户看得见的端口与健康地址**，出问题时
+// （例如把某个应用的端口对错了）只能靠日志回溯是哪一次列表请求改的。
+var reconcileLog = logx.New("services")
 
 // InstallResult 描述一次安装的结果。
 type InstallResult struct {
@@ -1252,6 +1259,57 @@ func FindAppByService(svc *Service) (App, bool) {
 	return App{}, false
 }
 
+// catalogAppForRecord 按**一条服务记录**在应用目录里找对应条目。
+//
+// 为什么单靠 catalogEntryForLabel 不够：那个函数只认 launchd 标签，而 **compose
+// 记录从不写标签**（见 Install 的登记分支：KindCompose 只写 ComposeFile）。
+// 结果是 compose 应用永远不参与健康地址对齐 —— 真机（mini，0.14.2）表现是
+// portainer 记录停在 port=9001 / health_url=http://127.0.0.1:9001/，而 9001 当时
+// 已经是 MinIO 的控制台：面板健康列照样回 code=200，检查打的是**别的应用**
+// （AGENTS.md 铁律 10 的"能谎报成功"）。
+//
+// 判据复用仓库里已有的匹配工具，不另写一套：
+//  1. FindAppByService —— label / name / display_name 三种写法都认，
+//     面板安装器与纳管类都由它覆盖（compose 记录登记时 Name=目录 ID、
+//     DisplayName=目录展示名，所以命中的就是同一个应用）；
+//  2. compose 项目目录兜底 —— <composeDir>/<目录 ID>/docker-compose.yml。
+//     记录被用户改过名、前一条匹配不上时，仍能按 compose_file 找回目录条目。
+//
+// 刻意**不**按 container / image 去猜：目录条目里根本没有这两个字段
+// （App 只有 ComposeYAML），按镜像名反推等于自造一份与目录无关的判据，
+// 正是任务里说的"完全不同的判据"。
+func catalogAppForRecord(rec *Service) (App, bool) {
+	if rec == nil {
+		return App{}, false
+	}
+	if app, ok := FindAppByService(rec); ok {
+		return app, true
+	}
+	if id := composeProjectIDFromFile(rec.ComposeFile); id != "" {
+		for _, a := range Catalog() {
+			if a.ID == id {
+				return a, true
+			}
+		}
+	}
+	return App{}, false
+}
+
+// composeProjectIDFromFile 从 compose 文件路径里取出项目目录名（= 目录 ID）。
+//
+// <composeDir>/<id>/docker-compose.yml → <id>；路径为空/退化（"." 之类）时返回空，
+// 绝不返回一个会到处乱匹配的伪 ID。
+func composeProjectIDFromFile(file string) string {
+	if strings.TrimSpace(file) == "" {
+		return ""
+	}
+	dir := filepath.Base(filepath.Dir(file))
+	if dir == "" || dir == "." || dir == ".." || dir == string(filepath.Separator) {
+		return ""
+	}
+	return dir
+}
+
 // healthURLFor 由目录条目拼出健康检查地址（没有健康路径/端口时返回空）。
 //
 // 用 WebPort() 而不是 Port：有些条目的协议口与界面口不同，健康检查必须打界面口。
@@ -1365,7 +1423,15 @@ func firstFormulaOf(args []string) string {
 // 只补不清会让界面永远显示"健康检查失败"，而服务其实是好的（见
 // TestHealthURLReconcilesBothWays 记录的那次真机问题）。
 //
-// 幂等且廉价：只在不一致时写库，返回改动条数。
+// compose 记录也必须参与（2026-09-17 修）：它们**从不写 launchd 标签**，所以
+// 过去被 `LaunchLabel == ""` 整条跳过，永远不参与对齐 —— 真机（mini）的 portainer
+// 记录因此停在 port=9001/http://127.0.0.1:9001/，而 9001 已经是 MinIO 的控制台，
+// 面板健康列照样报绿。判据见 catalogAppForRecord；目录里已经查不到条目时
+// （下架的 minio / portainer）清空 health_url，宁可显示"未配置检查地址"，
+// 也不能拿一条来历不明的旧地址继续谎报成功（铁律 10）。
+//
+// 幂等且廉价：只在不一致时写库（值已经对就 `continue`，连 mtime 都不动），
+// 每次改动都留一行日志，返回改动条数。
 func (m *Manager) ReconcileHealthURLs(ctx context.Context) (int, error) {
 	list, err := m.repo.List(ctx)
 	if err != nil {
@@ -1373,22 +1439,82 @@ func (m *Manager) ReconcileHealthURLs(ctx context.Context) (int, error) {
 	}
 	changed := 0
 	for _, s := range list {
-		if s.LaunchLabel == "" {
+		// ---- 原生 / 纳管类：按 launchd 标签对齐（既有行为，一字未改）----
+		if s.LaunchLabel != "" {
+			app, ok := catalogEntryForLabel(s.LaunchLabel)
+			if !ok {
+				// 标签在目录里查不到时保持原样：纳管记录的标签未必来自目录
+				// （用户自己的服务也能纳管），凭"查不到"就清空会误伤。
+				continue
+			}
+			want := healthURLFor(app)
+			if s.HealthURL == want {
+				continue
+			}
+			before := s.HealthURL
+			s.HealthURL = want
+			if err := m.repo.Update(ctx, s); err != nil {
+				s.HealthURL = before
+				continue
+			}
+			reconcileLog.Info("服务 %s 的健康地址按目录对齐：%q → %q", s.Name, before, want)
+			changed++
 			continue
 		}
-		app, ok := catalogEntryForLabel(s.LaunchLabel)
+
+		// ---- compose 记录：按记录本身找目录条目（它没有标签可用）----
+		if s.Kind != KindCompose {
+			continue
+		}
+		app, ok := catalogAppForRecord(s)
+		if ok && app.Kind != KindCompose {
+			// 名字撞上了目录里的**原生**条目（例如用户自己用 Docker 页起了个叫
+			// "nginx" 的项目）：那不是 compose 目录条目，按它对齐只会把健康检查
+			// 打到真正的 nginx 上 —— 又变成"检查打的是别的应用"。当作查不到处理。
+			ok = false
+		}
 		if !ok {
+			// 目录里已经没有这个条目（例如刚下架的 minio / portainer）。
+			// 旧健康地址此刻很可能正打**别的应用**，继续拿它当绿就是假成功。
+			// 清空 → 面板显示"未配置检查地址"；Port 推不出来就保持不动。
+			if s.HealthURL == "" {
+				continue
+			}
+			before := s.HealthURL
+			s.HealthURL = ""
+			if err := m.repo.Update(ctx, s); err != nil {
+				s.HealthURL = before
+				continue
+			}
+			reconcileLog.Info("compose 记录 %s 在应用目录里已无对应条目（可能已下架）："+
+				"清空健康地址 %q —— 它可能打到别的应用上，不能继续当绿", s.Name, before)
+			changed++
 			continue
 		}
-		want := healthURLFor(app)
-		if s.HealthURL == want {
-			continue
+
+		// 目录里找到了：**不一致就覆盖**（不只是零值才补）—— 这正是本次要修的。
+		// 端口取 WebPort()（界面/健康检查口），健康地址照抄 healthURLFor 的拼法。
+		wantPort := app.WebPort()
+		wantHealth := healthURLFor(app)
+		portChanged := wantPort > 0 && s.Port != wantPort
+		if !portChanged && s.HealthURL == wantHealth {
+			continue // 已对齐：不写库、不搅动 mtime
 		}
-		before := s.HealthURL
-		s.HealthURL = want
+		beforePort, beforeHealth := s.Port, s.HealthURL
+		if portChanged {
+			s.Port = wantPort
+		}
+		s.HealthURL = wantHealth
 		if err := m.repo.Update(ctx, s); err != nil {
-			s.HealthURL = before
+			s.Port, s.HealthURL = beforePort, beforeHealth
 			continue
+		}
+		if portChanged {
+			reconcileLog.Info("compose 记录 %s 按目录对齐：端口 %d → %d，健康地址 %q → %q",
+				s.Name, beforePort, wantPort, beforeHealth, wantHealth)
+		} else {
+			reconcileLog.Info("compose 记录 %s 按目录对齐：健康地址 %q → %q",
+				s.Name, beforeHealth, wantHealth)
 		}
 		changed++
 	}

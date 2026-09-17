@@ -933,9 +933,9 @@ check('docker 卡片：有 compose 地址 → 「打开 compose 文件」指向�
   (result.docker.links['IT-Tools（开发者工具箱）'] || [])
     .includes('打开 compose 文件 → http://192.168.1.8:8090/compose/it-tools/docker-compose.yml'),
   show(result.docker.links['IT-Tools（开发者工具箱）']));
-check('docker 卡片：有 compose_env_url → 「变量样例」（.env.example）',
+check('docker 卡片：有 compose_env_url → 「变量样例文件 ↗」（.env.example）',
   (result.docker.links['IT-Tools（开发者工具箱）'] || [])
-    .includes('变量样例 → http://192.168.1.8:8090/compose/it-tools/.env.example'),
+    .includes('变量样例文件 ↗ → http://192.168.1.8:8090/compose/it-tools/.env.example'),
   show(result.docker.links['IT-Tools（开发者工具箱）']));
 check('docker 顶部提示给出全部推荐项目的总索引（compose_readme_url）',
   (result.docker.calloutLinks || [])

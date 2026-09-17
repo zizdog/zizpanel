@@ -88,7 +88,7 @@ const APP_TAB_IDS = new Set(APP_TABS.map((t) => t.id));
 //     → 这是"面板推荐的 Docker 项目"：卡片进 docker Tab，**不给安装动作**；
 //   · compose_yaml           → 预配置 compose 文件的内容（卡片上「复制 compose 配置」）；
 //   · compose_url            → 镜像站上同一份文件的下载/查看地址（卡片上「打开 compose 文件」）；
-//   · compose_env_url        → 变量样例 .env.example 的地址（卡片上「变量样例」）；
+//   · compose_env_url        → 变量样例 .env.example 的地址（卡片上「变量样例文件 ↗」）；
 //   · compose_readme_url     → 全部推荐项目的总索引（顶部提示里的链接）。
 // 这里仍然多认几个历史/备用写法（docker_rec / recommended_docker / compose /
 // compose_file_content …），是为了**接口字段变更时不至于把条目漏出 docker Tab**；
@@ -373,7 +373,11 @@ export function AppsView(content, ctx = {}) {
       }),
       readme
         ? h('div', { style: { marginTop: '4px' } }, [
-          h('a', { href: readme, target: '_blank', rel: 'noopener', text: '查看全部推荐项目的 compose 说明 ↗' }),
+          h('a', {
+            href: readme, target: '_blank', rel: 'noopener',
+            text: '查看全部推荐项目的 compose 说明 ↗',
+            title: '从面板镜像站打开 compose/README.md：一页列出全部推荐项目、各自端口与网络方式，先看这里再挑项目（新标签页打开）',
+          }),
         ])
         : null,
     ]);
@@ -424,8 +428,9 @@ export function AppsView(content, ctx = {}) {
     }
     if (envURL) {
       actions.push(h('a.btn.btn-sm', {
-        href: envURL, target: '_blank', rel: 'noopener', text: '变量样例',
-        title: '打开/下载 .env.example：复制成 .env 后按里面的说明改（含端口与数据目录等变量）',
+        href: envURL, target: '_blank', rel: 'noopener', text: '变量样例文件 ↗',
+        title: '从面板镜像站取这个项目需要的环境变量样例（.env.example）：照着里面的说明改，'
+          + '再复制成 .env 就行（新标签页打开）',
       }));
     }
     if (!actions.length) {
