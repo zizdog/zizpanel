@@ -358,18 +358,22 @@ fi
 #   python3 一次都不许调用（会弹 macOS 开发者工具对话框）、面板 API 必须带后缀。
 step "干跑演练：默认不问 SSH/预授权 + 两条真机 bug 的静态锁"
 
+# ⚠️ 静态锁必须针对**仓库里的 install.sh**：remote-test 会用 ZIZPANEL_INSTALL_SH
+# 把"被测脚本"换成引导脚本，拿 $INSTALL_SH 做静态锁会查错对象（本轮实测：假失败）。
+SRC_INSTALL="$REPO/install.sh"
+
 # ---- 静态锁 1：install.sh 不许再调用 python3（弹窗根源）----
-if grep -nE 'command -v python3|python3 -c|python3 -' "$INSTALL_SH" | grep -vE '^[[:space:]]*#' >/dev/null 2>&1; then
+if grep -nE 'command -v python3|python3 -c|python3 -' "$SRC_INSTALL" | grep -vE '^[[:space:]]*#' >/dev/null 2>&1; then
   fail "install.sh 里仍有 python3 调用（会弹「命令行开发者工具」对话框）："
-  grep -nE 'command -v python3|python3 -c|python3 -' "$INSTALL_SH" | grep -vE '^[[:space:]]*#' | sed 's/^/      /'
+  grep -nE 'command -v python3|python3 -c|python3 -' "$SRC_INSTALL" | grep -vE '^[[:space:]]*#' | sed 's/^/      /'
 else
   pass "静态锁：install.sh 不调用 python3（全新机器上不再弹开发者工具对话框）"
 fi
 
 # ---- 静态锁 2：调面板接口必须带后缀（panelGate 之外一律 404）----
-if grep -qE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$INSTALL_SH"; then
+if grep -qE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$SRC_INSTALL"; then
   fail "仍有不带面板后缀的接口直连（会 404，表现为「面板又问一次账号」）："
-  grep -nE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$INSTALL_SH" | sed 's/^/      /'
+  grep -nE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$SRC_INSTALL" | sed 's/^/      /'
 else
   pass "静态锁：面板接口调用统一走 panel_api_base（带后缀），不再 404"
 fi
@@ -429,7 +433,7 @@ fi
 
 # ④ 静态锁 3：curl|bash 路径必须把 SCRIPT_DIR 指到解压目录（否则 tools/ 不会被安装，
 #    真机表现为"找不到 server-mode.sh"、以及一键 LNMP 缺 system-services.sh）
-if grep -q 'SCRIPT_DIR="\$TMP_DIR"' "$INSTALL_SH"; then
+if grep -q 'SCRIPT_DIR="\$TMP_DIR"' "$SRC_INSTALL"; then
   pass "静态锁：下载路径把 SCRIPT_DIR 指向解包目录（tools/ 会被正确安装）"
 else
   fail "下载路径没有设置 SCRIPT_DIR → 运行时工具不会被复制（真机踩到过）"
