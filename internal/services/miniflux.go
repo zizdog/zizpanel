@@ -373,7 +373,7 @@ func (m *Manager) InstallMiniflux(ctx context.Context, res *InstallResult) error
 	// ---- 2. miniflux 本体 ----
 	if !m.brewHas(ctx, minifluxFormula) {
 		res.step(ctx, "正在 brew install "+minifluxFormula+"（首次可能需要几分钟）")
-		if _, err := m.brewRun(ctx, 30*time.Minute, "install", minifluxFormula); err != nil {
+		if _, err := m.brewInstall(ctx, res, 30*time.Minute, minifluxFormula); err != nil {
 			return err
 		}
 		res.step(ctx, minifluxFormula+" 已安装")
@@ -562,7 +562,7 @@ func (m *Manager) InstallMiniflux(ctx context.Context, res *InstallResult) error
 func (m *Manager) ensureMinifluxPostgres(ctx context.Context, res *InstallResult) error {
 	if !m.brewHas(ctx, minifluxPostgresFormula) {
 		res.step(ctx, "正在 brew install "+minifluxPostgresFormula+"（Miniflux 的数据库）")
-		if _, err := m.brewRun(ctx, 30*time.Minute, "install", minifluxPostgresFormula); err != nil {
+		if _, err := m.brewInstall(ctx, res, 30*time.Minute, minifluxPostgresFormula); err != nil {
 			return err
 		}
 		res.step(ctx, minifluxPostgresFormula+" 已安装")

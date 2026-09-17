@@ -172,6 +172,16 @@ type Manager struct {
 	// 测试机是否装了 CLT 而变 —— 那正是"单测不许碰真实环境"禁止的
 	// （见 baseenv.go 的 BaseEnvStatus）。
 	baseEnvCLTProbe func(ctx context.Context) bool
+	// launchdDirsOverride 仅供测试：替换 launchd 里找 plist 的目录集合。
+	//
+	// 没有它，单测会去读真机 /Library/LaunchDaemons —— 本机恰好把 php@8.2
+	// 装成了系统级守护进程，于是"该服务尚未注册到 launchd"这个测试前提
+	// 在真机上不成立，断言的结论随测试机的安装状态漂移（2026-09-18 真踩到：
+	// 同一个提交在空机器上绿、在本机红）。
+	launchdDirsOverride []string
+	// phpRestartOverride 仅供测试：替换"重启某个 PHP 服务"这一步，
+	// 以便验证"无权重启时如实降级"这条分支（真机上要 root 才复现）。
+	phpRestartOverride func(ctx context.Context, formula string) error
 	// mirrorProbeOverride 仅供测试：替换 brew 镜像探测（它会发真实网络请求）。
 	// 没有它的话，每个碰 brewEnv 的单测都会去访问阿里云/中科大，既慢又依赖外网 ——
 	// 违反"单测不许碰真实服务"。
@@ -223,6 +233,20 @@ type Manager struct {
 	// minifluxHealthTimeoutOverride 仅供测试：把"等 /healthz 就绪"的 60 秒缩短。
 	// 否则"健康检查失败=如实报错"这条分支的单测要真的轮询满 60 秒。
 	minifluxHealthTimeoutOverride time.Duration
+	// brewSourceRunOverride 仅供测试：替换"用指定源跑一次 brew install"。
+	//
+	// 没有它，"失败即换源"的单测会去执行真实的 brew install（违反"单测不许碰真实
+	// brew"），而且 python@3.11 那种"镜像上是 0 字节瓶"的场景根本没法在测试机上
+	// 复现。有了它才能构造"第一个源校验失败 → 换源 → 第二个源成功"这类序列。
+	brewSourceRunOverride func(ctx context.Context, timeout time.Duration, src brewInstallSource, args ...string) (string, error)
+	// brewCacheDirOverride 仅供测试：替换 brew 的下载缓存目录
+	// （默认是真实用户家目录下的 ~/Library/Caches/Homebrew/downloads）。
+	// 没有它，碰"清缓存只删相关条目"的单测会去读/删开发机真实用户的缓存 ——
+	// 那正是 AGENTS.md 第三节禁止的"单测碰真实用户家目录"。
+	brewCacheDirOverride string
+	// brewCacheRemoveOverride 仅供测试：替换"以真实用户身份删除缓存条目"的动作。
+	// 没有它，测删除路径要么真的删文件、要么真的起 sudo。
+	brewCacheRemoveOverride func(ctx context.Context, paths []string) error
 }
 
 // Options 是管理器需要的环境信息。

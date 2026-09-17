@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/user"
@@ -92,6 +93,10 @@ func sandboxManagerWithBrew(t *testing.T, prefix string) *Manager {
 	// 留空 UserName：本测试不验证 socket 属主（那会去查真实系统用户），
 	// 也避免在临时目录上做 chown。
 	m.opt.UserName = ""
+	// launchd 目录必须隔离：默认实现读真机 /Library/LaunchDaemons，而本机恰好
+	// 把 php@8.2 装成了系统级守护进程 —— 那会让"服务尚未注册到 launchd"这个
+	// 测试前提在真机上不成立（同一提交在空机器上绿、在本机红，2026-09-18 真踩到）。
+	m.launchdDirsOverride = []string{filepath.Join(t.TempDir(), "LaunchDaemons")}
 	return m
 }
 
@@ -184,6 +189,51 @@ func TestEnsurePHPListenEndpointWritesOwnSocket(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(res2.Steps, "\n"), "无需改动") {
 		t.Errorf("幂等时应明说「无需改动」，实际 Steps=%v", res2.Steps)
+	}
+}
+
+// TestEnsurePHPListenEndpointDegradesHonestlyWhenRestartNotPermitted：
+// 服务由系统域 launchd 托管、当前身份又不是 root 时（真机 kickstart 报
+// "Operation not permitted"），**必须当失败如实报**，不能因为"端点写进去了"
+// 就假装整条闭环成功：服务此刻可能还在旧端点上跑，站点会 502。
+//
+// 与"尚未注册到 launchd"（那种情况随后注册会按新端点首次 bind）是两回事，
+// 所以这里断言的是"有错误 + 有 Warning + 没有成功字样"。
+func TestEnsurePHPListenEndpointDegradesHonestlyWhenRestartNotPermitted(t *testing.T) {
+	prefix := shortPHPPrefix(t)
+	m := sandboxManagerWithBrew(t, prefix)
+	// 系统域里的 plist 存在（所以 label 解析得出来、走的是"重启"这条分支），
+	// 但重启本身没权限 —— 真机上就是这么报的。
+	daemons := filepath.Join(t.TempDir(), "LaunchDaemons")
+	if err := os.MkdirAll(daemons, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(daemons, "homebrew.mxcl.php@8.2.plist"), []byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.launchdDirsOverride = []string{daemons}
+	m.phpRestartOverride = func(context.Context, string) error {
+		return errors.New("launchctl kickstart 失败: Operation not permitted")
+	}
+	writeFakePHPConf(t, prefix, "8.2", "127.0.0.1:9000")
+
+	res := &InstallResult{}
+	err := m.ensurePHPListenEndpoint(context.Background(), "php@8.2", res)
+	if err == nil {
+		t.Fatal("无权重启时必须返回错误：端点虽已写入，但服务还没按新端点跑，不能算成功")
+	}
+	joined := strings.Join(res.Steps, "\n")
+	wantSock := filepath.Join(prefix, "var", "run", "php-fpm-8.2.sock")
+	if !strings.Contains(joined, wantSock) {
+		t.Errorf("失败说明里必须写清端点写到哪了（用户第一眼要看它）：\n%s", joined)
+	}
+	if !strings.Contains(res.Warning, "8.2") {
+		t.Errorf("必须进 Warning，否则只看摘要会以为成功：%q", res.Warning)
+	}
+	for _, bad := range []string{"已监听在", "已生效", "已重启"} {
+		if strings.Contains(joined, bad) {
+			t.Errorf("没重启成功就出现 %q（谎报成功）：\n%s", bad, joined)
+		}
 	}
 }
 

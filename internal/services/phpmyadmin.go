@@ -72,7 +72,7 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 	// 而 brew 的 phpmyadmin 是 bottled（预编译），走国内镜像能正常下载。
 	if !m.brewHas(ctx, "phpmyadmin") {
 		result.step(ctx, "正在 brew install phpmyadmin")
-		if _, err := m.brewRun(ctx, 15*time.Minute, "install", "phpmyadmin"); err != nil {
+		if _, err := m.brewInstall(ctx, result, 15*time.Minute, "phpmyadmin"); err != nil {
 			return fmt.Errorf("安装 phpmyadmin 失败: %w", err)
 		}
 	} else {

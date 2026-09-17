@@ -199,7 +199,9 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	// 更高版本可能没有 wheel，会退化成源码编译甚至装不上。
 	if !m.brewHas(ctx, qwenPythonVer) {
 		result.step(ctx, "正在安装 "+qwenPythonVer)
-		if _, err := m.brewRun(ctx, 20*time.Minute, "install", qwenPythonVer); err != nil {
+		// 2026-09-20 事故就是这一步：镜像是坏的（0 字节瓶）→ 必须换源重试；
+		// python@3.11 的 arm64 瓶国内镜像常常没有，只能靠官方源兜底。
+		if _, err := m.brewInstall(ctx, result, 20*time.Minute, qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
 		}
 	} else {

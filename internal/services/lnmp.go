@@ -93,7 +93,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		}
 		result.Steps = append(result.Steps,
 			fmt.Sprintf("正在 brew install %s（国内镜像下通常几分钟）", f))
-		if _, err := m.brewRun(ctx, 40*time.Minute, "install", f); err != nil {
+		if _, err := m.brewInstall(ctx, result, 40*time.Minute, f); err != nil {
 			// 失败要能让用户自己救：给出手工命令与镜像提示，
 			// 而不是只抛一句 "brew install 失败"。
 			return fmt.Errorf("安装 %s 失败: %w；可在终端手工重试 `brew install %s`"+

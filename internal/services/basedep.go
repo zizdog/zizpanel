@@ -314,7 +314,9 @@ func (m *Manager) ensureBaseFormula(ctx context.Context, dep BaseDependency, res
 		return nil
 	}
 	result.step(ctx, "正在安装基础依赖 "+dep.Formula+"（"+dep.Command+"："+dep.Why+"）")
-	if _, err := m.brewRun(ctx, 30*time.Minute, "install", dep.Formula); err != nil {
+	// brewInstall：失败即换源（自建镜像 → 清华 → 官方 ghcr.io），
+	// 换源前清掉相关下载缓存，见 install.go 顶部那段事故说明。
+	if _, err := m.brewInstall(ctx, result, 30*time.Minute, dep.Formula); err != nil {
 		return fmt.Errorf("安装基础依赖 %s 失败：%w。"+
 			"它缺失会让 TTS 合成 mp3 返回 200 + 空 body（用户只看到作业全败），"+
 			"请修好后重试，或手工执行：%s", dep.Formula, err, fixCmdFor(dep))

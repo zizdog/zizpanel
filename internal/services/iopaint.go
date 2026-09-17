@@ -157,7 +157,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	// ---- 1. Python 3.11 ----
 	if !m.brewHas(ctx, qwenPythonVer) {
 		result.step(ctx, "正在安装 "+qwenPythonVer)
-		if _, err := m.brewRun(ctx, 20*time.Minute, "install", qwenPythonVer); err != nil {
+		if _, err := m.brewInstall(ctx, result, 20*time.Minute, qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
 		}
 	} else {

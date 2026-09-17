@@ -194,21 +194,51 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 // 面板以 root 运行，所以这里统一通过 sudo -u 切到真实用户。
 // sudoers 里已授权该用户免密使用 sudo，因此不需要密码。
 func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	// 只读 / 服务类命令（list、info、services …）沿用"当前镜像"这一条路：
+	// 它们不下载瓶文件，换源没有意义。**会下载瓶的 install 走 brewInstall**
+	// （带"失败即换源"兜底，见下面的长注释）。
+	src := brewInstallSource{
+		Name: "当前镜像",
+		Env:  m.brewEnv(ctx, firstFormulaOf(args)),
+	}
+	text, err := m.brewRunSource(ctx, timeout, src, args...)
+	if err != nil {
+		return text, fmt.Errorf("brew %s 失败: %s", strings.Join(args, " "),
+			truncate(strings.TrimSpace(text), 500))
+	}
+	return text, nil
+}
+
+// brewRunSource 用指定源跑一条 brew 命令，返回**完整输出**（不截断）。
+//
+// 为什么不复用 brewRun：brewRun 会把输出截断到 500 字符再塞进 error，
+// 而"瓶校验失败 / 下到的是 0 字节文件"的判据出现在输出中后段，截断后就判断不出来
+// —— 那恰恰是 2026-09-20 python@3.11 事故里唯一该换源的信号。
+func (m *Manager) brewRunSource(ctx context.Context, timeout time.Duration, src brewInstallSource, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// 逐行流式：brew install 的下载/解压进度因此能实时出现在任务中心，
+	// 而不是等命令跑完才一次性看到。
+	return streamCmd(ctx, m.brewCommand(ctx, src, args...))
+}
 
-	env := m.brewEnv(ctx, firstFormulaOf(args))
+// brewCommand 构造一条带**指定源**环境变量的 brew 命令（只构造，不执行）。
+//
+// 抽成独立方法有两个理由：
+//  1. 官方源必须**显式清掉** HOMEBREW_API_DOMAIN / HOMEBREW_BOTTLE_DOMAIN，
+//     只"不设"是不够的 —— 面板进程或用户 shell 里残留的值会被子进程继承，
+//     brew 仍会去撞那个坏镜像。这条约束必须能在不执行 brew 的前提下被验证；
+//  2. 降权规则不能走样：Homebrew 拒绝 root，面板是 LaunchDaemon（root），
+//     sudo 默认 env_reset，所以镜像变量只能靠 `/usr/bin/env` 显式带进去。
+func (m *Manager) brewCommand(ctx context.Context, src brewInstallSource, args ...string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 && m.opt.UserName != "" {
-		// 注意： sudo 默认会**清空环境**（env_reset），所以镜像变量不能只放在
-		// 进程环境里 —— 必须显式用 `env` 在命令里带上，否则等于没设。
-		full := append([]string{"-n", "-u", m.opt.UserName, "/usr/bin/env"}, env...)
-		full = append(full, m.opt.BrewBin)
-		full = append(full, args...)
+		full := []string{"-n", "-u", m.opt.UserName, "/usr/bin/env"}
+		full = append(full, brewEnvArgs(src, m.opt.BrewBin, args)...)
 		cmd = exec.CommandContext(ctx, "/usr/bin/sudo", full...)
 	} else {
 		cmd = exec.CommandContext(ctx, m.opt.BrewBin, args...)
-		cmd.Env = append(os.Environ(), env...)
+		cmd.Env = append(envWithout(os.Environ(), src.Unset), src.Env...)
 	}
 	// brew 需要正确的 HOME 才能找到 Cellar 与缓存
 	if m.opt.UserHome != "" {
@@ -217,14 +247,497 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 		}
 		cmd.Env = append(cmd.Env, "HOME="+m.opt.UserHome)
 	}
-	// 逐行流式：brew install 的下载/解压进度因此能实时出现在任务中心，
-	// 而不是等命令跑完才一次性看到。
-	text, err := streamCmd(ctx, cmd)
-	if err != nil {
-		return text, fmt.Errorf("brew %s 失败: %s", strings.Join(args, " "),
-			truncate(strings.TrimSpace(text), 500))
+	return cmd
+}
+
+// brewEnvArgs 构造 `/usr/bin/env` 的参数：先显式清除镜像变量（-u），再注入本次要用的源。
+//
+// 顺序有意为之：`env` 是"先 unset、再赋值"，-u 必须排在 KEY=VAL 之前，
+// 否则残留值会赢。
+func brewEnvArgs(src brewInstallSource, brewBin string, args []string) []string {
+	out := make([]string, 0, len(src.Unset)*2+len(src.Env)+1+len(args))
+	for _, k := range src.Unset {
+		out = append(out, "-u", k)
 	}
-	return text, nil
+	out = append(out, src.Env...)
+	out = append(out, brewBin)
+	return append(out, args...)
+}
+
+// envWithout 从环境变量列表里去掉指定键。
+func envWithout(env []string, keys []string) []string {
+	if len(keys) == 0 {
+		return append([]string(nil), env...)
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		drop := false
+		for _, k := range keys {
+			if strings.HasPrefix(kv, k+"=") {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// ============================================================================
+//  失败即换源（brew install 的兜底）
+//
+//  2026-09-20 真机事故：面板在装 Qwen3 TTS 时执行 `brew install python@3.11`
+//  失败，报
+//      Error: Bottle reports different checksum:   a5dd571f…
+//      SHA-256 checksum of downloaded file: e3b0c442…
+//  而 e3b0c442… 正是**空文件**的 SHA-256 —— 镜像侧把上游的 403 缓存成了 0 字节
+//  文件，brew 拿到空文件后校验失败，整个任务失败。
+//
+//  三个必须记住的事实（它们决定了下面这段代码的形状）：
+//   1. 面板**强制**把 HOMEBREW_BOTTLE_DOMAIN / HOMEBREW_API_DOMAIN 指向自建镜像
+//      （install.sh 写 rc、brewEnv 注入），这是为了国内速度，不能因为一次坏缓存就取消；
+//   2. python@3.11 的 3.11.16 arm64 bottle 在 USTC/清华/阿里云/腾讯**都没有**
+//      （实测 USTC 403、其余 404），只有官方 ghcr.io 有。所以"镜像全挂"是常态，
+//      必须有**官方源**这条兜底，而且必须能自动走到；
+//   3. brew 的下载缓存按 sha256 命名、命中即**复用**。换了源却不清掉那个空文件，
+//      只会拿着同一个坏包在下一个源上再撞一次校验失败 —— 换源等于白换。
+//
+//  所以：任何一次 brew install 失败都不能直接判死刑，按
+//  自建镜像 → 其它国内镜像（清华）→ 官方源(ghcr.io) 逐条重试，
+//  每次 result.step 说清"用了哪个源、结果如何"，最后把各源的**真实错误**逐条列出。
+// ============================================================================
+
+// brewInstallSource 是一次 brew install 尝试使用的"源"（API 域 + 瓶域）。
+type brewInstallSource struct {
+	// Name 是人类可读的源名，直接进任务日志与最终错误文案。
+	Name string
+	// Env 是这次要注入的环境变量（KEY=VAL）。
+	Env []string
+	// Unset 是这次要**显式清除**的环境变量名。
+	// 官方源靠它兜底：只"不设"不够，进程/用户 shell 里残留的值会被子进程继承。
+	Unset []string
+}
+
+// brewCommonEnv 与源无关的 brew 开关。
+//
+// 自动更新会在每次 brew 命令前拉一遍仓库元数据（国内很慢，面板自己管安装）；
+// NO_INSTALL_CLEANUP 防止 brew 在我们想保留旧版本时自行清理。
+var brewCommonEnv = []string{
+	"HOMEBREW_NO_AUTO_UPDATE=1",
+	"HOMEBREW_NO_INSTALL_CLEANUP=1",
+}
+
+// brewTUNABase 是"另一个国内镜像"（清华 TUNA）的 Homebrew 瓶基址。
+//
+// 为什么在自建镜像与官方源之间插这一家：自建镜像与面板探测选中的那家可能恰好
+// 缺某个 bottle 的某个版本，多一家多一条路；它挂了也只是多一次快速失败，
+// 后面还有官方源兜底。
+const brewTUNABase = "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
+
+// brewInstallSources 返回这次 brew install 的**换源顺序**。
+//
+// 顺序（顺序即优先级，全部写成返回值而不是散在重试循环里，是为了可测）：
+//  1. 当前镜像 —— brewEnv 的结果：自建镜像优先，否则是中科大/清华/阿里云里探测到的那家；
+//  2. 清华大学镜像 —— 另一家国内镜像（可选项，见 brewTUNABase）；
+//  3. 官方源 —— **不设** HOMEBREW_BOTTLE_DOMAIN（brew 回落 ghcr.io），
+//     API 也回落 formulae.brew.sh。这是 python@3.11 这类"国内镜像全都没有"的
+//     瓶的唯一出路，也是本次事故的根因修复点。
+//
+// 离线模式（仅走 NAS）下**只保留第 1 条**：项目硬规则是离线模式禁止任何外网回落
+// （见 Options.OfflineOnly），宁可明确失败也不能偷偷出网。
+func (m *Manager) brewInstallSources(ctx context.Context, formula string) []brewInstallSource {
+	curEnv := m.brewEnv(ctx, formula)
+	srcs := []brewInstallSource{{
+		Name: m.brewSourceName(curEnv),
+		Env:  curEnv,
+	}}
+	if m.opt.OfflineOnly {
+		return srcs
+	}
+	if !brewEnvMentions(curEnv, brewTUNABase) {
+		srcs = append(srcs, brewInstallSource{
+			Name: "清华大学镜像（tuna）",
+			Env: append([]string{
+				"HOMEBREW_API_DOMAIN=" + brewTUNABase + "/api",
+				"HOMEBREW_BOTTLE_DOMAIN=" + brewTUNABase,
+			}, brewCommonEnv...),
+		})
+	}
+	// 探测一个镜像都没选出来时，第 1 条**就是**官方源 —— 这时不必再排一遍官方，
+	// 否则日志里会出现两条一模一样的"官方源"，用户会以为面板在原地空转。
+	if brewEnvValue(curEnv, "HOMEBREW_BOTTLE_DOMAIN") != "" ||
+		brewEnvValue(curEnv, "HOMEBREW_API_DOMAIN") != "" {
+		srcs = append(srcs, brewInstallSource{
+			Name:  "官方源（formulae.brew.sh / ghcr.io）",
+			Env:   append([]string(nil), brewCommonEnv...),
+			Unset: []string{"HOMEBREW_API_DOMAIN", "HOMEBREW_BOTTLE_DOMAIN"},
+		})
+	}
+	return srcs
+}
+
+// brewSourceName 把一份 brew 环境变量翻译成"人话"的源名。
+//
+// 日志里"用了哪个源"必须是真的：直接写死"自建镜像"会在探测回落到中科大时骗人
+// （而这个项目最贵的教训就是"日志说 A、实际做 B"）。
+func (m *Manager) brewSourceName(env []string) string {
+	api := brewEnvValue(env, "HOMEBREW_API_DOMAIN")
+	bottle := brewEnvValue(env, "HOMEBREW_BOTTLE_DOMAIN")
+	switch {
+	case bottle == "" && api == "":
+		return "官方源（formulae.brew.sh / ghcr.io）"
+	case bottle == "":
+		return "仅有 API 源 " + api + "（瓶回落官方 ghcr.io）"
+	}
+	if base := strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/"); base != "" &&
+		strings.HasPrefix(bottle, base+"/brew") {
+		return "自建镜像 " + bottle
+	}
+	for _, c := range brewMirrorCandidates {
+		if strings.HasPrefix(bottle, c.Base) {
+			return c.Name + "镜像 " + bottle
+		}
+	}
+	return "镜像 " + bottle
+}
+
+// brewEnvValue 从 KEY=VAL 列表里取一个键的值（取不到返回 ""）。
+func brewEnvValue(env []string, key string) string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return strings.TrimPrefix(kv, key+"=")
+		}
+	}
+	return ""
+}
+
+// brewEnvMentions 判断这份环境变量里是不是已经在用某个镜像基址。
+func brewEnvMentions(env []string, base string) bool {
+	if base == "" {
+		return false
+	}
+	return strings.HasPrefix(brewEnvValue(env, "HOMEBREW_BOTTLE_DOMAIN"), base) ||
+		strings.HasPrefix(brewEnvValue(env, "HOMEBREW_API_DOMAIN"), base)
+}
+
+// sha256OfEmptyFile 是空文件的 SHA-256。
+//
+// 镜像侧把上游 403 缓存成 0 字节文件时，brew 报出来的"实际校验值"就是这个常量。
+// 见到它等价于"下到的是个空文件"，必须当作**该源不可用**去换源，而不是直接失败。
+const sha256OfEmptyFile = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// brewBottleDownloadBroken 判断一次失败是不是"这个源上的瓶文件是坏的/空的"。
+//
+// 判据是 brew 自己的原文：校验值不符，或实际校验值等于空文件的 sha256。
+// 这类失败**不代表这个包装不上**，只代表这个源不能用了 —— 必须换源重试。
+func brewBottleDownloadBroken(text string) bool {
+	low := strings.ToLower(text)
+	return strings.Contains(low, "bottle reports different checksum") ||
+		strings.Contains(low, "sha-256 checksum of downloaded file") ||
+		strings.Contains(low, sha256OfEmptyFile)
+}
+
+// brewFailureLine 从一次失败的输出里挑出**真正的那几句错误**。
+//
+// 为什么不直接贴输出尾部：brew 失败时最后几行常常是清理/提示，真正的原因
+// （例如 "Bottle reports different checksum"）在中间，而"为什么下不动"往往在
+// 紧邻的上一行（`curl: (28) timed out`）。只贴尾部等于把最该看的那一行丢掉；
+// 只贴一行又会丢掉"校验失败 → 下到的是空文件"这层因果。
+// 所以取**最后两行像错误的行**（保持原顺序），既短又不丢线索。
+func brewFailureLine(text string, err error) string {
+	lines := strings.Split(text, "\n")
+	picked := make([]string, 0, 2)
+	for i := len(lines) - 1; i >= 0 && len(picked) < 2; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l == "" || !brewErrorLineish(l) {
+			continue
+		}
+		picked = append([]string{l}, picked...)
+	}
+	if len(picked) > 0 {
+		return truncate(strings.Join(picked, " / "), 300)
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			return truncate(l, 300)
+		}
+	}
+	if err != nil {
+		return truncate(err.Error(), 300)
+	}
+	return "未知错误（brew 没有任何输出）"
+}
+
+// brewErrorLineish 判断一行是不是"值得进错误摘要"的那类行。
+func brewErrorLineish(l string) bool {
+	return strings.HasPrefix(l, "Error:") ||
+		strings.HasPrefix(l, "curl:") ||
+		strings.Contains(l, "reports different checksum") ||
+		strings.Contains(l, "SHA-256 checksum") ||
+		strings.Contains(l, "Failed to download")
+}
+
+// brewInstall 用"失败即换源"的方式执行一次 brew install，返回成功源的完整输出。
+//
+// 它是**所有** brew 安装路径的唯一入口（普通市场应用、LNMP、基础依赖、phpMyAdmin、
+// Miniflux、Syncthing、Colima、Qwen/IOPaint 的 python@3.11 …）—— 各写一遍必然走样，
+// 而这次事故要修的正是"同一条 brew install 少了一层兜底"。
+//
+// 关于 brewRun（只读命令）与它的分工见 brewRun 的注释。这里的注释不重复
+// 顶部那一大段教训，只讲循环本身：
+//   - 每次尝试前（除第一次）先清**与本次公式相关**的坏包缓存；
+//   - 每次尝试都写 result.step（用了哪个源、成功还是失败、失败的真实原因）；
+//   - 全部失败时把每个源的真实错误**逐条**列进 error，并给出可行动的下一步。
+func (m *Manager) brewInstall(ctx context.Context, res *InstallResult, timeout time.Duration, formulas ...string) (string, error) {
+	formulaList := strings.Join(formulas, "、")
+	if len(formulas) == 0 {
+		return "", fmt.Errorf("brewInstall 没有指定任何 formula")
+	}
+	args := append([]string{"install"}, formulas...)
+	srcs := m.brewInstallSources(ctx, formulas[0])
+
+	var (
+		failures []string
+		lastText string
+	)
+	for i, src := range srcs {
+		if i > 0 {
+			// 换源之前先清坏包：缓存按 sha256 命名、命中即复用，
+			// 不清就会拿着同一个空文件在下一个源上再撞一次校验失败。
+			m.cleanBrewDownloadCache(ctx, res, formulas, lastText)
+		}
+		if res != nil {
+			res.step(ctx, fmt.Sprintf("第 %d/%d 个源：%s", i+1, len(srcs), src.Name))
+		}
+		text, err := m.brewInstallRun(ctx, timeout, src, args...)
+		lastText = text
+		if err == nil {
+			if res != nil {
+				res.step(ctx, "安装成功（源："+src.Name+"）："+formulaList)
+			}
+			return text, nil
+		}
+		line := brewFailureLine(text, err)
+		failures = append(failures, src.Name+" → "+line)
+		if res != nil {
+			res.step(ctx, "失败（源："+src.Name+"）："+line)
+			if brewBottleDownloadBroken(text) {
+				// 重点：这不是"包装不上"，而是"这个源是坏的"。必须明说并继续换源。
+				res.step(ctx, "  ↑ 这个源上的瓶文件是坏的（0 字节 / 校验值不符），"+
+					"按「该源不可用」处理，继续换下一个源")
+			}
+		}
+	}
+
+	detail := strings.Join(failures, "\n  ")
+	if m.opt.OfflineOnly {
+		return lastText, fmt.Errorf(
+			"安装 %s 失败：离线模式（仅走 NAS 镜像）下不允许回落公网/官方源，因此只试了 1 个源。\n  %s\n"+
+				"请确认 NAS 镜像已同步该瓶，或关闭「仅走 NAS（离线）」后重试。",
+			formulaList, detail)
+	}
+	return lastText, fmt.Errorf(
+		"安装 %s 失败：面板试过的 %d 个源都不可用，各源的真实错误如下：\n  %s\n"+
+			"若错误里出现 `Bottle reports different checksum` / 0 字节（e3b0c442…），"+
+			"说明这些镜像上还没有这个版本的 arm64 bottle（实测 USTC 403、清华/阿里云/腾讯 404），"+
+			"而官方源也不通；建议稍后重试（镜像侧同步有延迟），"+
+			"或先清掉 brew 下载缓存再手工执行 `brew install %s`。",
+		formulaList, len(srcs), detail, strings.Join(formulas, " "))
+}
+
+// brewInstallRun 跑一次尝试。测试通过 brewSourceRunOverride 注入假执行器，
+// 这样"换源顺序 / 校验失败要换源"能在不执行真实 brew 的前提下被验证。
+func (m *Manager) brewInstallRun(ctx context.Context, timeout time.Duration, src brewInstallSource, args ...string) (string, error) {
+	if m.brewSourceRunOverride != nil {
+		return m.brewSourceRunOverride(ctx, timeout, src, args...)
+	}
+	return m.brewRunSource(ctx, timeout, src, args...)
+}
+
+// brewSHA256Pattern 从失败输出里抓 64 位十六进制校验值。
+//
+// 为什么值得抓：缓存条目一律以 `<sha256>--` 开头，而 brew 会在错误里同时给出
+// "期望的 sha"和"实际下到的 sha"。用它定位坏包，连**坏在依赖上**（例如
+// python@3.11 的 readline 瓶）也能精确删对，而不是只按 formula 名去猜。
+var brewSHA256Pattern = regexp.MustCompile(`\b[0-9a-f]{64}\b`)
+
+// brewChecksumsInText 返回文本里出现的所有 sha256（去重、小写）。
+func brewChecksumsInText(text string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range brewSHA256Pattern.FindAllString(strings.ToLower(text), -1) {
+		if seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+// brewCacheMatches 判断一个下载缓存条目是否属于"本次安装相关的坏包"。
+//
+// 两级判据，都要求名字里出现**明确分隔符**，宁可漏删也绝不误删：
+//  1. sha256：缓存条目一律以 `<sha256>--` 开头（Homebrew 用下载内容的 sha 命名），
+//     所以从失败输出里抓到的校验值能精确定位那一个坏文件 —— 即使坏的是**依赖**
+//     而不是目标公式（例如 python@3.11 依赖的 readline 下成了空文件）也能删对；
+//  2. formula：真实布局是 `<sha256>--<formula>-<version>…`（本机缓存实测，
+//     例如 `08b1afef…--libssh2-1.11.1_5.bottle_manifest.json`）。
+//     分隔符后**必须紧跟版本号（数字）**，这样 `go` 不会连 `go-task-3.40.0`
+//     一起删、`php` 不会碰 `phpmyadmin`、`python@3.11` 不会碰 `python@3.12`、
+//     `python` 也不会碰 `python@3.11`。
+//
+// `.incomplete`（下到一半的断点文件）先剥掉再判断 —— 那个同样必须清，
+// 否则 brew 会从断点续传继续拼出一个坏文件。
+func brewCacheMatches(name string, formulas, sha256s []string) bool {
+	base := strings.TrimSuffix(name, ".incomplete")
+	for _, sha := range sha256s {
+		if sha != "" && strings.HasPrefix(base, sha+"--") {
+			return true
+		}
+	}
+	for _, f := range formulas {
+		if f == "" {
+			continue
+		}
+		if brewCacheNameHasFormula(base, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// brewCacheNameHasFormula 判断 `<sha>--<formula>-<version>…` 这类缓存名里的
+// formula 是不是**这一个**（而不是恰好以它开头的另一个公式）。
+//
+// 判据：分隔符（`--<formula>` 之后的一个或多个 `-`）后面必须直接跟版本号的第一位数字。
+// 允许 `-` 与 `--` 两种分隔，是为了同时覆盖 `<sha>--xz-5.8.4.tar.gz` 与
+// `<sha>--xz--5.8.4.tar.gz` 两种历史布局。
+func brewCacheNameHasFormula(base, formula string) bool {
+	seg := "--" + formula
+	for i := strings.Index(base, seg); i >= 0; {
+		rest := strings.TrimLeft(base[i+len(seg):], "-")
+		if rest != "" && rest[0] >= '0' && rest[0] <= '9' {
+			return true
+		}
+		next := strings.Index(base[i+1:], seg)
+		if next < 0 {
+			return false
+		}
+		i = i + 1 + next
+	}
+	return false
+}
+
+// planBrewCacheClean 从缓存目录的文件名列表里挑出要删的那些（纯函数，可单测）。
+//
+// 只返回与本次公式/本次错误里的校验值相关的条目；目录里的其它东西一律不动 ——
+// 调用方也**不会** rm -rf 整个缓存目录。
+func planBrewCacheClean(names []string, formulas, sha256s []string) []string {
+	var out []string
+	for _, n := range names {
+		if brewCacheMatches(n, formulas, sha256s) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// brewCacheDir 返回 brew 的下载缓存目录。
+//
+// 缓存属于**真实用户**（Homebrew 的 `<brew> --cache` 就在用户家目录下），
+// 所以只能从 m.opt.UserHome 推导，不能自己拼 /var/root 之类。
+func (m *Manager) brewCacheDir() string {
+	if m.brewCacheDirOverride != "" {
+		return m.brewCacheDirOverride
+	}
+	if strings.TrimSpace(m.opt.UserHome) == "" {
+		return ""
+	}
+	return filepath.Join(m.opt.UserHome, "Library", "Caches", "Homebrew", "downloads")
+}
+
+// cleanBrewDownloadCache 在换源重试之前清掉与本次安装相关的坏包缓存条目。
+//
+// 只删相关条目（判据见 brewCacheMatches），并**把删了什么写进任务日志** ——
+// "我删了你的文件"这件事必须可追溯，否则用户没法判断是不是面板误删了什么。
+// 目录不存在/不可读一律不是错误（还没下过东西的机器就是这样），如实说一句即可。
+func (m *Manager) cleanBrewDownloadCache(ctx context.Context, res *InstallResult, formulas []string, failedText string) {
+	dir := m.brewCacheDir()
+	if dir == "" {
+		if res != nil {
+			res.step(ctx, "跳过 brew 下载缓存清理：面板不知道真实用户的家目录")
+		}
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if res != nil {
+			res.step(ctx, "brew 下载缓存目录不可读（"+dir+"），没有可清理的坏包："+err.Error())
+		}
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	doomed := planBrewCacheClean(names, formulas, brewChecksumsInText(failedText))
+	if len(doomed) == 0 {
+		if res != nil {
+			res.step(ctx, "brew 下载缓存里没有与 "+strings.Join(formulas, "、")+
+				" 相关的条目（未删任何文件；目录 "+dir+"）")
+		}
+		return
+	}
+	paths := make([]string, 0, len(doomed))
+	for _, n := range doomed {
+		paths = append(paths, filepath.Join(dir, n))
+	}
+	if err := m.removeBrewCacheEntries(ctx, paths); err != nil {
+		if res != nil {
+			res.step(ctx, "清理 brew 下载缓存失败（换源重试可能会复用坏包）："+err.Error())
+		}
+		return
+	}
+	if res != nil {
+		res.step(ctx, "已清除 "+strconv.Itoa(len(doomed))+" 个相关下载缓存条目"+
+			"（只删与本次公式相关的，未动整个缓存）："+strings.Join(doomed, "、"))
+	}
+}
+
+// removeBrewCacheEntries 以**真实用户身份**删除这些缓存条目，绝不以 root 删。
+//
+// 为什么必须降权：缓存文件归用户所有，root 直接删会在用户下次 brew 时留下
+// 归属/权限不一致的目录（Homebrew 自己就明确拒绝 root 运行）。
+// 非 root（本地调试实例）时用 os.Remove，等价且不需要 sudo。
+func (m *Manager) removeBrewCacheEntries(ctx context.Context, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if m.brewCacheRemoveOverride != nil {
+		return m.brewCacheRemoveOverride(ctx, paths)
+	}
+	if os.Geteuid() == 0 && m.opt.UserName != "" {
+		args := append([]string{"-n", "-u", m.opt.UserName, "/bin/rm", "-f", "--"}, paths...)
+		out, err := exec.CommandContext(ctx, "/usr/bin/sudo", args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("以用户 %s 删除缓存失败: %v: %s",
+				m.opt.UserName, err, truncate(strings.TrimSpace(string(out)), 200))
+		}
+		return nil
+	}
+	var firstErr error
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // brewMirrorBase 是一个 Homebrew 二进制瓶镜像的基址（API 与瓶文件共用基址）。
@@ -456,6 +969,10 @@ func (m *Manager) BrewCapture(ctx context.Context, timeout time.Duration, args .
 //  3. 都不行就不设 bottle 域，让 brew 回落官方（不会比不设更差）。
 //
 // probeFormula 是这次要装的第一个包（用它的清单做探针）；空表示不探测。
+//
+// 注意：这里选出的只是**第一个源**。真正会下载瓶的 brew install 走 brewInstall，
+// 它在这次失败之后还会按 自建镜像 → 清华 → 官方源 继续换源重试
+// （见文件上方"失败即换源"那一段事故说明）—— 所以"探测没选中镜像"不等于没救。
 func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 	pick := func(key, def string) string {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -496,7 +1013,9 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 	// 1) 确保包已安装
 	if !m.brewHas(ctx, app.BrewFormula) {
 		res.step(ctx, "正在 brew install "+app.BrewFormula+"（首次可能需要几分钟）")
-		if _, err := m.brewRun(ctx, 30*time.Minute, "install", app.BrewFormula); err != nil {
+		// 走 brewInstall（而不是裸 brewRun）：失败会自动换源重试，
+		// 详见文件上方"失败即换源"那一段。
+		if _, err := m.brewInstall(ctx, res, 30*time.Minute, app.BrewFormula); err != nil {
 			return err
 		}
 	}

@@ -143,14 +143,38 @@ func displayNameOf(s *Service) string {
 //
 // 都找不到时返回空串，让调用方回退到目录条目里写死的标签。
 func BrewLabelFor(userHome, formula string) string {
-	if strings.TrimSpace(formula) == "" {
+	return brewLabelInDirs(brewLabelDirs(userHome), formula)
+}
+
+// brewLabelFor 是可被测试隔离的 BrewLabelFor：测试用 launchdDirsOverride
+// 指定目录集合，避免单测去读真机 launchd 状态（见 services.go 里该字段的说明）。
+func (m *Manager) brewLabelFor(formula string) string {
+	if m != nil && m.launchdDirsOverride != nil {
+		return brewLabelInDirs(m.launchdDirsOverride, formula)
+	}
+	if m == nil {
 		return ""
 	}
+	return BrewLabelFor(m.opt.UserHome, formula)
+}
+
+// brewLabelDirs 是 launchd 里可能存 plist 的目录，按"先用户级、后系统级"排序。
+func brewLabelDirs(userHome string) []string {
 	dirs := []string{"/Library/LaunchDaemons"}
 	if userHome != "" {
 		dirs = append([]string{filepath.Join(userHome, "Library", "LaunchAgents")}, dirs...)
 	}
+	return dirs
+}
 
+// brewLabelInDirs 是 BrewLabelFor 的实现体，独立出来是为了让调用方能换掉目录集合：
+// 真机 /Library/LaunchDaemons 里有没有 php@x.y.plist 是**环境状态**，
+// 单测不该依赖它（本机恰好把 php@8.2 装成了系统守护进程，于是"服务未注册"
+// 这个测试前提不成立、断言随之漂移 —— 2026-09-18 真踩到）。
+func brewLabelInDirs(dirs []string, formula string) string {
+	if strings.TrimSpace(formula) == "" {
+		return ""
+	}
 	for _, d := range dirs {
 		for _, prefix := range []string{"homebrew.mxcl.", "sh.brew."} {
 			if fileExists(filepath.Join(d, prefix+formula+".plist")) {

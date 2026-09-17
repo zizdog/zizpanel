@@ -129,9 +129,12 @@ func (m *Manager) ensurePHPListenEndpoint(ctx context.Context, formula string, r
 // 复用 priv.LaunchKickstart（它自己按 plist 位置判断 system / gui 域），
 // 不在服务层重写 launchctl 调用 —— 两套实现迟早会不一致。
 func (m *Manager) restartPHPFPM(ctx context.Context, formula string) error {
-	label := BrewLabelFor(m.opt.UserHome, formula)
+	label := m.brewLabelFor(formula)
 	if label == "" {
 		return errPHPNotManaged
+	}
+	if m.phpRestartOverride != nil {
+		return m.phpRestartOverride(ctx, formula)
 	}
 	if err := priv.LaunchKickstart(label); err == nil {
 		return nil
@@ -140,9 +143,40 @@ func (m *Manager) restartPHPFPM(ctx context.Context, formula string) error {
 	// 已系统化的用 launchctl bootstrap，未系统化的才用 brew services restart。
 	// 一旦失败就必须如实冒泡，绝不吞掉。
 	if err := m.RestartBrewService(ctx, formula); err != nil {
+		// **权限/服务域不符**是失败，但原因和"配置写错"不同，要说清是哪一种：
+		// 一键 LNMP 会把 PHP 改造成**系统域** LaunchDaemon
+		// （/Library/LaunchDaemons/homebrew.mxcl.php@8.2.plist），
+		// 而当前身份不是 root 时 `launchctl kickstart system/...` 只会
+		// "Operation not permitted"。这时服务可能还跑在**旧**端点上，
+		// 所以必须如实冒泡（调用方进 Warning + Steps + 补救动作），绝不吞掉。
+		if isRestartNotPermitted(err) {
+			// 身份/服务域不允许重启（plist 在系统域，而当前不是 root）：**仍然是失败**，
+			// 必须冒泡 —— 调用方会把"端点已写入、但没生效"如实写进 Warning + Steps。
+			// 区别于 errPHPNotManaged：那种情况服务压根还没启动，随后注册时会按新端点
+			// 首次 bind；这里服务可能正跑在**旧**端点上，不重启用的是旧端点，站点会 502。
+			return fmt.Errorf("无权重启 %s（该服务由系统域 launchd 托管，需要 root 身份；"+
+				"可在「服务管理」里点重启）：%w", label, err)
+		}
 		return fmt.Errorf("launchctl kickstart %s 与重启服务都失败: %w", label, err)
 	}
 	return nil
+}
+
+// isRestartNotPermitted 判断失败是不是"身份/服务域不允许重启"（而不是配置写错）。
+func isRestartNotPermitted(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"operation not permitted", "not permitted", "could not kickstart",
+		"permission denied", "must be root", "requires root",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // chownSocketDir 把 Unix socket 所在目录归属真实用户（尽力而为）。

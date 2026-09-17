@@ -547,7 +547,7 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 	// ---- 2. 本体（30 分钟：瓶 + 可能的依赖） ----
 	if !m.brewHas(ctx, syncthingFormula) {
 		res.step(ctx, "正在 brew install "+syncthingFormula+"（首次可能需要几分钟）")
-		if _, err := m.brewRun(ctx, 30*time.Minute, "install", syncthingFormula); err != nil {
+		if _, err := m.brewInstall(ctx, res, 30*time.Minute, syncthingFormula); err != nil {
 			return err
 		}
 		res.step(ctx, syncthingFormula+" 已安装")
