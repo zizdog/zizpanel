@@ -17,7 +17,11 @@
 # =============================================================================
 
 SHELL      := /bin/bash
-VERSION    := $(shell grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
+# VERSION 必须**锚定 `var Version`**，不能用"文件里第一个 x.y.z"：
+# version.go 的文档注释里会写历史版本（如 `1.0.0：第一个正式版`），
+# 宽松 grep + head -1 会取到注释里的旧版本 → 包名/清单用旧版本、二进制却是新的，
+# 而 `make release` 不会报任何错（2026-09-17 实测踩到，见 DEVELOPMENT 坑 153）。
+VERSION    := $(shell sed -n 's/^var Version *= *"\([0-9][0-9.]*\)".*/\1/p' internal/version/version.go | head -1)
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS    := -s -w \
@@ -91,6 +95,15 @@ test-short: ## 只跑单测（跳过真实系统采集）
 
 .PHONY: check
 check: ## 提交前检查：格式 + shell 校验 + vet + 测试
+	@echo "==> 版本号来源检查（注释里的历史版本不许遮蔽 var Version）"
+	@real="$(VERSION)"; loose=$$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
+	 if [ -z "$$real" ]; then echo "!! 从 var Version 取不到版本号"; exit 1; fi; \
+	 if [ "$$loose" != "$$real" ]; then \
+	   echo "!! version.go 里'第一个版本号'($$loose) 与 var Version ($$real) 不一致："; \
+	   echo "   注释里的 x.y.z 会骗过按行取版本的脚本/工具（包名与二进制会错版本）。"; \
+	   echo "   把注释里的版本写成不含 x.y.z 的样子（例如 1.0.0 → 1_0_0 或加引号说明）。"; \
+	   exit 1; \
+	 fi; echo "   ok：版本号 $$real"
 	@echo "==> gofmt 检查"
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
