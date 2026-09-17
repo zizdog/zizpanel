@@ -408,7 +408,7 @@ publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS
 	@echo "验证（从这台机器）：curl -sI $(NAS_MIRROR_URL)/manifest.json"
 
 .PHONY: deploy
-deploy: ## 一条命令发布：release + 推 NAS（单流）+ 并行升级两台 + 验证（需要 ZP_PASS/NAS_PASS）
+deploy: ## 一条命令发布：release + 推 NAS（单流）+ 升级本机 + 验证（生产机不许碰，见 AGENTS 铁律 5）
 	@ZP_PASS='$(ZP_PASS)' NAS_PASS='$(NAS_PASS)' \
 	 SKIP_CHECK='$(SKIP_CHECK)' SKIP_BUILD='$(SKIP_BUILD)' \
 	 bash tools/deploy.sh

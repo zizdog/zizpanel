@@ -87,9 +87,8 @@ ZIZPANEL_LAN_PREAUTH="${ZIZPANEL_LAN_PREAUTH:-${ZP_LAN_PREAUTH:-}}"
 LAN_CIDR_INPUT="${ZIZPANEL_LAN_CIDR:-${ZP_LAN_CIDR:-}}"
 # ZIZPANEL_DRY_RUN=1：只演练，不做任何修改（用于验证交互与默认值，不装任何东西）
 ZIZPANEL_DRY_RUN="${ZIZPANEL_DRY_RUN:-0}"
-# ADMIN_PASSWORD_GENERATED=1 表示口令是脚本自动生成的（无终端场景）：
+# 说明：安装器**不再生成口令**（账号交给面板初始化向导）。
 # 安装结果里必须显著打印一次，之后不再显示。
-ADMIN_PASSWORD_GENERATED=0
 # PANEL_UPGRADE_SOURCE 是探测后真正写进 config.json 的在线升级源（main 里填）。
 # 空串 = 公网与 NAS 都不可用：宁可不写，也不写一个探不通的地址。
 PANEL_UPGRADE_SOURCE=""
@@ -362,6 +361,12 @@ download_binaries() {
   if ! tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"; then
     die "安装包解压失败，文件可能不完整"
   fi
+  # 把「脚本目录」指向解压目录：包里带着 tools/（server-mode.sh、system-services.sh …），
+  # 而 install_binaries 复制这些工具的前置是 `[ -d "$SCRIPT_DIR/tools" ]`。
+  # **真机实测踩到**：`curl … | sudo bash` 时 BASH_SOURCE[0] 是 "bash" → dirname 是 "." →
+  # SCRIPT_DIR 变成用户当前目录（如 /Users/zizdog），那里没有 tools/ → 整段复制被跳过 →
+  # 面板装完后「远程登录」报"找不到 server-mode.sh"、「一键 LNMP」也拿不到 system-services.sh。
+  SCRIPT_DIR="$TMP_DIR"
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"
   [ -x "$SOURCE_BIN" ] || die "安装包中缺少 zizpanel 可执行文件（来源：${ZIZPANEL_DOWNLOAD_BASE}）"
@@ -827,21 +832,28 @@ install_deps() {
   fi
 
   if ! has_brew; then
-    warn "未检测到 Homebrew。面板本身不依赖它，但网站管理（nginx/PHP/MySQL）需要。"
+    info "未检测到 Homebrew。面板本身不依赖它，但网站管理（nginx/PHP/MySQL）需要。"
     # CLT 是 Homebrew 的前置，也是整条链里最大的一笔下载：装它之前先探一次镜像，
     # 并把结论如实报出来（探不到就说探不到，绝不假装有镜像）。
     clt_mirror_note
-    if [ "${ZIZPANEL_INSTALL_BREW:-1}" = "1" ]; then
-      setup_homebrew || warn "Homebrew 未能自动安装，可稍后在面板里重试或手工安装"
+    # 🛑 2026-09-17 用户明确要求（真机实测后）：**默认不在安装期装 Homebrew/CLT**。
+    # 原因：CLT 的官方安装路径会弹 macOS 的「命令行开发者工具」GUI 对话框（要人点按钮、
+    # 还要从 Apple 下载），把"一条命令装完"卡住 —— 而面板「基础环境」里**已经**有
+    # 同一件事的完整实现（EnsureCLT 走 632MB 镜像分片 + EnsureHomebrew 走镜像，
+    # 以 root 在任务中心里流式安装、不弹任何窗口）。
+    # 所以这里默认跳过：唯一一份实现留在面板里，安装器只负责把面板装起来。
+    if [ "${ZIZPANEL_INSTALL_BREW:-0}" = "1" ]; then
+      setup_homebrew || warn "Homebrew 未能自动安装，可稍后在面板「基础环境」里重试"
     else
-      warn "已按 ZIZPANEL_INSTALL_BREW=0 跳过 Homebrew 安装"
+      info "按默认策略跳过（不在安装期装 Homebrew/CLT）："
+      info "  面板装好后进「基础环境」→ 一键安装（走国内镜像，含 CLT；在任务中心里能看到进度）"
+      info "  想在本步就装：ZIZPANEL_INSTALL_BREW=1 重跑（会走镜像，但 CLT 仍可能触发系统弹窗）"
     fi
   fi
 
   if ! has_brew; then
-    warn "面板已可以正常使用（面板本身不依赖 Homebrew）。"
-    warn "但「网站管理」与「数据库」需要 nginx、PHP、MySQL，装好 Homebrew 后执行："
-    warn "  brew install nginx php@8.3 mysql@8.4 && brew services start nginx php@8.3 mysql@8.4"
+    info "面板已可以正常使用（面板本身不依赖 Homebrew）。"
+    info "「网站管理 / 数据库 / 一键 LNMP」需要 nginx、PHP、MySQL —— 在面板「基础环境」里一键装。"
     return 0
   fi
   ok "Homebrew：$(brew_prefix)"
@@ -1426,12 +1438,15 @@ finish() {
     printf '  本机访问   %s%s://127.0.0.1:%s%s\n' "$C_BLUE" "$scheme" "$port" "$C_RESET"
   fi
   printf '\n'
+  if [ -z "$suffix" ]; then
+    printf '  安全加强   未启用（面板路径就是 /）—— 想加强安全可在面板「系统设置」里开启路径后缀。\n'
+  fi
   if [ -n "$ADMIN_USERNAME" ] && [ -n "$suffix" ]; then
-    printf '  管理员账号 %s%s%s（口令是你刚才设置的那个，本脚本不保存、不回显）\n' \
+    printf '  管理员账号 %s%s%s（来自 ZP_USER/ZP_PASS，安装器不保存口令）\n' \
       "$C_BOLD" "$ADMIN_USERNAME" "$C_RESET"
     printf '  安全后缀   %s%s%s（忘了就执行 zizpanel status）\n' "$C_BOLD" "$suffix" "$C_RESET"
   else
-    printf '  首次打开会进入初始化向导，请设置管理员账号。\n'
+    printf '  首次打开会进入初始化向导，请在那里设置管理员用户名与口令。\n'
   fi
   if [ "$CERT_STATE" = "mkcert-trusted" ]; then
     printf '  %s证书已受系统信任，浏览器不会提示。%s\n' "$C_GREEN" "$C_RESET"
@@ -1450,6 +1465,13 @@ finish() {
   printf '    sudo launchctl kickstart -k system/%s   重启面板\n' "$PANEL_LABEL"
   printf '    sudo %s/uninstall.sh                卸载（默认保留数据）\n' "$ZIZPANEL_ROOT"
   printf '\n'
+  # 只有**显式要求**（ZP_LAN_PREAUTH=1）才写过预授权；写了就必须在最后再提醒一次重启
+  # （真机反馈：之前提示只出现在中间那一步，装完的摘要里没有，用户以为装完就生效了）。
+  if [ "${LAN_PREAUTH_APPLIED:-0}" = "1" ]; then
+    printf '  %s⚠ 你要求写入的「免授权访问内网段」已写入，但要重启电脑才生效。%s\n' "$C_BOLD" "$C_RESET"
+    printf '     重启前一切照旧（面板的 Plan B 回环转发器已经在工作），想生效就找时间重启一次。\n'
+    printf '\n'
+  fi
 }
 
 # ------------------------------------------- 接管旧面板（部署替换） --
@@ -1690,6 +1712,7 @@ zp_random_hex() {
 # 分开之后：超时按"接受默认值"处理，EOF 只在**非交互**场景下才终止。
 zp_read() {
   local prompt="$1" def="$2" __var="$3" secret="${4:-0}" line="" rc=0 attempt=0
+  local ttydev="/dev/tty" tty_saved=""
   if [ -n "$def" ]; then
     printf '%s%s%s %s[%s]%s: ' "$C_BOLD" "$prompt" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET"
   else
@@ -1702,7 +1725,12 @@ zp_read() {
   while :; do
     rc=0
     if [ "$secret" = "1" ]; then
-      IFS= read -r -s -t 180 -u "$ZP_TTY_FD" line || rc=$?
+      # 关回显**必须显式用 stty**：`read -s` 在 `-u <fd>` 下不生效
+      # （本机 bash 3.2 只在读 stdin 时处理 echo），真机实测口令被明文回显。
+      tty_saved="$(stty -g < "$ttydev" 2>/dev/null || true)"
+      [ -n "$tty_saved" ] && stty -echo < "$ttydev" 2>/dev/null
+      IFS= read -r -t 180 -u "$ZP_TTY_FD" line || rc=$?
+      [ -n "$tty_saved" ] && stty "$tty_saved" < "$ttydev" 2>/dev/null
       printf '\n'
     else
       IFS= read -r -t 180 -u "$ZP_TTY_FD" line || rc=$?
@@ -1794,7 +1822,7 @@ collect_basic_info() {
   fi
 
   if zp_input_ok; then
-    info "接下来会问你几个问题（口令不会回显）。直接回车 = 用方括号里的默认值。"
+    info "接下来只会问面板后缀与监听端口（管理员账号由面板首次访问时设置）。直接回车 = 用方括号里的默认值。"
     info "想全程不回答：Ctrl-C 后用 ZP_YES=1 重跑。"
     printf '\n'
     # 语言/确认：默认中文，回车即继续。"英文"也接受 —— 但这轮只影响确认语，
@@ -1810,82 +1838,43 @@ collect_basic_info() {
     fi
   fi
 
-  # ---- 管理员用户名 ----
-  local def_user="${REAL_USER:-admin}"
-  [ "$def_user" = "root" ] && def_user="admin"
-  if [ -z "$ADMIN_USERNAME" ]; then
-    if zp_input_ok; then
-      zp_ask "管理员用户名" "$def_user" ADMIN_USERNAME
-    else
-      ADMIN_USERNAME="$def_user"
-    fi
-  fi
-
-  # ---- 登录口令 ----
+  # ---- 管理员账号：**安装器不再询问** ----
   #
-  # 三种来源，按优先级：
-  #   1. ZP_PASS / ZIZPANEL_ADMIN_PASSWORD —— 显式指定（自动化安装用）；
-  #   2. 有终端 → 交互输入两次（不回显）；
-  #   3. 无终端（最常见：curl | sudo bash）→ **自动生成强随机口令**，
-  #      并在安装结果里显著打印一次。
-  # 第 3 条是硬要求：`curl … | sudo bash` 的 stdin 是管道，没有终端可问，
-  # 这时必须"能装成功"，绝不能因为没人回答就报错退出。
-  if [ -z "$ADMIN_PASSWORD" ]; then
-    if zp_input_ok; then
-      local attempt p1 p2
-      for attempt in 1 2 3; do
-        if ! zp_read_quiet "设置登录口令（不回显，至少 8 位）" p1; then
-          die "读取口令失败（终端已关闭）"
-        fi
-        if ! zp_read_quiet "再输入一次确认" p2; then
-          die "读取口令失败（终端已关闭）"
-        fi
-        if [ "$p1" != "$p2" ]; then
-          warn "两次输入不一致，请重来"
-          continue
-        fi
-        ADMIN_PASSWORD="$p1"
-        break
-      done
-      if [ -z "$ADMIN_PASSWORD" ]; then
-        die "三次都没能设置成功，安装已取消（什么都没改）"
-      fi
-    else
-      # 无终端：生成 20 位随机口令（大小写+数字+符号的组合里取十六进制+固定符号）。
-      # 为什么要带符号：面板不限制口令字符集，长随机串已经足够，
-      # 这里只保证"人眼可抄写、能过 8 位门禁"。
-      local rnd1 rnd2
-      rnd1="$(zp_random_hex 10)"
-      rnd2="$(zp_random_hex 10)"
-      ADMIN_PASSWORD="zp-${rnd1}-${rnd2}"
-      ADMIN_PASSWORD_GENERATED=1
-      info "当前没有终端可以询问口令：已自动生成一个随机初始口令，安装完成后会显著打印一次。"
-      info "（想自己指定就用 ZP_PASS='你的口令' 重跑；无终端时问不了人。）"
-    fi
+  # 🛑 2026-09-17 用户明确要求（真机安装后）："既然面板初始访问要设置用户名和密码，
+  # 安装过程就不要输入了！" 之前的做法确实是重复的：安装时问一次、打开面板初始化向导又问一次
+  # （真机上那次安装期创建还因为接口缺后缀 404 而没生效，于是用户连着填了两遍）。
+  # 现在：**默认什么都不问、也不生成口令** —— 账号统一由面板的首次初始化向导创建。
+  # 只有**显式提供**（ZP_USER/ZP_PASS 或 --user/--password）时才在安装期建账号，供自动化/CI 用。
+  if [ -n "$ADMIN_PASSWORD" ] && [ -z "$ADMIN_USERNAME" ]; then
+    ADMIN_USERNAME="admin"
+  fi
+  if [ -n "$ADMIN_USERNAME" ] && [ -z "$ADMIN_PASSWORD" ]; then
+    die "给了管理员用户名（ZP_USER/--user）就必须同时给口令（ZP_PASS/--password）"
+  fi
+  if [ -z "$ADMIN_USERNAME" ]; then
+    info "管理员账号留给面板：装好后打开面板，首次访问会让你设置用户名与口令（安装器不再询问）。"
   fi
   # 提前校验：口令太短会让面板在**装完之后**才报错，用户得重装一遍。
   # 这里跟 auth.CreateUser 的规则保持一致（这条长度门禁可在这里挡住）。
-  if [ "${#ADMIN_PASSWORD}" -lt 8 ]; then
+  if [ -n "$ADMIN_PASSWORD" ] && [ "${#ADMIN_PASSWORD}" -lt 8 ]; then
     die "登录口令至少 8 位（当前 ${#ADMIN_PASSWORD} 位）"
   fi
 
-  # ---- 面板后缀 ----
-  local def_suffix=""
-  if [ -f "$DATA_DIR/config.json" ]; then
-    def_suffix="$(zcfg_get panel_suffix)"
+  # ---- 面板路径后缀（安全入口）：**安装器不再询问** ----
+  #
+  # 🛑 2026-09-17 用户明确要求："后缀功能也不要在安装时要求，用户可以在后台选择是否开启后缀安全加强。"
+  # 所以默认**不设后缀**（面板直接在 / 提供服务），装好后在面板「系统设置」里随时能开启
+  # （views.js 里那句"留空 = 不启用安全入口"就是同一个开关，改完会把新地址摆到用户眼前）。
+  # 升级/重装时**保留原有后缀**（用户可能已经在面板里设过）；只有显式给了
+  # ZP_SUFFIX / --suffix 才用传入值（自动化通路）。
+  if [ -f "$DATA_DIR/config.json" ] && [ -z "$PANEL_SUFFIX_INPUT" ]; then
+    PANEL_SUFFIX_INPUT="$(zcfg_get panel_suffix)"
   fi
-  if [ -z "$PANEL_SUFFIX_INPUT" ]; then
-    if zp_input_ok; then
-      [ -n "$def_suffix" ] || def_suffix="$(zp_random_suffix)"
-      zp_ask "面板路径后缀（安全入口，只允许小写字母/数字/-/_）" "$def_suffix" PANEL_SUFFIX_INPUT
-    else
-      PANEL_SUFFIX_INPUT="$def_suffix"
-    fi
-  fi
-  PANEL_SUFFIX_INPUT="$(zp_normalize_suffix "$PANEL_SUFFIX_INPUT")"
-  if [ -z "$PANEL_SUFFIX_INPUT" ]; then
-    PANEL_SUFFIX_INPUT="$(zp_random_suffix)"
-    warn "后缀为空或含非法字符，已改用随机后缀：$PANEL_SUFFIX_INPUT"
+  if [ -n "$PANEL_SUFFIX_INPUT" ]; then
+    PANEL_SUFFIX_INPUT="$(zp_normalize_suffix "$PANEL_SUFFIX_INPUT")"
+    info "面板路径后缀（安全入口）：${PANEL_SUFFIX_INPUT}（来自已有配置或 ZP_SUFFIX）"
+  else
+    info "面板路径后缀未启用（安全加强默认关闭）：装好后可在面板「系统设置」里随时开启。"
   fi
 
   # ---- 监听端口 ----
@@ -1908,16 +1897,16 @@ collect_basic_info() {
   local final_port="${ZIZPANEL_LISTEN##*:}"
   printf '\n'
   printf '  %s将要安装：%s\n' "$C_BOLD" "$C_RESET"
-  printf '    管理员用户名   %s\n' "$ADMIN_USERNAME"
-  if [ "$ADMIN_PASSWORD_GENERATED" = "1" ]; then
-    # 自动生成的口令必须让用户看得见（否则他永远登不进去）。
-    # 只在**终端**上打印一次；不写日志、不进 argv、不进任何文件。
-    printf '    初始登录口令   %s%s%s（自动生成，只显示这一次，请立即保存）\n' \
-      "$C_BOLD" "$ADMIN_PASSWORD" "$C_RESET"
+  if [ -n "$ADMIN_USERNAME" ]; then
+    printf '    管理员账号     %s（安装期创建，来自 ZP_USER/ZP_PASS）\n' "$ADMIN_USERNAME"
   else
-    printf '    登录口令       %s（不回显、不写日志）\n' "$(printf '%*s' 8 '' | tr ' ' '*')"
+    printf '    管理员账号     %s（由面板首次访问时的初始化向导创建）\n' '稍后设置'
   fi
-  printf '    面板后缀       %s\n' "$PANEL_SUFFIX_INPUT"
+  if [ -n "$PANEL_SUFFIX_INPUT" ]; then
+    printf '    面板路径后缀   %s\n' "$PANEL_SUFFIX_INPUT"
+  else
+    printf '    面板路径后缀   %s\n' '未启用（可在面板「系统设置」里开启安全加强）'
+  fi
   printf '    监听端口       %s\n' "$final_port"
   printf '    安装目录       %s\n' "$ZIZPANEL_ROOT"
   if [ "$(id -u)" -eq 0 ]; then
@@ -1964,27 +1953,17 @@ setup_ssh_choice() {
     [ -x "$src_tool" ] && tool="$src_tool"
   fi
 
+  # 🛑 2026-09-17 用户明确要求：**安装界面不问 SSH**。
+  # 真机实测：面板「系统设置 → 远程登录」点一下就能开（成功），安装期再问一次是多余的步骤。
+  # 只有显式要求时才动（`--ssh` / `ZP_SSH=1`），供无人值守安装与回归测试使用。
   if [ -z "$ZIZPANEL_SSH" ]; then
-    if is_remote_session; then
-      info "检测到你是通过 SSH 从别的电脑连过来的：远程访问已经可用，不再询问是否开启 SSH。"
-      return 0
-    fi
-    if ! zp_input_ok; then
-      info "非交互模式：不开启 SSH（需要时用 --ssh 或 ZP_SSH=1，或面板「系统设置 → 远程登录」）"
-      return 0
-    fi
-    printf '\n'
-    info "你是在这台机器上直接安装。开启「远程登录（SSH）」后，可以从别的电脑 ssh 连上来运维。"
-    if zp_yes "现在开启 SSH（远程登录）？" "y"; then
-      ZIZPANEL_SSH=1
-    else
-      ZIZPANEL_SSH=0
-    fi
+    info "SSH 保持系统默认；需要时在面板「系统设置 → 远程登录」一键开启（安装脚本不再询问）。"
+    return 0
   fi
 
   case "$ZIZPANEL_SSH" in
     1|on|yes) ;;
-    0|off|no) info "已按你的选择不开启 SSH（以后可在面板「系统设置 → 远程登录」或重跑本脚本时开启）"; return 0 ;;
+    0|off|no) info "已按 ZP_SSH/ZIZPANEL_SSH 的要求不开启 SSH"; return 0 ;;
     *) warn "无法识别的 ZP_SSH/ZIZPANEL_SSH 值：${ZIZPANEL_SSH}（按不开启处理）"; return 0 ;;
   esac
 
@@ -2029,24 +2008,24 @@ zcfg_get() {
 }
 
 # zp_json_escape：把 shell 字符串转义成 JSON 字符串字面量（含首尾引号）。
-# 用 python3 转义一次是刻意的：口令里可能有引号或反斜杠，手写转义迟早出错。
-# python3 由 Command Line Tools 提供（Homebrew 安装的前置），这里一定可用；
-# 万一不可用就退回一个"老实的"转义（先反斜杠、再双引号）。
+# **刻意不用 python3**：全新 macOS 上 /usr/bin/python3 是个空壳，一调用就弹
+# 「python3 命令需要使用命令行开发者工具，你要现在安装该工具吗？」的 GUI 弹窗 ——
+# 真机实测把安装卡在一个需要人去点按钮的对话框上（而且它下载的是 Apple 的 CLT，国内很慢）。
+# 用纯 shell 转义：反斜杠、双引号、以及 JSON 不允许的裸控制字符（\n \r \t）。
 zp_json_escape() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))' <<<"$1"
-    return 0
-  fi
   local s="$1"
   # shellcheck disable=SC1003
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
   printf '"%s"' "$s"
 }
 
 # write_raw_config：把"安装时确定的最小配置"写进 config.json。
-# 用 python3 生成合法 JSON（手写字符串拼接在口令含引号时会写出坏 JSON，
-# 而坏 JSON 的后果是面板起不来）；没有 python3 时退回 sed 精确注入。
+# **不用 python3**（见上面 zp_json_escape 的说明）：这里走 sed 精确注入，
+# 只碰后缀/监听/镜像基址/升级源四个键，其它字段一律不动。
 write_raw_config() {
   if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
     info "（干跑）将写入 $DATA_DIR/config.json：panel_suffix=${PANEL_SUFFIX_INPUT} listen=${ZIZPANEL_LISTEN} upgrade_source=${PANEL_UPGRADE_SOURCE:-<未探测到可用源>}"
@@ -2064,38 +2043,7 @@ write_raw_config() {
   # 四个字段：面板后缀、监听、镜像基址、在线升级源。
   # 升级源为空串也照写（空 = 面板里没配升级源，界面会让用户自己填）；
   # 关键是**不写错** —— 写一个探不通的地址会让用户在升级页看到莫名其妙的失败。
-  if command -v python3 >/dev/null 2>&1; then
-    if python3 - "$DATA_DIR/config.json" "$PANEL_SUFFIX_INPUT" "$ZIZPANEL_LISTEN" \
-        "$DEFAULT_MIRROR_BASE" "$PANEL_UPGRADE_SOURCE" <<'CONFIG_PYEOF'
-import json, os, sys
-path, suffix, listen, mirror_base, upgrade_source = sys.argv[1:6]
-cfg = {}
-if os.path.exists(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            cfg = json.load(fh)
-    except Exception:
-        cfg = {}
-cfg["panel_suffix"] = suffix
-cfg["listen"] = listen
-cfg["mirror_base"] = mirror_base
-cfg["upgrade_source"] = upgrade_source
-tmp = path + ".install.tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(cfg, fh, ensure_ascii=False, indent=2)
-    fh.write("\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-CONFIG_PYEOF
-    then
-      [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && chown "${REAL_USER}:staff" "$DATA_DIR/config.json" 2>/dev/null
-      ok "已写入面板后缀、监听端口、镜像基址与升级源：$DATA_DIR/config.json"
-      return 0
-    fi
-    warn "python3 写配置失败，退回 sed 注入"
-  fi
-
-  # 兜底：sed 精确替换（只碰这四个键，不动其它字段）。
+  # 纯 shell 写配置：sed 精确替换（只碰这四个键，不动其它字段）。
   # 注意：模式里**不给键名套双引号** —— 键名已足够唯一，套引号会把整段
   # 引号串切断（历史坑：\( 变成未加引号的分组括号，bash 直接语法错误）。
   local sed_inplace=(-i "")
@@ -2124,7 +2072,7 @@ CONFIG_PYEOF
   fi
   chmod 0600 "$DATA_DIR/config.json" 2>/dev/null || true
   [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && chown "${REAL_USER}:staff" "$DATA_DIR/config.json" 2>/dev/null
-  ok "已写入面板后缀、监听端口、镜像基址与升级源（sed 兜底路径）"
+  ok "已写入面板后缀、监听端口、镜像基址与升级源"
   return 0
 }
 
@@ -2135,14 +2083,42 @@ CONFIG_PYEOF
 #  口令通过 stdin 传给 `zizpanel setup --stdin`（不出现在 argv、不进 ps 输出）。
 #  已有账号（升级/重装）时**绝不覆盖**：那是用户的数据。
 # ============================================================================
+# panel_api_base：本机面板接口的基址 —— **必须带面板后缀**。
+#
+# 为什么单独抽一个函数：`internal/web/server.go` 的 panelGate 对 `/<后缀>/` 之外的
+# 一切路径返回 **404**（只放行 `/api/v1/health` 与 `/api/v1/ping`，那是升级看门狗
+# 与外部探活用的）。**真机实测踩到**：这里原来写 `https://127.0.0.1:<端口>`，
+# 于是 setup/status 与 setup 都 404 → 脚本判定"读不到初始化状态" → 把用户推给
+# 浏览器的初始化向导 → 用户看到的是"安装时填过一次账号，打开面板又要填一次"。
+# 升级/重装时后缀以**已有配置**为准（用户可能在面板里改过后缀）。
+panel_api_base() {
+  local sfx="$PANEL_SUFFIX_INPUT"
+  if [ -f "$DATA_DIR/config.json" ]; then
+    local have
+    have="$(zcfg_get panel_suffix)"
+    [ -n "$have" ] && sfx="$have"
+  fi
+  sfx="${sfx#/}"; sfx="${sfx%/}"
+  if [ -n "$sfx" ]; then
+    printf 'https://127.0.0.1:%s/%s' "$PANEL_PORT" "$sfx"
+  else
+    printf 'https://127.0.0.1:%s' "$PANEL_PORT"
+  fi
+}
+
 create_admin_account() {
   title "创建管理员账号"
   if [ "$ZIZPANEL_DRY_RUN" = "1" ]; then
-    info "（干跑）将创建管理员账号：$ADMIN_USERNAME"
+    if [ -n "$ADMIN_USERNAME" ]; then
+      info "（干跑）将创建管理员账号：${ADMIN_USERNAME}（来自 ZP_USER/ZP_PASS）"
+    else
+      info "（干跑）不创建管理员账号：面板首次访问时由初始化向导创建"
+    fi
     return 0
   fi
 
-  local base="https://127.0.0.1:${PANEL_PORT}" st
+  local base st
+  base="$(panel_api_base)"
   st="$(curl -fsSk --max-time 8 "$base/api/v1/setup/status" 2>/dev/null || true)"
   case "$st" in
     *'"needs_setup":false'*)
@@ -2207,14 +2183,16 @@ lan_preauth_notice() {
 # 面板侧的实现见 internal/web/api_systemsettings_lan.go（与界面同一条路径）。
 LAN_API_OUT=""
 lan_preauth_api_apply() {
-  local cidrs="$1" jar="$TMP_DIR/lan-cookies.txt" token body
+  local cidrs="$1" jar="$TMP_DIR/lan-cookies.txt" token body base
+  # 基址必须带面板后缀（panelGate 对后缀之外一律 404），与 create_admin_account 同源。
+  base="$(panel_api_base)"
   rm -f "$jar"
   # 1) 登录拿会话（口令走 stdin 的 JSON，不放 argv）
   if ! curl -fsSk --max-time 10 -c "$jar" -o /dev/null \
       -X POST -H 'Content-Type: application/json' \
       --data-binary "$(printf '{"username":%s,"password":%s}' \
         "$(zp_json_escape "$ADMIN_USERNAME")" "$(zp_json_escape "$ADMIN_PASSWORD")")" \
-      "https://127.0.0.1:${PANEL_PORT}/api/v1/login" 2>/dev/null; then
+      "$base/api/v1/login" 2>/dev/null; then
     return 1
   fi
   # 2) CSRF 双提交：从 cookie jar 里取 zp_csrf，放进 X-CSRF-Token 头
@@ -2226,7 +2204,7 @@ lan_preauth_api_apply() {
       -X POST -H 'Content-Type: application/json' \
       -H "X-CSRF-Token: $token" \
       --data-binary "$body" \
-      "https://127.0.0.1:${PANEL_PORT}/api/v1/system/settings/lan-preauth" 2>/dev/null)"; then
+      "$base/api/v1/system/settings/lan-preauth" 2>/dev/null)"; then
     return 0
   fi
   return 1
@@ -2236,7 +2214,6 @@ lan_preauth_api_apply() {
 # 只用 ipaddress 做"网络地址归一"这一步 —— 手写位运算在 shell 里容易错）。
 lan_detect_cidr() {
   local out iface ip mask cidr
-  command -v python3 >/dev/null 2>&1 || return 1
   if [ -x /sbin/ifconfig ]; then
     for iface in $(/sbin/ifconfig -l 2>/dev/null); do
       case "$iface" in lo*|utun*|awdl*|llw*|bridge*|ap*|anpi*|gif*|stf*|vmenet*|p2p*) continue ;; esac
@@ -2256,8 +2233,17 @@ lan_detect_cidr() {
             "$(( 16#${hex:4:2} ))" "$(( 16#${hex:6:2} ))")"
           ;;
       esac
-      cidr="$(python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))' \
-        "$ip/$mask" 2>/dev/null || true)"
+      # 归一成"网络地址/前缀长度"：**纯 shell 位运算**，不用 python3
+      # （python3 在全新 macOS 上会弹「命令行开发者工具」对话框，见坑 152）。
+      local o1 o2 o3 o4 m1 m2 m3 m4 bits=0 v
+      IFS=. read -r o1 o2 o3 o4 <<<"$ip"
+      IFS=. read -r m1 m2 m3 m4 <<<"$mask"
+      v=$(( (m1 << 24) | (m2 << 16) | (m3 << 8) | m4 ))
+      while [ "$v" -gt 0 ]; do
+        bits=$(( bits + (v & 1) ))
+        v=$(( v >> 1 ))
+      done
+      cidr="$(( o1 & m1 )).$(( o2 & m2 )).$(( o3 & m3 )).$(( o4 & m4 ))/$bits"
       [ -n "$cidr" ] && { printf '%s' "$cidr"; return 0; }
     done
   fi
@@ -2308,33 +2294,22 @@ lan_preauth_defaults() {
   return 0
 }
 
-# 安装收尾询问 + 应用。
+# 应用预授权（**默认什么都不做、也不问**）。
+#
+# 🛑 2026-09-17 用户明确要求："安装界面不需网络授权步骤了"。
+# 理由站得住：这件事在面板「系统设置 → 局域网访问」里点一下就能做（同一条
+# lan_preauth 代码路径），而且**必须重启才生效** —— 放在安装收尾既打断安装，
+# 又容易让人以为"装完就生效了"（真机实测：用户选了"是"，装完却没看到重启提示）。
+# 所以交互流程里**不再出现这一步**；只保留一条**纯环境变量**的自动化通路
+# （ZP_LAN_PREAUTH=1 + ZP_LAN_CIDR=…），供无人值守安装与回归测试使用。
 prompt_lan_preauth() {
-  title "局域网访问（可选）"
-
   local decided="$ZIZPANEL_LAN_PREAUTH"
-  if [ -z "$decided" ]; then
-    if zp_input_ok; then
-      printf '\n'
-      info "macOS 的「本地网络」隐私门会拦局域网反代（无头机器上没人点弹窗，表现为 502）。"
-      info "面板里有一个可选开关：「允许免授权访问内网段」——写一条官方预授权，重启后生效。"
-      if zp_yes "现在开启「允许免授权访问内网段」？" "n"; then
-        decided="1"
-      else
-        decided="0"
-      fi
-    else
-      decided="0"
-    fi
-  fi
-
   if [ "$decided" != "1" ] && [ "$decided" != "true" ] && [ "$decided" != "yes" ]; then
-    lan_preauth_notice
-    info "没有开启（保持默认关闭）。以后可以随时在面板「系统设置」里手动打开。"
     return 0
   fi
 
-  # 选"是"：先把三件事说清楚（用户明确要求），再动手
+  title "局域网访问（按 ZP_LAN_PREAUTH=1 写入）"
+  # 显式要求时才说清三件事，然后再动手
   lan_preauth_notice
 
   local cidrs="$LAN_CIDR_INPUT"
@@ -2359,10 +2334,12 @@ prompt_lan_preauth() {
   fi
 
   # 1) 优先走面板**已有的**接口（与界面同一条代码路径）
+  LAN_PREAUTH_APPLIED=0
   if lan_preauth_api_apply "$cidrs"; then
     ok "已通过面板接口写入预授权（$(printf '%s' "$LAN_API_OUT" | head -c 200)…）"
     if lan_readback_ok "${cidrs%%,*}"; then
       ok "读回复核通过：系统域与用户域都已写入"
+      LAN_PREAUTH_APPLIED=1
     else
       warn "接口返回成功，但 defaults 读回复核没通过 —— 请以面板「系统设置」里的状态为准"
     fi
@@ -2370,6 +2347,7 @@ prompt_lan_preauth() {
     warn "面板接口不可用（可能还没起来或未登录），改用脚本内 defaults 直接写入"
     if lan_preauth_defaults "$cidrs" && lan_readback_ok "${cidrs%%,*}"; then
       ok "已写入预授权（系统域 + 用户域），读回复核通过"
+      LAN_PREAUTH_APPLIED=1
     else
       warn "写入或复核失败。请在面板「系统设置 → 局域网访问」里手工打开（会显示真实状态与错误）"
       return 0

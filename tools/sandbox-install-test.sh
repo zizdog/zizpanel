@@ -350,42 +350,65 @@ else
 fi
 
 # ------------------------------------------------- 干跑演练（交互分支） --
-# 为什么要有这一段：SSH 提问与「免授权访问内网段」提示是用户明确要求的两个分支，
-# 但它们在"无终端 + 干跑"下不会走到交互对话（读不到输入就走默认值）。
-# 这里用**环境变量**把两个分支的决策逻辑固定下来，做确定性验证：
-# 有终端时的真实交互由 expect 手工验证（PTY 输入在自动化里不可靠），
-# 但"远程连过来不问 SSH""本机才问""三件事文案"这些**判断与文案**必须被锁住。
-step "干跑演练：SSH 判断与内网预授权文案"
+# 2026-09-17 真机安装后用户明确要求（两条都是"安装界面不要这一步"）：
+#   · 「网络授权 / 免授权访问内网段」：**安装界面不出现**（面板「系统设置 → 局域网访问」
+#     里点一下就行，而且必须重启才生效，放在安装收尾会误导）—— 只留 ZP_LAN_PREAUTH=1 自动化通路。
+#   · 「是否开启 SSH」：**安装界面不问**（面板「系统设置 → 远程登录」已验证可用）。
+# 这一段把"默认不问"和"显式要求时才做"两个方向都锁住；另外静态锁住两个真机 bug：
+#   python3 一次都不许调用（会弹 macOS 开发者工具对话框）、面板 API 必须带后缀。
+step "干跑演练：默认不问 SSH/预授权 + 两条真机 bug 的静态锁"
+
+# ---- 静态锁 1：install.sh 不许再调用 python3（弹窗根源）----
+if grep -nE 'command -v python3|python3 -c|python3 -' "$INSTALL_SH" | grep -vE '^[[:space:]]*#' >/dev/null 2>&1; then
+  fail "install.sh 里仍有 python3 调用（会弹「命令行开发者工具」对话框）："
+  grep -nE 'command -v python3|python3 -c|python3 -' "$INSTALL_SH" | grep -vE '^[[:space:]]*#' | sed 's/^/      /'
+else
+  pass "静态锁：install.sh 不调用 python3（全新机器上不再弹开发者工具对话框）"
+fi
+
+# ---- 静态锁 2：调面板接口必须带后缀（panelGate 之外一律 404）----
+if grep -qE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$INSTALL_SH"; then
+  fail "仍有不带面板后缀的接口直连（会 404，表现为「面板又问一次账号」）："
+  grep -nE '127\.0\.0\.1:\$\{PANEL_PORT\}/api/v1/(setup|login|system)' "$INSTALL_SH" | sed 's/^/      /'
+else
+  pass "静态锁：面板接口调用统一走 panel_api_base（带后缀），不再 404"
+fi
+
 DRUN_LOG="$SANDBOX/dryrun.log"
 : > "$DRUN_LOG"
-
-# ① 远程（SSH_CONNECTION 非空）→ 不询问 SSH
 # 注意：ZIZPANEL_ROOT 必须指向**独立目录**（不能是 $SANDBOX/root）——
 # 否则"干跑零副作用"的断言会读到真实安装写下的 config.json，误报成干跑写了文件。
 rm -rf "$SANDBOX/dryrun-root"
-SSH_CONNECTION="192.168.1.9 51234 192.168.1.4 22" SSH_CLIENT="192.168.1.9 51234 22" \
-  ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+
+# ① 默认干跑（无 ZP_SSH / 无 ZP_LAN_PREAUTH）→ 两个步骤都**不问、不做**
+ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
   ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" \
   bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
-if grep -q "不再询问是否开启 SSH" "$DRUN_LOG"; then
-  pass "干跑（远程）：识别为 SSH 连过来，未询问 SSH"
+if grep -q "需要时在面板「系统设置 → 远程登录」一键开启" "$DRUN_LOG"; then
+  pass "默认：安装界面不询问 SSH，并指明去面板「系统设置 → 远程登录」开"
 else
-  fail "干跑（远程）：没有识别出 SSH 会话（应跳过 SSH 提问）"
+  fail "默认：没有看到「不问 SSH、去面板开」的说明"
 fi
-if grep -q "要重启电脑才生效" "$DRUN_LOG" && grep -q "Plan B（回环转发器）" "$DRUN_LOG" \
-   && grep -q "面板「系统设置」里手动打开" "$DRUN_LOG"; then
-  pass "干跑：内网预授权提示的三件事（需重启 / 不必现在重启+Plan B / 系统设置里可开）逐字齐全"
+if grep -qE "现在开启 SSH|现在开启「允许免授权访问内网段」" "$DRUN_LOG"; then
+  fail "默认：安装界面竟然还在问 SSH / 网络授权（用户要求删掉这两步）"
 else
-  fail "干跑：内网预授权提示三件事文案缺失"
+  pass "默认：安装界面不问 SSH、也不问「免授权访问内网段」"
 fi
-# 第二遍：显式选"是"，验证走的是面板已有接口（而不是另造一套 defaults 逻辑）
+
+# ② 显式 ZP_LAN_PREAUTH=1 → 才走预授权（且要看到三件事 + 走面板接口的计划）
 ZP_LAN_PREAUTH=1 ZP_LAN_CIDR="192.168.1.0/24" ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
   ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" \
   bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
-if grep -q "将调用面板接口 POST /api/v1/system/settings/lan-preauth" "$DRUN_LOG"; then
-  pass "干跑：选「是」时走面板已有接口（lan-preauth），不是另造一套 defaults 逻辑"
+if grep -q "要重启电脑才生效" "$DRUN_LOG" && grep -q "Plan B（回环转发器）" "$DRUN_LOG" \
+   && grep -q "面板「系统设置」里手动打开" "$DRUN_LOG"; then
+  pass "显式要求预授权时：三件事（需重启 / 不必现在重启+Plan B / 系统设置里可开）逐字齐全"
 else
-  fail "干跑：没看到走面板接口的干跑行"
+  fail "显式要求预授权时：三件事文案缺失"
+fi
+if grep -q "将调用面板接口 POST /api/v1/system/settings/lan-preauth" "$DRUN_LOG"; then
+  pass "显式要求预授权时：走面板已有接口（lan-preauth），不是另造一套 defaults 逻辑"
+else
+  fail "显式要求预授权时：没看到走面板接口的干跑行"
 fi
 # 干跑绝不能真的写任何东西（用独立 root 验证，见上）
 if [ -f "$SANDBOX/dryrun-root/data/config.json" ]; then
@@ -394,14 +417,47 @@ else
   pass "干跑零副作用（未写 config.json）"
 fi
 
-# ② 本机（显式 ZP_SSH=1）→ 开启 SSH 分支被选中（干跑只打印计划）
+# ③ 显式 ZP_SSH=1 → 才开启 SSH 分支（干跑只打印计划）
 ZP_SSH=1 ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
   ZIZPANEL_ROOT="$SANDBOX/root" ZIZPANEL_LISTEN=":$PORT" \
   bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
 if grep -q "server-mode.sh --ssh-only" "$DRUN_LOG"; then
-  pass "干跑：选开 SSH 时走 server-mode.sh --ssh-only（只动 SSH，不改电源设置）"
+  pass "显式要求 SSH 时：走 server-mode.sh --ssh-only（只动 SSH，不改电源设置）"
 else
-  fail "干跑：选开 SSH 但没看到 --ssh-only 计划"
+  fail "显式要求 SSH 时：没看到 --ssh-only 计划"
+fi
+
+# ④ 静态锁 3：curl|bash 路径必须把 SCRIPT_DIR 指到解压目录（否则 tools/ 不会被安装，
+#    真机表现为"找不到 server-mode.sh"、以及一键 LNMP 缺 system-services.sh）
+if grep -q 'SCRIPT_DIR="\$TMP_DIR"' "$INSTALL_SH"; then
+  pass "静态锁：下载路径把 SCRIPT_DIR 指向解包目录（tools/ 会被正确安装）"
+else
+  fail "下载路径没有设置 SCRIPT_DIR → 运行时工具不会被复制（真机踩到过）"
+fi
+
+# ⑤ 管理员账号：**安装界面不问**（面板初始化向导负责）；只有显式给凭据时才建账号
+#    —— 这一轮刻意**不给 ZP_PASS**，走"用户真机的那条路"
+ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" ZP_SUFFIX=testsfx \
+  bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
+if grep -q "管理员账号留给面板" "$DRUN_LOG"; then
+  pass "默认：安装界面不问用户名/口令，明确告知去面板初始化向导设置"
+else
+  fail "默认：没有看到「账号留给面板」的说明"
+fi
+if grep -qE "设置登录口令|管理员用户名（面板登录用|再输入一次确认" "$DRUN_LOG"; then
+  fail "默认：安装界面竟然还在问账号/口令（用户要求删掉）"
+else
+  pass "默认：不再出现任何账号/口令提问"
+fi
+# 显式给凭据（自动化）时才建账号
+ZP_USER=ciadmin ZP_PASS=testpass123 ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" ZP_SUFFIX=testsfx \
+  bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
+if grep -q "将创建管理员账号：ciadmin（来自 ZP_USER/ZP_PASS）" "$DRUN_LOG"; then
+  pass "显式给 ZP_USER/ZP_PASS 时：安装期创建账号（自动化通路仍在）"
+else
+  fail "显式给凭据时没有看到创建账号的干跑行"
 fi
 
 step "校验沙箱未污染生产环境"

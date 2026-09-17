@@ -479,7 +479,18 @@ func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 // installViaBrew 用 Homebrew 安装原生服务。
 func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResult) error {
 	if _, err := os.Stat(m.opt.BrewBin); err != nil {
-		return fmt.Errorf("未安装 Homebrew，无法自动安装 %s。请先安装 Homebrew", app.Name)
+		// 全新 macOS 上 brew 与 CLT 都没有：安装脚本**刻意不装它们**
+		// （CLT 的官方安装路径会弹「命令行开发者工具」GUI 对话框，且 Apple 源在国内很慢）。
+		// 所以这里不能再报"请先安装 Homebrew"把用户挡在门外 —— 直接**复用面板自己的镜像链路**：
+		// EnsureHomebrew 会先装 CLT（632MB 镜像分片、不弹窗）再装 brew（镜像），
+		// 缺什么装什么、已就绪就秒过。qwentts / 音色接收端早就是这条路（见坑 152）。
+		res.step(ctx, "未检测到 Homebrew：先自动安装「命令行开发者工具 + Homebrew」（走国内镜像，可能需要几分钟）")
+		if err := m.EnsureHomebrew(ctx, res); err != nil {
+			return fmt.Errorf("自动安装 Homebrew 失败：%w（也可以在面板「基础环境」里重试）", err)
+		}
+		if _, err := os.Stat(m.opt.BrewBin); err != nil {
+			return fmt.Errorf("已尝试安装 Homebrew 但仍找不到 %s", m.opt.BrewBin)
+		}
 	}
 
 	// 1) 确保包已安装
