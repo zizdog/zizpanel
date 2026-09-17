@@ -1183,8 +1183,10 @@ export function marketUninstallButton(mi, onDone) {
   const blocked = !!plan.blocked && !residual;
   return h('button.btn.btn-sm.btn-danger', {
     text: residual ? '删除残留数据' : '卸载',
-    'aria-disabled': blocked ? 'true' : null,
-    style: blocked ? { opacity: '.72' } : null,
+    // 刻意**不**设 disabled（也刻意不设 aria-disabled：那会让辅助技术与自动化
+    // 把它当成不可用，点都点不到）。按钮保持可用，点下去用 toast 说明为什么
+    // 现在不能卸载 —— disabled 的按钮点下去什么都不发生，原因还只在悬浮提示里，
+    // 用户看到的就是"点了没反应"。
     title: residual ? '只删除磁盘上的残留产物/数据' : (plan.blocked || '卸载「' + mi.name + '」'),
     onclick: async () => {
       try {

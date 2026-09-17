@@ -32,11 +32,21 @@ import (
 const brewInstallScriptURL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 
 // brewInstallScriptCandidates 返回安装脚本的候选地址（官方优先，镜像兜底）。
+// brewInstallScriptMirror 是 USTC 镜像的 Homebrew 安装脚本（与官方同步、国内快）。
+// 与 install.sh 里的 BREW_INSTALL_SCRIPT_MIRROR 是同一个地址 —— 安装脚本与面板
+// 必须用同一套"镜像优先"口径，否则两边行为不一致。
+const brewInstallScriptMirror = "https://mirrors.ustc.edu.cn/misc/brew-install.sh"
+
 func brewInstallScriptCandidates() []string {
-	out := []string{brewInstallScriptURL}
+	// **镜像优先，官方放最后**（2026-09-18 用户真机反馈：默认走官方地址
+	// raw.githubusercontent.com 在国内要等很久，而且那段时间**没有任何输出**，
+	// 看起来就像卡死）。顺序：USTC 镜像的安装脚本 → 第三方加速镜像 → 官方兜底；
+	// 每一次尝试都会打印地址、用时与失败原因（见下面的下载循环）。
+	out := []string{brewInstallScriptMirror}
 	for _, m := range gitHubReleaseMirrors {
 		out = append(out, strings.TrimSuffix(m, "/")+"/"+brewInstallScriptURL)
 	}
+	out = append(out, brewInstallScriptURL)
 	return out
 }
 
@@ -298,22 +308,36 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 	// 2) 下载安装脚本（官方不通就走镜像）
 	scriptPath := "/tmp/zizpanel-brew-install.sh"
 	var lastErr error
-	for i, u := range brewInstallScriptCandidates() {
-		label := "官方地址"
-		if i > 0 {
-			label = "加速镜像（第三方）"
+	cands := brewInstallScriptCandidates()
+	for i, u := range cands {
+		label := "官方地址（兜底）"
+		if i == 0 {
+			label = "国内镜像"
+		} else if i < len(cands)-1 {
+			label = "加速镜像"
 		}
-		result.step(ctx, "下载 Homebrew 安装脚本（"+label+"）")
-		if _, err := m.runAsUser(ctx, 3*time.Minute, "/usr/bin/curl",
-			"-fsSL", "--connect-timeout", "20", "--max-time", "120", "-o", scriptPath, u); err != nil {
+		result.step(ctx, fmt.Sprintf("下载 Homebrew 安装脚本（%s，第 %d/%d 个来源）：%s",
+			label, i+1, len(cands), u))
+		started := time.Now()
+		// 单个来源最多 25 秒（原来 120 秒，国内不通时会静默等两分钟，用户以为卡死）
+		if _, err := m.runAsUser(ctx, 40*time.Second, "/usr/bin/curl",
+			"-fsSL", "--connect-timeout", "8", "--max-time", "25", "-o", scriptPath, u); err != nil {
+			result.step(ctx, fmt.Sprintf("  ↳ 失败（用时 %.1fs）：%v", time.Since(started).Seconds(), err))
 			lastErr = err
 			continue
 		}
+		// 下载到的**必须像安装脚本**（非空且不是错误页），否则换下一个来源
+		if st, err := os.Stat(scriptPath); err != nil || st.Size() < 500 {
+			result.step(ctx, "  ↳ 失败：下载内容不完整或不是脚本（换下一个来源）")
+			lastErr = fmt.Errorf("下载内容不完整：%s", u)
+			continue
+		}
+		result.step(ctx, fmt.Sprintf("  ↳ 成功（用时 %.1fs）", time.Since(started).Seconds()))
 		lastErr = nil
 		break
 	}
 	if lastErr != nil {
-		return fmt.Errorf("下载 Homebrew 安装脚本失败（官方与镜像都不通）：%w", lastErr)
+		return fmt.Errorf("下载 Homebrew 安装脚本失败（%d 个来源都不通，最后错误：%w）", len(cands), lastErr)
 	}
 	defer func() { _ = os.Remove(scriptPath) }()
 

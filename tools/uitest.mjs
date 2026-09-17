@@ -481,7 +481,9 @@ try {
   //   ② 点它 → 必须出现确认框（不是"点了没反应"）；
   //   ③ 确认（桩 202）→ 必须出现任务进度窗，且 DELETE 真的发出去了；
   //   ④ 后端失败（桩 500）→ 必须出现**带原因**的 toast，且不能弹出进度窗（谎报成功）；
-  //   ⑤ 请求被挂住（桩为迟到 4 秒）→ 超时也必须说话；迟到的 202 到达后任务要被接管。
+  //   ⑤ 卸载计划被 blocked 的按钮**不能是 disabled**：点下去要把原因说出来
+  //      （disabled 的按钮点了什么都不发生，用户看到的就是"点了没反应"）；
+  //   ⑥ 请求被挂住（桩为迟到 4 秒）→ 超时也必须说话；迟到的 202 到达后任务要被接管。
   //
   // 为什么三条服务：taskCenter 对"同一个 target 已在跑"会直接复用旧任务，
   // 三个场景各用自己的名字才不会互相短路。
@@ -490,7 +492,11 @@ try {
       { name: 'uitest-svc-ok', display_name: 'UITEST 卸载·正常', kind: 'native', managed: true, state: { running: true, status: 'running' } },
       { name: 'uitest-svc-fail', display_name: 'UITEST 卸载·失败', kind: 'native', managed: true, state: { running: true, status: 'running' } },
       { name: 'uitest-svc-slow', display_name: 'UITEST 卸载·被挂住', kind: 'native', managed: true, state: { running: true, status: 'running' } },
+      // 记录是「仅纳管」，目录说它是面板装的 → 面板里给的是市场式「卸载」
+      // （marketUninstallButton）；它的 uninstall.blocked 非空 = "现在不能卸"。
+      { name: 'uitest-svc-blocked', display_name: 'UITEST 卸载·被阻止', kind: 'native', managed: false, state: { running: true, status: 'running' } },
     ];
+    const BLOCKED_REASON = 'UITEST 桩：还有别的应用在用它';
     const uninstallCalls = [];
 
     // 桩返回的 5xx / 假 task id（SSE 会 404）都是断言对象，不是前端故障。
@@ -550,9 +556,21 @@ try {
       }
       return route.continue();
     });
-    // 市场目录：给空目录，「已安装」就只剩上面那三条桩服务
+    // 市场目录：只放那条"有卸载计划但当前被阻止"的条目（与服务记录同 key 会合并），
+    // 「已安装」里因此同时有 managed=true 的三条和这一条。
     await page.route('**/api/v1/market**', (route) => route.fulfill({
-      status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [] } }),
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          list: [{
+            id: 'uitest-svc-blocked',
+            name: 'UITEST 卸载·被阻止',
+            installed: true,
+            uninstall: { kind: 'installer', steps: ['停止服务', '删除残留'], blocked: BLOCKED_REASON },
+          }],
+        },
+      }),
     }));
     // 假任务的进度流：立刻回一条"成功"并结束。**必须**这么做 —— 否则假任务会一直
     // 挂在客户端里重连一个不存在的流，测试收尾后还在往 errors 里刷 404。
@@ -584,7 +602,7 @@ try {
     await (await openUninstallBtn('UITEST 卸载·正常')).click();
     const confirm = page.locator('.modal-mask', { hasText: '卸载服务' }).last();
     await confirm.locator('button:has-text("确认卸载")').waitFor({ timeout: 8000 });
-    await shot('46a-uninstall-confirm');
+    await shot('30a-uninstall-confirm');
 
     // ③ 确认（桩 202）→ 必须出现任务进度窗，且 DELETE 真的发出去了
     await confirm.locator('button:has-text("确认卸载")').click();
@@ -592,7 +610,7 @@ try {
     if (!uninstallCalls.includes('uitest-svc-ok')) {
       throw new Error('点了确认卸载，但 DELETE 没有发出去：' + JSON.stringify(uninstallCalls));
     }
-    await shot('46b-uninstall-task-window');
+    await shot('30b-uninstall-task-window');
     await closeAllModals();
     await clearToasts();
 
@@ -608,14 +626,46 @@ try {
     if (await page.locator('.modal-mask', { hasText: '关闭窗口（后台继续）' }).count()) {
       throw new Error('卸载提交失败了，却弹出了任务进度窗（谎报成功）');
     }
-    await shot('46c-uninstall-fail-visible');
+    await page.waitForTimeout(400); // 等 toast 淡入动画走完，截图里要看得见它
+    await shot('30c-uninstall-fail-visible');
     await closeAllModals();
     await clearToasts();
 
-    // ⑤ 请求被挂住：把提交超时收紧到 1.2s（默认 20s），让这条断言几秒内确定完成。
+    // ⑤ 卸载计划被 blocked：按钮**不能**是 disabled，点下去必须把原因说出来
+    const blockedCard = page.locator('#installed-grid > div', { hasText: 'UITEST 卸载·被阻止' }).first();
+    await blockedCard.waitFor({ timeout: 15000 });
+    await blockedCard.locator('button:has-text("管理")').click();
+    const blockedBtn = page.locator('.modal-mask button:text-is("卸载")').last();
+    await blockedBtn.waitFor({ timeout: 8000 });
+    if (await blockedBtn.isDisabled()) {
+      // 禁用的按钮点下去什么都不发生（原因还只在悬浮提示里）= 用户眼里的"点了没反应"
+      throw new Error('卸载计划被 blocked 时按钮是 disabled 的：点击不会有任何反馈');
+    }
+    const masksBefore = await page.locator('.modal-mask').count();
+    await blockedBtn.click();
+    const blockedToast = page.locator('.toasts .toast.warn').first();
+    await blockedToast.waitFor({ timeout: 8000 });
+    const blockedText = await blockedToast.innerText();
+    if (!blockedText.includes(BLOCKED_REASON)) {
+      throw new Error('被阻止的卸载没有把原因显示出来：' + blockedText);
+    }
+    if (await page.locator('.modal-mask').count() !== masksBefore) {
+      throw new Error('被阻止的卸载不该继续弹确认框');
+    }
+    if (uninstallCalls.includes('uitest-svc-blocked')) {
+      throw new Error('被阻止的卸载居然把 DELETE 发出去了（不该动后端）');
+    }
+    await page.waitForTimeout(400); // 等 toast 淡入动画走完，截图里要看得见它
+    await shot('30d-uninstall-blocked-visible');
+    await closeAllModals();
+    await clearToasts();
+
+    // ⑥ 请求被挂住：把提交超时收紧到 1.2s（默认 20s），让这条断言几秒内确定完成。
+    // 钩子用防御式调用：修复前没有这个 API，这条断言就会因为"界面从头到尾没说话"
+    // 而失败（waitFor 超时）—— 这正是要锁住的行为，别让它退化成 TypeError。
     await page.evaluate(async () => {
       const { taskCenter } = await import('./js/tasks.js');
-      taskCenter.setSubmitTimeoutMs(1200);
+      if (typeof taskCenter.setSubmitTimeoutMs === 'function') taskCenter.setSubmitTimeoutMs(1200);
     });
     await (await openUninstallBtn('UITEST 卸载·被挂住')).click();
     await page.locator('.modal-mask button:has-text("确认卸载")').last().click();
@@ -625,18 +675,19 @@ try {
     if (!/没有收到面板确认|请求被挂住/.test(slowText)) {
       throw new Error('提交被挂住时没有给出超时提示（界面静默了）：' + slowText);
     }
-    await shot('46d-uninstall-timeout-visible');
+    await page.waitForTimeout(400); // 等 toast 淡入动画走完，截图里要看得见它
+    await shot('30e-uninstall-timeout-visible');
     // 迟到 4 秒的 202 到达后，任务必须被接管（补开进度窗），不能成为"没人管的任务"
     await page.locator('.modal-mask', { hasText: '关闭窗口（后台继续）' }).last().waitFor({ timeout: 12000 });
     if (!uninstallCalls.includes('uitest-svc-slow')) {
       throw new Error('超时场景里 DELETE 没有被发出：' + JSON.stringify(uninstallCalls));
     }
-    await shot('46e-uninstall-late-adopted');
+    await shot('30f-uninstall-late-adopted');
 
     // 收尾：恢复默认超时、撤掉所有桩（后面的步骤必须看到真实数据）
     await page.evaluate(async () => {
       const { taskCenter } = await import('./js/tasks.js');
-      taskCenter.setSubmitTimeoutMs();
+      if (typeof taskCenter.setSubmitTimeoutMs === 'function') taskCenter.setSubmitTimeoutMs();
     });
     await closeAllModals();
     await clearToasts();
