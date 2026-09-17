@@ -349,6 +349,61 @@ else
   fail "config.json 未生成"
 fi
 
+# ------------------------------------------------- 干跑演练（交互分支） --
+# 为什么要有这一段：SSH 提问与「免授权访问内网段」提示是用户明确要求的两个分支，
+# 但它们在"无终端 + 干跑"下不会走到交互对话（读不到输入就走默认值）。
+# 这里用**环境变量**把两个分支的决策逻辑固定下来，做确定性验证：
+# 有终端时的真实交互由 expect 手工验证（PTY 输入在自动化里不可靠），
+# 但"远程连过来不问 SSH""本机才问""三件事文案"这些**判断与文案**必须被锁住。
+step "干跑演练：SSH 判断与内网预授权文案"
+DRUN_LOG="$SANDBOX/dryrun.log"
+: > "$DRUN_LOG"
+
+# ① 远程（SSH_CONNECTION 非空）→ 不询问 SSH
+# 注意：ZIZPANEL_ROOT 必须指向**独立目录**（不能是 $SANDBOX/root）——
+# 否则"干跑零副作用"的断言会读到真实安装写下的 config.json，误报成干跑写了文件。
+rm -rf "$SANDBOX/dryrun-root"
+SSH_CONNECTION="192.168.1.9 51234 192.168.1.4 22" SSH_CLIENT="192.168.1.9 51234 22" \
+  ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" \
+  bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
+if grep -q "不再询问是否开启 SSH" "$DRUN_LOG"; then
+  pass "干跑（远程）：识别为 SSH 连过来，未询问 SSH"
+else
+  fail "干跑（远程）：没有识别出 SSH 会话（应跳过 SSH 提问）"
+fi
+if grep -q "要重启电脑才生效" "$DRUN_LOG" && grep -q "Plan B（回环转发器）" "$DRUN_LOG" \
+   && grep -q "面板「系统设置」里手动打开" "$DRUN_LOG"; then
+  pass "干跑：内网预授权提示的三件事（需重启 / 不必现在重启+Plan B / 系统设置里可开）逐字齐全"
+else
+  fail "干跑：内网预授权提示三件事文案缺失"
+fi
+# 第二遍：显式选"是"，验证走的是面板已有接口（而不是另造一套 defaults 逻辑）
+ZP_LAN_PREAUTH=1 ZP_LAN_CIDR="192.168.1.0/24" ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-root" ZIZPANEL_LISTEN=":$PORT" \
+  bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
+if grep -q "将调用面板接口 POST /api/v1/system/settings/lan-preauth" "$DRUN_LOG"; then
+  pass "干跑：选「是」时走面板已有接口（lan-preauth），不是另造一套 defaults 逻辑"
+else
+  fail "干跑：没看到走面板接口的干跑行"
+fi
+# 干跑绝不能真的写任何东西（用独立 root 验证，见上）
+if [ -f "$SANDBOX/dryrun-root/data/config.json" ]; then
+  fail "干跑竟然写了 config.json（干跑必须零副作用）"
+else
+  pass "干跑零副作用（未写 config.json）"
+fi
+
+# ② 本机（显式 ZP_SSH=1）→ 开启 SSH 分支被选中（干跑只打印计划）
+ZP_SSH=1 ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+  ZIZPANEL_ROOT="$SANDBOX/root" ZIZPANEL_LISTEN=":$PORT" \
+  bash "$INSTALL_SH" > "$DRUN_LOG" 2>&1 || true
+if grep -q "server-mode.sh --ssh-only" "$DRUN_LOG"; then
+  pass "干跑：选开 SSH 时走 server-mode.sh --ssh-only（只动 SSH，不改电源设置）"
+else
+  fail "干跑：选开 SSH 但没看到 --ssh-only 计划"
+fi
+
 step "校验沙箱未污染生产环境"
 PROD_VHOST="/opt/homebrew/etc/nginx/vhosts/000-default.conf"
 if [ -f "$PROD_VHOST" ]; then
