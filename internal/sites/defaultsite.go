@@ -98,6 +98,16 @@ func EnsureLocalhostPlaceholder(wwwRoot string) (path string, created bool, err 
 // 用来实现"缺了才建、用户改过就不覆盖"：文件存在（无论内容）就一个字都不改。
 const DefaultIndexPHPMarker = "ZP-DEFAULT-SITE"
 
+// defaultSiteMarkerComment 是 PHP 版默认站点里**必须**出现的那行复核标记。
+//
+// 2026-09-18 mini 真机事故：默认站点复核取 http://127.0.0.1/ 的正文找
+// LocalhostIndexMarker，而 index.php 排在 index.html 前面（用户要求"默认站点要能跑
+// PHP"）——装了 phpMyAdmin 后首页永远由 index.php 渲染，它当时**不含**那段文字，
+// 于是复核必然失败（日志："共探测 31 次，最后一次本机首页返回 200"）；
+// 而当时失败即中止上传上限任务，PHP 上限从没重启生效（仍是出厂 2M/8M）→ 导入大 SQL 报 500。
+// 现在这行标记以 HTML 注释的形式出现在正文里（不影响用户看到的页面），并有单测锁住。
+const defaultSiteMarkerComment = "<!-- " + LocalhostIndexMarker + " -->"
+
 // DefaultIndexPHP 是默认站点的占位首页（PHP）。
 //
 // 刻意保持简单，但**自证 PHP 可用**：版本 + 服务器时间 + 运行方式。
@@ -121,6 +131,7 @@ header('Content-Type: text/html; charset=utf-8');
   </style>
 </head>
 <body>
+  <!-- 这是本机 Web 服务的默认站点 -->
   <h1>ZizPanel 默认站点</h1>
   <p class="ok">PHP 正常工作</p>
   <ul>

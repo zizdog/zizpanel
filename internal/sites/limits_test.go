@@ -361,3 +361,24 @@ func waitPort(t *testing.T, port int) {
 	}
 	t.Fatalf("端口 %d 上一直没有 nginx 在监听", port)
 }
+
+// TestDefaultSitePHPPagedCarriesReviewMarker：PHP 版默认站点**必须**含复核标记。
+//
+// 2026-09-18 mini 真机事故：默认站点的请求级复核是"取 http://127.0.0.1/ 的正文，
+// 看有没有 LocalhostIndexMarker"。而 index.php 排在 index.html 前面（用户要求
+// "默认站点要能跑 PHP"），只要装了 phpMyAdmin（它的安装器会建 index.php），
+// 首页就永远由 index.php 渲染 —— 它当时不含那段文字，于是复核**必然失败**：
+// "共探测 31 次，最后一次本机首页返回 200"。而当时那一步失败即中止上传上限任务，
+// PHP 上限从没重启生效（仍是出厂 2M/8M）→ 导入大 SQL 直接 500。
+//
+// 这条门禁把"两份占位页都能被复核认出来"钉死：改哪一份都不能再丢掉标记。
+func TestDefaultSitePHPPagedCarriesReviewMarker(t *testing.T) {
+	if !strings.Contains(DefaultIndexPHP, LocalhostIndexMarker) {
+		t.Fatalf("PHP 版默认站点（index.php）里没有复核标记 %q —— "+
+			"装了 phpMyAdmin 的机器上首页由它渲染，默认站点复核会永远失败（真机事故）",
+			LocalhostIndexMarker)
+	}
+	if !strings.Contains(LocalhostIndexHTML, LocalhostIndexMarker) {
+		t.Fatalf("HTML 版默认站点里没有复核标记 %q", LocalhostIndexMarker)
+	}
+}

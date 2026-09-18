@@ -214,6 +214,58 @@ func (s *Server) defaultSiteStatusNow() defaultSiteStatus {
 	return out
 }
 
+// vhostNotLoadedReason 判断"面板的 vhost 到底有没有被 nginx 加载"，返回人话原因（空 = 没发现问题）。
+//
+// 为什么需要（2026-09-18 mini 真机）：默认站点复核失败时，面板只报"6 秒内新配置仍未生效"，
+// 用户完全不知道该查哪。真机现场是：nginx.conf **没有 include 面板的 vhosts 目录**，
+// 于是 :80 上回答请求的是 Homebrew 自带的默认站点（首页 200、但没有面板的占位页标记，
+// PHP 探测文件也 404）。这条判断把"vhost 没被加载"这个根因**直接说出来**。
+func (s *Server) vhostNotLoadedReason(ctx context.Context) string {
+	vhostDir := s.Cfg.VhostDir
+	if vhostDir == "" {
+		return ""
+	}
+	// ① 目录 / 文件在不在
+	if _, err := os.Stat(filepath.Join(vhostDir, "000-default.conf")); err != nil {
+		return vhostDir + "/000-default.conf 不存在（面板没能写入默认站点配置）"
+	}
+	// ② 用 `nginx -T`（真实加载的全量配置）确认这个目录有没有被 include 进去。
+	res, err := s.callHelper(ctx, "nginx-conf-include-status")
+	if err == nil {
+		if inc, _ := res["data"].(map[string]any); inc != nil {
+			if detail, _ := inc["detail"].(string); detail != "" {
+				// conf.d 已就绪不代表 vhosts 已就绪；再看下面第三条。
+				_ = detail
+			}
+		}
+	}
+	out, derr := s.nginxDumpConfForCheck(ctx)
+	if derr != nil || out == "" {
+		return ""
+	}
+	if !strings.Contains(out, vhostDir) {
+		return "nginx 加载的配置里**没有出现** " + vhostDir + " —— 说明 nginx.conf 的 http 块" +
+			"缺少 `include " + filepath.Join(vhostDir, "*.conf") + ";`" +
+			"（面板写的站点/默认站点配置全部没生效，:80 上回答请求的是别的 server 块）"
+	}
+	return ""
+}
+
+// nginxDumpConfForCheck 取 `nginx -T` 的全量配置（经提权助手）。
+//
+// 必须用 -T（dump）而不是 -t（test）：`nginx -t` 的输出只有一行"syntax is ok"，
+// **看不到任何 include 的文件**；拿它去判断"面板的 vhost 有没有被加载"必然误判。
+func (s *Server) nginxDumpConfForCheck(ctx context.Context) (string, error) {
+	res, err := s.callHelper(ctx, "nginx-dump-conf")
+	if err != nil {
+		return "", err
+	}
+	if txt, _ := res["msg"].(string); txt != "" {
+		return txt, nil
+	}
+	return "", nil
+}
+
 // handleDefaultSiteStatus 返回默认站点状态（只读，不写盘）。
 func (s *Server) handleDefaultSiteStatus(w http.ResponseWriter, r *http.Request) {
 	ok(w, s.defaultSiteStatusNow())

@@ -251,6 +251,15 @@ func main() {
 			return
 		}
 
+	case "nginx-dump-conf":
+		// `nginx -T` 的全量配置：面板用它确认"自己写的 vhost 有没有真的被加载"。
+		var dump string
+		dump, err = priv.NginxDumpConf()
+		if err == nil {
+			emit(result{OK: true, Msg: dump})
+			return
+		}
+
 	case "nginx-conf-include-status":
 		var ok bool
 		var detail string

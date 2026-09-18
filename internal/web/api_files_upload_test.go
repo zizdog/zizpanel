@@ -1,6 +1,7 @@
 package web
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -676,4 +677,87 @@ func resolveExistingForTest(p string) string {
 		return r
 	}
 	return p
+}
+
+// TestFileExtractAndCompressGoThroughTaskCenter：打包/解压必须是**任务**（202）。
+//
+// 用户 2026-09-18 报障："我传了文件解压缩，一点反应都没有！900M 的文件解压
+// 没有任何进度" —— 老实现是同步跑 unzip/tar：请求挂着、页面无输出、
+// 用户一刷新还会把解压**杀掉**（任务挂在 r.Context 上）。现在两条都走任务中心，
+// 进度写在任务日志里，关掉窗口也能找回。
+func TestFileExtractAndCompressGoThroughTaskCenter(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	dir := filepath.Join(srv.Cfg.WWWRoot, "arch")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 先打包（应当 202 + task_id）
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/files/compress",
+		map[string]any{"dir": dir, "names": []string{"a.txt"}, "format": "zip", "output": "pack.zip"}, cookies)
+	if res.StatusCode != 202 {
+		t.Fatalf("打包应创建任务（202），实际 %d（body=%v）", res.StatusCode, out)
+	}
+	if asString(out["data"].(map[string]any)["task_id"]) == "" {
+		t.Errorf("202 必须带 task_id（关掉窗口也要能找回进度）：%v", out)
+	}
+
+	// 参数错误要**当场** 400（不建任务）
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/files/compress",
+		map[string]any{"dir": dir, "names": []string{}, "format": "zip", "output": "x.zip"}, cookies)
+	if res.StatusCode != 400 {
+		t.Errorf("没有选中任何项时应 400，实际 %d（%v）", res.StatusCode, out)
+	}
+
+	// 解压（归档先造出来，测试里直接用 unzip 生成，避免依赖任务完成时序）
+	zipPath := filepath.Join(dir, "pack.zip")
+	if err := makeTestZip(t, zipPath, map[string]string{"b.txt": "world"}); err != nil {
+		t.Fatal(err)
+	}
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/files/extract",
+		map[string]any{"archive": zipPath, "dest": dir}, cookies)
+	if res.StatusCode != 202 {
+		t.Fatalf("解压应创建任务（202），实际 %d（body=%v）", res.StatusCode, out)
+	}
+	if asString(out["data"].(map[string]any)["task_id"]) == "" {
+		t.Errorf("202 必须带 task_id：%v", out)
+	}
+
+	// 归档越界（zip-slip）必须在**开任务之前**被拒绝
+	slip := filepath.Join(dir, "slip.zip")
+	if err := makeTestZip(t, slip, map[string]string{"../escape.txt": "pwn"}); err != nil {
+		t.Fatal(err)
+	}
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/files/extract",
+		map[string]any{"archive": slip, "dest": dir}, cookies)
+	if res.StatusCode != 400 {
+		t.Errorf("含穿越路径的归档应 400（不建任务），实际 %d（%v）", res.StatusCode, out)
+	}
+}
+
+// makeTestZip 造一个测试用 zip（键是归档内路径）。
+func makeTestZip(t *testing.T, path string, files map[string]string) error {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	zw := zip.NewWriter(f)
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			return err
+		}
+	}
+	return zw.Close()
 }

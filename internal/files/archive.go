@@ -3,6 +3,7 @@ package files
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -41,10 +42,25 @@ func ArchiveFormats() []Archive {
 	}
 }
 
-// Compress 把若干路径压缩到一个归档文件。
+// ProgressFunc 是一次归档/解压操作的进度回调。
+//
+// done/total 是**已完成/预计总数**（条目数）；total<=0 表示总数未知（如实报告，
+// 界面上显示"已处理 N 项"而不是编一个百分比）。note 是当前正在处理的条目名。
+type ProgressFunc func(done, total int, note string)
+
+// Compress 把若干路径压缩到一个归档文件（无进度回调版本，保持向后兼容）。
 //
 // outputName 是归档文件名（不含目录），会被放到 dir 下。
 func (m *Manager) Compress(ctx context.Context, dir string, names []string, format, outputName string) (string, error) {
+	return m.CompressWithProgress(ctx, dir, names, format, outputName, nil)
+}
+
+// CompressWithProgress 与 Compress 相同，但会把进度回调出去。
+//
+// 为什么要进度（2026-09-18 用户报障："我传了文件解压缩，一点反应都没有！
+// 900M 的文件解压没有任何进度"）：打包/解压是**分钟级**动作，关掉窗口还要能
+// 找回进度（所以 web 层把它放进任务中心），而任务里必须有真实的过程输出。
+func (m *Manager) CompressWithProgress(ctx context.Context, dir string, names []string, format, outputName string, onProgress ProgressFunc) (string, error) {
 	realDir, err := m.Resolve(dir, false)
 	if err != nil {
 		return "", err
@@ -86,22 +102,39 @@ func (m *Manager) Compress(ctx context.Context, dir string, names []string, form
 	}
 	_ = os.Remove(outPath) // 覆盖同名归档
 
+	// 进度：按"处理了多少个条目"报（zip/tar 都会把每个条目打到 stdout/stderr）。
+	// total 用源路径个数（目录内部的条目数要先扫一遍才能知道，代价不值得）。
+	done := 0
+	total := len(rels)
+	tick := func(line string) {
+		name := strings.TrimSpace(line)
+		name = strings.TrimPrefix(name, "adding: ")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		done++
+		if onProgress != nil {
+			onProgress(done, total, name)
+		}
+	}
+	// -v：把每个条目名打出来（进度靠它）。zip 无 -q 时本来就逐条打印。
 	var args []string
 	switch format {
 	case "zip":
 		// -r 递归；-y 保留软链接本身而不是其目标内容（重要：否则会把链接目标整个拷进来）
 		args = append([]string{"-r", "-y", outPath}, rels...)
-		if _, err := runCmd(ctx, 10*time.Minute, realDir, "/usr/bin/zip", args...); err != nil {
+		if _, err := runCmdStreaming(ctx, 10*time.Minute, realDir, "/usr/bin/zip", args, tick); err != nil {
 			return "", err
 		}
 	case "tar.gz":
-		args = append([]string{"-czf", outPath}, rels...)
-		if _, err := runCmd(ctx, 10*time.Minute, realDir, "/usr/bin/tar", args...); err != nil {
+		args = append([]string{"-czvf", outPath}, rels...)
+		if _, err := runCmdStreaming(ctx, 10*time.Minute, realDir, "/usr/bin/tar", args, tick); err != nil {
 			return "", err
 		}
 	case "tar":
-		args = append([]string{"-cf", outPath}, rels...)
-		if _, err := runCmd(ctx, 10*time.Minute, realDir, "/usr/bin/tar", args...); err != nil {
+		args = append([]string{"-cvf", outPath}, rels...)
+		if _, err := runCmdStreaming(ctx, 10*time.Minute, realDir, "/usr/bin/tar", args, tick); err != nil {
 			return "", err
 		}
 	}
@@ -109,11 +142,67 @@ func (m *Manager) Compress(ctx context.Context, dir string, names []string, form
 	return outPath, nil
 }
 
-// Extract 解压归档文件。
+// CheckCompressTargets 只读预检：源路径合法、格式支持、输出名合法。
+//
+// 与 Compress 的第一段逻辑**同一套判据**（抽出来共用，避免预检与执行漂移）。
+func (m *Manager) CheckCompressTargets(dir string, names []string, format string) error {
+	realDir, err := m.Resolve(dir, false)
+	if err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("请至少选择一个要压缩的文件或目录")
+	}
+	switch format {
+	case "zip", "tar.gz", "tar":
+	default:
+		return fmt.Errorf("不支持的压缩格式: %s", format)
+	}
+	for _, n := range names {
+		full, err := m.Resolve(filepath.Join(realDir, filepath.Base(n)), false)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(realDir, full)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return fmt.Errorf("%w: %s", ErrForbidden, n)
+		}
+	}
+	return nil
+}
+
+// CheckExtractTargets 只读预检：归档存在/格式支持/目标目录合法/归档内没有穿越路径。
+//
+// 前三条是"用户能自己改的参数问题"（当场 400 + 人话）；最后一条是安全边界，
+// 也必须在**开任务之前**判掉 —— 让用户在任务日志里看到"拒绝解压"太晚了。
+func (m *Manager) CheckExtractTargets(ctx context.Context, archivePath, destDir string) error {
+	src, err := m.Resolve(archivePath, false)
+	if err != nil {
+		return err
+	}
+	if _, err := m.Resolve(destDir, false); err != nil {
+		return err
+	}
+	if _, err := m.archiveEntries(ctx, src); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Extract 解压归档文件（无进度回调版本，保持向后兼容）。
 //
 // 安全要点：解压前先列出归档内的条目，检查是否有绝对路径或 .. 穿越；
 // 同时拒绝解压出软链接到目标目录之外（tar 的软链接可以指向 /etc）。
 func (m *Manager) Extract(ctx context.Context, archivePath, destDir string) (string, error) {
+	return m.ExtractWithProgress(ctx, archivePath, destDir, nil)
+}
+
+// ExtractWithProgress 与 Extract 相同，但按**条目数**报进度。
+//
+// 用户 2026-09-18 报障："我传了文件解压缩，一点反应都没有！900M 的文件解压
+// 没有任何进度" —— 解压前那次安全检查（列条目）本来就知道总条目数，
+// 解压时 unzip/tar 的详细输出又逐条给出名字，两者一配就是真实进度。
+func (m *Manager) ExtractWithProgress(ctx context.Context, archivePath, destDir string, onProgress ProgressFunc) (string, error) {
 	src, err := m.Resolve(archivePath, false)
 	if err != nil {
 		return "", err
@@ -122,22 +211,48 @@ func (m *Manager) Extract(ctx context.Context, archivePath, destDir string) (str
 	if err != nil {
 		return "", err
 	}
-	if err := m.checkArchiveEntries(ctx, src); err != nil {
+	entries, err := m.archiveEntries(ctx, src)
+	if err != nil {
 		return "", err
+	}
+	total := 0
+	for _, e := range entries {
+		if strings.TrimSpace(e) != "" {
+			total++
+		}
+	}
+
+	done := 0
+	tick := func(line string) {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			return
+		}
+		// unzip 的详细输出形如 "  inflating: path/to/file"；tar -v 直接是路径。
+		if i := strings.LastIndex(name, ": "); i >= 0 && !strings.Contains(name[:i], "/") {
+			name = strings.TrimSpace(name[i+2:])
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			return
+		}
+		done++
+		if onProgress != nil {
+			onProgress(done, total, name)
+		}
 	}
 
 	lower := strings.ToLower(src)
 	switch {
 	case strings.HasSuffix(lower, ".zip"):
-		if _, err := runCmd(ctx, 10*time.Minute, dest, "/usr/bin/unzip", "-o", "-q", src); err != nil {
+		if _, err := runCmdStreaming(ctx, 30*time.Minute, dest, "/usr/bin/unzip", []string{"-o", src}, tick); err != nil {
 			return "", err
 		}
 	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
-		if _, err := runCmd(ctx, 10*time.Minute, dest, "/usr/bin/tar", "-xzf", src); err != nil {
+		if _, err := runCmdStreaming(ctx, 30*time.Minute, dest, "/usr/bin/tar", []string{"-xzvf", src}, tick); err != nil {
 			return "", err
 		}
 	case strings.HasSuffix(lower, ".tar"):
-		if _, err := runCmd(ctx, 10*time.Minute, dest, "/usr/bin/tar", "-xf", src); err != nil {
+		if _, err := runCmdStreaming(ctx, 30*time.Minute, dest, "/usr/bin/tar", []string{"-xvf", src}, tick); err != nil {
 			return "", err
 		}
 	default:
@@ -147,8 +262,53 @@ func (m *Manager) Extract(ctx context.Context, archivePath, destDir string) (str
 	return dest, nil
 }
 
+// runCmdStreaming 跑一条命令，把每一行输出交给 onLine（进度用），
+// 同时**完整保留**输出以便出错时如实回报（不截断到 400 字符就丢掉线索）。
+func runCmdStreaming(ctx context.Context, timeout time.Duration, dir, name string, args []string, onLine func(string)) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	cmd.Stderr = cmd.Stdout // tar/unzip 的详细输出有的走 stderr
+	var buf strings.Builder
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		buf.WriteString(line)
+		buf.WriteString("\n")
+		if onLine != nil {
+			onLine(line)
+		}
+	}
+	werr := cmd.Wait()
+	text := buf.String()
+	if werr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return text, fmt.Errorf("%s 超时（超过 %s）", filepath.Base(name), timeout)
+		}
+		return text, fmt.Errorf("%s 执行失败: %s", filepath.Base(name), truncateStr(strings.TrimSpace(text), 400))
+	}
+	return text, nil
+}
+
 // checkArchiveEntries 检查归档内条目是否安全。
 func (m *Manager) checkArchiveEntries(ctx context.Context, src string) error {
+	_, err := m.archiveEntries(ctx, src)
+	return err
+}
+
+// archiveEntries 列出归档内条目并做安全校验（返回条目列表，供进度用总数）。
+func (m *Manager) archiveEntries(ctx context.Context, src string) ([]string, error) {
 	lower := strings.ToLower(src)
 	var entries []string
 
@@ -156,18 +316,18 @@ func (m *Manager) checkArchiveEntries(ctx context.Context, src string) error {
 	case strings.HasSuffix(lower, ".zip"):
 		out, err := runCmd(ctx, 2*time.Minute, "", "/usr/bin/unzip", "-Z1", src)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		entries = strings.Split(out, "\n")
 	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"),
 		strings.HasSuffix(lower, ".tar"):
 		out, err := runCmd(ctx, 2*time.Minute, "", "/usr/bin/tar", "-tf", src)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		entries = strings.Split(out, "\n")
 	default:
-		return fmt.Errorf("不支持的归档格式")
+		return nil, fmt.Errorf("不支持的归档格式")
 	}
 
 	for _, e := range entries {
@@ -176,14 +336,14 @@ func (m *Manager) checkArchiveEntries(ctx context.Context, src string) error {
 			continue
 		}
 		if filepath.IsAbs(e) {
-			return fmt.Errorf("归档内包含绝对路径 %q，已拒绝解压（可能是恶意构造的压缩包）", e)
+			return nil, fmt.Errorf("归档内包含绝对路径 %q，已拒绝解压（可能是恶意构造的压缩包）", e)
 		}
 		clean := filepath.Clean(e)
 		if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
-			return fmt.Errorf("归档内包含目录穿越路径 %q，已拒绝解压", e)
+			return nil, fmt.Errorf("归档内包含目录穿越路径 %q，已拒绝解压", e)
 		}
 	}
-	return nil
+	return entries, nil
 }
 
 // chownTreeRealUser 把解压出来的内容归属真实用户。

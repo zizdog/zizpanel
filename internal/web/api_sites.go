@@ -16,6 +16,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tlsx"
+	"github.com/zizdog/zizpanel/internal/upgrade"
 )
 
 // ============================================================================
@@ -567,12 +568,18 @@ func (s *Server) probePHPVersions(ctx context.Context, list []sites.PHPVersion) 
 	}
 	defer func() { _ = os.Remove(probeFile) }()
 
-	// 用 -D - 把响应头打到 stdout，从中读 X-Powered-By
-	// 用 Host: localhost 命中默认 server（它能处理 PHP）
+	// 用 -D - 把响应头打到 stdout，从中读 X-Powered-By。
+	//
+	// Host 必须是 **127.0.0.1**（不是 localhost）：面板写的默认站点是
+	// `server_name _;` + `listen 80 default_server`，而 Homebrew 自带的默认站点是
+	// `server_name localhost;`。用 Host: localhost 会**按名字精确命中 brew 那块**
+	// （root 是 Cellar/nginx/html）→ `__zp_ver.php` 404 —— mini 真机的 error_log 里
+	// 整整一屏都是这个 404，PHP 版本探测因此永远"未复核"。
+	// 用 127.0.0.1 才会落到 default_server（面板的默认站点）上。
 	rctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 	out, err := execCommand(rctx, "/usr/bin/curl", "-sS", "-D", "-", "-o", "/dev/null",
-		"--max-time", "5", "-H", "Host: localhost",
+		"--max-time", "5", "-H", "Host: 127.0.0.1",
 		"http://127.0.0.1/__zp_ver.php").Output()
 	if err != nil {
 		return
@@ -1702,6 +1709,18 @@ func (s *Server) Startup(ctx context.Context) {
 	// 必须在任何 nginx reload 之前把监听器起好，否则重启后的第一次请求会打到
 	// 一个还没人听的回环端口上。
 	s.reconcileForwarders(ctx)
+
+	// 清掉升级暂存目录里的旧发布包（每个约 20~26MB，从不清理会滚到 GB 级 ——
+	// 而磁盘满的后果就是"上传/导入大文件直接 500"：nginx 缓冲突请求体需要空间）。
+	// 只保留最近 2 个版本；不认识的文件的**一个都不动**。
+	go func() {
+		if n, freed, err := upgrade.PruneOldPackages(s.Cfg.WorkDir, 2); err != nil {
+			s.Log.Warn("清理旧升级包失败: %v", err)
+		} else if n > 0 {
+			s.Log.Info("已清理 %d 个旧升级包，释放 %.1f MB（保留最近 2 个版本）",
+				n, float64(freed)/1024/1024)
+		}
+	}()
 
 	// 用审计日志回填"用户主动停止"的意图（升级后的老库）：
 	// 修复之前 stop/start 不记录意图，于是用户手动停掉的服务会被当成"需要处理"。

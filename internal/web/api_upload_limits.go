@@ -151,9 +151,15 @@ type uploadLimitsView struct {
 	NginxDir string           `json:"nginx_dir"`
 	// PHP 是每个已安装 PHP 版本的限制片段与真实生效值。
 	PHP []phpHardLimitState `json:"php"`
+	// GlobalValue 是 nginx.conf（http 块）里的全局 client_max_body_size。
+	// 站点 vhost 没写这一行时用的就是它 —— 界面据此说明"继承全局值，同样有效"。
+	GlobalValue string `json:"global_value,omitempty"`
 	// Mismatch = 有任何一处磁盘上的生效值还不是配置里的值。
 	// 界面据此显示"还有 N 处未生效 → 点应用"。
 	Mismatch bool `json:"mismatch"`
+	// Note 是**降级说明**：值都生效了、但有一步没做成（例如 80 端口默认站点
+	// 因 nginx 没加载面板 vhost 而未能应用）。界面必须显示它，不许把降级说成完全成功。
+	Note string `json:"note,omitempty"`
 }
 
 // uploadLimitsReq 是保存请求体。指针字段：只有传了的字段才改，便于将来做局部更新。
@@ -230,6 +236,8 @@ func (s *Server) handleSaveUploadLimits(w http.ResponseWriter, r *http.Request) 
 //     回读结果与补救动作写进日志，再返回错误。
 func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim sites.Limits) (any, error) {
 	lim = lim.Normalize()
+	// defaultSiteErr 记录"默认站点没应用上"（降级，不让任务失败）。
+	var defaultSiteErr error
 	if err := lim.Validate(); err != nil {
 		return nil, err
 	}
@@ -332,17 +340,13 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 		}
 	}
 
-	// ---- 5. 默认站点（phpMyAdmin 的导入路径）----
-	// 默认站点里既有 server 级上限，也有 phpMyAdmin 那个 location 自己的上限；
-	// 面板会整份重写它并做请求级复核（见 applyDefaultVhost）。
-	if err := s.applyDefaultVhost(ctx); err != nil {
-		log(tasks.LevelErr, "默认站点 / phpMyAdmin 入口应用失败："+err.Error())
-		return nil, fmt.Errorf("默认站点 / phpMyAdmin 入口应用失败: %w", err)
-	}
-	log(tasks.LevelOK, "默认站点与 phpMyAdmin 入口已应用（含 client_max_body_size "+
-		lim.ClientMaxBodySize+"）")
-
-	// ---- 6. 重启对应 php-fpm（改了 conf.d 必须重启才生效）----
+	// ---- 5. 重启对应 php-fpm（改了 conf.d 必须重启才生效）----
+	//
+	// ⚠️ 这一步必须排在"默认站点"**之前**（2026-09-18 mini 真机事故）：
+	// 过去默认站点排在前面且失败即中止任务 —— 于是在"nginx 没有加载面板 vhost"
+	// 的机器上，PHP 片段写好了却**永远不会重启 php-fpm**，上传上限还是出厂的 2M/8M，
+	// 导入大 SQL 直接 PHP 致命错误 → nginx 显示 500（登录页却是好的）。
+	// 现在先把 PHP 侧真正落地，再去做 nginx 那一步；那一步失败只警告、不中止。
 	var restartErrs []string
 	for _, version := range restartVersions {
 		svcName := s.phpServiceName(version)
@@ -363,6 +367,28 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 				" 上暂时没探测到监听（PHP 可能仍在启动；导入仍失败请回来看这里的回读值）")
 		}
 		log(tasks.LevelOK, "已重启 "+svcName)
+	}
+
+	// ---- 6b. 默认站点 / phpMyAdmin 入口（**失败不致命**）----
+	//
+	// 复核失败通常意味着"**面板的 vhost 根本没被 nginx 加载**"（mini 真机：
+	// nginx.conf 没有 include 面板的 vhosts 目录，于是 :80 上回答请求的是
+	// Homebrew 自带的默认站点：首页 200、但没有面板标记，PHP 探测文件 404）。
+	// 这时要把话说清楚，并且**不能**让整件事半途而废 —— 用户要改的上限已经生效。
+	if derr := s.applyDefaultVhost(ctx); derr != nil {
+		defaultSiteErr = derr
+		log(tasks.LevelWarn, "默认站点 / phpMyAdmin 入口未能应用："+derr.Error())
+		if reason := s.vhostNotLoadedReason(ctx); reason != "" {
+			log(tasks.LevelErr, "根因： "+reason)
+			log(tasks.LevelWarn, "修复：到「网站管理 → ⚙️ Nginx 管理 → 配置修改」确认 nginx.conf 的 "+
+				"http 块里有 include "+filepath.Join(s.Cfg.VhostDir, "*.conf")+"；"+
+				"或在「网站管理 → ⋯ 更多」里点「🧪 校验 nginx」查看校验结果")
+		}
+		log(tasks.LevelWarn, "注意：nginx 请求体上限与 PHP 上传/执行上限**已经写入并生效**"+
+			"（见下面的回读行）——这一条失败只影响 80 端口的默认站点/phpMyAdmin 入口")
+	} else {
+		log(tasks.LevelOK, "默认站点与 phpMyAdmin 入口已应用（含 client_max_body_size "+
+			lim.ClientMaxBodySize+"）")
 	}
 
 	// ---- 7. 回读生效值（不能只报"已保存"）----
@@ -403,6 +429,11 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 		return view, fmt.Errorf("配置已写入，但回读发现仍有生效值不是目标值（详见任务日志）：" +
 			"请确认 nginx 与 php-fpm 的状态后重试")
 	}
+	if defaultSiteErr != nil {
+		// 值都生效了：把"默认站点没应用上"作为**降级结果**如实带回界面，
+		// 而不是让整个任务显示失败 —— 用户真正要改的上限已经生效。
+		view.Note = "上传/执行上限已生效；但 80 端口默认站点未能应用：" + defaultSiteErr.Error()
+	}
 	return view, nil
 }
 
@@ -434,6 +465,7 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 	if b, err := os.ReadFile(s.Cfg.NginxConf); err == nil {
 		val, line := sites.FindClientMaxBodySize(string(b))
 		valTrim := strings.TrimSpace(val)
+		view.GlobalValue = valTrim
 		st := limitFileState{
 			File: "nginx.conf（http 全局）", Value: val, Line: line, Path: s.Cfg.NginxConf,
 			Managed: true,
@@ -468,10 +500,20 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 		}
 		val, line := sites.FindClientMaxBodySize(string(b))
 		managed := strings.Contains(string(b), services.DefaultVhostMarker) ||
-			strings.Contains(string(b), "由 ZizPanel 生成")
+			strings.Contains(string(b), "由 ZizPanel 生成") ||
+			strings.Contains(string(b), "由 ZizPanel「反向代理」生成")
+		valTrim := strings.TrimSpace(val)
 		st := limitFileState{
-			File: name, Value: val, Line: line, OK: val == lim.ClientMaxBodySize,
+			File: name, Value: val, Line: line, OK: valTrim == strings.TrimSpace(lim.ClientMaxBodySize),
 			Managed: managed, Path: filepath.Join(s.Cfg.VhostDir, name),
+		}
+		// 文件里没写这一行时，nginx 用的是**http 全局值**：全局值等于目标值
+		// 就说明"限制是生效的"，只是写法不同 —— 不能显示成"未生效"。
+		if managed && valTrim == "" && view.GlobalValue != "" &&
+			strings.TrimSpace(view.GlobalValue) == strings.TrimSpace(lim.ClientMaxBodySize) {
+			st.OK = true
+			st.Note = "这个 vhost 没写这一行：它用的是 nginx.conf 的全局值 " +
+				strings.TrimSpace(view.GlobalValue) + "（同样有效）"
 		}
 		if !managed {
 			st.Note = "这个 vhost 不是面板生成的：面板**不会改它**（保存时跳过）。" +

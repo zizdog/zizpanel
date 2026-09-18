@@ -709,6 +709,13 @@ func nginxDumpConf() (string, error) {
 	return r.combined(), nil
 }
 
+// NginxDumpConf 导出 `nginx -T`（真实加载的全量配置）。
+//
+// 用途：面板据此判断"自己写的 vhost 到底有没有被 include 进去"——
+// 2026-09-18 mini 真机事故里，:80 上回答请求的是 Homebrew 自带默认站点，
+// 而面板的 vhosts 目录压根没被加载（nginx -t 成功 ≠ 面板的配置在生效）。
+func NginxDumpConf() (string, error) { return nginxDumpConf() }
+
 // TuningJSON 是 helper 与面板之间传参用的编解码（结构化，不用 shell 字符串）。
 func TuningEncode(v NginxTuning) (string, error) {
 	b, err := json.Marshal(v)

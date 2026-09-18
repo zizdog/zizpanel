@@ -2655,6 +2655,23 @@ try {
     if (junk > 0) throw new Error('文件管理页出现了 ' + junk + ' 处字面量 null');
   });
 
+  await step('网站管理：状态行不许出现字面量 null，全就绪时不该念 LNMP 说明', async () => {
+    // 2026-09-18 用户报障：状态行显示成
+    // "网站环境：已就绪（nginx / PHP / MySQL 均在运行）null"，
+    // 而且全都跑着的时候还在念"一键 LNMP 会先确保运行依赖…"。
+    // 根因是原生 Element.append 把条件渲染的 `null` 当文本渲染（本项目的老坑），
+    // 修法是条件渲染一律走 appendAll / if 分支。
+    const box = page.locator('.card-body').first();
+    const text = (await box.innerText()) || '';
+    if (/\bnull\b/.test(text)) {
+      throw new Error('网站管理页出现字面量 null：' + text.slice(0, 200));
+    }
+    if (text.includes('已就绪') && text.includes('一键 LNMP」会先确保运行依赖')) {
+      throw new Error('环境已就绪时不该再念「一键 LNMP 会先确保运行依赖…」：' + text.slice(0, 200));
+    }
+    await shot('52c-sites-env-line');
+  });
+
   await step('常用设置弹窗必须有内容（点开空白 = 用户报障的那一类）', async () => {
     // 2026-09-18 用户报障：「上传大小 / 执行时间（nginx + PHP）」点开是**空的**。
     // 根因是前端把面板构建函数定义在了另一个函数作用域里（uploadLimitsModal

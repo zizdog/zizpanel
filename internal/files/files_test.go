@@ -1,6 +1,7 @@
 package files
 
 import (
+	"archive/zip"
 	"context"
 	"os"
 	"path/filepath"
@@ -556,5 +557,75 @@ func TestFormatSize(t *testing.T) {
 		if got := FormatSize(in); got != want {
 			t.Fatalf("FormatSize(%d) = %q，期望 %q", in, got, want)
 		}
+	}
+}
+
+// TestExtractReportsProgress：解压必须按**条目**报进度（用户 2026-09-18 报障：
+// "900M 的文件解压没有任何进度"）。
+//
+// 判据：进度回调被调用过、总条目数 > 0、最后一条的 done 等于总条目数
+// （也就是"真的走到了最后"，不是在中途停住还报成功）。
+func TestExtractReportsProgress(t *testing.T) {
+	m, root := newTestManager(t)
+	if err := os.MkdirAll(filepath.Join(root, "src", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"a.txt", "b.txt", "sub/c.txt"} {
+		if err := os.WriteFile(filepath.Join(root, "src", n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.Compress(context.Background(), filepath.Join(root, "src"), []string{"a.txt", "b.txt", "sub"}, "zip", "pack.zip"); err != nil {
+		t.Fatalf("打包失败: %v", err)
+	}
+
+	var seen []struct{ done, total int }
+	dest, err := m.ExtractWithProgress(context.Background(),
+		filepath.Join(root, "src", "pack.zip"), filepath.Join(root, "src"), func(done, total int, note string) {
+			seen = append(seen, struct{ done, total int }{done, total})
+			if note == "" {
+				t.Errorf("进度回调必须带上当前条目名（用户要看到「正在解压哪个文件」）")
+			}
+		})
+	if err != nil {
+		t.Fatalf("解压失败: %v", err)
+	}
+	if len(seen) == 0 {
+		t.Fatal("解压过程一次进度都没报 —— 用户看到的就是「没有任何进度」")
+	}
+	if seen[0].total <= 0 {
+		t.Errorf("总条目数必须 > 0（界面据此显示 N/M），实际 %+v", seen[0])
+	}
+	last := seen[len(seen)-1]
+	if last.done != last.total {
+		t.Errorf("结束时应报 done==total，实际 %+v（进度会在半路停住）", last)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "sub", "c.txt")); err != nil {
+		t.Errorf("解压结果不完整: %v", err)
+	}
+}
+
+// TestCheckExtractTargetsRejectsZipSlipBeforeTask：安全校验必须在**开任务之前**做。
+//
+// 让用户在任务日志里看到"拒绝解压"太晚了（他已经在等进度了）。
+func TestCheckExtractTargetsRejectsZipSlipBeforeTask(t *testing.T) {
+	m, root := newTestManager(t)
+	// 手工造一个含 ../ 的 zip
+	bad := filepath.Join(root, "bad.zip")
+	f, err := os.Create(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("../escape.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte("pwn"))
+	_ = zw.Close()
+	_ = f.Close()
+
+	if err := m.CheckExtractTargets(context.Background(), bad, root); err == nil {
+		t.Error("含目录穿越的归档必须在预检阶段就被拒绝")
 	}
 }

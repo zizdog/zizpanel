@@ -428,12 +428,27 @@ export function FilesView(content, ctx = {}) {
     if (/\.(zip|tar\.gz|tgz|tar)$/i.test(e.name)) {
       buttons.splice(3, 0, h('button.btn.btn-block', {
         text: '解压到当前目录',
+        title: '大压缩包会在任务中心里跑，并逐条显示"已解压 N/M：文件名"',
         onclick: async () => {
           m.close();
+          // 走任务中心：解压 900MB 是分钟级动作，关掉窗口也要能找回进度
+          //（用户 2026-09-18 报障："一点反应都没有！没有任何进度"）。
           try {
-            const r = await api.fileExtract(e.path, cwd);
-            toast(r.msg || '已解压', 'ok'); load(cwd);
-          } catch (err) { toast(err.message, 'err', 10000); }
+            await taskCenter.start({
+              kind: 'file_extract', target: e.path,
+              title: '解压 ' + e.name,
+              start: () => api.fileExtract(e.path, cwd),
+              onDone: (task) => {
+                if (task && task.status && task.status !== 'succeeded') {
+                  toast('解压失败：' + (task.error || task.status), 'err', 14000);
+                  return;
+                }
+                const r = (task && task.result) || {};
+                toast(r.msg || '已解压到当前目录', 'ok', 9000);
+                load(cwd);
+              },
+            });
+          } catch (err) { toast('解压失败：' + ((err && err.message) || err), 'err', 12000); }
         },
       }));
     }
@@ -662,12 +677,26 @@ export function FilesView(content, ctx = {}) {
       footer: (close) => [
         h('button.btn', { text: '取消', onclick: close }),
         h('button.btn.btn-primary', {
-          text: '开始压缩',
+          text: '开始打包',
+          title: '大目录会在任务中心里跑，并逐条显示"已处理 N/M：路径"',
           onclick: async () => {
+            close();
             try {
-              const r = await api.fileCompress(cwd, names, format.value, output.value);
-              toast(r.msg, 'ok'); close(); load(cwd);
-            } catch (e) { toast(e.message, 'err', 10000); }
+              await taskCenter.start({
+                kind: 'file_compress', target: cwd,
+                title: '打包 ' + names.length + ' 项',
+                start: () => api.fileCompress(cwd, names, format.value, output.value),
+                onDone: (task) => {
+                  if (task && task.status && task.status !== 'succeeded') {
+                    toast('打包失败：' + (task.error || task.status), 'err', 14000);
+                    return;
+                  }
+                  const r = (task && task.result) || {};
+                  toast(r.msg || '打包完成', 'ok', 9000);
+                  load(cwd);
+                },
+              });
+            } catch (e) { toast('打包失败：' + ((e && e.message) || e), 'err', 12000); }
           },
         }),
       ],

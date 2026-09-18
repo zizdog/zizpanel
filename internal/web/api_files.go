@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -305,6 +307,11 @@ type fileCompressReq struct {
 	Output string   `json:"output"`
 }
 
+// handleFileCompress 打包压缩（走任务中心：目录大了就是分钟级动作）。
+//
+// 用户 2026-09-18 报障："我传了文件解压缩，一点反应都没有！900M 的文件解压
+// 没有任何进度" —— 打包与解压都必须有**真实进度**，而且关掉窗口要能找回进度，
+// 所以统一改成 202 + task_id（与安装/卸载同一条规矩）。
 func (s *Server) handleFileCompress(w http.ResponseWriter, r *http.Request) {
 	var req fileCompressReq
 	if err := decode(r, &req); err != nil {
@@ -312,14 +319,31 @@ func (s *Server) handleFileCompress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mgr := s.fileManager()
-	out, err := mgr.Compress(r.Context(), req.Dir, req.Names, req.Format, req.Output)
-	if err != nil {
+	// 先做一次**只读**校验（源路径是否存在/是否越界、格式是否支持）：
+	// 参数错了要当场 400，而不是开一个注定失败的任务。
+	if err := mgr.CheckCompressTargets(req.Dir, req.Names, req.Format); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.audit(r, "file_compress", req.Dir,
-		fmt.Sprintf("压缩 %d 项为 %s", len(req.Names), filepath.Base(out)), true, "")
-	ok(w, map[string]any{"msg": "已生成 " + filepath.Base(out), "path": out})
+	title := fmt.Sprintf("打包 %d 项为 %s", len(req.Names), filepath.Base(req.Output))
+	s.launchTask(w, r, "file_compress", req.Dir, title,
+		"file_compress", func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			lastReport := time.Now()
+			out, err := mgr.CompressWithProgress(ctx, req.Dir, req.Names, req.Format, req.Output,
+				func(done, total int, note string) {
+					// 限流：每 400ms 或每 20 个条目报一次，免得 900MB 归档刷出几万行日志。
+					if time.Since(lastReport) < 400*time.Millisecond && done%20 != 0 {
+						return
+					}
+					lastReport = time.Now()
+					log(tasks.LevelOut, fmt.Sprintf("已处理 %d/%d：%s", done, total, note))
+				})
+			if err != nil {
+				return nil, err
+			}
+			log(tasks.LevelOK, "已生成 "+out)
+			return map[string]any{"path": out, "msg": "已生成 " + filepath.Base(out)}, nil
+		})
 }
 
 type fileExtractReq struct {
@@ -327,6 +351,11 @@ type fileExtractReq struct {
 	Dest    string `json:"dest"`
 }
 
+// handleFileExtract 解压归档（走任务中心 + 真实进度）。
+//
+// 同样的报障："900M 的文件解压没有任何进度" —— 老实现是**同步**跑 unzip/tar，
+// 请求挂着、页面没有任何输出，用户看到的就是"点了没反应"。现在：
+// 立刻 202 + task_id，任务里逐条报"已解压 N/M：路径"，完成后在任务中心看结果。
 func (s *Server) handleFileExtract(w http.ResponseWriter, r *http.Request) {
 	var req fileExtractReq
 	if err := decode(r, &req); err != nil {
@@ -334,13 +363,33 @@ func (s *Server) handleFileExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mgr := s.fileManager()
-	dest, err := mgr.Extract(r.Context(), req.Archive, req.Dest)
-	if err != nil {
+	// 只读预检：归档存在、格式支持、目标目录在允许范围内、归档内没有穿越路径。
+	// 这些问题要**当场**告诉用户（400 + 人话），而不是丢进任务再失败。
+	if err := mgr.CheckExtractTargets(r.Context(), req.Archive, req.Dest); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.audit(r, "file_extract", req.Archive, "解压到 "+dest, true, "")
-	ok(w, map[string]any{"msg": "已解压到 " + dest, "dest": dest})
+	s.launchTask(w, r, "file_extract", req.Archive, "解压 "+filepath.Base(req.Archive),
+		"file_extract", func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			lastReport := time.Now()
+			dest, err := mgr.ExtractWithProgress(ctx, req.Archive, req.Dest,
+				func(done, total int, note string) {
+					if time.Since(lastReport) < 400*time.Millisecond && done%20 != 0 {
+						return
+					}
+					lastReport = time.Now()
+					if total > 0 {
+						log(tasks.LevelOut, fmt.Sprintf("已解压 %d/%d：%s", done, total, note))
+					} else {
+						log(tasks.LevelOut, fmt.Sprintf("已解压 %d 项：%s", done, note))
+					}
+				})
+			if err != nil {
+				return nil, err
+			}
+			log(tasks.LevelOK, "已解压到 "+dest)
+			return map[string]any{"dest": dest, "msg": "已解压到 " + dest}, nil
+		})
 }
 
 // handleFileDownload 下载文件。

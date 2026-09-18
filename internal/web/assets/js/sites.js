@@ -582,22 +582,33 @@ export function SitesView(content, ctx = {}) {
           ? '未检测到运行中的：' + missing.join('、')
           : 'nginx / PHP / MySQL 均在运行') + '）',
       }),
-      // 在跑、但面板里没有它的记录 → 说清楚，并给出"接入"的路（不是"未就绪"）。
-      runningUnregistered().length
-        ? h('div', {
-          style: { marginTop: '3px' },
-          text: '注：' + runningUnregistered().map((x) => x.label).join('、')
-            + ' 正在运行，但面板里没有它的服务记录（不影响网站运行）。'
-            + '需要面板管它（重启/停止/看状态）时，到「应用」里对同名条目点「接入」。',
-        })
-        : null,
-      h('div', {
+    );
+    // 在跑、但面板里没有它的记录 → 说清楚，并给出"接入"的路（不是"未就绪"）。
+    //
+    // ⚠️ 这里**必须**用 appendAll：原生 Element.append 会把 `null` 当文本渲染成
+    // 字符串 "null"（2026-09-18 用户报障：状态行末尾直接显示了一个 null）。
+    // appendAll（ui.js）会跳过 null/undefined —— 条件渲染一律走它。
+    if (runningUnregistered().length) {
+      webEnvLine.append(h('div', {
+        style: { marginTop: '3px' },
+        text: '注：' + runningUnregistered().map((x) => x.label).join('、')
+          + ' 正在运行，但面板里没有它的服务记录（不影响网站运行）。'
+          + '需要面板管它（重启/停止/看状态）时，到「应用」里对同名条目点「接入」。',
+      }));
+    }
+    // "一键 LNMP 会做什么"这段只在**环境不完整或状态未知**时才说 ——
+    // 全都跑着的时候还念一遍，用户会以为面板在劝他重装（用户原话：
+    // "既然都在运行，提示这个干什么？"）。
+    const needExplain = lnmpNeeded() || missing.length > 0 || unknownParts.length > 0
+      || webEnv.lnmpPhase !== 'ready' || webEnv.basePhase !== 'ready';
+    if (needExplain) {
+      webEnvLine.append(h('div', {
         style: { marginTop: '3px' },
         text: '「⚡ 一键 LNMP」会先确保运行依赖（命令行开发者工具 CLT / Homebrew）'
           + '再装 nginx + PHP + MySQL + phpMyAdmin。运行依赖（含 ffmpeg）是所有 brew 应用的公共底座，'
           + '与网站无关，缺了会在首页提示。',
-      }),
-    );
+      }));
+    }
   }
 
   // refreshWebEnv 并行拉三层事实（服务状态 / 运行依赖 / LNMP 组件已装情况），
