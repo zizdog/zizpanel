@@ -544,11 +544,21 @@ async function renderLimitsInto(container, refresh) {
 
   // ---- 生效值：nginx 侧 ----
   const nginxRows = (v.nginx || []).map((f) => h('tr', [
-    h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' }, text: f.file }),
+    h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' } }, [
+      h('div', { text: f.file }),
+      f.note ? h('div', { style: { color: 'var(--text-dim)', fontSize: '11px' }, text: f.note }) : null,
+    ]),
     h('td.mono', { text: f.value || '（未设置 → nginx 默认 1m）' }),
     h('td', [f.ok
       ? h('span.pill.ok', { text: '已生效' })
-      : h('span.pill.warn', { text: '未生效' })]),
+      : (f.managed === false
+        ? h('span.pill.warn', { text: '面板不改这个文件' })
+        : h('span.pill.warn', { text: '未生效' }))]),
+    h('td', [f.path ? h('button.btn.btn-sm', {
+      text: '打开',
+      title: '打开 ' + f.path + '（看磁盘上的真实内容）',
+      onclick: () => configFileModal({ config_path: f.path, display_name: f.file }),
+    }) : null]),
   ]));
 
   // ---- 生效值：PHP 侧（每个版本真的跑一次 php-cgi 回读 ini）----
@@ -557,9 +567,33 @@ async function renderLimitsInto(container, refresh) {
     const valueText = p.error
       ? '未复核：' + p.error
       : `upload ${vals.upload_max_filesize} · post ${vals.post_max_size} · memory ${vals.memory_limit} · max_execution_time ${vals.max_execution_time}s`;
+    // php.ini 的出厂值也要显示：用户 2026-09-18 打开的是 php.ini，于是以为
+    // "面板不读真实文件、也不写真实文件" —— 真正生效的是面板的 conf.d 片段，
+    // 两份都摆出来、都给「打开」，这件事才说得清。
+    const iniText = p.ini_values
+      ? 'php.ini（面板刻意不改，升级会覆盖）：upload ' + (p.ini_values.upload_max_filesize || '-') +
+        ' · post ' + (p.ini_values.post_max_size || '-') +
+        ' · memory ' + (p.ini_values.memory_limit || '-') +
+        ' · max_execution_time ' + (p.ini_values.max_execution_time || '-') + 's'
+      : '';
     return h('tr', [
       h('td', { text: 'PHP ' + p.version }),
-      h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' }, text: p.fragment || '-' }),
+      h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' } }, [
+        h('div', { text: p.fragment || '-' }),
+        p.fragment ? h('button.btn.btn-sm', {
+          style: { marginTop: '2px' },
+          text: '打开片段',
+          title: '打开面板写的 conf.d 片段（PHP 真正读取的那一份）',
+          onclick: () => configFileModal({ config_path: p.fragment, display_name: 'PHP ' + p.version + ' 限制片段' }),
+        }) : null,
+        p.ini_path ? h('div', { style: { marginTop: '6px', color: 'var(--text-dim)', fontSize: '11px' }, text: iniText }) : null,
+        p.ini_path ? h('button.btn.btn-sm', {
+          style: { marginTop: '2px' },
+          text: '打开 php.ini',
+          title: 'brew 的 php.ini —— 面板不改它（升级会覆盖、手改会丢）；真正生效的是上面的片段',
+          onclick: () => configFileModal({ config_path: p.ini_path, display_name: 'PHP ' + p.version + ' php.ini' }),
+        }) : null,
+      ]),
       h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' } }, [
         h('div', { text: valueText }),
         // 回读用的 SAPI 与"查不到"的说明都如实显示（CLI 会把
@@ -590,6 +624,13 @@ async function renderLimitsInto(container, refresh) {
             + '</code> / <code class="code">' + (def.upload_max_filesize || '512M')
             + '</code> 就是按"能导入大 SQL"选的。',
         }),
+        h('div', { style: { margin: '0 0 10px', padding: '9px 11px', background: 'var(--warn-soft)',
+          borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.8' } }, [
+          h('div', { style: { fontWeight: '620' }, text: '保存会写进这些真实文件（下面「当前生效值」逐行列出来，可点「打开」查看）' }),
+          h('div', { text: '· nginx：nginx.conf 的 http 块（全局值）+ 面板生成的每个站点 vhost + 默认站点；' }),
+          h('div', { text: '· PHP：面板自己的 conf.d 片段 99-zizpanel-limits.ini —— 不改 brew 的 php.ini' +
+            '（升级会覆盖、手改会丢），PHP 真正读取的是这个片段，右边的回读值就是它。' }),
+        ]),
         h('div.row', [nginxField.field, uploadField.field]),
         h('div.row', [postField.field, memField.field, execField]),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '4px' } }, [
@@ -611,7 +652,7 @@ async function renderLimitsInto(container, refresh) {
         ]),
         nginxRows.length
           ? h('table.table', [
-            h('thead', [h('tr', [h('th', { text: '配置文件' }), h('th', { text: 'client_max_body_size' }), h('th', { text: '状态' })])]),
+            h('thead', [h('tr', [h('th', { text: '配置文件（真实路径）' }), h('th', { text: 'client_max_body_size' }), h('th', { text: '状态' }), h('th', { text: '' })])]),
             h('tbody', nginxRows),
           ])
           : h('div.empty', [h('p', { text: 'vhost 目录里还没有 .conf（先建站点或点「整理默认站点」）' })]),

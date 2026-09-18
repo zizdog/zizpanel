@@ -103,8 +103,21 @@ export function renderInstalledApps(container, opts = {}) {
   function problemOf(e) {
     const st = (e.svc && e.svc.state) || {};
     const health = (e.svc && e.svc.health) || {};
+    // 用户**主动停掉**的服务不是问题（stopped_by_user = 我不想让它跑）。
+    //
+    // 2026-09-18 用户报障："我手动停止了 Qwen3 TTS 和 TtsVoice 音色接收端；
+    // 然后它们就跑到：2 个需要处理中 … 这是我主动停的，不是运行错误，应该分清楚！"
+    // 后端已经不再对它们做健康检查（health.checked=false），这里再兜一层：
+    // 记录里写着 stopped_by_user 且确实没在跑 → 一律不算"需要处理"。
+    if (e.svc && e.svc.stopped_by_user === true && !st.running) return false;
     return st.status === 'error' || st.status === 'unavailable'
       || !!(health.checked && !health.ok);
+  }
+
+  // stoppedByUser 判"这个服务是被用户手动停掉的"（而不是崩了）。
+  function stoppedByUser(e) {
+    const st = (e.svc && e.svc.state) || {};
+    return !!(e.svc && e.svc.stopped_by_user === true && !st.running);
   }
 
   function matchesFilter(e) {
@@ -289,17 +302,38 @@ export function renderInstalledApps(container, opts = {}) {
           + portCheckNote(m, s),
       })]
       : [];
-    const extra = (health.checked && !health.ok)
-      ? [h('div', { style: { fontSize: '11.5px', color: 'var(--danger)' } }, [
-        h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
+    // 用户**手动停掉**的服务：说清"是你停的，不是坏了"，并给「▶ 启动」——
+    // 绝不再显示"检查未通过 / 改检查地址"（那是在把一个正常状态说成故障）。
+    const userStopped = stoppedByUser(e);
+    const extra = userStopped
+      ? [h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' } }, [
+        h('div', { text: '已停止（你手动停的）：面板不会对它做健康检查，也不会计入「需要处理」。' }),
         h('button.btn.btn-sm', {
           style: { marginTop: '4px' },
-          text: '改检查地址',
-          title: '改完再点这张卡片上的「⟳ 刷新」重新检查',
-          onclick: () => newServiceModal(reload, s),
+          text: '▶ 启动',
+          title: '重新启动这个服务',
+          onclick: async () => {
+            try {
+              await api.serviceAction(s.name, 'start');
+              toast('已启动「' + (s.display_name || s.name) + '」', 'ok', 6000);
+            } catch (err) {
+              toast('启动失败：' + ((err && err.message) || err), 'err', 12000);
+            }
+            reload();
+          },
         }),
       ])]
-      : [];
+      : ((health.checked && !health.ok)
+        ? [h('div', { style: { fontSize: '11.5px', color: 'var(--danger)' } }, [
+          h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
+          h('button.btn.btn-sm', {
+            style: { marginTop: '4px' },
+            text: '改检查地址',
+            title: '改完再点这张卡片上的「⟳ 刷新」重新检查',
+            onclick: () => newServiceModal(reload, s),
+          }),
+        ])]
+        : []);
 
     return appCardShell({
       icon,

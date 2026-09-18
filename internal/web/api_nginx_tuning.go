@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -30,6 +31,28 @@ type nginxTuningView struct {
 	// HelperUnavailable 为 true 表示这次读取根本没做成（提权助手不可用），
 	// 界面必须显示"读不到"，绝不能显示成"出厂默认值"。
 	HelperUnavailable bool `json:"helper_unavailable,omitempty"`
+}
+
+// readNginxTuning 读当前 nginx 参数（提权助手不可用时返回错误 + 出厂默认值）。
+//
+// 抽出来给"上传与执行限制"复用：它要把全局 client_max_body_size 写进 nginx.conf，
+// 而写入器要求**整份**参数（见 priv.ValidateTuning）—— 所以先读、改一项、再写回。
+func (s *Server) readNginxTuning(ctx context.Context) (priv.NginxTuning, error) {
+	res, err := s.callHelper(ctx, "nginx-tuning-read")
+	if err != nil {
+		return priv.DefaultTuning(), err
+	}
+	raw, merr := json.Marshal(res["data"])
+	if merr != nil {
+		return priv.DefaultTuning(), merr
+	}
+	var out struct {
+		Values priv.NginxTuning `json:"values"`
+	}
+	if uerr := json.Unmarshal(raw, &out); uerr != nil {
+		return priv.DefaultTuning(), uerr
+	}
+	return out.Values, nil
 }
 
 // handleNginxTuningGet 读取 nginx 性能参数（含真实生效值回读）。

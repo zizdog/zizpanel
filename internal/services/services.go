@@ -106,6 +106,13 @@ type Service struct {
 	Autostart    bool   `json:"autostart"`
 	Enabled      bool   `json:"enabled"`
 	Managed      bool   `json:"managed"` // true=面板安装（可卸载），false=仅纳管
+	// StoppedByUser 表示"用户**主动**停止过它"（面板的停止按钮点过、且之后没再启动）。
+	//
+	// 为什么必须单独记：运行状态本身分不出"用户停的"与"它自己崩了"——两者都是
+	// "没在跑"。而这两种情况在产品语义上完全相反：前者不是问题，后者要报出来。
+	// 2026-09-18 用户报障："我手动停止了 Qwen3 TTS 和 TtsVoice 音色接收端；
+	// 然后它们就跑到：2 个需要处理中 …… 这是我主动停的，不是运行错误，应该分清楚！"
+	StoppedByUser bool `json:"stopped_by_user"`
 
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
@@ -517,10 +524,26 @@ func (m *Manager) List(ctx context.Context, withHealth bool) ([]*View, error) {
 			} else {
 				r.state = st
 			}
+			// 用户**主动停掉**的服务（Enabled=false）不做健康检查。
+			//
+			// 2026-09-18 用户报障："我手动停止了 Qwen3 TTS 和 TtsVoice 音色接收端；
+			// 然后它们就跑到：2 个需要处理中。软件卡片提示：检查地址 … 检查未通过 …
+			// 这是我主动停的，不是运行错误，应该分清楚！"
+			//
+			// 健康检查是"这个服务**应该**在跑、它答不答得上来"的问题；
+			// 用户已经明确停掉它时，它当然答不上来 —— 那不是故障，不该进"需要处理"。
+			// 这里如实标 Checked=false（前端据此不再算问题），并写明原因。
 			if withHealth && s.HealthURL != "" {
-				hctx, hcancel := context.WithTimeout(ctx, 8*time.Second)
-				defer hcancel()
-				r.health = drv.Health(hctx)
+				if skipHealthForUserStopped(s, r.state) {
+					r.health = Health{
+						Checked: false, URL: s.HealthURL,
+						Message: "服务已被你手动停止：不做健康检查（它不是故障）。点「▶ 启动」即可恢复",
+					}
+				} else {
+					hctx, hcancel := context.WithTimeout(ctx, 8*time.Second)
+					defer hcancel()
+					r.health = drv.Health(hctx)
+				}
 			}
 			ch <- r
 		}(i, s)
@@ -600,6 +623,22 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	if err != nil {
 		return State{Status: "error", Detail: err.Error()}, err
 	}
+	// 把**用户意图**写进服务记录：stop ⇒ Enabled=false（我不想让它跑），
+	// start / restart ⇒ Enabled=true。健康检查与「需要处理」的判据都看这个字段 ——
+	// "用户主动停的"与"它自己崩了"是两件事，必须分得清（2026-09-18 用户报障）。
+	intentWarning := m.rememberUserIntent(ctx, s, action)
+	// attach 把"意图没记下来"的警告挂到返回状态上（每个返回点都要带上）。
+	attach := func(st State) State {
+		if intentWarning == "" {
+			return st
+		}
+		if st.Warning != "" {
+			st.Warning += "；" + intentWarning
+		} else {
+			st.Warning = intentWarning
+		}
+		return st
+	}
 	// 等待状态稳定（最多 8 秒）
 	want := action != "stop"
 	var last State
@@ -609,7 +648,7 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 		if serr == nil {
 			last = st
 			if st.Running == want {
-				return st, nil
+				return attach(st), nil
 			}
 		}
 	}
@@ -639,7 +678,85 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	// 所以仍然返回成功 —— 但必须让界面显示"还没确认"，不能让用户以为已经好了。
 	last.Warning = appendWarning(last.Warning,
 		"已请求启动，但 8 秒内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）")
-	return last, nil
+	return attach(last), nil
+}
+
+// ReconcileUserIntentFromAudit 用**审计日志**回填用户意图（升级后的老库）。
+//
+// 为什么需要：本次修复之前，stop/start 不记录意图，于是"用户手动停掉的服务"
+// 在列表里仍然被当成"应该在跑却没跑"（2026-09-18 用户报障）。
+// 运行状态本身分不出这两种情况，但**面板自己的审计日志分得出**：
+// 某个服务最后一次启停操作是 `service_stop`（且成功），那就是用户有意停的。
+//
+// 只回填"最后一条动作明确是 stop/start"的条目；查不到动作的**一个字都不改**
+// （不确定就保持原样，绝不猜）。返回改动的条数，供日志如实记录。
+func (m *Manager) ReconcileUserIntentFromAudit(ctx context.Context) (int, error) {
+	list, err := m.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	db := m.repo.Store()
+	if db == nil {
+		return 0, nil
+	}
+	changed := 0
+	for _, s := range list {
+		var action string
+		var ok int
+		row := db.DB().QueryRowContext(ctx,
+			`SELECT action, ok FROM audit_logs
+			  WHERE target = ? AND action IN ('service_stop','service_start','service_restart')
+			  ORDER BY id DESC LIMIT 1`, s.Name)
+		if err := row.Scan(&action, &ok); err != nil {
+			continue // 没有相关审计：不动
+		}
+		if ok != 1 {
+			continue // 那次操作没成功：不能作为"用户意图"的证据
+		}
+		want := action == "service_stop"
+		if s.StoppedByUser == want {
+			continue
+		}
+		s.StoppedByUser = want
+		if uerr := m.repo.Update(ctx, s); uerr != nil {
+			return changed, uerr
+		}
+		changed++
+	}
+	return changed, nil
+}
+
+// skipHealthForUserStopped 判"这次健康检查该不该跳过"。
+//
+// 用户**手动停掉**的服务（Enabled=false）当然答不上健康检查 —— 那不是故障，
+// 所以不做检查、不进「需要处理」（2026-09-18 用户报障："这是我主动停的，
+// 不是运行错误，应该分清楚！"）。
+func skipHealthForUserStopped(s *Service, st State) bool {
+	return s != nil && s.StoppedByUser && !st.Running
+}
+
+// rememberUserIntent 把用户的启停意图写进服务记录（Enabled = "用户希望它运行"）。
+//
+// 为什么必须落库：健康检查与「需要处理」的判据都要区分"用户主动停的"与"它自己崩了"，
+// 而这个区别**只能来自用户的操作历史** —— 运行状态本身两者一模一样（都是没在跑）。
+//
+// 返回值是"没记住"时的如实说明（空 = 记好了）。写不进去**不**让操作失败：
+// 服务确实停/起了，谎报失败反而更糟；但必须告诉用户，否则下次刷新面板又会把它当故障。
+func (m *Manager) rememberUserIntent(ctx context.Context, s *Service, action string) string {
+	if s == nil {
+		return ""
+	}
+	wantStopped := action == "stop"
+	if s.StoppedByUser == wantStopped {
+		return ""
+	}
+	s.StoppedByUser = wantStopped
+	if err := m.repo.Update(ctx, s); err != nil {
+		verb := map[string]string{"stop": "停止", "start": "启动", "restart": "重启"}[action]
+		return "已" + verb + "，但面板没能记下「这是你手动操作的」（" + err.Error() + "）：" +
+			"下次刷新可能又把它当成需要处理，请再操作一次或看面板日志"
+	}
+	return ""
 }
 
 // Logs 读取服务日志。

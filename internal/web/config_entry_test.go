@@ -145,3 +145,33 @@ func seedServiceRecord(t *testing.T, srv *Server, name, display, label, category
 		t.Fatalf("建服务记录 %s 失败: %v", name, err)
 	}
 }
+
+// TestFrontendDistinguishesUserStopped：前端不许把"用户主动停的服务"算成问题。
+//
+// 2026-09-18 用户报障："我手动停止了 Qwen3 TTS 和 TtsVoice 音色接收端；
+// 然后它们就跑到：2 个需要处理中 …… 这是我主动停的，不是运行错误，应该分清楚！"
+//
+// 这是**用户可见分类**的门禁：判据必须包含服务记录里的用户意图（enabled=false），
+// 而不仅仅看运行状态与健康检查（那两样在"用户停的"和"崩了的"之间没有区别）。
+func TestFrontendDistinguishesUserStopped(t *testing.T) {
+	js := readAssetJS(t, "services.js")
+	idx := strings.Index(js, "function problemOf(e)")
+	if idx < 0 {
+		t.Fatal("services.js 里找不到 problemOf（「需要处理」的唯一判据）")
+	}
+	end := idx + 1200
+	if end > len(js) {
+		end = len(js)
+	}
+	block := js[idx:end]
+	if !strings.Contains(block, "stopped_by_user === true") {
+		t.Errorf("「需要处理」的判据必须排除「用户主动停止」（stopped_by_user === true）：\n%s", block[:400])
+	}
+	// 卡片上要有"是你停的"这句人话，并且不再对它显示"改检查地址"。
+	if !strings.Contains(js, "已停止（你手动停的）") {
+		t.Errorf("卡片要明确说是「你手动停的」，而不是让用户以为坏了")
+	}
+	if !strings.Contains(js, "stoppedByUser") {
+		t.Errorf("卡片渲染要用 stoppedByUser 区分这两种完全不同的情况")
+	}
+}

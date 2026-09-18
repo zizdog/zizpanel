@@ -262,7 +262,17 @@ func (s *Server) buildDefaultVhost() string {
 //
 // 用户的要求就是这一句："phpmyadmin 不能直接访问，必须已经登录面板才可以访问。"
 func (s *Server) phpAdminProxy() http.Handler {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:80"}
+	return s.phpAdminProxyTo(&url.URL{Scheme: "http", Host: "127.0.0.1:80"})
+}
+
+// phpAdminProxyTo 是上面那个反代的本体（目标可注入，便于单测）。
+func (s *Server) phpAdminProxyTo(target *url.URL) http.Handler {
+	// 面板自己的入口前缀（例如 "/jab5c63"）：phpMyAdmin 的 Cookie 路径必须改写到它之下。
+	// 后缀就是面板入口那一段（见 config.PanelSuffix 的注释）。
+	prefix := ""
+	if suf := strings.Trim(s.Cfg.PanelSuffix, "/"); suf != "" {
+		prefix = "/" + suf
+	}
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = target.Scheme
@@ -271,6 +281,33 @@ func (s *Server) phpAdminProxy() http.Handler {
 			pr.Out.Host = target.Host
 			pr.SetXForwarded()
 		},
+		// ⚠️ 必须改写 Set-Cookie 的 path（2026-09-18 用户报障："本机的 phpmyadmin
+		// 登录不上了！Failed to set session cookie. Maybe you are using HTTP instead
+		// of HTTPS" + "一点导入就 500"）。
+		//
+		// 根因：phpMyAdmin 按**自己的**路径写 Cookie：`path=/phpmyadmin/`；而浏览器
+		// 访问的是面板入口 `/<安全后缀>/phpmyadmin/` —— 路径对不上，浏览器**不会**
+		// 把它带回来，于是每个请求都是新会话：登录页提交后没有会话（"Failed to set
+		// session cookie"），导入 POST 也因为没有会话/令牌而 500。
+		//
+		// 修法就是在反代这一层把 Cookie 的 path 补上面板前缀（不改 phpMyAdmin 一行配置，
+		// 也不把它的路径写死到 vhost 里）。Location 同理（phpMyAdmin 会 302 到自己的
+		// 绝对路径）。
+		ModifyResponse: func(res *http.Response) error {
+			if res == nil {
+				return nil
+			}
+			if cks := res.Header.Values("Set-Cookie"); len(cks) > 0 {
+				res.Header.Del("Set-Cookie")
+				for _, ck := range cks {
+					res.Header.Add("Set-Cookie", rewriteCookiePath(ck, "/phpmyadmin", prefix+"/phpmyadmin"))
+				}
+			}
+			if loc := res.Header.Get("Location"); strings.HasPrefix(loc, "/phpmyadmin") {
+				res.Header.Set("Location", prefix+loc)
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
@@ -278,6 +315,29 @@ func (s *Server) phpAdminProxy() http.Handler {
 <p>常见原因：nginx 没在跑，或 phpMyAdmin 还没安装（应用市场 → phpMyAdmin）。</p>`, escHTML(err.Error()))
 		},
 	}
+}
+
+// rewriteCookiePath 把 Set-Cookie 里的 Path 值按前缀改写（大小写不敏感，保留其余属性）。
+//
+// 只改**完全等于** from 或以其 + "/" 开头的 Path；其它 Path（例如 "/"）原样保留 ——
+// 改错会让本来正常的 Cookie 失效，比不改更糟。
+func rewriteCookiePath(cookie, from, to string) string {
+	lower := strings.ToLower(cookie)
+	idx := strings.Index(lower, "path=")
+	if idx < 0 {
+		return cookie
+	}
+	valStart := idx + len("path=")
+	valEnd := valStart
+	for valEnd < len(cookie) && cookie[valEnd] != ';' && cookie[valEnd] != ',' {
+		valEnd++
+	}
+	val := strings.TrimSpace(cookie[valStart:valEnd])
+	if val != from && !strings.HasPrefix(val, from+"/") {
+		return cookie
+	}
+	newVal := to + strings.TrimPrefix(val, from)
+	return cookie[:valStart] + newVal + cookie[valEnd:]
 }
 
 // handlePhpMyAdmin 是入口：未登录直接拦住（不是重定向，避免暴露面板地址）。

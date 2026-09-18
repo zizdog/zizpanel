@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/priv"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -68,6 +69,13 @@ type limitFileState struct {
 	Value string `json:"value"`
 	Line  int    `json:"line"`
 	OK    bool   `json:"ok"`
+	// Managed 表示这个文件是**面板生成的**（保存时面板会重写它）。
+	// 不是面板生成的文件（用户自己写的 vhost）面板**不会动**，界面上必须说清。
+	Managed bool `json:"managed"`
+	// Note 是这一行的人话说明（例如"全局默认值：站点 vhost 里没写时用它"）。
+	Note string `json:"note,omitempty"`
+	// Path 是文件的绝对路径（界面给一个「打开」按钮，用户能自己看真实内容）。
+	Path string `json:"path,omitempty"`
 }
 
 // phpHardLimitState 是一个 PHP 版本的生效值回读结果。
@@ -76,6 +84,13 @@ type phpHardLimitState struct {
 	Binary  string `json:"binary"`
 	// Fragment 是面板写的 conf.d 片段路径（空 = 没找到该版本的 conf.d）。
 	Fragment string `json:"fragment"`
+	// IniPath 是 brew 的 php.ini（**面板刻意不改它**：brew 升级会覆盖，用户手改会丢）。
+	// 界面要把它显示出来并写明"这一份不生效来源" —— 2026-09-18 用户报障：
+	// "根本就不读真实文件！保存也不会写入真实的配置文件"（他看的是 php.ini，
+	// 而真正生效的是面板的 conf.d 片段）。
+	IniPath string `json:"ini_path,omitempty"`
+	// IniValues 是 php.ini 里的出厂值（只读展示，用于对照）。
+	IniValues map[string]string `json:"ini_values,omitempty"`
 	// FragmentOK 表示片段内容与当前配置一致。
 	FragmentOK bool `json:"fragment_ok"`
 	// Values 是回读到的真实 ini 值（`php-cgi -f` 优先；回读不到时为空）。
@@ -89,6 +104,42 @@ type phpHardLimitState struct {
 	OK bool `json:"ok"`
 	// Error 是回读失败的原因（没装/执行失败），非空时界面显示"未复核"。
 	Error string `json:"error,omitempty"`
+}
+
+// readPHPLimitsFromIni 从 php.ini（**不是**面板的 conf.d 片段）里读出这四个上限。
+//
+// 只用于界面**对照显示**：让用户一眼看到"brew 的 php.ini 写的是 2M，
+// 而真正生效的是下面那个面板片段（512M）"—— 2026-09-18 用户报障
+// "根本就不读真实文件！保存也不会写入真实的配置文件"，原因正是他打开的是 php.ini。
+func readPHPLimitsFromIni(path string) map[string]string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	want := map[string]bool{
+		"upload_max_filesize": true, "post_max_size": true,
+		"memory_limit": true, "max_execution_time": true,
+	}
+	out := map[string]string{}
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		if !want[k] {
+			continue
+		}
+		out[k] = strings.TrimSpace(v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // uploadLimitsView 是 GET / POST 的统一响应形状。
@@ -225,6 +276,37 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 		log(tasks.LevelOut, "phpMyAdmin 的 ExecTimeLimit 已是最新（或未安装 phpMyAdmin）")
 	}
 
+	// ---- 3b. 把**全局**请求体上限写进 nginx.conf 的 http 块 ----
+	//
+	// 为什么必须写这一份（2026-09-18 用户报障："保存也不会写入真实的配置文件"）：
+	// 面板过去只改自己生成的站点 vhost 与默认站点，nginx.conf 里那一行保持出厂值。
+	// 对用户来说"我改了设置，配置文件却没变"就是没生效 —— 而且**没被面板管理的
+	// vhost**（用户自己写的站）根本没有 vhost 级设置，用的正是这个全局值。
+	// 这里复用「性能调整」那套写入器（备份 → 改写 → nginx -t → 失败回滚 → 回读），
+	// 只改 client_max_body_size 一项，其余参数原样保留。
+	if mb, ok := sites.ParseSizeBytes(lim.ClientMaxBodySize); ok && mb > 0 {
+		mbInt := int(mb / (1024 * 1024))
+		if mbInt < 1 {
+			mbInt = 1
+		}
+		if cur, err := s.readNginxTuning(ctx); err != nil {
+			log(tasks.LevelWarn, "读不到 nginx 当前参数，跳过全局值写入（站点 vhost 的值仍然生效）："+err.Error())
+		} else {
+			cur.ClientMaxBodySizeMB = mbInt
+			enc, _ := priv.TuningEncode(cur)
+			if _, werr := s.callHelper(ctx, "nginx-tuning-write", "-values", enc); werr != nil {
+				// 不致命：站点 vhost 与默认站点已经带上新值（用户真正要修的 phpMyAdmin 路径在那里）。
+				// 但必须如实说，并给出下一步。
+				log(tasks.LevelErr, "全局 client_max_body_size 写入 nginx.conf 失败："+werr.Error())
+				log(tasks.LevelWarn, "（站点 vhost 与默认站点的值已生效；要在 nginx.conf 里也写全局值，"+
+					"可到「网站管理 → ⚙️ Nginx 管理 → 性能调整」改 client_max_body_size）")
+			} else {
+				log(tasks.LevelOK, "已写入全局值：nginx.conf 的 http 块 client_max_body_size "+
+					strconv.Itoa(mbInt)+"m（其余 nginx 参数未动）")
+			}
+		}
+	}
+
 	// ---- 4. 重新生成站点 vhost（带上新的 client_max_body_size）----
 	// 这是"尽力而为"的一段：某个站点可能因为 PHP 端点没在跑而暂时应用不了，
 	// 那不该挡住其它站点与默认站点（用户真正要修的 phpMyAdmin 路径）。
@@ -345,6 +427,23 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 		NginxDir: s.Cfg.VhostDir,
 	}
 	// ---- nginx 侧 ----
+	//
+	// 先加**全局**那一行（nginx.conf 的 http 块）：站点 vhost 里没写
+	// client_max_body_size 时，用的就是它 —— 这是"真实文件"里最容易被忽略的一份，
+	// 也是 2026-09-18 用户说"不读真实文件"时真正想看的那一份。
+	if b, err := os.ReadFile(s.Cfg.NginxConf); err == nil {
+		val, line := sites.FindClientMaxBodySize(string(b))
+		st := limitFileState{
+			File: "nginx.conf（http 全局）", Value: val, Line: line, Path: s.Cfg.NginxConf,
+			Managed: true,
+			Note:    "全局默认值：站点 vhost 里没写 client_max_body_size 时用它（保存会写这一行）",
+			OK:      strings.TrimSpace(val) == strings.TrimSpace(lim.ClientMaxBodySize),
+		}
+		if !st.OK {
+			view.Mismatch = true
+		}
+		view.Nginx = append(view.Nginx, st)
+	}
 	entries, _ := os.ReadDir(s.Cfg.VhostDir)
 	var files []string
 	for _, e := range entries {
@@ -360,8 +459,19 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 			continue
 		}
 		val, line := sites.FindClientMaxBodySize(string(b))
-		st := limitFileState{File: name, Value: val, Line: line, OK: val == lim.ClientMaxBodySize}
-		if !st.OK {
+		managed := strings.Contains(string(b), services.DefaultVhostMarker) ||
+			strings.Contains(string(b), "由 ZizPanel 生成")
+		st := limitFileState{
+			File: name, Value: val, Line: line, OK: val == lim.ClientMaxBodySize,
+			Managed: managed, Path: filepath.Join(s.Cfg.VhostDir, name),
+		}
+		if !managed {
+			st.Note = "这个 vhost 不是面板生成的：面板**不会改它**（保存时跳过）。" +
+				"它里面的值会覆盖全局值 —— 要改它请用「网站管理 → ⚙️ 配置文件」手工改，" +
+				"或把它交给面板管理（重建配置）"
+			// 非面板管理的文件**不参与** mismatch 判定：面板改不了它，
+			// 把它算成"未生效"等于让用户永远点不绿（那是假故障）。
+		} else if !st.OK {
 			view.Mismatch = true
 		}
 		view.Nginx = append(view.Nginx, st)
@@ -369,6 +479,11 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 	// ---- PHP 侧 ----
 	for _, v := range sites.DiscoverPHPVersions(s.Cfg.BrewPrefix) {
 		st := phpHardLimitState{Version: v.Version, Binary: v.Binary}
+		// php.ini 现状（**面板不改它**，只用于对照说明"真正生效的是下面的片段"）
+		if ini := filepath.Join(s.Cfg.BrewPrefix, "etc", "php", v.Version, "php.ini"); fileExists(ini) {
+			st.IniPath = ini
+			st.IniValues = readPHPLimitsFromIni(ini)
+		}
 		frag := sites.PHPConfDPath(s.Cfg.BrewPrefix, v.Version)
 		st.Fragment = frag
 		if b, err := os.ReadFile(frag); err == nil {

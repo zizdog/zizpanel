@@ -25,18 +25,22 @@ type Repository struct {
 // NewRepository 创建仓库。
 func NewRepository(st *store.Store) *Repository { return &Repository{st: st} }
 
+// Store 返回底层数据库句柄（少数需要**只读**查询其它表的地方用，例如
+// 用审计日志回填"用户主动停止"的意图，见 services.go 的 ReconcileUserIntentFromAudit）。
+func (r *Repository) Store() *store.Store { return r.st }
+
 const cols = `id,name,display_name,kind,category,icon,description,port,
 	launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,
-	health_url,health_expect,log_path,autostart,enabled,managed,created_at,updated_at`
+	health_url,health_expect,log_path,autostart,enabled,managed,stopped_by_user,created_at,updated_at`
 
 func scanService(sc interface{ Scan(...any) error }) (*Service, error) {
 	var s Service
 	var kind string
-	var autostart, enabled, managed int
+	var autostart, enabled, managed, stoppedByUser int
 	err := sc.Scan(&s.ID, &s.Name, &s.DisplayName, &kind, &s.Category, &s.Icon,
 		&s.Description, &s.Port, &s.LaunchLabel, &s.PlistPath, &s.WorkDir, &s.StartCmd,
 		&s.Container, &s.ComposeFile, &s.Image, &s.HealthURL, &s.HealthExpect,
-		&s.LogPath, &autostart, &enabled, &managed, &s.CreatedAt, &s.UpdatedAt)
+		&s.LogPath, &autostart, &enabled, &managed, &stoppedByUser, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -44,6 +48,7 @@ func scanService(sc interface{ Scan(...any) error }) (*Service, error) {
 	s.Autostart = autostart == 1
 	s.Enabled = enabled == 1
 	s.Managed = managed == 1
+	s.StoppedByUser = stoppedByUser == 1
 	// 显示名兜底：老记录里 display_name 存的可能就是 launchd 标签
 	// （sh.brew.mysql@8.4），界面上该显示「MySQL 8.4」。
 	// 在这里做而不是在注册时做，是为了让已登记的服务立刻变好看，不用重新纳管。
@@ -111,11 +116,12 @@ func (r *Repository) Create(ctx context.Context, s *Service) error {
 	res, err := r.st.DB().ExecContext(ctx,
 		`INSERT INTO services(name,display_name,kind,category,icon,description,port,
 		 launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,
-		 health_url,health_expect,log_path,autostart,enabled,managed)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 health_url,health_expect,log_path,autostart,enabled,managed,stopped_by_user)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.Name, s.DisplayName, string(s.Kind), s.Category, s.Icon, s.Description, s.Port,
 		s.LaunchLabel, s.PlistPath, s.WorkDir, s.StartCmd, s.Container, s.ComposeFile, s.Image,
-		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled), boolInt(s.Managed))
+		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled), boolInt(s.Managed),
+		boolInt(s.StoppedByUser))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return fmt.Errorf("服务名 %s 已存在", s.Name)
@@ -131,12 +137,13 @@ func (r *Repository) Update(ctx context.Context, s *Service) error {
 	_, err := r.st.DB().ExecContext(ctx,
 		`UPDATE services SET display_name=?,kind=?,category=?,icon=?,description=?,port=?,
 		 launch_label=?,plist_path=?,work_dir=?,start_cmd=?,container=?,compose_file=?,image=?,
-		 health_url=?,health_expect=?,log_path=?,autostart=?,enabled=?,
+		 health_url=?,health_expect=?,log_path=?,autostart=?,enabled=?,stopped_by_user=?,
 		 updated_at=datetime('now','localtime')
 		 WHERE name=?`,
 		s.DisplayName, string(s.Kind), s.Category, s.Icon, s.Description, s.Port,
 		s.LaunchLabel, s.PlistPath, s.WorkDir, s.StartCmd, s.Container, s.ComposeFile, s.Image,
-		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled), s.Name)
+		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled),
+		boolInt(s.StoppedByUser), s.Name)
 	return err
 }
 

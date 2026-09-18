@@ -1703,6 +1703,15 @@ func (s *Server) Startup(ctx context.Context) {
 	// 一个还没人听的回环端口上。
 	s.reconcileForwarders(ctx)
 
+	// 用审计日志回填"用户主动停止"的意图（升级后的老库）：
+	// 修复之前 stop/start 不记录意图，于是用户手动停掉的服务会被当成"需要处理"。
+	// 只认**面板自己审计里最后一条成功的启停动作**，查不到就一个字都不改。
+	if n, err := s.svcManager().ReconcileUserIntentFromAudit(ctx); err != nil {
+		s.Log.Warn("回填服务启停意图失败: %v", err)
+	} else if n > 0 {
+		s.Log.Info("已按审计日志回填 %d 条服务的启停意图（用户手动停止的不再计入「需要处理」）", n)
+	}
+
 	// 证书自动续期：登记到面板既有的调度器里（每日检查一次，实现见 api_certs.go）。
 	// 这里只登记，不做立即续期 —— 真正决定签发的门槛是 NeedsRenewal，
 	// 启动路径上不该引入额外的网络等待。

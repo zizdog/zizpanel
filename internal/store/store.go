@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS services (
     autostart    INTEGER NOT NULL DEFAULT 0,
     enabled      INTEGER NOT NULL DEFAULT 1,
     managed      INTEGER NOT NULL DEFAULT 0,  -- 1=面板创建，0=仅纳管
+    -- 用户**主动停止**过这个服务（1=是）。运行状态分不出"用户停的"与"它崩了"，
+    -- 这个字段就是那个区别（2026-09-18 用户报障："这是我主动停的，不是运行错误"）。
+    stopped_by_user INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
     updated_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
@@ -286,6 +289,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	// 为什么必须向后兼容：用户已经有一批在用的反代规则，升级面板时不能因为
 	// 多了几列就让规则失效或让启动报错。ADD COLUMN 带 NOT NULL DEFAULT 会给
 	// 已有行填默认值 —— ssl_enabled=0 正是"老规则默认关 SSL"。
+	if err := s.ensureColumns(ctx, "services", map[string]string{
+		"stopped_by_user": "INTEGER NOT NULL DEFAULT 0",
+	}); err != nil {
+		return err
+	}
 	if err := s.ensureColumns(ctx, "proxies", map[string]string{
 		"ssl_enabled":  "INTEGER NOT NULL DEFAULT 0",
 		"ssl_cert":     "TEXT NOT NULL DEFAULT ''",
