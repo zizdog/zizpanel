@@ -2,14 +2,41 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/priv"
 )
+
+// brewUsesCache 缓存 `brew uses --installed <formula>` 的结果。
+//
+// 为什么是**包级**而不是 Manager 字段：svcManager() 每次请求都新建一个 Manager
+// （设置页保存后立刻生效），挂在 Manager 上的缓存活不过一次请求。依赖关系是
+// 低频数据，5 分钟足够；键是 formula，值是"依赖它的已装包"。
+var (
+	brewUsesMu    sync.Mutex
+	brewUsesCache = map[string]brewUsesEntry{}
+)
+
+const brewUsesTTL = 5 * time.Minute
+
+type brewUsesEntry struct {
+	deps []string
+	ok   bool
+	at   time.Time
+}
+
+// resetBrewUsesCache 仅供测试：清掉进程级缓存，避免用例之间互相污染。
+func resetBrewUsesCache() {
+	brewUsesMu.Lock()
+	brewUsesCache = map[string]brewUsesEntry{}
+	brewUsesMu.Unlock()
+}
 
 // ============================================================================
 //  卸载"面板自己装的应用"
@@ -38,9 +65,10 @@ import (
 // 以及**哪些东西会保留**（例如模型缓存、近期的合成任务），
 // 而不是一句"确定卸载吗"。这也是这个项目一贯的要求：用户要知道自己按的是什么。
 type UninstallPlan struct {
-	// Kind: service（托管服务）/ installer（面板安装器）/ forget（只能取消纳管）
+	// Kind: service（托管服务）/ installer（面板安装器）/ brew（Homebrew 包）
+	// / forget（用户自己装的、面板只登记过 —— 只允许从列表移除）
 	Kind string `json:"kind"`
-	// Service 是面板服务记录名（Kind=service/forget 时有意义）
+	// Service 是面板服务记录名（Kind=service/forget/brew 且有条记录时有意义）
 	Service string `json:"service,omitempty"`
 	// Steps 是卸载会做的事（人类可读，逐条列出）
 	Steps []string `json:"steps"`
@@ -50,6 +78,19 @@ type UninstallPlan struct {
 	KeepNote string `json:"keep_note,omitempty"`
 	// Blocked 非空表示现在不能卸载（例如 Docker 运行时还托着别的应用）
 	Blocked string `json:"blocked,omitempty"`
+	// Formula 是 Kind=brew 时要卸载的 Homebrew formula。
+	//
+	// 必须用**判定时采用的那个写法**，不能拿目录里的 BrewFormula 再猜一次：
+	// 目录写 `php@8.4` 而机器上装的是 `php`（当年安装时它正是 8.4）这种情况，
+	// 卸载要跑的是 `brew uninstall php`（见 ResolveBrewFormula）。
+	Formula string `json:"formula,omitempty"`
+	// Dependents 是"这次卸载会影响谁"（结构化）：站点 / 容器 / 面板应用 / brew 包。
+	// 前端据此逐条列出"谁在用它、该怎么办"，而不是一句笼统的"不能卸载"。
+	// 见 dependents.go —— 那是唯一的依赖判定实现。
+	Dependents []Dependent `json:"dependents,omitempty"`
+	// DependentsChecked 表示上面那份名单**真的查过**。
+	// false = 没查成（brew 不可用/超时）→ 界面必须如实写"未检查"，绝不能说"没有依赖"。
+	DependentsChecked bool `json:"dependents_checked,omitempty"`
 }
 
 // PlanUninstall 给出某个目录应用当前该怎么卸载（只读，不产生任何改动）。
@@ -97,20 +138,119 @@ func composeImageNote(imgs []string) string {
 		strings.Join(imgs, " ")
 }
 
+// BrewState 是"这个条目在 Homebrew 里的真实状态"。
+//
+// 为什么要由调用方算好传进来：应用市场一次要给出十几个条目的计划，而每次
+// `brew list --versions` 都要 0.4~0.6 秒。web 层本来就有整批缓存
+// （见 Server.installedFormulas），计划函数自己再跑一遍 brew 会把列表拖慢数秒。
+type BrewState struct {
+	// Formula 是判定采用的实际 formula，可能与目录里的写法不同
+	// （目录写 php@8.4，机器上装的是 php —— 见 ResolveBrewFormula）。
+	Formula string
+	// Installed 表示 Formula 真的在 brew list 里。
+	Installed bool
+}
+
+// ResolveBrewFormula 决定"这个目录条目对应机器上哪个已装的 brew formula"。
+//
+// 先精确匹配；不中且目录写的是带版本后缀的 formula（php@8.4）时，再看
+// **同名的无后缀 formula**（php）装的是不是同一个版本。
+//
+// 为什么必须有这条规则（2026-09-21 用户现场）：这台机器上 `brew list` 是
+// `php 8.4.7`（用户当年 `brew install php`，那时 php 就是 8.4），而目录条目
+// php84 写的是 `php@8.4`。只做精确匹配，面板就会对一台明明装着 PHP 8.4 的
+// 机器显示"未安装"（用户原话："没安装的显示安装"），并且因为没有可卸载对象
+// 而**一颗收尾按钮都不给**。这是同一类问题的两个方向，必须一起修。
+//
+// installed 是 formula → 版本串（`brew list --versions` 的整批结果）。
+func ResolveBrewFormula(catalogFormula string, installed map[string]string) (formula, version string, ok bool) {
+	f := strings.TrimSpace(catalogFormula)
+	if f == "" {
+		return "", "", false
+	}
+	if v, hit := installed[f]; hit {
+		return f, v, true
+	}
+	at := strings.Index(f, "@")
+	if at <= 0 {
+		return "", "", false
+	}
+	base, want := f[:at], f[at+1:]
+	v, hit := installed[base]
+	if !hit || !versionTokenMatches(v, want) {
+		return "", "", false
+	}
+	return base, v, true
+}
+
+// versionTokenMatches 判断 brew 的版本串里是否含 want（"8.4" 匹配 "8.4.7"、"8.4.7_1"）。
+func versionTokenMatches(installedVersions, want string) bool {
+	if want == "" {
+		return false
+	}
+	for _, tok := range strings.Fields(installedVersions) {
+		if i := strings.Index(tok, "_"); i > 0 {
+			tok = tok[:i] // 8.4.7_1 → 8.4.7
+		}
+		if tok == want || strings.HasPrefix(tok, want+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// BrewStateFor 从整批 brew 版本结果里解析出某个条目的状态。
+func BrewStateFor(catalogFormula string, installed map[string]string) BrewState {
+	f, _, ok := ResolveBrewFormula(catalogFormula, installed)
+	if !ok {
+		return BrewState{}
+	}
+	return BrewState{Formula: f, Installed: true}
+}
+
 // PlanUninstallFor 与 PlanUninstall 相同，但用调用方已经查好的记录。
 //
-// 为什么要这个重载：应用市场一次要给出十几个应用的计划，每个都去查一遍
-// 数据库很浪费（而且列表里本来就有记录）。列表页用这个，单个应用用上面那个。
+// 计划里需要 brew 的真实状态（"装了 brew 包但没有面板记录"这一态必须给得出
+// 卸载入口），这里按需查一次；web 层的市场列表用 PlanUninstallForBrew 传入
+// 整批缓存，避免每个条目各跑一次 brew。
 func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) UninstallPlan {
+	return m.PlanUninstallForBrew(ctx, app, rec, m.resolveBrewState(ctx, app))
+}
+
+// resolveBrewState 查一次这台机器上这个条目的 brew 状态（单个应用用；
+// 市场列表请用 PlanUninstallForBrew + 整批缓存）。
+func (m *Manager) resolveBrewState(ctx context.Context, app App) BrewState {
+	if app.BrewFormula == "" {
+		return BrewState{}
+	}
+	installed := m.installedFormulaVersions(ctx)
+	return BrewStateFor(app.BrewFormula, installed)
+}
+
+// installedFormulaVersions 取整批 formula → 版本，测试可注入。
+func (m *Manager) installedFormulaVersions(ctx context.Context) map[string]string {
+	if m.brewInstalledProbe != nil {
+		return m.brewInstalledProbe(ctx)
+	}
+	return m.InstalledFormulaVersions(ctx)
+}
+
+// PlanUninstallForBrew 与 PlanUninstallFor 相同，但 brew 状态由调用方按整批缓存传入。
+//
+// 所有分支的产出都会过一遍依赖引擎（dependents.go）：说得出"谁在用它、该怎么办"，
+// 而不是一句笼统的"不能卸载"。
+func (m *Manager) PlanUninstallForBrew(ctx context.Context, app App, rec *Service, brew BrewState) UninstallPlan {
+	plan := m.planUninstallForBrewCore(ctx, app, rec, brew)
+	m.ApplyDependents(ctx, app, rec, &plan)
+	return plan
+}
+
+// planUninstallForBrewCore 是计划的本体（不含依赖检测，便于测试单独驱动）。
+func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Service, brew BrewState) UninstallPlan {
 	if rec != nil && rec.Managed && app.PanelInstaller == "" {
-		keep := "Homebrew 包**不会被卸载**（面板只删服务定义），需要的话请自行 brew uninstall"
-		steps := []string{
-			"停止并移除「" + rec.DisplayName + "」的服务定义",
-			"从「服务管理」中删除这条记录",
-		}
 		if app.Kind == KindCompose || app.Kind == KindDocker {
-			keep = "compose 应用只删容器与网络，**具名卷（数据）保留**"
-			steps = []string{
+			keep := "compose 应用只删容器与网络，**具名卷（数据）保留**"
+			steps := []string{
 				"docker compose down（删除容器与网络）",
 				"从「服务管理」中删除这条记录",
 			}
@@ -119,8 +259,31 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 			if note := composeImageNote(composeImagesForPlan(app)); note != "" {
 				keep = keep + "；" + note
 			}
+			return UninstallPlan{Kind: "service", Service: rec.Name, Steps: steps, KeepNote: keep}
 		}
-		return UninstallPlan{Kind: "service", Service: rec.Name, Steps: steps, KeepNote: keep}
+		// brew 原生托管服务：**软件本身也是 brew 装的**。只删服务定义的话，
+		// 用户点了「卸载」、界面说成功了，brew 包还原封不动 —— 这正是用户
+		// 反馈的"卸载不了"（2026-09-21：php82 的计划只有"停服务 + 删记录"）。
+		// 真实动作 = 停服务 + 删记录 + brew uninstall。
+		if brew.Installed {
+			p := m.brewUninstallPlan(ctx, app, brew)
+			p.Service = rec.Name
+			p.Steps = append([]string{
+				"停止并移除「" + rec.DisplayName + "」的服务定义",
+				"从「服务管理」中删除这条记录",
+			}, p.Steps...)
+			return p
+		}
+		// 记录在、brew 包却不在（用户手工 brew uninstall 过）：只剩"删记录"是诚实的。
+		return UninstallPlan{
+			Kind:    "service",
+			Service: rec.Name,
+			Steps: []string{
+				"停止并移除「" + rec.DisplayName + "」的服务定义",
+				"从「服务管理」中删除这条记录",
+			},
+			KeepNote: "Homebrew 里已经没有这个包了（可能已被手工卸载），所以没有 brew uninstall 这一步",
+		}
 	}
 	if app.PanelInstaller != "" {
 		p := m.installerPlan(ctx, app)
@@ -130,13 +293,47 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 		return p
 	}
 	if rec != nil {
-		// 纳管的第三方服务：只允许取消纳管
+		// 记录 managed=false，但**目录说得出它是什么**（有 brew formula 且真的装着）
+		// → 给真正的卸载。2026-09-21 用户明确要求：目录里的应用主动作只有一个
+		// 「🗑 卸载」并真的卸载；不要再并排摆一颗"只删记录"（原话："移除却不卸载
+		// 是什么意思 …… 让用户看不到却持续运行"）。
+		//
+		// 这条覆盖 mysql84 这类"用户早年自己 brew 装、后来在面板里登记过"的条目：
+		// 面板知道怎么卸载它（brew uninstall），就必须给得出这条路，
+		// 而不是把软件藏起来假装卸载了。
+		if app.PanelInstaller == "" && brew.Installed &&
+			app.Kind != KindCompose && app.Kind != KindDocker {
+			p := m.brewUninstallPlan(ctx, app, brew)
+			p.Service = rec.Name
+			p.Steps = append([]string{
+				"停止并移除「" + rec.DisplayName + "」的服务定义",
+				"从「服务管理」中删除这条记录",
+			}, p.Steps...)
+			return p
+		}
+		// 面板**不认识**这条服务（没有目录条目、也不知道怎么卸载它）：
+		// 唯一诚实的收尾动作是"停止它 + 从面板记录里移除"，并逐字说明
+		// 软件仍在磁盘上、需要用户自己卸载 —— 绝不留下一个还在运行、
+		// 面板里却看不到的服务（那正是用户最厌恶的"隐身运行"）。
+		label := rec.DisplayName
+		if label == "" {
+			label = rec.Name
+		}
+		steps := []string{}
+		keep := ""
+		if rec.LaunchLabel != "" {
+			steps = append(steps, "停止并删除 launchd 服务 "+rec.LaunchLabel)
+		} else {
+			steps = append(steps, "停止这个服务（如果它正在运行）")
+		}
+		steps = append(steps, "把「"+label+"」从面板记录里移除")
+		keep = "面板**不卸载**这个软件（它不在应用目录里，面板不知道该怎么卸）：" +
+			"移除后软件仍在磁盘上、需要你自己卸载；但它**不会继续在后台运行**。"
 		return UninstallPlan{
-			Kind:    "forget",
-			Service: rec.Name,
-			Steps:   []string{"把「" + rec.DisplayName + "」从面板记录里移除"},
-			KeepNote: "面板**不会**卸载你自己安装的软件（不跑 brew uninstall、不删文件）。" +
-				"要真正删除，请在终端里自行处理。",
+			Kind:     "forget",
+			Service:  rec.Name,
+			Steps:    steps,
+			KeepNote: keep,
 		}
 	}
 	// 残留的**原生 release 安装**：应用已经不在注册表里（例如 Lucky 改成 Docker 版之后
@@ -154,6 +351,30 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 	}
 	if d := m.legacyNativeDir(app); d != "" {
 		paths = append(paths, d)
+	}
+	// **brew 装了、但面板没有任何记录**（用户自己 brew install 的、或换机后记录丢了）。
+	//
+	// 2026-09-21 用户现场：nginx 就是这一态 —— 市场卡片诚实地显示"已安装"
+	// （brew formula 在、launchd 也在），而卸载计划是 kind:"none"，
+	// 于是「⚙️ 管理」面板里**一颗收尾按钮都没有**（用户原话"甚至没有卸载按钮"）。
+	// installed=true 却给不出任何可卸载对象，本身就是自相矛盾。
+	// 现在给真实的 brew 卸载路径（先确认、走任务中心、失败可见）。
+	if brew.Installed {
+		p := m.brewUninstallPlan(ctx, app, brew)
+		// 残留的 launchd 服务要先停：只删 brew 包不摘服务的话，KeepAlive 会
+		// 一直尝试拉起一个已经不存在的二进制。
+		if label := m.brewLabelFor(brew.Formula); label != "" {
+			p.Steps = append([]string{"停止并删除 launchd 服务 " + label}, p.Steps...)
+		}
+		if len(paths) > 0 {
+			p.DataPaths = paths
+			head := []string{}
+			for _, d := range paths {
+				head = append(head, "删除残留目录 "+d)
+			}
+			p.Steps = append(head, p.Steps...)
+		}
+		return p
 	}
 	if len(paths) > 0 {
 		steps := []string{"停止并删除这个应用残留的 launchd 服务（如果有）"}
@@ -173,11 +394,99 @@ func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) U
 			KeepNote:  keep,
 		}
 	}
+	// 只剩 launchd 里的服务定义（brew 包已经不在了、也没有残留目录）：
+	// 这类"僵尸服务"必须能停掉并摘掉，否则就会出现"installed=true（plist 在）
+	// 却 kind=none（没有任何可卸载对象）"的自相矛盾 —— 界面上一颗收尾按钮都没有。
+	// Colima 的僵尸 plist（坑 161）就是这一类。
+	if app.BrewFormula != "" {
+		if label := m.brewLabelFor(app.BrewFormula); label != "" {
+			return UninstallPlan{
+				Kind:     "installer",
+				Steps:    []string{"停止并删除残留的 launchd 服务 " + label},
+				KeepNote: "Homebrew 里已经没有这个包了；这一步只摘掉它残留的服务定义",
+			}
+		}
+	}
 	// 残留态（**没有服务记录**，但磁盘上还有这个应用的 compose 目录）：
 	// 卸载（保留数据）或手工删了容器之后就会落到这里。不给计划的话，
 	// 卡片会显示成"未安装"却**没有任何清理入口**，那份数据永远清不掉 ——
 	// 与 2026-09-16 用户反馈的"卸载后连安装入口都没有"是同一类问题。
-	return UninstallPlan{Kind: "none", Blocked: "没有找到可卸载的对象（可能是 brew 装的核心组件）"}
+	return UninstallPlan{Kind: "none", Blocked: "没有找到可卸载的对象（Homebrew 里没有这个包，面板里也没有记录与残留）"}
+}
+
+// brewUninstallPlan 给出"按 Homebrew 包卸载"的计划。
+//
+// steps 第一条固定是 `brew uninstall <formula>`（界面逐条展示的就是真实计划），
+// 并在用户按确认之前如实交代依赖关系：
+//   - 查到了别的已装包在用它 → 点名（brew uninstall 不会连带删依赖，那些包会缺依赖）；
+//   - 查了、没有 → 明说"已检查"；
+//   - 没查成 → 明说"**未检查**"，绝不假装没有依赖（铁律 11）。
+func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState) UninstallPlan {
+	formula := brew.Formula
+	if formula == "" {
+		formula = app.BrewFormula
+	}
+	p := UninstallPlan{Kind: "brew", Formula: formula}
+	p.Steps = append(p.Steps, "brew uninstall "+formula)
+	deps, checked := m.brewUsesInstalled(ctx, formula)
+	p.DependentsChecked = checked
+	for _, d := range deps {
+		p.Dependents = append(p.Dependents, Dependent{Kind: "brew", Name: d,
+			Detail: "Homebrew 包 " + d + " 依赖 " + formula,
+			Action: "如果还要用 " + d + "，请保留 " + formula})
+	}
+	switch {
+	case len(deps) > 0:
+		p.Steps = append(p.Steps,
+			"⚠️ 下列已安装的软件依赖 "+formula+"，卸载后它们会缺依赖："+strings.Join(deps, "、"))
+		// brew uninstall 自己也会因为依赖而拒绝，但用户有权在按确认之前就知道。
+		p.Blocked = "还有 Homebrew 包依赖 " + formula + "（" + strings.Join(deps, "、") +
+			"）：请先处理它们，或保留 " + formula
+	case checked:
+		p.Steps = append(p.Steps, "已检查：没有其它已安装的 Homebrew 包依赖 "+formula)
+	default:
+		p.Steps = append(p.Steps,
+			"未检查是否有别的软件依赖 "+formula+"（可自行执行：brew uses --installed "+formula+"）")
+	}
+	p.KeepNote = "brew uninstall 只删除 " + formula + " 本身：**不会**删除它依赖的包，" +
+		"也不会删除用户数据与配置目录"
+	return p
+}
+
+// brewUsesInstalled 查 `brew uses --installed <formula>`：还有哪些**已安装**的包在用它。
+//
+// 为什么带缓存：市场列表里每个 brew 原生条目都会调一次，brew 启动本身就要 0.4 秒；
+// 而依赖关系几乎不变。返回的 bool 表示**这次查询真的成功了**（false = 未检查，
+// 界面与计划必须如实这么说，不能把"没查成"显示成"没有依赖"）。
+func (m *Manager) brewUsesInstalled(ctx context.Context, formula string) ([]string, bool) {
+	if formula == "" {
+		return nil, false
+	}
+	if m.brewUsesProbe != nil {
+		return m.brewUsesProbe(ctx, formula)
+	}
+	brewUsesMu.Lock()
+	if ent, ok := brewUsesCache[formula]; ok && time.Since(ent.at) < brewUsesTTL {
+		brewUsesMu.Unlock()
+		return ent.deps, ent.ok
+	}
+	brewUsesMu.Unlock()
+
+	out, err := m.brewRun(ctx, time.Minute, "uses", "--installed", formula)
+	ok := err == nil
+	deps := []string{}
+	if ok {
+		for _, ln := range strings.Split(out, "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln != "" {
+				deps = append(deps, ln)
+			}
+		}
+	}
+	brewUsesMu.Lock()
+	brewUsesCache[formula] = brewUsesEntry{deps: deps, ok: ok, at: time.Now()}
+	brewUsesMu.Unlock()
+	return deps, ok
 }
 
 // UninstallApp 执行卸载。Kind=service/forget 由 web 层走各自的既有接口，
@@ -214,15 +523,18 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		}
 		// 残留的 launchd 服务也要停掉：只删目录不摘服务的话，
 		// launchd 会一直尝试重启一个已经不存在的二进制（KeepAlive）。
-		label := app.ServiceLabel
-		if label == "" {
-			label = "com.zizdog." + app.ID
-		}
-		if _, err := os.Stat(filepath.Join("/Library/LaunchDaemons", label+".plist")); err == nil {
+		//
+		// 标签候选要**多试几个**：目录里写死的 homebrew.mxcl.<f> 与磁盘上真实的
+		// cn.zizdog.<f> / sh.brew.<f> 常常不一致（坑："PHP 8.3 点纳管报找不到
+		// plist"）。只试一个的话，僵尸 plist 会被当成"没有可清理的残留"，
+		// 于是 installed=true（plist 在）却一颗收尾按钮都不给。
+		removedService := false
+		for _, pl := range m.residualServicePlists(app) {
 			if result != nil {
-				result.step(ctx, "停止并删除残留的 launchd 服务 "+label)
+				result.step(ctx, "停止并删除残留的 launchd 服务 "+pl.Label)
 			}
-			_ = m.removeService(ctx, label, filepath.Join("/Library/LaunchDaemons", label+".plist"))
+			_ = m.removeService(ctx, pl.Label, pl.Plist)
+			removedService = true
 		}
 		removed := 0
 		for _, d := range targets {
@@ -237,8 +549,8 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 			}
 			removed++
 		}
-		if removed == 0 {
-			return fmt.Errorf("「%s」没有可清理的残留（磁盘上找不到它的目录）", app.Name)
+		if removed == 0 && !removedService {
+			return fmt.Errorf("「%s」没有可清理的残留（磁盘上找不到它的目录与 launchd 服务）", app.Name)
 		}
 		// 目录删掉了，但镜像还在。**不自动删镜像**（怕误删被别的项目共用的层），
 		// 只把名字如实告诉用户 —— 下架条目（n8n）靠 legacyComposeImages 提供。
@@ -249,30 +561,8 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		}
 		return nil
 	}
-	switch app.PanelInstaller {
-	case "qwen3tts":
-		return m.uninstallQwen(ctx, removeData, result)
-	case "voicereceiver":
-		return m.uninstallReceiver(ctx, removeData, result)
-	case "iopaint":
-		return m.uninstallIOPaint(ctx, removeData, result)
-	case "phpmyadmin":
-		return m.UninstallPhpMyAdmin(ctx, removeData, result)
-	case "ffmpeg":
-		// 基础依赖也允许单独卸载，但由 UninstallBaseDependency 把后果写清楚
-		// （用户要求"明确提示即可，不要禁止"）。
-		return m.UninstallBaseDependency(ctx, app, result)
-	case "docker-runtime":
-		return m.uninstallDockerRuntime(ctx, removeData, result)
-	case "miniflux":
-		return m.uninstallMiniflux(ctx, removeData, result)
-	case "syncthing":
-		return m.uninstallSyncthing(ctx, removeData, result)
-	case "python":
-		// Python 解释器（应用市场里三个版本共用这一个安装器，见 python_runtime.go）。
-		// 卸载必须如实点名"谁还在用它"（面板自研服务的 venv 只是**指向**它，
-		// 卸掉解释器不会报依赖缺失，而是让那些服务直接起不来）。
-		return m.UninstallPythonRuntime(ctx, app, result)
+	if fn, ok := installerUninstalls[app.PanelInstaller]; ok {
+		return fn(m, ctx, app, removeData, result)
 	}
 	// "官方 release 原生二进制"类应用（Lucky / Orbien）：同一套安装器，
 	// 用注册表查而不是在这里再抄一遍 switch，免得加了新应用忘记补卸载。
@@ -280,6 +570,166 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		return m.UninstallReleaseBinary(ctx, app.PanelInstaller, removeData, result)
 	}
 	return fmt.Errorf("「%s」没有对应的卸载实现（PanelInstaller=%q）", app.Name, app.PanelInstaller)
+}
+
+// installerUninstalls 是"面板自研安装器 → 卸载实现"的**唯一注册表**。
+//
+// 为什么用注册表而不是 switch（2026-09-21，用户第三次报"装上了卸不掉"）：
+// 安装器清单与卸载实现分散在两处（installerPlan 的 switch、UninstallApp 的
+// switch），加一个新应用时漏补任何一处，用户看到的就是"有安装入口、
+// 卸载按钮报没有实现"或者"计划里没有卸载实现"。现在 UninstallApp 只查这张表，
+// 全目录门禁测试（TestCatalogUninstallActionMatrix）也查它 ——
+// 有安装器却没有卸载实现，**测试阶段就会失败**，不会等到用户点下去。
+var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app App, removeData bool, result *InstallResult) error{
+	"qwen3tts": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallQwen(ctx, removeData, r)
+	},
+	"voicereceiver": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallReceiver(ctx, removeData, r)
+	},
+	"iopaint": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallIOPaint(ctx, removeData, r)
+	},
+	"phpmyadmin": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.UninstallPhpMyAdmin(ctx, removeData, r)
+	},
+	// 基础依赖也允许单独卸载，但由 UninstallBaseDependency 把后果写清楚
+	// （用户要求"明确提示即可，不要禁止"）。
+	"ffmpeg": func(m *Manager, ctx context.Context, app App, _ bool, r *InstallResult) error {
+		return m.UninstallBaseDependency(ctx, app, r)
+	},
+	"docker-runtime": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallDockerRuntime(ctx, removeData, r)
+	},
+	"miniflux": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallMiniflux(ctx, removeData, r)
+	},
+	"syncthing": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+		return m.uninstallSyncthing(ctx, removeData, r)
+	},
+	// Python 解释器（应用市场里三个版本共用这一个安装器，见 python_runtime.go）。
+	// 卸载必须如实点名"谁还在用它"（面板自研服务的 venv 只是**指向**它，
+	// 卸掉解释器不会报依赖缺失，而是让那些服务直接起不来）。
+	"python": func(m *Manager, ctx context.Context, app App, _ bool, r *InstallResult) error {
+		return m.UninstallPythonRuntime(ctx, app, r)
+	},
+}
+
+// HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
+// 导出给门禁测试用：有安装器却没有卸载实现 = 装上就卸不掉。
+func HasInstallerUninstall(panelInstaller string) bool {
+	if panelInstaller == "" {
+		return false
+	}
+	if _, ok := installerUninstalls[panelInstaller]; ok {
+		return true
+	}
+	_, ok := releaseBinaryApps[panelInstaller]
+	return ok
+}
+
+// StopAndForget 停掉一个服务并删除它的面板记录，返回"是否真的停过它"。
+//
+// 为什么"只删记录"必须先停服务（2026-09-21 用户明确要求）：只删记录会让一个
+// 仍在运行的服务彻底消失在面板里 —— 用户看不到它，它却继续占着端口跑业务，
+// 这正是用户最厌恶的"移除却不卸载"。所以：
+//   - 停成功               → 删记录；
+//   - 停失败但**确实不在跑** → 也删记录（运行时已经被删掉的卡死场景，
+//     没有"隐身运行"的风险，这条通路本来就是为它准备的）；
+//   - 停失败且仍在跑        → **拒绝删记录**并如实报错，让用户先停掉。
+func (m *Manager) StopAndForget(ctx context.Context, name string) (bool, error) {
+	if _, err := m.Action(ctx, name, "stop"); err != nil {
+		if errors.Is(err, ErrServiceNotFound) {
+			return false, err
+		}
+		drv, _, derr := m.driver(ctx, name)
+		if derr != nil {
+			if errors.Is(derr, ErrServiceNotFound) {
+				return false, derr
+			}
+			// 连驱动都构造不出来（运行时被删掉、plist/compose 文件都不在了）：
+			// 这个服务**不可能在运行** —— 没有可运行的东西。这正是 2026-09-17
+			// 那种"记录永远删不掉"的卡死场景，允许只删记录。
+			if err := m.repo.Delete(ctx, name); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		if st, serr := drv.Status(ctx); serr == nil && st.Running {
+			return false, fmt.Errorf("「%s」停止失败（%v）；它现在仍在运行，"+
+				"面板不会把它从列表里移除 —— 否则它会变成你看不到的常驻服务。"+
+				"请先把它停掉再移除", name, err)
+		}
+		if err := m.repo.Delete(ctx, name); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err := m.repo.Delete(ctx, name); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// UninstallBrewApp 执行 Kind=brew 的卸载：停服务 + （可选）删残留 + brew uninstall。
+//
+// 这是"brew 装了但没有面板记录"/"结论是 brew 原生托管服务"两条矩阵行共用的执行体。
+// formula 只认计划里那个（PlanUninstallForBrew 判定采用的真实写法），
+// 绝不在这里拿目录里的 BrewFormula 再猜一次 —— 猜错就是删错包。
+func (m *Manager) UninstallBrewApp(ctx context.Context, app App, plan UninstallPlan, removeData bool, result *InstallResult) error {
+	formula := plan.Formula
+	if formula == "" {
+		return fmt.Errorf("「%s」的卸载计划里没有 Homebrew formula，无法卸载", app.Name)
+	}
+	// ① 面板记录：停服务 + 删记录（managed=false 的登记记录也走这条 ——
+	// 它同样是"面板里的这条记录"，而 Manager.Uninstall 只收 managed 记录）。
+	if plan.Service != "" {
+		if result != nil {
+			result.step(ctx, "停止「"+plan.Service+"」并删除这条面板记录")
+		}
+		if _, err := m.StopAndForget(ctx, plan.Service); err != nil && !errors.Is(err, ErrServiceNotFound) {
+			return err
+		}
+	}
+	// ② 没有记录、但 launchd 里还有这个应用的服务：先摘掉。
+	// 只删 brew 包不摘服务的话，KeepAlive 会一直尝试拉起一个不存在的二进制。
+	if plan.Service == "" {
+		if label := m.brewLabelFor(formula); label != "" {
+			if result != nil {
+				result.step(ctx, "停止并删除 launchd 服务 "+label)
+			}
+			if err := m.stopLaunchdService(ctx, label, SystemDaemonPlistPath(label)); err != nil {
+				return err
+			}
+		}
+	}
+	// ③ 残留产物：只有用户勾了「同时删除数据/产物」才删（默认保留）。
+	if removeData {
+		for _, p := range plan.DataPaths {
+			if err := m.removeTree(ctx, p, result); err != nil {
+				return err
+			}
+		}
+	} else if len(plan.DataPaths) > 0 && result != nil {
+		result.step(ctx, "保留残留目录（需要彻底清理请勾选「同时删除数据/产物」）")
+	}
+	// ④ brew uninstall（真实执行，失败如实报；命令标签从参数派生）。
+	if !m.brewHas(ctx, formula) {
+		if result != nil {
+			result.step(ctx, formula+" 已经不在 Homebrew 里（可能刚被卸载过），跳过 brew uninstall")
+		}
+		return nil
+	}
+	if result != nil {
+		result.step(ctx, "brew uninstall "+formula)
+	}
+	if _, err := m.brewRun(ctx, 10*time.Minute, "uninstall", formula); err != nil {
+		return fmt.Errorf("brew uninstall %s 失败: %w", formula, err)
+	}
+	if result != nil {
+		result.step(ctx, formula+" 已从 Homebrew 卸载")
+	}
+	return nil
 }
 
 // installerPlan 按安装器给出卸载计划。
@@ -576,6 +1026,54 @@ func ComposeArtifactExists(workDir, appID string) bool {
 		return false
 	}
 	return dirExists(filepath.Join(workDir, "compose", appID))
+}
+
+// residualServicePlist 是一对"launchd 标签 + 真实 plist 路径"。
+type residualServicePlist struct {
+	Label string
+	Plist string
+}
+
+// residualServicePlists 找出这个应用**磁盘上真实存在**的 launchd 服务定义。
+//
+// 为什么要多候选标签（而不是用目录里写死的那一个）：磁盘上的真实标签常常是
+// cn.zizdog.<f> / sh.brew.<f>，而目录里写的是 homebrew.mxcl.<f>（坑："PHP 8.3
+// 点纳管报找不到 plist"）。只试一个的话，僵尸 plist 会被当成"没有可清理的残留"，
+// 于是 installed=true（plist 在）却没有任何收尾动作。
+//
+// 目录集合走 m.launchdDirsOverride（测试隔离）：单测不许读真机 launchd 状态。
+func (m *Manager) residualServicePlists(app App) []residualServicePlist {
+	cands := []string{}
+	for _, l := range []string{app.ServiceLabel, app.AdoptLabel, "com.zizdog." + app.ID, m.brewLabelFor(app.BrewFormula)} {
+		if l == "" {
+			continue
+		}
+		dup := false
+		for _, c := range cands {
+			if c == l {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			cands = append(cands, l)
+		}
+	}
+	dirs := []string{"/Library/LaunchDaemons"}
+	if len(m.launchdDirsOverride) > 0 {
+		dirs = m.launchdDirsOverride
+	}
+	out := []residualServicePlist{}
+	for _, l := range cands {
+		for _, d := range dirs {
+			p := filepath.Join(d, l+".plist")
+			if fileExists(p) {
+				out = append(out, residualServicePlist{Label: l, Plist: p})
+				break
+			}
+		}
+	}
+	return out
 }
 
 // legacyNativeDir 返回"这个应用在用户家目录下**残留的**原生安装目录"。

@@ -977,29 +977,29 @@ export async function openServicePanel(o = {}) {
     // 不是靠让用户理解"纳管"）。
     if (s) {
       const rt = runtimeDownOf(s);
-      if (s.managed) {
-        out.push(uninstallButton(s, afterAction));
-        out.push(forgetButton(s, afterAction, { recordOnly: true, runtimeDown: rt.down, reason: rt.reason }));
-      } else if (mi && (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service')) {
-        // 记录是 managed=false（内部叫"纳管记录"），但**目录**说这个应用是面板自己装的
-        // （uninstall.kind = installer/service）→ 以目录为准，给真正的「卸载」。
+      const pk = (mi && mi.uninstall && mi.uninstall.kind) || '';
+      if (pk === 'brew' || pk === 'installer' || pk === 'service') {
+        // 计划说得清"怎么真卸载" → 收尾只有这一颗主动作。
         //
-        // 为什么必须以目录为准（2026-09-17 真机复验）：PanelInstaller 类应用
-        // （Miniflux / Qwen3 TTS / IOPaint / phpMyAdmin / Alist / frpc / ddns-go…）
-        // 登记时走的是 RegisterInstalledService，记录同样是 managed=false。合并页面
-        // 之前，市场卡片上还有一颗基于**目录卸载计划**的「卸载」，所以还能卸；合并后
-        // 卸载统一收进这个面板，只看记录就会只剩「从列表移除」——
-        // 于是面板装的应用**在界面上永远卸不掉**（点了"从列表移除"东西还在）。
-        // 两个都留着：它们语义不同（卸载 = 删应用；从列表移除 = 只删面板记录）。
+        // 2026-09-21 用户明确要求：不要再并排摆一颗"只删记录"（原话："移除却不
+        // 卸载是什么意思 …… 让用户看不到却持续运行"）。目录里的应用
+        // （brew 原生 / 面板安装器 / compose）都走这里，点下去是真卸载。
         out.push(marketUninstallButton(mi, afterAction, s));
-        out.push(forgetButton(s, afterAction));
+      } else if (s.managed) {
+        // 面板托管的服务，但目录里没有它的卸载计划（下架条目等）：
+        // 仍然走通用卸载（停服务 + 删记录），不摆"只删记录"。
+        out.push(uninstallButton(s, afterAction));
       } else {
-        out.push(forgetButton(s, afterAction));
+        // 面板**不认识**这条服务（没有目录条目、也不知道怎么卸载它）：
+        // 唯一诚实的收尾是"停掉 + 从记录移除"，并逐字说明软件仍在磁盘上。
+        // 见 forgetButton：它现在会先停服务，绝不留下"隐身运行"。
+        out.push(forgetButton(s, afterAction, { runtimeDown: rt.down, reason: rt.reason }));
       }
     } else if (mi) {
       if (mi.uninstall?.kind === 'forget') {
         out.push(forgetButton(mi, afterAction));
-      } else if (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service') {
+      } else if (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service'
+        || mi.uninstall?.kind === 'brew') {
         out.push(marketUninstallButton(mi, afterAction));
       }
     }
@@ -1165,97 +1165,86 @@ function runtimeDownOf(s) {
 // 不再说"已删除面板记录"这种内部说法（2026-09-21）。
 async function forgetRecord(name, label, opts = {}) {
   try {
-    await api.serviceForget(name);
-    toast(opts.runtimeDown
-      ? '已从列表移除（未停止容器：' + (opts.reason || '运行时不可用') + '）'
-      : '已从列表移除（未停止、未删除任何容器或文件）', 'ok', 12000);
+    const res = await api.serviceForget(name);
+    const stopped = !!(res && res.stopped);
+    toast(stopped
+      ? '已停止这个服务并从面板移除。软件仍在磁盘上，需要你自己卸载。'
+      : '已从面板移除（它当时不在运行，没有留下后台进程）。软件仍在磁盘上，需要你自己卸载。',
+    'ok', 14000);
     if (typeof opts.onDone === 'function') opts.onDone();
     return true;
   } catch (e) {
     const status = e && e.status;
     if (status === 404 || status === 405) {
-      toast('该版本面板不支持"从列表移除"（' + ((e && e.message) || status) + '），请升级面板后再试', 'err', 15000);
+      toast('该版本面板不支持"从面板移除"（' + ((e && e.message) || status) + '），请升级面板后再试', 'err', 15000);
     } else {
-      toast('从列表移除失败：' + ((e && e.message) || e), 'err', 12000);
+      // 409 = 停不掉且仍在运行：面板**拒绝**移除，否则就成了"隐身运行"。
+      toast('没有从面板移除：' + ((e && e.message) || e), 'err', 15000);
     }
     return false;
   }
 }
 
 // recordOnlyModal 是"卸载失败"时的兜底对话框：把原因说清，并给一个**可直接点**的
-// 「从列表移除」出口。卸载失败不能只丢一句 toast 就完了（用户没有下一步）。
+// 「从面板移除该服务」出口。卸载失败不能只丢一句 toast 就完了（用户没有下一步）。
+//
+// 注意（2026-09-21）：这条出口现在也会**先停服务**（DELETE /services/{name} 的
+// 语义已改），停不掉且仍在运行时会拒绝移除 —— 绝不再制造"用户看不到却还在跑"。
 function recordOnlyModal(opts) {
   const { label, name, error, runtimeDown, reason, onDone } = opts;
   const bodyLines = [
     h('div', { style: { marginBottom: '8px' }, text: '卸载「' + label + '」没有成功：' + error }),
   ];
   if (runtimeDown) {
-    bodyLines.push(h('div', { text: '容器没法停（运行时不存在），可以把这条记录从列表里移除 —— 容器与磁盘数据不会被动。' }));
-    bodyLines.push(h('div.hint', { text: '未停止容器：' + (reason || '运行时不可用') + '。这一步只去掉面板里的记录，不碰磁盘上的项目文件/数据卷。' }));
+    bodyLines.push(h('div', { text: '它的运行时不可用（' + (reason || '运行时不可用') + '），所以卸载做不到。' }));
+    bodyLines.push(h('div.hint', { text: '这一步只把这条记录从面板移除；容器与磁盘数据不会被删（运行时不可用时也没有容器在跑）。' }));
   } else {
-    bodyLines.push(h('div', { text: '可以把这条记录从列表里移除，软件本身不受影响。' }));
-    bodyLines.push(h('div.hint', { text: '注意：从列表移除不会停止或删除任何容器/文件 —— 如果容器还在运行，它会保持原样（容器可能还在）。' }));
+    bodyLines.push(h('div', { text: '可以把这条服务从面板移除 —— 面板不认识它、也不知道该怎么卸载它。' }));
+    bodyLines.push(h('div.hint', { text: '面板会先停止这个服务，然后只删掉记录；软件仍留在磁盘上，需要你自己卸载。' }));
   }
   modal({
-    title: '从列表移除 · ' + label,
+    title: '从面板移除 · ' + label,
     body: h('div', bodyLines),
     footer: (close) => [
       h('button.btn', { text: '关闭', onclick: close }),
       h('button.btn.btn-primary', {
-        text: runtimeDown ? '从列表移除（不停止容器）' : '从列表移除（不卸载软件）',
+        text: '从面板移除该服务',
         onclick: async () => { close(); await forgetRecord(name, label, { runtimeDown, reason, onDone }); },
       }),
     ],
   });
 }
 
-// forgetButton 「从列表移除」：只删面板记录，不动系统上的任何东西。
+// forgetButton 「从面板移除该服务」：面板不认识这条服务时的唯一收尾动作。
 //
-// 用户 2026-09-21："用户不需要知道什么是纳管，不需要知道系统里运行的软件是怎么被
-// 面板控制的，只要知道自己可以在应用里执行安装、卸载、重装这些动作就可以了。"
-// 所以这颗按钮曾经叫「取消纳管 / 仅删除面板记录」，现在统一叫
-// 「从列表移除（不卸载软件）」——**说的是用户能观察到的后果**，不要求他理解
-// 记录、托管、纳管这些内部概念。
-//
-// 为什么文案必须带那个括号（这不是啰嗦，是安全边界的一部分）：
-// 后端的语义是"managed=false 的记录绝不卸载软件"（删掉用户自己的 MySQL 等于删掉
-// 他的数据）。如果这颗按钮只写「移除」，用户会以为"移除 = 卸载"，
-// 点了发现软件还在，就会以为面板坏了/在骗人；反过来，如果为了"说得像卸载"而真的
-// 去卸载，就会删掉用户自己装的软件。括号里的四个字 + 确认框里逐字说明，
-// 既保住了后端的安全边界，又让用户知道**软件本身完全不受影响**。
-//
-// opts.recordOnly=true 时用于**面板管理**的记录（managed=true）—— 这是"任何服务
-// 记录都有一个只删记录出口"的保证（2026-09 真机缺陷：用户删掉 Colima/Docker 后
-// 一条 compose 记录只剩「卸载」，卸载必然失败 → 记录永远删不掉）；
-// opts.runtimeDown=true 时（compose 运行时不可用）括号里改成「不停止容器」，
-// 并如实说明没有停止任何容器。
+// 2026-09-21 用户明确要求（原话："移除却不卸载是什么意思 …… 让用户看不到却持续
+// 运行"）：
+//   · 目录里的应用（brew 原生 / 面板安装器 / compose）**不再**出现这颗按钮 ——
+//     它们只有「🗑 卸载」，而且是真的卸载；
+//   · 只有"面板不认识、也不知道怎么卸载"的服务才允许只删记录；
+//   · 只删记录也**必须先停服务**（后端 DELETE /api/v1/services/{name} 已改成
+//     先停再删，停不掉且仍在运行会 409 拒绝），绝不留下一个还在运行、
+//     面板里却看不到的服务；
+//   · 文案逐字说明"软件仍在磁盘上，需要你自己卸载"。
 export function forgetButton(m, onDone, opts = {}) {
   const name = serviceNameOf(m);
   const label = m.display_name || m.name || name;
-  const recordOnly = !!opts.recordOnly;
   const runtimeDown = !!opts.runtimeDown;
   const reason = opts.reason || '运行时不可用';
-  const text = recordOnly && runtimeDown
-    ? '从列表移除（不停止容器）'
-    : '从列表移除（不卸载软件）';
   return h('button.btn.btn-sm', {
-    text,
-    title: recordOnly && runtimeDown
-      ? '只把这条记录从面板移除；运行时不可用，所以不会停止、也不会删除任何容器或文件'
-      : '只把这条记录从面板移除，不会卸载软件本身（不跑 brew uninstall、不删文件），系统上的服务完全不受影响',
+    text: '从面板移除该服务',
+    title: runtimeDown
+      ? '这个服务面板不认识、也不知道怎么卸载。会把这条记录从面板移除（软件仍在磁盘上，需要你自己卸载）'
+      : '这个服务面板不认识、也不知道怎么卸载。会先停止它，再把记录从面板移除（软件仍在磁盘上，需要你自己卸载）',
     onclick: async () => {
-      const msg = (recordOnly && runtimeDown)
-        ? ('把「' + label + '」从列表移除？\n\n'
-          + '运行时不可用（' + reason + '），所以**没有**停止任何容器，也不会删除磁盘上的项目文件与数据卷。\n'
-          + '只把这条记录从面板移除 —— 未停止容器。')
-        : ('把「' + label + '」从列表移除？\n\n'
-          + '不会卸载软件本身：面板不跑 brew uninstall、不删任何文件，'
-          + '软件在系统里的运行与配置完全不受影响，只是不再显示在面板里。\n'
-          + (recordOnly
-            ? '面板也不会停止或删除任何容器/文件（如果它们还在运行，会保持原样）。'
-            : '想再加回来，可以用「已安装」工具栏的「+ 注册服务」。'));
+      const msg = '把「' + label + '」从面板移除？\n\n'
+        + (runtimeDown
+          ? '运行时不可用（' + reason + '），现在没有容器在跑。\n'
+          : '面板会**先停止**这个服务（不会留下还在后台运行的隐身服务），\n')
+        + '然后只删掉面板里的这条记录 —— 软件本身仍在磁盘上、需要你自己卸载。\n'
+        + (runtimeDown ? '' : '想再加回来，可以用「已安装」工具栏的「+ 注册服务」。');
       if (!await confirmBox(msg, {
-        title: '从列表移除',
+        title: '从面板移除该服务',
         okText: '确认移除',
       })) return;
       await forgetRecord(name, label, { runtimeDown, reason, onDone });
@@ -1319,10 +1308,123 @@ export function uninstallButton(s, onDone) {
   });
 }
 
-// marketUninstallButton 从市场卸载（面板自研安装器 / compose 应用走这里）。
+// confirmUninstallPlan 弹出"这次卸载会做什么"的确认框。
+// 返回 Promise<{wipe:boolean}|null>：null = 取消/关掉（什么都没做），
+// 否则 wipe 表示用户有没有勾"同时删除数据/产物"。
+//
+// ⚠️ 这个函数是从一个真机事故里长出来的（2026-09-21 用户原话："frpc 点击卸载
+// 没有任何反应，没有进度，没有提示，什么都没有"）。根因不是后端：原来这两处
+// （apps.js 的残留清理、本文件的 marketUninstallButton）各写了一份一模一样的
+// 确认框，确认按钮都是：
+//
+//     onclick: () => { close(); resolve(true); }
+//     ...
+//     onClose: () => resolve(false)
+//
+// 而 modal 的 close() 会**同步**调用 onClose —— 于是 resolve(false) 先执行，
+// Promise 被定死为 false，`if (!okGo) return;` 直接返回：对话框关掉了，
+// 却什么都没发生（没有请求、没有进度、没有错误提示）。这正是用户报的形态。
+//
+// 现在只有这一份实现，并且用 done 闸门保证"谁先定稿谁算数"（与 ui.confirmBox
+// 同一套做法）。卸载确认只有一处，不会再出现第二份写错的拷贝。
+export function confirmUninstallPlan({ name, plan = {}, residual = false }) {
+  return new Promise((resolve) => {
+    let done = false;
+    // 勾选框放在**这一份**实现里，并由 finish 把结果带回调用方 ——
+    // 调用方不再自己渲染第二个确认框（那正是原来出错的形态）。
+    const remove = h('input', { type: 'checkbox' });
+    const m = modal({
+      title: (residual ? '删除残留数据 · ' : '卸载 ') + name,
+      body: h('div', [
+        residual
+          ? h('div', {
+            style: { marginBottom: '8px' },
+            text: '这个应用当前没有安装，这一步只删除磁盘上的残留产物/数据，不可恢复。',
+          })
+          : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
+        residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } },
+          (plan.steps || []).map((x) => h('li', { text: x }))),
+        (!residual && plan.keep_note) ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
+        (!residual && (plan.data_paths || []).length)
+          ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } },
+            [remove, h('span', { text: '同时删除数据/产物（不可恢复）：' })])
+          : null,
+        (plan.data_paths || []).length
+          ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
+            (plan.data_paths || []).map((x) => h('li.mono', { text: x })))
+          : null,
+      ]),
+      footer: [
+        h('button.btn', { text: '取消', onclick: () => finish(null) }),
+        h('button.btn.btn-danger', {
+          text: residual ? '删除残留数据' : '确认卸载',
+          onclick: () => finish({ wipe: residual ? true : !!remove.checked }),
+        }),
+      ],
+      onClose: () => finish(null),
+    });
+    // finish 在 m 赋值之后才会被调用（按钮/关闭都发生在用户交互时），
+    // 所以这里引用 m 是安全的；done 闸门保证 close() 触发的 onClose 不会
+    // 覆盖用户真正点下的那个结果。
+    function finish(v) {
+      if (done) return;
+      done = true;
+      m.close();
+      resolve(v);
+    }
+  });
+}
+
+// dependentsModal 是"还有东西在用它"的说明对话框。
+//
+// 用户 2026-09-21 明确要求：卸载有依赖时**不要只弹一句 toast**，要逐条列出
+// "谁在用它、该怎么办"，并给一个能直接去处理的入口：
+//   · 站点正在用这个 PHP 版本      → 去「网站管理」切版本
+//   · 有应用/容器在用（TTS、容器） → 去「应用」卸载/停止
+//   · 面板自身的依赖               → 说明后果
+function dependentsModal({ name, plan, onDone }) {
+  const deps = plan.dependents || [];
+  const KIND_LABEL = { site: '站点', container: '运行中的容器', app: '应用', panel: '面板自身', brew: 'Homebrew 包' };
+  const rows = deps.map((d) => h('div', {
+    style: { marginBottom: '10px', paddingBottom: '8px', borderBottom: '1px solid var(--border-soft)' },
+  }, [
+    h('div', { style: { fontWeight: '620' }, text: (KIND_LABEL[d.kind] || d.kind || '对象') + '：' + (d.name || '') }),
+    d.detail ? h('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '2px' }, text: d.detail }) : null,
+    d.action ? h('div', { style: { fontSize: '12.5px', marginTop: '4px' }, text: '→ ' + d.action }) : null,
+  ]));
+  const wantsSites = deps.some((d) => d.kind === 'site');
+  const wantsApps = deps.some((d) => d.kind === 'app' || d.kind === 'container');
+  let handle = null;
+  handle = modal({
+    title: '还不能卸载 ' + name,
+    wide: true,
+    body: h('div', [
+      h('div', {
+        style: { marginBottom: '10px', padding: '9px 11px', background: 'var(--warn-soft)',
+          borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+        text: plan.blocked || '还有对象在使用它，需要先处理。',
+      }),
+      ...rows,
+    ]),
+    footer: (close) => [
+      wantsSites ? h('button.btn.btn-sm', {
+        text: '去「网站管理」处理', title: '切 PHP 版本 / 停用站点',
+        onclick: () => { close(); if (typeof onDone === 'function') onDone(); location.hash = '#/sites'; },
+      }) : null,
+      wantsApps ? h('button.btn.btn-sm', {
+        text: '去「应用」处理', title: '卸载或停止依赖它的应用/容器',
+        onclick: () => { close(); if (typeof onDone === 'function') onDone(); location.hash = '#/services'; },
+      }) : null,
+      h('button.btn.btn-primary', { text: '知道了', onclick: close }),
+    ].filter(Boolean),
+  });
+  return handle;
+}
+
+// marketUninstallButton 从市场卸载（brew 原生 / 面板自研安装器 / compose 应用走这里）。
 // 确认框逐条列出会做什么、以及可选的"同时删除数据"路径 —— 卸载不可逆。
 //
-// svc 是可选的**服务记录**：卸载失败时用它做"只删除记录"的兜底出口
+// svc 是可选的**服务记录**：卸载失败时用它做"从面板移除记录"的兜底出口
 // （记录名/展示名以记录为准；没有记录时没有可删的记录，就只如实报错）。
 export function marketUninstallButton(mi, onDone, svc = null) {
   const plan = mi.uninstall || {};
@@ -1343,45 +1445,18 @@ export function marketUninstallButton(mi, onDone, svc = null) {
     onclick: async () => {
       try {
         if (blocked) {
+          // 有结构化依赖 → 弹说明对话框（逐条列出"谁在用它、该怎么办"）；
+          // 只有一句 Blocked 文案时才退回 toast。
+          if ((plan.dependents || []).length) {
+            dependentsModal({ name: mi.name, plan, onDone });
+            return;
+          }
           toast('现在不能卸载「' + mi.name + '」：' + plan.blocked, 'warn', 14000);
           return;
         }
-        const remove = h('input', { type: 'checkbox' });
-        const paths = plan.data_paths || [];
-        const okGo = await new Promise((resolve) => {
-          modal({
-            title: (residual ? '删除残留数据 · ' : '卸载 ') + mi.name,
-            body: h('div', [
-              residual
-                ? h('div', {
-                  style: { marginBottom: '8px' },
-                  text: '这个应用当前没有安装，这一步只删除磁盘上的残留产物/数据，不可恢复。',
-                })
-                : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
-              residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } },
-                (plan.steps || []).map((x) => h('li', { text: x }))),
-              (!residual && plan.keep_note) ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
-              (!residual && paths.length)
-                ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } },
-                  [remove, h('span', { text: '同时删除数据/产物（不可恢复）：' })])
-                : null,
-              paths.length
-                ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
-                  paths.map((x) => h('li.mono', { text: x })))
-                : null,
-            ]),
-            footer: (close) => [
-              h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
-              h('button.btn.btn-danger', {
-                text: residual ? '删除残留数据' : '确认卸载',
-                onclick: () => { close(); resolve(true); },
-              }),
-            ],
-            onClose: () => resolve(false),
-          });
-        });
-        if (!okGo) return;
-        const wipe = residual ? true : remove.checked;
+        const answer = await confirmUninstallPlan({ name: mi.name, plan, residual });
+        if (!answer) return; // 取消 / 直接关掉确认框：什么都不做（也不静默——本来就没提交）
+        const wipe = answer.wipe;
         await taskCenter.start({
           kind: 'uninstall', target: mi.id,
           title: (residual ? '删除残留数据 ' : '卸载 ') + mi.name,
@@ -1390,8 +1465,8 @@ export function marketUninstallButton(mi, onDone, svc = null) {
             if (task && task.status && task.status !== 'succeeded') {
               const err = task.error || task.status;
               toast((residual ? '删除残留数据失败：' : '卸载失败：') + err, 'err', 12000);
-              // 卸载失败时给出"只删记录"的下一步（compose 运行时不在时尤其关键）。
-              // 只有确实存在服务记录时才提供 —— 没有记录就没有可删的东西。
+              // 卸载失败时给出下一步。只有确实存在服务记录时才提供 ——
+              // 没有记录就没有可删的东西。
               if (svc && svc.name) {
                 const rt = runtimeDownOf(svc);
                 recordOnlyModal({

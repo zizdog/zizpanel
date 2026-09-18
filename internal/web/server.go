@@ -56,10 +56,15 @@ type Server struct {
 	mktMu         sync.Mutex
 	mktRefreshing atomic.Bool // 防止市场缓存刷新叠加
 	mktBrew       map[string]bool
-	mktBrewAt     time.Time
-	mktDocker     string
-	mktDockerV    string
-	mktDockerAt   time.Time
+	// mktBrewVer 与 mktBrew 同一次 `brew list --versions` 的**版本**投影
+	// （formula → 版本串）。卸载计划要把目录里的 `php@8.4` 对到机器上真实装的
+	// `php 8.4.7`（见 services.ResolveBrewFormula）—— 没有版本就只能精确匹配，
+	// 于是"装着 PHP 8.4 的机器"在市场里显示成未安装、连卸载入口都没有。
+	mktBrewVer  map[string]string
+	mktBrewAt   time.Time
+	mktDocker   string
+	mktDockerV  string
+	mktDockerAt time.Time
 
 	// ---- Docker 加速源「上次检测」的内存缓存（带时间戳）----
 	//

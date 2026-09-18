@@ -322,7 +322,7 @@ func (m *Manager) ApplyColimaWorkDirMount(ctx context.Context) error {
 	}
 	updated, changed := upsertColimaMounts(string(orig), []string{loc}, m.opt.UserHome)
 	if changed {
-		if err := os.WriteFile(cfg, []byte(updated), 0o644); err != nil {
+		if err := m.writeColimaConfig(cfg, []byte(updated)); err != nil {
 			return fmt.Errorf("写入 %s 失败：%w", cfg, err)
 		}
 		emit(ctx, tasks.LevelStep, "已把 compose 数据目录写进 Colima 挂载配置："+loc+"（"+cfg+"）")
@@ -351,7 +351,7 @@ func (m *Manager) ApplyColimaWorkDirMount(ctx context.Context) error {
 		if err != nil {
 			// 救不出来就**不动挂载**，否则旧数据会被挂载点盖住、在面板里凭空消失。
 			if changed {
-				_ = os.WriteFile(cfg, orig, 0o644)
+				_ = m.writeColimaConfig(cfg, orig)
 			}
 			return fmt.Errorf("%w；为避免把已有数据盖住，本次**未**改挂载配置，请先把数据导出后再重试", err)
 		}

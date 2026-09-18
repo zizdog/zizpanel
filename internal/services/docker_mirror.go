@@ -485,7 +485,7 @@ func (m *Manager) SetDockerMirrors(ctx context.Context, mirrors []string) error 
 	if len(insecure) > 0 {
 		updated = setColimaDockerOption(updated, "insecure-registries", insecure)
 	}
-	if err := os.WriteFile(cfgPath, []byte(updated), 0o644); err != nil {
+	if err := m.writeColimaConfig(cfgPath, []byte(updated)); err != nil {
 		return fmt.Errorf("写入 %s 失败：%w", cfgPath, err)
 	}
 	if len(clean) == 0 {

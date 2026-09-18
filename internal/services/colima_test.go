@@ -533,3 +533,66 @@ func TestDockerRuntimeVersionViaSocketRealDial(t *testing.T) {
 		t.Errorf("不存在的路径必须返回空（未知），实际 %q", v)
 	}
 }
+
+// TestEnsureColimaOwnershipRepairsRootOwnedTree 锁住 2026-09-18 的真机事故：
+//
+// 面板以 root 写 ~/.colima/default/colima.yaml（加速源/挂载），文件变成 root:staff；
+// 而 Colima CLI 以**真实用户**运行，start/restart 时要重写这个文件 →
+//
+//	level=fatal msg="error preparing config file: error writing yaml file:
+//	                 open /Users/zizdog/.colima/default/colima.yaml: permission denied"
+//
+// 表现是"包都装好了、一键安装却失败、应用列表里还多出一条已安装"。
+//
+// 单测不可能造出 root 拥有的文件（非 root 身份），所以用注入点验证**接线**：
+// 该走 chown 的时候真的走，且只走一次（幂等，不每次 colima 调用都 Walk 一遍）。
+func TestEnsureColimaOwnershipRepairsRootOwnedTree(t *testing.T) {
+	m, _ := sandboxManager(t)
+	home := m.opt.UserHome
+	if err := os.MkdirAll(filepath.Join(home, ".colima", "default"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m.opt.UserName = "some-user"
+
+	// 非 root（测试进程就是非 root）→ 不做事：写出来的文件本来就属于自己。
+	calls := 0
+	m.colimaChownOverride = func(string, string) (int, int, error) {
+		calls++
+		return 0, 0, nil
+	}
+	m.ensureColimaOwnership(context.Background())
+	if calls != 0 {
+		t.Errorf("非 root 身份不该触发 chown（本地调试实例就是这种情形），实际调了 %d 次", calls)
+	}
+
+	// root 身份才修：用一个"假装是 root"的 manager 验证路径与幂等。
+	m2, _ := sandboxManager(t)
+	m2.opt.UserName = "some-user"
+	if err := os.MkdirAll(filepath.Join(m2.opt.UserHome, ".colima", "default"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var gotRoot string
+	m2.colimaChownOverride = func(user, root string) (int, int, error) {
+		calls++
+		gotRoot = root
+		return 1, 1, nil
+	}
+	origEuid := colimaEuid
+	colimaEuid = func() int { return 0 } // 模拟"面板由 LaunchDaemon 以 root 启动"
+	defer func() { colimaEuid = origEuid }()
+	colimaOwnershipRepaired = false
+	defer func() { colimaOwnershipRepaired = false }()
+	m2.ensureColimaOwnership(context.Background())
+	if calls != 1 {
+		t.Fatalf("root 身份应修一次归属，实际 %d 次", calls)
+	}
+	want := filepath.Join(m2.opt.UserHome, ".colima")
+	if gotRoot != want {
+		t.Errorf("chown 的目标应是 %s，实际 %s", want, gotRoot)
+	}
+	// 幂等：同进程再调用不再重复 Walk（colima status/start/stop 会调很多次）。
+	m2.ensureColimaOwnership(context.Background())
+	if calls != 1 {
+		t.Errorf("同进程内应只修一次（幂等），实际 %d 次", calls)
+	}
+}

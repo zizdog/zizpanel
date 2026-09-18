@@ -124,6 +124,24 @@ func (s *Server) svcManager() *services.Manager {
 			return s.Cfg.Save()
 		},
 		MySQLInputTimeout: time.Duration(s.Cfg.MySQLInputTimeoutSeconds) * time.Second,
+		// 站点摘要：卸载依赖检测要回答"有没有站点正在用这个 PHP 版本 /
+		// 会被 MySQL、nginx 的卸载影响"。站点数据在 sites 包里，由这里注入。
+		SiteDependents: func() []services.SiteRef {
+			list, err := s.siteMgr().List(context.Background())
+			if err != nil {
+				return nil
+			}
+			out := make([]services.SiteRef, 0, len(list))
+			for _, st := range list {
+				if st == nil {
+					continue
+				}
+				out = append(out, services.SiteRef{
+					Domain: st.Domain, PHPVersion: st.PHPVersion, Enabled: st.Enabled,
+				})
+			}
+			return out
+		},
 	})
 }
 
@@ -558,36 +576,41 @@ func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
 	ok(w, cur)
 }
 
-// handleServiceDelete 只删面板记录，绝不触碰运行时。
+// handleServiceDelete 停止服务，然后删掉面板记录。
 //
-// 语义硬要求（2026-09-17 真机缺陷）：用户把本机 Docker/Colima 全删掉后，
-// managed=true 的 compose 记录走「卸载」会先 `docker compose down` 而失败，
-// 于是那条记录**永远删不掉**。这条通路就是那种情况下的唯一出口：
-// 它只删 services 表里的一行，绝不调用 docker / brew / launchctl 去停任何东西。
-// 纳管的本机现有服务同样只删记录，真实服务照旧运行。
+// 2026-09-21 用户明确要求改写语义（原话："移除却不卸载是什么意思 …… 让用户
+// 看不到却持续运行"）：**先停、再移除**。只删记录会让一个仍在运行的服务
+// 彻底消失在面板里 —— 用户看不到它，它却继续占着端口跑业务。
 //
-// 为什么**刻意不经 svcManager()**：构造管理器会探测 Docker socket、并
-// ReconcilePaths() 顺手写配置。这条通路的语义是"记录与运行时彻底解耦"，
-// 所以直接落到 serviceRepo —— 最短、也最容易证明不碰运行时的路径。
+// 停不掉时：只要它**确实不在跑**（运行时被删掉、compose 引擎不在这类卡死场景），
+// 仍然允许删记录 —— 那种情况没有"隐身运行"的风险，而这条通路本来就是为它准备的。
+// 真在跑却停不掉 → 409 拒绝，并告诉用户先停掉。
 func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := s.serviceRepo.Delete(r.Context(), name); err != nil {
-		// 记录不存在是 404（客户端用错名字），不是 500（服务端故障）
+	stopped, err := s.svcManager().StopAndForget(r.Context(), name)
+	if err != nil {
 		if errors.Is(err, services.ErrServiceNotFound) {
 			fail(w, http.StatusNotFound,
 				"服务 "+name+" 不在面板记录里（服务不存在或已被移除）")
 			return
 		}
-		fail(w, http.StatusInternalServerError, err.Error())
+		// 停不掉且仍在运行：这是"拒绝"，不是服务端故障。
+		fail(w, http.StatusConflict, err.Error())
 		return
 	}
-	s.audit(r, "service_forget", name, "从面板移除服务（不影响系统）", true, "")
+	note := "已停止并删除服务定义，然后从面板移除"
+	if !stopped {
+		note = "服务当时不在运行，已从面板移除（没有留下后台进程）"
+	}
+	s.audit(r, "service_forget", name, note, true, "")
 	ok(w, map[string]any{
 		"removed": true,
-		// runtime_touched 必须**如实**：这条通路只删了 services 表里的一行，
-		// 没有执行任何 docker / brew / launchctl 命令，也没有停任何服务。
-		"runtime_touched": false,
-		"msg":             "已从面板移除。系统上的服务本身没有被改动。",
+		// runtime_touched 必须**如实**：这条通路现在会真的去停服务，
+		// 只有"停失败但确认没在跑"这一态才是 false。
+		"runtime_touched": stopped,
+		"stopped":         stopped,
+		"msg": note + "。软件本身没有被卸载（面板不知道该怎么卸它），" +
+			"磁盘上的文件仍在，需要你自己卸载。",
 	})
 }
 
@@ -696,6 +719,13 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	}
 	// 整批查一次（而不是循环里逐个查），见 installedFormulas 的说明
 	brewSet := s.installedFormulas(ctx)
+	// 版本投影：卸载计划要用它把 `php@8.4` 对到机器上真实装的 `php 8.4.7`。
+	brewVers := map[string]string{}
+	s.mktMu.Lock()
+	if s.mktBrewVer != nil {
+		brewVers = s.mktBrewVer
+	}
+	s.mktMu.Unlock()
 	dockerSock, _ := s.cachedDocker()
 
 	type item struct {
@@ -803,6 +833,12 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if !isInstalled && a.BrewFormula != "" {
 			isInstalled = brewSet[a.BrewFormula]
 		}
+		// brew 真实状态（含"目录写 php@8.4、机器上装的是 php 8.4.7"这种等价形态）：
+		// 一条判据同时决定「已安装」与「怎么卸载」，不再让两个地方各猜一次。
+		brewState := services.BrewStateFor(a.BrewFormula, brewVers)
+		if !isInstalled && brewState.Installed {
+			isInstalled = true
+		}
 		// 容器运行时：**已安装必须看现实**，不看任何残留文件（见上面的长注释）。
 		//
 		// 关键点：这一段的结论会**覆盖**前面的 brew / 面板记录判据 ——
@@ -899,11 +935,25 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		// 卸载计划与「已安装」必须互相自洽：说已安装，就**必须**给得出一条卸载路径；
+		// 给不出（kind=none）说明我们的证据或计划有一处是错的。
+		// 2026-09-21 用户要求的不变量：installed=true ⇒ uninstall.kind != "none"，
+		// 反过来 kind=none ⇒ 界面不得显示已安装。这里以**计划**为准降级（绝不显示
+		// 一个"已安装却没有任何卸载入口"的卡片），并把矛盾如实写进 Note。
+		plan := s.svcManager().PlanUninstallForBrew(ctx, a, rec, brewState)
+		if isInstalled && plan.Kind == "none" {
+			isInstalled = false
+		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			PortURL: portURL, ProxyURL: proxyURL,
 			DockerRuntime: dockerRuntime,
-			Uninstall:     s.svcManager().PlanUninstallFor(ctx, a, rec)}
+			Uninstall:     plan}
+		if plan.Kind == "none" && (adopted || artifacts) {
+			// 有记录/产物却给不出计划：如实说明，别让用户对着卡片猜。
+			it.Note = "面板找不到可卸载的对象（Homebrew 里没有这个包、也没有可清理的产物）；" +
+				"如果它确实装着，请先点「⟳ 刷新」重新探测"
+		}
 		if dockerNote != "" {
 			// 只有"装了但引擎没跑"才写这句；"没装"由前端按状态给一键安装，
 			// 不需要这里再重复（重复的文案会盖掉更精确的提示）。
@@ -962,10 +1012,10 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 	app, found := services.FindApp(id)
 	if !found {
 		// 条目可能已经**从目录下架**（2026-09-17 移除 n8n），但用户机器上
-		// 还留着它的 compose 项目目录/镜像。只要卸载计划给出 installer
-		// （残留清理）就照常放行；没有可清理对象时仍按原来的 400 处理。
+		// 还留着它的 compose 项目目录/镜像。只要卸载计划给出 installer / brew
+		// （残留清理 / 按 formula 卸载）就照常放行；没有可清理对象时仍按原来的 400 处理。
 		// 这就是"界面上没了、磁盘上还在、用户无处可点"的反面。
-		if plan := s.svcManager().PlanUninstall(r.Context(), id); plan.Kind == "installer" {
+		if plan := s.svcManager().PlanUninstall(r.Context(), id); plan.Kind == "installer" || plan.Kind == "brew" {
 			app = services.App{ID: id, Name: id}
 			found = true
 		}
@@ -1017,6 +1067,30 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 				// 那种"静默消失"（TTS 返回 200 + 空 body）必须在这里被抓住并补回。
 				// 传 app.BrewFormula：用户主动卸载 ffmpeg 条目时不自动装回去。
 				s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, app.BrewFormula)
+				return res, nil
+			})
+	case "brew":
+		// brew 原生应用（含"面板只登记过、软件由 brew 装"的那种）：
+		// 真实动作 = 停服务 + 删记录 + `brew uninstall <plan.Formula>`。
+		// formula 只认计划里那个 —— 它已经按真实 brew 状态判定过写法
+		// （目录写 php@8.4、机器上装的是 php 8.4.7，要卸的是后者）。
+		if plan.Blocked != "" {
+			fail(w, http.StatusConflict, plan.Blocked)
+			return
+		}
+		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
+			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				res := &services.InstallResult{App: app.ID, Steps: []string{}}
+				if err := s.svcManager().UninstallBrewApp(ctx, app, plan, removeData, res); err != nil {
+					return res, err
+				}
+				if app.ServiceLabel != "" {
+					if n, ferr := s.svcManager().ForgetByLabel(ctx, app.ServiceLabel); ferr == nil && n > 0 {
+						res.Steps = append(res.Steps,
+							fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, app.ServiceLabel))
+					}
+				}
+				s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, plan.Formula)
 				return res, nil
 			})
 	default:
@@ -1599,10 +1673,10 @@ func (s *Server) installedFormulas(ctx context.Context) map[string]bool {
 	}
 
 	// 冷启动兜底：这里必须同步，否则首屏会把所有应用都显示成"未安装"。
-	set := s.fetchInstalledFormulas(ctx)
+	set, vers := s.fetchInstalledFormulas(ctx)
 	s.mktMu.Lock()
 	if s.mktBrew == nil {
-		s.mktBrew, s.mktBrewAt = set, time.Now()
+		s.mktBrew, s.mktBrewVer, s.mktBrewAt = set, vers, time.Now()
 	} else {
 		set = s.mktBrew
 	}
@@ -1610,12 +1684,32 @@ func (s *Server) installedFormulas(ctx context.Context) map[string]bool {
 	return set
 }
 
-func (s *Server) fetchInstalledFormulas(ctx context.Context) map[string]bool {
-	set := s.svcManager().InstalledFormulas(ctx)
-	if set == nil {
-		set = map[string]bool{}
+// brewVersions 返回本机已安装 formula 的版本串（与 installedFormulas 同一份缓存）。
+//
+// 单独一个入口是因为卸载计划需要**版本**：目录写 php@8.4、机器上装的是 php 8.4.7
+// 时，只有版本能证明"这就是同一个 PHP 8.4"。
+func (s *Server) brewVersions(ctx context.Context) map[string]string {
+	// 先让 installedFormulas 把缓存暖起来（它负责 TTL / 后台刷新 / 冷启动同步）。
+	s.installedFormulas(ctx)
+	s.mktMu.Lock()
+	vers := s.mktBrewVer
+	s.mktMu.Unlock()
+	if vers == nil {
+		return map[string]string{}
 	}
-	return set
+	return vers
+}
+
+func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, map[string]string) {
+	vers := s.svcManager().InstalledFormulaVersions(ctx)
+	if vers == nil {
+		vers = map[string]string{}
+	}
+	set := make(map[string]bool, len(vers))
+	for f := range vers {
+		set[f] = true
+	}
+	return set, vers
 }
 
 // dockerMissTTL 是"没探测到 Docker"这一结果的最长保鲜期。
@@ -1680,11 +1774,11 @@ func (s *Server) refreshMarketAsync() {
 // 两项都在锁外完成，算完再一次性换入缓存 —— 慢查询绝不持有 mktMu，
 // 否则 brew 的 1.5 秒会阻塞所有市场请求。
 func (s *Server) refreshMarketCaches(ctx context.Context) {
-	set := s.fetchInstalledFormulas(ctx)
+	set, vers := s.fetchInstalledFormulas(ctx)
 	sock, ver := s.detectDocker()
 
 	s.mktMu.Lock()
-	s.mktBrew, s.mktBrewAt = set, time.Now()
+	s.mktBrew, s.mktBrewVer, s.mktBrewAt = set, vers, time.Now()
 	// 探测成功才覆盖：一次失败不应把已知可用的 socket 抹掉，
 	// 否则容器列表会在 VM 抖动时突然全部"消失"。
 	if sock != "" || s.mktDockerAt.IsZero() {

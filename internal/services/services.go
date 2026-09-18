@@ -179,6 +179,24 @@ type Manager struct {
 	// 在真机上不成立，断言的结论随测试机的安装状态漂移（2026-09-18 真踩到：
 	// 同一个提交在空机器上绿、在本机红）。
 	launchdDirsOverride []string
+	// colimaChownOverride 仅供测试：替换"把 ~/.colima 交还真实用户"的 chown 调用。
+	// 没有它，测这条链路要么真的 chown（单测不许动真实家目录），要么只能测到"没跑"。
+	colimaChownOverride func(user, root string) (changed, total int, err error)
+	// brewInstalledProbe 仅供测试：替换"本机装了哪些 brew formula（含版本）"的探测。
+	//
+	// 没有它，卸载计划的单测会去跑真实的 `brew list --versions`（违反"单测不许
+	// 碰真实服务"），而且结论会随开发机装没装 php/nginx 而漂 —— 本机恰好装着一堆。
+	brewInstalledProbe func(ctx context.Context) map[string]string
+	// brewUsesProbe 仅供测试：替换 `brew uses --installed <formula>` 的探测。
+	// 返回 (依赖它的已装包, 这次查询是否真的成功)，后者决定计划里写"已检查"还是"未检查"。
+	brewUsesProbe func(ctx context.Context, formula string) ([]string, bool)
+	// dockerPSProbe 仅供测试：替换"列出正在运行的容器"的探测。
+	// 返回 (容器名, 这次查询是否成功)；后者决定依赖报告写"未检查/未列出"。
+	dockerPSProbe func(ctx context.Context) ([]string, bool)
+	// siteRefsCache/siteRefsLoaded 缓存注入的站点列表：市场列表会对十几个条目
+	// 各算一次计划，站点列表在一次请求内只该读一次。
+	siteRefsCache  []SiteRef
+	siteRefsLoaded bool
 	// phpRestartOverride 仅供测试：替换"重启某个 PHP 服务"这一步，
 	// 以便验证"无权重启时如实降级"这条分支（真机上要 root 才复现）。
 	phpRestartOverride func(ctx context.Context, formula string) error
@@ -316,6 +334,14 @@ type Options struct {
 	SetMySQLRootPassword func(password string) error
 	// MySQLInputTimeout 是"限时询问 root 口令"的等待时长；<=0 按 60 秒。
 	MySQLInputTimeout time.Duration
+
+	// SiteDependents 返回面板里的站点摘要（域名 + PHP 版本）。
+	//
+	// 为什么由 web 层注入：站点数据在另一个 store（sites 包），services 不直接
+	// 读它 —— 两份来源各写各的必然漂移。卸载依赖检测（dependents.go）靠它回答
+	// "有没有站点正在用这个 PHP 版本 / 会被 MySQL、nginx 的卸载影响"。
+	// nil = 未接入 → 依赖检测会如实说"没有站点记录可用"，绝不假装没有站点。
+	SiteDependents func() []SiteRef
 }
 
 // MySQLCredential 是"面板持有的 MySQL 超级账号凭据"（来自 config.json）。

@@ -410,3 +410,10 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 
 162. **dev 实例的一键安装按钮会**真的**动系统：验证"按钮是否接通"时亲手触发了一次真实 `brew install colima`**（2026-09-19，本轮自伤）→ 为了证明 Docker 页新按钮真的走到安装任务，我对 `make run-local` 起的调试实例 POST 了 `/api/v1/market/docker-runtime/install`。本地实例只有**配置与数据目录**是临时的，`BrewBin` 仍是真机 `/opt/homebrew/bin/brew` → 任务一路走到真实 `brew install colima docker docker-compose`（下载瓶），直到我发现才 kill（未装成：`brew list` 无这三个 formula、无 Cellar 目录，只留下 4 个 `*.incomplete` 半截下载）。**"点了会干什么"在验证前要先想清楚**：这类"写操作"接口在调试实例上跑一次就等于在真机上执行一次。
     - 可行做法：验证"按钮接线"只到**任务创建**这一步（`POST` 返回 202 + `task_id`、任务在任务中心里可查 —— 这正是 `TestDockerRuntimeInstallEndpointExists` 断言的），**不要**让安装任务继续往下跑；或先把 `BrewBin` 指向一个不存在的临时路径，让安装器在第一步"未安装 Homebrew"就如实失败。
+
+163. **面板（root）写用户家目录里的配置文件 → 以真实用户运行的 CLI 直接 fatal：Colima 装好了却起不来**（2026-09-18 用户真机实测）→ 现场：一键安装 Docker 运行时，`brew install colima docker docker-compose` 全部成功（走自建镜像，很快），随后 `colima start` 失败：
+    `level=fatal msg="error preparing config file: error writing yaml file: open /Users/zizdog/.colima/default/colima.yaml: permission denied"`；而任务失败后应用列表里又多出一条「Docker 运行时（Colima）」——用户看到的是"装失败却显示已安装"。
+    - 根因：面板以 root 写 `~/.colima/default/colima.yaml`（加速源 / compose 挂载 / insecure-registries 三处都会写），文件属主变成 `root:staff 0644`；Colima CLI 以**真实用户**运行，start/restart 时要重写这个文件 → 权限拒绝。这与 nginx 日志目录（坑 156）是**同一类**问题：**只要面板以 root 往用户家目录里写东西，就必须把归属交还回去**。
+    - 修法：① 新增 `Manager.ensureColimaOwnership()`，在**每一次** `runColima`（status/start/stop/restart 的唯一入口）之前把 `<家目录>/.colima` 整棵树 chown 回真实用户（幂等，只在本进程第一次调用时 Walk；非 root 身份直接跳过）——这同时是**对旧版本留下的事故现场的修复路径**；② 新增 `Manager.writeColimaConfig()`，所有写 colima.yaml 的地方（colima_mount.go ×2、docker_mirror_nas.go ×2、docker_mirror.go ×1）都改走它，写完立刻 chown，**不允许再出现裸的 `os.WriteFile(<用户家目录>…)`**；③ 修好归属后真机验证：`colima start` 成功创建虚拟机、`docker version` 拿到引擎 29.5.2、面板 `/api/v1/docker/info` 报 `state=running`。
+    - 教训：**判据是"写完之后立刻 chown 回真实用户"**，不是"下次启动时再说"；用户看到"安装失败 + 已安装"的组合，其实是两个独立缺陷叠在一起（权限 + 安装态判据）。
+

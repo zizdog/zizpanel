@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -70,6 +72,86 @@ func (m *Manager) colimaEnv() []string {
 	return env
 }
 
+// colimaOwnershipRepaired 记录"本次进程里是否已经修过一次归属"，避免每次
+// colima 调用都去 Walk 一遍目录树（CLI 调用很频繁：status/start/stop/restart）。
+var colimaOwnershipRepaired bool
+
+// colimaEuid 是"当前进程身份"的探测点。抽成变量只为让单测能模拟"面板以 root 运行"
+// —— 单测进程自己是普通用户，否则那条修复路径永远测不到（而它正是真机事故的现场）。
+var colimaEuid = os.Geteuid
+
+// ensureColimaOwnership 把 <家目录>/.colima 整棵树的归属交还真实用户。
+//
+// 为什么必须有它（2026-09-18 真机事故）：面板以 **root** 运行，写 Colima 配置
+// （加速源 / 挂载 / insecure-registries）用的是 `os.WriteFile` —— 于是
+// `~/.colima/default/colima.yaml` 变成 **root:staff 0644**。而 Colima 的 CLI 是以
+// **真实用户**运行的，它 start/restart 时要重写这个文件，直接 fatal：
+//
+//	level=fatal msg="error preparing config file: error writing yaml file:
+//	                 open /Users/zizdog/.colima/default/colima.yaml: permission denied"
+//
+// 表现就是"包都装好了、一键安装却失败、应用列表里还多出一条已安装"。
+// 这与 nginx 日志目录（root 建目录、真实用户写不进去）是**同一类**问题：
+// **只要面板以 root 往用户家目录里写东西，就必须把归属交还回去**。
+//
+// 判据是"当前身份不是 root 就直接跳过"：非 root 时（本地调试实例）写出来的文件
+// 本来就属于自己，没有可修的东西。
+func (m *Manager) ensureColimaOwnership(ctx context.Context) {
+	if colimaOwnershipRepaired {
+		return
+	}
+	colimaOwnershipRepaired = true
+	if colimaEuid() != 0 || strings.TrimSpace(m.opt.UserName) == "" || m.opt.UserHome == "" {
+		return
+	}
+	root := filepath.Join(m.opt.UserHome, ".colima")
+	if _, err := os.Stat(root); err != nil {
+		return // 还没建过：没有可修的东西
+	}
+	chown := chownTreeTo
+	if m.colimaChownOverride != nil {
+		chown = m.colimaChownOverride
+	}
+	changed, _, err := chown(m.opt.UserName, root)
+	if err != nil {
+		// 修不了也要继续：让 Colima 自己报出真实错误，比在这里吞掉强。
+		emit(ctx, tasks.LevelWarn, "无法修正 Colima 配置目录的归属（"+err.Error()+"）：启动虚拟机可能因权限失败")
+		return
+	}
+	if changed > 0 {
+		emit(ctx, tasks.LevelStep, fmt.Sprintf(
+			"已把 Colima 配置目录里 %d 个 root 所属的条目改回真实用户 %s（旧版本面板留下的问题，不改会导致 colima 启动报 permission denied）",
+			changed, m.opt.UserName))
+	}
+}
+
+// writeColimaConfig 写 Colima 配置文件，并立刻把归属交还真实用户。
+//
+// 所有写 <家目录>/.colima/*.yaml 的地方都必须走这里，不要直接 os.WriteFile ——
+// root 拥有的配置文件会让以真实用户运行的 `colima start/restart` 直接失败
+// （见 ensureColimaOwnership 的说明）。
+func (m *Manager) writeColimaConfig(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return err
+	}
+	// 写完立刻交还归属；colimaOwnershipRepaired 只影响 runColima 里的"启动前统一修"，
+	// 这里每次都修（写文件的次数很少，代价可忽略）。
+	if colimaEuid() == 0 && strings.TrimSpace(m.opt.UserName) != "" {
+		chown := chownTreeTo
+		if m.colimaChownOverride != nil {
+			chown = m.colimaChownOverride
+		}
+		if _, _, err := chown(m.opt.UserName, filepath.Dir(path)); err != nil {
+			return fmt.Errorf("已写入 %s，但无法把它交还给真实用户 %s（Colima 会读写失败）：%w",
+				path, m.opt.UserName, err)
+		}
+	}
+	return nil
+}
+
 // runColima 以真实用户身份执行 colima 子命令。
 //
 // 必须以真实用户运行：Colima 的虚拟机、socket、配置全在该用户家目录下，
@@ -80,6 +162,9 @@ func (m *Manager) runColima(ctx context.Context, timeout time.Duration, args ...
 	if !fileExists(bin) {
 		return "", fmt.Errorf("未安装 Colima")
 	}
+	// 每次调 Colima 之前先确认配置目录属于真实用户（**修复旧版本留下的
+	// root 属主文件**，也保证本次 start 能正常写配置）。幂等，只在本进程第一次调用时做事。
+	m.ensureColimaOwnership(ctx)
 	full := append([]string{"-n", "-u", m.opt.UserName, "/usr/bin/env"}, append(m.colimaEnv(), append([]string{bin}, args...)...)...)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

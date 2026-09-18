@@ -188,6 +188,39 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 	return res, nil
 }
 
+// InstalledFormulaVersions 一次性返回**已安装 formula → 版本串**。
+//
+// 为什么不复用 catalog.go 的 InstalledFormulas（map[string]bool）：卸载计划要知道
+// 版本，才能把 `php@8.4` 这种"目录写法"对到机器上真实装的 `php 8.4.7`
+// （见 uninstall_app.go 的 ResolveBrewFormula）。两者是同一条 `brew list --versions`
+// 的两种投影，分开查会白付一次 brew 启动成本。
+//
+// 降权规则与 InstalledFormulas 一致：Homebrew 拒绝以 root 运行。
+func (m *Manager) InstalledFormulaVersions(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var cmd *exec.Cmd
+	if os.Geteuid() == 0 && m.opt.UserName != "" {
+		cmd = exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "-u", m.opt.UserName,
+			m.opt.BrewBin, "list", "--versions")
+	} else {
+		cmd = exec.CommandContext(ctx, m.opt.BrewBin, "list", "--versions")
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return map[string]string{}
+	}
+	// 输出形如：nginx 1.31.5 / php@8.2 8.2.33 / mysql@8.4 8.4.11_4
+	res := map[string]string{}
+	for _, ln := range strings.Split(string(out), "\n") {
+		f := strings.Fields(ln)
+		if len(f) >= 2 {
+			res[f[0]] = strings.Join(f[1:], " ")
+		}
+	}
+	return res
+}
+
 // brewRun 以真实用户身份执行 brew 命令。
 //
 // 必须降权：Homebrew 明确拒绝 root 运行

@@ -63,6 +63,15 @@ const LNMP_GROUP_ORDER = [
   { key: 'mysql', label: 'MySQL', desc: '数据库（面板的「数据库」页与 phpMyAdmin 依赖它）' },
 ];
 
+// LNMP_TITLE_TAIL 是「⚡ 一键 LNMP」按钮 tooltip 的后半句（用户 2026-09 指定的
+// 逐字文案）。前半句由 lnmpHintTitle 按**真实探测**填：
+//   · 有缺失 → 当前缺失"xxx"（多项用「、」连接，底座项用后端 missing 里的名字）；
+//   · 读取中 → 正在读取环境状态…；
+//   · 读不到 → 环境状态读取失败，可点开确认。
+// 缺失项一变，整句跟着变（不写死任何一项）。
+const LNMP_TITLE_TAIL = '：「⚡ 一键 LNMP」会确保环境完整，包括mac系统必要的底座'
+  + '（如CLT / Homebrew），已安装的环境不会重复安装。';
+
 /**
  * openLNMPDialog 打开"选版本"弹窗；只有用户点确认之后才会创建安装任务。
  *
@@ -85,6 +94,10 @@ async function openLNMPDialog() {
   let m = null;
 
   const box = h('div', { style: { minWidth: '520px', maxWidth: '620px' } });
+  // noticeBox 是弹窗**顶部**那块"当前缺失"的显著提醒（用户要求：不是灰字小字）。
+  // 它在 render() 里按最新事实重画：内容来自 refreshWebEnv 已探到的底座缺失
+  // 与弹窗这次自己拉到的 groups —— 两处都是真实探测，不是猜的。
+  const noticeBox = h('div');
   const body = h('div');
   const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } });
   body.append(box);
@@ -122,9 +135,72 @@ async function openLNMPDialog() {
     return sel;
   }
 
+  // renderNotice 画顶部"当前缺失"块。三种情况分开说，绝不含糊：
+  //   · 有缺失（底座 + 整组未装的组件）→ 醒目列出，并说明已装的会跳过；
+  //   · 底座层没读到 → 如实说"无法确认"，不假装完整；
+  //   · 真的都齐了 → 写"环境已完整，无需安装"（用户手工从工具条点进来时兜住）。
+  function renderNotice() {
+    clear(noticeBox);
+    const frame = {
+      border: '1px solid var(--warn)', background: 'var(--warn-soft)',
+      borderRadius: '8px', padding: '10px 12px', marginBottom: '12px',
+    };
+    const detail = h('div', { style: { marginTop: '4px' },
+      text: '已安装的环境不会重复安装，本次会跳过。' });
+    if (state.busy) {
+      noticeBox.append(h('div', { style: frame }, [
+        h('div', { style: { fontWeight: '700' }, text: '⏳ 正在确认环境是否完整…' }),
+      ]));
+      return;
+    }
+    if (state.err) {
+      noticeBox.append(h('div', { style: frame }, [
+        h('div', { style: { fontWeight: '700' },
+          text: '⚠️ 环境状态读取失败，暂时无法确认缺失项 —— 请先点「重试」' }),
+        detail,
+      ]));
+      return;
+    }
+    const parts = [];
+    // 底座项用后端 missing 里的名字（命令行开发者工具 / Homebrew / ffmpeg）
+    if (webEnv.basePhase === 'ready') parts.push(...webEnv.baseMissing);
+    // 组件项用弹窗这次刚拉到的最新 groups（比页面初载时更可靠）
+    parts.push(...missingComponents(state.groups));
+    if (parts.length) {
+      noticeBox.append(h('div', { style: frame }, [
+        h('div', { style: { fontWeight: '700', fontSize: '14px' },
+          text: '⚠️ 当前缺失：' + parts.join('、') }),
+        detail,
+      ]));
+      return;
+    }
+    if (webEnv.basePhase === 'loading') {
+      noticeBox.append(h('div', { style: frame }, [
+        h('div', { style: { fontWeight: '700' },
+          text: '⏳ 正在读取运行依赖（CLT / Homebrew / ffmpeg）状态…' }),
+        detail,
+      ]));
+      return;
+    }
+    if (webEnv.basePhase !== 'ready') {
+      noticeBox.append(h('div', { style: frame }, [
+        h('div', { style: { fontWeight: '700' },
+          text: '⚠️ 运行依赖（CLT / Homebrew / ffmpeg）状态读取失败，暂时无法确认缺失项' }),
+        detail,
+      ]));
+      return;
+    }
+    noticeBox.append(h('div', { style: frame }, [
+      h('div', { style: { fontWeight: '700', fontSize: '14px' }, text: '✅ 环境已完整，无需安装' }),
+      detail,
+    ]));
+  }
+
   function render() {
     clear(box);
     clear(foot);
+    box.append(noticeBox);
+    renderNotice();
     foot.append(h('div', { style: { flex: '1' } }));
     foot.append(h('button.btn', { text: '取消', onclick: () => (m ? m.close() : null) }));
     foot.append(installBtn);
@@ -170,6 +246,7 @@ async function openLNMPDialog() {
       h('p.hint', { style: { marginBottom: '8px' },
         text: '三件套各选一个版本。取消或直接关闭弹窗都**不会**安装任何东西，' +
           '安装任务只有点「开始安装」之后才会创建。' }),
+      h('p.hint', { style: { marginBottom: '8px' }, text: LNMP_HINT }),
       h('p.hint', { style: { marginBottom: '12px' }, text: LNMP_MYSQL_HINT }),
     );
 
@@ -293,6 +370,99 @@ async function openLNMPDialog() {
 // 读不到状态时**如实说读不到**，绝不把"读不到"当成"已就绪"。
 const WEB_ENV_PARTS = ['nginx', 'PHP', 'MySQL'];
 
+// ---------------- 一键 LNMP 入口的判据（三层真实探测）----------------
+//
+// 入口要不要出现、"缺什么"怎么写，都必须有证据。三层各自记状态：
+//   · 服务层  GET /services            → nginx 条目 state.running（nginx 运行/停止）
+//   · 底座层  GET /system/base-env     → missing（命令行开发者工具 / Homebrew / ffmpeg）
+//   · 组件层  GET /market/lnmp-options → 每组 options[].installed（真实 brew+记录+plist）
+//
+// **没读到 ≠ 已就绪**：任何一层没读到都不隐藏入口，而是显示入口并如实说"读不到"
+//（隐藏入口等于对用户谎报"环境完整"）。三层都读到且都没有缺失时才隐藏。
+function freshWebEnv() {
+  return {
+    servicesPhase: 'loading', // loading | ready | error
+    servicesErr: '',
+    // nginxState 只有四种取值，**没有证据绝不写"运行"、也不写"停止"**：
+    //   loading → 还没读到；running / stopped → 服务列表里真有 nginx 条目；
+    //   unknown → 接口失败，或服务列表里根本没有 nginx 条目。
+    // 「没有条目」为什么算未知而不是停止：真机实测 nginx 在 :80 上跑着，
+    // 面板的服务列表里却没有它（不归面板登记/不是面板装的）—— 写"停止"就是谎报。
+    nginxState: 'loading',
+    basePhase: 'loading', // loading | ready | error
+    baseMissing: [],
+    lnmpPhase: 'loading', // loading | ready | error
+    lnmpGroups: [],
+  };
+}
+let webEnv = freshWebEnv();
+// envToken 是"页面代次"：切换页面后旧视图还在飞的探测结果必须作废，
+// 否则上一页的结论会写进新页面的状态条（用户会看到状态闪成上一次的结论）。
+let envToken = 0;
+
+// missingComponents 从 lnmpOptions 的分组算出"整组一个版本都没装"的组件。
+// 判据：整组 options 的 installed 全为 false 才算这个组件缺失；装了任意一个版本
+// 就算已有（重跑一键 LNMP 时后端会跳过已装的部分，面板不重复安装）。
+function missingComponents(groups) {
+  const list = Array.isArray(groups) ? groups : [];
+  const out = [];
+  LNMP_GROUP_ORDER.forEach((meta) => {
+    const g = list.find((x) => x && x.key === meta.key);
+    if (!g || !Array.isArray(g.options) || !g.options.length) {
+      // 目录里没有这个组件（面板拿不到任何可装版本）—— 按缺失列出，
+      // 绝不因为"没数据"就当成已安装（那会让入口消失、用户以为环境齐了）。
+      out.push(meta.label);
+      return;
+    }
+    if (!g.options.some((o) => o && o.installed)) out.push(g.label || meta.label);
+  });
+  return out;
+}
+
+// envMissing 返回当前**有证据**的缺失项（底座缺失 + 整组未装的组件）。
+function envMissing() {
+  return [
+    ...(webEnv.basePhase === 'ready' ? webEnv.baseMissing : []),
+    ...(webEnv.lnmpPhase === 'ready' ? missingComponents(webEnv.lnmpGroups) : []),
+  ];
+}
+
+// envUnread 表示还有一层没读到。读不到时不许把"没读到"当成"环境完整"。
+function envUnread() {
+  return webEnv.basePhase !== 'ready' || webEnv.lnmpPhase !== 'ready';
+}
+
+// lnmpNeeded：只有"两层都读到、且都没有缺失"才隐藏入口；其余一律显示。
+function lnmpNeeded() {
+  return envUnread() || envMissing().length > 0;
+}
+
+// lnmpHintTitle 生成按钮 tooltip：缺失项一变，文案跟着变。
+function lnmpHintTitle() {
+  if (webEnv.basePhase === 'error' || webEnv.lnmpPhase === 'error') {
+    return '环境状态读取失败，可点开确认' + LNMP_TITLE_TAIL;
+  }
+  if (envUnread()) return '正在读取环境状态…' + LNMP_TITLE_TAIL;
+  const miss = envMissing();
+  if (!miss.length) return '环境已完整，无需安装' + LNMP_TITLE_TAIL;
+  return '当前缺失"' + miss.join('、') + '"' + LNMP_TITLE_TAIL;
+}
+
+// phpAppID 把 PHP 版本映射成**应用市场目录里的 id**：php@8.2 → php82
+// （与 catalog.go 的 ID 命名一致：php82 / php84）。
+//
+// 为什么不能只去掉 service 里的 @ 和 .：真机上 8.4 可能是**无版本别名** `php`
+//（opt/php → Cellar/php/8.4.7），它的 PHPVersion.service 就叫 "php" ——
+// 去掉 @/. 会得到市场里根本不存在的 id "php"，点卸载只会拿到 400。
+// 所以 service 带版本号时用它，否则回落到 version（8.4 → php84）。
+// 目录里确实没有对应 id 时，后端会如实返回 400，界面把原因显示出来。
+function phpAppID(p) {
+  const svc = String((p && p.service) || '');
+  const m = svc.match(/^php@(\d+)\.(\d+)/)
+    || String((p && p.version) || '').match(/^(\d+)\.(\d+)/);
+  return m ? 'php' + m[1] + m[2] : '';
+}
+
 
 // startLNMP 是按钮的处理入口。
 //
@@ -305,16 +475,22 @@ function startLNMP() {
 
 // lnmpButton 生成 LNMP 入口按钮。big=true 用于站点列表为空时的**大按钮**，
 // 其余情况（列表非空）在工具条上给一个**次级按钮** —— 同一页不同时给两个大入口。
+// 调用方必须先判 lnmpNeeded()：环境完整时这个入口不该出现。
 function lnmpButton(big) {
   return h('button.btn' + (big ? '.btn-primary' : '.btn-sm'), {
     text: '⚡ 一键 LNMP',
-    title: LNMP_HINT,
+    title: lnmpHintTitle(),
     onclick: startLNMP,
   });
 }
 
 export function SitesView(content, ctx = {}) {
   clear(content);
+
+  // 新一页 = 新代次：旧视图还在飞的探测结果作废；事实先回到"读取中"，
+  // 不沿用上一页的"运行 / 环境完整"结论。
+  envToken += 1;
+  webEnv = freshWebEnv();
 
   const listBox = h('div');
   // 网站环境状态行：本页的定位只跟 nginx/PHP/MySQL/phpMyAdmin 有关，
@@ -337,17 +513,12 @@ export function SitesView(content, ctx = {}) {
     ]),
   );
 
-  // refreshWebEnv 拉服务列表（health=0，只要状态不要逐条探测）判断网站环境。
+  // renderWebEnvLine 画"网站环境"那一行（服务层就绪与否）。
   // 失败时**如实说读不到**，不沿用上一次的结论、更不假装就绪。
-  async function refreshWebEnv() {
+  function renderWebEnvLine(list) {
     clear(webEnvLine);
-    webEnvLine.textContent = '网站环境：读取中…';
-    let list = [];
-    try {
-      const res = await api.services(false);
-      list = (res && res.list) || [];
-    } catch (e) {
-      webEnvLine.textContent = '网站环境：无法读取服务状态（' + e.message + '）';
+    if (webEnv.servicesPhase === 'error') {
+      webEnvLine.textContent = '网站环境：无法读取服务状态（' + webEnv.servicesErr + '）';
       return;
     }
     // svcRunning 只在同名条目命中且 state.running 为真时算就绪
@@ -362,7 +533,6 @@ export function SitesView(content, ctx = {}) {
       MySQL: () => svcRunning(/^(mysql|mariadb|percona)/i),
     };
     const missing = WEB_ENV_PARTS.filter((label) => !checks[label]());
-    clear(webEnvLine);
     webEnvLine.append(
       h('span', { text: '网站环境：' }),
       missing.length
@@ -380,6 +550,66 @@ export function SitesView(content, ctx = {}) {
           + '与网站无关，缺了会在首页提示。',
       }),
     );
+  }
+
+  // refreshWebEnv 并行拉三层事实（服务状态 / 运行依赖 / LNMP 组件已装情况），
+  // 拿到后重画状态条与空列表大按钮。
+  //
+  // 为什么要在这里重画：renderStatus() 在 load() 里**早于**本函数完成就调用过一次，
+  // 那时三层都还是"读取中"。本函数只重画 DOM，不再触发探测 —— 不会形成循环。
+  async function refreshWebEnv() {
+    const myToken = envToken;
+    webEnv.servicesPhase = 'loading';
+    webEnv.nginxState = 'loading';
+    clear(webEnvLine);
+    webEnvLine.textContent = '网站环境：读取中…';
+
+    const [svcRes, baseRes, lnmpRes] = await Promise.allSettled([
+      api.services(false), // nginx 的真实运行判据（state.running）
+      api.baseEnv(), // 底座：CLT / Homebrew / ffmpeg
+      api.lnmpOptions(), // 三件套各自装了哪个版本（installed 是后端真实探测）
+    ]);
+    if (myToken !== envToken) return; // 页面已切换：这次结果作废，不写进新页面
+
+    // ① 服务层：nginx 到底在不在跑
+    let list = [];
+    if (svcRes.status === 'fulfilled') {
+      list = (svcRes.value && svcRes.value.list) || [];
+      webEnv.servicesPhase = 'ready';
+      const nginx = list.find((s) => nginxEntry(s));
+      // 有条目才谈运行/停止；**没有条目一律算未知**（见 freshWebEnv 的说明）。
+      webEnv.nginxState = !nginx ? 'unknown'
+        : (((nginx.state || {}).running) ? 'running' : 'stopped');
+    } else {
+      webEnv.servicesPhase = 'error';
+      webEnv.servicesErr = (svcRes.reason && svcRes.reason.message) || String(svcRes.reason);
+      webEnv.nginxState = 'unknown';
+    }
+
+    // ② 底座层：missing 是后端给的人读名（命令行开发者工具 / Homebrew / ffmpeg）
+    if (baseRes.status === 'fulfilled' && baseRes.value && Array.isArray(baseRes.value.missing)) {
+      webEnv.basePhase = 'ready';
+      webEnv.baseMissing = baseRes.value.missing.slice();
+    } else {
+      webEnv.basePhase = 'error';
+      webEnv.baseMissing = [];
+    }
+
+    // ③ 组件层：groups 为空 = 后端没给出候选（读不到），不能当成"都装了"
+    if (lnmpRes.status === 'fulfilled' && lnmpRes.value
+      && Array.isArray(lnmpRes.value.groups) && lnmpRes.value.groups.length) {
+      webEnv.lnmpPhase = 'ready';
+      webEnv.lnmpGroups = lnmpRes.value.groups;
+    } else {
+      webEnv.lnmpPhase = 'error';
+      webEnv.lnmpGroups = [];
+    }
+
+    renderWebEnvLine(list);
+    // 状态条上"一键 LNMP 入口"与 nginx 状态都依赖上面三层事实，重画一次；
+    // 空列表的中间大按钮同样要跟着出现/消失。
+    renderStatus();
+    renderList();
   }
 
   async function load() {
@@ -402,6 +632,83 @@ export function SitesView(content, ctx = {}) {
     renderList();
     // 放在 sites 之后：refreshWebEnv 会读 cache.php_versions 做 PHP 的真实判据。
     void refreshWebEnv();
+  }
+
+  // nginxEntry 判断服务条目是不是 nginx（与 renderWebEnvLine 的 svcRunning 同一套口径）。
+  function nginxEntry(s) {
+    return /^nginx/i.test(String((s && s.name) || ''))
+      || /^nginx/i.test(String((s && s.display_name) || ''));
+  }
+
+  // nginxPill 是「🐘 PHP 环境」右侧那颗**只读**状态药丸。
+  // 判据只有一处：api.services(false) 里 nginx 条目的 state.running。
+  // 四种状态各有各的文案，**没有证据时既不说"运行"也不说"停止"**：
+  //   还没读到       → nginx 状态读取中…
+  //   读不到         → nginx 状态未知（接口失败）
+  //   没有 nginx 条目 → nginx 状态未知（面板没登记 ≠ 它没在跑）
+  //   有条目         → nginx 运行 / nginx 停止
+  function nginxPill() {
+    if (webEnv.servicesPhase === 'loading') {
+      return h('span.pill', { text: 'nginx 状态读取中…', title: '正在读取服务列表' });
+    }
+    if (webEnv.nginxState === 'running') {
+      return h('span.pill.ok', { text: 'nginx 运行', title: '服务列表里 nginx 条目 state.running = true' });
+    }
+    if (webEnv.nginxState === 'stopped') {
+      return h('span.pill.warn', {
+        text: 'nginx 停止',
+        title: '服务列表里 nginx 条目 state.running = false',
+      });
+    }
+    return h('span.pill.warn', {
+      text: 'nginx 状态未知',
+      title: webEnv.servicesPhase === 'error'
+        ? '服务列表接口读取失败，无法判断 nginx 是否在跑：' + webEnv.servicesErr
+        : '服务列表里没有 nginx 条目（它可能不归面板登记）—— 面板没有证据说它在跑，也没有证据说它停了',
+    });
+  }
+
+  // moreMenu 是工具条上的二级菜单（弹窗 + 竖排 .btn-block，沿用文件管理的既有写法）。
+  // 「校验 nginx」与「重建全部配置」都是低频动作，收进这里，行为与原来完全一致。
+  function moreMenu() {
+    const validate = h('button.btn.btn-block', {
+      text: '🧪 校验 nginx',
+      onclick: async () => {
+        m.close();
+        try {
+          const r = await api.nginxTest();
+          if (r.ok) toast('nginx 配置校验通过', 'ok');
+          else toast('配置有问题：' + r.output, 'err', 12000);
+        } catch (e) { toast(e.message, 'err'); }
+      },
+    });
+    const rebuild = h('button.btn.btn-block', {
+      text: '♻️ 重建全部配置',
+      onclick: async () => {
+        m.close();
+        if (!await confirmBox('将按模板重新生成所有站点的 nginx 配置并重载。\n\n你自己手工加在 vhost 里的内容会被覆盖（面板只保留数据库中的设置）。\n\n继续？', { title: '重建全部配置' })) return;
+        try {
+          const r = await api.siteReloadAll();
+          const n = (r.rebuilt || []).length;
+          if ((r.failed || []).length) toast(`重建 ${n} 个，失败 ${r.failed.length} 个：${r.failed[0]}`, 'warn', 12000);
+          else toast(`已重建 ${n} 个站点配置`, 'ok');
+          load();
+        } catch (e) { toast(e.message, 'err', 9000); }
+      },
+    });
+    const m = modal({
+      title: '更多操作',
+      body: h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } }, [
+        h('div', [
+          validate,
+          h('div.hint', { text: '对 nginx 配置跑一次语法校验（nginx -t）' }),
+        ]),
+        h('div', [
+          rebuild,
+          h('div.hint', { text: '按当前数据库状态重新生成所有站点的 nginx 配置（用于修复被手工改坏的配置）' }),
+        ]),
+      ]),
+    });
   }
 
   function renderStatus() {
@@ -430,7 +737,10 @@ export function SitesView(content, ctx = {}) {
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
       // LNMP 入口：站点非空时放工具条上的**次级按钮**；空列表时改用中间的大按钮
       // （见 renderList 的空态），两处不同时出现，避免重复入口。
-      ...(list.length ? [lnmpButton(false)] : []),
+      //
+      // 只有"环境完整"（两层都读到且都不缺）时才不给入口 —— 读不到时照常给，
+      // 并在 title 里说明读不到（见 lnmpNeeded / lnmpHintTitle）。
+      ...(list.length && lnmpNeeded() ? [lnmpButton(false)] : []),
       // 「PHP-FPM 运行中 x/y 个」原来是一个独立药丸，与这个按钮说的是同一件事 ——
       // 用户要求合并：状态直接写进按钮文案，点开就是 PHP 环境面板。
       h('button.btn.btn-sm', {
@@ -439,31 +749,10 @@ export function SitesView(content, ctx = {}) {
           + phps.map((p) => `${p.version} ${p.running ? '运行中' : '未运行'} · ${p.pass || p.listen_err || '端点未解析'}`).join('\n'),
         onclick: phpEnvModal,
       }),
-      h('button.btn.btn-sm', {
-        text: '🧪 校验 nginx',
-        title: '对 nginx 配置跑一次语法校验（nginx -t）',
-        onclick: async () => {
-          try {
-            const r = await api.nginxTest();
-            if (r.ok) toast('nginx 配置校验通过', 'ok');
-            else toast('配置有问题：' + r.output, 'err', 12000);
-          } catch (e) { toast(e.message, 'err'); }
-        },
-      }),
-      h('button.btn.btn-sm', {
-        text: '♻️ 重建全部配置',
-        title: '按当前数据库状态重新生成所有站点的 nginx 配置（用于修复被手工改坏的配置）',
-        onclick: async () => {
-          if (!await confirmBox('将按模板重新生成所有站点的 nginx 配置并重载。\n\n你自己手工加在 vhost 里的内容会被覆盖（面板只保留数据库中的设置）。\n\n继续？', { title: '重建全部配置' })) return;
-          try {
-            const r = await api.siteReloadAll();
-            const n = (r.rebuilt || []).length;
-            if ((r.failed || []).length) toast(`重建 ${n} 个，失败 ${r.failed.length} 个：${r.failed[0]}`, 'warn', 12000);
-            else toast(`已重建 ${n} 个站点配置`, 'ok');
-            load();
-          } catch (e) { toast(e.message, 'err', 9000); }
-        },
-      }),
+      // 紧挨「PHP 环境」右侧：nginx 的真实运行状态（只读药丸，不是可点的假按钮）。
+      nginxPill(),
+      // 「校验 nginx」/「重建全部配置」收进这个二级菜单（用户要求）。
+      h('button.btn.btn-sm', { text: '⋯ 更多', title: '更多操作', onclick: moreMenu }),
       h('button.btn.btn-primary.btn-sm', { text: '+ 新建站点', onclick: newSiteModal }),
     );
     statusBar.append(...bar);
@@ -480,8 +769,11 @@ export function SitesView(content, ctx = {}) {
           '环境已就绪的话，直接新建站点即可。' }),
         // 空列表时 LNMP 是**大按钮**（用户要求：醒目但不过度）：
         // 没有环境的话，先建站点也跑不起来，所以它排在最前面。
+        //
+        // 与工具条同一判据：环境完整（两层都读到且都不缺）时**不出现**；
+        // 读不到时照常出现（不拿"没读到"当真完整）。
         h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
-          lnmpButton(true),
+          ...(lnmpNeeded() ? [lnmpButton(true)] : []),
           h('button.btn', { text: '新建第一个站点', onclick: newSiteModal }),
         ]),
       ]));
@@ -621,16 +913,25 @@ export function SitesView(content, ctx = {}) {
                 title: p.listen_err || p.conflict || `当前 ${p.pass}，应为 ${p.preferred_pass}`,
               })),
             h('td', [
-              p.listen_ok && p.running ? h('span', { style: { fontSize: '12px', color: 'var(--text-dim)' }, text: '无需处理' })
-                : h('button.btn.btn-sm.btn-primary', {
-                  text: p.listen_ok ? '↻ 重启服务' : '🔧 修复端点并重启',
-                  onclick: async () => {
-                    await fixPHPEndpoint(p.version, async () => {
-                      try { state2.data = await api.phpList(); } catch (e) { /* 拉取失败就保留旧数据 */ }
-                      render();
-                    });
-                  },
+              h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } }, [
+                p.listen_ok && p.running ? h('span', { style: { fontSize: '12px', color: 'var(--text-dim)' }, text: '无需处理' })
+                  : h('button.btn.btn-sm.btn-primary', {
+                    text: p.listen_ok ? '↻ 重启服务' : '🔧 修复端点并重启',
+                    onclick: async () => {
+                      await fixPHPEndpoint(p.version, async () => {
+                        try { state2.data = await api.phpList(); } catch (e) { /* 拉取失败就保留旧数据 */ }
+                        render();
+                      });
+                    },
+                  }),
+                // 卸载入口：**每个真实存在的版本**都有一颗（用户报障：php8.4 根本
+                // 找不到卸载按钮）。点了先出确认框，确认后才走任务中心。
+                h('button.btn.btn-sm.btn-danger', {
+                  text: '🗑 卸载',
+                  title: '卸载 PHP ' + p.version + '（停止该版本 php-fpm 并 brew uninstall ' + (p.service || ('php@' + p.version)) + '）',
+                  onclick: () => uninstallPHP(p, refreshAfterUninstall),
                 }),
+              ]),
             ]),
           ]))),
         ]),
@@ -638,7 +939,110 @@ export function SitesView(content, ctx = {}) {
         h('div.hint', { text: '注意：改写配置后必须重启对应的 php-fpm 才会生效；面板会在重启后确认端点真的有人在监听，否则如实报错。' }),
       );
     };
+    // refreshAfterUninstall 卸载成功后重拉列表并重绘。render/state2 是本函数的作用域，
+    // 而 uninstallPHP 定义在 SitesView 层（拿不到它们），所以用回调传进去。
+    const refreshAfterUninstall = async () => {
+      try { state2.data = await api.phpList(); } catch (e) { /* 拉取失败就保留旧数据 */ }
+      render();
+    };
     render();
+  }
+
+  // uninstallPHP 卸载一个**真实存在的** PHP 版本（用户报障：php8.4 找不到卸载入口）。
+  //
+  // 分工：这里只负责"说清会做什么 + 显著警告 + 走任务中心"；真的停服务、删服务
+  // 定义、`brew uninstall` 由后端（DELETE /api/v1/market/{id}）执行，本文件不碰后端。
+  //
+  // 三道门（缺一不可）：
+  //   ① 确认框逐条列出本次动作（卸载不可逆）；
+  //   ② 默认版本 / 正被站点使用的版本 → **显著警告**：卸载后这些站点会 502；
+  //   ③ 失败必须有可见反馈 —— taskCenter 提交失败会 toast，任务失败走 onDone 的
+  //      toast；绝不出现"点了没反应"。
+  async function uninstallPHP(p, onDone) {
+    const appId = phpAppID(p);
+    const formula = p.service || ('php@' + p.version);
+    const usedBy = ((cache && cache.list) || [])
+      .filter((s) => String(s.php_version || '') === String(p.version))
+      .map((s) => s.domain);
+    const risky = !!p.is_default || usedBy.length > 0;
+    let wipe = false;
+
+    const wipeBox = h('input', { type: 'checkbox' });
+    wipeBox.addEventListener('change', () => { wipe = wipeBox.checked; });
+
+    const warning = h('div', {
+      style: {
+        border: '1px solid ' + (risky ? 'var(--danger)' : 'var(--warn)'),
+        background: risky ? 'var(--danger-soft)' : 'var(--warn-soft)',
+        borderRadius: '8px', padding: '10px 12px', marginBottom: '12px',
+      },
+    }, risky
+      ? [
+        h('div', { style: { fontWeight: '700', color: '#f87171', fontSize: '14px' },
+          text: '⚠️ PHP ' + p.version
+            + (p.is_default ? ' 是面板的默认版本' : ' 正被站点使用')
+            + (usedBy.length ? '：' + usedBy.join('、') : '') }),
+        h('div', { style: { marginTop: '4px' },
+          text: '卸载后，使用 PHP ' + p.version + ' 的站点会 502 —— 需要到站点设置里改选其它 PHP 版本。' }),
+      ]
+      : [
+        h('div', { style: { fontWeight: '700', fontSize: '14px' }, text: '卸载 PHP ' + p.version }),
+        h('div', { style: { marginTop: '4px' }, text: '卸载不可恢复；其它 PHP 版本与站点文件不受影响。' }),
+      ]);
+
+    let m = null;
+    m = modal({
+      title: '卸载 PHP ' + p.version,
+      body: h('div', [
+        warning,
+        h('div', [
+          h('div', { style: { fontWeight: '600' }, text: '本次会做：' }),
+          h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } }, [
+            h('li', { text: '停止 PHP ' + p.version + ' 的 php-fpm（若在运行）' }),
+            h('li', { text: '删除面板里这个版本的服务定义与开机自启项' }),
+            h('li', { text: '执行 brew uninstall ' + formula + '（只动这一个版本）' }),
+            h('li', { text: '保留其它 PHP 版本与站点文件' }),
+          ]),
+        ]),
+        h('label', {
+          style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '12px', cursor: 'pointer' },
+        }, [
+          wipeBox,
+          h('div', [
+            h('div', { text: '同时删除该版本的配置目录（不可恢复）' }),
+            h('div.hint', { text: 'php.ini / php-fpm.conf 等；不勾选则保留，便于日后重装沿用' }),
+          ]),
+        ]),
+      ]),
+      footer: [
+        h('button.btn', { text: '取消', onclick: () => m.close() }),
+        h('button.btn.btn-danger', {
+          text: '卸载 PHP ' + p.version,
+          onclick: async () => {
+            m.close();
+            // 提交交给任务中心：立刻返回 task_id、进度走 SSE、提交失败会 toast。
+            await taskCenter.start({
+              kind: 'uninstall',
+              target: formula,
+              title: '卸载 PHP ' + p.version,
+              start: () => api.marketUninstall(appId, wipe),
+              onDone: async (task) => {
+                if (task && task.status && task.status !== 'succeeded') {
+                  // 失败绝不沉默：把后端的原话显示出来。
+                  toast('卸载 PHP ' + p.version + ' 失败：' + (task.error || task.status), 'err', 12000);
+                  return;
+                }
+                toast('已卸载 PHP ' + p.version, 'ok', 9000);
+                // 重拉 PHP 列表并重绘（回调由 phpEnvModal 提供：它持有 state2/render）。
+                if (typeof onDone === 'function') await onDone();
+                // 环境事实变了：重新探测，让「一键 LNMP」入口/nginx 状态跟着更新。
+                void refreshWebEnv();
+              },
+            });
+          },
+        }),
+      ],
+    });
   }
 
   // ---------- 新建站点 ----------

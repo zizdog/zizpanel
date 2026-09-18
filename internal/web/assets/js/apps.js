@@ -49,6 +49,10 @@ import { renderInstalledApps } from './services.js';
 import {
   openServicePanel, marketQuickActions, hasPanelUI, appCardShell,
   openOnlyAction, portAccessWarning, dedupeMarketEntries, appKeyOf,
+  // 卸载确认只有一份实现（servicePanel.confirmUninstallPlan）：这里曾经抄过
+  // 一份，而那份的确认按钮 `close(); resolve(true)` 会被 modal 的 onClose
+  // 里的 resolve(false) 抢先定稿 —— 用户点「确认卸载」后什么都不发生。
+  confirmUninstallPlan,
 } from './servicePanel.js';
 
 let cache = null;
@@ -1048,47 +1052,13 @@ export function AppsView(content, ctx = {}) {
   //
   // 确认框里逐条列出步骤与可选删除的路径 —— 卸载不可逆，
   // 一句"确定卸载吗"是不够的（用户有权知道模型/样本/任务会不会一起没）。
+  // 确认框本体只有 servicePanel.confirmUninstallPlan 一份实现（见那里的说明：
+  // 这里原来抄的那份会让「确认卸载」永远解析成 false，用户看到的就是"点了没反应"）。
   async function doUninstall(a, plan, residual = false) {
-    const remove = h('input', { type: 'checkbox' });
-    const lines = (plan.steps || []).map((s) => h('li', { text: s }));
-    const paths = plan.data_paths || [];
-    const body = h('div', [
-      residual
-        ? h('div', {
-          style: { marginBottom: '8px' },
-          text: '「' + a.name + '」当前没有安装（服务和面板记录都不在），这一步只删除磁盘上的残留产物/数据，不可恢复。',
-        })
-        : h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
-      residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } }, lines),
-      (residual || !plan.keep_note) ? null : h('div.hint', { text: '会保留：' + plan.keep_note }),
-      (!residual && paths.length)
-        ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } }, [
-          remove,
-          h('span', { text: '同时删除数据/产物（不可恢复）：' }),
-        ])
-        : null,
-      paths.length
-        ? h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.7', fontSize: '12px' } },
-          paths.map((p) => h('li.mono', { text: p })))
-        : null,
-    ]);
-    const okGo = await new Promise((resolve) => {
-      const m = modal({
-        title: (residual ? '删除残留数据 · ' : '卸载 ') + a.name,
-        body,
-        footer: (close) => [
-          h('button.btn', { text: '取消', onclick: () => { close(); resolve(false); } }),
-          h('button.btn.btn-danger', {
-            text: residual ? '删除残留数据' : '确认卸载',
-            onclick: () => { close(); resolve(true); },
-          }),
-        ],
-        onClose: () => resolve(false),
-      });
-    });
-    if (!okGo) return;
+    const answer = await confirmUninstallPlan({ name: a.name, plan, residual });
+    if (!answer) return;
     // 残留清理的语义就是"删掉产物"，所以直接 remove_data=1，不再让用户勾选。
-    const wipe = residual ? true : remove.checked;
+    const wipe = residual ? true : answer.wipe;
     taskCenter.start({
       kind: 'uninstall',
       target: a.id,

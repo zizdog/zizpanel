@@ -65,6 +65,11 @@ func fakeBrew(t *testing.T, versions map[string]string) string {
 		if err := os.MkdirAll(filepath.Join(prefix, "opt", "php@"+v, "bin"), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		// 解释器必须真存在：DiscoverPHPVersions 现在要求 <opt>/<name>/bin/php 可 stat
+		// （否则一个空目录/残留会被当成"装了 PHP"，2026-09-18 用户实测的假版本）。
+		if err := os.WriteFile(filepath.Join(prefix, "opt", "php@"+v, "bin", "php"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		confDir := filepath.Join(prefix, "etc", "php", v, "php-fpm.d")
 		if err := os.MkdirAll(confDir, 0o755); err != nil {
 			t.Fatal(err)
@@ -589,6 +594,70 @@ func TestDiscoverPHPVersions(t *testing.T) {
 }
 
 // 两个版本共用端点时必须被显式标记（而不是像旧实现那样悄悄去重、少列一个版本）。
+// TestDiscoverPHPVersionsIgnoresDanglingAlias 锁住 2026-09-18 用户实测的假"已安装"：
+//
+// Homebrew 卸掉某个 PHP 之后，<prefix>/opt/php 会**留下悬空软链接**（指向已删掉的
+// Cellar/php/8.4.7）。旧实现只 os.Readlink 解析出 "8.4" 就把它列成已安装 ——
+// 用户在面板里看到 PHP 8.4，照着去 `brew uninstall php@8.4` 只得到
+// "Error: No such keg: /opt/homebrew/Cellar/php@8.4"。
+//
+// 判据必须贴着运行体：软链接/目录要能 stat 到，且 bin/php 真的在。
+func TestDiscoverPHPVersionsIgnoresDanglingAlias(t *testing.T) {
+	prefix := fakeBrew(t, map[string]string{"8.2": "127.0.0.1:9000"})
+	// 悬空软链接：目标 Cellar/php/8.4.7 根本不存在
+	if err := os.Symlink(filepath.Join(prefix, "Cellar", "php", "8.4.7"),
+		filepath.Join(prefix, "opt", "php")); err != nil {
+		t.Fatal(err)
+	}
+	list := DiscoverPHPVersions(prefix)
+	if len(list) != 1 || list[0].Version != "8.2" {
+		t.Fatalf("悬空软链接不该被当成已安装的 PHP 版本，实际: %+v", list)
+	}
+
+	// 版本别名 `php` 指向的 Cellar 目录名是**完整版本**（php/8.4.7）：
+	// 必须归一化成 major.minor（8.4），否则这台机器上"装了 PHP 8.4 却完全列不出来"。
+	if err := os.MkdirAll(filepath.Join(prefix, "Cellar", "php", "8.4.7", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(prefix, "Cellar", "php", "8.4.7", "bin", "php"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(prefix, "Cellar", "php", "8.4.7"),
+		filepath.Join(prefix, "opt", "php2")); err != nil {
+		t.Fatal(err)
+	}
+	// （opt/php2 不是合法名字，仅用于确认下面的 php 解析；这里直接覆盖 opt/php 软链）
+	_ = os.Remove(filepath.Join(prefix, "opt", "php"))
+	if err := os.Symlink(filepath.Join(prefix, "Cellar", "php", "8.4.7"),
+		filepath.Join(prefix, "opt", "php")); err != nil {
+		t.Fatal(err)
+	}
+	list = DiscoverPHPVersions(prefix)
+	found84 := false
+	for _, pv := range list {
+		if pv.Version == "8.4" {
+			found84 = true
+		}
+		if strings.Contains(pv.Version, ".") && strings.Count(pv.Version, ".") > 1 {
+			t.Fatalf("版本号必须是 major.minor 形式，实际 %q", pv.Version)
+		}
+	}
+	if !found84 {
+		t.Fatalf("`php` 别名指向 Cellar/php/8.4.7 时应列出 8.4，实际: %+v", list)
+	}
+
+	// 目录在、但没有解释器 → 同样不算装好
+	if err := os.MkdirAll(filepath.Join(prefix, "opt", "php@8.3", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	list = DiscoverPHPVersions(prefix)
+	for _, pv := range list {
+		if pv.Version == "8.3" {
+			t.Fatalf("没有 bin/php 的目录不该被列成已安装：%+v", list)
+		}
+	}
+}
+
 func TestDiscoverPHPVersionsFlagsConflict(t *testing.T) {
 	prefix := fakeBrew(t, map[string]string{
 		"8.2": "127.0.0.1:9000",

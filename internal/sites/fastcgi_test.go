@@ -104,6 +104,12 @@ func writeFakePHPConfForTest(t *testing.T, prefix, version, listen string) error
 			return err
 		}
 	}
+	// 解释器文件也要真存在：DiscoverPHPVersions 现在要求 <opt>/<name>/bin/php
+	// 可 stat（否则悬空软链接/残留目录会被当成"装了 PHP"，2026-09-18 用户实测）。
+	if err := os.WriteFile(filepath.Join(prefix, "opt", "php@"+version, "bin", "php"),
+		[]byte("#!/bin/sh\n"), 0o755); err != nil {
+		return err
+	}
 	body := "[global]\npid = run/php-fpm.pid\n\n[www]\nuser = tester\ngroup = staff\n" +
 		"listen = " + listen + "\npm = dynamic\n"
 	conf := filepath.Join(prefix, "etc", "php", version, "php-fpm.d", "www.conf")

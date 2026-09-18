@@ -43,6 +43,13 @@ func seedFakePHP(t *testing.T, brewPrefix string, versions ...string) {
 		if err := os.MkdirAll(filepath.Join(brewPrefix, "opt", "php@"+v, "bin"), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		// bin/php 必须真的存在：sites.DiscoverPHPVersions 现在按"运行体"判定
+		// （opt/<name> 能 stat 且 bin/php 在），否则 Homebrew 卸载后留下的
+		// 悬空软链接会被当成"已安装"。夹具少了这个文件，就会测出 0 个版本。
+		if err := os.WriteFile(filepath.Join(brewPrefix, "opt", "php@"+v, "bin", "php"),
+			[]byte("#!/bin/sh\necho 'PHP "+v+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		confDir := filepath.Join(brewPrefix, "etc", "php", v, "php-fpm.d")
 		if err := os.MkdirAll(confDir, 0o755); err != nil {
 			t.Fatal(err)

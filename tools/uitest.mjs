@@ -896,6 +896,405 @@ try {
     await shot('20-sites');
   });
 
+  // ---------- 网站管理工具条改版（2026-09 用户要求）----------
+  //
+  // 锁住四件事：
+  //   ① 「🧪 校验 nginx」「♻️ 重建全部配置」不在工具条上，而在「⋯ 更多」二级菜单里；
+  //   ② 「🐘 PHP 环境」右侧的 nginx 状态只能来自真实探测（/services 的 state.running），
+  //      没有证据绝不写"运行"；
+  //   ③ 一键 LNMP 只在缺失时出现（含"只缺一部分"）；环境完整时不出现；
+  //   ④ 打开弹窗**不发**安装请求，必须用户再点一次「开始安装」——
+  //      install-lnmp 全程桩住（假 202），绝不真的 brew install。
+  const reloadSites = async () => {
+    const u = page.url().split('#')[0] + '#/sites';
+    if (page.url() !== u) await page.goto(u);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('.card-head button:has-text("⋯ 更多")', { timeout: 15000 });
+    // 等三层探测落地：nginx 状态不再是"读取中"就说明 refreshWebEnv 跑完了。
+    await page.waitForFunction(() => {
+      const t = document.querySelector('.card-head')?.innerText || '';
+      return t.includes('nginx 运行') || t.includes('nginx 停止') || t.includes('nginx 状态未知');
+    }, { timeout: 15000 });
+    await page.waitForTimeout(300);
+  };
+
+  await step('网站管理：低频按钮收进「⋯ 更多」，nginx 状态与真实服务一致（不桩）', async () => {
+    await reloadSites();
+    if (await page.locator('.card-head button:has-text("校验 nginx")').count()) {
+      throw new Error('工具条上仍有独立的「校验 nginx」按钮（应已收进「⋯ 更多」）');
+    }
+    if (await page.locator('.card-head button:has-text("重建全部配置")').count()) {
+      throw new Error('工具条上仍有独立的「重建全部配置」按钮（应已收进「⋯ 更多」）');
+    }
+    const moreBtn = page.locator('.card-head button:has-text("⋯ 更多")');
+    if (!(await moreBtn.count())) throw new Error('工具条上没有「⋯ 更多」按钮');
+    if ((await moreBtn.first().getAttribute('title')) !== '更多操作') {
+      throw new Error('「⋯ 更多」的 title 不是「更多操作」');
+    }
+    await moreBtn.first().click();
+    await page.waitForSelector('.modal-body button:has-text("校验 nginx")', { timeout: 8000 });
+    const menuText = await page.locator('.modal-body').last().innerText();
+    if (!menuText.includes('校验 nginx') || !menuText.includes('重建全部配置')) {
+      throw new Error('二级菜单里缺少「校验 nginx」或「重建全部配置」：\n' + menuText);
+    }
+    if (!menuText.includes('nginx -t')) throw new Error('「校验 nginx」项缺少说明文案（nginx -t）');
+    if (!menuText.includes('手工改坏')) throw new Error('「重建全部配置」项缺少说明文案');
+    await shot('20a-sites-more-menu');
+    await page.locator('.modal-mask').last().locator('button.modal-close').first().click();
+    await page.waitForTimeout(300);
+
+    // nginx 状态药丸：与真实 /services 的判据逐字对齐（本机实测）
+    const real = await page.evaluate(async () => {
+      const r = await fetch(new URL('api/v1/services?health=0', document.baseURI),
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+      return r.json();
+    });
+    const list = (real && real.data && real.data.list) || [];
+    const ng = list.find((s) => /^nginx/i.test(String(s.name || ''))
+      || /^nginx/i.test(String(s.display_name || '')));
+    // 有条目才谈运行/停止；没有条目只能是"未知"（面板没看见 ≠ nginx 没在跑，
+    // 真机实测：nginx 在 :80 上跑着，面板服务列表里却没有它）。
+    const want = !ng ? 'nginx 状态未知'
+      : ((ng.state || {}).running ? 'nginx 运行' : 'nginx 停止');
+    const headText = await page.locator('.card-head').first().innerText();
+    if (!headText.includes(want)) {
+      throw new Error('nginx 状态文案与真实服务状态不一致（期望「' + want + '」）：\n' + headText);
+    }
+    await shot('20b-sites-nginx-status');
+  });
+
+  await step('一键 LNMP 入口与真实环境一致（本机三层实测，不桩）', async () => {
+    await reloadSites();
+    const facts = await page.evaluate(async () => {
+      const j = async (p) => {
+        const r = await fetch(new URL(p, document.baseURI),
+          { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+        return r.json();
+      };
+      const [b, l] = await Promise.all([
+        j('api/v1/system/base-env'), j('api/v1/market/lnmp-options'),
+      ]);
+      return { base: b.data, lnmp: l.data };
+    });
+    const miss = [...(((facts.base || {}).missing) || [])];
+    const groups = ((facts.lnmp || {}).groups) || [];
+    ['nginx', 'php', 'mysql'].forEach((k) => {
+      const g = groups.find((x) => x.key === k);
+      if (!g || !g.options || !g.options.length || !g.options.some((o) => o.installed)) {
+        miss.push(g ? g.label : k);
+      }
+    });
+    const wantShown = miss.length > 0;
+    const has = (await page.locator('.content button:has-text("一键 LNMP")').count()) > 0;
+    if (has !== wantShown) {
+      throw new Error('「一键 LNMP」入口与真实环境不一致：真实缺失=' + JSON.stringify(miss)
+        + '（应' + (wantShown ? '显示' : '不显示') + '），实际' + (has ? '显示' : '不显示'));
+    }
+    if (wantShown) {
+      const title = await page.locator('.content button:has-text("一键 LNMP")').first().getAttribute('title');
+      for (const m of miss) {
+        if (!title.includes(m)) throw new Error('按钮 title 没列出真实缺失项「' + m + '」：' + title);
+      }
+    }
+    await shot('20c-lnmp-entry-real');
+  });
+
+  await step('nginx 状态：桩造"运行/停止/无条目"三态（判据只认 /services 的 state.running）', async () => {
+    const svcRoute = /\/api\/v1\/services\?health=0/;
+    const stubSvc = (body) => (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { list: body } }),
+    });
+    await page.route(svcRoute, stubSvc([
+      { name: 'nginx', display_name: 'Nginx', state: { running: true, status: 'running' } },
+    ]));
+    try {
+      await reloadSites();
+      let t = await page.locator('.card-head').first().innerText();
+      if (!t.includes('nginx 运行')) throw new Error('running=true 时药丸没写「nginx 运行」：\n' + t);
+      await shot('20d-nginx-running');
+      await page.unroute(svcRoute);
+      await page.route(svcRoute, stubSvc([
+        { name: 'nginx', display_name: 'Nginx', state: { running: false, status: 'stopped' } },
+      ]));
+      await reloadSites();
+      t = await page.locator('.card-head').first().innerText();
+      if (t.includes('nginx 运行')) throw new Error('running=false 时却出现「nginx 运行」：\n' + t);
+      if (!t.includes('nginx 停止')) throw new Error('running=false 时药丸没写「nginx 停止」：\n' + t);
+      await shot('20e-nginx-stopped');
+      // 没有 nginx 条目：既不能写"运行"也不能写"停止"（没证据）
+      await page.unroute(svcRoute);
+      await page.route(svcRoute, stubSvc([
+        { name: 'php', display_name: 'PHP 8.2 (FPM)', state: { running: true, status: 'running' } },
+      ]));
+      await reloadSites();
+      t = await page.locator('.card-head').first().innerText();
+      if (t.includes('nginx 运行') || t.includes('nginx 停止')) {
+        throw new Error('服务列表里没有 nginx 条目时却写了运行/停止（没有证据）：\n' + t);
+      }
+      if (!t.includes('nginx 状态未知')) throw new Error('没有 nginx 条目时药丸没写「nginx 状态未知」：\n' + t);
+      await shot('20e2-nginx-unknown');
+    } finally {
+      await page.unroute(svcRoute);
+    }
+  });
+
+  await step('一键 LNMP：完整→不显示；缺 Homebrew+PHP→显示并如实列出，且未点「开始安装」不发请求（桩数据）', async () => {
+    const requests = [];
+    const stub = (data) => (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data }),
+    });
+    const completeBase = { clt_ok: true, brew_ok: true, deps_ok: true, ready: true, missing: [] };
+    const optionsAllInstalled = {
+      groups: [
+        { key: 'nginx', label: 'Nginx', selected: 'nginx',
+          options: [{ formula: 'nginx', name: 'Nginx', installed: true, recommended: true }] },
+        { key: 'php', label: 'PHP', selected: 'php@8.2',
+          options: [{ formula: 'php@8.2', name: 'PHP 8.2', installed: true, recommended: true }] },
+        { key: 'mysql', label: 'MySQL', selected: 'mysql@8.4',
+          options: [{ formula: 'mysql@8.4', name: 'MySQL 8.4', installed: true, recommended: true }] },
+      ],
+      default: { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' },
+    };
+    const missingBase = { clt_ok: true, brew_ok: false, deps_ok: false, ready: false, missing: ['Homebrew'] };
+    const optionsMissingPHP = {
+      groups: [
+        { key: 'nginx', label: 'Nginx', selected: 'nginx',
+          options: [{ formula: 'nginx', name: 'Nginx', installed: true, recommended: true }] },
+        { key: 'php', label: 'PHP', selected: 'php@8.2',
+          options: [
+            { formula: 'php@8.2', name: 'PHP 8.2', installed: false, recommended: true },
+            { formula: 'php@8.4', name: 'PHP 8.4', installed: false },
+          ] },
+        { key: 'mysql', label: 'MySQL', selected: 'mysql@8.4',
+          options: [{ formula: 'mysql@8.4', name: 'MySQL 8.4', installed: true, recommended: true }] },
+      ],
+      default: { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' },
+    };
+
+    // 安装请求一律掉进桩里（假 202），绝不真的 brew install。
+    await page.route('**/api/v1/market/install-lnmp', (route) => {
+      requests.push(route.request().postData() || '');
+      return route.fulfill({
+        status: 202, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-lnmp-gate', title: '一键 LNMP' } }),
+      });
+    });
+    // 任务进度流：回一条"成功"并结束，否则任务窗会重连不存在的流刷 404。
+    await page.route('**/api/v1/tasks**', (route) => {
+      const m = route.request().url().match(/\/api\/v1\/tasks\/([^/?]+)\/stream/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '一键 LNMP', status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '一键 LNMP', status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+      });
+    });
+
+    try {
+      // ① 环境完整（底座就绪 + 三件套都装了任意版本）→ 入口**不出现**
+      await page.route('**/api/v1/system/base-env', stub(completeBase));
+      await page.route('**/api/v1/market/lnmp-options', stub(optionsAllInstalled));
+      await reloadSites();
+      if (await page.locator('.content button:has-text("一键 LNMP")').count()) {
+        throw new Error('环境完整时仍显示「一键 LNMP」（用户要求：不该显示）');
+      }
+      await shot('20f-lnmp-complete-hidden');
+
+      // ② 缺 Homebrew（底座）+ 整组 PHP 都没装 → 入口出现，title 如实列出
+      await page.unroute('**/api/v1/system/base-env');
+      await page.unroute('**/api/v1/market/lnmp-options');
+      await page.route('**/api/v1/system/base-env', stub(missingBase));
+      await page.route('**/api/v1/market/lnmp-options', stub(optionsMissingPHP));
+      await reloadSites();
+      const btn = page.locator('.content button:has-text("一键 LNMP")');
+      if (!(await btn.count())) throw new Error('缺失（Homebrew + PHP）时却没有「一键 LNMP」入口');
+      const title = await btn.first().getAttribute('title');
+      if (!title.includes('当前缺失"Homebrew、PHP"')) {
+        throw new Error('按钮 title 没有逐字写「当前缺失"Homebrew、PHP"」：' + title);
+      }
+      if (!title.includes('已安装的环境不会重复安装')) {
+        throw new Error('按钮 title 缺少"已安装的环境不会重复安装"：' + title);
+      }
+      await shot('20g-lnmp-missing-shown');
+
+      // ③ 打开弹窗：顶部显著提醒缺失项；**仍未发出**任何安装请求
+      await btn.first().click();
+      await page.waitForSelector('.modal-mask button:has-text("开始安装")', { timeout: 10000 });
+      await page.waitForTimeout(500);
+      const modalText = await page.locator('.modal-body').last().innerText();
+      if (!/当前缺失：Homebrew、PHP/.test(modalText)) {
+        throw new Error('弹窗顶部没有显著写出「当前缺失：Homebrew、PHP」：\n' + modalText.slice(0, 400));
+      }
+      if (!/已安装的环境不会重复安装/.test(modalText)) {
+        throw new Error('弹窗缺少"已安装的环境不会重复安装，本次会跳过"');
+      }
+      if (requests.length !== 0) {
+        throw new Error('只打开弹窗就发了安装请求（用户没有二次点击「开始安装」的机会）：'
+          + JSON.stringify(requests));
+      }
+      await shot('20h-lnmp-dialog-missing');
+
+      // ④ 用户再点一次「开始安装」→ 才发请求（桩回 202 假任务，不真装）
+      await page.locator('.modal-mask button:has-text("开始安装")').last().click();
+      await page.waitForTimeout(1200);
+      if (requests.length !== 1) {
+        throw new Error('点「开始安装」后应恰好发一次 install-lnmp，实际 ' + requests.length + ' 次');
+      }
+      await closeAnyModal(page);
+    } finally {
+      await page.unroute('**/api/v1/system/base-env');
+      await page.unroute('**/api/v1/market/lnmp-options');
+      await page.unroute('**/api/v1/market/install-lnmp');
+      await page.unroute('**/api/v1/tasks**');
+    }
+  });
+
+  await step('PHP 环境弹窗与真实 /api/v1/php 一致（本机实测：悬空别名不再算成一个版本）', async () => {
+    await reloadSites();
+    const real = await page.evaluate(async () => {
+      const r = await fetch(new URL('api/v1/php', document.baseURI),
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+      return r.json();
+    });
+    const want = ((real && real.data && real.data.list) || []).map((p) => 'PHP ' + p.version);
+    await page.click('.card-head button:has-text("🐘 PHP 环境")');
+    await page.waitForSelector('.modal-mask', { timeout: 10000 });
+    await page.waitForTimeout(600);
+    const mask = page.locator('.modal-mask').last();
+    if (!want.length) {
+      // 版本列表为空时必须给"去应用市场装"的引导，而不是空白弹窗。
+      await mask.locator('.empty').waitFor({ timeout: 8000 });
+      const t = await mask.innerText();
+      if (!/应用市场/.test(t)) throw new Error('没有 PHP 时弹窗没有引导去「应用市场」：\n' + t);
+      await shot('20k-php-env-empty');
+      await closeAnyModal(page);
+      return;
+    }
+    await mask.locator('table.table tbody tr').first().waitFor({ timeout: 8000 });
+    const rows = mask.locator('table.table tbody tr');
+    const got = [];
+    for (let i = 0; i < await rows.count(); i += 1) {
+      got.push((await rows.nth(i).locator('td').first().innerText()).replace(/\s+/g, ' ').trim());
+    }
+    for (const v of want) {
+      if (!got.some((g) => g.includes(v))) {
+        throw new Error('弹窗缺少真实存在的版本 ' + v + '：UI=' + JSON.stringify(got) + ' API=' + JSON.stringify(want));
+      }
+    }
+    if (got.length !== want.length) {
+      throw new Error('弹窗行数与真实 /api/v1/php 不一致：UI=' + JSON.stringify(got) + ' API=' + JSON.stringify(want));
+    }
+    for (let i = 0; i < got.length; i += 1) {
+      if (!(await rows.nth(i).locator('button:has-text("卸载")').count())) {
+        throw new Error(got[i] + ' 行没有「🗑 卸载」按钮');
+      }
+    }
+    await shot('20k-php-env-real');
+    await closeAnyModal(page);
+  });
+
+  await step('PHP 环境弹窗：每个版本都有「🗑 卸载」，点击先出确认框，确认后才发卸载请求（桩数据）', async () => {
+    const dels = [];
+    const phpStub = (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: {
+        list: [
+          { version: '8.2', service: 'php@8.2', pass: '/tmp/zp-php82.sock', running: true,
+            is_default: true, listen_ok: true, preferred_pass: '/tmp/zp-php82.sock' },
+          // 第 2 行刻意用真机上的形态：8.4 是**无版本别名** `php`（service='php'），
+          // 目录 id 仍必须是 php84 —— 卸载请求要打到 /market/php84，而不是 /market/php。
+          { version: '8.4', service: 'php', pass: '/tmp/zp-php84.sock', running: false,
+            is_default: false, listen_ok: false, listen_err: '桩：未配置端点',
+            preferred_pass: '/tmp/zp-php84.sock' },
+        ],
+        socket_dir: '/tmp', note: 'UI 测试桩：两个 PHP 版本',
+      } }),
+    });
+    await page.route('**/api/v1/php', phpStub);
+    // 卸载请求一律掉进桩里（假 202），绝不真的 brew uninstall。
+    await page.route(/\/api\/v1\/market\/[^/?]+/, (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      dels.push(route.request().url());
+      return route.fulfill({
+        status: 202, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-php-uninstall', title: '卸载 PHP' } }),
+      });
+    });
+    await page.route('**/api/v1/tasks**', (route) => {
+      const m = route.request().url().match(/\/api\/v1\/tasks\/([^/?]+)\/stream/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200, headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '卸载 PHP', status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '卸载 PHP', status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+      });
+    });
+    try {
+      await reloadSites();
+      await page.click('.card-head button:has-text("🐘 PHP 环境")');
+      await page.waitForSelector('.modal-mask table.table tbody tr', { timeout: 10000 });
+      await page.waitForTimeout(400);
+      const rows = page.locator('.modal-mask').last().locator('table.table tbody tr');
+      const n = await rows.count();
+      if (n !== 2) throw new Error('PHP 桩数据应有 2 行，实际 ' + n);
+      for (let i = 0; i < n; i++) {
+        if (!(await rows.nth(i).locator('button:has-text("卸载")').count())) {
+          throw new Error('PHP 环境弹窗第 ' + (i + 1) + ' 行没有「🗑 卸载」按钮（用户找不到卸载入口）');
+        }
+      }
+      await shot('20i-php-env-uninstall');
+
+      // ① 默认版本：确认框必须显著警告"站点会 502"，且**此刻没有**卸载请求
+      await rows.nth(0).locator('button:has-text("卸载")').click();
+      await page.waitForSelector('.modal-mask:has(button:has-text("卸载 PHP 8.2"))', { timeout: 8000 });
+      const c1 = await page.locator('.modal-mask').last().locator('.modal-body').innerText();
+      if (!c1.includes('502')) throw new Error('默认版本的卸载确认框没有警告"站点会 502"：\n' + c1);
+      if (!c1.includes('brew uninstall php@8.2')) {
+        throw new Error('确认框没写清会执行 brew uninstall php@8.2：\n' + c1);
+      }
+      if (dels.length !== 0) throw new Error('只弹出确认框就发了卸载请求：' + JSON.stringify(dels));
+      await shot('20j-php-uninstall-confirm');
+      await page.locator('.modal-mask').last().locator('button:has-text("取消")').click();
+      await page.waitForTimeout(400);
+      if (dels.length !== 0) throw new Error('取消卸载却发了请求：' + JSON.stringify(dels));
+
+      // ② 非默认版本：确认后才**恰好发一次** DELETE（应用 id 由 service 推导：php@8.4 → php84）
+      const rows2 = page.locator('.modal-mask').last().locator('table.table tbody tr');
+      await rows2.nth(1).locator('button:has-text("卸载")').click();
+      await page.waitForSelector('.modal-mask:has(button:has-text("卸载 PHP 8.4"))', { timeout: 8000 });
+      await page.locator('.modal-mask').last().locator('button:has-text("卸载 PHP 8.4")').click();
+      await page.waitForTimeout(1200);
+      if (dels.length !== 1) {
+        throw new Error('确认后应恰好发一次卸载请求，实际 ' + dels.length + ' 次：' + JSON.stringify(dels));
+      }
+      if (!/\/api\/v1\/market\/php84\?remove_data=0/.test(dels[0])) {
+        throw new Error('卸载请求的应用 id 应是目录 id php84（由 service=php@8.4 推导）：' + dels[0]);
+      }
+      await closeAnyModal(page);
+    } finally {
+      await page.unroute('**/api/v1/php');
+      await page.unroute(/\/api\/v1\/market\/[^/?]+/);
+      await page.unroute('**/api/v1/tasks**');
+    }
+  });
+
   await privStep('新建一个 PHP 站点', async () => {
     await page.click('button:has-text("新建站点")');
     const domainInput = page.locator('input[placeholder="例如：demo.test"]');
@@ -943,7 +1342,11 @@ try {
   });
 
   await privStep('校验 nginx', async () => {
-    await page.click('button:has-text("校验 nginx")');
+    // 「校验 nginx」已收进工具条的「⋯ 更多」二级菜单（用户要求），
+    // 不再是并排按钮 —— 先开菜单再点这一项。
+    await page.click('.card-head button:has-text("⋯ 更多")');
+    await page.waitForSelector('.modal-body button:has-text("校验 nginx")', { timeout: 8000 });
+    await page.click('.modal-body button:has-text("校验 nginx")');
     await page.waitForSelector('.toast', { timeout: 15000 });
     await page.waitForTimeout(800);
     const toastText = await page.locator('.toast').first().innerText();
@@ -1220,14 +1623,14 @@ try {
   //
   // 用户真机：删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，点卸载报
   // "未找到 docker compose 命令" → 记录永远删不掉。这条断言**全部走桩**：
-  //   ① 记录带 driver_error（运行时不可用）→ 面板里必须出现「从列表移除（不停止容器）」；
-  //   ② 点「卸载」→ 桩 500 → 必须弹出一个带「从列表移除」按钮的对话框；
+  //   ① 记录带 driver_error（运行时不可用）→ 面板里是「🗑 卸载」（2026-09-21 起
+  //      managed=true 的记录**不再**并排摆「只删记录」颗，只删记录的出口改到下面）；
+  //   ② 点「卸载」→ 桩 500 → 必须弹出一个带「从*移除」按钮的对话框；
   //   ③ 对话框必须如实说明"未停止容器"；
   //   ④ 点它 → 必须真的调用 DELETE /services/{name}（只删记录，不碰运行时）。
   //
-  // 2026-09-21 文案改动同步：「取消纳管（仅删除记录）」→「从列表移除（不停止容器）」
-  // （用户："用户不需要知道什么是纳管"）。**行为与接口一个字没改**，只改用户看到的词。
-  await step('compose 记录运行时不可用：有「从列表移除」出口，卸载失败可一键只删记录', async () => {
+  // 文案容错：另一轮正把「从列表移除」改成「从面板移除该服务」，两种写法都认。
+  await step('compose 记录运行时不可用：卸载失败可一键只删记录', async () => {
     const NAME = 'uitest-compose-gone';
     const LABEL = 'UITEST compose·运行时没了';
     const FAKE = {
@@ -1294,39 +1697,45 @@ try {
       await page.click('.nav-item:has-text("应用")');
       await page.waitForTimeout(2000);
 
-      // 打开这条 compose 记录的「⚙️ 管理」面板
+      // 打开这条 compose 记录的「⚙️ 管理」面板。
+      // 2026-09-21 起（用户要求）：目录应用的收尾**只有**「🗑 卸载」，
+      // 「只删记录」不再是并排按钮，只在"卸载失败"的兜底对话框里出现。
       const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
       await card.waitFor({ timeout: 15000 });
       await card.locator('button:has-text("管理")').click();
-      const recordOnly = page.locator('.modal-mask button:has-text("从列表移除")').last();
-      await recordOnly.waitFor({ timeout: 8000 });
-      await shot('31a-compose-record-only-entry');
+      const panel = page.locator('.modal-mask').last();
+      await panel.locator('button:has-text("🗑 卸载")').waitFor({ timeout: 8000 });
+      const panelText = await panel.innerText();
+      if (panelText.includes('从列表移除')) {
+        throw new Error('面板里仍有旧文案「从列表移除」（目录应用的收尾现在只有「🗑 卸载」）');
+      }
+      await shot('31a-compose-uninstall-entry');
 
-      // 点「🗑 卸载」→ 确认 → 桩 500 → 必须弹可点出口的对话框
-      await page.locator('.modal-mask button:has-text("🗑 卸载")').last().click();
+      // 点「🗑 卸载」→ 必须先出现确认框；确认后桩 500（模拟后端真卸载失败）
+      await panel.locator('button:has-text("🗑 卸载")').last().click();
       const confirm = page.locator('.modal-mask', { hasText: '卸载服务' }).last();
       await confirm.locator('button:has-text("确认卸载")').waitFor({ timeout: 8000 });
       await confirm.locator('button:has-text("确认卸载")').click();
 
-      // 兜底对话框用**标题**定位，不能用 hasText('从列表移除')：
-      // 「应用管理」面板里也有一颗「从列表移除（不停止容器）」按钮，
-      // hasText 会先把面板本身匹配上，waitFor 立刻返回 → 断言读到的是面板文本
-      // （2026-09-21 实测踩到：报"没有如实说明未停止容器"，其实是选错了元素）。
+      // 卸载失败 → 必须弹出带「从面板移除该服务」出口的说明对话框。
+      // 按**标题**定位：面板里可能也有同名按钮，hasText 会先匹配到面板本身
+      // （2026-09-21 实测踩到：报"没有如实说明"，其实是选错了元素）。
       const fallback = page.locator('.modal-mask')
-        .filter({ has: page.locator('.modal-head h3', { hasText: '从列表移除 ·' }) }).last();
+        .filter({ has: page.locator('.modal-head h3', { hasText: /^从面板移除 · / }) }).last();
       await fallback.waitFor({ timeout: 10000 });
       const ftext = await fallback.innerText();
-      if (!ftext.includes('未停止容器')) {
-        throw new Error('卸载失败对话框没有如实说明"未停止容器"：\n' + ftext.slice(0, 300));
+      if (!ftext.includes('容器与磁盘数据不会被删') && !ftext.includes('没有容器在跑')) {
+        throw new Error('卸载失败对话框没有如实说明"不会动容器/数据"：\n' + ftext.slice(0, 300));
       }
-      if (!ftext.includes('从列表移除')) throw new Error('卸载失败对话框没有「从列表移除」按钮');
+      if (!ftext.includes('从面板移除该服务')) throw new Error('兜底对话框没有「从面板移除该服务」出口');
+      if (ftext.includes('从列表移除')) throw new Error('兜底对话框仍有旧文案「从列表移除」');
       await shot('31b-compose-uninstall-failed-fallback');
 
-      // 点「从列表移除」→ 必须真的调用 DELETE /services/{name}
-      await fallback.locator('button:has-text("从列表移除")').last().click();
+      // 点「从面板移除该服务」→ 必须真的调用 DELETE /services/{name}
+      await fallback.locator('button:has-text("从面板移除该服务")').last().click();
       await page.waitForTimeout(1200);
       if (!forgetCalls.includes(`services/${NAME}`)) {
-        throw new Error('点了「从列表移除」但 DELETE /services/{name} 没有发出去：' + JSON.stringify(forgetCalls));
+        throw new Error('点了「从面板移除该服务」但 DELETE /services/{name} 没有发出去：' + JSON.stringify(forgetCalls));
       }
       if (!uninstallCalls.includes(`services/${NAME}/uninstall`)) {
         throw new Error('点「卸载」时 DELETE .../uninstall 没有发出去：' + JSON.stringify(uninstallCalls));
@@ -1334,9 +1743,10 @@ try {
       const okToast = page.locator('.toasts .toast.ok').last();
       await okToast.waitFor({ timeout: 8000 });
       const okText = await okToast.innerText();
-      if (!okText.includes('未停止容器')) {
-        throw new Error('删除记录成功的提示没有如实说"未停止容器"：' + okText);
+      if (!okText.includes('已从面板移除') && !okText.includes('已停止这个服务并从面板移除')) {
+        throw new Error('删除记录成功的提示没有如实说清结果：' + okText);
       }
+      if (okText.includes('从列表移除')) throw new Error('成功提示仍有旧文案「从列表移除」：' + okText);
       await shot('31c-compose-record-deleted');
     } finally {
       await closeModals();
@@ -1357,7 +1767,7 @@ try {
   // 用户原话："用户不需要知道什么是纳管 … 只要知道自己可以在应用里执行安装、卸载、
   // 重装这些动作。" 但对**用户自己装的软件**，面板绝不能假装能卸载（后端的
   // managed=false 语义就是"只删记录"）。这条边界现在靠按钮文案表达：
-  //   · 按钮必须写「从列表移除（不卸载软件）」；
+  //   · 按钮必须写「从*移除」（旧「从列表移除（不卸载软件）」/ 新「从面板移除该服务」）；
   //   · 点下去必须弹确认框，并**逐字**说明不会卸载软件本身；
   //   · 点「取消」不能发出任何 DELETE。
   // 全部走桩，不碰真实服务。
@@ -1408,20 +1818,30 @@ try {
       const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
       await card.waitFor({ timeout: 15000 });
       await card.locator('button:has-text("管理")').click();
-      const removeBtn = page.locator('.modal-mask button:has-text("从列表移除（不卸载软件）")').last();
+      // 面板不认识的服务（managed=false、无目录条目）：唯一收尾是
+      // 「从面板移除该服务」—— 它会**先停服务再删记录**（不再有"隐身运行"）。
+      const removeBtn = page.locator('.modal-mask button:has-text("从面板移除该服务")').last();
       await removeBtn.waitFor({ timeout: 8000 });
+      const panelText = await page.locator('.modal-mask').last().innerText();
+      if (panelText.includes('从列表移除')) {
+        throw new Error('面板里仍有旧文案「从列表移除（不卸载软件）」（新文案是「从面板移除该服务」）');
+      }
       await shot('31d-remove-from-list-entry');
 
       await removeBtn.click();
-      // 同样按**标题**定位确认框：面板里也有「从列表移除（不卸载软件）」这颗按钮，
-      // 用 hasText 会匹配到面板本身（见上面 compose 那一步的注释）。
+      // 同样按**标题**定位确认框：面板里也有一颗同名按钮，
+      // 用 hasText 会先匹配到面板本身（见上面 compose 那一步的注释）。
       const confirm = page.locator('.modal-mask')
-        .filter({ has: page.locator('.modal-head h3', { hasText: /^从列表移除$/ }) }).last();
+        .filter({ has: page.locator('.modal-head h3', { hasText: /^从面板移除该服务$/ }) }).last();
       await confirm.waitFor({ timeout: 8000 });
       const ctext = await confirm.innerText();
-      if (!ctext.includes('不会卸载软件本身')) {
+      if (!ctext.includes('不会卸载软件本身') && !ctext.includes('软件本身仍在磁盘上')) {
         throw new Error('确认框没有逐字说明"不会卸载软件本身"：\n' + ctext.slice(0, 300));
       }
+      if (!ctext.includes('先停止')) {
+        throw new Error('确认框没有说明会"先停服务再删记录"（否则会留下隐身运行的服务）：\n' + ctext.slice(0, 300));
+      }
+      if (ctext.includes('从列表移除')) throw new Error('确认框仍有旧文案「从列表移除」：\n' + ctext.slice(0, 200));
       if (/纳管/.test(ctext)) throw new Error('确认框里仍有内部词"纳管"：\n' + ctext.slice(0, 300));
       await shot('31e-remove-from-list-confirm');
 

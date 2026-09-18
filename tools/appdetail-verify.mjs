@@ -219,7 +219,10 @@ const MARKET = {
       summary: 'Web 服务器', description: 'brew 装的 nginx。', port: 8080,
       installed: true, adopted: true, available: true,
       service_label: 'homebrew.mxcl.nginx', service_in_launchd: true,
-      uninstall: { kind: 'forget', service: 'nginx', steps: ['从「服务管理」中删除这条记录'] },
+      // brew 原生（新矩阵）：只有「卸载」并且真的 brew uninstall，不再并排"只删记录"。
+      uninstall: { kind: 'brew', service: 'nginx', formula: 'nginx',
+        steps: ['停止并删除 launchd 服务 homebrew.mxcl.nginx', 'brew uninstall nginx'],
+        keep_note: '只删 nginx 本身，不动它依赖的包' },
     },
     {
       // 2026-09-17 合并验收：真机上 php81/82/83/84 每套在服务记录里都是**两条**
@@ -763,6 +766,41 @@ const result = await page.evaluate(async () => {
   return out;
 });
 
+// ---------- 3b. 卸载确认框：确认后必须**真的**发请求 ----------
+//
+// 2026-09-21 真机事故：marketUninstallButton 的确认按钮写的是
+// `close(); resolve(true)`，而 modal 的 close() 会**同步**触发 onClose 里的
+// resolve(false) —— Promise 先被定死为 false，`if (!okGo) return;` 直接返回。
+// 用户点「确认卸载」后：对话框关了、没有请求、没有进度、没有提示
+// （原话："frpc 点击卸载没有任何反应，没有进度，没有提示，什么都没有"）。
+// 这条断言锁住"确认后确实发出了 DELETE 请求"，回归立刻红。
+const uninstallFlow = await page.evaluate(async () => {
+  const { marketUninstallButton } = await import('./servicePanel.js');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const mi = {
+    id: 'frpc', name: 'frp 客户端 (frpc)', installed: true, artifacts: true,
+    uninstall: { kind: 'installer', steps: ['停止并删除 launchd 服务 com.zizdog.frpc', '从「服务管理」移除记录'] },
+  };
+  // svc 记录必须给：没有它，"卸载失败"时就没有"从面板移除"的兜底出口。
+  const btn = marketUninstallButton(mi, () => {}, { name: 'com-zizdog-frpc', display_name: 'frpc（frp 客户端）' });
+  document.body.appendChild(btn);
+  window.__calls.length = 0;
+  btn.click();
+  await sleep(60);
+  const modal = document.querySelector('.modal');
+  const confirmText = modal ? (modal.innerText || '') : '';
+  const buttons = modal ? Array.from(modal.querySelectorAll('button')).map((b) => (b.textContent || '').trim()) : [];
+  const okBtn = modal
+    ? Array.from(modal.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === '确认卸载')
+    : null;
+  if (okBtn) okBtn.click();
+  await sleep(150);
+  const calls = window.__calls.slice();
+  if (modal && modal.parentElement) modal.parentElement.remove();
+  btn.remove();
+  return { hasConfirm: /确认卸载/.test(confirmText), hasSteps: /停止并删除 launchd 服务/.test(confirmText), buttons, calls };
+});
+
 server.close();
 await browser.close();
 
@@ -1133,8 +1171,9 @@ check('点「全部」能复位（筛选状态不粘住）',
 check('本机已有但面板没记录的服务：市场卡片主按钮是「添加到面板」（不是"纳管/接入/安装"）',
   JSON.stringify(result.market.buttons['Ollama（本机已有）'] || []) === JSON.stringify(['添加到面板']),
   show(result.market.buttons['Ollama（本机已有）']));
-check('Nginx（本机已有的服务）：收尾按钮是「从列表移除（不卸载软件）」，不再说"取消纳管"',
-  panelOf('Nginx').includes('从列表移除（不卸载软件）') && !panelOf('Nginx').some((t) => t.includes('纳管')),
+check('Nginx（brew 原生）：收尾按钮是「卸载」，而且**没有**并排的"只删记录"',
+  panelOf('Nginx').includes('卸载')
+  && !panelOf('Nginx').some((t) => t.includes('从列表移除') || t.includes('从面板移除') || t.includes('纳管')),
   show(panelOf('Nginx')));
 
 // ---------- ⑧c 用户可见处一个内部词都不许留（2026-09-21） ----------
@@ -1189,10 +1228,17 @@ check('网站管理（空站点）：有「一键 LNMP」入口',
   (result.sites.emptyButtons || []).some((t) => t.includes('LNMP')), show(result.sites.emptyButtons));
 check('网站管理（有站点）：工具条上仍有「一键 LNMP」',
   (result.sites.listButtons || []).some((t) => t.includes('LNMP')), show(result.sites.listButtons));
-check('LNMP 按钮文案说清装什么（nginx / PHP / MySQL / phpMyAdmin）',
-  ['nginx', 'PHP', 'MySQL', 'phpMyAdmin'].every((w) => result.sites.hint.includes(w)), result.sites.hint);
-check('LNMP 按钮文案提示耗时与长任务特性（分钟级 + 不中断/任务中心）',
-  /分钟/.test(result.sites.hint) && /(中断|任务中心)/.test(result.sites.hint), result.sites.hint);
+check('LNMP 按钮文案说清"确保环境完整 + 系统底座 + 已装的会跳过"（2026-09 用户指定文案）',
+  /确保环境完整/.test(result.sites.hint)
+  && /底座/.test(result.sites.hint)
+  && /CLT \/ Homebrew/.test(result.sites.hint)
+  && /已安装的环境不会重复安装/.test(result.sites.hint), result.sites.hint);
+// 耗时/长任务特性已从按钮 title 移到**弹窗**里（按钮 title 只讲"缺什么/会确保完整"）。
+// 断言跟着搬到弹窗文本上：否则这条能力就没人看着了。
+check('LNMP 弹窗文案提示耗时与长任务特性（分钟级 + 不中断/任务中心）',
+  /分钟/.test(result.sites.modalAfterClick || '')
+  && /(中断|任务中心)/.test(result.sites.modalAfterClick || ''),
+  String(result.sites.modalAfterClick || '').slice(0, 200));
 // ---- 一键 LNMP 的"先弹窗选版本、确认后才安装"（2026-09-19 用户要求）----
 check('点「一键 LNMP」先弹出选版本弹窗（不是直接开装）',
   !!result.sites.modalAfterClick && /选择要安装的版本/.test(result.sites.modalAfterClick),
@@ -1211,6 +1257,12 @@ check('确认后才走既有异步接口 POST /market/install-lnmp（不是同�
 check('安装请求体里是用户选的 php@8.4（不是默认的 8.2）',
   /"php":"php@8\.4"/.test(result.sites.installBody || ''),
   String(result.sites.installBody || ''));
+
+// 卸载确认框的回归断言（见 3b）。
+check('点「卸载」先弹出确认框，并逐条列出真实计划步骤',
+  uninstallFlow.hasConfirm && uninstallFlow.hasSteps, show(uninstallFlow.buttons));
+check('点「确认卸载」后**真的**发出卸载请求（回归：确认结果被 resolve(false) 吞掉）',
+  uninstallFlow.calls.some((c) => /^DELETE .*\/market\/frpc/.test(c)), show(uninstallFlow.calls.slice(-4)));
 
 console.log('\n══════════ 断言结果 ══════════');
 let failed = 0;

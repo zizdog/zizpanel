@@ -503,6 +503,18 @@ type PHPVersion struct {
 	ActualVersion string `json:"actual_version,omitempty"`
 }
 
+// majorMinor 把 "8.4.7" / "8.4" / "8" 统一成 "8.4" 形式（拿不到就原样返回）。
+//
+// 为什么需要：Homebrew 的 Cellar 目录名是完整版本（`php/8.4.7`），而面板的站点
+// 配置、端点路径、应用目录 ID 全部按 major.minor 走。不归一化的后果是"装了却列不出来"。
+func majorMinor(v string) string {
+	parts := strings.Split(strings.TrimSpace(v), ".")
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return strings.TrimSpace(v)
+}
+
 // DiscoverPHPVersions 从 Homebrew 的实际安装情况推导已安装的 PHP 版本。
 //
 // 为什么不能写死列表：用户可能只装了 php@8.3，也可能装了 8.2/8.3/8.4，
@@ -525,12 +537,31 @@ func DiscoverPHPVersions(brewPrefix string) []PHPVersion {
 		if name != "php" && !strings.HasPrefix(name, "php@") {
 			continue
 		}
+		// **必须确认目标真的存在**（2026-09-18 用户实测的假"已安装"）：
+		// Homebrew 卸载后 <prefix>/opt/php 会留下**悬空软链接**（指向已删掉的
+		// Cellar/php/8.4.7）。只 Readlink 解析出 "8.4" 就会把已经卸载的版本列成
+		// "已安装"，用户照着去 `brew uninstall php@8.4` 只会得到 "No such keg"。
+		// 判据贴着运行体：opt/<name> 能 stat 到（Stat 会跟随软链接，悬空即失败），
+		// 且 <opt>/<name>/bin/php 这个可执行文件真的在。
+		dir := filepath.Join(optDir, name)
+		if _, err := os.Stat(dir); err != nil {
+			continue // 悬空软链接 / 目录已不在 = 这个版本没装
+		}
+		if _, err := os.Stat(filepath.Join(dir, "bin", "php")); err != nil {
+			continue // 目录在但没有解释器：不是一份可用的 PHP
+		}
 		version := ""
 		if v, ok := strings.CutPrefix(name, "php@"); ok {
 			version = v
 		} else {
 			// `php` 是版本别名（当前指 8.4）：解析软链接拿到真实版本号，
 			// 否则会出现一个叫 "php" 的条目，用户根本不知道那是哪个版本。
+			//
+			// 软链接目标是 Cellar 的**完整版本目录**（`../Cellar/php/8.4.7`），
+			// 所以必须取 major.minor（面板的站点配置、端点路径、目录 ID 全用 x.y）。
+			// 以前直接把 "8.4.7" 当版本号 → 被 `^[0-9]+\.[0-9]+$` 拒掉 → 这台机器上
+			// **装了 PHP 8.4（formula 叫 php）却完全不出现在面板里**（2026-09-18 用户实测：
+			// 面板 PHP 环境只列 8.2，用户以为 8.4 没装/卸不掉）。
 			if link, err := os.Readlink(filepath.Join(optDir, name)); err == nil {
 				base := filepath.Base(link)
 				if v, ok := strings.CutPrefix(base, "php@"); ok {
@@ -539,6 +570,7 @@ func DiscoverPHPVersions(brewPrefix string) []PHPVersion {
 					version = base
 				}
 			}
+			version = majorMinor(version)
 		}
 		if !rePHPVersion.MatchString(version) {
 			continue // 拿不到版本号就不列出来（列出来也没法配）

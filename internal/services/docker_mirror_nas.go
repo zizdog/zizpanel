@@ -167,7 +167,7 @@ func (m *Manager) ensureColimaConfigFile() (string, error) {
 			return "", fmt.Errorf("设置 %s 归属失败：%w", dir, err)
 		}
 	}
-	if err := os.WriteFile(cfg, []byte("# 由 ZizPanel 预置（只写必须项，其余用 Colima 默认值）\n"), 0o644); err != nil {
+	if err := m.writeColimaConfig(cfg, []byte("# 由 ZizPanel 预置（只写必须项，其余用 Colima 默认值）\n")); err != nil {
 		return "", fmt.Errorf("创建 %s 失败：%w", cfg, err)
 	}
 	return cfg, nil
@@ -295,7 +295,7 @@ func (m *Manager) writeColimaDockerMirrors(mirrors []string) (string, error) {
 	if len(insecure) > 0 {
 		updated = setColimaDockerOption(updated, "insecure-registries", insecure)
 	}
-	if err := os.WriteFile(cfg, []byte(updated), 0o644); err != nil {
+	if err := m.writeColimaConfig(cfg, []byte(updated)); err != nil {
 		return "", fmt.Errorf("写入 %s 失败：%w", cfg, err)
 	}
 	return cfg, nil
