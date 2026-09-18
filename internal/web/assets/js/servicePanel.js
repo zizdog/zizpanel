@@ -478,7 +478,12 @@ async function resolvePanelData(market, svc) {
   // 服务详情本来就便宜（本机接口），多这一次查询换来的是诚实的按钮清单。
   let cred = null;
   const credName = s ? serviceNameOf(s) : '';
-  if (credName) {
+  // 只在**可能真有凭据**时才去问（应用声明了配置文件路径；后端正是从那个文件里解析凭据）。
+  // 否则每次打开没有配置文件的应用（如 Docker 运行时）都会打一条 404 ——
+  // 按钮确实不会出现（下面 catch 掉），但浏览器控制台会留一条错误，
+  // 而我们自己的 UI 门禁把控制台错误当失败（2026-09-18 smoke 因此变红）。
+  const mayHaveCreds = !!(m && m.config_path);
+  if (credName && mayHaveCreds) {
     try {
       const res = await api.serviceCredentials(credName);
       const list = loginCredsOf(res && res.credentials);

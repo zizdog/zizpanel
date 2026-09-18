@@ -324,12 +324,54 @@ func (d *colimaDriver) Start(ctx context.Context) error {
 	if err := m.ApplyColimaWorkDirMount(ctx); err != nil {
 		return fmt.Errorf("配置 compose 数据目录挂载失败: %w", err)
 	}
+	// **僵尸转发**要用 restart 而不是 start（2026-09-18 真机实测）：
+	// 虚拟机还活着、但宿主侧的 socket 转发断了（socket 文件在、连上去没人应答）。
+	// 这时 `colima start` 是空操作（它认为 already running），于是用户点「启动」
+	// 什么都没发生 —— 又一种"点了没反应"。判据贴着运行体：socket 可达性。
+	action, why := "start", ""
+	if m.colimaForwardingStale(ctx) {
+		action, why = "restart", "检测到虚拟机在运行但 Docker socket 转发已失效（连不上引擎）：改用 colima restart 重建转发"
+	}
+	if why != "" {
+		emit(ctx, tasks.LevelStep, why)
+	}
 	// 冷启动要拉起虚拟机；首次还要下 317MiB 的 guest 镜像（公网实测约 71 分钟，
 	// 已从自建镜像站预热则几秒），所以超时按 colimaStartTimeout（90 分钟）给。
-	if _, err := m.runColima(ctx, colimaStartTimeout, "start"); err != nil {
+	if _, err := m.runColima(ctx, colimaStartTimeout, action); err != nil {
 		return fmt.Errorf("启动 Docker 运行时失败: %w", err)
 	}
 	return nil
+}
+
+// colimaForwardingStale 判断"虚拟机在跑、但宿主侧 socket 连不上引擎"这种僵尸转发。
+//
+// 为什么单列一个函数：它是"启动"与"重启"两条路的唯一判据，散在两处迟早走样。
+// 只做**只读探测**（fastState + 一次 socket 连接），不执行任何命令。
+func (m *Manager) colimaForwardingStale(_ context.Context) bool {
+	running, _, found := m.colimaFastState()
+	if !found || !running {
+		return false // 虚拟机根本没在跑：正常 start
+	}
+	// socket 文件在、但问不到引擎版本 → 转发已失效。
+	sock := ""
+	for _, c := range []string{
+		filepath.Join(m.colimaHome(), ".colima", "default", "docker.sock"),
+		filepath.Join(m.colimaHome(), ".colima", "docker.sock"),
+	} {
+		if isSocketFile(c) {
+			sock = c
+			break
+		}
+	}
+	if sock == "" {
+		// 连 socket 文件都没有，虚拟机却在跑：同样按"转发没建立"处理。
+		return true
+	}
+	probe := dockerVersionViaSocket
+	if m.dockerVersionOverride != nil { // 测试注入点（单测不许真连 socket）
+		probe = m.dockerVersionOverride
+	}
+	return probe(context.Background(), sock) == ""
 }
 
 func (d *colimaDriver) Stop(ctx context.Context) error {

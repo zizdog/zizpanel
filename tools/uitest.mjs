@@ -1894,7 +1894,12 @@ try {
       // 多个 pill，取第一个会拿到"运行中"，从而把一个正常的日志流误判成失败
       // （2026-09-20 实测踩到）。
       const pill = await page.locator('[data-testid="zp-logs-status"]').first().innerText();
-      const body = await page.locator('.modal-body').innerText().catch(() => '');
+      // 日志弹窗是**叠在**「应用管理」面板之上的，所以页面里同时有 2 个 .modal-body：
+      // 直接 innerText() 会命中 Playwright 的 strict mode 违规 → catch 吞掉 → body 变成空串，
+      // 于是"失败必须说明原因"这条断言看起来像是产品没说话（2026-09-18 实测的假失败）。
+      // 取全部弹窗正文拼起来，断言才是在看真实的页面文本。
+      const bodies = await page.locator('.modal-body').allInnerTexts().catch(() => []);
+      const body = bodies.join('\n');
       const okStates = ['实时', '中断', '结束', '无法读取日志'];
       if (!okStates.some((s) => pill.includes(s))) {
         throw new Error('日志流状态既不是实时/中断/结束，也不是明确的失败: ' + pill);

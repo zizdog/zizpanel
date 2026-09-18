@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -594,5 +595,97 @@ func TestEnsureColimaOwnershipRepairsRootOwnedTree(t *testing.T) {
 	m2.ensureColimaOwnership(context.Background())
 	if calls != 1 {
 		t.Errorf("同进程内应只修一次（幂等），实际 %d 次", calls)
+	}
+}
+
+// TestColimaStartUsesRestartWhenForwardingStale 锁住 2026-09-18 真机遇到的第三种
+// "点了没反应"：虚拟机还在跑，但宿主侧的 socket 转发断了（socket 文件在、连上去没人
+// 应答）。此时 `colima start` 是**空操作**（它认为 already running），用户点「启动」
+// 什么都不会发生。正确动作是 `colima restart`（重建转发）。
+//
+// 判据必须贴着运行体：socket 能不能真的问到引擎，而不是"文件在不在"。
+func TestColimaStartUsesRestartWhenForwardingStale(t *testing.T) {
+	m, _ := sandboxManager(t)
+	// 家目录必须**短**：unix socket 路径有 104 字节上限，t.TempDir() 的长路径会
+	// bind 失败（invalid argument）。shortPHPPrefix 用的是 /tmp/zpphpXXXX。
+	home := shortPHPPrefix(t)
+	m.opt.UserHome = home
+	// 造一个"虚拟机在跑"的实例目录：ha.pid 指向当前进程（一定活着）+ 一个真实 unix socket
+	inst := filepath.Join(home, ".colima", "_lima", "colima")
+	if err := os.MkdirAll(inst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inst, "ha.pid"), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sshSock := filepath.Join(inst, "ssh.sock")
+	ln, err := net.Listen("unix", sshSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// 1) 转发失效（socket 文件在、问不到引擎）→ 必须走 restart
+	defSock := filepath.Join(home, ".colima", "default")
+	if err := os.MkdirAll(defSock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dl, err := net.Listen("unix", filepath.Join(defSock, "docker.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dl.Close() }()
+	m.dockerVersionOverride = func(context.Context, string) string { return "" }
+	if !m.colimaForwardingStale(context.Background()) {
+		t.Error("socket 在但问不到引擎时应判为转发失效（否则 colima start 空操作，用户点了没反应）")
+	}
+
+	// 2) 转发正常（问得到引擎版本）→ 不该误判成失效（否则每次点启动都白重启一遍虚拟机）
+	m.dockerVersionOverride = func(context.Context, string) string { return "29.5.2" }
+	if m.colimaForwardingStale(context.Background()) {
+		t.Error("能问到引擎版本时不该判为转发失效")
+	}
+}
+
+// TestResolveDockerSocketPrefersRealColimaSocket 锁住 2026-09-18 真机缺陷：
+//
+// 面板配置里默认写 `/var/run/docker.sock`，而 macOS 上的 Docker 引擎来自 Colima
+// （socket 在 `~/.colima/default/docker.sock`）。判据若只看配置，就会出现
+// "引擎明明在跑，Docker 页却说 socket 不存在、容器列表 409"。
+// 规则：**现实优先** —— 配置里的路径不存在时，自动认 Colima 的 socket。
+func TestResolveDockerSocketPrefersRealColimaSocket(t *testing.T) {
+	home := shortPHPPrefix(t)
+	sockDir := filepath.Join(home, ".colima", "default")
+	if err := os.MkdirAll(sockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(sockDir, "docker.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	got := resolveDockerSocket(Options{UserHome: home, DockerSocket: "/var/run/docker.sock"})
+	want := filepath.Join(sockDir, "docker.sock")
+	if got != want {
+		t.Errorf("配置里的 socket 不存在时应自动认 Colima 的：期望 %s，实际 %s", want, got)
+	}
+
+	// 配置里的 socket **真的存在**时以它为准（部署时改过位置的机器不能被覆盖）。
+	cfgSock := filepath.Join(home, "custom.sock")
+	cl, err := net.Listen("unix", cfgSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cl.Close() }()
+	if got := resolveDockerSocket(Options{UserHome: home, DockerSocket: cfgSock}); got != cfgSock {
+		t.Errorf("配置里存在且是 socket 时应以配置为准，实际 %s", got)
+	}
+
+	// 一个都没有：保留配置值，让报错里显示的仍是用户配置的路径（而不是空串）。
+	// 注意要用一个**没有 Colima socket** 的家目录（上面那个已经造出来了）。
+	empty := shortPHPPrefix(t)
+	if got := resolveDockerSocket(Options{UserHome: empty, DockerSocket: "/nope/docker.sock"}); got != "/nope/docker.sock" {
+		t.Errorf("都不存在时应保留配置值，实际 %s", got)
 	}
 }

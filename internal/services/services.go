@@ -25,6 +25,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -358,7 +360,50 @@ type MySQLCredential struct {
 
 // NewManager 创建服务管理器。
 func NewManager(repo *Repository, opt Options) *Manager {
+	opt.DockerSocket = resolveDockerSocket(opt)
 	return &Manager{repo: repo, opt: opt}
+}
+
+// dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，
+// 按确定性从高到低排列。
+//
+// 为什么必须比配置多探几处（2026-09-18 用户真机）：面板配置里默认写的是
+// `/var/run/docker.sock`，而 macOS 上的 Docker 引擎来自 Colima —— 它的 socket 在
+// `~/.colima/default/docker.sock`。于是"引擎明明在跑"，Docker 页却报
+// "socket 不存在（/var/run/docker.sock）：引擎没有在运行"，容器列表 409。
+// 这类"配置里的值 ≠ 现实"的判据必须**以现实为准**（铁律：看真实状态）。
+func dockerSocketCandidates(opt Options) []string {
+	var out []string
+	if v := strings.TrimSpace(opt.DockerSocket); v != "" {
+		out = append(out, v)
+	}
+	if home := strings.TrimSpace(opt.UserHome); home != "" {
+		out = append(out,
+			filepath.Join(home, ".colima", "default", "docker.sock"),
+			filepath.Join(home, ".colima", "docker.sock"),
+		)
+	}
+	// OrbStack / Docker Desktop 的常见位置也顺带认一下（用户换运行时不必改配置）。
+	if home := strings.TrimSpace(opt.UserHome); home != "" {
+		out = append(out,
+			filepath.Join(home, ".orbstack", "run", "docker.sock"),
+			filepath.Join(home, ".docker", "run", "docker.sock"),
+		)
+	}
+	out = append(out, "/var/run/docker.sock")
+	return out
+}
+
+// resolveDockerSocket 选出**真实存在**的 socket；都没有则保留配置值（让报错里
+// 显示用户配置的那个路径，而不是空串）。
+func resolveDockerSocket(opt Options) string {
+	configured := strings.TrimSpace(opt.DockerSocket)
+	for _, c := range dockerSocketCandidates(opt) {
+		if fi, err := os.Stat(c); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			return c
+		}
+	}
+	return configured
 }
 
 // DriverFor 为一条服务记录构造对应的驱动。

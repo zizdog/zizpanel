@@ -49,7 +49,7 @@ function fmtSeconds(ms) {
 
 export async function renderMirrors(pane, ctx) {
   clear(pane);
-  appendAll(pane, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取加速源配置…' })]));
+  //appendAll(pane, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取加速源配置…' })]));
 
   // 两个请求并行：现状（很快，不探测）与"上次检测"的缓存（只读）。
   // 缓存接口失败不致命 —— 如实显示"尚未检测"即可，不要因此整页报错。
@@ -137,7 +137,7 @@ export async function renderMirrors(pane, ctx) {
         h('span', { text: '❔' }),
         h('div', { style: { flex: 1, minWidth: '200px' } }, [
           h('div', { style: { fontWeight: '620' }, text: 'Docker Hub 官方源（registry-1.docker.io）' }),
-          h('div', { style: { fontSize: '12px', opacity: 0.85 }, text: '尚未检测。点上面的「检测可用性」会用你自己这台机器的网络实测一次（最多约 8 秒）。' }),
+          h('div', { style: { fontSize: '12px', opacity: 0.85 }, text: '尚未检测。点击「检测可用性」会用你自己这台机器的网络实测一次（最多约 8 秒）。' }),
         ]),
       ]));
       return;

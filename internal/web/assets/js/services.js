@@ -408,13 +408,21 @@ export function openLogs(s) {
           status.className = 'pill warn';
           status.textContent = '无法读取日志';
           // 去非流式接口问一句真正的原因，别把原因硬编码在文案里。
+          // 如果这次查询本身也成功了（或失败得没给出原因），**也必须说点什么** ——
+          // 只留一句空的"（日志流无法建立）"等于把用户晾在那里（用户要求：
+          // 点击必有响应、有过程、有提示）。此时如实说明"服务端没给原因"，
+          // 并把面板知道的日志路径写出来（用户能自己去终端看）。
           let why = '';
           try {
             await api.serviceLogs(s.name, 1);
           } catch (e) {
-            why = e.message;
+            why = (e && e.message) || '';
           }
-          box.textContent = '（日志流无法建立' + (why ? '：' + why : '') + '）\n' + box.textContent;
+          if (!why) {
+            why = '服务端没有给出原因（这个服务可能没有可读的日志文件，或运行时不可用）' +
+              (s.log_path ? '；面板记录的日志路径：' + s.log_path : '');
+          }
+          box.textContent = '（日志流无法建立：' + why + '）\n' + box.textContent;
           return;
         }
         status.className = 'pill warn';
