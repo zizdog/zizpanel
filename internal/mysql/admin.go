@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -392,12 +393,37 @@ func (c *Client) ImportDatabase(ctx context.Context, db, sqlFile string) (string
 		return "", errors.New("这是一个目录，请选择 .sql 文件")
 	}
 
+	return c.ImportDatabaseProgress(ctx, db, sqlFile, nil)
+}
+
+// ImportDatabaseProgress 与 ImportDatabase 相同，但把**已送入 mysql 的字节数**回调出去。
+//
+// 为什么需要（2026-09-18 用户报障）：4MB 的 SQL 通过 phpMyAdmin 导入时页面没有任何
+// 输出，用户只能看到"卡死"；而面板自己的导入以前也是个长请求，同样看不到进展。
+// 这里改成"面板读文件 → 计数 → 喂给 mysql 的 stdin"，于是能算出真实进度
+// （已导入 1.2 MB / 4.0 MB，30%），任务中心据此显示进度条，也能中断
+// （中断 = 杀掉 mysql 进程，文件与库都不会留下半截状态以外的东西）。
+func (c *Client) ImportDatabaseProgress(ctx context.Context, db, sqlFile string,
+	onProgress func(done, total int64)) (string, error) {
+	if err := ValidateDBName(db); err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(sqlFile) {
+		return "", errors.New("SQL 文件路径必须是绝对路径")
+	}
+	st, err := os.Stat(sqlFile)
+	if err != nil {
+		return "", fmt.Errorf("找不到 SQL 文件: %w", err)
+	}
+	if st.IsDir() {
+		return "", errors.New("这是一个目录，请选择 .sql 文件")
+	}
 	bin := filepath.Join(c.opt.BinDir, "mysql")
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	args := []string{"-u", c.opt.User, "--default-character-set=utf8mb4", db}
 	if c.opt.Socket != "" {
-		if _, err := os.Stat(c.opt.Socket); err == nil {
+		if _, serr := os.Stat(c.opt.Socket); serr == nil {
 			args = append(args, "-S", c.opt.Socket)
 		}
 	} else {
@@ -405,18 +431,47 @@ func (c *Client) ImportDatabase(ctx context.Context, db, sqlFile string) (string
 			"-P", fmt.Sprint(orDefaultInt(c.opt.Port, 3306)))
 	}
 	cmd := execCommandContext(ctx, bin, args...)
-	cmd.Stdin, err = os.Open(sqlFile)
+	f, err := os.Open(sqlFile)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = f.Close() }()
+	// 计数阅读器：每读到一块就回调一次，进度是**真实的字节数**（不是猜的百分比）。
+	cmd.Stdin = &countingReader{r: f, total: st.Size(), onProgress: onProgress}
 	if c.opt.Password != "" {
 		cmd.Env = append(os.Environ(), "MYSQL_PWD="+c.opt.Password)
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("导入被中断或超时（已送入 %s）：%s", humanKB(st.Size()),
+				strings.TrimSpace(stderr.String()))
+		}
 		return "", fmt.Errorf("导入失败: %s", strings.TrimSpace(stderr.String()))
 	}
 	return fmt.Sprintf("已导入 %s（%.1f KB）到 %s", filepath.Base(sqlFile),
 		float64(st.Size())/1024, db), nil
 }
+
+// countingReader 边读边报进度（给导入用）。
+type countingReader struct {
+	r          io.Reader
+	done       int64
+	total      int64
+	onProgress func(done, total int64)
+	last       time.Time
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.done += int64(n)
+	// 限流：每 200ms 或读到结尾时报一次，避免刷爆任务日志。
+	if c.onProgress != nil && (time.Since(c.last) > 200*time.Millisecond || err == io.EOF) {
+		c.last = time.Now()
+		c.onProgress(c.done, c.total)
+	}
+	return n, err
+}
+
+func humanKB(n int64) string { return fmt.Sprintf("%.1f KB", float64(n)/1024) }

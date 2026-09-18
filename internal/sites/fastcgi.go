@@ -35,6 +35,15 @@ import (
 // 因为端点必须按机器/版本解析（见 PreferredFastCGIPass），绝不能写死 9000。
 func FastCGIParamsBlock() string {
 	var b strings.Builder
+	// ⚠️ 必须先定义 $zp_scheme / $zp_https（schemeTrustBlock 就是那几条 set）。
+	//
+	// 2026-09-18 mini 真机事故：默认站点/phpMyAdmin 这个块引用了 `$zp_scheme`
+	// （参数清单里的 REQUEST_SCHEME / HTTPS），却**没有**那几条 `set` ——
+	// 站点 vhost 里恰好有（Generate 走的是 fastcgiParams()），于是"本机能跑、
+	// mini 起不来"：mini 上没有任何站点 vhost 定义过这个变量 →
+	// `nginx: [emerg] unknown "zp_scheme" variable` → **nginx 直接起不来**，
+	// 用户连重装 nginx 都没用（配置还在）。凡引用就必须定义，这个块自己带上。
+	b.WriteString(schemeTrustBlock())
 	b.WriteString("fastcgi_index  index.php;\n")
 	b.WriteString("fastcgi_split_path_info ^(.+?\\.php)(/.*)$;\n")
 	b.WriteString("\n")

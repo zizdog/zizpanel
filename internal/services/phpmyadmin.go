@@ -731,15 +731,18 @@ func (m *Manager) ensureDefaultVhost(ctx context.Context, result *InstallResult)
 		action = defaultVhostAction(string(existing))
 	}
 
-	// 先把站点文件准备好（无论 vhost 动不动，缺了就补）
-	indexPHP, phpCreated, perr := sites.EnsureDefaultSitePHPIndex(wwwRoot)
-	if perr != nil {
-		result.Warning = appendWarning(result.Warning, "默认站点 index.php 创建失败："+perr.Error())
-	}
-	// index.html 是上一版的占位页：保留不动（用户可能改过）。它只是被 index.php 抢先。
+	// 先把站点文件准备好（无论 vhost 动不动，缺了就补）。
+	//
+	// ⚠️ 默认站点是**纯静态**的（用户 2026-09-18 明确要求："我从没要求默认站点要能跑
+	// PHP！我一直说的是默认站点是纯静态的，只需要一个 index.html！"）——
+	// 所以这里**只建 index.html**，不再往默认站点里放 index.php。
+	// phpMyAdmin 需要的是它自己的 `/phpmyadmin/` location（那里有 fastcgi），
+	// 与首页用哪张页面毫无关系；以前多建一个 index.php 反而把它顶到 index.html 前面，
+	// 让"默认站点复核"永远失败（真机事故，见 DEVELOPMENT 坑 173）。
 	if _, _, herr := sites.EnsureLocalhostPlaceholder(wwwRoot); herr != nil {
 		result.Warning = appendWarning(result.Warning, "默认站点占位页创建失败："+herr.Error())
 	}
+
 	if m.opt.UserName != "" {
 		_, _, _ = chownTreeTo(m.opt.UserName, siteRoot)
 	}
@@ -755,9 +758,6 @@ func (m *Manager) ensureDefaultVhost(ctx context.Context, result *InstallResult)
 		} else {
 			result.step(ctx, "默认站点已存在（非面板创建，未改动）："+siteRoot)
 		}
-		if phpCreated {
-			result.step(ctx, "已补上默认站点首页 "+indexPHP+"（原有内容未改动）")
-		}
 		return nil
 	}
 
@@ -765,7 +765,7 @@ func (m *Manager) ensureDefaultVhost(ctx context.Context, result *InstallResult)
 	pass, version := m.defaultFastCGIPass()
 	if pass == "" {
 		msg := "没有可用的 PHP 端点，默认站点暂时无法执行 PHP（请先确保 PHP 版本已安装并监听）；" +
-			"站点目录与 index.php 已就绪：" + siteRoot
+			"站点目录与 index.html 已就绪：" + siteRoot
 		result.Warning = appendWarning(result.Warning, msg)
 		result.step(ctx, "警告："+msg)
 		return nil
@@ -824,7 +824,8 @@ func (m *Manager) pmaDefaultVhostContent(wwwRoot, siteRoot, fastcgiPass, phpVers
 	fmt.Fprintf(&b, "    root   %s;\n", siteRoot)
 	// index.php 放在前面：这样 / 走 PHP（用户要求"有一个默认 index.php"）。
 	// 旧的 index.html 保留不动，只是排在后面。
-	b.WriteString("    index  index.php index.html;\n\n")
+	// 纯静态默认站点：index.html 在前（用户明确要求，同上）。
+	b.WriteString("    index  index.html index.php;\n\n")
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", logDir)
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", logDir)
 	// 请求体上限：默认 512m（nginx 出厂 1m 会让几十 MB 的 SQL 导入直接 413）。

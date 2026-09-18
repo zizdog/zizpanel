@@ -1537,7 +1537,15 @@ func (s *Server) handleSiteCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNginxTest(w http.ResponseWriter, r *http.Request) {
 	res, err := s.callHelper(r.Context(), "nginx-test")
 	if err != nil {
-		ok(w, map[string]any{"ok": false, "output": err.Error()})
+		// ⚠️ 失败时必须把**助手的原始输出**（`nginx -t` 的正文，含文件名与行号）
+		// 带给界面。2026-09-18 用户报障："配置有问题：nginx 配置检查未通过" ——
+		// 只有这一句，**看不出哪一行错**，用户只能干瞪眼。
+		// 助手在 ok:false 时把正文放在 msg、错误摘要放在 error，这里两个都要给。
+		detail := err.Error()
+		if m, _ := res["msg"].(string); strings.TrimSpace(m) != "" {
+			detail = strings.TrimSpace(m) + "\n\n" + detail
+		}
+		ok(w, map[string]any{"ok": false, "output": detail})
 		return
 	}
 	msg, _ := res["msg"].(string)
@@ -1787,6 +1795,56 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 		return
 	}
 	s.Log.Info("nginx 环境检查: %s", msg)
+
+	// 全局请求体上限也要自愈：`brew reinstall/upgrade nginx` 会把 nginx.conf
+	// **还原成 brew 出厂版** —— 那里面既没有 vhosts include（上面刚补），也没有
+	// 面板设的 `client_max_body_size`（出厂的 1m）。真机后果（2026-09-18）：
+	// "文件在、服务在、就是不生效"——4MB 的 SQL 导入直接被 nginx 以 1m 拒掉，
+	// 用户看到的是"phpMyAdmin 导入失败/卡住"，而面板里怎么看都正常。
+	s.ensureGlobalBodySize(ctx)
+}
+
+// ensureGlobalBodySize 确保 nginx.conf 的 http 块里有面板配置的全局请求体上限。
+//
+// 只读判断 → 不一致才写（写之前会备份、写后 nginx -t、失败回滚，见 priv.NginxTuningWrite）。
+// 这是幂等的：一致时一次文件读 + 一次比较，不做任何改动、不 reload。
+func (s *Server) ensureGlobalBodySize(ctx context.Context) {
+	want := strings.TrimSpace(s.Cfg.NginxClientMaxBodySize)
+	if want == "" {
+		return
+	}
+	b, err := os.ReadFile(s.Cfg.NginxConf)
+	if err != nil {
+		return
+	}
+	cur, _ := sites.FindClientMaxBodySize(string(b))
+	if strings.TrimSpace(cur) == want {
+		return
+	}
+	mb, ok := sites.ParseSizeBytes(want)
+	if !ok || mb <= 0 {
+		return
+	}
+	mbInt := int(mb / (1024 * 1024))
+	if mbInt < 1 {
+		mbInt = 1
+	}
+	tv, err := s.readNginxTuning(ctx)
+	if err != nil {
+		s.Log.Warn("全局请求体上限自愈失败（读不到 nginx 当前参数）：%v", err)
+		return
+	}
+	tv.ClientMaxBodySizeMB = mbInt
+	enc, err := priv.TuningEncode(tv)
+	if err != nil {
+		return
+	}
+	if _, werr := s.callHelper(ctx, "nginx-tuning-write", "-values", enc); werr != nil {
+		s.Log.Warn("全局请求体上限自愈失败（%s → %s）：%v", cur, want, werr)
+		return
+	}
+	s.Log.Info("已把全局 client_max_body_size 自愈为 %s（原来 %q —— 常见于 brew 重装/升级 nginx 还原了 nginx.conf）",
+		want, cur)
 }
 
 // checkProxyAgainstSiteVhosts 检查一条反代规则是否与 vhosts 目录里已有文件

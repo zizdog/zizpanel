@@ -44,9 +44,10 @@ func TestBuildDefaultVhostUsesSocketEndpoint(t *testing.T) {
 	if strings.Contains(content, "includes/php-fpm.conf") {
 		t.Errorf("不该再 include 那份写死 9000 的片段（这正是要修的 bug）：\n%s", content)
 	}
-	// index.php 必须优先：否则"整理默认站点"会把 PHP 版默认站点退回旧的 index.html
-	if !strings.Contains(content, "index  index.php index.html;") {
-		t.Errorf("index.php 应排在 index.html 前面：\n%s", content)
+	// 用户 2026-09-18 明确要求："默认站点是纯静态的，只需要一个 index.html" ——
+	// 所以 index.html 必须排在前面（面板也不再往默认站点里放 index.php）。
+	if !strings.Contains(content, "index  index.html index.php;") {
+		t.Errorf("index.html 应排在 index.php 前面（默认站点是纯静态的）：\n%s", content)
 	}
 	// 默认站点 + phpMyAdmin 各一处
 	if n := strings.Count(content, "fastcgi_pass"); n != 2 {

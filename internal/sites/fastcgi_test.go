@@ -115,3 +115,41 @@ func writeFakePHPConfForTest(t *testing.T, prefix, version, listen string) error
 	conf := filepath.Join(prefix, "etc", "php", version, "php-fpm.d", "www.conf")
 	return os.WriteFile(conf, []byte(body), 0o644)
 }
+
+// TestEveryGeneratedBlockDefinesSchemeVars：**凡引用 $zp_scheme/$zp_https，就必须定义它们。**
+//
+// 2026-09-18 mini 真机事故（用户报"nginx 无法启动""重装 nginx 也无效"）：
+// 默认站点/phpMyAdmin 的参数块引用了 $zp_scheme（REQUEST_SCHEME / HTTPS 两条），
+// 却没有那几条 `set` —— 站点 vhost 里恰好有（Generate 走 fastcgiParams()），
+// 于是"本机能跑、mini 起不来"：mini 上没有任何站点 vhost 定义过它，
+// nginx 直接 `[emerg] unknown "zp_scheme" variable` **起不来**，
+// 而配置是面板写的，重装 nginx 当然没用。
+//
+// 这条门禁遍历**所有**生成器输出，逐块检查"引用即定义"，把这一整类钉死。
+func TestEveryGeneratedBlockDefinesSchemeVars(t *testing.T) {
+	blocks := map[string]string{
+		"FastCGIParamsBlock": FastCGIParamsBlock(),
+		"FastCGIParams":      FastCGIParams(),
+		"PHPIniFragment":     PHPIniFragment(DefaultLimits()),
+	}
+	// 站点 vhost 也过一遍（它内部可能有多处引用）
+	site := &Site{Domain: "x.test", Root: "/tmp/x", Rewrite: "none", Enabled: true}
+	if conf, err := site.Generate(Options{LogDir: "/tmp/logs"}); err == nil {
+		blocks["site.Generate"] = conf
+	} else {
+		t.Fatalf("生成站点配置失败: %v", err)
+	}
+	for name, body := range blocks {
+		usesScheme := strings.Contains(body, "$zp_scheme")
+		usesHTTPS := strings.Contains(body, "$zp_https")
+		if !usesScheme && !usesHTTPS {
+			continue
+		}
+		if usesScheme && !strings.Contains(body, "set $zp_scheme") {
+			t.Errorf("%s 引用了 $zp_scheme 却没有定义它 —— nginx 会报 unknown zp_scheme variable 并**拒绝启动**（mini 真机事故）", name)
+		}
+		if usesHTTPS && !strings.Contains(body, "set $zp_https") {
+			t.Errorf("%s 引用了 $zp_https 却没有定义它 —— 同上", name)
+		}
+	}
+}

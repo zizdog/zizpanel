@@ -202,7 +202,11 @@ func (s *Server) buildDefaultVhost() string {
 	fmt.Fprintf(&b, "    root   %s;\n", localhostDir)
 	// index.php 放在前面：用户要求"默认站点有一个 index.php"，而"整理默认站点"
 	// 会把这份模板整份重写 —— 顺序写反了就会让 PHP 版默认站点退回旧的静态 index.html。
-	b.WriteString("    index  index.php index.html;\n\n")
+	// 用户 2026-09-18 明确要求："我从没要求默认站点要能跑 PHP！我一直说的是
+	// 默认站点是纯静态的，只需要一个 index.html！" —— 所以 index.html 排在前面，
+	// 而且面板**不再**往默认站点里放 index.php（见 phpmyadmin.go 里的说明）。
+	// PHP 只在 phpMyAdmin 那个 location 里用（那是它自己的事，与首页无关）。
+	b.WriteString("    index  index.html index.php;\n\n")
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", filepath.Join(wwwRoot, "_logs"))
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", filepath.Join(wwwRoot, "_logs"))
 	// 请求体上限：nginx 出厂只有 1m，用户导入几十 MB 的 SQL 会先撞 413
@@ -274,6 +278,10 @@ func (s *Server) phpAdminProxyTo(target *url.URL) http.Handler {
 		prefix = "/" + suf
 	}
 	return &httputil.ReverseProxy{
+		// 边收边转发（默认是"缓冲后再写"）：phpMyAdmin 的页面在慢机器/慢库上
+		// 可能几秒才出正文，缓冲会让浏览器**一直白屏转圈**（用户 2026-09-18 报障：
+		// "就这样卡着，一直加载不动"）。100ms 一次 flush 让它像直连一样逐段出现。
+		FlushInterval: 100 * time.Millisecond,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
@@ -311,8 +319,19 @@ func (s *Server) phpAdminProxyTo(target *url.URL) http.Handler {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = fmt.Fprintf(w, `<h1>502 phpMyAdmin 不可用</h1><p>面板无法连接本机 nginx 上的 phpMyAdmin：%s</p>
-<p>常见原因：nginx 没在跑，或 phpMyAdmin 还没安装（应用市场 → phpMyAdmin）。</p>`, escHTML(err.Error()))
+			// 错误页要**可操作**：不只是报"连不上"，而是把最可能的三步直接写出来
+			// （2026-09-18：用户遇到的是"页面一直转圈"，根因是 PHP-FPM 里有卡住的
+			// 请求 / nginx 没跑 / phpMyAdmin 没装 —— 三者的排查顺序就按这个写）。
+			_, _ = fmt.Fprintf(w, `<h1>502 phpMyAdmin 暂时不可用</h1>
+<p>面板无法连接本机 nginx 上的 phpMyAdmin（或它超时未响应）：%s</p>
+<p>如果刚才是"页面一直转圈没有反应"，**最可能是 PHP-FPM 里有卡住的请求**（phpMyAdmin 的
+会话在请求期间加锁，卡住的那个请求会让后面每个页面都排队等它）：</p>
+<ol>
+  <li>如果刚才有导入/导出**一直在转圈**：去「网站管理 → 🐘 PHP 环境」把对应 PHP 版本**重启**一次
+      （卡住的请求会一直占着 PHP 的会话，后面的页面就永远转圈），然后**只开一个 phpMyAdmin 标签页**重试。</li>
+  <li>确认 nginx 在跑：「网站管理 → ⚙️ Nginx 管理 → 服务」应显示"运行中"，不在跑就点「▶ 启动」。</li>
+  <li>确认 phpMyAdmin 已安装：「应用 → 应用市场 → phpMyAdmin」。</li>
+</ol>`, escHTML(err.Error()))
 		},
 	}
 }
@@ -348,7 +367,27 @@ func (s *Server) handlePhpMyAdmin(w http.ResponseWriter, r *http.Request) {
 		s.phpAdminLoginRequired(w, r)
 		return
 	}
-	s.phpAdminProxy().ServeHTTP(w, r)
+	// ⚠️ phpMyAdmin 的**导入**是一个大 body 的 POST（走浏览器 → 面板 → nginx → PHP）。
+	// 面板全局设了 `ReadTimeout: 30s`（防 Slowloris），它算的是"读完整个请求体"的
+	// 绝对截止时间 —— 于是任何一段稍慢的上传都会在面板这一层被掐断，表现就是
+	// **点了导入没反应/一直转圈**（2026-09-18 用户报障："我就是要用 phpMyAdmin"）。
+	// 这里给这条路由单独把读截止时间推后（与文件上传同一条保护，见 api_upload_guard.go）。
+	if r.Method == http.MethodPost {
+		if err := allowLongUpload(w, r); err != nil {
+			s.Log.Warn("延长 phpMyAdmin 反代的读超时失败（大文件导入可能被中断）：%v", err)
+		}
+	}
+	// 给上游一个**明确的上限**：超过就由反代的 ErrorHandler 输出一张"可操作"的错误页，
+	// 而不是让浏览器无限转圈（2026-09-18 用户报障："就这样卡着，一直加载不动"）。
+	// 页面（GET）给 2 分钟，导入/导出（POST）给 15 分钟（4MB 的库本机只要 2 秒，
+	// 15 分钟足够宽松；再大就该用「数据库 → 导入 SQL 文件」那条不走 PHP 的路）。
+	timeout := 2 * time.Minute
+	if r.Method == http.MethodPost {
+		timeout = 15 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	s.phpAdminProxy().ServeHTTP(w, r.WithContext(ctx))
 }
 
 // phpAdminLoginRequired 给未登录用户一张说明页：说清"要先去面板登录"，

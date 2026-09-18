@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/zizdog/zizpanel/internal/tasks"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -677,14 +678,45 @@ func (s *Server) handleDatabaseImport(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	msg, err := c.ImportDatabase(r.Context(), req.Name, req.File)
-	if err != nil {
-		s.audit(r, "db_import", req.Name, "导入失败: "+err.Error(), false, "")
-		fail(w, http.StatusInternalServerError, err.Error())
+	// 只读预检：文件在不在、是不是目录 —— 参数问题当场 400，不建任务。
+	st, serr := os.Stat(req.File)
+	if serr != nil {
+		fail(w, http.StatusBadRequest, "找不到 SQL 文件："+serr.Error())
 		return
 	}
-	s.audit(r, "db_import", req.Name, msg, true, "")
-	ok(w, map[string]any{"msg": msg})
+	if st.IsDir() {
+		fail(w, http.StatusBadRequest, "这是一个目录，请选择 .sql 文件")
+		return
+	}
+	// 走**任务中心**（2026-09-18 用户报障：4MB 的 SQL 导入时页面完全没输出，
+	// 只能看着像"卡死"）。现在：立刻返回 task_id，任务里按**真实字节数**报进度
+	// （已导入 1.2 MB / 4.0 MB），随时可以在任务中心里中断。
+	s.launchTask(w, r, "db_import", req.Name,
+		"导入 "+filepath.Base(req.File)+" → "+req.Name, "db_import",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			log(tasks.LevelStep, fmt.Sprintf("开始导入 %s（%.2f MB）到 %s",
+				filepath.Base(req.File), float64(st.Size())/1024/1024, req.Name))
+			lastPct := -1
+			msg, ierr := c.ImportDatabaseProgress(ctx, req.Name, req.File,
+				func(done, total int64) {
+					if total <= 0 {
+						return
+					}
+					pct := int(done * 100 / total)
+					// 每 5% 报一行：既能看出在动，也不会把日志刷爆。
+					if pct == lastPct || pct%5 != 0 {
+						return
+					}
+					lastPct = pct
+					log(tasks.LevelOut, fmt.Sprintf("已送入 %.2f MB / %.2f MB（%d%%）",
+						float64(done)/1024/1024, float64(total)/1024/1024, pct))
+				})
+			if ierr != nil {
+				return nil, ierr
+			}
+			log(tasks.LevelOK, msg)
+			return map[string]any{"msg": msg}, nil
+		})
 }
 
 // handleDatabaseBackups 列出已导出的备份文件。

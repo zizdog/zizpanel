@@ -11,6 +11,7 @@
 import { api, apiURL } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
 import { state, registerCleanup, panelPath } from './app.js';
+import { taskCenter } from './tasks.js';
 
 let cache = null;
 let tab = 'databases';
@@ -866,11 +867,26 @@ export function DatabaseView(content, ctx = {}) {
           onclick: async () => {
             if (!dbSel.value) { toast('请选择目标数据库', 'warn'); return; }
             if (!path.value.trim()) { toast('请填写文件路径', 'warn'); return; }
+            // 走任务中心：导入大 SQL 是分钟级动作，任务里按**真实字节数**报进度，
+            // 关掉窗口也能找回，还能中断（2026-09-18 用户报障：导入时页面毫无输出，
+            // 只能看着像"卡死"）。
+            close();
             try {
-              const r = await api.databaseImport(dbSel.value, path.value.trim());
-              toast(r.msg, 'ok', 12000);
-              close(); load();
-            } catch (e) { toast(e.message, 'err', 15000); }
+              await taskCenter.start({
+                kind: 'db_import', target: dbSel.value,
+                title: '导入 SQL → ' + dbSel.value,
+                start: () => api.databaseImport(dbSel.value, path.value.trim()),
+                onDone: (task) => {
+                  if (task && task.status && task.status !== 'succeeded') {
+                    toast('导入失败：' + (task.error || task.status), 'err', 16000);
+                    return;
+                  }
+                  const r = (task && task.result) || {};
+                  toast(r.msg || '导入完成', 'ok', 12000);
+                  load();
+                },
+              });
+            } catch (e) { toast('导入失败：' + ((e && e.message) || e), 'err', 15000); }
           },
         }),
       ],

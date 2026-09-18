@@ -936,9 +936,28 @@ export function SitesView(content, ctx = {}) {
         m.close();
         try {
           const r = await api.nginxTest();
-          if (r.ok) toast('nginx 配置校验通过', 'ok');
-          else toast('配置有问题：' + r.output, 'err', 12000);
-        } catch (e) { toast(e.message, 'err'); }
+          if (r.ok) { toast('nginx 配置校验通过', 'ok'); return; }
+          // 校验失败：**把 nginx 的原始输出完整显示出来**（含文件名与行号）。
+          // 用弹窗而不是 toast —— 报错常常好几行，toast 会被截断，
+          // 用户只看到"配置有问题"就等于没给信息（2026-09-18 用户报障）。
+          modal({
+            title: '❌ nginx 配置校验未通过',
+            wide: true,
+            body: h('div', [
+              h('div.hint', { text: '下面是 nginx -t 的原始输出（含出错文件与行号）：' }),
+              h('pre', {
+                style: { whiteSpace: 'pre-wrap', fontFamily: 'var(--mono)', fontSize: '12.5px',
+                  background: 'var(--danger-soft)', padding: '10px 12px', borderRadius: '6px',
+                  maxHeight: '340px', overflow: 'auto', userSelect: 'text' },
+                text: r.output || '（nginx 没有输出任何内容，请看「日志中心 → nginx 主错误日志」）',
+              }),
+              h('div.hint', { style: { marginTop: '8px' },
+                text: '常见修法：按行号改那一行；或到「⚙️ 配置文件」里打开对应文件修正。' +
+                  '面板改 nginx.conf 前会备份成 nginx.conf.zizpanel.bak，可直接用它还原。' }),
+            ]),
+            footer: (close) => [h('button.btn', { text: '关闭', onclick: close })],
+          });
+        } catch (e) { toast(e.message, 'err', 12000); }
       },
     });
     const rebuild = h('button.btn.btn-block', {

@@ -90,7 +90,7 @@ func TestPMADefaultVhostContent(t *testing.T) {
 		"listen       80 default_server;", // 必须抢到默认 server，否则 localhost/IP 访问不到
 		"server_name  _;",
 		"root   " + siteRoot + ";",
-		"index  index.php index.html;", // index.php 在前面 → "/" 就走 PHP
+		"index  index.html index.php;", // 用户要求：默认站点是纯静态的，index.html 优先
 		filepath.Join(www, "_logs", "localhost.access.log"),
 		"location = /phpmyadmin",
 		"location ^~ /phpmyadmin",
@@ -268,5 +268,41 @@ func TestPMAVhostInsertBlockUsesExplicitEndpoint(t *testing.T) {
 	}
 	if strings.Count(block, "{") != strings.Count(block, "}") {
 		t.Errorf("花括号不配对：\n%s", block)
+	}
+}
+
+// TestDefaultSiteStaysStaticNoIndexPHP：默认站点必须是**纯静态**的。
+//
+// 用户 2026-09-18 明确要求（原话）：
+//
+//	"我从没要求默认站点要能跑 PHP！从没有！我一直说得是默认站点是纯表态的。
+//	 只需要一个 index.html！！！"
+//
+// 以前 phpMyAdmin 安装器会顺手往默认站点里放一个 index.php，而它在 nginx 的
+// index 指令里排在 index.html 前面 —— 结果首页永远由 PHP 渲染，
+// "默认站点真的生效了吗"的请求级复核（靠 index.html 里的标记）**永远失败**，
+// 那一步失败还会中止整个上传上限任务（真机事故，见 DEVELOPMENT 坑 173）。
+//
+// 这条门禁两件事一起锁：① 面板不再创建默认站点的 index.php；
+// ② 生成的默认站点 vhost 里 index.html 排在 index.php 前面。
+func TestDefaultSiteStaysStaticNoIndexPHP(t *testing.T) {
+	// ① 源码级：phpMyAdmin 安装器不许再调 EnsureDefaultSitePHPIndex
+	src, err := os.ReadFile("phpmyadmin.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(src), "EnsureDefaultSitePHPIndex") {
+		t.Error("phpMyAdmin 安装器又在往默认站点里放 index.php —— 默认站点必须是纯静态的" +
+			"（并且会让默认站点复核永远失败）")
+	}
+	// ② 生成器级：这两处"最小默认站点"文案里，index.html 必须在前面
+	for _, f := range []string{"phpmyadmin.go"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "index  index.php index.html;") {
+			t.Errorf("%s 里还有把 index.php 排在前面的默认站点配置", f)
+		}
 	}
 }

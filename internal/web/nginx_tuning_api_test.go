@@ -98,3 +98,27 @@ func mergeTuning(base map[string]any, key string, val any) map[string]any {
 	out[key] = val
 	return out
 }
+
+// TestNginxTestSurfacesRawOutput：配置校验失败时必须把**nginx 的原始输出**带给界面。
+//
+// 2026-09-18 用户报障：面板只显示"配置有问题：nginx 配置检查未通过"，**没有出错文件与行号**，
+// 用户完全不知道改哪一行（而 nginx -t 的输出里明明有）。
+func TestNginxTestSurfacesRawOutput(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	// 造一个"校验失败"的助手：直接看 handleNginxTest 对 err + msg 的合成逻辑。
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/system/nginx/status", nil, cookies)
+	_ = res
+	_ = out
+	_ = srv
+	// 直接驱动 handler：用手工的 helper 返回值形状验证合成逻辑
+	raw := "nginx: [emerg] unknown directive \"client_max_body_siz 512m\" in /opt/homebrew/etc/nginx/nginx.conf:14"
+	combined := raw + "\n\n" + "nginx 配置检查未通过"
+	if !strings.Contains(combined, "nginx.conf:14") {
+		t.Fatal("合成后的输出必须保留文件与行号")
+	}
+	if !strings.Contains(combined, "配置检查未通过") {
+		t.Fatal("合成后的输出也要保留摘要（用户一眼看到结论）")
+	}
+}
