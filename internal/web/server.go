@@ -492,6 +492,9 @@ func (s *Server) routes() http.Handler {
 	// GET 回读生效值，POST 校验后走任务中心应用（写配置 → reload nginx → 重启 php-fpm）。
 	root.HandleFunc("GET /api/v1/settings/upload-limits", s.requireAuth(s.handleGetUploadLimits))
 	root.HandleFunc("POST /api/v1/settings/upload-limits", s.requireAuth(s.handleSaveUploadLimits))
+	// 「大文件上传自检」：磁盘空间 / nginx 临时目录可写性 / error_log 相关行。
+	// 用户报 500 时用它一眼看出卡在哪（413 与 500 是两件事，见 handler 注释）。
+	root.HandleFunc("GET /api/v1/settings/upload-doctor", s.requireAuth(s.handleUploadDoctor))
 
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会

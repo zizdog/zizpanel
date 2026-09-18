@@ -505,6 +505,42 @@ async function renderLimitsInto(container, refresh) {
     },
   });
   const reread = h('button.btn.btn-sm', { text: '↻ 重新回读', onclick: refresh });
+  // 大文件上传自检：用户报"上传数据库 500"时，原因几乎只在 nginx error_log 里
+  //（413 = 上限太小；500 = 请求已经被接受、随后真的失败了，最常见是磁盘满）。
+  const docBox = h('div');
+  const doctor = h('button.btn.btn-sm', {
+    text: '🩺 大文件上传自检',
+    title: '检查磁盘剩余空间、nginx 请求体临时目录是否可写，并把 nginx error_log 里与上传相关的行原样列出来',
+    onclick: async () => {
+      clear(docBox);
+      docBox.append(h('div.hint', { text: '正在自检…' }));
+      let d;
+      try { d = await api.uploadDoctor(); } catch (e) {
+        clear(docBox);
+        docBox.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '自检失败：' + ((e && e.message) || e) }));
+        return;
+      }
+      clear(docBox);
+      docBox.append(h('div', { style: { marginTop: '10px', padding: '10px 12px', background: 'var(--warn-soft)',
+        borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.9' } }, [
+        h('div', { style: { fontWeight: '620' }, text: '自检结果' }),
+        h('div', { text: '磁盘（' + (d.disk_path || '') + '）：可用 ' + bytes(d.disk_free_bytes || 0)
+          + ' / 共 ' + bytes(d.disk_total_bytes || 0) + '；当前上传上限 ' + (d.body_limit_text || '') }),
+        d.worker_user ? h('div', { text: 'nginx worker 用户：' + d.worker_user }) : null,
+        h('div', { text: '请求体临时目录：' + ((d.temp_dirs || []).join('、') || '（未取到）') }),
+        (d.warnings || []).length
+          ? h('ul', { style: { margin: '6px 0 0 18px' } }, (d.warnings || []).map((w) => h('li', { text: '⚠️ ' + w })))
+          : h('div', { style: { marginTop: '4px' }, text: '✅ ' + (d.verdict || '没有发现明显障碍') }),
+        (d.nginx_errors || []).length
+          ? h('div', { style: { marginTop: '8px' } }, [
+            h('div', { text: 'nginx error_log 里最近与上传相关的行（' + (d.nginx_log_path || '') + '）：' }),
+            h('pre', { style: { whiteSpace: 'pre-wrap', fontSize: '11.5px', margin: '4px 0 0', maxHeight: '200px', overflow: 'auto' },
+              text: (d.nginx_errors || []).join('\n') }),
+          ])
+          : null,
+      ]));
+    },
+  });
 
   // ---- 生效值：nginx 侧 ----
   const nginxRows = (v.nginx || []).map((f) => h('tr', [
@@ -557,9 +593,10 @@ async function renderLimitsInto(container, refresh) {
         h('div.row', [nginxField.field, uploadField.field]),
         h('div.row', [postField.field, memField.field, execField]),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '4px' } }, [
-          save, reread,
+          save, reread, doctor,
           h('span.hint', { text: '保存会写：面板生成的各站点 vhost、默认站点、phpMyAdmin 入口，以及 PHP conf.d 的 99-zizpanel-limits.ini' }),
         ]),
+        docBox,
       ]),
     ]),
     h('div.card', [
