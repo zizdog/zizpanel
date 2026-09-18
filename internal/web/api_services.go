@@ -163,11 +163,26 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 每条记录都补上"目录里声明的配置文件绝对路径"（与 handleServiceGet 同一份
+	// 解析逻辑）：管理面板的「📝 编辑配置文件」就靠它。
+	//
+	// 2026-09-18 用户报障：php / nginx 的这颗按钮是**灰的** —— 因为列表里不带
+	// config_path，前端只能按"没有路径"处理。配置路径是目录的静态属性，
+	// 与"面板有没有这条记录"无关，列表这里就该算出来。
+	views := make([]serviceDetail, 0, len(list))
+	for _, v := range list {
+		d := serviceDetail{View: v}
+		if app, found := services.FindAppByService(v.Service); found {
+			d.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
+		}
+		views = append(views, d)
+	}
+
 	// Docker 环境信息：前端据此决定是否显示 Docker 相关入口
 	sock, ver := s.cachedDocker()
 
 	ok(w, map[string]any{
-		"list": list,
+		"list": views,
 		"docker": map[string]any{
 			"available": sock != "",
 			"socket":    sock,
@@ -784,6 +799,15 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 前端据此区分"没装 → 一键安装"与"装了没跑 → 启动"，而不是靠猜；
 		// 也给界面一个如实的探测结果显示（socket 路径、引擎版本、VM 状态）。
 		DockerRuntime *services.DockerRuntimeState `json:"docker_runtime,omitempty"`
+
+		// ConfigAbs 是**解析好的绝对路径**（目录里声明的 ConfigPath 经
+		// {brew}/~ 展开）。为什么必须有：过去「📝 编辑配置文件」只在
+		// **面板里有这条服务的记录**时才给（config_path 从服务详情拿），
+		// 于是"装了、在跑、但面板没记录"的 nginx / PHP 直接变成**灰色按钮**——
+		// 用户改不了 client_max_body_size / upload_max_filesize，只能手工改文件
+		//（2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的"）。
+		// 配置路径是**目录的静态属性**，与有没有服务记录无关，这里一律算出来。
+		ConfigAbs string `json:"config_path_abs,omitempty"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -954,6 +978,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			PortURL: portURL, ProxyURL: proxyURL,
 			DockerRuntime: dockerRuntime,
+			ConfigAbs:     services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
 			Uninstall:     plan}
 		if plan.Kind == "none" && (adopted || artifacts) {
 			// 有记录/产物却给不出计划：如实说明，别让用户对着卡片猜。

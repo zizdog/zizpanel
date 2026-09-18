@@ -47,6 +47,9 @@ import { taskCenter } from './tasks.js';
 import {
   configFileModal, credentialsModal, openLogs, healthHint, loginCredsOf, appWidgets,
 } from './services.js';
+// 「上传大小 / 执行时间」编辑器在 views.js 里（与「面板设置」共用同一份实现 ——
+// 用户 2026-09-18 要求这类常用更改必须是功能，而不是让用户去编辑配置原文件）。
+import { uploadLimitsModal } from './views.js';
 
 // PANEL_QUERY_TIMEOUT_MS 是面板首屏查询的**硬上限**。
 //
@@ -986,26 +989,51 @@ export async function openServicePanel(o = {}) {
     const rb = reinstallButton(mi, { onReinstall, onDone: afterAction });
     if (rb) out.push(rb);
 
-    // ④ 配置：判据是 config_path 有没有（目录数据），不是应用 ID。
-    //    路径必须用**服务记录里的绝对路径**：市场条目里的 config_path 只是文件名。
-    const cfgPath = (s && s.config_path) || '';
+    // ④ 配置：判据是"面板知不知道配置文件的**绝对路径**"，不是"有没有服务记录"。
+    //
+    // 2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的" —— 旧逻辑只在
+    // 服务记录里带 config_path 时才给按钮，而 nginx 完全可以"装着、在跑、面板里
+    // 没有记录"，于是最常用的那颗按钮变成灰色，用户连 client_max_body_size /
+    // upload_max_filesize 都改不了，只能手工改文件。
+    //
+    // 配置路径是**目录的静态属性**（后端 config_path_abs / 服务记录的 config_path
+    // 都已经是绝对路径），与"归不归面板管"无关 —— 所以这里一律给可点的按钮。
+    const cfgPath = (s && s.config_path) || (mi && mi.config_path_abs) || '';
     if (cfgPath) {
+      // 没有服务记录时给一个最小的上下文：编辑器只需要路径与显示名，
+      // 「重启服务」那颗按钮在没有记录时会如实报错（而不是假装重启成功）。
+      const cfgCtx = s || { config_path: cfgPath, display_name: (mi && mi.name) || cfgPath };
       out.push(h('button.btn.btn-sm', {
         text: '📝 编辑配置文件',
         title: (mi && mi.post_install_hint ? '要改什么：' + mi.post_install_hint + ' —— ' : '') +
           '直接编辑 ' + cfgPath + '（保存后需重启服务才生效）',
-        onclick: () => configFileModal(s, afterAction),
+        onclick: () => configFileModal(cfgCtx, afterAction),
       }));
     } else if (mi && mi.config_path) {
-      // 有配置文件名、但查不到服务记录：如实说明原因，
-      // 绝不给一个"点了报 400：文件不存在"的编辑器。
-      // 2026-09-21：不再让用户"先点纳管"（内部词、入口也删了），改成指一个
-      // **真实存在**的用户入口 —— 工具栏的「+ 注册服务」。
+      // 目录里只写了文件名、也算不出绝对路径（罕见）：如实说"面板不知道它在哪"，
+      // 并给出用户能自己做的事 —— 不再把入口灰掉（灰按钮 = 点了没反应）。
       out.push(h('button.btn.btn-sm', {
         text: '📝 编辑配置文件',
-        disabled: true,
-        title: '配置文件是 ' + mi.config_path + '，但面板里还没有这条服务的记录，' +
-          '拿不到它的绝对路径。可以在「已安装」工具栏用「+ 注册服务」把本机已有的服务加进来，再来编辑。',
+        title: '面板不知道这个应用的配置文件在哪（目录里写的是 ' + mi.config_path +
+          '，解析不出绝对路径）。可以到「文件管理」里按路径找到它直接编辑。',
+        onclick: () => toast('这个应用的配置文件路径面板解析不出来（目录里写的是 ' + mi.config_path +
+          '）；可以到「文件管理」里手动找到它', 'warn', 12000),
+      }));
+    }
+
+    // ④b **常用设置**（用户 2026-09-18 明确要求："这些常用更改应该同时做成功能，
+    //     而不应该是让用户只能编辑配置原文件"）。
+    //
+    //     nginx / PHP 上最常改的两件事：
+    //       · 一次能传多大（client_max_body_size / upload_max_filesize / post_max_size）
+    //       · 脚本能跑多久（max_execution_time）
+    //     这里给一颗直达按钮，打开的是**与面板设置同一份**的编辑器（不复制实现）。
+    if (isLimitTunable(mi)) {
+      out.push(h('button.btn.btn-sm', {
+        text: '⚡ 上传大小 / 执行时间',
+        title: '直接在面板里改「一次能传多大」（nginx + PHP 一起改，改完自动重载 nginx、重启 php-fpm，'
+          + '并回读生效值）—— 不需要编辑配置文件',
+        onclick: () => uploadLimitsModal(),
       }));
     }
 
@@ -1557,6 +1585,18 @@ function dependentsModal({ name, plan, onDone, onForce = null, forceText = '' })
 //
 // svc 是可选的**服务记录**：卸载失败时用它做"从面板移除记录"的兜底出口
 // （记录名/展示名以记录为准；没有记录时没有可删的记录，就只如实报错）。
+// isLimitTunable 判断这个应用是不是"与上传/执行上限有关"（nginx / PHP）。
+//
+// 判据来自**目录数据**（id / brew_formula / service_label / name），不写死某一台机器
+// 上的条目名：nginx 的请求体上限、PHP 的上传与执行上限都在它们的配置里。
+// 其它应用（frpc / miniflux…）没有这两组上限，给了按钮只会让人困惑。
+export function isLimitTunable(mi) {
+  if (!mi) return false;
+  const hay = [mi.id, mi.brew_formula, mi.service_label, mi.name]
+    .map((x) => String(x || '')).join(' ').toLowerCase();
+  return /(^|[^a-z])nginx([^a-z]|$)/.test(hay) || /php/.test(hay);
+}
+
 export function marketUninstallButton(mi, onDone, svc = null) {
   // listPlan 是**列表里的**计划：它刻意**没有查过依赖**（查依赖要跑真的 brew，
   // 每个条目约 0.4s，36 条就是 15 秒冷启动 —— 用户看到的是"正在读取应用目录…"

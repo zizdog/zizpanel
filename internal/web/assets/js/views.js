@@ -411,6 +411,19 @@ export function DashboardView(content, ctx = {}) {
 //  面板设置
 // ============================================================================
 
+// uploadLimitsModal 是"上传大小 / 执行时间"的**独立弹窗**（nginx + PHP 一起改）。
+//
+// 用户 2026-09-18 明确要求：这类常用更改必须是**功能**，不能只让用户去编辑配置原文件。
+// 所以 nginx / PHP 的管理面板与网站管理工具条都直接开这个弹窗，改完自动
+// 重载 nginx + 重启 php-fpm，并**回读生效值**（不是只报"已保存"）。
+export function uploadLimitsModal() {
+  const box = h('div');
+  const m = modal({ title: '⚡ 上传大小 / 执行时间（nginx + PHP）', wide: true, body: box });
+  const refresh = async () => { clear(box); await renderLimitsInto(box, refresh); };
+  void refresh();
+  return m;
+}
+
 export function SettingsView(content, ctx = {}) {
   clear(content);
   const user = state.session?.user || {};
@@ -468,6 +481,8 @@ export function SettingsView(content, ctx = {}) {
   }
 
   // ---------- 上传与执行限制（用户报障 413 的入口）----------
+  async function renderLimits() { clear(body); await renderLimitsInto(body, renderLimits); }
+
   //
   // 背景：phpMyAdmin 导入几十 MB 的 SQL 报 **413 Request Entity Too Large**。
   // nginx 出厂 client_max_body_size 只有 1m、PHP 出厂 upload 2M/post 8M，
@@ -477,11 +492,19 @@ export function SettingsView(content, ctx = {}) {
   //   保存 → POST 校验（非法输入当场 400 + 人话）→ 202 + task_id →
   //   任务里写 vhost / conf.d → reload nginx → 重启 php-fpm → **回读生效值**。
   //   这里把回读结果渲染成"生效值"卡片，绝不只显示"已保存"。
-  async function renderLimits() {
+  // renderLimitsInto 把"上传与执行限制"面板画进**任意容器**。
+  //
+  // 为什么参数化容器：这两组上限（nginx client_max_body_size / PHP upload+post+memory+
+  // 执行时间）不只是设置页里的一个版块，它是用户**最常改**的东西 ——
+  // 2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的，用户没法更改文件大小限制"，
+  // 并明确要求"这些常用更改应该同时做成功能，而不是让用户只能编辑配置原文件"。
+  // 所以同一份实现要能同时出现在：面板设置版块、nginx/PHP 的管理面板、网站管理工具条
+  //（三处共用，绝不复制第二份 —— 复制出来的那份迟早会与后端校验漂移）。
+  async function renderLimitsInto(container, refresh) {
     let v;
     try { v = await api.getUploadLimits(); }
     catch (e) {
-      body.append(h('div.card', [h('div.card-body', { text: '读取上传/执行限制失败: ' + e.message })]));
+      container.append(h('div.card', [h('div.card-body', { text: '读取上传/执行限制失败: ' + e.message })]));
       return;
     }
     const lim = v.limits || {};
@@ -552,7 +575,7 @@ export function SettingsView(content, ctx = {}) {
             title: '应用上传与执行限制',
             start: () => api.saveUploadLimits(patch),
             // 任务结束后重新回读：生效值卡片必须跟着变（不能停在旧值）。
-            onDone: () => { toast('上传与执行限制已应用，正在回读生效值…', 'ok', 6000); renderLimits(); },
+            onDone: () => { toast('上传与执行限制已应用，正在回读生效值…', 'ok', 6000); refresh(); },
           });
           if (id) toast('已提交，进度与生效值回读在任务中心里', 'ok', 8000);
         } catch (e) {
@@ -562,7 +585,7 @@ export function SettingsView(content, ctx = {}) {
         }
       },
     });
-    const reread = h('button.btn.btn-sm', { text: '↻ 重新回读', onclick: renderLimits });
+    const reread = h('button.btn.btn-sm', { text: '↻ 重新回读', onclick: refresh });
 
     // ---- 生效值：nginx 侧 ----
     const nginxRows = (v.nginx || []).map((f) => h('tr', [
@@ -595,7 +618,7 @@ export function SettingsView(content, ctx = {}) {
       ]);
     });
 
-    body.append(
+    container.append(
       h('div.card', [
         h('div.card-head', [
           h('h3', { text: '上传与执行限制' }),

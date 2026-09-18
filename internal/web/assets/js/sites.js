@@ -24,6 +24,9 @@ import { acmeSslSection } from './certs.js';
 // 它读写走既有的文件接口（GET/POST /api/v1/files/read|write，含白名单与越界校验），
 // 保存/重启的语义也只有那一份实现。
 import { configFileModal } from './services.js';
+// 「上传大小 / 执行时间」：与「面板设置」共用同一份实现（用户要求这类常用更改
+// 必须是功能，而不是让用户去改配置原文件）。
+import { uploadLimitsModal } from './views.js';
 
 let cache = null; // 站点列表数据（含预设与 PHP 版本）
 
@@ -1092,6 +1095,13 @@ export function SitesView(content, ctx = {}) {
       }),
       // 紧挨「PHP 环境」右侧：nginx 的真实运行状态（只读药丸，不是可点的假按钮）。
       nginxPill(),
+      // ⚡ 常用设置：一次能传多大 / 脚本能跑多久。这是用户最常改的东西，
+      // 所以放在「配置文件」**前面**并且是功能按钮（不用去改配置文件）。
+      h('button.btn.btn-sm', {
+        text: '⚡ 上传大小 / 执行时间',
+        title: '在面板里改 nginx 请求体上限与 PHP 上传/执行上限（改完自动重载 nginx、重启 php-fpm，并回读生效值）',
+        onclick: () => uploadLimitsModal(),
+      }),
       // ⚙️ 配置文件：手动改 nginx.conf / 各站点 vhost / php.ini / my.cnf 的入口
       // （宝塔式"基本操作"）。文件清单与路径由后端给，编辑复用既有配置编辑器。
       h('button.btn.btn-sm', {
