@@ -401,6 +401,12 @@ function freshWebEnv() {
     // 「没有条目」为什么算未知而不是停止：真机实测 nginx 在 :80 上跑着，
     // 面板的服务列表里却没有它（不归面板登记/不是面板装的）—— 写"停止"就是谎报。
     nginxState: 'loading',
+    // runtime 是**运行体证据**（GET /api/v1/sites/runtime）：
+    //   nginx / PHP / MySQL 各自 {running, evidence, registered, probe_error}。
+    // 这是"网站在不在跑"的唯一权威来源 —— 服务列表只说明"归不归面板管"。
+    runtimePhase: 'loading', // loading | ready | error
+    runtime: null,
+    runtimeErr: '',
     basePhase: 'loading', // loading | ready | error
     baseMissing: [],
     lnmpPhase: 'loading', // loading | ready | error
@@ -533,28 +539,53 @@ export function SitesView(content, ctx = {}) {
       webEnvLine.textContent = '网站环境：无法读取服务状态（' + webEnv.servicesErr + '）';
       return;
     }
-    // svcRunning 只在同名条目命中且 state.running 为真时算就绪
-    //（PHP 允许多版本共存，任意一个版本在跑即可）。
+    // svcRunning 只用来说明"归不归面板管"（不再用来判断"在不在跑"）。
     const svcRunning = (re) => list.some((s) => (re.test(String(s.name || ''))
       || re.test(String(s.display_name || ''))) && !!((s.state || {}).running));
     // PHP 的真实探测（比"服务记录"准）：sites 接口的 php_versions 直接给出 fpm 是否在跑。
     const phpLive = ((cache && cache.php_versions) || []).some((p) => p && p.running);
+    const rt = webEnv.runtime;
+    // 判定顺序（2026-09-18 用户报障"nginx 明明在跑却显示未就绪"之后定的规矩）：
+    //   ① 有运行体证据 → 以它为准；
+    //   ② 探测本身没做成（runtime 接口挂了）→ **未知**（不写"未就绪"，也绝不写"已就绪"）；
+    //   ③ 兜底才看服务记录（老版本行为，仅当运行体层完全没数据时）。
     const checks = {
-      nginx: () => svcRunning(/^nginx/i),
-      PHP: () => phpLive || svcRunning(/^php/i),
-      MySQL: () => svcRunning(/^(mysql|mariadb|percona)/i),
+      nginx: () => (rt && rt.nginx ? !!rt.nginx.running : svcRunning(/^nginx/i)),
+      PHP: () => (rt && rt.php ? !!rt.php.running : (phpLive || svcRunning(/^php/i))),
+      MySQL: () => (rt && rt.mysql ? !!rt.mysql.running : svcRunning(/^(mysql|mariadb|percona)/i)),
+    };
+    // unknown：运行体层没读到、服务层也没读到 → 面板**没有证据**，如实说"未知"。
+    const unknown = (label) => {
+      if (rt) return false; // 有运行体层数据就不存在"未知"
+      const svcHas = svcRunning(new RegExp('^' + (label === 'PHP' ? 'php' : label), 'i'));
+      return !svcHas && !(label === 'PHP' && phpLive);
     };
     const missing = WEB_ENV_PARTS.filter((label) => !checks[label]());
+    const unknownParts = missing.filter((label) => unknown(label));
+    const reallyMissing = missing.filter((label) => !unknown(label));
     webEnvLine.append(
       h('span', { text: '网站环境：' }),
-      missing.length
+      reallyMissing.length
         ? h('span.pill.warn', { text: '未就绪' })
-        : h('span.pill.ok', { text: '已就绪' }),
+        : (unknownParts.length
+          ? h('span.pill.warn', { text: '状态未知' })
+          : h('span.pill.ok', { text: '已就绪' })),
       h('span', {
         // 用"未检测到运行中的"而不是"未运行"：面板没看见 ≠ 一定没在跑
         //（例如本机有一份不归面板管的 nginx）。只报"检测到了什么"，不替现实下结论。
-        text: '（' + (missing.length ? '未检测到运行中的：' + missing.join('、') : 'nginx / PHP / MySQL 均在运行') + '）',
+        text: '（' + (missing.length
+          ? '未检测到运行中的：' + missing.join('、')
+          : 'nginx / PHP / MySQL 均在运行') + '）',
       }),
+      // 在跑、但面板里没有它的记录 → 说清楚，并给出"接入"的路（不是"未就绪"）。
+      runningUnregistered().length
+        ? h('div', {
+          style: { marginTop: '3px' },
+          text: '注：' + runningUnregistered().map((x) => x.label).join('、')
+            + ' 正在运行，但面板里没有它的服务记录（不影响网站运行）。'
+            + '需要面板管它（重启/停止/看状态）时，到「应用」里对同名条目点「接入」。',
+        })
+        : null,
       h('div', {
         style: { marginTop: '3px' },
         text: '「⚡ 一键 LNMP」会先确保运行依赖（命令行开发者工具 CLT / Homebrew）'
@@ -576,10 +607,11 @@ export function SitesView(content, ctx = {}) {
     clear(webEnvLine);
     webEnvLine.textContent = '网站环境：读取中…';
 
-    const [svcRes, baseRes, lnmpRes] = await Promise.allSettled([
-      api.services(false), // nginx 的真实运行判据（state.running）
+    const [svcRes, baseRes, lnmpRes, rtRes] = await Promise.allSettled([
+      api.services(false), // 服务记录（回答"归不归面板管"，**不回答**"在不在跑"）
       api.baseEnv(), // 底座：CLT / Homebrew / ffmpeg
       api.lnmpOptions(), // 三件套各自装了哪个版本（installed 是后端真实探测）
+      api.sitesRuntime(), // 运行体证据：进程 / 端口 / socket（nginx / PHP / MySQL）
     ]);
     if (myToken !== envToken) return; // 页面已切换：这次结果作废，不写进新页面
 
@@ -596,6 +628,16 @@ export function SitesView(content, ctx = {}) {
       webEnv.servicesPhase = 'error';
       webEnv.servicesErr = (svcRes.reason && svcRes.reason.message) || String(svcRes.reason);
       webEnv.nginxState = 'unknown';
+    }
+
+    // ①b 运行体层：nginx / PHP / MySQL 到底在不在跑（与"有没有记录"分开）
+    if (rtRes.status === 'fulfilled' && rtRes.value) {
+      webEnv.runtimePhase = 'ready';
+      webEnv.runtime = rtRes.value;
+    } else {
+      webEnv.runtimePhase = 'error';
+      webEnv.runtime = null;
+      webEnv.runtimeErr = (rtRes.reason && rtRes.reason.message) || String(rtRes.reason);
     }
 
     // ② 底座层：missing 是后端给的人读名（命令行开发者工具 / Homebrew / ffmpeg）
@@ -650,6 +692,22 @@ export function SitesView(content, ctx = {}) {
     void refreshWebEnv();
   }
 
+  // runningUnregistered 返回"在跑、但面板服务记录里没有"的组件。
+  //
+  // 这是 2026-09-18 那次报障的另一半：nginx 在跑、面板没记录 → 以前显示"未就绪"，
+  // 现在显示"在跑"并说明"不归面板管"。用户据此可以决定要不要接入（而不是被误导去重装）。
+  function runningUnregistered() {
+    const rt = webEnv.runtime;
+    if (!rt) return [];
+    const out = [];
+    const pairs = [['nginx', 'Nginx'], ['php', 'PHP'], ['mysql', 'MySQL']];
+    for (const [key, label] of pairs) {
+      const p = rt[key];
+      if (p && p.running && !p.registered) out.push({ label, probe: p });
+    }
+    return out;
+  }
+
   // nginxEntry 判断服务条目是不是 nginx（与 renderWebEnvLine 的 svcRunning 同一套口径）。
   function nginxEntry(s) {
     return /^nginx/i.test(String((s && s.name) || ''))
@@ -657,15 +715,33 @@ export function SitesView(content, ctx = {}) {
   }
 
   // nginxPill 是「🐘 PHP 环境」右侧那颗**只读**状态药丸。
-  // 判据只有一处：api.services(false) 里 nginx 条目的 state.running。
-  // 四种状态各有各的文案，**没有证据时既不说"运行"也不说"停止"**：
-  //   还没读到       → nginx 状态读取中…
-  //   读不到         → nginx 状态未知（接口失败）
-  //   没有 nginx 条目 → nginx 状态未知（面板没登记 ≠ 它没在跑）
-  //   有条目         → nginx 运行 / nginx 停止
+  //
+  // 判据优先用**运行体证据**（GET /api/v1/sites/runtime → priv.NginxStatus() 的
+  // pgrep 结果），服务记录只在运行体层读不到时兜底：
+  //   运行体说在跑      → "nginx 运行"
+  //   运行体说没进程    → "nginx 停止"
+  //   运行体层读不到    → 退回服务记录；两者都没有 → "状态未知"
+  //
+  // 2026-09-18 的报障就是"只看服务记录"造成的：nginx 在 :80 上正常服务、面板里
+  // 却没有它的记录 → 药丸写"未知"、环境行写"未就绪"。**没看见 ≠ 没在跑。**
   function nginxPill() {
-    if (webEnv.servicesPhase === 'loading') {
-      return h('span.pill', { text: 'nginx 状态读取中…', title: '正在读取服务列表' });
+    const rt = webEnv.runtime && webEnv.runtime.nginx;
+    if (webEnv.runtimePhase === 'loading' && webEnv.servicesPhase === 'loading') {
+      return h('span.pill', { text: 'nginx 状态读取中…', title: '正在探测 nginx 进程与服务记录' });
+    }
+    if (rt) {
+      if (rt.running) {
+        return h('span.pill.ok', {
+          text: 'nginx 运行',
+          title: (rt.evidence || '运行体探测说它在跑')
+            + (rt.registered ? '' : '\n（面板里没有它的服务记录：能看状态，但重启/停止要在「应用」里先接入）'),
+        });
+      }
+      return h('span.pill.warn', {
+        text: 'nginx 停止',
+        title: (rt.evidence || '运行体探测没找到 nginx 进程')
+          + (rt.probe_error ? '\n探测错误：' + rt.probe_error : ''),
+      });
     }
     if (webEnv.nginxState === 'running') {
       return h('span.pill.ok', { text: 'nginx 运行', title: '服务列表里 nginx 条目 state.running = true' });
@@ -678,8 +754,8 @@ export function SitesView(content, ctx = {}) {
     }
     return h('span.pill.warn', {
       text: 'nginx 状态未知',
-      title: webEnv.servicesPhase === 'error'
-        ? '服务列表接口读取失败，无法判断 nginx 是否在跑：' + webEnv.servicesErr
+      title: webEnv.runtimePhase === 'error'
+        ? '运行体探测失败，服务列表里也没有可用结论，无法判断 nginx 是否在跑：' + webEnv.runtimeErr
         : '服务列表里没有 nginx 条目（它可能不归面板登记）—— 面板没有证据说它在跑，也没有证据说它停了',
     });
   }

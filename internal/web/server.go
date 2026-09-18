@@ -430,6 +430,9 @@ func (s *Server) routes() http.Handler {
 	// ---------- 环境与诊断 ----------
 	root.HandleFunc("POST /api/v1/system/nginx/test", s.requireAuth(s.handleNginxTest))
 	root.HandleFunc("GET /api/v1/system/nginx/status", s.requireAuth(s.handleNginxStatus))
+	// 网站环境的**真实运行时**（nginx / PHP / MySQL）：只看运行体证据（进程/端口/socket），
+	// 面板服务记录只回答"归不归面板管"。修的是"nginx 明明在跑却显示未就绪"。
+	root.HandleFunc("GET /api/v1/sites/runtime", s.requireAuth(s.handleSitesRuntime))
 	root.HandleFunc("POST /api/v1/system/nginx/repair", s.requireAuth(s.handleNginxEnvRepair))
 
 	// 应用界面子路径：探测（只读）与生成 nginx 入口（写配置 + reload）

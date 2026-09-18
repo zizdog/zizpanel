@@ -168,6 +168,9 @@ export const api = {
   sites: () => request('GET', `${API_BASE}/sites`),
   siteCreate: (payload) => request('POST', `${API_BASE}/sites`, payload),
   siteReloadAll: () => request('POST', `${API_BASE}/sites/reload`, {}),
+  // 网站环境的**真实运行时**（nginx / PHP / MySQL）：进程 / 端口 / socket 证据。
+  // 服务记录只回答"归不归面板管"，绝不能用来回答"在不在跑"。
+  sitesRuntime: () => request('GET', `${API_BASE}/sites/runtime`),
   site: (domain) => request('GET', `${API_BASE}/sites/${encodeURIComponent(domain)}`),
   siteUpdate: (domain, patch) => request('POST', `${API_BASE}/sites/${encodeURIComponent(domain)}`, patch),
   siteDelete: (domain, removeFiles) =>
