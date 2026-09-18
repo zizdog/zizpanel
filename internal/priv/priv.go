@@ -1661,6 +1661,111 @@ func netIPOK(s string) bool {
 // access_log / pid / *_temp_path / *_temp）解析出来，逐个确保目录存在。
 // 这样用户改了 nginx.conf 或换了前缀，面板依然能自愈。
 // 返回给人看的改动说明（无改动返回空串），调用方据此决定是否 reload。
+// ---------- nginx worker 属主判定（判据贴着运行体） ----------
+
+// nginxWorkerProbe 从**正在运行的 worker 进程**反查 uid/gid。
+//
+// 做成可注入的变量：开发机/CI 上真的跑着 nginx，不注入就没法测
+// "没有 worker 时退回配置"这条分支。
+var nginxWorkerProbe = func() (uid, gid, pid int, ok bool) {
+	out, err := exec.Command("/usr/bin/pgrep", "-f", "nginx: worker process").Output()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0, 0, 0, false
+	}
+	ps, err := exec.Command("/bin/ps", "-o", "uid=,gid=", "-p", fields[0]).Output()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	f := strings.Fields(string(ps))
+	if len(f) < 2 {
+		return 0, 0, 0, false
+	}
+	u, e1 := strconv.Atoi(f[0])
+	g, e2 := strconv.Atoi(f[1])
+	if e1 != nil || e2 != nil {
+		return 0, 0, 0, false
+	}
+	p, _ := strconv.Atoi(fields[0])
+	return u, g, p, true
+}
+
+// SetNginxWorkerProbeForTest 替换"从 worker 进程反查属主"的实现，返回恢复函数。
+//
+// 只给测试用：web 包也要验证"属主未知时不许 chown"这条判据，而真机上真的跑着
+// nginx，不注入就没法构造"没有 worker"的场景。
+func SetNginxWorkerProbeForTest(fn func() (uid, gid, pid int, ok bool)) (restore func()) {
+	prev := nginxWorkerProbe
+	nginxWorkerProbe = fn
+	return func() { nginxWorkerProbe = prev }
+}
+
+// NginxWorkerOwner 返回 nginx worker **真正**运行的用户（以及判据来源，给日志用）。
+//
+// 优先级（本项目最贵的纪律之一：判据贴着运行体）：
+//  1. 正在运行的 worker 进程的 uid/gid —— 唯一权威的事实；
+//  2. 退回 nginx.conf 的 `user` 指令；
+//  3. 都拿不到 → ok=false。调用方**不许猜**（尤其不许猜 nobody）：
+//     把临时目录 chown 给一个写不进去的用户，症状和没修一样，还更难查 ——
+//     2026-09-22 用户报障的"推音色样本 500（nginx 自己的 HTML 页面）"就是这个坑，
+//     当时 web 层的兜底写的是 nobody。
+func NginxWorkerOwner(confPath string) (name string, uid, gid int, how string, ok bool) {
+	if u, g, pid, pok := nginxWorkerProbe(); pok {
+		n := strconv.Itoa(u)
+		if lu, err := user.LookupId(n); err == nil && lu.Username != "" {
+			n = lu.Username
+		}
+		return n, u, g, fmt.Sprintf("运行中的 worker 进程（pid %d）", pid), true
+	}
+	if n := NginxWorkerUserFromConf(confPath); n != "" {
+		if u, g, err := lookupIDs(n); err == nil {
+			return n, u, g, "nginx.conf 的 user 指令", true
+		}
+		return n, -1, -1, "nginx.conf 的 user 指令（该用户不存在）", false
+	}
+	return "", -1, -1, "既没有运行中的 worker，nginx.conf 里也没有 user 指令", false
+}
+
+// NginxWorkerUserFromConf 从 nginx.conf 读 `user <name> [group];`（跳过注释行）。
+func NginxWorkerUserFromConf(confPath string) string {
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		return ""
+	}
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "user") {
+			continue
+		}
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		f := strings.Fields(strings.TrimSuffix(strings.TrimSpace(line), ";"))
+		if len(f) >= 2 {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// nginxTempDirs 返回 nginx 落盘请求体/代理响应要用的临时目录。
+//
+// 路径来自 Homebrew nginx 的编译参数（`nginx -V` 里的
+// --http-client-body-temp-path=… 等），全部在 <prefix>/var/run/nginx 下。
+// 这些目录缺失或属主不是 worker 用户时，**任何超过 client_body_buffer_size
+// 的请求体**都会让 nginx 直接回自己的 500 HTML 页面（上传、音色样本、大 SQL 导入）。
+func nginxTempDirs() []string {
+	base := filepath.Join(HomebrewPrefix(), "var", "run", "nginx")
+	out := []string{base}
+	for _, sub := range []string{"client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"} {
+		out = append(out, filepath.Join(base, sub))
+	}
+	return out
+}
+
 func ensureNginxRuntimeDirs() (string, error) {
 	dirs, err := nginxRequiredDirs(NginxConf())
 	if err != nil {
@@ -1682,7 +1787,34 @@ func ensureNginxRuntimeDirs() (string, error) {
 	if len(changed) == 0 {
 		return "", nil
 	}
-	// 归属真实用户：nginx 以该用户身份跑，目录属主不对写不进日志/pid。
+	// 临时目录：**worker 用户**必须能写（见 nginxTempDirs 的说明）。
+	// 属主判定走 NginxWorkerOwner：运行体优先，读不到就**不改属主**并如实说明。
+	tempDirs := nginxTempDirs()
+	tempChanged := []string{}
+	for _, d := range tempDirs {
+		if _, serr := os.Stat(d); serr == nil {
+			continue
+		}
+		if merr := os.MkdirAll(d, 0o700); merr != nil {
+			return "", fmt.Errorf("创建 nginx 临时目录 %s 失败: %w", d, merr)
+		}
+		tempChanged = append(tempChanged, d)
+	}
+	ownerNote := ""
+	if len(tempChanged) > 0 {
+		name, uid, gid, how, ok := NginxWorkerOwner(NginxConf())
+		if ok {
+			for _, d := range tempChanged {
+				_ = os.Chown(d, uid, gid)
+			}
+			ownerNote = fmt.Sprintf("（属主改为 nginx worker 用户 %s，判据：%s）", name, how)
+		} else {
+			// 绝不猜 nobody：猜错等于没修，而且把真正的原因藏起来。
+			ownerNote = "（**无法确定 nginx worker 用户**：" + how +
+				"；目录已建但未改属主，大请求体仍可能报 500 —— 请在 nginx.conf 里写上 user 指令）"
+		}
+	}
+	// 归属真实用户：nginx 以该用户身份跑，日志/pid 目录属主不对会写不进去。
 	// 只 chown 我们自己新建的那些目录，不做递归 —— 递归 chown 会误伤
 	// （真实事故：一条 `chown -R` 把 brew 的 etc 目录也改成了 root，配置全废）。
 	if u := strings.TrimSpace(os.Getenv("ZIZPANEL_USER")); u != "" && u != "root" {
@@ -1692,7 +1824,20 @@ func ensureNginxRuntimeDirs() (string, error) {
 			}
 		}
 	}
-	return fmt.Sprintf("已补齐 nginx 运行时目录 %d 个（%s）", len(changed), strings.Join(changed, "、")), nil
+	if len(changed) == 0 && len(tempChanged) == 0 {
+		return "", nil
+	}
+	msg := ""
+	if len(changed) > 0 {
+		msg = fmt.Sprintf("已补齐 nginx 运行时目录 %d 个（%s）", len(changed), strings.Join(changed, "、"))
+	}
+	if len(tempChanged) > 0 {
+		if msg != "" {
+			msg += "；"
+		}
+		msg += fmt.Sprintf("已补齐 nginx 临时目录 %d 个%s", len(tempChanged), ownerNote)
+	}
+	return msg, nil
 }
 
 // nginxRequiredDirs 从 nginx.conf 里解析出所有需要的目录。

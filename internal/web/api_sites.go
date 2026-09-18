@@ -1925,6 +1925,10 @@ func (s *Server) ensureGlobalBodySize(ctx context.Context) {
 // 而 nginx worker 跑在**另一个用户**下 → 任何带请求体的请求（上传、导入）都写不进去：
 // 表现就是"GET 一切正常、一上传就 500/卡死"（登录、翻页都没问题，因为它们没有请求体）。
 // 目录属主/权限是 brew 安装/升级时定的，面板不能假设它一定对。
+// runtimeDirChownFn 是 chown 的可注入点：单测要在**非 root** 下验证
+// "属主未知时绝不乱改"这条判据（非 root 的 chown 本来就失败，测不出决策）。
+var runtimeDirChownFn = os.Chown
+
 func (s *Server) ensureNginxRuntimeDirs() {
 	if defaultSiteEuid() != 0 {
 		return
@@ -1934,10 +1938,13 @@ func (s *Server) ensureNginxRuntimeDirs() {
 	if present, _ := s.nginxPresent(); !present {
 		return
 	}
-	worker := nginxWorkerUserFromConf(s.Cfg.NginxConf)
-	if worker == "" {
-		worker = "nobody"
-	}
+	// 属主判据必须来自**运行体**（正在跑的 worker 进程），读不到再退回 nginx.conf，
+	// 都读不到就**不改属主**。
+	//
+	// 旧版这里写的是 `worker == "" → "nobody"`：在 nginx.conf 没有 user 指令的机器上，
+	// 面板会把临时目录 chown 给 nobody，而 worker 跑在别人名下 —— 结果就是
+	// "面板修过了，但大请求体还是 500（nginx 自己的 HTML 页）"。绝不猜。
+	worker, uid, gid, how, ok := priv.NginxWorkerOwner(s.Cfg.NginxConf)
 	base := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx")
 	for _, sub := range []string{"", "client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"} {
 		dir := filepath.Join(base, sub)
@@ -1945,11 +1952,23 @@ func (s *Server) ensureNginxRuntimeDirs() {
 			s.Log.Warn("创建 nginx 运行时目录 %s 失败：%v", dir, err)
 			continue
 		}
-		if changed, err := chownToUser(dir, worker); err != nil {
+		if !ok {
+			s.Log.Warn("nginx worker 用户无法确定（%s）：%s 已存在但**未修改属主**；"+
+				"大请求体（音色样本、大 SQL 导入）仍可能被 nginx 自己回 500 —— "+
+				"请在 %s 里写上 `user <用户名> <组>;` 后点「🔧 修复 Nginx 环境」", how, dir, s.Cfg.NginxConf)
+			continue
+		}
+		st, serr := os.Stat(dir)
+		if serr == nil {
+			if sys, sok := st.Sys().(*syscall.Stat_t); sok && int(sys.Uid) == uid && int(sys.Gid) == gid {
+				continue // 已经对了：一次写都不做（巡检每 2 分钟跑一次，必须安静）
+			}
+		}
+		if err := runtimeDirChownFn(dir, uid, gid); err != nil {
 			s.Log.Warn("调整 %s 属主为 %s 失败（上传/导入可能仍失败）：%v", dir, worker, err)
-		} else if changed {
-			s.Log.Info("已把 nginx 运行时目录 %s 的属主改为 %s（否则带请求体的请求会写不进去：上传/导入 500 或卡住）",
-				dir, worker)
+		} else {
+			s.Log.Info("已把 nginx 运行时目录 %s 的属主改为 %s（判据：%s）——"+
+				"否则带请求体的请求会写不进去：上传/导入 500 或卡住", dir, worker, how)
 		}
 	}
 }
@@ -2028,30 +2047,11 @@ func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {
 }
 
 // nginxWorkerUserFromConf 从 nginx.conf 读 `user` 指令（worker 以谁的身份跑）。
-// 读不到（注释掉/没写）时返回空 —— 调用方回落到 nginx 的编译默认 nobody。
+//
+// 实现只有一份：priv.NginxWorkerUserFromConf（helper 侧也要用同一个判据）。
+// 读不到（注释掉/没写）时返回空 —— 调用方必须据此**放弃**改属主，而不是猜一个。
 func nginxWorkerUserFromConf(confPath string) string {
-	b, err := os.ReadFile(confPath)
-	if err != nil {
-		return ""
-	}
-	for _, raw := range strings.Split(string(b), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if !strings.HasPrefix(line, "user") {
-			continue
-		}
-		// 去掉行内注释后再取第二个词：`user nobody; # 默认` 这种写法很常见。
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
-		}
-		f := strings.Fields(strings.TrimSuffix(strings.TrimSpace(line), ";"))
-		if len(f) >= 2 {
-			return f[1]
-		}
-	}
-	return ""
+	return priv.NginxWorkerUserFromConf(confPath)
 }
 
 // chownToUser 把路径属主改成指定用户（同属主时返回 changed=false）。用户不存在返回错误。
