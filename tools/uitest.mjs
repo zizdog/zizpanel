@@ -116,6 +116,12 @@ page.on('response', (res) => {
   if (code < 400) return;
   // 未登录时的 /session 探活必然 401，属于设计内的行为
   if (code === 401 && /\/api\/v1\/(session|login)/.test(res.url())) return;
+  // 后台自动检查更新的失败**不是**前端故障：面板登录后与每次扫描都会静默
+  // POST /system/upgrade/check，没有可用升级源时后端按设计返回 409，
+  // 前端 silent 吞掉（只在「检查更新」页里如实显示）。
+  // 它是周期性的，落在 expectHTTPError 窗口之外是常态 —— 按 URL 显式豁免，
+  // 升级链路本身另有专门的断言步骤。
+  if (/\/api\/v1\/system\/upgrade\/check$/.test(res.url())) return;
   if (expectAuthFailure && (code === 401 || code === 403)) return;
   if (expectHTTPError) return;
   errors.push(`HTTP ${code} ${res.url()}`);
@@ -192,7 +198,7 @@ try {
     await page.waitForFunction(() => {
       const el = document.querySelector('.metric .value');
       return el && /%/.test(el.textContent);
-    }, { timeout: 15000 });
+    }, null, { timeout: 15000 });
     // 已进入面板，之后的 401 都算异常
     expectAuthFailure = false;
   });
@@ -444,13 +450,24 @@ try {
       'memory_limit', 'max_execution_time', '当前生效值']) {
       if (!txt.includes(need)) throw new Error(`上传与执行限制页缺少「${need}」`);
     }
-    // 默认值必须真的填进表单（默认就要能用，不能让用户先撞 413 才知道要改）
+    // 默认值必须真的填进表单（默认就要能用，不能让用户先撞 413 才知道要改）。
+    // ⚠️ nginx 的 client_max_body_size **不在这里编辑**（2026-09-22 用户报障：
+    // "Nginx 管理和上传大小 / 执行时间严重重复"）—— 这一页只做**只读展示**，
+    // 并指路到唯一可编辑入口「⚙️ 调整配置 → nginx → 性能调整」。
     const vals = await page.locator('.content input.input').evaluateAll((els) => els.map((e) => e.value));
-    if (!vals.includes('512m')) {
-      throw new Error('nginx 请求体上限的默认值没有填进表单（应为 512m）：' + JSON.stringify(vals));
+    if (vals.includes('512m')) {
+      throw new Error('这一页不该再有 client_max_body_size 的可编辑控件'
+        + '（同一个值只能在「调整配置 → nginx → 性能调整」里改）：' + JSON.stringify(vals));
     }
     if (!vals.includes('512M')) {
       throw new Error('PHP 上传上限的默认值没有填进表单（应为 512M）：' + JSON.stringify(vals));
+    }
+    const codes = (await page.locator('.content code.code').allInnerTexts()).map((t) => t.trim());
+    if (!codes.includes('512m')) {
+      throw new Error('这一页应当把 nginx 当前值**只读展示**出来（512m）：' + JSON.stringify(codes));
+    }
+    if (!txt.includes('性能调整')) {
+      throw new Error('只读展示必须配一句"去哪里改"（要指向「调整配置 → nginx → 性能调整」）');
     }
     if (/(^|\s)(null|undefined)(\s|$)/.test(txt)) {
       throw new Error('上传与执行限制页出现字面量 null/undefined：' + txt.slice(0, 300));
@@ -930,69 +947,112 @@ try {
     await shot('20-sites');
   });
 
-  // ---------- 网站管理工具条改版（2026-09 用户要求）----------
+  // ---------- 网站管理工具条改版（2026-09 / 2026-09-22 用户要求）----------
   //
-  // 锁住四件事：
-  //   ① 「🧪 校验 nginx」「♻️ 重建全部配置」不在工具条上，而在「⋯ 更多」二级菜单里；
-  //   ② 「🐘 PHP 环境」右侧的 nginx 状态只能来自真实探测（/services 的 state.running），
-  //      没有证据绝不写"运行"；
-  //   ③ 一键 LNMP 只在缺失时出现（含"只缺一部分"）；环境完整时不出现；
-  //   ④ 打开弹窗**不发**安装请求，必须用户再点一次「开始安装」——
+  // 锁住五件事：
+  //   ① 工具条上只剩一颗「⚙️ 调整配置」（原来的 Nginx 管理 / 上传大小 / 配置文件
+  //      已合并），「🐘 PHP 环境」按钮已删除（用户要求），
+  //      nginx 状态变成可点击的「nginx 运行 / nginx 停止」按钮；
+  //   ② 原来的「⋯ 更多」二级操作（校验 nginx / 修复 Nginx 环境 / 重建全部配置）
+  //      现在挂在 nginx 状态按钮的 hover/点击菜单里；
+  //   ③ nginx 状态只能来自真实探测（/services 的 state.running），没有证据绝不写"运行"；
+  //   ④ 一键 LNMP 只在缺失时出现（含"只缺一部分"）；环境完整时不出现；
+  //   ⑤ 打开弹窗**不发**安装请求，必须用户再点一次「开始安装」——
   //      install-lnmp 全程桩住（假 202），绝不真的 brew install。
   const reloadSites = async () => {
     const u = page.url().split('#')[0] + '#/sites';
     if (page.url() !== u) await page.goto(u);
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('.card-head button:has-text("⋯ 更多")', { timeout: 15000 });
-    // 等三层探测落地：nginx 状态不再是"读取中"就说明 refreshWebEnv 跑完了。
+    await page.waitForSelector('.card-head button.zp-run-btn', { timeout: 15000 });
+    // 等探测落地：nginx 状态按钮不再是"读取中"就说明 refreshWebEnv 跑完了。
+    //
+    // ⚠️ waitForFunction 的第 2 个参数是 **arg**（不是 options）—— options 必须放第 3 个；
+    // 放成第 2 个时超时会静默回落到默认 30s（本项目踩过这个坑，这里一并修正）。
+    // ⏱️ 本机实测 /api/v1/market/lnmp-options 单次约 30s（brew/网络探针），
+    // refreshWebEnv 是 Promise.allSettled，所以状态文案要等它 —— 给 90s 上限。
     await page.waitForFunction(() => {
-      const t = document.querySelector('.card-head')?.innerText || '';
-      return t.includes('nginx 运行') || t.includes('nginx 停止') || t.includes('nginx 状态未知');
-    }, { timeout: 15000 });
+      const b = document.querySelector('.card-head button.zp-run-btn');
+      return !!b && !/读取中/.test(b.textContent || '');
+    }, null, { timeout: 90000 });
     await page.waitForTimeout(300);
   };
 
-  await step('网站管理：低频按钮收进「⋯ 更多」，nginx 状态与真实服务一致（不桩）', async () => {
+  await step('网站管理：nginx 状态按钮的展开菜单里是二级操作；工具条只剩一颗「调整配置」（不桩）', async () => {
     await reloadSites();
-    if (await page.locator('.card-head button:has-text("校验 nginx")').count()) {
-      throw new Error('工具条上仍有独立的「校验 nginx」按钮（应已收进「⋯ 更多」）');
+    if (await page.locator('.card-head button:has-text("⋯ 更多")').count()) {
+      throw new Error('工具条上仍有「⋯ 更多」按钮（用户要求用「nginx 运行」替换它）');
     }
-    if (await page.locator('.card-head button:has-text("重建全部配置")').count()) {
-      throw new Error('工具条上仍有独立的「重建全部配置」按钮（应已收进「⋯ 更多」）');
+    if (await page.locator('.card-head button:has-text("🐘 PHP 环境")').count()) {
+      throw new Error('工具条上仍有「🐘 PHP 环境」按钮（用户要求直接去掉）');
     }
-    const moreBtn = page.locator('.card-head button:has-text("⋯ 更多")');
-    if (!(await moreBtn.count())) throw new Error('工具条上没有「⋯ 更多」按钮');
-    if ((await moreBtn.first().getAttribute('title')) !== '更多操作') {
-      throw new Error('「⋯ 更多」的 title 不是「更多操作」');
+    if ((await page.locator('.card-head button:has-text("⚙️ 调整配置")').count()) !== 1) {
+      throw new Error('工具条上「⚙️ 调整配置」不是恰好一颗（合并后只留这一个配置入口）');
     }
-    await moreBtn.first().click();
-    await page.waitForSelector('.modal-body button:has-text("校验 nginx")', { timeout: 8000 });
-    const menuText = await page.locator('.modal-body').last().innerText();
+    const menuBtn = page.locator('.card-head button.zp-run-btn');
+    if (!(await menuBtn.count())) {
+      throw new Error('工具条上没有「nginx 运行 / nginx 停止」按钮（用户要求用它替换「⋯ 更多」）');
+    }
+    // 二级操作在展开菜单里（不是并排按钮）
+    if (!(await page.locator('.card-head .zp-menu button:has-text("校验 nginx")').count())) {
+      throw new Error('nginx 展开菜单里没有「🧪 校验 nginx」');
+    }
+    if (!(await page.locator('.card-head .zp-menu button:has-text("重建全部配置")').count())) {
+      throw new Error('nginx 展开菜单里没有「♻️ 重建全部配置」');
+    }
+    const menu = page.locator('.card-head .zp-menu').first();
+    if (await menu.isVisible()) throw new Error('展开菜单默认就是打开的（应当 hover / 点击才展开）');
+    // 点击展开（触屏路径；hover 走 CSS :hover，键盘走 :focus-within）
+    await menuBtn.first().click();
+    await page.waitForTimeout(400);
+    if (!(await menu.isVisible())) throw new Error('点击「nginx 运行」后菜单没有展开');
+    const menuText = await menu.innerText();
     if (!menuText.includes('校验 nginx') || !menuText.includes('重建全部配置')) {
-      throw new Error('二级菜单里缺少「校验 nginx」或「重建全部配置」：\n' + menuText);
+      throw new Error('展开菜单里缺少「校验 nginx」或「重建全部配置」：\n' + menuText);
     }
     if (!menuText.includes('nginx -t')) throw new Error('「校验 nginx」项缺少说明文案（nginx -t）');
-    if (!menuText.includes('手工改坏')) throw new Error('「重建全部配置」项缺少说明文案');
-    await shot('20a-sites-more-menu');
-    await page.locator('.modal-mask').last().locator('button.modal-close').first().click();
+    if (!menuText.includes('手工改坏') || !menuText.includes('修复 Nginx 环境')) {
+      throw new Error('展开菜单里缺少「修复 Nginx 环境」及其说明文案：\n' + menuText);
+    }
+    await shot('20a-sites-nginx-menu');
+    // 再点一次收起（点击也要能收起，否则触屏用户没法关掉它）。
+    // 断言分两步，因为"可见"有三个来源：点击切换的 .open、CSS :hover、CSS :focus-within。
+    //   ① .open 必须被去掉 —— 这是"点击能收起"的直接证据；
+    //   ② 指针移开、按钮失焦之后必须真的看不见（hover/focus 两条路都断了）。
+    // 指针还悬在按钮上、或按钮仍持有键盘焦点时保持可见是**有意的**
+    //（键盘用户 Tab 进来时菜单不该自己关掉），所以不能直接断言 isVisible。
+    await menuBtn.first().click();
     await page.waitForTimeout(300);
+    if (await page.locator('.card-head .zp-menu-wrap.open').count()) {
+      throw new Error('再点一次之后仍然带着 .open（点击没能收起菜单）');
+    }
+    await page.evaluate(() => { if (document.activeElement) document.activeElement.blur(); });
+    await page.mouse.move(5, 500);
+    await page.waitForTimeout(400);
+    if (await menu.isVisible()) throw new Error('移开鼠标并让按钮失焦后菜单仍然展开');
 
-    // nginx 状态药丸：与真实 /services 的判据逐字对齐（本机实测）
+    // nginx 状态按钮的文案必须与**真实探测**一致。
+    //
+    // 判据顺序（与 sites.js 的 nginxState() 逐字对齐）：运行体证据（/sites/runtime，
+    // pgrep 出来的进程）优先，服务记录（/services 的 state.running）只在运行体读不到时兜底。
+    // ⚠️ 不能只看 /services：真机实测 nginx 在 :80 上跑着、面板服务列表里却没有它的条目
+    // —— 那时"没有条目"只能说明**服务记录**不知道，不等于 nginx 没在跑。
     const real = await page.evaluate(async () => {
-      const r = await fetch(new URL('api/v1/services?health=0', document.baseURI),
-        { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
-      return r.json();
+      const j = async (p) => {
+        const r = await fetch(new URL(p, document.baseURI),
+          { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+        return r.json();
+      };
+      const [rt, svc] = await Promise.all([j('api/v1/sites/runtime'), j('api/v1/services?health=0')]);
+      return { nginx: (rt.data || {}).nginx || null, list: (svc.data || {}).list || [] };
     });
-    const list = (real && real.data && real.data.list) || [];
-    const ng = list.find((s) => /^nginx/i.test(String(s.name || ''))
+    const ng = real.list.find((s) => /^nginx/i.test(String(s.name || ''))
       || /^nginx/i.test(String(s.display_name || '')));
-    // 有条目才谈运行/停止；没有条目只能是"未知"（面板没看见 ≠ nginx 没在跑，
-    // 真机实测：nginx 在 :80 上跑着，面板服务列表里却没有它）。
-    const want = !ng ? 'nginx 状态未知'
-      : ((ng.state || {}).running ? 'nginx 运行' : 'nginx 停止');
+    const want = real.nginx
+      ? (real.nginx.running ? 'nginx 运行' : 'nginx 停止')
+      : (!ng ? 'nginx 状态未知' : ((ng.state || {}).running ? 'nginx 运行' : 'nginx 停止'));
     const headText = await page.locator('.card-head').first().innerText();
     if (!headText.includes(want)) {
-      throw new Error('nginx 状态文案与真实服务状态不一致（期望「' + want + '」）：\n' + headText);
+      throw new Error('nginx 状态文案与真实探测不一致（期望「' + want + '」）：\n' + headText);
     }
     await shot('20b-sites-nginx-status');
   });
@@ -1002,17 +1062,22 @@ try {
   // 只验证"入口真的在、清单真的从后端来、路径不是前端拼的"：
   // **不点「📝 编辑」**——那会打开真实配置文件（甚至保存/重启服务），
   // 本地调试实例不该碰真机配置。读取本身是只读的。
-  await step('网站管理：⚙️ 配置文件清单来自后端，且不写任何东西', async () => {
+  await step('网站管理：调整配置 → 配置文件 清单来自后端，且不写任何东西', async () => {
     await reloadSites();
-    const btn = page.locator('.card-head button:has-text("⚙️ 配置文件")');
+    const btn = page.locator('.card-head button:has-text("⚙️ 调整配置")');
     if (!(await btn.count())) {
-      throw new Error('工具条上没有「⚙️ 配置文件」入口（用户要求面板里能手动改 nginx/php）');
+      throw new Error('工具条上没有「⚙️ 调整配置」入口（用户要求面板里能手动改 nginx/php）');
     }
-    if (!(await btn.first().getAttribute('title') || '').includes('my.cnf')) {
-      throw new Error('「⚙️ 配置文件」的 tooltip 没有说清能改哪些文件');
+    const tip = (await btn.first().getAttribute('title')) || '';
+    if (!tip.includes('配置文件清单') || !tip.includes('性能调整')) {
+      throw new Error('「⚙️ 调整配置」的 tooltip 没有说清它包含哪几块：' + tip);
     }
     await btn.first().click();
-    await page.waitForSelector('.modal-mask:has-text("网站环境配置文件")', { timeout: 10000 });
+    await page.waitForSelector('.modal-mask:has-text("调整配置")', { timeout: 10000 });
+    // 合并后的弹窗是两级分页：先点外层「配置文件」
+    const filesTab = page.locator('.modal button.zp-seg-btn').filter({ hasText: '配置文件' }).first();
+    if (!(await filesTab.count())) throw new Error('「调整配置」弹窗里没有「配置文件」页签');
+    await filesTab.click();
     await page.waitForTimeout(1200);
     const bodyText = await page.locator('.modal-mask').last().innerText();
     if (!bodyText.includes('nginx')) throw new Error('配置文件清单里没有 nginx：\n' + bodyText);
@@ -1070,30 +1135,64 @@ try {
     await shot('20c-lnmp-entry-real');
   });
 
-  await step('nginx 状态：桩造"运行/停止/无条目"三态（判据只认 /services 的 state.running）', async () => {
+  await step('nginx 状态按钮：桩造"运行 / 停止 / 无证据"三态（判据：运行体优先、服务记录兜底）', async () => {
+    // 判据住在 sites.js 的 nginxState()：**运行体证据（/sites/runtime 探测到的进程）优先**，
+    // 服务记录（/services 的 state.running）只在运行体读不到时兜底。
+    // 所以三态要桩的是 /sites/runtime；只桩 /services 是测不到真判据的
+    //（真机上 nginx 在跑、服务列表里没有它 —— 那时 UI 就该说"运行"）。
+    const rtRoute = /\/api\/v1\/sites\/runtime/;
     const svcRoute = /\/api\/v1\/services\?health=0/;
+    // 这一步里的所有响应都是**我们自己桩出来的**（包括刻意的 500），
+    // 整段开着 expectHTTPError，退出时在 finally 里还原。
+    expectHTTPError = true;
+    // lnmp-options 在本机实测单次约 30s（brew/网络探针），而 refreshWebEnv 是
+    // Promise.allSettled —— 不桩它的话每一步都要干等 30s。这里给一份"都装好了"的桩。
+    const lnmpRoute = '**/api/v1/market/lnmp-options';
+    const stubRT = (nginx) => (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { nginx, php: { running: true }, mysql: { running: true } } }),
+    });
     const stubSvc = (body) => (route) => route.fulfill({
       status: 200, contentType: 'application/json',
       body: JSON.stringify({ ok: true, data: { list: body } }),
     });
-    await page.route(svcRoute, stubSvc([
-      { name: 'nginx', display_name: 'Nginx', state: { running: true, status: 'running' } },
-    ]));
+    await page.route(lnmpRoute, (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { groups: [
+        { key: 'nginx', label: 'Nginx', selected: 'nginx',
+          options: [{ formula: 'nginx', name: 'Nginx', installed: true, recommended: true }] },
+        { key: 'php', label: 'PHP', selected: 'php@8.2',
+          options: [{ formula: 'php@8.2', name: 'PHP 8.2', installed: true, recommended: true }] },
+        { key: 'mysql', label: 'MySQL', selected: 'mysql@8.4',
+          options: [{ formula: 'mysql@8.4', name: 'MySQL 8.4', installed: true, recommended: true }] },
+      ], default: { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' } } }),
+    }));
     try {
+      // ① 运行体说在跑 → 「nginx 运行」（即使服务记录里没有它）
+      await page.route(rtRoute, stubRT({ running: true, evidence: '桩：nginx master 进程在跑' }));
+      await page.unroute(svcRoute).catch(() => {});
+      await page.route(svcRoute, stubSvc([]));
       await reloadSites();
       let t = await page.locator('.card-head').first().innerText();
-      if (!t.includes('nginx 运行')) throw new Error('running=true 时药丸没写「nginx 运行」：\n' + t);
+      if (!t.includes('nginx 运行')) throw new Error('运行体说在跑时按钮没写「nginx 运行」：\n' + t);
       await shot('20d-nginx-running');
-      await page.unroute(svcRoute);
-      await page.route(svcRoute, stubSvc([
-        { name: 'nginx', display_name: 'Nginx', state: { running: false, status: 'stopped' } },
-      ]));
+
+      // ② 运行体说没进程 → 「nginx 停止」
+      await page.unroute(rtRoute);
+      await page.route(rtRoute, stubRT({ running: false, evidence: '桩：没有 nginx 进程' }));
       await reloadSites();
       t = await page.locator('.card-head').first().innerText();
-      if (t.includes('nginx 运行')) throw new Error('running=false 时却出现「nginx 运行」：\n' + t);
-      if (!t.includes('nginx 停止')) throw new Error('running=false 时药丸没写「nginx 停止」：\n' + t);
+      if (t.includes('nginx 运行')) throw new Error('运行体说没进程时却出现「nginx 运行」：\n' + t);
+      if (!t.includes('nginx 停止')) throw new Error('运行体说没进程时按钮没写「nginx 停止」：\n' + t);
       await shot('20e-nginx-stopped');
-      // 没有 nginx 条目：既不能写"运行"也不能写"停止"（没证据）
+
+      // ③ 运行体读不到（探测失败）+ 服务记录里也没有 nginx → 「nginx 状态未知」
+      //    （没证据就不许写运行/停止 —— 2026-09-18 报障的另一半）
+      await page.unroute(rtRoute);
+      await page.route(rtRoute, (route) => route.fulfill({
+        status: 500, contentType: 'application/json',
+        body: JSON.stringify({ ok: false, msg: '桩：运行体探测失败' }),
+      }));
       await page.unroute(svcRoute);
       await page.route(svcRoute, stubSvc([
         { name: 'php', display_name: 'PHP 8.2 (FPM)', state: { running: true, status: 'running' } },
@@ -1101,12 +1200,27 @@ try {
       await reloadSites();
       t = await page.locator('.card-head').first().innerText();
       if (t.includes('nginx 运行') || t.includes('nginx 停止')) {
-        throw new Error('服务列表里没有 nginx 条目时却写了运行/停止（没有证据）：\n' + t);
+        throw new Error('运行体读不到、服务记录里也没有 nginx 时却写了运行/停止（没有证据）：\n' + t);
       }
-      if (!t.includes('nginx 状态未知')) throw new Error('没有 nginx 条目时药丸没写「nginx 状态未知」：\n' + t);
+      if (!t.includes('nginx 状态未知')) throw new Error('没有证据时按钮没写「nginx 状态未知」：\n' + t);
       await shot('20e2-nginx-unknown');
-    } finally {
+
+      // ④ 运行体读不到、但服务记录说在跑 → 兜底用服务记录（老行为不能丢）
       await page.unroute(svcRoute);
+      await page.route(svcRoute, stubSvc([
+        { name: 'nginx', display_name: 'Nginx', state: { running: true, status: 'running' } },
+      ]));
+      await reloadSites();
+      t = await page.locator('.card-head').first().innerText();
+      if (!t.includes('nginx 运行')) {
+        throw new Error('运行体读不到时应回落到服务记录（state.running=true → 「nginx 运行」）：\n' + t);
+      }
+      await shot('20e3-nginx-fallback-services');
+    } finally {
+      expectHTTPError = false;
+      await page.unroute(rtRoute).catch(() => {});
+      await page.unroute(svcRoute).catch(() => {});
+      await page.unroute(lnmpRoute).catch(() => {});
     }
   });
 
@@ -1230,7 +1344,7 @@ try {
     }
   });
 
-  await step('PHP 环境弹窗与真实 /api/v1/php 一致（本机实测：悬空别名不再算成一个版本）', async () => {
+  await step('PHP 环境（调整配置 → PHP 环境）与真实 /api/v1/php 一致（本机实测：悬空别名不再算成一个版本）', async () => {
     await reloadSites();
     const real = await page.evaluate(async () => {
       const r = await fetch(new URL('api/v1/php', document.baseURI),
@@ -1238,9 +1352,11 @@ try {
       return r.json();
     });
     const want = ((real && real.data && real.data.list) || []).map((p) => 'PHP ' + p.version);
-    await page.click('.card-head button:has-text("🐘 PHP 环境")');
+    await page.click('.card-head button:has-text("⚙️ 调整配置")');
     await page.waitForSelector('.modal-mask', { timeout: 10000 });
-    await page.waitForTimeout(600);
+    // PHP 环境现在是「调整配置」里的一页（用户要求删掉工具条上那颗独立按钮）
+    await page.locator('.modal button.zp-seg-btn').filter({ hasText: 'PHP 环境' }).first().click();
+    await page.waitForTimeout(800);
     const mask = page.locator('.modal-mask').last();
     if (!want.length) {
       // 版本列表为空时必须给"去应用市场装"的引导，而不是空白弹窗。
@@ -1274,7 +1390,7 @@ try {
     await closeAnyModal(page);
   });
 
-  await step('PHP 环境弹窗：每个版本都有「🗑 卸载」，点击先出确认框，确认后才发卸载请求（桩数据）', async () => {
+  await step('PHP 环境页：每个版本都有「🗑 卸载」，点击先出确认框，确认后才发卸载请求（桩数据）', async () => {
     const dels = [];
     const phpStub = (route) => route.fulfill({
       status: 200, contentType: 'application/json',
@@ -1319,7 +1435,9 @@ try {
     });
     try {
       await reloadSites();
-      await page.click('.card-head button:has-text("🐘 PHP 环境")');
+      await page.click('.card-head button:has-text("⚙️ 调整配置")');
+      await page.waitForSelector('.modal-mask', { timeout: 10000 });
+      await page.locator('.modal button.zp-seg-btn').filter({ hasText: 'PHP 环境' }).first().click();
       await page.waitForSelector('.modal-mask table.table tbody tr', { timeout: 10000 });
       await page.waitForTimeout(400);
       const rows = page.locator('.modal-mask').last().locator('table.table tbody tr');
@@ -1412,12 +1530,53 @@ try {
     await page.waitForTimeout(500);
   });
 
+  await step('网站管理：列表第一行是默认站点（打开/重建/查看状态），域名处有 http/https 地址链接', async () => {
+    // 用户 2026-09-22 的两条要求：
+    //   ① "默认站点要和宝塔完全一样，安装完用户就可以在网站管理里面看到有这样一个默认站点"
+    //      → 列表**第一行**就是它，且不是 sites 表里的记录（这里只验 UI 形态）；
+    //   ② "网站列表的域名处添加地址链接" → http:// 与 https://，新窗口打开。
+    await reloadSites();
+    const rows = page.locator('.zp-table-wrap table.table tbody tr');
+    if (!(await rows.count())) throw new Error('站点列表没有渲染出表格（默认站点这一行必须永远在）');
+    const first = rows.first();
+    if (!(await first.locator('text=默认站点').count())) {
+      throw new Error('列表第一行不是默认站点：\n' + (await first.innerText()));
+    }
+    for (const label of ['打开', '查看状态']) {
+      if (!(await first.locator(`button:has-text("${label}")`).count())) {
+        throw new Error('默认站点行缺少「' + label + '」按钮：\n' + (await first.innerText()));
+      }
+    }
+    if (!(await first.locator('button:has-text("重建"), button:has-text("创建")').count())) {
+      throw new Error('默认站点行缺少「重建 / 创建」按钮：\n' + (await first.innerText()));
+    }
+    await shot('23b-sites-default-row');
+
+    // 域名列的可点击地址：只检查**已注册站点**的行（默认站点只有 http，是 80 端口的兜底站点）。
+    const siteRows = page.locator('.zp-table-wrap table.table tbody tr:not(.zp-default-row)');
+    const n = await siteRows.count();
+    if (!n) return;
+    const links = await siteRows.first().locator('td').first().locator('a').evaluateAll(
+      (as) => as.map((a) => ({ href: a.getAttribute('href'), target: a.getAttribute('target'), rel: a.getAttribute('rel') })));
+    if (!links.length) throw new Error('站点域名处没有地址链接（用户要求加 http/https 链接）');
+    for (const l of links) {
+      if (!/^https?:\/\//.test(String(l.href || ''))) throw new Error('地址链接不是 http(s)：' + JSON.stringify(l));
+      if (l.target !== '_blank') throw new Error('地址链接没有 target=_blank：' + JSON.stringify(l));
+      if (!String(l.rel || '').includes('noopener')) throw new Error('地址链接没有 rel=noopener：' + JSON.stringify(l));
+    }
+    if (!links.some((l) => l.href.startsWith('http://')) || !links.some((l) => l.href.startsWith('https://'))) {
+      throw new Error('站点域名处应当同时有 http:// 与 https:// 两种链接：' + JSON.stringify(links));
+    }
+    await shot('23c-sites-domain-links');
+  });
+
   await privStep('校验 nginx', async () => {
-    // 「校验 nginx」已收进工具条的「⋯ 更多」二级菜单（用户要求），
-    // 不再是并排按钮 —— 先开菜单再点这一项。
-    await page.click('.card-head button:has-text("⋯ 更多")');
-    await page.waitForSelector('.modal-body button:has-text("校验 nginx")', { timeout: 8000 });
-    await page.click('.modal-body button:has-text("校验 nginx")');
+    // 「校验 nginx」挂在工具条「nginx 运行 / nginx 停止」按钮的展开菜单里
+    //（2026-09-22 起用它替换了「⋯ 更多」）—— 先展开再点这一项。
+    await page.click('.card-head button.zp-run-btn');
+    await page.waitForSelector('.card-head .zp-menu button:has-text("校验 nginx")',
+      { state: 'visible', timeout: 8000 });
+    await page.click('.card-head .zp-menu button:has-text("校验 nginx")');
     await page.waitForSelector('.toast', { timeout: 15000 });
     await page.waitForTimeout(800);
     const toastText = await page.locator('.toast').first().innerText();
@@ -2661,6 +2820,10 @@ try {
     // 而且全都跑着的时候还在念"一键 LNMP 会先确保运行依赖…"。
     // 根因是原生 Element.append 把条件渲染的 `null` 当文本渲染（本项目的老坑），
     // 修法是条件渲染一律走 appendAll / if 分支。
+    //
+    // ⚠️ 必须先回到网站管理页：这一步以前跑在"上一步留下的页面"上（文件管理），
+    // `.card-body` 在那边也存在，于是断言是**空过**的。
+    await reloadSites();
     const box = page.locator('.card-body').first();
     const text = (await box.innerText()) || '';
     if (/\bnull\b/.test(text)) {
@@ -2672,21 +2835,26 @@ try {
     await shot('52c-sites-env-line');
   });
 
-  await step('常用设置弹窗必须有内容（点开空白 = 用户报障的那一类）', async () => {
+  await step('调整配置 → 上传与执行上限 必须有内容（点开空白 = 用户报障的那一类）', async () => {
     // 2026-09-18 用户报障：「上传大小 / 执行时间（nginx + PHP）」点开是**空的**。
-    // 根因是前端把面板构建函数定义在了另一个函数作用域里（uploadLimitsModal
-    // 在模块作用域调它 → ReferenceError → 弹窗正文永远空白），而 acorn 只能查语法、
-    // Go 测试也碰不到前端作用域 —— 只有真浏览器点一次才发现。
-    // 这条门禁刻意断言"正文里有实质内容"，而不是"弹窗出现了"。
-    const btn = page.getByRole('button', { name: '⚡ 上传大小 / 执行时间', exact: true }).first();
-    if (!(await btn.count())) throw new Error('网站管理工具条里没有「⚡ 上传大小 / 执行时间」入口');
+    // 根因是前端把面板构建函数定义在了另一个函数作用域里（当时在模块作用域调它
+    // → ReferenceError → 弹窗正文永远空白）。这条门禁刻意断言"正文里有实质内容"，
+    // 而不是"弹窗出现了"。
+    // 2026-09-22 起这块内容并入「⚙️ 调整配置 → 上传与执行上限」页（用户要求合并）。
+    // 同上：先回到网站管理页 —— 工具条按钮只在那一页上。
+    await reloadSites();
+    const btn = page.getByRole('button', { name: '⚙️ 调整配置', exact: true }).first();
+    if (!(await btn.count())) throw new Error('网站管理工具条里没有「⚙️ 调整配置」入口');
     await btn.click();
     await page.waitForSelector('.modal-mask', { timeout: 10000 });
+    const tab = page.locator('.modal button.zp-seg-btn').filter({ hasText: '上传与执行上限' }).first();
+    if (!(await tab.count())) throw new Error('「调整配置」弹窗里没有「上传与执行上限」页签');
+    await tab.click();
     await page.waitForTimeout(2500);
     const text = (await page.locator('.modal-mask .modal-body').allInnerTexts()).join('\n');
     for (const want of ['client_max_body_size', 'upload_max_filesize', '保存并应用']) {
       if (!text.includes(want)) {
-        throw new Error('「上传大小 / 执行时间」弹窗里缺少 ' + want + ' —— 正文实际是：' + text.slice(0, 200));
+        throw new Error('「上传与执行上限」页里缺少 ' + want + ' —— 正文实际是：' + text.slice(0, 200));
       }
     }
     await shot('40c-limits-modal');
@@ -2700,6 +2868,13 @@ try {
     //   ② 过程中必须有可见进度（XHR upload.onprogress + 每秒 ticker）；
     //   ③ 页面必须提供「上传文件夹」（用户点名要的入口）。
     // 三条都是用户可见的行为，所以只能在这里端到端验，单测替代不了。
+    //
+    // ⚠️ 前置：这一步以前依赖"上一步恰好把浏览器停在文件管理页"（上一步后来变成了
+    // 网站管理页 → 整个上传门禁直接找不到 input）。显式导航，不依赖别人的副作用。
+    await page.goto(page.url().split('#')[0] + '#/files', { waitUntil: 'domcontentloaded' });
+    // ⚠️ 上传 input 是**隐藏的**（真正的点击目标是它外面的按钮）——默认等"可见"必然超时。
+    await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 20000 });
+    await page.waitForTimeout(1200);
     const plain = page.locator('input[type="file"]:not([webkitdirectory])');
     if (!(await plain.count())) throw new Error('文件管理页没有普通上传的 input');
     if (!(await page.locator('input[webkitdirectory]').count())) {
@@ -2708,16 +2883,38 @@ try {
     if (!(await page.getByRole('button', { name: '⬆ 上传文件夹', exact: true }).count())) {
       throw new Error('工具栏缺少「⬆ 上传文件夹」按钮');
     }
-    // 护栏（血泪教训，见 DEVELOPMENT 坑 168）：上传前**必须**确认当前目录在临时沙箱里。
-    // 这条断言如果不过，说明默认目录又漂到真实系统目录（曾经漂到 /opt/homebrew/etc），
-    // 那一刻继续往下走就是往真实目录里写测试文件。
-    const here = await page.evaluate(async () => {
+    // 上传前**必须先站进临时沙箱**（血泪教训，见 DEVELOPMENT 坑 168：
+    // 默认目录曾漂到 /opt/homebrew/etc，测试文件就写进真机了）。
+    //
+    // 为什么不能只断言"当前目录在 /tmp 下"：调试实例的默认目录是真实的
+    // ~/www（Cfg.WWWRoot），第一次跑必然不在沙箱内 —— 那样这条门禁永远红，
+    // 上传路径反而完全没被测到。这里改成**主动切**到面板自己的临时根：
+    // 文件管理器白名单里包含 <LOCAL_ROOT>/data（就是 /tmp 下的数据目录），
+    // 多根时面包屑上有一个根选择下拉（files.js::renderCrumbs）。
+    const roots = await page.evaluate(async () => {
       const r = await fetch('api/v1/files', { credentials: 'same-origin' });
       const j = await r.json();
-      return (j.data && j.data.path) || '';
+      return (j.data && j.data.roots) || [];
     });
-    if (!here.startsWith('/tmp/')) {
-      throw new Error('上传前当前目录不在临时沙箱内（' + here + '）—— 拒绝上传，先查默认目录逻辑');
+    const isTmp = (x) => x.startsWith('/tmp/') || x.startsWith('/private/tmp/');
+    // 优先用 <LOCAL_ROOT>/work（面板给调试/临时文件留的目录），退而求其次用任意临时根。
+    const sandbox = roots.find((x) => isTmp(x) && /\/work$/.test(x)) || roots.find(isTmp);
+    if (!sandbox) {
+      throw new Error('这个实例没有任何临时目录根（/tmp 或 /private/tmp），拒绝上传：' + JSON.stringify(roots));
+    }
+    const rootSel = page.locator('select.select').first();
+    const rootOpts = await rootSel.locator('option').evaluateAll((os) => os.map((o) => o.value));
+    if (!rootOpts.includes(sandbox)) {
+      throw new Error('根选择下拉里没有临时沙箱根 ' + sandbox + '：' + JSON.stringify(rootOpts));
+    }
+    await rootSel.selectOption(sandbox);
+    await page.waitForTimeout(1500);
+    // 判据取**根下拉当前选中的值**（就是列表正在展示的根），而不是
+    // GET /api/v1/files 的默认目录 —— 后者恒为 Cfg.WWWRoot，永远测不出真实所在。
+    const here = await rootSel.inputValue();
+    // macOS 的 /tmp 是 /private/tmp 的软链：两个前缀都算沙箱。
+    if (!isTmp(here)) {
+      throw new Error('切到临时沙箱失败，当前列表的根是（' + here + '）—— 拒绝上传');
     }
     const uploadHits = [];
     const watch = (req) => { if (req.url().includes('/files/upload')) uploadHits.push(req.url()); };

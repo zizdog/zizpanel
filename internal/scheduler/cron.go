@@ -47,6 +47,13 @@ type Job struct {
 	BackupTargets []string `json:"backup_targets"`
 	BackupDir     string   `json:"backup_dir"`
 	KeepDays      int      `json:"keep_days"`
+
+	// backup 任务生成脚本时要用的运行时路径（不入库）。
+	//
+	// 由 Manager 在写 launchd 之前注入，值来自面板配置 ——
+	// 脚本里写死 /opt/zizpanel 会在重定位安装下备错东西。
+	PanelBin   string `json:"-"`
+	ConfigPath string `json:"-"`
 }
 
 // LabelPrefix 是所有面板任务 label 的前缀。

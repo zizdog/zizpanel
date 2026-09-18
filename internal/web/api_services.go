@@ -1253,6 +1253,20 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		// 走通用 brew 流程会得到"已安装但启动失败"的假警告 + 一条永远没有状态的假服务记录。
 		s.handleInstallImageCompressor(w, r)
 		return
+	case "macspeech":
+		// macOS 语音合成（say）：安装器不做任何下载（引擎是系统自带的
+		// /usr/bin/say），只复核引擎 + 注册面板托管的网页界面服务。
+		// 走自研安装器而不是通用 brew 流程：这个应用**没有 brew 包**，
+		// 通用流程会 brew install 一个不存在的东西。
+		s.handleInstallMacSpeech(w, r)
+		return
+	case "stt":
+		// 语音转文字（whisper.cpp）：走自研安装器而不是通用 brew 流程，有三个理由：
+		//   · 要下**模型权重**（brew 的 caveat 明说 GGML 模型不随包下载）；
+		//   · 要注册面板托管的网页界面（系统级 launchd，跑 `zizpanel stt-serve`）；
+		//   · 要复核"真的能转出字"（不是 brew 退出码 0）。
+		s.handleInstallSTT(w, r)
+		return
 	case "python311", "python312", "python313":
 		// Python 解释器（应用市场里三个版本，用户 2026-09-18 要求上架）。
 		// 走自研安装器而不是通用 brew 流程：解释器**没有 brew service**，

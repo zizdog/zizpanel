@@ -416,6 +416,39 @@ func humanWait(d time.Duration) string {
 	return fmt.Sprintf("%.1f 秒", d.Seconds())
 }
 
+// existingLogPath 只在文件**真的存在**时返回该路径，否则返回空串。
+//
+// 为什么不是"推导出来就返回"：用户 2026-09-22 明确要求"不能写死，这是个要公开使用的
+// 面板"。旧实现把 /Users/zizdog/www/_logs/nginx-error.log 与
+// /opt/homebrew/var/log/nginx/error.log 写死在前端 JS 里 —— 换一台机器（另一个用户名、
+// Intel 的 /usr/local、自定义 LogRoot）两行就全是错的。真正的判据是"这个文件在不在"，
+// 读不到就返回空串，由界面显示"路径未知"，绝不拿推导出来的字符串冒充真实路径。
+func existingLogPath(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// nginxSiteErrorLog 是站点日志树（Cfg.LogRoot，默认 ~/www/_logs）里的 nginx 错误日志。
+func (s *Server) nginxSiteErrorLog() string {
+	if strings.TrimSpace(s.Cfg.LogRoot) == "" {
+		return ""
+	}
+	return existingLogPath(filepath.Join(s.Cfg.LogRoot, "nginx-error.log"))
+}
+
+// nginxBrewErrorLog 是 Homebrew nginx 的出厂错误日志位置（由 Cfg.BrewPrefix 推导）。
+func (s *Server) nginxBrewErrorLog() string {
+	if strings.TrimSpace(s.Cfg.BrewPrefix) == "" {
+		return ""
+	}
+	return existingLogPath(filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log"))
+}
+
 // nginxErrorLogTail 读取 nginx 全局 error_log 的末几行（读不到返回空串）。
 //
 // 复核超时的错误里直接**附上**这几行：用户不必先去日志中心翻，
@@ -559,13 +592,17 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item{Site: st, ConfExists: err == nil, Running: err == nil && st.Enabled})
 	}
 	ok(w, map[string]any{
-		"list":         out,
-		"www_root":     s.Cfg.WWWRoot,
-		"log_dir":      s.siteLogDir(),
-		"vhost_dir":    vhostDir,
-		"brew_prefix":  s.Cfg.BrewPrefix,
-		"presets":      sites.RewritePresets,
-		"php_versions": s.detectPHPVersions(r.Context()),
+		"list":        out,
+		"www_root":    s.Cfg.WWWRoot,
+		"log_dir":     s.siteLogDir(),
+		"vhost_dir":   vhostDir,
+		"brew_prefix": s.Cfg.BrewPrefix,
+		// nginx 错误日志的两个真实位置（由配置推导 + 存在性核对）。
+		// 前端不许再自己拼路径（会写死用户名与 brew 前缀），读不到就是空串 → 界面显示"路径未知"。
+		"nginx_error_log":      s.nginxSiteErrorLog(),
+		"nginx_brew_error_log": s.nginxBrewErrorLog(),
+		"presets":              sites.RewritePresets,
+		"php_versions":         s.detectPHPVersions(r.Context()),
 		// 手工编辑配置文件的入口清单（宝塔式的基本操作，见 api_config_files.go）。
 		// 路径由后端给：brew 前缀在 Apple Silicon / Intel 不同，前端不拼字符串。
 		"config_files": s.panelConfigFiles(r.Context()),

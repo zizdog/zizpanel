@@ -340,7 +340,9 @@ func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, _ = doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
-	written := stubDefaultSiteApply(t, srv)
+	// 只装桩（不读它的 *written）：断言改从磁盘上的 vhost 读，
+	// 避免与巡检 goroutine 的赋值构成数据竞争，也避免下面那个竞态（见 ③）。
+	stubDefaultSiteApply(t, srv)
 	// 整条自愈链都会碰 priv 包的路径（conf.d / 运行时目录），必须沙箱化，
 	// 否则一次 go test 就会去读写真机 /opt/homebrew/etc/nginx。
 	t.Setenv("ZIZPANEL_BREW_PREFIX", srv.Cfg.BrewPrefix)
@@ -372,11 +374,24 @@ func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); srv.watchWebEnv(ctx) }()
 
+	// 等待**两件事同时成立**：占位页出现、且带标记的 vhost 已落到磁盘。
+	//
+	// 为什么不能只等 index：createDefaultSite 的顺序是"先建占位页，再
+	// buildDefaultVhost + 写 vhost"。只等 index 就会在写 vhost 之前往下走，
+	// 断言 `*written` 时它还是空串 —— 这是一条**固有的竞态**（2026-09-23 实测：
+	// 同一份代码时红时绿）。vhost 文件本身就是"真的写完了"的判据，直接读盘最稳，
+	// 也顺带避开与巡检 goroutine 同时读写 *written 的数据竞争。
 	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")
+	vhostPath := filepath.Join(srv.Cfg.VhostDir, "000-default.conf")
 	deadline := time.Now().Add(5 * time.Second)
+	var vhostBody string
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(index); err == nil {
-			break
+		if b, err := os.ReadFile(vhostPath); err == nil {
+			vhostBody = string(b)
+			if _, err := os.Stat(index); err == nil &&
+				strings.Contains(vhostBody, services.DefaultVhostMarker) {
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -384,8 +399,8 @@ func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
 		cancel()
 		t.Fatalf("nginx 装上之后，面板必须自动把默认站点建起来（用户报障就是这里没人做）：%v", err)
 	}
-	if !strings.Contains(*written, services.DefaultVhostMarker) {
-		t.Errorf("自动创建的 vhost 必须是面板生成的默认站点：\n%s", *written)
+	if !strings.Contains(vhostBody, services.DefaultVhostMarker) {
+		t.Errorf("自动创建的 vhost 必须是面板生成的默认站点：\n%s", vhostBody)
 	}
 	// 必须**等巡检真的退出**再结束测试：t.Setenv 会在测试结束后还原
 	// ZIZPANEL_BREW_PREFIX，而还在飞的巡检会拿真机前缀去写真机 nginx 配置

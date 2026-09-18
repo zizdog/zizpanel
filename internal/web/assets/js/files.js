@@ -1382,11 +1382,27 @@ async function ensureLang(langKey) {
 
 // ---------------- 配色 ----------------
 //
-// 两档：跟随面板（默认）/ Monokai。键名沿用旧版：用户已经选过的偏好不该丢。
+// 语义只有两档（键名沿用旧版：用户已经选过的 panel / monokai 都还认）：
+//   · panel   → 跟随面板：浅色面板用官方浅色主题 eclipse、深色面板用官方深色主题
+//               material-darker（`:root[data-theme]` 一变就实时跟着换）；
+//   · monokai → 官方 monokai。
+//
+// 语法着色**全部**来自 CodeMirror 官方主题（`vendor/codemirror/theme/*.min.css`，
+// 从 cdnjs `codemirror@5.65.16` 原样下载、未改动一个字）。
+//
+// 为什么删掉自研主题：旧版手写了一个 `cm-s-<自研名>` 主题的 token 颜色，又在弹窗
+// 根节点上加一个类去覆盖面板 CSS 变量（--panel/--text/--bg-soft…），后者把弹窗里的
+// 按钮与输入框一起染成 Monokai 色 —— 用户 2026-09-22 报的"按钮颜色有问题"。
+// 现在的原则：编辑器配色只用官方主题，面板自己的控件永远用面板变量。
 const ZPF_THEME_KEY = 'zp-file-editor-theme';
 const ZPF_THEME_PANEL = 'panel';
 const ZPF_THEME_MONOKAI = 'monokai';
 const ZPF_CSS_ID = 'zpf-editor-style';
+
+// CodeMirror 主题名 == theme/<name>.min.css 的文件名 == `.cm-s-<name>` 类名。
+const CM_THEME_LIGHT = 'eclipse';
+const CM_THEME_DARK = 'material-darker';
+const CM_THEME_MONOKAI = 'monokai';
 
 function readEditorTheme() {
   try {
@@ -1398,14 +1414,27 @@ function saveEditorTheme(v) {
   try { localStorage.setItem(ZPF_THEME_KEY, v); } catch { /* 存不了就本次会话生效 */ }
 }
 
-function applyEditorThemeTo(el, v) {
-  if (el) el.classList.toggle('zpf-monokai', v === ZPF_THEME_MONOKAI);
+// panelIsLight 读面板**真正生效**的主题：app.js 把 light/dark/auto 三态折算后
+// 写到 documentElement 的 data-theme 上。读不到时按深色算 —— app.css 的
+// `:root` 默认就是深色，两者一致。
+function panelIsLight() {
+  return document.documentElement.dataset.theme === 'light';
 }
 
-// ensureEditorStyle 注入编辑器自己的样式（只注入一次）。
+function cmThemeFor(setting) {
+  if (setting === ZPF_THEME_MONOKAI) return CM_THEME_MONOKAI;
+  return panelIsLight() ? CM_THEME_LIGHT : CM_THEME_DARK;
+}
+
+// ensureCmTheme 按需加载官方主题 CSS（与本体一样：用到哪个才加载哪个）。
+function ensureCmTheme(name) {
+  return cmLoadOne(new URL(`theme/${name}.min.css`, CM_ASSET_BASE).href, true);
+}
+
+// ensureEditorStyle 注入**最小布局**样式（只注入一次）。
 //
-// 面板主题变量（--text / --panel-2 / …）两套主题都定义好了，这里只把 CodeMirror
-// 的类名映射过去，所以浅色/深色/Monokai 三种外观都不需要各写一份。
+// 只负责"让 CodeMirror 撑满容器"和"查找框跟随面板"；背景/前景/语法色一律交给
+// 官方主题，所以这里**不许**再出现任何 token 颜色或面板变量覆盖。
 function ensureEditorStyle() {
   if (document.getElementById(ZPF_CSS_ID)) return;
   const st = document.createElement('style');
@@ -1413,47 +1442,11 @@ function ensureEditorStyle() {
   st.textContent = [
     // 编辑器高度铺满外层容器（CodeMirror 需要一个有高度的父元素）
     '.zpf-cm { position: relative; display: flex; flex-direction: column; min-height: 0; }',
-    '.zpf-cm .CodeMirror { flex: 1 1 auto; height: auto; min-height: 0; font-family: var(--mono); font-size: 13px; line-height: 1.6; background: var(--bg-soft); color: var(--text); }',
-    '.zpf-cm .CodeMirror-gutters { background: var(--panel-2); border-right: 1px solid var(--border-soft); }',
-    '.zpf-cm .CodeMirror-linenumber { color: var(--text-mute); }',
-    '.zpf-cm .CodeMirror-cursor { border-left: 2px solid var(--text); }',
-    '.zpf-cm .CodeMirror-selected { background: rgba(96,165,250,.30) !important; }',
-    '.zpf-cm .CodeMirror-activeline-background { background: rgba(127,127,127,.08); }',
-    '.zpf-cm .CodeMirror-matchingbracket { color: #16a34a !important; font-weight: 700; }',
-    '.zpf-cm .CodeMirror-nonmatchingbracket { color: #dc2626 !important; }',
-    '.zpf-cm .CodeMirror-foldmarker { color: var(--brand); }',
-    // 面板主题下的语法着色（沿用旧版配色，视觉上与升级前一致）
-    '.cm-s-zp-panel .cm-comment { color: #6b7688; font-style: italic; }',
-    '.cm-s-zp-panel .cm-string, .cm-s-zp-panel .cm-string-2 { color: #86d99a; }',
-    '.cm-s-zp-panel .cm-number { color: #f0a868; }',
-    '.cm-s-zp-panel .cm-keyword, .cm-s-zp-panel .cm-atom, .cm-s-zp-panel .cm-def { color: #c792ea; }',
-    '.cm-s-zp-panel .cm-variable-2, .cm-s-zp-panel .cm-attribute { color: #e2b96b; }',
-    '.cm-s-zp-panel .cm-variable-3, .cm-s-zp-panel .cm-type, .cm-s-zp-panel .cm-builtin { color: #4ec9b0; }',
-    '.cm-s-zp-panel .cm-tag, .cm-s-zp-panel .cm-meta { color: #f07178; }',
-    '.cm-s-zp-panel .cm-link, .cm-s-zp-panel .cm-qualifier { color: #6fb3f2; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-comment { color: #8a93a3; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-string, :root[data-theme="light"] .cm-s-zp-panel .cm-string-2 { color: #15803d; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-number { color: #b45309; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-keyword, :root[data-theme="light"] .cm-s-zp-panel .cm-atom, :root[data-theme="light"] .cm-s-zp-panel .cm-def { color: #7c3aed; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-variable-2, :root[data-theme="light"] .cm-s-zp-panel .cm-attribute { color: #a16207; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-variable-3, :root[data-theme="light"] .cm-s-zp-panel .cm-type, :root[data-theme="light"] .cm-s-zp-panel .cm-builtin { color: #0f766e; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-tag, :root[data-theme="light"] .cm-s-zp-panel .cm-meta { color: #b91c1c; }',
-    ':root[data-theme="light"] .cm-s-zp-panel .cm-link, :root[data-theme="light"] .cm-s-zp-panel .cm-qualifier { color: #1d4ed8; }',
+    '.zpf-cm .CodeMirror { flex: 1 1 auto; height: auto; min-height: 0; font-family: var(--mono); font-size: 13px; line-height: 1.6; }',
     // 查找/替换对话框：CodeMirror 自带的是浅色浮层，这里让它跟随面板
     '.zpf-cm .CodeMirror-dialog { background: var(--panel); color: var(--text); border-top: 1px solid var(--border); padding: 6px 10px; font-size: 12.5px; }',
     '.zpf-cm .CodeMirror-dialog input { background: var(--bg-soft); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font-family: var(--mono); }',
     '.zpf-cm .CodeMirror-dialog button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; cursor: pointer; }',
-    // Monokai：只作用于编辑器弹窗根节点，面板其它部分不受影响
-    '.zpf-monokai { --bg-soft: #272822; --panel: #272822; --panel-2: #34352c;',
-    '  --border: #49483e; --border-soft: #3b3c33; --text: #f8f8f2; --text-mute: #b9b9ae;',
-    '  background: #272822; border-color: #49483e; }',
-    '.zpf-monokai .modal-head, .zpf-monokai .modal-foot { border-color: #3b3c33; }',
-    '.zpf-monokai .modal-head h3, .zpf-monokai .hint { color: #f8f8f2; }',
-    '.zpf-monokai .modal-close { color: #b9b9ae; }',
-    '.zpf-monokai .modal-close:hover { color: #f8f8f2; }',
-    '.zpf-monokai .select, .zpf-monokai .input { color: #f8f8f2; }',
-    '.zpf-monokai .select option { background: #272822; color: #f8f8f2; }',
-    '.zpf-monokai .zpf-cm .CodeMirror { background: #272822; color: #f8f8f2; }',
   ].join('\n');
   document.head.appendChild(st);
 }
@@ -1481,10 +1474,11 @@ function editorModal(entry, res) {
   let cm = null;
   let dirty = false;
   let theme = readEditorTheme();
+  let themeSeq = 0;
   let boxWide = false;
 
   const themeSel = h('select.select', { style: { width: 'auto' } }, [
-    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板', selected: theme === ZPF_THEME_PANEL }),
+    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板（浅色 Eclipse / 深色 Material）', selected: theme === ZPF_THEME_PANEL }),
     h('option', { value: ZPF_THEME_MONOKAI, text: '配色：Monokai', selected: theme === ZPF_THEME_MONOKAI }),
   ]);
   themeSel.addEventListener('change', () => applyTheme(themeSel.value));
@@ -1513,17 +1507,36 @@ function editorModal(entry, res) {
     m?.setStatus(v ? '● 未保存' : '');
   }
 
-  function applyTheme(v) {
+  // applyTheme 切配色：**先按需加载**官方主题 CSS，再改 CodeMirror 的 theme。
+  //
+  // 异步竞态：加载 CSS 期间用户可能又切了一次（或面板主题变了），晚到的结果
+  // 不能覆盖新的选择 —— 用 themeSeq 序号丢弃过期结果。
+  async function applyTheme(v) {
     theme = v === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
     saveEditorTheme(theme);
     themeSel.value = theme;
-    applyEditorThemeTo(m?.el, theme);
+    const seq = ++themeSeq;
+    const name = cmThemeFor(theme);
+    try {
+      await ensureCmTheme(name);
+    } catch (e) {
+      toast('编辑器主题加载失败：' + ((e && e.message) || e), 'err');
+      return;
+    }
+    if (seq !== themeSeq) return;
     if (cm) {
-      cm.setOption('theme', theme === ZPF_THEME_MONOKAI ? 'monokai' : 'zp-panel');
+      cm.setOption('theme', name);
       // 换主题会重建行高/尺寸相关样式，必须 refresh，否则光标与行会短暂错位
       requestAnimationFrame(() => cm.refresh());
     }
   }
+
+  // 面板主题（浅色/深色/跟随系统）在弹窗打开期间可能被切换：panel 档要**实时**跟着换。
+  // 观察 app.js 写到 documentElement 上的 data-theme；弹窗关闭时断开。
+  const themeObserver = new MutationObserver(() => {
+    if (theme === ZPF_THEME_PANEL) applyTheme(ZPF_THEME_PANEL);
+  });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
   function setMaximized(on) {
     boxWide = on;
@@ -1618,20 +1631,22 @@ function editorModal(entry, res) {
     onClose: () => {
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
+      themeObserver.disconnect();
     },
   });
-
-  applyEditorThemeTo(m.el, theme);
 
   // ---- 异步挂载 CodeMirror ----
   hint.textContent = '正在加载编辑器…';
   (async () => {
     await ensureCodeMirror();
     await ensureLang(langKey);
+    // 主题 CSS 与本体一样按需加载：进编辑器才拉当前这一份（切换时再拉另一份）
+    await ensureCmTheme(cmThemeFor(theme));
+    const themeName = cmThemeFor(theme);
     cm = window.CodeMirror(host, {
       value: res.content,
       mode: langDef ? langDef.mode : null,
-      theme: theme === ZPF_THEME_MONOKAI ? 'monokai' : 'zp-panel',
+      theme: themeName,
       lineNumbers: true,
       lineWrapping: false,
       indentUnit: 4,
@@ -1690,6 +1705,8 @@ function editorModal(entry, res) {
     cm.on('change', () => setDirty(true));
     setDirty(false);
     cm.focus();
+    // 挂载是异步的：如果这期间用户切了配色（或面板深浅色变了），按最新选择纠正一次
+    if (cmThemeFor(theme) !== themeName) applyTheme(theme);
     const lines = cm.lineCount();
     hint.textContent = `${langDef ? langDef.label : '纯文本'} · ${lines} 行 · ${humanSize(res.size)}`
       + '　Tab 缩进 · Ctrl+S 保存 · Ctrl+F 查找' + (langDef && langKey === 'ts' ? '（TypeScript 按 JavaScript 高亮）' : '');

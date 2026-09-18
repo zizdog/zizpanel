@@ -599,6 +599,13 @@ func (r *Rule) Generate(logDir string) (string, error) {
 	b.WriteString("\t\tproxy_send_timeout    3600s;\n")
 	b.WriteString("\t\tproxy_read_timeout    3600s;\n")
 	b.WriteString("\t\tproxy_buffering       off;\n")
+	// 请求体必须**边收边转发**给上游，不能先整段落盘到 client_body_temp。
+	//
+	// 为什么现在加（2026-09-18 生产事故）：那个临时目录一旦不可写（属主不对、
+	// 磁盘满），nginx 会在把请求转给上游**之前**就失败，直接回它自己的 500 HTML
+	// 页；而端口在听、健康检查全绿，用户却一上传（例如经反代推 368KB 音色样本）
+	// 就坏。`proxy_buffering off` 只关**响应**缓冲，请求体缓冲必须靠这一行关。
+	b.WriteString("\t\tproxy_request_buffering off;\n")
 	if logDir != "" {
 		fmt.Fprintf(&b, "\n\t\taccess_log %s/proxy-%d.access.log;\n", logDir, r.ID)
 		fmt.Fprintf(&b, "\t\terror_log  %s/proxy-%d.error.log;\n", logDir, r.ID)

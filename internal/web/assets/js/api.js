@@ -127,6 +127,29 @@ export const api = {
   auditFacets: () => request('GET', `${API_BASE}/audit/facets`),
   getSettings: () => request('GET', `${API_BASE}/settings`),
 
+  // ---- 导航页（sun-panel 风格图标网格首页）----
+  //
+  // 数据模型只有两层：分组（nav_groups）+ 站点（nav_items）。
+  // 全部 requireAuth；导入是**整份替换**，界面必须先二次确认再调。
+  // 导出返回的是可重新导入的纯 JSON 文档（不是 {ok,data} 包装），
+  // 所以这里不走 request()，由 nav.js 直接 fetch 成文件下载。
+  navTree: () => request('GET', `${API_BASE}/nav/tree`),
+  navGroups: () => request('GET', `${API_BASE}/nav/groups`),
+  navGroupCreate: (payload) => request('POST', `${API_BASE}/nav/groups`, payload),
+  navGroupUpdate: (id, payload) => request('PUT', `${API_BASE}/nav/groups/${id}`, payload),
+  navGroupDelete: (id) => request('DELETE', `${API_BASE}/nav/groups/${id}`),
+  navGroupReorder: (ids) => request('POST', `${API_BASE}/nav/groups/reorder`, { ids }),
+  navItems: () => request('GET', `${API_BASE}/nav/items`),
+  navItemCreate: (payload) => request('POST', `${API_BASE}/nav/items`, payload),
+  navItemUpdate: (id, payload) => request('PUT', `${API_BASE}/nav/items/${id}`, payload),
+  navItemDelete: (id) => request('DELETE', `${API_BASE}/nav/items/${id}`),
+  navItemReorder: (ids) => request('POST', `${API_BASE}/nav/items/reorder`, { ids }),
+  navImport: (doc) => request('POST', `${API_BASE}/nav/import`, doc),
+  navExportURL: () => apiURL('nav/export'),
+  // 独立别名页地址：用当前访问的面板地址推导，而不是写死主机 ——
+  // 面板可能从 127.0.0.1、局域网 IP 或隧道域名访问。
+  navStandaloneURL: () => new URL('../nav/', document.baseURI).pathname,
+
   // ---- 在线升级 ----
   upgradeStatus: () => request('GET', `${API_BASE}/system/upgrade`),
   upgradeCheck: (source) => request('POST', `${API_BASE}/system/upgrade/check`, { source }),
@@ -163,6 +186,8 @@ export const api = {
   proxyToggle: (id) => request('POST', `${API_BASE}/proxies/${id}/toggle`, {}),
   proxyDelete: (id) => request('DELETE', `${API_BASE}/proxies/${id}`),
   proxyTest: (target) => request('POST', `${API_BASE}/proxies/test`, { target }),
+  // 大请求体探测：真的 POST 64KB 到规则的监听端口，只在用户点按钮时调用。
+  probeProxyBody: (id) => request('POST', `${API_BASE}/proxies/${id}/probe-body`, {}),
   // HTTPS：与站点侧 siteSSL 对称（同一套 provider 取值：
   // self / mkcert / manual / acme）。acme 只是"引用证书库里那张"，
   // 申请仍走「SSL 证书」页的任务中心。
@@ -376,6 +401,15 @@ export const api = {
   cronPreview: (schedule) =>
     request('GET', `${API_BASE}/cron/preview?schedule=${encodeURIComponent(schedule)}`),
   backups: () => request('GET', `${API_BASE}/backups`),
+  // 备份与恢复（本轮新增）。上传走 multipart（字段名 file），其余是 JSON。
+  backupCreate: (payload) => request('POST', `${API_BASE}/backups`, payload),
+  backupInfo: (name) => request('GET', `${API_BASE}/backups/${encodeURIComponent(name)}`),
+  backupRestore: (name, restoreConfig) =>
+    request('POST', `${API_BASE}/backups/restore`, { name, restore_config: !!restoreConfig }),
+  backupDelete: (name) => request('DELETE', `${API_BASE}/backups/${encodeURIComponent(name)}`),
+  backupUpload: (file) => api.upload(`${API_BASE}/backups/upload`, file, 'file'),
+  // 下载用浏览器直接跳转（带 Cookie 认证），不要走 fetch 把大归档读进内存。
+  backupDownloadURL: (name) => `${API_BASE}/backups/${encodeURIComponent(name)}/download`,
 
   // ---- 文件管理 ----
   files: (path, hidden = false) =>

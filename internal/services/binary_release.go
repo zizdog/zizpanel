@@ -1110,6 +1110,24 @@ func IsReleaseBinaryApp(id string) bool {
 	return ok
 }
 
+// ReleaseBinaryAppConfigRelPaths 返回由本安装器部署的应用"家目录下的配置文件"
+// 相对路径（<RootDir>/<ConfigFile>），键是应用 ID。
+//
+// 为什么要有它：这些配置文件里常有第三方服务的 token（ddns-go 的 DNS API token、
+// frpc 的 serverAddr/auth.token、orbien 的隧道凭据），备份功能把它们的勾选权
+// 交给用户（默认不勾）。备份清单**从注册表派生**而不是各写一份：新加一个
+// release-binary 应用时，备份侧不会悄悄漏掉它（有覆盖门禁测试锁死）。
+func ReleaseBinaryAppConfigRelPaths() map[string]string {
+	out := map[string]string{}
+	for id, spec := range releaseBinaryApps {
+		if spec.ConfigFile == "" {
+			continue
+		}
+		out[id] = spec.RootDir + "/" + spec.ConfigFile
+	}
+	return out
+}
+
 // hostOf 取 URL 的主机名，用于日志（不要把完整 URL 塞进一行日志）。
 func hostOf(raw string) string {
 	if u, err := url.Parse(raw); err == nil && u.Host != "" {

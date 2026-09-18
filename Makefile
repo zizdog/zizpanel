@@ -130,8 +130,10 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@# 这类错误返回 0，而浏览器直接拒绝执行 → 整个面板白屏、连行号都不给。
 	@# 这个坑真踩过（docker-compose.js / docker-services.js），所以设成门禁。
 	@echo "==> 前端 JS 语法检查（acorn）"
+	@# assets/nav 是「导航页」的独立别名页（GET /nav/）：它同样会被浏览器
+	@# 当模块解析，语法错误一样是白屏，所以一并纳入门禁。
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-syntax.mjs internal/web/assets/js || exit 1; \
+	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@echo "==> go vet"
 	@$(MAKE) --no-print-directory vet

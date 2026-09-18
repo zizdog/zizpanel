@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -310,54 +309,26 @@ func (s *Store) migrate(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// 备份/恢复功能新增的列（cron_jobs 的备份选项）放在 backup_tables.go，
+	// 避免本文件的 schema 常量被多个并行改动同时编辑。
+	if err := EnsureBackupTables(ctx, s.db); err != nil {
+		return err
+	}
+	// 导航页的表同样在 migrate 里建：**KnownTables() 认的表都必须真的存在**，
+	// 否则「从备份恢复」会在这张表上失败（2026-09-18 接入导航页时就是这么暴露的：
+	// 恢复一开始就报 no such table: nav_groups，因为只有 handler 才会建它）。
+	if err := EnsureNavTables(ctx, s.db); err != nil {
+		return err
+	}
 	// 记录 schema 版本，后续增量迁移用
 	return s.setMeta(ctx, "schema_version", "3")
 }
 
 // ensureColumns 给已存在的表补齐缺失的列（SQLite 的 ADD COLUMN）。
 //
-// 只做"加列"，不改类型、不删列：迁移要能在任何老库上重复执行而不出错，
-// 且绝不能动用户已有数据。列名/定义都来自本包内的常量，不经用户输入，无注入面。
+// 实现见 backup_tables.go 的 ensureColumnsDB（显式接收 *sql.DB 以便复用）。
 func (s *Store) ensureColumns(ctx context.Context, table string, cols map[string]string) error {
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid, notNull, pk int
-			name, ctype      string
-			dflt             any
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("解析 %s 表结构失败: %w", table, err)
-		}
-		have[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
-	}
-	_ = rows.Close()
-
-	// 固定顺序执行，避免 map 迭代顺序让"失败的库"每次停在不同列上。
-	names := make([]string, 0, len(cols))
-	for n := range cols {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		if have[n] {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx,
-			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, n, cols[n])); err != nil {
-			return fmt.Errorf("迁移 %s.%s 失败: %w", table, n, err)
-		}
-	}
-	return nil
+	return ensureColumnsDB(ctx, s.db, table, cols)
 }
 
 // splitStatements 按分号切分 SQL。表结构里不含字符串字面量中的分号，

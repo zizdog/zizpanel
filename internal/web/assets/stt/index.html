@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>语音转文字（whisper.cpp）· ZizPanel</title>
+<!--
+  内嵌的语音转文字界面（无构建步骤、无外部 CDN、完全离线可用）。
+
+  两条入口共用这一份页面：
+    · 直连端口  http://127.0.0.1:8892/
+    · 面板别名  http://<主机>/stt/  （由 internal/appproxy 反代，要求先登录面板）
+
+  所以所有资源与接口调用都用**相对路径**（./app.js、v1/models）：
+  绝对路径（/app.js）在别名下会打到站点根，页面直接白屏。
+-->
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<header class="top">
+  <div class="title">
+    <h1>🎙️ 语音转文字</h1>
+    <p class="sub">引擎：<code>whisper.cpp</code>（Homebrew 原生 arm64 · Metal 加速 · 不需要 Docker / Python / GUI）</p>
+  </div>
+  <div class="engine" id="engine-badge" title="正在探测引擎…">
+    <span class="dot" id="engine-dot"></span>
+    <span id="engine-text">正在探测引擎…</span>
+  </div>
+</header>
+
+<div class="alert alert-error" id="global-error" hidden role="alert"></div>
+
+<main class="grid">
+  <!-- ===================== 左：输入 ===================== -->
+  <section class="card">
+    <h2>音频</h2>
+
+    <div class="drop" id="drop" role="button" tabindex="0" aria-label="选择或拖入音频文件">
+      <strong>把音频拖到这里，或点击选择文件</strong>
+      <span class="small">支持 wav / mp3 / m4a / flac / ogg / webm / mp4 等（由 ffmpeg 转码）</span>
+    </div>
+    <input type="file" id="file" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.flac,.ogg,.opus,.webm,.aiff,.caf" hidden>
+
+    <div class="rec-row">
+      <button type="button" id="btn-record">● 开始录音</button>
+      <span class="rec-time" id="rec-time" hidden>00:00</span>
+      <span class="small muted">或用浏览器麦克风直接录一段（MediaRecorder）</span>
+    </div>
+
+    <div class="fileinfo" id="fileinfo" hidden>
+      <div class="name" id="fi-name"></div>
+      <div class="meta" id="fi-meta"></div>
+      <audio id="player" controls preload="metadata" hidden></audio>
+    </div>
+
+    <div class="fields">
+      <div class="field">
+        <label for="model">模型档位</label>
+        <select id="model"></select>
+        <p class="small muted" id="model-note"></p>
+      </div>
+      <div class="field">
+        <label for="language">语言</label>
+        <select id="language"></select>
+      </div>
+      <div class="field">
+        <label for="format">结果导出格式</label>
+        <select id="format">
+          <option value="text">纯文本 text</option>
+          <option value="srt">字幕 srt</option>
+          <option value="vtt">字幕 vtt</option>
+          <option value="json">JSON（含分段）</option>
+        </select>
+        <p class="small muted">界面内部用 verbose_json 取回分段，导出按这里选的格式生成。</p>
+      </div>
+      <div class="field">
+        <label for="translate">任务</label>
+        <select id="translate">
+          <option value="0">转写（保持原语言）</option>
+          <option value="1">翻译成英语（whisper translate）</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" id="btn-run" class="primary" disabled>▶ 开始转写</button>
+      <button type="button" id="btn-reset" class="ghost">清空</button>
+    </div>
+
+    <details class="api" open>
+      <summary>模型档位（体积与内存建议）</summary>
+      <div class="model-list" id="model-list"></div>
+      <p class="small muted" style="margin-top:8px">
+        模型是可复用的下载产物：删除后要重新下载；下载走「自建镜像 → HF 镜像 → 官方」。
+      </p>
+    </details>
+
+    <p class="small muted" id="limit-note"></p>
+  </section>
+
+  <!-- ===================== 右：结果 ===================== -->
+  <section class="card">
+    <h2>结果</h2>
+
+    <div id="progress-wrap" hidden>
+      <div class="row between small">
+        <span id="progress-label">正在转写…</span>
+        <span id="progress-pct" class="muted">0%</span>
+      </div>
+      <progress id="progress" value="0" max="100"></progress>
+      <pre class="log" id="progress-log" aria-live="polite"></pre>
+    </div>
+
+    <div class="alert alert-error" id="error-box" hidden role="alert"></div>
+
+    <div id="result-wrap" hidden>
+      <div class="tabs" role="tablist">
+        <button type="button" id="tab-text" role="tab" aria-selected="true">纯文本</button>
+        <button type="button" id="tab-seg" role="tab" aria-selected="false">带时间戳分段</button>
+      </div>
+      <pre class="out" id="out-text"></pre>
+      <div class="out" id="out-seg" hidden></div>
+
+      <dl class="small muted" id="result-meta" style="margin:10px 0 0"></dl>
+
+      <div class="actions">
+        <button type="button" id="btn-copy" class="ghost">复制文本</button>
+        <button type="button" id="btn-copy-seg" class="ghost">复制分段</button>
+        <button type="button" id="btn-dl-txt" class="ghost">⬇ 下载 .txt</button>
+        <button type="button" id="btn-dl-srt" class="ghost">⬇ 下载 .srt</button>
+        <button type="button" id="btn-dl-fmt" class="ghost">⬇ 下载所选格式</button>
+      </div>
+    </div>
+
+    <p class="muted" id="empty-hint">还没有结果。左侧选择或录一段音频，然后点「开始转写」。</p>
+
+    <details class="api">
+      <summary>OpenAI 兼容接口</summary>
+      <pre class="code">POST /v1/audio/transcriptions        （multipart/form-data）
+  file=@audio.wav  model=small  language=zh  response_format=srt
+
+GET  /v1/models                     装了哪些档、当前档是谁
+GET  /healthz                       能力探活（模型在 + 引擎在 + 真的转一次）
+POST /v1/models/&lt;id&gt;/download       下载某一档（202 + task_id）
+POST /v1/models/&lt;id&gt;/delete         删除某一档（需 {"confirm":true}）
+
+curl -sS http://127.0.0.1:8892/v1/audio/transcriptions \
+     -F file=@/tmp/test.wav -F model=small -F language=zh \
+     -F response_format=verbose_json</pre>
+      <p class="small muted">
+        超过同步上限（<span id="sync-max">60</span> 秒）的音频会返回
+        <code>202 + task_id</code>（进度走 SSE，结果从
+        <code>/v1/tasks/&lt;id&gt;/result</code> 取）。
+        长音频按 <span id="chunk-sec">60</span> 秒切片，进度是**真的**（已完成/总片数）。
+      </p>
+    </details>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot-models"></span>
+  <span>·</span>
+  <span>界面与接口只监听 127.0.0.1；经面板别名访问需要先登录面板</span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -287,29 +288,82 @@ func TestCalendarIntervalsMapping(t *testing.T) {
 	}
 }
 
-// 备份脚本必须包含所选范围，并做旧备份清理。
-func TestBackupScriptContainsTargets(t *testing.T) {
+// 备份脚本必须调用面板自己的备份实现（一致性快照 + manifest），
+// 并且**不能**再写死 /opt/zizpanel、/opt/homebrew。
+func TestBackupScriptCallsPanelBinary(t *testing.T) {
 	j := &Job{
 		Name: "nightly", Kind: "backup", Schedule: "0 3 * * *",
 		BackupTargets: []string{"sites", "mysql", "nginx", "panel"},
 		BackupDir:     "/tmp/backups", KeepDays: 14,
+		PanelBin: "/custom/bin/zizpanel", ConfigPath: "/custom/data/config.json",
 	}
 	s := j.backupScript()
 	for _, want := range []string{
-		"/tmp/backups", "sites.tar.gz", "mysql/all.sql",
-		"nginx.tar.gz", "panel.tar.gz", "mtime +14",
-		"set -uo pipefail", "trap",
+		"/tmp/backups", "/custom/bin/zizpanel", "--config", "/custom/data/config.json",
+		"backup create", "--targets", "sites,mysql,nginx,panel", "--keep-days 14",
+		"set -uo pipefail",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("备份脚本缺少 %q\n%s", want, s)
 		}
 	}
-	// 凭证必须从 .env.local 读取，不能硬编码在脚本里
-	if strings.Contains(s, "zizpanel-test-fixture-pass") {
-		t.Fatal("备份脚本不应包含明文密码")
+	// 既有缺陷：路径写死。重定位安装（ZIZPANEL_ROOT）或 Intel 前缀下会备错东西。
+	for _, bad := range []string{"/opt/zizpanel", "/opt/homebrew"} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("备份脚本不应出现写死路径 %s\n%s", bad, s)
+		}
 	}
-	if !strings.Contains(s, ".env.local") {
-		t.Fatal("应从未 .env.local 读取数据库密码")
+	// 配置不全时必须如实失败，不能悄悄退到某个写死的目录。
+	bad := (&Job{Name: "x", Kind: "backup", Schedule: "0 3 * * *"}).backupScript()
+	if !strings.Contains(bad, "exit 1") {
+		t.Fatalf("缺少二进制/输出目录时应如实失败，实际脚本：%s", bad)
+	}
+}
+
+// 用户在界面上选的备份范围/目录/保留天数**必须落库**。
+//
+// 这是既有缺陷："我明明选了 mysql，它却没备" —— 因为 cron_jobs 表没有
+// backup_targets/backup_dir/keep_days 三列，重启后静默回落默认值。
+func TestRepositoryPersistsBackupOptions(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	m := NewManager(st, Options{LogDir: t.TempDir(), BackupDir: "/default/backup"})
+	ctx := context.Background()
+
+	j := &Job{
+		Name: "nightly", Kind: "backup", Schedule: "0 3 * * *",
+		BackupTargets: []string{"mysql", "panel"}, BackupDir: "/custom/backup",
+		KeepDays: 21, Enabled: false,
+	}
+	// 只用 Repository，避免 apply() 真的去动 launchd（单测不许碰真实系统）。
+	if err := m.repo.Create(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.repo.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got.BackupTargets, ",") != "mysql,panel" ||
+		got.BackupDir != "/custom/backup" || got.KeepDays != 21 {
+		t.Fatalf("备份选项没有落库，读回：targets=%v dir=%q keep=%d",
+			got.BackupTargets, got.BackupDir, got.KeepDays)
+	}
+	got.BackupTargets = []string{"nginx"}
+	got.BackupDir = "/updated"
+	got.KeepDays = 3
+	if err := m.repo.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	again, err := m.repo.Get(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(again.BackupTargets, ",") != "nginx" ||
+		again.BackupDir != "/updated" || again.KeepDays != 3 {
+		t.Fatalf("更新后的备份选项没有落库：%+v", again)
 	}
 }
 
@@ -324,7 +378,7 @@ func newTestManager(t *testing.T) *Manager {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return NewManager(st, Options{LogDir: t.TempDir()})
+	return NewManager(st, Options{LogDir: t.TempDir(), BackupDir: filepath.Join(t.TempDir(), "backup")})
 }
 
 func TestValidateRejectsBadJobs(t *testing.T) {

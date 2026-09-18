@@ -10,6 +10,10 @@ import {
 } from './ui.js';
 import { state, NAV, panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
+// 配置文件编辑器只有一份实现（services.js）——本页「当前生效值」里的「打开」按钮
+// 也走它。这里以前**漏了 import**：点那些「打开」会抛 ReferenceError
+//（async 事件处理器里的 rejection 不显示任何东西，用户看到的是"点了没反应"）。
+import { configFileModal } from './services.js';
 // 「检查更新」在 2026-09-20 被用户要求**收回**「面板设置」（原来是侧栏独立页），
 // 作为本页第 4 个 Tab。它的实现仍在 update.js 里，这里只是把它挂进来 ——
 // 不复制一份代码，避免"两处升级界面各改一半"（本项目反复踩过的坑）。
@@ -423,9 +427,12 @@ export function DashboardView(content, ctx = {}) {
 // ⚠️ nginx 的 `client_max_body_size` **不在这里改**（2026-09-22 用户报障：
 // "Nginx 管理和上传大小 / 执行时间严重重复"）。同一个值有两处可编辑入口，
 // 必然出现"这边改了那边没改、两边都以为自己对"——现在它只有一个可编辑入口
-// 「Nginx 管理 → 性能调整」；这里只**如实显示当前值**并给一颗直达按钮。
+// 「调整配置 → nginx → 性能调整」；这里只**如实显示当前值**并给一颗直达按钮。
 // opts.openNginxTuning 由调用方注入（避免 views.js ↔ nginxpanel.js 的循环 import）。
-async function renderLimitsInto(container, refresh, opts = {}) {
+//
+// 导出它：2026-09-22 起「调整配置」弹窗里的「上传与执行上限」页也用这一份实现
+//（同一个值只有一个来源，绝不复制第二份到 nginxpanel.js）。
+export async function renderLimitsInto(container, refresh, opts = {}) {
   let v;
   try { v = await api.getUploadLimits(); }
   catch (e) {
@@ -465,11 +472,11 @@ async function renderLimitsInto(container, refresh, opts = {}) {
   const nginxValue = lim.client_max_body_size || def.client_max_body_size || '（未设置）';
   const nginxJump = opts.openNginxTuning
     ? h('button.btn.btn-sm', {
-      text: '去 Nginx 管理 → 性能调整 改',
+      text: '去「nginx → 性能调整」改',
       title: 'nginx 的 client_max_body_size 只有一个可编辑入口（避免两处 UI 互相覆盖）',
       onclick: () => opts.openNginxTuning(),
     })
-    : h('span.hint', { text: '改它：网站管理 → ⚙️ Nginx 管理 → 性能调整 → client_max_body_size' });
+    : h('span.hint', { text: '改它：网站管理 → ⚙️ 调整配置 → nginx → 性能调整 → client_max_body_size' });
   const nginxInfo = h('div.field', [
     h('label', { text: 'nginx client_max_body_size（请求体硬上限）' }),
     h('div', {
@@ -480,7 +487,7 @@ async function renderLimitsInto(container, refresh, opts = {}) {
     ]),
     h('div.hint', {
       text: '请求超过它会被 nginx 直接返回 413，PHP 根本收不到数据 —— phpMyAdmin 导入大 SQL 报 413 就是这里太小。'
-        + '这个值只在这一处可改（与「Nginx 管理 → 性能调整」是同一个值，不会出现两处不一致）。',
+        + '这个值只在这一处可改（与「调整配置 → nginx → 性能调整」是同一个值，不会出现两处不一致）。',
     }),
   ]);
 
@@ -507,7 +514,7 @@ async function renderLimitsInto(container, refresh, opts = {}) {
       save.disabled = true;
       try {
         const patch = {
-          // nginx 值不在这里编辑（只有一个可编辑入口：Nginx 管理 → 性能调整）。
+          // nginx 值不在这里编辑（只有一个可编辑入口：调整配置 → nginx → 性能调整）。
           // 仍然原样回传当前值：应用 PHP 上限时会把同一个值写进各站点 vhost 与
           // 默认站点，避免"改了 PHP 之后 vhost 掉回旧值"。
           client_max_body_size: lim.client_max_body_size || def.client_max_body_size || '',
@@ -657,7 +664,7 @@ async function renderLimitsInto(container, refresh, opts = {}) {
           borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.8' } }, [
           h('div', { style: { fontWeight: '620' }, text: '保存会写进这些真实文件（下面「当前生效值」逐行列出来，可点「打开」查看）' }),
           h('div', { text: '· nginx：nginx.conf 的 http 块（全局值）+ 面板生成的每个站点 vhost + 默认站点' +
-            '（这里只原样沿用当前值；要改它请用「Nginx 管理 → 性能调整」）；' }),
+            '（这里只原样沿用当前值；要改它请用「调整配置 → nginx → 性能调整」）；' }),
           h('div', { text: '· PHP：面板自己的 conf.d 片段 99-zizpanel-limits.ini —— 不改 brew 的 php.ini' +
             '（升级会覆盖、手改会丢），PHP 真正读取的是这个片段，右边的回读值就是它。' }),
         ]),
@@ -699,18 +706,9 @@ async function renderLimitsInto(container, refresh, opts = {}) {
   );
 }
 
-// uploadLimitsModal 是"上传大小 / 执行时间"的**独立弹窗**（nginx + PHP 一起改）。
-//
-// 用户 2026-09-18 明确要求：这类常用更改必须是**功能**，不能只让用户去编辑配置原文件。
-// 所以 nginx / PHP 的管理面板与网站管理工具条都直接开这个弹窗，改完自动
-// 重载 nginx + 重启 php-fpm，并**回读生效值**（不是只报"已保存"）。
-export function uploadLimitsModal(opts = {}) {
-  const box = h('div');
-  const m = modal({ title: '⚡ 上传大小 / 执行时间（PHP 侧；nginx 请求体上限见提示）', wide: true, body: box });
-  const refresh = async () => { clear(box); await renderLimitsInto(box, refresh, opts); };
-  void refresh();
-  return m;
-}
+// 原「⚡ 上传大小 / 执行时间」独立弹窗已删除（2026-09-22 用户要求把重复入口整合成
+// 一个「调整配置」）。渲染实现仍只有下面 renderLimitsInto 这一份，被
+// 「调整配置 → 上传与执行上限」页与「面板设置 → 上传与执行限制」共用。
 
 export function SettingsView(content, ctx = {}) {
   clear(content);

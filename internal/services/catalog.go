@@ -759,26 +759,142 @@ func Catalog() []App {
 		//   · 它**没有 brew service**（纯 CLI），所以走面板自研安装器而不是通用
 		//     brew 流程（否则会 brew services start 一个没有 service 的定义，留下
 		//     "已安装但启动失败"的假警告 —— 与 ffmpeg 同一条理由）。
-		// 界面：面板自己的「文件管理 → 🖼️ 图片压缩」（批量、进度、省了多少一目了然），
-		// 所以这里**不设 UI**（设了市场会渲染一个点开必然打不开的「打开」按钮）。
+		// 界面（2026-09-23 用户要求"给它加一个 webui 通过端口和别名调用"）：
+		//   · 一个面板托管的常驻网页界面 —— 独立端口 8890（直连
+		//     http://127.0.0.1:8890/），服务由安装器注册成系统级 launchd
+		//     （com.zizdog.imgcompress，见 imgcompress.go）；
+		//   · 同时挂面板别名 /imgcompress/（UI.Slug，由 internal/appproxy 反代），
+		//     所以经 nginx 的 http://<主机>/imgcompress/ 也能用。
+		// 两个入口是同一份界面（由 cmd/zizpanel 的 `imgcompress-serve` 子命令内嵌提供）。
 		{
 			ID: "imgcompress", Name: "图片压缩（libvips）", Icon: "🖼️",
-			Summary:     "批量把图片压小（WebP / AVIF / JPEG/PNG），在文件管理里选目录直接跑",
-			Description: "用 libvips 批量压缩图片：可调质量、最长边、是否保留元数据，只缩小不放大；没有常驻进程与网页界面。",
-			Category:    CategoryOther, Kind: KindNative,
+			UI:      &AppUI{Slug: "imgcompress"},
+			Summary: "批量把图片压小（WebP / AVIF / JPEG/PNG），拖进去就能压，带进度与下载",
+			Description: "用 libvips 批量压缩图片：拖入多张，可调质量/最长边/格式，" +
+				"显示压前压后大小并可下载。带独立网页界面，也可在文件管理里按目录跑。",
+			Category: CategoryOther, Kind: KindNative,
 			PanelInstaller: "imgcompress",
 			BrewFormula:    "vips",
-			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
-			NoDaemon: true,
-			// 安装体 = `<brew>/bin/vips` 这个可执行文件。与 internal/imgopt 的
-			// DetectEngine 同一条口径（先看二进制在不在，再看能不能跑）——
-			// 「已安装」只看"在不在"（列表路径要便宜），"能不能跑"由按需探测负责。
+			ServiceLabel:   ImgCompressLabel,
+			// 安装体仍是 `<brew>/bin/vips` 这个可执行文件（与 internal/imgopt 的
+			// DetectEngine 同一条口径）：网页界面只是它的一个调用者，
+			// "引擎在不在"才是这个应用的能力判据。
 			RuntimePath: "{brew}/bin/vips",
-			Port:        0,
-			PostInstallHint: "装好后到「文件管理」选中要处理的目录，点工具条上的「🖼️ 图片压缩」：" +
+			Port:        ImgCompressPort,
+			HealthPath:  "/healthz",
+			// ⚠️ 刻意**不填** SystemDaemon：那个字段驱动的是"把 brew services 的
+			// 用户级 agent 搬进系统域"这条迁移路径，而 vips 没有 brew service。
+			// 这里的网页界面由面板安装器**自己**写系统级 LaunchDaemon
+			// （RunAtLoad=true），开机自启不依赖 SystemDaemon 字段。
+			PostInstallHint: "网页界面：直连 http://127.0.0.1:8890/ ，或从卡片点「打开」走面板别名 /imgcompress/。" +
+				"也可以到「文件管理」选中目录点工具条上的「🖼️ 图片压缩」批量处理目录：" +
 				"可调质量 / 最长边 / 输出格式（保持原格式、WebP、AVIF、JPEG、PNG）。" +
-				"默认**另存为 xxx.min.jpg**（不动原文件）；选「覆盖原文件」时会先确认，且压完更大时自动保留原文件。",
+				"默认**另存为 xxx.min.jpg**（不动原文件）；压完更大时会自动保留原文件。",
 			DocsURL: "https://www.libvips.org/",
+		},
+		// macOS 语音合成（say）。用户 2026-09-25 要求"评估 macos-speech-server
+		// 加入应用市场，并写好 webui"。
+		//
+		// 评估结论（完整版见 docs/应用市场-speech评估.md）：**用系统自带的 say**。
+		//   · 零安装、零下载、零运行时：/usr/bin/say 是 macOS 的一部分
+		//     （Mach-O universal，含 arm64e），比"Homebrew 原生"更原生；
+		//   · 完全离线：本机合成，不下载模型、不联网；
+		//   · 中文可用：`say -v '?'` 里有 zh_CN / zh_TW / zh_HK 音色；
+		//   · 落选者：dokterbob/macos-speech-server（同名项目：Swift/AGPL-3.0，
+		//     第三方 tap，首次启动要下 ~700MB FluidAudio 模型）、
+		//     alvinj/MacSpeechServer（Scala/JVM，2015 年后没动过，无 arm64 产物）、
+		//     easychen/miniaiapi（Node 18 + Python + ffmpeg，不是"一个可装的包"）、
+		//     soniqo/speech-swift 的 brew `speech`（Apache-2.0、有 arm64 瓶，
+		//     但 HTTP 服务只到 /v1/audio/transcriptions + /v1/realtime，
+		//     没有 OpenAI 兼容的 /v1/audio/speech，且 TTS 要下模型
+		//     ——它是"要更高音质时"的升级路径，不是本条的依赖）。
+		//
+		// 与已有的 Qwen3 TTS **不重叠**，是两条互补的路线：
+		//   · Qwen3 TTS = 音色克隆 / 高质量模型（要 Python + 2.9GB 权重 + ffmpeg）；
+		//   · 本条     = "装上就能出声"的轻量合成（秒级安装、离线、可做网页朗读/提示音）。
+		//
+		// 界面：面板托管的常驻网页界面（独立端口 8891 直连
+		// http://127.0.0.1:8891/，服务由安装器注册成系统级 launchd
+		// com.zizdog.macosspeech，见 macspeech_install.go），
+		// 同时挂面板别名 /speech/（UI.Slug，由 internal/appproxy 反代）。
+		// 两个入口是同一份界面（cmd/zizpanel 的 `speech-serve` 子命令内嵌提供）。
+		{
+			ID: MacSpeechAppID, Name: "macOS 语音合成（say）", Icon: "🔊",
+			UI:      &AppUI{Slug: MacSpeechSlug},
+			Summary: "系统自带语音合成：零安装、零下载、离线可用；OpenAI 兼容接口 + 网页界面",
+			// Description 上限 80 字（TestCatalogDescriptionsStayShort）：
+			// 只留用户决定要不要用的那一句，细节全在注释/文档里。
+			Description: "用 macOS 自带的 say 合成语音：零下载、完全离线，带网页界面与 OpenAI 兼容接口。",
+			Category:    CategoryAI, Kind: KindNative,
+			PanelInstaller: "macspeech",
+			ServiceLabel:   MacSpeechLabel,
+			Port:           MacSpeechPort,
+			HealthPath:     "/healthz",
+			// ⚠️ 刻意**不填** Requires / BrewFormula：这个应用没有任何下载点，
+			// 也没有 brew 包 —— 引擎是操作系统的一部分。装了它只是"把面板托管的
+			// 网页界面注册起来"，所以它也是市场里安装最快的一个（秒级）。
+			PostInstallHint: "网页界面：直连 http://127.0.0.1:8891/ ，或从卡片点「打开」走面板别名 /speech/。" +
+				"接口：POST /v1/audio/speech（OpenAI 兼容：input / voice / speed / format），" +
+				"GET /v1/voices（来自 `say -v '?'`，中文音色带 chinese=true）。" +
+				"超过 600 字的文本会自动转入任务并给出真实进度（按句分段合成）。" +
+				"音色更多/更好听可在「系统设置 → 辅助功能 → 朗读内容 → 系统声音」里添加。",
+			DocsURL: "https://keith.github.io/xcode-man-pages/say.1.html",
+		},
+		// 语音转文字（whisper.cpp）。用户 2026-09-25 要求"在市场里加入一个语音
+		// 转文字服务！要求：不要 docker，不要 gui 软件；有 webui 或 api
+		// （你自行开发配套 webui）"。
+		//
+		// 评估结论：**用 Homebrew 的 whisper.cpp**（本轮实测通过）。
+		//   · 原生 arm64 单二进制、Metal 加速（实测 `ggml_metal_device_init:
+		//     GPU name: MTL0 (Apple M4)`），不需要 Docker、不需要 GUI、
+		//     **不需要 Python venv** —— 最后这条尤其重要：2026-09-18
+		//     `python@3.11` 被外力删除让 Qwen3 TTS 挂了两小时，本轮刻意
+		//     不再引入任何 Python 运行时；
+		//   · 落选者：sherpa-onnx/SenseVoice（websocket 语义、要更多胶水）、
+		//     FunASR/SenseVoiceSmall（PyTorch 重依赖）、Speaches（Docker 一把起
+		//     → 违反"不要 docker"）、pfrankov/whisper-server（菜单栏 GUI App
+		//     → 违反"不要 gui"）、WhisperKit serve（要 Swift 构建链、无 brew
+		//     formula）、mlx-whisper + FastAPI（能用但要再造一套 Python venv，
+		//     仅作最后退路，本轮**没有启用**）、Vosk（中文精度弱）。
+		//
+		// ⚠️ BrewFormula 必须写 **`whisper.cpp`**（正名），不是用户习惯的
+		// `whisper-cpp`：后者只是 Old Name，而镜像/官方的清单 JSON 只有正名那个
+		// （`/api/formula/whisper-cpp.json` → 404）。写别名会让三家国内镜像全部
+		// 被判为不可用、静默回落 ghcr.io（实测同一个 brew info 走 USTC 镜像
+		// 2.1 秒、走官方默认 8 分 28 秒）。详见 stt.go 里 STTBrewFormula 的注释。
+		//
+		// 界面：面板托管的常驻网页界面（独立端口 8892 直连
+		// http://127.0.0.1:8892/，服务由安装器注册成系统级 launchd
+		// com.zizdog.stt，见 stt_install.go），同时挂面板别名 /stt/
+		// （UI.Slug，由 internal/appproxy 反代）。
+		// 两个入口是同一份界面（cmd/zizpanel 的 `stt-serve` 子命令内嵌提供）。
+		// RuntimePath 贴的是**引擎本身**（whisper-cli）：界面只是它的调用者，
+		// "引擎在不在"才是这个应用的能力判据。
+		{
+			ID: STTAppID, Name: "语音转文字（whisper.cpp）", Icon: "🎙️",
+			UI:      &AppUI{Slug: STTSlug},
+			Summary: "把音频转成文字（中文/英语/日语…）：原生 arm64 加速、离线可用，带网页界面",
+			Description: "用 whisper.cpp 把音频转成文字：可拖入文件或用麦克风录音，" +
+				"三档模型可选，结果带时间戳、可导出 txt/srt。",
+			Category: CategoryAI, Kind: KindNative,
+			PanelInstaller: "stt",
+			BrewFormula:    STTBrewFormula,
+			ServiceLabel:   STTLabel,
+			// 引擎本体 = brew 前缀下的 whisper-cli（与安装器复核的是同一个命令名）。
+			RuntimePath: "{brew}/bin/" + STTCLIBinName,
+			Port:        STTPort,
+			HealthPath:  "/healthz",
+			// ffmpeg 是转码链路的硬前置（brew 的 whisper.cpp 没链 ffmpeg，
+			// 它只吃得下 16 kHz 单声道 WAV）：由基础依赖设施 EnsureBaseDependencies
+			// 幂等补齐，缺了会在安装流程第一步就如实报出来。
+			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
+				Hint: "语音转文字要用 ffmpeg 把上传的音频转成 16 kHz 单声道 WAV（应用市场里的基础依赖，会自动一并装好）"}},
+			PostInstallHint: "网页界面：直连 http://127.0.0.1:8892/ ，或从卡片点「打开」走面板别名 /stt/。" +
+				"接口：POST /v1/audio/transcriptions（OpenAI 兼容：file / language / model / response_format）、" +
+				"GET /v1/models（装了哪些档、当前档是谁）、GET /healthz（能力探活）。" +
+				"模型三档（small / large-v3-turbo / medium）可在界面上按需下载，界面会显示各自体积与内存建议。" +
+				"超过 60 秒的音频会自动转入任务并给出真实进度（按 60 秒切片）。",
+			DocsURL: "https://github.com/ggml-org/whisper.cpp",
 		},
 		// ---------------- Python 解释器（基础环境的运行时，用户 2026-09-18 要求） ----------------
 		//

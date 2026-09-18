@@ -727,14 +727,14 @@ func backupOnce(path, content string) (string, error) {
 
 // ---------- 从 nginx.conf 推导 socket 属主 ----------
 
-// nginxUserPattern 匹配 nginx.conf 顶层的 `user  zizdog staff;`。
+// nginxUserPattern 匹配 nginx.conf 顶层的 `user  <用户名> <组名>;`。
 var nginxUserPattern = regexp.MustCompile(`(?m)^\s*user\s+([A-Za-z0-9._-]+)(?:\s+([A-Za-z0-9._-]+))?\s*;`)
 
 // detectNginxUser 从 nginx.conf 里读 worker 的运行用户。
 //
 // 为什么需要它：Unix socket 的权限由 php-fpm 建 socket 时决定。
 // 如果这个版本的池跑在别的用户下（实测 php@8.4 的出厂配置是 `user = _www`，
-// 而 nginx worker 是 zizdog），nginx 连 socket 会 permission denied。
+// 而 nginx worker 跑在**另一个**用户下），nginx 连 socket 会 permission denied。
 // 与其让用户去猜，不如把 nginx 的用户显式写进 listen.owner。
 func detectNginxUser(nginxConfPath string) string {
 	if strings.TrimSpace(nginxConfPath) == "" {

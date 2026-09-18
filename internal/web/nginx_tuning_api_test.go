@@ -74,20 +74,58 @@ func TestNginxTuningSaveValidatesOnPanelSide(t *testing.T) {
 	}
 }
 
-// TestNginxPanelFrontendWiring：宝塔式面板的接线（四页签 + 用到两个接口）。
+// TestNginxPanelFrontendWiring：宝塔式配置面板的接线（2026-09-22 合并后只有一条实现路径）。
+//
+// 用户 2026-09-22 要求把「⚙️ Nginx 管理」「⚡ 上传大小 / 执行时间」合并进一个
+// 「⚙️ 调整配置」弹窗。这条测试的**本意没变** —— 面板必须真的接到界面上，
+// 而且只能有一条实现路径 —— 合并后判据变成：
+//
+//	① 合并后的弹窗（nginxpanel.js）里仍然挂着 nginx 四页 + 宝塔那张表的关键项与接口；
+//	② 网站管理与 nginx 应用面板都经**同一个入口**（adjustConfigModal）进入它；
+//	③ 旧的独立实现（nginxPanelModal / uploadLimitsModal）一个都不许复活；
+//	④ nginx 的 client_max_body_size 仍然只有一个可编辑入口
+//	   （调整配置 → nginx → 性能调整）；「上传与执行上限」页只做只读展示 + 直达按钮。
 func TestNginxPanelFrontendWiring(t *testing.T) {
 	js := readAssetJS(t, "nginxpanel.js")
-	for _, want := range []string{"性能调整", "配置修改", "错误日志", "nginxTuning", "nginxTuningSave",
-		"client_max_body_size", "worker_processes", "gzip"} {
+	for _, want := range []string{
+		"性能调整", "配置修改", "错误日志", // nginx 组的四页签（「服务」由 NGINX_TABS 声明）
+		"nginxTuning", "nginxTuningSave",
+		"client_max_body_size", "worker_processes", "gzip",
+		"上传与执行上限",           // 合并进来的第二块
+		"renderLimitsInto",  // 与「面板设置」共用同一份实现（不复制第二份）
+		"adjustConfigModal", // 合并后的唯一入口
+	} {
 		if !strings.Contains(js, want) {
-			t.Errorf("Nginx 管理面板里缺少 %q（宝塔那张表的关键项/页签）", want)
+			t.Errorf("「调整配置」面板里缺少 %q（宝塔那张表的关键项/页签，或合并进来的页面）", want)
 		}
 	}
-	// 三处入口：网站管理工具条 + nginx 应用的管理面板。
+	if !strings.Contains(js, "NGINX_TABS") || !strings.Contains(js, "'service'") {
+		t.Errorf("「调整配置」里应当包含 nginx 的四个页签（服务 / 性能调整 / 配置修改 / 错误日志）")
+	}
+
+	// ② 两个入口都必须走合并后的同一个弹窗；旧名字一个都不许留。
 	for _, f := range []string{"sites.js", "servicePanel.js"} {
-		if src := readAssetJS(t, f); !strings.Contains(src, "nginxPanelModal") {
-			t.Errorf("%s 里没有「Nginx 管理」入口（用户不该去别处找性能参数）", f)
+		src := readAssetJS(t, f)
+		if !strings.Contains(src, "adjustConfigModal") {
+			t.Errorf("%s 里没有「⚙️ 调整配置」入口（用户不该去别处找性能参数）", f)
 		}
+		for _, oldName := range []string{"nginxPanelModal", "uploadLimitsModal"} {
+			if strings.Contains(src, oldName) {
+				t.Errorf("%s 里出现了旧的独立入口 %s（合并后只允许 adjustConfigModal 一条路径）", f, oldName)
+			}
+		}
+	}
+
+	// ③/④ client_max_body_size 只有一个可编辑入口。
+	if n := strings.Count(js, "key: 'client_max_body_size_mb'"); n != 1 {
+		t.Errorf("client_max_body_size 在「调整配置」里应恰好有一个可编辑控件，实际 %d 处", n)
+	}
+	limits := readAssetJS(t, "views.js")
+	if strings.Contains(limits, "sizeField('client_max_body_size'") {
+		t.Errorf("「上传与执行上限」里不许再有 client_max_body_size 的可编辑控件（只能只读展示 + 直达按钮）")
+	}
+	if !strings.Contains(limits, "openNginxTuning") {
+		t.Errorf("「上传与执行上限」里必须保留直达「性能调整」的入口（否则用户在那页改不了它）")
 	}
 }
 

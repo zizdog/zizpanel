@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图片压缩 · ZizPanel</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">🖼️</span>
+    <div>
+      <h1>图片压缩</h1>
+      <p class="sub">libvips 驱动 · 只缩小不放大 · 原图不动，压缩结果另存并可下载</p>
+    </div>
+  </div>
+  <div class="engine" id="engine-pill" title="引擎状态">
+    <span class="dot" id="engine-dot"></span>
+    <span id="engine-text">正在检测引擎…</span>
+  </div>
+</header>
+
+<main>
+  <div class="banner hidden" id="banner" role="alert"></div>
+
+  <section class="card" id="options-card">
+    <h2>压缩设置</h2>
+    <div class="options">
+      <label class="field">
+        <span>质量 <b id="quality-val">82</b></span>
+        <input type="range" id="quality" min="1" max="100" value="82" step="1">
+        <span class="hint">JPEG / WebP / AVIF 的编码质量；PNG 用压缩级别 9（无损）</span>
+      </label>
+      <label class="field">
+        <span>最长边</span>
+        <select id="max-edge">
+          <option value="0" selected>不缩放</option>
+          <option value="1280">1280 px</option>
+          <option value="1920">1920 px</option>
+          <option value="2560">2560 px</option>
+          <option value="3840">3840 px</option>
+        </select>
+        <span class="hint">只缩不放：比目标小的图保持原尺寸</span>
+      </label>
+      <label class="field">
+        <span>输出格式</span>
+        <select id="format">
+          <option value="keep" selected>保持原格式</option>
+          <option value="webp">WebP（通常最小）</option>
+          <option value="avif">AVIF（更小，解码稍慢）</option>
+          <option value="jpeg">JPEG</option>
+          <option value="png">PNG（无损）</option>
+        </select>
+        <span class="hint">改格式时输出扩展名会跟着变（如 photo.min.webp）</span>
+      </label>
+      <label class="field checkbox">
+        <input type="checkbox" id="strip">
+        <span>去掉 EXIF / ICC 等元数据（体积更小）</span>
+      </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>选择图片</h2>
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="选择或拖入图片">
+      <div class="drop-icon" aria-hidden="true">⬆️</div>
+      <div class="drop-main">把图片拖到这里，或点击选择</div>
+      <div class="drop-sub" id="drop-sub">支持 jpg / jpeg / png / webp / avif / heic / tif / gif / bmp，可多选</div>
+      <input type="file" id="file-input" accept="image/*,.heic,.heif,.avif,.tif,.tiff" multiple hidden>
+    </div>
+    <ul class="picked" id="picked"></ul>
+    <div class="actions">
+      <button type="button" id="start" class="primary" disabled>开始压缩</button>
+      <button type="button" id="clear">清空列表</button>
+      <button type="button" id="cancel" class="hidden">中断任务</button>
+    </div>
+  </section>
+
+  <section class="card hidden" id="progress-card">
+    <h2>进度 <span class="muted" id="progress-count"></span></h2>
+    <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+    <ul class="logs" id="logs"></ul>
+  </section>
+
+  <section class="card hidden" id="result-card">
+    <h2>结果 <span class="muted" id="result-summary"></span></h2>
+    <div class="actions">
+      <button type="button" id="zip">下载全部（zip）</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>文件</th><th>压缩前</th><th>压缩后</th><th>节省</th><th>状态</th><th>下载</th></tr>
+        </thead>
+        <tbody id="result-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot-note">面板别名 /imgcompress/ 与直连端口是同一份界面。</span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -267,6 +267,31 @@ export function ReverseProxyView(content, ctx = {}) {
             } catch (e) { toast('测试失败：' + e.message, 'err', 8000); }
           },
         }),
+        // 「测大请求体」——**按需触发**（真的发 64KB），刻意不放进 load()/列表渲染：
+        // "端口在听、目标可达"都不等于能收大请求体。2026-09-18 事故里，大请求体先被
+        // 缓冲到 client_body_temp，目录不可写时 nginx 在转发前直接回它自己的 500 页，
+        // 而所有常规状态都是绿的。坏的结果会写清卡在哪一步。
+        h('button.btn.btn-sm', {
+          text: '📦 测大请求体',
+          title: '真的向这条规则的监听端口 POST 一个 64KB 请求体，确认 nginx 能收下并转发。'
+            + '只在点这一下时跑，不会自动探测；失败会写清是哪一步'
+            + '（nginx 请求体上限 / nginx 自身的 500 页 / 转发到上游）。',
+          onclick: async () => {
+            const pending = toast('正在向 :' + it.listen + ' 发送 64KB 请求体…', 'info', 0);
+            try {
+              const r = await api.probeProxyBody(it.id);
+              pending.remove();
+              const step = r.step ? '（' + r.step + '）' : '';
+              const head = r.status === 'ok'
+                ? '✅ 大请求体探测通过：'
+                : (r.status === 'bad' ? '⛔ 大请求体探测失败' + step + '：' : '⚠️ 未能探测' + step + '：');
+              toast(head + (r.detail || ''), r.status === 'ok' ? 'ok' : (r.status === 'bad' ? 'err' : 'warn'), 14000);
+            } catch (e) {
+              pending.remove();
+              toast('探测请求本身失败：' + e.message, 'err', 10000);
+            }
+          },
+        }),
         h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: () => remove(it) }),
       ]),
     ]);

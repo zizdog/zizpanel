@@ -329,7 +329,7 @@ func (s *Server) phpAdminProxyTo(target *url.URL) http.Handler {
 <ol>
   <li>如果刚才有导入/导出**一直在转圈**：去「网站管理 → 🐘 PHP 环境」把对应 PHP 版本**重启**一次
       （卡住的请求会一直占着 PHP 的会话，后面的页面就永远转圈），然后**只开一个 phpMyAdmin 标签页**重试。</li>
-  <li>确认 nginx 在跑：「网站管理 → ⚙️ Nginx 管理 → 服务」应显示"运行中"，不在跑就点「▶ 启动」。</li>
+  <li>确认 nginx 在跑：「网站管理 → ⚙️ 调整配置 → nginx → 服务」应显示"运行中"，不在跑就点「▶ 启动」。</li>
   <li>确认 phpMyAdmin 已安装：「应用 → 应用市场 → phpMyAdmin」。</li>
 </ol>`, escHTML(err.Error()))
 		},

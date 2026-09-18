@@ -15,6 +15,7 @@ import { FilesView } from './files.js';
 import { TerminalView } from './terminal.js';
 import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
+import { NavView } from './nav.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { startUpgradeWatcher, hasUpdate } from './update.js';
@@ -32,6 +33,10 @@ export const state = {
 export const NAV = [
   { group: '总览' },
   { id: 'dashboard', title: '仪表盘', icon: '📊', view: DashboardView },
+  // 「导航页」＝ sun-panel 风格的图标网格首页（点卡片新标签打开）。
+  // 放在「总览」组：它是用户每天第一眼看的页面，不是运维工具。
+  // 数据量极小，直接做进面板（复用鉴权/备份/审计），不引入第二套运行时。
+  { id: 'nav', title: '导航页', icon: '🧭', view: NavView },
   // 「系统监控」已改成「mac设置」（2026-09 用户要求把显示名从「系统设置」改成
   // 「mac设置」：原名与「面板设置」并列时歧义太大）。**只改显示名**，
   // 路由 id 仍是 'system'，`#/system` 与所有旧链接照旧可用。

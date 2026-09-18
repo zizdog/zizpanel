@@ -1,0 +1,165 @@
+/* 图片压缩 Web UI 的样式（无构建步骤，直接内嵌）。
+   原则：窄屏不横向溢出、按钮都有可读名字、深浅色都看得清。 */
+
+:root {
+  --bg: #0f141b;
+  --panel: #161d27;
+  --line: #263243;
+  --text: #e6edf5;
+  --muted: #93a1b5;
+  --accent: #4c8dff;
+  --ok: #35c07a;
+  --warn: #e2b13c;
+  --err: #ef5f5f;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro SC", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  background: linear-gradient(180deg, #18202c, #131a24);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
+.brand .logo { font-size: 30px; }
+.brand h1 { margin: 0; font-size: 19px; }
+.brand .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+
+.engine {
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px;
+  background: #121924; color: var(--muted); font-size: 12.5px; max-width: 100%;
+}
+.engine .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.engine.ok .dot { background: var(--ok); }
+.engine.bad .dot { background: var(--err); }
+
+main { max-width: 1080px; margin: 0 auto; padding: 20px 22px 40px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  max-width: 100%;
+}
+.card h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+.muted { color: var(--muted); font-weight: 400; font-size: 12.5px; }
+
+.banner {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--err);
+  background: #241a1d;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.banner.warn { border-left-color: var(--warn); background: #241f16; }
+.banner.ok { border-left-color: var(--ok); background: #16241d; }
+
+.options { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.field > span { font-size: 13px; color: var(--text); }
+.field .hint { font-size: 11.5px; color: var(--muted); }
+.field select, .field input[type=range] { width: 100%; max-width: 100%; }
+.field select {
+  background: #0f1620; color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 9px; font-size: 13.5px;
+}
+.field.checkbox { flex-direction: row; align-items: center; gap: 9px; }
+.field.checkbox span { font-size: 13px; }
+
+.drop {
+  border: 1.5px dashed #33445c;
+  border-radius: var(--radius);
+  padding: 26px 16px;
+  text-align: center;
+  cursor: pointer;
+  background: #121a25;
+  transition: border-color .15s, background .15s;
+}
+.drop:hover, .drop:focus-visible, .drop.over { border-color: var(--accent); background: #14203a; outline: none; }
+.drop-icon { font-size: 26px; }
+.drop-main { margin-top: 6px; font-weight: 600; }
+.drop-sub { margin-top: 4px; color: var(--muted); font-size: 12px; word-break: break-word; }
+
+.picked { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.picked li {
+  display: flex; gap: 10px; align-items: center; justify-content: space-between;
+  background: #121a25; border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 10px; font-size: 13px; min-width: 0;
+}
+.picked .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picked .size { color: var(--muted); flex: 0 0 auto; }
+.picked .rm {
+  flex: 0 0 auto; background: transparent; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px; cursor: pointer; padding: 2px 8px;
+}
+.picked .rm:hover { color: var(--err); border-color: var(--err); }
+
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+button {
+  font: inherit; font-size: 13.5px; padding: 8px 16px; border-radius: 8px;
+  border: 1px solid var(--line); background: #1b2532; color: var(--text); cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: #41546e; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+button.ghost { background: transparent; }
+
+.bar { height: 10px; background: #0f1620; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, #3f7be0, #4cc9f0); transition: width .25s; }
+
+.logs {
+  list-style: none; margin: 12px 0 0; padding: 0; max-height: 220px; overflow: auto;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.logs li { padding: 2px 0; color: var(--muted); word-break: break-word; }
+.logs li.ok { color: var(--ok); }
+.logs li.err { color: var(--err); }
+.logs li.warn { color: var(--warn); }
+.logs li.step { color: var(--text); font-weight: 600; }
+
+.table-wrap { overflow-x: auto; max-width: 100%; margin-top: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+td.name { word-break: break-all; }
+td.num { white-space: nowrap; }
+td .bad { color: var(--err); word-break: break-word; }
+td .skip { color: var(--warn); }
+td .good { color: var(--ok); }
+td a.dl { color: var(--accent); text-decoration: none; }
+td a.dl:hover { text-decoration: underline; }
+
+.foot { max-width: 1080px; margin: 0 auto; padding: 0 22px 30px; color: var(--muted); font-size: 12px; }
+
+.hidden { display: none !important; }
+
+@media (max-width: 560px) {
+  .topbar { padding: 14px 14px; }
+  main { padding: 14px 14px 30px; }
+  .card { padding: 13px 13px; }
+  .engine { width: 100%; }
+}

@@ -44,10 +44,30 @@ func (s *Server) registerAppProxy(root *http.ServeMux) {
 		if s.Cfg.AppProxyAuth {
 			h = s.requireAppProxyAuth(slug, h)
 		}
+		// 应用界面可能上传大文件（本轮的图片压缩 Web UI 最直接：几十 MB 的图很常见，
+		// Squoosh / File Browser 同理）。面板给整个进程设了 ReadTimeout=30s，而它是
+		// "从连接建立到**读完整个请求体**"的绝对截止时间 —— 慢网络下的大上传会在
+		// 30 秒处被服务端掐断，浏览器只看到网络错误，用户看到的就是「点了没反应」。
+		// 这条保护与 handleFileUpload 是同一道（见 api_upload_guard.go）。
+		h = withLongUpload(h)
 		root.Handle("/"+slug+"/", h)
 		// 不带斜杠时补一个跳转：否则相对路径会解析到站点根（与 /_panel 同理）
 		root.Handle("/"+slug, http.RedirectHandler("/"+slug+"/", http.StatusMovedPermanently))
 	}
+}
+
+// withLongUpload 给应用界面的请求解除面板全局 30 秒读超时。
+//
+// 为什么应用界面也要（2026-09-23）：图片压缩的 Web UI 走 /imgcompress/ 别名时，
+// 上传体是在**面板进程**里被读进来再转发给 127.0.0.1:8890 的，所以
+// "谁解析 multipart"这件事在这里并不成立 —— 面板根本看不到 multipart，
+// 它只是在流式转发 body。全局 ReadTimeout 仍然按"读完请求体"计时，照样会掐断。
+// 失败不拦请求（理由见 allowLongUpload 的注释）。
+func withLongUpload(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = allowLongUpload(w, r)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ============================================================================
@@ -92,7 +112,14 @@ func appProxyBlock(entries []appEntry, upstream string) string {
 	b.WriteString("# 这样改写规则（/assets/、/api/、socket.io、Location）只有一份实现。\n")
 	for _, a := range entries {
 		b.WriteString("\n")
-		fmt.Fprintf(&b, "    # %s（127.0.0.1:%d）\n", a.Name, a.Port)
+		// Port==0 表示「目标就是面板自己」（目前只有面板自带的导航页 /nav/）：
+		// 它的 upstream 与其它条目完全一样（都转发给面板统一处理），
+		// 但没有独立的 127.0.0.1:port，注释里不要写一个假的端口号。
+		if a.Port > 0 {
+			fmt.Fprintf(&b, "    # %s（127.0.0.1:%d）\n", a.Name, a.Port)
+		} else {
+			fmt.Fprintf(&b, "    # %s（由面板自身提供）\n", a.Name)
+		}
 		fmt.Fprintf(&b, "    location = /%s {\n        return 301 /%s/;\n    }\n", a.Slug, a.Slug)
 		fmt.Fprintf(&b, "    location ^~ /%s/ {\n", a.Slug)
 		fmt.Fprintf(&b, "        proxy_pass https://%s;\n", upstream)
@@ -228,10 +255,16 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 
 func appProxyEntries() []appEntry {
 	apps := appproxy.Slugs()
-	out := make([]appEntry, 0, len(apps))
+	out := make([]appEntry, 0, len(apps)+1)
 	for _, a := range apps {
 		out = append(out, appEntry{Slug: a.UI.Slug, Name: a.Name, Port: a.WebPort()})
 	}
+	// 面板自带的「导航页」（见 api_nav.go）也走同一段 nginx location：
+	// 它的页面由面板进程直接提供（Port=0，upstream 就是面板），
+	// 这样 `http://<主机>/nav/` 才是稳定的浏览器首页别名，
+	// 而且与应用系统共用同一份生成逻辑（幂等、带 BEGIN/END 标记、写盘走
+	// applyDefaultVhost 的 nginx -t + reload + 复核通道）。
+	out = append(out, appEntry{Slug: "nav", Name: "导航页（面板自带）", Port: 0})
 	return out
 }
 

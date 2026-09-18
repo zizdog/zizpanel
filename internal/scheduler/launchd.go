@@ -202,87 +202,46 @@ func xmlEscape(s string) string {
 
 // backupScript 生成备份任务的 shell 脚本。
 //
-// 备份内容按 targets 选择：
-//   - sites   ：网站目录下所有站点文件
-//   - mysql   ：所有数据库（mysqldump）
-//   - panel   ：面板数据（配置、数据库、证书）
-//   - nginx   ：nginx 配置（含 vhosts）
+// 为什么脚本里只调 `zizpanel backup create` 而不是自己 tar 目录：
+//   - 数据的一致性只能由 Go 侧用 `VACUUM INTO` 保证（直接 tar panel.db+wal+shm
+//     会得到三个不同瞬间的文件，事后无法判断自不自洽）；
+//   - 归档还要带 manifest.json 与逐文件 sha256，shell 里做不划算；
+//   - 路径全部从 `--config` 读，脚本里**不再出现** /opt/zizpanel、/opt/homebrew。
 //
-// 输出为单个 tar.gz，并按 keep_days 清理旧备份。
+// 本函数不做默认值填充：默认值由 Manager.validate 依据面板配置补齐。
+// 没补齐就**如实报错退出**，不再悄悄退到某个写死的目录（那是"备错地方还报成功"）。
 func (j *Job) backupScript() string {
 	dir := j.BackupDir
-	if dir == "" {
-		dir = "/opt/zizpanel/work/backup"
-	}
 	keep := j.KeepDays
-	if keep <= 0 {
-		keep = 7
-	}
 	targets := j.BackupTargets
-	if len(targets) == 0 {
-		targets = []string{"sites", "nginx", "panel"}
+	bin := j.PanelBin
+
+	head := []string{"set -uo pipefail"}
+	// 启动横幅与结束横幅都带时间戳：任务日志里能一眼看出跑了多久。
+	head = append(head, `echo "[$(date '+%F %T')] 备份开始"`)
+
+	if bin == "" || dir == "" || len(targets) == 0 {
+		head = append(head,
+			`echo "备份任务配置不完整（缺少面板路径/输出目录/备份范围），请在面板「计划任务」里重新保存该任务"`,
+			"exit 1")
+		return strings.Join(head, "\n")
 	}
 
-	var lines []string
-	lines = append(lines,
-		"set -uo pipefail",
-		"STAMP=$(date +%Y%m%d-%H%M%S)",
-		fmt.Sprintf("DEST=%q", dir),
-		"mkdir -p \"$DEST\"",
-		"WORK=$(mktemp -d)",
-		"trap 'rm -rf \"$WORK\"' EXIT",
-		"",
-		"echo \"[$(date '+%F %T')] 备份开始\"",
-	)
-
-	for _, t := range targets {
-		switch t {
-		case "sites":
-			lines = append(lines,
-				`if [ -d "$HOME/www" ]; then`,
-				`  tar -czf "$WORK/sites.tar.gz" -C "$HOME" --exclude='*/node_modules' --exclude='*/.git' --exclude='*/vendor' www 2>/dev/null && echo "  已打包网站目录"`,
-				`fi`,
-			)
-		case "mysql":
-			lines = append(lines,
-				`MYSQL_BIN=/opt/homebrew/opt/mysql@8.4/bin/mysqldump`,
-				`if [ -x "$MYSQL_BIN" ]; then`,
-				`  mkdir -p "$WORK/mysql"`,
-				`  if [ -f "$HOME/www/.env.local" ]; then set -a; . "$HOME/www/.env.local"; set +a; fi`,
-				`  PASS="${MYSQL_ROOT_PASSWORD:-}"`,
-				`  if [ -n "$PASS" ]; then`,
-				`    "$MYSQL_BIN" -uroot -p"$PASS" --all-databases --single-transaction --routines --triggers > "$WORK/mysql/all.sql" 2>/dev/null && echo "  已导出数据库"`,
-				`  fi`,
-				`fi`,
-			)
-		case "nginx":
-			lines = append(lines,
-				`NGINX_ETC=/opt/homebrew/etc/nginx`,
-				`if [ -d "$NGINX_ETC" ]; then`,
-				`  tar -czf "$WORK/nginx.tar.gz" -C "$(dirname "$NGINX_ETC")" "$(basename "$NGINX_ETC")" 2>/dev/null && echo "  已打包 nginx 配置"`,
-				`fi`,
-			)
-		case "panel":
-			lines = append(lines,
-				`if [ -d /opt/zizpanel/data ]; then`,
-				`  tar -czf "$WORK/panel.tar.gz" -C /opt/zizpanel data 2>/dev/null && echo "  已打包面板数据"`,
-				`fi`,
-			)
-		}
+	args := []string{fmt.Sprintf("%q", bin), "backup", "create"}
+	if j.ConfigPath != "" {
+		args = append(args, "--config", fmt.Sprintf("%q", j.ConfigPath))
 	}
-
+	args = append(args, "--out", fmt.Sprintf("%q", dir))
+	args = append(args, "--targets", fmt.Sprintf("%q", strings.Join(targets, ",")))
+	if keep > 0 {
+		args = append(args, "--keep-days", strconv.Itoa(keep))
+	}
+	lines := append(head, strings.Join(args, " "))
 	lines = append(lines,
-		"",
-		"OUT=\"$DEST/backup-$STAMP.tar.gz\"",
-		`if [ -z "$(ls -A "$WORK" 2>/dev/null)" ]; then`,
-		`  echo "没有可备份的内容（检查备份范围设置）"; exit 1`,
-		`fi`,
-		`tar -czf "$OUT" -C "$WORK" . && echo "备份完成：$OUT"`,
-		`SIZE=$(du -h "$OUT" | cut -f1)`,
-		`echo "文件大小：$SIZE"`,
-		"",
-		fmt.Sprintf("find \"$DEST\" -name 'backup-*.tar.gz' -mtime +%d -delete 2>/dev/null && echo \"已清理 %d 天前的旧备份\"", keep, keep),
-		`echo "[$(date '+%F %T')] 备份结束"`,
+		"rc=$?",
+		`if [ $rc -eq 0 ]; then echo "[$(date '+%F %T')] 备份结束"; `+
+			`else echo "[$(date '+%F %T')] 备份失败（退出码 $rc），详见上面的输出"; fi`,
+		"exit $rc",
 	)
 	return strings.Join(lines, "\n")
 }
@@ -296,6 +255,12 @@ func (m *Manager) apply(ctx context.Context, j *Job) error {
 	c, err := ParseCron(j.Schedule)
 	if err != nil {
 		return err
+	}
+	// backup 任务的脚本需要知道"用哪个二进制、哪份配置"——这两个值来自面板配置，
+	// 在这里注入而不是写死在脚本里（重定位安装/ZIZPANEL_ROOT 下必须正确）。
+	if j.Kind == "backup" {
+		j.PanelBin = m.binaryPath
+		j.ConfigPath = m.configPath
 	}
 	if strings.TrimSpace(j.buildScript()) == "" {
 		return errors.New("任务内容为空")

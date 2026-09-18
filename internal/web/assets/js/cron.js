@@ -11,6 +11,7 @@
 import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
+import { taskCenter } from './tasks.js';
 
 let cache = null;
 
@@ -159,42 +160,270 @@ export function CronView(content, ctx = {}) {
   }
 
   // ---------- 备份文件列表 ----------
+  //
+  // 这块是「备份与恢复」的入口：立即备份 / 上传备份恢复 / 逐行 恢复·下载·删除。
+  // 恢复是长任务，统一交给任务中心（taskCenter.start），进度在顶栏「任务中心」里看。
   async function renderBackups() {
     clear(backupBox);
-    let data = { list: [], dir: '' };
-    try { data = await api.backups(); } catch { /* 忽略 */ }
-    if (!data.list.length) return;
+    let data = { list: [], dir: '', targets: [] };
+    let loadErr = '';
+    try { data = await api.backups() || data; } catch (e) { loadErr = e.message || String(e); }
 
-    appendAll(backupBox, h('div.card', [
-      h('div.card-head', [
-        h('h3', { text: '已有备份' }),
-        h('div.spacer'),
-        h('span.sub', { text: data.dir }),
-      ]),
-      h('div.card-body.tight', [
+    const head = h('div.card-head', [
+      h('h3', { text: '已有备份' }),
+      h('div.spacer'),
+      h('span.sub', { text: data.dir || '' }),
+      h('button.btn.btn-sm', {
+        text: '⬆ 上传备份恢复',
+        title: '上传本机或其他机器导出的 .tar.gz 备份归档（上传后立即校验 sha256，坏包会被拒绝）',
+        onclick: () => uploadBackup(data),
+      }),
+      h('button.btn.btn-primary.btn-sm', {
+        text: '立即备份',
+        title: '马上生成一份新的备份归档（数据库用一致性快照，带 sha256 清单）',
+        onclick: () => instantBackupModal(data),
+      }),
+    ]);
+
+    const list = data.list || [];
+    let inner;
+    if (loadErr) {
+      inner = h('div.empty', [h('div.big', { text: '⚠️' }), h('h4', { text: '读取备份列表失败' }), h('p', { text: loadErr })]);
+    } else if (!list.length) {
+      inner = h('div.empty', [
+        h('div.big', { text: '🗄️' }),
+        h('h4', { text: '还没有备份' }),
+        h('p', { text: '点右上角「立即备份」马上生成一份；也可以创建定时备份任务让它每天自动跑。' }),
+      ]);
+    } else {
+      inner = h('div', { style: { overflowX: 'auto' } }, [
         h('table.table', [
-          h('thead', [h('tr', [h('th', { text: '文件' }), h('th', { text: '大小' }), h('th', { text: '时间' }), h('th', { text: '操作' })])]),
-          h('tbody', data.list.map((b) => h('tr', [
-            h('td.mono', { style: { fontSize: '11.5px' }, text: b.name }),
-            h('td.num', { text: humanSize(b.size) }),
-            h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: b.mod_time }),
+          h('thead', [h('tr', [
+            h('th', { text: '文件' }), h('th', { text: '来源 / 时间' }), h('th', { text: '内容' }),
+            h('th', { text: '大小' }), h('th', { text: '操作' }),
+          ])]),
+          h('tbody', list.map((b) => h('tr', [
             h('td', [
-              h('button.btn.btn-sm', {
-                text: '下载',
-                onclick: () => { window.location.href = api.fileDownloadURL(b.path); },
-              }),
+              h('div.mono', { style: { fontSize: '11.5px' }, text: b.name }),
+              b.is_snapshot ? h('span.pill', {
+                text: '恢复前快照',
+                title: '恢复操作自动生成的回滚凭据：恢复后如果发现问题，可以用它再恢复一次回到原状',
+              }) : null,
+            ]),
+            h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' } }, [
+              h('div', { text: b.manifest_ok ? (b.hostname || '未知来源') : '⚠️ 清单不可读' }),
+              h('div', { text: b.created_at || b.mod_time || '' }),
+            ]),
+            h('td', { style: { fontSize: '11.5px' } }, [
+              b.manifest_ok
+                ? h('div', { text: (b.targets || []).join(' · ') || '（未记录范围）' })
+                : h('div', { style: { color: 'var(--danger, #d33)' }, text: b.manifest_error || '清单不可读' }),
+              b.manifest_ok && b.contains_secrets
+                ? h('span.pill.danger', {
+                    text: `含明文口令（${b.secret_count} 个文件）`,
+                    title: '归档里有面板配置、ACME 账号私钥或站点私钥。请当机密文件保管，不要外发。',
+                  })
+                : null,
+            ]),
+            h('td.num', { text: humanSize(b.size) }),
+            h('td', [
+              h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, [
+                h('button.btn.btn-sm', {
+                  text: '恢复',
+                  title: '用这份归档恢复站点配置 / 证书 / 反向代理（会先生成恢复前快照）',
+                  onclick: () => restoreModal(b),
+                }),
+                h('button.btn.btn-sm', {
+                  text: '下载',
+                  onclick: () => { window.location.href = api.backupDownloadURL(b.name); },
+                }),
+                h('button.btn.btn-danger.btn-sm', {
+                  text: '删除',
+                  onclick: async () => {
+                    const extra = b.contains_secrets ? '\n\n⚠️ 这个归档含明文口令，删除后无法找回。' : '';
+                    if (!await confirmBox(`删除备份「${b.name}」？${extra}`, { title: '删除备份', danger: true, okText: '删除' })) return;
+                    try {
+                      await api.backupDelete(b.name);
+                      toast('已删除', 'ok');
+                      renderBackups();
+                    } catch (e) { toast(e.message, 'err', 9000); }
+                  },
+                }),
+              ]),
             ]),
           ]))),
         ]),
+      ]);
+    }
+
+    appendAll(backupBox, h('div.card', [head, h('div.card-body.tight', [inner])]));
+  }
+
+  // 「立即备份」：勾选范围（含密项默认不勾，勾了会明确提示"含凭据"）。
+  function instantBackupModal(data) {
+    const targets = data.targets || [];
+    const boxes = targets.map((t) => {
+      const cb = h('input', { type: 'checkbox' });
+      // 默认勾选 panel + nginx（站点的配置/证书/反代都在里面）；
+      // 含第三方 token 的应用配置与体积巨大的网站文件默认**不勾**。
+      cb.checked = ['panel', 'nginx'].includes(t.id);
+      return { t, cb };
+    });
+    const keepInput = h('input.input', { type: 'number', min: '0', value: '7', style: { width: '90px' } });
+    const m = modal({
+      title: '立即备份',
+      body: h('div', [
+        h('p.hint', { text: '数据库会用一致性快照（VACUUM INTO）导出，归档里带每个文件的 sha256 清单。' }),
+        h('div', { style: { display: 'grid', gap: '6px', margin: '10px 0' } }, boxes.map(({ t, cb }) =>
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start' } }, [
+            cb,
+            h('span', [
+              h('span', { text: t.label }),
+              t.opt_in ? h('span.pill', { style: { marginLeft: '6px' }, text: '含凭据' }) : null,
+            ]),
+          ]))),
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
+          h('span', { text: '保留最近' }),
+          keepInput,
+          h('span', { text: '天（0 = 不自动清理旧备份）' }),
+        ]),
       ]),
-    ]));
+      footer: [
+        h('button.btn', { text: '取消', onclick: () => m.close() }),
+        h('button.btn.btn-primary', {
+          text: '开始备份',
+          onclick: () => {
+            const sel = boxes.filter(({ cb }) => cb.checked).map(({ t }) => t.id);
+            if (!sel.length) { toast('请至少选择一个备份范围', 'warn'); return; }
+            m.close();
+            taskCenter.start({
+              kind: 'backup',
+              target: 'backup:manual',
+              title: '立即备份（' + sel.join(',') + '）',
+              start: () => api.backupCreate({ targets: sel, keep_days: Number(keepInput.value) || 0 }),
+              onDone: () => { toast('备份任务已结束', 'ok'); renderBackups(); },
+            });
+          },
+        }),
+      ],
+    });
+  }
+
+  // 「恢复」：先展示归档来源（哪台机器/什么时候/含不含明文口令），再二次确认。
+  async function restoreModal(b) {
+    if (!b.manifest_ok) {
+      toast('这份归档的清单不可读，无法恢复：' + (b.manifest_error || ''), 'err', 12000);
+      return;
+    }
+    let info = null;
+    try { info = await api.backupInfo(b.name); } catch (e) { toast('读取归档信息失败：' + e.message, 'err', 9000); return; }
+    if (!info.compatible) {
+      toast('不能恢复：' + info.compat_reason, 'err', 14000);
+      return;
+    }
+
+    const secretList = (info.secret_files || []).slice(0, 8);
+    const secretMore = (info.secret_files || []).length - secretList.length;
+    const cfgBox = h('input', { type: 'checkbox' });
+    const body = h('div', [
+      h('table.table', [
+        h('tbody', [
+          h('tr', [h('th', { text: '来源机器' }), h('td', { text: info.hostname || '未知' })]),
+          h('tr', [h('th', { text: '备份时间' }), h('td', { text: info.created_at || '未知' })]),
+          h('tr', [h('th', { text: '面板版本' }), h('td', { text: info.panel_version || '未知' })]),
+          h('tr', [h('th', { text: '备份范围' }), h('td', { text: (info.targets || []).join(' · ') })]),
+          h('tr', [h('th', { text: '文件数' }), h('td', { text: String(info.file_count || 0) })]),
+        ]),
+      ]),
+      info.older ? h('p.hint', {
+        style: { marginTop: '8px' },
+        text: '⚠️ 这份备份比当前面板旧，恢复后会自动重放数据库迁移补齐新增字段。',
+      }) : null,
+      info.contains_secrets ? h('div', {
+        style: { marginTop: '10px', padding: '8px', border: '1px solid var(--danger, #d33)', borderRadius: '6px' },
+      }, [
+        h('div', { style: { fontWeight: '600' }, text: `⚠️ 归档含 ${(info.secret_files || []).length} 个明文口令/私钥文件` }),
+        h('div', { style: { fontSize: '12px', color: 'var(--text-mute)', marginTop: '4px' }, text: secretList.join('、') + (secretMore > 0 ? ` 等 ${secretList.length + secretMore} 个` : '') }),
+      ]) : null,
+      h('div', { style: { marginTop: '12px' } }, [
+        h('p', { text: '恢复会做这些事：先把当前状态自动快照一份（回滚凭据），替换面板数据库，写回证书与 ACME 状态，按数据库重建站点与反向代理配置，并重新注册计划任务。恢复后需要重新登录。' }),
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '8px' } }, [
+          cfgBox,
+          h('span', [
+            h('b', { text: '同时恢复面板配置（config.json）' }),
+            h('div', { style: { fontSize: '12px', color: 'var(--text-mute)' } ,
+              text: '默认不恢复，保持本机身份。勾选它会把面板后缀、监听端口、升级源一起换成备份里那套，' +
+                '需要重启面板才生效 —— 网页会断开几秒。只有在「把面板搬到新机器」时才需要勾。' }),
+          ]),
+        ]),
+      ]),
+    ]);
+
+    const m = modal({
+      title: '恢复：' + b.name,
+      body,
+      footer: [
+        h('button.btn', { text: '取消', onclick: () => m.close() }),
+        h('button.btn.btn-danger', {
+          text: '开始恢复',
+          onclick: () => {
+            const wantCfg = cfgBox.checked;
+            if (wantCfg && !window.confirm('再次确认：恢复面板配置会把面板后缀/监听端口/升级源一起换掉，并重启面板，网页会断开几秒。继续？')) {
+              return;
+            }
+            m.close();
+            taskCenter.start({
+              kind: 'restore',
+              target: 'backup:restore',
+              title: '恢复备份 ' + b.name,
+              start: () => api.backupRestore(b.name, wantCfg),
+              onDone: (meta) => {
+                if (meta && meta.status && meta.status !== 'succeeded') {
+                  toast('恢复未全部成功：' + (meta.error || meta.status) + '（详见任务日志里的「未恢复」清单）', 'err', 15000);
+                } else {
+                  toast('恢复完成', 'ok', 9000);
+                }
+                renderBackups();
+              },
+            });
+          },
+        }),
+      ],
+    });
+  }
+
+  // 「上传备份恢复」：上传后立刻整包校验，坏包当场拒绝。
+  function uploadBackup(data) {
+    const input = h('input', { type: 'file', accept: '.tar.gz,application/gzip', style: { display: 'none' } });
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      if (!file) { input.remove(); return; }
+      if (!/\.tar\.gz$/i.test(file.name)) {
+        toast('请选择 .tar.gz 备份归档', 'warn', 9000);
+        input.remove();
+        return;
+      }
+      toast('正在上传并校验 ' + file.name + ' …', 'info', 8000);
+      try {
+        const r = await api.backupUpload(file);
+        toast(`已上传：来源 ${r.hostname || '未知'}，${r.created_at || ''}` +
+          (r.contains_secrets ? `（含 ${r.secret_count} 个明文口令文件）` : ''), 'ok', 12000);
+        await renderBackups();
+      } catch (e) {
+        toast('上传失败：' + e.message, 'err', 14000);
+      }
+      input.remove();
+    });
+    document.body.appendChild(input);
+    input.click();
   }
 
   function quickBackup() {
     jobModal({
       name: 'daily-backup', kind: 'backup', schedule: '0 3 * * *',
       backup_targets: ['sites', 'nginx', 'panel'], keep_days: 7,
-      backup_dir: cache?.backup_dir || '/opt/zizpanel/work/backup',
+      // 目录从后端配置来，不再写死 /opt/zizpanel（重定位安装下会写错地方）。
+      backup_dir: cache?.backup_dir || '',
       enabled: true,
     }, load);
   }
@@ -262,21 +491,30 @@ export function jobModal(existing, onDone) {
   const workDir = h('input.input', { value: j.work_dir || '', placeholder: '可选，命令的工作目录' });
   const enabled = h('input', { type: 'checkbox', checked: j.enabled !== false });
 
-  // 备份专属字段
-  const targets = ['sites', 'mysql', 'nginx', 'panel'];
-  const targetLabels = { sites: '网站文件', mysql: '数据库', nginx: 'nginx 配置', panel: '面板数据' };
+  // 备份专属字段。可选范围从后端来（含按应用注册表派生的 apps:* 含密项），
+  // 不再在前端抄一份写死的四项目录。
+  const targetOpts = (cache?.targets && cache.targets.length)
+    ? cache.targets
+    : [
+      { id: 'sites', label: '网站文件' }, { id: 'mysql', label: '数据库' },
+      { id: 'nginx', label: 'nginx 配置' }, { id: 'panel', label: '面板数据' },
+    ];
   const targetBoxes = {};
   const selectedTargets = j.backup_targets || ['sites', 'nginx', 'panel'];
   const backupRow = h('div', { style: { display: 'flex', gap: '14px', flexWrap: 'wrap' } },
-    targets.map((t) => {
-      const cb = h('input', { type: 'checkbox', checked: selectedTargets.includes(t) });
-      targetBoxes[t] = cb;
-      return h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '13px' } }, [
-        cb, h('span', { text: targetLabels[t] }),
+    targetOpts.map((t) => {
+      const cb = h('input', { type: 'checkbox', checked: selectedTargets.includes(t.id) });
+      targetBoxes[t.id] = cb;
+      return h('label', {
+        style: { display: 'flex', gap: '6px', alignItems: 'center', fontSize: '13px' },
+        title: t.opt_in ? '这一项含第三方服务凭据（token / 密码），默认不勾；勾了归档里就会有它' : '',
+      }, [
+        cb,
+        h('span', { text: t.label + (t.opt_in ? '（含凭据）' : '') }),
       ]);
     }));
   const keepDays = h('input.input', { type: 'number', value: j.keep_days || 7, min: 1, max: 365 });
-  const backupDir = h('input.input', { value: j.backup_dir || cache?.backup_dir || '/opt/zizpanel/work/backup' });
+  const backupDir = h('input.input', { value: j.backup_dir || cache?.backup_dir || '' });
   const backupFields = h('div', [
     h('div.field', [h('label', { text: '备份范围' }), backupRow]),
     h('div.row', [

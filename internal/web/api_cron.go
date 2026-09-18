@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/scheduler"
@@ -27,6 +26,11 @@ import (
 func (s *Server) cronManager() *scheduler.Manager {
 	return scheduler.NewManager(s.Store, scheduler.Options{
 		LogDir: filepath.Join(s.Cfg.LogDir, "cron"),
+		// 备份输出目录与"用哪个二进制/哪份配置执行备份"都从面板配置取：
+		// 脚本里写死 /opt/zizpanel 会在 ZIZPANEL_ROOT 重定位或 Intel 前缀下备错东西。
+		BackupDir:  filepath.Join(s.Cfg.WorkDir, "backup"),
+		BinaryPath: s.Cfg.ServicePath("zizpanel"),
+		ConfigPath: s.Cfg.Path(),
 	})
 }
 
@@ -297,43 +301,8 @@ func (s *Server) handleCronPreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleBackupList 列出已有的备份文件（备份任务的产物）。
-func (s *Server) handleBackupList(w http.ResponseWriter, r *http.Request) {
-	dir := filepath.Join(s.Cfg.WorkDir, "backup")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			ok(w, map[string]any{"list": []any{}, "dir": dir})
-			return
-		}
-		fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	type item struct {
-		Name    string `json:"name"`
-		Path    string `json:"path"`
-		Size    int64  `json:"size"`
-		ModTime string `json:"mod_time"`
-	}
-	var list []item
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		list = append(list, item{
-			Name: e.Name(), Path: filepath.Join(dir, e.Name()),
-			Size: info.Size(), ModTime: info.ModTime().Format("2006-01-02 15:04:05"),
-		})
-	}
-	if list == nil {
-		list = []item{}
-	}
-	ok(w, map[string]any{"list": list, "dir": dir})
-}
+// handleBackupList 已移到 api_backup.go（本轮补齐"恢复/上传/删除/下载"后，
+// 备份相关接口集中在一个文件里）。
 
 // pathID 解析路径里的数字 ID。
 func pathID(r *http.Request) (int64, error) {

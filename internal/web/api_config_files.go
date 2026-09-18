@@ -52,7 +52,7 @@ type ConfigFileItem struct {
 // 而不是从列表里凭空消失。
 func (s *Server) panelConfigFiles(ctx context.Context) []ConfigFileItem {
 	const nginxHint = "改完必须让 nginx 重新加载才生效：可点本弹窗里的「🔄 重载 nginx」，" +
-		"或到「⋯ 更多 → 校验 nginx」确认语法，再保存任意站点让面板自动重载。"
+		"或到「nginx 运行 → 🧪 校验 nginx」确认语法，再保存任意站点让面板自动重载。"
 	out := []ConfigFileItem{}
 	add := func(group, label, path, service, hint string) {
 		if path == "" {

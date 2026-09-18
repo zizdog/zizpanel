@@ -47,10 +47,11 @@ import { taskCenter } from './tasks.js';
 import {
   configFileModal, credentialsModal, openLogs, healthHint, loginCredsOf, appWidgets,
 } from './services.js';
-// 「上传大小 / 执行时间」编辑器在 views.js 里（与「面板设置」共用同一份实现 ——
-// 用户 2026-09-18 要求这类常用更改必须是功能，而不是让用户去编辑配置原文件）。
-import { uploadLimitsModal } from './views.js';
-import { nginxPanelModal } from './nginxpanel.js';
+// 「上传与执行上限」的渲染实现只有 views.js 的 renderLimitsInto 一份
+//（用户 2026-09-18 要求这类常用更改必须是功能，而不是让用户去编辑配置原文件）；
+// 2026-09-22 起它与 nginx 四页 / 配置文件 / PHP 环境一起挂在同一个
+// 「⚙️ 调整配置」弹窗里（nginxpanel.js），所以这里只 import 那一个入口。
+import { adjustConfigModal } from './nginxpanel.js';
 
 // PANEL_QUERY_TIMEOUT_MS 是面板首屏查询的**硬上限**。
 //
@@ -1029,20 +1030,24 @@ export async function openServicePanel(o = {}) {
     //       · 一次能传多大（client_max_body_size / upload_max_filesize / post_max_size）
     //       · 脚本能跑多久（max_execution_time）
     //     这里给一颗直达按钮，打开的是**与面板设置同一份**的编辑器（不复制实现）。
-    // nginx 专属：宝塔式的「Nginx 管理」（性能调整表单就在这里）。
+    // nginx 专属：宝塔式的「⚙️ 调整配置」（原来这里有两颗按钮
+    // 「Nginx 管理」与「上传大小 / 执行时间」，内容重复 —— 用户 2026-09-22 要求
+    // 合并成一颗：nginx 四页 + 上传与执行上限 + 配置文件清单 + PHP 环境）。
     if (isNginxApp(mi)) {
       out.push(h('button.btn.btn-sm', {
-        text: '⚙️ Nginx 管理',
-        title: '打开 nginx 管理面板：服务状态、性能参数（含最大上传大小）、配置文件、错误日志',
-        onclick: () => nginxPanelModal(),
+        text: '⚙️ 调整配置',
+        title: '打开统一配置面板：nginx（服务 / 性能调整（含最大上传大小）/ 配置修改 / 错误日志）、'
+          + '上传与执行上限、配置文件清单、PHP 环境',
+        onclick: () => adjustConfigModal(),
       }));
-    }
-    if (isLimitTunable(mi)) {
+    } else if (isLimitTunable(mi)) {
+      // PHP 这类条目：同一份实现（views.js 的 renderLimitsInto），只是直接落到那一页 ——
+      // 不再有第二个"上传大小 / 执行时间"弹窗实现。
       out.push(h('button.btn.btn-sm', {
-        text: '⚡ 上传大小 / 执行时间',
-        title: '直接在面板里改「一次能传多大」（nginx + PHP 一起改，改完自动重载 nginx、重启 php-fpm，'
-          + '并回读生效值）—— 不需要编辑配置文件',
-        onclick: () => uploadLimitsModal({ openNginxTuning: () => nginxPanelModal({ tab: 'tuning' }) }),
+        text: '⚙️ 调整配置',
+        title: '直接打开「上传与执行上限」：改「一次能传多大」「脚本能跑多久」'
+          + '（改完自动重载 nginx、重启 php-fpm，并回读生效值）—— 不需要编辑配置文件',
+        onclick: () => adjustConfigModal({ page: 'limits' }),
       }));
     }
 

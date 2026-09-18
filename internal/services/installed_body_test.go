@@ -236,8 +236,14 @@ func TestDetectRuntimeBodyRejectsDanglingAndIncomplete(t *testing.T) {
 
 // TestNoDaemonCatalogEntriesKeepRuntimePathWired 是这一类的"点名"回归：
 // 用户 2026-09-23 点名的条目必须在门禁里留下名字，避免将来被静默删掉声明。
+//
+// 2026-09-23 晚些时候用户又要求给图片压缩"加一个 webui 通过端口和别名调用"，
+// 于是 imgcompress 从"纯 CLI"变成"CLI 引擎 + 面板托管的网页界面服务"：
+// 它**不再**标 NoDaemon，但 RuntimePath（vips 可执行文件）这条安装体判据必须
+// 继续保留 —— 下面分开断言这两类，免得把"新增了服务"误当成"判据可以删了"。
 func TestNoDaemonCatalogEntriesKeepRuntimePathWired(t *testing.T) {
-	for _, id := range []string{"imgcompress", "ffmpeg", "phpmyadmin"} {
+	// 纯 CLI / 网页入口（没有常驻进程）：必须标 NoDaemon。
+	for _, id := range []string{"ffmpeg", "phpmyadmin"} {
 		app, ok := FindApp(id)
 		if !ok {
 			t.Fatalf("目录里没有 %s（条目被删了？）", id)
@@ -249,10 +255,24 @@ func TestNoDaemonCatalogEntriesKeepRuntimePathWired(t *testing.T) {
 			t.Errorf("%s 是纯 CLI/网页入口，应当标 NoDaemon（否则市场会去找不存在的服务）", id)
 		}
 	}
-	// imgcompress 的运行体必须就是面板安装时复核的那个命令名（vips）：
+	// 图片压缩：有面板托管的网页界面服务（不标 NoDaemon），但安装体判据仍是 vips。
+	img, ok := FindApp("imgcompress")
+	if !ok {
+		t.Fatal("目录里没有 imgcompress")
+	}
+	if strings.TrimSpace(img.RuntimePath) == "" {
+		t.Error("imgcompress 必须有 RuntimePath（否则 brew 探测失败时又会显示未安装）")
+	}
+	if img.NoDaemon {
+		t.Error("imgcompress 现在有常驻的网页界面服务，不该再标 NoDaemon")
+	}
+	if img.ServiceLabel != ImgCompressLabel {
+		t.Errorf("imgcompress 的 ServiceLabel 应为 %s，实际 %q", ImgCompressLabel, img.ServiceLabel)
+	}
+	// 运行体必须就是面板安装时复核的那个命令名（vips）：
 	// 声明漂移（写了别的二进制）会让"装了也判成没装"，正是本类缺陷的形态。
-	if app, _ := FindApp("imgcompress"); !strings.HasSuffix(app.RuntimePath, "/"+ImgCompressBinName) {
+	if !strings.HasSuffix(img.RuntimePath, "/"+ImgCompressBinName) {
 		t.Errorf("imgcompress 的 RuntimePath=%q 必须以 /%s 结尾（与 ImgCompressBinName 同源）",
-			app.RuntimePath, ImgCompressBinName)
+			img.RuntimePath, ImgCompressBinName)
 	}
 }

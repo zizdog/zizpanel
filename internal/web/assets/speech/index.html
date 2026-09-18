@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS 语音合成（say）· ZizPanel</title>
+<!--
+  内嵌的语音合成界面（无构建步骤、无外部 CDN、完全离线可用）。
+
+  两条入口共用这一份页面：
+    · 直连端口  http://127.0.0.1:8891/
+    · 面板别名  http://<主机>/speech/  （由 internal/appproxy 反代，要求先登录面板）
+
+  所以所有资源与接口调用都用**相对路径**（./app.js、v1/voices）：
+  绝对路径（/app.js）在别名下会打到站点根，页面直接白屏。
+-->
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<header class="top">
+  <div class="title">
+    <h1>🔊 macOS 语音合成</h1>
+    <p class="sub">引擎：系统自带 <code>/usr/bin/say</code>（零安装、零下载、离线可用）</p>
+  </div>
+  <div class="engine" id="engine-badge" title="正在探测引擎…">
+    <span class="dot" id="engine-dot"></span>
+    <span id="engine-text">正在探测引擎…</span>
+  </div>
+</header>
+
+<div class="alert alert-error" id="global-error" hidden role="alert"></div>
+
+<main class="grid">
+  <section class="card">
+    <h2>文本</h2>
+    <label class="sr-only" for="text">要合成的文本</label>
+    <textarea id="text" rows="8" placeholder="输入要合成的内容，例如：你好，这是 ZizPanel 的语音合成测试。"
+      spellcheck="false"></textarea>
+    <div class="row between small muted">
+      <span id="text-stat">0 字</span>
+      <span id="text-hint"></span>
+    </div>
+
+    <div class="fields">
+      <div class="field">
+        <label for="voice">音色</label>
+        <select id="voice">
+          <option value="">（自动：中文文本优先用中文音色）</option>
+        </select>
+        <p class="small muted" id="voice-note"></p>
+      </div>
+
+      <div class="field">
+        <label for="format">输出格式</label>
+        <select id="format"></select>
+        <p class="small muted" id="format-note"></p>
+      </div>
+
+      <div class="field">
+        <label for="speed">语速 <span class="muted" id="speed-val">1.00×</span></label>
+        <input type="range" id="speed" min="0.5" max="2" step="0.05" value="1">
+        <p class="small muted">
+          面板把倍率换算成 <code>say -r</code> 的词/分钟并夹取到 80~400；
+          实际使用的语速会在结果里如实显示。
+        </p>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" id="btn-generate" class="primary">▶ 生成语音</button>
+      <button type="button" id="btn-reset" class="ghost">清空</button>
+      <button type="button" id="btn-sample" class="ghost">填入示例</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>结果</h2>
+
+    <div id="progress-wrap" hidden>
+      <div class="row between small">
+        <span id="progress-label">正在合成…</span>
+        <span id="progress-pct" class="muted">0%</span>
+      </div>
+      <progress id="progress" value="0" max="100"></progress>
+      <pre class="log" id="progress-log" aria-live="polite"></pre>
+    </div>
+
+    <div class="alert alert-error" id="error-box" hidden role="alert"></div>
+
+    <div id="result-wrap" hidden>
+      <audio id="player" controls preload="metadata"></audio>
+      <dl class="meta" id="meta"></dl>
+      <div class="actions">
+        <a id="btn-download" class="button" download>⬇ 下载音频</a>
+        <button type="button" id="btn-copy-curl" class="ghost">复制 curl 命令</button>
+      </div>
+    </div>
+
+    <p class="muted" id="empty-hint">还没有生成音频。左侧输入文本后点「生成语音」。</p>
+
+    <details class="api">
+      <summary>OpenAI 兼容接口</summary>
+      <pre class="code">POST /v1/audio/speech
+{ "input": "你好，世界", "voice": "Tingting", "format": "m4a", "speed": 1.0 }
+
+GET  /v1/voices          音色清单（来自 say -v '?'）
+GET  /healthz            能力探活（音色数、各格式可用性）</pre>
+      <p class="small muted">
+        超过同步上限的长文本会返回 <code>202 + task_id</code>，
+        进度与音频分别从 <code>/v1/tasks/&lt;id&gt;/stream</code> 与
+        <code>/v1/tasks/&lt;id&gt;/audio</code> 取。
+      </p>
+    </details>
+  </section>
+</main>
+
+<footer class="foot small muted">
+  <span id="foot-engine"></span>
+  <span>·</span>
+  <span>界面与接口只监听 127.0.0.1；经面板别名访问需要先登录面板</span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

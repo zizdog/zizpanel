@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/backup"
 	"github.com/zizdog/zizpanel/internal/store"
 )
 
@@ -17,21 +18,49 @@ import (
 type Manager struct {
 	repo   *Repository
 	logDir string
+	// 以下三项是 backup 任务生成脚本时要用的**配置派生路径**。
+	//
+	// 为什么必须由调用方注入：脚本里过去写死了 /opt/zizpanel 与 /opt/homebrew，
+	// 面板用 ZIZPANEL_ROOT 重定位或跑在 Intel 前缀（/usr/local）下时会备错东西
+	// 或什么都不备 —— 而任务日志里看不出来（脚本只是"没找到目录"）。
+	backupDir  string
+	binaryPath string
+	configPath string
 }
 
 // Options 是构造参数。
 type Options struct {
 	// LogDir 是任务运行日志目录
 	LogDir string
+	// BackupDir 是 backup 任务的默认输出目录（应传 <WorkDir>/backup）
+	BackupDir string
+	// BinaryPath 是面板二进制的绝对路径（backup 任务靠它执行真正的备份）
+	BinaryPath string
+	// ConfigPath 是面板配置文件路径（脚本用 --config 传给 CLI）
+	ConfigPath string
 }
 
 // NewManager 创建计划任务管理器。
 func NewManager(st *store.Store, opt Options) *Manager {
 	logDir := opt.LogDir
 	if logDir == "" {
-		logDir = "/opt/zizpanel/logs/cron"
+		// 兜底：不再写死 /opt/zizpanel（重定位安装下会写到别人的目录里）。
+		// 生产路径由 web 层显式传入，这里只服务直接调用本包的场景。
+		logDir = filepath.Join(os.TempDir(), "zizpanel-cron")
 	}
-	return &Manager{repo: NewRepository(st), logDir: logDir}
+	bin := opt.BinaryPath
+	if bin == "" {
+		if exe, err := os.Executable(); err == nil {
+			bin = exe
+		}
+	}
+	return &Manager{
+		repo:       NewRepository(st),
+		logDir:     logDir,
+		backupDir:  opt.BackupDir,
+		binaryPath: bin,
+		configPath: opt.ConfigPath,
+	}
 }
 
 func (m *Manager) logPathFor(j *Job) string {
@@ -214,16 +243,20 @@ func (m *Manager) validate(j *Job) error {
 		}
 	case "backup":
 		if len(j.BackupTargets) == 0 {
-			j.BackupTargets = []string{"sites", "nginx", "panel"}
+			j.BackupTargets = defaultBackupTargets()
 		}
-		valid := map[string]bool{"sites": true, "mysql": true, "nginx": true, "panel": true}
 		for _, t := range j.BackupTargets {
-			if !valid[t] {
-				return fmt.Errorf("未知的备份范围: %s", t)
+			if !backup.IsKnownTarget(t) {
+				return fmt.Errorf("未知的备份范围: %s（可用: %s）", t,
+					strings.Join(backup.AllTargets(), ", "))
 			}
 		}
 		if j.BackupDir == "" {
-			j.BackupDir = "/opt/zizpanel/work/backup"
+			// 默认值来自配置（<WorkDir>/backup），不再写死 /opt/zizpanel/work/backup。
+			if m.backupDir == "" {
+				return errors.New("备份目录未配置：面板配置里没有可用的工作目录")
+			}
+			j.BackupDir = m.backupDir
 		}
 		if j.KeepDays <= 0 {
 			j.KeepDays = 7
@@ -259,19 +292,38 @@ type Repository struct {
 // NewRepository 创建仓库。
 func NewRepository(st *store.Store) *Repository { return &Repository{st: st} }
 
-const jobCols = `id,name,kind,schedule,command,work_dir,enabled,last_run,last_status,last_output,run_count,created_at`
+const jobCols = `id,name,kind,schedule,command,work_dir,enabled,last_run,last_status,last_output,run_count,created_at,backup_targets,backup_dir,keep_days`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var enabled int
+	var targets string
 	err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.Schedule, &j.Command, &j.WorkDir,
-		&enabled, &j.LastRun, &j.LastStatus, &j.LastOutput, &j.RunCount, &j.CreatedAt)
+		&enabled, &j.LastRun, &j.LastStatus, &j.LastOutput, &j.RunCount, &j.CreatedAt,
+		&targets, &j.BackupDir, &j.KeepDays)
 	if err != nil {
 		return nil, err
 	}
 	j.Enabled = enabled == 1
+	j.BackupTargets = splitTargets(targets)
 	return &j, nil
 }
+
+// splitTargets 把库里的逗号分隔范围还原成切片（空串 = 还没选过）。
+func splitTargets(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func joinTargets(list []string) string { return strings.Join(list, ",") }
+
+// defaultBackupTargets 是没选范围时的默认（与既有行为一致，含 sites）。
+func defaultBackupTargets() []string { return []string{"sites", "nginx", "panel"} }
 
 // List 返回全部任务。
 func (r *Repository) List(ctx context.Context) ([]*Job, error) {
@@ -307,9 +359,10 @@ func (r *Repository) Get(ctx context.Context, id int64) (*Job, error) {
 // Create 写入任务。
 func (r *Repository) Create(ctx context.Context, j *Job) error {
 	res, err := r.st.DB().ExecContext(ctx,
-		`INSERT INTO cron_jobs(name,kind,schedule,command,work_dir,enabled)
-		 VALUES(?,?,?,?,?,?)`,
-		j.Name, j.Kind, j.Schedule, j.Command, j.WorkDir, boolToInt(j.Enabled))
+		`INSERT INTO cron_jobs(name,kind,schedule,command,work_dir,enabled,backup_targets,backup_dir,keep_days)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
+		j.Name, j.Kind, j.Schedule, j.Command, j.WorkDir, boolToInt(j.Enabled),
+		joinTargets(j.BackupTargets), j.BackupDir, j.KeepDays)
 	if err != nil {
 		return err
 	}
@@ -318,10 +371,16 @@ func (r *Repository) Create(ctx context.Context, j *Job) error {
 }
 
 // Update 更新任务。
+//
+// 必须落库 backup_targets/backup_dir/keep_days：不写它们的话，用户在界面上选的
+// 备份范围/目录/保留天数**面板一重启就回落默认**，而界面显示的是用户选的值
+// ——"我明明选了 mysql，它却没备"就是这么来的。
 func (r *Repository) Update(ctx context.Context, j *Job) error {
 	_, err := r.st.DB().ExecContext(ctx,
-		`UPDATE cron_jobs SET name=?,kind=?,schedule=?,command=?,work_dir=?,enabled=? WHERE id=?`,
-		j.Name, j.Kind, j.Schedule, j.Command, j.WorkDir, boolToInt(j.Enabled), j.ID)
+		`UPDATE cron_jobs SET name=?,kind=?,schedule=?,command=?,work_dir=?,enabled=?,
+		 backup_targets=?,backup_dir=?,keep_days=? WHERE id=?`,
+		j.Name, j.Kind, j.Schedule, j.Command, j.WorkDir, boolToInt(j.Enabled),
+		joinTargets(j.BackupTargets), j.BackupDir, j.KeepDays, j.ID)
 	return err
 }
 

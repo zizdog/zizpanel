@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -506,7 +507,7 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		if cert == "" || key == "" {
 			cert, key = cur.SSLCert, cur.SSLKey
 		}
-		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cert, key); err != nil {
+		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cert, key, next.SSLEnabled); err != nil {
 			_ = s.syncForwarder(cur) // 转发器退回旧状态
 			fail(w, http.StatusBadGateway, "切换 HTTPS 时调整域名兜底块失败："+err.Error())
 			return
@@ -660,6 +661,217 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	}
 	reachable, detail := probeTarget(r.Context(), strings.TrimSpace(req.Target))
 	ok(w, map[string]any{"ok": reachable, "detail": detail})
+}
+
+// ============================================================================
+//  反代「大请求体探测」——按需触发，绝不进列表/首屏
+//
+//  为什么需要它：端口在听、目标可达、健康检查全绿，**不等于**能收大请求体。
+//  2026-09-18 生产事故：经反代推 368KB 音色样本一律 500，而那个 500 是 nginx
+//  **自己**的错误页 —— 请求体先被缓冲到 client_body_temp，目录一旦不可写
+//  （属主不对 / 磁盘满），nginx 在转给上游之前就失败了。
+//
+//  所以这里真的发一个 ~64KB 请求体（> nginx 默认 client_body_buffer_size，
+//  足以走"落盘 / 边收边转"的分支），并断言拿到的**不是 nginx 自己的 500/413 页**。
+//  探测只在用户点按钮时跑（见 assets/js/reverseproxy.js），不放在 proxyView /
+//  列表渲染路径上 —— 那是 AGENTS.md 第三节坑 165 的教训。
+// ============================================================================
+
+const (
+	// proxyBodyProbeSize 是探测请求体大小：64KB。
+	//
+	// 取这个值的理由：它远大于 nginx 默认 client_body_buffer_size（8k/16k），
+	// 一定会触发"请求体缓冲"这条路径；又足够小，不会把上游或日志撑爆。
+	proxyBodyProbeSize = 64 * 1024
+	// proxyBodyProbeTimeout 是单次探测的整体超时。
+	proxyBodyProbeTimeout = 6 * time.Second
+)
+
+// proxyBodyPostFn 是"发一个带请求体的 POST"这一步的可注入点。
+//
+// 生产实现走 curl；单测替换它，就能在完全不碰真实服务的情况下钉住分类判据
+// （尤其是"nginx 回它自己的 500 页 → 判失败"）。
+var proxyBodyPostFn = curlPostBody
+
+// proxyProbeListeningFn 是探测前的"端口在不在听"检查，做成可注入点让单测不必
+// 真的去拨号（单测不许碰真实服务）。
+var proxyProbeListeningFn = portListening
+
+// curlPostBody 用 curl 向规则的监听端口 POST 一个请求体，返回 (状态码, 响应体, 错误)。
+//
+// 与 curlSite 同一套做法：--resolve 把 Host 钉到 127.0.0.1，域名没解析也能测到本机
+// nginx；-k 跳过证书校验（自签证书同样要能测）。显式发一个空的 `Expect:` 头，
+// 否则 curl 会先发头部等 100-continue，某些配置下请求体根本不会被发出去。
+func curlPostBody(ctx context.Context, scheme, host string, port int, path string, body []byte, timeout time.Duration) (code, respBody string, err error) {
+	url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	args := []string{
+		"-sS", "-k", "--max-time", strconv.Itoa(int(timeout.Seconds())),
+		"--resolve", fmt.Sprintf("%s:%d:127.0.0.1", host, port),
+		"-H", "Content-Type: application/octet-stream",
+		"-H", "Expect:",
+		"--data-binary", "@-",
+		"-o", "-", "-w", "\n__ZP_CODE__%{http_code}",
+		url,
+	}
+	cmd := execCommand(ctx, "/usr/bin/curl", args...)
+	cmd.Stdin = bytes.NewReader(body)
+	out, err := cmd.Output()
+	if err != nil && len(out) == 0 {
+		return "000", "", err
+	}
+	s := string(out)
+	if i := strings.LastIndex(s, "__ZP_CODE__"); i >= 0 {
+		code = strings.TrimSpace(s[i+len("__ZP_CODE__"):])
+		s = s[:i]
+	}
+	return code, s, nil
+}
+
+// proxyBodyProbeResult 是一次大请求体探测的结果（字段都给前端展示 / 排障用）。
+type proxyBodyProbeResult struct {
+	Status     string `json:"status"` // ok / bad / unknown
+	OK         bool   `json:"ok"`
+	Step       string `json:"step"`   // 坏 / 未能探测发生在哪一步
+	Detail     string `json:"detail"` // 给用户看的完整说明
+	Code       string `json:"code"`   // HTTP 状态码；"000" = 没拿到响应
+	Listen     int    `json:"listen"`
+	Target     string `json:"target"`
+	ProbeURL   string `json:"probe_url"`
+	BodyBytes  int    `json:"body_bytes"`
+	BodyPrefix string `json:"body_prefix"` // 响应体开头（排障用；已截断）
+}
+
+// looksLikeNginxErrorPage 判断响应体是不是 nginx **自己**生成的错误页。
+//
+// nginx 的出厂错误页固定带一行 `<hr><center>nginx</center>`（413/500/502 都一样），
+// 上游应用自己的 5xx 一般没有这个指纹。判据刻意很窄：正文里必须同时出现
+// "nginx" 与出厂页标记才算 —— 宁可漏判成"上游 5xx"，也不要把用户应用自己的
+// 500 页误报成 nginx 的请求体失败。
+func looksLikeNginxErrorPage(body string) bool {
+	low := strings.ToLower(body)
+	if !strings.Contains(low, "nginx") {
+		return false
+	}
+	return strings.Contains(low, "<center>nginx</center>") ||
+		strings.Contains(low, "<center>nginx/")
+}
+
+// classifyBodyProbe 把一次响应归类成 好 / 坏 / 未能探测，并写清发生在哪一步。
+//
+//	413                          → 坏：请求体在 nginx 层被 client_max_body_size 拒了；
+//	502/504                      → 坏：nginx 收下了请求体但连不上上游；
+//	5xx 且是 nginx 自己的错误页  → 坏：正是 2026-09-18 事故的形态（请求体落盘失败）；
+//	其它任何 HTTP 响应           → 好：请求体确实被接收并转发了（含上游自己的 4xx/5xx）；
+//	没有拿到任何 HTTP 响应       → 未能探测（连接被拒/断开/超时，不能算"nginx 收了"）。
+//
+// 502/504 必须排在"nginx 自己的错误页"之前：它们本来就是 nginx 生成的 5xx，
+// 但对用户来说要修的是"上游没起来"，不是请求体缓冲。
+func classifyBodyProbe(code, body string, listen int) (status, step, detail string) {
+	c := strings.TrimSpace(code)
+	switch {
+	case c == "" || c == "000":
+		return "unknown", "发送请求", "没有拿到任何 HTTP 响应（连接被拒 / 被断开 / 超时）"
+	case c == "413":
+		return "bad", "nginx 请求体上限",
+			"nginx 用 413 拒绝了请求体：它超过了 client_max_body_size（可到「设置 → 上传与执行限制」调大）"
+	case c == "502" || c == "504":
+		return "bad", "转发到上游",
+			"nginx 收下了请求体，但转发到上游时得到 " + c + "（目标服务没起来 / 连不上）"
+	case strings.HasPrefix(c, "5") && looksLikeNginxErrorPage(body):
+		return "bad", "nginx 自身的错误页",
+			"nginx 返回了它**自己**的 " + c + " 错误页：请求体在转给上游之前就失败了" +
+				"（典型原因是 client_body_temp 不可写或磁盘满）"
+	case listen == 80 && strings.Contains(body, sites.LocalhostIndexMarker):
+		return "unknown", "落到默认站点",
+			"请求落到了面板默认站点（000-default.conf）的占位页，说明这条反代规则没有被 nginx 使用"
+	default:
+		return "ok", "", "64KB 请求体已被 nginx 接收并转发，上游返回 HTTP " + c
+	}
+}
+
+// truncateProbeBody 只保留响应体开头，避免把巨大页面塞进接口响应。
+func truncateProbeBody(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 400 {
+		return s[:400] + "…（已截断）"
+	}
+	return s
+}
+
+// probeProxyLargeBody 对一条规则做一次"大请求体"探测，结果如实分类。
+//
+// 每一步失败都写清在哪一步（前置检查 / 发送请求 / nginx 请求体上限 /
+// nginx 自身的错误页 / 转发到上游 / 落到默认站点），绝不把"没探到"说成"通过"。
+func (s *Server) probeProxyLargeBody(ctx context.Context, rule *proxies.Rule) proxyBodyProbeResult {
+	res := proxyBodyProbeResult{Status: "unknown", BodyBytes: proxyBodyProbeSize}
+	if rule != nil {
+		res.Listen, res.Target = rule.Listen, rule.Target
+	}
+	if rule == nil {
+		res.Step, res.Detail = "前置检查", "规则不存在"
+		return res
+	}
+	host := proxyProbeHost(rule)
+	scheme := probeProxyScheme(rule)
+	path := proxyProbePath(rule)
+	res.ProbeURL = fmt.Sprintf("%s://%s:%d%s", scheme, host, rule.Listen, path)
+
+	if !rule.Enabled {
+		res.Step = "前置检查"
+		res.Detail = "规则已停用：nginx 里没有它的配置，无从探测（先启用这条规则）"
+		return res
+	}
+	if !s.nginxInstalled() {
+		res.Step = "前置检查"
+		res.Detail = "没有找到 nginx（" + s.Cfg.NginxBin + "）：请先到「应用市场 → 网站环境」安装 nginx"
+		return res
+	}
+	if !proxyProbeListeningFn(ctx, rule.Listen) {
+		res.Step = "前置检查"
+		res.Detail = fmt.Sprintf("127.0.0.1:%d 没有在监听：nginx 没起来、或这条规则没被加载"+
+			"（先看规则卡片上的端口状态与 nginx error_log）", rule.Listen)
+		return res
+	}
+
+	payload := bytes.Repeat([]byte("z"), proxyBodyProbeSize)
+	code, body, err := proxyBodyPostFn(ctx, scheme, host, rule.Listen, path, payload, proxyBodyProbeTimeout)
+	res.Code = strings.TrimSpace(code)
+	res.BodyPrefix = truncateProbeBody(body)
+	if err != nil && (res.Code == "" || res.Code == "000") {
+		res.Step = "发送请求"
+		res.Detail = "未能探测：向 " + res.ProbeURL + " 发送 64KB 请求体时失败：" + err.Error()
+		return res
+	}
+	status, step, detail := classifyBodyProbe(res.Code, body, rule.Listen)
+	res.Status, res.Step, res.Detail, res.OK = status, step, detail, status == "ok"
+	if err != nil {
+		res.Detail += "（curl: " + err.Error() + "）"
+	}
+	return res
+}
+
+// handleProxyBodyProbe 是「大请求体探测」的按需接口。
+//
+// 刻意只在用户点按钮时调用：它要真的发一个 64KB 请求体，属于"昂贵且会碰到真实
+// 服务"的探测，绝不能挂在列表 / 首屏渲染路径上（AGENTS.md 坑 165）。
+func (s *Server) handleProxyBodyProbe(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "规则 id 不合法")
+		return
+	}
+	rule, err := s.proxyRepo().Get(r.Context(), id)
+	if errors.Is(err, proxies.ErrNotFound) {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ok(w, s.probeProxyLargeBody(r.Context(), rule))
 }
 
 // ============================================================================
@@ -866,9 +1078,9 @@ func (s *Server) handleProxySSL(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, err.Error())
 		return
 	}
-	// 兜底块先进入"带证书的中性形态"：同时改规则 vhost 与兜底块时，
-	// 中间态若被 nginx 判 [emerg] 会让整个切换必然失败（见 stabilizeProxyReject）。
-	if err := s.stabilizeProxyReject(r.Context(), next.Listen, next.SSLCert, next.SSLKey); err != nil {
+	// 兜底块先带上证书行：同时改规则 vhost 与兜底块时，中间态若被 nginx 判
+	// [emerg] 会让整个切换必然失败（见 stabilizeProxyReject）。
+	if err := s.stabilizeProxyReject(r.Context(), next.Listen, next.SSLCert, next.SSLKey, next.SSLEnabled); err != nil {
 		fail(w, http.StatusBadGateway, "调整域名兜底块失败："+err.Error())
 		return
 	}
@@ -939,7 +1151,8 @@ func (s *Server) handleProxySSLDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	if cur.SSLEnabled {
 		// 中性形态：兜底块先带证书，规则 vhost 改回非 SSL 后再收敛掉证书行。
-		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cur.SSLCert, cur.SSLKey); err != nil {
+		// 这里 next.SSLEnabled=false（正在关 HTTPS），所以 listen 不带 ssl。
+		if err := s.stabilizeProxyReject(r.Context(), next.Listen, cur.SSLCert, cur.SSLKey, false); err != nil {
 			fail(w, http.StatusBadGateway, "关闭 HTTPS 时调整域名兜底块失败："+err.Error())
 			return
 		}
@@ -1710,11 +1923,10 @@ func (s *Server) syncRejectBlocks(ctx context.Context) error {
 
 	changed := false
 	for port, sp := range specs {
-		if sp.SSL && (sp.Cert == "" || sp.Key == "") {
-			return fmt.Errorf("端口 %d 上有已启用 HTTPS 的规则，但数据库里没有证书路径："+
-				"nginx 要求同一端口上每个 server 块都有证书，无法为域名兜底块提供证书", port)
+		content, cerr := s.proxyRejectBlockContent(port, sp)
+		if cerr != nil {
+			return cerr
 		}
-		content := proxies.GenerateRejectWithCert(port, s.proxyLogDir(), sp.Cert, sp.Key, sp.SSL)
 		if err := s.writeVhost(ctx, proxies.RejectVhostName(port), content); err != nil {
 			if isDuplicateDefaultServer(err) {
 				// 这个端口已经有别的 default_server 了（典型就是 000-default.conf
@@ -1784,14 +1996,114 @@ func proxyRejectSpecs(rules []*proxies.Rule) map[int]proxyRejectSpec {
 	return out
 }
 
+// proxyPortListenMode 判断某端口上**已有 vhost** 用的 listen 协议选项。
+//
+// 返回：
+//   - hasSSL：至少有一个 `listen <port> ssl`；
+//   - uniformSSL：该端口上所有 `listen <port>` 都带 ssl（没有"有的带有的不带"）。
+//
+// 为什么需要它（2026-09-18 生产 error.log 实测）：
+// nginx 对同一个 `0.0.0.0:<port>` 上重复出现的 listen 有严格规则 ——
+// 选项集**完全一致**（例如全 ssl，或全不带）不会报；一旦出现第二/第三种
+// 不同的协议选项集（典型是"有的 listen ... ssl、有的不带"），就会打
+// `protocol options redefined for 0.0.0.0:<port>`。
+//
+// 兜底拒绝块 `proxy-reject-<port>.conf` 的字典序永远排在 `proxy-<id>.conf`
+// 之后（数字 < 'r'），所以它是不是"那个多余的第二选项集"完全取决于它自己怎么写：
+//
+//	全 ssl 端口 → 兜底块也必须写 ssl（少写 ssl 会被判"选项被移除"）；
+//	混合端口   → 兜底块绝不能写 ssl（那会成为第三个不同的选项集）。
+//
+// 只看数据库里的反代规则不够：同一端口还可能有站点 vhost（站点侧会写
+// `listen <port> ssl`）。所以这里扫描 vhosts 目录里**别的** .conf，
+// 复用站点侧同一套 listen 解析（siteServerBlocks + siteListenPorts）。
+//
+// selfFile 是正在重写的兜底块文件名（不含 .conf 后缀），读目录时跳过它自己，
+// 否则旧内容会影响判断。
+func (s *Server) proxyPortListenMode(port int, selfFile string) (hasSSL, uniformSSL bool) {
+	if port <= 0 {
+		return false, false
+	}
+	entries, err := os.ReadDir(s.Cfg.VhostDir)
+	if err != nil {
+		// 读不到目录：不猜，按"没有 ssl 邻居"处理（生成不带 ssl 的兜底块）。
+		return false, false
+	}
+	uniformSSL = true
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || name == selfFile+".conf" || !strings.HasSuffix(name, ".conf") {
+			continue
+		}
+		b, rerr := os.ReadFile(filepath.Join(s.Cfg.VhostDir, name))
+		if rerr != nil {
+			continue
+		}
+		// 逐 server 块解析：同一份文件里可能有多个块（例如站点 vhost 的
+		// 80/443 两块），siteListenPorts 按块调用才不会把同端口的两种写法去重掉。
+		for _, block := range siteServerBlocks(string(b)) {
+			for _, lp := range siteListenPorts(block) {
+				if lp.Port != port {
+					continue
+				}
+				if lp.SSL {
+					hasSSL = true
+				} else {
+					uniformSSL = false
+				}
+			}
+		}
+	}
+	if !hasSSL {
+		uniformSSL = false
+	}
+	return hasSSL, uniformSSL
+}
+
+// proxyRejectBlockContent 生成某端口「域名兜底拒绝块」的内容。
+//
+// 这是**唯一的生成点**：listen 写不写 ssl、要不要带证书行，都在这里定，
+// 保证与端口上已有 vhost 的 listen 选项一致（见 proxyPortListenMode），
+// 从而不再产生 `protocol options redefined` 警告。
+//
+// 抽成方法是为了让单测能直接钉住生成结果，而不必走"写盘 + reload + 复核"。
+func (s *Server) proxyRejectBlockContent(port int, sp proxyRejectSpec) (string, error) {
+	if sp.SSL && (sp.Cert == "" || sp.Key == "") {
+		return "", fmt.Errorf("端口 %d 上有已启用 HTTPS 的规则，但数据库里没有证书路径："+
+			"nginx 要求同一端口上每个 server 块都有证书，无法为域名兜底块提供证书", port)
+	}
+	hasSSLPeer, uniformSSL := s.proxyPortListenMode(port, proxies.RejectVhostName(port))
+	cert, key := "", ""
+	if sp.SSL || hasSSLPeer {
+		// 端口上只要有任何 server 写 ssl，nginx 就要求该端口**每个** server
+		// 都能取到证书；兜底块永远 return 444，证书只是为满足这条要求。
+		cert, key = sp.Cert, sp.Key
+	}
+	// 什么时候兜底块要写 ssl：
+	//   sp.SSL 为真（这条端口的反代规则是 HTTPS）**且**端口上没有任何"不带 ssl
+	//   的邻居"。若真存在不带 ssl 的邻居，那就是混合端口，兜底块再写 ssl 会成为
+	//   第三种选项集 → 警告；此时宁可写不带 ssl 的形态。
+	// 注意不能只看"扫到了 ssl 邻居"：写这份兜底块时，规则自己的 vhost 可能还没
+	// 落盘（例如刚启用一条 HTTPS 规则），此时端口上只有旧文件，按 sp.SSL 判断才对。
+	sslListen := sp.SSL && (uniformSSL || !hasSSLPeer)
+	return proxies.GenerateRejectWithCert(port, s.proxyLogDir(), cert, key, sslListen), nil
+}
+
 // stabilizeProxyReject 在 SSL 开关切换的写盘之前，把该端口的兜底块改成
-// "listen <port> default_server;" + 证书行的中性形态。
+// "带证书行"的形态，保证切换的**中间态**不会让 `nginx -t` 判 [emerg]。
 //
 // 为什么需要（真机 nginx 1.31.5 实测）：SSL 开/关都要同时改两个文件
 // （规则 vhost 与兜底块），而写每个文件都会跑一次 `nginx -t`。中间态里
 // "有 ssl 的 server + 没证书的 server"会被判 [emerg] 并回滚，导致切换永远失败。
-// 带证书行的非 SSL server 在任何组合下都合法，所以先落它、再改规则 vhost。
-func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, keyPath string) error {
+// 带证书行的 server 在任何组合下都合法，所以先落它、再改规则 vhost。
+//
+// targetSSL 是**切换后**这条规则是否启用 HTTPS，决定 listen 要不要带 ssl：
+//   - 正在切成 HTTPS 且同端口其它 vhost 已经全是 ssl 时，必须保持 ssl
+//     （临时的"不带 ssl 兜底块"会在一个全 ssl 端口上凑出混合协议选项 →
+//     nginx 立刻打 protocol options redefined）；
+//   - 其余情况一律用不带 ssl 的中性形态 —— 尤其是"切成 HTTP"：规则 vhost
+//     马上会变成不带 ssl，兜底块若还带 ssl 会被 nginx 判 [emerg]。
+func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, keyPath string, targetSSL bool) error {
 	if certPath == "" || keyPath == "" {
 		return nil
 	}
@@ -1802,7 +2114,13 @@ func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, k
 	if !proxies.RejectPorts(list)[port] {
 		return nil // 这个端口不需要兜底块（例如全是通配规则）
 	}
-	content := proxies.GenerateRejectWithCert(port, s.proxyLogDir(), certPath, keyPath, false)
+	sslListen := false
+	if targetSSL {
+		if _, uniform := s.proxyPortListenMode(port, proxies.RejectVhostName(port)); uniform {
+			sslListen = true
+		}
+	}
+	content := proxies.GenerateRejectWithCert(port, s.proxyLogDir(), certPath, keyPath, sslListen)
 	return s.writeVhost(ctx, proxies.RejectVhostName(port), content)
 }
 

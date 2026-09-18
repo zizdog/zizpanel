@@ -133,6 +133,14 @@ func composeImagesOf(yaml string) []string {
 // 用户会去补一个根本不需要补的文件。
 var offlineSelfContained = map[string]string{
 	"voicereceiver": "无需额外文件：接收端脚本内嵌在面板二进制里；唯一外部依赖 ffmpeg 由 ffmpeg 条目覆盖",
+	// macOS 语音合成（say）是目录里**唯一真正零下载**的条目：
+	// 合成引擎 /usr/bin/say 与格式转换 /usr/bin/afconvert 都是 macOS 自带的
+	// （不动点：它们随系统走，镜像站上没有也不该有它们的副本 —— 把系统二进制
+	// 塞进离线包既没意义又会让"离线包完整"变成假的）；网页界面是面板自己的
+	// 二进制（`zizpanel speech-serve`，随面板升级）。所以离线包对它**零要求**。
+	// 不写这一条就会在报告里冒出一个假缺口，用户会去补一个根本不存在的东西。
+	"macspeech": "无需额外文件：合成引擎 /usr/bin/say 与转换工具 /usr/bin/afconvert 都是 macOS 自带的" +
+		"（不随离线包分发），网页界面由面板自己的二进制提供（cmd/zizpanel 的 speech-serve 子命令）",
 }
 
 // offlinePythonGaps 是面板自研 Python 安装器**已知还没镜像**的依赖。
@@ -148,6 +156,31 @@ var offlinePythonGaps = map[string][]string{
 		"PyPI 依赖闭包（pip install 'mlx-audio[server]' 及其全部传递依赖）尚未镜像；" +
 			"NAS 上还没有 /pypi/simple，真离线时装不上",
 		"HF 模型整目录（约 2.9GB）目前只走 /hf/ 按需缓存代理，未落成静态文件",
+	},
+}
+
+// offlineInstallerExtra 是"面板自研安装器需要但 brew 瓶里没有"的文件。
+//
+// 与 offlinePythonExtra 分开是刻意的：那张表是**Python 线**的（pip 依赖闭包），
+// 而语音转文字要的是**模型权重**（与 Python 一点关系都没有）。混在一起会让
+// 下一轮排查的人以为 whisper 是个 Python 应用。
+//
+// 路径必须与安装器代码里**实际使用**的镜像路径一致（见 stt.go 的
+// STTModelSourceList：静态目录 <base>/models/whisper/<file> 与
+// HF 代理 <base>/hf/ggerganov/whisper.cpp/resolve/main/<file>）。
+// 改下载点时**必须**同步这里，否则离线包会缺件。
+var offlineInstallerExtra = map[string][]OfflineArtifact{
+	"stt": {
+		{
+			Kind:        OfflineKindModel,
+			Path:        "artifacts/models/whisper/ggml-small.bin",
+			MirrorPath:  "hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+			UpstreamURL: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+			Note: "默认档模型（487,601,967 B，**本轮实测**：Range 读 Content-Range 得到；" +
+				"NAS 的 <base>/hf/ 代理上实测 HTTP 200 可用，静态目录 <base>/models/whisper/ 目前是 404）。" +
+				"安装流程只下这一档；large-v3-turbo（574,041,195 B）与 medium（1,533,763,059 B）" +
+				"按需下载、不在离线包的必需件里 —— 要真离线也必须把用得到的档位一起落盘。",
+		},
 	},
 }
 
@@ -269,6 +302,9 @@ func OfflinePlan() []OfflineAppPlan {
 					p.InstallMethod = "panel_installer"
 				}
 				if extra, ok := offlinePythonExtra[app.ID]; ok {
+					p.Artifacts = append(p.Artifacts, extra...)
+				}
+				if extra, ok := offlineInstallerExtra[app.ID]; ok {
 					p.Artifacts = append(p.Artifacts, extra...)
 				}
 				if gaps, ok := offlinePythonGaps[app.ID]; ok {

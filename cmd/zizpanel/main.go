@@ -73,6 +73,23 @@ func main() {
 		// 配置文件看起来"缺一大半"（www_root / access_mode 都读不到）。
 		// Bootstrap 只在"文件不存在"时 Save，所以也不能靠它。
 		err = cmdReconcileConfig(rest)
+	case "backup":
+		// 备份/恢复：launchd 定时任务与终端排障共用（见 cmd/zizpanel/backup.go）。
+		err = cmdBackup(rest)
+	case "imgcompress-serve":
+		// 图片压缩网页界面：由应用「图片压缩（libvips）」的 launchd 服务拉起
+		// （com.zizdog.imgcompress，见 cmd/zizpanel/imgcompress.go）。
+		err = cmdImgCompressServe(rest)
+	case "speech-serve":
+		// 语音合成网页界面：由应用「macOS 语音合成（say）」的 launchd 服务拉起
+		// （com.zizdog.macosspeech，见 cmd/zizpanel/speech.go）。
+		// 引擎是系统自带的 /usr/bin/say，没有任何外部依赖。
+		err = cmdSpeechServe(rest)
+	case "stt-serve":
+		// 语音转文字网页界面：由应用「语音转文字（whisper.cpp）」的 launchd 服务
+		// 拉起（com.zizdog.stt，见 cmd/zizpanel/stt.go）。
+		// 引擎是 Homebrew 的 whisper.cpp（whisper-cli），转码用 ffmpeg。
+		err = cmdSTTServe(rest)
 	case "reset-password", "passwd":
 		err = cmdResetPassword(rest)
 	case "hash-password":
@@ -135,6 +152,10 @@ func usage() {
   zizpanel reset-password <用户名>  重置账号密码（忘记密码时使用）
   zizpanel hash-password <密码>     生成 bcrypt 哈希（手工配置用）
   zizpanel gen-cert                重新生成自签 HTTPS 证书
+  zizpanel backup <子命令>          备份/恢复（create / verify / list）
+  zizpanel imgcompress-serve       启动图片压缩网页界面（由 launchd 托管，默认 127.0.0.1:8890）
+  zizpanel speech-serve            启动语音合成网页界面（由 launchd 托管，默认 127.0.0.1:8891；引擎为系统自带 say）
+  zizpanel stt-serve               启动语音转文字网页界面（由 launchd 托管，默认 127.0.0.1:8892；引擎为 whisper.cpp + ffmpeg）
   zizpanel version                 显示版本
 
 常用参数:
@@ -227,6 +248,15 @@ func cmdServe(args []string) error {
 	// 启动时清一次过期会话，避免表无限增长
 	if n, err := st.PurgeExpiredSessions(context.Background()); err == nil && n > 0 {
 		log.Info("清理过期会话 %d 条", n)
+	}
+
+	// 导航页的两张表（nav_groups / nav_items）不在 store.go 的 schema 常量里
+	// （那里是并行改动热点），由 store.EnsureNavTables 在自己的文件里幂等创建。
+	// API 层每个 handler 也会调一次做兜底；这里是「面板启动时建好」的正式时机。
+	// 失败不阻断启动：导航页是可选功能，建表失败时它的接口会如实报错，
+	// 不该因为一个附加页面让整个面板起不来。
+	if err := store.EnsureNavTables(context.Background(), st.DB()); err != nil {
+		log.Warn("创建导航页数据表失败（导航页将不可用）: %v", err)
 	}
 
 	am := auth.New(st, cfg.Secret, cfg.SessionHours, cfg.LoginMaxFail, cfg.LoginLockMins)

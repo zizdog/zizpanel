@@ -50,7 +50,8 @@ func TestEditorCodeMirrorAssetsPresent(t *testing.T) {
 		"addon/fold/brace-fold.min.js", "addon/fold/xml-fold.min.js",
 		"addon/fold/comment-fold.min.js", "addon/selection/active-line.min.js",
 		"addon/scroll/simplescrollbars.min.js", "addon/comment/comment.min.js",
-		"theme/monokai.min.css", "LICENSE",
+		"theme/eclipse.min.css", "theme/material-darker.min.css", "theme/monokai.min.css",
+		"LICENSE",
 	}
 	for _, f := range core {
 		if _, err := os.Stat(filepath.Join(base, f)); err != nil {
@@ -58,8 +59,32 @@ func TestEditorCodeMirrorAssetsPresent(t *testing.T) {
 		}
 	}
 
-	// CM_LANGS 的每条 deps 都必须有对应的 mode 文件
+	// 主题只用 CodeMirror 官方 CSS（`internal/web/assets/vendor/codemirror/theme/`）。
+	//
+	// 背景（用户 2026-09-22）：编辑器配色曾经是自研的 —— 手写 `.cm-s-zp-panel`
+	// 的 token 颜色，又用 `.zpf-monokai` 覆盖面板 CSS 变量，把弹窗里的按钮/输入框
+	// 一起染色。现在 files.js 里只许出现 `CM_THEME_*` 常量指向的官方主题名；
+	// 谁把自研主题加回来（或写错主题名导致 CSS 404 → 编辑器变成无高亮的白底），
+	// 这里就会红。
 	js := readAssetJS(t, "files.js")
+	for _, bad := range []string{"zpf-monokai", "cm-s-zp-panel", "applyEditorThemeTo"} {
+		if strings.Contains(js, bad) {
+			t.Errorf("files.js 里又出现了自研编辑器主题的 %q —— 语法着色必须用官方主题 CSS（见 vendor/codemirror/README.md）", bad)
+		}
+	}
+	themeRe := regexp.MustCompile(`const CM_THEME_[A-Z]+ = '([a-z0-9-]+)'`)
+	themes := themeRe.FindAllStringSubmatch(js, -1)
+	if len(themes) < 3 {
+		t.Fatalf("files.js 里只解析出 %d 个 CM_THEME_* 主题常量，测试判据可能已过期（改了写法要同步这里）", len(themes))
+	}
+	for _, m := range themes {
+		p := filepath.Join(base, "theme", m[1]+".min.css")
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("CM_THEME_* 指向官方主题 %s，但 %s 不存在 —— CodeMirror 不会报错，只会变成无高亮的白底", m[1], p)
+		}
+	}
+
+	// CM_LANGS 的每条 deps 都必须有对应的 mode 文件
 	re := regexp.MustCompile(`deps: \[([^\]]*)\]`)
 	matches := re.FindAllStringSubmatch(js, -1)
 	if len(matches) < 10 {

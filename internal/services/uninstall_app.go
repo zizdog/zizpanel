@@ -796,6 +796,18 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"imgcompress": func(m *Manager, ctx context.Context, app App, _, _ bool, r *InstallResult) error {
 		return m.UninstallImageCompressor(ctx, app, r)
 	},
+	// macOS 语音合成（say）：装的是"面板托管的网页界面服务"，引擎是系统自带的
+	// /usr/bin/say。卸载只摘服务与面板记录，**不动系统**（say 是 macOS 的一部分，
+	// 面板不会也不能删它）。
+	"macspeech": func(m *Manager, ctx context.Context, app App, _, _ bool, r *InstallResult) error {
+		return m.UninstallMacSpeech(ctx, app, r)
+	},
+	// 语音转文字（whisper.cpp）：停服务 + 撤 plist + 按用户选择删模型 + brew uninstall 引擎。
+	// removeData 直接决定"那几百 MB ~ 1.5 GB 的模型权重留不留"，确认框会先把
+	// 每个文件的路径与体积列出来（见 installerPlan 的 "stt" 分支）。
+	"stt": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
+		return m.UninstallSTT(ctx, app, removeData, false, r)
+	},
 }
 
 // HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
@@ -1293,15 +1305,60 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		}
 		p.KeepNote = "需要时可随时从应用市场重新安装；面板安装脚本与 LNMP / Qwen TTS 部署也会自动补装"
 	case "imgcompress":
-		// 能力型应用：没有服务、没有守护进程，卸载就是摘掉引擎。
-		// 步骤里必须写清"面板的图片压缩会因此不可用"，以及"你的图片不会被删"。
+		// 图片压缩现在有**两个**组成部分：面板托管的网页界面服务（launchd）
+		// 与 brew 的 vips 引擎。卸载必须两个都摘掉 —— 只停服务会把 vips 留在
+		// 机器上（卡片永远"已安装"），只 uninstall 包会把服务留成一个
+		// KeepAlive 复活、却找不到引擎的僵尸（端口占着、界面一直红）。
 		p.Steps = []string{
+			"停止并删除 launchd 服务 " + ImgCompressLabel + "（网页界面）",
 			"brew uninstall " + ImgCompressFormula + "（图片压缩引擎）",
-			"⚠️ 卸载后「文件管理 → 🖼️ 图片压缩」会显示引擎不可用，直到重新安装",
-			"你的图片文件**不会被删除或修改**（压缩只在你点「开始压缩」时读写你选中的那些文件）",
+			"⚠️ 卸载后网页界面与「文件管理 → 🖼️ 图片压缩」都会不可用，直到重新安装",
+			"你的图片文件**不会被删除或修改**（压缩只在你点「开始压缩」时读写你上传/选中的那些文件）",
 		}
-		p.KeepNote = "面板不保存任何图片副本，所以没有「要清理的数据目录」；" +
-			"需要时随时可以从应用市场重新安装（原生 arm64 包，装完即用）"
+		p.KeepNote = "面板不保存任何图片副本（上传的临时文件在任务结束一段时间后自动清理），" +
+			"所以没有「要清理的数据目录」；需要时随时可以从应用市场重新安装（原生 arm64 包，装完即用）"
+	case "macspeech":
+		// 语音合成只有一个组成部分：面板托管的网页界面服务（launchd）。
+		// 引擎 /usr/bin/say 与 /usr/bin/afconvert 是 macOS 的一部分 ——
+		// 卸载**不会也不能**动它们（这条必须写在确认框里，否则用户会以为
+		// "卸载语音合成"删掉了系统的语音能力）。
+		p.Steps = []string{
+			"停止并删除 launchd 服务 " + MacSpeechLabel + "（语音合成网页界面）",
+			"从「服务管理」移除记录",
+			"⚠️ 卸载后网页界面与面板别名 /speech/ 都会不可用，直到重新安装",
+			"系统自带的 /usr/bin/say 与你系统里安装的音色**不会被删除或修改**（那是 macOS 的一部分）",
+		}
+		p.KeepNote = "面板不保存任何合成音频（临时文件在任务结束后自动清理），所以没有数据目录要清理；" +
+			"重新安装是幂等的、**不需要下载任何东西**（这个应用本来就没有下载点）"
+	case "stt":
+		// 语音转文字有两个组成部分：面板托管的网页界面服务（launchd）与
+		// brew 的 whisper.cpp 引擎，外加**模型权重**（几百 MB ~ 1.5 GB，可复用）。
+		// 卸载必须三件事都说清：
+		//   ① 服务与 plist 总是摘掉（否则留下一个 KeepAlive 复活却找不到引擎的僵尸）；
+		//   ② 模型默认**保留**（它们只是下载产物，重装不用重下），
+		//      只有用户勾选「同时删除数据」才删 —— 所以路径逐条列进 DataPaths，
+		//      并把各自的体积写进 Steps（用户按下去之前就知道会释放多少）；
+		//   ③ brew 包总是卸（那就是这个应用的引擎本体）。
+		p.Steps = []string{
+			"停止并删除 launchd 服务 " + STTLabel + "（语音转文字网页界面）",
+			"从「服务管理」移除记录",
+			"brew uninstall " + STTBrewFormula + "（引擎 whisper-cli / whisper-server）",
+			"⚠️ 卸载后网页界面与面板别名 /" + STTSlug + "/ 都会不可用，直到重新安装",
+		}
+		models := m.InstalledSTTModels()
+		if len(models) > 0 {
+			for _, f := range models {
+				p.DataPaths = append(p.DataPaths, f.Path)
+				p.Steps = append(p.Steps, "可选清理的模型权重："+f.Path+
+					"（档位 "+f.ID+"，"+humanBytes(f.Bytes)+"）—— 勾选「同时删除数据」才会删")
+			}
+			p.KeepNote = "默认**保留**模型权重（共 " + humanBytes(m.STTModelBytes()) +
+				"）：它们只是下载产物，重新安装时不用重新下载；" +
+				"要释放磁盘请在确认框里勾选「同时删除数据」，或手工删除 " + m.sttPaths().ModelsDir
+		} else {
+			p.KeepNote = "磁盘上没有模型权重文件，没有要清理的数据；" +
+				"重新安装会重新下载默认档模型（约 466 MiB）"
+		}
 	case "miniflux":
 		// 铁律：卸载应用**不删数据**。Miniflux 库里是订阅源与已读状态，
 		// 删掉不可恢复，所以 PostgreSQL 与库一律保留，并在确认框里写清楚。

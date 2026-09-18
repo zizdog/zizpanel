@@ -307,7 +307,7 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 				// 但必须如实说，并给出下一步。
 				log(tasks.LevelErr, "全局 client_max_body_size 写入 nginx.conf 失败："+werr.Error())
 				log(tasks.LevelWarn, "（站点 vhost 与默认站点的值已生效；要在 nginx.conf 里也写全局值，"+
-					"可到「网站管理 → ⚙️ Nginx 管理 → 性能调整」改 client_max_body_size）")
+					"可到「网站管理 → ⚙️ 调整配置 → nginx → 性能调整」改 client_max_body_size）")
 			} else {
 				log(tasks.LevelOK, "已写入全局值：nginx.conf 的 http 块 client_max_body_size "+
 					strconv.Itoa(mbInt)+"m（其余 nginx 参数未动）")
@@ -380,9 +380,9 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 		log(tasks.LevelWarn, "默认站点 / phpMyAdmin 入口未能应用："+derr.Error())
 		if reason := s.vhostNotLoadedReason(ctx); reason != "" {
 			log(tasks.LevelErr, "根因： "+reason)
-			log(tasks.LevelWarn, "修复：到「网站管理 → ⚙️ Nginx 管理 → 配置修改」确认 nginx.conf 的 "+
+			log(tasks.LevelWarn, "修复：到「网站管理 → ⚙️ 调整配置 → nginx → 配置修改」确认 nginx.conf 的 "+
 				"http 块里有 include "+filepath.Join(s.Cfg.VhostDir, "*.conf")+"；"+
-				"或在「网站管理 → ⋯ 更多」里点「🧪 校验 nginx」查看校验结果")
+				"或在「网站管理 → nginx 运行 → 🧪 校验 nginx」里查看校验结果")
 		}
 		log(tasks.LevelWarn, "注意：nginx 请求体上限与 PHP 上传/执行上限**已经写入并生效**"+
 			"（见下面的回读行）——这一条失败只影响 80 端口的默认站点/phpMyAdmin 入口")

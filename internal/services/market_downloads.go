@@ -217,6 +217,15 @@ type MarketApp struct {
 	Runtime MarketRuntime
 	// Downloads 是全部网络下载点，**按执行顺序**。
 	Downloads []MarketDownloadPoint
+	// NoDownloadReason 是"这个应用安装时**真的不需要任何网络下载**"的理由。
+	//
+	// 为什么要有这个字段（2026-09-25 加「macOS 语音合成（say）」时发现的门禁缺口）：
+	// 原来的门禁把 `len(Downloads)==0` 一律判成缺陷，而目录里第一次出现了
+	// 真正零下载的原生应用 —— 引擎 /usr/bin/say 与 /usr/bin/afconvert 都是
+	// macOS 自带的，网页界面是面板自己的二进制。这时"编一个假的 brew 瓶下载点
+	// 去骗过门禁"才是真正的谎报；正确做法是**把这个事实声明出来**，
+	// 由门禁要求它写清理由（≥marketInvariantMinReason 字，与 NAS 理由同一条规矩）。
+	NoDownloadReason string
 	// Note 是补充说明（没有下载点的条目也要说清为什么）。
 	Note string
 }
@@ -610,23 +619,160 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
-	// 图片压缩（libvips）：用户 2026-09-18 要求上架。
+	// 图片压缩（libvips）：用户 2026-09-18 要求上架；2026-09-23 要求"加一个
+	// webui 通过端口和别名调用"。
 	//
-	// 下载点只有 Homebrew 瓶（`brew install vips`）：原生 arm64 包，装完就是
-	// /opt/homebrew/bin/vips 一个命令行；面板自己的「文件管理 → 🖼️ 图片压缩」
-	// 直接调它（为什么不用 govips/CGO：见 internal/imgopt 与 catalog.go 里的取舍）。
-	// 运行期没有任何常驻进程、没有端口、没有网页界面。
+	// 两个下载点：
+	//   · 引擎 = Homebrew 瓶（`brew install vips`，原生 arm64）；
+	//   · 网页界面 = 面板自己的二进制（`zizpanel imgcompress-serve`，随面板升级，
+	//     没有独立下载点），由安装器注册成系统级 launchd com.zizdog.imgcompress。
+	// 为什么不用 govips/CGO：见 internal/imgopt 与 catalog.go 里的取舍。
 	{
 		ID: "imgcompress", Kind: KindNative, BrewFormula: "vips", PanelInstaller: "imgcompress",
-		NoDaemon: true,
+		ServiceLabel: ImgCompressLabel,
 		Runtime: MarketRuntime{
-			Mode:        MarketRuntimeNone,
-			LabelSource: "目录 NoDaemon=true（命令行引擎，没有常驻进程；界面是面板自己的页面）",
+			Mode:  MarketRuntimeLaunchd,
+			Label: ImgCompressLabel,
+			LabelSource: "目录 ServiceLabel=com.zizdog.imgcompress" +
+				"（面板安装器写的系统级 plist，运行 `zizpanel imgcompress-serve`；" +
+				"引擎 vips 本身没有 brew service）",
 		},
 		Downloads: []MarketDownloadPoint{
 			brewBottlePoint("vips", 30*time.Minute,
-				"brew install vips（libvips 8.18.x，arm64 瓶；装完复核 `vips --version` 真的能跑）"),
+				"brew install vips（libvips 8.18.x，arm64 瓶；装完复核 `vips --version` 真的能跑；"+
+					"网页界面由面板自身提供，不需要额外下载）"),
 		},
+	},
+
+	// macOS 语音合成（say）：用户 2026-09-25 要求评估 macos-speech-server 并加进市场。
+	//
+	// 这是目录里**第一个真正零下载**的条目，所以它没有 Downloads，只有一份
+	// NoDownloadReason 说明为什么：引擎 /usr/bin/say 与 /usr/bin/afconvert 都是
+	// macOS 自带的（安装流程里唯一的网络动作是零个）。第 2 层静态门禁原来
+	// 把"下载点为空"一律当缺陷 —— 那是门禁自己的缺口，已改成
+	// "零下载点必须写清理由（≥20 字）"，见 MarketDeclarationProblems。
+	{
+		ID: MacSpeechAppID, Kind: KindNative, PanelInstaller: "macspeech",
+		ServiceLabel: MacSpeechLabel,
+		Runtime: MarketRuntime{
+			Mode:  MarketRuntimeLaunchd,
+			Label: MacSpeechLabel,
+			LabelSource: "目录 ServiceLabel=com.zizdog.macosspeech" +
+				"（面板安装器写的系统级 plist，运行 `zizpanel speech-serve`；" +
+				"引擎 say 是系统自带的，没有 brew service 也没有任何包）",
+		},
+		NoDownloadReason: "安装**不需要任何一个网络下载点**：合成引擎是 macOS 自带的 " +
+			"/usr/bin/say（Mach-O universal，含 arm64e），格式转换用同样自带的 " +
+			"/usr/bin/afconvert，网页界面是面板自己的二进制（`zizpanel speech-serve`，" +
+			"随面板升级）。实测安装耗时是秒级：唯一的网络动作是零个 —— " +
+			"所以既没有 brew 瓶、没有 release 产物、没有模型权重，也没有 pip/npm 包，" +
+			"更不需要 Docker（也就谈不上 arm64 镜像或 Rosetta 的问题）。" +
+			"离线环境下安装与使用都成立；这也正是它相对 Qwen3 TTS（要下 2.9GB 权重）" +
+			"与第三方 macos-speech-server（首启要下 ~700MB 模型）的取舍点。",
+	},
+
+	// 语音转文字（whisper.cpp）：用户 2026-09-25 要求上架
+	// （"不要 docker，不要 gui 软件；有 webui 或 api"）。
+	//
+	// 下载点共四个：引擎的 brew 瓶 + 三个模型档位（默认档必下，另两档按需）。
+	// 模型不是 brew 的 caveat 会替你下的东西 —— brew info 明确写着
+	// "whisper.cpp requires GGML model files to work. These are not downloaded
+	// by default."，所以面板必须自己接管，否则装完就是个不能用的应用。
+	// 每条模型点的 sha256 上游 HF 仓库**没有公布**，所以面板的校验判据是
+	// "精确字节数 + ggml 魔数"（两个数字都是本轮实测的），如实写在下面对应的
+	// Checksum.Note 里 —— 不编造一个 sha256 去骗过门禁。
+	{
+		ID: STTAppID, Kind: KindNative, BrewFormula: STTBrewFormula, PanelInstaller: "stt",
+		ServiceLabel: STTLabel,
+		Runtime: MarketRuntime{
+			Mode:  MarketRuntimeLaunchd,
+			Label: STTLabel,
+			LabelSource: "目录 ServiceLabel=com.zizdog.stt（面板安装器写的系统级 plist，" +
+				"运行 `zizpanel stt-serve`；引擎 whisper-cli 本身没有 brew service）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint(STTBrewFormula, 30*time.Minute,
+				"brew install whisper.cpp（引擎：whisper-cli 转写 / whisper-server 官方服务端；"+
+					"依赖 ggml + llama.cpp + sdl2-compat）"),
+			{
+				Purpose: MarketFetchModelFile,
+				Label:   "whisper 模型 small（默认档，487,601,967 B）",
+				Upstream: MarketUpstream{
+					ID:   "ggerganov/whisper.cpp/ggml-small.bin",
+					URL:  "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+					Size: 487601967,
+					Note: "**本轮实测**：对 hf-mirror 发 Range 请求读 Content-Range 得到 " +
+						"bytes 0-0/487601967；8 MiB 分片实测 783,547 B/s（约 10 分钟下完整档）。" +
+						"官方 huggingface.co 国内直连不可达（实测 curl 退出码 28 超时），" +
+						"所以面板的候选顺序是 自建镜像静态目录 → 自建镜像 /hf 代理 → hf-mirror.com → huggingface.co。",
+				},
+				// 实测：NAS 的 <base>/models/whisper/ggml-small.bin 是 **404**（还没落成静态文件），
+				// 但 <base>/hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin 是 200。
+				// 面板两条都探，静态缺件时自动回落到 /hf 这条（"优先+回落"是既定语义）。
+				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
+				Timeout:  STTModelDownloadTimeout,
+				Required: true,
+				Checksum: MarketChecksum{
+					Note: "上游 HF 仓库没有公布 sha256 清单（同目录只有 .bin，没有 checksums 文件）；" +
+						"面板改按**精确字节数 + ggml 魔数**校验：实测 487,601,967 B、文件头 'lmgg'。 " +
+						"这能挡住错误页 / 登录页 / 被截断的下载（那三类都出过事故），" +
+						"但挡不住'长度相同且魔数正确的恶意替换'——如实声明，不假装有 sha256。",
+				},
+				ARM64: "ggml 权重是纯数据、与架构无关；引擎由 brew 的 arm64 瓶提供。" +
+					"本轮实测：M4 + Metal（`ggml_metal_device_init: GPU name: MTL0 (Apple M4)`）下 " +
+					"3.35 秒中文音频 1.7 秒出字；peak RSS 887,586,816 B。",
+				Note: "模型落盘在 <家目录>/stt/models/，面板以 root 下载后会把属主交还真实用户；" +
+					"下载走 <dst>.part + 校验通过才改名，失败**不留半份模型**。",
+			},
+			{
+				Purpose: MarketFetchModelFile,
+				Label:   "whisper 模型 large-v3-turbo-q5_0（按需，574,041,195 B）",
+				Upstream: MarketUpstream{
+					ID:   "ggerganov/whisper.cpp/ggml-large-v3-turbo-q5_0.bin",
+					URL:  "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+					Size: 574041195,
+					Note: "**本轮实测**：Range 读 Content-Range 得到 bytes 0-0/574041195。" +
+						"比 medium 更小也更准（large-v3 的 turbo 蒸馏解码器 + q5_0 量化），推荐给要精度的场景。",
+				},
+				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"),
+				Timeout:  STTModelDownloadTimeout,
+				Required: false,
+				OptionalImpact: "不下载不影响转写：small 档已经能转中文。只是界面上不能选 large-v3-turbo 这一档；" +
+					"用户在网页界面点「下载」即可补上（走同一个多来源回落的下载器）。",
+				Checksum: MarketChecksum{
+					Note: "上游无 sha256 清单；按精确字节数 574,041,195 B + ggml 魔数 'lmgg' 校验（本轮实测）。",
+				},
+				ARM64: "ggml 权重与架构无关；本轮在 M4 + Metal 上实测可用（3.35 秒中文音频 2.7 秒出字，" +
+					"peak RSS 881,295,360 B ≈ 840 MiB）。",
+				Note: "按需下载（网页界面上的档位按钮），不在安装流程里；" +
+					"安装只下默认档 small —— 避免用户为一个不一定用得上的档位先等十几分钟。",
+			},
+			{
+				Purpose: MarketFetchModelFile,
+				Label:   "whisper 模型 medium（按需，1,533,763,059 B）",
+				Upstream: MarketUpstream{
+					ID:   "ggerganov/whisper.cpp/ggml-medium.bin",
+					URL:  "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+					Size: 1533763059,
+					Note: "**本轮实测**：Range 读 Content-Range 得到 bytes 0-0/1533763059。" +
+						"上游 README 标内存 2.1 GB（本轮**未实测** —— 没为基准测试下载这一档）。" +
+						"按 783 KB/s 估算整档约 32 分钟。",
+				},
+				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
+				Timeout:  STTModelDownloadTimeout,
+				Required: false,
+				OptionalImpact: "不下载不影响转写（small 已可用）；只是不能选 medium 这一档。" +
+					"medium 精度最高但慢一个量级，只有对精度有硬要求的用户才需要。",
+				Checksum: MarketChecksum{
+					Note: "上游无 sha256 清单；按精确字节数 1,533,763,059 B + ggml 魔数 'lmgg' 校验。" +
+						"这一档**本轮没有下载过**，字节数来自上游 Content-Range、魔数来自同仓库另两档的实测形态。",
+				},
+				ARM64: "ggml 权重与架构无关；引擎由 brew 的 arm64 瓶提供。**本档未在本机实测**。",
+				Note:  "按需下载，不在安装流程里。",
+			},
+		},
+		Note: "面板二进制自己当界面（`zizpanel stt-serve`，内嵌前端、随面板升级），" +
+			"所以没有第五个下载点。转码用 ffmpeg（应用市场里的基础依赖条目，见 Requires）。",
 	},
 
 	// ---------------- Python 解释器（基础环境，用户 2026-09-18 要求上架 3 个版本） ----------------
@@ -1495,8 +1641,18 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 	}
 
 	// ---- 每个下载点的不变量 ----
-	if len(m.Downloads) == 0 {
-		add("%s: 一个下载点都没有声明。真有「安装不需要任何下载」的条目，请在 Note 里写清为什么", m.ID)
+	// 零下载点是**允许**的，但必须显式声明理由（2026-09-25：「macOS 语音合成（say）」
+	// 是目录里第一个真正零下载的条目 —— 引擎与转换工具都是 macOS 自带的）。
+	// 为什么不是"留空默认通过"：那样下一个会话就分不清"确实不需要下载"与
+	// "漏填了下载点"，而后者会变成装到一半才发现缺东西。所以要求写清理由，
+	// 长度与 NAS 理由同一条规矩。
+	if len(m.Downloads) == 0 && len([]rune(strings.TrimSpace(m.NoDownloadReason))) < marketInvariantMinReason {
+		add("%s: 一个下载点都没有声明，也没有写 NoDownloadReason 说清「安装确实不需要任何下载」。"+
+			"真有这种条目（例如引擎是系统自带的），请填 NoDownloadReason（≥%d 字）；"+
+			"否则就是漏填了下载点", m.ID, marketInvariantMinReason)
+	}
+	if len(m.Downloads) > 0 && strings.TrimSpace(m.NoDownloadReason) != "" {
+		add("%s: 有下载点却还写了 NoDownloadReason（声明自相矛盾）", m.ID)
 	}
 	for i, d := range m.Downloads {
 		where := fmt.Sprintf("%s[%d] %q", m.ID, i, d.Label)

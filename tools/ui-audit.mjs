@@ -32,6 +32,7 @@ mkdirSync(outDir, { recursive: true });
 // 页面清单：改导航时要一起维护，否则审计会静默漏掉整页
 const ROUTES = [
   ['dashboard', '仪表盘'],
+  ['nav', '导航页'],
   ['files', '文件管理'],
   ['sites', '网站管理'],
   ['apps', '应用'],
@@ -42,11 +43,20 @@ const ROUTES = [
   ['settings', '面板设置'],
 ];
 
-// 需要检查"同一个配置项有没有两个入口"的弹窗：(入口按钮文案, 给人看的名字, 路由)
+// 需要检查"同一个配置项有没有两个入口"的弹窗：
+//   (路由, 给人看的名字, 入口按钮文案, 要依次点开的页签)
+//
+// 2026-09-22 起「Nginx 管理」/「上传大小 / 执行时间」/「配置文件」已合并成一个
+// 「⚙️ 调整配置」弹窗（用户要求），所以这里改成同一个入口 + 三个页签：
+// 重复设置项的判据（同一个字段出现在两个页签里）仍然成立，只是入口变成同一个。
+// 页签是两级：先点外层分组（nginx / 上传与执行上限 / 配置文件 / PHP 环境），
+// nginx 分组下再点内层页签。
 const MODALS = [
-  ['sites', 'Nginx 管理 · 性能调整', '⚙️ Nginx 管理', '性能调整'],
-  ['sites', '上传大小 / 执行时间', '⚡ 上传大小 / 执行时间'],
-  ['sites', '配置文件', '⚙️ 配置文件'],
+  ['sites', '调整配置 · nginx 性能调整', '⚙️ 调整配置', ['nginx', '性能调整']],
+  ['sites', '调整配置 · nginx 服务', '⚙️ 调整配置', ['nginx', '服务']],
+  ['sites', '调整配置 · 上传与执行上限', '⚙️ 调整配置', ['上传与执行上限']],
+  ['sites', '调整配置 · 配置文件', '⚙️ 调整配置', ['配置文件']],
+  ['sites', '调整配置 · PHP 环境', '⚙️ 调整配置', ['PHP 环境']],
   ['sites', '默认站点', '🏠 默认站点'],
 ];
 
@@ -170,9 +180,15 @@ async function auditModals() {
     await btn.click();
     await page.waitForTimeout(1200);
     if (tabText) {
-      // 弹窗里带页签的（Nginx 管理）：必须切到有表单的那一页，否则一个字段都收不到
-      const tab = page.locator('.modal button').filter({ hasText: tabText }).first();
-      if (await tab.count()) { await tab.click(); await page.waitForTimeout(800); }
+      // 调整配置是两级分页：按顺序点开（先分组再内层页签）。
+      // 只用页签自己的 class 定位 —— 'nginx' 之类的文字也可能出现在正文按钮上。
+      for (const t of (Array.isArray(tabText) ? tabText : [tabText])) {
+        const tab = page.locator('.modal button.zp-seg-btn, .modal button.zp-subtab-btn')
+          .filter({ hasText: t }).first();
+        if (!(await tab.count())) { soft.push(`· 弹窗「${name}」里找不到页签「${t}」`); break; }
+        await tab.click();
+        await page.waitForTimeout(900);
+      }
     }
     const open = await page.locator('.modal-mask').count();
     if (!open) { soft.push(`· 点「${btnText}」没有打开弹窗`); continue; }

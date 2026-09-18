@@ -252,6 +252,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/proxies/test", s.requireAuth(s.handleProxyTest))
 	root.HandleFunc("POST /api/v1/proxies/{id}", s.requireAuth(s.handleProxyUpdate))
 	root.HandleFunc("POST /api/v1/proxies/{id}/toggle", s.requireAuth(s.handleProxyToggle))
+	// 大请求体探测：只在用户点按钮时调用（真的发 64KB），绝不进列表渲染路径。
+	root.HandleFunc("POST /api/v1/proxies/{id}/probe-body", s.requireAuth(s.handleProxyBodyProbe))
 	// 反向代理的 HTTPS：与站点侧 /sites/{domain}/ssl 对称。
 	// acme 来源直接引用 <DataDir>/certs/<primary>/（续期同路径覆盖），
 	// self/mkcert/manual 落到 <DataDir>/proxy-certs/<规则>/。
@@ -326,6 +328,14 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/cron/{id}/run", s.requireAuth(s.handleCronRun))
 	root.HandleFunc("GET /api/v1/cron/{id}/log", s.requireAuth(s.handleCronLog))
 	root.HandleFunc("GET /api/v1/backups", s.requireAuth(s.handleBackupList))
+	root.HandleFunc("POST /api/v1/backups", s.requireAuth(s.handleBackupCreate))
+	// 注意：/backups/upload 与 /backups/restore 是字面量，比 /backups/{name} 更具体，
+	// Go 1.22 的 ServeMux 会优先匹配它们（方法不同也不会冲突）。
+	root.HandleFunc("POST /api/v1/backups/upload", s.requireAuth(s.handleBackupUpload))
+	root.HandleFunc("POST /api/v1/backups/restore", s.requireAuth(s.handleBackupRestore))
+	root.HandleFunc("GET /api/v1/backups/{name}", s.requireAuth(s.handleBackupInfo))
+	root.HandleFunc("DELETE /api/v1/backups/{name}", s.requireAuth(s.handleBackupDelete))
+	root.HandleFunc("GET /api/v1/backups/{name}/download", s.requireAuth(s.handleBackupDownload))
 
 	// ---------- 文件管理器 ----------
 	root.HandleFunc("GET /api/v1/files", s.requireAuth(s.handleFileList))
@@ -504,6 +514,25 @@ func (s *Server) routes() http.Handler {
 	// 用户报 500 时用它一眼看出卡在哪（413 与 500 是两件事，见 handler 注释）。
 	root.HandleFunc("GET /api/v1/settings/upload-doctor", s.requireAuth(s.handleUploadDoctor))
 
+	// ---------- 导航页（sun-panel 风格图标网格首页，见 api_nav.go）----------
+	//
+	// 面板内页面 `#/nav` 用这组接口，全部 requireAuth；写操作都进审计。
+	// 独立的匿名别名页（GET /nav/）注册在下面的外层 mux，不在这里 ——
+	// 它必须在不带安全后缀时也能打开，而这里的所有路径都在后缀闸门之后。
+	root.HandleFunc("GET /api/v1/nav/tree", s.requireAuth(s.handleNavTree))
+	root.HandleFunc("GET /api/v1/nav/groups", s.requireAuth(s.handleNavGroupsList))
+	root.HandleFunc("POST /api/v1/nav/groups", s.requireAuth(s.handleNavGroupCreate))
+	root.HandleFunc("POST /api/v1/nav/groups/reorder", s.requireAuth(s.handleNavGroupReorder))
+	root.HandleFunc("PUT /api/v1/nav/groups/{id}", s.requireAuth(s.handleNavGroupUpdate))
+	root.HandleFunc("DELETE /api/v1/nav/groups/{id}", s.requireAuth(s.handleNavGroupDelete))
+	root.HandleFunc("GET /api/v1/nav/items", s.requireAuth(s.handleNavItemsList))
+	root.HandleFunc("POST /api/v1/nav/items", s.requireAuth(s.handleNavItemCreate))
+	root.HandleFunc("POST /api/v1/nav/items/reorder", s.requireAuth(s.handleNavItemReorder))
+	root.HandleFunc("PUT /api/v1/nav/items/{id}", s.requireAuth(s.handleNavItemUpdate))
+	root.HandleFunc("DELETE /api/v1/nav/items/{id}", s.requireAuth(s.handleNavItemDelete))
+	root.HandleFunc("GET /api/v1/nav/export", s.requireAuth(s.handleNavExport))
+	root.HandleFunc("POST /api/v1/nav/import", s.requireAuth(s.handleNavImport))
+
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会
 	// 返回面板自己的 index.html（**状态码还是 200**），
@@ -518,6 +547,9 @@ func (s *Server) routes() http.Handler {
 	// 应用入口全变成 404（真机验证时抓到）。
 	outer := http.NewServeMux()
 	s.registerAppProxy(outer)
+	// 面板自带的「导航页」匿名别名入口（GET /nav/，见 api_nav.go）。
+	// 与应用界面代理同层：都必须在安全后缀之外，用户才能直接当浏览器首页用。
+	s.registerNavPage(outer)
 	outer.Handle("/", s.panelGate(root))
 
 	return s.accessControl(outer)
