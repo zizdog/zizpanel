@@ -641,6 +641,20 @@ function raceDeadline(p, ms, label) {
 
 // statusLine 把服务状态翻译成"一眼能看懂"的一行。
 //
+// ⚠️ 一条铁律（2026-09-21 用户发火点名的）：**只有真的有服务记录/launchd 作业
+// 而且它报 stopped 时，才允许写「已停止」。** 没有任何守护进程的应用
+// （ffmpeg / python@x.y / phpMyAdmin 这类 no_daemon）与"装了但面板里没有记录"
+// 的应用都**不是**"已停止" —— 它们本来就没有可停止的进程，写「已停止」是假信息。
+// 用户原话："以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、FFmpeg、
+// Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
+// （本机 nginx 事实在 :80 上跑着，只是面板里没有它的记录。）
+//
+// 判据顺序（按"用户能观察到的事实"排）：
+//   ① 有服务记录 → 运行中 / 异常 / 环境不可用 / 未安装 / 未知 / **已停止**；
+//   ② no_daemon  → 网页入口 / 命令行工具（本来就没有常驻进程）；
+//   ③ 其余（装了但面板里没有记录）→ **已安装（面板里暂无记录）** +
+//      端口是否监听（有健康检查结论就照实说；没有就明写"未检测"，绝不猜）。
+//
 // 2026-09-16 修 bug（用户反馈 "ffmpeg 显示读取中…未在服务管理里"、而且**卡在**
 // 读取中上）：以前 st 为空就一律返回「读取中…」。但 render() 只在数据**已经查完**
 // 之后才被调用（见文件末尾的 `render(await resolvePanelData(...))`），所以 st
@@ -648,33 +662,37 @@ function raceDeadline(p, ms, label) {
 // 没有守护进程的应用（ffmpeg / phpMyAdmin 这类 no_daemon）就永远停在一句
 // 不落定的话上，看上去像界面卡死。
 //
-// 现在按**目录数据**给终态，不再有"读取中"这种中间态从 render 里冒出来：
-//   · no_daemon 且面板托管界面 → 网页入口（本来就没有常驻进程）
-//   · no_daemon 且没有界面     → 命令行工具（本来就没有常驻进程）
-//   · 其余（装了但面板里没有记录）→ 面板里暂无记录
-//
-// 2026-09-21 用户："弱化管纳这个概念" —— 原来这里写的是「未纳管」，那是个内部词，
-// 用户既不知道也不需要知道"纳管"是什么。改成"面板里暂无记录"：说的是一件
-// 用户能观察到的**事实**（面板里查不到这条服务的记录），并如实说明后果
-// （拿不到配置文件路径与日志），不再要求用户理解后台机制。
+// 2026-09-21 用户："弱化管纳这个概念" —— 原来这里写的是「未纳管」，那是个内部词。
+// 改成"面板里暂无记录"：说的是一件用户能观察到的**事实**。
 //
 // 2026-09-17 导出：合并后的「我的应用」每一行的状态 pill 也走这一份措辞 ——
 // 服务行、市场卡片、管理面板三处的状态文案必须同一套（用户要求"复用现有
 // statusLine 那套措辞"），所以它不再是本文件的私有函数。
-export function statusLine(st, m) {
+// @param {object} [s] 服务记录（可选）：只为转述它上面**真实做过**的健康检查结论。
+export function statusLine(st, m, s = null) {
   if (st) {
     if (st.running) return { cls: 'ok', text: '运行中', title: st.detail || '' };
     if (st.status === 'error') return { cls: 'danger', text: '异常', title: st.detail || '' };
     if (st.status === 'unavailable') return { cls: 'warn', text: '环境不可用', title: st.detail || '' };
     if (st.status === 'not-installed') return { cls: 'warn', text: '未安装', title: st.detail || '' };
     if (st.status === 'unknown') return { cls: '', text: '未知', title: st.detail || '' };
-    return { cls: '', text: '已停止', title: st.detail || '' };
+    // 走到这里 = 有记录、服务没在跑、也没有报错 → 这才是真的「已停止」。
+    // no_daemon 的应用**不该**有服务记录；万一有（历史遗留）也要按"没有常驻
+    // 进程"如实说，而不是说它"已停止"。
+    if (m && m.no_daemon) return noDaemonLine(m);
+    return { cls: '', text: '已停止', title: st.detail || '服务记录报的是停止状态，可以在这里启动它' };
   }
-  if (m && m.no_daemon) {
-    const webUI = hasPanelUI(m) || !!(m.ui && m.ui.self_conf);
-    return webUI
-      ? { cls: '', text: '网页入口（无常驻进程）', title: '这个应用没有守护进程，装完就是一个网页入口，「已安装」里不会有常驻服务记录' }
-      : { cls: '', text: '命令行工具（无常驻进程）', title: '这个应用是命令行工具：没有守护进程、也没有网页界面，供面板或其它应用在后台调用' };
+  if (m && m.no_daemon) return noDaemonLine(m);
+  if (m && isInstalledMarketItem(m)) {
+    // 装了、但面板里没有它的服务记录（例如本机 nginx 在 :80 上跑着，只是没登记）。
+    // **绝不能**写「已停止」—— 面板根本不知道它停没停。
+    return {
+      cls: '',
+      text: '已安装（面板里暂无记录）',
+      title: '这个应用装在机器上，但面板里还没有它的服务记录 —— 所以这里既不能说它在跑、'
+        + '也不能说它停了。要能看到状态、启停、改配置，用工具栏的「+ 注册服务」把它加进来。'
+        + portCheckNote(m, s),
+    };
   }
   return {
     cls: '',
@@ -682,6 +700,54 @@ export function statusLine(st, m) {
     title: '面板里还没有这条服务的记录，所以拿不到配置文件路径与日志。'
       + '可以在「已安装」工具栏用「+ 注册服务」把本机已有的服务加进来',
   };
+}
+
+// noDaemonLine 是"没有常驻进程"的应用的终态文案。
+//
+// no_daemon 只说明"没有常驻进程"，**不等于**"是网页入口"：phpMyAdmin（nginx
+// alias）是网页入口，而 ffmpeg 是命令行工具。以前一律写「网页入口」，ffmpeg
+// 就被标成"网页入口"（用户 2026-09-16 截图反馈）。所以按**有没有界面**分开说，
+// 并且一律不出现「已停止」（它们本来就没有可停止的东西）。
+function noDaemonLine(m) {
+  const webUI = hasPanelUI(m) || !!(m.ui && m.ui.self_conf);
+  return webUI
+    ? { cls: '', text: '已安装（网页入口，无常驻进程）',
+      title: '这个应用没有守护进程：装完就是一个网页入口，面板里不会有常驻服务记录，也就没有"运行/停止"这回事' }
+    : { cls: '', text: '已安装（命令行工具，无常驻进程）',
+      title: '这个应用是命令行工具：没有守护进程、也没有网页界面，供面板或其它应用在后台调用，没有"运行/停止"这回事' };
+}
+
+// isInstalledMarketItem 判断"这条市场条目确实装在机器上"（后端给了 installed 或纳管记录）。
+function isInstalledMarketItem(m) {
+  return !!(m && (m.installed || m.adopted));
+}
+
+// portCheckNote 是"这个端口到底通不通"的如实说明。
+//
+// 只在**后端真的做过检查**时才给结论（服务记录里的 health.checked）：
+//   · 通过 → 端口在监听（来自面板自己的健康检查，不是猜的）；
+//   · 没通过 → 端口没在监听（或检查地址不对），并给出那个地址；
+//   · 没查过 → 明写"未检测"，绝不把"不知道"说成"在跑"或"停了"。
+//
+// 为什么用健康检查结论而不是自己探测：前端在浏览器里发请求会撞混合内容/跨域，
+// 拿到的失败不能证明端口没在听 —— 那种"看起来不对"的结论必须先怀疑探测方式
+// （2026-09-13 的教训）。所以这里只转述后端已经查过的结论。
+//
+// 导出给 services.js 的卡片正文用（同一份措辞，不写第二遍）。
+//
+// @param {object} m 市场条目（给端口）
+// @param {object} [s] 服务记录（给**真实做过**的健康检查结论；没有记录时为 null）
+export function portCheckNote(m, s = null) {
+  const h = (s && s.health) || (m && m.health) || null;
+  const port = Number((m && (m.entry_port || m.port)) || (s && s.port) || 0);
+  if (h && h.checked) {
+    const at = h.url ? '（' + h.url + '）' : '';
+    if (h.ok) return '端口在监听' + at + '：面板刚检查过，能连上';
+    return '端口没在监听' + at + '：面板刚检查过，连不上' + (port ? '（端口 ' + port + '）' : '');
+  }
+  return port > 0
+    ? '端口 ' + port + ' 是否在监听：未检测（面板还没有这条应用的检查地址）'
+    : '没有可用端口，无从检测它是否在运行';
 }
 
 // openDirectActions 渲染「打开 / 直链」这一对入口 —— **唯一的一份实现**。
@@ -1036,7 +1102,7 @@ export async function openServicePanel(o = {}) {
     // ---- 状态 ----
     // 把市场条目也传进去：没有服务记录时要靠它区分"本来就没有守护进程"
     // （no_daemon，终态是"命令行工具/网页入口"）与"装了但还没纳管"。
-    const line = statusLine(st, mi);
+    const line = statusLine(st, mi, s);
     clear(statusBox);
     appendAll(statusBox,
       h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' } }, [
@@ -1314,8 +1380,16 @@ export function uninstallButton(s, onDone) {
 }
 
 // confirmUninstallPlan 弹出"这次卸载会做什么"的确认框。
-// 返回 Promise<{wipe:boolean}|null>：null = 取消/关掉（什么都没做），
-// 否则 wipe 表示用户有没有勾"同时删除数据/产物"。
+// 返回 Promise<{wipe:boolean, force:boolean}|null>：null = 取消/关掉（什么都没做），
+// 否则 wipe 表示用户有没有勾"同时删除数据/产物"，force 表示有没有选"强制卸载"。
+//
+// 关于 force（2026-09-21 用户真机）：卸载 python@3.13 时 brew 以
+// "because it is required by llvm and rust" 拒绝卸载，而面板以前只把这段英文
+// 原文贴回来 —— 用户既看不懂，也不知道还能怎么办。现在计划阶段就把依赖方列出来，
+// 这里给出**两个明确选项**：取消（默认什么都不做）与
+// 「强制卸载（brew uninstall --ignore-dependencies …，会破坏 llvm、rust）」。
+// force 只能在计划里 force_allowed=true 时出现；它**默认不勾选**，
+// 必须用户主动勾上（或点强制按钮）才会带出去。
 //
 // ⚠️ 这个函数是从一个真机事故里长出来的（2026-09-21 用户原话："frpc 点击卸载
 // 没有任何反应，没有进度，没有提示，什么都没有"）。根因不是后端：原来这两处
@@ -1332,15 +1406,34 @@ export function uninstallButton(s, onDone) {
 //
 // 现在只有这一份实现，并且用 done 闸门保证"谁先定稿谁算数"（与 ui.confirmBox
 // 同一套做法）。卸载确认只有一处，不会再出现第二份写错的拷贝。
-export function confirmUninstallPlan({ name, plan = {}, residual = false }) {
+export function confirmUninstallPlan({ name, plan = {}, residual = false, forceDefault = false }) {
   return new Promise((resolve) => {
     let done = false;
     // 勾选框放在**这一份**实现里，并由 finish 把结果带回调用方 ——
     // 调用方不再自己渲染第二个确认框（那正是原来出错的形态）。
     const remove = h('input', { type: 'checkbox' });
+    // 强制卸载：只在计划明确允许时出现（默认不勾）。
+    const forceAllowed = !residual && plan.force_allowed === true;
+    // forceDefault：用户是**从「强制卸载」那颗按钮进来的** → 预勾选，按钮文字也直接
+    // 显示成「强制卸载」。多这一道确认是刻意的：强制卸载会破坏别的包（例如 llvm/rust），
+    // 必须让用户在**看得见后果**的那一屏再点一次。
+    const forceBox = h('input', { type: 'checkbox', checked: forceAllowed && forceDefault });
+    const forceDeps = (plan.dependents || []).filter((d) => d.kind === 'brew').map((d) => d.name);
+    const forceList = forceDeps.length ? forceDeps.join('、') : '依赖它的包';
+    // data-confirm-uninstall 是自动化测试的稳定锚点（uitest 用它确认"真的弹了确认框、
+    // 且确认之后真的会发请求"）。没有它，测试只能靠文案猜，改一次文案就假失败。
+    const okBtn = h('button.btn.btn-danger', {
+      dataset: { confirmUninstall: '' },
+      text: residual ? '删除残留数据' : (forceAllowed && forceDefault ? '强制卸载' : '确认卸载'),
+    });
+    // 勾上/取消强制时按钮文字跟着变：用户按下去之前必须一眼看见自己在做什么。
+    forceBox.addEventListener('change', () => {
+      okBtn.textContent = residual ? '删除残留数据' : (forceBox.checked ? '强制卸载' : '确认卸载');
+    });
     const m = modal({
       title: (residual ? '删除残留数据 · ' : '卸载 ') + name,
-      body: h('div', [
+      wide: false,
+      body: h('div', { dataset: { confirmUninstall: '1' } }, [
         residual
           ? h('div', {
             style: { marginBottom: '8px' },
@@ -1350,6 +1443,19 @@ export function confirmUninstallPlan({ name, plan = {}, residual = false }) {
         residual ? null : h('ul', { style: { margin: '0 0 10px 18px', lineHeight: '1.7' } },
           (plan.steps || []).map((x) => h('li', { text: x }))),
         (!residual && plan.keep_note) ? h('div.hint', { text: '会保留：' + plan.keep_note }) : null,
+        // 强制卸载：按钮上/正文里**逐字**写清会破坏哪些包，以及真正执行的命令。
+        forceAllowed ? h('div', {
+          style: { marginTop: '10px', padding: '9px 11px', border: '1px solid var(--danger)',
+            background: 'var(--danger-soft)', borderRadius: '6px', lineHeight: '1.7' },
+        }, [
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', cursor: 'pointer' } },
+            [forceBox, h('span', { text: '强制卸载（忽略依赖）' })]),
+          h('div', { style: { marginTop: '4px', fontSize: '12.5px' },
+            text: '会破坏这些包：' + forceList + '（它们会缺依赖、可能无法运行）。'
+              + '执行的命令：brew uninstall --ignore-dependencies ' + (plan.formula || name) }),
+          plan.force_note ? h('div', { style: { marginTop: '4px', fontSize: '12px', color: 'var(--text-dim)' },
+            text: plan.force_note }) : null,
+        ]) : null,
         (!residual && (plan.data_paths || []).length)
           ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '10px' } },
             [remove, h('span', { text: '同时删除数据/产物（不可恢复）：' })])
@@ -1361,13 +1467,14 @@ export function confirmUninstallPlan({ name, plan = {}, residual = false }) {
       ]),
       footer: [
         h('button.btn', { text: '取消', onclick: () => finish(null) }),
-        h('button.btn.btn-danger', {
-          text: residual ? '删除残留数据' : '确认卸载',
-          onclick: () => finish({ wipe: residual ? true : !!remove.checked }),
-        }),
+        okBtn,
       ],
       onClose: () => finish(null),
     });
+    okBtn.addEventListener('click', () => finish({
+      wipe: residual ? true : !!remove.checked,
+      force: forceAllowed && !!forceBox.checked,
+    }));
     // finish 在 m 赋值之后才会被调用（按钮/关闭都发生在用户交互时），
     // 所以这里引用 m 是安全的；done 闸门保证 close() 触发的 onClose 不会
     // 覆盖用户真正点下的那个结果。
@@ -1387,7 +1494,11 @@ export function confirmUninstallPlan({ name, plan = {}, residual = false }) {
 //   · 站点正在用这个 PHP 版本      → 去「网站管理」切版本
 //   · 有应用/容器在用（TTS、容器） → 去「应用」卸载/停止
 //   · 面板自身的依赖               → 说明后果
-function dependentsModal({ name, plan, onDone }) {
+//   · **Homebrew 包依赖它**        → 额外给「强制卸载」这颗按钮（见 onForce）
+//
+// onForce 非空 = 这个计划允许强制卸载（brew --ignore-dependencies）。此时页脚是
+// 两个明确选项：取消（默认）/ 强制卸载；forceText 逐字写清会破坏哪些包。
+function dependentsModal({ name, plan, onDone, onForce = null, forceText = '' }) {
   const deps = plan.dependents || [];
   const KIND_LABEL = { site: '站点', container: '运行中的容器', app: '应用', panel: '面板自身', brew: 'Homebrew 包' };
   const rows = deps.map((d) => h('div', {
@@ -1410,6 +1521,13 @@ function dependentsModal({ name, plan, onDone }) {
         text: plan.blocked || '还有对象在使用它，需要先处理。',
       }),
       ...rows,
+      // 强制卸载的后果：**逐字**写在正文里（按钮文字也要一致），
+      // 让用户在按下去之前就知道会破坏哪些包。
+      (onForce && forceText) ? h('div', {
+        style: { marginTop: '4px', padding: '9px 11px', border: '1px solid var(--danger)',
+          background: 'var(--danger-soft)', borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+        text: forceText,
+      }) : null,
     ]),
     footer: (close) => [
       wantsSites ? h('button.btn.btn-sm', {
@@ -1420,7 +1538,15 @@ function dependentsModal({ name, plan, onDone }) {
         text: '去「应用」处理', title: '卸载或停止依赖它的应用/容器',
         onclick: () => { close(); if (typeof onDone === 'function') onDone(); location.hash = '#/services'; },
       }) : null,
-      h('button.btn.btn-primary', { text: '知道了', onclick: close }),
+      onForce
+        ? h('button.btn.btn-sm', { text: '取消', onclick: close })
+        : h('button.btn.btn-primary', { text: '知道了', onclick: close }),
+      onForce
+        ? h('button.btn.btn-sm.btn-danger', {
+          text: '强制卸载', title: forceText || '忽略依赖强行卸载（会破坏依赖它的包）',
+          onclick: () => { close(); onForce(); },
+        })
+        : null,
     ].filter(Boolean),
   });
   return handle;
@@ -1440,6 +1566,44 @@ export function marketUninstallButton(mi, onDone, svc = null) {
   // disabled：禁用的按钮点下去什么都不发生（原因还只在悬浮提示里），用户看到的
   // 就是"点了没反应"—— 这正是本 bug 的形态。保持可点，点了把原因说出来。
   const blocked = !!plan.blocked && !residual;
+  // 被 **Homebrew 依赖**拦下、且计划允许强制时（force_allowed），用户有第二条路：
+  // brew uninstall --ignore-dependencies。它只在用户明确选择时才走。
+  const canForce = blocked && plan.force_allowed === true;
+  const forceDeps = (plan.dependents || []).filter((d) => d.kind === 'brew').map((d) => d.name);
+  const forceText = plan.force_note
+    || ('强制卸载会破坏这些包：' + (forceDeps.join('、') || '依赖它的包')
+      + '（它们会缺依赖、可能无法运行）。命令：brew uninstall --ignore-dependencies '
+      + (plan.formula || mi.id));
+
+  // submit 把一次卸载交给任务中心；force 只在用户明确选择时才为 true。
+  const submit = async (wipe, force) => {
+    await taskCenter.start({
+      kind: 'uninstall', target: mi.id,
+      title: (residual ? '删除残留数据 ' : (force ? '强制卸载 ' : '卸载 ')) + mi.name,
+      start: () => api.marketUninstall(mi.id, wipe, force),
+      onDone: (task) => {
+        if (task && task.status && task.status !== 'succeeded') {
+          const err = task.error || task.status;
+          toast((residual ? '删除残留数据失败：' : '卸载失败：') + err, 'err', 12000);
+          // 卸载失败时给出下一步。只有确实存在服务记录时才提供 ——
+          // 没有记录就没有可删的东西。
+          if (svc && svc.name) {
+            const rt = runtimeDownOf(svc);
+            recordOnlyModal({
+              label: recordLabel, name: recordName, error: err,
+              runtimeDown: rt.down, reason: rt.reason, onDone,
+            });
+            return;
+          }
+        } else {
+          toast(residual ? '已删除「' + mi.name + '」的残留数据'
+            : '已卸载「' + mi.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'), 'ok', 9000);
+        }
+        if (typeof onDone === 'function') onDone();
+      },
+    });
+  };
+
   return h('button.btn.btn-sm.btn-danger', {
     text: residual ? '删除残留数据' : '卸载',
     // 刻意**不**设 disabled（也刻意不设 aria-disabled：那会让辅助技术与自动化
@@ -1451,9 +1615,25 @@ export function marketUninstallButton(mi, onDone, svc = null) {
       try {
         if (blocked) {
           // 有结构化依赖 → 弹说明对话框（逐条列出"谁在用它、该怎么办"）；
-          // 只有一句 Blocked 文案时才退回 toast。
-          if ((plan.dependents || []).length) {
-            dependentsModal({ name: mi.name, plan, onDone });
+          // 允许强制时（brew 依赖）同时给出「强制卸载 / 取消」两个明确选择。
+          if ((plan.dependents || []).length || canForce) {
+            dependentsModal({
+              name: mi.name, plan, onDone,
+              // 强制卸载**不直接提交**：先弹"将执行…+强制开关已勾选"的确认框，
+              // 用户在那屏上再点一次才真的发请求（极端破坏性动作要两道门）。
+              onForce: canForce
+                ? () => {
+                  void (async () => {
+                    const ans = await confirmUninstallPlan({
+                      name: mi.name, plan, residual: false, forceDefault: true,
+                    });
+                    if (!ans) return;
+                    await submit(ans.wipe, true);
+                  })();
+                }
+                : null,
+              forceText: canForce ? forceText : '',
+            });
             return;
           }
           toast('现在不能卸载「' + mi.name + '」：' + plan.blocked, 'warn', 14000);
@@ -1461,32 +1641,7 @@ export function marketUninstallButton(mi, onDone, svc = null) {
         }
         const answer = await confirmUninstallPlan({ name: mi.name, plan, residual });
         if (!answer) return; // 取消 / 直接关掉确认框：什么都不做（也不静默——本来就没提交）
-        const wipe = answer.wipe;
-        await taskCenter.start({
-          kind: 'uninstall', target: mi.id,
-          title: (residual ? '删除残留数据 ' : '卸载 ') + mi.name,
-          start: () => api.marketUninstall(mi.id, wipe),
-          onDone: (task) => {
-            if (task && task.status && task.status !== 'succeeded') {
-              const err = task.error || task.status;
-              toast((residual ? '删除残留数据失败：' : '卸载失败：') + err, 'err', 12000);
-              // 卸载失败时给出下一步。只有确实存在服务记录时才提供 ——
-              // 没有记录就没有可删的东西。
-              if (svc && svc.name) {
-                const rt = runtimeDownOf(svc);
-                recordOnlyModal({
-                  label: recordLabel, name: recordName, error: err,
-                  runtimeDown: rt.down, reason: rt.reason, onDone,
-                });
-                return;
-              }
-            } else {
-              toast(residual ? '已删除「' + mi.name + '」的残留数据'
-                : '已卸载「' + mi.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'), 'ok', 9000);
-            }
-            if (typeof onDone === 'function') onDone();
-          },
-        });
+        await submit(answer.wipe, answer.force);
       } catch (e) {
         // 同上：任何一步失败都要有一句带原因的话，绝不静默。
         toast((residual ? '删除残留数据' : '卸载') + '「' + mi.name + '」失败：' +

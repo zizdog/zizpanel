@@ -1059,11 +1059,14 @@ export function AppsView(content, ctx = {}) {
     if (!answer) return;
     // 残留清理的语义就是"删掉产物"，所以直接 remove_data=1，不再让用户勾选。
     const wipe = residual ? true : answer.wipe;
+    // force 只可能来自确认框里那个默认不勾的「强制卸载」勾选框
+    //（brew --ignore-dependencies，会破坏依赖它的包）。
+    const force = residual ? false : !!answer.force;
     taskCenter.start({
       kind: 'uninstall',
       target: a.id,
-      title: (residual ? '删除残留数据 ' : '卸载 ') + a.name,
-      start: () => api.marketUninstall(a.id, wipe),
+      title: (residual ? '删除残留数据 ' : (force ? '强制卸载 ' : '卸载 ')) + a.name,
+      start: () => api.marketUninstall(a.id, wipe, force),
       // 结果必须显式说出来：用户反馈过"卸载完没有任何提示，卡片还停在旧状态，
       // 看起来像什么都没发生"。任务中心的进度窗给过程，这里给结论。
       onDone: (m) => {

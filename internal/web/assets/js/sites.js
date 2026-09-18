@@ -953,22 +953,41 @@ export function SitesView(content, ctx = {}) {
   // 分工：这里只负责"说清会做什么 + 显著警告 + 走任务中心"；真的停服务、删服务
   // 定义、`brew uninstall` 由后端（DELETE /api/v1/market/{id}）执行，本文件不碰后端。
   //
-  // 三道门（缺一不可）：
+  // 四道门（缺一不可）：
   //   ① 确认框逐条列出本次动作（卸载不可逆）；
   //   ② 默认版本 / 正被站点使用的版本 → **显著警告**：卸载后这些站点会 502；
-  //   ③ 失败必须有可见反馈 —— taskCenter 提交失败会 toast，任务失败走 onDone 的
+  //   ③ **brew 依赖**：如果别的已安装包依赖这个 PHP（真机：python 8.4 被 llvm/rust
+  //      依赖时 brew 会拒绝卸载），先弹说明对话框，给「取消 / 强制卸载」两个明确选择，
+  //      正文逐字写清会破坏哪些包 —— 而不是让用户点了确认再吃一整段 brew 英文报错；
+  //   ④ 失败必须有可见反馈 —— taskCenter 提交失败会 toast，任务失败走 onDone 的
   //      toast；绝不出现"点了没反应"。
+  //
+  // 计划来自市场接口（GET /api/v1/market 的 uninstall 字段，由后端依赖引擎生成），
+  // 不在前端重算依赖 —— 依赖判定只有后端那一处实现。
   async function uninstallPHP(p, onDone) {
     const appId = phpAppID(p);
     const formula = p.service || ('php@' + p.version);
+    // 市场计划可能还没加载过（用户直接开 PHP 环境弹窗）：拉一次，拿不到就按"未检查"处理。
+    let plan = null;
+    try {
+      const mkt = await api.market();
+      plan = (((mkt && mkt.list) || []).find((x) => x.id === appId) || {}).uninstall || null;
+    } catch (e) { plan = null; }
     const usedBy = ((cache && cache.list) || [])
       .filter((s) => String(s.php_version || '') === String(p.version))
       .map((s) => s.domain);
     const risky = !!p.is_default || usedBy.length > 0;
     let wipe = false;
+    let force = false;
 
     const wipeBox = h('input', { type: 'checkbox' });
     wipeBox.addEventListener('change', () => { wipe = wipeBox.checked; });
+    // 强制卸载：只在后端说"被 brew 依赖拦下"时出现，默认不勾。
+    const forceBox = h('input', { type: 'checkbox' });
+    forceBox.addEventListener('change', () => { force = forceBox.checked; });
+    const forceDeps = ((plan && plan.dependents) || [])
+      .filter((d) => d.kind === 'brew').map((d) => d.name);
+    const forceList = forceDeps.length ? forceDeps.join('、') : '依赖它的包';
 
     const warning = h('div', {
       style: {
@@ -990,59 +1009,162 @@ export function SitesView(content, ctx = {}) {
         h('div', { style: { marginTop: '4px' }, text: '卸载不可恢复；其它 PHP 版本与站点文件不受影响。' }),
       ]);
 
-    let m = null;
-    m = modal({
-      title: '卸载 PHP ' + p.version,
-      body: h('div', [
-        warning,
-        h('div', [
-          h('div', { style: { fontWeight: '600' }, text: '本次会做：' }),
-          h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } }, [
-            h('li', { text: '停止 PHP ' + p.version + ' 的 php-fpm（若在运行）' }),
-            h('li', { text: '删除面板里这个版本的服务定义与开机自启项' }),
-            h('li', { text: '执行 brew uninstall ' + formula + '（只动这一个版本）' }),
-            h('li', { text: '保留其它 PHP 版本与站点文件' }),
-          ]),
+    // brew 依赖拦下：**先**弹"还不能卸载"对话框（逐条列出谁依赖它），
+    // 用户在对话框里明确点「强制卸载」才继续到确认框 —— 也就是默认取消。
+    if (plan && plan.blocked && plan.force_allowed === true) {
+      const deps = (plan.dependents || []).map((d) => h('div', {
+        style: { marginBottom: '8px' },
+      }, [
+        h('div', { style: { fontWeight: '620' }, text: 'Homebrew 包：' + (d.name || '') }),
+        d.detail ? h('div', { style: { fontSize: '12px', color: 'var(--text-dim)' }, text: d.detail }) : null,
+      ]));
+      let dm = null;
+      dm = modal({
+        title: '还不能卸载 PHP ' + p.version,
+        wide: true,
+        body: h('div', [
+          h('div', {
+            style: { marginBottom: '10px', padding: '9px 11px', background: 'var(--warn-soft)',
+              borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+            text: plan.blocked,
+          }),
+          ...deps,
+          h('div', {
+            style: { marginTop: '4px', padding: '9px 11px', border: '1px solid var(--danger)',
+              background: 'var(--danger-soft)', borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+            text: '强制卸载会破坏这些包：' + forceList + '（它们会缺依赖、可能无法运行）。'
+              + '执行的命令：brew uninstall --ignore-dependencies ' + (plan.formula || formula),
+          }),
         ]),
-        h('label', {
-          style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '12px', cursor: 'pointer' },
-        }, [
-          wipeBox,
+        footer: [
+          h('button.btn', { text: '取消', onclick: () => dm.close() }),
+          h('button.btn.btn-danger', {
+            text: '强制卸载', title: '忽略依赖强行卸载（会破坏 ' + forceList + '）',
+            onclick: () => { dm.close(); force = true; void confirmThenRun(true); },
+          }),
+        ],
+      });
+      return; // 等用户在对话框里选；取消 = 什么都不做（不发请求）
+    }
+
+    // confirmThenRun 真正提交卸载任务。force 只在用户明确选择时为 true。
+    async function confirmThenRun(useForce) {
+      await taskCenter.start({
+        kind: 'uninstall',
+        target: formula,
+        title: (useForce ? '强制卸载 PHP ' : '卸载 PHP ') + p.version,
+        start: () => api.marketUninstall(appId, wipe, useForce),
+        onDone: async (task) => {
+          if (task && task.status && task.status !== 'succeeded') {
+            // 失败绝不沉默：把后端的原话显示出来（它已经是人话，会点名依赖方）。
+            toast('卸载 PHP ' + p.version + ' 失败：' + (task.error || task.status), 'err', 12000);
+            return;
+          }
+          toast('已卸载 PHP ' + p.version, 'ok', 9000);
+          // 重拉 PHP 列表并重绘（回调由 phpEnvModal 提供：它持有 state2/render）。
+          if (typeof onDone === 'function') await onDone();
+          // 环境事实变了：重新探测，让「一键 LNMP」入口/nginx 状态跟着更新。
+          void refreshWebEnv();
+        },
+      });
+    }
+
+    // openConfirm 弹"本次会做什么"确认框。forceDefault=true 时强制勾选已预置
+    // （用户在上一屏明确点了「强制卸载」，这一屏再让他确认一次命令与后果）。
+    function openConfirm(forceDefault) {
+      force = !!forceDefault;
+      forceBox.checked = !!forceDefault;
+      const okBtn = h('button.btn.btn-danger', {
+        text: force ? '强制卸载 PHP ' + p.version : '卸载 PHP ' + p.version,
+      });
+      forceBox.addEventListener('change', () => {
+        okBtn.textContent = forceBox.checked ? '强制卸载 PHP ' + p.version : '卸载 PHP ' + p.version;
+      });
+      let m = null;
+      m = modal({
+        title: '卸载 PHP ' + p.version,
+        body: h('div', { dataset: { confirmUninstall: '1' } }, [
+          // 与 servicePanel.confirmUninstallPlan 用同一句开场白：卸载确认框的
+          // 形状一致（也让自动化测试能用同一选择器稳定选中它）。
+          h('div', { style: { marginBottom: '8px' }, text: '将执行：' }),
+          warning,
           h('div', [
-            h('div', { text: '同时删除该版本的配置目录（不可恢复）' }),
-            h('div.hint', { text: 'php.ini / php-fpm.conf 等；不勾选则保留，便于日后重装沿用' }),
+            h('div', { style: { fontWeight: '600' }, text: '本次会做：' }),
+            h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } }, [
+              h('li', { text: '停止 PHP ' + p.version + ' 的 php-fpm（若在运行）' }),
+              h('li', { text: '删除面板里这个版本的服务定义与开机自启项' }),
+              h('li', { text: '执行 brew uninstall ' + formula + '（只动这一个版本）' }),
+              h('li', { text: '保留其它 PHP 版本与站点文件；不会自动删除其它 brew 包' }),
+            ]),
+          ]),
+          (plan && plan.force_allowed === true) ? h('div', {
+            style: { marginTop: '10px', padding: '9px 11px', border: '1px solid var(--danger)',
+              background: 'var(--danger-soft)', borderRadius: '6px', lineHeight: '1.7' },
+          }, [
+            h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', cursor: 'pointer' } },
+              [forceBox, h('span', { text: '强制卸载（忽略依赖，brew --ignore-dependencies）' })]),
+            h('div', { style: { marginTop: '4px', fontSize: '12.5px' },
+              text: '会破坏这些包：' + forceList + '（它们会缺依赖、可能无法运行）。'
+                + '不勾选时若 brew 因依赖拒绝卸载，任务会失败并如实报出依赖方。' }),
+          ]) : null,
+          h('label', {
+            style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '12px', cursor: 'pointer' },
+          }, [
+            wipeBox,
+            h('div', [
+              h('div', { text: '同时删除该版本的配置目录（不可恢复）' }),
+              h('div.hint', { text: 'php.ini / php-fpm.conf 等；只删除 ' + p.version
+                + ' 自己的 etc/php/' + p.version + '，其它版本与 phpmyadmin 的配置不会碰' }),
+            ]),
           ]),
         ]),
-      ]),
-      footer: [
-        h('button.btn', { text: '取消', onclick: () => m.close() }),
-        h('button.btn.btn-danger', {
-          text: '卸载 PHP ' + p.version,
-          onclick: async () => {
-            m.close();
-            // 提交交给任务中心：立刻返回 task_id、进度走 SSE、提交失败会 toast。
-            await taskCenter.start({
-              kind: 'uninstall',
-              target: formula,
-              title: '卸载 PHP ' + p.version,
-              start: () => api.marketUninstall(appId, wipe),
-              onDone: async (task) => {
-                if (task && task.status && task.status !== 'succeeded') {
-                  // 失败绝不沉默：把后端的原话显示出来。
-                  toast('卸载 PHP ' + p.version + ' 失败：' + (task.error || task.status), 'err', 12000);
-                  return;
-                }
-                toast('已卸载 PHP ' + p.version, 'ok', 9000);
-                // 重拉 PHP 列表并重绘（回调由 phpEnvModal 提供：它持有 state2/render）。
-                if (typeof onDone === 'function') await onDone();
-                // 环境事实变了：重新探测，让「一键 LNMP」入口/nginx 状态跟着更新。
-                void refreshWebEnv();
-              },
-            });
-          },
-        }),
-      ],
-    });
+        footer: [
+          h('button.btn', { text: '取消', onclick: () => m.close() }),
+          okBtn,
+        ],
+      });
+      okBtn.addEventListener('click', () => { m.close(); void confirmThenRun(forceBox.checked); });
+    }
+
+    // brew 依赖拦下：**先**弹"还不能卸载"对话框（逐条列出谁依赖它），
+    // 用户在对话框里明确点「强制卸载」才继续到确认框 —— 默认就是取消。
+    if (plan && plan.blocked && plan.force_allowed === true) {
+      const deps = (plan.dependents || []).map((d) => h('div', {
+        style: { marginBottom: '8px' },
+      }, [
+        h('div', { style: { fontWeight: '620' }, text: 'Homebrew 包：' + (d.name || '') }),
+        d.detail ? h('div', { style: { fontSize: '12px', color: 'var(--text-dim)' }, text: d.detail }) : null,
+      ]));
+      let dm = null;
+      dm = modal({
+        title: '还不能卸载 PHP ' + p.version,
+        wide: true,
+        body: h('div', [
+          h('div', {
+            style: { marginBottom: '10px', padding: '9px 11px', background: 'var(--warn-soft)',
+              borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+            text: plan.blocked,
+          }),
+          ...deps,
+          h('div', {
+            style: { marginTop: '4px', padding: '9px 11px', border: '1px solid var(--danger)',
+              background: 'var(--danger-soft)', borderRadius: '6px', fontSize: '13px', lineHeight: '1.7' },
+            text: '强制卸载会破坏这些包：' + forceList + '（它们会缺依赖、可能无法运行）。'
+              + '执行的命令：brew uninstall --ignore-dependencies ' + (plan.formula || formula),
+          }),
+        ]),
+        footer: [
+          h('button.btn', { text: '取消', onclick: () => dm.close() }),
+          h('button.btn.btn-danger', {
+            text: '强制卸载', title: '忽略依赖强行卸载（会破坏 ' + forceList + '）',
+            onclick: () => { dm.close(); openConfirm(true); },
+          }),
+        ],
+      });
+      return; // 等用户在对话框里选；取消 = 什么都不做（不发请求）
+    }
+
+    openConfirm(false);
   }
 
   // ---------- 新建站点 ----------

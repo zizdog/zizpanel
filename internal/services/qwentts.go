@@ -730,14 +730,36 @@ func execCommandCtx(ctx context.Context, name string, args ...string) *exec.Cmd 
 func (m *Manager) runAsUserEnv(ctx context.Context, timeout time.Duration, env []string, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	full := append([]string{"-n", "-u", m.opt.UserName, name}, args...)
+	// **必须用 /usr/bin/env 显式注入环境变量**（2026-09-18 用户真机事故）：
+	// `sudo` 默认 env_reset，会清掉我们设置在 sudo **进程**上的环境变量 ——
+	// 以前这里写 `full := []string{"-n","-u",user,name}` 再把 env 塞进 cmd.Env，
+	// 结果子进程根本收不到 `HF_ENDPOINT`/`HF_HUB_DISABLE_XET`：
+	// `hf download` 于是去连 huggingface.co（国内不可达）→
+	//   Error: Local entry not found. [Errno 60] Operation timed out
+	// 而面板日志里"模型来源：https://…/hf"看起来一切正常 —— 这正是用户看到的
+	// "明明配了镜像却一点速度都没有"。
+	// brew 那条链路早就踩过同一个坑（见 install.go 的 brewEnvArgs），这里跟进。
+	full := asUserEnvArgs(m.opt.UserName, m.opt.UserHome, env, name, args...)
 	cmd := execCommandCtx(ctx, "/usr/bin/sudo", full...)
-	e := append(os.Environ(), "HOME="+m.opt.UserHome)
-	e = append(e, env...)
-	cmd.Env = e
 	// 模型下载（hf download）动辄几百 MB，必须逐行流式，
 	// 否则用户在整个下载期间只能看到"正在下载模型"一句。
 	return streamCmd(ctx, cmd)
+}
+
+// asUserEnvArgs 构造"以真实用户身份 + 显式环境变量"执行一条命令的 sudo 参数。
+//
+// 形状：`sudo -n -u <user> /usr/bin/env HOME=<home> KEY=VAL… <cmd> args…`
+// 单独抽出来是为了**能被单测锁住**：`sudo` 默认 env_reset，直接把 KEY=VAL 放在
+// sudo 进程的 Env 里**不会**传给子进程 —— 这个形状错了，`hf download` 就会去连
+// huggingface.co（国内不可达），表现是"配了镜像却零速度"（2026-09-18 用户真机事故）。
+func asUserEnvArgs(user, home string, env []string, name string, args ...string) []string {
+	full := []string{"-n", "-u", user, "/usr/bin/env"}
+	if home != "" {
+		full = append(full, "HOME="+home)
+	}
+	full = append(full, env...)
+	full = append(full, name)
+	return append(full, args...)
 }
 
 // memoryGB 返回物理内存 GB，取不到返回 0。

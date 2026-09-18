@@ -65,3 +65,30 @@ func TestHFEndpointUsableRequiresWorkingAPI(t *testing.T) {
 		t.Error("API 与文件都通时应判为可用（这样才会优先走自建镜像）")
 	}
 }
+
+// TestAsUserEnvArgsInjectsEnvThroughEnv 锁住 2026-09-18 用户真机事故的根因：
+//
+// `sudo` 默认 env_reset —— 把 HF_ENDPOINT 塞在 sudo **进程**的 Env 里，子进程收不到，
+// `hf download` 于是去连 huggingface.co（国内不可达），用户看到的是"配了镜像却零速度 /
+// Errno 60 timed out"。形状必须是 `sudo -n -u <user> /usr/bin/env KEY=VAL… <cmd>`。
+func TestAsUserEnvArgsInjectsEnvThroughEnv(t *testing.T) {
+	got := asUserEnvArgs("zizdog", "/Users/zizdog",
+		[]string{"HF_ENDPOINT=https://mirror.example/hf", "HF_HUB_DISABLE_XET=1"},
+		"/Users/zizdog/tts/qwen3/.venv/bin/hf", "download", "some/repo")
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"-n -u zizdog /usr/bin/env",
+		"HOME=/Users/zizdog",
+		"HF_ENDPOINT=https://mirror.example/hf",
+		"HF_HUB_DISABLE_XET=1",
+		"download some/repo",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("构造出的参数缺少 %q：%v", want, got)
+		}
+	}
+	// 环境变量必须排在命令之前（env 的规则：先赋值、再执行命令）
+	if iEnv, iCmd := strings.Index(joined, "HF_ENDPOINT="), strings.Index(joined, "/hf download"); iEnv < 0 || iCmd < 0 || iEnv > iCmd {
+		t.Errorf("环境变量必须出现在命令之前：%v", got)
+	}
+}

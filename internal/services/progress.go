@@ -119,7 +119,36 @@ func streamCmd(ctx context.Context, cmd *exec.Cmd) (string, error) {
 	go scan(stdout, tasks.LevelOut)
 	go scan(stderr, tasks.LevelErr)
 
+	// ctx 取消/超时时**主动关掉管道**，保证读取 goroutine 一定能看到 EOF。
+	//
+	// 为什么必须这么做（2026-09-21 实测）：exec.CommandContext 在超时后只 kill
+	// **直接子进程**；brew 是脚本，它会 fork 出 `git` 之类的孙子进程，孙子进程
+	// 继承着这两个管道。父进程被 SIGKILL 之后管道写端仍然打开，读取 goroutine
+	// 永远等不到 EOF → `wg.Wait()` 死等 → 整个 HTTP 请求（市场列表）挂住。
+	// 表现就是"应用页一直转圈"以及单测里 `TestMarketZombieColimaPlistNotInstalled`
+	// 卡到 15 分钟超时（`go test` 的 panic dump 里能看到两个 scanLines 还活着）。
+	//
+	// 关掉读端不会泄漏：cmd.Wait() 之后 Go 自己也会关，重复关只是返回错误。
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stdout.Close()
+			_ = stderr.Close()
+		case <-done:
+		}
+	}()
+
 	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		// 超时/取消：连同管道一起收尾，并如实返回 ctx 的错误（调用方据此判"未检查"）。
+		_ = stdout.Close()
+		_ = stderr.Close()
+		if waitErr == nil {
+			waitErr = ctx.Err()
+		}
+	}
 	wg.Wait()
 	return buf.String(), waitErr
 }

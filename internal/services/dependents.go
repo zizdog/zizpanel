@@ -235,9 +235,14 @@ func (m *Manager) dockerRuntimeDependents(ctx context.Context) []Dependent {
 
 // brewDependents 通用兜底：`brew uses --installed`。
 func (m *Manager) brewDependents(ctx context.Context, formula string) []Dependent {
-	if m.brewUsesProbe == nil && m.opt.BrewBin == "" {
+	if formula == "" {
 		return nil
 	}
+	// 与 brewUninstallPlan 同一条判据：只读 brew。以前这里有个
+	// `m.opt.BrewBin == ""` 的短路，而**卸载计划走的路径从来不看它**
+	// （brewUninstallPlan 直接调用 brewUsesInstalled）—— 两条路的判据必须一致，
+	// 否则"面板安装器"那条路（Python 解释器就是）永远查不到 llvm/rust 依赖，
+	// 用户点下去只会吃到一整段 brew 英文报错（2026-09-21 真机）。
 	deps, checked := m.brewUsesInstalled(ctx, formula)
 	if !checked {
 		return nil
@@ -246,10 +251,61 @@ func (m *Manager) brewDependents(ctx context.Context, formula string) []Dependen
 	for _, d := range deps {
 		out = append(out, Dependent{
 			Kind: "brew", Name: d, Detail: "Homebrew 包 " + d + " 依赖 " + formula,
-			Action: "如果还要用 " + d + "，请保留 " + formula,
+			Action: "先卸载它（如果它已经不需要了），或选择强制卸载 " + formula +
+				"（会破坏 " + d + "：它会缺依赖、可能无法运行）",
 		})
 	}
 	return out
+}
+
+// BrewDependencyBlock 查一次"还有哪些**已安装**的 Homebrew 包依赖 formula"，
+// 把结果并进卸载计划（结构化 Dependents + 面向用户的 Blocked 文案 + ForceAllowed）。
+//
+// 为什么需要它（2026-09-21 用户真机卸载 python@3.13）：
+//
+//	Error: Refusing to uninstall ... because it is required by llvm and rust …
+//	You can override this and force removal with:
+//	  brew uninstall --ignore-dependencies python@3.13
+//
+// 面板路径：市场条目 python313 → PanelInstaller=python → 卸载计划由 installerPlan
+// 生成（格式为 `brew uninstall python@3.13`），**从来没查过 brew uses**，
+// 于是用户按了确认，只拿到 brew 的英文原文，既看不懂也不知道还有"强制卸载"这条路。
+//
+// 现在：计划阶段就把依赖方逐条列出并 Blocked；ForceAllowed 只在"确实被依赖拦下"
+// 时为 true，执行端只有收到显式 force=true 才会追加 --ignore-dependencies。
+//
+// 返回是否真的命中了 brew 依赖（false = 查了没有 / 没查成）。
+func (m *Manager) BrewDependencyBlock(ctx context.Context, formula string, plan *UninstallPlan) bool {
+	if plan == nil || formula == "" || plan.ForceAllowed {
+		return false
+	}
+	deps := m.brewDependents(ctx, formula)
+	if len(deps) == 0 {
+		return false
+	}
+	plan.DependentsChecked = true
+	plan.Dependents = dedupeDependents(append(plan.Dependents, deps...))
+	names := []string{}
+	for _, d := range deps {
+		names = append(names, d.Name)
+	}
+	joined := strings.Join(names, "、")
+	brewMsg := "brew 拒绝卸载 " + formula + "：" + joined + " 依赖它。" +
+		"可以先卸载它们，或选择强制卸载（brew uninstall --ignore-dependencies " + formula +
+		"，会破坏 " + joined + "：它们会缺依赖、可能无法运行）"
+	if plan.Blocked == "" {
+		plan.Blocked = brewMsg
+	} else {
+		plan.Blocked = plan.Blocked + "；" + brewMsg
+	}
+	plan.ForceAllowed = true
+	plan.ForceNote = "强制卸载会破坏这些包：" + joined +
+		"（它们会缺依赖、可能无法运行）。命令：brew uninstall --ignore-dependencies " + formula
+	plan.Steps = append(plan.Steps,
+		"⚠️ 下列已安装的软件依赖 "+formula+"，brew 会拒绝卸载："+joined,
+		"要保留它们就先卸载它们或保留 "+formula+"；只有选择「强制卸载」才会执行 "+
+			"brew uninstall --ignore-dependencies "+formula)
+	return true
 }
 
 // ---------- 证据查询 ----------

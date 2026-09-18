@@ -248,8 +248,11 @@ export const api = {
   // 纳管的第三方服务面板不卸载，前端改用「取消纳管」（serviceForget）。
   // 一键建站：domain/admin_user/admin_pass/site_name
   marketInstallSite: (id, payload) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install-site`, payload),
-  marketUninstall: (id, removeData = false) =>
-    request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`),
+  // force 只能在用户**明确选择**「强制卸载」时才传 true：后端会把它翻成
+  // `brew uninstall --ignore-dependencies`（会破坏依赖它的包）。默认 false。
+  marketUninstall: (id, removeData = false, force = false) =>
+    request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`
+      + (force ? '&force=1' : '')),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
   marketInstall: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install`, {}),
   // 一键 LNMP 分两步：先取**版本候选**（弹窗让用户选 nginx/PHP/MySQL 各自的版本），

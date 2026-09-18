@@ -186,6 +186,24 @@ const MARKET = {
       docs_url: 'https://ffmpeg.org',
     },
     {
+      // ⚠️ 2026-09-21 用户发火点名的那一类：**有守护进程、装在机器上，但面板里
+      // 没有它的服务记录**（真机就是 nginx 在 :80 上跑着，面板里却查不到记录）。
+      // 这种条目**绝不能**显示「已停止」—— 面板根本不知道它停没停。
+      // 它**没有** no_daemon 标记，所以"靠 no_daemon 兜住"在这里不成立：
+      // 必须是显式规则（statusLine 里 isInstalledMarketItem 那一条）。
+      //
+      // 标识用 `edge-web`：**刻意**不复用 nginx 的 key —— 真机上 nginx 是
+      // "有记录的服务"，而这一条要复刻的是"装了但**没有**记录"，两者合并到一起
+      // 就测不出这一态了。
+      id: 'edge-web', name: 'Edge Web（装了但无面板记录）', icon: '🌐', category: 'lnmp', kind: 'native',
+      summary: 'Web 服务器（复刻用户真机：在跑，但面板里没有记录）',
+      description: '复刻 2026-09-21 用户现场：装了、有守护进程，但面板里没有服务记录。',
+      port: 80, installed: true, adopted: false, available: true,
+      service_label: 'homebrew.mxcl.edge-web', service_in_launchd: false,
+      docs_url: 'https://nginx.org',
+      uninstall: { kind: 'brew', formula: 'edge-web', steps: ['brew uninstall edge-web'] },
+    },
+    {
       // 装了、但服务管理里**没有**记录（adopted=false）：配置文件按钮必须禁用，
       // 因为市场条目里的 config_path 只是文件名，拿不到绝对路径。
       id: 'stirling-pdf', name: 'Stirling PDF', icon: '📄', category: 'tool', kind: 'native',
@@ -592,6 +610,20 @@ const result = await page.evaluate(async () => {
   // 「只显示打开、不显示直链」：任何一张已安装卡片都不许出现「直链」。
   out.installed.anyDirect = mcards.some((r) => btns(r).some((t) => t.includes('直链')));
   out.installed.withOpen = mcards.filter((r) => btns(r).some((t) => t === '打开')).map((r) => r.getAttribute('data-app-name'));
+  // ---- ②g 状态命名（2026-09-21 用户发火的那一条）----
+  //  "以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、FFmpeg、Nginx、
+  //   phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
+  // 这里把每张已安装卡片上的**状态 pill** 单独采出来（pill 是卡片里的
+  // `.pill`，状态是其中不含数字/端口的那一颗）——断言里不许出现「已停止」，
+  // 除非那张卡片真的有服务记录且记录是停止态（下面 noRecord 与 noDaemon 名单）。
+  out.installed.pills = {};
+  for (const r of mcards) {
+    const name = r.getAttribute('data-app-name');
+    out.installed.pills[name] = Array.from(r.querySelectorAll('.pill'))
+      .map((p) => (p.textContent || '').trim()).filter(Boolean);
+  }
+  out.installed.noDaemonNames = ['FFmpeg（音视频工具）'];
+  out.installed.noRecordName = 'Edge Web（装了但无面板记录）';
   // 从每一张卡片的「⚙️ 管理」点开面板，采快照（与市场卡片那次对照）。
   for (const r of mcards) {
     const name = r.getAttribute('data-app-name');
@@ -632,6 +664,28 @@ const result = await page.evaluate(async () => {
     await settle();
     out.filter.problems = Array.from(filterBox.querySelectorAll('#installed-grid > div')).map(keyOfCard);
   }
+  // 「已停止」筛选：只允许命中**真的有服务记录**且状态是停止的那些卡片。
+  // 独立按 fixture 重算（不复用被测代码的判据）—— 这就是用户发火那条
+  // （ffmpeg / python / Nginx 没记录却被归到"已停止"）的门禁。
+  const stoppedBtn = toolbarBtns().find((b) => b.text === '已停止');
+  if (stoppedBtn) {
+    stoppedBtn.el.click();
+    await settle();
+    out.filter.stoppedKeys = Array.from(filterBox.querySelectorAll('#installed-grid > div')).map(keyOfCard);
+  } else {
+    out.filter.stoppedKeys = null;
+  }
+  out.filter.expectedStoppedKeys = (window.__servicesFixture.list || [])
+    .filter((s) => {
+      const st = s.state || {};
+      // 期望值必须扣掉"同一 key 里还有一条在跑"的记录：合并后取的是在跑那条
+      // （php82 就有两条记录、一条 running），它不该进「已停止」。
+      const mergedRunning = (window.__servicesFixture.list || [])
+        .some((o) => appKeyOf(o) === appKeyOf(s) && (o.state || {}).running);
+      return !mergedRunning && !st.running && st.status !== 'error' && st.status !== 'unavailable';
+    })
+    .map((s) => appKeyOf(s));
+  out.filter.allKeys = Array.from(filterBox.querySelectorAll('#installed-grid > div')).map(keyOfCard);
   // 复位成「全部」：stateFilter 是模块级变量，不复位会污染后面几次渲染
   const allBtn = toolbarBtns().find((b) => b.text === '全部');
   if (allBtn) { allBtn.el.click(); await settle(); }
@@ -866,6 +920,11 @@ console.log(`  筛选按钮：${show(result.filter.labels)}`);
 console.log(`  「需要处理」按钮文案：${result.filter.countText}`);
 console.log(`  筛选期望（按旧定义独立重算）：${show(result.filter.expectedKeys)}`);
 console.log(`  「需要处理」实际筛出：${show(result.filter.problems)}（复位后卡片数 ${result.filter.afterReset}）`);
+console.log(`  「已停止」实际筛出：${show(result.filter.stoppedKeys)}`);
+console.log(`  「已停止」期望（有记录且停止）：${show(result.filter.expectedStoppedKeys)}`);
+console.log(`  无守护进程卡片的状态 pill：${show(result.installed.pills['FFmpeg（音视频工具）'])}`);
+console.log(`  装了但无记录卡片的状态 pill：${show(result.installed.pills['Edge Web（装了但无面板记录）'])}`);
+console.log(`  装了但无记录的卡片正文：${(result.installed.text['Edge Web（装了但无面板记录）'] || '').slice(0, 220)}`);
 
 console.log('\n══════════ ②b docker Tab：纯展示，没有安装动作 ══════════');
 console.log(`  激活 Tab=${result.docker.activeTab}`);
@@ -1198,8 +1257,41 @@ check('市场 / 已安装打开的是同一个面板', same);
 check('ffmpeg 面板不显示「纳管 / 面板里没有服务记录」（它是 CLI 工具，不是"没纳管"）',
   !/纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || ''));
 check('ffmpeg 面板不显示「读取中」', !(ffPanel.panelText || '').includes('读取中'));
-check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', (ffPanel.status || '').includes('命令行工具（无常驻进程）'), ffPanel.status);
+check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', /已安装（命令行工具，无常驻进程）/.test(ffPanel.status || ''), ffPanel.status);
 check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups.join(', '));
+
+// ---------- ⑩ 状态命名：没有守护进程 / 没有面板记录的应用**不许**写「已停止」 ----------
+//  用户 2026-09-21 原话："以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、
+//  FFmpeg、Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
+//  ffmpeg（no_daemon）与 Nginx（有守护进程但装了没登记）都没有可停止的东西/
+//  面板不知道，写「已停止」就是假信息。
+const ffPills = result.installed.pills['FFmpeg（音视频工具）'] || [];
+const noRecPills = result.installed.pills['Edge Web（装了但无面板记录）'] || [];
+check('no_daemon（ffmpeg）卡片状态**不是**「已停止」',
+  !ffPills.some((t) => t.includes('已停止')), show(ffPills));
+check('no_daemon（ffmpeg）卡片如实写"命令行工具，无常驻进程"',
+  ffPills.some((t) => t.includes('命令行工具') && t.includes('无常驻进程')), show(ffPills));
+check('装了但面板无记录（Edge Web）卡片状态**不是**「已停止」',
+  !noRecPills.some((t) => t.includes('已停止')), show(noRecPills));
+check('装了但面板无记录（Edge Web）卡片如实写"已安装（面板里暂无记录）"',
+  noRecPills.some((t) => t.includes('已安装') && t.includes('面板里暂无记录')), show(noRecPills));
+check('装了但面板无记录（Edge Web）卡片正文给出端口监听结论（查不到就明写未检测）',
+  /端口/.test(result.installed.text['Edge Web（装了但无面板记录）'] || ''),
+  (result.installed.text['Edge Web（装了但无面板记录）'] || '').slice(0, 160));
+check('no_daemon 面板状态也不出现「已停止」',
+  !(result.panelFromMarket['FFmpeg（音视频工具）']?.status || '').includes('已停止'),
+  result.panelFromMarket['FFmpeg（音视频工具）']?.status);
+check('装了但无记录的应用面板状态也不出现「已停止」',
+  !(result.panelFromMarket['Edge Web（装了但无面板记录）']?.status || '').includes('已停止'),
+  result.panelFromMarket['Edge Web（装了但无面板记录）']?.status);
+check('「已停止」筛选只命中**真的有服务记录且状态是停止**的卡片',
+  JSON.stringify([...(result.filter.stoppedKeys || [])].sort())
+  === JSON.stringify([...(result.filter.expectedStoppedKeys || [])].sort()),
+  `期望 ${show(result.filter.expectedStoppedKeys)} 实际 ${show(result.filter.stoppedKeys)}`);
+check('「已停止」筛选不含 ffmpeg / Edge Web（没有可停止的东西 / 面板没有记录）',
+  !(result.filter.stoppedKeys || []).includes('ffmpeg')
+  && !(result.filter.stoppedKeys || []).includes('edgeweb'),
+  show(result.filter.stoppedKeys));
 check('超时兜底：面板一定落定（无"读取中"）', !/读取中|正在读取/.test(to.panelText || ''), to.status);
 check('超时兜底：在硬上限内落定', result.timeout.elapsedMs < 12000, result.timeout.elapsedMs + 'ms');
 check('归一化：php@8.2 / php8-2 / php82 / php8.2 收敛成同一个 key（=php82）',

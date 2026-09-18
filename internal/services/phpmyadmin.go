@@ -1241,7 +1241,7 @@ func (m *Manager) RepairPhpMyAdminConfigPerm() (bool, error) {
 // D10：入口识别**先按标记、再按 alias 指向的 phpMyAdmin 目录**（老版本生成器
 // 没写标记，正是"卸载报成功却残留 /phpmyadmin"的根因）。两者都识别不出、而配置里
 // 又确实有 /phpmyadmin 时**如实报错**并中止 —— 绝不静默跳过然后报成功。
-func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData bool, result *InstallResult) error {
+func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData, force bool, result *InstallResult) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("卸载 phpMyAdmin 需要以 root 运行")
 	}
@@ -1279,12 +1279,10 @@ func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData bool, resu
 	}
 
 	// ---- 2. 删包 ----
+	// force=true 只由用户在确认框里明确选「强制卸载」时传入（brew --ignore-dependencies）。
 	if m.brewHas(ctx, "phpmyadmin") {
-		if result != nil {
-			result.step(ctx, "正在 brew uninstall phpmyadmin")
-		}
-		if _, err := m.brewRun(ctx, 5*time.Minute, "uninstall", "phpmyadmin"); err != nil {
-			return fmt.Errorf("brew uninstall phpmyadmin 失败: %w", err)
+		if err := m.brewUninstall(ctx, "phpmyadmin", force, result); err != nil {
+			return err
 		}
 	} else if result != nil {
 		result.step(ctx, "phpmyadmin 未安装，跳过")

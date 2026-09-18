@@ -1025,7 +1025,27 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	removeData := r.URL.Query().Get("remove_data") == "1"
+	// force=1 只在用户**明确点了**确认框里的「强制卸载」时才会出现（前端 api.marketUninstall
+	// 的第三个参数）。它对应 brew uninstall --ignore-dependencies，会破坏依赖它的包，
+	// 所以：默认值永远是 false，且只有计划里 ForceAllowed=true 才准用（见下）。
+	force := r.URL.Query().Get("force") == "1"
 	plan := s.svcManager().PlanUninstall(r.Context(), id)
+	// 计划说有 Homebrew 依赖拦着、用户却**没有**选强制卸载 → 409 + 人话（谁依赖它、
+	// 两个选择）。这正是用户真机看到的那段 brew 英文原文的位置：以前面板把它整段贴回来，
+	// 现在换成"llvm、rust 依赖它，可以先卸载它们，或选择强制卸载（会破坏它们）"。
+	//
+	// 正常流程下面板前端不会走到这里：它一看见 blocked+force_allowed 就先弹
+	// 「取消 / 强制卸载」对话框。这条是**防御**：绕过前端直接调接口，也必须被拦下。
+	if plan.Kind != "service" && plan.Blocked != "" && plan.ForceAllowed && !force {
+		fail(w, http.StatusConflict, plan.Blocked)
+		return
+	}
+	if force && !plan.ForceAllowed {
+		fail(w, http.StatusBadRequest,
+			"不能强制卸载「"+app.Name+"」：当前计划没有查出 Homebrew 依赖。"+
+				"请刷新后重试（强制开关只对「被依赖拦下」的卸载开放）")
+		return
+	}
 	switch plan.Kind {
 	case "service":
 		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
@@ -1043,14 +1063,10 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 				return res, nil
 			})
 	case "installer":
-		if plan.Blocked != "" {
-			fail(w, http.StatusConflict, plan.Blocked)
-			return
-		}
 		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
 			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 				res := &services.InstallResult{App: app.ID, Steps: []string{}}
-				if err := s.svcManager().UninstallApp(ctx, app.ID, removeData, res); err != nil {
+				if err := s.svcManager().UninstallApp(ctx, app.ID, removeData, force, res); err != nil {
 					return res, err
 				}
 				// 卸载成功后必须**同时**把服务记录删掉：只删文件与 plist 的话，
@@ -1074,14 +1090,10 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 		// 真实动作 = 停服务 + 删记录 + `brew uninstall <plan.Formula>`。
 		// formula 只认计划里那个 —— 它已经按真实 brew 状态判定过写法
 		// （目录写 php@8.4、机器上装的是 php 8.4.7，要卸的是后者）。
-		if plan.Blocked != "" {
-			fail(w, http.StatusConflict, plan.Blocked)
-			return
-		}
 		s.launchTask(w, r, "uninstall", app.ID, "卸载 "+app.Name,
 			"market_uninstall", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 				res := &services.InstallResult{App: app.ID, Steps: []string{}}
-				if err := s.svcManager().UninstallBrewApp(ctx, app, plan, removeData, res); err != nil {
+				if err := s.svcManager().UninstallBrewApp(ctx, app, plan, removeData, force, res); err != nil {
 					return res, err
 				}
 				if app.ServiceLabel != "" {

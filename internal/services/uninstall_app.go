@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/zizdog/zizpanel/internal/priv"
 )
@@ -84,6 +85,13 @@ type UninstallPlan struct {
 	// 目录写 `php@8.4` 而机器上装的是 `php`（当年安装时它正是 8.4）这种情况，
 	// 卸载要跑的是 `brew uninstall php`（见 ResolveBrewFormula）。
 	Formula string `json:"formula,omitempty"`
+	// PhpVersion 是 PHP 卸载时"属于这一次的版本号"（"8.4"）。
+	//
+	// 为什么不能执行时重新从 Formula 推：真机上装的是无版本别名 `php`（8.4.7），
+	// 从 `php` 推不出 8.4，而配置目录就叫 etc/php/8.4。计划阶段已经把版本算准
+	// （phpVersionFor），这里原样带给执行端 —— 保证"确认框里写什么"与
+	// "真的删什么"逐字一致（多推一次就可能推出另一个版本）。
+	PhpVersion string `json:"php_version,omitempty"`
 	// Dependents 是"这次卸载会影响谁"（结构化）：站点 / 容器 / 面板应用 / brew 包。
 	// 前端据此逐条列出"谁在用它、该怎么办"，而不是一句笼统的"不能卸载"。
 	// 见 dependents.go —— 那是唯一的依赖判定实现。
@@ -91,6 +99,23 @@ type UninstallPlan struct {
 	// DependentsChecked 表示上面那份名单**真的查过**。
 	// false = 没查成（brew 不可用/超时）→ 界面必须如实写"未检查"，绝不能说"没有依赖"。
 	DependentsChecked bool `json:"dependents_checked,omitempty"`
+	// ForceAllowed 表示"这个计划可以用强制卸载（brew uninstall --ignore-dependencies）"。
+	//
+	// 2026-09-21 用户真机（卸载 python@3.13）：
+	//   Error: Refusing to uninstall ... because it is required by llvm and rust,
+	//   which are currently installed.
+	//   You can override this and force removal with:
+	//     brew uninstall --ignore-dependencies python@3.13
+	// 以前面板把这段 brew 原文当错误贴回去，用户既看不懂、也不知道还能怎么办。
+	// 现在计划阶段就把"谁依赖它"说清楚，并明确给出**两个选择**：
+	//   · 取消（默认，什么都不做）；
+	//   · 强制卸载 —— 只有这一条路会把依赖它的包弄坏。
+	//
+	// 语义边界（必须守住）：它只是"允许用户选"，**绝不允许默认加 --ignore-dependencies**。
+	// 执行端只有在请求显式带 force=true 时才会追加那个开关（见 UninstallBrewApp）。
+	ForceAllowed bool `json:"force_allowed,omitempty"`
+	// ForceNote 是"强制卸载会破坏什么"的逐字说明（界面直接展示，不用自己拼）。
+	ForceNote string `json:"force_note,omitempty"`
 }
 
 // PlanUninstall 给出某个目录应用当前该怎么卸载（只读，不产生任何改动）。
@@ -147,6 +172,10 @@ type BrewState struct {
 	// Formula 是判定采用的实际 formula，可能与目录里的写法不同
 	// （目录写 php@8.4，机器上装的是 php —— 见 ResolveBrewFormula）。
 	Formula string
+	// Version 是 `brew list --versions` 给出的版本串（如 "8.4.7" / "8.4.7_1"）。
+	// 用于推导"这个包在 etc 下的版本目录名"（PHP 的 etc/php/<版本>）——
+	// 无版本别名的 `php` 只有靠它才知道要清理的是 etc/php/8.4 而不是别的版本。
+	Version string
 	// Installed 表示 Formula 真的在 brew list 里。
 	Installed bool
 }
@@ -201,11 +230,11 @@ func versionTokenMatches(installedVersions, want string) bool {
 
 // BrewStateFor 从整批 brew 版本结果里解析出某个条目的状态。
 func BrewStateFor(catalogFormula string, installed map[string]string) BrewState {
-	f, _, ok := ResolveBrewFormula(catalogFormula, installed)
+	f, v, ok := ResolveBrewFormula(catalogFormula, installed)
 	if !ok {
 		return BrewState{}
 	}
-	return BrewState{Formula: f, Installed: true}
+	return BrewState{Formula: f, Version: v, Installed: true}
 }
 
 // PlanUninstallFor 与 PlanUninstall 相同，但用调用方已经查好的记录。
@@ -242,7 +271,62 @@ func (m *Manager) installedFormulaVersions(ctx context.Context) map[string]strin
 func (m *Manager) PlanUninstallForBrew(ctx context.Context, app App, rec *Service, brew BrewState) UninstallPlan {
 	plan := m.planUninstallForBrewCore(ctx, app, rec, brew)
 	m.ApplyDependents(ctx, app, rec, &plan)
+	m.brewDependencyBlockForInstaller(ctx, app, brew, &plan)
 	return plan
+}
+
+// brewDependencyBlockForInstaller 给"面板安装器但实际靠 brew 卸载"的条目补上
+// **brew 依赖**这一层（用户真机卸载 python@3.13 的那一类）。
+//
+// 为什么单独一个函数而不是写进 installerPlan：installerPlan 没有 context，
+// 而 `brew uses --installed` 是一次真实 brew 调用；而且它必须与其它分支一样
+// **只查一次**（brewUsesInstalled 自带 5 分钟进程级缓存）。
+//
+// 只有"卸载实现里真的会跑 brew uninstall"的安装器才查：python 与 phpmyadmin。
+// 其余安装器（qwen3tts / iopaint / docker-runtime …）要么不动 brew，要么
+// 明确保留 brew 包，问了只会得到噪音。
+func (m *Manager) brewDependencyBlockForInstaller(ctx context.Context, app App, brew BrewState, plan *UninstallPlan) {
+	if plan == nil || plan.Kind != "installer" {
+		return
+	}
+	switch app.PanelInstaller {
+	case "python", "phpmyadmin":
+	default:
+		return
+	}
+	formula := plan.brewUninstallFormula()
+	if formula == "" {
+		formula = brew.Formula
+	}
+	if formula == "" {
+		formula = app.BrewFormula
+	}
+	m.BrewDependencyBlock(ctx, formula, plan)
+}
+
+// brewUninstallFormula 从计划步骤里取回"这次到底要 brew uninstall 哪个 formula"。
+//
+// 为什么要从步骤里取（而不是用目录里的 BrewFormula 再猜一次）：目录写
+// php@8.4、机器上装的是 php 8.4.7，真正要卸的是后者 —— 计划里那一步是
+// 唯一权威的写法（与 UninstallBrewApp 的规则一致）。
+func (p UninstallPlan) brewUninstallFormula() string {
+	for _, s := range p.Steps {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(s), "brew uninstall "); ok {
+			rest = strings.TrimSpace(rest)
+			if rest == "" || strings.HasPrefix(rest, "-") {
+				// `brew uninstall --ignore-dependencies <f>` 这类写法：取最后一个非选项词。
+				f := ""
+				for _, tok := range strings.Fields(rest) {
+					if !strings.HasPrefix(tok, "-") {
+						f = tok
+					}
+				}
+				return f
+			}
+			return strings.Fields(rest)[0]
+		}
+	}
+	return ""
 }
 
 // planUninstallForBrewCore 是计划的本体（不含依赖检测，便于测试单独驱动）。
@@ -428,28 +512,69 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 	}
 	p := UninstallPlan{Kind: "brew", Formula: formula}
 	p.Steps = append(p.Steps, "brew uninstall "+formula)
+	// PHP：brew 从不删除 etc/php/<版本> 下的配置（php.ini / conf.d / php-fpm.d），
+	// 卸载后会留一份"上一个版本"的配置。计划里要把**这一个版本自己的**配置目录
+	// 列成可选清理项，并在确认框里说清那件事（见 phpConfigPaths 的注释）。
+	phpVersion := m.phpVersionFor(formula, brew.Version)
+	p.PhpVersion = phpVersion
+	phpConfig := m.phpConfigPathsFor(phpVersion)
+	if len(phpConfig) > 0 {
+		p.DataPaths = append(p.DataPaths, phpConfig...)
+		p.Steps = append(p.Steps, "brew uninstall 完成后，把 PHP "+
+			phpVersion+" **自己**的配置目录清理掉（勾选「同时删除配置」才会执行）："+
+			strings.Join(phpConfig, "、"))
+	}
 	deps, checked := m.brewUsesInstalled(ctx, formula)
 	p.DependentsChecked = checked
 	for _, d := range deps {
 		p.Dependents = append(p.Dependents, Dependent{Kind: "brew", Name: d,
 			Detail: "Homebrew 包 " + d + " 依赖 " + formula,
-			Action: "如果还要用 " + d + "，请保留 " + formula})
+			Action: "先卸载它（如果它已经不需要了），或选择强制卸载 " + formula +
+				"（会破坏 " + d + "：它会缺依赖、可能无法运行）"})
 	}
 	switch {
 	case len(deps) > 0:
 		p.Steps = append(p.Steps,
-			"⚠️ 下列已安装的软件依赖 "+formula+"，卸载后它们会缺依赖："+strings.Join(deps, "、"))
-		// brew uninstall 自己也会因为依赖而拒绝，但用户有权在按确认之前就知道。
-		p.Blocked = "还有 Homebrew 包依赖 " + formula + "（" + strings.Join(deps, "、") +
-			"）：请先处理它们，或保留 " + formula
+			"⚠️ 下列已安装的软件依赖 "+formula+"，brew 会拒绝卸载："+strings.Join(deps, "、"))
+		p.Steps = append(p.Steps,
+			"如果要保留它们，请先卸载它们或保留 "+formula+"；"+
+				"只有选择「强制卸载」才会执行 brew uninstall --ignore-dependencies "+formula)
+		// brew uninstall 自己也会因为依赖而拒绝；这里在**计划阶段**就把依赖方逐条列出来，
+		// 让用户在按确认之前就看清"谁依赖它、有什么选择"，而不是等 brew 甩一段英文原文。
+		// 强制卸载那一条必须**逐字写出命令**（用户要求：按钮/正文里写清
+		// `brew uninstall --ignore-dependencies <formula>`），否则用户不知道那是什么。
+		p.Blocked = "brew 拒绝卸载 " + formula + "：" + strings.Join(deps, "、") + " 依赖它。" +
+			"可以先卸载它们，或选择强制卸载（brew uninstall --ignore-dependencies " + formula +
+			"，会破坏 " + strings.Join(deps, "、") + "：它们会缺依赖、可能无法运行）"
+		// 强制开关必须只对"依赖拦下来"这一类开放。
+		p.ForceAllowed = true
+		p.ForceNote = "强制卸载会破坏这些包：" + strings.Join(deps, "、") +
+			"（它们会缺依赖、可能无法运行）。命令：brew uninstall --ignore-dependencies " + formula
 	case checked:
 		p.Steps = append(p.Steps, "已检查：没有其它已安装的 Homebrew 包依赖 "+formula)
 	default:
 		p.Steps = append(p.Steps,
 			"未检查是否有别的软件依赖 "+formula+"（可自行执行：brew uses --installed "+formula+"）")
 	}
+	// 这两句都是**用户最关心的两件事**，必须出现在确认框里：
+	//   · 不会自动删除别的包（HOMEBREW_NO_AUTOREMOVE=1，2026-09-21 用户真机看到
+	//     "Autoremoving 2 unneeded formulae: net-snmp rtmpdump"）;
+	//   · 不会删除配置目录（brew 从不删 etc/ 下的配置，但它会打印一段吓人的 warning）。
 	p.KeepNote = "brew uninstall 只删除 " + formula + " 本身：**不会**删除它依赖的包，" +
-		"也不会删除用户数据与配置目录"
+		"也**不会**自动删除其它「已不再被需要」的包（面板给卸载命令带上 HOMEBREW_NO_AUTOREMOVE=1），" +
+		"更不会删除用户数据与配置目录"
+	if len(phpConfig) > 0 {
+		// PHP 特殊：brew **从不删除** etc/php 下的配置，而它的 warning 会把整个
+		// /opt/homebrew/etc/php 目录（含其它版本的 8.2 目录、phpmyadmin 的配置）
+		// 一起列出来 —— 那段提示很容易被读成"面板要删这些"。必须翻译清楚。
+		p.KeepNote = "brew uninstall 只删除 " + formula + " 本身：**不会**删除它依赖的包，" +
+			"也**不会**自动删除其它「已不再被需要」的包（面板给卸载命令带上 HOMEBREW_NO_AUTOREMOVE=1）。" +
+			"Homebrew 从不删除 " + m.phpEtcDir() + " 下的配置：它卸载后打印的那段 " +
+			"「configuration files have not been removed」只是笼统地列出**整个目录**，" +
+			"其中其它 PHP 版本（例如 8.2）的目录与 phpmyadmin 的配置**不属于本次卸载、" +
+			"面板也不会碰**；本计划只涉及 " + strings.Join(phpConfig, "、") + "。" +
+			"不勾选「同时删除该版本的配置」时这些也原样保留"
+	}
 	return p
 }
 
@@ -458,6 +583,12 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 // 为什么带缓存：市场列表里每个 brew 原生条目都会调一次，brew 启动本身就要 0.4 秒；
 // 而依赖关系几乎不变。返回的 bool 表示**这次查询真的成功了**（false = 未检查，
 // 界面与计划必须如实这么说，不能把"没查成"显示成"没有依赖"）。
+//
+// ⚠️ 超时上限 45 秒（2026-09-21 实测踩到）：brew 会去更新/加载 tap，在测试机
+// 或网络不好的机器上**能挂几分钟**；而这条查询在**市场列表**的渲染路径上，
+// 挂住就等于整个「应用」页白屏（单测里表现为 TestMarketZombieColimaPlistNotInstalled
+// 卡到 15 分钟超时）。拿不到结论时**如实报"未检查"**，绝不假装"没有依赖"，
+// 也绝不拖着整页一起等 —— 这正是铁律 11 的口径。
 func (m *Manager) brewUsesInstalled(ctx context.Context, formula string) ([]string, bool) {
 	if formula == "" {
 		return nil, false
@@ -472,7 +603,10 @@ func (m *Manager) brewUsesInstalled(ctx context.Context, formula string) ([]stri
 	}
 	brewUsesMu.Unlock()
 
-	out, err := m.brewRun(ctx, time.Minute, "uses", "--installed", formula)
+	// 给自己一个硬上限：调用方（市场列表）的 ctx 可能没有 deadline。
+	qctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	out, err := m.brewRun(qctx, 45*time.Second, "uses", "--installed", formula)
 	ok := err == nil
 	deps := []string{}
 	if ok {
@@ -483,15 +617,23 @@ func (m *Manager) brewUsesInstalled(ctx context.Context, formula string) ([]stri
 			}
 		}
 	}
-	brewUsesMu.Lock()
-	brewUsesCache[formula] = brewUsesEntry{deps: deps, ok: ok, at: time.Now()}
-	brewUsesMu.Unlock()
+	// 只缓存**成功**结果：超时/失败不能缓 5 分钟（那会让"未检查"粘住，
+	// 用户修好 brew 之后刷新也还是"未检查"）。
+	if ok {
+		brewUsesMu.Lock()
+		brewUsesCache[formula] = brewUsesEntry{deps: deps, ok: ok, at: time.Now()}
+		brewUsesMu.Unlock()
+	}
 	return deps, ok
 }
 
 // UninstallApp 执行卸载。Kind=service/forget 由 web 层走各自的既有接口，
 // 这里只处理"面板安装器"这一类。
-func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData bool, result *InstallResult) error {
+//
+// force=true 只由 web 层在"用户在确认框里明确选了强制卸载"时传入；它只会被
+// 转交给那些真的跑 `brew uninstall` 的安装器（python / phpmyadmin），其余安装器
+// 忽略它（它们没有 brew 依赖这回事）。
+func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData, force bool, result *InstallResult) error {
 	app, ok := FindApp(appID)
 	if !ok {
 		// 条目已经从应用市场移除（2026-09-16 移除了 Lucky / frps / Orbien 服务端），
@@ -562,7 +704,7 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		return nil
 	}
 	if fn, ok := installerUninstalls[app.PanelInstaller]; ok {
-		return fn(m, ctx, app, removeData, result)
+		return fn(m, ctx, app, removeData, force, result)
 	}
 	// "官方 release 原生二进制"类应用（Lucky / Orbien）：同一套安装器，
 	// 用注册表查而不是在这里再抄一遍 switch，免得加了新应用忘记补卸载。
@@ -580,38 +722,40 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 // 卸载按钮报没有实现"或者"计划里没有卸载实现"。现在 UninstallApp 只查这张表，
 // 全目录门禁测试（TestCatalogUninstallActionMatrix）也查它 ——
 // 有安装器却没有卸载实现，**测试阶段就会失败**，不会等到用户点下去。
-var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app App, removeData bool, result *InstallResult) error{
-	"qwen3tts": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app App, removeData, force bool, result *InstallResult) error{
+	"qwen3tts": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallQwen(ctx, removeData, r)
 	},
-	"voicereceiver": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+	"voicereceiver": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallReceiver(ctx, removeData, r)
 	},
-	"iopaint": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+	"iopaint": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallIOPaint(ctx, removeData, r)
 	},
-	"phpmyadmin": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
-		return m.UninstallPhpMyAdmin(ctx, removeData, r)
+	"phpmyadmin": func(m *Manager, ctx context.Context, _ App, removeData, force bool, r *InstallResult) error {
+		return m.UninstallPhpMyAdmin(ctx, removeData, force, r)
 	},
 	// 基础依赖也允许单独卸载，但由 UninstallBaseDependency 把后果写清楚
-	// （用户要求"明确提示即可，不要禁止"）。
-	"ffmpeg": func(m *Manager, ctx context.Context, app App, _ bool, r *InstallResult) error {
+	// （用户要求"明确提示即可，不要禁止"）。它不走 brew uninstall（保留包），
+	// 所以 force 对它没有意义。
+	"ffmpeg": func(m *Manager, ctx context.Context, app App, _, _ bool, r *InstallResult) error {
 		return m.UninstallBaseDependency(ctx, app, r)
 	},
-	"docker-runtime": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+	"docker-runtime": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallDockerRuntime(ctx, removeData, r)
 	},
-	"miniflux": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+	"miniflux": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallMiniflux(ctx, removeData, r)
 	},
-	"syncthing": func(m *Manager, ctx context.Context, _ App, removeData bool, r *InstallResult) error {
+	"syncthing": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallSyncthing(ctx, removeData, r)
 	},
 	// Python 解释器（应用市场里三个版本共用这一个安装器，见 python_runtime.go）。
 	// 卸载必须如实点名"谁还在用它"（面板自研服务的 venv 只是**指向**它，
-	// 卸掉解释器不会报依赖缺失，而是让那些服务直接起不来）。
-	"python": func(m *Manager, ctx context.Context, app App, _ bool, r *InstallResult) error {
-		return m.UninstallPythonRuntime(ctx, app, r)
+	// 卸掉解释器不会报依赖缺失，而是让那些服务直接起不来）；force 交给
+	// UninstallPythonRuntime 去追加 --ignore-dependencies（只由用户显式选择）。
+	"python": func(m *Manager, ctx context.Context, app App, _, force bool, r *InstallResult) error {
+		return m.UninstallPythonRuntime(ctx, app, force, r)
 	},
 }
 
@@ -676,10 +820,18 @@ func (m *Manager) StopAndForget(ctx context.Context, name string) (bool, error) 
 // 这是"brew 装了但没有面板记录"/"结论是 brew 原生托管服务"两条矩阵行共用的执行体。
 // formula 只认计划里那个（PlanUninstallForBrew 判定采用的真实写法），
 // 绝不在这里拿目录里的 BrewFormula 再猜一次 —— 猜错就是删错包。
-func (m *Manager) UninstallBrewApp(ctx context.Context, app App, plan UninstallPlan, removeData bool, result *InstallResult) error {
+//
+// force=true 表示**用户在确认框里明确选了「强制卸载」**（对应 brew 的
+// `--ignore-dependencies`）。这条路径只能由用户显式选择触发：
+//   - 计划阶段没查出依赖（ForceAllowed=false）时，web 层会拒绝 force 请求；
+//   - 这里再挡一道：计划不允许强制时，force 请求直接报错，绝不悄悄放行。
+func (m *Manager) UninstallBrewApp(ctx context.Context, app App, plan UninstallPlan, removeData, force bool, result *InstallResult) error {
 	formula := plan.Formula
 	if formula == "" {
 		return fmt.Errorf("「%s」的卸载计划里没有 Homebrew formula，无法卸载", app.Name)
+	}
+	if force && !plan.ForceAllowed {
+		return fmt.Errorf("拒绝强制卸载 %s：当前计划没有查出依赖，不需要（也不允许）强制卸载", formula)
 	}
 	// ① 面板记录：停服务 + 删记录（managed=false 的登记记录也走这条 ——
 	// 它同样是"面板里的这条记录"，而 Manager.Uninstall 只收 managed 记录）。
@@ -720,16 +872,297 @@ func (m *Manager) UninstallBrewApp(ctx context.Context, app App, plan UninstallP
 		}
 		return nil
 	}
-	if result != nil {
-		result.step(ctx, "brew uninstall "+formula)
-	}
-	if _, err := m.brewRun(ctx, 10*time.Minute, "uninstall", formula); err != nil {
-		return fmt.Errorf("brew uninstall %s 失败: %w", formula, err)
+	if err := m.brewUninstall(ctx, formula, force, result); err != nil {
+		return err
 	}
 	if result != nil {
 		result.step(ctx, formula+" 已从 Homebrew 卸载")
 	}
+	// PHP：卸载后清掉**这一个版本自己的**配置目录（只列了它的那种）。
+	// brew 自己从不删配置，而它的 warning 会把整个 etc/php 目录列出来 ——
+	// 这里按计划（只含本版本）删，父目录只在空了的情况下才删。
+	if removeData {
+		if err := m.cleanupPHPConfigDirs(ctx, plan.PhpVersion, result); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// brewUninstall 跑一条 `brew uninstall`（force 时追加 --ignore-dependencies）。
+//
+// 命令形状：
+//
+//	brew uninstall <formula>                                  ← 默认，绝不加 force 开关
+//	brew uninstall --ignore-dependencies <formula>            ← 只有用户明确选了强制
+//
+// 环境变量由 brewCommand/brewEnv 统一带 HOMEBREW_NO_AUTOREMOVE=1：
+//
+//	2026-09-21 用户真机：`brew uninstall php` 结束时顺手
+//	`==> Autoremoving 2 unneeded formulae: net-snmp rtmpdump` —— 用户只点了一个卸载，
+//	面板却删了两个跟他这次操作无关的包。带上它就绝不会发生。
+//
+// 标签从真实参数派生（不手写），与实际执行的命令一致。
+//
+// 走 brewInstallRun 而不是裸 brewRunSource：生产路径完全一样（没有注入时它
+// 直接调 brewRunSource），但测试能注入假执行器**锁住命令形状**
+// （没有 force 时必须不含 --ignore-dependencies；force 时才追加它），
+// 而不必真的跑一次 brew uninstall。
+func (m *Manager) brewUninstall(ctx context.Context, formula string, force bool, result *InstallResult) error {
+	args := []string{"uninstall"}
+	if force {
+		args = append(args, "--ignore-dependencies")
+	}
+	args = append(args, formula)
+	if result != nil {
+		if force {
+			result.step(ctx, "⚠️ 强制卸载（ignore dependencies）：brew uninstall --ignore-dependencies "+
+				formula+"（依赖它的包会缺依赖、可能无法运行）")
+		} else {
+			result.step(ctx, "brew uninstall "+formula)
+		}
+	}
+	out, err := m.brewInstallRun(ctx, 10*time.Minute,
+		brewInstallSource{Name: "当前镜像", Env: m.brewEnv(ctx, formula)}, args...)
+	if err != nil {
+		return fmt.Errorf("%s", brewUninstallErrText(formula, force, out, err))
+	}
+	return nil
+}
+
+// brewUninstallErrText 把 brew uninstall 的失败**翻译**成用户能据以行动的说明。
+//
+// 为什么必须有（2026-09-21 用户真机，卸载 python@3.13）：
+//
+//	$ brew uninstall python@3.13
+//	Error: Refusing to uninstall /opt/homebrew/Cellar/python@3.13/3.13.3_1
+//	because it is required by llvm and rust, which are currently installed.
+//	You can override this and force removal with:
+//	  brew uninstall --ignore-dependencies python@3.13
+//
+// 以前面板把这一整段英文原文再贴一遍当错误文案：用户既不知道"谁依赖它"，
+// 也不知道还能怎么办（那段 override 提示被淹在文案里）。现在改成一句人话 +
+// 两个明确动作；**原始输出不丢**，跟在后面供排查。
+func brewUninstallErrText(formula string, force bool, out string, err error) string {
+	deps := parseBrewRequiredBy(out)
+	raw := strings.TrimSpace(out)
+	if raw == "" {
+		raw = err.Error()
+	}
+	prefix := "卸载 " + formula + " 失败："
+	if len(deps) > 0 {
+		if force {
+			// 已经强制了还被拒：如实说清，并给下一步。
+			return prefix + "即使加了 --ignore-dependencies 仍被 Homebrew 拒绝。" +
+				"可先在终端执行 `brew uninstall --ignore-dependencies " + formula + "` 查看完整原因。" +
+				"原始输出：" + truncate(raw, 500)
+		}
+		return prefix + strings.Join(deps, "、") + " 依赖它，brew 拒绝卸载。" +
+			"可以先卸载它们（如果确实不需要了），或选择「强制卸载」" +
+			"（brew uninstall --ignore-dependencies " + formula + "，会破坏 " +
+			strings.Join(deps, "、") + "：它们会缺依赖、可能无法运行）。" +
+			"原始输出：" + truncate(raw, 500)
+	}
+	if isBrewRefusingUninstall(out) {
+		return prefix + "Homebrew 拒绝卸载它（有已安装的包依赖它，或它是别人的依赖）。" +
+			"可以先运行 `brew uses --installed " + formula + "` 看是谁在用。" +
+			"原始输出：" + truncate(raw, 500)
+	}
+	return prefix + truncate(raw, 500)
+}
+
+// ---------- PHP 卸载：只动"这一个版本"的配置 ----------
+
+// phpEtcDir 是 brew 放 PHP 配置的父目录（<prefix>/etc/php）。
+func (m *Manager) phpEtcDir() string {
+	return filepath.Join(m.brewPrefix(), "etc", "php")
+}
+
+// phpVersionOfFormula 从 formula 取 PHP 的版本号（"php@8.4" → "8.4"；"php" → ""）。
+//
+// 为什么允许空：这台机器上的 `php` 就是"当年 brew install php 时装的那个版本"
+// （真机是 8.4.7，见 ResolveBrewFormula 的注释）。卸载 `php` 时配置在
+// etc/php/8.4，从 formula 推不出来 —— 这时宁可不列出任何配置目录，
+// 也**绝不**把别的版本（8.2）写进要删的名单（用户 2026-09-21 的报障）。
+func phpVersionOfFormula(formula string) string {
+	f := strings.TrimSpace(formula)
+	if f == "php" {
+		return ""
+	}
+	if !strings.HasPrefix(f, "php@") {
+		return ""
+	}
+	v := strings.TrimPrefix(f, "php@")
+	for _, r := range v {
+		if (r < '0' || r > '9') && r != '.' {
+			return ""
+		}
+	}
+	return v
+}
+
+// phpVersionFor 决定"这个 PHP formula 在 etc/php 下的版本目录名"。
+//
+// 两条来源，先 exact 再回落：
+//  1. formula 自己带版本（`php@8.4` → "8.4"）；
+//  2. 无版本别名 `php`（这台机器上 brew list 就是 `php 8.4.7`）→ 用 **brew 报出的
+//     真实版本**取主次版本号（"8.4.7" → "8.4"）。
+//
+// 两条都不成立时返回空 —— 这时宁可不列任何配置目录，也**绝不**去猜一个版本号：
+// 猜错就是删别的版本的配置（用户 2026-09-21 报障：卸载 8.4 时看到一堆 8.2 的路径）。
+func (m *Manager) phpVersionFor(formula, brewVersion string) string {
+	if v := phpVersionOfFormula(formula); v != "" {
+		return v
+	}
+	if strings.TrimSpace(formula) != "php" {
+		return ""
+	}
+	v := strings.Split(strings.TrimSpace(brewVersion), " ")[0] // "8.4.7_1"（多版本空格分隔时取第一个）
+	if i := strings.Index(v, "_"); i > 0 {
+		v = v[:i] // 8.4.7_1 → 8.4.7
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	major, minor := parts[0], parts[1]
+	if !allDigits(major) || !allDigits(minor) {
+		return ""
+	}
+	return major + "." + minor
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// phpConfigPathsFor 返回"这个 PHP 版本自己的配置目录"（版本为空 → 什么都不返回）。
+//
+// 用户 2026-09-21 真机（卸载 PHP 8.4）看到的 brew warning：
+//
+//	Warning: The following php configuration files have not been removed!
+//	  /opt/homebrew/etc/php
+//	  /opt/homebrew/etc/php/8.2
+//	  /opt/homebrew/etc/php/8.2/conf.d/ext-opcache.ini
+//	  …
+//	  /opt/homebrew/etc/phpmyadmin.config.inc.php
+//
+// 那是 brew **笼统地列出整个 /opt/homebrew/etc/php 目录**（它从不删配置），
+// 里面 8.2 的路径属于**另一个版本**、phpmyadmin 的配置属于另一个应用。
+// 本函数只认这一个版本的子目录：
+//
+//	<prefix>/etc/php/<版本>        （目录，含 php.ini / php-fpm.conf /
+//	                                 conf.d / php-fpm.d —— 全都在它下面）
+//
+// 只有真的存在于磁盘上才列出来（确认框里写不存在的路径等于骗人）。
+// 父目录 etc/php **不在这里**：它只有在空掉时才由 cleanupPHPConfigDirs 删。
+func (m *Manager) phpConfigPathsFor(version string) []string {
+	if strings.TrimSpace(version) == "" {
+		return nil
+	}
+	dir := filepath.Join(m.phpEtcDir(), version)
+	if !dirExists(dir) {
+		return nil
+	}
+	return []string{dir}
+}
+
+// cleanupPHPConfigDirs 删除"这个 PHP 版本自己的"配置目录，并**只在父目录空了**时删父目录。
+//
+// 两条铁律：
+//   - 绝不碰其它版本（etc/php/8.2）与 phpmyadmin 的配置 —— 那些路径根本不在计划里；
+//   - 父目录 etc/php 里有任何别的东西就保留（删它会带走别的版本与应用配置）。
+//
+// version 与计划里算 DataPaths 时用的是同一个（phpVersionFor），所以"确认框里
+// 写了什么"与"真的删什么"逐字一致。
+func (m *Manager) cleanupPHPConfigDirs(ctx context.Context, version string, result *InstallResult) error {
+	if strings.TrimSpace(version) == "" {
+		return nil
+	}
+	dir := filepath.Join(m.phpEtcDir(), version)
+	if !dirExists(dir) {
+		return nil
+	}
+	if err := m.removeTree(ctx, dir, result); err != nil {
+		return err
+	}
+	// 父目录：只有空掉才删。ReadDir 失败（不存在/无权限）一律保留 —— 宁可留一个空目录。
+	parent := m.phpEtcDir()
+	entries, err := os.ReadDir(parent)
+	if err != nil || len(entries) > 0 {
+		if err == nil && result != nil {
+			result.step(ctx, "保留 "+parent+"（里面还有其它版本/应用的配置，不能删）")
+		}
+		return nil
+	}
+	if result != nil {
+		result.step(ctx, "删除空目录 "+parent)
+	}
+	if err := os.Remove(parent); err != nil && !os.IsNotExist(err) {
+		// 删不掉不是失败：目录还在也不影响任何功能，如实记一行即可。
+		if result != nil {
+			result.step(ctx, "没能删除空目录 "+parent+"（"+err.Error()+"），不影响使用")
+		}
+	}
+	return nil
+}
+
+// parseBrewRequiredBy 从 brew 的拒绝文案里取出依赖方的包名。
+//
+//	"Error: Refusing to uninstall /opt/homebrew/Cellar/python@3.13/3.13.3_1
+//	 because it is required by llvm and rust, which are currently installed."
+//
+// → ["llvm", "rust"]。解析不出来就返回空（调用方退回通用文案 + 原始输出，
+// 绝不编造包名）。
+func parseBrewRequiredBy(out string) []string {
+	low := strings.ToLower(out)
+	idx := strings.Index(low, "because it is required by")
+	if idx < 0 {
+		return nil
+	}
+	rest := out[idx+len("because it is required by"):]
+	// 取到句末/换行；"llvm and rust, which are currently installed."
+	if i := strings.IndexAny(rest, ".\n"); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.Index(rest, ","); i >= 0 {
+		rest = rest[:i]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return nil
+	}
+	// 英文列表连接词：`A and B` / `A, B and C`（逗号已在上面截掉，这里处理 and）。
+	// 用 FieldsFunc 按逗号/空白切，再丢掉纯连接词，避免手写逗号拆分漏掉
+	// `llvm and rust` 这种只有 and 的形态（拆错就会把整句当包名）。
+	deps := []string{}
+	for _, p := range strings.FieldsFunc(rest, func(r rune) bool {
+		return r == ',' || r == ';' || unicode.IsSpace(r)
+	}) {
+		switch strings.ToLower(p) {
+		case "", "and", "or", "&":
+			continue
+		}
+		deps = append(deps, p)
+	}
+	return deps
+}
+
+// isBrewRefusingUninstall 识别 brew 的"因依赖而拒绝卸载"这一类输出
+// （不同 brew 版本的措辞不完全一样）。
+func isBrewRefusingUninstall(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "refusing to uninstall") ||
+		strings.Contains(low, "is required by") ||
+		strings.Contains(low, "ignore-dependencies")
 }
 
 // installerPlan 按安装器给出卸载计划。

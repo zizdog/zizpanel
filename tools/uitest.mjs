@@ -1619,6 +1619,306 @@ try {
     await page.waitForTimeout(2500);
   });
 
+  // ---------- brew 依赖拦下卸载：必须给「强制卸载 / 取消」两个选择（桩数据）----------
+  //
+  // 用户真机（2026-09-21）卸载 python@3.13：
+  //     Error: Refusing to uninstall … because it is required by llvm and rust …
+  //     You can override this and force removal with:
+  //       brew uninstall --ignore-dependencies python@3.13
+  // 面板以前只把这段英文原文贴回来 —— 用户既看不懂，也不知道还能选强制卸载。
+  //
+  // 这条断言走桩，锁住新的交互契约：
+  //   ① blocked + force_allowed 的计划点「卸载」→ 必须出现说明对话框，
+  //      逐字写明"会破坏 llvm、rust"与真实命令 `--ignore-dependencies`，
+  //      且**恰好**两个选择：取消 / 强制卸载；
+  //   ② 点「取消」→ 一个请求都不发；
+  //   ③ 点「强制卸载」→ 确认框 → 确认后 DELETE 发出去，且 URL 带 `force=1`。
+  //
+  // 绝不真的卸载任何东西：DELETE 被桩成 202 + 假任务（进度流也是假的）。
+  await step('brew 依赖拦下卸载：出「强制卸载 / 取消」说明框，取消不发请求、强制带 force=1（桩数据）', async () => {
+    const NAME = 'uitest-brew-blocked';
+    const LABEL = 'UITEST brew·被依赖拦下';
+    const FORCE_NOTE = '强制卸载会破坏这些包：llvm、rust（它们会缺依赖、可能无法运行）。'
+      + '命令：brew uninstall --ignore-dependencies python@3.13';
+    const deletes = [];
+
+    // 桩返回的假任务 id 会让 SSE 404 —— 那是断言对象，不算前端故障。
+    expectHTTPError = true;
+
+    const closeAllModals = async () => {
+      for (let i = 0; i < 5; i++) {
+        const masks = page.locator('.modal-mask');
+        if (!(await masks.count())) break;
+        const x = masks.last().locator('button.modal-close').first();
+        if (await x.count()) await x.click().catch(() => {});
+        await page.waitForTimeout(250);
+      }
+    };
+
+    await page.route('**/api/v1/services**', (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      if (req.method() === 'GET' && (path === 'services' || path === 'services/health')) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+          ok: true, data: { list: [{ name: NAME, display_name: LABEL, kind: 'native',
+            managed: false, state: { running: false, status: 'stopped' } }] },
+        }) });
+      }
+      if (req.method() === 'GET' && /^services\/[^/]+$/.test(path)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+          ok: true, data: { name: NAME, display_name: LABEL, kind: 'native', managed: false,
+            state: { running: false, status: 'stopped' } },
+        }) });
+      }
+      if (req.method() === 'GET' && /credentials$/.test(path)) {
+        return route.fulfill({ status: 200, contentType: 'application/json',
+          body: JSON.stringify({ ok: true, data: { credentials: [] } }) });
+      }
+      return route.continue();
+    });
+    // 市场目录：一条"brew 依赖拦下、但允许强制卸载"的条目。
+    await page.route('**/api/v1/market**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: {
+        list: [{
+          id: NAME, name: LABEL, installed: true,
+          uninstall: {
+            kind: 'brew', formula: 'python@3.13',
+            steps: ['brew uninstall python@3.13', '⚠️ llvm、rust 依赖它'],
+            blocked: 'brew 拒绝卸载 python@3.13：llvm、rust 依赖它。可以先卸载它们，'
+              + '或选择强制卸载（brew uninstall --ignore-dependencies python@3.13，'
+              + '会破坏 llvm、rust：它们会缺依赖、可能无法运行）',
+            force_allowed: true,
+            force_note: FORCE_NOTE,
+            dependents: [
+              { kind: 'brew', name: 'llvm', detail: 'Homebrew 包 llvm 依赖 python@3.13' },
+              { kind: 'brew', name: 'rust', detail: 'Homebrew 包 rust 依赖 python@3.13' },
+            ],
+          },
+        }],
+      } }),
+    }));
+    // DELETE 一律掉进桩里（记 URL、回假 202）—— 绝不真的 brew uninstall。
+    await page.route('**/api/v1/market/*', (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      deletes.push(route.request().url());
+      return route.fulfill({ status: 202, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-brew-force', title: '卸载 ' + LABEL } }) });
+    });
+    // 假任务进度流：立刻回"成功"并结束，避免假任务一直重连不存在的流刷 404。
+    await page.route('**/api/v1/tasks**', (route) => {
+      const m = route.request().url().match(/\/api\/v1\/tasks\/([^/?]+)\/stream/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200, headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '卸载', status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '卸载', status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }) });
+    });
+
+    // 必须制造一次 hash 变化，视图才会用刚注册的桩重新拉数据（同上面的步骤）。
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(500);
+    await page.goto(page.url().split('#')[0] + '#/services');
+    await page.waitForTimeout(2500);
+
+    const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
+    await card.waitFor({ timeout: 15000 });
+    await card.locator('button:has-text("管理")').click();
+    const unBtn = page.locator('.modal-mask button:text-is("卸载")').last();
+    await unBtn.waitFor({ timeout: 8000 });
+
+    // ① 点「卸载」→ 说明对话框（不是 toast、不是直接确认框）
+    const masksBefore = await page.locator('.modal-mask').count();
+    await unBtn.click();
+    const dlg = page.locator('.modal-mask', { hasText: '还不能卸载' }).last();
+    await dlg.waitFor({ timeout: 8000 });
+    const dlgText = await dlg.locator('.modal-body').innerText();
+    for (const need of ['llvm', 'rust', '强制卸载', '--ignore-dependencies']) {
+      if (!dlgText.includes(need)) {
+        throw new Error('说明对话框没有写清「' + need + '」（用户必须看到会破坏什么、执行什么命令）：\n' + dlgText);
+      }
+    }
+    if (await dlg.locator('button:text-is("取消")').count() !== 1
+      || await dlg.locator('button:text-is("强制卸载")').count() !== 1) {
+      throw new Error('说明对话框必须恰好给「取消」与「强制卸载」两个选择');
+    }
+    await shot('30g-brew-force-dialog');
+
+    // ② 点「取消」→ 一个请求都不发，且没有多出确认框
+    await dlg.locator('button:text-is("取消")').click();
+    await page.waitForTimeout(500);
+    if (deletes.length !== 0) {
+      throw new Error('点了取消却发了卸载请求：' + JSON.stringify(deletes));
+    }
+    if (await page.locator('.modal-mask', { hasText: '将执行：' }).count()) {
+      throw new Error('点了取消反而弹出了卸载确认框（应当什么都不做）');
+    }
+    if (await page.locator('.modal-mask').count() > masksBefore) {
+      throw new Error('取消之后留下了多余的弹窗');
+    }
+
+    // ③ 再次点「卸载」→ 强制卸载 → 确认框（勾选已预置）→ 确认 → DELETE 带 force=1
+    const unBtn2 = page.locator('.modal-mask button:text-is("卸载")').last();
+    await unBtn2.click();
+    const dlg2 = page.locator('.modal-mask', { hasText: '还不能卸载' }).last();
+    await dlg2.waitFor({ timeout: 8000 });
+    await dlg2.locator('button:text-is("强制卸载")').click();
+    await page.waitForTimeout(700);
+    await shot('30h0-after-force-click');
+    {
+      const masks = page.locator('.modal-mask');
+      const n = await masks.count();
+      const texts = [];
+      for (let i = 0; i < n; i++) texts.push((await masks.nth(i).innerText()).slice(0, 200));
+      console.log('  [debug] force 之后弹窗数=' + n + ' 删除请求=' + JSON.stringify(deletes)
+        + '\n' + texts.map((t, i) => '   #' + i + ': ' + t.replace(/\n/g, ' | ')).join('\n'));
+    }
+    // 确认框用稳定标记选中：说明框里也写了"将执行…"那句命令，按文本选会选错框。
+    const confirm = page.locator('.modal-mask:has([data-confirm-uninstall])').last();
+    await confirm.waitFor({ timeout: 8000 });
+    const confirmText = await confirm.locator('.modal-body').innerText();
+    if (!confirmText.includes('llvm') || !confirmText.includes('--ignore-dependencies')) {
+      throw new Error('强制卸载确认框没有写清会破坏哪些包/执行什么命令：\n' + confirmText);
+    }
+    const forceBox = confirm.locator('input[type="checkbox"]').first();
+    if (!(await forceBox.isChecked())) {
+      throw new Error('从「强制卸载」进来时，确认框里的强制开关应当是已勾选的');
+    }
+    await shot('30h-brew-force-confirm');
+    // 按钮文字必须跟着勾选变成「强制卸载」（用户按下去之前就看得见自己在做什么）
+    const okBtn = confirm.locator('button.btn-danger').last();
+    const okText = (await okBtn.innerText()).trim();
+    if (!okText.includes('强制卸载')) {
+      throw new Error('强制勾选后确认按钮应显示「强制卸载」，实际「' + okText + '」');
+    }
+    await okBtn.click();
+    await page.waitForTimeout(800);
+    if (deletes.length !== 1) {
+      throw new Error('确认强制卸载后应恰好发一次 DELETE，实际 ' + deletes.length + ' 次：' + JSON.stringify(deletes));
+    }
+    if (!/[?&]force=1\b/.test(deletes[0])) {
+      throw new Error('强制卸载的请求 URL 必须带 force=1（否则后端会按普通卸载拒绝）：' + deletes[0]);
+    }
+    await shot('30i-brew-force-task');
+
+    // 收尾：撤桩 + 恢复真实数据
+    await closeAllModals();
+    await page.evaluate(() => {
+      document.querySelectorAll('.toasts .toast').forEach((n) => n.remove());
+    });
+    await page.unroute('**/api/v1/services**');
+    await page.unroute('**/api/v1/market**');
+    await page.unroute('**/api/v1/market/*');
+    await page.unroute('**/api/v1/tasks**');
+    expectHTTPError = false;
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(800);
+    await page.click('.nav-item:has-text("应用")');
+    await page.waitForTimeout(2500);
+  });
+
+  // ---------- 状态命名：没有守护进程 / 装了但无面板记录 → 绝不写「已停止」----------
+  //
+  // 用户 2026-09-21 原话："以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、
+  // FFmpeg、Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
+  // 真机事实：ffmpeg / python@x.y / phpMyAdmin 是 no_daemon（**根本没有常驻进程**），
+  // 本机 nginx **正在 :80 上跑**，只是面板里没有它的服务记录。两类都不是"已停止"。
+  //
+  // 这条断言走桩（确定性、不依赖本机装了什么）：
+  //   ① no_daemon（ffmpeg）卡片：写"命令行工具/网页入口，无常驻进程"，**没有**「已停止」；
+  //   ② 装了但面板无记录（有守护进程）的卡片：写"已安装（面板里暂无记录）"+ 端口是否监听
+  //      （查不到就明写"未检测"），**没有**「已停止」；
+  //   ③ 点工具栏「已停止」筛选：这两张卡片都**不该**出现。
+  await step('状态命名：no_daemon / 装了但无面板记录都不许写「已停止」（桩数据）', async () => {
+    const NOD = { id: 'uitest-nodaemon', name: 'UITEST 命令行工具（无常驻进程）', installed: true, adopted: false,
+      no_daemon: true, kind: 'native', port: 0,
+      uninstall: { kind: 'installer', steps: ['brew uninstall uitest-nodaemon'] } };
+    const NOREC = { id: 'uitest-norecord', name: 'UITEST 装了但无面板记录', installed: true, adopted: false,
+      no_daemon: false, kind: 'native', port: 80, service_in_launchd: false,
+      uninstall: { kind: 'brew', formula: 'uitest-norecord', steps: ['brew uninstall uitest-norecord'] } };
+
+    await page.route('**/api/v1/services**', (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      if (req.method() === 'GET' && (path === 'services' || path === 'services/health')) {
+        // 一条**真的** Stopped 的服务记录：它才该出现在「已停止」里（对照组）。
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+          ok: true, data: { list: [{ name: 'uitest-really-stopped', display_name: 'UITEST 真停了',
+            kind: 'native', managed: true, state: { running: false, status: 'stopped' } }] },
+        }) });
+      }
+      return route.continue();
+    });
+    await page.route('**/api/v1/market**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { list: [NOD, NOREC] } }),
+    }));
+    await page.route('**/api/v1/market/*', (route) => route.continue());
+
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(500);
+    await page.goto(page.url().split('#')[0] + '#/services');
+    await page.waitForTimeout(2500);
+
+    const cardOf = (name) => page.locator('#installed-grid > div', { hasText: name }).first();
+    const nod = cardOf(NOD.name);
+    const norec = cardOf(NOREC.name);
+    await nod.waitFor({ timeout: 15000 });
+    await norec.waitFor({ timeout: 15000 });
+
+    const nodText = await nod.innerText();
+    const norecText = await norec.innerText();
+    if (nodText.includes('已停止')) {
+      throw new Error('no_daemon 的卡片写了「已停止」（它根本没有常驻进程，这是假信息）：\n' + nodText);
+    }
+    if (!/无常驻进程/.test(nodText)) {
+      throw new Error('no_daemon 的卡片没有如实写"无常驻进程"：\n' + nodText);
+    }
+    if (norecText.includes('已停止')) {
+      throw new Error('"装了但面板里没有记录"的卡片写了「已停止」（面板根本不知道它停没停）：\n' + norecText);
+    }
+    if (!/已安装（面板里暂无记录）/.test(norecText)) {
+      throw new Error('"装了但无面板记录"的卡片没有如实写「已安装（面板里暂无记录）」：\n' + norecText);
+    }
+    if (!/端口/.test(norecText)) {
+      throw new Error('"装了但无面板记录"的卡片没有给出端口监听结论（查不到也要明写"未检测"）：\n' + norecText);
+    }
+    await shot('30j-status-honest-labels');
+
+    // 点「已停止」筛选：只有**真的有记录且状态是停止**的那张该出现。
+    await page.locator('#installed-toolbar button', { hasText: '已停止' }).first().click();
+    await page.waitForTimeout(600);
+    const filtered = await page.locator('#installed-grid > div').allInnerTexts();
+    const joined = filtered.join('\n');
+    if (joined.includes(NOD.name)) {
+      throw new Error('「已停止」筛选里出现了 no_daemon 的应用（它没有可停止的东西）：\n' + joined);
+    }
+    if (joined.includes(NOREC.name)) {
+      throw new Error('「已停止」筛选里出现了"面板无记录"的应用（面板不知道它停没停）：\n' + joined);
+    }
+    if (!joined.includes('UITEST 真停了')) {
+      throw new Error('「已停止」筛选没有命中**真的** Stopped 的那条服务记录：\n' + joined);
+    }
+    await shot('30k-stopped-filter-honest');
+
+    // 复位筛选并撤桩，别影响后面的步骤。
+    await page.locator('#installed-toolbar button', { hasText: '全部' }).first().click();
+    await page.waitForTimeout(400);
+    await page.unroute('**/api/v1/services**');
+    await page.unroute('**/api/v1/market**');
+    await page.unroute('**/api/v1/market/*');
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(800);
+    await page.click('.nav-item:has-text("应用")');
+    await page.waitForTimeout(2500);
+  });
+
   // ---------- compose 记录 + 运行时不可用：必须有"只删记录"的出口（2026-09 真机缺陷）----------
   //
   // 用户真机：删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，点卸载报

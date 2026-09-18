@@ -364,6 +364,20 @@ func NewManager(repo *Repository, opt Options) *Manager {
 	return &Manager{repo: repo, opt: opt}
 }
 
+// SetBrewUsesProbeForTest 替换 `brew uses --installed <formula>` 的探测，返回值供测试恢复。
+//
+// 为什么必须是**导出**的（2026-09-21）：卸载计划现在会在市场列表里逐条查 brew 依赖
+// （用户要求"卸载前把谁依赖它讲清楚"），而 web 层的单测通过 svcManager() 现造
+// Manager，够不到未导出的 brewUsesProbe 字段 —— 于是 `go test ./internal/web/`
+// 会真的去跑开发机的 /opt/homebrew/bin/brew uses，在开着 tap 自动更新的机器上
+// 能挂十几分钟（TestMarketZombieColimaPlistNotInstalled 实际卡到 15 分钟超时）。
+// 单测不许碰真实 brew（同 brewInstalledProbe / mirrorProbeOverride 的理由）。
+func (m *Manager) SetBrewUsesProbeForTest(fn func(ctx context.Context, formula string) ([]string, bool)) func() {
+	prev := m.brewUsesProbe
+	m.brewUsesProbe = fn
+	return func() { m.brewUsesProbe = prev }
+}
+
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，
 // 按确定性从高到低排列。
 //

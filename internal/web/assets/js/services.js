@@ -27,7 +27,7 @@ import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from 
 // mergeAppEntries（去重）与 appCardShell（卡片 DOM）逻辑都只此一份。
 import {
   openServicePanel, openOnlyAction, portAccessWarning, appCardShell,
-  mergeAppEntries, statusLine, marketQuickActions,
+  mergeAppEntries, statusLine, marketQuickActions, portCheckNote,
 } from './servicePanel.js';
 
 // 「已安装」的状态筛选（全部 / 运行中 / 已停止 / 需要处理）。
@@ -112,6 +112,15 @@ export function renderInstalledApps(container, opts = {}) {
     const st = (e.svc && e.svc.state) || {};
     if (stateFilter === 'running') return !!st.running;
     if (stateFilter === 'stopped') {
+      // 「已停止」的判据必须**真的有服务在报停止状态**。
+      //
+      // 2026-09-21 用户发火："以下应用都被归类到了：已停止分类中：Docker 运行时
+      // （Colima）、FFmpeg、Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的
+      // 不运行吗？！" —— 那些条目**没有服务记录**（ffmpeg/python/phpMyAdmin 是
+      // no_daemon，本机 nginx 只是没登记），以前 `!st.running && st.status !== …`
+      // 对空 state 也成立，于是它们被塞进"已停止"，那是假信息。
+      // 现在只有"有服务记录、且状态就是停止"才算；没有记录 = 面板不知道，不算。
+      if (!e.svc) return false;
       return !st.running && st.status !== 'error' && st.status !== 'unavailable';
     }
     if (stateFilter === 'problem') return problemOf(e);
@@ -199,7 +208,7 @@ export function renderInstalledApps(container, opts = {}) {
   function installedCard(e) {
     const m = e.market;
     const s = e.svc;
-    const line = statusLine(s && s.state, m);
+    const line = statusLine(s && s.state, m, s);
     const health = (s && s.health) || {};
     const name = (s && (s.display_name || s.name)) || (m && m.name) || e.key;
     const icon = (s && s.icon) || (m && m.icon) || '🧩';
@@ -270,6 +279,16 @@ export function renderInstalledApps(container, opts = {}) {
         text: (health.message || '') + ' —— 该地址要求登录，服务本身是正常的',
       })]
       : [];
+    // 装了、但面板里没有它的服务记录（2026-09-21 用户发火的那一类）：
+    // 卡片上要**主动说清楚**，而不是让用户去猜"它到底跑没跑"。
+    // 端口是否监听只用后端真的做过的健康检查结论；没查过就明写"未检测"。
+    const noRecordNote = (!s && m && (m.installed || m.adopted) && !m.no_daemon)
+      ? [h('div', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        text: '面板里还没有它的服务记录 —— 拿不到配置文件路径与日志；'
+          + portCheckNote(m, s),
+      })]
+      : [];
     const extra = (health.checked && !health.ok)
       ? [h('div', { style: { fontSize: '11.5px', color: 'var(--danger)' } }, [
         h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
@@ -288,7 +307,7 @@ export function renderInstalledApps(container, opts = {}) {
       subtitle,
       pills,
       text,
-      extra: [...extra, ...authNote],
+      extra: [...extra, ...authNote, ...noRecordNote],
       // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-20 真的漏过一次，
       // 是 make smoke 的"必须能点到管理/卸载"断言抓到的 —— 别删这一行）。
       actions,

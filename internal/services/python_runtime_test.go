@@ -205,7 +205,7 @@ func TestUninstallPythonRuntimeHonestFailures(t *testing.T) {
 	// ① brew 不存在
 	m1, _ := sandboxManager(t)
 	m1.opt.BrewBin = filepath.Join(t.TempDir(), "nope", "bin", "brew")
-	if err := m1.UninstallPythonRuntime(context.Background(), app, &InstallResult{}); err == nil {
+	if err := m1.UninstallPythonRuntime(context.Background(), app, false, &InstallResult{}); err == nil {
 		t.Fatal("找不到 brew 时必须报错，不能假装已经卸载/没装")
 	}
 
@@ -220,7 +220,7 @@ func TestUninstallPythonRuntimeHonestFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := &InstallResult{}
-	if err := m2.UninstallPythonRuntime(context.Background(), app, res); err != nil {
+	if err := m2.UninstallPythonRuntime(context.Background(), app, false, res); err != nil {
 		t.Fatalf("正常卸载不该失败：%v", err)
 	}
 	joined := strings.Join(res.Steps, "\n")

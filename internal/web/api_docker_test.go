@@ -289,6 +289,9 @@ func newDockerTestServerFull(t *testing.T, sock string, runtimeProbe func(contex
 		t.Fatal(err)
 	}
 	srv.dockerRuntimeProbeOverride = runtimeProbe
+	// 同 newTestServer：卸载计划会查 `brew uses --installed`，单测绝不跑真实 brew
+	//（真的跑会去更新 tap，能挂十几分钟）。
+	stubBrewUsesProbe(t, srv)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 

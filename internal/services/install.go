@@ -358,9 +358,15 @@ type brewInstallSource struct {
 //
 // 自动更新会在每次 brew 命令前拉一遍仓库元数据（国内很慢，面板自己管安装）；
 // NO_INSTALL_CLEANUP 防止 brew 在我们想保留旧版本时自行清理。
+//
+// NO_AUTOREMOVE（2026-09-21 用户真机）：`brew uninstall php` 结束时会顺手
+// `Autoremoving 2 unneeded formulae: net-snmp rtmpdump` —— 用户只是卸载 PHP，
+// 面板却把两个**跟他这次操作无关**的包一起删了。所以所有 brew 命令（尤其
+// uninstall）都必须带上它：卸载只删用户点名的那一个包。
 var brewCommonEnv = []string{
 	"HOMEBREW_NO_AUTO_UPDATE=1",
 	"HOMEBREW_NO_INSTALL_CLEANUP=1",
+	"HOMEBREW_NO_AUTOREMOVE=1",
 }
 
 // brewTUNABase 是"另一个国内镜像"（清华 TUNA）的 Homebrew 瓶基址。
@@ -1103,12 +1109,11 @@ func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 	// 为什么不能写成 `HOMEBREW_API_DOMAIN=`（空值）：Homebrew 是 Ruby 写的，
 	// ENV 里存在但为空串不等于"未设置"（`ENV["X"]` 会返回 ""，仍然被当成已配置），
 	// brew 会拿着空域去拼 URL。历史上的注释说"不设"，代码却在设空值 —— 这次一起修掉。
-	env := []string{
-		// 自动更新会在每次 brew 命令前拉一遍仓库元数据：国内很慢，而且我们
-		// 不需要它（面板自己管安装）。
-		"HOMEBREW_NO_AUTO_UPDATE=1",
-		"HOMEBREW_NO_INSTALL_CLEANUP=1",
-	}
+	// 公共开关（NO_AUTO_UPDATE / NO_INSTALL_CLEANUP / **NO_AUTOREMOVE**）一律走
+	// brewCommonEnv：卸载绝不能顺手删掉用户没点名的包（2026-09-21 真机：卸 PHP 时
+	// 带走了 net-snmp / rtmpdump）。写在**两个列表里**是刻意的 —— 这里与
+	// brewCommand 各一份兜底，将来漏改一处也不会让 uninstall 退回自动清理。
+	env := append([]string(nil), brewCommonEnv...)
 	if v := pick("HOMEBREW_API_DOMAIN", apiDomain); v != "" {
 		env = append(env, "HOMEBREW_API_DOMAIN="+v)
 	}

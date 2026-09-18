@@ -180,7 +180,12 @@ func (m *Manager) pythonRuntimeDependents(formula string) []string {
 //
 // 诚实要求：卸载前把"谁还在用它"写进步骤与结果里；brew uninstall 失败（例如
 // 别的 formula 依赖它）时**如实报错**，不许吞掉当成卸载成功。
-func (m *Manager) UninstallPythonRuntime(ctx context.Context, app App, result *InstallResult) error {
+//
+// force=true = 用户在确认框里明确选了「强制卸载」（brew uninstall
+// --ignore-dependencies）。默认**绝不**加这个开关：2026-09-21 用户真机卸载
+// python@3.13 时正是 brew 因为 llvm/rust 依赖它而拒绝，面板需要先把依赖方
+// 讲清楚并让用户自己选（见 BrewDependencyBlock 与 brewUninstallErrText）。
+func (m *Manager) UninstallPythonRuntime(ctx context.Context, app App, force bool, result *InstallResult) error {
 	formula := app.BrewFormula
 	if strings.TrimSpace(formula) == "" {
 		return fmt.Errorf("「%s」没有声明 BrewFormula，无法卸载", app.Name)
@@ -201,12 +206,8 @@ func (m *Manager) UninstallPythonRuntime(ctx context.Context, app App, result *I
 		}
 		return nil
 	}
-	if result != nil {
-		result.step(ctx, "正在 brew uninstall "+formula)
-	}
-	out, err := m.brewRun(ctx, 10*time.Minute, "uninstall", formula)
-	if err != nil {
-		return fmt.Errorf("卸载 %s 失败：%v。brew 的输出：%s", formula, err, truncate(strings.TrimSpace(out), 500))
+	if err := m.brewUninstall(ctx, formula, force, result); err != nil {
+		return err
 	}
 	if result != nil {
 		result.step(ctx, formula+" 已卸载")

@@ -82,7 +82,7 @@ func TestUninstallAppRemovesServiceAndKeepsDataByDefault(t *testing.T) {
 	}
 
 	res := &InstallResult{App: "iopaint", Steps: []string{}}
-	if err := m.UninstallApp(ctx, "iopaint", false, res); err != nil {
+	if err := m.UninstallApp(ctx, "iopaint", false, false, res); err != nil {
 		t.Fatalf("卸载失败: %v", err)
 	}
 	// 记录必须没了
@@ -101,7 +101,7 @@ func TestUninstallAppRemovesServiceAndKeepsDataByDefault(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UninstallApp(ctx, "iopaint", true, res); err != nil {
+	if err := m.UninstallApp(ctx, "iopaint", true, false, res); err != nil {
 		t.Fatalf("带数据卸载失败: %v", err)
 	}
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
@@ -139,7 +139,7 @@ func TestUninstallDockerRuntimeBlockedByComposeApps(t *testing.T) {
 	if !strings.Contains(plan.Blocked, "Uptime Kuma") {
 		t.Errorf("拦截说明里要点名是哪个应用，实际：%s", plan.Blocked)
 	}
-	if err := m.UninstallApp(ctx, "docker-runtime", false, &InstallResult{Steps: []string{}}); err == nil {
+	if err := m.UninstallApp(ctx, "docker-runtime", false, false, &InstallResult{Steps: []string{}}); err == nil {
 		t.Error("被拦住时 UninstallApp 也必须拒绝，不能只靠界面")
 	}
 }
@@ -323,7 +323,7 @@ func TestUninstallAppRemovesLegacyNativeAndComposeLeftovers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := m.UninstallApp(context.Background(), "frps", true, &InstallResult{Steps: []string{}}); err != nil {
+	if err := m.UninstallApp(context.Background(), "frps", true, false, &InstallResult{Steps: []string{}}); err != nil {
 		t.Fatalf("已移除条目的残留应仍能清理：%v", err)
 	}
 	for _, d := range []string{composeProj, legacy} {
