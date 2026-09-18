@@ -172,6 +172,17 @@ export function AppsView(content, ctx = {}) {
         onclick: () => { if (active === t.id) return; active = t.id; renderTabBar(); renderBody(); },
       }));
     }
+    // 后端这次**没能复核**「本机装了哪些 Homebrew 包」（brew_probe_ok=false）时，
+    // 如实说出来：列表里那些「安装」只代表"没查成"，不代表东西真的没装
+    //（铁律 11：不许把"不知道"显示成"没有"）。没有这条提示，一次 brew 超时
+    // 就会让用户以为自己的软件全被卸了 —— 那正是 2026-09-23 那一类报障。
+    if (cache && cache.brew_probe_ok === false) {
+      tabBar.appendChild(h('span.pill.warn', {
+        text: '⚠ 未能复核已装软件',
+        title: '这次没能读到 Homebrew 的已装清单（brew 不可用或超时）：'
+          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新」重试。',
+      }));
+    }
   }
 
   function renderBody() {

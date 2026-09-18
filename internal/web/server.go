@@ -60,7 +60,12 @@ type Server struct {
 	// （formula → 版本串）。卸载计划要把目录里的 `php@8.4` 对到机器上真实装的
 	// `php 8.4.7`（见 services.ResolveBrewFormula）—— 没有版本就只能精确匹配，
 	// 于是"装着 PHP 8.4 的机器"在市场里显示成未安装、连卸载入口都没有。
-	mktBrewVer  map[string]string
+	mktBrewVer map[string]string
+	// mktBrewOK 表示 mktBrew 这一次是**真的探测成功**的结论（而不是"brew 探测失败
+	// 时返回的空集合"）。二者必须分开：把失败的空集合当成"这台机器什么都没装"，
+	// 会让全部只靠 brew 证据的条目一起显示「安装」（2026-09-23 用户报障的那一类）。
+	// false 时缓存按 marketProbeMissTTL 很快重试，且前端会如实标"未复核"。
+	mktBrewOK   bool
 	mktBrewAt   time.Time
 	mktDocker   string
 	mktDockerV  string

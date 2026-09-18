@@ -35,7 +35,9 @@ func matrixManager(t *testing.T) *Manager {
 	m, _ := sandboxManager(t)
 	m.opt.BrewBin = filepath.Join(t.TempDir(), "nonexistent-brew")
 	m.launchdDirsOverride = []string{filepath.Join(t.TempDir(), "LaunchDaemons")}
-	m.brewInstalledProbe = func(context.Context) map[string]string { return map[string]string{} }
+	m.brewInstalledProbe = func(context.Context) (map[string]string, bool) {
+		return map[string]string{}, true
+	}
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return nil, true }
 	t.Cleanup(resetBrewUsesCache)
 	return m
@@ -153,8 +155,8 @@ func TestBrewStateForRequiresRealEvidence(t *testing.T) {
 // （那只会得到 "No such keg"）。
 func TestPlanUninstallPhp84UsesRealFormula(t *testing.T) {
 	m := matrixManager(t)
-	m.brewInstalledProbe = func(context.Context) map[string]string {
-		return map[string]string{"php": "8.4.7", "php@8.2": "8.2.33"}
+	m.brewInstalledProbe = func(context.Context) (map[string]string, bool) {
+		return map[string]string{"php": "8.4.7", "php@8.2": "8.2.33"}, true
 	}
 	plan := m.PlanUninstall(context.Background(), "php84")
 	if plan.Kind != "brew" {
@@ -167,8 +169,8 @@ func TestPlanUninstallPhp84UsesRealFormula(t *testing.T) {
 		t.Errorf("计划步骤里必须有 `brew uninstall php`：%v", plan.Steps)
 	}
 	// nginx 现场：brew 装着、面板没有记录、也没有残留目录 → 必须有卸载路径。
-	m.brewInstalledProbe = func(context.Context) map[string]string {
-		return map[string]string{"nginx": "1.31.5"}
+	m.brewInstalledProbe = func(context.Context) (map[string]string, bool) {
+		return map[string]string{"nginx": "1.31.5"}, true
 	}
 	nplan := m.PlanUninstall(context.Background(), "nginx")
 	if nplan.Kind != "brew" || nplan.Formula != "nginx" {

@@ -126,6 +126,33 @@ type App struct {
 	// （phpMyAdmin 就是这种：nginx alias + php-fpm，没有自己的守护进程）。
 	// 有了它，市场就不会把"launchd 里找不到服务"当成异常去吓用户。
 	NoDaemon bool `json:"no_daemon,omitempty"`
+	// RuntimePath 是这个应用**装出来的真实产物**（安装体 / 运行体）在磁盘上的路径。
+	//
+	// 为什么需要它：目录里有一批条目**没有常驻服务**（NoDaemon），面板不会给它们
+	// 建服务记录（建了就是"永远没有状态的假记录"，ffmpeg 当年就是这么被误报的），
+	// 于是它们的「已安装」过去**只**来自 `brew list --versions` 的一句话。
+	// 那句话一旦缺席（探测失败/超时、市场缓存还没刷新、用户是手工装的），
+	// 判据就整个落空 —— 界面把明明装着的东西显示成「安装」。
+	// 2026-09-23 用户报障的正是这一类：
+	//   · 「图片压缩（libvips）安装成功后没变化、不在已安装里、还显示安装按钮」；
+	//   · 「phpMyAdmin 在应用市场里是未安装状态，很明显是判断错误。它是有状态的
+	//      目录，只要判断这个目录在，就是安装！」
+	//
+	// 判据贴着**运行体**（AGENTS 第三节），不看服务登记、也不看"有没有 plist"：
+	//   · 指向**可执行文件** → 文件存在且带可执行位才算（vips / ffmpeg / python3.x）；
+	//     悬空软链接（指向已删除的 Cellar）不算 —— 与 BrewStateFor 同一条口径；
+	//   · 指向**目录**       → 目录存在，且 RuntimeEntry（入口文件，如 index.php）也在。
+	// 支持 `{brew}` 前缀与 `~/` 家目录展开（与 ConfigPath 同一套约定）。
+	//
+	// ⚠️ 只给"装出来的东西就是它本身"的条目声明（纯 CLI 引擎 / 网页入口）。
+	// 面板自研安装器的应用（iopaint / qwen3tts / voicereceiver …）**不要**声明：
+	// 它们的虚拟环境/模型在卸载后会作为"残留数据"留下（InstallerArtifactExists），
+	// 声明成安装体就会把卡片永久钉在「已安装」上、用户再也点不到「安装」
+	//（2026-09-16 用户反馈的"卸载完成后连安装的入口都没有"）。
+	RuntimePath string `json:"runtime_path,omitempty"`
+	// RuntimeEntry 是 RuntimePath 为**目录**时要求的入口文件（相对路径）。
+	// 目录在、入口文件不在 = 没装好（例如 web 根被清空了），不算已安装。
+	RuntimeEntry string `json:"runtime_entry,omitempty"`
 	// SystemDaemon 表示这个应用**必须开机就在**（数据库 / Web 服务 / 同步守护 /
 	// 推理后端 / 站点赖以运行的 PHP-FPM），因此要装成**系统级 LaunchDaemon**
 	// （以真实用户身份运行），而不是 brew 默认的用户级 LaunchAgent。
@@ -580,9 +607,14 @@ func Catalog() []App {
 			Summary:     "数据库管理界面（推荐入口）",
 			Description: "库表管理界面（面板自带的只作应急）；依赖 nginx + PHP，装完从面板打开。",
 			Category:    "tool", Kind: KindNative, PanelInstaller: "phpmyadmin", BrewFormula: "phpmyadmin",
-			Port:       0,
-			HealthPath: "/phpmyadmin/",
-			DocsURL:    "https://www.phpmyadmin.net",
+			// 安装体 = **web 根目录**（不是服务、也不是 brew 记录）：
+			// 用户 2026-09-23 的原话是"它是有状态的目录，只要判断这个目录在，就是安装"。
+			// 路径与 internal/services/phpmyadmin.go 的 pmaPaths().Share 同源。
+			RuntimePath:  "{brew}/share/phpmyadmin",
+			RuntimeEntry: "index.php",
+			Port:         0,
+			HealthPath:   "/phpmyadmin/",
+			DocsURL:      "https://www.phpmyadmin.net",
 		},
 
 		// ---------------- 网站环境（LNMP，原生安装） ----------------
@@ -710,8 +742,10 @@ func Catalog() []App {
 			BrewFormula:    "ffmpeg",
 			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
 			NoDaemon: true,
-			Port:     0,
-			DocsURL:  "https://ffmpeg.org",
+			// 安装体 = brew 前缀下的可执行文件（"装了没有"贴着它判，不看服务登记）。
+			RuntimePath: "{brew}/bin/ffmpeg",
+			Port:        0,
+			DocsURL:     "https://ffmpeg.org",
 		},
 		// 图片压缩（libvips）。用户 2026-09-18 要求"为软件市场添加一个图片压缩软件"
 		//（附了一份 govips 的参考文档）。
@@ -736,7 +770,11 @@ func Catalog() []App {
 			BrewFormula:    "vips",
 			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
 			NoDaemon: true,
-			Port:     0,
+			// 安装体 = `<brew>/bin/vips` 这个可执行文件。与 internal/imgopt 的
+			// DetectEngine 同一条口径（先看二进制在不在，再看能不能跑）——
+			// 「已安装」只看"在不在"（列表路径要便宜），"能不能跑"由按需探测负责。
+			RuntimePath: "{brew}/bin/vips",
+			Port:        0,
 			PostInstallHint: "装好后到「文件管理」选中要处理的目录，点工具条上的「🖼️ 图片压缩」：" +
 				"可调质量 / 最长边 / 输出格式（保持原格式、WebP、AVIF、JPEG、PNG）。" +
 				"默认**另存为 xxx.min.jpg**（不动原文件）；选「覆盖原文件」时会先确认，且压完更大时自动保留原文件。",
@@ -771,8 +809,11 @@ func Catalog() []App {
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.10",
 			NoDaemon:       true,
-			Port:           0,
-			DocsURL:        "https://docs.python.org/3.10/",
+			// 安装体 = keg 里的解释器可执行文件（python@3.x 是 keg-only，
+			// `<brew>/bin/python3.x` 不一定有软链，`opt/<formula>/bin/` 才是稳的那个）。
+			RuntimePath: "{brew}/opt/python@3.10/bin/python3.10",
+			Port:        0,
+			DocsURL:     "https://docs.python.org/3.10/",
 		},
 		// 面板自己的两个 Python 服务默认用这一版：mlx-audio 在 3.11 上有预编译 wheel，
 		// 整条链路真机验证过。装了它不会自动创建虚拟环境 —— 虚拟环境由各应用按需创建。
@@ -784,9 +825,10 @@ func Catalog() []App {
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.11",
 			// 解释器没有守护进程、没有端口、没有网页界面（与 ffmpeg 同类）。
-			NoDaemon: true,
-			Port:     0,
-			DocsURL:  "https://docs.python.org/3.11/",
+			NoDaemon:    true,
+			RuntimePath: "{brew}/opt/python@3.11/bin/python3.11",
+			Port:        0,
+			DocsURL:     "https://docs.python.org/3.11/",
 		},
 		// 版本化 formula 各自独立，与 3.11 / 3.13 并存、互不覆盖。
 		{
@@ -797,6 +839,7 @@ func Catalog() []App {
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.12",
 			NoDaemon:       true,
+			RuntimePath:    "{brew}/opt/python@3.12/bin/python3.12",
 			Port:           0,
 			DocsURL:        "https://docs.python.org/3.12/",
 		},
@@ -809,6 +852,7 @@ func Catalog() []App {
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.13",
 			NoDaemon:       true,
+			RuntimePath:    "{brew}/opt/python@3.13/bin/python3.13",
 			Port:           0,
 			DocsURL:        "https://docs.python.org/3.13/",
 		},
@@ -1961,37 +2005,24 @@ func (m *Manager) checkRequirement(ctx context.Context, req Requirement) CheckRe
 	}
 }
 
-// brewHas 判断某个 Homebrew 包是否已安装。
-//
-// homebrew 拒绝以 root 运行，而面板以 root 运行，
-// 因此必须降权到真实用户执行（与安装脚本里的处理一致）。
 // InstalledFormulas 一次性返回已安装的 formula 集合。
 //
 // 为什么要"一次性"：`brew list --versions <单个>` 和
 // `brew list --versions`（全部）耗时几乎一样（实测 0.5s vs 0.58s）——
 // 因为开销主要在 brew 自身启动，不在查询。所以逐个查 N 次
 // 等于白付 N 次启动成本；市场列表有十几个条目，累加就是几秒。
+//
+// **唯一实现**是 InstalledFormulaVersions（install.go）：这里只是它的 bool 投影，
+// 不再自己拼一遍 `brew list --versions`（那种"同一个动作两条代码路径"必然漂移）。
+// 降权规则（Homebrew 拒绝 root）也在那里。
+//
+// ⚠️ 探测失败返回的是**空集合**，与"真的什么都没装"长得一样。需要区分这两件事的
+// 调用方（市场列表）必须用 InstalledFormulaVersions 的第二个返回值，不能读这里。
 func (m *Manager) InstalledFormulas(ctx context.Context) map[string]bool {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	set := map[string]bool{}
-	var cmd *exec.Cmd
-	if os.Geteuid() == 0 && m.opt.UserName != "" {
-		cmd = exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "-u", m.opt.UserName,
-			m.opt.BrewBin, "list", "--versions")
-	} else {
-		cmd = exec.CommandContext(ctx, m.opt.BrewBin, "list", "--versions")
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return set
-	}
-	// 输出形如：nginx 1.31.5 / php@8.3 8.3.33
-	for _, ln := range strings.Split(string(out), "\n") {
-		f := strings.Fields(ln)
-		if len(f) >= 2 {
-			set[f[0]] = true
-		}
+	vers, _ := m.InstalledFormulaVersions(ctx)
+	set := make(map[string]bool, len(vers))
+	for f := range vers {
+		set[f] = true
 	}
 	return set
 }
@@ -2005,6 +2036,10 @@ func (m *Manager) HasBrewFormula(ctx context.Context, formula string) bool {
 	return m.brewHas(ctx, formula)
 }
 
+// brewHas 判断某个 Homebrew 包是否已安装（单个）。
+//
+// Homebrew 拒绝以 root 运行，而面板以 root 运行，所以必须降权到真实用户执行。
+// 批量场景不要循环调它：见 InstalledFormulas —— 逐个查 N 次等于白付 N 次 brew 启动。
 func (m *Manager) brewHas(ctx context.Context, formula string) bool {
 	if formula == "" {
 		return false

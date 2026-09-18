@@ -1343,17 +1343,21 @@ func (m *Manager) RepairPhpMyAdminConfigPerm() (bool, error) {
 	return true, nil
 }
 
-// UninstallPhpMyAdmin 卸载 phpMyAdmin：撤掉 nginx 入口 + brew uninstall。
+// UninstallPhpMyAdmin 卸载 phpMyAdmin：撤掉 nginx 入口 + 删包 + 摘掉 web 根。
 //
 // 为什么必须由面板来做（而不是让用户自己 brew uninstall）：
 // 装的时候面板往默认站点里插了一段 location，直接 brew uninstall 会留下
 // 一个指向不存在目录的 location（访问变成 404/502，看起来像面板把站点弄坏了）。
 // 所以卸载必须**先撤 nginx 入口、再删包**，顺序反了会有一段时间是坏的。
 //
+// app 参数用于取目录里声明的**安装体**（RuntimePath）—— 用户手工装的 phpMyAdmin
+// 不在 Homebrew 里，只有那个目录是"装着"的证据，卸载就得真的删掉它
+// （见下面 2b 的说明）。
+//
 // D10：入口识别**先按标记、再按 alias 指向的 phpMyAdmin 目录**（老版本生成器
 // 没写标记，正是"卸载报成功却残留 /phpmyadmin"的根因）。两者都识别不出、而配置里
 // 又确实有 /phpmyadmin 时**如实报错**并中止 —— 绝不静默跳过然后报成功。
-func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData, force bool, result *InstallResult) error {
+func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, app App, removeData, force bool, result *InstallResult) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("卸载 phpMyAdmin 需要以 root 运行")
 	}
@@ -1392,12 +1396,41 @@ func (m *Manager) UninstallPhpMyAdmin(ctx context.Context, removeData, force boo
 
 	// ---- 2. 删包 ----
 	// force=true 只由用户在确认框里明确选「强制卸载」时传入（brew --ignore-dependencies）。
-	if m.brewHas(ctx, "phpmyadmin") {
+	brewOwned := m.brewHas(ctx, "phpmyadmin")
+	if brewOwned {
 		if err := m.brewUninstall(ctx, "phpmyadmin", force, result); err != nil {
 			return err
 		}
 	} else if result != nil {
 		result.step(ctx, "phpmyadmin 未安装，跳过")
+	}
+
+	// ---- 2b. 手工装的 web 根 ----
+	//
+	// 「已安装」的判据是**这个目录在**（目录条目的 RuntimePath，见
+	// services/installed_body.go）。Homebrew 装的那份，上面的 brew uninstall 会把
+	// keg 与 share/phpmyadmin 的软链一起带走；而用户手工装的那份是一个真目录，
+	// 不删它的话卸载完之后判据照样成立 —— 卡片永远停在「已安装」，用户再也点不到
+	// 「安装」（2026-09-16 的同一类缺陷）。
+	//
+	// 只删**目录条目声明的那个安装体**，不猜别的路径：
+	//   · RuntimePath 没声明 → 退回 pmaPaths().Share（面板自己那套布局）；
+	//   · 是个软链 → unlink 语义，只摘链、不动它指向的 Cellar；
+	//   · brew 装着的时候根本不走这里（上面已经处理）。
+	if !brewOwned {
+		share := ResolveRuntimePath(app.RuntimePath, m.brewPrefix(), m.opt.UserHome)
+		if share == "" {
+			share = m.pmaPaths().Share
+		}
+		if _, err := os.Lstat(share); err == nil {
+			if result != nil {
+				result.step(ctx, "移除 phpMyAdmin 的 web 根目录 "+share+
+					"（面板判它「已安装」靠的就是这个目录；你的数据库与库表不受影响）")
+			}
+			if err := os.RemoveAll(share); err != nil {
+				return fmt.Errorf("删除 %s 失败: %w", share, err)
+			}
+		}
 	}
 
 	// ---- 3. 删面板自己的配置文件 ----

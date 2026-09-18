@@ -59,6 +59,26 @@ func (s *Server) auditAs(info auditInfo, action, target, detail string, success 
 // taskRunner 是任务体：拿 ctx 与进度接收器，返回业务结果。
 type taskRunner func(ctx context.Context, log tasks.LogFunc) (any, error)
 
+// marketAffectingTask 判断一类任务结束后要不要让市场缓存失效。
+//
+// 判据是"这个动作可能改变 Homebrew 里装了/卸了什么"（那正是市场缓存里唯一会过期的
+// 证据），而不是任务名好看：
+//   - install     —— 应用市场安装 / 一键 LNMP / 基础环境 / Docker 运行时都在这一类；
+//   - uninstall   —— 应用市场卸载；
+//   - site-install—— 一键建站会按需补齐站点赖以运行的组件。
+//
+// 刻意**不**做成"所有任务都失效"：每次失效都会让下一次打开市场走一次同步
+// brew 探测（约 1.5 秒）。文件压缩、数据库导入、容器创建、部署 compose 这些任务
+// 都不改 Homebrew 的包集合（它们的"装了没有"来自服务记录，而服务记录不进缓存），
+// 让它们背这份等待没有意义。
+func marketAffectingTask(kind string) bool {
+	switch kind {
+	case "install", "uninstall", "site-install":
+		return true
+	}
+	return false
+}
+
 // launchTask 把一个长任务交给任务中心，立刻返回 task_id。
 //
 // 同一个 target 上已有运行中的任务时返回 409：brew 自己有全局锁，
@@ -99,6 +119,13 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 		//（单测 TestInstallLNMPEmptyBodyStillAccepted 当场变红，真机上就是
 		// "明明装完了，再点一次说它还在跑"）。自愈本来就是幂等的后台维护，
 		// 不该占着任务的生命周期。
+		// 安装/卸载结束必须让市场缓存失效 —— 否则这条任务改变了机器上装了什么，
+		// 而「已安装」是 5 分钟 TTL 的缓存结论：用户装完刷新页面，卡片仍停在
+		// 「安装」、也不进「已安装」（2026-09-23 用户报障的根因之一，
+		// 见 Server.InvalidateMarketCache）。
+		if marketAffectingTask(kind) {
+			s.InvalidateMarketCache()
+		}
 		s.kickEnvHeal()
 		return res, err
 	})

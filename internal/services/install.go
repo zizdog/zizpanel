@@ -188,15 +188,29 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 	return res, nil
 }
 
-// InstalledFormulaVersions 一次性返回**已安装 formula → 版本串**。
+// InstalledFormulaVersions 一次性返回**已安装 formula → 版本串**，
+// 第二个返回值表示这次探测**真的成功了**。
 //
 // 为什么不复用 catalog.go 的 InstalledFormulas（map[string]bool）：卸载计划要知道
 // 版本，才能把 `php@8.4` 这种"目录写法"对到机器上真实装的 `php 8.4.7`
 // （见 uninstall_app.go 的 ResolveBrewFormula）。两者是同一条 `brew list --versions`
 // 的两种投影，分开查会白付一次 brew 启动成本。
 //
-// 降权规则与 InstalledFormulas 一致：Homebrew 拒绝以 root 运行。
-func (m *Manager) InstalledFormulaVersions(ctx context.Context) map[string]string {
+// ⚠️ **必须把"探测失败"与"什么都没装"分开**（2026-09-23 那一类缺陷的根因之一）：
+// 过去失败时返回空集合，市场列表就把它当成"这台机器上一个 brew 包都没有"，
+// 于是所有只靠 brew 证据的条目（纯 CLI 应用）一起显示「安装」—— 用户眼里
+// 就是"装了却显示未装"。正确的含义是"**未复核**"，调用方要如实降级。
+//
+// 降权规则与 Homebrew 拒绝 root 运行一致。
+func (m *Manager) InstalledFormulaVersions(ctx context.Context) (map[string]string, bool) {
+	// 单测注入点：不碰真实 brew（理由同 brewUsesProbe）。
+	if m.brewInstalledProbe != nil {
+		vers, ok := m.brewInstalledProbe(ctx)
+		if vers == nil {
+			vers = map[string]string{}
+		}
+		return vers, ok
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
@@ -208,7 +222,7 @@ func (m *Manager) InstalledFormulaVersions(ctx context.Context) map[string]strin
 	}
 	out, err := cmd.Output()
 	if err != nil {
-		return map[string]string{}
+		return map[string]string{}, false
 	}
 	// 输出形如：nginx 1.31.5 / php@8.2 8.2.33 / mysql@8.4 8.4.11_4
 	res := map[string]string{}
@@ -218,7 +232,7 @@ func (m *Manager) InstalledFormulaVersions(ctx context.Context) map[string]strin
 			res[f[0]] = strings.Join(f[1:], " ")
 		}
 	}
-	return res
+	return res, true
 }
 
 // brewRun 以真实用户身份执行 brew 命令。

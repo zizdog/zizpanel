@@ -197,7 +197,11 @@ type Manager struct {
 	//
 	// 没有它，卸载计划的单测会去跑真实的 `brew list --versions`（违反"单测不许
 	// 碰真实服务"），而且结论会随开发机装没装 php/nginx 而漂 —— 本机恰好装着一堆。
-	brewInstalledProbe func(ctx context.Context) map[string]string
+	//
+	// 第二个返回值 = 这次探测**真的成功了**（false = brew 不可用/超时）。
+	// 它必须能被表达出来：空集合 + ok=false 的含义是"**未复核**"，与"确实什么都没装"
+	// 完全不同 —— 混为一谈就会把全部 brew 应用谎报成"未安装"（2026-09-23 那一类）。
+	brewInstalledProbe func(ctx context.Context) (map[string]string, bool)
 	// brewUsesProbe 仅供测试：替换 `brew uses --installed <formula>` 的探测。
 	// 返回 (依赖它的已装包, 这次查询是否真的成功)，后者决定计划里写"已检查"还是"未检查"。
 	brewUsesProbe func(ctx context.Context, formula string) ([]string, bool)
@@ -397,6 +401,17 @@ func (m *Manager) SetBrewUsesProbeForTest(fn func(ctx context.Context, formula s
 	prev := m.brewUsesProbe
 	m.brewUsesProbe = fn
 	return func() { m.brewUsesProbe = prev }
+}
+
+// SetBrewInstalledProbeForTest 替换"本机装了哪些 brew formula"的探测，返回值供测试恢复。
+//
+// 与 SetBrewUsesProbeForTest 同一个理由（web 层单测够不到未导出的字段，却又必须
+// 能造出"某台机器上 Homebrew 装着 vips"这种现场）。返回的 fn 的第二个返回值
+// 表示这次探测**真的成功了** —— 空集合 + true 才是"确实一个包都没装"。
+func (m *Manager) SetBrewInstalledProbeForTest(fn func(ctx context.Context) (map[string]string, bool)) func() {
+	prev := m.brewInstalledProbe
+	m.brewInstalledProbe = fn
+	return func() { m.brewInstalledProbe = prev }
 }
 
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，

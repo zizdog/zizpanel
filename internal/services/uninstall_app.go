@@ -258,12 +258,14 @@ func (m *Manager) resolveBrewState(ctx context.Context, app App) BrewState {
 	return BrewStateFor(app.BrewFormula, installed)
 }
 
-// installedFormulaVersions 取整批 formula → 版本，测试可注入。
+// installedFormulaVersions 取整批 formula → 版本（测试可注入）。
+//
+// 探测失败时返回空集合：卸载计划这一层只关心"有没有"，而"探测失败 ≠ 什么都没装"
+// 这件事实由 InstalledFormulaVersions 的第二个返回值表达，消费方（市场列表）
+// 必须自己判断 —— 见 install.go 的注释与 web 层的 installedFormulas。
 func (m *Manager) installedFormulaVersions(ctx context.Context) map[string]string {
-	if m.brewInstalledProbe != nil {
-		return m.brewInstalledProbe(ctx)
-	}
-	return m.InstalledFormulaVersions(ctx)
+	vers, _ := m.InstalledFormulaVersions(ctx)
+	return vers
 }
 
 // PlanUninstallForBrew 与 PlanUninstallFor 相同，但 brew 状态由调用方按整批缓存传入。
@@ -764,8 +766,8 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"iopaint": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallIOPaint(ctx, removeData, r)
 	},
-	"phpmyadmin": func(m *Manager, ctx context.Context, _ App, removeData, force bool, r *InstallResult) error {
-		return m.UninstallPhpMyAdmin(ctx, removeData, force, r)
+	"phpmyadmin": func(m *Manager, ctx context.Context, app App, removeData, force bool, r *InstallResult) error {
+		return m.UninstallPhpMyAdmin(ctx, app, removeData, force, r)
 	},
 	// 基础依赖也允许单独卸载，但由 UninstallBaseDependency 把后果写清楚
 	// （用户要求"明确提示即可，不要禁止"）。它不走 brew uninstall（保留包），
@@ -1237,12 +1239,27 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		p.DataPaths = []string{filepath.Join(m.opt.UserHome, "iopaint")}
 		p.KeepNote = "默认保留 ~/iopaint（虚拟环境，重新部署时不用重装依赖）"
 	case "phpmyadmin":
+		// 安装体是**磁盘上的 web 根目录**（目录里 RuntimePath 声明的那个）：
+		// Homebrew 装的时候它是 keg 里的软链（brew uninstall 一并带走），
+		// 而用户手工装的那份就是一个真目录 —— 面板既然凭"目录在"说它已安装，
+		// 卸载就必须真的把它删掉，否则卡片会永远停在「已安装」、连安装入口都没有
+		//（2026-09-16 用户反馈过的那一类）。所以这一步逐字写进计划，用户按确认
+		// 之前就看得见。
+		//
+		// 路径与执行端（phpmyadmin.go 的 2b）用**同一个**解析函数，避免"计划说删 A、
+		// 实际删 B"。RuntimePath 没声明时退回面板自己的那套布局。
+		pmaShare := ResolveRuntimePath(app.RuntimePath, m.brewPrefix(), m.opt.UserHome)
+		if pmaShare == "" {
+			pmaShare = m.pmaPaths().Share
+		}
 		p.Steps = []string{
 			"移除 nginx 默认站点里的 phpMyAdmin 入口并重载",
-			"brew uninstall phpmyadmin",
+			"brew uninstall phpmyadmin（Homebrew 里没有它时跳过）",
+			"移除 phpMyAdmin 的 web 根目录 " + pmaShare,
 		}
 		p.DataPaths = []string{filepath.Join(m.brewPrefix(), "etc", "phpmyadmin.config.inc.php")}
-		p.KeepNote = "面板自研的库表管理功能不受影响"
+		p.KeepNote = "面板自研的库表管理功能不受影响；你的数据库与库表**一个都不会动**" +
+			"（web 根里放的是 phpMyAdmin 程序本身，配置在同级的 etc/ 下，默认保留）"
 	case "docker-runtime":
 		p.Steps = []string{
 			"停止并删除 Colima 虚拟机（**其中的容器、镜像、卷都会消失**）",

@@ -737,7 +737,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 整批查一次（而不是循环里逐个查），见 installedFormulas 的说明
-	brewSet := s.installedFormulas(ctx)
+	brewSet, brewProbeOK := s.installedFormulas(ctx)
 	// 版本投影：卸载计划要用它把 `php@8.4` 对到机器上真实装的 `php 8.4.7`。
 	brewVers := map[string]string{}
 	s.mktMu.Lock()
@@ -762,6 +762,11 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 与 Installed 分开是为了区分「没装」和「装了但服务没注册」——
 		// 后者要给的是「重新部署」而不是「安装」。
 		Artifacts bool `json:"artifacts"`
+		// RuntimeBodyPath 是目录声明的**安装体**（RuntimePath）在磁盘上真实的路径：
+		// 纯 CLI 应用是可执行文件，phpMyAdmin 是 web 根目录。非空即"真实产物在"，
+		// 这是没有服务记录的应用最可靠的那条「已安装」证据。
+		// 声明了但不在 = 空（前端与门禁据此区分"没声明"与"声明了但产物不在"）。
+		RuntimeBodyPath string `json:"runtime_body_path,omitempty"`
 		// ServiceInLaunchd 表示这个应用的服务此刻真的能在 launchd 里找到。
 		// 「纳管」按钮必须以此为准：plist 不存在时点纳管必然报
 		// "找不到 xxx 的 plist，且该服务未在 launchd 中加载"。
@@ -865,6 +870,23 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 一条判据同时决定「已安装」与「怎么卸载」，不再让两个地方各猜一次。
 		brewState := services.BrewStateFor(a.BrewFormula, brewVers)
 		if !isInstalled && brewState.Installed {
+			isInstalled = true
+		}
+		// 真实证据之三：目录声明的**安装体**（真实产物）在磁盘上。
+		//
+		// 为什么必须有这一条（2026-09-23 用户报障两条的根因）：
+		// 没有常驻服务的应用（App.NoDaemon：vips / ffmpeg / python@x.y，以及
+		// 网页入口型的 phpMyAdmin）在面板里**没有服务记录**，它们的「已安装」
+		// 过去只来自上面那句 brew 结论。于是
+		//   · brew 探测失败（返回空集合）→ 一起显示「安装」；
+		//   · 5 分钟缓存还没失效 → 刚装完也显示「安装」；
+		//   · phpMyAdmin 的 web 根是**用户手工装好**的（不在 brew list 里）→
+		//     永远显示未安装（用户原话："它是有状态的目录，只要判断这个目录在，
+		//     就是安装！"）。
+		// 判据贴着运行体：可执行文件带执行位 / web 目录带入口文件（见
+		// services.DetectRuntimeBody）。只 stat、不执行 —— 列表路径要便宜。
+		runtimeBody := services.DetectRuntimeBody(a, s.Cfg.BrewPrefix, s.Cfg.UserHome)
+		if !isInstalled && runtimeBody.Exists() {
 			isInstalled = true
 		}
 		// 容器运行时：**已安装必须看现实**，不看任何残留文件（见上面的长注释）。
@@ -977,7 +999,8 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
-			PortURL: portURL, ProxyURL: proxyURL,
+			RuntimeBodyPath: runtimeBody.Path,
+			PortURL:         portURL, ProxyURL: proxyURL,
 			DockerRuntime: dockerRuntime,
 			ConfigAbs:     services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
 			Uninstall:     plan}
@@ -1019,6 +1042,10 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	sock, ver := s.cachedDocker()
 	ok(w, map[string]any{
 		"list": out,
+		// brew_probe_ok=false 表示这次**没能复核**「本机装了哪些 Homebrew 包」
+		//（brew 不可用/超时）。这时列表里的 installed=false 只代表"没查成"，
+		// 前端必须如实标出来，而不是让用户以为东西真的没装（铁律 11）。
+		"brew_probe_ok": brewProbeOK,
 		// sections 是市场板块的**顺序与中文名**（services.MarketSections）。
 		// 前端按它渲染板块标题，自己不再写一份分类中文名 ——
 		// 用户要求「其它」改名「基础环境」，改名只改 catalog.go 一处。
@@ -1742,40 +1769,58 @@ func adoptTargetExists(home, label string) bool {
 // 已装 formula 集合只在用户安装/卸载时变化，本身就是低频数据；30 秒的短 TTL
 // 会让「隔一会儿再打开市场」几乎必然触发一次 1.5 秒的 `brew list`。这里放宽到
 // 5 分钟，并在过期时走后台刷新，请求路径永远不等待 brew。
+//
+// ⚠️ 正因为有 5 分钟，安装/卸载结束**必须**主动失效（见 InvalidateMarketCache）：
+// 否则用户装完刷新页面，拿到的还是那句旧结论 —— 卡片停在「安装」、也不进「已安装」。
 const marketCacheTTL = 5 * time.Minute
+
+// marketProbeMissTTL 是"这次没查成"的保鲜期。
+//
+// 必须远小于 marketCacheTTL：brew 探测失败往往是瞬时的（brew 正在自我更新、
+// 镜像卡住、刚装完还没 link）。若按 5 分钟缓存这次失败，面板就会在 vips/ffmpeg
+// 明明已经装好的情况下持续显示「安装」—— 用户看到的就是"装了却显示未装"。
+const marketProbeMissTTL = 30 * time.Second
 
 // marketRefreshTimeout 限制单次后台刷新的时长，避免 brew 卡死拖住刷新 goroutine。
 const marketRefreshTimeout = 60 * time.Second
 
-// installedFormulas 返回本机已安装的 brew formula 集合。
+// installedFormulas 返回本机已安装的 brew formula 集合，以及**这次结论是否可信**。
 //
 // 三种情况：
 //   - 缓存新鲜      → 直接返回；
 //   - 缓存过期      → 先返回旧值，同时后台刷新（用户感知不到 brew 的耗时）；
 //   - 尚无缓存      → 同步取一次（仅在启动预热未完成时会走到，见 WarmMarket）。
-func (s *Server) installedFormulas(ctx context.Context) map[string]bool {
+//
+// 第二个返回值 false = "没查成"（brew 不可用/超时）。这时返回的是**上一次的真实
+// 结论**（没有历史结论时才是空集合），调用方必须如实降级：宁可说"未复核"，
+// 也不能把"没查成"当成"没装"（铁律 11）。
+func (s *Server) installedFormulas(ctx context.Context) (map[string]bool, bool) {
 	s.mktMu.Lock()
-	brew, at := s.mktBrew, s.mktBrewAt
+	brew, ok, at := s.mktBrew, s.mktBrewOK, s.mktBrewAt
 	s.mktMu.Unlock()
 
-	if brew != nil && time.Since(at) < marketCacheTTL {
-		return brew
+	ttl := marketCacheTTL
+	if !ok {
+		ttl = marketProbeMissTTL // 失败不粘 5 分钟，很快重试
+	}
+	if brew != nil && time.Since(at) < ttl {
+		return brew, ok
 	}
 	if brew != nil {
 		s.refreshMarketAsync()
-		return brew
+		return brew, ok
 	}
 
 	// 冷启动兜底：这里必须同步，否则首屏会把所有应用都显示成"未安装"。
-	set, vers := s.fetchInstalledFormulas(ctx)
+	set, vers, fetched := s.fetchInstalledFormulas(ctx)
 	s.mktMu.Lock()
 	if s.mktBrew == nil {
-		s.mktBrew, s.mktBrewVer, s.mktBrewAt = set, vers, time.Now()
+		s.mktBrew, s.mktBrewVer, s.mktBrewAt, s.mktBrewOK = set, vers, time.Now(), fetched
 	} else {
-		set = s.mktBrew
+		set, fetched = s.mktBrew, s.mktBrewOK
 	}
 	s.mktMu.Unlock()
-	return set
+	return set, fetched
 }
 
 // brewVersions 返回本机已安装 formula 的版本串（与 installedFormulas 同一份缓存）。
@@ -1794,8 +1839,8 @@ func (s *Server) brewVersions(ctx context.Context) map[string]string {
 	return vers
 }
 
-func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, map[string]string) {
-	vers := s.svcManager().InstalledFormulaVersions(ctx)
+func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, map[string]string, bool) {
+	vers, ok := s.svcManager().InstalledFormulaVersions(ctx)
 	if vers == nil {
 		vers = map[string]string{}
 	}
@@ -1803,7 +1848,29 @@ func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, m
 	for f := range vers {
 		set[f] = true
 	}
-	return set, vers
+	return set, vers, ok
+}
+
+// InvalidateMarketCache 让市场缓存立刻失效（安装/卸载任务结束后调用）。
+//
+// 为什么必须有它（2026-09-23 用户报障"图片压缩安装成功但没变化、不在已安装里、
+// 还显示安装按钮"的根因之一）：已装 formula 集合有 5 分钟 TTL，而**安装任务结束时
+// 没有任何地方让它失效** —— 前端 onDone 里那次刷新拿到的仍是旧集合，卡片就停在
+// 「安装」，「已安装」Tab 里也没有它。
+//
+// 清空而不是"标记过期"：过期路径会**先返回旧值**再后台刷新，那正是用户看到的那句
+// 旧结论。清空之后下一次 /api/v1/market 走冷启动**同步**探测（约 1.5 秒的真实
+// brew list），拿到的是装完之后的真相；随后 refreshMarketAsync 再预热一次，
+// 让紧随其后的请求不必再等。
+func (s *Server) InvalidateMarketCache() {
+	s.mktMu.Lock()
+	s.mktBrew, s.mktBrewVer, s.mktBrewAt, s.mktBrewOK = nil, nil, time.Time{}, false
+	s.mktMu.Unlock()
+	// Docker 侧**不**在这里清空：清空会让下次打开市场去做一次同步 socket 探测
+	//（每个候选路径 800ms 超时），破坏"列表渲染路径要便宜"这条规矩。
+	// 它本来就有 5 秒负缓存，而且每次后台刷新都会重探（cachedDocker /
+	// refreshMarketCaches）—— 刚装好的容器运行时会在秒级内自己纠正回来。
+	s.refreshMarketAsync()
 }
 
 // dockerMissTTL 是"没探测到 Docker"这一结果的最长保鲜期。
@@ -1868,11 +1935,19 @@ func (s *Server) refreshMarketAsync() {
 // 两项都在锁外完成，算完再一次性换入缓存 —— 慢查询绝不持有 mktMu，
 // 否则 brew 的 1.5 秒会阻塞所有市场请求。
 func (s *Server) refreshMarketCaches(ctx context.Context) {
-	set, vers := s.fetchInstalledFormulas(ctx)
+	set, vers, fetched := s.fetchInstalledFormulas(ctx)
 	sock, ver := s.detectDocker()
 
 	s.mktMu.Lock()
-	s.mktBrew, s.mktBrewVer, s.mktBrewAt = set, vers, time.Now()
+	// ⚠️ 探测失败时**绝不**用空集合覆盖上一次的真实结论：那会在一次瞬时故障里
+	// 把所有只靠 brew 证据的条目（纯 CLI 应用）一次性谎报成"未安装"。
+	// 保留旧集合，只把 ok 标成 false（前端如实说"未复核"），并按
+	// marketProbeMissTTL 很快重试。
+	if fetched || s.mktBrew == nil {
+		s.mktBrew, s.mktBrewVer = set, vers
+	}
+	s.mktBrewOK = fetched
+	s.mktBrewAt = time.Now()
 	// 探测成功才覆盖：一次失败不应把已知可用的 socket 抹掉，
 	// 否则容器列表会在 VM 抖动时突然全部"消失"。
 	if sock != "" || s.mktDockerAt.IsZero() {

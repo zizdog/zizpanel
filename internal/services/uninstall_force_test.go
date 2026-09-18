@@ -51,8 +51,8 @@ func TestPlanBrewUninstallBlockedByInstalledDependents(t *testing.T) {
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) {
 		return []string{"llvm", "rust"}, true
 	}
-	m.brewInstalledProbe = func(context.Context) map[string]string {
-		return map[string]string{"python@3.13": "3.13.3_1"}
+	m.brewInstalledProbe = func(context.Context) (map[string]string, bool) {
+		return map[string]string{"python@3.13": "3.13.3_1"}, true
 	}
 
 	plan := m.PlanUninstall(ctx, "python313")
@@ -212,9 +212,9 @@ func TestPhp84PlanNeverTouchesOtherVersions(t *testing.T) {
 	}
 
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return nil, true }
-	m.brewInstalledProbe = func(context.Context) map[string]string {
+	m.brewInstalledProbe = func(context.Context) (map[string]string, bool) {
 		// 目录写 php@8.4，机器上装的是 php 8.4.7（真机形态见 ResolveBrewFormula）。
-		return map[string]string{"php": "8.4.7", "php@8.2": "8.2.33"}
+		return map[string]string{"php": "8.4.7", "php@8.2": "8.2.33"}, true
 	}
 	plan := m.PlanUninstall(ctx, "php84")
 	if plan.Kind != "brew" || plan.Formula != "php" {
