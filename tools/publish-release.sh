@@ -114,6 +114,21 @@ remote_pubkey() {
 
 cmd_build() {
   local v; v="$(version)"; [ -n "$v" ] || die "读不到版本号"
+
+  # 发布前必须看清"树里还有谁的没写完的东西"（坑 177：2026-09-18 另一个子代理正在写
+  # 备份功能时，我用 `git add -A` 把它的半成品一起提交进了发布提交 —— 虽然产物核对证明
+  # 二进制里没有它们，但提交历史被污染，只能 reset 重做）。
+  # 这里只**列出并要求显式确认**，不自动改任何东西：发布是人的决定，脚本只负责别让人瞎着眼过。
+  local dirty
+  dirty="$(git status --porcelain -- '*.go' '*.js' '*.mjs' '*.sh' '*.css' '*.html' '*.py' 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    warn "工作区里有未提交/未跟踪的源码文件（下面这些**都会**被打进这次发布）："
+    printf '%s\n' "$dirty" | sed 's/^/      /'
+    if [ "${ZP_ALLOW_DIRTY_PUBLISH:-0}" != "1" ]; then
+      die "拒绝在「半成品可能混入」的状态下发布：确认上面这些文件都是你要发的，再设 ZP_ALLOW_DIRTY_PUBLISH=1 重跑"
+    fi
+    warn "已按 ZP_ALLOW_DIRTY_PUBLISH=1 继续（请确认上面清单里没有别人的半成品）"
+  fi
   info "构建 ${v}（公网清单 url = $ZIZDOG_URL/download/${v}/<name>）"
   make release RELEASE_BASE_URL="$ZIZDOG_URL/download/{version}/{name}" || die "make release 失败"
   cp "$RELDIR/manifest.json" "$RELDIR/manifest-zizdog.json"
