@@ -433,13 +433,21 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 	// 也是 2026-09-18 用户说"不读真实文件"时真正想看的那一份。
 	if b, err := os.ReadFile(s.Cfg.NginxConf); err == nil {
 		val, line := sites.FindClientMaxBodySize(string(b))
+		valTrim := strings.TrimSpace(val)
 		st := limitFileState{
 			File: "nginx.conf（http 全局）", Value: val, Line: line, Path: s.Cfg.NginxConf,
 			Managed: true,
-			Note:    "全局默认值：站点 vhost 里没写 client_max_body_size 时用它（保存会写这一行）",
-			OK:      strings.TrimSpace(val) == strings.TrimSpace(lim.ClientMaxBodySize),
+			OK:      valTrim == strings.TrimSpace(lim.ClientMaxBodySize),
 		}
-		if !st.OK {
+		switch {
+		case st.OK:
+			st.Note = "全局默认值：站点 vhost 里没写 client_max_body_size 时用它（这一行与目标值一致）"
+		case valTrim == "":
+			// 没写这一行是**正常状态**（nginx 出厂 1m，站点 vhost 各自带值）：
+			// 不算"未生效"，但提示保存会把它写进来。
+			st.Note = "这一行还没有（用 nginx 出厂值 1m；点「保存并应用」会把全局值写进这里）"
+		default:
+			st.Note = "这一行的值与目标值不一致 —— 点「保存并应用」会改写它"
 			view.Mismatch = true
 		}
 		view.Nginx = append(view.Nginx, st)

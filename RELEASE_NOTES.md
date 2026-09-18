@@ -3,6 +3,17 @@ v1.2.9 · 修 phpMyAdmin 登录不上/导入 500（反代没改写 Cookie 路径
 > 这个文件**只放当前这一版的更新说明**：`make release` 会把它整份写进清单，
 > 用户升级时看到的就是它。历史版本说明见 git 历史（`git log RELEASE_NOTES.md`）。
 
+**「上传大小 / 执行时间」现在真的落在你打开的那份配置文件里。**
+之前它只改**面板生成的**站点 vhost 与 PHP 的 conf.d 片段，`nginx.conf` 里那一行保持原样 ——
+你打开 nginx.conf（或 php.ini）看，当然"什么都没变"，于是看起来像"保存没用"。现在：
+- 保存会把**全局值写进 `nginx.conf` 的 http 块**（备份 → 改写 → `nginx -t` → 失败自动回滚）；
+- 「当前生效值」表把**每一份真实文件**都列出来（nginx.conf 全局、每个站点 vhost、
+  面板的 PHP 片段），每行都能点「打开」直接看磁盘内容；
+- 同时把 brew 的 `php.ini` 值也摆出来对照，并写明**面板刻意不改它**（升级会覆盖、
+  手改会丢）——PHP 真正读取的是面板写的 `98/99-zizpanel-limits.ini`，右边的回读值就是它；
+- 不是面板生成的 vhost 会标成「面板不改这个文件」（它里面的值会覆盖全局值），
+  并且**不计入**"未生效"，不会再出现"点不绿"的假故障。
+
 **phpMyAdmin 登录不上、"一点导入就 500" —— 修好了。**
 报错是 `Failed to set session cookie. Maybe you are using HTTP instead of HTTPS`。
 根因不在 HTTPS，而在**反代没有改写 Cookie 路径**：phpMyAdmin 按自己的路径写
