@@ -514,11 +514,59 @@ func (m *Manager) downloadQwenModel(ctx context.Context, p qwenPaths, result *In
 func (m *Manager) qwenHFEndpoint(ctx context.Context) string {
 	if m.MirrorEnabled() {
 		base := m.mirrorSubPath("hf")
-		if err := m.checkMirrorURL(ctx, base+"/"); err == nil {
+		if m.hfEndpointUsable(ctx, base) {
 			return base
 		}
 	}
 	return qwenHFMirror
+}
+
+// hfEndpointUsable 判断一个 HuggingFace 端点**真的能跑 hf download**。
+//
+// 为什么不能只看 `<base>/hf/` 返回 200（2026-09-18 用户真机事故）：
+// NAS 的 `/hf/` 首页是 200（一个落地页），但 `/hf/api/models/<repo>` 是 **502** ——
+// 而 `hf download` **必须**先调 API 列文件，再走 `/resolve/` 取文件。
+// 浅探测把"首页 200"当成可用 → 面板把 `HF_ENDPOINT` 指向 NAS →
+// CLI 连着 3 次 `Error: Local entry not found. [Errno 60] Operation timed out`，
+// 用户看到的是"下载失败"，而不是"镜像不可用"。
+//
+// 判据贴着 CLI 的真实需求，两件都要成立：
+//  1. API 能列出模型（`/api/models/<repo>` 返回 200 且是 JSON 而不是错误页）；
+//  2. 文件路径能取到（`/<repo>/resolve/main/config.json` 返回 200）。
+//
+// 探针用**正在安装的那个模型**（目录里的第一个），避免"探 A 用 B"的错配。
+func (m *Manager) hfEndpointUsable(ctx context.Context, base string) bool {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" || len(QwenModels) == 0 {
+		return false
+	}
+	repo := QwenModels[0].Name
+	cctx, cancel := context.WithTimeout(ctx, m.mirrorProbeTimeout())
+	defer cancel()
+	get := func(url string) (int, int64, string) {
+		req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+		if err != nil {
+			return 0, 0, ""
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, 0, ""
+		}
+		defer func() { _ = res.Body.Close() }()
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return res.StatusCode, res.ContentLength, string(b)
+	}
+	// ① API：必须 200 且像 JSON（错误页/302 登录页都不算）。
+	code, _, body := get(base + "/api/models/" + repo)
+	if code != http.StatusOK || !strings.HasPrefix(strings.TrimSpace(body), "{") {
+		return false
+	}
+	// ② 文件：必须真能取到内容。
+	code, size, body := get(base + "/" + repo + "/resolve/main/config.json")
+	if code != http.StatusOK || (size == 0 && len(body) == 0) {
+		return false
+	}
+	return true
 }
 
 // downloadOneQwenModel 下载单个模型并处理续传重试。
