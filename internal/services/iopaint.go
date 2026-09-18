@@ -163,7 +163,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	} else {
 		result.step(ctx, qwenPythonVer+" 已安装，跳过")
 	}
-	py311 := filepath.Join(m.brewPrefix(), "opt", qwenPythonVer, "bin", "python3.11")
+	pyBin := panelPythonInterpreter(m.brewPrefix(), qwenPythonVer)
 
 	// ---- 2. 虚拟环境 ----
 	if err := os.MkdirAll(p.Root, 0o755); err != nil {
@@ -174,7 +174,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 	_ = chownTree(m.opt.UserName, p.Root)
 	if _, err := os.Stat(p.Python); err != nil {
 		result.step(ctx, "正在创建 Python 虚拟环境")
-		if out, err := m.runAsUser(ctx, 5*time.Minute, py311, "-m", "venv", p.Venv); err != nil {
+		if out, err := m.runAsUser(ctx, 5*time.Minute, pyBin, "-m", "venv", p.Venv); err != nil {
 			return fmt.Errorf("创建虚拟环境失败: %v（%s）", err, tailText(out, 300))
 		}
 	} else {

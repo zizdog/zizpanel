@@ -252,7 +252,15 @@ export const api = {
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
   marketInstall: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install`, {}),
-  installLNMP: () => request('POST', `${API_BASE}/market/install-lnmp`, {}),
+  // 一键 LNMP 分两步：先取**版本候选**（弹窗让用户选 nginx/PHP/MySQL 各自的版本），
+  // 用户确认后才把选择提交出去。options 里的 installed 是后端真实探测
+  //（brew / 面板服务记录 / launchd plist），不是猜的 —— 用户重跑一键 LNMP 时
+  // 最关心的就是"会不会动我已经装好的东西"。
+  lnmpOptions: () => request('GET', `${API_BASE}/market/lnmp-options`),
+  // selection 形如 {nginx:'nginx', php:'php@8.2', mysql:'mysql@8.4'}。
+  // 不传也可以（后端按默认三件套处理，保证向后兼容），但前端**必须**把
+  // 用户在这次弹窗里的选择传出去 —— 不传就等于替用户做了决定。
+  installLNMP: (selection) => request('POST', `${API_BASE}/market/install-lnmp`, selection || {}),
   installPhpMyAdmin: () => request('POST', `${API_BASE}/market/install-phpmyadmin`, {}),
   installQwenTTS: (opts) => request('POST', `${API_BASE}/market/install-qwentts`, opts || {}),
   installVoiceReceiver: (opts) => request('POST', `${API_BASE}/market/install-voicereceiver`, opts || {}),

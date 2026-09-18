@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1004,6 +1005,13 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	case "ffmpeg":
 		s.handleInstallBaseDependency(w, r)
 		return
+	case "python311", "python312", "python313":
+		// Python 解释器（应用市场里三个版本，用户 2026-09-18 要求上架）。
+		// 走自研安装器而不是通用 brew 流程：解释器**没有 brew service**，
+		// 通用流程会 brew services start 一个没有 service 定义的 formula，
+		// 留下"已安装但启动失败"的假警告 + 一条永远没有状态的假服务记录。
+		s.handleInstallPythonRuntime(w, r)
+		return
 	case "docker-runtime":
 		s.handleInstallDockerRuntime(w, r)
 		return
@@ -1060,20 +1068,69 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		})
 }
 
+// handleLNMPOptions 返回一键 LNMP 的**版本候选**（按组件分组）。
+//
+// 为什么要有这个接口（2026-09-19 用户要求）：点「一键 LNMP」时先让用户
+// 选 nginx / PHP / MySQL 各自的版本，而不是直接按写死的三件套开装。
+// 候选必须由**后端**从应用目录推导（services.LNMPOptions）—— 前端自己
+// 抄一份版本清单，将来目录加了 php@8.5 就会漏（用户在弹窗里选不到，
+// 以为面板不支持）；或者反过来给出目录里没有的版本（安装当场失败）。
+//
+// 只读、requireAuth：它只暴露"目录里有哪些组件"与"本机装没装"，
+// 不含任何凭据。installed 是真实探测（brew + 面板记录 + launchd plist），
+// 不是猜的 —— 用户重跑一键 LNMP 时最关心的就是"会不会动我已经装好的东西"。
+func (s *Server) handleLNMPOptions(w http.ResponseWriter, r *http.Request) {
+	groups := s.svcManager().LNMPOptions(r.Context())
+	// 默认选择一并回给前端：它必须与后端 DefaultLNMPSelection 同源，
+	// 否则弹窗里"默认选中"的那一项与"不传字段时实际装的"会不一致
+	//（用户不点直接确认，装出来的东西与界面显示的不一样）。
+	def := services.DefaultLNMPSelection()
+	ok(w, map[string]any{
+		"groups": groups,
+		"default": map[string]string{
+			"nginx": def.Nginx,
+			"php":   def.PHP,
+			"mysql": def.MySQL,
+		},
+	})
+}
+
 // handleInstallLNMP 一键 LNMP（nginx + PHP + MySQL 的组合动作）。
 //
-// 这是个"组合动作"：会 brew 安装三个包，并做四件包管理管不到的收尾工作
-// （nginx 改 listen 80、建 vhosts/include、初始化 MySQL、注册系统级守护进程）。
-// 详见 internal/services/lnmp.go 里的说明。
+// 这是个"组合动作"：会 brew 安装用户选中的三个包，并做四件包管理管不到的
+// 收尾工作（nginx 改 listen 80、建 vhosts/include、初始化 MySQL、
+// 注册系统级守护进程）。详见 internal/services/lnmp.go 里的说明。
+//
+// 请求体（可空，保证向后兼容）：
+//
+//	{"nginx":"nginx","php":"php@8.2","mysql":"mysql@8.4"}
+//
+// 字段全部可选：不传 = 用默认选择（= 改造前的行为：nginx / php@8.2 /
+// mysql@8.4）。传了非法值（未知 formula、postgresql、空串）一律 **400 + 人话**，
+// 绝不用默认值替用户做决定 —— 那会装出与用户选择不同的版本。
 //
 // 异步执行：这一步动辄十几分钟，同步请求期间用户只能看到"请等待"，
 // 而且任务挂在 r.Context() 上 —— 一刷新就把 brew 杀了。现在交给任务中心，
 // 立刻返回 task_id，进度走 SSE（见 SPEC-任务中心.md）。
 func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "lnmp", "一键 LNMP（nginx / PHP 8.2 / MySQL 8.4）",
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		fail(w, http.StatusBadRequest, "读取请求内容失败："+err.Error())
+		return
+	}
+	sel, err := services.ParseLNMPSelection(body)
+	if err != nil {
+		// 校验失败要在**开任务之前**回答：开了任务再失败，用户会在任务中心
+		// 看到一个红叉，而真正的原因（版本选择不合法）本该是表单上的一句话。
+		s.audit(r, "install_lnmp", "lnmp", "版本选择被拒绝: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	title := "一键 LNMP（" + sel.ComponentsText() + "）"
+	s.launchTask(w, r, "install", "lnmp", title,
 		"install_lnmp", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "lnmp", Steps: []string{}}
-			if err := s.svcManager().InstallLNMP(ctx, res); err != nil {
+			if err := s.svcManager().InstallLNMP(ctx, res, sel); err != nil {
 				return res, err
 			}
 			return res, nil
@@ -1086,6 +1143,35 @@ func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request)
 		"install_phpmyadmin", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "phpmyadmin", Steps: []string{}}
 			if err := s.svcManager().InstallPhpMyAdmin(ctx, res); err != nil {
+				return res, err
+			}
+			return res, nil
+		})
+}
+
+// handleInstallPythonRuntime 安装应用市场里上架的一个 Python 解释器
+//（python311 / python312 / python313，见 catalog.go 与 python_runtime.go）。
+//
+// 它只做三件事：确保 Homebrew 在 → brewInstall（失败即换源）→ **如实报告
+// 真正装上的补丁版本**（`brew list --versions`）+ 解释器位置。
+//
+// 为什么不注册服务：解释器没有常驻进程。装了它就是多了一个命令行工具，
+// 真正的"服务"是 Qwen3 TTS / IOPaint 各自用某个版本建出来的 venv。
+func (s *Server) handleInstallPythonRuntime(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found || app.PanelInstaller != "python" {
+		fail(w, http.StatusBadRequest, "应用市场中找不到 Python 条目 "+id)
+		return
+	}
+	if app.BrewFormula == "" {
+		fail(w, http.StatusBadRequest, "「"+app.Name+"」没有声明 BrewFormula，无法安装")
+		return
+	}
+	s.launchTask(w, r, "install", id, "安装 "+app.Name+"（"+app.BrewFormula+"）",
+		"install_python", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: app.ID, Steps: []string{}}
+			if err := s.svcManager().InstallPythonRuntime(ctx, app.BrewFormula, res); err != nil {
 				return res, err
 			}
 			return res, nil

@@ -365,9 +365,30 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 			_ = upgrade.SaveState(s.Cfg.WorkDir, st)
 		}
 	}
+	// 下载进度写进 state（节流 700ms 一次）：用户 2026-09-20 要求"升级过程要有详细的
+	// 内容展示"，而升级下载是这一步里唯一耗时的地方 —— 只有写了进度，界面上才看得到
+	// "已下载 12.3 MB / 24.4 MB（50%）"，而不是一句静止的"正在下载"。
+	//
+	// 为什么节流：回调是同步的，每次都要写一次 state.json（含 fsync 语义的原子写）。
+	// 不节流的话，24MB 的包会写上百次盘，白白拖慢下载本身。
+	var lastProgressAt time.Time
+	progress := func(written, total int64) {
+		if time.Since(lastProgressAt) < 700*time.Millisecond {
+			return
+		}
+		lastProgressAt = time.Now()
+		if total > 0 {
+			st.Message = fmt.Sprintf("已下载 %s / %s（%d%%）",
+				upgradeHumanBytes(written), upgradeHumanBytes(total), written*100/total)
+		} else {
+			st.Message = "已下载 " + upgradeHumanBytes(written)
+		}
+		_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+	}
+
 	var lastErr error
 	for _, u := range tryURLs {
-		if _, err := upgrade.DownloadTarball(ctx, u, tarPath, ref.SHA256); err == nil {
+		if _, err := upgrade.DownloadTarballWithProgress(ctx, u, tarPath, ref.SHA256, progress); err == nil {
 			lastErr = nil
 			break
 		} else {
@@ -398,6 +419,27 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 		"state":            st,
 		"effective_source": usedBase,
 	})
+}
+
+// upgradeHumanBytes 把字节数变成人读形式（只用于升级进度文案）。
+//
+// 面板的服务层另有一个 humanBytes，但它在 internal/services 包里；这里只有
+// 升级接口用得到，为了几个字符去跨包导出并不划算 —— 而写死 "12.3 MB" 这种
+// 格式化逻辑在界面文案上必须一致，所以单独放一个同规则的小函数。
+func upgradeHumanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	v := float64(n)
+	for _, u := range units {
+		v /= unit
+		if v < unit {
+			return fmt.Sprintf("%.1f %s", v, u)
+		}
+	}
+	return fmt.Sprintf("%.1f PB", v/unit)
 }
 
 func (s *Server) stageFailed(st *upgrade.State, msg string) {

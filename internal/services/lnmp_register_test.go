@@ -71,7 +71,7 @@ func TestRegisterLNMPComponentsRegistersAllThree(t *testing.T) {
 	}
 
 	result := &InstallResult{}
-	m.registerLNMPComponents(ctx, result)
+	m.registerLNMPComponents(ctx, result, testLNMPFormulas(), testLNMPPorts())
 
 	list, err := repo.List(ctx)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestRegisterLNMPComponentsRegistersAllThree(t *testing.T) {
 
 	// ---- 幂等：再跑一次一键安装不能出现重复条目 ----
 	again := &InstallResult{}
-	m.registerLNMPComponents(ctx, again)
+	m.registerLNMPComponents(ctx, again, testLNMPFormulas(), testLNMPPorts())
 	list2, err := repo.List(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestRegisterLNMPComponentsReportsFailureHonestly(t *testing.T) {
 	defer func() { LNMPFormulas = orig }()
 
 	result := &InstallResult{}
-	m.registerLNMPComponents(ctx, result)
+	m.registerLNMPComponents(ctx, result, testLNMPFormulas(), testLNMPPorts())
 
 	list, err := repo.List(ctx)
 	if err != nil {
@@ -190,7 +190,7 @@ func TestRegisterLNMPComponentsMissingLaunchdDefinition(t *testing.T) {
 	defer func() { LNMPFormulas = orig }()
 
 	result := &InstallResult{}
-	m.registerLNMPComponents(ctx, result)
+	m.registerLNMPComponents(ctx, result, testLNMPFormulas(), testLNMPPorts())
 
 	if list, err := repo.List(ctx); err != nil || len(list) != 0 {
 		t.Fatalf("没有 launchd 定义却登记出了记录：%v / %d 条", err, len(list))
@@ -257,6 +257,10 @@ func TestAppendLNMPWarning(t *testing.T) {
 // 真机上"LNMP 早就跑着"的机器就永远登记不上 —— 而这正是用户反馈的场景。
 // InstallLNMP 没法直接跑单测（它第一件事就要求 root），所以按本项目
 // homebrew_clt_mirror_test.go 的做法，直接读源码锁住结构。
+//
+// 2026-09-19：调用形态变成 m.registerLNMPComponents(ctx, result, formulas, ports)
+// （本次选择的 formula 与判定端口由参数传入），所以断言跟着改成前缀匹配；
+// 被锁住的**位置约束**（在 allLNMPRunning 分支之后、端口验证之前）一字未变。
 func TestInstallLNMPCallsRegistrationOutsideRunningBranch(t *testing.T) {
 	b, err := os.ReadFile("lnmp.go")
 	if err != nil {
@@ -271,7 +275,7 @@ func TestInstallLNMPCallsRegistrationOutsideRunningBranch(t *testing.T) {
 	}
 	body := src[start:end]
 
-	iIf := strings.Index(body, "if m.allLNMPRunning(ctx) {")
+	iIf := strings.Index(body, "if m.allLNMPRunning(ctx, formulas) {")
 	if iIf < 0 {
 		t.Fatal("InstallLNMP 里应保留 allLNMPRunning 的跳过分支")
 	}
@@ -288,10 +292,11 @@ func TestInstallLNMPCallsRegistrationOutsideRunningBranch(t *testing.T) {
 	}
 	branchEnd := iIf + iElse + iElseClose
 
-	iReg := strings.Index(body, "m.registerLNMPComponents(ctx, result)")
+	iReg := strings.Index(body, "m.registerLNMPComponents(ctx, result, formulas, ports)")
 	if iReg < 0 {
-		t.Fatal("InstallLNMP 必须在收尾阶段调用 m.registerLNMPComponents(ctx, result)：" +
-			"否则一键装完服务管理里看不到 nginx/PHP/MySQL")
+		t.Fatal("InstallLNMP 必须在收尾阶段调用 m.registerLNMPComponents(ctx, result, formulas, ports)：" +
+			"否则一键装完服务管理里看不到 nginx/PHP/MySQL；" +
+			"并且必须传**本次选择**的 formula/端口，不能传默认值")
 	}
 	if iReg < branchEnd {
 		t.Error("登记调用在 allLNMPRunning 的 if/else 里面（或之前）—— " +
@@ -371,7 +376,7 @@ func TestRegisterLNMPComponentsRepairsAfterPlistAppears(t *testing.T) {
 
 	// 第一次：launchd 里什么都没有（模拟"装了一半"）
 	first := &InstallResult{}
-	m.registerLNMPComponents(ctx, first)
+	m.registerLNMPComponents(ctx, first, testLNMPFormulas(), testLNMPPorts())
 	if list, err := repo.List(ctx); err != nil || len(list) != 0 {
 		t.Fatalf("launchd 里没有定义时不该登记出记录：%v / %d 条", err, len(list))
 	}
@@ -388,7 +393,7 @@ func TestRegisterLNMPComponentsRepairsAfterPlistAppears(t *testing.T) {
 	}
 
 	second := &InstallResult{}
-	m.registerLNMPComponents(ctx, second)
+	m.registerLNMPComponents(ctx, second, testLNMPFormulas(), testLNMPPorts())
 	list, err := repo.List(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -404,7 +409,7 @@ func TestRegisterLNMPComponentsRepairsAfterPlistAppears(t *testing.T) {
 	}
 
 	// 再跑第三次：仍然 3 条（幂等，不产生重复记录）
-	m.registerLNMPComponents(ctx, &InstallResult{})
+	m.registerLNMPComponents(ctx, &InstallResult{}, testLNMPFormulas(), testLNMPPorts())
 	if list3, err := repo.List(ctx); err != nil || len(list3) != 3 {
 		t.Fatalf("重复登记应幂等（仍是 3 条），实际 %v / %d 条", err, len(list3))
 	}

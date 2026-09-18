@@ -563,7 +563,10 @@ func TestQwenIPv4PatchIsValidPython(t *testing.T) {
 		`"sitecustomize.py"`,
 		"socket.AF_INET",
 		"m.installIPv4Sitecustomize(ctx, p, result)",
-		"lib\", \"python3.11\", \"site-packages\"",
+		// site-packages 目录必须**从预置版本推导**（panelPythonSitePackages），
+		// 不能再写死 python3.11 —— 换预置版本时写死的那份会把补丁文件写进一个
+		// 不存在的目录，而且当场不报错（见 python_runtime.go 顶部的说明）。
+		"panelPythonSitePackages(p.Venv, qwenPythonVer)",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("qwentts.go 缺少 %q", want)

@@ -17,7 +17,7 @@ import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
-import { UpdateView, startUpgradeWatcher, hasUpdate } from './update.js';
+import { startUpgradeWatcher, hasUpdate } from './update.js';
 import { taskCenter } from './tasks.js';
 
 // ---------------- 全局状态 ----------------
@@ -35,7 +35,7 @@ export const NAV = [
   // 「系统监控」已改成「mac设置」（2026-09 用户要求把显示名从「系统设置」改成
   // 「mac设置」：原名与「面板设置」并列时歧义太大）。**只改显示名**，
   // 路由 id 仍是 'system'，`#/system` 与所有旧链接照旧可用。
-  { id: 'system', title: 'mac设置', icon: '🛠️', view: SystemSettingsView },
+  { id: 'system', title: 'mac设置', icon: '⚙️', view: SystemSettingsView },
   { group: '网站' },
   { id: 'sites', title: '网站管理', icon: '🌐', view: SitesView },
   { id: 'proxy', title: '反向代理', icon: '🔀', view: ReverseProxyView },
@@ -59,15 +59,15 @@ export const NAV = [
   { id: 'terminal', title: 'Web 终端', icon: '🖥️', view: TerminalView },
   { id: 'cron', title: '计划任务', icon: '⏰', view: CronView },
   { group: '系统' },
-  // 2026-09 用户要求：顺序上「面板设置 → 日志 → 检查更新」。
   // 「日志」把原「日志中心」与「操作审计」合并成一页两个 Tab（见 logshub.js）：
   // 侧栏只剩一个入口，旧的 #/logs 与 #/audit 仍分别落到对应 Tab（见 ROUTE_TARGET）。
-  { id: 'settings', title: '面板设置', icon: '🔧', view: SettingsView },
+  //
+  // 「检查更新」在 2026-09-20 被用户要求**收回**「面板设置」（第 4 个 Tab，
+  // 排在「访问与安全 / 文件与终端 / 账号与两步验证」之后）——它曾在侧栏独立存在过，
+  // 而设置里也留了一份入口，两处重复让用户困惑。现在侧栏只有「面板设置」，
+  // 升级入口在它里面；旧 hash（#/update、#/about、#/settings/about）走下面的别名表。
+  { id: 'settings', title: '面板设置', icon: '🛠️', view: SettingsView },
   { id: 'logs', title: '日志', icon: '📜', view: LogsHubView },
-  // 2026-09-21：原来这里是「面板设置 → 关于与运维」的第 4 个 Tab。用户要求把它
-  // 整块提到侧边栏并改名「检查更新」——"有没有新版本"是随时想知道的状态，
-  // 埋在两级点击之后没人看得到，也就没人升级。
-  { id: 'update', title: '检查更新', icon: '⬆️', view: UpdateView },
 ];
 
 const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n]));
@@ -87,17 +87,20 @@ const ROUTE_TARGET = {
   // 旧 hash `#/audit` 必须继续可用 → 落到 logs 版块并直接切到「操作审计」Tab；
   // `#/logs` 不需要别名（id 本来就是 logs），默认落第一个 Tab。
   audit: { id: 'logs', tab: 'audit' },
-  // 「关于与运维」已从「面板设置」的页内 Tab 提成独立页（侧栏「检查更新」）。
-  // 页内 Tab 时代的链接有两种写法，一个都不能 404：
-  //   #/settings/about  —— 旧写法（版块 + Tab），见下面的 SUB_ROUTE_TARGET
-  //   #/about / #/upgrade —— 文档/书签里可能直接引用的单段写法
-  about: { id: 'update' },
-  upgrade: { id: 'update' },
+  // 「检查更新」的 hash 变过两次，**历史写法一个都不能 404**（文档、书签、
+  // 侧栏徽标点进来的地址都在用）：
+  //   #/update            —— 侧栏独立页时代的地址
+  //   #/about / #/upgrade —— 更早的"关于与运维"单段写法
+  //   #/settings/about    —— 页内 Tab 时代的两段写法，见下面的 SUB_ROUTE_TARGET
+  // 一律落到「面板设置」的 update Tab（renderApp 把 tab 传给 SettingsView）。
+  update: { id: 'settings', tab: 'update' },
+  about: { id: 'settings', tab: 'update' },
+  upgrade: { id: 'settings', tab: 'update' },
 };
 
 // 两段式 hash（#/<版块>/<Tab>）的别名表，键是 "版块/Tab"。
 const SUB_ROUTE_TARGET = {
-  'settings/about': { id: 'update' },
+  'settings/about': { id: 'settings', tab: 'update' },
 };
 
 // routeFor 解析 hash：#/<版块> 或 #/<版块>/<页内 Tab>（如 #/apps/docker）。
@@ -370,13 +373,15 @@ function renderApp() {
   NAV.forEach((n) => {
     if (n.group) { nav.appendChild(h('div.nav-group', { text: n.group })); return; }
     const active = n.id === item.id;
-    // 「检查更新」上的小红点：发现新版本时挂在侧栏上，**刷新后仍然在**
-    // （检测结果落在 localStorage，见 update.js 的 updateInfo()）。
-    const dot = n.id === 'update'
+    // 有新版本时的小红点：挂在「面板设置」上（升级入口就在它的「检查更新」Tab 里）。
+    // **刷新后仍然在**：检测结果落在 localStorage，见 update.js 的 updateInfo()。
+    // 为什么不干脆去掉：删掉侧栏入口后，这是"有新版本"唯一常驻可见的信号 ——
+    // 没了它，用户不点进设置就永远不知道能升级。
+    const dot = n.id === 'settings'
       ? h('span.badge.zp-update-dot', {
         dataset: { testid: 'zp-update-badge' },
         text: '新',
-        title: '发现新版本，点击查看',
+        title: '面板设置 → 检查更新：发现新版本',
         style: { background: 'var(--danger)', color: '#fff', border: '1px solid transparent' },
         hidden: !hasUpdate(),
       })

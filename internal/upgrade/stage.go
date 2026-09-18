@@ -175,6 +175,21 @@ func getBytes(ctx context.Context, rawURL string, limit int64) ([]byte, error) {
 // 先写 .part 再原子改名：中途失败/断电不会留下一个"看起来完整"的半截文件，
 // 否则下次升级可能拿它去做校验（失败）或者更糟 —— 通过尺寸检查后被解包。
 func DownloadTarball(ctx context.Context, rawURL, destPath, wantSHA string) (string, error) {
+	return DownloadTarballWithProgress(ctx, rawURL, destPath, wantSHA, nil)
+}
+
+// ProgressFunc 报告下载进度：written = 已写入字节，total = 服务端声明的总字节
+// （-1 表示服务端没给 Content-Length）。
+type ProgressFunc func(written, total int64)
+
+// DownloadTarballWithProgress 与 DownloadTarball 完全一致，只是每读一块就回调一次进度。
+//
+// 为什么需要（2026-09-20 用户要求"升级过程要有详细的内容展示"）：升级是一次
+// 几十秒到十几分钟的长任务，界面上只写"正在下载"等于让用户干等；有了进度回调，
+// 面板可以把"已下载 12.3 MB / 24.4 MB（50%）"实时写进升级状态，用户看得到在动。
+//
+// 回调是**同步**调用的（同一个 goroutine），实现里不要做重活；调用方会自己节流。
+func DownloadTarballWithProgress(ctx context.Context, rawURL, destPath, wantSHA string, onProgress ProgressFunc) (string, error) {
 	if err := validateSHA256(wantSHA); err != nil {
 		return "", fmt.Errorf("期望的 sha256 不合法: %w", err)
 	}
@@ -205,7 +220,13 @@ func DownloadTarball(ctx context.Context, rawURL, destPath, wantSHA string) (str
 	if err != nil {
 		return "", err
 	}
-	n, copyErr := io.Copy(f, io.LimitReader(resp.Body, maxTarballBytes+1))
+	var n int64
+	var copyErr error
+	if onProgress == nil {
+		n, copyErr = io.Copy(f, io.LimitReader(resp.Body, maxTarballBytes+1))
+	} else {
+		n, copyErr = copyWithProgress(f, resp.Body, maxTarballBytes+1, resp.ContentLength, onProgress)
+	}
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(part)
@@ -234,6 +255,36 @@ func DownloadTarball(ctx context.Context, rawURL, destPath, wantSHA string) (str
 		return "", err
 	}
 	return destPath, nil
+}
+
+// copyWithProgress 是带进度回调的 io.Copy（上限语义与 io.Copy(LimitReader) 一致）。
+//
+// 为什么自己写循环而不是包一层 io.Reader：包装 reader 只能知道"读了多少"，
+// 而这里要同时保证"写入成功后才计入进度"——写盘失败时必须立刻停下，
+// 否则进度会显示成"下完了"而文件其实是坏的（谎报进度的另一种形式）。
+func copyWithProgress(dst io.Writer, src io.Reader, limit int64, total int64, onProgress ProgressFunc) (int64, error) {
+	buf := make([]byte, 256<<10)
+	var written int64
+	for {
+		if written >= limit {
+			// 触到上限：让调用方按"超过上限"处理（与 io.Copy(LimitReader) 的语义一致）。
+			return written, nil
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return written, werr
+			}
+			written += int64(n)
+			onProgress(written, total)
+		}
+		if rerr == io.EOF {
+			return written, nil
+		}
+		if rerr != nil {
+			return written, rerr
+		}
+	}
 }
 
 func short(s string) string {

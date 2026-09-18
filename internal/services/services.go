@@ -186,6 +186,12 @@ type Manager struct {
 	// 没有它的话，每个碰 brewEnv 的单测都会去访问阿里云/中科大，既慢又依赖外网 ——
 	// 违反"单测不许碰真实服务"。
 	mirrorProbeOverride func(ctx context.Context, probeFormula string) (apiDomain, bottleDomain string)
+	// lnmpInstalledProbe 仅供测试：替换"某个 LNMP formula 在本机装没装"的探测。
+	//
+	// 没有它，候选接口（GET /market/lnmp-options）的单测会去跑真实的
+	// `brew list` 与 /Library/LaunchDaemons（违反"单测不许碰真实服务"），
+	// 结论也会随开发机装没装东西而漂（本机恰好装着 php@8.2 的系统守护进程）。
+	lnmpInstalledProbe func(formula string) bool
 	// mirrorProbeCache 缓存探测结果：一次会话只探一次。
 	//
 	// 为什么必须有：brewEnv 会被**每次 brew 调用**用到（brew list --versions、

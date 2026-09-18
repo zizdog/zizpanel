@@ -288,7 +288,7 @@ func TestLNMPComponentLiveUsesSocketForPHP(t *testing.T) {
 	m := sandboxManagerWithBrew(t, prefix)
 	ctx := context.Background()
 
-	label, live := m.lnmpComponentLive(ctx, "php@8.2")
+	label, live := m.lnmpComponentLive(ctx, "php@8.2", nil)
 	if live {
 		t.Fatal("socket 还没建出来，不该判定为在监听")
 	}
@@ -310,13 +310,18 @@ func TestLNMPComponentLiveUsesSocketForPHP(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	label, live = m.lnmpComponentLive(ctx, "php@8.2")
+	label, live = m.lnmpComponentLive(ctx, "php@8.2", nil)
 	if !live {
 		t.Errorf("socket 已在监听，应判定为活着，实际标签 %q", label)
 	}
 }
 
 // TestInstallLNMPCallsSharedPHPListenFix 锁住**调用位置与复用**。
+//
+// 2026-09-19：PHP 端点闭环从"内联在 InstallLNMP 里的循环"提成了
+// ensureLNMPPHPEndpoints（因为本次选择要作为参数传进来）。位置约束一字未变，
+// 所以断言跟着改成：InstallLNMP 必须调用这个共用实现，且该调用必须出现在
+// installSystemDaemons **之前**。
 //
 // InstallLNMP 没法直接跑单测（第一件事就要求 root），所以与
 // TestInstallLNMPCallsRegistrationOutsideRunningBranch 一样直接读源码锁结构：
@@ -339,12 +344,12 @@ func TestInstallLNMPCallsSharedPHPListenFix(t *testing.T) {
 	}
 	body := src[start:end]
 
-	iFix := strings.Index(body, "m.ensurePHPListenEndpoint(ctx, f, result)")
+	iFix := strings.Index(body, "m.ensureLNMPPHPEndpoints(ctx, result, formulas)")
 	if iFix < 0 {
-		t.Fatal("一键 LNMP 必须在 PHP 组件上调用共用的 m.ensurePHPListenEndpoint(ctx, f, result)：" +
+		t.Fatal("一键 LNMP 必须调用共用实现 m.ensureLNMPPHPEndpoints(ctx, result, formulas)（它内部调 ensurePHPListenEndpoint）：" +
 			"否则一键装出来的 php-fpm 仍然听 9000，随后装第二个版本就互相抢端口")
 	}
-	iDaemon := strings.Index(body, "m.installSystemDaemons(ctx, result)")
+	iDaemon := strings.Index(body, "m.installSystemDaemons(ctx, result, formulas)")
 	if iDaemon < 0 {
 		t.Fatal("找不到 installSystemDaemons 调用（这段结构变了，请同步更新本测试）")
 	}
@@ -352,10 +357,19 @@ func TestInstallLNMPCallsSharedPHPListenFix(t *testing.T) {
 		t.Error("端点闭环必须在注册系统级服务**之前**：LaunchDaemon 在那一步启动，" +
 			"先写端点才能一次 bind 到专属 socket")
 	}
-	if !strings.Contains(body[:iFix], "phpVersionFromFormula(f)") {
+	// 过滤逻辑留在 ensureLNMPPHPEndpoints 里（它必须按 phpVersionFromFormula 过滤），
+	// 而那个函数必须**复用** ensurePHPListenEndpoint，不许自己抄一份。
+	helper := src[strings.Index(src, "func (m *Manager) ensureLNMPPHPEndpoints("):]
+	if iEnd := strings.Index(helper, "\n// installSystemDaemons"); iEnd > 0 {
+		helper = helper[:iEnd]
+	}
+	if !strings.Contains(helper, "phpVersionFromFormula(f)") {
 		t.Error("端点闭环必须按 phpVersionFromFormula 过滤：nginx / mysql 不该走 PHP 的端点逻辑")
 	}
-	if strings.Contains(body, "sites.EnsureListen") {
+	if !strings.Contains(helper, "m.ensurePHPListenEndpoint(ctx, f, result)") {
+		t.Error("ensureLNMPPHPEndpoints 必须复用 ensurePHPListenEndpoint（与通用 brew 安装路径同一份实现）")
+	}
+	if strings.Contains(body, "sites.EnsureListen") || strings.Contains(helper, "sites.EnsureListen") {
 		t.Error("一键 LNMP 不该自己调 sites.EnsureListen —— 必须复用 ensurePHPListenEndpoint，" +
 			"两份实现迟早走样（这正是历史上通用路径修了、一键路径没修的根因）")
 	}

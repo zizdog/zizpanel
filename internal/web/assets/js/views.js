@@ -10,6 +10,10 @@ import {
 } from './ui.js';
 import { state, NAV, panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
+// 「检查更新」在 2026-09-20 被用户要求**收回**「面板设置」（原来是侧栏独立页），
+// 作为本页第 4 个 Tab。它的实现仍在 update.js 里，这里只是把它挂进来 ——
+// 不复制一份代码，避免"两处升级界面各改一半"（本项目反复踩过的坑）。
+import { UpdateView } from './update.js';
 
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
@@ -407,17 +411,21 @@ export function DashboardView(content, ctx = {}) {
 //  面板设置
 // ============================================================================
 
-export function SettingsView(content) {
+export function SettingsView(content, ctx = {}) {
   clear(content);
   const user = state.session?.user || {};
   const cfg = state.session?.config || {};
 
+  // 「检查更新」排在三项之后（用户 2026-09-20 明确要求的顺序）。
+  // 它是**低频但重要**的动作：放在设置里，但保留直达 hash（#/settings/update），
+  // 以及旧 hash（#/update、#/about、#/settings/about）的别名，见 app.js 的别名表。
   const tabs = [
     { id: 'access', title: '访问与安全' },
     { id: 'terminal', title: '文件与终端' },
     { id: 'account', title: '账号与两步验证' },
+    { id: 'update', title: '检查更新' },
   ];
-  let active = 'access';
+  let active = tabs.some((t) => t.id === ctx.tab) ? ctx.tab : 'access';
 
   const body = h('div');
   const tabBar = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '16px', flexWrap: 'wrap' } });
@@ -426,7 +434,15 @@ export function SettingsView(content) {
     clear(tabBar);
     tabs.forEach((t) => tabBar.append(h(`button.btn.btn-sm${active === t.id ? '.btn-primary' : ''}`, {
       text: t.title,
-      onclick: () => { active = t.id; renderTabs(); renderBody(); },
+      onclick: () => {
+        active = t.id;
+        // 把当前 Tab 写进 URL（用 replaceState：不触发 hashchange，因此不会整页重挂载）。
+        // 为什么值得做：刷新后仍停在同一页（否则"检查更新"这种要看结果的页刷新就跳回
+        // 第一个 Tab），而且可以把 #/settings/update 直接收藏/发给别人。
+        try { history.replaceState(null, '', '#/settings/' + t.id); } catch { /* 隐私模式等 */ }
+        renderTabs();
+        renderBody();
+      },
     })));
   }
 
@@ -434,7 +450,17 @@ export function SettingsView(content) {
     clear(body);
     if (active === 'access') await renderAccess();
     else if (active === 'terminal') await renderTerminal();
+    else if (active === 'update') await renderUpdate();
     else await renderAccount();
+  }
+
+  // ---------- 检查更新 ----------
+  // 直接复用「检查更新」页的实现（update.js）。它渲染自己的卡片（在线升级 /
+  // 面板信息 / 常用运维命令），所以这里只给一个容器。
+  async function renderUpdate() {
+    const box = h('div', { dataset: { testid: 'zp-settings-update' } });
+    body.append(box);
+    UpdateView(box, ctx);
   }
 
   // ---------- 访问与安全 ----------
@@ -901,20 +927,10 @@ export function SettingsView(content) {
 
   renderTabs();
   renderBody();
-  // 迁移指路：「关于与运维」整块已搬到侧栏「检查更新」（2026-09-21 用户要求）。
-  // 在设置页底部留一条入口，老用户按旧位置找过来时不会以为功能被删了。
-  // 注意：新页面里**没有**操作审计 —— 侧栏已有独立的「操作审计」页，不重复放。
-  content.append(
-    tabBar,
-    body,
-    h('div.card', [
-      h('div.card-head', [h('h3', { text: '已迁移的功能' })]),
-      h('div.card-body', [
-        h('p.hint', { text: '原「关于与运维」里的在线升级、面板信息与常用运维命令，已移到侧边栏的「检查更新」。' }),
-        h('button.btn.btn-sm', { text: '前往「检查更新」', onclick: () => go('update') }),
-      ]),
-    ]),
-  );
+  // 这里**不再**有「已迁移的功能」指路卡片：2026-09-20 用户要求把「检查更新」
+  // 收回设置页（重复入口让人困惑），功能就在上面第 4 个 Tab 里，再放一个
+  // "去别处"的按钮只会把用户又支到别的地方。
+  content.append(tabBar, body);
 }
 
 // ============================================================================

@@ -1,8 +1,12 @@
-// update.js —— 「检查更新」页（原「面板设置 → 关于与运维」被整块搬到这里）。
+// update.js —— 「面板设置 → 检查更新」这一个页内 Tab 的内容。
 //
-// 为什么单独成页：用户 2026-09-21 要求把"在线升级"从设置页的第四个 Tab 提到
-// 侧边栏。设置页是**低频表单**，而"有没有新版本"是**随时想知道**的状态；
-// 埋在两层点击之后必然没人看。
+// 位置变过两次，最终形态是 2026-09-20 用户定的：
+//   原来是「面板设置」的第 4 个 Tab → 提到侧边栏做成独立页「检查更新」
+//   → 用户发现"设置里一个入口、侧栏又一个入口"是重复的，要求**收回设置页**，
+//     顺序排在「访问与安全 / 文件与终端 / 账号与两步验证」之后（见 views.js 的 tabs）。
+// 所以这里导出的 UpdateView 是**页内组件**，由 SettingsView 挂到那个 Tab 里，
+// 不再有独立的侧栏入口（旧 hash `#/update`、`#/about`、`#/settings/about`
+// 仍会被路由别名落到这个 Tab 上，见 app.js 的 ROUTE_TARGET）。
 //
 // 这一页除了原来的升级卡片，还负责三件主动的事（同一轮需求）：
 //   1. 进面板 / 打开本页时自动 `POST /system/upgrade/check`；
@@ -16,6 +20,12 @@
 //
 // 这个卡片最特殊的地方（沿用原注释）：升级过程中面板会**重启**，所有请求都会
 // 失败一段时间。任何"发起后弹个成功提示就完事"的写法都是错的：那时新版都还没开始跑。
+//
+// 2026-09-20 用户要求："升级过程要有详细的内容展示！"
+// 于是升级期间不再只有一句"升级中"（那样用户只能干等，也不知道卡在哪）：
+//   · 阶段条：检查更新 → 下载安装包 → 校验并暂存 → 替换程序 → 重启并验证 → 完成；
+//   · 后端 `state.steps` 里记的每一步（时间 + 阶段 + 结论）逐条摊开；
+//   · 已用时长每秒刷新，下载/重启期间持续轮询状态（面板重启时的失败是预期，保持安静）。
 
 import { api, apiURL } from './api.js';
 import { h, clear, toast } from './ui.js';
@@ -172,6 +182,85 @@ async function pingHealth() {
   }
 }
 
+// ---------------- 升级过程的可视化 ----------------
+//
+// 用户 2026-09-20 的要求："升级过程要有详细的内容展示！"
+// 光有一句"升级中…"等于让用户干等：他不知道是在下载、在校验、还是卡住了。
+// 这里把后端 state 里已有的信息全部摊开：
+//   · 阶段条：检查更新 → 下载安装包 → 校验并暂存 → 替换程序 → 重启并验证；
+//   · 当前阶段原文（st.stage / st.message，由后端逐步写盘）；
+//   · 已用时长（每秒刷新，来自 st.started_at）；
+//   · state.steps 里每一步的时间 + 结论（升级失败时这是唯一能看出卡在哪的证据）。
+const UP_PHASES = [
+  { id: 'check', label: '检查更新' },
+  { id: 'download', label: '下载安装包' },
+  { id: 'stage', label: '校验并暂存' },
+  { id: 'apply', label: '替换程序' },
+  { id: 'restart', label: '重启并验证' },
+];
+
+// upPhaseIndex 把后端状态映射到阶段下标；-1 表示"没有正在进行的升级"。
+function upPhaseIndex(status) {
+  switch (status) {
+    case 'checking': return 0;
+    case 'downloading': return 1;
+    case 'staged': return 2;
+    case 'applying': return 3;
+    case 'restarting': return 4;
+    case 'success': return UP_PHASES.length;
+    default: return -1;
+  }
+}
+
+function upPhaseBar(status) {
+  const cur = upPhaseIndex(status);
+  const bar = h('div', {
+    dataset: { testid: 'zp-upgrade-phases' },
+    style: { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '4px 0 10px' },
+  });
+  UP_PHASES.forEach((p, i) => {
+    const done = cur > i;
+    const active = cur === i;
+    bar.append(h('span', {
+      style: {
+        padding: '2px 8px', borderRadius: '10px', fontSize: '12px',
+        border: '1px solid ' + (active ? 'var(--primary)' : 'var(--border)'),
+        background: active ? 'var(--primary)' : 'transparent',
+        color: active ? '#fff' : (done ? 'var(--text)' : 'var(--text-mute)'),
+        opacity: done || active ? '1' : '0.55',
+      },
+      text: (done ? '✓ ' : (active ? '▶ ' : '')) + p.label,
+    }));
+  });
+  return bar;
+}
+
+function upElapsedText(startedAt) {
+  const started = startedAt ? Date.parse(startedAt) : 0;
+  if (!started) return '';
+  const secs = Math.max(0, Math.round((Date.now() - started) / 1000));
+  if (secs < 60) return `已用 ${secs} 秒`;
+  return `已用 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒`;
+}
+
+function upStepsBox(st) {
+  const steps = Array.isArray(st.steps) ? st.steps : [];
+  if (!steps.length) return null;
+  const lines = steps.map((s) => {
+    const at = s.at ? String(s.at).replace('T', ' ').slice(11, 19) : '--:--:--';
+    const mark = s.ok === false ? '✗' : '✓';
+    return `${at}  ${mark} ${s.stage || ''}${s.message ? '：' + s.message : ''}`;
+  });
+  const box = h('pre.logbox', {
+    dataset: { testid: 'zp-upgrade-steps' },
+    style: { maxHeight: '220px', overflow: 'auto', margin: '0 0 10px' },
+    text: lines.join('\n'),
+  });
+  // 追加式日志：滚到底部，用户一眼看到最新一步。
+  queueMicrotask(() => { box.scrollTop = box.scrollHeight; });
+  return box;
+}
+
 export function UpdateView(content, ctx = {}) {
   clear(content);
 
@@ -182,6 +271,8 @@ export function UpdateView(content, ctx = {}) {
   let pollTimer = null;
   let pollDeadline = 0;
   let checkInfo = null; // 最近一次"检查更新"的结论（has_update / latest）
+  let stageInflight = false; // stage 请求是否还在飞（决定轮询什么时候停）
+  let elapsedTimer = null;   // 每秒刷新"已用时长"
 
   const srcInput = h('input.input', {
     placeholder: 'https://example.com/zizpanel/releases（放着 manifest.json 的目录）',
@@ -190,8 +281,19 @@ export function UpdateView(content, ctx = {}) {
   const notice = h('div');
   const versionTag = h('span#zp-up-ver', { dataset: { testid: 'zp-up-ver' }, style: { color: 'var(--text-mute)', fontSize: '12px' }, text: '读取中…' });
   const bodyEl = h('div.card-body');
+  // 「检查更新」只留**一颗**按钮，放在卡片标题栏右侧。
+  //
+  // 为什么（用户 2026-09-20 反馈）：原来卡片正文里并排两颗按钮
+  // （「立即检测」+「一键更新到 vX」），而上方"发现新版本"的醒目横幅里**已经有**
+  // 一颗「一键更新」—— 同一个动作出现两次，用户不知道该点哪个，只觉得重复。
+  // 现在：横幅里那颗负责"升级"（只在真的有新版本时出现），标题栏这颗负责"再检测一次"。
+  const btnCheck = h('button.btn.btn-sm', {
+    dataset: { testid: 'zp-update-check-btn' },
+    text: '检查更新',
+    onclick: () => runCheck(true, btnCheck),
+  });
   const card = h('div.card', [
-    h('div.card-head', [h('h3', { text: '在线升级' }), h('div.spacer'), versionTag]),
+    h('div.card-head', [h('h3', { text: '在线升级' }), h('div.spacer'), btnCheck, versionTag]),
     bodyEl,
   ]);
 
@@ -251,7 +353,13 @@ export function UpdateView(content, ctx = {}) {
         checkInfo.asset_error ? h('div', { style: mutedStyle, text: checkInfo.asset_error }) : null,
         h('div', { style: mutedStyle, text: '最后检测：' + fmtTime(checkInfo.checked_at) + ' · 每 6 小时自动检测一次' }),
         h('div', { style: actionsStyle }, [
-          h('button.btn.btn-sm.btn-primary', { text: '一键更新', onclick: () => oneClickUpdate() }),
+          // 升级入口只留这一颗（新版本存在时出现）。testid 沿用原来的
+          // zp-oneclick-update —— 自动化测试按它找"一键更新"，换了名字等于偷偷改契约。
+          h('button.btn.btn-sm.btn-primary', {
+            dataset: { testid: 'zp-oneclick-update' },
+            text: `一键更新到 v${checkInfo.latest}`,
+            onclick: () => oneClickUpdate(),
+          }),
         ]),
       ], { border: '1px solid var(--warn)' }));
     } else if (checkInfo) {
@@ -271,6 +379,23 @@ export function UpdateView(content, ctx = {}) {
   // ---------- 升级卡片 ----------
   function stopPoll() {
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  function stopElapsedTimer() {
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  }
+
+  // startElapsedTimer 每秒刷新"已用时长"。为什么不用轮询兼做：轮询 2 秒一次、
+  // 且面板重启期间会失败 —— 那时秒表必须继续走（用户最需要知道"已经等了多久"）。
+  function startElapsedTimer(startedAt) {
+    const tick = () => {
+      const text = upElapsedText(startedAt);
+      document.querySelectorAll('[data-testid="zp-upgrade-elapsed"]').forEach((el) => {
+        el.textContent = text;
+      });
+    };
+    tick();
+    elapsedTimer = setInterval(tick, 1000);
   }
 
   function clearDismissTimer() {
@@ -348,6 +473,44 @@ export function UpdateView(content, ctx = {}) {
       ]));
     }
 
+    // ---- 升级过程详情（阶段条 + 当前阶段 + 已用时长 + 每一步）----
+    //
+    // 只在"正在进行/刚结束"的状态下显示：idle 时显示一整排阶段只会让人以为在升级。
+    const inProgress = status === 'checking' || status === 'downloading'
+      || status === 'applying' || status === 'restarting';
+    if (inProgress || upPhaseIndex(status) >= 0 || (st.steps || []).length) {
+      bodyEl.append(upPhaseBar(status));
+      if (st.stage || st.message) {
+        // stage 是"在哪一步"，message 是"这一步的细节"（例如下载百分比）——
+        // 两个都显示：只显示其中一个会把后端辛苦写的实时进度藏起来。
+        bodyEl.append(h('div', { style: { fontSize: '13px', marginBottom: '6px' } }, [
+          h('strong', { text: '当前：' }),
+          h('span', { dataset: { testid: 'zp-upgrade-stage' }, text: st.stage || '' }),
+          st.message ? h('span', {
+            dataset: { testid: 'zp-upgrade-message' },
+            style: { color: 'var(--text-mute)', marginLeft: '6px' },
+            text: st.message,
+          }) : null,
+          h('span', {
+            dataset: { testid: 'zp-upgrade-elapsed' },
+            style: { color: 'var(--text-mute)', marginLeft: '6px' },
+            text: upElapsedText(st.started_at),
+          }),
+        ]));
+      }
+      if (inProgress) {
+        bodyEl.append(h('div.hint', {
+          text: '下载与校验都由面板自己完成，进度会实时更新；替换程序后面板会短暂重启，'
+            + '页面自动重连并刷新，请不要关闭本页。',
+        }));
+      }
+      const sb = upStepsBox(st);
+      if (sb) bodyEl.append(sb);
+    }
+    // 已用时长每秒刷新：只在升级进行中挂计时器，结束就停（避免页面一直空转）。
+    stopElapsedTimer();
+    if (inProgress && st.started_at) startElapsedTimer(st.started_at);
+
     // ---- 版本与来源 ----
     bodyEl.append(h('dl.kv', [
       h('dt', { text: '当前版本' }), h('dd', { text: `v${data.current_version || '—'}（${data.arch || '—'}）` }),
@@ -384,23 +547,14 @@ export function UpdateView(content, ctx = {}) {
     }
 
     // ---- 操作按钮 ----
-    const isBusy = busy || status === 'applying' || status === 'restarting';
-    const btnCheck = h('button.btn', {
-      text: '立即检测',
-      disabled: isBusy || undefined,
-      onclick: () => runCheck(true, btnCheck),
-    });
-
-    // 「一键更新」：一次点击走完 stage → apply，中间不需要用户接管。
-    const target = data.staged ? data.staged_version : (checkInfo?.has_update ? checkInfo.latest : latestVersion());
-    const btnUpdate = h('button.btn.btn-primary', {
-      dataset: { testid: 'zp-oneclick-update' },
-      text: target ? `一键更新到 v${target}` : '一键更新',
-      disabled: isBusy || !data.can_remote || data.can_apply === false || undefined,
-      onclick: () => oneClickUpdate(),
-    });
-
-    bodyEl.append(h('div', { style: actionsStyle }, [btnCheck, btnUpdate]));
+    //
+    // 这里**不再**放"立即检测 + 一键更新"两颗按钮（用户 2026-09-20 明确要求删掉那一段：
+    // 与横幅里的「一键更新」重复）。只剩标题栏那颗「检查更新」；升级入口在
+    // 上方横幅（有新版本时）与下面「已就绪」区块（已暂存时），各出现一次。
+    const isBusy = busy || status === 'applying' || status === 'restarting'
+      || status === 'checking' || status === 'downloading';
+    btnCheck.disabled = !!isBusy;
+    btnCheck.textContent = (status === 'checking' || status === 'downloading') ? '检测中…' : '检查更新';
 
     // ---- 上传（离线路径）----
     const fileInput = h('input', { type: 'file', accept: '.tar.gz,.tgz' });
@@ -479,7 +633,7 @@ export function UpdateView(content, ctx = {}) {
     }
   }
 
-  // runCheck：手动「立即检测」走这条；自动检测由下方的 checkUpgrades 负责。
+  // runCheck：用户点标题栏「检查更新」走这条；自动检测由下方的 checkUpgrades 负责。
   async function runCheck(manual, btn) {
     if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
     try {
@@ -498,21 +652,26 @@ export function UpdateView(content, ctx = {}) {
     } catch (e) {
       toast(e.message, 'err', 9000);
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = '立即检测'; }
+      if (btn) { btn.disabled = false; btn.textContent = '检查更新'; }
     }
   }
 
   // 升级期间轮询。面板重启时请求会失败 —— 这是**预期行为**，
   // 所以失败不报错，只继续等，直到面板回来或超时。
-  function startPoll() {
+  // startPoll：升级期间轮询状态。
+  //
+  // keepGoing 由调用方给：下载阶段与替换阶段要继续的条件完全不同
+  // （下载阶段面板没重启，状态是 checking/downloading；替换阶段会重启，
+  // 状态是 applying/restarting）。budgetMs 是这次轮询的总预算 ——
+  // 下载可能十几分钟（公网源），不能再用写死的 5 分钟。
+  function startPoll(keepGoing, budgetMs) {
     stopPoll();
-    pollDeadline = Date.now() + 5 * 60 * 1000;
+    pollDeadline = Date.now() + (budgetMs || 6 * 60 * 1000);
     const tick = async () => {
       try {
         const data = await api.upgradeStatus();
         render(data);
-        const s = data.state?.status;
-        if (s !== 'applying' && s !== 'restarting') { stopPoll(); return; }
+        if (keepGoing && !keepGoing(data.state || {})) { stopPoll(); return; }
       } catch {
         // 面板正在重启：保持安静，继续尝试
       }
@@ -540,8 +699,23 @@ export function UpdateView(content, ctx = {}) {
 
       if (!staged) {
         toast('正在下载并校验升级包…', 'info', 6000);
-        const res = await api.upgradeStage(srcInput.value.trim());
+        // 下载阶段就开轮询：后端会把"正在获取清单 / 正在下载 / 已暂存"逐步写盘，
+        // 用户因此能看到进度与已用时长，而不是盯着一句 toast 干等（用户 2026-09-20 要求）。
+        stageInflight = true;
+        startPoll((st) => stageInflight || st.status === 'checking' || st.status === 'downloading',
+          20 * 60 * 1000);
+        render({
+          ...(info || {}),
+          state: { status: 'checking', stage: '正在获取发布清单…', started_at: new Date().toISOString() },
+        });
+        let res;
+        try {
+          res = await api.upgradeStage(srcInput.value.trim());
+        } finally {
+          stageInflight = false;
+        }
         if (!res.staged) {
+          stopPoll();
           toast(res.message || '无需升级', 'ok');
           busy = false;
           render(await api.upgradeStatus());
@@ -552,8 +726,8 @@ export function UpdateView(content, ctx = {}) {
       }
 
       toast(`${ver ? 'v' + ver + ' ' : ''}已就绪，正在升级，面板会短暂重启…`, 'info', 8000);
-      render({ ...(info || {}), state: { status: 'applying', message: `正在升级到 v${ver}…` } });
-      startPoll();
+      render({ ...(info || {}), state: { status: 'applying', stage: `正在升级到 v${ver}…`, started_at: new Date().toISOString() } });
+      startPoll((st) => st.status === 'applying' || st.status === 'restarting', 10 * 60 * 1000);
 
       // apply 会重启面板：请求本身可能中断，这属于预期，不能当失败处理。
       try { await api.upgradeApply(); } catch { /* 连接被重启切断 */ }
@@ -613,6 +787,7 @@ export function UpdateView(content, ctx = {}) {
   if (ctx.onLeave) {
     ctx.onLeave(() => {
       stopPoll();
+      stopElapsedTimer(); // 秒表也要停：升级中的页面被切走时它没有任何可见去处
       clearDismissTimer();
       // 离开页面时清掉这次检测的 in-flight 引用：它已经在模块级去重了，
       // 这里只需保证定时器不泄漏（SSE 式的长连接本页没有）。

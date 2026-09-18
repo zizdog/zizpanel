@@ -90,9 +90,11 @@ var QwenModels = []QwenModel{
 const qwenDefaultModel = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
 
 const (
-	qwenPort      = 8880
-	qwenLabel     = "com.zizdog.qwen3tts"
-	qwenPythonVer = "python@3.11"
+	qwenPort  = 8880
+	qwenLabel = "com.zizdog.qwen3tts"
+	// 预置的 Python 版本只有一处定义（python_runtime.go 的 panelPythonFormula）——
+	// 换版本时不会漏改解释器路径 / site-packages 路径（那两处以前写死了 python3.11）。
+	qwenPythonVer = panelPythonFormula
 	qwenPipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
 	qwenHFMirror  = "https://hf-mirror.com"
 	qwenMinDiskGB = 10
@@ -207,9 +209,9 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	} else {
 		result.step(ctx, qwenPythonVer+" 已安装，跳过")
 	}
-	py311 := filepath.Join(m.brewPrefix(), "opt", qwenPythonVer, "bin", "python3.11")
-	if _, err := os.Stat(py311); err != nil {
-		return fmt.Errorf("找不到 %s", py311)
+	pyBin := panelPythonInterpreter(m.brewPrefix(), qwenPythonVer)
+	if _, err := os.Stat(pyBin); err != nil {
+		return fmt.Errorf("找不到 %s", pyBin)
 	}
 
 	// ---- 2. 虚拟环境 ----
@@ -225,7 +227,7 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 	if _, err := os.Stat(p.Python); err != nil {
 		result.step(ctx, "正在创建 Python 虚拟环境")
-		if out, err := m.runAsUser(ctx, 5*time.Minute, py311, "-m", "venv", p.Venv); err != nil {
+		if out, err := m.runAsUser(ctx, 5*time.Minute, pyBin, "-m", "venv", p.Venv); err != nil {
 			return fmt.Errorf("创建虚拟环境失败: %v（%s）", err, tailText(out, 300))
 		}
 	} else {
@@ -1139,7 +1141,12 @@ socket.getaddrinfo = _zizpanel_v4
 // 刻意不做成"失败就算了"的静默降级：写不进去时要留下痕迹（调用方会写进任务步骤），
 // 因为它的症状是"下载变慢/超时"，没有痕迹的话下次又得从头排查。
 func (m *Manager) installIPv4Sitecustomize(ctx context.Context, p qwenPaths, result *InstallResult) error {
-	sp := filepath.Join(p.Venv, "lib", "python3.11", "site-packages")
+	// 目录名随 Python 版本变（python3.11 / python3.12 …），所以从同一个常量推导，
+	// 不写死 —— 写错的表现是补丁文件被写进一个不存在的目录，而且当场不报错。
+	sp := panelPythonSitePackages(p.Venv, qwenPythonVer)
+	if sp == "" {
+		return fmt.Errorf("无法从 %q 推导 site-packages 目录", qwenPythonVer)
+	}
 	if st, err := os.Stat(sp); err != nil || !st.IsDir() {
 		return fmt.Errorf("找不到 %s", sp)
 	}

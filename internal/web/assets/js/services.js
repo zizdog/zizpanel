@@ -210,7 +210,12 @@ export function renderInstalledApps(container, opts = {}) {
       }) : null,
       health.checked
         ? (health.ok
-          ? h('span.pill.ok', { text: '健康', title: (health.message || '') + '（' + (health.latency_ms || 0) + 'ms）' })
+          ? h('span.pill.ok', {
+            text: '健康',
+            // message 只在 title 里的话，用户看不到"为什么 401 也算健康"——
+            // 下面 extra 会把它显式写出来（2026-09-20：自动化测试也按可见文本断言）。
+            title: (health.message || '') + '（' + (health.latency_ms || 0) + 'ms）',
+          })
           : h('span.pill.danger', { text: '健康检查失败', title: health.message || '' }))
         : null,
       s && s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
@@ -228,6 +233,16 @@ export function renderInstalledApps(container, opts = {}) {
 
     // 健康检查失败：把"是什么、为什么、怎么办"摆出来（与旧服务卡片同一套话术）。
     // 「重新检查」不再单独给一颗按钮 —— 卡片上的「⟳ 刷新」就是重新查这一条。
+    // 「健康但需要登录」也要把原因写在卡片上（不能只藏在 tooltip 里）：
+    // 401/403 被判成健康之后，用户看到"健康"会疑惑——地址明明要登录。
+    // 后端 health.message 已经带了原因（"HTTP 401（需要身份验证，服务本身正常）"），
+    // 这里如实转述，不另编文案。
+    const authNote = (health.checked && health.ok && /需要身份验证/.test(String(health.message || '')))
+      ? [h('div', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        text: (health.message || '') + ' —— 该地址要求登录，服务本身是正常的',
+      })]
+      : [];
     const extra = (health.checked && !health.ok)
       ? [h('div', { style: { fontSize: '11.5px', color: 'var(--danger)' } }, [
         h('div', { text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) }),
@@ -246,7 +261,9 @@ export function renderInstalledApps(container, opts = {}) {
       subtitle,
       pills,
       text,
-      extra,
+      extra: [...extra, ...authNote],
+      // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-20 真的漏过一次，
+      // 是 make smoke 的"必须能点到管理/卸载"断言抓到的 —— 别删这一行）。
       actions,
       // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
       warning: portAccessWarning(m, { svc: s }),
@@ -400,7 +417,10 @@ export function openLogs(s) {
   let paused = false;
 
   const follow = h('input', { type: 'checkbox', checked: true });
-  const status = h('span.pill', { text: '连接中…' });
+  // testid 是给自动化测试用的稳定锚点：日志弹窗里还有别的 pill（服务状态、
+  // 面板托管…），按 ".modal .pill" 取第一个会拿到错的那个 —— 2026-09-20 实测
+  // 就是这样，测试报"日志流状态是：运行中"。
+  const status = h('span.pill', { dataset: { testid: 'zp-logs-status' }, text: '连接中…' });
 
   const start = () => {
     if (es) es.close();

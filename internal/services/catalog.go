@@ -676,6 +676,80 @@ func Catalog() []App {
 			Port:     0,
 			DocsURL:  "https://ffmpeg.org",
 		},
+		// ---------------- Python 解释器（基础环境的运行时，用户 2026-09-18 要求） ----------------
+		//
+		// 为什么把 Python 解释器当"应用"上架：面板自研的两个服务（Qwen3 TTS、
+		// IOPaint）各自需要一整套 Python 环境，而面板过去只会**偷偷**在它们自己的
+		// 安装流程里 `brew install python@3.11` —— 用户看不见、也无法选择版本，
+		// 更没法在装之前先把它准备好。用户 2026-09-18 明确要求：
+		//   "应用市场添加至少 3 个常用版本的 python。"
+		//
+		// 三条都有的意义是**用户可选**：不同应用对 Python 版本的要求不同
+		// （mlx-audio 走 3.11 最稳，torch 系在 3.12 上也没问题），面板不再替用户
+		// 赌一个版本。Qwen3 TTS / IOPaint 的预置版本仍是 panelPythonFormula
+		// （见 python_runtime.go），与这里上架的版本是两件事：这里是"给用户装的"，
+		// 那里是"面板自己的两个服务默认用的"。
+		//
+		// PanelInstaller=python：解释器**没有 brew service**（装了就是命令行工具 +
+		// 库），走通用 brew 流程会 `brew services start python@3.11` 并留下一条
+		// 永远没有状态的假服务记录、外加一句"已安装但启动失败"的假警告
+		// （ffmpeg 当年就是这么被误报的）。所以它有自己的安装/卸载路径。
+		{
+			ID: "python310", Name: "Python 3.10", Icon: "🐍",
+			Summary: "Python 解释器（老项目/Intel Mac 需要时的稳妥选择）",
+			Description: "Homebrew 的 python@3.10（含 pip）。Intel Mac 与老项目用：上游从 3.12 起" +
+				"不再提供 macOS Intel 瓶，只有 3.10 / 3.11 有；老项目也常锁 3.10。与其它版本并存，" +
+				"没有常驻进程，装完是命令行工具 `/opt/homebrew/opt/python@3.10/bin/python3.10`。",
+			Category: CategoryOther, Kind: KindNative,
+			PanelInstaller: "python",
+			BrewFormula:    "python@3.10",
+			NoDaemon:       true,
+			Port:           0,
+			DocsURL:        "https://docs.python.org/3.10/",
+		},
+		{
+			ID: "python311", Name: "Python 3.11", Icon: "🐍",
+			Summary: "Python 解释器（面板自研运行时 Qwen3 TTS / IOPaint 的预置版本）",
+			Description: "Homebrew 的 python@3.11（含 pip）。面板自己的两个 Python 服务" +
+				"（Qwen3 TTS 音色克隆、IOPaint 图像修复）默认就用这一版：mlx-audio 在 3.11 上有" +
+				"预编译 wheel，整条链路在真机验证过。装了它不会自动创建任何虚拟环境 —— " +
+				"虚拟环境是各应用安装时按需创建的（互不污染）。" +
+				"没有常驻进程、没有端口，装完是命令行工具：" +
+				"`/opt/homebrew/opt/python@3.11/bin/python3.11`。",
+			Category: CategoryOther, Kind: KindNative,
+			PanelInstaller: "python",
+			BrewFormula:    "python@3.11",
+			// 解释器没有守护进程、没有端口、没有网页界面（与 ffmpeg 同类）。
+			NoDaemon: true,
+			Port:     0,
+			DocsURL:  "https://docs.python.org/3.11/",
+		},
+		{
+			ID: "python312", Name: "Python 3.12", Icon: "🐍",
+			Summary: "Python 解释器（较新的稳定版本，适合需要 3.12 的应用）",
+			Description: "Homebrew 的 python@3.12（含 pip）。给要求 3.12 的应用与脚本用，与 3.11 并存" +
+				"（版本化 formula 各自独立，互不覆盖）。⚠️ Intel Mac 装不了：上游从 3.12 起不再提供" +
+				"macOS Intel 瓶，Intel 请用 3.10 / 3.11。装完是命令行工具，没有常驻进程。",
+			Category: CategoryOther, Kind: KindNative,
+			PanelInstaller: "python",
+			BrewFormula:    "python@3.12",
+			NoDaemon:       true,
+			Port:           0,
+			DocsURL:        "https://docs.python.org/3.12/",
+		},
+		{
+			ID: "python313", Name: "Python 3.13", Icon: "🐍",
+			Summary: "Python 解释器（最新稳定版，尝鲜/新项目用）",
+			Description: "Homebrew 的 python@3.13（含 pip）。最新稳定版，新项目用；与 3.11 / 3.12 并存。" +
+				"⚠️ Intel Mac 装不了（上游没有 macOS Intel 瓶）。部分需要预编译 wheel 的机器学习包可能" +
+				"还没适配 3.13，装包报错就换 3.11 / 3.12。没有常驻进程。",
+			Category: CategoryOther, Kind: KindNative,
+			PanelInstaller: "python",
+			BrewFormula:    "python@3.13",
+			NoDaemon:       true,
+			Port:           0,
+			DocsURL:        "https://docs.python.org/3.13/",
+		},
 		// PostgreSQL 归「网站环境」（CategoryLNMP）是**产品负责人 2026-09-19 的拆分**：
 		//   · 它是数据库组件，与 MySQL 同类；网站环境层 = nginx / PHP / MySQL /
 		//     PostgreSQL / phpMyAdmin，统一收在「网站环境」板块；

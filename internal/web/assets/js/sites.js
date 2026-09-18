@@ -33,15 +33,253 @@ let detailTab = 'basic';
 // 而 LNMP 是组合动作（三件套 + 默认站点 / vhosts / 系统级守护进程等收尾），
 // 不是一张可安装的卡片（目录里也没有 ID=lnmp 的条目，见 services/catalog.go）。
 //
-// 文案要求（用户原话）：说清"会安装 nginx + PHP + MySQL + phpMyAdmin 等"，
-// 并**如实提示耗时与长任务特性** —— 十几分钟、关掉窗口不中断、进度在任务中心。
+// LNMP_HINT 是按钮上的 tooltip（鼠标悬停就能看完的那段话）。
+//
+// 2026-09-19 起版本由用户在弹窗里选，所以这里不再写死 "PHP 8.2 + MySQL 8.4" ——
+// 写死的话，用户选了 8.4 再看提示就会发现"提示与实际不符"。
 const LNMP_HINT = '一键 LNMP 会先确保运行依赖（命令行开发者工具 CLT / Homebrew），'
-  + '再安装 nginx + PHP 8.2 + MySQL 8.4 + phpMyAdmin（数据库管理界面），'
+  + '再安装 nginx + PHP + MySQL + phpMyAdmin（数据库管理界面），'
   + '并完成默认站点、vhosts 目录、MySQL 初始化、系统级守护进程等收尾工作。'
+  + '点开会先让你选 nginx / PHP / MySQL 各自的版本。'
   + '全程约十几分钟（取决于网络与 Homebrew 下载/编译速度）。'
-  + '提交后立刻返回任务号，进度在「任务中心」实时显示 —— 关掉窗口、切换页面都不会中断安装。'
-  + '\n\n装 MySQL 时会问一次 root 口令（任务中心里，60 秒不回答就自动生成强随机口令）——'
-  + '**可以不干预**：装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。';
+  + '提交后立刻返回任务号，进度在「任务中心」实时显示 —— 关掉窗口、切换页面都不会中断安装。';
+
+// LNMP_MYSQL_HINT 是 MySQL root 口令的说明（用户明确要求"在这个界面上显著说明"）。
+//
+// 任务中心里还有一条同义的常驻提示条（tasks.js，按标题 /LNMP/i 匹配），
+// 两处都在：用户决定点确认之前就要知道"装 MySQL 会问口令、可以不干预"，
+// 而不是等任务开起来才看到。
+const LNMP_MYSQL_HINT = '装 MySQL 时会问一次 root 口令（在任务中心里，60 秒不回答就自动生成强随机口令）'
+  + ' —— **可以不干预**：装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。';
+
+// lnmpGroupOrder 是弹窗里组件分组的展示顺序（与后端 groups 的 key 对应）。
+//
+// 写在这里而不是直接用后端顺序：后端保证顺序（有测试锁死），但前端自己也该有
+// 一个明确的顺序概念 —— 万一后端漏了一组，下面的"缺组"检查会如实报出来，
+// 而不是悄悄少渲染一行。
+const LNMP_GROUP_ORDER = [
+  { key: 'nginx', label: 'Nginx', desc: 'Web 服务器（网站入口，只有一个版本）' },
+  { key: 'php', label: 'PHP', desc: '站点解析 PHP 用；面板让每个版本监听自己的专属 socket，可以多版本共存' },
+  { key: 'mysql', label: 'MySQL', desc: '数据库（面板的「数据库」页与 phpMyAdmin 依赖它）' },
+];
+
+/**
+ * openLNMPDialog 打开"选版本"弹窗；只有用户点确认之后才会创建安装任务。
+ *
+ * 流程（用户 2026-09-19 的要求："弹窗出来先让用户选择各服务版本，
+ * 而不是直接执行安装"）：
+ *   1. 点按钮 → **先发 GET /market/lnmp-options**（只读，不装任何东西）；
+ *   2. 三组（nginx / PHP / MySQL）各列出候选，默认选中推荐项，已安装的标出来；
+ *   3. 用户确认 → 才 POST /market/install-lnmp（body 里是本次选择）→ 任务中心。
+ *
+ * 接口失败时**不弹空弹窗、也不偷偷用默认值安装**：明确报错，并给一颗
+ * "用默认版本安装"的显式按钮（用户点了才算他的选择）。
+ */
+async function openLNMPDialog() {
+  const state = {
+    groups: null, // 后端给的分组
+    err: '',
+    busy: true,
+    picked: {}, // group.key → 选中的 formula
+  };
+  let m = null;
+
+  const box = h('div', { style: { minWidth: '520px', maxWidth: '620px' } });
+  const body = h('div');
+  const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } });
+  body.append(box);
+  foot.append(h('div', { style: { flex: '1' } }));
+  foot.append(h('button.btn', { text: '取消', onclick: () => (m ? m.close() : null) }));
+
+  // install 按钮是**唯一**发安装请求的入口。
+  const installBtn = h('button.btn.btn-primary', {
+    text: '开始安装',
+    onclick: () => {
+      const sel = currentSelection();
+      if (!sel) return; // currentSelection 已经 toast 过原因
+      if (m) m.close();
+      // 提交交给任务中心：立刻返回 task_id、进度走 SSE、失败有 toast。
+      // 绝不在这里同步 await 安装过程（那会让用户刷新就杀掉 brew）。
+      taskCenter.start({
+        kind: 'install',
+        target: 'lnmp',
+        title: '一键 LNMP',
+        start: () => api.installLNMP(sel),
+      });
+    },
+  });
+  installBtn.disabled = true;
+  foot.append(installBtn);
+
+  // currentSelection 把界面上的选择读成 {nginx, php, mysql}；不完整时 toast 并返回 null。
+  function currentSelection() {
+    const sel = { nginx: state.picked.nginx, php: state.picked.php, mysql: state.picked.mysql };
+    const missing = LNMP_GROUP_ORDER.filter((g) => !sel[g.key]).map((g) => g.label);
+    if (missing.length) {
+      toast('至少要选：' + missing.join('、') + '（三件套必须各选一个版本）', 'warn');
+      return null;
+    }
+    return sel;
+  }
+
+  function render() {
+    clear(box);
+    clear(foot);
+    foot.append(h('div', { style: { flex: '1' } }));
+    foot.append(h('button.btn', { text: '取消', onclick: () => (m ? m.close() : null) }));
+    foot.append(installBtn);
+
+    if (state.busy) {
+      box.append(h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取各组件可选版本…' })]));
+      installBtn.disabled = true;
+      return;
+    }
+    if (state.err) {
+      // 明确报错 + 显式默认入口。**不**自动用默认值装：那是替用户做决定，
+      // 用户以为面板"弹窗没出来就装好了"，实际装了他没选的版本。
+      box.append(h('div', [
+        h('p', { style: { color: 'var(--danger, #d33)', marginBottom: '8px' },
+          text: '读取可选版本失败：' + state.err }),
+        h('p.hint', { text: '没有拿到候选版本，所以面板**不会**擅自开始安装。' }),
+        h('p.hint', { text: '你可以点「重试」再取一次；或者明确选择"用默认版本安装"' +
+          '（nginx + PHP 8.2 + MySQL 8.4）。' }),
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px' } }, [
+          h('button.btn', { text: '重试', onclick: () => load() }),
+          h('button.btn.btn-primary', {
+            text: '用默认版本安装（nginx + PHP 8.2 + MySQL 8.4）',
+            onclick: () => {
+              // 显式默认：body 里仍然带上这三个 formula（不是"留空让后端决定"），
+              // 这样日志与审计里能看出"用户就是选的默认"。
+              const def = { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' };
+              if (m) m.close();
+              taskCenter.start({
+                kind: 'install',
+                target: 'lnmp',
+                title: '一键 LNMP',
+                start: () => api.installLNMP(def),
+              });
+            },
+          }),
+        ]),
+      ]));
+      installBtn.disabled = true;
+      return;
+    }
+
+    box.append(
+      h('p.hint', { style: { marginBottom: '8px' },
+        text: '三件套各选一个版本。取消或直接关闭弹窗都**不会**安装任何东西，' +
+          '安装任务只有点「开始安装」之后才会创建。' }),
+      h('p.hint', { style: { marginBottom: '12px' }, text: LNMP_MYSQL_HINT }),
+    );
+
+    const byKey = {};
+    (state.groups || []).forEach((g) => { byKey[g.key] = g; });
+
+    LNMP_GROUP_ORDER.forEach((meta) => {
+      const g = byKey[meta.key];
+      const row = h('div', { style: { marginBottom: '14px' } });
+      row.append(h('div', { style: { fontWeight: '600', marginBottom: '4px' },
+        text: meta.label + (g && g.label ? '（' + g.label + '）' : '') }));
+      row.append(h('div.hint', { style: { marginBottom: '6px' }, text: meta.desc }));
+
+      if (!g || !Array.isArray(g.options) || !g.options.length) {
+        // 后端没给这一组（或一个候选都没有）：如实说，并**禁用**安装按钮。
+        // 静默跳过会让用户以为"这个组件不用选"，最后 400 的错在提交后才出现。
+        row.append(h('div.hint', { style: { color: 'var(--danger, #d33)' },
+          text: '面板没有取到「' + meta.label + '」的可选版本（应用目录里可能没有这一项）。' +
+            '请到「应用市场 → 网站环境」里确认，或先点「重试」。' }));
+        box.append(row);
+        return;
+      }
+      if (!state.picked[meta.key]) {
+        // 默认选中后端给的 recommended/selected（PHP 8.2 为推荐）
+        const def = g.options.find((o) => o.recommended) || g.options.find((o) => o.formula === g.selected) || g.options[0];
+        state.picked[meta.key] = def.formula;
+      }
+
+      const name = 'zp-lnmp-' + meta.key;
+      g.options.forEach((o) => {
+        const input = h('input', {
+          type: 'radio',
+          name,
+          value: o.formula,
+          checked: state.picked[meta.key] === o.formula,
+        });
+        input.addEventListener('change', () => {
+          if (input.checked) {
+            state.picked[meta.key] = o.formula;
+            syncInstallLabel();
+          }
+        });
+        // 已安装的组件必须一眼看得出来：用户重跑一键 LNMP 时最关心
+        // "会不会动我已经装好的东西"（幂等会跳过重装，但界面得先说清楚）。
+        const badges = [];
+        if (o.recommended) badges.push(h('span.pill', { text: '推荐' }));
+        if (o.installed) badges.push(h('span.pill.ok', { text: '已安装（本次会跳过重装）' }));
+        row.append(h('label', {
+          style: { display: 'flex', gap: '8px', alignItems: 'flex-start', margin: '4px 0', cursor: 'pointer' },
+        }, [
+          input,
+          h('div', { style: { flex: '1' } }, [
+            h('div', [
+              h('span', { text: o.name || o.formula }),
+              h('span.hint', { text: '（' + o.formula + '）', style: { marginLeft: '6px' } }),
+              ...badges,
+            ]),
+            o.summary ? h('div.hint', { text: o.summary }) : null,
+            o.note ? h('div.hint', { text: o.note }) : null,
+          ]),
+        ]));
+      });
+      box.append(row);
+    });
+
+    // 三组都齐了才允许提交（后端也会校验一次，返回 400 + 原因）。
+    const complete = LNMP_GROUP_ORDER.every((g) => state.picked[g.key] && byKey[g.key]);
+    installBtn.disabled = !complete;
+    syncInstallLabel();
+  }
+
+  // syncInstallLabel 让按钮上写着"这次会装什么" —— 用户在点之前就能核对。
+  function syncInstallLabel() {
+    const labels = LNMP_GROUP_ORDER
+      .map((g) => {
+        const f = state.picked[g.key];
+        if (!f) return '';
+        return f.includes('@') ? g.label + ' ' + f.split('@')[1] : f;
+      })
+      .filter(Boolean);
+    installBtn.textContent = labels.length ? '开始安装（' + labels.join(' + ') + '）' : '开始安装';
+  }
+
+  async function load() {
+    state.busy = true;
+    state.err = '';
+    render();
+    try {
+      const res = await api.lnmpOptions();
+      const groups = (res && res.groups) || [];
+      if (!groups.length) throw new Error('接口没有返回任何候选组件');
+      state.groups = groups;
+      state.busy = false;
+    } catch (e) {
+      state.busy = false;
+      state.err = (e && e.message) || String(e);
+    }
+    render();
+  }
+
+  m = modal({
+    title: '一键 LNMP：选择要安装的版本',
+    body,
+    footer: foot,
+    // 弹窗宽度：三组选项要并排看清楚
+    wide: true,
+  });
+  render();
+  load();
+}
 
 // ---------------- 网站环境状态（现实判据）----------------
 //
@@ -56,15 +294,13 @@ const LNMP_HINT = '一键 LNMP 会先确保运行依赖（命令行开发者工�
 const WEB_ENV_PARTS = ['nginx', 'PHP', 'MySQL'];
 
 
+// startLNMP 是按钮的处理入口。
+//
+// 它**只打开弹窗**，绝不在这里发安装请求：用户必须先看到并确认版本选择。
+// 真正的 POST /market/install-lnmp 在弹窗的「开始安装」按钮里发出
+//（唯一出口），见 openLNMPDialog 的注释。
 function startLNMP() {
-  taskCenter.start({
-    kind: 'install',
-    // target 用 'lnmp'：与后端任务（POST /api/v1/market/install-lnmp → 202 + task_id）
-    // 保持一致，市场/任务中心的「查看进度」也按这个值找运行中的任务。
-    target: 'lnmp',
-    title: '一键 LNMP',
-    start: () => api.installLNMP(),
-  });
+  openLNMPDialog();
 }
 
 // lnmpButton 生成 LNMP 入口按钮。big=true 用于站点列表为空时的**大按钮**，

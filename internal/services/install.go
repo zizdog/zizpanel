@@ -14,6 +14,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -349,12 +350,27 @@ const brewTUNABase = "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
 // （见 Options.OfflineOnly），宁可明确失败也不能偷偷出网。
 func (m *Manager) brewInstallSources(ctx context.Context, formula string) []brewInstallSource {
 	curEnv := m.brewEnv(ctx, formula)
-	srcs := []brewInstallSource{{
-		Name: m.brewSourceName(curEnv),
-		Env:  curEnv,
-	}}
+	curHasMirror := brewEnvValue(curEnv, "HOMEBREW_BOTTLE_DOMAIN") != "" ||
+		brewEnvValue(curEnv, "HOMEBREW_API_DOMAIN") != ""
+
+	// 离线模式（仅走 NAS）：只允许那一个源，绝不回落公网。
+	//
+	// 2026-09-20 补的诚实性要求：如果**连自建镜像都没探到**，这里不能返回"官方源"
+	// 那一条（brewEnv 此时是空的 = brew 走官方默认），那等于"离线模式偷偷出网"。
+	// 返回空列表，让 brewInstall 明确报"离线模式下没有可用镜像"。
 	if m.opt.OfflineOnly {
-		return srcs
+		if !curHasMirror {
+			return nil
+		}
+		return []brewInstallSource{{Name: m.brewSourceName(curEnv), Env: curEnv}}
+	}
+
+	srcs := make([]brewInstallSource, 0, 3)
+	// 第 1 条只在**真的探到镜像**时才排。探不到时它其实就是官方源，
+	// 排在第一位意味着"先花几分钟撞官方源、再回头试国内镜像" —— 与
+	// "国内镜像优先、官方兜底"正好相反（2026-09-20 修）。
+	if curHasMirror {
+		srcs = append(srcs, brewInstallSource{Name: m.brewSourceName(curEnv), Env: curEnv})
 	}
 	if !brewEnvMentions(curEnv, brewTUNABase) {
 		srcs = append(srcs, brewInstallSource{
@@ -365,16 +381,12 @@ func (m *Manager) brewInstallSources(ctx context.Context, formula string) []brew
 			}, brewCommonEnv...),
 		})
 	}
-	// 探测一个镜像都没选出来时，第 1 条**就是**官方源 —— 这时不必再排一遍官方，
-	// 否则日志里会出现两条一模一样的"官方源"，用户会以为面板在原地空转。
-	if brewEnvValue(curEnv, "HOMEBREW_BOTTLE_DOMAIN") != "" ||
-		brewEnvValue(curEnv, "HOMEBREW_API_DOMAIN") != "" {
-		srcs = append(srcs, brewInstallSource{
-			Name:  "官方源（formulae.brew.sh / ghcr.io）",
-			Env:   append([]string(nil), brewCommonEnv...),
-			Unset: []string{"HOMEBREW_API_DOMAIN", "HOMEBREW_BOTTLE_DOMAIN"},
-		})
-	}
+	// 官方源永远**最后**兜底（显式清掉镜像变量：残留值会让 brew 仍去撞坏镜像）。
+	srcs = append(srcs, brewInstallSource{
+		Name:  "官方源（formulae.brew.sh / ghcr.io）",
+		Env:   append([]string(nil), brewCommonEnv...),
+		Unset: []string{"HOMEBREW_API_DOMAIN", "HOMEBREW_BOTTLE_DOMAIN"},
+	})
 	return srcs
 }
 
@@ -794,24 +806,100 @@ func brewMirrorWorks(ctx context.Context, base, formula string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// bottleTags 是本机可能用到的 Homebrew 瓶 tag，按新到旧排列。
+// bottleTagsForArch 返回**本机架构**可能用到的 Homebrew 瓶 tag，按新到旧排列。
 //
 // 探测时必须拿它去清单里找**真实存在**的瓶 —— 不能硬编码 sha256：
-// 之前那个常量是我编的，HEAD 永远 404，导致 NAS/镜像分支永不成立、
+// 之前那个常量是编的，HEAD 永远 404，导致 NAS/镜像分支永不成立、
 // 静默回落 ghcr.io（用户"装了 21 分钟"的真因，2026-09-16 NAS 侧实测确认）。
-var bottleTags = []string{"arm64_sequoia", "arm64_tahoe", "arm64_sonoma", "arm64_ventura"}
+//
+// 为什么必须按架构分（2026-09-20 实测补的）：arm64 的 tag 在 Intel 机器上永远
+// 匹配不到，于是**所有镜像都会被判为不可用**、静默回落 ghcr.io —— 而 Intel 机器
+// 恰恰最依赖国内镜像（官方源更慢）。Intel 侧只有 sonoma / ventura / monterey；
+// 上游已经删掉 ventura（实测 python@3.10/3.11/3.12/3.13 都没有 ventura 瓶），
+// 但留着它的代价只是一次快速 404，不作为判据去除。
+func bottleTagsForArch() []string {
+	if runtime.GOARCH == "amd64" {
+		return []string{"sonoma", "ventura", "monterey", "tahoe"}
+	}
+	return []string{"arm64_sequoia", "arm64_tahoe", "arm64_sonoma", "arm64_ventura"}
+}
+
+// brewBottleFilename 拼出 brew 7 在**自定义 HOMEBREW_BOTTLE_DOMAIN** 下真正请求的平铺文件名。
+//
+// 为什么必须完全照抄 brew 的规则（2026-09-20 读了 Homebrew 7.0.3 的
+// utils/bottles.rb + bottle.rb 才确认，之前面板的候选是错的）：
+//
+//	· brew 只在清单的 root_url 形如 https://ghcr.io/v2/… 时才走 OCI 路径
+//	  （<base>/v2/homebrew/core/<name>/blobs/sha256:<digest>）；镜像清单里的
+//	  root_url 仍写着 ghcr.io，但域被 HOMEBREW_BOTTLE_DOMAIN 换掉了 —— 于是
+//	  brew 走的是**旧式平铺**：<domain>/<name>-<version>.<tag>.bottle[.<rebuild>].tar.gz
+//	· `<name>` 里的 `@` 会被 URL 编码成 `%40`；
+//	· formula 重打包过（rebuild>0）时文件名里必须带 `.bottle.<N>` —— 少了它，
+//	  python@3.12（rebuild=1）这种包**永远 404**，探测会误判整家镜像不可用。
+func brewBottleFilename(formula, version, tag string, rebuild int) string {
+	name := strings.ReplaceAll(formula, "@", "%40")
+	if rebuild > 0 {
+		return name + "-" + version + "." + tag + ".bottle." + strconv.Itoa(rebuild) + ".tar.gz"
+	}
+	return name + "-" + version + "." + tag + ".bottle.tar.gz"
+}
+
+// brewOCIPath 拼出 OCI 布局路径（老 brew / 部分镜像用）。
+//
+// formula 里的 `@` 在 OCI 路径里是**目录分隔**：python@3.11 → python/3.11
+// （Homebrew 的 GitHubPackages.image_formula_name）。写成 `python@3.11` 会 404，
+// 之前的候选就是这么写的 —— 它只在镜像恰好把 `@` 也当路径时才对。
+func brewOCIPath(formula, sha string) string {
+	return "/v2/homebrew/core/" + strings.ReplaceAll(formula, "@", "/") + "/blobs/sha256:" + sha
+}
+
+// brewRemoteNonEmpty 确认一个瓶 URL **真的有内容**（不是 200 + 0 字节）。
+//
+// 为什么单看状态码不够（2026-09-20 实测）：中科大镜像在 **IPv4** 上对所有 bottle
+// 返回 `200` + **0 字节 body**（IPv6 正常，同一时刻同一 URL）。于是"只看 200"的
+// 探测会在只有 IPv4 的机器/网络上把中科大选为可用源，随后 brew 拿到空文件、
+// 校验失败 —— 正是 2026-09-18 python@3.11 事故的表象。判据必须看内容：
+//
+//	· HEAD 拿到 Content-Length > 0 即算通过；
+//	· 拿不到长度（很多镜像 HEAD 不给）时，用 Range 取 1 个字节，收到 ≥1 字节才算通过。
+func brewRemoteNonEmpty(ctx context.Context, url string) bool {
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err == nil {
+		if hresp, herr := http.DefaultClient.Do(hreq); herr == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(hresp.Body, 1<<12))
+			_ = hresp.Body.Close()
+			if hresp.StatusCode == http.StatusOK || hresp.StatusCode == http.StatusPartialContent {
+				if hresp.ContentLength > 0 {
+					return true
+				}
+			}
+		}
+	}
+	// HEAD 不可靠（无 Content-Length / 405）→ 真取一个字节。
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+	return n > 0
+}
 
 // brewMirrorSupportsOCI 判断某家镜像**真的能取到瓶文件**。
 //
+// 名字里的 OCI 是历史遗留（最初只探 /v2 布局），现在探的是 brew 真正会用的两条路。
 // 刻意贴近 Homebrew 自身行为，而不是拍一个固定 URL：
-//  1. GET <base>/api/formula/<formula>.json，按本机 tag 取真实 version 与 sha256；
-//  2. 依次试 brew 实际会用的两种瓶路径：
-//     legacy 平铺 <base>/<formula>-<version>.<tag>.bottle.tar.gz
-//     （自定义 HOMEBREW_BOTTLE_DOMAIN 时 Homebrew 7 走的就是这条）
-//     OCI 布局 <base>/v2/homebrew/core/<formula>/blobs/sha256:<hex>
-//  3. 任一返回 200/206 即认为可用。
-//
-// 这样镜像内容一变（升级、清老瓶）探测不会失效，也不需要维护常量。
+//  1. GET <base>/api/formula/<formula>.json，按本机 tag 取真实 version / sha256 / rebuild；
+//  2. 依次试 brew 实际会用的两种瓶路径（见 brewBottleFilename / brewOCIPath 的说明）；
+//  3. 必须**有内容**（见 brewRemoteNonEmpty），只看 200 会把"200 + 0 字节"的坏镜像当成好源。
 func brewMirrorSupportsOCI(ctx context.Context, base string) bool {
 	return brewMirrorSupportsOCIFor(ctx, base, "nginx")
 }
@@ -843,7 +931,8 @@ func brewMirrorSupportsOCIFor(ctx context.Context, base, formula string) bool {
 		} `json:"versions"`
 		Bottle struct {
 			Stable struct {
-				Files map[string]struct {
+				Rebuild int `json:"rebuild"`
+				Files   map[string]struct {
 					SHA256 string `json:"sha256"`
 				} `json:"files"`
 			} `json:"stable"`
@@ -852,49 +941,25 @@ func brewMirrorSupportsOCIFor(ctx context.Context, base, formula string) bool {
 	if json.Unmarshal(body, &man) != nil || man.Versions.Stable == "" {
 		return false
 	}
-	for _, tag := range bottleTags {
+	for _, tag := range bottleTagsForArch() {
 		f, ok := man.Bottle.Stable.Files[tag]
 		if !ok || f.SHA256 == "" {
 			continue
 		}
+		fname := brewBottleFilename(formula, man.Versions.Stable, tag, man.Bottle.Stable.Rebuild)
 		cands := []string{
-			base + "/" + formula + "-" + man.Versions.Stable + "." + tag + ".bottle.tar.gz",
-			base + "/v2/homebrew/core/" + formula + "/blobs/sha256:" + f.SHA256,
+			base + "/" + fname,
+			// 有的镜像/服务端把 `@` 原样保留而不是 %40，两种都试一次（NAS 实测两种都通）。
+			base + "/" + strings.ReplaceAll(fname, "%40", "@"),
+			base + brewOCIPath(formula, f.SHA256),
 		}
 		for _, u := range cands {
-			hreq, herr := http.NewRequestWithContext(pctx, http.MethodHead, u, nil)
-			if herr != nil {
-				continue
-			}
-			hresp, herr := http.DefaultClient.Do(hreq)
-			if herr != nil {
-				continue
-			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(hresp.Body, 1<<12))
-			_ = hresp.Body.Close()
-			if hresp.StatusCode == http.StatusOK || hresp.StatusCode == http.StatusPartialContent {
+			if brewRemoteNonEmpty(pctx, u) {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-// brewBottleDomain 选一个**真的能取到瓶文件**的镜像域做 HOMEBREW_BOTTLE_DOMAIN。
-//
-// 语义很重要：Homebrew 把清单里的 ghcr.io 域替换成这个域去取瓶，所以这个域
-// 必须提供 OCI 布局（<base>/v2/…）。候选里排在前面的镜像未必支持（实测阿里云 404），
-// 所以这里逐个探测，第一个支持的胜出。
-//
-// 全都不支持时返回 ""：**不设**比设一个取不到的更好 —— 设了会让 brew 先白试一次
-// （甚至撞上 4 秒超时），最后仍然回落 ghcr.io，用户只是多等。
-func brewBottleDomain(ctx context.Context) string {
-	for _, c := range brewMirrorCandidates {
-		if brewMirrorSupportsOCI(ctx, c.Base) {
-			return c.Base
-		}
-	}
-	return ""
 }
 
 // probeBrewMirrors 选出这次 brew 要用的 API 域与瓶域。
@@ -930,19 +995,36 @@ func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (ap
 			return nasBase + "/api", nasBase
 		}
 	}
-	chosen := brewMirrorCandidates[0]
+	// 选"清单对、而且**瓶真的下得动**"的那一家，API 域与瓶域用同一家。
+	//
+	// 为什么不再"先按清单 200 选中一家、再单独挑瓶域"（2026-09-20 修）：
+	//   · 阿里云的清单是**陈旧快照**（实测 python@3.11 清单写 3.11.12，而瓶
+	//     一个都没有）—— 只按清单 200 可能选中它，brew 随后拿着过期版本号去要瓶，
+	//     必然失败（多绕一圈才回落到官方源）；
+	//   · 中科大在 IPv4 上对所有瓶返回 `200 + 0 字节`，只按状态码探测会把它选中。
+	// 所以判据统一成"这家镜像 + 这个 formula 的瓶能取到非空内容"。
+	var chosen string
 	for _, c := range brewMirrorCandidates {
-		if brewMirrorWorks(ctx, c.Base, probeFormula) {
-			chosen = c
+		if brewMirrorSupportsOCIFor(ctx, c.Base, probeFormula) {
+			chosen = c.Base
 			break
 		}
 	}
-	api, bottle := chosen.Base+"/api", brewBottleDomain(ctx)
+	if chosen == "" {
+		// 都不行：返回空，让 brewEnv **不设**这两个变量（回落官方）。
+		// 之前这里会退回 brewMirrorCandidates[0] 的 API 域 + 单独挑一个瓶域，
+		// 于是"没有可用镜像"这件事被掩盖成"用了一家还行的镜像"。
+		if m.mirrorProbeCache == nil {
+			m.mirrorProbeCache = map[string]string{}
+		}
+		m.mirrorProbeCache[probeFormula] = "\x00"
+		return "", ""
+	}
 	if m.mirrorProbeCache == nil {
 		m.mirrorProbeCache = map[string]string{}
 	}
-	m.mirrorProbeCache[probeFormula] = api + "\x00" + bottle
-	return api, bottle
+	m.mirrorProbeCache[probeFormula] = chosen + "/api" + "\x00" + chosen
+	return chosen + "/api", chosen
 }
 
 // BrewCapture 以真实用户身份跑一条只读 brew 命令并把输出原样返回。
@@ -983,14 +1065,24 @@ func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 
 	apiDomain, bottleDomain := m.probeBrewMirrors(ctx, probeFormula)
 
-	return []string{
-		"HOMEBREW_API_DOMAIN=" + pick("HOMEBREW_API_DOMAIN", apiDomain),
-		"HOMEBREW_BOTTLE_DOMAIN=" + pick("HOMEBREW_BOTTLE_DOMAIN", bottleDomain),
+	// 域为空 = 没有可用镜像 → **不设**这两个变量，让 brew 用官方默认。
+	//
+	// 为什么不能写成 `HOMEBREW_API_DOMAIN=`（空值）：Homebrew 是 Ruby 写的，
+	// ENV 里存在但为空串不等于"未设置"（`ENV["X"]` 会返回 ""，仍然被当成已配置），
+	// brew 会拿着空域去拼 URL。历史上的注释说"不设"，代码却在设空值 —— 这次一起修掉。
+	env := []string{
 		// 自动更新会在每次 brew 命令前拉一遍仓库元数据：国内很慢，而且我们
 		// 不需要它（面板自己管安装）。
 		"HOMEBREW_NO_AUTO_UPDATE=1",
 		"HOMEBREW_NO_INSTALL_CLEANUP=1",
 	}
+	if v := pick("HOMEBREW_API_DOMAIN", apiDomain); v != "" {
+		env = append(env, "HOMEBREW_API_DOMAIN="+v)
+	}
+	if v := pick("HOMEBREW_BOTTLE_DOMAIN", bottleDomain); v != "" {
+		env = append(env, "HOMEBREW_BOTTLE_DOMAIN="+v)
+	}
+	return env
 }
 
 // installViaBrew 用 Homebrew 安装原生服务。

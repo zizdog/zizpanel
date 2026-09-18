@@ -13,6 +13,10 @@ import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
 
 const base = process.argv[2] || 'http://127.0.0.1:18443';
+// API 基址拼接：`base` 带尾斜杠（Makefile 传的是 .../dev/），直接拼 '/api/…' 会得到
+// '//api/…'，Go 的 ServeMux 会先回 301 清洗路径。健康检查会把 301 记为"健康"，
+// 于是「401 判为健康」这条断言根本走不到要测的分支（2026-09-20 实测踩到）。
+const apiURL = (path) => base.replace(/\/+$/, '') + path;
 // 测试站点域名：用 .test 顶级域（RFC 6761 保留），不会与真实域名冲突
 const TEST_SITE = process.env.ZP_TEST_SITE || 'zptest-demo.test';
 // 管理员口令**不写进仓库**。
@@ -41,6 +45,23 @@ const step = async (name, fn) => {
 // 所以本地 make smoke 用 ZP_SKIP_PRIV=1 显式跳过这几步，并如实打印"跳过"，
 // 而不是把失败当成通过。完整的特权链路请对真实安装实例跑：
 //     make uitest-live
+// closeAnyModal 关掉当前所有打开的弹窗（含遮罩）。
+//
+// 为什么要一个全局版本：某些步骤会**留下**弹窗（例如在文件列表里双击目录会打开
+// 编辑器），下一步点页面按钮时就会被 `.modal-mask` 挡住 —— Playwright 报的是
+// "intercepts pointer events"，而人看到的现象是"点了没反应"。2026-09-20 实测：
+// "新建文件并在线编辑保存"就卡在这里。
+const closeAnyModal = async (page) => {
+  for (let i = 0; i < 6; i++) {
+    const masks = page.locator('.modal-mask');
+    if (!(await masks.count())) return;
+    const x = masks.last().locator('button.modal-close').first();
+    if (await x.count()) { await x.click().catch(() => {}); }
+    else { await page.keyboard.press('Escape').catch(() => {}); }
+    await page.waitForTimeout(250);
+  }
+};
+
 const SKIP_PRIV = process.env.ZP_SKIP_PRIV === '1';
 const skipped = [];
 const privStep = async (name, fn) => {
@@ -382,13 +403,20 @@ try {
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(1200);
     await shot('05-settings');
-    // 2026-09-21：「关于与运维」整块已搬到侧栏「检查更新」，设置页不该再有这个 Tab。
+    // 2026-09-20 用户要求：Tab 顺序 = 访问与安全 → 文件与终端 → 账号与两步验证 → 检查更新。
+    const titles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
+    const want = ['访问与安全', '文件与终端', '账号与两步验证', '检查更新'];
+    const got = titles.filter((t) => want.includes(t));
+    if (got.join('|') !== want.join('|')) {
+      throw new Error(`设置页 Tab 顺序不对：期望 ${want.join(' → ')}，实际 ${got.join(' → ')}`);
+    }
+    // 「关于与运维」这个旧名字不该再出现（它已被「检查更新」取代）。
     if (await page.locator('button:has-text("关于与运维")').count()) {
-      throw new Error('面板设置里仍有「关于与运维」Tab（应已迁移到侧栏「检查更新」）');
+      throw new Error('面板设置里仍有「关于与运维」Tab（应由「检查更新」承担）');
     }
   });
 
-  await step('切换设置内的两个 Tab', async () => {
+  await step('切换设置内的各 Tab（含检查更新）', async () => {
     for (const t of ['账号与两步验证', '访问与安全']) {
       await page.click(`button:has-text("${t}")`);
       await page.waitForTimeout(700);
@@ -396,16 +424,26 @@ try {
     }
   });
 
-  // ---------- 检查更新（原「关于与运维」，2026-09-21 提到侧栏）----------
-  await step('侧栏「检查更新」可打开，且页内没有「操作审计」', async () => {
-    if (!(await page.locator('.nav-item:has-text("检查更新")').count())) {
-      throw new Error('侧栏缺少「检查更新」入口');
+  // ---------- 检查更新（2026-09-20 收进「面板设置」第 4 个 Tab）----------
+  await step('设置页「检查更新」Tab 可打开，且没有重复的更新按钮', async () => {
+    if (await page.locator('.nav-item:has-text("检查更新")').count()) {
+      throw new Error('侧栏不该再有「检查更新」入口（已收回面板设置，重复入口会让用户困惑）');
     }
-    await page.click('.nav-item:has-text("检查更新")');
+    await page.click('.nav-item:has-text("面板设置")');
+    await page.waitForTimeout(600);
+    await page.click('button:has-text("检查更新")');
     await page.waitForTimeout(1500);
     const txt = await page.locator('.content').innerText();
-    for (const need of ['在线升级', '当前版本', '内嵌发布公钥', '立即检测', '一键更新']) {
-      if (!txt.includes(need)) throw new Error(`检查更新页缺少「${need}」`);
+    for (const need of ['在线升级', '当前版本', '内嵌发布公钥', '检查更新']) {
+      if (!txt.includes(need)) throw new Error(`检查更新 Tab 里缺少「${need}」`);
+    }
+    // 用户 2026-09-20 明确要求删掉「立即检测 + 一键更新到 vX」这一对重复按钮：
+    // 上方"发现新版本"横幅里已经有「一键更新」，同一动作出现两次让人不知道该点哪个。
+    if (txt.includes('立即检测')) {
+      throw new Error('检查更新里仍有被要求删除的「立即检测」按钮（与横幅的一键更新重复）');
+    }
+    if (!(await page.locator('[data-testid="zp-update-check-btn"]').count())) {
+      throw new Error('检查更新里缺少「检查更新」按钮（再检测一次的唯一入口）');
     }
     // 操作审计是侧栏的独立页面，这里不能再出现第二份（用户明确要求去重）。
     if (txt.includes('操作审计')) throw new Error('检查更新页不应出现「操作审计」');
@@ -422,15 +460,22 @@ try {
       await page.waitForTimeout(1200);
       const active = (await page.locator('.nav-item.active').innerText().catch(() => '')).trim();
       const body = await page.locator('.content').innerText();
-      if (!active.includes('检查更新') || !body.includes('在线升级')) {
-        throw new Error(`旧 hash ${h} 没有落到「检查更新」（active=${active}）`);
+      // 现在升级在「面板设置」里，所以侧栏高亮应该是面板设置，而不是曾经的独立页。
+      if (!active.includes('面板设置') || !body.includes('在线升级')) {
+        throw new Error(`旧 hash ${h} 没有落到「面板设置 → 检查更新」（active=${active}）`);
+      }
+      // Tab 本身也要选中：URL 里带了 tab，刷新/直达都必须落在同一页。
+      const tabActive = (await page.locator('button.btn-primary:has-text("检查更新")').count()) > 0;
+      if (!tabActive) {
+        throw new Error(`旧 hash ${h} 落到了面板设置，但没有选中「检查更新」Tab`);
       }
     }
-    // 顺带确认设置页留下了迁移指路入口（老用户按旧位置找得到）
+    // 「已迁移的功能」指路卡片必须**消失**：功能已经回到设置页里，
+    // 再留一个"去别处"的按钮就是把用户又支走（用户 2026-09-20 的要求）。
     await page.goto(raw + '#/settings', { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(1000);
-    if (!(await page.locator('.content').innerText()).includes('已迁移的功能')) {
-      throw new Error('面板设置页缺少「已迁移的功能」指路入口');
+    if ((await page.locator('.content').innerText()).includes('已迁移的功能')) {
+      throw new Error('面板设置里仍有「已迁移的功能」指路卡片（检查更新已经收回来了）');
     }
   });
 
@@ -439,12 +484,14 @@ try {
     // （用户显式源 → 同网段 NAS → https://zizdog.com/zizpanel → mirror → GitHub），
     // 每个候选内部都要通过验签才算命中。所以这里断言的是"给出了结论"，
     // 而不是某个具体状态码 —— 有更新/已是最新/全部候选不可达都是正常结果。
-    await page.click('.nav-item:has-text("检查更新")');
+    await page.click('.nav-item:has-text("面板设置")');
+    await page.waitForTimeout(500);
+    await page.click('button:has-text("检查更新")');
     await page.waitForTimeout(800);
     await page.fill('input[placeholder^="https://example.com"]', '');
     expectHTTPError = true;
     try {
-      await page.click('button:has-text("立即检测")');
+      await page.click('[data-testid="zp-update-check-btn"]');
       await page.waitForTimeout(2500);
       const body = await page.locator('.content').innerText();
       if (body.includes('尚未配置升级源地址')) {
@@ -482,12 +529,12 @@ try {
       return route.continue();
     });
     try {
-      // 当前停在 #/update；整页刷新才会重挂载 View 并跑启动自动检测
+      // 当前停在 #/settings/update（Tab 会把地址写进 URL）；整页刷新才会重挂载并跑启动自动检测
       await page.reload({ waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(2500);
       const dot = page.locator('[data-testid="zp-update-badge"]');
       if (!(await dot.count()) || !(await dot.first().isVisible())) {
-        throw new Error('发现新版本后侧栏「检查更新」没有出现徽标');
+        throw new Error('发现新版本后侧栏「面板设置」没有出现徽标');
       }
       const txt = await page.locator('.content').innerText();
       if (!txt.includes('发现新版本')) throw new Error('检查更新页没有醒目提示新版本');
@@ -699,6 +746,148 @@ try {
     await shot('08-nav-all-real');
   });
 
+  // ---------- 一键 LNMP：先弹窗选版本，确认后才安装（2026-09-19 用户要求）----------
+  //
+  // 这条断言**全部走桩**：不依赖本机装了什么、绝不真的安装任何东西。
+  // 它锁住三件事（用户原话："弹窗出来先让用户选择各服务版本，而不是直接执行安装"）：
+  //   ① 点「一键 LNMP」→ 出现选版本弹窗，且**此刻没有** install-lnmp 请求；
+  //   ② 选择 PHP 8.4 后点「开始安装」→ 才发出请求，body 里是 php@8.4（不是默认 8.2）；
+  //   ③ 取消 / 关闭弹窗绝不安装（未确认 == 什么都没发生）。
+  await step('一键 LNMP：先出现版本选择弹窗、未确认不发安装请求、选 8.4 后请求体正确（桩数据）', async () => {
+    const lnmpReqs = [];
+    // 进度流：回一条"成功"并结束，否则任务窗会一直重连不存在的流刷 404。
+    await page.route('**/api/v1/tasks**', (route) => {
+      const m = route.request().url().match(/\/api\/v1\/tasks\/([^/?]+)\/stream/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const mk = (ev, obj) => `event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`;
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          body: mk('meta', { task: { id, title: '一键 LNMP', status: 'running' }, oldest_seq: 1 })
+            + mk('status', { id, title: '一键 LNMP', status: 'succeeded', line_count: 0 }),
+        });
+      }
+      return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+      });
+    });
+    const stubOptions = (status, data) => (route) => route.fulfill({
+      status,
+      contentType: 'application/json',
+      body: JSON.stringify(status === 200 ? { ok: true, data } : { ok: false, msg: 'UI 测试桩：接口不可用' }),
+    });
+    await page.route('**/api/v1/market/install-lnmp', (route) => {
+      lnmpReqs.push(route.request().postData() || '');
+      return route.fulfill({
+        status: 202, contentType: 'application/json',
+        body: JSON.stringify({ ok: true, data: { task_id: 'uitest-lnmp-1', title: '一键 LNMP' } }),
+      });
+    });
+    const OPTIONS = {
+      groups: [
+        { key: 'nginx', label: 'Nginx', selected: 'nginx',
+          options: [{ formula: 'nginx', name: 'Nginx', summary: 'Web 服务器', recommended: true, installed: true }] },
+        { key: 'php', label: 'PHP', selected: 'php@8.2',
+          options: [
+            { formula: 'php@8.4', name: 'PHP 8.4 (FPM)', summary: 'PHP 8.4 运行环境', recommended: false, installed: false },
+            { formula: 'php@8.2', name: 'PHP 8.2 (FPM)', summary: 'PHP 8.2 运行环境', recommended: true, installed: true },
+          ] },
+        { key: 'mysql', label: 'MySQL', selected: 'mysql@8.4',
+          options: [{ formula: 'mysql@8.4', name: 'MySQL 8.4', summary: '关系型数据库', recommended: true, installed: false }] },
+      ],
+      default: { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' },
+    };
+    const openSitesAndClickLNMP = async () => {
+      await page.click('.nav-item:has-text("网站管理")');
+      await page.waitForSelector('button:has-text("一键 LNMP")', { timeout: 10000 });
+      await page.waitForTimeout(600);
+      await page.locator('button:has-text("一键 LNMP")').first().click();
+      await page.locator('.modal-mask').last().waitFor({ timeout: 10000 });
+      await page.waitForTimeout(500);
+    };
+    const closeModal = async () => {
+      const x = page.locator('.modal-mask').last().locator('button.modal-close').first();
+      if (await x.count()) await x.click().catch(() => {});
+      await page.waitForTimeout(300);
+    };
+
+    await page.route('**/api/v1/market/lnmp-options', stubOptions(200, OPTIONS));
+    try {
+      // ① 点按钮 → 弹窗出现，且**没有**安装请求
+      await openSitesAndClickLNMP();
+      const modalTitle = await page.locator('.modal-mask').last().locator('.modal-head h3').innerText();
+      if (!modalTitle.includes('选择要安装的版本')) {
+        throw new Error('弹窗标题不对（应说明这是版本选择）：' + modalTitle);
+      }
+      const modalText = await page.locator('.modal-body').last().innerText();
+      if (lnmpReqs.length !== 0) {
+        throw new Error('还没确认就发出了安装请求（用户没有选择机会）：' + JSON.stringify(lnmpReqs));
+      }
+      if (!/已安装/.test(modalText)) {
+        throw new Error('弹窗里看不到"已安装"标记（用户重跑时最关心会不会动已装好的东西）');
+      }
+      if (!/root 口令/.test(modalText)) {
+        throw new Error('弹窗里缺少 MySQL root 口令说明');
+      }
+      await shot('19a-lnmp-options');
+
+      // ② 选 PHP 8.4 → 按钮上写清这次装什么 → 确认后才发请求
+      await page.locator('.modal-body input[type=radio][value="php@8.4"]').check();
+      await page.waitForTimeout(200);
+      const label = await page.locator('.modal-mask button:has-text("开始安装")').last().innerText();
+      if (!label.includes('PHP 8.4')) {
+        throw new Error('「开始安装」按钮没有写出本次选择（用户无法在点之前核对）：' + label);
+      }
+      await page.locator('.modal-mask button:has-text("开始安装")').last().click();
+      await page.waitForTimeout(1200);
+      if (lnmpReqs.length !== 1) {
+        throw new Error('确认后应恰好发一次 install-lnmp，实际 ' + lnmpReqs.length + ' 次');
+      }
+      if (!/"php":"php@8\.4"/.test(lnmpReqs[0])) {
+        throw new Error('请求体里应是用户选的 php@8.4（不能退回默认 8.2）：' + lnmpReqs[0]);
+      }
+      await closeModal();
+
+      // ③ 取消 / 关闭弹窗 = 什么都不装
+      lnmpReqs.length = 0;
+      await openSitesAndClickLNMP();
+      await closeModal();
+      await page.waitForTimeout(400);
+      if (lnmpReqs.length !== 0) {
+        throw new Error('只是打开又关闭弹窗却发了安装请求：' + JSON.stringify(lnmpReqs));
+      }
+    } finally {
+      await page.unroute('**/api/v1/market/lnmp-options');
+    }
+
+    // ④ 候选接口失败：**不弹空弹窗、不偷偷用默认值装**，给显式默认按钮
+    const prevExpectHTTPError = expectHTTPError;
+    expectHTTPError = true; // 这次的 500 是断言对象，不是前端故障
+    await page.route('**/api/v1/market/lnmp-options', stubOptions(500, null));
+    try {
+      await openSitesAndClickLNMP();
+      const modalText = await page.locator('.modal-body').last().innerText();
+      if (!/读取可选版本失败/.test(modalText)) {
+        throw new Error('接口失败时应明确报错，实际：\n' + modalText.slice(0, 300));
+      }
+      if (!/用默认版本安装/.test(modalText)) {
+        throw new Error('接口失败时应给"用默认版本安装"这个**显式**出口（而不是偷偷用默认值）');
+      }
+      if (lnmpReqs.length !== 0) {
+        throw new Error('接口失败时不该自动开始安装：' + JSON.stringify(lnmpReqs));
+      }
+      await shot('19b-lnmp-options-failed');
+      await closeModal();
+    } finally {
+      await page.unroute('**/api/v1/market/lnmp-options');
+      await page.unroute('**/api/v1/market/install-lnmp');
+      await page.unroute('**/api/v1/tasks**');
+      expectHTTPError = prevExpectHTTPError;
+    }
+  });
+
   // ---------- 网站管理（P2）----------
   await step('打开网站管理', async () => {
     await page.click('.nav-item:has-text("网站管理")');
@@ -720,6 +909,14 @@ try {
     // 等创建成功提示或详情弹窗
     await page.waitForTimeout(4000);
     await shot('22-site-created');
+    // 必须断言"真的建成了"：2026-09-20 发现这一步原来只截图不断言 ——
+    // 建站失败（例如本地非 root 实例回 500）时它照样打印 OK，把失败推给下一步，
+    // 让人以为是"列表"坏了。错误必须在这里就暴露。
+    const body = await page.locator('.content').innerText();
+    const okToast = await page.locator('.toast').count();
+    if (!body.includes(TEST_SITE) && !okToast) {
+      throw new Error('点了「创建站点」但既没建出站点、也没弹出任何提示（建站步骤静默失败了）');
+    }
   });
 
   await privStep('站点列表出现新站点且配置存在', async () => {
@@ -907,8 +1104,13 @@ try {
     });
 
     await closeAllModals();
-    await page.click('.nav-item:has-text("应用")');
-    await page.waitForTimeout(2000);
+    // 先回仪表盘再进「应用 → 已安装」：**必须制造一次 hash 变化**，否则视图不会
+    // 用刚注册的桩重新拉服务列表（上一步可能已经停在 #/services，直接点同一个
+    // 导航项是空操作 → 卡片永远等不到，2026-09-20 实测）。
+    await page.click('.nav-item:has-text("仪表盘")');
+    await page.waitForTimeout(500);
+    await page.goto(page.url().split('#')[0] + '#/services');
+    await page.waitForTimeout(2500);
 
     // ② 点「🗑 卸载」→ 必须出现确认框
     await (await openUninstallBtn('UITEST 卸载·正常')).click();
@@ -1081,6 +1283,11 @@ try {
     };
 
     try {
+      // 先离开「应用」再回来：**必须制造一次 hash 变化**，否则视图不会重新挂载、
+      // 也就不会用刚注册的桩重新拉服务列表 —— 上一步结尾正好停在「应用」，
+      // 直接 click 同一个 nav 是空操作（2026-09-20 实测：卡片等不到，超时 15s）。
+      await page.click('.nav-item:has-text("仪表盘")');
+      await page.waitForTimeout(600);
       await page.click('.nav-item:has-text("应用")');
       await page.waitForTimeout(2000);
 
@@ -1162,7 +1369,10 @@ try {
       await page.waitForSelector('.modal', { timeout: 8000 });
       await page.waitForTimeout(2500);
       await shot('31-service-logs');
-      const pill = await page.locator('.modal .pill').first().innerText();
+      // 必须按 testid 取**日志流自己的**状态 pill：日志弹窗里还有服务状态等
+      // 多个 pill，取第一个会拿到"运行中"，从而把一个正常的日志流误判成失败
+      // （2026-09-20 实测踩到）。
+      const pill = await page.locator('[data-testid="zp-logs-status"]').first().innerText();
       const body = await page.locator('.modal-body').innerText().catch(() => '');
       const okStates = ['实时', '中断', '结束', '无法读取日志'];
       if (!okStates.some((s) => pill.includes(s))) {
@@ -1233,7 +1443,10 @@ try {
   });
 
   await step('扫描可纳管服务', async () => {
-    await page.click('.nav-item:has-text("服务管理")');
+    // 「服务管理」侧栏项在 2026-09-17 已并入「应用」版块；旧的 #/services 会被
+    // 别名落到「已安装」Tab。用 goto 而不是点侧栏，是为了任何路由改造都不会
+    // 让这一步静默走错页面（原来的选择器等不到元素，报的却是"超时"）。
+    await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(1500);
     await page.click('button:has-text("扫描可纳管服务")');
     await page.waitForSelector('.modal', { timeout: 10000 });
@@ -1298,11 +1511,14 @@ try {
     // 面板自己的 API 在不带 cookie 时返回 401 —— 正是 Stirling PDF 那种情形
     await mkSvc({
       name, display_name: 'UI 测试：需要登录的服务', kind: 'native',
-      start_cmd: 'sleep 3600', health_url: base + '/api/v1/services',
+      start_cmd: 'sleep 3600', health_url: apiURL('/api/v1/services'),
     });
     await page.click('.nav-item:has-text("仪表盘")');
     await page.waitForTimeout(600);
-    await page.click('.nav-item:has-text("服务管理")');
+    // 「服务管理」侧栏项在 2026-09-17 已并入「应用」版块；旧的 #/services 会被
+    // 别名落到「已安装」Tab。用 goto 而不是点侧栏，是为了任何路由改造都不会
+    // 让这一步静默走错页面（原来的选择器等不到元素，报的却是"超时"）。
+    await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(2500);
 
     // 服务卡片是**内联样式的 div**、没有类名，用 `.card div` 之类的选择器会取到
@@ -1315,7 +1531,7 @@ try {
       });
       return hits.length ? hits[hits.length - 1].innerText : null;
     }, 'UI 测试：需要登录的服务');
-    if (!txt) throw new Error('服务管理页上没有找到刚造的测试服务卡片');
+    if (!txt) throw new Error('「应用 → 已安装」页上没有找到刚造的测试服务卡片');
     if (/健康检查失败/.test(txt)) {
       throw new Error('401 不该再显示"健康检查失败"（这就是用户报的误报）: ' + txt.slice(0, 200));
     }
@@ -1341,7 +1557,10 @@ try {
     // 所以这里先绕到仪表盘再回来，强制重新拉取服务列表（含健康检查）。
     await page.click('.nav-item:has-text("仪表盘")');
     await page.waitForTimeout(600);
-    await page.click('.nav-item:has-text("服务管理")');
+    // 「服务管理」侧栏项在 2026-09-17 已并入「应用」版块；旧的 #/services 会被
+    // 别名落到「已安装」Tab。用 goto 而不是点侧栏，是为了任何路由改造都不会
+    // 让这一步静默走错页面（原来的选择器等不到元素，报的却是"超时"）。
+    await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(2000);
 
     // 健康检查是异步的（每个服务最长 8s），轮询等待而不是固定 sleep
@@ -1359,8 +1578,11 @@ try {
     await shot('37b-health-filtered');
 
     const body = await page.locator('.content').innerText();
-    // 关键：不能只给一个红标签，必须告诉用户"检查了什么、大概为什么、下一步点哪"
-    for (const need of ['健康检查失败', '检查地址', '重新检查']) {
+    // 关键：不能只给一个红标签，必须告诉用户"检查了什么、大概为什么、下一步点哪"。
+    // 「重新检查」是旧的独立按钮，已并入卡片上的「⟳ 刷新」与「改检查地址」
+    // （见 services.js 里 installedCard 的注释）—— 这里按**当前真实入口**断言，
+    // 否则测试会一直要求一个已经不存在的按钮。
+    for (const need of ['健康检查失败', '检查地址', '改检查地址', '⟳ 刷新']) {
       if (!body.includes(need)) {
         throw new Error(`筛选后的页面缺少「${need}」，用户看完还是不知道怎么办: ` + body.slice(0, 220));
       }
@@ -1456,8 +1678,11 @@ try {
     // 通过页面上下文调用 API：保证测试可重复运行
     // （上一次失败时留下的文件会让这次的"新建"返回 400）
     const r = await page.evaluate(async (base) => {
+      // 这段跑在**浏览器**里：不能用 Node 侧的 apiURL，只能拿传进来的 base 自己拼。
+      // base 带尾斜杠，直接拼 '/api/…' 会变双斜杠 → ServeMux 301 清洗。
+      const api = base.replace(/\/+$/, '') + '/api/v1';
       const csrf = document.cookie.match(/(?:^|; )zp_csrf=([^;]*)/)?.[1] || '';
-      const res = await fetch(base + '/api/v1/files?path=' + encodeURIComponent('/Users/zizdog/www'), {
+      const res = await fetch(api + '/files?path=' + encodeURIComponent('/Users/zizdog/www'), {
         credentials: 'same-origin',
       });
       const j = await res.json();
@@ -1465,7 +1690,7 @@ try {
         .map((e) => e.path)
         .filter((p) => /zp-ui-test/.test(p));
       if (names.length) {
-        await fetch(base + '/api/v1/files/delete', {
+        await fetch(api + '/files/delete', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
@@ -1514,6 +1739,8 @@ try {
   });
 
   await step('新建文件并在线编辑保存', async () => {
+    // 上一步的双击可能留下了编辑弹窗：先关干净，否则新按钮被遮罩挡住点不到。
+    await closeAnyModal(page);
     // 确保在网站根目录（上一步可能停留在子目录）
     const crumb = page.locator('a:has-text("www")').first();
     if (await crumb.count()) {
@@ -1541,6 +1768,7 @@ try {
   });
 
   await step('删除测试文件', async () => {
+    await closeAnyModal(page);
     const row = page.locator('tr', { hasText: 'zp-ui-test.txt' }).first();
     await row.locator('button:has-text("⋯")').click();
     await page.waitForSelector('.modal button:has-text("删除")', { timeout: 8000 });
@@ -1805,7 +2033,7 @@ try {
   //   ③ 这个「日志」放在「系统」分组里、夹在「面板设置」与「检查更新」之间。
   // 分组在 DOM 里是**扁平的兄弟节点**（div.nav-group 后面跟若干 div.nav-item），
   // 所以"归属哪个分组"只能靠相对位置判断，不能用父子选择器。
-  await step('侧栏：mac设置改名 / 唯一「日志」项夹在面板设置与检查更新之间', async () => {
+  await step('侧栏：mac设置改名 / 唯一「日志」项紧跟面板设置 / 检查更新在设置里', async () => {
     // ① 不再有「系统设置」，只有「mac设置」
     if (await page.locator('.nav-item:has-text("系统设置")').count()) {
       throw new Error('侧栏仍有「系统设置」，应已改名「mac设置」');
@@ -1839,23 +2067,35 @@ try {
       return { found: true, items };
     }, title);
 
-    // ③「系统」分组里顺序必须是 面板设置 → 日志 → 检查更新（紧邻）。若要改成
-    // 检查更新 → 日志 → 面板设置，只需调整 app.js 的 NAV 顺序，这条断言会立刻提醒。
+    // ③「系统」分组里只剩 面板设置 → 日志（紧邻）。
+    //
+    // 2026-09-20 用户要求把「检查更新」**收回**「面板设置」（设置里的第 4 个 Tab）：
+    // 侧栏独立入口与设置里的入口是重复的，用户不知道该点哪个。所以这里同时断言
+    // "侧栏没有检查更新"与"设置里有这个 Tab、且排在最后"。
     const sys = await readGroup('系统');
     if (!sys || !sys.found) throw new Error('侧栏里找不到「系统」分组标题');
     const si = sys.items.findIndex((t) => t.includes('面板设置'));
     const li = sys.items.findIndex((t) => t.includes('日志'));
-    const ui = sys.items.findIndex((t) => t.includes('检查更新'));
     if (si < 0) throw new Error('「系统」分组里没有「面板设置」：' + JSON.stringify(sys.items));
     if (li < 0) throw new Error('「系统」分组里没有「日志」：' + JSON.stringify(sys.items));
-    if (ui < 0) throw new Error('「系统」分组里没有「检查更新」：' + JSON.stringify(sys.items));
-    if (!(si < li && li < ui)) {
-      throw new Error('「系统」分组顺序应为 面板设置 → 日志 → 检查更新：' + JSON.stringify(sys.items));
+    if (li !== si + 1) {
+      throw new Error('「日志」应紧跟在「面板设置」之后：' + JSON.stringify(sys.items));
     }
-    if (ui !== si + 2) {
-      throw new Error('「日志」应夹在「面板设置」与「检查更新」之间且紧邻：' + JSON.stringify(sys.items));
+    if (sys.items.some((t) => t.includes('检查更新'))) {
+      throw new Error('侧栏不该再有「检查更新」（已收回面板设置，重复入口会让用户困惑）：'
+        + JSON.stringify(sys.items));
     }
     await shot('52b-nav-system-group');
+
+    // 面板设置里的 4 个 Tab 顺序：访问与安全 → 文件与终端 → 账号与两步验证 → 检查更新
+    await page.click('.nav-item:has-text("面板设置")');
+    await page.waitForTimeout(900);
+    const tabTitles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
+    const wantTabs = ['访问与安全', '文件与终端', '账号与两步验证', '检查更新'];
+    const gotTabs = tabTitles.filter((t) => wantTabs.includes(t));
+    if (gotTabs.join('|') !== wantTabs.join('|')) {
+      throw new Error(`设置页 Tab 顺序不对：期望 ${wantTabs.join(' → ')}，实际 ${gotTabs.join(' → ')}`);
+    }
 
     // ② 旧 hash #/logs：默认落第一个 Tab（日志）
     await page.goto(base.replace(/\/+$/, '') + '/#/logs', { waitUntil: 'domcontentloaded' });

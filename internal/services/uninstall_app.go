@@ -268,6 +268,11 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData boo
 		return m.uninstallMiniflux(ctx, removeData, result)
 	case "syncthing":
 		return m.uninstallSyncthing(ctx, removeData, result)
+	case "python":
+		// Python 解释器（应用市场里三个版本共用这一个安装器，见 python_runtime.go）。
+		// 卸载必须如实点名"谁还在用它"（面板自研服务的 venv 只是**指向**它，
+		// 卸掉解释器不会报依赖缺失，而是让那些服务直接起不来）。
+		return m.UninstallPythonRuntime(ctx, app, result)
 	}
 	// "官方 release 原生二进制"类应用（Lucky / Orbien）：同一套安装器，
 	// 用注册表查而不是在这里再抄一遍 switch，免得加了新应用忘记补卸载。
@@ -327,6 +332,19 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		if users := m.composeUsers(ctx); len(users) > 0 {
 			p.Blocked = "还有 " + fmt.Sprint(len(users)) + " 个 Docker 应用在用这个运行时（" +
 				strings.Join(users, "、") + "），请先卸载它们"
+		}
+	case "python":
+		// Python 解释器：卸载计划必须把"谁会受影响"写在用户按下按钮**之前**。
+		// 依赖判断基于真实磁盘状态（各服务的 venv 里的 pyvenv.cfg），不是猜的。
+		p.Steps = []string{"brew uninstall " + app.BrewFormula}
+		if deps := m.pythonRuntimeDependents(app.BrewFormula); len(deps) > 0 {
+			p.Steps = append(p.Steps,
+				"⚠️ 下列环境正在使用 "+app.BrewFormula+"，卸载后它们会无法启动："+strings.Join(deps, "、"))
+			p.KeepNote = "卸载解释器不会删掉那些虚拟环境，但环境里的 python 是**指向它**的链接，" +
+				"所以相关服务会起不来（需要重新部署）；要恢复请重装本条目"
+		} else {
+			p.KeepNote = "当前没有面板内的虚拟环境在用这个版本；卸载不影响其它 Python 版本" +
+				"（3.11 / 3.12 / 3.13 各自独立、可并存）"
 		}
 	case "ffmpeg":
 		// 基础依赖也能单独卸载（用户要求"明确提示即可，不要禁止"）。

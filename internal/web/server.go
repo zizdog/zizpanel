@@ -355,6 +355,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/market/{id}/preflight", s.requireAuth(s.handleMarketPreflight))
 	root.HandleFunc("POST /api/v1/market/{id}/install", s.requireAuth(s.handleMarketInstall))
 	// 一键装 LNMP：比逐个装市场条目多做了四件收尾工作，见 services/lnmp.go
+	// 先取版本候选（弹窗用）再开任务：POST 的 body 里就是用户在这次弹窗里的选择。
+	root.HandleFunc("GET /api/v1/market/lnmp-options", s.requireAuth(s.handleLNMPOptions))
 	root.HandleFunc("POST /api/v1/market/install-lnmp", s.requireAuth(s.handleInstallLNMP))
 	root.HandleFunc("POST /api/v1/market/install-phpmyadmin", s.requireAuth(s.handleInstallPhpMyAdmin))
 	// 按 TtsVoice 插件的部署契约安装 Qwen3 TTS

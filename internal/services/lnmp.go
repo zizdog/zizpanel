@@ -38,8 +38,21 @@ import (
 //  在 Go 里重写一遍只会多一份会走样的实现。
 // ============================================================================
 
-// LNMPFormulas 是要安装的三个 formula，顺序有意义：nginx 是入口，先装它，
-// 用户能在最早的时刻看到东西。
+// LNMPFormulas 是**默认**三件套（nginx / PHP / MySQL），顺序有意义：nginx 是
+// 入口，先装它，用户能在最早的时刻看到东西。
+//
+// ⚠️ 语义已经收窄，别再把它当"本次要装的东西"：2026-09-19 起一键 LNMP
+// 先让用户选版本，本次选择由 LNMPSelection 承载，所有安装/收尾路径都从
+// **参数传进来的选择**取值（见 lnmp_options.go）。
+//
+// 这个变量现在只剩两个用途：
+//  1. 默认选择的唯一来源（DefaultLNMPSelection 与它由测试锁死必须一致）；
+//  2. 已有调用方/测试的兼容入口（历史上它是"LNMP 要装哪三个包"的答案）。
+//
+// 它**不是**"应用市场里 LNMP 板块的条目清单" —— 那是 Catalog() 里
+// category=网站环境 的条目（还包含 postgresql@17 这种不参与一键 LNMP 的）。
+// 谁要"本机都装了哪些 formula"用 Manager.InstalledFormulas，"市场有哪些组件"
+// 用 Catalog()/LNMPOptions，都不要读这个变量。
 //
 // PHP 默认 **8.2**（用户 2026-09-17 明确要求："默认装 php8.2"）：
 // 它是当前各站点/框架生态兼容性最好的选择，也避免"默认版本"与
@@ -48,7 +61,11 @@ import (
 // 8.1/8.3 不受影响，仍可继续跑站点的既有站点。
 var LNMPFormulas = []string{"nginx", "php@8.2", "mysql@8.4"}
 
-// LNMPPorts 是每个服务用于"是否真的起来了"的判定端口。
+// LNMPPorts 是**默认**三件套每个服务的判定端口（"是否真的起来了"用）。
+//
+// ⚠️ 与 LNMPFormulas 同理：这是默认值，不是"本次选择的端口表"。
+// 本次安装请用 LNMPSelection.Ports()（它按组件给端口，所以 php@8.4 / mysql@9.0
+// 这类不在默认表里的版本也能拿到正确的判定目标）。
 //
 // 用端口而不是 HTTP：PHP-FPM 说 FastCGI、MySQL 说 MySQL 协议，
 // 它们永远不可能通过 HTTP 检查（真机上就是这么被误判成"异常"的）。
@@ -65,9 +82,32 @@ var LNMPPorts = map[string]int{
 
 // InstallLNMP 一键把 LNMP 环境装好并跑起来。
 //
+// sel 是**本次要装的三件套**（用户选的版本）。空选择（三个字段都空）会被
+// 当成默认三件套 —— 这是给"老调用方/测试"留的后路：正常路径上 web 层已经用
+// ParseLNMPSelection 校验过，永远不会把非法选择送到这里。
+//
+// 为什么必须显式传参而不是继续读全局 LNMPFormulas：用户选了 PHP 8.4 之后，
+// 逐包安装、PHP 端点闭环、系统级守护进程注册、服务登记、人读文案**五条路径**
+// 都要用同一个选择。只改其中一条的后果是"装了 8.4、注册/文案还是 8.2"——
+// 本项目历史上正是这类"多条路径只改了一条"的坑（DEVELOPMENT.md 140/141）。
+//
 // 每一步都追加到 result.Steps，前端按顺序展示 —— 这个流程动辄十几分钟，
 // 用户必须能看到"现在到哪了"，否则会以为卡死。
-func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error {
+func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LNMPSelection) error {
+	if result == nil {
+		result = &InstallResult{App: "lnmp"}
+	}
+	// 空选择 = 默认三件套（向后兼容）；非空但非法的选择一律当场拒绝，
+	// 绝不用默认值替用户做决定（那会装出与用户选择不一样的版本）。
+	if len(sel.Formulas()) == 0 {
+		sel = DefaultLNMPSelection()
+	}
+	if err := sel.Validate(); err != nil {
+		return fmt.Errorf("一键 LNMP 的版本选择无效：%w", err)
+	}
+	formulas := sel.Formulas()
+	ports := sel.Ports()
+
 	// 全新 macOS 上没有 Homebrew，而 LNMP 三件套全靠它。
 	// 以前这里只会拒绝（"请先安装 Homebrew"），把用户赶回命令行 ——
 	// 与"装完面板后所有操作都在面板里完成"矛盾。现在缺什么装什么（含前置的 CLT）。
@@ -83,10 +123,10 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		return fmt.Errorf("安装 LNMP 需要以 root 运行（面板正式安装时由 LaunchDaemon 以 root 启动）")
 	}
 
-	result.step(ctx, "开始安装 LNMP 环境（"+m.lnmpComponentsText()+"）")
+	result.step(ctx, "开始安装 LNMP 环境（"+sel.ComponentsText()+"）")
 
 	// ---- 1. 逐包安装 ----
-	for _, f := range LNMPFormulas {
+	for _, f := range formulas {
 		if m.brewHas(ctx, f) {
 			result.step(ctx, f+" 已安装，跳过")
 			continue
@@ -137,7 +177,14 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	// 这里在启动服务**之前**把这棵树交还真实用户（失败只告警，不阻断）。
 	m.ensureNginxLogOwnership(ctx, result)
 
-	if m.brewHas(ctx, "mysql@8.4") {
+	// ---- 2a. MySQL 数据目录 ----
+	//
+	// 按**本次选的 MySQL formula** 判断：以前写死 "mysql@8.4"，一旦用户在弹窗里
+	// 选了别的版本，这一步就会静默跳过（数据目录没初始化 → mysqld 起不来 → 任务
+	// 最后报"MySQL 未能确认在监听"，而真正的原因在前面的路径漏改）。
+	// 认不出 MySQL 组件时就跳过（调用方已经校验过选择，正常不会发生）。
+	mysqlFormula := lnmpSelectedMySQL(formulas)
+	if mysqlFormula != "" && m.brewHas(ctx, mysqlFormula) {
 		if err := m.initMySQLDataDir(ctx, result); err != nil {
 			return err
 		}
@@ -157,18 +204,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	//
 	// 失败**不当致命错误**：nginx/mysql 仍然可用，"装了一半"的机器重跑本任务
 	// 也还能继续修；但必须如实进 Warning 与 Steps（含补救动作），不谎报成功。
-	for _, f := range LNMPFormulas {
-		if _, ok := phpVersionFromFormula(f); !ok {
-			continue
-		}
-		if !m.brewHas(ctx, f) {
-			continue
-		}
-		if err := m.ensurePHPListenEndpoint(ctx, f, result); err != nil {
-			result.step(ctx, "警告："+f+" 的专属端点未就绪，指向它的站点会解析不了 PHP"+
-				"（原因见上一行；可在「网站管理 → 🐘 PHP 环境」里点「修复端点并重启」重试）")
-		}
-	}
+	m.ensureLNMPPHPEndpoints(ctx, result, formulas)
 
 	// ---- 3. 注册为系统级守护进程（不依赖用户登录）----
 	//
@@ -179,9 +215,9 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	// 但对一台**已经调好了 LNMP 的机器**（例如本机），它会拆掉能用的配置 ——
 	// 我在本机实测时就是把正常工作的服务搞成失败的。
 	// 所以先看端口：都在监听就说明环境已经好了，直接跳过。
-	if m.allLNMPRunning(ctx) {
+	if m.allLNMPRunning(ctx, formulas) {
 		result.Steps = append(result.Steps,
-			"nginx / PHP / MySQL 均已在运行，跳过服务注册（不改动现有配置）")
+			sel.ComponentsText()+" 均已在运行，跳过服务注册（不改动现有配置）")
 	} else {
 		// 注册之前先清场：端口被"不在 launchd 里"的游离进程占着时，
 		// 直接 bootstrap 出来的守护进程会因为 Address already in use 反复退出，
@@ -190,7 +226,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 		m.freeStaleNginxPort(ctx, result)
 
 		result.step(ctx, "正在注册为系统级后台服务（不依赖用户登录）")
-		if err := m.installSystemDaemons(ctx, result); err != nil {
+		if err := m.installSystemDaemons(ctx, result, formulas); err != nil {
 			// 兜底：上面可能刚把游离的 nginx 停掉，这里再失败就会让机器
 			// "连原来那个能用的 nginx 都没了"。尽力把它拉回来并如实说明。
 			m.restoreNginxAfterFailure(ctx, result, err)
@@ -209,7 +245,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	//
 	// 失败不当致命错误（LNMP 本身可用），但必须如实写进 Steps 与 Warning，
 	// 并告诉用户还能在应用市场手动纳管 —— 绝不谎报"已登记"。
-	m.registerLNMPComponents(ctx, result)
+	m.registerLNMPComponents(ctx, result, formulas, ports)
 
 	// ---- 3b. 基础依赖：ffmpeg ----
 	//
@@ -229,14 +265,14 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	// ---- 4. 验证：只认端点/端口真的在监听 ----
 	//
 	// PHP 不能用端口判定：面板的多版本设计让每个 php@x.y 监听自己专属的
-	// Unix socket（LNMPPorts 里 PHP 记的就是 0）。这里统一走
+	// Unix socket（sel.Ports() 里 PHP 记的就是 0）。这里统一走
 	// lnmpComponentLive，避免"验证说 PHP 没在监听、其实它好好的"这种误报 ——
 	// 误报同样会让用户以为装失败了。
 	result.step(ctx, "正在验证服务是否真的可用")
 	var notUp []string
 	var upDesc []string
-	for _, f := range LNMPFormulas {
-		label, live := m.waitLNMPComponent(ctx, f, 20*time.Second)
+	for _, f := range formulas {
+		label, live := m.waitLNMPComponent(ctx, f, ports, 20*time.Second)
 		if !live {
 			notUp = append(notUp, label)
 			continue
@@ -275,11 +311,19 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	// ---- 5. phpMyAdmin ----
 	// 放在最后：它依赖 nginx 与 PHP-FPM 都已就绪，否则装完也打不开。
 	// 失败不阻断整个 LNMP —— 网站功能已经可用了，phpMyAdmin 可以稍后单独装。
-	result.step(ctx, "正在部署 phpMyAdmin（数据库管理界面）")
-	if err := m.InstallPhpMyAdmin(ctx, result); err != nil {
-		result.Warning = appendLNMPWarning(result.Warning,
-			"LNMP 已就绪，但 phpMyAdmin 部署失败："+err.Error())
-		result.step(ctx, "警告："+result.Warning)
+	//
+	// 没选 MySQL 就不部署它：phpMyAdmin 是**数据库管理界面**，没有数据库时
+	// 装出来只会得到一个永远登录不上的入口（比没装更糟）。如实说明而不是
+	// 静默跳过 —— 用户选组件时要知道自己放弃了什么。
+	if mysqlFormula == "" {
+		result.step(ctx, "本次没有选择 MySQL，跳过 phpMyAdmin（数据库管理界面）的部署")
+	} else {
+		result.step(ctx, "正在部署 phpMyAdmin（数据库管理界面）")
+		if err := m.InstallPhpMyAdmin(ctx, result); err != nil {
+			result.Warning = appendLNMPWarning(result.Warning,
+				"LNMP 已就绪，但 phpMyAdmin 部署失败："+err.Error())
+			result.step(ctx, "警告："+result.Warning)
+		}
 	}
 
 	// ---- 6. MySQL root 凭据闭环（必须有，见 lnmp_mysql_credentials.go）----
@@ -287,11 +331,29 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult) error 
 	// 为什么放在最后一步：这一步失败＝任务失败（凭据不一致会让之后每次库操作
 	// 都撞 1045），但前面的 LNMP、默认站点、phpMyAdmin 都已经装好了 ——
 	// 把它们一起报废只会让用户更难收拾。放在最后，既如实失败、也不白装。
-	result.step(ctx, "正在核对 MySQL root 凭据（面板配置与服务器是否一致）")
-	if err := m.ensureMySQLRootCredential(ctx, result); err != nil {
-		return err
+	//
+	// 没选 MySQL 就**没有这一步**（凭据闭环是 MySQL 专属的收尾）：不能因为
+	// 用户没装 MySQL 就报"凭据核对失败"——那会把一次成功的安装变成红色失败。
+	if mysqlFormula != "" {
+		result.step(ctx, "正在核对 MySQL root 凭据（面板配置与服务器是否一致）")
+		if err := m.ensureMySQLRootCredential(ctx, result); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// lnmpSelectedMySQL 从本次选择的 formula 列表里挑出 MySQL 那个（没有则空串）。
+//
+// 单独一个函数是为了让"哪个是 MySQL"的判据只有一处：lnmpGroupOf 的前缀判据
+// （mysql@）。散在各处写 strings.HasPrefix(f, "mysql@") 迟早会漏一处。
+func lnmpSelectedMySQL(formulas []string) string {
+	for _, f := range formulas {
+		if g, ok := lnmpGroupOf(f); ok && g.Key == "mysql" {
+			return f
+		}
+	}
+	return ""
 }
 
 // fixNginxBaseConfig 修正 brew 默认 nginx 配置，使其适合当服务器用。
@@ -385,9 +447,35 @@ func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult) e
 	return nil
 }
 
-// installSystemDaemons 把 LNMP 三件套注册成系统级 LaunchDaemon。
-func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResult) error {
-	return m.installSystemDaemonsFor(ctx, result, LNMPFormulas, 10*time.Minute)
+// ensureLNMPPHPEndpoints 对**本次选中的** PHP 版本做专属端点闭环。
+//
+// 单独一个函数（而不是把循环留在 InstallLNMP 里）是为了让"端点闭环必须在注册
+// 系统级服务之前"这条顺序约束能在源码级被测试锁住 —— 见
+// TestInstallLNMPCallsSharedPHPListenFix。
+//
+// 只对 php@x.y 生效：nginx/mysql 没有 www.conf，走的是端口。
+func (m *Manager) ensureLNMPPHPEndpoints(ctx context.Context, result *InstallResult, formulas []string) {
+	for _, f := range formulas {
+		if _, ok := phpVersionFromFormula(f); !ok {
+			continue
+		}
+		if !m.brewHas(ctx, f) {
+			continue
+		}
+		if err := m.ensurePHPListenEndpoint(ctx, f, result); err != nil {
+			result.step(ctx, "警告："+f+" 的专属端点未就绪，指向它的站点会解析不了 PHP"+
+				"（原因见上一行；可在「网站管理 → 🐘 PHP 环境」里点「修复端点并重启」重试）")
+		}
+	}
+}
+
+// installSystemDaemons 把**本次选中的** LNMP 组件注册成系统级 LaunchDaemon。
+//
+// formulas 是本次选择推导出来的（顺序 nginx 在前），不再是全局默认三件套：
+// 用户选了 PHP 8.4 之后，这里必须注册 8.4 的那个 plist/服务定义，
+// 注册成 8.2 会让"装的是 8.4、开机起来的是 8.2"。
+func (m *Manager) installSystemDaemons(ctx context.Context, result *InstallResult, formulas []string) error {
+	return m.installSystemDaemonsFor(ctx, result, formulas, 10*time.Minute)
 }
 
 // installSystemDaemonsFor 把**任意** formula 列表注册成系统级 LaunchDaemon。
@@ -437,7 +525,11 @@ func (m *Manager) installSystemDaemonsFor(ctx context.Context, result *InstallRe
 	return nil
 }
 
-// registerLNMPComponents 把 LNMP 三件套登记进面板自己的服务注册表。
+// registerLNMPComponents 把**本次选中的** LNMP 组件登记进面板自己的服务注册表。
+//
+// formulas / ports 都来自本次选择（ports 是 LNMPSelection.Ports()）：
+// 登记用的端口必须是**这个版本**的判定端口，不能读默认表 —— 否则用户选了
+// php@8.4 时登记出来的记录仍然带着默认那套端口/版本，服务管理里对不上。
 //
 // 为什么必须在 InstallLNMP 里显式做：一键 LNMP 过去只把三个服务注册成系统级
 // LaunchDaemon（那是 **launchd** 层面），从不写面板的 services 表。后果真机上
@@ -448,12 +540,13 @@ func (m *Manager) installSystemDaemonsFor(ctx context.Context, result *InstallRe
 // 登记复用 RegisterInstalledService（它内部走 AdoptCandidate，幂等）：
 // 不另写一套入库逻辑 —— 两份实现迟早会不一致，而不一致的服务记录会让
 // 状态/日志/端口对不上，排查成本极高。
-func (m *Manager) registerLNMPComponents(ctx context.Context, result *InstallResult) {
-	result.step(ctx, "正在把 "+m.lnmpComponentsText()+" 登记进「服务管理」")
-	for _, formula := range LNMPFormulas {
+func (m *Manager) registerLNMPComponents(ctx context.Context, result *InstallResult,
+	formulas []string, ports map[string]int) {
+	result.step(ctx, "正在把 "+lnmpComponentsTextOf(formulas)+" 登记进「服务管理」")
+	for _, formula := range formulas {
 		// 目录条目是端口/分类/图标/显示名的权威来源；查不到时用 formula 兜底，
 		// 至少不会登记成一条无名无端口的记录。
-		name, icon, category, port := formula, "🧩", "lnmp", LNMPPorts[formula]
+		name, icon, category, port := formula, "🧩", "lnmp", ports[formula]
 		if a, ok := lnmpCatalogApp(formula); ok {
 			if a.Name != "" {
 				name = a.Name
@@ -536,14 +629,17 @@ func appendLNMPWarning(cur, add string) string {
 	return cur + "；" + add
 }
 
-// lnmpComponentsText 生成"nginx / PHP 8.2 (FPM) / MySQL 8.4"这种人看的组件清单。
+// lnmpComponentsTextOf 生成"nginx / PHP 8.4 / MySQL 8.4"这种人看的组件清单。
 //
-// 由 LNMPFormulas + 应用目录推导，而不是在日志里写死字符串：默认版本从 8.3
-// 换成 8.2 时，写死的日志就成了"日志说 8.3、装的是 8.2"的假信息 ——
-// 用户排查时最恨这种自相矛盾。目录查不到就退回 formula 名。
-func (m *Manager) lnmpComponentsText() string {
-	parts := make([]string, 0, len(LNMPFormulas))
-	for _, f := range LNMPFormulas {
+// 由**本次选择**推导（formula → 目录条目展示名），而不是在日志里写死字符串，
+// 也不读全局默认值：默认版本从 8.2 换成 8.4 时，写死的日志就成了
+// "日志说 8.2、装的是 8.4"的假信息 —— 用户排查时最恨这种自相矛盾。
+// 目录查不到就退回 formula 全名。
+//
+// 顺序跟着传进来的 formulas（调用方保证 nginx 在前）。
+func lnmpComponentsTextOf(formulas []string) string {
+	parts := make([]string, 0, len(formulas))
+	for _, f := range formulas {
 		if a, ok := lnmpCatalogApp(f); ok && a.Name != "" {
 			parts = append(parts, a.Name)
 			continue
@@ -561,14 +657,14 @@ func (m *Manager) brewPrefix() string {
 	return filepath.Dir(filepath.Dir(m.opt.BrewBin))
 }
 
-// allLNMPRunning 判断 LNMP 三个服务是否都已在监听（PHP 按专属端点判断）。
+// allLNMPRunning 判断**本次选中的**组件是否都已在监听（PHP 按专属端点判断）。
 //
 // 用它来避免"重复改造"：环境已经能用的时候，动 plist 只有坏处没有好处。
 // 判定口径必须与最终验证一致（都走 lnmpComponentLive），否则会出现
 // "这里说都在跑、那里说没在跑"的自相矛盾，用户没法相信任何一条。
-func (m *Manager) allLNMPRunning(ctx context.Context) bool {
-	for _, f := range LNMPFormulas {
-		if _, live := m.lnmpComponentLive(ctx, f); !live {
+func (m *Manager) allLNMPRunning(ctx context.Context, formulas []string) bool {
+	for _, f := range formulas {
+		if _, live := m.lnmpComponentLive(ctx, f, nil); !live {
 			return false
 		}
 	}
@@ -582,7 +678,11 @@ func (m *Manager) allLNMPRunning(ctx context.Context) bool {
 //     必须按 sites.EndpointLive 判定。用端口判它必然误报（见 LNMPPorts 注释）。
 //   - 其它：按各自的判定端口连一次。PHP-FPM 说 FastCGI、MySQL 说 MySQL 协议，
 //     它们永远不可能通过 HTTP 检查（真机上就是这么被误判成"异常"的）。
-func (m *Manager) lnmpComponentLive(ctx context.Context, formula string) (string, bool) {
+//
+// ports 是本次选择的判定端口表（LNMPSelection.Ports()）；传 nil 时按 formula
+// 的组件前缀推导（lnmpGroupOf），**不读全局 LNMPPorts** —— 用户选了 mysql@9.0
+// 时全局表里没有它，读全局会得到"没有可判定的端口"这种假失败。
+func (m *Manager) lnmpComponentLive(ctx context.Context, formula string, ports map[string]int) (string, bool) {
 	if version, ok := phpVersionFromFormula(formula); ok {
 		endpoint, err := sites.PreferredEndpoint(m.phpBrewPrefix(), version)
 		if err != nil {
@@ -590,21 +690,30 @@ func (m *Manager) lnmpComponentLive(ctx context.Context, formula string) (string
 		}
 		return fmt.Sprintf("PHP %s(%s)", version, endpoint), sites.EndpointLive(endpoint)
 	}
-	port := LNMPPorts[formula]
+	port, ok := ports[formula]
+	if !ok {
+		group, known := lnmpGroupOf(formula)
+		if !known {
+			// 既不是 PHP、又不属于 LNMP 三件套：不能假装它在跑。
+			return fmt.Sprintf("%s（没有可判定的端口）", formula), false
+		}
+		port = group.Port
+	}
 	if port <= 0 {
-		// 既不是 PHP、目录里又没给端口：不能假装它在跑。
+		// 组件没给判定端口：不能假装它在跑（PHP 那条分支已经在上面处理了）。
 		return fmt.Sprintf("%s（没有可判定的端口）", formula), false
 	}
 	return fmt.Sprintf("%s(端口 %d)", formula, port), portOpen(ctx, port)
 }
 
 // waitLNMPComponent 轮询等某个组件就绪（服务启动需要时间，立即检查必然失败）。
-func (m *Manager) waitLNMPComponent(ctx context.Context, formula string, timeout time.Duration) (string, bool) {
+func (m *Manager) waitLNMPComponent(ctx context.Context, formula string,
+	ports map[string]int, timeout time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
 	var label string
 	for {
 		var live bool
-		label, live = m.lnmpComponentLive(ctx, formula)
+		label, live = m.lnmpComponentLive(ctx, formula, ports)
 		if live {
 			return label, true
 		}

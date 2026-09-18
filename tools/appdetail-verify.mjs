@@ -294,15 +294,36 @@ const CREDS = {
 
 await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
   window.__calls = [];
+  // 每次写请求的**请求体**（"方法 路径" → body 字符串）。
+  // 2026-09-19 起一键 LNMP 必须带上用户选的版本，所以必须能看到 body：
+  // 只看"发过 POST"无法证明"发的是用户选的那个版本"。
+  window.__bodies = {};
   // 网站管理页的假数据：默认"一个站点都没有"（要验空站点列表时的大按钮），
   // 测试里把它换成"有一个站点"再渲染一次（要验工具条上的次级按钮）。
   window.__sitesPayload = {
     list: [], presets: [], php_versions: [], www_root: '/Users/zizdog/www',
   };
+  // 一键 LNMP 的候选版本（GET /market/lnmp-options 的桩数据）。
+  // 与真实后端同形：三组 + 每组 recommended 一项（PHP 8.2 是默认）。
+  window.__lnmpOptions = {
+    groups: [
+      { key: 'nginx', label: 'Nginx', selected: 'nginx',
+        options: [{ formula: 'nginx', name: 'Nginx', summary: 'Web 服务器', recommended: true, installed: true }] },
+      { key: 'php', label: 'PHP', selected: 'php@8.2',
+        options: [
+          { formula: 'php@8.4', name: 'PHP 8.4 (FPM)', summary: 'PHP 8.4', recommended: false, installed: false },
+          { formula: 'php@8.2', name: 'PHP 8.2 (FPM)', summary: 'PHP 8.2', recommended: true, installed: true },
+        ] },
+      { key: 'mysql', label: 'MySQL', selected: 'mysql@8.4',
+        options: [{ formula: 'mysql@8.4', name: 'MySQL 8.4', summary: '数据库', recommended: true, installed: false }] },
+    ],
+    default: { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' },
+  };
   window.fetch = async (url, init = {}) => {
     const u = String(url);
     const method = (init.method || 'GET').toUpperCase();
     window.__calls.push(method + ' ' + u);
+    if (init.body) window.__bodies[method + ' ' + u.split('?')[0]] = String(init.body);
     const done = (data, ok = true, status = 200) => ({
       ok, status, statusText: ok ? 'OK' : 'ERR', text: async () => JSON.stringify({ ok, data }),
     });
@@ -310,6 +331,15 @@ await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
     if (u.includes('/services/com.zizdog.slowapp')) return new Promise(() => {});
     if (u.includes('/session')) return done({ user: { username: 'admin' }, config: { panel_entry: '/' } });
     if (u.includes('/market/proxies')) return done({ enabled: true, items: [] });
+    // 候选版本必须在 /market 的通配之前匹配（真实路由也是先注册它）。
+    if (u.includes('/market/lnmp-options')) return done(window.__lnmpOptions);
+    // 安装接口：回 202 + task_id（前端据此开任务进度窗）。
+    if (u.includes('/market/install-lnmp')) {
+      return {
+        ok: true, status: 202, statusText: 'Accepted',
+        text: async () => JSON.stringify({ ok: true, data: { task_id: 'stub-lnmp-1', title: '一键 LNMP' } }),
+      };
+    }
     if (/\/market(\?|$)/.test(u)) return done(MARKET);
     if (/\/sites(\?|$)/.test(u)) return done(window.__sitesPayload);
     const m = u.match(/\/services\/([^/?]+)\/credentials/);
@@ -495,9 +525,13 @@ const result = await page.evaluate(async () => {
   // 留一个引用（**不能放进 out**：DOM 节点无法从 page.evaluate 序列化回来）：
   // 最后点击它，证明点下去走的是既有异步接口
   // （POST /api/v1/market/install-lnmp → 202 + task_id），而不是同步请求。
+  //
+  // 注意：这里**先不 remove()** —— 节点必须还在文档里，点击才会被浏览器派发，
+  // 也才可能打开弹窗。③b 用完再 remove（以前是先 remove 再在最后点击，
+  // 那一下点的是脱离文档的节点，什么都不会发生）。
   lnmpListBtn = Array.from(sitesBox2.querySelectorAll('button'))
     .find((b) => (b.textContent || '').includes('LNMP')) || null;
-  sitesBox2.remove();
+  sitesBox2.dataset.keep = '1';
 
   // ---- ② 已安装 Tab：合并去重后**一张卡片一个应用** ----
   const svcBox = document.createElement('div');
@@ -622,14 +656,48 @@ const result = await page.evaluate(async () => {
   out.timeout.panel = panelSnapshot();
   closeModal();
 
-  // ---- ③b 点一下 LNMP 按钮：必须调用既有的异步接口 ----
-  //  用户明确要求"不要改成同步请求"：后端立刻返回 task_id（202），
-  //  进度交给任务中心。这里断言请求真的发到了 /market/install-lnmp 且是 POST。
+  // ---- ③b 点一下 LNMP 按钮：必须先弹"选版本"的弹窗，**不**立刻发安装请求 ----
+  //
+  //  用户 2026-09-19 的要求：「点按钮 → 弹窗让用户选 nginx / PHP / MySQL 版本
+  //  → 确认后才创建任务」。所以这里的断言顺序是：
+  //    ① 点按钮后**没有** install-lnmp 请求，而出现了弹窗、里面能选版本；
+  //    ② 选 PHP 8.4 再点「开始安装」→ 才发出请求，且 body 里是 php@8.4；
+  //    ③ 请求仍是异步接口（后端回 202 + task_id），进度交给任务中心。
+  out.sites.modalAfterClick = null;
+  out.sites.php84Selected = false;
+  out.sites.installBody = null;
+  out.sites.lnmpPostCall = null;
   if (lnmpListBtn) {
     lnmpListBtn.click();
-    await settle();
+    await settle(); await settle();
+    const mask = document.querySelector('.modal-mask');
+    out.sites.modalAfterClick = mask ? (mask.innerText || '').slice(0, 800) : null;
+    // 点按钮之后**绝不允许**已经发出安装请求
+    out.sites.postCallBeforeConfirm = window.__calls.find((c) => c.includes('/market/install-lnmp')) || null;
+    // 选 PHP 8.4（弹窗里第二组的第一个 radio）
+    const php84 = mask && Array.from(mask.querySelectorAll('input[type=radio]'))
+      .find((r) => r.value === 'php@8.4');
+    if (php84) {
+      php84.checked = true;
+      php84.dispatchEvent(new Event('change', { bubbles: true }));
+      out.sites.php84Selected = true;
+      await settle();
+    }
+    // 只有「开始安装」这一颗按钮会提交
+    const ok = mask && Array.from(mask.querySelectorAll('button'))
+      .find((b) => (b.textContent || '').includes('开始安装'));
+    out.sites.installButtonLabel = ok ? (ok.textContent || '').trim() : null;
+    if (ok) {
+      ok.click();
+      await settle(); await settle();
+    }
   }
   out.sites.lnmpPostCall = window.__calls.find((c) => c.includes('/market/install-lnmp')) || null;
+  out.sites.installBody = Object.entries(window.__bodies)
+    .filter(([k]) => k.includes('/market/install-lnmp')).map(([, v]) => v)[0] || null;
+  // 关掉任务进度弹窗，避免影响后面的采集
+  closeModal();
+  if (sitesBox2 && sitesBox2.parentNode) sitesBox2.remove();
 
   out.calls = window.__calls.slice();
   return out;
@@ -1015,9 +1083,24 @@ check('LNMP 按钮文案说清装什么（nginx / PHP / MySQL / phpMyAdmin）',
   ['nginx', 'PHP', 'MySQL', 'phpMyAdmin'].every((w) => result.sites.hint.includes(w)), result.sites.hint);
 check('LNMP 按钮文案提示耗时与长任务特性（分钟级 + 不中断/任务中心）',
   /分钟/.test(result.sites.hint) && /(中断|任务中心)/.test(result.sites.hint), result.sites.hint);
-check('LNMP 按钮走既有异步接口 POST /market/install-lnmp（不是同步请求）',
+// ---- 一键 LNMP 的"先弹窗选版本、确认后才安装"（2026-09-19 用户要求）----
+check('点「一键 LNMP」先弹出选版本弹窗（不是直接开装）',
+  !!result.sites.modalAfterClick && /选择要安装的版本/.test(result.sites.modalAfterClick),
+  String(result.sites.modalAfterClick || '').slice(0, 200));
+check('点按钮后、确认之前**没有**发出安装请求',
+  !result.sites.postCallBeforeConfirm, String(result.sites.postCallBeforeConfirm || ''));
+check('弹窗里能选到 PHP 8.4（候选来自目录，不是写死）',
+  result.sites.php84Selected, String(result.sites.installButtonLabel || ''));
+check('弹窗里看得到"已安装"标记与 MySQL root 口令说明',
+  /已安装/.test(result.sites.modalAfterClick || '')
+  && /root 口令/.test(result.sites.modalAfterClick || ''),
+  String(result.sites.modalAfterClick || '').slice(0, 300));
+check('确认后才走既有异步接口 POST /market/install-lnmp（不是同步请求）',
   /^POST .*\/market\/install-lnmp/.test(result.sites.lnmpPostCall || ''),
   String(result.sites.lnmpPostCall));
+check('安装请求体里是用户选的 php@8.4（不是默认的 8.2）',
+  /"php":"php@8\.4"/.test(result.sites.installBody || ''),
+  String(result.sites.installBody || ''));
 
 console.log('\n══════════ 断言结果 ══════════');
 let failed = 0;

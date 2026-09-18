@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -681,4 +684,72 @@ func runBash(t *testing.T, script string) (string, error) {
 // execCommand 是 os/exec 的薄封装，避免测试文件里散落 import。
 func execCommand(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
+}
+
+// TestDownloadTarballReportsProgress 锁住"下载进度回调"这条新增能力。
+//
+// 为什么值得测：用户 2026-09-20 明确要求"升级过程要有详细的内容展示"，
+// 而进度回调是那条要求唯一的数据来源。回调漏调/重复计数都会让界面上的
+// 百分比说谎（显示"下完了"或一直停在 0%），而升级界面恰恰是用户最紧张的地方。
+func TestDownloadTarballReportsProgress(t *testing.T) {
+	payload := bytes.Repeat([]byte("zizpanel"), 4096) // 32 KiB
+	sum := sha256.Sum256(payload)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer ts.Close()
+
+	var (
+		lastWritten int64
+		lastTotal   int64
+		calls       int
+	)
+	dest := filepath.Join(t.TempDir(), "pkg.tar.gz")
+	got, err := DownloadTarballWithProgress(context.Background(), ts.URL, dest,
+		hex.EncodeToString(sum[:]), func(written, total int64) {
+			calls++
+			if written < lastWritten {
+				t.Errorf("进度回调的字节数回退了：%d → %d", lastWritten, written)
+			}
+			lastWritten, lastTotal = written, total
+		})
+	if err != nil {
+		t.Fatalf("下载失败：%v", err)
+	}
+	if got != dest {
+		t.Errorf("返回路径应为 %s，实际 %s", dest, got)
+	}
+	if calls == 0 {
+		t.Fatal("一次进度回调都没有 —— 界面上会永远停在「正在下载」")
+	}
+	if lastWritten != int64(len(payload)) {
+		t.Errorf("最后一次回调应报告完整字节数 %d，实际 %d", len(payload), lastWritten)
+	}
+	if lastTotal != int64(len(payload)) {
+		t.Errorf("total 应为服务端声明的大小 %d，实际 %d", len(payload), lastTotal)
+	}
+	// 没有回调（nil）时也必须照常工作：DownloadTarball 是它的包装。
+	dest2 := filepath.Join(t.TempDir(), "pkg2.tar.gz")
+	if _, err := DownloadTarball(context.Background(), ts.URL, dest2, hex.EncodeToString(sum[:])); err != nil {
+		t.Fatalf("不带进度回调的下载也必须成功：%v", err)
+	}
+}
+
+// TestDownloadTarballWithProgressRejectsBadChecksum：带进度的路径同样要做校验，
+// 不能因为"边下边报进度"就把校验漏掉（漏掉等于允许装一个坏包）。
+func TestDownloadTarballWithProgressRejectsBadChecksum(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not the expected bytes"))
+	}))
+	defer ts.Close()
+	dest := filepath.Join(t.TempDir(), "pkg.tar.gz")
+	_, err := DownloadTarballWithProgress(context.Background(), ts.URL, dest,
+		strings.Repeat("ab", 32), func(int64, int64) {})
+	if err == nil {
+		t.Fatal("校验和不匹配时必须报错")
+	}
+	if _, statErr := os.Stat(dest); statErr == nil {
+		t.Error("校验失败时不该留下目标文件（升级会拿它去替换面板）")
+	}
 }

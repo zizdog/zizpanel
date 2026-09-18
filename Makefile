@@ -113,12 +113,12 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && bash -n tools/seed-nas-brew.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh
+	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh tools/seed-nas-brew.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh tools/seed-nas-brew.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@# 真实口令不许进仓库 —— 这条坑复发过两次（v0.3.1 基线 + 第九轮新增文件），
 	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
@@ -219,7 +219,11 @@ smoke: run-local ## 启动本地实例并做 UI 验证（特权步骤跳过，�
 	@# ⚠️ 必须**无论成败都 stop-local**：以前写成 `smoke: run-local uitest`，
 	# uitest 一失败 make 就中断，调试实例被留在用户机器上（真机发生过，
 	# 遗留进程监听 127.0.0.1:18443 好几轮才被发现）。
-	@node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS); rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
+	@# ⚠️ **必须带 ZP_SKIP_PRIV=1**：本地实例不是 root，建站/nginx 校验这类要动
+	# 系统配置的步骤在这里必然失败（实测建站返回 500「sudo: a password is required」）。
+	# uitest 会给这些步骤打印"跳过"并把清单汇总出来 —— 那是**如实跳过**，不是假装通过；
+	# 完整的特权链路请对真实安装实例跑 `make uitest-live`。
+	@ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS); rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
 
 # ---------------------------------------------------------------- 发布打包 --
 # install.sh 在目标机上会用到这些脚本（入口接管 / 服务器模式 / 自检工具）。
@@ -384,6 +388,12 @@ publish-mirror: mirror-manifest ## 生成镜像版清单并打印"上传到国�
 	@echo "并在站点根放指向 latest 的符号链接。例："
 	@echo "  scp $(RELDIR)/manifest.json* $(RELDIR)/zizpanel_*_darwin_*.tar.gz install.sh \\"
 	@echo "      <user>@<host>:<站点根>/zizpanel/"
+
+.PHONY: seed-nas-brew
+seed-nas-brew: ## 把 brew 瓶（含依赖闭包）预置到 NAS 镜像的按需缓存里（ARGS="python@3.11 [--tags ...]"）
+	@# 为什么要这个目标：NAS 的 /brew 是**按需**缓存，装机那一刻上游有没有货决定成败。
+	@# 脚本会自己校验 sha256 与 `X-Cache: HIT`，任一不过就非 0 退出（不许谎报"已预置"）。
+	@bash tools/seed-nas-brew.sh $(ARGS)
 
 .PHONY: mirror-nas
 mirror-nas: host-zizpanel ## 生成"指向 NAS 镜像"的清单（url 用 download/<版本>/ 布局）并签名

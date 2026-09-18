@@ -642,8 +642,11 @@ func TestBrewMirrorWorksProbe(t *testing.T) {
 //
 // 背景（2026-09-16 真机教训）：这里原先硬编码了一个**编造的** sha256 去 HEAD，
 // 结果永远 404 → 镜像分支永不成立 → brew 静默回落 ghcr.io（用户"装了 21 分钟"）。
-// 现在改成：先读 <base>/api/formula/<f>.json 拿真实版本与标签，再按 brew 实际会用的
-// 两种瓶路径去探测。这条测试同时锁住"必须有清单""瓶必须真的能取到"。
+// 现在改成：先读 <base>/api/formula/<f>.json 拿真实版本/标签/rebuild，再按 brew 实际
+// 会用的两种瓶路径去探测。这条测试同时锁住"必须有清单""瓶必须真的能取到（且非空）"。
+//
+// 2026-09-20 补：判据从"状态码 200/206"升级为"200/206 **且真的有字节**"，
+// 并且文件名要按 brew 7 的规则拼（`@`→%40、rebuild>0 时带 `.bottle.<N>`）。
 func TestBrewMirrorSupportsOCI(t *testing.T) {
 	manifest := `{"versions":{"stable":"1.31.5"},
 		"bottle":{"stable":{"files":{"arm64_sequoia":{"sha256":"deadbeefcafe"}}}}}`
@@ -655,7 +658,11 @@ func TestBrewMirrorSupportsOCI(t *testing.T) {
 	})
 	ok.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, ".bottle.tar.gz") || strings.Contains(r.URL.Path, "/blobs/sha256:") {
+			// 必须真给一个字节：2026-09-20 起探测判据是"200/206 **且有内容**"，
+			// 因为真机实测中科大 IPv4 侧对所有瓶回 `200 + 0 字节`，
+			// 只看状态码会把坏源判成可用（正是 python@3.11 事故的表象）。
 			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("B"))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -671,6 +678,7 @@ func TestBrewMirrorSupportsOCI(t *testing.T) {
 	noManifest.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/blobs/sha256:") {
 			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("B"))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)

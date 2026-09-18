@@ -384,3 +384,21 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 
 157. **`brew install` 单走一个源：镜像侧一次 200+空 body 被缓存成"永远装不上"，面板还只会说一句"失败"**（2026-09-18，python@3.11 事故）→ 两层根因，缺一层都不算修好。**镜像侧**：NAS 的按需缓存容器（`zizpanel-pullcache`，8091，nginx `/brew/` 的反代后端）命中判定是"文件存在 且 元数据 size==真实 size"（`0==0` 也算命中），落盘又不校验 2xx 的 body 是否为空 → 上游抽风那一次被**永久固化**成"这个 URL 永远返回 0 字节"；而 brew 拿 0 字节文件去校验，报 `Bottle reports different checksum` + 实际值 `e3b0c442…`（空文件 sha256）。附带查出真凶不是 USTC：容器走 docker bridge 时**没有 IPv6**、只能走 IPv4，而本机出网优先 IPv6 —— 同一 URL 宿主 `200/185092`、bridge 容器 `200/0`、同容器 `--network host` 又 `200/185092`。修法：空 body 早退 + 删除临时文件（**不 rename、不写 `.json`/`.ok`**）+ 重试 + 最终 502；`openCached` 把 `size<=0` 判为未命中（历史坏条目自动失效）；`rebuild.sh` 改 `--network host`；坏缓存逐条打印后删除。**面板侧**（本轮代码）：所有会下载瓶的 `brew install`（市场应用 / LNMP / 基础依赖 / phpMyAdmin / Miniflux / Syncthing / Colima / Qwen 与 IOPaint 的 python@3.11）统一收进 `brewInstall`，**失败即换源**：当前镜像 → 清华 tuna → 官方（`Unset HOMEBREW_API_DOMAIN`/`HOMEBREW_BOTTLE_DOMAIN`，靠 `env -u` 显式清除而不是"不设"，否则残留值会赢）；每次尝试前清掉**与本次公式/本次报错 sha256 相关**的坏包缓存（`<sha>--<formula>-<版本>` 才匹配，宁可漏删不误删 `go`/`go-task`、`python`/`python@3.11`），并把"删了什么"写进任务日志；离线模式（`OfflineOnly`）只留第 1 个源，绝不偷偷出网。教训：**降级/换源必须发生在"服务端缓存已经坏了"这条链路的每一层** —— 面板侧兜底只是冗余，镜像侧把 200+空 body 缓存下来才是事故本体；另外"上游为什么回空 body"这类问题，先比对**同一个 URL 在不同网络命名空间里**的结果，比读 brew 日志快得多。
 
+158. **预置 Python 版本不能拍脑袋：brew 装的是 formula 的**当前补丁**，而 IOPaint 把 3.12/3.13 堵死了**（2026-09-20 用户问"预置 3.11.16 是不是选错了"）→ 用户看到的是"面板预置 3.11.16，装不上"。查清三件事后才敢回答：
+    · **面板选不了补丁**：`brew install python@3.11` 装的是 formula 当前指向的补丁（3.11.16），而国内镜像**只保留当前补丁**（逐 URL 探测 3.11.0–3.11.16 × 3 家镜像共 108 个地址：只有 3.11.16 是 200，其余全 404；清华完整目录索引里也只剩 3.11.16）——所以"换一个更老的 patch 当预置"这条根本不成立。
+    · **3.11.16 现在确实有货**：中科大（IPv6）/清华/腾讯 三家都能完整下载并通过 sha256（官方 ghcr 亦可）；阿里云**只有 API 没有瓶数据**（连它自己 API 宣称的 3.11.12 也 404），已从瓶候选里排除。
+    · **换 3.12/3.13 会直接弄坏 IOPaint**：`iopaint 1.6.0`（最后一版）METADATA 硬钉 `Pillow==9.5.0`，而 Pillow 9.5.0 的 macOS arm64 wheel 只有 cp38–cp311（官方支持表："9.3–9.5 → 3.7–3.11"）；实测 3.13 上 `pip install iopaint --only-binary` 直接 `ResolutionImpossible`，放开 sdist 则 Pillow 源码构建 `KeyError: '__version__'`（PEP 667 改了 locals()），3.12 同样没有 cp312 的 macOS wheel。TTS 侧（mlx-audio）3.12/3.13 都能跑，但两条链路必须同时成立。
+    **结论与落地**：预置版本保持 `python@3.11`，并把它收成**唯一常量** `panelPythonFormula`（解释器路径 / site-packages 目录名都从它推导 —— 以前写死 `python3.11`，换版本必漏改，见 pit 159）；任务日志里如实报告 `brew list --versions` 的真实补丁版本；应用市场另上架 3.10/3.11/3.12/3.13 四个版本由用户自选（3.10/3.11 是 Intel Mac 唯一有 macOS 瓶的两个版本 —— 上游从 3.12 起不再发 Intel 瓶）；NAS 用 `tools/seed-nas-brew.sh` 预置了 4 个版本 + 依赖闭包（每个文件都验 sha256 与 `X-Cache: HIT`）。教训：**"预置哪个版本"必须同时满足"镜像有货"与"下游依赖装得上"**，缺一条都是把失败推给用户。
+
+159. **面板探测镜像只看 HTTP 200：中科大 IPv4 侧对所有 bottle 回 `200 + 0 字节`，于是坏源被判成好源**（同轮，读 Homebrew 7.0.3 源码 + curl 复现）→ 三处修正，每一处都对应一个真实故障：
+    ① **文件名必须照抄 brew 的规则**：brew 只在清单 `root_url` 形如 `https://ghcr.io/v2/…` 时才走 OCI 路径；自定义 `HOMEBREW_BOTTLE_DOMAIN` 时走**旧式平铺** `<domain>/<name>-<version>.<tag>.bottle[.<rebuild>].tar.gz`，其中 `@` 被编码成 `%40`。旧候选既漏了 `%40`、也漏了 rebuild 后缀（`python@3.12` 是 rebuild=1，文件名必须带 `.bottle.1`）→ 3.12 永远 404、整家镜像被误判不可用。另外 OCI 候选把 formula 原样塞进路径（`python@3.12`），真 brew 用的是 `python/3.12`。
+    ② **判据必须看内容**：`HEAD` 的 `Content-Length > 0`，拿不到长度就用 `Range: bytes=0-0` 真取一个字节；只有 200/206 **且有字节**才算可用。
+    ③ **瓶候选按本机架构给 tag**：Intel 机器上拿 arm64_* 去匹配永远找不到 → 所有镜像被判不可用、静默回落 ghcr.io（Intel 恰恰最需要国内镜像）。
+    顺带修掉两个同源问题：`brewEnv` 在域为空时**不再写空值变量**（Homebrew 是 Ruby，`ENV["X"]` 为空串仍算"已配置"）；`brewInstallSources` 在没探到镜像时**不再把官方源排第一**，并把"离线模式（仅走 NAS）却连自建镜像都没探到"从"偷偷走官方"改成**明确报错**（离线不许出网是硬规则）。
+
+160. **`make smoke` 长期红着没人看：本地非 root 实例根本跑不了特权步骤，而它没被跳过**（同轮，顺手修完 6 处测试侧漂移）→ 本地调试实例不是 root，建站 / nginx 校验这类步骤必然失败（实测建站返回 500「sudo: a password is required」），而 Makefile 的 `smoke` 忘了传 `ZP_SKIP_PRIV=1`（uitest 里那句"本地 make smoke 用 ZP_SKIP_PRIV=1 显式跳过"成了空话）→ 于是"反正跑不过"成了常态，**门禁形同虚设**：这一轮它连"安装卡片的按钮全没了"（我重构时把 `actions` 漏传）都差点放过。修法：`smoke` 显式传 `ZP_SKIP_PRIV=1`（跳过的步骤会逐条打印并汇总，是**如实跳过**）；同时修掉一路上被挡住的 6 处漂移，其中值得记的三类：
+    · **视图不会因为你点同一个导航项而重挂载**（hash 没变 → 不触发 hashchange）→ 桩测试必须先制造一次 hash 变化，否则等的是上一次渲染的旧数据（报"超时"而不是"数据不对"，很容易查错方向）；
+    · **`base + '/api/…'` 会拼出双斜杠**（`base` 带尾斜杠），Go 的 ServeMux 先 301 清洗路径，于是"401 判为健康"这条断言其实一直在测 301 —— 要用 `base.replace(/\/+$/,'') + path`；
+    · **上一步留下的弹窗遮罩会让下一步"点了没反应"**（Playwright 报的是 `intercepts pointer events`）→ 关键步骤前统一关干净弹窗。
+    教训：**门禁红了就要当场修，不能让它长期红着** —— 长期红的门禁等于没有门禁，而"这一步本来就坏"的假设会掩盖新引入的回归。
+

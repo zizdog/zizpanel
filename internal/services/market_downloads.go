@@ -317,7 +317,10 @@ var marketDownloadApps = []MarketApp{
 			LabelSource: "目录 ServiceLabel（与声明一致）",
 		},
 		Downloads: []MarketDownloadPoint{
-			brewBottlePoint("python@3.11", 20*time.Minute, "brew install python@3.11"),
+			// 用 panelPythonFormula 而不是字面量：声明必须跟着预置版本走，
+			// 否则换版本时会出现"代码装 3.12、声明写 3.11"的静默不一致。
+			brewBottlePoint(panelPythonFormula, 20*time.Minute,
+				"brew install "+panelPythonFormula+"（面板自研运行时的预置版本）"),
 			pipPoint("pip", 5*time.Minute, "pip install -U pip", "先把 pip 自己升到最新，避免旧 pip 解析不出新的 wheel tag"),
 			pipPoint("iopaint", 40*time.Minute, "pip install iopaint",
 				"PyPI/清华上 iopaint 只有 sdist（实测 iopaint-1.6.0.tar.gz 2,952,739 B），"+
@@ -438,7 +441,10 @@ var marketDownloadApps = []MarketApp{
 				},
 				ARM64: "shell 脚本 + git，与架构无关",
 			},
-			brewBottlePoint("python@3.11", 20*time.Minute, "brew install python@3.11"),
+			// 用 panelPythonFormula 而不是字面量：声明必须跟着预置版本走，
+			// 否则换版本时会出现"代码装 3.12、声明写 3.11"的静默不一致。
+			brewBottlePoint(panelPythonFormula, 20*time.Minute,
+				"brew install "+panelPythonFormula+"（面板自研运行时的预置版本）"),
 			pipPoint("pip", 5*time.Minute, "pip install -U pip", "只升级 pip 自己"),
 			pipPoint("mlx-audio[server]", 40*time.Minute, "pip install mlx-audio[server]",
 				"实测 mlx-audio 本身有 py3-none-any 纯 wheel；但 server extra 的依赖 webrtcvad **只有 .tar.gz、没有任何 wheel** → "+
@@ -601,6 +607,60 @@ var marketDownloadApps = []MarketApp{
 		},
 		Downloads: []MarketDownloadPoint{
 			brewBottlePoint("ffmpeg", 30*time.Minute, "brew install ffmpeg"),
+		},
+	},
+
+	// ---------------- Python 解释器（基础环境，用户 2026-09-18 要求上架 3 个版本） ----------------
+	//
+	// 三个条目走**同一条**安装路径（PanelInstaller=python，见 python_runtime.go 的
+	// InstallPythonRuntime）：brew 装 formula → 如实报告实际补丁版本 → 不注册任何服务。
+	// 为什么必须显式声明 PanelInstaller：通用 brew 流程会去 `brew services start`
+	// 一个没有 service 定义的 formula，得到"已安装但启动失败"的假警告 + 一条假服务记录。
+	{
+		ID: "python310", Kind: KindNative, BrewFormula: "python@3.10", PanelInstaller: "python",
+		NoDaemon: true,
+		Runtime: MarketRuntime{
+			Mode:        MarketRuntimeNone,
+			LabelSource: "目录 NoDaemon=true（解释器，没有常驻进程）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("python@3.10", 30*time.Minute,
+				"brew install python@3.10（Intel Mac 与老项目用；3.12/3.13 上游没有 Intel macOS 瓶）"),
+		},
+	},
+	{
+		ID: "python311", Kind: KindNative, BrewFormula: "python@3.11", PanelInstaller: "python",
+		NoDaemon: true,
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeNone,
+			LabelSource: "目录 NoDaemon=true（解释器：没有常驻进程，装完是命令行工具；" +
+				"用它建 venv 是各应用安装时的事）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("python@3.11", 30*time.Minute,
+				"brew install python@3.11（面板自研运行时 Qwen3 TTS / IOPaint 的预置版本）"),
+		},
+	},
+	{
+		ID: "python312", Kind: KindNative, BrewFormula: "python@3.12", PanelInstaller: "python",
+		NoDaemon: true,
+		Runtime: MarketRuntime{
+			Mode:        MarketRuntimeNone,
+			LabelSource: "目录 NoDaemon=true（解释器，没有常驻进程）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("python@3.12", 30*time.Minute, "brew install python@3.12"),
+		},
+	},
+	{
+		ID: "python313", Kind: KindNative, BrewFormula: "python@3.13", PanelInstaller: "python",
+		NoDaemon: true,
+		Runtime: MarketRuntime{
+			Mode:        MarketRuntimeNone,
+			LabelSource: "目录 NoDaemon=true（解释器，没有常驻进程）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("python@3.13", 30*time.Minute, "brew install python@3.13"),
 		},
 	},
 
