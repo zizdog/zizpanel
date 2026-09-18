@@ -210,6 +210,76 @@ export function FilesView(content, ctx = {}) {
     }
   }
 
+  // ---------- 列表：排序 / 图片预览 / 键盘 ----------
+  //
+  // 用户 2026-09-22："让文件管理器和编辑器变成可用的现代的工具。"
+  // 编辑器换成了 CodeMirror（见下），文件列表这边补三件最常用的：
+  //   · 点表头排序（名称/大小/时间），目录永远在前；
+  //   · 图片点开是**预览**（把图片塞进文本编辑器是最糟的默认行为）；
+  //   · 键盘：↑↓ 之外 —— Enter 打开选中项、Delete 删除选中项、Esc 取消选择，
+  //     双击行直接打开（这是所有人的肌肉记忆，之前只有"编辑"按钮能点）。
+  const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+  let sortKey = 'name';   // name | size | time
+  let sortDir = 1;        // 1 升序 / -1 降序
+
+  function isImage(entry) { return !entry.is_dir && IMAGE_EXT.test(entry.name || ''); }
+
+  function sortedEntries(list) {
+    const arr = list.slice();
+    arr.sort((a, b) => {
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1; // 目录永远排在文件前面
+      let r = 0;
+      if (sortKey === 'size') r = (a.size || 0) - (b.size || 0);
+      else if (sortKey === 'time') r = String(a.mod_time || '').localeCompare(String(b.mod_time || ''));
+      else r = String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+      if (r === 0) r = String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+      return r * sortDir;
+    });
+    return arr;
+  }
+
+  function sortHeader(key, text) {
+    const on = sortKey === key;
+    return h('th', [
+      h('button.btn.btn-sm', {
+        text: text + (on ? (sortDir > 0 ? ' ▲' : ' ▼') : ''),
+        title: '按' + text + '排序（再点一次反向）',
+        style: { padding: '2px 6px', fontSize: '12px' },
+        onclick: () => {
+          if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = 1; }
+          renderTable();
+        },
+      }),
+    ]);
+  }
+
+  // openAny 是按文件类型选动作的唯一入口：图片 → 预览，其余 → 文本编辑器。
+  function openAny(entry) {
+    if (isImage(entry)) previewImage(entry);
+    else openEditor(entry);
+  }
+
+  function previewImage(entry) {
+    const url = api.fileDownloadURL(entry.path);
+    const m = modal({
+      title: '🖼️ ' + entry.name,
+      wide: true,
+      body: h('div', { style: { textAlign: 'center' } }, [
+        h('img', {
+          src: url, alt: entry.name,
+          style: { maxWidth: '100%', maxHeight: '68vh', borderRadius: '6px', background: 'var(--panel-2)' },
+          onerror: () => toast('图片加载失败（可能不是浏览器支持的格式）', 'warn', 8000),
+        }),
+        h('div.hint', { style: { marginTop: '8px' }, text: `${humanSize(entry.size)} · ${entry.path}` }),
+      ]),
+      footer: () => [
+        h('button.btn', { text: '下载', onclick: () => { window.location.href = url; } }),
+        h('button.btn', { text: '仍然用文本编辑器打开', onclick: () => { m.close(); openEditor(entry); } }),
+        h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() }),
+      ],
+    });
+  }
+
   function renderToolbar() {
     clear(toolbar);
     const selCount = selection.size;
@@ -286,17 +356,25 @@ export function FilesView(content, ctx = {}) {
           },
         }),
       ]),
-      h('th', { text: '名称' }),
-      h('th', { text: '大小' }),
+      sortHeader('name', '名称'),
+      sortHeader('size', '大小'),
       h('th', { text: '权限' }),
       h('th', { text: '属主' }),
-      h('th', { text: '修改时间' }),
+      sortHeader('time', '修改时间'),
       h('th', { text: '操作' }),
     ]);
 
-    const rows = list.map((e) => {
+    const rows = sortedEntries(list).map((e) => {
       const selected = selection.has(e.path);
-      return h('tr', { style: selected ? { background: 'var(--brand-soft)' } : {} }, [
+      return h('tr', {
+        style: selected ? { background: 'var(--brand-soft)' } : {},
+        // 双击行 = 打开（目录进入 / 文件编辑或预览）；单击仍然是勾选/点链接。
+        // 这是所有文件管理器的通用肌肉记忆，之前只有"编辑"按钮能点。
+        ondblclick: (ev) => {
+          if (ev.target && ev.target.tagName === 'INPUT') return; // 别抢勾选框
+          if (e.is_dir) load(e.path); else openAny(e);
+        },
+      }, [
         h('td', [
           h('input', {
             type: 'checkbox', checked: selected,
@@ -316,8 +394,8 @@ export function FilesView(content, ctx = {}) {
               })
               : h('a', {
                 href: 'javascript:void(0)', text: e.name,
-                title: '点击编辑',
-                onclick: () => openEditor(e),
+                title: isImage(e) ? '点击预览' : '点击编辑（双击也可以）',
+                onclick: () => openAny(e),
               }),
             e.symlink ? h('span.pill', { text: '链接', title: '指向 ' + (e.symlink_target || '?') }) : null,
             e.read_only ? h('span.pill.warn', { text: '只读' }) : null,
@@ -331,7 +409,10 @@ export function FilesView(content, ctx = {}) {
           h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, [
             e.is_dir
               ? h('button.btn.btn-sm', { text: '打开', onclick: () => load(e.path) })
-              : h('button.btn.btn-sm', { text: '编辑', onclick: () => openEditor(e) }),
+              : h('button.btn.btn-sm', {
+                text: isImage(e) ? '预览' : '编辑',
+                onclick: () => openAny(e),
+              }),
             h('button.btn.btn-sm', {
               text: '下载',
               disabled: e.is_dir,
@@ -1127,666 +1208,327 @@ export function FilesView(content, ctx = {}) {
     setTimeout(() => query.focus(), 60);
   }
 
-  registerCleanup(() => { });
+  // 键盘：Enter 打开选中项、Delete 删除选中项、Esc 取消选择。
+  // 输入框/弹窗里有焦点时一律不接管（否则在搜索框里按 Delete 会删文件）。
+  function onKeyDown(e) {
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return;
+    if (document.querySelector('.modal-mask')) return;
+    if (e.key === 'Escape' && selection.size) {
+      selection.clear(); renderToolbar(); renderTable(); return;
+    }
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selection.size) {
+      e.preventDefault(); deleteSelected(); return;
+    }
+    if (e.key === 'Enter' && selection.size) {
+      const list = lastList?.entries || [];
+      const first = list.find((x) => selection.has(x.path));
+      if (!first) return;
+      e.preventDefault();
+      if (first.is_dir) load(first.path); else openAny(first);
+    }
+  }
+  document.addEventListener('keydown', onKeyDown);
+  registerCleanup(() => { document.removeEventListener('keydown', onKeyDown); });
   load(cwd || undefined);
 }
 
 // ============================================================================
-//  在线编辑器：透明 textarea + 高亮层
+//  在线编辑器（内嵌 CodeMirror 5，MIT）
+//
+//  为什么不再自己写（用户 2026-09-22 授权："让文件管理器和编辑器变成可用的现代
+//  的工具，写不好可以直接引入开源项目。"）：
+//  这里原来是一套自研的"透明 textarea + 高亮层"。字体、行高、内边距、Tab 宽度
+//  任何一处不一致就会错位，而它真的错了两次且都是用户先发现的：
+//    · 光标与文字逐列错开 —— 浏览器 UA 给 `<code>` 写死了 font-family: monospace，
+//      直接作用在元素上的规则压过继承，两层字宽不一致；
+//    · 第一次点进编辑区光标被拉到开头 —— focus 处理器里改了选区。
+//  这类"自己维护一个文本编辑器"的账越滚越大，而 CodeMirror 5 是成熟稳定的选择：
+//  光标/选区/撤销重做、查找替换、括号匹配、自动缩进、代码折叠、大文件视口渲染
+//  全部现成，且是**单文件 UMD + 按需模式**，不需要任何构建步骤就能嵌进面板。
+//
+//  按需加载：CodeMirror 本体 + 语言模式约 470KB，只有真的打开编辑器时才加载，
+//  不让它拖慢面板首屏（仪表盘/文件列表根本用不到）。
+//  许可证与来源见 assets/vendor/codemirror/README.md（文件未做任何修改）。
 // ============================================================================
-//
-// 做法：一个 <pre> 放彩色高亮结果，一个 <textarea> 叠在它上面负责真正的输入；
-// textarea 的文字设成透明、只留光标，看起来就像在"直接编辑彩色代码"。
-//
-// 为什么不用 contenteditable：输入法、选区、撤销、光标位置全都要自己实现，
-// textarea 是浏览器白送的、行为最稳的输入控件。代价是两层必须逐像素对齐 ——
-// 字体、字号、行高、内边距、边框宽度、tab 宽度任何一项不一致都会错位，
-// 所以这些属性统一由 zpfTextStyle() 提供，两层共用同一份。
 
-const HL_MAX_CHARS = 200 * 1024; // 超过 200KB 直接跳过高亮：整篇重新分词的开销随体积线性增长，几 MB 的日志会把页面冻住
-const HL_MAX_TOKENS = 20000;     // 片段上限：压缩过的单行代码能在一屏里产生几万个 token，超了同样退回纯文本
-const LN_MAX = 20000;            // 行号上限：全换行的 2MB 文件能有上百万行，拼行号字符串会拖死输入
-const ZPF_FONT_SIZE = 13;
-const ZPF_LINE_HEIGHT = 20;
-const ZPF_PAD = '10px 12px';
-const ZPF_CSS_ID = 'zpf-editor-style';
-
-// ---------------- 编辑器配色（跟随面板 / Monokai） ----------------
-//
-// 编辑器是面板里唯一的"长时间盯着的代码界面"，所以给它一套**独立于面板主题**的配色。
-// 两档：跟随面板（默认，行为与以前完全一致）/ Monokai（经典取值，深色）。
-// 选择要持久化 —— 每次打开文件都要重选一次的话这个开关就等于没有。
-// 键名刻意与面板主题 'zp-theme'、应用市场筛选 'zp-market-kind-filter' 区分开，
-// 互不覆盖：改编辑器配色不该把面板切到深色，反之亦然。
-const ZPF_THEME_KEY = 'zp-file-editor-theme';
-const ZPF_THEME_PANEL = 'panel';     // 跟随面板（浅色/深色都走原来的规则）
-const ZPF_THEME_MONOKAI = 'monokai';
-
-function readEditorTheme() {
-  // localStorage 在隐私模式/被禁用时会抛异常，读不到就退回默认值
-  try {
-    return localStorage.getItem(ZPF_THEME_KEY) === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
-  } catch { return ZPF_THEME_PANEL; }
-}
-
-function saveEditorTheme(v) {
-  try { localStorage.setItem(ZPF_THEME_KEY, v); } catch { /* 存不了就算了，本次会话仍然生效 */ }
-}
-
-/**
- * applyEditorThemeTo(el, v) —— 把配色作用到弹窗根节点。
- * 只加/去一个类，样式全在 ensureEditorStyle() 注入的 CSS 里。
- * 不动 :root，所以面板主题不受影响，同页面其它弹窗也不会被带成黑底。
- */
-function applyEditorThemeTo(el, v) {
-  if (el) el.classList.toggle('zpf-monokai', v === ZPF_THEME_MONOKAI);
-}
-
-function zpfTextStyle() {
-  return {
-    fontFamily: 'var(--mono)',
-    fontSize: ZPF_FONT_SIZE + 'px',
-    lineHeight: ZPF_LINE_HEIGHT + 'px',
-    fontWeight: '400',
-    letterSpacing: 'normal',
-    tabSize: '4',
-    whiteSpace: 'pre',               // 必须 pre：pre-wrap 会折行，折行后行号槽和高亮层必然错位
-    padding: ZPF_PAD,
-    border: '1px solid transparent', // 透明边框占位：textarea 自带 1px 边框，高亮层不补就会差 1px
-    margin: '0',
-  };
-}
-
-// 扩展名 → 语言。任务里要求的语言集，不认识的一律纯文本。
+// 扩展名 → 语言键。语言键再映射到 CodeMirror 的模式与依赖文件。
 const EXT_LANG = {
-  php: 'php',
-  js: 'js', mjs: 'js', cjs: 'js',
-  ts: 'ts',
+  php: 'php', phtml: 'php',
+  js: 'js', mjs: 'js', cjs: 'js', jsx: 'js',
+  ts: 'ts', tsx: 'ts',
   json: 'json',
   go: 'go',
   py: 'py',
   sh: 'sh', bash: 'sh', zsh: 'sh',
   yaml: 'yaml', yml: 'yaml',
   html: 'html', htm: 'html',
-  css: 'css',
+  css: 'css', scss: 'css', less: 'css',
   sql: 'sql',
-  ini: 'ini', conf: 'ini', cnf: 'ini',
-  md: 'md',
+  ini: 'ini', conf: 'ini', cnf: 'ini', properties: 'ini', env: 'ini',
+  md: 'md', markdown: 'md',
+  xml: 'xml', svg: 'xml',
+  dockerfile: 'docker',
 };
 
-const LANG_LABEL = {
-  php: 'PHP', js: 'JavaScript', ts: 'TypeScript', json: 'JSON', go: 'Go',
-  py: 'Python', sh: 'Shell', yaml: 'YAML', html: 'HTML', css: 'CSS',
-  sql: 'SQL', ini: 'INI', md: 'Markdown',
+// 每种语言：给用户看的名字 + CodeMirror 的 mode + 需要按顺序加载的模式文件。
+//
+// 依赖关系不能省：php 模式依赖 xml + javascript + css + htmlmixed + clike，
+// htmlmixed 又依赖 xml + javascript + css —— 少加载一个，CodeMirror 会**静默**
+// 退化成纯文本（控制台只留一行 undefined 模式名），用户看到的是"高亮没了"。
+const CM_LANGS = {
+  php: { label: 'PHP', mode: 'application/x-httpd-php', deps: ['xml', 'javascript', 'css', 'htmlmixed', 'clike', 'php'] },
+  js: { label: 'JavaScript', mode: 'javascript', deps: ['javascript'] },
+  ts: { label: 'TypeScript', mode: 'javascript', deps: ['javascript'] },
+  json: { label: 'JSON', mode: { name: 'javascript', json: true }, deps: ['javascript'] },
+  go: { label: 'Go', mode: 'go', deps: ['go'] },
+  py: { label: 'Python', mode: 'python', deps: ['python'] },
+  sh: { label: 'Shell', mode: 'shell', deps: ['shell'] },
+  yaml: { label: 'YAML', mode: 'yaml', deps: ['yaml'] },
+  html: { label: 'HTML', mode: 'htmlmixed', deps: ['xml', 'javascript', 'css', 'htmlmixed'] },
+  xml: { label: 'XML', mode: 'xml', deps: ['xml'] },
+  css: { label: 'CSS', mode: 'css', deps: ['css'] },
+  sql: { label: 'SQL', mode: 'sql', deps: ['sql'] },
+  ini: { label: 'INI / 配置', mode: 'properties', deps: ['properties'] },
+  md: { label: 'Markdown', mode: 'markdown', deps: ['markdown'] },
+  nginx: { label: 'Nginx', mode: 'text/x-nginx-conf', deps: ['nginx'] },
+  docker: { label: 'Dockerfile', mode: 'text/x-dockerfile', deps: ['dockerfile'] },
 };
 
-// 语法规则：每种语言是一组 [组名, 正则源]，运行时拼成一条带命名分组的 alternation。
-// 顺序 = 优先级：注释/字符串必须排在关键字前面。整篇只跑一次 exec 循环，
-// 不能对每个 token 各来一遍 replace —— 那样既慢，又会让后一遍把前一遍的结果套娃。
-const RE_C_COM = String.raw`\/\/[^\n]*|\/\*[\s\S]*?\*\/`;
-const RE_HASH_COM = String.raw`#[^\n]*`;
-const RE_STR_DQ = String.raw`"(?:\\.|[^"\\\n])*"`;
-const RE_STR_SQ = String.raw`'(?:\\.|[^'\\\n])*'`;
-const RE_STR_JS = String.raw`\x60(?:\\.|[^\x60\\])*\x60|` + RE_STR_DQ + '|' + RE_STR_SQ;
-const RE_NUM = String.raw`\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)`;
-const RE_FN_CALL = String.raw`[A-Za-z_$][\w$]*(?=\s*\()`;
-const RE_TYPE_NAME = String.raw`\b[A-Z][A-Za-z0-9_$]*\b`;
-
-function kwRe(words) { return String.raw`\b(?:` + words + String.raw`)\b`; }
-
-const JS_KW = 'break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|static|super|switch|this|throw|try|typeof|var|void|while|with|yield|async|await|true|false|null|undefined|get|set';
-const TS_KW = JS_KW + '|interface|type|enum|implements|declare|namespace|abstract|public|private|protected|readonly|as|satisfies|keyof|infer|is|asserts|never|unknown|any|string|number|boolean|object|symbol|bigint|override';
-const GO_KW = 'break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var|nil|true|false|iota|make|new|len|cap|append|copy|delete|panic|recover';
-const PY_KW = 'and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|True|False|None|self';
-const SH_KW = 'if|then|else|elif|fi|for|while|until|do|done|case|esac|function|return|in|local|export|readonly|declare|source|alias|unset|shift|exit|eval|exec|trap|set|echo|printf|test|break|continue|true|false';
-const SQL_KW = 'select|from|where|insert|into|values|update|set|delete|create|table|drop|alter|add|index|view|join|left|right|inner|outer|on|group|by|order|having|limit|offset|union|all|distinct|as|and|or|not|null|is|like|between|exists|count|sum|avg|min|max|case|when|then|else|end|primary|key|foreign|references|default|unique|begin|commit|rollback|with|desc|asc';
-const PHP_KW = 'abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|do|echo|else|elseif|empty|enddeclare|endfor|endforeach|endif|endswitch|endwhile|enum|eval|exit|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null|this|parent|self';
-
-function jsLike(kw) {
-  return {
-    flags: 'g',
-    rules: [
-      ['com', RE_C_COM],
-      ['str', RE_STR_JS],
-      ['num', RE_NUM],
-      ['kw', kwRe(kw)],
-      ['fn', RE_FN_CALL],
-      ['typ', RE_TYPE_NAME],
-    ],
-  };
+// langKeyFor 判断某个文件名该用哪种语言（认不出来的返回空 = 纯文本）。
+//
+// 文件名判据优先于扩展名：`nginx.conf` / `Dockerfile` 都没有可用的扩展名，
+// 只看后缀会把它们当纯文本 —— 而这两种恰恰是面板里最常改的文件。
+function langKeyFor(name) {
+  const base = String(name || '').split('/').pop().toLowerCase();
+  if (base === 'dockerfile' || base.startsWith('dockerfile.')) return 'docker';
+  if (base === 'nginx.conf' || /\.nginx$/.test(base)) return 'nginx';
+  const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1) : '';
+  return EXT_LANG[ext] || '';
 }
 
-const LANG_DEFS = {
-  js: jsLike(JS_KW),
-  ts: jsLike(TS_KW),
-  json: {
-    flags: 'g',
-    rules: [
-      // 键名单独一色：JSON 里 "key": 和普通字符串靠这个区分
-      ['key', String.raw`"(?:\\.|[^"\\\n])*"(?=\s*:)`],
-      ['str', RE_STR_DQ],
-      ['num', RE_NUM],
-      ['kw', kwRe('true|false|null')],
-    ],
-  },
-  php: {
-    flags: 'g',
-    rules: [
-      // `#(?!\[)`：PHP 8 的属性语法 `#[Attr]` 不是注释，不能吃掉整行
-      ['com', String.raw`\/\/[^\n]*|\/\*[\s\S]*?\*\/|#(?!\[)[^\n]*`],
-      ['str', RE_STR_DQ + '|' + RE_STR_SQ],
-      ['vr', String.raw`\$[A-Za-z_]\w*`],
-      ['num', RE_NUM],
-      ['kw', kwRe(PHP_KW)],
-      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
-      ['typ', RE_TYPE_NAME],
-    ],
-  },
-  go: {
-    flags: 'g',
-    rules: [
-      ['com', RE_C_COM],
-      ['str', String.raw`\x60[^\x60]*\x60` + '|' + RE_STR_DQ + '|' + RE_STR_SQ],
-      ['num', RE_NUM],
-      ['kw', kwRe(GO_KW)],
-      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
-      ['typ', RE_TYPE_NAME],
-    ],
-  },
-  py: {
-    flags: 'g',
-    rules: [
-      ['com', RE_HASH_COM],
-      ['str', String.raw`[rRbBuUfF]{0,2}(?:"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')`],
-      ['num', RE_NUM],
-      ['kw', kwRe(PY_KW)],
-      ['fn', String.raw`[A-Za-z_]\w*(?=\s*\()`],
-      ['typ', RE_TYPE_NAME],
-    ],
-  },
-  sh: {
-    flags: 'g',
-    rules: [
-      ['com', RE_HASH_COM],
-      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
-      ['vr', String.raw`\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|\$[0-9@*#?$!-]`],
-      ['num', String.raw`\b\d+\b`],
-      ['kw', kwRe(SH_KW)],
-      ['fn', String.raw`[A-Za-z_][\w-]*(?=\s*\(\s*\))`],
-    ],
-  },
-  yaml: {
-    flags: 'gm',
-    rules: [
-      ['com', RE_HASH_COM],
-      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
-      ['key', String.raw`^[ \t]*-?[ \t]*[A-Za-z_][\w .-]*(?=:)`],
-      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
-      ['kw', kwRe('true|false|null|yes|no|on|off|True|False|Null|Yes|No|On|Off')],
-    ],
-  },
-  html: {
-    flags: 'gi',
-    rules: [
-      ['com', String.raw`<!--[\s\S]*?-->`],
-      ['imp', String.raw`<!doctype[^>]*>`],
-      ['tag', String.raw`<\/?[a-z][\w:-]*`],
-      ['attr', String.raw`[a-z_:][\w:.-]*(?=\s*=)`],
-      ['str', String.raw`"[^"\n]*"|'[^'\n]*'`],
-    ],
-  },
-  css: {
-    flags: 'g',
-    rules: [
-      ['com', String.raw`\/\*[\s\S]*?\*\/`],
-      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
-      ['at', String.raw`@[a-zA-Z-]+`],
-      ['imp', String.raw`!important\b`],
-      ['num', String.raw`#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|vmin|vmax|%|s|ms|deg|fr|ch)?`],
-      ['fn', String.raw`[a-zA-Z-]+(?=\()`],
-    ],
-  },
-  sql: {
-    flags: 'gi',
-    rules: [
-      ['com', String.raw`--[^\n]*|\/\*[\s\S]*?\*\/`],
-      ['str', String.raw`'(?:''|[^'])*'|"(?:""|[^"])*"`],
-      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
-      ['kw', kwRe(SQL_KW)],
-      ['fn', String.raw`[a-z_]\w*(?=\s*\()`],
-    ],
-  },
-  ini: {
-    flags: 'gim',
-    rules: [
-      ['com', String.raw`[;#][^\n]*`],
-      ['sec', String.raw`^[ \t]*\[[^\]\n]*\]`],
-      ['str', RE_STR_DQ + '|' + String.raw`'[^'\n]*'`],
-      ['key', String.raw`^[ \t]*[A-Za-z_][\w.-]*(?=\s*[=:])`],
-      ['num', String.raw`\b\d+(?:\.\d+)?\b`],
-      ['kw', kwRe('true|false|yes|no|on|off|null')],
-    ],
-  },
-  md: {
-    flags: 'gm',
-    rules: [
-      ['com', String.raw`<!--[\s\S]*?-->`],
-      ['hd', String.raw`^#{1,6}[^\n]*`],
-      ['delim', String.raw`^[ \t]*(?:\x60{3,}|~{3,})[^\n]*`],
-      ['code', String.raw`\x60[^\x60\n]+\x60`],
-      ['bold', String.raw`\*\*[^*\n]+\*\*|__[^_\n]+__`],
-      ['link', String.raw`!?\[[^\]\n]*\]\([^)\n]*\)`],
-      ['kw', String.raw`^[ \t]{0,3}(?:[-*+]|\d+\.)[ \t]|^[ \t]{0,3}>[ \t]?`],
-    ],
-  },
-};
+// ---------------- 资源按需加载 ----------------
+//
+// 为什么自己写 <script> 注入而不是 `import()`：CodeMirror 5 是 UMD 包，
+// 它把 CodeMirror 挂到 window 上；`import()` 一个 UMD 文件拿到的是它的
+// module.exports，而模式/插件文件之间靠**全局 CodeMirror**互相注册 ——
+// 混用两条路径会让插件注册到另一个实例上，表现为"模式加载了但没生效"。
+const CM_ASSET_BASE = new URL('../vendor/codemirror/', import.meta.url);
+const CM_CORE_CSS = [
+  'codemirror.min.css',
+  'addon/dialog/dialog.min.css',
+  'addon/fold/foldgutter.min.css',
+  'addon/scroll/simplescrollbars.min.css',
+];
+const CM_CORE_JS = [
+  'codemirror.min.js',
+  'addon/search/searchcursor.min.js',
+  'addon/search/search.min.js',
+  'addon/search/jump-to-line.min.js',
+  'addon/dialog/dialog.min.js',
+  'addon/edit/matchbrackets.min.js',
+  'addon/edit/closebrackets.min.js',
+  'addon/edit/continuelist.min.js',
+  'addon/edit/matchtags.min.js',
+  'addon/fold/foldcode.min.js',
+  'addon/fold/foldgutter.min.js',
+  'addon/fold/brace-fold.min.js',
+  'addon/fold/xml-fold.min.js',
+  'addon/fold/comment-fold.min.js',
+  'addon/fold/indent-fold.min.js',
+  'addon/selection/active-line.min.js',
+  'addon/scroll/simplescrollbars.min.js',
+  'addon/comment/comment.min.js',
+];
 
-// 组名 → 注入样式里的类名
-const TOKEN_CLASS = {
-  com: 'zpf-com', str: 'zpf-str', num: 'zpf-num', kw: 'zpf-kw', fn: 'zpf-fn',
-  typ: 'zpf-typ', vr: 'zpf-vr', key: 'zpf-key', tag: 'zpf-tag', attr: 'zpf-attr',
-  at: 'zpf-at', imp: 'zpf-imp', hd: 'zpf-hd', link: 'zpf-link', sec: 'zpf-sec',
-  code: 'zpf-str', bold: 'zpf-b', delim: 'zpf-com',
-};
+const cmAssetLoaded = new Set();
+let cmCorePromise = null;
 
-const ZPF_REGEX = new Map();
-
-function langRegex(lang) {
-  let re = ZPF_REGEX.get(lang);
-  if (re) return re;
-  const def = LANG_DEFS[lang];
-  if (!def) return null;
-  re = new RegExp(def.rules.map(([name, src]) => `(?<${name}>${src})`).join('|'), def.flags || 'g');
-  ZPF_REGEX.set(lang, re);
-  return re;
+function cmLoadOne(url, isCss) {
+  if (cmAssetLoaded.has(url)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const el = isCss
+      ? Object.assign(document.createElement('link'), { rel: 'stylesheet', href: url })
+      : Object.assign(document.createElement('script'), { src: url, async: false });
+    el.onload = () => { cmAssetLoaded.add(url); resolve(); };
+    el.onerror = () => reject(new Error('加载编辑器资源失败：' + url));
+    document.head.appendChild(el);
+  });
 }
 
-/** paintHighlight(frag, text, lang) -> token 数：把文本切成"纯文本 + 上色 span"塞进 frag。 */
-function paintHighlight(frag, text, lang) {
-  const re = langRegex(lang);
-  if (!re) return 0;
-  re.lastIndex = 0;
-  let last = 0;
-  let count = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const tok = m[0];
-    // 零宽匹配会让 exec 原地踏步、死循环；正则都要求至少一个字符，这里只是兜底
-    if (!tok.length) { re.lastIndex++; continue; }
-    if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-    const g = m.groups || {};
-    let cls = '';
-    for (const k in g) { if (g[k] !== undefined) { cls = TOKEN_CLASS[k] || ''; break; } }
-    frag.appendChild(cls ? h('span', { class: cls, text: tok }) : document.createTextNode(tok));
-    last = m.index + tok.length;
-    count++;
+// ensureCodeMirror 保证本体与插件就绪（同一个 Promise 只加载一次；失败不缓存，
+// 下次打开还能重试 —— 缓存失败的 Promise 会让编辑器"永远打不开"）。
+function ensureCodeMirror() {
+  if (!cmCorePromise) {
+    cmCorePromise = (async () => {
+      for (const f of CM_CORE_CSS) await cmLoadOne(new URL(f, CM_ASSET_BASE).href, true);
+      // 顺序加载 JS：插件依赖全局 CodeMirror，异步并行会让插件先于本体执行
+      for (const f of CM_CORE_JS) await cmLoadOne(new URL(f, CM_ASSET_BASE).href, false);
+      if (!window.CodeMirror) throw new Error('CodeMirror 已加载但没有挂上 window.CodeMirror');
+      ensureEditorStyle();
+    })().catch((e) => { cmCorePromise = null; throw e; });
   }
-  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-  return count;
+  return cmCorePromise;
 }
 
-/** langOf(name) -> 语言 id，不认识的返回 ''（纯文本）。 */
-function langOf(name) {
-  const m = /\.([A-Za-z0-9]+)$/.exec(String(name));
-  return m ? (EXT_LANG[m[1].toLowerCase()] || '') : '';
+// ensureLang 按依赖顺序加载该语言需要的模式文件（模式之间也有依赖，见 CM_LANGS）。
+async function ensureLang(langKey) {
+  const def = CM_LANGS[langKey];
+  if (!def) return;
+  for (const m of def.deps) {
+    await cmLoadOne(new URL(`mode/${m}.min.js`, CM_ASSET_BASE).href, false);
+  }
 }
 
-function countLines(text) {
-  let n = 1;
-  for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) n++;
-  return n;
+// ---------------- 配色 ----------------
+//
+// 两档：跟随面板（默认）/ Monokai。键名沿用旧版：用户已经选过的偏好不该丢。
+const ZPF_THEME_KEY = 'zp-file-editor-theme';
+const ZPF_THEME_PANEL = 'panel';
+const ZPF_THEME_MONOKAI = 'monokai';
+const ZPF_CSS_ID = 'zpf-editor-style';
+
+function readEditorTheme() {
+  try {
+    return localStorage.getItem(ZPF_THEME_KEY) === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
+  } catch { return ZPF_THEME_PANEL; }
 }
 
-// 行号文本按"行数"缓存：输入时行数通常没变，没必要每次重新拼几万个数
-let zpfLnKey = -1;
-let zpfLnText = '';
-function lineNumbers(n) {
-  if (n === zpfLnKey) return zpfLnText;
-  const arr = new Array(n);
-  for (let i = 0; i < n; i++) arr[i] = i + 1;
-  zpfLnKey = n;
-  zpfLnText = arr.join('\n');
-  return zpfLnText;
+function saveEditorTheme(v) {
+  try { localStorage.setItem(ZPF_THEME_KEY, v); } catch { /* 存不了就本次会话生效 */ }
 }
 
-// 面板禁止改 CSS 文件，所以编辑器自己的样式在这里注入一次。
-// 只能用 textContent 赋值：面板禁止一切 HTML 字符串注入，样式表也不例外。
+function applyEditorThemeTo(el, v) {
+  if (el) el.classList.toggle('zpf-monokai', v === ZPF_THEME_MONOKAI);
+}
+
+// ensureEditorStyle 注入编辑器自己的样式（只注入一次）。
+//
+// 面板主题变量（--text / --panel-2 / …）两套主题都定义好了，这里只把 CodeMirror
+// 的类名映射过去，所以浅色/深色/Monokai 三种外观都不需要各写一份。
 function ensureEditorStyle() {
   if (document.getElementById(ZPF_CSS_ID)) return;
   const st = document.createElement('style');
   st.id = ZPF_CSS_ID;
   st.textContent = [
-    '.zpf-code, .zpf-lines { margin: 0; transform-origin: 0 0; will-change: transform; }',
-    // <code> 默认是 inline，而 transform 对 inline 元素无效 —— 不改成 block 滚动同步会静默失效
-    '.zpf-code { display: block; }',
-    // ⚠️ 必须显式 inherit 字体，否则高亮层和输入层**不是同一个字体**。
-    //
-    // 根因（2026-09-22 用户报障："光标严重偏移"）：浏览器 UA 样式表给 `code` 元素
-    // 直接写了 `font-family: monospace`，而**直接作用在元素上的规则压过从父节点继承**
-    // —— 于是外层 <pre>（我们内联设了 var(--mono)，即 ui-monospace / SF Mono…）
-    // 里的那个 <code class="zpf-code"> 实际用的是通用 monospace。
-    // 两种等宽字体的字符宽度不一样：textarea 里画的光标按 SF Mono 的列宽走，
-    // 屏幕上的字却按通用 monospace 的列宽排 —— 逐列错开，行越长偏得越多。
-    '.zpf-code { font: inherit; letter-spacing: inherit; }',
-    // 输入层的文字永远不可见（高亮层负责显示），否则会出现"双层文字"；
-    // ::selection 也要一起处理：某些浏览器选中时会用默认高亮前景色把文字显出来
-    '.zpf-ta { color: transparent !important; -webkit-text-fill-color: transparent; caret-color: var(--text); background: transparent !important; }',
-    '.zpf-ta::selection { background: rgba(96,165,250,.35); color: transparent; -webkit-text-fill-color: transparent; }',
-    // 纯文本模式（大文件 / 不认识的语言 / 代码过密）让 textarea 自己显示文字
-    '.zpf-ta.zpf-plain { color: var(--text) !important; -webkit-text-fill-color: var(--text); }',
-    // 查找命中层：整层文字透明，只留 <mark> 的背景色块，所以它既可以垫在
-    // 高亮模式（彩色文字）下面，也可以垫在纯文本模式（textarea 自己显示文字）下面。
-    // color 必须显式写：mark 的 UA 样式会带上 MarkText 前景色，不覆盖就会把
-    // 下面那层的字盖成不透明色块后的另一种颜色。
-    '.zpf-hitbox { color: transparent; pointer-events: none; }',
-    '.zpf-hit, .zpf-hit-cur { color: transparent; padding: 0; margin: 0; border-radius: 2px; }',
-    '.zpf-hit { background: rgba(250, 204, 21, .30); }',
-    '.zpf-hit-cur { background: rgba(249, 115, 22, .70); box-shadow: 0 0 0 1px rgba(249, 115, 22, .85); }',
-    ':root[data-theme="light"] .zpf-hit { background: rgba(234, 179, 8, .40); }',
-    ':root[data-theme="light"] .zpf-hit-cur { background: rgba(249, 115, 22, .55); }',
-    '.zpf-fcount { display: inline-block; min-width: 54px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }',
-    '.zpf-editor:fullscreen, .zpf-editor:-webkit-full-screen { border: none; border-radius: 0; }',
-    '.zpf-com { color: #6b7688; font-style: italic; }',
-    // 注意别把 .zpf-code（高亮层容器）写进着色规则：它一上色，所有未被 token 命中的
-    // 普通文本（标识符、运算符、括号）都会跟着变绿，看起来整篇都是字符串
-    '.zpf-str { color: #86d99a; }',
-    '.zpf-num { color: #f0a868; }',
-    '.zpf-kw, .zpf-at, .zpf-sec { color: #c792ea; }',
-    '.zpf-fn, .zpf-key { color: #6fb3f2; }',
-    '.zpf-typ { color: #4ec9b0; }',
-    '.zpf-vr, .zpf-attr { color: #e2b96b; }',
-    '.zpf-tag, .zpf-imp { color: #f07178; }',
-    '.zpf-hd { color: #6fb3f2; font-weight: 600; }',
-    '.zpf-link { color: #6fb3f2; text-decoration: underline; }',
-    '.zpf-b { color: #c792ea; font-weight: 600; }',
-    ':root[data-theme="light"] .zpf-com { color: #8a93a3; }',
-    ':root[data-theme="light"] .zpf-str { color: #15803d; }',
-    ':root[data-theme="light"] .zpf-num { color: #b45309; }',
-    ':root[data-theme="light"] .zpf-kw, :root[data-theme="light"] .zpf-at, :root[data-theme="light"] .zpf-sec, :root[data-theme="light"] .zpf-b { color: #7c3aed; }',
-    ':root[data-theme="light"] .zpf-fn, :root[data-theme="light"] .zpf-key, :root[data-theme="light"] .zpf-hd, :root[data-theme="light"] .zpf-link { color: #1d4ed8; }',
-    ':root[data-theme="light"] .zpf-typ { color: #0f766e; }',
-    ':root[data-theme="light"] .zpf-vr, :root[data-theme="light"] .zpf-attr { color: #a16207; }',
-    ':root[data-theme="light"] .zpf-tag, :root[data-theme="light"] .zpf-imp { color: #b91c1c; }',
-
-    // ---------------- Monokai（只作用于编辑器弹窗） ----------------
-    //
-    // 面板全局只有浅色/深色两套，编辑器要的是第三套**互不干扰**的配色，所以不去动
-    // :root，而是挂在编辑器自己的弹窗根节点 .zpf-monokai 上。用户没选 Monokai 时
-    // 这条规则完全不参与匹配，浅色/深色下的观感与以前逐像素一致。
-    //
-    // 重定义面板变量而不是逐个覆盖内联样式：编辑器的背景、行号槽、查找条背景的内联
-    // 样式里写的都是 var(--xxx)（见 editorModal），变量在这里被重定义后它们自动跟着变；
-    // 面板对这些元素没有 !important，且正文文字在编辑器里本来就由高亮层画，
-    // 所以只用 .zpf-monokai 这一个类就能整套换色。
-    '.zpf-monokai {',
-    '  --bg-soft: #272822; --panel: #272822; --panel-2: #34352c;',
+    // 编辑器高度铺满外层容器（CodeMirror 需要一个有高度的父元素）
+    '.zpf-cm { position: relative; display: flex; flex-direction: column; min-height: 0; }',
+    '.zpf-cm .CodeMirror { flex: 1 1 auto; height: auto; min-height: 0; font-family: var(--mono); font-size: 13px; line-height: 1.6; background: var(--bg-soft); color: var(--text); }',
+    '.zpf-cm .CodeMirror-gutters { background: var(--panel-2); border-right: 1px solid var(--border-soft); }',
+    '.zpf-cm .CodeMirror-linenumber { color: var(--text-mute); }',
+    '.zpf-cm .CodeMirror-cursor { border-left: 2px solid var(--text); }',
+    '.zpf-cm .CodeMirror-selected { background: rgba(96,165,250,.30) !important; }',
+    '.zpf-cm .CodeMirror-activeline-background { background: rgba(127,127,127,.08); }',
+    '.zpf-cm .CodeMirror-matchingbracket { color: #16a34a !important; font-weight: 700; }',
+    '.zpf-cm .CodeMirror-nonmatchingbracket { color: #dc2626 !important; }',
+    '.zpf-cm .CodeMirror-foldmarker { color: var(--brand); }',
+    // 面板主题下的语法着色（沿用旧版配色，视觉上与升级前一致）
+    '.cm-s-zp-panel .cm-comment { color: #6b7688; font-style: italic; }',
+    '.cm-s-zp-panel .cm-string, .cm-s-zp-panel .cm-string-2 { color: #86d99a; }',
+    '.cm-s-zp-panel .cm-number { color: #f0a868; }',
+    '.cm-s-zp-panel .cm-keyword, .cm-s-zp-panel .cm-atom, .cm-s-zp-panel .cm-def { color: #c792ea; }',
+    '.cm-s-zp-panel .cm-variable-2, .cm-s-zp-panel .cm-attribute { color: #e2b96b; }',
+    '.cm-s-zp-panel .cm-variable-3, .cm-s-zp-panel .cm-type, .cm-s-zp-panel .cm-builtin { color: #4ec9b0; }',
+    '.cm-s-zp-panel .cm-tag, .cm-s-zp-panel .cm-meta { color: #f07178; }',
+    '.cm-s-zp-panel .cm-link, .cm-s-zp-panel .cm-qualifier { color: #6fb3f2; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-comment { color: #8a93a3; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-string, :root[data-theme="light"] .cm-s-zp-panel .cm-string-2 { color: #15803d; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-number { color: #b45309; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-keyword, :root[data-theme="light"] .cm-s-zp-panel .cm-atom, :root[data-theme="light"] .cm-s-zp-panel .cm-def { color: #7c3aed; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-variable-2, :root[data-theme="light"] .cm-s-zp-panel .cm-attribute { color: #a16207; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-variable-3, :root[data-theme="light"] .cm-s-zp-panel .cm-type, :root[data-theme="light"] .cm-s-zp-panel .cm-builtin { color: #0f766e; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-tag, :root[data-theme="light"] .cm-s-zp-panel .cm-meta { color: #b91c1c; }',
+    ':root[data-theme="light"] .cm-s-zp-panel .cm-link, :root[data-theme="light"] .cm-s-zp-panel .cm-qualifier { color: #1d4ed8; }',
+    // 查找/替换对话框：CodeMirror 自带的是浅色浮层，这里让它跟随面板
+    '.zpf-cm .CodeMirror-dialog { background: var(--panel); color: var(--text); border-top: 1px solid var(--border); padding: 6px 10px; font-size: 12.5px; }',
+    '.zpf-cm .CodeMirror-dialog input { background: var(--bg-soft); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; font-family: var(--mono); }',
+    '.zpf-cm .CodeMirror-dialog button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; cursor: pointer; }',
+    // Monokai：只作用于编辑器弹窗根节点，面板其它部分不受影响
+    '.zpf-monokai { --bg-soft: #272822; --panel: #272822; --panel-2: #34352c;',
     '  --border: #49483e; --border-soft: #3b3c33; --text: #f8f8f2; --text-mute: #b9b9ae;',
-    '  background: #272822; border-color: #49483e;',
-    '}',
+    '  background: #272822; border-color: #49483e; }',
     '.zpf-monokai .modal-head, .zpf-monokai .modal-foot { border-color: #3b3c33; }',
     '.zpf-monokai .modal-head h3, .zpf-monokai .hint { color: #f8f8f2; }',
     '.zpf-monokai .modal-close { color: #b9b9ae; }',
     '.zpf-monokai .modal-close:hover { color: #f8f8f2; }',
-    // 工具栏/查找条里的 input、下拉都是 var(--bg-soft) 底色 + 面板默认的深色文字，
-    // Monokai 下 --bg-soft 变成 #272822，文字却还是深色 —— 实测"配色"下拉成了
-    // 近黑底上的近黑字，基本看不见。这里把文字/占位符一起提亮。
     '.zpf-monokai .select, .zpf-monokai .input { color: #f8f8f2; }',
-    '.zpf-monokai .input::placeholder { color: #9a9a90; }',
     '.zpf-monokai .select option { background: #272822; color: #f8f8f2; }',
-    '.zpf-monokai .zpf-editor { background: #272822; border-color: #49483e; }',
-    '.zpf-monokai .zpf-code, .zpf-monokai .zpf-hitbox, .zpf-monokai .zpf-lines { color: #f8f8f2; }',
-    '.zpf-monokai .zpf-ta { caret-color: #f8f8f2; }',
-    '.zpf-monokai .zpf-ta.zpf-plain { color: #f8f8f2 !important; -webkit-text-fill-color: #f8f8f2; }',
-    '.zpf-monokai .zpf-ta::selection { background: rgba(73, 72, 62, .85); }',
-    '.zpf-monokai .zpf-hit { background: rgba(230, 219, 116, .35); }',
-    '.zpf-monokai .zpf-hit-cur { background: rgba(249, 38, 114, .55); box-shadow: 0 0 0 1px rgba(249, 38, 114, .9); }',
-    // 经典 Monokai 取值：注释 #75715e / 字符串 #e6db74 / 关键字 #f92672 /
-    // 数字 #ae81ff / 函数名 #a6e22e / 类型·类名 #66d9ef。
-    //
-    // 这里必须带 `:root`：上面的浅色规则是 `:root[data-theme="light"] .zpf-kw`，
-    // 选择器权重 (0,3,0) 比 `.zpf-monokai .zpf-kw` 的 (0,2,0) 高，浅色面板下会直接
-    // 把 Monokai 的配色顶掉（真机验证时就是这样：字全是浅色主题的颜色）。
-    // 补一个 :root 让权重相同，靠"后写的那条赢"取胜。
-    ':root .zpf-monokai .zpf-com { color: #75715e; }',
-    ':root .zpf-monokai .zpf-str { color: #e6db74; }',
-    ':root .zpf-monokai .zpf-num { color: #ae81ff; }',
-    ':root .zpf-monokai .zpf-kw, :root .zpf-monokai .zpf-at, :root .zpf-monokai .zpf-sec { color: #f92672; }',
-    ':root .zpf-monokai .zpf-fn, :root .zpf-monokai .zpf-key { color: #a6e22e; }',
-    ':root .zpf-monokai .zpf-typ { color: #66d9ef; }',
-    ':root .zpf-monokai .zpf-vr, :root .zpf-monokai .zpf-attr { color: #fd971f; }',
-    ':root .zpf-monokai .zpf-tag, :root .zpf-monokai .zpf-imp { color: #f92672; }',
-    ':root .zpf-monokai .zpf-hd { color: #a6e22e; }',
-    ':root .zpf-monokai .zpf-link { color: #66d9ef; }',
-    ':root .zpf-monokai .zpf-b { color: #ae81ff; }',
-
-    // ---------------- 弹窗最小化（ui.js modal({minimizable:true})） ----------------
-    //
-    // 正文/页脚由 ui.js 用 display:none 隐藏（DOM 不销毁，编辑内容与光标都在），
-    // 这里只负责"看起来收成了右下角一条标题栏"。
-    // 遮罩整层藏掉：不然一条细窗口底下压着一层半透明全屏黑幕，页面上什么都看不清。
-    '.modal-mask.zp-min { background: transparent; backdrop-filter: none; pointer-events: none; }',
-    // 收起时必须固定定位并指定宽度：弹窗本来是 grid 居中项，宽度由 max-width 决定，
-    // 不给宽度就会撑成整行。position:fixed 会脱离 grid 容器，right/bottom 才生效。
-    '.modal.zp-min { position: fixed; right: 20px; bottom: 20px; width: min(420px, calc(100vw - 40px)); height: auto !important; max-height: none !important; z-index: 300; pointer-events: auto; cursor: pointer; }',
-    '.zp-min-status { font-size: 12px; color: var(--text-mute); margin-right: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }',
-    '.zp-min-status.zpf-dirty { color: var(--warn); font-weight: 600; }',
-    '.zp-min-btn { font-size: 15px; padding: 0 6px; }',
+    '.zpf-monokai .zpf-cm .CodeMirror { background: #272822; color: #f8f8f2; }',
   ].join('\n');
   document.head.appendChild(st);
 }
 
-/**
- * editorModal(entry, res) —— 打开在线编辑弹窗。
- * 只在这里组装 UI；读文件/二进制判断仍由调用方负责。
- * 查找/替换是弹窗内部的一条可折叠查找条（默认隐藏），不再走另一个小弹窗。
- */
+// ---------------- 编辑器弹窗 ----------------
+
+// editorModal 打开在线编辑器（entry 是文件条目，res 是 /files/read 的结果）。
+//
+// 结构：工具条（配色 / 路径 / 语言 / 查找 / 最大化 / 全屏）+ CodeMirror + 底部保存。
+// 先把窗口立起来再异步加载 CodeMirror：加载慢或失败时用户看到的是**原因**，
+// 而不是一个"点了没反应"的空白弹窗。
 function editorModal(entry, res) {
-  ensureEditorStyle();
-  const lang = langOf(entry.name);
-
-  // 高亮层：用 <code> 包一层，滚动同步靠 transform 平移它（见 syncScroll）
-  const hlInner = h('code.zpf-code');
-  const hlLayer = h('pre.zpf-pre', {
-    style: Object.assign(zpfTextStyle(), {
-      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
-      overflow: 'hidden', color: 'var(--text)',
-    }),
-  }, [hlInner]);
-
-  const linesInner = h('pre.zpf-lines', {
-    style: Object.assign(zpfTextStyle(), {
-      padding: '0', border: 'none', textAlign: 'right',
-      color: 'var(--text-mute)', userSelect: 'none',
-    }),
-  });
-  const gutter = h('div', {
+  const langKey = langKeyFor(entry.name);
+  const langDef = CM_LANGS[langKey];
+  const host = h('div.zpf-cm', { style: { flex: '1 1 auto', minHeight: '0', height: '58vh' } });
+  const hint = h('div.hint', { style: { marginTop: '6px' } });
+  const editorBox = h('div', {
     style: {
-      flexShrink: '0', overflow: 'hidden', background: 'var(--panel-2)',
-      border: '1px solid transparent', borderRightColor: 'var(--border-soft)',
-      padding: '10px 10px 10px 12px', width: 'calc(3ch + 26px)',
-      // 宽度用 ch 计算，所以 gutter 自己的字体也必须是等宽体，否则 ch 是正文字的宽度
-      fontFamily: 'var(--mono)', fontSize: ZPF_FONT_SIZE + 'px',
+      display: 'flex', flexDirection: 'column', minHeight: '0',
+      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', overflow: 'hidden',
+      background: 'var(--bg-soft)',
     },
-    // 点行号栏会把焦点从 textarea 抢走，接着敲字就敲不进去
-    onmousedown: (e) => e.preventDefault(),
-  }, [linesInner]);
+  }, [host, hint]);
 
-  const editor = h('textarea.textarea.zpf-ta', {
-    value: res.content,
-    wrap: 'off',
-    autocapitalize: 'off',
-    autocomplete: 'off',
-    autocorrect: 'off',
-    style: Object.assign(zpfTextStyle(), {
-      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
-      width: '100%', height: '100%', resize: 'none', outline: 'none', minHeight: '0',
-      color: 'transparent', caretColor: 'var(--text)', background: 'transparent',
-      overflow: 'auto', zIndex: '2',
-    }),
-  });
-  // h() 会跳过值为 false 的属性，spellcheck 只能创建后补 —— 否则代码里满屏红波浪线
-  editor.setAttribute('spellcheck', 'false');
-  // 打开文件时光标必须在开头、视图必须在顶部。
-  //
-  // 为什么在这里做（而不是在 focus 事件里）：给 textarea 赋 value 会把光标放到文末，
-  // modal() 随后自动 focus 又会把它滚进视野 —— 用户看到的是"一打开就停在最后一行"。
-  // 此刻还没有焦点，直接归零即可，不会打断任何用户操作。
-  //
-  // 🔴 绝不可以在 focus 事件里做这件事：那只会在**用户第一次点进编辑区**时执行，
-  // 表现就是"点哪儿都跳到文本开头、光标还跟鼠标对不上"（2026-09-22 用户报障，
-  // 根因就是这个 firstFocus 分支）。
-  editor.setSelectionRange(0, 0);
-  editor.scrollTop = 0;
-  editor.scrollLeft = 0;
-
-  // 查找命中层：和高亮层同一套 zpfTextStyle、同一个 transform，所以逐像素对齐。
-  //
-  // 为什么不用 textarea 的 ::selection 来显示当前匹配：查找时焦点必须留在查找框里
-  // （否则"输入即查找"就断了），而浏览器只在输入控件**获得焦点**时才绘制它的选区 ——
-  // 失焦的 textarea 选区是看不见的。所以命中色块必须由外面这层画。
-  // 它垫在 textarea 下面（textarea 的背景是透明的），因此两行文字都能透出来：
-  // 高亮模式下透出彩色文字，纯文本模式下透出 textarea 自己渲染的文字。
-  const hitInner = h('code.zpf-code');
-  const hitLayer = h('pre.zpf-hitbox', {
-    style: Object.assign(zpfTextStyle(), {
-      position: 'absolute', top: '0', left: '0', right: '0', bottom: '0',
-      overflow: 'hidden', zIndex: '1', display: 'none',
-    }),
-  }, [hitInner]);
-
-  const codeWrap = h('div', { style: { position: 'relative', flex: '1 1 auto', minWidth: '0' } }, [hlLayer, hitLayer, editor]);
-
-  const editorBox = h('div.zpf-editor', {
-    style: {
-      position: 'relative', display: 'flex', flex: '1 1 auto',
-      height: '58vh', minHeight: '300px', overflow: 'hidden',
-      background: 'var(--bg-soft)', border: '1px solid var(--border)',
-      borderRadius: 'var(--radius-sm)', transition: 'border-color .16s',
-    },
-  }, [gutter, codeWrap]);
-
-  const stat = h('span', { style: { fontSize: '12px', color: 'var(--text-mute)' }, text: `${res.content.length} 字符` });
-  const bigHint = h('div.hint', { style: { display: 'none' } });
-  const langPill = h('span.pill', { text: lang ? LANG_LABEL[lang] : '纯文本' });
-
+  let cm = null;
   let dirty = false;
-  let dense = false;   // 代码过密（token 超预算）→ 永久退回纯文本，避免每次输入都要重绘几万个 span
-  let maximized = false;
-  let collapsed = false;  // 最小化（收成右下角一条标题栏），由下面的 restoreView() 维护
-  let rafId = 0;
-  let lastHint = '';
-  let m = null;
+  let theme = readEditorTheme();
+  let boxWide = false;
 
-  // 最小化时编辑器整体 display:none。高亮层/命中层的滚动同步依赖 clientHeight，
-  // 隐藏状态下算出来的都是 0，所以这类计算要先问一句"看得见吗"。
-  function boxHidden() { return collapsed; }
+  const themeSel = h('select.select', { style: { width: 'auto' } }, [
+    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板', selected: theme === ZPF_THEME_PANEL }),
+    h('option', { value: ZPF_THEME_MONOKAI, text: '配色：Monokai', selected: theme === ZPF_THEME_MONOKAI }),
+  ]);
+  themeSel.addEventListener('change', () => applyTheme(themeSel.value));
 
-  function setHint(msg) {
-    if (msg === lastHint) return;
-    lastHint = msg;
-    if (msg) { bigHint.textContent = msg; bigHint.style.display = ''; }
-    else bigHint.style.display = 'none';
+  const findBtn = h('button.btn.btn-sm', {
+    text: '🔍 查找替换',
+    title: '查找 Ctrl+F · 替换 Shift+Ctrl+F · 跳行 Alt+G',
+    onclick: () => cm && cm.execCommand('findPersistent'),
+  });
+  const maxBtn = h('button.btn.btn-sm', { text: '⛶ 最大化', title: '撑满窗口（不进入系统全屏）', onclick: () => setMaximized(!boxWide) });
+  const fsBtn = h('button.btn.btn-sm', { text: '⛶ 屏幕全屏', title: '进入浏览器全屏（Esc 退出）', onclick: toggleFullscreen });
+  const saveBtn = h('button.btn.btn-primary', { text: '保存', title: '保存（Ctrl+S）' });
+
+  const toolbar = h('div', {
+    style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '8px 10px', borderBottom: '1px solid var(--border-soft)' },
+  }, [
+    themeSel, findBtn, maxBtn, fsBtn,
+    h('div', { style: { flex: '1 1 auto' } }),
+    h('span.hint', { text: entry.path }),
+  ]);
+
+  const bodyEl = h('div', { style: { display: 'flex', flexDirection: 'column', minHeight: '0', flex: '1 1 auto' } }, [toolbar, editorBox]);
+
+  function setDirty(v) {
+    dirty = v;
+    m?.setStatus(v ? '● 未保存' : '');
   }
 
-  function renderGutter(text) {
-    const n = countLines(text);
-    if (n > LN_MAX) { gutter.style.display = 'none'; linesInner.textContent = ''; return; }
-    gutter.style.display = '';
-    gutter.style.width = `calc(${String(n).length}ch + 26px)`;
-    linesInner.textContent = lineNumbers(n);
-  }
-
-  // 高亮层与输入层的滚动同步。
-  //
-  // 为什么用 transform 而不是把 pre.scrollTop 设成和 textarea 一样：
-  // pre 必须隐藏自己的滚动条（否则会和 textarea 的滚动条叠成两条），
-  // 一旦隐藏，pre 的 clientHeight 就比 textarea 大，"滚到底"的位置对不上，
-  // 最后几行会错位。transform 没有可滚动范围，直接用 textarea 的值平移，
-  // 顶部和底部都严格对齐。
-  function syncScroll() {
-    const x = editor.scrollLeft;
-    const y = editor.scrollTop;
-    hlInner.style.transform = `translate(${-x}px, ${-y}px)`;
-    linesInner.style.transform = `translateY(${-y}px)`;
-    if (hitLayer.style.display !== 'none') {
-      syncHits();
-      // 命中层只画可视区上下各 HIT_MARGIN 行；滚出这个范围才需要重画。
-      // 缓冲留 10 行：滚动事件里直接重画会让大文件每次滚动都扫一遍文本，很浪费。
-      const top = y / ZPF_LINE_HEIGHT;
-      const bottom = (y + editor.clientHeight) / ZPF_LINE_HEIGHT;
-      if (top < hitWinFirst + 10 || bottom > hitWinLast - 10) scheduleHits();
+  function applyTheme(v) {
+    theme = v === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
+    saveEditorTheme(theme);
+    themeSel.value = theme;
+    applyEditorThemeTo(m?.el, theme);
+    if (cm) {
+      cm.setOption('theme', theme === ZPF_THEME_MONOKAI ? 'monokai' : 'zp-panel');
+      // 换主题会重建行高/尺寸相关样式，必须 refresh，否则光标与行会短暂错位
+      requestAnimationFrame(() => cm.refresh());
     }
-  }
-
-  function render() {
-    // 最小化期间不重绘，也不做滚动同步：编辑器是 display:none，clientHeight 全是 0，
-    // 这时候算出来的命中窗口和 transform 都是错的，只是在浪费 CPU。
-    // 内容本来就在 textarea 的 value 里，还原时 restoreView() 会重新走一遍完整版。
-    if (boxHidden()) return;
-    const text = editor.value;
-    const tooBig = text.length > HL_MAX_CHARS;
-    const overlay = !!lang && !tooBig && !dense;
-
-    if (overlay) {
-      editor.classList.remove('zpf-plain');
-      hlLayer.style.display = '';
-      const frag = document.createDocumentFragment();
-      let n = 0;
-      try {
-        n = paintHighlight(frag, text, lang);
-      } catch (e) {
-        dense = true;
-        toast('语法高亮出错，已切换为纯文本：' + e.message, 'warn', 8000);
-      }
-      if (n > HL_MAX_TOKENS) dense = true;        // 片段太多，丢弃这次结果
-      else if (!dense) { clear(hlInner); hlInner.appendChild(frag); }
-    }
-
-    // 纯文本模式：让 textarea 自己显示文字（原生渲染比我们重绘一份快得多），
-    // 高亮层必须同时隐藏，否则两层文字会叠在一起
-    if (!overlay || dense) {
-      editor.classList.add('zpf-plain');
-      hlLayer.style.display = 'none';
-    }
-
-    renderGutter(text);
-    if (tooBig) setHint(`文件较大（${humanSize(text.length)}），已改用纯文本模式以保证输入流畅；编辑与保存不受影响。`);
-    else if (dense) setHint('代码片段过于密集，已改用纯文本模式以保证输入流畅。');
-    else setHint('');
-    // 查找条开着时，文本一变命中位置也跟着变（用户可能直接在编辑区改代码）。
-    // 这里只重算计数、不滚动：用户正在编辑的地方不能被"跳到当前匹配"拽走。
-    if (findOpen) { recount(); paintHits(); }
-    syncScroll();
-  }
-
-  // 合并同一帧内的多次输入。不用 debounce：textarea 的文字是透明的，
-  // 高亮层必须紧跟输入，延迟重绘会让刚敲的字先"消失"再出现。
-  function scheduleRender() {
-    if (rafId) return;
-    rafId = requestAnimationFrame(() => { rafId = 0; render(); });
-  }
-
-  // ---------- 两种全屏 ----------
-  function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
-
-  function applyHeight() {
-    // 屏幕全屏时由 UA 决定尺寸，这里显式给 100% 更稳（各浏览器 UA 规则强度不一致）
-    //
-    // 非全屏时要把查找条让出来的高度扣掉：编辑区是定高的，而 .modal 有 88vh 上限，
-    // 查找条一展开，正文就超出上限被 .modal-body 裁掉 —— 表现为编辑器最后几行
-    // （连同当前匹配的色块）看不见，点"下一处"像是没反应。
-    const shrink = findOpen && !fsElement() ? Math.min(160, findBar.offsetHeight + 8) : 0;
-    editorBox.style.height = fsElement() ? '100%' : `calc(58vh - ${shrink}px)`;
   }
 
   function setMaximized(on) {
-    maximized = on;
-    // 注意：modal() 会把我传进去的 body 再包一层 .modal-body，
-    // 所以编辑器区外面其实有两层。要让编辑器撑满，必须让外层也变成
-    // "定高的纵向 flex"，否则里层 flex:1 没有可分配的空闲空间（表现为底部留一大块空白）。
+    boxWide = on;
     const bodyWrap = m.el.querySelector('.modal-body');
     if (on) {
-      // 网页全屏：只把弹窗撑满视口，不碰系统全屏
       m.el.style.width = 'min(96vw, 1600px)';
       m.el.style.maxWidth = '96vw';
       m.el.style.height = '92vh';
@@ -1796,6 +1538,7 @@ function editorModal(entry, res) {
       bodyWrap.style.flex = '1 1 auto';
       bodyWrap.style.minHeight = '0';
       bodyWrap.style.overflow = 'hidden';
+      host.style.height = '100%';
     } else {
       m.el.style.width = '';
       m.el.style.maxWidth = '';
@@ -1806,638 +1549,162 @@ function editorModal(entry, res) {
       bodyWrap.style.flex = '';
       bodyWrap.style.minHeight = '';
       bodyWrap.style.overflow = '';
+      host.style.height = '58vh';
     }
     maxBtn.textContent = on ? '🗗 还原' : '⛶ 最大化';
-    // 尺寸变了，textarea 的可滚动范围也变了，下一帧把高亮层对回去
-    requestAnimationFrame(syncScroll);
+    requestAnimationFrame(() => { if (cm) { cm.setSize(null, '100%'); cm.refresh(); } });
   }
+
+  function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
 
   function toggleFullscreen() {
     if (fsElement()) {
       const exit = document.exitFullscreen || document.webkitExitFullscreen;
-      if (exit) {
-        const p = exit.call(document);
-        if (p && p.catch) p.catch(() => {});
-      }
+      if (exit) { const p = exit.call(document); if (p && p.catch) p.catch(() => {}); }
       return;
     }
     const req = editorBox.requestFullscreen || editorBox.webkitRequestFullscreen;
     if (!req) { toast('当前浏览器不支持屏幕全屏', 'warn'); return; }
-    // 必须在用户手势里调用，浏览器可能拒绝（权限/手势失效）——不能静默失败
     const p = req.call(editorBox);
-    if (p && p.catch) p.catch((e) => toast('进入屏幕全屏失败：' + (e && e.message ? e.message : e), 'err'));
+    if (p && p.catch) p.catch((e) => toast('进入屏幕全屏失败：' + ((e && e.message) || e), 'err'));
   }
 
   function onFsChange() {
     const on = !!fsElement();
     fsBtn.textContent = on ? '🗗 退出全屏' : '⛶ 屏幕全屏';
-    applyHeight();
-    requestAnimationFrame(syncScroll);
+    requestAnimationFrame(() => { if (cm) cm.refresh(); });
   }
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
 
-  // 全屏下 Esc 是浏览器"退出全屏"的快捷键，但它也会冒泡到 modal 的 Esc 监听上 ——
-  // 不拦住的话，用户按一次 Esc 会连编辑器弹窗一起关掉。捕获阶段截住即可。
-  const onEscCapture = (e) => {
-    if (e.key === 'Escape' && fsElement()) e.stopPropagation();
-  };
-  document.addEventListener('keydown', onEscCapture, true);
-
-  // ---------- 查找 / 替换条 ----------
-  //
-  // 为什么默认隐藏、而且在 DOM 顺序里排在编辑区之后：
-  // ui.js 的 modal() 打开弹窗后会自动 focus 里面第一个 input/textarea/select。
-  // 查找条里全是输入框 —— 一旦它先出现在 DOM 里（或者不隐藏），打开文件时焦点就会被
-  // 查找框抢走：用户一敲键盘是在搜索，而且编辑器根本收不到输入。
-  // 所以两道保险：① 默认 display:none；② 在 bodyEl 里排在 editorBox 之后，
-  // querySelector 找到的第一个控件永远是编辑用的 textarea。
-  // 视觉上它仍在编辑区上方，靠 flex 的 order:-1（只影响绘制顺序，不影响 DOM 顺序）。
-
-  const FIND_MAX = 20000;   // 命中上限：2MB 文件里搜单个字母能有几十万处，全存下来只会拖慢计数
-  const HIT_MARGIN = 40;    // 命中层窗口在可视区上下各多画 40 行，避免滚动时每帧重画
-  let findOpen = false;
-  let matches = [];
-  let truncated = false;
-  let cur = -1;
-  let hitWinFirst = 0;
-  let hitWinLast = 0;
-  let hitsRaf = 0;
-  let measureCtx = null;
-
-  const findInput = h('input.input', { placeholder: '查找内容', style: { width: '160px' } });
-  const replaceInput = h('input.input', { placeholder: '替换为', style: { width: '160px' } });
-  const caseCb = h('input', { type: 'checkbox', style: { margin: '0' } });
-  const findCount = h('span.zpf-fcount', { text: '0/0', title: '当前匹配 / 匹配总数' });
-  // onmousedown 里 preventDefault：点按钮不该把焦点从查找框抢走，
-  // 否则"输入关键词 → 点下一处 → 继续敲字"会变成敲进编辑区
-  const keepFocus = (e) => e.preventDefault();
-  const prevBtn = h('button.btn.btn-sm', { text: '↑ 上一处', title: '上一处（Shift+Enter）', onmousedown: keepFocus, onclick: () => stepMatch(-1) });
-  const nextBtn = h('button.btn.btn-sm', { text: '↓ 下一处', title: '下一处（Enter）', onmousedown: keepFocus, onclick: () => stepMatch(1) });
-  const findBar = h('div.zpf-findbar', {
-    style: {
-      display: 'none', flexDirection: 'column', gap: '6px',
-      marginBottom: '8px', padding: '8px 10px', order: '-1',
-      background: 'var(--panel-2)', border: '1px solid var(--border-soft)',
-      borderRadius: 'var(--radius-sm)',
-    },
-  }, [
-    // 分两行是刻意的：弹窗默认宽度下"查找 + 替换"挤一行会折行，把关闭按钮甩到
-    // 第二行去，看起来像坏了。两组各占一行，任何宽度下都整齐。
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } }, [
-      h('span', { style: { fontSize: '12.5px', color: 'var(--text-mute)' }, text: '查找' }),
-      findInput,
-      findCount,
-      prevBtn,
-      nextBtn,
-      h('label', {
-        style: { display: 'flex', alignItems: 'center', gap: '3px', fontSize: '12px', cursor: 'pointer' },
-        title: '区分大小写',
-      }, [caseCb, h('span', { text: 'Aa' })]),
-      h('div', { style: { flex: '1' } }),
-      h('button.btn.btn-sm', { text: '×', title: '关闭查找（Esc）', onclick: closeFind }),
-    ]),
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } }, [
-      h('span', { style: { fontSize: '12.5px', color: 'var(--text-mute)' }, text: '替换为' }),
-      replaceInput,
-      h('button.btn.btn-sm', { text: '替换当前', title: '只替换当前匹配（尚未保存）', onmousedown: keepFocus, onclick: replaceCurrent }),
-      h('button.btn.btn-sm', { text: '全部替换', title: '替换全部匹配（尚未保存）', onmousedown: keepFocus, onclick: replaceAll }),
-    ]),
-  ]);
-
-  /**
-   * haystack(q) —— 按当前"区分大小写"开关返回用于 indexOf 的文本与关键词。
-   * 查找一律按**纯文本**处理，不把用户输入当正则（正则会让 `.` `*` `(` 这类
-   * 输入变成语法错误或意外命中，普通用户只会觉得"搜不到"）。
-   */
-  function haystack(q) {
-    const text = editor.value;
-    if (caseCb.checked) return { src: text, hay: text, needle: q };
-    const lo = text.toLowerCase();
-    const nlo = q.toLowerCase();
-    // 个别 Unicode 字符（如 'İ'）小写化后长度会变，长度一旦不同，命中下标就和原文
-    // 对不上（会画错位置、替换错字符）。这种极少数情况退回区分大小写：宁可少命中，不能错位。
-    if (lo.length !== text.length || nlo.length !== q.length) return { src: text, hay: text, needle: q };
-    return { src: text, hay: lo, needle: nlo };
-  }
-
-  function computeMatches() {
-    const q = findInput.value;
-    matches = [];
-    truncated = false;
-    if (!q) return;
-    const { hay, needle } = haystack(q);
-    let from = 0;
-    for (;;) {
-      const at = hay.indexOf(needle, from);
-      if (at < 0) break;
-      matches.push({ start: at, end: at + q.length });
-      if (matches.length >= FIND_MAX) { truncated = true; break; }
-      from = at + q.length;
-    }
-  }
-
-  function lineAt(text, pos) {
-    let line = 0;
-    for (let i = text.indexOf('\n'); i >= 0 && i < pos; i = text.indexOf('\n', i + 1)) line++;
-    return line;
-  }
-
-  function updateFindUI() {
-    const q = findInput.value;
-    if (!q) findCount.textContent = '0/0';
-    else if (!matches.length) findCount.textContent = '无匹配';
-    else findCount.textContent = `${cur + 1}/${matches.length}${truncated ? '+' : ''}`;
-    findCount.style.color = q && !matches.length ? '#f87171' : 'var(--text-mute)';
-    findCount.title = truncated ? `命中超过 ${FIND_MAX} 处，只统计并跳到前 ${FIND_MAX} 处` : '当前匹配 / 匹配总数';
-    prevBtn.disabled = !matches.length;
-    nextBtn.disabled = !matches.length;
-  }
-
-  function syncHits() {
-    // 窗口首行在文档里的 y 是 hitWinFirst*行高，所以整体上移这么多再减掉 scrollTop
-    hitInner.style.transform = `translate(${-editor.scrollLeft}px, ${hitWinFirst * ZPF_LINE_HEIGHT - editor.scrollTop}px)`;
-  }
-
-  function scheduleHits() {
-    if (hitsRaf) return;
-    hitsRaf = requestAnimationFrame(() => { hitsRaf = 0; paintHits(); });
-  }
-
-  /**
-   * paintHits() —— 把命中画进命中层（当前匹配换一个更醒目的颜色）。
-   * 只画可视区附近的窗口：大文件退回纯文本模式后 textarea 自己已经在渲染整篇文本，
-   * 再整篇镜像一份、每次滚动都重排，就是白白的双倍开销。
-   */
-  function paintHits() {
-    // 最小化时编辑器是 display:none，clientHeight 为 0：这时候画命中只会画出一个
-    // 一行的窗口（错误的色块位置）。直接跳过，还原时由 restoreView() 重画。
-    if (boxHidden()) { hitLayer.style.display = 'none'; return; }
-    if (!findOpen || !findInput.value || !matches.length) {
-      hitLayer.style.display = 'none';
-      clear(hitInner);
-      return;
-    }
-    const text = editor.value;
-    const viewH = editor.clientHeight || 0;
-    const firstView = Math.floor(editor.scrollTop / ZPF_LINE_HEIGHT);
-    const lastView = firstView + Math.ceil(viewH / ZPF_LINE_HEIGHT) + 1;
-    const firstLine = Math.max(0, firstView - HIT_MARGIN);
-    const lastLine = lastView + HIT_MARGIN;
-
-    // 行号 → 字符下标（数换行）。纯文本模式的大文件下这是 O(n)，但只在重画时做一次，
-    // 比把整篇文本镜像进 DOM 便宜得多。
-    let line = 0;
-    let pos = 0;
-    while (line < firstLine && pos < text.length) {
-      const nl = text.indexOf('\n', pos);
-      if (nl < 0) break;
-      pos = nl + 1; line++;
-    }
-    const winStart = pos;
-    const winFirst = line;   // 窗口首行在文件里的真实行号（文件比 firstLine 短时会更小）
-    while (line <= lastLine && pos < text.length) {
-      const nl = text.indexOf('\n', pos);
-      if (nl < 0) { pos = text.length; break; }
-      pos = nl + 1; line++;
-    }
-    const winEnd = pos;
-
-    const curMatch = cur >= 0 ? matches[cur] : null;
-    const frag = document.createDocumentFragment();
-    let p = winStart;
-    for (const mt of matches) {
-      if (mt.end <= winStart) continue;
-      if (mt.start >= winEnd) break;
-      const s = Math.max(mt.start, winStart);
-      const e = Math.min(mt.end, winEnd);
-      if (s > p) frag.appendChild(document.createTextNode(text.slice(p, s)));
-      frag.appendChild(h('mark', {
-        class: mt === curMatch ? 'zpf-hit zpf-hit-cur' : 'zpf-hit',
-        text: text.slice(s, e),
-      }));
-      p = e;
-    }
-    if (p < winEnd) frag.appendChild(document.createTextNode(text.slice(p, winEnd)));
-
-    clear(hitInner);
-    hitInner.appendChild(frag);
-    hitWinFirst = winFirst;
-    hitWinLast = line;
-    hitLayer.style.display = '';
-    syncHits();
-  }
-
-  /** 用 canvas 量同一字体下的文字宽度：中文这类宽字符也能量准（按字符数×单宽算会偏）。 */
-  function textWidth(s) {
-    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
-    measureCtx.font = `${ZPF_FONT_SIZE}px ${getComputedStyle(editor).fontFamily}`;
-    return measureCtx.measureText(s).width;
-  }
-
-  /** 把当前匹配滚进可视区（只动编辑器内部滚动，绝不 scrollIntoView，否则整个页面会被顶跑）。 */
-  function revealMatch(i) {
-    const mt = matches[i];
-    if (!mt) return;
-    const text = editor.value;
-    const lineTop = lineAt(text, mt.start) * ZPF_LINE_HEIGHT;
-    const viewH = editor.clientHeight;
-    if (lineTop - ZPF_LINE_HEIGHT < editor.scrollTop) {
-      editor.scrollTop = Math.max(0, lineTop - ZPF_LINE_HEIGHT);
-    } else if (lineTop + 2 * ZPF_LINE_HEIGHT > editor.scrollTop + viewH) {
-      editor.scrollTop = Math.max(0, lineTop + 2 * ZPF_LINE_HEIGHT - viewH);
-    }
-    // 横向：只有在匹配列真的滚出视野时才动，两侧各留 24px 余量
-    const lineStart = text.lastIndexOf('\n', mt.start - 1) + 1;
-    const before = text.slice(lineStart, mt.start).replace(/\t/g, '    ');
-    const self = text.slice(mt.start, mt.end).replace(/\t/g, '    ');
-    const x0 = textWidth(before);
-    const x1 = x0 + textWidth(self);
-    if (x0 - 24 < editor.scrollLeft) editor.scrollLeft = Math.max(0, x0 - 24);
-    else if (x1 + 24 > editor.scrollLeft + editor.clientWidth) {
-      editor.scrollLeft = Math.max(0, x1 + 24 - editor.clientWidth);
-    }
-    // 选区也设到匹配上：一是让"替换当前"有明确目标，二是用户点回编辑区时光标正好在匹配处。
-    // 注意不能 focus 编辑器 —— 焦点必须留在查找框里，否则"输入即查找"就断了；
-    // 失焦的 textarea 不绘制选区，所以可见的命中由 hitLayer 负责画（见上面的说明）。
-    editor.setSelectionRange(mt.start, mt.end);
-    syncScroll();
-  }
-
-  /** 重算命中并把"当前匹配"钉在 anchorStart 之后第一个（anchorStart 为空则从光标处往后找）。 */
-  function recount(anchorStart) {
-    const prev = cur >= 0 && matches[cur] ? matches[cur].start : null;
-    computeMatches();
-    const anchor = anchorStart != null ? anchorStart : prev;
-    if (!matches.length) cur = -1;
-    else if (anchor != null) {
-      const i = matches.findIndex((m) => m.start >= anchor);
-      cur = i < 0 ? matches.length - 1 : i;
-    } else {
-      // 在文件中间按 Ctrl+F 时不应该跳回文件头，从光标处往后找第一个
-      const i = matches.findIndex((m) => m.end > editor.selectionStart);
-      cur = i < 0 ? 0 : i;
-    }
-    updateFindUI();
-  }
-
-  /** 改文本、更新计数、把匹配重算一遍并跳到 anchorStart 之后的下一个匹配。 */
-  function findRefresh(anchorStart) {
-    recount(anchorStart);
-    if (cur >= 0) revealMatch(cur);
-    paintHits();
-  }
-
-  /** 下一处 / 上一处：到头循环回绕。 */
-  function stepMatch(delta) {
-    if (!matches.length) return;
-    cur = (cur + delta + matches.length) % matches.length;
-    updateFindUI();
-    revealMatch(cur);
-    paintHits();
-  }
-
-  /** 替换/直接改文本后的统一收口：滚动位置要显式放回去。 */
-  function applyEdited(next, anchorStart) {
-    const y = editor.scrollTop;
-    const x = editor.scrollLeft;
-    editor.value = next;
-    // 直接给 value 赋值在部分浏览器会把滚动位置弹回开头，存一下再放回去
-    editor.scrollTop = y;
-    editor.scrollLeft = x;
-    dirty = true;
-    stat.textContent = `${next.length} 字符（已修改）`;
-    scheduleRender();
-    findRefresh(anchorStart);
-  }
-
-  function replaceCurrent() {
-    if (cur < 0 || !matches.length) { toast('没有可替换的匹配', 'warn'); return; }
-    const mt = matches[cur];
-    const rep = replaceInput.value;
-    const next = editor.value.slice(0, mt.start) + rep + editor.value.slice(mt.end);
-    // 锚在插入内容之后：连续点"替换当前"会顺着往下替换，和编辑器里的替换流程一致
-    applyEdited(next, mt.start + rep.length);
-  }
-
-  function replaceAll() {
-    const q = findInput.value;
-    if (!q) { toast('请先输入查找内容', 'warn'); return; }
-    // 这里单独扫一遍而**不复用 matches**：matches 有 FIND_MAX 上限（大文件里搜单个
-    // 字母会撞上），拿它来"全部替换"会只替换前 2 万处却不告诉用户。
-    const { src, hay, needle } = haystack(q);
-    const rep = replaceInput.value;
-    let out = '';
-    let pos = 0;
-    let n = 0;
-    for (;;) {
-      const at = hay.indexOf(needle, pos);
-      if (at < 0) break;
-      out += src.slice(pos, at) + rep;
-      pos = at + q.length;
-      n++;
-    }
-    if (!n) { toast('没有可替换的匹配', 'warn'); return; }
-    out += src.slice(pos);
-    applyEdited(out, 0);
-    toast(`已替换 ${n} 处（尚未保存）`, 'ok');
-  }
-
-  function openFind() {
-    if (!findOpen) {
-      findOpen = true;
-      findBar.style.display = 'flex';
-      // 让出查找条占的高度，别把弹窗顶过 88vh 上限（见 applyHeight 的说明）
-      applyHeight();
-      requestAnimationFrame(syncScroll);
-    }
-    // 再按一次 Ctrl+F 或点按钮时把已有关键词选中，方便直接覆盖重输
-    findInput.focus();
-    findInput.select();
-    findRefresh();
-  }
-
-  function closeFind() {
-    if (!findOpen) return;
-    findOpen = false;
-    // 保留关键词和命中不删（matches 留着），但要清掉画出来的色块
-    findBar.style.display = 'none';
-    clear(hitInner);
-    hitLayer.style.display = 'none';
-    applyHeight();                 // 把高度还给编辑区
-    requestAnimationFrame(syncScroll);
-    // 焦点还给编辑器：按 Esc 关掉查找条之后，用户通常就是要接着改代码
-    editor.focus();
-  }
-
-  findInput.addEventListener('input', () => findRefresh());
-  findInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); stepMatch(e.shiftKey ? -1 : 1); }
-  });
-  replaceInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); replaceCurrent(); }
-  });
-  caseCb.addEventListener('change', () => findRefresh());
-
-  // 为什么快捷键挂在 document 的**捕获阶段**：
-  // ① 焦点在查找框里时，Ctrl+F / Esc 不会冒泡到 textarea 的监听器上；
-  // ② ui.js 的 modal() 也是在 document 上（冒泡阶段）监听 Esc 的，捕获阶段先跑，
-  //    这样"查找条开着 → Esc 只关查找条；查找条关着 → Esc 才关弹窗"才成立。
-  const onEditorKey = (e) => {
-    const key = e.key || '';
-    const mod = e.ctrlKey || e.metaKey;
-    if (key === 'Escape') {
-      // 屏幕全屏时 Esc 归浏览器"退出全屏"用（见上面的 onEscCapture），
-      // 这时不能抢：否则 preventDefault 会让用户退不出全屏。
-      if (findOpen && !fsElement()) {
-        e.preventDefault();
-        e.stopPropagation();   // 拦住 modal 的 Esc，别把整个编辑弹窗一起关掉
-        closeFind();
-      }
-      return;
-    }
-    if (mod && !e.altKey && key.toLowerCase() === 'f') {
-      e.preventDefault();      // 拦掉浏览器自带的查找框，否则它会盖在面板上
-      openFind();
-      return;
-    }
-    // 焦点在查找框里时 Ctrl+S 也要保存。焦点在编辑区里时由 textarea 自己的监听处理，
-    // 这里不重复触发（否则会写两次文件、弹两个 toast）。
-    if (mod && findOpen && findBar.contains(e.target) && key.toLowerCase() === 's') {
-      e.preventDefault();
-      writeBack();
-    }
-  };
-  document.addEventListener('keydown', onEditorKey, true);
-
-  // ---------- 工具栏 ----------
-  const maxBtn = h('button.btn.btn-sm', {
-    text: '⛶ 最大化', title: '撑满浏览器窗口（不进入系统全屏）',
-    onclick: () => setMaximized(!maximized),
-  });
-  const fsBtn = h('button.btn.btn-sm', {
-    text: '⛶ 屏幕全屏', title: '调用系统全屏，Esc 退出',
-    onclick: toggleFullscreen,
-  });
-  // 配色选择：两档（跟随面板 / Monokai），选择存 localStorage（见 ZPF_THEME_KEY）。
-  // 排在工具栏最前面，避免被右侧的查找/全屏按钮挤到换行之外看不见。
-  const themeSel = h('select.select', {
-    title: '编辑器配色（选择会记住）',
-    style: { width: 'auto', fontSize: '12.5px', padding: '5px 26px 5px 8px' },
-    onchange: () => applyEditorTheme(themeSel.value),
-  }, [
-    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板' }),
-    h('option', { value: ZPF_THEME_MONOKAI, text: '配色：Monokai' }),
-  ]);
-  themeSel.value = readEditorTheme();
-
-  const toolbar = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } }, [
-    themeSel,
-    h('code.code', { text: entry.path }),
-    stat,
-    langPill,
-    h('div', { style: { flex: '1' } }),
-    h('button.btn.btn-sm', { text: '🔍 查找替换', title: '查找 / 替换（Ctrl+F）', onclick: openFind }),
-    maxBtn,
-    fsBtn,
-  ]);
-
-  const bodyEl = h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: '0' } }, [
-    toolbar,
-    editorBox,
-    // 查找条排在编辑区之后是有意的，见上面"为什么默认隐藏"的说明；
-    // 视觉位置由它自己的 order:-1 决定（显示在编辑区上方）
-    findBar,
-    bigHint,
-    h('div.hint', { style: { marginTop: '8px' }, text: '保存采用"先写临时文件再替换"，写入中断不会破坏原文件。' }),
-  ]);
-
   async function writeBack() {
+    if (!cm) return false;
+    saveBtn.disabled = true;
     try {
-      await api.fileWrite(entry.path, editor.value);
-      dirty = false;
-      syncStatus();
+      await api.fileWrite(entry.path, cm.getValue());
+      setDirty(false);
       toast('已保存', 'ok');
       return true;
-    } catch (e) { toast(e.message, 'err', 10000); return false; }
+    } catch (e) {
+      toast(e.message, 'err', 10000);
+      return false;
+    } finally {
+      saveBtn.disabled = false;
+    }
   }
 
-  // 未保存时才拦一道。ui.js 的 onRequestClose 对"关闭按钮 / 遮罩 / Esc"三条路径一视同仁，
-  // 而我们下面把后两条关掉了，所以实际只有关闭按钮会走到这里。
   function confirmDiscard() {
     return !dirty || confirm('有未保存的修改，确定关闭？');
   }
 
-  // 未保存提示写进标题栏（最小化后它是唯一还看得见的区域），否则收起来之后
-  // 用户完全不知道里面还有没保存的改动。
-  function syncStatus() {
-    // m 可能还没赋值（本函数只在 modal() 之后被调用，这里只是兜底）
-    m?.setStatus(dirty ? '● 未保存' : '');
-  }
+  saveBtn.addEventListener('click', async () => { if (await writeBack()) m.close(); });
 
-  m = modal({
+  const m = modal({
     title: `编辑：${entry.name}`,
     wide: true,
+    minimizable: true,
     body: bodyEl,
     footer: () => [
-      h('button.btn', {
-        text: '取消',
-        // 已保存（或没改过）时直接关，走不到确认框；有改动才问
-        onclick: () => { if (confirmDiscard()) m.close(); },
-      }),
-      h('button.btn.btn-primary', {
-        text: '保存',
-        onclick: async () => { if (await writeBack()) m.close(); },
-      }),
+      h('button.btn', { text: '取消', onclick: () => { if (confirmDiscard()) m.close(); } }),
+      saveBtn,
     ],
-    // ① 只能通过关闭按钮关闭：Esc 与点遮罩都不关。
-    //    为什么只给文件编辑器：其它弹窗都是"填错就重来"的短表单，点遮罩放弃是符合
-    //    直觉的；编辑器里可能是十几分钟的改动，误触一下就没了的代价太大。
-    closeOnEsc: false,
+    // 编辑器里可能是十几分钟的改动：点遮罩不关（误触代价太大）。
+    // Esc 允许关闭，但**必须走同一道确认**（有未保存改动时先问）——
+    // 完全禁用 Esc 反直觉，而"能关但不丢数据"才是用户真正要的。
     closeOnBackdrop: false,
-    onRequestClose: confirmDiscard,
-    // ② 最小化：点标题栏的「—」收成右下角一条标题栏，再点还原。
-    minimizable: true,
-    onMinimize: (on) => { collapsed = on; if (!on) restoreView(); },
+    closeOnEsc: true,
+    onRequestClose: () => confirmDiscard(),
+    onMinimize: (min) => { if (!min && cm) requestAnimationFrame(() => cm.refresh()); },
     onClose: () => {
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
-      document.removeEventListener('keydown', onEscCapture, true);
-      document.removeEventListener('keydown', onEditorKey, true);
-      // 关弹窗时如果还在屏幕全屏，必须主动退出，否则会留在一块空白全屏层上
-      if (fsElement()) {
-        const exit = document.exitFullscreen || document.webkitExitFullscreen;
-        if (exit) { const p = exit.call(document); if (p && p.catch) p.catch(() => {}); }
-      }
     },
   });
 
-  /**
-   * applyEditorTheme(v) —— 切编辑器配色并把选择记下来。
-   * 用户没选 Monokai 时（默认）面板原来的浅色/深色规则原样生效。
-   */
-  function applyEditorTheme(v) {
-    const val = v === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
-    applyEditorThemeTo(m.el, val);
-    saveEditorTheme(val);
-    themeSel.value = val;
-  }
+  applyEditorThemeTo(m.el, theme);
 
-  /**
-   * restoreView() —— 从"最小化"还原之后把视图对齐回来。
-   *
-   * 最小化只是给编辑区 display:none，textarea 的 value / 光标 / 滚动位置都是浏览器
-   * 自己保着的，所以这里不需要（也不能）重建 DOM。但有两件事必须补：
-   *   ① 还原后编辑器重新获得焦点，用户接着敲字不用再点一下；
-   *   ② 高亮层与行号槽是 transform 平移的，隐藏期间没同步过，要重画一次。
-   */
-  function restoreView() {
-    // 之前 render() 在最小化期间被跳过，这里补一次完整重绘（含行号、命中层、滚动同步）
-    render();
-    editor.focus();
-    // 还原后可见高度变了，命中层的可视窗口要按新尺寸重画
-    if (findOpen) requestAnimationFrame(() => { paintHits(); syncScroll(); });
-  }
-
-  // 初始配色：读 localStorage，打开文件就应用，不需要用户每次重选
-  applyEditorTheme(themeSel.value);
-  syncStatus();
-
-  editor.addEventListener('input', () => {
-    dirty = true;
-    stat.textContent = `${editor.value.length} 字符（已修改）`;
-    syncStatus(); // 标题栏的"● 未保存"提示（最小化后这是唯一看得见的地方）
-    scheduleRender();
-  });
-  editor.addEventListener('scroll', syncScroll);
-  editor.addEventListener('focus', () => {
-    editorBox.style.borderColor = 'var(--brand)';
-    // 这里**只改边框颜色**。光标与滚动位置属于用户，焦点事件里不许动它们
-    //（详见上面"创建时归零"的说明）。
-  });
-  editor.addEventListener('blur', () => { editorBox.style.borderColor = 'var(--border)'; });
-
-  // ---------- 缩进 / 自动缩进 / 保存 ----------
-  //
-  // 以前这里**一个键都没拦**：在编辑区按 Tab 会把焦点 tab 到别的按钮上，
-  // 想缩进一行代码都做不到 —— 对一个"在线代码编辑器"来说这是致命的（用户
-  // 2026-09-22 的原话是"难用得让人想吐"）。现在：
-  //   · Tab / Shift+Tab：有选区则整块缩进 / 反缩进，没选区则插入 / 删除一级缩进；
-  //   · Enter：保持当前行缩进；行尾是 `{([` 时多缩一级，光标在 `}])` 前时不加深；
-  //   · Ctrl/Cmd+S：保存（不关弹窗）。
-  //
-  // 为什么用 execCommand('insertText') 而不是直接改 value：前者会进入浏览器的
-  // **原生撤销栈**（用户 Ctrl+Z 能撤销缩进），后者会把撤销历史清空 ——
-  // 一个按 Tab 就让"撤销"失效的编辑器同样是不可用的。老浏览器不支持时再退回
-  // setRangeText + 手动派发 input 事件（功能一致，只是撤销由浏览器决定）。
-  const INDENT_UNIT = '    '; // 4 个空格，与 tabSize:4 一致
-  function replaceRange(from, to, text) {
-    editor.focus();
-    editor.setSelectionRange(from, to);
-    let ok = false;
-    try { ok = document.execCommand('insertText', false, text); } catch { ok = false; }
-    if (!ok) {
-      editor.setRangeText(text, from, to, 'end');
-      editor.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-  }
-  function lineStartAt(pos) { return editor.value.lastIndexOf('\n', pos - 1) + 1; }
-
-  // indentSelection 把选区覆盖的整行缩进/反缩进一级（无选区时作用于当前行）。
-  function indentSelection(dedent) {
-    const v = editor.value;
-    const from = lineStartAt(editor.selectionStart);
-    // 选区末尾正好落在行首时，不要把下一行也算进来（否则多缩进一行）
-    let tail = editor.selectionEnd;
-    if (tail > from && v[tail - 1] === '\n') tail -= 1;
-    const nl = v.indexOf('\n', tail);
-    const to = nl === -1 ? v.length : nl;
-    const lines = v.slice(from, to).split('\n').map((ln) => {
-      if (!dedent) return INDENT_UNIT + ln;
-      if (ln.startsWith(INDENT_UNIT)) return ln.slice(INDENT_UNIT.length);
-      return ln.replace(/^[ \t]{1,4}/, ''); // 兼容手打的 Tab / 2 空格缩进
+  // ---- 异步挂载 CodeMirror ----
+  hint.textContent = '正在加载编辑器…';
+  (async () => {
+    await ensureCodeMirror();
+    await ensureLang(langKey);
+    cm = window.CodeMirror(host, {
+      value: res.content,
+      mode: langDef ? langDef.mode : null,
+      theme: theme === ZPF_THEME_MONOKAI ? 'monokai' : 'zp-panel',
+      lineNumbers: true,
+      lineWrapping: false,
+      indentUnit: 4,
+      tabSize: 4,
+      indentWithTabs: false,
+      smartIndent: true,
+      electricChars: true,
+      autoCloseBrackets: true,
+      matchBrackets: true,
+      styleActiveLine: true,
+      foldGutter: true,
+      gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
+      scrollbarStyle: 'simple',
+      viewportMargin: 30,
+      extraKeys: {
+        'Ctrl-S': () => { writeBack(); },
+        'Cmd-S': () => { writeBack(); },
+        'Ctrl-F': 'findPersistent',
+        'Cmd-F': 'findPersistent',
+        'Shift-Ctrl-F': 'replace',
+        'Shift-Cmd-F': 'replace',
+        'Alt-G': 'jumpToLine',
+        'Ctrl-/': 'toggleComment',
+        'Cmd-/': 'toggleComment',
+        // Tab / Shift+Tab 必须显式接管：CodeMirror 默认的 Tab 在空行上会插入
+        // **制表符**，而面板其它地方（以及面板自己生成的配置）统一用 4 空格 ——
+        // 混用会在保存后的文件里留下看不见的差异。有选区时整块缩进/反缩进。
+        'Tab': (ed) => {
+          if (ed.somethingSelected()) ed.indentSelection('add');
+          else ed.replaceSelection('    ', 'end');
+        },
+        'Shift-Tab': (ed) => ed.indentSelection('subtract'),
+      },
+      // 查找/替换对话框的文案（CodeMirror 自带的是英文；面板是中文界面）
+      // 键名必须与 CodeMirror 插件的 phrase() 调用逐字一致（含冒号），
+      // 否则查表失败会**静默**退回英文 —— 第一版就踩了（写的是 'Search'）。
+      phrases: {
+        'Search:': '查找：',
+        'Replace:': '替换：',
+        'Replace with:': '替换为：',
+        'Replace all:': '全部替换：',
+        'Replace?': '要替换吗？',
+        'With:': '替换为：',
+        'Jump to line:': '跳到行：',
+        'All': '全部',
+        'Stop': '停止',
+        'Yes': '是',
+        'No': '否',
+        '(Use /re/ syntax for regexp search)': '（支持 /正则/ 语法）',
+        '(Use line:column or scroll% syntax)': '（可用 行:列 或 百分比）',
+      },
     });
-    const next = lines.join('\n');
-    if (next === v.slice(from, to)) return; // 反缩进到顶了：什么都不做，别产生假修改
-    replaceRange(from, to, next);
-    editor.setSelectionRange(from, from + next.length);
-  }
-
-  editor.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      writeBack();
-      return;
-    }
-    if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      const hasSelection = editor.selectionStart !== editor.selectionEnd;
-      if (!hasSelection && !e.shiftKey) {
-        replaceRange(editor.selectionStart, editor.selectionEnd, INDENT_UNIT);
-        return;
-      }
-      indentSelection(e.shiftKey);
-      return;
-    }
-    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
-      && editor.selectionStart === editor.selectionEnd) {
-      const at = editor.selectionStart;
-      const line = editor.value.slice(lineStartAt(at), at);
-      const lead = (line.match(/^[ \t]*/) || [''])[0];
-      const beforeCaret = line.replace(/[ \t]+$/, '');
-      const opens = /[{([:]$/.test(beforeCaret);
-      const nextChar = editor.value.slice(at, at + 1);
-      const closes = /^[}\])]/.test(nextChar);
-      // 光标正对着闭合括号时不加深缩进，让 } 停在原层级
-      const extra = opens && !closes ? INDENT_UNIT : '';
-      e.preventDefault();
-      replaceRange(at, at, '\n' + lead + extra);
-    }
+    // 打开时把光标放在开头，并且**不让这次初始内容算作"未保存的改动"**
+    cm.setCursor(0, 0);
+    cm.clearHistory();
+    cm.on('change', () => setDirty(true));
+    setDirty(false);
+    cm.focus();
+    const lines = cm.lineCount();
+    hint.textContent = `${langDef ? langDef.label : '纯文本'} · ${lines} 行 · ${humanSize(res.size)}`
+      + '　Tab 缩进 · Ctrl+S 保存 · Ctrl+F 查找' + (langDef && langKey === 'ts' ? '（TypeScript 按 JavaScript 高亮）' : '');
+  })().catch((e) => {
+    // 加载失败要给出**原因**（网络/镜像/文件缺失），并且仍然给一条能走通的路
+    clear(host);
+    appendAll(host, h('div.empty', [
+      h('div.big', { text: '⚠️' }),
+      h('h4', { text: '编辑器加载失败' }),
+      h('p', { text: (e && e.message) || String(e) }),
+      h('p', { text: '可以刷新页面重试；也可以用 Web 终端或下载后本地编辑。文件内容没有被改动。' }),
+    ]));
+    hint.textContent = '';
   });
-
-  render(); // 先画好再让用户看到，避免弹窗刚出现时高亮层是空的
 }
-
 // ---------- 拖拽：把 DataTransfer 展开成 {file, rel} ----------
 //
 // 只有 webkitGetAsEntry 能拿到目录与相对路径；Entry.file() / readEntries() 都是

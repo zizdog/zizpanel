@@ -2805,10 +2805,22 @@ try {
     const link = page.locator('a', { hasText: 'zp-ui-test.txt' }).first();
     await link.waitFor({ timeout: 10000 });
     await link.click();
-    await page.waitForSelector('.modal textarea', { timeout: 10000 });
+    // 编辑器是内嵌的 CodeMirror（2026-09-22 起）：等 .CodeMirror 挂上再操作。
+    // 不能用 page.fill('.modal textarea')：CM 的输入层也是个隐藏 textarea，
+    // 直接塞值它会读不到（表现为"填了没反应"）。
+    await page.waitForSelector('.modal .CodeMirror', { timeout: 20000 });
     await page.waitForTimeout(600);
     await shot('42a-files-editor');
-    await page.fill('.modal textarea', 'hello from ui test');
+    await page.locator('.modal .CodeMirror').click();
+    await page.keyboard.press('ControlOrMeta+a');
+    await page.keyboard.type('hello from ui test');
+    const typed = await page.evaluate(() => {
+      const el = document.querySelector('.modal .CodeMirror');
+      return el && el.CodeMirror ? el.CodeMirror.getValue() : '';
+    });
+    if (!typed.includes('hello from ui test')) {
+      throw new Error('CodeMirror 里没有出现输入的内容，实际：' + JSON.stringify(typed));
+    }
     await page.click('.modal button:has-text("保存")');
     await page.waitForTimeout(2500);
     await shot('42-files-edited');
