@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS nav_items (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_nav_items_group ON nav_items(group_id);
+
+CREATE TABLE IF NOT EXISTS nav_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 `
 
 // NavGroup 是一个分组（导航页上的一个区段）。
@@ -408,4 +413,78 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ---------- 外观设置（标题 / 副标题 / 主题色 / 背景图）----------
+
+// NavSettings 是导航页的外观设置。
+//
+// 用户 2026-09-18 要求：「标题要可以改！要可以自定义背景图！要可以指定主题色！」
+//
+// 为什么存**导航页自己的表**而不是面板 config：
+//   - 它属于导航页的数据，应该跟分组/站点一起进备份与恢复 ——
+//     nav_settings 由 navSchema 派生，自动出现在 KnownTables()（备份兼容性判定的唯一依据）；
+//   - 面板 config 是**面板级**设置（监听地址、TLS、镜像…）。把页面外观塞进去，
+//     "恢复导航页数据"就变成了"改面板全局配置"，那是两件不同的事。
+//
+// 空值有明确含义 = "用默认"：标题回落到「导航页」、背景回落到无图、
+// 主题色回落到面板品牌色。所以保存空串是**有效操作**（清除自定义），不是异常。
+type NavSettings struct {
+	Title      string `json:"title"`
+	Subtitle   string `json:"subtitle"`
+	Accent     string `json:"accent"`
+	Background string `json:"background"`
+}
+
+// navSettingKeys 是允许写入的键（白名单）。
+//
+// 不用"随便存"：这张表将来可能被别处复用，放开键名等于放开一个任意键值存储，
+// 备份/恢复时的语义也就说不清了。
+var navSettingKeys = []string{"title", "subtitle", "accent", "background"}
+
+// NavSettings 读取外观设置（缺的键回落到空串 = 用默认）。
+func (s *Store) NavSettings(ctx context.Context) (NavSettings, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM nav_settings`)
+	if err != nil {
+		return NavSettings{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	m := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return NavSettings{}, err
+		}
+		m[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return NavSettings{}, err
+	}
+	return NavSettings{
+		Title:      m["title"],
+		Subtitle:   m["subtitle"],
+		Accent:     m["accent"],
+		Background: m["background"],
+	}, nil
+}
+
+// SaveNavSettings 整体写入外观设置（单事务；空值也写，表示"用默认"）。
+func (s *Store) SaveNavSettings(ctx context.Context, n NavSettings) error {
+	vals := map[string]string{
+		"title": n.Title, "subtitle": n.Subtitle,
+		"accent": n.Accent, "background": n.Background,
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, k := range navSettingKeys {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO nav_settings(key, value) VALUES(?,?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, vals[k]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

@@ -36,6 +36,7 @@ window.addEventListener('storage', (e) => { if (e.key === THEME_KEY) applyTheme(
 const app = document.getElementById('app');
 const search = document.getElementById('search');
 const subtitle = document.getElementById('subtitle');
+const navTitle = document.getElementById('nav-title');
 
 let groups = [];
 let items = [];
@@ -47,6 +48,45 @@ const el = (tag, cls, text) => {
   if (text !== undefined && text !== null) n.textContent = String(text);
   return n;
 };
+
+// applySettings 把面板里配置的外观应用到这一页（标题 / 副标题 / 主题色 / 背景图）。
+//
+// 用户 2026-09-18 要求：「标题要可以改！要可以自定义背景图！要可以指定主题色！」
+// 设置随公开的 ./data 一起下发（未登录也能读到 —— 这些本来就是给访客看的东西）。
+// 主题色用 CSS 变量覆盖；背景图铺满整页并压一层暗色遮罩，保证卡片文字可读。
+function applySettings(st) {
+  const s = st || {};
+  const title = String(s.title || '').trim();
+  if (title) {
+    if (navTitle) navTitle.textContent = title;
+    document.title = title + ' · ZizPanel';
+  }
+  const sub = String(s.subtitle || '').trim();
+  if (sub && subtitle) subtitle.textContent = sub;
+
+  // 只认 #rrggbb（与服务端同一条判据）：拼进 CSS 之前再校验一次。
+  const accent = /^#[0-9a-f]{6}$/i.test(String(s.accent || '')) ? String(s.accent) : '';
+  const root = document.documentElement;
+  if (accent) {
+    root.style.setProperty('--brand', accent);
+    // 由主题色算出柔和的强调底色（color-mix 在现代 Safari/Chrome 都可用；
+    // 不支持时只是没有那层柔光，不影响主色本身）。
+    root.style.setProperty('--brand-soft', 'color-mix(in srgb, ' + accent + ' 16%, transparent)');
+  } else {
+    root.style.removeProperty('--brand');
+    root.style.removeProperty('--brand-soft');
+  }
+
+  const bg = String(s.background || '').trim();
+  if (bg) {
+    const safe = bg.replace(/["'()\\\s]/g,
+      (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    document.body.style.backgroundImage =
+      'linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,.35)), url("' + safe + '")';
+  } else {
+    document.body.style.backgroundImage = '';
+  }
+}
 
 function iconNode(it) {
   const icon = String(it.icon || '').trim();
@@ -144,6 +184,7 @@ async function load() {
     }
     groups = (body.data && body.data.groups) || [];
     items = (body.data && body.data.items) || [];
+    applySettings(body.data && body.data.settings);
   } catch (e) {
     groups = [];
     items = [];

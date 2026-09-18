@@ -534,7 +534,13 @@ func (s *Server) navTree(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"groups": groups, "items": items}, nil
+	settings, err := s.Store.NavSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// 外观设置随数据一起返回：**公开别名页（未登录）也必须能拿到** ——
+	// 标题 / 主题色 / 背景图都是给访问者看的，不含任何敏感信息。
+	return map[string]any{"groups": groups, "items": items, "settings": settings}, nil
 }
 
 func (s *Server) handleNavTree(w http.ResponseWriter, r *http.Request) {
@@ -548,6 +554,122 @@ func (s *Server) handleNavTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, tree)
+}
+
+// ---------- 外观设置（标题 / 副标题 / 主题色 / 背景图）----------
+//
+// 用户 2026-09-18 要求：「标题要可以改！要可以自定义背景图！要可以指定主题色！」
+// 数据存导航页自己的 nav_settings 表（跟分组/站点一起进备份，见 store/nav.go）。
+
+// 上限与面板其它一行文案一致：标题是标题，不是正文。
+const (
+	navMaxTitleLen    = 40
+	navMaxSubtitleLen = 60
+)
+
+// navAccentRe 是主题色的**唯一**合法形状：#rrggbb（六个十六进制位）。
+//
+// 为什么卡这么死：主题色会直接拼进 CSS 自定义属性。命名色、rgb()/hsl()、
+// 8 位带透明度、以及任何含分号/括号的串都可能被拿来注入（例如
+// `#fff; background-image:url(...)`）。判据是"能安全拼进 CSS 的最小形状"，
+// 不是"看起来像颜色"。
+var navAccentRe = regexp.MustCompile(`^#[0-9a-f]{6}$`)
+
+// navSettingsReq 是 POST /api/v1/nav/settings 的请求体。
+type navSettingsReq struct {
+	Title      string `json:"title"`
+	Subtitle   string `json:"subtitle"`
+	Accent     string `json:"accent"`
+	Background string `json:"background"`
+}
+
+func (s *Server) handleNavSettingsGet(w http.ResponseWriter, r *http.Request) {
+	if err := s.navEnsure(r.Context()); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	set, err := s.Store.NavSettings(r.Context())
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "读取导航页外观设置失败: "+err.Error())
+		return
+	}
+	ok(w, set)
+}
+
+func (s *Server) handleNavSettingsSave(w http.ResponseWriter, r *http.Request) {
+	var req navSettingsReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	set, err := validateNavSettings(req)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.navEnsure(r.Context()); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.Store.SaveNavSettings(r.Context(), set); err != nil {
+		s.audit(r, "nav_settings_save", "外观设置", "失败: "+err.Error(), false, "")
+		fail(w, http.StatusInternalServerError, "保存导航页外观设置失败: "+err.Error())
+		return
+	}
+	s.audit(r, "nav_settings_save", "外观设置",
+		fmt.Sprintf("标题=%q 主题色=%q 背景=%q", set.Title, set.Accent, set.Background), true, "")
+	ok(w, set)
+}
+
+// validateNavSettings 校验并规范化外观设置（返回人话错误）。
+func validateNavSettings(req navSettingsReq) (store.NavSettings, error) {
+	var out store.NavSettings
+	title, err := navCleanOptional(req.Title, navMaxTitleLen, "标题")
+	if err != nil {
+		return out, err
+	}
+	sub, err := navCleanOptional(req.Subtitle, navMaxSubtitleLen, "副标题")
+	if err != nil {
+		return out, err
+	}
+	accent := strings.ToLower(strings.TrimSpace(req.Accent))
+	if accent != "" && !navAccentRe.MatchString(accent) {
+		return out, errors.New("主题色只接受 #rrggbb 形式的十六进制颜色（例如 #3b82f6）")
+	}
+	bg, err := validateNavBackground(req.Background)
+	if err != nil {
+		return out, err
+	}
+	out.Title, out.Subtitle, out.Accent, out.Background = title, sub, accent, bg
+	return out, nil
+}
+
+// validateNavBackground 校验背景图：空 / 面板自己托管的图片 / http(s) 直链。
+//
+// 与图标同一条思路（见 validateNavIcon）：只放行"面板生成的内容哈希名"这一种
+// 相对路径，其余相对路径（`//evil.com`、`../`、`javascript:`）一律拒绝。
+func validateNavBackground(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", nil
+	}
+	if len(v) > navMaxIconLen {
+		return "", fmt.Errorf("背景图地址过长（上限 %d 字符）", navMaxIconLen)
+	}
+	if navLocalIconRe.MatchString(v) {
+		return v, nil
+	}
+	if reScheme.MatchString(v) {
+		u, err := url.Parse(v)
+		if err != nil || u.Host == "" {
+			return "", errors.New("背景图地址不是合法的 URL")
+		}
+		if sc := strings.ToLower(u.Scheme); sc != "http" && sc != "https" {
+			return "", errors.New("背景图只支持 http:// 或 https:// 直链，或在面板里上传一张")
+		}
+		return v, nil
+	}
+	return "", errors.New("背景图只支持面板里上传的图片或 http(s) 直链（不能是相对路径）")
 }
 
 // ---------- 导入 / 导出 ----------

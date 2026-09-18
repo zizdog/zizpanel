@@ -149,6 +149,10 @@ export const api = {
   navIcons: () => request('GET', `${API_BASE}/nav/icons`),
   navIconUpload: (file) => api.upload(apiURL('nav/icons'), file, 'file'),
   navIconDelete: (name) => request('DELETE', `${API_BASE}/nav/icons/${encodeURIComponent(name)}`),
+  // 导航页外观（标题 / 副标题 / 主题色 / 背景图）。背景图上传走独立入口（上限 8 MiB）。
+  navSettings: () => request('GET', `${API_BASE}/nav/settings`),
+  navSaveSettings: (payload) => request('POST', `${API_BASE}/nav/settings`, payload),
+  navBackgroundUpload: (file) => api.upload(apiURL('nav/background'), file, 'file'),
   navImport: (doc) => request('POST', `${API_BASE}/nav/import`, doc),
   navExportURL: () => apiURL('nav/export'),
   // 独立别名页地址：用当前访问的面板地址推导，而不是写死主机 ——

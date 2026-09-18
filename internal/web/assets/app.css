@@ -556,6 +556,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .zp-nav-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
 .zp-nav-empty-inline { grid-column: 1 / -1; color: var(--text-mute); font-size: 12.5px; padding: 10px 2px; }
 
+/* 导航页外观（用户 2026-09-18 要求：标题可改 / 自定义背景图 / 指定主题色）。
+   主题色用**局部变量** --nav-accent：只影响导航页自己的容器，
+   绝不去改面板全局的 --brand（那会把整个面板的按钮/高亮都换色，不是用户的诉求）。 */
+.zp-nav-title { font-size: 15px; font-weight: 650; letter-spacing: .2px; margin-right: 4px; }
+.zp-nav-subtitle { font-size: 11.5px; color: var(--text-mute); margin-right: 4px; }
+.zp-nav-surface {
+  border-radius: var(--radius);
+  background-size: cover; background-position: center; background-attachment: fixed;
+  padding: 2px; /* 有背景图时留一点内边距，卡片不至于贴边 */
+}
+
 .zp-nav-card-wrap { display: flex; flex-direction: column; min-width: 0; }
 .zp-nav-card {
   display: flex; align-items: center; gap: 12px; padding: 13px 14px; min-height: 70px;
@@ -566,7 +577,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .zp-nav-card:hover {
   transform: translateY(-2px); box-shadow: var(--shadow); text-decoration: none;
-  border-color: color-mix(in srgb, var(--border) 62%, var(--brand));
+  /* --nav-accent = 用户在「🎨 外观」里指定的主题色（没设就跟随面板品牌色）。 */
+  border-color: color-mix(in srgb, var(--border) 62%, var(--nav-accent, var(--brand)));
 }
 .zp-nav-card-top { flex: 0 0 auto; display: flex; align-items: center; }
 .zp-nav-icon {

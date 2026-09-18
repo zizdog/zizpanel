@@ -37,16 +37,21 @@ function faviconOf(rawURL) {
   }
 }
 
-// uploadNavIcon 让用户挑一张本地图片，上传成面板自己托管的图标。
+// uploadNavImage 让用户挑一张本地图片，上传成面板自己托管的图片。
 //
-// 用户 2026-09-18 要求："导航页要求可以上传本地图标！"
-// 图标落在面板数据目录的 nav-icons/ 里（文件名是内容哈希），
-// 读取走公开的 /nav/icons/<name>（导航页是匿名首页，图标必须匿名可读）。
-// 上传成功后把地址直接填进图标输入框 —— 用户点「保存」才真正生效。
-async function uploadNavIcon(iconInput, btn) {
+// 用户 2026-09-18 要求："导航页要求可以上传本地图标！"以及"要可以自定义背景图！"
+// 两者共用这套逻辑，只是接口/上限/格式不同：
+//   · 图标 —— /api/v1/nav/icons，≤512 KiB，png/jpg/gif/webp/svg/ico；
+//   · 背景图 —— /api/v1/nav/background，≤8 MiB，png/jpg/webp（不收 SVG）。
+// 文件都落在面板数据目录的 nav-icons/ 里（文件名是内容哈希），
+// 读取走公开的 /nav/icons/<name>（导航页是匿名首页，图片必须匿名可读）。
+// 上传成功后把地址填进输入框 —— 用户点「保存」才真正生效。
+async function uploadNavImage(input, btn, what, isBackground) {
   const picker = h('input', {
     type: 'file',
-    accept: '.png,.jpg,.jpeg,.gif,.webp,.svg,.ico,image/png,image/jpeg,image/gif,image/webp,image/svg+xml,image/x-icon',
+    accept: isBackground
+      ? '.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp'
+      : '.png,.jpg,.jpeg,.gif,.webp,.svg,.ico,image/png,image/jpeg,image/gif,image/webp,image/svg+xml,image/x-icon',
     style: { display: 'none' },
   });
   picker.onchange = async () => {
@@ -57,11 +62,11 @@ async function uploadNavIcon(iconInput, btn) {
     btn.disabled = true;
     btn.textContent = '上传中…';
     try {
-      const info = await api.navIconUpload(f);
-      iconInput.value = (info && info.url) || '';
-      toast('图标已上传：' + f.name + '。点「保存」后这条才生效', 'ok', 6000);
+      const info = isBackground ? await api.navBackgroundUpload(f) : await api.navIconUpload(f);
+      input.value = (info && info.url) || '';
+      toast(what + '已上传：' + f.name + '。点「保存」后生效', 'ok', 6000);
     } catch (e) {
-      toast('图标上传失败：' + e.message, 'err', 9000);
+      toast(what + '上传失败：' + e.message, 'err', 9000);
     } finally {
       btn.disabled = false;
       btn.textContent = oldText;
@@ -78,11 +83,11 @@ async function uploadNavIcon(iconInput, btn) {
 // 为什么必须有个看图的选择器（用户："也可以在已经上传的图标中选择！"）：
 // 落盘文件名是内容哈希（防穿越、天然去重），人根本认不出来是哪张 ——
 // 只给一个文件名列表等于让用户猜。
-async function pickUploadedIcon(iconInput) {
+async function pickUploadedIcon(iconInput, what = '图标') {
   const grid = h('div.zp-icon-grid');
   const status = h('div.hint', { text: '正在读取已上传的图标…' });
   const m = modal({
-    title: '从已上传的图标中选择',
+    title: '从已上传的' + what + '中选择',
     wide: true,
     body: h('div', [status, grid]),
     footer: (close) => [h('button.btn', { text: '关闭', onclick: close })],
@@ -96,7 +101,7 @@ async function pickUploadedIcon(iconInput) {
     return m;
   }
   if (icons.length === 0) {
-    status.textContent = '还没有上传过图标 —— 到「编辑站点 → 图标」那一行点「⬆ 上传本地图标」。';
+    status.textContent = '还没有上传过' + what + ' —— 用上面的「⬆ 上传」按钮先传一张。';
     return m;
   }
   status.textContent = '共 ' + icons.length + ' 张：点一张就选中（🗑 删除该图，已引用的条目会显示默认图标）';
@@ -110,7 +115,7 @@ async function pickUploadedIcon(iconInput) {
         onclick: () => {
           iconInput.value = ic.url;
           m.close();
-          toast('已选择图标，点「保存」后生效', 'ok');
+          toast('已选择' + what + '，点「保存」后生效', 'ok');
         },
       }),
       h('button.btn.btn-sm.btn-icon.btn-danger.zp-icon-del', {
@@ -145,6 +150,9 @@ export function NavView(content, ctx = {}) {
   let edit = false;
   let query = '';
   let loaded = false;
+  // 外观设置（标题 / 副标题 / 主题色 / 背景图），随 navTree 一起返回，
+  // 面板内页面与独立别名页共用同一份（存 nav_settings 表）。
+  let settings = {};
 
   const toolbar = h('div.zp-nav-toolbar');
   const body = h('div', { id: 'zp-nav-body' });
@@ -160,7 +168,9 @@ export function NavView(content, ctx = {}) {
       const tree = await api.navTree();
       groups = (tree && tree.groups) || [];
       items = (tree && tree.items) || [];
+      settings = (tree && tree.settings) || {};
       loaded = true;
+      applyAppearance();
       renderBody();
     } catch (e) {
       loaded = true;
@@ -202,6 +212,115 @@ export function NavView(content, ctx = {}) {
       .filter((x) => x.list.length > 0);
   }
 
+  // ---------------- 外观（标题 / 主题色 / 背景图）----------------
+  //
+  // 用户 2026-09-18 要求：「标题要可以改！要可以自定义背景图！要可以指定主题色！」
+  // 设置存在服务端（nav_settings 表），面板内页面与独立别名页共用同一份 ——
+  // 所以在面板里改完，访客打开的 /nav/ 也会是同一套外观。
+
+  // safeAccent 只认 #rrggbb（与服务端同一条判据）：拼进 CSS 之前**再校验一次**，
+  // 免得坏数据（手工改库、旧版本残留）把样式注入点打开。
+  const safeAccent = () => (/^#[0-9a-f]{6}$/i.test(String(settings.accent || ''))
+    ? String(settings.accent) : '');
+
+  // cssURL 把地址安全地拼进 CSS 的 url("…")：引号/括号/反斜杠/空白一律百分号化。
+  const cssURL = (u) => String(u).replace(/["'()\\\s]/g,
+    (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
+  function applyAppearance() {
+    const accent = safeAccent();
+    // 主题色只作用于导航页自己的容器（--nav-accent），不动面板全局 --brand：
+    // 用户要的是"这个页面的主题色"，不是"把整个面板换色"。
+    if (accent) content.style.setProperty('--nav-accent', accent);
+    else content.style.removeProperty('--nav-accent');
+    const bg = String(settings.background || '').trim();
+    if (bg) {
+      // 压一层暗色遮罩：亮背景图会把卡片文字吃掉，可读性优先。
+      content.style.backgroundImage =
+        'linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,.35)), url("' + cssURL(bg) + '")';
+    } else {
+      content.style.backgroundImage = '';
+    }
+  }
+
+  // appearanceForm 是「🎨 外观」弹窗：标题 / 副标题 / 主题色 / 背景图。
+  function appearanceForm() {
+    const title = h('input.input', {
+      type: 'text', value: settings.title || '', placeholder: '导航页（默认）', maxlength: '40',
+    });
+    const subtitle = h('input.input', {
+      type: 'text', value: settings.subtitle || '', placeholder: 'ZizPanel · 自托管首页（默认）', maxlength: '60',
+    });
+    const accent = h('input.input', {
+      type: 'text', value: settings.accent || '', placeholder: '#3b82f6（默认跟随面板）', maxlength: '7',
+    });
+    const colorPick = h('input', { type: 'color', value: safeAccent() || '#3b82f6', title: '用取色器选一个主题色' });
+    colorPick.oninput = () => { accent.value = colorPick.value; };
+    const presets = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4'];
+    const swatches = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
+      presets.map((c) => h('button.btn.btn-sm', {
+        text: '●', title: '用 ' + c, style: { color: c, fontWeight: '700' },
+        onclick: () => { accent.value = c; colorPick.value = c; },
+      })).concat([
+        h('button.btn.btn-sm', { text: '恢复默认', title: '清空主题色，跟随面板品牌色', onclick: () => { accent.value = ''; } }),
+      ]));
+
+    const bgInput = h('input', { type: 'hidden', value: settings.background || '' });
+    const bgPreview = h('img', {
+      alt: '', style: { maxWidth: '100%', maxHeight: '150px', borderRadius: '8px', display: 'none', marginTop: '8px' },
+    });
+    const refreshBg = () => {
+      const v = String(bgInput.value || '').trim();
+      if (v) { bgPreview.src = v; bgPreview.style.display = 'block'; } else { bgPreview.style.display = 'none'; }
+    };
+    refreshBg();
+    const bgUp = h('button.btn.btn-sm', { text: '⬆ 上传背景图', title: 'png / jpg / webp，≤8 MiB' });
+    bgUp.onclick = async () => { await uploadNavImage(bgInput, bgUp, '背景图', true); refreshBg(); };
+    const bgPick = h('button.btn.btn-sm', { text: '🖼 已上传', title: '从已经上传过的图片里挑一张' });
+    bgPick.onclick = () => pickUploadedIcon(bgInput, '背景图');
+    const bgClear = h('button.btn.btn-sm', { text: '清除背景', title: '恢复无背景图', onclick: () => { bgInput.value = ''; refreshBg(); } });
+
+    const okBtn = h('button.btn.btn-primary', { text: '保存外观' });
+    const m = modal({
+      title: '导航页外观',
+      wide: true,
+      body: h('div', [
+        h('div.field', [h('label', { text: '标题' }), title,
+          h('div.hint', { text: '显示在导航页左上角。留空 = 「导航页」。' })]),
+        h('div.field', [h('label', { text: '副标题' }), subtitle,
+          h('div.hint', { text: '标题下面那行小字。留空 = 默认。' })]),
+        h('div.field', [h('label', { text: '主题色' }),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+            [accent, colorPick, swatches]),
+          h('div.hint', { text: '只影响导航页自己的强调色（卡片悬停边框、搜索框聚焦…），不会改面板其它页面的配色。' })]),
+        h('div.field', [h('label', { text: '背景图' }),
+          h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [bgUp, bgPick, bgClear]),
+          h('div.hint', { text: 'png / jpg / webp，≤8 MiB。铺满整页（cover），并压一层暗色遮罩保证文字可读。' }),
+          bgPreview]),
+      ]),
+      footer: (close) => [h('button.btn', { text: '取消', onclick: close }), okBtn],
+    });
+    okBtn.onclick = async () => {
+      okBtn.disabled = true;
+      try {
+        const saved = await api.navSaveSettings({
+          title: title.value.trim(),
+          subtitle: subtitle.value.trim(),
+          accent: accent.value.trim(),
+          background: bgInput.value.trim(),
+        });
+        if (saved) settings = saved;
+        applyAppearance();
+        renderToolbar();
+        m.close();
+        toast('外观已保存 —— 独立导航页刷新后同样生效', 'ok', 5000);
+      } catch (e) {
+        toast('保存外观失败：' + e.message, 'err', 9000);
+        okBtn.disabled = false;
+      }
+    };
+  }
+
   // ---------------- 工具栏 ----------------
 
   function renderToolbar() {
@@ -214,6 +333,9 @@ export function NavView(content, ctx = {}) {
       oninput: (e) => { query = e.target.value; renderBody(); },
     });
     appendAll(toolbar,
+      h('b.zp-nav-title', { text: String(settings.title || '').trim() || '导航页' }),
+      String(settings.subtitle || '').trim()
+        ? h('span.zp-nav-subtitle', { text: String(settings.subtitle).trim() }) : null,
       search,
       h('div.spacer'),
       h('a.btn.btn-sm', {
@@ -221,6 +343,11 @@ export function NavView(content, ctx = {}) {
         title: '打开可在浏览器里当首页的独立导航页（未登录也能看）',
         text: '↗ 独立页',
       }),
+      edit ? h('button.btn.btn-sm', {
+        text: '🎨 外观', dataset: { testid: 'nav-appearance' },
+        title: '改标题 / 副标题 / 主题色 / 背景图（独立导航页同样生效）',
+        onclick: appearanceForm,
+      }) : null,
       edit ? h('button.btn.btn-sm', {
         text: '＋ 站点', dataset: { testid: 'nav-add-item' },
         onclick: () => itemForm(null, groups.length ? idOf(groups[0]) : 0),
@@ -492,7 +619,7 @@ export function NavView(content, ctx = {}) {
       text: '🖼 已上传',
       title: '从你上传过的图标里挑一张（看图选择，可删除）',
     });
-    iconUp.onclick = () => uploadNavIcon(icon, iconUp);
+    iconUp.onclick = () => uploadNavImage(icon, iconUp, '图标', false);
     iconPick.onclick = () => pickUploadedIcon(icon);
 
     const okBtn = h('button.btn.btn-primary', { text: isEdit ? '保存' : '创建' });

@@ -97,7 +97,7 @@ func (s *Server) handleNavIconsList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// 一个都没传过：如实返回空列表，不是错误。
-			ok(w, map[string]any{"icons": []navIconInfo{}, "max_bytes": navIconMaxBytes})
+			ok(w, map[string]any{"icons": []navIconInfo{}, "max_bytes": navIconMaxBytes, "background_max_bytes": navBackgroundMaxBytes})
 			return
 		}
 		fail(w, http.StatusInternalServerError, "读取图标目录失败: "+err.Error())
@@ -124,47 +124,85 @@ func (s *Server) handleNavIconsList(w http.ResponseWriter, r *http.Request) {
 	if len(out) > navIconListMax {
 		out = out[:navIconListMax]
 	}
-	ok(w, map[string]any{"icons": out, "max_bytes": navIconMaxBytes})
+	ok(w, map[string]any{"icons": out, "max_bytes": navIconMaxBytes, "background_max_bytes": navBackgroundMaxBytes})
 }
 
-// handleNavIconUpload 接收一个本地图片文件，落盘成内容寻址的图标。
+// navBackgroundMaxBytes 是**背景图**的上限。
+//
+// 比图标（512 KiB）大得多：背景图是整屏图。8 MiB 足够放一张 2560×1440 的
+// 高质量 WebP/JPEG，又小到"不会把面板数据目录撑爆"。
+const navBackgroundMaxBytes = 8 << 20
+
+// navBackgroundExts 是背景图允许的格式。
+//
+// 刻意**不含 SVG**：背景图是以 CSS background-image 加载的，虽然这样加载的 SVG
+// 不执行脚本，但"能给整页换背景"的东西没必要开放脚本型格式。
+var navBackgroundExts = map[string]string{
+	"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
+}
+
+// handleNavIconUpload 上传一个**图标**（≤512 KiB，见 navIconMaxBytes）。
+func (s *Server) handleNavIconUpload(w http.ResponseWriter, r *http.Request) {
+	s.navStoreImageUpload(w, r, navIconMaxBytes, navIconExts, "图标", "nav_icon_upload")
+}
+
+// handleNavBackgroundUpload 上传一张**背景图**（≤8 MiB）。
+//
+// 存进同一个 nav-icons 目录：文件名是内容哈希，天然不会与图标撞名，
+// 读取也复用同一个公开入口 /nav/icons/<name>（带 immutable 缓存头）——
+// 背景图必须匿名可读，因为导航页本身就是匿名首页。
+func (s *Server) handleNavBackgroundUpload(w http.ResponseWriter, r *http.Request) {
+	s.navStoreImageUpload(w, r, navBackgroundMaxBytes, navBackgroundExts, "背景图", "nav_background_upload")
+}
+
+// navStoreImageUpload 是图标与背景图**共用**的落盘逻辑（只有上限/格式/文案不同）。
 //
 // 幂等：同一张图再传一次得到同一个名字（内容一样），不会堆重复文件。
-func (s *Server) handleNavIconUpload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) navStoreImageUpload(w http.ResponseWriter, r *http.Request,
+	maxBytes int64, exts map[string]string, what string, auditAction string) {
 	dir := s.navIconsDir()
 	if dir == "" {
-		fail(w, http.StatusInternalServerError, "面板数据目录未配置，无法保存图标")
+		fail(w, http.StatusInternalServerError, "面板数据目录未配置，无法保存"+what)
 		return
 	}
+	limitText := fmt.Sprintf("%d KiB", maxBytes>>10)
+	if maxBytes >= 1<<20 {
+		limitText = fmt.Sprintf("%d MiB", maxBytes>>20)
+	}
 	// 先给整个请求体设上限（multipart 的边界/头部也占字节，所以留一点余量）。
-	r.Body = http.MaxBytesReader(w, r.Body, navIconMaxBytes+(64<<10))
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+(64<<10))
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
-		fail(w, http.StatusBadRequest,
-			"没有收到图标文件（表单字段名必须是 file；单个文件不超过 512 KiB）: "+err.Error())
+		fail(w, http.StatusBadRequest, "没有收到"+what+"文件（表单字段名必须是 file；单个文件不超过 "+
+			limitText+"）: "+err.Error())
 		return
 	}
 	defer func() { _ = file.Close() }()
 
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(hdr.Filename), "."))
-	if _, allowed := navIconExts[ext]; !allowed {
+	if _, allowed := exts[ext]; !allowed {
+		names := make([]string, 0, len(exts))
+		for k := range exts {
+			names = append(names, k)
+		}
+		sort.Strings(names)
 		fail(w, http.StatusBadRequest,
-			"只支持这些图标格式：png / jpg / jpeg / gif / webp / svg / ico（收到的是 ."+ext+"）")
+			"这个"+what+"格式不支持："+strings.Join(names, " / ")+"（收到的是 ."+ext+"）")
 		return
 	}
-	data, rerr := io.ReadAll(io.LimitReader(file, navIconMaxBytes+1))
+	data, rerr := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if rerr != nil {
 		fail(w, http.StatusBadRequest, "读取上传内容失败: "+rerr.Error())
 		return
 	}
 	if len(data) == 0 {
-		fail(w, http.StatusBadRequest, "上传的图标是空文件（0 字节）")
+		fail(w, http.StatusBadRequest, "上传的"+what+"是空文件（0 字节）")
 		return
 	}
-	if len(data) > navIconMaxBytes {
+	if int64(len(data)) > maxBytes {
 		fail(w, http.StatusBadRequest,
-			fmt.Sprintf("图标太大：%d 字节，上限 %d 字节（512 KiB）。请先压小再上传",
-				len(data), navIconMaxBytes))
+			fmt.Sprintf("%s太大：%d 字节，上限 %d 字节（%s）。请先压小再上传",
+				what, len(data), maxBytes, limitText))
 		return
 	}
 	if err := navIconCheckMagic(ext, data); err != nil {
@@ -175,13 +213,13 @@ func (s *Server) handleNavIconUpload(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256(data)
 	name := hex.EncodeToString(sum[:8]) + "." + ext
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fail(w, http.StatusInternalServerError, "创建图标目录失败: "+err.Error())
+		fail(w, http.StatusInternalServerError, "创建图片目录失败: "+err.Error())
 		return
 	}
 	dst := filepath.Join(dir, name)
 	if st, serr := os.Stat(dst); serr == nil && st.Size() == int64(len(data)) {
 		// 内容一样 → 同一个文件。如实告诉用户"这张图之前就传过"，不制造副本。
-		s.audit(r, "nav_icon_upload", name,
+		s.audit(r, auditAction, name,
 			fmt.Sprintf("%s（%d 字节，内容已存在，复用）", hdr.Filename, len(data)), true, "")
 		ok(w, navIconInfo{Name: name, URL: navIconURLBase + name, Bytes: st.Size(),
 			Modified: st.ModTime().Format(time.RFC3339)})
@@ -189,15 +227,15 @@ func (s *Server) handleNavIconUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	tmp := dst + ".tmp"
 	if werr := os.WriteFile(tmp, data, 0o644); werr != nil {
-		fail(w, http.StatusInternalServerError, "写入图标失败: "+werr.Error())
+		fail(w, http.StatusInternalServerError, "写入"+what+"失败: "+werr.Error())
 		return
 	}
 	if rerr := os.Rename(tmp, dst); rerr != nil {
 		_ = os.Remove(tmp)
-		fail(w, http.StatusInternalServerError, "保存图标失败: "+rerr.Error())
+		fail(w, http.StatusInternalServerError, "保存"+what+"失败: "+rerr.Error())
 		return
 	}
-	s.audit(r, "nav_icon_upload", name,
+	s.audit(r, auditAction, name,
 		fmt.Sprintf("%s（%d 字节）", hdr.Filename, len(data)), true, "")
 	ok(w, navIconInfo{Name: name, URL: navIconURLBase + name, Bytes: int64(len(data)),
 		Modified: time.Now().Format(time.RFC3339)})

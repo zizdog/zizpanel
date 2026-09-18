@@ -538,6 +538,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/nav/icons", s.requireAuth(s.handleNavIconsList))
 	root.HandleFunc("POST /api/v1/nav/icons", s.requireAuth(s.handleNavIconUpload))
 	root.HandleFunc("DELETE /api/v1/nav/icons/{name}", s.requireAuth(s.handleNavIconDelete))
+	// 导航页外观设置（用户 2026-09-18 要求：标题可改 / 自定义背景图 / 指定主题色）：
+	// 背景图上传走独立入口（上限 8 MiB，图标是 512 KiB），读取复用公开的 /nav/icons/。
+	root.HandleFunc("POST /api/v1/nav/background", s.requireAuth(s.handleNavBackgroundUpload))
+	root.HandleFunc("GET /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsGet))
+	root.HandleFunc("POST /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsSave))
 
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会
