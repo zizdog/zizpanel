@@ -1150,7 +1150,7 @@ func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request)
 }
 
 // handleInstallPythonRuntime 安装应用市场里上架的一个 Python 解释器
-//（python311 / python312 / python313，见 catalog.go 与 python_runtime.go）。
+// （python311 / python312 / python313，见 catalog.go 与 python_runtime.go）。
 //
 // 它只做三件事：确保 Homebrew 在 → brewInstall（失败即换源）→ **如实报告
 // 真正装上的补丁版本**（`brew list --versions`）+ 解释器位置。
