@@ -85,6 +85,21 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 		} else {
 			s.auditAs(info, auditAction, target, summarizeResult(res), true, "")
 		}
+		// 任务收尾顺手核对一次「有 nginx、但 80 端口上还没有默认站点」+ 环境自愈。
+		//
+		// 为什么放在这个**中心位置**：nginx/PHP 可能是任务跑起来之后才装上的
+		//（一键 LNMP / 应用市场单装 nginx / 重装 nginx），而面板启动时那一次检查
+		// 早就过去了。放在每个安装路径里逐个加钩子，漏一个就是又一轮
+		// "装完没有默认网站"（2026-09-22 用户报障）。失败的任务也照查：
+		// LNMP 可能装好了 nginx、只是后面的 MySQL 步骤超时。
+		//
+		// 为什么要**后台**跑（第一版写成同步，立刻踩到）：任务中心的"结束"以这个
+		// 闭包返回为准，而自愈可能因为提权助手/探测而花上几秒到几十秒 ——
+		// 同步做会让任务看起来一直没结束，期间同一目标再点一次就是 409
+		//（单测 TestInstallLNMPEmptyBodyStillAccepted 当场变红，真机上就是
+		// "明明装完了，再点一次说它还在跑"）。自愈本来就是幂等的后台维护，
+		// 不该占着任务的生命周期。
+		s.kickEnvHeal()
 		return res, err
 	})
 	s.auditAs(info, "task_start", target, title+"（任务 "+t.ID()+"）", true, "")

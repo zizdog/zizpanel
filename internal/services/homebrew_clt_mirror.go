@@ -50,7 +50,16 @@ import (
 // 所以默认基址改成自建 NAS 镜像（5.6–8.9 MB/s）。NAS 对 /zizpanel/ 有**按需回源**
 // （nginx @pull → zizdog.com），首次取完即缓存，之后走本地。
 // 注意：它**不是**在线升级的源（升级源是 Cfg.UpgradeSource）。
-const cltMirrorBaseDefault = "https://mirror.zizdog.com:8888/zizpanel"
+// ⚠️ 2026-09-18 修正：这个常量过去写的是 `https://mirror.zizdog.com:8888/zizpanel`
+// —— 而那个**公网入口本身**已经用不了（TLS 能握手、随后空响应/连接被拒）。
+// 真机后果（重装后的 mini）：面板设置里的镜像基址探不通（正常回落），接着探这个
+// 静态兜底也探不通，于是"CLT 镜像这条路整个走不通"，只能去弹 Apple 的 GUI 对话框；
+// 而 **zizdog.com 上的同一份清单是好的**（实测 200，且有 632MB 的包），
+// NAS 局域网入口上也有整套 CLT。
+//
+// 所以静态兜底改成 zizdog.com（它是安装源，一直可达），局域网入口由
+// cltMirrorBaseFor 的候选链负责（优先、更快）。
+const cltMirrorBaseDefault = "https://zizdog.com/zizpanel"
 
 // cltInstallPkgs 是真正需要安装的组件：CLTools_Executables.pkg（576 MB，真正的
 // 工具链，`/usr/bin/python3`、`clang`、`git` 都在里面）与 CLTools_macOSNMOS_SDK.pkg
@@ -180,8 +189,13 @@ var cltMirrorSubdirs = []string{"", "/zizpanel"}
 // 探测失败不报错：CLT 安装有三条路（镜像 → softwareupdate → 弹窗），
 // 这里只是挑"镜像那条路走哪个基址"，挑不出来就交给后面的路。
 func (m *Manager) cltMirrorBaseFor(ctx context.Context) string {
-	if m.MirrorEnabled() {
-		base := m.mirrorBase()
+	// 公网基址 → 局域网基址，谁通就用谁。
+	//
+	// 2026-09-18 真机（重装后的 mini）：公网入口 mirror.zizdog.com:8888 连不上
+	// （NAS 侧反代坏了），于是 CLT 的镜像这条路整个走不通，只能去弹窗让用户手动装 ——
+	// 而**同一台 NAS 的局域网入口上整套 CLT 都在**。加这一条候选，重装/新机器上
+	// 的 CLT 就能从局域网镜像装上（快得多、也不依赖 Apple 的服务器）。
+	for _, base := range m.mirrorBaseCandidates() {
 		for _, sub := range cltMirrorSubdirs {
 			if err := m.checkMirrorURL(ctx, base+sub+"/clt/index.json"); err == nil {
 				return base + sub

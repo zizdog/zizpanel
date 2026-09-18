@@ -612,3 +612,25 @@ func TestQwenIPv4PatchIsValidPython(t *testing.T) {
 		t.Errorf("补丁没有把解析限制到 IPv4：%s", out)
 	}
 }
+
+// TestCLTStaticFallbackIsPublic：CLT 的**静态兜底**必须是公网可达的源。
+//
+// 2026-09-18 真机（重装后的 mini，用户原话："难道没有自建镜像这个面板就用不了吗"）：
+// 兜底常量当时写的是自建镜像 `https://mirror.zizdog.com:8888/zizpanel` ——
+// 那个公网入口一旦坏掉，CLT 的三条路就断了两条（镜像探不通、softwareupdate 目录也取不到），
+// 只剩"弹 Apple 的 GUI 对话框让用户手点"。而 zizdog.com（安装源，一直可达）上
+// 有同一份清单与整套包。
+//
+// 门禁：兜底地址**不许**指向任何自建/内网域名（那是"可选加速"，不是"唯一来源"）。
+func TestCLTStaticFallbackIsPublic(t *testing.T) {
+	base := cltMirrorBaseDefault
+	for _, bad := range []string{"mirror.zizdog.com:8888", "192.168.", "127.0.0.1", "localhost"} {
+		if strings.Contains(base, bad) {
+			t.Errorf("CLT 静态兜底基址 %q 指向了自建/内网地址 %q —— "+
+				"镜像挂掉时新机器将无法安装 CLT（真机事故）", base, bad)
+		}
+	}
+	if !strings.HasPrefix(base, "https://zizdog.com/") {
+		t.Errorf("CLT 静态兜底应为公网安装源 https://zizdog.com/zizpanel，实际 %q", base)
+	}
+}

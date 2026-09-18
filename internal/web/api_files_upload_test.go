@@ -40,10 +40,22 @@ type uploadPart struct {
 // 与 relpaths 数组一一对齐，顺序错了就会把 A 目录的文件写进 B 目录。
 func buildUploadBody(t *testing.T, dir string, rels []string, files []uploadPart) (*bytes.Buffer, string) {
 	t.Helper()
+	return buildUploadBodyWith(t, dir, rels, files, nil)
+}
+
+// buildUploadBodyWith 与 buildUploadBody 相同，但可以多带几个表单字段
+// （如 on_conflict —— 同名文件"覆盖还是共存"的用户选择）。
+func buildUploadBodyWith(t *testing.T, dir string, rels []string, files []uploadPart, extra map[string]string) (*bytes.Buffer, string) {
+	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	if err := mw.WriteField("dir", dir); err != nil {
 		t.Fatal(err)
+	}
+	for k, v := range extra {
+		if err := mw.WriteField(k, v); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if rels != nil {
 		raw, err := json.Marshal(rels)
@@ -760,4 +772,74 @@ func makeTestZip(t *testing.T, path string, files map[string]string) error {
 		}
 	}
 	return zw.Close()
+}
+
+// ============================================================================
+//  ⑥ 同名文件：用户必须先被问"覆盖还是共存"（2026-09-22 用户要求）
+//
+//  这条门禁锁的是**行为**（后端的两种策略与 overwritten 标记），前端的询问弹窗
+//  由 files_upload_frontend_test.go 里的静态断言 + uitest 覆盖。
+//  两条不变量：
+//    · 普通上传默认 **不覆盖**（改名保留两者）—— 静默覆盖是不可原谅的默认值；
+//    · 用户明确选 overwrite 时必须真的覆盖，并且如实回 overwritten=true。
+// ============================================================================
+
+func TestFileUploadConflictRenameAndOverwrite(t *testing.T) {
+	srv, _ := newTestServer(t)
+	dir := siteDir(t, srv, "conflict")
+
+	// 先放一个同名旧文件
+	old := filepath.Join(dir, "data.txt")
+	if err := os.WriteFile(old, []byte("OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// ① 不传 on_conflict（普通上传默认 rename）：旧文件必须原样保留，新文件改名
+	body, ct := buildUploadBody(t, dir, nil, []uploadPart{{filename: "data.txt", data: "NEW1"}})
+	rec, resp := postUpload(t, srv, body, ct)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("默认上传应当成功，实际 %d：%s", rec.Code, rec.Body.String())
+	}
+	if len(resp.Data.Uploaded) != 1 {
+		t.Fatalf("应当上传 1 个文件：%+v", resp.Data)
+	}
+	got := resp.Data.Uploaded[0]
+	if got.Name == "data.txt" || got.Overwritten {
+		t.Errorf("普通上传默认必须改名保留两者，实际 name=%q overwritten=%v", got.Name, got.Overwritten)
+	}
+	if b, _ := os.ReadFile(old); string(b) != "OLD" {
+		t.Errorf("默认策略绝不能动旧文件，实际内容 %q", b)
+	}
+	if b, _ := os.ReadFile(got.Path); string(b) != "NEW1" {
+		t.Errorf("改名后的新文件应当是新内容，实际 %q", b)
+	}
+	if !strings.Contains(resp.Data.Msg, "改名") {
+		t.Errorf("汇总文案要如实说明「自动改名保留两者」，实际 %q", resp.Data.Msg)
+	}
+
+	// ② on_conflict=overwrite：真覆盖，且如实标记
+	body2, ct2 := buildUploadBodyWith(t, dir, nil, []uploadPart{{filename: "data.txt", data: "NEW2"}},
+		map[string]string{"on_conflict": "overwrite"})
+	rec2, resp2 := postUpload(t, srv, body2, ct2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("覆盖上传应当成功，实际 %d：%s", rec2.Code, rec2.Body.String())
+	}
+	got2 := resp2.Data.Uploaded[0]
+	if got2.Name != "data.txt" || !got2.Overwritten {
+		t.Errorf("选了覆盖就必须真覆盖并标记 overwritten，实际 name=%q overwritten=%v", got2.Name, got2.Overwritten)
+	}
+	if b, _ := os.ReadFile(old); string(b) != "NEW2" {
+		t.Errorf("覆盖后旧文件内容应被替换成 NEW2，实际 %q", b)
+	}
+	if !strings.Contains(resp2.Data.Msg, "覆盖") {
+		t.Errorf("汇总文案要如实说明「覆盖了同名文件」，实际 %q", resp2.Data.Msg)
+	}
+
+	// ③ 非法策略要明确 400，不许悄悄按默认值办
+	body3, ct3 := buildUploadBodyWith(t, dir, nil, []uploadPart{{filename: "data.txt", data: "NEW3"}},
+		map[string]string{"on_conflict": "whatever"})
+	rec3, _ := postUpload(t, srv, body3, ct3)
+	if rec3.Code != http.StatusBadRequest {
+		t.Errorf("非法 on_conflict 应当 400，实际 %d：%s", rec3.Code, rec3.Body.String())
+	}
 }

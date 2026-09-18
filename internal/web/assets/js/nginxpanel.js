@@ -62,12 +62,17 @@ const TUNING_FIELDS = [
 ];
 
 // nginxPanelModal 打开「Nginx 管理」。
-export function nginxPanelModal() {
+//
+// opts.tab 可以指定初始页签（service / config / tuning / logs）—— 上传/执行限制
+// 弹窗里那颗「去 Nginx 管理改」的按钮就直接落到「性能调整」，
+// 用户点一下就到地方，而不是自己猜在哪一页。
+export function nginxPanelModal(opts = {}) {
   const body = h('div');
   const tabsBox = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' } });
   const m = modal({ title: '⚙️ Nginx 管理', wide: true, body: h('div', [tabsBox, body]) });
 
-  let tab = 'tuning';
+  const VALID_TABS = ['service', 'config', 'tuning', 'logs'];
+  let tab = VALID_TABS.includes(opts.tab) ? opts.tab : 'tuning';
   let tuning = null; // 上一次读到的参数（保存后刷新）
 
   function drawTabs() {

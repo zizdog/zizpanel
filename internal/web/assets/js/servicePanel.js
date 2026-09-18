@@ -1042,7 +1042,7 @@ export async function openServicePanel(o = {}) {
         text: '⚡ 上传大小 / 执行时间',
         title: '直接在面板里改「一次能传多大」（nginx + PHP 一起改，改完自动重载 nginx、重启 php-fpm，'
           + '并回读生效值）—— 不需要编辑配置文件',
-        onclick: () => uploadLimitsModal(),
+        onclick: () => uploadLimitsModal({ openNginxTuning: () => nginxPanelModal({ tab: 'tuning' }) }),
       }));
     }
 

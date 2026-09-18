@@ -722,11 +722,79 @@ export function FilesView(content, ctx = {}) {
       if (!entries.length) return;
       const problem = precheckUpload(entries);
       if (problem) { showUploadProblem(problem); return; }
-      await runUpload(entries, { folder: !!opts.folder });
+      // 同名文件先问清楚：覆盖还是共存（用户 2026-09-22 明确要求）。
+      // 上传文件夹不走这个询问 —— 它的语义本来就是"按原结构覆盖整站"，
+      // 进度窗里也明说了；把 index.php 问成 index-1.php 会让站点直接跑不起来。
+      let onConflict = '';
+      if (!opts.folder) {
+        const dup = conflictNames(entries);
+        if (dup.length) {
+          const choice = await askUploadConflict(dup, entries.length);
+          if (!choice) return; // 用户取消：一个字节都没上传
+          onConflict = choice;
+        }
+      }
+      await runUpload(entries, { folder: !!opts.folder, onConflict });
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       toast('上传未能开始：' + msg, 'err', 15000);
     }
+  }
+
+  // conflictNames 返回这一批里"目标目录已存在同名条目"的文件名（去重）。
+  //
+  // 判据用**当前目录的列表**（lastList）：用户看到的就是它，所以弹窗里说的
+  // 名字与他屏幕上的一致。列表可能已经过期（别人刚传过），那种情况由服务端兜底
+  // （on_conflict 传到后端，真正落盘时再判一次）。
+  function conflictNames(entries) {
+    const have = new Set(((lastList && lastList.entries) || []).map((e) => e.name));
+    const out = [];
+    for (const e of entries) {
+      const base = e.rel.split('/').pop();
+      if (have.has(base) && !out.includes(base)) out.push(base);
+    }
+    return out;
+  }
+
+  // askUploadConflict 问用户"同名文件怎么办"，返回 'rename' / 'overwrite' / null（取消）。
+  //
+  // 默认选中「保留两者」：不覆盖是最安全的默认值（覆盖别人的文件不可逆）。
+  function askUploadConflict(names, total) {
+    return new Promise((resolve) => {
+      let picked = 'rename';
+      const radios = [
+        { v: 'rename', label: '保留两者（推荐）', desc: '同名文件自动改名（如 index-1.php），两个都留着，什么都不丢。' },
+        { v: 'overwrite', label: '覆盖同名文件', desc: '用新上传的文件替换旧文件 —— 旧内容不可恢复，请确认。' },
+      ];
+      const inputs = radios.map((r) => h('input', {
+        type: 'radio', name: 'zp-upload-conflict', value: r.v, checked: r.v === picked,
+        onchange: () => { picked = r.v; },
+      }));
+      const body = h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
+        h('p', { text: `目标目录里已经有 ${names.length} 个同名文件（本次共 ${total} 个文件）：` }),
+        h('ul', { style: { margin: '6px 0 10px 18px', maxHeight: '160px', overflow: 'auto' } },
+          names.slice(0, 50).map((n) => h('li', { text: n }))),
+        ...radios.map((r, i) => h('label', {
+          style: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '8px 10px',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', marginBottom: '8px', cursor: 'pointer' },
+        }, [inputs[i], h('div', [
+          h('div', { style: { fontWeight: '600' }, text: r.label }),
+          h('div', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: r.desc }),
+        ])])),
+        h('div.hint', { text: '这个选择对本次上传的所有同名文件都生效。' }),
+      ]);
+      const m = modal({
+        title: '同名文件已存在',
+        body,
+        footer: [
+          h('button.btn', { text: '取消上传', onclick: () => { m.close(); resolve(null); } }),
+          h('button.btn.btn-primary', {
+            text: '继续上传',
+            onclick: () => { m.close(); resolve(picked); },
+          }),
+        ],
+      });
+    });
   }
 
   // precheckUpload 在**发请求之前**做本地校验，返回 null 表示可以上传。
@@ -770,7 +838,7 @@ export function FilesView(content, ctx = {}) {
   }
 
   // runUpload 真正发请求：XHR + 进度窗。
-  async function runUpload(entries, { folder }) {
+  async function runUpload(entries, { folder, onConflict }) {
     const total = entries.reduce((s, e) => s + (e.file.size || 0), 0);
 
     // ---- 进度窗（先建窗口，再拼请求体）----
@@ -867,6 +935,9 @@ export function FilesView(content, ctx = {}) {
     try {
       fd = new FormData();
       fd.append('dir', cwd);
+      // on_conflict：用户在上面那个弹窗里的选择（普通上传才有）。
+      // 传空时后端按形态取默认值（普通=rename 保留两者，文件夹=overwrite）。
+      if (onConflict) fd.append('on_conflict', onConflict);
       if (folder) {
         // 相对路径按顺序与 files 一一对应；后端 Go 的 multipart 解析对同一字段名保序。
         fd.append('relpaths', JSON.stringify(entries.map((e) => e.rel)));
@@ -895,6 +966,14 @@ export function FilesView(content, ctx = {}) {
       lineRate.textContent = `共 ${humanSize(uploaded.reduce((s, u) => s + (u.size || 0), 0))} · 用时 ${duration((Date.now() - started) / 1000)}`;
       clear(lineNote);
       if (overwritten) appendAll(lineNote, h('div', { text: `其中 ${overwritten} 个覆盖了同名文件。` }));
+      else if (payload.on_conflict === 'rename') {
+        const renamed = uploaded.filter((u) => basename(u.rel_path || u.name || '') !== (u.name || ''));
+        if (renamed.length) {
+          appendAll(lineNote, h('div', { text: `其中 ${renamed.length} 个与已有文件重名，已自动改名（两个都保留）：` }),
+            h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } },
+              renamed.slice(0, 10).map((u) => h('li', { text: `${basename(u.rel_path || '')} → ${u.name}` }))));
+        }
+      }
       if (failed.length) {
         appendAll(lineNote,
           h('div', { style: { color: 'var(--warn)', marginTop: '6px' }, text: `${failed.length} 个文件失败：` }),
@@ -1380,6 +1459,15 @@ function ensureEditorStyle() {
     '.zpf-code, .zpf-lines { margin: 0; transform-origin: 0 0; will-change: transform; }',
     // <code> 默认是 inline，而 transform 对 inline 元素无效 —— 不改成 block 滚动同步会静默失效
     '.zpf-code { display: block; }',
+    // ⚠️ 必须显式 inherit 字体，否则高亮层和输入层**不是同一个字体**。
+    //
+    // 根因（2026-09-22 用户报障："光标严重偏移"）：浏览器 UA 样式表给 `code` 元素
+    // 直接写了 `font-family: monospace`，而**直接作用在元素上的规则压过从父节点继承**
+    // —— 于是外层 <pre>（我们内联设了 var(--mono)，即 ui-monospace / SF Mono…）
+    // 里的那个 <code class="zpf-code"> 实际用的是通用 monospace。
+    // 两种等宽字体的字符宽度不一样：textarea 里画的光标按 SF Mono 的列宽走，
+    // 屏幕上的字却按通用 monospace 的列宽排 —— 逐列错开，行越长偏得越多。
+    '.zpf-code { font: inherit; letter-spacing: inherit; }',
     // 输入层的文字永远不可见（高亮层负责显示），否则会出现"双层文字"；
     // ::selection 也要一起处理：某些浏览器选中时会用默认高亮前景色把文字显出来
     '.zpf-ta { color: transparent !important; -webkit-text-fill-color: transparent; caret-color: var(--text); background: transparent !important; }',
@@ -1538,6 +1626,18 @@ function editorModal(entry, res) {
   });
   // h() 会跳过值为 false 的属性，spellcheck 只能创建后补 —— 否则代码里满屏红波浪线
   editor.setAttribute('spellcheck', 'false');
+  // 打开文件时光标必须在开头、视图必须在顶部。
+  //
+  // 为什么在这里做（而不是在 focus 事件里）：给 textarea 赋 value 会把光标放到文末，
+  // modal() 随后自动 focus 又会把它滚进视野 —— 用户看到的是"一打开就停在最后一行"。
+  // 此刻还没有焦点，直接归零即可，不会打断任何用户操作。
+  //
+  // 🔴 绝不可以在 focus 事件里做这件事：那只会在**用户第一次点进编辑区**时执行，
+  // 表现就是"点哪儿都跳到文本开头、光标还跟鼠标对不上"（2026-09-22 用户报障，
+  // 根因就是这个 firstFocus 分支）。
+  editor.setSelectionRange(0, 0);
+  editor.scrollTop = 0;
+  editor.scrollLeft = 0;
 
   // 查找命中层：和高亮层同一套 zpfTextStyle、同一个 transform，所以逐像素对齐。
   //
@@ -1573,7 +1673,6 @@ function editorModal(entry, res) {
   let dense = false;   // 代码过密（token 超预算）→ 永久退回纯文本，避免每次输入都要重绘几万个 span
   let maximized = false;
   let collapsed = false;  // 最小化（收成右下角一条标题栏），由下面的 restoreView() 维护
-  let firstFocus = true;
   let rafId = 0;
   let lastHint = '';
   let m = null;
@@ -2253,24 +2352,86 @@ function editorModal(entry, res) {
   editor.addEventListener('scroll', syncScroll);
   editor.addEventListener('focus', () => {
     editorBox.style.borderColor = 'var(--brand)';
-    // 首次聚焦时把光标和滚动拉回开头。
-    // 坑：modal() 会自动 focus 第一个输入框，而给 textarea 赋 value 会把光标放在文末，
-    // focus 又会把光标滚进视野 —— 结果是打开文件直接停在最后一行，很莫名其妙。
-    if (firstFocus) {
-      firstFocus = false;
-      editor.setSelectionRange(0, 0);
-      editor.scrollTop = 0;
-      editor.scrollLeft = 0;
-      syncScroll();
-    }
+    // 这里**只改边框颜色**。光标与滚动位置属于用户，焦点事件里不许动它们
+    //（详见上面"创建时归零"的说明）。
   });
   editor.addEventListener('blur', () => { editorBox.style.borderColor = 'var(--border)'; });
 
-  // Ctrl/Cmd+S 保存（不关闭弹窗，和原来一致）
+  // ---------- 缩进 / 自动缩进 / 保存 ----------
+  //
+  // 以前这里**一个键都没拦**：在编辑区按 Tab 会把焦点 tab 到别的按钮上，
+  // 想缩进一行代码都做不到 —— 对一个"在线代码编辑器"来说这是致命的（用户
+  // 2026-09-22 的原话是"难用得让人想吐"）。现在：
+  //   · Tab / Shift+Tab：有选区则整块缩进 / 反缩进，没选区则插入 / 删除一级缩进；
+  //   · Enter：保持当前行缩进；行尾是 `{([` 时多缩一级，光标在 `}])` 前时不加深；
+  //   · Ctrl/Cmd+S：保存（不关弹窗）。
+  //
+  // 为什么用 execCommand('insertText') 而不是直接改 value：前者会进入浏览器的
+  // **原生撤销栈**（用户 Ctrl+Z 能撤销缩进），后者会把撤销历史清空 ——
+  // 一个按 Tab 就让"撤销"失效的编辑器同样是不可用的。老浏览器不支持时再退回
+  // setRangeText + 手动派发 input 事件（功能一致，只是撤销由浏览器决定）。
+  const INDENT_UNIT = '    '; // 4 个空格，与 tabSize:4 一致
+  function replaceRange(from, to, text) {
+    editor.focus();
+    editor.setSelectionRange(from, to);
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, text); } catch { ok = false; }
+    if (!ok) {
+      editor.setRangeText(text, from, to, 'end');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+  function lineStartAt(pos) { return editor.value.lastIndexOf('\n', pos - 1) + 1; }
+
+  // indentSelection 把选区覆盖的整行缩进/反缩进一级（无选区时作用于当前行）。
+  function indentSelection(dedent) {
+    const v = editor.value;
+    const from = lineStartAt(editor.selectionStart);
+    // 选区末尾正好落在行首时，不要把下一行也算进来（否则多缩进一行）
+    let tail = editor.selectionEnd;
+    if (tail > from && v[tail - 1] === '\n') tail -= 1;
+    const nl = v.indexOf('\n', tail);
+    const to = nl === -1 ? v.length : nl;
+    const lines = v.slice(from, to).split('\n').map((ln) => {
+      if (!dedent) return INDENT_UNIT + ln;
+      if (ln.startsWith(INDENT_UNIT)) return ln.slice(INDENT_UNIT.length);
+      return ln.replace(/^[ \t]{1,4}/, ''); // 兼容手打的 Tab / 2 空格缩进
+    });
+    const next = lines.join('\n');
+    if (next === v.slice(from, to)) return; // 反缩进到顶了：什么都不做，别产生假修改
+    replaceRange(from, to, next);
+    editor.setSelectionRange(from, from + next.length);
+  }
+
   editor.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       writeBack();
+      return;
+    }
+    if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      const hasSelection = editor.selectionStart !== editor.selectionEnd;
+      if (!hasSelection && !e.shiftKey) {
+        replaceRange(editor.selectionStart, editor.selectionEnd, INDENT_UNIT);
+        return;
+      }
+      indentSelection(e.shiftKey);
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
+      && editor.selectionStart === editor.selectionEnd) {
+      const at = editor.selectionStart;
+      const line = editor.value.slice(lineStartAt(at), at);
+      const lead = (line.match(/^[ \t]*/) || [''])[0];
+      const beforeCaret = line.replace(/[ \t]+$/, '');
+      const opens = /[{([:]$/.test(beforeCaret);
+      const nextChar = editor.value.slice(at, at + 1);
+      const closes = /^[}\])]/.test(nextChar);
+      // 光标正对着闭合括号时不加深缩进，让 } 停在原层级
+      const extra = opens && !closes ? INDENT_UNIT : '';
+      e.preventDefault();
+      replaceRange(at, at, '\n' + lead + extra);
     }
   });
 

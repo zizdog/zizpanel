@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -115,10 +116,60 @@ func (s *Server) callHelper(ctx context.Context, args ...string) (map[string]any
 }
 
 // writeVhost 把配置写入 nginx vhost 目录（经助手，含语法校验与回滚）。
+//
+// 写之前先确保 nginx 的**基础片段已加载**，失败时若是"变量未定义"再自愈重试一次。
+//
+// 为什么必须这样（2026-09-22 用户报障："反向代理用不了了！规则已保存但 nginx 配置
+// 应用失败：unknown "connection_upgrade" variable"）：brew 重装/升级 nginx 会把
+// nginx.conf **还原成出厂版** —— 里面没有 `include conf.d/*.conf`，面板写在
+// conf.d/upgrade-map.conf 里的 map 就不会被加载，于是任何反代规则都过不了 nginx -t。
+// 面板**自己就会修这件事**（EnsureNginxEnv：补 include + map + 运行时目录），
+// 但过去只在启动时修一次；用户看到的只有一句"配置语法错误，已回滚"，无从下手。
+// 现在：先铺好环境再写；万一中途环境又被人改掉，也由下面的重试兜住。
 func (s *Server) writeVhost(ctx context.Context, domain, content string) error {
+	s.ensureNginxEnvOnStart(ctx)
+	err := s.writeVhostOnce(ctx, domain, content)
+	if err == nil || !isNginxEnvVarErr(err) {
+		return err
+	}
+	if s.Log != nil {
+		s.Log.Warn("写入 %s 时 nginx -t 报变量未定义（面板的 nginx 片段没被加载）——"+
+			"自动补齐 conf.d 加载与 WebSocket map 后重试：%v", domain, err)
+	}
+	if err2 := s.writeVhostOnce(ctx, domain, content); err2 == nil {
+		if s.Log != nil {
+			s.Log.Info("nginx 环境自愈后重试写入 %s 成功", domain)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w；面板已自动补齐 nginx 的 conf.d 加载与 WebSocket map 后重试，仍然失败", err)
+}
+
+// isNginxEnvVarErr 判断 nginx -t 的报错是不是"面板自己该铺好的变量没定义"。
+//
+// 目前两种，根因相同（nginx.conf 没 include 面板的片段目录）：
+//
+//	· $connection_upgrade —— 面板写在 conf.d/upgrade-map.conf 里的 map，反向代理用；
+//	· $zp_scheme / $zp_https —— 面板生成的 fastcgi 参数块里的 scheme 判断。
+func isNginxEnvVarErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `unknown "`) || !strings.Contains(msg, `" variable`) {
+		return false
+	}
+	return strings.Contains(msg, "connection_upgrade") ||
+		strings.Contains(msg, "zp_scheme") || strings.Contains(msg, "zp_https")
+}
+
+// writeVhostOnce 是真正执行一次写入（不含自愈与重试）。
+func (s *Server) writeVhostOnce(ctx context.Context, domain, content string) error {
 	bin := s.Cfg.ServicePath("zizpanel-helper")
 	args := []string{"vhost-write", domain}
-	if os.Geteuid() != 0 {
+	// 用可注入的 root 判据（与整条环境自愈链同一个 seam）：单测以普通用户跑，
+	// 但必须能验证"以 root 运行时直接执行助手、不套 sudo"这条路径。
+	if defaultSiteEuid() != 0 {
 		args = append([]string{"-n", bin}, args...)
 		bin = "/usr/bin/sudo"
 	}
@@ -1713,7 +1764,7 @@ func (s *Server) Startup(ctx context.Context) {
 		s.Log.Warn("创建站点日志目录失败 %s: %v", logDir, err)
 	}
 
-	s.ensureNginxEnvOnStart(ctx)
+	s.healWebEnv(ctx)
 
 	// 把回环转发器对齐到数据库里的反代规则（macOS 15 本地网络隐私门的修法）。
 	// 必须在任何 nginx reload 之前把监听器起好，否则重启后的第一次请求会打到
@@ -1752,6 +1803,12 @@ func (s *Server) Startup(ctx context.Context) {
 	// 那些回环端口要先对齐好，否则写出来的 proxy_pass 会指向旧端口。
 	s.ensureDefaultSiteOnStart(ctx)
 
+	// 默认站点**持续自愈**：新机器的顺序是"先装面板、再在面板里装 nginx"，
+	// 启动时那一次检查必然看到"没有 nginx"。没有这条巡检，装上 nginx 之后就再也
+	// 没人建默认站点了 —— 用户看到的就是"全新安装的面板，没有默认网站"
+	//（2026-09-22 报障）。巡检间隔与判据见 maybeEnsureDefaultSite。
+	go s.watchWebEnv(ctx)
+
 	// 空闲终端会话回收：
 	// WebSocket 断开时会关闭会话，但网络异常（客户端崩溃、断网）
 	// 可能导致连接一直挂着。这里做兜底清理。
@@ -1774,36 +1831,46 @@ func (s *Server) Startup(ctx context.Context) {
 // 面板启动后也会把 WebSocket map 与 conf.d include 补齐，
 // 否则反向代理站点会在 nginx -t 阶段直接失败。
 func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
-	if os.Geteuid() != 0 {
+	if defaultSiteEuid() != 0 {
 		// 非 root 时尝试通过助手（sudoers 已授权）
 		if _, err := s.callHelper(ctx, "nginx-ensure-env"); err != nil {
 			s.Log.Warn("nginx 环境自愈失败（反向代理可能不可用）: %v", err)
 		}
+		// 后面的两步会**写真实 nginx 配置**（全局上限 / 运行时目录属主），
+		// 而调试实例（make run-local）的 BrewPrefix/NginxConf 指向真机 —— 必须到此为止，
+		// 否则就重现了 AGENTS 坑 162（调试实例真的动了真机）。
 		return
 	}
+	// ① 环境片段（conf.d include / WebSocket upgrade map）。
+	//
+	// ⚠️ 这里过去是"环境一变就 return"，于是同一轮里的 ②③ **永远轮不到**：
+	// 全新机器上 nginx 是**装完面板之后**才装的，重启面板后的第一轮必然
+	// "环境已更新并重载" → 直接返回 → 全局请求体上限与运行时目录属主都没做。
+	// 表现就是用户 2026-09-22 报的："全新安装的面板，导入数据库文件，phpMyAdmin 也会卡死"
+	//（nginx 还是出厂 1m，client_body_temp 属主也不对）。三步必须互不遮挡。
 	msg, err := priv.EnsureNginxEnv()
 	if err != nil {
 		s.Log.Warn("nginx 环境自愈失败（反向代理可能不可用）: %v", err)
-		return
-	}
-	// 只有真的改动了 nginx 配置才重载。
-	// 每次启动无条件 reload 会在开机时给所有站点造成一次无谓的请求抖动。
-	if priv.NginxEnvChanged(msg) {
-		if err := s.nginxReload(ctx); err != nil {
-			s.Log.Warn("nginx 环境已更新但重载失败: %v", err)
+	} else if priv.NginxEnvChanged(msg) {
+		// 只有真的改动了 nginx 配置才重载。
+		// 每次启动无条件 reload 会在开机时给所有站点造成一次无谓的请求抖动。
+		if rerr := s.nginxReload(ctx); rerr != nil {
+			s.Log.Warn("nginx 环境已更新但重载失败: %v", rerr)
 		} else {
 			s.Log.Info("nginx 环境已更新并重载: %s", msg)
 		}
-		return
+	} else {
+		s.Log.Info("nginx 环境检查: %s", msg)
 	}
-	s.Log.Info("nginx 环境检查: %s", msg)
 
-	// 全局请求体上限也要自愈：`brew reinstall/upgrade nginx` 会把 nginx.conf
+	// ② 全局请求体上限也要自愈：`brew reinstall/upgrade nginx` 会把 nginx.conf
 	// **还原成 brew 出厂版** —— 那里面既没有 vhosts include（上面刚补），也没有
 	// 面板设的 `client_max_body_size`（出厂的 1m）。真机后果（2026-09-18）：
 	// "文件在、服务在、就是不生效"——4MB 的 SQL 导入直接被 nginx 以 1m 拒掉，
 	// 用户看到的是"phpMyAdmin 导入失败/卡住"，而面板里怎么看都正常。
 	s.ensureGlobalBodySize(ctx)
+
+	// ③ nginx 运行时目录（带请求体的请求要往这里落盘）。
 	s.ensureNginxRuntimeDirs()
 }
 
@@ -1859,7 +1926,12 @@ func (s *Server) ensureGlobalBodySize(ctx context.Context) {
 // 表现就是"GET 一切正常、一上传就 500/卡死"（登录、翻页都没问题，因为它们没有请求体）。
 // 目录属主/权限是 brew 安装/升级时定的，面板不能假设它一定对。
 func (s *Server) ensureNginxRuntimeDirs() {
-	if os.Geteuid() != 0 {
+	if defaultSiteEuid() != 0 {
+		return
+	}
+	// 没有 nginx 就别自愈：这一步会 MkdirAll，若 brew 前缀不存在，root 会把
+	// 整个前缀目录树建出来（"本来没有 Homebrew，面板却造了一个 /opt/homebrew"）。
+	if present, _ := s.nginxPresent(); !present {
 		return
 	}
 	worker := nginxWorkerUserFromConf(s.Cfg.NginxConf)
@@ -1882,8 +1954,80 @@ func (s *Server) ensureNginxRuntimeDirs() {
 	}
 }
 
-// nginxWorkerUserFromConf 从 nginx.conf 读 `user` 指令（worker 以谁的身份跑）。
+// healWebEnv 是"环境层面自愈"的总入口：nginx 侧 + PHP 侧一次做完。
 //
+// 为什么需要一个总入口（2026-09-22 用户连续两个报障都栽在同一类上：
+// "全新安装的面板，没有默认网站！" / "全新安装的面板，导入数据库文件，
+// phpMyAdmin 也会卡死"）：这些都是**面板启动之后才装上 nginx/PHP** 才会暴露的
+// 问题，而自愈过去只在启动那一刻跑一次。现在三处触发同一个入口：
+//
+//	· 面板启动（Startup）；
+//	· 任何任务收尾（launchTask）—— 装完 LNMP / 装完单个 nginx / 重装，立刻生效；
+//	· 默认站点的巡检 goroutine（watchDefaultSite 那条链另走 maybeEnsureDefaultSite）。
+func (s *Server) healWebEnv(ctx context.Context) {
+	s.ensureNginxEnvOnStart(ctx)
+	s.ensurePHPLimitsOnStart(ctx)
+}
+
+// ensurePHPLimitsOnStart 把面板配置的上传/执行上限落到每个已装 PHP 版本的
+// `<brew>/etc/php/<版本>/conf.d/99-zizpanel-limits.ini` 上（幂等）。
+//
+// 为什么必须自愈（2026-09-22 报障）：面板过去只在用户点「保存上传/执行上限」时
+// 才写这份片段。新机器的顺序是"先装面板、再在面板里装 PHP"，那时启动检查早过了 ——
+// 于是 PHP 一直是 brew 出厂值（upload 2M / post 8M / memory 128M / 30s）：
+// 导入稍大的 SQL 会被 PHP 自己掐死，用户看到的就是"phpMyAdmin 卡死"，
+// 而 nginx 与面板里怎么看都"正常"。默认值本来就是给这种场景定的（512M/300s），
+// 没落到文件上等于没有默认值。
+//
+// 只在片段**不存在**时创建，并只在真的创建了之后重启对应 php-fpm：
+//
+//	· 不覆盖已存在的文件，是因为这个片段的文档语义就是"删掉它即恢复出厂限制" ——
+//	  每次任务收尾都把它重写回去，"删掉"这个退路就失效了，用户手改过的值也会被抹掉
+//	  （用户显式点「保存上传/执行上限」时才会覆盖，那是一次明确动作）。
+//	· 不无条件重启，是因为那会把正在跑的站点一次次打断。
+func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {
+	if defaultSiteEuid() != 0 {
+		return
+	}
+	lim := s.uploadLimits().Normalize()
+	versions := sites.DiscoverPHPVersions(s.Cfg.BrewPrefix)
+	if len(versions) == 0 {
+		return
+	}
+	for _, v := range versions {
+		path := sites.PHPConfDPath(s.Cfg.BrewPrefix, v.Version)
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			continue // 已存在：面板的设置页与用户自己都能改它，自愈不碰。
+		}
+		lr, err := sites.EnsurePHPLimits(s.Cfg.BrewPrefix, v.Version, lim, true)
+		if err != nil {
+			s.Log.Warn("PHP %s 的上传/执行限制片段写入失败（导入大 SQL 会失败）：%v", v.Version, err)
+			continue
+		}
+		if !lr.Changed {
+			continue
+		}
+		s.Log.Info("已写入 PHP %s 的上传/执行限制片段 %s（upload=%s post=%s memory=%s max_execution_time=%ds）——"+
+			"全新机器上 PHP 出厂值只有 2M/8M，导入稍大的 SQL 会失败",
+			v.Version, lr.Path, lim.UploadMaxFilesize, lim.PostMaxSize, lim.MemoryLimit, lim.MaxExecutionTime)
+		svcName := s.phpServiceName(v.Version)
+		if svcName == "" {
+			s.Log.Info("PHP %s 的限制片段已写入，但面板里没有它的服务记录，"+
+				"无法重启：该版本下次启动时自动生效（也可到「网站管理 → PHP 环境」修复端点并重启）", v.Version)
+			continue
+		}
+		if _, err := s.svcManager().Action(ctx, svcName, "restart"); err != nil {
+			s.Log.Warn("PHP %s 的限制片段已写入，但重启 %s 失败（新上限还没生效）：%v", v.Version, svcName, err)
+			continue
+		}
+		s.Log.Info("已重启 %s，使新的上传/执行上限生效", svcName)
+	}
+}
+
+// nginxWorkerUserFromConf 从 nginx.conf 读 `user` 指令（worker 以谁的身份跑）。
 // 读不到（注释掉/没写）时返回空 —— 调用方回落到 nginx 的编译默认 nobody。
 func nginxWorkerUserFromConf(confPath string) string {
 	b, err := os.ReadFile(confPath)
@@ -1972,4 +2116,28 @@ func (s *Server) checkProxyAgainstSiteVhosts(rule *proxies.Rule, selfFile string
 		}
 	}
 	return nil
+}
+
+// webEnvHealMu 串行化环境自愈：多个任务同时收尾（或任务与巡检撞上）时，
+// 只让一个真的动手，其余的**跳过而不是排队** —— 它们要做的事一模一样，
+// 排队只会让最后一个在几秒后再重复一遍已经做完的事。
+var webEnvHealMu sync.Mutex
+
+// kickEnvHeal 在后台跑一次「环境自愈 + 默认站点核对」。
+//
+// 见 launchTask 里的说明：任务中心的"结束"不该被这件事拖住。
+// 用**独立的**后台 ctx（不受任何请求/任务生命周期影响）+ 2 分钟上限：
+// 面板可能在写完配置前就被升级重启，但每一次写入本身是原子+带校验的，
+// 最坏情况只是这次没做完，下一轮巡检会接着做。
+func (s *Server) kickEnvHeal() {
+	if !webEnvHealMu.TryLock() {
+		return
+	}
+	go func() {
+		defer webEnvHealMu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		s.healWebEnv(ctx)
+		s.maybeEnsureDefaultSite(ctx)
+	}()
 }

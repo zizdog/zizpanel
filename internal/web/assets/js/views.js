@@ -413,13 +413,19 @@ export function DashboardView(content, ctx = {}) {
 
 // renderLimitsInto 把"上传与执行限制"面板画进**任意容器**。
 //
-// 为什么参数化容器：这两组上限（nginx client_max_body_size / PHP upload+post+memory+
-// 执行时间）不只是设置页里的一个版块，它是用户**最常改**的东西 ——
+// 为什么参数化容器：这些上限（PHP upload+post+memory+执行时间，以及 nginx 侧的
+// 只读展示）不只是设置页里的一个版块，它是用户**最常改**的东西 ——
 // 2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的，用户没法更改文件大小限制"，
 // 并明确要求"这些常用更改应该同时做成功能，而不是让用户只能编辑配置原文件"。
 // 所以同一份实现要能同时出现在：面板设置版块、nginx/PHP 的管理面板、网站管理工具条
 //（三处共用，绝不复制第二份 —— 复制出来的那份迟早会与后端校验漂移）。
-async function renderLimitsInto(container, refresh) {
+//
+// ⚠️ nginx 的 `client_max_body_size` **不在这里改**（2026-09-22 用户报障：
+// "Nginx 管理和上传大小 / 执行时间严重重复"）。同一个值有两处可编辑入口，
+// 必然出现"这边改了那边没改、两边都以为自己对"——现在它只有一个可编辑入口
+// 「Nginx 管理 → 性能调整」；这里只**如实显示当前值**并给一颗直达按钮。
+// opts.openNginxTuning 由调用方注入（避免 views.js ↔ nginxpanel.js 的循环 import）。
+async function renderLimitsInto(container, refresh, opts = {}) {
   let v;
   try { v = await api.getUploadLimits(); }
   catch (e) {
@@ -439,9 +445,6 @@ async function renderLimitsInto(container, refresh) {
       field: h('div.field', [h('label', { text: label }), input, h('div.hint', { text: hint })]),
     };
   };
-  const nginxField = sizeField('client_max_body_size', 'nginx 请求体上限（client_max_body_size）',
-    '例：512m / 1g。这是 nginx 的硬上限：请求超过它会被直接返回 413，PHP 根本收不到数据 —— '
-    + 'phpMyAdmin 导入大 SQL 报 413 就是这里太小。');
   const uploadField = sizeField('upload_max_filesize', 'PHP upload_max_filesize',
     '单个上传文件的上限（例：512M）。');
   const postField = sizeField('post_max_size', 'PHP post_max_size',
@@ -456,6 +459,29 @@ async function renderLimitsInto(container, refresh) {
     h('label', { text: 'PHP max_execution_time（秒）' }),
     execInput,
     h('div.hint', { text: '导入大 SQL 会跑很久；出厂的 30 秒会让大文件导入中途失败。改这个值会同时对齐 phpMyAdmin 的 $cfg[\'ExecTimeLimit\']。' }),
+  ]);
+
+  // nginx 请求体上限：**只读展示 + 直达入口**（见上面 renderLimitsInto 的说明）
+  const nginxValue = lim.client_max_body_size || def.client_max_body_size || '（未设置）';
+  const nginxJump = opts.openNginxTuning
+    ? h('button.btn.btn-sm', {
+      text: '去 Nginx 管理 → 性能调整 改',
+      title: 'nginx 的 client_max_body_size 只有一个可编辑入口（避免两处 UI 互相覆盖）',
+      onclick: () => opts.openNginxTuning(),
+    })
+    : h('span.hint', { text: '改它：网站管理 → ⚙️ Nginx 管理 → 性能调整 → client_max_body_size' });
+  const nginxInfo = h('div.field', [
+    h('label', { text: 'nginx client_max_body_size（请求体硬上限）' }),
+    h('div', {
+      style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' },
+    }, [
+      h('code.code', { text: nginxValue }),
+      nginxJump,
+    ]),
+    h('div.hint', {
+      text: '请求超过它会被 nginx 直接返回 413，PHP 根本收不到数据 —— phpMyAdmin 导入大 SQL 报 413 就是这里太小。'
+        + '这个值只在这一处可改（与「Nginx 管理 → 性能调整」是同一个值，不会出现两处不一致）。',
+    }),
   ]);
 
   // mismatch 横幅：磁盘上的生效值还不是配置值时，明确告诉用户"还没生效"。
@@ -481,7 +507,10 @@ async function renderLimitsInto(container, refresh) {
       save.disabled = true;
       try {
         const patch = {
-          client_max_body_size: nginxField.input.value.trim(),
+          // nginx 值不在这里编辑（只有一个可编辑入口：Nginx 管理 → 性能调整）。
+          // 仍然原样回传当前值：应用 PHP 上限时会把同一个值写进各站点 vhost 与
+          // 默认站点，避免"改了 PHP 之后 vhost 掉回旧值"。
+          client_max_body_size: lim.client_max_body_size || def.client_max_body_size || '',
           upload_max_filesize: uploadField.input.value.trim(),
           post_max_size: postField.input.value.trim(),
           memory_limit: memField.input.value.trim(),
@@ -627,11 +656,13 @@ async function renderLimitsInto(container, refresh) {
         h('div', { style: { margin: '0 0 10px', padding: '9px 11px', background: 'var(--warn-soft)',
           borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.8' } }, [
           h('div', { style: { fontWeight: '620' }, text: '保存会写进这些真实文件（下面「当前生效值」逐行列出来，可点「打开」查看）' }),
-          h('div', { text: '· nginx：nginx.conf 的 http 块（全局值）+ 面板生成的每个站点 vhost + 默认站点；' }),
+          h('div', { text: '· nginx：nginx.conf 的 http 块（全局值）+ 面板生成的每个站点 vhost + 默认站点' +
+            '（这里只原样沿用当前值；要改它请用「Nginx 管理 → 性能调整」）；' }),
           h('div', { text: '· PHP：面板自己的 conf.d 片段 99-zizpanel-limits.ini —— 不改 brew 的 php.ini' +
             '（升级会覆盖、手改会丢），PHP 真正读取的是这个片段，右边的回读值就是它。' }),
         ]),
-        h('div.row', [nginxField.field, uploadField.field]),
+        nginxInfo,
+        h('div.row', [uploadField.field]),
         h('div.row', [postField.field, memField.field, execField]),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '4px' } }, [
           save, reread, doctor,
@@ -673,10 +704,10 @@ async function renderLimitsInto(container, refresh) {
 // 用户 2026-09-18 明确要求：这类常用更改必须是**功能**，不能只让用户去编辑配置原文件。
 // 所以 nginx / PHP 的管理面板与网站管理工具条都直接开这个弹窗，改完自动
 // 重载 nginx + 重启 php-fpm，并**回读生效值**（不是只报"已保存"）。
-export function uploadLimitsModal() {
+export function uploadLimitsModal(opts = {}) {
   const box = h('div');
-  const m = modal({ title: '⚡ 上传大小 / 执行时间（nginx + PHP）', wide: true, body: box });
-  const refresh = async () => { clear(box); await renderLimitsInto(box, refresh); };
+  const m = modal({ title: '⚡ 上传大小 / 执行时间（PHP 侧；nginx 请求体上限见提示）', wide: true, body: box });
+  const refresh = async () => { clear(box); await renderLimitsInto(box, refresh, opts); };
   void refresh();
   return m;
 }

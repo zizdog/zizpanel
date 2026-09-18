@@ -2,12 +2,16 @@ package web
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -321,5 +325,201 @@ func TestDefaultSiteApplyBacksUpForeignVhost(t *testing.T) {
 	}
 	if !strings.Contains(string(after), services.DefaultVhostMarker) {
 		t.Errorf("覆盖后的 vhost 应当是面板生成的那份：\n%s", after)
+	}
+}
+
+// TestDefaultSiteHealedAfterNginxInstalledLater 锁的是用户 2026-09-22 的报障：
+// "全新安装的面板，没有默认网站！"
+//
+// 真机顺序就长这样：先装面板（那一刻机器上连 Homebrew/nginx 都没有），再在面板里
+// 装 nginx。启动时那一次检查只能如实记下"等待 nginx" —— **必须有东西在之后补上**，
+// 否则"装上 Nginx 后面板会自动建默认站点"就是一句谎话（这正是当时的行为）。
+// 这条测试先在没有 nginx 时跑一次，再把 nginx 放上去，靠巡检把它建出来：
+// 少了 watchWebEnv 这条链，这里就必然失败。
+func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, _ = doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	written := stubDefaultSiteApply(t, srv)
+	// 整条自愈链都会碰 priv 包的路径（conf.d / 运行时目录），必须沙箱化，
+	// 否则一次 go test 就会去读写真机 /opt/homebrew/etc/nginx。
+	t.Setenv("ZIZPANEL_BREW_PREFIX", srv.Cfg.BrewPrefix)
+
+	prevEuid := defaultSiteEuid
+	defaultSiteEuid = func() int { return 0 }
+	t.Cleanup(func() { defaultSiteEuid = prevEuid })
+
+	// ① 明确"这台机器还没有 nginx"：必须指向一个不存在的路径
+	// （newTestServer 的 Cfg.NginxBin 默认指向真机的 /opt/homebrew/bin/nginx）。
+	srv.Cfg.NginxBin = filepath.Join(t.TempDir(), "no-nginx-yet", "nginx")
+	srv.maybeEnsureDefaultSite(context.Background())
+	st := srv.readDefaultSiteState()
+	if st.Applied {
+		t.Fatalf("没有 nginx 时绝不能报「已创建」（状态：%+v）", st)
+	}
+	if st.NginxPresent {
+		t.Errorf("状态里应当如实记下「当前没有 nginx」：%+v", st)
+	}
+
+	// ② nginx 装上了 —— 等价于用户刚在面板里跑完一键 LNMP / 只安装 Nginx。
+	seedFakeNginx(t, srv)
+
+	// ③ 巡检必须自动补上，不需要用户重启面板、也不需要再去点什么。
+	prevInterval := defaultSiteWatchInterval
+	defaultSiteWatchInterval = 20 * time.Millisecond
+	t.Cleanup(func() { defaultSiteWatchInterval = prevInterval })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); srv.watchWebEnv(ctx) }()
+
+	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(index); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(index); err != nil {
+		cancel()
+		t.Fatalf("nginx 装上之后，面板必须自动把默认站点建起来（用户报障就是这里没人做）：%v", err)
+	}
+	if !strings.Contains(*written, services.DefaultVhostMarker) {
+		t.Errorf("自动创建的 vhost 必须是面板生成的默认站点：\n%s", *written)
+	}
+	// 必须**等巡检真的退出**再结束测试：t.Setenv 会在测试结束后还原
+	// ZIZPANEL_BREW_PREFIX，而还在飞的巡检会拿真机前缀去写真机 nginx 配置
+	//（这正是这个项目反复踩的"测试污染真机"，绝不能留给运气）。
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("巡检 goroutine 没有在 ctx 取消后退出")
+	}
+}
+
+// TestEnvHealWritesPHPLimitsOnceAndNeverFightsTheUser 锁的是同一类报障的另一半：
+// "全新安装的面板，导入数据库文件，phpMyAdmin 也会卡死"。
+//
+// 根因是 PHP 侧一直是 brew 出厂值（upload 2M / post 8M / 30s）—— 面板只在用户
+// 点「保存上传/执行上限」时才写 conf.d 片段，而"装完 PHP 之后"没人再写一次。
+// 两条不变量：
+//  1. 片段不存在时，自愈要按面板配置写出来（默认 512M/512M/300s）；
+//  2. 片段已存在（用户改过 / 用户删了又想自己写）时，自愈**一个字都不改** ——
+//     这个文件的文档语义就是"删掉它即恢复出厂限制"，自愈把它重写回去会毁掉那条退路。
+func TestEnvHealWritesPHPLimitsOnceAndNeverFightsTheUser(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, _ = doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	prevEuid := defaultSiteEuid
+	defaultSiteEuid = func() int { return 0 }
+	t.Cleanup(func() { defaultSiteEuid = prevEuid })
+
+	// 造一个"装了 php@8.2"的 brew 前缀（DiscoverPHPVersions 认 opt/php@x.y/bin/php）。
+	verDir := filepath.Join(srv.Cfg.BrewPrefix, "etc", "php", "8.2")
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	phpBin := filepath.Join(srv.Cfg.BrewPrefix, "opt", "php@8.2", "bin", "php")
+	if err := os.MkdirAll(filepath.Dir(phpBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(phpBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	frag := filepath.Join(verDir, "conf.d", "99-zizpanel-limits.ini")
+	srv.ensurePHPLimitsOnStart(context.Background())
+	b, err := os.ReadFile(frag)
+	if err != nil {
+		t.Fatalf("PHP 已安装时自愈必须写出上传/执行上限片段（否则导入稍大的 SQL 就是卡死/500）：%v", err)
+	}
+	for _, want := range []string{"upload_max_filesize = 512M", "post_max_size = 512M", "max_execution_time = 300"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("片段里缺 %q：\n%s", want, b)
+		}
+	}
+
+	// 用户自己的改动不许被自愈覆盖。
+	custom := "; 我自己调的\nupload_max_filesize = 1G\n"
+	if err := os.WriteFile(frag, []byte(custom), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv.ensurePHPLimitsOnStart(context.Background())
+	after, _ := os.ReadFile(frag)
+	if string(after) != custom {
+		t.Errorf("自愈不许覆盖用户已经改过的片段：\n期望：%s\n实际：%s", custom, after)
+	}
+}
+
+// TestTaskCompletionTriggersEnvHealAndDefaultSite 锁住**中心钩子**这条接线：
+// 任何任务收尾（成功或失败）都必须跑一次环境自愈 + 默认站点核对。
+//
+// 为什么用"直接调 launchTask"而不是打某个安装接口：安装接口会真的去 brew 装东西
+// （AGENTS 坑 162：在调试实例上点写操作按钮＝在真机上执行）。这里只验证接线本身：
+// 任务体是测试自己给的，不碰任何外部命令。
+func TestTaskCompletionTriggersEnvHealAndDefaultSite(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, _ = doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	stubDefaultSiteApply(t, srv)
+	t.Setenv("ZIZPANEL_BREW_PREFIX", srv.Cfg.BrewPrefix)
+	seedFakeNginx(t, srv)
+	prevEuid := defaultSiteEuid
+	defaultSiteEuid = func() int { return 0 }
+	t.Cleanup(func() { defaultSiteEuid = prevEuid })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/test-hook", nil)
+	srv.launchTask(rec, req, "test", "hook-env-heal", "接线测试", "test_hook",
+		func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			return map[string]any{"ok": true}, nil
+		})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("任务应当以 202 提交，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+
+	// 等任务结束（RunningFor 返回 nil 即已完成）——钩子是**后台**跑的，
+	// 任务本身不该被自愈拖住（这正是第一版写成同步后踩到的坑）。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Tasks.RunningFor("hook-env-heal") == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if srv.Tasks.RunningFor("hook-env-heal") != nil {
+		t.Fatal("测试任务没有在 5 秒内结束")
+	}
+
+	// 后台自愈完成时必须已经建好默认站点（nginx 是"任务开始前"就装好的，
+	// 等价于"用户刚装完 nginx 的那个任务"）。
+	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(index); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(index); err != nil {
+		t.Fatalf("任务收尾必须核对默认站点并把它建起来：%v", err)
+	}
+
+	// 必须等后台自愈**真的跑完**再结束测试：t.Setenv 会在测试结束后还原
+	// ZIZPANEL_BREW_PREFIX，还在飞的自愈会拿真机前缀去写真机 nginx 配置。
+	// 判据是"能抢到它的锁" —— 抢到了说明没有自愈在跑（立刻还回去）。
+	joinDeadline := time.Now().Add(10 * time.Second)
+	joined := false
+	for time.Now().Before(joinDeadline) {
+		if webEnvHealMu.TryLock() {
+			webEnvHealMu.Unlock()
+			joined = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !joined {
+		t.Fatal("后台环境自愈没有在 10 秒内结束")
 	}
 }

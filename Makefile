@@ -508,3 +508,7 @@ market-audit-offline: ## 应用市场静态门禁：只查声明完整性/不变
 .PHONY: market-audit-verify
 market-audit-verify: ## 真机安装验收（会真的装软件）：ARGS="<base_url> <user> <pass>"
 	@tools/market-audit.sh --install -- $(ARGS)
+
+.PHONY: ui-audit
+ui-audit: ## UI 审计（需要先 make run-local；查溢出 / 无名按钮 / 重复设置项）
+	@ZP_PASS='$(ZP_PASS)' node tools/ui-audit.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX) $(SHOTS)

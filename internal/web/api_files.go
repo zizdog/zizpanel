@@ -471,12 +471,16 @@ const maxUpload = int64(4) << 30 // 4 GiB
 // handleFileUpload 上传文件（multipart/form-data）。
 //
 // 支持两种形态，共用一条路由：
-//   - 普通上传：多个 `files` 字段，落在目标目录里；同名文件**不覆盖**，
-//     自动加 -1/-2 序号（保留旧行为）。
+//   - 普通上传：多个 `files` 字段，落在目标目录里；
 //   - 「上传文件夹」：额外带一个 `relpaths` 字段（JSON 数组，与 `files` 顺序一一对应），
-//     后端按相对路径在目标目录下重建目录树，并且**允许覆盖**同名文件 ——
-//     传整站时把 index.php 存成 index-1.php 会直接让站点跑不起来。
-//     结果里每个文件都带 overwritten 标记，前端如实显示"已覆盖"。
+//     后端按相对路径在目标目录下重建目录树。
+//
+// 同名文件怎么办由 `on_conflict` 决定（前端会先弹窗问用户，再把选择传上来）：
+//   - "rename"（普通上传默认）：保留两者，自动加 -1/-2 序号；
+//   - "overwrite"（上传文件夹默认）：覆盖同名文件 —— 传整站时把 index.php 存成
+//     index-1.php 会直接让站点跑不起来。
+//
+// 结果里每个文件都带 overwritten 标记，前端如实显示"已覆盖"或"已改名保留两者"。
 func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	// 先解除全局 30 秒读超时对这条路由的限制（否则大文件必然被掐断，
 	// 而浏览器只看到"网络错误"，用户看到的就是"点了没反应"）。
@@ -556,6 +560,30 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// on_conflict 决定**同名文件**怎么处理，由前端把用户的选择传上来：
+	//   "rename"    = 保留两者，自动加序号（默认，普通上传）
+	//   "overwrite" = 覆盖同名文件（默认，上传文件夹）
+	//
+	// 用户 2026-09-22 明确要求："文件管理上传文件，如果相同名字应该询问是否覆盖
+	// 还是共存。" 所以前端在发现重名时会先弹窗问，再把结果传到这里。
+	// 默认值刻意分开：
+	//   · 普通上传默认 **rename** —— 静默覆盖别人的文件是最不可原谅的默认行为；
+	//   · 上传文件夹默认 **overwrite** —— 传整站时把 index.php 存成 index-1.php
+	//     会让站点直接跑不起来（这是既有语义，进度窗里也明说了"同名会被覆盖"）。
+	onConflict := strings.ToLower(strings.TrimSpace(r.FormValue("on_conflict")))
+	if onConflict == "" {
+		if treeMode {
+			onConflict = "overwrite"
+		} else {
+			onConflict = "rename"
+		}
+	}
+	if onConflict != "overwrite" && onConflict != "rename" {
+		fail(w, http.StatusBadRequest, "on_conflict 只能是 overwrite 或 rename，收到："+onConflict)
+		return
+	}
+	overwrite := onConflict == "overwrite"
+
 	var results []uploadedFile
 	var failures []string
 
@@ -566,14 +594,14 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		rel := relAt(relPaths, treeMode, idx)
-		var path string
-		var n int64
-		var overwritten bool
-		if treeMode {
-			path, n, overwritten, err = mgr.SaveUploadAs(dir, rel, f, true)
-		} else {
-			path, n, err = mgr.SaveUpload(dir, fh.Filename, f)
+		// 普通上传只取基名（历史行为：绝不因为用户手工构造的 "a/b.txt" 就建目录）；
+		// 上传文件夹则按相对路径重建目录树。
+		if !treeMode {
+			rel = filepath.Base(filepath.FromSlash(fh.Filename))
 		}
+		// 两种策略统一走 SaveUploadAs：它同时告诉我们"是不是真的覆盖了"，
+		// 前端据此如实显示"已覆盖"还是"已改名保留两者"。
+		path, n, overwritten, err := mgr.SaveUploadAs(dir, rel, f, overwrite)
 		_ = f.Close()
 		if err != nil {
 			failures = append(failures, uploadLabel(fh.Filename, rel)+": "+err.Error())
@@ -597,13 +625,33 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	msg := fmt.Sprintf("已上传 %d 个文件", len(results))
 	if n := countOverwritten(results); n > 0 {
 		msg += fmt.Sprintf("（其中 %d 个覆盖了同名文件）", n)
+	} else if n := countRenamed(results); n > 0 {
+		msg += fmt.Sprintf("（其中 %d 个与已有文件重名，已自动改名，两个都保留）", n)
 	}
 	if len(failures) > 0 {
 		msg += fmt.Sprintf("，%d 个失败", len(failures))
 	}
 	ok(w, map[string]any{
 		"uploaded": results, "failed": failures, "msg": msg,
+		"on_conflict": onConflict,
 	})
+}
+
+// countRenamed 统计"因为重名被自动改名"的文件数。
+//
+// RelPath 是请求里的名字（普通上传时就是原文件名），Name 是真正落盘的名字 ——
+// 两者不同且不是覆盖，就是自动改名保留了两份。
+func countRenamed(list []uploadedFile) int {
+	n := 0
+	for _, f := range list {
+		if f.Overwritten {
+			continue
+		}
+		if filepath.Base(filepath.FromSlash(f.RelPath)) != f.Name {
+			n++
+		}
+	}
+	return n
 }
 
 // uploadedFile 是一个成功落盘的文件。

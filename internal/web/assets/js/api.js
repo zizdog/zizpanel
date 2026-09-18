@@ -140,6 +140,8 @@ export const api = {
   // POST 校验后返回 202 + task_id，真正的应用（写 vhost + conf.d → reload nginx
   // → 重启 php-fpm）在任务中心里跑，进度与回读都在任务日志里。
   getUploadLimits: () => request('GET', `${API_BASE}/settings/upload-limits`),
+  // nginx 环境自愈（补 conf.d/vhosts include 与 WebSocket map），供「⋯ 更多 → 🔧 修复 Nginx 环境」
+  nginxEnsureEnv: () => request('POST', `${API_BASE}/system/nginx/ensure-env`),
   saveUploadLimits: (patch) => request('POST', `${API_BASE}/settings/upload-limits`, patch),
   // 大文件上传自检：磁盘空间 / nginx 临时目录可写性 / error_log 里与上传相关的行。
   // 用户看到 500（不是 413）时用它定位 —— 500 的原因几乎只在 nginx error_log 里。

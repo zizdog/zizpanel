@@ -175,3 +175,32 @@ func TestFilesFrontendUploadWiring(t *testing.T) {
 		t.Error("files.js 没有处理「拼请求体失败」这条路径（历史上它就是静默的那一条）")
 	}
 }
+
+// TestFilesFrontendUploadAsksAboutConflicts 锁"同名文件必须先问用户"这条接线
+// （用户 2026-09-22："上传文件，如果相同名字应该询问是否覆盖还是共存"）。
+//
+// 为什么用静态断言而不是只靠后端测试：后端的两种策略早就存在，用户报的是
+// **没人问他**。少了这三处任何一处，功能就等于没有：
+//
+//	① uploadEntries 发现重名要真去问；② 询问结果要能回传（on_conflict）；
+//	③ 默认必须是"不覆盖"（覆盖是最危险的那个动作，绝不做默认值）。
+func TestFilesFrontendUploadAsksAboutConflicts(t *testing.T) {
+	js := readAssetJS(t, "files.js")
+	for _, want := range []string{
+		"askUploadConflict(",
+		"conflictNames(",
+		"fd.append('on_conflict', onConflict)",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("files.js 缺少 %s —— 同名文件就不会问用户（或问了也传不到后端）", want)
+		}
+	}
+	// 默认选择必须是「保留两者」：不能让覆盖成为默认值
+	if !strings.Contains(js, "let picked = 'rename'") {
+		t.Error("冲突弹窗的默认选项必须是「保留两者」（rename）；默认覆盖是不可逆的危险行为")
+	}
+	// 上传文件夹不弹这个窗（它的语义就是按原结构覆盖，进度窗里已明说）
+	if !strings.Contains(js, "if (!opts.folder) {") {
+		t.Error("只有普通上传才该弹「覆盖/共存」；上传文件夹是「按原结构覆盖」的语义")
+	}
+}

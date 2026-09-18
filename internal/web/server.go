@@ -434,6 +434,9 @@ func (s *Server) routes() http.Handler {
 	// 备份 → 改写 nginx.conf → nginx -t → 失败回滚 → reload → 回读（见 priv/nginxtuning.go）。
 	root.HandleFunc("GET /api/v1/system/nginx/tuning", s.requireAuth(s.handleNginxTuningGet))
 	root.HandleFunc("POST /api/v1/system/nginx/tuning", s.requireAuth(s.handleNginxTuningSave))
+	// 手动触发一次 nginx 环境自愈（补 conf.d/vhosts include 与 WebSocket map）。
+	// 反向代理报 unknown "connection_upgrade" variable 时的**一键修复**入口。
+	root.HandleFunc("POST /api/v1/system/nginx/ensure-env", s.requireAuth(s.handleNginxEnsureEnv))
 
 	// 网站环境的**真实运行时**（nginx / PHP / MySQL）：只看运行体证据（进程/端口/socket），
 	// 面板服务记录只回答"归不归面板管"。修的是"nginx 明明在跑却显示未就绪"。

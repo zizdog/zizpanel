@@ -523,6 +523,15 @@ export function SitesView(content, ctx = {}) {
   });
   const statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
 
+  // defSiteNotice：默认站点没建好时的**醒目提示条**。
+  //
+  // 为什么必须有它（2026-09-22 用户报障"全新安装的面板，没有默认网站！"）：
+  // 以前只有工具条上一颗小药丸，而空列表那句提示说的是"新建站点需要
+  // nginx+PHP+MySQL" —— 默认站点的事一个字都没提。用户在新机器上看到的
+  // 就是"这里什么都没有"，根本不知道该有一个默认站点。
+  // 这里如实说清状态，并且给一颗**能走通**的按钮（弹窗里缺 nginx 就先只装 nginx）。
+  const defSiteNotice = h('div');
+
   const toolbar = h('div.card-head', [
     h('h3', { text: '站点列表' }),
     h('div.spacer'),
@@ -532,7 +541,7 @@ export function SitesView(content, ctx = {}) {
   content.append(
     h('div.card', [
       toolbar,
-      h('div.card-body.tight', [webEnvLine, listBox]),
+      h('div.card-body.tight', [defSiteNotice, webEnvLine, listBox]),
     ]),
   );
 
@@ -808,6 +817,44 @@ export function SitesView(content, ctx = {}) {
     });
   }
 
+  // renderDefSiteNotice 画"默认站点没建好"的提示条（见 defSiteNotice 的说明）。
+  //
+  // 判据只有一条：defSite.applied === false。null（还没读到）不出提示 ——
+  // 不拿"没读到"当"没建"；已就绪时这一段是空的，不占地方。
+  function renderDefSiteNotice() {
+    clear(defSiteNotice);
+    if (!defSite || defSite.applied) return;
+    const noNginx = defSite.nginx_present === false;
+    const foreign = !!defSite.foreign_vhost;
+    const title = noNginx ? '🏠 默认站点还没有创建：这台机器上还没有 Nginx'
+      : foreign ? '🏠 80 端口上是别人写的站点，面板没有自动覆盖它'
+        : '🏠 默认站点还没有创建';
+    const detail = defSite.needs_action
+      || (noNginx
+        ? '默认站点要靠 nginx 监听 80 端口。可以只装 Nginx（不装 PHP 与 MySQL），装好后面板会自动建一个纯静态默认站点。'
+        : '点右边按钮即可创建（只写面板自己的那份 vhost + 一张占位页，不需要 PHP 与 MySQL）。');
+    defSiteNotice.append(h('div', {
+      style: {
+        display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap',
+        border: '1px solid var(--warn)', borderRadius: '8px',
+        padding: '10px 12px', marginBottom: '10px',
+        background: 'color-mix(in srgb, var(--warn) 8%, transparent)',
+      },
+    }, [
+      h('div', { style: { flex: '1 1 320px', minWidth: '260px' } }, [
+        h('div', { style: { fontWeight: '600' }, text: title }),
+        h('div', { style: { fontSize: '12.5px', lineHeight: '1.7', color: 'var(--text-dim)', marginTop: '3px' }, text: detail }),
+        defSite.error ? h('div', { style: { fontSize: '12px', color: 'var(--text-mute)', marginTop: '3px' }, text: '上次尝试：' + defSite.error }) : null,
+      ]),
+      // 按钮复用**同一个**弹窗（缺 nginx → 先只装 nginx，然后立刻建站点）：
+      // 另写一条快捷路径就会多出第二套实现，早晚走样。
+      h('button.btn.btn-sm.btn-primary', {
+        text: noNginx ? '只安装 Nginx' : (foreign ? '覆盖为面板默认站点' : '立即创建默认站点'),
+        onclick: defaultSiteModal,
+      }),
+    ]));
+  }
+
   // defaultSiteModal 是「默认站点」弹窗：说清状态、给一条能走通的路。
   //
   // 用户 2026-09-21 的要求是"装完就该有一个默认静态站点"。所以这里的按钮
@@ -960,6 +1007,40 @@ export function SitesView(content, ctx = {}) {
         } catch (e) { toast(e.message, 'err', 12000); }
       },
     });
+    // 🔧 修复 nginx 环境：把"面板自己的片段没被加载"这类故障变成一键可修。
+    // 用户 2026-09-22 报障："反向代理用不了了！…unknown "connection_upgrade" variable"
+    // —— 根因是 brew 重装/升级 nginx 把 nginx.conf 还原成出厂版，conf.d 的 include
+    // 与 upgrade map 一起没了。这里补齐并复核 nginx -t，不再让用户去重装 nginx。
+    const fixEnv = h('button.btn.btn-block', {
+      text: '🔧 修复 Nginx 环境',
+      title: '补齐 nginx.conf 的 conf.d / vhosts 加载与 WebSocket map（$connection_upgrade），并复核 nginx -t',
+      onclick: async () => {
+        m.close();
+        try {
+          const r = await api.nginxEnsureEnv();
+          const fixed = r.fixed || [];
+          if (r.nginx_test_ok === false) {
+            modal({
+              title: 'nginx 配置校验仍未通过',
+              wide: true,
+              body: h('div', [
+                h('div.hint', { text: fixed.length ? '已修复：\n' + fixed.join('\n') : '环境没有需要修的地方。' }),
+                h('pre', {
+                  style: { whiteSpace: 'pre-wrap', fontFamily: 'var(--mono)', fontSize: '12.5px',
+                    background: 'var(--danger-soft)', padding: '10px 12px', borderRadius: '6px',
+                    maxHeight: '320px', overflow: 'auto', userSelect: 'text' },
+                  text: r.nginx_test || '（nginx 没有输出）',
+                }),
+              ]),
+              footer: (close) => [h('button.btn', { text: '关闭', onclick: close })],
+            });
+            return;
+          }
+          toast(fixed.length ? `已修复 ${fixed.length} 项：${fixed[0]}` : 'nginx 环境本来就是好的，校验通过', 'ok', 9000);
+          load();
+        } catch (e) { toast('修复失败：' + e.message, 'err', 14000); }
+      },
+    });
     const rebuild = h('button.btn.btn-block', {
       text: '♻️ 重建全部配置',
       onclick: async () => {
@@ -980,6 +1061,11 @@ export function SitesView(content, ctx = {}) {
         h('div', [
           validate,
           h('div.hint', { text: '对 nginx 配置跑一次语法校验（nginx -t）' }),
+        ]),
+        h('div', [
+          fixEnv,
+          h('div.hint', { text: '反向代理报 unknown "connection_upgrade" variable、或站点配置保存后不生效时点它：' +
+            '补齐面板的 nginx 片段加载与 WebSocket map，并复核 nginx -t' }),
         ]),
         h('div', [
           rebuild,
@@ -1089,6 +1175,7 @@ export function SitesView(content, ctx = {}) {
 
   function renderStatus() {
     clear(statusBar);
+    renderDefSiteNotice();
     const c = cache || {};
     const list = c.list || [];
     const phps = c.php_versions || [];
@@ -1138,7 +1225,7 @@ export function SitesView(content, ctx = {}) {
       h('button.btn.btn-sm', {
         text: '⚡ 上传大小 / 执行时间',
         title: '在面板里改 nginx 请求体上限与 PHP 上传/执行上限（改完自动重载 nginx、重启 php-fpm，并回读生效值）',
-        onclick: () => uploadLimitsModal(),
+        onclick: () => uploadLimitsModal({ openNginxTuning: () => nginxPanelModal({ tab: 'tuning' }) }),
       }),
       // ⚙️ 配置文件：手动改 nginx.conf / 各站点 vhost / php.ini / my.cnf 的入口
       // （宝塔式"基本操作"）。文件清单与路径由后端给，编辑复用既有配置编辑器。
@@ -1171,7 +1258,12 @@ export function SitesView(content, ctx = {}) {
       listBox.append(h('div.empty', [
         h('div.big', { text: '🌐' }),
         h('h4', { text: '还没有站点' }),
-        h('p', { text: '新建站点需要 nginx + PHP + MySQL。环境还没装的话，用「一键 LNMP」一次装好；' +
+        // 空列表不再只说"新建站点需要 nginx+PHP+MySQL" —— 新机器上用户最该知道的
+        // 是"装完 panel 本来就该有一个默认站点，它还没建"。默认站点是纯静态的，
+        // 不需要 PHP/MySQL（用户 2026-09-21 明确要求），所以它单独一句说清。
+        h('p', { text: '面板装好后在 80 端口上本来就该有一个**默认站点**（纯静态，不需要 PHP 与 MySQL）；' +
+          '上面的提示条会如实显示它建好了没有。' }),
+        h('p', { text: '新建自己的站点才需要 nginx + PHP + MySQL：环境还没装的话，用「一键 LNMP」一次装好；' +
           '环境已就绪的话，直接新建站点即可。' }),
         // 空列表时 LNMP 是**大按钮**（用户要求：醒目但不过度）：
         // 没有环境的话，先建站点也跑不起来，所以它排在最前面。
@@ -1179,6 +1271,13 @@ export function SitesView(content, ctx = {}) {
         // 与工具条同一判据：环境完整（两层都读到且都不缺）时**不出现**；
         // 读不到时照常出现（不拿"没读到"当真完整）。
         h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
+          // 默认站点还没建 → 这颗排最前（它就是"新机器上第一件该做的事"）。
+          ...(defSite && !defSite.applied
+            ? [h('button.btn.btn-primary', {
+              text: defSite.nginx_present === false ? '🏠 创建默认站点（先装 Nginx）' : '🏠 创建默认站点',
+              onclick: defaultSiteModal,
+            })]
+            : []),
           ...(lnmpNeeded() ? [lnmpButton(true)] : []),
           h('button.btn', { text: '新建第一个站点', onclick: newSiteModal }),
         ]),

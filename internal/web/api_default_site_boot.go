@@ -58,6 +58,10 @@ type defaultSiteState struct {
 
 // defaultSiteEuid 是"当前有效用户 id"的可注入点：单测以普通用户跑，
 // 但必须能验证"以 root 启动时会真的建站点"这条路径（否则只能测到跳过分支）。
+//
+// 它同时是**整条环境自愈链**（默认站点 / nginx 全局上限 / nginx 运行时目录 /
+// PHP 上传执行上限）共用的 root 判据：这几个动作都只在 root 下做（非 root 的
+// 调试实例绝不能写真机配置，AGENTS 坑 162），共用一个注入点才能一起被测试覆盖。
 var defaultSiteEuid = os.Geteuid
 
 // nginxPresent 判"这台机器上到底有没有 nginx" —— 只看**二进制**。
@@ -271,7 +275,66 @@ func (s *Server) handleDefaultSiteStatus(w http.ResponseWriter, r *http.Request)
 	ok(w, s.defaultSiteStatusNow())
 }
 
-// ensureDefaultSiteOnStart 在面板启动时自动把默认站点建起来（用户要求"装完就有"）。
+// defaultSiteWatchInterval 是"有 nginx 却没默认站点"的巡检间隔。
+//
+// 为什么需要巡检（2026-09-22 用户报障："全新安装的面板，没有默认网站！"）：
+// 面板启动时的这一次检查，只能覆盖"启动那一刻 nginx 已就绪"的机器。而新机器的
+// 正常顺序恰恰相反 —— 先装面板（此时机器上连 Homebrew 都没有），再在面板里装
+// nginx（一键 LNMP / 应用市场单装 nginx / brew 重装）。那之后**没有任何东西**
+// 会再跑一次这个检查，于是"装上 Nginx 后面板会自动建默认站点"这句话是假的，
+// 用户看到的就是"没有默认网站"。修法是把它变成**持续自愈**：
+//
+//	· 启动时查一次（下面 ensureDefaultSiteOnStart）；
+//	· 之后按本间隔巡检（watchWebEnv）；
+//	· 任何任务收尾时再查一次（launchTask → maybeEnsureDefaultSite），
+//	  这样"刚点完安装"就能立刻看到，不必等下一次巡检。
+//
+// 巡检本身极便宜：两次 os.Stat + 一次状态文件读；已就绪时**一次都不写盘、不 reload**。
+var defaultSiteWatchInterval = 2 * time.Minute
+
+// maybeEnsureDefaultSite 只在"nginx 在、默认站点确实不在"时才动手。
+//
+// 这是所有调用点的统一入口：调用方不必自己判断，也不需要记住在哪个安装路径上
+// 加钩子（漏一个就是又一轮"装完没有默认站点"）。没有 nginx / 已经建好 /
+// 80 端口上是用户自己写的站点 → 一次 stat 后原样返回。
+func (s *Server) maybeEnsureDefaultSite(ctx context.Context) {
+	present, why := s.nginxPresent()
+	if !present {
+		// 仍然调用一次：它会把"等待 nginx"如实记进状态文件（只在状态变化时写盘），
+		// 界面据此显示"默认站点待创建（缺 nginx）"，而不是含糊的"未知"。
+		_ = why
+		s.ensureDefaultSiteOnStart(ctx)
+		return
+	}
+	if ready, _, _ := s.defaultSiteDiskReady(); ready {
+		return
+	}
+	s.ensureDefaultSiteOnStart(ctx)
+}
+
+// watchWebEnv 持续巡检"面板装好之后才出现"的环境问题（见 defaultSiteWatchInterval 的说明）。
+//
+// 两件事一起做，因为它们被同一个触发条件（"nginx/PHP 是后来才装上的"）绑在一起：
+//
+//	· healWebEnv —— nginx 全局上限 / 运行时目录属主 / PHP 上传执行上限；
+//	· maybeEnsureDefaultSite —— 80 端口上的默认站点。
+//
+// ctx 结束时退出：面板进程退出前不会有半途写配置的 goroutine 残留。
+func (s *Server) watchWebEnv(ctx context.Context) {
+	t := time.NewTicker(defaultSiteWatchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.healWebEnv(ctx)
+			s.maybeEnsureDefaultSite(ctx)
+		}
+	}
+}
+
+// ensureDefaultSiteOnStart 自动把默认站点建起来（用户要求"装完就有"）。
 //
 // 幂等 + 诚实：
 //   - 已经成功过（落盘标记 + 现场仍在）→ 什么都不做；
@@ -279,6 +342,11 @@ func (s *Server) handleDefaultSiteStatus(w http.ResponseWriter, r *http.Request)
 //   - 非 root → 跳过（调试实例必须不碰真机 nginx 配置，AGENTS 坑 162）。
 func (s *Server) ensureDefaultSiteOnStart(ctx context.Context) {
 	st := s.readDefaultSiteState()
+	// prevErr 是上一次记下的原因。巡检每隔 defaultSiteWatchInterval 就会调到这里，
+	// 而"跳过的理由"（缺 nginx / 80 端口上是用户自己的站点 / 非 root）在状态变化前
+	// 一直不变 —— 不比较就会每两分钟刷一条同样的日志（"没有日志是信息"，
+	// "全是重复日志"同样会把真正有用的那一条淹掉）。
+	prevErr := st.Error
 	present, why := s.nginxPresent()
 	if !present {
 		if !st.Attempted || st.NginxPresent || st.Error != why {
@@ -314,7 +382,9 @@ func (s *Server) ensureDefaultSiteOnStart(ctx context.Context) {
 			"在「网站管理 → 默认站点」里可以明确选择覆盖它"
 		st.At = time.Now().Format(time.RFC3339)
 		s.writeDefaultSiteState(st)
-		s.Log.Info("默认站点：%s", st.Error)
+		if st.Error != prevErr {
+			s.Log.Info("默认站点：%s", st.Error)
+		}
 		return
 	}
 	if defaultSiteEuid() != 0 {
@@ -323,7 +393,9 @@ func (s *Server) ensureDefaultSiteOnStart(ctx context.Context) {
 		st.Error = "面板不是以 root 运行，已跳过自动创建默认站点（调试实例不写真实 nginx 配置）"
 		st.At = time.Now().Format(time.RFC3339)
 		s.writeDefaultSiteState(st)
-		s.Log.Info("默认站点：%s", st.Error)
+		if st.Error != prevErr {
+			s.Log.Info("默认站点：%s", st.Error)
+		}
 		return
 	}
 	s.Log.Info("默认站点不存在（vhost 或占位页缺失）—— 自动创建一份纯静态默认站点")

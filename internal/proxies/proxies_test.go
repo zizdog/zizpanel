@@ -222,3 +222,43 @@ func TestPreserveHostAlsoRewritesPortlessUpstreamLocation(t *testing.T) {
 		t.Errorf("没开 PreserveHost 的规则不该注入 proxy_redirect：\n%s", got2)
 	}
 }
+
+// TestRuleGenerateWithoutWebsocketHasNoUpgradeLines 锁住用户 2026-09-22 的要求：
+//
+//	"不需要 WebSocket 就不要加 Upgrade 那两行，干净利落。"
+//
+// 为什么这条必须钉死：`proxy_set_header Connection $connection_upgrade;` 依赖
+// http 上下文里定义的 map（面板写在 conf.d/upgrade-map.conf）。一旦那份 map 没被
+// nginx.conf 加载（brew 重装/升级 nginx 就会还原成出厂配置），**整份配置 nginx -t
+// 直接失败**，用户看到的是"规则已保存但配置应用失败，已回滚"。
+// 不需要 WebSocket 的规则根本不该依赖它 —— 关掉开关就必须一行都不出现。
+func TestRuleGenerateWithoutWebsocketHasNoUpgradeLines(t *testing.T) {
+	r := &Rule{
+		ID: 9, Name: "纯 HTTP 上游", Listen: 8090,
+		Target: "http://127.0.0.1:3000", Websocket: false, Enabled: true,
+	}
+	got, err := r.Generate("/tmp/logs")
+	if err != nil {
+		t.Fatalf("生成失败：%v", err)
+	}
+	for _, bad := range []string{
+		"$connection_upgrade",
+		"proxy_set_header Upgrade",
+		"proxy_set_header Connection",
+	} {
+		if strings.Contains(got, bad) {
+			t.Errorf("关掉 WebSocket 后，生成的配置里不该出现 %q（否则平白依赖 conf.d 里的 map）：\n%s", bad, got)
+		}
+	}
+	// 反过来也要成立：开着的时候必须有（别把功能一起删了）
+	r.Websocket = true
+	got2, err := r.Generate("/tmp/logs")
+	if err != nil {
+		t.Fatalf("生成失败：%v", err)
+	}
+	for _, want := range []string{"proxy_set_header Upgrade $http_upgrade;", "proxy_set_header Connection $connection_upgrade;"} {
+		if !strings.Contains(got2, want) {
+			t.Errorf("开着 WebSocket 时生成的配置缺少 %q：\n%s", want, got2)
+		}
+	}
+}
