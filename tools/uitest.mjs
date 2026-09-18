@@ -2655,6 +2655,28 @@ try {
     if (junk > 0) throw new Error('文件管理页出现了 ' + junk + ' 处字面量 null');
   });
 
+  await step('常用设置弹窗必须有内容（点开空白 = 用户报障的那一类）', async () => {
+    // 2026-09-18 用户报障：「上传大小 / 执行时间（nginx + PHP）」点开是**空的**。
+    // 根因是前端把面板构建函数定义在了另一个函数作用域里（uploadLimitsModal
+    // 在模块作用域调它 → ReferenceError → 弹窗正文永远空白），而 acorn 只能查语法、
+    // Go 测试也碰不到前端作用域 —— 只有真浏览器点一次才发现。
+    // 这条门禁刻意断言"正文里有实质内容"，而不是"弹窗出现了"。
+    const btn = page.getByRole('button', { name: '⚡ 上传大小 / 执行时间', exact: true }).first();
+    if (!(await btn.count())) throw new Error('网站管理工具条里没有「⚡ 上传大小 / 执行时间」入口');
+    await btn.click();
+    await page.waitForSelector('.modal-mask', { timeout: 10000 });
+    await page.waitForTimeout(2500);
+    const text = (await page.locator('.modal-mask .modal-body').allInnerTexts()).join('\n');
+    for (const want of ['client_max_body_size', 'upload_max_filesize', '保存并应用']) {
+      if (!text.includes(want)) {
+        throw new Error('「上传大小 / 执行时间」弹窗里缺少 ' + want + ' —— 正文实际是：' + text.slice(0, 200));
+      }
+    }
+    await shot('40c-limits-modal');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(600);
+  });
+
   await step('上传：进度提示 + 落盘 + 上传文件夹入口', async () => {
     // 锁 2026-09-20 的报障：点上传「没反应、没成功也没提示」。三条断言缺一不可：
     //   ① 上传必须真的发出请求并落盘（不是静默失败）；

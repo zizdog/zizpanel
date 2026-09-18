@@ -374,6 +374,7 @@ func (s *Server) settingsView() map[string]any {
 		// 应用包镜像：设置页要能看见当前值、能改、能清空
 		// （清空 = 关闭镜像、回到公网来源，仅用于镜像站故障时应急）。
 		"mirror_base":          s.Cfg.MirrorBase,
+		"mirror_base_lan":      s.Cfg.MirrorBaseLAN,
 		"mirror_probe_seconds": s.Cfg.MirrorProbeSeconds,
 		// 仅走 NAS（离线）模式：设置页要能看见并切换它。
 		// 打开后各安装器禁止回落外网，缺资源就明确失败（见 services/mirror.go）。
@@ -430,6 +431,8 @@ type settingsReq struct {
 	// 有值时镜像是**优先来源**：先用镜像，缺元件或不可达时回落到公网源
 	// （见 services/mirror.go 文件头；"唯一来源"是更早一版的需求，已作废）。
 	MirrorBase *string `json:"mirror_base"`
+	// MirrorBaseLAN 是镜像站的局域网入口（公网入口不可达时的第二候选）。
+	MirrorBaseLAN *string `json:"mirror_base_lan"`
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，1~60）。
 	MirrorProbeSeconds *int `json:"mirror_probe_seconds"`
 	// OfflineOnly = 仅走 NAS（离线）模式：禁止任何外网回落，缺资源即明确失败。
@@ -531,6 +534,16 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.UpgradeSource = src
+	}
+	if req.MirrorBaseLAN != nil {
+		lan := strings.TrimRight(strings.TrimSpace(*req.MirrorBaseLAN), "/")
+		if lan != "" && !strings.HasPrefix(lan, "http://") && !strings.HasPrefix(lan, "https://") {
+			fail(w, http.StatusBadRequest,
+				"局域网镜像地址必须以 http:// 或 https:// 开头（例如 http://192.168.1.8:8090）；"+
+					"留空表示不尝试局域网入口")
+			return
+		}
+		cfg.MirrorBaseLAN = lan
 	}
 	if req.MirrorBase != nil {
 		base := strings.TrimRight(strings.TrimSpace(*req.MirrorBase), "/")

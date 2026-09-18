@@ -511,8 +511,12 @@ func Catalog() []App {
 			// IOPaint 的**视频**去水印路径要 ffmpeg 拆帧/合帧（市场描述里的"支持视频"
 			// 就是它）；图片路径不需要。面板不直接调用 ffmpeg，所以这里只作提示 +
 			// 部署时一并装好 —— 装上不会有副作用（它本来就是基础环境）。
-			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
-				Hint: "brew install ffmpeg（IOPaint 的视频处理需要它，安装时会一并安装）"}},
+			Requires: []Requirement{
+				{Type: "brew_formula", Value: "ffmpeg",
+					Hint: "brew install ffmpeg（IOPaint 的视频处理需要它，安装时会一并安装）"},
+				{Type: "brew_formula", Value: "python@3.11",
+					Hint: "brew install python@3.11（IOPaint 跑在自己的 Python venv 里，安装时会一并安装）"},
+			},
 			DocsURL: "https://github.com/Sanster/IOPaint",
 		},
 		// 按 TtsVoice 插件契约原生安装（Python 3.11 + mlx-audio[server]）：插件只支持
@@ -529,8 +533,17 @@ func Catalog() []App {
 			// HTTP 200 + 0 字节 body（2026-09-16 事故的确切成因）。用目录既有的
 			// Requires 机制声明 —— 安装前检查会提示，部署时由
 			// EnsureBaseDependencies 一并装好，不需要前端配合新字段。
-			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
-				Hint: "brew install ffmpeg（TTS 编码 mp3 必需，部署时会一并安装）"}},
+			// 依赖要**在这里全部声明**（用户 2026-09-18 报障："它依赖 ffmpeg，却没有
+			// 安装 ffmpeg，并且应该给出提示，知道会一并安装" / "Python 3.11 也是 tts 等的
+			// 依赖，也没有一并安装"）——声明了才会出现在安装前的检查里、才会在任务日志
+			// 里事先说明"将一并安装"，安装器也才会真的把它们装好并复核。
+			// python@3.11 不是偏好：mlx-audio 只在 cp311 有预编译 wheel（见 qwentts.go）。
+			Requires: []Requirement{
+				{Type: "brew_formula", Value: "ffmpeg",
+					Hint: "brew install ffmpeg（TTS 编码 mp3 必需，部署时会一并安装）"},
+				{Type: "brew_formula", Value: "python@3.11",
+					Hint: "brew install python@3.11（mlx-audio 只在 3.11 有预编译 wheel，部署时会一并安装）"},
+			},
 			DocsURL: "https://github.com/Blaizzy/mlx-audio",
 		},
 		// 样本必须落到本机磁盘 —— 上游只接受本地文件路径，不能把上传流直接转发过去。
@@ -548,8 +561,12 @@ func Catalog() []App {
 			// 接收端自己就用 ffmpeg / ffprobe（样本真解码校验 + 转码与归一），
 			// 同时它是上游 Qwen 编码 mp3 的必经环节。用目录既有的 Requires 声明，
 			// 安装前检查会提示，部署时由 EnsureBaseDependencies 一并装好。
-			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
-				Hint: "brew install ffmpeg（样本校验与音频转码必需，部署时会一并安装）"}},
+			Requires: []Requirement{
+				{Type: "brew_formula", Value: "ffmpeg",
+					Hint: "brew install ffmpeg（样本校验与音频转码必需，部署时会一并安装）"},
+				{Type: "brew_formula", Value: "python@3.11",
+					Hint: "brew install python@3.11（接收端跑在自己的 Python venv 里，部署时会一并安装）"},
+			},
 			// 契约来源是网站侧插件目录里的 HANDOFF-TO-MINI.md。
 			// 这里原先错填成 phpmyadmin.net（复制粘贴残留），会把人引到无关文档。
 			DocsURL: "https://github.com/Blaizzy/mlx-audio",

@@ -299,6 +299,9 @@ type Options struct {
 	// 非空 = 镜像是**优先来源**：安装前先检查资源在不在，在就从镜像下、
 	// 缺件或不可达则回落到公网源（见 mirror.go）；空 = 关闭镜像（应急用）。
 	MirrorBase string
+	// MirrorBaseLAN 是同一个镜像站的局域网入口（来自 Config.MirrorBaseLAN）。
+	// 公网入口不可达/缺件时用它兜底 —— 见 mirrorBaseCandidates 的注释。
+	MirrorBaseLAN string
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，来自 Config.MirrorProbeSeconds）；
 	// <=0 按 4 秒处理。
 	MirrorProbeSeconds int

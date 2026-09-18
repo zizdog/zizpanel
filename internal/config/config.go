@@ -70,6 +70,16 @@ type Config struct {
 	// 需求描述，代码从来不是那样跑的（真按"唯一来源"跑会在镜像站抖一下时
 	// 就让用户装不上东西）。以这里为准。
 	MirrorBase string `json:"mirror_base"`
+	// MirrorBaseLAN 是同一个镜像站的**局域网地址**（可选，例如 http://192.168.1.8:8090）。
+	//
+	// 为什么需要（2026-09-18 用户报障："ddns-go 等没有 nas 缓存！装不上啊！"）：
+	// 公网入口（mirror.zizdog.com:8888）坏掉时，面板会**回落公网**（GitHub/第三方加速），
+	// 而国内直连 GitHub 很慢甚至不通 —— 用户就看到"装不上"。而同一台 NAS 的局域网
+	// 入口（8090）往往是好的、还快得多。配了这个地址后：镜像探测会**依次尝试**
+	// 公网基址 → 局域网基址，谁先命中用谁，都不可达才回落公网。
+	//
+	// 留空 = 不尝试局域网地址（默认给作者家里的 NAS，见 DefaultMirrorBaseLAN）。
+	MirrorBaseLAN string `json:"mirror_base_lan"`
 	// MirrorProbeSeconds 是"镜像上有没有这个资源"的单次探测超时（秒）。
 	//
 	// 必须短：镜像不可达时不能让每次安装都白等。默认 4 秒 —— 局域网/同城镜像
@@ -208,6 +218,14 @@ func root() string {
 // 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 
+// DefaultMirrorBaseLAN 是镜像站的**局域网**入口（同一个 NAS 的另一个入口）。
+//
+// 它只是"公网入口不可达时的第二候选"，不是替代品：面板先探公网镜像，
+// 探不通（站点挂了 / 不在同一网络 / 缺件）再探这个，最后才回落公网源。
+// 2026-09-18 实测：公网入口 TLS 握手成功但返回空响应（NAS 侧反代坏了），
+// 而 http://192.168.1.8:8090 完全正常 —— 有这条候选就不会"装不上"。
+const DefaultMirrorBaseLAN = "http://192.168.1.8:8090"
+
 // DefaultUpgradeSource 是在线升级的**公网主源**（用户要求"以后探测以公网 zizdog.com 为主"）。
 //
 // 它与 internal/upgrade.CandidateSources 里的默认候选是同一个值
@@ -284,6 +302,7 @@ func Default() *Config {
 		// 镜像上缺件/不可达时自动回落公网源（保证"镜像抖一下就装不上"不会发生）。
 		// 留空 = 关闭镜像（应急用）。
 		MirrorBase:         DefaultMirrorBase,
+		MirrorBaseLAN:      DefaultMirrorBaseLAN,
 		MirrorProbeSeconds: 4,
 		// 在线升级：默认指向公网主源 zizdog.com。
 		//

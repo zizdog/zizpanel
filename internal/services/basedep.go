@@ -198,15 +198,27 @@ func (m *Manager) AnnounceAppDependencies(ctx context.Context, appID string, res
 		return
 	}
 	for _, req := range app.Requires {
-		if req.Type != "brew_formula" {
-			continue
+		switch req.Type {
+		case "brew_formula":
+			if dep, isBase := baseDependencyFor(req.Value); isBase {
+				result.step(ctx, fmt.Sprintf("依赖提示：「%s」需要基础依赖 %s，将一并安装/确认。%s",
+					app.Name, dep.Command, req.Hint))
+				continue
+			}
+			// 非"基础依赖"的 brew 包（例如 python@3.11）同样要**事先说清楚**：
+			// 用户 2026-09-18 报障"Python 3.11 也是 tts 等的依赖，也没有一并安装"，
+			// 其中的一半是"没人告诉他会被一并装上哪些东西"。
+			result.step(ctx, fmt.Sprintf("依赖提示：「%s」需要 %s，将一并安装/确认。%s",
+				app.Name, req.Value, req.Hint))
+		case "docker":
+			result.step(ctx, fmt.Sprintf("依赖提示：「%s」需要 Docker 运行时。%s",
+				app.Name, req.Hint))
+		default:
+			if req.Hint != "" {
+				result.step(ctx, fmt.Sprintf("依赖提示：「%s」需要 %s：%s",
+					app.Name, req.Value, req.Hint))
+			}
 		}
-		dep, isBase := baseDependencyFor(req.Value)
-		if !isBase {
-			continue
-		}
-		result.step(ctx, fmt.Sprintf("依赖提示：「%s」需要基础依赖 %s，将一并安装/确认。%s",
-			app.Name, dep.Command, req.Hint))
 	}
 }
 

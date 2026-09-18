@@ -29,7 +29,7 @@
 //     「⚙️ 管理」面板
 
 import { api } from './api.js';
-import { h, clear, toast, modal, appendAll } from './ui.js';
+import { h, clear, toast, modal, appendAll, confirmBox } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
 // 「已安装」Tab 的实现（合并去重清单、一张卡片一个应用）住在 services.js ——
@@ -1173,6 +1173,21 @@ export function AppsView(content, ctx = {}) {
           text: '$ ' + c.fix_cmd,
         }) : null,
       ])),
+      // 依赖清单（目录里的 requires）：**安装前**就告诉用户"会一并装哪些东西"。
+      //
+      // 用户 2026-09-18 报障："我安装 tts 成功了，但是它依赖 ffmpeg，却没有安装 ffmpeg，
+      // 并且应该给出提示，知道会一并安装" + "Python 3.11 也是 tts 等的依赖，也没有一并安装"。
+      // 依赖声明在目录里（requires），但界面从来没渲染过 —— 用户当然不知道。
+      reqList(a).length ? h('div', {
+        style: {
+          padding: '9px 11px', marginTop: '10px', borderRadius: '6px', fontSize: '12.5px',
+          background: 'var(--brand-soft, var(--ok-soft))',
+        },
+      }, [
+        h('div', { style: { fontWeight: '620' }, text: '依赖：安装时会一并装好' }),
+        h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.8' } },
+          reqList(a).map((r) => h('li', { text: r.text }))),
+      ]) : null,
       a.post_install_hint ? h('div.hint', { style: { marginTop: '12px' }, text: (adopt ? '加到面板后：' : '安装后：') + a.post_install_hint }) : null,
       a.manual_hint ? h('div.hint', { style: { marginTop: '8px' }, text: a.manual_hint }) : null,
     );
@@ -1193,12 +1208,43 @@ export function AppsView(content, ctx = {}) {
     );
   }
 
+  // reqList 把目录里的 requires 渲染成人话（安装检查对话框与安装确认共用）。
+  //
+  // 依赖声明的**唯一来源**是目录（internal/services/catalog.go 的 Requires）：
+  // 前端不写死任何应用名与依赖名，加应用时不需要改前端。
+  function reqList(a) {
+    const out = [];
+    for (const r of (a && a.requires) || []) {
+      const v = String((r && r.value) || '');
+      let text = '';
+      if (r && r.type === 'brew_formula') {
+        text = v + (r.hint ? '（' + r.hint.replace(/^brew install [^（(]*[（(]?/, '').replace(/）?$/, '') + '）' : '');
+        if (!r.hint) text = v;
+      } else if (r && r.type === 'docker') {
+        text = 'Docker 运行时' + (r.hint ? '（' + r.hint + '）' : '');
+      } else {
+        text = (v || r.type || '未知依赖') + (r && r.hint ? '（' + r.hint + '）' : '');
+      }
+      out.push({ raw: v, text });
+    }
+    return out;
+  }
+
   // ---------- 执行安装 ----------
   //
   // 旧实现是"同步等请求 + 事后打印 steps"，用户在整个过程中看不到任何真实输出，
   // 关掉窗口也找不回来。现在改成：POST 立刻返回 task_id，进度交给任务中心。
   // 失败（4xx/5xx）由 taskCenter.start 统一 toast，这里不需要再兜一层。
-  function doInstall(a) {
+  async function doInstall(a) {
+    // 安装前把"会一并安装的依赖"再说一遍并要求确认（用户明确要求"应该给出提示，
+    // 知道会一并安装"）——装 TTS 会顺带装上 ffmpeg 与 Python 3.11 这种事实，
+    // 不该只在任务日志里出现。
+    const reqs = reqList(a);
+    if (reqs.length && !await confirmBox(
+      '安装「' + a.name + '」时会**一并安装**这些依赖：\n\n· ' +
+      reqs.map((r) => r.text).join('\n· ') +
+      '\n\n依赖由 Homebrew 安装（原生 arm64 包）。继续安装？',
+      { title: '安装 ' + a.name, okText: '开始安装' })) return;
     // adopt 类应用（目录有 adopt_label）：后端只把本机已有的服务登记进来，
     // 所以任务名与成功提示都**不能**说"安装"（没装任何东西，也不该让用户以为
     // 面板重新装了一遍他已有的软件）。

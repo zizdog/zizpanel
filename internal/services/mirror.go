@@ -97,6 +97,37 @@ func (m *Manager) mirrorBase() string {
 	return strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/")
 }
 
+// mirrorBaseLAN 是同一个镜像站的局域网入口（可选）。
+func (m *Manager) mirrorBaseLAN() string {
+	return strings.TrimRight(strings.TrimSpace(m.opt.MirrorBaseLAN), "/")
+}
+
+// mirrorBaseCandidates 返回**按顺序尝试**的镜像基址：公网 → 局域网 → …。
+//
+// 为什么要有多个候选（2026-09-18 用户报障"ddns-go 等没有 nas 缓存！装不上啊！"）：
+// 用户看到的是"镜像上没有这个包"，实测却是**公网入口坏了**（TLS 通、返回空响应），
+// 而同一台 NAS 的局域网入口（192.168.1.8:8090）上包好好地躺着。
+// 只有一个基址时，公网入口一坏，安装就只能回落 GitHub —— 国内那就是"装不上"。
+//
+// 去重：局域网地址与公网地址相同时只留一个（避免白探一次）。
+func (m *Manager) mirrorBaseCandidates() []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, base := range []string{m.mirrorBase(), m.mirrorBaseLAN()} {
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		out = append(out, base)
+	}
+	return out
+}
+
+// mirrorAssetURLOn 在**指定**基址上拼应用包地址（供多候选探测使用）。
+func mirrorAssetURLOn(base, appID, version, asset string) string {
+	return strings.Join([]string{base, mirrorAppsDir, appID, version, asset}, "/")
+}
+
 // MirrorEnabled 表示当前是否启用"镜像优先"（界面/日志用）。
 //
 // 注意语义：启用 != 只用镜像。启用后镜像**优先**，但它缺件或不可达时
@@ -217,12 +248,16 @@ func (m *Manager) downloadURLsFor(ctx context.Context, spec releaseBinaryApp) []
 	if !m.MirrorEnabled() {
 		return fallback
 	}
-	mirrorURL := m.appAssetURL(spec.ID, spec.Tag, spec.Asset)
-	if err := m.checkMirrorURL(ctx, mirrorURL); err != nil {
-		// 不可达/缺包：回落。把原因留给调用方记进任务日志（这里只返回列表）。
-		return fallback
+	// 依次尝试每个镜像基址（公网 → 局域网）：**第一个真有这个包的**用作首选。
+	// 每个基址的探测都有自己的短超时（MirrorProbeSeconds），不会把安装拖住。
+	for _, base := range m.mirrorBaseCandidates() {
+		url := mirrorAssetURLOn(base, spec.ID, spec.Tag, spec.Asset)
+		if err := m.checkMirrorURL(ctx, url); err != nil {
+			continue // 不可达 / 缺件：试下一个基址，最后回落公网
+		}
+		return append([]string{url}, fallback...)
 	}
-	return append([]string{mirrorURL}, fallback...)
+	return fallback
 }
 
 // mirrorReachable 探测镜像站是否可用（只探站点根，用于"整条链路"级别的判断）。

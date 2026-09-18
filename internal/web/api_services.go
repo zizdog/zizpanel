@@ -97,6 +97,7 @@ func (s *Server) svcManager() *services.Manager {
 		// 应用包镜像基址：面板里所有安装过程都从这里取资源（见 services/mirror.go）。
 		// svcManager() 每次都按当前 Cfg 新建，所以设置页保存后立刻生效。
 		MirrorBase:         s.Cfg.MirrorBase,
+		MirrorBaseLAN:      s.Cfg.MirrorBaseLAN,
 		MirrorProbeSeconds: s.Cfg.MirrorProbeSeconds,
 		// 仅走 NAS（离线）模式：打开后各安装器禁止回落外网
 		// （见 internal/services/mirror.go 的 MirrorOfflineOnly）。

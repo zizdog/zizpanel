@@ -1463,8 +1463,78 @@ export function configFileModal(s, reload) {
   let editor = null;
   let saved = '';
 
+  // ---- 查找（用户 2026-09-18 明确要求："编辑配置文件总行有个搜索功能吧！要不怎么找！！"）----
+  //
+  // 配置文件动辄几百上千行（php.ini 73831 字节、nginx.conf 893 字节但结构密），
+  // 没有查找就只能靠肉眼滚。这里给：关键词输入 + 上一个/下一个 + "第 n/m 处"，
+  // 命中的片段会被**选中并滚动到可见**（textarea.setSelectionRange + focus）。
+  let findInput = null;   // 见 body()：每次重画都会新建
+  let findHits = [];      // 当前关键词的全部命中位置
+  let findIdx = -1;       // 当前停在命中列表的第几个
+
+  function computeFindHits() {
+    findHits = [];
+    findIdx = -1;
+    if (!editor || !findInput) return;
+    const kw = findInput.value;
+    if (!kw) return;
+    const text = editor.value;
+    let from = 0;
+    for (;;) {
+      const at = text.indexOf(kw, from);
+      if (at < 0) break;
+      findHits.push(at);
+      from = at + Math.max(1, kw.length);
+      if (findHits.length > 5000) break; // 保险：极端文件不至于卡死
+    }
+  }
+
+  function gotoHit(i, forward = true) {
+    if (!editor || !findInput) return;
+    if (!findHits.length) {
+      computeFindHits();
+      if (!findHits.length) {
+        toast(findInput.value ? ('找不到「' + findInput.value + '」') : '先输入要查找的内容', 'warn', 6000);
+        return;
+      }
+    }
+    if (findIdx < 0) {
+      // 从光标位置往后找第一个命中（没有光标就用开头）
+      const cur = editor.selectionStart ?? 0;
+      const at = forward ? findHits.findIndex((p) => p >= cur) : -1;
+      findIdx = at >= 0 ? at : (forward ? 0 : findHits.length - 1);
+    } else {
+      findIdx = (findIdx + i + findHits.length) % findHits.length;
+    }
+    const pos = findHits[findIdx];
+    const kw = findInput.value;
+    editor.focus();
+    editor.setSelectionRange(pos, pos + kw.length);
+    // 把命中的行滚到视野中间附近：按"命中之前有多少个换行"估行号
+    const line = editor.value.slice(0, pos).split('\n').length;
+    const lineHeight = 20; // 与 textarea 的 lineHeight 保持一致
+    editor.scrollTop = Math.max(0, (line - 4) * lineHeight);
+    findCount.textContent = '第 ' + (findIdx + 1) + '/' + findHits.length + ' 处';
+  }
+
+  let findCount = h('span.hint', { text: '' });
+
   const body = () => h('div', [
     h('div.hint', { text: '文件：' + path }),
+    // 查找条（永远在编辑器上方，一眼能看到）
+    h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', margin: '6px 0', flexWrap: 'wrap' } }, [
+      findInput = h('input.input', {
+        placeholder: '🔍 在这份配置里查找（回车 = 下一个，例如 client_max_body_size）',
+        style: { maxWidth: '360px' },
+        onkeydown: (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); gotoHit(1, !e.shiftKey); }
+        },
+        oninput: () => { computeFindHits(); findCount.textContent = findHits.length ? (findHits.length + ' 处') : ''; },
+      }),
+      h('button.btn.btn-sm', { text: '↓ 下一个', onclick: () => gotoHit(1) }),
+      h('button.btn.btn-sm', { text: '↑ 上一个', onclick: () => gotoHit(-1, false) }),
+      findCount,
+    ]),
     editor,
     h('div', { style: { marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
       h('button.btn.btn-sm.btn-primary', { text: '💾 保存', onclick: save }),
