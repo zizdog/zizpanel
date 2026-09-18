@@ -437,6 +437,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/proxies/apply", s.requireAuth(s.handleAppProxyApply))
 	// 从市场卸载（service / installer 两类；纳管的走 DELETE /api/v1/services/{name}）
 	root.HandleFunc("DELETE /api/v1/market/{id}", s.requireAuth(s.handleMarketUninstall))
+	// 卸载前的**完整**计划（含依赖检测，会真的跑一次 brew uses）：
+	// 列表刻意不查依赖（36 条要 15 秒），用户点「卸载」时才按需查（见该 handler 注释）。
+	root.HandleFunc("GET /api/v1/market/{id}/uninstall-plan", s.requireAuth(s.handleMarketUninstallPlan))
 	// 一键建站（Typecho / WordPress …）：建目录 + 建库 + 建站点 + 伪静态
 	root.HandleFunc("POST /api/v1/market/{id}/install-site", s.requireAuth(s.handleSiteAppInstall))
 
@@ -464,11 +467,18 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("/phpmyadmin/", s.handlePhpMyAdmin)
 	root.HandleFunc("/phpmyadmin", s.handlePhpMyAdmin)
 
-	// 整理默认站点（建 www/localhost + 重写 000-default.conf，去掉 /_panel）
+	// 默认站点（建 www/localhost + 重写 000-default.conf，去掉 /_panel）。
+	// 面板启动时会**自动**做一次（见 api_default_site_boot.go）—— 这两个接口是
+	// 给"看一眼状态 / 自动没成功时手动重试 / 还没有 nginx 时只装 nginx"用的。
+	root.HandleFunc("GET /api/v1/system/default-site", s.requireAuth(s.handleDefaultSiteStatus))
 	root.HandleFunc("POST /api/v1/system/default-site/apply", s.requireAuth(s.handleDefaultSiteApply))
 
 	root.HandleFunc("GET /api/v1/settings", s.requireAuth(s.handleGetSettings))
 	root.HandleFunc("POST /api/v1/settings", s.requireAuth(s.handleSaveSettings))
+	// 上传与执行限制（nginx client_max_body_size + PHP upload/post/memory/执行时间）：
+	// GET 回读生效值，POST 校验后走任务中心应用（写配置 → reload nginx → 重启 php-fpm）。
+	root.HandleFunc("GET /api/v1/settings/upload-limits", s.requireAuth(s.handleGetUploadLimits))
+	root.HandleFunc("POST /api/v1/settings/upload-limits", s.requireAuth(s.handleSaveUploadLimits))
 
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会

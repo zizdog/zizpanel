@@ -10,7 +10,9 @@
 // 退出码非 0 表示流程失败，可直接接入 CI。
 
 import { chromium } from 'playwright';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const base = process.argv[2] || 'http://127.0.0.1:18443';
 // API 基址拼接：`base` 带尾斜杠（Makefile 传的是 .../dev/），直接拼 '/api/…' 会得到
@@ -403,9 +405,11 @@ try {
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(1200);
     await shot('05-settings');
-    // 2026-09-20 用户要求：Tab 顺序 = 访问与安全 → 文件与终端 → 账号与两步验证 → 检查更新。
+    // 2026-09-20 用户要求把「上传与执行限制」放进面板设置（phpMyAdmin 导入 413
+    // 就是在这里改的）；顺序 = 访问与安全 → 上传与执行限制 → 文件与终端 →
+    // 账号与两步验证 → 检查更新。
     const titles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
-    const want = ['访问与安全', '文件与终端', '账号与两步验证', '检查更新'];
+    const want = ['访问与安全', '上传与执行限制', '文件与终端', '账号与两步验证', '检查更新'];
     const got = titles.filter((t) => want.includes(t));
     if (got.join('|') !== want.join('|')) {
       throw new Error(`设置页 Tab 顺序不对：期望 ${want.join(' → ')}，实际 ${got.join(' → ')}`);
@@ -422,6 +426,36 @@ try {
       await page.waitForTimeout(700);
       await shot('06-settings-' + t);
     }
+  });
+
+  // ---------- 上传与执行限制（用户报障 413 的入口）----------
+  //
+  // 只验证"入口在、表单有默认值、生效值会回读"：**不点保存**——
+  // 保存会真的走任务（写 vhost / 重启 php-fpm），本地非 root 实例上会失败，
+  // 那属于 privStep 的范围；这里读接口是只读的。
+  await step('面板设置 → 上传与执行限制：表单默认值 + 生效值回读', async () => {
+    await page.click('.nav-item:has-text("面板设置")');
+    await page.waitForTimeout(600);
+    await page.click('button:has-text("上传与执行限制")');
+    await page.waitForSelector('.card-head h3:has-text("上传与执行限制")', { timeout: 15000 });
+    await page.waitForTimeout(1500);
+    const txt = await page.locator('.content').innerText();
+    for (const need of ['client_max_body_size', 'upload_max_filesize', 'post_max_size',
+      'memory_limit', 'max_execution_time', '当前生效值']) {
+      if (!txt.includes(need)) throw new Error(`上传与执行限制页缺少「${need}」`);
+    }
+    // 默认值必须真的填进表单（默认就要能用，不能让用户先撞 413 才知道要改）
+    const vals = await page.locator('.content input.input').evaluateAll((els) => els.map((e) => e.value));
+    if (!vals.includes('512m')) {
+      throw new Error('nginx 请求体上限的默认值没有填进表单（应为 512m）：' + JSON.stringify(vals));
+    }
+    if (!vals.includes('512M')) {
+      throw new Error('PHP 上传上限的默认值没有填进表单（应为 512M）：' + JSON.stringify(vals));
+    }
+    if (/(^|\s)(null|undefined)(\s|$)/.test(txt)) {
+      throw new Error('上传与执行限制页出现字面量 null/undefined：' + txt.slice(0, 300));
+    }
+    await shot('06b-settings-limits');
   });
 
   // ---------- 检查更新（2026-09-20 收进「面板设置」第 4 个 Tab）----------
@@ -961,6 +995,43 @@ try {
       throw new Error('nginx 状态文案与真实服务状态不一致（期望「' + want + '」）：\n' + headText);
     }
     await shot('20b-sites-nginx-status');
+  });
+
+  // ---------- 「⚙️ 配置文件」入口（2026-09-20 用户要求：手动改 nginx/php 的基本操作）----------
+  //
+  // 只验证"入口真的在、清单真的从后端来、路径不是前端拼的"：
+  // **不点「📝 编辑」**——那会打开真实配置文件（甚至保存/重启服务），
+  // 本地调试实例不该碰真机配置。读取本身是只读的。
+  await step('网站管理：⚙️ 配置文件清单来自后端，且不写任何东西', async () => {
+    await reloadSites();
+    const btn = page.locator('.card-head button:has-text("⚙️ 配置文件")');
+    if (!(await btn.count())) {
+      throw new Error('工具条上没有「⚙️ 配置文件」入口（用户要求面板里能手动改 nginx/php）');
+    }
+    if (!(await btn.first().getAttribute('title') || '').includes('my.cnf')) {
+      throw new Error('「⚙️ 配置文件」的 tooltip 没有说清能改哪些文件');
+    }
+    await btn.first().click();
+    await page.waitForSelector('.modal-mask:has-text("网站环境配置文件")', { timeout: 10000 });
+    await page.waitForTimeout(1200);
+    const bodyText = await page.locator('.modal-mask').last().innerText();
+    if (!bodyText.includes('nginx')) throw new Error('配置文件清单里没有 nginx：\n' + bodyText);
+    // 后端至少要给出 nginx 主配置；PHP/MySQL 条目在没装对应组件时可以不出现。
+    const listed = await page.locator('.modal-mask').last().locator('code.code').allInnerTexts();
+    if (!listed.some((p) => p.endsWith('nginx.conf'))) {
+      throw new Error('配置文件清单里没有 nginx.conf 的**绝对路径**：' + JSON.stringify(listed));
+    }
+    if (listed.some((p) => p.includes('{brew}'))) {
+      throw new Error('路径里的 {brew} 占位符没有被后端展开：' + JSON.stringify(listed));
+    }
+    if (listed.some((p) => !p.startsWith('/'))) {
+      throw new Error('配置文件路径必须是绝对路径（相对路径会被文件接口的越界校验拒绝）：' + JSON.stringify(listed));
+    }
+    if (!bodyText.includes('保存不等于生效')) {
+      throw new Error('清单里没有说明"保存后需要重载/重启才生效"（宝塔那类会给重载入口）');
+    }
+    await shot('20c-sites-config-files');
+    await closeAnyModal(page);
   });
 
   await step('一键 LNMP 入口与真实环境一致（本机三层实测，不桩）', async () => {
@@ -2584,6 +2655,83 @@ try {
     if (junk > 0) throw new Error('文件管理页出现了 ' + junk + ' 处字面量 null');
   });
 
+  await step('上传：进度提示 + 落盘 + 上传文件夹入口', async () => {
+    // 锁 2026-09-20 的报障：点上传「没反应、没成功也没提示」。三条断言缺一不可：
+    //   ① 上传必须真的发出请求并落盘（不是静默失败）；
+    //   ② 过程中必须有可见进度（XHR upload.onprogress + 每秒 ticker）；
+    //   ③ 页面必须提供「上传文件夹」（用户点名要的入口）。
+    // 三条都是用户可见的行为，所以只能在这里端到端验，单测替代不了。
+    const plain = page.locator('input[type="file"]:not([webkitdirectory])');
+    if (!(await plain.count())) throw new Error('文件管理页没有普通上传的 input');
+    if (!(await page.locator('input[webkitdirectory]').count())) {
+      throw new Error('文件管理页没有 webkitdirectory input（用户报障点名要「上传文件夹」）');
+    }
+    if (!(await page.getByRole('button', { name: '⬆ 上传文件夹', exact: true }).count())) {
+      throw new Error('工具栏缺少「⬆ 上传文件夹」按钮');
+    }
+    // 护栏（血泪教训，见 DEVELOPMENT 坑 168）：上传前**必须**确认当前目录在临时沙箱里。
+    // 这条断言如果不过，说明默认目录又漂到真实系统目录（曾经漂到 /opt/homebrew/etc），
+    // 那一刻继续往下走就是往真实目录里写测试文件。
+    const here = await page.evaluate(async () => {
+      const r = await fetch('api/v1/files', { credentials: 'same-origin' });
+      const j = await r.json();
+      return (j.data && j.data.path) || '';
+    });
+    if (!here.startsWith('/tmp/')) {
+      throw new Error('上传前当前目录不在临时沙箱内（' + here + '）—— 拒绝上传，先查默认目录逻辑');
+    }
+    const uploadHits = [];
+    const watch = (req) => { if (req.url().includes('/files/upload')) uploadHits.push(req.url()); };
+    page.on('request', watch);
+    const name = 'zp-uitest-upload.txt';
+    const tmp = join(tmpdir(), name);
+    try {
+      writeFileSync(tmp, 'zizpanel uitest upload\n');
+      await plain.setInputFiles(tmp);
+      await page.waitForSelector('.modal-mask', { timeout: 10000 });
+      const progressText = (await page.locator('.modal-mask .modal-body').textContent()) || '';
+      if (!/[已正]上传|正在准备|%/.test(progressText)) {
+        throw new Error('上传时没有出现进度提示，弹窗里是：' + progressText);
+      }
+      // ⚠️ waitForFunction 的第 2 个参数是 arg（不是 options），options 必须放第 3 个 ——
+      // 写错会得到一个"假超时"，排查方向全错。
+      await page.waitForFunction(() => {
+        const el = document.querySelector('.modal-mask .modal-body');
+        return el && /已上传 \d+ 个文件/.test(el.textContent);
+      }, null, { timeout: 30000 });
+      await shot('40b-files-upload-progress');
+      await page.getByRole('button', { name: '关闭', exact: true }).click();
+      await page.waitForTimeout(1200);
+      const rows = await page.locator('tbody tr').allTextContents();
+      if (!rows.some((r) => r.includes(name))) throw new Error('上传完成但列表里看不到 ' + name);
+      // 清理：删除后列表不自动刷新，必须点「⟳ 刷新」再断言（否则看到的是过期 DOM）。
+      const abs = await page.evaluate(async (n) => {
+        const r = await fetch('api/v1/files', { credentials: 'same-origin' });
+        const j = await r.json();
+        const e = (j.data.entries || []).find((x) => x.name === n);
+        return e ? e.path : '';
+      }, name);
+      if (abs) {
+        await page.evaluate(async (p) => {
+          const csrf = decodeURIComponent((document.cookie.match(/(?:^|; )zp_csrf=([^;]*)/) || [])[1] || '');
+          await fetch('api/v1/files/delete', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+            body: JSON.stringify({ paths: [p], recursive: false }),
+          });
+        }, abs);
+        await page.getByRole('button', { name: '⟳ 刷新', exact: true }).click();
+        await page.waitForTimeout(1200);
+        const after = await page.locator('tbody tr').allTextContents();
+        if (after.some((r) => r.includes(name))) throw new Error('清理失败：' + name + ' 还在列表里');
+      }
+      if (uploadHits.length !== 1) throw new Error('期望恰好 1 次上传请求，实际 ' + uploadHits.length);
+    } finally {
+      page.off('request', watch);
+      rmSync(tmp, { force: true });
+    }
+  });
+
   await step('进入子目录并返回上级', async () => {
     // 找到第一个目录链接
     const dirLink = page.locator('tbody tr td a').first();
@@ -2947,11 +3095,12 @@ try {
     }
     await shot('52b-nav-system-group');
 
-    // 面板设置里的 4 个 Tab 顺序：访问与安全 → 文件与终端 → 账号与两步验证 → 检查更新
+    // 面板设置里的 5 个 Tab 顺序：访问与安全 → 上传与执行限制 → 文件与终端 →
+    // 账号与两步验证 → 检查更新
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(900);
     const tabTitles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
-    const wantTabs = ['访问与安全', '文件与终端', '账号与两步验证', '检查更新'];
+    const wantTabs = ['访问与安全', '上传与执行限制', '文件与终端', '账号与两步验证', '检查更新'];
     const gotTabs = tabTitles.filter((t) => wantTabs.includes(t));
     if (gotTabs.join('|') !== wantTabs.join('|')) {
       throw new Error(`设置页 Tab 顺序不对：期望 ${wantTabs.join(' → ')}，实际 ${gotTabs.join(' → ')}`);

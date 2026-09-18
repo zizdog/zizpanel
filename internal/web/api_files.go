@@ -2,11 +2,15 @@ package web
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -81,13 +85,21 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	p := r.URL.Query().Get("path")
 	if p == "" {
-		// 默认打开网站根目录（最常用的位置）
-		roots := mgr.Roots()
-		if len(roots) == 0 {
-			fail(w, http.StatusInternalServerError, "没有可访问的目录。请检查配置中的 file_roots")
-			return
+		// 默认打开**网站根目录**（最常用的位置）。
+		//
+		// 不能用 mgr.Roots()[0]：roots 是按字母排序的，而白名单里还包含面板安装的
+		// 应用的配置目录。真机上 /opt/homebrew/etc 排在网站目录前面，用户点开文件
+		// 管理看到的是 Homebrew 的配置目录 —— 他正要传网站文件，很可能就传错地方。
+		// 详见 files.Manager.DefaultDir 的注释。
+		p = mgr.DefaultDir(s.Cfg.WWWRoot)
+		if p == "" {
+			roots := mgr.Roots()
+			if len(roots) == 0 {
+				fail(w, http.StatusInternalServerError, "没有可访问的目录。请检查配置中的 file_roots")
+				return
+			}
+			p = roots[0]
 		}
-		p = roots[0]
 	}
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	res, err := mgr.List(p, showHidden)
@@ -384,16 +396,57 @@ func urlEncode(s string) string {
 	return b.String()
 }
 
+// maxUpload 是**面板自身**允许的单次上传请求体上限（含 multipart 开销）。
+//
+// 为什么是 4GB：
+//   - 用户报障的真实场景是「新建站点 + 传 978MB 的网站包」。旧的 512MB 太小，
+//     而且超限是在**浏览器已经把 512MB 传完**之后才被服务端拒绝的 ——
+//     用户白等了半天，只得到一句失败。
+//   - 2GB 是很多浏览器的单次请求/文件系统的心理门槛，4GB 留出余量，
+//     也覆盖"一个中等站点 + 一堆图片/视频"的常见情形。
+//
+// 为什么不放进设置项（internal/config）：
+//   - nginx 的 client_max_body_size 与 PHP 的 upload_max_filesize/post_max_size
+//     才是"用户自己网站"的 413 来源，那条链路已经另有面板入口
+//     （「设置 → 上传与执行限制」，见 api_upload_limits.go）。两件事别混在一起：
+//     那条链路限制的是**别的程序**（phpMyAdmin、Typecho 后台）收多大的请求，
+//     这里限制的是**面板自己**收多大的请求。
+//   - 面板自身这个上限的目的是"别让用户在浏览器里白传几个 GB 才被拒"，
+//     不是让用户调的业务参数。做成设置项只会制造"调小了传不动、
+//     调大了内存/磁盘被吃满"的坑。
+//
+// 单文件与总大小都受它约束（整个请求体就是一个 multipart）；「上传文件夹」的
+// 总大小同样受限，但可以做**增量**：传失败的那几个在结果里逐个列出，重传即可。
+const maxUpload = int64(4) << 30 // 4 GiB
+
 // handleFileUpload 上传文件（multipart/form-data）。
 //
-// 限制单文件 512MB：再大就应该用别的方式传输（scp/rsync），
-// 走浏览器上传既慢又占内存。
+// 支持两种形态，共用一条路由：
+//   - 普通上传：多个 `files` 字段，落在目标目录里；同名文件**不覆盖**，
+//     自动加 -1/-2 序号（保留旧行为）。
+//   - 「上传文件夹」：额外带一个 `relpaths` 字段（JSON 数组，与 `files` 顺序一一对应），
+//     后端按相对路径在目标目录下重建目录树，并且**允许覆盖**同名文件 ——
+//     传整站时把 index.php 存成 index-1.php 会直接让站点跑不起来。
+//     结果里每个文件都带 overwritten 标记，前端如实显示"已覆盖"。
 func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
-	const maxUpload = 512 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxUpload)
+	// 先解除全局 30 秒读超时对这条路由的限制（否则大文件必然被掐断，
+	// 而浏览器只看到"网络错误"，用户看到的就是"点了没反应"）。
+	if err := allowLongUpload(w, r); err != nil {
+		// 如实记录下来：延长失败时大文件会被 30 秒读超时中断，而这不是用户的错。
+		if s.Log != nil {
+			s.Log.Warn("延长上传读超时失败（超过 30 秒的上传可能被中断）: %v", err)
+		}
+	}
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		fail(w, http.StatusBadRequest, "解析上传内容失败（文件可能超过 512MB）: "+err.Error())
+	// 两道判据都在 readUploadForm 里（先看 ContentLength，再用 MaxBytesReader 边收边算），
+	// 超限一律 413 + 人话：含实际大小、上限、以及两条可执行的建议。
+	if err := readUploadForm(r, maxUpload); err != nil {
+		if errors.Is(err, errUploadTooLarge) {
+			fail(w, http.StatusRequestEntityTooLarge,
+				uploadLimitMessage(r.ContentLength, maxUpload, "请求体过大"))
+			return
+		}
+		fail(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())
 		return
 	}
 	dir := r.FormValue("dir")
@@ -409,42 +462,154 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type uploaded struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
-		Size int64  `json:"size"`
+	// 相对路径（仅「上传文件夹」会带）。顺序与 form.File["files"] 一致：
+	// 前端在同一个循环里先 append 文件、再 append 相对路径，Go 的 multipart
+	// 解析对同一个字段名保序，所以两个切片天然对齐。
+	relPaths, err := parseRelPaths(form.Value["relpaths"])
+	if err != nil {
+		fail(w, http.StatusBadRequest, "上传的相对路径不合法："+err.Error())
+		return
 	}
-	var results []uploaded
+	// 先整批校验：任一条非法（.. / 绝对路径 / 反斜杠 / 盘符）就整单拒绝。
+	// 这是**攻击特征**而不是用户笔误，不该"部分成功"地把可疑请求写进磁盘。
+	treeMode := len(relPaths) > 0
+	if treeMode {
+		for _, p := range relPaths {
+			if _, err := files.CleanRelPath(p); err != nil {
+				s.audit(r, "file_upload", dir, "拒绝可疑相对路径: "+p, false, "")
+				fail(w, http.StatusBadRequest, "拒绝上传：相对路径不合法（"+err.Error()+"）")
+				return
+			}
+		}
+	}
+
+	// 按**顺序**取文件。form.File 是 map，直接 range 会打乱顺序；而「上传文件夹」
+	// 的相对路径是按顺序对齐的 —— 顺序错了就会把 A 目录的 index.php 写进 B 目录。
+	// 前端固定用 `files` 字段，所以先按原序取它；其它字段名（手工调 API 才可能出现）
+	// 按字段名排序后追加，保证同一份请求每次结果一致。
+	parts := append([]*multipart.FileHeader{}, form.File["files"]...)
+	if len(form.File) > 1 {
+		var others []string
+		for name := range form.File {
+			if name != "files" {
+				others = append(others, name)
+			}
+		}
+		sort.Strings(others)
+		for _, name := range others {
+			parts = append(parts, form.File[name]...)
+		}
+	}
+	if treeMode && len(relPaths) != len(parts) {
+		fail(w, http.StatusBadRequest, fmt.Sprintf(
+			"上传的相对路径数量（%d）与文件数量（%d）不一致，拒绝上传（可能的中途截断）",
+			len(relPaths), len(parts)))
+		return
+	}
+
+	var results []uploadedFile
 	var failures []string
 
-	for field, headers := range form.File {
-		for _, fh := range headers {
-			f, err := fh.Open()
-			if err != nil {
-				failures = append(failures, fh.Filename+": "+err.Error())
-				continue
-			}
-			path, n, err := mgr.SaveUpload(dir, fh.Filename, f)
-			_ = f.Close()
-			if err != nil {
-				failures = append(failures, fh.Filename+": "+err.Error())
-				continue
-			}
-			results = append(results, uploaded{Name: filepath.Base(path), Path: path, Size: n})
-			_ = field
+	for idx, fh := range parts {
+		f, err := fh.Open()
+		if err != nil {
+			failures = append(failures, uploadLabel(fh.Filename, relAt(relPaths, treeMode, idx))+": "+err.Error())
+			continue
 		}
+		rel := relAt(relPaths, treeMode, idx)
+		var path string
+		var n int64
+		var overwritten bool
+		if treeMode {
+			path, n, overwritten, err = mgr.SaveUploadAs(dir, rel, f, true)
+		} else {
+			path, n, err = mgr.SaveUpload(dir, fh.Filename, f)
+		}
+		_ = f.Close()
+		if err != nil {
+			failures = append(failures, uploadLabel(fh.Filename, rel)+": "+err.Error())
+			continue
+		}
+		results = append(results, uploadedFile{
+			Name: filepath.Base(path), Path: path, RelPath: rel,
+			Size: n, Overwritten: overwritten,
+		})
 	}
 
 	if len(results) == 0 {
 		fail(w, http.StatusBadRequest, "上传失败："+strings.Join(failures, "；"))
 		return
 	}
-	s.audit(r, "file_upload", dir,
-		fmt.Sprintf("上传 %d 个文件", len(results)), true, "")
+	action := fmt.Sprintf("上传 %d 个文件", len(results))
+	if treeMode {
+		action = fmt.Sprintf("上传文件夹（%d 个文件）", len(results))
+	}
+	s.audit(r, "file_upload", dir, action, true, "")
+	msg := fmt.Sprintf("已上传 %d 个文件", len(results))
+	if n := countOverwritten(results); n > 0 {
+		msg += fmt.Sprintf("（其中 %d 个覆盖了同名文件）", n)
+	}
+	if len(failures) > 0 {
+		msg += fmt.Sprintf("，%d 个失败", len(failures))
+	}
 	ok(w, map[string]any{
-		"uploaded": results, "failed": failures,
-		"msg": fmt.Sprintf("已上传 %d 个文件", len(results)),
+		"uploaded": results, "failed": failures, "msg": msg,
 	})
+}
+
+// uploadedFile 是一个成功落盘的文件。
+type uploadedFile struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	// RelPath 是「上传文件夹」时的相对路径（普通上传为空）
+	RelPath string `json:"rel_path,omitempty"`
+	Size    int64  `json:"size"`
+	// Overwritten 表示这次覆盖了一个已存在的同名文件
+	Overwritten bool `json:"overwritten,omitempty"`
+}
+
+// relAt 取第 idx 个文件的相对路径（非文件夹上传时为 ""）。
+func relAt(relPaths []string, treeMode bool, idx int) string {
+	if !treeMode || idx < 0 || idx >= len(relPaths) {
+		return ""
+	}
+	return relPaths[idx]
+}
+
+// uploadLabel 是结果里给用户看的文件名：有相对路径就用它（更能说明是哪个文件）。
+func uploadLabel(name, rel string) string {
+	if rel != "" {
+		return rel
+	}
+	return name
+}
+
+// parseRelPaths 解析「上传文件夹」带的相对路径字段（JSON 数组）。
+//
+// 空值返回 nil，表示这是普通上传。
+func parseRelPaths(vals []string) ([]string, error) {
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	raw := vals[0]
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("relpaths 不是合法的 JSON 数组: %w", err)
+	}
+	return out, nil
+}
+
+func countOverwritten(list []uploadedFile) int {
+	n := 0
+	for _, it := range list {
+		if it.Overwritten {
+			n++
+		}
+	}
+	return n
 }
 
 type fileSearchReq struct {

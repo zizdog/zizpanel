@@ -168,6 +168,18 @@ type Config struct {
 	MySQLBin   string `json:"mysql_bin"`
 	PmaDir     string `json:"pma_dir"`
 
+	// ---------- 上传与执行限制（面板设置 → 上传与执行限制）----------
+	//
+	// 为什么放在面板配置里：用户报障"phpMyAdmin 导入 413，面板找不到入口"。
+	// nginx 出厂 client_max_body_size 只有 1m、PHP 出厂 upload 2M/post 8M，
+	// 两组上限都必须能在面板里改、且**默认就要能用**。这里存的是值，
+	// 真正的落点由 sites 包负责（vhost 的 server 块 + PHP conf.d 片段）。
+	NginxClientMaxBodySize string `json:"nginx_client_max_body_size"`
+	PHPUploadMaxFilesize   string `json:"php_upload_max_filesize"`
+	PHPPostMaxSize         string `json:"php_post_max_size"`
+	PHPMemoryLimit         string `json:"php_memory_limit"`
+	PHPMaxExecutionTime    int    `json:"php_max_execution_time"`
+
 	// DockerSocket 为空表示 Docker 不可用。
 	DockerSocket string `json:"docker_socket"`
 
@@ -303,6 +315,18 @@ func Default() *Config {
 		PHPVer:                   "8.2",
 		MySQLSvc:                 "mysql@8.4",
 		DockerSocket:             "/var/run/docker.sock",
+		// 上传与执行限制的默认值。**必须与 sites.DefaultLimits() 一致**：
+		// 面板生成的 vhost / PHP 片段在字段为空时会退回 sites 包的默认，
+		// 两处不一致会导致"界面显示的默认值"与实际写入的不是同一个。
+		// 有测试（sites 包的 TestConfigDefaultsMatchSitesDefaults）锁死这一点。
+		//
+		// 为什么默认就要是 512m/512M：nginx 出厂 1m、PHP 出厂 2M/8M，
+		// phpMyAdmin 导入几十 MB 的 SQL 必然 413 —— 用户不该先撞墙才知道要改。
+		NginxClientMaxBodySize: "512m",
+		PHPUploadMaxFilesize:   "512M",
+		PHPPostMaxSize:         "512M",
+		PHPMemoryLimit:         "512M",
+		PHPMaxExecutionTime:    300,
 	}
 	c.applyBrewPrefix(brew)
 	c.TLSCert = filepath.Join(c.DataDir, "tls", "panel.crt")
@@ -599,6 +623,26 @@ func (c *Config) fill() {
 	}
 	if c.TLSKey == "" {
 		c.TLSKey = filepath.Join(c.DataDir, "tls", "panel.key")
+	}
+	// 上传与执行限制：老配置没有这些字段 → 补默认值。
+	//
+	// 注意这里**不能**在用户显式清空时重新填回去：这个设置块的保存接口
+	// 会用 ParseSize 校验（空值直接被拒），所以字段要么合法、要么缺失，
+	// 不存在"用户故意留空"的语义（与 UpgradeSource 那种可清空的字段不同）。
+	if c.NginxClientMaxBodySize == "" {
+		c.NginxClientMaxBodySize = d.NginxClientMaxBodySize
+	}
+	if c.PHPUploadMaxFilesize == "" {
+		c.PHPUploadMaxFilesize = d.PHPUploadMaxFilesize
+	}
+	if c.PHPPostMaxSize == "" {
+		c.PHPPostMaxSize = d.PHPPostMaxSize
+	}
+	if c.PHPMemoryLimit == "" {
+		c.PHPMemoryLimit = d.PHPMemoryLimit
+	}
+	if c.PHPMaxExecutionTime <= 0 {
+		c.PHPMaxExecutionTime = d.PHPMaxExecutionTime
 	}
 }
 

@@ -40,29 +40,36 @@ import (
 // handleDefaultSiteApply 整理默认站点：建占位页 + 重写 000-default.conf。
 //
 // 秒级动作（写两个文件 + nginx -t + reload），按项目约定同步返回。
+//
+// 与启动时的自动创建共用 createDefaultSite：**同一套实现**，包括"没有 nginx
+// 就不要假装能建"这条判断（没有 nginx 时返回 409 + 人话，界面据此给「只安装 Nginx」）。
 func (s *Server) handleDefaultSiteApply(w http.ResponseWriter, r *http.Request) {
-	index, _, err := sites.EnsureLocalhostPlaceholder(s.Cfg.WWWRoot)
-	if err != nil {
+	if present, why := s.nginxPresent(); !present {
+		fail(w, http.StatusConflict, "还不能创建默认站点："+why+
+			"。默认站点要由 nginx 监听 80 端口才有意义 —— 可以先只装 Nginx"+
+			"（不需要 PHP 与 MySQL），装好后这里的「创建默认站点」就能用了。")
+		return
+	}
+	if err := s.createDefaultSite(r.Context()); err != nil {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dir := filepath.Dir(index)
-	// 归属交给面板运行用户，别留下 root 属主的站点目录
-	if s.Cfg.User != "" && os.Geteuid() == 0 {
-		if err := chownTreeTo(dir, s.Cfg.User); err != nil {
-			s.Log.Warn("调整 %s 归属失败（站点可能仍是 root 属主）：%v", dir, err)
-		}
-	}
+	st := s.readDefaultSiteState()
+	st.Attempted, st.Applied, st.NginxPresent = true, true, true
+	st.IndexPath = filepath.Join(s.Cfg.WWWRoot, "localhost", "index.html")
+	st.VhostPath = filepath.Join(s.Cfg.VhostDir, "000-default.conf")
+	st.URL = "http://" + s.lanIP() + "/"
+	st.Error = ""
+	st.At = time.Now().Format(time.RFC3339)
+	s.writeDefaultSiteState(st)
 
-	if err := s.applyDefaultVhost(r.Context()); err != nil {
-		fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	s.audit(r, "default_site_apply", "nginx", "整理默认站点（去 /_panel、phpMyAdmin 限本机）", true, "")
 	ok(w, map[string]any{
-		"dir":     dir,
-		"index":   index,
-		"message": "默认站点已指向 " + dir + "；面板入口已从 80 端口移除；phpMyAdmin 仅允许本机（须登录面板访问）",
+		"dir":   filepath.Dir(st.IndexPath),
+		"index": st.IndexPath,
+		"url":   st.URL,
+		"message": "默认站点已指向 " + filepath.Dir(st.IndexPath) + "；面板入口已从 80 端口移除；" +
+			"phpMyAdmin 仅允许本机（须登录面板访问）",
 	})
 }
 
@@ -166,6 +173,7 @@ func (s *Server) buildDefaultVhost() string {
 	// phpMyAdmin 入口共用同一份，见 sites.PreferredFastCGIPass / FastCGIParamsBlock）。
 	pass, phpVersion := sites.PreferredFastCGIPass(s.Cfg.BrewPrefix)
 	phpParams := sites.FastCGIParamsBlock()
+	lim := s.uploadLimits()
 
 	var b strings.Builder
 	writePHPLocationBody := func(indent string) {
@@ -197,6 +205,9 @@ func (s *Server) buildDefaultVhost() string {
 	b.WriteString("    index  index.php index.html;\n\n")
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", filepath.Join(wwwRoot, "_logs"))
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", filepath.Join(wwwRoot, "_logs"))
+	// 请求体上限：nginx 出厂只有 1m，用户导入几十 MB 的 SQL 会先撞 413
+	// （请求根本到不了 PHP）。默认 512m，可在「面板设置 → 上传与执行限制」里改。
+	b.WriteString("    client_max_body_size " + lim.ClientMaxBodySize + ";\n\n")
 
 	// 应用界面代理：**用与应用市场那个按钮完全相同的生成函数**（含 BEGIN/END 标记）。
 	//
@@ -229,9 +240,10 @@ func (s *Server) buildDefaultVhost() string {
 	// 落到目录索引上 → **403 directory index is forbidden**（真机踩过）。
 	// 生成器用的是这台机器上一直跑通的"无尾斜杠 location + alias + try_files 回落"。
 	b.WriteString(services.PMAEntryBlock(services.PMAEntryOptions{
-		Share:       phpmyadmin,
-		FastCGIPass: pass,
-		PHPVersion:  phpVersion,
+		Share:             phpmyadmin,
+		FastCGIPass:       pass,
+		PHPVersion:        phpVersion,
+		ClientMaxBodySize: lim.ClientMaxBodySize,
 	}))
 	_ = defaultDir
 	b.WriteString("}\n")

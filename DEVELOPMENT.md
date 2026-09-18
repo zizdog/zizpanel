@@ -417,3 +417,25 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
     - 修法：① 新增 `Manager.ensureColimaOwnership()`，在**每一次** `runColima`（status/start/stop/restart 的唯一入口）之前把 `<家目录>/.colima` 整棵树 chown 回真实用户（幂等，只在本进程第一次调用时 Walk；非 root 身份直接跳过）——这同时是**对旧版本留下的事故现场的修复路径**；② 新增 `Manager.writeColimaConfig()`，所有写 colima.yaml 的地方（colima_mount.go ×2、docker_mirror_nas.go ×2、docker_mirror.go ×1）都改走它，写完立刻 chown，**不允许再出现裸的 `os.WriteFile(<用户家目录>…)`**；③ 修好归属后真机验证：`colima start` 成功创建虚拟机、`docker version` 拿到引擎 29.5.2、面板 `/api/v1/docker/info` 报 `state=running`。
     - 教训：**判据是"写完之后立刻 chown 回真实用户"**，不是"下次启动时再说"；用户看到"安装失败 + 已安装"的组合，其实是两个独立缺陷叠在一起（权限 + 安装态判据）。
 
+
+164. **默认值不能用 + 面板里没有入口 = 用户只能改文件：phpMyAdmin 导入报 413**（2026-09-20 用户报障）→ 现场：导入几十 MB 的 SQL 得到 **413 Request Entity Too Large**。根因是 **nginx**：`client_max_body_size` 出厂 **1m**，请求体在 nginx 层就被拒，**根本到不了 PHP**，所以先 413 而不是 PHP 的报错；即使放进来，PHP 出厂 `upload_max_filesize=2M` / `post_max_size=8M` 也会再挡一次。而面板生成的 vhost 过去完全没写这条指令、界面上也没有任何入口 —— 用户只能手工改 brew 的配置文件（违反"能在面板里做完"）。
+    - 修法：① 面板生成的**所有** vhost（普通站点、默认站点 000-default、phpMyAdmin 的 `location ^~ /phpmyadmin`）都带 `client_max_body_size`，默认 **512m**，值来自面板配置（`Cfg.NginxClientMaxBodySize`）；② PHP 侧由面板写自己的 `<brew>/etc/php/<版本>/conf.d/99-zizpanel-limits.ini`（`upload/post/memory=512M`、`max_execution_time=300`）——**不动 brew 的 php.ini**（升级会覆盖、用户手改会丢），删掉片段重启即恢复出厂；③ 「面板设置 → 上传与执行限制」的保存走**任务中心**：写 vhost + conf.d → reload nginx → 重启对应 php-fpm → **回读生效值**；④ 保存前校验（`512m`/`1g` 格式、`post_max_size ≥ upload_max_filesize`、nginx 上限 ≥ upload、执行时间 1~86400），非法当场 400 + 人话。
+    - 两个必须记住的点：**（a）location 里也要写一遍** —— phpMyAdmin 入口可能被插进"用户自己的默认站点"（面板只插一段、不整份重写），只靠 server 级会漏，用户的 413 就出在这条路径上；**（b）CLI 不能复核 `max_execution_time`** —— PHP CLI SAPI 会把它强制成 0（实测 `php -r` → 0，`php-cgi -f` → 300），所以回读优先用同目录的 `php-cgi`，没有它时如实标"这一项未复核"，**不许据此报失败**。
+    - 门禁：`internal/sites/limits_test.go` 里 `TestGeneratedVhostAcceptsLargeBodyRealNginx` 会在临时 nginx 上真发 2MB 请求体 —— 512m 组**不许 413**、1m 对照组**必须 413**（只断言"配置里有这行字"是不够的：指令写错位置照样 413）。教训：**默认值就要能用，且每一项设置都必须能在面板里改**；"保存成功"不等于"已生效"，回读不到就如实说未复核。
+
+165. **昂贵的依赖探测被放在市场列表的渲染路径上：36 条应用 × 一次真实 `brew uses` = 冷启动 15 秒**（2026-09-21 用户报障，原话"应用又开始卡了：正在读取应用目录…不是早就开发了缓存功能吗！！？？"）→ 现场：`GET /api/v1/market` **冷 14.998s / 热 0.25s**。用户以为是缓存坏了，其实缓存一直在工作 —— 真根因是列表为**每一条**应用调 `PlanUninstallForBrew`，而那里面（`brewUninstallPlan`）有一次真实的 `brew uses --installed <formula>`；brew 启动本身约 0.4s，36 条串起来正好十几秒。列表**不需要**这个结论：它只用计划渲染"能不能卸"的入口。
+    - 修法：把计划拆成两层 —— `PlanUninstallForBrewFast`（`checkDeps=false`，一次 brew 都不跑；列表用它，`brew` 版本仍由列表已经批量查好的 `brewVers` 传入）与 `PlanUninstallForBrew`（完整路径：核心查依赖 + `ApplyDependents` + `brewDependencyBlockForInstaller`，卸载动作与 409 防御都用它）。依赖判定改为**用户点「卸载」时按需查**：新增 `GET /api/v1/market/{id}/uninstall-plan`，前端在点击时先取完整计划（按钮上显示"检查依赖…"），拿不到就按"未检查"继续并如实说明 —— 绝不因为省时间就把"没查过"说成"没有依赖"。修复后实测冷启动 **0.33s**。
+    - 这条的**类别**教训：**任何"真实探测"（brew / docker / 网络）都不许出现在列表或首屏渲染路径上**。列表只算便宜的部分，"贵且危险"的判定推迟到用户真的要做那件事的那一刻（带可见的进行中提示），代价是点下去多等半秒 —— 而不是整个页面卡十几秒。
+    - 门禁：① 后端 `TestMarketListNeverProbesBrewDependencies` 用**计数探测**断言列表一次依赖探测都不做、点「卸载」时必须真的探测（计数是确定性的，计时在负载下会假绿/假红）；② 前端 `TestMarketPlanConsumersUseOnDemandEndpoint` 遍历**全部** JS，禁止"从 `api.market()` 列表里读 `blocked`/`force_allowed`/`dependents`"这种静默失效形态（后端不再往列表里塞这些字段，读它不会报错，只会悄悄少一个「强制卸载」按钮），并断言按需接口在三处（路由 / api.js / 两个消费方）都接着。
+
+166. **`appendAll(FormData, …)` 抛在提示之前 = 用户看到"点了没反应"**（2026-09-20 文件上传报障的直接原因）→ 上传入口第一句就把 DOM 助手 `appendAll` 用在 `FormData` 上 → `parent.appendChild is not a function`，抛在 `toast()` **之前**、async 事件处理器里没人 catch → 未捕获的 rejection 什么也不显示。于是**任何大小**的文件点「上传」都是彻底无声失败（用户以为是 978MB 的问题）。
+    - 规矩：**提示通道必须先建立，再去做可能抛异常的事**（先立进度窗/占位提示，再拼 FormData），入口整体 try/catch，且 `appendAll` 之类的 DOM 助手要显式拒绝非 DOM 目标（`TestAppendAllRejectsFormDataLoudly`）。同类：`files.js` 上传改走 `XMLHttpRequest` 才有 `upload.onprogress`（`fetch` 没有上传进度）。
+
+167. **`http.Server.ReadTimeout` 覆盖**整个**请求体，会掐断一切慢上传**（同一报障的主因）→ `cmd/zizpanel/http.go` 的 `ReadTimeout: 30s` 是"连接建立到读完 body"的绝对截止；978MB 要 30 秒内传完需 ~32MB/s，否则浏览器只看到网络错误。测试用 `httptest` + `ReadTimeout=150ms` + 慢 body 稳定复现（去掉修复即 FAIL，反证成立）。
+    - 修法：大 body 路由（文件上传、升级包、音色样本）统一走 `allowLongUpload(w)` —— `http.NewResponseController(w).SetReadDeadline(time.Now().Add(2h))` **推后**而不是清零（保留总时长上限），并在读 body **之前**先看 `ContentLength` 直接 413。门禁：`TestEveryMultipartRouteClearsReadDeadline` **遍历全包源码**找 multipart 处理函数（以后新增上传路由漏了就红）。
+
+168. **文件管理的默认目录曾是 `/opt/homebrew/etc`**（同一条用户路径上顺手抓到的真 bug）→ `handleFileList` 用 `mgr.Roots()[0]` 当默认目录，而 roots **按字母排序**且白名单里含"应用配置目录"，真机默认落到 Homebrew 配置目录；代码注释却一直写着"默认打开网站根目录"（**注释在说谎**）。
+    - 修法：`Manager.DefaultDir(preferred)` —— 优先 `WWWRoot`，不在白名单才退 `roots[0]`，有测试锁死。教训：默认值要贴着**用户意图**，不能贴着内部数据结构的排序。
+
+169. **磁盘满时 `make dev` / `make check` 会谎报构建完成**（2026-09-20 排查中被误导一轮）→ `go build` 因 `no space left on device` 失败，而 make 那一步用 `;` 继续 → 后面跑的是**旧二进制**，表现为莫名 409 / 行为与代码不符（本次是"已注入发布公钥"却仍 409）。
+    - 规矩：构建步骤必须检查退出码（不许 `;` 串接掩盖）；发布链路里"公钥/版本号已注入"必须**运行产物核对**（`-X` 在 `-trimpath` 下会静默失效，坑 152）。排查"代码明明改了却不生效"时，**先确认跑的是不是新二进制**（比对 mtime/sha256）。

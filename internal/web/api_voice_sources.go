@@ -43,8 +43,23 @@ func (s *Server) handleVoiceSources(w http.ResponseWriter, r *http.Request) {
 // 走同步请求而不是任务中心：接收端把上传限制在 20MB、转码几十毫秒到一两秒，
 // 属于"秒级动作"。真正可能慢的是下载，而那是浏览器在做。
 func (s *Server) handleVoiceSourceUpload(w http.ResponseWriter, r *http.Request) {
+	// 与文件管理/升级包上传同类：全局 ReadTimeout=30s 会掐断慢速上传，
+	// 这里一并解除（20MB 在慢速链路上超过 30 秒并不罕见）。
+	if err := allowLongUpload(w, r); err != nil && s.Log != nil {
+		s.Log.Warn("延长音色上传读超时失败（超过 30 秒的上传可能被中断）: %v", err)
+	}
 	// 多留 1MB 给表单本身的开销
+	if r.ContentLength > maxVoiceUpload+(1<<20) {
+		fail(w, http.StatusRequestEntityTooLarge,
+			uploadLimitMessage(r.ContentLength, maxVoiceUpload, "音频文件过大（参考音频不需要这么大）"))
+		return
+	}
 	if err := r.ParseMultipartForm(maxVoiceUpload + (1 << 20)); err != nil {
+		if isBodyTooLarge(err) {
+			fail(w, http.StatusRequestEntityTooLarge,
+				uploadLimitMessage(r.ContentLength, maxVoiceUpload, "音频文件过大（参考音频不需要这么大）"))
+			return
+		}
 		fail(w, http.StatusBadRequest, "表单解析失败（文件可能超过 20MB）："+err.Error())
 		return
 	}

@@ -63,7 +63,41 @@ export function clear(el) { while (el.firstChild) el.removeChild(el.firstChild);
 // 这个坑真实发生过：服务管理页与应用市场页的工具栏都显示了一个 null。
 //
 // 用法：需要追加"可能为 null 的节点"时，用 appendAll 而不是原生 append。
+//
+// ⚠️ 它是 **DOM** 助手，不是万能 append。历史上有人拿它往 FormData 里塞字段：
+//
+//	appendAll(fd, 'dir', cwd)   // fd 是 FormData
+//
+// DOM 的 append() 可以只传一个参数，而 FormData.append() 至少要两个
+// （name、value）—— 形状根本不同。旧实现在这里 `parent.appendChild(...)`，
+// 于是抛 `parent.appendChild is not a function`；第一版"修好它"的实现改成
+// `parent.append(it)`，又抛 `Failed to execute 'append' on 'FormData':
+// 2 arguments required`。两次都抛在**任何 toast 之前**，而 async 事件处理器里
+// 的 rejection 不会显示任何东西 —— 用户看到的就是 2026-09-20 那次报障：
+// 「点上传没反应、没成功也没提示」。
+//
+// 所以这里的规矩是：**不认识的目标要大声报错**，并且上传路径由调用方
+// 用 try/catch 把这个错误变成用户看得见的提示（见 files.js::uploadEntries）。
+// 上传请直接用 `fd.append(name, value)` / `fd.append(name, blob, filename)`。
 export function appendAll(parent, ...items) {
+  if (parent && typeof parent.appendChild !== 'function') {
+    if (typeof FormData !== 'undefined' && parent instanceof FormData) {
+      throw new TypeError(
+        'appendAll 用于 DOM，不能追加到 FormData（FormData.append 需要 name/value 两个参数）。' +
+        '请改用 fd.append(name, value) 或 fd.append(name, blob, filename)。',
+      );
+    }
+    // 其它"单参数 append"的容器（URLSearchParams 之类）可以照常追加
+    if (typeof parent.append === 'function') {
+      for (const it of items) {
+        if (it === null || it === undefined || it === false || it === true) continue;
+        if (Array.isArray(it)) { appendAll(parent, ...it); continue; }
+        parent.append(it);
+      }
+      return parent;
+    }
+    throw new TypeError('appendAll 的目标既不是 DOM 节点，也没有 append() 方法');
+  }
   for (const it of items) {
     if (it === null || it === undefined || it === false || it === true) continue;
     if (Array.isArray(it)) { appendAll(parent, ...it); continue; }

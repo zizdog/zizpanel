@@ -171,6 +171,9 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	content, err := site.Generate(sites.Options{
 		LogDir:      s.siteLogDir(),
 		FastCGIPass: pass,
+		// 请求体上限来自面板配置（默认 512m）：nginx 出厂 1m 会让
+		// phpMyAdmin 导入几十 MB 的 SQL 直接 413（用户报障原文）。
+		ClientMaxBodySize: s.uploadLimits().ClientMaxBodySize,
 	})
 	if err != nil {
 		return err
@@ -506,8 +509,12 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 		"www_root":     s.Cfg.WWWRoot,
 		"log_dir":      s.siteLogDir(),
 		"vhost_dir":    vhostDir,
+		"brew_prefix":  s.Cfg.BrewPrefix,
 		"presets":      sites.RewritePresets,
 		"php_versions": s.detectPHPVersions(r.Context()),
+		// 手工编辑配置文件的入口清单（宝塔式的基本操作，见 api_config_files.go）。
+		// 路径由后端给：brew 前缀在 Apple Silicon / Intel 不同，前端不拼字符串。
+		"config_files": s.panelConfigFiles(r.Context()),
 	})
 }
 
@@ -802,6 +809,7 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	generated, genErr := site.Generate(sites.Options{
 		LogDir: s.siteLogDir(), FastCGIPass: pass,
+		ClientMaxBodySize: s.uploadLimits().ClientMaxBodySize,
 	})
 	ok(w, map[string]any{
 		"site":         site,
@@ -1699,6 +1707,12 @@ func (s *Server) Startup(ctx context.Context) {
 	// 这里只登记，不做立即续期 —— 真正决定签发的门槛是 NeedsRenewal，
 	// 启动路径上不该引入额外的网络等待。
 	s.startCertRenewal(ctx)
+
+	// 安装后自动建一个**纯静态**默认站点（用户 2026-09-21 要求"装完就有"）。
+	// 幂等：成功过就只做一次现场复核；没有 nginx 就如实记"等待 nginx"，不报错刷屏。
+	// 放在 reconcileForwarders 之后：默认站点 vhost 里写着应用代理的 location，
+	// 那些回环端口要先对齐好，否则写出来的 proxy_pass 会指向旧端口。
+	s.ensureDefaultSiteOnStart(ctx)
 
 	// 空闲终端会话回收：
 	// WebSocket 断开时会关闭会话，但网络异常（客户端崩溃、断网）

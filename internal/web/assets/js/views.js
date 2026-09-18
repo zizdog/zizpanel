@@ -421,6 +421,9 @@ export function SettingsView(content, ctx = {}) {
   // 以及旧 hash（#/update、#/about、#/settings/about）的别名，见 app.js 的别名表。
   const tabs = [
     { id: 'access', title: '访问与安全' },
+    // 上传与执行限制紧跟访问设置：用户报障的 413（phpMyAdmin 导入失败）就是
+    // 在这里改的 —— 放太深等于"又找不到入口"。
+    { id: 'limits', title: '上传与执行限制' },
     { id: 'terminal', title: '文件与终端' },
     { id: 'account', title: '账号与两步验证' },
     { id: 'update', title: '检查更新' },
@@ -449,6 +452,7 @@ export function SettingsView(content, ctx = {}) {
   async function renderBody() {
     clear(body);
     if (active === 'access') await renderAccess();
+    else if (active === 'limits') await renderLimits();
     else if (active === 'terminal') await renderTerminal();
     else if (active === 'update') await renderUpdate();
     else await renderAccount();
@@ -461,6 +465,187 @@ export function SettingsView(content, ctx = {}) {
     const box = h('div', { dataset: { testid: 'zp-settings-update' } });
     body.append(box);
     UpdateView(box, ctx);
+  }
+
+  // ---------- 上传与执行限制（用户报障 413 的入口）----------
+  //
+  // 背景：phpMyAdmin 导入几十 MB 的 SQL 报 **413 Request Entity Too Large**。
+  // nginx 出厂 client_max_body_size 只有 1m、PHP 出厂 upload 2M/post 8M，
+  // 而面板此前**没有任何界面**能改这两组上限（用户原话："面板找不到更改的入口"）。
+  //
+  // 交互约定（与任务中心的规矩一致）：
+  //   保存 → POST 校验（非法输入当场 400 + 人话）→ 202 + task_id →
+  //   任务里写 vhost / conf.d → reload nginx → 重启 php-fpm → **回读生效值**。
+  //   这里把回读结果渲染成"生效值"卡片，绝不只显示"已保存"。
+  async function renderLimits() {
+    let v;
+    try { v = await api.getUploadLimits(); }
+    catch (e) {
+      body.append(h('div.card', [h('div.card-body', { text: '读取上传/执行限制失败: ' + e.message })]));
+      return;
+    }
+    const lim = v.limits || {};
+    const def = v.defaults || {};
+
+    const sizeField = (key, label, hint) => {
+      const input = h('input.input', {
+        value: lim[key] ?? '', placeholder: def[key] || '',
+        style: { maxWidth: '220px' },
+      });
+      return {
+        input,
+        field: h('div.field', [h('label', { text: label }), input, h('div.hint', { text: hint })]),
+      };
+    };
+    const nginxField = sizeField('client_max_body_size', 'nginx 请求体上限（client_max_body_size）',
+      '例：512m / 1g。这是 nginx 的硬上限：请求超过它会被直接返回 413，PHP 根本收不到数据 —— '
+      + 'phpMyAdmin 导入大 SQL 报 413 就是这里太小。');
+    const uploadField = sizeField('upload_max_filesize', 'PHP upload_max_filesize',
+      '单个上传文件的上限（例：512M）。');
+    const postField = sizeField('post_max_size', 'PHP post_max_size',
+      '整个请求体的上限（例：512M）。不能小于 upload_max_filesize，否则上传一定失败。');
+    const memField = sizeField('memory_limit', 'PHP memory_limit',
+      'PHP 进程内存上限（例：512M）。导入大 SQL 时解析要占用内存。');
+    const execInput = h('input.input', {
+      type: 'number', value: lim.max_execution_time ?? 300, min: 1, max: 86400,
+      style: { maxWidth: '220px' },
+    });
+    const execField = h('div.field', [
+      h('label', { text: 'PHP max_execution_time（秒）' }),
+      execInput,
+      h('div.hint', { text: '导入大 SQL 会跑很久；出厂的 30 秒会让大文件导入中途失败。改这个值会同时对齐 phpMyAdmin 的 $cfg[\'ExecTimeLimit\']。' }),
+    ]);
+
+    // mismatch 横幅：磁盘上的生效值还不是配置值时，明确告诉用户"还没生效"。
+    const banner = h('div');
+    function renderBanner() {
+      clear(banner);
+      if (!v.mismatch) return;
+      banner.append(h('div', {
+        style: {
+          margin: '0 0 14px', padding: '10px 12px', background: 'var(--warn-soft)',
+          borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.8',
+        },
+      }, [
+        h('div', { text: '⚠️ 有配置项还没有生效（见下面的「当前生效值」）。' }),
+        h('div', { text: '点「保存并应用」会把目标值写进面板生成的 vhost 与 PHP conf.d，重载 nginx 并重启对应的 php-fpm。' }),
+      ]));
+    }
+    renderBanner();
+
+    const save = h('button.btn.btn-primary', {
+      text: '保存并应用',
+      onclick: async () => {
+        save.disabled = true;
+        try {
+          const patch = {
+            client_max_body_size: nginxField.input.value.trim(),
+            upload_max_filesize: uploadField.input.value.trim(),
+            post_max_size: postField.input.value.trim(),
+            memory_limit: memField.input.value.trim(),
+            max_execution_time: Number(execInput.value),
+          };
+          // 后端会先校验（非法 400 + 人话）；通过则 202 + task_id，进度在任务中心。
+          const id = await taskCenter.start({
+            kind: 'settings',
+            target: 'upload-limits',
+            title: '应用上传与执行限制',
+            start: () => api.saveUploadLimits(patch),
+            // 任务结束后重新回读：生效值卡片必须跟着变（不能停在旧值）。
+            onDone: () => { toast('上传与执行限制已应用，正在回读生效值…', 'ok', 6000); renderLimits(); },
+          });
+          if (id) toast('已提交，进度与生效值回读在任务中心里', 'ok', 8000);
+        } catch (e) {
+          toast(e.message, 'err', 12000);
+        } finally {
+          save.disabled = false;
+        }
+      },
+    });
+    const reread = h('button.btn.btn-sm', { text: '↻ 重新回读', onclick: renderLimits });
+
+    // ---- 生效值：nginx 侧 ----
+    const nginxRows = (v.nginx || []).map((f) => h('tr', [
+      h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' }, text: f.file }),
+      h('td.mono', { text: f.value || '（未设置 → nginx 默认 1m）' }),
+      h('td', [f.ok
+        ? h('span.pill.ok', { text: '已生效' })
+        : h('span.pill.warn', { text: '未生效' })]),
+    ]));
+
+    // ---- 生效值：PHP 侧（每个版本真的跑一次 php-cgi 回读 ini）----
+    const phpRows = (v.php || []).map((p) => {
+      const vals = p.values || {};
+      const valueText = p.error
+        ? '未复核：' + p.error
+        : `upload ${vals.upload_max_filesize} · post ${vals.post_max_size} · memory ${vals.memory_limit} · max_execution_time ${vals.max_execution_time}s`;
+      return h('tr', [
+        h('td', { text: 'PHP ' + p.version }),
+        h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' }, text: p.fragment || '-' }),
+        h('td.mono', { style: { fontSize: '12px', wordBreak: 'break-all' } }, [
+          h('div', { text: valueText }),
+          // 回读用的 SAPI 与"查不到"的说明都如实显示（CLI 会把
+          // max_execution_time 强制成 0，那时标"未复核"而不是报失败）。
+          p.sapi ? h('div.hint', { text: '（' + p.sapi + ' 回读）' }) : null,
+          p.note ? h('div.hint', { style: { color: '#d97706' }, text: p.note }) : null,
+        ]),
+        h('td', [p.error
+          ? h('span.pill.warn', { text: '未复核' })
+          : (p.ok ? h('span.pill.ok', { text: '已生效' }) : h('span.pill.warn', { text: '未生效' }))]),
+      ]);
+    });
+
+    body.append(
+      h('div.card', [
+        h('div.card-head', [
+          h('h3', { text: '上传与执行限制' }),
+          h('div.spacer'),
+          h('span.sub', { text: '改完会自动重载 nginx 并重启 php-fpm（走任务中心）' }),
+        ]),
+        h('div.card-body', [
+          banner,
+          h('div.hint', {
+            style: { marginBottom: '12px' },
+            html: '这里控制"一次能传多大"：nginx 的请求体上限与 PHP 的上传/执行上限必须<b>同时</b>放大，'
+              + '否则请求要么被 nginx 用 413 挡在门外，要么进来后被 PHP 拒绝。'
+              + '默认值 <code class="code">' + (def.client_max_body_size || '512m')
+              + '</code> / <code class="code">' + (def.upload_max_filesize || '512M')
+              + '</code> 就是按"能导入大 SQL"选的。',
+          }),
+          h('div.row', [nginxField.field, uploadField.field]),
+          h('div.row', [postField.field, memField.field, execField]),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '4px' } }, [
+            save, reread,
+            h('span.hint', { text: '保存会写：面板生成的各站点 vhost、默认站点、phpMyAdmin 入口，以及 PHP conf.d 的 99-zizpanel-limits.ini' }),
+          ]),
+        ]),
+      ]),
+      h('div.card', [
+        h('div.card-head', [
+          h('h3', { text: '当前生效值（回读）' }),
+          h('div.spacer'),
+          h('span.sub', { text: v.mismatch ? '有未生效项' : '全部已生效' }),
+        ]),
+        h('div.card-body.tight', [
+          h('div', { style: { padding: '0 0 8px', fontSize: '12.5px' } }, [
+            h('div', { text: 'nginx（' + (v.nginx_dir || '') + '）：' }),
+          ]),
+          nginxRows.length
+            ? h('table.table', [
+              h('thead', [h('tr', [h('th', { text: '配置文件' }), h('th', { text: 'client_max_body_size' }), h('th', { text: '状态' })])]),
+              h('tbody', nginxRows),
+            ])
+            : h('div.empty', [h('p', { text: 'vhost 目录里还没有 .conf（先建站点或点「整理默认站点」）' })]),
+          h('div', { style: { padding: '12px 0 8px', fontSize: '12.5px' }, text: 'PHP（每个已安装版本真的跑一次 php 回读 ini_get；CLI 与 php-fpm 读同一份 conf.d）：' }),
+          phpRows.length
+            ? h('table.table', [
+              h('thead', [h('tr', [h('th', { text: '版本' }), h('th', { text: '面板片段' }), h('th', { text: '回读值' }), h('th', { text: '状态' })])]),
+              h('tbody', phpRows),
+            ])
+            : h('div.empty', [h('p', { text: '本机没有发现已安装的 PHP 版本（先装 PHP 或用一键 LNMP）' })]),
+        ]),
+      ]),
+    );
   }
 
   // ---------- 访问与安全 ----------

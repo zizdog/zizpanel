@@ -215,6 +215,12 @@ func ConfigFilePath(app App, userHome, workDir string) string {
 		}
 		return filepath.Join(workDir, "compose", app.ID, app.ConfigPath)
 	}
+	// {brew} 占位符：Homebrew 前缀在 Apple Silicon 是 /opt/homebrew、Intel 是 /usr/local。
+	// 配置文件路径由 formula 决定，写死前缀在另一种架构上就是错的（点开编辑器报
+	// "文件不存在"，用户以为面板坏了）。前缀从环境推导，推导不到就退回 /opt/homebrew。
+	if strings.HasPrefix(app.ConfigPath, "{brew}/") {
+		return filepath.Join(brewPrefixDefault(), strings.TrimPrefix(app.ConfigPath, "{brew}/"))
+	}
 	// 绝对路径（含 ~/ 展开）：brew 类应用的配置文件位置由 formula 决定，
 	// 不在家目录下的安装目录里。
 	if filepath.IsAbs(app.ConfigPath) {
@@ -230,6 +236,22 @@ func ConfigFilePath(app App, userHome, workDir string) string {
 		return filepath.Join(userHome, spec.RootDir, app.ConfigPath)
 	}
 	return ""
+}
+
+// brewPrefixDefault 返回本机 Homebrew 前缀（推不出来时退回 Apple Silicon 的默认值）。
+//
+// 顺序：环境变量 → 磁盘上真实存在的那个。**不看架构猜**：Intel 机器上装的是
+// /usr/local，写死 /opt/homebrew 会让"编辑配置文件"点开就是"文件不存在"。
+func brewPrefixDefault() string {
+	if p := strings.TrimSpace(os.Getenv("HOMEBREW_PREFIX")); p != "" {
+		return p
+	}
+	for _, p := range []string{"/opt/homebrew", "/usr/local"} {
+		if fi, err := os.Stat(filepath.Join(p, "bin", "brew")); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return "/opt/homebrew"
 }
 
 // AppUI 描述一个应用的网页界面，以及"把它挂到子路径下"需要知道的事。
@@ -580,8 +602,11 @@ func Catalog() []App {
 			Category:    "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.nginx",
 			Port: 80, HealthPath: "/",
 			BrewFormula: "nginx",
-			LogPath:     "~/Library/Logs/homebrew.mxcl.nginx.log",
-			DocsURL:     "https://nginx.org",
+			// 手动改 nginx 的入口（用户 2026-09-18："面板也要有手动改 php 和 nginx 的入口"）：
+			// 管理面板里的「📝 编辑配置文件」直接打开这一份。
+			ConfigPath: "{brew}/etc/nginx/nginx.conf",
+			LogPath:    "~/Library/Logs/homebrew.mxcl.nginx.log",
+			DocsURL:    "https://nginx.org",
 		},
 		// 面板会把它配置成监听自己专属的端点（默认 Unix socket
 		// /opt/homebrew/var/run/php-fpm-8.2.sock），不会与其它版本抢 9000 端口；
@@ -595,6 +620,8 @@ func Catalog() []App {
 			Port:        0,
 			HealthPath:  "",
 			BrewFormula: "php@8.2",
+			// 手动改 PHP 的入口：该版本的 php.ini（php-fpm 的 www.conf 在「文件管理」里也能改）。
+			ConfigPath: "{brew}/etc/php/8.2/php.ini",
 			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
 			SystemDaemon: true,
 			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.2.log",
@@ -612,6 +639,7 @@ func Catalog() []App {
 			Port:        0,
 			HealthPath:  "",
 			BrewFormula: "php@8.4",
+			ConfigPath:  "{brew}/etc/php/8.4/php.ini",
 			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
 			SystemDaemon: true,
 			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.4.log",
@@ -625,6 +653,7 @@ func Catalog() []App {
 			Category:    "lnmp", Kind: KindNative, ServiceLabel: "sh.brew.mysql@8.4",
 			Port: 3306, HealthPath: "",
 			BrewFormula: "mysql@8.4",
+			ConfigPath:  "{brew}/etc/my.cnf",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.mysql@8.4.log",
 			DocsURL:     "https://dev.mysql.com",
 		},

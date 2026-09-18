@@ -57,6 +57,20 @@ func (m *Manager) pmaPaths() pmaPaths {
 	}
 }
 
+// PhpMyAdminConfPath 返回 phpMyAdmin 真实配置文件的路径（**唯一**推导处）。
+//
+// 导出它是给 web 层的「上传与执行限制」用：改了 max_execution_time 之后，
+// phpMyAdmin 的 $cfg['ExecTimeLimit'] 也要跟着改，否则导入大 SQL 仍然是
+// PHP 超时（症状和 413 不同：那是 504/中断）。
+func PhpMyAdminConfPath(brewPrefix string) string {
+	return filepath.Join(brewPrefix, "etc", "phpmyadmin.config.inc.php")
+}
+
+// limits 返回面板配置的上传/执行限制（空值补默认 512m/512M）。
+func (m *Manager) limits() sites.Limits {
+	return m.opt.UploadLimits.Normalize()
+}
+
 // InstallPhpMyAdmin 安装并接好 phpMyAdmin。
 func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) error {
 	var err error
@@ -116,7 +130,7 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 	if err := os.MkdirAll(filepath.Dir(p.ConfReal), 0o755); err != nil {
 		return err
 	}
-	conf := pmaConfig(secret, p.Temp, noPass)
+	conf := pmaConfig(secret, p.Temp, noPass, m.limits().MaxExecutionTime)
 	tmp := p.ConfReal + ".tmp"
 	if err := os.WriteFile(tmp, []byte(conf), 0o600); err != nil {
 		return fmt.Errorf("写入 phpMyAdmin 配置失败: %w", err)
@@ -203,10 +217,13 @@ func (m *Manager) InstallPhpMyAdmin(ctx context.Context, result *InstallResult) 
 // 用 cookie 登录（而不是把账号密码写进配置的 config 模式）：
 // 后者意味着**任何能访问到这个 URL 的人**都直接拥有数据库权限。
 // 多输一次密码换掉这个风险，是值得的。
-func pmaConfig(secret, tmpDir string, allowNoPassword bool) string {
+func pmaConfig(secret, tmpDir string, allowNoPassword bool, execTimeLimit int) string {
 	allow := "false"
 	if allowNoPassword {
 		allow = "true"
+	}
+	if execTimeLimit <= 0 {
+		execTimeLimit = sites.DefaultPHPMaxExecutionTime
 	}
 	return fmt.Sprintf(`<?php
 /* ZIZPANEL-MANAGED phpMyAdmin 配置（由面板生成，手工改动可能被覆盖） */
@@ -226,7 +243,78 @@ $cfg['ThemeManager']                   = true;
 $cfg['ThemeDefault']                   = 'pmahomme';
 $cfg['DefaultLang']                    = 'zh_CN';
 $cfg['ServerDefault']                  = 1;
-`, allow, secret, tmpDir)
+/* 与面板「上传与执行限制」里的 max_execution_time 一致：导入大 SQL 会跑很久，
+   用 phpMyAdmin 自己的默认值（300 秒/或 PHP 的 max_execution_time）会把大文件
+   的导入中途掐断。0 = 不限制，这里刻意不写 0（不限制等于请求永远不会超时释放）。 */
+$cfg['ExecTimeLimit']                  = %d;
+`, allow, secret, tmpDir, execTimeLimit)
+}
+
+// pmaExecTimeLimitRe 定位配置里的 ExecTimeLimit 那一行（保留缩进与等号两侧空白）。
+var pmaExecTimeLimitRe = regexp.MustCompile(
+	`(?m)^([ \t]*\$cfg\['ExecTimeLimit'\][ \t]*=[ \t]*)([0-9]+)([ \t]*;)`)
+
+// SyncPhpMyAdminExecTimeLimit 幂等地把 phpMyAdmin 的 ExecTimeLimit 改成 want 秒。
+//
+// 为什么需要它：这一行原来只由安装流程写一次。用户后来在面板里把
+// max_execution_time 调大（例如为了导入几百 MB 的 SQL），phpMyAdmin 仍然用
+// 安装当时的值，于是"面板说改好了、导入还是超时"。
+//
+// 语义：
+//   - 配置不存在（没装 phpMyAdmin）→ (false, nil)，不报错；
+//   - 已有该行且值一致       → (false, nil)，一个字都不写；
+//   - 已有该行但值不同       → 原地改写并返回 true；
+//   - 没有该行（旧配置）     → 追加到文件末尾（PHP 配置文件，追加合法）。
+//
+// user 非空时把文件归属交还真实用户：phpMyAdmin 由 php-fpm 以该用户执行，
+// root 属主会让它读不到（表现为 "configuration file is not readable"）。
+func SyncPhpMyAdminExecTimeLimit(confPath string, want int, user string) (bool, error) {
+	if want <= 0 {
+		want = sites.DefaultPHPMaxExecutionTime
+	}
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // 没装 phpMyAdmin
+		}
+		return false, fmt.Errorf("读取 phpMyAdmin 配置失败: %w", err)
+	}
+	text := string(data)
+	next := ""
+	if m := pmaExecTimeLimitRe.FindStringSubmatch(text); m != nil {
+		cur, _ := strconv.Atoi(m[2])
+		if cur == want {
+			return false, nil
+		}
+		next = pmaExecTimeLimitRe.ReplaceAllString(text, "${1}"+strconv.Itoa(want)+"${3}")
+	} else {
+		line := "$cfg['ExecTimeLimit']                  = " + strconv.Itoa(want) + ";\n"
+		if !strings.HasSuffix(text, "\n") {
+			text += "\n"
+		}
+		next = text + line
+	}
+	tmp := confPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(next), 0o600); err != nil {
+		return false, fmt.Errorf("写入 phpMyAdmin 配置失败: %w", err)
+	}
+	if user != "" {
+		if err := chownTree(user, tmp); err != nil {
+			_ = os.Remove(tmp)
+			return false, fmt.Errorf("设置 phpMyAdmin 配置归属失败: %w", err)
+		}
+	}
+	if err := os.Rename(tmp, confPath); err != nil {
+		return false, fmt.Errorf("替换 phpMyAdmin 配置失败: %w", err)
+	}
+	after, err := os.ReadFile(confPath)
+	if err != nil {
+		return false, fmt.Errorf("复核 phpMyAdmin 配置失败: %w", err)
+	}
+	if m := pmaExecTimeLimitRe.FindStringSubmatch(string(after)); m == nil || m[2] != strconv.Itoa(want) {
+		return false, fmt.Errorf("phpMyAdmin 配置写入后复核失败：ExecTimeLimit 应为 %d（%s）", want, confPath)
+	}
+	return true, nil
 }
 
 // mysqlRootPasswordState 是"root 目前有没有口令"的**真实连接**结论。
@@ -724,6 +812,7 @@ func (m *Manager) defaultFastCGIPass() (pass, version string) {
 func (m *Manager) pmaDefaultVhostContent(wwwRoot, siteRoot, fastcgiPass, phpVersion string) string {
 	logDir := filepath.Join(wwwRoot, "_logs")
 	params := strings.TrimSpace(sites.FastCGIParamsBlock())
+	lim := m.limits()
 
 	var b strings.Builder
 	b.WriteString(DefaultVhostMarker + "\n")
@@ -738,6 +827,8 @@ func (m *Manager) pmaDefaultVhostContent(wwwRoot, siteRoot, fastcgiPass, phpVers
 	b.WriteString("    index  index.php index.html;\n\n")
 	fmt.Fprintf(&b, "    access_log  %s/localhost.access.log;\n", logDir)
 	fmt.Fprintf(&b, "    error_log   %s/localhost.error.log warn;\n\n", logDir)
+	// 请求体上限：默认 512m（nginx 出厂 1m 会让几十 MB 的 SQL 导入直接 413）。
+	b.WriteString("    client_max_body_size " + lim.ClientMaxBodySize + ";\n\n")
 	b.WriteString("    location / {\n        try_files $uri $uri/ =404;\n    }\n\n")
 	b.WriteString("    # PHP：" + phpVersion + " 的专属 FastCGI 端点（多版本共存，不占 9000）\n")
 	b.WriteString("    location ~ \\.php$ {\n")
@@ -750,9 +841,10 @@ func (m *Manager) pmaDefaultVhostContent(wwwRoot, siteRoot, fastcgiPass, phpVers
 	// "插入已有默认站点"共用同一个生成器（PMAEntryBlock），这样安全指令
 	// （allow/deny/301）与卸载标记不可能再漂移（D10/D14）。
 	b.WriteString(PMAEntryBlock(PMAEntryOptions{
-		Share:       m.pmaPaths().Share,
-		FastCGIPass: fastcgiPass,
-		PHPVersion:  phpVersion,
+		Share:             m.pmaPaths().Share,
+		FastCGIPass:       fastcgiPass,
+		PHPVersion:        phpVersion,
+		ClientMaxBodySize: lim.ClientMaxBodySize,
 	}))
 	b.WriteString("}\n")
 	return b.String()
@@ -784,6 +876,13 @@ type PMAEntryOptions struct {
 	FastCGIPass string // 该机器当前 PHP 版本的专属 FastCGI 端点；空 = 没有可用端点
 	PHPVersion  string // 只用于注释，方便排查
 	Indent      string // 每行前缀；空则用 "    "
+	// ClientMaxBodySize 写进这个 location 的 `client_max_body_size`（如 "512m"）。
+	//
+	// 为什么 location 里还要写一遍（server 级已经有了）：phpMyAdmin 的入口可能
+	// 被插进**用户自己的默认站点**（那种站点面板不整份重写、server 级没有我们的
+	// 上限），只靠 server 级会漏；这是用户报障 413 的直接路径。
+	// 空 = 用 sites.DefaultClientMaxBodySize。
+	ClientMaxBodySize string
 }
 
 // PMAEntryBlock 是 phpMyAdmin nginx 入口的唯一生成器（三处调用点共用）。
@@ -813,6 +912,18 @@ func PMAEntryBlock(opt PMAEntryOptions) string {
 	w("    allow 127.0.0.1;")
 	w("    allow ::1;")
 	w("    deny all;")
+	// 请求体上限必须**直接写在 phpMyAdmin 的 location 里**：默认站点若是
+	// 用户自己的（面板只插这一段、不整份重写），server 级没有面板的
+	// client_max_body_size，导入大 SQL 就会重新变成 413（用户报障原文）。
+	bodyLimit := opt.ClientMaxBodySize
+	if strings.TrimSpace(bodyLimit) == "" {
+		bodyLimit = sites.DefaultClientMaxBodySize
+	}
+	if err := sites.ValidateSizeValue("client_max_body_size", bodyLimit); err != nil {
+		// 生成器不接受非法值：宁可退化成默认，也不写出会让 nginx 拒绝加载的配置。
+		bodyLimit = sites.DefaultClientMaxBodySize
+	}
+	w("    client_max_body_size " + bodyLimit + ";")
 	w("    alias " + opt.Share + ";")
 	w("    index index.php;")
 	w("    try_files $uri $uri/ /phpmyadmin/index.php$is_args$args;")

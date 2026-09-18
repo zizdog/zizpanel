@@ -101,6 +101,9 @@ func (s *Server) svcManager() *services.Manager {
 		// 仅走 NAS（离线）模式：打开后各安装器禁止回落外网
 		// （见 internal/services/mirror.go 的 MirrorOfflineOnly）。
 		OfflineOnly: s.Cfg.OfflineOnly,
+		// 上传与执行限制：安装路径会用它写默认站点 vhost（client_max_body_size）
+		// 与 PHP conf.d 片段。空值由 sites.Limits.Normalize() 补默认 512m/512M。
+		UploadLimits: s.uploadLimits(),
 		// MySQL root 凭据闭环：读面板当前持有的凭据、把新口令写回 config.json。
 		//
 		// 为什么从这里注入而不是让 services 自己读配置：凭据只有一份来源
@@ -940,7 +943,10 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 2026-09-21 用户要求的不变量：installed=true ⇒ uninstall.kind != "none"，
 		// 反过来 kind=none ⇒ 界面不得显示已安装。这里以**计划**为准降级（绝不显示
 		// 一个"已安装却没有任何卸载入口"的卡片），并把矛盾如实写进 Note。
-		plan := s.svcManager().PlanUninstallForBrew(ctx, a, rec, brewState)
+		// ⚠️ 这里**必须**用 Fast（不跑 brew）版本：列表曾对每条应用查一次
+		// `brew uses --installed`，36 条串成 15 秒冷启动（用户看到的"正在读取应用目录…"）。
+		// 依赖检查由 GET /api/v1/market/{id}/uninstall-plan 在用户点「卸载」时按需做。
+		plan := s.svcManager().PlanUninstallForBrewFast(a, rec, brewState)
 		if isInstalled && plan.Kind == "none" {
 			isInstalled = false
 		}
@@ -1113,6 +1119,31 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 		}
 		fail(w, http.StatusBadRequest, msg)
 	}
+}
+
+// handleMarketUninstallPlan 在用户**真的要点「卸载」**时按需算出完整卸载计划
+// （含依赖检测：谁在用它、能不能强制卸载）。
+//
+// 为什么单独一个接口：依赖检测里的 `brew uses --installed` 是一次真实 brew 调用
+// （每个 formula 约 0.4s）。市场列表要是每条都查，36 条就是 15 秒冷启动 ——
+// 用户看到的就是"正在读取应用目录…"卡住。列表用 PlanUninstallForBrewFast
+// （不查依赖），真正的判定推迟到这里：宁可点「卸载」后多等半秒并看到
+// "正在检查依赖…"，也不要整个市场列表卡十几秒。
+//
+// 返回的形状里只有计划本身：installed 由列表给出，这里再算一遍只会多一个
+// 可能不一致的真值来源（前端以列表的卡片状态为准）。
+func (s *Server) handleMarketUninstallPlan(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found {
+		app = services.App{ID: id, Name: id}
+	}
+	plan := s.svcManager().PlanUninstall(r.Context(), id)
+	ok(w, map[string]any{
+		"id":        app.ID,
+		"name":      app.Name,
+		"uninstall": plan,
+	})
 }
 
 // handleMarketPreflight 安装前检查。

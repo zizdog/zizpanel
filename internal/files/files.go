@@ -572,6 +572,28 @@ func (m *Manager) Chmod(p string, mode os.FileMode) error {
 	return os.Chmod(real, mode)
 }
 
+// DefaultDir 返回"没有指定路径时应该打开哪个目录"。
+//
+// 为什么不直接用 Roots()[0]：roots 在 NewManager 里是**按字母排序**的，
+// 而文件管理器还会把"面板安装的应用的配置文件所在目录"加进白名单。
+// 真机上实测：`/opt/homebrew/etc` 排在网站根目录前面 —— 于是用户点开
+// 「文件管理」看到的是 Homebrew 的配置目录。他正要"把网站文件传上去"，
+// 一不小心就把整站传进了 Homebrew 的配置目录（2026-09-20 复现，
+// 这也正是 handleFileList 那句注释「默认打开网站根目录」本来想做的事）。
+//
+// 优先返回 preferred（网站根目录）；它不在白名单里（没建/不存在）时才退回第一个根。
+func (m *Manager) DefaultDir(preferred string) string {
+	if preferred != "" {
+		if real, err := m.Resolve(preferred, false); err == nil {
+			return real
+		}
+	}
+	if len(m.roots) == 0 {
+		return ""
+	}
+	return m.roots[0]
+}
+
 // ---------- 上传 / 下载 ----------
 
 // SaveUpload 保存上传的文件到指定目录。
@@ -609,6 +631,157 @@ func (m *Manager) SaveUpload(dir, filename string, r io.Reader) (string, int64, 
 	}
 	m.chownRealUser(final)
 	return final, n, nil
+}
+
+// SaveUploadAs 按**相对路径**保存上传的文件，用于「上传文件夹」时重建目录树。
+//
+// 与 SaveUpload 的区别（都是刻意的）：
+//   - 相对路径的每一段都会被 CleanRelPath 校验（拒绝 ..、绝对路径、反斜杠、
+//     盘符前缀），再把整条路径交给 Resolve 做软链接解析 + 白名单前缀检查；
+//   - overwrite 为 true 时覆盖同名文件（浏览器上传整个站点时，把 index.php
+//     存成 index-1.php 会直接让站点跑不起来）；为 false 时沿用 SaveUpload 的
+//     "加序号不覆盖" 行为。
+//
+// 返回值里的 overwritten 表示这次确实覆盖了一个已存在的文件，前端要如实告诉
+// 用户（"传上去了"和"把原来的覆盖了"是两件事）。
+func (m *Manager) SaveUploadAs(dir, relPath string, r io.Reader, overwrite bool) (path string, n int64, overwritten bool, err error) {
+	realDir, err := m.Resolve(dir, false)
+	if err != nil {
+		return "", 0, false, err
+	}
+	rel, err := CleanRelPath(relPath)
+	if err != nil {
+		return "", 0, false, err
+	}
+	dst := filepath.Join(realDir, filepath.FromSlash(rel))
+
+	// 关键一步：目标（多半）还不存在，必须让 Resolve 去解析**已存在的祖先**
+	// 里的软链接。否则 <根>/link -> /etc 这种目录能借相对路径穿越出去 ——
+	// 纯字符串前缀检查看不出来（见本包开头的安全模型）。
+	final, err := m.Resolve(dst, true)
+	if err != nil {
+		return "", 0, false, err
+	}
+	// 双保险：Resolve 已经做过前缀检查，这里再确认一次结果落在目标目录之内，
+	// 免得将来有人改动 Resolve 时悄悄放宽。
+	if final == realDir || !strings.HasPrefix(final, realDir+string(os.PathSeparator)) {
+		return "", 0, false, fmt.Errorf("%w: %s", ErrForbidden, relPath)
+	}
+	if err := m.mkdirAllOwned(realDir, filepath.Dir(final)); err != nil {
+		return "", 0, false, err
+	}
+
+	if overwrite {
+		if _, statErr := os.Lstat(final); statErr == nil {
+			overwritten = true
+		}
+	} else {
+		final = uniquePath(final)
+	}
+	// MkdirAll 之后父目录真实存在了，再解析一次：这次连**文件本身**是软链接的
+	// 情况也一起挡下（覆盖一个指向外部的软链接 = 往外部写）。
+	final, err = m.Resolve(final, true)
+	if err != nil {
+		return "", 0, false, err
+	}
+	if final == realDir || !strings.HasPrefix(final, realDir+string(os.PathSeparator)) {
+		return "", 0, false, fmt.Errorf("%w: %s", ErrForbidden, relPath)
+	}
+
+	f, err := os.OpenFile(final, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("创建文件失败: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	n, err = io.Copy(f, r)
+	if err != nil {
+		_ = os.Remove(final)
+		return "", 0, false, fmt.Errorf("写入失败: %w", err)
+	}
+	m.chownRealUser(final)
+	return final, n, overwritten, nil
+}
+
+// mkdirAllOwned 在 base 之下逐段创建 dir，并把**新建的**目录归属给真实用户。
+//
+// 为什么不用 os.MkdirAll：面板以 root 运行，MkdirAll 建出来的目录归 root，
+// 而网站进程（nginx / php-fpm 以真实用户跑）要能在里面写缓存/上传 —— 归属必须
+// 在创建的那一刻就交还，不能"下次再说"（见 AGENTS.md 第三节：坑 156/163）。
+// 逐段做还有个好处：只在真正新建的那一层 chown，重复上传同一棵目录树不会
+// 对每个文件都重跑一遍 chown。
+func (m *Manager) mkdirAllOwned(base, dir string) error {
+	rel, err := filepath.Rel(base, dir)
+	if err != nil {
+		return fmt.Errorf("创建目录失败: %w", err)
+	}
+	if rel == "." {
+		return nil // base 本身由调用方保证存在
+	}
+	cur := base
+	for _, seg := range strings.Split(rel, string(os.PathSeparator)) {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("创建目录失败: 非法的相对目录 %q", rel)
+		}
+		cur = filepath.Join(cur, seg)
+		if st, statErr := os.Stat(cur); statErr == nil {
+			if !st.IsDir() {
+				return fmt.Errorf("创建目录失败: %s 已被同名文件占用", cur)
+			}
+			continue
+		}
+		if err := os.Mkdir(cur, 0o755); err != nil {
+			return fmt.Errorf("创建目录失败: %w", err)
+		}
+		m.chownRealUser(cur)
+	}
+	return nil
+}
+
+// ErrBadRelPath 表示上传时携带的相对路径不合法（疑似路径穿越）。
+var ErrBadRelPath = errors.New("非法的相对路径")
+
+// CleanRelPath 校验并净化上传时携带的相对路径（如 webkitRelativePath）。
+//
+// 「上传文件夹」要按客户端给的相对路径重建目录树，这条路径是**用户可控输入**，
+// 因此这里的每一条拒绝规则都对应一种穿越手法：
+//
+// 空路径 / 含 NUL：截断类攻击，以及无意义的输入。
+// 以斜杠开头：绝对路径，直接无视目标目录。
+// 含反斜杠：Windows 分隔符。macOS 上反斜杠是合法文件名字符，但后端不该按平台
+// 差异给出两种语义（同一份请求在 Windows 浏览器上会变成 ..\..\ 穿越），一律拒绝。
+// 形如 "C:" 的盘符前缀：同上。
+// 任何一段是空 / 点 / 点点：空段与相对段。点点段就是最典型的穿越，而且
+// filepath.Join 会**静默吃掉**它，不在这里挡住就没人挡了。
+//
+// 返回用 "/" 分隔的净化路径（至少一段）。
+func CleanRelPath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("%w: 路径为空", ErrBadRelPath)
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("%w: 含 NUL 字符", ErrBadRelPath)
+	}
+	if strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("%w: 不允许绝对路径 %q", ErrBadRelPath, p)
+	}
+	if strings.Contains(p, "\\") {
+		return "", fmt.Errorf("%w: 不允许反斜杠分隔符 %q", ErrBadRelPath, p)
+	}
+	if len(p) >= 2 && p[1] == ':' {
+		return "", fmt.Errorf("%w: 不允许盘符前缀 %q", ErrBadRelPath, p)
+	}
+	segs := strings.Split(p, "/")
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		switch s {
+		case "":
+			return "", fmt.Errorf("%w: 含空的路径段 %q", ErrBadRelPath, p)
+		case ".", "..":
+			return "", fmt.Errorf("%w: 含相对路径段 %q（疑似目录穿越）", ErrBadRelPath, p)
+		}
+		out = append(out, s)
+	}
+	return strings.Join(out, "/"), nil
 }
 
 // uniquePath 在同名文件存在时追加 -1 / -2 后缀。

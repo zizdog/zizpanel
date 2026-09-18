@@ -226,6 +226,20 @@ type Options struct {
 	// 或 127.0.0.1:9000。由调用方按站点所选的 PHP 版本解析后传入
 	// （见 ResolveEndpoint：每个版本一个唯一端点，解析不到会报错）。
 	FastCGIPass string
+	// ClientMaxBodySize 是写进 server 块的 `client_max_body_size`（如 "512m"）。
+	//
+	// 空 = 用 DefaultClientMaxBodySize（512m）。**默认值必须能用**：
+	// 用户报障的 phpMyAdmin 导入 413，根因就是 nginx 出厂默认只有 1m，
+	// 而面板生成的 vhost 过去没有任何地方设它（用户也找不到入口改）。
+	ClientMaxBodySize string
+}
+
+// clientMaxBodySize 返回要写进 vhost 的请求体上限（空则用默认值）。
+func clientMaxBodySize(v string) string {
+	if s := strings.TrimSpace(v); s != "" {
+		return s
+	}
+	return DefaultClientMaxBodySize
 }
 
 // Generate 生成一个站点的 nginx server 配置。
@@ -249,6 +263,12 @@ func (s *Site) Generate(opt Options) (string, error) {
 	preset, ok := RewritePresetByName(s.Rewrite)
 	if !ok {
 		return "", fmt.Errorf("%w: 未知的伪静态模板 %q", ErrInvalid, s.Rewrite)
+	}
+	// 请求体上限来自面板配置（默认 512m）。这里再校验一次：它会被直接写进
+	// nginx 配置，非法值等于配置注入面（与 ValidateProxyPass 同一个理由）。
+	bodyLimit := clientMaxBodySize(opt.ClientMaxBodySize)
+	if err := ValidateSizeValue("client_max_body_size", bodyLimit); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	logDir := opt.LogDir
 	if logDir == "" {
@@ -292,7 +312,10 @@ func (s *Site) Generate(opt Options) (string, error) {
 	fmt.Fprintf(&b, "\taccess_log  %s/%s.access.log;\n", logDir, s.Domain)
 	fmt.Fprintf(&b, "\terror_log   %s/%s.error.log warn;\n\n", logDir, s.Domain)
 	b.WriteString("\tcharset utf-8;\n")
-	b.WriteString("\tclient_max_body_size 64m;\n")
+	// 请求体上限写在 server 级：它对本站所有 location（含反代、PHP、phpMyAdmin）
+	// 一并生效。nginx 默认只有 1m —— 用户导入几十 MB 的 SQL 时请求根本进不来，
+	// 得到的是 413 而不是 PHP 的错误（这就是那次报障的根因）。
+	b.WriteString("\tclient_max_body_size " + bodyLimit + ";\n")
 
 	if s.SSLEnabled {
 		if s.SSLCert == "" || s.SSLKey == "" {
@@ -339,7 +362,8 @@ func (s *Site) Generate(opt Options) (string, error) {
 		b.WriteString("\t\tproxy_cache_bypass $http_upgrade;\n")
 		b.WriteString("\t\tproxy_read_timeout 300s;\n")
 		b.WriteString("\t\tproxy_send_timeout 300s;\n")
-		b.WriteString("\t\tclient_max_body_size 512m;\n")
+		// 请求体上限已经在 server 级设过（同一份配置值），这里不再重复写死，
+		// 否则会覆盖用户在面板里设的值（location 级优先于 server 级）。
 		b.WriteString("\t}\n")
 	} else {
 		b.WriteString("\n\t# ---- 伪静态规则（模板：" + preset.Name + "）----\n")

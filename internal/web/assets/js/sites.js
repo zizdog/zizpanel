@@ -19,8 +19,20 @@ import { taskCenter } from './tasks.js';
 // 证书库与站点是两套生命周期，把它做成一个"自包含 + 自己异步填充"的组件，
 // sites.js 只负责挂上去，避免两个页面对证书数据各写一份渲染逻辑。
 import { acmeSslSection } from './certs.js';
+// 手动编辑底层配置文件（nginx.conf / php.ini / my.cnf）的入口不复用第二套编辑器：
+// 「⚙️ 配置文件」弹窗里的每一条都调 services.js 的 configFileModal ——
+// 它读写走既有的文件接口（GET/POST /api/v1/files/read|write，含白名单与越界校验），
+// 保存/重启的语义也只有那一份实现。
+import { configFileModal } from './services.js';
 
 let cache = null; // 站点列表数据（含预设与 PHP 版本）
+
+// defSite 是「默认站点」的真实状态（GET /api/v1/system/default-site）。
+//
+// 用户要求"面板安装完成后要建立一个默认静态站点"：面板启动时会自动建一次，
+// 这个状态就是"到底建成了没有"的唯一显示来源 —— null = 还没读到（既不说成
+// 建好了，也不说成失败）。
+let defSite = null;
 
 // 站点详情面板当前所在的 Tab
 let detailTab = 'basic';
@@ -615,6 +627,10 @@ export function SitesView(content, ctx = {}) {
   async function load() {
     clear(listBox);
     listBox.append(h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取站点…' })]));
+    // 默认站点状态与站点列表并行拉（只读文件探测，没有 brew / 网络开销）。
+    // 失败不阻断列表：状态退回 null，药丸显示"未知"，绝不假装"已创建"。
+    void api.defaultSite().then((v) => { defSite = v || null; renderStatus(); })
+      .catch(() => { defSite = null; renderStatus(); });
     try {
       cache = await api.sites();
     } catch (e) {
@@ -668,6 +684,157 @@ export function SitesView(content, ctx = {}) {
     });
   }
 
+  // defSitePill 是工具条上「默认站点」的状态药丸（只读）。
+  // 判据全部来自后端 defaultSiteStatusNow()：已创建 / 还没建 / 缺 nginx / 读不到。
+  // **没有证据时既不说"已创建"也不说"失败"**。
+  function defSitePill() {
+    if (defSite === null) {
+      return h('span.pill', { text: '默认站点未知', title: '还没读到默认站点状态（或读取失败）' });
+    }
+    if (defSite.applied) {
+      return h('span.pill.ok', {
+        text: '默认站点已就绪',
+        title: 'http://' + (defSite.url || '').replace(/^https?:\/\//, '') +
+          ' 由面板的默认站点接住（root ' + (defSite.index_path || '') + '）',
+      });
+    }
+    if (defSite.nginx_present === false) {
+      return h('span.pill.warn', {
+        text: '默认站点待创建（缺 nginx）',
+        title: defSite.needs_action || '这台机器还没有 nginx',
+      });
+    }
+    if (defSite.foreign_vhost) {
+      return h('span.pill.warn', {
+        text: '默认站点（非面板生成）',
+        title: defSite.needs_action || '80 端口上已有一份不是面板生成的配置；面板不会自动覆盖它',
+      });
+    }
+    return h('span.pill.warn', {
+      text: '默认站点未创建',
+      title: defSite.needs_action || '点「🏠 默认站点」创建',
+    });
+  }
+
+  // defaultSiteModal 是「默认站点」弹窗：说清状态、给一条能走通的路。
+  //
+  // 用户 2026-09-21 的要求是"装完就该有一个默认静态站点"。所以这里的按钮
+  // 顺序刻意按"缺什么先补什么"排：没有 nginx → 先「只安装 Nginx」（不拉 PHP/MySQL）；
+  // 有 nginx 但没建 → 「创建默认站点」；已建 → 显示地址与「重建」。
+  function defaultSiteModal() {
+    const body = h('div');
+    const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
+    const m = modal({ title: '🏠 默认站点', body, footer: [foot], wide: false });
+
+    function draw(st) {
+      clear(body);
+      clear(foot);
+      if (!st) {
+        body.append(h('div.hint', { text: '正在读取默认站点状态…' }));
+        return;
+      }
+      const ip = (st.url || '').replace(/^https?:\/\//, '');
+      body.append(h('div', { style: { lineHeight: '1.8' } }, [
+        h('div', { style: { marginBottom: '6px' },
+          text: st.applied ? '✅ 默认站点已就绪' : '⚠️ 默认站点还没建好' }),
+        h('div', { style: { fontSize: '12.5px', color: 'var(--text-dim)' },
+          text: '默认站点是 80 端口上接住"没匹配到具体域名"的请求的兜底站点，' +
+            'root 指向 ' + (st.index_path ? st.index_path.replace(/\/index\.html$/, '') : '（未创建）') +
+            '。它**只依赖 nginx**：没有 PHP / MySQL 也是一份可用的静态站点。' }),
+        st.applied ? h('ul', { style: { margin: '10px 0 0 18px', lineHeight: '1.8' } }, [
+          h('li', { text: '访问地址：http://' + ip + '/' }),
+          h('li', { text: 'vhost：' + (st.vhost_path || '') + (st.vhost_marked ? '（面板生成）' : '（不是面板生成的，重建会覆盖）') }),
+        ]) : null,
+        st.nginx_present === false
+          ? h('div', { style: { marginTop: '10px', padding: '9px 11px', border: '1px solid var(--warn)',
+            background: 'var(--warn-soft)', borderRadius: '6px', lineHeight: '1.7' },
+          }, [
+            h('div', { style: { fontWeight: '620' }, text: '这台机器还没有 Nginx' }),
+            h('div', { style: { marginTop: '4px', fontSize: '12.5px' },
+              text: '默认站点要靠 nginx 监听 80 端口，所以先装它。面板可以**只装 Nginx**（不装 PHP 与 MySQL），' +
+                '装好后面板会自动把默认站点建起来，你也可以回来点「创建默认站点」。' }),
+          ])
+          : null,
+        st.foreign_vhost ? h('div', { style: { marginTop: '10px', padding: '9px 11px', border: '1px solid var(--warn)',
+          background: 'var(--warn-soft)', borderRadius: '6px', lineHeight: '1.7' } }, [
+          h('div', { style: { fontWeight: '620' }, text: '80 端口上已有一份不是面板生成的配置' }),
+          h('div', { style: { marginTop: '4px', fontSize: '12.5px' },
+            text: '面板不会自动覆盖它（那可能是你自己写的站点）。要换成面板的默认站点，' +
+              '点下面那颗按钮 —— 原文件会先备份成 ' + ((st.vhost_path || '000-default.conf') + '.zizpanel.bak') + '。' }),
+        ]) : null,
+        st.error ? h('div.hint', { style: { marginTop: '8px', color: 'var(--danger)' },
+          text: '上一次的结果：' + st.error }) : null,
+        h('div', { style: { marginTop: '10px', fontSize: '12px', color: 'var(--text-dim)' },
+          text: '重建会按模板重写 ' + (st.vhost_path || '000-default.conf') +
+            '（面板自己的那份配置）：手工加在这份文件里的内容会丢；别的站点文件不受影响。' }),
+      ]));
+
+      if (st.nginx_present === false) {
+        foot.append(h('button.btn.btn-primary', {
+          text: '只安装 Nginx（不装 PHP/MySQL）',
+          onclick: async () => {
+            try {
+              await taskCenter.start({
+                kind: 'install', target: 'nginx', title: '安装 Nginx',
+                start: () => api.marketInstall('nginx'),
+                onDone: async (task) => {
+                  if (task && task.status && task.status !== 'succeeded') {
+                    toast('安装 Nginx 失败：' + (task.error || task.status), 'err', 12000);
+                    return;
+                  }
+                  toast('Nginx 已安装，正在创建默认站点…', 'ok', 8000);
+                  // 装完立刻接着建默认站点：用户点这一颗按钮的意图就是"给我一个能访问的站点"，
+                  // 不该再让他回来点第二次。失败时如实报错（不静默）。
+                  try {
+                    const r = await api.defaultSiteApply();
+                    toast((r && r.message) || '默认站点已创建', 'ok', 9000);
+                  } catch (e) {
+                    toast('Nginx 装好了，但默认站点创建失败：' + ((e && e.message) || e), 'err', 14000);
+                  }
+                  await refreshDefaultSite();
+                  load();
+                },
+              });
+            } catch (e) { toast('安装 Nginx 失败：' + ((e && e.message) || e), 'err', 12000); }
+          },
+        }));
+      } else {
+        // foreign_vhost：80 端口上已经有一份**不是面板生成的**配置（用户自己写的）。
+        // 面板不会自动覆盖它，只有用户在这一屏明确点下去才覆盖 —— 而且**会先备份**。
+        const foreign = !!st.foreign_vhost;
+        foot.append(h('button.btn' + (st.applied ? '' : '.btn-primary'), {
+          text: st.applied ? '重建默认站点' : (foreign ? '覆盖为面板默认站点' : '创建默认站点'),
+          onclick: async () => {
+            if (foreign && !await confirmBox(
+              (st.vhost_path || '000-default.conf') + ' 不是面板生成的（可能是你自己写的 80 端口站点）。\n\n'
+              + '继续会用面板的默认站点覆盖它，原文件会先备份成 .zizpanel.bak（不会丢）。\n\n继续？',
+              { title: '覆盖为面板默认站点', okText: '覆盖（先备份）' })) return;
+            try {
+              const r = await api.defaultSiteApply();
+              toast((r && r.message) || '默认站点已创建', 'ok', 9000);
+              await refreshDefaultSite();
+              load();
+            } catch (e) { toast('创建默认站点失败：' + ((e && e.message) || e), 'err', 14000); }
+          },
+        }));
+      }
+      if (st.applied) {
+        foot.append(h('button.btn', {
+          text: '打开看看', onclick: () => window.open('http://' + ip + '/', '_blank', 'noopener'),
+        }));
+      }
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+    }
+
+    async function refreshDefaultSite() {
+      try { defSite = await api.defaultSite(); } catch (e) { defSite = null; }
+      draw(defSite);
+      renderStatus();
+    }
+    draw(defSite);
+    void refreshDefaultSite();
+  }
+
   // moreMenu 是工具条上的二级菜单（弹窗 + 竖排 .btn-block，沿用文件管理的既有写法）。
   // 「校验 nginx」与「重建全部配置」都是低频动作，收进这里，行为与原来完全一致。
   function moreMenu() {
@@ -711,6 +878,104 @@ export function SitesView(content, ctx = {}) {
     });
   }
 
+  // ---------- ⚙️ 配置文件（手动改 nginx / php.ini / my.cnf 的入口）----------
+  //
+  // 用户 2026-09-20："面板也要有手动改 php 和 nginx 的入口啊！这是基本操作。"
+  //
+  // 清单由后端给（api.sites() 的 config_files 字段）：brew 前缀在 Apple Silicon
+  // 是 /opt/homebrew、Intel 是 /usr/local，前端拼字符串一定会在另一种机器上错。
+  // 每一条的「📝 编辑」都复用 services.js 的 configFileModal（同一套文件接口与
+  // 保存/重启语义）；文件不存在时按钮照点，编辑器会如实报原因。
+  function configFilesModal() {
+    const box = h('div', [h('div.empty', [h('p', { text: '正在读取配置文件清单…' })])]);
+    const m = modal({ title: '网站环境配置文件', wide: true, body: box });
+
+    async function load() {
+      clear(box);
+      box.append(h('div.empty', [h('p', { text: '正在读取配置文件清单…' })]));
+      let files = (cache && cache.config_files) || null;
+      if (!files) {
+        try {
+          const res = await api.sites();
+          cache = res;
+          files = res.config_files || [];
+        } catch (e) {
+          clear(box);
+          box.append(h('div.empty', [
+            h('div.big', { text: '⚠️' }),
+            h('h4', { text: '读取配置文件清单失败' }),
+            h('p', { text: e.message }),
+          ]));
+          return;
+        }
+      }
+      if (!files.length) {
+        clear(box);
+        box.append(h('div.empty', [
+          h('div.big', { text: '📄' }),
+          h('h4', { text: '没有可列出的配置文件' }),
+          h('p', { text: '后端没有返回清单（面板版本可能较旧）；也可以先在「⋯ 更多 → 重建全部配置」之后再试。' }),
+        ]));
+        return;
+      }
+      const groups = new Map();
+      for (const f of files) {
+        if (!groups.has(f.group)) groups.set(f.group, []);
+        groups.get(f.group).push(f);
+      }
+      const rows = [];
+      for (const [group, items] of groups) {
+        rows.push(h('div', { style: { fontWeight: '600', margin: '12px 0 4px' }, text: group }));
+        for (const it of items) {
+          rows.push(h('div', {
+            style: {
+              display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap',
+              padding: '7px 0', borderBottom: '1px solid var(--line,#e5e7eb)',
+            },
+          }, [
+            h('div', { style: { flex: '1 1 320px', minWidth: '260px' } }, [
+              h('div', { text: it.label }),
+              h('code.code', { style: { fontSize: '11.5px', wordBreak: 'break-all' }, text: it.path }),
+              it.exists
+                ? null
+                : h('div.hint', { text: '文件还不存在（服务未启动过或尚未生成）—— 编辑器会如实说明' }),
+            ]),
+            h('button.btn.btn-sm', {
+              text: '📝 编辑',
+              title: it.service
+                ? '打开编辑器；保存后可用编辑器里的「🔄 重启服务」重启 ' + it.service
+                : '打开编辑器；面板没有这条服务的记录，保存后请手工重启对应服务',
+              onclick: () => configFileModal({
+                display_name: it.label,
+                config_path: it.path,
+                name: it.service || '',
+              }, () => { load(); }),
+            }),
+          ]));
+        }
+      }
+      clear(box);
+      box.append(
+        h('div.hint', {
+          style: { marginBottom: '6px' },
+          text: '这些文件是底层服务的真实配置。面板生成的站点 vhost 会在下次保存站点时被覆盖；'
+            + 'nginx.conf / php.ini / my.cnf 属于手工维护，面板不会动它们。',
+        }),
+        ...rows,
+        h('div', {
+          style: { marginTop: '14px', padding: '10px 12px', background: 'var(--warn-soft)', borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.8' },
+        }, [
+          h('div', { text: '⚠️ 保存不等于生效：' }),
+          h('div', { text: '· nginx 配置改完要重新加载 nginx（本条目的「🔄 重启服务」；只想重载可用「⋯ 更多 → 校验 nginx」先确认语法，再保存任意站点触发自动重载）' }),
+          h('div', { text: '· php.ini / php-fpm.conf / www.conf 改完要重启对应版本的 php-fpm' }),
+          h('div', { text: '· my.cnf 改完要重启 MySQL' }),
+          h('div', { text: '重启按钮点下去如果失败，会给出失败原因（面板没登记该服务 / 权限不足等），不会假装成功。' }),
+        ]),
+      );
+    }
+    load();
+  }
+
   function renderStatus() {
     clear(statusBar);
     const c = cache || {};
@@ -751,6 +1016,23 @@ export function SitesView(content, ctx = {}) {
       }),
       // 紧挨「PHP 环境」右侧：nginx 的真实运行状态（只读药丸，不是可点的假按钮）。
       nginxPill(),
+      // ⚙️ 配置文件：手动改 nginx.conf / 各站点 vhost / php.ini / my.cnf 的入口
+      // （宝塔式"基本操作"）。文件清单与路径由后端给，编辑复用既有配置编辑器。
+      h('button.btn.btn-sm', {
+        text: '⚙️ 配置文件',
+        title: '手动编辑 nginx.conf、各站点 vhost、每个 PHP 版本的 php.ini / php-fpm 配置、MySQL 的 my.cnf（保存后需要重载/重启才生效）',
+        onclick: configFilesModal,
+      }),
+      // 🏠 默认站点：装完面板就该有的那个静态站点。状态如实显示：
+      //   · 已创建 → 绿色药丸（点开可重建）
+      //   · 还没建 → 橙色药丸（点开一键建；缺 nginx 时先只装 nginx）
+      //   · 读不到 → 灰色药丸"未知"（不假装已创建）
+      defSitePill(),
+      h('button.btn.btn-sm', {
+        text: '🏠 默认站点',
+        title: '查看/创建面板的默认静态站点（www/localhost，监听 80 端口的兜底站点；不需要 PHP 与 MySQL）',
+        onclick: defaultSiteModal,
+      }),
       // 「校验 nginx」/「重建全部配置」收进这个二级菜单（用户要求）。
       h('button.btn.btn-sm', { text: '⋯ 更多', title: '更多操作', onclick: moreMenu }),
       h('button.btn.btn-primary.btn-sm', { text: '+ 新建站点', onclick: newSiteModal }),
@@ -962,16 +1244,21 @@ export function SitesView(content, ctx = {}) {
   //   ④ 失败必须有可见反馈 —— taskCenter 提交失败会 toast，任务失败走 onDone 的
   //      toast；绝不出现"点了没反应"。
   //
-  // 计划来自市场接口（GET /api/v1/market 的 uninstall 字段，由后端依赖引擎生成），
+  // 计划来自后端依赖引擎（按需接口，见下面 uninstallPHP 里的说明），
   // 不在前端重算依赖 —— 依赖判定只有后端那一处实现。
   async function uninstallPHP(p, onDone) {
     const appId = phpAppID(p);
     const formula = p.service || ('php@' + p.version);
-    // 市场计划可能还没加载过（用户直接开 PHP 环境弹窗）：拉一次，拿不到就按"未检查"处理。
+    // 计划来自后端**按需**接口（GET /api/v1/market/{id}/uninstall-plan）：
+    // 市场列表里的计划**故意不查依赖**（每个条目一次真实 brew 调用，36 条串起来
+    // 就是 15 秒冷启动 —— 用户报的"正在读取应用目录…"）。依赖判定只有后端一处实现，
+    // 前端只负责把结论讲给用户听。
+    // 取不到就按"未检查"继续（照旧弹确认框），但不假装没有依赖：真被 brew 拒绝时
+    // 任务里会如实报错。
     let plan = null;
     try {
-      const mkt = await api.market();
-      plan = (((mkt && mkt.list) || []).find((x) => x.id === appId) || {}).uninstall || null;
+      const res = await api.marketUninstallPlan(appId);
+      plan = (res && res.uninstall) || null;
     } catch (e) { plan = null; }
     const usedBy = ((cache && cache.list) || [])
       .filter((s) => String(s.php_version || '') === String(p.version))

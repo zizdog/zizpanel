@@ -1558,22 +1558,14 @@ function dependentsModal({ name, plan, onDone, onForce = null, forceText = '' })
 // svc 是可选的**服务记录**：卸载失败时用它做"从面板移除记录"的兜底出口
 // （记录名/展示名以记录为准；没有记录时没有可删的记录，就只如实报错）。
 export function marketUninstallButton(mi, onDone, svc = null) {
-  const plan = mi.uninstall || {};
+  // listPlan 是**列表里的**计划：它刻意**没有查过依赖**（查依赖要跑真的 brew，
+  // 每个条目约 0.4s，36 条就是 15 秒冷启动 —— 用户看到的是"正在读取应用目录…"
+  // 卡住）。真正的依赖判定在用户点「卸载」时按需查，见下面的 onclick。
+  const listPlan = mi.uninstall || {};
   const residual = !!mi.artifacts && !mi.installed;
   const recordName = (svc && svc.name) || mi.id;
   const recordLabel = (svc && (svc.display_name || svc.name)) || mi.name;
-  // 计划被 blocked（例如"还有 1 个 Docker 应用在用这个运行时"）时**不能**用
-  // disabled：禁用的按钮点下去什么都不发生（原因还只在悬浮提示里），用户看到的
-  // 就是"点了没反应"—— 这正是本 bug 的形态。保持可点，点了把原因说出来。
-  const blocked = !!plan.blocked && !residual;
-  // 被 **Homebrew 依赖**拦下、且计划允许强制时（force_allowed），用户有第二条路：
-  // brew uninstall --ignore-dependencies。它只在用户明确选择时才走。
-  const canForce = blocked && plan.force_allowed === true;
-  const forceDeps = (plan.dependents || []).filter((d) => d.kind === 'brew').map((d) => d.name);
-  const forceText = plan.force_note
-    || ('强制卸载会破坏这些包：' + (forceDeps.join('、') || '依赖它的包')
-      + '（它们会缺依赖、可能无法运行）。命令：brew uninstall --ignore-dependencies '
-      + (plan.formula || mi.id));
+  const label = residual ? '删除残留数据' : '卸载';
 
   // submit 把一次卸载交给任务中心；force 只在用户明确选择时才为 true。
   const submit = async (wipe, force) => {
@@ -1604,49 +1596,84 @@ export function marketUninstallButton(mi, onDone, svc = null) {
     });
   };
 
-  return h('button.btn.btn-sm.btn-danger', {
-    text: residual ? '删除残留数据' : '卸载',
-    // 刻意**不**设 disabled（也刻意不设 aria-disabled：那会让辅助技术与自动化
-    // 把它当成不可用，点都点不到）。按钮保持可用，点下去用 toast 说明为什么
-    // 现在不能卸载 —— disabled 的按钮点下去什么都不发生，原因还只在悬浮提示里，
-    // 用户看到的就是"点了没反应"。
-    title: residual ? '只删除磁盘上的残留产物/数据' : (plan.blocked || '卸载「' + mi.name + '」'),
-    onclick: async () => {
+  // 按钮**刻意不设 disabled**（也刻意不设 aria-disabled：那会让辅助技术与自动化
+  // 把它当成不可用，点都点不到）。按钮保持可用，点下去用 toast 说明为什么
+  // 现在不能卸载 —— disabled 的按钮点下去什么都不发生，原因还只在悬浮提示里，
+  // 用户看到的就是"点了没反应"。唯一短暂禁用是下面"检查依赖…"的那半秒，
+  // 而且按钮上**看得见**正在做什么。
+  const btn = h('button.btn.btn-sm.btn-danger', {
+    text: label,
+    title: residual ? '只删除磁盘上的残留产物/数据' : (listPlan.blocked || '卸载「' + mi.name + '」'),
+  });
+  btn.onclick = async () => {
+    // 1) 先把**完整**计划取回来（含依赖检测）。这一步失败**不阻断**卸载：
+    //    按列表里那份（未查依赖）继续，但如实说明"没能检查依赖"。
+    let plan = listPlan;
+    let depCheckErr = '';
+    if (!residual) {
+      btn.disabled = true;
+      btn.textContent = '检查依赖…';
       try {
-        if (blocked) {
-          // 有结构化依赖 → 弹说明对话框（逐条列出"谁在用它、该怎么办"）；
-          // 允许强制时（brew 依赖）同时给出「强制卸载 / 取消」两个明确选择。
-          if ((plan.dependents || []).length || canForce) {
-            dependentsModal({
-              name: mi.name, plan, onDone,
-              // 强制卸载**不直接提交**：先弹"将执行…+强制开关已勾选"的确认框，
-              // 用户在那屏上再点一次才真的发请求（极端破坏性动作要两道门）。
-              onForce: canForce
-                ? () => {
-                  void (async () => {
-                    const ans = await confirmUninstallPlan({
-                      name: mi.name, plan, residual: false, forceDefault: true,
-                    });
-                    if (!ans) return;
-                    await submit(ans.wipe, true);
-                  })();
-                }
-                : null,
-              forceText: canForce ? forceText : '',
-            });
-            return;
-          }
-          toast('现在不能卸载「' + mi.name + '」：' + plan.blocked, 'warn', 14000);
+        const res = await api.marketUninstallPlan(mi.id);
+        if (res && res.uninstall) plan = res.uninstall;
+      } catch (e) {
+        depCheckErr = (e && e.message) || String(e);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+      if (depCheckErr && !plan.blocked) {
+        toast('没能检查「' + mi.name + '」的依赖关系（' + depCheckErr + '）：'
+          + '按"没有已知依赖"继续；如果别的包依赖它，Homebrew 会在执行时拒绝（那时会有明确报错）',
+        'warn', 12000);
+      }
+    }
+    // 2) 计划被 blocked（例如"还有 1 个 Docker 应用在用这个运行时"）时保持可点：
+    //    点下去把原因说出来，而不是静默。
+    const blocked = !!plan.blocked && !residual;
+    // 被 **Homebrew 依赖**拦下、且计划允许强制时（force_allowed），用户有第二条路：
+    // brew uninstall --ignore-dependencies。它只在用户明确选择时才走。
+    const canForce = blocked && plan.force_allowed === true;
+    const forceDeps = (plan.dependents || []).filter((d) => d.kind === 'brew').map((d) => d.name);
+    const forceText = plan.force_note
+      || ('强制卸载会破坏这些包：' + (forceDeps.join('、') || '依赖它的包')
+        + '（它们会缺依赖、可能无法运行）。命令：brew uninstall --ignore-dependencies '
+        + (plan.formula || mi.id));
+    try {
+      if (blocked) {
+        // 有结构化依赖 → 弹说明对话框（逐条列出"谁在用它、该怎么办"）；
+        // 允许强制时（brew 依赖）同时给出「强制卸载 / 取消」两个明确选择。
+        if ((plan.dependents || []).length || canForce) {
+          dependentsModal({
+            name: mi.name, plan, onDone,
+            // 强制卸载**不直接提交**：先弹"将执行…+强制开关已勾选"的确认框，
+            // 用户在那屏上再点一次才真的发请求（极端破坏性动作要两道门）。
+            onForce: canForce
+              ? () => {
+                void (async () => {
+                  const ans = await confirmUninstallPlan({
+                    name: mi.name, plan, residual: false, forceDefault: true,
+                  });
+                  if (!ans) return;
+                  await submit(ans.wipe, true);
+                })();
+              }
+              : null,
+            forceText: canForce ? forceText : '',
+          });
           return;
         }
-        const answer = await confirmUninstallPlan({ name: mi.name, plan, residual });
-        if (!answer) return; // 取消 / 直接关掉确认框：什么都不做（也不静默——本来就没提交）
-        await submit(answer.wipe, answer.force);
-      } catch (e) {
-        // 同上：任何一步失败都要有一句带原因的话，绝不静默。
-        toast((residual ? '删除残留数据' : '卸载') + '「' + mi.name + '」失败：' +
-          ((e && e.message) || e), 'err', 12000);
+        toast('现在不能卸载「' + mi.name + '」：' + plan.blocked, 'warn', 14000);
+        return;
       }
-    },
-  });
+      const answer = await confirmUninstallPlan({ name: mi.name, plan, residual });
+      if (!answer) return; // 取消 / 直接关掉确认框：什么都不做（也不静默——本来就没提交）
+      await submit(answer.wipe, answer.force);
+    } catch (e) {
+      // 同上：任何一步失败都要有一句带原因的话，绝不静默。
+      toast((residual ? '删除残留数据' : '卸载') + '「' + mi.name + '」失败：' +
+        ((e && e.message) || e), 'err', 12000);
+    }
+  };
+  return btn;
 }

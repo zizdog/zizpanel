@@ -240,14 +240,16 @@ func BrewStateFor(catalogFormula string, installed map[string]string) BrewState 
 // PlanUninstallFor 与 PlanUninstall 相同，但用调用方已经查好的记录。
 //
 // 计划里需要 brew 的真实状态（"装了 brew 包但没有面板记录"这一态必须给得出
-// 卸载入口），这里按需查一次；web 层的市场列表用 PlanUninstallForBrew 传入
-// 整批缓存，避免每个条目各跑一次 brew。
+// 卸载入口），这里按需查一次；web 层的市场列表用 PlanUninstallForBrewFast
+// （**不查依赖**，避免每个条目各跑一次 brew —— 36 条就是 15 秒冷启动），
+// 依赖检测由 GET /api/v1/market/{id}/uninstall-plan 在点「卸载」时按需做。
 func (m *Manager) PlanUninstallFor(ctx context.Context, app App, rec *Service) UninstallPlan {
 	return m.PlanUninstallForBrew(ctx, app, rec, m.resolveBrewState(ctx, app))
 }
 
 // resolveBrewState 查一次这台机器上这个条目的 brew 状态（单个应用用；
-// 市场列表请用 PlanUninstallForBrew + 整批缓存）。
+// 市场列表请用 PlanUninstallForBrewFast —— 它一次 brew 都不跑，brew 版本
+// 由列表已经查好的整批 brewVers 传入）。
 func (m *Manager) resolveBrewState(ctx context.Context, app App) BrewState {
 	if app.BrewFormula == "" {
 		return BrewState{}
@@ -269,10 +271,26 @@ func (m *Manager) installedFormulaVersions(ctx context.Context) map[string]strin
 // 所有分支的产出都会过一遍依赖引擎（dependents.go）：说得出"谁在用它、该怎么办"，
 // 而不是一句笼统的"不能卸载"。
 func (m *Manager) PlanUninstallForBrew(ctx context.Context, app App, rec *Service, brew BrewState) UninstallPlan {
-	plan := m.planUninstallForBrewCore(ctx, app, rec, brew)
+	// 完整路径：核心就**查依赖**（checkDeps=true），与历史上一致 —— 卸载是不可逆动作，
+	// 计划必须说得出"谁在用它、能不能强制卸载"。市场列表走 Fast 版本（见下）。
+	plan := m.planUninstallForBrewCore(ctx, app, rec, brew, true)
 	m.ApplyDependents(ctx, app, rec, &plan)
 	m.brewDependencyBlockForInstaller(ctx, app, brew, &plan)
 	return plan
+}
+
+// PlanUninstallForBrewFast 是**只算本体、不查依赖**的计划（列表用）。
+//
+// 为什么必须有这么个"半成品"：依赖检测里 `brew uses --installed` 是一次**真实 brew
+// 调用**（每个 formula 一次）。市场列表曾对**每一条**应用跑一遍 PlanUninstallForBrew，
+// 36 条串起来就是 15 秒 —— 用户看到的就是"正在读取应用目录…"卡住不动
+// （2026-09-21 真机实测：GET /api/v1/market 冷 14.998s、热 0.25s）。
+//
+// 分界线：**列表要便宜，危险动作要准确**。列表只用它渲染"能不能卸"的入口，
+// 依赖检查推迟到用户真的点「卸载」时按需查（GET /api/v1/market/{id}/uninstall-plan）。
+// 因此调用方**不得**拿这份计划向用户断言"没有依赖" —— 它只是"还没查"。
+func (m *Manager) PlanUninstallForBrewFast(app App, rec *Service, brew BrewState) UninstallPlan {
+	return m.planUninstallForBrewCore(context.Background(), app, rec, brew, false)
 }
 
 // brewDependencyBlockForInstaller 给"面板安装器但实际靠 brew 卸载"的条目补上
@@ -330,7 +348,9 @@ func (p UninstallPlan) brewUninstallFormula() string {
 }
 
 // planUninstallForBrewCore 是计划的本体（不含依赖检测，便于测试单独驱动）。
-func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Service, brew BrewState) UninstallPlan {
+// checkDeps=false 时**一次 brew 都不跑**：brew 依赖（brewUsesInstalled）留在
+// 用户真的点「卸载」时按需查（见 PlanUninstallForBrewFast 的注释）。
+func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Service, brew BrewState, checkDeps bool) UninstallPlan {
 	if rec != nil && rec.Managed && app.PanelInstaller == "" {
 		if app.Kind == KindCompose || app.Kind == KindDocker {
 			keep := "compose 应用只删容器与网络，**具名卷（数据）保留**"
@@ -350,7 +370,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 		// 反馈的"卸载不了"（2026-09-21：php82 的计划只有"停服务 + 删记录"）。
 		// 真实动作 = 停服务 + 删记录 + brew uninstall。
 		if brew.Installed {
-			p := m.brewUninstallPlan(ctx, app, brew)
+			p := m.brewUninstallPlan(ctx, app, brew, checkDeps)
 			p.Service = rec.Name
 			p.Steps = append([]string{
 				"停止并移除「" + rec.DisplayName + "」的服务定义",
@@ -387,7 +407,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 		// 而不是把软件藏起来假装卸载了。
 		if app.PanelInstaller == "" && brew.Installed &&
 			app.Kind != KindCompose && app.Kind != KindDocker {
-			p := m.brewUninstallPlan(ctx, app, brew)
+			p := m.brewUninstallPlan(ctx, app, brew, checkDeps)
 			p.Service = rec.Name
 			p.Steps = append([]string{
 				"停止并移除「" + rec.DisplayName + "」的服务定义",
@@ -444,7 +464,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 	// installed=true 却给不出任何可卸载对象，本身就是自相矛盾。
 	// 现在给真实的 brew 卸载路径（先确认、走任务中心、失败可见）。
 	if brew.Installed {
-		p := m.brewUninstallPlan(ctx, app, brew)
+		p := m.brewUninstallPlan(ctx, app, brew, checkDeps)
 		// 残留的 launchd 服务要先停：只删 brew 包不摘服务的话，KeepAlive 会
 		// 一直尝试拉起一个已经不存在的二进制。
 		if label := m.brewLabelFor(brew.Formula); label != "" {
@@ -505,7 +525,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 //   - 查到了别的已装包在用它 → 点名（brew uninstall 不会连带删依赖，那些包会缺依赖）；
 //   - 查了、没有 → 明说"已检查"；
 //   - 没查成 → 明说"**未检查**"，绝不假装没有依赖（铁律 11）。
-func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState) UninstallPlan {
+func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState, checkDeps bool) UninstallPlan {
 	formula := brew.Formula
 	if formula == "" {
 		formula = app.BrewFormula
@@ -524,7 +544,12 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 			phpVersion+" **自己**的配置目录清理掉（勾选「同时删除配置」才会执行）："+
 			strings.Join(phpConfig, "、"))
 	}
-	deps, checked := m.brewUsesInstalled(ctx, formula)
+	// checkDeps=false（市场列表）：**不跑 brew**，如实标成"未检查"。
+	// 一条 `brew uses --installed` 是 0.4 秒的真实 brew 启动，36 个条目就是 15 秒。
+	deps, checked := []string(nil), false
+	if checkDeps {
+		deps, checked = m.brewUsesInstalled(ctx, formula)
+	}
 	p.DependentsChecked = checked
 	for _, d := range deps {
 		p.Dependents = append(p.Dependents, Dependent{Kind: "brew", Name: d,
@@ -580,9 +605,16 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 
 // brewUsesInstalled 查 `brew uses --installed <formula>`：还有哪些**已安装**的包在用它。
 //
-// 为什么带缓存：市场列表里每个 brew 原生条目都会调一次，brew 启动本身就要 0.4 秒；
-// 而依赖关系几乎不变。返回的 bool 表示**这次查询真的成功了**（false = 未检查，
-// 界面与计划必须如实这么说，不能把"没查成"显示成"没有依赖"）。
+// 为什么带缓存：卸载计划（以及面板安装器 python / phpmyadmin 那条路）会调它，
+// brew 启动本身就要 0.4 秒，而依赖关系几乎不变。返回的 bool 表示**这次查询真的
+// 成功了**（false = 未检查，界面与计划必须如实这么说，不能把"没查成"显示成
+// "没有依赖"）。
+//
+// ⚠️ **绝不再放回市场列表的渲染路径**（2026-09-21 用户报"正在读取应用目录…"卡住）：
+// 列表对每条应用跑一遍 = 每个 formula 一次真实 brew 调用，36 条串起来 15 秒冷启动。
+// 列表用 PlanUninstallForBrewFast（不查依赖），依赖检测推迟到用户点「卸载」
+// 时按需查（GET /api/v1/market/{id}/uninstall-plan）。有测试锁死这条
+// （TestMarketListNeverProbesBrewDependencies）。
 //
 // ⚠️ 超时上限 45 秒（2026-09-21 实测踩到）：brew 会去更新/加载 tap，在测试机
 // 或网络不好的机器上**能挂几分钟**；而这条查询在**市场列表**的渲染路径上，

@@ -310,7 +310,7 @@ func TestPlanPMAEntryRemoval(t *testing.T) {
 // ============================================================================
 
 func TestPMAAllowNoPasswordLine(t *testing.T) {
-	conf := pmaConfig("0123456789abcdef0123456789abcdef", "/tmp/pma", true)
+	conf := pmaConfig("0123456789abcdef0123456789abcdef", "/tmp/pma", true, 300)
 	if got, ok := pmaAllowNoPasswordFromConfig(conf); !ok || !got {
 		t.Fatalf("生成的配置应含 AllowNoPassword=true，实际 ok=%v got=%v", ok, got)
 	}

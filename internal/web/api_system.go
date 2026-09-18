@@ -388,6 +388,13 @@ func (s *Server) settingsView() map[string]any {
 		// 装 MySQL 时"限时询问 root 口令"的秒数（0/缺省按 60）。
 		// 回传它是为了让运维能把它调成 1 秒＝全自动（无人值守安装）。
 		"mysql_input_timeout_seconds": s.Cfg.MySQLInputTimeoutSeconds,
+		// 上传与执行限制也回传（设置页的「上传与执行限制」Tab 首次渲染就用它，
+		// 不必再多打一个请求；生效值回读仍走 GET /settings/upload-limits）。
+		"nginx_client_max_body_size": s.Cfg.NginxClientMaxBodySize,
+		"php_upload_max_filesize":    s.Cfg.PHPUploadMaxFilesize,
+		"php_post_max_size":          s.Cfg.PHPPostMaxSize,
+		"php_memory_limit":           s.Cfg.PHPMemoryLimit,
+		"php_max_execution_time":     s.Cfg.PHPMaxExecutionTime,
 	}
 }
 

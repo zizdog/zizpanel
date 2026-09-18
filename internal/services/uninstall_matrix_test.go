@@ -189,7 +189,7 @@ func TestBrewPlanTellsTruthAboutDependents(t *testing.T) {
 	}
 
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return []string{"php@8.2"}, true }
-	p := m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true})
+	p := m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true}, true)
 	if !hasStepContaining(p.Steps, "php@8.2") {
 		t.Errorf("查到依赖时必须点名，实际 %v", p.Steps)
 	}
@@ -198,13 +198,13 @@ func TestBrewPlanTellsTruthAboutDependents(t *testing.T) {
 	}
 
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return nil, true }
-	p = m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true})
+	p = m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true}, true)
 	if !hasStepContaining(p.Steps, "已检查") {
 		t.Errorf("查了没有依赖时应明说已检查，实际 %v", p.Steps)
 	}
 
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return nil, false }
-	p = m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true})
+	p = m.brewUninstallPlan(ctx, app, BrewState{Formula: "nginx", Installed: true}, true)
 	if !hasStepContaining(p.Steps, "未检查") {
 		t.Errorf("没查成时必须说『未检查』（不许假装没有依赖），实际 %v", p.Steps)
 	}

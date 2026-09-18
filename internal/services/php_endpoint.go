@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +81,26 @@ func (m *Manager) ensurePHPListenEndpoint(ctx context.Context, formula string, r
 		res.step(ctx, "已把 PHP "+version+" 的监听端点改为 "+fix.Endpoint+"（原配置已备份）")
 	} else {
 		res.step(ctx, "PHP "+version+" 的监听端点已是 "+fix.Endpoint+"（无需改动）")
+	}
+
+	// 上传/执行限制片段：与端点同一时机写入（都是"这个 PHP 版本刚装好"的收尾）。
+	//
+	// 为什么必须在安装流程内做：出厂的 upload_max_filesize=2M / post_max_size=8M
+	// 会让 phpMyAdmin 导入稍大的 SQL 就失败；用户不该装完还要自己去翻配置
+	// （这正是那次 413 报障的另一半）。片段写在 conf.d，属于面板自己的文件。
+	limits := m.limits()
+	if lr, lerr := sites.EnsurePHPLimits(prefix, version, limits, false); lerr != nil {
+		// 不致命：端点已经修好，站点仍可用；但必须如实写进 Warning/Steps。
+		msg := fmt.Sprintf("PHP %s 的上传/执行限制片段写入失败：%v。"+
+			"大型 SQL 导入/上传仍可能失败（默认 upload_max_filesize=2M、post_max_size=8M）；"+
+			"可稍后在「面板设置 → 上传与执行限制」里重新应用", version, lerr)
+		res.Warning = appendWarning(res.Warning, msg)
+		res.step(ctx, "警告："+msg)
+	} else if lr.Changed {
+		res.step(ctx, "已写入 PHP "+version+" 的上传/执行限制片段："+
+			lr.Path+"（upload "+limits.UploadMaxFilesize+" / post "+limits.PostMaxSize+
+			" / memory "+limits.MemoryLimit+" / max_execution_time "+
+			strconv.Itoa(limits.MaxExecutionTime)+"s）")
 	}
 
 	// 套接字目录归属真实用户（见文件头第 2 条）。失败不致命：目录本来就可能

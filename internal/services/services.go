@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/sites"
 )
 
 // RuntimeUnavailableError 标记"本机没有可用的容器运行时，命令根本没执行"。
@@ -344,6 +346,15 @@ type Options struct {
 	// "有没有站点正在用这个 PHP 版本 / 会被 MySQL、nginx 的卸载影响"。
 	// nil = 未接入 → 依赖检测会如实说"没有站点记录可用"，绝不假装没有站点。
 	SiteDependents func() []SiteRef
+
+	// UploadLimits 是面板配置的上传与执行限制（nginx 请求体上限 + PHP 上传/
+	// 执行上限，来自 Config 的那五个字段）。
+	//
+	// 为什么安装路径需要它：一键 LNMP / 装 phpMyAdmin 时面板会**生成默认站点
+	// vhost**，那份 vhost 必须带上 client_max_body_size（否则 nginx 用出厂的
+	// 1m，用户一导入就 413）；装 PHP 时还要写 conf.d 限制片段。两者都用这里的值，
+	// 空值由 sites.Limits.Normalize() 补默认 512m/512M。
+	UploadLimits sites.Limits
 }
 
 // MySQLCredential 是"面板持有的 MySQL 超级账号凭据"（来自 config.json）。

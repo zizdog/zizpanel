@@ -7,8 +7,16 @@
 //   - 所有破坏性操作都要二次确认，删除目录必须显式勾选"递归"
 
 import { api, apiURL } from './api.js';
-import { h, clear, toast, modal, confirmBox, promptBox, appendAll, esc } from './ui.js';
+import { h, clear, toast, modal, confirmBox, promptBox, appendAll, esc, rate, duration } from './ui.js';
 import { registerCleanup } from './app.js';
+
+// MAX_UPLOAD 必须与后端 internal/web/api_files.go 的 maxUpload 一致（4 GiB）。
+//
+// 为什么前端要单独知道这个数：用户选中文件后**先本地判一次**，超限就直接给
+// 明确提示、一个字节都不发。旧版是在浏览器把 512MB 传完之后才被服务端拒绝，
+// 用户白等半天只看到一句失败 —— 这正是"点了没反应"的一半原因。
+// 两边漂移会让"本地通过、服务端拒收"重现，所以有测试锁死这两个数字相等。
+const MAX_UPLOAD = 4 * 1024 * 1024 * 1024;
 
 let cwd = '';
 let showHidden = false;
@@ -27,20 +35,118 @@ export function FilesView(content, ctx = {}) {
   const fileInput = h('input', {
     type: 'file', multiple: true, style: { display: 'none' },
     onchange: async (e) => {
-      if (e.target.files.length) await uploadFiles(e.target.files);
+      if (e.target.files.length) {
+        await uploadEntries(Array.from(e.target.files).map((f) => ({ file: f, rel: f.name })));
+      }
       e.target.value = '';
     },
   });
 
-  appendAll(content, 
-    h('div.card', [
-      h('div.card-head', [crumbs]),
-      h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border-soft)', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [toolbar]),
-      h('div.card-body.tight', [tableBox]),
-      statusBar,
-      fileInput,
-    ]),
-  );
+  // 「上传文件夹」入口：webkitdirectory 让浏览器把整棵目录树交出来，
+  // 每个文件带 webkitRelativePath（如 mysite/assets/app.css）。
+  // 用 setAttribute 而不是 h() 的属性赋值：webkitdirectory 是**布尔** IDL 属性，
+  // 赋空字符串会被浏览器当成 false（"设了但没生效"），setAttribute 才稳。
+  const folderInput = h('input', {
+    type: 'file', multiple: true, style: { display: 'none' },
+    onchange: async (e) => {
+      const files = Array.from(e.target.files || []);
+      // 空文件夹浏览器不会给任何文件：这里必须**说出来**，否则"选了文件夹没反应"
+      // 又是一次静默（取消选择不会触发 change，所以走到这里就是真的空）。
+      if (!files.length) {
+        toast('这个文件夹里没有文件（空文件夹不会有任何东西被上传）', 'warn', 8000);
+        e.target.value = '';
+        return;
+      }
+      await uploadEntries(files.map((f) => ({ file: f, rel: f.webkitRelativePath || f.name })), { folder: true });
+      e.target.value = '';
+    },
+  });
+  folderInput.setAttribute('webkitdirectory', '');
+  folderInput.setAttribute('directory', '');
+
+  // 拖拽提示区：只有拖动时才显示（平时不占版面）。
+  const dropZone = h('div.files-drop', {
+    style: { display: 'none', margin: '0 14px 10px' },
+    text: '把文件或整个文件夹拖到这里上传（文件夹会保留目录结构）',
+  });
+
+  const card = h('div.card', [
+    h('div.card-head', [crumbs]),
+    h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border-soft)', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [toolbar]),
+    dropZone,
+    h('div.card-body.tight', [tableBox]),
+    statusBar,
+    fileInput,
+    folderInput,
+  ]);
+
+  appendAll(content, card);
+  wireDropZone(card);
+
+  // wireDropZone 让"拖文件/拖文件夹进来"走与按钮完全相同的上传路径。
+  //
+  // 为什么要走同一条路：拖拽只是另一个入口，校验、进度、错误提示、相对路径
+  // 重建目录树的行为必须与「上传文件夹」按钮一模一样，否则会出现
+  // "按钮传没问题、拖进来就静默失败"这种最难查的差异。
+  function wireDropZone(el) {
+    const hasFiles = (e) => {
+      const dt = e.dataTransfer;
+      if (!dt) return false;
+      const types = Array.from(dt.types || []);
+      return types.includes('Files');
+    };
+    let depth = 0; // dragenter/dragleave 会随子元素反复触发，用计数避免提示闪烁
+    const show = (on) => { dropZone.style.display = on ? '' : 'none'; };
+    el.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); depth++; show(true);
+    });
+    el.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    el.addEventListener('dragleave', (e) => {
+      if (!hasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) show(false);
+    });
+    el.addEventListener('drop', async (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); depth = 0; show(false);
+      try {
+        await handleDrop(e.dataTransfer);
+      } catch (err) {
+        toast('处理拖入的内容失败：' + (err && err.message ? err.message : err), 'err', 12000);
+      }
+    });
+  }
+
+  // handleDrop 把 DataTransfer 展开成 {file, rel} 列表。
+  //
+  // 优先用 webkitGetAsEntry：只有它能拿到**目录**与相对路径。
+  // 它不可用时退化到 dataTransfer.files（拿不到目录结构，也不能拖文件夹），
+  // 这时只能按文件名上传，并且要如实告诉用户为什么没有目录。
+  async function handleDrop(dt) {
+    const items = dt.items ? Array.from(dt.items).filter((it) => it.kind === 'file') : [];
+    const roots = items.map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null)).filter(Boolean);
+    if (!roots.length) {
+      const plain = Array.from(dt.files || []);
+      if (!plain.length) { toast('没有识别到可上传的文件', 'warn'); return; }
+      toast('当前浏览器不支持读取拖入的文件夹，已按普通文件上传（目录结构会丢失）', 'warn', 12000);
+      await uploadEntries(plain.map((f) => ({ file: f, rel: f.name })));
+      return;
+    }
+    const entries = [];
+    let hasDir = false;
+    for (const root of roots) {
+      if (root.isDirectory) hasDir = true;
+      await walkEntry(root, '', entries);
+    }
+    if (!entries.length) { toast('拖入的文件夹是空的，没有可上传的文件', 'warn'); return; }
+    // 只有文件夹（或混着文件夹）时才带相对路径；纯文件拖拽与「⬆ 上传」等价。
+    await uploadEntries(entries, { folder: hasDir });
+  }
 
   async function load(path) {
     if (path) cwd = path;
@@ -109,6 +215,7 @@ export function FilesView(content, ctx = {}) {
     appendAll(toolbar, 
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: () => load(cwd) }),
       h('button.btn.btn-sm', { text: '⬆ 上传', onclick: () => fileInput.click() }),
+      h('button.btn.btn-sm', { text: '⬆ 上传文件夹', onclick: () => folderInput.click() }),
       h('button.btn.btn-sm', {
         text: '＋ 新建文件夹',
         onclick: async () => {
@@ -411,27 +518,241 @@ export function FilesView(content, ctx = {}) {
   }
 
   // ---------- 上传 ----------
-  async function uploadFiles(files) {
-    const fd = new FormData();
-    appendAll(fd, 'dir', cwd);
-    for (const f of files) appendAll(fd, 'files', f, f.name);
-    const t = toast(`正在上传 ${files.length} 个文件…`, 'info', 0);
+  //
+  // 三条不可退让的规矩（用户报障后定的）：
+  //   1. 绝不静默：选中文件后先本地判大小，超限立刻弹明确提示并且**不发请求**；
+  //   2. 必须能看出"在动"：用 XHR（不是 fetch）拿 upload.onprogress，
+  //      显示百分比 + 已传/总大小 + 速度 + 预计剩余；
+  //   3. 失败必须给出**服务端返回的原因**（HTTP status + body 里的 msg），
+  //      网络中断明说"连接中断"，不许只剩一句干等的 toast。
+
+  // uploadEntries 是所有上传入口（按钮/文件夹按钮/拖拽）的唯一实现。
+  //
+  // 整体套 try/catch：**任何**没预料到的异常都必须变成用户看得见的提示。
+  // 2026-09-20 那次报障的形态就是"异常抛在任何提示之前 → 彻底无声"，
+  // 所以这里不允许再出现没有出口的异常路径。
+  async function uploadEntries(entries, opts = {}) {
     try {
-      // 上传用原生 fetch：FormData 不能走 JSON 封装的 request()
-      const res = await fetch(apiURL('files/upload'), {
-        method: 'POST', body: fd, credentials: 'same-origin',
-        headers: { 'X-CSRF-Token': readCookie('zp_csrf') },
-      });
-      const data = await res.json();
-      t.remove();
-      if (!res.ok || data.ok === false) throw new Error(data.msg || `HTTP ${res.status}`);
-      toast(data.data.msg || '上传完成', 'ok');
-      if (data.data.failed?.length) toast('部分失败：' + data.data.failed.join('；'), 'warn', 12000);
-      load(cwd);
-    } catch (e) {
-      t.remove();
-      toast('上传失败：' + e.message, 'err', 12000);
+      if (!entries.length) return;
+      const problem = precheckUpload(entries);
+      if (problem) { showUploadProblem(problem); return; }
+      await runUpload(entries, { folder: !!opts.folder });
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      toast('上传未能开始：' + msg, 'err', 15000);
     }
+  }
+
+  // precheckUpload 在**发请求之前**做本地校验，返回 null 表示可以上传。
+  //
+  // 为什么总大小也要判：整个 multipart 请求体只受后端 maxUpload 约束，
+  // "每个文件都没超但加起来超了"同样会被服务端拒收 —— 那又是一次白传。
+  function precheckUpload(entries) {
+    const total = entries.reduce((s, e) => s + (e.file.size || 0), 0);
+    const oversize = entries.filter((e) => (e.file.size || 0) > MAX_UPLOAD);
+    if (!oversize.length && total <= MAX_UPLOAD) return null;
+    return { total, oversize };
+  }
+
+  // showUploadProblem 把"超限"讲清楚：文件名 + 实际大小 + 上限 + 建议。
+  function showUploadProblem({ total, oversize }) {
+    const rows = [];
+    if (oversize.length) {
+      rows.push(h('p', { text: `有 ${oversize.length} 个文件超过单个文件上限：` }));
+      const list = h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } },
+        oversize.slice(0, 20).map((e) => h('li', { text: `${e.rel} — ${humanSize(e.file.size)}` })));
+      rows.push(list);
+      if (oversize.length > 20) rows.push(h('p', { text: `…另有 ${oversize.length - 20} 个同样超限的文件` }));
+    } else {
+      rows.push(h('p', { text: `这一次要传的总大小是 ${humanSize(total)}，超过单次上传上限。` }));
+    }
+    rows.push(h('p', {
+      style: { marginTop: '10px' },
+      text: `面板单次上传上限：${humanSize(MAX_UPLOAD)}；你这次总共 ${humanSize(total)}。`,
+    }));
+    rows.push(h('div', {
+      style: { marginTop: '8px', lineHeight: '1.8' },
+      text: '建议：① 用「⬆ 上传文件夹」把网站按子目录分批传上去（超限的那个文件仍然要单独处理）；' +
+        '② 先在本地分卷压缩（如 site.part1.zip、site.part2.zip）再逐个上传；' +
+        '③ 也可以再把压缩包解压。文件一个字节都没有上传，不需要清理。',
+    }));
+    const m = modal({
+      title: '⛔ 超过上传上限，已在上传前拦下',
+      body: h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, rows),
+      footer: [h('button.btn.btn-primary', { text: '知道了', onclick: () => m.close() })],
+    });
+  }
+
+  // runUpload 真正发请求：XHR + 进度窗。
+  async function runUpload(entries, { folder }) {
+    const total = entries.reduce((s, e) => s + (e.file.size || 0), 0);
+
+    // ---- 进度窗（先建窗口，再拼请求体）----
+    //
+    // 顺序很重要：拼 FormData 也可能抛（历史上 appendAll 就抛在这里，
+    // 而窗口还没建 → 用户什么都看不到）。先把窗口立起来，任何后续异常
+    // 都能显示在窗口里。
+    const barFill = h('i', { style: { width: '0%' } });
+    const lineMain = h('div', { style: { fontWeight: '600' } , text: '正在准备…' });
+    const lineRate = h('div', { style: { color: 'var(--text-mute)', marginTop: '4px' }, text: ' ' });
+    const lineNote = h('div', { style: { marginTop: '8px', fontSize: '12.5px', color: 'var(--text-mute)' },
+      text: folder ? `将在 ${cwd} 下按原目录结构重建（同名文件会被覆盖）` : `目标目录：${cwd}` });
+
+    // 状态与 XHR 先声明再接线：按钮回调（取消上传）会引用 xhr。
+    const started = Date.now();
+    let lastDraw = 0;
+    let loaded = 0;
+    let finished = false;
+
+    // 上传必须用 XHR：fetch 完全没有"上传进度"能力（只有下载流的 reader），
+    // 这正是旧版只剩一句干等 toast 的原因。XHR 的 upload.onprogress 才有已传字节。
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', apiURL('files/upload'), true);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('X-CSRF-Token', readCookie('zp_csrf'));
+
+    let modalRef = null;
+    const cancelBtn = h('button.btn', { text: '取消上传', onclick: () => xhr.abort() });
+    const closeBtn = h('button.btn.btn-primary', { text: '关闭', style: { display: 'none' }, onclick: () => modalRef && modalRef.close() });
+    modalRef = modal({
+      title: folder ? `⬆ 上传文件夹（${entries.length} 个文件）` : `⬆ 上传 ${entries.length} 个文件`,
+      body: h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
+        lineMain,
+        h('div.bar', [barFill]),
+        lineRate,
+        lineNote,
+      ]),
+      footer: [cancelBtn, closeBtn],
+      closeOnBackdrop: false, // 上传中误点遮罩不该让窗口消失（那看起来又像"没反应"）
+      closeOnEsc: false,
+    });
+
+    // 每 200ms~1s 刷新一次界面：**即使一个进度事件都没有**也要能看出"在动" ——
+    // 大文件在浏览器决定何时发第一个 progress 事件前可能安静好几秒，
+    // 那几秒里用户看到的不能是静止的窗口。
+    const ticker = setInterval(() => {
+      if (!finished) draw(loaded);
+    }, 1000);
+
+    function draw(sent) {
+      const now = Date.now();
+      const elapsed = Math.max(0.001, (now - started) / 1000);
+      const p = total > 0 ? Math.min(100, (sent / total) * 100) : 0;
+      barFill.style.width = p.toFixed(1) + '%';
+      lineMain.textContent = total > 0
+        ? `已上传 ${humanSize(sent)} / ${humanSize(total)}（${p.toFixed(1)}%）`
+        : `已上传 ${humanSize(sent)}`;
+      const bps = sent / elapsed;
+      let rest = '—';
+      if (sent > 0 && total > sent) rest = duration((total - sent) / Math.max(1, bps));
+      lineRate.textContent = `速度 ${rate(bps)} · ${sent > 0 && total > sent ? `预计剩余 ${rest}` : '等待服务端确认'} · 已用 ${duration(elapsed)}`;
+    }
+
+    function finish() {
+      finished = true;
+      clearInterval(ticker);
+      cancelBtn.style.display = 'none';
+      closeBtn.style.display = '';
+    }
+
+    // fail 把失败原因写进同一个窗口（用户不用去找别的地方），再补一条 toast。
+    function fail(title, detail) {
+      finish();
+      barFill.style.background = 'var(--danger)';
+      lineMain.textContent = title;
+      lineMain.style.color = 'var(--danger)';
+      lineRate.textContent = '';
+      clear(lineNote);
+      appendAll(lineNote, h('div', { text: detail }));
+      toast(`${title}：${detail}`, 'err', 15000);
+    }
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) loaded = e.loaded;
+      const now = Date.now();
+      if (now - lastDraw < 200) return; // 进度事件很密，限制重绘频率
+      lastDraw = now;
+      draw(loaded);
+    };
+
+    // 拼请求体。FormData 必须用 fd.append(two args) —— appendAll 是 DOM 助手，
+    // 拿它塞 FormData 会抛（见 ui.js 的注释）。这里的异常会显示在进度窗里。
+    let fd;
+    try {
+      fd = new FormData();
+      fd.append('dir', cwd);
+      if (folder) {
+        // 相对路径按顺序与 files 一一对应；后端 Go 的 multipart 解析对同一字段名保序。
+        fd.append('relpaths', JSON.stringify(entries.map((e) => e.rel)));
+      }
+      for (const e of entries) fd.append('files', e.file, e.file.name);
+    } catch (err) {
+      fail('无法准备上传数据', (err && err.message ? err.message : String(err)));
+      return;
+    }
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (_) { data = null; }
+      const okBody = xhr.status >= 200 && xhr.status < 300 && data && data.ok !== false;
+      if (!okBody) {
+        fail(`上传失败（HTTP ${xhr.status}${xhr.statusText ? ' ' + xhr.statusText : ''}）`, serverReason(xhr, data));
+        return;
+      }
+      finish();
+      const payload = data.data || {};
+      const uploaded = payload.uploaded || [];
+      const failed = payload.failed || [];
+      const overwritten = uploaded.filter((u) => u.overwritten).length;
+      barFill.style.width = '100%';
+      lineMain.textContent = `✅ ${payload.msg || `已上传 ${uploaded.length} 个文件`}`;
+      lineMain.style.color = 'var(--ok)';
+      lineRate.textContent = `共 ${humanSize(uploaded.reduce((s, u) => s + (u.size || 0), 0))} · 用时 ${duration((Date.now() - started) / 1000)}`;
+      clear(lineNote);
+      if (overwritten) appendAll(lineNote, h('div', { text: `其中 ${overwritten} 个覆盖了同名文件。` }));
+      if (failed.length) {
+        appendAll(lineNote,
+          h('div', { style: { color: 'var(--warn)', marginTop: '6px' }, text: `${failed.length} 个文件失败：` }),
+          h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } }, failed.map((f) => h('li', { text: String(f) }))));
+        toast(`已上传 ${uploaded.length} 个，${failed.length} 个失败（详见窗口）`, 'warn', 15000);
+      } else {
+        toast(payload.msg || '上传完成', 'ok');
+      }
+      // 文件夹上传后，若所有相对路径都在同一个顶层目录下，给一个"进入"按钮
+      const top = singleTopDir(entries.filter((e) => e.rel.includes('/')).map((e) => e.rel));
+      if (folder && top) {
+        appendAll(lineNote, h('button.btn.btn-sm', {
+          text: `进入 ${top}`, style: { marginTop: '8px' },
+          onclick: () => { modalRef && modalRef.close(); load(`${cwd}/${top}`); },
+        }));
+      }
+      load(cwd);
+    };
+    xhr.onerror = () => fail('连接中断，上传未完成',
+      '与服务端的连接被中断（网络断开、面板重启、或服务端在读请求时中断）。已上传的部分文件可能留在目标目录里，重传即可。');
+    xhr.ontimeout = () => fail('上传超时', '服务端在限定时间内没有收完数据。');
+    xhr.onabort = () => fail('已取消上传', '你点了「取消上传」，请求已中止。已传完的文件会留在目标目录里。');
+    xhr.send(fd);
+  }
+
+  // serverReason 把服务端返回的原因原样取出来（这是用户唯一能据此自救的信息）。
+  //
+  // 优先 JSON 里的 msg/error（面板自己的失败响应）；拿不到就把原始 body 截一段
+  // 显示出来（例如反向代理返回的 413 HTML 页面 —— 那也必须让用户看见）。
+  function serverReason(xhr, data) {
+    let msg = '';
+    if (data && typeof data === 'object') msg = String(data.msg || data.error || '');
+    if (!msg) {
+      const txt = String(xhr.responseText || '').trim();
+      if (txt) msg = txt.length > 400 ? txt.slice(0, 400) + '…' : txt;
+    }
+    return msg || '（服务端没有返回任何说明）';
+  }
+
+  // singleTopDir 返回一组相对路径共同的唯一顶层目录（没有则返回 ''）。
+  function singleTopDir(rels) {
+    if (!rels.length) return '';
+    const tops = new Set(rels.map((r) => r.split('/')[0]));
+    return tops.size === 1 ? [...tops][0] : '';
   }
 
   // ---------- 编辑器 ----------
@@ -1770,9 +2091,46 @@ function editorModal(entry, res) {
   render(); // 先画好再让用户看到，避免弹窗刚出现时高亮层是空的
 }
 
+// ---------- 拖拽：把 DataTransfer 展开成 {file, rel} ----------
+//
+// 只有 webkitGetAsEntry 能拿到目录与相对路径；Entry.file() / readEntries() 都是
+// 回调式 API，这里包成 Promise 好按顺序走完。
+// readEntries 一次**最多只返回一批**（Chrome 约 100 个），必须反复调用到返回空数组
+// —— 只调一次会静默丢掉后面的文件（"文件夹传了一半"就是这么来的）。
+
+function readAllEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const all = [];
+    const next = () => {
+      reader.readEntries((batch) => {
+        if (!batch.length) { resolve(all); return; }
+        all.push(...batch);
+        next();
+      }, reject);
+    };
+    next();
+  });
+}
+
+function entryFile(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function walkEntry(entry, prefix, out) {
+  if (!entry) return;
+  if (entry.isFile) {
+    const file = await entryFile(entry);
+    out.push({ file, rel: prefix + entry.name });
+    return;
+  }
+  if (entry.isDirectory) {
+    const kids = await readAllEntries(entry.createReader());
+    for (const k of kids) await walkEntry(k, prefix + entry.name + '/', out);
+  }
+}
+
 // ---------- 小工具 ----------
-function basename(p) { return String(p).split('/').filter(Boolean).pop() || '/'; }
-function dirname(p) { const parts = String(p).split('/'); parts.pop(); return parts.join('/') || '/'; }
+function basename(p) { return String(p).split('/').filter(Boolean).pop() || '/'; }function dirname(p) { const parts = String(p).split('/'); parts.pop(); return parts.join('/') || '/'; }
 
 function humanSize(n) {
   n = Number(n) || 0;

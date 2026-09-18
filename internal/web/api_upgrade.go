@@ -496,9 +496,26 @@ func (s *Server) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 手动上传升级包（离线路径）同样可能传很慢：256MB 在慢速公网上超过 30 秒是常态，
+	// 而全局 ReadTimeout=30s（cmd/zizpanel/http.go）会把它直接掐断 —— 表现与
+	// 文件管理里传大文件一样（"点了没反应"）。所以这条路由也要解除读超时。
+	if err := allowLongUpload(w, r); err != nil && s.Log != nil {
+		s.Log.Warn("延长升级包上传读超时失败（超过 30 秒的上传可能被中断）: %v", err)
+	}
+	// 在接收 body 之前先按声明长度判一次，避免用户白传 256MB 才被拒。
+	if r.ContentLength > maxUploadBytes {
+		fail(w, http.StatusRequestEntityTooLarge,
+			uploadLimitMessage(r.ContentLength, maxUploadBytes, "升级包过大"))
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		fail(w, http.StatusBadRequest, "上传内容无法解析或超过 256MB 上限："+err.Error())
+		if isBodyTooLarge(err) {
+			fail(w, http.StatusRequestEntityTooLarge,
+				uploadLimitMessage(r.ContentLength, maxUploadBytes, "升级包过大"))
+			return
+		}
+		fail(w, http.StatusBadRequest, "上传内容无法解析："+err.Error())
 		return
 	}
 	file, hdr, err := r.FormFile("package")

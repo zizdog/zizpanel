@@ -135,6 +135,12 @@ export const api = {
   upgradeDismiss: () => request('POST', `${API_BASE}/system/upgrade/dismiss`, {}),
   upgradeUpload: (file) => api.upload(`${API_BASE}/system/upgrade/upload`, file),
   saveSettings: (patch) => request('POST', `${API_BASE}/settings`, patch),
+  // ---- 上传与执行限制（nginx client_max_body_size + PHP 上传/执行上限）----
+  // GET 返回配置值 + **回读的生效值**（界面据此区分"已保存"与"已生效"）；
+  // POST 校验后返回 202 + task_id，真正的应用（写 vhost + conf.d → reload nginx
+  // → 重启 php-fpm）在任务中心里跑，进度与回读都在任务日志里。
+  getUploadLimits: () => request('GET', `${API_BASE}/settings/upload-limits`),
+  saveUploadLimits: (patch) => request('POST', `${API_BASE}/settings/upload-limits`, patch),
   changePassword: (oldPwd, newPwd) =>
     request('POST', `${API_BASE}/account/password`, { old: oldPwd, new: newPwd }),
   // 改用户名：要当前密码确认；成功后会话仍然有效（会话按 user_id 关联）
@@ -254,6 +260,10 @@ export const api = {
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`
       + (force ? '&force=1' : '')),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
+  // 卸载前的完整计划（含依赖检测）。市场列表**故意不查依赖** —— 每个条目
+  // 一次 `brew uses --installed`，36 条就是 15 秒冷启动（列表卡在"正在读取应用目录…"）。
+  // 所以前端在用户点「卸载」时才调这个接口，拿到真正带 blocked/dependents 的计划。
+  marketUninstallPlan: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/uninstall-plan`),
   marketInstall: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/install`, {}),
   // 一键 LNMP 分两步：先取**版本候选**（弹窗让用户选 nginx/PHP/MySQL 各自的版本），
   // 用户确认后才把选择提交出去。options 里的 installed 是后端真实探测
@@ -405,6 +415,12 @@ export const api = {
   nginxTest: () => request('POST', `${API_BASE}/system/nginx/test`, {}),
   nginxStatus: () => request('GET', `${API_BASE}/system/nginx/status`),
   nginxRepair: () => request('POST', `${API_BASE}/system/nginx/repair`, {}),
+
+  // ---- 默认站点（80 端口上的兜底静态站点）----
+  // 面板启动时会自动建一次；这两个接口用于"看状态"与"手动创建/修复"。
+  // 没有 nginx 时 apply 会返回 409 + 人话（界面据此给「只安装 Nginx」）。
+  defaultSite: () => request('GET', `${API_BASE}/system/default-site`),
+  defaultSiteApply: () => request('POST', `${API_BASE}/system/default-site/apply`, {}),
 
   // ---- Docker ----
   //
