@@ -58,7 +58,12 @@ func (m *Manager) InstallImageCompressor(ctx context.Context, app App, result *I
 		if result != nil {
 			result.step(ctx, "正在 brew install "+formula+"（原生 arm64 包，不需要 Docker/Node）")
 		}
-		if _, err := m.brewRun(ctx, 30*time.Minute, "install", formula); err != nil {
+		// 必须走 brewInstall（**多源兜底**）而不是 brewRun：
+		// brewRun 只用"当前镜像"这一个源，而镜像站经常缺某个瓶文件
+		//（2026-09-18 实测：aliyun 镜像上 gcc-16.2.0.arm64_sequoia.bottle.1.tar.gz 是 404，
+		//  而 vips 依赖 gcc 的 OpenMP 运行时 → 单源直接失败）。
+		// brewInstall 会清掉坏缓存并依次换源，最后回落到官方源。
+		if _, err := m.brewInstall(ctx, result, 30*time.Minute, formula); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", formula, err)
 		}
 	}

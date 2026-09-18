@@ -1,7 +1,16 @@
-v1.2.5 · 「编辑配置文件」不再变灰 + 「上传大小 / 执行时间」成为一键功能 + 图片压缩（libvips）上架 + 网站环境状态不再误报"未就绪" + 应用市场不再卡 15 秒 + 文件上传重做（4GiB/进度/上传文件夹）+ 装完自动建默认站点 + phpMyAdmin 413 修复
+v1.2.6 · 宝塔式「Nginx 管理」（性能调整表单）+ 「编辑配置文件」不再变灰 + 「上传大小 / 执行时间」成为一键功能 + 图片压缩（libvips）上架 + 网站环境状态不再误报"未就绪" + 应用市场不再卡 15 秒 + 文件上传重做（4GiB/进度/上传文件夹）+ 装完自动建默认站点 + phpMyAdmin 413 修复
 
 > 这个文件**只放当前这一版的更新说明**：`make release` 会把它整份写进清单，
 > 用户升级时看到的就是它。历史版本说明见 git 历史（`git log RELEASE_NOTES.md`）。
+
+**新增宝塔式的「⚙️ Nginx 管理」**（网站管理工具条，或 nginx 应用的管理面板）。
+四个页签：**服务**（版本/运行状态/站点数，启动·重载·停止·校验）、**配置修改**（打开 nginx.conf 原文）、
+**性能调整**、**错误日志**。性能调整就是那张常用表单：worker_processes、worker_connections、
+keepalive_timeout、gzip（开/关）、gzip_min_length、gzip_comp_level、**client_max_body_size（MB，
+最大上传文件）**、server_names_hash_bucket_size、client_header_buffer_size、client_body_buffer_size。
+保存时会先**备份** nginx.conf（`.zizpanel.bak`），再写盘 → `nginx -t` → 重载；
+**校验不通过会自动回滚**（绝不会留下一个起不来的 nginx）；随后用 `nginx -T`
+**回读真实生效值**告诉你哪一项真的生效了，被别处配置覆盖时也会明确指出来。
 
 **「📝 编辑配置文件」不会再是灰色的了。**
 之前它只在"面板里有这条服务的记录"时才可点 —— 而 nginx / PHP 完全可以

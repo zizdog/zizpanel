@@ -430,6 +430,11 @@ func (s *Server) routes() http.Handler {
 	// ---------- 环境与诊断 ----------
 	root.HandleFunc("POST /api/v1/system/nginx/test", s.requireAuth(s.handleNginxTest))
 	root.HandleFunc("GET /api/v1/system/nginx/status", s.requireAuth(s.handleNginxStatus))
+	// nginx 性能参数（宝塔式「性能调整」表单）：读含"真实生效值回读"，保存走
+	// 备份 → 改写 nginx.conf → nginx -t → 失败回滚 → reload → 回读（见 priv/nginxtuning.go）。
+	root.HandleFunc("GET /api/v1/system/nginx/tuning", s.requireAuth(s.handleNginxTuningGet))
+	root.HandleFunc("POST /api/v1/system/nginx/tuning", s.requireAuth(s.handleNginxTuningSave))
+
 	// 网站环境的**真实运行时**（nginx / PHP / MySQL）：只看运行体证据（进程/端口/socket），
 	// 面板服务记录只回答"归不归面板管"。修的是"nginx 明明在跑却显示未就绪"。
 	root.HandleFunc("GET /api/v1/sites/runtime", s.requireAuth(s.handleSitesRuntime))

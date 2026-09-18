@@ -418,6 +418,10 @@ export const api = {
   nginxTest: () => request('POST', `${API_BASE}/system/nginx/test`, {}),
   nginxStatus: () => request('GET', `${API_BASE}/system/nginx/status`),
   nginxRepair: () => request('POST', `${API_BASE}/system/nginx/repair`, {}),
+  // nginx 性能参数（宝塔式「性能调整」表单）：GET 含**真实生效值回读**（nginx -T），
+  // POST 会备份 → 改写 nginx.conf → nginx -t → 失败自动回滚 → 重载 → 回读生效值。
+  nginxTuning: () => request('GET', `${API_BASE}/system/nginx/tuning`),
+  nginxTuningSave: (values) => request('POST', `${API_BASE}/system/nginx/tuning`, values),
 
   // ---- 图片压缩（应用「图片压缩（libvips）」）----
   // engine：引擎在不在 + 目标目录里有多少张图（只读，不改任何文件）。

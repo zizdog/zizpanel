@@ -268,6 +268,32 @@ func main() {
 			return
 		}
 
+	// ---------------- nginx 性能参数（宝塔式表单的后端）----------------
+	//
+	// 只接受**结构化 JSON**参数（不是 shell 字符串），取值范围在 priv 里再校验一次：
+	// 面板被绕过也改不出一个让 nginx 起不来的配置。
+	case "nginx-tuning-read":
+		emit(result{OK: true, Data: priv.NginxTuningRead()})
+		return
+
+	case "nginx-tuning-write":
+		fs := flag.NewFlagSet("nginx-tuning-write", flag.ContinueOnError)
+		values := fs.String("values", "", "JSON 形式的参数")
+		if perr := fs.Parse(rest); perr != nil {
+			err = perr
+			break
+		}
+		var v priv.NginxTuning
+		if v, err = priv.TuningDecode(*values); err != nil {
+			break
+		}
+		var res priv.NginxTuningReadResult
+		if res, err = priv.NginxTuningWrite(v); err != nil {
+			break
+		}
+		emit(result{OK: true, Msg: "已写入并重载", Data: res})
+		return
+
 	// ---------------- 站点证书 ----------------
 	case "site-cert-self":
 		fs := flag.NewFlagSet("site-cert-self", flag.ContinueOnError)

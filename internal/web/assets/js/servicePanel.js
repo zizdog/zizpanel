@@ -50,6 +50,7 @@ import {
 // 「上传大小 / 执行时间」编辑器在 views.js 里（与「面板设置」共用同一份实现 ——
 // 用户 2026-09-18 要求这类常用更改必须是功能，而不是让用户去编辑配置原文件）。
 import { uploadLimitsModal } from './views.js';
+import { nginxPanelModal } from './nginxpanel.js';
 
 // PANEL_QUERY_TIMEOUT_MS 是面板首屏查询的**硬上限**。
 //
@@ -1028,6 +1029,14 @@ export async function openServicePanel(o = {}) {
     //       · 一次能传多大（client_max_body_size / upload_max_filesize / post_max_size）
     //       · 脚本能跑多久（max_execution_time）
     //     这里给一颗直达按钮，打开的是**与面板设置同一份**的编辑器（不复制实现）。
+    // nginx 专属：宝塔式的「Nginx 管理」（性能调整表单就在这里）。
+    if (isNginxApp(mi)) {
+      out.push(h('button.btn.btn-sm', {
+        text: '⚙️ Nginx 管理',
+        title: '打开 nginx 管理面板：服务状态、性能参数（含最大上传大小）、配置文件、错误日志',
+        onclick: () => nginxPanelModal(),
+      }));
+    }
     if (isLimitTunable(mi)) {
       out.push(h('button.btn.btn-sm', {
         text: '⚡ 上传大小 / 执行时间',
@@ -1590,6 +1599,14 @@ function dependentsModal({ name, plan, onDone, onForce = null, forceText = '' })
 // 判据来自**目录数据**（id / brew_formula / service_label / name），不写死某一台机器
 // 上的条目名：nginx 的请求体上限、PHP 的上传与执行上限都在它们的配置里。
 // 其它应用（frpc / miniflux…）没有这两组上限，给了按钮只会让人困惑。
+// isNginxApp 判断是不是 nginx 条目（判据来自目录数据，不写死名字）。
+export function isNginxApp(mi) {
+  if (!mi) return false;
+  const hay = [mi.id, mi.brew_formula, mi.service_label, mi.name]
+    .map((x) => String(x || '')).join(' ').toLowerCase();
+  return /(^|[^a-z])nginx([^a-z]|$)/.test(hay);
+}
+
 export function isLimitTunable(mi) {
   if (!mi) return false;
   const hay = [mi.id, mi.brew_formula, mi.service_label, mi.name]

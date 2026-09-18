@@ -27,6 +27,8 @@ import { configFileModal } from './services.js';
 // 「上传大小 / 执行时间」：与「面板设置」共用同一份实现（用户要求这类常用更改
 // 必须是功能，而不是让用户去改配置原文件）。
 import { uploadLimitsModal } from './views.js';
+// 宝塔式「Nginx 管理」（服务 / 配置修改 / 性能调整 / 错误日志）。
+import { nginxPanelModal } from './nginxpanel.js';
 
 let cache = null; // 站点列表数据（含预设与 PHP 版本）
 
@@ -1095,6 +1097,12 @@ export function SitesView(content, ctx = {}) {
       }),
       // 紧挨「PHP 环境」右侧：nginx 的真实运行状态（只读药丸，不是可点的假按钮）。
       nginxPill(),
+      // ⚙️ Nginx 管理：宝塔式的四页签（服务 / 配置修改 / 性能调整 / 错误日志）。
+      h('button.btn.btn-sm', {
+        text: '⚙️ Nginx 管理',
+        title: 'nginx 的运行状态、性能参数（worker_processes / 连接数 / gzip / 最大上传大小…）、配置文件与错误日志',
+        onclick: () => nginxPanelModal(),
+      }),
       // ⚡ 常用设置：一次能传多大 / 脚本能跑多久。这是用户最常改的东西，
       // 所以放在「配置文件」**前面**并且是功能按钮（不用去改配置文件）。
       h('button.btn.btn-sm', {
