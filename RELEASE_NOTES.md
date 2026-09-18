@@ -3,6 +3,18 @@ v1.3.4 · 启动自愈全局 client_max_body_size（brew 重装/升级 nginx 还
 > 这个文件**只放当前这一版的更新说明**：`make release` 会把它整份写进清单，
 > 用户升级时看到的就是它。历史版本说明见 git 历史（`git log RELEASE_NOTES.md`）。
 
+**新建数据库账号默认带上"建表"权限（这是你 `#1142 CREATE command denied` 的真根因）。**
+以前"新建数据库账号"的权限默认只勾 `SELECT/INSERT/UPDATE/DELETE` —— 按默认建出来的账号
+**能读写却建不了表**，用它导入任何 `.sql` 备份都会报 `#1142 CREATE command denied`
+（备份里全是 `CREATE TABLE`）。现在默认**全选**（含 CREATE/ALTER/DROP/INDEX），
+取消勾选时当场提示"这个账号将无法导入 .sql 备份"。
+
+**nginx 运行时目录（请求体临时目录）自愈。**
+超过内存缓冲（默认 8k）的请求体会被 nginx 落盘到 `<brew>/var/run/nginx/client_body_temp`；
+真机上这个目录可能是 `nobody:admin 0700`，而 worker 跑在**另一个用户**下 ——
+于是**GET 一切正常、一上传/一导入就 500 或卡死**（登录、翻页没有请求体，所以看不出问题）。
+现在面板启动时会读 nginx.conf 的 `user` 指令，把运行时目录按真实 worker 用户建好并改属主。
+
 **"重装 nginx 之后导入就卡死"这一类，从此不可能再发生。**
 `brew reinstall/upgrade nginx` 会把 `nginx.conf` 还原成 brew 出厂版 —— 面板加进去的
 `include .../vhosts/*.conf;` 与**全局 `client_max_body_size`** 会一起消失；后者消失后

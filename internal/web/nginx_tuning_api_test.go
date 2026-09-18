@@ -1,6 +1,8 @@
 package web
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -120,5 +122,32 @@ func TestNginxTestSurfacesRawOutput(t *testing.T) {
 	}
 	if !strings.Contains(combined, "配置检查未通过") {
 		t.Fatal("合成后的输出也要保留摘要（用户一眼看到结论）")
+	}
+}
+
+// TestNginxWorkerUserParsing：从 nginx.conf 读 worker 用户（自愈运行时目录要用它）。
+//
+// 2026-09-18 mini 真机：`<brew>/var/run/nginx/client_body_temp` 是 `nobody 0700`，
+// 而 nginx worker 可能跑在另一个用户下 → **任何带请求体的请求**（上传/导入）都写不进去，
+// 表现是"GET 一切正常、一导入就 500/卡死"。判据必须来自 nginx.conf 的 `user` 指令。
+func TestNginxWorkerUserParsing(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct{ name, body, want string }{
+		{"显式指定", "user  zizdog staff;\nevents {}\n", "zizdog"},
+		{"注释掉", "#user  nobody;\nevents {}\n", ""},
+		{"没有该指令（brew 出厂版）", "worker_processes auto;\nevents {}\n", ""},
+		{"行内注释", "user nobody; # 默认\n", "nobody"},
+	}
+	for _, c := range cases {
+		p := filepath.Join(dir, c.name+".conf")
+		if err := os.WriteFile(p, []byte(c.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := nginxWorkerUserFromConf(p); got != c.want {
+			t.Errorf("%s：解析 worker 用户应为 %q，实际 %q", c.name, c.want, got)
+		}
+	}
+	if got := nginxWorkerUserFromConf(filepath.Join(dir, "不存在.conf")); got != "" {
+		t.Errorf("读不到配置时应返回空（调用方回落 nobody），实际 %q", got)
 	}
 }

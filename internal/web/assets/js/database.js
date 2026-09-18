@@ -554,12 +554,25 @@ export function DatabaseView(content, ctx = {}) {
     const allDBs = h('input', { type: 'checkbox', onchange: (e) => { dbSelect.disabled = e.target.checked; } });
     const privBoxes = {};
     const privList = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'INDEX'];
+    // 默认**全选**：以前默认只勾 SELECT/INSERT/UPDATE/DELETE，于是按默认建出来的账号
+    // 能读写却不能建表 —— 用它导入任何 `.sql` 备份都会得到
+    // `#1142 CREATE command denied`（2026-09-18 用户报障："新建用户选择数据库，
+    // 结果没有权限"）。导入备份是账号最常见的用途，默认值必须能用。
     const privRow = h('div', { style: { display: 'flex', gap: '12px', flexWrap: 'wrap' } },
       privList.map((p) => {
-        const cb = h('input', { type: 'checkbox', checked: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'].includes(p) });
+        const cb = h('input', { type: 'checkbox', checked: true });
         privBoxes[p] = cb;
         return h('label', { style: { display: 'flex', gap: '5px', alignItems: 'center', fontSize: '12.5px' } }, [cb, h('span', { text: p })]);
       }));
+    // 取消勾选「建表相关」权限时，**当场**把后果说清楚（不要等用户导入时才撞 #1142）。
+    const privWarn = h('div.hint', { style: { color: 'var(--warn)' }, text: '' });
+    const refreshPrivWarn = () => {
+      const missing = ['CREATE', 'ALTER', 'DROP', 'INDEX'].filter((k) => privBoxes[k] && !privBoxes[k].checked);
+      privWarn.textContent = missing.length
+        ? '⚠️ 不含 ' + missing.join('/') + '：这个账号**无法导入 .sql 备份**（备份里有建表/改表语句），也建不了表'
+        : '';
+    };
+    Object.values(privBoxes).forEach((cb) => cb.addEventListener('change', refreshPrivWarn));
 
     // 创建按钮先建出来：失败/部分失败时要能禁用它，避免用户重复点导致重复建号。
     const createBtn = h('button.btn.btn-primary', {
@@ -591,6 +604,7 @@ export function DatabaseView(content, ctx = {}) {
       },
     });
 
+    refreshPrivWarn();
     const m = modal({
       title: '新建数据库账号',
       wide: true,

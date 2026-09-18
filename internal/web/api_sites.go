@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	userpkg "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/priv"
@@ -1802,6 +1804,7 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 	// "文件在、服务在、就是不生效"——4MB 的 SQL 导入直接被 nginx 以 1m 拒掉，
 	// 用户看到的是"phpMyAdmin 导入失败/卡住"，而面板里怎么看都正常。
 	s.ensureGlobalBodySize(ctx)
+	s.ensureNginxRuntimeDirs()
 }
 
 // ensureGlobalBodySize 确保 nginx.conf 的 http 块里有面板配置的全局请求体上限。
@@ -1845,6 +1848,92 @@ func (s *Server) ensureGlobalBodySize(ctx context.Context) {
 	}
 	s.Log.Info("已把全局 client_max_body_size 自愈为 %s（原来 %q —— 常见于 brew 重装/升级 nginx 还原了 nginx.conf）",
 		want, cur)
+}
+
+// ensureNginxRuntimeDirs 确保 nginx 的**运行时目录**存在、且属于它真正的 worker 用户。
+//
+// 为什么必须自愈（2026-09-18 mini 真机，用户报"phpMyAdmin 导入 4MB 的 SQL 一直卡死、
+// 400/500 都出现过"）：nginx 要把超过内存缓冲（默认 8k）的**请求体**落盘到
+// `<brew>/var/run/nginx/client_body_temp`。真机上那个目录是 `nobody:admin 0700`，
+// 而 nginx worker 跑在**另一个用户**下 → 任何带请求体的请求（上传、导入）都写不进去：
+// 表现就是"GET 一切正常、一上传就 500/卡死"（登录、翻页都没问题，因为它们没有请求体）。
+// 目录属主/权限是 brew 安装/升级时定的，面板不能假设它一定对。
+func (s *Server) ensureNginxRuntimeDirs() {
+	if os.Geteuid() != 0 {
+		return
+	}
+	worker := nginxWorkerUserFromConf(s.Cfg.NginxConf)
+	if worker == "" {
+		worker = "nobody"
+	}
+	base := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx")
+	for _, sub := range []string{"", "client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"} {
+		dir := filepath.Join(base, sub)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			s.Log.Warn("创建 nginx 运行时目录 %s 失败：%v", dir, err)
+			continue
+		}
+		if changed, err := chownToUser(dir, worker); err != nil {
+			s.Log.Warn("调整 %s 属主为 %s 失败（上传/导入可能仍失败）：%v", dir, worker, err)
+		} else if changed {
+			s.Log.Info("已把 nginx 运行时目录 %s 的属主改为 %s（否则带请求体的请求会写不进去：上传/导入 500 或卡住）",
+				dir, worker)
+		}
+	}
+}
+
+// nginxWorkerUserFromConf 从 nginx.conf 读 `user` 指令（worker 以谁的身份跑）。
+//
+// 读不到（注释掉/没写）时返回空 —— 调用方回落到 nginx 的编译默认 nobody。
+func nginxWorkerUserFromConf(confPath string) string {
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		return ""
+	}
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "user") {
+			continue
+		}
+		// 去掉行内注释后再取第二个词：`user nobody; # 默认` 这种写法很常见。
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		f := strings.Fields(strings.TrimSuffix(strings.TrimSpace(line), ";"))
+		if len(f) >= 2 {
+			return f[1]
+		}
+	}
+	return ""
+}
+
+// chownToUser 把路径属主改成指定用户（同属主时返回 changed=false）。用户不存在返回错误。
+func chownToUser(path, user string) (changed bool, err error) {
+	u, lerr := userpkg.Lookup(user)
+	if lerr != nil {
+		return false, lerr
+	}
+	uid, aerr := strconv.Atoi(u.Uid)
+	gid, berr := strconv.Atoi(u.Gid)
+	if aerr != nil || berr != nil {
+		return false, fmt.Errorf("解析用户 %s 的 uid/gid 失败", user)
+	}
+	st, serr := os.Stat(path)
+	if serr != nil {
+		return false, serr
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		if int(sys.Uid) == uid && int(sys.Gid) == gid {
+			return false, nil
+		}
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // checkProxyAgainstSiteVhosts 检查一条反代规则是否与 vhosts 目录里已有文件
