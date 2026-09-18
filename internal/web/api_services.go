@@ -41,6 +41,34 @@ func (s *Server) detectDocker() (string, string) {
 	return services.DetectDocker("", s.Cfg.UserHome)
 }
 
+// dockerRuntimeStatus 探测容器运行时（Colima）的**真实**状态。
+//
+// 这是"已安装"判据的唯一入口（见 handleMarketList 的说明）：不看残留 plist、
+// 不看残留记录，只看 colima 二进制在不在、socket 能不能连（只读探测，
+// 不起容器、不跑 colima 命令）。单测通过 dockerRuntimeProbeOverride 注入结论。
+func (s *Server) dockerRuntimeStatus(ctx context.Context) services.DockerRuntimeState {
+	if s.dockerRuntimeProbeOverride != nil { // 单测注入点，见 server.go 的字段说明
+		return s.dockerRuntimeProbeOverride(ctx)
+	}
+	// 刻意**不**走 svcManager()：那个会 ReconcilePaths（写配置）并再探一次
+	// docker socket（一次 HTTP 往返）。这里只要一个轻量 Manager，
+	// 探测本身只 stat 文件 + 一次本地 socket 连接，可以每次请求都做。
+	// DockerSocket 用 cachedDocker 的结果（市场缓存，5 秒负缓存），
+	// 找不到就退回配置里那条路径。
+	sock, _ := s.cachedDocker()
+	if sock == "" {
+		sock = s.Cfg.DockerSocket
+	}
+	mgr := services.NewManager(s.serviceRepo, services.Options{
+		BrewBin:      s.Cfg.BrewBin,
+		DockerSocket: sock,
+		UserHome:     s.Cfg.UserHome,
+		UserName:     s.Cfg.User,
+		WorkDir:      s.Cfg.WorkDir,
+	})
+	return mgr.DockerRuntimeStatus(ctx)
+}
+
 // svcManager 构造服务管理器。
 func (s *Server) svcManager() *services.Manager {
 	if s.svcManagerOverride != nil { // 单测注入点，见 server.go 的字段说明
@@ -595,7 +623,7 @@ func uninstallFailure(err error, name string) error {
 		return err
 	}
 	return fmt.Errorf("%w（说明：本机没有可用的容器运行时，本次没有停止任何容器、"+
-		"系统上的服务一点没动；如果你只是想清掉面板里的这条记录，请用「取消纳管」——"+
+		"系统上的服务一点没动；如果你只是想清掉面板里的这条记录，请用「从列表移除」——"+
 		"DELETE /api/v1/services/%s 只删记录、不需要 Docker）", err, name)
 }
 
@@ -717,6 +745,12 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		ComposeEnvURL string `json:"compose_env_url,omitempty"`
 		// ComposeReadmeURL 是全部推荐项目的总索引（镜像站 /compose/README.md）。
 		ComposeReadmeURL string `json:"compose_readme_url,omitempty"`
+
+		// DockerRuntime 只对容器运行时条目出现：一次**真实探测**的原始结论
+		// （二进制在不在 / socket 在不在且能不能连 / 三态 / 有没有残留）。
+		// 前端据此区分"没装 → 一键安装"与"装了没跑 → 启动"，而不是靠猜；
+		// 也给界面一个如实的探测结果显示（socket 路径、引擎版本、VM 状态）。
+		DockerRuntime *services.DockerRuntimeState `json:"docker_runtime,omitempty"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -746,7 +780,16 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// 面板自研安装器部署的系统级服务：/Library/LaunchDaemons 下有 plist 也算
-		if !isInstalled {
+		//
+		// ⚠️ **容器运行时是唯一例外**（2026-09-19 用户实测）：colima 的运行体是
+		// 一个虚拟机和它的 docker socket，而 plist 只是"开机把 VM 拉起来"的
+		// 一次性作业。旧版卸载/换机留下 zombie plist 时，这台机器上
+		// colima 二进制没有、~/.colima 不存在、socket 也不存在，市场却显示
+		// 「Colima 已安装·未纳管」—— 用户既看不到安装入口，也点不出引擎。
+		// 所以这一类的"已安装"必须看现实（见下面的 dockerRuntime），
+		// 不再用 plist 判定；nginx/PHP/MySQL 那些包在磁盘上的应用保持原判据不变。
+		isDockerRuntime := a.PanelInstaller == "docker-runtime" || a.Kind == services.KindColima
+		if !isInstalled && !isDockerRuntime {
 			for _, l := range cand {
 				if l == "" {
 					continue
@@ -760,6 +803,23 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if !isInstalled && a.BrewFormula != "" {
 			isInstalled = brewSet[a.BrewFormula]
 		}
+		// 容器运行时：**已安装必须看现实**，不看任何残留文件（见上面的长注释）。
+		//
+		// 关键点：这一段的结论会**覆盖**前面的 brew / 面板记录判据 ——
+		// 因为用户看到的正是"记录在、plist 在、二进制不在"。brewSet 命中也救不了
+		// 僵尸态（colima 已被 brew 卸掉，只是 plist 忘了清）。
+		// 探测结论同时原样带给前端（DockerRuntime），Docker 版块据此决定是显示
+		// 「一键安装」还是「启动」。
+		var dockerRuntime *services.DockerRuntimeState
+		dockerNote := ""
+		if isDockerRuntime {
+			rt := s.dockerRuntimeStatus(ctx)
+			dockerRuntime = &rt
+			isInstalled = rt.BinaryInstalled
+			if rt.State == services.DockerRuntimeStopped {
+				dockerNote = "已安装但引擎没在运行（可在 Docker 页点启动）"
+			}
+		}
 		// 面板自研安装器：磁盘上有产物**不等于已安装**。
 		//
 		// 2026-09-16 用户反馈：卸载时没勾「同时删除数据/产物」（或手动删了服务、
@@ -771,6 +831,13 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		artifacts := false
 		if a.PanelInstaller != "" {
 			artifacts = services.InstallerArtifactExists(s.Cfg.UserHome, a.PanelInstaller)
+		}
+		// 容器运行时的残留判据是它**自己的**（僵尸 plist / ~/.colima 配置目录），
+		// InstallerArtifactExists 那张表里没有 docker-runtime，不会命中。
+		// 不补这一条，用户现场那份僵尸 plist 就既不算"已安装"也不报残留 ——
+		// 卡片变成干净的"未安装"，用户不知道磁盘上还有上一轮的东西。
+		if !artifacts && dockerRuntime != nil {
+			artifacts = dockerRuntime.Artifacts
 		}
 		// 旧版**原生安装**的残留：应用从注册表里拿掉（如 Lucky 改成 Docker 版）之后，
 		// 家目录下那份安装还在。不报出来的话卡片显示"未安装"却没有任何清理入口 ——
@@ -835,7 +902,13 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			PortURL: portURL, ProxyURL: proxyURL,
-			Uninstall: s.svcManager().PlanUninstallFor(ctx, a, rec)}
+			DockerRuntime: dockerRuntime,
+			Uninstall:     s.svcManager().PlanUninstallFor(ctx, a, rec)}
+		if dockerNote != "" {
+			// 只有"装了但引擎没跑"才写这句；"没装"由前端按状态给一键安装，
+			// 不需要这里再重复（重复的文案会盖掉更精确的提示）。
+			it.Note = dockerNote
+		}
 		if a.DockerReference {
 			// 推荐项目的稳定契约：标记 + compose 内容（App.ComposeYAML → compose_yaml）
 			// + 镜像站地址。front 端据此把卡片放进 docker Tab 并隐藏安装按钮。
@@ -950,7 +1023,7 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 		msg := plan.Blocked
 		if msg == "" {
 			msg = "「" + app.Name + "」不能从这里卸载（面板不会卸载你自己安装的软件；" +
-				"如只想从列表移除，请用「取消纳管」）"
+				"如只想从列表移除，请用「从列表移除（不卸载软件）」）"
 		}
 		fail(w, http.StatusBadRequest, msg)
 	}
@@ -1059,7 +1132,8 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if app.AdoptLabel != "" {
-		fail(w, http.StatusBadRequest, "「"+app.Name+"」是纳管类应用，请用「纳管」而不是安装")
+		// 用户可见文案里不出现"纳管"（那是面板的内部概念，用户 2026-09-19 要求弱化）。
+		fail(w, http.StatusBadRequest, "「"+app.Name+"」只需要把它加入面板（不重新安装）：请在卡片上点「添加到面板」")
 		return
 	}
 	s.launchTask(w, r, "install", id, "安装 "+app.Name,
@@ -1394,7 +1468,7 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 		for _, e := range list {
 			if e.LaunchLabel == req.Label {
 				fail(w, http.StatusConflict,
-					"该服务已经纳管过了（记录名："+e.DisplayName+"），无需重复纳管")
+					"该服务已经在面板里了（记录名："+e.DisplayName+"），无需重复添加")
 				return
 			}
 		}

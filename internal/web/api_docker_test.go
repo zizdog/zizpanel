@@ -230,6 +230,16 @@ func newDockerTestServer(t *testing.T, sock string) (*httptest.Server, []*http.C
 // newDockerTestServerWithSrv 与 newDockerTestServer 相同，但把 *Server 也返回，
 // 给需要直接访问任务中心（srv.Tasks）的测试用。
 func newDockerTestServerWithSrv(t *testing.T, sock string) (*Server, *httptest.Server, []*http.Cookie) {
+	return newDockerTestServerFull(t, sock, nil)
+}
+
+// newDockerTestServerFull 接受一个容器运行时状态探测的**注入实现**。
+//
+// 为什么必须能注入：市场卡片对 docker-runtime 的"已安装"判据是真实探测
+// （看 PATH 上有没有 colima、连一次本机 docker socket），结论会随开发机装没装
+// Colima 而变 —— 那正是"单测不许碰真实服务"禁止的。更重要的是要能造出
+// 用户实测的那个现场并把它钉死（见 TestMarketZombieColimaPlistNotInstalled）。
+func newDockerTestServerFull(t *testing.T, sock string, runtimeProbe func(context.Context) services.DockerRuntimeState) (*Server, *httptest.Server, []*http.Cookie) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
@@ -250,6 +260,16 @@ func newDockerTestServerWithSrv(t *testing.T, sock string) (*Server, *httptest.S
 	cfg.UserHome = dir + "/home"
 	cfg.WWWRoot = cfg.UserHome + "/www"
 	cfg.LogRoot = cfg.WWWRoot + "/_logs"
+	// 系统级 LaunchDaemons 目录必须沙箱化（与 newTestServer 同样的理由）：
+	// 容器运行时的"残留识别"会 stat com.zizdog.colima.plist，而单测**绝不能**
+	// 去读写真实 /Library/LaunchDaemons —— 第一次写这条测试时就撞上了
+	// "permission denied"，说明它真的碰到了系统目录。
+	prevLaunchDaemonsDir := launchDaemonsDir
+	launchDaemonsDir = dir + "/LaunchDaemons"
+	if err := os.MkdirAll(launchDaemonsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { launchDaemonsDir = prevLaunchDaemonsDir })
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +288,7 @@ func newDockerTestServerWithSrv(t *testing.T, sock string) (*Server, *httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
+	srv.dockerRuntimeProbeOverride = runtimeProbe
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 
@@ -872,5 +893,163 @@ func TestHealthReturnsPlainVersionForWatchdog(t *testing.T) {
 	// 必须是精确的 version.Version，而不是别的形式
 	if got != version.Version {
 		t.Errorf("健康检查的 version 应为纯版本号 %q，实际 %q", version.Version, got)
+	}
+}
+
+// ============================================================================
+//  容器运行时状态：市场卡片与 Docker 版块（2026-09-19 用户实测的两个问题）
+//
+//  问题 1：本机没有 colima（~/.colima 不存在、which colima 为空、
+//          /var/run/docker.sock 不存在），只有旧版安装留下的僵尸 plist
+//          /Library/LaunchDaemons/com.zizdog.colima.plist，
+//          市场却显示「Colima 已安装·未纳管」。
+//  问题 2：Docker 版块在没有运行时只给「去应用市场 / 去服务管理」两个指路按钮，
+//          而服务管理早已合并进应用市场 —— 用户找不到 Docker。
+//
+//  下面把这两条钉死：僵尸 plist ≠ 已安装；market 的 docker-runtime 条目必须
+//  带**真实探测结论**（前端据此给「一键安装」）。
+// ============================================================================
+
+// zombieColimaRuntimeState 复刻用户实测的现场结论：二进制不在、socket 不在、
+// 只有上一轮留下的 plist。
+func zombieColimaRuntimeState(context.Context) services.DockerRuntimeState {
+	return services.DockerRuntimeState{
+		BinaryInstalled: false,
+		State:           services.DockerRuntimeNotInstalled,
+		PlistExists:     true,
+		Artifacts:       true,
+		VMState:         "未创建虚拟机实例",
+		Note:            "未安装 Docker 运行时（Colima）；检测到上一次安装的残留（开机自启配置或配置目录），可重新安装覆盖",
+	}
+}
+
+// TestMarketZombieColimaPlistNotInstalled 是用户那条假"已安装"的端到端回归。
+//
+// 关键断言：
+//
+//	· installed=false —— 僵尸 plist 绝不能算已安装（否则卡片没有安装入口）；
+//	· artifacts=true  —— 残留要如实报出来，界面才好给「重新安装 / 清理残留」；
+//	· docker_runtime.state=not-installed —— 前端据此给「🐳 一键安装 Docker」；
+//	· note 里不能再说"已安装"。
+func TestMarketZombieColimaPlistNotInstalled(t *testing.T) {
+	srv, ts, cookies := newDockerTestServerFull(t, "", zombieColimaRuntimeState)
+
+	// 真机现场：旧版留下的僵尸 plist（测试里 launchDaemonsDir 已被沙箱化，
+	// 见 server_test.go —— 单测绝不碰真实 /Library/LaunchDaemons）。
+	plist := filepath.Join(launchDaemonsDir, services.ColimaLaunchLabel+".plist")
+	if err := os.WriteFile(plist, []byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = srv
+
+	it := marketItem(t, ts, cookies, "docker-runtime")
+	if it["installed"] != false {
+		t.Fatalf("只有僵尸 plist、colima 二进制不在时，installed 必须是 false —— "+
+			"否则市场卡片停在「已安装」，用户根本找不到安装入口（2026-09-19 用户实测）。实际 %v（note=%v）",
+			it["installed"], it["note"])
+	}
+	if it["artifacts"] != true {
+		t.Errorf("残留的 plist 要如实报成 artifacts=true（界面据此给「重新安装 / 清理残留」），实际 %v", it["artifacts"])
+	}
+	rt, _ := it["docker_runtime"].(map[string]any)
+	if rt == nil {
+		t.Fatal("docker-runtime 条目必须带 docker_runtime 真实探测结论（前端据此区分安装/启动）")
+	}
+	if got := asString(rt["state"]); got != services.DockerRuntimeNotInstalled {
+		t.Errorf("docker_runtime.state 应为 %q，实际 %q", services.DockerRuntimeNotInstalled, got)
+	}
+	if rt["binary_installed"] != false {
+		t.Errorf("binary_installed 应为 false，实际 %v", rt["binary_installed"])
+	}
+	if rt["plist_exists"] != true {
+		t.Errorf("plist_exists 要如实报 true（残留识别就靠它），实际 %v", rt["plist_exists"])
+	}
+	if strings.Contains(asString(it["note"]), "已安装") {
+		t.Errorf("没装就不能在 note 里说已安装，实际 %q", asString(it["note"]))
+	}
+}
+
+// TestMarketColimaInstalledButEngineStopped 覆盖第二态：
+// 装了 colima 但引擎没在跑 → installed=true（二进制在），note 如实写清"引擎没在运行"。
+//
+// 这一条是"不许把停止态谎报成运行态"的接口层保证：卡片可以显示已安装，
+// 但必须告诉用户引擎没起来、并能从这里启动。
+func TestMarketColimaInstalledButEngineStopped(t *testing.T) {
+	probe := func(context.Context) services.DockerRuntimeState {
+		return services.DockerRuntimeState{
+			BinaryInstalled: true,
+			BinPath:         "/opt/homebrew/bin/colima",
+			State:           services.DockerRuntimeStopped,
+			VMState:         "虚拟机未运行（实例 colima）",
+			Note:            "已安装但引擎没在运行（可在 Docker 页点启动）",
+		}
+	}
+	_, ts, cookies := newDockerTestServerFull(t, "", probe)
+
+	it := marketItem(t, ts, cookies, "docker-runtime")
+	if it["installed"] != true {
+		t.Errorf("二进制在时应报已安装，实际 %v", it["installed"])
+	}
+	if got := asString(it["note"]); !strings.Contains(got, "没在运行") {
+		t.Errorf("装了但引擎没跑时 note 必须如实写清（用户在卡片上要看到），实际 %q", got)
+	}
+	rt, _ := it["docker_runtime"].(map[string]any)
+	if asString(rt["state"]) != services.DockerRuntimeStopped {
+		t.Errorf("state 应为 %q，实际 %v", services.DockerRuntimeStopped, rt["state"])
+	}
+}
+
+// TestDockerInfoExposesRuntimeState 锁住 Docker 版块首屏需要的契约。
+//
+// 前端 renderUnavailable 靠 info.runtime 区分三态：
+//
+//	· binary_installed=false → 「🐳 一键安装 Docker（Colima）」
+//	· binary_installed=true  → 「▶ 启动 Docker 运行时」
+//
+// 少了这些字段，用户又只能看到"去别处装"的指路文案（用户实测的痛点）。
+func TestDockerInfoExposesRuntimeState(t *testing.T) {
+	_, ts, cookies := newDockerTestServerFull(t, "", zombieColimaRuntimeState)
+
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/docker/info", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("info 应 200，实际 %d", res.StatusCode)
+	}
+	data, _ := out["data"].(map[string]any)
+	if data["available"] != false {
+		t.Errorf("没有引擎时 available 应为 false，实际 %v", data["available"])
+	}
+	rt, _ := data["runtime"].(map[string]any)
+	if rt == nil {
+		t.Fatal("info 必须带 runtime 真实探测结论（前端据此决定显示「一键安装」还是「启动」）")
+	}
+	if rt["binary_installed"] != false || asString(rt["state"]) != services.DockerRuntimeNotInstalled {
+		t.Errorf("runtime 探测结论不对: %v", rt)
+	}
+	if got := asString(data["runtime_app_id"]); got != "docker-runtime" {
+		t.Errorf("runtime_app_id 应为 docker-runtime（前端拿它提交安装任务），实际 %q", got)
+	}
+}
+
+// TestDockerRuntimeInstallEndpointExists 锁住"一键安装"的落点。
+//
+// 用户要求 Docker 版块直接给「一键安装 docker」，而不是指路到应用市场 ——
+// 所以前端点的那个接口（POST /api/v1/market/docker-runtime/install）必须存在、
+// 必须走任务中心（202 + task_id），而不是同步挂在那里。
+// 这里不断言安装成功（测试机没有 Homebrew，装了就是真的动了系统），
+// 只断言"提交成功并给出可查询的任务"——失败会如实落在任务结果里。
+func TestDockerRuntimeInstallEndpointExists(t *testing.T) {
+	srv, ts, cookies := newDockerTestServerFull(t, "", zombieColimaRuntimeState)
+
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/market/docker-runtime/install", nil, cookies)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("一键安装必须立刻 202（长任务，走任务中心），实际 %d: %v", res.StatusCode, out)
+	}
+	data, _ := out["data"].(map[string]any)
+	id := asString(data["task_id"])
+	if id == "" {
+		t.Fatalf("202 响应里必须有 task_id，实际 %v", out)
+	}
+	if task := srv.Tasks.Get(id); task == nil {
+		t.Fatal("任务中心里必须能查到刚提交的安装任务")
 	}
 }

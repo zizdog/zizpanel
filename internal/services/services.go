@@ -253,6 +253,18 @@ type Manager struct {
 	// brewCacheRemoveOverride 仅供测试：替换"以真实用户身份删除缓存条目"的动作。
 	// 没有它，测删除路径要么真的删文件、要么真的起 sudo。
 	brewCacheRemoveOverride func(ctx context.Context, paths []string) error
+	// dockerBinProbeOverride 仅供测试：替换"colima 二进制在不在"的探测。
+	//
+	// 没有它，DockerRuntimeStatus 的单测结论会随开发机装没装 colima 而变
+	// （开发机装了、CI 没装，"没装"那条分支就永远测不到）——
+	// 这正是"单测不许碰真实环境"要排除的（AGENTS.md 第三节）。
+	// 注入的函数返回 ("", error) 表示没装，返回 ("/path/colima", nil) 表示装了。
+	dockerBinProbeOverride func(command string) (string, error)
+	// dockerVersionOverride 仅供测试：替换"连一次 Docker API 问引擎版本"的动作。
+	//
+	// 没有它，单测要么真去连开发机上的 Docker（如果恰好装了，结论随机器变），
+	// 要么只能测到"连不上"一态；返回非空字符串 = 引擎在跑，返回 "" = 连不上。
+	dockerVersionOverride func(ctx context.Context, sock string) string
 }
 
 // Options 是管理器需要的环境信息。
@@ -557,7 +569,7 @@ func (m *Manager) Uninstall(ctx context.Context, name string) error {
 	}
 	if !s.Managed {
 		return fmt.Errorf("「%s」是纳管服务（由你自己安装），面板不会卸载它。"+
-			"如需停止请用「停止」，如需从列表移除请用「取消纳管」", s.DisplayName)
+			"如需停止请用「停止」，如需从列表移除请用「从列表移除（不卸载软件）」", s.DisplayName)
 	}
 	if err := drv.Uninstall(ctx); err != nil {
 		return err

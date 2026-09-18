@@ -1220,11 +1220,14 @@ try {
   //
   // 用户真机：删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，点卸载报
   // "未找到 docker compose 命令" → 记录永远删不掉。这条断言**全部走桩**：
-  //   ① 记录带 driver_error（运行时不可用）→ 面板里必须出现「取消纳管（仅删除记录）」；
-  //   ② 点「卸载」→ 桩 500 → 必须弹出一个带「只删除记录」按钮的对话框；
+  //   ① 记录带 driver_error（运行时不可用）→ 面板里必须出现「从列表移除（不停止容器）」；
+  //   ② 点「卸载」→ 桩 500 → 必须弹出一个带「从列表移除」按钮的对话框；
   //   ③ 对话框必须如实说明"未停止容器"；
-  //   ④ 点「只删除记录」→ 必须真的调用 DELETE /services/{name}（只删记录，不碰运行时）。
-  await step('compose 记录运行时不可用：有「取消纳管（仅删除记录）」出口，卸载失败可一键只删记录', async () => {
+  //   ④ 点它 → 必须真的调用 DELETE /services/{name}（只删记录，不碰运行时）。
+  //
+  // 2026-09-21 文案改动同步：「取消纳管（仅删除记录）」→「从列表移除（不停止容器）」
+  // （用户："用户不需要知道什么是纳管"）。**行为与接口一个字没改**，只改用户看到的词。
+  await step('compose 记录运行时不可用：有「从列表移除」出口，卸载失败可一键只删记录', async () => {
     const NAME = 'uitest-compose-gone';
     const LABEL = 'UITEST compose·运行时没了';
     const FAKE = {
@@ -1295,7 +1298,7 @@ try {
       const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
       await card.waitFor({ timeout: 15000 });
       await card.locator('button:has-text("管理")').click();
-      const recordOnly = page.locator('.modal-mask button:has-text("取消纳管（仅删除记录）")').last();
+      const recordOnly = page.locator('.modal-mask button:has-text("从列表移除")').last();
       await recordOnly.waitFor({ timeout: 8000 });
       await shot('31a-compose-record-only-entry');
 
@@ -1305,20 +1308,25 @@ try {
       await confirm.locator('button:has-text("确认卸载")').waitFor({ timeout: 8000 });
       await confirm.locator('button:has-text("确认卸载")').click();
 
-      const fallback = page.locator('.modal-mask', { hasText: '只删除记录' }).last();
+      // 兜底对话框用**标题**定位，不能用 hasText('从列表移除')：
+      // 「应用管理」面板里也有一颗「从列表移除（不停止容器）」按钮，
+      // hasText 会先把面板本身匹配上，waitFor 立刻返回 → 断言读到的是面板文本
+      // （2026-09-21 实测踩到：报"没有如实说明未停止容器"，其实是选错了元素）。
+      const fallback = page.locator('.modal-mask')
+        .filter({ has: page.locator('.modal-head h3', { hasText: '从列表移除 ·' }) }).last();
       await fallback.waitFor({ timeout: 10000 });
       const ftext = await fallback.innerText();
       if (!ftext.includes('未停止容器')) {
         throw new Error('卸载失败对话框没有如实说明"未停止容器"：\n' + ftext.slice(0, 300));
       }
-      if (!ftext.includes('只删除记录')) throw new Error('卸载失败对话框没有「只删除记录」按钮');
+      if (!ftext.includes('从列表移除')) throw new Error('卸载失败对话框没有「从列表移除」按钮');
       await shot('31b-compose-uninstall-failed-fallback');
 
-      // 点「只删除记录」→ 必须真的调用 DELETE /services/{name}
-      await fallback.locator('button:has-text("只删除记录")').last().click();
+      // 点「从列表移除」→ 必须真的调用 DELETE /services/{name}
+      await fallback.locator('button:has-text("从列表移除")').last().click();
       await page.waitForTimeout(1200);
       if (!forgetCalls.includes(`services/${NAME}`)) {
-        throw new Error('点了「只删除记录」但 DELETE /services/{name} 没有发出去：' + JSON.stringify(forgetCalls));
+        throw new Error('点了「从列表移除」但 DELETE /services/{name} 没有发出去：' + JSON.stringify(forgetCalls));
       }
       if (!uninstallCalls.includes(`services/${NAME}/uninstall`)) {
         throw new Error('点「卸载」时 DELETE .../uninstall 没有发出去：' + JSON.stringify(uninstallCalls));
@@ -1332,6 +1340,99 @@ try {
       await shot('31c-compose-record-deleted');
     } finally {
       await closeModals();
+      await page.unroute('**/api/v1/services**');
+      await page.unroute('**/api/v1/market**');
+      await page.unroute('**/api/v1/tasks**');
+      expectHTTPError = false;
+      // 让页面重新拉真实数据，后面步骤不要停在这张桩卡片上
+      await page.click('.nav-item:has-text("仪表盘")');
+      await page.waitForTimeout(700);
+      await page.click('.nav-item:has-text("应用")');
+      await page.waitForTimeout(2200);
+    }
+  });
+
+  // ---------- 本机已有的服务：移除动作必须如实说"不卸载软件"（用户 2026-09-21）----------
+  //
+  // 用户原话："用户不需要知道什么是纳管 … 只要知道自己可以在应用里执行安装、卸载、
+  // 重装这些动作。" 但对**用户自己装的软件**，面板绝不能假装能卸载（后端的
+  // managed=false 语义就是"只删记录"）。这条边界现在靠按钮文案表达：
+  //   · 按钮必须写「从列表移除（不卸载软件）」；
+  //   · 点下去必须弹确认框，并**逐字**说明不会卸载软件本身；
+  //   · 点「取消」不能发出任何 DELETE。
+  // 全部走桩，不碰真实服务。
+  await step('本机已有的服务：移除按钮如实写「不卸载软件」，取消不发请求', async () => {
+    const NAME = 'uitest-adopted-svc';
+    const LABEL = 'UITEST 本机已有·只移除记录';
+    const FAKE = {
+      name: NAME, display_name: LABEL, kind: 'native', managed: false,
+      state: { running: true, status: 'running', detail: 'pid 999' },
+      launch_label: 'com.uitest.adopted', port: 0,
+    };
+    const deletes = [];
+    expectHTTPError = true; // 桩的 404（凭据）是断言对象，不是前端故障
+
+    await page.route('**/api/v1/services**', async (route) => {
+      const req = route.request();
+      const path = req.url().split('/api/v1/')[1].split('?')[0];
+      if (req.method() === 'DELETE' && path === `services/${NAME}`) {
+        deletes.push(path);
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: {} }) });
+      }
+      if (req.method() === 'GET' && (path === 'services' || path === 'services/health')) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [FAKE] } }) });
+      }
+      if (req.method() === 'GET' && path === `services/${NAME}`) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: FAKE }) });
+      }
+      if (req.method() === 'GET' && /credentials$/.test(path)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { credentials: [] } }) });
+      }
+      return route.continue();
+    });
+    await page.route('**/api/v1/market**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, data: { list: [] } }),
+    }));
+    await page.route('**/api/v1/tasks**', (route) => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, data: { tasks: [], lines: [], has_more: false } }),
+    }));
+
+    try {
+      // 制造一次 hash 变化，否则视图不会重新挂载、也就不会用刚注册的桩重拉列表
+      await page.click('.nav-item:has-text("仪表盘")');
+      await page.waitForTimeout(600);
+      await page.click('.nav-item:has-text("应用")');
+      await page.waitForTimeout(2000);
+
+      const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
+      await card.waitFor({ timeout: 15000 });
+      await card.locator('button:has-text("管理")').click();
+      const removeBtn = page.locator('.modal-mask button:has-text("从列表移除（不卸载软件）")').last();
+      await removeBtn.waitFor({ timeout: 8000 });
+      await shot('31d-remove-from-list-entry');
+
+      await removeBtn.click();
+      // 同样按**标题**定位确认框：面板里也有「从列表移除（不卸载软件）」这颗按钮，
+      // 用 hasText 会匹配到面板本身（见上面 compose 那一步的注释）。
+      const confirm = page.locator('.modal-mask')
+        .filter({ has: page.locator('.modal-head h3', { hasText: /^从列表移除$/ }) }).last();
+      await confirm.waitFor({ timeout: 8000 });
+      const ctext = await confirm.innerText();
+      if (!ctext.includes('不会卸载软件本身')) {
+        throw new Error('确认框没有逐字说明"不会卸载软件本身"：\n' + ctext.slice(0, 300));
+      }
+      if (/纳管/.test(ctext)) throw new Error('确认框里仍有内部词"纳管"：\n' + ctext.slice(0, 300));
+      await shot('31e-remove-from-list-confirm');
+
+      // 取消 → 一个请求都不该发出去
+      await confirm.locator('button:has-text("取消")').last().click();
+      await page.waitForTimeout(800);
+      if (deletes.length) {
+        throw new Error('点了「取消」却发出了 DELETE：' + JSON.stringify(deletes));
+      }
+    } finally {
+      await closeAnyModal(page);
       await page.unroute('**/api/v1/services**');
       await page.unroute('**/api/v1/market**');
       await page.unroute('**/api/v1/tasks**');
@@ -1442,22 +1543,36 @@ try {
     await page.waitForTimeout(600);
   });
 
-  await step('扫描可纳管服务', async () => {
+  await step('「扫描可纳管服务」入口已不存在（纳管是面板自己的事）', async () => {
+    // 用户 2026-09-21："扫描可纳管服务和'应该弱化管纳这个概念'是一回事，用户不需要
+    // 知道什么是纳管，不需要知道系统里运行的软件是怎么被面板控制的。"
+    // 所以这一步从"点开扫描弹窗"改成**断言这个入口不存在、页面上也不再出现内部词**：
+    // 面板启动时会自己登记本机已有的已知服务（services.Manager.AutoRegisterKnown）；
+    // 目录之外的第三方服务仍可用工具栏的「+ 注册服务」手工加进来。
+    //
     // 「服务管理」侧栏项在 2026-09-17 已并入「应用」版块；旧的 #/services 会被
     // 别名落到「已安装」Tab。用 goto 而不是点侧栏，是为了任何路由改造都不会
     // 让这一步静默走错页面（原来的选择器等不到元素，报的却是"超时"）。
     await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(1500);
-    await page.click('button:has-text("扫描可纳管服务")');
-    await page.waitForSelector('.modal', { timeout: 10000 });
-    await page.waitForTimeout(2000);
-    await shot('35-adoptable');
-    const body = await page.locator('.modal-body').innerText();
-    // 面板自身与 nginx 必须被排除
-    if (body.includes('cn.zizpanel.panel')) throw new Error('扫描结果不应包含面板自身');
-    if (body.includes('cn.zizdog.nginx')) throw new Error('扫描结果不应包含 nginx');
+    await shot('35-no-adopt-entry');
+
+    if (await page.locator('button:has-text("扫描可纳管服务")').count()) {
+      throw new Error('工具栏上仍然有「扫描可纳管服务」按钮（用户要求删掉这个入口）');
+    }
+    if (await page.locator('button:has-text("注册服务")').count() === 0) {
+      throw new Error('「+ 注册服务」不见了 —— 删的是"纳管扫描"，不是手工登记已有服务的能力');
+    }
+    // 用户可见处一个内部词都不许留（注释里可以解释，界面上不行）。
+    // 只查"纳管"与两个整词，不查"托管"：应用摘要里有"自托管"这种正常说法。
+    const txt = await page.locator('.content').innerText();
+    for (const bad of ['纳管', '面板托管', '接入管理']) {
+      if (txt.includes(bad)) {
+        throw new Error(`「应用」页面上仍出现内部词「${bad}」：` + txt.slice(0, 240));
+      }
+    }
     await page.keyboard.press('Escape');
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);
   });
 
   await step('注册服务弹窗表单完整', async () => {
@@ -1564,20 +1679,40 @@ try {
     await page.waitForTimeout(2000);
 
     // 健康检查是异步的（每个服务最长 8s），轮询等待而不是固定 sleep
-    const pill = page.locator('button:has-text("个健康检查失败")');
+    //
+    // 2026-09-21：工具栏那颗按钮从「⚠ N 个健康检查失败」改成「⚠ N 个需要处理」——
+    // 筛选也合并成一项（旧的「异常」与「仅健康检查失败」重复，后者是前者的子集）。
+    // 这里断言两件事：① 按钮出现且筛得到**这张卡片**（合并不许把问题藏起来）；
+    // ② 工具栏只剩 4 项、没有半术语按钮。
+    const pill = page.locator('button:has-text("个需要处理")');
     let appeared = false;
     for (let i = 0; i < 20; i++) {
       if (await pill.count()) { appeared = true; break; }
       await page.waitForTimeout(500);
     }
     if (!appeared) {
-      throw new Error('造了一个连不上的服务，页头应当出现"N 个健康检查失败"');
+      throw new Error('造了一个连不上的服务，页头应当出现"N 个需要处理"');
+    }
+    const filterLabels = await page.locator('#installed-toolbar button').allInnerTexts();
+    for (const need of ['全部', '运行中', '已停止', '需要处理']) {
+      if (!filterLabels.some((t) => t.includes(need))) {
+        throw new Error(`工具栏缺少筛选「${need}」：` + JSON.stringify(filterLabels));
+      }
+    }
+    for (const bad of ['异常', '仅健康检查失败', '健康检查失败', '纳管']) {
+      if (filterLabels.some((t) => t.includes(bad))) {
+        throw new Error(`工具栏仍有半术语/内部词「${bad}」：` + JSON.stringify(filterLabels));
+      }
     }
     await pill.first().click();
     await page.waitForTimeout(1200);
     await shot('37b-health-filtered');
 
     const body = await page.locator('.content').innerText();
+    // 合并的关键：健康检查失败的服务必须**仍然被筛出来**（不许因为合并而消失）
+    if (!body.includes('UI 测试：连不上的服务')) {
+      throw new Error('「需要处理」筛掉了健康检查失败的服务（合并筛选时藏起了问题）: ' + body.slice(0, 300));
+    }
     // 关键：不能只给一个红标签，必须告诉用户"检查了什么、大概为什么、下一步点哪"。
     // 「重新检查」是旧的独立按钮，已并入卡片上的「⟳ 刷新」与「改检查地址」
     // （见 services.js 里 installedCard 的注释）—— 这里按**当前真实入口**断言，
@@ -2205,22 +2340,39 @@ try {
 
     const unavailable = body.includes('Docker 环境不可用');
     if (unavailable) {
-      if (!body.includes('Colima') && !body.includes('应用市场')) {
-        throw new Error('Docker 不可用时必须给出安装引导，实际: ' + body.slice(0, 200));
+      // 用户 2026-09-19 的要求：
+      //  · 没装运行时**直接给一键安装**（以前给的是「去应用市场」，用户在原话里说
+      //    "我亲[测]很难找到 docker"）；
+      //  · 不再有「去服务管理」（服务管理早已并入应用市场）与「已纳管服务」入口；
+      //  · 文案要如实说清代价（需要 Linux 虚拟机、下载 1–3 GB、首次启动约 40 秒）。
+      if (!body.includes('一键安装 Docker（Colima）')) {
+        throw new Error('Docker 不可用时应直接给「一键安装 Docker（Colima）」，实际: ' + body.slice(0, 240));
+      }
+      for (const bad of ['去应用市场', '去服务管理', '已纳管服务', '纳管']) {
+        if (body.includes(bad)) {
+          throw new Error(`Docker 页不该再出现「${bad}」入口（用户要求弱化纳管、去掉无效跳转）`);
+        }
+      }
+      if (!/虚拟机/.test(body) || !/1[–-]3\s*GB/.test(body)) {
+        throw new Error('一键安装必须如实写清代价（Linux 虚拟机 + 约 1–3 GB 下载）: ' + body.slice(0, 240));
       }
       return;
     }
 
-    // 环境可用：六个分区都要能切过去且不报错
+    // 环境可用：剩下的分区都要能切过去且不报错
     //
     // 注意循环变量不能叫 shot —— 那会遮蔽上面的截图函数 shot()，
     // 于是 await shot(shot) 变成"拿字符串当函数调"，报错还很误导（shot is not a function）。
+    //
+    // 2026-09-21：'已纳管服务' 这一项删掉了 —— docker.js 的分区表里已经没有它
+    // （那个分区本身就是"纳管"这个概念的用户可见入口），继续点它会超时。
+    // 本机没有 Docker，下面 unavailable 分支会提前 return，所以这条改动
+    // **在本机是未被执行到的**（真机上由 uitest-live 覆盖）。
     for (const [tab, shotName] of [
       ['镜像', '47-docker-images'],
       ['数据卷', '48-docker-volumes'],
       ['网络', '49-docker-networks'],
       ['Compose', '50-docker-compose'],
-      ['已纳管服务', '51-docker-services'],
     ]) {
       await page.click(`button:has-text("${tab}")`);
       await page.waitForTimeout(1200);
@@ -2238,6 +2390,55 @@ try {
     await page.click('button:has-text("容器")');
     await page.waitForTimeout(1200);
     await shot('52-docker-containers-back');
+  });
+
+  // ---------- 容器运行时的"已安装"必须看现实（用户 2026-09-19 报的假"已安装"）----------
+  //
+  // 现场：本机没有 colima（无二进制、无 ~/.colima、无 docker.sock），只剩一份旧版安装
+  // 留下的 /Library/LaunchDaemons/com.zizdog.colima.plist；而应用市场对 docker-runtime
+  // 回 installed=true → 卡片显示「Colima 已安装·未纳管」，用户既装不上也起不来。
+  //
+  // 这条断言以**本机真实探测**为准（不写死"本机一定没装"）：先读 /docker/info 的
+  // runtime.binary_installed，再要求市场条目的 installed 与它一致。
+  await step('容器运行时的「已安装」跟真实探测一致（僵尸 plist 不算已安装）', async () => {
+    const probe = await page.evaluate(async (b) => {
+      const api = b.replace(/\/+$/, '') + '/api/v1';
+      const info = await (await fetch(api + '/docker/info', { credentials: 'same-origin' })).json();
+      const market = await (await fetch(api + '/market', { credentials: 'same-origin' })).json();
+      const item = (market?.data?.list || []).find((x) => x.id === 'docker-runtime');
+      return {
+        binary: info?.data?.runtime?.binary_installed,
+        state: info?.data?.runtime?.state,
+        installed: item ? item.installed : null,
+        artifacts: item ? item.artifacts : null,
+        note: item ? item.note : '',
+        plistExists: item?.docker_runtime?.plist_exists,
+      };
+    }, base);
+    if (probe.installed === null) throw new Error('应用市场里找不到 docker-runtime 条目');
+    if (probe.binary !== probe.installed) {
+      throw new Error('docker-runtime 的 installed 与真实探测不一致（假"已安装"回归）：'
+        + JSON.stringify(probe));
+    }
+    // 二进制不在却有残留（僵尸 plist）时：必须是"未安装 + 残留"，且提示能重装。
+    if (probe.binary === false) {
+      if (probe.state !== 'not-installed') {
+        throw new Error('没有二进制时 state 应为 not-installed，实际 ' + probe.state);
+      }
+      if (probe.plistExists === true && probe.artifacts !== true) {
+        throw new Error('只剩僵尸 plist 时应如实报 artifacts=true（用户要能清理/重装），实际 '
+          + JSON.stringify(probe));
+      }
+      // 再去应用市场看**那张卡片本身**（接口说未安装，界面也不许说已安装）。
+      await page.goto(page.url().split('#')[0] + '#/apps/market', { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2500);
+      const card = page.locator('.grid.grid-3 > div', { hasText: 'Docker 运行时' }).first();
+      const cardText = (await card.count()) ? await card.innerText() : '';
+      if (/已安装/.test(cardText)) {
+        throw new Error('应用市场把 docker-runtime 显示成「已安装」，而真实探测是未安装（僵尸 plist）：'
+          + cardText.slice(0, 200));
+      }
+    }
   });
 
   await step('回到仪表盘', async () => {

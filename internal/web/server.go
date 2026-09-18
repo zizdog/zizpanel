@@ -123,6 +123,16 @@ type Server struct {
 	// 一个会记账的假实现，就能断言删除通路根本没有走到运行时那一步。
 	svcManagerOverride func(*Server) *services.Manager
 
+	// dockerRuntimeProbeOverride 仅供单测：替换"容器运行时到底装没装/在不在跑"的探测。
+	//
+	// 为什么需要它：市场卡片对 docker-runtime 的"已安装"判据必须是**真实探测**
+	// （见 api_services.go 与 services/docker_runtime.go），而默认探测会
+	// 看 PATH 上有没有 colima、连一次本机 docker socket ——
+	// 结论会随开发机装没装 Colima 而变，且真的去碰了系统（违反"单测不许碰真实
+	// 服务"）。更关键的是要能造出用户实测的那个现场：**只有僵尸 plist、
+	// 二进制不在**，并断言此时 installed 必须是 false。
+	dockerRuntimeProbeOverride func(ctx context.Context) services.DockerRuntimeState
+
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time

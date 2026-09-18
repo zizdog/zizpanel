@@ -111,7 +111,9 @@ func summarizeResult(res any) string {
 		if v == nil {
 			return "完成"
 		}
-		return "已纳管/登记服务 " + v.DisplayName
+		// 用户可见的任务标题：不要出现"纳管"这种内部词（用户 2026-09-19 要求
+		// 弱化纳管概念——那是面板要做的事，不是用户要理解的词）。
+		return "登记服务 " + v.DisplayName
 	default:
 		return "完成"
 	}

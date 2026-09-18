@@ -468,6 +468,8 @@ func Catalog() []App {
 		// 真正的安装由 handleMarketInstall 按 ID 路由到对应安装器
 		// （见 PanelInstaller 字段）；"已安装"则靠 ServiceLabel
 		// 或 BrewFormula 判断。
+		// 描述只留用户要决定的：原生安装 + 加速 + 模型约 200MB。安装用 LaMa 模型并启用 MPS；
+		// 更强的 MAT / ZITS / LDM 在 M 系列上不支持 MPS，所以不推荐。
 		{
 			ID: "iopaint", Name: "IOPaint（图片去水印）", Icon: "🖼️",
 			// 子路径：真机实测（mini，2026-09-14）。它的前端把 API 与 socket.io
@@ -480,11 +482,9 @@ func Catalog() []App {
 					{From: "/socket.io", To: "/{slug}/socket.io"},
 				},
 			},
-			Summary: "AI 擦除水印与杂物，支持批量与视频",
-			Description: "上传图片、涂抹要去掉的水印即可擦除；走原生安装，用 LaMa 模型并启用 " +
-				"Apple Silicon MPS 加速，模型约 200MB。可切换更强模型，" +
-				"但 MAT / ZITS / LDM 在 M 系列上不支持 MPS。",
-			Category: "tool", Kind: KindNative, PanelInstaller: "iopaint", ServiceLabel: "com.zizdog.iopaint",
+			Summary:     "AI 擦除水印与杂物，支持批量与视频",
+			Description: "上传图片涂抹即可去水印，原生安装并启用 Apple Silicon 加速；模型约 200MB。",
+			Category:    "tool", Kind: KindNative, PanelInstaller: "iopaint", ServiceLabel: "com.zizdog.iopaint",
 			Port: 8080,
 			// IOPaint 的**视频**去水印路径要 ffmpeg 拆帧/合帧（市场描述里的"支持视频"
 			// 就是它）；图片路径不需要。面板不直接调用 ffmpeg，所以这里只作提示 +
@@ -493,14 +493,14 @@ func Catalog() []App {
 				Hint: "brew install ffmpeg（IOPaint 的视频处理需要它，安装时会一并安装）"}},
 			DocsURL: "https://github.com/Sanster/IOPaint",
 		},
+		// 按 TtsVoice 插件契约原生安装（Python 3.11 + mlx-audio[server]）：插件只支持
+		// 「自定义音色」，所以只需要 1.7B-Base-8bit 这一个模型（约 2.9GB）；Qwen 加鉴权后
+		// 只监听本机，对外由音色接收端（8899）带密钥反代。
 		{
 			ID: "qwen3tts", Name: "Qwen3 TTS（语音合成）", Icon: "🗣️",
-			Summary: "本地语音合成，支持音色克隆",
-			Description: "按 TtsVoice 插件契约原生安装：Python 3.11 + mlx-audio[server] " +
-				"+ 1.7B-Base-8bit 模型（约 2.9GB，用于音色克隆），网站插件只支持" +
-				"「自定义音色」，故只需这一个模型。" +
-				"加鉴权后 Qwen 只监听本机，对外由音色接收端（8899）带密钥反代。",
-			Category: "ai", Kind: KindNative, PanelInstaller: "qwen3tts", ServiceLabel: "com.zizdog.qwen3tts",
+			Summary:     "本地语音合成，支持音色克隆",
+			Description: "本地语音合成，支持音色克隆；首次安装要下载约 2.9GB 模型。",
+			Category:    "ai", Kind: KindNative, PanelInstaller: "qwen3tts", ServiceLabel: "com.zizdog.qwen3tts",
 			Port:       8880,
 			HealthPath: audioHealth,
 			// ffmpeg 是它的**硬依赖**：mlx_audio 编码 mp3 必须靠它，缺了就会返回
@@ -511,13 +511,12 @@ func Catalog() []App {
 				Hint: "brew install ffmpeg（TTS 编码 mp3 必需，部署时会一并安装）"}},
 			DocsURL: "https://github.com/Blaizzy/mlx-audio",
 		},
+		// 样本必须落到本机磁盘 —— 上游只接受本地文件路径，不能把上传流直接转发过去。
 		{
 			ID: "voicereceiver", Name: "TtsVoice 音色接收端", Icon: "🔐",
-			Summary: "接收音色样本 + 带鉴权的反向代理",
-			Description: "给网站插件用的对外入口：接收上传的音色样本（落到本机，" +
-				"因为上游只认本地文件路径），并把 /v1/* 反代给只监听本机的 8880。" +
-				"共享密钥可指定或自动生成。",
-			Category: "ai", Kind: KindNative, PanelInstaller: "voicereceiver", ServiceLabel: "com.zizdog.voicereceiver",
+			Summary:     "接收音色样本 + 带鉴权的反向代理",
+			Description: "网站插件用的对外入口：接收音色样本并带密钥转发给本机 TTS。",
+			Category:    "ai", Kind: KindNative, PanelInstaller: "voicereceiver", ServiceLabel: "com.zizdog.voicereceiver",
 			Port: 8899,
 			// 接收端有免鉴权的 GET /health（实测 200；/jobs 等才要密钥）。
 			// 这里原先**没配** HealthPath —— 后果是面板"纳管了却不监测"：
@@ -537,13 +536,11 @@ func Catalog() []App {
 			ID: "phpmyadmin", Name: "phpMyAdmin", Icon: "🐬",
 			// phpMyAdmin 没有守护进程（nginx alias + php-fpm），装完就是一个网页入口。
 			// 它的 nginx location 由安装器自己写，所以 SelfConf=true：面板只给「打开」。
-			UI:       &AppUI{Slug: "phpmyadmin", SelfConf: true},
-			NoDaemon: true,
-			Summary:  "数据库管理界面（推荐入口）",
-			Description: "面板自研的库表管理功能有限，日常的库/表/权限/导入导出建议用它。" +
-				"装好后接入 nginx 默认站点，访问 http://<本机地址>/phpmyadmin/；" +
-				"面板内置那套保留为应急入口。",
-			Category: "tool", Kind: KindNative, PanelInstaller: "phpmyadmin", BrewFormula: "phpmyadmin",
+			UI:          &AppUI{Slug: "phpmyadmin", SelfConf: true},
+			NoDaemon:    true,
+			Summary:     "数据库管理界面（推荐入口）",
+			Description: "库表管理界面（面板自带的只作应急）；依赖 nginx + PHP，装完从面板打开。",
+			Category:    "tool", Kind: KindNative, PanelInstaller: "phpmyadmin", BrewFormula: "phpmyadmin",
 			Port:       0,
 			HealthPath: "/phpmyadmin/",
 			DocsURL:    "https://www.phpmyadmin.net",
@@ -575,26 +572,25 @@ func Catalog() []App {
 		// 早就有了，缺的只是条目。
 		//
 		// 顺序有意义：nginx 在最前，它是网站功能的入口。
+		// 装好后面板会自动补齐 include 上下文与 WebSocket 升级映射，用户不必手改 nginx.conf。
 		{
 			ID: "nginx", Name: "Nginx", Icon: "🌐",
-			Summary: "Web 服务器，网站管理功能的基础",
-			Description: "面板的「网站管理」依赖它：新建站点、伪静态、SSL、反向代理" +
-				"都是往它的 vhosts 目录写配置并 reload。" +
-				"装好后面板会自动补齐 include 上下文与 WebSocket 升级映射。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.nginx",
+			Summary:     "Web 服务器，网站管理功能的基础",
+			Description: "Web 服务器，「网站管理」的基础：新建站点、伪静态、SSL 都由它提供。",
+			Category:    "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.nginx",
 			Port: 80, HealthPath: "/",
 			BrewFormula: "nginx",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.nginx.log",
 			DocsURL:     "https://nginx.org",
 		},
+		// 面板会把它配置成监听自己专属的端点（默认 Unix socket
+		// /opt/homebrew/var/run/php-fpm-8.2.sock），不会与其它版本抢 9000 端口；
+		// 「修复端点」会改写该版本的 www.conf 并重启 fpm。
 		{
 			ID: "php82", Name: "PHP 8.2 (FPM)", Icon: "🐘",
-			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
-			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
-				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.2.sock），" +
-				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
-				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.2",
+			Summary:     "PHP FastCGI 进程管理器，供站点解析 PHP",
+			Description: "PHP-FPM 8.2，供站点解析 PHP；与其它版本共存，端点未配置时点「修复」。",
+			Category:    "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.2",
 			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
 			Port:        0,
 			HealthPath:  "",
@@ -604,14 +600,14 @@ func Catalog() []App {
 			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.2.log",
 			DocsURL:      "https://www.php.net",
 		},
+		// 面板会把它配置成监听自己专属的端点（默认 Unix socket
+		// /opt/homebrew/var/run/php-fpm-8.4.sock），不会与其它版本抢 9000 端口；
+		// 「修复端点」会改写该版本的 www.conf 并重启 fpm。
 		{
 			ID: "php84", Name: "PHP 8.4 (FPM)", Icon: "🐘",
-			Summary: "PHP FastCGI 进程管理器，供站点解析 PHP",
-			Description: "与其它 PHP 版本**共存**：面板会把它配置成监听自己专属的端点" +
-				"（默认 Unix socket /opt/homebrew/var/run/php-fpm-8.4.sock），" +
-				"因此不会和其它版本抢 9000 端口；站点在「网站管理」里按站点选择用哪个版本。" +
-				"装完若提示「端点未配置」，点「🔧 修复端点并重启」即可（会改写该版本的 www.conf 并重启 fpm）。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.4",
+			Summary:     "PHP FastCGI 进程管理器，供站点解析 PHP",
+			Description: "PHP-FPM 8.4，供站点解析 PHP；与其它版本共存，端点未配置时点「修复」。",
+			Category:    "lnmp", Kind: KindNative, ServiceLabel: "homebrew.mxcl.php@8.4",
 			// PHP-FPM 说的是 FastCGI 协议、不是 HTTP：不能做 HTTP 健康检查，端点由面板按版本分配。
 			Port:        0,
 			HealthPath:  "",
@@ -621,12 +617,12 @@ func Catalog() []App {
 			LogPath:      "~/Library/Logs/homebrew.mxcl.php@8.4.log",
 			DocsURL:      "https://www.php.net",
 		},
+		// macOS 上 brew 版默认用 /tmp/mysql.sock（不是 TCP 3306），连接时按这个来。
 		{
 			ID: "mysql84", Name: "MySQL 8.4", Icon: "🐬",
-			Summary: "关系型数据库，供站点与面板的数据库管理使用",
-			Description: "面板的「数据库管理」通过它管理库、表、账号与导入导出。" +
-				"macOS 上 brew 版默认用 /tmp/mysql.sock，root 初始无密码。",
-			Category: "lnmp", Kind: KindNative, ServiceLabel: "sh.brew.mysql@8.4",
+			Summary:     "关系型数据库，供站点与面板的数据库管理使用",
+			Description: "MySQL 8.4，供站点与面板的数据库管理使用；brew 版 root 初始无密码。",
+			Category:    "lnmp", Kind: KindNative, ServiceLabel: "sh.brew.mysql@8.4",
 			Port: 3306, HealthPath: "",
 			BrewFormula: "mysql@8.4",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.mysql@8.4.log",
@@ -661,14 +657,9 @@ func Catalog() []App {
 		// 假警告，还会在服务管理里留下一条永远没有状态的假记录。
 		{
 			ID: "ffmpeg", Name: "FFmpeg（音视频工具）", Icon: "🎬",
-			Summary: "音视频转码基础工具（TTS 编码 mp3 依赖它）",
-			Description: "面板的基础环境之一：Qwen TTS 用 mlx_audio 编码 mp3 必须靠它，" +
-				"音色接收端用 ffprobe 校验上传的音色样本、用 ffmpeg 做转码与响度归一，" +
-				"后续的音视频功能也都要用。" +
-				"缺了它的典型症状是「合成接口返回 HTTP 200 但 body 是 0 字节」——" +
-				"服务看起来一切正常，用户却一个作业都跑不成。" +
-				"没有网页界面，装好后供面板与其它应用在后台调用。",
-			Category: CategoryOther, Kind: KindNative,
+			Summary:     "音视频转码基础工具（TTS 编码 mp3 依赖它）",
+			Description: "音视频转码命令行工具；Qwen TTS 编码 mp3 必须依赖它，没有网页界面。",
+			Category:    CategoryOther, Kind: KindNative,
 			PanelInstaller: "ffmpeg",
 			BrewFormula:    "ffmpeg",
 			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
@@ -694,29 +685,27 @@ func Catalog() []App {
 		// 库），走通用 brew 流程会 `brew services start python@3.11` 并留下一条
 		// 永远没有状态的假服务记录、外加一句"已安装但启动失败"的假警告
 		// （ffmpeg 当年就是这么被误报的）。所以它有自己的安装/卸载路径。
+		// 上游从 3.12 起不再提供 macOS Intel 瓶，只有 3.10 / 3.11 有。
+		// 装完是命令行工具（/opt/homebrew/opt/python@3.10/bin/python3.10），没有常驻进程，
+		// 也不会自动创建虚拟环境。
 		{
 			ID: "python310", Name: "Python 3.10", Icon: "🐍",
-			Summary: "Python 解释器（老项目/Intel Mac 需要时的稳妥选择）",
-			Description: "Homebrew 的 python@3.10（含 pip）。Intel Mac 与老项目用：上游从 3.12 起" +
-				"不再提供 macOS Intel 瓶，只有 3.10 / 3.11 有；老项目也常锁 3.10。与其它版本并存，" +
-				"没有常驻进程，装完是命令行工具 `/opt/homebrew/opt/python@3.10/bin/python3.10`。",
-			Category: CategoryOther, Kind: KindNative,
+			Summary:     "Python 解释器（老项目/Intel Mac 需要时的稳妥选择）",
+			Description: "Python 3.10 解释器（含 pip）；Intel Mac 与老项目选它，3.12+ 无 Intel 包。",
+			Category:    CategoryOther, Kind: KindNative,
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.10",
 			NoDaemon:       true,
 			Port:           0,
 			DocsURL:        "https://docs.python.org/3.10/",
 		},
+		// 面板自己的两个 Python 服务默认用这一版：mlx-audio 在 3.11 上有预编译 wheel，
+		// 整条链路真机验证过。装了它不会自动创建虚拟环境 —— 虚拟环境由各应用按需创建。
 		{
 			ID: "python311", Name: "Python 3.11", Icon: "🐍",
-			Summary: "Python 解释器（面板自研运行时 Qwen3 TTS / IOPaint 的预置版本）",
-			Description: "Homebrew 的 python@3.11（含 pip）。面板自己的两个 Python 服务" +
-				"（Qwen3 TTS 音色克隆、IOPaint 图像修复）默认就用这一版：mlx-audio 在 3.11 上有" +
-				"预编译 wheel，整条链路在真机验证过。装了它不会自动创建任何虚拟环境 —— " +
-				"虚拟环境是各应用安装时按需创建的（互不污染）。" +
-				"没有常驻进程、没有端口，装完是命令行工具：" +
-				"`/opt/homebrew/opt/python@3.11/bin/python3.11`。",
-			Category: CategoryOther, Kind: KindNative,
+			Summary:     "Python 解释器（面板自研运行时 Qwen3 TTS / IOPaint 的预置版本）",
+			Description: "Python 3.11 解释器（含 pip）；面板的 Qwen3 TTS / IOPaint 默认用这一版。",
+			Category:    CategoryOther, Kind: KindNative,
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.11",
 			// 解释器没有守护进程、没有端口、没有网页界面（与 ffmpeg 同类）。
@@ -724,26 +713,24 @@ func Catalog() []App {
 			Port:     0,
 			DocsURL:  "https://docs.python.org/3.11/",
 		},
+		// 版本化 formula 各自独立，与 3.11 / 3.13 并存、互不覆盖。
 		{
 			ID: "python312", Name: "Python 3.12", Icon: "🐍",
-			Summary: "Python 解释器（较新的稳定版本，适合需要 3.12 的应用）",
-			Description: "Homebrew 的 python@3.12（含 pip）。给要求 3.12 的应用与脚本用，与 3.11 并存" +
-				"（版本化 formula 各自独立，互不覆盖）。⚠️ Intel Mac 装不了：上游从 3.12 起不再提供" +
-				"macOS Intel 瓶，Intel 请用 3.10 / 3.11。装完是命令行工具，没有常驻进程。",
-			Category: CategoryOther, Kind: KindNative,
+			Summary:     "Python 解释器（较新的稳定版本，适合需要 3.12 的应用）",
+			Description: "Python 3.12 解释器（含 pip）；⚠️ Intel Mac 装不了（上游无 Intel 包）。",
+			Category:    CategoryOther, Kind: KindNative,
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.12",
 			NoDaemon:       true,
 			Port:           0,
 			DocsURL:        "https://docs.python.org/3.12/",
 		},
+		// 部分需要预编译 wheel 的 ML 包可能还没适配 3.13；装包报错就换回 3.11 / 3.12。
 		{
 			ID: "python313", Name: "Python 3.13", Icon: "🐍",
-			Summary: "Python 解释器（最新稳定版，尝鲜/新项目用）",
-			Description: "Homebrew 的 python@3.13（含 pip）。最新稳定版，新项目用；与 3.11 / 3.12 并存。" +
-				"⚠️ Intel Mac 装不了（上游没有 macOS Intel 瓶）。部分需要预编译 wheel 的机器学习包可能" +
-				"还没适配 3.13，装包报错就换 3.11 / 3.12。没有常驻进程。",
-			Category: CategoryOther, Kind: KindNative,
+			Summary:     "Python 解释器（最新稳定版，尝鲜/新项目用）",
+			Description: "Python 3.13 解释器（含 pip）；⚠️ Intel Mac 装不了，部分 ML 包可能未适配。",
+			Category:    CategoryOther, Kind: KindNative,
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.13",
 			NoDaemon:       true,
@@ -765,13 +752,9 @@ func Catalog() []App {
 		//     不会碰这个 cluster（数据保留语义见 uninstall 计划）。
 		{
 			ID: "postgresql17", Name: "PostgreSQL 17", Icon: "🐘",
-			Summary: "关系型数据库（自托管应用用，例如 Miniflux）",
-			Description: "PostgreSQL 17（brew formula postgresql@17）。给需要它的自托管应用用，" +
-				"目前是 Miniflux（装 Miniflux 时会自动确认并安装它）。" +
-				"brew 安装时**已经自动 initdb 建好 cluster**（数据目录 /opt/homebrew/var/postgresql@17），" +
-				"本机连接走 trust 认证，超级用户就是当前登录用户。" +
-				"卸载本条目**不会**删除数据目录（面板默认保留你的数据）。",
-			Category: CategoryLNMP, Kind: KindNative, ServiceLabel: "sh.brew.postgresql@17",
+			Summary:     "关系型数据库（自托管应用用，例如 Miniflux）",
+			Description: "PostgreSQL 17，供自托管应用（如 Miniflux）使用；卸载不会删数据目录。",
+			Category:    CategoryLNMP, Kind: KindNative, ServiceLabel: "sh.brew.postgresql@17",
 			// PostgreSQL 说的是自己的线路协议、不是 HTTP：不能做 HTTP 健康检查，
 			// 否则会永远显示"不健康"（与 PHP-FPM 同理）。留空 = 只按进程与端口判断。
 			Port: 5432, HealthPath: "",
@@ -785,10 +768,9 @@ func Catalog() []App {
 		// ---------------- AI 服务（原生，用 Metal 加速） ----------------
 		{
 			ID: "ollama", Name: "Ollama", Icon: "🦙",
-			Summary: "本地大模型推理，支持 Metal 加速",
-			Description: "一行命令跑起本地大模型（Llama / Qwen / DeepSeek 等）。" +
-				"原生安装才能用 Apple Silicon 的 GPU 加速，Docker 里用不了 Metal。",
-			Category: "ai", Kind: KindNative,
+			Summary:     "本地大模型推理，支持 Metal 加速",
+			Description: "本地大模型推理（Llama / Qwen 等），原生安装才能用 Metal 加速。",
+			Category:    "ai", Kind: KindNative,
 			Port: 11434, HealthPath: "/api/tags",
 			BrewFormula: "ollama", LogPath: "~/.ollama/ollama.log",
 			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
@@ -804,14 +786,17 @@ func Catalog() []App {
 		//
 		// 放在所有 Docker 应用之前：它是那些应用的前提。面板不把它当普通应用，
 		// 而是同时登记进「服务管理」，让它像 nginx/MySQL 一样可启停、看日志。
+		// Colima 在轻量 Linux 虚拟机里跑 Docker 引擎，原生支持 Apple Silicon，
+		// 装好后开机自启、无需登录桌面；停止它会让所有容器一起停掉。
 		{
 			ID: "docker-runtime", Name: "Docker 运行时（Colima）", Icon: "🐳",
-			Summary: "容器引擎，Docker 类应用的前提",
-			Description: "Colima 在轻量 Linux 虚拟机里跑 Docker 引擎，原生支持 Apple Silicon，" +
-				"装好后开机自启、无需登录桌面；停止它会让所有容器一起停掉。",
-			Category: "runtime", Kind: KindColima, PanelInstaller: "docker-runtime",
-			// BrewFormula 用于判断"装没装"；ServiceLabel 用于判断"纳没纳管"。
-			// 两者都要给，否则市场会显示"已安装·未纳管"并给出一个点了会报错的纳管按钮。
+			Summary:     "容器引擎，Docker 类应用的前提",
+			Description: "Docker 引擎（Colima）：需要 Linux 虚拟机，首次启动较慢；停止它容器全停。",
+			Category:    "runtime", Kind: KindColima, PanelInstaller: "docker-runtime",
+			// BrewFormula / ServiceLabel 仍然要给（安装器与 launchd 作业要靠它们），
+			// 但**"装没装"不看它们、也不看 plist**：容器运行时的运行体是"二进制 + VM +
+			// socket"，只剩一份僵尸 plist 也照样是"没装"（2026-09-19 用户实测的假"已安装"，
+			// 见 DEVELOPMENT 坑 161）。真实判定在 api_services.go 的 dockerRuntimeStatus。
 			BrewFormula: "colima", ServiceLabel: ColimaLaunchLabel,
 			DocsURL: "https://github.com/abiosoft/colima",
 		},
@@ -836,6 +821,9 @@ func Catalog() []App {
 		//      明确拒绝它（DENIED / not in the allowlist），docker.1panel.live 能服务。
 		//      所以面板自动配加速源时**必须配多个**、靠 docker 逐条回落，只配一个
 		//      daocloud 会让 squoosh 装不上（见 docker_mirror_nas.go 顶部说明）。
+		// 镜像用官方滚动 tag louislam/uptime-kuma:2（1.x 已停维护）；v1→v2 会自动迁移
+		// 数据库且不可逆，UI.Note 与 PostInstallHint 里都提醒先备份 ./data。
+		// 子路径那 5 条改写真机是按 v1 调的，v2 前端路由改版后未重测（见 UI.Note）。
 		{
 			ID: "uptime-kuma", Name: "Uptime Kuma", Icon: "📡",
 			UI: &AppUI{
@@ -856,12 +844,9 @@ func Catalog() []App {
 				// 那套改 entrypoint 的社区方案才能挂子路径，面板不做那种侵入。
 				PreferDirect: true,
 			},
-			Summary: "自托管服务监控与告警",
-			Description: "监控网站与服务的可用性，支持多种通知渠道（Telegram / Bark / 邮件等）。" +
-				"镜像用官方滚动 tag louislam/uptime-kuma:2（1.x 已停维护）。" +
-				"⚠️ v1→v2 会**自动迁移数据库**（不可逆），请先备份 ./data；" +
-				"子路径改写是按 v1 调的、v2 未重测。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 3001,
+			Summary:     "自托管服务监控与告警",
+			Description: "网站与服务的可用性监控，支持多种通知渠道；v1→v2 会自动迁移数据库。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 3001,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// host 网络（2026-09-17 mini 实测：Colima/Lima 会把 VM 内监听的端口自动
@@ -970,12 +955,10 @@ func Catalog() []App {
 		{
 			ID: "it-tools", Name: "IT-Tools（开发者工具箱）", Icon: "🧰",
 			// 纯前端应用：所有逻辑在浏览器里跑，没有后端 API，只有静态资源前缀要改写。
-			UI:      &AppUI{Slug: "it-tools"},
-			Summary: "几十个开发者常用小工具，纯前端",
-			Description: "JSON 格式化、Base64/URL 编解码、UUID/哈希、时间戳、正则、" +
-				"JWT、CIDR 等开发者小工具合集。走 Docker，纯前端本地执行、" +
-				"输入不上传，端口 8083。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8083,
+			UI:          &AppUI{Slug: "it-tools"},
+			Summary:     "几十个开发者常用小工具，纯前端",
+			Description: "开发者小工具合集（JSON、Base64、UUID、哈希等），纯前端执行、输入不上传。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8083,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 官方镜像（README 里给的就是 corentinth/it-tools 与 ghcr.io/corentinth/it-tools
@@ -999,12 +982,9 @@ func Catalog() []App {
 				SelfBase: true,
 				Note:     "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
 			},
-			Summary: "在浏览器里管理服务器上的文件",
-			Description: "浏览器里浏览、上传、下载、分享文件，支持多用户与细粒度权限；" +
-				"它不像面板自带文件管理器那样限定白名单目录。" +
-				"因 Homebrew 版没有 service 定义，仍走 Docker，端口 8081，" +
-				"默认管理 compose 目录下的 data/。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8081,
+			Summary:     "在浏览器里管理服务器上的文件",
+			Description: "在浏览器里管理服务器文件，支持多用户与权限；默认只挂几个常用目录。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8081,
 			// 官方镜像的 healthcheck 打的就是 /health（见仓库 docker/common/healthcheck.sh），
 			// 不是猜测的路径。
 			HealthPath: "/health",
@@ -1075,6 +1055,8 @@ func Catalog() []App {
 		//     通用的 brew 原生路径。
 		//   · lucky / orbien：没有 formula，但有官方 darwin-arm64 预编译产物，
 		//     由 binary_release.go 那套通用安装器装（见该文件顶部说明）。
+		// 客户端要暴露的是**这台 Mac 上**的服务，放进容器后 127.0.0.1 会指向容器自己，
+		// 所以走原生（官方 darwin-arm64 tarball 解压到 ~/frpc + 系统级 launchd）。
 		{
 			ID: "frpc", Name: "frpc（frp 客户端）", Icon: "🧷",
 			// frpc 的 admin UI 是它自己监听的 7400（协议上它是主动往外连的客户端，
@@ -1088,13 +1070,9 @@ func Catalog() []App {
 				// 市场与服务管理只给「📝 编辑配置文件」+「🔄 重启服务」。
 				ConsoleOnly: true,
 			},
-			Summary: "把本机端口映射到 frps（客户端，带 admin UI）",
-			Description: "fatedier/frp 的客户端：连上你自己的 frps，把本机端口映射出去。" +
-				"**走原生（不走 Docker）**：官方 darwin-arm64 tarball 解压到 ~/frpc " +
-				"并用系统级 launchd 托管 —— 客户端要暴露的是" +
-				"**这台 Mac 上**的服务，放进容器后 127.0.0.1 会指向容器自己。" +
-				"admin UI 在 7400。**面板不提供 frps**，服务端地址与 token 请自己填。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "把本机端口映射到 frps（客户端，带 admin UI）",
+			Description: "frp 客户端：把本机端口映射到你的 frps；面板不提供 frps，需自填地址与 token。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "frpc", ServiceLabel: "com.zizdog.frpc",
 			// 7400 是它唯一监听的端口（admin UI），所以健康检查也查它。
 			Port: 7400, HealthPath: "/",
@@ -1106,17 +1084,16 @@ func Catalog() []App {
 				"改完点「📝 编辑配置文件」，保存后按提示重启服务生效。",
 			DocsURL: "https://github.com/fatedier/frp",
 		},
+		// 同 frpc：原生下 [[tunnels]] 的 service 直接写 127.0.0.1，容器里会指向容器自己，
+		// 所以走原生（官方 darwin-arm64 产物解压到 ~/orbien-client + 系统级 launchd）。
 		{
 			ID: "orbien-client", Name: "Orbien 客户端（CLI）", Icon: "🛰️",
 			// 客户端没有自己的 Web 界面（就是上游的 orbien CLI），所以不给 UI 入口 ——
 			// 不渲染一个点开必然打不开的按钮。它的可视化配置入口是服务详情里的
 			// 「📝 编辑配置文件」（orbien.toml），要看图表请开服务端的 Dashboard(8020)。
-			Summary: "连上 Orbien 服务端，把本机端口穿透出去（客户端）",
-			Description: "Orbien 的**客户端**（上游 CLI）。**走原生（不走 Docker）**：" +
-				"官方 darwin-arm64 产物解压到 ~/orbien-client，由系统级 launchd 托管 ——" +
-				"原生下 [[tunnels]] 的 service 直接写 127.0.0.1，容器里会指向容器自己。" +
-				"客户端主动外连、不监听端口。**面板不提供服务端**，地址请自己填。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "连上 Orbien 服务端，把本机端口穿透出去（客户端）",
+			Description: "Orbien 客户端（CLI），把本机端口穿透到你的服务端；面板不提供服务端。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "orbien-client", ServiceLabel: "com.zizdog.orbien-client",
 			Port:       0,
 			ConfigPath: "orbien.toml",
@@ -1156,12 +1133,9 @@ func Catalog() []App {
 				Note: "首次配置（添加 DNS 服务商与域名）要在 ddns-go 自己的网页界面里做。" +
 					"子路径（/ddns-go/）与端口直连 http://<地址>:9876 都能用。",
 			},
-			Summary: "动态公网 IP 变化时自动更新到 DNS 解析（Cloudflare / 阿里云 / DNSPod …）",
-			Description: "把变化的公网 IP 自动更新到你的域名解析，支持 Cloudflare、阿里云、" +
-				"腾讯云、DNSPod、华为云、百度云等。**走原生（不走 Docker）**：官方 darwin-arm64 " +
-				"预编译产物解压到 ~/ddns-go，由系统级 launchd 托管（homebrew 的 formula " +
-				"没有 service 块，不能用 brew services 托管）。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "动态公网 IP 变化时自动更新到 DNS 解析（Cloudflare / 阿里云 / DNSPod …）",
+			Description: "公网 IP 变化时自动更新域名解析，支持 Cloudflare / 阿里云 / DNSPod 等。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "ddns-go", ServiceLabel: "com.zizdog.ddns-go",
 			// 9876 是它网页界面端口，也是唯一监听端口（装机实测：启动后 *:9876 LISTEN）。
 			Port: 9876, HealthPath: "/",
@@ -1198,13 +1172,9 @@ func Catalog() []App {
 					"「打开」给端口直连 http://<本机地址>:8087；要挂域名/HTTPS 请在面板" +
 					"「反向代理」里加规则指向 127.0.0.1:8087，并把配置里的 BASE_URL 改成对应地址。",
 			},
-			Summary: "极简自托管 RSS 阅读器（需要 PostgreSQL）",
-			Description: "自托管的 RSS 阅读器：没有广告、没有推荐算法，界面干净、键盘操作友好。" +
-				"**必须要有 PostgreSQL**（上游 README 明确写 Works only with PostgreSQL）：" +
-				"装它的时候面板会先确保 postgresql@17 已安装并启动，再自动建库建账号、" +
-				"写好配置、跑完数据库迁移，最后随机生成管理员口令。" +
-				"管理员口令只在安装结果里出现一次，请自行保存（之后可在服务详情里改配置）。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "极简自托管 RSS 阅读器（需要 PostgreSQL）",
+			Description: "极简 RSS 阅读器（需要 PostgreSQL）；装完建库建账号，初始口令只显示一次。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "miniflux",
 			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
 			SystemDaemon: true,
@@ -1239,13 +1209,9 @@ func Catalog() []App {
 					"Syncthing 的 GUI 不支持挂在子路径下（它用绝对路径 /rest/*），" +
 					"所以子路径入口只作备用。",
 			},
-			Summary: "去中心化文件同步（不经过云盘）",
-			Description: "在多台设备之间直接同步文件，不经过任何云服务，支持版本历史与" +
-				"选择性同步。**走原生（不走 Docker）**：homebrew 的 formula 自带 service 块，" +
-				"官方就是按无头方式设计的（cask 那个才是菜单栏 App）。" +
-				"面板会把 GUI 从上游默认的 127.0.0.1:8384 改成 0.0.0.0:8384，" +
-				"**并同时设置随机用户名口令** —— 否则等于把远程控制台无口令暴露在局域网里。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "去中心化文件同步（不经过云盘）",
+			Description: "去中心化文件同步（不经过云盘）；面板安装时会同时设置随机登录口令。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "syncthing",
 			// 必须开机就在：装成系统级 LaunchDaemon（无头机器开机不加载用户级 agent，坑 130）
 			SystemDaemon: true,
@@ -1259,6 +1225,8 @@ func Catalog() []App {
 				"被拒绝了就在那里打开它，或在面板设置里允许免授权访问内网段。",
 			DocsURL: "https://syncthing.net",
 		},
+		// ⚠️ 上游只发布 md5 校验清单（没有 sha256）：安装这一步只能做架构复核 + md5 互证，
+		// 面板不假装自己校验过 sha256。
 		{
 			ID: "alist", Name: "Alist（文件列表）", Icon: "📂",
 			UI: &AppUI{
@@ -1279,14 +1247,9 @@ func Catalog() []App {
 					"初始管理员口令由 Alist 在**首次启动时**随机生成并写进它自己的日志，" +
 					"面板会把这一条从日志里抓出来放进安装结果（抓不到时会说明）。",
 			},
-			Summary: "把网盘、对象存储、本地目录挂成一个网页文件站",
-			Description: "支持 40+ 存储后端（阿里云盘、OneDrive、Google Drive、S3、WebDAV、" +
-				"本地目录……），统一成一个可浏览、可分享的网页文件列表，并提供 WebDAV 接口。" +
-				"**走原生（不走 Docker）**：官方 alist-darwin-arm64.tar.gz 解压到 ~/alist，" +
-				"由系统级 launchd 托管。" +
-				"⚠️ 上游只发布 md5 校验清单（没有 sha256），所以这一步只能做架构复核 + md5 互证，" +
-				"面板不假装自己校验过 sha256。",
-			Category: "tool", Kind: KindNative,
+			Summary:     "把网盘、对象存储、本地目录挂成一个网页文件站",
+			Description: "把网盘、对象存储、本地目录挂成一个网页文件站，并提供 WebDAV。",
+			Category:    "tool", Kind: KindNative,
 			PanelInstaller: "alist", ServiceLabel: "com.zizdog.alist",
 			Port: 5244, HealthPath: "/",
 			ConfigPath: "data/config.json",
@@ -1300,11 +1263,9 @@ func Catalog() []App {
 		// ---------------- 一键建站（Category: site） ----------------
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",
-			Summary: "轻量博客程序，一键装好并配好伪静态",
-			Description: "轻量博客程序（PHP + MySQL）。面板会自动下载官方最新版、" +
-				"解压到 ~/www/<域名>、建库建用户、写 config.inc.php 并套用 Typecho 伪静态。" +
-				"完成后到 http://<域名>/install.php 走完最后一步（数据库信息已预填）。",
-			Category: "site", Kind: KindNative, Port: 0,
+			Summary:     "轻量博客程序，一键装好并配好伪静态",
+			Description: "轻量博客程序（PHP + MySQL），面板一键装好；装完到 /install.php 收尾。",
+			Category:    "site", Kind: KindNative, Port: 0,
 			SiteApp: &SiteAppSpec{
 				DownloadURL: "https://github.com/typecho/typecho/releases/latest/download/typecho.zip",
 				MirrorURLs:  []string{"https://cdn.jsdelivr.net/gh/typecho/typecho@master/typecho.zip"},
@@ -1319,11 +1280,9 @@ func Catalog() []App {
 		},
 		{
 			ID: "freshrss", Name: "FreshRSS", Icon: "📰",
-			Summary: "自托管 RSS 阅读器（原生：nginx + PHP + SQLite）",
-			Description: "多用户 RSS 聚合阅读器。**原生安装**（不用 Docker）：面板把官方源码装到 " +
-				"~/www/<域名>、套用 FreshRSS 的伪静态，数据库直接用 **SQLite**（不需要 MySQL）。" +
-				"装完到 http://<域名>/i/ 走完向导（数据库类型选 SQLite）即可。",
-			Category: "site", Kind: KindNative, Port: 0,
+			Summary:     "自托管 RSS 阅读器（原生：nginx + PHP + SQLite）",
+			Description: "多用户 RSS 阅读器，原生安装并用 SQLite；装完到 /i/ 走完向导。",
+			Category:    "site", Kind: KindNative, Port: 0,
 			SiteApp: &SiteAppSpec{
 				// 上游 releases **一直没有资产**（1.26.3~1.30.0 连续 8 个版本 assets 为空），
 				// 只能拿源码归档。固定 1.30.0 而不是 rolling master：只有固定版本才能把
@@ -1342,6 +1301,8 @@ func Catalog() []App {
 			},
 			DocsURL: "https://freshrss.org",
 		},
+		// 要显示容器状态需要额外挂 Docker socket —— 面板刻意没有默认挂上
+		// （那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。
 		{
 			ID: "homepage", Name: "Homepage", Icon: "🏠",
 			UI: &AppUI{
@@ -1362,12 +1323,9 @@ func Catalog() []App {
 					{From: "/homepage.ico", To: "/{slug}/homepage.ico"},
 				},
 			},
-			Summary: "自建导航首页 / 服务仪表盘",
-			Description: "把本机的服务、书签、常用链接汇总成一个首页。端口 **3010**（避开 Gitea 的 3000）。" +
-				"配置文件在应用目录的 config/ 下（services.yaml / settings.yaml / widgets.yaml），" +
-				"可在「管理」里直接编辑。要显示容器状态需要额外挂 Docker socket —— 面板刻意**没有**默认挂上" +
-				"（那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 3010,
+			Summary:     "自建导航首页 / 服务仪表盘",
+			Description: "把服务、书签与常用链接汇总成一个导航首页；首次打开是空的，需自己加卡片。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 3010,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			ComposeYAML: `services:
@@ -1412,11 +1370,9 @@ func Catalog() []App {
 					"面板只做绝对路径改写、不保证它的前端路由认子路径 —— 建议用「直链」" +
 					"http://<本机地址>:8091（子路径未实测）",
 			},
-			Summary: "自托管个人知识库 / 笔记（全文搜索、关系图、脚本）",
-			Description: "TriliumNext Notes 服务端：层级化笔记 + 富文本/代码/Mermaid、全文搜索与关系图。" +
-				"**走 Docker**：Homebrew 只有 Electron GUI cask，官方服务端产物只有 Linux；" +
-				"镜像自带 linux/arm64，不转译。数据在应用目录 data/；端口 **8091**（让开 IOPaint 的 8080）。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8091,
+			Summary:     "自托管个人知识库 / 笔记（全文搜索、关系图、脚本）",
+			Description: "层级化笔记与知识库（全文搜索、关系图）；首次打开自行创建管理员账号。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8091,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 上游 compose（develop 分支 docker-compose.yml）的等价物，三处**故意不同**：
@@ -1472,11 +1428,9 @@ func Catalog() []App {
 				Note: "Activepieces 官方不支持子路径（AP_FRONTEND_URL 只决定 webhook/回调地址，" +
 					"不能把界面挂到 /activepieces/）；请用「直链」http://<本机地址>:8090。",
 			},
-			Summary: "可视化自动化工作流（开源 Zapier 替代）",
-			Description: "用节点拖拽编排自动化流程，连接大量 SaaS / HTTP / 数据库 / AI 接口。" +
-				"**走 Docker（3 容器）**：app（API+worker）、PostgreSQL(pgvector)、Redis，宿主端口 8090。" +
-				"AP_JWT_SECRET / AP_ENCRYPTION_KEY / 数据库口令安装时随机生成，只在安装结果的凭据区块出现。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8090,
+			Summary:     "可视化自动化工作流（开源 Zapier 替代）",
+			Description: "可视化自动化工作流（开源 Zapier 替代）；密钥与数据库口令安装时随机生成。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8090,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// arm64 证据（2026-09-17 本机 `docker manifest inspect` 直查 ghcr.io）：
@@ -1565,6 +1519,7 @@ func Catalog() []App {
 				"否则生成的回调地址会指向 127.0.0.1，外部触发打不进来。",
 			DocsURL: "https://www.activepieces.com/docs/install/options/docker-compose",
 		},
+		// DB_PASSWORD 重装会复用 .env 旧值、绝不重新生成 —— 数据库初始化后换口令会直接连不上。
 		{
 			// Immich 为什么走 Docker：官方只发布容器镜像；没有 brew formula、
 			// 也没有 darwin-arm64 服务端产物。四个镜像都自带 linux/arm64（证据见下）。
@@ -1580,12 +1535,9 @@ func Catalog() []App {
 					"首次启动要下载人脸/CLIP 模型到 model-cache/，期间搜索不可用。" +
 					"DB_PASSWORD 重装会复用 .env 旧值、绝不重新生成 —— 数据库初始化后换口令会直接连不上。",
 			},
-			Summary: "自托管照片 / 视频备份（Google Photos 替代）",
-			Description: "本地优先的照片与视频备份、浏览、相册共享、人脸/语义搜索。" +
-				"**走 Docker（官方 4 容器）**，宿主端口 2283，DB_PASSWORD 安装时随机生成。" +
-				"⚠️ 官方明确非 Linux 宿主 strongly discouraged；macOS **没有硬件转码**（只能 CPU 软转）；" +
-				"首次启动要下载 ML 模型。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 2283,
+			Summary:     "自托管照片 / 视频备份（Google Photos 替代）",
+			Description: "自托管照片/视频备份；macOS 无硬件转码只能软转，首次启动要下模型。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 2283,
 			// 官方健康端点：GET /api/server/ping → 200 {"res":"pong"}
 			HealthPath: "/api/server/ping",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
@@ -1669,11 +1621,9 @@ func Catalog() []App {
 		},
 		{
 			ID: "wordpress", Name: "WordPress", Icon: "🌐",
-			Summary: "最流行的建站程序，一键装好并配好伪静态",
-			Description: "最流行的建站程序（PHP + MySQL）。面板会自动下载官方中文版、" +
-				"解压到 ~/www/<域名>、建库建用户、生成 wp-config.php 并套用 WordPress 伪静态。" +
-				"完成后到 http://<域名>/wp-admin/install.php 填站点标题与管理员账号即可。",
-			Category: "site", Kind: KindNative, Port: 0,
+			Summary:     "最流行的建站程序，一键装好并配好伪静态",
+			Description: "最流行的建站程序（PHP + MySQL）；装完到 /wp-admin/install.php 填站点信息。",
+			Category:    "site", Kind: KindNative, Port: 0,
 			SiteApp: &SiteAppSpec{
 				// 用官方中文站（国内可达性明显好于 wordpress.org）
 				DownloadURL: "https://cn.wordpress.org/latest-zh_CN.zip",
@@ -1689,11 +1639,9 @@ func Catalog() []App {
 		},
 		{
 			ID: "metatube-server", Name: "MetaTube（媒体元数据服务）", Icon: "🎬",
-			Summary: "给 Emby / Jellyfin 刮削影片元数据",
-			Description: "MetaTube 的 API 服务端：聚合 20+ 元数据提供方，供 Emby / Jellyfin 的 " +
-				"MetaTube 插件调用，按番号抓取封面、简介、演员等信息。" +
-				"装好后把插件里的服务地址填成 http://<本机地址>:8084。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8084,
+			Summary:     "给 Emby / Jellyfin 刮削影片元数据",
+			Description: "给 Emby / Jellyfin 刮削影片元数据的服务；默认不鉴权，建议只在内网用。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8084,
 			// 项目自带 Web 首页（GET / 返回 app 与 version 的 JSON，见 route/route.go），
 			// 拿它当探活路径既真实又不受后续 API 变更影响。
 			HealthPath: "/",
@@ -1735,11 +1683,9 @@ func Catalog() []App {
 					"Cross-Origin-Embedder-Policy": "require-corp",
 				},
 			},
-			Summary: "浏览器里的图片压缩，本地 wasm 完成",
-			Description: "PNG / JPEG / WebP / AVIF 压缩与尺寸调整，编解码全在浏览器里用 " +
-				"wasm 完成，图片不上传。⚠️ 上游没有官方镜像，这里用社区镜像 " +
-				"pjmeca/squoosh:1.1.0（固定版本），只托管静态文件、无服务端逻辑；端口 8085。",
-			Category: "tool", Kind: KindCompose, DockerReference: true, Port: 8085,
+			Summary:     "浏览器里的图片压缩，本地 wasm 完成",
+			Description: "浏览器里的图片压缩（PNG / JPEG / WebP / AVIF），本机 wasm 完成、不上传。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8085,
 			HealthPath: "/",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
 			// 唯一一个没有官方镜像的条目，如实标注并固定版本号：
@@ -1810,7 +1756,7 @@ func (m *Manager) Preflight(ctx context.Context, app App) Preflight {
 	// 端口被它自己占用是预期状态，报"冲突"会误导用户。
 	if app.AdoptLabel != "" {
 		pf.PortFree = true
-		pf.PortNote = "纳管已有服务，无需检查端口占用"
+		pf.PortNote = "已有服务，无需检查端口占用"
 		for _, req := range app.Requires {
 			pf.Checks = append(pf.Checks, m.checkRequirement(ctx, req))
 		}

@@ -218,21 +218,35 @@ func TestNormalizeRestartPolicy(t *testing.T) {
 }
 
 // TestDockerClientUnavailableMessage Docker 不可用时的报错必须可读且可执行。
+//
+// ⚠️ 2026-09-19 起指向的是「Docker」页的两颗按钮，**不再**提「服务管理」：
+// 服务管理已经合并进「应用 → 我的应用」，再指那里等于把用户送进死路
+// （用户原话："还有一个入口『去服务管理』，现在服务管理已经合并到应用市场了，
+//
+//	这个入口更没有意义了"）。这条测试锁住"指路必须是现存页面"。
 func TestDockerClientUnavailableMessage(t *testing.T) {
-	// 空 socket
+	// 空 socket：还没装，指向一键安装
 	m := NewManager(nil, Options{})
 	if _, err := m.dockerClientOrErr(); err == nil {
 		t.Fatal("空 socket 应报错")
-	} else if !strings.Contains(err.Error(), "应用市场") {
-		t.Errorf("应告诉用户去哪里装 Docker，实际: %v", err)
+	} else if !strings.Contains(err.Error(), "一键安装") {
+		t.Errorf("应告诉用户去哪里装 Docker（Docker 页的一键安装），实际: %v", err)
 	}
 
-	// socket 路径存在但文件不存在
+	// socket 路径存在但文件不存在：装了没跑，指向"启动运行时"
 	m2 := NewManager(nil, Options{DockerSocket: "/nonexistent/docker.sock"})
-	if _, err := m2.dockerClientOrErr(); err == nil {
+	_, err2 := m2.dockerClientOrErr()
+	if err2 == nil {
 		t.Fatal("socket 不存在时应报错")
-	} else if !strings.Contains(err.Error(), "服务管理") {
-		t.Errorf("应告诉用户去哪里启动运行时，实际: %v", err)
+	}
+	if !strings.Contains(err2.Error(), "启动") {
+		t.Errorf("应告诉用户去哪里启动运行时，实际: %v", err2)
+	}
+	for _, bad := range []string{"服务管理", "去应用市场"} {
+		if strings.Contains(err2.Error(), bad) {
+			t.Errorf("报错里不该再出现已消失的入口「%s」（服务管理已并入应用市场），实际: %v",
+				bad, err2)
+		}
 	}
 
 	// DockerInfo 不返回 error：不可用本身就是要显示给用户的信息

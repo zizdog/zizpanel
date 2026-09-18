@@ -22,7 +22,7 @@
 //
 //  1. **不出现任何应用 ID 的 if/else。** 哪颗按钮出现，全部由数据决定：
 //       · config_path 有没有            → 有没有「📝 编辑配置文件」
-//       · managed 是 true 还是 false    → 「卸载」还是「取消纳管」
+//       · managed 是 true 还是 false    → 「卸载」还是「从列表移除（不卸载软件）」
 //       · ui.slug 且 !ui.console_only   → 有没有「打开 / 直链」（见 openDirectActions）
 //       · 凭据接口返回空                → 不给「🔑 查看凭据」
 //       · 目录条目的 app_widgets        → 有没有这个应用自己的功能入口
@@ -646,7 +646,12 @@ function raceDeadline(p, ms, label) {
 // 现在按**目录数据**给终态，不再有"读取中"这种中间态从 render 里冒出来：
 //   · no_daemon 且面板托管界面 → 网页入口（本来就没有常驻进程）
 //   · no_daemon 且没有界面     → 命令行工具（本来就没有常驻进程）
-//   · 其余（已安装但没纳管）    → 未纳管（有服务可纳管，只是还没登记）
+//   · 其余（装了但面板里没有记录）→ 面板里暂无记录
+//
+// 2026-09-21 用户："弱化管纳这个概念" —— 原来这里写的是「未纳管」，那是个内部词，
+// 用户既不知道也不需要知道"纳管"是什么。改成"面板里暂无记录"：说的是一件
+// 用户能观察到的**事实**（面板里查不到这条服务的记录），并如实说明后果
+// （拿不到配置文件路径与日志），不再要求用户理解后台机制。
 //
 // 2026-09-17 导出：合并后的「我的应用」每一行的状态 pill 也走这一份措辞 ——
 // 服务行、市场卡片、管理面板三处的状态文案必须同一套（用户要求"复用现有
@@ -663,10 +668,15 @@ export function statusLine(st, m) {
   if (m && m.no_daemon) {
     const webUI = hasPanelUI(m) || !!(m.ui && m.ui.self_conf);
     return webUI
-      ? { cls: '', text: '网页入口（无常驻进程）', title: '这个应用没有守护进程，装完就是一个网页入口，「我的应用」里不会有常驻服务记录' }
+      ? { cls: '', text: '网页入口（无常驻进程）', title: '这个应用没有守护进程，装完就是一个网页入口，「已安装」里不会有常驻服务记录' }
       : { cls: '', text: '命令行工具（无常驻进程）', title: '这个应用是命令行工具：没有守护进程、也没有网页界面，供面板或其它应用在后台调用' };
   }
-  return { cls: '', text: '未纳管', title: '面板里还没有这条服务的记录，所以拿不到配置文件路径与日志' };
+  return {
+    cls: '',
+    text: '面板里暂无记录',
+    title: '面板里还没有这条服务的记录，所以拿不到配置文件路径与日志。'
+      + '可以在「已安装」工具栏用「+ 注册服务」把本机已有的服务加进来',
+  };
 }
 
 // openDirectActions 渲染「打开 / 直链」这一对入口 —— **唯一的一份实现**。
@@ -746,7 +756,7 @@ export function openDirectActions(m, opts = {}) {
       href: panelPath((slug || 'phpmyadmin') + '/'), target: '_blank', rel: 'noopener', text: '打开',
       title: '经面板打开（需先登录面板）' +
         (direct ? '；也可以直连：' + direct
-          : '；这个应用由面板直接托管，没有可直连的端口，所以没有「直链」'),
+          : '；这个应用只能从面板打开，没有可直连的端口，所以没有「直链」'),
     })];
     if (direct) out.push(directButton());
     return out;
@@ -819,7 +829,7 @@ export function reinstallButton(m, { onReinstall, onDone } = {}) {
  * @param {function}[o.onDone]  动作完成后刷新调用方（市场卡片 / 服务卡片）
  * @param {function}[o.onReinstall] 调用方那套"现有重装动作"（apps.js 的安装器）；
  *                                  不传时面板退回通用后端安装接口（见 reinstallButton）
- * @param {string} [o.primaryText] 面板里的第一颗按钮（"纳管"/"安装"这类**状态相关**动作）；
+ * @param {string} [o.primaryText] 面板里的第一颗按钮（"添加到面板"/"安装"这类**状态相关**动作）；
  *                                 文案与行为由调用方决定，面板只负责把它放在同一屏里。
  * @param {function}[o.primaryRun]
  * @returns {Promise<object>} modal 句柄
@@ -852,8 +862,8 @@ export async function openServicePanel(o = {}) {
 
   // renderActions 生成面板里的全部按钮 —— 这就是"不该分散在两个页面"的那份清单。
   // 顺序按用户的使用顺序：
-  //   ① 状态相关动作（纳管/安装，由调用方给） ② 启停 ③ 界面 ④ 配置 ⑤ 凭据
-  //   ⑥ 日志 ⑦ 应用自己的功能（目录条目的 app_widgets） ⑧ 收尾（取消纳管 / 卸载）
+  //   ① 状态相关动作（添加到面板/安装，由调用方给） ② 启停 ③ 界面 ④ 配置 ⑤ 凭据
+  //   ⑥ 日志 ⑦ 应用自己的功能（目录条目的 app_widgets） ⑧ 收尾（从列表移除 / 卸载）
   function renderActions(res) {
     const s = res.svc;
     const mi = res.market || m0;
@@ -916,13 +926,15 @@ export async function openServicePanel(o = {}) {
         onclick: () => configFileModal(s, afterAction),
       }));
     } else if (mi && mi.config_path) {
-      // 有配置文件名、但查不到服务记录（还没纳管）：如实说明原因，
+      // 有配置文件名、但查不到服务记录：如实说明原因，
       // 绝不给一个"点了报 400：文件不存在"的编辑器。
+      // 2026-09-21：不再让用户"先点纳管"（内部词、入口也删了），改成指一个
+      // **真实存在**的用户入口 —— 工具栏的「+ 注册服务」。
       out.push(h('button.btn.btn-sm', {
         text: '📝 编辑配置文件',
         disabled: true,
         title: '配置文件是 ' + mi.config_path + '，但面板里还没有这条服务的记录，' +
-          '拿不到它的绝对路径。先点「纳管」（或在「我的应用」里启动一次）再来编辑。',
+          '拿不到它的绝对路径。可以在「已安装」工具栏用「+ 注册服务」把本机已有的服务加进来，再来编辑。',
       }));
     }
 
@@ -950,29 +962,35 @@ export async function openServicePanel(o = {}) {
     //    这里只负责把它们放在同一排；没有专属入口的应用得到空数组。
     if (s) out.push(...appWidgets(s, m));
 
-    // ⑧ 收尾：managed=false 只给「取消纳管」，managed=true 才给「卸载」。
+    // ⑧ 收尾：managed=false 只给「从列表移除（不卸载软件）」，managed=true 才给「卸载」。
     //    这条判据来自**服务记录**，不来自应用 ID —— 非面板管理的服务不出现卸载。
     //
     // 2026-09 真机缺陷：用户删掉 Colima/Docker 后，一条 compose 记录只剩「卸载」，
     // 而卸载必然失败（"未找到 docker compose 命令"）→ 记录永远删不掉、被卡死。
     // 现在**任何托管记录都额外给一个"只删记录"出口**；运行时不可用时它就是唯一
-    // 能真正成功的收尾动作，文案如实写「取消纳管（仅删除记录）」并说明未停止容器。
+    // 能真正成功的收尾动作，文案如实写「从列表移除（不停止容器）」并说明未停止容器。
+    //
+    // 2026-09-21 用户："用户不需要知道什么是纳管 … 只要知道自己可以在应用里执行
+    // 安装、卸载、重装这些动作。" 所以这里的文案全部改成用户语言（删掉"纳管/托管"），
+    // 但**判据与行为一个字没改**：能不能真卸载仍然只看服务记录/目录卸载计划，
+    // 面板永远不会假装能卸载用户自己装的软件（那条边界是靠按钮文案如实表达，
+    // 不是靠让用户理解"纳管"）。
     if (s) {
       const rt = runtimeDownOf(s);
       if (s.managed) {
         out.push(uninstallButton(s, afterAction));
         out.push(forgetButton(s, afterAction, { recordOnly: true, runtimeDown: rt.down, reason: rt.reason }));
       } else if (mi && (mi.uninstall?.kind === 'installer' || mi.uninstall?.kind === 'service')) {
-        // 记录是「纳管」（managed=false），但**目录**说这个应用是面板自己装的
+        // 记录是 managed=false（内部叫"纳管记录"），但**目录**说这个应用是面板自己装的
         // （uninstall.kind = installer/service）→ 以目录为准，给真正的「卸载」。
         //
         // 为什么必须以目录为准（2026-09-17 真机复验）：PanelInstaller 类应用
         // （Miniflux / Qwen3 TTS / IOPaint / phpMyAdmin / Alist / frpc / ddns-go…）
-        // 登记时走的是 RegisterInstalledService，记录落在「纳管」上。合并页面之前，
-        // 市场卡片上还有一颗基于**目录卸载计划**的「卸载」，所以还能卸；合并后
-        // 卸载统一收进这个面板，只看记录就会只剩「取消纳管」——
-        // 于是面板装的应用**在界面上永远卸不掉**（点了"取消纳管"东西还在）。
-        // 两个都留着：它们语义不同（卸载 = 删应用；取消纳管 = 只删记录）。
+        // 登记时走的是 RegisterInstalledService，记录同样是 managed=false。合并页面
+        // 之前，市场卡片上还有一颗基于**目录卸载计划**的「卸载」，所以还能卸；合并后
+        // 卸载统一收进这个面板，只看记录就会只剩「从列表移除」——
+        // 于是面板装的应用**在界面上永远卸不掉**（点了"从列表移除"东西还在）。
+        // 两个都留着：它们语义不同（卸载 = 删应用；从列表移除 = 只删面板记录）。
         out.push(marketUninstallButton(mi, afterAction, s));
         out.push(forgetButton(s, afterAction));
       } else {
@@ -1020,8 +1038,13 @@ export async function openServicePanel(o = {}) {
         h('div', { style: { fontWeight: '620', fontSize: '14px', marginRight: '4px' }, text: displayName }),
         pill(line.cls, line.text, line.title),
         ((s && s.port) || (mi && mi.port)) > 0 ? pill('', ':' + ((s && s.port) || mi.port)) : null,
-        s ? pill(s.managed ? 'brand' : '', s.managed ? '面板托管' : '仅纳管',
-          s.managed ? '面板负责完整生命周期，可卸载' : '由你自己安装，面板只做启停与查看，不会卸载') : null,
+        // 「面板托管 / 仅纳管」pill 已删除（2026-09-21 用户："弱化管纳这个概念"）。
+        // 不能换成"由面板安装 / 本机已有"：记录里的 managed=false 并不等于
+        // "软件是用户装的" —— 面板自研安装器装出来的应用走的也是
+        // RegisterInstalledService，记录同样是 managed=false（见 install.go:1945）。
+        // 照记录写就会对用户说假话（铁律 11），而"谁装的"也不是用户能做的动作。
+        // 面板到底是「卸载」还是只「从列表移除（不卸载软件）」，由下面那颗
+        // 收尾按钮自己如实说明 —— 那才是用户需要知道的。
         // 「面板里没有服务记录」只对"**本该有服务**却查不到记录"的应用说。
         // no_daemon 的应用（ffmpeg / phpMyAdmin）本来就没有守护进程，报这一句
         // 是纯粹的误导 —— 用户 2026-09-16 反馈的正是 ffmpeg 上这句。
@@ -1083,12 +1106,14 @@ export async function openServicePanel(o = {}) {
     // 没有服务记录时给一句**终态**说明（不是"读取中"）：
     //   · no_daemon 的应用本来就没有守护进程 —— 说清它是命令行工具/网页入口，
     //     免得用户以为"面板没管到它"（用户 2026-09-16 反馈 ffmpeg 的那一条）；
-    //   · 其余是"装了但没纳管"—— 说清纳管之后才会出现配置/日志/启停。
+    //   · 其余是"装了、但面板里还没有它的记录"—— 说清加进来之后才会有
+    //     配置/日志/启停（入口：工具栏「+ 注册服务」；不再说"纳管"这个内部词）。
     const noSvcHint = (!s && mi)
       ? (mi.no_daemon
         ? '这个应用是' + (hasPanelUI(mi) || (mi.ui && mi.ui.self_conf) ? '网页入口' : '命令行工具') +
-          '，本来就没有常驻进程，所以不会出现在「服务管理」里。'
-        : '面板里还没有这条服务的记录（可能还没纳管）：纳管之后这里才会有配置路径、日志与启停入口。')
+          '，本来就没有常驻进程，所以不会出现在「已安装」的服务清单里。'
+        : '面板里还没有这条服务的记录，所以看不到配置路径与日志。'
+          + '可以在「已安装」工具栏用「+ 注册服务」把本机已有的服务加进来，之后这里就会有配置、日志与启停入口。')
       : (!rows.length ? '读不到这条服务的详情。' : '');
     appendAll(detailBox,
       rows.length
@@ -1108,7 +1133,7 @@ export async function openServicePanel(o = {}) {
   // （服务查询、凭据查询失败都只是"没有那项数据"），正常不会抛。这里再兜一层，
   // 是因为面板一旦抛出，界面上就永远停在「正在读取服务状态…」这个中间态 ——
   // 用户反馈的"卡在读取中"无论如何不能再出现。
-  // 兜底渲染用"无服务记录"的形态：它会走 statusLine 的终态分支（未纳管 /
+  // 兜底渲染用"无服务记录"的形态：它会走 statusLine 的终态分支（面板里暂无记录 /
   // 命令行工具），而不是中间态。
   try {
     render(await raceDeadline(resolvePanelData(m0, svc), PANEL_QUERY_TIMEOUT_MS, '读取服务状态'));
@@ -1135,84 +1160,103 @@ function runtimeDownOf(s) {
 // forgetRecord 走"只删记录"接口（DELETE /api/v1/services/{name}，后端只从面板
 // 移除记录、不触碰系统）。**404 必须如实降级**：旧面板没有这个能力时明确说
 // "该版本面板不支持，请升级"，绝不假装已经删掉。
+//
+// 提示语一律说**用户能观察到的后果**（记录没了、容器/文件没动），
+// 不再说"已删除面板记录"这种内部说法（2026-09-21）。
 async function forgetRecord(name, label, opts = {}) {
   try {
     await api.serviceForget(name);
     toast(opts.runtimeDown
-      ? '已删除面板记录（未停止容器：' + (opts.reason || '运行时不可用') + '）'
-      : '已删除面板记录（未停止、未删除任何容器或文件）', 'ok', 12000);
+      ? '已从列表移除（未停止容器：' + (opts.reason || '运行时不可用') + '）'
+      : '已从列表移除（未停止、未删除任何容器或文件）', 'ok', 12000);
     if (typeof opts.onDone === 'function') opts.onDone();
     return true;
   } catch (e) {
     const status = e && e.status;
     if (status === 404 || status === 405) {
-      toast('该版本面板不支持"只删除记录"（' + ((e && e.message) || status) + '），请升级面板后再试', 'err', 15000);
+      toast('该版本面板不支持"从列表移除"（' + ((e && e.message) || status) + '），请升级面板后再试', 'err', 15000);
     } else {
-      toast('删除记录失败：' + ((e && e.message) || e), 'err', 12000);
+      toast('从列表移除失败：' + ((e && e.message) || e), 'err', 12000);
     }
     return false;
   }
 }
 
 // recordOnlyModal 是"卸载失败"时的兜底对话框：把原因说清，并给一个**可直接点**的
-// 「只删除记录」出口。卸载失败不能只丢一句 toast 就完了（用户没有下一步）。
+// 「从列表移除」出口。卸载失败不能只丢一句 toast 就完了（用户没有下一步）。
 function recordOnlyModal(opts) {
   const { label, name, error, runtimeDown, reason, onDone } = opts;
   const bodyLines = [
     h('div', { style: { marginBottom: '8px' }, text: '卸载「' + label + '」没有成功：' + error }),
   ];
   if (runtimeDown) {
-    bodyLines.push(h('div', { text: '容器没法停（运行时不存在），可以只把这条记录从面板里去掉 —— 容器与磁盘数据不会被动。' }));
-    bodyLines.push(h('div.hint', { text: '未停止容器：' + (reason || '运行时不可用') + '。这一步只删除面板记录，不碰磁盘上的项目文件/数据卷。' }));
+    bodyLines.push(h('div', { text: '容器没法停（运行时不存在），可以把这条记录从列表里移除 —— 容器与磁盘数据不会被动。' }));
+    bodyLines.push(h('div.hint', { text: '未停止容器：' + (reason || '运行时不可用') + '。这一步只去掉面板里的记录，不碰磁盘上的项目文件/数据卷。' }));
   } else {
-    bodyLines.push(h('div', { text: '可以只把这条记录从面板里去掉。' }));
-    bodyLines.push(h('div.hint', { text: '注意：删记录不会停止或删除任何容器/文件 —— 如果容器还在运行，它会保持原样（容器可能还在）。' }));
+    bodyLines.push(h('div', { text: '可以把这条记录从列表里移除，软件本身不受影响。' }));
+    bodyLines.push(h('div.hint', { text: '注意：从列表移除不会停止或删除任何容器/文件 —— 如果容器还在运行，它会保持原样（容器可能还在）。' }));
   }
   modal({
-    title: '只删除记录 · ' + label,
+    title: '从列表移除 · ' + label,
     body: h('div', bodyLines),
     footer: (close) => [
       h('button.btn', { text: '关闭', onclick: close }),
       h('button.btn.btn-primary', {
-        text: '只删除记录',
+        text: runtimeDown ? '从列表移除（不停止容器）' : '从列表移除（不卸载软件）',
         onclick: async () => { close(); await forgetRecord(name, label, { runtimeDown, reason, onDone }); },
       }),
     ],
   });
 }
 
-// forgetButton 取消纳管 / 只删除记录：只删面板记录，不动系统上的服务。
+// forgetButton 「从列表移除」：只删面板记录，不动系统上的任何东西。
 //
-// opts.recordOnly=true 时用于**面板托管**的记录（managed=true）—— 这是"任何服务记录
-// 都有一个只删记录出口"的保证；opts.runtimeDown=true 时（compose 运行时不可用）
-// 文案直接写成「取消纳管（仅删除记录）」并如实说明没有停止任何容器。
+// 用户 2026-09-21："用户不需要知道什么是纳管，不需要知道系统里运行的软件是怎么被
+// 面板控制的，只要知道自己可以在应用里执行安装、卸载、重装这些动作就可以了。"
+// 所以这颗按钮曾经叫「取消纳管 / 仅删除面板记录」，现在统一叫
+// 「从列表移除（不卸载软件）」——**说的是用户能观察到的后果**，不要求他理解
+// 记录、托管、纳管这些内部概念。
+//
+// 为什么文案必须带那个括号（这不是啰嗦，是安全边界的一部分）：
+// 后端的语义是"managed=false 的记录绝不卸载软件"（删掉用户自己的 MySQL 等于删掉
+// 他的数据）。如果这颗按钮只写「移除」，用户会以为"移除 = 卸载"，
+// 点了发现软件还在，就会以为面板坏了/在骗人；反过来，如果为了"说得像卸载"而真的
+// 去卸载，就会删掉用户自己装的软件。括号里的四个字 + 确认框里逐字说明，
+// 既保住了后端的安全边界，又让用户知道**软件本身完全不受影响**。
+//
+// opts.recordOnly=true 时用于**面板管理**的记录（managed=true）—— 这是"任何服务
+// 记录都有一个只删记录出口"的保证（2026-09 真机缺陷：用户删掉 Colima/Docker 后
+// 一条 compose 记录只剩「卸载」，卸载必然失败 → 记录永远删不掉）；
+// opts.runtimeDown=true 时（compose 运行时不可用）括号里改成「不停止容器」，
+// 并如实说明没有停止任何容器。
 export function forgetButton(m, onDone, opts = {}) {
   const name = serviceNameOf(m);
   const label = m.display_name || m.name || name;
   const recordOnly = !!opts.recordOnly;
   const runtimeDown = !!opts.runtimeDown;
   const reason = opts.reason || '运行时不可用';
-  const text = recordOnly
-    ? (runtimeDown ? '取消纳管（仅删除记录）' : '仅删除面板记录')
-    : '取消纳管';
+  const text = recordOnly && runtimeDown
+    ? '从列表移除（不停止容器）'
+    : '从列表移除（不卸载软件）';
   return h('button.btn.btn-sm', {
     text,
-    title: recordOnly
-      ? '只把这条记录从面板移除，不停止、不删除任何容器或文件'
-      : '只把这个服务从面板记录里移除，不动系统上的任何东西',
+    title: recordOnly && runtimeDown
+      ? '只把这条记录从面板移除；运行时不可用，所以不会停止、也不会删除任何容器或文件'
+      : '只把这条记录从面板移除，不会卸载软件本身（不跑 brew uninstall、不删文件），系统上的服务完全不受影响',
     onclick: async () => {
-      const msg = recordOnly
-        ? ('把「' + label + '」从面板记录里移除？\n\n'
-          + (runtimeDown
-            ? ('运行时不可用（' + reason + '），所以**没有**停止任何容器，也不会删除磁盘上的项目文件与数据卷。\n'
-              + '只把这条记录从面板移除 —— 未停止容器。')
-            : '只删除面板记录：面板不会停止或删除任何容器/文件（如果它们还在运行，会保持原样）。'))
-        : ('把「' + label + '」从面板记录里移除？\n\n' +
-          '面板不会卸载你自己安装的软件（不跑 brew uninstall、不删文件），只是不再管它。' +
-          '以后想再管它，可以用「扫描可纳管服务」重新纳管。');
+      const msg = (recordOnly && runtimeDown)
+        ? ('把「' + label + '」从列表移除？\n\n'
+          + '运行时不可用（' + reason + '），所以**没有**停止任何容器，也不会删除磁盘上的项目文件与数据卷。\n'
+          + '只把这条记录从面板移除 —— 未停止容器。')
+        : ('把「' + label + '」从列表移除？\n\n'
+          + '不会卸载软件本身：面板不跑 brew uninstall、不删任何文件，'
+          + '软件在系统里的运行与配置完全不受影响，只是不再显示在面板里。\n'
+          + (recordOnly
+            ? '面板也不会停止或删除任何容器/文件（如果它们还在运行，会保持原样）。'
+            : '想再加回来，可以用「已安装」工具栏的「+ 注册服务」。'));
       if (!await confirmBox(msg, {
-        title: recordOnly ? '仅删除记录' : '取消纳管',
-        okText: '确认删除记录',
+        title: '从列表移除',
+        okText: '确认移除',
       })) return;
       await forgetRecord(name, label, { runtimeDown, reason, onDone });
     },

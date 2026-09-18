@@ -178,36 +178,10 @@ func (m *Manager) colimaFastState() (running bool, detail string, found bool) {
 	if base == "" {
 		base = filepath.Join(home, ".colima", "_lima")
 	}
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return false, "", false
-	}
-
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		// 实例名：默认 profile 是 colima，带 profile 的是 colima-<name>
-		if e.Name() != "colima" && !strings.HasPrefix(e.Name(), "colima-") {
-			continue
-		}
-		dir := filepath.Join(base, e.Name())
-		alive := false
-		if b, err := os.ReadFile(filepath.Join(dir, "ha.pid")); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
-				alive = processAlive(pid)
-			}
-		}
-		sockOK := false
-		if fi, err := os.Stat(filepath.Join(dir, "ssh.sock")); err == nil && fi.Mode()&os.ModeSocket != 0 {
-			sockOK = true
-		}
-		if alive && sockOK {
-			return true, "虚拟机运行中（实例 " + e.Name() + "）", true
-		}
-		return false, "虚拟机未运行（实例 " + e.Name() + "）", true
-	}
-	return false, "", false
+	// 目录布局与判据的**唯一实现**在 readColimaFastState（docker_runtime.go）：
+	// DockerRuntimeStatus 也要用同一套（pid 活着 **且** ssh.sock 在），
+	// 判据抄两份迟早会分叉，出现"这里说在跑、那里说没跑"。
+	return readColimaFastState(base)
 }
 
 func (d *colimaDriver) Status(ctx context.Context) (State, error) {

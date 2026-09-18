@@ -205,6 +205,16 @@ const MARKET = {
       docs_url: 'https://ollama.com',
     },
     {
+      // 2026-09-21 用户："弱化管纳这个概念 … 用户不需要知道什么是纳管。"
+      // adopt_label 非空 = 后端对这条只做 AdoptApp（把本机**已经存在**的服务
+      // 登记进面板，不重新安装）。所以卡片主按钮必须是用户语言的「添加到面板」，
+      // 界面上不许出现"纳管 / 接入 / 托管"。
+      id: 'ollama-adopt', name: 'Ollama（本机已有）', icon: '🦙', category: 'ai', kind: 'native',
+      summary: '本机已经装了 Ollama，只把它加到面板里管理', description: '不重新安装，只登记已有服务。',
+      port: 11434, installed: false, adopted: false, available: true,
+      adopt_label: 'com.ollama.serve',
+    },
+    {
       id: 'nginx', name: 'Nginx', icon: '🌐', category: 'lnmp', kind: 'native',
       summary: 'Web 服务器', description: 'brew 装的 nginx。', port: 8080,
       installed: true, adopted: true, available: true,
@@ -279,6 +289,16 @@ const SERVICES = {
     // 合并后必须只剩一行，状态取在跑的那条、plist 路径补自另一条。
     SV({ name: 'php82', display_name: 'PHP 8.2 (FPM)', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'homebrew.mxcl.php@8.2', config_path: '/opt/homebrew/etc/php/8.2/php-fpm.d/www.conf', log_path: '/opt/homebrew/var/log/php-fpm.log', state: { running: true, status: 'running', detail: 'pid 1234' } }),
     SV({ name: 'sh-brew-php8-2', display_name: 'PHP 8.2', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'sh.brew.php8-2', plist_path: '/Users/zizdog/Library/LaunchAgents/homebrew.mxcl.php@8.2.plist', health: { checked: false }, state: { running: false, status: 'stopped', detail: '未在运行' } }),
+    // ---- 「需要处理」筛选合并的夹具（2026-09-21）----
+    // 三种"需要处理"必须**全部**被合并后的一个筛选命中：
+    //   ① 启动失败（status=error）  ② 运行时不可用（status=unavailable）
+    //   ③ 健康检查没通过（health.checked && !health.ok）
+    // 合并前它们是两个筛选（「异常」= ①②， 「仅健康检查失败」= ③），而 ③ 是
+    // ①②那个判据的一部分 —— 这里独立按**旧定义**重算一遍期望值，
+    // 断言合并后一张都不少（用户：别把有问题却看起来正常的情况藏起来）。
+    SV({ name: 'uitest-svc-error', display_name: 'UITEST 启动失败', icon: '💥', kind: 'native', port: 0, managed: false, state: { running: false, status: 'error', detail: '启动失败：退出码 1' }, health: { checked: false } }),
+    SV({ name: 'uitest-svc-unavail', display_name: 'UITEST 运行时不可用', icon: '🧯', kind: 'native', port: 0, managed: false, state: { running: false, status: 'unavailable', detail: 'Docker 不可用' }, health: { checked: false } }),
+    SV({ name: 'uitest-svc-health', display_name: 'UITEST 健康检查没过', icon: '🩺', kind: 'native', port: 0, managed: false, state: { running: true, status: 'running', detail: 'pid 777' }, health: { checked: true, ok: false, message: '连接被拒绝', url: 'http://127.0.0.1:9/' } }),
   ],
 };
 
@@ -294,6 +314,10 @@ const CREDS = {
 
 await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
   window.__calls = [];
+  // 服务夹具也挂到 window 上：page.evaluate 里要用**旧定义**独立重算
+  // "需要处理"筛选的期望值（SERVICES 本身只是 addInitScript 的闭包参数，
+  // 在 evaluate 里取不到 —— 2026-09-21 这里踩过一次 ReferenceError）。
+  window.__servicesFixture = SERVICES;
   // 每次写请求的**请求体**（"方法 路径" → body 字符串）。
   // 2026-09-19 起一键 LNMP 必须带上用户选的版本，所以必须能看到 body：
   // 只看"发过 POST"无法证明"发的是用户选的那个版本"。
@@ -443,8 +467,10 @@ const result = await page.evaluate(async () => {
   // 页内 Tab 条：当前选中项的 data-tab（btn-primary 是选中态）。
   const activeTabOf = (box) => Array.from(box.querySelectorAll('[data-tab]'))
     .find((b) => b.classList.contains('btn-primary'))?.getAttribute('data-tab') || null;
-  // 卡片上的"已安装"判据：pill 文案里有「已安装」或「已纳管」。
-  const looksInstalled = (c) => /已安装|已纳管/.test(c.textContent || '');
+  // 卡片上的"已安装"判据：pill 文案里有「已安装」。
+  // 2026-09-21 起面板里不再有「已纳管」这个 pill（内部词，用户要求弱化），
+  // 面板有记录的应用显示的就是「已安装」。
+  const looksInstalled = (c) => /已安装/.test(c.textContent || '');
 
   // ---- ① 四个一级 Tab：存在、默认「已安装」 ----
   const tabBox = document.createElement('div');
@@ -574,6 +600,40 @@ const result = await page.evaluate(async () => {
     closeModal();
   }
   svcBox.remove();
+
+  // ---- ②f 筛选合并（2026-09-21）：4 项、且「需要处理」不漏卡 ----
+  //  用户在 2026-09-21 指出「异常」与「仅健康检查失败」重复（后者是前者的子集），
+  //  而且这两个名字对用户都没有意义。现在只剩 4 项，其中「需要处理」是唯一的
+  //  "有问题"入口。这里独立按**旧定义**重算期望值（不复用被测代码的判据），
+  //  断言：原本能被「异常」或「仅健康检查失败」命中的卡片，一张都不少。
+  const filterBox = document.createElement('div');
+  root.appendChild(filterBox);
+  AppsView(filterBox, { tab: 'installed' });
+  await settle(); await settle();
+  const keyOfCard = (el) => el.getAttribute('data-app-key');
+  const toolbarBtns = () => Array.from(filterBox.querySelectorAll('#installed-toolbar button'))
+    .map((b) => ({ el: b, text: (b.textContent || '').trim() }));
+  out.filter = {
+    labels: toolbarBtns().map((b) => b.text),
+    expectedKeys: (window.__servicesFixture.list || []).filter((s) => {
+      const st = s.state || {};
+      const h = s.health || {};
+      return st.status === 'error' || st.status === 'unavailable' || (h.checked && !h.ok);
+    }).map((s) => appKeyOf(s)),
+    problems: [],
+    countText: (toolbarBtns().find((b) => b.text.includes('需要处理') && b.text.includes('⚠')) || {}).text || '',
+  };
+  const problemBtn = toolbarBtns().find((b) => b.text === '需要处理');
+  if (problemBtn) {
+    problemBtn.el.click();
+    await settle();
+    out.filter.problems = Array.from(filterBox.querySelectorAll('#installed-grid > div')).map(keyOfCard);
+  }
+  // 复位成「全部」：stateFilter 是模块级变量，不复位会污染后面几次渲染
+  const allBtn = toolbarBtns().find((b) => b.text === '全部');
+  if (allBtn) { allBtn.el.click(); await settle(); }
+  out.filter.afterReset = filterBox.querySelectorAll('#installed-grid > div').length;
+  filterBox.remove();
 
   // ---- ②b docker Tab：纯展示，**没有任何安装动作** ----
   const dockerBox = document.createElement('div');
@@ -731,9 +791,10 @@ const infoOf = (name) => {
     manageCount: b.filter((t) => t.includes('管理')).length,
     refresh: b.some((t) => t.includes('刷新')),
     // 2026-09-17：重装 / 文档 / 卸载**不再**摆卡片上，它们收进「⚙️ 管理」面板。
+    // 2026-09-21：「取消纳管」这个词从界面上删掉了，收尾按钮叫「从列表移除（…）」。
     reinstall: b.some((t) => t.includes('重装')),
     docs: b.some((t) => t === '文档'),
-    uninstall: b.some((t) => t.includes('卸载') || t.includes('取消纳管') || t.includes('删除残留')),
+    uninstall: b.some((t) => t.includes('卸载') || t.includes('从列表移除') || t.includes('删除残留')),
   };
 };
 // 面板里的按钮（从市场卡片的「⚙️ 管理」点开时采到的快照）。
@@ -763,6 +824,10 @@ console.log(`  Uptime Kuma 卡片文本：${(result.installed.text['Uptime Kuma'
 console.log(`  有「打开」的卡片：${show(result.installed.withOpen)}`);
 console.log(`  任何卡片出现过「直链」？ ${result.installed.anyDirect ? '是 ✗' : '否 ✓'}`);
 console.log(`  已安装工具条：${show(result.installed.toolbarButtons)}`);
+console.log(`  筛选按钮：${show(result.filter.labels)}`);
+console.log(`  「需要处理」按钮文案：${result.filter.countText}`);
+console.log(`  筛选期望（按旧定义独立重算）：${show(result.filter.expectedKeys)}`);
+console.log(`  「需要处理」实际筛出：${show(result.filter.problems)}（复位后卡片数 ${result.filter.afterReset}）`);
 
 console.log('\n══════════ ②b docker Tab：纯展示，没有安装动作 ══════════');
 console.log(`  激活 Tab=${result.docker.activeTab}`);
@@ -789,7 +854,7 @@ const ffPanel = result.panelFromMarket['FFmpeg（音视频工具）'] || {};
 console.log(`  卡片按钮：${show(ff.buttons)}`);
 console.log(`  面板状态行：${ffPanel.status || '（没打开）'}`);
 console.log(`  面板按钮：${show(ffPanel.buttons)}`);
-console.log(`  面板里出现「未纳管 / 面板里没有服务记录」？ ${/未纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || '') ? '是 ✗' : '否 ✓'}`);
+console.log(`  面板里出现「纳管 / 面板里没有服务记录」？ ${/纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || '') ? '是 ✗' : '否 ✓'}`);
 console.log(`  面板里出现「读取中」？        ${(ffPanel.panelText || '').includes('读取中') ? '是 ✗' : '否 ✓'}`);
 const ffLookups = result.calls.filter((c) => /\/services\/ffmpeg(\?|$)/.test(c));
 console.log(`  面板是否查过不存在的服务记录？ ${ffLookups.length ? '查了 ✗ ' + ffLookups.join(', ') : '没查 ✓（no_daemon 直接走终态）'}`);
@@ -838,7 +903,7 @@ for (const [slug, name, installed] of WANT) {
   if (installed) {
     check(`${name}：卡片上不再有「重装」（收进 ⚙️ 管理）`, !i.reinstall, show(i.buttons));
     check(`${name}：卡片上不再有「文档」（收进 ⚙️ 管理）`, !i.docs, show(i.buttons));
-    check(`${name}：卡片上不再有「卸载 / 取消纳管」（收进 ⚙️ 管理）`, !i.uninstall, show(i.buttons));
+    check(`${name}：卡片上不再有「卸载 / 从列表移除」（收进 ⚙️ 管理）`, !i.uninstall, show(i.buttons));
     check(`${name}：卡片上有「⚙️ 管理」`, i.manageCount === 1, `实际 ${i.manageCount} 个`);
     check(`${name}：管理面板里有「重装」`, panelOf(name).some((t) => t.includes('重装')), show(panelOf(name)));
   } else {
@@ -1039,15 +1104,60 @@ check('已安装：php82 卡片如实标出被合并掉的记录条数',
 check('去重：被丢弃记录的字段（plist 路径）并进了保留的那条',
   (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').includes('homebrew.mxcl.php@8.2.plist'),
   (result.panelFromService['PHP 8.2 (FPM)']?.panelText || '').slice(0, 400));
-check('已安装工具条：有「🔍 扫描可纳管服务」与「+ 注册服务」（可纳管功能没丢）',
-  (result.installed.toolbarButtons || []).includes('🔍 扫描可纳管服务')
+check('已安装工具条：不再有「🔍 扫描可纳管服务」，但保留了「+ 注册服务」（能力没丢，只换了说法）',
+  !(result.installed.toolbarButtons || []).some((t) => t.includes('扫描') || t.includes('纳管'))
   && (result.installed.toolbarButtons || []).includes('+ 注册服务'),
   show(result.installed.toolbarButtons));
+
+// ---------- ⑧b 筛选合并：4 项、且一个问题卡片都不许漏 ----------
+check('状态筛选只剩 4 项（全部 / 运行中 / 已停止 / 需要处理）',
+  ['全部', '运行中', '已停止', '需要处理'].every((n) => (result.filter.labels || []).includes(n)),
+  show(result.filter.labels));
+check('筛选里不再有「异常」与「仅健康检查失败」（用户说这两个重复且无意义）',
+  !(result.filter.labels || []).some((t) => t.includes('异常') || t.includes('仅健康检查失败')),
+  show(result.filter.labels));
+check('工具条那颗按钮的文案是「⚠ N 个需要处理」（不再写"健康检查失败"这个半术语）',
+  /^⚠\s*\d+\s*个需要处理$/.test(result.filter.countText || ''), result.filter.countText);
+check('「需要处理」把旧「异常」（启动失败 / 运行时不可用）的卡片全部筛出来',
+  ['uitestsvcerror', 'uitestsvcunavail'].every((k) => (result.filter.problems || []).includes(k)),
+  `期望含 error/unavailable，实际 ${show(result.filter.problems)}`);
+check('「需要处理」把旧「仅健康检查失败」的卡片也筛出来（合并不许藏起问题）',
+  (result.filter.problems || []).includes('uitestsvchealth'),
+  `实际 ${show(result.filter.problems)}`);
+check('「需要处理」筛出的**正好**是旧判据命中的那些卡片（不多不漏）',
+  JSON.stringify([...(result.filter.problems || [])].sort()) === JSON.stringify([...(result.filter.expectedKeys || [])].sort()),
+  `期望 ${show(result.filter.expectedKeys)} 实际 ${show(result.filter.problems)}`);
+check('点「全部」能复位（筛选状态不粘住）',
+  result.filter.afterReset > (result.filter.problems || []).length,
+  `复位后 ${result.filter.afterReset}，筛选时 ${(result.filter.problems || []).length}`);
+check('本机已有但面板没记录的服务：市场卡片主按钮是「添加到面板」（不是"纳管/接入/安装"）',
+  JSON.stringify(result.market.buttons['Ollama（本机已有）'] || []) === JSON.stringify(['添加到面板']),
+  show(result.market.buttons['Ollama（本机已有）']));
+check('Nginx（本机已有的服务）：收尾按钮是「从列表移除（不卸载软件）」，不再说"取消纳管"',
+  panelOf('Nginx').includes('从列表移除（不卸载软件）') && !panelOf('Nginx').some((t) => t.includes('纳管')),
+  show(panelOf('Nginx')));
+
+// ---------- ⑧c 用户可见处一个内部词都不许留（2026-09-21） ----------
+// 卡片、面板文本、工具条一起查。只查"纳管 / 面板托管 / 仅纳管 / 接入管理"，
+// 不查"托管"两个字：应用摘要里有"自托管服务监控"这种正常说法。
+const INTERNAL_WORD = /纳管|面板托管|仅纳管|接入管理/;
+const internalOffenders = [];
+for (const [where, text] of [
+  ...Object.entries(result.installed.text || {}).map(([n, t]) => ['已安装卡片 ' + n, t]),
+  ...Object.entries(result.market.text || {}).map(([n, t]) => ['市场卡片 ' + n, t]),
+  ...Object.entries(result.panelFromMarket || {}).map(([n, p]) => ['市场面板 ' + n, (p || {}).panelText || '']),
+  ...Object.entries(result.panelFromService || {}).map(([n, p]) => ['服务面板 ' + n, (p || {}).panelText || '']),
+  ['已安装工具条', (result.installed.toolbarButtons || []).join(' ')],
+]) {
+  if (INTERNAL_WORD.test(text || '')) internalOffenders.push(where);
+}
+check('全部用户可见文本里不再出现「纳管 / 面板托管 / 仅纳管 / 接入管理」',
+  internalOffenders.length === 0, show(internalOffenders));
 check('市场 / 已安装打开的是同一个面板', same);
 
 // ---------- ⑨ ffmpeg / 超时 / 归一化 / 管理面板 ----------
-check('ffmpeg 面板不显示「未纳管 / 面板里没有服务记录」（它是 CLI 工具，不是"没纳管"）',
-  !/未纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || ''));
+check('ffmpeg 面板不显示「纳管 / 面板里没有服务记录」（它是 CLI 工具，不是"没纳管"）',
+  !/纳管|面板里没有服务记录|未在服务管理里/.test(ffPanel.panelText || ''));
 check('ffmpeg 面板不显示「读取中」', !(ffPanel.panelText || '').includes('读取中'));
 check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', (ffPanel.status || '').includes('命令行工具（无常驻进程）'), ffPanel.status);
 check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups.join(', '));
@@ -1065,7 +1175,7 @@ check('归一化：com.zizdog.* 前缀的不同写法同 key',
   JSON.stringify(result.keys));
 const qwenPanel = result.panelFromService['Qwen3 TTS（语音合成）'] || {};
 const qwenDirect = (qwenPanel.links || []).find((l) => l.text === '直链');
-check('管理面板：纯纳管服务（无 port_url）有端口 → 给出拼接的「直链」，title 说明局限',
+check('管理面板：只有面板记录、没有市场条目的服务（无 port_url）有端口 → 给出拼接的「直链」，title 说明局限',
   !!qwenDirect && qwenDirect.href === 'http://127.0.0.1:8880/' && /拼出来/.test(qwenDirect.title),
   JSON.stringify(qwenDirect));
 const orbienPanel = result.panelFromService['Orbien 客户端（CLI）'] || {};

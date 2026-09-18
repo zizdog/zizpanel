@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -326,5 +327,209 @@ func TestColimaFastState(t *testing.T) {
 	_ = os.Remove(sockPath)
 	if running, _, found := m.colimaFastState(); !found || running {
 		t.Errorf("socket 不存在时应报未运行，实际 running=%v found=%v", running, found)
+	}
+}
+
+// ============================================================================
+//  Docker 运行时的真实状态探测（三态 + 僵尸 plist 回归）
+//
+//  用户 2026-09-19 实测的现场：本机**没有** colima（~/.colima 不存在、
+//  which colima 为空、/var/run/docker.sock 不存在），只有一份旧版安装留下的
+//  /Library/LaunchDaemons/com.zizdog.colima.plist；应用市场却因为"plist 在
+//  就算已安装"显示「Colima 已安装·未纳管」，用户既找不到安装入口、
+//  也点不出引擎来。
+//
+//  下面用注入点把三个状态钉死（**绝不**去真跑 colima、真连 socket）：
+//    · 没装        —— 二进制探测返回错误；
+//    · 装了没跑    —— 二进制在、socket 连不上；
+//    · 在跑        —— 二进制在、socket 有响应。
+// ============================================================================
+
+// dockerRuntimeTestManager 造一个完全隔离的 Manager：家目录是临时目录、
+// brew 前缀在临时目录下（所以真实文件系统里不可能意外命中 colima）。
+func dockerRuntimeTestManager(t *testing.T, home string) *Manager {
+	t.Helper()
+	return NewManager(nil, Options{
+		BrewBin:  filepath.Join(home, "brew", "bin", "brew"),
+		UserHome: home,
+		UserName: "zizdog",
+	})
+}
+
+// TestDockerRuntimeStatusNotInstalled 没装 = not-installed，且**不看**任何残留文件。
+func TestDockerRuntimeStatusNotInstalled(t *testing.T) {
+	home := t.TempDir()
+	m := dockerRuntimeTestManager(t, home)
+	m.dockerBinProbeOverride = func(string) (string, error) {
+		return "", fmt.Errorf("executable file not found in $PATH")
+	}
+	m.dockerVersionOverride = func(context.Context, string) string { return "" }
+
+	got := m.DockerRuntimeStatus(context.Background())
+	if got.State != DockerRuntimeNotInstalled {
+		t.Errorf("没装 colima 时必须报 %s，实际 %q（note: %s）",
+			DockerRuntimeNotInstalled, got.State, got.Note)
+	}
+	if got.BinaryInstalled {
+		t.Error("二进制不在时 BinaryInstalled 必须是 false —— 这是「已安装」的唯一判据")
+	}
+	if got.SocketReachable {
+		t.Error("没有 socket 时不该报 SocketReachable=true")
+	}
+	if got.EngineVersion != "" {
+		t.Errorf("拿不到引擎版本就该留空（未知，不许猜），实际 %q", got.EngineVersion)
+	}
+}
+
+// TestDockerRuntimeStatusStopped 装了但引擎没跑 = stopped。
+//
+// 这一态是**最容易谎报**的：socket 文件还留在磁盘上（VM 崩了/刚重启），
+// 只看"文件在不在"就会说"在跑"。所以判据必须是"问得到 Docker API"。
+func TestDockerRuntimeStatusStopped(t *testing.T) {
+	home := t.TempDir()
+	m := dockerRuntimeTestManager(t, home)
+	m.dockerBinProbeOverride = func(string) (string, error) {
+		return "/opt/homebrew/bin/colima", nil
+	}
+	m.dockerVersionOverride = func(context.Context, string) string { return "" }
+
+	// 造一个**残留 socket 文件**：它存在，但上面没人应答。
+	// macOS 上 unix socket 路径上限约 104 字节，所以用 /tmp 短路径。
+	short, err := os.MkdirTemp("/tmp", "zpc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	sock := filepath.Join(short, "docker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("造残留 socket 失败: %v", err)
+	}
+	// 监听保持打开（t.Cleanup 里由 testing 收尾）：`ln.Close()` 会把 socket 文件
+	// 一起删掉，那就造不出"文件在、引擎不在"的现场了。这里的关键是**注入的
+	// DialVersion 返回空** —— 等价于"文件在但上面没人应答"（VM 崩掉的样子）。
+	defer ln.Close()
+
+	m.opt.DockerSocket = sock
+	got := m.DockerRuntimeStatus(context.Background())
+	if got.State != DockerRuntimeStopped {
+		t.Errorf("二进制在但 socket 连不上时必须报 %s，实际 %q", DockerRuntimeStopped, got.State)
+	}
+	if !got.BinaryInstalled {
+		t.Error("二进制在时 BinaryInstalled 应为 true")
+	}
+	if got.SocketReachable {
+		t.Error("socket 连不上时绝不能报 SocketReachable=true（那会把停止态谎报成运行态）")
+	}
+	if got.SocketPath != sock {
+		t.Errorf("探测到的 socket 路径应为 %q，实际 %q", sock, got.SocketPath)
+	}
+}
+
+// TestDockerRuntimeStatusRunning 装着且在跑 = running，并且**如实**给出引擎版本。
+func TestDockerRuntimeStatusRunning(t *testing.T) {
+	home := t.TempDir()
+	m := dockerRuntimeTestManager(t, home)
+	m.dockerBinProbeOverride = func(string) (string, error) {
+		return "/opt/homebrew/bin/colima", nil
+	}
+	m.dockerVersionOverride = func(_ context.Context, sock string) string {
+		if sock == "" {
+			t.Error("引擎在跑时必须把探测到的 socket 路径传进来")
+		}
+		return "29.5.2"
+	}
+
+	short, err := os.MkdirTemp("/tmp", "zpc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	sock := filepath.Join(short, "docker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	m.opt.DockerSocket = sock
+	got := m.DockerRuntimeStatus(context.Background())
+	if got.State != DockerRuntimeRunning {
+		t.Fatalf("应报 %s，实际 %q", DockerRuntimeRunning, got.State)
+	}
+	if !got.SocketReachable {
+		t.Error("能问到 Docker API 时应报 SocketReachable=true")
+	}
+	if got.EngineVersion != "29.5.2" {
+		t.Errorf("引擎版本应如实返回 29.5.2，实际 %q", got.EngineVersion)
+	}
+	if got.Note == "" {
+		t.Error("应给一句人能看懂的状态说明（界面直接显示它）")
+	}
+}
+
+// TestDockerRuntimeZombiePlistIsArtifactNotInstalled 是用户实测那条的**回归测试**。
+//
+// 现场：只有一份旧版留下的开机自启 plist（或 ~/.colima 配置目录），
+// colima 二进制根本不在。此时：
+//
+//	· State 必须是 not-installed（不能因为 plist 在就算装了）；
+//	· Artifacts 必须是 true 且 PlistExists=true —— 界面据此给「重新安装 / 清理残留」，
+//	  而不是把卡片钉死在"已安装"上让用户没有入口。
+func TestDockerRuntimeZombiePlistIsArtifactNotInstalled(t *testing.T) {
+	home := t.TempDir()
+	m := dockerRuntimeTestManager(t, home)
+	m.dockerBinProbeOverride = func(string) (string, error) {
+		return "", fmt.Errorf("executable file not found in $PATH")
+	}
+	m.dockerVersionOverride = func(context.Context, string) string { return "" }
+
+	// 复刻残留：~/.colima 配置目录（僵尸 plist 在 /Library/LaunchDaemons，
+	// 单测没有 root 也**绝不该**去动真实系统目录 —— 所以用 os.Stat 的注入在
+	// web 层覆盖，见 internal/web/api_docker_test.go 的端到端回归）。
+	if err := os.MkdirAll(filepath.Join(home, ".colima"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := m.DockerRuntimeStatus(context.Background())
+	if got.State != DockerRuntimeNotInstalled {
+		t.Errorf("二进制不在时必须报 %s（不能因为磁盘上有残留就报已安装），实际 %q",
+			DockerRuntimeNotInstalled, got.State)
+	}
+	if got.BinaryInstalled {
+		t.Error("二进制不在时 BinaryInstalled 必须是 false")
+	}
+	if !got.Artifacts {
+		t.Error("二进制不在但 ~/.colima 还在时必须如实报 Artifacts=true（界面据此给重新安装/清理）")
+	}
+	if !strings.Contains(got.Note, "残留") {
+		t.Errorf("残留态应在说明里点出「残留」，实际 %q", got.Note)
+	}
+}
+
+// TestDockerRuntimeColimaInstalledRegression 是"plist 判定"这次修复的**服务层**回归：
+//
+// ColimaInstalled（旧判据）会看 brew 前缀下的 colima 可执行文件。这台机器上
+// 没有它，所以它必须是 false —— 注意这里**不注入**，直接读临时目录，
+// 证明确实不会去碰真实文件系统（BrewBin 在 t.TempDir() 下）。
+func TestDockerRuntimeColimaInstalledRegression(t *testing.T) {
+	home := t.TempDir()
+	m := dockerRuntimeTestManager(t, home)
+	if m.ColimaInstalled() {
+		t.Fatal("临时 brew 前缀下没有 colima，ColimaInstalled 必须是 false")
+	}
+}
+
+// TestDockerRuntimeVersionViaSocketRealDial 锁住真实实现：socket 不存在时
+// 连不上就返回空（未知），绝不给假版本号。
+//
+// 这里只 stat/连一个临时路径，不碰任何真实服务。
+func TestDockerRuntimeVersionViaSocketRealDial(t *testing.T) {
+	ctx := context.Background()
+	if v := dockerVersionViaSocket(ctx, ""); v != "" {
+		t.Errorf("空路径必须返回空（未知），实际 %q", v)
+	}
+	if v := dockerVersionViaSocket(ctx, "/tmp/definitely-not-a-docker-socket-zzz"); v != "" {
+		t.Errorf("不存在的路径必须返回空（未知），实际 %q", v)
 	}
 }

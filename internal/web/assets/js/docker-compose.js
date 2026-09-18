@@ -112,7 +112,8 @@ export async function renderCompose(container, ctx) {
           p.exists
             ? h('span.pill.ok', { text: '已就绪' })
             : h('span.pill.warn', { text: '缺 yml' }),
-          p.registered ? h('span.pill.brand', { text: '已纳管', style: { marginLeft: '6px' } }) : null,
+          // 「已纳管」改成用户语言：这条 compose 项目已经登记进面板，能启停/看日志。
+          p.registered ? h('span.pill.brand', { text: '面板可管理', style: { marginLeft: '6px' } }) : null,
         ]),
         h('td', [h('span.hint', { text: p.updated_at || '—' })]),
         h('td', [actions]),

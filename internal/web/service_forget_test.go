@@ -157,8 +157,10 @@ func TestServiceUninstallRuntimeUnavailableSaysNothingStopped(t *testing.T) {
 	if !strings.Contains(msg, "没有停止任何容器") {
 		t.Errorf("报错必须说清没有停止任何容器，实际 %q", msg)
 	}
-	if !strings.Contains(msg, "取消纳管") {
-		t.Errorf("报错应指出可以只删记录（取消纳管），实际 %q", msg)
+	// 文案在 2026-09-19 改成用户语言「从列表移除（不卸载软件）」——断言要跟着走，
+	// 否则真机上的出口还在、测试却红（或者反过来：改了文案而测试没跟上）。
+	if !strings.Contains(msg, "从列表移除") {
+		t.Errorf("报错应指出可以只删记录（「从列表移除（不卸载软件）」），实际 %q", msg)
 	}
 	if exists, _ := srv.serviceRepo.Exists(context.Background(), "stirling-pdf"); !exists {
 		t.Error("卸载失败时不该把面板记录删掉（失败＝什么都没发生）")

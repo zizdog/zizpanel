@@ -54,12 +54,20 @@ func (s *Server) dockerFail(w http.ResponseWriter, err error) {
 func (s *Server) handleDockerInfo(w http.ResponseWriter, r *http.Request) {
 	mgr := s.svcManager()
 	info := mgr.DockerInfo(r.Context())
+	// 运行时（Colima）的**真实**状态：环境不可用时前端靠它区分
+	// "没装 → 一键安装" 与 "装了但引擎没跑 → 启动"（见 assets/js/docker.js）。
+	// 探测只读（stat + 一次本机 socket 连接）；socket 文件在而连不上时，
+	// info.Error 已经如实说明了，这里只补"运行时装没装"这一层。
+	runtime := s.dockerRuntimeStatus(r.Context())
 
 	out := map[string]any{
-		"available": info.Available,
-		"socket":    info.Socket,
-		"version":   info.Version,
-		"error":     info.Error,
+		"available":      info.Available,
+		"socket":         info.Socket,
+		"version":        info.Version,
+		"error":          info.Error,
+		"runtime":        runtime,
+		"runtime_state":  runtime.State,
+		"runtime_app_id": "docker-runtime",
 	}
 	if info.Available {
 		counts := map[string]int{}

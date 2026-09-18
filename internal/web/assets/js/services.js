@@ -10,7 +10,11 @@
 // 交互设计要点：
 //   - 每张卡片一眼看清"这个应用在不在跑、健康不健康"
 //   - 状态灯的颜色直接反映真实状态（面板每次都实时查询系统）
-//   - 纳管服务与托管服务在界面上有明确区分：前者不能卸载
+//   - **给用户看的界面里不出现"纳管 / 接入 / 托管"这类内部概念**（用户
+//     2026-09-21："弱化管纳这个概念，这是面板要做的事，不是用户的事"）。
+//     底层安全语义一个字没改：面板自己装的才能卸载，用户自己装的软件面板
+//     绝不卸载 —— 但那个区别只体现在**移除动作的文案**上（「卸载」 vs
+//     「从列表移除（不卸载软件）」），不再用一个 pill 去向用户解释"谁装的"。
 //   - 卡片上只给一颗「打开」（判定见 servicePanel.openTargetOf）；「直链」在管理面板里
 //   - 日志用 SSE 实时推送，不靠前端轮询
 
@@ -26,8 +30,12 @@ import {
   mergeAppEntries, statusLine, marketQuickActions,
 } from './servicePanel.js';
 
-// 「已安装」的状态筛选（全部 / 运行中 / 已停止 / 异常 / 仅健康检查失败）。
+// 「已安装」的状态筛选（全部 / 运行中 / 已停止 / 需要处理）。
 // 放模块级：Tab 切换、动作后重画都不该把用户的筛选选择丢掉。
+//
+// 2026-09-21 用户："「异常」和「仅健康检查失败」是否重复，甚至这两个页面对用户
+// 是否有意义？" —— 确实重复：旧的「仅健康检查失败」是旧「异常」的真子集
+// （见 problemOf）。现在只剩 4 项，且全部是用户语言。
 let stateFilter = 'all';
 
 // ============================================================================
@@ -45,9 +53,9 @@ let stateFilter = 'all';
 //      「直链」仍然在「⚙️ 管理」面板里 —— 这是上一轮用户明确要的，不能删。
 //
 // 数据由调用方（apps.js 的 AppsView）一次拉好递进来，本函数自己不发起请求：
-//   opts.market    GET /api/v1/market 的**整个响应**（取 .list 里已安装/已纳管的）
+//   opts.market    GET /api/v1/market 的**整个响应**（取 .list 里已安装的条目）
 //   opts.list      GET /api/v1/services?health=1 的 list（服务记录）
-//   opts.onReload  需要整体重拉时的回调（注册服务后、纳管/取消纳管后等）
+//   opts.onReload  需要整体重拉时的回调（注册服务后、删除记录后等）
 export function renderInstalledApps(container, opts = {}) {
   const marketList = () => (opts.market && opts.market.list) || [];
   const svcList = () => (Array.isArray(opts.list) ? opts.list : []);
@@ -59,7 +67,7 @@ export function renderInstalledApps(container, opts = {}) {
   // afterAction 是启停/重启/刷新动作完成后的回调。
   // 只拿到一条新记录时就地替换、重画这一屏（不整页重拉 —— 整页要重查所有服务，
   // 含 colima/compose 这类偏慢的，而用户此刻只关心这一个）；
-  // 拿不到具体记录（纳管 / 取消纳管）才让调用方整体重拉。
+  // 拿不到具体记录（删除记录 / 注册服务）才让调用方整体重拉。
   function afterAction(fresh) {
     if (fresh && fresh.name && Array.isArray(opts.list)) {
       const i = opts.list.findIndex((x) => x && x.name === fresh.name);
@@ -84,18 +92,29 @@ export function renderInstalledApps(container, opts = {}) {
   // entriesNow 每次都重新合并：动作更新的是服务记录数组，合并结果必须跟着变。
   function entriesNow() { return mergeAppEntries(marketList(), svcList()); }
 
+  // problemOf 是「需要处理」的**唯一**判据（筛选与工具条计数共用同一个定义）。
+  //
+  // 「需要处理」= 启动失败（status=error）∪ 运行时不可用（status=unavailable）
+  //            ∪ 健康检查没通过（health.checked && !health.ok）。
+  //
+  // 合并前的两个筛选是「异常」（前两项）与「仅健康检查失败」（第三项），
+  // 而第三项本来就是「异常」判据的一部分 —— 所以合并**不会**漏掉任何原本能被
+  // 这两个筛选命中的卡片（appdetail-verify.mjs 里有一条按旧定义反推的断言锁着）。
+  function problemOf(e) {
+    const st = (e.svc && e.svc.state) || {};
+    const health = (e.svc && e.svc.health) || {};
+    return st.status === 'error' || st.status === 'unavailable'
+      || !!(health.checked && !health.ok);
+  }
+
   function matchesFilter(e) {
     if (stateFilter === 'all') return true;
     const st = (e.svc && e.svc.state) || {};
-    const health = (e.svc && e.svc.health) || {};
     if (stateFilter === 'running') return !!st.running;
     if (stateFilter === 'stopped') {
       return !st.running && st.status !== 'error' && st.status !== 'unavailable';
     }
-    if (stateFilter === 'problem') {
-      return st.status === 'error' || st.status === 'unavailable' || (health.checked && !health.ok);
-    }
-    if (stateFilter === 'unhealthy') return !!(health.checked && !health.ok);
+    if (stateFilter === 'problem') return problemOf(e);
     return true;
   }
 
@@ -103,13 +122,14 @@ export function renderInstalledApps(container, opts = {}) {
     const rows = entriesNow();
     const svcs = svcList();
     const running = svcs.filter((s) => s.state && s.state.running).length;
-    const unhealthy = svcs.filter((s) => s.health && s.health.checked && !s.health.ok).length;
+    // 计数与筛选用同一个判据：按钮上说 N 个，点进去就得正好是这 N 张卡片
+    // （按合并去重后的卡片数计，与筛选结果一一对应）。
+    const needAttention = rows.filter(problemOf).length;
     const filters = [
       { id: 'all', label: '全部' },
       { id: 'running', label: '运行中' },
       { id: 'stopped', label: '已停止' },
-      { id: 'problem', label: '异常' },
-      { id: 'unhealthy', label: '仅健康检查失败' },
+      { id: 'problem', label: '需要处理' },
     ];
     clear(toolbarBox);
     appendAll(toolbarBox,
@@ -121,12 +141,13 @@ export function renderInstalledApps(container, opts = {}) {
         text: `共 ${rows.length} 个应用`,
         title: '市场已安装条目 + 服务记录合并去重后的卡片数（一个应用一张卡片）',
       }),
-      // 可点的：用户看到"有失败"的第一反应是"哪些？怎么办？"，
-      // 所以点它直接筛出失败的服务（卡片里还有具体原因与下一步）。
-      unhealthy > 0 ? h('button.btn.btn-sm.btn-danger', {
-        text: `⚠ ${unhealthy} 个健康检查失败`,
-        title: '点这里只看失败的服务',
-        onclick: () => { stateFilter = 'unhealthy'; renderAll(); },
+      // 可点的：用户看到"有要处理的"第一反应是"哪些？怎么办？"，
+      // 所以点它直接筛出这些卡片（卡片里还有具体原因与下一步）。
+      // 文案不再写"健康检查失败"：那只是三种情况之一，而且是半术语。
+      needAttention > 0 ? h('button.btn.btn-sm.btn-danger', {
+        text: `⚠ ${needAttention} 个需要处理`,
+        title: '点这里只看要处理的：启动失败、运行时不可用、健康检查没通过',
+        onclick: () => { stateFilter = 'problem'; renderAll(); },
       }) : null,
       h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, filters.map((f) =>
         h(`button.btn.btn-sm${stateFilter === f.id ? '.btn-primary' : ''}`, {
@@ -138,11 +159,12 @@ export function renderInstalledApps(container, opts = {}) {
         title: '重新读取市场目录与服务状态',
         onclick: reload,
       }),
-      h('button.btn.btn-sm', {
-        text: '🔍 扫描可纳管服务',
-        title: '找出本机上已经在运行的 launchd 服务，接入面板管理',
-        onclick: () => openAdoptable(afterAction),
-      }),
+      // 「🔍 扫描可纳管服务」按钮与它的弹窗流程已删除（2026-09-21 用户要求
+      // "弱化管纳这个概念"）。为什么可以删：面板启动时已经自动登记本机已有的
+      // **已知**服务（cmd/zizpanel/main.go 调 services.Manager.AutoRegisterKnown，
+      // 见 internal/services/catalog.go:2202），扫描本来就是面板自己该做的事；
+      // 目录之外的任意第三方服务仍可用旁边的「+ 注册服务」手工加进来 ——
+      // 所以删掉这个入口没有丢能力，只是不再让用户去理解"纳管"。
       h('button.btn.btn-primary.btn-sm', { text: '+ 注册服务', onclick: () => newServiceModal(reload) }),
     );
   }
@@ -155,10 +177,12 @@ export function renderInstalledApps(container, opts = {}) {
       appendAll(listBox, h('div.empty', [
         h('div.big', { text: '🧩' }),
         h('h4', { text: all.length ? '没有符合筛选条件的应用' : '还没有已安装的应用' }),
-        h('p', { text: '到「应用市场」Tab 安装新应用，或扫描本机已在运行的服务接入管理。' }),
-        h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center' } }, [
-          h('button.btn', { text: '扫描可纳管服务', onclick: () => openAdoptable(afterAction) }),
-        ]),
+        h('p', {
+          text: all.length
+            ? '换一个筛选条件看看，或点工具栏的「全部」。'
+            : '到「应用市场」Tab 安装新应用即可。面板启动时会自动登记本机已有的、'
+              + '它认得的服务；其它服务可以用工具栏的「+ 注册服务」加进来。',
+        }),
       ]));
       return;
     }
@@ -204,10 +228,13 @@ export function renderInstalledApps(container, opts = {}) {
     const pills = [
       h('span.pill' + (line.cls ? '.' + line.cls : ''), { text: line.text, title: line.title || '' }),
       port > 0 ? h('span.pill', { text: ':' + port }) : null,
-      s ? h('span.pill' + (s.managed ? '.brand' : ''), {
-        text: s.managed ? '面板托管' : '仅纳管',
-        title: s.managed ? '面板负责完整生命周期，可卸载' : '由你自己安装，面板只做启停与查看，不会卸载',
-      }) : null,
+      // 「面板托管 / 仅纳管」pill 已删除（2026-09-21 用户："弱化管纳这个概念"）。
+      // 为什么不换成"由面板安装 / 本机已有"：记录里的 managed=false 并不能证明
+      // 软件是用户装的 —— 面板自研安装器装出来的应用（Miniflux / Qwen3 TTS /
+      // IOPaint …）走的也是 RegisterInstalledService，记录同样是 managed=false
+      // （见 internal/services/install.go:1945）。照记录写就会对用户说假话。
+      // "谁装的"也不是用户能做的动作，所以卡片上不再显示它（卡片要短）；
+      // 面板会卸载还是只移除记录，由「⚙️ 管理」里那颗收尾按钮的文案如实说明。
       health.checked
         ? (health.ok
           ? h('span.pill.ok', {
@@ -219,7 +246,7 @@ export function renderInstalledApps(container, opts = {}) {
           : h('span.pill.danger', { text: '健康检查失败', title: health.message || '' }))
         : null,
       s && s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
-      // 装了但面板里没有服务记录（孤儿态）时 statusLine 已经如实说「未纳管」，
+      // 装了但面板里没有服务记录（孤儿态）时 statusLine 已经如实说「面板里暂无记录」，
       // 这里不再补第二颗同义 pill —— 卡片本来就要短，重复说两遍只会更乱。
       // 去重的证据：同一 launchd 服务在面板里有多条记录时，这里如实说出合并了几条，
       // 免得用户以后在数据库里看到两条记录却不知道为什么界面只有一张卡片。
@@ -271,87 +298,21 @@ export function renderInstalledApps(container, opts = {}) {
     });
   }
 
-  // ---------- 扫描可纳管服务（原服务管理页的扫描弹窗，功能一字未减） ----------
+  // ---------- 「扫描可纳管服务」入口已删除（2026-09-21） ----------
   //
-  // 2026-09-17：合并后它挂在「已安装」Tab 的工具条上（可纳管属于"本机已有的服务"）。
-  // 纳管成功后 onDone(afterAction) 会重画这一屏。
-  async function openAdoptable(onDone) {
-    const box = h('div', [
-      h('div.empty', [h('div.big', { text: '🔍' }), h('p', { text: '正在扫描本机的 launchd 服务…' })]),
-    ]);
-    modal({ title: '扫描可纳管服务', wide: true, body: box });
-
-    let list = [];
-    try {
-      const r = await api.adoptable();
-      list = r.list || [];
-    } catch (e) {
-      clear(box);
-      appendAll(box, h('div.empty', [h('div.big', { text: '⚠️' }), h('p', { text: e.message })]));
-      return;
-    }
-
-    clear(box);
-    if (!list.length) {
-      appendAll(box, h('div.empty', [
-        h('div.big', { text: '✅' }),
-        h('h4', { text: '没有发现可纳管的新服务' }),
-        h('p', { text: '本机上已运行的第三方 launchd 服务都已经在面板里了。' }),
-      ]));
-      return;
-    }
-
-    appendAll(box,
-      h('div.hint', {
-        style: { marginBottom: '12px' },
-        text: '以下是本机正在使用的 launchd 服务。纳管后可以在面板里查看状态、启停、看日志；面板不会卸载它们。',
-      }),
-      h('table.table', [
-        h('thead', [h('tr', [
-          h('th', { text: '名称' }), h('th', { text: '状态' }), h('th', { text: '可执行文件' }), h('th', { text: '操作' }),
-        ])]),
-        h('tbody', list.map((c) => h('tr', [
-          h('td', [
-            h('div', { style: { fontWeight: '550' }, text: c.label }),
-            h('div', { style: { fontSize: '11px', color: 'var(--text-mute)' }, text: c.plist_path }),
-          ]),
-          // 状态措辞分三种：正在跑 / 已加载但按需启动（没有进程是正常的）/
-          // 根本没加载。macOS 上很多作业是按需触发的（系统 cron 就是），
-          // 一律写成"已停止"会让人以为服务坏了。
-          h('td', [
-            c.running
-              ? h('span.pill.ok', { text: '运行中' })
-              : (c.loaded
-                ? h('span.pill', {
-                  text: '待触发（按需运行）',
-                  title: '已加载到 launchd，但没有常驻进程 —— 这类作业在需要时才被拉起，属正常状态',
-                })
-                : h('span.pill.warn', { text: '未加载' })),
-          ]),
-          h('td.mono', { style: { fontSize: '11px' }, text: c.program || '—' }),
-          h('td', h('button.btn.btn-sm.btn-primary', {
-            text: '纳管',
-            onclick: async (ev) => {
-              const btn = ev.target;
-              btn.disabled = true;
-              btn.textContent = '纳管中…';
-              try {
-                await api.adopt({ label: c.label, display_name: c.label, icon: '🧩' });
-                toast(`已纳管 ${c.label}`, 'ok');
-                ev.target.closest('tr').style.opacity = '0.4';
-                btn.textContent = '已纳管';
-                if (typeof onDone === 'function') onDone();
-              } catch (e) {
-                toast(e.message, 'err', 9000);
-                btn.disabled = false;
-                btn.textContent = '纳管';
-              }
-            },
-          })),
-        ]))),
-      ]),
-    );
-  }
+  // 原来这里有一个 openAdoptable()：弹窗列出本机所有 launchd 服务，逐条给
+  // 「纳管」按钮。用户 2026-09-21 的原话是"扫描可纳管服务和'应该弱化管纳这个
+  // 概念'是一回事，用户不需要知道什么是纳管，不需要知道系统里运行的软件是怎么
+  // 被面板控制的" —— 所以整段（按钮 + 弹窗 + api.adoptable/adopt 的前端调用）
+  // 删掉了。
+  //
+  // 为什么删掉不算丢能力（内部概念，写给维护者看）：
+  //   · 面板启动时本来就会自动登记本机已有的**已知**服务
+  //     （cmd/zizpanel/main.go → services.Manager.AutoRegisterKnown，
+  //      实现见 internal/services/catalog.go:2202）—— 扫描是面板自己的事；
+  //   · 目录之外的任意第三方 launchd 服务，仍然可以用工具栏的「+ 注册服务」
+  //     手工加进来（同一个 POST /api/v1/services 路径，能力一字未减）。
+  // 后端接口 /api/v1/adoptable 与 /api/v1/adopt 保留未动（不属于本轮前端改动范围）。
 
   renderAll();
 }
@@ -536,7 +497,7 @@ export function newServiceModal(onDone, existing = null) {
   // 按类型显示不同字段
   const nativeBox = h('div', [
     h('div.field', [h('label', { text: 'launchd 标签' }), launchLabel,
-      h('div.hint', { text: '如果服务由 launchd 托管，填标签（如 com.example.api）；留空并填下面的启动命令则由面板作为子进程运行。' })]),
+      h('div.hint', { text: '如果这个服务已经注册到 launchd，填它的标签（如 com.example.api）；留空并填下面的启动命令，则由面板作为子进程运行。' })]),
     h('div.field', [h('label', { text: 'plist 路径（可选）' }), plistPath]),
     h('div.field', [h('label', { text: '启动命令（无 launchd 时使用）' }), startCmd,
       h('div.hint', { text: '⚠️ 用启动命令的服务是面板的子进程：面板重启后它们会停止。需要长期稳定运行请改用 launchd。' })]),

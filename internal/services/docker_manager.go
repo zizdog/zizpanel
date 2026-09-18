@@ -42,12 +42,16 @@ func (m *Manager) dockerClientOrErr() (*dockerClient, error) {
 	sock := strings.TrimSpace(m.opt.DockerSocket)
 	if sock == "" {
 		return nil, fmt.Errorf("没有可用的 Docker socket。" +
-			"macOS 上 Docker 引擎不是系统自带：请先在「应用市场」安装「Docker 运行时（Colima）」，" +
+			"macOS 上 Docker 引擎不是系统自带：请在「Docker」页点「🐳 一键安装 Docker（Colima）」，" +
 			"或安装 OrbStack / Docker Desktop 任一")
 	}
 	if _, err := os.Stat(sock); err != nil {
+		// 指向「Docker」页的一键安装，而不是「服务管理」——
+		// 服务管理已经合并进「应用 → 我的应用」，再指那里等于把用户送进死路
+		// （2026-09-19 用户原话："还有一个入口『去服务管理』，现在服务管理已经
+		//  合并到应用市场了，这个入口更没有意义了"）。
 		return nil, fmt.Errorf("Docker socket 不存在（%s）：引擎没有在运行。"+
-			"可在「服务管理」里启动 docker-runtime", sock)
+			"到「Docker」页点「🐳 一键安装 Docker（Colima）」（已装过则点「▶ 启动 Docker 运行时」）", sock)
 	}
 	return newDockerClient(sock), nil
 }

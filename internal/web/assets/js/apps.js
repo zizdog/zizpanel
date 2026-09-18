@@ -140,7 +140,9 @@ function dockerImagesOf(a) {
   return out;
 }
 
-// isInstalled 是"已安装 / 已纳管"的唯一判据（市场卡片 pill、安装按钮共用）。
+// isInstalled 是"已安装"的唯一判据（市场卡片 pill、安装按钮共用）。
+// installed=true 是"磁盘上装了/launchd 里有"；adopted=true 是"面板里还有它的
+// 服务记录"（内部概念）。两者对用户都是"已经装好了"，所以合并成同一个判断。
 function isInstalled(a) { return !!(a && (a.installed || a.adopted)); }
 
 export function AppsView(content, ctx = {}) {
@@ -183,7 +185,7 @@ export function AppsView(content, ctx = {}) {
       ])])]));
       return;
     }
-    // 合并去重、卡片动作、可纳管扫描都在 services.js 的 renderInstalledApps 里
+    // 合并去重、卡片动作、状态筛选都在 services.js 的 renderInstalledApps 里
     // （它同时握着市场条目与服务记录，见那边文件头的说明）。
     renderInstalledApps(body, { market: cache, list: svcList, onReload: load });
   }
@@ -652,12 +654,13 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // adoptApp（纳管一个已在跑的服务）已删除（2026-09-17 合并时）：
-  // 唯一的纳管入口是「已安装 → 🔍 扫描可纳管服务」，实现住在 services.js 的
-  // renderInstalledApps（openAdoptable）。市场卡片本来就不给「纳管」按钮 ——
-  // 卡片上的按钮集合只由数据决定（打开 / 启停 / 重启 / 刷新 / 管理），
-  // 而纳管是另一个语义（登记一个已经存在的服务），不该混进应用的生命周期动作里。
-  // 保留两份"确认纳管"弹窗只会在文案与行为上慢慢分叉，所以这里整段删掉。
+  // adoptApp（把本机已有的服务接进面板）的用户入口在 2026-09-21 之后只剩一处：
+  // 这类应用（目录里有 adopt_label 的，例如 Ollama 的官方二进制安装）在卡片上
+  // 显示「添加到面板」，点了走下面的 preflight → doInstall → 后端 POST
+  // /api/v1/market/install（后端对 AdoptLabel 非空的应用走 AdoptApp，不重新安装、
+  // 也不动用户的软件）。**不再有"扫描本机可纳管服务"的批量入口**（见 services.js）。
+  // 面板启动时会自己登记本机已有的已知服务，用户不需要理解"纳管"。
+  // 曾经有过两份"确认纳管"弹窗，那份历史实现在 2026-09-17 合并时就删掉了。
 
   function installPhpMyAdmin(appId) {
     taskCenter.start({
@@ -744,19 +747,25 @@ export function AppsView(content, ctx = {}) {
 
   // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
   //
-  // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
-  //
   // 判定顺序（改之前先读完这段）：
   //   有任务在跑              → 查看进度（点回任务中心，而不是再点一次）
+  //   本机已有这个服务、面板还没记录 → **添加到面板**（不重新安装；见下）
   //   残留态（产物还在、没装） → **安装**（安装器幂等，会复用残留产物）
   //   其它（未安装）          → 安装
   //
-  // 2026-09-17 收敛：这个函数现在**只服务未安装/残留态的卡片**。
+  // 2026-09-17 收敛：这个函数现在**只服务未安装/残留态/未登记的卡片**。
   //   · 已安装的卡片给「打开」+ 启停/重启/刷新/管理（见下面的 installed 分支，
   //     「已安装」Tab 里则由 services.js 的 installedCard 给同一组）；
   //   · 站点应用的入口是卡片上的「一键建站」（siteInstallButtons）；
   //   · 「重装 / 卸载 / 文档」全部收进「⚙️ 管理」面板（servicePanel.js 的
   //     reinstallButton / marketUninstallButton / docLink），卡片上不再出现。
+  //
+  // 2026-09-21 用户："弱化管纳这个概念 … 只要知道自己可以在应用里执行安装、
+  // 卸载、重装这些动作就可以了。" 所以：
+  //   · adopt_label 非空（后端会走 AdoptApp，只登记已存在的服务）时，按钮文案
+  //     写成用户能懂的「添加到面板」，而不是「安装」或「纳管」；
+  //   · 点完之后的下一步与其它应用完全一样：卡片变成"已安装"，出现
+  //     启动 / 停止 / 重启 / ⚙️ 管理（marketQuickActions 由数据决定，不按应用分叉）。
   function primaryButton(a) {
     const running = taskCenter.findByTarget(a.id);
     if (running) {
@@ -766,12 +775,17 @@ export function AppsView(content, ctx = {}) {
         onclick: () => taskCenter.openTask(running.id),
       });
     }
+    const adopt = !!a.adopt_label;
     return h('button.btn.btn-sm.btn-primary', {
-      text: '安装',
+      text: adopt ? '添加到面板' : '安装',
       disabled: !a.available,
-      title: residualOf(a)
-        ? '磁盘上还有上次卸载保留的数据/产物；安装会复用它们，不会重复下载'
-        : '',
+      title: adopt
+        ? (a.available
+          ? '本机已经有这个服务，把它加到面板里就能查看状态、启动 / 停止 / 重启'
+          : (a.note || '本机没有检测到这个服务'))
+        : (residualOf(a)
+          ? '磁盘上还有上次卸载保留的数据/产物；安装会复用它们，不会重复下载'
+          : ''),
       onclick: () => openInstaller(a),
     });
   }
@@ -787,9 +801,10 @@ export function AppsView(content, ctx = {}) {
   //
   // 三种形态（全部由数据决定，没有按应用 ID 的分支）：
   //   · 站点应用       → 「一键建站」+（有文档时）「文档」
-  //   · 已安装 / 已纳管 → 「已安装」pill + **一颗「打开」**（用户第六条：
+  //   · 已安装         → 「已安装」pill + **一颗「打开」**（用户第六条：
   //                       "只显示打开，不显示直链"）+ 启停/重启/刷新/⚙️ 管理
-  //   · 未安装         → 「安装」+（残留态时）「删除残留数据」+（有文档时）「文档」
+  //   · 未安装         → 「安装」（本机已有这个服务时是「添加到面板」）
+  //                       +（残留态时）「删除残留数据」+（有文档时）「文档」
   function appCard(a) {
     const installed = isInstalled(a);
     const actions = [];
@@ -834,12 +849,16 @@ export function AppsView(content, ctx = {}) {
             title: '这个 brew 服务还没在 launchd 里注册（plist 不存在）。' +
               '到「已安装」Tab 点一次启动即可自动注册（面板会用 brew services start 补上）',
           })
-          : (a.adopted ? h('span.pill.ok', { text: '已纳管' })
+          : (a.adopted
+            // 面板里有这条记录（内部叫"纳管"）。对用户来说就是**已安装**：
+            // 不再单给一个"已纳管"pill（那个词是内部概念，用户 2026-09-21 要求弱化）。
+            // 用户能做什么由卡片上的按钮给（启停 / 重启 / ⚙️ 管理），不需要看懂记录来源。
+            ? h('span.pill.ok', {
+              text: '已安装',
+              title: '面板已经认得这个服务：可以启动 / 停止 / 重启，也能在「⚙️ 管理」里改配置、看日志',
+            })
           : (a.installed
-            // 装了但服务没在 launchd 里（plist 丢了/没注册成功）是一种**孤儿态**：
-            // 说"已安装·未纳管"会让人以为点一下纳管就行，而那个按钮必然报错。
-            // 所以这里如实说"服务未注册"。
-            //
+            // 装了但服务没在 launchd 里（plist 丢了/没注册成功）是一种**孤儿态**。
             // 例外：no_daemon 的应用**本来就没有守护进程**（phpMyAdmin 是
             // nginx alias + php-fpm，装完就是一个网页入口）。对它报"服务未注册"
             // 是纯粹的误导 —— 用户反馈过这个。（2026-09-14）
@@ -852,8 +871,13 @@ export function AppsView(content, ctx = {}) {
                 ? h('span.pill.ok', { text: '已安装·网页入口', title: '这个应用没有常驻进程，装完就是一个网页入口' })
                 : h('span.pill.ok', { text: '已安装·命令行', title: '这个应用是命令行工具（没有常驻进程，也没有网页界面）' }))
               : h('span.pill' + (a.service_in_launchd ? '' : '.warn'), {
-                text: a.service_in_launchd ? '已安装·未纳管' : '已安装·服务未注册',
-                title: a.service_in_launchd ? '' : '安装产物还在，但 launchd 里找不到这个服务；点「⚙️ 管理」里的「重装」可修复（会重建服务定义）',
+                // "未纳管"改成用户语言：服务在系统里，面板里还没有它的记录。
+                // 怎么加进来写在 title 里（工具栏的「+ 注册服务」是真实入口）。
+                text: a.service_in_launchd ? '已安装·未加入面板' : '已安装·服务未注册',
+                title: a.service_in_launchd
+                  ? '这个服务在系统里是好的，只是面板里还没有它的记录。' +
+                    '可以在「已安装」工具栏用「+ 注册服务」把它加进来（就能改配置、看日志、启停）'
+                  : '安装产物还在，但 launchd 里找不到这个服务；点「⚙️ 管理」里的「重装」可修复（会重建服务定义）',
               }))
             : null)),
         // 残留数据：没装、但磁盘上还有上次卸载保留的产物/数据。
@@ -925,9 +949,10 @@ export function AppsView(content, ctx = {}) {
   //   · service   —— 托管服务（compose 应用等），可以真卸载；
   //   · installer —— 面板自研安装器装的（IOPaint / Qwen / 接收端 / phpMyAdmin /
   //                  Docker 运行时），走安装器自己的卸载；
-  //   · forget    —— **纳管的第三方服务**（nginx / php / mysql / 用户自己注册的）：
-  //                  面板绝不卸载它们（删掉用户自己的 MySQL 等于删掉他的数据），
-  //                  只给「取消纳管」，并在确认框里说清楚"只移除记录，不动系统"。
+  //   · forget    —— **本机已有的第三方服务**（内部叫"纳管"：nginx / php / mysql /
+  //                  用户自己注册的）：面板绝不卸载它们（删掉用户自己的 MySQL
+  //                  等于删掉他的数据），只给「从列表移除（不卸载软件）」，
+  //                  并在确认框里逐字说清"不会卸载软件、不动系统上的任何东西"。
   // 没有这三类之一的（brew 核心组件、未安装）就不给按钮。
   // siteInstallButtons 给「一键建站」类应用一个建站入口。
   //
@@ -999,10 +1024,10 @@ export function AppsView(content, ctx = {}) {
   // uninstallButtons 只保留**残留态**的「删除残留数据」入口。
   //
   // 2026-09-17（用户原话："每个应用只保留，打开、直链、刷新、重启、停止、管理……
-  // 重装、卸载、文档等放进管理的弹出页面里"）：已安装应用的「卸载 / 取消纳管」
+  // 重装、卸载、文档等放进管理的弹出页面里"）：已安装应用的收尾动作
   // 不再摆在卡片上 —— 它们已经（并继续）住在「⚙️ 管理」面板里：
   //   · managed=true          → 面板里的「🗑 卸载」（uninstallButton）
-  //   · managed=false         → 面板里的「取消纳管」（forgetButton）
+  //   · managed=false         → 面板里的「从列表移除（不卸载软件）」（forgetButton）
   //   · 市场安装器 / compose  → 面板里的「卸载」（marketUninstallButton，逐条列出会删什么）
   // 三类语义都在 servicePanel.js 里由数据决定，一处都不会丢。
   //
@@ -1086,9 +1111,10 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // doForget（取消纳管）已删除（2026-09-17）：卡片上不再直接给「取消纳管」，
+  // doForget（只删除面板记录）已删除（2026-09-17）：卡片上不再直接给那颗按钮，
   // 它住在「⚙️ 管理」面板里（servicePanel.js 的 forgetButton，按 s.managed===false
   // 决定出现），实现只有那一份。卡片上唯一保留的残留态动作是「删除残留数据」。
+  // 2026-09-21 起它的文案是「从列表移除（不卸载软件）」，不再出现"纳管"。
 
   // openInstaller 按应用打开对应的部署对话框。
   //
@@ -1119,13 +1145,19 @@ export function AppsView(content, ctx = {}) {
   // 文案与一份确认语义，而应用自己的选项框仍然保留。
 
   // ---------- 安装前检查 ----------
+  //
+  // adopt = 目录里声明了 adopt_label（后端对这类应用走 AdoptApp：只把本机**已经
+  // 存在**的服务登记进面板，不重新安装、不动用户的软件）。用户 2026-09-21 要求
+  // 弱化"纳管"这个概念，所以这类应用在这里一律说「添加到面板」，
+  // 不说"安装"（它没装任何东西）也不说"纳管"（内部词）。
   async function preflight(a) {
-    const box = h('div', [h('div.empty', [h('div.big', { text: '🔍' }), h('p', { text: '正在检查安装条件…' })])]);
+    const adopt = !!a.adopt_label;
+    const box = h('div', [h('div.empty', [h('div.big', { text: '🔍' }), h('p', { text: adopt ? '正在检查这个服务…' : '正在检查安装条件…' })])]);
     const footer = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', width: '100%' } });
 
     let pf = null;
     const m = modal({
-      title: `安装检查：${a.name}`,
+      title: adopt ? `添加到面板：${a.name}` : `安装检查：${a.name}`,
       wide: true,
       body: box,
       footer: () => [footer],
@@ -1143,7 +1175,7 @@ export function AppsView(content, ctx = {}) {
     appendAll(box, 
       h('div', { style: { marginBottom: '14px' } }, [
         pf.ready
-          ? h('span.pill.ok', { text: '✅ 条件满足，可以安装' })
+          ? h('span.pill.ok', { text: adopt ? '✅ 本机已经有这个服务，可以添加到面板' : '✅ 条件满足，可以安装' })
           : h('span.pill.danger', { text: '⚠️ 有未满足的条件' }),
       ]),
       // 端口
@@ -1168,7 +1200,7 @@ export function AppsView(content, ctx = {}) {
           text: '$ ' + c.fix_cmd,
         }) : null,
       ])),
-      a.post_install_hint ? h('div.hint', { style: { marginTop: '12px' }, text: '安装后：' + a.post_install_hint }) : null,
+      a.post_install_hint ? h('div.hint', { style: { marginTop: '12px' }, text: (adopt ? '加到面板后：' : '安装后：') + a.post_install_hint }) : null,
       a.manual_hint ? h('div.hint', { style: { marginTop: '8px' }, text: a.manual_hint }) : null,
     );
 
@@ -1177,7 +1209,7 @@ export function AppsView(content, ctx = {}) {
       h('button.btn', { text: '关闭', onclick: () => m.close() }),
       pf.ready || a.adopt_label
         ? h('button.btn.btn-primary', {
-          text: a.adopt_label ? '接入管理' : '开始安装',
+          text: adopt ? '添加到面板' : '开始安装',
           onclick: () => { m.close(); doInstall(a); },
         })
         : h('button.btn.btn-primary', {
@@ -1194,17 +1226,21 @@ export function AppsView(content, ctx = {}) {
   // 关掉窗口也找不回来。现在改成：POST 立刻返回 task_id，进度交给任务中心。
   // 失败（4xx/5xx）由 taskCenter.start 统一 toast，这里不需要再兜一层。
   function doInstall(a) {
+    // adopt 类应用（目录有 adopt_label）：后端只把本机已有的服务登记进来，
+    // 所以任务名与成功提示都**不能**说"安装"（没装任何东西，也不该让用户以为
+    // 面板重新装了一遍他已有的软件）。
+    const adopt = !!a.adopt_label;
     taskCenter.start({
       kind: 'install',
       target: a.id,
-      title: `安装 ${a.name}`,
+      title: adopt ? `添加到面板 ${a.name}` : `安装 ${a.name}`,
       start: () => api.marketInstall(a.id),
       // 装完必须**立刻**把卡片状态刷新过来（用户 2026-09-16 要求：
       // "安装、卸载后面板中的软件状态要及时更新"）。以前只靠任务状态变化重画，
       // 而任务结束时市场数据还是旧的，卡片就停留在"可安装"。
       onDone: (m) => {
         if (m && m.status && m.status !== 'succeeded') {
-          toast('安装失败：' + (m.error || m.status), 'err', 12000);
+          toast((adopt ? '添加到面板失败：' : '安装失败：') + (m.error || m.status), 'err', 12000);
         } else {
           // 装完把"下一步"直接说出来。用户最常问的就是"装完我该干嘛"。
           // 2026-09-16 起配置入口只有一个：卡片上的「⚙️ 管理」→ 面板里的
@@ -1212,7 +1248,9 @@ export function AppsView(content, ctx = {}) {
           const next = a.config_path
             ? '：点卡片上的「⚙️ 管理」，在面板里改「📝 编辑配置文件」并重启服务生效'
             : '';
-          toast('「' + a.name + '」已安装' + next, 'ok', 10000);
+          toast(adopt
+            ? '「' + a.name + '」已添加到面板：现在可以启动 / 停止 / 重启它了' + next
+            : '「' + a.name + '」已安装' + next, 'ok', 10000);
         }
         refreshSilently();
       },

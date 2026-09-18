@@ -130,7 +130,7 @@ export function DashboardView(content, ctx = {}) {
     if (!list.length) {
       svcBody.append(h('div.empty', [
         h('div.big', { text: '⚙️' }),
-        h('p', { text: '还没有登记服务，可到「应用」的「应用市场」安装，或在「我的应用」里纳管本机已有服务。' }),
+        h('p', { text: '还没有服务。到「应用」的「应用市场」安装一个即可。' }),
       ]));
       return;
     }
