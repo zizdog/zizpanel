@@ -568,7 +568,7 @@ func (m *Manager) Uninstall(ctx context.Context, name string) error {
 		return err
 	}
 	if !s.Managed {
-		return fmt.Errorf("「%s」是纳管服务（由你自己安装），面板不会卸载它。"+
+		return fmt.Errorf("「%s」是面板只做了登记的服务（软件由你自己安装），面板不会卸载它。"+
 			"如需停止请用「停止」，如需从列表移除请用「从列表移除（不卸载软件）」", s.DisplayName)
 	}
 	if err := drv.Uninstall(ctx); err != nil {

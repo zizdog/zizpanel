@@ -693,7 +693,7 @@ func (m *Manager) waitReceiverReady(ctx context.Context, p receiverPaths,
 		"查看状态与调用密钥）"
 	if !registered {
 		state = "接收端已写入并加载 launchd，但登记进服务管理失败，" +
-			"可在「可纳管」里手动加入"
+			"可在「应用 → 已安装」里点「+ 注册服务」手动加入"
 	}
 	wait := readyWaitJSONBool
 	return assertReady(ctx, readySpec{

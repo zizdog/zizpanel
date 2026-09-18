@@ -324,8 +324,12 @@ func TestUninstallRefusesAdoptedService(t *testing.T) {
 	if err == nil {
 		t.Fatal("卸载纳管服务必须被拒绝")
 	}
-	if !strings.Contains(err.Error(), "纳管") {
-		t.Fatalf("错误信息应说明原因，实际: %v", err)
+	// 文案 2026-09-19 换成用户语言：说清"这是面板只做了登记的服务（软件由你自己装），
+	// 面板不会卸载它"，并给出真正的出口「从列表移除（不卸载软件）」。
+	for _, want := range []string{"不会卸载", "从列表移除"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误信息应说明原因（含 %q），实际: %v", want, err)
+		}
 	}
 	// 记录仍在
 	if _, err := repo.Get(ctx, "adopted"); err != nil {

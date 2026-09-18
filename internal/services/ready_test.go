@@ -311,7 +311,8 @@ func TestWaitQwenReadyDoesNotClaimRegisteredWhenItFailed(t *testing.T) {
 	if strings.Contains(err.Error(), "服务也已登记进服务管理") {
 		t.Errorf("登记失败时不能在错误里谎称已登记：%v", err)
 	}
-	if !strings.Contains(err.Error(), "登记进服务管理失败") {
+	// 文案 2026-09-19 改成"登记进面板失败"（不再出现"服务管理"这个已经不存在的页面名）。
+	if !strings.Contains(err.Error(), "登记进面板失败") {
 		t.Errorf("登记失败要如实写出来：%v", err)
 	}
 }

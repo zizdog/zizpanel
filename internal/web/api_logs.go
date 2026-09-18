@@ -34,11 +34,12 @@ func (s *Server) logCatalog() *logs.Catalog {
 					continue
 				}
 				svcLogs = append(svcLogs, logs.Entry{
-					Key:         "service:" + svc.Name,
-					Name:        svc.DisplayName + " · 运行日志",
-					Category:    "service",
-					Path:        expandHomePath(svc.LogPath, s.Cfg.UserHome),
-					Description: fmt.Sprintf("纳管服务 %s 的输出日志", svc.Name),
+					Key:      "service:" + svc.Name,
+					Name:     svc.DisplayName + " · 运行日志",
+					Category: "service",
+					Path:     expandHomePath(svc.LogPath, s.Cfg.UserHome),
+					// 用户可见（日志页的描述）：不出现"纳管"这种内部词。
+					Description: fmt.Sprintf("已登记服务 %s 的输出日志", svc.Name),
 				})
 			}
 		}

@@ -1645,7 +1645,7 @@ func (m *Manager) AdoptApp(ctx context.Context, appID string) (*InstallResult, e
 		return nil, fmt.Errorf("应用市场中找不到 %s", appID)
 	}
 	if app.AdoptLabel == "" {
-		return nil, fmt.Errorf("「%s」不是纳管类应用", app.Name)
+		return nil, fmt.Errorf("「%s」不是「只登记已有服务」类应用", app.Name)
 	}
 
 	label := app.AdoptLabel
@@ -1704,7 +1704,7 @@ func (m *Manager) AdoptCandidate(ctx context.Context, label, displayName, icon s
 		return nil, fmt.Errorf("缺少服务 label")
 	}
 	if isSystemLabel(label) {
-		return nil, fmt.Errorf("系统自带服务不允许纳管：%s", label)
+		return nil, fmt.Errorf("系统自带服务不允许登记到面板：%s", label)
 	}
 	plist := filepath.Join("/Library/LaunchDaemons", label+".plist")
 	if !fileExists(plist) && m.opt.UserHome != "" {
@@ -1753,7 +1753,7 @@ func (m *Manager) AdoptCandidate(ctx context.Context, label, displayName, icon s
 
 	// 如果这个 label 在应用目录里有对应条目，继承它的端口与健康检查地址 ——
 	// 否则纳管后状态显示为"运行中"但健康列永远是"未检查"，价值大打折扣。
-	port, healthURL, category, description := 0, "", "custom", "由面板纳管的 launchd 服务（"+label+"）"
+	port, healthURL, category, description := 0, "", "custom", "由面板登记的本机服务（"+label+"）"
 	if a, ok := catalogEntryForLabel(label); ok {
 		port = a.WebPort()
 		healthURL = healthURLFor(a)

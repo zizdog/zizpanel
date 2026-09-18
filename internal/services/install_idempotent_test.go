@@ -459,8 +459,10 @@ func TestAlreadyInLaunchdWithoutRecordIsTreatedAsInstalled(t *testing.T) {
 		t.Fatalf("服务已在 launchd 里时不该再报 failed，实际 %v", err)
 	}
 	joined := strings.Join(res.Steps, "\n")
-	if !strings.Contains(joined, "纳管") {
-		t.Errorf("没有面板记录时要提示用户去「纳管」，实际步骤：\n%s", joined)
+	// 文案在 2026-09-19 换成用户语言：不再说"纳管"，而是告诉用户去「应用 → 已安装」
+	// 点「+ 注册服务」。断言要跟着走 —— 否则出口还在、测试反而红。
+	if !strings.Contains(joined, "注册服务") {
+		t.Errorf("没有面板记录时要提示用户怎么把它加入面板（「+ 注册服务」），实际步骤：\n%s", joined)
 	}
 	if list, _ := repo.List(ctx); len(list) != 0 {
 		t.Errorf("这一步只跳过、不写记录（纳管由用户点），实际 %d 条", len(list))
@@ -615,8 +617,8 @@ func TestTarballInstallGateNotSkippedWithoutRealEvidence(t *testing.T) {
 		if !done {
 			t.Fatal("launchd 里真有它的 plist 时应判已安装（与 brew/compose 同一语义）")
 		}
-		if !strings.Contains(strings.Join(res.Steps, "\n"), "纳管") {
-			t.Errorf("没有面板记录时要提示去「纳管」：\n%s", strings.Join(res.Steps, "\n"))
+		if !strings.Contains(strings.Join(res.Steps, "\n"), "注册服务") {
+			t.Errorf("没有面板记录时要提示怎么加入面板（「+ 注册服务」）：\n%s", strings.Join(res.Steps, "\n"))
 		}
 	})
 }

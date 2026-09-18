@@ -97,7 +97,7 @@ export async function renderCompose(container, ctx) {
         h('button.btn.btn-ghost.btn-sm', { text: p.exists ? '编辑' : '创建文件', onclick: () => edit(p) }),
         h('button.btn.btn-ghost.btn-sm', {
           text: '日志',
-          title: '跳到「服务管理」看这个项目的实时日志',
+          title: '跳到「应用 → 已安装」看这个项目的实时日志',
           onclick: () => { location.hash = '#/services'; },
         }),
         h('button.btn.btn-danger.btn-sm', { text: '删除', onclick: () => del(p) }),
@@ -129,7 +129,7 @@ export async function renderCompose(container, ctx) {
 
     appendAll(listBox, h('div.hint', {
       style: { marginTop: '12px' },
-      text: '「部署」= docker compose up -d --remove-orphans，并自动登记到「服务管理」；「停止」= docker compose down。',
+      text: '「部署」= docker compose up -d --remove-orphans，并自动登记到「应用 → 已安装」；「停止」= docker compose down。',
     }));
   }
 
@@ -156,7 +156,7 @@ export async function renderCompose(container, ctx) {
         ]),
         h('div.field', [h('label', { text: 'docker-compose.yml' }), editor]),
         h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, [
-          register, h('span', { text: '保存后登记到「服务管理」（推荐，部署后可在那里启停与看实时日志）' }),
+          register, h('span', { text: '保存后登记到「应用 → 已安装」（推荐，部署后可在那里启停与看实时日志）' }),
         ]),
       ]),
       footer: [

@@ -1489,7 +1489,8 @@ func (s *Server) handleAdopt(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = s.serviceRepo.Update(r.Context(), svc)
 	}
-	s.audit(r, "service_adopt", req.Label, "纳管服务 "+svc.DisplayName, true, "")
+	// 审计详情会显示在「日志 → 操作审计」里，用"登记服务"而不是内部词"纳管"。
+	s.audit(r, "service_adopt", req.Label, "登记服务 "+svc.DisplayName, true, "")
 	ok(w, svc)
 }
 

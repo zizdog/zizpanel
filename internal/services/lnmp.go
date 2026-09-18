@@ -565,14 +565,14 @@ func (m *Manager) registerLNMPComponents(ctx context.Context, result *InstallRes
 		label := m.lnmpComponentLabel(formula)
 		if label == "" {
 			msg := fmt.Sprintf("登记失败：找不到 %s 的 launchd 服务定义（服务可能不在 launchd 里），"+
-				"可在「服务管理」→「扫描可纳管服务」或应用市场对应条目上手动纳管", formula)
+				"可在「应用 → 已安装」里点「+ 注册服务」把它加入面板", formula)
 			result.step(ctx, msg)
 			result.Warning = appendLNMPWarning(result.Warning, msg)
 			continue
 		}
 		if err := m.RegisterInstalledService(ctx, label, name, icon, category, port); err != nil {
 			msg := fmt.Sprintf("登记失败：%s（%s）没能加入「服务管理」：%v；"+
-				"服务本身已装好，可在应用市场对应条目上点「纳管」补登记", formula, label, err)
+				"服务本身已装好，可在应用市场对应条目上点「添加到面板」补登记", formula, label, err)
 			result.step(ctx, msg)
 			result.Warning = appendLNMPWarning(result.Warning, msg)
 			continue

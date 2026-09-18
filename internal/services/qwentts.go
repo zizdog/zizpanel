@@ -269,7 +269,7 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	registered := true
 	if err := m.RegisterInstalledService(ctx, qwenLabel, "Qwen3 TTS", "🗣️", "ai", qwenPort); err != nil {
 		registered = false
-		result.step(ctx, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
+		result.step(ctx, "（自动登记到面板失败："+err.Error()+"，可在「应用 → 已安装」里点「+ 注册服务」手动加入）")
 	}
 
 	// ---- 6b. 验证：端口真的在监听才算成功（首次加载模型要十几秒）----
@@ -357,7 +357,7 @@ func (m *Manager) waitQwenReady(ctx context.Context, p qwenPaths, registered boo
 	state := "Python 环境、模型权重与 launchd 服务都已就位，服务也已登记进服务管理"
 	if !registered {
 		state = "Python 环境、模型权重与 launchd 服务都已就位" +
-			"（但登记进服务管理失败，可在「可纳管」里手动加入）"
+			"（但登记进面板失败，可在「应用 → 已安装」里点「+ 注册服务」手动加入）"
 	}
 	return assertReady(ctx, readySpec{
 		What: "Qwen3 TTS 服务",

@@ -147,7 +147,7 @@ func (m *Manager) installedSkipResult(ctx context.Context, app App) (*InstallRes
 		res.Steps = append(res.Steps,
 			fmt.Sprintf("检测到「%s」的服务已经在 launchd 里（%s）", app.Name, label),
 			"没有重复执行安装命令（brew / docker 都没有重跑）",
-			"如需重启或改配置，请到「服务管理」操作；如需在「服务管理」里看到它，请点「纳管」",
+			"如需重启或改配置，请到「应用 → 已安装」操作；如需在列表里看到它，请点「+ 注册服务」",
 		)
 		res.Message = fmt.Sprintf("「%s」已经装过了，本次跳过，没有重复安装", app.Name)
 		return res, true

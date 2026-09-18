@@ -691,7 +691,7 @@ func (m *Manager) InstallSyncthing(ctx context.Context, res *InstallResult) erro
 	if err := m.RegisterInstalledService(ctx, label, syncthingDisplayName, syncthingIcon, "tool", syncthingPort); err != nil {
 		// 登记失败不让整个部署失败（与 Miniflux / Qwen3 TTS 同一取舍）：
 		// 服务本身是好的，只是列表里暂时没有它，可手工纳管。
-		res.step(ctx, "（自动登记到服务管理失败："+err.Error()+"，可在「可纳管」里手动加入）")
+		res.step(ctx, "（自动登记到面板失败："+err.Error()+"，可在「应用 → 已安装」里点「+ 注册服务」手动加入）")
 	}
 
 	host := m.primaryIP()
