@@ -789,6 +789,11 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"python": func(m *Manager, ctx context.Context, app App, _, force bool, r *InstallResult) error {
 		return m.UninstallPythonRuntime(ctx, app, force, r)
 	},
+	// 图片压缩（libvips）：装的是 brew 的 vips 命令行，卸载就是 brew uninstall。
+	// 如实说明后果（面板的「图片压缩」会不可用），但用户的图片一张都不会动。
+	"imgcompress": func(m *Manager, ctx context.Context, app App, _, _ bool, r *InstallResult) error {
+		return m.UninstallImageCompressor(ctx, app, r)
+	},
 }
 
 // HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
@@ -1270,6 +1275,16 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 			"brew uninstall ffmpeg",
 		}
 		p.KeepNote = "需要时可随时从应用市场重新安装；面板安装脚本与 LNMP / Qwen TTS 部署也会自动补装"
+	case "imgcompress":
+		// 能力型应用：没有服务、没有守护进程，卸载就是摘掉引擎。
+		// 步骤里必须写清"面板的图片压缩会因此不可用"，以及"你的图片不会被删"。
+		p.Steps = []string{
+			"brew uninstall " + ImgCompressFormula + "（图片压缩引擎）",
+			"⚠️ 卸载后「文件管理 → 🖼️ 图片压缩」会显示引擎不可用，直到重新安装",
+			"你的图片文件**不会被删除或修改**（压缩只在你点「开始压缩」时读写你选中的那些文件）",
+		}
+		p.KeepNote = "面板不保存任何图片副本，所以没有「要清理的数据目录」；" +
+			"需要时随时可以从应用市场重新安装（原生 arm64 包，装完即用）"
 	case "miniflux":
 		// 铁律：卸载应用**不删数据**。Miniflux 库里是订阅源与已读状态，
 		// 删掉不可恢复，所以 PostgreSQL 与库一律保留，并在确认框里写清楚。

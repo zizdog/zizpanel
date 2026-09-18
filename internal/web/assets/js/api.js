@@ -419,6 +419,14 @@ export const api = {
   nginxStatus: () => request('GET', `${API_BASE}/system/nginx/status`),
   nginxRepair: () => request('POST', `${API_BASE}/system/nginx/repair`, {}),
 
+  // ---- 图片压缩（应用「图片压缩（libvips）」）----
+  // engine：引擎在不在 + 目标目录里有多少张图（只读，不改任何文件）。
+  // compress：批量压缩，走任务中心（202 + task_id，进度走 SSE）。
+  imageEngine: (dir, recursive = false) =>
+    request('GET', `${API_BASE}/images/engine?dir=${encodeURIComponent(dir || '')}`
+      + (recursive ? '&recursive=1' : '')),
+  imageCompress: (payload) => request('POST', `${API_BASE}/images/compress`, payload),
+
   // ---- 默认站点（80 端口上的兜底静态站点）----
   // 面板启动时会自动建一次；这两个接口用于"看状态"与"手动创建/修复"。
   // 没有 nginx 时 apply 会返回 409 + 人话（界面据此给「只安装 Nginx」）。

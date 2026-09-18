@@ -439,3 +439,8 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 
 169. **磁盘满时 `make dev` / `make check` 会谎报构建完成**（2026-09-20 排查中被误导一轮）→ `go build` 因 `no space left on device` 失败，而 make 那一步用 `;` 继续 → 后面跑的是**旧二进制**，表现为莫名 409 / 行为与代码不符（本次是"已注入发布公钥"却仍 409）。
     - 规矩：构建步骤必须检查退出码（不许 `;` 串接掩盖）；发布链路里"公钥/版本号已注入"必须**运行产物核对**（`-X` 在 `-trimpath` 下会静默失效，坑 152）。排查"代码明明改了却不生效"时，**先确认跑的是不是新二进制**（比对 mtime/sha256）。
+
+170. **"nginx 明明在跑，面板说未就绪"：用面板服务记录当运行判据**（2026-09-18 用户报障，原话"我网站运行地好好的！"）→ 现场：本机 nginx 在 :80 上正常服务（`http://127.0.0.1/` 200、`nginx: master` 进程在跑），但「网站管理」顶部写着 **"网站环境：未就绪（未检测到运行中的：nginx）"**，并顺势建议一键 LNMP。根因：那一行只看 `GET /api/v1/services` 里有没有一条 running 的 nginx 记录，而 nginx 完全可以"装着、在跑、不归面板管"（用户自己装的/换机后记录丢了）—— **没看见 ≠ 没在跑**。
+    - 修法：新增 `GET /api/v1/sites/runtime`，用**运行体证据**分别回答三个组件：nginx = `pgrep nginx: master`（复用 `priv.NginxStatus`）、PHP = 各版本 FPM 端点是否有人在听（`EndpointLive`）、MySQL = 配置的 host:port **真的能连**（700ms 超时）。面板服务记录只用来回答"归不归面板管"（`registered`），并且三种结果严格分开：在跑=已就绪（附一句"面板里暂无记录，需要管它就到「应用」里接入"）、真没进程=未就绪、**探测本身失败=状态未知**（绝不因为一次探测抖动说用户环境没就绪）。同时把 `.modal`/工具栏里的 nginx 药丸也改成同一判据。
+    - 门禁：`TestSitesRuntimeNginxRunningWithoutRecord`（在跑但无记录 ⇒ running=true / registered=false）、`TestSitesRuntimeProbeErrorNotReportedAsStopped`（探测失败 ⇒ 带 probe_error，不能当成"停止"）、`TestSitesRuntimeMySQLProbeUsesRealPort`（真开一个监听端口 ⇒ running=true）。
+    - 教训（类级）：**"归不归我管"与"它在不在跑"是两个问题，必须用两套判据。** 任何"状态"如果来自面板自己的登记表，就一定要问一句"登记表里没有它时，我会说什么"——答"未就绪/未安装"就是谎报。

@@ -1195,6 +1195,11 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	case "ffmpeg":
 		s.handleInstallBaseDependency(w, r)
 		return
+	case "imgcompress":
+		// 图片压缩（libvips）：同一个理由——vips 是纯命令行工具、没有 brew service，
+		// 走通用 brew 流程会得到"已安装但启动失败"的假警告 + 一条永远没有状态的假服务记录。
+		s.handleInstallImageCompressor(w, r)
+		return
 	case "python311", "python312", "python313":
 		// Python 解释器（应用市场里三个版本，用户 2026-09-18 要求上架）。
 		// 走自研安装器而不是通用 brew 流程：解释器**没有 brew service**，
@@ -1384,6 +1389,26 @@ func (s *Server) handleInstallBaseDependency(w http.ResponseWriter, r *http.Requ
 			}
 			res.Steps = append(res.Steps,
 				"FFmpeg 已就绪：TTS 编码 mp3、音色样本校验与后续音视频功能都会用到它")
+			return res, nil
+		})
+}
+
+// handleInstallImageCompressor 安装图片压缩引擎（libvips 的 vips 命令行）。
+//
+// 与 ffmpeg 同形：只做 brew install + 复核，不碰 brew services、不写服务记录。
+func (s *Server) handleInstallImageCompressor(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found || app.PanelInstaller != "imgcompress" {
+		fail(w, http.StatusBadRequest, "应用市场中找不到图片压缩条目 "+id)
+		return
+	}
+	s.launchTask(w, r, "install", id, "安装 "+app.Name+"（"+services.ImgCompressFormula+"）",
+		"install_imgcompress", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: app.ID, Steps: []string{}}
+			if err := s.svcManager().InstallImageCompressor(ctx, app, res); err != nil {
+				return res, err
+			}
 			return res, nil
 		})
 }

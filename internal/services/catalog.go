@@ -696,6 +696,35 @@ func Catalog() []App {
 			Port:     0,
 			DocsURL:  "https://ffmpeg.org",
 		},
+		// 图片压缩（libvips）。用户 2026-09-18 要求"为软件市场添加一个图片压缩软件"
+		//（附了一份 govips 的参考文档）。
+		//
+		// 为什么是 brew 的 vips 命令行、而不是面板里链 govips（CGO 绑定）：
+		//   · 面板是纯 Go 单二进制（交叉构建 arm64/amd64、-trimpath 注版本号），
+		//     链路里没有 CGO；更要紧的是运行期 —— CGO 会把 libvips 的动态库绑到
+		//     面板进程上，用户机器少一个 dylib 面板就起不来。管所有东西的进程
+		//     不能这样冒险。`vips` 命令行就是 libvips 本身（与 govips/sharp 同一引擎），
+		//     导出参数逐字可用，代价只是"每个文件一个进程"（几十毫秒）。
+		//   · 它**没有 brew service**（纯 CLI），所以走面板自研安装器而不是通用
+		//     brew 流程（否则会 brew services start 一个没有 service 的定义，留下
+		//     "已安装但启动失败"的假警告 —— 与 ffmpeg 同一条理由）。
+		// 界面：面板自己的「文件管理 → 🖼️ 图片压缩」（批量、进度、省了多少一目了然），
+		// 所以这里**不设 UI**（设了市场会渲染一个点开必然打不开的「打开」按钮）。
+		{
+			ID: "imgcompress", Name: "图片压缩（libvips）", Icon: "🖼️",
+			Summary:     "批量把图片压小（WebP / AVIF / JPEG/PNG），在文件管理里选目录直接跑",
+			Description: "用 libvips 批量压缩图片：可调质量、最长边、是否保留元数据，只缩小不放大；没有常驻进程与网页界面。",
+			Category:    CategoryOther, Kind: KindNative,
+			PanelInstaller: "imgcompress",
+			BrewFormula:    "vips",
+			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
+			NoDaemon: true,
+			Port:     0,
+			PostInstallHint: "装好后到「文件管理」选中要处理的目录，点工具条上的「🖼️ 图片压缩」：" +
+				"可调质量 / 最长边 / 输出格式（保持原格式、WebP、AVIF、JPEG、PNG）。" +
+				"默认**另存为 xxx.min.jpg**（不动原文件）；选「覆盖原文件」时会先确认，且压完更大时自动保留原文件。",
+			DocsURL: "https://www.libvips.org/",
+		},
 		// ---------------- Python 解释器（基础环境的运行时，用户 2026-09-18 要求） ----------------
 		//
 		// 为什么把 Python 解释器当"应用"上架：面板自研的两个服务（Qwen3 TTS、

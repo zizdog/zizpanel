@@ -7,6 +7,7 @@
 //   - 所有破坏性操作都要二次确认，删除目录必须显式勾选"递归"
 
 import { api, apiURL } from './api.js';
+import { taskCenter } from './tasks.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll, esc, rate, duration } from './ui.js';
 import { registerCleanup } from './app.js';
 
@@ -247,7 +248,14 @@ export function FilesView(content, ctx = {}) {
       ]),
       selCount > 0 ? h('div', { style: { flex: 1 } }) : h('div', { style: { flex: 1 } }),
       selCount > 0 ? h('span.pill.brand', { text: `已选 ${selCount} 项` }) : null,
-      selCount > 0 ? h('button.btn.btn-sm', { text: '压缩', onclick: compressSelected }) : null,
+      // 两个"压缩"必须一眼分得清：这里是**打包**（zip/tar 归档），
+      // 「🖼️ 图片压缩」是图片体积优化（另一件事，用 libvips）。
+      h('button.btn.btn-sm', {
+        text: '🖼️ 图片压缩',
+        title: '把当前目录里的图片压小（质量 / 最长边 / 输出格式可选；默认另存为 xxx.min.<ext>，不动原文件）',
+        onclick: imageCompressModal,
+      }),
+      selCount > 0 ? h('button.btn.btn-sm', { text: '打包压缩', onclick: compressSelected }) : null,
       selCount > 0 ? h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: deleteSelected }) : null,
       h('button.btn.btn-sm', { text: '🔍 搜索', onclick: searchModal }),
     );
@@ -480,6 +488,155 @@ export function FilesView(content, ctx = {}) {
       else toast(r.msg, 'ok');
       load(cwd);
     } catch (e) { toast(e.message, 'err', 10000); }
+  }
+
+  // imageCompressModal 是「图片压缩」弹窗：引擎状态 + 选项 + 走任务中心。
+  //
+  // 设计要点（都是用户提过的要求）：
+  //   · 先给**事实**：这个目录里有几张图、共多大（后端扫描给出），值不值得跑用户自己判断；
+  //   · 引擎没装时**不让点**，并直接给「一键安装」（不把用户打发去别的页面找）；
+  //   · 长任务走任务中心（关掉窗口也能在任务中心看进度），结果逐条列出"省了多少"；
+  //   · 默认**不动原文件**（另存 .min），覆盖是显式选项且会先确认。
+  async function imageCompressModal() {
+    const body = h('div');
+    const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
+    const m = modal({ title: '🖼️ 图片压缩（libvips）', body, footer: [foot], wide: false });
+    body.append(h('div.hint', { text: '正在读取引擎与目录…' }));
+
+    let st = null;
+    try {
+      st = await api.imageEngine(cwd, false);
+    } catch (e) {
+      body.textContent = '读取引擎状态失败：' + ((e && e.message) || e);
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+      return;
+    }
+
+    // 选项（把上次的选择留在本页会话里，省得每次都重设）
+    const quality = h('input', { type: 'range', min: '40', max: '100', step: '1', value: String(st.default_quality || 82), style: { flex: '1' } });
+    const qualityText = h('span', { text: String(st.default_quality || 82), style: { width: '34px', textAlign: 'right' } });
+    quality.addEventListener('input', () => { qualityText.textContent = quality.value; });
+    const format = h('select.select', [
+      h('option', { value: 'keep', text: '保持原格式（只重新编码）' }),
+      h('option', { value: 'webp', text: 'WebP（通常最小，兼容性好）' }),
+      h('option', { value: 'avif', text: 'AVIF（更小，但编码慢、老浏览器不支持）' }),
+      h('option', { value: 'jpeg', text: 'JPEG' }),
+      h('option', { value: 'png', text: 'PNG（无损，压不动多少）' }),
+    ]);
+    const maxEdge = h('select.select', (st.max_edge_choices || [0, 1920, 2560, 3840]).map((v) => h('option', {
+      value: String(v), text: v === 0 ? '不缩放（只重压）' : '最长边 ' + v + 'px（只缩小，不放大）',
+    })));
+    maxEdge.value = '0';
+    const strip = h('input', { type: 'checkbox' });
+    const recursive = h('input', { type: 'checkbox' });
+    const overwrite = h('input', { type: 'checkbox' });
+
+    function draw() {
+      clear(body);
+      clear(foot);
+
+      if (!st.available) {
+        body.append(h('div', { style: { lineHeight: '1.8' } }, [
+          h('div', { style: { fontWeight: '620', color: 'var(--warn)' }, text: '引擎还没装（缺 libvips）' }),
+          h('div', { style: { marginTop: '4px' }, text: st.reason || '' }),
+          h('div.hint', { style: { marginTop: '8px' },
+            text: '「图片压缩（libvips）」是原生 arm64 包，不需要 Docker / Node / PHP；装好后这个弹窗就能用了。' }),
+        ]));
+        foot.append(h('button.btn.btn-primary', {
+          text: '一键安装（libvips）',
+          onclick: async () => {
+            try {
+              await taskCenter.start({
+                kind: 'install', target: st.market_app_id, title: '安装 图片压缩（libvips）',
+                start: () => api.marketInstall(st.market_app_id),
+                onDone: async (task) => {
+                  if (task && task.status && task.status !== 'succeeded') {
+                    toast('安装失败：' + (task.error || task.status), 'err', 12000);
+                    return;
+                  }
+                  toast('引擎已装好，正在刷新…', 'ok', 8000);
+                  try { st = await api.imageEngine(cwd, recursive.checked); } catch (e) { /* 下面 draw 会如实显示 */ }
+                  draw();
+                },
+              });
+            } catch (e) { toast('安装失败：' + ((e && e.message) || e), 'err', 12000); }
+          },
+        }));
+        foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+        return;
+      }
+
+      const scan = st.scan_error
+        ? h('div.hint', { style: { color: 'var(--danger)' }, text: '扫描目录失败：' + st.scan_error })
+        : h('div.hint', {
+          text: '目录 ' + (st.dir || cwd) + '：找到 ' + st.image_count + ' 张图片，共 ' + humanSize(st.total_bytes)
+            + (st.image_count === 0 ? '（这个目录里没有可压缩的图片）' : ''),
+        });
+
+      body.append(h('div', { style: { lineHeight: '1.7' } }, [
+        h('div', { style: { fontSize: '12.5px', color: 'var(--text-dim)', marginBottom: '6px' },
+          text: '引擎：' + (st.version || '') + '（' + (st.bin || '') + '）' }),
+        scan,
+        h('div.field', { style: { marginTop: '10px' } }, [
+          h('label', { text: '质量（越小越省体积；PNG 是无损格式，这一项对它无效）' }),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [quality, qualityText]),
+        ]),
+        h('div.field', [h('label', { text: '输出格式' }), format]),
+        h('div.field', [h('label', { text: '尺寸' }), maxEdge]),
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px' } },
+          [strip, h('span', { text: '去掉元数据（EXIF/ICC 等，体积更小；照片的拍摄信息会丢）' })]),
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } },
+          [recursive, h('span', { text: '包含子目录' })]),
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } },
+          [overwrite, h('span', { text: '覆盖原文件（默认不勾：另存为 xxx.min.<ext>）' })]),
+        h('div.hint', { style: { marginTop: '8px' },
+          text: '失败或"压完反而更大"的文件一律保留原样并逐条说明；压缩在任务中心执行，关掉这个窗口也能看进度。' }),
+      ]));
+
+      const start = h('button.btn.btn-primary', { text: '开始压缩' + (st.image_count ? '（' + st.image_count + ' 张）' : '') });
+      start.addEventListener('click', async () => {
+        const opts = {
+          dir: st.dir || cwd,
+          recursive: recursive.checked,
+          quality: Number(quality.value),
+          format: format.value,
+          max_edge: Number(maxEdge.value),
+          strip_metadata: strip.checked,
+          overwrite: overwrite.checked,
+        };
+        if (opts.overwrite && !await confirmBox(
+          '将**覆盖** ' + (st.dir || cwd) + ' 里的原图（共 ' + st.image_count + ' 张）。\n\n'
+          + '压完更大的文件会自动保留原样，但覆盖不可撤销 —— 重要图片建议先备份。\n\n继续？',
+          { title: '覆盖原文件', okText: '覆盖压缩' })) return;
+        m.close();
+        try {
+          await taskCenter.start({
+            kind: 'image_compress', target: opts.dir,
+            title: '压缩图片（' + st.image_count + ' 张）',
+            start: () => api.imageCompress(opts),
+            onDone: (task) => {
+              if (task && task.status && task.status !== 'succeeded') {
+                toast('图片压缩失败：' + (task.error || task.status), 'err', 14000);
+                return;
+              }
+              const r = (task && task.result) || {};
+              toast('图片压缩完成：成功 ' + (r.done || 0) + ' 张，跳过 ' + (r.skipped || 0)
+                + ' 张（压完更大），失败 ' + (r.failed || 0) + ' 张；共省 ' + humanSize(r.saved_bytes || 0),
+              r.failed ? 'warn' : 'ok', 14000);
+              load(cwd);
+            },
+          });
+        } catch (e) { toast('图片压缩失败：' + ((e && e.message) || e), 'err', 14000); }
+      });
+      foot.append(h('button.btn', { text: '重新扫描', onclick: async () => {
+        try { st = await api.imageEngine(cwd, recursive.checked); draw(); }
+        catch (e) { toast('扫描失败：' + ((e && e.message) || e), 'err'); }
+      } }));
+      foot.append(start);
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+      recursive.addEventListener('change', () => { /* 需要重新扫描才准 */ });
+    }
+    draw();
   }
 
   async function compressSelected() {

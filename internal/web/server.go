@@ -470,6 +470,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("/phpmyadmin/", s.handlePhpMyAdmin)
 	root.HandleFunc("/phpmyadmin", s.handlePhpMyAdmin)
 
+	// ---------- 图片压缩（应用「图片压缩（libvips）」的能力入口）----------
+	// engine 是只读探测（引擎在不在 + 目录里有几张图），compress 走任务中心。
+	root.HandleFunc("GET /api/v1/images/engine", s.requireAuth(s.handleImageEngine))
+	root.HandleFunc("POST /api/v1/images/compress", s.requireAuth(s.handleImageCompress))
+
 	// 默认站点（建 www/localhost + 重写 000-default.conf，去掉 /_panel）。
 	// 面板启动时会**自动**做一次（见 api_default_site_boot.go）—— 这两个接口是
 	// 给"看一眼状态 / 自动没成功时手动重试 / 还没有 nginx 时只装 nginx"用的。

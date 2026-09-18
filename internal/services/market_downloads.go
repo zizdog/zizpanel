@@ -610,6 +610,25 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
+	// 图片压缩（libvips）：用户 2026-09-18 要求上架。
+	//
+	// 下载点只有 Homebrew 瓶（`brew install vips`）：原生 arm64 包，装完就是
+	// /opt/homebrew/bin/vips 一个命令行；面板自己的「文件管理 → 🖼️ 图片压缩」
+	// 直接调它（为什么不用 govips/CGO：见 internal/imgopt 与 catalog.go 里的取舍）。
+	// 运行期没有任何常驻进程、没有端口、没有网页界面。
+	{
+		ID: "imgcompress", Kind: KindNative, BrewFormula: "vips", PanelInstaller: "imgcompress",
+		NoDaemon: true,
+		Runtime: MarketRuntime{
+			Mode:        MarketRuntimeNone,
+			LabelSource: "目录 NoDaemon=true（命令行引擎，没有常驻进程；界面是面板自己的页面）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("vips", 30*time.Minute,
+				"brew install vips（libvips 8.18.x，arm64 瓶；装完复核 `vips --version` 真的能跑）"),
+		},
+	},
+
 	// ---------------- Python 解释器（基础环境，用户 2026-09-18 要求上架 3 个版本） ----------------
 	//
 	// 三个条目走**同一条**安装路径（PanelInstaller=python，见 python_runtime.go 的
