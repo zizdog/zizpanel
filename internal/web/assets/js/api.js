@@ -144,6 +144,11 @@ export const api = {
   navItemUpdate: (id, payload) => request('PUT', `${API_BASE}/nav/items/${id}`, payload),
   navItemDelete: (id) => request('DELETE', `${API_BASE}/nav/items/${id}`),
   navItemReorder: (ids) => request('POST', `${API_BASE}/nav/items/reorder`, { ids }),
+  // 「导航页」的本地图标：上传本地图片 + 列出已上传的（用户 2026-09-18 要求）。
+  // 上传走 api.upload（multipart 必须让浏览器自己生成 boundary）。
+  navIcons: () => request('GET', `${API_BASE}/nav/icons`),
+  navIconUpload: (file) => api.upload(apiURL('nav/icons'), file, 'file'),
+  navIconDelete: (name) => request('DELETE', `${API_BASE}/nav/icons/${encodeURIComponent(name)}`),
   navImport: (doc) => request('POST', `${API_BASE}/nav/import`, doc),
   navExportURL: () => apiURL('nav/export'),
   // 独立别名页地址：用当前访问的面板地址推导，而不是写死主机 ——

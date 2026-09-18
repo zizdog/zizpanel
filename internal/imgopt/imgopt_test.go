@@ -7,7 +7,9 @@ import (
 	"image/png"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -55,7 +57,12 @@ exit 0
 
 func TestDetectEngineHonest(t *testing.T) {
 	// ① 完全没有 vips：必须明确说"没有"，并给出安装入口（应用市场）。
+	//
+	// ⚠️ 必须把 PATH 也清干净：DetectEngine 会回落到 exec.LookPath("vips")
+	// （那是**真实产品行为** —— 用户可能从别处装了 vips），而开发机上现在真的
+	// 装了 vips，不清 PATH 这条断言就变成"看这台机器装没装"，而不是在测代码。
 	empty := t.TempDir()
+	t.Setenv("PATH", filepath.Join(empty, "bin"))
 	eng := DetectEngine(empty)
 	if eng.Available() {
 		t.Fatalf("沙箱里没有 vips 却被判成可用：%+v", eng)
@@ -293,11 +300,257 @@ func TestCompressFileRealVips(t *testing.T) {
 	_ = before
 }
 
+// TestThumbnailArgsAlwaysCarryWidth 是"默认值就坏"那次事故的门禁。
+//
+// 判据贴着 libvips 的真实约束：`vips thumbnail` 至少要 in / out / width
+// 三个**位置参数**，少给宽度它会 `thumbnail: too few arguments` 直接退出 1。
+// 而界面上「最长边」的默认值就是 0（不缩放）—— 这条判据一旦失守，
+// **默认设置下每一张图都压不了**（2026-09-18 用户报障的原样：
+// `vips 处理 xxx.heic 失败: exit status 1 / thumbnail: too few arguments`）。
+func TestThumbnailArgsAlwaysCarryWidth(t *testing.T) {
+	for _, edge := range []int{0, 1, 1280, maxEdgeLimit} {
+		o := Options{MaxEdge: edge}
+		args := o.thumbnailArgs("/in.jpg", "/out.jpg")
+		if args[0] != "thumbnail" {
+			t.Fatalf("MaxEdge=%d：操作名应是 thumbnail，得到 %q", edge, args[0])
+		}
+		// 位置参数：操作名之后，以 "--" 开头的都算选项，其余按位置算。
+		pos, width := 0, ""
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "--") {
+				continue
+			}
+			pos++
+			if pos == 3 {
+				width = a
+			}
+		}
+		if pos < 3 {
+			t.Fatalf("MaxEdge=%d：vips thumbnail 至少要 in/out/width 三个位置参数，"+
+				"现在只有 %d 个（%v）—— 这正是 `thumbnail: too few arguments` 的成因", edge, pos, args)
+		}
+		if w, err := strconv.Atoi(width); err != nil || w <= 0 {
+			t.Fatalf("MaxEdge=%d：width 必须是正整数，得到 %q（%v）", edge, width, args)
+		}
+		// `--size down`：没有它，vips thumbnail 会把**小图放大**到目标框
+		//（默认 size 语义），而界面与文档都对用户承诺"只缩不放"。
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "--size down") {
+			t.Fatalf("MaxEdge=%d：命令里必须有 `--size down`（只缩不放），实际 %v。\n"+
+				"少了它，900×700 的图配 1280 会被放大成 1280×996（实测），"+
+				"MaxEdge=0 时更会放大到超过 libwebp 上限报 `webpsave: image too large`", edge, args)
+		}
+	}
+}
+
+// TestCompressAllOptionCombinationsRealVips：**选项矩阵**逐格真跑。
+//
+// 为什么必须有这条：形状门禁只能挡住"少参数"，而"某一格组合让真 vips 报错"
+// 只有真跑才知道。老实现恰恰败在这里 —— 假 vips 永远说 OK，真 vips 一张都压不了
+// （默认档"不缩放"就是坏的那一格）。
+//
+// 没有 vips 的机器上如实 skip（不是假装通过）。
+func TestCompressAllOptionCombinationsRealVips(t *testing.T) {
+	eng := DetectEngine("/opt/homebrew")
+	if !eng.Available() {
+		t.Skip("本机没装 libvips，跳过真实选项矩阵校验")
+	}
+	for _, edge := range []int{0, 1280} {
+		for _, format := range []Format{FormatKeep, FormatWebP, FormatJPEG, FormatPNG} {
+			for _, strip := range []bool{false, true} {
+				dir := t.TempDir()
+				src := filepath.Join(dir, "probe.png")
+				writeNoisePNG(t, src, 640, 480)
+				res, err := eng.CompressFile(context.Background(), src,
+					Options{Quality: 80, Format: format, MaxEdge: edge, StripMetadata: strip})
+				if err != nil {
+					t.Fatalf("最长边=%d 格式=%s strip=%v：真实 vips 失败：%v", edge, format, strip, err)
+				}
+				if _, serr := os.Stat(res.Dst); serr != nil && !res.Skipped {
+					t.Fatalf("最长边=%d 格式=%s strip=%v：没有产出 %s（skipped=%v）",
+						edge, format, strip, res.Dst, res.Skipped)
+				} else if serr == nil {
+					// **绝不放大**：产物宽高都不得超过源图（640×480）。
+					// 这是第二层 bug 的门禁：`--size down` 缺失时 vips 会把小图
+					// 放大到目标框（900×700 + 1280 → 1280×996，实测），
+					// 而界面/文档对用户承诺的是"比目标小的图保持原尺寸"。
+					w, h := vipsImageDims(t, eng.Bin, res.Dst)
+					if w > 640 || h > 480 {
+						t.Fatalf("最长边=%d 格式=%s strip=%v：产物是 %dx%d，比源图 640x480 还大 —— "+
+							"vips thumbnail 少了 `--size down` 就会放大（2026-09-18 实测）",
+							edge, format, strip, w, h)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestCompressHEICViaSipsFallback：iPhone 拍的 HEIC 必须能压。
+//
+// 这台机器上的 vips（Homebrew 8.18.6）读不了 HEIC —— 它的动态模块搜索路径被
+// 编译成了构建机路径（sharp-libvips），实测 `vips -l` 里没有 heifload、直接报
+// `is not a known file format`。所以引擎对 HEIC/HEIF 先走系统 sips 转 PNG。
+// 这条测试就是用户 2026-09-18 报的那个场景：HEIC + **默认「不缩放」** → 必须成功。
+func TestCompressHEICViaSipsFallback(t *testing.T) {
+	eng := DetectEngine("/opt/homebrew")
+	if !eng.Available() {
+		t.Skip("本机没装 libvips，跳过 HEIC 兜底校验")
+	}
+	if _, err := os.Stat(SipsBin); err != nil {
+		t.Skip("本机没有 sips（不是 macOS？），跳过 HEIC 兜底校验")
+	}
+	dir := t.TempDir()
+	png := filepath.Join(dir, "src.png")
+	// 用平滑渐变（像真实照片）：随机噪声转 WebP 可能**变大**，
+	// 那样测的就是"压完更大要不要保留原文件"，而不是"HEIC 这条路通不通"。
+	writeGradientPNG(t, png, 640, 480)
+	heic := filepath.Join(dir, "photo.heic")
+	if out, err := exec.Command(SipsBin, "-s", "format", "heic", png, "--out", heic).
+		CombinedOutput(); err != nil {
+		t.Skipf("这台机器的 sips 生成不了 HEIC（%v：%s），跳过", err, strings.TrimSpace(string(out)))
+	}
+	res, err := eng.CompressFile(context.Background(), heic,
+		Options{Quality: 80, Format: FormatWebP, MaxEdge: 0, StripMetadata: true})
+	if err != nil {
+		t.Fatalf("压 HEIC 失败（正是用户 2026-09-18 报的场景）：%v", err)
+	}
+	if res.Skipped {
+		// 压完更大 → 保留原文件、如实标记：这是**正确**行为（绝不把文件弄大）。
+		// 判据是"HEIC 这条路能不能走通"，不是"每一张都必须变小"。
+		t.Logf("HEIC 走得通；这一张压完更大（%d → %d），按设计保留原文件", res.Before, res.After)
+		return
+	}
+	if !strings.HasSuffix(res.Dst, ".min.webp") {
+		t.Fatalf("产物名应按**原文件名**算（.min.webp），不该变成 .png：%s", res.Dst)
+	}
+	w, h := vipsImageDims(t, eng.Bin, res.Dst)
+	if w > 640 || h > 480 {
+		t.Fatalf("产物 %dx%d 比源图 640x480 还大：HEIC 这条路也必须只缩不放", w, h)
+	}
+}
+
+// TestVipsCapsComeFromRuntime：格式能力必须来自**运行体**，不是编译期配置。
+//
+// 依据是 2026-09-18 的实测：Homebrew 的 vips 8.18.6 瓶（sharp-libvips 构建）把
+// 动态模块路径编译成了构建机路径，`vips --vips-config` 里写着
+// "HEIC/AVIF load/save with libheif: true"，而 `vips -l` 里连 heifload 都没有。
+// 所以面板判断"能不能压这个格式"只能问 `vips -l`。
+func TestVipsCapsComeFromRuntime(t *testing.T) {
+	eng := DetectEngine("/opt/homebrew")
+	if !eng.Available() {
+		t.Skip("本机没装 libvips，跳过格式能力校验")
+	}
+	if len(eng.Ops) == 0 {
+		t.Fatalf("引擎可用却拿不到操作表（probeOps 返回空）：格式能力必须来自运行体")
+	}
+	// 核心格式是面板对用户的承诺，缺一个都算能力退化。
+	for _, op := range []string{"jpegload", "jpegsave", "pngload", "pngsave", "webpload", "webpsave"} {
+		if !eng.Ops[op] {
+			t.Errorf("核心操作 %s 在这台机器上不可用 —— 面板连 jpg/png/webp 都压不了", op)
+		}
+	}
+	// canSave/canLoad 必须与操作表一致：Ops 说不行就必须提前拦下来，
+	// 而不是放行到 vips 那里再抛一句 is not a known file format。
+	for ext, op := range saverForExt {
+		if got, want := eng.canSave(ext), eng.Ops[op]; got != want {
+			t.Errorf("canSave(%s) 与运行体能力不一致：canSave=%v，Ops[%s]=%v", ext, got, op, want)
+		}
+	}
+	for ext, op := range loaderForExt {
+		if got, want := eng.canLoad(ext), eng.Ops[op]; got != want {
+			t.Errorf("canLoad(%s) 与运行体能力不一致：canLoad=%v，Ops[%s]=%v", ext, got, op, want)
+		}
+	}
+}
+
+// TestUnsupportedOutputGivesActionableError：写不了的格式要给出**能照做的动作**。
+//
+// 用户场景（2026-09-18）：iPhone 的 HEIC + 默认「保持原格式」→ 这台机器的 vips
+// 写不了 HEIC。错误里必须有"不能输出 heic"和替代格式，而不是 vips 的原文。
+func TestUnsupportedOutputGivesActionableError(t *testing.T) {
+	eng := DetectEngine("/opt/homebrew")
+	if !eng.Available() {
+		t.Skip("本机没装 libvips，跳过")
+	}
+	if eng.canSave(".heic") {
+		t.Skip("这台机器的 vips 能写 HEIC（模块可用），本条不适用")
+	}
+	if _, err := os.Stat(SipsBin); err != nil {
+		t.Skip("本机没有 sips，造不出 HEIC 素材")
+	}
+	dir := t.TempDir()
+	png := filepath.Join(dir, "src.png")
+	writeGradientPNG(t, png, 320, 240)
+	heic := filepath.Join(dir, "photo.heic")
+	if out, err := exec.Command(SipsBin, "-s", "format", "heic", png, "--out", heic).
+		CombinedOutput(); err != nil {
+		t.Skipf("sips 生成不了 HEIC（%v：%s）", err, strings.TrimSpace(string(out)))
+	}
+	_, err := eng.CompressFile(context.Background(), heic, Options{Quality: 80, Format: FormatKeep})
+	if err == nil {
+		t.Fatal("vips 写不了 HEIC 时，FormatKeep 必须如实报错（不许报成功）")
+	}
+	for _, want := range []string{"不能输出 heic", "WebP"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误里应当有 %q（用户据此知道下一步做什么），实际：%v", want, err)
+		}
+	}
+}
+
+// vipsImageDims 用 vipsheader 读产物尺寸（`-f width` / `-f height`）。
+//
+// 为什么不用 Go 解码：产物可能是 png / jpeg / webp / avif 四种之一，
+// 而 vipsheader 就装在被测引擎旁边，且这两条真实测试本来就要求 vips 存在。
+func vipsImageDims(t *testing.T, vipsBin, path string) (int, int) {
+	t.Helper()
+	header := filepath.Join(filepath.Dir(vipsBin), "vipsheader")
+	read := func(field string) int {
+		out, err := exec.Command(header, "-f", field, path).Output()
+		if err != nil {
+			t.Fatalf("vipsheader -f %s %s 失败：%v", field, path, err)
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		if err != nil {
+			t.Fatalf("vipsheader 输出的 %s 不是整数：%q", field, out)
+		}
+		return n
+	}
+	return read("width"), read("height")
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
+}
+
+// writeGradientPNG 生成一张平滑渐变的 PNG。
+//
+// 比随机噪声更像真实照片：有损编码（WebP/JPEG/HEIC）都能把它显著压小，
+// 因此适合验证"真的变小了"，而不会把测试变成在测 Skipped 分支。
+func writeGradientPNG(t *testing.T, path string, w, h int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{
+				R: uint8(x * 255 / w),
+				G: uint8(y * 255 / h),
+				B: uint8((x + y) * 255 / (w + h)),
+				A: 255,
+			})
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := png.Encode(f, img); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // writeNoisePNG 生成一张随机噪点的 PNG（压缩空间大，适合验证"真的变小了"）。

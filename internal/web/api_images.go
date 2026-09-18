@@ -231,7 +231,8 @@ func (s *Server) handleImageCompress(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(targets) == 0 {
 		fail(w, http.StatusBadRequest, "目录 "+dir+" 里没有可压缩的图片"+
-			"（支持 jpg/png/webp/avif/heic/tif/gif/bmp；要看子目录请勾上「包含子目录」）")
+			"（jpg / jpeg / png / webp / tif / gif；heic / heif 由 macOS 系统解码器兜底；"+
+			"avif / bmp 取决于这台机器上的 vips 是否带对应模块。要看子目录请勾上「包含子目录」）")
 		return
 	}
 	overwrite := opt.Overwrite

@@ -377,7 +377,8 @@ func (s *ImgCompressServer) handleCompress(w http.ResponseWriter, r *http.Reques
 	}
 	if len(badExt) > 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"ok": false, "msg": "这些文件不是支持的图片格式（jpg/jpeg/png/webp/avif/heic/tif/gif/bmp）：" +
+			"ok": false, "msg": "这些文件不是支持的图片格式（jpg / jpeg / png / webp / tif / gif；" +
+				"heic / heif 由 macOS 系统解码器兜底；avif / bmp 取决于这台机器上的 vips 是否带对应模块）：" +
 				strings.Join(badExt, "、"),
 		})
 		return

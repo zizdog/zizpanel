@@ -50,7 +50,11 @@ const el = (tag, cls, text) => {
 
 function iconNode(it) {
   const icon = String(it.icon || '').trim();
-  if (/^https?:\/\//i.test(icon)) {
+  // http(s) 直链，或**面板自己托管的本地图标**（/nav/icons/<内容哈希>.<扩展名>）：
+  // 用户在面板的「编辑站点」里点「⬆ 上传本地图标」传上来的那张。
+  // 这条路径是公开可读的（导航页本身匿名可访问），所以别名页也能显示。
+  if (/^https?:\/\//i.test(icon)
+    || /^\/nav\/icons\/[0-9a-f]{16}\.(png|jpg|jpeg|gif|webp|svg|ico)$/i.test(icon)) {
     const img = el('img', 'icon');
     img.src = icon;
     img.alt = '';

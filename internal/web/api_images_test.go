@@ -63,6 +63,11 @@ func seedImages(t *testing.T, dir string, names ...string) {
 // TestImageEngineHonestWithoutEngine：没装引擎时必须如实说"没装"，并给出应用 ID
 // （界面据此渲染「一键安装」按钮）。
 func TestImageEngineHonestWithoutEngine(t *testing.T) {
+	// ⚠️ 必须把 PATH 也隔离掉：DetectEngine 会回落到 exec.LookPath("vips")
+	//（那是真实产品行为 —— 用户可能从别处装了 vips），而开发机上现在真的装了
+	// vips（2026-09-18 为复现 HEIC 问题装的）。不清 PATH，这条断言就变成
+	// "看这台机器装没装"，而不是在测代码。
+	t.Setenv("PATH", t.TempDir())
 	_, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)

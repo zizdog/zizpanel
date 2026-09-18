@@ -579,6 +579,21 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .zp-nav-desc { font-size: 11.5px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .zp-nav-card-ops { display: flex; gap: 4px; justify-content: flex-end; margin-top: 6px; }
 
+/* 「已上传的图标」选择器：看图挑一张（用户 2026-09-18 要求）。
+   文件名是内容哈希，人认不出来 —— 所以这里以图为主、删除按钮只在悬停/聚焦时显眼。 */
+.zp-icon-grid {
+  display: grid; gap: 10px; margin-top: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  max-height: 46vh; overflow-y: auto;
+}
+.zp-icon-cell {
+  position: relative; padding: 6px; border-radius: var(--radius);
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.zp-icon-cell img { width: 100%; height: 64px; object-fit: contain; display: block; cursor: pointer; }
+.zp-icon-cell .zp-icon-del { position: absolute; top: 2px; right: 2px; opacity: .3; }
+.zp-icon-cell:hover .zp-icon-del, .zp-icon-cell .zp-icon-del:focus { opacity: 1; }
+
 @media (max-width: 760px) {
   .zp-nav-grid { grid-template-columns: 1fr; }
   .zp-nav-search { max-width: none; }

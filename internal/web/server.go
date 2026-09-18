@@ -532,6 +532,12 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/nav/items/{id}", s.requireAuth(s.handleNavItemDelete))
 	root.HandleFunc("GET /api/v1/nav/export", s.requireAuth(s.handleNavExport))
 	root.HandleFunc("POST /api/v1/nav/import", s.requireAuth(s.handleNavImport))
+	// 导航页的本地图标（上传本地图片 + 在已上传的里面挑）：
+	// 读文件走公开的 /nav/icons/（在下面的外层 mux，导航页是匿名首页），
+	// 这里这三条是**写/列**——必须登录面板。
+	root.HandleFunc("GET /api/v1/nav/icons", s.requireAuth(s.handleNavIconsList))
+	root.HandleFunc("POST /api/v1/nav/icons", s.requireAuth(s.handleNavIconUpload))
+	root.HandleFunc("DELETE /api/v1/nav/icons/{name}", s.requireAuth(s.handleNavIconDelete))
 
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会

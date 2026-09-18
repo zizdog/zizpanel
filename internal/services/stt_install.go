@@ -459,10 +459,15 @@ func (m *Manager) InstallSTT(ctx context.Context, app App, result *InstallResult
 		}
 	}
 
-	// ③ 复核引擎真的能跑。
+	// ③ 轻量检查：whisper-cli 在不在、可不可执行（**不 spawn 进程**）。
+	//
+	// 重型复核（真的跑一次 `--help`）挪到第 ⑥ 步、也就是网页界面服务注册**之后**：
+	// 2026-09-18 真机事故正是它在前面失败 —— 模型没下、界面服务没注册，
+	// 用户点「打开」直接得到 502（面板无法连接 127.0.0.1:8892）。
+	// 判据越贵，越要放在不挡用户路的位置（AGENTS 第三节）。
 	eng := m.STTEngineFor()
-	if verr := m.sttVerifyCLI(ctx, eng, result); verr != nil {
-		return verr
+	if err := sttEngineFileCheck(eng); err != nil {
+		return err
 	}
 
 	// ④ 下载默认档模型。
@@ -501,6 +506,35 @@ func (m *Manager) InstallSTT(ctx context.Context, app App, result *InstallResult
 			"模型目录："+p.ModelsDir+"（卸载时可在确认框里选择是否一并删除）",
 		)
 	}
+
+	// ⑥ 复核引擎真的能跑（单次超时 180s + 冷启动自动重试一次，见 probe_retry.go）。
+	//
+	// 排在服务注册之后是刻意的：复核失败时用户仍能打开网页界面、在界面里看到
+	// 引擎的真实状态并点「重新检测」，而不是连入口都没有。
+	if verr := m.sttVerifyCLI(ctx, eng, result); verr != nil {
+		return fmt.Errorf("%w。网页界面服务已经注册好（http://127.0.0.1:%d/ ，"+
+			"或从卡片点「打开」走面板别名 /%s/），可以先在界面里看引擎的真实状态并点「重新检测」；"+
+			"若界面里也报引擎不可用，请执行 `brew reinstall %s` 后重试",
+			verr, port, STTSlug, STTBrewFormula)
+	}
+	return nil
+}
+
+// sttEngineFileCheck 是复核前的**轻量**检查：只看文件，不 spawn 进程。
+//
+// 为什么要它：重型复核很贵（要加载 Metal 后端，首次执行还要过系统完整性校验），
+// 而"Homebrew 根本没装上 / 软链悬空"用 os.Stat 就能挡住 ——
+// 挡在下载几百 MB 模型之前，比事后报错便宜得多。
+func sttEngineFileCheck(eng *STTEngine) error {
+	if eng == nil || strings.TrimSpace(eng.CLIBin) == "" {
+		return fmt.Errorf("找不到 whisper-cli（Homebrew 的 %s 装到哪里了？）。"+
+			"请先在「应用市场」对「语音转文字」点「重新部署」，或在终端执行 `brew install %s`",
+			STTBrewFormula, STTBrewFormula)
+	}
+	if !fileExecutable(eng.CLIBin) {
+		return fmt.Errorf("%s 不存在或不可执行（悬空软链 / 权限不对）。"+
+			"请执行 `brew reinstall %s` 后重试", eng.CLIBin, STTBrewFormula)
+	}
 	return nil
 }
 
@@ -510,10 +544,19 @@ func (m *Manager) InstallSTT(ctx context.Context, app App, result *InstallResult
 // 也可能缺了动态库直接 dyld 报错。所以真跑一次 `--help` 并看输出里
 // 有没有我们依赖的那几个开关。
 func (m *Manager) sttVerifyCLI(ctx context.Context, eng *STTEngine, result *InstallResult) error {
-	out, err := eng.run()(ctx, 60*time.Second, eng.CLIBin, []string{"--help"}, nil)
+	var logf func(string)
+	if result != nil {
+		logf = func(s string) { result.step(ctx, s) }
+	}
+	run := eng.run()
+	out, err := RunEngineProbeWithRetry(ctx, logf,
+		func(c context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+			return run(c, timeout, name, args, nil)
+		}, eng.CLIBin, "--help")
 	if err != nil {
-		return fmt.Errorf("引擎装好了但跑不起来（%s --help 失败）：%w。"+
-			"通常是 Homebrew 下载/链接失败，请重试或在终端跑 `brew install %s`",
+		return fmt.Errorf("引擎装好了但复核没通过（%s --help 失败）：%w。"+
+			"已自动重试一次（刚装好的二进制首次执行可能被系统完整性校验拖慢）。"+
+			"若反复失败，通常是 Homebrew 下载/链接不完整，请执行 `brew reinstall %s`",
 			eng.CLIBin, err, STTBrewFormula)
 	}
 	// 这几个开关是转写流程真正用到的（模型是每次调用的参数、JSON 输出、

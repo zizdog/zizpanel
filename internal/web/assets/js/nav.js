@@ -37,6 +37,106 @@ function faviconOf(rawURL) {
   }
 }
 
+// uploadNavIcon 让用户挑一张本地图片，上传成面板自己托管的图标。
+//
+// 用户 2026-09-18 要求："导航页要求可以上传本地图标！"
+// 图标落在面板数据目录的 nav-icons/ 里（文件名是内容哈希），
+// 读取走公开的 /nav/icons/<name>（导航页是匿名首页，图标必须匿名可读）。
+// 上传成功后把地址直接填进图标输入框 —— 用户点「保存」才真正生效。
+async function uploadNavIcon(iconInput, btn) {
+  const picker = h('input', {
+    type: 'file',
+    accept: '.png,.jpg,.jpeg,.gif,.webp,.svg,.ico,image/png,image/jpeg,image/gif,image/webp,image/svg+xml,image/x-icon',
+    style: { display: 'none' },
+  });
+  picker.onchange = async () => {
+    const f = picker.files && picker.files[0];
+    picker.value = '';
+    if (!f) return;
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '上传中…';
+    try {
+      const info = await api.navIconUpload(f);
+      iconInput.value = (info && info.url) || '';
+      toast('图标已上传：' + f.name + '。点「保存」后这条才生效', 'ok', 6000);
+    } catch (e) {
+      toast('图标上传失败：' + e.message, 'err', 9000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
+  };
+  // 追加到 body 再点：Safari 要求 input 在文档里才能触发选择框。
+  document.body.appendChild(picker);
+  picker.click();
+  setTimeout(() => picker.remove(), 120000);
+}
+
+// pickUploadedIcon 打开「已上传的图标」选择器：**看着图挑**。
+//
+// 为什么必须有个看图的选择器（用户："也可以在已经上传的图标中选择！"）：
+// 落盘文件名是内容哈希（防穿越、天然去重），人根本认不出来是哪张 ——
+// 只给一个文件名列表等于让用户猜。
+async function pickUploadedIcon(iconInput) {
+  const grid = h('div.zp-icon-grid');
+  const status = h('div.hint', { text: '正在读取已上传的图标…' });
+  const m = modal({
+    title: '从已上传的图标中选择',
+    wide: true,
+    body: h('div', [status, grid]),
+    footer: (close) => [h('button.btn', { text: '关闭', onclick: close })],
+  });
+  let icons = [];
+  try {
+    const data = await api.navIcons();
+    icons = (data && data.icons) || [];
+  } catch (e) {
+    status.textContent = '读取已上传图标失败：' + e.message;
+    return m;
+  }
+  if (icons.length === 0) {
+    status.textContent = '还没有上传过图标 —— 到「编辑站点 → 图标」那一行点「⬆ 上传本地图标」。';
+    return m;
+  }
+  status.textContent = '共 ' + icons.length + ' 张：点一张就选中（🗑 删除该图，已引用的条目会显示默认图标）';
+  for (const ic of icons) {
+    const card = h('div.zp-icon-cell', [
+      h('img', {
+        src: ic.url,
+        alt: '',
+        title: ic.name + '（' + Math.round((ic.bytes || 0) / 1024) + ' KB）',
+        loading: 'lazy',
+        onclick: () => {
+          iconInput.value = ic.url;
+          m.close();
+          toast('已选择图标，点「保存」后生效', 'ok');
+        },
+      }),
+      h('button.btn.btn-sm.btn-icon.btn-danger.zp-icon-del', {
+        text: '🗑',
+        title: '删除这张图标（磁盘上真的删掉）',
+        onclick: async (ev) => {
+          ev.stopPropagation();
+          const yes = await confirmBox(
+            '这张图标会从磁盘上真的删掉。已经引用它的站点会显示默认图标，需要重新选一张。',
+            { title: '删除图标？', danger: true, okText: '删除' });
+          if (!yes) return;
+          try {
+            await api.navIconDelete(ic.name);
+            card.remove();
+            toast('已删除该图标', 'ok');
+          } catch (e) {
+            toast('删除失败：' + e.message, 'err');
+          }
+        },
+      }),
+    ]);
+    grid.appendChild(card);
+  }
+  return m;
+}
+
 export function NavView(content, ctx = {}) {
   clear(content);
 
@@ -147,7 +247,10 @@ export function NavView(content, ctx = {}) {
 
   function iconNode(it) {
     const icon = String(it.icon || '').trim();
-    if (/^https?:\/\//i.test(icon)) {
+    // http(s) 直链，或**面板自己托管的本地图标**（/nav/icons/<内容哈希>.<扩展名>，
+    // 就是用户在编辑弹窗里点「⬆ 上传本地图标」传上来的那张）。两者都用 <img> 渲染。
+    if (/^https?:\/\//i.test(icon)
+      || /^\/nav\/icons\/[0-9a-f]{16}\.(png|jpg|jpeg|gif|webp|svg|ico)$/i.test(icon)) {
       return h('img.zp-nav-icon', { src: icon, alt: '', loading: 'lazy' });
     }
     return h('span.zp-nav-icon.zp-nav-emoji', { text: icon || '🔗' });
@@ -380,6 +483,17 @@ export function NavView(content, ctx = {}) {
         icon.value = v;
       },
     });
+    // 上传本地图标 / 从已上传的里面挑（用户 2026-09-18 要求）。
+    const iconUp = h('button.btn.btn-sm', {
+      text: '⬆ 上传本地图标',
+      title: '选一张本地图片（png / jpg / gif / webp / svg / ico，≤512 KiB）上传到面板，当作这个站点的图标',
+    });
+    const iconPick = h('button.btn.btn-sm', {
+      text: '🖼 已上传',
+      title: '从你上传过的图标里挑一张（看图选择，可删除）',
+    });
+    iconUp.onclick = () => uploadNavIcon(icon, iconUp);
+    iconPick.onclick = () => pickUploadedIcon(icon);
 
     const okBtn = h('button.btn.btn-primary', { text: isEdit ? '保存' : '创建' });
     const m = modal({
@@ -390,8 +504,12 @@ export function NavView(content, ctx = {}) {
         h('div.field', [h('label', { text: '网址（只支持 http / https）' }), url]),
         h('div.field', [
           h('label', { text: '图标' }),
-          h('div', { style: { display: 'flex', gap: '8px' } }, [icon, favi]),
-          h('div.hint', { text: '填 emoji 或图片直链；留空则显示一个默认图标。' }),
+          h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+            [icon, favi, iconUp, iconPick]),
+          h('div.hint', {
+            text: '填 emoji、图片直链，或上传一张本地图片（png / jpg / gif / webp / svg / ico，≤512 KiB）。'
+              + '上传后可点「🖼 已上传」在已传过的里面挑。留空则显示默认图标。',
+          }),
         ]),
         h('div.field', [h('label', { text: '描述' }), desc]),
         h('div.field', [h('label', { text: '所属分组' }), groupSel]),

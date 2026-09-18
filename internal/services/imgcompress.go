@@ -218,19 +218,29 @@ func (m *Manager) InstallImageCompressor(ctx context.Context, app App, result *I
 		}
 	}
 	bin := m.ImgCompressBin()
-	ver, err := m.imgCompressVersion(ctx, bin)
-	if err != nil {
+	// 轻量检查（只看文件，不 spawn）：挡在注册服务之前，但**不**因为复核而阻断它。
+	if err := imgCompressFileCheck(bin); err != nil {
 		return err
 	}
-	if result != nil {
-		result.step(ctx, "引擎已就绪："+bin+"（"+ver+"）")
-	}
+	// 先注册/启动网页界面服务，再复核引擎 —— 顺序是刻意的：
+	// 2026-09-18 真机事故里，复核排在前面失败，导致服务没注册、用户点「打开」拿到 502，
+	// 而引擎其实好好的（详见 probe_retry.go 顶部）。界面本身会如实报引擎状态。
 	if err := m.installImgCompressService(ctx, app, result); err != nil {
 		return err
 	}
 	port := app.WebPort()
 	if port <= 0 {
 		port = ImgCompressPort
+	}
+	ver, err := m.imgCompressVersion(ctx, bin)
+	if err != nil {
+		return fmt.Errorf("%w。网页界面服务已经注册好（http://127.0.0.1:%d/ ，"+
+			"或从卡片点「打开」走面板别名 /%s/），可以先在界面里看引擎的真实状态；"+
+			"若界面里也报引擎不可用，请执行 `brew reinstall %s` 后重试",
+			err, port, imgCompressSlug(app), ImgCompressFormula)
+	}
+	if result != nil {
+		result.step(ctx, "引擎已就绪："+bin+"（"+ver+"）")
 	}
 	if result != nil {
 		result.Steps = append(result.Steps,
@@ -384,7 +394,23 @@ func (m *Manager) removeImgCompressService(ctx context.Context, result *InstallR
 	return nil
 }
 
+// imgCompressFileCheck 是复核前的**轻量**检查：只看文件，不 spawn 进程。
+func imgCompressFileCheck(bin string) error {
+	if strings.TrimSpace(bin) == "" {
+		return fmt.Errorf("找不到 vips 可执行文件（Homebrew 的 %s 装到哪里了？）。"+
+			"请在「应用市场」对「图片压缩（libvips）」点「重新部署」", ImgCompressFormula)
+	}
+	if !fileExecutable(bin) {
+		return fmt.Errorf("%s 不存在或不可执行（悬空软链 / 权限不对）。"+
+			"请执行 `brew reinstall %s` 后重试", bin, ImgCompressFormula)
+	}
+	return nil
+}
+
 // imgCompressVersion 跑一次 `vips --version` 复核引擎真的能用。
+//
+// 单次超时 180s、失败自动重试一次（首次执行可能被系统完整性校验拖慢）——
+// 与 STT 共用同一套判据，见 probe_retry.go 顶部的事故说明。
 func (m *Manager) imgCompressVersion(ctx context.Context, bin string) (string, error) {
 	if _, err := os.Stat(bin); err != nil {
 		return "", fmt.Errorf("安装似乎完成了，但 %s 不存在：%w"+
@@ -393,12 +419,15 @@ func (m *Manager) imgCompressVersion(ctx context.Context, bin string) (string, e
 	}
 	// 直接执行（不需要降权：`vips --version` 只是打印版本，任何人可跑）。
 	// 用 sudo -u 反而会把"用户不存在"这种测试/环境问题混进来。
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	outRaw, err := exec.CommandContext(cctx, bin, "--version").CombinedOutput()
-	out := string(outRaw)
+	out, err := RunEngineProbeWithRetry(ctx, nil,
+		func(c context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+			cctx, cancel := context.WithTimeout(c, timeout)
+			defer cancel()
+			b, e := exec.CommandContext(cctx, name, args...).CombinedOutput()
+			return string(b), e
+		}, bin, "--version")
 	if err != nil {
-		return "", fmt.Errorf("引擎装好了但跑不起来（%s --version 失败）：%v\n%s",
+		return "", fmt.Errorf("引擎装好了但复核没通过（%s --version 失败）：%v\n%s",
 			bin, err, strings.TrimSpace(out))
 	}
 	return strings.TrimSpace(out), nil

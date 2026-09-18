@@ -125,8 +125,17 @@ func validateNavIcon(raw string) (string, error) {
 		}
 		return v, nil
 	}
+	// 面板自己托管的本地图标（上传后在"已上传"里选出来的那个）。
+	//
+	// 只放行这一种形状：`/nav/icons/<16 位内容哈希>.<白名单扩展名>` ——
+	// 它由 handleNavIconUpload 生成，读取端同样用这条判据挡路径穿越。
+	// 其它任何相对路径（`//evil.com`、`../`、`/api/...`）都不在这里放行，
+	// 会落到下面"必须是 emoji"的分支被拒。
+	if navLocalIconRe.MatchString(v) {
+		return v, nil
+	}
 	if utf8.RuneCountInString(v) > 8 {
-		return "", errors.New("图标只支持一个 emoji，或 http(s) 图片地址")
+		return "", errors.New("图标只支持一个 emoji、http(s) 图片地址，或面板里上传的本地图标")
 	}
 	return v, nil
 }
@@ -737,6 +746,10 @@ func (s *Server) navItemCount(ctx context.Context) (int, error) {
 // ============================================================================
 
 func (s *Server) registerNavPage(root *http.ServeMux) {
+	// 公开面有两个前缀：/nav/（页面与数据）与 /nav/icons/（用户上传的本地图标）。
+	// ServeMux 取**最长匹配**，所以 /nav/icons/<name> 一定会命中下面这条，
+	// 与注册顺序无关；写在前面只是为了让人一眼看到公开面有哪些。
+	root.Handle(navIconURLBase, http.HandlerFunc(s.handleNavIconFile))
 	root.Handle("/nav/", http.HandlerFunc(s.handleNavPage))
 	root.Handle("/nav", http.RedirectHandler("/nav/", http.StatusMovedPermanently))
 }

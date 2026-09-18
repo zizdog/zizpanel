@@ -181,9 +181,20 @@ func Handler(app services.App) http.Handler {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = io.WriteString(w, "<h1>502 应用没有响应</h1><p>面板无法连接 "+ui.Slug+
-				"（127.0.0.1:"+itoa(app.WebPort())+"）："+esc(err.Error())+"</p>"+
-				"<p>这个应用可能没有启动。请到「服务管理」看它的状态，或到「应用市场」重新部署。</p>")
+			// 这页文案是用户唯一能看到的线索，所以必须给出**可照做的动作**。
+			//
+			// 2026-09-18 真机：从旧版升级上来的机器上，应用市场里这个应用显示
+			// "已安装"（引擎产物在），但**网页界面服务从来没被注册过**（旧版没有它），
+			// 于是点「打开」就是这张 502 —— 而原文案只说"到服务管理看状态"，
+			// 用户在服务管理里根本找不到这一项（服务压根没注册过）。
+			_, _ = io.WriteString(w, "<h1>502 应用没有响应</h1>"+
+				"<p>面板无法连接「"+esc(app.Name)+"」（127.0.0.1:"+itoa(app.WebPort())+"）："+esc(err.Error())+"</p>"+
+				"<p>最常见的原因：这个应用的<b>网页界面服务还没部署、或者没起来</b> —— "+
+				"从旧版本升级上来的机器上尤其常见（旧版只装了引擎，没有网页界面）。</p>"+
+				"<p><b>怎么办</b>：回到面板 →「应用市场」→ 找到「"+esc(app.Name)+"」→ "+
+				"点卡片上的 <b>⚙️ 管理</b> → <b>重装</b>。"+
+				"重装是幂等的：已下载的产物会复用、你的数据保留，它会把这个网页界面服务注册并启动起来。<br>"+
+				"也可以到「服务管理」看这一项的状态与日志尾部（起不来的真实原因在那里）。</p>")
 		},
 	}
 	return proxy
