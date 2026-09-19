@@ -408,48 +408,80 @@ else
   pass "默认：安装界面不问 SSH、也不问「免授权访问内网段」"
 fi
 
-# ①b 外接硬盘与系统授权：**真机安装 vs 远程安装必须区别对待**
-#     用户 2026-09-19 的铁律：真机安装才允许弹窗要权限；远程安装绝不触发任何弹窗。
-EXT_LOCAL_LOG="$SANDBOX/dryrun-ext-local.log"
-rm -rf "$SANDBOX/dryrun-ext-local-root"
-ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
-  ZIZPANEL_ROOT="$SANDBOX/dryrun-ext-local-root" ZIZPANEL_LISTEN=":$PORT" \
-  bash "$INSTALL_SH" > "$EXT_LOCAL_LOG" 2>&1 || true
-if grep -q "可以走系统授权弹窗" "$EXT_LOCAL_LOG" && grep -q "现在就插上" "$EXT_LOCAL_LOG" \
-   && grep -q "想要访问可移除宗卷上的文件" "$EXT_LOCAL_LOG"; then
-  pass "真机安装：说明可走系统授权弹窗 + 提示「要接外接盘就先插上」"
+# ①a 代码签名证书信任：安装时必须走这一步（它是"授权跨升级有效"的前提）
+if grep -q "代码签名证书" "$DRUN_LOG"; then
+  pass "安装流程包含「代码签名证书信任」步骤（面板授权跨升级有效的关键）"
 else
-  fail "真机安装：缺少「可弹窗要权限 / 先插外接盘」的说明"
+  fail "安装流程没有「代码签名证书信任」这一步 → 用户每次升级都要重新授权"
+fi
+# 静态锁：必须是**系统级**信任（-d + System.keychain），否则代码要求验不过
+if grep -q 'add-trusted-cert -d -r trustRoot -p codeSign' "$SRC_INSTALL" \
+   && grep -q '/Library/Keychains/System.keychain' "$SRC_INSTALL"; then
+  pass "静态锁：证书信任写进系统钥匙串（-d / System.keychain）"
+else
+  fail "静态锁：证书信任没有写进系统钥匙串"
+fi
+
+# ①b 外接硬盘与系统授权：**先问"用不用"，再决定要不要授权**（用户 2026-09-19 的要求）
+#     默认「不用」⇒ 不碰外接卷、不弹任何窗；只有明确说"会用"才走授权流程。
+EXT_NO_LOG="$SANDBOX/dryrun-ext-no.log"
+rm -rf "$SANDBOX/dryrun-ext-no-root"
+ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-ext-no-root" ZIZPANEL_LISTEN=":$PORT" \
+  bash "$INSTALL_SH" > "$EXT_NO_LOG" 2>&1 || true
+if grep -q "不会碰任何外接卷" "$EXT_NO_LOG" && grep -q "不会触发任何系统授权弹窗" "$EXT_NO_LOG"; then
+  pass "默认（不用外接盘）：明确承诺不碰外接卷、不触发任何弹窗"
+else
+  fail "默认（不用外接盘）：缺少「不碰外接卷 / 不触发弹窗」的承诺"
+fi
+
+EXT_YES_LOG="$SANDBOX/dryrun-ext-yes.log"
+rm -rf "$SANDBOX/dryrun-ext-yes-root"
+ZP_EXTERNAL_DISK=1 ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+  ZIZPANEL_ROOT="$SANDBOX/dryrun-ext-yes-root" ZIZPANEL_LISTEN=":$PORT" \
+  bash "$INSTALL_SH" > "$EXT_YES_LOG" 2>&1 || true
+if grep -q "请\*\*现在把它插上\*\*" "$EXT_YES_LOG" \
+   && grep -q "想要访问可移除宗卷上的文件" "$EXT_YES_LOG" \
+   && grep -q "固定证书签名" "$EXT_YES_LOG"; then
+  pass "选择会用外接盘（真机）：提示先插盘 + 说明会弹一次授权 + 说明签名后升级不用再授权"
+else
+  fail "选择会用外接盘（真机）：缺少「先插盘 / 弹窗说明 / 签名」任一项"
+fi
+if grep -q "这台机器会接外置硬盘吗" "$SRC_INSTALL" && grep -q 'ZP_EXTERNAL_DISK' "$SRC_INSTALL"; then
+  pass "外接盘是**由用户选择**的（交互提问 + ZP_EXTERNAL_DISK 环境变量，默认不用）"
+else
+  fail "外接盘没有做成「用户可选」（会用的人被打扰 / 不用的人也被问）"
 fi
 
 EXT_REMOTE_LOG="$SANDBOX/dryrun-ext-remote.log"
 rm -rf "$SANDBOX/dryrun-ext-remote-root"
-SSH_CONNECTION="10.0.0.9 55555 10.0.0.1 22" ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+SSH_CONNECTION="10.0.0.9 55555 10.0.0.1 22" ZP_EXTERNAL_DISK=1 \
+  ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
   ZIZPANEL_ROOT="$SANDBOX/dryrun-ext-remote-root" ZIZPANEL_LISTEN=":$PORT" \
   bash "$INSTALL_SH" > "$EXT_REMOTE_LOG" 2>&1 || true
 if grep -q "不会触发任何系统授权弹窗" "$EXT_REMOTE_LOG" \
-   && grep -q "必须到\*\*真机\*\*上授权一次" "$EXT_REMOTE_LOG" \
+   && grep -q "请到\*\*真机\*\*上授权一次" "$EXT_REMOTE_LOG" \
    && grep -q "完全磁盘访问权限" "$EXT_REMOTE_LOG"; then
   pass "远程安装：明确「不触发任何弹窗」+「外接盘必须到真机授权」（铁律）"
 else
   fail "远程安装：缺少「不触发弹窗 / 真机授权」的说明"
 fi
-if grep -qE "现在就插上|可以走系统授权弹窗" "$EXT_REMOTE_LOG"; then
-  fail "远程安装：不该出现「可以弹窗/现在就插上」这类真机话术"
+if grep -qE "现在把它插上|可以走系统授权弹窗" "$EXT_REMOTE_LOG"; then
+  fail "远程安装：不该出现「现在插上/可弹窗」这类真机话术"
 else
   pass "远程安装：不出现真机话术（不会误导用户以为远程能弹窗）"
 fi
 
-# 授权请求标记只有在「真机 + 当面同意 + 有外接卷 + 有图形登录会话」时才写；
-# 沙箱与远程**都绝不能写**（写了就等于允许守护进程去触发弹窗）。
+# 授权请求标记只有在「真机 + 明确说要用 + 检测到外接卷 + 有图形登录会话」时才写；
+# 不用 / 远程 / 沙箱都**绝不能写**（写了就等于允许守护进程去触发弹窗）。
 EXT_MARKERS=""
-for d in "$SANDBOX/dryrun-ext-local-root" "$SANDBOX/dryrun-ext-remote-root"; do
+for d in "$SANDBOX/dryrun-ext-no-root" "$SANDBOX/dryrun-ext-yes-root" "$SANDBOX/dryrun-ext-remote-root"; do
   [ -e "$d/data/request-volume-auth.once" ] && EXT_MARKERS="$EXT_MARKERS $d"
 done
 if [ -n "$EXT_MARKERS" ]; then
-  fail "写了外接盘授权请求标记（沙箱/远程都不该写）：$EXT_MARKERS"
+  fail "写了外接盘授权请求标记（不用/沙箱/远程都不该写）：$EXT_MARKERS"
 else
-  pass "沙箱/远程：不写外接盘授权请求标记（绝不触发弹窗）"
+  pass "不用 / 沙箱 / 远程：都不写外接盘授权请求标记（绝不触发弹窗）"
 fi
 
 # ② 显式 ZP_LAN_PREAUTH=1 → 才走预授权（且要看到三件事 + 走面板接口的计划）

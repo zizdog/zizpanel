@@ -238,6 +238,9 @@ RUNTIME_TOOLS := tools/takeover-panel-entry.sh tools/panel-entry.awk \
 # 发布签名密钥。私钥只在本机存在（.release-key/ 已 gitignore），
 # 绝不能进仓库、更不能打进发布包 —— 否则任何人都能签出"合法"升级包。
 RELEASE_KEY ?= .release-key/zizpanel-ed25519.key
+# 代码签名证书（公钥部分随包分发，目标机由 install.sh 装进系统钥匙串并设信任）。
+# 私钥在 .release-key/codesign/（已 gitignore，只存在于构建机）。
+CODESIGN_CERT ?= .release-key/codesign/zp-codesign.crt
 # 发布包对外可下载的地址前缀（写进 manifest.json 的资源 URL）
 RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSION)
 # 可选：把更新说明写进这个文件，会被放进清单里展示给用户
@@ -301,7 +304,20 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；AR
 			-o $(DIST)/tmp-$$arch/zizpanel ./cmd/zizpanel; \
 		GOOS=darwin GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
 			-o $(DIST)/tmp-$$arch/zizpanel-helper ./cmd/zizpanel-helper; \
+		if [ "$${SKIP_CODESIGN:-0}" = "1" ]; then \
+			echo "    !! 跳过签名（SKIP_CODESIGN=1）：本次产物是 adhoc 签名，"; \
+			echo "       用户升级后系统会要求重新授权（见 docs/坑清单.md #183）"; \
+		else \
+			bash tools/codesign-release.sh $(DIST)/tmp-$$arch/zizpanel com.zizpanel.panel; \
+			bash tools/codesign-release.sh $(DIST)/tmp-$$arch/zizpanel-helper com.zizpanel.helper; \
+		fi; \
 		install -m 0755 install.sh $(DIST)/tmp-$$arch/install.sh; \
+		if [ -f $(CODESIGN_CERT) ]; then \
+			install -m 0644 $(CODESIGN_CERT) $(DIST)/tmp-$$arch/zizpanel-codesign.crt; \
+		else \
+			echo "    !! 没有 $(CODESIGN_CERT)：目标机不会自动信任签名证书，"; \
+			echo "       用户升级后可能被系统要求重新授权（只影响授权持久性，不影响安装）"; \
+		fi; \
 		mkdir -p $(DIST)/tmp-$$arch/tools; \
 		for t in $(RUNTIME_TOOLS); do \
 			install -m 0644 "$$t" "$(DIST)/tmp-$$arch/tools/$${t#tools/}"; \

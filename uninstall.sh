@@ -166,6 +166,17 @@ remove_panel_program() { # 只删程序，保留 $PANEL_ROOT 里的数据
 
 remove_panel_data() {
   title "删除面板数据"
+  # 代码签名证书的信任：面板装的时候以 root 把它写进系统钥匙串（让 TCC 授权跨升级有效）。
+  # 卸载时**必须一起撤掉** —— 留一个"受信任的代码签名根"在系统里，比留几个文件危险得多。
+  local crt="$PANEL_ROOT/data/zizpanel-codesign.crt"
+  [ -f "$crt" ] || crt="$PANEL_ROOT/zizpanel-codesign.crt"
+  if [ -f "$crt" ]; then
+    if run security remove-trusted-cert -d "$crt"; then
+      ok "已撤销代码签名证书信任（${crt}）"
+    else
+      warn "撤销证书信任失败（可手工在「钥匙串访问」里删掉 ZizPanel Release 证书）"
+    fi
+  fi
   if [ -d "$PANEL_ROOT" ]; then
     run rm -rf "$PANEL_ROOT"
     ok "已删除 ${PANEL_ROOT}（配置、面板数据库、证书、日志）"

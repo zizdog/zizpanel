@@ -187,6 +187,8 @@ TMP_DIR=""
 #   ZP_EXTERNAL_ACK  = 1 表示用户当面同意"安装时顺便申请一次外接盘授权"
 ZP_EXTERNAL_MODE=""
 ZP_EXTERNAL_ACK=0
+# ZP_EXTERNAL_WANT：用户是否说"会用到外接硬盘"（1/0）。不用的人全程不碰外接卷、不弹任何窗。
+ZP_EXTERNAL_WANT=0
 # 脚本所在目录（用于定位随包分发的工具脚本）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 
@@ -1520,15 +1522,20 @@ finish() {
   printf '\n'
   # 只有**显式要求**（ZP_LAN_PREAUTH=1）才写过预授权；写了就必须在最后再提醒一次重启
   # （真机反馈：之前提示只出现在中间那一步，装完的摘要里没有，用户以为装完就生效了）。
-  # 外接硬盘的授权状态：真机（已申请）/ 远程（没触发任何弹窗，必须到真机授权）。
-  if [ "${ZP_EXTERNAL_MODE:-}" = "local" ] && [ "${ZP_EXTERNAL_ACK:-0}" = "1" ]; then
-    printf '  外接硬盘   已按你的同意申请一次系统授权：若屏幕弹过「访问可移除宗卷」请确认点了「允许」。\n'
-    printf '             升级面板后二进制会变，系统可能要你再授权一次（不是 bug）。\n'
+  # 外接硬盘：按用户**自己的选择**如实汇报（不用的人压根没被碰过，也就没有弹窗）。
+  if [ "${ZP_EXTERNAL_WANT:-0}" != "1" ]; then
+    printf '  外接硬盘   你说不用 —— 安装过程没有碰任何外接卷，也没有触发任何系统授权弹窗。\n'
+    printf '             以后想用：插上盘，到「面板 → 磁盘」按页面指引授权一次即可。\n'
+    printf '\n'
+  elif [ "${ZP_EXTERNAL_MODE:-}" = "local" ] && [ "${ZP_EXTERNAL_ACK:-0}" = "1" ]; then
+    printf '  外接硬盘   已按你的同意申请一次系统授权：屏幕上若弹过「访问可移除宗卷」请确认点了「允许」。\n'
+    printf '             面板已用固定证书签名 —— 以后升级面板不需要再授权。\n'
     printf '\n'
   elif [ "${ZP_EXTERNAL_MODE:-}" = "remote" ]; then
-    printf '  %s外接硬盘   本次远程安装没有触发任何授权弹窗。%s\n' "$C_YELLOW" "$C_RESET"
-    printf '             要用外接盘请到真机上：系统设置 → 隐私与安全性 → 完全磁盘访问权限\n'
-    printf '             → 点「+」选中 %s/bin/zizpanel → 打开开关 → 重启面板。\n' "$ZIZPANEL_ROOT"
+    printf '  %s外接硬盘   你说会用到，但本次远程安装没有（也不会）触发任何授权弹窗。%s\n' "$C_YELLOW" "$C_RESET"
+    printf '             请到真机上授权一次：系统设置 → 隐私与安全性 → 完全磁盘访问权限\n'
+    printf '             → 点「+」选中 %s/bin/zizpanel → 打开开关。\n' "$ZIZPANEL_ROOT"
+    printf '             面板已用固定证书签名 —— 授权一次后升级不用再授。\n'
     printf '\n'
   fi
   if [ "${LAN_PREAUTH_APPLIED:-0}" = "1" ]; then
@@ -1777,6 +1784,15 @@ zp_random_hex() {
 zp_read() {
   local prompt="$1" def="$2" __var="$3" secret="${4:-0}" line="" rc=0 attempt=0
   local ttydev="/dev/tty" tty_saved=""
+  # 没有可交互终端（curl | sudo bash 且没有 /dev/tty、或自动化）：
+  # 直接按"读不到输入"返回，让调用方走默认值分支。
+  # 不能去执行 `read -u ""` —— bash 会打一行
+  # `read: : invalid file descriptor specification` 的噪音（真机安装时很吓人），
+  # 而语义上本来就"没有输入"。
+  if [ -z "$ZP_TTY_FD" ]; then
+    printf -v "$__var" '%s' "${def:-}"
+    return 1
+  fi
   if [ -n "$def" ]; then
     printf '%s%s%s %s[%s]%s: ' "$C_BOLD" "$prompt" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET"
   else
@@ -2001,6 +2017,57 @@ is_remote_session() {
   return 0
 }
 
+# -------------------------------------- 代码签名证书信任（授权能否跨升级存活）--
+#
+# 为什么需要：macOS 把"用户对外接盘 / 受保护目录的授权"绑定在二进制的**代码要求**上。
+#   · 未签名（adhoc）面板：判据是 `cdhash H"…"` —— **每次构建都变** ⇒ 用户每升一次级就要重新授权一次
+#     （2026-09-19 实测：1.4.5→1.4.6、1.4.6→1.4.7 都失效，System Settings 里的开关也一起失效）；
+#   · 用固定证书 + 固定 identifier 签名后：判据是 `identifier "com.zizpanel.panel" and
+#     certificate root = H"<证书指纹>"` —— **与 cdhash 无关** ⇒ 授权一次长期有效
+#     （同日实测：1.4.8 授权后升到 1.4.9，cdhash 变了但读盘仍是 200）。
+#
+# 目标机缺的那一步就是**信任这张自签证书**（否则代码要求验不过）。证书公钥随包分发，
+# 这里以 root 装进系统钥匙串。⚠️ 这一步**只导入证书、不触发任何 TCC 弹窗**（与铁律 12 不冲突）。
+install_codesign_trust() {
+  title "代码签名证书信任（让面板授权跨升级有效）"
+  local crt=""
+  for c in "$SCRIPT_DIR/zizpanel-codesign.crt" "$TMP_DIR/zizpanel-codesign.crt"; do
+    [ -f "$c" ] && { crt="$c"; break; }
+  done
+  if [ -z "$crt" ]; then
+    warn "包里没有 zizpanel-codesign.crt（旧包或不带签名的构建）"
+    info "不影响安装；但面板升级后系统可能要求你重新授权一次外接盘/受保护目录。"
+    return 0
+  fi
+  if [ "$(id -u)" != "0" ]; then
+    warn "非 root，跳过证书信任导入；请用 sudo 重跑，或手工执行："
+    info "  sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain $crt"
+    return 0
+  fi
+  if dry_run; then
+    info "（干跑）将导入并信任代码签名证书：$crt"
+    return 0
+  fi
+  # 留一份副本在数据目录：卸载脚本要凭它撤销信任，否则会把一个"受信任的代码签名根"
+  # 永久留在用户系统里（比留几个文件危险得多）。
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  cp -f "$crt" "$DATA_DIR/zizpanel-codesign.crt" 2>/dev/null || true
+  if security add-trusted-cert -d -r trustRoot -p codeSign \
+       -k /Library/Keychains/System.keychain "$crt" >/dev/null 2>&1; then
+    ok "代码签名证书已受系统信任（面板授权可跨升级保持有效）"
+    return 0
+  fi
+  # 已经信任过 / 首次失败都要如实说，不谎报
+  if security verify-cert -c "$crt" >/dev/null 2>&1; then
+    ok "代码签名证书已在系统信任库里（无需重复导入）"
+    return 0
+  fi
+  warn "证书信任导入失败。影响：面板**升级后**系统可能要求重新授权一次（外接盘、受保护目录）。"
+  warn "可手工执行：sudo security add-trusted-cert -d -r trustRoot -p codeSign \\"
+  warn "              -k /Library/Keychains/System.keychain $crt"
+  return 0
+}
+
 # --------------------------------------------- 外接硬盘与系统授权（真机/远程）--
 #
 # 🚨 用户 2026-09-19 定的**铁律**（安装脚本与面板都必须遵守）：
@@ -2035,43 +2102,70 @@ console_login_user() {
 
 # setup_external_volume_notice：安装最前面就问清楚（用户要求"过程中要让用户知道并确认"）。
 setup_external_volume_notice() {
-  title "外接硬盘与系统授权（真机 / 远程不一样）"
-  local vols=""
-  vols="$(external_volume_list)"
+  title "外接硬盘（用不用由你决定）"
 
+  # 先问一个**明确的选择题**，默认「不用」：
+  #   · 不用外接盘的人，安装过程不该碰任何外接卷、更不该被系统授权弹窗打扰；
+  #   · 会用的人，才需要"现在插上 + 屏幕上点一次允许"这套流程。
+  # 环境变量优先（无人值守安装）：ZP_EXTERNAL_DISK=1/0。
+  local want=0
+  case "${ZP_EXTERNAL_DISK:-}" in
+    1|yes|y|on)  want=1 ;;
+    0|no|n|off)  want=0 ;;
+    "")
+      if zp_yes "这台机器会接外置硬盘吗？（做镜像盘 / 在文件管理里访问它）" "n"; then
+        want=1
+      fi
+      ;;
+    *) warn "无法识别的 ZP_EXTERNAL_DISK=${ZP_EXTERNAL_DISK}（按「不用外接盘」处理）"; want=0 ;;
+  esac
+  ZP_EXTERNAL_WANT="$want"
+
+  if [ "$want" != "1" ]; then
+    info "好 —— 本次安装**不会碰任何外接卷**，也**不会触发任何系统授权弹窗**。"
+    info "以后想用了：插上盘，到「面板 → 磁盘」按页面上的指引授权一次即可。"
+    if is_remote_session; then ZP_EXTERNAL_MODE="remote"; else ZP_EXTERNAL_MODE="local"; fi
+    return 0
+  fi
+
+  # ---- 用户说会用到外接硬盘 ----
   if is_remote_session; then
     ZP_EXTERNAL_MODE="remote"
-    warn "你是从**别的电脑**（SSH/远程）运行这个安装脚本的。"
-    info "· 本次安装**不会触发任何系统授权弹窗**：没人能在机器前点按钮，"
-    info "  弹窗只会被系统记成拒绝，反而让面板以后一碰外接盘就是「静默被拒」。"
-    info "· 要用外接硬盘（做镜像盘 / 在文件管理里访问），必须到**真机**上授权一次："
-    info "    系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 $BIN_DIR/zizpanel"
-    info "    （这块盘还要给站点/镜像站用，就把 nginx 的二进制也照同样方式加上）→ 打开开关 → 重启面板"
-    info "· 授权是发给**面板这个二进制**的：升级面板后二进制变了，可能要再授权一次。"
-    if zp_yes "明白了：外接硬盘需要我到真机上授权。继续安装？" "y"; then
+    warn "你是从别的电脑（SSH/远程）跑安装的：本次**不会触发任何系统授权弹窗** ——"
+    info "没人能在机器前点按钮，弹窗只会被系统记成拒绝，反而让面板以后一碰外接盘就「静默被拒」。"
+    info "要用外接盘，请到**真机**上授权一次（二选一）："
+    info "  · 系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 $BIN_DIR/zizpanel"
+    info "    （这块盘还要给站点/镜像站用，就把 nginx 的二进制也照同样方式加上）→ 打开开关"
+    info "  · 或者在那台机器上跑到面板「磁盘」页，按页面指引操作（同样不需要弹窗）"
+    info "授权是发给**面板这个二进制**的；面板已用固定证书签名，所以**一次授权后升级也不用再授**。"
+    if zp_yes "明白了：外接盘需要我到真机上授权。继续安装？" "y"; then
       return 0
     fi
     die "已按你的要求停止安装（可以稍后到真机上再跑一次）"
   fi
 
-  # ---- 真机安装 ----
   ZP_EXTERNAL_MODE="local"
-  ok "你在**本机**（这台机器的屏幕/键盘前）运行安装脚本 —— 可以走系统授权弹窗。"
+  ok "你选了会用到外接硬盘。请**现在把它插上**（U 盘/硬盘盒插好后再继续）。"
+  info "安装过程中系统会弹一次「…想要访问可移除宗卷上的文件」——点「允许」就把授权做完了。"
+  info "（面板已用固定证书签名：这一次授权之后，升级面板也不需要再授权。）"
+
+  local vols="" try=0 _ignored=""
+  while [ "$try" -lt 3 ]; do
+    zp_read "插好后按回车继续（不想插了就再按一次回车，最多问 3 次）" "" _ignored || true
+    vols="$(external_volume_list)"
+    [ -n "$vols" ] && break
+    try=$((try + 1))
+    [ "$try" -lt 3 ] && warn "还没检测到外接卷（第 ${try}/3 次）。插好后再按一次回车。"
+  done
+
   if [ -n "$vols" ]; then
-    info "检测到外接卷："
+    ok "检测到外接卷："
     printf '%s\n' "$vols" | sed 's/^/    /'
-  else
-    info "当前没有检测到外接卷。"
-  fi
-  info "· 打算把外接硬盘当镜像盘 / 在文件管理里用它：**现在就插上**（插好后再按回车），"
-  info "  安装会替你向系统申请一次授权 —— 屏幕上弹出「…想要访问可移除宗卷上的文件」时点「允许」。"
-  info "· 不插也行：以后随时能在真机上补授权（系统设置 → 隐私与安全性 → 完全磁盘访问权限）。"
-  info "· 授权跟面板二进制绑定：升级面板后系统可能要你再点一次，这不是面板的 bug。"
-  if zp_yes "要用外接硬盘的话，现在插好了吗？（选 n = 这次不申请外接盘授权）" "y"; then
     ZP_EXTERNAL_ACK=1
   else
     ZP_EXTERNAL_ACK=0
-    info "好，这次不申请外接盘授权 —— 安装过程一个字节都不会碰外接卷。"
+    warn "仍未检测到外接卷 → 这次不申请授权（安装照常继续，不会碰任何外接卷）。"
+    info "插上盘以后：到「面板 → 磁盘」按页面指引授权一次即可，或重跑一次安装脚本。"
   fi
   return 0
 }
@@ -2706,6 +2800,9 @@ main() {
   write_raw_config
 
   install_binaries
+
+  # 让签名证书在本机受信任：这是"用户授权一次、以后升级都不用再授"的前提。
+  install_codesign_trust
 
   # 补齐配置：预写的那份只有 4 个键，其余默认值（www_root / access_mode 等）
   # 只在 Go 侧定义。这里调**刚装好的**面板二进制把它补齐并落盘，避免磁盘上
