@@ -46,6 +46,7 @@ var tarballDescriptors = []string{
 	"orbien-client",
 	"ddns-go",
 	"alist",
+	"filebrowser",
 }
 
 // descriptorsByID / descriptorOrder 是描述符注册表
@@ -348,6 +349,9 @@ func tarballKeepNote(spec releaseBinaryApp) string {
 		return keep + "与 frpc.toml，配置里有 token）"
 	case "orbien-client":
 		return keep + "与 orbien.toml，配置里可能有服务端 token）"
+	case "filebrowser":
+		return keep + "与 filebrowser.db；filebrowser.db 里有用户、权限与设置，" +
+			"删除它等于重置管理员口令）"
 	default:
 		return keep + "与 " + spec.ConfigFile + "，配置里可能有秘密）"
 	}
@@ -462,9 +466,10 @@ func (m *Manager) OrchestrateTarballInstall(ctx context.Context, d AppDescriptor
 		Result: result,
 		Runner: newSysRunner(m),
 		pathVars: map[string]string{
-			"{root}": p.Root,
-			"{home}": m.opt.UserHome,
-			"{user}": m.opt.UserName,
+			"{root}":   p.Root,
+			"{home}":   m.opt.UserHome,
+			"{user}":   m.opt.UserName,
+			"{vardir}": m.opt.WorkDir,
 		},
 		// 镜像是执行期才知道配没配的（设置项），所以候选地址在**执行期**注入，
 		// 而不是把镜像地址写死进描述符（写死就无法跟随设置变更，也会让

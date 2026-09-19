@@ -1350,6 +1350,87 @@ export async function openVoiceSourcesModal(parentModal) {
 //  的割裂（用户 2026-09-16 反馈的正是这个）。
 // ============================================================================
 
+// FILEBROWSER_LABEL 是 File Browser 的 launchd label（与后端 constants 同源）。
+const FILEBROWSER_LABEL = 'com.zizdog.filebrowser';
+
+// openFilebrowserRootModal 改 File Browser 的「主目录」。
+//
+// 后端读/写的是 launchd plist 的 `-r` 参数（不是它数据库里的 config.root ——
+// 实测启动参数优先级更高且运行中改库会被 Bolt 锁挡住），写完后端会**回读核对**，
+// 这里如实显示"已回读生效"或"未复核"。
+async function openFilebrowserRootModal(s, parentModal) {
+  const status = h('div.muted', { text: '正在读取当前主目录…' });
+  const input = h('input', {
+    type: 'text', value: '', placeholder: '/Users/你的用户名',
+    style: { width: '100%', boxSizing: 'border-box' },
+  });
+  const saveBtn = h('button.btn.btn-ok', { text: '保存并重启' });
+
+  const guidance = h('div', [
+    h('p', { text: 'File Browser 单实例只有**一个**根目录（启动参数 -r）。想要"多目录"，按推荐度：' }),
+    h('ul', [
+      h('li', { text: '① 管理整个家目录（默认）：root = 你的家目录，Downloads / Documents / www 全都在里面，最简单。' }),
+      h('li', { text: '② 只想暴露某几个目录：把要展示的目录放进同一个父目录，再把 root 指那个父目录（最稳，等价于旧 Docker 挂到 /srv）。' }),
+      h('li', { text: '③ 多用户 + 各自 scope：在 File Browser 的 Web UI → 管理 → 用户管理 → 选中用户 → 设置 Scope；一个用户只有一个 scope。' }),
+      h('li', { text: '④ 软链接：目标在 root 内时默认可用；指向 root 外时默认被隐藏，需开 --followExternalSymlinks（上游标注 unsafe，不建议）。' }),
+    ]),
+    h('p', {
+      text: '⚠️ 风险与边界：root 指向家目录时，**谁能登录这个 Web UI，谁就能读写整个家目录**'
+        + '（含 ~/.ssh、凭据、~/Library/Keychains）。当前版本没有按目录排除的机制，'
+        + 'db 里的 --hide-dotfiles 只隐藏列表显示、实测能用 /api/raw/.ssh/id_rsa 直接绕过 —— 隐藏 ≠ 安全。'
+        + '它只绑 127.0.0.1、只经面板 /filebrowser/ 入口访问，不要直接开到局域网/公网。',
+    }),
+  ]);
+
+  const body = h('div', [
+    h('p', { text: '主目录（绝对路径）：' }),
+    input,
+    h('div', { style: { margin: '8px 0' } }, [saveBtn]),
+    status,
+    h('hr'),
+    guidance,
+  ]);
+  const m = modal({ title: 'File Browser 主目录', wide: true, body });
+
+  async function load() {
+    try {
+      const info = await api.filebrowserRoot(s.name);
+      input.value = info.root || info.default_root || '';
+      status.textContent = info.installed
+        ? `当前生效：${info.root || '(空)'}（来源：${info.root_source || 'plist'}）`
+        : `还没有读到 launchd 配置（${info.plist || ''}）——File Browser 可能没装好。`;
+    } catch (e) {
+      status.textContent = '读取失败：' + e.message;
+    }
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    const root = (input.value || '').trim();
+    if (!root) { toast('主目录不能为空', 'err'); return; }
+    saveBtn.disabled = true;
+    status.textContent = '正在改配置并重启服务…';
+    try {
+      const info = await api.setFilebrowserRoot(s.name, root);
+      input.value = info.root || root;
+      if (info.verified) {
+        status.textContent = `✅ 已回读生效：${info.root}。${info.note || ''}`;
+        toast('主目录已生效：' + info.root, 'ok');
+      } else {
+        status.textContent = `⚠️ 未复核：${info.note || '没能回读到新值'}`;
+        toast('已请求修改，但没能回读确认（未复核）', 'warn', 12000);
+      }
+    } catch (e) {
+      status.textContent = '保存失败：' + e.message;
+      toast('保存失败：' + e.message, 'err', 12000);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+
+  await load();
+  return m;
+}
+
 // WIDGET_BUTTONS：launchd 标签 → 造按钮的函数。
 //
 // 用 label 而不是"应用 ID"当键：服务记录里可靠的就是 launch_label
@@ -1374,6 +1455,14 @@ const WIDGET_BUTTONS = {
       text: '🧠 模型',
       title: '查看模型是否驻留内存、手动加载或释放（释放后下次请求会自动重新加载）',
       onclick: () => openQwenModels(s),
+    }),
+  ],
+  // File Browser：文件根目录（-r）设置。改完重启并回读生效值。
+  [FILEBROWSER_LABEL]: (parentModal, s) => [
+    h('button.btn.btn-sm', {
+      text: '📁 主目录',
+      title: '设置 File Browser 管理的根目录（改 launchd plist 的 -r → 重启 → 回读生效值）',
+      onclick: () => openFilebrowserRootModal(s, parentModal),
     }),
   ],
 };

@@ -78,6 +78,154 @@ var siteHomeProbeFn = func(ctx context.Context, url string) (int, string) {
 	return probeHTTP(ctx, url)
 }
 
+// sitePHPPreflightFn 是"一键建站前置条件检查"的注入点。
+//
+// 默认真实执行：解析该版本真实的 php 二进制、核对最低版本、必需的 PHP 扩展、
+// 以及站点根目录可写。缺任何一项都在**建目录/下载之前**拒绝，绝不装出一个
+// 打不开的站点。单测注入假实现（不跑真实 php、不碰真实 brew 前缀）。
+var sitePHPPreflightFn = func(s *Server, appName string, spec *services.SiteAppSpec, phpVersion string) error {
+	return checkSiteAppRequirements(s, appName, spec, phpVersion)
+}
+
+// checkSiteAppRequirements 实现一键建站的前置条件检查（MinPHP / PHPExts / 目录可写）。
+//
+// 判据贴着"运行体"：真的去跑本机该版本的 php 二进制，而不是猜扩展装没装。
+// spec 没声明任何要求时直接通过（既有 typecho / wordpress 不受影响）。
+func checkSiteAppRequirements(s *Server, appName string, spec *services.SiteAppSpec, phpVersion string) error {
+	if spec == nil || (spec.MinPHP == "" && len(spec.PHPExts) == 0) {
+		return nil
+	}
+	bin := s.phpBinaryFor(phpVersion)
+	if bin == "" {
+		return fmt.Errorf("「%s」需要 PHP %s，但本机找不到它的可执行文件"+
+			"（已找 %s/opt/php@%s/bin/php）——请先在「应用市场」安装 PHP %s，或在一键建站时选一个已安装的版本",
+			appName, phpVersion, s.Cfg.BrewPrefix, phpVersion, phpVersion)
+	}
+	actual, err := phpVersionOf(bin)
+	if err != nil {
+		return fmt.Errorf("无法执行 PHP %s（%s）：%w", phpVersion, bin, err)
+	}
+	if spec.MinPHP != "" && !phpVersionAtLeast(actual, spec.MinPHP) {
+		return fmt.Errorf("「%s」要求 PHP >= %s，但本机 PHP %s 实际是 %s —— 请选更高的 PHP 版本或先安装新版本",
+			appName, spec.MinPHP, phpVersion, actual)
+	}
+	if len(spec.PHPExts) > 0 {
+		have, err := phpModules(bin)
+		if err != nil {
+			return fmt.Errorf("读取 PHP %s 的扩展列表失败（%s）：%w", actual, bin, err)
+		}
+		var missing []string
+		for _, e := range spec.PHPExts {
+			if !have[strings.ToLower(e)] {
+				missing = append(missing, e)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("「%s」需要 PHP %s，但当前 PHP %s 缺少必需扩展：%s —— "+
+				"缺扩展时站点会打不开，所以这里直接拒绝安装；请补齐这些扩展后重试",
+				appName, phpVersion, actual, strings.Join(missing, "、"))
+		}
+	}
+	if root := strings.TrimSpace(s.Cfg.WWWRoot); root != "" {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return fmt.Errorf("站点根目录 %s 不可用：%w", root, err)
+		}
+		f, err := os.CreateTemp(root, ".zp-writecheck-*")
+		if err != nil {
+			return fmt.Errorf("站点根目录 %s 不可写（%v）—— 一键建站需要在该目录下创建站点目录", root, err)
+		}
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+	}
+	return nil
+}
+
+// phpBinaryFor 返回某个 PHP 版本对应的 php 可执行文件路径（空 = 找不到）。
+//
+// 只认 Homebrew 每个版本独立的 keg：{brew}/opt/php@<ver>/bin/php；只有配置里的
+// 默认 PHP 服务就是该版本时，才允许退回 {brew}/bin/php（那个别名随时可能指向别的版本）。
+func (s *Server) phpBinaryFor(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return ""
+	}
+	cands := []string{filepath.Join(s.Cfg.BrewPrefix, "opt", "php@"+version, "bin", "php")}
+	if s.Cfg.PHPSvc == "php@"+version || s.Cfg.PHPSvc == "php" {
+		cands = append(cands, filepath.Join(s.Cfg.BrewPrefix, "bin", "php"))
+	}
+	for _, c := range cands {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// phpVersionOf 跑 `php -r 'echo PHP_VERSION;'` 取真实版本。
+func phpVersionOf(bin string) (string, error) {
+	cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, bin, "-r", "echo PHP_VERSION;").Output()
+	if err != nil {
+		return "", err
+	}
+	v := strings.TrimSpace(string(out))
+	if v == "" {
+		return "", fmt.Errorf("php 没有输出版本号")
+	}
+	return v, nil
+}
+
+// phpModules 跑 `php -m` 取扩展名集合（小写）。
+func phpModules(bin string) (map[string]bool, error) {
+	cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, bin, "-m").Output()
+	if err != nil {
+		return nil, err
+	}
+	have := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "[") {
+			continue
+		}
+		have[strings.ToLower(line)] = true
+	}
+	return have, nil
+}
+
+// phpVersionAtLeast 判断 actual（如 "8.2.33"）是否 >= min（如 "8.2"）。
+func phpVersionAtLeast(actual, min string) bool {
+	pa, pb := parsePHPVersion(actual), parsePHPVersion(min)
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			return pa[i] > pb[i]
+		}
+	}
+	return true
+}
+
+// parsePHPVersion 把 "8.2.33" 拆成 [8,2,33]（缺位补 0）。
+func parsePHPVersion(v string) [3]int {
+	var out [3]int
+	for i, part := range strings.SplitN(strings.TrimSpace(v), ".", 3) {
+		if i >= 3 {
+			break
+		}
+		n := 0
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				break
+			}
+			n = n*10 + int(r-'0')
+		}
+		out[i] = n
+	}
+	return out
+}
+
 // handleSiteAppInstall 一键建站（长任务：下载 + 解压 + 建库 + 建站点）。
 func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -105,6 +253,14 @@ func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 		// 不写死成别的：站点向导里能选的版本来自本机实际安装列表，
 		// 这里只是"用户没填"时的兜底，兜错会让新建的站点 502。
 		req.PHP = "8.2"
+	}
+
+	// 前置条件检查放在**开任务之前**：缺 PHP 版本/扩展时直接 400 + 说清缺什么，
+	// 而不是让用户等一个必然失败的任务（installSiteApp 里还会再挡一次，纵深防御）。
+	if err := sitePHPPreflightFn(s, app.Name, app.SiteApp, req.PHP); err != nil {
+		s.audit(r, "site_app_install", domain, "前置检查未通过: "+err.Error(), false, "")
+		fail(w, http.StatusBadRequest, "安装前检查未通过："+err.Error())
+		return
 	}
 
 	s.launchTask(w, r, "site-install", domain, "一键建站 "+app.Name+"（"+domain+"）",
@@ -136,6 +292,13 @@ type siteInstallArtifacts struct {
 func (s *Server) installSiteApp(ctx context.Context, app services.App, domain string, req siteInstallReq) (res *siteInstallResult, err error) {
 	spec := app.SiteApp
 	res = &siteInstallResult{App: app.ID, Domain: domain}
+	// 前置条件（PHP 版本 / 扩展 / 目录可写）不满足时，**在建目录之前**如实失败。
+	// 放在这里而不只是在 HTTP 层，是纵深防御：任务中心、未来调用方都可能直接调它。
+	// 注意：这里**不替调用方补默认 PHP 版本** —— 站点为空 PHP 时是"纯静态站点"，
+	// 那是既有语义（HTTP 层已经在开任务前把默认值填好了）。
+	if err := sitePHPPreflightFn(s, app.Name, spec, req.PHP); err != nil {
+		return res, fmt.Errorf("安装前检查未通过：%w", err)
+	}
 	step := func(format string, a ...any) {
 		msg := fmt.Sprintf(format, a...)
 		res.Steps = append(res.Steps, msg)
@@ -288,17 +451,24 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	}
 
 	// ---------- ④ 写配置文件 ----------
+	//
+	// configReady：面板是否**替用户预填**了数据库配置。只有 WordPress / Typecho
+	// 走这条路；Flarum / emlog / 可道云由各自的安装向导写自己的配置文件，
+	// 所以下面那句"数据库信息已预填"必须按事实说（谎报成功比没做更糟）。
+	configReady := false
 	switch app.ID {
 	case "wordpress":
 		if err := writeWpConfig(dir, dbName, dbUser, dbPass); err != nil {
 			return res, err
 		}
 		step("已生成 wp-config.php（数据库信息已写入）")
+		configReady = true
 	case "typecho":
 		if err := writeTypechoConfig(dir, dbName, dbUser, dbPass); err != nil {
 			return res, err
 		}
 		step("已生成 config.inc.php（数据库信息已写入；安装向导里会自动带上）")
+		configReady = true
 	}
 
 	// ---------- ⑤ 建站点（带伪静态）----------
@@ -355,10 +525,19 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	// 站点却 500「Database Query Error」）。根因是**面板预置了 config.inc.php**（省掉手填数据库），
 	// 而 Typecho/WordPress 看到该文件就认为"已经装好了" —— 于是首页直接去查还不存在的表，
 	// 表现成 500，而不是自动跳到安装向导。用户不知道要去 /install.php，就会以为站点坏了。
-	step("⚠️ 还差最后一步：打开 %s 走完安装向导（数据库信息已预填）。"+
-		"**在向导完成之前，访问站点首页会显示 500/数据库错误**，这是应用以为已安装导致的，不是配置坏了。",
-		res.FinishURL)
-	res.Message = fmt.Sprintf("「%s」文件与数据库已就绪 —— 请打开 %s 完成安装向导", app.Name, res.FinishURL)
+	if configReady {
+		step("⚠️ 还差最后一步：打开 %s 走完安装向导（数据库信息已预填）。"+
+			"**在向导完成之前，访问站点首页会显示 500/数据库错误**，这是应用以为已安装导致的，不是配置坏了。",
+			res.FinishURL)
+		res.Message = fmt.Sprintf("「%s」文件与数据库已就绪 —— 请打开 %s 完成安装向导", app.Name, res.FinishURL)
+	} else {
+		// Flarum / emlog / 可道云：面板**没有**预写配置文件，向导会自己写。
+		// 所以要说清"去向导里把上面的库名/账号/口令填进去"，不能谎报"已预填"。
+		step("⚠️ 还差最后一步：打开 %s 走完安装向导 —— 向导里数据库地址填 localhost，"+
+			"库名/用户名/密码照上面的安装结果填（面板没有替你预写配置文件）。", res.FinishURL)
+		res.Message = fmt.Sprintf("「%s」文件与空数据库已就绪 —— 请打开 %s，"+
+			"在向导里填安装结果中的数据库信息完成安装", app.Name, res.FinishURL)
+	}
 	return res, nil
 }
 

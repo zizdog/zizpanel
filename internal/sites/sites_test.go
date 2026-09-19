@@ -94,6 +94,41 @@ func TestRewritePresetsComplete(t *testing.T) {
 	}
 }
 
+// TestNewSiteRewritePresets 锁住 Flarum / emlog / 可道云三条**来自官方**的伪静态规则。
+//
+// 规则来源（写死在注释里，改规则时必须一并更新）：
+//
+//	· flarum：安装包内 public/.nginx.conf 的 try_files；docroot 必须 public/
+//	· emlog ：官方文档 emlog.net/docs/faq#nginx 与包内 nginx.conf 的 if + rewrite
+//	· kodbox：官方 README_zh-CN.md「nginx rewrite」的 try_files
+func TestNewSiteRewritePresets(t *testing.T) {
+	cases := []struct {
+		name      string
+		publicDir string
+		must      []string
+	}{
+		{"flarum", "public", []string{"try_files $uri $uri/ /index.php?$query_string;"}},
+		{"emlog", "", []string{"index index.php index.html;", "if (!-e $request_filename)", "rewrite ^/(.*)$ /index.php last;"}},
+		{"kodbox", "", []string{"try_files $uri $uri/ /index.php?$query_string;"}},
+	}
+	for _, c := range cases {
+		p, ok := RewritePresetByName(c.name)
+		if !ok {
+			t.Errorf("伪静态预设 %q 不存在", c.name)
+			continue
+		}
+		if p.PublicDir != c.publicDir {
+			t.Errorf("%s 的 PublicDir = %q，期望 %q", c.name, p.PublicDir, c.publicDir)
+		}
+		loc := rewriteLocation(c.name)
+		for _, m := range c.must {
+			if !strings.Contains(loc, m) {
+				t.Errorf("%s 的 location 块缺少官方规则片段 %q，实际：\n%s", c.name, m, loc)
+			}
+		}
+	}
+}
+
 // 生成静态站点配置
 func TestGenerateStaticSite(t *testing.T) {
 	s := &Site{

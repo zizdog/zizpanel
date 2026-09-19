@@ -271,6 +271,11 @@ export const api = {
   // 没有这个接口时，用户装完 frpc/Orbien 根本不知道 admin UI 的账号口令。
   serviceCredentials: (name) =>
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/credentials`),
+  // File Browser 的「主目录」：读/写的是 launchd plist 的 -r，写后后端会回读核对。
+  filebrowserRoot: (name) =>
+    request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-root`),
+  setFilebrowserRoot: (name, root) =>
+    request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-root`, { root }),
 
   // ---- 任务中心（安装/卸载的实时进度）----
   //

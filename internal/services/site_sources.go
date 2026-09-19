@@ -96,6 +96,49 @@ var siteSources = map[string]SiteSource{
 			"https://downloads.wordpress.org/release/zh_CN/wordpress-7.1.zip",
 		},
 	},
+	"flarum": {
+		App: "flarum", Name: "Flarum", Version: "1.8.19",
+		File: "flarum-v1.8.19-php8.2.zip",
+		// 2026-09-19 本机实测：gh-proxy 与 jsdelivr **两条独立链路**下到的字节完全相同
+		// （15,286,354 B，sha256 一致），所以这个值不是"我以为"而是双源实测。
+		SHA256: "c8d191b333839eb3b603deb9e4a711721708115379e285cfa90d4cffa7c9887a",
+		Size:   15286354,
+		Upstreams: []string{
+			// gh-proxy 在前：国内可达性明显更好（与 typecho / freshrss 同一取舍），
+			// 拉完照样核对 sha256，走代理不影响完整性。
+			"https://gh-proxy.com/https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+			// 官方安装包（flarum/installation-packages 的 raw 主路径，官方文档指定的分发仓库）。
+			"https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+			// jsdelivr 是 GitHub CDN 镜像，实测同一份字节。
+			"https://cdn.jsdelivr.net/gh/flarum/installation-packages@main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+		},
+	},
+	"emlog": {
+		App: "emlog", Name: "emlog", Version: "2.6.31",
+		File: "emlog_pro_2.6.31.zip",
+		// 2026-09-19 本机实测：gh-proxy 与 gitee（emlog.net/download 指向的官方镜像）
+		// 两条独立链路下到的字节完全相同（1,416,299 B，sha256 一致）。
+		SHA256: "65522bb01789eeee3c4458694d117e3610902d4b174d8892d2f2fe2a25a39a7d",
+		Size:   1416299,
+		Upstreams: []string{
+			"https://gh-proxy.com/https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+			"https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+			// emlog 官网下载页指向的 gitee release（同一份官方产物）。
+			"https://gitee.com/snowsun/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+		},
+	},
+	"kodbox": {
+		App: "kodbox", Name: "可道云", Version: "1.69.03",
+		File: "kodbox-1.69.03.zip",
+		// 2026-09-19 本机经 gh-proxy 下载整包实算（45,639,934 B）。官方 `server.link`
+		// 入口是"永远最新"，没有稳定 sha256，所以这里固定官方仓库的 tag 归档。
+		SHA256: "d4e53e23aee9137076709ab659fe37956c38923a15e1cfde508d34f83c05960d",
+		Size:   45639934,
+		Upstreams: []string{
+			"https://gh-proxy.com/https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+			"https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+		},
+	},
 }
 
 // SiteSourceFor 查某个一键建站应用的固定版本源码包。

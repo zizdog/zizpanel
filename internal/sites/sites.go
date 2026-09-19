@@ -145,6 +145,15 @@ var RewritePresets = []RewritePreset{
 	{Name: "generic", Label: "通用（推荐）", Description: "文件存在则直接返回，否则交给 index.php。适配绝大多数 PHP 程序。"},
 	{Name: "typecho", Label: "Typecho", Description: "官方推荐的 try_files 写法，兼容性最好。"},
 	{Name: "wordpress", Label: "WordPress", Description: "WordPress 标准伪静态，固定链接可自定义。"},
+	// Flarum：官方随包附带的 public/.nginx.conf 里就是 `try_files $uri $uri/ /index.php?$query_string;`，
+	// 并要求 web 根指向 public/（源码、storage/ 不能暴露）——所以 PublicDir 是安全边界而不是可选优化。
+	{Name: "flarum", Label: "Flarum", Description: "官方 .nginx.conf 的 try_files 规则；入口在 public/ 子目录。", PublicDir: "public"},
+	// emlog：官方文档（emlog.net/docs/faq#nginx）与包内自带的 nginx.conf 都是
+	// `if (!-e $request_filename) { rewrite ^/(.*)$ /index.php last; }`。
+	{Name: "emlog", Label: "emlog", Description: "官方 nginx 规则：文件不存在时重写到 /index.php。"},
+	// kodbox：官方 README_zh-CN.md 的「nginx rewrite」小节给的就是
+	// `try_files $uri $uri/ /index.php?$query_string;`（与通用规则同形）。
+	{Name: "kodbox", Label: "可道云（kodbox）", Description: "官方 README 的 nginx rewrite 规则（try_files → index.php）。"},
 	{Name: "laravel", Label: "Laravel / Lumen", Description: "入口在 public/ 子目录，需要把运行目录指到 public。", PublicDir: "public"},
 	// FreshRSS 只允许暴露它自己的 p/ 目录（上级目录里的 data/ 是用户的全部订阅数据，
 	// 上游明确要求不能进 web 根）——所以这里的 PublicDir 不是"可选优化"，是安全边界。
@@ -181,6 +190,22 @@ func rewriteLocation(name string) string {
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php$is_args$args;\n\t}"
 	case "wordpress":
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$args;\n\t}"
+	case "flarum":
+		// 官方 public/.nginx.conf 原文：`try_files $uri $uri/ /index.php?$query_string;`
+		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
+	case "emlog":
+		// 官方规则（emlog.net/docs/faq + 包内 nginx.conf）。这里保留官方的 if 写法：
+		// emlog 的 .htaccess 是 `RewriteRule . /index.php [L]`，用 if 表达"文件不存在才重写"
+		// 与官方逐字一致，避免 try_files 的语义差异导致后台/伪静态行为不同。
+		return "\tlocation / {\n" +
+			"\t\tindex index.php index.html;\n" +
+			"\t\tif (!-e $request_filename) {\n" +
+			"\t\t\trewrite ^/(.*)$ /index.php last;\n" +
+			"\t\t}\n" +
+			"\t}"
+	case "kodbox":
+		// 官方 README_zh-CN.md「nginx rewrite」：`try_files $uri $uri/ /index.php?$query_string;`
+		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
 	case "laravel":
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
 	case "freshrss":

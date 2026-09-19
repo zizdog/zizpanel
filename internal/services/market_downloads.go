@@ -973,8 +973,52 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
-		ID: "filebrowser", Kind: KindCompose, ComposeImage: "filebrowser/filebrowser:latest",
+		ID: "filebrowser", Kind: KindNative, PanelInstaller: "filebrowser", ServiceLabel: "com.zizdog.filebrowser",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "com.zizdog.filebrowser",
+			LabelSource: "目录 ServiceLabel（与 releaseBinaryApps 注册表里的 Label 一致）",
+		},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 darwin-arm64-filebrowser.tar.gz",
+				Upstream: MarketUpstream{
+					ID:   "github.com/filebrowser/filebrowser@v2.63.23/darwin-arm64-filebrowser.tar.gz",
+					URL:  "https://github.com/filebrowser/filebrowser/releases/download/v2.63.23/darwin-arm64-filebrowser.tar.gz",
+					Repo: "filebrowser/filebrowser", Tag: "v2.63.23", Asset: "darwin-arm64-filebrowser.tar.gz",
+					Size: 15258752,
+					Note: "实测 15,258,752 B；上游 filebrowser_2.63.23_checksums.txt 里这一行的 sha256 是 " +
+						"b7d451cb6e31497d649895d410df5e2786fe23c58b6c2341073c967388959f8e，与本机实测值完全一致（双证）。" +
+						"候选顺序：镜像站（无测速直下）→ 官方 + ghfast.top + gh-proxy.com 按实测速度重排",
+				},
+				NAS: nasMissing("镜像站上没有 filebrowser 的 darwin-arm64 产物（apps/filebrowser/... 不存在）。" +
+					"这是**缺口**不是'不需要'：它是原生安装的唯一来源，NAS 关机时只能走 GitHub 直连/加速镜像。" +
+					"建议 NAS 开机后同步到 apps/filebrowser/v2.63.23/darwin-arm64-filebrowser.tar.gz 与其 sha256 清单"),
+				Timeout:  150 * time.Second,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset:        "上游 filebrowser_2.63.23_checksums.txt + 镜像 manifest.json",
+					UpstreamFile: "filebrowser_2.63.23_checksums.txt",
+					SHA256:       "b7d451cb6e31497d649895d410df5e2786fe23c58b6c2341073c967388959f8e",
+					Source: "2026-09-19 本机经 gh-proxy 下载整包实算 sha256（15,258,752 B）；" +
+						"与官方 filebrowser_2.63.23_checksums.txt 里 darwin-arm64-filebrowser.tar.gz 那一行**逐字符一致**（两条独立来源互证）",
+					Note: "上游**有** sha256 清单，所以这一步是真的内容校验（不是只做架构复核）",
+				},
+				ARM64: "上游资产名自带 darwin-arm64；2026-09-19 本机实测解压出的 filebrowser 用 file(1) 报 " +
+					"Mach-O 64-bit executable arm64，`filebrowser version` 输出 v2.63.23，/health 返回 200",
+				Note: "tarball 内是 CHANGELOG.md / LICENSE / README.md / filebrowser 四个平级成员（无顶层目录）；" +
+					"该应用上游已于 2026-09-01 归档，不再有安全更新",
+			},
+		},
+	},
+
+	{
+		// 原 filebrowser Docker 条目降级成的**参考**：面板不再代装，但保留预配置
+		// compose 与镜像下载点（不直接删掉用户可能还在用的路径）。ID 加 -docker 后缀。
+		ID: "filebrowser-docker", Kind: KindCompose, ComposeImage: "filebrowser/filebrowser:latest",
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Note: "原 filebrowser Docker 条目降级成的参考：面板不再代装，但保留预配置 compose " +
+			"与镜像下载点，已经在用 Docker 版的用户继续可用",
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("filebrowser/filebrowser:latest", 20*time.Minute,
 				nasMirrored("docker"),
@@ -1275,6 +1319,188 @@ var marketDownloadApps = []MarketApp{
 					Source: "与主址同一份字节（2026-09-17 两条链路实算比对一致）",
 				},
 				ARM64: "PHP 站点源码（tar.gz），与架构无关",
+			},
+		},
+	},
+
+	{
+		ID: "flarum", Kind: KindNative,
+		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空（一键建站，产出是网站不是服务）"},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 Flarum 1.8.19 安装包 flarum-v1.8.19-php8.2.zip（官方 raw 主址）",
+				Upstream: MarketUpstream{
+					ID:   "github.com/flarum/installation-packages@v1.8.19/flarum-v1.8.19-php8.2.zip",
+					URL:  "https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+					Size: 15286354,
+					Note: "实测 15,286,354 B；sha256 c8d191b333839eb3b603deb9e4a711721708115379e285cfa90d4cffa7c9887a；" +
+						"官方安装包仓库 flarum/installation-packages（官方文档 docs.flarum.org/install 指定的分发仓库），固定 v1.8.19 + php8.2",
+				},
+				NAS: nasMissing("镜像站上没有 Flarum 安装包（sites/flarum/... 不存在）。它是**缺口**：" +
+					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/flarum/1.8.19/flarum-v1.8.19-php8.2.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → jsdelivr"),
+				Timeout:  9 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					SHA256: "c8d191b333839eb3b603deb9e4a711721708115379e285cfa90d4cffa7c9887a",
+					Source: "2026-09-19 本机实测：gh-proxy 与 jsdelivr 两条独立链路下到的字节完全相同（15,286,354 B）；" +
+						"安装器（services/site_sources.go）按这个值强制校验，镜像站补包后写进 manifest.json 即可",
+				},
+				ARM64: "PHP 站点源码（zip），与架构无关；原生跑在面板已有的 nginx + php-fpm 上",
+				Note: "包内没有单一顶层目录（.nginx.conf/composer.json/public/ 平级）→ 不剥顶层；" +
+					"vendor 已打包，docroot 必须落在 public/（见目录 SiteApp.Rewrite=flarum 的 PublicDir）",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 Flarum 1.8.19 安装包（gh-proxy 备址）",
+				Upstream: MarketUpstream{
+					ID:   "gh-proxy.com/github.com/flarum/installation-packages@v1.8.19/flarum-v1.8.19-php8.2.zip",
+					URL:  "https://gh-proxy.com/https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+					Size: 15286354,
+					Note: "与主址字节相同（实测 sha256 一致）",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必两条都镜像"),
+				Timeout:        9 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只少一条退路（主址是 GitHub 直连，国内可达性一般；安装器实际把 gh-proxy 排在候选第一）",
+				Checksum: MarketChecksum{
+					SHA256: "c8d191b333839eb3b603deb9e4a711721708115379e285cfa90d4cffa7c9887a",
+					Source: "与主址同一份字节（2026-09-19 两条链路实算比对一致）",
+				},
+				ARM64: "PHP 站点源码，与架构无关",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 Flarum 1.8.19 安装包（jsdelivr 备址）",
+				Upstream: MarketUpstream{
+					ID:   "cdn.jsdelivr.net/gh/flarum/installation-packages@main/flarum-v1.8.19-php8.2.zip",
+					URL:  "https://cdn.jsdelivr.net/gh/flarum/installation-packages@main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+					Size: 15286354,
+					Note: "与主址字节相同（实测 sha256 一致）；jsdelivr 是 GitHub 的 CDN 镜像",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必三条都镜像"),
+				Timeout:        9 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只少一条退路（主址 + gh-proxy 都不可达时才轮到它）",
+				Checksum: MarketChecksum{
+					SHA256: "c8d191b333839eb3b603deb9e4a711721708115379e285cfa90d4cffa7c9887a",
+					Source: "与主址同一份字节（2026-09-19 实算比对一致）",
+				},
+				ARM64: "PHP 站点源码，与架构无关",
+			},
+		},
+	},
+
+	{
+		ID: "emlog", Kind: KindNative,
+		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空（一键建站，产出是网站不是服务）"},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 emlog pro-2.6.31 发布包（GitHub 官方）",
+				Upstream: MarketUpstream{
+					ID:   "github.com/emlog/emlog@pro-2.6.31/emlog_pro_2.6.31.zip",
+					URL:  "https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+					Size: 1416299,
+					Note: "实测 1,416,299 B；sha256 65522bb01789eeee3c4458694d117e3610902d4b174d8892d2f2fe2a25a39a7d；" +
+						"emlog.net/download 指向的也是这一份产物（gitee release 同字节）",
+				},
+				NAS: nasMissing("镜像站上没有 emlog 发布包（sites/emlog/... 不存在）。它是**缺口**：" +
+					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/emlog/2.6.31/emlog_pro_2.6.31.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → gitee"),
+				Timeout:  9 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					SHA256: "65522bb01789eeee3c4458694d117e3610902d4b174d8892d2f2fe2a25a39a7d",
+					Source: "2026-09-19 本机实测：gh-proxy 与 gitee 两条独立链路下到的字节完全相同（1,416,299 B）；" +
+						"安装器（services/site_sources.go）按这个值强制校验",
+				},
+				ARM64: "PHP 站点源码（zip），与架构无关",
+				Note:  "包内无顶层目录（admin/index.php/include/... 平级）→ 不剥；上游要求 PHP 5.6+、推荐 7.4+",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 emlog pro-2.6.31 发布包（gh-proxy 备址）",
+				Upstream: MarketUpstream{
+					ID:   "gh-proxy.com/github.com/emlog/emlog@pro-2.6.31/emlog_pro_2.6.31.zip",
+					URL:  "https://gh-proxy.com/https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+					Size: 1416299,
+					Note: "与主址字节相同（实测 sha256 一致）",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必两条都镜像"),
+				Timeout:        9 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只少一条退路（安装器实际把 gh-proxy 排在候选第一）",
+				Checksum: MarketChecksum{
+					SHA256: "65522bb01789eeee3c4458694d117e3610902d4b174d8892d2f2fe2a25a39a7d",
+					Source: "与主址同一份字节（2026-09-19 实算比对一致）",
+				},
+				ARM64: "PHP 站点源码，与架构无关",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 emlog pro-2.6.31 发布包（gitee 备址）",
+				Upstream: MarketUpstream{
+					ID:   "gitee.com/snowsun/emlog@pro-2.6.31/emlog_pro_2.6.31.zip",
+					URL:  "https://gitee.com/snowsun/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+					Size: 1416299,
+					Note: "与主址字节相同（实测 sha256 一致）；这是 emlog.net 下载页指向的官方镜像",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必三条都镜像"),
+				Timeout:        9 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只少一条退路（主址 + gh-proxy 都不可达时才轮到它）",
+				Checksum: MarketChecksum{
+					SHA256: "65522bb01789eeee3c4458694d117e3610902d4b174d8892d2f2fe2a25a39a7d",
+					Source: "与主址同一份字节（2026-09-19 实算比对一致）",
+				},
+				ARM64: "PHP 站点源码，与架构无关",
+			},
+		},
+	},
+
+	{
+		ID: "kodbox", Kind: KindNative,
+		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空（一键建站，产出是网站不是服务）"},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 可道云 kodbox 1.69.03 源码包（官方仓库 tag 归档）",
+				Upstream: MarketUpstream{
+					ID:   "github.com/kalcaddle/kodbox@1.69.03/source.zip",
+					URL:  "https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+					Size: 45639934,
+					Note: "实测 45,639,934 B；sha256 d4e53e23aee9137076709ab659fe37956c38923a15e1cfde508d34f83c05960d；" +
+						"官方 server.link 入口是「永远最新」、无法登记稳定 sha256，所以固定官方仓库 tag 归档",
+				},
+				NAS: nasMissing("镜像站上没有可道云源码包（sites/kodbox/... 不存在）。它是**缺口**：" +
+					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/kodbox/1.69.03/kodbox-1.69.03.zip 并把候选顺序改成 镜像 → gh-proxy → 官方"),
+				Timeout:  15 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					SHA256: "d4e53e23aee9137076709ab659fe37956c38923a15e1cfde508d34f83c05960d",
+					Source: "2026-09-19 本机经 gh-proxy 下载整包实算（45,639,934 B）；安装器（services/site_sources.go）按这个值强制校验",
+				},
+				ARM64: "PHP 站点源码（zip），与架构无关",
+				Note:  "归档内有一层顶层目录 kodbox-1.69.03/ → 必须剥；上游要求 PHP 7.0+（推荐 8.0+）",
+			},
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 可道云 kodbox 1.69.03 源码包（gh-proxy 备址）",
+				Upstream: MarketUpstream{
+					ID:   "gh-proxy.com/github.com/kalcaddle/kodbox@1.69.03/source.zip",
+					URL:  "https://gh-proxy.com/https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+					Size: 45639934,
+					Note: "与主址字节相同（实测 sha256 一致）",
+				},
+				NAS:            nasNotNeeded("与主址同一份字节；镜像站补主址即可，不必两条都镜像"),
+				Timeout:        15 * time.Minute,
+				Required:       false,
+				OptionalImpact: "备址失效只少一条退路（安装器实际把 gh-proxy 排在候选第一）",
+				Checksum: MarketChecksum{
+					SHA256: "d4e53e23aee9137076709ab659fe37956c38923a15e1cfde508d34f83c05960d",
+					Source: "与主址同一份字节（2026-09-19 实算比对一致）",
+				},
+				ARM64: "PHP 站点源码，与架构无关",
 			},
 		},
 	},

@@ -133,6 +133,10 @@ func Plan(o PlanOptions) []Item {
 	}
 	if o.WorkDir != "" {
 		add("apps/compose", filepath.Join(o.WorkDir, "compose"), ApplyReplace, true, TargetCompose)
+		// filebrowser 的数据库（用户、设置、主目录等都在里面）。
+		// 为什么放在备份里：面板托管的 filebrowser 是**原生安装**（二进制在 ~/filebrowser），
+		// 它的状态全在这个 sqlite 里；只备份二进制/配置而丢了它，恢复后用户与设置全没了。
+		add("apps/filebrowser", filepath.Join(o.WorkDir, "filebrowser"), ApplyReplace, true, TargetPanel)
 	}
 	return items
 }
@@ -237,7 +241,7 @@ func DataExcludedNames() map[string]string {
 }
 
 // WorkCoveredNames 是 <WorkDir> 下进了备份的一级名字。
-func WorkCoveredNames() []string { return []string{"compose"} }
+func WorkCoveredNames() []string { return []string{"compose", "filebrowser"} }
 
 // WorkExcludedNames 是 <WorkDir> 下明确不进备份的一级名字及原因。
 func WorkExcludedNames() map[string]string {

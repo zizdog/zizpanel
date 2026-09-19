@@ -367,6 +367,10 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/services/{name}", s.requireAuth(s.handleServiceDelete))
 	root.HandleFunc("POST /api/v1/services/{name}/{action}", s.requireAuth(s.handleServiceAction))
 	root.HandleFunc("GET /api/v1/services/{name}/credentials", s.requireAuth(s.handleServiceCredentials))
+	// File Browser「主目录」设置：读取/修改 launchd plist 的 -r 并回读核对。
+	// 这两条比上面的 {name}/{action} 更具体，Go 1.22 的 mux 会优先匹配它们。
+	root.HandleFunc("GET /api/v1/services/{name}/filebrowser-root", s.requireAuth(s.handleFilebrowserRootGet))
+	root.HandleFunc("POST /api/v1/services/{name}/filebrowser-root", s.requireAuth(s.handleFilebrowserRootSet))
 	// brew 的真实状态（服务/可升级/已装），面板直接渲染它，不再只信自己的记录表。
 	root.HandleFunc("GET /api/v1/brew/overview", s.requireAuth(s.handleBrewOverview))
 	root.HandleFunc("GET /api/v1/services/{name}/logs", s.requireAuth(s.handleServiceLogs))

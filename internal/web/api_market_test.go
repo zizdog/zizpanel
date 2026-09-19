@@ -334,7 +334,9 @@ func TestMarketDockerReferenceContract(t *testing.T) {
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
-	for _, id := range []string{"it-tools", "filebrowser", "activepieces", "immich"} {
+	// filebrowser 现在是**原生**条目（不再是 DockerReference）；
+	// 原 Docker 路径降级成 filebrowser-docker 参考条目，这里换成它来锁契约。
+	for _, id := range []string{"it-tools", "filebrowser-docker", "activepieces", "immich"} {
 		it := marketItem(t, ts, cookies, id)
 		if it["docker_reference"] != true {
 			t.Errorf("%s 是推荐 Docker 项目，接口必须给 docker_reference=true，实际 %v", id, it["docker_reference"])

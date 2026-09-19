@@ -374,6 +374,14 @@ type SiteAppSpec struct {
 	FinishPath string `json:"finish_path"`
 	// NeedsDB 表示要建数据库与用户
 	NeedsDB bool `json:"needs_db"`
+	// MinPHP 是这个应用要求的最低 PHP 版本（如 "8.2"）；空 = 不检查版本。
+	//
+	// 一键建站会在**建目录之前**用本机该版本真实的 php 二进制复核（php -r 'echo PHP_VERSION;'），
+	// 不满足就直接拒绝安装 —— 绝不装出一个打不开的站点（见 api_site_apps.go 的前置检查）。
+	MinPHP string `json:"min_php,omitempty"`
+	// PHPExts 是必需的 PHP 扩展（`php -m` 里的条目名）；空 = 不检查扩展。
+	// 缺任何一个都在安装前拒绝，并把"缺什么"写清楚。
+	PHPExts []string `json:"php_exts,omitempty"`
 	// Notes 是给用户的关键提醒（数据库名/密码怎么填等）
 	Notes []string `json:"notes,omitempty"`
 }
@@ -1212,36 +1220,38 @@ func Catalog() []App {
 			ID: "filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
 			UI: &AppUI{
 				Slug: "filebrowser",
-				// compose 里用 `command: ["-b", "/filebrowser"]` 让它自带前缀，
-				// 所以面板不再改写路径（否则会 /filebrowser/static/filebrowser/…）
+				// 原生版用 `-b /filebrowser` 启动，应用自己就带这个前缀，
+				// 所以面板不再改写路径（否则会 /filebrowser/static/filebrowser/… 双重加前缀）。
 				SelfBase: true,
-				Note:     "File Browser 需要以 -b /filebrowser 启动才能用子路径；compose 里已带上，改动过 compose 的话请同步",
+				Note: "File Browser 以 `-b /filebrowser` 启动，自带这个前缀；" +
+					"原生版由面板托管（launchd，二进制与数据库都在 ~/filebrowser/），不再需要 Docker。",
 			},
-			Summary:     "在浏览器里管理服务器上的文件",
-			Description: "在浏览器里管理服务器文件，支持多用户与权限；默认只挂几个常用目录。",
-			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8081,
-			// 官方镜像的 healthcheck 打的就是 /health（见仓库 docker/common/healthcheck.sh），
-			// 不是猜测的路径。
+			Summary:     "在浏览器里管理这台 Mac 上的文件（原生）",
+			Description: "在浏览器里管理这台 Mac 上的文件，支持多用户与权限；官方 darwin-arm64 原生安装。",
+			Category:    "tool", Kind: KindNative,
+			PanelInstaller: "filebrowser", ServiceLabel: "com.zizdog.filebrowser",
+			// 8081 是它一贯的端口（原 Docker 版就是它，目录内唯一）。
+			Port: 8081, HealthPath: "/health",
+			// 安装体 = 解压出来的可执行文件（官方 release 产物，file(1) 复核 Mach-O arm64）。
+			RuntimePath: "~/filebrowser/filebrowser",
+			PostInstallHint: "默认用户名 admin，密码是首次启动随机生成的 —— 面板会从启动日志里把" +
+				"**用户名与口令**都读出来显示在安装结果里（日志里没读到时会明说，不会编）。没看到就去" +
+				"「服务管理 → File Browser → 日志」找 `randomly generated password` 那一行，登录后请立刻改掉。" +
+				"文件根目录默认是你的**整个家目录**；想换目录用服务详情里的「主目录」设置（改 -r → 重启 → 回读生效值）。" +
+				"⚠️ 谁能登录这个 Web UI，谁就能读写整个家目录（含 .ssh 等）；它只绑 127.0.0.1、只经面板入口访问，" +
+				"不要直接开到局域网/公网。⚠️ 上游项目已于 2026-09-01 归档，之后不再发版、不再修安全问题。",
+			DocsURL: "https://filebrowser.org",
+		},
+		{
+			// 原 Docker 条目**降级成"参考"**（不删用户可能还在用的路径）：
+			// 面板不再代装，但保留预配置 compose 与镜像下载点；ID 加 `-docker` 后缀
+			// 以区别于上面这条原生条目。
+			ID: "filebrowser-docker", Name: "File Browser（Docker 版参考）", Icon: "🐳",
+			Summary:     "File Browser 的 Docker 部署参考（面板不再代装）",
+			Description: "给已经用 Docker/Colima 的用户保留的 File Browser 参考 compose；面板只在 docker 页给出文件。",
+			Category:    "tool", Kind: KindCompose, DockerReference: true, Port: 8097,
 			HealthPath: "/health",
 			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
-			// 为什么有 brew formula 却走 Docker（唯一的例外，理由要写清楚）：
-			// homebrew/core 的 filebrowser（2.63.23，bottle 覆盖 arm64_tahoe/sequoia）
-			// **没有 service 定义** —— 读 `brew info --json=v2 filebrowser` 的 service
-			// 字段是 null，formula 源码里也没有 `service do` 块。
-			// 而面板的原生路径装完必须 `brew services start`，对这类 formula 必然失败：
-			// 结果是一条 launchd label 指向不存在 plist 的"托管"记录 —— 市场说已安装，
-			// 服务管理里却永远起不来。宁可用官方 Docker 镜像，也不留这种假成功。
-			// arm64 证据（Docker Hub 经镜像站读同一份 index）：
-			//   docker manifest inspect docker.1ms.run/filebrowser/filebrowser:latest
-			//   → linux/amd64、linux/arm64、linux/arm/v7
-			//
-			// 2026-09-14 用户反馈后的两处调整：
-			//  ① **子路径**：它的前端用绝对路径（/static/…、/api/…），挂在
-			//     /filebrowser/ 下会一直转圈打不开（真机实测）。官方支持 `-b/--baseurl`，
-			//     而镜像的 /init.sh 会把参数原样转发给 filebrowser，所以直接加
-			//     `command: ["-b", "/filebrowser"]` —— 比在代理里改写路径可靠得多。
-			//  ② **默认目录**：用户要的是"Mac 用户那几个常用目录，别的不要看到"，
-			//     所以把 5 个目录分别挂成 /srv/<中文名>，而不是把整个家目录挂进去。
 			ComposeYAML: `services:
   filebrowser:
     image: filebrowser/filebrowser:latest
@@ -1253,10 +1263,11 @@ func Catalog() []App {
     # 子路径：镜像的 /init.sh 会把参数透传给 filebrowser，所以这一行就能生效
     # host 网络（2026-09-17 mini 实测：Colima/Lima 会把 VM 内监听的端口自动转发到
     # Mac 宿主，host 网络下没有 ports: 也能从宿主访问）。镜像默认监听 80，会和
-    # 面板自带的 nginx 抢端口，所以用 -a/-p 显式改到 8081（容器内端口就是 VM 内端口）。
+    # 面板自带的 nginx 抢端口，所以用 -a/-p 显式改到 8097（容器内端口就是 VM 内端口）。
+    # 8097 是刻意避开原生版占用的 8081：两者可以并存做迁移对照，不会抢端口。
     # 不要再加 ports:（host 网络下会被 docker 静默忽略）。
     network_mode: host
-    command: ["-b", "/filebrowser", "-a", "0.0.0.0", "-p", "${FILEBROWSER_PORT:-8081}"]
+    command: ["-b", "/filebrowser", "-a", "0.0.0.0", "-p", "${FILEBROWSER_PORT:-8097}"]
     volumes:
       # 只挂这几个常用目录（界面上就是 /srv 下的 5 个条目）。
       # 想改挂载：Docker → Compose → filebrowser → 编辑 yml → 重新部署。
@@ -1277,8 +1288,10 @@ func Catalog() []App {
 `,
 			// 首次启动会自动生成 admin 密码并打在容器日志里；面板部署完会把它捞出来
 			// 直接显示在安装结果里（用户不用再去服务管理翻日志）。
-			PostInstallHint: "默认用户名 admin，密码是首次启动随机生成的 —— 面板会把它显示在安装结果里。" +
-				"没看到就去「服务管理 → File Browser → 日志」找 `randomly generated password`，登录后请立刻改掉。",
+			PostInstallHint: "这是**参考** compose：面板不再代装。自己 docker compose up -d 后，" +
+				"默认用户名 admin，密码在容器日志里（`randomly generated password`）。" +
+				"想改成原生（不用 Docker）请用上面那条「File Browser（网页文件管理）」；" +
+				"原生版占 8081、这份参考占 8097，两者可以并存做迁移对照。",
 			DocsURL: "https://filebrowser.org",
 		},
 		// ---------------- 内网穿透 / 反向代理（全部原生） ----------------
@@ -1535,6 +1548,104 @@ func Catalog() []App {
 				},
 			},
 			DocsURL: "https://freshrss.org",
+		},
+		{
+			ID: "flarum", Name: "Flarum", Icon: "💬",
+			Summary:     "轻量论坛程序，一键装好并配好伪静态",
+			Description: "现代轻量论坛（PHP + MySQL）；装完到站点首页走完安装向导，数据库信息照安装结果填。",
+			Category:    "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 官方**预编译安装包**（flarum/installation-packages，vendor/ 已打包）：固定
+				// 1.8.19 + php8.2，不追 latest（latest 会让 sha256 过期、且与所选 PHP 版本脱钩）。
+				// 官方文档的安装章节就是这个仓库：https://docs.flarum.org/install
+				DownloadURL: "https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+				MirrorURLs: []string{
+					"https://gh-proxy.com/https://github.com/flarum/installation-packages/raw/main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+					"https://cdn.jsdelivr.net/gh/flarum/installation-packages@main/packages/v1.x/v1.8.19/flarum-v1.8.19-php8.2.zip",
+				},
+				Archive: "zip",
+				// 包内**没有**单一顶层目录（.editorconfig/.nginx.conf/composer.json/public/...
+				// 都是平级），剥顶层目录会剥错；docroot 靠伪静态预设的 PublicDir=public
+				// 落到 public/（Flarum 要求 web 根是 public，源码与 storage/ 不能暴露）。
+				StripTopDir: false,
+				Rewrite:     "flarum", FinishPath: "/", NeedsDB: true,
+				// php8.2 预编译包的 vendor 带 platform_check，要求 PHP >= 8.2；
+				// 换 PHP 版本要用对应的 flarum-vX-phpY.zip（面板只登记了这一份）。
+				MinPHP: "8.2",
+				// 官方 Server Requirements（docs.flarum.org/install）里的扩展清单。
+				PHPExts: []string{"curl", "dom", "fileinfo", "gd", "json", "mbstring",
+					"openssl", "pdo_mysql", "tokenizer", "zip", "session"},
+				Notes: []string{
+					"安装向导在站点首页（打开站点就是安装页）：数据库地址填 localhost，" +
+						"库名/用户名/密码照安装结果填（面板已建好库与账号，口令在结果里）",
+					"Flarum 需要写权限（config.php、storage/、assets/）：面板已把整个站点目录交给运行用户",
+					"伪静态用官方 .nginx.conf 的同一条 try_files 规则；docroot 必须是 public/ 子目录",
+					"装完请立刻在 Flarum 后台设置管理员账号；本包固定为 1.8.19 + PHP 8.2",
+				},
+			},
+			DocsURL: "https://docs.flarum.org/install",
+		},
+		{
+			ID: "emlog", Name: "emlog", Icon: "📓",
+			Summary:     "经典国产博客程序，一键装好并配好伪静态",
+			Description: "emlog Pro（PHP + MySQL）博客系统；装完到 /install.php 走完向导并填安装结果里的数据库信息。",
+			Category:    "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 官方发布包（GitHub releases 固定 tag pro-2.6.31；emlog.net/download 也指到这里）。
+				DownloadURL: "https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+				MirrorURLs: []string{
+					"https://gh-proxy.com/https://github.com/emlog/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+					"https://gitee.com/snowsun/emlog/releases/download/pro-2.6.31/emlog_pro_2.6.31.zip",
+				},
+				Archive: "zip",
+				// 包内是 admin/index.php/include/... 平级（无顶层目录），不能剥。
+				StripTopDir: false,
+				Rewrite:     "emlog", FinishPath: "/install.php", NeedsDB: true,
+				// 上游 README：PHP 5.6/7/8，**推荐 7.4 及以上**；这里按推荐值卡。
+				MinPHP: "7.4",
+				// README「环境准备」+ 代码实际用到的扩展：数据库驱动是 mysqli（默认）
+				// 或 PDO（USE_MYSQL_PDO），这里按默认的 mysqli 要求。
+				PHPExts: []string{"mysqli", "gd", "mbstring", "curl", "json", "zip", "openssl"},
+				Notes: []string{
+					"安装向导在 /install.php：数据库地址填 localhost，库名/用户名/密码照安装结果填",
+					"向导会写 config.php，所以站点目录必须可写（面板已把目录交给运行用户）",
+					"后台入口是 /admin/（装完向导会让你设置管理员账号）",
+					"伪静态用官方 nginx 规则：文件不存在时 rewrite 到 /index.php",
+				},
+			},
+			DocsURL: "https://www.emlog.net/docs/",
+		},
+		{
+			ID: "kodbox", Name: "可道云（kodbox）", Icon: "☁️",
+			Summary:     "私有云网盘 / 在线文件管理，一键装好并配好伪静态",
+			Description: "可道云 kodbox（PHP + MySQL）私有云盘；装完到站点首页走完安装向导，数据库信息照安装结果填。",
+			Category:    "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 官方仓库固定 tag 归档（kalcaddle/kodbox 1.69.03）；官方安装包入口
+				// https://api.kodcloud.com/?app/version&download=server.link 是"永远最新"，
+				// 无法登记稳定 sha256，所以这里用固定 tag 的归档（同样来自官方仓库）。
+				DownloadURL: "https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+				MirrorURLs: []string{
+					"https://gh-proxy.com/https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
+				},
+				Archive: "zip",
+				// 归档里有一层顶层目录 kodbox-1.69.03/，必须剥掉。
+				StripTopDir: true,
+				Rewrite:     "kodbox", FinishPath: "/", NeedsDB: true,
+				// 官方依赖说明：PHP 7.0+ / 8.0+ 推荐（docs.kodcloud.com/setup/environment）。
+				MinPHP: "7.0",
+				// 官方「依赖的 PHP 扩展」必需清单（同名文档），按 MySQL 连接补 pdo_mysql。
+				PHPExts: []string{"curl", "dom", "gd", "json", "libxml", "mbstring",
+					"openssl", "session", "xml", "zip", "zlib", "pdo_mysql"},
+				Notes: []string{
+					"安装向导在站点首页：数据库类型选 MySQL，地址填 localhost，" +
+						"库名/用户名/密码照安装结果填（面板已建好库与账号）",
+					"可道云需要写权限（config/、data/）：面板已把整个站点目录交给运行用户",
+					"管理员账号由你在安装向导里设置（面板不预设）",
+					"伪静态用官方 README_zh-CN 的 nginx 规则：try_files $uri $uri/ /index.php?$query_string",
+				},
+			},
+			DocsURL: "https://docs.kodcloud.com/setup/environment/",
 		},
 		// 要显示容器状态需要额外挂 Docker socket —— 面板刻意没有默认挂上
 		// （那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。

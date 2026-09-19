@@ -125,6 +125,15 @@ type releaseBinaryApp struct {
 	// frp 是这套安装器里唯一提供校验清单的上游；Lucky / Orbien 的 release 里没有，
 	// 那它们就只能靠 file(1) 的架构复核（见 README 的如实说明）。
 	ChecksumAsset string
+	// CheckPortConflict 表示安装前要**主动**检查端口有没有被别的进程占用。
+	//
+	// 为什么必须有这一条（filebrowser 加的，2026-09-19）：这条轨的就绪判定是
+	// "端口在监听"（Probe=ProbePort）。如果端口正好被**别人**占着，assertReady 会把
+	// "别人的端口在听"当成"我们装好了"，任务报成功而 filebrowser 其实没起来 ——
+	// 这正是 AGENTS 第三节说的"谎报成功"。所以对端口语义强的应用，宁可安装前就问一次：
+	// 端口被非本应用的服务占着 → 立刻如实失败并点名占用者。
+	// 已被本应用自己的服务记录占用不算冲突（那是"已安装"，前面的幂等门禁已经处理）。
+	CheckPortConflict bool
 	// Notes 是安装结果里要额外告诉用户的话
 	Notes []string
 }
@@ -319,6 +328,58 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 				"忘了口令就在终端执行 ~/alist/alist admin set <新口令>。",
 			"⚠️ Alist 上游只发布 md5 校验清单，没有 sha256：这一步的内容校验是" +
 				"「架构复核（file -b）+ 与上游 md5 互证」，强度弱于有 sha256 清单的应用（frpc / ddns-go）。",
+		},
+	},
+	"filebrowser": {
+		ID: "filebrowser", Label: "com.zizdog.filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
+		Category: "tool", RootDir: "filebrowser",
+		// 为什么走 release 产物而不是 brew：homebrew/core 的 filebrowser **没有 service 定义**
+		// （与 ddns-go 同因）—— 通用 brew 路径会留下"装了但永远起不来"的假服务记录。
+		// arm64 证据：v2.63.23 资产 darwin-arm64-filebrowser.tar.gz（15,258,752 B）。
+		// 2026-09-19 本机实测：解压出的 filebrowser 用 file(1) 报 Mach-O 64-bit executable arm64、
+		// `filebrowser version` 输出 "File Browser v2.63.23"；/health 返回 200、`-b /filebrowser` 下
+		// `/filebrowser/` 返回 200。
+		Repo: "filebrowser/filebrowser", Tag: "v2.63.23", Asset: "darwin-arm64-filebrowser.tar.gz",
+		Binary: "filebrowser",
+		// tarball 里是 CHANGELOG.md / LICENSE / README.md / filebrowser 四个**平级**成员
+		// （无顶层目录）→ TarStrip=0；PickBinary 只取 filebrowser 那一个。
+		TarStrip: 0, PickBinary: true,
+		// -b /filebrowser 与目录里的 AppUI.SelfBase 一致（应用自己带前缀，面板不改写路径）。
+		// -a 127.0.0.1：**只绑回环**，只经面板 /filebrowser/ 别名 + 面板会话访问，
+		// 不直接开到局域网/公网（家目录里有 .ssh / 凭据，暴露面必须收住）。
+		// -r 指到**真实用户的家目录**（用户 2026-09-19 明确要求管理整个用户目录）：
+		// File Browser 是"单实例一个 root"（-r/--root 决定唯一根），旧 Docker 版能同时显示
+		// /srv/下载、/srv/文档 是因为把多个宿主目录挂到同一个父目录 /srv 下，不是它支持多 root。
+		// -d 指到**面板工作目录**（{vardir}，家目录之外）：数据库里存着用户/权限/设置，
+		// 放在家目录里会被 filebrowser 自己列出来，也更容易被误改。
+		Args: []string{"-b", "/filebrowser", "-a", "127.0.0.1", "-p", "8081",
+			"-r", "{home}", "-d", "{vardir}/filebrowser/filebrowser.db"},
+		Port: 8081, HealthPath: "/health",
+		// 只绑回环：广告地址也用 127.0.0.1（见 releaseBinaryApp.BindAddress 的注释）。
+		BindAddress: "127.0.0.1",
+		// 端口语义强（就绪判定就看它）→ 安装前主动查占用，避免把别人的端口当成自己的。
+		CheckPortConflict: true,
+		// 上游 release **有** sha256 清单 → 必须核对（回落到第三方加速镜像时它是唯一内容校验）。
+		ChecksumAsset: "filebrowser_2.63.23_checksums.txt",
+		Notes: []string{
+			"安装目录：~/filebrowser（二进制与日志）；数据库在主目录之外的面板工作目录 " +
+				"<面板工作目录>/filebrowser/filebrowser.db（用户要求：它自己不该被自己管）。",
+			"文件根目录默认是**你的家目录**（-r {home}）—— Downloads / Documents / www 等都在里面，" +
+				"不需要额外拼多目录。想换根目录：服务详情里的「主目录」设置（改 plist 的 -r → 重启 → 回读生效值）。",
+			"⚠️ 风险与边界（实测，2026-09-19）：root=家目录意味着**谁能打开这个 Web UI、登录进去，" +
+				"谁就能读写整个家目录**（含 ~/.ssh、~/.panel-credential.local、~/Library/Keychains 等）。" +
+				"当前版本**没有**按目录排除/黑名单机制，也**没有**可靠的隐藏：`--hide-dotfiles` 只是 DB 里的" +
+				"一个显示开关（不是启动参数），实测开了之后列表里不显示 .ssh，但知道路径仍可 stat 到 " +
+				".ssh/id_rsa，并且 /api/raw/.ssh/id_rsa 直接返回文件内容 —— 隐藏 ≠ 安全。",
+			"所以：它只绑 127.0.0.1，只经面板 /filebrowser/ 别名 + 面板会话访问；**不要**把它直接开到局域网/公网。",
+			"如果你只想暴露某几个目录（不管理整个家目录），可以这样做（按推荐度）：" +
+				"① 把要展示的目录放在同一个父目录下，再把 root 改指那个父目录（最稳，等价于旧 Docker 的 /srv）；" +
+				"② 多用户 + 各自的 scope（Web UI：管理 → 用户管理 → 选中用户 → Scope；一个用户只有一个 scope）；" +
+				"③ 软链接：目标在 root 内时默认可用；指向 root 外时会被隐藏，需开 --followExternalSymlinks，" +
+				"而上游把该参数标注为 unsafe，不建议。",
+			"初始管理员凭据（用户名 + 随机口令）由 File Browser 首次启动时生成 —— 面板已从启动日志里抓出来" +
+				"放进上面的凭据区块；日志里抓不到时会如实说明，绝不编造。",
+			"⚠️ 上游项目已于 2026-09-01 归档：之后不再发版、不再修安全问题，请只在内网使用。",
 		},
 	},
 }
@@ -566,6 +627,31 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	if m.opt.UserName == "" || m.opt.UserHome == "" {
 		return fmt.Errorf("无法确定运行该服务的真实用户与家目录")
 	}
+	// 端口占用检查（只对显式声明 CheckPortConflict 的应用，见该字段注释）。
+	// 端口被**别人**占着时提前失败，而不是让 assertReady 把"别人的端口在听"
+	// 当成"我们装好了"（那是最危险的一种谎报成功）。
+	if spec, ok := releaseBinaryApps[d.ID]; ok && spec.CheckPortConflict && spec.Port > 0 {
+		if info, err := m.checkPort(spec.Port); err == nil && info.InUse {
+			var self []string
+			if app, found := FindApp(d.ID); found {
+				self = m.selfPortOccupiers(ctx, app)
+			}
+			if len(self) == 0 {
+				return fmt.Errorf("端口 %d 已被其它进程占用（%s）——「%s」起不来，"+
+					"本次安装已中止，不会留下「装好了但打不开」的假象。"+
+					"请先停掉占用它的服务（如果那是旧 Docker 版的 File Browser，"+
+					"先在 Docker/Compose 里 docker compose down）再重试",
+					spec.Port, strings.Join(info.Holders, ", "), spec.Name)
+			}
+		}
+	}
+	// filebrowser 的数据库放在面板工作目录（家目录之外，见 Args 注释）：
+	// 先建目录并把归属交给真实用户（服务以该用户身份运行，要能写 Bolt 库）。
+	if d.ID == "filebrowser" {
+		if err := m.prepareFilebrowserDataDir(); err != nil {
+			return err
+		}
+	}
 	if err := m.OrchestrateTarballInstall(ctx, d, result); err != nil {
 		return err
 	}
@@ -575,6 +661,11 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	// 抓不到就如实说明、绝不编造口令。
 	if d.ID == "alist" {
 		m.appendAlistInitialPassword(d, result)
+	}
+	// File Browser 同理：首次 quick setup 会随机生成 admin 口令并打进 stdout，
+	// 从日志里读出来放进凭据区（读不到就明说，不编造）。
+	if d.ID == "filebrowser" {
+		m.appendFilebrowserInitialPassword(d, result)
 	}
 	return nil
 }
@@ -634,6 +725,109 @@ func (m *Manager) appendAlistInitialPassword(d AppDescriptor, result *InstallRes
 		result.Steps = append(result.Steps,
 			"配置文件 "+p.Config+"（服务详情里可「📝 编辑配置文件」）")
 	}
+}
+
+// filebrowserInitialCredRe 匹配 File Browser 首次 quick setup 打的那行日志。
+//
+// 上游真实格式（直接取自 v2.63.23 二进制的格式串 `User '%s' initialized with
+// randomly generated password: %s`；本机实测输出：
+//
+//	2026/09/19 14:58:06 User 'admin' initialized with randomly generated password: OMh0r3E_RmVzNFrx
+//
+// ）—— 用户名与口令**都在这一行里**，所以两个都抓，绝不把 admin 写死当默认。
+// 口令字符集含大小写字母、数字与下划线，所以用 \S+ 而不是只认字母数字。
+var filebrowserInitialCredRe = regexp.MustCompile(
+	`User '([^']+)' initialized with randomly generated password:\s*(\S+)`)
+
+// filebrowserPasswordOnlyRe 是防御性的兜底：万一上游换成只打口令、不打用户名
+// 的格式（早期/后续版本的另一种写法），也把口令抓出来，但**不编用户名**。
+var filebrowserPasswordOnlyRe = regexp.MustCompile(
+	`(?i)(?:random(?:ly)? generated )password[:\s]+([A-Za-z0-9_\-]{6,})`)
+
+// appendFilebrowserInitialPassword 把 File Browser 日志里的初始凭据搬进安装结果的**凭据区**。
+//
+// 为什么值得单写一段：File Browser 装好后用户第一件事就是登录，而初始用户名与口令
+// 只出现在服务日志里（上游没有"由外部指定初始口令"的参数，`--password` 要的是 bcrypt 哈希）。
+// 抓不到就明说"没抓到、去哪儿看 + 看什么命令"，绝不编造 —— 这个仓库因为编造凭据出过事。
+//
+// 凭据**只进 InstallResult.Credentials**（面板 UI 的凭据区），不进任务步骤叙述：
+// 步骤会进任务日志 / SSE / 审计，明文口令出现在那里等于多一份长期留存。
+func (m *Manager) appendFilebrowserInitialPassword(d AppDescriptor, result *InstallResult) {
+	if result == nil {
+		return
+	}
+	for _, c := range result.Credentials {
+		if c.Key == "filebrowser_admin_password" {
+			return
+		}
+	}
+	p := m.binaryReleasePathsFor(d)
+	var username, password string
+	for _, f := range []string{p.OutLog, p.ErrLog} {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if mm := filebrowserInitialCredRe.FindSubmatch(data); len(mm) == 3 {
+			username, password = string(mm[1]), string(mm[2])
+			break
+		}
+		if password == "" {
+			if mm := filebrowserPasswordOnlyRe.FindSubmatch(data); len(mm) == 2 {
+				password = string(mm[1]) // 只捞到口令：用户名留空，绝不写死 admin
+			}
+		}
+	}
+	uiURL := fmt.Sprintf("http://%s:%d/filebrowser/", m.primaryIP(), releaseBinaryApps[d.ID].webPort())
+	if password == "" {
+		result.Steps = append(result.Steps,
+			"没能从启动日志里读到 File Browser 的首次凭据 —— 请到「服务管理 → File Browser → 日志」"+
+				"（或终端执行 `tail -n 50 "+p.OutLog+"`）查看带 `randomly generated password` 的那一行；"+
+				"确实登录不上时，可删除 ~/filebrowser/filebrowser.db 后重装以重置管理员口令。")
+		return
+	}
+	label := "File Browser 初始管理员口令（首次启动随机生成；在界面里改过之后就失效）"
+	if username == "" {
+		label = "File Browser 初始管理员口令（用户名未能从日志解析出来，请对照日志那一行；改过之后就失效）"
+	}
+	result.Credentials = append(result.Credentials, Credential{
+		Key: "filebrowser_admin_password", Value: password, Label: label,
+	})
+	if username != "" {
+		result.Credentials = append(result.Credentials, Credential{
+			Key: "filebrowser_admin_user", Value: username,
+			Label: "File Browser 初始管理员用户名（首次启动随机生成/quick setup 默认用户名）",
+		})
+		result.Steps = append(result.Steps,
+			fmt.Sprintf("File Browser 首次启动生成了初始凭据：用户名 %s + 随机口令（口令已放进本次安装的凭据区）。", username))
+	} else {
+		result.Steps = append(result.Steps,
+			"File Browser 首次启动生成了随机口令，已放进本次安装的凭据区；"+
+				"用户名没能从日志里解析出来，请对照日志里 `User '<用户名>' initialized with randomly generated password` 那一行。")
+	}
+	result.Steps = append(result.Steps,
+		"入口 "+uiURL+"（子路径）或 http://"+m.primaryIP()+":8081/ ；登录后请立刻改口令。")
+}
+
+// prepareFilebrowserDataDir 建好"家目录之外"的数据目录并把归属交给真实用户。
+//
+// 用户要求（2026-09-19）：File Browser 管理整个家目录，但它自己的 filebrowser.db
+// 不能放在家目录里（否则会被它自己列出来、也更容易被误改）。所以数据库放
+// <面板工作目录>/filebrowser/，这里负责创建 + chown（服务以真实用户身份运行，要能写）。
+func (m *Manager) prepareFilebrowserDataDir() error {
+	if strings.TrimSpace(m.opt.WorkDir) == "" {
+		return fmt.Errorf("无法确定面板工作目录，不能把 File Browser 数据库放到家目录之外")
+	}
+	dir := filepath.Join(m.opt.WorkDir, "filebrowser")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建 File Browser 数据目录 %s 失败: %w", dir, err)
+	}
+	if m.opt.UserName != "" {
+		if err := chownTree(m.opt.UserName, dir); err != nil {
+			return fmt.Errorf("把 %s 的归属交给 %s 失败: %w", dir, m.opt.UserName, err)
+		}
+	}
+	return nil
 }
 
 // portHasListener 判断某个端口此刻真的有进程在监听。
