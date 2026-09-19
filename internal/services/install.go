@@ -256,8 +256,15 @@ func (m *Manager) InstalledFormulaVersionsErr(ctx context.Context) (map[string]s
 		if asUser != "" {
 			how = fmt.Sprintf("（以用户 %s 通过 sudo -n 执行）", asUser)
 		}
-		return map[string]string{}, fmt.Errorf("`%s list --versions` 失败%s：%s",
+		tech := fmt.Sprintf("`%s list --versions` 失败%s：%s",
 			m.opt.BrewBin, how, tailText(why, 400))
+		// 「brew 目录缺失」：可操作建议放**最前** —— 应用市场那条"原因："只显示前 140
+		// 字符（apps.js），补建命令必须落在里面才看得见；真实 stderr 完整跟在后面。
+		if d, ok := diagnoseBrewDirError(why, m.brewPrefixes()); ok {
+			return map[string]string{}, errors.New(
+				FormatBrewDirAdvice(d, BrewDirOwnerOf(d.Prefix)) + "\n" + tech)
+		}
+		return map[string]string{}, errors.New(tech)
 	}
 	// 输出形如：nginx 1.31.5 / php@8.2 8.2.33 / mysql@8.4 8.4.11_4
 	res := map[string]string{}

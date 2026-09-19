@@ -12,7 +12,7 @@
 //   3. 机器不支持的项（例如笔记本 pmset 没有 autorestart）**明确标出来**，
 //      不提供一个点了会静默无效的按钮 —— 那比没有更糟。
 
-import { api } from './api.js';
+import { api, apiURL } from './api.js';
 import { h, clear, toast, confirmBox, appendAll } from './ui.js';
 import { taskCenter } from './tasks.js';
 
@@ -72,6 +72,17 @@ export function SystemSettingsView(content, ctx = {}) {
   lanInput.addEventListener('input', () => { lanTouched = true; });
 
   const refreshBtn = h('button.btn.btn-sm', { text: '⟳ 刷新状态', onclick: () => load(true) });
+
+  // ---------- Homebrew 目录（「未能复核已装软件」的修复入口，坑 186）----------
+  // 只在点击时执行；状态来自 GET /brew/dirs（不跑 brew），补建+回读复核在任务中心跑。
+  const brewStatus = h('div');
+  const brewMsg = h('div');
+  const brewBtn = h('button.btn.btn-sm.btn-primary', {
+    text: '🔧 补建缺失的 brew 目录',
+    onclick: () => repairBrewDirs(),
+  });
+  // brewActionRow 只在"可修"时放按钮；其它状态留空（不摆无用按钮）。
+  const brewActionRow = h('span');
 
   appendAll(content,
     warnings,
@@ -144,6 +155,25 @@ export function SystemSettingsView(content, ctx = {}) {
           lanRollbackBtn,
         ]),
         lanMsg,
+      ]),
+    ]),
+
+    // ---------- Homebrew 目录（应用市场「未能复核已装软件」的修复入口）----------
+    h('div.card', [
+      h('div.card-head', [
+        h('h3', { text: 'Homebrew 目录' }),
+        h('div.spacer'),
+        h('span.sub', { text: '只在点击时执行 · 不自动改系统' }),
+      ]),
+      h('div.card-body', [
+        h('p.hint', {
+          text: '市场提示「未能复核」且原因是 brew 目录不存在时，才需要点下面的按钮。',
+          title: '只补建缺失目录并把归属交回真实属主；之后会重跑 brew 复核，通不过就如实报失败。',
+        }),
+        brewStatus,
+        // 按钮**只在真的缺目录时**才出现 —— 无事可修时摆一个"补建"主按钮是纯噪音。
+        h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' } }, [brewActionRow]),
+        brewMsg,
       ]),
     ]),
 
@@ -394,6 +424,10 @@ export function SystemSettingsView(content, ctx = {}) {
 
     // ---------- 内网段预授权 ----------
     renderLAN(st);
+
+    // ---------- Homebrew 目录 ----------
+    // 它是独立接口（只解析上次探测失败的原因，不跑 brew），跟着刷新一起更新。
+    loadBrewDirs();
   }
 
   // renderLAN 把后端探测到的真实状态画成状态行（不靠"上次点过按钮"的记忆）。
@@ -502,6 +536,86 @@ export function SystemSettingsView(content, ctx = {}) {
   function setLANBusy(busy) {
     lanSaveBtn.disabled = busy;
     lanRollbackBtn.disabled = busy;
+  }
+
+  // loadBrewDirs 只读地拿"上一次为什么没能复核已装软件"（后端不跑 brew）。
+  // 读不到就如实说读不到，不猜一个状态。
+  async function loadBrewDirs() {
+    clear(brewStatus);
+    try {
+      const st = await api.get(apiURL('brew/dirs'));
+      if (st && st.brew_probe_ok) {
+        clear(brewActionRow);
+        brewStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('span.pill.ok', { text: 'Homebrew 已能复核' }),
+          h('span.hint', { text: '应用市场没有「未能复核已装软件」的警告。' }),
+        ]));
+        return;
+      }
+      const why = String((st && st.error) || '').trim();
+      if (st && st.repairable) {
+        clear(brewActionRow);
+        brewActionRow.append(brewBtn);
+        brewStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('span.pill.warn', { text: '缺目录：' + st.missing_dir }),
+        ]));
+        if (st.command) {
+          brewStatus.append(h('div.hint.mono', { text: st.command }));
+        }
+        if (st.advice) {
+          brewStatus.append(h('div.hint', { text: st.advice }));
+        }
+      } else if (why) {
+        // 不是「目录缺失」这一类：如实显示原文，**不**假装这个按钮能修好它。
+        brewStatus.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('span.pill.warn', { text: '上次复核失败（不是目录缺失这一类，按钮可能修不了）' }),
+        ]));
+        brewStatus.append(h('div.hint', { text: why }));
+      } else {
+        brewStatus.append(h('div.hint', {
+          text: '还没有失败记录。若应用市场有「未能复核已装软件」，刷新一次市场就能在这里看到原因。',
+        }));
+      }
+    } catch (e) {
+      brewStatus.append(h('div.hint', { text: '读取失败：' + ((e && e.message) || e) }));
+    }
+  }
+
+  // repairBrewDirs 提交"补建目录"任务（走任务中心，进度与结果都在进度窗里）。
+  // 提交失败一律如实提示；**绝不**在提交没落定时假装开始。
+  async function repairBrewDirs() {
+    const yes = await confirmBox(
+      '面板会补建缺失的 brew 目录、把归属交还 brew 前缀的真实属主，' +
+      '再跑一次 `brew list --versions` 复核。不会卸载或改动任何已装软件。确定执行？',
+      { title: '补建 Homebrew 缺失目录', okText: '执行' },
+    );
+    if (!yes) return;
+    clear(brewMsg);
+    brewMsg.append(h('div.hint', { text: '正在提交…' }));
+    const id = await taskCenter.start({
+      kind: 'brew-repair',
+      target: 'brew-dirs',
+      title: '补建 Homebrew 缺失目录',
+      // api.js 没有为这个接口单开方法（那个文件不在本次改动范围），
+      // 用通用 api.post + apiURL 走同一条带 CSRF 的请求通路。
+      start: () => api.post(apiURL('brew/repair-dirs'), {}),
+      onDone: (m) => {
+        clear(brewMsg);
+        const done = m && m.status === 'succeeded';
+        brewMsg.append(h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
+          done
+            ? h('span.pill.ok', { text: '✓ 复核通过' })
+            : h('span.pill.danger', { text: '✗ 未通过：' + ((m && (m.error || m.last)) || '任务失败') }),
+          h('span.hint', { text: ' 详细命令与输出在任务中心；结论以任务日志里的回读复核为准。' }),
+        ]));
+        // 重新读一次真实状态：修好了就该显示"已能复核"，没修好就继续显示真实原因。
+        loadBrewDirs();
+      },
+    });
+    if (!id) {
+      clear(brewMsg);
+      brewMsg.append(h('div.hint', { text: '提交失败（原因见上方提示），没有创建任务。' }));
+    }
   }
 
   // 注意：**不**订阅任务中心的进度变化来刷新状态。
