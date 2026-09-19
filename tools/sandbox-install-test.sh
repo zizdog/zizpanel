@@ -269,6 +269,15 @@ fi
 step "执行安装（沙箱模式）"
 export PATH="$STUB:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export ZIZPANEL_SANDBOX=1
+# ⚠️ 必须清掉从外部环境继承的 ZP_USER / ZP_PASS。
+#
+# 本脚本里有好几个用例的**语义就是"刻意不给凭据"**（验证"安装器不建账号、交给面板初始化
+# 向导"），而 install.sh 一旦看到 ZP_USER/ZP_PASS 就会走"安装期建账号"分支 ——
+# 断言必然失败。2026-09-19 实测：`make deploy` 之前 source 过 .panel-credential.local
+# （为了把 ZP_PASS 传给 deploy）就会把变量带进来，于是**同一个测试**在
+# `make check` 里绿、在 `make deploy` 里红 —— 典型的"环境依赖导致的幻影失败"。
+# 各用例需要凭据时会在它自己的命令行上显式给，基线必须是干净的。
+unset ZP_USER ZP_PASS
 export ZIZPANEL_ROOT="$SANDBOX/root"
 export ZIZPANEL_LISTEN=":$PORT"
 export ZIZPANEL_PLIST_DIR="$SANDBOX/Library/LaunchDaemons"
