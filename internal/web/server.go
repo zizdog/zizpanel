@@ -223,6 +223,21 @@ func (s *Server) routes() http.Handler {
 	// 所以会优先命中（见 api_systemsettings_lan.go）。
 	root.HandleFunc("POST /api/v1/system/settings/lan-preauth", s.requireAuth(s.handleLANPreauth))
 	root.HandleFunc("POST /api/v1/system/settings/{action}", s.requireAuth(s.handleSystemSettingsAction))
+	// 磁盘工具（见 api_disks.go / api_disks_ops.go）：只读枚举 + 挂载/卸载 +
+	// 开机自动挂载 + 非系统盘的抹盘/格式化/建卷/删卷/重命名。
+	// 全部 requireAuth；写操作另有 CSRF 双提交（requireAuth 内统一处理）。
+	// 系统盘相关设备一律 403，且被拒时不会执行任何 diskutil 写命令。
+	root.HandleFunc("GET /api/v1/system/disks", s.requireAuth(s.handleDiskList))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/mount", s.requireAuth(s.handleDiskMount))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/unmount", s.requireAuth(s.handleDiskUnmount))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/auto-mount", s.requireAuth(s.handleDiskAutoMount))
+	// 危险动作（前端要手输设备标识；后端执行前重新枚举校验，见 beginDiskWrite）
+	root.HandleFunc("POST /api/v1/system/disks/{id}/erase", s.requireAuth(s.handleDiskErase))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/volume-create", s.requireAuth(s.handleDiskVolumeCreate))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/volume-delete", s.requireAuth(s.handleDiskVolumeDelete))
+	root.HandleFunc("POST /api/v1/system/disks/{id}/volume-rename", s.requireAuth(s.handleDiskVolumeRename))
+	// init-volume 是第一版接口名，保留为 volume-create 的别名，不破坏既有调用。
+	root.HandleFunc("POST /api/v1/system/disks/{id}/init-volume", s.requireAuth(s.handleDiskVolumeCreate))
 	// 操作审计：检索 + 游标分页 + 导出（facets 给下拉框提供真实出现过的动作名）
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
 	root.HandleFunc("GET /api/v1/audit/facets", s.requireAuth(s.handleAuditFacets))

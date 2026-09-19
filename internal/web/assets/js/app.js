@@ -16,6 +16,7 @@ import { TerminalView, destroyTerminal } from './terminal.js';
 import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
+import { DisksView } from './disks.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { startUpgradeWatcher, hasUpdate } from './update.js';
@@ -64,6 +65,11 @@ export const NAV = [
   { id: 'terminal', title: 'Web 终端', icon: '🖥️', view: TerminalView },
   { id: 'cron', title: '计划任务', icon: '⏰', view: CronView },
   { group: '系统' },
+  // 「磁盘」：看磁盘信息 + 挂载/卸载 + 开机自动挂载 + 受控初始化镜像盘。
+  // 放在「系统」组（与「面板设置 / 日志」同组）：它是 OS 级的存储工具，
+  // 不是"面板自己的设置"，也不是「mac设置」那种把 macOS 配成服务器的动作集。
+  // 第一版**不含**抹盘/格式化/分区（见 disks.js 与 api_disks.go）。
+  { id: 'disks', title: '磁盘', icon: '💾', view: DisksView },
   // 「日志」把原「日志中心」与「操作审计」合并成一页两个 Tab（见 logshub.js）：
   // 侧栏只剩一个入口，旧的 #/logs 与 #/audit 仍分别落到对应 Tab（见 ROUTE_TARGET）。
   //

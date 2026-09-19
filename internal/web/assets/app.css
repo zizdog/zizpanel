@@ -975,3 +975,46 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 
 /* 确认框里的说明块：顶部与提示文字之间留出呼吸感 */
 .zp-notes-confirm .zp-notes { margin-top: 0; }
+
+/* ==========================================================================
+   磁盘工具（internal/web/assets/js/disks.js）
+   只加"可读性"：卡片里的分区表横排不挤、操作按钮可换行、警告块有底色。
+   **刻意没有任何动效/过渡** —— 面板要求遵守 prefers-reduced-motion，
+   这里干脆不引入动画，就不存在"忘了加媒体查询"的问题。
+   颜色全部沿用既有 CSS 变量（--border / --brand 等），不新增主题变量。
+   ========================================================================== */
+.disk-card .card-body + .card-body { border-top: 1px solid var(--border-soft); }
+.disk-card .table { width: 100%; }
+.disk-card .table th { white-space: nowrap; font-weight: 600; }
+.disk-card .table td { vertical-align: top; }
+/* 操作列：按钮多了要能换行，而不是把表格撑破 */
+.disk-card .table td .btn { white-space: nowrap; }
+/* 初始化镜像盘的确认警告块：红底 + 与正文留出间距 */
+.disk-warn {
+  padding: 8px 10px; margin-bottom: 10px;
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(220, 60, 60, .12);
+  border: 1px solid rgba(220, 60, 60, .4);
+  line-height: 1.6; font-size: 12.5px;
+}
+.disk-warn strong { color: #e05555; }
+
+/* 危险操作区：默认折叠 <details>，与上面的"安全操作"在视觉上分开。
+   边框/文字用红色系提示"会毁数据"；同样没有任何动效。 */
+.disk-danger {
+  margin-top: 14px;
+  border: 1px solid rgba(220, 60, 60, .4);
+  border-radius: var(--radius-sm, 8px);
+  background: color-mix(in srgb, rgba(220, 60, 60, .08) 100%, transparent);
+}
+.disk-danger > summary {
+  cursor: pointer; padding: 8px 10px;
+  font-size: 12.5px; font-weight: 600; color: #e05555;
+  user-select: none; list-style: none;
+}
+.disk-danger > summary::-webkit-details-marker { display: none; }
+.disk-danger > summary::before { content: '▸ '; }
+.disk-danger[open] > summary::before { content: '▾ '; }
+.disk-danger[open] > summary { border-bottom: 1px solid rgba(220, 60, 60, .25); }
+.disk-danger-body { padding: 4px 10px 12px; }
+.disk-danger select.input { min-width: 220px; max-width: 100%; }
