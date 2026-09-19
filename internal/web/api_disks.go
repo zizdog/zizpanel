@@ -126,26 +126,30 @@ func firstLine(s string) string {
 // ---------- 数据结构 ----------
 
 type diskInfo struct {
-	ID             string   `json:"id"`
-	Node           string   `json:"device_node"`
-	WholeDisk      bool     `json:"whole_disk"`
-	Parent         string   `json:"parent"`
-	Content        string   `json:"content"`
-	SizeBytes      int64    `json:"size_bytes"`
-	Filesystem     string   `json:"filesystem"`
-	FSType         string   `json:"fs_type"`
-	VolumeName     string   `json:"volume_name"`
-	MountPoint     string   `json:"mount_point"`
-	Mounted        bool     `json:"mounted"`
-	Internal       bool     `json:"internal"`
-	External       bool     `json:"external"`
-	Removable      bool     `json:"removable"`
-	Ejectable      bool     `json:"ejectable"`
-	Encrypted      bool     `json:"encrypted"`
-	EncryptedKnown bool     `json:"encrypted_known"`
-	Locked         bool     `json:"locked"`
-	SMARTStatus    string   `json:"smart_status"`
-	SMARTNote      string   `json:"smart_note"`
+	ID             string `json:"id"`
+	Node           string `json:"device_node"`
+	WholeDisk      bool   `json:"whole_disk"`
+	Parent         string `json:"parent"`
+	Content        string `json:"content"`
+	SizeBytes      int64  `json:"size_bytes"`
+	Filesystem     string `json:"filesystem"`
+	FSType         string `json:"fs_type"`
+	VolumeName     string `json:"volume_name"`
+	MountPoint     string `json:"mount_point"`
+	Mounted        bool   `json:"mounted"`
+	Internal       bool   `json:"internal"`
+	External       bool   `json:"external"`
+	Removable      bool   `json:"removable"`
+	Ejectable      bool   `json:"ejectable"`
+	Encrypted      bool   `json:"encrypted"`
+	EncryptedKnown bool   `json:"encrypted_known"`
+	Locked         bool   `json:"locked"`
+	SMARTStatus    string `json:"smart_status"`
+	SMARTNote      string `json:"smart_note"`
+	// Virtual 表示这是**合成设备**（diskutil 的 VirtualOrPhysical=Virtual），
+	// 典型就是 APFS 容器：物理盘是另一台设备，卷建在容器里。
+	// 页面据此把"同一块盘出现两次"讲清楚（用户 2026-09-19 报过这个困惑）。
+	Virtual        bool     `json:"virtual"`
 	BusProtocol    string   `json:"bus_protocol"`
 	Model          string   `json:"model"`
 	UUID           string   `json:"uuid"`
@@ -230,6 +234,7 @@ func infoFromPlist(id string, m map[string]any) diskInfo {
 	d.Ejectable = plistBool(m, "Ejectable")
 	d.Locked = plistBool(m, "Locked")
 	d.BusProtocol = plistStr(m, "BusProtocol")
+	d.Virtual = strings.EqualFold(plistStr(m, "VirtualOrPhysical"), "Virtual")
 	d.Model = firstNonEmpty(plistStr(m, "MediaName"), plistStr(m, "IORegistryEntryName"))
 	d.DiskUUID = plistStr(m, "DiskUUID")
 	d.UUID = firstNonEmpty(plistStr(m, "VolumeUUID"), d.DiskUUID)
@@ -295,9 +300,30 @@ func infoFromListNode(id string, node map[string]any, parent string, whole bool)
 
 // ---------- 快照采集 ----------
 
+// diskScope 决定枚举范围。
+//
+// 为什么要有"只看外置"这个范围（2026-09-19）：
+//
+//	· **产品口径**：磁盘页只服务"外接硬盘"这件事，系统盘不显示（用户明确要求）；
+//	· **性能**：每次 `diskutil info -plist <id>` 是真实硬件查询，机器上 25 台设备要 3.3 秒；
+//	  `diskutil list -plist external` 只要 17ms，外置设备通常只有 5 台 ⇒ 一次约 0.5 秒。
+//
+// 写操作仍然用 all（保护判据必须看得到系统盘，安全不能因为"界面不显示"而放松）。
+type diskScope string
+
+const (
+	diskScopeExternal diskScope = "external"
+	diskScopeAll      diskScope = "all"
+)
+
 // collectDiskSnapshot 采集一次真实磁盘状态：list + 每台设备 info + apfs list + fstab。
-func collectDiskSnapshot(ctx context.Context) (*diskSnapshot, error) {
-	listOut, listErr, err := runDiskutil(ctx, diskListTimeout, "list", "-plist")
+func collectDiskSnapshot(ctx context.Context, scope diskScope) (*diskSnapshot, error) {
+	// `diskutil list -plist external` 只列外接设备（macOS 原生支持，比全量快得多）。
+	listArgs := []string{"list", "-plist"}
+	if scope == diskScopeExternal {
+		listArgs = append(listArgs, "external")
+	}
+	listOut, listErr, err := runDiskutil(ctx, diskListTimeout, listArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("读取磁盘列表失败：%w", err)
 	}
@@ -1039,11 +1065,62 @@ func (s *diskSnapshot) view() diskListView {
 	return v
 }
 
+// 磁盘快照的短缓存。
+//
+// 为什么要缓存：一次真实采集要跑 diskutil（外置范围约 0.5 秒，全量 3 秒+），
+// 而磁盘状态**秒级不会变**，用户来回切页面时没必要每次重跑硬件查询。
+// 为什么只有 15 秒：面板的纪律是"看真实状态" —— 缓存必须短，且
+// **任何写操作（挂载/卸载/抹盘/建卷/删卷/重命名）成功后立即失效**，
+// 前端"刷新"按钮传 `?fresh=1` 也会绕过缓存。
+const diskSnapshotTTL = 15 * time.Second
+
+var diskSnapshotCache struct {
+	mu    sync.Mutex
+	at    time.Time
+	scope diskScope
+	snap  *diskSnapshot
+}
+
+// invalidateDiskSnapshotCache 让下一次读取重新采集（写操作后必须调用）。
+func invalidateDiskSnapshotCache() {
+	diskSnapshotCache.mu.Lock()
+	diskSnapshotCache.snap = nil
+	diskSnapshotCache.mu.Unlock()
+}
+
+func collectDiskSnapshotCached(ctx context.Context, scope diskScope, fresh bool) (*diskSnapshot, error) {
+	if !fresh {
+		diskSnapshotCache.mu.Lock()
+		if diskSnapshotCache.snap != nil && diskSnapshotCache.scope == scope &&
+			time.Since(diskSnapshotCache.at) < diskSnapshotTTL {
+			snap := diskSnapshotCache.snap
+			diskSnapshotCache.mu.Unlock()
+			return snap, nil
+		}
+		diskSnapshotCache.mu.Unlock()
+	}
+	snap, err := collectDiskSnapshot(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	diskSnapshotCache.mu.Lock()
+	diskSnapshotCache.at = time.Now()
+	diskSnapshotCache.scope = scope
+	diskSnapshotCache.snap = snap
+	diskSnapshotCache.mu.Unlock()
+	return snap, nil
+}
+
 // ---------- HTTP handlers ----------
 
 // handleDiskList 枚举磁盘与分区（只读）。见 GET /api/v1/system/disks。
 func (s *Server) handleDiskList(w http.ResponseWriter, r *http.Request) {
-	snap, err := collectDiskSnapshot(r.Context())
+	// 默认只看外置盘（用户口径）；`?scope=all` 给排障/将来用。
+	scope := diskScopeExternal
+	if strings.EqualFold(r.URL.Query().Get("scope"), "all") {
+		scope = diskScopeAll
+	}
+	snap, err := collectDiskSnapshotCached(r.Context(), scope, r.URL.Query().Get("fresh") == "1")
 	if err != nil {
 		s.audit(r, "disk_list", "", err.Error(), false, "")
 		fail(w, http.StatusInternalServerError, "读取磁盘列表失败："+err.Error())
@@ -1093,7 +1170,7 @@ type diskActionResult struct {
 // 这不是 TCC 的解法：实测证明换挂载点后读卷仍被拒（见本节顶部结论）。
 func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action, customMountPoint string) {
 	id := r.PathValue("id")
-	snap, err := collectDiskSnapshot(r.Context())
+	snap, err := collectDiskSnapshot(r.Context(), diskScopeAll)
 	if err != nil {
 		s.audit(r, "disk_"+action, id, "读取磁盘状态失败："+err.Error(), false, "")
 		fail(w, http.StatusInternalServerError, "读取磁盘状态失败："+err.Error())
@@ -1196,6 +1273,8 @@ func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action,
 		res.Message = "已卸载（回读挂载点为空）"
 	}
 	s.audit(r, "disk_"+action, id, res.Message, true, "")
+	// 挂载状态变了：让磁盘快照缓存立刻失效，后续读取必须重新采集（看真实状态）。
+	invalidateDiskSnapshotCache()
 	ok(w, res)
 }
 
@@ -1276,7 +1355,7 @@ func (s *Server) handleDiskAutoMount(w http.ResponseWriter, r *http.Request) {
 	}
 	enable := *req.Enabled
 
-	snap, err := collectDiskSnapshot(r.Context())
+	snap, err := collectDiskSnapshot(r.Context(), diskScopeAll)
 	if err != nil {
 		s.audit(r, "disk_auto_mount", id, "读取磁盘状态失败："+err.Error(), false, "")
 		fail(w, http.StatusInternalServerError, "读取磁盘状态失败："+err.Error())

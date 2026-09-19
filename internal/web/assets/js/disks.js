@@ -1,22 +1,20 @@
-// disks.js —— 「磁盘」页：看磁盘信息 + 挂载/卸载 + 开机自动挂载 + 危险操作。
+// disks.js —— 「外接磁盘」页：只显示外置磁盘，只有危险操作（抹盘/格式化/建卷/删卷/重命名）。
 //
-// 页面结构刻意分成**两区**，视觉上就让人分清"安全"与"会毁数据"：
-//   · 安全操作：挂载 / 卸载 / 开机自动挂载（每行三个按钮，二次确认）；
-//   · 危险操作：抹盘 / 格式化 / 建卷 / 删卷 / 重命名 —— 单独放进**默认折叠**的
-//     <details> 里，每个都要"手输设备标识 + 勾选警告 + 看清受影响清单"才允许点。
+// 2026-09-19 按用户要求重做（原版被批"看着就头痛"）：
+//   · **只显示外置磁盘**（后端 `GET /system/disks` 默认就是 `diskutil list -plist external`）；
+//   · **不再有**挂载/卸载/开机自动挂载按钮 —— 外接盘 macOS 本来就会自动挂载，
+//     用户在这页只做四件事：抹盘 / 格式化 / 建卷 / 删卷 / 重命名；
+//   · 危险操作区**默认展开**（原来要点开），页面上只剩一句警告；
+//   · 其它说明（隐私保护授权、文件系统取舍）收进折叠项，不再堆在首屏。
 //
-// 纪律：
+// 纪律（不变）：
 //   1. 只显示运行体的真实结论；读不到写"未复核 + 原因"，不显示空白、不假装成功。
-//   2. **系统盘/受保护设备所有写操作按钮禁用并写明原因**（后端还会再 403）。
-//   3. 危险操作必须强确认；后端执行前还会重新枚举校验（TOCTOU，见 api_disks_ops.go）。
-//
-// 文件系统取舍（与后端 diskFilesystems 同一份文案，来自 GET /system/disks）：
-//   exFAT 全平台读写、适合插拔备份，但无日志；APFS macOS 原生最快、别家读不了；
-//   HFS+ 旧；FAT32 单文件 ≤ 4 GiB，装不下镜像包。
+//   2. 危险操作必须强确认（手输设备标识 + 勾选警告）；后端执行前后都会重新枚举校验（TOCTOU）。
+//   3. 系统盘不在这个页面出现（后端已经过滤），但后端写操作仍按全量枚举做系统盘保护。
 
 import { api, apiURL } from './api.js';
 import { taskCenter } from './tasks.js';
-import { h, clear, toast, confirmBox, modal, bytes, appendAll } from './ui.js';
+import { h, clear, toast, modal, bytes, appendAll } from './ui.js';
 
 export function DisksView(content, ctx = {}) {
   clear(content);
@@ -31,9 +29,9 @@ export function DisksView(content, ctx = {}) {
   appendAll(content,
     h('div.card', [
       h('div.card-head', [
-        h('h3', { text: '磁盘工具' }),
+        h('h3', { text: '外接磁盘' }),
         h('div.spacer'),
-        h('span.sub', { text: '查看 / 挂载 / 卸载 / 开机自动挂载 / 抹盘 / 格式化 / 建卷 / 删卷 / 重命名' }),
+        h('span.sub', { text: '只显示外置磁盘；只有危险操作' }),
         refreshBtn,
       ]),
       status,
@@ -42,16 +40,26 @@ export function DisksView(content, ctx = {}) {
     listBox,
   );
 
+  // loading 状态放在卡片头旁边，不在正文里塞一大段"读取中…"——
+  // 刷新时**保留旧内容**（避免整页闪白），只有第一次才显示骨架。
+  let firstLoad = true;
   load(false);
 
   async function load(showToast) {
-    clear(status);
-    status.append(h('div.hint', { text: '读取中…（diskutil list + info + apfs list）' }));
-    clear(listBox);
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '读取中…';
+    if (firstLoad) {
+      clear(status);
+      status.append(h('div.hint', { text: '正在读取外置磁盘…（首次约 0.5 秒；15 秒内再打开直接用缓存）' }));
+    }
     let data;
     try {
-      data = await api.get(apiURL('system/disks'));
+      // 刷新走 ?fresh=1：绕过 15 秒缓存，拿真实状态（面板纪律：看真实状态）。
+      data = await api.get(apiURL('system/disks' + (showToast ? '?fresh=1' : '')));
     } catch (e) {
+      firstLoad = false;
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = '⟳ 刷新';
       clear(status);
       status.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
         h('span.pill.danger', { text: '磁盘列表读取失败' }),
@@ -60,6 +68,9 @@ export function DisksView(content, ctx = {}) {
       return;
     }
     snapshot = data || {};
+    firstLoad = false;
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = '⟳ 刷新';
     renderStatus(snapshot);
     renderList(snapshot);
     if (showToast) toast('已刷新磁盘状态', 'ok');
@@ -116,33 +127,28 @@ export function DisksView(content, ctx = {}) {
 
   function renderStatus(data) {
     clear(status);
+    // 首屏只留一句：用户明确要求"只留 危险操作 抹盘/格式化/删卷会永久销毁数据"。
     status.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-      h('span', { class: data.is_root ? 'pill ok' : 'pill warn', text: data.is_root ? '面板以 root 运行' : '面板非 root' }),
-      h('span.sub', { text: data.is_root
-        ? '磁盘操作直接执行（root 下 diskutil 不需要任何 GUI 授权弹窗）。'
-        : '挂载/卸载可能可用；抹盘/格式化/建卷/删卷/写 fstab 通常会因权限失败并如实报错 —— 正式面板以 root 运行时可执行。' }),
-    ]));
-    status.append(h('div.hint.mono', { text: 'fstab：' + (data.fstab_path || '/etc/fstab')
-      + (data.fstab_readable ? '' : '（读不到：' + (data.fstab_error || '未知原因') + '）') }));
-    (data.notes || []).forEach((n) => status.append(h('div.hint', { text: '· ' + n })));
-
-    // 外接盘/卷的静态提示：macOS 隐私保护会挡住外接盘，**要给二进制授权**（实测过，
-    // 弹窗点允许或去系统设置加都行）。静态写在页面上，不让用户先在文件管理里撞一次 EPERM 才知道。
-    status.append(h('div', { style: { marginTop: '8px' } }, [
-      h('span.pill.warn', { text: '外接盘/卷' }),
-      h('span.hint', { text: ' 文件管理读写外接盘（可移除宗卷）需要你授权：'
-        + '系统弹窗问「想要访问可移除宗卷上的文件」时点「允许」即可（实测点完立刻读写全通）；'
-        + '没弹窗就自己加：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 ' + panelBin()
-        + '（这块盘还要给镜像站/站点用，就把 nginx 二进制也加上，它自己也会弹一次）→ 打开开关 → 重启面板。'
-        + '授权跟二进制绑定，面板升级后可能要再授权一次；换挂载点不能绕过（已实测）。' }),
-    ]));
-    status.append(h('div', { style: { marginTop: '8px' } }, [
-      h('span.pill.warn', { text: '危险操作' }),
-      h('span.hint', { text: ' 抹盘/格式化/删卷会永久销毁数据；系统盘相关设备已禁用全部写操作。' }),
+      h('span.pill.danger', { text: '危险操作' }),
+      h('span.hint', { text: ' 抹盘 / 格式化 / 删卷会永久销毁数据。' }),
     ]));
 
-    // 文件系统取舍直接列在页面上（不只藏在格式化弹窗里）——
-    // 用户做镜像盘之前就该看到"exFAT 全平台/FAT32 单文件 4GiB"这类代价。
+    // 其余说明收进折叠项（默认收起）：想看的人点开，不占首屏。
+    const det = h('details', { style: { marginTop: '8px' } });
+    det.append(h('summary', { text: '说明（外接盘读不到 / 文件系统怎么选 / 面板权限）' }));
+    const inner = h('div', { style: { marginTop: '6px' } });
+
+    // ① 读不到外接盘 = macOS 隐私保护，两条授权路径。
+    inner.append(h('div', [
+      h('strong', { text: '文件管理读不到这块盘？' }),
+      h('div.hint', { text: 'macOS 隐私保护（可移除宗卷）拦住了面板。放行两条路：'
+        + '① 系统弹窗问「想要访问可移除宗卷上的文件」时点「允许」；'
+        + '② 系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 把 ' + panelBin()
+        + ' 打开（这块盘还要给站点/镜像站用，就把 nginx 也打开）。'
+        + '面板已用固定证书签名，所以授权一次之后升级不用再授。' }),
+    ]));
+
+    // ② 文件系统取舍（做镜像盘/备份盘时才有用）。
     const fss = data.filesystems || [];
     if (fss.length) {
       const ul = h('ul.zp-notes-list');
@@ -150,11 +156,18 @@ export function DisksView(content, ctx = {}) {
         h('strong', { text: f.label }),
         h('span.hint', { text: ' — ' + (f.note || '') }),
       ])));
-      const det = h('details');
-      det.append(h('summary', { text: '文件系统取舍（抹盘/格式化时怎么选）' }));
-      det.append(ul);
-      status.append(det);
+      inner.append(h('div', { style: { marginTop: '6px' } }, [h('strong', { text: '格式化时文件系统怎么选' }), ul]));
     }
+
+    // ③ 面板权限：非 root 时写操作会如实失败（不谎报）。
+    if (!data.is_root) {
+      inner.append(h('div', { style: { marginTop: '6px' } }, [
+        h('span.pill.warn', { text: '面板非 root' }),
+        h('span.hint', { text: ' 抹盘/格式化/建卷/删卷会因权限失败并如实报错；正式面板以 root 运行时可执行。' }),
+      ]));
+    }
+    det.append(inner);
+    status.append(det);
   }
 
   function renderList(data) {
@@ -170,27 +183,20 @@ export function DisksView(content, ctx = {}) {
   function diskCard(g) {
     const d = g.disk || {};
     const head = [
-      h('h3', { text: `💾 ${d.id}${d.volume_name ? ' · ' + d.volume_name : ''}` }),
+      h('h3', { text: `💾 ${d.id}${d.virtual ? ' · APFS 容器' : (d.volume_name ? ' · ' + d.volume_name : '')}` }),
       h('div.spacer'),
       h('span.sub', { text: [d.model, d.bus_protocol, bytes(d.size_bytes)].filter(Boolean).join(' · ') }),
     ];
 
     const body = h('div.card-body');
-    const marks = [h('span.pill', { text: d.whole_disk ? '整盘' : '分区/卷' })];
-    if (d.internal) marks.push(h('span.pill.warn', { text: '内置' }));
-    if (d.removable || d.external) marks.push(h('span.pill', { text: '可移除/外接' }));
-    marks.push(encMark(d), smartMark(d));
-    if (d.system_disk) marks.push(h('span.pill.danger', { text: '系统盘' }));
+    // 标记只留必要的：原来把"整盘/可移除/加密未复核/SMART未复核"全糊上去，用户说看着头痛。
+    const marks = [h('span.pill', { text: '可移除/外接' })];
+    if (d.encrypted === true) marks.push(h('span.pill.warn', { text: '已加密' }));
+    if (d.smart_status === 'failing') marks.push(h('span.pill.danger', { text: 'SMART 异常' }));
     body.append(h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, marks));
     if (d.info_error) {
       body.append(h('div', { style: { marginTop: '8px' } }, [
         h('span.pill.danger', { text: '未复核' }), h('span.hint', { text: ' ' + d.info_error }),
-      ]));
-    }
-    if (d.system_disk) {
-      body.append(h('div', { style: { marginTop: '8px' } }, [
-        h('span.pill.danger', { text: '⛔ 系统盘，已禁用全部写操作' }),
-        h('span.hint', { text: ' ' + (d.protect_reason || '') }),
       ]));
     }
 
@@ -202,7 +208,7 @@ export function DisksView(content, ctx = {}) {
         h('table.table', [
           h('thead', [h('tr', [
             h('th', { text: '设备' }), h('th', { text: '卷名' }), h('th', { text: '文件系统' }),
-            h('th', { text: '容量' }), h('th', { text: '挂载点' }), h('th', { text: '标记' }), h('th', { text: '安全操作' }),
+            h('th', { text: '容量' }), h('th', { text: '挂载点' }), h('th', { text: '说明' }),
           ])]),
           tbody,
         ]),
@@ -211,93 +217,60 @@ export function DisksView(content, ctx = {}) {
       body.append(h('div.hint', { text: '这台设备没有分区/卷。' }));
     }
 
-    if (d.whole_disk && (d.mountable || d.mounted)) {
-      body.append(h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, safeActions(d)));
-    }
+    // 容器提示：APFS 容器**不直接挂载**，卷建在它里面 —— 用户被"没有可挂载的文件系统"绕晕过，
+    // 这里直接用一句话说清楚它是什么、以及为什么不需要对它做任何挂载操作。
+    const containers = parts.filter((p) => p.content === 'Apple_APFS' && !p.has_filesystem);
+    containers.forEach((c) => {
+      const names = (g.init && g.init.container_ref === c.id && g.init.volume_names) ? g.init.volume_names : [];
+      body.append(h('div.hint', { style: { marginTop: '8px' } }, [
+        h('span.pill', { text: 'APFS 容器' }),
+        h('span', { text: ' ' + c.id + ' 是 APFS 容器（不是卷，不直接挂载）：卷建在它里面'
+          + (names.length ? '，目前有 ' + names.join('、') : '') + ' —— 文件管理访问的是里面的卷，不是它本身。' }),
+      ]));
+    });
 
     body.append(dangerZone(g, d));
     return h('div.card.disk-card', [h('div.card-head', head), body]);
   }
 
   function partRow(p) {
-    const marks = [encMark(p)];
-    if (p.external || p.removable) marks.push(h('span.pill', { text: '可移除/外接' }));
-    marks.push(h('span.pill', { text: p.filesystem || p.content || '未知' }));
-    if (p.auto_mount) marks.push(h('span.pill.ok', { text: '开机自动挂载' }));
-    if (p.system_disk) marks.push(h('span.pill.danger', { text: '系统盘' }));
+    const isContainer = p.content === 'Apple_APFS' && !p.has_filesystem;
     const mountCell = p.mounted && p.mount_point ? h('span.mono', { text: p.mount_point }) : h('span.hint', { text: '未挂载' });
+    const note = isContainer
+      ? h('span.hint', { text: 'APFS 容器（不直接挂载）' })
+      : (p.apfs_volume ? h('span.hint', { text: 'APFS 卷' }) : h('span.hint', { text: '' }));
     return h('tr', [
       h('td', [h('div.mono', { text: p.id })]),
       h('td', { text: p.volume_name || '—' }),
       h('td', { text: p.filesystem || p.content || '—' }),
       h('td.mono', { text: bytes(p.size_bytes) }),
       h('td', [mountCell]),
-      h('td', [h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, marks)]),
-      h('td', [h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, safeActions(p))]),
+      h('td', [note]),
     ]);
   }
 
-  // safeActions 是挂载/卸载/开机自动挂载；系统盘一律 disabled 并写明原因。
-  function safeActions(p) {
-    const sys = !!p.system_disk;
-    const reason = p.protect_reason || '系统盘';
-    const out = [];
-    out.push(h('button.btn.btn-sm', {
-      text: '挂载',
-      title: sys ? '系统盘，禁用：' + reason
-        : (p.mounted ? '已经挂载了' : (p.locked ? '加密卷锁定，需人工解锁（无头环境不可用）' : '挂载这台设备')),
-      disabled: sys || p.mounted || p.locked,
-      onclick: () => doAction(p, 'mount'),
-    }));
-    out.push(h('button.btn.btn-sm', {
-      text: '卸载',
-      title: sys ? '系统盘，禁用：' + reason : (p.mounted ? '卸载（有程序占用时会失败并如实报错）' : '当前未挂载'),
-      disabled: sys || !p.mounted,
-      onclick: () => doAction(p, 'unmount'),
-    }));
-    let amReason = '';
-    if (sys) amReason = '系统盘，禁用：' + reason;
-    else if (p.whole_disk) amReason = '整盘不能设置开机自动挂载，请选某个卷';
-    else if (!p.uuid) amReason = '没有卷 UUID，无法用 UUID 稳定引用';
-    else if (!p.has_filesystem) amReason = '没有可挂载的文件系统（例如 APFS 容器）';
-    else if (p.encrypted) amReason = '加密卷开机需人工解锁（无头环境不可用），本版拒绝为它写自动挂载';
-    out.push(h('button.btn.btn-sm' + (p.auto_mount ? '.btn-primary' : ''), {
-      text: p.auto_mount ? '关闭自动挂载' : '开机自动挂载',
-      title: amReason || (p.auto_mount ? '删除 /etc/fstab 条目' : '写入 /etc/fstab'),
-      disabled: !!amReason,
-      onclick: () => doAutoMount(p, !p.auto_mount),
-    }));
-    if (amReason && !sys) out.push(h('span.hint', { text: amReason }));
-    return out;
-  }
-
-  // dangerZone：默认折叠的危险操作区。系统盘 → 全部禁用并写明原因。
+  // dangerZone：危险操作区 —— **默认展开**（用户要求：不要再点一下才看到）。
+  // 这一页只做这些事，所以默认展开才是正常的；警告靠一句文字 + 按钮本身的红色。
   function dangerZone(g, d) {
     const sys = !!d.system_disk;
     const reason = d.protect_reason || '系统盘';
-    const wrap = h('details.disk-danger');
+    const wrap = h('div.disk-danger-area');
+    wrap.append(h('div.disk-danger-head', { text: '危险操作（会永久销毁数据）' }));
     const body = h('div.disk-danger-body');
-    wrap.append(h('summary', { text: '⚠️ 危险操作：抹盘 / 格式化 / 建卷 / 删卷 / 重命名（点击展开；系统盘已禁用）' }));
 
-    if (sys) {
-      body.append(h('div', { style: { marginTop: '8px' } }, [
-        h('span.pill.danger', { text: '⛔ 系统盘，危险操作全部禁用' }),
-        h('span.hint', { text: ' ' + reason }),
-      ]));
-    }
-
-    body.append(h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+    body.append(h('div', { style: { marginTop: '4px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
       h('button.btn.btn-sm.btn-danger', {
         text: d.whole_disk ? '格式化 / 抹盘这块盘…' : '格式化这个分区/卷…',
         title: sys ? '系统盘，禁用：' + reason : '会永久抹掉这块设备上的一切数据',
         disabled: sys,
         onclick: () => openFormatDialog(g, d),
       }),
-      sys ? h('span.hint', { text: '禁用：' + reason })
-        : h('span.hint', { text: '整盘抹掉会重建分区表；分区/卷抹掉只重建该卷。' }),
+      h('span.hint', { text: '整盘抹掉会重建分区表；格式化某个卷只重建该卷。' }),
     ]));
 
-    if (g.init) {
+    // 只在**容器自己**那一组显示"新建 APFS 卷"：
+    // 容器的卷是建在容器里的，物理盘那一组（disk9）不该再出现同一个按钮（用户看到两个"新建 APFS 卷"）。
+    if (g.init && g.init.container_ref === d.id) {
       const init = g.init;
       body.append(h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
         h('button.btn.btn-sm.btn-danger', {
@@ -313,7 +286,13 @@ export function DisksView(content, ctx = {}) {
       ]));
     }
 
-    const rows = (g.partitions || []).filter((p) => !p.system_disk);
+    // 只列"用户真正会操作的卷"：
+    //   · 排除系统盘设备（后端已过滤，这里再保险一次）；
+    //   · 排除 EFI 分区（外接盘的 EFI 分区格式化只会毁掉可引导性，磁盘工具里做更合适）；
+    //   · 排除 APFS 容器本身（它不是卷；对它要做的"新建卷"在上一行的按钮里）。
+    const rows = (g.partitions || []).filter((p) => !p.system_disk
+      && p.content !== 'EFI'
+      && !(p.content === 'Apple_APFS' && !p.has_filesystem));
     if (rows.length) {
       const tbody = h('tbody');
       rows.forEach((p) => {
@@ -350,20 +329,6 @@ export function DisksView(content, ctx = {}) {
     return wrap;
   }
 
-  function encMark(d) {
-    if (!d.encrypted_known) return h('span.pill', { text: '加密：未复核', title: 'diskutil 未返回加密字段' });
-    return d.encrypted ? h('span.pill.warn', { text: '已加密' }) : h('span.pill.ok', { text: '未加密' });
-  }
-
-  function smartMark(d) {
-    const map = {
-      verified: ['ok', 'SMART：正常'], failing: ['danger', 'SMART：异常'],
-      not_supported: ['warn', 'SMART：不支持'], unknown: ['warn', 'SMART：未复核'],
-    };
-    const [cls, label] = map[d.smart_status] || ['warn', 'SMART：未复核'];
-    return h('span.pill.' + cls, { text: label, title: d.smart_note || '' });
-  }
-
   // ---------- 安全动作 ----------
 
   // panelBin 是面板自己的可执行文件路径（由 /system/disks 下发，非默认安装也对）。
@@ -378,54 +343,6 @@ export function DisksView(content, ctx = {}) {
   // 挂到 /Volumes 之外后挂载成功，但面板读那个路径仍然 operation not permitted
   // （TCC 按**卷**判定，与挂载点无关）。留着一个做不到的按钮比没有更糟，
   // 所以入口去掉；后端 `mount_point` 能力保留（API 可用，见 api_disks.go）。
-
-  // renderMountResult 把结果（含**回读**挂载点）留在页面上，不只是一闪而过的 toast。
-  function renderMountResult(p, r) {
-    if (!r) return;
-    clear(resultBox);
-    resultBox.append(h('div.disk-task-result', [
-      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-        h('span.pill' + (r.verified && r.mounted ? '.ok' : '.danger'),
-          { text: r.verified && r.mounted ? '已挂载（回读确认）' : '未确认' }),
-        h('span.sub', { text: p.id + (p.volume_name ? '（' + p.volume_name + '）' : '') }),
-      ]),
-      h('div.mono', { style: { marginTop: '6px' }, text: r.mount_point ? ('挂载点：' + r.mount_point) : (r.message || '回读没有给出挂载点') }),
-      h('div.hint', { text: '文件管理里的「位置」下拉现在应能看到它；读不到多半是 macOS 隐私保护（见上方「外接盘/卷」那行）。' }),
-    ]));
-  }
-
-  async function doAction(p, action) {
-    const verb = action === 'mount' ? '挂载' : '卸载';
-    const yes = await confirmBox(`${verb} ${p.id}${p.volume_name ? '（' + p.volume_name + '）' : ''}？\n\n` +
-      (action === 'mount' ? '会调用 diskutil mount 并回读挂载点确认。' : '会调用 diskutil unmount；被占用会失败并如实报错（不强卸）。'),
-      { title: verb + '磁盘', okText: verb });
-    if (!yes) return;
-    try {
-      const r = await api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/${action}`), {});
-      toast(r && r.message ? r.message : verb + '完成', 'ok');
-      // 挂载后把**回读**到的挂载点留在页面上（不只是一闪而过的 toast）：
-      // 挂载点是否真的生效，只能看回读结果。
-      if (action === 'mount') renderMountResult(p, r);
-    } catch (e) {
-      toast(e && e.message ? e.message : String(e), 'err', 9000);
-    } finally { load(false); }
-  }
-
-  async function doAutoMount(p, enable) {
-    const yes = await confirmBox(
-      (enable
-        ? `把 ${p.id}（${p.volume_name || ''}）写进 /etc/fstab，开机自动挂载？\n\n条目形如：UUID=${p.uuid} ${p.mount_point || '/Volumes/…'} ${p.fs_type || 'apfs'} rw 0 2`
-        : `从 /etc/fstab 删除 ${p.id}（${p.volume_name || ''}）的自动挂载条目？`) +
-      '\n\n注意：开机自动挂载是否真正生效必须重启后才能确认；本面板不做重启，也不会标成已验证。',
-      { title: enable ? '设置开机自动挂载' : '关闭开机自动挂载', okText: enable ? '写入' : '删除' });
-    if (!yes) return;
-    try {
-      const r = await api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/auto-mount`), { enabled: enable });
-      toast(r && r.message ? r.message : '已保存', 'ok', 8000);
-    } catch (e) {
-      toast(e && e.message ? e.message : String(e), 'err', 9000);
-    } finally { load(false); }
-  }
 
   // ---------- 危险动作：共用的强确认弹窗 ----------
   //

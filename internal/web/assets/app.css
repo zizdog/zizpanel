@@ -999,23 +999,18 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 }
 .disk-warn strong { color: #e05555; }
 
-/* 危险操作区：默认折叠 <details>，与上面的"安全操作"在视觉上分开。
-   边框/文字用红色系提示"会毁数据"；同样没有任何动效。 */
-.disk-danger {
+/* 危险操作区：**默认展开**（2026-09-19 用户要求：这一页只做这些事，不该再点一下才看到）。
+   只用一个红色区块把它与其它内容分开，不再整页堆警告色；没有任何动效。 */
+.disk-danger-area {
   margin-top: 14px;
-  border: 1px solid rgba(220, 60, 60, .4);
+  border: 1px solid rgba(220, 60, 60, .35);
   border-radius: var(--radius-sm, 8px);
-  background: color-mix(in srgb, rgba(220, 60, 60, .08) 100%, transparent);
 }
-.disk-danger > summary {
-  cursor: pointer; padding: 8px 10px;
+.disk-danger-head {
+  padding: 7px 10px;
   font-size: 12.5px; font-weight: 600; color: #e05555;
-  user-select: none; list-style: none;
+  border-bottom: 1px solid rgba(220, 60, 60, .2);
 }
-.disk-danger > summary::-webkit-details-marker { display: none; }
-.disk-danger > summary::before { content: '▸ '; }
-.disk-danger[open] > summary::before { content: '▾ '; }
-.disk-danger[open] > summary { border-bottom: 1px solid rgba(220, 60, 60, .25); }
 .disk-danger-body { padding: 4px 10px 12px; }
 .disk-danger select.input { min-width: 220px; max-width: 100%; }
 

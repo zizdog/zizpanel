@@ -209,7 +209,7 @@ func (s *Server) beginDiskWrite(ctx context.Context, id, confirm, expectUUID str
 			"二次确认失败：请手动输入磁盘标识 " + id + "（原样输入）后才能执行"
 	}
 	// 重新枚举：不看页面数据，重跑 list + info。
-	snap, err := collectDiskSnapshot(ctx)
+	snap, err := collectDiskSnapshot(ctx, diskScopeAll)
 	if err != nil {
 		return nil, http.StatusInternalServerError, "执行前重新枚举磁盘失败：" + err.Error()
 	}
@@ -292,7 +292,7 @@ func (s *Server) executeDiskWrite(ctx context.Context, action, id, cmdLine strin
 		Stderr:      strings.TrimSpace(errb),
 		BeforeState: before,
 	}
-	after, afterErr := collectDiskSnapshot(ctx)
+	after, afterErr := collectDiskSnapshot(ctx, diskScopeAll)
 	if after != nil {
 		res.AfterState = diskStateSummary(after, id)
 	}
@@ -465,6 +465,8 @@ func (s *Server) runDiskWritePlan(ctx context.Context, log tasks.LogFunc, plan *
 	}
 	res.Verified = true
 	res.Message = summary
+	// 写操作已经落到真实设备上：让磁盘快照缓存失效，任务完成后的刷新一定拿到新状态。
+	invalidateDiskSnapshotCache()
 	steps := []string{
 		"before={" + res.BeforeState + "}",
 		"after={" + res.AfterState + "}",
