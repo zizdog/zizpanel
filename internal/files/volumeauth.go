@@ -34,6 +34,10 @@ import (
 //
 //  判据全部可注入（consoleUserFn / volumeMountsFn / readDirFn），
 //  这样单测能断言"没有登录会话时**一个字节都没读**"，而不用真的插一块盘。
+//
+//  另有一条**按需**入口 RequestVolumeAuthorizationNow：用户在面板上主动点「申请授权」时，
+//  由 web 层先做同步预检（有外接盘 + 有图形登录会话），通过后才调它读一次。
+//  它不看/不消费一次性标记，但共用同一套"读了才弹窗、没人在场一个字节都不读"的核心。
 // ============================================================================
 
 // volumeAuthMarkerName 是一次性授权请求标记的文件名（放在 DataDir 下）。
@@ -57,6 +61,14 @@ func consoleUserReal() string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// ConsoleUser 返回当前图形控制台（物理屏幕）的登录用户名；没有登录会话时返回空串。
+//
+// 只读判据、**不碰任何卷**：面板用它做"现在有没有人能点弹窗"的同步预检（铁律 12）。
+func ConsoleUser() string { return strings.TrimSpace(consoleUserFn()) }
+
+// ExternalVolumeMounts 返回当前检测到的非系统卷挂载点（只枚举挂载点，不读卷内容）。
+func ExternalVolumeMounts() []string { return volumeMountsForAuthFn() }
 
 // volumeMountsForAuthFn 是"要申请授权的外接卷列表"的来源（默认复用 NonSystemVolumeMounts）。
 // 变量而非常量：单测要能造出"有没有外接卷"两种情形，而不依赖跑测试那台机器插没插盘。
@@ -123,13 +135,60 @@ func RequestVolumeAuthorizationOnce(ctx context.Context, markerPath string, wait
 
 	// ③ 真的去读一次 —— 这一步才会让 macOS 弹出授权询问。
 	log("按安装时的同意，向系统申请访问 %d 个外接卷（屏幕上可能弹出授权询问，请点「允许」）", len(mounts))
+	res.Okay, res.Attempted = requestVolumeAuthCore(ctx, mounts, wait, log)
+
+	// ④ 一次性：用过就删，绝不反复打扰（每次启动都弹窗是最讨人厌的行为）。
+	_ = os.Remove(markerPath)
+	res.MarkerConsumed = true
+	return res
+}
+
+// RequestVolumeAuthorizationNow 是"用户在面板上**主动**点了申请授权"时的入口。
+//
+// 与 RequestVolumeAuthorizationOnce 共用同一套纪律与同一份读盘实现（没人在场一个字节都不读），
+// 差别只有两点：不看、也不消费一次性标记（它由用户的一次明确点击触发），
+// 并且不做「安装时不碰外接卷」的承诺 —— 调用方必须先做同步预检（有人在 + 有外接盘）。
+//
+// 返回值语义与 RequestVolumeAuthorizationOnce 一致：Skipped=true 表示**什么都没读**。
+func RequestVolumeAuthorizationNow(ctx context.Context, wait time.Duration, logf func(string, ...any)) VolumeAuthResult {
+	log := func(format string, args ...any) {
+		if logf != nil {
+			logf(format, args...)
+		}
+	}
+	res := VolumeAuthResult{}
+
+	res.ConsoleUser = strings.TrimSpace(consoleUserFn())
+	switch res.ConsoleUser {
+	case "", "root", "loginwindow":
+		res.Skipped = true
+		res.Reason = fmt.Sprintf("当前没有图形登录会话（控制台用户 %q）——不触发任何系统弹窗", res.ConsoleUser)
+		log("跳过外接卷授权请求：%s", res.Reason)
+		return res
+	}
+
+	mounts := volumeMountsForAuthFn()
+	if len(mounts) == 0 {
+		res.Skipped = true
+		res.Reason = "当前没有检测到任何非系统卷（外接盘）"
+		log("跳过外接卷授权请求：%s", res.Reason)
+		return res
+	}
+
+	res.Okay, res.Attempted = requestVolumeAuthCore(ctx, mounts, wait, log)
+	return res
+}
+
+// requestVolumeAuthCore 是"真的去读一次外接卷"的核心（两种入口共用）。
+// 读通记 Okay；权限拒绝记 Attempted 并按 wait 轮询等用户点弹窗；其它错误只记日志。
+func requestVolumeAuthCore(ctx context.Context, mounts []string, wait time.Duration, log func(string, ...any)) (okay, attempted []string) {
 	for _, m := range mounts {
 		if ctx.Err() != nil {
 			break
 		}
 		_, err := readDirFn(m)
 		if err == nil {
-			res.Okay = append(res.Okay, m)
+			okay = append(okay, m)
 			continue
 		}
 		if !volumeAuthPermissionDenied(err) {
@@ -137,7 +196,7 @@ func RequestVolumeAuthorizationOnce(ctx context.Context, markerPath string, wait
 			log("外接卷 %s 读取失败（非权限原因，跳过）：%v", m, err)
 			continue
 		}
-		res.Attempted = append(res.Attempted, m)
+		attempted = append(attempted, m)
 		log("外接卷 %s 被系统拒绝（%v）——授权询问应已弹出，等待用户点「允许」…", m, err)
 		// 等用户点弹窗；点完之后同一路径就能读了。
 		if wait > 0 {
@@ -150,22 +209,18 @@ func RequestVolumeAuthorizationOnce(ctx context.Context, markerPath string, wait
 				case <-time.After(time.Second):
 				}
 				if _, rerr := readDirFn(m); rerr == nil {
-					res.Okay = append(res.Okay, m)
+					okay = append(okay, m)
 					log("外接卷 %s 已可访问（授权成功）", m)
 					break waitLoop
 				}
 			}
 		}
-		if !containsStr(res.Okay, m) {
+		if !containsStr(okay, m) {
 			log("外接卷 %s 仍未授权；"+
 				"可在真机上打开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」，把面板二进制加进去", m)
 		}
 	}
-
-	// ④ 一次性：用过就删，绝不反复打扰（每次启动都弹窗是最讨人厌的行为）。
-	_ = os.Remove(markerPath)
-	res.MarkerConsumed = true
-	return res
+	return okay, attempted
 }
 
 // volumeAuthPermissionDenied 判断错误链上是否有真实的权限拒绝（EPERM/EACCES）。

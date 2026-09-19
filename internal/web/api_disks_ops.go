@@ -31,8 +31,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -778,4 +780,134 @@ func (s *Server) handleDiskVolumeRename(w http.ResponseWriter, r *http.Request) 
 		},
 	}
 	s.launchDiskWrite(w, r, "重命名卷 "+id, plan)
+}
+
+// ---------- 申请外接盘授权（用户点按钮；读了才会弹窗） ----------
+
+// diskVolumeAuthWait 是"等用户在弹窗上点「允许」"的上限：超时就如实报仍被拒。
+var diskVolumeAuthWait = 90 * time.Second
+
+// 同步预检的拒绝理由（用户可见文案；前端按钮禁用时也用同一份前两条）。
+const (
+	diskVolumeAuthNoVolumeReason  = "先接上外接硬盘"
+	diskVolumeAuthNoSessionReason = "现在没人在机器前，弹窗没人点；请到真机操作，或按下面的路径手动授权"
+	// diskVolumeAuthConfirmRequiredReason 与前端确认框是同一件事：只点按钮不算，
+	// 必须让用户先确认"人就在屏幕前、准备好点弹窗了"。
+	diskVolumeAuthConfirmRequiredReason = "请先确认：接下来需要你在这台机器的屏幕上点『允许』"
+)
+
+// 机器可读的拒绝原因（响应里的 reason 字段），测试按它断言，不靠中文文案。
+const (
+	diskVolumeAuthReasonNoVolume        = "no_volume"
+	diskVolumeAuthReasonNoConsole       = "no_console"
+	diskVolumeAuthReasonConfirmRequired = "confirm_required"
+)
+
+// diskVolumeAuthErrView 是拒绝响应的正文：msg 给人看，reason 给机器断言。
+type diskVolumeAuthErrView struct {
+	OK     bool   `json:"ok"`
+	Msg    string `json:"msg"`
+	Reason string `json:"reason"`
+}
+
+func failDiskVolumeAuth(w http.ResponseWriter, code int, msg, reason string) {
+	writeJSON(w, code, diskVolumeAuthErrView{Msg: msg, Reason: reason})
+}
+
+// diskVolumeAuthManualPath 是"仍被拒"时的手动授权路径（与文件管理里的 TCC 指引同一份事实）。
+func diskVolumeAuthManualPath() string {
+	return "手动授权：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 打开 " + panelBinaryForGuide +
+		"（这块盘还要给站点/镜像站用，就把 nginx 也打开）。" +
+		"授权跟二进制绑定：面板升级后可能要再授一次（用固定证书签名的正式包通常不用）。"
+}
+
+// diskVolumeAuthPrecheck 按固定顺序回答"现在能不能弹窗"：① 有没有非系统卷、
+// ② 有没有人在屏幕前、③ 用户有没有显式确认"我准备好点弹窗了"。每条拒绝都有
+// **独立可断言**的 reason（no_volume / no_console / confirm_required）。
+// 三条判据都**不读卷内容**；mounts 只用于日志与结果。
+func diskVolumeAuthPrecheck(confirm bool) (mounts []string, consoleUser string, code int, msg, reason string) {
+	mounts = diskVolumeAuthMountsFn()
+	consoleUser = strings.TrimSpace(diskVolumeAuthConsoleUserFn())
+	if len(mounts) == 0 {
+		return nil, consoleUser, http.StatusConflict, diskVolumeAuthNoVolumeReason, diskVolumeAuthReasonNoVolume
+	}
+	if !diskConsoleSessionOK(consoleUser) {
+		return mounts, consoleUser, http.StatusConflict, diskVolumeAuthNoSessionReason, diskVolumeAuthReasonNoConsole
+	}
+	if !confirm {
+		return mounts, consoleUser, http.StatusBadRequest,
+			diskVolumeAuthConfirmRequiredReason, diskVolumeAuthReasonConfirmRequired
+	}
+	return mounts, consoleUser, 0, "", ""
+}
+
+// handleDiskVolumeAuthRequest 是「申请授权」的入口：**同步预检 → 任务中心**。
+//
+// 为什么必须预检（铁律 12）：读外接卷会让 macOS 弹授权询问；没人在屏幕前时弹了也没人点，
+// 系统只会把它记成 denial。所以没有人 / 没有盘 / 没有显式确认 → 当场 4xx，
+// **不创建任务、一个字节都不读**。确认不能只靠前端自觉（坑 192）。
+func (s *Server) handleDiskVolumeAuthRequest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Confirm bool `json:"confirm"`
+	}
+	// 空 body 合法：等于「没确认」，交给预检第③条给 confirm_required（不是解码错误）。
+	if err := decode(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_, consoleUser, code, msg, reason := diskVolumeAuthPrecheck(req.Confirm)
+	if msg != "" {
+		s.audit(r, "disk_volume_auth", "", "拒绝："+msg+"（控制台用户 "+consoleUser+"，reason="+reason+"）", false, "")
+		failDiskVolumeAuth(w, code, msg, reason)
+		return
+	}
+	s.launchTask(w, r, "disk_volume_auth", "disk-volume-auth", "申请访问外接盘授权", "disk_volume_auth",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return s.runDiskVolumeAuth(ctx, log)
+		})
+}
+
+// runDiskVolumeAuth 是任务体：再预检一次（排队期间人可能注销、盘可能被拔）→
+// 读一次外接卷（这一步才会弹窗）→ 最多等 diskVolumeAuthWait → 如实报告每个卷的结果。
+func (s *Server) runDiskVolumeAuth(ctx context.Context, log tasks.LogFunc) (any, error) {
+	// 任务体复检的 confirm 恒为 true：用户已在 handler 那次显式确认过。
+	mounts, _, _, reason, _ := diskVolumeAuthPrecheck(true)
+	if reason != "" {
+		return nil, errors.New(reason)
+	}
+	log(tasks.LevelStep, "已向系统发起授权请求，请在这台机器的屏幕上点『允许』（最多等 "+
+		diskVolumeAuthWait.Round(time.Second).String()+"，不点就如实报仍被拒）")
+	res := diskVolumeAuthRequestFn(ctx, diskVolumeAuthWait, func(f string, a ...any) {
+		log(tasks.LevelStep, fmt.Sprintf(f, a...))
+	})
+	if res.Skipped {
+		return nil, errors.New("未发起授权请求：" + res.Reason)
+	}
+
+	var lines, denied []string
+	for _, m := range mounts {
+		switch {
+		case slices.Contains(res.Okay, m):
+			lines = append(lines, m+"：已可访问")
+			log(tasks.LevelOK, m+"：已可访问")
+		case slices.Contains(res.Attempted, m):
+			lines = append(lines, m+"：仍被拒（operation not permitted）")
+			denied = append(denied, m)
+			log(tasks.LevelErr, m+"：仍被拒")
+		default:
+			lines = append(lines, m+"：未读到（可能已卸载，非授权问题）")
+			log(tasks.LevelOut, m+"：未读到（可能已卸载，非授权问题）")
+		}
+	}
+	if len(res.Okay) == 0 {
+		return nil, errors.New("外接盘仍不可访问：" + strings.Join(lines, "；") + "。" + diskVolumeAuthManualPath())
+	}
+	if len(denied) > 0 {
+		return nil, errors.New(strings.Join(denied, "、") + " 仍被拒（已可访问：" +
+			strings.Join(res.Okay, "、") + "）。" + diskVolumeAuthManualPath())
+	}
+	msg := "已可访问：" + strings.Join(res.Okay, "、")
+	steps := append(lines, "结果："+msg)
+	log(tasks.LevelOK, "结果："+msg)
+	return &services.InstallResult{App: "disk", Name: "disk_volume_auth", Message: msg, Steps: steps}, nil
 }

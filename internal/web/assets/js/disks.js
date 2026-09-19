@@ -1,4 +1,4 @@
-// disks.js —— 「外接磁盘」页：只显示外置磁盘，只有危险操作（抹盘/格式化/建卷/删卷/重命名）。
+// disks.js —— 「磁盘管理」页：只显示外置磁盘（危险操作 + 申请系统授权）。
 //
 // 2026-09-19 按用户要求重做（原版被批"看着就头痛"）：
 //   · **只显示外置磁盘**（后端 `GET /system/disks` 默认就是 `diskutil list -plist external`）；
@@ -7,6 +7,10 @@
 //   · 危险操作区**默认展开**（原来要点开），页面上只剩一句警告；
 //   · 其它说明（隐私保护授权、文件系统取舍）收进折叠项，不再堆在首屏。
 //
+// 「申请授权」按钮（用户点名要）：点了由面板读一次外接卷，让 macOS 弹授权询问。
+// 能不能点**贴着真实状态**（`volume_auth`）：没外接盘 / 没人在屏幕前 → 禁用并写明原因；
+// 后端在同一个预检里也会拒绝（没人在场绝不读盘，铁律 12），不靠前端自觉。
+//
 // 纪律（不变）：
 //   1. 只显示运行体的真实结论；读不到写"未复核 + 原因"，不显示空白、不假装成功。
 //   2. 危险操作必须强确认（手输设备标识 + 勾选警告）；后端执行前后都会重新枚举校验（TOCTOU）。
@@ -14,7 +18,7 @@
 
 import { api, apiURL } from './api.js';
 import { taskCenter } from './tasks.js';
-import { h, clear, toast, modal, bytes, appendAll } from './ui.js';
+import { h, clear, toast, modal, bytes, appendAll, confirmBox } from './ui.js';
 
 export function DisksView(content, ctx = {}) {
   clear(content);
@@ -29,7 +33,7 @@ export function DisksView(content, ctx = {}) {
   appendAll(content,
     h('div.card', [
       h('div.card-head', [
-        h('h3', { text: '外接磁盘' }),
+        h('h3', { text: '磁盘管理' }),
         h('div.spacer'),
         h('span.sub', { text: '只显示外置磁盘；只有危险操作' }),
         refreshBtn,
@@ -99,7 +103,7 @@ export function DisksView(content, ctx = {}) {
   }
 
   // renderTaskResult 展示"完成后回读"的结果摘要（卷名/容量/挂载/容器剩余空间）。
-  // 结果来自任务 result（后端 diskTaskResult 的 message + steps）。
+  // 结果来自任务 result（后端 diskTaskResult 的 message + steps）或失败时的 error。
   function renderTaskResult(m) {
     clear(resultBox);
     if (!m) return;
@@ -107,19 +111,25 @@ export function DisksView(content, ctx = {}) {
     const r = m.result || {};
     const steps = Array.isArray(r.steps) ? r.steps : [];
     const msg = r.message || m.error || '';
+    // 后端的结果/错误可能多行（授权被拒时每条结论一行）；逐行显示，别让换行被吃掉。
+    const lines = String(msg).split('\n').map((s) => s.trim()).filter(Boolean);
     const wrap = h('div.disk-task-result', [
       h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
         h('span.pill' + (done ? '.ok' : '.danger'), { text: done ? '磁盘任务完成' : '磁盘任务未完成' }),
         h('span.sub', { text: m.title || '' }),
         h('button.btn.btn-sm', { text: '查看任务日志', onclick: () => taskCenter.openTask(m.id) }),
       ]),
-      msg ? h('div', { style: { marginTop: '6px' } }, [h('strong', { text: msg })]) : null,
+      ...lines.map((ln) => h('div', { style: { marginTop: '6px' } }, [h('strong', { text: ln })])),
       steps.length ? (() => {
         const ul = h('ul.zp-notes-list');
         steps.forEach((s) => ul.append(h('li.mono', { text: s })));
         return ul;
       })() : null,
     ]);
+    // 申请授权被拒：失败原因里已带手动授权路径，这里在同一处再给一次按钮。
+    if (!done && m.kind === 'disk_volume_auth') {
+      wrap.append(authRow((snapshot && snapshot.volume_auth) || {}));
+    }
     resultBox.append(wrap);
     if (done && msg) toast(msg, 'ok', 10000);
     else if (!done) toast('磁盘任务失败：' + (m.error || '未知原因'), 'err', 12000);
@@ -127,29 +137,97 @@ export function DisksView(content, ctx = {}) {
 
   function renderStatus(data) {
     clear(status);
-    // 首屏只留一句：用户明确要求"只留 危险操作 抹盘/格式化/删卷会永久销毁数据"。
-    status.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-      h('span.pill.danger', { text: '危险操作' }),
-      h('span.hint', { text: ' 抹盘 / 格式化 / 删卷会永久销毁数据。' }),
-    ]));
+    const va = data.volume_auth || {};
+    const groups = Array.isArray(data.list) ? data.list : [];
+    const hasVolumes = Number(va.count) > 0;
 
-    // 其余说明收进折叠项（默认收起）：想看的人点开，不占首屏。
+    if (!groups.length && !hasVolumes) {
+      // 空状态：装机器时在安装脚本里选了"不用外接硬盘"（铁律 12）就是这条路。
+      status.append(h('div.empty', [
+        h('div.big', { text: '💾' }),
+        h('h4', { text: '您当前没有外接磁盘' }),
+        h('div.hint', { text: '要用外接盘做镜像/备份，把它插上（系统会自动挂载），再点右上角「⟳ 刷新」。' }),
+      ]));
+    } else {
+      // 首屏只留一句：用户明确要求"只留 危险操作 抹盘/格式化/删卷会永久销毁数据"。
+      status.append(h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill.danger', { text: '危险操作' }),
+        h('span.hint', { text: ' 抹盘 / 格式化 / 删卷会永久销毁数据。' }),
+      ]));
+    }
+
+    // 「申请授权」：只有真机有人在屏幕前 + 真的有外接卷时才可点（后端预检同一套判据）。
+    status.append(authRow(va));
+    status.append(guidanceDetails(data));
+  }
+
+  // authRow 是「申请授权」按钮 + 它此刻的真实状态。
+  //
+  // 读外接卷会让 macOS 弹授权询问，而弹窗只有**有人坐在屏幕前**点了才有用（铁律 12）——
+  // 所以没盘 / 没人在场时按钮禁用并写明原因，不让它看起来能用。
+  function authRow(va) {
+    const hasVolumes = Number(va && va.count) > 0;
+    const hasSession = !!(va && va.has_console_session);
+    const disabled = !hasVolumes || !hasSession;
+    const why = !hasVolumes
+      ? '先接上外接硬盘'
+      : (hasSession ? '' : '现在没人在机器前，弹窗没人点；请到真机操作，或按下面的路径手动授权');
+    const btn = h('button.btn.btn-sm', {
+      text: '🔓 申请授权',
+      disabled,
+      title: disabled ? why : '面板会读一次外接盘，让 macOS 弹窗询问',
+      onclick: () => requestAuth(btn),
+    });
+    return h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      btn,
+      h('span.hint', {
+        text: disabled ? why
+          : '点一下，面板会读一次外接盘，让 macOS 弹窗询问；请在这台机器的屏幕上点「允许」。',
+      }),
+    ]);
+  }
+
+  // requestAuth 先二次确认再提交任务（202 + task_id，进度走 SSE），结果由 onDone 展示。
+  // 二次确认是必须的：弹窗只有人在这台机器前点了才有用，用户得先确认"我准备好点弹窗了"。
+  // 取消 = 什么都不做（不发请求、不建任务）；后端也要求 body.confirm=true，不靠前端自觉。
+  async function requestAuth(btn) {
+    const ok = await confirmBox(
+      '接下来系统会弹出「想要访问可移除宗卷上的文件」——请在这台机器的屏幕上点「允许」。\n'
+      + '你现在不在那台机器前的话，先别继续：没人点，系统会把它记成拒绝。',
+      { title: '申请访问外接盘授权', okText: '我准备好了' });
+    if (!ok) return;
+    btn.disabled = true;
+    btn.textContent = '申请中…';
+    await taskCenter.start({
+      kind: 'disk_volume_auth',
+      target: 'disk-volume-auth',
+      title: '申请访问外接盘授权',
+      start: () => api.post(apiURL('system/disks/volume-auth'), { confirm: true }),
+      onDone: afterDiskTask,
+    });
+    // 提交失败 / 已有同名任务在跑（start 直接返回它的 id，不会回调 onDone）都要能再点。
+    btn.disabled = false;
+    btn.textContent = '🔓 申请授权';
+  }
+
+  // guidanceDetails 把"读不到盘怎么办 / 文件系统怎么选 / 非 root"收进折叠项（文案纪律）。
+  // 授权两条路径与后端（api_files.go 的 TCC 指引）是同一份事实：弹窗点允许 / 系统设置里加。
+  function guidanceDetails(data) {
     const det = h('details', { style: { marginTop: '8px' } });
     det.append(h('summary', { text: '说明（外接盘读不到 / 文件系统怎么选 / 面板权限）' }));
     const inner = h('div', { style: { marginTop: '6px' } });
 
-    // ① 读不到外接盘 = macOS 隐私保护，两条授权路径。
     inner.append(h('div', [
-      h('strong', { text: '文件管理读不到这块盘？' }),
-      h('div.hint', { text: 'macOS 隐私保护（可移除宗卷）拦住了面板。放行两条路：'
-        + '① 系统弹窗问「想要访问可移除宗卷上的文件」时点「允许」；'
-        + '② 系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 把 ' + panelBin()
-        + ' 打开（这块盘还要给站点/镜像站用，就把 nginx 也打开）。'
-        + '面板已用固定证书签名，所以授权一次之后升级不用再授。' }),
+      h('strong', { text: '读不到这块盘？' }),
+      h('div.hint', { text: 'macOS 隐私保护（可移除宗卷）挡住了面板。两条路：'
+        + '① 点「申请授权」后系统会弹「…想要访问可移除宗卷上的文件」，在这台机器的屏幕上点「允许」即可；'
+        + '② 没弹窗的话，去 系统设置 → 隐私与安全性 → 完全磁盘访问权限，把 ' + panelBin()
+        + ' 打开（这块盘还要给站点/镜像站用，就把 nginx 也打开）。' }),
+      h('div.hint', { text: '授权跟二进制绑定：正式包已用固定证书签名，升级通常不用再授；万一又被拦，再授一次即可。' }),
     ]));
 
-    // ② 文件系统取舍（做镜像盘/备份盘时才有用）。
-    const fss = data.filesystems || [];
+    // 文件系统取舍（做镜像盘/备份盘时才有用）。
+    const fss = (data && data.filesystems) || [];
     if (fss.length) {
       const ul = h('ul.zp-notes-list');
       fss.forEach((f) => ul.append(h('li', [
@@ -159,22 +237,29 @@ export function DisksView(content, ctx = {}) {
       inner.append(h('div', { style: { marginTop: '6px' } }, [h('strong', { text: '格式化时文件系统怎么选' }), ul]));
     }
 
-    // ③ 面板权限：非 root 时写操作会如实失败（不谎报）。
-    if (!data.is_root) {
+    // 面板权限：非 root 时写操作会如实失败（不谎报）。
+    if (data && !data.is_root) {
       inner.append(h('div', { style: { marginTop: '6px' } }, [
         h('span.pill.warn', { text: '面板非 root' }),
         h('span.hint', { text: ' 抹盘/格式化/建卷/删卷会因权限失败并如实报错；正式面板以 root 运行时可执行。' }),
       ]));
     }
     det.append(inner);
-    status.append(det);
+    return det;
   }
 
   function renderList(data) {
     clear(listBox);
     const groups = data.list || [];
     if (!groups.length) {
-      listBox.append(h('div.card', [h('div.card-body', [h('div.hint', { text: '没有读到任何磁盘。' })])]));
+      // 空状态已经在上面的卡片里说过了（"您当前没有外接磁盘"），这里不再堆一句重复的话。
+      // 只有"diskutil 没列外接设备、但确实检测到非系统卷"时才补一句，别把"没显示"当"没有"。
+      const va = data.volume_auth || {};
+      if (Number(va.count) > 0) {
+        listBox.append(h('div.card', [h('div.card-body', [
+          h('div.hint', { text: 'diskutil 没有列出外接设备，但有非系统卷：' + (va.mounts || []).join('、') }),
+        ])]));
+      }
       return;
     }
     groups.forEach((g) => listBox.append(diskCard(g)));

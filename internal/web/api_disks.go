@@ -20,6 +20,8 @@ package web
 //    这里**禁止**出现任何"弹 GUI 授权窗、要人在屏幕上点一下"的脚本或提权 API
 //    （具体黑名单在 api_disks_test.go 的 diskForbiddenGUIs，有门禁 grep 锁死）——
 //    无头机器上它们会**永久挂起**，比失败更糟。有测试 grep 源码锁死。
+//    唯一的例外是用户**主动**点的「申请授权」（api_disks_ops.go）：它读一次外接卷、
+//    可能触发 macOS 的 TCC 询问，但同步预检保证"没人在屏幕前就一个字节都不读"（铁律 12）。
 // 5. **需要人工介入的操作明确拒绝**：加密卷处于 Locked 时解锁要口令/钥匙串，
 //    无头环境下不可用 → 409 + 人话说明，绝不静默挂起。
 // 6. 每条 `diskutil` 都带超时，stderr 原文进错误；超时/失败后**一律回读真实状态**
@@ -47,6 +49,7 @@ import (
 	"unicode"
 
 	"github.com/zizdog/zizpanel/internal/config"
+	"github.com/zizdog/zizpanel/internal/files"
 )
 
 // ---------- 可注入的执行器（沿用本仓库的包级测试钩子风格，不动 Server 结构体） ----------
@@ -65,6 +68,51 @@ var (
 	diskInitTimeout  = 60 * time.Second
 	diskInfoParallel = 6
 )
+
+// 「申请授权」按钮要用的三个入口，全部做成包级变量：
+//   - 前两个是**只读判据**（有没有人在屏幕前 / 有没有非系统卷），不读卷内容、不弹窗；
+//   - 第三个才是"读一次外接卷"（会弹窗），只在任务体里、且同步预检通过后才调用。
+//
+// 做成变量是为了单测能造出"有人在/没人/有盘/没盘"四种情形，**不碰用户真实的外接盘**。
+var (
+	diskVolumeAuthConsoleUserFn = files.ConsoleUser
+	diskVolumeAuthMountsFn      = files.NonSystemVolumeMounts
+	diskVolumeAuthRequestFn     = files.RequestVolumeAuthorizationNow
+)
+
+// diskVolumeAuthView 是「申请授权」按钮看到的真实状态（下发进 GET /system/disks）。
+//
+// 刻意**不包含**"盘读得到吗"：那要读卷，读了就会触发系统弹窗，而铁律 12 不允许
+// 面板在没人在场时碰外接卷。所以这里只给两个不碰卷的判据，前端据此决定按钮能不能点。
+type diskVolumeAuthView struct {
+	Mounts            []string `json:"mounts"`
+	Count             int      `json:"count"`
+	ConsoleUser       string   `json:"console_user"`
+	HasConsoleSession bool     `json:"has_console_session"`
+}
+
+// diskVolumeAuthState 采集按钮判据（不读任何卷）。
+func diskVolumeAuthState() diskVolumeAuthView {
+	mounts := diskVolumeAuthMountsFn()
+	if mounts == nil {
+		mounts = []string{}
+	}
+	cu := strings.TrimSpace(diskVolumeAuthConsoleUserFn())
+	return diskVolumeAuthView{
+		Mounts: mounts, Count: len(mounts), ConsoleUser: cu,
+		HasConsoleSession: diskConsoleSessionOK(cu),
+	}
+}
+
+// diskConsoleSessionOK 判断控制台用户是不是"真有人坐在屏幕前"。
+// 空串（没有登录会话）、root（登录窗口）、loginwindow 都不是 —— 此时弹窗没人点。
+func diskConsoleSessionOK(user string) bool {
+	switch strings.TrimSpace(user) {
+	case "", "root", "loginwindow":
+		return false
+	}
+	return true
+}
 
 // errDiskTimeout 是"命令被我们主动掐掉"的哨兵错误（区别于 diskutil 自己失败）。
 var errDiskTimeout = errors.New("diskutil 命令超时")
@@ -1034,7 +1082,9 @@ type diskListView struct {
 	// 外接盘被 macOS 隐私保护拒绝时，只有人工给这个二进制授权才能放行
 	// （换挂载点没用 —— 见 api_files.go 顶部 2026-09-19 的实测结论）。
 	PanelBinary string `json:"panel_binary"`
-	CollectedAt string `json:"collected_at"`
+	// VolumeAuth 是「申请授权」按钮的同步预检结论（不读盘：有没有外接卷、有没有人在屏幕前）。
+	VolumeAuth  diskVolumeAuthView `json:"volume_auth"`
+	CollectedAt string             `json:"collected_at"`
 }
 
 func (s *diskSnapshot) view() diskListView {
@@ -1132,6 +1182,8 @@ func (s *Server) handleDiskList(w http.ResponseWriter, r *http.Request) {
 	// 与文件管理里的 TCC 指引用**同一个**来源（见 api_files.go 的 panelBinaryForGuide）：
 	// 两处各算一次是"同一事实两个来源"，非默认安装时必然写出两个不同路径。
 	v.PanelBinary = panelBinaryForGuide
+	// 按钮状态每次都重新采（不进 15 秒快照缓存）：人可能刚走开/刚插上盘。
+	v.VolumeAuth = diskVolumeAuthState()
 	ok(w, v)
 }
 

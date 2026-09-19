@@ -208,3 +208,57 @@ func TestVolumeAuthMarkerPathIsInsideDataDir(t *testing.T) {
 		t.Errorf("标记路径应为 %q，实际 %q", want, got)
 	}
 }
+
+// ---------- 按需入口（用户点「申请授权」） ----------
+
+// TestRequestVolumeAuthorizationNowNoConsoleSessionNeverReads：按需入口守着同一条铁律 ——
+// 没人在屏幕前时一个字节都不读（它没有一次性标记可依赖，全靠这条预检）。
+func TestRequestVolumeAuthorizationNowNoConsoleSessionNeverReads(t *testing.T) {
+	for _, consoleUser := range []string{"", "root", "loginwindow"} {
+		calls := stubVolumeAuth(t, consoleUser, []string{"/Volumes/Ext"}, nil)
+
+		res := RequestVolumeAuthorizationNow(context.Background(), time.Second, nil)
+
+		if !res.Skipped {
+			t.Errorf("控制台用户 %q 时按需入口必须 Skipped，实际 %+v", consoleUser, res)
+		}
+		if *calls != 0 {
+			t.Errorf("控制台用户 %q 时按需入口也绝不许碰外接卷，实际读了 %d 次", consoleUser, *calls)
+		}
+		if len(res.Attempted) != 0 {
+			t.Errorf("控制台用户 %q 时不该有「被拒」记录，实际 %v", consoleUser, res.Attempted)
+		}
+		if res.MarkerConsumed {
+			t.Errorf("控制台用户 %q 时按需入口不该报告消费标记（它根本没有标记语义）", consoleUser)
+		}
+	}
+}
+
+// TestRequestVolumeAuthorizationNowNoExternalVolumeDoesNotRead：没盘就不读。
+func TestRequestVolumeAuthorizationNowNoExternalVolumeDoesNotRead(t *testing.T) {
+	calls := stubVolumeAuth(t, "zizdog", nil, nil)
+
+	res := RequestVolumeAuthorizationNow(context.Background(), time.Second, nil)
+	if !res.Skipped {
+		t.Errorf("没有外接卷时按需入口应 Skipped，实际 %+v", res)
+	}
+	if *calls != 0 {
+		t.Errorf("没有外接卷时不该读任何东西，实际读了 %d 次", *calls)
+	}
+}
+
+// TestRequestVolumeAuthorizationNowReadsWhenSomeoneIsPresent：有人在 + 有盘 → 才真的读。
+func TestRequestVolumeAuthorizationNowReadsWhenSomeoneIsPresent(t *testing.T) {
+	calls := stubVolumeAuth(t, "zizdog", []string{"/Volumes/A", "/Volumes/B"}, nil)
+
+	res := RequestVolumeAuthorizationNow(context.Background(), time.Second, nil)
+	if len(res.Okay) != 2 || len(res.Attempted) != 0 {
+		t.Errorf("两个卷都读得通时应全部记为 Okay，实际 %+v", res)
+	}
+	if *calls != 2 {
+		t.Errorf("应恰好读两次（每卷一次），实际 %d 次", *calls)
+	}
+	if res.Skipped || res.MarkerConsumed {
+		t.Errorf("按需入口不该有一次性标记语义，实际 %+v", res)
+	}
+}

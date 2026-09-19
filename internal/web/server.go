@@ -63,7 +63,7 @@ type Server struct {
 	mktBrewVer map[string]string
 	// mktBrewOK 表示 mktBrew 这一次是**真的探测成功**的结论（而不是"brew 探测失败
 	// 时返回的空集合"）。二者必须分开：把失败的空集合当成"这台机器什么都没装"，
-	// 会让全部只靠 brew 证据的条目一起显示「安装」（2026-09-23 用户报障的那一类）。
+	// 会让全部只靠 brew 证据的条目一起显示「安装」（用户报障的那一类）。
 	// false 时缓存按 marketProbeMissTTL 很快重试，且前端会如实标"未复核"。
 	mktBrewOK   bool
 	mktBrewAt   time.Time
@@ -226,11 +226,14 @@ func (s *Server) routes() http.Handler {
 	// 所以会优先命中（见 api_systemsettings_lan.go）。
 	root.HandleFunc("POST /api/v1/system/settings/lan-preauth", s.requireAuth(s.handleLANPreauth))
 	root.HandleFunc("POST /api/v1/system/settings/{action}", s.requireAuth(s.handleSystemSettingsAction))
-	// 磁盘工具（见 api_disks.go / api_disks_ops.go）：只读枚举 + 挂载/卸载 +
+	// 磁盘管理（见 api_disks.go / api_disks_ops.go）：只读枚举 + 挂载/卸载 +
 	// 开机自动挂载 + 非系统盘的抹盘/格式化/建卷/删卷/重命名。
 	// 全部 requireAuth；写操作另有 CSRF 双提交（requireAuth 内统一处理）。
 	// 系统盘相关设备一律 403，且被拒时不会执行任何 diskutil 写命令。
 	root.HandleFunc("GET /api/v1/system/disks", s.requireAuth(s.handleDiskList))
+	// 「申请授权」：读了外接卷才会让 macOS 弹窗，所以同步预检不通过就当场 4xx，
+	// 通过才走任务中心（见 api_disks_ops.go 的 handleDiskVolumeAuthRequest）。
+	root.HandleFunc("POST /api/v1/system/disks/volume-auth", s.requireAuth(s.handleDiskVolumeAuthRequest))
 	root.HandleFunc("POST /api/v1/system/disks/{id}/mount", s.requireAuth(s.handleDiskMount))
 	root.HandleFunc("POST /api/v1/system/disks/{id}/unmount", s.requireAuth(s.handleDiskUnmount))
 	root.HandleFunc("POST /api/v1/system/disks/{id}/auto-mount", s.requireAuth(s.handleDiskAutoMount))
