@@ -2051,6 +2051,33 @@ func Catalog() []App {
     restart: unless-stopped`),
 			DocsURL: "https://github.com/GoogleChromeLabs/squoosh",
 		},
+		{
+			ID: "hivision-idphotos", Name: "HivisionIDPhotos（AI 证件照）", Icon: "🪪",
+			UI: &AppUI{
+				Slug: "hivision-idphotos",
+				// 镜像的 CMD 没传 --root_path，Gradio 挂子路径未验证 → 让用户直连端口。
+				PreferDirect: true,
+				Note:         "Gradio 子路径未验证（镜像未传 --root_path），请用直连端口 http://<本机IP>:7860/ 打开",
+			},
+			Summary:     "AI 证件照（抠图换底 / 排版 / API）",
+			Description: "上传人像自动抠图、换底色，生成标准与高清证件照，支持排版和 HTTP API。",
+			Category:    CategoryAI, Kind: KindCompose, DockerReference: true, Port: 7860,
+			HealthPath: "/",
+			Requires:   []Requirement{{Type: "docker", Hint: "需要安装 Docker 运行时（Colima）"}},
+			// 两条原生路都不存在（Releases 16 个 tag 资产数全为 0、无 brew formula），
+			// 只能 Docker；官方镜像自带 linux/arm64。下载点与完整证据写在
+			// market_downloads.go 的声明里（审计从这里读）。
+			ComposeYAML: composeTemplate("hivision-idphotos", "linzeyi/hivision_idphotos:v1.3.1", 7860, 7860, `
+    # 端口映射（宿主 7860 → 容器 7860），与上游 README 的 docker run -p 7860:7860 一致。
+    # 模型权重（5 个 onnx，约 561 MB）已在镜像里，起容器后不需要联网下模型，也不需要 GPU。
+    # 想要 HTTP API（容器内 8080）就打开下面这行；8080 是本项目 IOPaint 的保留端口，
+    # 宿主侧要另选端口（例如把上面的映射改成 "8086:8080"）。
+    # command: python3 deploy_api.py
+    restart: unless-stopped`),
+			PostInstallHint: "取走 compose 自己 `docker compose up -d`，浏览器打开 http://<本机IP>:7860/ 即可。" +
+				"镜像约 917 MiB（已含全部模型权重），首次拉取较慢；起完不需要再联网下模型。",
+			DocsURL: "https://github.com/Zeyi-Lin/HivisionIDPhotos",
+		},
 	}
 }
 

@@ -1051,6 +1051,28 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
+	{
+		ID: "hivision-idphotos", Kind: KindCompose, ComposeImage: "linzeyi/hivision_idphotos:v1.3.1",
+		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
+		Note: "上游是 Python 项目（FastAPI + Gradio）：GitHub Releases 的 16 个 release **资产数全是 0**" +
+			"（只有 pretrained-model 那个 tag 带 4 个 onnx/mnn 模型权重，不是可执行产物），" +
+			"homebrew-core 也没有对应 formula —— 两条原生路都不存在，只能 Docker。" +
+			"官方镜像把 5 个 onnx 权重（约 561 MB）在 CI 里 build 前下好并 COPY 进镜像" +
+			"（.github/workflows/build-image.yml + 无 .dockerignore），所以运行期**不需要**再联网下模型、" +
+			"也不需要 GPU（onnxruntime CPU）。固定 v1.3.1（与 latest 是同一份镜像，但不跟 tag 漂）",
+		Downloads: []MarketDownloadPoint{
+			dockerImagePoint("linzeyi/hivision_idphotos:v1.3.1", 30*time.Minute,
+				nasMirrored("docker"),
+				"arm64 证据（2026-09-19 本机实测；registry-1.docker.io 直连超时，经内置加速源 dockerproxy.net "+
+					"读同一份 OCI index）：`curl -H 'Accept: application/vnd.oci.image.index.v1+json' "+
+					"https://dockerproxy.net/v2/linzeyi/hivision_idphotos/manifests/v1.3.1` → "+
+					"index 里有 linux/amd64 与 **linux/arm64**（arm64 digest sha256:2b9de4f2…，与 `latest` 的 arm64 "+
+					"是同一个 digest；另有 2 个 unknown/unknown 的 buildkit attestation）。"+
+					"arm64 层合计 961,738,893 B（约 917 MiB，最大一层 504,326,826 B 是 COPY . . 带进去的模型权重）；"+
+					"**完整体积与完整 pull 未实测**（30 min 超时按同量级的 stirling-pdf/immich 取的）"),
+		},
+	},
+
 	// ---------------- GitHub release 原生二进制 ----------------
 
 	{
