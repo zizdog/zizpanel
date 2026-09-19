@@ -134,7 +134,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   padding: 9px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border);
   background: linear-gradient(180deg, var(--panel-2), color-mix(in srgb, var(--panel-2) 88%, var(--bg)));
   cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
-  /* 动效克制：只加一点位移与阴影，不改变版式（用户 2026-09-22：UI 太"生硬"） */
+  /* 动效克制：只加一点位移与阴影，不改变版式（用户：UI 太"生硬"） */
   transition: background .18s ease, border-color .18s ease, color .18s ease,
     transform .12s ease, box-shadow .18s ease;
 }
@@ -198,7 +198,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 /* ---------- 卡片 ---------- */
 .card {
-  /* 轻微渐变 + 阴影：让卡片有层次，而不是一块纯色（用户 2026-09-22："太生硬"）。
+  /* 轻微渐变 + 阴影：让卡片有层次，而不是一块纯色（用户："太生硬"）。
      渐变幅度刻意压到几乎看不出色带，只做层次。 */
   background: linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--panel) 94%, var(--bg)));
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -425,7 +425,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .banner-warn strong { color: var(--warn); }
 
 /* ==========================================================================
-   动效与渐变（2026-09-22 用户："整个面板的 ui 太生硬了，加一些动画和渐变"）
+   动效与渐变（用户："整个面板的 ui 太生硬了，加一些动画和渐变"）
    原则：
    - **克制**：只有 hover / 展开 / 弹窗出现这些"有因果"的时刻才有动效，
      不动版式、不动字号、不加外部依赖；
@@ -615,7 +615,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 
 /* ==========================================================================
-   文件编辑器窗口（2026-09-23 用户要求：照宝塔那样做成"窗口 + 目录树 + 菜单栏"）
+   文件编辑器窗口（用户要求：照宝塔那样做成"窗口 + 目录树 + 菜单栏"）
    只新增，不动上面的既有规则。所有颜色走既有 CSS 变量，深浅主题自动跟随。
    ========================================================================== */
 
@@ -743,7 +743,7 @@ body.zpf-dragging { user-select: none; }
 body.zpf-dragging .zpf-win { cursor: move; }
 
 /* ==========================================================================
-   面板外壳补充：底部 footer + 侧栏折叠（2026-09-23）
+   面板外壳补充：底部 footer + 侧栏折叠（2026-09-19）
    ========================================================================== */
 .footer {
   flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -775,7 +775,7 @@ body.zp-sidebar-collapsed .nav-item > span.zp-update-dot {
 body.zp-sidebar-collapsed .sidebar-foot { display: none; }
 
 /* ==========================================================================
-   升级进度面板（检查更新页最显眼处，2026-09-23）
+   升级进度面板（检查更新页最显眼处，2026-09-19）
    --------------------------------------------------------------------------
    用户要求：下载升级包要很久，页面必须实时显示下载/安装进度，并提示
    「升级进行中，请勿退出或刷新页面」，用类似 logbox 的样式。
@@ -880,7 +880,7 @@ body.zp-sidebar-collapsed .sidebar-foot { display: none; }
 }
 
 /* ==========================================================================
-   2026-09-24 修复：进程表横向滚动 / 顶栏 2FA 状态按钮 / 设置锚点高亮
+   2026-09-19 修复：进程表横向滚动 / 顶栏 2FA 状态按钮 / 设置锚点高亮
    --------------------------------------------------------------------------
    只新增；不覆盖上面的既有规则，也不碰文件编辑器那一段。
    颜色一律用既有 CSS 变量，深浅主题自动跟随。
@@ -911,7 +911,7 @@ body.zp-sidebar-collapsed .sidebar-foot { display: none; }
 }
 
 /* ==========================================================================
-   更新说明（检查更新页横幅 / 已就绪 / 升级完成 / 确认框，2026-09-24）
+   更新说明（检查更新页横幅 / 已就绪 / 升级完成 / 确认框，）
    --------------------------------------------------------------------------
    用户要求：「面板在线更新要提示更新内容。」
    说明来自远端发布清单的外部输入，前端只做基础 Markdown 渲染
@@ -977,7 +977,7 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 .zp-notes-confirm .zp-notes { margin-top: 0; }
 
 /* ==========================================================================
-   磁盘工具（internal/web/assets/js/disks.js）
+   磁盘管理（internal/web/assets/js/disks.js）
    只加"可读性"：卡片里的分区表横排不挤、操作按钮可换行、警告块有底色。
    **刻意没有任何动效/过渡** —— 面板要求遵守 prefers-reduced-motion，
    这里干脆不引入动画，就不存在"忘了加媒体查询"的问题。
@@ -1054,7 +1054,18 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 }
 .zp-imgview-stage img { transition: none; }
 
-/* 磁盘工具：危险操作走任务中心后的"完成后回读"结果卡片。
+/* 音视频播放器（Plyr，见 assets/vendor/plyr/）：舞台限高，控件跟随面板主题色；
+   音频只占一行控件，不铺满高度。 */
+.zp-media-stage {
+  max-height: 68vh; overflow: auto;
+  border-radius: 6px; background: var(--panel-2);
+}
+.zp-media-stage .plyr { --plyr-color-main: var(--brand); width: 100%; }
+.zp-media-stage video.zp-media-el { width: 100%; max-height: 62vh; display: block; }
+.zp-media-stage audio.zp-media-el { width: 100%; }
+.zp-media-stage .plyr--audio { padding: 4px 0; }
+
+/* 磁盘管理：危险操作走任务中心后的"完成后回读"结果卡片。
    危险动作（抹盘/建卷/删卷/重命名）提交后进度与日志在任务中心里看，
    这里在页面上留一份持久的结果摘要（卷名/容量/挂载点/容器剩余空间）。 */
 .disk-task-result {

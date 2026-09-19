@@ -2,7 +2,7 @@
 //
 // 交互设计：
 //   - 面包屑 + 目录树式导航；每行显示权限/属主/大小/时间
-//   - 双击目录进入，双击文件打开编辑器（带语法高亮的简易编辑器）
+//   - 双击目录进入；双击文件按类型打开：图片→查看器、音视频→播放器、其余→编辑器
 //   - 多选 + 批量操作（删除/压缩）；上传支持拖拽与多选
 //   - 所有破坏性操作都要二次确认，删除目录必须显式勾选"递归"
 
@@ -30,6 +30,10 @@ let lastList = null;
 let selAnchor = -1;
 // visibleEntries 是最近一次渲染的可见条目顺序（键盘/范围选择都用它）。
 let visibleEntries = [];
+// rowEls / headCheckbox 是最近一次渲染的 DOM 引用：选中态靠它们**原地**改，
+// 不整表重绘 —— 重绘会让双击的第二次点击落到新节点上，dblclick 永不触发（坑：双击打不开）。
+let rowEls = [];
+let headCheckbox = null;
 // clipboard = { mode: 'copy' | 'cut', paths: string[] }
 // 只在内存里（不写 localStorage）：剪贴板内容是易失的，刷新页面后失效最不意外。
 let clipboard = null;
@@ -42,6 +46,8 @@ export function FilesView(content, ctx = {}) {
   selection = new Set();
   selAnchor = -1;
   visibleEntries = [];
+  rowEls = [];
+  headCheckbox = null;
 
   const crumbs = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', fontSize: '13px' } });
   const toolbar = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } });
@@ -199,7 +205,7 @@ export function FilesView(content, ctx = {}) {
     // 指引里提到的「磁盘 → 挂载到自定义挂载点…」直接给一个入口。
     if (isTCC) {
       box.append(h('button.btn.btn-sm', {
-        text: '🖥 打开磁盘工具…',
+        text: '🖥 打开磁盘管理…',
         style: { marginTop: '8px' },
         onclick: () => { location.hash = '#/disks'; },
       }));
@@ -356,10 +362,33 @@ export function FilesView(content, ctx = {}) {
   //   · 键盘：↑↓ 之外 —— Enter 打开选中项、Delete 删除选中项、Esc 取消选择，
   //     双击行直接打开（这是所有人的肌肉记忆，之前只有"编辑"按钮能点）。
   const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+  // 浏览器能原生解码的媒体（其余一律不假装能播，见 noPlayBody）：
+  //   视频 mp4/m4v/mov(H.264+AAC)、webm/ogv；音频 mp3/m4a/aac/wav/ogg/flac。
+  const VIDEO_EXT = /\.(mp4|m4v|mov|webm|ogv)$/i;
+  const AUDIO_EXT = /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i;
+  // 已知放不了的容器/编码：mkv/avi/wmv/flv/rmvb 等，浏览器基本解不了（坑 178）。
+  const NO_PLAY_EXT = /\.(mkv|avi|wmv|flv|rmvb|rm|mpg|mpeg|ts|m2ts|3gp|asf|wma|mka|ape|vob|f4v)$/i;
   let sortKey = 'name';   // name | size | time
   let sortDir = 1;        // 1 升序 / -1 降序
 
   function isImage(entry) { return !entry.is_dir && IMAGE_EXT.test(entry.name || ''); }
+
+  // mediaKind 判一个条目该走播放器还是"放不了"提示：video | audio | unsupported | ''。
+  function mediaKind(entry) {
+    if (entry.is_dir) return '';
+    const n = entry.name || '';
+    if (VIDEO_EXT.test(n)) return 'video';
+    if (AUDIO_EXT.test(n)) return 'audio';
+    if (NO_PLAY_EXT.test(n)) return 'unsupported';
+    return '';
+  }
+
+  // openLabel 是列表按钮与右键菜单的动词：媒体不能写"编辑"（以前点开是乱码）。
+  function openLabel(entry) {
+    if (entry.is_dir) return '打开';
+    if (isImage(entry)) return '查看';
+    return mediaKind(entry) ? '播放' : '编辑';
+  }
 
   function sortedEntries(list) {
     const arr = list.slice();
@@ -390,9 +419,11 @@ export function FilesView(content, ctx = {}) {
     ]);
   }
 
-  // openAny 是按文件类型选动作的唯一入口：图片 → 预览，其余 → 文本编辑器。
+  // openAny 是按文件类型选动作的唯一入口：图片 → 预览，音视频 → 播放器，其余 → 文本编辑器。
   function openAny(entry) {
+    const kind = mediaKind(entry);
     if (isImage(entry)) previewImage(entry);
+    else if (kind) previewMedia(entry, kind);
     else openEditor(entry);
   }
 
@@ -471,6 +502,91 @@ export function FilesView(content, ctx = {}) {
     show(idx);
   }
 
+  // ---------- 音视频播放器（Plyr，内嵌 vendor） ----------
+  //
+  // 用户要"文件管理要能打开视频和音频文件" + "最好引入现有项目"。
+  // Plyr 见 assets/vendor/plyr/README.md；解码交给浏览器，面板不做转码。
+  function previewMedia(entry, kind) {
+    if (kind === 'unsupported') { noPlayModal(entry); return; }
+
+    // preload=metadata：只取元数据，长视频/大文件不会整份进内存。
+    const media = h(kind === 'video' ? 'video' : 'audio', {
+      class: 'zp-media-el', controls: true, playsinline: true, preload: 'metadata',
+    });
+    media.src = api.fileDownloadURL(entry.path);
+
+    const status = h('div.hint', { style: { textAlign: 'center' }, text: '正在加载播放器…' });
+    const stage = h('div.zp-media-stage', [media]);
+    let player = null;
+    let closed = false;
+    let failed = false;
+
+    // 元素报错（容器/编码浏览器解不了）→ 换成明确提示，绝不假装能播。
+    media.addEventListener('error', () => {
+      if (closed || failed) return;
+      failed = true;
+      showNoPlay(stage, status, entry, player);
+    });
+
+    const m = modal({
+      title: (kind === 'video' ? '🎬 ' : '🎵 ') + entry.name,
+      wide: true,
+      body: h('div', [stage, status]),
+      footer: () => [downloadBtn(entry), h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() })],
+      onClose: () => {
+        closed = true;
+        try { if (player) player.destroy(); } catch { /* 销毁失败不该挡住关闭 */ }
+      },
+    });
+
+    ensurePlyr().then((Plyr) => {
+      if (closed || failed) return;
+      player = new Plyr(media, PLYR_OPTIONS);
+      player.on('ready', () => { if (!closed) status.style.display = 'none'; });
+    }).catch(() => {
+      if (closed) return;
+      // Plyr 没起来也不装死：元素自带 controls，原生控件仍可播放。
+      status.textContent = '播放器皮肤没加载上，已用浏览器自带控件';
+    });
+  }
+
+  // showNoPlay 把播放器换成"放不了"提示（loaded→error 与已知不支持的格式共用）。
+  function showNoPlay(stage, status, entry, player) {
+    try { if (player) player.destroy(); } catch { /* 同上 */ }
+    clear(stage);
+    stage.appendChild(noPlayBody());
+    if (status) status.style.display = 'none';
+  }
+
+  function noPlayModal(entry) {
+    const m = modal({
+      title: entry.name,
+      body: noPlayBody(),
+      footer: () => [downloadBtn(entry), h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() })],
+    });
+  }
+
+  // noPlayBody：一句话给结论，为什么/后续能力收进折叠项（文案纪律：可见文案 ≤40 字）。
+  function noPlayBody() {
+    return h('div', [
+      h('div.hint', { style: { textAlign: 'center', padding: '18px 0' },
+        text: '浏览器不支持这个格式，请下载后用本地播放器' }),
+      h('details', { style: { maxWidth: '560px', margin: '0 auto' } }, [
+        h('summary', { text: '为什么放不了？', style: { cursor: 'pointer' } }),
+        h('div.hint', { style: { marginTop: '6px' },
+          text: '浏览器只直接解 mp4/m4v/mov/webm/ogv 与 mp3/m4a/aac/wav/ogg/flac；' +
+            'mkv/avi/wmv/flv/rmvb 等容器或 HEVC 等编码要先转码，后续可做 ffmpeg 边转边播。' }),
+      ]),
+    ]);
+  }
+
+  function downloadBtn(entry) {
+    return h('button.btn', {
+      text: '下载',
+      onclick: () => { window.location.href = api.fileDownloadURL(entry.path); },
+    });
+  }
+
   // wwwRoot 返回网站根目录（kind=www 的根），找不到就退回第一个根。
   function wwwRoot() {
     const roots = lastList?.roots || [];
@@ -527,7 +643,12 @@ export function FilesView(content, ctx = {}) {
         h('span', { text: '显示隐藏文件' }),
       ]),
       h('div', { style: { flex: 1 } }),
-      selCount > 0 ? h('span.pill.brand', { text: `已选 ${selCount} 项` }) : null,
+      // 选中相关控件**始终占位**（空选时隐藏/禁用）：一旦让工具栏因选中而换行，
+      // 列表整体下移，双击的第二下会落到别的行上（1280 宽实测打开了错误的文件）。
+      h('span.pill.brand', {
+        text: selCount ? `已选 ${selCount} 项` : '已选 0 项',
+        style: { minWidth: '78px', justifyContent: 'center', visibility: selCount ? '' : 'hidden' },
+      }),
       // 剪贴板状态与粘贴入口：用户按了 Ctrl+C/X 之后要能一眼看到"剪贴板里有什么"。
       clip ? h('button.btn.btn-sm', {
         text: `📋 粘贴 ${clip.paths.length} 项${clip.mode === 'cut' ? '（剪切）' : '（复制）'}`,
@@ -541,10 +662,73 @@ export function FilesView(content, ctx = {}) {
         title: '把当前目录里的图片压小（质量 / 最长边 / 输出格式可选；默认另存为 xxx.min.<ext>，不动原文件）',
         onclick: imageCompressModal,
       }),
-      selCount > 0 ? h('button.btn.btn-sm', { text: '打包压缩', onclick: compressSelected }) : null,
-      selCount > 0 ? h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: deleteSelected }) : null,
+      h('button.btn.btn-sm', { text: '打包压缩', disabled: selCount === 0, onclick: compressSelected }),
+      h('button.btn.btn-sm.btn-danger', { text: '删除', disabled: selCount === 0, onclick: deleteSelected }),
       h('button.btn.btn-sm', { text: '🔍 搜索', onclick: searchModal }),
     );
+  }
+
+  // 文件名不是"打开"按钮：单击只选中，双击才打开（handleRowOpen）。
+  // 文件分支绝不能调 openAny —— 否则第一次点击就弹窗，第二次点击落在遮罩上把它关掉，
+  // 用户看到的就是"双击没反应"。目录保留"单击进入"这条既有路径。
+  function nameCell(e) {
+    return h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px' } }, [
+      h('span', { text: e.is_dir ? '📁' : fileIcon(e.name), style: { fontSize: '15px' } }),
+      e.is_dir
+        ? h('a', {
+          href: 'javascript:void(0)', style: { fontWeight: '550' }, text: e.name,
+          title: '单击进入目录',
+          onclick: (ev) => { ev.stopPropagation(); load(e.path); },
+        })
+        : h('a', {
+          href: 'javascript:void(0)', text: e.name,
+          title: '双击' + openLabel(e) + '（单击只选中）',
+        }),
+      e.symlink ? h('span.pill', { text: '链接', title: '指向 ' + (e.symlink_target || '?') }) : null,
+      e.read_only ? h('span.pill.warn', { text: '只读' }) : null,
+      e.sensitive ? h('span.pill.danger', {
+        text: '敏感',
+        title: '面板数据目录（数据库与凭据）。仍可读写，但覆盖/删除前会二次确认。',
+      }) : null,
+    ]);
+  }
+
+  // 行单击：只改选中态，**不整表重绘**。重绘会让 dblclick 的第二次点击落到新节点上，
+  // 浏览器就不发 dblclick 了 —— 这是"双击打不开"的直接原因。
+  function handleRowClick(e, idx, ev) {
+    if (ev.target && ev.target.closest('button, input')) return;
+    if (ev.shiftKey && selAnchor >= 0) {
+      selectRange(selAnchor, idx);
+    } else if (ev.ctrlKey || ev.metaKey) {
+      if (selection.has(e.path)) selection.delete(e.path); else selection.add(e.path);
+      selAnchor = idx;
+    } else {
+      selection = new Set([e.path]);
+      selAnchor = idx;
+    }
+    syncSelectionUI();
+    renderToolbar();
+  }
+
+  // 行双击：文件走 openAny（图片查看器 / 播放器 / 编辑器同一入口），目录进入。
+  function handleRowOpen(e) {
+    if (e.is_dir) load(e.path); else openAny(e);
+  }
+
+  // 选中态原地同步（行 class/底色 + 复选框），替代整表重绘。
+  function syncSelectionUI() {
+    rowEls.forEach((tr, i) => {
+      const e = visibleEntries[i];
+      if (!tr || !e) return;
+      const on = selection.has(e.path);
+      tr.classList.toggle('zp-row-selected', on);
+      tr.style.background = on ? 'var(--brand-soft)' : '';
+      const cb = tr.querySelector('input[type=checkbox]');
+      if (cb) cb.checked = on;
+    });
+    if (headCheckbox) {
+      headCheckbox.checked = visibleEntries.length > 0 && visibleEntries.every((e) => selection.has(e.path));
+    }
   }
 
   function renderTable() {
@@ -552,6 +736,8 @@ export function FilesView(content, ctx = {}) {
     const list = lastList?.entries || [];
     if (!list.length) {
       visibleEntries = [];
+      rowEls = [];
+      headCheckbox = null;
       appendAll(tableBox, h('div.empty', [
         h('div.big', { text: '📂' }),
         h('h4', { text: '这个目录是空的' }),
@@ -563,20 +749,20 @@ export function FilesView(content, ctx = {}) {
 
     const ordered = sortedEntries(list);
     visibleEntries = ordered;
+    rowEls = [];
     const allChecked = ordered.length > 0 && ordered.every((e) => selection.has(e.path));
+    headCheckbox = h('input', {
+      type: 'checkbox', checked: allChecked,
+      title: '全选 / 取消全选（Ctrl+A）',
+      onchange: (e) => {
+        selection.clear();
+        if (e.target.checked) ordered.forEach((x) => selection.add(x.path));
+        selAnchor = -1;
+        renderToolbar(); renderTable();
+      },
+    });
     const head = h('tr', [
-      h('th', { style: { width: '34px' } }, [
-        h('input', {
-          type: 'checkbox', checked: allChecked,
-          title: '全选 / 取消全选（Ctrl+A）',
-          onchange: (e) => {
-            selection.clear();
-            if (e.target.checked) ordered.forEach((x) => selection.add(x.path));
-            selAnchor = -1;
-            renderToolbar(); renderTable();
-          },
-        }),
-      ]),
+      h('th', { style: { width: '34px' } }, [headCheckbox]),
       sortHeader('name', '名称'),
       sortHeader('size', '大小'),
       h('th', { text: '权限' }),
@@ -587,33 +773,21 @@ export function FilesView(content, ctx = {}) {
 
     const rows = ordered.map((e, idx) => {
       const selected = selection.has(e.path);
-      return h('tr', {
+      const tr = h('tr', {
         class: selected ? 'zp-row-selected' : '',
         style: selected ? { background: 'var(--brand-soft)' } : {},
-        // 单击 = 选择（Ctrl/⌘ 切换、Shift 范围），双击 = 打开。
-        // 这是所有文件管理器的通用肌肉记忆，之前只有"编辑"按钮能点。
-        onclick: (ev) => {
-          if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.closest('button, a, input'))) return;
-          if (ev.shiftKey && selAnchor >= 0) {
-            selectRange(selAnchor, idx);
-          } else if (ev.ctrlKey || ev.metaKey) {
-            if (selection.has(e.path)) selection.delete(e.path); else selection.add(e.path);
-            selAnchor = idx;
-          } else {
-            selection = new Set([e.path]);
-            selAnchor = idx;
-          }
-          renderToolbar(); renderTable();
-        },
+        // 单击 = 选择（Ctrl/⌘ 切换、Shift 范围），双击 = 打开（handleRowOpen）。
+        // 单击处理器只原地切选中态：整表重绘会让第二次点击落到新节点上，dblclick 永不触发。
+        onclick: (ev) => handleRowClick(e, idx, ev),
         // 右键：文件/文件夹行的上下文菜单（按类型禁用不适用项）
         oncontextmenu: (ev) => {
           ev.preventDefault();
-          if (!selection.has(e.path)) { selection = new Set([e.path]); selAnchor = idx; renderToolbar(); renderTable(); }
+          if (!selection.has(e.path)) { selection = new Set([e.path]); selAnchor = idx; renderToolbar(); syncSelectionUI(); }
           rowContextMenu(ev.clientX, ev.clientY, e);
         },
         ondblclick: (ev) => {
           if (ev.target && ev.target.closest('input')) return; // 别抢勾选框
-          if (e.is_dir) load(e.path); else openAny(e);
+          handleRowOpen(e);
         },
       }, [
         h('td', [
@@ -626,27 +800,7 @@ export function FilesView(content, ctx = {}) {
             },
           }),
         ]),
-        h('td', [
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: '7px' } }, [
-            h('span', { text: e.is_dir ? '📁' : fileIcon(e.name), style: { fontSize: '15px' } }),
-            e.is_dir
-              ? h('a', {
-                href: 'javascript:void(0)', style: { fontWeight: '550' }, text: e.name,
-                onclick: () => load(e.path),
-              })
-              : h('a', {
-                href: 'javascript:void(0)', text: e.name,
-                title: isImage(e) ? '点击查看' : '点击编辑（双击也可以）',
-                onclick: () => openAny(e),
-              }),
-            e.symlink ? h('span.pill', { text: '链接', title: '指向 ' + (e.symlink_target || '?') }) : null,
-            e.read_only ? h('span.pill.warn', { text: '只读' }) : null,
-            e.sensitive ? h('span.pill.danger', {
-              text: '敏感',
-              title: '面板数据目录（数据库与凭据）。仍可读写，但覆盖/删除前会二次确认。',
-            }) : null,
-          ]),
-        ]),
+        h('td', [nameCell(e)]),
         h('td.num', { text: e.is_dir ? '—' : humanSize(e.size) }),
         h('td.mono', { style: { fontSize: '11.5px' }, text: String(e.mode_num.toString(8)).padStart(3, '0') }),
         h('td', { style: { fontSize: '11.5px' }, text: e.owner || '—' }),
@@ -656,7 +810,7 @@ export function FilesView(content, ctx = {}) {
             e.is_dir
               ? h('button.btn.btn-sm', { text: '打开', onclick: () => load(e.path) })
               : h('button.btn.btn-sm', {
-                text: isImage(e) ? '查看' : '编辑',
+                text: openLabel(e),
                 onclick: () => openAny(e),
               }),
             h('button.btn.btn-sm', {
@@ -668,6 +822,8 @@ export function FilesView(content, ctx = {}) {
           ]),
         ]),
       ]);
+      rowEls.push(tr);
+      return tr;
     });
 
     appendAll(tableBox, h('table.table', [h('thead', [head]), h('tbody', rows)]));
@@ -740,10 +896,11 @@ export function FilesView(content, ctx = {}) {
 
     const items = [
       {
-        label: e.is_dir ? '打开' : (isImage(e) ? '查看' : '编辑'),
+        label: openLabel(e),
         run: () => (e.is_dir ? load(e.path) : openAny(e)),
       },
-      !e.is_dir && !isImage(e) ? { label: '用编辑器打开', run: () => openEditor(e) } : null,
+      // 媒体不走文本编辑器（点开就是乱码/二进制提示），只留播放与下载。
+      !e.is_dir && !isImage(e) && !mediaKind(e) ? { label: '用编辑器打开', run: () => openEditor(e) } : null,
       { label: '下载', disabled: e.is_dir || multi, run: () => { window.location.href = api.fileDownloadURL(e.path); } },
       archive ? { label: '解压到当前目录', run: () => extractEntry(e) } : null,
       { sep: true },
@@ -2064,17 +2221,17 @@ const CM_CORE_JS = [
   'addon/comment/comment.min.js',
 ];
 
-const cmAssetLoaded = new Set();
-let cmCorePromise = null;
+// 内嵌资源通用加载器（CodeMirror 与 Plyr 共用）：注入 <script>/<link>，同一 URL 只加载一次。
+const assetLoaded = new Set();
 
-function cmLoadOne(url, isCss) {
-  if (cmAssetLoaded.has(url)) return Promise.resolve();
+function loadAssetOnce(url, isCss) {
+  if (assetLoaded.has(url)) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const el = isCss
       ? Object.assign(document.createElement('link'), { rel: 'stylesheet', href: url })
       : Object.assign(document.createElement('script'), { src: url, async: false });
-    el.onload = () => { cmAssetLoaded.add(url); resolve(); };
-    el.onerror = () => reject(new Error('加载编辑器资源失败：' + url));
+    el.onload = () => { assetLoaded.add(url); resolve(); };
+    el.onerror = () => reject(new Error('加载内嵌资源失败：' + url));
     document.head.appendChild(el);
   });
 }
@@ -2084,9 +2241,9 @@ function cmLoadOne(url, isCss) {
 function ensureCodeMirror() {
   if (!cmCorePromise) {
     cmCorePromise = (async () => {
-      for (const f of CM_CORE_CSS) await cmLoadOne(new URL(f, CM_ASSET_BASE).href, true);
+      for (const f of CM_CORE_CSS) await loadAssetOnce(new URL(f, CM_ASSET_BASE).href, true);
       // 顺序加载 JS：插件依赖全局 CodeMirror，异步并行会让插件先于本体执行
-      for (const f of CM_CORE_JS) await cmLoadOne(new URL(f, CM_ASSET_BASE).href, false);
+      for (const f of CM_CORE_JS) await loadAssetOnce(new URL(f, CM_ASSET_BASE).href, false);
       if (!window.CodeMirror) throw new Error('CodeMirror 已加载但没有挂上 window.CodeMirror');
       ensureEditorStyle();
     })().catch((e) => { cmCorePromise = null; throw e; });
@@ -2099,8 +2256,39 @@ async function ensureLang(langKey) {
   const def = CM_LANGS[langKey];
   if (!def) return;
   for (const m of def.deps) {
-    await cmLoadOne(new URL(`mode/${m}.min.js`, CM_ASSET_BASE).href, false);
+    await loadAssetOnce(new URL(`mode/${m}.min.js`, CM_ASSET_BASE).href, false);
   }
+}
+
+// ---------------- 播放器按需加载（Plyr） ----------------
+//
+// 与 CodeMirror 同一套做法：真点开音视频才注入 css/js（坑 179）。
+// 不能用 `import()`：面板把 .mjs/.js 按 MIME 直发，UMD 在 module 里拿不到 root 会崩。
+const PLYR_ASSET_BASE = new URL('../vendor/plyr/', import.meta.url);
+let plyrPromise = null;
+
+const PLYR_OPTIONS = {
+  // 图标必须指到内嵌 svg：Plyr 默认指官方 CDN，运行时绝不联网（坑 179）。
+  iconUrl: new URL('plyr.svg', PLYR_ASSET_BASE).href,
+  preload: 'metadata',
+  i18n: {
+    restart: '重播', play: '播放', pause: '暂停', seek: '跳转', volume: '音量',
+    mute: '静音', unmute: '取消静音', settings: '设置', speed: '速度',
+    normal: '正常', quality: '画质', loop: '循环', enterFullscreen: '全屏',
+    exitFullscreen: '退出全屏', pip: '画中画', played: '已播放', buffered: '已缓冲',
+  },
+};
+
+function ensurePlyr() {
+  if (!plyrPromise) {
+    plyrPromise = (async () => {
+      await loadAssetOnce(new URL('plyr.css', PLYR_ASSET_BASE).href, true);
+      await loadAssetOnce(new URL('plyr.min.js', PLYR_ASSET_BASE).href, false);
+      if (!window.Plyr) throw new Error('Plyr 已加载但没有挂上 window.Plyr');
+      return window.Plyr;
+    })().catch((e) => { plyrPromise = null; throw e; });
+  }
+  return plyrPromise;
 }
 
 // ---------------- 配色 ----------------
@@ -2151,7 +2339,7 @@ function cmThemeFor(setting) {
 
 // ensureCmTheme 按需加载官方主题 CSS（与本体一样：用到哪个才加载哪个）。
 function ensureCmTheme(name) {
-  return cmLoadOne(new URL(`theme/${name}.min.css`, CM_ASSET_BASE).href, true);
+  return loadAssetOnce(new URL(`theme/${name}.min.css`, CM_ASSET_BASE).href, true);
 }
 
 // ensureEditorStyle 注入**最小布局**样式（只注入一次）。

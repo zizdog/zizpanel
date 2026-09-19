@@ -559,7 +559,7 @@ func tccSolution() string {
 		"\n  ② 手动授权：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 " + panelBinaryForGuide +
 		" → 打开开关 → 重启面板。" +
 		"\n  这块盘还要给镜像站/站点用（nginx 直接读文件），把 nginx 的二进制也照上面加上——它自己也会弹一次窗。" +
-		"\n注意：授权跟二进制绑定。面板升级后二进制变了，可能要再授权一次（可能要再点一次弹窗）。" +
+		"\n注意：授权跟二进制绑定。正式包已用固定证书签名，升级通常不用再授；万一系统又拦，再授一次即可。" +
 		"\n注意：把卷改挂到 /Volumes 之外不能绕过——实测挂载本身成功，读它照样被拒。"
 }
 
@@ -1024,10 +1024,38 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
 			asciiFallback(name), urlEncode(name)))
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Type", downloadContentType(name))
 	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
 	http.ServeContent(w, r, name, st.ModTime(), f)
 	s.audit(r, "file_download", p, fmt.Sprintf("下载 %s", files.FormatSize(st.Size())), true, "")
+}
+
+// downloadContentType 给媒体回真实 MIME：octet-stream 会被 <video>/<audio> 拒播（坑 178）。
+// 其余文件保持 octet-stream，下载行为不变；Content-Disposition 仍是 attachment。
+func downloadContentType(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".webm":
+		return "video/webm"
+	case ".ogv":
+		return "video/ogg"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".m4a":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg", ".oga", ".opus":
+		return "audio/ogg"
+	case ".flac":
+		return "audio/flac"
+	}
+	return "application/octet-stream"
 }
 
 // asciiFallback 把文件名转成 ASCII 安全形式（非 ASCII 用 _ 替代）。
