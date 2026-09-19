@@ -210,7 +210,9 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	sources := s.resolveUpgradeSources(requested)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// 检查更新同样不随请求取消：用户点完「检查更新」就去切页面是常态，
+	// 拉清单被取消只会让他看到一句莫名的 `context canceled`（30 秒超时足够）。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 	defer cancel()
 
 	// fail closed + 多候选认证：每个候选都必须通过验签才会被采用
@@ -300,7 +302,13 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 	// 持久化用户选择是 check/设置页的职责。
 	sources := s.resolveUpgradeSources(strings.TrimSpace(req.Source))
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	// ⚠️ 不能挂在请求上下文上（`r.Context()`）：用户在下载期间刷新/切走页面
+	// 会取消 r.Context()，正在进行的下载当场变成
+	// `Get "https://…/zizpanel_1.4.1_darwin_arm64.tar.gz": context canceled`
+	//（2026-09-19 用户报的原话）。这与 AGENTS 第三节记的"任务挂在 r.Context() 上、
+	// 用户一刷新就把任务杀了"是同一类。WithoutCancel 保留请求里的值（日志/追踪），
+	// 只断开取消信号；超时仍由这里的 15 分钟兜底，upgradeMu 保证同一时刻只有一个升级任务。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Minute)
 	defer cancel()
 
 	// 保留上一次"实际命中的源"：万一这次探测失败，status 里仍能显示
