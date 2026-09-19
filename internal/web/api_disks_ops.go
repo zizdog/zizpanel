@@ -280,7 +280,14 @@ func (s *Server) executeDiskWrite(ctx context.Context, action, id, cmdLine strin
 }
 
 // failWrite 统一处理"命令失败/超时"与"回读失败"，返回给前端人话。
+// 失败也要把**动作前的卷/容量快照**记进审计（before=），便于事后追溯。
 func (s *Server) failDiskWrite(w http.ResponseWriter, r *http.Request, action, id string, res *diskOpResult, runErr, afterErr error) {
+	detail := func(msg string) string {
+		if res.BeforeState != "" {
+			return "before={" + res.BeforeState + "} " + msg
+		}
+		return msg
+	}
 	if runErr != nil {
 		base := res.Command + " 失败：" + runErr.Error()
 		if errors.Is(runErr, errDiskTimeout) {
@@ -291,19 +298,19 @@ func (s *Server) failDiskWrite(w http.ResponseWriter, r *http.Request, action, i
 		} else if res.AfterState != "" {
 			base += "。回读状态：" + res.AfterState
 		}
-		s.audit(r, action, id, base, false, "")
+		s.audit(r, action, id, detail(base), false, "")
 		fail(w, http.StatusInternalServerError, base)
 		return
 	}
 	if afterErr != nil {
 		msg := res.Command + " 已执行，但回读磁盘状态失败，**未复核**结果：" + afterErr.Error()
-		s.audit(r, action, id, msg, false, "")
+		s.audit(r, action, id, detail(msg), false, "")
 		fail(w, http.StatusInternalServerError, msg)
 		return
 	}
 	// 正常情况下不会到这里；留一个兜底，避免"什么都没发生却返回成功"。
 	msg := res.Command + " 结果未知（未复核）"
-	s.audit(r, action, id, msg, false, "")
+	s.audit(r, action, id, detail(msg), false, "")
 	fail(w, http.StatusInternalServerError, msg)
 }
 
