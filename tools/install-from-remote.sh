@@ -55,8 +55,25 @@ esac
 ok "系统：macOS $(sw_vers -productVersion)（${ARCH}）"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/zizpanel-install.XXXXXX")"
-cleanup() { rm -rf "$WORK"; }
+# 清理工作目录。**保留现场**用 ZP_KEEP_INSTALL_DIR=1（排查安装失败时要用：
+# 里面是解压好的安装包 + install.sh 的真实运行环境）。
+cleanup() {
+  if [ "${ZP_KEEP_INSTALL_DIR:-0}" = "1" ]; then
+    printf '\n安装工作目录已保留：%s\n' "$WORK"
+    return 0
+  fi
+  rm -rf "$WORK"
+}
 trap cleanup EXIT INT TERM
+
+# 顺手清掉**上一次**遗留的同名前缀目录（超过 24 小时的）。
+#
+# 为什么需要这道保险：见文件末尾 —— 老版本用 `exec` 调 install.sh，
+# trap 永远不会执行，于是每次安装都留下一个 ~96 MiB 的目录
+#（2026-09-18 真机事故：开发机上累积 1424 个、97 GB，把系统盘撑到 99%）。
+# 已经发出去的老版本装机还会留，所以新版本要能把那些陈旧残留清掉。
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'zizpanel-install.*' -type d -mtime +0 \
+  -exec rm -rf {} + 2>/dev/null || true
 
 PKG="zizpanel_${ZP_VERSION}_darwin_${PKG_ARCH}.tar.gz"
 URL="$ZP_BASE_URL/pkg/$PKG"
@@ -73,4 +90,18 @@ ok "安装包已就绪"
 
 info "开始安装（参数：$*）…"
 cd "$WORK" || die "无法进入工作目录"
-exec bash "$WORK/install.sh" "$@"
+
+# ⚠️ 这里**不能**用 `exec`。
+#
+# 老实现是 `exec bash "$WORK/install.sh" "$@"` —— exec 会把本进程**替换**掉，
+# 上面的 trap 随之消失，于是每次安装都在 $TMPDIR 留下一个 ~96 MiB 的
+# `zizpanel-install.XXXXXX`（解压好的安装包 + 沙箱 root）。
+# 2026-09-18 真机事故：开发机上累积 **1424 个、97 GB**，把系统盘撑到 99%，
+# 门禁因此报"沙箱安装失败: No space left on device"（当时还误判成代码问题）。
+#
+# 现在改成普通调用：EXIT trap 会在脚本退出时执行；退出码照原样传出去；
+# Ctrl-C 时两者同在前台进程组，信号照样能到 install.sh。
+bash "$WORK/install.sh" "$@"
+rc=$?
+cleanup   # 显式清一次（EXIT trap 兜底；ZP_KEEP_INSTALL_DIR=1 时只打印路径）
+exit "$rc"
