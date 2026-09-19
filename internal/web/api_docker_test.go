@@ -41,6 +41,9 @@ type fakeDaemon struct {
 	// logs 覆盖 /containers/{name}/logs 的返回（空 = 用默认那一行）。
 	// 用它造"日志里有初始随机口令"的场景（File Browser 就是这种）。
 	logs string
+	// pullError 非空时 /images/create 回一条 Docker 错误事件（模拟 registry 拉取失败）。
+	// 网络提示接线门禁靠它造出**真实的**拉取失败路径。
+	pullError string
 }
 
 func (f *fakeDaemon) record(r *http.Request) {
@@ -85,6 +88,19 @@ func (f *fakeDaemon) logText() string {
 	return f.logs
 }
 
+// setPullError / pullErrorText 控制拉取是否失败（失败时回 Docker 的 error 事件）。
+func (f *fakeDaemon) setPullError(msg string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullError = msg
+}
+
+func (f *fakeDaemon) pullErrorText() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pullError
+}
+
 func (f *fakeDaemon) handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -127,6 +143,14 @@ func (f *fakeDaemon) handler() http.Handler {
 			// 如果退回"读完整段响应再返回最后一行"，这些中间行就看不到了。
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(200)
+			if msg := f.pullErrorText(); msg != "" {
+				// Docker 用 error 事件报 registry 失败（DNS/超时/鉴权都走这一条）。
+				b, _ := json.Marshal(map[string]any{
+					"errorDetail": map[string]any{"message": msg}, "error": msg,
+				})
+				_, _ = w.Write(append(b, '\n'))
+				return
+			}
 			_, _ = w.Write([]byte(`{"status":"Pulling from ` + r.URL.Query().Get("fromImage") + `","id":"7"}` + "\n"))
 			_, _ = w.Write([]byte(`{"status":"Pulling fs layer","progressDetail":{},"id":"abc123def456"}` + "\n"))
 			_, _ = w.Write([]byte(`{"status":"Downloading","progressDetail":{"current":1048576,"total":50331648},"id":"abc123def456"}` + "\n"))

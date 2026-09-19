@@ -24,6 +24,78 @@ import { taskCenter } from './tasks.js';
 // 的典型来源。所以统一走"讲清后果 + 二次确认"的路径。
 const IN_USE_RE = /(being used|in use|is used by|conflict|referenced in multiple|dependent child)/i;
 
+// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
+// 文案纪律：标题一句话 ≤40 字，改镜像/代理的入口收进折叠项。
+const NET_HINT_MARKER = '面板不会替你翻墙';
+const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+const NET_HINT_ENTRIES = 'Docker 页 →「加速源」（换 docker.io 镜像源）；面板设置 → 访问与安全 →「应用包镜像基址」。';
+const NET_EVIDENCE = [
+  'could not resolve host', 'temporary failure in name resolution',
+  'name or service not known', 'no such host', 'server misbehaving',
+  'connection refused', 'connection timed out', 'connection timeout',
+  'connection reset by peer', 'no route to host', 'network is unreachable',
+  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
+  'failed to connect to', "couldn't connect to server", 'could not connect to server',
+  'dial tcp', 'dial udp',
+  'tls handshake timeout', 'tls: failed to verify certificate',
+  'tls: bad certificate', 'remote error: tls:', 'x509:',
+  'certificate signed by unknown authority', 'certificate is not valid for',
+  'client.timeout exceeded', 'request canceled while waiting for connection',
+  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
+  'curl: (56)', 'curl: (60)', 'ssl connect error',
+];
+const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
+const NET_LOCAL_OVERRIDE = ['proxyconnect'];
+
+// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
+function isNetworkFailureText(text) {
+  const msg = String(text == null ? '' : text).toLowerCase();
+  if (!msg.trim()) return false;
+  if (msg.includes(NET_HINT_MARKER)) return true;
+  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
+  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地 socket 没起来 ≠ 要翻墙
+  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
+  if (msg.includes('context deadline exceeded')
+    && (msg.includes('http://') || msg.includes('https://'))) return true;
+  return false;
+}
+
+// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
+function networkHintBlock(errText) {
+  const raw = String(errText == null ? '' : errText).trim();
+  const nodes = [
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
+      h('strong', { text: NET_HINT_ONE_LINE }),
+    ]),
+    h('details', { style: { marginTop: '6px' } }, [
+      h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
+      h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
+    ]),
+  ];
+  if (raw) {
+    nodes.push(h('div', {
+      style: {
+        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
+        color: 'var(--text-dim)', wordBreak: 'break-all',
+      },
+      text: '原始报错：' + raw,
+    }));
+  }
+  return h('div', {
+    dataset: { testid: 'zp-network-failure' },
+    style: {
+      padding: '11px 13px', background: 'var(--danger-soft)',
+      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
+      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
+    },
+  }, nodes);
+}
+
+// netFailure 保存本分区最近一次"网络类"失败（拉取任务在任务中心结束时写入）。
+// 它必须在模块级：ctx.refresh() 会重建整个分区，函数局部状态会被冲掉。
+let netFailure = '';
+
 /** tagsOf 把 RepoTags 规范化成数组。 */
 // 坑（真实发生过）：悬空镜像 <none>:<none> 的 RepoTags 在 JSON 里是 null
 // 而不是 []，直接 .map/.length 会抛 TypeError，把整个列表打成空白页 ——
@@ -84,8 +156,12 @@ export async function renderImages(container, ctx) {
 
   const listCount = h('span.pill', { text: '—' });
   const listBox = h('div');
+  // netNotice：拉取失败且判据是网络问题时，在这里显示醒目块（原文收在块里）。
+  const netNotice = h('div');
+  if (netFailure) netNotice.append(networkHintBlock(netFailure));
 
   container.append(
+    netNotice,
     h('div.card', [
       h('div.card-head', [
         h('h3', { text: '拉取 / 清理' }),
@@ -238,9 +314,14 @@ export async function renderImages(container, ctx) {
       onDone: (m) => {
         if (disposed) return;
         if (m && m.status === 'succeeded') {
+          netFailure = ''; // 这次成功了，把上一次的网络提示收掉
           const msg = (m.result && m.result.message) ? `已拉取 ${image} · ${m.result.message}` : `已拉取 ${image}`;
           toast(msg, 'ok', 8000);
           pullInput.value = '';
+        } else if (m && m.status && m.status !== 'succeeded') {
+          // 拉取是联网动作：网络类失败在本分区顶部给醒目块（非网络失败一个字都不加）。
+          const msg = m.error || m.status;
+          if (isNetworkFailureText(msg)) netFailure = msg;
         }
         ctx.refresh();
       },

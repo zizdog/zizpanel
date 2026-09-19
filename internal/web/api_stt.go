@@ -8,6 +8,11 @@ import (
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
+// sttInstallFn 是安装入口；单测注入假实现（真实安装要联网 + brew，单测不许跑）。
+var sttInstallFn = func(s *Server, ctx context.Context, app services.App, res *services.InstallResult) error {
+	return s.svcManager().InstallSTT(ctx, app, res)
+}
+
 // handleInstallSTT 安装应用市场里的「语音转文字（whisper.cpp）」。
 //
 // 四步，每一步都真的复核（不靠"上一步退出码 0"）：
@@ -32,8 +37,9 @@ func (s *Server) handleInstallSTT(w http.ResponseWriter, r *http.Request) {
 		"安装 "+app.Name+"（"+services.STTBrewFormula+" + 默认档模型）",
 		"install_stt", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: app.ID, Steps: []string{}}
-			if err := s.svcManager().InstallSTT(ctx, app, res); err != nil {
-				return res, err
+			if err := sttInstallFn(s, ctx, app, res); err != nil {
+				// brew 装瓶 + 模型下载都是联网动作：网络类失败附统一提示（见 services/netfail.go）。
+				return res, services.AppendNetworkHint(err)
 			}
 			return res, nil
 		})

@@ -1049,7 +1049,8 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		"brew_probe_ok": brewProbeOK,
 		// 失败时的**真实原因**（brew 的 stderr 尾部 / 超时标志 / sudo 是怎么跑的）。
 		// 只给"未能复核"而不给原因，等于把排查起点也一起藏了（2026-09-19 用户报障）。
-		"brew_probe_error": marketProbeErrorForAPI(),
+		// 原因带网络证据时附统一提示（前端渲染成醒目 pill）。
+		"brew_probe_error": services.AppendNetworkHintToText(marketProbeErrorForAPI()),
 		// sections 是市场板块的**顺序与中文名**（services.MarketSections）。
 		// 前端按它渲染板块标题，自己不再写一份分类中文名 ——
 		// 用户要求「其它」改名「基础环境」，改名只改 catalog.go 一处。
@@ -1229,6 +1230,20 @@ func dockerReferenceInstallMessage(app services.App, mirrorBase string) string {
 	return msg + "Docker 页有 Compose 面板。"
 }
 
+// netHinted 包一层任务体：失败原因是网络问题时附统一提示（判据见 services/netfail.go）。
+func netHinted(run taskRunner) taskRunner {
+	return func(ctx context.Context, log tasks.LogFunc) (any, error) {
+		res, err := run(ctx, log)
+		return res, services.AppendNetworkHint(err)
+	}
+}
+
+// launchInstallTask 与 launchTask 同语义，只是给失败原因补网络提示（市场安装入口统一走它）。
+func (s *Server) launchInstallTask(w http.ResponseWriter, r *http.Request,
+	kind, target, title, auditAction string, run taskRunner) {
+	s.launchTask(w, r, kind, target, title, auditAction, netHinted(run))
+}
+
 // handleMarketInstall 安装应用。
 //
 // 大多数条目走通用的 brew / compose 安装流程；但有一批项目用的是
@@ -1329,7 +1344,7 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "「"+app.Name+"」只需要把它加入面板（不重新安装）：请在卡片上点「添加到面板」")
 		return
 	}
-	s.launchTask(w, r, "install", id, "安装 "+app.Name,
+	s.launchInstallTask(w, r, "install", id, "安装 "+app.Name,
 		"market_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			return s.svcManager().Install(ctx, id)
 		})
@@ -1394,7 +1409,7 @@ func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	title := "一键 LNMP（" + sel.ComponentsText() + "）"
-	s.launchTask(w, r, "install", "lnmp", title,
+	s.launchInstallTask(w, r, "install", "lnmp", title,
 		"install_lnmp", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "lnmp", Steps: []string{}}
 			if err := s.svcManager().InstallLNMP(ctx, res, sel); err != nil {
@@ -1406,7 +1421,7 @@ func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
 
 // handleInstallPhpMyAdmin 单独部署 phpMyAdmin（LNMP 已装好、只想补它时用）。
 func (s *Server) handleInstallPhpMyAdmin(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "phpmyadmin", "部署 phpMyAdmin",
+	s.launchInstallTask(w, r, "install", "phpmyadmin", "部署 phpMyAdmin",
 		"install_phpmyadmin", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "phpmyadmin", Steps: []string{}}
 			if err := s.svcManager().InstallPhpMyAdmin(ctx, res); err != nil {
@@ -1435,7 +1450,7 @@ func (s *Server) handleInstallPythonRuntime(w http.ResponseWriter, r *http.Reque
 		fail(w, http.StatusBadRequest, "「"+app.Name+"」没有声明 BrewFormula，无法安装")
 		return
 	}
-	s.launchTask(w, r, "install", id, "安装 "+app.Name+"（"+app.BrewFormula+"）",
+	s.launchInstallTask(w, r, "install", id, "安装 "+app.Name+"（"+app.BrewFormula+"）",
 		"install_python", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: app.ID, Steps: []string{}}
 			if err := s.svcManager().InstallPythonRuntime(ctx, app.BrewFormula, res); err != nil {
@@ -1452,7 +1467,7 @@ func (s *Server) handleInstallPythonRuntime(w http.ResponseWriter, r *http.Reque
 // 假警告，还会在服务管理里留下一条永远没有状态的假记录。
 // 这里只做一件事：EnsureBaseDependencies（幂等：已装则跳过并说明）。
 func (s *Server) handleInstallBaseDependency(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "ffmpeg", "安装 FFmpeg（音视频工具）",
+	s.launchInstallTask(w, r, "install", "ffmpeg", "安装 FFmpeg（音视频工具）",
 		"install_basedep", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "ffmpeg", Steps: []string{}}
 			if err := s.svcManager().EnsureBaseDependencies(ctx, res); err != nil {
@@ -1474,7 +1489,7 @@ func (s *Server) handleInstallImageCompressor(w http.ResponseWriter, r *http.Req
 		fail(w, http.StatusBadRequest, "应用市场中找不到图片压缩条目 "+id)
 		return
 	}
-	s.launchTask(w, r, "install", id, "安装 "+app.Name+"（"+services.ImgCompressFormula+"）",
+	s.launchInstallTask(w, r, "install", id, "安装 "+app.Name+"（"+services.ImgCompressFormula+"）",
 		"install_imgcompress", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: app.ID, Steps: []string{}}
 			if err := s.svcManager().InstallImageCompressor(ctx, app, res); err != nil {
@@ -1558,7 +1573,7 @@ func (s *Server) handleInstallQwenTTS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := services.QwenOptions{Auth: auth, Token: req.Token}
-	s.launchTask(w, r, "install", "qwen3tts", "部署 Qwen3 TTS 语音服务",
+	s.launchInstallTask(w, r, "install", "qwen3tts", "部署 Qwen3 TTS 语音服务",
 		"install_qwen3tts", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "qwen3tts", Steps: []string{}}
 			if err := s.svcManager().InstallQwenTTS(ctx, res, opts); err != nil {
@@ -1587,7 +1602,7 @@ func (s *Server) handleInstallVoiceReceiver(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	opts := services.ReceiverOptions{Token: req.Token, NoAuth: req.NoAuth, Host: req.Host}
-	s.launchTask(w, r, "install", "voicereceiver", "部署音色样本接收端",
+	s.launchInstallTask(w, r, "install", "voicereceiver", "部署音色样本接收端",
 		"install_voicereceiver", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "voicereceiver", Steps: []string{}}
 			if err := s.svcManager().InstallVoiceReceiver(ctx, res, opts); err != nil {
@@ -1599,7 +1614,7 @@ func (s *Server) handleInstallVoiceReceiver(w http.ResponseWriter, r *http.Reque
 
 // handleInstallIOPaint 部署 IOPaint（图片去水印 / 物体擦除 / 扩图）。
 func (s *Server) handleInstallIOPaint(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "iopaint", "安装 IOPaint（图片去水印）",
+	s.launchInstallTask(w, r, "install", "iopaint", "安装 IOPaint（图片去水印）",
 		"install_iopaint", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "iopaint", Steps: []string{}}
 			if err := s.svcManager().InstallIOPaint(ctx, res); err != nil {
@@ -1622,7 +1637,7 @@ func (s *Server) handleInstallReleaseBinary(w http.ResponseWriter, r *http.Reque
 		fail(w, http.StatusBadRequest, "应用市场中找不到 "+id)
 		return
 	}
-	s.launchTask(w, r, "install", id, "安装 "+app.Name,
+	s.launchInstallTask(w, r, "install", id, "安装 "+app.Name,
 		"market_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: id, Name: app.Name, Steps: []string{}}
 			if err := s.svcManager().InstallReleaseBinary(ctx, id, res); err != nil {
@@ -1634,7 +1649,7 @@ func (s *Server) handleInstallReleaseBinary(w http.ResponseWriter, r *http.Reque
 
 // handleInstallDockerRuntime 安装 Docker 运行时（Colima）。
 func (s *Server) handleInstallDockerRuntime(w http.ResponseWriter, r *http.Request) {
-	s.launchTask(w, r, "install", "docker-runtime", "安装 Docker 运行时（Colima）",
+	s.launchInstallTask(w, r, "install", "docker-runtime", "安装 Docker 运行时（Colima）",
 		"install_docker_runtime", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "docker-runtime", Name: "Docker 运行时（Colima）", Steps: []string{}}
 			if err := s.svcManager().InstallColimaRuntime(ctx, res); err != nil {

@@ -42,6 +42,85 @@ let defSite = null;
 // 站点详情面板当前所在的 Tab
 let detailTab = 'basic';
 
+// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
+// 文案纪律：标题一句话 ≤40 字，改镜像/代理的入口收进折叠项。
+const NET_HINT_MARKER = '面板不会替你翻墙';
+const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker 页 →「加速源」（Docker 镜像）。';
+const NET_EVIDENCE = [
+  'could not resolve host', 'temporary failure in name resolution',
+  'name or service not known', 'no such host', 'server misbehaving',
+  'connection refused', 'connection timed out', 'connection timeout',
+  'connection reset by peer', 'no route to host', 'network is unreachable',
+  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
+  'failed to connect to', "couldn't connect to server", 'could not connect to server',
+  'dial tcp', 'dial udp',
+  'tls handshake timeout', 'tls: failed to verify certificate',
+  'tls: bad certificate', 'remote error: tls:', 'x509:',
+  'certificate signed by unknown authority', 'certificate is not valid for',
+  'client.timeout exceeded', 'request canceled while waiting for connection',
+  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
+  'curl: (56)', 'curl: (60)', 'ssl connect error',
+];
+const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
+const NET_LOCAL_OVERRIDE = ['proxyconnect'];
+
+// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
+function isNetworkFailureText(text) {
+  const msg = String(text == null ? '' : text).toLowerCase();
+  if (!msg.trim()) return false;
+  if (msg.includes(NET_HINT_MARKER)) return true;
+  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
+  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地服务没起来 ≠ 要翻墙
+  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
+  if (msg.includes('context deadline exceeded')
+    && (msg.includes('http://') || msg.includes('https://'))) return true;
+  return false;
+}
+
+// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
+function networkHintBlock(errText) {
+  const raw = String(errText == null ? '' : errText).trim();
+  const nodes = [
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
+      h('strong', { text: NET_HINT_ONE_LINE }),
+    ]),
+    h('details', { style: { marginTop: '6px' } }, [
+      h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
+      h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
+    ]),
+  ];
+  if (raw) {
+    nodes.push(h('div', {
+      style: {
+        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
+        color: 'var(--text-dim)', wordBreak: 'break-all',
+      },
+      text: '原始报错：' + raw,
+    }));
+  }
+  return h('div', {
+    dataset: { testid: 'zp-network-failure' },
+    style: {
+      padding: '11px 13px', background: 'var(--danger-soft)',
+      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
+      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
+    },
+  }, nodes);
+}
+
+// netFailureHost 是本页的提示容器（SitesView 挂载）。LNMP / Nginx 安装任务在没有
+// 网络时失败，要在这里说清"是网络问题"，而不是让用户以为建站功能坏了。
+let netFailureHost = null;
+
+// showNetFailure 只在判据命中时画醒目块（非网络失败一个字都不加）。
+function showNetFailure(errText) {
+  if (!netFailureHost || !isNetworkFailureText(errText)) return;
+  clear(netFailureHost);
+  netFailureHost.append(networkHintBlock(errText));
+}
+
 // ---------------- 一键 LNMP 入口 ----------------
 //
 // 为什么这个入口在「网站管理」而不在「应用市场」（用户明确要求）：
@@ -135,6 +214,12 @@ async function openLNMPDialog() {
         target: 'lnmp',
         title: '一键 LNMP',
         start: () => api.installLNMP(sel),
+        // 三件套要联网下载：网络类失败在页面上给醒目块（非网络失败一个字都不加）。
+        onDone: (task) => {
+          if (task && task.status && task.status !== 'succeeded') {
+            showNetFailure(task.error || task.status);
+          }
+        },
       });
     },
   });
@@ -250,6 +335,11 @@ async function openLNMPDialog() {
                 target: 'lnmp',
                 title: '一键 LNMP',
                 start: () => api.installLNMP(def),
+                onDone: (task) => {
+                  if (task && task.status && task.status !== 'succeeded') {
+                    showNetFailure(task.error || task.status);
+                  }
+                },
               });
             },
           }),
@@ -531,6 +621,9 @@ export function SitesView(content, ctx = {}) {
   // 就是"这里什么都没有"，根本不知道该有一个默认站点。
   // 这里如实说清状态，并且给一颗**能走通**的按钮（弹窗里缺 nginx 就先只装 nginx）。
   const defSiteNotice = h('div');
+  // netNotice：LNMP / Nginx 安装任务的网络类失败在页面顶部给醒目块。
+  const netNotice = h('div');
+  netFailureHost = netNotice;
 
   const toolbar = h('div.card-head', [
     h('h3', { text: '站点列表' }),
@@ -541,7 +634,7 @@ export function SitesView(content, ctx = {}) {
   content.append(
     h('div.card', [
       toolbar,
-      h('div.card-body.tight', [defSiteNotice, webEnvLine, listBox]),
+      h('div.card-body.tight', [netNotice, defSiteNotice, webEnvLine, listBox]),
     ]),
   );
 
@@ -1053,6 +1146,7 @@ export function SitesView(content, ctx = {}) {
                 start: () => api.marketInstall('nginx'),
                 onDone: async (task) => {
                   if (task && task.status && task.status !== 'succeeded') {
+                    showNetFailure(task.error || task.status);
                     toast('安装 Nginx 失败：' + (task.error || task.status), 'err', 12000);
                     return;
                   }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/config"
+	"github.com/zizdog/zizpanel/internal/services"
 )
 
 // ============================================================================
@@ -231,6 +232,7 @@ func FetchManifestAny(ctx context.Context, sources []string, perTry time.Duratio
 		}
 		failures = append(failures, fmt.Sprintf("%s: %v", base, err))
 	}
-	return nil, "", fmt.Errorf("所有升级源都失败（共尝试 %d 个候选）：\n  - %s",
-		len(failures), strings.Join(failures, "\n  - "))
+	// 全部候选失败：逐个列出原因，有网络证据就再附统一提示（判据见 services/netfail.go）。
+	return nil, "", services.AppendNetworkHint(fmt.Errorf("所有升级源都失败（共尝试 %d 个候选）：\n  - %s",
+		len(failures), strings.Join(failures, "\n  - ")))
 }

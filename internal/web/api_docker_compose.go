@@ -73,6 +73,12 @@ func (s *Server) handleDockerComposeSave(w http.ResponseWriter, r *http.Request)
 	ok(w, map[string]any{"name": req.Name, "message": msg})
 }
 
+// composeActionFn 执行 compose 动作。单测注入假实现（真实 compose 要 docker 守护进程）。
+var composeActionFn = func(mgr *services.Manager, ctx context.Context,
+	name, action string, removeVolumes bool) (string, error) {
+	return mgr.DockerComposeAction(ctx, name, action, removeVolumes)
+}
+
 // handleDockerComposeAction 部署 / 停止 / 重启 / 查看状态。
 //
 // 用 URL 查询参数区分动作，而不是给每个动作开一条路由：
@@ -97,9 +103,10 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 		s.launchTask(w, r, "deploy", "compose:"+name, "部署 Docker Compose 项目 "+name,
 			"docker_compose_up", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 				mgr := s.svcManager()
-				out, err := mgr.DockerComposeAction(ctx, name, "up", removeVolumes)
+				out, err := composeActionFn(mgr, ctx, name, "up", removeVolumes)
 				if err != nil {
-					return nil, err
+					// up 会拉镜像：网络类失败附统一提示（见 services/netfail.go）。
+					return nil, services.AppendNetworkHint(err)
 				}
 				// 部署成功后顺手把项目登记成服务 —— 用户不必再去「可纳管」里加一遍。
 				registered := false
@@ -130,7 +137,7 @@ func (s *Server) handleDockerComposeAction(w http.ResponseWriter, r *http.Reques
 	}
 
 	mgr := s.svcManager()
-	out, err := mgr.DockerComposeAction(r.Context(), name, action, removeVolumes)
+	out, err := composeActionFn(mgr, r.Context(), name, action, removeVolumes)
 	if err != nil {
 		s.audit(r, "docker_compose_"+action, name, err.Error(), false, "")
 		s.dockerFail(w, err)

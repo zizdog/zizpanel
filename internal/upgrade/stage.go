@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
 )
 
 // 尺寸与超时上限。存在的意义是"被恶意源拖死/撑爆磁盘"这类问题：
@@ -129,7 +131,8 @@ func FetchManifestRaw(ctx context.Context, baseURL string) ([]byte, []byte, erro
 func FetchManifest(ctx context.Context, baseURL string) (*Manifest, []byte, error) {
 	data, sig, err := FetchManifestRaw(ctx, baseURL)
 	if err != nil {
-		return nil, nil, err
+		// 单源失败：网络原因附统一提示（多候选在 FetchManifestAny 汇总层附，避免重复）。
+		return nil, nil, services.AppendNetworkHint(err)
 	}
 	if err := VerifyManifest(data, sig); err != nil {
 		return nil, nil, err
@@ -225,7 +228,8 @@ func DownloadTarballWithObserver(ctx context.Context, rawURL, destPath, wantSHA 
 	req.Header.Set("User-Agent", "zizpanel-upgrade")
 	resp, err := httpClient(downloadTimeout).Do(req)
 	if err != nil {
-		return "", err
+		// 建连失败（DNS/拒绝/超时/TLS）：网络原因附统一提示。
+		return "", services.AppendNetworkHint(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
@@ -249,7 +253,9 @@ func DownloadTarballWithObserver(ctx context.Context, rawURL, destPath, wantSHA 
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(part)
-		return "", copyErr
+		// 传输中途断开（i/o timeout / connection reset by peer / unexpected EOF）：
+		// 网络原因才附提示；写盘失败（no space left on device）不会被误报。
+		return "", services.AppendNetworkHint(copyErr)
 	}
 	if closeErr != nil {
 		_ = os.Remove(part)

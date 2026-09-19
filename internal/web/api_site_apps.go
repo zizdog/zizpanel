@@ -265,7 +265,9 @@ func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 
 	s.launchTask(w, r, "site-install", domain, "一键建站 "+app.Name+"（"+domain+"）",
 		"site_app_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
-			return s.installSiteApp(ctx, app, domain, req)
+			res, err := s.installSiteApp(ctx, app, domain, req)
+			// 源码包要从 NAS/GitHub 下：网络类失败附统一提示（见 services/netfail.go）。
+			return res, services.AppendNetworkHint(err)
 		})
 }
 

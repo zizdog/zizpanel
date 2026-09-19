@@ -8,6 +8,11 @@ import (
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
+// syncthingInstallFn 是安装入口；单测注入假实现（真实安装要联网 + brew，单测不许跑）。
+var syncthingInstallFn = func(s *Server, ctx context.Context, res *services.InstallResult) error {
+	return s.svcManager().InstallSyncthing(ctx, res)
+}
+
 // handleInstallSyncthing 安装 Syncthing（文件同步）并把它的 Web GUI 安全地
 // 开放到局域网。
 //
@@ -21,8 +26,9 @@ func (s *Server) handleInstallSyncthing(w http.ResponseWriter, r *http.Request) 
 	s.launchTask(w, r, "install", "syncthing", "安装 Syncthing（文件同步）",
 		"install_syncthing", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: "syncthing", Name: "Syncthing（文件同步）", Steps: []string{}}
-			if err := s.svcManager().InstallSyncthing(ctx, res); err != nil {
-				return res, err
+			if err := syncthingInstallFn(s, ctx, res); err != nil {
+				// brew 装包是联网动作：网络类失败附统一提示（见 services/netfail.go）。
+				return res, services.AppendNetworkHint(err)
 			}
 			return res, nil
 		})

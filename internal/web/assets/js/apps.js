@@ -55,6 +55,86 @@ import {
   confirmUninstallPlan,
 } from './servicePanel.js';
 
+// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
+// 文案纪律：标题一句话 ≤40 字，入口名收进折叠项。update.js 有一份同样的实现。
+const NET_HINT_MARKER = '面板不会替你翻墙';
+const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker →「加速源」；'
+  + '面板设置 →「检查更新」→「升级源地址」。';
+const NET_EVIDENCE = [
+  'could not resolve host', 'temporary failure in name resolution',
+  'name or service not known', 'no such host', 'server misbehaving',
+  'connection refused', 'connection timed out', 'connection timeout',
+  'connection reset by peer', 'no route to host', 'network is unreachable',
+  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
+  'failed to connect to', "couldn't connect to server", 'could not connect to server',
+  'dial tcp', 'dial udp',
+  'tls handshake timeout', 'tls: failed to verify certificate',
+  'tls: bad certificate', 'remote error: tls:', 'x509:',
+  'certificate signed by unknown authority', 'certificate is not valid for',
+  'client.timeout exceeded', 'request canceled while waiting for connection',
+  // curl 特定退出码（刻意排除 22：HTTP 错误码，是"镜像上没有文件"不是网络不通）
+  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
+  'curl: (56)', 'curl: (60)', 'ssl connect error',
+];
+const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
+const NET_LOCAL_OVERRIDE = ['proxyconnect'];
+
+// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
+function isNetworkFailureText(text) {
+  const msg = String(text == null ? '' : text).toLowerCase();
+  if (!msg.trim()) return false;
+  if (msg.includes(NET_HINT_MARKER)) return true;
+  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
+  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地服务没起来 ≠ 要翻墙
+  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
+  if (msg.includes('context deadline exceeded')
+    && (msg.includes('http://') || msg.includes('https://'))) return true;
+  return false;
+}
+
+// networkHintText 是可直接 toast 的一句话（≤40 字）。
+function networkHintText() {
+  return NET_HINT_ONE_LINE;
+}
+
+// networkHintEntries 渲染"改镜像/代理的入口"折叠项（细节收起来，标题只一句话）。
+function networkHintEntries() {
+  return h('details', { style: { marginTop: '6px' } }, [
+    h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
+    h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
+  ]);
+}
+
+// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
+function networkHintBlock(errText) {
+  const raw = String(errText == null ? '' : errText).trim();
+  const nodes = [
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
+      h('strong', { text: NET_HINT_ONE_LINE }),
+    ]),
+    networkHintEntries(),
+  ];
+  if (raw) {
+    nodes.push(h('div', {
+      style: {
+        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
+        color: 'var(--text-dim)', wordBreak: 'break-all',
+      },
+      text: '原始报错：' + raw,
+    }));
+  }
+  return h('div', {
+    dataset: { testid: 'zp-network-failure' },
+    style: {
+      padding: '11px 13px', background: 'var(--danger-soft)',
+      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
+      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
+    },
+  }, nodes);
+}
+
 let cache = null;
 // svcList 是这轮市场数据对应**完整服务记录**（api.services(true)，带健康检查）。
 // 「已安装」Tab 用它做合并去重、状态/端口/健康，以及管理面板的 svc 入参。
@@ -158,6 +238,9 @@ export function AppsView(content, ctx = {}) {
   let loadError = null;
   let marketGrid = null;
   let marketHead = null;
+  // netFailure：最近一次安装/探测失败的原文，**仅当判定为网络问题时**才存。
+  // 存下来是为了在本页内容最上方常驻一条醒目的网络提示（见 renderBody）。
+  let netFailure = '';
 
   const tabBar = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '14px', flexWrap: 'wrap' } });
   const body = h('div');
@@ -186,7 +269,14 @@ export function AppsView(content, ctx = {}) {
       }));
       // 把真实原因**显示出来**（不只塞进 title）：2026-09-19 用户报障时界面上
       // 只有一句"brew 不可用或超时"，谁也不知道到底是 brew 坏了、权限问题还是超时。
+      // 原因是网络时额外给醒目 pill（这条路径既可能是 brew 坏了，也可能是网络失败）。
       if (why) {
+        if (isNetworkFailureText(why)) {
+          tabBar.appendChild(h('span.pill.danger', {
+            text: '🌐 网络问题',
+            title: why,
+          }));
+        }
         tabBar.appendChild(h('span.hint', {
           text: '原因：' + (why.length > 140 ? why.slice(0, 140) + '…' : why),
           title: why,
@@ -197,6 +287,9 @@ export function AppsView(content, ctx = {}) {
 
   function renderBody() {
     clear(body);
+    // 有网络失败时，先在最上方摆出醒目提示（pill + 能照做的镜像入口 + 原文）。
+    // 放在内容之前：用户打开这一页第一眼就知道"是网络，不是功能坏了"。
+    if (netFailure) body.append(networkHintBlock(netFailure));
     if (active === 'installed') renderInstalledTab();
     else if (active === 'docker') renderDockerTab();
     else if (active === 'sites') renderSitesTab();
@@ -514,7 +607,14 @@ export function AppsView(content, ctx = {}) {
       proxyState = await api.appProxies();
       renderGrid();
     } catch (e) {
-      toast('探测失败：' + e.message, 'err', 8000);
+      if (isNetworkFailureText(e.message)) {
+        // 探测失败也可能是网络：摆出常驻醒目提示，而不是只闪一条 toast。
+        netFailure = e.message;
+        renderBody();
+        toast(networkHintText() + '\n原始报错：' + e.message, 'err', 20000);
+      } else {
+        toast('探测失败：' + e.message, 'err', 8000);
+      }
     }
   }
 
@@ -1031,7 +1131,14 @@ export function AppsView(content, ctx = {}) {
               start: () => api.marketInstallSite(a.id, { domain: d, php: php.value.trim() || '8.2' }),
               onDone: (m) => {
                 if (m && m.status && m.status !== 'succeeded') {
-                  toast('建站失败：' + (m.error || m.status), 'err', 12000);
+                  const msg = m.error || m.status;
+                  // 站点源码包要从镜像/GitHub 下：网络失败必须显著，别让用户以为建站功能坏了。
+                  if (isNetworkFailureText(msg)) {
+                    netFailure = msg;
+                    toast(networkHintText() + '\n原始报错：' + msg, 'err', 20000);
+                  } else {
+                    toast('建站失败：' + msg, 'err', 12000);
+                  }
                 } else {
                   toast('「' + a.name + '」已建站完成', 'ok', 9000);
                 }
@@ -1161,7 +1268,13 @@ export function AppsView(content, ctx = {}) {
       pf = await api.marketPreflight(a.id);
     } catch (e) {
       clear(box);
-      appendAll(box, h('div.empty', [h('div.big', { text: '⚠️' }), h('p', { text: e.message })]));
+      const network = isNetworkFailureText(e.message);
+      if (network) netFailure = e.message;
+      appendAll(box,
+        h('div.empty', [h('div.big', { text: '⚠️' }), h('p', { text: e.message })]),
+        // 安装前检查本身是本地动作；但一旦失败原因是网络（例如去探测镜像/依赖），
+        // 必须让用户当场看出是网络，而不是以为这个应用不能装。
+        network ? networkHintBlock(e.message) : null);
       return;
     }
 
@@ -1280,7 +1393,15 @@ export function AppsView(content, ctx = {}) {
       // 而任务结束时市场数据还是旧的，卡片就停留在"可安装"。
       onDone: (m) => {
         if (m && m.status && m.status !== 'succeeded') {
-          toast((adopt ? '添加到面板失败：' : '安装失败：') + (m.error || m.status), 'err', 12000);
+          const msg = m.error || m.status;
+          // 安装失败里最常见的真实原因是网络（brew 瓶 / GitHub / docker 镜像）。
+          // 后端已尽量在任务错误里附上网络提示；这里再判一次是为了兜住没附上的路径。
+          if (isNetworkFailureText(msg)) {
+            netFailure = msg;
+            toast(networkHintText() + '\n原始报错：' + msg, 'err', 20000);
+          } else {
+            toast((adopt ? '添加到面板失败：' : '安装失败：') + msg, 'err', 12000);
+          }
         } else {
           // 装完把"下一步"直接说出来。用户最常问的就是"装完我该干嘛"。
           // 2026-09-16 起配置入口只有一个：卡片上的「⚙️ 管理」→ 面板里的

@@ -46,11 +46,87 @@ services:
       - "8080:80"
 `;
 
+// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
+// 文案纪律：标题一句话 ≤40 字，改镜像/代理的入口收进折叠项。
+const NET_HINT_MARKER = '面板不会替你翻墙';
+const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+const NET_HINT_ENTRIES = 'Docker 页 →「加速源」（换 docker.io 镜像源）；面板设置 → 访问与安全 →「应用包镜像基址」。';
+const NET_EVIDENCE = [
+  'could not resolve host', 'temporary failure in name resolution',
+  'name or service not known', 'no such host', 'server misbehaving',
+  'connection refused', 'connection timed out', 'connection timeout',
+  'connection reset by peer', 'no route to host', 'network is unreachable',
+  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
+  'failed to connect to', "couldn't connect to server", 'could not connect to server',
+  'dial tcp', 'dial udp',
+  'tls handshake timeout', 'tls: failed to verify certificate',
+  'tls: bad certificate', 'remote error: tls:', 'x509:',
+  'certificate signed by unknown authority', 'certificate is not valid for',
+  'client.timeout exceeded', 'request canceled while waiting for connection',
+  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
+  'curl: (56)', 'curl: (60)', 'ssl connect error',
+];
+const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
+const NET_LOCAL_OVERRIDE = ['proxyconnect'];
+
+// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
+function isNetworkFailureText(text) {
+  const msg = String(text == null ? '' : text).toLowerCase();
+  if (!msg.trim()) return false;
+  if (msg.includes(NET_HINT_MARKER)) return true;
+  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
+  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地 socket 没起来 ≠ 要翻墙
+  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
+  if (msg.includes('context deadline exceeded')
+    && (msg.includes('http://') || msg.includes('https://'))) return true;
+  return false;
+}
+
+// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
+function networkHintBlock(errText) {
+  const raw = String(errText == null ? '' : errText).trim();
+  const nodes = [
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
+      h('strong', { text: NET_HINT_ONE_LINE }),
+    ]),
+    h('details', { style: { marginTop: '6px' } }, [
+      h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
+      h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
+    ]),
+  ];
+  if (raw) {
+    nodes.push(h('div', {
+      style: {
+        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
+        color: 'var(--text-dim)', wordBreak: 'break-all',
+      },
+      text: '原始报错：' + raw,
+    }));
+  }
+  return h('div', {
+    dataset: { testid: 'zp-network-failure' },
+    style: {
+      padding: '11px 13px', background: 'var(--danger-soft)',
+      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
+      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
+    },
+  }, nodes);
+}
+
 export async function renderCompose(container, ctx) {
   const toolbar = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' } });
   const listBox = h('div');
   const rootHint = h('div.hint', { style: { marginBottom: '10px' } });
-  container.append(toolbar, rootHint, listBox);
+  // netNotice：部署（up 会拉镜像）失败且判据是网络问题时，在这里显示醒目块。
+  const netNotice = h('div');
+  container.append(netNotice, toolbar, rootHint, listBox);
+
+  // showNetFailure 只对网络类失败画醒目块（非网络失败一个字都不加）。
+  function showNetFailure(errText) {
+    clear(netNotice);
+    if (isNetworkFailureText(errText)) netNotice.append(networkHintBlock(errText));
+  }
 
   let projects = [];
 
@@ -222,6 +298,8 @@ export async function renderCompose(container, ctx) {
         // 再弹一个"部署完成"结果：列出容器并给每个容器一个「日志」入口
         //（初始登录信息只在容器日志里，例如 File Browser 的随机 admin 口令）。
         onDone: async (m) => {
+          // 部署（up）会拉镜像：网络类失败在页面顶部给醒目块（非网络失败一个字都不加）。
+          showNetFailure(m && m.status !== 'succeeded' ? (m.error || m.status) : '');
           await load();
           ctx.refresh && ctx.refresh();
           showDeployResult(name, m);
@@ -237,6 +315,7 @@ export async function renderCompose(container, ctx) {
       ctx.refresh && ctx.refresh();
     } catch (e) {
       // 失败时后端也会把 compose 的输出带在错误里，展示出来比只报"失败"有用得多
+      showNetFailure(e.message);
       showOutput(name, action, e.message);
       toast(`${name}：${action} 失败`, 'err');
     }
@@ -293,14 +372,18 @@ export async function renderCompose(container, ctx) {
     const m = modal({
       title: `compose ${action} · ${name}`,
       wide: true,
-      body: h('pre', {
-        style: {
-          maxHeight: '60vh', overflow: 'auto', margin: '0', padding: '10px',
-          background: 'var(--bg-soft, rgba(127,127,127,.08))', borderRadius: '6px',
-          fontSize: '12px', lineHeight: '1.55', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-        },
-        text: output || '（没有输出）',
-      }),
+      body: h('div', [
+        // 输出是 compose 原话：网络类失败时在原文前面加醒目块，别让用户以为镜像本身坏了。
+        isNetworkFailureText(output) ? networkHintBlock(output) : null,
+        h('pre', {
+          style: {
+            maxHeight: '60vh', overflow: 'auto', margin: '0', padding: '10px',
+            background: 'var(--bg-soft, rgba(127,127,127,.08))', borderRadius: '6px',
+            fontSize: '12px', lineHeight: '1.55', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          },
+          text: output || '（没有输出）',
+        }),
+      ]),
       footer: [h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() })],
     });
   }

@@ -355,11 +355,13 @@ func (s *Server) handleDockerContainerCreate(w http.ResponseWriter, r *http.Requ
 		func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			id, err := mgr.DockerCreateContainer(ctx, spec)
 			if err != nil {
+				// 本地没有镜像时会先拉取：网络类失败附统一提示（见 services/netfail.go）。
 				// 创建成功但启动失败时 id 非空，提示要区分开
 				if id != "" {
-					return nil, fmt.Errorf("%s（容器已创建，可在列表里手动启动）", err.Error())
+					return nil, services.AppendNetworkHint(
+						fmt.Errorf("%s（容器已创建，可在列表里手动启动）", err.Error()))
 				}
-				return nil, err
+				return nil, services.AppendNetworkHint(err)
 			}
 			return map[string]any{"id": id, "name": spec.Name, "started": spec.AutoStart}, nil
 		})
@@ -410,7 +412,9 @@ func (s *Server) handleDockerImagePull(w http.ResponseWriter, r *http.Request) {
 			mgr := s.svcManager()
 			msg, err := mgr.DockerPullImage(ctx, image)
 			if err != nil {
-				return nil, err
+				// 拉取是联网动作：网络类失败附统一提示（见 services/netfail.go）。
+				// 本地 socket 报错判据不算网络，一个字都不加。
+				return nil, services.AppendNetworkHint(err)
 			}
 			return map[string]any{"image": image, "message": msg}, nil
 		})

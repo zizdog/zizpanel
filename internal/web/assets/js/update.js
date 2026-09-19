@@ -164,6 +164,86 @@ function banner(kind, nodes, extra = {}) {
   }, nodes);
 }
 
+// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
+// 文案纪律：标题一句话 ≤40 字，入口名收进折叠项。apps.js 有一份同样的实现。
+const NET_HINT_MARKER = '面板不会替你翻墙';
+const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker →「加速源」；'
+  + '面板设置 →「检查更新」→「升级源地址」。';
+const NET_EVIDENCE = [
+  'could not resolve host', 'temporary failure in name resolution',
+  'name or service not known', 'no such host', 'server misbehaving',
+  'connection refused', 'connection timed out', 'connection timeout',
+  'connection reset by peer', 'no route to host', 'network is unreachable',
+  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
+  'failed to connect to', "couldn't connect to server", 'could not connect to server',
+  'dial tcp', 'dial udp',
+  'tls handshake timeout', 'tls: failed to verify certificate',
+  'tls: bad certificate', 'remote error: tls:', 'x509:',
+  'certificate signed by unknown authority', 'certificate is not valid for',
+  'client.timeout exceeded', 'request canceled while waiting for connection',
+  // curl 特定退出码（刻意排除 22：HTTP 错误码，是"镜像上没有文件"不是网络不通）
+  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
+  'curl: (56)', 'curl: (60)', 'ssl connect error',
+];
+const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
+const NET_LOCAL_OVERRIDE = ['proxyconnect'];
+
+// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
+function isNetworkFailureText(text) {
+  const msg = String(text == null ? '' : text).toLowerCase();
+  if (!msg.trim()) return false;
+  if (msg.includes(NET_HINT_MARKER)) return true; // 后端已附提示
+  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
+  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地服务没起来 ≠ 要翻墙
+  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
+  if (msg.includes('context deadline exceeded')
+    && (msg.includes('http://') || msg.includes('https://'))) return true;
+  return false;
+}
+
+// networkHintText 是可直接 toast 的一句话（≤40 字）。
+function networkHintText() {
+  return NET_HINT_ONE_LINE;
+}
+
+// networkHintEntries 渲染"改镜像/代理的入口"折叠项（细节收起来，标题只一句话）。
+function networkHintEntries() {
+  return h('details', { style: { marginTop: '6px' } }, [
+    h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
+    h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
+  ]);
+}
+
+// networkPanel 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
+function networkPanel(errText) {
+  const raw = String(errText == null ? '' : errText).trim();
+  const nodes = [
+    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
+      h('strong', { text: NET_HINT_ONE_LINE }),
+    ]),
+    networkHintEntries(),
+  ];
+  if (raw) {
+    nodes.push(h('div', {
+      style: {
+        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
+        color: 'var(--text-dim)', wordBreak: 'break-all',
+      },
+      text: '原始报错：' + raw,
+    }));
+  }
+  return h('div', {
+    dataset: { testid: 'zp-network-failure' },
+    style: {
+      padding: '11px 13px', background: 'var(--danger-soft)',
+      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
+      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '13px',
+    },
+  }, nodes);
+}
+
 function fmtTime(ts) {
   if (!ts) return '尚未检测';
   try { return new Date(ts).toLocaleString('zh-CN'); } catch { return '—'; }
@@ -607,7 +687,19 @@ function upProgressPanel(st, status) {
             : (st.message || '升级未完成'),
         }),
         // 失败原因必须留在页面上（用户明确要求"不要一闪而过"）。
-        st.error ? h('div', { class: 'zp-upg-err', dataset: { testid: 'zp-upgrade-error' }, text: '原因：' + st.error }) : null,
+        // 网络失败额外挂一颗醒目的 pill + 可照做的入口，别让用户以为功能坏了。
+        st.error ? h('div', { class: 'zp-upg-err', dataset: { testid: 'zp-upgrade-error' } }, [
+          isNetworkFailureText(st.error)
+            ? h('span.pill.danger', { style: { fontWeight: '700', marginRight: '6px' }, text: '🌐 网络问题' })
+            : null,
+          h('span', { text: '原因：' + st.error }),
+          isNetworkFailureText(st.error)
+            ? h('div', { style: { marginTop: '4px' } }, [
+              h('strong', { text: NET_HINT_MARKER + ' —— 请自备代理/梯子后重试' }),
+              h('div', { text: '镜像入口：面板设置 → 访问与安全 →「应用包镜像基址」；在线升级源在「面板设置 → 检查更新」。' }),
+            ])
+            : null,
+        ]) : null,
       ]),
     ]));
   }
@@ -674,6 +766,9 @@ export function UpdateView(content, ctx = {}) {
   // statusNotes：后端 status 顶层带回来的更新说明（配置里的缓存值）。
   // 它是刷新页面后（check 还没回来时）也能显示说明的兜底来源。
   let statusNotes = '';
+  // netFailure：最近一次"检查更新 / 升级"失败的原文，**仅当判定为网络问题时**才存。
+  // 存下来是为了在页面最上方常驻一条醒目的网络提示（见 renderNotice）。
+  let netFailure = '';
 
   const srcInput = h('input.input', {
     placeholder: 'https://example.com/zizpanel/releases（放着 manifest.json 的目录）',
@@ -741,7 +836,7 @@ export function UpdateView(content, ctx = {}) {
   );
 
   // ---------- 顶部醒目提示：有没有新版本 ----------
-  function renderNotice() {
+  function renderNoticeInner() {
     clear(notice);
     // 升级进行中：顶部不再劝用户"一键更新"（那样自相矛盾），
     // 改成最醒目的"请勿退出或刷新页面"。进度面板里也有一条同样的警示，
@@ -801,6 +896,14 @@ export function UpdateView(content, ctx = {}) {
         h('span.sub', { text: '最后检测：' + fmtTime(lastCheckedAt()) }),
       ]));
     }
+  }
+
+  // renderNotice 在"有没有新版本"的基础上，再挂一条**网络失败**提示：
+  // 只要最近一次检查更新/升级失败被判定为网络问题，就常驻在页面最上方
+  // （醒目 pill + 可照做的入口 + 原始报错），直到下一次成功为止。
+  function renderNotice() {
+    renderNoticeInner();
+    if (netFailure) notice.append(networkPanel(netFailure));
   }
 
   // ---------- 升级卡片 ----------
@@ -900,14 +1003,19 @@ export function UpdateView(content, ctx = {}) {
       bodyEl.append(banner('err', [
         h('strong', { text: '升级失败，已自动回滚：' }),
         h('span', { text: st.message || '' }),
-        st.error ? h('div', { style: mutedStyle, text: '原因：' + st.error }) : null,
+        // 网络原因就用**醒目**的网络提示替代那行灰色小字；非网络原因保持原文。
+        st.error && isNetworkFailureText(st.error)
+          ? networkPanel(st.error)
+          : (st.error ? h('div', { style: mutedStyle, text: '原因：' + st.error }) : null),
         h('div', { style: mutedStyle, text: '面板已恢复到升级前的版本，可以正常使用。请把上面这条原因反馈给开发者。' }),
       ]));
     } else if (status === 'failed') {
       bodyEl.append(banner('err', [
         h('strong', { text: '升级未执行：' }),
         h('span', { text: st.message || '' }),
-        st.error ? h('div', { style: mutedStyle, text: '原因：' + st.error }) : null,
+        st.error && isNetworkFailureText(st.error)
+          ? networkPanel(st.error)
+          : (st.error ? h('div', { style: mutedStyle, text: '原因：' + st.error }) : null),
       ]));
     }
 
@@ -1091,6 +1199,9 @@ export function UpdateView(content, ctx = {}) {
     if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
     try {
       checkInfo = await checkUpgrades({ force: true, silent: !manual });
+      // 这次真的拿到了结论 → 上一次的网络失败提示该撤掉了（只在 manual 时会抛错，
+      // 自动检测失败是静默的，不该覆盖用户刚刚看到的提示）。
+      if (checkInfo) netFailure = '';
       if (manual) {
         if (checkInfo?.has_update) {
           toast(`发现新版本 v${checkInfo.latest}`, 'ok');
@@ -1103,7 +1214,14 @@ export function UpdateView(content, ctx = {}) {
       render();
       if (checkInfo?.has_update) render(await api.upgradeStatus());
     } catch (e) {
-      toast(e.message, 'err', 9000);
+      if (isNetworkFailureText(e.message)) {
+        // 醒目、且能照做：常驻面板 + 一条能看全的错误 toast。
+        netFailure = e.message;
+        renderNotice();
+        toast(networkHintText() + '\n原始报错：' + e.message, 'err', 20000);
+      } else {
+        toast(e.message, 'err', 9000);
+      }
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = '检查更新'; }
     }
@@ -1213,6 +1331,8 @@ export function UpdateView(content, ctx = {}) {
         }
         staged = true;
         ver = res.version || ver;
+        // 这一轮真的下到了包 → 网络是通的，撤掉之前那条网络提示。
+        netFailure = '';
       }
 
       toast(`${ver ? 'v' + ver + ' ' : ''}已就绪，正在升级，面板会短暂重启…`, 'info', 8000);
@@ -1232,6 +1352,12 @@ export function UpdateView(content, ctx = {}) {
 
       await watchRestartAndReload();
     } catch (e) {
+      // 下载/暂存失败：网络原因就把提示摆到页面最上方（醒目 pill），
+      // 而不是只弹一条会消失的 toast。
+      if (isNetworkFailureText(e.message)) {
+        netFailure = e.message;
+        renderNotice();
+      }
       toast('更新失败：' + e.message, 'err', 12000);
       try { render(await api.upgradeStatus()); } catch { /* 保持现状 */ }
     } finally {
