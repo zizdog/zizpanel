@@ -270,41 +270,67 @@ func resolveForCompare(p string) string {
 //  macOS 隐私保护（TCC）拦住外接卷 —— 把 EPERM 变成可操作的指引
 //
 //  为什么单独处理：面板以 root 的 LaunchDaemon 运行、**没有用户会话**，
-//  读写 /Volumes 下的外接盘/可移除卷会被 macOS 隐私保护（TCC）直接拒绝，
-//  返回 EPERM（operation not permitted）。用户报障原文：
+//  读写外接盘/可移除卷会被 macOS 隐私保护（TCC）直接拒绝，返回 EPERM
+//  （operation not permitted）。用户报障原文：
 //  「打开目录失败: open /Volumes/ZPMirror: operation not permitted」。
-//  Apple 的"正规"出口是人工授予「完全磁盘访问权限」，但那需要在有屏幕的
-//  机器上点一次，无头/远程场景做不到，所以对外**只给**"挂到 /Volumes 之外"
-//  这条面板自己能执行的解法（见 tccSolution）。
+//
+//  🚨 **换挂载点不是解法（2026-09-19 实测证伪，别再写回去）**：
+//  曾经的方案是"把卷挂到 /Volumes 之外绕过 TCC"。实测（真实 root 面板 + 4T 外接盘）：
+//    · `diskutil mount -mountPoint /opt/zizpanel/mnt/ZPMirror disk4s1` → 挂载成功；
+//    · 面板读那个新路径 → 仍然 operation not permitted。
+//  系统日志给出原因：`kTCCServiceSystemPolicyRemovableVolumes` + 「Background Session …
+//  record_denial」—— 这条保护按**卷**判定，与挂载路径无关；后台进程没有用户界面，
+//  macOS 连询问窗口都不会弹，只能直接拒绝。所以对外**只能**如实给人工授权这条路。
 //
 //  为什么此前测不出来（验证盲区，必须写清楚）：本机调试实例（make run-local）
 //  跑在**用户会话**里，那个终端早已被授权，所以能读 /Volumes/ZPMirror；
 //  只有正式 root 面板 + 真实外接盘才会命中。调试实例上**永远复现不出**这个错误。
 //
-//  判据是**真实 errno（EPERM/EACCES） + 路径在 /Volumes 下**，绝不靠匹配
-//  "operation not permitted" 字符串：字符串匹配会把别的原因误报成 TCC，
-//  也会在包装/本地化变化后失效。
+//  判据是**真实 errno（EPERM/EACCES） + 路径落在某个非系统卷的挂载点之下**，
+//  绝不靠匹配 "operation not permitted" 字符串：字符串匹配会把别的原因误报成 TCC，
+//  也会在包装/本地化变化后失效。挂载点取自 files.NonSystemVolumeMounts()（与文件
+//  管理器根目录同一份来源），因此**挂在 /Volumes 之外的外接盘同样会被识别** ——
+//  这正是上面那次实验的教训：只认 /Volumes 会让"换了挂载点"的错误变成一句
+//  干巴巴的 errno，用户反而看不出真正原因。
 // ============================================================================
 
-// volumeMountRoot 是 macOS 挂载外接盘/可移除卷的标准位置（与 internal/files/volumes.go 一致）。
-const volumeMountRoot = "/Volumes"
+// panelBinaryForGuide 是"去系统设置里授权"要选中的那个可执行文件路径。
+//
+// 变量而不是常量：非默认安装根（BinDir 配在别处）时写死 /opt/zizpanel 会让用户
+// 照着一个**不存在的文件**去点「+」—— 指引里写错路径比不写更糟。由 web.New 按配置
+// 写一次（见 setPanelBinaryForGuide），磁盘页下发的 panel_binary 也是同一个值。
+var panelBinaryForGuide = filepath.Join(config.DefaultRoot, "bin", "zizpanel")
 
-// tccSolution 是给用户的**唯一**解法：让面板自己把卷挂到 /Volumes 之外。
+// setPanelBinaryForGuide 按配置里的 BinDir 更新要授权的二进制路径（空值忽略）。
+func setPanelBinaryForGuide(binDir string) {
+	binDir = strings.TrimSpace(binDir)
+	if binDir == "" {
+		return
+	}
+	panelBinaryForGuide = filepath.Join(filepath.Clean(binDir), "zizpanel")
+}
+
+// tccSolution 是给用户的解法：**一次**人工在系统设置里授权。
 //
-// 刻意**不写**"去系统设置 → 隐私与安全性 → 完全磁盘访问权限里手动授权"：
-// 那要求在**有屏幕的机器上人工点一次**，无头/远程场景根本做不到，
-// 不能作为给用户的指引。人工授权只是 Apple 提供的另一条路（见 docs/磁盘工具.md）。
-//
-// 诚实标注：这条路径（换挂载点绕过 TCC）**尚未在真实 root 面板 + 外接盘上实测**，
-// 已由真实磁盘工具能力支撑（挂载本身不需要 TCC 授权），但不写成"已验证"。
-const tccSolution = "解法：用面板「磁盘 → 挂载到自定义挂载点…」把这个卷挂到 /Volumes 之外，再访问那个路径（挂载本身不受隐私保护限制）。等价命令：" +
-	"\n  sudo diskutil mount -mountPoint " + config.DefaultRoot + "/mnt/mirror <卷标识>"
+// 这是与用户 2026-09-19 商定的取舍：他选了"用外接盘做镜像盘 + 接受手动授权一次"。
+// 无头/远程场景做不到人工授权，所以面板**不隐瞒**这一点：做不到就如实说，
+// 并给出确切路径与位置（见铁律 11：能谎报成功的功能比没做更糟）。
+func tccSolution() string {
+	return "解法（一次性，需要在有屏幕的这台机器上点）：" +
+		"\n  系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」，选中 " + panelBinaryForGuide + " → 打开开关 → 重启面板。" +
+		"\n  这块盘还要给镜像站/站点（nginx）读的话，把 nginx 的二进制也照同样方式加进去。" +
+		"\n为什么只能人工：这条保护按「卷」判定、与挂载点无关，面板又是无用户会话的后台进程，" +
+		"系统连询问窗口都不会弹，只能直接拒绝。" +
+		"\n（把卷改挂到 /Volumes 之外不能绕过 —— 2026-09-19 实测：挂载本身成功，读它仍被拒。）" +
+		"\n注意：面板二进制升级后系统可能重新拦截（二进制变了），需要再授权一次。"
+}
 
 // volumeTCCGuide 是给用户的完整指引（前端会把每一行都显示出来，不是一行 errno）。
 func volumeTCCGuide(path string) string {
 	return fmt.Sprintf("macOS 隐私保护拦住了对外接卷 %s 的访问：operation not permitted。"+
-		"面板以 root 的 LaunchDaemon 运行、没有用户会话，读写 /Volumes 下的外接盘会被系统拒绝。\n%s",
-		path, tccSolution)
+		"面板以 root 的 LaunchDaemon 运行、没有用户会话，系统对可移除宗卷的读写要求用户授权，"+
+		"后台进程连询问窗口都不会弹。\n%s",
+		path, tccSolution())
 }
 
 // isPermissionDenied 判断 err 链上是否是一次**真实的**权限拒绝（EPERM/EACCES）。
@@ -327,38 +353,54 @@ func errPathCandidates(err error) []string {
 	return out
 }
 
-// withinVolumes 判断 p 是否就是 /Volumes 或在其之下（按路径分段比较，不用裸前缀字符串，
-// 免得把 /Volumes2/... 这类路径也算进来）。
-func withinVolumes(p string) bool {
+// nonSystemVolumeMountsFn 是"本机所有非系统卷挂载点"的探测入口。
+//
+// 变量而非常量：单测必须能注入固定的挂载点列表 —— 否则断言会随
+// **跑测试那台机器**上有没有插外接盘而变（本机就插着一块 4T 盘）。
+var nonSystemVolumeMountsFn = files.NonSystemVolumeMounts
+
+// onNonSystemVolume 判断 p 是否落在某个非系统卷的挂载点之下（含挂载点本身）。
+//
+// 按路径分段比较，不用裸前缀字符串，免得把 /Volumes2 这类路径算进来。
+func onNonSystemVolume(p string) bool {
 	p = filepath.Clean(strings.TrimSpace(p))
-	if p == "" || p == "." {
+	if p == "" || p == "." || p == "/" {
 		return false
 	}
-	return p == volumeMountRoot || strings.HasPrefix(p, volumeMountRoot+string(os.PathSeparator))
+	for _, mp := range nonSystemVolumeMountsFn() {
+		mp = filepath.Clean(strings.TrimSpace(mp))
+		if mp == "" || mp == "/" {
+			continue
+		}
+		if p == mp || strings.HasPrefix(p, mp+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // volumeTCCPath 判断这次失败是否是"macOS 隐私保护拦住外接卷"；命中则返回用户访问的那个路径。
 //
-// 两道判据缺一不可：① 真实 errno 是 EPERM/EACCES；② **出错的那个路径**在 /Volumes 下。
+// 两道判据缺一不可：① 真实 errno 是 EPERM/EACCES；② **出错的那个路径**落在非系统卷上。
 //
 // 路径优先取 err 自带的 PathError/LinkError（谁出错看谁，不会张冠李戴）；
 // 只有当 err 完全没带路径时，才退回调用方从请求里取的 explicit 路径。
-// 反过来，如果 err 带了路径但都不在 /Volumes，就**不**再看 explicit ——
-// 否则"从普通目录重命名进 /Volumes"这类失败会被误报成外接卷 TCC 问题。
+// 反过来，如果 err 带了路径但都不在非系统卷上，就**不**再看 explicit ——
+// 否则"从普通目录重命名进外接卷"这类失败会被误报成外接卷 TCC 问题。
 func volumeTCCPath(err error, explicit ...string) (string, bool) {
 	if err == nil || !isPermissionDenied(err) {
 		return "", false
 	}
 	if paths := errPathCandidates(err); len(paths) > 0 {
 		for _, p := range paths {
-			if withinVolumes(p) {
+			if onNonSystemVolume(p) {
 				return filepath.Clean(p), true
 			}
 		}
 		return "", false
 	}
 	for _, p := range explicit {
-		if withinVolumes(p) {
+		if onNonSystemVolume(p) {
 			return filepath.Clean(p), true
 		}
 	}

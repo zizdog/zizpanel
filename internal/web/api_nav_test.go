@@ -485,8 +485,27 @@ func navExport(t *testing.T, ts *httptest.Server, cookies []*http.Cookie) navExp
 }
 
 func navDocEqual(a, b navExportDoc) bool {
-	// exported_at 每次都不同，不参与比较。
+	// 每次导出/导入都会变的字段不参与比较：
+	//   · exported_at —— 导出时刻；
+	//   · 每行的 created_at —— 导入是"整份重建"（见 store.ReplaceNav：显式沿用 id，
+	//     行本身由默认值重新落库），创建时刻自然变成导入那一刻。
+	// 以前只清了 exported_at，于是**跨秒边界**时这条门禁会偶发失败
+	// （2026-09-19 实测：before 21:07:55 / after 21:07:56），报出来的却是
+	// "导出→导入→导出 不一致"，看起来像导入丢了字段 —— 实际只是时钟走了 1 秒。
+	// 其余字段（名称/URL/图标/描述/新标签/sort/分组关系/id）仍然逐字段严格比较。
 	a.ExportedAt, b.ExportedAt = "", ""
+	for i := range a.Groups {
+		a.Groups[i].CreatedAt = ""
+	}
+	for i := range b.Groups {
+		b.Groups[i].CreatedAt = ""
+	}
+	for i := range a.Items {
+		a.Items[i].CreatedAt = ""
+	}
+	for i := range b.Items {
+		b.Items[i].CreatedAt = ""
+	}
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)
 	return string(ab) == string(bb)

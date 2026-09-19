@@ -126,12 +126,15 @@ export function DisksView(content, ctx = {}) {
       + (data.fstab_readable ? '' : '（读不到：' + (data.fstab_error || '未知原因') + '）') }));
     (data.notes || []).forEach((n) => status.append(h('div.hint', { text: '· ' + n })));
 
-    // 外接盘/卷的静态提示：什么时候会被 macOS 隐私保护挡住、面板给的解法是什么。
+    // 外接盘/卷的静态提示：macOS 隐私保护会挡住外接盘，**只能人工授权**（实测过），
     // 静态写在页面上，不让用户先在文件管理里撞一次 EPERM 才知道。
     status.append(h('div', { style: { marginTop: '8px' } }, [
-      h('span.pill', { text: '外接盘/卷' }),
-      h('span.hint', { text: ' 文件管理直接读 /Volumes 下的外接盘会被 macOS 隐私保护拒绝（operation not permitted）；'
-        + '用下面的「挂载到自定义挂载点…」把它挂到 ' + customBase() + ' 下，再让文件管理访问那个路径（挂载本身不需要授权）。' }),
+      h('span.pill.warn', { text: '外接盘/卷' }),
+      h('span.hint', { text: ' 文件管理读写外接盘（可移除宗卷）会被 macOS 隐私保护拒绝（operation not permitted）：'
+        + '面板是 root 后台进程、没有用户会话，系统连询问窗口都不会弹。放行只能人工授权一次 —— '
+        + '系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 ' + panelBin()
+        + '（这块盘还要给镜像站/站点用，就把 nginx 二进制也加上）→ 打开开关 → 重启面板。'
+        + '换挂载点不能绕过（已实测：挂载本身成功，读它仍被拒）；升级面板后可能要再授权一次。' }),
     ]));
     status.append(h('div', { style: { marginTop: '8px' } }, [
       h('span.pill.warn', { text: '危险操作' }),
@@ -252,16 +255,6 @@ export function DisksView(content, ctx = {}) {
       disabled: sys || !p.mounted,
       onclick: () => doAction(p, 'unmount'),
     }));
-    // 「挂载到自定义挂载点」：给外接盘绕开 macOS 隐私保护（TCC）的入口。
-    // 条件与「挂载」按钮一致（系统盘/已挂载/加密锁定不可用）。
-    out.push(h('button.btn.btn-sm', {
-      text: '挂载到自定义挂载点…',
-      title: sys ? '系统盘，禁用：' + reason
-        : (p.mounted ? '已经挂载了' : (p.locked ? '加密卷锁定，需人工解锁（无头环境不可用）'
-          : '挂到 ' + customBase() + ' 下（/Volumes 之外），绕开 macOS 对外接盘的隐私保护')),
-      disabled: sys || p.mounted || p.locked,
-      onclick: () => openCustomMountDialog(p),
-    }));
     let amReason = '';
     if (sys) amReason = '系统盘，禁用：' + reason;
     else if (p.whole_disk) amReason = '整盘不能设置开机自动挂载，请选某个卷';
@@ -373,58 +366,18 @@ export function DisksView(content, ctx = {}) {
 
   // ---------- 安全动作 ----------
 
-  // customBase 是后端允许的「自定义挂载点」前缀（<面板安装根>/mnt，由 /system/disks 下发）。
-  function customBase() {
-    return (snapshot && snapshot.custom_mount_base) || '/opt/zizpanel/mnt';
-  }
-
-  // suggestCustomMountPoint 预填 <安装根>/mnt/<卷名>（后端只接受这个前缀下的目录）。
-  function suggestCustomMountPoint(p) {
-    const name = String(p.volume_name || p.id || '').trim().replace(/[/\\]/g, '-');
-    return customBase() + '/' + (name || p.id);
-  }
-
-  // openCustomMountDialog 挂到自定义挂载点：把外接盘挂到 /Volumes 之外再访问。
+  // panelBin 是面板自己的可执行文件路径（由 /system/disks 下发，非默认安装也对）。
   //
-  // 为什么需要：面板以 root 的 LaunchDaemon 运行、没有用户会话，文件管理读
-  // /Volumes/<卷> 会被 macOS 隐私保护（TCC）以 operation not permitted 拒绝——
-  // 而**挂载本身不受这条保护限制**。后端仍会校验挂载点必须落在 customBase() 下。
-  // ⚠️ 这条路径尚未在真实 root 面板 + 外接盘上实测（见 docs/磁盘工具.md）。
-  function openCustomMountDialog(p) {
-    const input = h('input.input', { type: 'text', value: suggestCustomMountPoint(p), spellcheck: false });
-    const errBox = h('div');
-    const goBtn = h('button.btn.btn-primary', { text: '挂载' });
-    const m = modal({
-      title: '挂载到自定义挂载点 · ' + p.id,
-      body: h('div', [
-        h('p.hint', { text: '把卷挂到 /Volumes 之外再访问：文件管理读 /Volumes 下的外接盘会被 macOS 隐私保护拒绝，'
-          + '而挂载本身不需要授权。' }),
-        h('div.field', [h('label', { text: '挂载点目录（必须在 ' + customBase() + ' 下；不存在会自动创建）' }), input]),
-        h('div.hint.mono', { text: '将执行：diskutil mount -mountPoint <目录> ' + p.id }),
-        errBox,
-      ]),
-      footer: [h('button.btn', { text: '取消', onclick: () => m.close() }), goBtn],
-    });
-    goBtn.addEventListener('click', async () => {
-      const mp = input.value.trim();
-      if (!mp) { errBox.textContent = '请填写挂载点目录'; return; }
-      goBtn.disabled = true; goBtn.textContent = '挂载中…';
-      try {
-        const r = await api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/mount`), { mount_point: mp });
-        m.close();
-        toast((r && r.message) || '已挂载', 'ok', 9000);
-        renderMountResult(p, r);
-        load(false);
-      } catch (e) {
-        clear(errBox);
-        errBox.append(h('div', { style: { marginTop: '8px' } }, [
-          h('span.pill.danger', { text: '挂载失败' }),
-          h('span.hint', { text: ' ' + ((e && e.message) || String(e)) }),
-        ]));
-        goBtn.disabled = false; goBtn.textContent = '挂载';
-      }
-    });
+  // 用途只有一个：外接盘被 macOS 隐私保护拒绝时，告诉用户**去系统设置里给谁授权**。
+  function panelBin() {
+    return (snapshot && snapshot.panel_binary) || '/opt/zizpanel/bin/zizpanel';
   }
+
+  // 注：「挂载到自定义挂载点…」入口已删除（2026-09-19）。
+  // 它当初是作为"绕开 macOS 对外接盘的隐私保护"的解法加进来的，实测证伪：
+  // 挂到 /Volumes 之外后挂载成功，但面板读那个路径仍然 operation not permitted
+  // （TCC 按**卷**判定，与挂载点无关）。留着一个做不到的按钮比没有更糟，
+  // 所以入口去掉；后端 `mount_point` 能力保留（API 可用，见 api_disks.go）。
 
   // renderMountResult 把结果（含**回读**挂载点）留在页面上，不只是一闪而过的 toast。
   function renderMountResult(p, r) {
@@ -437,7 +390,7 @@ export function DisksView(content, ctx = {}) {
         h('span.sub', { text: p.id + (p.volume_name ? '（' + p.volume_name + '）' : '') }),
       ]),
       h('div.mono', { style: { marginTop: '6px' }, text: r.mount_point ? ('挂载点：' + r.mount_point) : (r.message || '回读没有给出挂载点') }),
-      h('div.hint', { text: '文件管理里的「位置」下拉现在应能看到它（在 ' + customBase() + ' 下）。' }),
+      h('div.hint', { text: '文件管理里的「位置」下拉现在应能看到它；读不到多半是 macOS 隐私保护（见上方「外接盘/卷」那行）。' }),
     ]));
   }
 
@@ -450,6 +403,9 @@ export function DisksView(content, ctx = {}) {
     try {
       const r = await api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/${action}`), {});
       toast(r && r.message ? r.message : verb + '完成', 'ok');
+      // 挂载后把**回读**到的挂载点留在页面上（不只是一闪而过的 toast）：
+      // 挂载点是否真的生效，只能看回读结果。
+      if (action === 'mount') renderMountResult(p, r);
     } catch (e) {
       toast(e && e.message ? e.message : String(e), 'err', 9000);
     } finally { load(false); }

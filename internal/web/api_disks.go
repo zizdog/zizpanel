@@ -904,15 +904,16 @@ func defaultMountPoint(volumeName, id string) string {
 	return "/Volumes/" + name
 }
 
-// ---------- 自定义挂载点（绕开 macOS 对外接卷的隐私保护） ----------
+// ---------- 自定义挂载点（把卷挂到 <安装根>/mnt 下的 API 能力） ----------
 //
-// 背景：面板以 root 的 LaunchDaemon 运行、没有用户会话，文件管理读写
-// /Volumes 下的外接盘会被 macOS 隐私保护（TCC）以 EPERM 拒绝。**挂载本身
-// 不受这条保护限制**，所以把卷挂到 /Volumes 之外（默认 <安装根>/mnt/<名字>）
-// 再访问，是面板自己能执行、不需要任何人工 GUI 授权的解法。
-//
-// ⚠️ 诚实标注：这条路径**尚未在真实 root 面板 + 外接盘上实测**（需要正式面板
-// 与外接盘；本机调试实例是在用户会话里，走的不是同一条拒绝路径）。
+// 🚨 这个功能**不是** macOS 隐私保护（TCC）的解法 —— 2026-09-19 实测证伪：
+//   · `diskutil mount -mountPoint /opt/zizpanel/mnt/ZPMirror disk4s1` → 挂载成功；
+//   · 面板（root LaunchDaemon）读那个新路径 → 仍然 operation not permitted；
+//   · 系统日志：kTCCServiceSystemPolicyRemovableVolumes + 「Background Session …
+//     record_denial」—— 这条保护按**卷**判定，与挂载路径无关，后台进程连询问
+//     窗口都不会弹。所以"挂到 /Volumes 之外"绕不过去（见 api_files.go 顶部）。
+// 因此前端的「挂载到自定义挂载点…」入口已删除；这里只保留 API 能力本身
+// （把卷挂到指定目录是有效的磁盘操作），调用方要清楚它不解决 TCC。
 
 // diskMountReq 是挂载动作的**可选**请求体。MountPoint 为空时行为不变（挂到 /Volumes）。
 type diskMountReq struct {
@@ -944,7 +945,8 @@ func (s *Server) customMountBase() string {
 // resolveCustomMountPoint 校验自定义挂载点并**建好目录**（不存在则先建）。
 //
 // 只允许 <安装根>/mnt/<单个目录名>，且解析软链接后仍在这个前缀内；
-// 落在 /Volumes 下的挂载点直接拒绝 —— 那正是要被绕开的隐私保护位置。
+// 落在 /Volumes 下的挂载点直接拒绝：那不叫「自定义」位置（默认挂载点就是它）。
+// 注意这**不是** TCC 的解法 —— 实测证明换挂载点后读卷仍被拒（见本节顶部结论）。
 func (s *Server) resolveCustomMountPoint(raw string) (string, error) {
 	p := filepath.Clean(strings.TrimSpace(raw))
 	if !filepath.IsAbs(p) {
@@ -962,7 +964,7 @@ func (s *Server) resolveCustomMountPoint(raw string) (string, error) {
 		return x == "/Volumes" || strings.HasPrefix(x, "/Volumes"+string(os.PathSeparator))
 	}
 	if inVolumes(p) {
-		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那正是要被绕开的位置）")
+		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那不叫自定义挂载点）")
 	}
 	// 目录不存在则先建：`diskutil mount -mountPoint` 要求挂载点目录已存在。
 	if err := os.MkdirAll(p, 0o755); err != nil {
@@ -981,7 +983,7 @@ func (s *Server) resolveCustomMountPoint(raw string) (string, error) {
 		return "", fmt.Errorf("自定义挂载点解析后越出 %s，拒绝", base)
 	}
 	if inVolumes(real) {
-		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那正是要被绕开的位置）")
+		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那不叫自定义挂载点）")
 	}
 	return real, nil
 }
@@ -1000,9 +1002,13 @@ type diskListView struct {
 	FstabError    string          `json:"fstab_error,omitempty"`
 	Notes         []string        `json:"notes"`
 	// CustomMountBase 是「挂载到自定义挂载点」允许的前缀（<安装根>/mnt），
-	// 供前端预填路径。放在响应里而不是前端写死 /opt/zizpanel，非默认安装才正确。
+	// 供 API 调用方预填路径。放在响应里而不是写死 /opt/zizpanel，非默认安装才正确。
 	CustomMountBase string `json:"custom_mount_base"`
-	CollectedAt     string `json:"collected_at"`
+	// PanelBinary 是面板自己的可执行文件路径。给前端显示"去系统设置里给谁授权"用：
+	// 外接盘被 macOS 隐私保护拒绝时，只有人工给这个二进制授权才能放行
+	// （换挂载点没用 —— 见 api_files.go 顶部 2026-09-19 的实测结论）。
+	PanelBinary string `json:"panel_binary"`
+	CollectedAt string `json:"collected_at"`
 }
 
 func (s *diskSnapshot) view() diskListView {
@@ -1046,6 +1052,9 @@ func (s *Server) handleDiskList(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "disk_list", "", fmt.Sprintf("%d 组设备", len(snap.Groups)), true, "")
 	v := snap.view()
 	v.CustomMountBase = s.customMountBase()
+	// 与文件管理里的 TCC 指引用**同一个**来源（见 api_files.go 的 panelBinaryForGuide）：
+	// 两处各算一次是"同一事实两个来源"，非默认安装时必然写出两个不同路径。
+	v.PanelBinary = panelBinaryForGuide
 	ok(w, v)
 }
 
@@ -1080,7 +1089,8 @@ type diskActionResult struct {
 // diskMountAction 执行挂载/卸载，并**回读真实状态**确认结果。
 //
 // customMountPoint 非空（仅 mount）时改用 `diskutil mount -mountPoint <dir> <id>`：
-// 把外接盘挂到 /Volumes 之外，绕开 macOS 对外接卷的隐私保护（见 resolveCustomMountPoint）。
+// 把外接盘挂到 <安装根>/mnt 下的指定目录（见 resolveCustomMountPoint）。
+// 这不是 TCC 的解法：实测证明换挂载点后读卷仍被拒（见本节顶部结论）。
 func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action, customMountPoint string) {
 	id := r.PathValue("id")
 	snap, err := collectDiskSnapshot(r.Context())

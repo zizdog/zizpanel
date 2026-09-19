@@ -1,19 +1,16 @@
 package web
 
-// api_disks_custommount_test.go —— 「挂载到自定义挂载点」的门禁。
+// api_disks_custommount_test.go —— 「把卷挂到 <安装根>/mnt 下」这条 API 能力的门禁。
 //
-// 为什么有这个能力：面板以 root 的 LaunchDaemon 运行、没有用户会话，文件管理读
-// /Volumes 下的外接盘会被 macOS 隐私保护（TCC）以 EPERM 拒绝；而**挂载本身不受
-// 这条限制**。把卷挂到 /Volumes 之外（<安装根>/mnt/...）再访问，是面板自己能执行、
-// 不需要任何人工 GUI 授权的解法（见 docs/磁盘工具.md 第七节）。
-//
-// ⚠️ 诚实标注：换挂载点是否真能绕开 TCC **尚未在真实 root 面板 + 外接盘上实测**。
-// 这里锁的是代码行为（命令形态、回读、挂载点白名单），不是那条系统结论。
+// 🚨 这个能力**不是** macOS 隐私保护（TCC）的解法 —— 2026-09-19 实测证伪：
+// 把卷挂到 /Volumes 之外后挂载成功，面板读那个路径仍然 operation not permitted
+// （TCC 按**卷**判定，与挂载点无关，见 api_files.go 顶部）。前端的
+// 「挂载到自定义挂载点…」入口已因此删除，这里只锁后端 API 行为本身。
 //
 // 安全边界（面板是 root，必须严）：
 //   - 只允许 <面板安装根>/mnt/<单个目录名>，别处一律 400 且不执行任何 diskutil 写命令；
 //   - 解析软链接后仍必须在这个前缀内（防 symlink 逃逸）；
-//   - /Volumes 下的"自定义挂载点"直接拒绝 —— 那正是要被绕开的位置。
+//   - /Volumes 下的挂载点直接拒绝（那不叫「自定义」位置）。
 
 import (
 	"net/http"
@@ -98,6 +95,15 @@ func TestDiskListExposesCustomMountBase(t *testing.T) {
 	d := mapGet(out, "data")
 	if got, want := asString(mapGet(d, "custom_mount_base")), srv.customMountBase(); got != want {
 		t.Errorf("custom_mount_base 应为 %q，实际 %q", want, got)
+	}
+	// panel_binary：外接盘被 TCC 拒绝时，前端要用它告诉用户"去系统设置里给谁授权"。
+	// 必须是真实存在的可执行文件路径，不能是猜的默认安装位置。
+	bin := asString(mapGet(d, "panel_binary"))
+	if !filepath.IsAbs(bin) || filepath.Base(bin) != "zizpanel" {
+		t.Errorf("panel_binary 应是绝对路径且以 zizpanel 结尾，实际 %q", bin)
+	}
+	if want := filepath.Join(srv.Cfg.BinDir, "zizpanel"); bin != want {
+		t.Errorf("panel_binary 应来自配置的 BinDir（%q），实际 %q", want, bin)
 	}
 }
 

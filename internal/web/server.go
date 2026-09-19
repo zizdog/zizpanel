@@ -171,6 +171,9 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		static:      sub,
 		startAt:     time.Now(),
 	}
+	// TCC 指引里"要去系统设置里授权"的那个二进制路径按配置解析一次：
+	// 非默认安装根（BinDir 配在别处）也能给出正确路径。
+	setPanelBinaryForGuide(cfg.BinDir)
 	// 转发器的解析器走 web 包的可注入变量（proxyLookupHostFn），
 	// 这样单测能把域名解析钉成假数据，绝不碰真实网络。
 	s.forwarders = proxies.NewManager(proxies.ManagerOptions{

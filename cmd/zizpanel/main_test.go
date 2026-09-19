@@ -28,25 +28,33 @@ func TestProcessAliveAsNonRoot(t *testing.T) {
 
 // 如果本机存在 root 进程（launchd 本身），普通用户也必须能正确判断。
 func TestProcessAliveForRootProcess(t *testing.T) {
+	// 样本用 **PID 1**（launchd：root、永远在；普通用户向它发信号只会拿到 EPERM ——
+	// 正是老实现误报"已停止"的那个场景）。
+	// 以前这里取 `ps` 输出里**第一个** root 进程：那个 PID 完全可能在 `ps` 与判定之间
+	// 就退出（2026-09-19 实测踩到，pid 164），于是门禁偶发失败，报出来的却是
+	// "普通用户检测不到 root 进程"——看起来像功能坏了，其实是被测对象消失了。
+	// 教训：门禁的样本必须**寿命长于测试**，否则测的是调度运气。
+	if !processAlive(1) {
+		t.Fatalf("普通用户应能检测到 root 进程 1（launchd）存活（这正是之前的 bug）")
+	}
+	// 再顺带看一个别的 root 进程：有就一并验，取不到 / 刚好退出都不算失败。
 	out, err := exec.Command("/bin/ps", "-axo", "pid,user").Output()
 	if err != nil {
-		t.Skip("无法列出进程")
+		return
 	}
-	rootPID := 0
 	for _, ln := range splitLines(string(out)) {
 		f := fields(ln)
-		if len(f) == 2 && f[1] == "root" {
-			if n, err := strconv.Atoi(f[0]); err == nil && n > 1 {
-				rootPID = n
-				break
-			}
+		if len(f) != 2 || f[1] != "root" {
+			continue
 		}
-	}
-	if rootPID == 0 {
-		t.Skip("未找到 root 进程")
-	}
-	if !processAlive(rootPID) {
-		t.Fatalf("普通用户应能检测到 root 进程 %d 存活（这正是之前的 bug）", rootPID)
+		n, err := strconv.Atoi(f[0])
+		if err != nil || n <= 1 {
+			continue
+		}
+		if !processAlive(n) {
+			t.Logf("样本 pid %d 在采样后消失（竞态，不计失败）", n)
+		}
+		return
 	}
 }
 
