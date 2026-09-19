@@ -106,7 +106,7 @@ const MARKET = {
       service_label: 'com.zizdog.frpc', service_in_launchd: true, panel_installer: 'frpc',
       config_path: 'frpc.toml', post_install_hint: '① serverAddr/serverPort 要改成你自己 frps 的地址与端口',
       ui: { slug: 'frpc', console_only: true, prefer_direct: true, note: 'frpc 的 admin UI 在 7400' },
-      port_url: 'http://192.168.1.4:7400/',
+      port_url: 'http://mirror.example.com:7400/',
       uninstall: { kind: 'installer', service: 'com.zizdog.frpc', steps: ['停止并删除 launchd 服务', '删除 ~/frpc'], data_paths: ['/Users/zizdog/frpc'], keep_note: '配置与数据会保留' },
     },
     {
@@ -139,15 +139,15 @@ const MARKET = {
       id: 'it-tools', name: 'IT-Tools（开发者工具箱）', icon: '🧰', category: 'tool', kind: 'compose',
       summary: '几十个开发者常用小工具，纯前端', description: '开发者小工具合集。',
       port: 8083, installed: true, adopted: true, available: true,
-      service_label: 'it-tools', service_in_launchd: false, port_url: 'http://192.168.1.4:8083/',
+      service_label: 'it-tools', service_in_launchd: false, port_url: 'http://mirror.example.com:8083/',
       compose_yaml: 'services:\n  it-tools:\n    image: ghcr.io/corentinth/it-tools:latest\n',
       // 后端真实字段：App.DockerReference → docker_reference；
       // market item 还有别名 docker_recommended（见 api_services.go）。
       docker_reference: true,
       images: ['ghcr.io/corentinth/it-tools:latest'],
-      compose_url: 'http://192.168.1.8:8090/compose/it-tools/docker-compose.yml',
-      compose_env_url: 'http://192.168.1.8:8090/compose/it-tools/.env.example',
-      compose_readme_url: 'http://192.168.1.8:8090/compose/README.md',
+      compose_url: 'https://mirror.example.com/compose/it-tools/docker-compose.yml',
+      compose_env_url: 'https://mirror.example.com/compose/it-tools/.env.example',
+      compose_readme_url: 'https://mirror.example.com/compose/README.md',
       ui: { slug: 'it-tools' },
       docs_url: 'https://github.com/CorentinTh/it-tools',
       uninstall: { kind: 'service', service: 'it-tools', steps: ['docker compose down（删除容器与网络）'], keep_note: 'compose 应用只删容器与网络，**具名卷（数据）保留**' },
@@ -156,7 +156,7 @@ const MARKET = {
       id: 'uptime-kuma', name: 'Uptime Kuma', icon: '📡', category: 'tool', kind: 'compose',
       summary: '自托管服务监控与告警', description: '监控网站与服务的可用性。',
       port: 3001, installed: true, adopted: true, available: true,
-      service_label: 'uptime-kuma', service_in_launchd: false, port_url: 'http://192.168.1.4:3001/',
+      service_label: 'uptime-kuma', service_in_launchd: false, port_url: 'http://mirror.example.com:3001/',
       compose_yaml: 'services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:1\n',
       // 只有内容、没有下载地址：docker 卡片上必须给「复制 compose 配置」（不能是空操作）。
       // 标记走 market item 的别名 docker_recommended（前端两个字段都要认）。
@@ -186,7 +186,7 @@ const MARKET = {
       docs_url: 'https://ffmpeg.org',
     },
     {
-      // ⚠️ 2026-09-21 用户发火点名的那一类：**有守护进程、装在机器上，但面板里
+      // ⚠️用户发火点名的那一类：**有守护进程、装在机器上，但面板里
       // 没有它的服务记录**（真机就是 nginx 在 :80 上跑着，面板里却查不到记录）。
       // 这种条目**绝不能**显示「已停止」—— 面板根本不知道它停没停。
       // 它**没有** no_daemon 标记，所以"靠 no_daemon 兜住"在这里不成立：
@@ -197,7 +197,7 @@ const MARKET = {
       // 就测不出这一态了。
       id: 'edge-web', name: 'Edge Web（装了但无面板记录）', icon: '🌐', category: 'lnmp', kind: 'native',
       summary: 'Web 服务器（复刻用户真机：在跑，但面板里没有记录）',
-      description: '复刻 2026-09-21 用户现场：装了、有守护进程，但面板里没有服务记录。',
+      description: '复刻用户现场：装了、有守护进程，但面板里没有服务记录。',
       port: 80, installed: true, adopted: false, available: true,
       service_label: 'homebrew.mxcl.edge-web', service_in_launchd: false,
       docs_url: 'https://nginx.org',
@@ -223,7 +223,7 @@ const MARKET = {
       docs_url: 'https://ollama.com',
     },
     {
-      // 2026-09-21 用户："弱化管纳这个概念 … 用户不需要知道什么是纳管。"
+      // 用户："弱化管纳这个概念 … 用户不需要知道什么是纳管。"
       // adopt_label 非空 = 后端对这条只做 AdoptApp（把本机**已经存在**的服务
       // 登记进面板，不重新安装）。所以卡片主按钮必须是用户语言的「添加到面板」，
       // 界面上不许出现"纳管 / 接入 / 托管"。
@@ -252,7 +252,7 @@ const MARKET = {
       summary: 'PHP 8.2 运行环境', description: 'brew 装的 PHP 8.2（FPM）。', port: 9000,
       installed: true, adopted: true, available: true,
       service_label: 'homebrew.mxcl.php@8.2', service_in_launchd: true,
-      ui: { slug: 'php82' }, port_url: 'http://192.168.1.4:9000/',
+      ui: { slug: 'php82' }, port_url: 'http://mirror.example.com:9000/',
       uninstall: { kind: 'forget', service: 'php82', steps: ['从「服务管理」中删除这条记录'] },
     },
     {
@@ -310,7 +310,7 @@ const SERVICES = {
     // 合并后必须只剩一行，状态取在跑的那条、plist 路径补自另一条。
     SV({ name: 'php82', display_name: 'PHP 8.2 (FPM)', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'homebrew.mxcl.php@8.2', config_path: '/opt/homebrew/etc/php/8.2/php-fpm.d/www.conf', log_path: '/opt/homebrew/var/log/php-fpm.log', state: { running: true, status: 'running', detail: 'pid 1234' } }),
     SV({ name: 'sh-brew-php8-2', display_name: 'PHP 8.2', icon: '🐘', kind: 'native', port: 0, category: 'lnmp', managed: false, launch_label: 'sh.brew.php8-2', plist_path: '/Users/zizdog/Library/LaunchAgents/homebrew.mxcl.php@8.2.plist', health: { checked: false }, state: { running: false, status: 'stopped', detail: '未在运行' } }),
-    // ---- 「需要处理」筛选合并的夹具（2026-09-21）----
+    // ---- 「需要处理」筛选合并的夹具（2026-09-18）----
     // 三种"需要处理"必须**全部**被合并后的一个筛选命中：
     //   ① 启动失败（status=error）  ② 运行时不可用（status=unavailable）
     //   ③ 健康检查没通过（health.checked && !health.ok）
@@ -337,7 +337,7 @@ await page.addInitScript(({ MARKET, SERVICES, CREDS }) => {
   window.__calls = [];
   // 服务夹具也挂到 window 上：page.evaluate 里要用**旧定义**独立重算
   // "需要处理"筛选的期望值（SERVICES 本身只是 addInitScript 的闭包参数，
-  // 在 evaluate 里取不到 —— 2026-09-21 这里踩过一次 ReferenceError）。
+  // 在 evaluate 里取不到 —— 2026-09-18 这里踩过一次 ReferenceError）。
   window.__servicesFixture = SERVICES;
   // 每次写请求的**请求体**（"方法 路径" → body 字符串）。
   // 2026-09-19 起一键 LNMP 必须带上用户选的版本，所以必须能看到 body：
@@ -489,7 +489,7 @@ const result = await page.evaluate(async () => {
   const activeTabOf = (box) => Array.from(box.querySelectorAll('[data-tab]'))
     .find((b) => b.classList.contains('btn-primary'))?.getAttribute('data-tab') || null;
   // 卡片上的"已安装"判据：pill 文案里有「已安装」。
-  // 2026-09-21 起面板里不再有「已纳管」这个 pill（内部词，用户要求弱化），
+  // 起面板里不再有「已纳管」这个 pill（内部词，用户要求弱化），
   // 面板有记录的应用显示的就是「已安装」。
   const looksInstalled = (c) => /已安装/.test(c.textContent || '');
 
@@ -610,7 +610,7 @@ const result = await page.evaluate(async () => {
   // 「只显示打开、不显示直链」：任何一张已安装卡片都不许出现「直链」。
   out.installed.anyDirect = mcards.some((r) => btns(r).some((t) => t.includes('直链')));
   out.installed.withOpen = mcards.filter((r) => btns(r).some((t) => t === '打开')).map((r) => r.getAttribute('data-app-name'));
-  // ---- ②g 状态命名（2026-09-21 用户发火的那一条）----
+  // ---- ②g 状态命名（用户发火的那一条）----
   //  "以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、FFmpeg、Nginx、
   //   phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
   // 这里把每张已安装卡片上的**状态 pill** 单独采出来（pill 是卡片里的
@@ -636,8 +636,8 @@ const result = await page.evaluate(async () => {
   }
   svcBox.remove();
 
-  // ---- ②f 筛选合并（2026-09-21）：4 项、且「需要处理」不漏卡 ----
-  //  用户在 2026-09-21 指出「异常」与「仅健康检查失败」重复（后者是前者的子集），
+  // ---- ②f 筛选合并（2026-09-18）：4 项、且「需要处理」不漏卡 ----
+  //  用户在指出「异常」与「仅健康检查失败」重复（后者是前者的子集），
   //  而且这两个名字对用户都没有意义。现在只剩 4 项，其中「需要处理」是唯一的
   //  "有问题"入口。这里独立按**旧定义**重算期望值（不复用被测代码的判据），
   //  断言：原本能被「异常」或「仅健康检查失败」命中的卡片，一张都不少。
@@ -822,7 +822,7 @@ const result = await page.evaluate(async () => {
 
 // ---------- 3b. 卸载确认框：确认后必须**真的**发请求 ----------
 //
-// 2026-09-21 真机事故：marketUninstallButton 的确认按钮写的是
+// 真机事故：marketUninstallButton 的确认按钮写的是
 // `close(); resolve(true)`，而 modal 的 close() 会**同步**触发 onClose 里的
 // resolve(false) —— Promise 先被定死为 false，`if (!okGo) return;` 直接返回。
 // 用户点「确认卸载」后：对话框关了、没有请求、没有进度、没有提示
@@ -883,7 +883,7 @@ const infoOf = (name) => {
     manageCount: b.filter((t) => t.includes('管理')).length,
     refresh: b.some((t) => t.includes('刷新')),
     // 2026-09-17：重装 / 文档 / 卸载**不再**摆卡片上，它们收进「⚙️ 管理」面板。
-    // 2026-09-21：「取消纳管」这个词从界面上删掉了，收尾按钮叫「从列表移除（…）」。
+    // 2026-09-18：「取消纳管」这个词从界面上删掉了，收尾按钮叫「从列表移除（…）」。
     reinstall: b.some((t) => t.includes('重装')),
     docs: b.some((t) => t === '文档'),
     uninstall: b.some((t) => t.includes('卸载') || t.includes('从列表移除') || t.includes('删除残留')),
@@ -1071,7 +1071,7 @@ check('已安装：Uptime Kuma（prefer_direct）卡片上有那句逐字提示'
   kumaCard.includes(EXACT_SUBPATH_HINT), kumaCard.slice(0, 300));
 const kumaLinks = result.installed.links['Uptime Kuma'] || [];
 check('已安装：Uptime Kuma 不支持子路径 → 「打开」指向 port_url 的端口',
-  kumaLinks.includes('打开 → http://192.168.1.4:3001/'), show(kumaLinks));
+  kumaLinks.includes('打开 → http://mirror.example.com:3001/'), show(kumaLinks));
 const stirlingText = result.installed.text['Stirling PDF'] || '';
 check('已安装：没有面板界面但有端口（Stirling PDF）也走端口打开 + 逐字提示',
   stirlingText.includes(EXACT_SUBPATH_HINT)
@@ -1086,7 +1086,7 @@ check('已安装：支持子路径的卡片**不**显示那句提示（php82）'
 const kumaPanelLinks = result.panelFromService['Uptime Kuma']?.links || [];
 check('管理面板：Uptime Kuma 仍然有「打开 + 直链」两颗（直链没被删掉）',
   kumaPanelLinks.some((l) => l.text.includes('打开') && l.href === '/uptime-kuma/')
-  && kumaPanelLinks.some((l) => l.text === '直链' && l.href === 'http://192.168.1.4:3001/'),
+  && kumaPanelLinks.some((l) => l.text === '直链' && l.href === 'http://mirror.example.com:3001/'),
   show(kumaPanelLinks.map((l) => l.text + ' → ' + l.href)));
 check('管理面板里同样显示"不支持子路径"小字',
   (result.panelFromService['Uptime Kuma']?.panelText || '').includes('不支持子路径'),
@@ -1161,15 +1161,15 @@ check('docker 卡片：有 compose 内容 → 「复制 compose 配置」',
   show(result.docker.buttons['Uptime Kuma']));
 check('docker 卡片：有 compose 地址 → 「打开 compose 文件」指向接口给的 URL',
   (result.docker.links['IT-Tools（开发者工具箱）'] || [])
-    .includes('打开 compose 文件 → http://192.168.1.8:8090/compose/it-tools/docker-compose.yml'),
+    .includes('打开 compose 文件 → https://mirror.example.com/compose/it-tools/docker-compose.yml'),
   show(result.docker.links['IT-Tools（开发者工具箱）']));
 check('docker 卡片：有 compose_env_url → 「变量样例文件 ↗」（.env.example）',
   (result.docker.links['IT-Tools（开发者工具箱）'] || [])
-    .includes('变量样例文件 ↗ → http://192.168.1.8:8090/compose/it-tools/.env.example'),
+    .includes('变量样例文件 ↗ → https://mirror.example.com/compose/it-tools/.env.example'),
   show(result.docker.links['IT-Tools（开发者工具箱）']));
 check('docker 顶部提示给出全部推荐项目的总索引（compose_readme_url）',
   (result.docker.calloutLinks || [])
-    .includes('查看全部推荐项目的 compose 说明 ↗ → http://192.168.1.8:8090/compose/README.md'),
+    .includes('查看全部推荐项目的 compose 说明 ↗ → https://mirror.example.com/compose/README.md'),
   show(result.docker.calloutLinks));
 check('docker 卡片：接口没给 compose 内容/地址时留出位置并如实说明（n8n）',
   (result.docker.text['n8n（推荐 compose 项目）'] || '').includes('接口还没有提供这个项目的 compose 文件内容/地址'),
@@ -1235,7 +1235,7 @@ check('Nginx（brew 原生）：收尾按钮是「卸载」，而且**没有**�
   && !panelOf('Nginx').some((t) => t.includes('从列表移除') || t.includes('从面板移除') || t.includes('纳管')),
   show(panelOf('Nginx')));
 
-// ---------- ⑧c 用户可见处一个内部词都不许留（2026-09-21） ----------
+// ---------- ⑧c 用户可见处一个内部词都不许留 ----------
 // 卡片、面板文本、工具条一起查。只查"纳管 / 面板托管 / 仅纳管 / 接入管理"，
 // 不查"托管"两个字：应用摘要里有"自托管服务监控"这种正常说法。
 const INTERNAL_WORD = /纳管|面板托管|仅纳管|接入管理/;
@@ -1261,7 +1261,7 @@ check('ffmpeg 面板状态是「命令行工具（无常驻进程）」', /已�
 check('ffmpeg 不查不存在的服务记录', ffLookups.length === 0, ffLookups.join(', '));
 
 // ---------- ⑩ 状态命名：没有守护进程 / 没有面板记录的应用**不许**写「已停止」 ----------
-//  用户 2026-09-21 原话："以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、
+//  用户原话："以下应用都被归类到了：已停止分类中：Docker 运行时（Colima）、
 //  FFmpeg、Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的不运行吗？！"
 //  ffmpeg（no_daemon）与 Nginx（有守护进程但装了没登记）都没有可停止的东西/
 //  面板不知道，写「已停止」就是假信息。

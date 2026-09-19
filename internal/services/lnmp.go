@@ -81,7 +81,7 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 		if _, err := m.brewInstall(ctx, result, 40*time.Minute, f); err != nil {
 			// 失败要能让用户自己救：给出手工命令与镜像提示，不只抛一句 "brew install 失败"。
 			return fmt.Errorf("安装 %s 失败: %w；可在终端手工重试 `brew install %s`"+
-				"（若下载很慢，面板已优先走 NAS 镜像，重跑本任务会继续用镜像）", f, err, f)
+				"（若下载很慢，面板已优先走镜像站，重跑本任务会继续用镜像）", f, err, f)
 		}
 		result.step(ctx, f+" 安装完成")
 	}

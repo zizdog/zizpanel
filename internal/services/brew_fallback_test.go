@@ -11,7 +11,7 @@ import (
 )
 
 // ============================================================================
-//  "brew install 失败即换源" 的回归测试（2026-09-20 真机事故）
+//  "brew install 失败即换源" 的回归测试（真机事故）
 //
 //  现场：装 Qwen3 TTS 时 `brew install python@3.11` 失败，报
 //      Error: Bottle reports different checksum:   a5dd571f…
@@ -235,14 +235,14 @@ func TestBrewInstallAllSourcesFailListsEveryRealError(t *testing.T) {
 }
 
 // TestBrewInstallOfflineModeDoesNotFallBack 锁住与离线模式的交互：
-// 「仅走 NAS」时禁止任何外网回落（项目硬规则），只试 NAS 那一个源。
+// 「仅走镜像站」时禁止任何外网回落（项目硬规则），只试镜像站那一个源。
 func TestBrewInstallOfflineModeDoesNotFallBack(t *testing.T) {
 	m := brewFallbackTestManager(t, "https://mirror.zizdog.com:8888")
 	m.opt.OfflineOnly = true
 
 	srcs := m.brewInstallSources(context.Background(), "python@3.11")
 	if len(srcs) != 1 {
-		t.Fatalf("离线模式只能有 NAS 一个源，实际 %d：%+v", len(srcs), srcs)
+		t.Fatalf("离线模式只能有镜像站一个源，实际 %d：%+v", len(srcs), srcs)
 	}
 
 	var n int

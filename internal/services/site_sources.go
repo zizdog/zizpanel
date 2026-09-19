@@ -12,19 +12,19 @@ import (
 //  一键建站源码包（Typecho / WordPress）的镜像来源
 //
 //  缺陷 D34：这两类应用的源码包原先在 internal/web/api_site_apps.go 里
-//  **直接 curl 官方地址**（只有"官方 + 一个写死的镜像"），既没有 NAS 优先、
+//  **直接 curl 官方地址**（只有"官方 + 一个写死的镜像"），既没有镜像站优先、
 //  也没有测速、更不上报来源，而且完全不校验哈希。实测还发现 Typecho 那个
 //  写死的 jsdelivr 备用地址**已经 404**（2026-09-16），等于只有一个源。
 //
 //  本文件把它纳入与 internal/services/mirror.go 一致的镜像政策：
 //    · 版本**写死**（不追 latest）：追 latest 会让"昨天能装、今天装不上"，
 //      而且 sha256 必然过期；
-//    · NAS 优先：<base>/sites/<app>/<version>/<文件名>（与 /apps/ 同一套布局）；
+//    · 镜像站优先：<base>/sites/<app>/<version>/<文件名>（与 /apps/ 同一套布局）；
 //    · 探不通就**回落**官方源，并把真实来源与耗时写进任务日志；
 //    · 每下一个都核对 **真实 sha256**，不符就删文件并如实失败。
 //
 //  ⚠️ 版本号与 sha256 都是 2026-09-16 **实测**得到（下载官方固定版本地址、
-//  在 NAS 上再算一遍），不是抄文档、不是编的。这个仓库因为编造 sha256 出过
+//  在镜像站上再算一遍），不是抄文档、不是编的。这个仓库因为编造 sha256 出过
 //  "镜像永不命中、静默回落慢源"的事故，所以这里只认真算过的值。
 //
 //  ⚠️ Upstreams 只允许放**字节完全一致**的地址：这里每下一个都要核对同一个
@@ -164,9 +164,9 @@ func (m *Manager) sitePackageMirrorURL(src SiteSource) string {
 	}, "/")
 }
 
-// sitePackageSources 选出这次的下载候选：**NAS 优先，探不通再回落官方**。
+// sitePackageSources 选出这次的下载候选：**镜像站优先，探不通再回落官方**。
 //
-// 风格照抄 iopaintWeightSources：先探 NAS 上的**具体文件**（不是站点根），
+// 风格照抄 iopaintWeightSources：先探镜像站上的**具体文件**（不是站点根），
 // 探到了才排第一并如实标注；探不到就明说"镜像上没有这个版本，回落官方"。
 // 探测走 m.probeMirrorFile，单测用 mirrorFileProbeOverride 注入（不联网）。
 func (m *Manager) sitePackageSources(ctx context.Context, src SiteSource, logf func(string)) []weightSource {
@@ -188,13 +188,13 @@ func (m *Manager) sitePackageSources(ctx context.Context, src SiteSource, logf f
 		return nil
 	}
 	if !m.MirrorEnabled() {
-		logf("未启用 NAS 镜像，源码包来源：" + fallback[0].URL)
+		logf("未启用镜像站，源码包来源：" + fallback[0].URL)
 		return fallback
 	}
 	mirrorURL := m.sitePackageMirrorURL(src)
 	size, err := m.probeMirrorFile(ctx, mirrorURL)
 	if err != nil {
-		logf(fmt.Sprintf("NAS 镜像上没有 %s %s（%v），源码包来源回落到官方源",
+		logf(fmt.Sprintf("镜像站上没有 %s %s（%v），源码包来源回落到官方源",
 			src.Name, src.Version, err))
 		return fallback
 	}
@@ -202,9 +202,9 @@ func (m *Manager) sitePackageSources(ctx context.Context, src SiteSource, logf f
 	if size > 0 {
 		sizeText = humanBytes(size)
 	}
-	logf(fmt.Sprintf("NAS 镜像上有 %s %s（已探通，%s），优先从镜像站下载",
+	logf(fmt.Sprintf("镜像站上有 %s %s（已探通，%s），优先从镜像站下载",
 		src.Name, src.Version, sizeText))
-	return append([]weightSource{{URL: mirrorURL, Label: "NAS 镜像"}}, fallback...)
+	return append([]weightSource{{URL: mirrorURL, Label: "镜像站"}}, fallback...)
 }
 
 // fetchVerifiedSitePackage 按候选顺序下载源码包，**每下一个都核对 SHA256**。
@@ -286,9 +286,9 @@ func siteProgressLogger(logf func(string)) fetchProgressFunc {
 
 // DownloadSitePackage 把某个一键建站应用的源码包下载到 dest，返回选中的来源。
 //
-// 这是 web 层唯一需要调用的入口：**NAS 优先 → 回落官方 → 强制 SHA256 校验**。
+// 这是 web 层唯一需要调用的入口：**镜像站优先 → 回落官方 → 强制 SHA256 校验**。
 // 返回的 src 让调用方知道"固定版本是多少"，label 是给用户看的真实来源
-// （如 "NAS 镜像" / "官方源"）。
+// （如 "镜像站" / "官方源"）。
 func (m *Manager) DownloadSitePackage(ctx context.Context, appID, dest string,
 	logf func(string)) (SiteSource, string, error) {
 

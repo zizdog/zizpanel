@@ -74,9 +74,9 @@ func TestNginxTuningSaveValidatesOnPanelSide(t *testing.T) {
 	}
 }
 
-// TestNginxPanelFrontendWiring：宝塔式配置面板的接线（2026-09-22 合并后只有一条实现路径）。
+// TestNginxPanelFrontendWiring：宝塔式配置面板的接线（2026-09-18 合并后只有一条实现路径）。
 //
-// 用户 2026-09-22 要求把「⚙️ Nginx 管理」「⚡ 上传大小 / 执行时间」合并进一个
+// 用户要求把「⚙️ Nginx 管理」「⚡ 上传大小 / 执行时间」合并进一个
 // 「⚙️ 调整配置」弹窗。这条测试的**本意没变** —— 面板必须真的接到界面上，
 // 而且只能有一条实现路径 —— 合并后判据变成：
 //

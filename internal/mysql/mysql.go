@@ -93,7 +93,7 @@ var (
 	reDBName   = regexp.MustCompile(`^[A-Za-z0-9_$]{1,64}$`)
 	reUserName = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,32}$`)
 	// 主机名允许：字母数字、点、下划线、%、冒号（IPv6）、连字符，
-	// 以及 /（MySQL 支持网段形式的 host，如 10.0.0.0/255.0.0.0）
+	// 以及 /（MySQL 支持网段形式的 host，如 192.0.2.0/255.255.255.0）
 	reHost  = regexp.MustCompile(`^[A-Za-z0-9_.%:/\-]{1,60}$`)
 	reTable = regexp.MustCompile(`^[A-Za-z0-9_$]{1,64}$`)
 )

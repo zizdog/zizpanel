@@ -14,7 +14,7 @@ import (
 //
 //  背景（2026-09-18 用户反馈）：装 Qwen3 TTS 时 `brew install python@3.11`
 //  在用户机器上反复失败，用户看到的现象是"预置的 python 版本装不上"。
-//  真实原因有两层（见 DEVELOPMENT.md 坑 157）：NAS 按需缓存把上游一次
+//  真实原因有两层（见 DEVELOPMENT.md 坑 157）：镜像站按需缓存把上游一次
 //  `200 + 空 body` 永久缓存成了 0 字节文件；而 Housebrew 的 python@3.11
 //  当前补丁（3.11.16）又是**镜像侧最新同步**的那一版，最容易被"同步延迟"命中。
 //
@@ -36,13 +36,13 @@ import (
 //     生产环境验证过整条链路（真机跑的是 3.11.12 的 venv，见
 //     ZizPanel-当前状态.md 的部署记录）；
 //   - IOPaint 的 PyTorch 依赖在 3.11 上同样是稳妥组合；
-//   - 对应的 bottle 在**国内镜像与 NAS 镜像**上都能取到（含依赖闭包，
-//     已用 tools/seed-nas-brew.sh 预置到 NAS，见该脚本的说明与实测输出）。
+//   - 对应的 bottle 在**国内镜像与镜像站**上都能取到（含依赖闭包，
+//     已用 tools/seed-nas-brew.sh 预置到镜像站，见该脚本的说明与实测输出）。
 //
 // 改这个常量之前请先做两件事：
 //
 //	① 用 `bash tools/seed-nas-brew.sh <新 formula>` 把新版本的瓶（含依赖）
-//	   预置到 NAS，并确认每个文件都 sha256 一致 + `X-Cache: HIT`；
+//	   预置到镜像站，并确认每个文件都 sha256 一致 + `X-Cache: HIT`；
 //	② 确认 mlx-audio / iopaint 在新 Python 上有可用的 wheel（PyPI 上的
 //	   cp3xx-macosx_arm64 轮子），否则装到一半才失败。
 const panelPythonFormula = "python@3.11"
@@ -182,7 +182,7 @@ func (m *Manager) pythonRuntimeDependents(formula string) []string {
 // 别的 formula 依赖它）时**如实报错**，不许吞掉当成卸载成功。
 //
 // force=true = 用户在确认框里明确选了「强制卸载」（brew uninstall
-// --ignore-dependencies）。默认**绝不**加这个开关：2026-09-21 用户真机卸载
+// --ignore-dependencies）。默认**绝不**加这个开关：用户真机卸载
 // python@3.13 时正是 brew 因为 llvm/rust 依赖它而拒绝，面板需要先把依赖方
 // 讲清楚并让用户自己选（见 BrewDependencyBlock 与 brewUninstallErrText）。
 func (m *Manager) UninstallPythonRuntime(ctx context.Context, app App, force bool, result *InstallResult) error {

@@ -437,7 +437,7 @@ type PipInstallAction struct {
 	Python string `json:"python"`
 	// Packages 是要安装的包（如 "mlx-audio[server]"）。
 	Packages []string `json:"packages"`
-	// IndexURL 是 pip 索引（空 = 用执行器算出来的：NAS 优先、回落清华）。
+	// IndexURL 是 pip 索引（空 = 用执行器算出来的：镜像站优先、回落清华）。
 	IndexURL string `json:"index_url,omitempty"`
 	// ExtraArgs 是额外参数（如 --upgrade）。
 	ExtraArgs []string      `json:"extra_args,omitempty"`

@@ -68,7 +68,7 @@ func (s *Server) handleLANPreauth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(cidrs) == 0 {
-		fail(w, http.StatusBadRequest, "请至少填一个网段（CIDR），例如 192.168.1.0/24")
+		fail(w, http.StatusBadRequest, "请至少填一个网段（CIDR），例如 192.0.2.0/24")
 		return
 	}
 	if err := lanPreauthApplyFn(ctx, strings.Join(cidrs, ","), nil); err != nil {

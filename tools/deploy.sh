@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  deploy.sh —— 一条命令完成"发布 → 推 NAS → 升级两台机器 → 验证"
+#  deploy.sh —— 一条命令完成"发布 → 推你自己的镜像机 → 升级本机 → 验证"
 #
-#  为什么要有它：以前每次发布是 6~7 个手工步骤（bump/check/release/mirror-nas/
-#  逐文件 scp/两台各自 upgrade），其中**逐文件 scp 每个文件都要重新握一次手、
+#  为什么要有它：以前每次发布是 6~7 个手工步骤（bump/check/release/mirror-public/
+#  逐文件 scp/各自 upgrade），其中**逐文件 scp 每个文件都要重新握一次手、
 #  输一次密码**，是最大的时间浪费。这里全部改成：
 #    · 上传用**一条 tar 流**（一次 ssh 会话）；
-#    · 两台机器的升级**并行**跑；
-#    · 最后打印两台的版本与市场条目做验证。
+#    · 最后打印本机版本与市场条目做验证。
 #
+#  地址由调用者提供，仓库里不留任何内网默认值。
 #  用法：
-#    ZP_PASS='面板口令' NAS_PASS='NAS口令' bash tools/deploy.sh
+#    ZP_PASS='面板口令' NAS_HOST='<你的镜像机>' NAS_USER='<用户>' NAS_ROOT='<镜像目录>' \
+#      MIRROR_URL='https://<你的镜像机>/zizpanel' NAS_PASS='镜像机口令' bash tools/deploy.sh
 #    可选：ZP_USER（默认 admin）、SKIP_CHECK=1 跳过 make check、SKIP_BUILD=1 复用已有产物
 # ============================================================================
 set -euo pipefail
@@ -20,11 +21,15 @@ cd "$REPO_ROOT"
 
 VERSION="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)"
 RELDIR="dist/release"
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
-NAS_ROOT="${NAS_ROOT:-/vol2/zizpanel-mirror/zizpanel}"
-MIRROR_URL="${MIRROR_URL:-http://192.168.1.8:8090/zizpanel}"
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
+NAS_ROOT="${NAS_ROOT:-}"
+MIRROR_URL="${MIRROR_URL:-}"
 ZP_USER="${ZP_USER:-admin}"
+: "${NAS_HOST:?请传 NAS_HOST=<你自己的镜像机>}"
+: "${NAS_USER:?请传 NAS_USER=<镜像机用户>}"
+: "${NAS_ROOT:?请传 NAS_ROOT=<镜像上的 zizpanel 目录>}"
+: "${MIRROR_URL:?请传 MIRROR_URL=<镜像的 zizpanel 地址，如 https://mirror.example.com/zizpanel>}"
 : "${ZP_PASS:?需要面板口令：ZP_PASS='...'}"
 
 # NAS 登录方式：**优先 SSH 密钥**，密钥不通才要 NAS_PASS。
@@ -57,7 +62,11 @@ EOF
   fi
 }
 
-LOCAL_URL="https://127.0.0.1:8443/jab5c63"
+# 面板地址：**后缀从面板自己的配置读**（曾经写死 jab5c63，面板换后缀后就 404 了）。
+# 面板后缀允许为空（面板设置里可以关掉），所以这里按"有则拼、无则不拼"处理。
+PANEL_DATA="${PANEL_DATA:-/opt/zizpanel/data}"
+LOCAL_SUFFIX="${LOCAL_SUFFIX:-$(sed -n 's/.*"panel_suffix"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PANEL_DATA/config.json" 2>/dev/null | head -1)}"
+LOCAL_URL="https://127.0.0.1:8443${LOCAL_SUFFIX:+/$LOCAL_SUFFIX}"
 
 # 🛑 2026-09-17 用户明确要求：1.0.0 起 Mac mini 是**生产环境**，本脚本/本机**只升级本机**。
 # 历史：这里曾有 MINI_URL（局域网 + 后缀）与"并行升级两台"—— 那会让一次 `make deploy`
@@ -85,16 +94,16 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     step "make check（门禁）—— ${stamp_msg}"
     make check
   fi
-  step "make release + mirror-nas（构建 ARCHS=${ARCHS} + 签 NAS 版清单）"
+  step "make release + mirror-public（构建 ARCHS=${ARCHS} + 签公网镜像版清单）"
   make release ARCHS="$ARCHS" >/dev/null
-  make mirror-nas ARCHS="$ARCHS" >/dev/null
+  make mirror-public ARCHS="$ARCHS" >/dev/null
 else
   step "跳过构建（SKIP_BUILD=1），复用 $RELDIR"
 fi
 
 # ---------------------------------------------------------------- 上传 --
 # 一条 tar 流：只握一次手。登录方式见上面的 nas_sh（密钥优先）。
-step "推送到 NAS（单流 tar，版本 ${VERSION}）"
+step "推送到镜像机（单流 tar，版本 ${VERSION}）"
 # 只传**版本的**包（latest 与 download/<版本>/ 的软链/副本由下面的 LAYOUT 在 NAS 上造）。
 # 以前连两份 latest 副本一起传，等于白传一份同样的 46MB。
 FILES=(manifest.json manifest.json.sig install.sh)

@@ -1,6 +1,6 @@
 // tools/sites-url-verify.mjs —— 用真实浏览器验证「站点列表域名列」的新口径。
 //
-// 用户 2026-09-25 明确要求：不要 blog.x / http://blog.x / https://blog.x 三种都列，
+// 用户明确要求：不要 blog.x / http://blog.x / https://blog.x 三种都列，
 // 只显示**域名文本本身**，并且这段文字本身就是链接（target=_blank + rel=noopener）；
 // 协议等附加信息用别的方式表达（小字/title/图标）。
 //

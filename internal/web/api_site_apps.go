@@ -51,7 +51,7 @@ type siteInstallResult struct {
 	Dir    string `json:"dir"`
 	URL    string `json:"url"`
 	// Version / Source 如实告诉用户"装的是哪个固定版本、实际走的哪个源"
-	// （NAS 镜像 / 官方源）。留空表示这个应用还没登记固定版本。
+	// （镜像站 / 官方源）。留空表示这个应用还没登记固定版本。
 	Version   string   `json:"version,omitempty"`
 	Source    string   `json:"source,omitempty"`
 	FinishURL string   `json:"finish_url"`
@@ -66,7 +66,7 @@ type siteInstallResult struct {
 
 // sitePackageFetchFn 下载并校验固定版本源码包。
 //
-// 默认实现走 services.Manager 的"NAS 优先 → 回落官方 → SHA256 校验"
+// 默认实现走 services.Manager 的"镜像站优先 → 回落官方 → SHA256 校验"
 // （见 services/site_sources.go）；单测注入假实现，绝不联网（AGENTS.md 第三节）。
 var sitePackageFetchFn = func(s *Server, ctx context.Context, appID, dest string,
 	logf func(string)) (services.SiteSource, string, error) {
@@ -266,7 +266,7 @@ func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 	s.launchTask(w, r, "site-install", domain, "一键建站 "+app.Name+"（"+domain+"）",
 		"site_app_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res, err := s.installSiteApp(ctx, app, domain, req)
-			// 源码包要从 NAS/GitHub 下：网络类失败附统一提示（见 services/netfail.go）。
+			// 源码包要从镜像站/GitHub 下：网络类失败附统一提示（见 services/netfail.go）。
 			return res, services.AppendNetworkHint(err)
 		})
 }
@@ -333,7 +333,7 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 
 	// ---------- ② 下载 + 解压 ----------
 	//
-	// 固定版本 + NAS 优先 + 强制 SHA256（见 services/site_sources.go）。
+	// 固定版本 + 镜像站优先 + 强制 SHA256（见 services/site_sources.go）。
 	// 原实现直接 curl 目录条目里的地址、不校验哈希；审计还发现 Typecho 那个
 	// 写死的 jsdelivr 备用地址早已 404 —— 一旦 GitHub 不通就完全装不上。
 	logf := func(msg string) { step("%s", msg) }
@@ -362,7 +362,7 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	defer func() { _ = os.Remove(archive) }()
 
 	if hasPinned {
-		// 已登记固定版本：只走实测过的地址（NAS 镜像 → 官方 → 加速），
+		// 已登记固定版本：只走实测过的地址（镜像站 → 官方 → 加速），
 		// 每个地址下完都核对真实 sha256，绝不把 404/坏文件当成"可用备源"。
 		fetched, label, err := sitePackageFetchFn(s, ctx, app.ID, archive, logf)
 		if err != nil {

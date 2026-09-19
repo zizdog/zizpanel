@@ -1,6 +1,6 @@
 package web
 
-// api_disks_test.go —— 磁盘工具的后端门禁。
+// api_disks_test.go —— 磁盘管理的后端门禁。
 //
 // 这里**绝不碰真机磁盘**：全部走 diskExec / diskFstabPath 两个包级测试钩子，
 // 用一个内存里的假 `diskutil` 世界回答 list/info/mount/unmount/apfs。

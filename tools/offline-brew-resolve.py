@@ -234,7 +234,7 @@ def resolve(base, root, tags):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True, help="镜像基址，例如 http://192.168.1.8:8090")
+    ap.add_argument("--base", required=True, help="镜像基址，例如 https://<你自己的镜像机>")
     ap.add_argument("--formula", required=True)
     ap.add_argument("--tag", action="append", default=[],
                     help="目标机器的瓶 tag，可重复（顺序即优先级）。默认 arm64_sequoia")

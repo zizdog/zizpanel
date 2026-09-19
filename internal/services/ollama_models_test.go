@@ -14,7 +14,7 @@ import (
 //  Ollama 模型镜像的契约
 //
 //  单测全程走 httptest / 注入点，不碰真实 registry.ollama.ai、不碰真实镜像站。
-//  真实的端到端验证（NAS → ollama list → ollama run）在交付说明里单独记录。
+//  真实的端到端验证（镜像站 → ollama list → ollama run）在交付说明里单独记录。
 // ============================================================================
 
 // makeOllamaTestSpec 造一个只有几十字节 blob 的测试模型。
@@ -55,7 +55,7 @@ func registerOllamaTestModel(t *testing.T, spec OllamaModelSpec) {
 }
 
 // serveOllamaModel 起一个本地 registry：mirrorPrefix 为空时按公网布局，
-// 否则按 NAS 镜像布局（/models/ollama/...）。返回可能被替换 blob 的服务。
+// 否则按镜像站布局（/models/ollama/...）。返回可能被替换 blob 的服务。
 func serveOllamaModel(t *testing.T, spec OllamaModelSpec, payloads [][]byte, tamperLayer bool) *httptest.Server {
 	t.Helper()
 	manifest, blobs := payloads[0], payloads[1:]
@@ -72,7 +72,7 @@ func serveOllamaModel(t *testing.T, spec OllamaModelSpec, payloads [][]byte, tam
 		}
 		write("/v2/"+spec.Namespace+"/"+spec.Name+"/blobs/sha256:"+spec.blobs()[i].Digest, body)
 	}
-	// NAS 镜像布局：/models/ollama/{manifests/registry.ollama.ai/...,blobs/sha256-...}
+	// 镜像站布局：/models/ollama/{manifests/registry.ollama.ai/...,blobs/sha256-...}
 	write("/models/ollama/manifests/"+ollamaRegistryHost+"/"+spec.Namespace+"/"+spec.Name+"/"+spec.Tag, manifest)
 	for i, b := range blobs {
 		body := b
@@ -131,7 +131,7 @@ func TestOllamaModelRegistryPinned(t *testing.T) {
 	}
 }
 
-// TestOllamaModelSourcesMirrorFirst：NAS 探得通 → 镜像排第一，blob 走 sha256- 布局。
+// TestOllamaModelSourcesMirrorFirst：镜像站探得通 → 镜像排第一，blob 走 sha256- 布局。
 func TestOllamaModelSourcesMirrorFirst(t *testing.T) {
 	spec, _ := makeOllamaTestSpec("")
 	m := &Manager{opt: Options{MirrorBase: "https://mirror.example.com:8888"}}
@@ -146,8 +146,8 @@ func TestOllamaModelSourcesMirrorFirst(t *testing.T) {
 	if len(srcs) != 2 {
 		t.Fatalf("镜像可用时应给出镜像 + 公网两个候选，实际 %d", len(srcs))
 	}
-	if srcs[0].label != "NAS 镜像" {
-		t.Errorf("第一位应是 NAS 镜像，实际 %q", srcs[0].label)
+	if srcs[0].label != "镜像站" {
+		t.Errorf("第一位应是镜像站，实际 %q", srcs[0].label)
 	}
 	u := srcs[0].blobURL(spec.Config.Digest)
 	want := "https://mirror.example.com:8888/models/ollama/blobs/sha256-" + spec.Config.Digest
@@ -159,7 +159,7 @@ func TestOllamaModelSourcesMirrorFirst(t *testing.T) {
 	}
 }
 
-// TestOllamaModelSourcesFallback：NAS 探不通 → 直接公网并如实写明原因。
+// TestOllamaModelSourcesFallback：镜像站探不通 → 直接公网并如实写明原因。
 func TestOllamaModelSourcesFallback(t *testing.T) {
 	spec, _ := makeOllamaTestSpec("")
 	m := &Manager{opt: Options{MirrorBase: "https://mirror.example.com:8888"}}
@@ -192,8 +192,8 @@ func TestEnsureOllamaModelFromMirror(t *testing.T) {
 	if err != nil {
 		t.Fatalf("从镜像拉取应成功：%v", err)
 	}
-	if label != "NAS 镜像" {
-		t.Errorf("来源应为 NAS 镜像，实际 %q", label)
+	if label != "镜像站" {
+		t.Errorf("来源应为镜像站，实际 %q", label)
 	}
 	// 清单与每个 blob 都要真实存在且内容正确。
 	if got := readAll(t, filepath.Join(dir, spec.manifestRelPath())); got != string(payloads[0]) {

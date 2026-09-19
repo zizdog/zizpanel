@@ -60,15 +60,9 @@ BASEDEP_FORMULAS=(ffmpeg)
 
 # DEFAULT_MIRROR_BASE：自建 NAS 镜像默认基址（与面板 config.DefaultMirrorBase 一致）。
 DEFAULT_MIRROR_BASE="${ZIZPANEL_MIRROR_BASE_DEFAULT:-https://mirror.zizdog.com:8888}"
-# 面板发布件在镜像上的子目录（NAS_ROOT 的对外前缀）。
-MIRROR_PANEL_SUBDIR="/zizpanel"
-# 局域网直连 NAS 镜像（比公网入口快约 26 倍，见 AGENTS.md 四）；只探通就用。
-NAS_LAN_MIRROR="http://192.168.1.8:8090"
-
-# 面板在线升级源（写进 config.json 的 upgrade_source）：公网优先，NAS 只作回落。
-# 判据是"清单 + 签名都在"；实测 2026-09-17 公网 manifest.json(+.sig) 与 <NAS>/zizpanel/ 均 200。
+# 面板在线升级源（写进 config.json 的 upgrade_source）：**只有公网**。
+# 判据是"清单 + 签名都在"；实测 2026-09-17 公网 manifest.json(+.sig) 200。
 PANEL_UPGRADE_SOURCE_PUBLIC="${ZIZPANEL_UPGRADE_SOURCE:-https://zizdog.com/zizpanel}"
-PANEL_UPGRADE_SOURCE_LAN="${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}"
 # 升级源是否可用以"清单 + 签名都在"为准（只有清单没有签名，面板会拒绝升级）。
 UPGRADE_MANIFEST_PATH="/manifest.json"
 
@@ -217,7 +211,7 @@ detect_source() {
   done
 
   # 2) 联网下载预编译包：探真实 tarball 地址（目录 HEAD 在 nginx 下常 403 会误判）。
-  # 逐个候选源都试一遍；顺序 = 用户指定 → NAS 公网 → 局域网 NAS → GitHub（只兜底）。
+  # 逐个候选源都试一遍；顺序 = 用户指定 → 公网镜像 → GitHub（只兜底）。
   local arch="arm64" base
   [ "$(uname -m)" = "x86_64" ] && arch="amd64"
   local file="zizpanel_${ZIZPANEL_VERSION}_darwin_${arch}.tar.gz"
@@ -225,7 +219,7 @@ detect_source() {
   if [ -n "$ZIZPANEL_DOWNLOAD_BASE" ]; then
     bases+=("${ZIZPANEL_DOWNLOAD_BASE%/}")
   fi
-  bases+=("$BUILTIN_MIRROR" "${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}" "$GITHUB_RELEASE_BASE")
+  bases+=("$BUILTIN_MIRROR" "$GITHUB_RELEASE_BASE")
   for base in "${bases[@]}"; do
     [ -n "$base" ] || continue
     base="${base%/}"
@@ -296,7 +290,7 @@ download_binaries() {
   info "下载：$url"
   if ! zp_curl_progress "$TMP_DIR/pkg.tar.gz" "$url"; then
     # 自动换到下一个候选源（镜像优先，官方兜底）：用户不必知道镜像地址
-    local -a fallbacks=("$BUILTIN_MIRROR" "${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR}" "$GITHUB_RELEASE_BASE")
+    local -a fallbacks=("$BUILTIN_MIRROR" "$GITHUB_RELEASE_BASE")
     local fb
     local done_ok=0
     for fb in "${fallbacks[@]}"; do
@@ -563,7 +557,7 @@ choose_brew_mirror() {
     return 0
   fi
 
-  # NAS 候选：用户配置/内置默认，再局域网直连；探通才用。
+  # 镜像候选：用户配置 / 内置公网默认；探通才用。
   local nas_candidates=()
   nas="${ZIZPANEL_MIRROR_BASE:-}"
   if [ -z "$nas" ] && [ -f "$DATA_DIR/config.json" ]; then
@@ -572,14 +566,13 @@ choose_brew_mirror() {
       "$DATA_DIR/config.json" 2>/dev/null | head -1)"
   fi
   nas_candidates+=("${nas:-$DEFAULT_MIRROR_BASE}")
-  [ -n "$nas" ] || nas_candidates+=("$NAS_LAN_MIRROR")
   for nas in "${nas_candidates[@]}"; do
     [ -n "$nas" ] || continue
     if brew_api_ok "$nas/brew" "$formula"; then
       HOMEBREW_API_DOMAIN="${nas%/}/brew/api"
       HOMEBREW_BOTTLE_DOMAIN="${nas%/}/brew"
       export HOMEBREW_API_DOMAIN HOMEBREW_BOTTLE_DOMAIN
-      BREW_MIRROR_NAME="自建 NAS 镜像（${HOMEBREW_BOTTLE_DOMAIN}）"
+      BREW_MIRROR_NAME="自建镜像（${HOMEBREW_BOTTLE_DOMAIN}）"
       return 0
     fi
   done
@@ -621,8 +614,6 @@ clt_mirror_note() {
   local base="${ZIZPANEL_MIRROR_BASE:-$DEFAULT_MIRROR_BASE}"
   if probe_clt_mirror "$base"; then
     ok "CLT 镜像可用：${CLT_MIRROR_BASE}/clt/index.json（面板补装 CLT 时会用它）"
-  elif [ -z "${ZIZPANEL_MIRROR_BASE:-}" ] && probe_clt_mirror "$NAS_LAN_MIRROR$MIRROR_PANEL_SUBDIR"; then
-    ok "CLT 镜像可用（局域网 NAS）：${CLT_MIRROR_BASE}/clt/index.json"
   else
     warn "镜像上没有 CLT 清单：CLT 由 Homebrew 安装器负责（走 softwareupdate 或弹窗），"
     warn "  镜像路径：${base%/}/zizpanel/clt/index.json"
@@ -630,18 +621,17 @@ clt_mirror_note() {
 }
 
 # ------------------------------------------------------------ 在线升级源 --
-# 顺序：用户显式指定 → 公网 zizdog.com → 局域网 NAS。判据是"清单 + 签名都在"，缺签名面板会拒绝升级。
+# 只有公网 zizdog.com 一个候选（可由 ZIZPANEL_UPGRADE_SOURCE 覆盖）。
+# 判据是"清单 + 签名都在"，缺签名面板会拒绝升级。
 probe_upgrade_source() {
-  local cand
-  for cand in "$PANEL_UPGRADE_SOURCE_PUBLIC" "$PANEL_UPGRADE_SOURCE_LAN"; do
-    [ -n "$cand" ] || continue
-    cand="${cand%/}"
-    if curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}" >/dev/null 2>&1 &&
-       curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}.sig" >/dev/null 2>&1; then
-      PANEL_UPGRADE_SOURCE="$cand"
-      return 0
-    fi
-  done
+  # 只有一个公网候选，不需要循环（写成 `for x in "$VAR"` 只会跑一次，shellcheck 会报 SC2066）。
+  local cand="${PANEL_UPGRADE_SOURCE_PUBLIC%/}"
+  if [ -n "$cand" ] &&
+     curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}" >/dev/null 2>&1 &&
+     curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}.sig" >/dev/null 2>&1; then
+    PANEL_UPGRADE_SOURCE="$cand"
+    return 0
+  fi
   PANEL_UPGRADE_SOURCE=""
   return 1
 }
@@ -649,13 +639,9 @@ probe_upgrade_source() {
 # upgrade_source_note：只读探测并如实汇报（探不到就说探不到，界面里再让用户填）。
 upgrade_source_note() {
   if probe_upgrade_source; then
-    if [ "$PANEL_UPGRADE_SOURCE" = "${PANEL_UPGRADE_SOURCE_PUBLIC%/}" ]; then
-      ok "在线升级源：${PANEL_UPGRADE_SOURCE}（公网 zizdog.com，已确认清单与签名都在）"
-    else
-      warn "公网升级源不可达，回落局域网 NAS：${PANEL_UPGRADE_SOURCE}"
-    fi
+    ok "在线升级源：${PANEL_UPGRADE_SOURCE}（公网 zizdog.com，已确认清单与签名都在）"
   else
-    warn "公网与局域网升级源都没探通（面板仍可用，升级源留空，可在「面板设置 → 在线升级」里手工填写）"
+    warn "公网升级源没探通（面板仍可用，升级源留空，可在「面板设置 → 在线升级」里手工填写）"
   fi
 }
 
@@ -795,7 +781,7 @@ install_binaries() {
     err "没有可安装的面板程序（内部错误：来源为空或不可执行）。"
     err "已尝试的来源："
     err "  · 本地二进制：${SCRIPT_DIR}/dist、${SCRIPT_DIR}/../dist、${SCRIPT_DIR}"
-    err "  · 下载：${ZIZPANEL_DOWNLOAD_BASE:-<未选定>} → $BUILTIN_MIRROR → ${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR} → $GITHUB_RELEASE_BASE"
+    err "  · 下载：${ZIZPANEL_DOWNLOAD_BASE:-<未选定>} → $BUILTIN_MIRROR → $GITHUB_RELEASE_BASE"
     err "  · 源码构建：需要本机有 go"
     die "无法获取面板程序，安装中止（没有改动任何东西）"
   fi
@@ -1322,8 +1308,12 @@ finish() {
     printf '             以后想用：插上盘，到「面板 → 磁盘」按页面指引授权一次即可。\n'
     printf '\n'
   elif [ "${ZP_EXTERNAL_MODE:-}" = "local" ] && [ "${ZP_EXTERNAL_ACK:-0}" = "1" ]; then
-    printf '  外接硬盘   已按你的同意申请一次系统授权：屏幕上若弹过「访问可移除宗卷」请确认点了「允许」。\n'
-    printf '             面板已用固定证书签名 —— 以后升级面板不需要再授权。\n'
+    printf '  外接硬盘   已按你的确认申请一次授权：若屏幕弹过请确认点了「允许」。\n'
+    printf '             没点的话可在「磁盘管理 → 申请授权」重来一次；升级面板不用再授权。\n'
+    printf '\n'
+  elif [ "${ZP_EXTERNAL_MODE:-}" = "local" ]; then
+    printf '  外接硬盘   你这次选择不申请授权 —— 安装过程没有触发任何系统授权弹窗。\n'
+    printf '             想用的时候到「面板 → 磁盘管理 → 申请授权」按一下（要在真机屏幕前）。\n'
     printf '\n'
   elif [ "${ZP_EXTERNAL_MODE:-}" = "remote" ]; then
     printf '  %s外接硬盘   你说会用到，但本次远程安装没有（也不会）触发任何授权弹窗。%s\n' "$C_YELLOW" "$C_RESET"
@@ -1855,7 +1845,6 @@ setup_external_volume_notice() {
 
   ZP_EXTERNAL_MODE="local"
   ok "你选了会用到外接硬盘。请**现在把它插上**（U 盘/硬盘盒插好后再继续）。"
-  info "安装过程中系统会弹一次「…想要访问可移除宗卷上的文件」——点「允许」就把授权做完了。"
   info "（面板已用固定证书签名：这一次授权之后，升级面板也不需要再授权。）"
 
   local vols="" try=0 _ignored=""
@@ -1870,18 +1859,33 @@ setup_external_volume_notice() {
   if [ -n "$vols" ]; then
     ok "检测到外接卷："
     printf '%s\n' "$vols" | sed 's/^/    /'
-    ZP_EXTERNAL_ACK=1
   else
     ZP_EXTERNAL_ACK=0
     warn "仍未检测到外接卷 → 这次不申请授权（安装照常继续，不会碰任何外接卷）。"
     info "插上盘以后：到「面板 → 磁盘」按页面指引授权一次即可，或重跑一次安装脚本。"
+    return 0
+  fi
+
+  # ---- 写一次性标记之前的**显式确认**（用户点名：让用户知道接下来要点弹窗）----
+  # 问题先打印出来（没有终端时 zp_yes 不回显，日志/远程都要能看到问的是什么），
+  # 再问 yes/no：选"否"就不写标记 = 这次不申请授权；
+  # 以后可在面板「磁盘管理 → 申请授权」补（同一套门禁）。
+  warn "接下来安装过程中，系统会弹一次「…想要访问可移除宗卷上的文件」。"
+  info "请**留在这台机器前**：弹出来时点「允许」，授权就做完了。"
+  info "准备好了吗？（要在这台机器前点弹窗；没准备好就选 n）"
+  if zp_yes "确认现在申请外接盘授权（接下来你要在屏幕上点「允许」）？" "n"; then
+    ZP_EXTERNAL_ACK=1
+  else
+    ZP_EXTERNAL_ACK=0
+    warn "好 —— 这次不申请授权（不会触发任何弹窗）。"
+    info "以后想用：到「面板 → 磁盘管理 → 申请授权」按一下即可（同样要点屏幕上的「允许」）。"
   fi
   return 0
 }
 
 # request_external_volume_auth：把"一次性授权请求"标记写给面板。
-# 只在①真机安装 ②用户当面同意 ③确有外接卷 ④有图形登录会话 ⑤非沙箱/干跑 时写；
-# 守护进程只读一次（internal/files/volumeauth.go），绝不反复弹窗。
+# 只在①真机安装 ②用户在"准备好了吗"那道确认上选了是 ③确有外接卷 ④有图形登录会话
+# ⑤非沙箱/干跑 时写；守护进程只读一次（internal/files/volumeauth.go），绝不反复弹窗。
 request_external_volume_auth() {
   local marker="$DATA_DIR/request-volume-auth.once"
   [ "${ZIZPANEL_SANDBOX:-0}" = "1" ] && return 0
@@ -1889,7 +1893,7 @@ request_external_volume_auth() {
   [ "${ZP_EXTERNAL_ACK:-0}" = "1" ] || return 0
 
   if dry_run; then
-    info "（干跑）真机安装且已同意：将写入一次性授权请求 $marker"
+    info "（干跑）真机安装且已确认：将写入一次性授权请求 $marker"
     return 0
   fi
 
@@ -1913,7 +1917,7 @@ request_external_volume_auth() {
     chmod 600 "$marker" 2>/dev/null || true
     ok "已记录一次性授权请求（${marker}）"
     info "面板启动后会替你申请一次外接盘授权：屏幕上弹出「…想要访问可移除宗卷上的文件」时点「允许」。"
-    info "只有这一次会自动申请 —— 被拒或错过的话，去系统设置里手动加一次即可。"
+    info "没点或错过了也不怕：到「面板 → 磁盘管理 → 申请授权」可以再来一次。"
   else
     warn "写授权请求失败：${marker}（请稍后在真机的系统设置里手动授权）"
   fi
@@ -2249,7 +2253,8 @@ prompt_lan_preauth() {
     cidrs="$(lan_detect_cidr || true)"
   fi
   if [ -z "$cidrs" ] && zp_input_ok; then
-    zp_ask "请填写要免授权的网段（CIDR）" "192.168.1.0/24" cidrs
+    # 默认留空：网段因机器而异，不许把作者家里的网段当默认值塞给用户。
+    zp_ask "请填写要免授权的网段（CIDR）" "" cidrs
   fi
   cidrs="$(lan_normalize_cidrs "$cidrs")"
   if [ -z "$cidrs" ]; then
@@ -2431,8 +2436,8 @@ main() {
   if dry_run; then
     # 干跑必须把整条计划走完（SSH 提问与内网预授权提示都是用户要求的分支）。
     title "干跑：将要执行的动作"
-    info "下载源候选（公网 zizdog.com 优先）：${ZIZPANEL_DOWNLOAD_BASE:+$ZIZPANEL_DOWNLOAD_BASE → }$BUILTIN_MIRROR → ${NAS_LAN_MIRROR}${MIRROR_PANEL_SUBDIR} → $GITHUB_RELEASE_BASE"
-    info "镜像基址：${DEFAULT_MIRROR_BASE}（brew/CLT/应用包都挂它下面；公网优先，NAS 只作回落加速）"
+    info "下载源候选（公网 zizdog.com 优先）：${ZIZPANEL_DOWNLOAD_BASE:+$ZIZPANEL_DOWNLOAD_BASE → }$BUILTIN_MIRROR → $GITHUB_RELEASE_BASE"
+    info "镜像基址：${DEFAULT_MIRROR_BASE}（brew/CLT/应用包都挂它下面；公网镜像站）"
     install_deps
   fi
 

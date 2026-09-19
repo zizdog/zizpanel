@@ -10,13 +10,13 @@ import (
 )
 
 // ============================================================================
-//  Ollama 模型镜像（NAS 优先 + 回落公网 registry）
+//  Ollama 模型镜像（镜像站优先 + 回落公网 registry）
 //
 //  现状（2026-09-16 实测）：应用市场里的 ollama 条目只给一句
 //  `ollama pull qwen2.5:7b`，面板**不代下**；模型来自 registry.ollama.ai。
-//  本文件把"从 NAS 拉模型"这件事做成可测试的能力：
+//  本文件把"从镜像站拉模型"这件事做成可测试的能力：
 //    · 版本写死（qwen2.5:7b），并钉住清单本身的 sha256；
-//    · NAS 优先（<mirror>/models/ollama，与 ~/.ollama/models 同布局），
+//    · 镜像站优先（<mirror>/models/ollama，与 ~/.ollama/models 同布局），
 //      探不通就回落公网 registry.ollama.ai，并把真实来源写进日志；
 //    · 每个 blob 按它自己的 digest **逐个校验 sha256**，不符就删掉重来；
 //    · 落到 Ollama 的本地模型仓库（OLLAMA_MODELS，默认 ~/.ollama/models），
@@ -24,14 +24,14 @@ import (
 //
 //  ⚠️ 这不是在反代 OCI registry 协议，而是"预置 blob + 写清单"：
 //  绕开了 Ollama 对自定义 registry 的 HTTPS/域名要求（详见交付说明）。
-//  局限：模型体积大（qwen2.5:7b 单个 blob 4.68 GB），首次同步要 NAS 能访问
-//  registry.ollama.ai；之后面板/脚本从 NAS 取就是局域网速度。
+//  局限：模型体积大（qwen2.5:7b 单个 blob 4.68 GB），首次同步要镜像站能访问
+//  registry.ollama.ai；之后面板/脚本从镜像站取就是局域网速度。
 // ============================================================================
 
 const (
 	// ollamaRegistryHost 是 Ollama 官方 registry（也是清单在本地仓库里的目录名）。
 	ollamaRegistryHost = "registry.ollama.ai"
-	// ollamaMirrorSubdir 是 NAS 镜像上模型仓库的子路径（与 ~/.ollama/models 同布局）。
+	// ollamaMirrorSubdir 是镜像站上模型仓库的子路径（与 ~/.ollama/models 同布局）。
 	ollamaMirrorSubdir = "models/ollama"
 	// ollamaBlobSeparator 是 Ollama 本地 blob 文件名的分隔符（sha256-<hex>）。
 	ollamaBlobSeparator = "sha256-"
@@ -126,7 +126,7 @@ func OllamaModelFor(ref string) (OllamaModelSpec, bool) {
 	return s, ok
 }
 
-// OllamaModelMirrorURL 返回模型清单在 NAS 镜像上的地址。
+// OllamaModelMirrorURL 返回模型清单在镜像站上的地址。
 //
 // 用 <base>/models/ollama/manifests/registry.ollama.ai/... （Ollama 本地仓库
 // 的同一套相对路径）而不是造一个新前缀：这样镜像目录能被直接拷进
@@ -145,9 +145,9 @@ type ollamaSource struct {
 	blobURL     func(digest string) string
 }
 
-// ollamaModelSources 选出这次从哪儿拉模型：NAS 优先，探不通回落公网 registry。
+// ollamaModelSources 选出这次从哪儿拉模型：镜像站优先，探不通回落公网 registry。
 //
-// 与 iopaintWeightSources 同一风格：探的是 NAS 上**这个模型的清单**，
+// 与 iopaintWeightSources 同一风格：探的是镜像站上**这个模型的清单**，
 // 探到了才排第一并如实标注；探不到就明说"镜像上没有，回落公网"。
 func (m *Manager) ollamaModelSources(ctx context.Context, spec OllamaModelSpec, logf func(string)) []ollamaSource {
 	if logf == nil {
@@ -159,37 +159,37 @@ func (m *Manager) ollamaModelSources(ctx context.Context, spec OllamaModelSpec, 
 		blobURL:     spec.upstreamBlobURL,
 	}
 	if !m.MirrorEnabled() {
-		logf("未启用 NAS 镜像，模型来源：" + upstream.manifestURL)
+		logf("未启用镜像站，模型来源：" + upstream.manifestURL)
 		return []ollamaSource{upstream}
 	}
 	mirrorManifest := m.OllamaModelMirrorURL(spec)
 	if _, err := m.probeMirrorFile(ctx, mirrorManifest); err != nil {
-		logf(fmt.Sprintf("NAS 镜像上没有 %s 这个模型（%v），回落到公网 registry：%s",
+		logf(fmt.Sprintf("镜像站上没有 %s 这个模型（%v），回落到公网 registry：%s",
 			spec.Ref(), err, upstream.manifestURL))
 		return []ollamaSource{upstream}
 	}
 	mirrorBase := m.mirrorSubPath(ollamaMirrorSubdir)
 	mirror := ollamaSource{
-		label:       "NAS 镜像",
+		label:       "镜像站",
 		manifestURL: mirrorManifest,
 		blobURL: func(digest string) string {
 			return mirrorBase + "/blobs/" + ollamaBlobSeparator + digest
 		},
 	}
-	logf(fmt.Sprintf("NAS 镜像上有 %s（已探通，清单 %s），优先从 NAS 拉取", spec.Ref(), mirrorManifest))
+	logf(fmt.Sprintf("镜像站上有 %s（已探通，清单 %s），优先从镜像站拉取", spec.Ref(), mirrorManifest))
 	return []ollamaSource{mirror, upstream}
 }
 
 // ollamaModelTimeout 是单个 blob 的下载超时。
 //
-// qwen2.5:7b 的最大 blob 有 4.68 GB；NAS 局域网实测 6+ MB/s，但公网回落到
+// qwen2.5:7b 的最大 blob 有 4.68 GB；镜像站局域网实测 6+ MB/s，但公网回落到
 // 2~3 MB/s 时要约半小时。给 2 小时是为了不误杀，同时 fetchToFile 的停滞
 // 看门狗会拦住"读得动但永远下不完"的病态情况。
 const ollamaModelTimeout = 2 * time.Hour
 
 // EnsureOllamaModel 把某个模型落到 modelsDir（Ollama 的 OLLAMA_MODELS 目录）。
 //
-// NAS 优先 → 回落公网 → 逐 blob 校验 sha256。返回**真实来源标签**。
+// 镜像站优先 → 回落公网 → 逐 blob 校验 sha256。返回**真实来源标签**。
 // 已经存在且校验通过的 blob 会被跳过，所以重复调用是廉价的（断点续传式的幂等）。
 func (m *Manager) EnsureOllamaModel(ctx context.Context, ref, modelsDir string,
 	logf func(string)) (string, error) {

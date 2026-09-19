@@ -24,19 +24,20 @@
 #    bash tools/sync-nas-compose.sh --app it-tools   # 只发布一个项目
 #    bash tools/sync-nas-compose.sh --prune          # 同时删除镜像上多余的旧文件
 #
-#  环境变量：
-#    NAS_HOST / NAS_USER / NAS_MIRROR_ROOT / MIRROR_BASE_URL
+#  环境变量（地址由调用者提供，仓库里不留任何内网默认值）：
+#    NAS_HOST / NAS_USER / NAS_MIRROR_ROOT（非 dry-run 必填）
+#    MIRROR_BASE_URL（验收与生成用的公网基址；默认面板的公网镜像入口）
 # ============================================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
 # 镜像站根目录（nginx 的 root；/apps、/sites、/zizpanel 都与它同级）。
-NAS_MIRROR_ROOT="${NAS_MIRROR_ROOT:-/vol2/zizpanel-mirror}"
-# 验收基址：默认走局域网（比公网入口快，且不依赖外部反代）。
-MIRROR_BASE_URL="${MIRROR_BASE_URL:-http://192.168.1.8:8090}"
+NAS_MIRROR_ROOT="${NAS_MIRROR_ROOT:-}"
+# 验收与生成基址：公网入口（面板按同一基址取 compose）。
+MIRROR_BASE_URL="${MIRROR_BASE_URL:-https://mirror.zizdog.com:8888}"
 
 DRY_RUN=0
 PRUNE=0
@@ -62,6 +63,13 @@ done
 MIRROR_BASE_URL="${MIRROR_BASE_URL%/}"
 NAS_MIRROR_ROOT="${NAS_MIRROR_ROOT%/}"
 DEST="$NAS_MIRROR_ROOT/compose"
+
+# 地址由调用者提供（dry-run 只打印计划，不连镜像机）。
+if [ "$DRY_RUN" != "1" ]; then
+  : "${NAS_HOST:?请传 NAS_HOST=<你自己的镜像机>（或用 --host）}"
+  : "${NAS_USER:?请传 NAS_USER=<镜像机用户>（或用 --user）}"
+  : "${NAS_MIRROR_ROOT:?请传 NAS_MIRROR_ROOT=<镜像站根目录>（或用 --root）}"
+fi
 
 echo "==> 生成参考文件（来源：代码 -- go run ./cmd/zizpanel-assets compose）"
 if ! JSON="$(cd "$REPO_ROOT" && MIRROR_BASE_URL="$MIRROR_BASE_URL" go run ./cmd/zizpanel-assets compose)"; then

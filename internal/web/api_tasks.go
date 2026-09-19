@@ -110,7 +110,7 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 		// 为什么放在这个**中心位置**：nginx/PHP 可能是任务跑起来之后才装上的
 		//（一键 LNMP / 应用市场单装 nginx / 重装 nginx），而面板启动时那一次检查
 		// 早就过去了。放在每个安装路径里逐个加钩子，漏一个就是又一轮
-		// "装完没有默认网站"（2026-09-22 用户报障）。失败的任务也照查：
+		// "装完没有默认网站"（用户报障）。失败的任务也照查：
 		// LNMP 可能装好了 nginx、只是后面的 MySQL 步骤超时。
 		//
 		// 为什么要**后台**跑（第一版写成同步，立刻踩到）：任务中心的"结束"以这个
@@ -121,7 +121,7 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 		// 不该占着任务的生命周期。
 		// 安装/卸载结束必须让市场缓存失效 —— 否则这条任务改变了机器上装了什么，
 		// 而「已安装」是 5 分钟 TTL 的缓存结论：用户装完刷新页面，卡片仍停在
-		// 「安装」、也不进「已安装」（2026-09-23 用户报障的根因之一，
+		// 「安装」、也不进「已安装」（用户报障的根因之一，
 		// 见 Server.InvalidateMarketCache）。
 		if marketAffectingTask(kind) {
 			s.InvalidateMarketCache()

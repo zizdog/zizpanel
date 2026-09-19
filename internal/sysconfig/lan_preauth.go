@@ -207,7 +207,7 @@ func lanCommand(t lanTarget, action, key string, cidrs []string) (string, []stri
 // ---------- 纯解析（全部可用真机输出做单测） ----------
 
 // ParseLANCIDRs 解析用户输入的网段列表（逗号/分号/空白/换行分隔），
-// 校验每个都是合法 CIDR，并归一到网络地址（192.168.1.5/24 → 192.168.1.0/24）。
+// 校验每个都是合法 CIDR，并归一到网络地址（192.0.2.5/24 → 192.0.2.0/24）。
 func ParseLANCIDRs(raw string) ([]string, error) {
 	fields := strings.FieldsFunc(raw, func(r rune) bool {
 		switch r {
@@ -225,7 +225,7 @@ func ParseLANCIDRs(raw string) ([]string, error) {
 		}
 		_, ipnet, err := net.ParseCIDR(f)
 		if err != nil {
-			return nil, fmt.Errorf("网段 %q 不是合法的 CIDR（形如 192.168.1.0/24）：%v", f, err)
+			return nil, fmt.Errorf("网段 %q 不是合法的 CIDR（形如 192.0.2.0/24）：%v", f, err)
 		}
 		v := ipnet.String()
 		if seen[v] {
@@ -241,7 +241,7 @@ func ParseLANCIDRs(raw string) ([]string, error) {
 //
 // 真机输出形如：
 //
-//	inet 192.168.1.179 netmask 0xffffff00 broadcast 192.168.1.255
+//	inet 192.0.2.179 netmask 0xffffff00 broadcast 192.0.2.255
 //
 // 注意要跳过 inet6 行；netmask 可能是十六进制（Apple 默认）或点分十进制。
 func ParseIPv4CIDR(out string) (string, bool) {
@@ -297,8 +297,8 @@ func parseNetmask(s string) net.IPMask {
 // parseDefaultsArray 解析 `defaults read <domain> <key>` 的数组输出：
 //
 //	(
-//	    "192.168.1.0/24",
-//	    "10.0.0.0/8"
+//	    "192.0.2.0/24",
+//	    "198.51.100.0/24"
 //	)
 //
 // 只接受数组形态；其它形态返回错误（不猜、不硬塞）。
@@ -378,14 +378,14 @@ func interfaceCandidates(listOut string) []string {
 	out := append(en, other...)
 	if len(out) == 0 {
 		// ifconfig -l 没给出东西时也要能工作（老系统/异常输出）——
-		// 这是候选顺序，不是把 192.168.1.0/24 写死。
+		// 这是候选顺序，不是把 192.0.2.0/24 写死。
 		return []string{"en0", "en1"}
 	}
 	return out
 }
 
 // DetectPrimaryCIDR 从主网卡的 IPv4 + netmask 推导默认网段。
-// 推不出来返回空串（界面会让用户自己填，而不是硬塞 192.168.1.0/24）。
+// 推不出来返回空串（界面会让用户自己填，而不是硬塞 192.0.2.0/24）。
 func DetectPrimaryCIDR(ctx context.Context) string {
 	for _, name := range interfaceCandidates(ifconfigListFn(ctx)) {
 		if cidr, ok := ParseIPv4CIDR(ifconfigFn(ctx, name)); ok {
@@ -553,7 +553,7 @@ func ApplyLANPreauth(ctx context.Context, rawCIDRs string, log LogFunc) error {
 		return err
 	}
 	if len(cidrs) == 0 {
-		return fmt.Errorf("至少填一个网段（CIDR），例如 192.168.1.0/24")
+		return fmt.Errorf("至少填一个网段（CIDR），例如 192.0.2.0/24")
 	}
 	if !defaultsSupported() {
 		return fmt.Errorf("本机找不到 %s，无法写入这个偏好域", defaultsBin)

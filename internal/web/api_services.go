@@ -98,9 +98,8 @@ func (s *Server) svcManager() *services.Manager {
 		// 应用包镜像基址：面板里所有安装过程都从这里取资源（见 services/mirror.go）。
 		// svcManager() 每次都按当前 Cfg 新建，所以设置页保存后立刻生效。
 		MirrorBase:         s.Cfg.MirrorBase,
-		MirrorBaseLAN:      s.Cfg.MirrorBaseLAN,
 		MirrorProbeSeconds: s.Cfg.MirrorProbeSeconds,
-		// 仅走 NAS（离线）模式：打开后各安装器禁止回落外网
+		// 仅走镜像站（离线）模式：打开后各安装器禁止回落外网
 		// （见 internal/services/mirror.go 的 MirrorOfflineOnly）。
 		OfflineOnly: s.Cfg.OfflineOnly,
 		// 上传与执行限制：安装路径会用它写默认站点 vhost（client_max_body_size）
@@ -299,7 +298,7 @@ func (s *Server) handleServiceCredentials(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// 地址必须用**服务所在机器**的，不能用请求里的客户端 IP。
-	// 后者是浏览器的地址（真机踩到：显示成用户自己电脑的 192.168.1.179）。
+	// 后者是浏览器的地址（真机踩到：显示成用户自己电脑的 IP）。
 	// 同时给出"本机"与"局域网"两个地址：在本机上用 127.0.0.1 更稳妥
 	// （en0 未必是当前在用的网卡）。
 	ui, uiLocal := "", ""
@@ -598,7 +597,7 @@ func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
 
 // handleServiceDelete 停止服务，然后删掉面板记录。
 //
-// 2026-09-21 用户明确要求改写语义（原话："移除却不卸载是什么意思 …… 让用户
+// 用户明确要求改写语义（原话："移除却不卸载是什么意思 …… 让用户
 // 看不到却持续运行"）：**先停、再移除**。只删记录会让一个仍在运行的服务
 // 彻底消失在面板里 —— 用户看不到它，它却继续占着端口跑业务。
 //
@@ -875,7 +874,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 		// 真实证据之三：目录声明的**安装体**（真实产物）在磁盘上。
 		//
-		// 为什么必须有这一条（2026-09-23 用户报障两条的根因）：
+		// 为什么必须有这一条（用户报障两条的根因）：
 		// 没有常驻服务的应用（App.NoDaemon：vips / ffmpeg / python@x.y，以及
 		// 网页入口型的 phpMyAdmin）在面板里**没有服务记录**，它们的「已安装」
 		// 过去只来自上面那句 brew 结论。于是
@@ -988,7 +987,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 		// 卸载计划与「已安装」必须互相自洽：说已安装，就**必须**给得出一条卸载路径；
 		// 给不出（kind=none）说明我们的证据或计划有一处是错的。
-		// 2026-09-21 用户要求的不变量：installed=true ⇒ uninstall.kind != "none"，
+		// 用户要求的不变量：installed=true ⇒ uninstall.kind != "none"，
 		// 反过来 kind=none ⇒ 界面不得显示已安装。这里以**计划**为准降级（绝不显示
 		// 一个"已安装却没有任何卸载入口"的卡片），并把矛盾如实写进 Note。
 		// ⚠️ 这里**必须**用 Fast（不跑 brew）版本：列表曾对每条应用查一次
@@ -1912,7 +1911,7 @@ func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, m
 
 // InvalidateMarketCache 让市场缓存立刻失效（安装/卸载任务结束后调用）。
 //
-// 为什么必须有它（2026-09-23 用户报障"图片压缩安装成功但没变化、不在已安装里、
+// 为什么必须有它（用户报障"图片压缩安装成功但没变化、不在已安装里、
 // 还显示安装按钮"的根因之一）：已装 formula 集合有 5 分钟 TTL，而**安装任务结束时
 // 没有任何地方让它失效** —— 前端 onDone 里那次刷新拿到的仍是旧集合，卡片就停在
 // 「安装」，「已安装」Tab 里也没有它。

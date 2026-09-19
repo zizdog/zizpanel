@@ -1,12 +1,12 @@
 # 应用市场选型：「macOS 语音合成（say）」为什么不用第三方 macos-speech-server
 
-> 2026-09-25 用户要求："**评估 macos-speech-server 加入应用市场。并写好 webui。**"
+> 用户要求："**评估 macos-speech-server 加入应用市场。并写好 webui。**"
 > 这份文档是那次评估的**事实底稿**（含引用与实测），结论落在
 > `internal/services/catalog.go` 的 `macspeech` 条目上。
 > 结论一句话：**引擎用 macOS 自带的 `/usr/bin/say`**；第三方项目作为
 > "什么条件下才选它"的备选写清在下面。
 
-## 一、候选事实（都在 2026-09-25 核对过，只读，未安装任何一件）
+## 一、候选事实（都在 2026-09-18 核对过，只读，未安装任何一件）
 
 | 候选 | 语言/运行时 | 许可证 | darwin-arm64 原生产物 | 安装 / 卸载 | 离线 | 结论 |
 |---|---|---|---|---|---|---|
@@ -72,6 +72,6 @@
 - Homebrew `speech` 瓶与依赖：https://formulae.brew.sh/formula/speech
 - `soniqo/speech-swift`：https://github.com/soniqo/speech-swift
 
-> 本机实测（2026-09-25）：`/usr/bin/say -v '?'` → 177 音色 / 19 中文；
+> 本机实测（2026-09-18）：`/usr/bin/say -v '?'` → 177 音色 / 19 中文；
 > 四种格式各自产出真实音频（同一段文本时长一致：aiff=wav=m4a=6.2177s，mp3=6.2955s）；
 > 1200 字 → 5 段拼接 → 244.5s / 1.93MB m4a。

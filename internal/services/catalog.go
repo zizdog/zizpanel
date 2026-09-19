@@ -133,7 +133,7 @@ type App struct {
 	// 于是它们的「已安装」过去**只**来自 `brew list --versions` 的一句话。
 	// 那句话一旦缺席（探测失败/超时、市场缓存还没刷新、用户是手工装的），
 	// 判据就整个落空 —— 界面把明明装着的东西显示成「安装」。
-	// 2026-09-23 用户报障的正是这一类：
+	// 用户报障的正是这一类：
 	//   · 「图片压缩（libvips）安装成功后没变化、不在已安装里、还显示安装按钮」；
 	//   · 「phpMyAdmin 在应用市场里是未安装状态，很明显是判断错误。它是有状态的
 	//      目录，只要判断这个目录在，就是安装！」
@@ -616,7 +616,7 @@ func Catalog() []App {
 			Description: "库表管理界面（面板自带的只作应急）；依赖 nginx + PHP，装完从面板打开。",
 			Category:    "tool", Kind: KindNative, PanelInstaller: "phpmyadmin", BrewFormula: "phpmyadmin",
 			// 安装体 = **web 根目录**（不是服务、也不是 brew 记录）：
-			// 用户 2026-09-23 的原话是"它是有状态的目录，只要判断这个目录在，就是安装"。
+			// 用户的原话是"它是有状态的目录，只要判断这个目录在，就是安装"。
 			// 路径与 internal/services/phpmyadmin.go 的 pmaPaths().Share 同源。
 			RuntimePath:  "{brew}/share/phpmyadmin",
 			RuntimeEntry: "index.php",
@@ -767,7 +767,7 @@ func Catalog() []App {
 		//   · 它**没有 brew service**（纯 CLI），所以走面板自研安装器而不是通用
 		//     brew 流程（否则会 brew services start 一个没有 service 的定义，留下
 		//     "已安装但启动失败"的假警告 —— 与 ffmpeg 同一条理由）。
-		// 界面（2026-09-23 用户要求"给它加一个 webui 通过端口和别名调用"）：
+		// 界面（用户要求"给它加一个 webui 通过端口和别名调用"）：
 		//   · 一个面板托管的常驻网页界面 —— 独立端口 8890（直连
 		//     http://127.0.0.1:8890/），服务由安装器注册成系统级 launchd
 		//     （com.zizdog.imgcompress，见 imgcompress.go）；
@@ -800,7 +800,7 @@ func Catalog() []App {
 				"默认**另存为 xxx.min.jpg**（不动原文件）；压完更大时会自动保留原文件。",
 			DocsURL: "https://www.libvips.org/",
 		},
-		// macOS 语音合成（say）。用户 2026-09-25 要求"评估 macos-speech-server
+		// macOS 语音合成（say）。用户要求"评估 macos-speech-server
 		// 加入应用市场，并写好 webui"。
 		//
 		// 评估结论（完整版见 docs/应用市场-speech评估.md）：**用系统自带的 say**。
@@ -848,7 +848,7 @@ func Catalog() []App {
 				"音色更多/更好听可在「系统设置 → 辅助功能 → 朗读内容 → 系统声音」里添加。",
 			DocsURL: "https://keith.github.io/xcode-man-pages/say.1.html",
 		},
-		// 语音转文字（whisper.cpp）。用户 2026-09-25 要求"在市场里加入一个语音
+		// 语音转文字（whisper.cpp）。用户要求"在市场里加入一个语音
 		// 转文字服务！要求：不要 docker，不要 gui 软件；有 webui 或 api
 		// （你自行开发配套 webui）"。
 		//
@@ -1046,9 +1046,10 @@ func Catalog() []App {
 		// ---------------- 运维工具（Docker） ----------------
 		//
 		// arm64 证据（2026-09-16 逐条实测；铁律②要求"镜像必须自带 linux/arm64"）：
-		//   Hub 上的条目经自建 NAS 镜像站读**同一份 image index**（镜像站是
-		//   registry:2 pull-through，拿到就是 Hub 原始 index，不是第三方转存）：
-		//     GET <mirror>/docker/v2/<repo>/manifests/<tag>
+		//   读 Docker Hub 的 OCI image index（manifest list），看里面有没有 linux/arm64：
+		//     GET https://dockerproxy.net/v2/<repo>/manifests/<tag>
+		//         Accept: application/vnd.oci.image.index.v1+json
+		//   2026-09-20 起不再经镜像站 `/docker` —— 公网镜像站不提供该路径。
 		//   · louislam/uptime-kuma:1                → linux/amd64 + linux/arm64
 		//   · gitea/gitea:latest                    → linux/amd64 + linux/arm64
 		//   · stirlingtools/stirling-pdf:latest      → linux/amd64 + linux/arm64
@@ -1686,7 +1687,7 @@ func Catalog() []App {
       # 官方要求必须设置，否则启动后直接 host validation failed（页面打不开）。
       # 这里放开是因为面板装的时候还不知道用户会用哪个地址访问；
       # 只在内网用是可接受的取舍 —— 要收紧就在 .env 里写
-      # HOMEPAGE_ALLOWED_HOSTS=192.168.1.4:3010,localhost:3010 这种显式清单。
+      # HOMEPAGE_ALLOWED_HOSTS=<本机IP>:3010,localhost:3010 这种显式清单。
       HOMEPAGE_ALLOWED_HOSTS: "${HOMEPAGE_ALLOWED_HOSTS:-*}"
     volumes:
       # 配置目录由 DATA_ROOT 决定（默认 . 即本 compose 文件所在目录）
@@ -1861,7 +1862,7 @@ func Catalog() []App {
 				"（Activepieces 不预设默认口令）。" +
 				"② 安装结果里的凭据区块有数据库口令与两个密钥，请自行留存；重装不会重新生成。" +
 				"③ 要用**外部 webhook/触发器**时，把 <应用目录>/.env 里的 AP_FRONTEND_URL 改成" +
-				"外部可达的地址（如 http://192.168.1.4:8090 或你的隧道域名），再重启容器 —— " +
+				"外部可达的地址（如 http://<本机地址>:8090 或你的隧道域名），再重启容器 —— " +
 				"否则生成的回调地址会指向 127.0.0.1，外部触发打不进来。",
 			DocsURL: "https://www.activepieces.com/docs/install/options/docker-compose",
 		},
@@ -1891,7 +1892,7 @@ func Catalog() []App {
 			//   ghcr.io/immich-app/immich-server:release            → linux/amd64、linux/arm64
 			//   ghcr.io/immich-app/immich-machine-learning:release  → linux/amd64、linux/arm64
 			//   ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0 → linux/amd64、linux/arm64
-			//   valkey/valkey:9 （经自建 NAS 镜像站读同一份 index）  → linux/amd64、linux/arm64
+			//   valkey/valkey:9 （读 Docker Hub 的 OCI index）       → linux/amd64、linux/arm64
 			//   （ghcr 三个各另有 unknown/unknown 的 attestation）
 			//
 			// 与官方 compose 的三处**故意差异**（都是本项目约定，别改回去）：

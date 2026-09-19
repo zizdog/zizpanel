@@ -10,7 +10,7 @@ import (
 // ============================================================================
 //  卸载依赖引擎（面板级）
 //
-//  用户原话（2026-09-21）：
+//  用户原话：
 //    · "有没有做卸载依赖检测？如果我要卸载 ffmpeg，tts 需要用它，就要提示
 //      必须先卸载 tts。卸载 php 也一样，有没有网站正在用它，有就提示让网站
 //      切换其它版本，然后才能卸载。要全局考虑！"
@@ -242,7 +242,7 @@ func (m *Manager) brewDependents(ctx context.Context, formula string) []Dependen
 	// `m.opt.BrewBin == ""` 的短路，而**卸载计划走的路径从来不看它**
 	// （brewUninstallPlan 直接调用 brewUsesInstalled）—— 两条路的判据必须一致，
 	// 否则"面板安装器"那条路（Python 解释器就是）永远查不到 llvm/rust 依赖，
-	// 用户点下去只会吃到一整段 brew 英文报错（2026-09-21 真机）。
+	// 用户点下去只会吃到一整段 brew 英文报错（真机）。
 	deps, checked := m.brewUsesInstalled(ctx, formula)
 	if !checked {
 		return nil
@@ -261,7 +261,7 @@ func (m *Manager) brewDependents(ctx context.Context, formula string) []Dependen
 // BrewDependencyBlock 查一次"还有哪些**已安装**的 Homebrew 包依赖 formula"，
 // 把结果并进卸载计划（结构化 Dependents + 面向用户的 Blocked 文案 + ForceAllowed）。
 //
-// 为什么需要它（2026-09-21 用户真机卸载 python@3.13）：
+// 为什么需要它（用户真机卸载 python@3.13）：
 //
 //	Error: Refusing to uninstall ... because it is required by llvm and rust …
 //	You can override this and force removal with:

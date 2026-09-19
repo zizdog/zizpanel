@@ -15,7 +15,7 @@ import (
 )
 
 // ============================================================================
-//  "装完面板就该有一个默认静态站点"（用户 2026-09-21 要求）
+//  "装完面板就该有一个默认静态站点"（用户要求）
 //
 //  这条测试锁的是**自动**那一步的真实性与诚实性：
 //    · 有 nginx + 没有 PHP → 也必须建成一份**纯静态**可用的默认站点
@@ -328,7 +328,7 @@ func TestDefaultSiteApplyBacksUpForeignVhost(t *testing.T) {
 	}
 }
 
-// TestDefaultSiteHealedAfterNginxInstalledLater 锁的是用户 2026-09-22 的报障：
+// TestDefaultSiteHealedAfterNginxInstalledLater 锁的是用户的报障：
 // "全新安装的面板，没有默认网站！"
 //
 // 真机顺序就长这样：先装面板（那一刻机器上连 Homebrew/nginx 都没有），再在面板里
@@ -378,7 +378,7 @@ func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
 	//
 	// 为什么不能只等 index：createDefaultSite 的顺序是"先建占位页，再
 	// buildDefaultVhost + 写 vhost"。只等 index 就会在写 vhost 之前往下走，
-	// 断言 `*written` 时它还是空串 —— 这是一条**固有的竞态**（2026-09-23 实测：
+	// 断言 `*written` 时它还是空串 —— 这是一条**固有的竞态**（2026-09-18 实测：
 	// 同一份代码时红时绿）。vhost 文件本身就是"真的写完了"的判据，直接读盘最稳，
 	// 也顺带避开与巡检 goroutine 同时读写 *written 的数据竞争。
 	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")

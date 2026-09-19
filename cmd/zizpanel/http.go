@@ -51,7 +51,7 @@ func listenAndServe(cfg *config.Config, srv *http.Server) error {
 //  明文 HTTP 误访问 HTTPS 端口时自动跳转
 // ---------------------------------------------------------------------------
 //
-// 现象：在地址栏只输入 "192.168.1.4:8443"（不写 scheme）时，浏览器默认用
+// 现象：在地址栏只输入 "本机IP:8443"（不写 scheme）时，浏览器默认用
 // http:// 发请求，而面板这个端口只接受 TLS —— Go 的标准应答是一句
 //   Client sent an HTTP request to an HTTPS server.
 // 用户看到这句话完全不知道该怎么办（实测：真机上就这么卡住了）。
@@ -145,8 +145,8 @@ func (c *plainHTTPRedirectConn) redirectToHTTPS() (int, error) {
 // panelURLs 生成面板的可访问地址列表。
 //
 // 必须从 cfg.Listen 里解析端口，不能直接把 Listen 拼到 IP 后面 ——
-// Listen 形如 ":8443"，直接拼会得到 "192.168.1.5:8443" 看似正确，
-// 但若 Listen 是 "127.0.0.1:8443" 就会拼成 "192.168.1.5127.0.0.1:8443"。
+// Listen 形如 ":8443"，直接拼会得到 "<本机IP>:8443" 看似正确，
+// 但若 Listen 是 "127.0.0.1:8443" 就会拼成 "<本机IP>127.0.0.1:8443"。
 // 这个拼接错误在真实机器上复现过，所以这里统一走一个函数。
 func panelURLs(cfg *config.Config) []string {
 	scheme := "https"

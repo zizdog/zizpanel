@@ -1,6 +1,6 @@
 // nginxpanel.js —— 「⚙️ 调整配置」（宝塔式的统一配置面板）。
 //
-// 为什么是"一个"面板：用户 2026-09-22 明确要求
+// 为什么是"一个"面板：用户明确要求
 //   「合并「⚙️ Nginx 管理」和「⚡ 上传大小 / 执行时间」2 个按钮到「配置文件」中，
 //     合并后改名「调整配置」，重复的内容要整合」
 // 于是原来三个各自独立、内容互相重复的弹窗收敛成这一个：
@@ -408,7 +408,7 @@ export function adjustConfigModal(opts = {}) {
   // 路径**全部来自后端**（api_sites.go 的 nginx_error_log / nginx_brew_error_log，
   // 由 Cfg.LogRoot 与 Cfg.BrewPrefix 推导并核对文件真的存在）。
   // 这里以前写着 /Users/zizdog/www/_logs/nginx-error.log 与 /opt/homebrew/...，
-  // 换一台机器（另一个用户名 / Intel 前缀）两行就都是错的 —— 用户 2026-09-22 报障。
+  // 换一台机器（另一个用户名 / Intel 前缀）两行就都是错的 —— 用户报障。
   async function drawLogs() {
     clear(target);
     if (!paths.site_error_log && !paths.brew_error_log) {

@@ -8,7 +8,7 @@ import (
 
 // TestUninstallDependentsRealEvidence 逐条锁住依赖引擎的判据（全部基于真实证据）。
 //
-// 用户 2026-09-21 原话："如果我要卸载 ffmpeg，tts 需要用它，就要提示必须先卸载 tts。
+// 用户原话："如果我要卸载 ffmpeg，tts 需要用它，就要提示必须先卸载 tts。
 // 卸载 php 也一样，有没有网站正在用它 …… 只要有运行中的容器，就要提醒用户。"
 func TestUninstallDependentsRealEvidence(t *testing.T) {
 	m := matrixManager(t)

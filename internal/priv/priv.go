@@ -1524,7 +1524,7 @@ func SetNginxWorkerProbeForTest(fn func() (uid, gid, pid int, ok bool)) (restore
 
 // NginxWorkerOwner 返回 nginx worker **真正**运行的用户（及判据来源，给日志用）。
 // 优先级：运行中的 worker 进程（唯一权威事实）→ nginx.conf 的 `user` 指令 →
-// 都拿不到就 ok=false，调用方**不许猜**（尤其不许猜 nobody：猜错等于没修还藏因，2026-09-22 报障即此坑）。
+// 都拿不到就 ok=false，调用方**不许猜**（尤其不许猜 nobody：猜错等于没修还藏因，报障即此坑）。
 func NginxWorkerOwner(confPath string) (name string, uid, gid int, how string, ok bool) {
 	if u, g, pid, pok := nginxWorkerProbe(); pok {
 		n := strconv.Itoa(u)

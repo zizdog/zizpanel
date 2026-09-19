@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 const base = process.argv[2] || 'http://127.0.0.1:18443';
 // base 带尾斜杠时直接拼 '/api/…' 会变 '//api/…'，ServeMux 先回 301，而健康检查把 301 记为"健康"
-// ⇒「401 判为健康」这条断言根本走不到要测的分支（2026-09-20 实测）。
+// ⇒「401 判为健康」这条断言根本走不到要测的分支（2026-09-19 实测）。
 const apiURL = (path) => base.replace(/\/+$/, '') + path;
 const TEST_SITE = process.env.ZP_TEST_SITE || 'zptest-demo.test';
 // 口令**不写进仓库**：make smoke 用默认假口令；make uitest-live 由 Makefile 通过 ZP_PASS
@@ -32,7 +32,7 @@ const step = async (name, fn) => {
 
 // ZP_SKIP_PRIV=1 显式跳过需要 root 提权的步骤并如实打印"跳过"；完整特权链路跑 make uitest-live。
 // closeAnyModal 关掉所有弹窗（含遮罩）：上一步留下的弹窗会挡住下一步按钮，Playwright 报
-// "intercepts pointer events"，人看到的是"点了没反应"（2026-09-20 实测）。
+// "intercepts pointer events"，人看到的是"点了没反应"（2026-09-19 实测）。
 const closeAnyModal = async (page) => {
   for (let i = 0; i < 6; i++) {
     // 文件编辑器是独立窗口 .zpf-win（铺满 content 区），不关掉后面按钮点不到；
@@ -394,7 +394,7 @@ try {
     }
   });
 
-  // ---------- 设置里不该再有「上传与执行限制」「文件与终端」（2026-09-25 用户要求）----------
+  // ---------- 设置里不该再有「上传与执行限制」「文件与终端」（用户要求）----------
   // 只做只读断言：两个旧 Tab 消失，旧路由别名落地后不能白屏。
   await step('面板设置：旧 Tab（上传与执行限制 / 文件与终端）已移除且别名不白屏', async () => {
     await page.click('.nav-item:has-text("面板设置")');
@@ -417,7 +417,7 @@ try {
     await shot('06b-settings-no-limits');
   });
 
-  // ---------- 检查更新（2026-09-20 收进「面板设置」第 3 个 Tab）----------
+  // ---------- 检查更新（2026-09-19 收进「面板设置」第 3 个 Tab）----------
   await step('设置页「检查更新」Tab 可打开，且没有重复的更新按钮', async () => {
     if (await page.locator('.nav-item:has-text("检查更新")').count()) {
       throw new Error('侧栏不该再有「检查更新」入口（已收回面板设置，重复入口会让用户困惑）');
@@ -430,7 +430,7 @@ try {
     for (const need of ['在线升级', '当前版本', '内嵌发布公钥', '检查更新']) {
       if (!txt.includes(need)) throw new Error(`检查更新 Tab 里缺少「${need}」`);
     }
-    // 用户 2026-09-20 要求删掉「立即检测 + 一键更新到 vX」这对重复按钮（横幅里已有一键更新）。
+    // 用户要求删掉「立即检测 + 一键更新到 vX」这对重复按钮（横幅里已有一键更新）。
     if (txt.includes('立即检测')) {
       throw new Error('检查更新里仍有被要求删除的「立即检测」按钮（与横幅的一键更新重复）');
     }
@@ -460,7 +460,7 @@ try {
         throw new Error(`旧 hash ${h} 落到了面板设置，但没有选中「检查更新」Tab`);
       }
     }
-    // 「已迁移的功能」指路卡片必须消失：功能已回到设置页（用户 2026-09-20 的要求）。
+    // 「已迁移的功能」指路卡片必须消失：功能已回到设置页（用户的要求）。
     await page.goto(raw + '#/settings', { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(1000);
     if ((await page.locator('.content').innerText()).includes('已迁移的功能')) {
@@ -493,7 +493,7 @@ try {
     await shot('07-update-no-source');
   });
 
-  // ---------- 主动检测 / 徽标 / 一键更新（用户 2026-09-21 的第 4、5 条）----------
+  // ---------- 主动检测 / 徽标 / 一键更新（用户的第 4、5 条）----------
   // 全部用 page.route 桩伪造升级接口，**绝不真实升级**（apply 会重启面板）。
   await step('发现新版本：页内醒目提示 + 侧栏徽标（刷新后仍在）', async () => {
     const json = (route, data, status = 200) => route.fulfill({
@@ -620,7 +620,7 @@ try {
       page.on('framenavigated', onNav);
       navs = 0;
       await btn.first().click();
-      // 2026-09-25 用户要求「更新要提示更新内容」→ 一键更新会先弹带更新说明的确认框，
+      // 用户要求「更新要提示更新内容」→ 一键更新会先弹带更新说明的确认框，
       // 断言要跟着走完这一步。
       const confirmOk = page.locator('[data-testid="zp-update-confirm-ok"]');
       await confirmOk.waitFor({ state: 'visible', timeout: 8000 });
@@ -866,7 +866,7 @@ try {
     await shot('20-sites');
   });
 
-  // ---------- 网站管理工具条改版（2026-09 / 2026-09-22 用户要求）----------
+  // ---------- 网站管理工具条改版（2026-09 / 用户要求）----------
   // ① 工具条只剩「⚙️ 调整配置」，nginx 状态变可点击按钮、二级操作挂进它的菜单；
   // ② nginx 状态只能来自真实探测（运行体优先），没有证据绝不写"运行"。
   const reloadSites = async () => {
@@ -953,7 +953,7 @@ try {
     await shot('20b-sites-nginx-status');
   });
 
-  // ---------- 「⚙️ 配置文件」入口（2026-09-20 用户要求）----------
+  // ---------- 「⚙️ 配置文件」入口（用户要求）----------
   // 只验证入口在、清单来自后端、路径不是前端拼的；**不点「📝 编辑」**（会碰真机配置）。
   await step('网站管理：调整配置 → 配置文件 清单来自后端，且不写任何东西', async () => {
     await reloadSites();
@@ -1405,7 +1405,7 @@ try {
   });
 
   await step('网站管理：列表第一行是默认站点（打开/重建/查看状态），域名文本本身是外链', async () => {
-    // 用户 2026-09-25 改口径：**只显示域名文本本身**，且这段文字本身就是链接。
+    // 用户改口径：**只显示域名文本本身**，且这段文字本身就是链接。
     await reloadSites();
     const rows = page.locator('.zp-table-wrap table.table tbody tr');
     if (!(await rows.count())) throw new Error('站点列表没有渲染出表格（默认站点这一行必须永远在）');
@@ -2044,7 +2044,7 @@ try {
       await page.waitForTimeout(2000);
 
       // 打开这条 compose 记录的「⚙️ 管理」面板。
-      // 2026-09-21 起（用户要求）：目录应用的收尾**只有**「🗑 卸载」，
+      // 起（用户要求）：目录应用的收尾**只有**「🗑 卸载」，
       // 「只删记录」不再是并排按钮，只在"卸载失败"的兜底对话框里出现。
       const card = page.locator('#installed-grid > div', { hasText: LABEL }).first();
       await card.waitFor({ timeout: 15000 });
@@ -2106,7 +2106,7 @@ try {
     }
   });
 
-  // ---------- 本机已有的服务：移除动作必须如实说"不卸载软件"（用户 2026-09-21）----------
+  // ---------- 本机已有的服务：移除动作必须如实说"不卸载软件"（用户）----------
   // managed=false 的语义是"只删记录"，绝不能假装能卸载：按钮写「从*移除」，点下去弹确认框并
   // **逐字**说明不会卸载软件本身，点「取消」不发任何 DELETE。全部走桩。
   await step('本机已有的服务：移除按钮如实写「不卸载软件」，取消不发请求', async () => {
@@ -2291,7 +2291,7 @@ try {
   });
 
   await step('「扫描可纳管服务」入口已不存在（纳管是面板自己的事）', async () => {
-    // 用户 2026-09-21："用户不需要知道什么是纳管。" 断言这个入口不存在、页面上也不再出现内部词；
+    // 用户："用户不需要知道什么是纳管。" 断言这个入口不存在、页面上也不再出现内部词；
     // 面板启动时自己登记已知服务，第三方服务用「+ 注册服务」加。用 goto 而非点侧栏，路由改造不会走错页。
     await page.goto(page.url().split('#')[0] + '#/services');
     await page.waitForTimeout(1500);
@@ -2407,7 +2407,7 @@ try {
     await page.waitForTimeout(2000);
 
     // 健康检查是异步的（每个服务最长 8s），轮询等待而不是固定 sleep。
-    // 2026-09-21 工具栏按钮改成「⚠ N 个需要处理」、筛选合并成一项；断言按钮出现且筛得到**这张卡片**、
+    // 2026-09-19 工具栏按钮改成「⚠ N 个需要处理」、筛选合并成一项；断言按钮出现且筛得到**这张卡片**、
     // 工具栏只剩 4 项。
     const pill = page.locator('button:has-text("个需要处理")');
     let appeared = false;
@@ -2586,7 +2586,7 @@ try {
 
   await step('调整配置 → 上传与执行上限 必须有内容（点开空白 = 用户报障的那一类）', async () => {
     // 2026-09-18 报障：「上传大小 / 执行时间」点开是**空的**（函数定义在另一个作用域里）。
-    // 断言"正文里有实质内容"而不是"弹窗出现了"；2026-09-22 起并入「⚙️ 调整配置」。
+    // 断言"正文里有实质内容"而不是"弹窗出现了"；2026-09-19 起并入「⚙️ 调整配置」。
     await reloadSites();
     const btn = page.getByRole('button', { name: '⚙️ 调整配置', exact: true }).first();
     if (!(await btn.count())) throw new Error('网站管理工具条里没有「⚙️ 调整配置」入口');
@@ -2608,7 +2608,7 @@ try {
   });
 
   await step('上传：进度提示 + 落盘 + 上传文件夹入口', async () => {
-    // 锁 2026-09-20 的报障：点上传"没反应、没成功也没提示"。三条缺一不可：① 真的发出请求并落盘；
+    // 锁的报障：点上传"没反应、没成功也没提示"。三条缺一不可：① 真的发出请求并落盘；
     // ② 有可见进度；③ 有「上传文件夹」入口。⚠️ 显式导航，不依赖上一步停在文件管理页。
     await page.goto(page.url().split('#')[0] + '#/files', { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 20000 });
@@ -3026,7 +3026,7 @@ try {
     }, title);
 
     // ③「系统」分组里只剩 面板设置 → 日志（紧邻）。
-    // 2026-09-20 用户要求把「检查更新」收回「面板设置」第 3 个 Tab：同时断言侧栏没有它、设置里有它。
+    // 用户要求把「检查更新」收回「面板设置」第 3 个 Tab：同时断言侧栏没有它、设置里有它。
     const sys = await readGroup('系统');
     if (!sys || !sys.found) throw new Error('侧栏里找不到「系统」分组标题');
     const si = sys.items.findIndex((t) => t.includes('面板设置'));
@@ -3164,7 +3164,7 @@ try {
 
     // 环境可用：剩下的分区都要能切过去且不报错。
     // 循环变量不能叫 shot（会遮蔽截图函数 shot()，报错很误导）。
-    // 2026-09-21 删掉了 '已纳管服务' 分区；本机没有 Docker，这条在本机**未被执行到**。
+    // 2026-09-19 删掉了 '已纳管服务' 分区；本机没有 Docker，这条在本机**未被执行到**。
     for (const [tab, shotName] of [
       ['镜像', '47-docker-images'],
       ['数据卷', '48-docker-volumes'],

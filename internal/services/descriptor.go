@@ -97,7 +97,7 @@ type Arm64Evidence struct {
 // Source 的三种取值对应三种**不同强度**的校验，必须如实区分（不许含糊）：
 //   - 上游清单（<repo>/releases/download/<tag>/<asset>）：能防传输损坏，
 //     但清单与产物可能来自同一个第三方镜像 —— 那时它防不住镜像作恶；
-//   - 镜像清单（NAS 的 manifest.json，由同步工具生成）：镜像模式下唯一的内容校验；
+//   - 镜像清单（镜像站的 manifest.json，由同步工具生成）：镜像模式下唯一的内容校验；
 //   - 空：上游没有清单（例如 Orbien 客户端），只能靠 verify_arm64 做架构复核。
 type ArtifactChecksum struct {
 	// Kind 是校验方式标识，用于文档与日志（"upstream-list" / "mirror-manifest" / ""）。
@@ -557,7 +557,7 @@ type AppDescriptor struct {
 	PanelInstaller string `json:"panel_installer,omitempty"`
 	// ServiceLabel 与目录条目的同名字段对齐。
 	ServiceLabel string `json:"service_label,omitempty"`
-	// ChecksumArtifacts 是"这份描述符引用的校验清单"（镜像模式下由 NAS 的
+	// ChecksumArtifacts 是"这份描述符引用的校验清单"（镜像模式下由镜像站的
 	// manifest.json 提供，公网模式下从上游下载）。
 	ChecksumArtifacts []Artifact `json:"checksum_artifacts,omitempty"`
 }

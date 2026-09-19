@@ -75,8 +75,8 @@ func assertTCCGuide(t *testing.T, rec *httptest.ResponseRecorder, wantPath strin
 		// 2026-09-19 实测到两条路：弹窗点允许 / 自己去系统设置加。**两条都要在**——
 		// 只写系统设置会让用户白跑一趟，只写弹窗则在没有 UI 会话的机器上无路可走。
 		"点「允许」",
-		// 升级会让二进制变化 → 授权可能失效，必须提前说清楚。
-		"再授权一次",
+		// 授权跟二进制绑定：正式包签名后升级通常不用再授，但"万一被拦要再授一次"必须说清楚。
+		"再授一次",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("%s：错误体缺 %q，实际：%s", sub, want, msg)

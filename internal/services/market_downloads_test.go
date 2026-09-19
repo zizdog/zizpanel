@@ -45,7 +45,7 @@ func TestMarketDeclarationsCoverCatalogExactly(t *testing.T) {
 	}
 }
 
-// TestMarketInvariantsHold 跑全部静态不变量（超时 / NAS 回答 / arm64 证据 /
+// TestMarketInvariantsHold 跑全部静态不变量（超时 / 镜像站回答 / arm64 证据 /
 // 服务语义 / compose 不许 platform / sha256 来源）。
 func TestMarketInvariantsHold(t *testing.T) {
 	for _, p := range MarketInvariantProblems() {
@@ -127,7 +127,7 @@ func TestMarketPointInvariantsAreNotVacuous(t *testing.T) {
 		want   string
 	}{
 		{"没有超时也没理由", func(d *MarketDownloadPoint) { d.Timeout = 0 }, "没有超时也没有理由"},
-		{"NAS 状态留空", func(d *MarketDownloadPoint) { d.NAS = MarketNAS{Reason: strings.Repeat("理由", 20)} }, "不合法"},
+		{"镜像站状态留空", func(d *MarketDownloadPoint) { d.NAS = MarketNAS{Reason: strings.Repeat("理由", 20)} }, "不合法"},
 		{"not_needed 理由太短", func(d *MarketDownloadPoint) { d.NAS = nasNotNeeded("不需要") }, "理由太短"},
 		{"missing 理由太短", func(d *MarketDownloadPoint) { d.NAS = nasMissing("没有") }, "理由太短"},
 		{"mirrored 没有路径", func(d *MarketDownloadPoint) { d.NAS = MarketNAS{State: NASMirrored} }, "Path 为空"},

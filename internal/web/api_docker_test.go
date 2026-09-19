@@ -868,7 +868,7 @@ func TestSettingsCanClearUpgradeSource(t *testing.T) {
 
 	// 3) 清空后"检查更新"不应再报 400「尚未配置升级源地址」。
 	//
-	// 空源现在的语义是"按候选顺序自动选源"（同网段 NAS → 公网主源 →
+	// 空源现在的语义是"按候选顺序自动选源"（用户显式源 → 公网主源 →
 	// 备用镜像 → GitHub 兜底，见 internal/upgrade/source.go），
 	// 所以"没配源"不再是错误。测试环境没有内嵌发布公钥，
 	// 请求会在联网之前 fail closed 返回 409 —— 关键是不能再是 400。

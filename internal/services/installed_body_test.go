@@ -10,7 +10,7 @@ import (
 // ============================================================================
 //  「安装体」判据的全目录门禁
 //
-//  2026-09-23 用户连报两条同一类缺陷：
+//  用户连报两条同一类缺陷：
 //    · 「图片压缩（libvips）安装成功后没变化、不在已安装里、还显示安装按钮」；
 //    · 「phpMyAdmin 在应用市场里是未安装状态，很明显是判断错误。它是有状态的
 //       目录，只要判断这个目录在，就是安装！」
@@ -98,7 +98,7 @@ func TestCatalogServiceLessAppsNeedRealBodyEvidence(t *testing.T) {
 			if strings.TrimSpace(app.RuntimePath) == "" {
 				t.Errorf("%s 标了 NoDaemon（没有常驻服务）却没有声明 RuntimePath —— "+
 					"它的「已安装」就只能靠 brew 的一句话，brew 探测失败/缓存没刷新/"+
-					"用户手工装时会把明明装着的东西显示成「安装」（2026-09-23 用户报障）", app.ID)
+					"用户手工装时会把明明装着的东西显示成「安装」（用户报障）", app.ID)
 			}
 			if isServiceRegisteredOnInstall(app) {
 				t.Errorf("%s 既是 NoDaemon 又声明了服务标签（%q/%q）：两者会互相矛盾，"+
@@ -235,9 +235,9 @@ func TestDetectRuntimeBodyRejectsDanglingAndIncomplete(t *testing.T) {
 }
 
 // TestNoDaemonCatalogEntriesKeepRuntimePathWired 是这一类的"点名"回归：
-// 用户 2026-09-23 点名的条目必须在门禁里留下名字，避免将来被静默删掉声明。
+// 用户点名的条目必须在门禁里留下名字，避免将来被静默删掉声明。
 //
-// 2026-09-23 晚些时候用户又要求给图片压缩"加一个 webui 通过端口和别名调用"，
+// 晚些时候用户又要求给图片压缩"加一个 webui 通过端口和别名调用"，
 // 于是 imgcompress 从"纯 CLI"变成"CLI 引擎 + 面板托管的网页界面服务"：
 // 它**不再**标 NoDaemon，但 RuntimePath（vips 可执行文件）这条安装体判据必须
 // 继续保留 —— 下面分开断言这两类，免得把"新增了服务"误当成"判据可以删了"。

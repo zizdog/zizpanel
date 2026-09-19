@@ -14,7 +14,7 @@ import (
 //  Docker 类条目从"可安装应用"改成"面板建议的项目"：
 //    · 面板**不代用户安装**（安装接口明确拒绝，见 web 层）；
 //    · 只提供预配置好的 compose 文件，用户改完自己 `docker compose up -d`；
-//    · 这些文件同时发布到 NAS 镜像站，供"从镜像拉取"的场景取用。
+//    · 这些文件同时发布到镜像站，供"从镜像拉取"的场景取用。
 //
 //  本文件是**单一数据源**：内容来自 catalog 里的 App.ComposeYAML，
 //  由 cmd/zizpanel-assets 的 `compose` 子命令导出、

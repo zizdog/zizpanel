@@ -12,7 +12,7 @@ import (
 )
 
 // ============================================================================
-//  卸载 python@3.13 的真机流程（2026-09-21 用户原文）
+//  卸载 python@3.13 的真机流程（用户原文）
 //
 //  brew uninstall python@3.13 →
 //    Error: Refusing to uninstall … because it is required by llvm and rust …
@@ -174,7 +174,7 @@ func TestMarketUninstallBlockedByBrewDependentsThenForce(t *testing.T) {
 }
 
 // TestMarketListNeverProbesBrewDependencies 锁住"市场列表一条依赖都不查"这条**类级**
-// 不变量（用户 2026-09-21 报的"应用又开始卡了：正在读取应用目录…"）。
+// 不变量（用户报的"应用又开始卡了：正在读取应用目录…"）。
 //
 // 根因：列表对**每一条**应用跑一遍完整卸载计划，其中依赖检测是一次真实的
 // `brew uses --installed`（brew 启动本身约 0.4s）。36 条 → 冷启动 15 秒。

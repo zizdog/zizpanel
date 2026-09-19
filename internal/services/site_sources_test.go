@@ -20,7 +20,7 @@ import (
 //  下面这些断言把用户要求变成代码能守住的东西：
 //    · 版本**写死**，绝不出现 latest（否则"昨天能装、今天装不上"）；
 //    · sha256 是 64 位十六进制，且不指向 jsdelivr 那种实测失效的地址；
-//    · NAS 探通 → 镜像排第一；探不通 → 回落官方并把原因写进日志；
+//    · 镜像站探通 → 镜像排第一；探不通 → 回落官方并把原因写进日志；
 //    · 校验不通过必然删文件，绝不留下坏包；
 //    · 单测全程走 httptest / 注入点，不碰真实镜像站、不碰真实网络。
 // ============================================================================
@@ -68,7 +68,7 @@ func TestSiteSourceRegistryPinnedRealHashes(t *testing.T) {
 	}
 }
 
-// TestSitePackageSourcesMirrorFirst：NAS 探得通 → 镜像排第一，并如实标注。
+// TestSitePackageSourcesMirrorFirst：镜像站探得通 → 镜像排第一，并如实标注。
 func TestSitePackageSourcesMirrorFirst(t *testing.T) {
 	src, _ := SiteSourceFor("typecho")
 	m := &Manager{opt: Options{MirrorBase: "https://mirror.example.com:8888"}}
@@ -87,11 +87,11 @@ func TestSitePackageSourcesMirrorFirst(t *testing.T) {
 	if srcs[0].URL != want {
 		t.Errorf("镜像可用时第一位应是镜像：\n got %s\nwant %s", srcs[0].URL, want)
 	}
-	if srcs[0].Label != "NAS 镜像" {
-		t.Errorf("第一位应标注为 NAS 镜像，实际 %q", srcs[0].Label)
+	if srcs[0].Label != "镜像站" {
+		t.Errorf("第一位应标注为镜像站，实际 %q", srcs[0].Label)
 	}
 	joined := strings.Join(logs, "\n")
-	if !strings.Contains(joined, "NAS 镜像上有") {
+	if !strings.Contains(joined, "镜像站上有") {
 		t.Errorf("日志要如实写出走了镜像，实际：%q", joined)
 	}
 }
@@ -130,7 +130,7 @@ func TestSitePackageSourcesMirrorDisabled(t *testing.T) {
 	if len(srcs) == 0 || srcs[0].URL != src.Upstreams[0] {
 		t.Errorf("关闭镜像时应直接用官方源，实际 %v", srcs)
 	}
-	if !strings.Contains(strings.Join(logs, "\n"), "未启用 NAS 镜像") {
+	if !strings.Contains(strings.Join(logs, "\n"), "未启用镜像站") {
 		t.Errorf("要如实说明未启用镜像，实际：%q", logs)
 	}
 }
@@ -189,7 +189,7 @@ func TestFetchVerifiedSitePackageFallsBackToNextSource(t *testing.T) {
 	var logs []string
 	used, err := m.fetchVerifiedSitePackage(context.Background(), src,
 		[]weightSource{
-			{URL: bad.URL + "/fake.zip", Label: "NAS 镜像"},
+			{URL: bad.URL + "/fake.zip", Label: "镜像站"},
 			{URL: good.URL + "/fake.zip", Label: "官方源"},
 		}, dest, func(s string) { logs = append(logs, s) })
 	if err != nil {
@@ -254,8 +254,8 @@ func TestDownloadSitePackagePrefersMirrorAndVerifies(t *testing.T) {
 	if src.Version != "9.9" {
 		t.Errorf("应返回固定版本 9.9，实际 %q", src.Version)
 	}
-	if label != "NAS 镜像" {
-		t.Errorf("镜像可用时来源应是 NAS 镜像，实际 %q", label)
+	if label != "镜像站" {
+		t.Errorf("镜像可用时来源应是镜像站，实际 %q", label)
 	}
 	got, _ := os.ReadFile(dest)
 	if sha256Hex(got) != sum {

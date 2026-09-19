@@ -10,7 +10,7 @@ import (
 
 // TestEnsureNginxRuntimeDirsOwnerDiscipline 锁"临时目录属主只能来自运行体"。
 //
-// 2026-09-22 用户报障（推音色样本 → nginx 自己的 500 HTML 页）暴露的规则：
+// 用户报障（推音色样本 → nginx 自己的 500 HTML 页）暴露的规则：
 // 临时目录属主不对时 worker 写不进去，症状与"目录不存在"完全一样。所以
 //
 //	① 属主判不出来（没有 worker、nginx.conf 里也没有 user）→ 建目录但**一次都不 chown**，

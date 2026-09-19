@@ -70,7 +70,7 @@ type UninstallPlan struct {
 	// false = 没查成（brew 不可用/超时）→ 界面必须如实写"未检查"，绝不能说"没有依赖"。
 	DependentsChecked bool `json:"dependents_checked,omitempty"`
 	// ForceAllowed 表示"这个计划允许强制卸载（brew uninstall --ignore-dependencies）"。
-	// 2026-09-21 用户真机卸载 python@3.13：brew 因 llvm/rust 依赖拒绝卸载，计划阶段就要说清"谁依赖它"。
+	// 用户真机卸载 python@3.13：brew 因 llvm/rust 依赖拒绝卸载，计划阶段就要说清"谁依赖它"。
 	// 语义边界（必须守住）：只是"允许用户选"，**绝不允许默认加 --ignore-dependencies**（只在 force=true 时追加）。
 	ForceAllowed bool `json:"force_allowed,omitempty"`
 	// ForceNote 是"强制卸载会破坏什么"的逐字说明（界面直接展示，不用自己拼）。
@@ -130,7 +130,7 @@ type BrewState struct {
 
 // ResolveBrewFormula 决定"这个目录条目对应机器上哪个已装的 brew formula"（installed = formula→版本串）：
 // 先精确匹配；不中且目录写 `php@8.4` 时看无后缀 formula（php）版本是否匹配。
-// 只精确匹配会让装着 PHP 8.4 的机器显示"未安装"、一颗收尾按钮都不给（2026-09-21 用户现场："没安装的显示安装"）。
+// 只精确匹配会让装着 PHP 8.4 的机器显示"未安装"、一颗收尾按钮都不给（用户现场："没安装的显示安装"）。
 func ResolveBrewFormula(catalogFormula string, installed map[string]string) (formula, version string, ok bool) {
 	f := strings.TrimSpace(catalogFormula)
 	if f == "" {
@@ -212,7 +212,7 @@ func (m *Manager) PlanUninstallForBrew(ctx context.Context, app App, rec *Servic
 
 // PlanUninstallForBrewFast 是**只算本体、不查依赖**的计划（列表用）：依赖检测是一次真实
 // brew 调用，列表每条跑一遍 = 36 条 15 秒冷启动，用户看到的是"正在读取应用目录…"卡住不动
-// （2026-09-21 真机实测：GET /api/v1/market 冷 14.998s、热 0.25s）。
+// （真机实测：GET /api/v1/market 冷 14.998s、热 0.25s）。
 //
 // 调用方**不得**拿它断言"没有依赖"—— 它只是"还没查"，按需查走 uninstall-plan 接口。
 func (m *Manager) PlanUninstallForBrewFast(app App, rec *Service, brew BrewState) UninstallPlan {
@@ -281,7 +281,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 			}
 			return UninstallPlan{Kind: "service", Service: rec.Name, Steps: steps, KeepNote: keep}
 		}
-		// brew 原生托管服务：只删服务定义的话 brew 包还原封不动（2026-09-21 php82 的报障）。
+		// brew 原生托管服务：只删服务定义的话 brew 包还原封不动（php82 的报障）。
 		// 真实动作 = 停服务 + 删记录 + brew uninstall。
 		if brew.Installed {
 			p := m.brewUninstallPlan(ctx, app, brew, checkDeps)
@@ -312,7 +312,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 	}
 	if rec != nil {
 		// managed=false 但目录知道它是什么（有 brew formula 且真的装着）→ 给真正的卸载。
-		// 2026-09-21 用户要求：目录里的应用只有一个「🗑 卸载」动作并真的卸载，不摆"只删记录"
+		// 用户要求：目录里的应用只有一个「🗑 卸载」动作并真的卸载，不摆"只删记录"
 		// （"移除却不卸载"会让它隐身运行）。mysql84 这类用户早年自装、后登记的条目也走这条。
 		if app.PanelInstaller == "" && brew.Installed &&
 			app.Kind != KindCompose && app.Kind != KindDocker {
@@ -358,7 +358,7 @@ func (m *Manager) planUninstallForBrewCore(ctx context.Context, app App, rec *Se
 		paths = append(paths, d)
 	}
 	// **brew 装了、但面板没有任何记录**（用户自己 brew install 的、或换机后记录丢了）。
-	// 2026-09-21 用户现场 nginx 就是这一态：installed=true 却 kind:"none"，一颗收尾按钮都没有
+	// 用户现场 nginx 就是这一态：installed=true 却 kind:"none"，一颗收尾按钮都没有
 	// （"甚至没有卸载按钮"）。installed=true 必须给得出卸载路径。
 	if brew.Installed {
 		p := m.brewUninstallPlan(ctx, app, brew, checkDeps)
@@ -467,7 +467,7 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 		p.Steps = append(p.Steps,
 			"未检查是否有别的软件依赖 "+formula+"（可自行执行：brew uses --installed "+formula+"）")
 	}
-	// 必须出现在确认框里：不会自动删别的包（HOMEBREW_NO_AUTOREMOVE=1；2026-09-21 用户真机见到
+	// 必须出现在确认框里：不会自动删别的包（HOMEBREW_NO_AUTOREMOVE=1；用户真机见到
 	// "Autoremoving 2 unneeded formulae"），也不会删配置目录（brew 从不删 etc/ 下的配置）。
 	p.KeepNote = "brew uninstall 只删除 " + formula + " 本身：**不会**删除它依赖的包，" +
 		"也**不会**自动删除其它「已不再被需要」的包（面板给卸载命令带上 HOMEBREW_NO_AUTOREMOVE=1），" +
@@ -490,7 +490,7 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 // （false = 未检查，绝不能显示成"没有依赖"）。
 // ⚠️ **绝不再放回市场列表渲染路径**（测试锁死 TestMarketListNeverProbesBrewDependencies）。
 //
-// ⚠️ 超时 45 秒（2026-09-21 实测踩到）：brew 更新/加载 tap 能挂几分钟，挂住就是整页白屏
+// ⚠️ 超时 45 秒（2026-09-19 实测踩到）：brew 更新/加载 tap 能挂几分钟，挂住就是整页白屏
 // （TestMarketZombieColimaPlistNotInstalled 曾卡到 15 分钟超时）；拿不到结论就如实报"未检查"。
 func (m *Manager) brewUsesInstalled(ctx context.Context, formula string) ([]string, bool) {
 	if formula == "" {
@@ -597,7 +597,7 @@ func (m *Manager) UninstallApp(ctx context.Context, appID string, removeData, fo
 	return fmt.Errorf("「%s」没有对应的卸载实现（PanelInstaller=%q）", app.Name, app.PanelInstaller)
 }
 
-// installerUninstalls 是"面板自研安装器 → 卸载实现"的**唯一注册表**（2026-09-21 用户第三次报"装上了卸不掉"：
+// installerUninstalls 是"面板自研安装器 → 卸载实现"的**唯一注册表**（用户第三次报"装上了卸不掉"：
 // 安装器清单与卸载实现分散两处时，漏补任何一处就是"有安装入口、点了报没有实现"）。
 // UninstallApp 只查这张表，全目录门禁测试 TestCatalogUninstallActionMatrix 也查它 —— 有安装器却没有卸载实现，**测试阶段就会失败**。
 var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app App, removeData, force bool, result *InstallResult) error{
@@ -668,7 +668,7 @@ func HasInstallerUninstall(panelInstaller string) bool {
 //
 //   - 停失败但**确实不在跑** → 也删记录（没有"隐身运行"风险）；
 //
-//   - 停失败且仍在跑 → **拒绝删记录**并如实报错（2026-09-21 用户要求）。
+//   - 停失败且仍在跑 → **拒绝删记录**并如实报错（用户要求）。
 func (m *Manager) StopAndForget(ctx context.Context, name string) (bool, error) {
 	if _, err := m.Action(ctx, name, "stop"); err != nil {
 		if errors.Is(err, ErrServiceNotFound) {
@@ -765,7 +765,7 @@ func (m *Manager) UninstallBrewApp(ctx context.Context, app App, plan UninstallP
 }
 
 // brewUninstall 跑一条 `brew uninstall`：默认**绝不加 force 开关**，只有用户明确选了强制才追加
-// --ignore-dependencies。统一带 HOMEBREW_NO_AUTOREMOVE=1（2026-09-21 用户真机：一次卸载被顺手
+// --ignore-dependencies。统一带 HOMEBREW_NO_AUTOREMOVE=1（用户真机：一次卸载被顺手
 // Autoremove 了两个无关包）。走 brewInstallRun 以便测试注入假执行器**锁住命令形状**、标签从真实参数派生。
 func (m *Manager) brewUninstall(ctx context.Context, formula string, force bool, result *InstallResult) error {
 	args := []string{"uninstall"}
@@ -789,7 +789,7 @@ func (m *Manager) brewUninstall(ctx context.Context, formula string, force bool,
 	return nil
 }
 
-// brewUninstallErrText 把 brew uninstall 的失败**翻译**成用户能据以行动的说明（2026-09-21 真机
+// brewUninstallErrText 把 brew uninstall 的失败**翻译**成用户能据以行动的说明（真机
 // 卸载 python@3.13 时面板只贴整段英文原文，用户不知道谁依赖它、还能怎么办）。
 // 一句人话 + 两个明确动作；**原始输出不丢**，跟在后面供排查。
 func brewUninstallErrText(formula string, force bool, out string, err error) string {
@@ -829,7 +829,7 @@ func (m *Manager) phpEtcDir() string {
 
 // phpVersionOfFormula 从 formula 取 PHP 版本号（"php@8.4" → "8.4"；"php" → ""）。
 // 允许空：无版本别名 `php` 推不出 etc/php/8.4 —— 宁可不列任何配置目录，
-// 也**绝不**把别的版本（8.2）写进要删的名单（用户 2026-09-21 报障）。
+// 也**绝不**把别的版本（8.2）写进要删的名单（用户报障）。
 func phpVersionOfFormula(formula string) string {
 	f := strings.TrimSpace(formula)
 	if f == "php" {
@@ -849,7 +849,7 @@ func phpVersionOfFormula(formula string) string {
 
 // phpVersionFor 决定"这个 PHP formula 在 etc/php 下的版本目录名"：先取 formula 自带版本
 // （`php@8.4` → "8.4"），否则用 brew 报出的真实版本取主次号（"8.4.7" → "8.4"）。
-// 两条都不成立就返回空 —— 宁可不列配置目录，也**绝不**猜版本号（猜错就删到 8.2，2026-09-21 报障）。
+// 两条都不成立就返回空 —— 宁可不列配置目录，也**绝不**猜版本号（猜错就删到 8.2，报障）。
 func (m *Manager) phpVersionFor(formula, brewVersion string) string {
 	if v := phpVersionOfFormula(formula); v != "" {
 		return v
@@ -886,7 +886,7 @@ func allDigits(s string) bool {
 
 // phpConfigPathsFor 返回"这个 PHP 版本自己的配置目录"（版本为空 → 什么都不返回）。
 // brew 的 warning 会笼统列出整个 etc/php：里面 8.2 的路径属于**另一个版本**、
-// phpmyadmin 的配置属于另一个应用（2026-09-21 真机）。
+// phpmyadmin 的配置属于另一个应用（真机）。
 //
 // 本函数只认 <prefix>/etc/php/<版本>，且只有真的存在才列出；父目录为空时才由 cleanupPHPConfigDirs 删。
 func (m *Manager) phpConfigPathsFor(version string) []string {

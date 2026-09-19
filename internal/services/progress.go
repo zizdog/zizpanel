@@ -121,7 +121,7 @@ func streamCmd(ctx context.Context, cmd *exec.Cmd) (string, error) {
 
 	// ctx 取消/超时时**主动关掉管道**，保证读取 goroutine 一定能看到 EOF。
 	//
-	// 为什么必须这么做（2026-09-21 实测）：exec.CommandContext 在超时后只 kill
+	// 为什么必须这么做（2026-09-18 实测）：exec.CommandContext 在超时后只 kill
 	// **直接子进程**；brew 是脚本，它会 fork 出 `git` 之类的孙子进程，孙子进程
 	// 继承着这两个管道。父进程被 SIGKILL 之后管道写端仍然打开，读取 goroutine
 	// 永远等不到 EOF → `wg.Wait()` 死等 → 整个 HTTP 请求（市场列表）挂住。

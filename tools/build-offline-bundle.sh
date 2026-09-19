@@ -32,25 +32,27 @@
 #  ---------------------------------------------------------------------------
 #  用法：
 #    bash tools/build-offline-bundle.sh --list                    # 只看计划与缺口
-#    bash tools/build-offline-bundle.sh --app frpc               # 本地生成（不上传）
-#    NAS_PASS='…' bash tools/build-offline-bundle.sh --app frpc --upload
-#    NAS_PASS='…' bash tools/build-offline-bundle.sh --all --upload
-#    bash tools/build-offline-bundle.sh --verify frpc            # 只做 HTTP 侧核对
+#    MIRROR_BASE='https://…' bash tools/build-offline-bundle.sh --app frpc    # 本地生成（不上传）
+#    MIRROR_BASE='https://…' NAS_HOST='…' NAS_ROOT='…' NAS_USER='…' NAS_PASS='…' \
+#        bash tools/build-offline-bundle.sh --app frpc --upload
+#    MIRROR_BASE='https://…' bash tools/build-offline-bundle.sh --verify frpc # 只做 HTTP 侧核对
 #
-#  环境变量：NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS / MIRROR_BASE
+#  环境变量：MIRROR_BASE（必填；--list 与 --dry-run 除外）
+#           NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS（只有 --upload 需要）
+#  ⚠️ 地址由调用者提供，仓库里不留任何内网默认值。
 #  ⚠️ 口令只从环境变量进、只交给 sshpass，绝不写进任何文件、也不打印。
 # ============================================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
-# NAS_ROOT 是 offline 目录（与 /vol2/zizpanel-mirror 下的 apps/ brew/ 同级）
-NAS_ROOT="${NAS_ROOT:-/vol2/zizpanel-mirror/offline}"
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
+# NAS_ROOT 是 offline 目录（与镜像站上的 apps/ brew/ 同级）
+NAS_ROOT="${NAS_ROOT:-}"
 NAS_PASS="${NAS_PASS:-}"
-# 取件与验收都用这个基址。默认走里网直连 8090（不经过公网 8888，测试更干净）
-MIRROR_BASE="${MIRROR_BASE:-http://192.168.1.8:8090}"
+# 取件与验收都用这个基址（调用者提供，例如 https://mirror.example.com）
+MIRROR_BASE="${MIRROR_BASE:-}"
 TAG="${TAG:-arm64_sequoia}"
 
 MODE="build"
@@ -62,7 +64,7 @@ STAGE=""
 ONLY_APPS=()
 VERIFY_ONLY=""
 
-usage() { sed -n '2,45p' "$0"; }
+usage() { sed -n '2,44p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,6 +89,10 @@ while [ $# -gt 0 ]; do
 done
 
 MIRROR_BASE="${MIRROR_BASE%/}"
+# 地址由调用者提供：仓库里不留任何内网默认值（--list 不联网，不需要基址）。
+if [ "$MODE" != "list" ]; then
+  : "${MIRROR_BASE:?请传 MIRROR_BASE=<你自己的镜像基址，如 https://mirror.example.com>（或用 --base）}"
+fi
 sha256_of() { /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; }
 http_code() { /usr/bin/curl -s -o /dev/null -m 20 -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
 py() { python3 "$@"; }
@@ -144,6 +150,9 @@ if [ "$UPLOAD" = "1" ] && [ -n "$DRY_RUN" ]; then
   echo "--dry-run 与 --upload 不能同时用" >&2; exit 2
 fi
 if [ "$UPLOAD" = "1" ]; then
+  : "${NAS_HOST:?--upload 需要 NAS_HOST=<你自己的镜像机>}"
+  : "${NAS_USER:?--upload 需要 NAS_USER=<镜像机用户>}"
+  : "${NAS_ROOT:?--upload 需要 NAS_ROOT=<镜像上的 offline 目录>}"
   if [ -z "$NAS_PASS" ]; then
     echo "需要 NAS 口令：NAS_PASS='...' bash tools/build-offline-bundle.sh …（或用 ssh 密钥）" >&2
     exit 1
@@ -192,7 +201,7 @@ while IFS= read -r app; do
   else
     # 清掉上一次构建的暂存（否则旧版本目录会被算进"磁盘文件数"，对账必错 ——
     # 真机踩过：换了目录名（current → 9.0.1_1）后旧目录还在，45 个制品数成 90 个）
-    rm -rf "$STAGE/$app" "$WORK/$app"
+    rm -rf "${STAGE:?}/$app" "${WORK:?}/$app"
     REPORT="$WORK/$app.json"
     if ! py "$REPO_ROOT/tools/offline-bundle-lib.py" \
         --plan "$PLAN_JSON" --app "$app" --stage "$WORK/$app" \

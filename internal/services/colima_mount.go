@@ -51,7 +51,7 @@ import (
 // 冷启动要下 guest 镜像：Ubuntu 24.04 minimal arm64-docker 是 **332,354,401 B**。
 // 实测（2026-09-16）公网 GitHub 只有 ~77 KB/s（≈71 分钟），5 分钟必然被掐断 ——
 // 旧值就是 5 分钟，于是"VM 镜像还没下完就被杀"必然发生。
-// 现在优先从自建 NAS 预热（本机↔NAS 实测 317MiB 秒级），但 NAS 不通时会回落到
+// 现在优先从自建镜像站 预热（本机↔镜像站实测 317MiB 秒级），但镜像站不通时会回落到
 // GitHub，所以超时按"公网也能下完"给：90 分钟。
 const colimaStartTimeout = 90 * time.Minute
 

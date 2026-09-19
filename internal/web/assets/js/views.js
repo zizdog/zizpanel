@@ -14,7 +14,7 @@ import { taskCenter } from './tasks.js';
 // 也走它。这里以前**漏了 import**：点那些「打开」会抛 ReferenceError
 //（async 事件处理器里的 rejection 不显示任何东西，用户看到的是"点了没反应"）。
 import { configFileModal } from './services.js';
-// 「检查更新」在 2026-09-20 被用户要求**收回**「面板设置」（原来是侧栏独立页），
+// 「检查更新」在被用户要求**收回**「面板设置」（原来是侧栏独立页），
 // 作为本页第 4 个 Tab。它的实现仍在 update.js 里，这里只是把它挂进来 ——
 // 不复制一份代码，避免"两处升级界面各改一半"（本项目反复踩过的坑）。
 import { UpdateView } from './update.js';
@@ -89,7 +89,7 @@ export function DashboardView(content, ctx = {}) {
         h('button.btn.btn-sm', { text: '按内存', onclick: () => loadProcs('mem') }),
       ]),
     ]),
-    // 移动端横向溢出（用户 2026-09-24 报障）：这张表有 6 列，窄屏下会被
+    // 移动端横向溢出（用户报障）：这张表有 6 列，窄屏下会被
     // 单元格最小内容宽度顶破页面。给它一个**自己的横向滚动容器** +
     // 表格 min-width，让它可以左右滑，而不是撑破整个 .layout
     // （见 app.css 的 .zp-table-scroll）。
@@ -428,16 +428,16 @@ export function DashboardView(content, ctx = {}) {
 // 2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的，用户没法更改文件大小限制"，
 // 并明确要求"这些常用更改应该同时做成功能，而不是让用户只能编辑配置原文件"。
 // 所以同一份实现曾被多处共用：面板设置版块、nginx/PHP 的管理面板、网站管理工具条。
-// 2026-09-24 面板设置里的那份已删（去重），现在主要入口是「调整配置 → 上传与执行上限」
+// 2026-09-19 面板设置里的那份已删（去重），现在主要入口是「调整配置 → 上传与执行上限」
 //（实现只有这一份，绝不复制第二份 —— 复制出来的那份迟早会与后端校验漂移）。
 //
-// ⚠️ nginx 的 `client_max_body_size` **不在这里改**（2026-09-22 用户报障：
+// ⚠️ nginx 的 `client_max_body_size` **不在这里改**（用户报障：
 // "Nginx 管理和上传大小 / 执行时间严重重复"）。同一个值有两处可编辑入口，
 // 必然出现"这边改了那边没改、两边都以为自己对"——现在它只有一个可编辑入口
 // 「调整配置 → nginx → 性能调整」；这里只**如实显示当前值**并给一颗直达按钮。
 // opts.openNginxTuning 由调用方注入（避免 views.js ↔ nginxpanel.js 的循环 import）。
 //
-// 导出它：2026-09-22 起「调整配置」弹窗里的「上传与执行上限」页也用这一份实现
+// 导出它：2026-09-18 起「调整配置」弹窗里的「上传与执行上限」页也用这一份实现
 //（同一个值只有一个来源，绝不复制第二份到 nginxpanel.js）。
 export async function renderLimitsInto(container, refresh, opts = {}) {
   let v;
@@ -713,9 +713,9 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
   );
 }
 
-// 原「⚡ 上传大小 / 执行时间」独立弹窗已删除（2026-09-22 用户要求把重复入口整合成
+// 原「⚡ 上传大小 / 执行时间」独立弹窗已删除（用户要求把重复入口整合成
 // 一个「调整配置」）。渲染实现仍只有下面 renderLimitsInto 这一份，现在只被
-// 「调整配置 → 上传与执行上限」使用 —— 2026-09-24 用户要求把面板设置里的
+// 「调整配置 → 上传与执行上限」使用 ——用户要求把面板设置里的
 // 「上传与执行限制」Tab 删掉（那是同一个值的第二个可编辑入口），这里同步更新说明。
 
 export function SettingsView(content, ctx = {}) {
@@ -723,7 +723,7 @@ export function SettingsView(content, ctx = {}) {
   const user = state.session?.user || {};
   const cfg = state.session?.config || {};
 
-  // 2026-09-24 用户要求的两次信息架构调整：
+  // 用户要求的两次信息架构调整：
   //   · 「上传与执行限制」从面板设置里**整个删掉** —— 网站管理里已经有同一个
   //     可编辑入口（「调整配置 → 上传与执行上限」），设置页再放一份就是重复入口。
   //     它的渲染实现 renderLimitsInto 仍保留并导出，nginx/PHP 面板继续用。
@@ -733,7 +733,7 @@ export function SettingsView(content, ctx = {}) {
   // 旧 hash 一个都不能白屏：`#/settings/limits`、`#/settings/terminal` 由
   // app.js 的 SUB_ROUTE_TARGET 别名落到 access Tab（这里也对未知 tab 兜底）。
   //
-  // 「检查更新」仍排在最后（用户 2026-09-20 明确要求的顺序），保留直达 hash。
+  // 「检查更新」仍排在最后（用户明确要求的顺序），保留直达 hash。
   const tabs = [
     { id: 'access', title: '访问与安全' },
     { id: 'account', title: '账号与两步验证' },
@@ -778,7 +778,7 @@ export function SettingsView(content, ctx = {}) {
 
   // ---------- 访问与安全 ----------
   //
-  // 2026-09-24：原「文件与终端」Tab 的内容（Web 终端开关 / 当前会话 /
+  // 2026-09-19：原「文件与终端」Tab 的内容（Web 终端开关 / 当前会话 /
   // 文件管理可访问范围）并入本节的末尾 —— 见 renderTerminalInto。
   // 原「上传与执行限制」Tab 已删除（用户要求去重，入口只在「调整配置」里）；
   // 它的渲染实现 renderLimitsInto 仍在本文件导出，别处继续复用。
@@ -794,7 +794,7 @@ export function SettingsView(content, ctx = {}) {
     ]);
     const whitelist = h('textarea.textarea', {
       value: (s.ip_whitelist || []).join('\n'),
-      placeholder: '每行一个网段或 IP，例如：\n100.64.0.0/10\n192.168.1.0/24\n10.0.0.5',
+      placeholder: '每行一个网段或 IP，例如：\n100.64.0.0/10\n192.0.2.0/24\n198.51.100.5',
       style: { minHeight: '110px' },
     });
     const trustProxy = h('input', { type: 'checkbox', checked: !!s.trust_proxy });
@@ -817,7 +817,7 @@ export function SettingsView(content, ctx = {}) {
     const sessionHours = h('input.input', { type: 'number', value: s.session_hours, min: 1, max: 720 });
     const maxFail = h('input.input', { type: 'number', value: s.login_max_fail, min: 1, max: 50 });
     const lockMins = h('input.input', { type: 'number', value: s.login_lock_mins, min: 1, max: 1440 });
-    // 应用包镜像（自建 NAS）：面板里所有安装过程都先检查它。
+    // 应用包镜像（自建镜像站，公网域名）：面板里所有安装过程都先检查它。
     // 留空 = 关闭镜像、各来源回到内置的公网/国内镜像（仅用于镜像站故障时应急）。
     const mirrorInput = h('input.input', {
       value: s.mirror_base || '',
@@ -825,15 +825,7 @@ export function SettingsView(content, ctx = {}) {
       style: { flex: '1 1 320px' },
     });
     const mirrorProbe = h('input.input', { type: 'number', value: s.mirror_probe_seconds || 4, min: 1, max: 60 });
-    // 局域网入口（第二候选）：公网镜像入口坏掉时用它 —— 2026-09-18 用户报障
-    // "ddns-go 等没有 nas 缓存！装不上啊！"，实测是公网入口返回空响应，
-    // 而同一台 NAS 的 8090 上包好好地躺着。
-    const mirrorLAN = h('input.input', {
-      value: s.mirror_base_lan || '',
-      placeholder: '例如 http://192.168.1.8:8090（留空 = 不尝试局域网入口）',
-      style: { flex: '1 1 320px' },
-    });
-    // 仅走 NAS（离线）模式：整机断外网 / 隔离网络 / 迁移到新 Mac 时打开。
+    // 仅走镜像站（离线）模式：整机断外网 / 隔离网络 / 迁移到新 Mac 时打开。
     // 打开后各安装器**禁止回落外网**，缺资源就明确失败并列出缺哪个文件。
     // 刻意与 mirror_base 放在同一张卡片里：两者一起看才不会被误解成
     // "配了镜像就离线了" —— 默认是"镜像优先 + 缺件回落公网"，只有这个勾才是硬离线。
@@ -863,7 +855,6 @@ export function SettingsView(content, ctx = {}) {
             login_max_fail: Number(maxFail.value),
             login_lock_mins: Number(lockMins.value),
             mirror_base: mirrorInput.value.trim(),
-            mirror_base_lan: mirrorLAN.value.trim(),
             mirror_probe_seconds: Number(mirrorProbe.value) || 4,
             offline_only: offlineOnly.checked,
           };
@@ -930,25 +921,22 @@ export function SettingsView(content, ctx = {}) {
           ]),
           // 应用包镜像：面板里所有安装过程都先检查它（见 services/mirror.go）。
           // 语义是"镜像**优先**、缺件回落公网"；要"禁止回落"必须再勾下面的
-          // 「仅走 NAS（离线）」—— 两件事分开，文案必须写清，否则用户会以为
+          // 「仅走镜像站（离线）」—— 两件事分开，文案必须写清，否则用户会以为
           // 配了镜像就等于离线（那是这个页面最容易被误读的地方）。
           h('div.field', [
             h('label', { text: '应用包镜像基址' }),
             mirrorInput,
-            h('div.hint', { style: { marginTop: '6px' } },
-              [h('span', { text: '局域网入口（公网入口不可达时的第二候选）：' })]),
-            mirrorLAN,
             h('div.hint', {
               html: '安装 frpc / DDNS-Go 这类应用时，面板先检查 ' +
                 '<code class="code">&lt;基址&gt;/apps/&lt;应用&gt;/&lt;版本&gt;/&lt;文件名&gt;</code> 在不在；' +
                 '在就从镜像下（并在任务日志里写明来源）。' +
                 '镜像上缺这个包、或镜像站暂时不可达时，<b>默认</b>会回落到内置的公网/国内源 —— ' +
-                '要禁止回落请勾下面的「仅走 NAS（离线）」。<br>' +
+                '要禁止回落请勾下面的「仅走镜像站（离线）」。<br>' +
                 '留空 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）。',
             }),
           ]),
           h('div.row', [
-            h('label', [h('span', { text: '仅走 NAS（离线）：禁止任何外网回落，缺资源即明确失败' })]),
+            h('label', [h('span', { text: '仅走镜像站（离线）：禁止任何外网回落，缺资源即明确失败' })]),
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
               offlineOnly,
               h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: '用于整机断外网 / 隔离网络 / 迁移到新 Mac。打开后装不了的应用会明确报出缺哪个文件，而不是悄悄去连外网（那样只会"装到一半卡死"）。' }),
@@ -957,7 +945,7 @@ export function SettingsView(content, ctx = {}) {
           ]),
           h('div.row', [
             h('div.field', [h('label', { text: '镜像资源探测超时（秒）' }), mirrorProbe]),
-            h('div.hint', { style: { alignSelf: 'center' }, text: '镜像不可达时不让安装白等；局域网/同城镜像正常在 100ms 内应答。' }),
+            h('div.hint', { style: { alignSelf: 'center' }, text: '镜像不可达时不让安装白等；同城/国内镜像正常在 100ms 内应答。' }),
           ]),
           save,
         ]),
@@ -977,14 +965,14 @@ export function SettingsView(content, ctx = {}) {
       ]),
     );
 
-    // 原「文件与终端」Tab 的内容并入本节（2026-09-24 用户要求）：
+    // 原「文件与终端」Tab 的内容并入本节（用户要求）：
     // 连接是「哪些来源能进面板」，终端是「进来后能做什么」，放在一起才完整。
     await renderTerminalInto(body);
   }
 
-  // ---------- Web 终端 / 文件范围（原「文件与终端」，2026-09-24 并入本页）----------
+  // ---------- Web 终端 / 文件范围（原「文件与终端」，2026-09-19 并入本页）----------
   //
-  // ⚠️ 状态来源（用户 2026-09-24 报障："不管开没开，这里永远显示未勾选"）：
+  // ⚠️ 状态来源（用户报障："不管开没开，这里永远显示未勾选"）：
   //   GET /api/v1/settings 的返回体（server 的 settingsView）里**根本没有**
   //   terminal_enabled / terminal_shell / terminal_idle_mins / terminal_max_sessions
   //   这几个字段 —— 所以老代码里的 `st.terminal_enabled` 永远是 undefined，
@@ -1330,7 +1318,7 @@ export function SettingsView(content, ctx = {}) {
 
   renderTabs();
   renderBody();
-  // 这里**不再**有「已迁移的功能」指路卡片：2026-09-20 用户要求把「检查更新」
+  // 这里**不再**有「已迁移的功能」指路卡片：用户要求把「检查更新」
   // 收回设置页（重复入口让人困惑），功能就在上面第 4 个 Tab 里，再放一个
   // "去别处"的按钮只会把用户又支到别的地方。
   content.append(tabBar, body);

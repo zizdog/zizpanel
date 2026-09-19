@@ -688,7 +688,7 @@ func execCommand(name string, args ...string) ([]byte, error) {
 
 // TestDownloadTarballReportsProgress 锁住"下载进度回调"这条新增能力。
 //
-// 为什么值得测：用户 2026-09-20 明确要求"升级过程要有详细的内容展示"，
+// 为什么值得测：用户明确要求"升级过程要有详细的内容展示"，
 // 而进度回调是那条要求唯一的数据来源。回调漏调/重复计数都会让界面上的
 // 百分比说谎（显示"下完了"或一直停在 0%），而升级界面恰恰是用户最紧张的地方。
 func TestDownloadTarballReportsProgress(t *testing.T) {

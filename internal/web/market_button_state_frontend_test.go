@@ -39,7 +39,7 @@ func TestFrontendInstalledStateComesFromBackendFields(t *testing.T) {
 	mustContain(t, "servicePanel.js", sp, "if (!installed) return [];")
 
 	// 安装态判定里的"未装"必须来自后端字段，绝不用产物/plist 另算一遍：
-	// 那正是 2026-09-16"有产物就算已安装"与 2026-09-23"装了却显示未装"的同一类错误。
+	// 那正是 2026-09-16"有产物就算已安装"与 2026-09-18"装了却显示未装"的同一类错误。
 	assertInstalledNotDerivedFromArtifacts(t)
 }
 

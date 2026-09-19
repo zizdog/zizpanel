@@ -100,7 +100,7 @@ var (
 
 // --- 模型档位 ---
 
-// STTModel 是一个可选的模型档位；体积是**实测值**（2026-09-25 读 hf-mirror Content-Range），不是抄的/估的。
+// STTModel 是一个可选的模型档位；体积是**实测值**（2026-09-19 读 hf-mirror Content-Range），不是抄的/估的。
 type STTModel struct {
 	// ID 是对外契约（请求里的 model 字段、/v1/models 的 id）。改名等于改协议。
 	ID string `json:"id"`
@@ -304,7 +304,7 @@ func STTModelsStateFor(modelsDir, currentID string) STTModelsState {
 	return out
 }
 
-// --- 下载来源（NAS → HF 镜像 → 官方）---
+// --- 下载来源（镜像站 → HF 镜像 → 官方）---
 
 // STTModelSource 是一个模型下载来源。
 type STTModelSource struct {

@@ -11,7 +11,7 @@ import (
 )
 
 // ============================================================================
-//  镜像探测的判据（2026-09-20 按真机实测重写）
+//  镜像探测的判据（按真机实测重写）
 //
 //  这一组测试锁住三件在真机上真的出过错的事：
 //    1. brew 7 在自定义 HOMEBREW_BOTTLE_DOMAIN 下走**旧式平铺**文件名，
@@ -123,7 +123,7 @@ func TestBrewMirrorProbeHonoursRebuildSuffix(t *testing.T) {
 	}
 }
 
-// @ 形式与 %40 形式都要试：brew 用 %40，但有的镜像/服务端只认原样的 @（NAS 两种都通）。
+// @ 形式与 %40 形式都要试：brew 用 %40，但有的镜像/服务端只认原样的 @（镜像站两种都通）。
 func TestBrewMirrorProbeAcceptsPlainAtForm(t *testing.T) {
 	tag := bottleTagsForArch()[0]
 	plain := "python@3.11-3.11.16." + tag + ".bottle.tar.gz"
@@ -179,7 +179,7 @@ func TestBrewInstallSourcesOfficialLastWhenNoMirror(t *testing.T) {
 	}
 }
 
-// 离线模式（仅走 NAS）连自建镜像都没探到时，必须**什么都不试**并如实报错，
+// 离线模式（仅走镜像站）连自建镜像都没探到时，必须**什么都不试**并如实报错，
 // 绝不能退回官方源（那等于"离线模式偷偷出网"）。
 func TestBrewInstallOfflineWithoutMirrorFailsHonestly(t *testing.T) {
 	m := brewFallbackTestManager(t, "")

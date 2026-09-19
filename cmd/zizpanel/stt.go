@@ -9,7 +9,7 @@
 // 用 Homebrew 的 whisper.cpp 把音频转成文字并提供界面与 OpenAI 兼容接口。
 // 这样即使面板主进程在重启，已经打开的这个页面也不会跟着挂掉。
 //
-// 面板设置里的镜像基址由 plist 通过 --mirror-base / --mirror-lan 传进来
+// 面板设置里的镜像基址由 plist 通过 --mirror-base 传进来
 // （它不读配置，但下载模型时必须遵守"镜像优先"）。
 package main
 
@@ -39,7 +39,6 @@ func cmdSTTServe(args []string) error {
 	root := fs.String("root", "", "模型根目录（默认 <当前用户家目录>/stt）")
 	modelID := fs.String("model", "", "当前档位（留空则读 <root>/current_model，再空则用默认档）")
 	mirrorBase := fs.String("mirror-base", "", "镜像基址（面板设置里的值，下载模型时优先走它）")
-	mirrorLAN := fs.String("mirror-lan", "", "镜像的局域网入口（可选）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -63,7 +62,6 @@ func cmdSTTServe(args []string) error {
 		Root:       modelRoot,
 		Model:      strings.TrimSpace(*modelID),
 		MirrorBase: strings.TrimSpace(*mirrorBase),
-		MirrorLAN:  strings.TrimSpace(*mirrorLAN),
 	})
 	httpSrv := &http.Server{
 		Addr:    srv.Listen(),

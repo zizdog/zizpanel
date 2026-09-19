@@ -62,7 +62,7 @@ export function SystemSettingsView(content, ctx = {}) {
   const lanToggle = h('input', { type: 'checkbox' });
   const lanInput = h('input.input', {
     type: 'text',
-    placeholder: '例如 192.168.1.0/24（多个用逗号分隔）',
+    placeholder: '例如 192.0.2.0/24（多个用逗号分隔）',
   });
   const lanMsg = h('div');
   const lanSaveBtn = h('button.btn.btn-sm.btn-primary', { text: '保存', onclick: () => submitLAN(lanToggle.checked) });
@@ -491,7 +491,7 @@ export function SystemSettingsView(content, ctx = {}) {
     if (enable) {
       const cidrs = (lanInput.value || '').trim();
       if (!cidrs) {
-        showLANMsg('请先填一个网段（CIDR），例如 192.168.1.0/24。');
+        showLANMsg('请先填一个网段（CIDR），例如 192.0.2.0/24。');
         lanInput.focus();
         return;
       }

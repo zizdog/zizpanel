@@ -292,21 +292,18 @@ func probeGitMirror(ctx context.Context, repoURL string) time.Duration {
 	return time.Since(started)
 }
 
-// brewSeedCandidates 是 "Homebrew 浅克隆包" 的候选地址（局域网 NAS 优先）。
+// brewSeedCandidates 是 "Homebrew 浅克隆包" 的候选地址（公网镜像）。
 //
 // 为什么必须有它（2026-09-18 生产机事故）：Homebrew 官方安装脚本会对 brew.git 做
 // **全量历史 clone**（几百 MB），而国内镜像对 git-upload-pack 的大历史传输会被限速到
 // 近乎 0 —— 用户卡在 "Downloading and installing Homebrew..." 十几分钟、吞吐近零。
-// 把 **--depth=1 的浅克隆包**（31MB → 压缩 9.1MB）放到镜像上：局域网 60 MB/s、1 秒下完，
+// 把 **--depth=1 的浅克隆包**（31MB → 压缩 9.1MB）放到镜像上：公网入口约 10 MB/s，
 // 解出来就是可用的 brew 前缀（Homebrew 的前缀本身就是这个仓库），**完全不需要 git clone**。
+//
+// 只有公网入口：面板要发给所有人用，作者自己的局域网镜像入口已删除（2026-09-20 用户要求）。
 func brewSeedCandidates() []string {
-	// **公网镜像优先**：这个面板是要发给公众用的，192.168.1.8 只是作者家里的 NAS ——
-	// 公众用户永远连不上，放在第一顺位等于让每个人都先白等一次连接超时。
-	// 公网入口本身也走同一台 NAS（10 MB/s，9.5MB ≈ 1 秒），局域网用户并不会慢；
-	// 作者自己的局域网再把 LAN 地址作为第二顺位（连上就 60 MB/s）。
 	return []string{
-		"https://mirror.zizdog.com:8888/brew-seed/brew-shallow.tar.gz", // 公网镜像入口（默认）
-		"http://192.168.1.8:8090/brew-seed/brew-shallow.tar.gz",        // 局域网 NAS（更快，仅作者内网可达）
+		"https://mirror.zizdog.com:8888/brew-seed/brew-shallow.tar.gz",
 	}
 }
 
@@ -437,7 +434,7 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 		return err
 	}
 
-	// 2) **种子优先**：能从镜像（局域网 NAS → 公网镜像）拿到浅克隆包，就完全不做 git clone
+	// 2) **种子优先**：能从公网镜像拿到浅克隆包，就完全不做 git clone
 	//    （clone 几百 MB 全量历史在国内镜像上会被限速到近乎 0 —— 真机卡死的根因）。
 	if m.tryBrewSeed(ctx, result) {
 		if m.reconcileBrewBin() {

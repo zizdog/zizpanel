@@ -124,6 +124,7 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
 	@echo "==> 真实凭据泄漏检查"
 	@bash tools/check-no-real-credentials.sh
+	@echo "==> 未来日期检查（注释/文档里不许有比今天更晚的日期）" && bash tools/check-future-dates.sh
 	@echo "==> Python 工具语法检查"
 	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"
 	@# 前端语法必须用真正的 ES 解析器校验：`node --check` 对"对象字面量少一个 }"
@@ -247,20 +248,23 @@ RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSI
 NOTES_FILE ?= RELEASE_NOTES.md
 # 自建国内镜像（`make publish-mirror` 用）。面板里的"升级源"也填这个地址。
 MIRROR_BASE_URL ?= https://zizdog.com/zizpanel
-# NAS 镜像（飞牛 fnOS 192.168.1.8）。URL 是给面板"升级源"填的地址。
-NAS_MIRROR_URL ?= http://192.168.1.8:8090/zizpanel
-NAS_HOST       ?= 192.168.1.8
-NAS_USER       ?= zizdog
-# NAS_ROOT 是 NAS 上 zizpanel 镜像目录（容器 /usr/share/nginx/html 的 zizpanel 子目录）
-NAS_ROOT       ?= /vol2/zizpanel-mirror/zizpanel
+# 公网镜像地址：**唯一真源是 internal/upgrade/source.go 的 MirrorSource**，
+# 这里从代码里取，避免出现第二份（2026-09-20 用户要求：发布产物只允许公网地址）。
+PUBLIC_MIRROR_URL ?= $(shell sed -n 's/.*MirrorSource = "\([^"]*\)".*/\1/p' internal/upgrade/source.go | head -1)
+# make deploy 让本机面板走哪个升级源（默认公网镜像；你自己的镜像机可覆盖）。
+MIRROR_URL ?= $(PUBLIC_MIRROR_URL)
+# 镜像机（你自己的自建镜像）：地址/账号/目录**全部由调用者提供**，仓库里不留默认值。
+# 口令不写进仓库（铁律 7）。发布时用 make publish-nas NAS_PASS='...' 传入。
+NAS_HOST       ?=
+NAS_USER       ?=
+NAS_ROOT       ?=
 # NAS_APPS_ROOT 是**应用安装包**镜像目录（与面板镜像同级）：
 #   <NAS_APPS_ROOT>/<应用>/<版本>/<文件名> —— 见 tools/sync-nas-apps.sh
-NAS_APPS_ROOT  ?= /vol2/zizpanel-mirror/apps
+NAS_APPS_ROOT  ?=
+NAS_PASS       ?=
 # APPS_MIRROR_URL 是应用包镜像的对外基址（= 面板设置里的"镜像基址"）。
 # sync-apps 上传后用它验收；面板也按这个基址取包。
 APPS_MIRROR_URL ?= https://mirror.zizdog.com:8888
-# 口令不写进仓库（铁律 7）。发布时用 make publish-nas NAS_PASS='...' 传入。
-NAS_PASS       ?=
 # 传给 sync-apps 的额外参数，例如 SYNC_ARGS='--dry-run' 或 SYNC_ARGS='--app frpc'
 SYNC_ARGS      ?=
 
@@ -408,34 +412,49 @@ publish-mirror: mirror-manifest ## 生成镜像版清单并打印"上传到国�
 	@echo "      <user>@<host>:<站点根>/zizpanel/"
 
 .PHONY: seed-nas-brew
-seed-nas-brew: ## 把 brew 瓶（含依赖闭包）预置到 NAS 镜像的按需缓存里（ARGS="python@3.11 [--tags ...]"）
-	@# 为什么要这个目标：NAS 的 /brew 是**按需**缓存，装机那一刻上游有没有货决定成败。
+seed-nas-brew: ## 把 brew 瓶（含依赖闭包）预置到镜像的按需缓存里（需 MIRROR=<你的镜像基址> ARGS="python@3.11"）
+	@# 为什么要这个目标：镜像的 /brew 是**按需**缓存，装机那一刻上游有没有货决定成败。
 	@# 脚本会自己校验 sha256 与 `X-Cache: HIT`，任一不过就非 0 退出（不许谎报"已预置"）。
 	@bash tools/seed-nas-brew.sh $(ARGS)
 
-.PHONY: mirror-nas
-mirror-nas: host-zizpanel ## 生成"指向 NAS 镜像"的清单（url 用 download/<版本>/ 布局）并签名
-	@# 为什么要单独一份：GitHub/线上镜像把包平铺在同一层，而 NAS 镜像按
+.PHONY: mirror-public
+mirror-public: host-zizpanel ## 生成"指向公网镜像"的清单（url 用 download/<版本>/ 布局）并签名
+	@# 为什么要单独一份：GitHub/线上镜像把包平铺在同一层，而公网镜像按
 	@# download/<版本>/ 分目录。签名覆盖 manifest 原始字节，**事后改 url 会让签名失效**，
 	@# 所以只能在生成时用另一套 url 模板、另签一次。
+	@# 基址取自 internal/upgrade/source.go 的 MirrorSource（不写第二份内网/公网地址）。
+	@test -n "$(PUBLIC_MIRROR_URL)" || { echo "!! 读不到 internal/upgrade/source.go 的 MirrorSource"; exit 1; }
 	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
-		--arches "$(ARCHS)" --base-url "$(NAS_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
+		--arches "$(ARCHS)" --base-url "$(PUBLIC_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
+	@# 发布产物是要发给用户的：清单里出现任何 RFC1918 地址就当场失败（2026-09-20 用户要求）。
+	@if grep -En '\b(192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})\b' $(RELDIR)/manifest.json; then \
+		echo "!! 清单里出现内网地址（发布给所有人用的产物绝不允许）：$(RELDIR)/manifest.json"; exit 1; \
+	else \
+		echo "    ✓ 清单里没有内网地址（基址 $(PUBLIC_MIRROR_URL)）"; \
+	fi
 	@set -e; \
 	if [ -f "$(RELEASE_KEY)" ]; then \
 		$(DIST)/host-zizpanel sign-manifest --key $(RELEASE_KEY) \
 			--in $(RELDIR)/manifest.json --out $(RELDIR)/manifest.json.sig; \
-		echo "==> 已签名（NAS 版清单，版本 $(VERSION)）"; \
+		echo "==> 已签名（公网镜像版清单，版本 $(VERSION)）"; \
 	else \
 		echo "!! 没有 $(RELEASE_KEY)，无法签名"; exit 1; \
 	fi
 	@echo ""
-	@echo "同步到 NAS（本机可直连 192.168.1.8，用 ssh 推送）："
+	@echo "同步到你自己镜像机上的 $(PUBLIC_MIRROR_URL)/（地址/账号由调用者提供）："
 	@echo "  make publish-nas"
 
+.PHONY: mirror-nas
+mirror-nas: mirror-public ## 旧名字（兼容旧文档）；新名字是 mirror-public
+	@:
+
 .PHONY: publish-nas
-publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS_PASS，或用 ssh 密钥）
-	@test -n "$(NAS_PASS)" || { echo "需要 NAS 口令：make publish-nas NAS_PASS='...'"; exit 1; }
+publish-nas: ## 把当前版本 + 公网镜像版清单推送到你自己的镜像机（NAS_HOST/NAS_USER/NAS_ROOT + NAS_PASS 或 ssh 密钥）
+	@test -n "$(NAS_PASS)" || { echo "需要镜像机口令：make publish-nas NAS_PASS='...'"; exit 1; }
+	@test -n "$(NAS_HOST)" || { echo "需要镜像机地址：make publish-nas NAS_HOST=<你自己的镜像机>"; exit 1; }
+	@test -n "$(NAS_USER)" || { echo "需要镜像机用户：make publish-nas NAS_USER=<镜像机用户>"; exit 1; }
+	@test -n "$(NAS_ROOT)" || { echo "需要镜像目录：make publish-nas NAS_ROOT=<镜像上的 zizpanel 目录>"; exit 1; }
 	@command -v sshpass >/dev/null 2>&1 || { echo "需要 sshpass（brew install hudochenkov/sshpass/sshpass）"; exit 1; }
 	@echo "==> 上传 install.sh / 清单 / 发布包到 $(NAS_HOST):$(NAS_ROOT)"
 	@sshpass -p '$(NAS_PASS)' rsync -az --no-perms --no-owner --no-group \
@@ -455,16 +474,19 @@ publish-nas: ## 把当前版本 + NAS 版清单推送到 NAS 镜像（需要 NAS
 		 ln -sfn download/$(VERSION)/zizpanel_$(VERSION)_darwin_amd64.tar.gz zizpanel_$(VERSION)_darwin_amd64.tar.gz; \
 		 ls -l download/$(VERSION) | head -4"
 	@echo ""
-	@echo "验证（从这台机器）：curl -sI $(NAS_MIRROR_URL)/manifest.json"
+	@echo "验证（从这台机器）：curl -sI $(PUBLIC_MIRROR_URL)/manifest.json"
 
 .PHONY: deploy
-deploy: ## 一条命令发布：release + 推 NAS（单流）+ 升级本机 + 验证（生产机不许碰，见 AGENTS 铁律 5）
-	@ZP_PASS='$(ZP_PASS)' NAS_PASS='$(NAS_PASS)' \
+deploy: ## 一条命令发布：release + 推镜像机（单流）+ 升级本机 + 验证（生产机不许碰，见 AGENTS 铁律 5）
+	@NAS_HOST='$(NAS_HOST)' NAS_USER='$(NAS_USER)' NAS_ROOT='$(NAS_ROOT)' \
+	 MIRROR_URL='$(MIRROR_URL)' \
+	 ZP_PASS='$(ZP_PASS)' NAS_PASS='$(NAS_PASS)' \
 	 SKIP_CHECK='$(SKIP_CHECK)' SKIP_BUILD='$(SKIP_BUILD)' \
 	 bash tools/deploy.sh
 
 .PHONY: sync-apps
-sync-apps: ## 把应用安装包同步到 NAS 镜像（apps/<应用>/<版本>/<文件名>；需要 NAS_PASS）
+sync-apps: ## 把应用安装包同步到你自己的镜像机（apps/<应用>/<版本>/<文件名>；地址由调用者提供）
+	@test -n "$(NAS_HOST)" || { echo "需要镜像机地址：make sync-apps NAS_HOST=<你自己的镜像机>"; exit 1; }
 	@NAS_HOST="$(NAS_HOST)" NAS_USER="$(NAS_USER)" NAS_ROOT="$(NAS_APPS_ROOT)" \
 	 NAS_PASS="$(NAS_PASS)" MIRROR_BASE_URL="$(APPS_MIRROR_URL)" \
 	 bash tools/sync-nas-apps.sh $(SYNC_ARGS)

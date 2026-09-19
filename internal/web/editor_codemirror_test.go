@@ -11,7 +11,7 @@ import (
 // ============================================================================
 //  编辑器门禁：内嵌 CodeMirror 的资源必须齐全、语言依赖不许写错
 //
-//  背景（用户 2026-09-22）："让文件管理器和编辑器变成可用的现代的工具，写不好
+//  背景（用户）："让文件管理器和编辑器变成可用的现代的工具，写不好
 //  可以直接引入开源项目。" 自研的"透明 textarea + 高亮层"两次出用户可见故障
 //  （光标偏移、首次聚焦跳开头），所以编辑器换成了内嵌的 CodeMirror 5
 //  （MIT，assets/vendor/codemirror/）。
@@ -61,7 +61,7 @@ func TestEditorCodeMirrorAssetsPresent(t *testing.T) {
 
 	// 主题只用 CodeMirror 官方 CSS（`internal/web/assets/vendor/codemirror/theme/`）。
 	//
-	// 背景（用户 2026-09-22）：编辑器配色曾经是自研的 —— 手写 `.cm-s-zp-panel`
+	// 背景（用户）：编辑器配色曾经是自研的 —— 手写 `.cm-s-zp-panel`
 	// 的 token 颜色，又用 `.zpf-monokai` 覆盖面板 CSS 变量，把弹窗里的按钮/输入框
 	// 一起染色。现在 files.js 里只许出现 `CM_THEME_*` 常量指向的官方主题名；
 	// 谁把自研主题加回来（或写错主题名导致 CSS 404 → 编辑器变成无高亮的白底），

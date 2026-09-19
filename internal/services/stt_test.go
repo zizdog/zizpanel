@@ -78,7 +78,7 @@ func TestSTTModelTiersAreStable(t *testing.T) {
 		file  string
 		bytes int64
 	}{
-		// 体积是 2026-09-25 对 hf-mirror 发 Range 请求读 Content-Range 得到的**实测值**。
+		// 体积是 2026-09-18 对 hf-mirror 发 Range 请求读 Content-Range 得到的**实测值**。
 		{"small", "ggml-small.bin", 487601967},
 		{"large-v3-turbo", "ggml-large-v3-turbo-q5_0.bin", 574041195},
 		{"medium", "ggml-medium.bin", 1533763059},
@@ -106,7 +106,7 @@ func TestSTTModelTiersAreStable(t *testing.T) {
 
 // TestFindSTTModelInjection 锁住"档位 → STTModel"的解析规则。
 func TestFindSTTModelInjection(t *testing.T) {
-	// 2026-09-25 用户要求把默认档从 small 换成 large-v3-turbo（更准、只大 ~85 MiB）。
+	// 用户要求把默认档从 small 换成 large-v3-turbo（更准、只大 ~85 MiB）。
 	if id := DefaultSTTModelID(); id != "large-v3-turbo" {
 		t.Errorf("默认档应为 large-v3-turbo，实际 %q", id)
 	}
@@ -286,7 +286,7 @@ func TestSTTSourceHasNoHardcodedPrefixOrUser(t *testing.T) {
 
 // TestParseWhisperCLIJSONParsesRealOutput 用**真机上跑出来的** JSON 形状锁解析。
 //
-// 这是一份真实 `whisper-cli -oj` 输出的裁剪（2026-09-25 本机，模型 small，
+// 这是一份真实 `whisper-cli -oj` 输出的裁剪（2026-09-18 本机，模型 small，
 // 音频是 say 合成的中文）。解析规则错了的直接后果是"转出的文本是空的"
 // 或"时间戳全是 0"。
 func TestParseWhisperCLIJSONParsesRealOutput(t *testing.T) {
@@ -884,8 +884,8 @@ func TestSTTUninstallPathExistsForEveryInstalledEvidence(t *testing.T) {
 // TestSTTModelSourcesAreMirrorFirst 锁住"镜像优先 + 逐个回落"的候选顺序。
 func TestSTTModelSourcesAreMirrorFirst(t *testing.T) {
 	mdl, _ := FindSTTModel("small")
-	// probe 全通：两个镜像候选都该排在公网前面。
-	srcs := STTModelSourceList(context.Background(), "http://mirror.lan:8090", "", mdl,
+	// probe 全通：镜像候选都该排在公网前面。
+	srcs := STTModelSourceList(context.Background(), "https://mirror.example.com", mdl,
 		func(context.Context, string) error { return nil })
 	if len(srcs) < 3 {
 		t.Fatalf("候选太少：%d", len(srcs))
@@ -893,7 +893,7 @@ func TestSTTModelSourcesAreMirrorFirst(t *testing.T) {
 	if !srcs[0].Mirror || !srcs[1].Mirror {
 		t.Errorf("镜像候选必须排在前面：%+v", srcs)
 	}
-	if !strings.Contains(srcs[0].URL, "mirror.lan:8090") {
+	if !strings.Contains(srcs[0].URL, "mirror.example.com") {
 		t.Errorf("第一个候选应指向自建镜像：%q", srcs[0].URL)
 	}
 	if srcs[len(srcs)-1].Mirror {
@@ -912,7 +912,7 @@ func TestSTTModelSourcesAreMirrorFirst(t *testing.T) {
 		t.Error("hf-mirror 必须排在官方 huggingface.co 之前（官方国内常不可达）")
 	}
 	// 不配镜像时不该出现任何镜像候选。
-	srcs = STTModelSourceList(context.Background(), "", "", mdl, nil)
+	srcs = STTModelSourceList(context.Background(), "", mdl, nil)
 	for _, s := range srcs {
 		if s.Mirror {
 			t.Errorf("没配镜像却出现镜像候选：%+v", s)
@@ -1112,7 +1112,7 @@ func TestSTTModelsStateForReportsPerTierTruth(t *testing.T) {
 //	· 没有把镜像基址带进去 → stt-serve 不读面板配置，下载模型时会绕过"镜像优先"。
 func TestSTTPlistRunsAsRealUserAndCarriesMirrorConfig(t *testing.T) {
 	plist := sttPlist("/opt/zizpanel/bin/zizpanel", STTPort, "/opt/homebrew",
-		"/Users/someone/stt", "small", "https://mirror.example.com", "", "someone",
+		"/Users/someone/stt", "small", "https://mirror.example.com", "someone",
 		"/Users/someone/Library/Logs/out.log", "/Users/someone/Library/Logs/err.log")
 
 	for _, want := range []string{
@@ -1145,7 +1145,7 @@ func TestSTTPlistRunsAsRealUserAndCarriesMirrorConfig(t *testing.T) {
 // launchd 直接拒绝加载，而日志里什么都没有（最难查的一类）。
 func TestSTTPlistEscapesXMLInMirrorBase(t *testing.T) {
 	plist := sttPlist("/bin/zp", STTPort, "/opt/homebrew", "/tmp/r", "small",
-		"https://mirror.example.com/a?x=1&y=2", "https://lan.example.com/b&c", "u", "/o", "/e")
+		"https://mirror.example.com/a?x=1&y=2", "u", "/o", "/e")
 	if strings.Contains(plist, "&y=2") || strings.Contains(plist, "b&c") {
 		t.Errorf("镜像基址里的 & 没有被转义（会生成非法 plist）：\n%s", plist)
 	}
@@ -1215,7 +1215,7 @@ func TestDownloadSTTModelSkipsWhenAlreadyPresent(t *testing.T) {
 	}
 }
 
-// TestDownloadSTTModelOfflineModeRefusesPublicFallback：离线模式（仅走 NAS）下
+// TestDownloadSTTModelOfflineModeRefusesPublicFallback：离线模式（仅走镜像站）下
 // 缺件必须**明确失败**，绝不偷偷出网。
 func TestDownloadSTTModelOfflineModeRefusesPublicFallback(t *testing.T) {
 	m, _ := sandboxManager(t)

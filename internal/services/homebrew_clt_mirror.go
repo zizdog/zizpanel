@@ -39,7 +39,7 @@ import (
 //  这样同型号机器第二次安装几乎不会踩到已经失败的条目。
 // ============================================================================
 
-// cltMirrorBaseDefault 是 CLT 的静态兜底基址（自建 NAS 的"面板发布目录"
+// cltMirrorBaseDefault 是 CLT 的静态兜底基址（自建镜像站的"面板发布目录"
 // 对外地址就是 <mirror>:8888/zizpanel，与这个常量同一份内容）。
 //
 // 注意：它**不是**在线升级的源。在线升级读的是 Cfg.UpgradeSource，
@@ -47,7 +47,7 @@ import (
 // 2026-09-17 用户定的分工：**大件一律走快镜像**。zizdog.com（腾讯云北京 VPS）
 // 只当"安装脚本 + 面板本体/在线升级"的源（数据量小）；CLT 整包 632MB，
 // 实测 zizdog.com 只有 298–654 KB/s 且整条链路限速（见下方注释里的复测），
-// 所以默认基址改成自建 NAS 镜像（5.6–8.9 MB/s）。NAS 对 /zizpanel/ 有**按需回源**
+// 所以默认基址改成自建镜像站（5.6–8.9 MB/s）。镜像站对 /zizpanel/ 有**按需回源**
 // （nginx @pull → zizdog.com），首次取完即缓存，之后走本地。
 // 注意：它**不是**在线升级的源（升级源是 Cfg.UpgradeSource）。
 // ⚠️ 2026-09-18 修正：这个常量过去写的是 `https://mirror.zizdog.com:8888/zizpanel`
@@ -55,7 +55,7 @@ import (
 // 真机后果（重装后的 mini）：面板设置里的镜像基址探不通（正常回落），接着探这个
 // 静态兜底也探不通，于是"CLT 镜像这条路整个走不通"，只能去弹 Apple 的 GUI 对话框；
 // 而 **zizdog.com 上的同一份清单是好的**（实测 200，且有 632MB 的包），
-// NAS 局域网入口上也有整套 CLT。
+// 镜像站局域网入口上也有整套 CLT。
 //
 // 所以静态兜底改成 zizdog.com（它是安装源，一直可达），局域网入口由
 // cltMirrorBaseFor 的候选链负责（优先、更快）。
@@ -163,25 +163,22 @@ func cltMirrorBase() string {
 // cltMirrorSubdirs 是镜像站上 CLT 清单可能的**子目录后缀**，按优先级排列。
 //
 // 为什么有不止一个：镜像站把 CLT 与面板发布包放在同一个"面板镜像目录"里，
-// 而那个目录在 NAS 上的对外前缀是 `/zizpanel`（实测 2026-09-16：
+// 而那个目录在镜像站上的对外前缀是 `/zizpanel`（实测 2026-09-16：
 //
 //	<base>/zizpanel/clt/index.json → 200，且与 <base>/clt/index.json 期望的
 //	内容 sha256 完全一致；而 <base>/clt/index.json → 404）。
 //
 // 空串是"CLT 直接挂在镜像根下"的布局（最初的设想，保留兼容）。
 //
-// 只认其中一个的代价很实在：NAS 上整套 CLT 包（含 32MB 分片）都在，代码却去探
-// 一个 404 的路径，于是**每次都静默跳过 NAS**、落到公网静态源 ——
+// 只认其中一个的代价很实在：镜像站上整套 CLT 包（含 32MB 分片）都在，代码却去探
+// 一个 404 的路径，于是**每次都静默跳过镜像站**、落到公网静态源 ——
 // 这正是"逻辑写了但等于没写"的典型。
 var cltMirrorSubdirs = []string{"", "/zizpanel"}
 
 // cltMirrorBaseFor 按"优先级 + 可用性"挑 CLT 镜像基址。
 //
-// 顺序（2026-09-16 用户要求："能用这个地址的尽量用"）：
-//  1. 面板设置里的镜像基址（自建 NAS，省流量、同城速度）—— 但**必须探通**
-//     （HEAD 它的 clt/index.json，见 cltMirrorSubdirs 的两种布局），不通就跳过；
-//  2. 环境变量 ZIZPANEL_CLT_MIRROR（测试/临时覆盖）；
-//  3. 内置的静态镜像常量。
+// 顺序：面板设置里的镜像基址（公网，**必须探通**）→ 环境变量 ZIZPANEL_CLT_MIRROR
+// → 内置的静态常量（cltMirrorBase）。
 //
 // 返回的基址结尾**不含** `/clt`：调用方（filesBase）会自己接 `/clt/<dir>` 或
 // 条目里的 path，所以这里返回 `base + "/zizpanel"` 这种"前缀"才对得上。
@@ -189,13 +186,8 @@ var cltMirrorSubdirs = []string{"", "/zizpanel"}
 // 探测失败不报错：CLT 安装有三条路（镜像 → softwareupdate → 弹窗），
 // 这里只是挑"镜像那条路走哪个基址"，挑不出来就交给后面的路。
 func (m *Manager) cltMirrorBaseFor(ctx context.Context) string {
-	// 公网基址 → 局域网基址，谁通就用谁。
-	//
-	// 2026-09-18 真机（重装后的 mini）：公网入口 mirror.zizdog.com:8888 连不上
-	// （NAS 侧反代坏了），于是 CLT 的镜像这条路整个走不通，只能去弹窗让用户手动装 ——
-	// 而**同一台 NAS 的局域网入口上整套 CLT 都在**。加这一条候选，重装/新机器上
-	// 的 CLT 就能从局域网镜像装上（快得多、也不依赖 Apple 的服务器）。
-	for _, base := range m.mirrorBaseCandidates() {
+	// 只用配置里的公网基址；没有局域网候选（2026-09-20 用户要求删掉局域网镜像）。
+	if base := m.mirrorBase(); base != "" {
 		for _, sub := range cltMirrorSubdirs {
 			if err := m.checkMirrorURL(ctx, base+sub+"/clt/index.json"); err == nil {
 				return base + sub

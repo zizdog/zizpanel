@@ -18,7 +18,7 @@ package services
 //    第 4 层  文档              —— 操作手册
 //
 //  三条不许违反的原则：
-//    1. **不许把缺口写成"不需要"。** NAS 的处置必须三选一（mirrored / missing /
+//    1. **不许把缺口写成"不需要"。** 镜像站的处置必须三选一（mirrored / missing /
 //       not_needed），选 not_needed 必须给出经得起看的理由（带实测数字或架构事实）；
 //       实测下来"该镜像但还没镜像"的，必须老实写 missing —— 审计会把它报成 ❌。
 //    2. **不许编造 sha256 / 体积 / 平台。** 拿不到就留空并在 Note 里写"未验证"。
@@ -85,7 +85,7 @@ const (
 	NASNotNeeded MarketNASState = "not_needed"
 )
 
-// MarketNAS 回答"这个下载点 NAS 优先吗？"。
+// MarketNAS 回答"这个下载点镜像站优先吗？"。
 type MarketNAS struct {
 	State MarketNASState
 	// Path 是**镜像站相对路径**（相对镜像基址，不以 / 开头）。
@@ -145,7 +145,7 @@ type MarketDownloadPoint struct {
 	Label string
 	// Upstream 是上游来源。
 	Upstream MarketUpstream
-	// NAS 回答"NAS 优先吗"。
+	// 镜像站回答"镜像站优先吗"。
 	NAS MarketNAS
 	// Timeout 是代码里**真实存在**的超时。
 	// 0 = 真的没有超时，此时必须写 TimeoutReason（历史上的"没有超时 → 永远挂住"
@@ -219,12 +219,12 @@ type MarketApp struct {
 	Downloads []MarketDownloadPoint
 	// NoDownloadReason 是"这个应用安装时**真的不需要任何网络下载**"的理由。
 	//
-	// 为什么要有这个字段（2026-09-25 加「macOS 语音合成（say）」时发现的门禁缺口）：
+	// 为什么要有这个字段（2026-09-18 加「macOS 语音合成（say）」时发现的门禁缺口）：
 	// 原来的门禁把 `len(Downloads)==0` 一律判成缺陷，而目录里第一次出现了
 	// 真正零下载的原生应用 —— 引擎 /usr/bin/say 与 /usr/bin/afconvert 都是
 	// macOS 自带的，网页界面是面板自己的二进制。这时"编一个假的 brew 瓶下载点
 	// 去骗过门禁"才是真正的谎报；正确做法是**把这个事实声明出来**，
-	// 由门禁要求它写清理由（≥marketInvariantMinReason 字，与 NAS 理由同一条规矩）。
+	// 由门禁要求它写清理由（≥marketInvariantMinReason 字，与镜像站理由同一条规矩）。
 	NoDownloadReason string
 	// Note 是补充说明（没有下载点的条目也要说清为什么）。
 	Note string
@@ -274,7 +274,7 @@ func pipPoint(pkg string, timeout time.Duration, label, note string) MarketDownl
 			Note: "固定走清华源（常量 qwenPipMirror）；" + note,
 		},
 		NAS: nasMissing("镜像站没有 /pypi 入口（实测 <base>/pypi/simple/ → 404），" +
-			"两个 Python 应用恒走清华源。这是**缺口**不是'不需要'：NAS 化要先给镜像站加 pypi 反代。" +
+			"两个 Python 应用恒走清华源。这是**缺口**不是'不需要'：镜像站化要先给镜像站加 pypi 反代。" +
 			"当前不致命（实测 iopaint sdist 2,952,739 B / 4.6 MB/s），但它是「镜像优先」原则上的一个洞"),
 		Timeout:  timeout,
 		Required: true,
@@ -337,7 +337,7 @@ var marketDownloadApps = []MarketApp{
 					"依赖树含 torch>=2.0.0 / opencv-python / diffusers 等，**总下载量未实测**（代码注释只写'约 1~2GB'）"),
 			{
 				Purpose: MarketFetchModelFile,
-				Label:   "下载 big-lama.pt（NAS 优先）",
+				Label:   "下载 big-lama.pt（镜像站优先）",
 				Upstream: MarketUpstream{
 					ID:   "Sanster/models@add_big_lama/big-lama.pt",
 					URL:  "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt",
@@ -393,8 +393,8 @@ var marketDownloadApps = []MarketApp{
 					// 体积写进 Note，别挂在错误的 URL 上。
 					Note: "镜像整包走 <base>/clt/index.json（先 <base>/clt，再 <base>/zizpanel/clt，都不通回落静态常量 zizdog.com）；" +
 						// 2026-09-17 用户定的分工：zizdog.com 只当**安装脚本与面板本体/在线升级**的源（数据量小）；
-						// 市场里的软件、CLT（632MB）这类大件一律走**快镜像**（mirror.zizdog.com:8888 = NAS，
-						// 实测 5.6–8.9MB/s；NAS 对 /zizpanel/ 有按需回源，首次取完即缓存）。
+						// 市场里的软件、CLT（632MB）这类大件一律走**快镜像**（mirror.zizdog.com:8888 = 镜像站，
+						// 实测 5.6–8.9MB/s；镜像站对 /zizpanel/ 有按需回源，首次取完即缓存）。
 						// 实测：<mirror>/zizpanel/clt/index.json = 200（<mirror>/clt/index.json 是 404）。" +
 						"清单 bytes=661,802,053（含 CLTools_Executables.pkg 604,642,024 + CLTools_macOSNMOS_SDK.pkg）；" +
 						"镜像路失败还有 softwareupdate -l(3 min) / softwareupdate -i(40 min) / xcode-select --install 弹窗(1 min + 轮询 30 min) 两条退路",
@@ -460,7 +460,7 @@ var marketDownloadApps = []MarketApp{
 					"现场用 C 编译器构建（mlx-audio 特意 pin setuptools<81），所以这一步依赖第 1 步装好的 CLT 里的 clang"),
 			{
 				Purpose: MarketFetchModelFile,
-				Label:   "hf download Qwen3-TTS-12Hz-1.7B-Base-8bit（NAS 优先）",
+				Label:   "hf download Qwen3-TTS-12Hz-1.7B-Base-8bit（镜像站优先）",
 				Upstream: MarketUpstream{
 					ID:   "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
 					URL:  qwenHFMirror + "/mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit/resolve/main/model.safetensors",
@@ -619,7 +619,7 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
-	// 图片压缩（libvips）：用户 2026-09-18 要求上架；2026-09-23 要求"加一个
+	// 图片压缩（libvips）：用户 2026-09-18 要求上架；要求"加一个
 	// webui 通过端口和别名调用"。
 	//
 	// 两个下载点：
@@ -644,7 +644,7 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
-	// macOS 语音合成（say）：用户 2026-09-25 要求评估 macos-speech-server 并加进市场。
+	// macOS 语音合成（say）：用户要求评估 macos-speech-server 并加进市场。
 	//
 	// 这是目录里**第一个真正零下载**的条目，所以它没有 Downloads，只有一份
 	// NoDownloadReason 说明为什么：引擎 /usr/bin/say 与 /usr/bin/afconvert 都是
@@ -671,7 +671,7 @@ var marketDownloadApps = []MarketApp{
 			"与第三方 macos-speech-server（首启要下 ~700MB 模型）的取舍点。",
 	},
 
-	// 语音转文字（whisper.cpp）：用户 2026-09-25 要求上架
+	// 语音转文字（whisper.cpp）：用户要求上架
 	// （"不要 docker，不要 gui 软件；有 webui 或 api"）。
 	//
 	// 下载点共四个：引擎的 brew 瓶 + 三个模型档位（默认档必下，另两档按需）。
@@ -706,7 +706,7 @@ var marketDownloadApps = []MarketApp{
 						"官方 huggingface.co 国内直连不可达（实测 curl 退出码 28 超时），" +
 						"所以面板的候选顺序是 自建镜像静态目录 → 自建镜像 /hf 代理 → hf-mirror.com → huggingface.co。",
 				},
-				// 实测：NAS 的 <base>/models/whisper/ggml-small.bin 是 **404**（还没落成静态文件），
+				// 实测：镜像站的 <base>/models/whisper/ggml-small.bin 是 **404**（还没落成静态文件），
 				// 但 <base>/hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin 是 200。
 				// 面板两条都探，静态缺件时自动回落到 /hf 这条（"优先+回落"是既定语义）。
 				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
@@ -858,7 +858,7 @@ var marketDownloadApps = []MarketApp{
 					"用户只能手工在终端等约 2 小时，且失败了面板不知道。这是**明确的缺口**（P1-4）"),
 				Timeout: 0,
 				TimeoutReason: "面板完全不参与这条命令（只有文案提示），所以面板里不存在它的超时；" +
-					"如实声明而不是假装有超时。要么把模型镜像到 NAS 并接管进度，要么在界面上明说'这一步面板不管'",
+					"如实声明而不是假装有超时。要么把模型镜像到镜像站并接管进度，要么在界面上明说'这一步面板不管'",
 				Required: true,
 				Checksum: MarketChecksum{
 					Asset:  "OCI manifest 的 layer digest",
@@ -898,7 +898,7 @@ var marketDownloadApps = []MarketApp{
 			},
 			{
 				Purpose: MarketFetchVMImage,
-				Label:   "colima start：guest 虚拟机镜像（NAS 预热，缺了才回 GitHub）",
+				Label:   "colima start：guest 虚拟机镜像（镜像站预热，缺了才回 GitHub）",
 				Upstream: MarketUpstream{
 					ID:   "abiosoft/colima-core@v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
 					URL:  "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
@@ -931,7 +931,7 @@ var marketDownloadApps = []MarketApp{
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("louislam/uptime-kuma:2", 20*time.Minute,
 				nasMirrored("docker"),
-				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+				"arm64 证据（2026-09-17 读 Docker Hub 的 OCI image index，含 linux/arm64）："+
 					"tag `:2` 有 linux/amd64、linux/arm64、linux/arm/v7；"+
 					"同时核实 **`:v2` 这个 tag 不存在（manifest 404）**，`latest` 也不是 v2 —— 只能用 `:2`。"+
 					"1.x 已停止维护（应用自己会告警 \"1.23.17 is a v1 tag\"），compose 里不写 platform（铁律②）"),
@@ -966,7 +966,7 @@ var marketDownloadApps = []MarketApp{
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("ghcr.io/corentinth/it-tools:latest", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io /v2/ 实测 405 / 0.66 s 直连可达，"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；ghcr.io /v2/ 实测 405 / 0.66 s 直连可达，"+
 					"arm64 层合计只有 22.5 MiB。（诚实标注：未实测完整 pull 的吞吐）"),
 				"arm64 证据：ghcr.io 的 index 里有 linux/arm64（实测层合计 22.5 MiB）"),
 		},
@@ -992,8 +992,8 @@ var marketDownloadApps = []MarketApp{
 						"候选顺序：镜像站（无测速直下）→ 官方 + ghfast.top + gh-proxy.com 按实测速度重排",
 				},
 				NAS: nasMissing("镜像站上没有 filebrowser 的 darwin-arm64 产物（apps/filebrowser/... 不存在）。" +
-					"这是**缺口**不是'不需要'：它是原生安装的唯一来源，NAS 关机时只能走 GitHub 直连/加速镜像。" +
-					"建议 NAS 开机后同步到 apps/filebrowser/v2.63.23/darwin-arm64-filebrowser.tar.gz 与其 sha256 清单"),
+					"这是**缺口**不是'不需要'：它是原生安装的唯一来源，镜像站关机时只能走 GitHub 直连/加速镜像。" +
+					"建议镜像站开机后同步到 apps/filebrowser/v2.63.23/darwin-arm64-filebrowser.tar.gz 与其 sha256 清单"),
 				Timeout:  150 * time.Second,
 				Required: true,
 				Checksum: MarketChecksum{
@@ -1031,7 +1031,7 @@ var marketDownloadApps = []MarketApp{
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("ghcr.io/metatube-community/metatube-server:latest", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io /v2/ 实测 405 / 0.66 s 直连可达，"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；ghcr.io /v2/ 实测 405 / 0.66 s 直连可达，"+
 					"arm64 层合计只有 19.3 MiB。（诚实标注：未实测完整 pull 的吞吐）"),
 				"arm64 证据：ghcr.io 的 index 里有 linux/arm64（实测层合计 19.3 MiB）"),
 		},
@@ -1100,7 +1100,7 @@ var marketDownloadApps = []MarketApp{
 					Asset:        "上游 checksums 清单 + 镜像 manifest.json",
 					UpstreamFile: frpChecksumAsset,
 					SHA256:       "45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6",
-					Source:       "镜像站 manifest.json 声明；2026-09-16 把整包从 NAS 下下来实算 sha256 **完全一致**（清点报告记录）",
+					Source:       "镜像站 manifest.json 声明；2026-09-16 把整包从镜像站下下来实算 sha256 **完全一致**（清点报告记录）",
 					Note:         "解压前校验，另外还有 file -b 复核 Mach-O arm64",
 				},
 				ARM64: "上游 release 资产名自带 darwin_arm64；实测解压出的二进制 file(1) 报 Mach-O arm64",
@@ -1360,7 +1360,7 @@ var marketDownloadApps = []MarketApp{
 						"官方安装包仓库 flarum/installation-packages（官方文档 docs.flarum.org/install 指定的分发仓库），固定 v1.8.19 + php8.2",
 				},
 				NAS: nasMissing("镜像站上没有 Flarum 安装包（sites/flarum/... 不存在）。它是**缺口**：" +
-					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/flarum/1.8.19/flarum-v1.8.19-php8.2.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → jsdelivr"),
+					"镜像站关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/flarum/1.8.19/flarum-v1.8.19-php8.2.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → jsdelivr"),
 				Timeout:  9 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
@@ -1428,7 +1428,7 @@ var marketDownloadApps = []MarketApp{
 						"emlog.net/download 指向的也是这一份产物（gitee release 同字节）",
 				},
 				NAS: nasMissing("镜像站上没有 emlog 发布包（sites/emlog/... 不存在）。它是**缺口**：" +
-					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/emlog/2.6.31/emlog_pro_2.6.31.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → gitee"),
+					"镜像站关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/emlog/2.6.31/emlog_pro_2.6.31.zip 并把候选顺序改成 镜像 → gh-proxy → 官方 → gitee"),
 				Timeout:  9 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
@@ -1495,7 +1495,7 @@ var marketDownloadApps = []MarketApp{
 						"官方 server.link 入口是「永远最新」、无法登记稳定 sha256，所以固定官方仓库 tag 归档",
 				},
 				NAS: nasMissing("镜像站上没有可道云源码包（sites/kodbox/... 不存在）。它是**缺口**：" +
-					"NAS 关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/kodbox/1.69.03/kodbox-1.69.03.zip 并把候选顺序改成 镜像 → gh-proxy → 官方"),
+					"镜像站关机时只能走 GitHub 直连/gh-proxy；建议同步到 sites/kodbox/1.69.03/kodbox-1.69.03.zip 并把候选顺序改成 镜像 → gh-proxy → 官方"),
 				Timeout:  15 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
@@ -1532,7 +1532,7 @@ var marketDownloadApps = []MarketApp{
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("ghcr.io/gethomepage/homepage:v2.3.0", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io 可直连（本机实测），"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；ghcr.io 可直连（本机实测），"+
 					"arm64 层与 amd64 同 index 已确认"),
 				"arm64 证据：ghcr.io 的 index 里同时有 amd64 与 arm64（:v2.3.0 与 :latest 都确认过）"),
 		},
@@ -1569,17 +1569,17 @@ var marketDownloadApps = []MarketApp{
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("ghcr.io/activepieces/activepieces:0.91.0", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；ghcr.io 本机实测可直连"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；ghcr.io 本机实测可直连"+
 					"（docker manifest inspect 直接成功），arm64 层大小未实测。（诚实标注：未实测完整 pull 的吞吐）"),
 				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/activepieces/activepieces:0.91.0` 直查）："+
 					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
 			dockerImagePoint("pgvector/pgvector:0.8.0-pg14", 20*time.Minute,
 				nasMirrored("docker"),
-				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+				"arm64 证据（2026-09-17 读 Docker Hub 的 OCI image index，含 linux/arm64）："+
 					"linux/amd64、linux/arm64（另两个 unknown/unknown attestation）"),
 			dockerImagePoint("library/redis:7.0.7", 20*time.Minute,
 				nasMirrored("docker"),
-				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 manifest list）："+
+				"arm64 证据（2026-09-17 读 Docker Hub 的 manifest list，含 linux/arm64）："+
 					"linux/amd64、linux/arm64/v8、linux/arm/v5、linux/arm/v7、386、mips64le、ppc64le、s390x。"+
 					"compose 里写规范形式 library/redis:7.0.7（等价官方 redis:7.0.7）"),
 		},
@@ -1602,23 +1602,23 @@ var marketDownloadApps = []MarketApp{
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
 			dockerImagePoint("ghcr.io/immich-app/immich-server:release", 30*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；本机实测 ghcr.io 可直连"+
 					"（docker manifest inspect 直接成功）。immich-server 体积较大，30 min 超时未实测完整 pull。"),
 				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/immich-server:release` 直查）："+
 					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
 			dockerImagePoint("ghcr.io/immich-app/immich-machine-learning:release", 30*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连。"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；本机实测 ghcr.io 可直连。"+
 					"首次启动还要从外部下载 ML 模型权重，那部分不在这个镜像里。"),
 				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/immich-machine-learning:release` 直查）："+
 					"index 里有 linux/amd64 与 linux/arm64（另两个是 unknown/unknown 的 attestation）"),
 			dockerImagePoint("ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0", 20*time.Minute,
-				nasNotNeeded("镜像站的 /docker 只反代 Docker Hub，不覆盖 ghcr.io；本机实测 ghcr.io 可直连"+
+				nasNotNeeded("ghcr.io 不是 Docker Hub，加速源不覆盖它；本机实测 ghcr.io 可直连"+
 					"（docker manifest inspect 直接成功）。与 Immich 官方 compose 用的是同一个 tag。"),
 				"arm64 证据（2026-09-17 本机 `docker manifest inspect ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0` 直查）："+
 					"index 里有 linux/amd64 与 linux/arm64"),
 			dockerImagePoint("valkey/valkey:9", 20*time.Minute,
 				nasMirrored("docker"),
-				"arm64 证据（2026-09-17 经自建 NAS 的 /docker pull-through 读同一份 OCI index）："+
+				"arm64 证据（2026-09-17 读 Docker Hub 的 OCI image index，含 linux/arm64）："+
 					"linux/amd64、linux/arm64、linux/arm/v7、ppc64le"),
 		},
 		Note: "官方 4 容器；DB_PASSWORD 由安装时随机生成（hex 32 字节），重装复用不重新生成 —— " +
@@ -1890,11 +1890,11 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 	}
 
 	// ---- 每个下载点的不变量 ----
-	// 零下载点是**允许**的，但必须显式声明理由（2026-09-25：「macOS 语音合成（say）」
+	// 零下载点是**允许**的，但必须显式声明理由（2026-09-18：「macOS 语音合成（say）」
 	// 是目录里第一个真正零下载的条目 —— 引擎与转换工具都是 macOS 自带的）。
 	// 为什么不是"留空默认通过"：那样下一个会话就分不清"确实不需要下载"与
 	// "漏填了下载点"，而后者会变成装到一半才发现缺东西。所以要求写清理由，
-	// 长度与 NAS 理由同一条规矩。
+	// 长度与镜像站理由同一条规矩。
 	if len(m.Downloads) == 0 && len([]rune(strings.TrimSpace(m.NoDownloadReason))) < marketInvariantMinReason {
 		add("%s: 一个下载点都没有声明，也没有写 NoDownloadReason 说清「安装确实不需要任何下载」。"+
 			"真有这种条目（例如引擎是系统自带的），请填 NoDownloadReason（≥%d 字）；"+
@@ -1919,29 +1919,29 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 		if d.Timeout > 0 && strings.TrimSpace(d.TimeoutReason) != "" {
 			add("%s: 有超时（%s）就不该再写 TimeoutReason（声明自相矛盾）", where, d.Timeout)
 		}
-		// 2) 每个下载点必须回答「NAS 优先？」。
+		// 2) 每个下载点必须回答「镜像站优先？」。
 		switch d.NAS.State {
 		case NASMirrored:
 			if strings.TrimSpace(d.NAS.Path) == "" {
-				add("%s: NAS 状态是 mirrored 但 Path 为空", where)
+				add("%s: 镜像站状态是 mirrored 但 Path 为空", where)
 			}
 			if strings.HasPrefix(d.NAS.Path, "/") {
-				add("%s: NAS Path 必须是相对路径（不以 / 开头），现在是 %q", where, d.NAS.Path)
+				add("%s: 镜像站 Path 必须是相对路径（不以 / 开头），现在是 %q", where, d.NAS.Path)
 			}
 			if strings.TrimSpace(d.NAS.Reason) != "" {
-				add("%s: NAS 状态是 mirrored 却还写了 Reason（自相矛盾）", where)
+				add("%s: 镜像站状态是 mirrored 却还写了 Reason（自相矛盾）", where)
 			}
 		case NASMissing, NASNotNeeded:
 			if len([]rune(strings.TrimSpace(d.NAS.Reason))) < marketInvariantMinReason {
-				add("%s: NAS 状态 %s 的理由太短（%d 字 < %d）—— 必须写清「缺什么 / 为什么不需要」，"+
+				add("%s: 镜像站状态 %s 的理由太短（%d 字 < %d）—— 必须写清「缺什么 / 为什么不需要」，"+
 					"理由要带实测数字或架构事实；不许写「不需要」三个字就过",
 					where, d.NAS.State, len([]rune(strings.TrimSpace(d.NAS.Reason))), marketInvariantMinReason)
 			}
 			if strings.TrimSpace(d.NAS.Path) != "" {
-				add("%s: NAS 状态 %s 时不该有 Path（%q）", where, d.NAS.State, d.NAS.Path)
+				add("%s: 镜像站状态 %s 时不该有 Path（%q）", where, d.NAS.State, d.NAS.Path)
 			}
 		default:
-			add("%s: NAS 状态 %q 不合法（必须是 mirrored / missing / not_needed）—— "+
+			add("%s: 镜像站状态 %q 不合法（必须是 mirrored / missing / not_needed）—— "+
 				"留空默认通过是不允许的", where, d.NAS.State)
 		}
 		// 3) 可选步骤必须写清降级后果。

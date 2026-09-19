@@ -146,7 +146,7 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	// 指定 3.11 不是偏好：mlx-audio 在该版本有预编译 wheel（cp311），更高版本可能退化成源码编译甚至装不上。
 	if !m.brewHas(ctx, qwenPythonVer) {
 		result.step(ctx, "正在安装 "+qwenPythonVer)
-		// 2026-09-20 事故就是这一步：镜像是坏的（0 字节瓶）→ 必须换源重试。
+		// 2026-09-19 事故就是这一步：镜像是坏的（0 字节瓶）→ 必须换源重试。
 		// python@3.11 的 arm64 瓶国内镜像常常没有，只能靠官方源兜底。
 		if _, err := m.brewInstall(ctx, result, 20*time.Minute, qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
@@ -352,7 +352,7 @@ func (m *Manager) checkQwenPreconditions(ctx context.Context, result *InstallRes
 // pipInstall 装 pip 与 mlx-audio[server]。
 func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallResult) error {
 	pip := filepath.Join(p.Venv, "bin", "pip")
-	// pip 索引按"NAS 优先、探不通回落清华"现算（见 pypi_mirror.go），
+	// pip 索引按"镜像站优先、探不通回落清华"现算（见 pypi_mirror.go），
 	// 选择与原因由它写进任务日志，与 brew/HF 是同一套语义。
 	pipIdx, err := m.pipMirrorArgs(ctx, result)
 	if err != nil {
@@ -418,7 +418,7 @@ func (m *Manager) qwenHFEndpoint(ctx context.Context) string {
 }
 
 // hfEndpointUsable 判断一个 HuggingFace 端点**真的能跑 hf download**。
-// 2026-09-18 真机事故：NAS 的 /hf/ 首页是 200，但 /hf/api/models/<repo> 是 **502** —— 浅探测会把"下载失败"伪装成"网络问题"。
+// 2026-09-18 真机事故：镜像站的 /hf/ 首页是 200，但 /hf/api/models/<repo> 是 **502** —— 浅探测会把"下载失败"伪装成"网络问题"。
 // 判据贴 CLI 真实需求：① API 能列出模型且是 JSON ② <repo>/resolve/main/config.json 取得到内容；探针用清单第一个模型。
 func (m *Manager) hfEndpointUsable(ctx context.Context, base string) bool {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
@@ -522,8 +522,8 @@ func modelDownloaded(userHome, model string) bool {
 // installQwenService 写系统级 plist 并加载（LaunchDaemon + UserName，与手册的差异见文件头）。
 // 先写 .tmp 再 rename，保证 launchd 不会读到半截 plist。
 func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *InstallResult, auth bool) error {
-	// 端点按"NAS 优先"现算后写进 plist：**服务进程**日后自己补拉模型时用的是 plist 里的值，
-	// 写死 hf-mirror.com 会让"面板配了 NAS 镜像、服务却永远走公网"。
+	// 端点按"镜像站优先"现算后写进 plist：**服务进程**日后自己补拉模型时用的是 plist 里的值，
+	// 写死 hf-mirror.com 会让"面板配了镜像站、服务却永远走公网"。
 	hfEndpoint := m.qwenHFEndpoint(ctx)
 	plist := qwenPlist(p, m.opt.UserName, auth, hfEndpoint)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
@@ -543,7 +543,7 @@ func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *I
 }
 
 // qwenPlist 生成 LaunchDaemon 定义；绑定地址由 qwenBindHost(auth) 决定。
-// hfEndpoint 由调用方按"NAS 优先"现算（见 installQwenService）。
+// hfEndpoint 由调用方按"镜像站优先"现算（见 installQwenService）。
 func qwenPlist(p qwenPaths, user string, auth bool, hfEndpoint string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

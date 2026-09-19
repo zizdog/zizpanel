@@ -113,7 +113,7 @@ func fileSHA512(path string) (string, error) {
 // colimaGuestMirrorURLs 返回镜像站上该文件的候选地址。
 //
 // 两个布局都试：`apps/colima-core/<ver>/<file>`（与 apps 下其它应用包一致）
-// 与 `colima/<ver>/<file>`（短路径）。NAS 上两者是同一个 inode 的硬链接。
+// 与 `colima/<ver>/<file>`（短路径）。镜像站上两者是同一个 inode 的硬链接。
 func (m *Manager) colimaGuestMirrorURLs(imageURL string) []string {
 	base := m.mirrorBase()
 	if base == "" {
@@ -136,7 +136,7 @@ func (m *Manager) colimaGuestMirrorURLs(imageURL string) []string {
 	}
 }
 
-// colimaGuestManifest 是 NAS 上 `apps/colima-core/<ver>/manifest.json` 的结构。
+// colimaGuestManifest 是镜像站上 `apps/colima-core/<ver>/manifest.json` 的结构。
 //
 // 与 mirror.go 的 apps 清单同一套约定（<base>/apps/<app-id>/<version>/manifest.json）：
 // 校验值由**放置方用上游作者发布的校验文件交叉验证过**，面板只做判等、不自己编。

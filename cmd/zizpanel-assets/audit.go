@@ -7,7 +7,7 @@ package main
 //    "如果以后每加一个应用都要一点一点慢慢调试，那这个应用市场就没什么实用价值了。"
 //
 //  这个子命令就是"一条命令告诉你缺什么"：
-//    · NAS 路径：真实 HTTP HEAD / Range GET，记录**状态码 + 体积 + 速度**
+//    · 镜像站路径：真实 HTTP HEAD / Range GET，记录**状态码 + 体积 + 速度**
 //    · 上游 URL：真实可达性（每个请求都有超时，绝不无限等）
 //    · Docker 镜像：真的取 manifest，判断有没有 linux/arm64
 //    · sha256：镜像 manifest / 上游 checksums.txt / 文件实算，**三方比对**；
@@ -43,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/services"
 )
 
@@ -260,7 +261,7 @@ func summarize(rows []auditRow, staticProblems int) map[string]int {
 // resolveMirrorBase 决定"审哪个镜像站"。
 //
 // 顺序：--mirror > $ZIZPANEL_MIRROR_BASE > 面板配置（/opt/zizpanel/data/config.json）
-// > 局域网 NAS 默认值。返回值第二项是来源说明 —— 报告里必须写清楚"审的是哪一个"，
+// > 公网默认值。返回值第二项是来源说明 —— 报告里必须写清楚"审的是哪一个"，
 // 否则"审计全绿"可能只是审了一个空地址。
 func resolveMirrorBase(flagVal string) (string, string) {
 	clean := func(s string) string { return strings.TrimRight(strings.TrimSpace(s), "/") }
@@ -284,7 +285,7 @@ func resolveMirrorBase(flagVal string) (string, string) {
 			}
 		}
 	}
-	return "http://192.168.1.8:8090", "内置默认（局域网 NAS）"
+	return config.DefaultMirrorBase, "内置默认（公网镜像站）"
 }
 
 // ---------------------------------------------------------------------------
@@ -419,13 +420,13 @@ func (a *auditor) probePoint(ctx context.Context, d services.MarketDownloadPoint
 		details = append(details, fmt.Sprintf(format, args...))
 	}
 
-	// ---- NAS 缺口类：声明里已经承认的缺口，直接报，不用探测 ----
+	// ---- 镜像站缺口类：声明里已经承认的缺口，直接报，不用探测 ----
 	if d.NAS.State == services.NASMissing {
-		add(stFail, "NAS 缺口（声明里就是这么写的）：%s", d.NAS.Reason)
+		add(stFail, "镜像站缺口（声明里就是这么写的）：%s", d.NAS.Reason)
 		fixes = append(fixes, fixHint(d))
 	}
 	if d.NAS.State == services.NASNotNeeded {
-		add(stInfo, "NAS 不需要：%s", d.NAS.Reason)
+		add(stInfo, "镜像站不需要：%s", d.NAS.Reason)
 	}
 
 	// ---- 逐用途探测 ----
@@ -511,7 +512,7 @@ func (a *auditor) probeUpstreamURL(ctx context.Context, d services.MarketDownloa
 func (a *auditor) probeMirrorFile(ctx context.Context, d services.MarketDownloadPoint, path string, withSHA512 bool,
 	add func(auditStatus, string, ...any), fixes *[]string) {
 	if a.mirror == "" {
-		add(stWarn, "没有镜像站基址，跳过 NAS 探测")
+		add(stWarn, "没有镜像站基址，跳过镜像站探测")
 		return
 	}
 	if path == "" {
@@ -565,18 +566,18 @@ func (a *auditor) probeMirrorFile(ctx context.Context, d services.MarketDownload
 // probeCLT 探 CLT 清单，并顺着清单里的 path+pkgs 去探**真实载荷**。
 //
 // 为什么不能只看 index.json：清单在、载荷不在是本仓库真实出现过的情况
-// （NAS 上 zizpanel/clt/072-44426-A/ 是空目录）。只探清单会给出一个假的绿。
+// （镜像站上 zizpanel/clt/072-44426-A/ 是空目录）。只探清单会给出一个假的绿。
 func (a *auditor) probeCLT(ctx context.Context, d services.MarketDownloadPoint,
 	add func(auditStatus, string, ...any), fixes *[]string) {
 	if a.mirror == "" {
-		add(stWarn, "没有镜像站基址，跳过 NAS 探测")
+		add(stWarn, "没有镜像站基址，跳过镜像站探测")
 		return
 	}
 	// CLT 清单在镜像站上有两种布局（<base>/clt/index.json 与
 	// <base>/zizpanel/clt/index.json，见 services 里的 cltMirrorSubdirs）。
 	// 这里按真实代码的顺序逐个探，用**探通的那个前缀**去拼载荷地址 —— 而不是
 	// 拿清单里的相对 path 直接拼镜像根：那正是 2026-09-16 清点报告里
-	// "整套包都在、代码却每次都去探 404、于是静默跳过 NAS" 的同一个坑。
+	// "整套包都在、代码却每次都去探 404、于是静默跳过镜像站" 的同一个坑。
 	var prefix, found string
 	for _, sub := range []string{"", "/zizpanel"} {
 		u := a.mirror + sub + "/clt/index.json"
@@ -621,7 +622,7 @@ func (a *auditor) probeCLT(ctx context.Context, d services.MarketDownloadPoint,
 		add(stFail, "CLT 载荷探不到：%s（%v）", pkgURL, perr)
 		*fixes = append(*fixes, fixHint(d))
 	case pcode == 200:
-		// ⚠️ 200 不等于"已经预置在 NAS 本地"：镜像站的 @pull 回退会现拉现给。
+		// ⚠️ 200 不等于"已经预置在镜像站本地"：镜像站的 @pull 回退会现拉现给。
 		add(stInfo, "CLT 载荷 %s：HTTP 200，%d B（%d ms）。注意：镜像站有 @pull 回退，"+
 			"200 **不等于**已本地预置 —— 若要比吞吐，看下面的测速", cltPkgs[0], psize, ptook.Milliseconds())
 		if psize > 1<<20 {
@@ -638,7 +639,7 @@ func (a *auditor) probeCLT(ctx context.Context, d services.MarketDownloadPoint,
 	a.probeUpstreamURL(ctx, d, add)
 }
 
-// releaseManifest 与 NAS 上的 manifest.json 对应。
+// releaseManifest 与镜像站上的 manifest.json 对应。
 type releaseManifest struct {
 	App     string `json:"app"`
 	Version string `json:"version"`
@@ -649,7 +650,7 @@ type releaseManifest struct {
 	} `json:"assets"`
 }
 
-// probeReleaseBinary 探 release 二进制：NAS 包 + manifest + 三方 sha256 比对 + 上游。
+// probeReleaseBinary 探 release 二进制：镜像站包 + manifest + 三方 sha256 比对 + 上游。
 func (a *auditor) probeReleaseBinary(ctx context.Context, d services.MarketDownloadPoint,
 	add func(auditStatus, string, ...any), fixes *[]string) {
 	var nasURL string
@@ -761,21 +762,27 @@ func (a *auditor) probeReleaseBinary(ctx context.Context, d services.MarketDownl
 
 // probeDocker 取真的 manifest，判断有没有 linux/arm64。
 //
-// 顺序：自建镜像站（Docker Hub 的 pull-through）→ 官方 registry（带 Bearer token）。
-// 对 Docker Hub 镜像，自建站往往是唯一能通的那条路（registry-1.docker.io 实测被 DNS 污染）。
+// 顺序：公网 Docker Hub 加速源（读同一份 OCI image index）→ 官方 registry（带 Bearer token）。
+// **不再经镜像站 `/docker`**：公网镜像站不提供该路径（2026-09-20 用户明确）。
 func (a *auditor) probeDocker(ctx context.Context, d services.MarketDownloadPoint,
 	add func(auditStatus, string, ...any), fixes *[]string) {
 	host, repo, tag := services.MarketImageRef(d.Upstream.ID)
 	var errs []string
 
-	if a.mirror != "" && host == "" {
-		url := fmt.Sprintf("%s/docker/v2/%s/manifests/%s", a.mirror, repo, tag)
-		if body, _, err := a.registryManifest(ctx, url, ""); err == nil {
-			a.reportPlatforms(ctx, body, url, add)
-			a.probeUpstreamURL(ctx, d, add)
-			return
-		} else {
-			errs = append(errs, fmt.Sprintf("自建镜像站 %s：%v", url, err))
+	if host == "" {
+		// Docker Hub：按能力等级试公网加速源（能力差的源不进自动配置，这里也跳过）。
+		for _, m := range services.BuiltinDockerMirrors {
+			if m.Rank >= services.DockerMirrorRankUnusable {
+				continue
+			}
+			url := strings.TrimRight(m.URL, "/") + "/v2/" + repo + "/manifests/" + tag
+			if body, _, err := a.registryManifest(ctx, url, ""); err == nil {
+				a.reportPlatforms(ctx, body, url, add)
+				a.probeUpstreamURL(ctx, d, add)
+				return
+			} else {
+				errs = append(errs, fmt.Sprintf("%s：%v", url, err))
+			}
 		}
 	}
 	endpoint := host
@@ -794,8 +801,8 @@ func (a *auditor) probeDocker(ctx context.Context, d services.MarketDownloadPoin
 	add(stFail, "取不到 manifest（%s）→ **无法证明它自带 linux/arm64**（铁律②）：%s",
 		d.Upstream.ID, strings.Join(errs, "；"))
 	*fixes = append(*fixes, fixHint(d))
-	if a.mirror != "" && host != "" {
-		add(stWarn, "自建镜像站的 /docker 只反代 Docker Hub，不覆盖 %s；要么直连可用，要么在镜像站加一层反代", host)
+	if host != "" {
+		add(stWarn, "%s 不是 Docker Hub，Docker Hub 加速源不覆盖它；只能直连可用，或在别的加速源里找", host)
 	}
 }
 
@@ -1086,7 +1093,7 @@ func printOffline(rep auditReport, quiet bool) {
 	if len(rep.Static) == 0 {
 		fmt.Println("✅ 全部静态不变量通过：")
 		fmt.Println("   · 每个下载点都声明了超时（或写清了为什么没有）")
-		fmt.Println("   · 每个下载点都回答了「NAS 优先？」（mirrored / missing / not_needed + 理由）")
+		fmt.Println("   · 每个下载点都回答了「镜像站优先？」（mirrored / missing / not_needed + 理由）")
 		fmt.Println("   · 每个下载点都有 arm64 证据与校验现状说明")
 		fmt.Println("   · 每个应用都显式回答了服务语义（launchd / container / site / none）")
 		fmt.Println("   · 声明与目录 Catalog() 逐字段一致，与 release 注册表一致")
@@ -1216,7 +1223,7 @@ func short(sha string) string {
 func fixHint(d services.MarketDownloadPoint) string {
 	switch d.Purpose {
 	case services.MarketFetchBrewBottle:
-		return "确认镜像站 /brew 反代可用（NAS 侧 nginx 的 /brew → 中科大 homebrew-bottles 按需缓存）"
+		return "确认镜像站 /brew 反代可用（镜像站侧 nginx 的 /brew → 中科大 homebrew-bottles 按需缓存）"
 	case services.MarketFetchReleaseBinary:
 		return "跑 tools/sync-nas-apps.sh 同步到 apps/<id>/<tag>/（含 manifest.json）"
 	case services.MarketFetchVMImage:
@@ -1225,7 +1232,7 @@ func fixHint(d services.MarketDownloadPoint) string {
 		return "把这一步要的文件同步到镜像站（上游：" + d.Upstream.ID + "）—— " +
 			"iopaint 权重放 models/iopaint/，HF 模型由镜像站的 /hf 按需缓存"
 	case services.MarketFetchDockerImage:
-		return "确认 NAS 的 /docker pull-through 在跑；或先在 NAS 上 docker pull 一次预热"
+		return "公网镜像站不提供 /docker 端点；确认公网加速源能取到该镜像的 manifest，或本机 docker pull 一次预热"
 	case services.MarketFetchSiteSource:
 		return "把源码包同步到 apps/<id>/<ver>/ 并把候选顺序改成 镜像优先（当前代码只试 DownloadURL + MirrorURLs）"
 	case services.MarketFetchCLT:

@@ -45,7 +45,7 @@ func TestAllComposeEntriesAreDockerReferences(t *testing.T) {
 	}
 }
 
-// TestComposeReferencesMatchCatalog 锁住导出给 NAS 同步工具的数据与目录一一对应。
+// TestComposeReferencesMatchCatalog 锁住导出给镜像站同步工具的数据与目录一一对应。
 func TestComposeReferencesMatchCatalog(t *testing.T) {
 	refs := ComposeReferences()
 	if len(refs) == 0 {

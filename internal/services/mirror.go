@@ -12,10 +12,10 @@ import (
 )
 
 // ============================================================================
-//  应用包镜像（自建 NAS）
+//  应用包镜像（自建镜像站）
 //
 //  政策（用户原话，2026-09-16 最终版）：
-//    "对所有能用到的模型、软件，如 ffmpeg，都要以 NAS 镜像优先，不通再走别的！"
+//    "对所有能用到的模型、软件，如 ffmpeg，都要以镜像站优先，不通再走别的！"
 //
 //  也就是说镜像的语义是**优先来源，不是唯一来源**：
 //    · 镜像上有 → **一定**用镜像（地址写进任务日志，用户看得见到底从哪下的）；
@@ -31,10 +31,9 @@ import (
 //    <base>/apps/<app-id>/<version>/<原始文件名>
 //    <base>/apps/<app-id>/<version>/manifest.json   ← 每个包的 sha256/大小
 //
-//  其它来源统一走同一台镜像的子路径（NAS 侧反代，见 NAS 上 zizpanel-mirror
-//  容器的 nginx.conf）：
+//  其它来源统一走同一台镜像的子路径（镜像站侧反代，见镜像上的 nginx.conf）：
 //    HF → <base>/hf、brew → <base>/brew、CLT → <base>/zizpanel/clt
-//    （pypi 目前 NAS 上没有，见交付说明）
+//    （pypi 目前镜像站上没有，见交付说明）
 //
 //  镜像基址来自面板设置（Config.MirrorBase → Options.MirrorBase），
 //  留空表示**关闭镜像**（应急用；那时各来源回到内置的公网/国内镜像）。
@@ -51,7 +50,7 @@ const (
 
 // mirrorProbeTimeout 是"镜像上有没有这个资源"的单次探测超时。
 //
-// 必须短（默认 4 秒）：局域网/同城镜像正常在 100ms 内应答，4 秒足够区分"慢"与
+// 必须短（默认 4 秒）：同城/国内镜像正常在 100ms 内应答，4 秒足够区分"慢"与
 // "不通"，又不会在镜像站故障时把每次安装都拖很久。
 func (m *Manager) mirrorProbeTimeout() time.Duration {
 	sec := m.opt.MirrorProbeSeconds
@@ -61,7 +60,7 @@ func (m *Manager) mirrorProbeTimeout() time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
-// ReleaseBinaryAsset 描述"要同步到镜像站的一个包"（给 NAS 同步工具用）。
+// ReleaseBinaryAsset 描述"要同步到镜像站的一个包"（给镜像站同步工具用）。
 type ReleaseBinaryAsset struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
@@ -75,7 +74,7 @@ type ReleaseBinaryAsset struct {
 
 // ReleaseBinaryAssets 导出注册表里全部"官方 release 原生二进制"应用的下载信息。
 //
-// 为什么要有它：NAS 同步工具要按 apps/<id>/<版本>/<文件名> 存包，这个布局与版本
+// 为什么要有它：镜像站同步工具要按 apps/<id>/<版本>/<文件名> 存包，这个布局与版本
 // 必须和代码一致。让工具从注册表读（而不是在 shell 里手抄），就不会出现
 // "代码升了版本、镜像还停在旧版本"的错位，加新应用也会自动带上。
 func ReleaseBinaryAssets() []ReleaseBinaryAsset {
@@ -95,32 +94,6 @@ func ReleaseBinaryAssets() []ReleaseBinaryAsset {
 // 空串 = 用户显式关掉了镜像（Config.MirrorBase 留空）。
 func (m *Manager) mirrorBase() string {
 	return strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/")
-}
-
-// mirrorBaseLAN 是同一个镜像站的局域网入口（可选）。
-func (m *Manager) mirrorBaseLAN() string {
-	return strings.TrimRight(strings.TrimSpace(m.opt.MirrorBaseLAN), "/")
-}
-
-// mirrorBaseCandidates 返回**按顺序尝试**的镜像基址：公网 → 局域网 → …。
-//
-// 为什么要有多个候选（2026-09-18 用户报障"ddns-go 等没有 nas 缓存！装不上啊！"）：
-// 用户看到的是"镜像上没有这个包"，实测却是**公网入口坏了**（TLS 通、返回空响应），
-// 而同一台 NAS 的局域网入口（192.168.1.8:8090）上包好好地躺着。
-// 只有一个基址时，公网入口一坏，安装就只能回落 GitHub —— 国内那就是"装不上"。
-//
-// 去重：局域网地址与公网地址相同时只留一个（避免白探一次）。
-func (m *Manager) mirrorBaseCandidates() []string {
-	out := []string{}
-	seen := map[string]bool{}
-	for _, base := range []string{m.mirrorBase(), m.mirrorBaseLAN()} {
-		if base == "" || seen[base] {
-			continue
-		}
-		seen[base] = true
-		out = append(out, base)
-	}
-	return out
 }
 
 // mirrorAssetURLOn 在**指定**基址上拼应用包地址（供多候选探测使用）。
@@ -147,7 +120,7 @@ func (m *Manager) appManifestURL(appID, version string) string {
 	return m.appAssetURL(appID, version, mirrorManifestName)
 }
 
-// mirrorSubPath 拼"其它来源"在镜像上的子路径（NAS 侧反代）：
+// mirrorSubPath 拼"其它来源"在镜像上的子路径（镜像站侧反代）：
 // mirrorSubPath("pypi/simple") → <base>/pypi/simple。
 func (m *Manager) mirrorSubPath(sub string) string {
 	return m.mirrorBase() + "/" + strings.Trim(sub, "/")
@@ -227,7 +200,7 @@ func (m *Manager) checkMirrorURL(ctx context.Context, url string) error {
 		return nil
 	case res.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("镜像站上没有这个资源（%s，HTTP 404）。"+
-			"请在能访问上游的机器上执行 `make sync-apps` 把它同步到 NAS 后重试", url)
+			"请在能访问上游的机器上执行 `make sync-apps` 把它同步到镜像站后重试", url)
 	default:
 		return fmt.Errorf("镜像站返回 HTTP %d（%s）", res.StatusCode, url)
 	}
@@ -248,16 +221,13 @@ func (m *Manager) downloadURLsFor(ctx context.Context, spec releaseBinaryApp) []
 	if !m.MirrorEnabled() {
 		return fallback
 	}
-	// 依次尝试每个镜像基址（公网 → 局域网）：**第一个真有这个包的**用作首选。
-	// 每个基址的探测都有自己的短超时（MirrorProbeSeconds），不会把安装拖住。
-	for _, base := range m.mirrorBaseCandidates() {
-		url := mirrorAssetURLOn(base, spec.ID, spec.Tag, spec.Asset)
-		if err := m.checkMirrorURL(ctx, url); err != nil {
-			continue // 不可达 / 缺件：试下一个基址，最后回落公网
-		}
-		return append([]string{url}, fallback...)
+	// 探镜像上的这个包；不可达 / 缺件就回落到公网源。
+	// 探测有短超时（MirrorProbeSeconds），不会把安装拖住。
+	url := mirrorAssetURLOn(m.mirrorBase(), spec.ID, spec.Tag, spec.Asset)
+	if err := m.checkMirrorURL(ctx, url); err != nil {
+		return fallback
 	}
-	return fallback
+	return append([]string{url}, fallback...)
 }
 
 // mirrorReachable 探测镜像站是否可用（只探站点根，用于"整条链路"级别的判断）。
@@ -373,7 +343,7 @@ func (m *Manager) verifyMirrorChecksum(ctx context.Context, spec releaseBinaryAp
 }
 
 // ============================================================================
-//  离线模式（仅走 NAS，禁止外网回落）
+//  离线模式（仅走镜像站，禁止外网回落）
 //
 //  设置项：Config.OfflineOnly → Options.OfflineOnly。
 //
@@ -388,7 +358,7 @@ func (m *Manager) verifyMirrorChecksum(ctx context.Context, spec releaseBinaryAp
 //  不会自动拦截任何东西。需要接线的清单见交付说明里的"接线清单"。
 //  ============================================================================
 
-// MirrorOfflineOnly 报告当前是否处于"仅走 NAS（离线）模式"。
+// MirrorOfflineOnly 报告当前是否处于"仅走镜像站（离线）模式"。
 //
 // 各安装器在下决心回落公网之前**必须**先问它：
 //
@@ -415,11 +385,11 @@ func (m *Manager) offlineOnlyFail(resource, mirrorURL string) error {
 		where = "（镜像基址为空：设置里的 mirror_base 没填）"
 	}
 	return fmt.Errorf(
-		"离线模式（仅走 NAS）已开启，禁止回落外网，但镜像上没有这个资源：%s\n"+
+		"离线模式（仅走镜像站）已开启，禁止回落外网，但镜像上没有这个资源：%s\n"+
 			"  镜像上应存在的位置：%s\n"+
 			"  补法：在能访问上游的机器上执行 "+
-			"`bash tools/build-offline-bundle.sh --app <应用> --upload` 把它打进 NAS 离线包；"+
-			"或在「设置 → 访问与安全」里关闭「仅走 NAS（离线）」",
+			"`bash tools/build-offline-bundle.sh --app <应用> --upload` 把它打进镜像站离线包；"+
+			"或在「设置 → 访问与安全」里关闭「仅走镜像站（离线）」",
 		resource, where)
 }
 

@@ -23,8 +23,8 @@ import (
 //  这一组锁的是两个**真机上出过事**的约束（2026-09-16 Mac mini）：
 //
 //   1. LaMa 权重来自 **GitHub release**（不是 HuggingFace），所以必须
-//      "NAS 静态镜像优先 + 探通才算数 + MD5 校验"，而且任务日志要**如实**
-//      写出这次到底走了哪个来源 —— 不能再出现"日志说走 NAS、进程在连 GitHub"。
+//      "镜像站静态镜像优先 + 探通才算数 + MD5 校验"，而且任务日志要**如实**
+//      写出这次到底走了哪个来源 —— 不能再出现"日志说走镜像站、进程在连 GitHub"。
 //
 //   2. 模型下载与服务就绪**都必须有超时**，超时后**如实失败**：
 //      既不许任务永远停在 running（用户看着一个假进度），
@@ -61,7 +61,7 @@ func stepsContain(res *InstallResult, want string) bool {
 
 func iopaintTestSources() []weightSource {
 	return []weightSource{
-		{URL: "https://mirror.example:8888/models/iopaint/big-lama.pt", Label: "NAS 镜像"},
+		{URL: "https://mirror.example:8888/models/iopaint/big-lama.pt", Label: "镜像站"},
 		{URL: iopaintWeightURL, Label: "GitHub release（Sanster/models）"},
 	}
 }
@@ -216,7 +216,7 @@ func TestWaitIOPaintReadySuccess(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-//  权重：来源选择（NAS 优先，且"探通才算数"）
+//  权重：来源选择（镜像站优先，且"探通才算数"）
 // ---------------------------------------------------------------------------
 
 func TestIOPaintWeightSourcesPrefersReachableMirror(t *testing.T) {
@@ -242,8 +242,8 @@ func TestIOPaintWeightSourcesPrefersReachableMirror(t *testing.T) {
 	if srcs[1].URL != iopaintWeightURL {
 		t.Fatalf("第二个来源应当是 GitHub 原址，实际 %q", srcs[1].URL)
 	}
-	if !stepsContain(res, "NAS 镜像") {
-		t.Fatalf("日志必须如实写出『这次走 NAS 镜像』，实际：%v", res.Steps)
+	if !stepsContain(res, "镜像站") {
+		t.Fatalf("日志必须如实写出『这次走镜像站』，实际：%v", res.Steps)
 	}
 }
 
@@ -317,7 +317,7 @@ func TestEnsureWeightFilePrefersFirstSourceAndVerifiesMD5(t *testing.T) {
 	if rerr != nil || string(b) != string(payload) {
 		t.Fatalf("权重没有正确落盘：%v", rerr)
 	}
-	if !stepsContain(res, "MD5 校验通过") || !stepsContain(res, "NAS 镜像") {
+	if !stepsContain(res, "MD5 校验通过") || !stepsContain(res, "镜像站") {
 		t.Fatalf("日志要写明来源与校验结论，实际：%v", res.Steps)
 	}
 }
@@ -456,7 +456,7 @@ func TestEnsureIOPaintWeightRejectsNonOfficialPayload(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-//  plist 与路径：锁住"面板真的会优先用 NAS"这件事
+//  plist 与路径：锁住"面板真的会优先用镜像站"这件事
 // ---------------------------------------------------------------------------
 
 func TestIOPaintPlistPinsWeightSourceAndMD5(t *testing.T) {

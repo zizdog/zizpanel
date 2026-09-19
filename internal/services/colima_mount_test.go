@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -136,10 +137,10 @@ func TestSetColimaDockerOptionOnEmptyDockerSection(t *testing.T) {
 // TestInsecureRegistryHostFor 只对明文 HTTP 的源要求登记 insecure-registries。
 func TestInsecureRegistryHostFor(t *testing.T) {
 	cases := map[string]string{
-		"http://192.168.1.8:8090/docker":        "192.168.1.8:8090",
-		"http://mirror.local/docker":            "mirror.local",
-		"https://mirror.zizdog.com:8888/docker": "",
-		"https://docker.1ms.run":                "",
+		"http://registry.example:5000/v2": "registry.example:5000",
+		"http://mirror.local":             "mirror.local",
+		"https://mirror.zizdog.com:8888":  "",
+		"https://docker.1ms.run":          "",
 	}
 	for in, want := range cases {
 		if got := insecureRegistryHostFor(in); got != want {
@@ -210,23 +211,29 @@ func TestColimaGuestMirrorURLs(t *testing.T) {
 	}
 }
 
-// TestDockerMirrorCandidatesNASFirst 自建镜像站必须排在候选列表第一位。
-func TestDockerMirrorCandidatesNASFirst(t *testing.T) {
+// TestDockerMirrorCandidatesArePublicOnly 公网镜像站**不提供** `/docker/` 路径
+// （2026-09-20 用户明确）：候选里绝不能出现任何以镜像基址拼出来的 /docker 端点，
+// 否则 docker 会把一个 404 端点排在第一位，层数据阶段卡死/失败。
+func TestDockerMirrorCandidatesArePublicOnly(t *testing.T) {
 	m := &Manager{opt: Options{MirrorBase: "https://mirror.zizdog.com:8888"}}
 	got := m.DockerMirrorCandidates()
-	if len(got) != len(BuiltinDockerMirrors)+1 {
-		t.Fatalf("候选数 = %d，期望内置 %d + 自建 1", len(got), len(BuiltinDockerMirrors))
+	if len(got) != len(BuiltinDockerMirrors) {
+		t.Fatalf("候选数 = %d，期望只有内置公网候选 %d 个", len(got), len(BuiltinDockerMirrors))
 	}
-	if got[0].URL != "https://mirror.zizdog.com:8888/docker" {
-		t.Errorf("第一位 = %q，期望自建镜像站", got[0].URL)
+	// 只匹配 URL 的**路径**段 `/docker`，不能误伤主机名（如 https://dockerproxy.net）。
+	mirrorDockerPath := regexp.MustCompile(`^https?://[^/]+/docker(?:/|$)`)
+	for i, c := range got {
+		if c.URL != BuiltinDockerMirrors[i].URL {
+			t.Errorf("第 %d 位 = %q，期望内置公网候选 %q", i, c.URL, BuiltinDockerMirrors[i].URL)
+		}
+		if mirrorDockerPath.MatchString(c.URL) {
+			t.Errorf("候选里出现镜像站 /docker 端点（公网镜像站不提供它）：%q", c.URL)
+		}
 	}
-	// 没配镜像站时不应该凭空造一个
+	// 没配镜像站时同样只有公网候选（数量与内容都不随 MirrorBase 变）。
 	m2 := &Manager{opt: Options{}}
 	if got2 := m2.DockerMirrorCandidates(); len(got2) != len(BuiltinDockerMirrors) {
 		t.Errorf("未配置镜像站时候选数 = %d，期望 %d", len(got2), len(BuiltinDockerMirrors))
-	}
-	if m2.nasDockerMirror() != "" {
-		t.Errorf("未配置镜像站时 nasDockerMirror 应为空")
 	}
 }
 
@@ -296,10 +303,10 @@ func TestUnusableMirrorsMarked(t *testing.T) {
 	}
 }
 
-// TestDockerMirrorRankDefaultsToOne 用户手填/自建地址既不当"最好"也不排除。
+// TestDockerMirrorRankDefaultsToOne 用户手填的未知地址既不当"最好"也不排除。
 func TestDockerMirrorRankDefaultsToOne(t *testing.T) {
-	if got := DockerMirrorRank("https://mirror.zizdog.com:8888/docker"); got != 1 {
-		t.Errorf("自建镜像站 Rank = %d，期望 1", got)
+	if got := DockerMirrorRank("https://unknown-mirror.example/v2"); got != 1 {
+		t.Errorf("未知地址 Rank = %d，期望 1", got)
 	}
 	if got := DockerMirrorRank("https://dockerproxy.net/"); got != 0 {
 		t.Errorf("带尾斜杠的已知地址应解析出 Rank 0，实际 %d", got)

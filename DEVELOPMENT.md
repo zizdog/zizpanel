@@ -108,11 +108,16 @@ make test-short   # 只跑 Go 单测
 make bump            # 0.11.3 → 0.11.4 … → 0.11.10 → 0.12.0
 make check           # 必须真绿（第四节）
 make release         # dist/release/：darwin/arm64+amd64 包、签名清单
-make mirror-nas      # 生成"指向 NAS 镜像"的清单（url=download/<版本>/）并签名
-make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验证版本
-# 分步亦可：make publish-nas（仍要求 NAS_PASS）/ bash tools/deploy.sh（密钥优先、口令兜底）
+make mirror-public   # 生成"指向公网镜像"的清单（url=download/<版本>/）并签名，回读断言无内网地址
+make deploy          # release + 推你自己的镜像机(单流 tar) + 升级本机 + 验证版本
+# 分步亦可：make publish-nas（NAS_HOST/NAS_USER/NAS_ROOT/NAS_PASS 全由调用者提供）/ bash tools/deploy.sh
 ```
 
+- **发布产物只允许公网地址**：`make mirror-public` 的基址直接取自
+  `internal/upgrade/source.go` 的 `MirrorSource`（`https://mirror.zizdog.com:8888/zizpanel`），
+  不写第二份；生成后 `grep` 回读，出现任何 RFC1918 地址就失败。
+  **地址由开发者提供**：镜像机的主机/账号/目录在 Makefile 与 `tools/` 里都没有默认值，
+  必须用环境变量传（旧的 `make mirror-nas` 保留为 `mirror-public` 的别名）。
 - `make release` 会把发布公钥注入二进制，并**运行产物核对公钥**：`-X` 在 `-trimpath` 下会静默失效
   （符号被死代码消除，退出码仍是 0）。
 - 私钥在 `.release-key/`（gitignored）。丢了就再也签不出被已装面板接受的升级包。
@@ -121,10 +126,10 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
   `install.sh` 的 `ZIZPANEL_DOWNLOAD_BASE` 默认也指向 `https://github.com/zizdog/zizpanel/releases`，
   启动后回落内置镜像 `https://zizdog.com/zizpanel`。`make release` 还会多产一份 `manifest-github.json`
   （同一批包、同一把私钥，只有 url 不同）。**历史入口已废弃**（不发 GitHub，那里没有新版本）；
-  实际下发走 `make mirror-nas` 的 NAS 版清单与内置镜像。
+  实际下发走 `make mirror-public` 的公网镜像版清单与内置镜像。
 - 面板"在线升级"读 `manifest.json` + `manifest.json.sig`；升级后**必须等新版本健康检查回来**
   （看版本号，不是端口通）。
-- 国内网络实测：GitHub 直连 20 秒 0 字节；NAS 局域网 ~87 MB/s、公网镜像 ~8.6 MB/s。
+- 国内网络实测：GitHub 直连 20 秒 0 字节；自建镜像作者本机链路 ~87 MB/s、公网镜像 ~8.6 MB/s。
   CLT 整包、brew 瓶、pip、HF、Docker 都走镜像。
 
 ---
@@ -133,10 +138,10 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 
 - 加一个应用 = 5 步：**`docs/新增应用工作流.md`**（声明 → 静态门禁 → 在线审计 → 真机验收）。
 - 离线/断网/迁移：**`docs/离线打包与迁移.md`**（`/offline/` 包格式 + `tools/build-offline-bundle.sh`
-  + 面板「仅走 NAS」开关）。
+  + 面板「仅走镜像站」开关）。
 - 每个应用从哪下、多快、超时多少：**`docs/应用市场下载点清点.md`**。
-- 镜像布局：`/apps/<id>/<ver>/`、`/models/`、`/sites/`、`/brew/`、`/pypi/`、`/hf/`、`/docker/`、
-  `/zizpanel/clt/`、`/offline/`。
+- 镜像布局：`/apps/<id>/<ver>/`、`/models/`、`/sites/`、`/brew/`、`/pypi/`、`/hf/`、
+  `/zizpanel/clt/`、`/offline/`（**没有 `/docker`**：docker 加速只用公网候选）。
 - 两条不变量：**能原生就原生**；**Docker 必须自带 arm64**（`platform:` 由测试扫目录条目锁死）。
 
 ---
@@ -152,7 +157,7 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 在不支持的机器上**静默返回成功**却什么都没做，脚本却报告"已开启断电自恢复" —— 真跳闸那天才会发现。
 **能谎报成功的功能，比没做更糟。**
 
-**磁盘工具**（侧栏 系统 → 💾 磁盘）是另一类：只读枚举 + 挂载/卸载 + 开机自动挂载 +
+**磁盘管理**（侧栏 系统 → 💾 磁盘管理）是另一类：只读枚举 + 危险操作（抹盘/格式化/建卷/删卷/重命名）+
 对**非系统盘**开放的抹盘/格式化/建卷/删卷/重命名（系统盘一律 403，执行前重新枚举防 TOCTOU）。
 安全边界、无头（无 GUI 授权弹窗）说明、API 契约与验证状态见 **`docs/磁盘工具.md`**；
 后端 `internal/web/api_disks*.go`，前端 `assets/js/disks.js`。
@@ -184,12 +189,12 @@ make deploy          # release + 推 NAS(单流 tar) + 并行升级两台 + 验�
 | 段 | 之前 | 现在 | 做法 |
 |---|---|---|---|
 | `make check` | 5–7 min（每次都跑） | 同一棵树**跳过** | `tools/check-stamp.sh`：check 成功时把**工作树指纹**（含未跟踪文件内容）写进 `dist/.check-stamp`；`make deploy` 先 `verify`，指纹一致才跳过并打印"哪个版本、什么时候跑的" |
-| `make release` | 双架构，16s | **只 arm64**，8s | `ARCHS`（默认 `arm64 amd64`，`make deploy` 传 `arm64`）—— 本机与 mini 都是 Apple Silicon |
-| 上传 NAS | 4 个包 ≈96MB | **1 个包 23MB** | 只传版本包；`latest` 与 `download/<版本>/` 的副本/软链由远端 LAYOUT 造 |
+| `make release` | 双架构，16s | **只 arm64**，8s | `ARCHS`（默认 `arm64 amd64`，`make deploy` 传 `arm64`）—— 本机是 Apple Silicon |
+| 上传镜像机 | 4 个包 ≈96MB | **1 个包 23MB** | 只传版本包；`latest` 与 `download/<版本>/` 的副本/软链由远端 LAYOUT 造 |
 | 升级等待 | 每轮 sleep 2s | 前 20 轮 0.5s，之后 2s | `tools/panel-upgrade.py`；总窗口不变（≈3 min） |
 
-**实测：一次 `make deploy` 从 ~1.5–2 min 降到 17s**（含构建 8s、上传 23MB、两台并行升级 4s、版本核对）。
-⚠️ 两条纪律不能忘：① `ARCHS=arm64` 只适合"本机 + mini"这种全 arm64 部署，**正式发布仍建议双架构**（`make release` 默认就是）；
+**实测：一次 `make deploy` 从 ~1.5–2 min 降到 17s**（含构建 8s、上传 23MB、升级本机 4s、版本核对）。
+⚠️ 两条纪律不能忘：① `ARCHS=arm64` 只适合只发本机（Apple Silicon）的场景，**正式发布仍建议双架构**（`make release` 默认就是）；
 ② check 标记是**便利**不是安全边界 —— 手动 `bash tools/check-stamp.sh write` 等价于 `SKIP_CHECK=1`，只在你自己确认过的情况下用。
 
 ## 九、已修复的典型坑

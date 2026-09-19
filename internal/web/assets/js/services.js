@@ -11,7 +11,7 @@
 //   - 每张卡片一眼看清"这个应用在不在跑、健康不健康"
 //   - 状态灯的颜色直接反映真实状态（面板每次都实时查询系统）
 //   - **给用户看的界面里不出现"纳管 / 接入 / 托管"这类内部概念**（用户
-//     2026-09-21："弱化管纳这个概念，这是面板要做的事，不是用户的事"）。
+//    ："弱化管纳这个概念，这是面板要做的事，不是用户的事"）。
 //     底层安全语义一个字没改：面板自己装的才能卸载，用户自己装的软件面板
 //     绝不卸载 —— 但那个区别只体现在**移除动作的文案**上（「卸载」 vs
 //     「从列表移除（不卸载软件）」），不再用一个 pill 去向用户解释"谁装的"。
@@ -33,7 +33,7 @@ import {
 // 「已安装」的状态筛选（全部 / 运行中 / 已停止 / 需要处理）。
 // 放模块级：Tab 切换、动作后重画都不该把用户的筛选选择丢掉。
 //
-// 2026-09-21 用户："「异常」和「仅健康检查失败」是否重复，甚至这两个页面对用户
+// 用户："「异常」和「仅健康检查失败」是否重复，甚至这两个页面对用户
 // 是否有意义？" —— 确实重复：旧的「仅健康检查失败」是旧「异常」的真子集
 // （见 problemOf）。现在只剩 4 项，且全部是用户语言。
 let stateFilter = 'all';
@@ -127,7 +127,7 @@ export function renderInstalledApps(container, opts = {}) {
     if (stateFilter === 'stopped') {
       // 「已停止」的判据必须**真的有服务在报停止状态**。
       //
-      // 2026-09-21 用户发火："以下应用都被归类到了：已停止分类中：Docker 运行时
+      // 用户发火："以下应用都被归类到了：已停止分类中：Docker 运行时
       // （Colima）、FFmpeg、Nginx、phpMyAdmin、Python 3.10/3.11/3.13。它们真的
       // 不运行吗？！" —— 那些条目**没有服务记录**（ffmpeg/python/phpMyAdmin 是
       // no_daemon，本机 nginx 只是没登记），以前 `!st.running && st.status !== …`
@@ -181,7 +181,7 @@ export function renderInstalledApps(container, opts = {}) {
         title: '重新读取市场目录与服务状态',
         onclick: reload,
       }),
-      // 「🔍 扫描可纳管服务」按钮与它的弹窗流程已删除（2026-09-21 用户要求
+      // 「🔍 扫描可纳管服务」按钮与它的弹窗流程已删除（用户要求
       // "弱化管纳这个概念"）。为什么可以删：面板启动时已经自动登记本机已有的
       // **已知**服务（cmd/zizpanel/main.go 调 services.Manager.AutoRegisterKnown，
       // 见 internal/services/catalog.go:2202），扫描本来就是面板自己该做的事；
@@ -250,7 +250,7 @@ export function renderInstalledApps(container, opts = {}) {
     const pills = [
       h('span.pill' + (line.cls ? '.' + line.cls : ''), { text: line.text, title: line.title || '' }),
       port > 0 ? h('span.pill', { text: ':' + port }) : null,
-      // 「面板托管 / 仅纳管」pill 已删除（2026-09-21 用户："弱化管纳这个概念"）。
+      // 「面板托管 / 仅纳管」pill 已删除（用户："弱化管纳这个概念"）。
       // 为什么不换成"由面板安装 / 本机已有"：记录里的 managed=false 并不能证明
       // 软件是用户装的 —— 面板自研安装器装出来的应用（Miniflux / Qwen3 TTS /
       // IOPaint …）走的也是 RegisterInstalledService，记录同样是 managed=false
@@ -262,7 +262,7 @@ export function renderInstalledApps(container, opts = {}) {
           ? h('span.pill.ok', {
             text: '健康',
             // message 只在 title 里的话，用户看不到"为什么 401 也算健康"——
-            // 下面 extra 会把它显式写出来（2026-09-20：自动化测试也按可见文本断言）。
+            // 下面 extra 会把它显式写出来（2026-09-18：自动化测试也按可见文本断言）。
             title: (health.message || '') + '（' + (health.latency_ms || 0) + 'ms）',
           })
           : h('span.pill.danger', { text: '健康检查失败', title: health.message || '' }))
@@ -292,7 +292,7 @@ export function renderInstalledApps(container, opts = {}) {
         text: (health.message || '') + ' —— 该地址要求登录，服务本身是正常的',
       })]
       : [];
-    // 装了、但面板里没有它的服务记录（2026-09-21 用户发火的那一类）：
+    // 装了、但面板里没有它的服务记录（用户发火的那一类）：
     // 卡片上要**主动说清楚**，而不是让用户去猜"它到底跑没跑"。
     // 端口是否监听只用后端真的做过的健康检查结论；没查过就明写"未检测"。
     const noRecordNote = (!s && m && (m.installed || m.adopted) && !m.no_daemon)
@@ -342,7 +342,7 @@ export function renderInstalledApps(container, opts = {}) {
       pills,
       text,
       extra: [...extra, ...authNote, ...noRecordNote],
-      // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-20 真的漏过一次，
+      // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，
       // 是 make smoke 的"必须能点到管理/卸载"断言抓到的 —— 别删这一行）。
       actions,
       // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
@@ -351,10 +351,10 @@ export function renderInstalledApps(container, opts = {}) {
     });
   }
 
-  // ---------- 「扫描可纳管服务」入口已删除（2026-09-21） ----------
+  // ---------- 「扫描可纳管服务」入口已删除（2026-09-18） ----------
   //
   // 原来这里有一个 openAdoptable()：弹窗列出本机所有 launchd 服务，逐条给
-  // 「纳管」按钮。用户 2026-09-21 的原话是"扫描可纳管服务和'应该弱化管纳这个
+  // 「纳管」按钮。用户的原话是"扫描可纳管服务和'应该弱化管纳这个
   // 概念'是一回事，用户不需要知道什么是纳管，不需要知道系统里运行的软件是怎么
   // 被面板控制的" —— 所以整段（按钮 + 弹窗 + api.adoptable/adopt 的前端调用）
   // 删掉了。
@@ -432,7 +432,7 @@ export function openLogs(s) {
 
   const follow = h('input', { type: 'checkbox', checked: true });
   // testid 是给自动化测试用的稳定锚点：日志弹窗里还有别的 pill（服务状态、
-  // 面板托管…），按 ".modal .pill" 取第一个会拿到错的那个 —— 2026-09-20 实测
+  // 面板托管…），按 ".modal .pill" 取第一个会拿到错的那个 —— 2026-09-18 实测
   // 就是这样，测试报"日志流状态是：运行中"。
   const status = h('span.pill', { dataset: { testid: 'zp-logs-status' }, text: '连接中…' });
 

@@ -118,7 +118,7 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	}
 	// brew 依赖探测必须钉住：卸载计划（市场列表逐条算）会跑
 	// `brew uses --installed`，在开发机上真的执行会去更新 tap、能挂十几分钟
-	//（2026-09-21 实测），而且结论随开发机装了什么而漂 —— 单测不许碰真实 brew。
+	//（2026-09-18 实测），而且结论随开发机装了什么而漂 —— 单测不许碰真实 brew。
 	// 返回"查了、没有依赖"，等价于一台干净的机器。
 	stubBrewUsesProbe(t, srv)
 	t.Cleanup(srv.forwarders.StopAll)
@@ -131,7 +131,7 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 //
 // 卸载计划会在市场列表里逐条查"谁依赖它"（用户要求卸载前讲清依赖），而没有
 // 注入点时 web 层单测真的会执行开发机的 /opt/homebrew/bin/brew uses —— 开着
-// tap 自动更新的机器上它能挂十几分钟（2026-09-21 TestMarketZombieColimaPlistNotInstalled
+// tap 自动更新的机器上它能挂十几分钟（2026-09-18 TestMarketZombieColimaPlistNotInstalled
 // 卡到 15 分钟超时就是它）。默认答"查了、没有依赖"，等价于干净机器；
 // 需要"依赖命中"的用例自己再 SetBrewUsesProbeForTest 覆盖。
 func stubBrewUsesProbe(t *testing.T, srv *Server) {
@@ -140,7 +140,7 @@ func stubBrewUsesProbe(t *testing.T, srv *Server) {
 	restore := mgr.SetBrewUsesProbeForTest(
 		func(context.Context, string) ([]string, bool) { return nil, true })
 	// 必须把**同一个** Manager 固定给这台测试服务器用：svcManager() 每次请求都
-	// 新造一个，注入到刚造出来的那个上等于没注入（2026-09-21 实测：测试仍然
+	// 新造一个，注入到刚造出来的那个上等于没注入（2026-09-18 实测：测试仍然
 	// 真的跑了开发机的 brew，卡到 900s 超时）。生产路径不受影响 ——
 	// svcManagerOverride 只在单测里被设置。
 	prev := srv.svcManagerOverride

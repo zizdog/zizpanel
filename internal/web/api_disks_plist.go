@@ -1,6 +1,6 @@
 package web
 
-// api_disks_plist.go —— 给磁盘工具用的极简 XML plist 解析器。
+// api_disks_plist.go —— 给磁盘管理用的极简 XML plist 解析器。
 //
 // 为什么手写而不是引三方库：
 //   · 面板的硬约束是"不引入依赖、无构建步骤"；

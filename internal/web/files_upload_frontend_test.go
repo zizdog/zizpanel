@@ -15,7 +15,7 @@ import (
 //  为什么放在 Go 测试里：面板前端是"无构建步骤"的原生 ESM，没有测试运行器。
 //  而这几个不变量一旦破了，用户报障会原样复发。
 //
-//  2026-09-20 的报障（978MB 上传"点了没反应"）里，前端有两个独立的原因：
+//  的报障（978MB 上传"点了没反应"）里，前端有两个独立的原因：
 //    1. ui.js 的 appendAll 只会 appendChild，而 files.js 拿它往 FormData 里塞字段
 //       → `parent.appendChild is not a function`，抛在任何 toast 之前，
 //         于是**任何大小**的上传都是彻底无声失败；
@@ -163,7 +163,7 @@ func TestFilesFrontendUploadWiring(t *testing.T) {
 	}
 	if regexp.MustCompile(`appendAll\(\s*fd\b`).MatchString(js) {
 		t.Fatal("files.js 又用 appendAll 往 FormData 里塞字段了 —— " +
-			"这正是 2026-09-20「点上传没反应」的直接原因（异常抛在提示之前）")
+			"这正是「点上传没反应」的直接原因（异常抛在提示之前）")
 	}
 	// 任何未预料的异常都必须变成用户看得见的提示
 	if !regexp.MustCompile(`catch\s*\(err\)\s*\{[^}]*toast\(`).MatchString(js) &&
@@ -177,7 +177,7 @@ func TestFilesFrontendUploadWiring(t *testing.T) {
 }
 
 // TestFilesFrontendUploadAsksAboutConflicts 锁"同名文件必须先问用户"这条接线
-// （用户 2026-09-22："上传文件，如果相同名字应该询问是否覆盖还是共存"）。
+// （用户："上传文件，如果相同名字应该询问是否覆盖还是共存"）。
 //
 // 为什么用静态断言而不是只靠后端测试：后端的两种策略早就存在，用户报的是
 // **没人问他**。少了这三处任何一处，功能就等于没有：

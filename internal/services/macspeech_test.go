@@ -742,7 +742,7 @@ func TestMarketZeroDownloadGateIsNotVacuous(t *testing.T) {
 	if !strings.Contains(strings.Join(problems, "\n"), "NoDownloadReason") {
 		t.Errorf("报错信息要点名 NoDownloadReason：%v", problems)
 	}
-	// ② 理由太短 → 仍然报错（与 NAS 理由同一条规矩）
+	// ② 理由太短 → 仍然报错（与镜像站理由同一条规矩）
 	base.NoDownloadReason = "不需要"
 	if len(MarketDeclarationProblems(base, app)) == 0 {
 		t.Error("理由太短也该被拦下（不许写「不需要」三个字就过）")

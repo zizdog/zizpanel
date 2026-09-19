@@ -73,7 +73,7 @@ export function clear(el) { while (el.firstChild) el.removeChild(el.firstChild);
 // 于是抛 `parent.appendChild is not a function`；第一版"修好它"的实现改成
 // `parent.append(it)`，又抛 `Failed to execute 'append' on 'FormData':
 // 2 arguments required`。两次都抛在**任何 toast 之前**，而 async 事件处理器里
-// 的 rejection 不会显示任何东西 —— 用户看到的就是 2026-09-20 那次报障：
+// 的 rejection 不会显示任何东西 —— 用户看到的就是那次报障：
 // 「点上传没反应、没成功也没提示」。
 //
 // 所以这里的规矩是：**不认识的目标要大声报错**，并且上传路径由调用方

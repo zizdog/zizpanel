@@ -10,9 +10,9 @@ import (
 
 // TestHFEndpointUsableRequiresWorkingAPI 锁住 2026-09-18 用户真机事故：
 //
-// NAS 的 `/hf/` 首页返回 200（一个落地页），但 `/hf/api/models/<repo>` 是 **502** ——
+// 镜像站的 `/hf/` 首页返回 200（一个落地页），但 `/hf/api/models/<repo>` 是 **502** ——
 // 而 `hf download` 必须先用 API 列文件。旧探测只看首页 200，于是把 `HF_ENDPOINT`
-// 指向 NAS，用户看到的是连续三次
+// 指向镜像站，用户看到的是连续三次
 //
 //	Error: Local entry not found. [Errno 60] Operation timed out
 //
@@ -26,7 +26,7 @@ func TestHFEndpointUsableRequiresWorkingAPI(t *testing.T) {
 	}
 	repo := QwenModels[0].Name
 
-	// ① 只有首页 200，API 502（NAS 当年的真实状态）→ 不可用
+	// ① 只有首页 200，API 502（镜像站当年的真实状态）→ 不可用
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			_, _ = w.Write([]byte("<html>hf mirror</html>"))

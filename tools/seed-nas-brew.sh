@@ -13,27 +13,28 @@
 # 任一条不过就计失败，脚本退出码非 0。
 #
 # 用法：
-#   bash tools/seed-nas-brew.sh python@3.11                  # 含依赖闭包；tag 由本机系统推导
-#   bash tools/seed-nas-brew.sh python@3.12 --no-deps
-#   bash tools/seed-nas-brew.sh python@3.11 --tags arm64_sequoia,sonoma
-#   bash tools/seed-nas-brew.sh python@3.11 --dry-run        # 只列出要预置什么，不下载
-#   bash tools/seed-nas-brew.sh python@3.11 --also-oci       # 连 OCI 路径也各预热一份
+#   MIRROR='https://<你的镜像机>' bash tools/seed-nas-brew.sh python@3.11   # 含依赖闭包；tag 由本机系统推导
+#   MIRROR='https://…' bash tools/seed-nas-brew.sh python@3.12 --no-deps
+#   MIRROR='https://…' bash tools/seed-nas-brew.sh python@3.11 --tags arm64_sequoia,sonoma
+#   MIRROR='https://…' bash tools/seed-nas-brew.sh python@3.11 --dry-run    # 只列出要预置什么，不下载
+#   MIRROR='https://…' bash tools/seed-nas-brew.sh python@3.11 --also-oci   # 连 OCI 路径也各预热一份
 #
-# 预热的是**哪条 URL**（很重要，2026-09-20 读 Homebrew 7 源码后才确认）：
+# 预热的是**哪条 URL**（很重要，2026-09-18 读 Homebrew 7 源码后才确认）：
 # 默认预热 **legacy 平铺** `<%40编码的 formula>-<版本>.<tag>.bottle[.<rebuild>].tar.gz`
 # —— 面板设了自定义 HOMEBREW_BOTTLE_DOMAIN 时，brew 真正请求的就是这条；
 # `--also-oci` 额外把 `/v2/homebrew/core/<name>/<ver>/blobs/sha256:<digest>` 也预热
 # （老 brew 或直接按 OCI 取的服务会用到）。缓存按**路径**存，两条路各存一份。
 #
 # 备注：
-#   · 镜像入口用**局域网**地址最快；公网入口（mirror.zizdog.com:8888）与 LAN 共用同一份缓存。
+#   · 地址由调用者提供，仓库里不留任何内网默认值：MIRROR=<你自己的镜像基址>。
 #   · 只读本地 brew（`brew deps`）；不装、不删、不改本机任何东西。
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-MIRROR="${MIRROR:-http://192.168.1.8:8090}"
+MIRROR="${MIRROR:-}"
+: "${MIRROR:?请传 MIRROR=<你自己的镜像基址，如 https://mirror.example.com>（本机可覆盖）}"
 BREW_BIN="${BREW_BIN:-/opt/homebrew/bin/brew}"
 TMPDIR_SEED="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_SEED"' EXIT

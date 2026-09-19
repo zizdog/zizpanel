@@ -14,7 +14,7 @@ import (
 )
 
 // ============================================================================
-//  Docker 加速源：**自建 NAS 优先 + 自动配 + 逐条回落**（P0-B / D18）
+//  Docker 加速源：**多个公网候选 + 自动配 + 逐条回落**（P0-B / D18）
 //
 //  为什么必须自动配：`SetDockerMirrors` 过去只在用户点"保存"时调用，
 //  装 Docker 运行时与装 compose 应用都不写 registry-mirrors —— 新机器上
@@ -26,63 +26,21 @@ import (
 //  而 `docker.1panel.live` / `dockerproxy.net` 能服务它。只配一个源 =
 //  换一个镜像就装不上。所以这里配一整个**有序列表**，让 docker 自己逐条回落。
 //
-//  为什么顺序是"NAS 在第一个"而不是"按延迟排"：用户的要求是资源放 NAS 上
-//  （镜像站会缓存层数据，第二次拉就是局域网速度）。但 NAS 探不通时**必须**
-//  还能回落公共源，所以它只是列表的第一项、不是唯一项。
-//
-//  ⚠️ 一个诚实的局限：探测是在**宿主机**上做的，而真正拉镜像的是 Colima
-//  虚拟机里的守护进程。宿主通不代表 VM 通（另一路审计在 mini 上测到
-//  "VM 到不了 NAS"；本机实测 VM **能**到 NAS，两台机器结论不一致）。
-//  所以 NAS 只是"优先项"，守护进程侧的逐条回落才是真正的兜底。
+//  ⚠️ 没有"自建镜像站 /docker"候选：公网镜像站**不提供** `/docker/` 路径
+//  （2026-09-20 用户明确）。把 404 端点排在第一位更糟 —— docker 只对 manifest
+//  做多源回落，层数据阶段选错源会直接卡死/失败。加速源只用公网候选。
 // ============================================================================
 
-// nasDockerMirror 返回自建镜像站上的 Docker Hub 镜像端点（未配置镜像站时为空）。
-//
-// 地址形态：<MirrorBase>/docker —— NAS 侧是 zizpanel-mirror 容器的
-// `location /docker/`，转发给 registry:2 pull-through cache（见 NAS 上的 nginx.conf）。
-// 用 MirrorBase 而不是写死 IP：用户把镜像站改成局域网地址时这里自动跟着走。
-func (m *Manager) nasDockerMirror() string {
-	base := m.mirrorBase()
-	if base == "" {
-		return ""
-	}
-	return base + "/docker"
-}
-
-// DockerMirrorCandidates 返回界面上要展示的候选列表（自建镜像站在最前）。
-//
-// 与 BuiltinDockerMirrors 分开：后者是"公网候选"的固有清单（有单测锁格式），
-// 自建站是**本机配置相关**的，混进去会让那份清单不再是常量。
+// DockerMirrorCandidates 返回界面上要展示的候选列表（全部是公网候选）。
 func (m *Manager) DockerMirrorCandidates() []DockerMirror {
-	out := make([]DockerMirror, 0, len(BuiltinDockerMirrors)+1)
-	if nas := m.nasDockerMirror(); nas != "" {
-		out = append(out, DockerMirror{
-			URL:  nas,
-			Name: "自建 NAS 镜像",
-			Note: "面板自建镜像站上的 Docker Hub 拉取缓存：优先用它，探不通自动回落下面的公共源",
-		})
-	}
+	out := make([]DockerMirror, 0, len(BuiltinDockerMirrors))
 	return append(out, BuiltinDockerMirrors...)
 }
 
-// preferredDockerMirrors 探测全部候选，返回**可用的有序列表**（NAS 钉在最前）。
+// preferredDockerMirrors 探测全部候选，返回**可用的有序列表**。
 //
-// 顺序规则与 SetDockerMirrors 的注释一致：可用优先、其次按延迟升序；
-// 唯一的例外是自建 NAS —— 只要它探通就排第一，这是用户明确要求的"镜像优先"。
-// preferredDockerMirrors 探测**公网**候选，返回可用的有序列表（按延迟升序）。
-//
-// 为什么自动配置时**不**把自建 NAS 镜像放进列表（2026-09-16 定的口径）：
-// registry-mirrors 是给 **Colima 虚拟机里的守护进程**用的，而实测 VM 到 NAS
-// 的连通性**两台机器结论不一致**（本机 VM 能到 NAS；另一路审计在 mini 上测到
-// VM 到 NAS 一律 connect 立即失败）。把一个可能不通的地址放在列表前面，
-// 等于给每次拉取都加一次无谓的失败。所以：
-//
-//	· **自动配置**只写探通的公网源（多个，靠 docker 自己逐条回落）；
-//	· 自建 NAS 镜像仍然在「Docker → 加速源」的候选列表里（DockerMirrorCandidates），
-//	  确认 VM 能到 NAS 的机器可以手动勾上它，享受 NAS 侧的层缓存。
-//
-// NAS 上的 /docker/（registry:2 pull-through）保留：宿主机可达，可作为
-// 将来宿主侧代理的上游，也是离线打包的取件口。
+// 全部候选都是公网源（见文件头：镜像站不提供 /docker/）。
+// 排序主键是**实测能力等级**，延迟只是次键 —— 见下面 sort 的注释。
 func (m *Manager) preferredDockerMirrors(ctx context.Context) ([]string, []DockerMirrorProbe) {
 	cands := m.DockerMirrorCandidates()
 	urls := make([]string, 0, len(cands))
@@ -90,14 +48,10 @@ func (m *Manager) preferredDockerMirrors(ctx context.Context) ([]string, []Docke
 		urls = append(urls, c.URL)
 	}
 	probes := m.ProbeDockerMirrors(ctx, urls)
-	nas := m.nasDockerMirror()
 	ok := make([]DockerMirrorProbe, 0, len(probes))
 	for _, p := range probes {
 		if !p.OK {
 			continue
-		}
-		if nas != "" && p.URL == nas {
-			continue // 见函数注释：不自动把守护进程指向 NAS
 		}
 		if DockerMirrorRank(p.URL) >= DockerMirrorRankUnusable {
 			continue // 实测"清单能取但层数据不可靠"的源不进自动配置
@@ -126,8 +80,8 @@ func (m *Manager) preferredDockerMirrors(ctx context.Context) ([]string, []Docke
 	return ordered, probes
 }
 
-// DockerMirrorRank 返回某个地址的实测能力等级；不在内置列表里的（用户手填的、
-// 或自建 NAS）按 1 处理 —— 既不当成"已验证最好"，也不排除。
+// DockerMirrorRank 返回某个地址的实测能力等级；不在内置列表里的（用户手填的）
+// 按 1 处理 —— 既不当成"已验证最好"，也不排除。
 func DockerMirrorRank(url string) int {
 	u := strings.TrimRight(strings.TrimSpace(url), "/")
 	for _, m := range BuiltinDockerMirrors {
@@ -257,9 +211,8 @@ func setColimaDockerOption(text, key string, values []string) string {
 // insecureRegistryHostFor 判断某个镜像地址是否必须登记进 insecure-registries。
 //
 // 只有 **http://** 的镜像源需要：dockerd 默认只对 HTTPS 的 registry 放行，
-// 明文 HTTP 的必须在 insecure-registries 里点名。自建镜像站默认是 https
-// （mirror.zizdog.com:8888，Let's Encrypt 证书），所以通常什么都不用加；
-// 用户把镜像站改成 `http://192.168.x.x:8090` 这种局域网地址时才需要。
+// 明文 HTTP 的必须在 insecure-registries 里点名。内置公网候选都是 https，
+// 所以通常什么都不用加；用户手填一个 `http://<自建机>:8090` 时才需要。
 func insecureRegistryHostFor(raw string) string {
 	if !strings.HasPrefix(strings.ToLower(raw), "http://") {
 		return ""
@@ -301,7 +254,7 @@ func (m *Manager) writeColimaDockerMirrors(mirrors []string) (string, error) {
 	return cfg, nil
 }
 
-// EnsureDockerMirrorsForRuntime 自动配置加速源（自建 NAS 优先 + 探通的公共源回落）。
+// EnsureDockerMirrorsForRuntime 自动配置加速源（自建镜像站优先 + 探通的公共源回落）。
 //
 // 在 `colima start` **之前**调用：写进去的列表会被这次 start 带进 VM 里的
 // daemon.json。探测有超时上限（4 秒），不会拖慢正常安装。
@@ -323,7 +276,7 @@ func (m *Manager) EnsureDockerMirrorsForRuntime(ctx context.Context, result *Ins
 			}
 		}
 	}
-	step(fmt.Sprintf("正在探测 Docker 加速源（共 %d 个，含自建 NAS 镜像，限时 %ds）…",
+	step(fmt.Sprintf("正在探测 Docker 加速源（共 %d 个，限时 %ds）…",
 		len(m.DockerMirrorCandidates()), m.mirrorProbeTimeout()/time.Second))
 	ordered, probes := m.preferredDockerMirrors(ctx)
 	for _, p := range probes {

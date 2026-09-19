@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# 发布 ZizPanel 到**公网源**（zizdog.com：安装源 + 面板在线升级源）与 **NAS 镜像**，并复验线上产物。
+# 发布 ZizPanel 到**公网源**（zizdog.com：安装源 + 面板在线升级源）与**你自己的镜像机**，并复验线上产物。
 #
 # 为什么做成脚本：这套流程每次发版都要跑，而它有两个反复踩过的坑（DEVELOPMENT.md 坑 149）：
-#   ① 两台主机的**目录布局不同**（公网 `download/<版本>/`、NAS 同布局但另有 latest 软链），
+#   ① 两台主机的**目录布局不同**（公网 `download/<版本>/`、镜像机同布局但另有 latest 软链），
 #      而清单里的 url **写死在签名覆盖的字节里** —— 一份清单只能对应一台主机；
-#   ② NAS 的 `download/latest/*` 是**软链**，用 `cp -f` 覆盖会 `not writing through dangling symlink`
+#   ② 镜像机的 `download/latest/*` 是**软链**，用 `cp -f` 覆盖会 `not writing through dangling symlink`
 #      并在 `set -e` 下把发布断在半路。
 # 所以这里把"构建 → 两份清单各签一次 → 分别上传 → 复验"固化，避免每次手工摸索。
 #
+# 地址由调用者提供，仓库里不留任何内网默认值。
 # 用法：
-#   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / NAS）
+#   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / 镜像机）
 #   ZIZDOG_VPS_PASS='...' bash tools/publish-release.sh push-zizdog
-#   bash tools/publish-release.sh push-nas      # 走 SSH 密钥（NAS 已配置密钥登录）
+#   NAS_HOST='<你的镜像机>' NAS_USER='<用户>' NAS_ROOT='<镜像目录>' \
+#     bash tools/publish-release.sh push-nas    # 走 SSH 密钥
 #   bash tools/publish-release.sh verify        # 复验公网：HTTP + sha256 + Ed25519 验签
 #
 # 口令来源：优先环境变量 ZIZDOG_VPS_PASS，其次 `.panel-credential.local`（gitignored）。
@@ -29,16 +31,17 @@ ZIZDOG_USER="${ZIZDOG_USER:-root}"
 ZIZDOG_ROOT="${ZIZDOG_ROOT:-/www/wwwroot/zizdog.com/zizpanel}"
 ZIZDOG_URL="${ZIZDOG_URL:-https://zizdog.com/zizpanel}"
 
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
-NAS_ROOT="${NAS_ROOT:-/vol2/zizpanel-mirror/zizpanel}"
-NAS_MIRROR_URL="${NAS_MIRROR_URL:-http://192.168.1.8:8090/zizpanel}"
+# 地址由调用者提供，仓库里不留任何内网默认值（push-nas 才需要 NAS_HOST/NAS_USER/NAS_ROOT）。
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
+NAS_ROOT="${NAS_ROOT:-}"
 NAS_PUBLIC_URL="${NAS_PUBLIC_URL:-https://mirror.zizdog.com:8888/zizpanel}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
 ok()   { printf '  ✓ %s\n' "$*"; }
 info() { printf '==> %s\n' "$*"; }
+warn() { printf '!! %s\n' "$*" >&2; }
 die()  { printf '!! %s\n' "$*" >&2; exit 1; }
 
 version() {
@@ -135,8 +138,8 @@ cmd_build() {
   cp "$RELDIR/manifest.json.sig" "$RELDIR/manifest-zizdog.json.sig"
   ok "公网清单已存为 manifest-zizdog.json（签名随之留存，避免被 NAS 版覆盖 —— 坑 149）"
 
-  info "生成 NAS 版清单（url 用 download/<版本>/ 布局）"
-  make mirror-nas || die "make mirror-nas 失败"
+  info "生成公网镜像版清单（url 用 download/<版本>/ 布局）"
+  make mirror-public || die "make mirror-public 失败"
   cp "$RELDIR/manifest.json" "$RELDIR/manifest-nas.json"
   cp "$RELDIR/manifest.json.sig" "$RELDIR/manifest-nas.json.sig"
   ls -lh "$RELDIR" | sed -n '1,20p'
@@ -176,10 +179,13 @@ cmd_push_zizdog() {
 cmd_push_nas() {
   local v; v="$(version)"
   [ -f "$RELDIR/manifest-nas.json" ] || die "先跑 build（缺 manifest-nas.json）"
+  : "${NAS_HOST:?请传 NAS_HOST=<你自己的镜像机>}"
+  : "${NAS_USER:?请传 NAS_USER=<镜像机用户>}"
+  : "${NAS_ROOT:?请传 NAS_ROOT=<镜像上的 zizpanel 目录>}"
   cp "$RELDIR/manifest-nas.json" "$RELDIR/manifest.json"
   cp "$RELDIR/manifest-nas.json.sig" "$RELDIR/manifest.json.sig"
 
-  info "同步到 NAS $NAS_USER@$NAS_HOST:$NAS_ROOT"
+  info "同步到镜像机 $NAS_USER@$NAS_HOST:$NAS_ROOT"
   rsync -az --no-perms --no-owner --no-group -e "ssh ${SSH_OPTS[*]}" \
     "$RELDIR/zizpanel_${v}_darwin_arm64.tar.gz" \
     "$RELDIR/zizpanel_${v}_darwin_amd64.tar.gz" \
@@ -198,7 +204,7 @@ cmd_push_nas() {
      ln -sfn download/$v/zizpanel_${v}_darwin_arm64.tar.gz zizpanel_${v}_darwin_arm64.tar.gz; \
      ln -sfn download/$v/zizpanel_${v}_darwin_amd64.tar.gz zizpanel_${v}_darwin_amd64.tar.gz; \
      ls -l download/$v" || die "NAS 布局失败"
-  ok "已同步（NAS 版清单 url 指向 $NAS_MIRROR_URL/download/$v/）"
+  ok "已同步（公网镜像版清单 url 指向 $NAS_PUBLIC_URL/download/$v/）"
 }
 
 # cmd_verify：三层复验 —— HTTP 可达、包 sha256 与清单一致、清单签名能用发布公钥验过。

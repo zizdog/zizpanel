@@ -15,7 +15,7 @@
 #    tools/market-audit.sh --only squoosh   # 只审一个（加新应用时用）
 #    tools/market-audit.sh --json           # 机器可读
 #    tools/market-audit.sh --fast           # 跳过"下载整包实算 sha256"
-#    tools/market-audit.sh --mirror http://192.168.1.8:8090
+#    tools/market-audit.sh --mirror https://<你自己的镜像机>
 #    tools/market-audit.sh --install -- https://127.0.0.1:8443 admin pass --only squoosh
 #                                           # 追加"真机安装验收"档（会真的装软件）
 #

@@ -200,7 +200,7 @@ type Manager struct {
 	//
 	// 第二个返回值 = 这次探测**真的成功了**（false = brew 不可用/超时）。
 	// 它必须能被表达出来：空集合 + ok=false 的含义是"**未复核**"，与"确实什么都没装"
-	// 完全不同 —— 混为一谈就会把全部 brew 应用谎报成"未安装"（2026-09-23 那一类）。
+	// 完全不同 —— 混为一谈就会把全部 brew 应用谎报成"未安装"（2026-09-18 那一类）。
 	brewInstalledProbe func(ctx context.Context) (map[string]string, bool)
 	// brewUsesProbe 仅供测试：替换 `brew uses --installed <formula>` 的探测。
 	// 返回 (依赖它的已装包, 这次查询是否真的成功)，后者决定计划里写"已检查"还是"未检查"。
@@ -310,13 +310,10 @@ type Options struct {
 	// 非空 = 镜像是**优先来源**：安装前先检查资源在不在，在就从镜像下、
 	// 缺件或不可达则回落到公网源（见 mirror.go）；空 = 关闭镜像（应急用）。
 	MirrorBase string
-	// MirrorBaseLAN 是同一个镜像站的局域网入口（来自 Config.MirrorBaseLAN）。
-	// 公网入口不可达/缺件时用它兜底 —— 见 mirrorBaseCandidates 的注释。
-	MirrorBaseLAN string
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，来自 Config.MirrorProbeSeconds）；
 	// <=0 按 4 秒处理。
 	MirrorProbeSeconds int
-	// OfflineOnly 为 true 时进入**仅走 NAS（离线）模式**（来自
+	// OfflineOnly 为 true 时进入**仅走镜像站（离线）模式**（来自
 	// Config.OfflineOnly）：各安装器必须先用 MirrorOfflineOnly(ctx) 判断，
 	// **禁止任何外网回落**，缺资源就明确失败。见 mirror.go 的说明。
 	OfflineOnly bool
@@ -391,7 +388,7 @@ func NewManager(repo *Repository, opt Options) *Manager {
 
 // SetBrewUsesProbeForTest 替换 `brew uses --installed <formula>` 的探测，返回值供测试恢复。
 //
-// 为什么必须是**导出**的（2026-09-21）：卸载计划现在会在市场列表里逐条查 brew 依赖
+// 为什么必须是**导出**的（2026-09-18）：卸载计划现在会在市场列表里逐条查 brew 依赖
 // （用户要求"卸载前把谁依赖它讲清楚"），而 web 层的单测通过 svcManager() 现造
 // Manager，够不到未导出的 brewUsesProbe 字段 —— 于是 `go test ./internal/web/`
 // 会真的去跑开发机的 /opt/homebrew/bin/brew uses，在开着 tap 自动更新的机器上

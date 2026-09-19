@@ -85,9 +85,8 @@ type STTOptions struct {
 	Root string
 	// Model 是当前档位（空 = 默认档）。
 	Model string
-	// MirrorBase / MirrorLAN 是面板设置里的镜像基址（下载模型时遵守它）。
+	// MirrorBase 是面板设置里的镜像基址（下载模型时遵守它）。
 	MirrorBase string
-	MirrorLAN  string
 	// Engine 覆盖引擎（测试注入；nil = 按上面的参数造一个）。
 	Engine *services.STTEngine
 	// SyncMaxSeconds <=0 用 services.STTSyncMaxSeconds。
@@ -393,7 +392,7 @@ func (s *STTServer) handleModelDownload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.cleanupExpired()
-	srcs := services.STTModelSourcesForServe(r.Context(), s.opt.MirrorBase, s.opt.MirrorLAN, model)
+	srcs := services.STTModelSourcesForServe(r.Context(), s.opt.MirrorBase, model)
 	dst := filepath.Join(sttModelsDir(s.opt.Root), model.File)
 	label := fmt.Sprintf("下载语音模型 %s（%s）", model.ID, humanSize(model.Bytes))
 	t := s.tasks.StartWithTask("stt_model_download", "stt", label,

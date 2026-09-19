@@ -145,13 +145,10 @@ func STTHealthURL() string {
 //
 // 镜像基址作为参数带进去：stt-serve 不读面板配置（刻意的），但下载模型时
 // 必须遵守面板的"镜像优先"设置，所以由 plist 把生效值传给它。
-func sttPlist(panelBin string, port int, brewPrefix, root, modelID, mirrorBase, mirrorLAN, user, outLog, errLog string) string {
+func sttPlist(panelBin string, port int, brewPrefix, root, modelID, mirrorBase, user, outLog, errLog string) string {
 	var mirrorArgs string
 	if strings.TrimSpace(mirrorBase) != "" {
 		mirrorArgs += "        <string>--mirror-base</string>\n        <string>" + xmlEscape(mirrorBase) + "</string>\n"
-	}
-	if strings.TrimSpace(mirrorLAN) != "" {
-		mirrorArgs += "        <string>--mirror-lan</string>\n        <string>" + xmlEscape(mirrorLAN) + "</string>\n"
 	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -210,7 +207,7 @@ type STTFetchFunc func(ctx context.Context, url, dest string, onProgress func(go
 // probe 用来判断"镜像上到底有没有这个文件"（面板侧是 m.checkMirrorURL，
 // stt-serve 侧是一个普通 HEAD）。probe 为 nil 时所有镜像候选都直接放进去，
 // 由下载环节自己去试 —— 那时也只是多一次失败重试，不会出错。
-func STTModelSourceList(ctx context.Context, mirrorBase, mirrorLAN string, m0 STTModel,
+func STTModelSourceList(ctx context.Context, mirrorBase string, m0 STTModel,
 	probe func(ctx context.Context, url string) error) []STTModelSource {
 
 	var out []STTModelSource
@@ -223,22 +220,16 @@ func STTModelSourceList(ctx context.Context, mirrorBase, mirrorLAN string, m0 ST
 		seen[s.URL] = true
 		out = append(out, s)
 	}
-	for _, base := range []struct{ name, base string }{
-		{"自建镜像", strings.TrimRight(strings.TrimSpace(mirrorBase), "/")},
-		{"自建镜像（局域网）", strings.TrimRight(strings.TrimSpace(mirrorLAN), "/")},
-	} {
-		if base.base == "" {
-			continue
-		}
+	if base := strings.TrimRight(strings.TrimSpace(mirrorBase), "/"); base != "" {
 		// ① 静态模型目录（与 iopaint 的 models/<app>/<file> 同一套布局）。
-		staticURL := base.base + "/models/whisper/" + m0.File
+		staticURL := base + "/models/whisper/" + m0.File
 		if probe == nil || probe(ctx, staticURL) == nil {
-			add(STTModelSource{Name: base.name + "（静态模型）", URL: staticURL, Mirror: true})
+			add(STTModelSource{Name: "自建镜像（静态模型）", URL: staticURL, Mirror: true})
 		}
 		// ② HF 按需缓存代理。
-		hfURL := base.base + "/hf/" + hfPath
+		hfURL := base + "/hf/" + hfPath
 		if probe == nil || probe(ctx, hfURL) == nil {
-			add(STTModelSource{Name: base.name + "（HF 缓存）", URL: hfURL, Mirror: true})
+			add(STTModelSource{Name: "自建镜像（HF 缓存）", URL: hfURL, Mirror: true})
 		}
 	}
 	add(STTModelSource{Name: "hf-mirror.com（国内公共镜像）", URL: sttHFMirror + "/" + hfPath})
@@ -249,9 +240,9 @@ func STTModelSourceList(ctx context.Context, mirrorBase, mirrorLAN string, m0 ST
 // STTModelSourcesForManager 是面板侧（带设置）的候选列表。
 func (m *Manager) STTModelSourcesForManager(ctx context.Context, result *InstallResult, m0 STTModel) []STTModelSource {
 	if !m.MirrorEnabled() {
-		return STTModelSourceList(ctx, "", "", m0, nil)
+		return STTModelSourceList(ctx, "", m0, nil)
 	}
-	return STTModelSourceList(ctx, m.mirrorBase(), m.mirrorBaseLAN(), m0, m.checkMirrorURL)
+	return STTModelSourceList(ctx, m.mirrorBase(), m0, m.checkMirrorURL)
 }
 
 // STTDownloadResult 是一次模型下载的结果。
@@ -371,11 +362,11 @@ func (m *Manager) DownloadSTTModel(ctx context.Context, modelID string, result *
 		}
 		_ = os.Remove(dst)
 	}
-	// 离线模式（仅走 NAS）：缺件必须明确失败，绝不偷偷出网。
+	// 离线模式（仅走镜像站）：缺件必须明确失败，绝不偷偷出网。
 	if m.MirrorOfflineOnly(ctx) {
 		if err := m.MirrorOfflinePreflight(ctx, "whisper 模型 "+want.File,
 			m.mirrorSubPath("models")+"/whisper/"+want.File); err != nil {
-			// 静态目录没有时，退一步看 HF 代理上有没有（那也算"仅走 NAS"）。
+			// 静态目录没有时，退一步看 HF 代理上有没有（那也算"仅走镜像站"）。
 			if err2 := m.MirrorOfflinePreflight(ctx, "whisper 模型 "+want.File,
 				m.mirrorSubPath("hf")+"/"+sttHFRepo+"/resolve/main/"+want.File); err2 != nil {
 				return nil, err
@@ -627,7 +618,7 @@ func (m *Manager) installSTTService(ctx context.Context, app App, result *Instal
 		_ = chownTree(m.opt.UserName, p.Root)
 	}
 	plist := sttPlist(panelBin, port, m.brewPrefix(), p.Root, sttCurrentModel(p.Root),
-		m.mirrorBase(), m.mirrorBaseLAN(), m.opt.UserName, p.OutLog, p.ErrLog)
+		m.mirrorBase(), m.opt.UserName, p.OutLog, p.ErrLog)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("写入 plist %s 失败（面板需要以 root 运行）：%w", p.Plist, err)
 	}
@@ -845,8 +836,8 @@ func STTProbeMirrorFile(ctx context.Context, url string) error {
 }
 
 // STTModelSourcesForServe 是 stt-serve 侧的候选列表（镜像基址由 plist 参数传进来）。
-func STTModelSourcesForServe(ctx context.Context, mirrorBase, mirrorLAN string, m0 STTModel) []STTModelSource {
-	return STTModelSourceList(ctx, mirrorBase, mirrorLAN, m0, STTProbeMirrorFile)
+func STTModelSourcesForServe(ctx context.Context, mirrorBase string, m0 STTModel) []STTModelSource {
+	return STTModelSourceList(ctx, mirrorBase, m0, STTProbeMirrorFile)
 }
 
 // STTDefaultFetch 是模型下载的生产实现（导出给 stt-serve 用）。

@@ -122,7 +122,7 @@ func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 	staged, stagedVersion := s.stagedInfo()
 
 	// plain_http 用"最近实际用过的源"判断，没有过成功记录时退回配置值。
-	// 局域网 NAS 是 http 私有地址，不该被当成"明文公网"来吓唬用户。
+	// 用户自建的 http 镜像（内网私有地址）不该被当成"明文公网"来吓唬用户。
 	plainHTTP := upgrade.IsPlainHTTPToPublicHost(s.Cfg.UpgradeSource)
 	if strings.TrimSpace(s.Cfg.UpgradeSource) == "" {
 		plainHTTP = upgrade.IsPlainHTTPToPublicHost(st.SourceBase)
@@ -142,9 +142,9 @@ func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 		// 设置页的输入框读的就是它，所以语义必须保持"用户填过的值"。
 		"source": s.Cfg.UpgradeSource,
 		// effective_source 是**最近一次探测实际命中的源**（见 State.SourceBase）：
-		// 候选顺序是动态的（同网段先走 NAS），前端/CLI 靠它才能知道真实用了哪个。
+		// 候选顺序是动态的（用户显式源 → 公网主源 → 备用镜像 → GitHub），前端/CLI 靠它才能知道真实用了哪个。
 		"effective_source": st.SourceBase,
-		// candidates 是当前机器上的候选顺序（含是否插入 NAS），供排障展示。
+		// candidates 是当前机器上的候选顺序，供排障展示。
 		"candidates": upgrade.CandidateSources(s.Cfg.UpgradeSource),
 		// 能不能从网络升级
 		"can_remote": upgrade.HasPublicKey(),
@@ -190,7 +190,7 @@ type upgradeCheckReq struct {
 //     upgrade.CandidateSources 按优先级依次试。
 //
 // 关键：没有显式传源时**绝不写回配置**。若把候选/默认源存进去，每台机器
-// 就被钉死在一个源上，同网段的 NAS 快通道再也排不到前面（见 upgrade/source.go）。
+// 就被钉死在一个源上，后面的公网候选再也排不到前面（见 upgrade/source.go）。
 func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 	var req upgradeCheckReq
 	if r.ContentLength > 0 {
@@ -242,7 +242,7 @@ func (s *Server) handleUpgradeCheck(w http.ResponseWriter, r *http.Request) {
 	_ = s.Cfg.Save()
 
 	// 记录"这次实际命中了哪个源"。候选是动态排序的，不落盘的话
-	// 刷新一次页面就再也说不清刚才到底走的 NAS 还是公网。
+	// 刷新一次页面就再也说不清刚才到底走的镜像站还是公网。
 	st := upgrade.LoadState(s.Cfg.WorkDir)
 	st.SourceBase = usedBase
 	_ = upgrade.SaveState(s.Cfg.WorkDir, st)
@@ -382,18 +382,8 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 
 	tarPath := filepath.Join(s.Cfg.WorkDir, "upgrade", "download",
 		fmt.Sprintf("zizpanel_%s_%s.tar.gz", m.Version, upgrade.AssetKey(runtime.GOOS, runtime.GOARCH)))
-	// 局域网抓包：清单来自权威源（保证"有没有更新"判断正确），但**包**优先从 NAS 取 ——
-	// 实测快两个数量级（92 MB/s vs ～0.5 MB/s）。DownloadTarball 会按清单里的 SHA-256 校验，
-	// NAS 上是旧包/坏包时校验必然失败 → 自动回落到清单里的原始地址。
 	tryURLs := []string{ref.URL}
-	if upgrade.OnNASSubnet() {
-		if lan := upgrade.LANAssetURL(ref.URL); lan != "" {
-			tryURLs = append([]string{lan}, tryURLs...)
-			st.Stage = fmt.Sprintf("正在下载 v%s 安装包（优先局域网镜像）", m.Version)
-			sw.Log("info", "检测到同网段 NAS，优先尝试局域网镜像 "+lan)
-		}
-	}
-	// 下载进度写进 state（节流 700ms 一次）：用户 2026-09-20 要求"升级过程要有详细的
+	// 下载进度写进 state（节流 700ms 一次）：用户要求"升级过程要有详细的
 	// 内容展示"，而升级下载是这一步里唯一耗时的地方 —— 只有写了进度，界面上才看得到
 	// "已下载 12.3 MB / 24.4 MB（50%）"，而不是一句静止的"正在下载"。
 	//
@@ -432,10 +422,6 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 			// 换源重试必须把进度归零，否则下一段下载的百分比会从上一段的
 			// 字节数接着涨，看起来像"秒下完了"。
 			sw.StartDownload(ref.Size)
-			if len(tryURLs) > 1 {
-				st.Stage = fmt.Sprintf("局域网镜像那份没通过校验或不可达（%v），回落到原地址", err)
-				sw.Log("info", st.Stage)
-			}
 		}
 	}
 	if lastErr != nil {
@@ -515,7 +501,7 @@ func (s *Server) stageFailed(st *upgrade.State, msg string) {
 //
 // 这一步是"早失败"的关键：在**换掉任何东西之前**就确认包是好的。
 //
-// 2026-09-23 起这里真的会**运行**新版二进制读版本号（此前注释这么写、代码却没做，
+// 2026-09-19 起这里真的会**运行**新版二进制读版本号（此前注释这么写、代码却没做，
 // 界面上那个"试运行"阶段因此是空转）。同时把"解包 / 试运行 / 完成"三个真实阶段
 // 与日志写进 State，用户才能看到"卡在哪一步"。
 func (s *Server) stageFromTarball(ctx context.Context, tarPath string, st *upgrade.State, sw *upgrade.StateWriter) error {

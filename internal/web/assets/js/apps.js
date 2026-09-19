@@ -258,7 +258,7 @@ export function AppsView(content, ctx = {}) {
     // 后端这次**没能复核**「本机装了哪些 Homebrew 包」（brew_probe_ok=false）时，
     // 如实说出来：列表里那些「安装」只代表"没查成"，不代表东西真的没装
     //（铁律 11：不许把"不知道"显示成"没有"）。没有这条提示，一次 brew 超时
-    // 就会让用户以为自己的软件全被卸了 —— 那正是 2026-09-23 那一类报障。
+    // 就会让用户以为自己的软件全被卸了 —— 那正是那一类报障。
     if (cache && cache.brew_probe_ok === false) {
       const why = String(cache.brew_probe_error || '').trim();
       tabBar.appendChild(h('span.pill.warn', {
@@ -414,7 +414,7 @@ export function AppsView(content, ctx = {}) {
       // 原来的「⚙️ 服务管理」按钮已删：那一页就是本页的「已安装」Tab，
       // 页内 Tab 已经给了入口，再放一颗按钮只会让人以为是两个页面。
       // 子路径入口有两段：面板自己反代（自动生效）+ nginx 的 80 端口（要写配置）。
-      // 这个按钮管第二段 —— 用户要的 `http://192.168.1.4/iopaint/` 就是它。
+      // 这个按钮管第二段 —— 用户要的 `http://<本机 IP>/iopaint/` 就是它。
       proxyState && proxyState.enabled
         ? h('button.btn.btn-sm', {
           text: '🔍 检测可用性',
@@ -436,7 +436,7 @@ export function AppsView(content, ctx = {}) {
   //
   // 用户 2026-09-17 的原始要求（"一，关于 docker 应用"）：docker 容器不该放在
   // 应用中心、不该写得那么"重"；这里只列出**面板建议的项目**，不添加任何功能，
-  // 就是纯卡片展示。这些推荐项目在 NAS 镜像里提供现成内容供拉取，compose 里给出
+  // 就是纯卡片展示。这些推荐项目在镜像站里提供现成内容供拉取，compose 里给出
   // **预配置文件**供用户参考，用户简单编辑后即可自己运行 —— 所以这个 Tab 里
   // **没有任何安装/部署/启停按钮**（"但不提供安装"）。
   function renderDockerTab() {
@@ -779,7 +779,7 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
-  // adoptApp（把本机已有的服务接进面板）的用户入口在 2026-09-21 之后只剩一处：
+  // adoptApp（把本机已有的服务接进面板）的用户入口在之后只剩一处：
   // 这类应用（目录里有 adopt_label 的，例如 Ollama 的官方二进制安装）在卡片上
   // 显示「添加到面板」，点了走下面的 preflight → doInstall → 后端 POST
   // /api/v1/market/install（后端对 AdoptLabel 非空的应用走 AdoptApp，不重新安装、
@@ -885,7 +885,7 @@ export function AppsView(content, ctx = {}) {
   //   · 「重装 / 卸载 / 文档」全部收进「⚙️ 管理」面板（servicePanel.js 的
   //     reinstallButton / marketUninstallButton / docLink），卡片上不再出现。
   //
-  // 2026-09-21 用户："弱化管纳这个概念 … 只要知道自己可以在应用里执行安装、
+  // 用户："弱化管纳这个概念 … 只要知道自己可以在应用里执行安装、
   // 卸载、重装这些动作就可以了。" 所以：
   //   · adopt_label 非空（后端会走 AdoptApp，只登记已存在的服务）时，按钮文案
   //     写成用户能懂的「添加到面板」，而不是「安装」或「纳管」；
@@ -976,7 +976,7 @@ export function AppsView(content, ctx = {}) {
           })
           : (a.adopted
             // 面板里有这条记录（内部叫"纳管"）。对用户来说就是**已安装**：
-            // 不再单给一个"已纳管"pill（那个词是内部概念，用户 2026-09-21 要求弱化）。
+            // 不再单给一个"已纳管"pill（那个词是内部概念，用户要求弱化）。
             // 用户能做什么由卡片上的按钮给（启停 / 重启 / ⚙️ 管理），不需要看懂记录来源。
             ? h('span.pill.ok', {
               text: '已安装',
@@ -1215,7 +1215,7 @@ export function AppsView(content, ctx = {}) {
   // doForget（只删除面板记录）已删除（2026-09-17）：卡片上不再直接给那颗按钮，
   // 它住在「⚙️ 管理」面板里（servicePanel.js 的 forgetButton，按 s.managed===false
   // 决定出现），实现只有那一份。卡片上唯一保留的残留态动作是「删除残留数据」。
-  // 2026-09-21 起它的文案是「从列表移除（不卸载软件）」，不再出现"纳管"。
+  // 2026-09-18 起它的文案是「从列表移除（不卸载软件）」，不再出现"纳管"。
 
   // openInstaller 按应用打开对应的部署对话框。
   //
@@ -1248,7 +1248,7 @@ export function AppsView(content, ctx = {}) {
   // ---------- 安装前检查 ----------
   //
   // adopt = 目录里声明了 adopt_label（后端对这类应用走 AdoptApp：只把本机**已经
-  // 存在**的服务登记进面板，不重新安装、不动用户的软件）。用户 2026-09-21 要求
+  // 存在**的服务登记进面板，不重新安装、不动用户的软件）。用户要求
   // 弱化"纳管"这个概念，所以这类应用在这里一律说「添加到面板」，
   // 不说"安装"（它没装任何东西）也不说"纳管"（内部词）。
   async function preflight(a) {

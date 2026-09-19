@@ -66,7 +66,7 @@ type State struct {
 	Source string `json:"source,omitempty"` // remote / upload
 	// SourceBase 记录最近一次探测**实际命中**的升级源地址。
 	//
-	// 为什么必须落盘：候选顺序是动态的（同网段会先走 NAS，见 source.go），
+	// 为什么必须落盘：候选顺序是动态的（用户显式源 → 公网主源 → 备用镜像 → GitHub，见 source.go），
 	// 用户/前端/CLI 需要知道这次到底用了哪个源，否则排障时只能猜；
 	// 而检查更新会跨面板重启，内存里存不住。空串 = 还没成功探测过。
 	SourceBase string    `json:"source_base,omitempty"`

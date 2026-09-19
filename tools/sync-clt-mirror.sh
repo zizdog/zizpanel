@@ -19,11 +19,11 @@
 #      NAS_PASS='...' bash tools/sync-clt-mirror.sh --product 072-44426-A
 #      bash tools/sync-clt-mirror.sh --local-dest DIR --source-dir DIR   # 沙箱自测
 #
-#  环境变量：
-#      NAS_HOST / NAS_USER / NAS_PASS / NAS_CLT_ROOT
+#  环境变量（地址由调用者提供，仓库里不留任何内网默认值）：
+#      NAS_HOST / NAS_USER / NAS_PASS / NAS_CLT_ROOT   （非沙箱模式必须显式提供）
 #      SOURCE_BASE   （默认 https://zizdog.com/zizpanel，CLT 载荷的现存来源）
 #      SOURCE_DIR    （沙箱：把本地目录当源，完全不碰网络）
-#      MIRROR_CLT_URL（验收基址，默认 http://192.168.1.8:8090/zizpanel/clt）
+#      MIRROR_CLT_URL（验收基址，必须显式提供，如 https://mirror.example.com/zizpanel/clt）
 #      WORK_DIR      （本地缓存；默认 $TMPDIR/zizpanel-clt-sync）
 #
 #  ⚠️ 口令只从环境变量进、只交给 sshpass，绝不写进任何文件、也不打印。
@@ -55,16 +55,14 @@
 # ============================================================================
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
 NAS_PASS="${NAS_PASS:-}"
-NAS_CLT_ROOT="${NAS_CLT_ROOT:-/vol2/zizpanel-mirror/zizpanel/clt}"
+NAS_CLT_ROOT="${NAS_CLT_ROOT:-}"
 
 SOURCE_BASE="${SOURCE_BASE:-https://zizdog.com/zizpanel}"
 SOURCE_DIR="${SOURCE_DIR:-}"
-MIRROR_CLT_URL="${MIRROR_CLT_URL:-http://192.168.1.8:8090/zizpanel/clt}"
+MIRROR_CLT_URL="${MIRROR_CLT_URL:-}"
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}/zizpanel-clt-sync}"
 
 PRODUCT=""
@@ -104,6 +102,15 @@ MIRROR_CLT_URL="${MIRROR_CLT_URL%/}"
 [ -n "$LOCAL_DEST" ] && LOCAL_DEST="${LOCAL_DEST%/}"
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3（用于清单解析/生成）"
+
+# 地址由调用者提供：仓库里不留任何内网默认值。
+# 沙箱模式（--local-dest + --source-dir）完全不碰网络/ssh，不需要这些。
+if [ -z "$LOCAL_DEST" ]; then
+  [ -n "$NAS_HOST" ] || die "请传 NAS_HOST=<你自己的镜像机>（沙箱模式用 --local-dest 时不需）"
+  [ -n "$NAS_USER" ] || die "请传 NAS_USER=<镜像机用户>"
+  [ -n "$NAS_CLT_ROOT" ] || die "请传 NAS_CLT_ROOT=<镜像上的 clt 目录>（或用 --dest）"
+  [ -n "$MIRROR_CLT_URL" ] || die "请传 MIRROR_CLT_URL=<镜像的 clt 验收基址>（或用 --mirror-url）"
+fi
 
 if [ "$CLEAN" = "1" ]; then
   echo "==> 清理本地缓存 $WORK_DIR"

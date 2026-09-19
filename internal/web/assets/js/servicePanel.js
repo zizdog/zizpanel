@@ -10,7 +10,7 @@ import {
   configFileModal, credentialsModal, openLogs, healthHint, loginCredsOf, appWidgets,
 } from './services.js';
 // 「上传与执行上限」的渲染实现只有 views.js 的 renderLimitsInto 一份；
-// 2026-09-22 起它与 nginx 四页 / 配置文件 / PHP 环境一起挂在「⚙️ 调整配置」弹窗里。
+// 2026-09-19 起它与 nginx 四页 / 配置文件 / PHP 环境一起挂在「⚙️ 调整配置」弹窗里。
 import { adjustConfigModal } from './nginxpanel.js';
 
 // PANEL_QUERY_TIMEOUT_MS 是面板首屏查询的**硬上限**。
@@ -458,7 +458,7 @@ function raceDeadline(p, ms, label) {
 }
 
 // statusLine 把服务状态翻译成"一眼能看懂"的一行。
-// ⚠️ 铁律（2026-09-21 用户点名）：**只有真的有服务记录/launchd 作业且它报 stopped 时才许写「已停止」**；
+// ⚠️ 铁律（用户点名）：**只有真的有服务记录/launchd 作业且它报 stopped 时才许写「已停止」**；
 // no_daemon 与"装了但无记录"的应用都**不是**"已停止"。st 为空不是"还在读"，而是"根本没有服务记录"。
 export function statusLine(st, m, s = null) {
   if (st) {
@@ -777,7 +777,7 @@ export async function openServicePanel(o = {}) {
       const rt = runtimeDownOf(s);
       const pk = (mi && mi.uninstall && mi.uninstall.kind) || '';
       if (pk === 'brew' || pk === 'installer' || pk === 'service') {
-        // 计划说得清"怎么真卸载" → 收尾只有这一颗主动作。2026-09-21 用户要求不要再并排
+        // 计划说得清"怎么真卸载" → 收尾只有这一颗主动作。用户要求不要再并排
         // 摆一颗"只删记录"（"移除却不卸载是什么意思 …… 让用户看不到却持续运行"）。
         out.push(marketUninstallButton(mi, afterAction, s));
       } else if (s.managed) {
@@ -828,7 +828,7 @@ export async function openServicePanel(o = {}) {
         h('div', { style: { fontWeight: '620', fontSize: '14px', marginRight: '4px' }, text: displayName }),
         pill(line.cls, line.text, line.title),
         ((s && s.port) || (mi && mi.port)) > 0 ? pill('', ':' + ((s && s.port) || mi.port)) : null,
-        // 「面板托管 / 仅纳管」pill 已删除（用户 2026-09-21："弱化管纳这个概念"）；不能换成
+        // 「面板托管 / 仅纳管」pill 已删除（用户："弱化管纳这个概念"）；不能换成
         // "由面板安装/本机已有" —— managed=false 并不等于"软件是用户装的"，照记录写就是说假话。
         // 「面板里没有服务记录」只对"本该有服务却查不到"的应用说，no_daemon 报这句是误导。
         (!s && mi && (mi.installed || mi.adopted) && !mi.no_daemon)
@@ -976,7 +976,7 @@ function recordOnlyModal(opts) {
   });
 }
 
-// forgetButton 「从面板移除该服务」：面板不认识这条服务时的唯一收尾动作（用户 2026-09-21：
+// forgetButton 「从面板移除该服务」：面板不认识这条服务时的唯一收尾动作（用户：
 // "让用户看不到却持续运行"）。目录里的应用**不再**出现它；只删记录也**必须先停服务**（会 409 拒绝）。
 export function forgetButton(m, onDone, opts = {}) {
   const name = serviceNameOf(m);
@@ -1132,7 +1132,7 @@ export function confirmUninstallPlan({ name, plan = {}, residual = false, forceD
   });
 }
 
-// dependentsModal 是"还有东西在用它"的说明对话框（用户 2026-09-21：不要只弹一句 toast，要逐条列出
+// dependentsModal 是"还有东西在用它"的说明对话框（用户：不要只弹一句 toast，要逐条列出
 // "谁在用它、该怎么办"并给可处理的入口：站点 → 网站管理切版本；应用/容器 → 去「应用」；Homebrew
 // 包依赖 → 额外给「强制卸载」）。onForce 非空 = 允许强制，forceText 逐字写清会破坏哪些包。
 function dependentsModal({ name, plan, onDone, onForce = null, forceText = '' }) {

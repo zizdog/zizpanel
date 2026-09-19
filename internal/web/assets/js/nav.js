@@ -144,7 +144,7 @@ async function pickUploadedIcon(iconInput, what = '图标') {
 
 // NAV_APPEARANCE_CSS —— 面板内导航页**只保留卡片尺寸**的样式。
 //
-// 2026-09-24 用户要求：背景图 / 主题背景**只用于独立页 /nav/**，
+// 用户要求：背景图 / 主题背景**只用于独立页 /nav/**，
 // 面板内 #/nav 的观感必须与面板一致（不铺背景）。
 // 所以原来那套"毛玻璃 + 渐变 + 漂移光晕"的运行时样式整体删掉：
 // 面板内直接吃 app.css 里既有的 .zp-nav-* 规则 —— 那是面板自己的色板，
@@ -200,7 +200,7 @@ export function NavView(content, ctx = {}) {
 
   const toolbar = h('div.zp-nav-toolbar');
   const body = h('div', { id: 'zp-nav-body' });
-  // 面板内**不再有背景层/光晕层**（2026-09-24 用户要求：不铺背景，观感与面板一致）。
+  // 面板内**不再有背景层/光晕层**（用户要求：不铺背景，观感与面板一致）。
   // 背景图与色系渐变只在独立页 /nav/（assets/nav/）里渲染。
   const shell = h('div.zp-nav-shell', { dataset: { testid: 'nav-shell' } }, [toolbar, body]);
   content.append(shell);
@@ -287,7 +287,7 @@ export function NavView(content, ctx = {}) {
 
   // applyAppearance 把外观应用到导航页容器（标题/副标题在 renderToolbar 里走 DOM）。
   //
-  // 2026-09-24：面板内**只应用卡片尺寸与自定义主题色** —— 背景图 / 色系渐变 /
+  // 2026-09-19：面板内**只应用卡片尺寸与自定义主题色** —— 背景图 / 色系渐变 /
   // 漂移光晕 / 外观模式都**只作用于独立页 /nav/**（用户明确要求面板内不铺背景、
   // 观感与面板一致）。设置本身仍然保存到服务端，独立页读的是同一份。
   // 因此这里不再设置 data-nav-mode，也不再画任何背景图层。

@@ -197,7 +197,7 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 // （见 uninstall_app.go 的 ResolveBrewFormula）。两者是同一条 `brew list --versions`
 // 的两种投影，分开查会白付一次 brew 启动成本。
 //
-// ⚠️ **必须把"探测失败"与"什么都没装"分开**（2026-09-23 那一类缺陷的根因之一）：
+// ⚠️ **必须把"探测失败"与"什么都没装"分开**（2026-09-18 那一类缺陷的根因之一）：
 // 过去失败时返回空集合，市场列表就把它当成"这台机器上一个 brew 包都没有"，
 // 于是所有只靠 brew 证据的条目（纯 CLI 应用）一起显示「安装」—— 用户眼里
 // 就是"装了却显示未装"。正确的含义是"**未复核**"，调用方要如实降级。
@@ -303,7 +303,7 @@ func (m *Manager) brewRun(ctx context.Context, timeout time.Duration, args ...st
 //
 // 为什么不复用 brewRun：brewRun 会把输出截断到 500 字符再塞进 error，
 // 而"瓶校验失败 / 下到的是 0 字节文件"的判据出现在输出中后段，截断后就判断不出来
-// —— 那恰恰是 2026-09-20 python@3.11 事故里唯一该换源的信号。
+// —— 那恰恰是 2026-09-18 python@3.11 事故里唯一该换源的信号。
 func (m *Manager) brewRunSource(ctx context.Context, timeout time.Duration, src brewInstallSource, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -378,7 +378,7 @@ func envWithout(env []string, keys []string) []string {
 // ============================================================================
 //  失败即换源（brew install 的兜底）
 //
-//  2026-09-20 真机事故：面板在装 Qwen3 TTS 时执行 `brew install python@3.11`
+//  真机事故：面板在装 Qwen3 TTS 时执行 `brew install python@3.11`
 //  失败，报
 //      Error: Bottle reports different checksum:   a5dd571f…
 //      SHA-256 checksum of downloaded file: e3b0c442…
@@ -415,7 +415,7 @@ type brewInstallSource struct {
 // 自动更新会在每次 brew 命令前拉一遍仓库元数据（国内很慢，面板自己管安装）；
 // NO_INSTALL_CLEANUP 防止 brew 在我们想保留旧版本时自行清理。
 //
-// NO_AUTOREMOVE（2026-09-21 用户真机）：`brew uninstall php` 结束时会顺手
+// NO_AUTOREMOVE（用户真机）：`brew uninstall php` 结束时会顺手
 // `Autoremoving 2 unneeded formulae: net-snmp rtmpdump` —— 用户只是卸载 PHP，
 // 面板却把两个**跟他这次操作无关**的包一起删了。所以所有 brew 命令（尤其
 // uninstall）都必须带上它：卸载只删用户点名的那一个包。
@@ -441,16 +441,16 @@ const brewTUNABase = "https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
 //     API 也回落 formulae.brew.sh。这是 python@3.11 这类"国内镜像全都没有"的
 //     瓶的唯一出路，也是本次事故的根因修复点。
 //
-// 离线模式（仅走 NAS）下**只保留第 1 条**：项目硬规则是离线模式禁止任何外网回落
+// 离线模式（仅走镜像站）下**只保留第 1 条**：项目硬规则是离线模式禁止任何外网回落
 // （见 Options.OfflineOnly），宁可明确失败也不能偷偷出网。
 func (m *Manager) brewInstallSources(ctx context.Context, formula string) []brewInstallSource {
 	curEnv := m.brewEnv(ctx, formula)
 	curHasMirror := brewEnvValue(curEnv, "HOMEBREW_BOTTLE_DOMAIN") != "" ||
 		brewEnvValue(curEnv, "HOMEBREW_API_DOMAIN") != ""
 
-	// 离线模式（仅走 NAS）：只允许那一个源，绝不回落公网。
+	// 离线模式（仅走镜像站）：只允许那一个源，绝不回落公网。
 	//
-	// 2026-09-20 补的诚实性要求：如果**连自建镜像都没探到**，这里不能返回"官方源"
+	// 补的诚实性要求：如果**连自建镜像都没探到**，这里不能返回"官方源"
 	// 那一条（brewEnv 此时是空的 = brew 走官方默认），那等于"离线模式偷偷出网"。
 	// 返回空列表，让 brewInstall 明确报"离线模式下没有可用镜像"。
 	if m.opt.OfflineOnly {
@@ -463,7 +463,7 @@ func (m *Manager) brewInstallSources(ctx context.Context, formula string) []brew
 	srcs := make([]brewInstallSource, 0, 3)
 	// 第 1 条只在**真的探到镜像**时才排。探不到时它其实就是官方源，
 	// 排在第一位意味着"先花几分钟撞官方源、再回头试国内镜像" —— 与
-	// "国内镜像优先、官方兜底"正好相反（2026-09-20 修）。
+	// "国内镜像优先、官方兜底"正好相反（2026-09-18 修）。
 	if curHasMirror {
 		srcs = append(srcs, brewInstallSource{Name: m.brewSourceName(curEnv), Env: curEnv})
 	}
@@ -641,8 +641,8 @@ func (m *Manager) brewInstall(ctx context.Context, res *InstallResult, timeout t
 	detail := strings.Join(failures, "\n  ")
 	if m.opt.OfflineOnly {
 		return lastText, fmt.Errorf(
-			"安装 %s 失败：离线模式（仅走 NAS 镜像）下不允许回落公网/官方源，因此只试了 1 个源。\n  %s\n"+
-				"请确认 NAS 镜像已同步该瓶，或关闭「仅走 NAS（离线）」后重试。",
+			"安装 %s 失败：离线模式（仅走镜像站）下不允许回落公网/官方源，因此只试了 1 个源。\n  %s\n"+
+				"请确认镜像站已同步该瓶，或关闭「仅走镜像站（离线）」后重试。",
 			formulaList, detail)
 	}
 	return lastText, fmt.Errorf(
@@ -904,10 +904,10 @@ func brewMirrorWorks(ctx context.Context, base, formula string) bool {
 // bottleTagsForArch 返回**本机架构**可能用到的 Homebrew 瓶 tag，按新到旧排列。
 //
 // 探测时必须拿它去清单里找**真实存在**的瓶 —— 不能硬编码 sha256：
-// 之前那个常量是编的，HEAD 永远 404，导致 NAS/镜像分支永不成立、
-// 静默回落 ghcr.io（用户"装了 21 分钟"的真因，2026-09-16 NAS 侧实测确认）。
+// 之前那个常量是编的，HEAD 永远 404，导致镜像站/镜像分支永不成立、
+// 静默回落 ghcr.io（用户"装了 21 分钟"的真因，2026-09-16 镜像站侧实测确认）。
 //
-// 为什么必须按架构分（2026-09-20 实测补的）：arm64 的 tag 在 Intel 机器上永远
+// 为什么必须按架构分（2026-09-18 实测补的）：arm64 的 tag 在 Intel 机器上永远
 // 匹配不到，于是**所有镜像都会被判为不可用**、静默回落 ghcr.io —— 而 Intel 机器
 // 恰恰最依赖国内镜像（官方源更慢）。Intel 侧只有 sonoma / ventura / monterey；
 // 上游已经删掉 ventura（实测 python@3.10/3.11/3.12/3.13 都没有 ventura 瓶），
@@ -921,7 +921,7 @@ func bottleTagsForArch() []string {
 
 // brewBottleFilename 拼出 brew 7 在**自定义 HOMEBREW_BOTTLE_DOMAIN** 下真正请求的平铺文件名。
 //
-// 为什么必须完全照抄 brew 的规则（2026-09-20 读了 Homebrew 7.0.3 的
+// 为什么必须完全照抄 brew 的规则（2026-09-18 读了 Homebrew 7.0.3 的
 // utils/bottles.rb + bottle.rb 才确认，之前面板的候选是错的）：
 //
 //	· brew 只在清单的 root_url 形如 https://ghcr.io/v2/… 时才走 OCI 路径
@@ -950,7 +950,7 @@ func brewOCIPath(formula, sha string) string {
 
 // brewRemoteNonEmpty 确认一个瓶 URL **真的有内容**（不是 200 + 0 字节）。
 //
-// 为什么单看状态码不够（2026-09-20 实测）：中科大镜像在 **IPv4** 上对所有 bottle
+// 为什么单看状态码不够（2026-09-18 实测）：中科大镜像在 **IPv4** 上对所有 bottle
 // 返回 `200` + **0 字节 body**（IPv6 正常，同一时刻同一 URL）。于是"只看 200"的
 // 探测会在只有 IPv4 的机器/网络上把中科大选为可用源，随后 brew 拿到空文件、
 // 校验失败 —— 正是 2026-09-18 python@3.11 事故的表象。判据必须看内容：
@@ -1044,7 +1044,7 @@ func brewMirrorSupportsOCIFor(ctx context.Context, base, formula string) bool {
 		fname := brewBottleFilename(formula, man.Versions.Stable, tag, man.Bottle.Stable.Rebuild)
 		cands := []string{
 			base + "/" + fname,
-			// 有的镜像/服务端把 `@` 原样保留而不是 %40，两种都试一次（NAS 实测两种都通）。
+			// 有的镜像/服务端把 `@` 原样保留而不是 %40，两种都试一次（镜像站实测两种都通）。
 			base + "/" + strings.ReplaceAll(fname, "%40", "@"),
 			base + brewOCIPath(formula, f.SHA256),
 		}
@@ -1062,7 +1062,7 @@ func brewMirrorSupportsOCIFor(ctx context.Context, base, formula string) bool {
 // 抽成独立方法是为了**可测试**：默认实现会发真实网络请求，而单测不该碰真实服务
 // （AGENTS.md 第三节）。测试通过 m.mirrorProbeOverride 注入一个假实现。
 //
-// 优先级：自建 NAS 镜像（<mirror>/brew）→ 公共镜像按序探测 → 都不行则不设瓶域。
+// 优先级：自建镜像站（<mirror>/brew）→ 公共镜像按序探测 → 都不行则不设瓶域。
 func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (apiDomain, bottleDomain string) {
 	if m.mirrorProbeOverride != nil {
 		return m.mirrorProbeOverride(ctx, probeFormula)
@@ -1079,7 +1079,7 @@ func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (ap
 		}
 	}
 	// 自建镜像优先：布局是 <mirror>/brew（api 在 <mirror>/brew/api，瓶在 <mirror>/brew/v2/…），
-	// 由 NAS 那一侧负责同步上游瓶文件。
+	// 由镜像站那一侧负责同步上游瓶文件。
 	if base := strings.TrimRight(strings.TrimSpace(m.opt.MirrorBase), "/"); base != "" {
 		nasBase := base + "/brew"
 		if brewMirrorSupportsOCI(ctx, nasBase) {
@@ -1092,7 +1092,7 @@ func (m *Manager) probeBrewMirrors(ctx context.Context, probeFormula string) (ap
 	}
 	// 选"清单对、而且**瓶真的下得动**"的那一家，API 域与瓶域用同一家。
 	//
-	// 为什么不再"先按清单 200 选中一家、再单独挑瓶域"（2026-09-20 修）：
+	// 为什么不再"先按清单 200 选中一家、再单独挑瓶域"（2026-09-18 修）：
 	//   · 阿里云的清单是**陈旧快照**（实测 python@3.11 清单写 3.11.12，而瓶
 	//     一个都没有）—— 只按清单 200 可能选中它，brew 随后拿着过期版本号去要瓶，
 	//     必然失败（多绕一圈才回落到官方源）；
@@ -1140,8 +1140,8 @@ func (m *Manager) BrewCapture(ctx context.Context, timeout time.Duration, args .
 // 表现是"点安装后长时间没进度"，而且看起来像面板卡死。
 //
 // 镜像优先级（用户自己设过的**一律以用户为准**，不覆盖）：
-//  1. **自建 NAS 镜像**（Cfg.MirrorBase，如 https://mirror.zizdog.com:8888）的
-//     `/brew` 子路径 —— 用户明确要求"LNMP 的包也留一份在 NAS 上、优先调用"；
+//  1. **自建镜像站**（Cfg.MirrorBase，如 https://mirror.zizdog.com:8888）的
+//     `/brew` 子路径 —— 用户明确要求"LNMP 的包也留一份在镜像站上、优先调用"；
 //  2. 中科大 / 清华 / 阿里云（按实测速度排序，见 brewMirrorCandidates）；
 //  3. 都不行就不设 bottle 域，让 brew 回落官方（不会比不设更差）。
 //
@@ -1166,7 +1166,7 @@ func (m *Manager) brewEnv(ctx context.Context, probeFormula string) []string {
 	// ENV 里存在但为空串不等于"未设置"（`ENV["X"]` 会返回 ""，仍然被当成已配置），
 	// brew 会拿着空域去拼 URL。历史上的注释说"不设"，代码却在设空值 —— 这次一起修掉。
 	// 公共开关（NO_AUTO_UPDATE / NO_INSTALL_CLEANUP / **NO_AUTOREMOVE**）一律走
-	// brewCommonEnv：卸载绝不能顺手删掉用户没点名的包（2026-09-21 真机：卸 PHP 时
+	// brewCommonEnv：卸载绝不能顺手删掉用户没点名的包（真机：卸 PHP 时
 	// 带走了 net-snmp / rtmpdump）。写在**两个列表里**是刻意的 —— 这里与
 	// brewCommand 各一份兜底，将来漏改一处也不会让 uninstall 退回自动清理。
 	env := append([]string(nil), brewCommonEnv...)

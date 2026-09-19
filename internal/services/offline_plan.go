@@ -7,15 +7,15 @@ import (
 )
 
 // ============================================================================
-//  离线包（NAS 侧）——清单驱动的"一个应用安装所需的全部文件"
+//  离线包（镜像站侧）——清单驱动的"一个应用安装所需的全部文件"
 //
 //  背景（用户原话，2026-09-16）：
 //    "要确保应用市场里的所有软件都能顺利安装！有必要的话可以把所有文件卡点
-//     都放到 nas 镜像。甚至直接将软件'打包'一键迁移回 mac 系统里。"
+//     都放到镜像站。甚至直接将软件'打包'一键迁移回 mac 系统里。"
 //
 //  本文件只做**一件事**：把"应用市场里每个应用需要从网上拿哪些文件"变成
 //  一份**机器可读的计划**（OfflinePlan），交给构建工具
-//  tools/build-offline-bundle.sh 去 NAS 上汇总成离线包。
+//  tools/build-offline-bundle.sh 去镜像站上汇总成离线包。
 //
 //  为什么计划必须从代码生成、而不是在 shell 脚本里手抄：
 //    tools/sync-nas-apps.sh 的教训 —— 手抄的那份在加应用/升版本时一定会漏，
@@ -23,7 +23,7 @@ import (
 //    releaseBinaryApps，加应用/改公式会自动出现在计划里。
 //
 //  ⚠️ 本文件**不下载任何东西**，也不做网络探测：它必须是纯函数（可单测、
-//  不会因为 NAS 不在线而失败）。真正取件、算 sha256 的是构建工具。
+//  不会因为镜像站不在线而失败）。真正取件、算 sha256 的是构建工具。
 //
 //  离线包布局（与 tools/build-offline-bundle.sh 严格一致）：
 //    <base>/offline/<app-id>/index.json              ← 有哪些版本、current 是哪个
@@ -150,11 +150,11 @@ var offlineSelfContained = map[string]string{
 var offlinePythonGaps = map[string][]string{
 	"iopaint": {
 		"PyPI 依赖闭包（pip install iopaint 及其全部传递依赖）尚未镜像；" +
-			"NAS 上还没有 /pypi/simple，真离线时装不上",
+			"镜像站上还没有 /pypi/simple，真离线时装不上",
 	},
 	"qwen3tts": {
 		"PyPI 依赖闭包（pip install 'mlx-audio[server]' 及其全部传递依赖）尚未镜像；" +
-			"NAS 上还没有 /pypi/simple，真离线时装不上",
+			"镜像站上还没有 /pypi/simple，真离线时装不上",
 		"HF 模型整目录（约 2.9GB）目前只走 /hf/ 按需缓存代理，未落成静态文件",
 	},
 }
@@ -177,7 +177,7 @@ var offlineInstallerExtra = map[string][]OfflineArtifact{
 			MirrorPath:  "hf/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
 			UpstreamURL: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
 			Note: "**默认档**模型（574,041,195 B，**本轮实测**：Range 读 Content-Range 得到）。" +
-				"2026-09-25 用户要求把默认档从 small 换成它，所以离线包的必需件也随之改成这一档。" +
+				"用户要求把默认档从 small 换成它，所以离线包的必需件也随之改成这一档。" +
 				"安装流程只下这一档；small（487,601,967 B）与 medium（1,533,763,059 B）" +
 				"按需下载、不在离线包的必需件里 —— 要真离线也必须把用得到的档位一起落盘。",
 		},
@@ -237,12 +237,11 @@ func OfflinePlan() []OfflineAppPlan {
 
 		switch {
 		case app.Kind == KindColima:
-			// Colima：brew formula + Lima 虚拟机镜像。VM 镜像在别人那条线上
-			// （/docker/ + Colima/Lima VM 镜像），这里只登记，别抢。
+			// Colima：brew formula + Lima 虚拟机镜像。VM 镜像单独登记（见下），别抢。
 			p.InstallMethod = "colima"
 			p.BrewFormula = app.BrewFormula
-			// 2026-09-16：VM 镜像**已经镜像到 NAS 并接进面板**了，这条缺口关掉。
-			//   NAS: <base>/apps/colima-core/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz
+			// 2026-09-16：VM 镜像**已经镜像到镜像站并接进面板**了，这条缺口关掉。
+			//   镜像站：<base>/apps/colima-core/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz
 			//        （332,354,401 B，sha256 与上游 .sha512sum 交叉验证过）
 			//   面板: internal/services/colima_image.go 在 colima start 之前
 			//        按「sha256(URL)」把它预热进 Colima 的下载缓存
@@ -260,8 +259,9 @@ func OfflinePlan() []OfflineAppPlan {
 				p.Artifacts = append(p.Artifacts, OfflineArtifact{
 					Kind: OfflineKindOther,
 					Path: "artifacts/docker/README.md",
-					Note: "镜像 tar（docker save）体积大，由 /docker/ 镜像线负责；" +
-						"本计划只登记 compose 引用的镜像名：" + strings.Join(p.DockerImages, ", "),
+					Note: "镜像 tar（docker save）体积大，镜像站**不提供** /docker 端点；" +
+						"要离线加载请自行 docker save 后放进离线包。本计划只登记 compose 引用的镜像名：" +
+						strings.Join(p.DockerImages, ", "),
 				})
 			}
 			p.Gaps = append(p.Gaps,

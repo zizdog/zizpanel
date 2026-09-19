@@ -15,7 +15,7 @@
 #
 #  用法：
 #    python3 tools/offline-bundle-lib.py --plan plan.json --app frpc \
-#        --stage /tmp/stage --base http://192.168.1.8:8090 --tag arm64_sequoia
+#        --stage /tmp/stage --base https://<你自己的镜像机> --tag arm64_sequoia
 #  stdout：构建报告 JSON（供 shell 汇总）；进度写 stderr。
 # ============================================================================
 import argparse

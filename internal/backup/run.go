@@ -48,7 +48,7 @@ func NewRequest(cfg *config.Config, snap Snapshotter, targets []string, outDir s
 
 // sitesGenerators 生成 `sites` 目标（<UserHome>/www 的内容）。
 //
-// 用户 2026-09-21 拍板：~/www 站点文件**不默认进备份**（几 GB 级），
+// 用户拍板：~/www 站点文件**不默认进备份**（几 GB 级），
 // 但既有 backup 任务的 sites 选项保持原样、用户勾了就照打。
 func sitesGenerators(cfg *config.Config, targets []string) []GeneratedFile {
 	if !Selected([]string{TargetSites}, targets) {

@@ -52,15 +52,14 @@ type Config struct {
 	// 到点自动生成强随机口令并继续，见 services/lnmp_mysql_credentials.go。
 	MySQLInputTimeoutSeconds int `json:"mysql_input_timeout_seconds"`
 
-	// ---------- 应用包镜像（自建 NAS） ----------
+	// ---------- 应用包镜像（自建镜像站） ----------
 	// MirrorBase 是应用包镜像基址，例如 https://mirror.zizdog.com:8888。
 	//
 	// 为什么要有它：面板要下的东西来自很多不同上游（GitHub Release、Homebrew、
 	// PyPI、huggingface、苹果 CLT 包……），各自维护一套"国内加速源"既散又容易过期。
 	// 统一指向自建镜像后，从哪下、下什么、怎么校验都由我们自己控制。
 	//
-	// 语义（用户原话："对所有能用到的模型、软件，如 ffmpeg，
-	// 都要以 NAS 镜像优先，不通再走别的！"）：
+	// 语义：对所有能用到的模型、软件（如 ffmpeg）都以镜像站优先，不通再走别的：
 	// 有值时镜像是**优先来源** —— 安装前先检查镜像上有没有这个资源，
 	// 有就从镜像下（并把地址写进任务日志）；镜像上缺件或不可达时**自动回落**
 	// 到各来源内置的公网/国内镜像，而不是让安装失败。
@@ -70,24 +69,14 @@ type Config struct {
 	// 需求描述，代码从来不是那样跑的（真按"唯一来源"跑会在镜像站抖一下时
 	// 就让用户装不上东西）。以这里为准。
 	MirrorBase string `json:"mirror_base"`
-	// MirrorBaseLAN 是同一个镜像站的**局域网地址**（可选，例如 http://192.168.1.8:8090）。
-	//
-	// 为什么需要（2026-09-18 用户报障："ddns-go 等没有 nas 缓存！装不上啊！"）：
-	// 公网入口（mirror.zizdog.com:8888）坏掉时，面板会**回落公网**（GitHub/第三方加速），
-	// 而国内直连 GitHub 很慢甚至不通 —— 用户就看到"装不上"。而同一台 NAS 的局域网
-	// 入口（8090）往往是好的、还快得多。配了这个地址后：镜像探测会**依次尝试**
-	// 公网基址 → 局域网基址，谁先命中用谁，都不可达才回落公网。
-	//
-	// 留空 = 不尝试局域网地址（默认给作者家里的 NAS，见 DefaultMirrorBaseLAN）。
-	MirrorBaseLAN string `json:"mirror_base_lan"`
 	// MirrorProbeSeconds 是"镜像上有没有这个资源"的单次探测超时（秒）。
 	//
 	// 必须短：镜像不可达时不能让每次安装都白等。默认 4 秒 —— 局域网/同城镜像
 	// 正常在 100ms 内应答，4 秒足够区分"慢"和"不通"，又不会把安装拖得很难看。
 	MirrorProbeSeconds int `json:"mirror_probe_seconds"`
 
-	// OfflineOnly 打开后进入**仅走 NAS（离线）模式**：所有安装过程只用镜像站上的
-	// 资源，**禁止任何外网回落**；缺资源就明确失败并要求补到 NAS 上。
+	// OfflineOnly 打开后进入**仅走镜像站（离线）模式**：所有安装过程只用镜像站上的
+	// 资源，**禁止任何外网回落**；缺资源就明确失败并要求补到镜像站上。
 	//
 	// 与 MirrorBase 的关系（两者语义不同，别混）：
 	//   MirrorBase 非空 + OfflineOnly=false → "镜像优先 + 探不通回落公网"（默认）；
@@ -105,7 +94,7 @@ type Config struct {
 	//
 	// 语义（2026-09 改造后）：这里存的是**用户显式选择的源**。
 	// 留空不再等于"不能升级"，而是"按 internal/upgrade 的候选顺序自动选源"
-	// （同网段 NAS → 公网主源 → 备用镜像 → GitHub 兜底，见 CandidateSources）。
+	// （用户显式源 → 公网主源 → 备用镜像 → GitHub 兜底，见 CandidateSources）。
 	// 只有用户在设置页/接口显式填过地址，才会被写进这里；
 	// "检查更新"不会再把它自动写成一个候选，否则每台机器都会被钉死在一个源上。
 	UpgradeSource string `json:"upgrade_source"`
@@ -213,25 +202,16 @@ func root() string {
 }
 
 // DefaultConfigPath 返回默认配置文件路径（受 ZIZPANEL_ROOT 影响）。
-// DefaultMirrorBase 是应用包镜像的默认基址（自建 NAS，经 mirror.zizdog.com 反代）。
+// DefaultMirrorBase 是应用包镜像的默认基址（自建镜像站，公网 mirror.zizdog.com）。
 //
 // 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
-
-// DefaultMirrorBaseLAN 是镜像站的**局域网**入口（同一个 NAS 的另一个入口）。
-//
-// 它只是"公网入口不可达时的第二候选"，不是替代品：面板先探公网镜像，
-// 探不通（站点挂了 / 不在同一网络 / 缺件）再探这个，最后才回落公网源。
-// 2026-09-18 实测：公网入口 TLS 握手成功但返回空响应（NAS 侧反代坏了），
-// 而 http://192.168.1.8:8090 完全正常 —— 有这条候选就不会"装不上"。
-const DefaultMirrorBaseLAN = "http://192.168.1.8:8090"
 
 // DefaultUpgradeSource 是在线升级的**公网主源**（用户要求"以后探测以公网 zizdog.com 为主"）。
 //
 // 它与 internal/upgrade.CandidateSources 里的默认候选是同一个值
 // （那里直接引用本常量，保证不会漂移）。注意语义：
 //   - 它只是默认配置值，不代表"用户显式选了它"；
-//   - 候选顺序里同网段的 NAS 会排在它前面（局域网快约 100 倍）；
 //   - UpgradeSource 被显式清空后，候选列表会照常包含它 —— 清空配置
 //     不等于禁用网络升级，只等于"让面板自己按优先级选"。
 const DefaultUpgradeSource = "https://zizdog.com/zizpanel"
@@ -298,11 +278,10 @@ func Default() *Config {
 		AppProxy: true,
 		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）
 		AppProxyAuth: true,
-		// 应用包镜像：默认指向自建 NAS。面板所有安装过程**优先**从这里下，
-		// 镜像上缺件/不可达时自动回落公网源（保证"镜像抖一下就装不上"不会发生）。
+		// 应用包镜像：默认指向自建镜像站（公网域名）。面板所有安装过程**优先**
+		// 从这里下，镜像上缺件/不可达时自动回落公网源（保证"镜像抖一下就装不上"不会发生）。
 		// 留空 = 关闭镜像（应急用）。
 		MirrorBase:         DefaultMirrorBase,
-		MirrorBaseLAN:      DefaultMirrorBaseLAN,
 		MirrorProbeSeconds: 4,
 		// 在线升级：默认指向公网主源 zizdog.com。
 		//

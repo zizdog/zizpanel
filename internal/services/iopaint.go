@@ -73,7 +73,7 @@ const (
 	// 为什么是静态文件、而不是走 /hf/ 那条按需缓存：/hf/ 反代的是 hf-mirror.com，
 	// 覆盖不到 GitHub release；而这个权重恰恰来自 GitHub。
 	// 镜像根就是 nginx 的 docroot，/apps/ 与 /zizpanel/ 都是根下的普通目录，
-	// 所以这里放一个 models/ 目录即可 —— **不用改 NAS 容器配置、不用重启容器**。
+	// 所以这里放一个 models/ 目录即可 —— **不用改镜像站容器配置、不用重启容器**。
 	iopaintWeightMirrorPath = "models/iopaint/" + iopaintWeightFile
 )
 
@@ -187,7 +187,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 		return err
 	}
 
-	// ---- 4. 模型权重：面板先下好（NAS 优先），再让服务起来 ----
+	// ---- 4. 模型权重：面板先下好（镜像站优先），再让服务起来 ----
 	//
 	// 顺序很关键：**权重必须在服务启动之前就位**。原因见文件头 ——
 	// IOPaint 自己去 GitHub 下权重时既没有进度、也没有超时，装完一半
@@ -239,7 +239,7 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 		"想换更强的模型（如 PowerPaint，擦除同时保持背景语义）：",
 		"  在界面右上角切换模型即可，首次使用会下载对应权重（较大）",
 		"  ⚠️ 这些额外权重**目前只有公网源**（GitHub / HuggingFace），镜像站上还没有，",
-		"     国内第一次切换会很慢；默认的 "+iopaintModel+" 已经预置好（走 NAS 镜像下好并校验过）",
+		"     国内第一次切换会很慢；默认的 "+iopaintModel+" 已经预置好（走镜像站下好并校验过）",
 		"  注意：MAT / ZITS / LDM 等模型在 M1/M2 上不支持 MPS，会失败",
 	)
 	return nil
@@ -247,8 +247,8 @@ func (m *Manager) InstallIOPaint(ctx context.Context, result *InstallResult) err
 
 // pipInstallIOPaint 装 pip 与 iopaint。
 func (m *Manager) pipInstallIOPaint(ctx context.Context, p iopaintPaths, result *InstallResult) error {
-	// pip 索引按"NAS 优先、探不通回落清华"现算（见 pypi_mirror.go）；
-	// 镜像路径会自动带上 --timeout 180 --retries 3，因为 NAS 的按需缓存
+	// pip 索引按"镜像站优先、探不通回落清华"现算（见 pypi_mirror.go）；
+	// 镜像路径会自动带上 --timeout 180 --retries 3，因为镜像站的按需缓存
 	// 是"整份落盘后才回第一个字节"，冷缓存拉大轮子会超过 pip 默认的 15 秒。
 	pipIdx, err := m.pipMirrorArgs(ctx, result)
 	if err != nil {
@@ -300,15 +300,15 @@ func (m *Manager) pickIOPaintDevice(ctx context.Context, p iopaintPaths, result 
 //
 // 三个来源参数必须分清（2026-09-16 真机踩过"日志说谎"的坑）：
 //   - weightURL：**默认模型 LaMa 的权重地址**。它来自 **GitHub release**
-//     （Sanster/models），不是 HuggingFace —— 面板已按"NAS 优先"算好并写进来。
+//     （Sanster/models），不是 HuggingFace —— 面板已按"镜像站优先"算好并写进来。
 //     IOPaint 的 iopaint/model/lama.py 会读 LAMA_MODEL_URL/LAMA_MODEL_MD5
 //     （这是上游**官方**读的环境变量，不需要也不会去 patch 它的 venv）。
 //     正常情况下权重已被面板预取到 torch 缓存里，服务启动时直接命中、不联网；
 //     这两个变量是"缓存万一丢了/删了"时的兜底来源，以及必须的一致性校验。
 //   - hfEndpoint：**其它模型**（SD / PowerPaint 等，用户在界面里切换才需要）
-//     的 HuggingFace 端点，由调用方按"NAS 优先"现算（m.qwenHFEndpoint(ctx)）。
+//     的 HuggingFace 端点，由调用方按"镜像站优先"现算（m.qwenHFEndpoint(ctx)）。
 //     用的是 Qwen 那套端点选择器：它的**名字**是历史原因，机制是通用的
-//     （探 <mirror>/hf/，通就用 NAS，不通回 hf-mirror.com），复用比再造一个稳。
+//     （探 <mirror>/hf/，通就用镜像站，不通回 hf-mirror.com），复用比再造一个稳。
 func iopaintPlist(p iopaintPaths, user, device, hfEndpoint, weightURL string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -340,7 +340,7 @@ func iopaintPlist(p iopaintPaths, user, device, hfEndpoint, weightURL string) st
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- 默认模型 LaMa 的权重：**GitHub release**，不是 HuggingFace。
-             面板已按"NAS 镜像优先 → GitHub 原址"探通并写在这里（见任务日志
+             面板已按"镜像站优先 → GitHub 原址"探通并写在这里（见任务日志
              "模型权重来源"那几行）。MD5 是上游公布的唯一校验值：
              对不上时 IOPaint 会删掉文件并退出，而不是拿错权重算出错图。 -->
         <key>LAMA_MODEL_URL</key>
@@ -407,11 +407,11 @@ func (m *Manager) iopaintStallTimeoutDur() time.Duration {
 
 // iopaintWeightSources 决定这次从哪儿拿权重，并把**真实来源**写进任务日志。
 //
-// 为什么必须"探通才算数"（而不是无脑写一行 NAS 地址）：镜像站的 /hf/ 反代的是
+// 为什么必须"探通才算数"（而不是无脑写一行镜像站地址）：镜像站的 /hf/ 反代的是
 // hf-mirror.com，覆盖不到 GitHub release —— 而这个权重恰恰来自 GitHub。
-// 真机事故（2026-09-16 mini）就是：日志写着"走 NAS 镜像"，进程却在直连 GitHub。
+// 真机事故（2026-09-16 mini）就是：日志写着"走镜像站"，进程却在直连 GitHub。
 // 所以这里探的是**静态镜像路径** <base>/models/iopaint/big-lama.pt
-// （与 /apps/、/zizpanel/ 一样是镜像根下的普通目录，不用动 NAS 容器配置），
+// （与 /apps/、/zizpanel/ 一样是镜像根下的普通目录，不用动镜像站容器配置），
 // 探到了才把镜像排第一并如实标注；探不到就明说"镜像上没有，回落 GitHub"。
 func (m *Manager) iopaintWeightSources(ctx context.Context, result *InstallResult) []weightSource {
 	upstream := weightSource{URL: iopaintWeightURL, Label: "GitHub release（Sanster/models）"}
@@ -426,7 +426,7 @@ func (m *Manager) iopaintWeightSources(ctx context.Context, result *InstallResul
 	if err != nil {
 		if result != nil {
 			result.step(ctx, fmt.Sprintf(
-				"NAS 镜像上没有这个模型（%v），权重来源回落到 GitHub 原址：%s", err, iopaintWeightURL))
+				"镜像站上没有这个模型（%v），权重来源回落到 GitHub 原址：%s", err, iopaintWeightURL))
 		}
 		return []weightSource{upstream}
 	}
@@ -435,9 +435,9 @@ func (m *Manager) iopaintWeightSources(ctx context.Context, result *InstallResul
 		if size > 0 {
 			sizeText = humanBytes(size)
 		}
-		result.step(ctx, fmt.Sprintf("模型权重来源：NAS 镜像 %s（已探通，%s）", mirrorURL, sizeText))
+		result.step(ctx, fmt.Sprintf("模型权重来源：镜像站 %s（已探通，%s）", mirrorURL, sizeText))
 	}
-	return []weightSource{{URL: mirrorURL, Label: "NAS 镜像"}, upstream}
+	return []weightSource{{URL: mirrorURL, Label: "镜像站"}, upstream}
 }
 
 // ensureIOPaintWeight 把 LaMa 权重在**服务启动之前**准备好，返回"该写进 plist 的来源"。

@@ -27,8 +27,8 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 全自动安装（CI 或无人值守）：`ZP_YES=1` 一个问题都不问；要给账号就同时给 `ZP_USER` + `ZP_PASS`
 （只给口令时用户名默认 `admin`）。**不给账号时安装器什么都不问、也不会卡住** —— 账号留给面板。
 
-给另一台机器装、手上有 NAS 时可以用内网镜像（更快，内容与公网一致）：
-`make serve-install` 会构建发布包并打印目标机要执行的 `curl … | sudo bash` 命令。
+给另一台机器装：`make serve-install` 会构建发布包并打印目标机要执行的
+`curl … | sudo bash` 命令。
 
 ### 安装时用户需要手动做什么
 
@@ -62,7 +62,7 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 > `ZP_*` 与 `ZIZPANEL_*` 两组变量等价（例如 `ZP_SUFFIX` = `ZIZPANEL_PANEL_SUFFIX`）。
 
-离线安装：发布包在 NAS 的 `http://192.168.1.8:8090/zizpanel/download/latest/`，
+离线安装：发布包在 `https://zizdog.com/zizpanel/download/latest/`，
 解开后 `cd` 进去执行 `sudo bash install.sh`。
 
 ## 二、使用
@@ -116,8 +116,8 @@ Uptime Kuma、n8n、Gitea、MinIO 等）、**一键建站**（Typecho、WordPres
 「面板设置 → 关于与运维 → 在线升级」：
 
 1. 升级源默认已填好公网 `https://zizdog.com/zizpanel`（放着 `manifest.json` 与
-   `manifest.json.sig` 的目录）。面板会按「你填的源 → 同网段 NAS → zizdog.com →
-   镜像 → GitHub」的顺序探测，装面板时脚本已把可用源写进配置。
+   `manifest.json.sig` 的目录）。面板会按「你填的源 → zizdog.com → 备用镜像 →
+   GitHub」的顺序探测，装面板时脚本已把可用源写进配置。
 2. 「检查更新」→「下载并准备升级」→「立即升级」
 
 面板会验签、试运行自检、原子替换；新版本起不来会自动回滚到升级前的版本。
@@ -185,9 +185,8 @@ sudo launchctl kickstart -k system/cn.zizpanel.panel
 发布件与应用包都走自建镜像，仓库不发布到 GitHub、不推任何远程仓库：
 
 - 面板发布件（`install.sh`、升级清单、发布包）：**公网 `https://zizdog.com/zizpanel`**
-  （任何网络都能用）；同一份内容也在 NAS `http://192.168.1.8:8090/zizpanel`，只作局域网加速/回落
-- 面板设置里的「应用包镜像基址」默认 `https://mirror.zizdog.com:8888`（NAS 的公网入口，
-  内容与局域网地址一致）
+  （任何网络都能用）
+- 面板设置里的「应用包镜像基址」默认 `https://mirror.zizdog.com:8888`（公网入口）
 
 **镜像优先，且按具体资源判断**：每一项都先探镜像、探不通才回落官方源，不会卡住。
 装 Homebrew 会注入国内镜像（安装脚本本身也走中科大镜像），

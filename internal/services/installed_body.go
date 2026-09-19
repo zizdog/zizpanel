@@ -10,7 +10,7 @@ import (
 //  「安装体」（真实产物）判定
 //
 //  为什么需要它 —— 这是「装了却显示未安装 / 不在已安装列表 / 还显示安装按钮」
-//  这一族缺陷的根因（2026-09-23 用户报障两条：图片压缩（libvips）安装成功后
+//  这一族缺陷的根因（用户报障两条：图片压缩（libvips）安装成功后
 //  仍显示「安装」；phpMyAdmin 明明是装好的目录却显示未安装）。
 //
 //  目录里有一批条目**没有常驻服务**（App.NoDaemon）：
@@ -89,7 +89,7 @@ func DetectRuntimeBody(app App, brewPrefix, userHome string) RuntimeBody {
 	}
 	// os.Stat 会跟随软链接：brew 的 bin 全部是软链，**悬空软链**（指向已删除的
 	// Cellar）会返回错误 → 不算已安装。这与 BrewStateFor 的口径一致
-	// （2026-09-21 的教训：悬空软链把已卸载的版本列成"已安装"）。
+	// （2026-09-18 的教训：悬空软链把已卸载的版本列成"已安装"）。
 	st, err := os.Stat(path)
 	if err != nil {
 		return body

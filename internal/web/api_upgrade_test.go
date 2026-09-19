@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"runtime"
 	"strings"
@@ -65,16 +64,6 @@ func armUpgradeTestFetcher(t *testing.T, manifestVersion string, okBases ...stri
 	t.Cleanup(func() { upgradeManifestFetcher = prevFetch })
 }
 
-// forceNoNASSubnet 把网卡探测钉成"不在 NAS 网段"，让候选顺序可预期
-// （否则跑测试的这台开发机自己就在 192.168.1.0/24 里）。
-func forceNoNASSubnet(t *testing.T) {
-	t.Helper()
-	prev := upgrade.SetLocalInterfaceIPsForTest(func() []net.IP {
-		return []net.IP{net.ParseIP("10.0.0.7")}
-	})
-	t.Cleanup(func() { upgrade.SetLocalInterfaceIPsForTest(prev) })
-}
-
 // TestUpgradeCheckWithEmptySourceUsesCandidatesAndDoesNotPersist 锁住本轮改造的核心：
 //
 //	① 空 source 不再 400「尚未配置升级源地址」，而是走候选列表；
@@ -86,7 +75,6 @@ func TestUpgradeCheckWithEmptySourceUsesCandidatesAndDoesNotPersist(t *testing.T
 
 	// 用户从没显式配过源（配置字段为空 = 走默认候选）
 	srv.Cfg.UpgradeSource = ""
-	forceNoNASSubnet(t)
 	// 只有默认主源可用，前面的候选（这里是同一个）之外的都不可达
 	armUpgradeTestFetcher(t, "999.0.0", upgrade.DefaultSource)
 
@@ -133,7 +121,6 @@ func TestUpgradeCheckPersistsExplicitSource(t *testing.T) {
 	cookies := loginPanel(t, ts)
 
 	srv.Cfg.UpgradeSource = ""
-	forceNoNASSubnet(t)
 	explicit := "https://explicit.example/zizpanel"
 	armUpgradeTestFetcher(t, "999.0.0", explicit)
 
@@ -170,7 +157,6 @@ func TestUpgradeStageWithEmptySourceUsesCandidates(t *testing.T) {
 	cookies := loginPanel(t, ts)
 
 	srv.Cfg.UpgradeSource = ""
-	forceNoNASSubnet(t)
 	armUpgradeTestFetcher(t, "0.0.1", upgrade.DefaultSource)
 
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/upgrade/stage", map[string]any{}, cookies)

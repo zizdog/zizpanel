@@ -149,9 +149,9 @@ const SITES = [SITE('www.demo.test'), SITE('sub.api.test'), SITE('nope.test')];
 const PROXIES = [
   {
     id: 21, name: 'NAS 镜像站', listen: 8090, domains: 'nas.zizdog.com', path: '',
-    target: 'http://192.168.1.8:8090', preserve_host: false, websocket: true,
+    target: 'http://mirror.example.com:8090', preserve_host: false, websocket: true,
     enabled: true, remark: '', port_listening: true, target_ok: true,
-    target_detail: '可达 192.168.1.8:8090（3ms）',
+    target_detail: '可达 mirror.example.com:8090（3ms）',
     ssl_enabled: true,
     ssl_cert: '/opt/zizpanel/certs/nas.zizdog.com/fullchain.pem',
     ssl_key: '/opt/zizpanel/certs/nas.zizdog.com/privkey.pem',
@@ -522,8 +522,8 @@ const result = await page.evaluate(async () => {
   out.proxyHasSSLSwitch = !!pmodal.querySelector('#zp-proxy-ssl-on');
   out.sslDetailHiddenBefore = (pmodal.querySelector('#zp-proxy-ssl-detail')?.style.display || '') === 'none';
 
-  pmodal.querySelector('input[placeholder="例如：NAS 镜像站"]').value = '演示反代';
-  pmodal.querySelector('input[placeholder="http://192.168.1.8:8090"]').value = 'http://127.0.0.1:9000';
+  pmodal.querySelector('input[placeholder="例如：镜像站"]').value = '演示反代';
+  pmodal.querySelector('input[placeholder="http://127.0.0.1:8090"]').value = 'http://127.0.0.1:9000';
   pmodal.querySelector('input[placeholder^="留空 = 该端口上所有域名"]').value = 'demo.test';
 
   document.getElementById('zp-proxy-ssl-on').checked = true;

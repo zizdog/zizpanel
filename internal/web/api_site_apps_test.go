@@ -164,7 +164,7 @@ func TestSiteInstallAppliesPublicDirFromRewritePreset(t *testing.T) {
 	srv, _ := newTestServer(t)
 	fakeMySQLClient(t, srv)
 	stubSiteApplySteps(t, nil)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "freshrss", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "freshrss", 2048))
 
 	app := typechoAppWithDB(t) // 复用 typecho 的下载/解压打桩，只改伪静态与 ID
 	app.ID = "freshrss"
@@ -205,7 +205,7 @@ func TestSiteInstallRemembersDBPassword(t *testing.T) {
 	srv, _ := newTestServer(t)
 	fakeMySQLClient(t, srv)
 	stubSiteApplySteps(t, nil)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "typecho", 2048))
 
 	app := typechoAppWithDB(t)
 	domain := "dbcred.test"
@@ -233,7 +233,7 @@ func TestSiteInstallRemembersDBPassword(t *testing.T) {
 func TestSiteInstallRollsBackRecordWhenApplyFails(t *testing.T) {
 	srv, _ := newTestServer(t)
 	stubSiteApplySteps(t, os.ErrPermission)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "typecho", 2048))
 
 	app := typechoAppNoDB(t)
 	domain := "rollback.test"
@@ -257,7 +257,7 @@ func TestSiteInstallRollsBackRecordWhenApplyFails(t *testing.T) {
 func TestSiteInstallReportsPinnedVersionAndSource(t *testing.T) {
 	srv, _ := newTestServer(t)
 	stubSiteApplySteps(t, nil)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "typecho", 2048))
 
 	app := typechoAppNoDB(t)
 	domain := "pinned.test"
@@ -268,11 +268,11 @@ func TestSiteInstallReportsPinnedVersionAndSource(t *testing.T) {
 	if res.Version != "1.3.0" {
 		t.Errorf("结果里应带固定版本 1.3.0，实际 %q", res.Version)
 	}
-	if res.Source != "NAS 镜像" {
+	if res.Source != "镜像站" {
 		t.Errorf("结果里应带真实来源，实际 %q", res.Source)
 	}
 	steps := strings.Join(res.Steps, "\n")
-	if !strings.Contains(steps, "源码包已就绪") || !strings.Contains(steps, "NAS 镜像") {
+	if !strings.Contains(steps, "源码包已就绪") || !strings.Contains(steps, "镜像站") {
 		t.Errorf("任务日志要写明版本与来源，实际：%q", steps)
 	}
 	if _, gerr := srv.siteMgr().Get(context.Background(), domain); gerr != nil {
@@ -366,7 +366,7 @@ func TestSiteInstallCleansUpEmptyDBAndRetrySucceeds(t *testing.T) {
 	fakeMySQLClient(t, srv)
 	st := stubSiteApplyChannel(t, "404") // 首次：nginx 还没加载新配置
 	stubSiteHomeProbe(t)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "typecho", 2048))
 
 	app := typechoAppWithDB(t)
 	domain := "cleanup.test"
@@ -407,7 +407,7 @@ func TestSiteInstallKeepsDatabaseWithTablesOnFailure(t *testing.T) {
 	fakeMySQLClientReportingTables(t, srv, mysqlLog, 1) // 这个库里有 1 张表
 	stubSiteApplyChannel(t, "404")                      // 首次：nginx 还没加载新配置
 	stubSiteHomeProbe(t)
-	stubSitePackageFetch(t, "NAS 镜像", makeSiteZip(t, "typecho", 2048))
+	stubSitePackageFetch(t, "镜像站", makeSiteZip(t, "typecho", 2048))
 
 	app := typechoAppWithDB(t)
 	res, err := srv.installSiteApp(context.Background(), app, "keepdb.test", siteInstallReq{})

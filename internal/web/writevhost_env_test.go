@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestWriteVhostHealsNginxEnvAndRetries 锁的是 2026-09-22 用户报障的**根修**：
+// TestWriteVhostHealsNginxEnvAndRetries 锁的是用户报障的**根修**：
 //
 //	"反向代理用不了了！规则已保存但 nginx 配置应用失败：配置语法错误，已回滚：
 //	 nginx: [emerg] unknown "connection_upgrade" variable"

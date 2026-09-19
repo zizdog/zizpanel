@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// pipMirrorArgs 是"NAS 优先 + 回落"在 pip 上的唯一入口。
-// 这几条测试锁死三件事：探通走 NAS、探不通回落清华、离线模式不许回落。
+// pipMirrorArgs 是"镜像站优先 + 回落"在 pip 上的唯一入口。
+// 这几条测试锁死三件事：探通走镜像站、探不通回落清华、离线模式不许回落。
 // 全部用 mirrorFileProbeOverride 注入，单测不碰真实镜像站（AGENTS.md 第三节）。
 
 func TestPipMirrorArgsUsesNASWhenReachable(t *testing.T) {
@@ -31,12 +31,12 @@ func TestPipMirrorArgsUsesNASWhenReachable(t *testing.T) {
 	got := strings.Join(args, " ")
 	wantIdx := "-i https://mirror.example.com:8888/pypi/simple/"
 	if !strings.Contains(got, wantIdx) {
-		t.Errorf("应优先用 NAS 索引 %q，实际参数：%s", wantIdx, got)
+		t.Errorf("应优先用镜像站索引 %q，实际参数：%s", wantIdx, got)
 	}
-	// NAS 的按需缓存是整份落盘后才回字节，必须放宽 pip 的 15 秒默认读超时。
+	// 镜像站的按需缓存是整份落盘后才回字节，必须放宽 pip 的 15 秒默认读超时。
 	for _, want := range []string{"--timeout 180", "--retries 3"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("NAS 索引模式下参数应包含 %q，实际：%s", want, got)
+			t.Errorf("镜像站索引模式下参数应包含 %q，实际：%s", want, got)
 		}
 	}
 	// https 基址不需要 --trusted-host。
@@ -77,7 +77,7 @@ func TestPipMirrorArgsFallsBackWhenMirrorMissing(t *testing.T) {
 	if want := []string{"-i", pipIndexFallback}; strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Errorf("应回落清华源 %v，实际 %v", want, args)
 	}
-	// 回落路径是 pip 直连（流式下载），不要带 NAS 专属的放宽超时。
+	// 回落路径是 pip 直连（流式下载），不要带镜像站专属的放宽超时。
 	if strings.Join(args, " ") != "-i "+pipIndexFallback {
 		t.Errorf("回落参数应只有索引，实际：%v", args)
 	}
@@ -130,7 +130,7 @@ func TestPythonPipInstallersGoThroughMirror(t *testing.T) {
 			t.Errorf("%s 的 pip 安装没有走 pipMirrorArgs（镜像未接线）", f)
 		}
 		if strings.Contains(src, `"-i", qwenPipMirror`) {
-			t.Errorf("%s 里仍有写死清华源的 pip 调用，绕过了 NAS 镜像", f)
+			t.Errorf("%s 里仍有写死清华源的 pip 调用，绕过了镜像站", f)
 		}
 	}
 }

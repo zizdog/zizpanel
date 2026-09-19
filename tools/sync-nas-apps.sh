@@ -17,18 +17,19 @@
 #    只同步一个应用：加 --app frpc
 #
 #  环境变量：NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS / MIRROR_BASE_URL
+#  ⚠️ 地址由调用者提供，仓库里不留任何内网默认值（NAS_HOST/NAS_USER/NAS_ROOT 非 dry-run 必填）。
 #  ⚠️ 口令只从环境变量进、只交给 sshpass，绝不写进任何文件、也不打印。
 # ============================================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-NAS_HOST="${NAS_HOST:-192.168.1.8}"
-NAS_USER="${NAS_USER:-zizdog}"
-# NAS_ROOT 是 apps 目录的父目录（与 Makefile 的 zizpanel 镜像目录同级）
-NAS_ROOT="${NAS_ROOT:-/vol2/zizpanel-mirror/apps}"
+NAS_HOST="${NAS_HOST:-}"
+NAS_USER="${NAS_USER:-}"
+# NAS_ROOT 是 apps 目录的父目录（与镜像站上的 zizpanel 镜像目录同级）
+NAS_ROOT="${NAS_ROOT:-}"
 NAS_PASS="${NAS_PASS:-}"
-# 校验用的对外基址：默认取面板的默认镜像基址，确保"面板真的能取到"
+# 校验用的对外基址：默认取面板的默认镜像基址（公网），确保"面板真的能取到"
 MIRROR_BASE_URL="${MIRROR_BASE_URL:-https://mirror.zizdog.com:8888}"
 
 DRY_RUN=0
@@ -51,6 +52,13 @@ while [ $# -gt 0 ]; do
 done
 
 MIRROR_BASE_URL="${MIRROR_BASE_URL%/}"
+
+# 地址由调用者提供（dry-run 只打印计划，不连镜像机）。
+if [ "$DRY_RUN" != "1" ]; then
+  : "${NAS_HOST:?请传 NAS_HOST=<你自己的镜像机>（或用 --host）}"
+  : "${NAS_USER:?请传 NAS_USER=<镜像机用户>（或用 --user）}"
+  : "${NAS_ROOT:?请传 NAS_ROOT=<镜像上的 apps 目录>（或用 --apps-root）}"
+fi
 
 sha256_of() { /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; }
 http_code() { /usr/bin/curl -s -o /dev/null -m 10 -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
