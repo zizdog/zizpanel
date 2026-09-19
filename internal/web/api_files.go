@@ -61,36 +61,131 @@ func (s *Server) fileManager() *files.Manager {
 // 它们不在任何根目录之下，越界由 files.Manager.Resolve 返回 ErrForbidden。
 // 软链接逃逸防护也没有被削弱 —— Resolve 仍然先 EvalSymlinks 再做前缀检查。
 func (s *Server) fileRoots() []string {
-	roots := append([]string{}, s.Cfg.FileRoots...)
-	if len(roots) == 0 {
-		roots = s.defaultFileRoots()
+	// 自定义 file_roots 时仍补上应用配置目录，否则「📝 编辑配置文件」会被拒绝。
+	if len(s.Cfg.FileRoots) > 0 {
+		roots := append([]string{}, s.Cfg.FileRoots...)
+		return append(roots, s.appConfigRoots()...)
 	}
-	roots = append(roots, s.appConfigRoots()...)
+	return s.defaultFileRoots()
+}
+
+// fileRootEntry 是「位置」下拉的一项（路径/类型/标签），也是白名单与标签的唯一真源。
+type fileRootEntry struct {
+	Path  string // 配置里的原始路径
+	Kind  string // fileRootKind* / "volume"
+	Label string // 展示标签，同一列表内唯一
+	// Hidden：不进下拉，但仍在白名单（被父根覆盖的子目录、敏感的数据目录）。
+	Hidden bool
+	// independent：嵌在父根里也要单独列（www / 应用配置根 / 卷 …）。
+	independent bool
+	key         string // 解析软链接后的真实路径，去重与父子判断用
+}
+
+// defaultFileRootEntries：默认根集合。按真实路径去重；DataDir 与被父根覆盖的
+// 无独立用途子目录标 Hidden（不进下拉，仍在白名单）。坑：下拉标签重复。
+func (s *Server) defaultFileRootEntries() []fileRootEntry {
+	var cands []fileRootEntry
+	add := func(path, kind, label string, independent bool) {
+		if strings.TrimSpace(path) == "" {
+			return
+		}
+		cands = append(cands, fileRootEntry{Path: path, Kind: kind, Label: label, independent: independent})
+	}
+
+	// 顺序即优先级：同一真实路径先出现的类型/标签胜出（brew etc 先于 MySQL 配置目录）。
+	add(s.Cfg.WWWRoot, fileRootKindWWW, "www 目录", true)
+	add(s.Cfg.UserHome, fileRootKindHome, "用户目录", true)
+	// 面板安装根：配置推导的 + 编译期默认值（run-local 也要能访问真实安装根）。
+	for _, r := range s.installRoots() {
+		add(r, fileRootKindPanel, panelRootLabel(r), true)
+	}
+	add(config.DefaultRoot, fileRootKindPanel, panelRootLabel(config.DefaultRoot), true)
+	// Homebrew 的 etc（nginx / php 配置都在这里）
+	if s.Cfg.BrewPrefix != "" {
+		etc := filepath.Join(s.Cfg.BrewPrefix, "etc")
+		add(etc, fileRootKindHomebrew, brewRootLabel(etc), true)
+	}
+	// 应用配置目录（「📝 编辑配置文件」入口），标签=「应用短名（位置）」。
+	for _, a := range s.appConfigRootEntries() {
+		add(a.Path, fileRootKindApp, a.Label, true)
+	}
+	// 外接盘：每次重新枚举；走 nonSystemVolumeMountsFn 便于单测注入固定挂载点。
+	for _, v := range nonSystemVolumeMountsFn() {
+		add(v, "volume", volumeRootLabel(v), true)
+	}
+	// 数据/日志/工作目录：默认嵌在安装根下 → 不进下拉；不在安装根下时才单列。
+	add(s.Cfg.DataDir, fileRootKindData, s.Cfg.DataDir+"（面板数据，敏感）", false)
+	add(s.Cfg.LogDir, fileRootKindPanel, s.Cfg.LogDir+"（面板日志）", false)
+	add(s.Cfg.WorkDir, fileRootKindPanel, s.Cfg.WorkDir+"（面板工作目录）", false)
+
+	// ① 按解析后的真实路径去重。
+	entries := make([]fileRootEntry, 0, len(cands))
+	seen := map[string]bool{}
+	for _, e := range cands {
+		e.Path = strings.TrimSpace(e.Path)
+		key := resolveForCompare(e.Path)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		e.key = key
+		entries = append(entries, e)
+	}
+	// ② 剪枝：被某个独立用途的根完整覆盖、自己又没有独立用途的子目录不进下拉。
+	for i := range entries {
+		if entries[i].Kind == fileRootKindData {
+			entries[i].Hidden = true
+			continue
+		}
+		if entries[i].independent {
+			continue
+		}
+		for j := range entries {
+			if i == j || !entries[j].independent {
+				continue
+			}
+			if isStrictAncestor(entries[j].key, entries[i].key) {
+				entries[i].Hidden = true
+				break
+			}
+		}
+	}
+	return entries
+}
+
+// defaultFileRoots：白名单路径列表（含 Hidden 项 —— 只是不进下拉，访问范围不变）。
+func (s *Server) defaultFileRoots() []string {
+	entries := s.defaultFileRootEntries()
+	roots := make([]string, 0, len(entries))
+	for _, e := range entries {
+		roots = append(roots, e.Path)
+	}
 	return roots
 }
 
-// defaultFileRoots 是未显式配置 file_roots 时的默认根集合。
-func (s *Server) defaultFileRoots() []string {
-	roots := []string{
-		s.Cfg.WWWRoot,
-		s.Cfg.DataDir,
-		s.Cfg.LogDir,
-		s.Cfg.WorkDir,
-		// 整个用户目录
-		s.Cfg.UserHome,
-		// 面板安装根。除由配置推导出的安装根外，显式加上编译期默认值
-		// （/opt/zizpanel）：`make run-local` 会把配置指向临时根，
-		// 但验收要求此时仍然能访问真实安装根。
-		config.DefaultRoot,
+// isStrictAncestor 判断 parent 是否是 child 的严格祖先（按路径分段，不是裸前缀，
+// 免得把 /opt/zizpanel2 算成 /opt/zizpanel 的子目录）。
+func isStrictAncestor(parent, child string) bool {
+	if parent == "" || child == "" || parent == child {
+		return false
 	}
-	// Homebrew 的 etc（nginx / php 配置都在这里）
-	if s.Cfg.BrewPrefix != "" {
-		roots = append(roots, filepath.Join(s.Cfg.BrewPrefix, "etc"))
+	if parent == string(os.PathSeparator) {
+		return strings.HasPrefix(child, string(os.PathSeparator))
 	}
-	roots = append(roots, s.installRoots()...)
-	// 外接盘：每次构造都重新枚举（读 /Volumes + getfsstat，不 fork 进程、不跑 diskutil）
-	roots = append(roots, files.NonSystemVolumeMounts()...)
-	return roots
+	return strings.HasPrefix(child, parent+string(os.PathSeparator))
+}
+
+// panelRootLabel / brewRootLabel：标签带完整路径，多个安装根/前缀时才不会撞名。
+func panelRootLabel(p string) string { return p + "（面板安装根）" }
+func brewRootLabel(p string) string  { return p + "（Homebrew 配置）" }
+
+// volumeRootLabel：卷名（挂载点）；非 /Volumes 下用目录名当卷名。
+func volumeRootLabel(p string) string {
+	name := strings.TrimPrefix(p, "/Volumes/")
+	if name == p || name == "" {
+		name = filepath.Base(p)
+	}
+	return name + "（" + p + "）"
 }
 
 // installRoots 由配置里的 BinDir 推导安装根，支持非默认安装位置。
@@ -109,15 +204,16 @@ func (s *Server) installRoots() []string {
 	return []string{parent}
 }
 
-// appConfigRoots 返回"面板安装的应用的配置文件所在目录"。
-//
-// 为什么需要：frpc / Orbien 客户端装在用户家目录下（~/frpc、~/orbien-client），
-// 默认的文件管理器白名单（网站目录 + 面板数据/日志/工作目录）覆盖不到，
-// 于是服务详情里的「📝 编辑配置文件」会被 files.Manager 正当地拒绝。
-// 这里只把**这些应用的安装目录**加进白名单，不是整个家目录 ——
-// 越界校验、软链接解析仍然全部由 files.Manager 负责，没有第二套读写。
-func (s *Server) appConfigRoots() []string {
-	var out []string
+// appConfigRoot 是某个应用的配置目录，带一个能区分的展示标签。
+type appConfigRoot struct {
+	Path  string // 配置文件的父目录（加进白名单的那一层）
+	Label string // 「应用短名（位置）」
+}
+
+// appConfigRootEntries：面板装的应用的配置目录（家目录下的 frpc/ddns-go 等），
+// 否则服务详情「📝 编辑配置文件」会被白名单拒绝。越界校验仍由 files.Manager 负责。
+func (s *Server) appConfigRootEntries() []appConfigRoot {
+	var out []appConfigRoot
 	seen := map[string]bool{}
 	for _, a := range services.Catalog() {
 		if a.ConfigPath == "" {
@@ -128,13 +224,54 @@ func (s *Server) appConfigRoots() []string {
 			continue
 		}
 		dir := filepath.Dir(p)
-		if seen[dir] {
+		key := resolveForCompare(dir)
+		if key == "" || seen[key] {
 			continue
 		}
-		seen[dir] = true
-		out = append(out, dir)
+		seen[key] = true
+		out = append(out, appConfigRoot{
+			Path:  dir,
+			Label: shortAppName(a.Name, a.ID) + "（" + s.appRootDisplay(dir) + "）",
+		})
 	}
 	return out
+}
+
+// appConfigRoots 只要路径（白名单与既有调用方用）。
+func (s *Server) appConfigRoots() []string {
+	entries := s.appConfigRootEntries()
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Path)
+	}
+	return out
+}
+
+// shortAppName：截掉展示名括号里的说明（"PHP 8.2 (FPM)" → "PHP 8.2"）。
+func shortAppName(name, id string) string {
+	s := strings.TrimSpace(name)
+	for _, sep := range []string{"（", " ("} {
+		if i := strings.Index(s, sep); i > 0 {
+			s = strings.TrimSpace(s[:i])
+		}
+	}
+	if s == "" {
+		return id
+	}
+	return s
+}
+
+// appRootDisplay：家目录下的位置显示成 ~/<rel>（短且好认），其余用完整路径。
+func (s *Server) appRootDisplay(dir string) string {
+	home := filepath.Clean(strings.TrimSpace(s.Cfg.UserHome))
+	if home == "" || home == "." {
+		return dir
+	}
+	dir = filepath.Clean(dir)
+	if isStrictAncestor(home, dir) {
+		return "~/" + strings.TrimPrefix(dir, home+string(os.PathSeparator))
+	}
+	return dir
 }
 
 func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
@@ -163,54 +300,39 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 		failFileErr(w, err, p)
 		return
 	}
-	s.annotateRoots(res)
+	// entries 只算一次（遍历目录 + 解析软链接），再分给分组与标签。
+	entries := s.defaultFileRootEntries()
+	s.annotateRoots(res, entries)
 	s.markSensitive(res)
-	ok(w, res)
+	ok(w, fileListPayload{ListResult: res, RootLabels: rootLabelsFor(res, entries)})
 }
 
-// annotateRoots 给每个根目录标一个用途，供前端「位置」下拉分组显示。
-// fileRootKind* 是给前端"位置"下拉分组用的**根类型标签**（不是路径）。
-//
-// 为什么用常量而不是到处写字面量：① 语义单一来源；② 备份覆盖门禁的正则是
-// `\.(DataDir|WorkDir)[ \t]*,[ \t]*"([^"]+)"`，会把「`s.Cfg.DataDir` 后紧跟一个字符串
-// 字面量」的相邻参数对误判成 `<DataDir>/<那个字符串>` 路径（见 internal/backup/plan_gate_test.go 顶部）。
-// 用常量名就不带引号，从写法上避开这个已知误报，而不是去削弱那条门禁。
+// fileListPayload：文件列表响应 = ListResult + 下拉标签表 root_labels。
+// 标签属展示层，故不改 files.ListResult（本轮也只许改 web 包）。
+type fileListPayload struct {
+	*files.ListResult
+	RootLabels map[string]string `json:"root_labels,omitempty"`
+}
+
+// fileRootKind*：常量名不带引号，避开备份覆盖门禁
+// `\.(DataDir|WorkDir)[ \t]*,[ \t]*"..."` 的误报（见 internal/backup/plan_gate_test.go）。
 const (
 	fileRootKindWWW      = "www"
 	fileRootKindHome     = "home"
 	fileRootKindData     = "data"
 	fileRootKindPanel    = "panel"
 	fileRootKindHomebrew = "homebrew"
+	fileRootKindApp      = "app" // 应用配置目录；与 home 分开，否则家目录下应用都叫"用户目录"
 )
 
-func (s *Server) annotateRoots(res *files.ListResult) {
+// annotateRoots：给每个根标类型，供「位置」下拉分组（精确匹配优先于最长前缀）。
+func (s *Server) annotateRoots(res *files.ListResult, entries []fileRootEntry) {
 	if res == nil {
 		return
 	}
-	known := map[string]string{}
-	add := func(p, kind string) {
-		if rp := resolveForCompare(p); rp != "" {
-			known[rp] = kind
-		}
-	}
-	add(s.Cfg.WWWRoot, fileRootKindWWW)
-	add(s.Cfg.UserHome, fileRootKindHome)
-	// 面板数据目录单独标一类：它嵌在安装根里，前端下拉不再重复列，但要能认出它。
-	add(s.Cfg.DataDir, fileRootKindData)
-	add(config.DefaultRoot, fileRootKindPanel)
-	if s.Cfg.BrewPrefix != "" {
-		add(filepath.Join(s.Cfg.BrewPrefix, "etc"), fileRootKindHomebrew)
-	}
-	for _, r := range s.installRoots() {
-		add(r, fileRootKindPanel)
-	}
-	for _, v := range files.NonSystemVolumeMounts() {
-		add(v, "volume")
-	}
+	known := knownRootKindsFrom(entries)
 	kinds := make(map[string]string, len(res.Roots))
 	for _, root := range res.Roots {
-		// 先看**精确匹配**：这样嵌在用户目录里的网站根目录（~/www）仍然是 www，
-		// 不会被父根（用户目录）盖掉；面板数据目录也不会被安装根盖掉。
 		if k, ok := known[root]; ok {
 			kinds[root] = k
 			continue
@@ -218,6 +340,115 @@ func (s *Server) annotateRoots(res *files.ListResult) {
 		kinds[root] = classifyRoot(root, known)
 	}
 	res.RootKinds = kinds
+}
+
+// knownRootKindsFrom 由条目构建"真实路径 → 用途类型"的对照表（精确匹配 + 最长前缀分类用）。
+func knownRootKindsFrom(entries []fileRootEntry) map[string]string {
+	known := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.key != "" {
+			known[e.key] = e.Kind
+		}
+	}
+	return known
+}
+
+// rootLabels 是 rootLabelsFor 的便捷入口（一次算 entries）。
+func (s *Server) rootLabels(res *files.ListResult) map[string]string {
+	return rootLabelsFor(res, s.defaultFileRootEntries())
+}
+
+// rootLabelsFor：给 res.Roots 算展示标签，**只含该进下拉的根**（被父根覆盖且无
+// 独立用途的子目录、数据目录都不在其中）。标签自带位置以保证唯一；分组见
+// annotateRoots 的 kinds。
+func rootLabelsFor(res *files.ListResult, entries []fileRootEntry) map[string]string {
+	if res == nil || len(res.Roots) == 0 {
+		return nil
+	}
+	byPath := make(map[string]fileRootEntry, len(entries))
+	for _, e := range entries {
+		byPath[e.key] = e
+	}
+	known := knownRootKindsFrom(entries)
+
+	labels := make(map[string]string, len(res.Roots))
+	used := make(map[string]bool, len(res.Roots))
+	for _, root := range res.Roots {
+		var label string
+		if e, ok := byPath[root]; ok {
+			if e.Hidden {
+				continue
+			}
+			label = e.Label
+		} else {
+			// 显式配置的 file_roots（不在默认真源里）：按同样的规则决定"要不要列"。
+			kind := classifyRoot(root, known)
+			if kind == fileRootKindData {
+				continue
+			}
+			if !rootKindIndependent(kind) && coveredByRoot(root, res.Roots, byPath, known) {
+				continue
+			}
+			label = fallbackRootLabel(root, kind)
+		}
+		if label == "" {
+			label = root
+		}
+		// 标签必须唯一：自定义根撞上同一个短名时，用完整路径消歧（正常路径下不会触发）。
+		if used[label] {
+			label = label + "（" + root + "）"
+		}
+		used[label] = true
+		labels[root] = label
+	}
+	return labels
+}
+
+// rootKindIndependent 判断某个用途类型是否"有独立用途"（嵌在父根里也要单独列）。
+func rootKindIndependent(kind string) bool {
+	switch kind {
+	case fileRootKindWWW, fileRootKindHome, fileRootKindPanel,
+		fileRootKindHomebrew, fileRootKindApp, "volume":
+		return true
+	}
+	return false
+}
+
+// coveredByRoot 判断 root 是否被 roots 里另一个"有独立用途的根"完整覆盖。
+func coveredByRoot(root string, roots []string, byPath map[string]fileRootEntry, known map[string]string) bool {
+	for _, o := range roots {
+		if o == root || !isStrictAncestor(o, root) {
+			continue
+		}
+		if e, ok := byPath[o]; ok {
+			if e.independent {
+				return true
+			}
+			continue
+		}
+		if rootKindIndependent(classifyRoot(o, known)) {
+			return true
+		}
+	}
+	return false
+}
+
+// fallbackRootLabel：给自定义 file_roots 算标签，一律带完整路径以免两根同名。
+func fallbackRootLabel(root, kind string) string {
+	switch kind {
+	case fileRootKindWWW:
+		return root + "（www 目录）"
+	case fileRootKindHome:
+		return root + "（用户目录）"
+	case fileRootKindPanel:
+		return panelRootLabel(root)
+	case fileRootKindHomebrew:
+		return brewRootLabel(root)
+	case fileRootKindApp:
+		return root + "（应用配置目录）"
+	default:
+		return root
+	}
 }
 
 // classifyRoot 取"最长匹配"的已知用途；都不匹配时归到 other。

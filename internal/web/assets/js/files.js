@@ -212,30 +212,37 @@ export function FilesView(content, ctx = {}) {
   }
 
   // ---------- 位置下拉：常用 / 磁盘与卷 ----------
-  //
-  // 根目录集合由后端下发（lastList.roots），并带 root_kinds 标出用途。
-  // 下拉只列"没有被别的根包含"的根（/opt/zizpanel/data 在 /opt/zizpanel 之下，
-  // 就不重复列），末尾固定一条「🖥 管理磁盘…」跳到已存在的 #/disks 页。
+  // 标签由后端下发（root_labels，已去重/剪枝/唯一），前端只按 root_kinds 分组渲染。
   function rootKind(r) {
     return (lastList && lastList.root_kinds && lastList.root_kinds[r]) || 'other';
   }
 
+  // root_labels 是后端的"路径 → 唯一标签"表；没有它时（旧响应）退回本地启发式。
+  function rootLabels() {
+    return (lastList && lastList.root_labels) || null;
+  }
+
   function rootLabel(r) {
+    const labels = rootLabels();
+    if (labels && labels[r]) return labels[r];
+    // 回退也带上位置，免得两个根显示成同一行。
     switch (rootKind(r)) {
       case 'www': return 'www 目录';
       case 'home': return '用户目录';
-      case 'panel': return '/opt/zizpanel（面板安装根）';
-      case 'homebrew': return '/opt/homebrew/etc';
+      case 'panel': return r + '（面板安装根）';
+      case 'homebrew': return r + '（Homebrew 配置）';
+      case 'app': return r + '（应用配置目录）';
       case 'volume': return r.replace(/^\/Volumes\//, '') + '（' + r + '）';
       default: return r;
     }
   }
 
-  // dropdownRoots 去掉被其它根包含的子根，但**命名根**（www/用户/安装根/homebrew/卷）
-  // 即使嵌在别的根里也保留 —— 网站根目录就在用户目录之下，不能因为它被折叠掉。
+  // 只列后端给了标签的根；没有 root_labels 时退回旧启发式。
   function dropdownRoots() {
     const roots = lastList?.roots || [];
-    const named = new Set(['www', 'home', 'panel', 'homebrew', 'volume']);
+    const labels = rootLabels();
+    if (labels) return roots.filter((r) => !!labels[r]);
+    const named = new Set(['www', 'home', 'panel', 'homebrew', 'app', 'volume']);
     return roots.filter((r) => {
       const kind = rootKind(r);
       if (kind === 'data') return false; // 面板数据目录从安装根进去即可，不重复列
@@ -265,10 +272,10 @@ export function FilesView(content, ctx = {}) {
     for (const r of listed) {
       const k = rootKind(r);
       if (k === 'volume') groups.volume.push(r);
-      else if (k === 'www' || k === 'home' || k === 'panel' || k === 'homebrew') groups.common.push(r);
+      else if (k === 'www' || k === 'home' || k === 'panel' || k === 'homebrew' || k === 'app') groups.common.push(r);
       else groups.other.push(r);
     }
-    const order = { www: 0, home: 1, panel: 2, homebrew: 3, other: 9 };
+    const order = { www: 0, home: 1, panel: 2, homebrew: 3, app: 4, other: 9 };
     groups.common.sort((a, b) => (order[rootKind(a)] ?? 9) - (order[rootKind(b)] ?? 9));
 
     const opt = (r) => h('option', { value: r, text: rootLabel(r) });
