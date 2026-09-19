@@ -120,7 +120,7 @@ func TestRuleNeedsForward(t *testing.T) {
 // 同时保留真实目标的注释与正确的 Host 头。
 func TestGenerateForwardsPrivateTarget(t *testing.T) {
 	r := &Rule{
-		ID: 3, Name: "NAS", Listen: 8081, Target: "http://192.168.1.8:8081",
+		ID: 3, Name: "镜像站", Listen: 8081, Target: "http://192.168.1.8:8081",
 		Enabled: true, Websocket: true, LANForward: "auto", ForwardPort: 47003,
 	}
 	out, err := r.Generate("/tmp/logs")

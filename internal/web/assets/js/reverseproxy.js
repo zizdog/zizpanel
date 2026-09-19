@@ -43,10 +43,18 @@ function authSummary(it) {
   return base + '；回读：⚠️ 未复核 —— ' + (a.note || '读不到生效值，请重新保存并检查 nginx。');
 }
 
+// cacheSummary 把后端给的缓存"回读生效值"拼成一行文字（同样绝不说"已保存"了事）。
+function cacheSummary(it) {
+  const c = (it && it.cache) || {};
+  if (!c.enabled) return '';
+  const base = '当前：上限 ' + (c.size || '?') + '，有效期 ' + (c.valid || '?') + '，目录 ' + (c.dir || '?');
+  if (c.verified) return base + '；回读：✅ conf.d 声明与该规则的 nginx 配置都已生效。';
+  return base + '；回读：⚠️ 未复核 —— ' + (c.note || '读不到生效值，请重新保存并检查 nginx。');
+}
+
 // sslSummary 把后端给的证书摘要拼成一行可读文字（来源 / 覆盖域名 / 到期 / 剩余）。
 // 字段缺失时逐项跳过，不编造——没有的信息宁可不说。
-function sslSummary(it) {
-  const s = (it && it.ssl) || {};
+function sslSummary(it) {  const s = (it && it.ssl) || {};
   const parts = ['HTTPS 已启用 · ' + (s.provider_label || s.provider || '证书')];
   const domains = Array.isArray(s.domains) ? s.domains.filter(Boolean) : [];
   if (domains.length) parts.push('覆盖 ' + domains.join(', '));
@@ -239,7 +247,7 @@ export function ReverseProxyView(content, ctx = {}) {
       appendAll(grid, h('div.empty', [
         h('div.big', { text: '🔀' }),
         h('p', { text: '还没有反向代理规则' }),
-        h('p.hint', { text: '例如：监听 8090，目标 http://192.168.1.8:8090 —— 就能从这台机器访问 NAS 上的站点' }),
+        h('p.hint', { text: '例如：监听 8090，目标 http://127.0.0.1:8090 —— 就能从这台机器访问镜像站上的站点' }),
       ]));
       return;
     }
@@ -288,6 +296,14 @@ export function ReverseProxyView(content, ctx = {}) {
           ? h('span.pill' + (it.auth_verified ? '.ok' : '.warn'), {
             text: it.auth_verified ? '🔑 鉴权' : '🔑 鉴权（未复核）',
             title: authSummary(it),
+          })
+          : null,
+        it.cache_enabled
+          ? h('span.pill' + (it.cache_verified ? '.ok' : '.warn'), {
+            text: it.cache_verified
+              ? ('⚡ 缓存 ' + (it.cache_size || '') + '/' + (it.cache_valid || ''))
+              : '⚡ 缓存（未复核）',
+            title: cacheSummary(it),
           })
           : null,
         lanForwardPill(it),
@@ -375,11 +391,19 @@ export function ReverseProxyView(content, ctx = {}) {
             }
           },
         }),
+        // 「清空缓存」只在开过缓存（配置在，或磁盘上还有缓存文件）时出现。
+        (it.cache_enabled || it.cache_dir_exists)
+          ? h('button.btn.btn-sm', {
+            text: '🧹 清空缓存',
+            title: '删除这条规则的本地缓存文件' + (it.cache_zone ? '（缓存区 ' + it.cache_zone + '）' : '')
+              + '；不改 nginx 配置，也不影响目标机器。',
+            onclick: () => clearCache(it),
+          })
+          : null,
         h('button.btn.btn-sm.btn-danger', { text: '删除', onclick: () => remove(it) }),
       ]),
     ]);
   }
-
   async function toggle(it) {
     try {
       await api.proxyToggle(it.id);
@@ -394,15 +418,39 @@ export function ReverseProxyView(content, ctx = {}) {
     const okGo = await confirmBox(
       '删除规则「' + (it.name || it.id) + '」？\n\n' +
       '· 会移除它的 nginx 配置并重载\n' +
+      '· 它的本地缓存文件也会一起删除\n' +
       '· 目标机器上的服务**不受影响**',
       { title: '删除反向代理规则', okText: '删除' });
     if (!okGo) return;
     try {
-      await api.proxyDelete(it.id);
-      toast('已删除', 'ok');
+      const r = await api.proxyDelete(it.id);
+      // 后端清缓存失败时会带回 cache_clear_error：如实转述，不谎报"已删除干净"。
+      if (r && r.cache_clear_error) {
+        toast('已删除，但缓存没清掉：' + r.cache_clear_error, 'warn', 14000);
+      } else {
+        toast('已删除', 'ok');
+      }
       load();
     } catch (e) {
       toast('删除失败：' + e.message, 'err', 10000);
+    }
+  }
+
+  // clearCache 清空一条规则的本地缓存（只删文件：走主接口的 cache_clear 动作，
+  // 不新增路由，也不重写 nginx 配置）。
+  async function clearCache(it) {
+    const okGo = await confirmBox(
+      '清空规则「' + (it.name || it.id) + '」的缓存？\n\n' +
+      '· 只删除本机缓存文件，下次访问会重新回源\n' +
+      '· 不改 nginx 配置，也不影响目标机器',
+      { title: '清空反向代理缓存', okText: '清空' });
+    if (!okGo) return;
+    try {
+      const r = await api.proxyUpdate(it.id, { cache_clear: true });
+      toast((r && r.msg) || '已清空缓存', 'ok');
+      load();
+    } catch (e) {
+      toast('清空失败：' + e.message, 'err', 12000);
     }
   }
 
@@ -420,7 +468,7 @@ export function ReverseProxyView(content, ctx = {}) {
     const cur = (it && it.ssl) || {};
     const hadSSL = !!cur.enabled;
     const f = {
-      name: h('input.input', { value: it?.name || '', placeholder: '例如：NAS 镜像站' }),
+      name: h('input.input', { value: it?.name || '', placeholder: '例如：镜像站' }),
       listen: h('input.input', { type: 'number', value: it?.listen ?? 8090, min: '1', max: '65535' }),
       domains: h('input.input', { value: it?.domains || '', placeholder: '留空 = 该端口上所有域名；多个用逗号分隔' }),
       path: h('input.input', { value: it?.path || '', placeholder: '留空 = 所有路径；或填前缀，例如 /api' }),
@@ -456,9 +504,21 @@ export function ReverseProxyView(content, ctx = {}) {
       authUser: h('input.input', { value: it?.auth_user || '', placeholder: '例如：admin' }),
       // 密码框永远不回显：留空 = 沿用已保存的密码（编辑已有规则时不会被迫重设）。
       authPass: h('input.input', { type: 'password', placeholder: it?.auth_enabled ? '留空 = 保持原密码不变' : '设置访问密码' }),
+      // ---- 反向代理缓存（可选，默认关）----
+      cacheOn: h('input', { type: 'checkbox', checked: it ? !!it.cache_enabled : false, id: 'zp-proxy-cache-on' }),
+      cacheSize: h('select.select', { id: 'zp-proxy-cache-size' },
+        [['256m', '256 MB'], ['1g', '1 GB（推荐）'], ['5g', '5 GB'], ['10g', '10 GB'], ['50g', '50 GB']]
+          .map(([v, label]) => h('option', { value: v, text: label }))),
+      cacheValid: h('select.select', { id: 'zp-proxy-cache-valid' },
+        [['10m', '10 分钟'], ['1h', '1 小时（推荐）'], ['1d', '1 天'], ['7d', '7 天'], ['30d', '30 天']]
+          .map(([v, label]) => h('option', { value: v, text: label }))),
     };
     f.sslProvider.value = SSL_PROVIDERS.some((p) => p.value === cur.provider) ? cur.provider : 'acme';
     f.lanForward.value = ['auto', 'on', 'off'].includes(it?.lan_forward) ? it.lan_forward : 'auto';
+    const sizeOpts = Array.from(f.cacheSize.options).map((o) => o.value);
+    const validOpts = Array.from(f.cacheValid.options).map((o) => o.value);
+    f.cacheSize.value = sizeOpts.includes(it?.cache_size) ? it.cache_size : '1g';
+    f.cacheValid.value = validOpts.includes(it?.cache_valid) ? it.cache_valid : '1h';
 
     const certSel = h('select.select', { id: 'zp-proxy-ssl-cert' });
     const certHint = h('div.hint', { text: '正在读取证书…' });
@@ -586,12 +646,28 @@ export function ReverseProxyView(content, ctx = {}) {
     ]);
     const renderAuth = () => { authDetail.style.display = f.authOn.checked ? '' : 'none'; };
     f.authOn.addEventListener('change', renderAuth);
+
+    // ---- 反向代理缓存详情（开关关掉时整块隐藏）----
+    const cacheReadback = it && it.cache_enabled
+      ? h('div.hint', { style: { color: it.cache_verified ? 'var(--ok)' : 'var(--warn)' },
+        text: cacheSummary(it) })
+      : null;
+    const cacheDetail = h('div', { id: 'zp-proxy-cache-detail', style: { marginTop: '8px' } }, [
+      row('缓存上限', f.cacheSize, '超过上限时 nginx 淘汰最久没用的缓存'),
+      row('有效期', f.cacheValid, '超过有效期后回源重新校验'),
+      cacheReadback,
+      it && it.cache_dir_exists
+        ? h('div.hint', { text: '缓存目录：' + (it.cache_dir || '') + '（已有缓存文件，可用列表上的「清空缓存」删掉）' })
+        : null,
+    ]);
+    const renderCache = () => { cacheDetail.style.display = f.cacheOn.checked ? '' : 'none'; };
+    f.cacheOn.addEventListener('change', renderCache);
     const body = h('div', [
       row('规则名称', f.name, '只用于你自己识别'),
       row('监听端口', f.listen, 'nginx 在这个端口上接收请求；80 需要 root，面板已具备'),
       row('域名（可选）', f.domains, '留空表示这个端口上任何域名都走这条规则'),
       row('路径前缀（可选）', f.path, '只代理某个前缀，例如 /api；留空代理全部'),
-      row('目标地址', f.target, '例：http://192.168.1.8:8090、https://127.0.0.1:8443'),
+      row('目标地址', f.target, '例：http://127.0.0.1:8090、https://<面板地址>:8443'),
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
         [f.preserve, h('span', { text: '把原始 Host 透传给目标（默认关：多数后端按目标 Host 分站，透传会 404）' })]),
       h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
@@ -626,6 +702,16 @@ export function ReverseProxyView(content, ctx = {}) {
             + '不回显、不写日志、不进审计。',
         }),
         authDetail,
+      ]),
+      // ---- 反向代理缓存（可选，默认关）----
+      h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' },
+          title: 'nginx 只在开启响应缓冲（proxy_buffering on）时才写缓存；'
+            + '该规则下的 SSE / 流式输出会从"边收边发"变成"先攒后发"，要流式就别开缓存。' }, [
+          f.cacheOn, h('span', { style: { fontWeight: '600' }, text: '启用缓存（回源一次，之后走本地缓存）' }),
+        ]),
+        h('div.hint', { text: '镜像站 / 图床 / CDN 前置适用；关闭时行为与现在完全一致。' }),
+        cacheDetail,
       ]),
       h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
@@ -703,6 +789,10 @@ export function ReverseProxyView(content, ctx = {}) {
             payload.auth_enabled = f.authOn.checked;
             payload.auth_user = f.authUser.value.trim();
             if (f.authPass.value !== '') payload.auth_password = f.authPass.value;
+            // 缓存：开关 + 上限 + 有效期（后端会归一化并回读真实配置）。
+            payload.cache_enabled = f.cacheOn.checked;
+            payload.cache_size = f.cacheSize.value;
+            payload.cache_valid = f.cacheValid.value;
             if (f.authOn.checked) {
               if (!payload.auth_user) {
                 toast('开启了「需要用户名密码」，请填用户名', 'warn', 9000);
@@ -798,6 +888,17 @@ export function ReverseProxyView(content, ctx = {}) {
                 hold = 16000;
               }
             }
+            // 缓存同样要回读生效值（conf.d 的声明 + vhost 的 location 指令）。
+            const cv = (saved && saved.cache) || {};
+            if (saved && saved.cache_enabled) {
+              if (cv.verified) {
+                msg += '；缓存已生效（' + (cv.size || '') + ' / ' + (cv.valid || '') + '）';
+              } else {
+                msg += '；缓存未复核：' + (cv.note || '读不到生效值，请检查 nginx 是否已重载');
+                level = 'warn';
+                hold = 16000;
+              }
+            }
             toast(msg, level, hold);
             close();
             load();
@@ -808,6 +909,7 @@ export function ReverseProxyView(content, ctx = {}) {
     void m;
     renderSSL();
     renderAuth();
+    renderCache();
     setTimeout(() => f.name.focus(), 60);
   }
 

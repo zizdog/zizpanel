@@ -20,11 +20,11 @@ import (
 // 它自己的 500 HTML 页 —— 端口在听、健康检查全绿，用户却一上传就坏
 // （真实现场：经反代推 368KB 音色样本）。`proxy_buffering off` 只关响应缓冲，
 // 关不掉请求体缓冲，必须显式写这一行，让请求体边收边转发给上游。
-const expectedVhostGolden = "# 由 ZizPanel「反向代理」生成 —— 请勿手工编辑（会被面板覆盖）\n# 规则：NAS 镜像站\nserver {\n\tlisten      8090;\n\tserver_name a.com b.com;\n\n\t# 反代目标的真实地址（日志里用得上）\n\t# target: http://192.168.1.8:8090\n\n\tlocation /api {\n\t\tproxy_pass http://192.168.1.8:8090;\n\t\tproxy_set_header Host 192.168.1.8:8090;\n\t\tproxy_set_header X-Real-IP $remote_addr;\n\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\t\tproxy_set_header X-Forwarded-Proto $scheme;\n\t\tproxy_http_version 1.1;\n\t\t# WebSocket（upgrade map 由面板确保存在）\n\t\tproxy_set_header Upgrade $http_upgrade;\n\t\tproxy_set_header Connection $connection_upgrade;\n\n\t\tproxy_connect_timeout 60s;\n\t\tproxy_send_timeout    3600s;\n\t\tproxy_read_timeout    3600s;\n\t\tproxy_buffering       off;\n\t\tproxy_request_buffering off;\n\n\t\taccess_log /tmp/logs/proxy-7.access.log;\n\t\terror_log  /tmp/logs/proxy-7.error.log;\n\t}\n}\n"
+const expectedVhostGolden = "# 由 ZizPanel「反向代理」生成 —— 请勿手工编辑（会被面板覆盖）\n# 规则：镜像站\nserver {\n\tlisten      8090;\n\tserver_name a.com b.com;\n\n\t# 反代目标的真实地址（日志里用得上）\n\t# target: http://192.168.1.8:8090\n\n\tlocation /api {\n\t\tproxy_pass http://192.168.1.8:8090;\n\t\tproxy_set_header Host 192.168.1.8:8090;\n\t\tproxy_set_header X-Real-IP $remote_addr;\n\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\t\tproxy_set_header X-Forwarded-Proto $scheme;\n\t\tproxy_http_version 1.1;\n\t\t# WebSocket（upgrade map 由面板确保存在）\n\t\tproxy_set_header Upgrade $http_upgrade;\n\t\tproxy_set_header Connection $connection_upgrade;\n\n\t\tproxy_connect_timeout 60s;\n\t\tproxy_send_timeout    3600s;\n\t\tproxy_read_timeout    3600s;\n\t\tproxy_buffering       off;\n\t\tproxy_request_buffering off;\n\n\t\taccess_log /tmp/logs/proxy-7.access.log;\n\t\terror_log  /tmp/logs/proxy-7.error.log;\n\t}\n}\n"
 
 func goldenRule() *Rule {
 	return &Rule{
-		ID: 7, Name: "NAS 镜像站", Listen: 8090, Domains: "a.com, b.com", Path: "/api",
+		ID: 7, Name: "镜像站", Listen: 8090, Domains: "a.com, b.com", Path: "/api",
 		Target: "http://192.168.1.8:8090", PreserveHost: false, Websocket: true,
 		Enabled: true, Remark: "x",
 	}

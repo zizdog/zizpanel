@@ -12,7 +12,7 @@ import (
 // 这些都不是编译期错误，只能靠断言钉住。
 func TestRuleGenerateBasic(t *testing.T) {
 	r := &Rule{
-		ID: 7, Name: "NAS 镜像站", Listen: 8090,
+		ID: 7, Name: "镜像站", Listen: 8090,
 		Target: "http://192.168.1.8:8090", Websocket: true, Enabled: true,
 	}
 	got, err := r.Generate("/tmp/logs")

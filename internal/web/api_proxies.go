@@ -11,10 +11,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/acme"
+	"github.com/zizdog/zizpanel/internal/priv"
 	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tlsx"
@@ -385,6 +388,511 @@ func apr1To64(v, n int) string {
 	return string(out)
 }
 
+// ============================================================================
+//  反向代理缓存（可选，默认关）
+//
+//  缓存区声明放 conf.d/<proxies.CacheConfName>，不放 nginx.conf：proxy_cache_path
+//  只能在 http 上下文，而反代规则在 server 级。面板已约定"conf.d 放 http 上下文
+//  片段"（upgrade-map.conf 就是），且 nginx.conf 的 include conf.d/*.conf 由既有自愈
+//  保证 —— 改缓存只改一个面板自己的文件，nginx.conf 一字不动，天然幂等。
+//
+//  归属：缓存目录必须交给**运行中的 nginx worker 用户**（判据见 priv.NginxWorkerOwner）；
+//  读不到就如实失败，绝不猜 nobody（AGENTS 坑 173：猜错等于没修还藏因）。
+// ============================================================================
+
+const proxyCacheSettingPrefix = "proxy_cache."
+
+// proxyCacheConfig 是持久化的缓存配置（settings 表一行 JSON；与鉴权同一条约定）。
+type proxyCacheConfig struct {
+	Enabled bool   `json:"enabled"`
+	Size    string `json:"size"`
+	Valid   string `json:"valid"`
+}
+
+func proxyCacheKey(id int64) string {
+	return proxyCacheSettingPrefix + strconv.FormatInt(id, 10)
+}
+
+// proxyCacheRoot 返回缓存目录根（面板自己的数据目录下）。
+func (s *Server) proxyCacheRoot() string {
+	if strings.TrimSpace(s.Cfg.DataDir) == "" {
+		return ""
+	}
+	return filepath.Join(s.Cfg.DataDir, "proxy-cache")
+}
+
+// proxyCacheView 是"配置放在哪、有没有真的生效"的只读快照。
+// 列表路径上只读一个小文本文件 + 一次 stat，不做递归 du（缓存可能有几 GB）。
+func (s *Server) proxyCacheView(ctx context.Context, rule *proxies.Rule) map[string]any {
+	view := map[string]any{
+		"enabled": false, "size": "", "valid": "", "zone": "", "dir": "",
+		"dir_exists": false, "verified": false, "note": "",
+	}
+	if rule == nil {
+		return view
+	}
+	cfg, err := s.loadProxyCache(ctx, rule.ID)
+	if err != nil {
+		view["note"] = "未复核：" + err.Error()
+		return view
+	}
+	view["enabled"] = cfg.Enabled
+	view["size"] = cfg.Size
+	view["valid"] = cfg.Valid
+	zone := proxies.CacheZoneName(rule.ID)
+	view["zone"] = zone
+	dir := proxies.CacheZoneDir(s.proxyCacheRoot(), rule.ID)
+	view["dir"] = dir
+	if st, serr := os.Stat(dir); serr == nil && st.IsDir() {
+		view["dir_exists"] = true
+	}
+	if !cfg.Enabled {
+		return view
+	}
+	if !rule.Enabled {
+		view["note"] = "规则已停用：缓存目前不生效"
+		return view
+	}
+	// 回读两份真实配置：conf.d 的缓存区声明 + vhost 的 location 指令。
+	confPath := s.proxyCacheConfPath()
+	conf, cerr := os.ReadFile(confPath)
+	if cerr != nil {
+		view["note"] = "未复核：读不到 " + confPath
+		return view
+	}
+	hasDecl := strings.Contains(string(conf), "keys_zone="+zone+":") &&
+		strings.Contains(string(conf), "max_size="+cfg.Size+" ")
+	vhostPath := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
+	vh, verr := os.ReadFile(vhostPath)
+	if verr != nil {
+		view["note"] = "未复核：读不到 nginx 配置 " + vhostPath
+		return view
+	}
+	hasZone := strings.Contains(string(vh), "proxy_cache "+zone+";")
+	hasValid := strings.Contains(string(vh), "proxy_cache_valid 200 301 302 "+cfg.Valid+";")
+	view["decl_ok"] = hasDecl
+	view["vhost_ok"] = hasZone && hasValid
+	if hasDecl && hasZone && hasValid {
+		view["verified"] = true
+		return view
+	}
+	view["note"] = fmt.Sprintf("未复核：生成的配置与保存值不一致（缓存区声明=%v、location=%v、有效期=%v）",
+		hasDecl, hasZone, hasValid)
+	return view
+}
+
+// loadProxyCache 读取一条规则的缓存配置（没有就返回零值 = 未开启）。
+func (s *Server) loadProxyCache(ctx context.Context, id int64) (proxyCacheConfig, error) {
+	raw, err := s.Store.GetSetting(ctx, proxyCacheKey(id))
+	if err != nil {
+		return proxyCacheConfig{}, fmt.Errorf("读取规则 %d 的缓存配置失败：%w", id, err)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return proxyCacheConfig{}, nil
+	}
+	var cfg proxyCacheConfig
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return proxyCacheConfig{}, fmt.Errorf("规则 %d 的缓存配置已损坏（%v）；请到该规则的「编辑」里重新开启缓存", id, err)
+	}
+	return cfg, nil
+}
+
+// saveProxyCache 写入一条规则的缓存配置。
+func (s *Server) saveProxyCache(ctx context.Context, id int64, cfg proxyCacheConfig) error {
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("序列化缓存配置失败：%w", err)
+	}
+	if err := s.Store.SetSetting(ctx, proxyCacheKey(id), string(b)); err != nil {
+		return fmt.Errorf("保存缓存配置失败：%w", err)
+	}
+	return nil
+}
+
+// hydrateProxyCache 把持久化的缓存配置装回 Rule（生成 nginx 配置前必须调用）。
+// 与鉴权一样由 applyProxy 统一调用：漏掉它会让缓存开关静默失效。
+func (s *Server) hydrateProxyCache(ctx context.Context, rule *proxies.Rule) error {
+	if rule == nil {
+		return nil
+	}
+	cfg, err := s.loadProxyCache(ctx, rule.ID)
+	if err != nil {
+		return err
+	}
+	rule.CacheEnabled = cfg.Enabled
+	rule.CacheSize = cfg.Size
+	rule.CacheValid = cfg.Valid
+	rule.CacheRoot = s.proxyCacheRoot()
+	return nil
+}
+
+// proxyCacheFromRequest 把请求里的缓存字段合并到已有配置并校验。
+// 关闭时**保留**上限/有效期：下次开启不用重填（它们只在启用时才被引用）。
+func proxyCacheFromRequest(req proxyReq, cur proxyCacheConfig) (proxyCacheConfig, error) {
+	next := cur
+	if req.CacheEnabled != nil {
+		next.Enabled = *req.CacheEnabled
+	}
+	if req.CacheSize != nil {
+		next.Size = strings.TrimSpace(*req.CacheSize)
+	}
+	if req.CacheValid != nil {
+		next.Valid = strings.TrimSpace(*req.CacheValid)
+	}
+	if !next.Enabled {
+		return next, nil
+	}
+	if next.Size == "" {
+		next.Size = proxies.CacheDefaultSize
+	}
+	if next.Valid == "" {
+		next.Valid = proxies.CacheDefaultValid
+	}
+	size, err := proxies.NormalizeCacheSize(next.Size)
+	if err != nil {
+		return proxyCacheConfig{}, err
+	}
+	valid, err := proxies.NormalizeCacheValid(next.Valid)
+	if err != nil {
+		return proxyCacheConfig{}, err
+	}
+	next.Size, next.Valid = size, valid
+	return next, nil
+}
+
+// proxyCacheConfPath 是缓存区声明文件（放在面板管理的 nginx conf.d 下）。
+func (s *Server) proxyCacheConfPath() string {
+	return filepath.Join(filepath.Dir(s.Cfg.NginxConf), "conf.d", proxies.CacheConfName)
+}
+
+// ensureProxyCacheDir 建缓存目录并把归属交给 nginx worker **真实**运行用户。
+// 拿不到用户就返回错误（**绝不猜**：猜 nobody 会让缓存写不进去还藏起真因）。
+// 注意：目录本身一定会被建出来 —— nginx 启动时若 proxy_cache_path 的父目录不存在会直接 [emerg]。
+func (s *Server) ensureProxyCacheDir() (string, error) {
+	root := s.proxyCacheRoot()
+	if root == "" {
+		return "", errors.New("数据目录未配置，无法创建缓存目录")
+	}
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		return "", fmt.Errorf("创建缓存目录失败：%v", err)
+	}
+	name, uid, gid, how, ok := priv.NginxWorkerOwner(s.Cfg.NginxConf)
+	if !ok {
+		return "", fmt.Errorf("拿不到 nginx worker 用户（%s）：缓存目录 %s 已建好，但没有改归属"+
+			"（猜一个用户是害你）。请先启动 nginx，或在 nginx.conf 里写上 user 指令后重试", how, root)
+	}
+	if err := chownCacheRoot(root, uid, gid); err != nil {
+		return "", fmt.Errorf("把缓存目录交给 nginx worker 用户 %s 失败：%v", name, err)
+	}
+	return root, nil
+}
+
+// chownCacheRoot 只改缓存根目录与它**直接子目录**的归属。
+// nginx -t（以 root 跑）只会创建到 <root>/<zone> 这一层，levels 子目录由 worker
+// 自己建、本来就是 worker 属主；递归整棵缓存树（可能几万个文件）会白白拖慢每次保存。
+// 用 Lchown：不跟随符号链接，避免把链接指向的外部文件改掉。
+func chownCacheRoot(root string, uid, gid int) error {
+	if err := os.Lchown(root, uid, gid); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if err := os.Lchown(filepath.Join(root, e.Name()), uid, gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// proxyConfSnapshot 是缓存区声明文件写入前的内容快照（回滚用）。
+type proxyConfSnapshot struct {
+	path    string
+	existed bool
+	prev    []byte
+}
+
+func (s *Server) snapshotCacheConf() proxyConfSnapshot {
+	path := s.proxyCacheConfPath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return proxyConfSnapshot{path: path}
+	}
+	return proxyConfSnapshot{path: path, existed: true, prev: b}
+}
+
+// restore 把声明文件还原到快照状态（原本不存在就删掉）。
+func (snap proxyConfSnapshot) restore() error {
+	if snap.path == "" {
+		return nil
+	}
+	if !snap.existed {
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return os.WriteFile(snap.path, snap.prev, 0o644)
+}
+
+// restoreCacheConf 尽力还原并**把还原失败并进原始错误**，不静默吞掉。
+func (s *Server) restoreCacheConf(snap proxyConfSnapshot, cause error) error {
+	if cause == nil {
+		cause = errors.New("缓存区声明处理失败")
+	}
+	if err := snap.restore(); err != nil {
+		return fmt.Errorf("%w（另外：缓存区声明还原失败：%v，请手工检查 %s）", cause, err, snap.path)
+	}
+	return cause
+}
+
+// reProxyCacheRef 匹配 vhost 里引用的缓存区（proxy_cache <区名>;）。
+var reProxyCacheRef = regexp.MustCompile(`(?m)^\s*proxy_cache\s+([A-Za-z0-9_]+)\s*;`)
+
+// reProxyVhostName 只认面板生成的反代规则文件（proxy-<数字>.conf）。
+// 刻意不用"前缀 + 后缀"模糊匹配：那会把用户自己建的 proxy-*.conf 也算进来，
+// 进而为它引用到的、面板不知道的缓存区报错。
+var reProxyVhostName = regexp.MustCompile(`^proxy-[0-9]+\.conf$`)
+
+// reProxyCacheKeysZone 从声明行里取出 keys_zone 的区名。
+var reProxyCacheKeysZone = regexp.MustCompile(`keys_zone=([A-Za-z0-9_]+):`)
+
+// zonesFromVhostText 取出配置文本里引用的缓存区名（proxy_cache off 不算）。
+func zonesFromVhostText(text string) []string {
+	var out []string
+	for _, m := range reProxyCacheRef.FindAllStringSubmatch(text, -1) {
+		if m[1] == "off" {
+			continue
+		}
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// zoneFromDeclLine 从 `proxy_cache_path` 声明行里取出区名（不是面板写的返回空串）。
+func zoneFromDeclLine(line string) string {
+	m := reProxyCacheKeysZone.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// cacheZonesContent 生成缓存区声明文件的内容。
+//
+// 判据是"**磁盘上真的被引用**"（只扫面板生成的反代 vhost，绝不去猜别的文件），
+// 而不是数据库状态：这样删除/停用规则后声明自然收敛，也不会和用户自己的
+// proxy_cache_path 撞出 duplicate zone。
+// extraVhostText 是本次**即将**落盘的 vhost 内容 —— 写盘前旧 vhost 还在磁盘上，
+// 它引用的缓存区必须继续有声明，否则提权助手跑的 `nginx -t` 会报 unknown zone。
+func (s *Server) cacheZonesContent(ctx context.Context, extraVhostText string) (string, error) {
+	root := s.proxyCacheRoot()
+	zones := map[string]bool{}
+	entries, rerr := os.ReadDir(s.Cfg.VhostDir)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		// 读不到 vhost 目录时**绝不能**当成"没有引用"去删声明：那会让仍在磁盘上的
+		// vhost 引用一个不存在的区，下一次 nginx -t 直接 unknown zone。
+		return "", fmt.Errorf("读取 vhost 目录失败：%v", rerr)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !reProxyVhostName.MatchString(name) {
+			continue
+		}
+		b, rerr := os.ReadFile(filepath.Join(s.Cfg.VhostDir, name))
+		if rerr != nil {
+			continue
+		}
+		for _, z := range zonesFromVhostText(string(b)) {
+			zones[z] = true
+		}
+	}
+	for _, z := range zonesFromVhostText(extraVhostText) {
+		zones[z] = true
+	}
+	if len(zones) == 0 {
+		return "", nil
+	}
+	// 已有的声明行：过渡态或历史行原样保留（不改写用户没让我们改的东西）。
+	existing := map[string]string{}
+	if b, rerr := os.ReadFile(s.proxyCacheConfPath()); rerr == nil {
+		for _, ln := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(ln)
+			if !strings.HasPrefix(t, "proxy_cache_path ") {
+				continue
+			}
+			if z := zoneFromDeclLine(t); z != "" {
+				existing[z] = t
+			}
+		}
+	}
+	names := make([]string, 0, len(zones))
+	for z := range zones {
+		names = append(names, z)
+	}
+	names = sortStrings(names)
+	decls := make([]string, 0, len(names))
+	for _, z := range names {
+		decl := ""
+		if id, ok := proxies.CacheZoneID(z); ok {
+			cfg, lerr := s.loadProxyCache(ctx, id)
+			if lerr != nil {
+				return "", lerr
+			}
+			if cfg.Enabled {
+				d, derr := proxies.CacheZoneDecl(root, id, cfg.Size, cfg.Valid)
+				if derr != nil {
+					return "", fmt.Errorf("缓存区 %s 无法声明：%w", z, derr)
+				}
+				decl = d
+			}
+		}
+		if decl == "" {
+			decl = existing[z]
+		}
+		if decl == "" {
+			return "", fmt.Errorf("缓存区 %s 被 nginx 配置引用，但面板找不到它的上限/有效期："+
+				"请重新保存对应规则，或手工清理 vhosts 下的 proxy-*.conf", z)
+		}
+		decls = append(decls, decl)
+	}
+	return proxies.CacheConfHeader + strings.Join(decls, "\n") + "\n", nil
+}
+
+// writeCacheConf 原子写入声明文件；内容为空时删除文件（= 没有任何规则开缓存，
+// 磁盘上与升级前完全一致）。返回是否发生改动。
+func (s *Server) writeCacheConf(content string) (bool, error) {
+	path := s.proxyCacheConfPath()
+	cur, rerr := os.ReadFile(path)
+	curExists := rerr == nil
+	if content == "" {
+		if !curExists {
+			return false, nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("删除缓存区声明失败：%v", err)
+		}
+		return true, nil
+	}
+	if curExists && string(cur) == content {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, fmt.Errorf("创建 conf.d 目录失败：%v", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return false, fmt.Errorf("写入缓存区声明失败：%v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return false, fmt.Errorf("替换缓存区声明失败：%v", err)
+	}
+	return true, nil
+}
+
+// applyCacheZones 重新生成 conf.d 的缓存区声明。返回改动前的快照与是否改动。
+func (s *Server) applyCacheZones(ctx context.Context, extraVhostText string) (proxyConfSnapshot, bool, error) {
+	snap := s.snapshotCacheConf()
+	content, err := s.cacheZonesContent(ctx, extraVhostText)
+	if err != nil {
+		return snap, false, err
+	}
+	changed, werr := s.writeCacheConf(content)
+	return snap, changed, werr
+}
+
+// proxyCacheTestFn 校验整份 nginx 配置（生产 = 提权助手跑 nginx -t）。做成变量
+// 是因为删/停用规则后的收敛路径也要校验，而单测不许碰真实 nginx。
+var proxyCacheTestFn = func(s *Server, ctx context.Context) error {
+	_, err := s.callHelper(ctx, "nginx-test")
+	return err
+}
+
+// clearProxyCache 清空一条规则的缓存目录，返回释放的字节数。
+// 目录不存在视为"已经是空的"（清空是幂等动作），不是错误。
+func (s *Server) clearProxyCache(rule *proxies.Rule) (int64, string, error) {
+	if rule == nil || rule.ID <= 0 {
+		return 0, "", errors.New("规则不存在，无法清空缓存")
+	}
+	dir := proxies.CacheZoneDir(s.proxyCacheRoot(), rule.ID)
+	if strings.TrimSpace(s.proxyCacheRoot()) == "" {
+		return 0, dir, errors.New("数据目录未配置，无法定位缓存目录")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return 0, dir, nil
+		}
+		return 0, dir, fmt.Errorf("读取缓存目录失败：%v", err)
+	}
+	freed, err := dirSize(dir)
+	if err != nil {
+		return 0, dir, fmt.Errorf("统计缓存大小失败：%v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return 0, dir, fmt.Errorf("清空缓存目录失败：%v", err)
+	}
+	// 回读：目录必须真的没了，否则就是我们自己谎报"已清空"。
+	if _, err := os.Stat(dir); err == nil {
+		return 0, dir, fmt.Errorf("清空后缓存目录 %s 仍然存在", dir)
+	}
+	return freed, dir, nil
+}
+
+// dirSize 递归统计目录占用（只在"清空缓存"与删除规则时调用，不在列表路径上）。
+func dirSize(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil // 单个文件读不到不影响总量统计
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
+}
+
+// reconcileProxyCache 让缓存区声明与磁盘上的 vhost 引用保持一致，并确保缓存目录
+// 存在：nginx 启动时若 proxy_cache_path 的父目录不存在会直接 [emerg]，所以启动
+// 时必须先补目录（挂在 reconcileForwarders 里，那是本文件唯一的启动钩子）。
+func (s *Server) reconcileProxyCache(ctx context.Context) {
+	content, err := s.cacheZonesContent(ctx, "")
+	if err != nil {
+		s.Log.Warn("缓存区声明检查失败：%v", err)
+		return
+	}
+	if content != "" {
+		if _, derr := s.ensureProxyCacheDir(); derr != nil {
+			// 不猜用户、也不动声明：现有声明仍合法，只是缓存可能写不进去。
+			s.Log.Warn("缓存目录归属处理失败（缓存可能写不进去）：%v", derr)
+		}
+	}
+	_, changed, err := s.applyCacheZones(ctx, "")
+	if err != nil {
+		s.Log.Warn("缓存区声明对齐失败：%v", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	if rerr := proxyReloadFn(s, ctx); rerr != nil {
+		s.Log.Warn("缓存区声明已更新但 nginx 重载失败：%v", rerr)
+	}
+}
+
 // proxyLookupHostFn 是"目标是公网还是局域网"判定用的 DNS 解析器，做成变量是为了
 // 单测能钉住解析结果（否则一次 go test 就会去查真实 DNS）。
 // 只用于**判定与提示**：真正决定"要不要起转发器"的是 Manager.NeedsForward。
@@ -554,6 +1062,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		s.Log.Warn("读取规则 %d 的鉴权配置失败：%v", rule.ID, err)
 	}
 	auth := s.proxyAuthView(ctx, rule)
+	cacheView := s.proxyCacheView(ctx, rule)
 
 	// 实时状态只读 TTL 缓存：**列表路径绝不跑真实探测**（见上面的缓存说明）。
 	st := proxyStatusLookup(rule)
@@ -636,6 +1145,16 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"target_scope":         string(scope),
 		// 直连 + 局域网目标 = 随时可能被 macOS 隐私门拦成 502。
 		"lan_direct_warning": scope == proxies.ScopePrivate && !fwdListening && rule.Enabled,
+		// ---- 反向代理缓存（可选，默认关）----
+		"cache":            cacheView,
+		"cache_enabled":    cacheView["enabled"],
+		"cache_size":       cacheView["size"],
+		"cache_valid":      cacheView["valid"],
+		"cache_zone":       cacheView["zone"],
+		"cache_dir":        cacheView["dir"],
+		"cache_dir_exists": cacheView["dir_exists"],
+		"cache_verified":   cacheView["verified"],
+		"cache_note":       cacheView["note"],
 	}
 }
 
@@ -787,6 +1306,28 @@ type proxyReq struct {
 	AuthEnabled  *bool   `json:"auth_enabled"`
 	AuthUser     *string `json:"auth_user"`
 	AuthPassword *string `json:"auth_password"`
+
+	// ---- 反向代理缓存（可选，默认关）----
+	CacheEnabled *bool   `json:"cache_enabled"`
+	CacheSize    *string `json:"cache_size"`
+	CacheValid   *string `json:"cache_valid"`
+	// CacheClear 是"清空这条规则的缓存"动作位（只清文件，不改配置）。
+	CacheClear *bool `json:"cache_clear"`
+}
+
+// cacheClearOnly 判断这次请求是不是"只清缓存"：除 cache_clear 外没有任何字段。
+// 是的话走短路，不重写配置、不重载 nginx —— 清文件本来就不需要动配置。
+func (req proxyReq) cacheClearOnly() bool {
+	if req.CacheClear == nil || !*req.CacheClear {
+		return false
+	}
+	return req.Name == nil && req.Listen == nil && req.Domains == nil && req.Path == nil &&
+		req.Target == nil && req.PreserveHost == nil && req.Websocket == nil && req.Enabled == nil &&
+		req.Remark == nil && req.SSLEnabled == nil && req.SSLCert == nil && req.SSLKey == nil &&
+		req.SSLProvider == nil && req.SSLExpires == nil && req.TLSName == nil &&
+		req.StandardHeaders == nil && req.RedirectHTTP == nil && req.LANForward == nil &&
+		req.AuthEnabled == nil && req.AuthUser == nil && req.AuthPassword == nil &&
+		req.CacheEnabled == nil && req.CacheSize == nil && req.CacheValid == nil
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -852,6 +1393,15 @@ func (req proxyReq) apply(rule *proxies.Rule) {
 			rule.SSLExpires = ""
 		}
 	}
+	if req.CacheEnabled != nil {
+		rule.CacheEnabled = *req.CacheEnabled
+	}
+	if req.CacheSize != nil {
+		rule.CacheSize = *req.CacheSize
+	}
+	if req.CacheValid != nil {
+		rule.CacheValid = *req.CacheValid
+	}
 }
 
 // handleProxyCreate 新建规则：先校验、查冲突、再落库并应用。
@@ -863,6 +1413,13 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	rule := &proxies.Rule{Listen: 80, Websocket: true, Enabled: true}
 	req.apply(rule)
+	// 缓存配置先合并再校验（Validate 会归一化上限/有效期）。
+	cacheCfg, cerr := proxyCacheFromRequest(req, proxyCacheConfig{})
+	if cerr != nil {
+		fail(w, http.StatusBadRequest, cerr.Error())
+		return
+	}
+	rule.CacheEnabled, rule.CacheSize, rule.CacheValid = cacheCfg.Enabled, cacheCfg.Size, cacheCfg.Valid
 	if err := rule.Validate(); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
@@ -904,10 +1461,17 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 后续任何一步失败都会把规则删掉，鉴权配置与它生成的 htpasswd 文件也要一起清掉。
+	// 缓存配置同理：applyProxy 从 settings 装回 Rule（生成 location 与缓存区声明都要）。
+	if err := s.saveProxyCache(r.Context(), created.ID, cacheCfg); err != nil {
+		_ = s.proxyRepo().Delete(r.Context(), created.ID)
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 后续任何一步失败都会把规则删掉，鉴权/缓存配置与它们生成的磁盘文件也要一起清掉。
 	cleanupCreatedAuth := func() {
 		_ = s.saveProxyAuth(r.Context(), created.ID, proxyAuthConfig{})
 		_ = os.Remove(s.proxyAuthFile(created.ID))
+		_ = s.saveProxyCache(r.Context(), created.ID, proxyCacheConfig{})
 	}
 	// 先起回环转发器（如果需要），再生成 nginx 配置：proxy_pass 里的端口是
 	// 转发器分配出来的，顺序反了就会写成一个没人听的端口。
@@ -969,6 +1533,31 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	next := *cur
 	req.apply(&next)
+	// "只清缓存"：不动配置、不重载（nginx 读不到被删的文件会回源重取）。
+	if req.cacheClearOnly() {
+		freed, dir, cerr := s.clearProxyCache(cur)
+		if cerr != nil {
+			fail(w, http.StatusInternalServerError, "清空缓存失败："+cerr.Error())
+			return
+		}
+		s.audit(r, "proxy_cache_clear", cur.Name,
+			fmt.Sprintf("清空缓存 %s（释放 %.1f MB）", dir, float64(freed)/1024/1024), true, "")
+		ok(w, map[string]any{"cleared": true, "freed_bytes": freed, "dir": dir,
+			"msg": fmt.Sprintf("已清空缓存（释放 %.1f MB）", float64(freed)/1024/1024)})
+		return
+	}
+	// 缓存配置：与鉴权同一条约定（真相在 settings 表），先合并再校验。
+	prevCache, cerr := s.loadProxyCache(r.Context(), id)
+	if cerr != nil {
+		fail(w, http.StatusInternalServerError, cerr.Error())
+		return
+	}
+	cacheCfg, cerr := proxyCacheFromRequest(req, prevCache)
+	if cerr != nil {
+		fail(w, http.StatusBadRequest, cerr.Error())
+		return
+	}
+	next.CacheEnabled, next.CacheSize, next.CacheValid = cacheCfg.Enabled, cacheCfg.Size, cacheCfg.Valid
 	if err := next.Validate(); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
@@ -1026,11 +1615,17 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 缓存配置同理（改上限要重写 conf.d 的缓存区声明、改有效期要重写 vhost）。
+	if err := s.saveProxyCache(r.Context(), id, cacheCfg); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := s.applyProxy(r.Context(), &next); err != nil {
-		_ = s.saveProxyAuth(r.Context(), id, prevAuth) // 鉴权配置回滚
-		_ = s.applyProxy(r.Context(), cur)             // 回滚成旧配置
-		_ = s.syncForwarder(cur)                       // 转发器也跟着回滚（含端口）
-		_ = s.syncRejectBlocks(r.Context())            // 兜底块也回到数据库描述的状态
+		_ = s.saveProxyAuth(r.Context(), id, prevAuth)   // 鉴权配置回滚
+		_ = s.saveProxyCache(r.Context(), id, prevCache) // 缓存配置回滚
+		_ = s.applyProxy(r.Context(), cur)               // 回滚成旧配置
+		_ = s.syncForwarder(cur)                         // 转发器也跟着回滚（含端口）
+		_ = s.syncRejectBlocks(r.Context())              // 兜底块也回到数据库描述的状态
 		fail(w, http.StatusBadGateway, "应用新配置失败（已回滚）："+err.Error())
 		return
 	}
@@ -1081,6 +1676,18 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		s.Log.Warn("清理规则 %d 的鉴权配置失败：%v", id, err)
 	}
 	_ = os.Remove(s.proxyAuthFile(id))
+	// 缓存配置与缓存文件同样清掉：规则都没了，留一个没人引用、还会占满磁盘的
+	// 缓存目录没有意义（清不掉也如实报出来，不谎报"已删除"）。
+	if err := s.saveProxyCache(r.Context(), id, proxyCacheConfig{}); err != nil && s.Log != nil {
+		s.Log.Warn("清理规则 %d 的缓存配置失败：%v", id, err)
+	}
+	cacheClearErr := ""
+	if _, _, cerr := s.clearProxyCache(cur); cerr != nil {
+		cacheClearErr = cerr.Error()
+		if s.Log != nil {
+			s.Log.Warn("清理规则 %d 的缓存目录失败：%v", id, cerr)
+		}
+	}
 	detail := fmt.Sprintf("%d → %s", cur.Listen, cur.Target)
 	if err := s.syncRejectBlocks(r.Context()); err != nil {
 		s.rejectGuardFailed(w, r, "proxy_delete", cur.Name,
@@ -1088,7 +1695,13 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "proxy_delete", cur.Name, detail, true, "")
-	ok(w, map[string]any{"msg": "已删除规则「" + cur.Name + "」并移除它的 nginx 配置"})
+	resp := map[string]any{"msg": "已删除规则「" + cur.Name + "」并移除它的 nginx 配置"}
+	if cacheClearErr != "" {
+		// 规则确实删了，但缓存目录没清掉：如实报出来，别让用户以为磁盘已经干净。
+		resp["cache_clear_error"] = cacheClearErr
+		resp["msg"] = resp["msg"].(string) + "；但缓存文件没清掉：" + cacheClearErr
+	}
+	ok(w, resp)
 }
 
 // rejectGuardFailed 把"域名兜底拒绝块没生效"如实上报为非 2xx，并写清"什么已经成功、
@@ -2217,18 +2830,47 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if err := s.writeProxyAuthFile(rule); err != nil {
 		return err
 	}
+	// 缓存配置同理（缓存区声明与 location 指令都由它决定）。
+	if err := s.hydrateProxyCache(ctx, rule); err != nil {
+		return err
+	}
+	// 开了缓存就先把目录建好并交给真实 worker 用户：拿不到用户如实失败，绝不猜（坑 173）。
+	if rule.CacheEnabled {
+		if _, err := s.ensureProxyCacheDir(); err != nil {
+			return err
+		}
+	}
 	content, err := rule.Generate(s.proxyLogDir())
 	if err != nil {
 		return err
 	}
 	snap := s.snapshotVhost(rule.VhostName())
+	// ① 过渡态：旧 vhost 还在磁盘上，它引用的缓存区必须继续有声明，否则提权助手
+	// 跑的 `nginx -t` 会报 unknown "…" zone 并把这次写入整份回滚。
+	zoneSnap, _, err := s.applyCacheZones(ctx, content)
+	if err != nil {
+		return err
+	}
 	// 复用站点的写盘通道：它经提权助手做原子写 + nginx -t 校验 + 失败回滚
 	if err := proxyWriteVhostFn(s, ctx, rule.VhostName(), content); err != nil {
-		return err
+		return s.restoreCacheConf(zoneSnap, err)
+	}
+	// ② 新 vhost 已落盘：只保留仍被引用的缓存区（关闭缓存从此收敛，不留没用的声明）。
+	if _, changed, zerr := s.applyCacheZones(ctx, ""); zerr != nil {
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+			s.restoreCacheConf(zoneSnap, zerr))
+	} else if changed {
+		// 删声明本身不会让配置非法，但仍让 nginx 自己说话一次（不能只看"我写完了"）。
+		if terr := proxyCacheTestFn(s, ctx); terr != nil {
+			return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+				s.restoreCacheConf(zoneSnap,
+					fmt.Errorf("缓存区声明已更新，但 nginx 配置校验未通过：%w", terr)))
+		}
 	}
 	// **写盘之后、reload 之前**把日志树交还真实用户，并在 reload 后做请求级复核。
 	if err := s.reloadProxyAndVerify(ctx, rule); err != nil {
-		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn, err)
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+			s.restoreCacheConf(zoneSnap, err))
 	}
 	return nil
 }
@@ -2254,6 +2896,9 @@ func (s *Server) syncForwarder(rule *proxies.Rule) error {
 // 端口分配结果落库（重启后复用同一个端口）；端口变了就重写对应 vhost —— 否则 nginx 里的
 // proxy_pass 会指向旧端口，表现为"转发器起来了、规则却是 502"。
 func (s *Server) reconcileForwarders(ctx context.Context) {
+	// 缓存区声明也在这里对齐：nginx 启动时若 proxy_cache_path 的父目录不存在会
+	// 直接 [emerg]，而这是在面板启动阶段唯一能补目录的时机（本文件里的启动钩子）。
+	s.reconcileProxyCache(ctx)
 	list, err := s.proxyRepo().List(ctx)
 	if err != nil {
 		s.Log.Warn("读取反向代理规则失败，跳过回环转发器对齐: %v", err)
@@ -2296,8 +2941,22 @@ func (s *Server) removeProxyConfig(ctx context.Context, rule *proxies.Rule) erro
 	if err := siteDeleteVhostFn(s, ctx, rule.VhostName()); err != nil {
 		return err
 	}
+	// 规则文件没了：把它引用过的缓存区声明一起收敛掉（否则 conf.d 会留下没人用的区）。
+	zoneSnap, changed, zerr := s.applyCacheZones(ctx, "")
+	if zerr != nil {
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+			s.restoreCacheConf(zoneSnap, zerr))
+	}
+	if changed {
+		if terr := proxyCacheTestFn(s, ctx); terr != nil {
+			return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+				s.restoreCacheConf(zoneSnap,
+					fmt.Errorf("缓存区声明已收敛，但 nginx 配置校验未通过：%w", terr)))
+		}
+	}
 	if err := s.reloadProxyAndVerifyGone(ctx, rule); err != nil {
-		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn, err)
+		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
+			s.restoreCacheConf(zoneSnap, err))
 	}
 	return nil
 }

@@ -94,7 +94,7 @@ func Plan(o PlanOptions) []Item {
 	add("data/certs", filepath.Join(o.DataDir, "certs"), ApplyReplace, true, TargetPanel)
 	add("data/site-certs", filepath.Join(o.DataDir, "site-certs"), ApplyReplace, true, TargetPanel)
 	add("data/proxy-certs", filepath.Join(o.DataDir, "proxy-certs"), ApplyReplace, true, TargetPanel)
-	// 反向代理的访问鉴权凭据（htpasswd 文件，2026-09-25 新增"可加权鉴"时引入）。
+	// 反向代理的访问鉴权凭据（htpasswd 文件，2026-09-19 新增"可加权鉴"时引入）。
 	// 必须进备份：vhost 里的 `auth_basic_user_file` 指向它，只备份库/vhost 而丢了
 	// 这个文件，恢复后要么鉴权悄悄失效、要么 nginx 因文件缺失而报错。
 	add("data/proxy-auth", filepath.Join(o.DataDir, "proxy-auth"), ApplyReplace, true, TargetPanel)
@@ -237,6 +237,7 @@ func DataExcludedNames() map[string]string {
 		"panel.db-wal": "数据库快照由 VACUUM INTO 生成，绝不用 WAL 文件凑",
 		"panel.db-shm": "同上",
 		"logs":         "日志可重建、体积大",
+		"proxy-cache":  "反向代理缓存（可回源重建，动辄上 GB，不该进备份）",
 	}
 }
 

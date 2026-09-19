@@ -132,6 +132,23 @@ type Rule struct {
 	// AuthFile 是生成的 htpasswd 文件绝对路径（nginx 的 auth_basic_user_file）。
 	AuthFile string `json:"auth_file,omitempty"`
 
+	// ---- 反向代理缓存（可选，默认关）----
+	//
+	// 与 Auth* 同一条约定：**不进 proxies 表**，真相存在面板 settings 表
+	// （键 `proxy_cache.<id>`，见 internal/web/api_proxies.go），生成配置前再装回 Rule。
+	// 这样"一条规则的缓存配置"仍然只有一份真相，也不抢 store 的 schema。
+	//
+	// CacheEnabled 为真时，location 里写 proxy_cache <区名> + 有效期，并在
+	// conf.d/<CacheConfName> 声明对应的 proxy_cache_path（见 cache.go）。
+	// 关闭时**一个 proxy_cache 指令都不写**，输出与加缓存之前逐字一致。
+	CacheEnabled bool `json:"cache_enabled"`
+	// CacheSize 是缓存上限（nginx max_size，如 1g / 512m）。
+	CacheSize string `json:"cache_size"`
+	// CacheValid 是有效期（proxy_cache_valid 的时间，如 1h / 1d）。
+	CacheValid string `json:"cache_valid"`
+	// CacheRoot 是缓存目录根（面板生成配置时填入；空 = 未配置，生成时直接报错）。
+	CacheRoot string `json:"cache_root,omitempty"`
+
 	Created time.Time `json:"created_at"`
 	Updated time.Time `json:"updated_at"`
 }
@@ -225,7 +242,7 @@ func (r *Rule) Validate() error {
 	r.AuthFile = strings.TrimSpace(r.AuthFile)
 
 	if r.Name == "" {
-		return fmt.Errorf("请填规则名称（只用于你自己识别，例如「NAS 镜像站」）")
+		return fmt.Errorf("请填规则名称（只用于你自己识别，例如「镜像站」）")
 	}
 	if r.Listen < 1 || r.Listen > 65535 {
 		return fmt.Errorf("监听端口要在 1~65535 之间，当前是 %d", r.Listen)
@@ -246,6 +263,18 @@ func (r *Rule) Validate() error {
 	r.LANForward = r.LANForwardMode()
 	if r.ForwardPort < 0 || r.ForwardPort > 65535 {
 		return fmt.Errorf("回环转发端口不合法：%d（应为 0~65535，0 表示不使用转发）", r.ForwardPort)
+	}
+	// 缓存：只在启用时校验/归一化（关闭时不碰这两个值，重新开启不用重填）。
+	if r.CacheEnabled {
+		size, err := NormalizeCacheSize(r.CacheSize)
+		if err != nil {
+			return err
+		}
+		valid, err := NormalizeCacheValid(r.CacheValid)
+		if err != nil {
+			return err
+		}
+		r.CacheSize, r.CacheValid = size, valid
 	}
 	for _, d := range SplitDomains(r.Domains) {
 		if strings.ContainsAny(d, " /:\\") {
@@ -637,11 +666,34 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		b.WriteString("\t\tproxy_set_header Connection $connection_upgrade;\n")
 	}
 
+	// 可选缓存：只写 location 级指令，缓存区（proxy_cache_path）在 conf.d 由面板声明。
+	if r.CacheEnabled {
+		if r.ID <= 0 {
+			return "", fmt.Errorf("规则「%s」开启了缓存，但规则还没有保存；请先保存再开缓存", r.Name)
+		}
+		if strings.TrimSpace(r.CacheRoot) == "" {
+			return "", fmt.Errorf("规则「%s」开启了缓存，但缓存目录未配置；请重新保存这条规则", r.Name)
+		}
+		zone := CacheZoneName(r.ID)
+		b.WriteString("\n\t\t# 反向代理缓存：回源一次，之后走本地缓存（缓存区在 conf.d 声明）\n")
+		fmt.Fprintf(&b, "\t\tproxy_cache %s;\n", zone)
+		fmt.Fprintf(&b, "\t\tproxy_cache_valid 200 301 302 %s;\n", r.CacheValid)
+		// WebSocket 升级请求不读、也不写缓存，避免把升级响应喂给普通请求。
+		b.WriteString("\t\tproxy_cache_bypass $http_upgrade;\n")
+		b.WriteString("\t\tproxy_no_cache $http_upgrade;\n")
+	}
+
 	// 反代经常遇到大文件/慢后端，默认 60s 会把正常请求掐断
 	b.WriteString("\n\t\tproxy_connect_timeout 60s;\n")
 	b.WriteString("\t\tproxy_send_timeout    3600s;\n")
 	b.WriteString("\t\tproxy_read_timeout    3600s;\n")
-	b.WriteString("\t\tproxy_buffering       off;\n")
+	if r.CacheEnabled {
+		// nginx 在 proxy_buffering off 时**根本不写缓存**（本机 1.31.5 实测：同一
+		// location 三次全 MISS、上游被打三次）。开缓存必须开缓冲，否则就是谎报成功。
+		b.WriteString("\t\tproxy_buffering       on;\n")
+	} else {
+		b.WriteString("\t\tproxy_buffering       off;\n")
+	}
 	// 请求体必须**边收边转发**给上游，不能先整段落盘到 client_body_temp。
 	//
 	// 为什么现在加（2026-09-18 生产事故）：那个临时目录一旦不可写（属主不对、
