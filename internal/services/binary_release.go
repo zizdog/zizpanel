@@ -71,6 +71,17 @@ type releaseBinaryApp struct {
 	CheckPortConflict bool
 	// Notes 是安装结果里要额外告诉用户的话
 	Notes []string
+	// MirrorOnly 表示这个包**只在镜像站上有**（没有 GitHub 官方地址，也没有第三方加速源）。
+	//
+	// 为什么需要它：mac军刀 是本仓库自己编的产物，`releaseURL()` 对它没有意义
+	// （Repo/Tag 留空会拼出一个不存在的 github.com//releases/... 地址）。
+	// 声明它之后下载候选只保留镜像站地址 —— 而不是"先试一个假地址再回落"。
+	//
+	// ⚠️ 这类应用**不走** releaseBinaryApps 的通用安装流程（那套是"系统级 LaunchDaemon +
+	// 家目录安装"），安装入口由 web 层的分流与 internal/services/macsaber.go 负责；
+	// 这里登记它是因为市场门禁要求 release_binary 下载点必须在
+	// ReleaseBinaryAssets() 注册表里有一份可核对的事实（版本/文件名）。
+	MirrorOnly bool
 }
 
 // webPort 返回网页界面/健康检查应当使用的端口（UIPort 为 0 时等于 Port）。
@@ -265,6 +276,21 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 			"⚠️ 上游项目已于 2026-09-01 归档：之后不再发版、不再修安全问题，请只在内网使用。",
 		},
 	},
+	// mac军刀（MacSaber）：本项目自研产物，**只在公网镜像站上**。
+	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
+	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
+	// 它的安装/卸载走 macsaber.go（用户级 LaunchAgent），不走这套通用流程。
+	"macsaber": {
+		ID: "macsaber", Label: MacSaberLabel, Name: "mac军刀", Icon: "🔪",
+		Category: "tool", RootDir: "macsaber", MirrorOnly: true,
+		Tag: MacSaberVersion, Asset: MacSaberArtifactName(MacSaberVersion),
+		Binary: "macsaber",
+		// 归档是平铺的（macsaber + README.md，无顶层目录），不剥层、只挑 macsaber。
+		TarStrip: 0, PickBinary: true,
+		Port: MacSaberPort, HealthPath: macSaberHealthPath,
+		BindAddress:       "127.0.0.1",
+		CheckPortConflict: true,
+	},
 }
 
 // panelConfigMarker 是"面板生成配置"的标记（重装时据此决定保留还是覆盖）。
@@ -364,6 +390,11 @@ func (a releaseBinaryApp) releaseURL() string {
 
 // downloadURLs 返回按优先级排列的下载地址：官方第一，其余为加速镜像。
 func (a releaseBinaryApp) downloadURLs() []string {
+	// MirrorOnly：只在镜像站上有（自研产物）。返回空列表 = "没有公网候选"，
+	// 调用方必须据此如实失败，而不是去试一个拼出来的假 GitHub 地址。
+	if a.MirrorOnly {
+		return nil
+	}
 	official := a.releaseURL()
 	urls := []string{official}
 	for _, m := range gitHubReleaseMirrors {
@@ -1059,6 +1090,16 @@ func max64(a float64, b float64) float64 {
 func IsReleaseBinaryApp(id string) bool {
 	_, ok := releaseBinaryApps[id]
 	return ok
+}
+
+// ReleaseBinaryIsMirrorOnly 报告某个 release 二进制条目是不是"只在镜像站上有"
+// （自研产物：没有官方 GitHub 地址）。
+//
+// 导出给 web 层分流用：这类条目虽然登记在注册表里（市场门禁要求），
+// 但**不能**走通用的 release 安装流程（那套会去 GitHub 拼地址、装系统级 daemon）。
+func ReleaseBinaryIsMirrorOnly(id string) bool {
+	spec, ok := releaseBinaryApps[id]
+	return ok && spec.MirrorOnly
 }
 
 // ReleaseBinaryAppConfigRelPaths 返回由本安装器部署的应用"家目录下的配置文件"相对路径

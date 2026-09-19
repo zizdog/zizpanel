@@ -26,20 +26,32 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 		if !strings.Contains(spec.Asset, "darwin_arm64") && !strings.Contains(spec.Asset, "darwin-arm64") {
 			t.Errorf("%s 的产物 %q 不是 darwin-arm64", id, spec.Asset)
 		}
-		if !strings.HasPrefix(spec.Tag, "v") {
-			t.Errorf("%s 的 tag %q 应当写死成 vX.Y.Z（跟着 latest 漂会装错版本）", id, spec.Tag)
-		}
-		urls := spec.downloadURLs()
-		if urls[0] != spec.releaseURL() {
-			t.Errorf("%s 的官方地址必须排在加速镜像前面，实际第一个是 %s", id, urls[0])
-		}
-		if !strings.Contains(urls[0], "github.com/"+spec.Repo+"/releases/download/") {
-			t.Errorf("%s 的官方地址不是 GitHub release：%s", id, urls[0])
-		}
-		for _, u := range urls {
-			if !strings.HasPrefix(u, "https://") {
-				t.Errorf("%s 的下载地址必须是 https：%s", id, u)
+		// MirrorOnly = 自研产物，只在镜像站上有（mac军刀）：
+		// 没有 GitHub tag / 官方地址 / 加速镜像，所以下面那三条"官方地址"的判据
+		// 对它不适用 —— 但**架构、目录一致性**这些判据一条都不放宽。
+		if !spec.MirrorOnly {
+			if !strings.HasPrefix(spec.Tag, "v") {
+				t.Errorf("%s 的 tag %q 应当写死成 vX.Y.Z（跟着 latest 漂会装错版本）", id, spec.Tag)
 			}
+			urls := spec.downloadURLs()
+			if len(urls) == 0 {
+				t.Errorf("%s 没有任何下载地址（非 MirrorOnly 的条目必须有官方地址）", id)
+			} else {
+				if urls[0] != spec.releaseURL() {
+					t.Errorf("%s 的官方地址必须排在加速镜像前面，实际第一个是 %s", id, urls[0])
+				}
+				if !strings.Contains(urls[0], "github.com/"+spec.Repo+"/releases/download/") {
+					t.Errorf("%s 的官方地址不是 GitHub release：%s", id, urls[0])
+				}
+				for _, u := range urls {
+					if !strings.HasPrefix(u, "https://") {
+						t.Errorf("%s 的下载地址必须是 https：%s", id, u)
+					}
+				}
+			}
+		} else if len(spec.downloadURLs()) != 0 {
+			t.Errorf("%s 标了 MirrorOnly 却还给出公网下载地址：%v（自研产物没有 GitHub 源）",
+				id, spec.downloadURLs())
 		}
 
 		app, ok := FindApp(id)
@@ -291,6 +303,13 @@ func TestReleaseBinaryChecksumRejectsMismatch(t *testing.T) {
 func TestReleaseBinaryUninstallPlans(t *testing.T) {
 	m := &Manager{opt: Options{UserHome: "/Users/tester", UserName: "tester"}}
 	for id := range releaseBinaryApps {
+		// MirrorOnly（自研产物，mac军刀）不走这条轨：它的卸载计划在
+		// macsaber.go 的 macSaberInstallPlan（用户级 LaunchAgent + /opt/macsaber，
+		// 与"家目录 + 系统级 daemon"的通用计划完全不同）。这里只保证
+		// "登记在注册表里的通用条目都有计划"。
+		if ReleaseBinaryIsMirrorOnly(id) {
+			continue
+		}
 		plan, ok := m.releaseBinaryPlan(id)
 		if !ok {
 			t.Fatalf("%s 没有卸载计划", id)

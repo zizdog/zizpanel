@@ -646,6 +646,11 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"stt": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallSTT(ctx, app, removeData, false, r)
 	},
+	// mac军刀（MacSaber）：bootout + 删 plist + 删 /opt/macsaber；数据目录与
+	// ~/MacSaberFiles **默认保留**（里面是账号、审计日志与用户自己的文件）。
+	"macsaber": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
+		return m.UninstallMacSaber(ctx, app, removeData, r)
+	},
 }
 
 // HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
@@ -1131,6 +1136,11 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		p.DataPaths = []string{filepath.Join(m.opt.UserHome, "Library", "Application Support", "Syncthing")}
 		p.KeepNote = "默认保留 Syncthing 的数据目录（设备身份与同步索引在里面）；" +
 			"删掉它等于重置本机身份，重新同步要重新配对设备。**同步目录本身不在这个目录里**，不受影响。"
+	case "macsaber":
+		// mac军刀：产物是自研的 LaunchAgent + /opt/macsaber，没有 brew 包要卸。
+		// 计划与执行端共用同一个 macSaberInstallPlan（路径只写一份，避免"计划说删 A、
+		// 实际删 B"）。
+		p = m.macSaberInstallPlan()
 	default:
 		p.Blocked = "这个应用没有卸载实现"
 	}

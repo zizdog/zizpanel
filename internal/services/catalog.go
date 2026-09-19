@@ -1509,6 +1509,42 @@ func Catalog() []App {
 			DocsURL: "https://alistgo.com",
 		},
 
+		// ---------------- mac军刀（本项目自研，原生 LaunchAgent） ----------------
+		//
+		// 与目录里别的条目最大的区别：**它没有上游**。产物是本仓库 macsaber/
+		// 自己编的 darwin/arm64 单二进制，由 tools/macsaber-release.sh 打包、
+		// 只发公网镜像站 <base>/apps/macsaber/<ver>/，没有 GitHub 回落源。
+		//
+		// 为什么是 LaunchAgent（而不是别的应用那种系统级 LaunchDaemon）：
+		// 它读的是**这个用户**的家目录、写的是**这个用户**的 ~/MacSaberFiles，
+		// 以 root 跑只会看到 /var/root 那一套。label 与 plist 位置沿用
+		// macsaber/README.md 预留的那一份（cn.macsaber.web /
+		// ~/Library/LaunchAgents/）—— 不另发明。
+		{
+			ID: MacSaberAppID, Name: "mac军刀", Icon: "🔪",
+			UI: &AppUI{
+				Slug: MacSaberSlug,
+				// 面板的 /macsaber/ 反代是"给打开入口"的实现；本机直连走
+				// http://127.0.0.1:<Port>/。两条都要求 mac军刀 自己先登录（它不带鉴权
+				// 就没有会话），所以经面板打开**不等于**免登录。
+				//
+				// ⚠️ Port 不是产品事实里的 8899：8899 被音色接收端占着（硬冲突，
+				// 见 services/macsaber.go 里 MacSaberPort 的注释与交付报告）。
+				Note: "网页界面只绑 127.0.0.1:" + strconv.Itoa(MacSaberPort) +
+					"（本机直连 http://127.0.0.1:" + strconv.Itoa(MacSaberPort) + "/）；" +
+					"经面板的 /macsaber/ 打开同样要登录 mac军刀 自己的账号。",
+			},
+			Summary: "macOS 原生小工具箱（图片转换 / 哈希 / 系统概览 / 去隔离）",
+			Description: "macOS 原生小工具箱：一个本地网页界面跑图片转换、哈希、系统概览等，" +
+				"只绑本机回环、不联网、不上传。",
+			Category: CategoryTool, Kind: KindNative,
+			PanelInstaller: MacSaberAppID, ServiceLabel: MacSaberLabel,
+			Port: MacSaberPort, HealthPath: macSaberHealthPath,
+			PostInstallHint: "首次打开要设置本机用户名与口令（口令至少 8 位，只存在这台机器上）。" +
+				"它的可读根是家目录、只写 ~/MacSaberFiles；首次用到某些目录时 macOS 可能弹一次隐私授权。",
+			DocsURL: "https://github.com/zizdog/zizpanel",
+		},
+
 		// ---------------- 一键建站（Category: site） ----------------
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",

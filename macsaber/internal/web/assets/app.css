@@ -1,0 +1,97 @@
+/* mac军刀 样式：只写通用渲染器需要的类，不做主题系统。 */
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --line: #e3e6ea;
+  --text: #1c1f23;
+  --muted: #6b7280;
+  --accent: #0a6cff;
+  --danger: #c0392b;
+  --warn: #b7791f;
+  --ok: #197d3f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.6 -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+}
+.top {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 20px; background: var(--card); border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; font-size: 16px; letter-spacing: .5px; }
+.top .meta { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
+.wrap { padding: 18px 20px 60px; max-width: 1100px; margin: 0 auto; }
+.hidden { display: none !important; }
+
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; margin-bottom: 14px;
+}
+.card.narrow { max-width: 420px; margin: 40px auto; }
+.card h2 { margin: 0 0 12px; font-size: 16px; }
+.card h3 { margin: 0 0 10px; font-size: 15px; }
+.hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+
+.fld { display: block; margin-bottom: 12px; }
+.fld > span { display: block; font-size: 13px; margin-bottom: 4px; }
+.fld em { color: var(--danger); font-style: normal; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fff; font: inherit; color: inherit;
+}
+textarea { min-height: 70px; resize: vertical; }
+textarea.multi { min-height: 130px; }
+label.check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
+label.check input { width: 16px; height: 16px; }
+
+button {
+  font: inherit; padding: 8px 14px; border-radius: 8px;
+  border: 1px solid var(--line); background: #fff; cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:disabled, button:disabled { opacity: .5; cursor: not-allowed; }
+button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+button.tool {
+  display: block; width: 100%; text-align: left; margin-bottom: 8px;
+  border-left: 3px solid transparent;
+}
+button.tool.active { border-left-color: var(--accent); background: #f0f6ff; }
+button.tool small { display: block; color: var(--muted); font-size: 12px; }
+
+/* 工具卡片 */
+.cats { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.cats button { padding: 5px 12px; border-radius: 999px; font-size: 13px; }
+.cats button.active { background: #e8f0ff; border-color: #c7dcff; color: #0a53c0; }
+.toolgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.tcard { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #fff; }
+.tcard h4 { margin: 0 0 4px; font-size: 14px; }
+.tcard p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+.tcard .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+.badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); color: var(--muted); }
+.badge.async { border-color: #c7dcff; color: #0a53c0; background: #f0f6ff; }
+.badge.danger { border-color: #f3c9c4; color: var(--danger); background: #fdf2f0; }
+.badge.no { border-color: #f0d9a8; color: var(--warn); background: #fff8e8; }
+.note { color: var(--muted); font-size: 12px; margin: 2px 0 8px; }
+.note.danger { color: var(--danger); }
+
+/* 结果 */
+.kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; word-break: break-all; }
+table.grid { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.grid th, table.grid td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; }
+table.grid th { color: var(--muted); font-weight: 500; }
+pre.out {
+  background: #0f1115; color: #e6e6e6; padding: 12px; border-radius: 8px;
+  overflow: auto; max-height: 420px; font-size: 12px; margin: 0;
+}
+.bar { height: 8px; background: #eceff3; border-radius: 999px; overflow: hidden; margin: 10px 0; }
+.bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+.msg.ok { color: var(--ok); }
+.msg.err { color: var(--danger); }
+.toast {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+  background: #1c1f23; color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 13px;
+}
