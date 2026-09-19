@@ -41,7 +41,7 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="1.4.6"
+SCRIPT_VERSION="1.4.7"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
@@ -182,6 +182,11 @@ SUDOERS_PATH="$SUDOERS_DIR/zizpanel"
 # PANEL_PORT 在 main 里由 panel_port() 填好；这里的空值只是给 shellcheck 的声明。
 PANEL_PORT=""
 TMP_DIR=""
+# 外接盘与系统授权（真机/远程不同，见 setup_external_volume_notice）：
+#   ZP_EXTERNAL_MODE = local（真机）/ remote（远程 SSH）/ ""（没判定）
+#   ZP_EXTERNAL_ACK  = 1 表示用户当面同意"安装时顺便申请一次外接盘授权"
+ZP_EXTERNAL_MODE=""
+ZP_EXTERNAL_ACK=0
 # 脚本所在目录（用于定位随包分发的工具脚本）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 
@@ -1515,6 +1520,17 @@ finish() {
   printf '\n'
   # 只有**显式要求**（ZP_LAN_PREAUTH=1）才写过预授权；写了就必须在最后再提醒一次重启
   # （真机反馈：之前提示只出现在中间那一步，装完的摘要里没有，用户以为装完就生效了）。
+  # 外接硬盘的授权状态：真机（已申请）/ 远程（没触发任何弹窗，必须到真机授权）。
+  if [ "${ZP_EXTERNAL_MODE:-}" = "local" ] && [ "${ZP_EXTERNAL_ACK:-0}" = "1" ]; then
+    printf '  外接硬盘   已按你的同意申请一次系统授权：若屏幕弹过「访问可移除宗卷」请确认点了「允许」。\n'
+    printf '             升级面板后二进制会变，系统可能要你再授权一次（不是 bug）。\n'
+    printf '\n'
+  elif [ "${ZP_EXTERNAL_MODE:-}" = "remote" ]; then
+    printf '  %s外接硬盘   本次远程安装没有触发任何授权弹窗。%s\n' "$C_YELLOW" "$C_RESET"
+    printf '             要用外接盘请到真机上：系统设置 → 隐私与安全性 → 完全磁盘访问权限\n'
+    printf '             → 点「+」选中 %s/bin/zizpanel → 打开开关 → 重启面板。\n' "$ZIZPANEL_ROOT"
+    printf '\n'
+  fi
   if [ "${LAN_PREAUTH_APPLIED:-0}" = "1" ]; then
     printf '  %s⚠ 你要求写入的「免授权访问内网段」已写入，但要重启电脑才生效。%s\n' "$C_BOLD" "$C_RESET"
     printf '     重启前一切照旧（面板的 Plan B 回环转发器已经在工作），想生效就找时间重启一次。\n'
@@ -1981,6 +1997,125 @@ is_remote_session() {
   console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo "")"
   if [ -n "$console_user" ] && [ "$console_user" != "root" ] && [ "$console_user" = "${REAL_USER:-}" ]; then
     return 1
+  fi
+  return 0
+}
+
+# --------------------------------------------- 外接硬盘与系统授权（真机/远程）--
+#
+# 🚨 用户 2026-09-19 定的**铁律**（安装脚本与面板都必须遵守）：
+#   · **真机安装**：可以（也只有这时才允许）在安装过程中触发系统授权弹窗 ——
+#     人就在屏幕前，点一下「允许」就完事；
+#   · **远程 / 无人在场**：**绝不触发任何系统授权弹窗** —— 弹了也没人点，
+#     系统只会把它记成 denial，反而让面板以后访问外接盘一直"静默被拒"。
+#   · 无论哪种，都要**先告诉用户、拿到确认**再继续。
+#
+# 为什么外接盘要单独说：macOS 的「可移除宗卷」保护是按**卷**判定的（换挂载点绕不过去，
+# 2026-09-19 实测），面板以 root 守护进程运行时必须由**用户授权**才能读写外接盘。
+# 授权是发给"面板这个二进制"的：升级换二进制后可能要重新授权一次。
+
+# external_volume_list：列出当前挂载的非系统卷（与面板侧 files.NonSystemVolumeMounts 同口径：
+# 扫描 /Volumes，排除指向 / 的软链接）。
+external_volume_list() {
+  local v
+  for v in /Volumes/*; do
+    [ -e "$v" ] || continue
+    [ -L "$v" ] && continue
+    [ -d "$v" ] || continue
+    printf '%s\n' "$v"
+  done
+}
+
+# console_login_user：当前图形控制台（屏幕前）的登录用户；没人时为 root/loginwindow/空。
+console_login_user() {
+  local u=""
+  u="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo "")"
+  printf '%s' "$u"
+}
+
+# setup_external_volume_notice：安装最前面就问清楚（用户要求"过程中要让用户知道并确认"）。
+setup_external_volume_notice() {
+  title "外接硬盘与系统授权（真机 / 远程不一样）"
+  local vols=""
+  vols="$(external_volume_list)"
+
+  if is_remote_session; then
+    ZP_EXTERNAL_MODE="remote"
+    warn "你是从**别的电脑**（SSH/远程）运行这个安装脚本的。"
+    info "· 本次安装**不会触发任何系统授权弹窗**：没人能在机器前点按钮，"
+    info "  弹窗只会被系统记成拒绝，反而让面板以后一碰外接盘就是「静默被拒」。"
+    info "· 要用外接硬盘（做镜像盘 / 在文件管理里访问），必须到**真机**上授权一次："
+    info "    系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 $BIN_DIR/zizpanel"
+    info "    （这块盘还要给站点/镜像站用，就把 nginx 的二进制也照同样方式加上）→ 打开开关 → 重启面板"
+    info "· 授权是发给**面板这个二进制**的：升级面板后二进制变了，可能要再授权一次。"
+    if zp_yes "明白了：外接硬盘需要我到真机上授权。继续安装？" "y"; then
+      return 0
+    fi
+    die "已按你的要求停止安装（可以稍后到真机上再跑一次）"
+  fi
+
+  # ---- 真机安装 ----
+  ZP_EXTERNAL_MODE="local"
+  ok "你在**本机**（这台机器的屏幕/键盘前）运行安装脚本 —— 可以走系统授权弹窗。"
+  if [ -n "$vols" ]; then
+    info "检测到外接卷："
+    printf '%s\n' "$vols" | sed 's/^/    /'
+  else
+    info "当前没有检测到外接卷。"
+  fi
+  info "· 打算把外接硬盘当镜像盘 / 在文件管理里用它：**现在就插上**（插好后再按回车），"
+  info "  安装会替你向系统申请一次授权 —— 屏幕上弹出「…想要访问可移除宗卷上的文件」时点「允许」。"
+  info "· 不插也行：以后随时能在真机上补授权（系统设置 → 隐私与安全性 → 完全磁盘访问权限）。"
+  info "· 授权跟面板二进制绑定：升级面板后系统可能要你再点一次，这不是面板的 bug。"
+  if zp_yes "要用外接硬盘的话，现在插好了吗？（选 n = 这次不申请外接盘授权）" "y"; then
+    ZP_EXTERNAL_ACK=1
+  else
+    ZP_EXTERNAL_ACK=0
+    info "好，这次不申请外接盘授权 —— 安装过程一个字节都不会碰外接卷。"
+  fi
+  return 0
+}
+
+# request_external_volume_auth：把"一次性授权请求"标记写给面板（守护进程启动时处理）。
+#
+# 只在下述条件**全部**成立时才写：
+#   ① 真机安装（不是 SSH 远程）；② 用户当面同意；③ 当前确实有外接卷；
+#   ④ 当前有图形登录会话（否则没人在屏幕前，绝不触发弹窗）；⑤ 不是沙箱/干跑。
+# 守护进程拿到标记后也只读**一次**（见 internal/files/volumeauth.go），绝不反复弹窗。
+request_external_volume_auth() {
+  local marker="$DATA_DIR/request-volume-auth.once"
+  [ "${ZIZPANEL_SANDBOX:-0}" = "1" ] && return 0
+  [ "${ZP_EXTERNAL_MODE:-}" = "local" ] || return 0
+  [ "${ZP_EXTERNAL_ACK:-0}" = "1" ] || return 0
+
+  if dry_run; then
+    info "（干跑）真机安装且已同意：将写入一次性授权请求 $marker"
+    return 0
+  fi
+
+  local console_user="" vols=""
+  console_user="$(console_login_user)"
+  case "$console_user" in
+    ""|root|loginwindow)
+      info "当前没有图形登录会话（控制台用户：${console_user:-无}）→ 不写授权请求。"
+      info "原因：没人在屏幕前时绝不触发系统弹窗（弹了只会被记成拒绝）。"
+      info "需要时请到真机前：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 加上 $BIN_DIR/zizpanel"
+      return 0
+      ;;
+  esac
+  vols="$(external_volume_list)"
+  if [ -z "$vols" ]; then
+    info "当前没有外接卷，跳过授权请求（以后插上盘再到真机上授权即可）。"
+    return 0
+  fi
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  if printf '1\n' > "$marker" 2>/dev/null; then
+    chmod 600 "$marker" 2>/dev/null || true
+    ok "已记录一次性授权请求（${marker}）"
+    info "面板启动后会替你申请一次外接盘授权：屏幕上弹出「…想要访问可移除宗卷上的文件」时点「允许」。"
+    info "只有这一次会自动申请 —— 被拒或错过的话，去系统设置里手动加一次即可。"
+  else
+    warn "写授权请求失败：${marker}（请稍后在真机的系统设置里手动授权）"
   fi
   return 0
 }
@@ -2534,6 +2669,10 @@ main() {
   # 放在最前面：用户还没等太久就拿到反馈，且口令/后缀有问题时不会白装一半。
   collect_basic_info
 
+  # 外接硬盘与系统授权：**真机**才允许在安装期弹窗要权限，远程安装绝不触发弹窗。
+  # 必须早问：用户还得有时间把外接盘插上（用户 2026-09-19 的铁律）。
+  setup_external_volume_notice
+
   # 在线升级源的探测放在最前面：它只做几次 HEAD 请求，很快，
   # 而且结果要写进 config.json（write_raw_config 会用它）。
   title "面板在线升级源"
@@ -2582,6 +2721,8 @@ main() {
   fi
 
   install_sudoers
+  # 让面板（守护进程）在启动时替用户申请一次外接盘授权：标记必须在启动**之前**写好。
+  request_external_volume_auth
   install_daemon
   setup_nginx_env
   setup_cert

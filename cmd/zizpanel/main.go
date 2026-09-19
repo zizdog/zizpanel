@@ -30,6 +30,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/auth"
 	"github.com/zizdog/zizpanel/internal/config"
+	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/logx"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
@@ -337,6 +338,22 @@ func cmdServe(args []string) error {
 	// 启动时做一次环境准备与自愈（站点日志目录、nginx 的 WebSocket map 等）。
 	// 只调用一次：Startup 内部会跑 nginx -t 并可能重载，重复调用纯属白做一遍。
 	srv.Startup(context.Background())
+
+	// 一次性"请求系统授权访问外接卷"（macOS 隐私保护）。
+	//
+	// 🚨 铁律（用户 2026-09-19）：**非真机 / 无人在场时绝不触发任何系统授权弹窗**。
+	// 所以这里只在安装脚本留下"一次性标记"（真机安装 + 用户当面同意）**且当前有
+	// 图形登录会话**时才去读一次外接卷；其余情况一个字节都不读。
+	// 详见 internal/files/volumeauth.go 的说明。
+	go func() {
+		marker := files.VolumeAuthMarkerPath(cfg.DataDir)
+		res := files.RequestVolumeAuthorizationOnce(context.Background(), marker, 90*time.Second, log.Info)
+		if !res.MarkerConsumed {
+			return
+		}
+		log.Info("外接卷授权请求处理完毕：可访问 %d 个，被系统拒绝 %d 个（控制台用户 %q）",
+			len(res.Okay), len(res.Attempted), res.ConsoleUser)
+	}()
 
 	// 预热市场缓存。`brew list` 要约 1.5 秒，放在这里异步做掉，
 	// 用户第一次打开市场就能命中缓存，不必等 brew。
