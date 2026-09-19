@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent 草图：本轮只提供文件，没有安装，也没有验证过加载。
+  这是用户级 Agent（随登录启动、以当前用户身份运行），不是系统 Daemon。
+  安装前把 PROGRAM 和 DATA_DIR 换成真实路径。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cn.govideo.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/CHANGE_ME/bin/govideo</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/CHANGE_ME/Library/Application Support/govideo</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>GV_FFMPEG_BIN</key>
+    <string>/opt/homebrew/bin/ffmpeg</string>
+    <key>GV_FFPROBE_BIN</key>
+    <string>/opt/homebrew/bin/ffprobe</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/CHANGE_ME/Library/Logs/govideo.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/CHANGE_ME/Library/Logs/govideo.err.log</string>
+</dict>
+</plist>

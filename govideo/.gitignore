@@ -1,0 +1,5 @@
+dist/
+fixtures/
+*.db
+*.db-wal
+*.db-shm
