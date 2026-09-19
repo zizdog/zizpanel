@@ -374,29 +374,7 @@ func (c *Client) DumpDatabase(ctx context.Context, db, destDir string) (*DumpRes
 	return res, nil
 }
 
-// ImportDatabase 从 SQL 文件导入到一个库。
-//
-// 导入前会检查文件是否存在与大小上限，
-// 避免误选几百 MB 的文件把 request 拖住。
-func (c *Client) ImportDatabase(ctx context.Context, db, sqlFile string) (string, error) {
-	if err := ValidateDBName(db); err != nil {
-		return "", err
-	}
-	if !filepath.IsAbs(sqlFile) {
-		return "", errors.New("SQL 文件路径必须是绝对路径")
-	}
-	st, err := os.Stat(sqlFile)
-	if err != nil {
-		return "", fmt.Errorf("找不到 SQL 文件: %w", err)
-	}
-	if st.IsDir() {
-		return "", errors.New("这是一个目录，请选择 .sql 文件")
-	}
-
-	return c.ImportDatabaseProgress(ctx, db, sqlFile, nil)
-}
-
-// ImportDatabaseProgress 与 ImportDatabase 相同，但把**已送入 mysql 的字节数**回调出去。
+// ImportDatabaseProgress 把 SQL 文件导入到一个库，并把**已送入 mysql 的字节数**回调出去。
 //
 // 为什么需要（2026-09-18 用户报障）：4MB 的 SQL 通过 phpMyAdmin 导入时页面没有任何
 // 输出，用户只能看到"卡死"；而面板自己的导入以前也是个长请求，同样看不到进展。

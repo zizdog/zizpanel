@@ -64,6 +64,7 @@ type fakeWorld struct {
 	erasedVol      map[string]eraseState // 分区/卷 eraseVolume 的结果
 	renamed        map[string]string     // 卷重命名
 	deleted        map[string]bool       // 已删除的 APFS 卷
+	containerPlain bool                  // 容器盘不报 VirtualOrPhysical=Virtual（只靠 Content 认）
 }
 
 func newFakeWorld() *fakeWorld {
@@ -172,6 +173,7 @@ func staticInfo(id string) map[string]any {
 			"APFSContainerReference": "disk4", "BusProtocol": "USB", "SMARTStatus": "Not Supported"}
 	case "disk4":
 		return map[string]any{"DeviceIdentifier": id, "WholeDisk": true, "Internal": false,
+			"VirtualOrPhysical":              "Virtual",
 			"RemovableMediaOrExternalDevice": true, "Content": "Apple_APFS_Container",
 			"Size": int64(1023999787008), "BusProtocol": "USB", "MediaName": "RTL9210",
 			"APFSPhysicalStores": []any{map[string]any{"APFSPhysicalStore": "disk9s2"}},
@@ -245,6 +247,9 @@ func (w *fakeWorld) infoDict(id string) map[string]any {
 	}
 	if isRenamed {
 		out["VolumeName"] = newName
+	}
+	if w.containerPlain && id == "disk4" {
+		out["VirtualOrPhysical"] = "Physical"
 	}
 	w.mu.Lock()
 	mp, mounted := w.mounted[id]
@@ -487,6 +492,8 @@ func stubDiskWorld(t *testing.T, w *fakeWorld) string {
 // newDiskServer 起一个用假磁盘世界武装起来的测试服务器，并完成初始化登录。
 func newDiskServer(t *testing.T, w *fakeWorld) (*Server, *httptest.Server, []*http.Cookie) {
 	t.Helper()
+	// 快照缓存是全局的：不清掉，下一个夹具会读到上一个夹具的磁盘状态（门禁会假绿）。
+	invalidateDiskSnapshotCache()
 	stubDiskWorld(t, w)
 	srv, ts := newTestServer(t)
 	res, out, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
@@ -689,21 +696,33 @@ func TestDiskListReturnsExternalDiskAndPartitions(t *testing.T) {
 	for _, p := range asSlice(g9["partitions"]) {
 		ids = append(ids, asString(mapGet(p, "id")))
 	}
-	if strings.Join(ids, ",") != "disk9s1,disk9s2" {
-		t.Fatalf("disk9 的分区应为 disk9s1,disk9s2，实际 %v", ids)
+	// 合成 APFS 容器 disk4 活在 disk9s2 的设备树里 ⇒ 不许再单独出一张卡，
+	// 它的卷必须并进物理盘 disk9（nested_under 指回容器分区）。坑 192。
+	if strings.Join(ids, ",") != "disk9s1,disk9s2,disk4s1" {
+		t.Fatalf("disk9 的分区应为 disk9s1,disk9s2,disk4s1，实际 %v", ids)
+	}
+	if findGroup(data, "disk4") != nil {
+		t.Error("合成 APFS 容器 disk4 不该再单独占一张卡（重复条目）")
+	}
+	// 容器的 init 必须挂到这张卡上，否则前端「新建 APFS 卷」按钮会整块消失（空容器尤其明显）。
+	if asString(mapGet(g9["init"], "container_ref")) != "disk4" {
+		t.Errorf("disk9 卡片应带容器 init（container_ref=disk4），实际 %v", g9["init"])
 	}
 	if mapGet(findGroup(data, "disk0")["disk"], "system_disk") != true {
 		t.Error("disk0 必须被标成系统盘")
 	}
 	// disk4s1 ZPMirror 应带挂载点与"已挂载"、SMART 如实
 	var zd map[string]any
-	for _, p := range asSlice(findGroup(data, "disk4")["partitions"]) {
+	for _, p := range asSlice(g9["partitions"]) {
 		if asString(mapGet(p, "id")) == "disk4s1" {
 			zd, _ = p.(map[string]any)
 		}
 	}
 	if zd == nil {
 		t.Fatal("找不到 disk4s1（ZPMirror）")
+	}
+	if asString(zd["nested_under"]) != "disk9s2" {
+		t.Errorf("disk4s1 必须标 nested_under=disk9s2，实际 %q", asString(zd["nested_under"]))
 	}
 	if zd["mounted"] != true || asString(zd["mount_point"]) != "/Volumes/ZPMirror" {
 		t.Errorf("disk4s1 应显示已挂载于 /Volumes/ZPMirror，实际 %v", zd)
@@ -716,6 +735,93 @@ func TestDiskListReturnsExternalDiskAndPartitions(t *testing.T) {
 	}
 	if len(asSlice(data["protected"])) == 0 {
 		t.Fatal("protected 不能为空（至少要有系统盘）")
+	}
+}
+
+// TestDiskListOneCardPerPhysicalDisk 遍历全量分组，锁死"一台物理设备一张卡"这一类：
+// 卡片 id 不许撞车；合成 APFS 容器不许自己成卡；nested_under 必须指向同组、且排在它前面的分区。
+// 坑 192：外接盘在列表里出现两张卡（disk9 物理盘 + disk4 APFS 容器），同一块盘看两遍。
+func TestDiskListOneCardPerPhysicalDisk(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		plainContent bool // 容器盘没被报成 Virtual，只靠 Content 认出来（真机上见过）
+	}{
+		{name: "Virtual 容器"},
+		{name: "只报 Content 的容器", plainContent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newFakeWorld()
+			w.containerPlain = tc.plainContent
+			assertOneCardPerPhysicalDisk(t, w)
+		})
+	}
+}
+
+func assertOneCardPerPhysicalDisk(t *testing.T, w *fakeWorld) {
+	t.Helper()
+	_, ts, cookies := newDiskServer(t, w)
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/system/disks", nil, cookies)
+	data, _ := out["data"].(map[string]any)
+
+	// 从原始 plist 推出"哪些容器被合进了哪块物理盘"，判据不写死设备号。
+	rootMap, err := parsePlist([]byte(w.listPlist()))
+	if err != nil {
+		t.Fatalf("解析夹具 plist 失败: %v", err)
+	}
+	root := plistMap(rootMap)
+	storeOf := map[string]string{} // 合成容器 id → 它建在其上的分区 id
+	partitionIDs := map[string]bool{}
+	for _, it := range plistArray(root["AllDisksAndPartitions"]) {
+		node := plistMap(it)
+		cid := plistStr(node, "DeviceIdentifier")
+		info := w.infoDict(cid)
+		for _, pit := range plistArray(node["Partitions"]) {
+			partitionIDs[plistStr(plistMap(pit), "DeviceIdentifier")] = true
+		}
+		// 与后端同判据：Virtual 或内容类型是容器。
+		if asString(mapGet(info, "VirtualOrPhysical")) != "Virtual" &&
+			!strings.EqualFold(asString(mapGet(info, "Content")), "Apple_APFS_Container") {
+			continue
+		}
+		for _, s := range plistArray(info["APFSPhysicalStores"]) {
+			storeOf[cid] = plistStr(plistMap(s), "APFSPhysicalStore")
+		}
+	}
+	if len(storeOf) == 0 {
+		t.Fatal("夹具里必须有一个建在物理盘上的合成容器，否则这条门禁没在测东西")
+	}
+
+	seen := map[string]bool{}
+	for _, it := range asSlice(data["list"]) {
+		g, _ := it.(map[string]any)
+		id := asString(mapGet(g["disk"], "id"))
+		if seen[id] {
+			t.Errorf("%s 出了不止一张卡（重复条目）", id)
+		}
+		seen[id] = true
+		if store, isContainer := storeOf[id]; isContainer && partitionIDs[store] {
+			t.Errorf("合成容器 %s 已并入 %s，却仍单独占一张卡", id, store)
+		}
+		inGroup := map[string]int{}
+		for i, p := range asSlice(g["partitions"]) {
+			inGroup[asString(mapGet(p, "id"))] = i
+		}
+		for i, p := range asSlice(g["partitions"]) {
+			pid := asString(mapGet(p, "id"))
+			parent := asString(mapGet(p, "nested_under"))
+			if parent == "" {
+				continue
+			}
+			pi, ok := inGroup[parent]
+			if !ok {
+				t.Errorf("%s 的嵌套卷 %s 指向不存在的同组分区分区 %s", id, pid, parent)
+			} else if pi > i {
+				t.Errorf("%s 的嵌套卷 %s 排在容器分区 %s 前面，缩进会读反", id, pid, parent)
+			}
+		}
+	}
+	if !seen["disk9"] || seen["disk4"] {
+		t.Errorf("外接盘应只有 disk9 一张卡，实际 %v", seen)
 	}
 }
 

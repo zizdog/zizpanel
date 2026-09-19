@@ -9,7 +9,7 @@
 
 import { api } from './api.js';
 import {
-  h, clear, toast, modal, confirmBox, $,
+  h, clear, toast, modal, confirmBox,
 } from './ui.js';
 import { state, registerCleanup } from './app.js';
 // 任务中心：LNMP 是长任务（十几分钟），提交后立刻返回 task_id，进度走 SSE。
@@ -29,6 +29,8 @@ import { configFileModal } from './services.js';
 // renderLimitsInto 里，由 nginxpanel.js 直接复用。
 // 宝塔式「⚙️ 调整配置」（nginx 四页 + 上传与执行上限 + 配置文件 + PHP 环境）。
 import { adjustConfigModal } from './nginxpanel.js';
+// 网络失败判据与统一文案（唯一前端真源，见 netfail.js；后端同名判据见 services/netfail.go）。
+import { isNetworkFailureText, networkHintBlock } from './netfail.js';
 
 let cache = null; // 站点列表数据（含预设与 PHP 版本）
 
@@ -42,73 +44,8 @@ let defSite = null;
 // 站点详情面板当前所在的 Tab
 let detailTab = 'basic';
 
-// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
-// 文案纪律：标题一句话 ≤40 字，改镜像/代理的入口收进折叠项。
-const NET_HINT_MARKER = '面板不会替你翻墙';
-const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+// NET_HINT_ENTRIES 是本页"去哪改镜像/代理"的入口（各页入口不同）。
 const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker 页 →「加速源」（Docker 镜像）。';
-const NET_EVIDENCE = [
-  'could not resolve host', 'temporary failure in name resolution',
-  'name or service not known', 'no such host', 'server misbehaving',
-  'connection refused', 'connection timed out', 'connection timeout',
-  'connection reset by peer', 'no route to host', 'network is unreachable',
-  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
-  'failed to connect to', "couldn't connect to server", 'could not connect to server',
-  'dial tcp', 'dial udp',
-  'tls handshake timeout', 'tls: failed to verify certificate',
-  'tls: bad certificate', 'remote error: tls:', 'x509:',
-  'certificate signed by unknown authority', 'certificate is not valid for',
-  'client.timeout exceeded', 'request canceled while waiting for connection',
-  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
-  'curl: (56)', 'curl: (60)', 'ssl connect error',
-];
-const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
-const NET_LOCAL_OVERRIDE = ['proxyconnect'];
-
-// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
-function isNetworkFailureText(text) {
-  const msg = String(text == null ? '' : text).toLowerCase();
-  if (!msg.trim()) return false;
-  if (msg.includes(NET_HINT_MARKER)) return true;
-  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
-  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地服务没起来 ≠ 要翻墙
-  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
-  if (msg.includes('context deadline exceeded')
-    && (msg.includes('http://') || msg.includes('https://'))) return true;
-  return false;
-}
-
-// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
-function networkHintBlock(errText) {
-  const raw = String(errText == null ? '' : errText).trim();
-  const nodes = [
-    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
-      h('strong', { text: NET_HINT_ONE_LINE }),
-    ]),
-    h('details', { style: { marginTop: '6px' } }, [
-      h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
-      h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
-    ]),
-  ];
-  if (raw) {
-    nodes.push(h('div', {
-      style: {
-        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
-        color: 'var(--text-dim)', wordBreak: 'break-all',
-      },
-      text: '原始报错：' + raw,
-    }));
-  }
-  return h('div', {
-    dataset: { testid: 'zp-network-failure' },
-    style: {
-      padding: '11px 13px', background: 'var(--danger-soft)',
-      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
-      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
-    },
-  }, nodes);
-}
 
 // netFailureHost 是本页的提示容器（SitesView 挂载）。LNMP / Nginx 安装任务在没有
 // 网络时失败，要在这里说清"是网络问题"，而不是让用户以为建站功能坏了。
@@ -118,7 +55,7 @@ let netFailureHost = null;
 function showNetFailure(errText) {
   if (!netFailureHost || !isNetworkFailureText(errText)) return;
   clear(netFailureHost);
-  netFailureHost.append(networkHintBlock(errText));
+  netFailureHost.append(networkHintBlock(errText, NET_HINT_ENTRIES));
 }
 
 // ---------------- 一键 LNMP 入口 ----------------

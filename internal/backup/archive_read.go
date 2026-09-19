@@ -254,11 +254,3 @@ func checkArchivePath(p string) error {
 	}
 	return nil
 }
-
-// EnsureFileMode 把解出来的敏感文件收成 0600（私钥/凭据）。
-func EnsureFileMode(path string, mode os.FileMode) error {
-	if _, err := os.Stat(path); err != nil {
-		return err
-	}
-	return os.Chmod(path, mode)
-}

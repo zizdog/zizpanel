@@ -280,7 +280,7 @@ func newDockerTestServerFull(t *testing.T, sock string, runtimeProbe func(contex
 	cfg.DockerSocket = sock
 	cfg.User = "zizdog"
 	// 与 newTestServer 同样的隔离：Cfg.UserHome/WWWRoot/LogRoot 绝不能指向真实家目录
-	// （见 README 坑 57：测试把用户真实 launchd plist 覆盖成空 plist 的事故）
+	// （见 坑清单 坑 57：测试把用户真实 launchd plist 覆盖成空 plist 的事故）
 	cfg.UserHome = dir + "/home"
 	cfg.WWWRoot = cfg.UserHome + "/www"
 	cfg.LogRoot = cfg.WWWRoot + "/_logs"

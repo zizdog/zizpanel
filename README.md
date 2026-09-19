@@ -14,18 +14,18 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 安装过程**不问任何配置**：监听端口默认 **8443**，你只需要在"确认安装"那一步回车（`ZP_YES=1` 则完全不问）。
 **管理员账号、面板路径后缀、SSH、内网预授权都不在安装期问** —— 它们都在面板里点一下就能做，
-而且账号与后缀本来就是"面板首次访问时设置 / 系统设置里随时改"的东西：
+而且账号本来就是"面板首次访问时设置"、后缀在「面板设置 → 访问与安全」随时改：
 
 | 安装后再做的事 | 去哪里 |
 |---|---|
 | 设置管理员用户名与口令 | 打开面板，**首次访问的初始化向导** |
-| 开启「后缀安全加强」（面板路径带一串随机后缀） | 面板「系统设置」——留空即不启用 |
-| 开启 SSH（远程登录） | 面板「系统设置 → 远程登录」 |
-| 开启「允许免授权访问内网段」 | 面板「系统设置 → 局域网访问」（**需要重启才生效**） |
-| 装 Homebrew / nginx / PHP / MySQL（基础环境） | 面板「基础环境」——走国内镜像，任务中心可见进度 |
+| 开启「后缀安全加强」（面板路径带一串随机后缀） | 面板设置 → 访问与安全（留空即不启用） |
+| 开启 SSH（远程登录） | mac设置 → 远程登录 |
+| 开启「允许免授权访问内网段」 | mac设置 → 局域网访问（**需要重启才生效**） |
+| 装 Homebrew / nginx / PHP / MySQL（基础环境），或 CLI 开发工具链（CLT） | 面板「仪表盘」的引导横幅（走国内镜像 / 镜像整包，任务中心可见进度） |
 
-全自动安装（CI 或无人值守）：`ZP_YES=1` 一个问题都不问；要给账号就同时给 `ZP_USER` + `ZP_PASS`
-（只给口令时用户名默认 `admin`）。**不给账号时安装器什么都不问、也不会卡住** —— 账号留给面板。
+全自动安装（CI 或无人值守）：`ZP_YES=1` 一个问题都不问；要给账号就同时给 `ZP_USER` + `ZP_PASS`。
+**不给账号时安装器什么都不问、也不会卡住** —— 账号留给面板。全部变量见下一节。
 
 给另一台机器装：`make serve-install` 会构建发布包并打印目标机要执行的
 `curl … | sudo bash` 命令。
@@ -36,7 +36,7 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 |---|---|---|
 | 想换监听端口 | 安装器默认 8443、不提问 | 装之前给 `ZP_PORT=9000`；装之后改 `/opt/zizpanel/data/config.json` 的 `listen` 再 `sudo launchctl kickstart -k system/cn.zizpanel.panel`（运行中改端口会失联，所以设置页不提供该开关） |
 | 浏览器提示证书不受信任 | 「您的连接不是私密连接」 | 点「继续前往」即可；想彻底消除见「五、证书」 |
-| 需要 CLI/开发工具链（CLT）时 | 在面板「基础环境」里点安装 | 面板走**镜像整包**静默安装（632MB 分片），不会弹 Apple 的对话框 |
+| 需要 CLI/开发工具链（CLT）时 | 在面板「仪表盘」的引导横幅里点安装 | 面板走**镜像整包**静默安装（632MB 分片），不会弹 Apple 的对话框 |
 
 > 设计原则（2026-09-17 真机安装后按用户要求收敛）：**安装器只做"把面板装起来并启动"这一件事**，
 > 凡"能在线做、能改、需要重启、会弹窗"的一律留给面板 —— 所以安装界面不弹任何窗口、
@@ -80,12 +80,12 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 ### 左侧导航
 
-- **总览**：`仪表盘`（负载/磁盘/站点概览）、`系统设置`（电源与睡眠、系统更新阻断、
-  崩溃报告与 Spotlight、远程登录 SSH，含「一键设为服务器模式」）
+- **总览**：`仪表盘`、`导航页`（可当浏览器首页的独立导航）、`mac设置`（电源与睡眠、
+  系统更新阻断、崩溃报告与 Spotlight、远程登录 SSH，含「一键设为服务器模式」）
 - **网站**：`网站管理`、`反向代理`、`SSL 证书`、`数据库`
-- **服务器**：`服务管理`、`应用市场`、`Docker`
-- **运维**：`文件管理`、`Web 终端`、`计划任务`、`日志中心`
-- **系统**：`操作审计`、`面板设置`
+- **服务器**：`应用`（页内四个 Tab：已安装 / 应用市场 / docker / 一键建站）、`Docker`
+- **运维**：`文件管理`、`Web 终端`、`计划任务`
+- **系统**：`磁盘管理`、`面板设置`、`日志`（日志中心 + 操作审计）
 
 ### 建站
 
@@ -96,14 +96,15 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 ### 应用市场
 
-分类：**网站环境**（Nginx、PHP 8.1/8.2/8.3/8.4、MySQL 8.4）、**AI 服务**
-（Qwen3 TTS、TtsVoice 音色接收端）、**运维工具**（phpMyAdmin、IOPaint（图片去水印）、
-Uptime Kuma、n8n、Gitea、MinIO 等）、**一键建站**（Typecho、WordPress）。
+分类：**网站环境**（Nginx、PHP 8.2/8.4、MySQL 8.4、PostgreSQL、Python 3.10–3.13）、
+**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、IOPaint、图片压缩）、**运维工具**
+（phpMyAdmin、Uptime Kuma、Gitea、Miniflux、Syncthing、Alist、frpc、ddns-go 等）、
+**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
 
-- 顶部「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + MySQL 并做收尾配置。
+- 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + MySQL 并做收尾配置。
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
-- 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物），需要容器时才用 Docker，
-  且镜像必须原生支持 arm64。
+- 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物）；**Docker 应用面板不代装**，
+  只在 Docker 页给一份可参考的预配置 compose，镜像必须原生支持 arm64。
 
 ### 任务中心
 
@@ -113,7 +114,7 @@ Uptime Kuma、n8n、Gitea、MinIO 等）、**一键建站**（Typecho、WordPres
 
 ### 在线升级
 
-「面板设置 → 关于与运维 → 在线升级」：
+「面板设置 → 检查更新」：
 
 1. 升级源默认已填好公网 `https://zizdog.com/zizpanel`（放着 `manifest.json` 与
    `manifest.json.sig` 的目录）。面板会按「你填的源 → zizdog.com → 备用镜像 →

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	userpkg "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -656,7 +655,7 @@ func firstMissingAncestor(root string) string {
 // ensureSiteRoot 创建站点根目录，并把**我们新建的**目录归属交还真实用户。
 //
 // 铁律：面板以 root 建了用户目录却不 chown，nginx 读不了、用户也写不了
-// （nginx 日志目录坑 156、Colima 配置坑 163）。做完必须 stat 回读归属；
+// （nginx 日志目录/Colima 配置都归坑 163）。做完必须 stat 回读归属；
 // 归属不对就如实报错，绝不谎报成功。
 func (s *Server) ensureSiteRoot(root string) error {
 	newTop := firstMissingAncestor(root)
@@ -2190,32 +2189,6 @@ func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {
 // 读不到返回空 —— 调用方必须据此放弃改属主，绝不猜一个。
 func nginxWorkerUserFromConf(confPath string) string {
 	return priv.NginxWorkerUserFromConf(confPath)
-}
-
-// chownToUser 把路径属主改成指定用户（同属主时返回 changed=false）。用户不存在返回错误。
-func chownToUser(path, user string) (changed bool, err error) {
-	u, lerr := userpkg.Lookup(user)
-	if lerr != nil {
-		return false, lerr
-	}
-	uid, aerr := strconv.Atoi(u.Uid)
-	gid, berr := strconv.Atoi(u.Gid)
-	if aerr != nil || berr != nil {
-		return false, fmt.Errorf("解析用户 %s 的 uid/gid 失败", user)
-	}
-	st, serr := os.Stat(path)
-	if serr != nil {
-		return false, serr
-	}
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		if int(sys.Uid) == uid && int(sys.Gid) == gid {
-			return false, nil
-		}
-	}
-	if err := os.Chown(path, uid, gid); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // checkProxyAgainstSiteVhosts 检查一条反代规则是否与已有 vhost 在"同端口 +

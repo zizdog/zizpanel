@@ -68,7 +68,7 @@ func TestDisksFrontendHasEmptyStateAndAuthButtonWiring(t *testing.T) {
 	}
 }
 
-// TestDisksRequestAuthConfirmBoxBeforeRequest —— 二次确认的门禁（坑 192）。
+// TestDisksRequestAuthConfirmBoxBeforeRequest —— 二次确认的门禁（坑 191）。
 //
 // 只断言"字符串存在"是不够的：确认框可以写了却没接在按钮路径上，也可以放在请求之后
 // （那时任务已经建了，确认框形同虚设）。所以这里**按函数体 + 顺序**断言：
@@ -143,5 +143,42 @@ func TestAppJsNavDiskTitleIsDiskManagement(t *testing.T) {
 	// 负向对照：不许留下旧的侧栏名。
 	if regexp.MustCompile(`title:\s*'磁盘'\s*[,}]`).MatchString(js) {
 		t.Error("app.js 里还留着旧侧栏名 title: '磁盘'")
+	}
+}
+
+// TestDisksAckTextMatchesDestructiveness：磁盘页的"二次确认勾选框"文案必须与动作的危险程度一致。
+//
+// 用户点名的黑色幽默：给卷**重命名**（只改名字、不动数据）也弹
+// 「我已知晓：这会永久销毁上述设备上的数据，且不可恢复」。
+// 这里按函数体断言，防止把危险提示挂到非破坏性动作上（也防止反过来把危险动作的提示删掉）。
+func TestDisksAckTextMatchesDestructiveness(t *testing.T) {
+	js := readAssetJS(t, "disks.js")
+	const destroy = "永久销毁"
+
+	destructive := map[string]string{
+		"openFormatDialog":       "格式化/抹盘",
+		"openDeleteVolumeDialog": "删除卷",
+	}
+	for fn, what := range destructive {
+		body := jsFuncBody(t, js, fn)
+		if !strings.Contains(body, destroy) {
+			t.Errorf("%s（%s）必须保留「%s」这种明确警告", fn, what, destroy)
+		}
+	}
+
+	// 非破坏性动作：不许出现"永久销毁"（重命名只改名字；新建卷不动已有卷）。
+	harmless := map[string]string{
+		"openRenameVolumeDialog": "重命名卷",
+		"openCreateVolumeDialog": "新建 APFS 卷",
+	}
+	for fn, what := range harmless {
+		body := jsFuncBody(t, js, fn)
+		if body == "" {
+			t.Errorf("找不到 %s（%s）—— 名字改了就要同步这条门禁", fn, what)
+			continue
+		}
+		if strings.Contains(body, destroy) {
+			t.Errorf("%s（%s）不是破坏性操作，不得挂「%s」的警告：%s", fn, what, destroy, body)
+		}
 	}
 }

@@ -281,7 +281,7 @@ func TestPMAVhostInsertBlockUsesExplicitEndpoint(t *testing.T) {
 // 以前 phpMyAdmin 安装器会顺手往默认站点里放一个 index.php，而它在 nginx 的
 // index 指令里排在 index.html 前面 —— 结果首页永远由 PHP 渲染，
 // "默认站点真的生效了吗"的请求级复核（靠 index.html 里的标记）**永远失败**，
-// 那一步失败还会中止整个上传上限任务（真机事故，见 DEVELOPMENT 坑 173）。
+// 那一步失败还会中止整个上传上限任务（真机事故，见 坑清单 坑 164）。
 //
 // 这条门禁两件事一起锁：① 面板不再创建默认站点的 index.php；
 // ② 生成的默认站点 vhost 里 index.html 排在 index.php 前面。

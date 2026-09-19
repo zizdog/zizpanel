@@ -94,15 +94,6 @@ func diskFSKeys() string {
 
 // ---------- 快照辅助 ----------
 
-func (snap *diskSnapshot) containsID(id string) bool {
-	for _, x := range snap.AllIDs {
-		if x == id {
-			return true
-		}
-	}
-	return false
-}
-
 func (snap *diskSnapshot) findInfo(id string) (diskInfo, bool) {
 	for _, g := range snap.Groups {
 		if g.Disk.ID == id {
@@ -140,16 +131,23 @@ func (snap *diskSnapshot) containerRefFor(id string) string {
 			}
 		}
 	}
+	// 合成容器被并进物理盘卡片后就没有自己的分组了（坑 192），Init 里还留着它的引用。
+	for _, g := range snap.Groups {
+		if g.Init != nil && g.Init.ContainerRef == id {
+			return id
+		}
+	}
 	return ""
 }
 
+// findVolumeInContainer 在任意分组里找容器 ref 下的某个卷。
+// 容器可能已被并进物理盘卡片、没有自己的分组（坑 192），所以不能按"组 id == ref"找；
+// 自带容器的整盘（PhysicalStores 指向自己）则仍按组归属匹配。
 func (snap *diskSnapshot) findVolumeInContainer(ref, name string) (diskInfo, bool) {
 	for _, g := range snap.Groups {
-		if g.Disk.ID != ref {
-			continue
-		}
+		selfContained := g.Disk.ID == ref
 		for _, p := range g.Partitions {
-			if p.VolumeName == name {
+			if p.VolumeName == name && (selfContained || p.ContainerRef == ref) {
 				return p, true
 			}
 		}
@@ -845,7 +843,7 @@ func diskVolumeAuthPrecheck(confirm bool) (mounts []string, consoleUser string, 
 //
 // 为什么必须预检（铁律 12）：读外接卷会让 macOS 弹授权询问；没人在屏幕前时弹了也没人点，
 // 系统只会把它记成 denial。所以没有人 / 没有盘 / 没有显式确认 → 当场 4xx，
-// **不创建任务、一个字节都不读**。确认不能只靠前端自觉（坑 192）。
+// **不创建任务、一个字节都不读**。确认不能只靠前端自觉（坑 191）。
 func (s *Server) handleDiskVolumeAuthRequest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Confirm bool `json:"confirm"`

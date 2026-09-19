@@ -534,7 +534,7 @@ func (s *Server) runRestore(ctx context.Context, log tasks.LogFunc, archive stri
 		// 非特权实例（make run-local / 前台调试）只允许写面板自己的数据目录与工作目录。
 		//
 		// 为什么必须有这道闸：调试实例的 BrewPrefix 仍是真机的 /opt/homebrew
-		// （config 只在安装时确定前缀，见 DEVELOPMENT 坑 162），不拦的话
+		// （config 只在安装时确定前缀，见 坑清单 坑 162），不拦的话
 		// "在调试实例上点恢复"会去写真实机器的 PHP 片段/phpMyAdmin 配置 ——
 		// 权限挡住时任务会莫名其妙地"部分失败"，权限没挡住时就是真机被改。
 		if os.Geteuid() != 0 && !underAny(it.SourcePath, s.Cfg.DataDir, s.Cfg.WorkDir) {

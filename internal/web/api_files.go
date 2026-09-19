@@ -353,11 +353,6 @@ func knownRootKindsFrom(entries []fileRootEntry) map[string]string {
 	return known
 }
 
-// rootLabels 是 rootLabelsFor 的便捷入口（一次算 entries）。
-func (s *Server) rootLabels(res *files.ListResult) map[string]string {
-	return rootLabelsFor(res, s.defaultFileRootEntries())
-}
-
 // rootLabelsFor：给 res.Roots 算展示标签，**只含该进下拉的根**（被父根覆盖且无
 // 独立用途的子目录、数据目录都不在其中）。标签自带位置以保证唯一；分组见
 // annotateRoots 的 kinds。
@@ -1030,7 +1025,7 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "file_download", p, fmt.Sprintf("下载 %s", files.FormatSize(st.Size())), true, "")
 }
 
-// downloadContentType 给媒体回真实 MIME：octet-stream 会被 <video>/<audio> 拒播（坑 178）。
+// downloadContentType 给媒体回真实 MIME：octet-stream 会被 <video>/<audio> 拒播（坑 188）。
 // 其余文件保持 octet-stream，下载行为不变；Content-Disposition 仍是 attachment。
 func downloadContentType(name string) string {
 	switch strings.ToLower(filepath.Ext(name)) {

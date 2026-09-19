@@ -45,7 +45,7 @@ func stubDiskVolumeAuth(t *testing.T, consoleUser string, mounts []string, req f
 }
 
 // diskVolumeAuthConfirmBody 是"用户在前端确认框里点了确定"之后的请求体。
-// 后端要求显式 confirm=true（坑 192）：不带就 4xx，且不建任务、不读盘。
+// 后端要求显式 confirm=true（坑 191）：不带就 4xx，且不建任务、不读盘。
 var diskVolumeAuthConfirmBody = map[string]any{"confirm": true}
 
 // assertVolumeAuthRejected 断言一条拒绝：状态码、逐字 msg、机器可读 reason、
@@ -101,7 +101,7 @@ func TestDiskVolumeAuthRejectsWithoutExternalVolume(t *testing.T) {
 		diskVolumeAuthNoVolumeReason, diskVolumeAuthReasonNoVolume, *calls, "没有外接卷申请授权")
 }
 
-// TestDiskVolumeAuthRequiresExplicitConfirm：后端强制"显式确认"（坑 192）——
+// TestDiskVolumeAuthRequiresExplicitConfirm：后端强制"显式确认"（坑 191）——
 // 只点按钮不算：缺 confirm（或 confirm=false）→ 4xx + reason=confirm_required +
 // **任务表为空 + 读盘 0 次**，绝不靠前端自觉。
 func TestDiskVolumeAuthRequiresExplicitConfirm(t *testing.T) {

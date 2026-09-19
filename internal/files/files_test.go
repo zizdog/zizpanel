@@ -440,7 +440,7 @@ func TestExtractBlocksZipSlip(t *testing.T) {
 	}
 	// 直接构造一个带 ../ 路径的 tar（用 tar 的 -P 无法产生，手工写字节）
 	// 更简单可靠：构造一个正常的 tar，然后验证检查函数能识别越界条目。
-	// 这里直接测 checkArchiveEntries 的判定逻辑。
+	// 这里直接测 Extract 对归档越界条目（../）的拒绝逻辑。
 	destDir := filepath.Join(root, "dest")
 	_ = os.MkdirAll(destDir, 0o755)
 

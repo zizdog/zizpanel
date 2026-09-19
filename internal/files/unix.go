@@ -49,9 +49,6 @@ func (m *Manager) chownRealUser(p string) {
 	_ = os.Chown(p, uid, gid)
 }
 
-// StatUint32 把 os.FileMode 的权限位转成八进制整数（前端编辑权限用）。
-func StatUint32(mode os.FileMode) uint32 { return uint32(mode.Perm()) }
-
 // ParseMode 把 "755" 这样的八进制字符串解析为 FileMode。
 //
 // 严格校验：只接受 3~4 位八进制数字，

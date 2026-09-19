@@ -1039,7 +1039,7 @@ func Catalog() []App {
 			// BrewFormula / ServiceLabel 仍然要给（安装器与 launchd 作业要靠它们），
 			// 但**"装没装"不看它们、也不看 plist**：容器运行时的运行体是"二进制 + VM +
 			// socket"，只剩一份僵尸 plist 也照样是"没装"（2026-09-19 用户实测的假"已安装"，
-			// 见 DEVELOPMENT 坑 161）。真实判定在 api_services.go 的 dockerRuntimeStatus。
+			// 见 坑清单 坑 161）。真实判定在 api_services.go 的 dockerRuntimeStatus。
 			BrewFormula: "colima", ServiceLabel: ColimaLaunchLabel,
 			DocsURL: "https://github.com/abiosoft/colima",
 		},

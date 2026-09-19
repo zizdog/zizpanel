@@ -27,21 +27,6 @@ import (
 //  解压时额外做一次"归档内路径"检查，防止 zip-slip（../../ 穿越）。
 // ---------------------------------------------------------------------------
 
-// Archive 支持的归档格式。
-type Archive struct {
-	Ext   string `json:"ext"`
-	Label string `json:"label"`
-}
-
-// ArchiveFormats 返回支持的压缩格式。
-func ArchiveFormats() []Archive {
-	return []Archive{
-		{Ext: "zip", Label: "ZIP（通用，Windows/Mac 都能打开）"},
-		{Ext: "tar.gz", Label: "TAR.GZ（保留权限与软链接，适合服务端）"},
-		{Ext: "tar", Label: "TAR（不压缩）"},
-	}
-}
-
 // ProgressFunc 是一次归档/解压操作的进度回调。
 //
 // done/total 是**已完成/预计总数**（条目数）；total<=0 表示总数未知（如实报告，
@@ -299,12 +284,6 @@ func runCmdStreaming(ctx context.Context, timeout time.Duration, dir, name strin
 		return text, fmt.Errorf("%s 执行失败: %s", filepath.Base(name), truncateStr(strings.TrimSpace(text), 400))
 	}
 	return text, nil
-}
-
-// checkArchiveEntries 检查归档内条目是否安全。
-func (m *Manager) checkArchiveEntries(ctx context.Context, src string) error {
-	_, err := m.archiveEntries(ctx, src)
-	return err
 }
 
 // archiveEntries 列出归档内条目并做安全校验（返回条目列表，供进度用总数）。

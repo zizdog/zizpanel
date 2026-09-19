@@ -523,7 +523,9 @@ const result = await page.evaluate(async () => {
   out.sslDetailHiddenBefore = (pmodal.querySelector('#zp-proxy-ssl-detail')?.style.display || '') === 'none';
 
   pmodal.querySelector('input[placeholder="例如：镜像站"]').value = '演示反代';
-  pmodal.querySelector('input[placeholder="http://127.0.0.1:8090"]').value = 'http://127.0.0.1:9000';
+  // 目标地址输入框的 placeholder 已随示例更新（不再是 127.0.0.1 那个旧示例），
+  // 这里按前缀匹配，避免又被示例地址的改动带红。
+  pmodal.querySelector('input[placeholder^="http://"]').value = 'http://127.0.0.1:9000';
   pmodal.querySelector('input[placeholder^="留空 = 该端口上所有域名"]').value = 'demo.test';
 
   document.getElementById('zp-proxy-ssl-on').checked = true;
@@ -822,8 +824,13 @@ check('证书说明给出到期/剩余天数',
 check('切到「粘贴自有证书」后两个来源互斥',
   result.sslManualVisibleAfterSwitch === true && result.sslAcmeHiddenAfterSwitch === true,
   JSON.stringify({ manual: result.sslManualVisibleAfterSwitch, acmeHidden: result.sslAcmeHiddenAfterSwitch }));
-check('保存先创建规则，且创建请求体不带 ssl_enabled（证书由专用接口绑定）',
-  !!result.proxyCreateBody && !('ssl_enabled' in result.proxyCreateBody)
+// 2026-09-17 真机报障后的**当前**行为：启用 HTTPS 时，创建规则的 payload 就必须
+// 带上 ssl_enabled + 证书路径 —— 否则后端把这条当 HTTP 规则，同端口已有 HTTPS 规则时
+// 会被"同端口不能混用"直接 409，第二步 /ssl 永远没机会跑。证书仍由专用接口绑定（下一条断言）。
+check('启用 HTTPS：创建规则时 payload 就带 ssl 信息（避免同端口 HTTP/HTTPS 冲突 409）',
+  !!result.proxyCreateBody && result.proxyCreateBody.ssl_enabled === true
+  && result.proxyCreateBody.ssl_provider === 'acme'
+  && !!result.proxyCreateBody.ssl_cert
   && result.proxyCreateBody.target === 'http://127.0.0.1:9000'
   && result.proxyCreateBody.domains === 'demo.test',
   JSON.stringify(result.proxyCreateBody));

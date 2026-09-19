@@ -596,7 +596,7 @@ func (m *Manager) ensureDefaultVhost(ctx context.Context, result *InstallResult)
 
 	// 先把站点文件准备好（无论 vhost 动不动，缺了就补）：默认站点是**纯静态**的
 	// （用户 2026-09-18 明确要求"只需要一个 index.html"），只建 index.html；phpMyAdmin 用它的 location。
-	// 以前多建的 index.php 会把 index.html 顶下去、让"默认站点复核"永远失败（见 DEVELOPMENT 坑 173）。
+	// 以前多建的 index.php 会把 index.html 顶下去、让"默认站点复核"永远失败（默认站点复核）。
 	if _, _, herr := sites.EnsureLocalhostPlaceholder(wwwRoot); herr != nil {
 		result.Warning = appendWarning(result.Warning, "默认站点占位页创建失败："+herr.Error())
 	}
@@ -922,24 +922,6 @@ func (m *Manager) writeNginxConfAndReload(ctx context.Context, conf, oldText, ne
 	}
 	result.step(ctx, okMsg)
 	return nil
-}
-
-// waitHTTP 轮询等某个 URL 返回 200。
-func waitHTTP(ctx context.Context, url string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		out, err := exec.CommandContext(ctx, "/usr/bin/curl",
-			"-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "4", url).Output()
-		if err == nil && strings.TrimSpace(string(out)) == "200" {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return false
 }
 
 func randomHex(n int) (string, error) {

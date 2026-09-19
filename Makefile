@@ -20,7 +20,7 @@ SHELL      := /bin/bash
 # VERSION 必须**锚定 `var Version`**，不能用"文件里第一个 x.y.z"：
 # version.go 的文档注释里会写历史版本（如 `1.0.0：第一个正式版`），
 # 宽松 grep + head -1 会取到注释里的旧版本 → 包名/清单用旧版本、二进制却是新的，
-# 而 `make release` 不会报任何错（2026-09-17 实测踩到，见 DEVELOPMENT 坑 153）。
+# 而 `make release` 不会报任何错（2026-09-17 实测踩到，见 坑清单 坑 153）。
 VERSION    := $(shell sed -n 's/^var Version *= *"\([0-9][0-9.]*\)".*/\1/p' internal/version/version.go | head -1)
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)

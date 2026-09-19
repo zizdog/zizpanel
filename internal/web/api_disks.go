@@ -197,12 +197,16 @@ type diskInfo struct {
 	// Virtual 表示这是**合成设备**（diskutil 的 VirtualOrPhysical=Virtual），
 	// 典型就是 APFS 容器：物理盘是另一台设备，卷建在容器里。
 	// 页面据此把"同一块盘出现两次"讲清楚（用户 2026-09-19 报过这个困惑）。
-	Virtual        bool     `json:"virtual"`
-	BusProtocol    string   `json:"bus_protocol"`
-	Model          string   `json:"model"`
-	UUID           string   `json:"uuid"`
-	DiskUUID       string   `json:"disk_uuid"`
-	ContainerRef   string   `json:"container_ref"`
+	Virtual      bool   `json:"virtual"`
+	BusProtocol  string `json:"bus_protocol"`
+	Model        string `json:"model"`
+	UUID         string `json:"uuid"`
+	DiskUUID     string `json:"disk_uuid"`
+	ContainerRef string `json:"container_ref"`
+	// NestedUnder 非空表示"这个卷属于某个 APFS 容器、而容器挂在 id=NestedUnder 的分区上"。
+	// 用户报障：同一块物理盘原来会显示成两张卡片（物理盘 + 合成的 APFS 容器盘）——
+	// 现在只出物理盘一张，容器的卷并到它里面，前端据此缩进显示。
+	NestedUnder    string   `json:"nested_under,omitempty"`
 	PhysicalStores []string `json:"physical_stores"`
 
 	SystemDisk    bool   `json:"system_disk"`
@@ -510,7 +514,65 @@ func markAutoMount(d *diskInfo, entries []fstabEntry) {
 }
 
 // buildGroups 把 `diskutil list -plist` 的层级摊成"整盘 → 分区/卷"两层的卡片。
+//
+// 一块物理盘只出一张卡片：APFS 容器（`VirtualOrPhysical=Virtual` 的合成盘，如 disk4）
+// **不再单独成卡**，它的卷并到"容器分区所在的物理盘"（如 disk9，分区 disk9s2）的卡片里，
+// 并标 NestedUnder，前端缩进显示。用户报障"同一块盘显示两次"就是这里来的。
 func buildGroups(rootMap map[string]any, infos map[string]diskInfo, apfs map[string]*apfsContainer, protected map[string]string) []diskGroup {
+	// 第一遍：找出虚拟容器 → 它的卷、以及它建在哪个分区上。
+	containerVols := map[string][]diskInfo{}
+	containerStore := map[string]string{}
+	for _, it := range plistArray(rootMap["AllDisksAndPartitions"]) {
+		node := plistMap(it)
+		if node == nil {
+			continue
+		}
+		cid := plistStr(node, "DeviceIdentifier")
+		if cid == "" {
+			continue
+		}
+		d, okk := infos[cid]
+		// 合成 APFS 容器：`VirtualOrPhysical=Virtual` 或内容类型是容器。
+		// 只靠 Content 也不会误伤"整盘就是一个 APFS 容器"的物理盘 —— 那种盘的
+		// PhysicalStores 指向它自己，下一步的 merged 判定不会命中，它照样出自己的卡片。
+		if !okk || !(d.Virtual || strings.EqualFold(d.Content, "Apple_APFS_Container")) {
+			continue
+		}
+		for _, store := range d.PhysicalStores {
+			containerStore[cid] = store
+		}
+		for _, vit := range plistArray(node["APFSVolumes"]) {
+			vn := plistMap(vit)
+			if vn == nil {
+				continue
+			}
+			vid := plistStr(vn, "DeviceIdentifier")
+			if vid == "" {
+				continue
+			}
+			vd, vok := infos[vid]
+			if !vok {
+				vd = infoFromListNode(vid, vn, cid, false)
+			}
+			containerVols[cid] = append(containerVols[cid], vd)
+		}
+	}
+	merged := map[string]bool{} // 已被并进物理盘的容器
+	for cid, store := range containerStore {
+		for _, it := range plistArray(rootMap["AllDisksAndPartitions"]) {
+			node := plistMap(it)
+			if node == nil {
+				continue
+			}
+			for _, pit := range plistArray(node["Partitions"]) {
+				if plistStr(plistMap(pit), "DeviceIdentifier") == store {
+					merged[cid] = true
+					break
+				}
+			}
+		}
+	}
+
 	var groups []diskGroup
 	for _, it := range plistArray(rootMap["AllDisksAndPartitions"]) {
 		node := plistMap(it)
@@ -519,6 +581,12 @@ func buildGroups(rootMap map[string]any, infos map[string]diskInfo, apfs map[str
 		}
 		id := plistStr(node, "DeviceIdentifier")
 		if id == "" {
+			continue
+		}
+		// 合成容器盘：已经把卷并进物理盘了就不再单独成卡（并不到就照旧显示，绝不静默丢设备）。
+		// 判据与上一遍找容器时一致：只看 d.Virtual 会漏掉没报 Virtual 的容器盘。
+		if d, okk := infos[id]; okk && merged[id] &&
+			(d.Virtual || strings.EqualFold(d.Content, "Apple_APFS_Container")) {
 			continue
 		}
 		g := diskGroup{}
@@ -547,6 +615,19 @@ func buildGroups(rootMap map[string]any, infos map[string]diskInfo, apfs map[str
 				d.Parent = id
 			}
 			g.Partitions = append(g.Partitions, d)
+			// 这个分区上建着 APFS 容器 → 把容器的卷紧跟其后并入（同一张卡片）。
+			for cid, store := range containerStore {
+				if store != pid || !merged[cid] {
+					continue
+				}
+				for _, vd := range containerVols[cid] {
+					if vd.ContainerRef == "" {
+						vd.ContainerRef = cid // 归属必须落地：写操作回读靠它认容器（坑 192）
+					}
+					vd.NestedUnder = pid
+					g.Partitions = append(g.Partitions, vd)
+				}
+			}
 		}
 		for _, vit := range plistArray(node["APFSVolumes"]) {
 			vn := plistMap(vit)
@@ -563,6 +644,9 @@ func buildGroups(rootMap map[string]any, infos map[string]diskInfo, apfs map[str
 			}
 			if d.Parent == "" {
 				d.Parent = id
+			}
+			if d.ContainerRef == "" {
+				d.ContainerRef = id
 			}
 			g.Partitions = append(g.Partitions, d)
 		}

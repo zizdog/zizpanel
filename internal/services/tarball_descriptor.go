@@ -49,8 +49,7 @@ var tarballDescriptors = []string{
 	"filebrowser",
 }
 
-// descriptorsByID / descriptorOrder 是描述符注册表
-// （descriptor.go 的 FindDescriptor / AllDescriptors 用它）。
+// descriptorsByID / descriptorOrder 是描述符注册表（descriptor.go 的 FindDescriptor 用它）。
 var (
 	descriptorsByID = map[string]AppDescriptor{}
 	descriptorOrder []string
@@ -433,16 +432,6 @@ func descriptorIDsForRail(rail Rail) []string {
 		}
 	}
 	sort.Strings(out)
-	return out
-}
-
-// descriptorsForRail 返回某条轨上的全部描述符（按 ID 排序）。
-func descriptorsForRail(rail Rail) []AppDescriptor {
-	ids := descriptorIDsForRail(rail)
-	out := make([]AppDescriptor, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, descriptorsByID[id])
-	}
 	return out
 }
 

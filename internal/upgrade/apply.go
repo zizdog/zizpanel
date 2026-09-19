@@ -76,9 +76,6 @@ func (o *Options) withDefaults() {
 	}
 }
 
-// stagingDir 返回暂存目录。
-func (o *Options) stagingDir() string { return filepath.Join(o.WorkDir, "upgrade", "staging") }
-
 // Apply 执行升级的最后阶段：自检 → 备份 → 原子替换 → 启动看门狗 → 重启。
 //
 // 返回 nil 不代表"升级成功"，只代表"已经把控制权交给看门狗"。

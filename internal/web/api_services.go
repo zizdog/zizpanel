@@ -1855,22 +1855,6 @@ func (s *Server) installedFormulas(ctx context.Context) (map[string]bool, bool) 
 	return set, fetched
 }
 
-// brewVersions 返回本机已安装 formula 的版本串（与 installedFormulas 同一份缓存）。
-//
-// 单独一个入口是因为卸载计划需要**版本**：目录写 php@8.4、机器上装的是 php 8.4.7
-// 时，只有版本能证明"这就是同一个 PHP 8.4"。
-func (s *Server) brewVersions(ctx context.Context) map[string]string {
-	// 先让 installedFormulas 把缓存暖起来（它负责 TTL / 后台刷新 / 冷启动同步）。
-	s.installedFormulas(ctx)
-	s.mktMu.Lock()
-	vers := s.mktBrewVer
-	s.mktMu.Unlock()
-	if vers == nil {
-		return map[string]string{}
-	}
-	return vers
-}
-
 // marketProbeErr 保存"上一次复核本机已装 Homebrew 包"失败的**真实原因**（包级，带时间）。
 //
 // 为什么不放进 Server 结构体：Server 定义在 server.go（那个文件的改动线多），而这份信息

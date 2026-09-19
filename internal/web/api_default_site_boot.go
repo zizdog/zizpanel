@@ -67,7 +67,7 @@ var defaultSiteEuid = os.Geteuid
 // nginxPresent 判"这台机器上到底有没有 nginx" —— 只看**二进制**。
 //
 // 为什么不用 `<brew>/etc/nginx/nginx.conf` 之类的文件判：那是"有配置文件"，
-// 不是"有这个能力"（AGENTS 第三节、DEVELOPMENT 坑 161）。二进制在才算在。
+// 不是"有这个能力"（AGENTS 第三节、坑清单 坑 161）。二进制在才算在。
 func (s *Server) nginxPresent() (bool, string) {
 	bin := strings.TrimSpace(s.Cfg.NginxBin)
 	if bin == "" && s.Cfg.BrewPrefix != "" {

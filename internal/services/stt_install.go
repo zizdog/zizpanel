@@ -195,9 +195,6 @@ func sttPlist(panelBin string, port int, brewPrefix, root, modelID, mirrorBase, 
 //  模型下载（面板安装器与 stt-serve 共用）
 // ---------------------------------------------------------------------------
 
-// STTMinPlausibleModelBytes 导出给 web 层做上传/落盘校验（与内部判据同一份）。
-func STTMinPlausibleModelBytes() int64 { return sttMinPlausibleModelBytes }
-
 // STTFetchFunc 是"把一个 URL 下载到本地文件"的注入点。
 // 生产实现是 iopaint.go 里的 fetchToFile（带停滞看门狗 + .part 原子改名 + 进度回调）。
 type STTFetchFunc func(ctx context.Context, url, dest string, onProgress func(got, total int64)) error
@@ -387,7 +384,7 @@ func (m *Manager) DownloadSTTModel(ctx context.Context, modelID string, result *
 		return nil, derr
 	}
 	// 以 root 下载的文件属主是 root，必须交还真实用户 —— 否则以该用户身份
-	// 运行的 stt-serve 读不了自己的模型（AGENTS 第三节的坑 156/163）。
+	// 运行的 stt-serve 读不了自己的模型（AGENTS 第三节的坑 163）。
 	if m.opt.UserName != "" {
 		if cerr := chownTree(m.opt.UserName, p.ModelsDir); cerr != nil {
 			if result != nil {

@@ -302,30 +302,21 @@ export function DisksView(content, ctx = {}) {
       body.append(h('div.hint', { text: '这台设备没有分区/卷。' }));
     }
 
-    // 容器提示：APFS 容器**不直接挂载**，卷建在它里面 —— 用户被"没有可挂载的文件系统"绕晕过，
-    // 这里直接用一句话说清楚它是什么、以及为什么不需要对它做任何挂载操作。
-    const containers = parts.filter((p) => p.content === 'Apple_APFS' && !p.has_filesystem);
-    containers.forEach((c) => {
-      const names = (g.init && g.init.container_ref === c.id && g.init.volume_names) ? g.init.volume_names : [];
-      body.append(h('div.hint', { style: { marginTop: '8px' } }, [
-        h('span.pill', { text: 'APFS 容器' }),
-        h('span', { text: ' ' + c.id + ' 是 APFS 容器（不是卷，不直接挂载）：卷建在它里面'
-          + (names.length ? '，目前有 ' + names.join('、') : '') + ' —— 文件管理访问的是里面的卷，不是它本身。' }),
-      ]));
-    });
-
     body.append(dangerZone(g, d));
     return h('div.card.disk-card', [h('div.card-head', head), body]);
   }
 
   function partRow(p) {
     const isContainer = p.content === 'Apple_APFS' && !p.has_filesystem;
+    const nested = !!p.nested_under;
     const mountCell = p.mounted && p.mount_point ? h('span.mono', { text: p.mount_point }) : h('span.hint', { text: '未挂载' });
     const note = isContainer
-      ? h('span.hint', { text: 'APFS 容器（不直接挂载）' })
-      : (p.apfs_volume ? h('span.hint', { text: 'APFS 卷' }) : h('span.hint', { text: '' }));
-    return h('tr', [
-      h('td', [h('div.mono', { text: p.id })]),
+      ? h('span.hint', { text: 'APFS 容器（卷在下面）' })
+      : (nested
+        ? h('span.hint', { text: 'APFS 卷（在 ' + p.nested_under + ' 的容器里）' })
+        : (p.apfs_volume ? h('span.hint', { text: 'APFS 卷' }) : h('span.hint', { text: '' })));
+    return h('tr', { style: nested ? { background: 'color-mix(in srgb, var(--brand-soft) 40%, transparent)' } : {} }, [
+      h('td', [h('div.mono', { text: (nested ? '└ ' : '') + p.id })]),
       h('td', { text: p.volume_name || '—' }),
       h('td', { text: p.filesystem || p.content || '—' }),
       h('td.mono', { text: bytes(p.size_bytes) }),
@@ -353,9 +344,11 @@ export function DisksView(content, ctx = {}) {
       h('span.hint', { text: '整盘抹掉会重建分区表；格式化某个卷只重建该卷。' }),
     ]));
 
-    // 只在**容器自己**那一组显示"新建 APFS 卷"：
-    // 容器的卷是建在容器里的，物理盘那一组（disk9）不该再出现同一个按钮（用户看到两个"新建 APFS 卷"）。
-    if (g.init && g.init.container_ref === d.id) {
+    // 「新建 APFS 卷」只在该容器所属的那一组显示（容器并入物理盘后，这里就是唯一的卡片）：
+    // 要么本组就是容器本身，要么本组里有引用它的分区 —— 空的合成容器没有卷可并入，只能靠分区认。
+    const ref = g.init ? g.init.container_ref : '';
+    const ownsContainer = !!ref && (ref === d.id || (g.partitions || []).some((x) => x.container_ref === ref));
+    if (ownsContainer) {
       const init = g.init;
       body.append(h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
         h('button.btn.btn-sm.btn-danger', {
@@ -433,14 +426,17 @@ export function DisksView(content, ctx = {}) {
   //
   // 必须同时满足：手输设备标识一致 + 勾选警告 + 业务校验通过，才允许点"执行"。
   // submit 返回任务编号（提交给任务中心）或 null（提交失败，原因已 toast）。
-  function strongDialog({ title, device, warning, body, command, submitLabel, validateExtra, submit }) {
+  function strongDialog({ title, device, warning, ackText, body, command, submitLabel, validateExtra, submit }) {
     const confirmInput = h('input.input', { type: 'text', placeholder: '原样输入 ' + device.id });
     const ack = h('input', { type: 'checkbox' });
+    // 勾选框的文案由调用方给：破坏性动作是"会永久销毁…"，非破坏性（重命名/新建卷）必须说实话。
+    // 传空串 = 不要这个勾选框（别给"改个名字"挂上"数据不可恢复"）。
+    const showAck = ackText !== null && ackText !== undefined && ackText !== '';
     const errBox = h('div');
     const goBtn = h('button.btn.btn-danger', { text: submitLabel, disabled: true });
     const sync = () => {
       const extra = validateExtra ? validateExtra() : true;
-      goBtn.disabled = !(confirmInput.value.trim() === device.id && ack.checked && extra);
+      goBtn.disabled = !(confirmInput.value.trim() === device.id && (!showAck || ack.checked) && extra);
     };
     confirmInput.addEventListener('input', sync);
     ack.addEventListener('change', sync);
@@ -452,9 +448,9 @@ export function DisksView(content, ctx = {}) {
         command ? h('div.hint.mono', { text: '将执行：' + command }) : null,
         body,
         h('div.field', [h('label', { text: `二次确认：手动输入设备标识 「${device.id}」` }), confirmInput]),
-        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } }, [
-          ack, h('span', { text: '我已知晓：这会永久销毁上述设备上的数据，且不可恢复' }),
-        ]),
+        showAck ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' } }, [
+          ack, h('span', { text: ackText }),
+        ]) : null,
         errBox,
       ]),
       footer: [h('button.btn', { text: '取消', onclick: () => m.close() }), goBtn],
@@ -531,6 +527,7 @@ export function DisksView(content, ctx = {}) {
     const m = strongDialog({
       title: '格式化 / 抹盘 · ' + d.id,
       device: d,
+      ackText: '我已知晓：这会永久销毁上述设备上的数据，且不可恢复',
       warning: '这会永久抹掉 ' + d.id + ' 上的一切数据（不可恢复）。选择「保持现状」则不会执行任何格式化。',
       body,
       submitLabel: '格式化',
@@ -586,6 +583,7 @@ export function DisksView(content, ctx = {}) {
     strongDialog({
       title: '删除 APFS 卷 · ' + p.id,
       device: p,
+      ackText: '我已知晓：这会永久销毁上述设备上的数据，且不可恢复',
       warning: '这会永久删除卷 ' + (p.volume_name || p.id) + ' 及其中的数据，不可恢复。',
       body,
       command: 'diskutil apfs deleteVolume ' + p.id,
@@ -605,7 +603,8 @@ export function DisksView(content, ctx = {}) {
     const m = strongDialog({
       title: '重命名卷 · ' + p.id,
       device: p,
-      warning: '会修改卷 ' + p.id + ' 的名称（不影响数据）。',
+      warning: '只改卷名，不动里面的数据。',
+      ackText: '我已知晓：重命名只改名字，不会删除数据',
       body,
       command: 'diskutil rename ' + p.id + ' <新卷名>',
       submitLabel: '重命名',

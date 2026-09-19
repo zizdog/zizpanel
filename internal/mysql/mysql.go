@@ -94,8 +94,7 @@ var (
 	reUserName = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,32}$`)
 	// 主机名允许：字母数字、点、下划线、%、冒号（IPv6）、连字符，
 	// 以及 /（MySQL 支持网段形式的 host，如 192.0.2.0/255.255.255.0）
-	reHost  = regexp.MustCompile(`^[A-Za-z0-9_.%:/\-]{1,60}$`)
-	reTable = regexp.MustCompile(`^[A-Za-z0-9_$]{1,64}$`)
+	reHost = regexp.MustCompile(`^[A-Za-z0-9_.%:/\-]{1,60}$`)
 )
 
 // ValidateDBName 校验数据库名。
@@ -118,14 +117,6 @@ func ValidateUserName(s string) error {
 func ValidateHost(s string) error {
 	if !reHost.MatchString(s) {
 		return fmt.Errorf("主机名格式不合法: %q", s)
-	}
-	return nil
-}
-
-// ValidateTableName 校验表名。
-func ValidateTableName(s string) error {
-	if !reTable.MatchString(s) {
-		return fmt.Errorf("表名只允许字母、数字、下划线与 $（最多 64 字符）: %q", s)
 	}
 	return nil
 }

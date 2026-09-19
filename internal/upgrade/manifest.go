@@ -48,9 +48,6 @@ func AssetKey(goos, goarch string) string {
 // 绝不能进仓库、也不能出现在发布包里。
 var PubKeyHex = ""
 
-// SetPublicKey 允许从构建变量注入公钥（-ldflags -X）。
-func SetPublicKey(hexKey string) { PubKeyHex = strings.TrimSpace(hexKey) }
-
 // PublicKeyHex 返回当前生效的公钥（空串表示未配置）。
 //
 // 这个访问器存在的首要目的不是"给外面看"，而是**让这个变量真的被引用**。

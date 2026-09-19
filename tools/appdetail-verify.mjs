@@ -879,7 +879,6 @@ const infoOf = (name) => {
   return {
     buttons: b,
     primary: b[0] || '',
-    viewService: b.some((t) => t.includes('查看服务')),
     manageCount: b.filter((t) => t.includes('管理')).length,
     refresh: b.some((t) => t.includes('刷新')),
     // 2026-09-17：重装 / 文档 / 卸载**不再**摆卡片上，它们收进「⚙️ 管理」面板。

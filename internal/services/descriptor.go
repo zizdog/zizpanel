@@ -581,17 +581,6 @@ func FindDescriptor(id string) (AppDescriptor, bool) {
 	return d, ok
 }
 
-// AllDescriptors 返回全部已注册的描述符（按 ID 排序，结果稳定）。
-func AllDescriptors() []AppDescriptor {
-	out := make([]AppDescriptor, 0, len(descriptorsByID))
-	for _, id := range descriptorOrder {
-		if d, ok := descriptorsByID[id]; ok {
-			out = append(out, d)
-		}
-	}
-	return out
-}
-
 // Validate 对描述符做静态自检，供测试与"新增应用"的预检使用。
 //
 // 为什么要在**构造期**就检查：描述符是数据，写错了不会有编译错误 ——

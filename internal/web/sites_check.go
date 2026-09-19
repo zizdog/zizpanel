@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -17,15 +16,13 @@ import (
 	"github.com/zizdog/zizpanel/internal/sites"
 )
 
-// execCommand / jsonUnmarshal / netDialer 是薄封装，
+// execCommand / jsonUnmarshal 是薄封装，
 // 便于在测试里替换，也让调用点更简洁。
 func execCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, name, args...)
 }
 
 func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
-
-func netDialer() *net.Dialer { return &net.Dialer{} }
 
 // lookupIDs 把用户名解析为 uid/gid。
 func lookupIDs(username string) (int, int, error) {

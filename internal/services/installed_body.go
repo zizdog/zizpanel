@@ -115,23 +115,3 @@ func DetectRuntimeBody(app App, brewPrefix, userHome string) RuntimeBody {
 	body.Path = path
 	return body
 }
-
-// RuntimePathProblem 说明"声明了安装体、但它不在"时到底缺什么（人话，给门禁与诊断用）。
-// 没有声明 RuntimePath 时返回空串。
-func RuntimePathProblem(app App, brewPrefix, userHome string) string {
-	if strings.TrimSpace(app.RuntimePath) == "" {
-		return ""
-	}
-	body := DetectRuntimeBody(app, brewPrefix, userHome)
-	if body.Exists() {
-		return ""
-	}
-	path := ResolveRuntimePath(app.RuntimePath, brewPrefix, userHome)
-	if path == "" {
-		return "声明了 RuntimePath=" + app.RuntimePath + "，但 {brew}/~ 展开不出来（拿不到 brew 前缀或家目录）"
-	}
-	if entry := strings.TrimSpace(app.RuntimeEntry); entry != "" {
-		return "缺少 " + path + "（目录）或其中的入口文件 " + entry
-	}
-	return "缺少可执行文件 " + path
-}

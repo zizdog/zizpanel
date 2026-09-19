@@ -366,7 +366,7 @@ export function FilesView(content, ctx = {}) {
   //   视频 mp4/m4v/mov(H.264+AAC)、webm/ogv；音频 mp3/m4a/aac/wav/ogg/flac。
   const VIDEO_EXT = /\.(mp4|m4v|mov|webm|ogv)$/i;
   const AUDIO_EXT = /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i;
-  // 已知放不了的容器/编码：mkv/avi/wmv/flv/rmvb 等，浏览器基本解不了（坑 178）。
+  // 已知放不了的容器/编码：mkv/avi/wmv/flv/rmvb 等，浏览器基本解不了（坑 188）。
   const NO_PLAY_EXT = /\.(mkv|avi|wmv|flv|rmvb|rm|mpg|mpeg|ts|m2ts|3gp|asf|wma|mka|ape|vob|f4v)$/i;
   let sortKey = 'name';   // name | size | time
   let sortDir = 1;        // 1 升序 / -1 降序
@@ -2262,13 +2262,13 @@ async function ensureLang(langKey) {
 
 // ---------------- 播放器按需加载（Plyr） ----------------
 //
-// 与 CodeMirror 同一套做法：真点开音视频才注入 css/js（坑 179）。
+// 与 CodeMirror 同一套做法：真点开音视频才注入 css/js（坑 188）。
 // 不能用 `import()`：面板把 .mjs/.js 按 MIME 直发，UMD 在 module 里拿不到 root 会崩。
 const PLYR_ASSET_BASE = new URL('../vendor/plyr/', import.meta.url);
 let plyrPromise = null;
 
 const PLYR_OPTIONS = {
-  // 图标必须指到内嵌 svg：Plyr 默认指官方 CDN，运行时绝不联网（坑 179）。
+  // 图标必须指到内嵌 svg：Plyr 默认指官方 CDN，运行时绝不联网（坑 188）。
   iconUrl: new URL('plyr.svg', PLYR_ASSET_BASE).href,
   preload: 'metadata',
   i18n: {

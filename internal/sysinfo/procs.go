@@ -2,7 +2,6 @@ package sysinfo
 
 import (
 	"context"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -219,45 +218,4 @@ func parseCPUTime(s string) float64 {
 		total = total*60 + v
 	}
 	return days*86400 + total
-}
-
-// ListProcessesRaw 是一次性快照（无采样历史），CPU 使用 ps 的瞬时值。
-// 仅在需要立刻给出结果且无法等待采样时使用（如命令行工具）。
-func ListProcessesRaw(ctx context.Context, sortBy string, limit int) []Proc {
-	key := "-r" // 按 CPU 降序
-	if sortBy == "mem" {
-		key = "-m" // 按内存降序
-	}
-	cmd := exec.CommandContext(ctx, "/bin/ps", "-axo",
-		"pid,user,pcpu,pmem,rss,etime,cputime,comm", key)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) < 2 {
-		return nil
-	}
-	list := make([]Proc, 0, len(lines)-1)
-	for _, ln := range lines[1:] {
-		f := strings.Fields(ln)
-		if len(f) < 8 {
-			continue
-		}
-		pid, err := strconv.Atoi(f[0])
-		if err != nil {
-			continue
-		}
-		cpu, _ := strconv.ParseFloat(f[2], 64)
-		pmem, _ := strconv.ParseFloat(f[3], 64)
-		rss, _ := strconv.ParseUint(f[4], 10, 64)
-		list = append(list, Proc{
-			PID: pid, User: f[1], CPU: cpu, Mem: pmem, RSS: rss,
-			Etime: f[5], Command: shortenPath(strings.Join(f[7:], " ")),
-		})
-	}
-	if limit > 0 && len(list) > limit {
-		list = list[:limit]
-	}
-	return list
 }

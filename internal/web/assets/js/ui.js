@@ -108,14 +108,13 @@ export function appendAll(parent, ...items) {
 }
 
 export const $ = (sel, root = document) => root.querySelector(sel);
-export const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // ---------------- Toast ----------------
 
 export function toast(message, type = 'info', timeout = 4200) {
   // 反馈通道本身不能失败：所有写操作（启停/卸载/升级…）的失败提示都走这里。
   // 一旦它抛异常（例如 #toasts 不在 DOM 里），调用方 catch 里的那句提示就跟着
-  // 一起没了 —— 用户看到的正是"点了没反应"（见 DEVELOPMENT.md 坑 154）。
+  // 一起没了 —— 用户看到的正是"点了没反应"（见 坑清单 坑 154）。
   // 缺容器就现场补一个，保证提示一定看得见。
   let box = document.getElementById('toasts');
   if (!box) {
@@ -343,11 +342,6 @@ export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
-}
-
-/** 把带 ANSI 色彩/进度的终端输出简化成纯文本。 */
-export function stripAnsi(s) {
-  return String(s ?? '').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
 }
 
 // ---------------- 迷你折线图 ----------------

@@ -243,11 +243,24 @@ func TestNetworkHintOnDockerEntries(t *testing.T) {
 	})
 }
 
-// TestNetworkHintRenderedByDockerAndSitePages 锁住前端三个页面都接上了统一醒目块
-// （判据/文案与 apps.js、services/netfail.go 同源）。真正的语法门禁是
-// tools/check-js-syntax.mjs；这里只防"某个页面漏接"。
-func TestNetworkHintRenderedByDockerAndSitePages(t *testing.T) {
+// TestNetworkHintUsesSharedFrontendModule 锁住前端**唯一真源**：判据与文案住在
+// assets/js/netfail.js，五个联网页面 import 使用，谁都不许再各抄一份证据表。
+// 真正的语法门禁是 tools/check-js-syntax.mjs；这里防"某个页面漏接 / 又抄一份"。
+func TestNetworkHintUsesSharedFrontendModule(t *testing.T) {
+	shared, err := os.ReadFile("assets/js/netfail.js")
+	if err != nil {
+		t.Fatalf("读取 assets/js/netfail.js 失败：%v", err)
+	}
+	if !strings.Contains(string(shared), services.NetworkHintMarker) {
+		t.Errorf("assets/js/netfail.js 里没有与后端逐字一致的识别短语 %q", services.NetworkHintMarker)
+	}
+	if !strings.Contains(string(shared), "export function isNetworkFailureText(") {
+		t.Error("assets/js/netfail.js 缺 isNetworkFailureText 的定义 —— 各页面就没有可 import 的判据")
+	}
+
 	for _, p := range []string{
+		"assets/js/apps.js",
+		"assets/js/update.js",
 		"assets/js/docker-images.js",
 		"assets/js/docker-compose.js",
 		"assets/js/sites.js",
@@ -257,12 +270,20 @@ func TestNetworkHintRenderedByDockerAndSitePages(t *testing.T) {
 			t.Fatalf("读取 %s 失败：%v", p, err)
 		}
 		src := string(b)
-		if !strings.Contains(src, services.NetworkHintMarker) {
-			t.Errorf("%s 里没有统一识别短语 %q", p, services.NetworkHintMarker)
+		if !strings.Contains(src, "from './netfail.js'") {
+			t.Errorf("%s 没有 import 共享的 ./netfail.js —— 判据/文案必须同源", p)
 		}
-		// 一处定义 + 至少一处调用。
-		if n := strings.Count(src, "networkHintBlock("); n < 2 {
-			t.Errorf("%s 里 networkHintBlock 出现 %d 次（需要定义 + 至少一处调用）", p, n)
+		if strings.Count(src, "isNetworkFailureText(") < 1 {
+			t.Errorf("%s 没有调用共享判据 isNetworkFailureText", p)
+		}
+		if !strings.Contains(src, "networkHintBlock") && !strings.Contains(src, "networkPanel") {
+			t.Errorf("%s 没有使用共享的醒目块渲染", p)
+		}
+		// 证据表/判据只许有一份：页面里再出现这些名字就是又抄了一份。
+		for _, dup := range []string{"NET_EVIDENCE", "NET_LOCAL_ENDPOINT", "function isNetworkFailureText("} {
+			if strings.Contains(src, dup) {
+				t.Errorf("%s 里又出现了 %q —— 判据必须只在 netfail.js 定义一份", p, dup)
+			}
 		}
 	}
 }

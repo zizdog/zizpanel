@@ -779,9 +779,6 @@ func (c *Config) Path() string {
 	return filepath.Join(c.DataDir, "config.json")
 }
 
-// SetPath 用于安装阶段指定非默认路径。
-func (c *Config) SetPath(p string) { c.path = p }
-
 // ---------- 小工具 ----------
 
 // Port 从 Listen 中解析端口号。

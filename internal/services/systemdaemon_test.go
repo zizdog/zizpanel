@@ -4,7 +4,7 @@ package services
 //
 // 测试纪律（AGENTS.md 第三节）：**绝不碰真实的 /Library/LaunchDaemons**、
 // 不真的调 launchctl / brew。能纯函数测的就纯函数测；要执行的就换掉注入点。
-// 真机行为（重启后真的起来）在 mini 上验，见 DEVELOPMENT.md 坑 130。
+// 真机行为（重启后真的起来）在 mini 上验，见 坑清单 坑 130。
 
 import (
 	"context"

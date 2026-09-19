@@ -36,19 +36,6 @@ func composeHostPorts(yaml string) []int {
 	return out
 }
 
-// composeHostPortPairs 返回 `宿主:容器` 端口对（顺序即 compose 里的顺序）。
-func composeHostPortPairs(yaml string) [][2]int {
-	var out [][2]int
-	for _, m := range composeHostPortRe.FindAllStringSubmatch(yaml, -1) {
-		h, e1 := strconv.Atoi(m[1])
-		c, e2 := strconv.Atoi(m[2])
-		if e1 == nil && e2 == nil {
-			out = append(out, [2]int{h, c})
-		}
-	}
-	return out
-}
-
 // composeUsesHostNetwork 判断一份 compose 是否用了 host 网络。
 //
 // 只认整行 `network_mode: host`（允许缩进与行尾注释），不认注释掉的那一行 ——

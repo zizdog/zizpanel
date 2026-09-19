@@ -270,27 +270,6 @@ func (m *Manager) NewVoiceKey(name, value string, quotaChars int64, enabled bool
 	}, nil
 }
 
-// voiceAuthKey 取一把可用于调用接收端自身的密钥（面板读来源/用量时用）。
-//
-// 优先用 keys.json 里第一条启用的；还没迁移的机器回退到 plist 的 --token。
-func (m *Manager) voiceAuthKey() (string, error) {
-	if keys, err := m.LoadVoiceKeys(); err == nil {
-		for _, k := range keys {
-			if k.Enabled && k.Key != "" {
-				return k.Key, nil
-			}
-		}
-	}
-	p := m.receiverPaths()
-	if _, err := os.Stat(p.Plist); err != nil {
-		return "", fmt.Errorf("接收端还没部署过（找不到 %s）", p.Plist)
-	}
-	if t := m.existingReceiverToken(p); t != "" {
-		return t, nil
-	}
-	return "", nil // 未启用鉴权：空密钥照常可调
-}
-
 // ensureVoiceKeys 保证密钥表存在：不存在就从现有 plist 的 --token（或新生成的
 // 值）建一条 default 记录。返回是否新建、以及当前第一条可用密钥。
 //

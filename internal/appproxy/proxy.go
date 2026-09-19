@@ -217,13 +217,3 @@ func Slugs() []services.App {
 	}
 	return out
 }
-
-// FindApp 按子路径找应用。
-func FindApp(slug string) (services.App, bool) {
-	for _, a := range services.Catalog() {
-		if a.UI != nil && a.UI.Slug == slug {
-			return a, true
-		}
-	}
-	return services.App{}, false
-}

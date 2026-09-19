@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/imgopt"
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
@@ -346,12 +344,4 @@ func humanBytes(n int64) string {
 		i++
 	}
 	return fmt.Sprintf("%.1f %s", f, units[i])
-}
-
-// imgWriteError 把 files 包的错误翻译成更贴用户的话（保留原意）。
-func imgWriteError(err error) string {
-	if errors.Is(err, files.ErrForbidden) {
-		return "路径不在面板允许访问的范围内：" + err.Error()
-	}
-	return err.Error()
 }

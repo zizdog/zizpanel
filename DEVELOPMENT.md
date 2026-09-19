@@ -3,7 +3,7 @@
 > 给**改这个项目的人**：设计取舍、构建、测试/门禁、发布、已修复的坑。
 > 使用者看 [`README.md`](README.md)；进度与凭据看 `ZizPanel-当前状态.md`（gitignored）；规则看 `AGENTS.md`。
 > 专题文档：`docs/新增应用工作流.md`、`docs/应用市场下载点清点.md`、`docs/离线打包与迁移.md`、`docs/磁盘工具.md`。
-> **历史过程不进本文**，只留结论与坑；**坑清单只增不减**。
+> **历史过程不进本文**，只留结论与坑；坑清单见 `docs/坑清单.md`（可删过时条目，判据见 `AGENTS.md` 第六节）。
 
 ---
 
@@ -105,7 +105,7 @@ make test-short   # 只跑 Go 单测
 仓库只在本机，**不配远程、不 push、不发 GitHub Releases**。发布链路：
 
 ```bash
-make bump            # 0.11.3 → 0.11.4 … → 0.11.10 → 0.12.0
+make bump            # 只在用户同意发版时；patch 到 10 进位（见 AGENTS 第二节）
 make check           # 必须真绿（第四节）
 make release         # dist/release/：darwin/arm64+amd64 包、签名清单
 make mirror-public   # 生成"指向公网镜像"的清单（url=download/<版本>/）并签名，回读断言无内网地址
@@ -123,13 +123,13 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 - 私钥在 `.release-key/`（gitignored）。丢了就再也签不出被已装面板接受的升级包。
 - **Makefile 与 `install.sh` 里仍有 GitHub 默认值，但不属于发布链路**：
   `RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSION)`；
-  `install.sh` 的 `ZIZPANEL_DOWNLOAD_BASE` 默认也指向 `https://github.com/zizdog/zizpanel/releases`，
-  启动后回落内置镜像 `https://zizdog.com/zizpanel`。`make release` 还会多产一份 `manifest-github.json`
+  `install.sh` 的 `ZIZPANEL_DOWNLOAD_BASE` 默认为空，GitHub 默认值在 `ZIZPANEL_GITHUB_BASE` /
+  `ZIZPANEL_GITHUB_RELEASE_BASE`，启动后回落内置镜像 `https://zizdog.com/zizpanel`。`make release` 还会多产一份 `manifest-github.json`
   （同一批包、同一把私钥，只有 url 不同）。**历史入口已废弃**（不发 GitHub，那里没有新版本）；
   实际下发走 `make mirror-public` 的公网镜像版清单与内置镜像。
 - 面板"在线升级"读 `manifest.json` + `manifest.json.sig`；升级后**必须等新版本健康检查回来**
   （看版本号，不是端口通）。
-- 国内网络实测：GitHub 直连 20 秒 0 字节；自建镜像作者本机链路 ~87 MB/s、公网镜像 ~8.6 MB/s。
+- 国内网络实测（历史，未复测）：GitHub 直连 20 秒 0 字节；公网镜像 ~8.6 MB/s。
   CLT 整包、brew 瓶、pip、HF、Docker 都走镜像。
 
 ---
@@ -142,7 +142,7 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 - 每个应用从哪下、多快、超时多少：**`docs/应用市场下载点清点.md`**。
 - 镜像布局：`/apps/<id>/<ver>/`、`/models/`、`/sites/`、`/brew/`、`/pypi/`、`/hf/`、
   `/zizpanel/clt/`、`/offline/`（**没有 `/docker`**：docker 加速只用公网候选）。
-- 两条不变量：**能原生就原生**；**Docker 必须自带 arm64**（`platform:` 由测试扫目录条目锁死）。
+- 两条不变量见 AGENTS 铁律 10（能原生就原生；Docker 必须自带 arm64，`platform:` 由测试扫目录条目锁死）。
 
 ---
 
@@ -173,7 +173,7 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 | SSH | — | **禁止**（本机已删除它的主机记录与全部凭据） |
 
 > **为什么从双机变单机**：1.0.0 起 mini 是用户的生产环境，AI 不许接触（用户 2026-09-17 明确要求）。
-> `tools/deploy.sh` 的 mini 那一腿已删除、`Mac-mini部署指南.md` 已删除、原来的
+> `tools/deploy.sh` 的 mini 那一腿已删除；原来的
 > "需要重启/断网/断电恢复才能验证"这一类测试**从此没有真机可做** —— 只能近似验证或**如实标注"未验证"**。
 > 教训见坑 151。
 
@@ -188,7 +188,7 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 
 | 段 | 之前 | 现在 | 做法 |
 |---|---|---|---|
-| `make check` | 5–7 min（每次都跑） | 同一棵树**跳过** | `tools/check-stamp.sh`：check 成功时把**工作树指纹**（含未跟踪文件内容）写进 `dist/.check-stamp`；`make deploy` 先 `verify`，指纹一致才跳过并打印"哪个版本、什么时候跑的" |
+| `make check` | 5–7 min（每次都跑） | 同一棵树**跳过** | `tools/check-stamp.sh`：check 成功时把**工作树指纹**（含未跟踪文件内容）写进仓库根 `.zp-check-stamp`；`make deploy` 先 `verify`，指纹一致才跳过并打印"哪个版本、什么时候跑的" |
 | `make release` | 双架构，16s | **只 arm64**，8s | `ARCHS`（默认 `arm64 amd64`，`make deploy` 传 `arm64`）—— 本机是 Apple Silicon |
 | 上传镜像机 | 4 个包 ≈96MB | **1 个包 23MB** | 只传版本包；`latest` 与 `download/<版本>/` 的副本/软链由远端 LAYOUT 造 |
 | 升级等待 | 每轮 sleep 2s | 前 20 轮 0.5s，之后 2s | `tools/panel-upgrade.py`；总窗口不变（≈3 min） |
@@ -199,7 +199,7 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 
 ## 九、已修复的典型坑
 
-**清单已移到 `docs/坑清单.md`**（只增不减，当前 177 条）。那里记录了每个坑的现象、根因、
+**清单已移到 `docs/坑清单.md`**（可删过时条目）。那里记录了每个坑的现象、根因、
 修法与对应门禁；本节只留指针，避免这份文档超出 450 行预算、把上下文挤爆。
 新踩到坑时：先追加到 `docs/坑清单.md`；如果它会**伤到使用者**（安装卡住 / 谎报成功 /
 破坏用户环境），再摘要一句进 `AGENTS.md` 第三节。

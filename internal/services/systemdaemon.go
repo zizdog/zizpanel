@@ -40,7 +40,7 @@ package services
 //  重新写一份 Go 版只会多出一份"只在真机上才会暴露差异"的实现，所以这里
 //  只补脚本没覆盖的那一段：**裸奔在 user/<uid> 域里的旧作业**。
 //  脚本用 `launchctl bootout gui/<uid>/<label>` 清用户级 agent，而无头机器上
-//  gui 域根本不存在（坑 125），作业其实挂在 user/<uid> 里 —— 不清掉就会出现
+//  gui 域根本不存在（坑 122），作业其实挂在 user/<uid> 里 —— 不清掉就会出现
 //  "同一服务两份实例抢同一个端口"。所以改造前先走一次 priv.LaunchUnload
 //  （它按域探测，user/gui 都覆盖）。
 

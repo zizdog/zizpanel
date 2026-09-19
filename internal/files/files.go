@@ -25,7 +25,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // Manager 管理允许访问的根目录集合。
@@ -838,7 +837,7 @@ func (m *Manager) SaveUploadAs(dir, relPath string, r io.Reader, overwrite bool)
 //
 // 为什么不用 os.MkdirAll：面板以 root 运行，MkdirAll 建出来的目录归 root，
 // 而网站进程（nginx / php-fpm 以真实用户跑）要能在里面写缓存/上传 —— 归属必须
-// 在创建的那一刻就交还，不能"下次再说"（见 AGENTS.md 第三节：坑 156/163）。
+// 在创建的那一刻就交还，不能"下次再说"（见 AGENTS.md 第三节：坑 163）。
 // 逐段做还有个好处：只在真正新建的那一层 chown，重复上传同一棵目录树不会
 // 对每个文件都重跑一遍 chown。
 func (m *Manager) mkdirAllOwned(base, dir string) error {
@@ -986,13 +985,4 @@ func FormatSize(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %cB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-// ModTimeOf 返回文件修改时间（用于前端展示）。
-func ModTimeOf(p string) time.Time {
-	st, err := os.Stat(p)
-	if err != nil {
-		return time.Time{}
-	}
-	return st.ModTime()
 }

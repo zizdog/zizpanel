@@ -5,10 +5,10 @@
 
 import { api, sse, apiURL } from './api.js';
 import {
-  h, clear, toast, modal, confirmBox, bytes, rate, pct, duration,
-  levelOf, Sparkline, $, appendAll,
+  h, clear, toast, modal, bytes, rate, pct, duration,
+  levelOf, Sparkline, appendAll,
 } from './ui.js';
-import { state, NAV, panelPath, consumePendingAnchor } from './app.js';
+import { state, consumePendingAnchor } from './app.js';
 import { taskCenter } from './tasks.js';
 // 配置文件编辑器只有一份实现（services.js）——本页「当前生效值」里的「打开」按钮
 // 也走它。这里以前**漏了 import**：点那些「打开」会抛 ReferenceError
@@ -1322,61 +1322,4 @@ export function SettingsView(content, ctx = {}) {
   // 收回设置页（重复入口让人困惑），功能就在上面第 4 个 Tab 里，再放一个
   // "去别处"的按钮只会把用户又支到别的地方。
   content.append(tabBar, body);
-}
-
-// ============================================================================
-//  开发中的模块占位
-// ============================================================================
-
-export function ComingSoonView(content, ctx = {}) {
-  clear(content);
-  const item = ctx.item || {};
-  const phase = item.phase || '后续阶段';
-
-  const roadmap = {
-    P2: ['站点增删改查与 nginx 配置生成', '伪静态规则模板（Typecho / WordPress / Laravel 等）',
-      '多版本 PHP 绑定与切换', 'Let\'s Encrypt 一键签发与自动续期', '反向代理可视化配置'],
-    P3: ['服务注册表（裸装 + Docker 统一抽象）', '服务启停、实时日志、健康检查',
-      'Compose 编辑器与一键部署', '应用市场：STT/TTS/IOPaint/Ollama/Uptime Kuma 等'],
-    P4: ['文件管理器与在线代码编辑', 'Web 终端（浏览器内 shell）', '计划任务（定时备份/脚本）',
-      '日志中心（聚合 + 实时尾随）', '数据库管理（库/用户/导入导出）'],
-    P1: ['两步验证强制策略', '操作审计检索与导出', '系统告警通知'],
-  }[phase] || [];
-
-  content.append(
-    h('div.card', [
-      h('div.card-body', [
-        h('div.empty', [
-          h('div.big', { text: item.icon || '🚧' }),
-          h('h4', { text: `${item.title || '该模块'}正在开发中` }),
-          h('p', { text: `计划在 ${phase} 阶段交付。以下是该模块将包含的能力：` }),
-        ]),
-        h('div', { style: { maxWidth: '620px', margin: '0 auto' } },
-          roadmap.map((t) => h('div', {
-            style: {
-              display: 'flex', gap: '9px', padding: '8px 0',
-              borderBottom: '1px solid var(--border-soft)', fontSize: '13px', color: 'var(--text-dim)',
-            },
-          }, [h('span', { text: '•', style: { color: 'var(--brand)' } }), h('span', { text: t })]))),
-        h('div', { style: { textAlign: 'center', marginTop: '22px' } }, [
-          h('button.btn.btn-primary', { text: '返回仪表盘', onclick: () => go('dashboard') }),
-        ]),
-      ]),
-    ]),
-    h('div.card', [
-      h('div.card-head', [h('h3', { text: '当前已交付' })]),
-      h('div.card-body', [
-        h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
-          h('span.pill.ok', { text: '远程访问 + 自签 HTTPS' }),
-          h('span.pill.ok', { text: '登录鉴权 + 会话管理' }),
-          h('span.pill.ok', { text: '两步验证 TOTP' }),
-          h('span.pill.ok', { text: '访问策略（IP 白名单）' }),
-          h('span.pill.ok', { text: '实时系统监控（仪表盘）' }),
-          h('span.pill.ok', { text: 'mac 设置' }),
-          h('span.pill.ok', { text: '操作审计' }),
-          h('span.pill.ok', { text: '内存级登录限流' }),
-        ]),
-      ]),
-    ]),
-  );
 }

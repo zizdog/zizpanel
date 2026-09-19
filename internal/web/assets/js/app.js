@@ -4,7 +4,7 @@
 // hash 路由不需要服务端配合改写，也避免了刷新 404。
 
 import { api, ApiError } from './api.js';
-import { h, clear, toast, $, modal, bytes, duration, esc } from './ui.js';
+import { h, clear, toast, $ } from './ui.js';
 import { DashboardView, SettingsView } from './views.js';
 import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';

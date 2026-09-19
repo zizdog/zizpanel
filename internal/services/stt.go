@@ -181,15 +181,6 @@ func STTModelIDList() string {
 	return strings.Join(ids, " / ")
 }
 
-// STTModelFilename 在档位不变时保证文件名不变（别名/大小写不敏感）。
-func STTModelFilename(id string) (string, error) {
-	m, err := FindSTTModel(id)
-	if err != nil {
-		return "", err
-	}
-	return m.File, nil
-}
-
 // --- 路径 ---
 
 // STTPaths 是目录约定：面板自己的东西放 <真实用户家目录>/stt/（与 qwentts / iopaint 同规矩）。

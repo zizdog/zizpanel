@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -58,29 +57,10 @@ func copyDirTo(src, dst string) error {
 	})
 }
 
-// ItemByArchivePath 在当前配置的计划里按归档路径找条目（恢复时用）。
-func ItemByArchivePath(items []Item, archivePath string) (Item, bool) {
-	for _, it := range items {
-		if it.ArchivePath == archivePath {
-			return it, true
-		}
-	}
-	return Item{}, false
-}
-
 // CopyFile 暴露给调用方做"恢复前快照"以外的少量复制（如 config.json）。
 func CopyFile(src, dst string) error {
 	if _, err := os.Stat(src); err != nil {
 		return err
 	}
 	return copyFileTo(src, dst)
-}
-
-// ReadFile 读一个小文件（恢复前的二次确认、回读等）。
-func ReadFile(p string) ([]byte, error) {
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return nil, fmt.Errorf("读取 %s 失败: %w", p, err)
-	}
-	return b, nil
 }

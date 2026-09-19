@@ -67,9 +67,6 @@ func consoleUserReal() string {
 // 只读判据、**不碰任何卷**：面板用它做"现在有没有人能点弹窗"的同步预检（铁律 12）。
 func ConsoleUser() string { return strings.TrimSpace(consoleUserFn()) }
 
-// ExternalVolumeMounts 返回当前检测到的非系统卷挂载点（只枚举挂载点，不读卷内容）。
-func ExternalVolumeMounts() []string { return volumeMountsForAuthFn() }
-
 // volumeMountsForAuthFn 是"要申请授权的外接卷列表"的来源（默认复用 NonSystemVolumeMounts）。
 // 变量而非常量：单测要能造出"有没有外接卷"两种情形，而不依赖跑测试那台机器插没插盘。
 var volumeMountsForAuthFn = NonSystemVolumeMounts

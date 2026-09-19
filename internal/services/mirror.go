@@ -230,17 +230,6 @@ func (m *Manager) downloadURLsFor(ctx context.Context, spec releaseBinaryApp) []
 	return append([]string{url}, fallback...)
 }
 
-// mirrorReachable 探测镜像站是否可用（只探站点根，用于"整条链路"级别的判断）。
-//
-// 与 checkMirrorURL 的分工：那个探**具体资源**（用来决定某个包从哪下），
-// 这个探**站点本身**（用来决定 pip / HF 这类"整条链路"要不要走镜像）。
-func (m *Manager) mirrorReachable(ctx context.Context) bool {
-	if !m.MirrorEnabled() {
-		return false
-	}
-	return m.checkMirrorURL(ctx, m.mirrorBase()+"/") == nil
-}
-
 // probeMirrorFile 探镜像上一个**具体文件**是否可用，并返回它的大小
 // （上游没给 Content-Length 时返回 -1）。
 //

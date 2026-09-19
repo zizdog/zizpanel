@@ -12,7 +12,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/services"
 )
 
-// Homebrew 目录缺失修复接口的门禁（坑 178）：202+task_id、requireAuth、回读失败不谎报。
+// Homebrew 目录缺失修复接口的门禁（坑 186）：202+task_id、requireAuth、回读失败不谎报。
 // 全程用临时前缀里的假 brew，不碰 /opt/homebrew、不跑真 brew。
 // bindFakeBrew 把测试服务器的服务管理器指向临时前缀里的**假 brew**。
 //

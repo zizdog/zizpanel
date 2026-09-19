@@ -120,9 +120,6 @@ func NewSpeechServer(opt SpeechOptions) *SpeechServer {
 	}
 }
 
-// Engine 暴露引擎给子命令（启动时打印一次真实状态）。
-func (s *SpeechServer) Engine() *services.SpeechEngine { return s.engine }
-
 // Listen 返回监听地址。
 func (s *SpeechServer) Listen() string { return s.opt.Listen }
 

@@ -780,12 +780,6 @@ export function openQwenModels(svc) {
 // ---------------------------------------------------------------------
 export const RECEIVER_LABEL = 'com.zizdog.voicereceiver';
 
-function randomReceiverToken() {
-  const b = new Uint8Array(16);
-  crypto.getRandomValues(b);
-  return 'ttsv-' + Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-}
-
 // 与后端 ValidateReceiverToken 同一套规则
 function validReceiverToken(t) {
   return /^[A-Za-z0-9._-]{8,128}$/.test(t);

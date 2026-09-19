@@ -17,7 +17,7 @@
 //  3. **导出沿用当前筛选**。页面上看到什么，导出的就是什么。
 
 import { api, apiURL } from './api.js';
-import { h, clear, toast, appendAll } from './ui.js';
+import { h, clear, toast } from './ui.js';
 
 // 筛选状态放在模块级：切走再回来时保留上次的筛选（审计常常要来回对照）。
 let filters = {

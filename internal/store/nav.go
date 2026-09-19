@@ -86,20 +86,6 @@ type NavItem struct {
 	CreatedAt   string `json:"created_at"`
 }
 
-// NavKnownTables 返回导航页建的表名。
-//
-// 从 navSchema 派生而不是抄一份名字列表：抄一份就多一处会走样的真相源，
-// 而备份兼容性判定完全依赖这份名单（见 restore.go 的 KnownTables）。
-func NavKnownTables() []string {
-	var out []string
-	for _, stmt := range splitStatements(navSchema) {
-		if name := createTableName(stmt); name != "" {
-			out = append(out, name)
-		}
-	}
-	return out
-}
-
 // init 把导航页的建表语句登记进 KnownTables()（备份兼容性判定的唯一依据）。
 func init() { registerSchemaSource(navSchema) }
 

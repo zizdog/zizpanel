@@ -144,9 +144,6 @@ func NewStateWriter(workDir string, st *State) *StateWriter {
 // State 返回底层状态指针（调用方只读或做兼容字段的赋值）。
 func (w *StateWriter) State() *State { return w.st }
 
-// Now 返回写入器使用的当前时间（与进度时间戳同源，避免两处时钟不一致）。
-func (w *StateWriter) Now() time.Time { return w.now() }
-
 // Log 追加一条日志并落盘。
 //
 // 日志行直接进 State（而不是只写进程日志）：用户看的是网页，

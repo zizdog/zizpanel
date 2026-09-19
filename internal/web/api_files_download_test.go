@@ -18,7 +18,7 @@ import (
 //  必须回 206 + Content-Range。
 //
 //  另一半是 MIME：下载接口以前一律回 application/octet-stream，
-//  `<video>/<audio>` 拿到会直接拒播（坑 178）—— 媒体必须回真实类型。
+//  `<video>/<audio>` 拿到会直接拒播（坑 188）—— 媒体必须回真实类型。
 // ============================================================================
 
 func TestFileDownloadRangeReturns206(t *testing.T) {
@@ -56,7 +56,7 @@ func TestFileDownloadRangeReturns206(t *testing.T) {
 	if got := res.Header.Get("Accept-Ranges"); got != "bytes" {
 		t.Errorf("Accept-Ranges = %q，想要 bytes", got)
 	}
-	// 媒体必须回真实 MIME，否则 <video> 拒播（坑 178）。
+	// 媒体必须回真实 MIME，否则 <video> 拒播（坑 188）。
 	if got := res.Header.Get("Content-Type"); got != "video/mp4" {
 		t.Errorf("Content-Type = %q，想要 video/mp4 —— octet-stream 会让浏览器拒播", got)
 	}

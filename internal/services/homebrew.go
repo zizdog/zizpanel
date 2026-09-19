@@ -544,7 +544,7 @@ func (m *Manager) EnsureHomebrew(ctx context.Context, result *InstallResult) err
 	args = append(args, "/bin/bash", scriptPath)
 	// 先说清"接下来会安静几分钟"：brew 的安装脚本在 `git fetch brew.git`（几百 MB）
 	// 期间**一行都不打印**，任务窗看起来就像卡死（真机反馈）。这句话是给用户的预期管理；
-	// 真正的实时心跳需要线程安全的 step 发射器（见 tools/../DEVELOPMENT 坑 156 的待办）。
+	// 真正的实时心跳需要线程安全的 step 发射器（见坑 113 的待办）。
 	result.step(ctx, "开始安装 Homebrew：此步会先拉取 brew.git 仓库（几百 MB），通常几分钟；"+
 		"brew 在这段时间不打印日志，属正常现象，请勿关闭")
 	installStart := time.Now()

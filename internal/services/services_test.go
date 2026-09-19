@@ -24,7 +24,7 @@ func newTestManager(t *testing.T) (*Manager, *Repository) {
 	m := NewManager(repo, Options{
 		BrewBin: "/opt/homebrew/bin/brew",
 		// ⚠️ 不能用 os.Getenv("HOME")：那是**真实**家目录。
-		// 测试里的所有用户可见路径都必须落在临时目录里（见 README 坑 57）。
+		// 测试里的所有用户可见路径都必须落在临时目录里（见 坑清单 坑 57）。
 		UserHome: t.TempDir(),
 		UserName: "zizdog",
 		UID:      os.Getuid(),

@@ -395,7 +395,7 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/services/{name}/filebrowser-root", s.requireAuth(s.handleFilebrowserRootSet))
 	// brew 的真实状态（服务/可升级/已装），面板直接渲染它，不再只信自己的记录表。
 	root.HandleFunc("GET /api/v1/brew/overview", s.requireAuth(s.handleBrewOverview))
-	// Homebrew 目录缺失（「未能复核已装软件」的修复入口，坑 178）：
+	// Homebrew 目录缺失（「未能复核已装软件」的修复入口，坑 186）：
 	// GET 只解析上次失败原因（不跑 brew）；POST 走任务中心，只有用户点击才执行、做完回读复核。
 	root.HandleFunc("GET /api/v1/brew/dirs", s.requireAuth(s.handleBrewDirs))
 	root.HandleFunc("POST /api/v1/brew/repair-dirs", s.requireAuth(s.handleBrewRepairDirs))

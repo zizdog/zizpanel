@@ -54,86 +54,13 @@ import {
   // 里的 resolve(false) 抢先定稿 —— 用户点「确认卸载」后什么都不发生。
   confirmUninstallPlan,
 } from './servicePanel.js';
+// 网络失败判据与统一文案（唯一前端真源，见 netfail.js；后端同名判据见 services/netfail.go）。
+import { isNetworkFailureText, networkHintText, networkHintBlock } from './netfail.js';
 
-// 网络失败提示：判据与 internal/services/netfail.go 同源，NET_HINT_MARKER 必须逐字一致。
-// 文案纪律：标题一句话 ≤40 字，入口名收进折叠项。update.js 有一份同样的实现。
-const NET_HINT_MARKER = '面板不会替你翻墙';
-const NET_HINT_ONE_LINE = '🌐 网络问题：面板不会替你翻墙，请自备代理/梯子后重试';
+// NET_HINT_ENTRIES 是本页"去哪改镜像/代理"的入口（各页入口不同）。
 const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker →「加速源」；'
   + '面板设置 →「检查更新」→「升级源地址」。';
-const NET_EVIDENCE = [
-  'could not resolve host', 'temporary failure in name resolution',
-  'name or service not known', 'no such host', 'server misbehaving',
-  'connection refused', 'connection timed out', 'connection timeout',
-  'connection reset by peer', 'no route to host', 'network is unreachable',
-  'network is down', 'host is down', 'i/o timeout', 'operation timed out',
-  'failed to connect to', "couldn't connect to server", 'could not connect to server',
-  'dial tcp', 'dial udp',
-  'tls handshake timeout', 'tls: failed to verify certificate',
-  'tls: bad certificate', 'remote error: tls:', 'x509:',
-  'certificate signed by unknown authority', 'certificate is not valid for',
-  'client.timeout exceeded', 'request canceled while waiting for connection',
-  // curl 特定退出码（刻意排除 22：HTTP 错误码，是"镜像上没有文件"不是网络不通）
-  'curl: (6)', 'curl: (7)', 'curl: (28)', 'curl: (35)', 'curl: (52)',
-  'curl: (56)', 'curl: (60)', 'ssl connect error',
-];
-const NET_LOCAL_ENDPOINT = ['unix://', 'dial unix', 'docker.sock', '127.0.0.1', 'localhost', '[::1]'];
-const NET_LOCAL_OVERRIDE = ['proxyconnect'];
-
-// 只认有真实证据的网络失败，拿不准 false：误报比漏报更糟。
-function isNetworkFailureText(text) {
-  const msg = String(text == null ? '' : text).toLowerCase();
-  if (!msg.trim()) return false;
-  if (msg.includes(NET_HINT_MARKER)) return true;
-  if (NET_LOCAL_OVERRIDE.some((s) => msg.includes(s))) return true; // 走代理失败优先
-  if (NET_LOCAL_ENDPOINT.some((s) => msg.includes(s))) return false; // 本地服务没起来 ≠ 要翻墙
-  if (NET_EVIDENCE.some((s) => msg.includes(s))) return true;
-  if (msg.includes('context deadline exceeded')
-    && (msg.includes('http://') || msg.includes('https://'))) return true;
-  return false;
-}
-
-// networkHintText 是可直接 toast 的一句话（≤40 字）。
-function networkHintText() {
-  return NET_HINT_ONE_LINE;
-}
-
-// networkHintEntries 渲染"改镜像/代理的入口"折叠项（细节收起来，标题只一句话）。
-function networkHintEntries() {
-  return h('details', { style: { marginTop: '6px' } }, [
-    h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '面板里改镜像/代理的入口' }),
-    h('div', { style: { marginTop: '4px', color: 'var(--text-dim)' }, text: NET_HINT_ENTRIES }),
-  ]);
-}
-
-// networkHintBlock 是醒目展示块：danger 底 + pill + 一句话 + 折叠入口 + 原文。
-function networkHintBlock(errText) {
-  const raw = String(errText == null ? '' : errText).trim();
-  const nodes = [
-    h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-      h('span.pill.danger', { style: { fontSize: '12px', fontWeight: '700' }, text: '🌐 网络问题' }),
-      h('strong', { text: NET_HINT_ONE_LINE }),
-    ]),
-    networkHintEntries(),
-  ];
-  if (raw) {
-    nodes.push(h('div', {
-      style: {
-        marginTop: '6px', fontFamily: 'var(--mono)', fontSize: '11.5px',
-        color: 'var(--text-dim)', wordBreak: 'break-all',
-      },
-      text: '原始报错：' + raw,
-    }));
-  }
-  return h('div', {
-    dataset: { testid: 'zp-network-failure' },
-    style: {
-      padding: '11px 13px', background: 'var(--danger-soft)',
-      border: '1px solid var(--danger)', borderRadius: 'var(--radius)',
-      fontSize: '12.5px', lineHeight: '1.7', marginBottom: '12px',
-    },
-  }, nodes);
-}
+const netHintBlock = (errText) => networkHintBlock(errText, NET_HINT_ENTRIES);
 
 let cache = null;
 // svcList 是这轮市场数据对应**完整服务记录**（api.services(true)，带健康检查）。
@@ -289,7 +216,7 @@ export function AppsView(content, ctx = {}) {
     clear(body);
     // 有网络失败时，先在最上方摆出醒目提示（pill + 能照做的镜像入口 + 原文）。
     // 放在内容之前：用户打开这一页第一眼就知道"是网络，不是功能坏了"。
-    if (netFailure) body.append(networkHintBlock(netFailure));
+    if (netFailure) body.append(netHintBlock(netFailure));
     if (active === 'installed') renderInstalledTab();
     else if (active === 'docker') renderDockerTab();
     else if (active === 'sites') renderSitesTab();
@@ -1274,7 +1201,7 @@ export function AppsView(content, ctx = {}) {
         h('div.empty', [h('div.big', { text: '⚠️' }), h('p', { text: e.message })]),
         // 安装前检查本身是本地动作；但一旦失败原因是网络（例如去探测镜像/依赖），
         // 必须让用户当场看出是网络，而不是以为这个应用不能装。
-        network ? networkHintBlock(e.message) : null);
+        network ? netHintBlock(e.message) : null);
       return;
     }
 
