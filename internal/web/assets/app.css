@@ -613,3 +613,137 @@ button, input, select, textarea { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   .zp-nav-card:hover { transform: none !important; }
 }
+
+/* ==========================================================================
+   文件编辑器窗口（2026-09-23 用户要求：照宝塔那样做成"窗口 + 目录树 + 菜单栏"）
+   只新增，不动上面的既有规则。所有颜色走既有 CSS 变量，深浅主题自动跟随。
+   ========================================================================== */
+
+/* 窗口层：**pointer-events:none** —— 最小化后这里只剩右下角胶囊可点，
+   绝不会像全屏遮罩那样把面板其它部分挡住（用户点名的要求 e）。 */
+.zpf-layer { position: fixed; inset: 0; z-index: 245; pointer-events: none; }
+
+.zpf-win {
+  position: absolute; pointer-events: auto; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); overflow: hidden; min-width: 320px; min-height: 200px;
+  animation: zpModalIn .16s cubic-bezier(.2, .8, .3, 1) both;
+}
+.zpf-win-max { border-radius: 0; }
+
+/* 标题栏：图标按钮（最小化 / 最大化 / 关闭），可拖动 */
+.zpf-titlebar {
+  display: flex; align-items: center; gap: 7px; padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--border-soft); background: var(--panel-2);
+  cursor: move; user-select: none; flex: 0 0 auto;
+}
+.zpf-title { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.zpf-title-path { font-size: 11.5px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.zpf-titlebar .spacer { flex: 1 1 auto; min-width: 8px; }
+.zpf-dirty-dot { color: var(--warn); font-size: 11.5px; white-space: nowrap; }
+.zpf-iconbtn {
+  width: 28px; height: 24px; flex: 0 0 auto; display: grid; place-items: center; cursor: pointer;
+  border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-dim);
+  font-size: 13px; line-height: 1; padding: 0;
+  transition: background .14s ease, color .14s ease, border-color .14s ease;
+}
+.zpf-iconbtn:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
+.zpf-iconbtn.zpf-close:hover { background: var(--danger-soft); border-color: rgba(239,68,68,.5); color: #ff8080; }
+
+/* 菜单栏 */
+.zpf-menubar {
+  display: flex; align-items: stretch; gap: 2px; padding: 0 6px;
+  border-bottom: 1px solid var(--border-soft); background: var(--panel);
+  cursor: default; user-select: none; flex: 0 0 auto;
+}
+.zpf-menubar-item { position: relative; }
+.zpf-menu-title {
+  padding: 6px 10px; font-size: 12.5px; background: transparent; border: none;
+  color: var(--text-dim); cursor: pointer; border-radius: 6px;
+}
+.zpf-menu-title:hover, .zpf-menubar-item.open .zpf-menu-title { background: var(--panel-2); color: var(--text); }
+.zpf-menu-pop {
+  position: absolute; top: 100%; left: 0; z-index: 6; min-width: 220px; padding: 5px;
+  display: none; flex-direction: column; gap: 1px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 9px; box-shadow: var(--shadow);
+}
+.zpf-menubar-item.open .zpf-menu-pop { display: flex; animation: zpDropdownIn .14s ease both; }
+.zpf-menu-row {
+  display: flex; align-items: center; gap: 12px; width: 100%; padding: 7px 10px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  color: var(--text); font-size: 12.5px; cursor: pointer; text-align: left; white-space: nowrap;
+}
+.zpf-menu-row:hover { background: var(--panel-2); border-color: var(--border); }
+.zpf-menu-row:disabled { opacity: .5; cursor: default; }
+.zpf-menu-row:disabled:hover { background: transparent; border-color: transparent; }
+.zpf-menu-hint { margin-left: auto; color: var(--text-mute); font-size: 11px; font-family: var(--mono); }
+.zpf-menu-sep { height: 1px; margin: 4px 6px; background: var(--border-soft); }
+
+/* 主体：左目录树 + 可拖动分隔条 + 右编辑区 */
+.zpf-body { display: flex; flex: 1 1 auto; min-height: 0; }
+.zpf-tree { display: flex; flex-direction: column; min-width: 0; flex: 0 0 auto; background: var(--panel-2); border-right: 1px solid var(--border-soft); }
+.zpf-tree-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border-soft); font-size: 11.5px; color: var(--text-mute); }
+.zpf-tree-scroll { flex: 1 1 auto; overflow: auto; padding: 4px 2px 10px; }
+.zpf-tree-row { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 5px; font-size: 12.5px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.zpf-tree-row:hover { background: var(--panel); color: var(--text); }
+.zpf-tree-row.active { background: var(--brand-soft); color: var(--brand); font-weight: 600; }
+.zpf-tree-row.current-dir { color: var(--text); }
+.zpf-tree-caret { width: 14px; text-align: center; font-size: 10px; color: var(--text-mute); flex: 0 0 auto; }
+.zpf-tree-name { overflow: hidden; text-overflow: ellipsis; }
+.zpf-tree-resizer { flex: 0 0 auto; width: 5px; cursor: col-resize; background: transparent; }
+.zpf-tree-resizer:hover, body.zpf-resizing .zpf-tree-resizer { background: var(--brand-soft); }
+
+.zpf-edit { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; min-height: 0; }
+.zpf-edit .zpf-cm { flex: 1 1 auto; min-height: 0; }
+.zpf-statusbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 4px 10px;
+  border-top: 1px solid var(--border-soft); font-size: 11.5px; color: var(--text-mute);
+  font-family: var(--mono); white-space: nowrap; overflow: hidden;
+}
+
+/* 最小化：右下角胶囊。窗口本身在 pointer-events:none 的层里，
+   所以收起后**只有这颗胶囊可点**，面板其它按钮照常工作。 */
+.zpf-win.zpf-win-min {
+  left: auto !important; top: auto !important; right: 18px !important; bottom: 18px !important;
+  width: 320px !important; height: 46px !important; min-width: 0; min-height: 0;
+  border-radius: 23px; animation: none;
+}
+.zpf-win.zpf-win-min .zpf-menubar,
+.zpf-win.zpf-win-min .zpf-body,
+.zpf-win.zpf-win-min .zpf-title-path { display: none; }
+.zpf-win.zpf-win-min .zpf-titlebar { border-bottom: none; height: 100%; padding: 0 8px 0 14px; }
+.zpf-win.zpf-win-min .zpf-titlebar .spacer { min-width: 4px; }
+body.zpf-dragging { user-select: none; }
+body.zpf-dragging .zpf-win { cursor: move; }
+
+/* ==========================================================================
+   面板外壳补充：底部 footer + 侧栏折叠（2026-09-23）
+   ========================================================================== */
+.footer {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 18px; border-top: 1px solid var(--border);
+  font-size: 11.5px; color: var(--text-mute); background: var(--bg);
+}
+.footer .footer-sep { opacity: .5; }
+.footer .footer-strong { color: var(--text-dim); font-weight: 550; }
+
+.sidebar-head .sidebar-brand { min-width: 0; }
+.sidebar-head .sidebar-toggle { margin-left: auto; flex: 0 0 auto; }
+
+/* 折叠后 --sidebar-w 变窄，侧栏与主区同时跟着变（变量在 body 上重定义并向下继承） */
+body.zp-sidebar-collapsed { --sidebar-w: 64px; }
+body.zp-sidebar-collapsed .sidebar-head { justify-content: center; padding: 0 8px; gap: 0; }
+body.zp-sidebar-collapsed .sidebar-head .mark { display: none; }
+body.zp-sidebar-collapsed .sidebar-head .sidebar-brand { display: none; }
+body.zp-sidebar-collapsed .sidebar-head .sidebar-toggle { margin: 0; }
+body.zp-sidebar-collapsed .nav { padding: 10px 6px 16px; }
+body.zp-sidebar-collapsed .nav-group { display: none; }
+body.zp-sidebar-collapsed .nav-item { position: relative; justify-content: center; gap: 0; padding: 10px 0; }
+body.zp-sidebar-collapsed .nav-item > span:not(.ico) { display: none; }
+body.zp-sidebar-collapsed .nav-item .ico { width: auto; font-size: 17px; }
+/* 新版本小红点保留成角标：折叠态下它是唯一常驻的升级信号 */
+body.zp-sidebar-collapsed .nav-item > span.zp-update-dot {
+  display: inline-flex; position: absolute; top: 3px; right: 10px; margin: 0;
+  font-size: 9px; padding: 0 3px;
+}
+body.zp-sidebar-collapsed .sidebar-foot { display: none; }

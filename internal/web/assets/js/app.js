@@ -368,6 +368,41 @@ function renderSetup() {
 
 // ---------------- 主界面 ----------------
 
+// ---------------- 侧栏折叠（只显示图标） ----------------
+//
+// 为什么记在 localStorage：用户折叠侧栏是"我习惯这样用"的长期偏好，
+// 刷新一次就弹回来会让他每次都要再折一遍。
+const SIDEBAR_KEY = 'zp-sidebar-collapsed';
+
+function sidebarCollapsed() {
+  try { return localStorage.getItem(SIDEBAR_KEY) === '1'; } catch { return false; }
+}
+
+// applySidebarState 把折叠状态落到 body 类名与那颗开关按钮上。
+// 单独抽出来是因为 renderApp() 每次路由切换都会重建侧栏 DOM，重建后必须**原地**补状态。
+function applySidebarState() {
+  const on = sidebarCollapsed();
+  document.body.classList.toggle('zp-sidebar-collapsed', on);
+  const btn = document.querySelector('.sidebar-toggle');
+  if (btn) {
+    btn.textContent = on ? '»' : '«';
+    btn.title = on ? '展开侧栏（显示文字）' : '折叠侧栏（只显示图标）';
+    btn.setAttribute('aria-label', on ? '展开侧栏' : '折叠侧栏');
+  }
+}
+
+function toggleSidebar() {
+  try { localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed() ? '0' : '1'); } catch { /* 存不了就本次会话生效 */ }
+  applySidebarState();
+}
+
+// footerStatus 给底部 footer 的一句状态（版本号在 footer 里单独一列）。
+function footerStatus() {
+  const c = state.session?.config || {};
+  const scheme = c.tls ? 'HTTPS' : 'HTTP';
+  return c.listen ? `面板运行正常 · 监听 ${c.listen} · ${scheme}` : '面板运行正常';
+}
+
 function renderApp() {
   // 路由先过别名表：`#/services` 会落到 apps 版块的「已安装」Tab（见 ROUTE_TARGET）；
   // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
@@ -392,6 +427,8 @@ function renderApp() {
       })
       : null;
     nav.appendChild(h(`div.nav-item${active ? '.active' : ''}`, {
+      // 折叠后只剩图标，所以 title 是用户唯一能看到的名称提示。
+      title: n.title,
       onclick: () => { location.hash = '#/' + n.id; document.body.classList.remove('nav-open'); },
     }, [
       h('span.ico', { text: n.icon }),
@@ -402,13 +439,19 @@ function renderApp() {
   });
 
   const user = state.session?.user || {};
+  const sidebarToggle = h('button.btn.btn-ghost.btn-icon.sidebar-toggle', {
+    text: sidebarCollapsed() ? '»' : '«',
+    title: sidebarCollapsed() ? '展开侧栏（显示文字）' : '折叠侧栏（只显示图标）',
+    onclick: (e) => { e.stopPropagation(); toggleSidebar(); },
+  });
   const sidebar = h('aside.sidebar', [
     h('div.sidebar-head', [
       h('div.mark', { text: 'Z' }),
-      h('div', [
+      h('div.sidebar-brand', [
         h('div.title', { text: 'ZizPanel' }),
         h('div.ver', { text: 'v' + (state.session?.version || '') }),
       ]),
+      sidebarToggle,
     ]),
     nav,
     h('div.sidebar-foot', [
@@ -438,11 +481,22 @@ function renderApp() {
     h('button.btn.btn-ghost.btn-icon', { text: '⏻', title: '退出登录', onclick: doLogout }),
   ]);
 
-  const main = h('main.main', [topbar, content]);
+  // 底部 footer：版本号 + 一句状态。放在 main 的**正常流**里（不是 fixed），
+  // 所以它永远不会盖住 content 的内容 —— 内容短时它在视口底部，内容长时它在最下面。
+  const footer = h('footer.footer', [
+    h('span.footer-strong', { text: 'ZizPanel' }),
+    h('span', { text: 'v' + (state.session?.version || '未知') }),
+    h('span.footer-sep', { text: '·' }),
+    h('span', { text: footerStatus() }),
+  ]);
+
+  const main = h('main.main', [topbar, content, footer]);
   const layout = h('div.layout', [sidebar, main, h('div.overlay', { onclick: () => document.body.classList.remove('nav-open') })]);
 
   mount(layout);
   document.body.classList.remove('nav-open');
+  // 侧栏折叠状态：renderApp() 每次都重建侧栏 DOM，重建后必须原地补回折叠类与按钮外观。
+  applySidebarState();
 
   // 任务中心初始化：内部幂等（只会拉一次 GET /api/v1/tasks，然后按运行中的任务建 SSE）。
   // 之所以放在这里而不是 boot()，是因为 renderApp() 会重建顶栏按钮 ——

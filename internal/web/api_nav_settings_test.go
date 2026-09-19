@@ -151,6 +151,104 @@ func TestNavSettingsVisibleOnPublicPage(t *testing.T) {
 	}
 }
 
+// TestNavAppearanceTripleWhitelist：外观三件套（mode/theme/size）必须是白名单。
+//
+// 用户 2026-09-18 要求新增这三个键（照抄参考首页的外观模式 / 8 套色系 / 三档尺寸），
+// 并明确"非法值拒绝 + 人话错误"。这里把**每一组合法值都真存一遍**（3×3×8 组合），
+// 再逐个试非法值 —— 只测一个样本挡不住"白名单只加了一半"。
+func TestNavAppearanceTripleWhitelist(t *testing.T) {
+	_, ts, cookies := setupNavPanel(t)
+	modes := []string{"auto", "light", "dark"}
+	sizes := []string{"s", "m", "l"}
+	for _, mode := range modes {
+		for _, size := range sizes {
+			for _, theme := range navThemeIDs() {
+				res, out, _ := doJSON(t, ts, "POST", "/api/v1/nav/settings", map[string]string{
+					"mode": mode, "theme": theme, "size": size,
+				}, cookies)
+				if res.StatusCode != http.StatusOK {
+					t.Fatalf("合法三件套 mode=%s theme=%s size=%s 应 200，得到 %d: %v",
+						mode, theme, size, res.StatusCode, out)
+				}
+			}
+		}
+	}
+	// 非法值：400，且错误信息要点名被拒的值与合法取值（人话，不是一句"参数错误"）。
+	bad := []struct{ name, key, val string }{
+		{"非法外观模式", "mode", "evening"},
+		{"非法主题色系", "theme", "rainbow"},
+		{"非法卡片尺寸", "size", "xl"},
+	}
+	for _, c := range bad {
+		res, out, _ := doJSON(t, ts, "POST", "/api/v1/nav/settings",
+			map[string]string{c.key: c.val}, cookies)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s（%s=%s）应 400，得到 %d: %v", c.name, c.key, c.val, res.StatusCode, out)
+			continue
+		}
+		msg, _ := out["msg"].(string)
+		if !strings.Contains(msg, c.val) {
+			t.Errorf("%s 的错误信息应点名被拒的值 %q，得到 %q", c.name, c.val, msg)
+		}
+	}
+}
+
+// TestNavAppearanceDefaultsAndPublicData：三件套的默认值 + 公开 /nav/data 必须带上它们与色系表。
+//
+// 独立别名页是匿名可访问的，只能读 /nav/data —— 设置/色系表不带出去的话，
+// 访客看到的就是默认配色（用户在面板里改了却"没生效"）。
+func TestNavAppearanceDefaultsAndPublicData(t *testing.T) {
+	_, ts, cookies := setupNavPanel(t)
+
+	// 未设置过：GET 返回具体默认值（老库/新装都拿到可用外观，前端不必再补默认）。
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/nav/settings", nil, cookies)
+	d, _ := out["data"].(map[string]any)
+	if d["mode"] != "auto" || d["theme"] != "neon" || d["size"] != "m" {
+		t.Fatalf("未设置时外观三件套应为 auto/neon/m，得到 %v", d)
+	}
+
+	// 存一组非默认值，公开 /nav/data（刻意不带 Cookie）必须原样带上。
+	if res, o, _ := doJSON(t, ts, "POST", "/api/v1/nav/settings", map[string]string{
+		"title": "我的首页", "mode": "dark", "theme": "sunset", "size": "l",
+	}, cookies); res.StatusCode != http.StatusOK {
+		t.Fatalf("保存失败 %d: %v", res.StatusCode, o)
+	}
+	res, err := ts.Client().Get(ts.URL + "/nav/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	var body map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&body)
+	data, _ := body["data"].(map[string]any)
+	st, _ := data["settings"].(map[string]any)
+	if st == nil || st["mode"] != "dark" || st["theme"] != "sunset" || st["size"] != "l" {
+		t.Fatalf("公开 /nav/data 必须带上外观三件套，得到 %v", body)
+	}
+
+	// 色系表：8 套，每套都要有 id/name + light/dark 的渐变与光晕色（前端据此渲染色卡与光晕）。
+	themes, _ := data["themes"].([]any)
+	if len(themes) != len(navThemeIDs()) {
+		t.Fatalf("公开 /nav/data 应带 %d 套色系，得到 %d", len(navThemeIDs()), len(themes))
+	}
+	for _, raw := range themes {
+		th, _ := raw.(map[string]any)
+		id, _ := th["id"].(string)
+		name, _ := th["name"].(string)
+		if id == "" || name == "" {
+			t.Errorf("色系缺少 id/name: %v", raw)
+		}
+		for _, mode := range []string{"light", "dark"} {
+			v, _ := th[mode].(map[string]any)
+			grad, _ := v["grad"].([]any)
+			orb, _ := v["orb"].([]any)
+			if len(grad) < 2 || len(orb) < 2 {
+				t.Errorf("色系 %s 的 %s 缺少渐变/光晕色: %v", id, mode, raw)
+			}
+		}
+	}
+}
+
 func TestNavBackgroundUploadLimits(t *testing.T) {
 	_, ts, cookies := setupNavPanel(t)
 	// 2 MiB 的 PNG：图标接口会拒（上限 512 KiB），背景图接口应当接受。

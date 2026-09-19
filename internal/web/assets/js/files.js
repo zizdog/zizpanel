@@ -23,6 +23,8 @@ let cwd = '';
 let showHidden = false;
 let selection = new Set();
 let lastList = null;
+// 当前打开的编辑器窗口（同一时刻最多一个）。切换路由时由 FilesView 注册的 cleanup 销毁。
+let activeEditor = null;
 
 export function FilesView(content, ctx = {}) {
   clear(content);
@@ -1102,6 +1104,19 @@ export function FilesView(content, ctx = {}) {
   }
 
   // ---------- 编辑器 ----------
+  //
+  // 编辑器是**窗口化**的（见文件末尾 createEditorWindow）：同一时刻只存在一个窗口，
+  // 再次打开别的文件时复用同一个窗口切换文件（不叠一层新窗口）。
+  function openInEditorWindow(entry, res) {
+    if (activeEditor) { activeEditor.setFile(entry, res); activeEditor.focus(); return; }
+    activeEditor = createEditorWindow(entry, res, {
+      roots: (lastList && lastList.roots) || [],
+      refreshList: () => load(cwd),
+      onDir: (p) => load(p),
+      onClosed: () => { activeEditor = null; },
+    });
+  }
+
   async function openEditor(entry) {
     let res;
     try {
@@ -1133,7 +1148,7 @@ export function FilesView(content, ctx = {}) {
       return;
     }
 
-    editorModal(entry, res);
+    openInEditorWindow(entry, res);
   }
 
   // ---------- 搜索 ----------
@@ -1229,7 +1244,11 @@ export function FilesView(content, ctx = {}) {
     }
   }
   document.addEventListener('keydown', onKeyDown);
-  registerCleanup(() => { document.removeEventListener('keydown', onKeyDown); });
+  registerCleanup(() => {
+    document.removeEventListener('keydown', onKeyDown);
+    // 离开文件页：直接销毁编辑器窗口（不弹未保存确认 —— 路由切换时弹窗也会被清掉）。
+    if (activeEditor) { activeEditor.dispose(); activeEditor = null; }
+  });
   load(cwd || undefined);
 }
 
@@ -1451,70 +1470,646 @@ function ensureEditorStyle() {
   document.head.appendChild(st);
 }
 
-// ---------------- 编辑器弹窗 ----------------
-
-// editorModal 打开在线编辑器（entry 是文件条目，res 是 /files/read 的结果）。
+// ---------------- 编辑器窗口（窗口化：图标按钮 + 菜单栏 + 目录树 + 状态栏） ----------------
 //
-// 结构：工具条（配色 / 路径 / 语言 / 查找 / 最大化 / 全屏）+ CodeMirror + 底部保存。
-// 先把窗口立起来再异步加载 CodeMirror：加载慢或失败时用户看到的是**原因**，
-// 而不是一个"点了没反应"的空白弹窗。
-function editorModal(entry, res) {
-  const langKey = langKeyFor(entry.name);
-  const langDef = CM_LANGS[langKey];
-  const host = h('div.zpf-cm', { style: { flex: '1 1 auto', minHeight: '0', height: '58vh' } });
-  const hint = h('div.hint', { style: { marginTop: '6px' } });
-  const editorBox = h('div', {
-    style: {
-      display: 'flex', flexDirection: 'column', minHeight: '0',
-      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', overflow: 'hidden',
-      background: 'var(--bg-soft)',
-    },
-  }, [host, hint]);
+// 用户 2026-09-23 原话："文件编辑器还是太差了，能不能照抄宝塔的吗？"
+// 宝塔的文件编辑器是"窗口 + 目录树 + 菜单栏"的形态，所以这里按那套重做：
+//   · 右上角是**图标按钮**（最小化 / 最大化 / 关闭），不是文字按钮，每个都有中文 title；
+//   · 左侧目录树：展开/折叠、点目录切换浏览目录、点文件切换编辑文件、当前文件高亮、
+//     宽度可拖动（记在 localStorage）；
+//   · 菜单栏把已有能力（保存/另存为/查找/跳行/刷新/下载/关闭…）收进「文件/编辑/视图/帮助」；
+//   · 窗口可拖动，位置记在 localStorage；
+//   · 「最大化」= 铺满**面板 content 区域**（不是浏览器全屏、不是系统全屏）；
+//   · 「最小化」= 右下角胶囊，**不加任何遮罩**。
+//
+// 为什么不再用 modal()：modal 的遮罩是 `position:fixed; inset:0`，最小化时若忘了
+// 写 `pointer-events:none`，收起后整块透明遮罩仍然吞掉所有点击 —— 这正是用户报的
+// "最小化后点不了面板别处"。这里自己起一层 `.zpf-layer`（`pointer-events:none`）
+// + 窗口本身（`pointer-events:auto`），从结构上杜绝"全屏遮罩挡住点击"。
 
+const ZPF_TREE_W_KEY = 'zp-file-editor-tree-w';
+const ZPF_TREE_HIDDEN_KEY = 'zp-file-editor-tree-hidden';
+const ZPF_POS_KEY = 'zp-file-editor-pos';
+// 还原态相对 content 区域的内缩：让它看起来是一个"窗口"，同时仍然充满内容区。
+const ZPF_WIN_INSET = 14;
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function readLS(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function writeLS(key, v) { try { localStorage.setItem(key, String(v)); } catch { /* 存不了就本次会话生效 */ } }
+
+// contentRect 返回面板内容区（`.content`）的视口坐标。编辑器的所有几何都以它为界。
+function contentRect() {
+  const el = document.querySelector('.content');
+  if (el) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 80 && r.height > 80) return r;
+  }
+  return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight };
+}
+
+// pickTreeRoot 选目录树的根：优先用白名单根目录里**包含该文件**的那个（最长匹配），
+// 否则退到文件所在目录 —— 这样树不会从一个莫名其妙的祖先开始。
+function pickTreeRoot(filePath, roots) {
+  const p = String(filePath || '');
+  let best = '';
+  for (const raw of roots || []) {
+    const r = String(raw || '').replace(/\/+$/, '');
+    if (!r) continue;
+    if ((p === r || p.startsWith(r + '/')) && r.length > best.length) best = r;
+  }
+  if (best) return best;
+  return dirname(p) || '/';
+}
+
+function readStoredPos() {
+  try {
+    const v = JSON.parse(readLS(ZPF_POS_KEY) || 'null');
+    if (v && Number.isFinite(v.x) && Number.isFinite(v.y)) return { x: v.x, y: v.y };
+  } catch { /* 坏值就按默认位置 */ }
+  return { x: 0, y: 0 };
+}
+
+function cssEsc(s) {
+  if (window.CSS && CSS.escape) return CSS.escape(String(s));
+  return String(s).replace(/["\\]/g, '\\$&');
+}
+
+// createEditorWindow 打开一个编辑器窗口（同一时刻只应存在一个）。
+// entry/res 是初始文件；opts.roots 是文件白名单根目录；opts.refreshList 刷新背后的文件列表；
+// opts.onDir 是"树里点了目录"时要切换的浏览目录；opts.onClosed 用于让调用方清掉引用。
+function createEditorWindow(entry0, res0, opts = {}) {
+  const roots = opts.roots || [];
+  const refreshList = typeof opts.refreshList === 'function' ? opts.refreshList : () => {};
+  const onDir = typeof opts.onDir === 'function' ? opts.onDir : () => {};
+  const onClosed = typeof opts.onClosed === 'function' ? opts.onClosed : () => {};
+
+  let entry = entry0;
+  let res = res0;
   let cm = null;
   let dirty = false;
   let theme = readEditorTheme();
   let themeSeq = 0;
-  let boxWide = false;
+  let maximized = false;
+  let minimized = false;
+  let disposed = false;
+  let langKey = langKeyFor(entry.name);
+  let langDef = CM_LANGS[langKey];
 
-  const themeSel = h('select.select', { style: { width: 'auto' } }, [
-    h('option', { value: ZPF_THEME_PANEL, text: '配色：跟随面板（浅色 Eclipse / 深色 Material）', selected: theme === ZPF_THEME_PANEL }),
-    h('option', { value: ZPF_THEME_MONOKAI, text: '配色：Monokai', selected: theme === ZPF_THEME_MONOKAI }),
+  // ---- 目录树状态 ----
+  let treeRoot = pickTreeRoot(entry.path, roots);
+  let treeWidth = clamp(Number(readLS(ZPF_TREE_W_KEY)) || 230, 150, 460);
+  let treeHidden = readLS(ZPF_TREE_HIDDEN_KEY) === '1';
+  const treeChildren = new Map(); // dir -> entries[]
+  const treeExpanded = new Set([treeRoot]);
+  const treeLoading = new Set();
+  let curDir = dirname(entry.path);
+
+  // ---- 位置记忆（还原态默认位置之上的偏移） ----
+  let pos = readStoredPos();
+
+  // ===================== DOM =====================
+  const titleText = h('span.zpf-title');
+  const titlePath = h('span.zpf-title-path');
+  const dirtyDot = h('span.zpf-dirty-dot', { style: { display: 'none' } });
+
+  const minBtn = h('button.zpf-iconbtn', { text: '–', title: '最小化（收成右下角胶囊，面板仍可操作）', 'aria-label': '最小化' });
+  const maxBtn = h('button.zpf-iconbtn', { text: '⛶', title: '最大化（铺满面板内容区）', 'aria-label': '最大化' });
+  const closeBtn = h('button.zpf-iconbtn.zpf-close', { text: '✕', title: '关闭编辑器（Esc；有未保存修改会先确认）', 'aria-label': '关闭' });
+
+  const titlebar = h('div.zpf-titlebar', [
+    h('span', { text: '📝', style: { fontSize: '13px' } }),
+    titleText,
+    titlePath,
+    h('div.spacer'),
+    dirtyDot,
+    minBtn,
+    maxBtn,
+    closeBtn,
   ]);
-  themeSel.addEventListener('change', () => applyTheme(themeSel.value));
 
-  const findBtn = h('button.btn.btn-sm', {
-    text: '🔍 查找替换',
-    title: '查找 Ctrl+F · 替换 Shift+Ctrl+F · 跳行 Alt+G',
-    onclick: () => cm && cm.execCommand('findPersistent'),
-  });
-  const maxBtn = h('button.btn.btn-sm', { text: '⛶ 最大化', title: '撑满窗口（不进入系统全屏）', onclick: () => setMaximized(!boxWide) });
-  const fsBtn = h('button.btn.btn-sm', { text: '⛶ 屏幕全屏', title: '进入浏览器全屏（Esc 退出）', onclick: toggleFullscreen });
-  const saveBtn = h('button.btn.btn-primary', { text: '保存', title: '保存（Ctrl+S）' });
+  const menubar = h('div.zpf-menubar');
 
-  const toolbar = h('div', {
-    style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', padding: '8px 10px', borderBottom: '1px solid var(--border-soft)' },
-  }, [
-    themeSel, findBtn, maxBtn, fsBtn,
-    h('div', { style: { flex: '1 1 auto' } }),
-    h('span.hint', { text: entry.path }),
-  ]);
+  const treeHead = h('div.zpf-tree-head');
+  const treeScroll = h('div.zpf-tree-scroll');
+  const treeEl = h('aside.zpf-tree', [treeHead, treeScroll]);
+  const treeResizer = h('div.zpf-tree-resizer', { title: '拖动调整目录树宽度（双击还原默认宽度）' });
 
-  const bodyEl = h('div', { style: { display: 'flex', flexDirection: 'column', minHeight: '0', flex: '1 1 auto' } }, [toolbar, editorBox]);
+  const host = h('div.zpf-cm');
+  const statusInfo = h('span');
+  const statusbar = h('div.zpf-statusbar', [statusInfo]);
+  const editEl = h('section.zpf-edit', [host, statusbar]);
+  const bodyEl = h('div.zpf-body', [treeEl, treeResizer, editEl]);
 
-  function setDirty(v) {
-    dirty = v;
-    m?.setStatus(v ? '● 未保存' : '');
+  const win = h('div.zpf-win', [titlebar, menubar, bodyEl]);
+  const layer = h('div.zpf-layer', [win]);
+  document.body.appendChild(layer);
+
+  // ===================== 几何：窗口 / 最大化 / 最小化 =====================
+  function applyGeometry() {
+    if (disposed || minimized) return; // 胶囊的位置由 CSS 固定
+    const r = contentRect();
+    let left;
+    let top;
+    let width;
+    let height;
+    if (maximized) {
+      // 「最大化」= 与 content 区域逐像素重合（不是浏览器全屏）。
+      left = r.left; top = r.top; width = r.width; height = r.height;
+    } else {
+      const inset = Math.min(ZPF_WIN_INSET, Math.max(4, Math.min(r.width, r.height) / 10));
+      width = Math.max(320, r.width - inset * 2);
+      height = Math.max(200, r.height - inset * 2);
+      width = Math.min(width, r.width);
+      height = Math.min(height, r.height);
+      // 拖动范围：至少留 160px 横向、标题栏纵向留在 content 内，别把窗口拖到看不见。
+      left = clamp(r.left + inset + pos.x, r.left - width + 160, r.right - 160);
+      top = clamp(r.top + inset + pos.y, r.top, r.bottom - 46);
+    }
+    win.style.left = Math.round(left) + 'px';
+    win.style.top = Math.round(top) + 'px';
+    win.style.width = Math.round(width) + 'px';
+    win.style.height = Math.round(height) + 'px';
   }
 
-  // applyTheme 切配色：**先按需加载**官方主题 CSS，再改 CodeMirror 的 theme。
-  //
-  // 异步竞态：加载 CSS 期间用户可能又切了一次（或面板主题变了），晚到的结果
-  // 不能覆盖新的选择 —— 用 themeSeq 序号丢弃过期结果。
+  function refreshCM() { requestAnimationFrame(() => { if (cm) { cm.setSize(null, '100%'); cm.refresh(); } }); }
+
+  function setMaximized(on) {
+    maximized = !!on;
+    if (maximized && minimized) setMinimizedState(false);
+    win.classList.toggle('zpf-win-max', maximized);
+    applyGeometry();
+    syncChrome();
+    refreshCM();
+  }
+
+  function setMinimizedState(on) {
+    minimized = !!on;
+    if (minimized) maximized = false;
+    win.classList.toggle('zpf-win-min', minimized);
+    win.classList.toggle('zpf-win-max', maximized);
+    applyGeometry();
+    syncChrome();
+    setDirty(dirty);
+    if (!minimized) { refreshCM(); if (cm) cm.focus(); }
+  }
+
+  function syncChrome() {
+    maxBtn.textContent = maximized ? '🗗' : '⛶';
+    maxBtn.title = maximized ? '还原窗口（回到面板内容区里可拖动的位置）' : '最大化（铺满面板内容区）';
+    maxBtn.setAttribute('aria-label', maximized ? '还原' : '最大化');
+    minBtn.title = minimized ? '还原窗口' : '最小化（收成右下角胶囊，面板仍可操作）';
+    minBtn.setAttribute('aria-label', minimized ? '还原' : '最小化');
+    treeEl.style.display = treeHidden ? 'none' : '';
+    treeResizer.style.display = treeHidden ? 'none' : '';
+    if (!treeHidden) treeEl.style.width = treeWidth + 'px';
+  }
+
+  // ===================== 标题 / 状态 =====================
+  function updateTitle() {
+    titleText.textContent = '编辑：' + entry.name;
+    titlePath.textContent = entry.path;
+    win.title = entry.path;
+  }
+
+  function updateStatus() {
+    if (!cm) { statusInfo.textContent = '正在加载编辑器…'; return; }
+    const c = cm.getCursor();
+    statusInfo.textContent = (langDef ? langDef.label : '纯文本') + ' · ' + cm.lineCount() + ' 行 · '
+      + humanSize(res.size) + ' · 第 ' + (c.line + 1) + ' 行，第 ' + (c.ch + 1) + ' 列';
+  }
+
+  let unloadGuardOn = false;
+  function onBeforeUnload(e) { if (!dirty) return; e.preventDefault(); e.returnValue = ''; }
+  function installUnloadGuard() { if (!unloadGuardOn) { unloadGuardOn = true; window.addEventListener('beforeunload', onBeforeUnload); } }
+  function removeUnloadGuard() { if (unloadGuardOn) { unloadGuardOn = false; window.removeEventListener('beforeunload', onBeforeUnload); } }
+
+  function setDirty(v) {
+    dirty = !!v;
+    dirtyDot.textContent = '● 未保存';
+    dirtyDot.style.display = dirty ? '' : 'none';
+    if (dirty) installUnloadGuard(); else removeUnloadGuard();
+  }
+
+  // ===================== 菜单栏 =====================
+  let openMenuIdx = -1;
+  // 鼠标划过菜单标题会切换打开的菜单；此时紧接着的点击**不应该把它关掉**
+  // （否则"从「文件」划到「编辑」再点一下"会把编辑菜单关了 —— 真实用户会以为点坏了）。
+  let menuOpenedByHover = false;
+
+  function closeMenus() {
+    openMenuIdx = -1;
+    menuOpenedByHover = false;
+    menubar.querySelectorAll('.zpf-menubar-item').forEach((el) => el.classList.remove('open'));
+  }
+
+  function renderMenuPop(pop, def) {
+    clear(pop);
+    for (const it of def.items()) {
+      if (it.sep) { pop.appendChild(h('div.zpf-menu-sep')); continue; }
+      const mark = it.checked === true ? '✓ ' : (it.checked === false ? '　' : '');
+      pop.appendChild(h('button.zpf-menu-row', {
+        disabled: !!it.disabled,
+        type: 'button',
+        onclick: () => {
+          closeMenus();
+          try { it.run(); } catch (e) { toast('操作失败：' + ((e && e.message) || e), 'err'); }
+        },
+      }, [
+        h('span', { text: mark + it.label }),
+        it.hint ? h('span.zpf-menu-hint', { text: it.hint }) : null,
+      ]));
+    }
+  }
+
+  function buildMenus() {
+    clear(menubar);
+    menuDefs().forEach((def, idx) => {
+      const title = h('button.zpf-menu-title', { text: def.label, type: 'button' });
+      const pop = h('div.zpf-menu-pop');
+      const item = h('div.zpf-menubar-item', [title, pop]);
+      const openIt = () => { closeMenus(); item.classList.add('open'); openMenuIdx = idx; renderMenuPop(pop, def); };
+      title.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (openMenuIdx === idx) {
+          if (menuOpenedByHover) { menuOpenedByHover = false; return; } // 刚被 hover 打开，这一击不关
+          closeMenus();
+        } else openIt();
+      });
+      title.addEventListener('mouseenter', () => {
+        if (openMenuIdx >= 0 && openMenuIdx !== idx) { openIt(); menuOpenedByHover = true; }
+      });
+      item.addEventListener('click', (e) => e.stopPropagation());
+      menubar.appendChild(item);
+    });
+  }
+
+  function menuDefs() {
+    return [
+      {
+        label: '文件',
+        items: () => [
+          { label: '保存', hint: '⌘S', disabled: !cm, run: saveFile },
+          { label: '另存为…', hint: '⌘⇧S', disabled: !cm, run: saveAs },
+          { label: '重新载入（放弃未保存修改）', disabled: !cm, run: reloadFile },
+          { sep: true },
+          { label: '下载文件', run: downloadFile },
+          { label: '复制文件路径', run: () => copyText(entry.path) },
+          { sep: true },
+          { label: '关闭编辑器', hint: 'Esc', run: requestClose },
+        ],
+      },
+      {
+        label: '编辑',
+        items: () => [
+          { label: '撤销', hint: '⌘Z', disabled: !cm, run: () => cm.execCommand('undo') },
+          { label: '重做', hint: '⌘⇧Z', disabled: !cm, run: () => cm.execCommand('redo') },
+          { sep: true },
+          { label: '查找替换', hint: '⌘F', disabled: !cm, run: () => cm.execCommand('findPersistent') },
+          { label: '跳转到行…', hint: '⌥G', disabled: !cm, run: () => cm.execCommand('jumpToLine') },
+          { sep: true },
+          { label: '切换注释', hint: '⌘/', disabled: !cm, run: () => cm.execCommand('toggleComment') },
+          { label: '全选', hint: '⌘A', disabled: !cm, run: () => { cm.focus(); cm.execCommand('selectAll'); } },
+        ],
+      },
+      {
+        label: '视图',
+        items: () => [
+          { label: maximized ? '还原窗口' : '最大化', run: () => setMaximized(!maximized) },
+          { label: treeHidden ? '显示目录树' : '隐藏目录树', run: toggleTree },
+          { label: '刷新目录树', run: refreshTree },
+          { sep: true },
+          { label: '自动换行', checked: !!(cm && cm.getOption('lineWrapping')), disabled: !cm, run: toggleWrap },
+          { label: '折叠全部', disabled: !cm, run: () => cm.execCommand('foldAll') },
+          { label: '展开全部', disabled: !cm, run: () => cm.execCommand('unfoldAll') },
+          { sep: true },
+          { label: '配色：跟随面板', checked: theme === ZPF_THEME_PANEL, run: () => applyTheme(ZPF_THEME_PANEL) },
+          { label: '配色：Monokai', checked: theme === ZPF_THEME_MONOKAI, run: () => applyTheme(ZPF_THEME_MONOKAI) },
+          { sep: true },
+          { label: fsElement() ? '退出浏览器全屏' : '浏览器全屏', run: toggleFullscreen },
+        ],
+      },
+      {
+        label: '帮助',
+        items: () => [
+          { label: '快捷键说明', run: showShortcuts },
+          { label: '关于在线编辑器', run: showAbout },
+        ],
+      },
+    ];
+  }
+
+  function showShortcuts() {
+    const rows = [
+      ['⌘ / Ctrl + S', '保存'],
+      ['⌘ / Ctrl + ⇧ + S', '另存为'],
+      ['⌘ / Ctrl + F', '查找 / 替换'],
+      ['⌥ / Alt + G', '跳转到行'],
+      ['⌘ / Ctrl + /', '切换注释'],
+      ['Tab / ⇧ + Tab', '缩进 / 反缩进'],
+      ['Esc', '关闭编辑器（有未保存修改会先确认）'],
+    ];
+    modal({
+      title: '编辑器快捷键',
+      body: h('table.table', [
+        h('thead', [h('tr', [h('th', { text: '按键' }), h('th', { text: '作用' })])]),
+        h('tbody', rows.map((r) => h('tr', [h('td.mono', { text: r[0] }), h('td', { text: r[1] })]))),
+      ]),
+    });
+  }
+
+  function showAbout() {
+    modal({
+      title: '关于在线编辑器',
+      body: h('div', { style: { fontSize: '13px', lineHeight: '1.8' } }, [
+        h('p', { text: '内嵌 CodeMirror 5（MIT 许可），随面板一起分发，不依赖任何外部 CDN，也没有构建步骤。' }),
+        h('p', { text: '目录树、菜单栏与窗口行为（拖动 / 最小化 / 最大化）由 ZizPanel 自己实现。' }),
+      ]),
+    });
+  }
+
+  // ===================== 目录树 =====================
+  async function treeLoad(dir) {
+    if (treeChildren.has(dir)) return treeChildren.get(dir);
+    if (treeLoading.has(dir)) return [];
+    treeLoading.add(dir);
+    try {
+      const l = await api.files(dir, false);
+      treeChildren.set(dir, (l.entries || []).slice());
+      return treeChildren.get(dir);
+    } catch (e) {
+      treeChildren.set(dir, []);
+      if (!disposed) toast('目录树读取失败：' + dir + '（' + ((e && e.message) || e) + '）', 'warn', 10000);
+      return [];
+    } finally {
+      treeLoading.delete(dir);
+      if (!disposed) treeRender();
+    }
+  }
+
+  function sortedKids(list) {
+    const arr = list.slice();
+    arr.sort((a, b) => {
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+      return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+    });
+    return arr;
+  }
+
+  function treeRow(e, depth) {
+    const active = !e.is_dir && e.path === entry.path;
+    const isCurDir = e.is_dir && e.path === curDir;
+    const row = h('div.zpf-tree-row' + (active ? '.active' : '') + (isCurDir ? '.current-dir' : ''), {
+      style: { paddingLeft: (6 + depth * 12) + 'px' },
+      dataset: { path: e.path },
+      title: e.path,
+    });
+    row.appendChild(h('span.zpf-tree-caret', {
+      text: e.is_dir ? (treeExpanded.has(e.path) ? '▾' : '▸') : '',
+      onclick: (ev) => { if (!e.is_dir) return; ev.stopPropagation(); toggleDir(e.path); },
+    }));
+    row.appendChild(h('span', { text: e.is_dir ? (treeExpanded.has(e.path) ? '📂' : '📁') : fileIcon(e.name) }));
+    row.appendChild(h('span.zpf-tree-name', { text: e.name }));
+    row.addEventListener('click', () => {
+      if (e.is_dir) {
+        treeExpanded.add(e.path);
+        curDir = e.path;
+        treeRender();
+        treeLoad(e.path);
+        onDir(e.path); // 切换当前浏览目录（背后的文件列表跟着走）
+      } else {
+        openFileByTree(e.path, e.name);
+      }
+    });
+    return row;
+  }
+
+  function treeRender() {
+    if (disposed) return;
+    clear(treeScroll);
+    const nodes = [h('div.zpf-tree-row.zpf-tree-root', { title: treeRoot }, [
+      h('span.zpf-tree-caret', {
+        text: treeExpanded.has(treeRoot) ? '▾' : '▸',
+        onclick: (ev) => { ev.stopPropagation(); toggleDir(treeRoot); },
+      }),
+      h('span', { text: '🗂️' }),
+      h('span.zpf-tree-name', { text: basename(treeRoot) || treeRoot, style: { fontWeight: '600' } }),
+    ])];
+    const walk = (dir, depth) => {
+      for (const e of sortedKids(treeChildren.get(dir) || [])) {
+        nodes.push(treeRow(e, depth));
+        if (e.is_dir && treeExpanded.has(e.path)) walk(e.path, depth + 1);
+      }
+    };
+    if (treeExpanded.has(treeRoot)) walk(treeRoot, 1);
+    appendAll(treeScroll, nodes);
+    locateCurrent();
+  }
+
+  function toggleDir(path) {
+    if (treeExpanded.has(path)) treeExpanded.delete(path);
+    else { treeExpanded.add(path); if (!treeChildren.has(path)) treeLoad(path); }
+    treeRender();
+  }
+
+  function locateCurrent() {
+    const el = treeScroll.querySelector('.zpf-tree-row[data-path="' + cssEsc(entry.path) + '"]');
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+
+  // revealFile 把当前文件在树里定位出来：展开祖先目录 → 高亮 → 滚到可见处。
+  async function revealFile(file) {
+    const d = dirname(file);
+    const rootPrefix = treeRoot.replace(/\/+$/, '');
+    const chain = [];
+    let cur = d;
+    while (cur && (cur === treeRoot || cur.startsWith(rootPrefix + '/'))) {
+      chain.unshift(cur);
+      if (cur === treeRoot) break;
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+    for (const dir of chain) {
+      treeExpanded.add(dir);
+      if (!treeChildren.has(dir)) await treeLoad(dir);
+    }
+    treeRender();
+  }
+
+  function refreshTree() {
+    treeChildren.clear();
+    treeLoad(treeRoot).then(() => revealFile(entry.path));
+  }
+
+  function toggleTree() {
+    treeHidden = !treeHidden;
+    writeLS(ZPF_TREE_HIDDEN_KEY, treeHidden ? '1' : '0');
+    syncChrome();
+    refreshCM();
+  }
+
+  // ===================== 打开 / 切换文件 =====================
+  async function openFileByTree(path, name) {
+    if (path === entry.path) { toast('这已经是当前打开的文件', 'warn', 4000); return; }
+    if (!confirmDiscard()) return;
+    let r;
+    try { r = await api.fileRead(path); }
+    catch (e) { toast('打开失败：' + ((e && e.message) || e), 'err', 10000); return; }
+    if (r.binary) { toast('这是二进制文件，不能用文本编辑器打开', 'warn', 8000); return; }
+    if (r.too_large) { toast('文件过大（' + humanSize(r.size) + '），超过在线编辑上限', 'warn', 10000); return; }
+    await applyFile({ path, name: name || basename(path) }, r);
+  }
+
+  async function applyFile(newEntry, newRes) {
+    entry = newEntry;
+    res = newRes;
+    const key = langKeyFor(entry.name);
+    if (key !== langKey) {
+      langKey = key;
+      langDef = CM_LANGS[key];
+      try { await ensureLang(langKey); } catch (e) { toast('语言模式加载失败：' + ((e && e.message) || e), 'warn', 8000); }
+      if (cm) cm.setOption('mode', langDef ? langDef.mode : null);
+    }
+    curDir = dirname(entry.path);
+    if (cm) {
+      cm.setValue(res.content);
+      cm.clearHistory();
+      cm.setCursor(0, 0);
+      setDirty(false);
+      refreshCM();
+      requestAnimationFrame(() => { if (cm) cm.focus(); });
+    }
+    updateTitle();
+    updateStatus();
+    revealFile(entry.path);
+  }
+
+  // ===================== 保存 / 下载 =====================
+  async function saveFile() {
+    if (!cm) return false;
+    try {
+      await api.fileWrite(entry.path, cm.getValue());
+      setDirty(false);
+      toast('已保存 ' + basename(entry.path), 'ok');
+      refreshList();
+      return true;
+    } catch (e) {
+      toast('保存失败：' + ((e && e.message) || e), 'err', 12000);
+      return false;
+    }
+  }
+
+  async function saveAs() {
+    if (!cm) return;
+    const dest = await promptBox({
+      title: '另存为', label: '目标完整路径', value: entry.path,
+      hint: '必须在文件管理允许的目录内（绝对路径）',
+    });
+    if (!dest || dest === entry.path) return;
+    const content = cm.getValue();
+    try {
+      // 后端 /files/write 只写**已存在**的文件（不新建），所以"另存为新路径"要先 touch。
+      // touch 报"已存在同名文件"时问一句是否覆盖 —— 覆盖不可逆。
+      let exists = false;
+      try {
+        await api.fileTouch(dest);
+      } catch (e) {
+        exists = /已存在/.test((e && e.message) || '');
+      }
+      if (exists) {
+        const yes = await confirmBox(`「${dest}」已存在，要用当前内容覆盖它吗？`, {
+          title: '覆盖已存在的文件', danger: true, okText: '覆盖',
+        });
+        if (!yes) return;
+      }
+      await api.fileWrite(dest, content);
+      entry = { path: dest, name: basename(dest) };
+      res = Object.assign({}, res, { size: content.length });
+      setDirty(false);
+      updateTitle();
+      updateStatus();
+      toast('已另存为 ' + dest, 'ok');
+      revealFile(entry.path);
+      refreshList();
+    } catch (e) {
+      toast('另存为失败：' + ((e && e.message) || e), 'err', 12000);
+    }
+  }
+
+  async function reloadFile() {
+    if (!confirmDiscard()) return;
+    try {
+      const r = await api.fileRead(entry.path);
+      if (r.binary || r.too_large) { toast('该文件已不能在线编辑（二进制或过大）', 'warn', 8000); return; }
+      await applyFile(entry, r);
+      toast('已重新载入', 'ok');
+    } catch (e) { toast('重新载入失败：' + ((e && e.message) || e), 'err', 10000); }
+  }
+
+  function downloadFile() { window.location.href = api.fileDownloadURL(entry.path); }
+
+  function copyText(t) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t)
+        .then(() => toast('已复制：' + t, 'ok', 5000))
+        .catch(() => toast('复制失败，请手动选择：' + t, 'warn', 8000));
+    } else {
+      toast(t, 'ok', 8000);
+    }
+  }
+
+  function toggleWrap() {
+    if (!cm) return;
+    cm.setOption('lineWrapping', !cm.getOption('lineWrapping'));
+    refreshCM();
+  }
+
+  // ===================== 关闭 =====================
+  function confirmDiscard() {
+    if (!dirty) return true;
+    return confirm('「' + entry.name + '」有未保存的修改，确定放弃这些修改？');
+  }
+
+  function requestClose() {
+    if (dirty && !confirm('「' + entry.name + '」有未保存的修改，确定关闭编辑器？')) return;
+    dispose();
+  }
+
+  // 点侧栏导航 / 顶栏（会销毁编辑器）时，若还有未保存修改先确认 —— 否则一次误点就静默丢改动。
+  function onDocCapture(e) {
+    if (!dirty || disposed) return;
+    const t = e.target;
+    if (!(t && t.closest)) return;
+    if (t.closest('.zpf-win')) return;
+    if (t.closest('.nav-item, .topbar, .sidebar-toggle')) {
+      if (!confirm('「' + entry.name + '」有未保存的修改，离开会丢失。确定离开？')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }
+  }
+  document.addEventListener('click', onDocCapture, true);
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    removeUnloadGuard();
+    document.removeEventListener('mousedown', onDocDown);
+    document.removeEventListener('click', onDocCapture, true);
+    document.removeEventListener('fullscreenchange', onFsChange);
+    document.removeEventListener('webkitfullscreenchange', onFsChange);
+    window.removeEventListener('resize', applyGeometry);
+    if (resizeObs) { try { resizeObs.disconnect(); } catch { /* 忽略 */ } }
+    themeObserver.disconnect();
+    layer.remove();
+    onClosed();
+  }
+
+  // ===================== 主题 =====================
   async function applyTheme(v) {
     theme = v === ZPF_THEME_MONOKAI ? ZPF_THEME_MONOKAI : ZPF_THEME_PANEL;
     saveEditorTheme(theme);
-    themeSel.value = theme;
     const seq = ++themeSeq;
     const name = cmThemeFor(theme);
     try {
@@ -1523,51 +2118,101 @@ function editorModal(entry, res) {
       toast('编辑器主题加载失败：' + ((e && e.message) || e), 'err');
       return;
     }
-    if (seq !== themeSeq) return;
+    if (seq !== themeSeq || disposed) return;
     if (cm) {
       cm.setOption('theme', name);
-      // 换主题会重建行高/尺寸相关样式，必须 refresh，否则光标与行会短暂错位
-      requestAnimationFrame(() => cm.refresh());
+      requestAnimationFrame(() => { if (cm) cm.refresh(); });
     }
   }
 
-  // 面板主题（浅色/深色/跟随系统）在弹窗打开期间可能被切换：panel 档要**实时**跟着换。
-  // 观察 app.js 写到 documentElement 上的 data-theme；弹窗关闭时断开。
   const themeObserver = new MutationObserver(() => {
     if (theme === ZPF_THEME_PANEL) applyTheme(ZPF_THEME_PANEL);
   });
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
-  function setMaximized(on) {
-    boxWide = on;
-    const bodyWrap = m.el.querySelector('.modal-body');
-    if (on) {
-      m.el.style.width = 'min(96vw, 1600px)';
-      m.el.style.maxWidth = '96vw';
-      m.el.style.height = '92vh';
-      m.el.style.maxHeight = '92vh';
-      bodyWrap.style.display = 'flex';
-      bodyWrap.style.flexDirection = 'column';
-      bodyWrap.style.flex = '1 1 auto';
-      bodyWrap.style.minHeight = '0';
-      bodyWrap.style.overflow = 'hidden';
-      host.style.height = '100%';
-    } else {
-      m.el.style.width = '';
-      m.el.style.maxWidth = '';
-      m.el.style.height = '';
-      m.el.style.maxHeight = '';
-      bodyWrap.style.display = '';
-      bodyWrap.style.flexDirection = '';
-      bodyWrap.style.flex = '';
-      bodyWrap.style.minHeight = '';
-      bodyWrap.style.overflow = '';
-      host.style.height = '58vh';
-    }
-    maxBtn.textContent = on ? '🗗 还原' : '⛶ 最大化';
-    requestAnimationFrame(() => { if (cm) { cm.setSize(null, '100%'); cm.refresh(); } });
+  // ===================== 拖动 / 缩放 =====================
+  function startDrag(e) {
+    if (e.button !== 0 || minimized) return;
+    const t = e.target;
+    if (t && t.closest && t.closest('button, a, select, input, textarea, .zpf-menu-pop')) return;
+    closeMenus();
+    if (maximized) setMaximized(false); // 拖最大化窗口 = 先还原再拖（与系统窗口一致）
+    e.preventDefault();
+    const rect = win.getBoundingClientRect();
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const ol = rect.left;
+    const ot = rect.top;
+    const move = (ev) => {
+      const r = contentRect();
+      const w = win.offsetWidth;
+      const h = win.offsetHeight;
+      let left = ol + (ev.clientX - sx);
+      let top = ot + (ev.clientY - sy);
+      // 关键约束：窗口**始终留在 content 区域内**（用户要求 f：任何状态下都充满内容区、
+      // 不留大片空白）。还原态只比 content 内缩 14px，所以可拖范围不大，但位置会被记住。
+      left = clamp(left, r.left, Math.max(r.left, r.right - w));
+      top = clamp(top, r.top, Math.max(r.top, r.bottom - h));
+      win.style.left = Math.round(left) + 'px';
+      win.style.top = Math.round(top) + 'px';
+      pos = { x: Math.round(left - (r.left + ZPF_WIN_INSET)), y: Math.round(top - (r.top + ZPF_WIN_INSET)) };
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('zpf-dragging');
+      writeLS(ZPF_POS_KEY, JSON.stringify(pos));
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+    document.body.classList.add('zpf-dragging');
   }
 
+  titlebar.addEventListener('mousedown', startDrag);
+  menubar.addEventListener('mousedown', startDrag);
+
+  // 最小化后整条标题栏就是"还原"热区（宝塔手感）；按钮自己已处理，别重复触发。
+  titlebar.addEventListener('click', (e) => {
+    if (!minimized) return;
+    if (e.target && e.target.closest && e.target.closest('button')) return;
+    setMinimizedState(false);
+  });
+
+  treeResizer.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const sx = e.clientX;
+    const w0 = treeWidth;
+    const move = (ev) => {
+      treeWidth = clamp(w0 + (ev.clientX - sx), 150, 460);
+      treeEl.style.width = treeWidth + 'px';
+      if (cm) cm.refresh();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('zpf-resizing');
+      writeLS(ZPF_TREE_W_KEY, treeWidth);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+    document.body.classList.add('zpf-resizing');
+  });
+  treeResizer.addEventListener('dblclick', () => {
+    treeWidth = 230;
+    treeEl.style.width = '230px';
+    writeLS(ZPF_TREE_W_KEY, 230);
+    if (cm) cm.refresh();
+  });
+
+  minBtn.addEventListener('click', (e) => { e.stopPropagation(); setMinimizedState(!minimized); });
+  maxBtn.addEventListener('click', (e) => { e.stopPropagation(); setMaximized(!maximized); });
+  closeBtn.addEventListener('click', (e) => { e.stopPropagation(); requestClose(); });
+
+  function onDocDown(e) { if (!win.contains(e.target)) closeMenus(); }
+  document.addEventListener('mousedown', onDocDown);
+
+  // ===================== 浏览器全屏（既有能力，收进「视图」菜单） =====================
   function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
 
   function toggleFullscreen() {
@@ -1576,152 +2221,133 @@ function editorModal(entry, res) {
       if (exit) { const p = exit.call(document); if (p && p.catch) p.catch(() => {}); }
       return;
     }
-    const req = editorBox.requestFullscreen || editorBox.webkitRequestFullscreen;
+    const req = win.requestFullscreen || win.webkitRequestFullscreen;
     if (!req) { toast('当前浏览器不支持屏幕全屏', 'warn'); return; }
-    const p = req.call(editorBox);
+    const p = req.call(win);
     if (p && p.catch) p.catch((e) => toast('进入屏幕全屏失败：' + ((e && e.message) || e), 'err'));
   }
 
-  function onFsChange() {
-    const on = !!fsElement();
-    fsBtn.textContent = on ? '🗗 退出全屏' : '⛶ 屏幕全屏';
-    requestAnimationFrame(() => { if (cm) cm.refresh(); });
-  }
+  function onFsChange() { refreshCM(); }
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
 
-  async function writeBack() {
-    if (!cm) return false;
-    saveBtn.disabled = true;
-    try {
-      await api.fileWrite(entry.path, cm.getValue());
-      setDirty(false);
-      toast('已保存', 'ok');
-      return true;
-    } catch (e) {
-      toast(e.message, 'err', 10000);
-      return false;
-    } finally {
-      saveBtn.disabled = false;
-    }
+  // ===================== 自适应 =====================
+  // 侧栏折叠 / 展开只改变 content 的宽度，**不触发 window.resize**，所以必须观察 content 本身。
+  let resizeObs = null;
+  if (window.ResizeObserver) {
+    const c = document.querySelector('.content');
+    if (c) { resizeObs = new ResizeObserver(() => applyGeometry()); resizeObs.observe(c); }
   }
+  window.addEventListener('resize', applyGeometry);
 
-  function confirmDiscard() {
-    return !dirty || confirm('有未保存的修改，确定关闭？');
-  }
+  // ===================== 初始化 =====================
+  updateTitle();
+  syncChrome();
+  setDirty(false);
+  buildMenus();
+  applyGeometry();
 
-  saveBtn.addEventListener('click', async () => { if (await writeBack()) m.close(); });
-
-  const m = modal({
-    title: `编辑：${entry.name}`,
-    wide: true,
-    minimizable: true,
-    body: bodyEl,
-    footer: () => [
-      h('button.btn', { text: '取消', onclick: () => { if (confirmDiscard()) m.close(); } }),
-      saveBtn,
-    ],
-    // 编辑器里可能是十几分钟的改动：点遮罩不关（误触代价太大）。
-    // Esc 允许关闭，但**必须走同一道确认**（有未保存改动时先问）——
-    // 完全禁用 Esc 反直觉，而"能关但不丢数据"才是用户真正要的。
-    closeOnBackdrop: false,
-    closeOnEsc: true,
-    onRequestClose: () => confirmDiscard(),
-    onMinimize: (min) => { if (!min && cm) requestAnimationFrame(() => cm.refresh()); },
-    onClose: () => {
-      document.removeEventListener('fullscreenchange', onFsChange);
-      document.removeEventListener('webkitfullscreenchange', onFsChange);
-      themeObserver.disconnect();
-    },
-  });
-
-  // ---- 异步挂载 CodeMirror ----
-  hint.textContent = '正在加载编辑器…';
   (async () => {
-    await ensureCodeMirror();
-    await ensureLang(langKey);
-    // 主题 CSS 与本体一样按需加载：进编辑器才拉当前这一份（切换时再拉另一份）
-    await ensureCmTheme(cmThemeFor(theme));
-    const themeName = cmThemeFor(theme);
-    cm = window.CodeMirror(host, {
-      value: res.content,
-      mode: langDef ? langDef.mode : null,
-      theme: themeName,
-      lineNumbers: true,
-      lineWrapping: false,
-      indentUnit: 4,
-      tabSize: 4,
-      indentWithTabs: false,
-      smartIndent: true,
-      electricChars: true,
-      autoCloseBrackets: true,
-      matchBrackets: true,
-      styleActiveLine: true,
-      foldGutter: true,
-      gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
-      scrollbarStyle: 'simple',
-      viewportMargin: 30,
-      extraKeys: {
-        'Ctrl-S': () => { writeBack(); },
-        'Cmd-S': () => { writeBack(); },
-        'Ctrl-F': 'findPersistent',
-        'Cmd-F': 'findPersistent',
-        'Shift-Ctrl-F': 'replace',
-        'Shift-Cmd-F': 'replace',
-        'Alt-G': 'jumpToLine',
-        'Ctrl-/': 'toggleComment',
-        'Cmd-/': 'toggleComment',
-        // Tab / Shift+Tab 必须显式接管：CodeMirror 默认的 Tab 在空行上会插入
-        // **制表符**，而面板其它地方（以及面板自己生成的配置）统一用 4 空格 ——
-        // 混用会在保存后的文件里留下看不见的差异。有选区时整块缩进/反缩进。
-        'Tab': (ed) => {
-          if (ed.somethingSelected()) ed.indentSelection('add');
-          else ed.replaceSelection('    ', 'end');
+    try { await treeLoad(treeRoot); } catch { /* 已在 treeLoad 里提示 */ }
+    await revealFile(entry.path);
+  })();
+
+  (async () => {
+    try {
+      await ensureCodeMirror();
+      await ensureLang(langKey);
+      await ensureCmTheme(cmThemeFor(theme));
+      const themeName = cmThemeFor(theme);
+      cm = window.CodeMirror(host, {
+        value: res.content,
+        mode: langDef ? langDef.mode : null,
+        theme: themeName,
+        lineNumbers: true,
+        lineWrapping: false,
+        indentUnit: 4,
+        tabSize: 4,
+        indentWithTabs: false,
+        smartIndent: true,
+        electricChars: true,
+        autoCloseBrackets: true,
+        matchBrackets: true,
+        styleActiveLine: true,
+        foldGutter: true,
+        gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
+        scrollbarStyle: 'simple',
+        viewportMargin: 30,
+        extraKeys: {
+          'Ctrl-S': () => { saveFile(); },
+          'Cmd-S': () => { saveFile(); },
+          'Shift-Ctrl-S': () => { saveAs(); },
+          'Shift-Cmd-S': () => { saveAs(); },
+          'Ctrl-F': 'findPersistent',
+          'Cmd-F': 'findPersistent',
+          'Shift-Ctrl-F': 'replace',
+          'Shift-Cmd-F': 'replace',
+          'Alt-G': 'jumpToLine',
+          'Ctrl-/': 'toggleComment',
+          'Cmd-/': 'toggleComment',
+          'Esc': () => requestClose(),
+          // Tab / Shift+Tab 必须显式接管：CodeMirror 默认的 Tab 在空行上会插入
+          // **制表符**，而面板其它地方（以及面板自己生成的配置）统一用 4 空格 ——
+          // 混用会在保存后的文件里留下看不见的差异。有选区时整块缩进/反缩进。
+          'Tab': (ed) => {
+            if (ed.somethingSelected()) ed.indentSelection('add');
+            else ed.replaceSelection('    ', 'end');
+          },
+          'Shift-Tab': (ed) => ed.indentSelection('subtract'),
         },
-        'Shift-Tab': (ed) => ed.indentSelection('subtract'),
-      },
-      // 查找/替换对话框的文案（CodeMirror 自带的是英文；面板是中文界面）
-      // 键名必须与 CodeMirror 插件的 phrase() 调用逐字一致（含冒号），
-      // 否则查表失败会**静默**退回英文 —— 第一版就踩了（写的是 'Search'）。
-      phrases: {
-        'Search:': '查找：',
-        'Replace:': '替换：',
-        'Replace with:': '替换为：',
-        'Replace all:': '全部替换：',
-        'Replace?': '要替换吗？',
-        'With:': '替换为：',
-        'Jump to line:': '跳到行：',
-        'All': '全部',
-        'Stop': '停止',
-        'Yes': '是',
-        'No': '否',
-        '(Use /re/ syntax for regexp search)': '（支持 /正则/ 语法）',
-        '(Use line:column or scroll% syntax)': '（可用 行:列 或 百分比）',
-      },
-    });
-    // 打开时把光标放在开头，并且**不让这次初始内容算作"未保存的改动"**
-    cm.setCursor(0, 0);
-    cm.clearHistory();
-    cm.on('change', () => setDirty(true));
-    setDirty(false);
-    cm.focus();
-    // 挂载是异步的：如果这期间用户切了配色（或面板深浅色变了），按最新选择纠正一次
-    if (cmThemeFor(theme) !== themeName) applyTheme(theme);
-    const lines = cm.lineCount();
-    hint.textContent = `${langDef ? langDef.label : '纯文本'} · ${lines} 行 · ${humanSize(res.size)}`
-      + '　Tab 缩进 · Ctrl+S 保存 · Ctrl+F 查找' + (langDef && langKey === 'ts' ? '（TypeScript 按 JavaScript 高亮）' : '');
-  })().catch((e) => {
-    // 加载失败要给出**原因**（网络/镜像/文件缺失），并且仍然给一条能走通的路
-    clear(host);
-    appendAll(host, h('div.empty', [
-      h('div.big', { text: '⚠️' }),
-      h('h4', { text: '编辑器加载失败' }),
-      h('p', { text: (e && e.message) || String(e) }),
-      h('p', { text: '可以刷新页面重试；也可以用 Web 终端或下载后本地编辑。文件内容没有被改动。' }),
-    ]));
-    hint.textContent = '';
-  });
+        // 查找/替换对话框的文案（CodeMirror 自带的是英文；面板是中文界面）
+        // 键名必须与 CodeMirror 插件的 phrase() 调用逐字一致（含冒号），
+        // 否则查表失败会**静默**退回英文 —— 第一版就踩了（写的是 'Search'）。
+        phrases: {
+          'Search:': '查找：',
+          'Replace:': '替换：',
+          'Replace with:': '替换为：',
+          'Replace all:': '全部替换：',
+          'Replace?': '要替换吗？',
+          'With:': '替换为：',
+          'Jump to line:': '跳到行：',
+          'All': '全部',
+          'Stop': '停止',
+          'Yes': '是',
+          'No': '否',
+          '(Use /re/ syntax for regexp search)': '（支持 /正则/ 语法）',
+          '(Use line:column or scroll% syntax)': '（可用 行:列 或 百分比）',
+        },
+      });
+      cm.setCursor(0, 0);
+      cm.clearHistory();
+      cm.on('change', () => setDirty(true));
+      cm.on('cursorActivity', updateStatus);
+      setDirty(false);
+      updateStatus();
+      cm.focus();
+      buildMenus(); // 编辑器就绪后菜单项从禁用变可用
+      refreshCM();
+      // 挂载是异步的：如果这期间用户切了配色（或面板深浅色变了），按最新选择纠正一次
+      if (cmThemeFor(theme) !== themeName) applyTheme(theme);
+    } catch (e) {
+      // 加载失败要给出**原因**（网络/镜像/文件缺失），并且仍然给一条能走通的路
+      clear(host);
+      appendAll(host, h('div.empty', [
+        h('div.big', { text: '⚠️' }),
+        h('h4', { text: '编辑器加载失败' }),
+        h('p', { text: (e && e.message) || String(e) }),
+        h('p', { text: '可以刷新页面重试；也可以用 Web 终端或下载后本地编辑。文件内容没有被改动。' }),
+      ]));
+      statusInfo.textContent = '';
+    }
+  })();
+
+  return {
+    setFile: (e, r) => applyFile(e, r),
+    focus: () => { if (cm) cm.focus(); },
+    dispose,
+  };
 }
+
 // ---------- 拖拽：把 DataTransfer 展开成 {file, rel} ----------
 //
 // 只有 webkitGetAsEntry 能拿到目录与相对路径；Entry.file() / readEntries() 都是

@@ -428,21 +428,41 @@ func boolToInt(b bool) int {
 //     "恢复导航页数据"就变成了"改面板全局配置"，那是两件不同的事。
 //
 // 空值有明确含义 = "用默认"：标题回落到「导航页」、背景回落到无图、
-// 主题色回落到面板品牌色。所以保存空串是**有效操作**（清除自定义），不是异常。
+// 主题色回落到色系自带的强调色。所以保存空串是**有效操作**（清除自定义），不是异常。
+//
+// Mode / Theme / Size 是 2026-09-18 新增的「外观三件套」（用户要求照抄参考页的观感）：
+//
+//	· Mode  = 外观模式：auto（跟随系统）/ light / dark；
+//	· Theme = 主题色系：8 套之一的 kebab id（颜色表在 web 层，见 navThemes）；
+//	· Size  = 卡片尺寸：s / m / l。
+//
+// 与 Title/Accent 不同，这三项**没有"空 = 自定义"的语义**，所以读出来时空值会被
+// 归一化成默认值（见 NavSettings 方法）—— 老库里的行没有这三个键，公开页也就能
+// 直接拿到一个可用值，不必在前端再补一次默认。
 type NavSettings struct {
 	Title      string `json:"title"`
 	Subtitle   string `json:"subtitle"`
 	Accent     string `json:"accent"`
 	Background string `json:"background"`
+	Mode       string `json:"mode"`
+	Theme      string `json:"theme"`
+	Size       string `json:"size"`
 }
+
+// 外观三件套的默认值（缺失/空值时回落到这里）。取值白名单在 web 层校验。
+const (
+	NavDefaultMode  = "auto"
+	NavDefaultTheme = "neon"
+	NavDefaultSize  = "m"
+)
 
 // navSettingKeys 是允许写入的键（白名单）。
 //
 // 不用"随便存"：这张表将来可能被别处复用，放开键名等于放开一个任意键值存储，
 // 备份/恢复时的语义也就说不清了。
-var navSettingKeys = []string{"title", "subtitle", "accent", "background"}
+var navSettingKeys = []string{"title", "subtitle", "accent", "background", "mode", "theme", "size"}
 
-// NavSettings 读取外观设置（缺的键回落到空串 = 用默认）。
+// NavSettings 读取外观设置（缺的键回落到默认；标题/主题色/背景图的空值保持空串）。
 func (s *Store) NavSettings(ctx context.Context) (NavSettings, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM nav_settings`)
 	if err != nil {
@@ -460,11 +480,24 @@ func (s *Store) NavSettings(ctx context.Context) (NavSettings, error) {
 	if err := rows.Err(); err != nil {
 		return NavSettings{}, err
 	}
+	mode, theme, size := m["mode"], m["theme"], m["size"]
+	if mode == "" {
+		mode = NavDefaultMode
+	}
+	if theme == "" {
+		theme = NavDefaultTheme
+	}
+	if size == "" {
+		size = NavDefaultSize
+	}
 	return NavSettings{
 		Title:      m["title"],
 		Subtitle:   m["subtitle"],
 		Accent:     m["accent"],
 		Background: m["background"],
+		Mode:       mode,
+		Theme:      theme,
+		Size:       size,
 	}, nil
 }
 
@@ -473,6 +506,7 @@ func (s *Store) SaveNavSettings(ctx context.Context, n NavSettings) error {
 	vals := map[string]string{
 		"title": n.Title, "subtitle": n.Subtitle,
 		"accent": n.Accent, "background": n.Background,
+		"mode": n.Mode, "theme": n.Theme, "size": n.Size,
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

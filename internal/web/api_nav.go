@@ -539,8 +539,9 @@ func (s *Server) navTree(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	// 外观设置随数据一起返回：**公开别名页（未登录）也必须能拿到** ——
-	// 标题 / 主题色 / 背景图都是给访问者看的，不含任何敏感信息。
-	return map[string]any{"groups": groups, "items": items, "settings": settings}, nil
+	// 标题 / 主题色 / 背景图 / 三件套都是给访问者看的，不含任何敏感信息。
+	// themes 是 8 套色系表：前端据此渲染"主题色卡"与渐变/光晕，服务端是唯一真相源。
+	return map[string]any{"groups": groups, "items": items, "settings": settings, "themes": navThemes}, nil
 }
 
 func (s *Server) handleNavTree(w http.ResponseWriter, r *http.Request) {
@@ -575,12 +576,97 @@ const (
 // 不是"看起来像颜色"。
 var navAccentRe = regexp.MustCompile(`^#[0-9a-f]{6}$`)
 
+// ---------- 外观色系（8 套）----------
+//
+// 用户 2026-09-18 要求：照抄参考首页的观感 —— 外观模式（自动/亮色/暗色）、
+// 8 套主题色系（每套含 light/dark 的渐变与光晕色）、卡片尺寸（小/中/大）。
+//
+// 为什么颜色表放在**服务端**（而不是两份前端各抄一遍）：
+//
+//	· 公开别名页的 nav.js 必须自包含（不能 import 面板资源），面板内页面又是另一个
+//	  文件 —— 颜色表抄两份，迟早只改一份（这正是"离散真相源"那一类坑）；
+//	· 校验用的白名单也要与颜色表的 id 一致，放在一起才不会"能存不能用"。
+//
+// 前端从 /nav/data（公开）或 /api/v1/nav/tree 里的 `themes` 字段读取。
+type navThemeVariant struct {
+	// Grad 是背景渐变的 2~3 个色停（左→右）。
+	Grad []string `json:"grad"`
+	// Orb 是两个漂移光晕的颜色。
+	Orb []string `json:"orb"`
+	// Accent 是这套色系自带的强调色（用户没自定义 accent 时用它）。
+	Accent string `json:"accent"`
+}
+
+type navTheme struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Light navThemeVariant `json:"light"`
+	Dark  navThemeVariant `json:"dark"`
+}
+
+// navThemes 是照抄参考页的 8 套色系（颜色值逐字取自考参文件）。
+var navThemes = []navTheme{
+	{ID: "neon", Name: "霓虹",
+		Light: navThemeVariant{Grad: []string{"#6a7ef0", "#8f5fe8", "#e96fc0"}, Orb: []string{"#7c5cff", "#ff5cc8"}, Accent: "#7c5cff"},
+		Dark:  navThemeVariant{Grad: []string{"#150a2e", "#2a1250", "#3d1147"}, Orb: []string{"#8b5cf6", "#22d3ee"}, Accent: "#8b5cf6"}},
+	{ID: "aurora", Name: "极光",
+		Light: navThemeVariant{Grad: []string{"#5ee7df", "#7f9cf5", "#c8a2e0"}, Orb: []string{"#34d399", "#60a5fa"}, Accent: "#14b8a6"},
+		Dark:  navThemeVariant{Grad: []string{"#08131f", "#0d2b3e", "#123044"}, Orb: []string{"#10b981", "#0ea5e9"}, Accent: "#10b981"}},
+	{ID: "sunset", Name: "日落",
+		Light: navThemeVariant{Grad: []string{"#ffb26b", "#ff7e5f", "#f76b8a"}, Orb: []string{"#fb923c", "#f43f5e"}, Accent: "#fb7185"},
+		Dark:  navThemeVariant{Grad: []string{"#2a1216", "#43181f", "#2b1424"}, Orb: []string{"#f97316", "#e11d48"}, Accent: "#f97316"}},
+	{ID: "ocean", Name: "海洋",
+		Light: navThemeVariant{Grad: []string{"#4fc3f7", "#2193b0", "#2b5876"}, Orb: []string{"#38bdf8", "#0e7490"}, Accent: "#0ea5e9"},
+		Dark:  navThemeVariant{Grad: []string{"#061a2e", "#0a2c48", "#0e3a52"}, Orb: []string{"#0ea5e9", "#155e75"}, Accent: "#0ea5e9"}},
+	{ID: "forest", Name: "森林",
+		Light: navThemeVariant{Grad: []string{"#8fd694", "#43a047", "#1b6b4a"}, Orb: []string{"#4ade80", "#15803d"}, Accent: "#43a047"},
+		Dark:  navThemeVariant{Grad: []string{"#071a12", "#0d2f20", "#123a26"}, Orb: []string{"#22c55e", "#0f766e"}, Accent: "#22c55e"}},
+	{ID: "ink", Name: "水墨",
+		Light: navThemeVariant{Grad: []string{"#cfd9df", "#8e9eab", "#5c6b73"}, Orb: []string{"#94a3b8", "#64748b"}, Accent: "#64748b"},
+		Dark:  navThemeVariant{Grad: []string{"#0a0a0f", "#161622", "#1f1f2e"}, Orb: []string{"#64748b", "#334155"}, Accent: "#94a3b8"}},
+	{ID: "violet", Name: "罗兰",
+		Light: navThemeVariant{Grad: []string{"#c9a7f5", "#9b6dff", "#6d5efc"}, Orb: []string{"#a78bfa", "#6366f1"}, Accent: "#9b6dff"},
+		Dark:  navThemeVariant{Grad: []string{"#120a26", "#221043", "#2e1550"}, Orb: []string{"#a855f7", "#4f46e5"}, Accent: "#a855f7"}},
+	{ID: "ember", Name: "炭火",
+		Light: navThemeVariant{Grad: []string{"#f6d365", "#e8a87c", "#c98b6b"}, Orb: []string{"#fbbf24", "#ea580c"}, Accent: "#ea580c"},
+		Dark:  navThemeVariant{Grad: []string{"#1c1208", "#2e1c0f", "#231510"}, Orb: []string{"#f59e0b", "#b45309"}, Accent: "#f59e0b"}},
+}
+
+// navThemeIDs 由 navThemes 派生（不要另抄一份）。
+func navThemeIDs() []string {
+	out := make([]string, 0, len(navThemes))
+	for _, t := range navThemes {
+		out = append(out, t.ID)
+	}
+	return out
+}
+
+// 外观模式 / 卡片尺寸的白名单（值少且稳定，直接列出来更好读）。
+var (
+	navModeIDs = []string{"auto", "light", "dark"}
+	navSizeIDs = []string{"s", "m", "l"}
+)
+
+// navOneOf 返回 v 是否在 allowed 里。
+func navOneOf(v string, allowed []string) bool {
+	for _, a := range allowed {
+		if v == a {
+			return true
+		}
+	}
+	return false
+}
+
 // navSettingsReq 是 POST /api/v1/nav/settings 的请求体。
 type navSettingsReq struct {
 	Title      string `json:"title"`
 	Subtitle   string `json:"subtitle"`
 	Accent     string `json:"accent"`
 	Background string `json:"background"`
+	// Mode / Theme / Size 为空时回落到默认值（老前端不带这三个字段也能保存）。
+	Mode  string `json:"mode"`
+	Theme string `json:"theme"`
+	Size  string `json:"size"`
 }
 
 func (s *Server) handleNavSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -617,11 +703,16 @@ func (s *Server) handleNavSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "nav_settings_save", "外观设置",
-		fmt.Sprintf("标题=%q 主题色=%q 背景=%q", set.Title, set.Accent, set.Background), true, "")
+		fmt.Sprintf("标题=%q 主题色=%q 背景=%q 模式=%s 色系=%s 尺寸=%s",
+			set.Title, set.Accent, set.Background, set.Mode, set.Theme, set.Size), true, "")
 	ok(w, set)
 }
 
 // validateNavSettings 校验并规范化外观设置（返回人话错误）。
+//
+// 三件套（mode/theme/size）是**白名单**：只接受列出的取值；空串回落到默认值
+// （兼容老前端/老库）。非法值一律 400 并说明合法取值 —— 不静默改写成默认，
+// 否则用户会以为"选了却没生效"。
 func validateNavSettings(req navSettingsReq) (store.NavSettings, error) {
 	var out store.NavSettings
 	title, err := navCleanOptional(req.Title, navMaxTitleLen, "标题")
@@ -640,7 +731,26 @@ func validateNavSettings(req navSettingsReq) (store.NavSettings, error) {
 	if err != nil {
 		return out, err
 	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = store.NavDefaultMode
+	} else if !navOneOf(mode, navModeIDs) {
+		return out, fmt.Errorf("外观模式只支持 %s（收到 %q）", strings.Join(navModeIDs, " / "), mode)
+	}
+	theme := strings.ToLower(strings.TrimSpace(req.Theme))
+	if theme == "" {
+		theme = store.NavDefaultTheme
+	} else if !navOneOf(theme, navThemeIDs()) {
+		return out, fmt.Errorf("主题色系只支持 %s（收到 %q）", strings.Join(navThemeIDs(), " / "), theme)
+	}
+	size := strings.ToLower(strings.TrimSpace(req.Size))
+	if size == "" {
+		size = store.NavDefaultSize
+	} else if !navOneOf(size, navSizeIDs) {
+		return out, fmt.Errorf("卡片尺寸只支持 %s（收到 %q）", strings.Join(navSizeIDs, " / "), size)
+	}
 	out.Title, out.Subtitle, out.Accent, out.Background = title, sub, accent, bg
+	out.Mode, out.Theme, out.Size = mode, theme, size
 	return out, nil
 }
 

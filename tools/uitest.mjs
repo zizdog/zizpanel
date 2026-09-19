@@ -55,6 +55,18 @@ const step = async (name, fn) => {
 // "新建文件并在线编辑保存"就卡在这里。
 const closeAnyModal = async (page) => {
   for (let i = 0; i < 6; i++) {
+    // 文件编辑器现在是**独立窗口**（.zpf-win，宝塔式），不再是 .modal：
+    // 它铺满 content 区，不关掉后面的按钮全都点不到。窗口里可能有未保存修改，
+    // 所以临时接管对话框（确认框一律接受）再点关闭。
+    const wins = page.locator('.zpf-win');
+    if (await wins.count()) {
+      const accept = (d) => d.accept().catch(() => {});
+      page.on('dialog', accept);
+      await wins.last().locator('.zpf-iconbtn.zpf-close').click().catch(() => {});
+      await page.waitForTimeout(300);
+      page.off('dialog', accept);
+      continue;
+    }
     const masks = page.locator('.modal-mask');
     if (!(await masks.count())) return;
     const x = masks.last().locator('button.modal-close').first();
@@ -3002,23 +3014,24 @@ try {
     const link = page.locator('a', { hasText: 'zp-ui-test.txt' }).first();
     await link.waitFor({ timeout: 10000 });
     await link.click();
-    // 编辑器是内嵌的 CodeMirror（2026-09-22 起）：等 .CodeMirror 挂上再操作。
-    // 不能用 page.fill('.modal textarea')：CM 的输入层也是个隐藏 textarea，
-    // 直接塞值它会读不到（表现为"填了没反应"）。
-    await page.waitForSelector('.modal .CodeMirror', { timeout: 20000 });
+    // 编辑器是内嵌 CodeMirror + 宝塔式窗口（.zpf-win，2026-09-23 起）：
+    // 等 .CodeMirror 挂上再操作。不能用 page.fill('.zpf-win textarea')：
+    // CM 的输入层也是个隐藏 textarea，直接塞值它会读不到（表现为"填了没反应"）。
+    await page.waitForSelector('.zpf-win .CodeMirror', { timeout: 20000 });
     await page.waitForTimeout(600);
     await shot('42a-files-editor');
-    await page.locator('.modal .CodeMirror').click();
+    await page.locator('.zpf-win .CodeMirror').click();
     await page.keyboard.press('ControlOrMeta+a');
     await page.keyboard.type('hello from ui test');
     const typed = await page.evaluate(() => {
-      const el = document.querySelector('.modal .CodeMirror');
+      const el = document.querySelector('.zpf-win .CodeMirror');
       return el && el.CodeMirror ? el.CodeMirror.getValue() : '';
     });
     if (!typed.includes('hello from ui test')) {
       throw new Error('CodeMirror 里没有出现输入的内容，实际：' + JSON.stringify(typed));
     }
-    await page.click('.modal button:has-text("保存")');
+    // 保存走快捷键（菜单里也有「保存」；快捷键是用户最常用的那条路径）
+    await page.keyboard.press('ControlOrMeta+s');
     await page.waitForTimeout(2500);
     await shot('42-files-edited');
   });

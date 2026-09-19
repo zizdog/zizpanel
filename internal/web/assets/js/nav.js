@@ -142,21 +142,183 @@ async function pickUploadedIcon(iconInput, what = '图标') {
   return m;
 }
 
+// NAV_APPEARANCE_CSS —— 面板内导航页的"毛玻璃外观"。
+//
+// 为什么是**运行时注入**而不是写进 app.css：
+//   用户 2026-09-18 要求把参考首页的观感搬进导航页，同时明确另一条硬约束 ——
+//   不要改 assets/app.css（那里是并行改动热点）。所以样式全部 scope 在
+//   `.zp-nav-shell` 之下，运行时注入到 <head>（见 ensureNavAppearanceStyle）。
+//   面板内页面与独立别名页共用同一份设置，但各自的样式实现是独立的：
+//   别名页必须自包含（assets/nav/index.html 里内联），这里则复用面板壳子。
+//
+// 颜色表（8 套色系）不在前端硬编码：随 navTree 的 `themes` 字段从服务端下发。
+const NAV_APPEARANCE_CSS = `
+.zp-nav-shell{
+  position:relative; overflow:hidden; border-radius:16px; padding:18px; min-height:60vh;
+  color:var(--zp-nav-text);
+  --zp-nav-text:#eef0ff;
+  --zp-nav-text-dim:rgba(238,240,255,.62);
+  --zp-nav-text-mute:rgba(238,240,255,.42);
+  --zp-nav-card-bg:rgba(255,255,255,.09);
+  --zp-nav-card-bg-hover:rgba(255,255,255,.16);
+  --zp-nav-card-bd:rgba(255,255,255,.14);
+  --zp-nav-chip:rgba(255,255,255,.08);
+  --zp-nav-chip-active:rgba(255,255,255,.22);
+  --zp-nav-icon-bg:rgba(255,255,255,.10);
+  --zp-nav-icon-bg-hover:rgba(255,255,255,.18);
+  --zp-nav-shadow:0 10px 30px rgba(0,0,0,.45);
+  --zp-nav-shadow-hover:0 18px 44px rgba(0,0,0,.55);
+  --zp-nav-orb1:#8b5cf6; --zp-nav-orb2:#22d3ee; --zp-nav-orb-op:.38;
+  --zp-nav-accent:#8b5cf6;
+}
+.zp-nav-shell[data-nav-mode="light"]{
+  --zp-nav-text:#1b1b2f;
+  --zp-nav-text-dim:rgba(27,27,47,.60);
+  --zp-nav-text-mute:rgba(27,27,47,.42);
+  --zp-nav-card-bg:rgba(255,255,255,.55);
+  --zp-nav-card-bg-hover:rgba(255,255,255,.80);
+  --zp-nav-card-bd:rgba(255,255,255,.70);
+  --zp-nav-chip:rgba(255,255,255,.40);
+  --zp-nav-chip-active:rgba(255,255,255,.95);
+  --zp-nav-icon-bg:rgba(255,255,255,.50);
+  --zp-nav-icon-bg-hover:rgba(255,255,255,.92);
+  --zp-nav-shadow:0 8px 24px rgba(31,38,135,.10);
+  --zp-nav-shadow-hover:0 16px 36px rgba(31,38,135,.16);
+  --zp-nav-orb-op:.28;
+}
+@media (prefers-color-scheme: light){
+  .zp-nav-shell[data-nav-mode="auto"]{
+    --zp-nav-text:#1b1b2f;
+    --zp-nav-text-dim:rgba(27,27,47,.60);
+    --zp-nav-text-mute:rgba(27,27,47,.42);
+    --zp-nav-card-bg:rgba(255,255,255,.55);
+    --zp-nav-card-bg-hover:rgba(255,255,255,.80);
+    --zp-nav-card-bd:rgba(255,255,255,.70);
+    --zp-nav-chip:rgba(255,255,255,.40);
+    --zp-nav-chip-active:rgba(255,255,255,.95);
+    --zp-nav-icon-bg:rgba(255,255,255,.50);
+    --zp-nav-icon-bg-hover:rgba(255,255,255,.92);
+    --zp-nav-shadow:0 8px 24px rgba(31,38,135,.10);
+    --zp-nav-shadow-hover:0 16px 36px rgba(31,38,135,.16);
+    --zp-nav-orb-op:.28;
+  }
+}
+.zp-nav-bglayer{position:absolute;inset:0;z-index:0;opacity:0;transition:opacity .7s ease;
+  background-size:cover;background-position:center;background-repeat:no-repeat}
+.zp-nav-bglayer.on{opacity:1}
+.zp-nav-orbs{position:absolute;inset:0;z-index:1;overflow:hidden;pointer-events:none}
+.zp-nav-orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:var(--zp-nav-orb-op);
+  width:46vmax;height:46vmax;transition:background-color .9s ease,opacity .6s ease}
+.zp-nav-orb.a{background:var(--zp-nav-orb1);top:-14vmax;left:-10vmax;animation:zp-nav-drift1 26s ease-in-out infinite}
+.zp-nav-orb.b{background:var(--zp-nav-orb2);right:-12vmax;bottom:-14vmax;animation:zp-nav-drift2 32s ease-in-out infinite}
+@keyframes zp-nav-drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(6vmax,4vmax) scale(1.12)}}
+@keyframes zp-nav-drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-5vmax,-4vmax) scale(1.15)}}
+.zp-nav-fg{position:relative;z-index:2}
+.zp-nav-shell .zp-nav-title{color:var(--zp-nav-text)}
+.zp-nav-shell .zp-nav-subtitle{color:var(--zp-nav-text-mute)}
+.zp-nav-shell .zp-nav-group{background:transparent;border:none;box-shadow:none;margin-bottom:18px}
+.zp-nav-shell .zp-nav-group:hover{border-color:transparent;box-shadow:none}
+.zp-nav-shell .zp-nav-group>.card-head{padding:0 0 12px;border-bottom:none}
+.zp-nav-shell .zp-nav-group>.card-body{padding:0}
+.zp-nav-shell .zp-nav-group-head h3{color:var(--zp-nav-text);font-size:1.12em;font-weight:400;
+  padding-left:12px;border-left:3px solid var(--zp-nav-accent)}
+.zp-nav-shell .zp-nav-group-head .pill{background:var(--zp-nav-chip);color:var(--zp-nav-text-dim);
+  border-color:var(--zp-nav-card-bd)}
+.zp-nav-shell .zp-nav-card{
+  position:relative;overflow:hidden;color:var(--zp-nav-text);
+  background:var(--zp-nav-card-bg);border:1px solid var(--zp-nav-card-bd);
+  backdrop-filter:blur(16px) saturate(150%);-webkit-backdrop-filter:blur(16px) saturate(150%);
+  border-radius:18px;padding:16px 18px;min-height:70px;box-shadow:var(--zp-nav-shadow);
+  transition:transform .32s cubic-bezier(.34,1.4,.5,1),background .3s ease,box-shadow .3s ease,border-color .3s ease;
+}
+.zp-nav-shell .zp-nav-card::after{
+  content:"";position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.85),transparent);
+  transform:translateX(-100%);transition:transform .6s ease;
+}
+.zp-nav-shell .zp-nav-card:hover{
+  transform:translateY(-6px);background:var(--zp-nav-card-bg-hover);box-shadow:var(--zp-nav-shadow-hover);
+  border-color:color-mix(in srgb,var(--zp-nav-card-bd) 40%,var(--zp-nav-accent));
+}
+.zp-nav-shell .zp-nav-card:hover::after{transform:translateX(100%)}
+.zp-nav-shell .zp-nav-icon{background:var(--zp-nav-icon-bg);
+  transition:transform .35s cubic-bezier(.34,1.4,.5,1),background .3s ease}
+.zp-nav-shell .zp-nav-card:hover .zp-nav-icon{transform:scale(1.10) rotate(-4deg);background:var(--zp-nav-icon-bg-hover)}
+.zp-nav-shell .zp-nav-name{color:var(--zp-nav-text)}
+.zp-nav-shell .zp-nav-desc{color:var(--zp-nav-text-dim)}
+.zp-nav-shell .zp-nav-empty-inline{color:var(--zp-nav-text-mute)}
+.zp-nav-shell .input,.zp-nav-shell .select{
+  background:var(--zp-nav-card-bg);border-color:var(--zp-nav-card-bd);color:var(--zp-nav-text);
+}
+.zp-nav-shell .input::placeholder{color:var(--zp-nav-text-mute)}
+.zp-nav-shell .btn{background:var(--zp-nav-chip);border-color:var(--zp-nav-card-bd);color:var(--zp-nav-text)}
+.zp-nav-shell .btn:hover{background:var(--zp-nav-chip-active)}
+.zp-nav-shell .btn-primary{background:var(--zp-nav-accent);border-color:var(--zp-nav-accent);color:#fff}
+.zp-nav-shell .btn-primary:hover{background:var(--zp-nav-accent);border-color:var(--zp-nav-accent)}
+.zp-nav-shell .empty{color:var(--zp-nav-text-mute)}
+.zp-nav-shell .empty h4{color:var(--zp-nav-text-dim)}
+.zp-nav-shell[data-nav-size="s"] .zp-nav-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
+.zp-nav-shell[data-nav-size="s"] .zp-nav-card{padding:11px 14px;border-radius:14px;gap:11px;min-height:56px}
+.zp-nav-shell[data-nav-size="s"] .zp-nav-icon{width:38px;height:38px;font-size:19px;border-radius:11px}
+.zp-nav-shell[data-nav-size="s"] .zp-nav-name{font-size:.90em}
+.zp-nav-shell[data-nav-size="s"] .zp-nav-desc{font-size:.70em}
+.zp-nav-shell[data-nav-size="m"] .zp-nav-grid{grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px}
+.zp-nav-shell[data-nav-size="m"] .zp-nav-card{padding:16px 18px;border-radius:18px;gap:14px;min-height:70px}
+.zp-nav-shell[data-nav-size="m"] .zp-nav-icon{width:52px;height:52px;font-size:26px;border-radius:15px}
+.zp-nav-shell[data-nav-size="m"] .zp-nav-name{font-size:1.02em}
+.zp-nav-shell[data-nav-size="m"] .zp-nav-desc{font-size:.78em}
+.zp-nav-shell[data-nav-size="l"] .zp-nav-grid{grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:24px}
+.zp-nav-shell[data-nav-size="l"] .zp-nav-card{padding:22px 24px;border-radius:24px;gap:18px;min-height:86px}
+.zp-nav-shell[data-nav-size="l"] .zp-nav-icon{width:68px;height:68px;font-size:34px;border-radius:20px}
+.zp-nav-shell[data-nav-size="l"] .zp-nav-name{font-size:1.20em}
+.zp-nav-shell[data-nav-size="l"] .zp-nav-desc{font-size:.86em}
+@media (prefers-reduced-motion: reduce){
+  .zp-nav-shell .zp-nav-orb{animation:none}
+  .zp-nav-shell .zp-nav-card,.zp-nav-shell .zp-nav-icon,.zp-nav-bglayer{transition:none}
+  .zp-nav-shell .zp-nav-card:hover{transform:none}
+  .zp-nav-shell .zp-nav-card:hover .zp-nav-icon{transform:none}
+  .zp-nav-shell .zp-nav-card::after{display:none}
+}
+`;
+
+// ensureNavAppearanceStyle 把上面的样式注入 <head>，只注入一次（切页重进不叠加）。
+function ensureNavAppearanceStyle() {
+  if (document.getElementById('zp-nav-appearance-css')) return;
+  const st = document.createElement('style');
+  st.id = 'zp-nav-appearance-css';
+  st.textContent = NAV_APPEARANCE_CSS;
+  document.head.appendChild(st);
+}
+
+// 外观三件套的白名单（与服务端同一条判据；服务端是权威，这里只是渲染兜底）。
+const NAV_MODES = ['auto', 'light', 'dark'];
+const NAV_SIZES = ['s', 'm', 'l'];
+
 export function NavView(content, ctx = {}) {
   clear(content);
+  ensureNavAppearanceStyle();
 
   let groups = [];
   let items = [];
   let edit = false;
   let query = '';
   let loaded = false;
-  // 外观设置（标题 / 副标题 / 主题色 / 背景图），随 navTree 一起返回，
+  // 外观设置（标题 / 副标题 / 主题色 / 背景图 / 模式 / 色系 / 尺寸），随 navTree 一起返回，
   // 面板内页面与独立别名页共用同一份（存 nav_settings 表）。
   let settings = {};
+  // 8 套色系表：由服务端下发（navTree.themes），前端不硬编码颜色。
+  let themes = [];
+  // draft 是「🎨 外观」弹窗里未保存的即时预览（只含 mode/theme/size），关掉弹窗就丢弃。
+  let draft = null;
 
   const toolbar = h('div.zp-nav-toolbar');
   const body = h('div', { id: 'zp-nav-body' });
-  content.append(toolbar, body);
+  const bgA = h('div.zp-nav-bglayer');
+  const bgB = h('div.zp-nav-bglayer');
+  const orbs = h('div.zp-nav-orbs', [h('div.zp-nav-orb.a'), h('div.zp-nav-orb.b')]);
+  const fg = h('div.zp-nav-fg', [toolbar, body]);
+  const shell = h('div.zp-nav-shell', { dataset: { testid: 'nav-shell' } }, [bgA, bgB, orbs, fg]);
+  content.append(shell);
 
   const idOf = (x) => Number(x.id);
   const itemsOf = (gid) => items.filter((it) => Number(it.group_id) === Number(gid));
@@ -169,6 +331,7 @@ export function NavView(content, ctx = {}) {
       groups = (tree && tree.groups) || [];
       items = (tree && tree.items) || [];
       settings = (tree && tree.settings) || {};
+      themes = (tree && tree.themes) || [];
       loaded = true;
       applyAppearance();
       renderBody();
@@ -220,30 +383,73 @@ export function NavView(content, ctx = {}) {
 
   // safeAccent 只认 #rrggbb（与服务端同一条判据）：拼进 CSS 之前**再校验一次**，
   // 免得坏数据（手工改库、旧版本残留）把样式注入点打开。
-  const safeAccent = () => (/^#[0-9a-f]{6}$/i.test(String(settings.accent || ''))
-    ? String(settings.accent) : '');
+  const safeAccentOf = (raw) => (/^#[0-9a-f]{6}$/i.test(String(raw || '')) ? String(raw) : '');
+  const safeAccent = () => safeAccentOf(settings.accent);
 
   // cssURL 把地址安全地拼进 CSS 的 url("…")：引号/括号/反斜杠/空白一律百分号化。
   const cssURL = (u) => String(u).replace(/["'()\\\s]/g,
     (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
-  function applyAppearance() {
-    const accent = safeAccent();
-    // 主题色只作用于导航页自己的容器（--nav-accent），不动面板全局 --brand：
-    // 用户要的是"这个页面的主题色"，不是"把整个面板换色"。
-    if (accent) content.style.setProperty('--nav-accent', accent);
-    else content.style.removeProperty('--nav-accent');
-    const bg = String(settings.background || '').trim();
-    if (bg) {
-      // 压一层暗色遮罩：亮背景图会把卡片文字吃掉，可读性优先。
-      content.style.backgroundImage =
-        'linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,.35)), url("' + cssURL(bg) + '")';
-    } else {
-      content.style.backgroundImage = '';
-    }
+  // effSettings：服务端已保存的设置 ← 弹窗里未保存的即时预览（draft）。
+  function effSettings() {
+    const base = settings || {};
+    const d = draft || {};
+    const mode = NAV_MODES.includes(String(d.mode || base.mode)) ? String(d.mode || base.mode) : 'auto';
+    const size = NAV_SIZES.includes(String(d.size || base.size)) ? String(d.size || base.size) : 'm';
+    let theme = String(d.theme || base.theme || '');
+    if (!themes.some((t) => t.id === theme)) theme = themes.length ? themes[0].id : '';
+    return { ...base, mode, size, theme };
   }
 
-  // appearanceForm 是「🎨 外观」弹窗：标题 / 副标题 / 主题色 / 背景图。
+  const modeIsDark = (mode) => mode === 'dark'
+    || (mode === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+  // 双缓冲交叉淡入：渐变/背景图写到"另一张"图层上，再淡出旧的（与别名页同一手法）。
+  let bgFlip = false;
+  function paintNavBG(s, variant) {
+    const next = bgFlip ? bgA : bgB;
+    const cur = bgFlip ? bgB : bgA;
+    const bg = String(s.background || '').trim();
+    if (bg) {
+      // 压一层暗色遮罩：亮背景图会把卡片文字吃掉，可读性优先。
+      next.style.backgroundImage =
+        'linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,.35)), url("' + cssURL(bg) + '")';
+    } else if (variant) {
+      next.style.backgroundImage = 'linear-gradient(135deg, ' + (variant.grad || []).join(',') + ')';
+    } else {
+      next.style.backgroundImage = 'linear-gradient(135deg,#1b1b2f,#2b2b45)';
+    }
+    next.classList.add('on');
+    cur.classList.remove('on');
+    bgFlip = !bgFlip;
+  }
+
+  // applyAppearance 把外观应用到导航页容器（标题/副标题在 renderToolbar 里走 DOM）。
+  //
+  // accent 与 theme 的共存：accent（「主题色」输入框，留空 = 跟随色系）是**单一强调色**，
+  // 优先于色系自带的 accent；theme 还决定背景渐变与两个光晕色。见弹窗里的说明文案。
+  function applyAppearance() {
+    const s = effSettings();
+    shell.setAttribute('data-nav-mode', s.mode);
+    shell.setAttribute('data-nav-size', s.size);
+
+    const th = themes.find((t) => t.id === s.theme) || null;
+    const variant = th ? (modeIsDark(s.mode) ? th.dark : th.light) : null;
+    const accent = safeAccentOf(s.accent) || (variant && variant.accent) || '#8b5cf6';
+    shell.style.setProperty('--zp-nav-accent', accent);
+    // 同时保留面板既有的 --nav-accent（app.css 的 .zp-nav-card:hover 用它），语义相同。
+    content.style.setProperty('--nav-accent', accent);
+    if (variant) {
+      shell.style.setProperty('--zp-nav-orb1', (variant.orb && variant.orb[0]) || '#8b5cf6');
+      shell.style.setProperty('--zp-nav-orb2', (variant.orb && variant.orb[1]) || '#22d3ee');
+    }
+    paintNavBG(s, variant);
+  }
+
+  // appearanceForm 是「🎨 外观」弹窗：外观模式 / 主题色系 / 卡片尺寸 / 标题 / 副标题 / 主题色 / 背景图。
+  //
+  // 前四项（模式/色系/尺寸）改的是**导航页自己的观感**（服务端默认，别名页同样生效）；
+  // 弹窗里的选择即时预览，点「保存外观」才写库。
   function appearanceForm() {
     const title = h('input.input', {
       type: 'text', value: settings.title || '', placeholder: '导航页（默认）', maxlength: '40',
@@ -252,9 +458,9 @@ export function NavView(content, ctx = {}) {
       type: 'text', value: settings.subtitle || '', placeholder: 'ZizPanel · 自托管首页（默认）', maxlength: '60',
     });
     const accent = h('input.input', {
-      type: 'text', value: settings.accent || '', placeholder: '#3b82f6（默认跟随面板）', maxlength: '7',
+      type: 'text', value: settings.accent || '', placeholder: '留空 = 跟随色系', maxlength: '7',
     });
-    const colorPick = h('input', { type: 'color', value: safeAccent() || '#3b82f6', title: '用取色器选一个主题色' });
+    const colorPick = h('input', { type: 'color', value: safeAccent() || '#8b5cf6', title: '用取色器选一个主题色' });
     colorPick.oninput = () => { accent.value = colorPick.value; };
     const presets = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4'];
     const swatches = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
@@ -262,8 +468,70 @@ export function NavView(content, ctx = {}) {
         text: '●', title: '用 ' + c, style: { color: c, fontWeight: '700' },
         onclick: () => { accent.value = c; colorPick.value = c; },
       })).concat([
-        h('button.btn.btn-sm', { text: '恢复默认', title: '清空主题色，跟随面板品牌色', onclick: () => { accent.value = ''; } }),
+        h('button.btn.btn-sm', { text: '跟随色系', title: '清空自定义主题色，改用所选色系自带的强调色', onclick: () => { accent.value = ''; } }),
       ]));
+
+    // ---- 外观模式 ----
+    const modeWrap = h('div', { style: { display: 'flex', gap: '6px' } });
+    NAV_MODES.forEach((v) => {
+      const label = { auto: '自动', light: '亮色', dark: '暗色' }[v];
+      const b = h('button.btn.btn-sm', { text: label, type: 'button', dataset: { testid: 'nav-mode-' + v } });
+      b.onclick = () => { draft = { ...(draft || {}), mode: v }; applyAppearance(); sync(); };
+      modeWrap.appendChild(b);
+    });
+
+    // ---- 卡片尺寸 ----
+    const sizeWrap = h('div', { style: { display: 'flex', gap: '6px' } });
+    NAV_SIZES.forEach((v) => {
+      const label = { s: '小', m: '中', l: '大' }[v];
+      const b = h('button.btn.btn-sm', { text: label, type: 'button', dataset: { testid: 'nav-size-' + v } });
+      b.onclick = () => { draft = { ...(draft || {}), size: v }; applyAppearance(); sync(); };
+      sizeWrap.appendChild(b);
+    });
+
+    // ---- 主题色系（8 套，预览色随模式联动）----
+    const themeGrid = h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '9px' } });
+    function renderThemes() {
+      clear(themeGrid);
+      if (themes.length === 0) {
+        themeGrid.appendChild(h('div.hint', { text: '色系表未加载 —— 关闭弹窗、刷新页面后重试' }));
+        return;
+      }
+      const dark = modeIsDark(effSettings().mode);
+      const cur = effSettings().theme;
+      themes.forEach((t) => {
+        const c = (dark ? t.dark : t.light) || {};
+        const on = cur === t.id;
+        const b = h('button', {
+          type: 'button', title: t.name, dataset: { testid: 'nav-theme-' + t.id },
+          style: {
+            cursor: 'pointer', background: 'none', padding: '3px', borderRadius: '12px',
+            border: on ? '2px solid var(--text)' : '2px solid transparent',
+          },
+        });
+        b.appendChild(h('span', {
+          style: {
+            display: 'block', height: '34px', borderRadius: '9px',
+            boxShadow: 'inset 0 0 0 1px rgba(255,255,255,.18)',
+            background: 'linear-gradient(135deg,' + (c.grad || []).join(',') + ')',
+          },
+        }));
+        b.appendChild(h('span', {
+          style: { display: 'block', textAlign: 'center', fontSize: '11px', marginTop: '5px', color: 'var(--text-dim)' },
+          text: t.name,
+        }));
+        b.onclick = () => { draft = { ...(draft || {}), theme: t.id }; applyAppearance(); sync(); };
+        themeGrid.appendChild(b);
+      });
+    }
+
+    function sync() {
+      const ef = effSettings();
+      NAV_MODES.forEach((v, i) => modeWrap.children[i].classList.toggle('btn-primary', v === ef.mode));
+      NAV_SIZES.forEach((v, i) => sizeWrap.children[i].classList.toggle('btn-primary', v === ef.size));
+      renderThemes();
+    }
+    sync();
 
     const bgInput = h('input', { type: 'hidden', value: settings.background || '' });
     const bgPreview = h('img', {
@@ -278,13 +546,21 @@ export function NavView(content, ctx = {}) {
     bgUp.onclick = async () => { await uploadNavImage(bgInput, bgUp, '背景图', true); refreshBg(); };
     const bgPick = h('button.btn.btn-sm', { text: '🖼 已上传', title: '从已经上传过的图片里挑一张' });
     bgPick.onclick = () => pickUploadedIcon(bgInput, '背景图');
-    const bgClear = h('button.btn.btn-sm', { text: '清除背景', title: '恢复无背景图', onclick: () => { bgInput.value = ''; refreshBg(); } });
+    const bgClear = h('button.btn.btn-sm', { text: '清除背景', title: '恢复无色系渐变（改用当前色系背景）', onclick: () => { bgInput.value = ''; refreshBg(); } });
 
     const okBtn = h('button.btn.btn-primary', { text: '保存外观' });
     const m = modal({
       title: '导航页外观',
       wide: true,
+      // 关掉弹窗（含取消/遮罩/Esc）就丢弃未保存的即时预览，恢复服务端值。
+      onClose: () => { draft = null; applyAppearance(); },
       body: h('div', [
+        h('div.field', [h('label', { text: '外观模式' }), modeWrap,
+          h('div.hint', { text: '自动 = 跟随操作系统；亮色 / 暗色为固定外观。只作用于导航页。' })]),
+        h('div.field', [h('label', { text: '主题色系' }), themeGrid,
+          h('div.hint', { text: '8 套色系决定背景渐变与两个光晕的颜色；每套都含亮/暗两版。' })]),
+        h('div.field', [h('label', { text: '卡片尺寸' }), sizeWrap,
+          h('div.hint', { text: '小 / 中 / 大三档，改变卡片密度与图标大小。' })]),
         h('div.field', [h('label', { text: '标题' }), title,
           h('div.hint', { text: '显示在导航页左上角。留空 = 「导航页」。' })]),
         h('div.field', [h('label', { text: '副标题' }), subtitle,
@@ -292,10 +568,13 @@ export function NavView(content, ctx = {}) {
         h('div.field', [h('label', { text: '主题色' }),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
             [accent, colorPick, swatches]),
-          h('div.hint', { text: '只影响导航页自己的强调色（卡片悬停边框、搜索框聚焦…），不会改面板其它页面的配色。' })]),
+          h('div.hint', {
+            text: '自定义强调色（卡片悬停边框、搜索框聚焦…），会覆盖所选色系自带的强调色；'
+              + '留空 = 跟随色系。不影响面板其它页面的配色。',
+          })]),
         h('div.field', [h('label', { text: '背景图' }),
           h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [bgUp, bgPick, bgClear]),
-          h('div.hint', { text: 'png / jpg / webp，≤8 MiB。铺满整页（cover），并压一层暗色遮罩保证文字可读。' }),
+          h('div.hint', { text: 'png / jpg / webp，≤8 MiB。铺满整个导航页（cover），并压一层暗色遮罩保证文字可读；设置后色系渐变被它盖住。' }),
           bgPreview]),
       ]),
       footer: (close) => [h('button.btn', { text: '取消', onclick: close }), okBtn],
@@ -303,12 +582,17 @@ export function NavView(content, ctx = {}) {
     okBtn.onclick = async () => {
       okBtn.disabled = true;
       try {
+        const ef = effSettings();
         const saved = await api.navSaveSettings({
           title: title.value.trim(),
           subtitle: subtitle.value.trim(),
           accent: accent.value.trim(),
           background: bgInput.value.trim(),
+          mode: ef.mode,
+          theme: ef.theme,
+          size: ef.size,
         });
+        draft = null;
         if (saved) settings = saved;
         applyAppearance();
         renderToolbar();
@@ -345,7 +629,7 @@ export function NavView(content, ctx = {}) {
       }),
       edit ? h('button.btn.btn-sm', {
         text: '🎨 外观', dataset: { testid: 'nav-appearance' },
-        title: '改标题 / 副标题 / 主题色 / 背景图（独立导航页同样生效）',
+        title: '改外观模式 / 主题色系 / 卡片尺寸 / 标题 / 副标题 / 主题色 / 背景图（独立导航页同样生效）',
         onclick: appearanceForm,
       }) : null,
       edit ? h('button.btn.btn-sm', {
@@ -736,6 +1020,14 @@ export function NavView(content, ctx = {}) {
         okBtn.disabled = false;
       }
     };
+  }
+
+  // 系统主题变化时（自动模式）实时联动；离开页面时摘掉监听，避免切页后叠加。
+  const sysTheme = window.matchMedia('(prefers-color-scheme: dark)');
+  const onSysTheme = () => { if (effSettings().mode === 'auto') applyAppearance(); };
+  sysTheme.addEventListener('change', onSysTheme);
+  if (ctx && typeof ctx.onLeave === 'function') {
+    ctx.onLeave(() => sysTheme.removeEventListener('change', onSysTheme));
   }
 
   renderToolbar();

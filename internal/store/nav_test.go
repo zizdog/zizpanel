@@ -244,3 +244,52 @@ func TestNavIDPreservedAfterDeleteAndReinsert(t *testing.T) {
 		t.Fatalf("显式 id 写入后新建的 id 应大于 5（否则主键会撞），got=%d", next.ID)
 	}
 }
+
+// TestNavSettingsAppearanceRoundTrip：外观设置的存取（含三件套的默认值）。
+//
+// 为什么默认值必须由**数据层**给出：独立别名页（未登录）直接读 /nav/data，
+// 老库里的 nav_settings 没有 mode/theme/size 三行 —— 如果读出来是空串，
+// 访客就会看到一套没有色系/尺寸的页面（或者前端得各自再补一次默认，容易走样）。
+func TestNavSettingsAppearanceRoundTrip(t *testing.T) {
+	st := newNavTestStore(t)
+	ctx := context.Background()
+
+	// 一条都没有：读出来是具体默认值，不是空串。
+	set, err := st.NavSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.Mode != NavDefaultMode || set.Theme != NavDefaultTheme || set.Size != NavDefaultSize {
+		t.Fatalf("默认外观三件套应为 %s/%s/%s，得到 %s/%s/%s",
+			NavDefaultMode, NavDefaultTheme, NavDefaultSize, set.Mode, set.Theme, set.Size)
+	}
+
+	// 存一整套（含空标题 = 恢复默认的语义）。
+	want := NavSettings{
+		Title: "首页", Subtitle: "副标题", Accent: "#3b82f6",
+		Background: "https://example.com/bg.jpg",
+		Mode:       "dark", Theme: "sunset", Size: "l",
+	}
+	if err := st.SaveNavSettings(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.NavSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("回读与保存不一致：\n got=%+v\nwant=%+v", got, want)
+	}
+
+	// 空标题/主题色/背景图是**有效操作**（恢复默认），三件套仍是明确取值。
+	if err := st.SaveNavSettings(ctx, NavSettings{Mode: "auto", Theme: "neon", Size: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.NavSettings(ctx)
+	if got.Title != "" || got.Accent != "" || got.Background != "" {
+		t.Fatalf("清空后应回落到空串，得到 %+v", got)
+	}
+	if got.Mode != "auto" || got.Theme != "neon" || got.Size != "m" {
+		t.Fatalf("清空后三件套应保持显式取值，得到 %+v", got)
+	}
+}
