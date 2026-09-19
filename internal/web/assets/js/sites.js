@@ -25,7 +25,7 @@ import { acmeSslSection } from './certs.js';
 // 保存/重启的语义也只有那一份实现。
 import { configFileModal } from './services.js';
 // 「上传与执行上限」的实现不再单独开弹窗：它现在是「⚙️ 调整配置」里的一个页签
-// （2026-09-22 用户要求把重复入口整合成一个）。渲染实现仍在 views.js 的
+// （用户要求把重复入口整合成一个）。渲染实现仍在 views.js 的
 // renderLimitsInto 里，由 nginxpanel.js 直接复用。
 // 宝塔式「⚙️ 调整配置」（nginx 四页 + 上传与执行上限 + 配置文件 + PHP 环境）。
 import { adjustConfigModal } from './nginxpanel.js';
@@ -552,7 +552,7 @@ export function SitesView(content, ctx = {}) {
 
   // defSiteNotice：默认站点没建好时的**醒目提示条**。
   //
-  // 为什么必须有它（2026-09-22 用户报障"全新安装的面板，没有默认网站！"）：
+  // 为什么必须有它（用户报障"全新安装的面板，没有默认网站！"）：
   // 以前只有工具条上一颗小药丸，而空列表那句提示说的是"新建站点需要
   // nginx+PHP+MySQL" —— 默认站点的事一个字都没提。用户在新机器上看到的
   // 就是"这里什么都没有"，根本不知道该有一个默认站点。
@@ -830,7 +830,7 @@ export function SitesView(content, ctx = {}) {
     };
   }
 
-  // nginxRunButton 是工具条上的「nginx 运行 / nginx 停止」按钮（用户 2026-09-22 要求
+  // nginxRunButton 是工具条上的「nginx 运行 / nginx 停止」按钮（用户要求
   // 用它替换「⋯ 更多」）。它 hover / 聚焦 / 点击时下拉显示原来的二级操作：
   //   🧪 校验 nginx / 🔧 修复 Nginx 环境 / ♻️ 重建全部配置
   //
@@ -910,7 +910,7 @@ export function SitesView(content, ctx = {}) {
     });
 
     // 🔧 修复 nginx 环境：把"面板自己的片段没被加载"这类故障变成一键可修。
-    // 用户 2026-09-22 报障："反向代理用不了了！…unknown "connection_upgrade" variable"
+    // 用户报障："反向代理用不了了！…unknown "connection_upgrade" variable"
     // —— 根因是 brew 重装/升级 nginx 把 nginx.conf 还原成出厂版，conf.d 的 include
     // 与 upgrade map 一起没了。这里补齐并复核 nginx -t，不再让用户去重装 nginx。
     const fixEnv = menuItem('🔧 修复 Nginx 环境',
@@ -1022,7 +1022,7 @@ export function SitesView(content, ctx = {}) {
 
   // defaultSiteModal 是「默认站点」弹窗：说清状态、给一条能走通的路。
   //
-  // 用户 2026-09-21 的要求是"装完就该有一个默认静态站点"。所以这里的按钮
+  // 用户的要求是"装完就该有一个默认静态站点"。所以这里的按钮
   // 顺序刻意按"缺什么先补什么"排：没有 nginx → 先「只安装 Nginx」（不拉 PHP/MySQL）；
   // 有 nginx 但没建 → 「创建默认站点」；已建 → 显示地址与「重建」。
   function defaultSiteModal() {
@@ -1138,7 +1138,7 @@ export function SitesView(content, ctx = {}) {
   // 每一条的「📝 编辑」都复用 services.js 的 configFileModal（同一套文件接口与
   // 保存/重启语义）；文件不存在时按钮照点，编辑器会如实报原因。
   // renderConfigFilesInto 把清单画进「⚙️ 调整配置 → 配置文件」页（原来是独立弹窗
-  // 「网站环境配置文件」，2026-09-22 用户要求合并成一个入口）。
+  // 「网站环境配置文件」，用户要求合并成一个入口）。
   async function renderConfigFilesInto(box) {
     async function load() {
       clear(box);
@@ -1255,7 +1255,7 @@ export function SitesView(content, ctx = {}) {
       // （见 renderList 的空态），两处不同时出现，避免重复入口。
       ...(list.length && lnmpNeeded() ? [lnmpButton(false)] : []),
       // nginx 状态与三个低频操作合成一颗按钮：hover / 聚焦 / 点击都会展开二级菜单
-      // （用户 2026-09-22 要求用它替换「⋯ 更多」，状态本身仍然只来自真实探测）。
+      // （用户要求用它替换「⋯ 更多」，状态本身仍然只来自真实探测）。
       nginxRunButton(),
       // 🏠 默认站点：装完面板就该有的那个静态站点。它同时是列表里的第一行；
       // 这里保留工具条入口，是为了"还没建 / 缺 nginx"时能一键补上。
@@ -1265,7 +1265,7 @@ export function SitesView(content, ctx = {}) {
         onclick: defaultSiteModal,
       }),
       // ⚙️ 调整配置：原来三颗按钮（Nginx 管理 / 上传大小 / 执行时间 / 配置文件）合并成
-      // 这一颗（用户 2026-09-22 要求）。PHP 版本与端点也在里面的一页 ——
+      // 这一颗（用户要求）。PHP 版本与端点也在里面的一页 ——
       // 原来那颗「🐘 PHP 环境 · x/y 运行中」按钮已删除（用户明确要求去掉）。
       h('button.btn.btn-sm', {
         text: '⚙️ 调整配置',
@@ -1283,7 +1283,7 @@ export function SitesView(content, ctx = {}) {
 
   // openAdjustConfig 打开合并后的「⚙️ 调整配置」弹窗。
   //
-  // 页面结构与数据来源（用户 2026-09-22 的合并要求）：
+  // 页面结构与数据来源（用户的合并要求）：
   //   nginx 组（服务 / 性能调整 / 配置修改 / 错误日志）—— nginxpanel.js 自带
   //   上传与执行上限 —— views.js 的 renderLimitsInto（唯一一份实现）
   //   配置文件 / PHP 环境 —— 通过 opts.extra 注入（它们要用到本作用域的站点缓存
@@ -1327,7 +1327,7 @@ export function SitesView(content, ctx = {}) {
 
     // 表格**永远**画出来，第一行是默认站点。
     //
-    // 用户 2026-09-22："默认站点要和宝塔完全一样，安装完用户就可以在网站管理里面
+    // 用户："默认站点要和宝塔完全一样，安装完用户就可以在网站管理里面
     // 看到有这样一个默认站点" —— 所以哪怕 sites 表里一条记录都没有，首页也要有这一行。
     //
     // ⚠️ **不往 sites 表里插记录**：站点模板生成器会按站点记录整份重写 vhost，
@@ -1416,7 +1416,7 @@ export function SitesView(content, ctx = {}) {
     ]);
   }
 
-  // domainLink 把**域名文本本身**做成链接（用户 2026-09-25 明确要求）。
+  // domainLink 把**域名文本本身**做成链接（用户明确要求）。
   //
   // 用户原话：不要 `blog.zizdog.com` / `http://blog.zizdog.com` / `https://blog.zizdog.com`
   // 三种形式都列出来 —— 只显示域名文本本身，并且这段文字本身可点、新标签打开。
@@ -1465,7 +1465,7 @@ export function SitesView(content, ctx = {}) {
     ]);
   }
 
-  // defaultSiteRow 把默认站点画成列表里的第一行（用户 2026-09-22 要求与宝塔一致）。
+  // defaultSiteRow 把默认站点画成列表里的第一行（用户要求与宝塔一致）。
   //
   // 状态只有三种：已就绪 / 还没建好（含缺 nginx、80 端口是别人写的） / 读不到。
   // **读不到就写"状态未知"**，绝不假装已创建。
@@ -1577,7 +1577,7 @@ export function SitesView(content, ctx = {}) {
   // 把"装了哪些版本、各自听在哪、跑没跑、要不要修"一次说清，
   // 并且**每个版本一个修复按钮** —— 多版本共存的排障全靠这一屏。
   //
-  // 它现在是「⚙️ 调整配置 → PHP 环境」那一页：用户 2026-09-22 要求删掉工具条上那颗
+  // 它现在是「⚙️ 调整配置 → PHP 环境」那一页：用户要求删掉工具条上那颗
   // 「🐘 PHP 环境 · 1/1 运行中」按钮，把版本/端点信息并进调整配置弹窗。
   // 依旧画进调用方给的容器 —— 同一份渲染既能被弹窗用，也能被将来的别处用。
   async function renderPHPEnvInto(box) {
@@ -1925,6 +1925,7 @@ export function SitesView(content, ctx = {}) {
     });
     const port = h('input.input', { type: 'number', min: '1', max: '65535', value: '80' });
     const autoindex = h('input', { type: 'checkbox' });
+    const proxyCache = h('input', { type: 'checkbox' });
     const rootPreview = h('div.hint', { text: '' });
 
     const updatePreview = () => {
@@ -1969,6 +1970,7 @@ export function SitesView(content, ctx = {}) {
           root: root.value.trim(),
           listen_port: portNum,
           autoindex: autoindex.checked,
+          proxy_cache: proxyCache.checked,
         });
         toast(`站点 ${d} 创建成功`, 'ok');
         if (r && (r.root_verified === false || r.listen_port_verified === false)) {
@@ -2012,6 +2014,17 @@ export function SitesView(content, ctx = {}) {
             text: '默认关闭；目录里没有首页文件时才会列出文件',
             title: '生成的 vhost 是 server 级 autoindex on，对本站所有目录生效。' +
               '有 index.php/index.html 的目录仍优先显示首页，不受影响。',
+          }),
+        ]),
+        h('div.field', [
+          h('label', { text: '回源缓存' }),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+            proxyCache, h('span', { style: { fontSize: '13px' }, text: '把上游文件缓存到本地，省流量、提速' }),
+          ]),
+          h('div.hint', {
+            text: '改上游内容后可能要等缓存过期才更新',
+            title: '开启后由面板声明 nginx 缓存区（zp_site_<id>），server 级 proxy_cache 会继承到本站所有回源 location。' +
+              '200/301/302 缓存 7 天、404 缓存 1 分钟；上游出错时先给旧副本。关闭后配置与开启前逐字一致。',
           }),
         ]),
         h('div.field', [
@@ -2079,6 +2092,7 @@ export function SitesView(content, ctx = {}) {
         placeholder: wwwRoot ? `留空用 ${wwwRoot}/${site.domain}` : '留空用 网站根目录/<域名>',
       });
       const autoindex = h('input', { type: 'checkbox', checked: !!site.autoindex });
+      const proxyCache = h('input', { type: 'checkbox', checked: !!site.proxy_cache });
       const port = h('input.input', {
         type: 'number', min: '1', max: '65535',
         value: String(site.listen_port || 80),
@@ -2098,6 +2112,7 @@ export function SitesView(content, ctx = {}) {
             const r = await api.siteUpdate(domain, {
               aliases: aliases.value.trim(), remark: remark.value.trim(), enabled: enabled.checked,
               root: root.value.trim(), listen_port: portNum, autoindex: autoindex.checked,
+              proxy_cache: proxyCache.checked,
             });
             if (r && r.site) {
               Object.assign(site, r.site);
@@ -2108,6 +2123,9 @@ export function SitesView(content, ctx = {}) {
             if (r && (r.root_verified === false || r.listen_port_verified === false)) {
               const why = r.root_verify_error || r.listen_port_verify_error || '';
               toast(`有改动未复核${why ? '：' + why : ''}`, 'warn', 9000);
+            }
+            if (r && r.cache_enabled && r.cache_verified === false) {
+              toast(`回源缓存未复核${r.cache_verify_error ? '：' + r.cache_verify_error : ''}`, 'warn', 9000);
             }
             load();
           } catch (e) { toast(e.message, 'err', 9000); }
@@ -2139,6 +2157,17 @@ export function SitesView(content, ctx = {}) {
             text: '默认关闭；目录里没有首页文件时才会列出文件',
             title: '生成的 vhost 是 server 级 autoindex on，对本站所有目录生效。' +
               '有 index.php/index.html 的目录仍优先显示首页，不受影响。',
+          }),
+        ]),
+        h('div.field', [
+          h('label', { text: '回源缓存' }),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+            proxyCache, h('span', { style: { fontSize: '13px' }, text: '把上游文件缓存到本地，省流量、提速' }),
+          ]),
+          h('div.hint', {
+            text: '改上游内容后可能要等缓存过期才更新',
+            title: '开启后由面板声明 nginx 缓存区（zp_site_<id>），server 级 proxy_cache 会继承到本站所有回源 location。' +
+              '200/301/302 缓存 7 天、404 缓存 1 分钟；上游出错时先给旧副本。关闭后配置与开启前逐字一致。',
           }),
         ]),
         h('div.field', [h('label', { text: '备注' }), remark]),

@@ -38,6 +38,10 @@ type Site struct {
 	// 老站点 BaseRoot="" 时行为与加这个字段之前逐字一致。
 	BaseRoot  string `json:"base_root"`
 	AutoIndex bool   `json:"autoindex"` // 目录索引，默认关
+	// ProxyCache 是站点级回源缓存开关（默认关）。开启后 vhost 的 server 级写
+	// proxy_cache，extra_conf 里的回源 location 会继承它；关闭时生成物与加这个
+	// 字段之前逐字一致（一个 proxy_cache 指令都不写）。
+	ProxyCache bool `json:"proxy_cache"`
 	// ListenPort 是站点明文 HTTP 的监听端口（默认 80）。老站点字段缺失/为 0 时按 80，
 	// 生成的 vhost 与加这个字段之前逐字一致。
 	ListenPort  int    `json:"listen_port"`
@@ -366,6 +370,15 @@ func (s *Site) Generate(opt Options) (string, error) {
 	// 得到的是 413 而不是 PHP 的错误（这就是那次报障的根因）。
 	b.WriteString("\tclient_max_body_size " + bodyLimit + ";\n")
 
+	// 回源缓存写在 server 级：proxy_cache* 会被本站所有 location 继承（含用户在
+	// extra_conf 里写的回源 location）——这是本次选定的机制。关闭 = 一行都不写。
+	if s.ProxyCache {
+		if s.ID <= 0 {
+			return "", fmt.Errorf("%w: 站点「%s」还没有保存，无法开启回源缓存", ErrInvalid, s.Domain)
+		}
+		b.WriteString(cacheServerBlock(s.ID))
+	}
+
 	if s.SSLEnabled {
 		if s.SSLCert == "" || s.SSLKey == "" {
 			return "", fmt.Errorf("%w: 已开启 SSL 但缺少证书路径", ErrInvalid)
@@ -451,7 +464,13 @@ func (s *Site) Generate(opt Options) (string, error) {
 	}
 
 	b.WriteString("}\n")
-	return b.String(), nil
+	out := b.String()
+	if s.ProxyCache {
+		// 坑 189：proxy_buffering off 时 nginx 根本不写缓存。开缓存必须把 extra_conf
+		// 里的 off 改写成 on，否则这个开关就是谎报成功。
+		out = reProxyBufferingOff.ReplaceAllString(out, "proxy_buffering on;")
+	}
+	return out, nil
 }
 
 // UpgradeMapName 是 WebSocket 升级所需的 map 变量片段文件名。
@@ -748,13 +767,13 @@ func NewManager(st *store.Store, opt Options) *Manager {
 // Options 返回生成配置所用的选项（面板保存配置时需要保持一致）。
 func (m *Manager) Options() Options { return m.opt }
 
-const siteCols = `id,domain,base_root,autoindex,listen_port,aliases,root,php_version,rewrite,ssl_enabled,ssl_cert,ssl_key,
+const siteCols = `id,domain,base_root,autoindex,proxy_cache,listen_port,aliases,root,php_version,rewrite,ssl_enabled,ssl_cert,ssl_key,
 	ssl_provider,ssl_expires,proxy_pass,extra_conf,enabled,remark,created_at,updated_at`
 
 func scanSite(sc interface{ Scan(...any) error }) (*Site, error) {
 	var s Site
-	var ssl, enabled, autoindex int
-	err := sc.Scan(&s.ID, &s.Domain, &s.BaseRoot, &autoindex, &s.ListenPort, &s.Aliases, &s.Root, &s.PHPVersion, &s.Rewrite,
+	var ssl, enabled, autoindex, proxyCache int
+	err := sc.Scan(&s.ID, &s.Domain, &s.BaseRoot, &autoindex, &proxyCache, &s.ListenPort, &s.Aliases, &s.Root, &s.PHPVersion, &s.Rewrite,
 		&ssl, &s.SSLCert, &s.SSLKey, &s.SSLProvider, &s.SSLExpires, &s.ProxyPass,
 		&s.ExtraConf, &enabled, &s.Remark, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
@@ -763,6 +782,7 @@ func scanSite(sc interface{ Scan(...any) error }) (*Site, error) {
 	s.SSLEnabled = ssl == 1
 	s.Enabled = enabled == 1
 	s.AutoIndex = autoindex == 1
+	s.ProxyCache = proxyCache == 1
 	return &s, nil
 }
 
@@ -846,9 +866,9 @@ func (m *Manager) Create(ctx context.Context, s *Site) error {
 	}
 
 	res, err := m.st.DB().ExecContext(ctx,
-		`INSERT INTO sites(domain,base_root,autoindex,listen_port,aliases,root,php_version,rewrite,proxy_pass,extra_conf,remark,enabled)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		s.Domain, s.BaseRoot, boolToInt(s.AutoIndex), s.EffectiveListenPort(), s.Aliases, s.Root, s.PHPVersion, s.Rewrite,
+		`INSERT INTO sites(domain,base_root,autoindex,proxy_cache,listen_port,aliases,root,php_version,rewrite,proxy_pass,extra_conf,remark,enabled)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		s.Domain, s.BaseRoot, boolToInt(s.AutoIndex), boolToInt(s.ProxyCache), s.EffectiveListenPort(), s.Aliases, s.Root, s.PHPVersion, s.Rewrite,
 		s.ProxyPass, s.ExtraConf, s.Remark, boolToInt(s.Enabled))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -886,11 +906,11 @@ func (m *Manager) Update(ctx context.Context, s *Site) error {
 		}
 	}
 	_, err := m.st.DB().ExecContext(ctx,
-		`UPDATE sites SET aliases=?,base_root=?,autoindex=?,listen_port=?,root=?,php_version=?,rewrite=?,proxy_pass=?,
+		`UPDATE sites SET aliases=?,base_root=?,autoindex=?,proxy_cache=?,listen_port=?,root=?,php_version=?,rewrite=?,proxy_pass=?,
 		 extra_conf=?,remark=?,enabled=?,ssl_enabled=?,ssl_cert=?,ssl_key=?,
 		 ssl_provider=?,ssl_expires=?,updated_at=datetime('now','localtime')
 		 WHERE id=?`,
-		s.Aliases, s.BaseRoot, boolToInt(s.AutoIndex), s.EffectiveListenPort(), s.Root, s.PHPVersion, s.Rewrite, s.ProxyPass, s.ExtraConf,
+		s.Aliases, s.BaseRoot, boolToInt(s.AutoIndex), boolToInt(s.ProxyCache), s.EffectiveListenPort(), s.Root, s.PHPVersion, s.Rewrite, s.ProxyPass, s.ExtraConf,
 		s.Remark, boolToInt(s.Enabled), boolToInt(s.SSLEnabled), s.SSLCert, s.SSLKey,
 		s.SSLProvider, s.SSLExpires, s.ID)
 	return err

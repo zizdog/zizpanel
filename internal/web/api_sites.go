@@ -101,7 +101,7 @@ func (s *Server) callHelper(ctx context.Context, args ...string) (map[string]any
 
 // writeVhost 把配置写入 nginx vhost 目录（经助手，含语法校验与回滚）。
 // 写前先确保 nginx 基础片段已加载：brew 重装/升级会把 nginx.conf 还原成出厂版、
-// 没有 conf.d include ⇒ 反代规则过不了 nginx -t（2026-09-22 报障）；报变量未定义时自愈重试一次。
+// 没有 conf.d include ⇒ 反代规则过不了 nginx -t（此前报障）；报变量未定义时自愈重试一次。
 func (s *Server) writeVhost(ctx context.Context, domain, content string) error {
 	s.ensureNginxEnvOnStart(ctx)
 	err := s.writeVhostOnce(ctx, domain, content)
@@ -193,9 +193,41 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err != nil {
 		return err
 	}
+	// 开了回源缓存就先把缓存目录建好并交给真实 worker：拿不到用户如实失败，绝不猜（坑 173）。
+	if site.ProxyCache {
+		if _, err := s.ensureSiteCacheDir(site.ID); err != nil {
+			return err
+		}
+	}
 	snap := s.snapshotVhost(site.Domain)
-	if err := siteWriteVhostFn(s, ctx, site.Domain, content); err != nil {
+	// ① 过渡态：旧 vhost 可能仍引用本站缓存区，先保住声明，否则助手跑的 nginx -t
+	// 会报 unknown "…" zone 并把这次写入整份回滚。
+	zoneSnap, _, err := s.applyCacheZones(ctx, content)
+	if err != nil {
 		return err
+	}
+	if err := siteWriteVhostFn(s, ctx, site.Domain, content); err != nil {
+		return s.restoreCacheConf(zoneSnap, err)
+	}
+	// 助手以 root 跑 nginx -t 会以 root 建出 zone 目录，这里补回真实 worker 归属
+	// （否则 worker 写不进去、缓存永远是 MISS：坑 189）。
+	if site.ProxyCache {
+		if _, err := s.ensureSiteCacheDir(site.ID); err != nil {
+			return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+				s.restoreCacheConf(zoneSnap, err))
+		}
+	}
+	// ② 新 vhost 已落盘：只保留仍被引用的缓存区（关缓存/删站点后声明自然收敛）。
+	if _, changed, zerr := s.applyCacheZones(ctx, ""); zerr != nil {
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+			s.restoreCacheConf(zoneSnap, zerr))
+	} else if changed {
+		// 删声明本身不会让配置非法，但仍让 nginx 自己说话一次（不能只看"我写完了"）。
+		if terr := proxyCacheTestFn(s, ctx); terr != nil {
+			return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
+				s.restoreCacheConf(zoneSnap,
+					fmt.Errorf("缓存区声明已更新，但 nginx 配置校验未通过：%w", terr)))
+		}
 	}
 	// nginx -t 会以 root 创建 access_log/error_log，而 nginx master 以真实用户运行，
 	// reload 时打不开 → 配置根本没加载（站点 404），reload 退出码却仍是 0。
@@ -205,7 +237,7 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	}
 	if err := siteReloadFn(s, ctx); err != nil {
 		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
-			fmt.Errorf("配置已写入但 nginx 重载失败: %w", err))
+			s.restoreCacheConf(zoneSnap, fmt.Errorf("配置已写入但 nginx 重载失败: %w", err)))
 	}
 	// reload 成功 ≠ 新配置生效：nginx 读配置失败（日志/证书打不开）时只写 [emerg]，
 	// nginx -s reload 退出码依然是 0；不复核就必然"面板说成功、用户打开 404/502"。
@@ -518,7 +550,7 @@ func humanWait(d time.Duration) string {
 }
 
 // existingLogPath 只在文件真的存在时返回路径，否则返回空串 —— 判据必须是"文件在不在"：
-// 绝不拿推导出来的字符串冒充真实路径，读不到就让界面显示"路径未知"（用户 2026-09-22 要求不写死）。
+// 绝不拿推导出来的字符串冒充真实路径，读不到就让界面显示"路径未知"（用户要求不写死）。
 func existingLogPath(p string) string {
 	if strings.TrimSpace(p) == "" {
 		return ""
@@ -709,6 +741,155 @@ func (s *Server) verifyExistingSiteRoot(root string) error {
 	return sites.DirReadableBy(root, uid, gid)
 }
 
+// ---------- 站点级回源缓存 ----------
+//
+// 与反向代理缓存同一套机制：缓存区声明都在 conf.d/zizpanel-cache.conf（http 上下文），
+// 站点只在 server 级引用 zp_site_<id>；目录在 <DataDir>/proxy-cache/zp_site_<id>。
+// 关闭时 vhost 里一个 proxy_cache 指令都没有（与加这个开关之前逐字一致）。
+
+// siteCacheRoot 站点缓存目录根：与反代共用 <DataDir>/proxy-cache。
+func (s *Server) siteCacheRoot() string { return s.proxyCacheRoot() }
+
+// ensureSiteCacheDir 建站点缓存区目录并把归属交给 nginx worker **真实**用户；
+// 读不到用户就失败，绝不猜 nobody（坑 173/189）。目录必须先存在，否则 nginx -t [emerg]。
+func (s *Server) ensureSiteCacheDir(id int64) (string, error) {
+	if id <= 0 {
+		return "", errors.New("站点还没有保存，无法创建缓存目录")
+	}
+	root, err := s.ensureProxyCacheDir() // 建根 + 复核 worker 用户 + chown 根与已有子目录
+	if err != nil {
+		return "", err
+	}
+	dir := sites.CacheZoneDir(root, id)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", fmt.Errorf("创建站点缓存目录失败：%v", err)
+	}
+	name, uid, gid, how, ok := priv.NginxWorkerOwner(s.Cfg.NginxConf)
+	if !ok {
+		return "", fmt.Errorf("拿不到 nginx worker 用户（%s）：站点缓存目录 %s 已建好，但没有改归属"+
+			"（猜一个用户是害你）。请先启动 nginx，或在 nginx.conf 里写上 user 指令后重试", how, dir)
+	}
+	if err := os.Lchown(dir, uid, gid); err != nil {
+		return "", fmt.Errorf("把站点缓存目录交给 nginx worker 用户 %s 失败：%v", name, err)
+	}
+	return dir, nil
+}
+
+// clearSiteCache 清空一个站点的缓存目录，返回释放的字节数；目录不存在视为已经空的。
+func (s *Server) clearSiteCache(site *sites.Site) (int64, string, error) {
+	if site == nil || site.ID <= 0 {
+		return 0, "", errors.New("站点不存在，无法清空缓存")
+	}
+	if strings.TrimSpace(s.siteCacheRoot()) == "" {
+		return 0, "", errors.New("数据目录未配置，无法定位缓存目录")
+	}
+	dir := sites.CacheZoneDir(s.siteCacheRoot(), site.ID)
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return 0, dir, nil
+		}
+		return 0, dir, fmt.Errorf("读取缓存目录失败：%v", err)
+	}
+	freed, err := dirSize(dir)
+	if err != nil {
+		return 0, dir, fmt.Errorf("统计缓存大小失败：%v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return 0, dir, fmt.Errorf("清空缓存目录失败：%v", err)
+	}
+	// 回读：目录必须真的没了，否则就是我们自己谎报"已清空"。
+	if _, err := os.Stat(dir); err == nil {
+		return 0, dir, fmt.Errorf("清空后缓存目录 %s 仍然存在", dir)
+	}
+	return freed, dir, nil
+}
+
+// siteCacheZonesFromDisk 返回磁盘上的站点 vhost 引用到的站点缓存区（只认 zp_site_）。
+// 只扫数据库里存在的站点的 <域名>.conf，避免把用户自建 vhost 也卷进面板的声明。
+func (s *Server) siteCacheZonesFromDisk(ctx context.Context) []string {
+	list, err := s.siteMgr().List(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, st := range list {
+		b, rerr := os.ReadFile(filepath.Join(s.Cfg.VhostDir, st.Domain+".conf"))
+		if rerr != nil {
+			continue
+		}
+		for _, z := range zonesFromVhostText(string(b)) {
+			if _, ok := sites.CacheZoneID(z); ok {
+				out = append(out, z)
+			}
+		}
+	}
+	return out
+}
+
+// siteCacheView 是"缓存开关有没有真的生效"的只读快照（读不到就如实标未复核）。
+func (s *Server) siteCacheView(site *sites.Site) map[string]any {
+	view := map[string]any{
+		"enabled": false, "zone": "", "dir": "", "dir_exists": false,
+		"verified": false, "note": "",
+	}
+	if site == nil {
+		return view
+	}
+	view["enabled"] = site.ProxyCache
+	zone := sites.CacheZoneName(site.ID)
+	dir := sites.CacheZoneDir(s.siteCacheRoot(), site.ID)
+	view["zone"], view["dir"] = zone, dir
+	if st, serr := os.Stat(dir); serr == nil && st.IsDir() {
+		view["dir_exists"] = true
+	}
+	if !site.ProxyCache {
+		return view
+	}
+	if !site.Enabled {
+		view["note"] = "站点已停用：缓存目前不生效"
+		return view
+	}
+	conf, cerr := os.ReadFile(s.proxyCacheConfPath())
+	if cerr != nil {
+		view["note"] = "未复核：读不到 " + s.proxyCacheConfPath()
+		return view
+	}
+	hasDecl := strings.Contains(string(conf), "keys_zone="+zone+":") &&
+		strings.Contains(string(conf), "max_size="+sites.SiteCacheDefaultSize+" ")
+	vhostPath := filepath.Join(s.Cfg.VhostDir, site.Domain+".conf")
+	vh, verr := siteReadVhostFn(s, vhostPath)
+	if verr != nil {
+		view["note"] = "未复核：读不到 nginx 配置 " + vhostPath
+		return view
+	}
+	hasZone := strings.Contains(string(vh), "proxy_cache "+zone+";")
+	hasValid := strings.Contains(string(vh), "proxy_cache_valid 200 301 302 "+sites.SiteCacheValid+";")
+	hasOff := sites.HasProxyBufferingOff(string(vh))
+	view["decl_ok"], view["vhost_ok"] = hasDecl, hasZone && hasValid
+	if hasDecl && hasZone && hasValid && !hasOff {
+		view["verified"] = true
+		return view
+	}
+	view["note"] = fmt.Sprintf("未复核：生成的配置与保存值不一致（缓存区声明=%v、server 级指令=%v、有效期=%v、残留 proxy_buffering off=%v）",
+		hasDecl, hasZone, hasValid, hasOff)
+	return view
+}
+
+// siteCacheConfirm 给接口返回缓存生效值的扁平字段（读不到就如实说未复核）。
+func (s *Server) siteCacheConfirm(site *sites.Site) map[string]any {
+	v := s.siteCacheView(site)
+	verified, _ := v["verified"].(bool)
+	view := map[string]any{
+		"cache_enabled":      v["enabled"],
+		"cache_verified":     verified,
+		"cache_verify_error": v["note"],
+		"cache_zone":         v["zone"],
+		"cache_dir":          v["dir"],
+		"cache_dir_exists":   v["dir_exists"],
+	}
+	return view
+}
+
 // ---------- HTTP 接口 ----------
 
 func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
@@ -843,6 +1024,8 @@ type siteCreateReq struct {
 	Root string `json:"root"`
 	// AutoIndex 目录索引开关，默认关。
 	AutoIndex bool `json:"autoindex"`
+	// ProxyCache 站点级回源缓存开关，默认关。
+	ProxyCache bool `json:"proxy_cache"`
 	// ListenPort 明文 HTTP 监听端口；nil = 默认 80，显式 0/负数会被拒绝。
 	ListenPort *int `json:"listen_port"`
 	// CreateDir 为 false 时不创建目录（站点根目录可能已存在）
@@ -903,6 +1086,7 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		BaseRoot:   baseRoot,
 		Root:       runRoot,
 		AutoIndex:  req.AutoIndex,
+		ProxyCache: req.ProxyCache,
 		ListenPort: listenPort,
 		PHPVersion: req.PHPVersion,
 		Rewrite:    req.Rewrite,
@@ -958,13 +1142,16 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "site_create", site.Domain,
-		fmt.Sprintf("根目录=%s 端口=%d PHP=%s 伪静态=%s 目录索引=%v",
-			runRoot, listenPort, req.PHPVersion, req.Rewrite, req.AutoIndex), true, "")
+		fmt.Sprintf("根目录=%s 端口=%d PHP=%s 伪静态=%s 目录索引=%v 回源缓存=%v",
+			runRoot, listenPort, req.PHPVersion, req.Rewrite, req.AutoIndex, req.ProxyCache), true, "")
 	resp := map[string]any{"site": site, "root": runRoot, "listen_port": listenPort}
 	for k, v := range s.siteRootConfirm(site) {
 		resp[k] = v
 	}
 	for k, v := range s.sitePortConfirm(site) {
+		resp[k] = v
+	}
+	for k, v := range s.siteCacheConfirm(site) {
 		resp[k] = v
 	}
 	ok(w, resp)
@@ -1069,6 +1256,7 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 		"presets":      sites.RewritePresets,
 		"php_versions": s.detectPHPVersions(r.Context()),
 		"ssl":          s.siteSSLView(site),
+		"cache":        s.siteCacheView(site),
 	})
 }
 
@@ -1409,6 +1597,10 @@ type siteUpdateReq struct {
 	Root *string `json:"root"`
 	// AutoIndex 非 nil 时才改目录索引开关。
 	AutoIndex *bool `json:"autoindex"`
+	// ProxyCache 非 nil 时才改回源缓存开关（关闭时不产生任何 proxy_cache 指令/缓存区）。
+	ProxyCache *bool `json:"proxy_cache"`
+	// CacheClear 是"清空本站缓存"动作位（只清文件，不改配置、不重载）。
+	CacheClear *bool `json:"cache_clear"`
 	// ListenPort 非 nil 时才改监听端口（1-65535；0/负数会被拒绝）。
 	ListenPort *int `json:"listen_port"`
 }
@@ -1424,6 +1616,19 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	var req siteUpdateReq
 	if err := decode(r, &req); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// "只清缓存"：不动配置、不重载（nginx 读不到被删的文件会回源重取）。
+	if req.CacheClear != nil && *req.CacheClear {
+		freed, dir, cerr := s.clearSiteCache(site)
+		if cerr != nil {
+			fail(w, http.StatusInternalServerError, "清空缓存失败："+cerr.Error())
+			return
+		}
+		s.audit(r, "site_cache_clear", domain,
+			fmt.Sprintf("清空站点缓存 %s（释放 %.1f MB）", dir, float64(freed)/1024/1024), true, "")
+		ok(w, map[string]any{"cleared": true, "freed_bytes": freed, "dir": dir,
+			"msg": fmt.Sprintf("已清空缓存（释放 %.1f MB）", float64(freed)/1024/1024)})
 		return
 	}
 
@@ -1451,6 +1656,9 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AutoIndex != nil {
 		site.AutoIndex = *req.AutoIndex
+	}
+	if req.ProxyCache != nil {
+		site.ProxyCache = *req.ProxyCache
 	}
 	if req.ListenPort != nil {
 		// 只有真要改端口时才校验：否则"端口后来被别的应用占了"会连带锁死改备注这类无关编辑。
@@ -1523,8 +1731,17 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 停用：从 nginx 移除配置并重载
-		if _, err := s.callHelper(r.Context(), "vhost-delete", domain); err != nil {
+		delErr := error(nil)
+		if err := siteDeleteVhostFn(s, r.Context(), domain); err != nil {
+			delErr = err
 			s.Log.Warn("删除 vhost 失败: %v", err)
+		}
+		// vhost 真的没了才收敛缓存区声明；删除失败还留着那份 vhost 时保留声明，
+		// 否则下一次 nginx -t 会报 unknown zone。
+		if delErr == nil {
+			if _, _, zerr := s.applyCacheZones(r.Context(), ""); zerr != nil {
+				s.Log.Warn("站点 %s 停用后清理缓存区声明失败: %v", domain, zerr)
+			}
 		}
 		if err := s.nginxReload(r.Context()); err != nil {
 			s.Log.Warn("重载 nginx 失败: %v", err)
@@ -1532,8 +1749,8 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "site_update", domain,
-		fmt.Sprintf("更新站点配置（根目录=%s 端口=%d 目录索引=%v）",
-			site.Root, site.EffectiveListenPort(), site.AutoIndex), true, "")
+		fmt.Sprintf("更新站点配置（根目录=%s 端口=%d 目录索引=%v 回源缓存=%v）",
+			site.Root, site.EffectiveListenPort(), site.AutoIndex, site.ProxyCache), true, "")
 	resp := map[string]any{"site": site}
 	if site.Enabled {
 		for k, v := range s.siteRootConfirm(site) {
@@ -1542,6 +1759,9 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 		for k, v := range s.sitePortConfirm(site) {
 			resp[k] = v
 		}
+	}
+	for k, v := range s.siteCacheConfirm(site) {
+		resp[k] = v
 	}
 	ok(w, resp)
 }
@@ -1557,15 +1777,29 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.callHelper(r.Context(), "vhost-delete", domain); err != nil {
+	delErr := error(nil)
+	if err := siteDeleteVhostFn(s, r.Context(), domain); err != nil {
+		delErr = err
 		s.Log.Warn("删除 vhost 失败: %v", err)
 	}
 	if err := mgr.Delete(r.Context(), domain); err != nil {
 		fail(w, http.StatusInternalServerError, "删除站点记录失败: "+err.Error())
 		return
 	}
+	// 站点没了：收敛它的缓存区声明（vhost 删除成功才收敛，否则保留声明保住残留 vhost）。
+	if delErr == nil {
+		if _, _, zerr := s.applyCacheZones(r.Context(), ""); zerr != nil {
+			s.Log.Warn("清理站点 %s 的缓存区声明失败: %v", domain, zerr)
+		}
+	}
 	if err := s.nginxReload(r.Context()); err != nil {
 		s.Log.Warn("重载 nginx 失败: %v", err)
+	}
+	// 缓存文件也一起清掉：站点都没了，留着只占磁盘（清不掉如实报出来，不谎报已删除）。
+	cacheClearErr := ""
+	if _, _, cerr := s.clearSiteCache(site); cerr != nil {
+		cacheClearErr = cerr.Error()
+		s.Log.Warn("清理站点 %s 的缓存目录失败：%v", domain, cerr)
 	}
 
 	var filesMsg string
@@ -1586,7 +1820,13 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 	detail := fmt.Sprintf("删除站点（根目录=%s，SSL=%v，PHP=%s）%s",
 		site.Root, site.SSLEnabled, site.PHPVersion, filesMsg)
 	s.audit(r, "site_delete", domain, detail, true, "")
-	ok(w, map[string]any{"msg": "站点已删除", "files": filesMsg})
+	resp := map[string]any{"msg": "站点已删除", "files": filesMsg}
+	if cacheClearErr != "" {
+		// 站点确实删了，但缓存目录没清掉：如实报出来，别让用户以为磁盘已经干净。
+		resp["cache_clear_error"] = cacheClearErr
+		resp["msg"] = "站点已删除；但缓存文件没清掉：" + cacheClearErr
+	}
+	ok(w, resp)
 }
 
 // ---------- SSL ----------
@@ -1974,13 +2214,13 @@ func (s *Server) Startup(ctx context.Context) {
 	// 启动路径上不该引入额外的网络等待。
 	s.startCertRenewal(ctx)
 
-	// 安装后自动建一个纯静态默认站点（用户 2026-09-21 要求"装完就有"），幂等：
+	// 安装后自动建一个纯静态默认站点（用户要求"装完就有"），幂等：
 	// 成功过只做一次现场复核，没有 nginx 就如实记"等待 nginx"。必须在
 	// reconcileForwarders 之后，否则 vhost 里的 proxy_pass 会指向旧回环端口。
 	s.ensureDefaultSiteOnStart(ctx)
 
 	// 默认站点持续自愈：新机器是先装面板再装 nginx，启动那次检查必然"没有 nginx"，
-	// 没有这条巡检就再也没人建默认站点（2026-09-22 报障）。判据见 maybeEnsureDefaultSite。
+	// 没有这条巡检就再也没人建默认站点（此前报障）。判据见 maybeEnsureDefaultSite。
 	go s.watchWebEnv(ctx)
 
 	// 空闲终端会话回收：
@@ -2015,7 +2255,7 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 	// ① 环境片段（conf.d include / WebSocket upgrade map）。
 	//
 	// ⚠️ 三步必须互不遮挡：过去"环境一变就 return"，于是同一轮的 ②③ 永远轮不到
-	//（新机器是装完面板才装 nginx），表现就是 2026-09-22 报的"导入数据库卡死"
+	//（新机器是装完面板才装 nginx），表现就是此前报的"导入数据库卡死"
 	//（nginx 还是出厂 1m、client_body_temp 属主也不对）。
 	msg, err := priv.EnsureNginxEnv()
 	if err != nil {
@@ -2132,7 +2372,7 @@ func (s *Server) ensureNginxRuntimeDirs() {
 
 // healWebEnv 是"环境层面自愈"的总入口：nginx 侧 + PHP 侧一次做完。
 // 面板启动、任何任务收尾（launchTask）、默认站点巡检三处都触发同一入口 ——
-// "启动之后才装 nginx/PHP"暴露的问题，只在启动时跑一次是覆盖不到的（2026-09-22 报障）。
+// "启动之后才装 nginx/PHP"暴露的问题，只在启动时跑一次是覆盖不到的（此前报障）。
 func (s *Server) healWebEnv(ctx context.Context) {
 	s.ensureNginxEnvOnStart(ctx)
 	s.ensurePHPLimitsOnStart(ctx)
@@ -2140,7 +2380,7 @@ func (s *Server) healWebEnv(ctx context.Context) {
 
 // ensurePHPLimitsOnStart 把面板配置的上传/执行上限落到已装 PHP 版本的
 // conf.d/99-zizpanel-limits.ini（幂等）。新机器是先装面板再装 PHP、启动检查早过了，
-// PHP 一直是出厂值（2M/8M/30s），导入稍大 SQL 被掐死（2026-09-22 报障）。
+// PHP 一直是出厂值（2M/8M/30s），导入稍大 SQL 被掐死（此前报障）。
 //
 // 只在片段不存在时创建（片段语义是"删掉即恢复出厂限制"），且只在真的写入后重启。
 func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {

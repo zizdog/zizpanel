@@ -127,7 +127,8 @@ func (r *Rule) CacheZoneDirFor() string {
 }
 
 // CacheConfHeader 是缓存区声明文件的头部两行（内容为空时整个文件会被删除）。
-const CacheConfHeader = "# 由 ZizPanel「反向代理缓存」生成 —— 请勿手工编辑（会被面板覆盖）\n" +
+// 站点级回源缓存（zp_site_<id>）与反代规则共用这个文件，所以标题写"回源缓存"。
+const CacheConfHeader = "# 由 ZizPanel「回源缓存」生成 —— 请勿手工编辑（会被面板覆盖）\n" +
 	"# proxy_cache_path 只能在 http 上下文；本文件由 nginx.conf 的 include conf.d/*.conf 加载。\n"
 
 // GenerateCacheConf 生成缓存区声明文件的内容。

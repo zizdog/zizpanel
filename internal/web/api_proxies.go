@@ -51,7 +51,7 @@ func (s *Server) proxyRepo() *proxies.Repository {
 
 // 反向代理「需要用户名密码」（HTTP Basic Auth）：每条规则可单独开启，否则 401。
 // 真相存 settings 表键 `proxy_auth.<id>`（**不新增 DB 列**），applyProxy 生成配置前装回 Rule。
-// apr1 哈希：本机 nginx 1.31.5 实测**不支持 bcrypt**（2026-09-25 实测）；仓库里只有哈希，明文绝不落盘/进日志。
+// apr1 哈希：本机 nginx 1.31.5 实测**不支持 bcrypt**；仓库里只有哈希，明文绝不落盘/进日志。
 
 const proxyAuthSettingPrefix = "proxy_auth."
 
@@ -684,11 +684,21 @@ func zoneFromDeclLine(line string) string {
 	return m[1]
 }
 
+// panelCacheZone 只认面板自己命名的缓存区（反代 zp_proxy_<id> / 站点 zp_site_<id>）。
+// 用户自己写的 `proxy_cache 别的区;` 一律忽略，不替他声明、也不因此拦下保存。
+func panelCacheZone(z string) bool {
+	if _, ok := proxies.CacheZoneID(z); ok {
+		return true
+	}
+	_, ok := sites.CacheZoneID(z)
+	return ok
+}
+
 // cacheZonesContent 生成缓存区声明文件的内容。
 //
-// 判据是"**磁盘上真的被引用**"（只扫面板生成的反代 vhost，绝不去猜别的文件），
-// 而不是数据库状态：这样删除/停用规则后声明自然收敛，也不会和用户自己的
-// proxy_cache_path 撞出 duplicate zone。
+// 判据是"**磁盘上真的被引用**"（反代 proxy-<id>.conf 与站点 <域名>.conf，绝不去猜别的文件），
+// 而不是数据库状态：这样删除/停用规则/站点后声明自然收敛，也不会和用户自己的
+// proxy_cache_path 撞出 duplicate zone（只声明 zp_proxy_<id> / zp_site_<id>）。
 // extraVhostText 是本次**即将**落盘的 vhost 内容 —— 写盘前旧 vhost 还在磁盘上，
 // 它引用的缓存区必须继续有声明，否则提权助手跑的 `nginx -t` 会报 unknown zone。
 func (s *Server) cacheZonesContent(ctx context.Context, extraVhostText string) (string, error) {
@@ -710,11 +720,19 @@ func (s *Server) cacheZonesContent(ctx context.Context, extraVhostText string) (
 			continue
 		}
 		for _, z := range zonesFromVhostText(string(b)) {
-			zones[z] = true
+			if panelCacheZone(z) {
+				zones[z] = true
+			}
 		}
 	}
-	for _, z := range zonesFromVhostText(extraVhostText) {
+	// 站点 vhost（<域名>.conf）的 server 级也可能引用本站缓存区（zp_site_<id>）。
+	for _, z := range s.siteCacheZonesFromDisk(ctx) {
 		zones[z] = true
+	}
+	for _, z := range zonesFromVhostText(extraVhostText) {
+		if panelCacheZone(z) {
+			zones[z] = true
+		}
 	}
 	if len(zones) == 0 {
 		return "", nil
@@ -749,6 +767,15 @@ func (s *Server) cacheZonesContent(ctx context.Context, extraVhostText string) (
 				d, derr := proxies.CacheZoneDecl(root, id, cfg.Size, cfg.Valid)
 				if derr != nil {
 					return "", fmt.Errorf("缓存区 %s 无法声明：%w", z, derr)
+				}
+				decl = d
+			}
+		} else if id, ok := sites.CacheZoneID(z); ok {
+			// 站点缓存区：开关是 sites 表的 proxy_cache 列（真相在数据库）。
+			if st, serr := s.siteMgr().GetByID(ctx, id); serr == nil && st.ProxyCache {
+				d, derr := sites.CacheZoneDecl(root, id)
+				if derr != nil {
+					return "", fmt.Errorf("站点缓存区 %s 无法声明：%w", z, derr)
 				}
 				decl = d
 			}
@@ -878,6 +905,18 @@ func (s *Server) reconcileProxyCache(ctx context.Context) {
 		if _, derr := s.ensureProxyCacheDir(); derr != nil {
 			// 不猜用户、也不动声明：现有声明仍合法，只是缓存可能写不进去。
 			s.Log.Warn("缓存目录归属处理失败（缓存可能写不进去）：%v", derr)
+		}
+		// 站点缓存区目录同理：nginx 启动/`-t` 会以 root 建 zone 目录，worker 写不进去
+		// 就永远 MISS（坑 189）。这里按数据库里的开关逐个补齐归属。
+		if list, lerr := s.siteMgr().List(ctx); lerr == nil {
+			for _, st := range list {
+				if !st.ProxyCache || !st.Enabled {
+					continue
+				}
+				if _, derr := s.ensureSiteCacheDir(st.ID); derr != nil {
+					s.Log.Warn("站点 %s 的缓存目录归属处理失败（缓存可能写不进去）：%v", st.Domain, derr)
+				}
+			}
 		}
 	}
 	_, changed, err := s.applyCacheZones(ctx, "")

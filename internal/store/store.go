@@ -111,6 +111,8 @@ CREATE TABLE IF NOT EXISTS sites (
     autoindex   INTEGER NOT NULL DEFAULT 0,
     -- 明文 HTTP 监听端口。默认 80：老站点读出来就是 80，vhost 逐字不变
     listen_port INTEGER NOT NULL DEFAULT 80,
+    -- 站点级回源缓存开关。默认 0：关闭时不产生任何 proxy_cache 指令/缓存区
+    proxy_cache INTEGER NOT NULL DEFAULT 0,
     php_version TEXT    NOT NULL DEFAULT '',   -- 空=纯静态
     rewrite     TEXT    NOT NULL DEFAULT 'none',
     ssl_enabled INTEGER NOT NULL DEFAULT 0,
@@ -299,12 +301,13 @@ func (s *Store) migrate(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	// 站点根目录可自定义 + 目录索引（2026-09-19）。老库的表已存在，
+	// 站点根目录可自定义 + 目录索引 + 回源缓存（2026-09-19/20）。老库的表已存在，
 	// CREATE TABLE IF NOT EXISTS 补不了列，必须显式 ADD COLUMN。
 	if err := s.ensureColumns(ctx, "sites", map[string]string{
 		"base_root":   "TEXT NOT NULL DEFAULT ''",
 		"autoindex":   "INTEGER NOT NULL DEFAULT 0",
 		"listen_port": "INTEGER NOT NULL DEFAULT 80",
+		"proxy_cache": "INTEGER NOT NULL DEFAULT 0",
 	}); err != nil {
 		return err
 	}
