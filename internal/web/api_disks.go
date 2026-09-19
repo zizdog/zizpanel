@@ -45,6 +45,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/zizdog/zizpanel/internal/config"
 )
 
 // ---------- 可注入的执行器（沿用本仓库的包级测试钩子风格，不动 Server 结构体） ----------
@@ -902,6 +904,88 @@ func defaultMountPoint(volumeName, id string) string {
 	return "/Volumes/" + name
 }
 
+// ---------- 自定义挂载点（绕开 macOS 对外接卷的隐私保护） ----------
+//
+// 背景：面板以 root 的 LaunchDaemon 运行、没有用户会话，文件管理读写
+// /Volumes 下的外接盘会被 macOS 隐私保护（TCC）以 EPERM 拒绝。**挂载本身
+// 不受这条保护限制**，所以把卷挂到 /Volumes 之外（默认 <安装根>/mnt/<名字>）
+// 再访问，是面板自己能执行、不需要任何人工 GUI 授权的解法。
+//
+// ⚠️ 诚实标注：这条路径**尚未在真实 root 面板 + 外接盘上实测**（需要正式面板
+// 与外接盘；本机调试实例是在用户会话里，走的不是同一条拒绝路径）。
+
+// diskMountReq 是挂载动作的**可选**请求体。MountPoint 为空时行为不变（挂到 /Volumes）。
+type diskMountReq struct {
+	MountPoint string `json:"mount_point"`
+}
+
+// decodeOptional 解析可选 JSON body：空 body 不算错误（老前端/脚本不带 body）。
+func decodeOptional(r *http.Request, v any) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil
+	}
+	return decode(r, v)
+}
+
+// customMountBase 返回自定义挂载点唯一允许的前缀：<面板安装根>/mnt。
+//
+// 为什么必须限制前缀：面板以 root 运行，若"用户给什么绝对路径就挂什么"，
+// 等于允许把任意卷挂到 /etc、/usr 之上 —— 是提权级别的事故。
+func (s *Server) customMountBase() string {
+	root := config.DefaultRoot
+	if s.Cfg != nil && s.Cfg.BinDir != "" {
+		if parent := filepath.Dir(filepath.Clean(s.Cfg.BinDir)); parent != "/" && parent != "." && filepath.IsAbs(parent) {
+			root = parent
+		}
+	}
+	return filepath.Join(root, "mnt")
+}
+
+// resolveCustomMountPoint 校验自定义挂载点并**建好目录**（不存在则先建）。
+//
+// 只允许 <安装根>/mnt/<单个目录名>，且解析软链接后仍在这个前缀内；
+// 落在 /Volumes 下的挂载点直接拒绝 —— 那正是要被绕开的隐私保护位置。
+func (s *Server) resolveCustomMountPoint(raw string) (string, error) {
+	p := filepath.Clean(strings.TrimSpace(raw))
+	if !filepath.IsAbs(p) {
+		return "", errors.New("自定义挂载点必须是绝对路径")
+	}
+	base := s.customMountBase()
+	if p == base || !strings.HasPrefix(p, base+string(os.PathSeparator)) {
+		return "", fmt.Errorf("自定义挂载点必须是 %s 下的子目录（例如 %s）", base, filepath.Join(base, "mirror"))
+	}
+	leaf := filepath.Base(p)
+	if leaf == "" || leaf == "." || leaf == ".." || strings.ContainsAny(leaf, `/\`) {
+		return "", errors.New("自定义挂载点的目录名不合法")
+	}
+	inVolumes := func(x string) bool {
+		return x == "/Volumes" || strings.HasPrefix(x, "/Volumes"+string(os.PathSeparator))
+	}
+	if inVolumes(p) {
+		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那正是要被绕开的位置）")
+	}
+	// 目录不存在则先建：`diskutil mount -mountPoint` 要求挂载点目录已存在。
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		return "", fmt.Errorf("创建挂载点目录失败：%w", err)
+	}
+	// 解析软链接后再确认没越界（面板是 root，这里不能只做字符串前缀检查）。
+	realBase := base
+	if r, err := filepath.EvalSymlinks(base); err == nil {
+		realBase = r
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", fmt.Errorf("解析挂载点失败：%w", err)
+	}
+	if real != realBase && !strings.HasPrefix(real, realBase+string(os.PathSeparator)) {
+		return "", fmt.Errorf("自定义挂载点解析后越出 %s，拒绝", base)
+	}
+	if inVolumes(real) {
+		return "", errors.New("自定义挂载点不能落在 /Volumes 下（那正是要被绕开的位置）")
+	}
+	return real, nil
+}
+
 // ---------- 视图 / 响应 ----------
 
 type diskListView struct {
@@ -915,7 +999,10 @@ type diskListView struct {
 	FstabReadable bool            `json:"fstab_readable"`
 	FstabError    string          `json:"fstab_error,omitempty"`
 	Notes         []string        `json:"notes"`
-	CollectedAt   string          `json:"collected_at"`
+	// CustomMountBase 是「挂载到自定义挂载点」允许的前缀（<安装根>/mnt），
+	// 供前端预填路径。放在响应里而不是前端写死 /opt/zizpanel，非默认安装才正确。
+	CustomMountBase string `json:"custom_mount_base"`
+	CollectedAt     string `json:"collected_at"`
 }
 
 func (s *diskSnapshot) view() diskListView {
@@ -957,15 +1044,23 @@ func (s *Server) handleDiskList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "disk_list", "", fmt.Sprintf("%d 组设备", len(snap.Groups)), true, "")
-	ok(w, snap.view())
+	v := snap.view()
+	v.CustomMountBase = s.customMountBase()
+	ok(w, v)
 }
 
 func (s *Server) handleDiskMount(w http.ResponseWriter, r *http.Request) {
-	s.diskMountAction(w, r, "mount")
+	// body 可选：mount_point 非空时走「挂载到自定义挂载点」（见 diskMountReq）。
+	var req diskMountReq
+	if err := decodeOptional(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.diskMountAction(w, r, "mount", req.MountPoint)
 }
 
 func (s *Server) handleDiskUnmount(w http.ResponseWriter, r *http.Request) {
-	s.diskMountAction(w, r, "unmount")
+	s.diskMountAction(w, r, "unmount", "")
 }
 
 type diskActionResult struct {
@@ -983,7 +1078,10 @@ type diskActionResult struct {
 }
 
 // diskMountAction 执行挂载/卸载，并**回读真实状态**确认结果。
-func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action string) {
+//
+// customMountPoint 非空（仅 mount）时改用 `diskutil mount -mountPoint <dir> <id>`：
+// 把外接盘挂到 /Volumes 之外，绕开 macOS 对外接卷的隐私保护（见 resolveCustomMountPoint）。
+func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action, customMountPoint string) {
 	id := r.PathValue("id")
 	snap, err := collectDiskSnapshot(r.Context())
 	if err != nil {
@@ -1020,11 +1118,25 @@ func (s *Server) diskMountAction(w http.ResponseWriter, r *http.Request, action 
 		}
 	}
 
-	out, errb, runErr := runDiskutil(r.Context(), diskMountTimeout, action, id)
+	// 自定义挂载点（仅挂载）：校验 + 建目录都在这里做，命令标签与实际参数一致。
+	args := []string{action, id}
+	command := "diskutil " + action + " " + id
+	if action == "mount" && strings.TrimSpace(customMountPoint) != "" {
+		mp, mpErr := s.resolveCustomMountPoint(customMountPoint)
+		if mpErr != nil {
+			s.audit(r, "disk_mount", id, "自定义挂载点不合法："+mpErr.Error(), false, "")
+			fail(w, http.StatusBadRequest, mpErr.Error())
+			return
+		}
+		args = []string{"mount", "-mountPoint", mp, id}
+		command = "diskutil mount -mountPoint " + mp + " " + id
+	}
+
+	out, errb, runErr := runDiskutil(r.Context(), diskMountTimeout, args...)
 	res := diskActionResult{
 		ID:      id,
 		Action:  action,
-		Command: "diskutil " + action + " " + id,
+		Command: command,
 		Stdout:  strings.TrimSpace(out),
 		Stderr:  strings.TrimSpace(errb),
 	}

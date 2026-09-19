@@ -174,17 +174,41 @@ export function FilesView(content, ctx = {}) {
       lastList = await api.files(cwd, showHidden);
     } catch (e) {
       clear(tableBox);
-      appendAll(tableBox, h('div.empty', [
-        h('div.big', { text: '⚠️' }),
-        h('h4', { text: '无法打开该目录' }),
-        h('p', { text: e.message }),
-      ]));
+      renderOpenError(e);
       return;
     }
     cwd = lastList.path;
     renderCrumbs();
     renderToolbar();
     renderTable();
+  }
+
+  // renderOpenError 把后端的错误按行显示出来。
+  //
+  // 为什么不是一行 <p>：外接卷被 macOS 隐私保护拒绝时，后端（api_files.go）
+  // 返回的是 **403 + 多行可操作指引**（改用「挂载到自定义挂载点」）。挤进一行
+  // 文本会把换行吃掉，用户只看到 "operation not permitted" —— 那正是报障的原文。
+  function renderOpenError(e) {
+    const msg = String((e && e.message) || e);
+    // 403 有两种：越界（面板白名单拒绝）与"外接卷被 macOS 隐私保护拒绝"。
+    // 只有后者才说"被系统拒绝"，并给磁盘页入口 —— 别把面板自己的拒绝也说成系统问题。
+    const isTCC = !!(e && e.status === 403) && msg.includes('隐私保护');
+    const box = h('div.files-denied');
+    msg.split('\n').map((s) => s.trim()).filter(Boolean)
+      .forEach((ln, i) => box.append(h('div', { class: i === 0 ? 'files-denied-head' : 'files-denied-line', text: ln })));
+    // 指引里提到的「磁盘 → 挂载到自定义挂载点…」直接给一个入口。
+    if (isTCC) {
+      box.append(h('button.btn.btn-sm', {
+        text: '🖥 打开磁盘工具…',
+        style: { marginTop: '8px' },
+        onclick: () => { location.hash = '#/disks'; },
+      }));
+    }
+    appendAll(tableBox, h('div.empty', [
+      h('div.big', { text: '⚠️' }),
+      h('h4', { text: isTCC ? '无法打开该目录（被系统拒绝）' : '无法打开该目录' }),
+      box,
+    ]));
   }
 
   // ---------- 位置下拉：常用 / 磁盘与卷 ----------

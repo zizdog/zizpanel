@@ -1072,3 +1072,15 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 }
 .disk-task-result .zp-notes-list { margin-bottom: 0; }
 .disk-task-result .zp-notes-list li { font-size: 12px; color: var(--text-dim); }
+
+/* 文件管理：后端把「macOS 隐私保护拦住了外接卷」这类错误连**完整解法**一起返回
+   （见 internal/web/api_files.go::volumeTCCGuide），前端按行显示 ——
+   挤成一行会把换行吃掉，用户只看到 "operation not permitted"。 */
+.files-denied {
+  display: inline-block; text-align: left; max-width: 760px;
+  margin: 10px auto 0; padding: 10px 12px;
+  border: 1px solid var(--border); border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm, 7px); background: var(--panel-2);
+}
+.files-denied-head { color: var(--text-dim); font-size: 12.5px; font-weight: 600; }
+.files-denied-line { color: var(--text-dim); font-size: 12px; line-height: 1.65; margin-top: 6px; white-space: pre-wrap; }

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -140,6 +141,13 @@ func (m *Manager) Resolve(p string, allowMissing bool) (string, error) {
 	} else {
 		real = resolveExisting(clean)
 		if _, err := os.Stat(real); err != nil {
+			// 权限拒绝必须**保留真实 errno 与路径**，不能一律谎报"文件不存在"：
+			// 外接卷被 macOS 隐私保护（TCC）拦住时 stat 就会 EPERM，而 web 层要靠
+			// errno + 路径前缀把它映射成"用自定义挂载点绕过"的可操作指引
+			// （见 internal/web/api_files.go 的 volumeTCCPath）。
+			if errors.Is(err, fs.ErrPermission) {
+				return "", err
+			}
 			return "", fmt.Errorf("文件不存在: %s", p)
 		}
 	}

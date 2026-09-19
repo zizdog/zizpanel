@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/config"
@@ -158,7 +160,7 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	res, err := mgr.List(p, showHidden)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, p)
 		return
 	}
 	s.annotateRoots(res)
@@ -264,11 +266,117 @@ func resolveForCompare(p string) string {
 	return p
 }
 
+// ============================================================================
+//  macOS 隐私保护（TCC）拦住外接卷 —— 把 EPERM 变成可操作的指引
+//
+//  为什么单独处理：面板以 root 的 LaunchDaemon 运行、**没有用户会话**，
+//  读写 /Volumes 下的外接盘/可移除卷会被 macOS 隐私保护（TCC）直接拒绝，
+//  返回 EPERM（operation not permitted）。用户报障原文：
+//  「打开目录失败: open /Volumes/ZPMirror: operation not permitted」。
+//  Apple 的"正规"出口是人工授予「完全磁盘访问权限」，但那需要在有屏幕的
+//  机器上点一次，无头/远程场景做不到，所以对外**只给**"挂到 /Volumes 之外"
+//  这条面板自己能执行的解法（见 tccSolution）。
+//
+//  为什么此前测不出来（验证盲区，必须写清楚）：本机调试实例（make run-local）
+//  跑在**用户会话**里，那个终端早已被授权，所以能读 /Volumes/ZPMirror；
+//  只有正式 root 面板 + 真实外接盘才会命中。调试实例上**永远复现不出**这个错误。
+//
+//  判据是**真实 errno（EPERM/EACCES） + 路径在 /Volumes 下**，绝不靠匹配
+//  "operation not permitted" 字符串：字符串匹配会把别的原因误报成 TCC，
+//  也会在包装/本地化变化后失效。
+// ============================================================================
+
+// volumeMountRoot 是 macOS 挂载外接盘/可移除卷的标准位置（与 internal/files/volumes.go 一致）。
+const volumeMountRoot = "/Volumes"
+
+// tccSolution 是给用户的**唯一**解法：让面板自己把卷挂到 /Volumes 之外。
+//
+// 刻意**不写**"去系统设置 → 隐私与安全性 → 完全磁盘访问权限里手动授权"：
+// 那要求在**有屏幕的机器上人工点一次**，无头/远程场景根本做不到，
+// 不能作为给用户的指引。人工授权只是 Apple 提供的另一条路（见 docs/磁盘工具.md）。
+//
+// 诚实标注：这条路径（换挂载点绕过 TCC）**尚未在真实 root 面板 + 外接盘上实测**，
+// 已由真实磁盘工具能力支撑（挂载本身不需要 TCC 授权），但不写成"已验证"。
+const tccSolution = "解法：用面板「磁盘 → 挂载到自定义挂载点…」把这个卷挂到 /Volumes 之外，再访问那个路径（挂载本身不受隐私保护限制）。等价命令：" +
+	"\n  sudo diskutil mount -mountPoint " + config.DefaultRoot + "/mnt/mirror <卷标识>"
+
+// volumeTCCGuide 是给用户的完整指引（前端会把每一行都显示出来，不是一行 errno）。
+func volumeTCCGuide(path string) string {
+	return fmt.Sprintf("macOS 隐私保护拦住了对外接卷 %s 的访问：operation not permitted。"+
+		"面板以 root 的 LaunchDaemon 运行、没有用户会话，读写 /Volumes 下的外接盘会被系统拒绝。\n%s",
+		path, tccSolution)
+}
+
+// isPermissionDenied 判断 err 链上是否是一次**真实的**权限拒绝（EPERM/EACCES）。
+func isPermissionDenied(err error) bool {
+	return errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
+}
+
+// errPathCandidates 取出 err 链上自带的路径（*fs.PathError / *os.LinkError）。
+func errPathCandidates(err error) []string {
+	var out []string
+	var pe *fs.PathError
+	if errors.As(err, &pe) && pe.Path != "" {
+		out = append(out, pe.Path)
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		out = append(out, le.Old, le.New)
+	}
+	return out
+}
+
+// withinVolumes 判断 p 是否就是 /Volumes 或在其之下（按路径分段比较，不用裸前缀字符串，
+// 免得把 /Volumes2/... 这类路径也算进来）。
+func withinVolumes(p string) bool {
+	p = filepath.Clean(strings.TrimSpace(p))
+	if p == "" || p == "." {
+		return false
+	}
+	return p == volumeMountRoot || strings.HasPrefix(p, volumeMountRoot+string(os.PathSeparator))
+}
+
+// volumeTCCPath 判断这次失败是否是"macOS 隐私保护拦住外接卷"；命中则返回用户访问的那个路径。
+//
+// 两道判据缺一不可：① 真实 errno 是 EPERM/EACCES；② **出错的那个路径**在 /Volumes 下。
+//
+// 路径优先取 err 自带的 PathError/LinkError（谁出错看谁，不会张冠李戴）；
+// 只有当 err 完全没带路径时，才退回调用方从请求里取的 explicit 路径。
+// 反过来，如果 err 带了路径但都不在 /Volumes，就**不**再看 explicit ——
+// 否则"从普通目录重命名进 /Volumes"这类失败会被误报成外接卷 TCC 问题。
+func volumeTCCPath(err error, explicit ...string) (string, bool) {
+	if err == nil || !isPermissionDenied(err) {
+		return "", false
+	}
+	if paths := errPathCandidates(err); len(paths) > 0 {
+		for _, p := range paths {
+			if withinVolumes(p) {
+				return filepath.Clean(p), true
+			}
+		}
+		return "", false
+	}
+	for _, p := range explicit {
+		if withinVolumes(p) {
+			return filepath.Clean(p), true
+		}
+	}
+	return "", false
+}
+
 // failFileErr 把文件操作的错误映射成 HTTP 状态码。
 //
 // 越界（ErrForbidden）必须是 403 而不是 400：前端与测试据此区分"路径不合法"
 // 与"你没有权限访问这里"，也避免把"系统目录被拒绝"误报成"请求写错了"。
-func failFileErr(w http.ResponseWriter, err error) {
+//
+// 外接卷被 TCC 拒绝同样是 403（不是 500），并且错误体里带完整解法。
+// paths 是调用方从请求里取到的路径（可选；错误自带路径时可以不传）。
+func failFileErr(w http.ResponseWriter, err error, paths ...string) {
+	if p, ok := volumeTCCPath(err, paths...); ok {
+		fail(w, http.StatusForbidden, volumeTCCGuide(p))
+		return
+	}
 	if errors.Is(err, files.ErrForbidden) {
 		fail(w, http.StatusForbidden, err.Error())
 		return
@@ -278,9 +386,10 @@ func failFileErr(w http.ResponseWriter, err error) {
 
 func (s *Server) handleFileRead(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
-	res, err := mgr.Read(r.URL.Query().Get("path"))
+	p := r.URL.Query().Get("path")
+	res, err := mgr.Read(p)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, p)
 		return
 	}
 	ok(w, res)
@@ -301,7 +410,7 @@ func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr := s.fileManager()
 	if err := mgr.Write(req.Path, req.Content, req.Create); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Path)
 		return
 	}
 	s.audit(r, "file_write", req.Path, fmt.Sprintf("写入 %d 字节", len(req.Content)), true, "")
@@ -320,7 +429,7 @@ func (s *Server) handleFileMkdir(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr := s.fileManager()
 	if err := mgr.Mkdir(req.Path); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Path)
 		return
 	}
 	s.audit(r, "file_mkdir", req.Path, "新建目录", true, "")
@@ -335,7 +444,7 @@ func (s *Server) handleFileTouch(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr := s.fileManager()
 	if err := mgr.Touch(req.Path); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Path)
 		return
 	}
 	s.audit(r, "file_touch", req.Path, "新建文件", true, "")
@@ -355,7 +464,7 @@ func (s *Server) handleFileRename(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr := s.fileManager()
 	if err := mgr.Rename(req.From, req.To); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.From, req.To)
 		return
 	}
 	s.audit(r, "file_rename", req.From, "重命名为 "+req.To, true, "")
@@ -370,7 +479,7 @@ func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
 	}
 	mgr := s.fileManager()
 	if err := mgr.Copy(req.From, req.To); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.From, req.To)
 		return
 	}
 	s.audit(r, "file_copy", req.From, "复制到 "+req.To, true, "")
@@ -392,7 +501,7 @@ func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	res, err := mgr.Move(req.From, req.To, req.OnConflict)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.From, req.To)
 		return
 	}
 	s.audit(r, "file_move", req.From, fmt.Sprintf("移动到 %s（%s）", res.To, res.Way), true, "")
@@ -453,14 +562,14 @@ func (s *Server) handleFileChmod(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	if !req.Recursive {
 		if err := mgr.Chmod(req.Path, mode); err != nil {
-			failFileErr(w, err)
+			failFileErr(w, err, req.Path)
 			return
 		}
 	} else {
 		// 递归修改：逐个走 Resolve 校验，确保不会因软链接越界
 		target, err := mgr.Resolve(req.Path, false)
 		if err != nil {
-			failFileErr(w, err)
+			failFileErr(w, err, req.Path)
 			return
 		}
 		count := 0
@@ -504,6 +613,13 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	var done []string
 	for _, p := range req.Paths {
 		if err := mgr.Delete(p, req.Recursive); err != nil {
+			// 外接卷被 macOS 隐私保护拒绝：整单 403 + 完整指引，
+			// 而不是 200 + 一行 errno（同一类问题的其它入口也都这么映射）。
+			if tccPath, isTCC := volumeTCCPath(err, p); isTCC {
+				s.audit(r, "file_delete", p, "删除失败: "+err.Error(), false, "")
+				fail(w, http.StatusForbidden, volumeTCCGuide(tccPath))
+				return
+			}
 			// 部分失败时返回已删列表与失败原因，便于前端准确展示
 			s.audit(r, "file_delete", p, "删除失败: "+err.Error(), false, "")
 			ok(w, map[string]any{
@@ -541,7 +657,7 @@ func (s *Server) handleFileCompress(w http.ResponseWriter, r *http.Request) {
 	// 先做一次**只读**校验（源路径是否存在/是否越界、格式是否支持）：
 	// 参数错了要当场 400，而不是开一个注定失败的任务。
 	if err := mgr.CheckCompressTargets(req.Dir, req.Names, req.Format); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Dir, req.Output)
 		return
 	}
 	title := fmt.Sprintf("打包 %d 项为 %s", len(req.Names), filepath.Base(req.Output))
@@ -585,7 +701,7 @@ func (s *Server) handleFileExtract(w http.ResponseWriter, r *http.Request) {
 	// 只读预检：归档存在、格式支持、目标目录在允许范围内、归档内没有穿越路径。
 	// 这些问题要**当场**告诉用户（400 + 人话），而不是丢进任务再失败。
 	if err := mgr.CheckExtractTargets(r.Context(), req.Archive, req.Dest); err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Archive, req.Dest)
 		return
 	}
 	s.launchTask(w, r, "file_extract", req.Archive, "解压 "+filepath.Base(req.Archive),
@@ -617,7 +733,7 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	f, st, err := mgr.OpenForRead(p)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, p)
 		return
 	}
 	defer func() { _ = f.Close() }()
@@ -805,11 +921,15 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 
 	var results []uploadedFile
 	var failures []string
+	// failureErrs 与 failures 一一对应：聚合的失败文案会把 errno 拍平成字符串，
+	// 判"是不是外接卷被 TCC 拒绝"必须回到原始 error（真实 errno）。
+	var failureErrs []error
 
 	for idx, fh := range parts {
 		f, err := fh.Open()
 		if err != nil {
 			failures = append(failures, uploadLabel(fh.Filename, relAt(relPaths, treeMode, idx))+": "+err.Error())
+			failureErrs = append(failureErrs, err)
 			continue
 		}
 		rel := relAt(relPaths, treeMode, idx)
@@ -824,6 +944,7 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		_ = f.Close()
 		if err != nil {
 			failures = append(failures, uploadLabel(fh.Filename, rel)+": "+err.Error())
+			failureErrs = append(failureErrs, err)
 			continue
 		}
 		results = append(results, uploadedFile{
@@ -833,6 +954,13 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(results) == 0 {
+		// 目标是外接卷、被 macOS 隐私保护拒绝：403 + 完整指引，不是 400 + errno。
+		for _, e := range failureErrs {
+			if tccPath, isTCC := volumeTCCPath(e, dir); isTCC {
+				fail(w, http.StatusForbidden, volumeTCCGuide(tccPath))
+				return
+			}
+		}
 		fail(w, http.StatusBadRequest, "上传失败："+strings.Join(failures, "；"))
 		return
 	}
@@ -948,7 +1076,7 @@ func (s *Server) handleFileSearch(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	res, err := mgr.Search(r.Context(), req.Path, req.Query, req.Mode, req.Limit)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Path)
 		return
 	}
 	ok(w, res)
@@ -970,7 +1098,7 @@ func (s *Server) handleFileReplace(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	n, err := mgr.ReplaceInFile(req.Path, req.Find, req.Replace, req.All)
 	if err != nil {
-		failFileErr(w, err)
+		failFileErr(w, err, req.Path)
 		return
 	}
 	s.audit(r, "file_replace", req.Path,

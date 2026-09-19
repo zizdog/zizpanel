@@ -425,22 +425,34 @@ func (w *fakeWorld) exec(_ context.Context, _ time.Duration, args ...string) (st
 		}
 		return encodePlist(m), "", nil
 	case "mount":
-		id := args[1]
+		// 支持 `mount <id>` 与 `mount -mountPoint <dir> <id>` 两种形态。
+		mountPoint, id := "", ""
+		if len(args) >= 4 && args[1] == "-mountPoint" {
+			mountPoint, id = args[2], args[3]
+		} else if len(args) >= 2 {
+			id = args[1]
+		}
+		if id == "" {
+			return "", "", fmt.Errorf("mount needs device")
+		}
 		if w.failMount {
 			return "", "Could not mount disk " + id, fmt.Errorf("exit status 1")
 		}
 		if !w.mountNoVerify {
 			w.mu.Lock()
 			if _, okk := w.mounted[id]; !okk {
-				name := "Untitled"
-				for _, vols := range w.containerVols {
-					for _, v := range vols {
-						if v.id == id {
-							name = v.name
+				if mountPoint == "" {
+					name := "Untitled"
+					for _, vols := range w.containerVols {
+						for _, v := range vols {
+							if v.id == id {
+								name = v.name
+							}
 						}
 					}
+					mountPoint = "/Volumes/" + name
 				}
-				w.mounted[id] = "/Volumes/" + name
+				w.mounted[id] = mountPoint
 			}
 			w.mu.Unlock()
 		}
