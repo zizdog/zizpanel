@@ -12,7 +12,7 @@ import { ReverseProxyView } from './reverseproxy.js';
 import { CertsView } from './certs.js';
 import { AppsView } from './apps.js';
 import { FilesView } from './files.js';
-import { TerminalView } from './terminal.js';
+import { TerminalView, destroyTerminal } from './terminal.js';
 import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
@@ -106,6 +106,13 @@ const ROUTE_TARGET = {
 // 两段式 hash（#/<版块>/<Tab>）的别名表，键是 "版块/Tab"。
 const SUB_ROUTE_TARGET = {
   'settings/about': { id: 'settings', tab: 'update' },
+  // 2026-09-24：面板设置的两个 Tab 被删/合并，但旧 hash（书签、文档、别的页面
+  // 里的链接）一个都不能白屏：
+  //   #/settings/limits   —— 「上传与执行限制」Tab（已删，入口只在「调整配置」里）
+  //   #/settings/terminal —— 「文件与终端」Tab（已并入「访问与安全」）
+  // 两者都落到合并后的「访问与安全」。
+  'settings/limits': { id: 'settings', tab: 'access' },
+  'settings/terminal': { id: 'settings', tab: 'access' },
 };
 
 // routeFor 解析 hash：#/<版块> 或 #/<版块>/<页内 Tab>（如 #/apps/docker）。
@@ -403,6 +410,51 @@ function footerStatus() {
   return c.listen ? `面板运行正常 · 监听 ${c.listen} · ${scheme}` : '面板运行正常';
 }
 
+// ---------------- 顶栏「2FA」状态按钮 ----------------
+//
+// 用户 2026-09-24 要求：内容改成只写「2FA」，状态**只用颜色**表达，
+// 点击跳到「面板设置 → 账号与两步验证」里的 2FA 那一节。
+// 三态各一种颜色，title 说明到底是什么意思：
+//   ok     已开启（绿）
+//   warn   未开启（橙；面板建议开启）
+//   danger 需注意 / 未复核（红）—— 会话里读不到 totp_enabled 字段时如实说
+//          "无法复核"，**绝不猜成"未开启"**（第三节：读不到就拒绝，不猜默认值）
+function totpBadge(user) {
+  const v = user ? user.totp_enabled : undefined;
+  if (v === true) {
+    return { tone: 'ok', title: '两步验证（2FA）已开启。点击前往「面板设置 → 账号与两步验证」调整' };
+  }
+  if (v === false) {
+    return { tone: 'warn', title: '两步验证（2FA）未开启 —— 建议开启。点击前往「面板设置 → 账号与两步验证」' };
+  }
+  return { tone: 'danger', title: '两步验证（2FA）需注意：会话数据里读不到该字段，无法复核（不猜状态）。点击前往查看' };
+}
+
+// ---------------- 「跳到设置页的某一节」 ----------------
+//
+// 设置页的 Tab 内容是**异步**渲染的（如 renderAccount 里 await 了登录会话），
+// 点击那一刻目标元素还不存在。所以这里只记下"渲染完成后要滚到哪个锚点"，
+// 由视图渲染完成后消费（views.js 的 renderAccount → consumePendingAnchor）。
+let pendingAnchor = '';
+
+export function consumePendingAnchor() {
+  const a = pendingAnchor;
+  pendingAnchor = '';
+  return a;
+}
+
+// goto2FASettings 跳到「面板设置 → 账号与两步验证」，并把 2FA 卡片滚进视野。
+function goto2FASettings() {
+  pendingAnchor = 'zp-2fa-section';
+  const wanted = '#/settings/account';
+  if ((location.hash || '#/dashboard') === wanted) {
+    // hash 没变不会触发 hashchange —— 手动重渲染一次，让新视图消费锚点。
+    render();
+    return;
+  }
+  location.hash = wanted;
+}
+
 function renderApp() {
   // 路由先过别名表：`#/services` 会落到 apps 版块的「已安装」Tab（见 ROUTE_TARGET）；
   // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
@@ -472,12 +524,26 @@ function renderApp() {
     // 任务中心入口：任务状态活在 tasks.js 的模块级单例里，不随路由重建，
     // 所以任何页面都能重新打开正在安装的任务（关掉窗口 ≠ 取消任务）。
     taskCenter.button(),
-    h('span.pill.' + (user.totp_enabled ? 'ok' : 'warn'), {
-      text: user.totp_enabled ? '2FA 已开启' : '2FA 未开启',
-      title: '两步验证状态，可在「面板设置」中调整',
-    }),
+    // 2FA 状态：内容只有「2FA」，状态靠颜色（见 totpBadge），点击去设置里那一节。
+    (() => {
+      const t = totpBadge(user);
+      return h('button.pill.' + t.tone + '.zp-2fa-pill', {
+        text: '2FA',
+        title: t.title,
+        'aria-label': t.title,
+        dataset: { testid: 'zp-2fa-pill', state: t.tone },
+        onclick: goto2FASettings,
+      });
+    })(),
     (() => { const f = themeButtonFace(); return h('button.btn.btn-ghost.btn-icon', { text: f.icon, title: f.title, onclick: () => { toggleTheme(); renderApp(); } }); })(),
-    h('button.btn.btn-ghost.btn-icon', { text: '⟳', title: '刷新', onclick: () => render() }),
+    // 刷新：原来是 '⟳'（U+27F3），在顶栏里比其它图标明显偏小、发虚。
+    // 换成与主题按钮同一套的 emoji 字符，并保留 title / 说明快捷键。
+    h('button.btn.btn-ghost.btn-icon.zp-refresh-btn', {
+      text: '🔄',
+      title: '刷新当前页面（浏览器快捷键：⌘/Ctrl + R）',
+      'aria-label': '刷新',
+      onclick: () => render(),
+    }),
     h('button.btn.btn-ghost.btn-icon', { text: '⏻', title: '退出登录', onclick: doLogout }),
   ]);
 
@@ -554,6 +620,9 @@ function runCleanup() {
 async function doLogout() {
   try { await api.logout(); } catch { /* 网络失败也要让用户退出，本地状态必须清空 */ }
   state.session = null;
+  // 终端是**跨路由保活**的（见 terminal.js）：登出是"必须销毁"的时刻之一，
+  // 否则会把一条能执行本机 shell 的连接留给下一位登录者。
+  destroyTerminal();
   runCleanup();
   location.hash = '';
   renderLogin();

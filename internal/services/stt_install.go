@@ -426,7 +426,7 @@ func (m *Manager) sttFetch() STTFetchFunc {
 //  1. 提示并补齐基础依赖 —— ffmpeg（转码链路要用它，见 Requires）；
 //  2. `brew install whisper.cpp`（走**多源兜底**：镜像 → 清华 → 官方）；
 //  3. 复核 whisper-cli 真的能跑（--help 有输出）；
-//  4. 下载**默认档**模型（small）并校验（大小 + ggml 魔数）；
+//  4. 下载**默认档**模型（large-v3-turbo，574 MB）并校验（大小 + ggml 魔数）；
 //  5. 写系统级 plist、装载、登记进「服务管理」、等 /healthz 真的报 ok:true
 //     （那一刻 = 模型在 + 进程在 + **真的跑过一次极短音频转写**）。
 func (m *Manager) InstallSTT(ctx context.Context, app App, result *InstallResult) error {

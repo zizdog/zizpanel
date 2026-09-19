@@ -173,12 +173,12 @@ var offlineInstallerExtra = map[string][]OfflineArtifact{
 	"stt": {
 		{
 			Kind:        OfflineKindModel,
-			Path:        "artifacts/models/whisper/ggml-small.bin",
-			MirrorPath:  "hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-			UpstreamURL: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-			Note: "默认档模型（487,601,967 B，**本轮实测**：Range 读 Content-Range 得到；" +
-				"NAS 的 <base>/hf/ 代理上实测 HTTP 200 可用，静态目录 <base>/models/whisper/ 目前是 404）。" +
-				"安装流程只下这一档；large-v3-turbo（574,041,195 B）与 medium（1,533,763,059 B）" +
+			Path:        "artifacts/models/whisper/ggml-large-v3-turbo-q5_0.bin",
+			MirrorPath:  "hf/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+			UpstreamURL: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+			Note: "**默认档**模型（574,041,195 B，**本轮实测**：Range 读 Content-Range 得到）。" +
+				"2026-09-25 用户要求把默认档从 small 换成它，所以离线包的必需件也随之改成这一档。" +
+				"安装流程只下这一档；small（487,601,967 B）与 medium（1,533,763,059 B）" +
 				"按需下载、不在离线包的必需件里 —— 要真离线也必须把用得到的档位一起落盘。",
 		},
 	},

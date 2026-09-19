@@ -696,7 +696,7 @@ var marketDownloadApps = []MarketApp{
 					"依赖 ggml + llama.cpp + sdl2-compat）"),
 			{
 				Purpose: MarketFetchModelFile,
-				Label:   "whisper 模型 small（默认档，487,601,967 B）",
+				Label:   "whisper 模型 small（按需，487,601,967 B）",
 				Upstream: MarketUpstream{
 					ID:   "ggerganov/whisper.cpp/ggml-small.bin",
 					URL:  "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
@@ -711,7 +711,9 @@ var marketDownloadApps = []MarketApp{
 				// 面板两条都探，静态缺件时自动回落到 /hf 这条（"优先+回落"是既定语义）。
 				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
 				Timeout:  STTModelDownloadTimeout,
-				Required: true,
+				Required: false,
+				OptionalImpact: "不下载不影响转写：默认档 large-v3-turbo 已经能转中文。只是界面上不能选 small 这一档；" +
+					"用户在网页界面点「下载」即可补上（走同一个多来源回落的下载器）。",
 				Checksum: MarketChecksum{
 					Note: "上游 HF 仓库没有公布 sha256 清单（同目录只有 .bin，没有 checksums 文件）；" +
 						"面板改按**精确字节数 + ggml 魔数**校验：实测 487,601,967 B、文件头 'lmgg'。 " +
@@ -726,26 +728,25 @@ var marketDownloadApps = []MarketApp{
 			},
 			{
 				Purpose: MarketFetchModelFile,
-				Label:   "whisper 模型 large-v3-turbo-q5_0（按需，574,041,195 B）",
+				Label:   "whisper 模型 large-v3-turbo-q5_0（默认档，574,041,195 B）",
 				Upstream: MarketUpstream{
 					ID:   "ggerganov/whisper.cpp/ggml-large-v3-turbo-q5_0.bin",
 					URL:  "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
 					Size: 574041195,
 					Note: "**本轮实测**：Range 读 Content-Range 得到 bytes 0-0/574041195。" +
-						"比 medium 更小也更准（large-v3 的 turbo 蒸馏解码器 + q5_0 量化），推荐给要精度的场景。",
+						"比 medium 更小也更准（large-v3 的 turbo 蒸馏解码器 + q5_0 量化），" +
+						"是现在的默认档（比原默认 small 大 ~85 MiB）。",
 				},
 				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"),
 				Timeout:  STTModelDownloadTimeout,
-				Required: false,
-				OptionalImpact: "不下载不影响转写：small 档已经能转中文。只是界面上不能选 large-v3-turbo 这一档；" +
-					"用户在网页界面点「下载」即可补上（走同一个多来源回落的下载器）。",
+				Required: true,
 				Checksum: MarketChecksum{
 					Note: "上游无 sha256 清单；按精确字节数 574,041,195 B + ggml 魔数 'lmgg' 校验（本轮实测）。",
 				},
 				ARM64: "ggml 权重与架构无关；本轮在 M4 + Metal 上实测可用（3.35 秒中文音频 2.7 秒出字，" +
 					"peak RSS 881,295,360 B ≈ 840 MiB）。",
-				Note: "按需下载（网页界面上的档位按钮），不在安装流程里；" +
-					"安装只下默认档 small —— 避免用户为一个不一定用得上的档位先等十几分钟。",
+				Note: "安装流程会下载这一档（默认档）；其余档位可在网页界面按需下载。" +
+					"安装只下一个默认档 —— 避免用户为不一定用得上的档位先等十几分钟。",
 			},
 			{
 				Purpose: MarketFetchModelFile,
@@ -761,7 +762,7 @@ var marketDownloadApps = []MarketApp{
 				NAS:      nasMirrored("hf/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
 				Timeout:  STTModelDownloadTimeout,
 				Required: false,
-				OptionalImpact: "不下载不影响转写（small 已可用）；只是不能选 medium 这一档。" +
+				OptionalImpact: "不下载不影响转写（默认档 large-v3-turbo 已可用）；只是不能选 medium 这一档。" +
 					"medium 精度最高但慢一个量级，只有对精度有硬要求的用户才需要。",
 				Checksum: MarketChecksum{
 					Note: "上游无 sha256 清单；按精确字节数 1,533,763,059 B + ggml 魔数 'lmgg' 校验。" +

@@ -114,9 +114,33 @@ type Rule struct {
 	// proxy_pass 会指向一个没人听的端口。0 = 这条规则不经过面板转发。
 	ForwardPort int `json:"forward_port"`
 
+	// ---- HTTP Basic Auth（"需要用户名密码"，2026-09-25 用户要求，Lucky 式）----
+	//
+	// ⚠️ 这几个字段**不进 proxies 表**：proxies 表由仓库层的固定列清单读写，
+	// 这里刻意不加列，避免和其它并行改动抢 store.go / repository.go。
+	// 真相存在面板的 settings 表（键 `proxy_auth.<id>`，由 api_proxies.go 读写），
+	// 生成 nginx 配置前再装回 Rule。这样"一条规则的鉴权配置"仍然只有一份真相。
+	//
+	// AuthEnabled 为真时，该规则的 location 会带 auth_basic + auth_basic_user_file，
+	// 未通过校验一律 401 + WWW-Authenticate: Basic realm=...。
+	AuthEnabled bool `json:"auth_enabled"`
+	// AuthUser 是 Basic Auth 用户名（会写进 htpasswd 文件的行首）。
+	AuthUser string `json:"auth_user"`
+	// AuthHash 是口令哈希（apr1）。**只用于写 htpasswd 文件**：
+	// json:"-" 保证它永远不会出现在任何 API 响应里；绝不落明文、绝不进日志/审计。
+	AuthHash string `json:"-"`
+	// AuthFile 是生成的 htpasswd 文件绝对路径（nginx 的 auth_basic_user_file）。
+	AuthFile string `json:"auth_file,omitempty"`
+
 	Created time.Time `json:"created_at"`
 	Updated time.Time `json:"updated_at"`
 }
+
+// ProxyAuthRealm 是 Basic Auth 的 realm（401 响应头里显示给用户看的名字）。
+//
+// 固定常量而不是按规则名拼：realm 里的引号/反斜杠/换行会把 nginx 配置写坏，
+// 而规则名是用户随便填的。测试会断言 401 的 WWW-Authenticate 里带它。
+const ProxyAuthRealm = "ZizPanel 反向代理"
 
 // LANForward 三态取值。
 const (
@@ -197,6 +221,8 @@ func (r *Rule) Validate() error {
 	r.SSLCert = strings.TrimSpace(r.SSLCert)
 	r.SSLKey = strings.TrimSpace(r.SSLKey)
 	r.SSLProvider = strings.ToLower(strings.TrimSpace(r.SSLProvider))
+	r.AuthUser = strings.TrimSpace(r.AuthUser)
+	r.AuthFile = strings.TrimSpace(r.AuthFile)
 
 	if r.Name == "" {
 		return fmt.Errorf("请填规则名称（只用于你自己识别，例如「NAS 镜像站」）")
@@ -507,6 +533,23 @@ func (r *Rule) Generate(logDir string) (string, error) {
 		prefix = "/"
 	}
 	fmt.Fprintf(&b, "\n\tlocation %s {\n", prefix)
+	// HTTP Basic Auth（"需要用户名密码"）：放在 location 级，只保护这条规则的代理路径。
+	//
+	// 校验必须在生成阶段做：配置缺用户名/文件时**绝不能静默生成一份没有鉴权的配置**
+	// （那等于把"需要密码"的承诺变成了公开访问）。宁可直接报错、保留旧配置。
+	if r.AuthEnabled {
+		if r.AuthUser == "" {
+			return "", fmt.Errorf("规则「%s」开启了「需要用户名密码」，但没有用户名；请重新保存该规则", r.Name)
+		}
+		if r.AuthHash == "" {
+			return "", fmt.Errorf("规则「%s」开启了「需要用户名密码」，但没有设置密码；请重新保存该规则", r.Name)
+		}
+		if !filepath.IsAbs(r.AuthFile) {
+			return "", fmt.Errorf("规则「%s」开启了「需要用户名密码」，但 htpasswd 文件路径不是绝对路径（%q）", r.Name, r.AuthFile)
+		}
+		fmt.Fprintf(&b, "\t\tauth_basic \"%s\";\n", ProxyAuthRealm)
+		fmt.Fprintf(&b, "\t\tauth_basic_user_file %s;\n", r.AuthFile)
+	}
 	if r.Forwarding() {
 		// 只连回环：回环不受 macOS 15「本地网络」隐私门限制，由面板负责出局域网。
 		fmt.Fprintf(&b, "\t\tproxy_pass %s;\n", r.ForwardProxyPass())

@@ -6,9 +6,9 @@
 import { api, sse, apiURL } from './api.js';
 import {
   h, clear, toast, modal, confirmBox, bytes, rate, pct, duration,
-  levelOf, Sparkline, $,
+  levelOf, Sparkline, $, appendAll,
 } from './ui.js';
-import { state, NAV, panelPath } from './app.js';
+import { state, NAV, panelPath, consumePendingAnchor } from './app.js';
 import { taskCenter } from './tasks.js';
 // 配置文件编辑器只有一份实现（services.js）——本页「当前生效值」里的「打开」按钮
 // 也走它。这里以前**漏了 import**：点那些「打开」会抛 ReferenceError
@@ -89,14 +89,20 @@ export function DashboardView(content, ctx = {}) {
         h('button.btn.btn-sm', { text: '按内存', onclick: () => loadProcs('mem') }),
       ]),
     ]),
+    // 移动端横向溢出（用户 2026-09-24 报障）：这张表有 6 列，窄屏下会被
+    // 单元格最小内容宽度顶破页面。给它一个**自己的横向滚动容器** +
+    // 表格 min-width，让它可以左右滑，而不是撑破整个 .layout
+    // （见 app.css 的 .zp-table-scroll）。
     h('div.card-body.tight', [
-      h('table.table', [
-        h('thead', [h('tr', [
-          h('th', { text: 'PID' }), h('th', { text: '程序' }),
-          h('th', { text: 'CPU' }), h('th', { text: '内存' }),
-          h('th', { text: '常驻内存' }), h('th', { text: '运行时长' }),
-        ])]),
-        procBody,
+      h('div.zp-table-scroll', [
+        h('table.table', [
+          h('thead', [h('tr', [
+            h('th', { text: 'PID' }), h('th', { text: '程序' }),
+            h('th', { text: 'CPU' }), h('th', { text: '内存' }),
+            h('th', { text: '常驻内存' }), h('th', { text: '运行时长' }),
+          ])]),
+          procBody,
+        ]),
       ]),
     ]),
   ]);
@@ -421,8 +427,9 @@ export function DashboardView(content, ctx = {}) {
 // 只读展示）不只是设置页里的一个版块，它是用户**最常改**的东西 ——
 // 2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的，用户没法更改文件大小限制"，
 // 并明确要求"这些常用更改应该同时做成功能，而不是让用户只能编辑配置原文件"。
-// 所以同一份实现要能同时出现在：面板设置版块、nginx/PHP 的管理面板、网站管理工具条
-//（三处共用，绝不复制第二份 —— 复制出来的那份迟早会与后端校验漂移）。
+// 所以同一份实现曾被多处共用：面板设置版块、nginx/PHP 的管理面板、网站管理工具条。
+// 2026-09-24 面板设置里的那份已删（去重），现在主要入口是「调整配置 → 上传与执行上限」
+//（实现只有这一份，绝不复制第二份 —— 复制出来的那份迟早会与后端校验漂移）。
 //
 // ⚠️ nginx 的 `client_max_body_size` **不在这里改**（2026-09-22 用户报障：
 // "Nginx 管理和上传大小 / 执行时间严重重复"）。同一个值有两处可编辑入口，
@@ -707,23 +714,28 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
 }
 
 // 原「⚡ 上传大小 / 执行时间」独立弹窗已删除（2026-09-22 用户要求把重复入口整合成
-// 一个「调整配置」）。渲染实现仍只有下面 renderLimitsInto 这一份，被
-// 「调整配置 → 上传与执行上限」页与「面板设置 → 上传与执行限制」共用。
+// 一个「调整配置」）。渲染实现仍只有下面 renderLimitsInto 这一份，现在只被
+// 「调整配置 → 上传与执行上限」使用 —— 2026-09-24 用户要求把面板设置里的
+// 「上传与执行限制」Tab 删掉（那是同一个值的第二个可编辑入口），这里同步更新说明。
 
 export function SettingsView(content, ctx = {}) {
   clear(content);
   const user = state.session?.user || {};
   const cfg = state.session?.config || {};
 
-  // 「检查更新」排在三项之后（用户 2026-09-20 明确要求的顺序）。
-  // 它是**低频但重要**的动作：放在设置里，但保留直达 hash（#/settings/update），
-  // 以及旧 hash（#/update、#/about、#/settings/about）的别名，见 app.js 的别名表。
+  // 2026-09-24 用户要求的两次信息架构调整：
+  //   · 「上传与执行限制」从面板设置里**整个删掉** —— 网站管理里已经有同一个
+  //     可编辑入口（「调整配置 → 上传与执行上限」），设置页再放一份就是重复入口。
+  //     它的渲染实现 renderLimitsInto 仍保留并导出，nginx/PHP 面板继续用。
+  //   · 「文件与终端」的内容**并入「访问与安全」** —— 二者都是"面板自身的访问
+  //     与高危能力"，拆成两个 Tab 只会让用户多点一次。合并后本页只剩 3 个 Tab，
+  //     没有空板块、也没有重复入口。
+  // 旧 hash 一个都不能白屏：`#/settings/limits`、`#/settings/terminal` 由
+  // app.js 的 SUB_ROUTE_TARGET 别名落到 access Tab（这里也对未知 tab 兜底）。
+  //
+  // 「检查更新」仍排在最后（用户 2026-09-20 明确要求的顺序），保留直达 hash。
   const tabs = [
     { id: 'access', title: '访问与安全' },
-    // 上传与执行限制紧跟访问设置：用户报障的 413（phpMyAdmin 导入失败）就是
-    // 在这里改的 —— 放太深等于"又找不到入口"。
-    { id: 'limits', title: '上传与执行限制' },
-    { id: 'terminal', title: '文件与终端' },
     { id: 'account', title: '账号与两步验证' },
     { id: 'update', title: '检查更新' },
   ];
@@ -751,8 +763,6 @@ export function SettingsView(content, ctx = {}) {
   async function renderBody() {
     clear(body);
     if (active === 'access') await renderAccess();
-    else if (active === 'limits') await renderLimits();
-    else if (active === 'terminal') await renderTerminal();
     else if (active === 'update') await renderUpdate();
     else await renderAccount();
   }
@@ -766,19 +776,12 @@ export function SettingsView(content, ctx = {}) {
     UpdateView(box, ctx);
   }
 
-  // ---------- 上传与执行限制（用户报障 413 的入口）----------
-  async function renderLimits() { clear(body); await renderLimitsInto(body, renderLimits); }
-
-  //
-  // 背景：phpMyAdmin 导入几十 MB 的 SQL 报 **413 Request Entity Too Large**。
-  // nginx 出厂 client_max_body_size 只有 1m、PHP 出厂 upload 2M/post 8M，
-  // 而面板此前**没有任何界面**能改这两组上限（用户原话："面板找不到更改的入口"）。
-  //
-  // 交互约定（与任务中心的规矩一致）：
-  //   保存 → POST 校验（非法输入当场 400 + 人话）→ 202 + task_id →
-  //   任务里写 vhost / conf.d → reload nginx → 重启 php-fpm → **回读生效值**。
-  //   这里把回读结果渲染成"生效值"卡片，绝不只显示"已保存"。
   // ---------- 访问与安全 ----------
+  //
+  // 2026-09-24：原「文件与终端」Tab 的内容（Web 终端开关 / 当前会话 /
+  // 文件管理可访问范围）并入本节的末尾 —— 见 renderTerminalInto。
+  // 原「上传与执行限制」Tab 已删除（用户要求去重，入口只在「调整配置」里）；
+  // 它的渲染实现 renderLimitsInto 仍在本文件导出，别处继续复用。
   async function renderAccess() {
     let s;
     try { s = await api.getSettings(); }
@@ -973,32 +976,80 @@ export function SettingsView(content, ctx = {}) {
         ]),
       ]),
     );
+
+    // 原「文件与终端」Tab 的内容并入本节（2026-09-24 用户要求）：
+    // 连接是「哪些来源能进面板」，终端是「进来后能做什么」，放在一起才完整。
+    await renderTerminalInto(body);
   }
 
-  // ---------- 文件与终端 ----------
-  async function renderTerminal() {
-    let st;
-    try { st = await api.getSettings(); } catch (e) {
-      body.append(h('div.card', [h('div.card-body', { text: '读取设置失败: ' + e.message })]));
-      return;
-    }
-    let info = null;
-    try { info = await api.terminalInfo(); } catch { /* 忽略 */ }
+  // ---------- Web 终端 / 文件范围（原「文件与终端」，2026-09-24 并入本页）----------
+  //
+  // ⚠️ 状态来源（用户 2026-09-24 报障："不管开没开，这里永远显示未勾选"）：
+  //   GET /api/v1/settings 的返回体（server 的 settingsView）里**根本没有**
+  //   terminal_enabled / terminal_shell / terminal_idle_mins / terminal_max_sessions
+  //   这几个字段 —— 所以老代码里的 `st.terminal_enabled` 永远是 undefined，
+  //   勾选框于是永远空着（这就是"永远未勾选"的真正原因）。
+  //   终端运行状态的**唯一权威**是 GET /api/v1/terminal（handleTerminalStatus）：
+  //   它的 enabled 来自 term.Manager.Enabled()，shell / idle / max_sessions 也一并下发。
+  //   本函数**只认这个接口**；一旦读不到，就明确显示"未复核"并说明原因，
+  //   绝不为了"看起来正常"去猜一个默认值（铁律 11 / 第三节验证纪律）。
+  async function renderTerminalInto(container) {
+    // 用一个固定 class 的宿主容器承载这几张卡片：保存 / 回读后的重渲染会
+    // **替换**旧的宿主，而不是再 append 一份（否则页面会出现两套一模一样的卡片）。
+    let host = container.querySelector(':scope > .zp-terminal-settings');
+    if (!host) { host = h('div.zp-terminal-settings'); container.appendChild(host); }
+    clear(host);
+    const rerender = () => renderTerminalInto(container);
 
-    const enabled = h('input', { type: 'checkbox', checked: !!st.terminal_enabled });
-    const shell = h('input.input', { value: st.terminal_shell || '', placeholder: '留空自动选择 /bin/zsh 或 /bin/bash' });
-    const idle = h('input.input', { type: 'number', value: st.terminal_idle_mins, min: 0, max: 1440 });
-    const maxSess = h('input.input', { type: 'number', value: st.terminal_max_sessions, min: 1, max: 20 });
+    let info = null;
+    let infoErr = null;
+    try { info = await api.terminalInfo(); }
+    catch (e) { infoErr = e; }
+
+    // known = 是否读到了运行体的真实状态。读不到时下面所有控件都禁用，
+    // 不允许保存（保存必然是在写一个猜出来的值）。
+    const known = !!info && typeof info.enabled === 'boolean';
+    const enabled = h('input', { type: 'checkbox', checked: known ? !!info.enabled : false, disabled: !known });
+    const shell = h('input.input', {
+      value: known ? (info.shell || '') : '',
+      placeholder: '留空自动选择 /bin/zsh 或 /bin/bash',
+      disabled: !known,
+    });
+    const idle = h('input.input', {
+      type: 'number', value: known ? (info.idle_timeout_mins ?? 0) : '',
+      min: 0, max: 1440, disabled: !known,
+    });
+    const maxSess = h('input.input', {
+      type: 'number', value: known ? (info.max_sessions ?? '') : '',
+      min: 1, max: 20, disabled: !known,
+    });
+
+    // 状态徽标：颜色即状态，文案说全（与顶栏 2FA 同一套语义）。
+    const statusPill = known
+      ? (info.enabled
+        ? h('span.pill.ok', { text: '✅ 当前已开启' })
+        : h('span.pill.warn', { text: '⚠️ 当前未开启' }))
+      : h('span.pill.danger', { text: '未复核' });
 
     const warnBox = h('div', { style: { marginTop: '12px' } });
     const updateWarn = () => {
       clear(warnBox);
+      if (!known) {
+        appendAll(warnBox, h('div', {
+          style: { padding: '10px 12px', background: 'var(--danger-soft)', borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.7' },
+        }, [
+          h('div', { text: '⚠️ 未复核：读不到终端的运行状态，所以这里不显示勾选/不勾选（不猜默认值）。' }),
+          h('div', { text: '读取失败原因：' + ((infoErr && infoErr.message) || String(infoErr || '接口未返回 enabled 字段')) }),
+          h('div', { text: '在这条恢复之前，请勿在此保存（保存会把猜出来的值写进配置）。' }),
+        ]));
+        return;
+      }
       if (enabled.checked) {
         appendAll(warnBox, h('div', {
           style: { padding: '10px 12px', background: 'var(--warn-soft)', borderRadius: '6px', fontSize: '12.5px', lineHeight: '1.7' },
         }, [
           h('div', { text: '⚠️ 开启后，任何能登录面板的人都能在这台 Mac 上执行任意命令。' }),
-          h('div', { text: `当前将以「${st.terminal_user || 'root'}」身份运行 shell。` }),
+          h('div', { text: `当前将以「${info.user || 'root'}」身份运行 shell。` }),
           h('div', { text: '请确保：面板已开启两步验证、访问来源受限（如 Tailscale），并使用强密码。' }),
         ]));
       }
@@ -1008,7 +1059,10 @@ export function SettingsView(content, ctx = {}) {
 
     const save = h('button.btn.btn-primary', {
       text: '保存设置',
+      disabled: !known,
+      title: known ? '保存后会重建终端管理器并回读运行状态' : '未复核当前状态，禁止保存（先把状态读出来）',
       onclick: async () => {
+        if (!known) return;
         save.disabled = true;
         try {
           await api.saveSettings({
@@ -1017,15 +1071,21 @@ export function SettingsView(content, ctx = {}) {
             terminal_idle_mins: Number(idle.value),
             terminal_max_sessions: Number(maxSess.value),
           });
-          toast('已保存', 'ok');
-          renderTerminal();
+          toast('已保存，正在回读真实状态…', 'ok');
+          // 回读而不是"保存成功就算数"：开关状态必须来自运行体（见函数头注释）。
+          await rerender();
         } catch (e) { toast(e.message, 'err', 9000); }
         finally { save.disabled = false; }
       },
     });
+    const reread = h('button.btn.btn-sm', {
+      text: '↻ 重新回读', dataset: { testid: 'zp-terminal-reread' },
+      title: '重新读取 GET /api/v1/terminal 的真实状态',
+      onclick: () => rerender(),
+    });
 
     const sessions = (info?.list || []).map((s0) => h('tr', [
-      h('td.mono', { style: { fontSize: '11.5px' }, text: s0.id.slice(0, 8) }),
+      h('td.mono', { style: { fontSize: '11.5px' }, text: String(s0.id || '').slice(0, 8) }),
       h('td', { text: s0.user || '-' }),
       h('td.mono', { text: s0.ip || '-' }),
       h('td', { text: s0.started_at }),
@@ -1033,47 +1093,50 @@ export function SettingsView(content, ctx = {}) {
       h('td', h('button.btn.btn-sm.btn-danger', {
         text: '强制关闭',
         onclick: async () => {
-          try { await api.terminalKill(s0.id); toast('已关闭', 'ok'); renderTerminal(); }
+          try { await api.terminalKill(s0.id); toast('已关闭', 'ok'); await rerender(); }
           catch (e) { toast(e.message, 'err'); }
         },
       })),
     ]));
 
-    body.append(
+    host.append(
       h('div.card', [
         h('div.card-head', [h('h3', { text: 'Web 终端' }), h('div.spacer'),
+          statusPill,
           h('span.sub', { text: '高权限功能，默认关闭' })]),
         h('div.card-body', [
           h('div.field', [
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '9px' } }, [
               enabled, h('span', { style: { fontSize: '13.5px', fontWeight: '550' }, text: '启用 Web 终端（浏览器里操作本机 shell）' }),
             ]),
+            h('div.hint', { text: '勾选框来自终端运行体的真实状态（GET /api/v1/terminal 的 enabled），不是猜的默认值。' }),
           ]),
           warnBox,
           h('div.row', { style: { marginTop: '16px' } }, [
             h('div.field', [h('label', { text: 'Shell 路径' }), shell,
               h('div.hint', { text: '留空则自动选择 /bin/zsh（macOS 默认）或 /bin/bash' })]),
             h('div.field', [h('label', { text: '空闲超时（分钟）' }), idle,
-              h('div.hint', { text: '0 = 不自动回收（会话一直留着，直到你点「关闭会话」或面板重启）' }),
-              h('div.hint', { text: '填 0 表示不限制。超时后会话自动断开。' })]),
+              h('div.hint', { text: '0 = 不自动回收（会话一直留着，直到你点「关闭会话」或面板重启）' })]),
             h('div.field', [h('label', { text: '最大并发会话数' }), maxSess]),
           ]),
-          save,
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [save, reread]),
         ]),
       ]),
       h('div.card', [
         h('div.card-head', [h('h3', { text: '当前终端会话' }), h('div.spacer'),
-          h('span.sub', { text: `${(info?.list || []).length} 个活动会话` })]),
+          h('span.sub', { text: known ? `${(info?.list || []).length} 个活动会话` : '未复核' })]),
         h('div.card-body.tight', [
           sessions.length
-            ? h('table.table', [
-              h('thead', [h('tr', [
-                h('th', { text: '会话' }), h('th', { text: '运行用户' }), h('th', { text: '来源 IP' }),
-                h('th', { text: '开始时间' }), h('th', { text: '活动' }), h('th', { text: '操作' }),
-              ])]),
-              h('tbody', sessions),
+            ? h('div.zp-table-scroll', [
+              h('table.table', [
+                h('thead', [h('tr', [
+                  h('th', { text: '会话' }), h('th', { text: '运行用户' }), h('th', { text: '来源 IP' }),
+                  h('th', { text: '开始时间' }), h('th', { text: '活动' }), h('th', { text: '操作' }),
+                ])]),
+                h('tbody', sessions),
+              ]),
             ])
-            : h('div.empty', [h('p', { text: '当前没有活动的终端会话' })]),
+            : h('div.empty', [h('p', { text: known ? '当前没有活动的终端会话' : '未复核：读不到终端运行状态' })]),
         ]),
       ]),
       h('div.card', [
@@ -1081,8 +1144,8 @@ export function SettingsView(content, ctx = {}) {
         h('div.card-body', [
           h('div.hint', { text: '文件管理器只能访问以下目录（由安装时的配置决定）。所有路径都会做软链接解析，无法越界。' }),
           h('div', { style: { marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '5px' } },
-            (st.www_root ? [
-              h('code.code', { text: st.www_root + '　（网站目录）' }),
+            (cfg.www_root ? [
+              h('code.code', { text: cfg.www_root + '　（网站目录）' }),
               h('code.code', { text: '/opt/zizpanel/data　（面板数据）' }),
               h('code.code', { text: '/opt/zizpanel/logs　（日志）' }),
               h('code.code', { text: '/opt/zizpanel/work　（工作目录）' }),
@@ -1230,7 +1293,7 @@ export function SettingsView(content, ctx = {}) {
           pwdBtn,
         ]),
       ]),
-      h('div.card', [
+      h('div.card', { id: 'zp-2fa-section' }, [
         h('div.card-head', [h('h3', { text: '两步验证（2FA）' }), h('div.spacer'), h('span.sub', { text: '强烈建议开启' })]),
         h('div.card-body', [totpBox]),
       ]),
@@ -1249,8 +1312,21 @@ export function SettingsView(content, ctx = {}) {
         ]),
       ]),
     );
-  }
 
+    // 顶栏「2FA」按钮跳进来时，把 2FA 卡片滚到视野里并闪一下（见 app.js goto2FASettings）。
+    // 本函数是异步的（上面 await 了登录会话），所以由**渲染完成后**消费锚点，
+    // 而不是在点击那一刻去找元素（那时还没渲染出来）。
+    const anchorId = consumePendingAnchor();
+    if (anchorId) {
+      const el = document.getElementById(anchorId);
+      if (el) {
+        const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+        el.classList.add('zp-anchor-flash');
+        setTimeout(() => el.classList.remove('zp-anchor-flash'), 1800);
+      }
+    }
+  }
 
   renderTabs();
   renderBody();

@@ -195,6 +195,9 @@ export const api = {
   proxyToggle: (id) => request('POST', `${API_BASE}/proxies/${id}/toggle`, {}),
   proxyDelete: (id) => request('DELETE', `${API_BASE}/proxies/${id}`),
   proxyTest: (target) => request('POST', `${API_BASE}/proxies/test`, { target }),
+  // 列表状态的**异步**探测（2026-09-19 性能优化）：传 {all:true} 或 {ids:[...]}，
+  // 后端并发探测、每条 ≤500ms，结果进 TTL 缓存。列表接口本身不再跑任何真实探测。
+  proxyProbeStatus: (payload) => request('POST', `${API_BASE}/proxies/test`, payload),
   // 大请求体探测：真的 POST 64KB 到规则的监听端口，只在用户点按钮时调用。
   probeProxyBody: (id) => request('POST', `${API_BASE}/proxies/${id}/probe-body`, {}),
   // HTTPS：与站点侧 siteSSL 对称（同一套 provider 取值：

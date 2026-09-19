@@ -3,8 +3,11 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -14,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,6 +54,380 @@ func (s *Server) proxyLogDir() string {
 
 func (s *Server) proxyRepo() *proxies.Repository {
 	return proxies.NewRepository(s.Store)
+}
+
+// ============================================================================
+//  反向代理「需要用户名密码」（HTTP Basic Auth）
+//
+//  用户 2026-09-25 要求（类 Lucky）：每条反代规则可单独开启"需要用户名密码"，
+//  开启后访问该规则地址必须通过 HTTP Basic Auth，否则 401 + WWW-Authenticate。
+//
+//  真相存哪：**不新增 DB 列**（proxies 表的列清单在 repository.go 里固定，
+//  本轮的改动范围刻意不包含 store.go / repository.go）。鉴权配置以 JSON 存进
+//  面板已有的 settings 表，键 `proxy_auth.<id>`：{enabled,user,hash}。
+//  applyProxy 在生成配置前把它装回 Rule，所以"一条规则的鉴权"只有这一份真相。
+//
+//  口令哈希用什么：**apr1**（Apache MD5，带 8 字符随机盐 + 1000 轮拉伸）。
+//  项目面板口令用的是 bcrypt，但 nginx 的 auth_basic_user_file 在本机
+//  （macOS + nginx 1.31.5）实测**不支持 bcrypt**：$2a$/$2y$/$2b$ 三种前缀都是
+//  "正确口令也回 401"（2026-09-25 实测）。apr1 是 nginx 自己实现的，实测可用。
+//  无论哪种，仓库里**只有哈希**：明文只存在于这次请求的内存里，绝不落盘/进日志。
+// ============================================================================
+
+const proxyAuthSettingPrefix = "proxy_auth."
+
+// proxyAuthConfig 是持久化的鉴权配置（settings 表里一行 JSON）。
+type proxyAuthConfig struct {
+	Enabled bool   `json:"enabled"`
+	User    string `json:"user"`
+	Hash    string `json:"hash"`
+}
+
+func proxyAuthKey(id int64) string {
+	return proxyAuthSettingPrefix + strconv.FormatInt(id, 10)
+}
+
+// proxyAuthFile 返回某条规则的 htpasswd 文件路径。
+//
+// 放在 DataDir 下（与证书同一个根），由面板生成、0600、属主对齐 DataDir ——
+// 与 alignProxyCertOwner 同一条真机教训：nginx 读不到就是 401 到底/配置报错。
+func (s *Server) proxyAuthFile(id int64) string {
+	return filepath.Join(s.Cfg.DataDir, "proxy-auth", fmt.Sprintf("proxy-%d.htpasswd", id))
+}
+
+// loadProxyAuth 读取一条规则的鉴权配置（没有就返回零值 = 未开启）。
+func (s *Server) loadProxyAuth(ctx context.Context, id int64) (proxyAuthConfig, error) {
+	raw, err := s.Store.GetSetting(ctx, proxyAuthKey(id))
+	if err != nil {
+		return proxyAuthConfig{}, fmt.Errorf("读取规则 %d 的访问鉴权配置失败：%w", id, err)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return proxyAuthConfig{}, nil
+	}
+	var cfg proxyAuthConfig
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return proxyAuthConfig{}, fmt.Errorf("规则 %d 的访问鉴权配置已损坏（%v）；"+
+			"请到该规则的「编辑」里重新设置用户名与密码", id, err)
+	}
+	return cfg, nil
+}
+
+// saveProxyAuth 写入一条规则的鉴权配置（关闭时也写一行 enabled=false，保持显式）。
+func (s *Server) saveProxyAuth(ctx context.Context, id int64, cfg proxyAuthConfig) error {
+	if !cfg.Enabled {
+		cfg = proxyAuthConfig{}
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("序列化访问鉴权配置失败：%w", err)
+	}
+	if err := s.Store.SetSetting(ctx, proxyAuthKey(id), string(b)); err != nil {
+		return fmt.Errorf("保存访问鉴权配置失败：%w", err)
+	}
+	return nil
+}
+
+// hydrateProxyAuth 把持久化的鉴权配置装回 Rule（生成 nginx 配置前必须调用）。
+//
+// 这是唯一把 Auth* 字段填进 Rule 的地方：仓库层读出来的 Rule 永远没有这几个字段，
+// 任何一个"重新生成配置"的路径漏了这一步，鉴权就会被静默抹掉 —— 所以
+// applyProxy 在生成前统一调用它，而不是指望每个调用方自觉。
+func (s *Server) hydrateProxyAuth(ctx context.Context, rule *proxies.Rule) error {
+	if rule == nil {
+		return nil
+	}
+	cfg, err := s.loadProxyAuth(ctx, rule.ID)
+	if err != nil {
+		return err
+	}
+	rule.AuthEnabled = cfg.Enabled
+	rule.AuthUser = cfg.User
+	rule.AuthHash = cfg.Hash
+	if cfg.Enabled {
+		rule.AuthFile = s.proxyAuthFile(rule.ID)
+	} else {
+		rule.AuthFile = ""
+	}
+	return nil
+}
+
+// writeProxyAuthFile 按当前 Rule 的鉴权配置生成/删除 htpasswd 文件。
+//
+// 关闭鉴权时把文件删掉：vhost 已经不再引用它，留着就是一份没用的口令哈希躺在盘上。
+func (s *Server) writeProxyAuthFile(rule *proxies.Rule) error {
+	if rule == nil {
+		return nil
+	}
+	if !rule.AuthEnabled {
+		if rule.ID > 0 {
+			_ = os.Remove(s.proxyAuthFile(rule.ID))
+		}
+		return nil
+	}
+	if strings.TrimSpace(s.Cfg.DataDir) == "" {
+		return fmt.Errorf("数据目录未配置，无法生成访问鉴权的密码文件")
+	}
+	path := s.proxyAuthFile(rule.ID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("创建密码文件目录失败：%w", err)
+	}
+	// 一行一个用户；哈希里不含换行，用户名在写入前已校验过。
+	content := rule.AuthUser + ":" + rule.AuthHash + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("写入密码文件失败：%w", err)
+	}
+	s.alignProxyAuthOwner(path)
+	return nil
+}
+
+// alignProxyAuthOwner 把密码文件的属主对齐到 DataDir（与证书同一条真机教训）。
+//
+// 面板以 root 跑、nginx 以真实用户跑；root 用 0600 写出的文件 nginx 读不到，
+// 表现为 nginx 报 permission denied 或一律 401。只改属主、不放宽权限。
+func (s *Server) alignProxyAuthOwner(path string) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	fi, err := os.Stat(s.Cfg.DataDir)
+	if err != nil {
+		return
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	if err := os.Chown(path, int(st.Uid), int(st.Gid)); err != nil && s.Log != nil {
+		s.Log.Warn("调整密码文件 %s 属主失败：%v", path, err)
+	}
+}
+
+// proxyAuthFromRequest 把请求里的鉴权字段合并到已有配置并校验。
+//
+// 语义：
+//   - auth_password 非空才更新哈希；空串 = 保持原密码（前端不回显密码，所以
+//     "只改用户名/改备注"不会被迫重设密码）；
+//   - 关闭鉴权时把用户名与哈希一起清掉（不留残料）；
+//   - 开启时用户名与哈希都必须在 —— 少一个就明确报错，绝不生成一份没有鉴权的配置。
+func proxyAuthFromRequest(req proxyReq, cur proxyAuthConfig) (proxyAuthConfig, error) {
+	next := cur
+	if req.AuthEnabled != nil {
+		next.Enabled = *req.AuthEnabled
+	}
+	if req.AuthUser != nil {
+		next.User = strings.TrimSpace(*req.AuthUser)
+	}
+	if req.AuthPassword != nil && *req.AuthPassword != "" {
+		hash, err := hashProxyBasicAuthPassword(*req.AuthPassword)
+		if err != nil {
+			return proxyAuthConfig{}, err
+		}
+		next.Hash = hash
+	}
+	if !next.Enabled {
+		return proxyAuthConfig{Enabled: false}, nil
+	}
+	if next.User == "" {
+		return proxyAuthConfig{}, fmt.Errorf("已开启「需要用户名密码」，请填一个用户名")
+	}
+	if strings.ContainsAny(next.User, ":\r\n") {
+		return proxyAuthConfig{}, fmt.Errorf("用户名不能包含冒号或换行（htpasswd 用冒号分隔用户名与哈希）")
+	}
+	if len(next.User) > 128 {
+		return proxyAuthConfig{}, fmt.Errorf("用户名过长（%d 字符，最多 128）", len(next.User))
+	}
+	if next.Hash == "" {
+		return proxyAuthConfig{}, fmt.Errorf("已开启「需要用户名密码」，请设置密码（编辑已有规则时留空表示沿用原密码）")
+	}
+	return next, nil
+}
+
+// proxyAuthView 回读一条规则**磁盘上生效的**鉴权配置。
+//
+// 这是"保存后回读生效值"的实现：不只看数据库里写了什么，而是看
+//
+//	① htpasswd 文件真的在、里面真的有这个用户与哈希；
+//	② 生成的 nginx 配置里真的有 auth_basic 与指向该文件的 auth_basic_user_file。
+//
+// 两者都对才算 verified=true；否则 verified=false + note 写清卡在哪一步 ——
+// 界面据此显示"未复核"，而不是只报一句"已保存"。
+func (s *Server) proxyAuthView(ctx context.Context, rule *proxies.Rule) map[string]any {
+	view := map[string]any{
+		"enabled": false, "user": "", "password_set": false,
+		"verified": false, "note": "",
+	}
+	if rule == nil {
+		return view
+	}
+	cfg, err := s.loadProxyAuth(ctx, rule.ID)
+	if err != nil {
+		view["note"] = "未复核：" + err.Error()
+		return view
+	}
+	view["enabled"] = cfg.Enabled
+	view["user"] = cfg.User
+	view["password_set"] = cfg.Hash != ""
+	if !cfg.Enabled {
+		return view
+	}
+	path := s.proxyAuthFile(rule.ID)
+	view["user_file"] = path
+	b, ferr := os.ReadFile(path)
+	if ferr != nil {
+		view["note"] = "未复核：读不到生成的密码文件 " + path + "（" + ferr.Error() + "）"
+		return view
+	}
+	fileUser, hasHash := parseHtpasswdFirstUser(string(b))
+	view["user_file_user"] = fileUser
+	view["user_file_has_hash"] = hasHash
+
+	vhostPath := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
+	view["vhost_path"] = vhostPath
+	vh, verr := os.ReadFile(vhostPath)
+	if verr != nil {
+		view["note"] = "未复核：读不到 nginx 配置文件 " + vhostPath +
+			"（规则可能已停用或还没生成；nginx 未加载时鉴权不生效）"
+		return view
+	}
+	content := string(vh)
+	hasAuth := strings.Contains(content, "auth_basic ")
+	hasFile := strings.Contains(content, "auth_basic_user_file "+path+";")
+	view["vhost_has_auth_basic"] = hasAuth
+	view["vhost_has_user_file"] = hasFile
+	if fileUser != "" && fileUser == cfg.User && hasHash && hasAuth && hasFile {
+		view["verified"] = true
+		return view
+	}
+	view["note"] = fmt.Sprintf("未复核：生成的配置与保存值不一致"+
+		"（密码文件里的用户=%q、含哈希=%v；nginx 配置含 auth_basic=%v、指向本文件的 auth_basic_user_file=%v）",
+		fileUser, hasHash, hasAuth, hasFile)
+	return view
+}
+
+// parseHtpasswdFirstUser 解析 htpasswd 的第一条有效行，返回 (用户名, 是否带哈希)。
+//
+// 只为回读/展示用，不做校验（校验由 nginx 自己做）。
+func parseHtpasswdFirstUser(content string) (string, bool) {
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		i := strings.Index(ln, ":")
+		if i <= 0 {
+			return "", false
+		}
+		return ln[:i], strings.TrimSpace(ln[i+1:]) != ""
+	}
+	return "", false
+}
+
+// hashProxyBasicAuthPassword 生成 apr1 口令哈希（带 8 字符随机盐）。
+func hashProxyBasicAuthPassword(password string) (string, error) {
+	salt, err := randomApr1Salt()
+	if err != nil {
+		return "", err
+	}
+	return apr1Crypt(password, salt), nil
+}
+
+// apr1SaltChars 是 apr1 盐使用的字符表（与 apr1 的 itoa64 一致，取前 64 个）。
+const apr1SaltChars = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func randomApr1Salt() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成随机盐失败：%w", err)
+	}
+	out := make([]byte, 8)
+	for i, b := range buf {
+		out[i] = apr1SaltChars[int(b)%len(apr1SaltChars)]
+	}
+	return string(out), nil
+}
+
+// apr1Crypt 实现 Apache 的 apr1（MD5 crypt）口令哈希。
+//
+// 为什么在仓库里自己实现而不是调 `openssl passwd -apr1`：后者要把明文口令
+// 放进命令行参数 —— 同一台机器上 `ps` 就能看到，违反"口令不进日志/进程表"。
+// 算法是 Apache apr_md5.c 的公开实现，输出形如 `$apr1$<salt>$<22 字符>`，
+// nginx 的 auth_basic_user_file 原生支持（本机 nginx 1.31.5 实测 200/401 正确）。
+func apr1Crypt(password, salt string) string {
+	if len(salt) > 8 {
+		salt = salt[:8]
+	}
+	// 第一轮：md5(password + "$apr1$" + salt)
+	h := md5.New()
+	_, _ = h.Write([]byte(password))
+	_, _ = h.Write([]byte("$apr1$"))
+	_, _ = h.Write([]byte(salt))
+
+	// md5(password + salt + password)，按 length 规则混入
+	alt := md5.New()
+	_, _ = alt.Write([]byte(password))
+	_, _ = alt.Write([]byte(salt))
+	_, _ = alt.Write([]byte(password))
+	altSum := alt.Sum(nil)
+	for i := len(password); i > 0; i -= 16 {
+		if i > 16 {
+			_, _ = h.Write(altSum)
+		} else {
+			_, _ = h.Write(altSum[:i])
+		}
+	}
+	for i := len(password); i > 0; i >>= 1 {
+		if i&1 != 0 {
+			_, _ = h.Write([]byte{0})
+		} else if len(password) > 0 {
+			_, _ = h.Write([]byte{password[0]})
+		}
+	}
+	sum := h.Sum(nil)
+
+	// 1000 轮拉伸
+	for i := 0; i < 1000; i++ {
+		c := md5.New()
+		if i&1 != 0 {
+			_, _ = c.Write([]byte(password))
+		} else {
+			_, _ = c.Write(sum)
+		}
+		if i%3 != 0 {
+			_, _ = c.Write([]byte(salt))
+		}
+		if i%7 != 0 {
+			_, _ = c.Write([]byte(password))
+		}
+		if i&1 != 0 {
+			_, _ = c.Write(sum)
+		} else {
+			_, _ = c.Write([]byte(password))
+		}
+		sum = c.Sum(nil)
+	}
+
+	var b strings.Builder
+	b.WriteString("$apr1$")
+	b.WriteString(salt)
+	b.WriteByte('$')
+	// 按 apr_md5.c 的固定顺序编码 16 字节。
+	groups := [][3]int{{0, 6, 12}, {1, 7, 13}, {2, 8, 14}, {3, 9, 15}, {4, 10, 5}}
+	for _, g := range groups {
+		v := int(sum[g[0]])<<16 | int(sum[g[1]])<<8 | int(sum[g[2]])
+		b.WriteString(apr1To64(v, 4))
+	}
+	b.WriteString(apr1To64(int(sum[11]), 2))
+	return b.String()
+}
+
+// apr1To64 是 apr1 的自定义 base64 编码（低位在前）。
+func apr1To64(v, n int) string {
+	out := make([]byte, 0, n)
+	for ; n > 0; n-- {
+		out = append(out, apr1SaltChars[v&0x3f])
+		v >>= 6
+	}
+	return string(out)
 }
 
 // proxyLookupHostFn 是"目标是公网还是局域网"判定用的 DNS 解析器。
@@ -100,14 +478,162 @@ func (s *Server) handleProxyList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ============================================================================
+//  规则「实时状态」的 TTL 缓存（2026-09-19 用户报"反向代理页明显变慢"）
+//
+//  根因：handleProxyList 对每条规则都**串行**跑一次真实目标探测
+//  （proxyProbeTargetFn，超时 3s）与一次端口拨号（portListening，超时 800ms）。
+//  目标不可达时每条就是几秒，规则一多整页就是"明显需要等待" ——
+//  这正是 AGENTS 第三节坑 165：昂贵的真实探测不许放在列表/首屏路径上。
+//
+//  修法：列表只读这里的缓存（带检测时间）；探测改为前端渲染后异步触发，
+//  并发、每条短超时（≤500ms），结果写回缓存；缓存的旧结果带检测时间展示。
+// ============================================================================
+
+const (
+	// proxyStatusTTL 是"结果还算新鲜"的时长；超过它界面要标出实际检测时间。
+	proxyStatusTTL = 60 * time.Second
+	// proxyStatusProbeTimeout 是单条规则状态探测的超时（端口拨号 + 目标 TCP 连接）。
+	//
+	// 刻意远小于列表接口里原来的 3s：状态是"锦上添花"，不值得让用户等。
+	proxyStatusProbeTimeout = 500 * time.Millisecond
+	// proxyStatusProbeConcurrency 是并发探测的条数上限（避免一次开太多 fd）。
+	proxyStatusProbeConcurrency = 8
+)
+
+// proxyStatusEntry 是一条规则的探测结果缓存项。
+type proxyStatusEntry struct {
+	Listening bool
+	Reachable bool
+	Detail    string
+	At        time.Time
+}
+
+// proxyStatusSnapshot 是给视图/接口用的只读快照。
+type proxyStatusSnapshot struct {
+	// Known 表示缓存里有没有这条规则的结果（没有 = 从未探测过）。
+	Known bool
+	// Stale 表示结果已超过 TTL（界面必须标"约 N 秒前检测"，不能当实时）。
+	Stale     bool
+	Listening bool
+	Reachable bool
+	Detail    string
+	At        time.Time
+	Age       time.Duration
+}
+
+// proxyStatusCache 进程内缓存。
+//
+// 用包级变量而不是 Server 字段：Server 结构体在 server.go，不在本轮允许改动的
+// 文件范围内。键里带 target/listen，避免测试之间同 id 不同规则串结果。
+var proxyStatusCache = struct {
+	mu sync.Mutex
+	m  map[string]proxyStatusEntry
+}{m: map[string]proxyStatusEntry{}}
+
+func proxyStatusKey(rule *proxies.Rule) string {
+	if rule == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d|%d|%s", rule.ID, rule.Listen, rule.Target)
+}
+
+func proxyStatusLookup(rule *proxies.Rule) proxyStatusSnapshot {
+	key := proxyStatusKey(rule)
+	if key == "" {
+		return proxyStatusSnapshot{}
+	}
+	proxyStatusCache.mu.Lock()
+	e, ok := proxyStatusCache.m[key]
+	proxyStatusCache.mu.Unlock()
+	if !ok {
+		return proxyStatusSnapshot{}
+	}
+	age := time.Since(e.At)
+	if age < 0 {
+		age = 0
+	}
+	return proxyStatusSnapshot{
+		Known: true, Stale: age > proxyStatusTTL,
+		Listening: e.Listening, Reachable: e.Reachable, Detail: e.Detail,
+		At: e.At, Age: age,
+	}
+}
+
+func proxyStatusStore(rule *proxies.Rule, listening, reachable bool, detail string, at time.Time) {
+	key := proxyStatusKey(rule)
+	if key == "" {
+		return
+	}
+	proxyStatusCache.mu.Lock()
+	proxyStatusCache.m[key] = proxyStatusEntry{
+		Listening: listening, Reachable: reachable, Detail: detail, At: at,
+	}
+	proxyStatusCache.mu.Unlock()
+}
+
+// proxyStatusResetCache 清空缓存（单测用；生产没有调用方）。
+func proxyStatusResetCache() {
+	proxyStatusCache.mu.Lock()
+	proxyStatusCache.m = map[string]proxyStatusEntry{}
+	proxyStatusCache.mu.Unlock()
+}
+
+// probeProxyStatuses 并发探测一批规则的状态，写进缓存并返回逐条结果。
+//
+// 每条都带 500ms 超时；用信号量限制并发。**绝不在 HTTP 列表路径里调用它** ——
+// 只由前端渲染完后的异步探测请求（或用户点「检测」）触发。
+func (s *Server) probeProxyStatuses(ctx context.Context, rules []*proxies.Rule) map[int64]proxyStatusSnapshot {
+	out := map[int64]proxyStatusSnapshot{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, proxyStatusProbeConcurrency)
+	at := time.Now()
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r *proxies.Rule) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			pctx, cancel := context.WithTimeout(ctx, proxyStatusProbeTimeout)
+			defer cancel()
+			listening := false
+			if r.Enabled {
+				listening = portListening(pctx, r.Listen)
+			}
+			reachable, detail := proxyProbeTargetFn(pctx, r.Target)
+			proxyStatusStore(r, listening, reachable, detail, at)
+			mu.Lock()
+			out[r.ID] = proxyStatusSnapshot{
+				Known: true, Listening: listening, Reachable: reachable,
+				Detail: detail, At: at,
+			}
+			mu.Unlock()
+		}(rule)
+	}
+	wg.Wait()
+	return out
+}
+
 // proxyView 组装一条规则给前端的样子（含实时状态）。
 func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]any {
-	listening := false
-	if rule.Enabled {
-		listening = portListening(ctx, rule.Listen)
+	// 鉴权配置装回 Rule（仓库层读出来的 Rule 没有这几个字段）。
+	if err := s.hydrateProxyAuth(ctx, rule); err != nil && s.Log != nil {
+		s.Log.Warn("读取规则 %d 的鉴权配置失败：%v", rule.ID, err)
 	}
+	auth := s.proxyAuthView(ctx, rule)
+
+	// 实时状态只读 TTL 缓存：**列表路径绝不跑真实探测**（见上面的缓存说明）。
+	st := proxyStatusLookup(rule)
+	detail := st.Detail
+	if !st.Known {
+		detail = "尚未检测：打开本页后会自动探测（也可以点这条规则上的「检测」）"
+	}
+
 	host, port, _ := rule.TargetHostPort()
-	reachable, detail := proxyProbeTargetFn(ctx, rule.Target)
 	vhost := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
 	_, statErr := os.Stat(vhost)
 	// 域名兜底块是否存在：界面要能看出"域名限制到底有没有生效"，
@@ -139,16 +665,22 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"redirect_http":    rule.RedirectHTTP,
 		"created_at":       rule.Created,
 		"updated_at":       rule.Updated,
-		"port_listening":   listening,
+		"port_listening":   st.Listening,
 		"target_host":      host,
 		"target_port":      port,
-		"target_ok":        reachable,
+		"target_ok":        st.Reachable,
 		"target_detail":    detail,
-		"config_written":   statErr == nil,
-		"config_path":      vhost,
-		"domain_guard":     domainGuard,
-		"reject_written":   rejectErr == nil,
-		"reject_path":      reject,
+		// 状态探测的元信息：谁在什么时候测的、结果新不新鲜。界面据此显示
+		// "约 N 秒前检测"，绝不把过期缓存当成实时状态（诚实原则）。
+		"status_probed":       st.Known,
+		"status_stale":        st.Stale,
+		"status_probe_at":     statusProbeAtString(st),
+		"status_probe_age_ms": statusProbeAgeMS(st),
+		"config_written":      statErr == nil,
+		"config_path":         vhost,
+		"domain_guard":        domainGuard,
+		"reject_written":      rejectErr == nil,
+		"reject_path":         reject,
 		// HTTPS：既要能被列表行直接读（ssl_enabled 等平铺字段），
 		// 也要有一份"证书文件实际内容"的汇总（ssl.days_left / ssl.domains）。
 		"ssl_enabled":  rule.SSLEnabled,
@@ -157,6 +689,12 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"ssl_provider": rule.SSLProvider,
 		"ssl_expires":  rule.SSLExpires,
 		"ssl":          s.proxySSLView(rule),
+		// ---- 访问鉴权（HTTP Basic Auth）----
+		"auth":          auth,
+		"auth_enabled":  auth["enabled"],
+		"auth_user":     auth["user"],
+		"auth_verified": auth["verified"],
+		"auth_note":     auth["note"],
 		// ---- 局域网出口 ----
 		"lan_forward":          rule.LANForwardMode(),
 		"lan_forward_label":    proxies.LANForwardLabel(rule.LANForwardMode()),
@@ -173,6 +711,21 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		// 直连 + 局域网目标 = 随时可能被 macOS 隐私门拦成 502。
 		"lan_direct_warning": scope == proxies.ScopePrivate && !fwdListening && rule.Enabled,
 	}
+}
+
+// statusProbeAtString / statusProbeAgeMS 是给前端的检测时间展示字段。
+func statusProbeAtString(st proxyStatusSnapshot) string {
+	if !st.Known || st.At.IsZero() {
+		return ""
+	}
+	return st.At.Format(time.RFC3339)
+}
+
+func statusProbeAgeMS(st proxyStatusSnapshot) int64 {
+	if !st.Known {
+		return -1
+	}
+	return st.Age.Milliseconds()
 }
 
 // proxySSLView 汇总反代规则证书的展示字段（与站点侧 siteSSLView 同一套口径）。
@@ -312,6 +865,14 @@ type proxyReq struct {
 	// 刻意**不接受** forward_port 输入：它是转发器分配出来的回环端口，
 	// 让前端能随便指定会让 nginx 指向一个没人听的端口（或撞上别的服务）。
 	LANForward *string `json:"lan_forward"`
+
+	// ---- HTTP Basic Auth（"需要用户名密码"）----
+	//
+	// AuthPassword 是**只写**字段：请求里非空才更新哈希，空串表示沿用原密码
+	// （前端不回显密码）。响应里永远没有它，也没有哈希（见 Rule.AuthHash 的 json:"-"）。
+	AuthEnabled  *bool   `json:"auth_enabled"`
+	AuthUser     *string `json:"auth_user"`
+	AuthPassword *string `json:"auth_password"`
 }
 
 func (req proxyReq) apply(rule *proxies.Rule) {
@@ -392,6 +953,13 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 访问鉴权先解析并校验（此时还没建库）：缺用户名/密码就在建规则之前拒绝，
+	// 不留下"规则建好了、鉴权没生效"的半成品。
+	authCfg, aerr := proxyAuthFromRequest(req, proxyAuthConfig{})
+	if aerr != nil {
+		fail(w, http.StatusBadRequest, aerr.Error())
+		return
+	}
 	if !s.nginxInstalled() {
 		fail(w, http.StatusConflict, "反向代理需要 nginx：请先到「应用市场 → 网站环境」安装 nginx")
 		return
@@ -416,11 +984,23 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 鉴权配置先落库：applyProxy 生成配置时从 settings 把它装回 Rule。
+	if err := s.saveProxyAuth(r.Context(), created.ID, authCfg); err != nil {
+		_ = s.proxyRepo().Delete(r.Context(), created.ID)
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 后续任何一步失败都会把规则删掉，鉴权配置与它生成的 htpasswd 文件也要一起清掉。
+	cleanupCreatedAuth := func() {
+		_ = s.saveProxyAuth(r.Context(), created.ID, proxyAuthConfig{})
+		_ = os.Remove(s.proxyAuthFile(created.ID))
+	}
 	// 先起回环转发器（如果需要），再生成 nginx 配置：proxy_pass 里的端口是
 	// 转发器分配出来的，顺序反了就会写成一个没人听的端口。
 	if err := s.syncForwarder(created); err != nil {
 		s.forwarders.Stop(created.ID)
 		_ = s.proxyRepo().Delete(r.Context(), created.ID)
+		cleanupCreatedAuth()
 		fail(w, http.StatusBadGateway, "规则已保存但回环转发器无法启动："+err.Error())
 		return
 	}
@@ -428,6 +1008,7 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		if err := s.proxyRepo().SetForwardPort(r.Context(), created.ID, created.ForwardPort); err != nil {
 			s.forwarders.Stop(created.ID)
 			_ = s.proxyRepo().Delete(r.Context(), created.ID)
+			cleanupCreatedAuth()
 			fail(w, http.StatusInternalServerError, "回环转发端口落库失败："+err.Error())
 			return
 		}
@@ -436,6 +1017,7 @@ func (s *Server) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 		// 配置写不进去就把记录删掉，避免留下一条"看着在、其实没生效"的规则
 		s.forwarders.Stop(created.ID)
 		_ = s.proxyRepo().Delete(r.Context(), created.ID)
+		cleanupCreatedAuth()
 		fail(w, http.StatusBadGateway, "规则已保存但 nginx 配置应用失败："+err.Error())
 		return
 	}
@@ -477,6 +1059,17 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 访问鉴权：在旧配置基础上合并本次请求（空密码 = 沿用原密码）。
+	prevAuth, perr := s.loadProxyAuth(r.Context(), id)
+	if perr != nil {
+		fail(w, http.StatusInternalServerError, perr.Error())
+		return
+	}
+	authCfg, aerr := proxyAuthFromRequest(req, prevAuth)
+	if aerr != nil {
+		fail(w, http.StatusBadRequest, aerr.Error())
+		return
+	}
 	if other, cerr := repo.ConflictWith(r.Context(), &next); cerr == nil && other != nil {
 		fail(w, http.StatusConflict, fmt.Sprintf(
 			"和规则「%s」（同端口 %d、同域名/路径）冲突，nginx 只会用先加载的那一条", other.Name, other.Listen))
@@ -513,10 +1106,17 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 鉴权配置先落库再写盘：applyProxy 从 settings 读它生成 auth_basic。
+	// 写盘失败时把鉴权配置恢复成旧值，再回滚旧配置（否则回滚出的 vhost 会带着新密码）。
+	if err := s.saveProxyAuth(r.Context(), id, authCfg); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := s.applyProxy(r.Context(), &next); err != nil {
-		_ = s.applyProxy(r.Context(), cur)  // 回滚成旧配置
-		_ = s.syncForwarder(cur)            // 转发器也跟着回滚（含端口）
-		_ = s.syncRejectBlocks(r.Context()) // 兜底块也回到数据库描述的状态
+		_ = s.saveProxyAuth(r.Context(), id, prevAuth) // 鉴权配置回滚
+		_ = s.applyProxy(r.Context(), cur)             // 回滚成旧配置
+		_ = s.syncForwarder(cur)                       // 转发器也跟着回滚（含端口）
+		_ = s.syncRejectBlocks(r.Context())            // 兜底块也回到数据库描述的状态
 		fail(w, http.StatusBadGateway, "应用新配置失败（已回滚）："+err.Error())
 		return
 	}
@@ -562,6 +1162,11 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// 规则没了，回环监听器也必须跟着消失：留着就是"删了规则却还开着端口"。
 	s.forwarders.Stop(id)
+	// 鉴权配置与 htpasswd 文件也一起清掉：留着一份没人引用的口令哈希没有意义。
+	if err := s.saveProxyAuth(r.Context(), id, proxyAuthConfig{}); err != nil && s.Log != nil {
+		s.Log.Warn("清理规则 %d 的鉴权配置失败：%v", id, err)
+	}
+	_ = os.Remove(s.proxyAuthFile(id))
 	detail := fmt.Sprintf("%d → %s", cur.Listen, cur.Target)
 	if err := s.syncRejectBlocks(r.Context()); err != nil {
 		s.rejectGuardFailed(w, r, "proxy_delete", cur.Name,
@@ -651,12 +1256,58 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 // handleProxyTest 在保存前试一次目标可达性（界面上的「测试连通」按钮）。
 //
 // 单独一个接口而不是保存时顺带做：用户想在**不落库**的情况下先确认地址对不对。
+//
+// 同时承接**列表状态的异步探测**：{all:true} 或 {ids:[...]} 时走批量分支，
+// 并发探测（每条 ≤500ms）并把结果写进 TTL 缓存。两种用法共用一个路由，
+// 是为了不新增路由（server.go 不在本轮改动范围）。
 func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Target string `json:"target"`
+		Target string  `json:"target"`
+		IDs    []int64 `json:"ids"`
+		All    bool    `json:"all"`
 	}
 	if err := decode(r, &req); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.All || len(req.IDs) > 0 {
+		list, err := s.proxyRepo().List(r.Context())
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if len(req.IDs) > 0 {
+			want := make(map[int64]bool, len(req.IDs))
+			for _, id := range req.IDs {
+				want[id] = true
+			}
+			filtered := make([]*proxies.Rule, 0, len(list))
+			for _, rule := range list {
+				if want[rule.ID] {
+					filtered = append(filtered, rule)
+				}
+			}
+			list = filtered
+		}
+		res := s.probeProxyStatuses(r.Context(), list)
+		items := make([]map[string]any, 0, len(list))
+		for _, rule := range list {
+			st := res[rule.ID]
+			items = append(items, map[string]any{
+				"id":             rule.ID,
+				"enabled":        rule.Enabled,
+				"port_listening": st.Listening,
+				"target_ok":      st.Reachable,
+				"target_detail":  st.Detail,
+				"probed_at":      st.At.Format(time.RFC3339),
+			})
+		}
+		ok(w, map[string]any{
+			"list": items,
+			// 全局检测时间：界面显示"约 N 秒前检测"时以它为准（每条的 probed_at 相同）。
+			"probed_at":   time.Now().Format(time.RFC3339),
+			"ttl_seconds": int(proxyStatusTTL.Seconds()),
+		})
 		return
 	}
 	reachable, detail := probeTarget(r.Context(), strings.TrimSpace(req.Target))
@@ -1794,6 +2445,14 @@ func isDuplicateDefaultServer(err error) bool {
 func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if !rule.Enabled {
 		return s.removeProxyConfig(ctx, rule)
+	}
+	// 生成前统一把鉴权配置装回 Rule 并落 htpasswd 文件：所有"重新生成配置"的
+	// 路径（新建/更新/启停/绑证书/启动对齐）都经过这里，不会漏掉鉴权。
+	if err := s.hydrateProxyAuth(ctx, rule); err != nil {
+		return err
+	}
+	if err := s.writeProxyAuthFile(rule); err != nil {
+		return err
 	}
 	content, err := rule.Generate(s.proxyLogDir())
 	if err != nil {

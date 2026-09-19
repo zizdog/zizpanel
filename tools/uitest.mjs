@@ -423,11 +423,11 @@ try {
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(1200);
     await shot('05-settings');
-    // 2026-09-20 用户要求把「上传与执行限制」放进面板设置（phpMyAdmin 导入 413
-    // 就是在这里改的）；顺序 = 访问与安全 → 上传与执行限制 → 文件与终端 →
-    // 账号与两步验证 → 检查更新。
+    // 面板设置现在只有 3 个 Tab：访问与安全 → 账号与两步验证 → 检查更新。
+    // 2026-09-25 用户要求：「上传与执行限制」在网站管理里已经有了 → 从设置里去掉；
+    // 「文件与终端」的内容并入「访问与安全」（终端开关、当前会话、文件可访问范围都在里面）。
     const titles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
-    const want = ['访问与安全', '上传与执行限制', '文件与终端', '账号与两步验证', '检查更新'];
+    const want = ['访问与安全', '账号与两步验证', '检查更新'];
     const got = titles.filter((t) => want.includes(t));
     if (got.join('|') !== want.join('|')) {
       throw new Error(`设置页 Tab 顺序不对：期望 ${want.join(' → ')}，实际 ${got.join(' → ')}`);
@@ -446,48 +446,33 @@ try {
     }
   });
 
-  // ---------- 上传与执行限制（用户报障 413 的入口）----------
+  // ---------- 设置里不该再有「上传与执行限制」「文件与终端」----------
   //
-  // 只验证"入口在、表单有默认值、生效值会回读"：**不点保存**——
-  // 保存会真的走任务（写 vhost / 重启 php-fpm），本地非 root 实例上会失败，
-  // 那属于 privStep 的范围；这里读接口是只读的。
-  await step('面板设置 → 上传与执行限制：表单默认值 + 生效值回读', async () => {
+  // 2026-09-25 用户要求：①「上传与执行限制」在网站管理里已经有了 → 设置里去掉；
+  // ②「文件与终端」的内容并入「访问与安全」。
+  // 这里**只做只读断言**（不点保存）：两个旧 Tab 必须消失，旧路由别名落地后不能白屏。
+  await step('面板设置：旧 Tab（上传与执行限制 / 文件与终端）已移除且别名不白屏', async () => {
     await page.click('.nav-item:has-text("面板设置")');
-    await page.waitForTimeout(600);
-    await page.click('button:has-text("上传与执行限制")');
-    await page.waitForSelector('.card-head h3:has-text("上传与执行限制")', { timeout: 15000 });
-    await page.waitForTimeout(1500);
-    const txt = await page.locator('.content').innerText();
-    for (const need of ['client_max_body_size', 'upload_max_filesize', 'post_max_size',
-      'memory_limit', 'max_execution_time', '当前生效值']) {
-      if (!txt.includes(need)) throw new Error(`上传与执行限制页缺少「${need}」`);
+    await page.waitForTimeout(900);
+    for (const gone of ['上传与执行限制', '文件与终端']) {
+      const asTab = await page.locator(`.content button.btn-sm:has-text("${gone}")`).count();
+      if (asTab > 0) {
+        throw new Error(`面板设置里仍有「${gone}」Tab（用户要求移除/并入「访问与安全」）`);
+      }
     }
-    // 默认值必须真的填进表单（默认就要能用，不能让用户先撞 413 才知道要改）。
-    // ⚠️ nginx 的 client_max_body_size **不在这里编辑**（2026-09-22 用户报障：
-    // "Nginx 管理和上传大小 / 执行时间严重重复"）—— 这一页只做**只读展示**，
-    // 并指路到唯一可编辑入口「⚙️ 调整配置 → nginx → 性能调整」。
-    const vals = await page.locator('.content input.input').evaluateAll((els) => els.map((e) => e.value));
-    if (vals.includes('512m')) {
-      throw new Error('这一页不该再有 client_max_body_size 的可编辑控件'
-        + '（同一个值只能在「调整配置 → nginx → 性能调整」里改）：' + JSON.stringify(vals));
+    // 旧路由别名：不能白屏，要能落到设置页里可见的内容。
+    for (const h of ['/settings/limits', '/settings/terminal']) {
+      await page.evaluate((x) => { location.hash = '#' + x; }, h);
+      await page.waitForTimeout(900);
+      const txt = await page.locator('.content').innerText();
+      if (!/访问与安全|账号与两步验证|检查更新/.test(txt)) {
+        throw new Error(`旧路由 #${h} 落地后看不到设置页内容（可能白屏）：` + txt.slice(0, 200));
+      }
     }
-    if (!vals.includes('512M')) {
-      throw new Error('PHP 上传上限的默认值没有填进表单（应为 512M）：' + JSON.stringify(vals));
-    }
-    const codes = (await page.locator('.content code.code').allInnerTexts()).map((t) => t.trim());
-    if (!codes.includes('512m')) {
-      throw new Error('这一页应当把 nginx 当前值**只读展示**出来（512m）：' + JSON.stringify(codes));
-    }
-    if (!txt.includes('性能调整')) {
-      throw new Error('只读展示必须配一句"去哪里改"（要指向「调整配置 → nginx → 性能调整」）');
-    }
-    if (/(^|\s)(null|undefined)(\s|$)/.test(txt)) {
-      throw new Error('上传与执行限制页出现字面量 null/undefined：' + txt.slice(0, 300));
-    }
-    await shot('06b-settings-limits');
+    await shot('06b-settings-no-limits');
   });
 
-  // ---------- 检查更新（2026-09-20 收进「面板设置」第 4 个 Tab）----------
+  // ---------- 检查更新（2026-09-20 收进「面板设置」第 3 个 Tab）----------
   await step('设置页「检查更新」Tab 可打开，且没有重复的更新按钮', async () => {
     if (await page.locator('.nav-item:has-text("检查更新")').count()) {
       throw new Error('侧栏不该再有「检查更新」入口（已收回面板设置，重复入口会让用户困惑）');
@@ -698,6 +683,12 @@ try {
       page.on('framenavigated', onNav);
       navs = 0;
       await btn.first().click();
+      // 2026-09-25 用户要求「面板在线更新要提示更新内容」→ 现在点「一键更新」会先弹
+      // 一个确认框（里面带本版本的更新说明），必须再点「立即升级」才真正走 stage→apply。
+      // 这段断言要跟着走完这一步，否则会误报"一键更新没有走完 stage→apply"。
+      const confirmOk = page.locator('[data-testid="zp-update-confirm-ok"]');
+      await confirmOk.waitFor({ state: 'visible', timeout: 8000 });
+      await confirmOk.click();
       await page.waitForTimeout(12000); // stage → apply → 等 status=success + health 200 → reload
       page.off('framenavigated', onNav);
       const si = calls.indexOf('stage');
@@ -1542,11 +1533,10 @@ try {
     await page.waitForTimeout(500);
   });
 
-  await step('网站管理：列表第一行是默认站点（打开/重建/查看状态），域名处有 http/https 地址链接', async () => {
-    // 用户 2026-09-22 的两条要求：
-    //   ① "默认站点要和宝塔完全一样，安装完用户就可以在网站管理里面看到有这样一个默认站点"
-    //      → 列表**第一行**就是它，且不是 sites 表里的记录（这里只验 UI 形态）；
-    //   ② "网站列表的域名处添加地址链接" → http:// 与 https://，新窗口打开。
+  await step('网站管理：列表第一行是默认站点（打开/重建/查看状态），域名文本本身是外链', async () => {
+    // 用户 2026-09-22 要求：默认站点要和宝塔一样，列表第一行就是它。
+    // 2026-09-25 用户改口径：**只显示域名文本本身**，且这段文字本身就是链接
+    //（不要再把 blog.x / http://blog.x / https://blog.x 三种形式都列出来）。
     await reloadSites();
     const rows = page.locator('.zp-table-wrap table.table tbody tr');
     if (!(await rows.count())) throw new Error('站点列表没有渲染出表格（默认站点这一行必须永远在）');
@@ -1564,23 +1554,41 @@ try {
     }
     await shot('23b-sites-default-row');
 
-    // 域名列的可点击地址：只检查**已注册站点**的行（默认站点只有 http，是 80 端口的兜底站点）。
+    // 域名列：**只检查已注册站点**（默认站点是 80 端口兜底站点，形态略不同）。
     const siteRows = page.locator('.zp-table-wrap table.table tbody tr:not(.zp-default-row)');
     const n = await siteRows.count();
     if (!n) return;
-    const links = await siteRows.first().locator('td').first().locator('a').evaluateAll(
-      (as) => as.map((a) => ({ href: a.getAttribute('href'), target: a.getAttribute('target'), rel: a.getAttribute('rel') })));
-    if (!links.length) throw new Error('站点域名处没有地址链接（用户要求加 http/https 链接）');
-    for (const l of links) {
-      if (!/^https?:\/\//.test(String(l.href || ''))) throw new Error('地址链接不是 http(s)：' + JSON.stringify(l));
-      if (l.target !== '_blank') throw new Error('地址链接没有 target=_blank：' + JSON.stringify(l));
-      if (!String(l.rel || '').includes('noopener')) throw new Error('地址链接没有 rel=noopener：' + JSON.stringify(l));
+    const cell = siteRows.first().locator('td').first();
+    const links = await cell.locator('a').evaluateAll(
+      (as) => as.map((a) => ({
+        href: a.getAttribute('href'),
+        target: a.getAttribute('target'),
+        rel: a.getAttribute('rel'),
+        text: (a.textContent || '').trim(),
+      })));
+    if (!links.length) throw new Error('站点域名处没有链接（用户要求域名文本本身可点）');
+    if (links.length !== 1) {
+      throw new Error('域名处只应有 1 个链接（不再并列 http:// 与 https://）：' + JSON.stringify(links));
     }
-    if (!links.some((l) => l.href.startsWith('http://')) || !links.some((l) => l.href.startsWith('https://'))) {
-      throw new Error('站点域名处应当同时有 http:// 与 https:// 两种链接：' + JSON.stringify(links));
+    const l = links[0];
+    if (!/^https?:\/\//.test(String(l.href || ''))) throw new Error('域名链接不是 http(s)：' + JSON.stringify(l));
+    if (l.target !== '_blank') throw new Error('域名链接没有 target=_blank：' + JSON.stringify(l));
+    if (!String(l.rel || '').includes('noopener')) throw new Error('域名链接没有 rel=noopener：' + JSON.stringify(l));
+    // 关键：链接**文本**是裸域名，不是 http:// 或 https:// 开头。
+    if (/^https?:\/\//i.test(l.text)) {
+      throw new Error('域名链接的文本带协议前缀（用户明确不要）：' + JSON.stringify(l));
+    }
+    const cellText = await cell.innerText();
+    if (cellText.includes('http://') || cellText.includes('https://')) {
+      throw new Error('域名列里仍出现了 http:// 或 https:// 文本：\n' + cellText);
+    }
+    // 协议信息不能丢：小字里要能看出 http / https 与配置状态。
+    if (!/(https?|🔒)/.test(cellText)) {
+      throw new Error('域名列丢失了协议信息（协议要用小字/title/图标表达，不能丢）：\n' + cellText);
     }
     await shot('23c-sites-domain-links');
   });
+
 
   await privStep('校验 nginx', async () => {
     // 「校验 nginx」挂在工具条「nginx 运行 / nginx 停止」按钮的展开菜单里
@@ -3338,7 +3346,7 @@ try {
 
     // ③「系统」分组里只剩 面板设置 → 日志（紧邻）。
     //
-    // 2026-09-20 用户要求把「检查更新」**收回**「面板设置」（设置里的第 4 个 Tab）：
+    // 2026-09-20 用户要求把「检查更新」**收回**「面板设置」（设置里的第 3 个 Tab）：
     // 侧栏独立入口与设置里的入口是重复的，用户不知道该点哪个。所以这里同时断言
     // "侧栏没有检查更新"与"设置里有这个 Tab、且排在最后"。
     const sys = await readGroup('系统');
@@ -3356,12 +3364,12 @@ try {
     }
     await shot('52b-nav-system-group');
 
-    // 面板设置里的 5 个 Tab 顺序：访问与安全 → 上传与执行限制 → 文件与终端 →
-    // 账号与两步验证 → 检查更新
+    // 面板设置里的 3 个 Tab 顺序：访问与安全 → 账号与两步验证 → 检查更新
+    //（2026-09-25 用户要求：「上传与执行限制」从设置里去掉、「文件与终端」并入访问与安全）
     await page.click('.nav-item:has-text("面板设置")');
     await page.waitForTimeout(900);
     const tabTitles = (await page.locator('.content button.btn-sm').allInnerTexts()).map((x) => x.trim());
-    const wantTabs = ['访问与安全', '上传与执行限制', '文件与终端', '账号与两步验证', '检查更新'];
+    const wantTabs = ['访问与安全', '账号与两步验证', '检查更新'];
     const gotTabs = tabTitles.filter((t) => wantTabs.includes(t));
     if (gotTabs.join('|') !== wantTabs.join('|')) {
       throw new Error(`设置页 Tab 顺序不对：期望 ${wantTabs.join(' → ')}，实际 ${gotTabs.join(' → ')}`);

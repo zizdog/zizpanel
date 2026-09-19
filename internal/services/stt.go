@@ -195,21 +195,26 @@ type STTModel struct {
 // STTModels 是面板支持的三个档位，**顺序即界面下拉框顺序**。
 //
 // 为什么是这三档（用户要求"至少支持 small / medium / large-v3-turbo(q5)"）：
-//   - small：默认档。466 MB，中文可用，短音频秒级出字；
-//   - medium：更准但 1.43 GiB、内存 2.1 GB，慢一个量级；
-//   - large-v3-turbo（q5_0 量化）：574 MB —— 比 medium **小**、质量**更好**，
-//     是这三档里最划算的一档（turbo 版是 large-v3 的蒸馏解码器）。
+//   - small：466 MB，中文可用、速度最快，但精度不如 turbo；
+//   - large-v3-turbo（q5_0 量化）：**默认档**（2026-09-25 用户要求把默认从
+//     small 换成它）。574 MB —— 比 medium **小**、质量**更好**，是这三档里
+//     最划算的一档（turbo 版是 large-v3 的蒸馏解码器）。
+//     ⚠️ 默认档变大（466 MiB → 547 MiB）意味着安装时下载更久一点；
+//     "没装/下到一半"时的行为不变：/healthz 与 /v1/models 如实报缺、
+//     网页界面照旧给「下载」入口，绝不假装已就绪。
+//   - medium：更准但 1.43 GiB、内存 2.1 GB，慢一个量级。
 var STTModels = []STTModel{
 	{
-		ID: "small", Name: "Small（均衡，默认）", File: "ggml-small.bin",
-		Bytes: 487601967, RAMMB: 852, Default: true,
+		ID: "small", Name: "Small（快，466 MiB）", File: "ggml-small.bin",
+		Bytes: 487601967, RAMMB: 852,
 		Note: "466 MiB 权重，上游 README 标内存 852 MB，本机实测 peak RSS 887,586,816 B ≈ 847 MiB（吻合）；" +
-			"中文可用、速度最快，适合日常录音与短语音。",
+			"中文可用、速度最快，适合日常录音与短语音；精度不如 Large-v3-turbo。",
 	},
 	{
-		ID: "large-v3-turbo", Name: "Large-v3-turbo（q5_0 量化，更准）", File: "ggml-large-v3-turbo-q5_0.bin",
-		Bytes: 574041195, RAMMB: 840, RAMNote: "**本机实测**（M4，Apple Silicon + Metal）：`/usr/bin/time -l` 报 peak RSS 881,295,360 B ≈ 840 MiB。",
-		Note: "547 MiB 权重，比 medium 更小也更准（large-v3 的 turbo 蒸馏解码器 + q5_0 量化），推荐给要精度的场景。",
+		ID: "large-v3-turbo", Name: "Large-v3-turbo（q5_0 量化，默认，更准）", File: "ggml-large-v3-turbo-q5_0.bin",
+		Bytes: 574041195, RAMMB: 840, Default: true,
+		RAMNote: "**本机实测**（M4，Apple Silicon + Metal）：`/usr/bin/time -l` 报 peak RSS 881,295,360 B ≈ 840 MiB。",
+		Note:    "547 MiB 权重，比 medium 更小也更准（large-v3 的 turbo 蒸馏解码器 + q5_0 量化），推荐给要精度的场景。",
 	},
 	{
 		ID: "medium", Name: "Medium（最准，最慢）", File: "ggml-medium.bin",

@@ -23,7 +23,8 @@ let cwd = '';
 let showHidden = false;
 let selection = new Set();
 let lastList = null;
-// 当前打开的编辑器窗口（同一时刻最多一个）。切换路由时由 FilesView 注册的 cleanup 销毁。
+// 当前打开的编辑器窗口（同一时刻最多一个）。**全局存活**：切换路由时不清除，
+// 只有用户点 ✕ / 菜单「关闭编辑器」才会被 dispose（见 createEditorWindow 的 onClosed）。
 let activeEditor = null;
 
 export function FilesView(content, ctx = {}) {
@@ -1105,16 +1106,32 @@ export function FilesView(content, ctx = {}) {
 
   // ---------- 编辑器 ----------
   //
-  // 编辑器是**窗口化**的（见文件末尾 createEditorWindow）：同一时刻只存在一个窗口，
-  // 再次打开别的文件时复用同一个窗口切换文件（不叠一层新窗口）。
-  function openInEditorWindow(entry, res) {
-    if (activeEditor) { activeEditor.setFile(entry, res); activeEditor.focus(); return; }
-    activeEditor = createEditorWindow(entry, res, {
+  // 编辑器是**窗口化 + 全局存活**的（见文件末尾 createEditorWindow）：同一时刻只存在
+  // 一个窗口，再次打开别的文件时在窗口里新开一个标签（不叠一层新窗口、也不顶掉旧标签）。
+  //
+  // 关键：编辑器层挂在 document.body 上，而路由切换只重建 #app 里的内容，所以窗口
+  // 天然跨板块存活；离开文件页时**不再销毁它**（见本函数末尾的 cleanup）。这样
+  // 最小化后的胶囊切到仪表盘/网站再切回来仍在，点开内容不丢。
+  //
+  // 编辑器由旧版 FilesView 创建，但它跨路由存活后，回调里捕获的旧 DOM 已经脱离。
+  // 所以每次 FilesView 重建都把 refreshList / onDir 重新绑到**当前**这个视图上。
+  function editorOptions() {
+    return {
       roots: (lastList && lastList.roots) || [],
-      refreshList: () => load(cwd),
-      onDir: (p) => load(p),
+      refreshList: () => { if (content.isConnected) load(cwd); },
+      onDir: (p) => { if (content.isConnected) load(p); },
+    };
+  }
+
+  function openInEditorWindow(entry, res) {
+    if (activeEditor) {
+      activeEditor.setOptions(editorOptions());
+      activeEditor.openFile(entry, res);
+      return;
+    }
+    activeEditor = createEditorWindow(entry, res, Object.assign(editorOptions(), {
       onClosed: () => { activeEditor = null; },
-    });
+    }));
   }
 
   async function openEditor(entry) {
@@ -1246,9 +1263,14 @@ export function FilesView(content, ctx = {}) {
   document.addEventListener('keydown', onKeyDown);
   registerCleanup(() => {
     document.removeEventListener('keydown', onKeyDown);
-    // 离开文件页：直接销毁编辑器窗口（不弹未保存确认 —— 路由切换时弹窗也会被清掉）。
-    if (activeEditor) { activeEditor.dispose(); activeEditor = null; }
+    // 编辑器**故意不在这里销毁**：它是全局存活的窗口（用户要求 1 —— 最小化后切成
+    // 胶囊，切到别的板块再切回来仍要在、内容不能丢）。模块级的 activeEditor 引用
+    // 也不会因为路由切换而失效。关掉它只有两条路：窗口右上角 ✕，或菜单「文件 →
+    // 关闭编辑器」。未保存的内容由 beforeunload 守卫 + 关闭前确认保护。
   });
+  // 编辑器可能由**上一次**的 FilesView 创建并一直存活：这里把它的 refreshList / onDir
+  // 重新绑到当前这个视图，否则保存后的文件列表刷新会打在已经脱离文档的旧 DOM 上。
+  if (activeEditor) activeEditor.setOptions(editorOptions());
   load(cwd || undefined);
 }
 
@@ -1538,12 +1560,19 @@ function cssEsc(s) {
 // createEditorWindow 打开一个编辑器窗口（同一时刻只应存在一个）。
 // entry/res 是初始文件；opts.roots 是文件白名单根目录；opts.refreshList 刷新背后的文件列表；
 // opts.onDir 是"树里点了目录"时要切换的浏览目录；opts.onClosed 用于让调用方清掉引用。
+//
+// 多标签（用户要求 2）：窗口里可以有多个文件标签。做法是**一个 CodeMirror 实例 +
+// 每个标签一份 CodeMirror.Doc**，切换标签用 cm.swapDoc()。为什么不是每个标签造一个
+// 编辑器实例：Doc 会自带**各自的撤销历史、光标与滚动位置**，这正好是标签切换要的语义，
+// 而一个实例只维护一套 DOM/事件，代价最小。查找框、配色、缩进等实例级选项全局共用。
 function createEditorWindow(entry0, res0, opts = {}) {
-  const roots = opts.roots || [];
-  const refreshList = typeof opts.refreshList === 'function' ? opts.refreshList : () => {};
-  const onDir = typeof opts.onDir === 'function' ? opts.onDir : () => {};
+  let roots = opts.roots || [];
+  let refreshList = typeof opts.refreshList === 'function' ? opts.refreshList : () => {};
+  let onDir = typeof opts.onDir === 'function' ? opts.onDir : () => {};
   const onClosed = typeof opts.onClosed === 'function' ? opts.onClosed : () => {};
 
+  // 活动标签的"镜像"变量：下面大量既有函数直接读写 entry/res/dirty 等，切标签时
+  // 由 activateTab() 先 commit 回标签对象、再把这些变量换成新标签的值，改动面最小。
   let entry = entry0;
   let res = res0;
   let cm = null;
@@ -1555,6 +1584,29 @@ function createEditorWindow(entry0, res0, opts = {}) {
   let disposed = false;
   let langKey = langKeyFor(entry.name);
   let langDef = CM_LANGS[langKey];
+
+  // ---- 标签状态 ----
+  // tab: { id, entry, res, doc, dirty, langKey, langDef, cleanGen }
+  const tabs = [];
+  let tabSeq = 0;
+  let activeTabId = null;
+
+  function currentTab() { return tabs.find((t) => t.id === activeTabId) || null; }
+  function tabForPath(p) { return tabs.find((t) => t.entry.path === p) || null; }
+  function mkTab(e, r) {
+    const key = langKeyFor(e.name);
+    return { id: 'zpf-filetab-' + (++tabSeq), entry: e, res: r, doc: null, dirty: false, langKey: key, langDef: CM_LANGS[key], cleanGen: 0 };
+  }
+  // snapshotActive 把镜像变量写回活动标签对象（切换/保存前调用）。
+  function snapshotActive() {
+    const t = currentTab();
+    if (!t) return;
+    t.entry = entry; t.res = res; t.dirty = dirty; t.langKey = langKey; t.langDef = langDef;
+  }
+
+  const firstTab = mkTab(entry0, res0);
+  tabs.push(firstTab);
+  activeTabId = firstTab.id;
 
   // ---- 目录树状态 ----
   let treeRoot = pickTreeRoot(entry.path, roots);
@@ -1575,7 +1627,7 @@ function createEditorWindow(entry0, res0, opts = {}) {
 
   const minBtn = h('button.zpf-iconbtn', { text: '–', title: '最小化（收成右下角胶囊，面板仍可操作）', 'aria-label': '最小化' });
   const maxBtn = h('button.zpf-iconbtn', { text: '⛶', title: '最大化（铺满面板内容区）', 'aria-label': '最大化' });
-  const closeBtn = h('button.zpf-iconbtn.zpf-close', { text: '✕', title: '关闭编辑器（Esc；有未保存修改会先确认）', 'aria-label': '关闭' });
+  const closeBtn = h('button.zpf-iconbtn.zpf-close', { text: '✕', title: '关闭编辑器（有未保存修改会先确认；Esc 不会关闭编辑器）', 'aria-label': '关闭' });
 
   const titlebar = h('div.zpf-titlebar', [
     h('span', { text: '📝', style: { fontSize: '13px' } }),
@@ -1589,6 +1641,7 @@ function createEditorWindow(entry0, res0, opts = {}) {
   ]);
 
   const menubar = h('div.zpf-menubar');
+  const tabStrip = h('div.zpf-filetabs');
 
   const treeHead = h('div.zpf-tree-head');
   const treeScroll = h('div.zpf-tree-scroll');
@@ -1601,13 +1654,14 @@ function createEditorWindow(entry0, res0, opts = {}) {
   const editEl = h('section.zpf-edit', [host, statusbar]);
   const bodyEl = h('div.zpf-body', [treeEl, treeResizer, editEl]);
 
-  const win = h('div.zpf-win', [titlebar, menubar, bodyEl]);
+  const win = h('div.zpf-win', [titlebar, menubar, tabStrip, bodyEl]);
   const layer = h('div.zpf-layer', [win]);
   document.body.appendChild(layer);
 
   // ===================== 几何：窗口 / 最大化 / 最小化 =====================
   function applyGeometry() {
     if (disposed || minimized) return; // 胶囊的位置由 CSS 固定
+    ensureContentObserver(); // 路由切换会换掉 .content 元素，几何/观察都要贴着**当前**那个
     const r = contentRect();
     let left;
     let top;
@@ -1680,15 +1734,45 @@ function createEditorWindow(entry0, res0, opts = {}) {
   }
 
   let unloadGuardOn = false;
-  function onBeforeUnload(e) { if (!dirty) return; e.preventDefault(); e.returnValue = ''; }
+  // 只要**任意一个标签**有未保存修改，关闭/刷新浏览器就要拦一次（不只是活动标签）。
+  function onBeforeUnload(e) { if (!tabs.some((t) => t.dirty)) return; e.preventDefault(); e.returnValue = ''; }
   function installUnloadGuard() { if (!unloadGuardOn) { unloadGuardOn = true; window.addEventListener('beforeunload', onBeforeUnload); } }
   function removeUnloadGuard() { if (unloadGuardOn) { unloadGuardOn = false; window.removeEventListener('beforeunload', onBeforeUnload); } }
+  function syncUnloadGuard() { if (tabs.some((t) => t.dirty)) installUnloadGuard(); else removeUnloadGuard(); }
 
+  // setDirty 只作用于**活动标签**（镜像变量 dirty 也同步）。后台标签的状态由
+  // saveAll / closeTab 直接改标签对象，改完调 renderTabs()。
   function setDirty(v) {
-    dirty = !!v;
+    const t = currentTab();
+    const val = !!v;
+    const changed = !t || t.dirty !== val;
+    if (t) t.dirty = val;
+    dirty = val;
     dirtyDot.textContent = '● 未保存';
-    dirtyDot.style.display = dirty ? '' : 'none';
-    if (dirty) installUnloadGuard(); else removeUnloadGuard();
+    dirtyDot.style.display = val ? '' : 'none';
+    syncUnloadGuard();
+    if (changed) renderTabs();
+  }
+
+  // ===================== 标签栏 =====================
+  // 每次重画整条标签栏（标签数量是个位数，成本可忽略）；标签过多时靠 CSS
+  // overflow-x:auto 横向滚动，并把活动标签滚进可视区。
+  function renderTabs() {
+    if (disposed) return;
+    clear(tabStrip);
+    for (const t of tabs) {
+      const active = t.id === activeTabId;
+      const dot = h('span.zpf-filetab-dot', { text: '●', title: '有未保存的修改', style: { display: t.dirty ? '' : 'none' } });
+      const nameEl = h('span.zpf-filetab-name', { text: t.entry.name, title: t.entry.path });
+      const x = h('button.zpf-filetab-close', { type: 'button', text: '✕', title: '关闭这个标签（未保存会先确认）', 'aria-label': '关闭标签' });
+      x.addEventListener('click', (e) => { e.stopPropagation(); closeTab(t); });
+      const el = h('div.zpf-filetab' + (active ? '.active' : ''), [dot, nameEl, x]);
+      el.title = t.entry.path;
+      el.addEventListener('click', () => { if (t.id !== activeTabId) activateTab(t); });
+      tabStrip.appendChild(el);
+    }
+    const act = tabStrip.querySelector('.zpf-filetab.active');
+    if (act && act.scrollIntoView) act.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
   // ===================== 菜单栏 =====================
@@ -1749,14 +1833,15 @@ function createEditorWindow(entry0, res0, opts = {}) {
       {
         label: '文件',
         items: () => [
-          { label: '保存', hint: '⌘S', disabled: !cm, run: saveFile },
+          { label: '保存', hint: '⌘S', disabled: !cm, run: () => saveFile() },
+          { label: '全部保存', hint: '⌘⌥S', disabled: !cm || !tabs.some((t) => t.dirty), run: saveAll },
           { label: '另存为…', hint: '⌘⇧S', disabled: !cm, run: saveAs },
           { label: '重新载入（放弃未保存修改）', disabled: !cm, run: reloadFile },
           { sep: true },
           { label: '下载文件', run: downloadFile },
           { label: '复制文件路径', run: () => copyText(entry.path) },
           { sep: true },
-          { label: '关闭编辑器', hint: 'Esc', run: requestClose },
+          { label: '关闭编辑器', run: requestClose },
         ],
       },
       {
@@ -1801,13 +1886,15 @@ function createEditorWindow(entry0, res0, opts = {}) {
 
   function showShortcuts() {
     const rows = [
-      ['⌘ / Ctrl + S', '保存'],
+      ['⌘ / Ctrl + S', '保存当前标签'],
+      ['⌘ / Ctrl + ⌥ / Alt + S', '全部保存（依次写盘，汇总成功/失败）'],
       ['⌘ / Ctrl + ⇧ + S', '另存为'],
       ['⌘ / Ctrl + F', '查找 / 替换'],
       ['⌥ / Alt + G', '跳转到行'],
       ['⌘ / Ctrl + /', '切换注释'],
       ['Tab / ⇧ + Tab', '缩进 / 反缩进'],
-      ['Esc', '关闭编辑器（有未保存修改会先确认）'],
+      ['Esc', '关闭菜单 / 查找框（**不会**关闭编辑器）'],
+      ['✕ / 菜单「关闭编辑器」', '关闭编辑器（未保存会先确认）'],
     ];
     modal({
       title: '编辑器快捷键',
@@ -1949,34 +2036,78 @@ function createEditorWindow(entry0, res0, opts = {}) {
     refreshCM();
   }
 
-  // ===================== 打开 / 切换文件 =====================
+  // ===================== 打开 / 切换文件（多标签） =====================
+  // activateTab 把活动标签切到 t：先把镜像变量写回旧标签，再把镜像换成 t 的值，
+  // 最后让 CodeMirror 显示 t 的 Doc（swapDoc 会保留该标签自己的撤销历史/光标/滚动）。
+  async function activateTab(t) {
+    if (!t || disposed) return;
+    snapshotActive();
+    activeTabId = t.id;
+    entry = t.entry;
+    res = t.res;
+    dirty = t.dirty;
+    langKey = t.langKey;
+    langDef = t.langDef;
+    curDir = dirname(entry.path);
+    renderTabs();
+    // 语言模式必须先就绪：模式文件没加载完就建 Doc，CodeMirror 会**静默**退化成纯文本。
+    try { await ensureLang(langKey); } catch (e) { toast('语言模式加载失败：' + ((e && e.message) || e), 'warn', 8000); }
+    if (disposed) return;
+    langDef = CM_LANGS[langKey];
+    if (cm) {
+      if (!t.doc) t.doc = window.CodeMirror.Doc(res.content, langDef ? langDef.mode : null);
+      cm.swapDoc(t.doc);
+      setDirty(!!t.dirty);
+      refreshCM();
+      if (!minimized) requestAnimationFrame(() => { if (cm) cm.focus(); });
+    }
+    updateTitle();
+    updateStatus();
+    revealFile(entry.path);
+  }
+
+  // addTab 打开一个新标签（已经打开过的路径就切过去，不重复开）。
+  async function addTab(e, r) {
+    const exist = tabForPath(e.path);
+    if (exist) { await activateTab(exist); return; }
+    const t = mkTab(e, r);
+    tabs.push(t);
+    await activateTab(t);
+  }
+
   async function openFileByTree(path, name) {
-    if (path === entry.path) { toast('这已经是当前打开的文件', 'warn', 4000); return; }
-    if (!confirmDiscard()) return;
+    const exist = tabForPath(path);
+    if (exist) { await activateTab(exist); return; }
     let r;
     try { r = await api.fileRead(path); }
     catch (e) { toast('打开失败：' + ((e && e.message) || e), 'err', 10000); return; }
     if (r.binary) { toast('这是二进制文件，不能用文本编辑器打开', 'warn', 8000); return; }
     if (r.too_large) { toast('文件过大（' + humanSize(r.size) + '），超过在线编辑上限', 'warn', 10000); return; }
-    await applyFile({ path, name: name || basename(path) }, r);
+    await addTab({ path, name: name || basename(path) }, r);
   }
 
+  // applyFile 把**当前标签**换成另一个文件内容（重新载入 / 另存为后的路径更新）。
   async function applyFile(newEntry, newRes) {
+    const t = currentTab();
     entry = newEntry;
     res = newRes;
     const key = langKeyFor(entry.name);
-    if (key !== langKey) {
-      langKey = key;
-      langDef = CM_LANGS[key];
+    const langChanged = key !== langKey;
+    langKey = key;
+    langDef = CM_LANGS[key];
+    if (langChanged) {
       try { await ensureLang(langKey); } catch (e) { toast('语言模式加载失败：' + ((e && e.message) || e), 'warn', 8000); }
-      if (cm) cm.setOption('mode', langDef ? langDef.mode : null);
     }
     curDir = dirname(entry.path);
+    if (t) { t.entry = entry; t.res = res; t.langKey = langKey; t.langDef = langDef; }
     if (cm) {
       cm.setValue(res.content);
       cm.clearHistory();
       cm.setCursor(0, 0);
+      if (langChanged) cm.setOption('mode', langDef ? langDef.mode : null);
+      if (t) t.cleanGen = cm.changeGeneration();
       setDirty(false);
+      renderTabs();
       refreshCM();
       requestAnimationFrame(() => { if (cm) cm.focus(); });
     }
@@ -1987,11 +2118,16 @@ function createEditorWindow(entry0, res0, opts = {}) {
 
   // ===================== 保存 / 下载 =====================
   async function saveFile() {
-    if (!cm) return false;
+    const t = currentTab();
+    if (!cm || !t) return false;
     try {
-      await api.fileWrite(entry.path, cm.getValue());
-      setDirty(false);
-      toast('已保存 ' + basename(entry.path), 'ok');
+      await api.fileWrite(t.entry.path, t.doc.getValue());
+      if (t.id === activeTabId) { t.cleanGen = cm.changeGeneration(); setDirty(false); }
+      else t.dirty = false;
+      t.res = Object.assign({}, t.res, { size: t.doc.getValue().length });
+      if (t.id === activeTabId) updateStatus();
+      renderTabs();
+      toast('已保存 ' + basename(t.entry.path), 'ok');
       refreshList();
       return true;
     } catch (e) {
@@ -2000,8 +2136,53 @@ function createEditorWindow(entry0, res0, opts = {}) {
     }
   }
 
+  // saveAll 依次把**所有未保存**的标签写盘，最后汇总：成功几个、哪个失败、原因是什么。
+  // 失败不中断（一个文件权限不对不该让其余文件也存不了），但必须逐个说清楚。
+  async function saveAll() {
+    if (!cm) return;
+    const pending = tabs.filter((t) => t.dirty);
+    if (!pending.length) { toast('没有未保存的修改', 'warn', 4000); return; }
+    let ok = 0;
+    const fails = [];
+    for (const t of pending) {
+      try {
+        await api.fileWrite(t.entry.path, t.doc.getValue());
+        if (t.id === activeTabId) t.cleanGen = cm.changeGeneration();
+        t.dirty = false;
+        t.res = Object.assign({}, t.res, { size: t.doc.getValue().length });
+        ok++;
+      } catch (e) {
+        fails.push({ path: t.entry.path, msg: (e && e.message) || String(e) });
+      }
+    }
+    if (tabs.length && currentTab()) setDirty(!!currentTab().dirty);
+    syncUnloadGuard();
+    renderTabs();
+    updateStatus();
+    refreshList();
+    const skipped = tabs.length - pending.length;
+    if (!fails.length) {
+      toast(`全部保存完成：成功写入 ${ok} 个文件` + (skipped ? `（另有 ${skipped} 个没有改动）` : ''), 'ok', 6000);
+      return;
+    }
+    modal({
+      title: '全部保存结果',
+      body: h('div', [
+        h('p', { text: `成功 ${ok} 个，失败 ${fails.length} 个` + (skipped ? `（另有 ${skipped} 个没有改动）` : '') + '。' }),
+        h('table.table', [
+          h('thead', [h('tr', [h('th', { text: '文件' }), h('th', { text: '失败原因' })])]),
+          h('tbody', fails.map((f) => h('tr', [
+            h('td.mono', { style: { fontSize: '11.5px' }, text: f.path }),
+            h('td', { style: { color: 'var(--danger)' }, text: f.msg }),
+          ]))),
+        ]),
+      ]),
+    });
+  }
+
   async function saveAs() {
     if (!cm) return;
+    const cur = currentTab();
     const dest = await promptBox({
       title: '另存为', label: '目标完整路径', value: entry.path,
       hint: '必须在文件管理允许的目录内（绝对路径）',
@@ -2026,7 +2207,13 @@ function createEditorWindow(entry0, res0, opts = {}) {
       await api.fileWrite(dest, content);
       entry = { path: dest, name: basename(dest) };
       res = Object.assign({}, res, { size: content.length });
+      if (cur) {
+        cur.entry = entry;
+        cur.res = res;
+        cur.cleanGen = cm.changeGeneration();
+      }
       setDirty(false);
+      renderTabs();
       updateTitle();
       updateStatus();
       toast('已另存为 ' + dest, 'ok');
@@ -2071,35 +2258,51 @@ function createEditorWindow(entry0, res0, opts = {}) {
     return confirm('「' + entry.name + '」有未保存的修改，确定放弃这些修改？');
   }
 
+  // closeTab 关闭单个标签：有未保存修改先确认；关掉最后一个标签 = 关闭整个编辑器。
+  function closeTab(t) {
+    const idx = tabs.indexOf(t);
+    if (idx < 0 || disposed) return;
+    if (t.dirty && !confirm('「' + t.entry.name + '」有未保存的修改，确定关闭这个标签？')) return;
+    const wasActive = t.id === activeTabId;
+    tabs.splice(idx, 1);
+    if (!tabs.length) { dispose(); return; }
+    if (wasActive) {
+      activateTab(tabs[Math.min(idx, tabs.length - 1)]);
+    } else {
+      syncUnloadGuard();
+      renderTabs();
+    }
+  }
+
+  // requestClose 关闭整个编辑器（✕ 或菜单「文件 → 关闭编辑器」）。只要**任一**标签
+  // 有未保存修改就先确认，并把是哪些文件说清楚。
   function requestClose() {
-    if (dirty && !confirm('「' + entry.name + '」有未保存的修改，确定关闭编辑器？')) return;
+    const dirtyTabs = tabs.filter((t) => t.dirty);
+    if (dirtyTabs.length) {
+      const names = dirtyTabs.map((t) => t.entry.name).join('、');
+      if (!confirm('有未保存的修改（' + names + '），确定关闭编辑器？')) return;
+    }
     dispose();
   }
 
-  // 点侧栏导航 / 顶栏（会销毁编辑器）时，若还有未保存修改先确认 —— 否则一次误点就静默丢改动。
-  function onDocCapture(e) {
-    if (!dirty || disposed) return;
-    const t = e.target;
-    if (!(t && t.closest)) return;
-    if (t.closest('.zpf-win')) return;
-    if (t.closest('.nav-item, .topbar, .sidebar-toggle')) {
-      if (!confirm('「' + entry.name + '」有未保存的修改，离开会丢失。确定离开？')) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    }
+  // Esc 只关菜单；**不关编辑器**（用户要求 3）。查找/跳行框由 CodeMirror 的
+  // dialog 插件自己处理（它收到 Esc 会 close 并 stopPropagation），所以这里只补菜单。
+  function onDocKeyDown(e) {
+    if (disposed || e.key !== 'Escape') return;
+    if (openMenuIdx >= 0) closeMenus();
   }
-  document.addEventListener('click', onDocCapture, true);
+  document.addEventListener('keydown', onDocKeyDown);
 
   function dispose() {
     if (disposed) return;
     disposed = true;
     removeUnloadGuard();
     document.removeEventListener('mousedown', onDocDown);
-    document.removeEventListener('click', onDocCapture, true);
+    document.removeEventListener('keydown', onDocKeyDown);
     document.removeEventListener('fullscreenchange', onFsChange);
     document.removeEventListener('webkitfullscreenchange', onFsChange);
     window.removeEventListener('resize', applyGeometry);
+    window.removeEventListener('hashchange', onRouteChange);
     if (resizeObs) { try { resizeObs.disconnect(); } catch { /* 忽略 */ } }
     themeObserver.disconnect();
     layer.remove();
@@ -2233,17 +2436,31 @@ function createEditorWindow(entry0, res0, opts = {}) {
 
   // ===================== 自适应 =====================
   // 侧栏折叠 / 展开只改变 content 的宽度，**不触发 window.resize**，所以必须观察 content 本身。
+  //
+  // 编辑器是全局存活的，而每次路由切换都会重建 `.content` 元素 —— 旧观察目标会脱离
+  // 文档树（resize 再也不触发）。ensureContentObserver 负责在目标失效时改观察新的那个，
+  // applyGeometry 每次都会调它，所以切换板块后点胶囊还原 / 最大化都能拿到正确矩形。
   let resizeObs = null;
-  if (window.ResizeObserver) {
+  let contentObsTarget = null;
+  function ensureContentObserver() {
+    if (!window.ResizeObserver) return;
     const c = document.querySelector('.content');
-    if (c) { resizeObs = new ResizeObserver(() => applyGeometry()); resizeObs.observe(c); }
+    if (!c || (contentObsTarget === c && c.isConnected)) return;
+    if (!resizeObs) resizeObs = new ResizeObserver(() => applyGeometry());
+    else { try { resizeObs.disconnect(); } catch { /* 忽略 */ } }
+    contentObsTarget = c;
+    resizeObs.observe(c);
   }
+  ensureContentObserver();
   window.addEventListener('resize', applyGeometry);
+  function onRouteChange() { applyGeometry(); }
+  window.addEventListener('hashchange', onRouteChange);
 
   // ===================== 初始化 =====================
   updateTitle();
   syncChrome();
   setDirty(false);
+  renderTabs();
   buildMenus();
   applyGeometry();
 
@@ -2259,8 +2476,8 @@ function createEditorWindow(entry0, res0, opts = {}) {
       await ensureCmTheme(cmThemeFor(theme));
       const themeName = cmThemeFor(theme);
       cm = window.CodeMirror(host, {
-        value: res.content,
-        mode: langDef ? langDef.mode : null,
+        value: '',
+        mode: null,
         theme: themeName,
         lineNumbers: true,
         lineWrapping: false,
@@ -2279,6 +2496,8 @@ function createEditorWindow(entry0, res0, opts = {}) {
         extraKeys: {
           'Ctrl-S': () => { saveFile(); },
           'Cmd-S': () => { saveFile(); },
+          'Ctrl-Alt-S': () => { saveAll(); },
+          'Cmd-Alt-S': () => { saveAll(); },
           'Shift-Ctrl-S': () => { saveAs(); },
           'Shift-Cmd-S': () => { saveAs(); },
           'Ctrl-F': 'findPersistent',
@@ -2288,7 +2507,9 @@ function createEditorWindow(entry0, res0, opts = {}) {
           'Alt-G': 'jumpToLine',
           'Ctrl-/': 'toggleComment',
           'Cmd-/': 'toggleComment',
-          'Esc': () => requestClose(),
+          // 这里**故意没有 Esc**（用户要求 3）：按 Esc 不许关编辑器。Esc 只用于关菜单
+          // （见 onDocKeyDown）和关 CodeMirror 的查找/跳行框（dialog 插件自带，且它会
+          // stopPropagation）。关编辑器只能点 ✕ 或菜单「文件 → 关闭编辑器」。
           // Tab / Shift+Tab 必须显式接管：CodeMirror 默认的 Tab 在空行上会插入
           // **制表符**，而面板其它地方（以及面板自己生成的配置）统一用 4 空格 ——
           // 混用会在保存后的文件里留下看不见的差异。有选区时整块缩进/反缩进。
@@ -2317,12 +2538,24 @@ function createEditorWindow(entry0, res0, opts = {}) {
           '(Use line:column or scroll% syntax)': '（可用 行:列 或 百分比）',
         },
       });
+      // 初始标签的 Doc（每个标签一份 Doc => 各自独立的撤销历史/光标/滚动）
+      const t0 = currentTab();
+      if (t0 && !t0.doc) t0.doc = window.CodeMirror.Doc(res.content, langDef ? langDef.mode : null);
+      if (t0) cm.swapDoc(t0.doc);
       cm.setCursor(0, 0);
       cm.clearHistory();
-      cm.on('change', () => setDirty(true));
+      if (t0) t0.cleanGen = cm.changeGeneration();
+      // 脏标记用"与上次干净时的变更代数比较"，而不是收到 change 就置脏：
+      // 程序化的 setValue / swapDoc / clearHistory 也会触发 change，靠事件置脏会假报未保存。
+      cm.on('change', () => {
+        const t = currentTab();
+        if (!t) return;
+        setDirty(!cm.isClean(t.cleanGen));
+      });
       cm.on('cursorActivity', updateStatus);
       setDirty(false);
       updateStatus();
+      renderTabs();
       cm.focus();
       buildMenus(); // 编辑器就绪后菜单项从禁用变可用
       refreshCM();
@@ -2342,7 +2575,16 @@ function createEditorWindow(entry0, res0, opts = {}) {
   })();
 
   return {
+    // openFile 打开文件：已打开则切到那个标签，否则新开一个标签。
+    openFile: (e, r) => addTab(e, r),
+    // setFile 保留旧语义：把**当前标签**换成另一个文件（内部重新载入等场景）。
     setFile: (e, r) => applyFile(e, r),
+    // setOptions 让重新创建的 FilesView 把回调重新绑到当前 DOM 上（编辑器跨路由存活）。
+    setOptions: (o = {}) => {
+      if (Array.isArray(o.roots)) roots = o.roots;
+      if (typeof o.refreshList === 'function') refreshList = o.refreshList;
+      if (typeof o.onDir === 'function') onDir = o.onDir;
+    },
     focus: () => { if (cm) cm.focus(); },
     dispose,
   };

@@ -28,7 +28,7 @@
 //   · 已用时长每秒刷新，下载/重启期间持续轮询状态（面板重启时的失败是预期，保持安静）。
 
 import { api, apiURL } from './api.js';
-import { h, clear, toast } from './ui.js';
+import { h, clear, toast, modal } from './ui.js';
 import { state } from './app.js';
 
 // ---------------- 主动检测：状态、周期、持久化 ----------------
@@ -104,6 +104,10 @@ export async function checkUpgrades({ force = false, silent = true } = {}) {
         checked_at: Date.now(),
         effective_source: res.effective_source || res.source || '',
         asset_error: res.asset_error || '',
+        // notes 是远端清单里的**外部输入**，原样存起来（渲染时才净化）。
+        // 存进 localStorage 是为了刷新页面后，顶部横幅仍能在 status 回来之前
+        // 就把"这次更新了什么"显示出来（status 也会带一份，见 api_upgrade.go）。
+        notes: typeof res.notes === 'string' ? res.notes : '',
       };
       saveSaved(info);
       emit();
@@ -166,6 +170,233 @@ function fmtTime(ts) {
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---------------- 更新说明（Markdown 基础渲染） ----------------
+//
+// 用户 2026-09-24 的要求：「面板在线更新要提示更新内容。」
+//
+// 说明文字来自远端清单的 `notes`（RELEASE_NOTES.md 原文），是**外部输入** ——
+// 发布源一旦被投毒，notes 里放一段 <script> 就能在面板里执行脚本（面板是 root 权限，
+// 后果不需要解释）。所以这里的铁律：
+//
+//   1. **绝不 innerHTML**。所有节点都用 createElement / textContent 逐节点构造，
+//      原始 HTML 标签只会变成字面文本（`<script>alert(1)</script>` 显示为一行字）。
+//   2. **链接白名单**：只有 `http(s)://` 才生成 <a>，`javascript:` / `data:` / 相对路径
+//      一律退回纯文本，连 href 都不碰。
+//   3. 属性值只来自我们自己写死的字符串；用户内容永远走 textContent。
+//
+// 支持的语法（够 RELEASE_NOTES.md 用就行）：#/##/### 标题、-/* 无序列表、
+// 1. 有序列表、段落、**粗体**、`行内代码`、[文字](http链接)、``` 代码块。
+
+// notesInline 把一行里的行内标记渲染成一组节点（返回 DocumentFragment）。
+function notesInline(text) {
+  const frag = document.createDocumentFragment();
+  const src = String(text == null ? '' : text);
+  // 一条正则一次扫描：粗体 / 行内代码 / 链接。不递归、不解析嵌套，
+  // 这样不存在"转义绕过"的路径 —— 每个分支产出的都是纯文本或白名单链接。
+  const re = /\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]*)\]\(([^)\s]*)\)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    if (m.index > last) frag.append(document.createTextNode(src.slice(last, m.index)));
+    if (m[1] !== undefined) {
+      frag.append(h('strong', { text: m[1] }));
+    } else if (m[2] !== undefined) {
+      frag.append(h('code', { text: m[2] }));
+    } else {
+      const label = m[3] || '';
+      const url = m[4] || '';
+      if (/^https?:\/\//i.test(url)) {
+        // 只有明确 http(s) 的链接才成为 <a>。rel/target 写死，防 window.opener 反向控制。
+        frag.append(h('a', {
+          href: url, target: '_blank', rel: 'noopener noreferrer',
+          text: label || url,
+        }));
+      } else {
+        // javascript: / data: / file: 等：**整段原样当文本**，绝不进 href。
+        frag.append(document.createTextNode(src.slice(m.index, re.lastIndex)));
+      }
+    }
+    last = re.lastIndex;
+  }
+  if (last < src.length) frag.append(document.createTextNode(src.slice(last)));
+  return frag;
+}
+
+function notesIsListStart(line) { return /^\s*[-*]\s+/.test(line); }
+function notesIsOrderedStart(line) { return /^\s*\d+[.)]\s+/.test(line); }
+function notesIsBlockStart(line) {
+  return /^\s*```/.test(line) || /^#{1,3}\s+/.test(line)
+    || notesIsListStart(line) || notesIsOrderedStart(line);
+}
+
+// renderNotesMarkdown 把说明文本渲染成一个 DOM 子树（绝不 innerHTML）。
+function renderNotesMarkdown(md) {
+  const root = h('div.zp-notes-md');
+  const lines = String(md == null ? '' : md).replace(/\r\n?/g, '\n').split('\n');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // ``` 代码块：内容整体进 textContent（Fence 里的标签同样只是文本）。
+    if (/^\s*```/.test(line)) {
+      const buf = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i += 1; }
+      i += 1; // 跳过收尾的 ```
+      root.append(h('pre.zp-notes-code', { text: buf.join('\n') }));
+      continue;
+    }
+
+    // #/##/### 标题（h4/h5/h6，避免抢走页面 <h3> 的层级）。
+    const heading = /^(#{1,3})\s+(.*)$/.exec(line);
+    if (heading) {
+      const tag = 'h' + (heading[1].length + 3);
+      root.append(h(tag + '.zp-notes-h', [notesInline(heading[2])]));
+      i += 1;
+      continue;
+    }
+
+    // - / * 无序列表：连续同类行合成一个 <ul>。
+    if (notesIsListStart(line)) {
+      const ul = h('ul.zp-notes-list');
+      while (i < lines.length && notesIsListStart(lines[i])) {
+        ul.append(h('li', [notesInline(lines[i].replace(/^\s*[-*]\s+/, ''))]));
+        i += 1;
+      }
+      root.append(ul);
+      continue;
+    }
+
+    // 1. / 1) 有序列表：连续同类行合成一个 <ol>。
+    if (notesIsOrderedStart(line)) {
+      const ol = h('ol.zp-notes-list');
+      while (i < lines.length && notesIsOrderedStart(lines[i])) {
+        ol.append(h('li', [notesInline(lines[i].replace(/^\s*\d+[.)]\s+/, ''))]));
+        i += 1;
+      }
+      root.append(ol);
+      continue;
+    }
+
+    if (line.trim() === '') { i += 1; continue; }
+
+    // 段落：一直收行到空行 / 下一个块级语法为止，行间按 Markdown 约定用空格连接。
+    const buf = [line];
+    i += 1;
+    while (i < lines.length && lines[i].trim() !== '' && !notesIsBlockStart(lines[i])) {
+      buf.push(lines[i]);
+      i += 1;
+    }
+    root.append(h('p.zp-notes-p', [notesInline(buf.join(' '))]));
+  }
+  return root;
+}
+
+// notesSummary 从说明里抽一句纯文本摘要（确认框先给"这次更新了什么"的概览）。
+// 纯标题块会被跳过 —— 摘要只显示一句版本号标题等于没给。
+function notesSummary(md, max = 200) {
+  const raw = String(md == null ? '' : md).trim();
+  if (!raw) return '';
+  const clean = (s) => s
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+  let chosen = '';
+  for (const block of raw.split(/\n\s*\n/)) {
+    const t = block.trim();
+    if (!t) continue;
+    const lines = t.split('\n');
+    // 整块都是标题 → 跳过，继续找真正的正文。
+    if (/^#{1,6}\s+/.test(lines[0])
+      && lines.every((l) => l.trim() === '' || /^#{1,6}\s+/.test(l))) continue;
+    chosen = clean(t);
+    if (chosen) break;
+  }
+  if (!chosen) chosen = clean(raw);
+  return chosen.length > max ? chosen.slice(0, max) + '…' : chosen;
+}
+
+// notesBlock 是"更新说明"的标准展示块：标题 + 默认展开、可折叠的说明体。
+// open=false 时收起，但 summary 文案仍是用户能看懂的一句话。
+// 没有说明时**如实写出来**，不留空白、也不编内容。
+function notesBlock(notes, { title = '本次更新内容', open = true, testid = 'zp-update-notes', summary } = {}) {
+  const raw = typeof notes === 'string' ? notes.trim() : '';
+  const box = h('div.zp-notes', { dataset: { testid } });
+  if (title) box.append(h('div.zp-notes-title', { text: title }));
+  if (!raw) {
+    box.append(h('div.zp-notes-empty', {
+      dataset: { testid: testid + '-empty' },
+      text: '这个版本没有提供更新说明。',
+    }));
+    return box;
+  }
+  const details = h('details.zp-notes-details');
+  if (open) details.open = true;
+  details.append(h('summary.zp-notes-sum', { text: summary || (open ? '收起更新说明' : '展开查看完整更新说明') }));
+  details.append(h('div.zp-notes-body', [renderNotesMarkdown(raw)]));
+  box.append(details);
+  return box;
+}
+
+// confirmUpgrade 是「一键更新 / 立即升级」前的确认框。
+//
+// 用户 2026-09-24 的要求：动手之前要能看到"这个版本更新了什么" ——
+// 先给一句**摘要**，再给一个可展开的**全文**，而不是只有一个"确定/取消"。
+// notes 同样来自远端清单，走和页面上一样的净化渲染路径。
+function confirmUpgrade(version, notes) {
+  const raw = typeof notes === 'string' ? notes.trim() : '';
+  const full = h('details.zp-notes-details');
+  full.append(h('summary.zp-notes-sum', { text: '展开查看完整更新说明' }));
+  full.append(h('div.zp-notes-body', [renderNotesMarkdown(raw)]));
+
+  const notesEl = h('div.zp-notes', { dataset: { testid: 'zp-update-notes-confirm' } }, [
+    h('div.zp-notes-title', { text: '这个版本更新了什么' }),
+    raw
+      ? h('div', {}, [
+        h('p.zp-notes-p', { text: notesSummary(raw) }),
+        full,
+      ])
+      : h('div.zp-notes-empty', {
+        dataset: { testid: 'zp-update-notes-confirm-empty' },
+        text: '这个版本没有提供更新说明。',
+      }),
+  ]);
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; m.close(); resolve(v); };
+    const m = modal({
+      title: `确认升级到 v${version || '新版本'}`,
+      body: h('div.zp-notes-confirm', [
+        h('div', {
+          style: { fontSize: '13.5px', lineHeight: '1.7', marginBottom: '11px' },
+          text: '面板会先下载并校验升级包，确认无误后替换程序并自动重启；重启期间页面短暂断开，请不要关闭本页。',
+        }),
+        notesEl,
+      ]),
+      footer: [
+        h('button.btn', {
+          dataset: { testid: 'zp-update-confirm-cancel' },
+          text: '取消',
+          onclick: () => finish(false),
+        }),
+        h('button.btn.btn-primary', {
+          dataset: { testid: 'zp-update-confirm-ok' },
+          text: '立即升级',
+          onclick: () => finish(true),
+        }),
+      ],
+      onClose: () => finish(false),
+    });
+  });
+}
 
 // pingHealth 探一次面板是否已经活过来。升级/重启期间连接会断，失败是预期。
 async function pingHealth() {
@@ -440,6 +671,9 @@ export function UpdateView(content, ctx = {}) {
   let sessionResult = null;
   // watching：是否已经在等面板重启，避免刷新恢复轮询时挂出第二条等待链。
   let watching = false;
+  // statusNotes：后端 status 顶层带回来的更新说明（配置里的缓存值）。
+  // 它是刷新页面后（check 还没回来时）也能显示说明的兜底来源。
+  let statusNotes = '';
 
   const srcInput = h('input.input', {
     placeholder: 'https://example.com/zizpanel/releases（放着 manifest.json 的目录）',
@@ -526,6 +760,11 @@ export function UpdateView(content, ctx = {}) {
     }
     if (checkInfo && checkInfo.has_update) {
       const cur = checkInfo.current || state.session?.version || '?';
+      // 说明有两份来源：这次 check 的响应（checkInfo.notes）与后端缓存的
+      // 配置值（status 顶层的 notes，落盘后刷新页面也在）。谁有就用谁，
+      // 两份都没有时**如实说"没有提供说明"**，不编造。
+      const notes = (checkInfo.notes && String(checkInfo.notes).trim())
+        || (statusNotes && String(statusNotes).trim()) || '';
       notice.append(banner('warn', [
         h('div', { style: { display: 'flex', gap: '9px', alignItems: 'center', flexWrap: 'wrap' } }, [
           h('span', { style: { fontSize: '18px' }, text: '🎉' }),
@@ -533,6 +772,12 @@ export function UpdateView(content, ctx = {}) {
           h('span', { text: `（当前 v${cur}）` }),
         ]),
         checkInfo.asset_error ? h('div', { style: mutedStyle, text: checkInfo.asset_error }) : null,
+        // 更新内容放在横幅里最显眼的位置：默认展开，可折叠。
+        notesBlock(notes, {
+          title: `本次更新内容（v${checkInfo.latest}）`,
+          open: true,
+          testid: 'zp-update-notes-banner',
+        }),
         h('div', { style: mutedStyle, text: '最后检测：' + fmtTime(checkInfo.checked_at) + ' · 每 6 小时自动检测一次' }),
         h('div', { style: actionsStyle }, [
           // 升级入口只留这一颗（新版本存在时出现）。testid 沿用原来的
@@ -613,6 +858,11 @@ export function UpdateView(content, ctx = {}) {
     const st = data.state || {};
     const status = st.status || 'idle';
 
+    // 说明的两份来源：status 顶层（配置缓存）与 state 里（若有）。
+    const prevStatusNotes = statusNotes;
+    statusNotes = (typeof data.notes === 'string' && data.notes)
+      || (typeof st.notes === 'string' && st.notes) || '';
+
     // 每次重渲染先作废旧的成功自动消失定时器；只有 success 会重新排一个。
     clearDismissTimer();
 
@@ -639,6 +889,12 @@ export function UpdateView(content, ctx = {}) {
           text: `上次升级：v${st.to || '?'} 成功${st.finished_at ? '（' + st.finished_at.replace('T', ' ').slice(0, 19) + '）' : ''}`,
         }));
       }
+      // apply 成功后告诉用户"本次升级包含什么"（说明来自发布清单，可能为空）。
+      bodyEl.append(notesBlock(statusNotes, {
+        title: `本次升级包含（v${st.to || '?'}）`,
+        open: true,
+        testid: 'zp-update-notes-success',
+      }));
       scheduleSuccessDismiss(fresh);
     } else if (status === 'rolled_back') {
       bodyEl.append(banner('err', [
@@ -670,7 +926,9 @@ export function UpdateView(content, ctx = {}) {
     // 升级中显示"请勿退出或刷新页面"，结束/开始时各自恢复。
     const wasRunning = upRunning;
     upRunning = inProgress;
-    if (upRunning !== wasRunning) renderNotice();
+    // notes 变了也要重画顶部横幅：刷新页面时 check 还没回来、status 先带着
+    // 说明到达，这时横幅必须立刻从"没有说明"变成真正的说明。
+    if (upRunning !== wasRunning || statusNotes !== prevStatusNotes) renderNotice();
 
     if (hasUpgradeTrace && ended) {
       // 记下结束态的快照：即使随后绿色横幅按约定自动消失（磁盘状态被清成 idle），
@@ -767,9 +1025,18 @@ export function UpdateView(content, ctx = {}) {
 
     // ---- 已就绪 → 一键更新 ----
     if (data.staged && status === 'staged') {
+      // stage 之后（包已下好、尚未替换程序）：说明同样要展示，
+      // 用户在这里做"要不要真的换"的决定。data.notes 优先，退回 statusNotes。
+      const stagedNotes = (typeof data.notes === 'string' && data.notes)
+        || (data.state && typeof data.state.notes === 'string' && data.state.notes)
+        || statusNotes;
       bodyEl.append(banner('ok', [
         h('strong', { text: `v${data.staged_version} 已准备就绪。` }),
-        (data.notes || data.state?.notes) ? h('pre.logbox', { text: data.notes || data.state.notes }) : null,
+        notesBlock(stagedNotes, {
+          title: `本次更新内容（v${data.staged_version}）`,
+          open: true,
+          testid: 'zp-update-notes-staged',
+        }),
         h('div', { style: actionsStyle }, [
           h('button.btn.btn-primary', {
             text: `一键更新到 v${data.staged_version}`,
@@ -900,6 +1167,14 @@ export function UpdateView(content, ctx = {}) {
       toast('当前面板不是以 root 运行，无法自我升级；请用「上传升级包」或 install.sh', 'warn', 9000);
       return;
     }
+    // 动手之前先把"这个版本更新了什么"摆出来（摘要 + 可展开全文）。
+    // 取消就什么都不做 —— 确认框是用户唯一能看到说明后再做决定的地方。
+    const targetVer = (info && info.staged_version) || (checkInfo && checkInfo.latest) || '';
+    const targetNotes = (info && typeof info.notes === 'string' && info.notes)
+      || (info && info.state && typeof info.state.notes === 'string' && info.state.notes)
+      || (checkInfo && typeof checkInfo.notes === 'string' && checkInfo.notes)
+      || statusNotes;
+    if (!(await confirmUpgrade(targetVer, targetNotes))) return;
     busy = true;
     try {
       let staged = !!(info && info.staged);

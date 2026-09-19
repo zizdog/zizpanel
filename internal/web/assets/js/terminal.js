@@ -8,45 +8,98 @@
 //     用户手动上滚后暂停贴底并给出「↓ 回到底部」
 //   - 断线后显示原因并提供"重连"，而不是静默失效
 //   - 顶部明确标注当前身份（默认是普通用户，不是 root）
+//
+// ---------------------------------------------------------------------------
+//  保活（2026-09-24 用户要求，与文件编辑器最小化同等要求）
+// ---------------------------------------------------------------------------
+//  面板是 hash 路由 SPA：切板块时视图 DOM 会整个重建。终端**不能**因此被切断 ——
+//  只要没登出面板，切走再回来，屏幕内容、回滚历史、正在跑的命令都必须还在，
+//  而且还能继续输入执行。
+//
+//  做法：把终端实例（term）、WebSocket（ws）与整块终端 DOM（dom）缓存在
+//  **模块级**；TerminalView 每次挂载只是把这些**同一个节点重新挂到新容器**里，
+//  连接全程不动。只有两种情况才真正销毁：
+//    · 用户点「关闭会话」（会话本身就该结束）；
+//    · 登出面板（app.js 的 doLogout 调 destroyTerminal()）。
+//
+//  ⚠️ 路由切换时 app.js 会执行 onLeave 清理，所以这里的清理**绝不能** closeWS ——
+//  它只摘掉 window resize 监听，连接与 DOM 全部保留。
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
-import { registerCleanup } from './app.js';
+import { h, clear, toast, confirmBox, appendAll } from './ui.js';
 import { Terminal } from './ansi.js';
 
+// ---------------- 模块级持久状态（跨路由复用的那部分） ----------------
 let ws = null;
 let term = null;
-let containerEl = null;
-let infoEl = null;
+let heartbeat = null;
 // follow：是否自动贴底。用户手动往上滚看历史时置 false，
 // 否则每来一行输出就把他拽回底部，等于没法回看。
 let follow = true;
-// 「↓ 回到底部」按钮（做法与任务中心进度窗的 tc-tobottom 一致）
-let toBottomBtn = null;
-// statusBar 必须和 containerEl / infoEl 一样放在模块级：
-// renderStatus() 是模块级函数，却要往这个元素里塞按钮。之前它是
-// TerminalView 里的 const，于是 renderStatus 一调用就抛
-// "statusBar is not defined"（终端状态栏永远不更新，而且只在浏览器
-// 控制台留下一行无文件名的 ReferenceError）。
-let statusBar = null;
 // 心跳：后端给 WebSocket 读了 75 秒的超时，用来发现"对端被强杀、没有 FIN"的情况。
 // 真实空闲的会话必须靠它不断刷新期限，否则用户走开一会儿终端就被判死了。
-let heartbeat = null;
 const HEARTBEAT_MS = 25000;
+
+// dom 是整块终端 UI 的持久节点（screen / statusBar / infoEl / toBottomBtn）。
+// 连 statusBar 与 infoEl 也持久化：renderStatus() 是模块级函数，
+// 若每次挂载都换新节点，切走后连接上收到的输出就会画进已经脱离文档的旧节点。
+let dom = null;
+
+// gen 用来作废"挂起的异步启动"：登出/重连会让上一次 start() 的 await 变成过期操作，
+// 否则用户登出后，一个尚未返回的 terminalInfo() 仍会建立一条新的 shell 连接。
+let gen = 0;
+
+// sessionClosed：是否已显式关闭（点「关闭会话」或登出）。关闭后不再自动重连，
+// 直到用户点状态栏里的「重连」。
+let sessionClosed = false;
 
 export function TerminalView(content, ctx = {}) {
   clear(content);
+  const d = ensureDom();
+
+  // 每次挂载都用**同一批持久节点**重建卡片：DOM 被移动而非重建，
+  // 所以 screen 里的回滚历史、滚动位置、statusBar 的当前状态都原样保留。
+  content.append(
+    h('div.card', [
+      h('div.card-head', [
+        h('h3', { text: 'Web 终端' }),
+        h('div.spacer'),
+        d.statusBar,
+      ]),
+      h('div.card-body.tight', { style: { padding: '0' } }, [d.screenWrap]),
+      h('div', { style: { padding: '10px 14px', borderTop: '1px solid var(--border-soft)' } }, [d.infoEl]),
+    ]),
+  );
+
+  if (!term) {
+    // 还没有会话（首次进入 / 上次读到"未启用"后重进）→ 建立。
+    start();
+  } else {
+    // 已有会话：**不重连、不清屏**，只把持久 DOM 重新挂上、按新尺寸 fit。
+    reattach();
+  }
+
+  // 屏幕尺寸变化时同步给后端。
+  // 监听是"每次挂载一份、离开时摘掉"的：connection 保活，但监听不能叠加。
+  const onResize = () => fitSize();
+  window.addEventListener('resize', onResize);
+  if (ctx.onLeave) {
+    ctx.onLeave(() => {
+      window.removeEventListener('resize', onResize);
+      // 刻意**不** closeWS()、不销毁 term：这就是保活的关键。
+    });
+  }
+}
+
+// ensureDom 只构造一次持久节点，并把与"会话无关"的事件监听挂一次。
+function ensureDom() {
+  if (dom) return dom;
 
   // .term-screen 自己就是滚动容器（overflow: auto）：滚出屏幕顶部的行
   // 会被保留在它内部的 .term-history 里，所以滚轮/滚动条在这里生效，
   // 而不是去撑高整个页面。
   const screen = h('div.term-screen', { tabindex: '0' });
-  statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
-  infoEl = h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', lineHeight: '1.6' } });
-  containerEl = screen;
-  follow = true;
-
-  toBottomBtn = h('button.btn.btn-sm', {
+  const toBottomBtn = h('button.btn.btn-sm', {
     text: '↓ 回到底部',
     style: { display: 'none', position: 'absolute', right: '14px', bottom: '12px', boxShadow: 'var(--shadow)' },
     onclick: () => {
@@ -57,6 +110,8 @@ export function TerminalView(content, ctx = {}) {
     },
   });
   const screenWrap = h('div', { style: { position: 'relative' } }, [screen, toBottomBtn]);
+  const statusBar = h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } });
+  const infoEl = h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)', lineHeight: '1.6' } });
 
   // 用户手动往上滚 → 暂停自动贴底并给出「回到底部」；滚回底部 → 恢复自动贴底。
   screen.addEventListener('scroll', () => {
@@ -65,43 +120,30 @@ export function TerminalView(content, ctx = {}) {
     toBottomBtn.style.display = atBottom ? 'none' : '';
   });
 
-  content.append(
-    h('div.card', [
-      h('div.card-head', [
-        h('h3', { text: 'Web 终端' }),
-        h('div.spacer'),
-        statusBar,
-      ]),
-      h('div.card-body.tight', { style: { padding: '0' } }, [screenWrap]),
-      h('div', { style: { padding: '10px 14px', borderTop: '1px solid var(--border-soft)' } }, [infoEl]),
-    ]),
-  );
+  // 键盘输入 -> PTY（监听只挂一次，重连不会叠加）。
+  screen.addEventListener('keydown', onKeyDown);
+  screen.addEventListener('paste', onPaste);
+  screen.addEventListener('click', () => screen.focus());
 
-  start();
-
-  // 屏幕尺寸变化时同步给后端
-  const onResize = () => fitSize();
-  window.addEventListener('resize', onResize);
-  registerCleanup(() => {
-    window.removeEventListener('resize', onResize);
-    closeWS();
-  });
+  dom = { screen, screenWrap, toBottomBtn, statusBar, infoEl };
+  return dom;
 }
 
 function renderStatus(state, text) {
-  clear(statusBar);
-  appendAll(statusBar,
+  if (!dom) return;
+  clear(dom.statusBar);
+  appendAll(dom.statusBar,
     h('span.pill' + (state === 'ok' ? '.ok' : state === 'err' ? '.danger' : '.warn'), { text }),
     h('button.btn.btn-sm', {
       text: '清屏',
       onclick: () => {
         // reset() 同时清网格与回滚历史：清屏按钮的语义就是"把屏幕清干净"，
         // 只清可见区而把历史留着，用户会以为清屏没生效。
-        if (term) { term.reset(); term.render(containerEl); }
+        if (term) { term.reset(); term.render(dom.screen); }
         follow = true;
-        if (toBottomBtn) toBottomBtn.style.display = 'none';
-        containerEl.scrollTop = 0;
-        containerEl.focus();
+        if (dom.toBottomBtn) dom.toBottomBtn.style.display = 'none';
+        dom.screen.scrollTop = 0;
+        dom.screen.focus();
       },
     }),
     h('button.btn.btn-sm', {
@@ -121,7 +163,9 @@ function renderStatus(state, text) {
       text: '关闭会话',
       onclick: async () => {
         if (!await confirmBox('关闭当前终端会话？正在运行的任务会被终止。', { title: '关闭终端', danger: true, okText: '关闭' })) return;
+        // 这是"主动关闭"：连接真的断掉，并标记为已关闭（切页回来不会偷偷重连）。
         closeWS();
+        sessionClosed = true;
         renderStatus('', '会话已关闭');
       },
     }),
@@ -144,39 +188,85 @@ function closeWS() {
   }
 }
 
+// destroyTerminal 是**唯一**的销毁入口：登出面板时由 app.js 调用。
+// 主动点「关闭会话」只断连接（term 留着让用户还能看到关闭前的内容）。
+export function destroyTerminal() {
+  gen++; // 作废所有挂起的 start()
+  closeWS();
+  term = null;
+  sessionClosed = false;
+  follow = true;
+  if (dom) {
+    clear(dom.screen);
+    clear(dom.statusBar);
+    clear(dom.infoEl);
+    dom.toBottomBtn.style.display = 'none';
+  }
+}
+
+// reattach 把一个**仍然活着的**会话重新挂到刚重建的视图里。
+function reattach() {
+  if (!dom || !term) return;
+  const el = dom.screen;
+  // 先按当前 DOM 重画一遍（脱离文档期间的输出会在这时补齐结构），
+  // 再按新容器尺寸 fit —— 否则 vim/top 之类按旧列数画的界面会错位。
+  term.render(el);
+  fitSize();
+  if (follow) el.scrollTop = el.scrollHeight;
+  el.focus();
+}
+
+// showUnavailable 在终端区域里画一个"读不到状态"的说明（绝不猜一个默认状态）。
+function showUnavailable(title, detail, withRetry) {
+  if (!dom) return;
+  clear(dom.screen);
+  appendAll(dom.screen, h('div.empty', [
+    h('div.big', { text: '⚠️' }),
+    h('h4', { text: title }),
+    h('p', { text: detail }),
+    withRetry ? h('div', { style: { marginTop: '16px' } }, [
+      h('button.btn.btn-sm', { text: '↻ 重试', onclick: () => start() }),
+    ]) : null,
+  ]));
+}
+
 async function start() {
+  const d = ensureDom();
+  const my = ++gen;
+  sessionClosed = false;
+
   let info;
   try {
     info = await api.terminalInfo();
   } catch (e) {
-    clear(containerEl);
-    appendAll(containerEl, h('div.empty', [
-      h('div.big', { text: '⚠️' }),
-      h('h4', { text: '无法读取终端状态' }),
-      h('p', { text: e.message }),
-    ]));
+    if (my !== gen) return; // 已被登出/重连取代
+    showUnavailable('无法读取终端状态', e.message || String(e), true);
     return;
   }
+  if (my !== gen) return;
 
   if (!info.enabled) {
-    clear(containerEl);
-    appendAll(containerEl, h('div.empty', [
+    clear(d.screen);
+    appendAll(d.screen, h('div.empty', [
       h('div.big', { text: '🔒' }),
       h('h4', { text: 'Web 终端未启用' }),
       h('p', { text: '这是一个高权限功能（等于把本机 shell 交给浏览器），因此默认关闭。' }),
       h('div', { style: { marginTop: '16px' } }, [
         h('button.btn.btn-primary', {
+          // 终端的开关已并入「面板设置 → 访问与安全」（2026-09-24 信息架构调整）。
           text: '前往面板设置开启',
-          onclick: () => { location.hash = '#/settings'; },
+          onclick: () => { location.hash = '#/settings/access'; },
         }),
       ]),
     ]));
+    renderStatus('', '未启用');
+    clear(d.infoEl);
     return;
   }
 
   // 状态信息（明确告知当前身份，避免误以为一定是 root）
-  clear(infoEl);
-  appendAll(infoEl,
+  clear(d.infoEl);
+  appendAll(d.infoEl,
     h('div', { text: info.note }),
     // 空闲超时 0 的含义是"不限制"（见 internal/term 的 IdleTimeout），
     // 直接写"0 分钟"会让人以为会话立刻过期 —— 这是用户真正会误读的一句话。
@@ -188,13 +278,13 @@ async function start() {
   );
 
   // 初始化网格：按容器实际尺寸推算列数行数
-  const cols = estimateCols(containerEl);
-  const rows = estimateRows(containerEl);
+  const cols = estimateCols(d.screen);
+  const rows = estimateRows(d.screen);
   term = new Terminal(cols, rows);
-  clear(containerEl);
-  // 重连/新会话都回到"自动贴底"的初始状态
+  clear(d.screen);
+  // 新建会话都回到"自动贴底"的初始状态
   follow = true;
-  if (toBottomBtn) toBottomBtn.style.display = 'none';
+  if (d.toBottomBtn) d.toBottomBtn.style.display = 'none';
   renderStatus('connecting', '正在连接…');
 
   // 建立 WebSocket
@@ -205,18 +295,20 @@ async function start() {
     renderStatus('err', '无法构造连接地址');
     return;
   }
-  ws = new WebSocket(url);
+  const sock = new WebSocket(url);
+  ws = sock;
 
-  ws.onopen = () => {
+  sock.onopen = () => {
+    if (sock !== ws) return; // 已被重连替换
     renderStatus('ok', '已连接');
     send({ type: 'resize', cols: term.cols, rows: term.rows });
     // 心跳：让服务端知道"对端还活着"（服务端读超时 75s，这里 25s 一次）。
     stopHeartbeat();
     heartbeat = setInterval(() => send({ type: 'ping' }), HEARTBEAT_MS);
-    containerEl.focus();
+    d.screen.focus();
   };
 
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === 'output') {
@@ -230,21 +322,19 @@ async function start() {
     }
   };
 
-  ws.onerror = () => {
+  sock.onerror = () => {
+    if (sock !== ws) return;
     renderStatus('err', '连接出错');
   };
 
-  ws.onclose = (ev) => {
+  sock.onclose = (ev) => {
+    if (sock !== ws) return; // 旧 socket（已被重连替换）的关闭事件，忽略
     stopHeartbeat();
+    ws = null;
     if (ev.code !== 1000) {
       renderStatus('err', `连接已断开（代码 ${ev.code}）。可点"重连"。`);
     }
   };
-
-  // 键盘输入 -> PTY
-  containerEl.addEventListener('keydown', onKeyDown);
-  containerEl.addEventListener('paste', onPaste);
-  containerEl.addEventListener('click', () => containerEl.focus());
 }
 
 function send(obj) {
@@ -259,17 +349,18 @@ function send(obj) {
  * 自动贴底的判定必须放在 render 之后：只有渲染完 scrollHeight 才是新的。
  */
 function paintOutput(data) {
-  if (!term || !containerEl) return;
-  const prevHeight = containerEl.scrollHeight;
+  if (!term || !dom) return;
+  const el = dom.screen;
+  const prevHeight = el.scrollHeight;
   term.write(data);
-  term.render(containerEl);
+  term.render(el);
   if (follow) {
-    containerEl.scrollTop = containerEl.scrollHeight;
+    el.scrollTop = el.scrollHeight;
   } else {
     // 用户正在翻历史：新行是从上方（.term-history）插入的，
     // 把 scrollTop 加上同样的高度增量，让他盯着的那几行留在原地，
     // 而不是被新输出向上顶走。
-    containerEl.scrollTop += containerEl.scrollHeight - prevHeight;
+    el.scrollTop += el.scrollHeight - prevHeight;
   }
 }
 
@@ -349,12 +440,13 @@ function estimateRows(el) {
 }
 
 function fitSize() {
-  if (!term || !containerEl) return;
-  const cols = estimateCols(containerEl);
-  const rows = estimateRows(containerEl);
+  if (!term || !dom) return;
+  const el = dom.screen;
+  const cols = estimateCols(el);
+  const rows = estimateRows(el);
   if (cols === term.cols && rows === term.rows) return;
   term.resize(cols, rows);
-  term.render(containerEl);
-  if (follow) containerEl.scrollTop = containerEl.scrollHeight;
+  term.render(el);
+  if (follow) el.scrollTop = el.scrollHeight;
   send({ type: 'resize', cols, rows });
 }

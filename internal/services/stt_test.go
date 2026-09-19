@@ -106,13 +106,18 @@ func TestSTTModelTiersAreStable(t *testing.T) {
 
 // TestFindSTTModelInjection 锁住"档位 → STTModel"的解析规则。
 func TestFindSTTModelInjection(t *testing.T) {
-	if id := DefaultSTTModelID(); id != "small" {
-		t.Errorf("默认档应为 small，实际 %q", id)
+	// 2026-09-25 用户要求把默认档从 small 换成 large-v3-turbo（更准、只大 ~85 MiB）。
+	if id := DefaultSTTModelID(); id != "large-v3-turbo" {
+		t.Errorf("默认档应为 large-v3-turbo，实际 %q", id)
 	}
 	// 空串 = 默认档（请求里不写 model 时就是这个行为）。
 	m, err := FindSTTModel("")
-	if err != nil || m.ID != "small" {
+	if err != nil || m.ID != "large-v3-turbo" {
 		t.Errorf("空档位应解析为默认档，得到 %q err=%v", m.ID, err)
+	}
+	// 默认档必须指向一个**真实存在**的档位，且权重是 turbo 那份（不小写错文件）。
+	if m.File != "ggml-large-v3-turbo-q5_0.bin" || m.Bytes != 574041195 {
+		t.Errorf("默认档指向的文件不对：%q / %d 字节", m.File, m.Bytes)
 	}
 	// 大小写与两端空白都要容忍（curl 调用方很容易写成 "Small"）。
 	m, err = FindSTTModel("  LARGE-V3-TURBO ")

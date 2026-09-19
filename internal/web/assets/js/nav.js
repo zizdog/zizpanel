@@ -142,121 +142,15 @@ async function pickUploadedIcon(iconInput, what = '图标') {
   return m;
 }
 
-// NAV_APPEARANCE_CSS —— 面板内导航页的"毛玻璃外观"。
+// NAV_APPEARANCE_CSS —— 面板内导航页**只保留卡片尺寸**的样式。
 //
-// 为什么是**运行时注入**而不是写进 app.css：
-//   用户 2026-09-18 要求把参考首页的观感搬进导航页，同时明确另一条硬约束 ——
-//   不要改 assets/app.css（那里是并行改动热点）。所以样式全部 scope 在
-//   `.zp-nav-shell` 之下，运行时注入到 <head>（见 ensureNavAppearanceStyle）。
-//   面板内页面与独立别名页共用同一份设置，但各自的样式实现是独立的：
-//   别名页必须自包含（assets/nav/index.html 里内联），这里则复用面板壳子。
-//
-// 颜色表（8 套色系）不在前端硬编码：随 navTree 的 `themes` 字段从服务端下发。
+// 2026-09-24 用户要求：背景图 / 主题背景**只用于独立页 /nav/**，
+// 面板内 #/nav 的观感必须与面板一致（不铺背景）。
+// 所以原来那套"毛玻璃 + 渐变 + 漂移光晕"的运行时样式整体删掉：
+// 面板内直接吃 app.css 里既有的 .zp-nav-* 规则 —— 那是面板自己的色板，
+// 深浅主题跟随 panel 的 data-theme，视觉上就是普通面板页。
+// 这里只留"卡片尺寸（小/中/大）"这一档与背景无关的密度设置。
 const NAV_APPEARANCE_CSS = `
-.zp-nav-shell{
-  position:relative; overflow:hidden; border-radius:16px; padding:18px; min-height:60vh;
-  color:var(--zp-nav-text);
-  --zp-nav-text:#eef0ff;
-  --zp-nav-text-dim:rgba(238,240,255,.62);
-  --zp-nav-text-mute:rgba(238,240,255,.42);
-  --zp-nav-card-bg:rgba(255,255,255,.09);
-  --zp-nav-card-bg-hover:rgba(255,255,255,.16);
-  --zp-nav-card-bd:rgba(255,255,255,.14);
-  --zp-nav-chip:rgba(255,255,255,.08);
-  --zp-nav-chip-active:rgba(255,255,255,.22);
-  --zp-nav-icon-bg:rgba(255,255,255,.10);
-  --zp-nav-icon-bg-hover:rgba(255,255,255,.18);
-  --zp-nav-shadow:0 10px 30px rgba(0,0,0,.45);
-  --zp-nav-shadow-hover:0 18px 44px rgba(0,0,0,.55);
-  --zp-nav-orb1:#8b5cf6; --zp-nav-orb2:#22d3ee; --zp-nav-orb-op:.38;
-  --zp-nav-accent:#8b5cf6;
-}
-.zp-nav-shell[data-nav-mode="light"]{
-  --zp-nav-text:#1b1b2f;
-  --zp-nav-text-dim:rgba(27,27,47,.60);
-  --zp-nav-text-mute:rgba(27,27,47,.42);
-  --zp-nav-card-bg:rgba(255,255,255,.55);
-  --zp-nav-card-bg-hover:rgba(255,255,255,.80);
-  --zp-nav-card-bd:rgba(255,255,255,.70);
-  --zp-nav-chip:rgba(255,255,255,.40);
-  --zp-nav-chip-active:rgba(255,255,255,.95);
-  --zp-nav-icon-bg:rgba(255,255,255,.50);
-  --zp-nav-icon-bg-hover:rgba(255,255,255,.92);
-  --zp-nav-shadow:0 8px 24px rgba(31,38,135,.10);
-  --zp-nav-shadow-hover:0 16px 36px rgba(31,38,135,.16);
-  --zp-nav-orb-op:.28;
-}
-@media (prefers-color-scheme: light){
-  .zp-nav-shell[data-nav-mode="auto"]{
-    --zp-nav-text:#1b1b2f;
-    --zp-nav-text-dim:rgba(27,27,47,.60);
-    --zp-nav-text-mute:rgba(27,27,47,.42);
-    --zp-nav-card-bg:rgba(255,255,255,.55);
-    --zp-nav-card-bg-hover:rgba(255,255,255,.80);
-    --zp-nav-card-bd:rgba(255,255,255,.70);
-    --zp-nav-chip:rgba(255,255,255,.40);
-    --zp-nav-chip-active:rgba(255,255,255,.95);
-    --zp-nav-icon-bg:rgba(255,255,255,.50);
-    --zp-nav-icon-bg-hover:rgba(255,255,255,.92);
-    --zp-nav-shadow:0 8px 24px rgba(31,38,135,.10);
-    --zp-nav-shadow-hover:0 16px 36px rgba(31,38,135,.16);
-    --zp-nav-orb-op:.28;
-  }
-}
-.zp-nav-bglayer{position:absolute;inset:0;z-index:0;opacity:0;transition:opacity .7s ease;
-  background-size:cover;background-position:center;background-repeat:no-repeat}
-.zp-nav-bglayer.on{opacity:1}
-.zp-nav-orbs{position:absolute;inset:0;z-index:1;overflow:hidden;pointer-events:none}
-.zp-nav-orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:var(--zp-nav-orb-op);
-  width:46vmax;height:46vmax;transition:background-color .9s ease,opacity .6s ease}
-.zp-nav-orb.a{background:var(--zp-nav-orb1);top:-14vmax;left:-10vmax;animation:zp-nav-drift1 26s ease-in-out infinite}
-.zp-nav-orb.b{background:var(--zp-nav-orb2);right:-12vmax;bottom:-14vmax;animation:zp-nav-drift2 32s ease-in-out infinite}
-@keyframes zp-nav-drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(6vmax,4vmax) scale(1.12)}}
-@keyframes zp-nav-drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-5vmax,-4vmax) scale(1.15)}}
-.zp-nav-fg{position:relative;z-index:2}
-.zp-nav-shell .zp-nav-title{color:var(--zp-nav-text)}
-.zp-nav-shell .zp-nav-subtitle{color:var(--zp-nav-text-mute)}
-.zp-nav-shell .zp-nav-group{background:transparent;border:none;box-shadow:none;margin-bottom:18px}
-.zp-nav-shell .zp-nav-group:hover{border-color:transparent;box-shadow:none}
-.zp-nav-shell .zp-nav-group>.card-head{padding:0 0 12px;border-bottom:none}
-.zp-nav-shell .zp-nav-group>.card-body{padding:0}
-.zp-nav-shell .zp-nav-group-head h3{color:var(--zp-nav-text);font-size:1.12em;font-weight:400;
-  padding-left:12px;border-left:3px solid var(--zp-nav-accent)}
-.zp-nav-shell .zp-nav-group-head .pill{background:var(--zp-nav-chip);color:var(--zp-nav-text-dim);
-  border-color:var(--zp-nav-card-bd)}
-.zp-nav-shell .zp-nav-card{
-  position:relative;overflow:hidden;color:var(--zp-nav-text);
-  background:var(--zp-nav-card-bg);border:1px solid var(--zp-nav-card-bd);
-  backdrop-filter:blur(16px) saturate(150%);-webkit-backdrop-filter:blur(16px) saturate(150%);
-  border-radius:18px;padding:16px 18px;min-height:70px;box-shadow:var(--zp-nav-shadow);
-  transition:transform .32s cubic-bezier(.34,1.4,.5,1),background .3s ease,box-shadow .3s ease,border-color .3s ease;
-}
-.zp-nav-shell .zp-nav-card::after{
-  content:"";position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,.85),transparent);
-  transform:translateX(-100%);transition:transform .6s ease;
-}
-.zp-nav-shell .zp-nav-card:hover{
-  transform:translateY(-6px);background:var(--zp-nav-card-bg-hover);box-shadow:var(--zp-nav-shadow-hover);
-  border-color:color-mix(in srgb,var(--zp-nav-card-bd) 40%,var(--zp-nav-accent));
-}
-.zp-nav-shell .zp-nav-card:hover::after{transform:translateX(100%)}
-.zp-nav-shell .zp-nav-icon{background:var(--zp-nav-icon-bg);
-  transition:transform .35s cubic-bezier(.34,1.4,.5,1),background .3s ease}
-.zp-nav-shell .zp-nav-card:hover .zp-nav-icon{transform:scale(1.10) rotate(-4deg);background:var(--zp-nav-icon-bg-hover)}
-.zp-nav-shell .zp-nav-name{color:var(--zp-nav-text)}
-.zp-nav-shell .zp-nav-desc{color:var(--zp-nav-text-dim)}
-.zp-nav-shell .zp-nav-empty-inline{color:var(--zp-nav-text-mute)}
-.zp-nav-shell .input,.zp-nav-shell .select{
-  background:var(--zp-nav-card-bg);border-color:var(--zp-nav-card-bd);color:var(--zp-nav-text);
-}
-.zp-nav-shell .input::placeholder{color:var(--zp-nav-text-mute)}
-.zp-nav-shell .btn{background:var(--zp-nav-chip);border-color:var(--zp-nav-card-bd);color:var(--zp-nav-text)}
-.zp-nav-shell .btn:hover{background:var(--zp-nav-chip-active)}
-.zp-nav-shell .btn-primary{background:var(--zp-nav-accent);border-color:var(--zp-nav-accent);color:#fff}
-.zp-nav-shell .btn-primary:hover{background:var(--zp-nav-accent);border-color:var(--zp-nav-accent)}
-.zp-nav-shell .empty{color:var(--zp-nav-text-mute)}
-.zp-nav-shell .empty h4{color:var(--zp-nav-text-dim)}
 .zp-nav-shell[data-nav-size="s"] .zp-nav-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
 .zp-nav-shell[data-nav-size="s"] .zp-nav-card{padding:11px 14px;border-radius:14px;gap:11px;min-height:56px}
 .zp-nav-shell[data-nav-size="s"] .zp-nav-icon{width:38px;height:38px;font-size:19px;border-radius:11px}
@@ -272,13 +166,6 @@ const NAV_APPEARANCE_CSS = `
 .zp-nav-shell[data-nav-size="l"] .zp-nav-icon{width:68px;height:68px;font-size:34px;border-radius:20px}
 .zp-nav-shell[data-nav-size="l"] .zp-nav-name{font-size:1.20em}
 .zp-nav-shell[data-nav-size="l"] .zp-nav-desc{font-size:.86em}
-@media (prefers-reduced-motion: reduce){
-  .zp-nav-shell .zp-nav-orb{animation:none}
-  .zp-nav-shell .zp-nav-card,.zp-nav-shell .zp-nav-icon,.zp-nav-bglayer{transition:none}
-  .zp-nav-shell .zp-nav-card:hover{transform:none}
-  .zp-nav-shell .zp-nav-card:hover .zp-nav-icon{transform:none}
-  .zp-nav-shell .zp-nav-card::after{display:none}
-}
 `;
 
 // ensureNavAppearanceStyle 把上面的样式注入 <head>，只注入一次（切页重进不叠加）。
@@ -313,11 +200,9 @@ export function NavView(content, ctx = {}) {
 
   const toolbar = h('div.zp-nav-toolbar');
   const body = h('div', { id: 'zp-nav-body' });
-  const bgA = h('div.zp-nav-bglayer');
-  const bgB = h('div.zp-nav-bglayer');
-  const orbs = h('div.zp-nav-orbs', [h('div.zp-nav-orb.a'), h('div.zp-nav-orb.b')]);
-  const fg = h('div.zp-nav-fg', [toolbar, body]);
-  const shell = h('div.zp-nav-shell', { dataset: { testid: 'nav-shell' } }, [bgA, bgB, orbs, fg]);
+  // 面板内**不再有背景层/光晕层**（2026-09-24 用户要求：不铺背景，观感与面板一致）。
+  // 背景图与色系渐变只在独立页 /nav/（assets/nav/）里渲染。
+  const shell = h('div.zp-nav-shell', { dataset: { testid: 'nav-shell' } }, [toolbar, body]);
   content.append(shell);
 
   const idOf = (x) => Number(x.id);
@@ -386,10 +271,6 @@ export function NavView(content, ctx = {}) {
   const safeAccentOf = (raw) => (/^#[0-9a-f]{6}$/i.test(String(raw || '')) ? String(raw) : '');
   const safeAccent = () => safeAccentOf(settings.accent);
 
-  // cssURL 把地址安全地拼进 CSS 的 url("…")：引号/括号/反斜杠/空白一律百分号化。
-  const cssURL = (u) => String(u).replace(/["'()\\\s]/g,
-    (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-
   // effSettings：服务端已保存的设置 ← 弹窗里未保存的即时预览（draft）。
   function effSettings() {
     const base = settings || {};
@@ -404,46 +285,20 @@ export function NavView(content, ctx = {}) {
   const modeIsDark = (mode) => mode === 'dark'
     || (mode === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
 
-  // 双缓冲交叉淡入：渐变/背景图写到"另一张"图层上，再淡出旧的（与别名页同一手法）。
-  let bgFlip = false;
-  function paintNavBG(s, variant) {
-    const next = bgFlip ? bgA : bgB;
-    const cur = bgFlip ? bgB : bgA;
-    const bg = String(s.background || '').trim();
-    if (bg) {
-      // 压一层暗色遮罩：亮背景图会把卡片文字吃掉，可读性优先。
-      next.style.backgroundImage =
-        'linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,.35)), url("' + cssURL(bg) + '")';
-    } else if (variant) {
-      next.style.backgroundImage = 'linear-gradient(135deg, ' + (variant.grad || []).join(',') + ')';
-    } else {
-      next.style.backgroundImage = 'linear-gradient(135deg,#1b1b2f,#2b2b45)';
-    }
-    next.classList.add('on');
-    cur.classList.remove('on');
-    bgFlip = !bgFlip;
-  }
-
   // applyAppearance 把外观应用到导航页容器（标题/副标题在 renderToolbar 里走 DOM）。
   //
-  // accent 与 theme 的共存：accent（「主题色」输入框，留空 = 跟随色系）是**单一强调色**，
-  // 优先于色系自带的 accent；theme 还决定背景渐变与两个光晕色。见弹窗里的说明文案。
+  // 2026-09-24：面板内**只应用卡片尺寸与自定义主题色** —— 背景图 / 色系渐变 /
+  // 漂移光晕 / 外观模式都**只作用于独立页 /nav/**（用户明确要求面板内不铺背景、
+  // 观感与面板一致）。设置本身仍然保存到服务端，独立页读的是同一份。
+  // 因此这里不再设置 data-nav-mode，也不再画任何背景图层。
   function applyAppearance() {
     const s = effSettings();
-    shell.setAttribute('data-nav-mode', s.mode);
     shell.setAttribute('data-nav-size', s.size);
-
-    const th = themes.find((t) => t.id === s.theme) || null;
-    const variant = th ? (modeIsDark(s.mode) ? th.dark : th.light) : null;
-    const accent = safeAccentOf(s.accent) || (variant && variant.accent) || '#8b5cf6';
-    shell.style.setProperty('--zp-nav-accent', accent);
-    // 同时保留面板既有的 --nav-accent（app.css 的 .zp-nav-card:hover 用它），语义相同。
-    content.style.setProperty('--nav-accent', accent);
-    if (variant) {
-      shell.style.setProperty('--zp-nav-orb1', (variant.orb && variant.orb[0]) || '#8b5cf6');
-      shell.style.setProperty('--zp-nav-orb2', (variant.orb && variant.orb[1]) || '#22d3ee');
-    }
-    paintNavBG(s, variant);
+    // 自定义主题色只影响卡片悬停边框（app.css 的 --nav-accent）；
+    // 留空就删掉，回落到**面板品牌色**，而不是某个色系自带的颜色。
+    const accent = safeAccentOf(s.accent);
+    if (accent) content.style.setProperty('--nav-accent', accent);
+    else content.style.removeProperty('--nav-accent');
   }
 
   // appearanceForm 是「🎨 外观」弹窗：外观模式 / 主题色系 / 卡片尺寸 / 标题 / 副标题 / 主题色 / 背景图。
@@ -555,26 +410,32 @@ export function NavView(content, ctx = {}) {
       // 关掉弹窗（含取消/遮罩/Esc）就丢弃未保存的即时预览，恢复服务端值。
       onClose: () => { draft = null; applyAppearance(); },
       body: h('div', [
-        h('div.field', [h('label', { text: '外观模式' }), modeWrap,
-          h('div.hint', { text: '自动 = 跟随操作系统；亮色 / 暗色为固定外观。只作用于导航页。' })]),
-        h('div.field', [h('label', { text: '主题色系' }), themeGrid,
-          h('div.hint', { text: '8 套色系决定背景渐变与两个光晕的颜色；每套都含亮/暗两版。' })]),
-        h('div.field', [h('label', { text: '卡片尺寸' }), sizeWrap,
-          h('div.hint', { text: '小 / 中 / 大三档，改变卡片密度与图标大小。' })]),
+        h('div.hint', {
+          style: { marginBottom: '12px' },
+          html: '<b>面板内导航页</b>固定跟随面板观感、<b>不铺背景</b>；下面的外观模式 / 主题色系 / 背景图'
+            + '<b>只作用于独立页 <code class="code">/nav/</code></b>（点工具栏「↗ 独立页」查看效果）。'
+            + '卡片尺寸与自定义主题色在面板内同样生效。',
+        }),
+        h('div.field', [h('label', { text: '外观模式（仅独立页）' }), modeWrap,
+          h('div.hint', { text: '自动 = 跟随操作系统；亮色 / 暗色为固定外观。只作用于独立导航页 /nav/。' })]),
+        h('div.field', [h('label', { text: '主题色系（仅独立页）' }), themeGrid,
+          h('div.hint', { text: '8 套色系决定独立页的背景渐变与两个光晕的颜色；每套都含亮/暗两版。' })]),
+        h('div.field', [h('label', { text: '卡片尺寸（面板内 + 独立页）' }), sizeWrap,
+          h('div.hint', { text: '小 / 中 / 大三档，改变卡片密度与图标大小。两处都生效。' })]),
         h('div.field', [h('label', { text: '标题' }), title,
           h('div.hint', { text: '显示在导航页左上角。留空 = 「导航页」。' })]),
         h('div.field', [h('label', { text: '副标题' }), subtitle,
           h('div.hint', { text: '标题下面那行小字。留空 = 默认。' })]),
-        h('div.field', [h('label', { text: '主题色' }),
+        h('div.field', [h('label', { text: '主题色（面板内 + 独立页）' }),
           h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
             [accent, colorPick, swatches]),
           h('div.hint', {
-            text: '自定义强调色（卡片悬停边框、搜索框聚焦…），会覆盖所选色系自带的强调色；'
-              + '留空 = 跟随色系。不影响面板其它页面的配色。',
+            text: '自定义强调色（卡片悬停边框、搜索框聚焦…）。面板内以它为准；留空 = 跟随面板品牌色'
+              + '（独立页留空 = 跟随所选色系）。不影响面板其它页面的配色。',
           })]),
-        h('div.field', [h('label', { text: '背景图' }),
+        h('div.field', [h('label', { text: '背景图（仅独立页）' }),
           h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [bgUp, bgPick, bgClear]),
-          h('div.hint', { text: 'png / jpg / webp，≤8 MiB。铺满整个导航页（cover），并压一层暗色遮罩保证文字可读；设置后色系渐变被它盖住。' }),
+          h('div.hint', { text: 'png / jpg / webp，≤8 MiB。只铺在独立导航页 /nav/ 上（cover + 暗色遮罩保证文字可读）；面板内不显示背景图。' }),
           bgPreview]),
       ]),
       footer: (close) => [h('button.btn', { text: '取消', onclick: close }), okBtn],
@@ -629,7 +490,7 @@ export function NavView(content, ctx = {}) {
       }),
       edit ? h('button.btn.btn-sm', {
         text: '🎨 外观', dataset: { testid: 'nav-appearance' },
-        title: '改外观模式 / 主题色系 / 卡片尺寸 / 标题 / 副标题 / 主题色 / 背景图（独立导航页同样生效）',
+        title: '改导航页外观：外观模式 / 主题色系 / 背景图只作用于独立页 /nav/；卡片尺寸与主题色两处都生效',
         onclick: appearanceForm,
       }) : null,
       edit ? h('button.btn.btn-sm', {
@@ -1022,13 +883,8 @@ export function NavView(content, ctx = {}) {
     };
   }
 
-  // 系统主题变化时（自动模式）实时联动；离开页面时摘掉监听，避免切页后叠加。
-  const sysTheme = window.matchMedia('(prefers-color-scheme: dark)');
-  const onSysTheme = () => { if (effSettings().mode === 'auto') applyAppearance(); };
-  sysTheme.addEventListener('change', onSysTheme);
-  if (ctx && typeof ctx.onLeave === 'function') {
-    ctx.onLeave(() => sysTheme.removeEventListener('change', onSysTheme));
-  }
+  // 面板内只看卡片尺寸与自定义强调色，与系统主题无关（背景/色系只在独立页），
+  // 所以这里不再监听 prefers-color-scheme。
 
   renderToolbar();
   renderBody();

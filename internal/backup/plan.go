@@ -94,6 +94,10 @@ func Plan(o PlanOptions) []Item {
 	add("data/certs", filepath.Join(o.DataDir, "certs"), ApplyReplace, true, TargetPanel)
 	add("data/site-certs", filepath.Join(o.DataDir, "site-certs"), ApplyReplace, true, TargetPanel)
 	add("data/proxy-certs", filepath.Join(o.DataDir, "proxy-certs"), ApplyReplace, true, TargetPanel)
+	// 反向代理的访问鉴权凭据（htpasswd 文件，2026-09-25 新增"可加权鉴"时引入）。
+	// 必须进备份：vhost 里的 `auth_basic_user_file` 指向它，只备份库/vhost 而丢了
+	// 这个文件，恢复后要么鉴权悄悄失效、要么 nginx 因文件缺失而报错。
+	add("data/proxy-auth", filepath.Join(o.DataDir, "proxy-auth"), ApplyReplace, true, TargetPanel)
 	add("data/acme", filepath.Join(o.DataDir, "acme"), ApplyReplace, true, TargetPanel)
 	add("data/default-site.json", filepath.Join(o.DataDir, "default-site.json"), ApplyReplace, false, TargetPanel)
 
@@ -219,7 +223,7 @@ func Selected(itemTargets, targets []string) bool {
 
 // DataCoveredNames 是 <DataDir> 下进了备份（或由数据库快照等价覆盖）的一级名字。
 func DataCoveredNames() []string {
-	return []string{"config.json", "tls", "certs", "site-certs", "proxy-certs", "acme",
+	return []string{"config.json", "tls", "certs", "site-certs", "proxy-certs", "proxy-auth", "acme",
 		"default-site.json", "panel.db"}
 }
 

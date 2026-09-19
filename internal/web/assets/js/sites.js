@@ -1347,14 +1347,14 @@ export function SitesView(content, ctx = {}) {
     ]));
   }
 
-  // siteRow 画一个**已注册站点**的行（含域名后面的可点击地址）。
+  // siteRow 画一个**已注册站点**的行。
   function siteRow(s) {
     return h('tr', [
       h('td', [
-        h('div', { style: { fontWeight: '600' }, text: s.domain }),
+        h('div', { style: { fontWeight: '600' } }, [domainLink(s)]),
         s.aliases ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.aliases }) : null,
         s.remark ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.remark }) : null,
-        addressLinks(s.domain, s.ssl_enabled),
+        addressInfo(s),
       ]),
       h('td', [
         h('span.pill' + (s.conf_exists ? '.ok' : '.danger'), {
@@ -1380,29 +1380,50 @@ export function SitesView(content, ctx = {}) {
     ]);
   }
 
-  // addressLinks 生成域名后面的可点击地址（http:// 与 https://，新窗口打开）。
+  // domainLink 把**域名文本本身**做成链接（用户 2026-09-25 明确要求）。
   //
-  // 用户 2026-09-22："网站列表的域名处添加地址链接"。
+  // 用户原话：不要 `blog.zizdog.com` / `http://blog.zizdog.com` / `https://blog.zizdog.com`
+  // 三种形式都列出来 —— 只显示域名文本本身，并且这段文字本身可点、新标签打开。
   //
-  // 带端口 / 别名时**按主域名生成**：站点记录里的 domain 才是 nginx server_name 的
-  // 主名（别名只是同一份 vhost 里的附加名字，拿别名拼链接可能落到别的站点上）；
-  // domain 里若带端口，链接里也去掉端口 —— 面板生成 vhost 时按 80/443 监听，
-  // 拼上端口反而打不开。
-  function addressLinks(domain, sslEnabled) {
-    const host = String(domain || '').replace(/:\d+$/, '');
+  // 链接用该站点**实际启用的协议**：开了 SSL 走 https，否则走 http；
+  // 协议、SSL 状态、nginx 配置是否存在等附加信息放进 title 与下面那行小字，
+  // 保证信息不丢（见 addressInfo）。带端口的 domain 与旧实现一样去掉端口 ——
+  // 面板生成的 vhost 按 80/443 监听，拼上端口反而打不开。
+  function domainLink(s) {
+    const host = String(s.domain || '').replace(/:\d+$/, '');
+    if (!host) return h('span', { text: s.domain || '' });
+    const scheme = s.ssl_enabled ? 'https' : 'http';
+    const href = scheme + '://' + host + '/';
+    const notes = ['在新窗口打开 ' + href];
+    notes.push(s.ssl_enabled
+      ? '该站点已开启 SSL：https 可用'
+      : '该站点未开启 SSL：这里用 http 打开；直接访问 https://' + host + '/ 会提示证书不受信任');
+    if (!s.conf_exists) {
+      notes.push('nginx 配置文件不存在（数据库有记录、nginx 没在服务）');
+    } else if (!s.enabled) {
+      notes.push('站点已停用（nginx 配置文件在，但不服务）');
+    }
+    return h('a', {
+      href, target: '_blank', rel: 'noopener',
+      text: s.domain, title: notes.join('；'),
+    });
+  }
+
+  // addressInfo 用小字如实标出协议与可达状态。
+  //
+  // 这是"不丢信息"的那一半：不再列出三种网址形态，但协议（http/https）与
+  // "配置在不在、启没启用"仍然看得见；具体状态列还有更细的判定。
+  function addressInfo(s) {
+    const host = String(s.domain || '').replace(/:\d+$/, '');
     if (!host) return null;
+    const proto = s.ssl_enabled ? '🔒 https' : 'http';
+    const state = !s.conf_exists
+      ? '⚠ nginx 配置缺失'
+      : (s.enabled ? '配置存在、已启用' : '配置存在、已停用');
     return h('div.zp-addr', [
-      h('a', {
-        href: 'http://' + host + '/', target: '_blank', rel: 'noopener',
-        text: 'http://' + host,
-        title: '在新窗口打开 http://' + host + '/',
-      }),
-      h('a', {
-        href: 'https://' + host + '/', target: '_blank', rel: 'noopener',
-        text: 'https://' + host,
-        title: sslEnabled
-          ? '在新窗口打开 https://' + host + '/'
-          : '该站点未开启 SSL：浏览器会提示证书不受信任（链接本身仍然可用）',
+      h('span', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        text: proto + ' · ' + state,
       }),
     ]);
   }
@@ -1432,10 +1453,12 @@ export function SitesView(content, ctx = {}) {
           h('span.pill.brand', { style: { marginLeft: '6px' }, text: '默认' }),
         ]),
         host
-          ? h('div.zp-addr', [h('a', {
-            href: 'http://' + host + '/', target: '_blank', rel: 'noopener',
-            text: 'http://' + host + '/', title: '在新窗口打开 http://' + host + '/',
-          })])
+          ? h('div', { style: { fontWeight: '600' } }, [
+            h('a', {
+              href: 'http://' + host + '/', target: '_blank', rel: 'noopener',
+              text: host, title: '在新窗口打开 http://' + host + '/（默认站点只监听 80 端口、没有 HTTPS）',
+            }),
+          ])
           : null,
         h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' },
           text: '80 端口兜底站点（面板自带，不占用「站点」表的记录）' }),

@@ -481,7 +481,7 @@ func TestSTTHealthzUnhealthyWithoutModel(t *testing.T) {
 func TestSTTHealthzHealthyOnlyWhenProbeReallyRuns(t *testing.T) {
 	root := t.TempDir()
 	modelsDir := filepath.Join(root, services.STTModelDirName)
-	sttSparseModel(t, modelsDir, "small")
+	sttSparseModel(t, modelsDir, "large-v3-turbo")
 
 	// ① 探针会失败（whisper-cli 跑不起来）。
 	brokenEng := newSTTFakeEngine(t, modelsDir, sttFakeEngineOptions{CLIFails: true})
@@ -584,7 +584,7 @@ func TestSTTModelsListContract(t *testing.T) {
 	if len(body.Data) != len(services.STTModels) {
 		t.Fatalf("应列出全部 %d 档，实际 %d", len(services.STTModels), len(body.Data))
 	}
-	if body.Ready != 2 || body.Current != "small" {
+	if body.Ready != 2 || body.Current != "large-v3-turbo" {
 		t.Errorf("ready/current 不对：ready=%d current=%q", body.Ready, body.Current)
 	}
 	byID := map[string]int{}
@@ -603,7 +603,7 @@ func TestSTTModelsListContract(t *testing.T) {
 		if m.Note == "" {
 			t.Errorf("%s：必须有取舍说明", m.ID)
 		}
-		if m.Current != (m.ID == "small") {
+		if m.Current != (m.ID == "large-v3-turbo") {
 			t.Errorf("%s：current 标记不对", m.ID)
 		}
 	}
@@ -663,7 +663,7 @@ func TestSTTModelDeleteRequiresConfirm(t *testing.T) {
 		t.Fatal("没有 confirm 时**绝不能**删掉模型文件")
 	}
 
-	// ② 带 confirm → 200，文件真没了，释放字节数如实回报，当前档（small）不变。
+	// ② 带 confirm → 200，文件真没了，释放字节数如实回报，当前档（默认 large-v3-turbo）不变。
 	rec, body := del("medium", `{"confirm":true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("带 confirm 时应给 200，实际 %d（%s）", rec.Code, rec.Body.String())
@@ -675,7 +675,7 @@ func TestSTTModelDeleteRequiresConfirm(t *testing.T) {
 	if services.STTModelFileExists(modelsDir, "medium") {
 		t.Error("确认后 medium 的权重应当被删除")
 	}
-	if body.Current != "small" {
+	if body.Current != "large-v3-turbo" {
 		t.Errorf("删非当前档时当前档不该变，实际 %q", body.Current)
 	}
 
@@ -910,7 +910,7 @@ func TestSTTSelectModelRequiresInstalled(t *testing.T) {
 func TestSTTRoutesAreRegistered(t *testing.T) {
 	root := t.TempDir()
 	modelsDir := filepath.Join(root, services.STTModelDirName)
-	sttSparseModel(t, modelsDir, "small")
+	sttSparseModel(t, modelsDir, "large-v3-turbo")
 	eng := newSTTFakeEngine(t, modelsDir, sttFakeEngineOptions{})
 	srv := newSTTTestServer(t, eng, root, 60)
 	h := srv.Handler()
@@ -978,7 +978,7 @@ func TestSTTRoutesAreRegistered(t *testing.T) {
 func TestSTTAliasPathWorksThroughAppProxy(t *testing.T) {
 	root := t.TempDir()
 	modelsDir := filepath.Join(root, services.STTModelDirName)
-	sttSparseModel(t, modelsDir, "small")
+	sttSparseModel(t, modelsDir, "large-v3-turbo")
 	eng := newSTTFakeEngine(t, modelsDir, sttFakeEngineOptions{})
 	srv := newSTTTestServer(t, eng, root, 60)
 
@@ -1060,7 +1060,7 @@ func TestSTTAliasPathWorksThroughAppProxy(t *testing.T) {
 
 	// ⑤ POST multipart 经别名：证明请求体真的流过去了（大上传就是这条路）。
 	body, ctype := sttMultipartBody(t, map[string]string{
-		"model": "small", "language": "zh", "response_format": "text",
+		"model": "large-v3-turbo", "language": "zh", "response_format": "text",
 	}, "t.wav", []byte("RIFF....WAVEfmt "))
 	req := httptest.NewRequest(http.MethodPost, "/stt/v1/audio/transcriptions", body)
 	req.Header.Set("Content-Type", ctype)

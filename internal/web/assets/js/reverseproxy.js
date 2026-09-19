@@ -18,6 +18,8 @@ import { registerCleanup } from './app.js';
 import { normalizeCerts, pickCertForDomain } from './certs.js';
 
 let cache = null;
+// probeErr 是最近一次异步状态探测的错误（列表徽标据此显示"检测失败"，不谎报不可达）。
+let probeErr = '';
 
 // SSL_PROVIDERS 是证书来源选项，取值与站点侧完全一致（self/mkcert/manual/acme）。
 // ACME 放第一位并标注"推荐"：它是唯一能被浏览器直接信任的来源，
@@ -28,6 +30,18 @@ const SSL_PROVIDERS = [
   { value: 'self', label: '自签证书（浏览器会提示不受信任）' },
   { value: 'manual', label: '粘贴自有证书' },
 ];
+
+// authSummary 把后端的「回读生效值」拼成一行文字。
+//
+// 绝不只说"已保存"：verified=true 才说生效；读不到就明确写"未复核"并带上原因
+//（用户 2026-09-25 明确要求"保存后要回读生效值，读不到就如实说未复核"）。
+function authSummary(it) {
+  const a = (it && it.auth) || {};
+  if (!a.enabled) return '';
+  const base = '当前：用户名 ' + (a.user || '（未设置）');
+  if (a.verified) return base + '；回读：✅ 密码文件与 nginx 配置都已生效。';
+  return base + '；回读：⚠️ 未复核 —— ' + (a.note || '读不到生效值，请重新保存并检查 nginx。');
+}
 
 // sslSummary 把后端给的证书摘要拼成一行可读文字（来源 / 覆盖域名 / 到期 / 剩余）。
 // 字段缺失时逐项跳过，不编造——没有的信息宁可不说。
@@ -142,6 +156,38 @@ export function ReverseProxyView(content, ctx = {}) {
     }
     renderHead();
     renderGrid();
+    // 首屏渲染完**立刻**异步探测状态：列表接口本身不再跑任何真实探测，
+    // 所以目标不可达也不会拖慢打开页面（2026-09-19 用户报"明显需要等待"）。
+    void probeStatuses();
+  }
+
+  // probeStatuses 渲染完/点「检测」时异步探测规则状态。
+  //
+  // 后端并发探测、每条 ≤500ms、结果进 60s TTL 缓存；这里把结果写回当前列表
+  // 并重绘徽标。探测失败**不**把状态改成"不可达"（那会是谎报），只提示失败。
+  async function probeStatuses(ids) {
+    let r;
+    try {
+      r = await api.proxyProbeStatus(ids && ids.length ? { ids } : { all: true });
+      probeErr = '';
+    } catch (e) {
+      probeErr = (e && e.message) || String(e);
+      renderGrid();
+      return;
+    }
+    const byId = new Map((r.list || []).map((x) => [x.id, x]));
+    (cache?.list || []).forEach((it) => {
+      const x = byId.get(it.id);
+      if (!x) return;
+      it.port_listening = !!x.port_listening;
+      it.target_ok = !!x.target_ok;
+      it.target_detail = x.target_detail;
+      it.status_probed = true;
+      it.status_stale = false;
+      it.status_probe_at = x.probed_at;
+      it.status_probe_age_ms = 0;
+    });
+    renderGrid();
   }
 
   function renderHead() {
@@ -203,6 +249,12 @@ export function ReverseProxyView(content, ctx = {}) {
   function ruleCard(it) {
     const domains = (it.domains || '').split(',').map((s) => s.trim()).filter(Boolean);
     const title = it.name || ('规则 #' + it.id);
+    // 状态徽标的"新鲜度"：probed=false 表示还没探测过（显示"检测中…"）；
+    // 有检测时间就显示"约 N 秒前检测"，过期要明确标出来（不当实时状态展示）。
+    const probed = !!it.status_probed;
+    const ageS = it.status_probe_at
+      ? Math.max(0, Math.round((Date.now() - Date.parse(it.status_probe_at)) / 1000))
+      : null;
     return h('div', {
       style: {
         border: '1px solid var(--border)', borderRadius: 'var(--radius)',
@@ -213,18 +265,30 @@ export function ReverseProxyView(content, ctx = {}) {
       h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
         h('div', { style: { fontWeight: '620', fontSize: '13.5px' }, text: title }),
         it.enabled ? h('span.pill.ok', { text: '已启用' }) : h('span.pill', { text: '已停用' }),
-        it.enabled && it.port_listening
-          ? h('span.pill.ok', { text: '端口 ' + it.listen + ' 在听' })
-          : (it.enabled ? h('span.pill.danger', {
-            text: '端口 ' + it.listen + ' 没有监听',
-            title: 'nginx 没在这个端口上监听：可能 nginx 没启动、或端口被别的进程占用。看「日志中心」或终端里 nginx -t',
-          }) : null),
-        it.target_ok
-          ? h('span.pill.ok', { text: '目标可达', title: it.target_detail })
-          : h('span.pill.warn', { text: '目标不可达', title: it.target_detail }),
+        it.enabled
+          ? (!probed
+            ? h('span.pill', { text: '端口检测中…', title: '正在异步检测 ' + it.listen + ' 端口是否在监听' })
+            : (it.port_listening
+              ? h('span.pill.ok', { text: '端口 ' + it.listen + ' 在听' })
+              : h('span.pill.danger', {
+                text: '端口 ' + it.listen + ' 没有监听',
+                title: 'nginx 没在这个端口上监听：可能 nginx 没启动、或端口被别的进程占用。看「日志中心」或终端里 nginx -t',
+              })))
+          : null,
+        !probed
+          ? h('span.pill', { text: '目标检测中…', title: '正在异步检测目标是否可达（每条 ≤500ms）' })
+          : (it.target_ok
+            ? h('span.pill.ok', { text: '目标可达', title: it.target_detail })
+            : h('span.pill.warn', { text: '目标不可达', title: it.target_detail })),
         it.websocket ? h('span.pill', { text: 'WS' }) : null,
         it.ssl_enabled
           ? h('span.pill.ok', { text: '🔒 HTTPS', title: sslTitle(it) })
+          : null,
+        it.auth_enabled
+          ? h('span.pill' + (it.auth_verified ? '.ok' : '.warn'), {
+            text: it.auth_verified ? '🔑 鉴权' : '🔑 鉴权（未复核）',
+            title: authSummary(it),
+          })
           : null,
         lanForwardPill(it),
         h('div.spacer'),
@@ -251,7 +315,20 @@ export function ReverseProxyView(content, ctx = {}) {
         : null,
       it.ssl_enabled && it.ssl ? h('div.hint', { text: sslSummary(it) }) : null,
       it.remark ? h('div.hint', { text: it.remark }) : null,
-      it.target_detail && !it.target_ok ? h('div.hint', { style: { color: 'var(--danger)' }, text: it.target_detail }) : null,
+      probed
+        ? h('div.hint', {
+          style: it.status_stale ? { color: 'var(--warn)' } : {},
+          text: '状态检测时间：' + (ageS != null ? '约 ' + ageS + ' 秒前' : '刚检测')
+            + (it.status_stale ? '（缓存已过期，点「检测」重测）' : ''),
+        })
+        : h('div.hint', {
+          text: probeErr
+            ? ('状态检测失败：' + probeErr + '（点「检测」重试）')
+            : '状态：检测中…（列表不再同步探测，探测在后台跑）',
+        }),
+      probed && it.target_detail && !it.target_ok
+        ? h('div.hint', { style: { color: 'var(--danger)' }, text: it.target_detail })
+        : null,
       h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
         h('button.btn.btn-sm', { text: '✏️ 编辑', onclick: () => editRule(it) }),
         h('button.btn.btn-sm', {
@@ -266,6 +343,12 @@ export function ReverseProxyView(content, ctx = {}) {
               toast(r.detail || (r.ok ? '可达' : '不可达'), r.ok ? 'ok' : 'err', 8000);
             } catch (e) { toast('测试失败：' + e.message, 'err', 8000); }
           },
+        }),
+        // 「检测」= 重测这条规则的端口/目标状态（走异步批量接口的单条分支）。
+        h('button.btn.btn-sm', {
+          text: '检测',
+          title: '重新检测这条规则的端口监听与目标可达性（每条 ≤500ms）',
+          onclick: () => { void probeStatuses([it.id]); },
         }),
         // 「测大请求体」——**按需触发**（真的发 64KB），刻意不放进 load()/列表渲染：
         // "端口在听、目标可达"都不等于能收大请求体。2026-09-18 事故里，大请求体先被
@@ -367,6 +450,12 @@ export function ReverseProxyView(content, ctx = {}) {
       sslReissue: h('input', { type: 'checkbox', checked: false, id: 'zp-proxy-ssl-reissue' }),
       // 明文 HTTP 打到本端口时 301 跳 https（Lucky 同款行为），新建规则默认开。
       redirectHTTP: h('input', { type: 'checkbox', checked: it ? !!it.redirect_http : true }),
+      // ---- 访问鉴权（HTTP Basic Auth，2026-09-25 用户要求）----
+      // 开启后访问该规则地址必须通过 Basic Auth，否则 401（nginx 直接回）。
+      authOn: h('input', { type: 'checkbox', checked: it ? !!it.auth_enabled : false }),
+      authUser: h('input.input', { value: it?.auth_user || '', placeholder: '例如：admin' }),
+      // 密码框永远不回显：留空 = 沿用已保存的密码（编辑已有规则时不会被迫重设）。
+      authPass: h('input.input', { type: 'password', placeholder: it?.auth_enabled ? '留空 = 保持原密码不变' : '设置访问密码' }),
     };
     f.sslProvider.value = SSL_PROVIDERS.some((p) => p.value === cur.provider) ? cur.provider : 'acme';
     f.lanForward.value = ['auto', 'on', 'off'].includes(it?.lan_forward) ? it.lan_forward : 'auto';
@@ -482,6 +571,21 @@ export function ReverseProxyView(content, ctx = {}) {
       node,
       hint ? h('div.hint', { text: hint }) : null,
     ]);
+
+    // ---- 访问鉴权详情（开关关掉时整块隐藏）----
+    const authReadback = it && it.auth_enabled
+      ? h('div.hint', { style: { color: it.auth_verified ? 'var(--ok)' : 'var(--warn)' },
+        text: authSummary(it) })
+      : null;
+    const authDetail = h('div', { id: 'zp-proxy-auth-detail', style: { marginTop: '8px' } }, [
+      row('用户名', f.authUser, '存在 htpasswd 文件里的用户名（建议只用字母数字与 . _ -）'),
+      row('密码', f.authPass, it?.auth_enabled
+        ? '留空 = 保持已保存的密码不变；填了就换成新的。'
+        : '开启鉴权时必须设置；密码只保存哈希。'),
+      authReadback,
+    ]);
+    const renderAuth = () => { authDetail.style.display = f.authOn.checked ? '' : 'none'; };
+    f.authOn.addEventListener('change', renderAuth);
     const body = h('div', [
       row('规则名称', f.name, '只用于你自己识别'),
       row('监听端口', f.listen, 'nginx 在这个端口上接收请求；80 需要 root，面板已具备'),
@@ -511,6 +615,18 @@ export function ReverseProxyView(content, ctx = {}) {
         })
         : null,
       row('备注', f.remark),
+      // ---- 访问鉴权（HTTP Basic Auth）----
+      h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
+        h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
+          f.authOn, h('span', { style: { fontWeight: '600' }, text: '需要用户名密码（HTTP Basic Auth）' }),
+        ]),
+        h('div.hint', {
+          text: '开启后，访问这条规则的地址必须先通过 Basic Auth，否则 nginx 直接回 401'
+            + '（响应头带 WWW-Authenticate: Basic realm=…）。密码只保存 apr1 哈希：'
+            + '不回显、不写日志、不进审计。',
+        }),
+        authDetail,
+      ]),
       h('div', { style: { borderTop: '1px solid var(--border-soft)', paddingTop: '12px', marginTop: '4px' } }, [
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
           f.sslOn, h('span', { style: { fontWeight: '600' }, text: '启用 HTTPS（由 nginx 直接终止 TLS）' }),
@@ -582,6 +698,22 @@ export function ReverseProxyView(content, ctx = {}) {
               redirect_http: f.redirectHTTP.checked,
               lan_forward: f.lanForward.value,
             };
+            // 访问鉴权：开关 + 用户名 + 密码。空密码**不放进 payload**，
+            // 后端据此判定"沿用原密码"（密码框永不回显）。
+            payload.auth_enabled = f.authOn.checked;
+            payload.auth_user = f.authUser.value.trim();
+            if (f.authPass.value !== '') payload.auth_password = f.authPass.value;
+            if (f.authOn.checked) {
+              if (!payload.auth_user) {
+                toast('开启了「需要用户名密码」，请填用户名', 'warn', 9000);
+                return;
+              }
+              const hasStored = !!(it && it.auth && it.auth.password_set);
+              if (f.authPass.value === '' && !hasStored) {
+                toast('开启了「需要用户名密码」，请设置密码', 'warn', 9000);
+                return;
+              }
+            }
             // 关闭 HTTPS：走主接口把 ssl_enabled=false 落库并重生成非 SSL 配置。
             if (hadSSL && !sslOn) payload.ssl_enabled = false;
 
@@ -651,7 +783,22 @@ export function ReverseProxyView(content, ctx = {}) {
                 return;
               }
             }
-            toast(isNew ? '规则已创建' : '规则已保存', 'ok');
+            // 保存结果要如实说清"鉴权有没有真的生效"：后端做了磁盘回读，
+            // verified=true 才敢说已生效；读不到就显示"未复核"（用户明确要求）。
+            const a = (saved && saved.auth) || {};
+            let msg = isNew ? '规则已创建' : '规则已保存';
+            let level = 'ok';
+            let hold = 0;
+            if (saved && saved.auth_enabled) {
+              if (a.verified) {
+                msg += '；访问鉴权已生效（用户名 ' + (a.user || '') + '）';
+              } else {
+                msg += '；访问鉴权未复核：' + (a.note || '读不到生效值，请检查 nginx 是否已重载');
+                level = 'warn';
+                hold = 16000;
+              }
+            }
+            toast(msg, level, hold);
             close();
             load();
           },
@@ -660,6 +807,7 @@ export function ReverseProxyView(content, ctx = {}) {
     });
     void m;
     renderSSL();
+    renderAuth();
     setTimeout(() => f.name.focus(), 60);
   }
 

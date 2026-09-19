@@ -137,7 +137,7 @@
     <details class="api">
       <summary>OpenAI 兼容接口</summary>
       <pre class="code">POST /v1/audio/transcriptions        （multipart/form-data）
-  file=@audio.wav  model=small  language=zh  response_format=srt
+  file=@audio.wav  model=large-v3-turbo  language=zh  response_format=srt
 
 GET  /v1/models                     装了哪些档、当前档是谁
 GET  /healthz                       能力探活（模型在 + 引擎在 + 真的转一次）
@@ -145,7 +145,7 @@ POST /v1/models/&lt;id&gt;/download       下载某一档（202 + task_id）
 POST /v1/models/&lt;id&gt;/delete         删除某一档（需 {"confirm":true}）
 
 curl -sS http://127.0.0.1:8892/v1/audio/transcriptions \
-     -F file=@/tmp/test.wav -F model=small -F language=zh \
+     -F file=@/tmp/test.wav -F model=large-v3-turbo -F language=zh \
      -F response_format=verbose_json</pre>
       <p class="small muted">
         超过同步上限（<span id="sync-max">60</span> 秒）的音频会返回
