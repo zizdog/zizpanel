@@ -184,48 +184,65 @@ async function pingHealth() {
 
 // ---------------- 升级过程的可视化 ----------------
 //
-// 用户 2026-09-20 的要求："升级过程要有详细的内容展示！"
-// 光有一句"升级中…"等于让用户干等：他不知道是在下载、在校验、还是卡住了。
-// 这里把后端 state 里已有的信息全部摊开：
-//   · 阶段条：检查更新 → 下载安装包 → 校验并暂存 → 替换程序 → 重启并验证；
-//   · 当前阶段原文（st.stage / st.message，由后端逐步写盘）；
-//   · 已用时长（每秒刷新，来自 st.started_at）；
-//   · state.steps 里每一步的时间 + 结论（升级失败时这是唯一能看出卡在哪的证据）。
+// 用户 2026-09-23 的要求（原话意译）：
+//   「下载升级包要很久，页面上没有明显的升级进度，用户不知道发生了什么就去刷新重试。
+//     要在检查更新页面最显眼的位置实时显示进度，并提示『请勿退出或刷新页面』，
+//     用类似 logbox 的样式。」
+//
+// 所以这里的重点从"摊开 state.steps"升级成"一块真正的进度面板"：
+//   · 大号百分比 + 进度条 + 已下载 X / Y + 速度 + 已用时间 + 当前阶段；
+//   · 顶部固定一行醒目警示（只在升级进行中出现）；
+//   · 等宽字体的 logbox，逐行显示后端写的**真实**阶段与日志，自动滚到底；
+//   · 结束（完成/失败）后结果留在页面上，失败原因不会一闪而过。
+//
+// 数据全部来自后端 `state.progress` / `state.logs`（见 internal/upgrade/progress.go）：
+// 字节数来自下载回调的真实写入计数，阶段来自真实的过程切换 —— 前端不编造任何数字。
 const UP_PHASES = [
-  { id: 'check', label: '检查更新' },
-  { id: 'download', label: '下载安装包' },
-  { id: 'stage', label: '校验并暂存' },
+  { id: 'manifest', label: '获取清单' },
+  { id: 'download', label: '下载' },
+  { id: 'verify', label: '校验' },
+  { id: 'extract', label: '解包' },
+  { id: 'smoke', label: '试运行' },
   { id: 'apply', label: '替换程序' },
   { id: 'restart', label: '重启并验证' },
 ];
 
-// upPhaseIndex 把后端状态映射到阶段下标；-1 表示"没有正在进行的升级"。
-function upPhaseIndex(status) {
-  switch (status) {
+// upStageIndex 把后端的阶段 id（优先）或状态映射到阶段下标；
+// -1 = 没有正在进行的升级，UP_PHASES.length = 全部走完。
+function upStageIndex(st) {
+  const stage = st && st.progress && st.progress.stage;
+  if (stage) {
+    const i = UP_PHASES.findIndex((p) => p.id === stage);
+    if (i >= 0) return i;
+    if (stage === 'done') return UP_PHASES.length;
+    if (stage === 'failed') return -1;
+  }
+  // 老状态没有 progress：按 status 退化推断，保证面板仍然可用。
+  switch (st && st.status) {
     case 'checking': return 0;
     case 'downloading': return 1;
-    case 'staged': return 2;
-    case 'applying': return 3;
-    case 'restarting': return 4;
+    case 'staged': return UP_PHASES.length;
+    case 'applying': return 5;
+    case 'restarting': return 6;
     case 'success': return UP_PHASES.length;
     default: return -1;
   }
 }
 
-function upPhaseBar(status) {
-  const cur = upPhaseIndex(status);
+function upPhaseBar(st) {
+  const cur = upStageIndex(st);
   const bar = h('div', {
     dataset: { testid: 'zp-upgrade-phases' },
-    style: { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '4px 0 10px' },
+    style: { display: 'flex', gap: '6px', flexWrap: 'wrap', margin: '10px 0 0' },
   });
   UP_PHASES.forEach((p, i) => {
     const done = cur > i;
     const active = cur === i;
     bar.append(h('span', {
       style: {
-        padding: '2px 8px', borderRadius: '10px', fontSize: '12px',
-        border: '1px solid ' + (active ? 'var(--primary)' : 'var(--border)'),
-        background: active ? 'var(--primary)' : 'transparent',
+        padding: '2px 8px', borderRadius: '10px', fontSize: '11.5px',
+        border: '1px solid ' + (active ? 'var(--brand)' : 'var(--border)'),
+        background: active ? 'var(--brand)' : 'transparent',
         color: active ? '#fff' : (done ? 'var(--text)' : 'var(--text-mute)'),
         opacity: done || active ? '1' : '0.55',
       },
@@ -243,22 +260,162 @@ function upElapsedText(startedAt) {
   return `已用 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒`;
 }
 
-function upStepsBox(st) {
-  const steps = Array.isArray(st.steps) ? st.steps : [];
-  if (!steps.length) return null;
-  const lines = steps.map((s) => {
-    const at = s.at ? String(s.at).replace('T', ' ').slice(11, 19) : '--:--:--';
-    const mark = s.ok === false ? '✗' : '✓';
-    return `${at}  ${mark} ${s.stage || ''}${s.message ? '：' + s.message : ''}`;
-  });
+// upFmtBytes 把字节数变成人读形式（与后端 upgradeHumanBytes 同规则）。
+function upFmtBytes(n) {
+  const v0 = Number(n);
+  if (!isFinite(v0) || v0 <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = v0;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return (i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+}
+
+function upFmtSpeed(bps) {
+  const v = Number(bps);
+  if (!isFinite(v) || v <= 0) return '—';
+  return upFmtBytes(v) + '/s';
+}
+
+// upPct 只在后端**确实**给出了百分比时才显示数字。
+// -1 表示"总大小未知"（既没有清单 size 也没有 Content-Length）——
+// 这时宁可不显示百分比、画一条滚动的不确定进度条，也不猜一个假数字。
+function upPct(st, status) {
+  const p = (st && st.progress) || {};
+  if (typeof p.percent === 'number' && p.percent >= 0) return Math.min(100, p.percent);
+  if (status === 'staged' || status === 'success') return 100;
+  return -1;
+}
+
+function upStageText(st, status) {
+  const p = (st && st.progress) || {};
+  if (p.stage_label) return p.stage_label;
+  if (status === 'staged') return '已完成，等待应用';
+  if (status === 'success') return '完成';
+  if (status === 'rolled_back') return '失败（已回滚）';
+  if (status === 'failed') return '失败';
+  return st.stage || '准备中';
+}
+
+// upLogLines 把后端的结构化日志（或老状态的 steps）拍成等宽文本行。
+function upLogLines(st) {
+  const lines = [];
+  if (Array.isArray(st.logs)) {
+    for (const l of st.logs) {
+      const at = l.at ? String(l.at).replace('T', ' ').slice(11, 19) : '--:--:--';
+      lines.push(`${at}  ${l.text || ''}`);
+    }
+  }
+  if (!lines.length && Array.isArray(st.steps)) {
+    // 向后兼容：老状态只有 steps（没有 logs）时照旧能显示。
+    for (const s of st.steps) {
+      const at = s.at ? String(s.at).replace('T', ' ').slice(11, 19) : '--:--:--';
+      const mark = s.ok === false ? '✗' : '✓';
+      lines.push(`${at}  ${mark} ${s.stage || ''}${s.message ? '：' + s.message : ''}`);
+    }
+  }
+  return lines;
+}
+
+function upLogBox(st) {
+  const lines = upLogLines(st);
+  if (!lines.length) return null;
   const box = h('pre.logbox', {
-    dataset: { testid: 'zp-upgrade-steps' },
-    style: { maxHeight: '220px', overflow: 'auto', margin: '0 0 10px' },
+    dataset: { testid: 'zp-upgrade-log' },
+    style: { maxHeight: '240px', marginTop: '10px' },
     text: lines.join('\n'),
   });
-  // 追加式日志：滚到底部，用户一眼看到最新一步。
+  // 追加式日志：永远滚到底部，用户一眼看到最新一步。
+  // 用即时赋值而不是 behavior:'smooth' —— 后者对 prefers-reduced-motion 用户是动画。
   queueMicrotask(() => { box.scrollTop = box.scrollHeight; });
   return box;
+}
+
+// upProgressPanel 画出"最显眼"的那块升级进度面板。
+//
+// running：正在升级（顶部出警示条 + 不确定/确定进度条）
+// 结束态：顶部换成结果行（含失败原因），下面照样保留日志与阶段。
+function upProgressPanel(st, status) {
+  const running = status === 'checking' || status === 'downloading'
+    || status === 'applying' || status === 'restarting';
+  const finished = status === 'staged' || status === 'success'
+    || status === 'rolled_back' || status === 'failed';
+  const p = st.progress || {};
+  const pct = upPct(st, status);
+  const unknown = pct < 0;
+  const done = status === 'staged' || status === 'success';
+  const failed = status === 'rolled_back' || status === 'failed';
+
+  const panel = h('div', {
+    class: 'zp-upg-panel' + (running ? ' running' : '') + (finished ? ' finished' : ''),
+    dataset: { testid: 'zp-upgrade-panel' },
+  });
+
+  // ---- 顶部：警示条（运行中）或结果条（已结束）----
+  if (running) {
+    panel.append(h('div', {
+      class: 'zp-upg-warn',
+      dataset: { testid: 'zp-upgrade-warning' },
+    }, [
+      h('span', { class: 'zp-upg-warn-ico', text: '⚠️' }),
+      h('div', {}, [
+        h('strong', { text: '升级进行中，请勿退出或刷新页面' }),
+        h('div', { class: 'zp-upg-warn-sub', text: '进度由面板实时写入，刷新/关闭会让你看不到进展；面板重启期间页面会自动重连。' }),
+      ]),
+    ]));
+  } else {
+    panel.append(h('div', {
+      class: 'zp-upg-result ' + (done ? 'ok' : (failed ? 'err' : '')),
+      dataset: { testid: 'zp-upgrade-result' },
+    }, [
+      h('span', { class: 'zp-upg-result-ico', text: done ? '✅' : (failed ? '⛔' : 'ℹ️') }),
+      h('div', {}, [
+        h('strong', {
+          text: done
+            ? (status === 'staged' ? `安装包已就绪，可以升级到 v${(st.to || '')}` : '升级完成')
+            : (st.message || '升级未完成'),
+        }),
+        // 失败原因必须留在页面上（用户明确要求"不要一闪而过"）。
+        st.error ? h('div', { class: 'zp-upg-err', dataset: { testid: 'zp-upgrade-error' }, text: '原因：' + st.error }) : null,
+      ]),
+    ]));
+  }
+
+  // ---- 主体：大号百分比 + 进度条 + 字节/速度/时间 ----
+  const barFill = h('i', unknown ? { class: 'indet' } : { style: { width: Math.max(0, Math.min(100, pct)) + '%' } });
+  const total = Number(p.total_bytes) || 0;
+  const got = Number(p.downloaded_bytes) || 0;
+  const bytesText = total > 0
+    ? `已下载 ${upFmtBytes(got)} / ${upFmtBytes(total)}`
+    : `已下载 ${upFmtBytes(got)}`;
+
+  panel.append(h('div', { class: 'zp-upg-main' }, [
+    h('div', {
+      class: 'zp-upg-pct',
+      dataset: { testid: 'zp-upgrade-percent' },
+      text: unknown ? '…' : Math.round(pct) + '%',
+    }),
+    h('div', { class: 'zp-upg-detail' }, [
+      h('div', { class: 'zp-upg-stage' }, [
+        h('span', { class: 'zp-upg-stage-dot' }),
+        h('span', { dataset: { testid: 'zp-upgrade-stage-label' }, text: upStageText(st, status) }),
+        st.message ? h('span', { class: 'zp-upg-msg', dataset: { testid: 'zp-upgrade-message' }, text: st.message }) : null,
+      ]),
+      h('div', { class: 'zp-upg-bar' + (unknown ? ' unknown' : '') }, [barFill]),
+      h('div', { class: 'zp-upg-stats' }, [
+        h('span', { dataset: { testid: 'zp-upgrade-bytes' }, text: bytesText }),
+        h('span', { class: 'zp-upg-sep', text: '·' }),
+        h('span', { text: '速度 ' + upFmtSpeed(p.bytes_per_second) }),
+        h('span', { class: 'zp-upg-sep', text: '·' }),
+        h('span', { dataset: { testid: 'zp-upgrade-elapsed' }, text: upElapsedText(st.started_at) }),
+      ]),
+    ]),
+  ]));
+
+  panel.append(upPhaseBar(st));
+  const log = upLogBox(st);
+  if (log) panel.append(log);
+  return panel;
 }
 
 export function UpdateView(content, ctx = {}) {
@@ -273,6 +430,16 @@ export function UpdateView(content, ctx = {}) {
   let checkInfo = null; // 最近一次"检查更新"的结论（has_update / latest）
   let stageInflight = false; // stage 请求是否还在飞（决定轮询什么时候停）
   let elapsedTimer = null;   // 每秒刷新"已用时长"
+  // upRunning：升级是否正在进行。顶部醒目提示读它决定显示"发现新版本"还是
+  // "请勿退出或刷新页面"—— 升级途中还在劝用户"一键更新"是自相矛盾的。
+  let upRunning = false;
+  // sessionResult：本次会话里最后一次**结束**的进度面板快照。
+  // 用户明确要求"结束（成功/失败）后结果要留在页面上，不要一闪而过"；
+  // 而 success 的绿色横幅仍按既有约定自动消失（历史回归），所以面板自己留一份，
+  // 直到用户点「知道了 / 放弃这个包」主动清除。刷新页面不再保留（磁盘状态说了算）。
+  let sessionResult = null;
+  // watching：是否已经在等面板重启，避免刷新恢复轮询时挂出第二条等待链。
+  let watching = false;
 
   const srcInput = h('input.input', {
     placeholder: 'https://example.com/zizpanel/releases（放着 manifest.json 的目录）',
@@ -342,6 +509,21 @@ export function UpdateView(content, ctx = {}) {
   // ---------- 顶部醒目提示：有没有新版本 ----------
   function renderNotice() {
     clear(notice);
+    // 升级进行中：顶部不再劝用户"一键更新"（那样自相矛盾），
+    // 改成最醒目的"请勿退出或刷新页面"。进度面板里也有一条同样的警示，
+    // 这里是页面最顶上的那一份，滚动到任何位置都能看到。
+    if (upRunning) {
+      const warnTop = banner('warn', [
+        h('div', { style: { display: 'flex', gap: '9px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('span', { style: { fontSize: '18px' }, text: '⚠️' }),
+          h('strong', { text: '升级进行中，请勿退出或刷新页面' }),
+        ]),
+        h('div', { style: mutedStyle, text: '下载 / 校验 / 安装都在面板后台继续；刷新虽然不会中断下载，但你会看不到实时进度。' }),
+      ], { border: '1px solid var(--warn)' });
+      warnTop.dataset.testid = 'zp-upgrade-warning-top';
+      notice.append(warnTop);
+      return;
+    }
     if (checkInfo && checkInfo.has_update) {
       const cur = checkInfo.current || state.session?.version || '?';
       notice.append(banner('warn', [
@@ -473,39 +655,38 @@ export function UpdateView(content, ctx = {}) {
       ]));
     }
 
-    // ---- 升级过程详情（阶段条 + 当前阶段 + 已用时长 + 每一步）----
+    // ---- 升级进度面板（最显眼的位置）----
     //
-    // 只在"正在进行/刚结束"的状态下显示：idle 时显示一整排阶段只会让人以为在升级。
+    // 只有在"真的有一次升级过程"时才显示：idle 时挂一块面板会让用户以为在升级。
+    // 判据是后端写了结构化进度 / 日志 / 步骤（老状态只有 steps 也能显示）。
     const inProgress = status === 'checking' || status === 'downloading'
       || status === 'applying' || status === 'restarting';
-    if (inProgress || upPhaseIndex(status) >= 0 || (st.steps || []).length) {
-      bodyEl.append(upPhaseBar(status));
-      if (st.stage || st.message) {
-        // stage 是"在哪一步"，message 是"这一步的细节"（例如下载百分比）——
-        // 两个都显示：只显示其中一个会把后端辛苦写的实时进度藏起来。
-        bodyEl.append(h('div', { style: { fontSize: '13px', marginBottom: '6px' } }, [
-          h('strong', { text: '当前：' }),
-          h('span', { dataset: { testid: 'zp-upgrade-stage' }, text: st.stage || '' }),
-          st.message ? h('span', {
-            dataset: { testid: 'zp-upgrade-message' },
-            style: { color: 'var(--text-mute)', marginLeft: '6px' },
-            text: st.message,
-          }) : null,
-          h('span', {
-            dataset: { testid: 'zp-upgrade-elapsed' },
-            style: { color: 'var(--text-mute)', marginLeft: '6px' },
-            text: upElapsedText(st.started_at),
-          }),
-        ]));
-      }
-      if (inProgress) {
-        bodyEl.append(h('div.hint', {
-          text: '下载与校验都由面板自己完成，进度会实时更新；替换程序后面板会短暂重启，'
-            + '页面自动重连并刷新，请不要关闭本页。',
-        }));
-      }
-      const sb = upStepsBox(st);
-      if (sb) bodyEl.append(sb);
+    const ended = status === 'staged' || status === 'success'
+      || status === 'rolled_back' || status === 'failed';
+    const hasUpgradeTrace = !!(st.progress
+      || (Array.isArray(st.logs) && st.logs.length)
+      || (Array.isArray(st.steps) && st.steps.length));
+    // 顶部提示要在"升级开始/结束"的那一刻跟着切换：
+    // 升级中显示"请勿退出或刷新页面"，结束/开始时各自恢复。
+    const wasRunning = upRunning;
+    upRunning = inProgress;
+    if (upRunning !== wasRunning) renderNotice();
+
+    if (hasUpgradeTrace && ended) {
+      // 记下结束态的快照：即使随后绿色横幅按约定自动消失（磁盘状态被清成 idle），
+      // 进度面板与日志仍留在页面上，失败原因不会一闪而过。
+      sessionResult = { state: st, data };
+    }
+    let panelState = null;
+    if (hasUpgradeTrace && (inProgress || ended)) {
+      panelState = st;
+    } else if (sessionResult && status === 'idle') {
+      panelState = sessionResult.state;
+    }
+    if (panelState) {
+      // 结束态用快照里的 status 渲染（此时 info 可能已经是 idle 了）。
+      const panelStatus = (panelState === st) ? status : (panelState.status || 'idle');
+      bodyEl.append(upProgressPanel(panelState, panelStatus));
     }
     // 已用时长每秒刷新：只在升级进行中挂计时器，结束就停（避免页面一直空转）。
     stopElapsedTimer();
@@ -598,6 +779,7 @@ export function UpdateView(content, ctx = {}) {
           h('button.btn.btn-sm', {
             text: '放弃这个包',
             onclick: async () => {
+              sessionResult = null;
               try { await api.upgradeDismiss(); toast('已清除', 'ok'); render(await api.upgradeStatus()); }
               catch (e) { toast(e.message, 'err'); }
             },
@@ -613,6 +795,7 @@ export function UpdateView(content, ctx = {}) {
           text: '知道了（清除提示）',
           onclick: async () => {
             clearDismissTimer();
+            sessionResult = null;
             try { await api.upgradeDismiss(); render(await api.upgradeStatus()); }
             catch (e) { toast(e.message, 'err'); }
           },
@@ -625,11 +808,14 @@ export function UpdateView(content, ctx = {}) {
 
   async function refresh(showError) {
     try {
-      render(await api.upgradeStatus());
+      const data = await api.upgradeStatus();
+      render(data);
+      return data;
     } catch (e) {
       clear(bodyEl);
       bodyEl.append(banner('err', [h('span', { text: '读取升级信息失败：' + e.message })]));
       if (showError) toast('读取升级信息失败：' + e.message, 'err', 9000);
+      return null;
     }
   }
 
@@ -681,6 +867,28 @@ export function UpdateView(content, ctx = {}) {
     pollTimer = setTimeout(tick, 2000);
   }
 
+  // resumeUpgradeIfRunning：用户在升级途中刷新/重新进入本页时，把进度轮询
+  // （以及"等面板重启"）接回去。
+  //
+  // 这正是用户报的场景 —— "看不到进度就刷新重试"。刷新本身不该中断下载
+  // （后端已用 WithoutCancel），页面也必须自己恢复到"正在升级"的显示，
+  // 而不是让用户看到一句 idle 以为白等了。
+  function resumeUpgradeIfRunning(data) {
+    const st = (data && data.state) || {};
+    const status = st.status || 'idle';
+    if (status === 'checking' || status === 'downloading') {
+      startPoll((s) => s.status === 'checking' || s.status === 'downloading', 20 * 60 * 1000);
+      return;
+    }
+    if (status === 'applying' || status === 'restarting') {
+      startPoll((s) => s.status === 'applying' || s.status === 'restarting', 10 * 60 * 1000);
+      if (!watching) {
+        watching = true;
+        watchRestartAndReload().finally(() => { watching = false; });
+      }
+    }
+  }
+
   // oneClickUpdate：stage → apply → 等面板重启 → location.reload()。
   //
   // 这是"一键"的核心：用户不再需要先点「下载并准备升级」、再点「立即升级」。
@@ -706,7 +914,14 @@ export function UpdateView(content, ctx = {}) {
           20 * 60 * 1000);
         render({
           ...(info || {}),
-          state: { status: 'checking', stage: '正在获取发布清单…', started_at: new Date().toISOString() },
+          state: {
+            status: 'checking',
+            stage: '正在获取发布清单…',
+            started_at: new Date().toISOString(),
+            // 先摆一个"未知百分比"的进度骨架：点下按钮到第一次轮询之间（约 2 秒）
+            // 也得有那块醒目的警示与面板，否则用户会以为按钮没反应。
+            progress: { stage: 'manifest', stage_label: '获取发布清单', percent: -1 },
+          },
         });
         let res;
         try {
@@ -726,7 +941,15 @@ export function UpdateView(content, ctx = {}) {
       }
 
       toast(`${ver ? 'v' + ver + ' ' : ''}已就绪，正在升级，面板会短暂重启…`, 'info', 8000);
-      render({ ...(info || {}), state: { status: 'applying', stage: `正在升级到 v${ver}…`, started_at: new Date().toISOString() } });
+      render({
+        ...(info || {}),
+        state: {
+          status: 'applying',
+          stage: `正在升级到 v${ver}…`,
+          started_at: new Date().toISOString(),
+          progress: { stage: 'apply', stage_label: '替换程序', percent: -1 },
+        },
+      });
       startPoll((st) => st.status === 'applying' || st.status === 'restarting', 10 * 60 * 1000);
 
       // apply 会重启面板：请求本身可能中断，这属于预期，不能当失败处理。
@@ -775,7 +998,8 @@ export function UpdateView(content, ctx = {}) {
   // "vundefined" 和一条假的能力警告（首帧没有 can_apply / current_version）。
   renderNotice();
   bodyEl.append(h('div.empty', { text: '读取升级信息中…' }));
-  refresh(false);
+  // 读一次真状态；如果后端说"正在升级"（用户刷新过页面），就把轮询接回去。
+  refresh(false).then((data) => { resumeUpgradeIfRunning(data); });
 
   // 打开本页时**总是**检测一次（不受 6 小时周期限制）——用户点进来就是想看结果。
   checkInfo = readSaved();

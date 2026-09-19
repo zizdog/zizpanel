@@ -182,6 +182,19 @@ func DownloadTarball(ctx context.Context, rawURL, destPath, wantSHA string) (str
 // （-1 表示服务端没给 Content-Length）。
 type ProgressFunc func(written, total int64)
 
+// PhaseFunc 报告下载内部的**真实阶段切换**（下载完成 → 计算并比对 SHA-256）。
+//
+// 为什么要单独一个回调：界面上"下载中"和"校验中"是两件事，而校验（对 25MB
+// 的包算 SHA-256，慢机器上要几百毫秒到数秒）发生在下载函数内部。没有这个回调，
+// 面板只能在下载返回后补一句"已校验"，用户看到的就是进度条停在 100% 不动、
+// 不知道是在校验还是卡死了。phase 是机器可读 id（见 PhaseVerify 等）。
+type PhaseFunc func(phase, detail string)
+
+// 下载内部阶段 id（PhaseFunc 的 phase 参数）。
+const (
+	PhaseVerify = "verify" // 正在计算/比对下载文件的 SHA-256
+)
+
 // DownloadTarballWithProgress 与 DownloadTarball 完全一致，只是每读一块就回调一次进度。
 //
 // 为什么需要（2026-09-20 用户要求"升级过程要有详细的内容展示"）：升级是一次
@@ -190,6 +203,12 @@ type ProgressFunc func(written, total int64)
 //
 // 回调是**同步**调用的（同一个 goroutine），实现里不要做重活；调用方会自己节流。
 func DownloadTarballWithProgress(ctx context.Context, rawURL, destPath, wantSHA string, onProgress ProgressFunc) (string, error) {
+	return DownloadTarballWithObserver(ctx, rawURL, destPath, wantSHA, onProgress, nil)
+}
+
+// DownloadTarballWithObserver 在 DownloadTarballWithProgress 之上，把下载内部的
+// 真实阶段切换（下载完成 → 校验）也报告给调用方。
+func DownloadTarballWithObserver(ctx context.Context, rawURL, destPath, wantSHA string, onProgress ProgressFunc, onPhase PhaseFunc) (string, error) {
 	if err := validateSHA256(wantSHA); err != nil {
 		return "", fmt.Errorf("期望的 sha256 不合法: %w", err)
 	}
@@ -241,6 +260,10 @@ func DownloadTarballWithProgress(ctx context.Context, rawURL, destPath, wantSHA 
 		return "", fmt.Errorf("升级包超过 %d 字节上限，已中止", maxTarballBytes)
 	}
 
+	// 下载已结束，下面是真实的校验步骤 —— 如实告诉调用方，别让界面停在 100%。
+	if onPhase != nil {
+		onPhase(PhaseVerify, "正在计算并比对安装包的 SHA-256")
+	}
 	got, err := FileSHA256(part)
 	if err != nil {
 		_ = os.Remove(part)

@@ -102,7 +102,15 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 	st.FinishedAt = time.Time{}
 	st.Error = ""
 	st.Steps = nil
+	// 结构化进度：应用阶段同样要能在界面上看到"走到哪一步了"。
+	// 新尝试必须重置进度与日志（上一次的日志留着会让用户以为这次也走了那些步骤）。
+	st.Progress = &Progress{Percent: -1}
+	st.Logs = nil
+	sw := NewStateWriter(opt.WorkDir, st)
+	sw.now = opt.Now
+
 	addStep(opt, st, "开始升级", fmt.Sprintf("从 %s 升级到 %s（来源：%s）", from, to, source), true)
+	sw.Log("info", fmt.Sprintf("开始升级：v%s → v%s（来源：%s）", from, to, source))
 
 	if err := SaveState(opt.WorkDir, st); err != nil {
 		return err
@@ -111,32 +119,38 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 	// ---- 第 1 步：自检暂存的二进制 ----
 	// 必须在**替换之前**确认新二进制真的能跑。装了跑不起来的二进制，
 	// 就只能指望看门狗回滚了，那是最后一道防线而不是第一道。
+	sw.Stage(StageSmoke)
+	sw.Log("info", "正在试运行新版主程序与提权助手…")
 	if err := selfTest(ctx, opt, staged, to, st); err != nil {
 		st.Status = StatusFailed
-		st.Error = err.Error()
 		st.Message = "新版自检未通过，已中止（旧版本未做任何改动）"
 		st.FinishedAt = opt.Now()
 		addStep(opt, st, "新版自检", err.Error(), false)
+		sw.Fail(err)
 		_ = SaveState(opt.WorkDir, st)
 		return err
 	}
 	addStep(opt, st, "新版自检", "二进制可执行且版本号正确", true)
+	sw.Log("ok", "试运行通过：新版二进制可执行且版本号正确")
 	_ = SaveState(opt.WorkDir, st)
 
 	// ---- 第 2 步：备份现有二进制 ----
 	if err := backup(opt, st); err != nil {
 		st.Status = StatusFailed
-		st.Error = err.Error()
 		st.Message = "备份旧版本失败，已中止（旧版本未做任何改动）"
 		st.FinishedAt = opt.Now()
 		addStep(opt, st, "备份旧版本", err.Error(), false)
+		sw.Fail(err)
 		_ = SaveState(opt.WorkDir, st)
 		return err
 	}
 	addStep(opt, st, "备份旧版本", "已备份为 *.bak", true)
+	sw.Log("ok", "已备份现有二进制为 *.bak")
 	_ = SaveState(opt.WorkDir, st)
 
 	// ---- 第 3 步：原子替换 ----
+	sw.Stage(StageApply)
+	sw.Log("info", "正在原子替换二进制…")
 	if err := swap(opt, staged, st); err != nil {
 		// 替换中途失败：立刻尝试把备份换回去，不能让面板处于"半个新版本"的状态
 		st.Error = err.Error()
@@ -150,10 +164,12 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 			st.Message = "替换失败，已就地恢复旧版本"
 		}
 		st.FinishedAt = opt.Now()
+		sw.Fail(errors.New(st.Error))
 		_ = SaveState(opt.WorkDir, st)
 		return err
 	}
 	addStep(opt, st, "替换二进制", "已完成原子替换", true)
+	sw.Log("ok", "二进制已原子替换")
 	_ = SaveState(opt.WorkDir, st)
 
 	// ---- 第 4 步：启动看门狗（必须在重启自己之前） ----
@@ -170,22 +186,27 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 			st.Message = "看门狗启动失败，已恢复旧版本（未重启）"
 		}
 		st.FinishedAt = opt.Now()
+		sw.Fail(errors.New(st.Error))
 		_ = SaveState(opt.WorkDir, st)
 		return err
 	}
 	addStep(opt, st, "启动看门狗", "验证与回滚由独立守护进程负责", true)
+	sw.Log("ok", "看门狗已启动：验证与失败回滚由它负责")
 
 	// ---- 第 5 步：重启面板 ----
 	// 这一步会杀掉我们自己，所以放在最后，且之后不能再依赖任何内存状态。
 	st.Status = StatusRestarting
 	st.Stage = "正在重启面板"
 	st.Message = "新版已就位，正在重启并验证"
+	sw.Stage(StageRestart)
+	sw.Log("info", "正在重启面板；重启后由看门狗验证新版，失败会自动回滚")
 	_ = SaveState(opt.WorkDir, st)
 
 	if _, err := opt.Run(ctx, "launchctl", "kickstart", "-k", "system/"+opt.Label); err != nil {
 		// kickstart 失败：看门狗仍在运行，它会发现健康检查通不过并回滚。
 		// 这里只记录，不返回错误（返回也没人接得住了）。
 		addStep(opt, st, "重启面板", "kickstart 失败："+err.Error(), false)
+		sw.Log("error", "kickstart 失败："+err.Error())
 		_ = SaveState(opt.WorkDir, st)
 	}
 	return nil

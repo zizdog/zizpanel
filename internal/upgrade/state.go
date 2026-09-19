@@ -76,6 +76,17 @@ type State struct {
 	StartedAt  time.Time `json:"started_at,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 	Steps      []Step    `json:"steps,omitempty"`
+
+	// Progress 是**结构化**的实时进度（阶段 id / 真实字节数 / 百分比 / 速度）。
+	//
+	// 与 Message 的关系：Message 是给人读的一句话（"已下载 12.3 MB / 24.4 MB"），
+	// Progress 是给界面画进度条、速度、阶段用的机器可读字段。两者都保留 ——
+	// 老前端继续读 Message 不会坏，新前端读 Progress 才有真实进度条。
+	// 指针 + omitempty：没有进度信息时 JSON 里干脆不出现，老前端拿到的是原样结构。
+	Progress *Progress `json:"progress,omitempty"`
+	// Logs 是升级过程中产生的日志行（最近 maxLogLines 行，含时间与级别）。
+	// 落盘的意义：用户刷新/面板重启后，日志仍在，能看出"卡在哪一步、报了什么"。
+	Logs []LogLine `json:"logs,omitempty"`
 }
 
 // statePath 返回状态文件路径。
@@ -182,8 +193,34 @@ func applyResult(workDir string, st *State) bool {
 	}
 	st.Stage = ""
 	st.FinishedAt = parseUnix(fields[2])
+	// 结构化进度也要收尾：看门狗的结论是这条升级链路的最后一步，
+	// 如果这里不写，前端会永远停在"重启并验证"的进度条上（看起来像卡住）。
+	if st.Progress != nil {
+		st.Progress.UpdatedAt = st.FinishedAt
+		if st.Status == StatusSuccess {
+			st.Progress.Stage = StageDone
+		} else {
+			st.Progress.Stage = StageFailed
+		}
+		st.Progress.StageLabel = StageLabel(st.Progress.Stage)
+	}
+	st.Logs = append(st.Logs, LogLine{At: st.FinishedAt, Level: logLevelFor(st.Status), Text: st.Message})
+	if len(st.Logs) > maxLogLines {
+		st.Logs = append([]LogLine(nil), st.Logs[len(st.Logs)-maxLogLines:]...)
+	}
 	_ = os.Remove(resultPath(workDir))
 	return true
+}
+
+// logLevelFor 把终态映射成日志级别（供前端给结果行上色）。
+func logLevelFor(s Status) string {
+	switch s {
+	case StatusSuccess:
+		return "ok"
+	case StatusRolledBack, StatusFailed:
+		return "error"
+	}
+	return "info"
 }
 
 func parseUnix(s string) time.Time {

@@ -747,3 +747,108 @@ body.zp-sidebar-collapsed .nav-item > span.zp-update-dot {
   font-size: 9px; padding: 0 3px;
 }
 body.zp-sidebar-collapsed .sidebar-foot { display: none; }
+
+/* ==========================================================================
+   升级进度面板（检查更新页最显眼处，2026-09-23）
+   --------------------------------------------------------------------------
+   用户要求：下载升级包要很久，页面必须实时显示下载/安装进度，并提示
+   「升级进行中，请勿退出或刷新页面」，用类似 logbox 的样式。
+
+   这里的 class 全部以 zp-upg- 前缀，只新增不覆盖既有样式；
+   配色一律沿用上面的 CSS 变量，深浅色主题自动跟随。
+   ========================================================================== */
+.zp-upg-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  padding: 13px 14px;
+  margin-bottom: 14px;
+}
+.zp-upg-panel.running { border-color: var(--warn); }
+.zp-upg-panel.finished.ok { border-color: var(--ok); }
+.zp-upg-panel.finished.err { border-color: var(--danger); }
+
+/* 顶部固定警示：升级进行中，请勿退出或刷新页面 */
+.zp-upg-warn {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; margin-bottom: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 13px; line-height: 1.6;
+}
+.zp-upg-warn strong { font-size: 13.5px; letter-spacing: .01em; }
+.zp-upg-warn-ico { font-size: 16px; line-height: 1.35; }
+.zp-upg-warn-sub { color: var(--text-dim); font-size: 12px; margin-top: 2px; }
+
+.zp-upg-result {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; margin-bottom: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--panel); border: 1px solid var(--border);
+  font-size: 13px; line-height: 1.6;
+}
+.zp-upg-result.ok { background: var(--ok-soft); border-color: var(--ok); color: var(--ok); }
+.zp-upg-result.err { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+.zp-upg-result-ico { font-size: 16px; line-height: 1.35; }
+.zp-upg-err { color: var(--danger); font-size: 12px; margin-top: 3px; word-break: break-all; }
+
+.zp-upg-main { display: flex; align-items: center; gap: 16px; }
+.zp-upg-pct {
+  flex: 0 0 auto; min-width: 92px;
+  font-size: 34px; font-weight: 650; line-height: 1.1;
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+  color: var(--brand);
+}
+.zp-upg-panel.finished.ok .zp-upg-pct { color: var(--ok); }
+.zp-upg-panel.finished.err .zp-upg-pct { color: var(--danger); }
+.zp-upg-detail { flex: 1 1 auto; min-width: 0; }
+.zp-upg-stage {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  font-size: 13px; font-weight: 550; margin-bottom: 6px;
+}
+.zp-upg-stage-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--brand);
+  flex: 0 0 auto;
+}
+.zp-upg-panel.finished.ok .zp-upg-stage-dot { background: var(--ok); }
+.zp-upg-panel.finished.err .zp-upg-stage-dot { background: var(--danger); }
+.zp-upg-msg { color: var(--text-mute); font-weight: 400; font-size: 12px; }
+
+.zp-upg-bar {
+  height: 8px; border-radius: 5px; background: var(--bg);
+  border: 1px solid var(--border-soft); overflow: hidden;
+}
+.zp-upg-bar i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--brand), var(--brand-strong));
+  transition: width .35s ease;
+}
+.zp-upg-panel.finished.ok .zp-upg-bar i { background: var(--ok); }
+.zp-upg-panel.finished.err .zp-upg-bar i { background: var(--danger); }
+/* 总大小未知：画一条来回跑的不确定进度条，而不是编一个百分比 */
+.zp-upg-bar.unknown i.indet {
+  width: 34%;
+  animation: zpUpgIndet 1.15s ease-in-out infinite alternate;
+}
+@keyframes zpUpgIndet {
+  from { margin-left: 0; }
+  to { margin-left: 66%; }
+}
+
+.zp-upg-stats {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-top: 7px; font-size: 12px; color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.zp-upg-sep { opacity: .5; }
+
+/* 日志区：沿用 .logbox 的深色等宽风格，只限制高度并把"滚到底"交给 JS */
+.zp-upg-panel .logbox { font-size: 11.5px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .zp-upg-bar i { transition: none; }
+  .zp-upg-bar.unknown i.indet { animation: none; width: 100%; }
+  .zp-upg-panel { animation: none; }
+}

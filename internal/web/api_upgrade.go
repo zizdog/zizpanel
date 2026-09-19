@@ -321,35 +321,46 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 		StartedAt:  time.Now(),
 		Stage:      "正在获取发布清单",
 	}
-	_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+	// sw 是这次升级**唯一**的写状态入口：阶段切换、真实字节进度、日志都经过它，
+	// 保证节流与日志上限只有一份实现（前端轮询 status 读到的就是它写的 State）。
+	sw := upgrade.NewStateWriter(s.Cfg.WorkDir, st)
+	sw.Log("info", fmt.Sprintf("开始检查更新（候选源：%s）", strings.Join(sources, "、")))
+	sw.Stage(upgrade.StageManifest)
 
 	m, usedBase, err := upgrade.FetchManifestAny(ctx, sources, upgradeStagePerSourceTimeout, upgradeManifestFetcher)
 	if err != nil {
 		s.Log.Warn("升级暂存获取清单失败（候选顺序：%v）：%v", sources, err)
+		sw.Fail(err)
 		s.stageFailed(st, "获取清单失败: "+err.Error())
 		fail(w, http.StatusBadGateway, "获取发布清单失败："+err.Error())
 		return
 	}
 	st.SourceBase = usedBase
+	sw.Log("ok", "命中升级源 "+usedBase)
 	s.Log.Info("升级暂存命中源 %s（候选顺序：%v）", usedBase, sources)
 	newer, err := upgrade.IsNewer(m.Version, version.Version)
 	if err != nil {
+		sw.Fail(err)
 		s.stageFailed(st, err.Error())
 		fail(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	sw.Log("info", fmt.Sprintf("远端最新版本 v%s（当前 v%s）", m.Version, version.Version))
 	if !newer {
 		st.Status = upgrade.StatusIdle
 		st.Stage = ""
 		st.Message = fmt.Sprintf("当前已是最新版本 v%s", version.Version)
 		st.FinishedAt = time.Now()
-		_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+		sw.State().Progress.Stage = upgrade.StageDone
+		sw.State().Progress.StageLabel = upgrade.StageLabel(upgrade.StageDone)
+		sw.Log("ok", st.Message)
 		ok(w, map[string]any{"staged": false, "message": st.Message})
 		return
 	}
 
 	ref, err := m.Pick(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
+		sw.Fail(err)
 		s.stageFailed(st, err.Error())
 		fail(w, http.StatusBadRequest, err.Error())
 		return
@@ -358,7 +369,16 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 	st.To = m.Version
 	st.Status = upgrade.StatusDownloading
 	st.Stage = fmt.Sprintf("正在下载 v%s 安装包", m.Version)
-	_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+	// 总字节优先取**清单里声明的 size**（权威值）；清单没写时才回落到服务端
+	// Content-Length（见 SetDownloaded）。两个都没有就如实显示"未知"。
+	sw.StartDownload(ref.Size)
+	sw.Stage(upgrade.StageDownload)
+	if ref.Size > 0 {
+		sw.Log("info", fmt.Sprintf("安装包大小 %s，校验值 sha256:%s…",
+			upgradeHumanBytes(ref.Size), shortSHA(ref.SHA256)))
+	} else {
+		sw.Log("info", "清单没有声明安装包大小，总进度以服务端声明为准")
+	}
 
 	tarPath := filepath.Join(s.Cfg.WorkDir, "upgrade", "download",
 		fmt.Sprintf("zizpanel_%s_%s.tar.gz", m.Version, upgrade.AssetKey(runtime.GOOS, runtime.GOARCH)))
@@ -370,7 +390,7 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 		if lan := upgrade.LANAssetURL(ref.URL); lan != "" {
 			tryURLs = append([]string{lan}, tryURLs...)
 			st.Stage = fmt.Sprintf("正在下载 v%s 安装包（优先局域网镜像）", m.Version)
-			_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+			sw.Log("info", "检测到同网段 NAS，优先尝试局域网镜像 "+lan)
 		}
 	}
 	// 下载进度写进 state（节流 700ms 一次）：用户 2026-09-20 要求"升级过程要有详细的
@@ -379,41 +399,66 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 	//
 	// 为什么节流：回调是同步的，每次都要写一次 state.json（含 fsync 语义的原子写）。
 	// 不节流的话，24MB 的包会写上百次盘，白白拖慢下载本身。
-	var lastProgressAt time.Time
 	progress := func(written, total int64) {
-		if time.Since(lastProgressAt) < 700*time.Millisecond {
-			return
-		}
-		lastProgressAt = time.Now()
 		if total > 0 {
 			st.Message = fmt.Sprintf("已下载 %s / %s（%d%%）",
 				upgradeHumanBytes(written), upgradeHumanBytes(total), written*100/total)
 		} else {
 			st.Message = "已下载 " + upgradeHumanBytes(written)
 		}
-		_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+		// 字节数直接来自下载回调实际写入的计数 —— 界面上的百分比就是它算出来的，
+		// 没有任何定时器在这里编造数字。放在 Message 之后写盘，保证落盘的
+		// message 与 progress 描述的是同一个瞬间。
+		sw.SetDownloaded(written, total)
+	}
+	// 下载函数内部的真实阶段切换（下载完成 → 校验 SHA-256）也要如实上报，
+	// 否则进度条会停在 100% 一动不动，用户以为卡死了。
+	phase := func(p, detail string) {
+		if p == upgrade.PhaseVerify {
+			sw.Stage(upgrade.StageVerify)
+			sw.Log("info", detail)
+		}
 	}
 
 	var lastErr error
 	for _, u := range tryURLs {
-		if _, err := upgrade.DownloadTarballWithProgress(ctx, u, tarPath, ref.SHA256, progress); err == nil {
+		sw.Log("info", "开始下载 "+u)
+		if _, err := upgrade.DownloadTarballWithObserver(ctx, u, tarPath, ref.SHA256, progress, phase); err == nil {
 			lastErr = nil
 			break
 		} else {
 			lastErr = err
+			sw.Log("warn", fmt.Sprintf("从 %s 下载失败：%v", u, err))
+			// 换源重试必须把进度归零，否则下一段下载的百分比会从上一段的
+			// 字节数接着涨，看起来像"秒下完了"。
+			sw.StartDownload(ref.Size)
 			if len(tryURLs) > 1 {
 				st.Stage = fmt.Sprintf("局域网镜像那份没通过校验或不可达（%v），回落到原地址", err)
-				_ = upgrade.SaveState(s.Cfg.WorkDir, st)
+				sw.Log("info", st.Stage)
 			}
 		}
 	}
 	if lastErr != nil {
+		sw.Fail(lastErr)
 		s.stageFailed(st, lastErr.Error())
 		fail(w, http.StatusBadGateway, "下载升级包失败："+lastErr.Error())
 		return
 	}
 
-	if err := s.stageFromTarball(tarPath, st); err != nil {
+	// 下载收尾：字节数以磁盘上真实文件为准（stat 出来多少就是多少），
+	// 同时把进度钉在 100%（下载回调的最后一个块可能被节流吞掉）。
+	if fi, err := os.Stat(tarPath); err == nil {
+		if st.Progress.TotalBytes <= 0 {
+			st.Progress.TotalBytes = fi.Size()
+		}
+		sw.SetDownloaded(fi.Size(), fi.Size())
+		sw.Log("ok", fmt.Sprintf("下载完成：%s（平均 %s/s）",
+			upgradeHumanBytes(fi.Size()), upgradeHumanBytes(int64(st.Progress.BytesPerSecond))))
+	}
+	sw.Log("ok", "安装包 SHA-256 校验通过")
+
+	if err := s.stageFromTarball(ctx, tarPath, st, sw); err != nil {
+		sw.Fail(err)
 		s.stageFailed(st, err.Error())
 		fail(w, http.StatusBadRequest, err.Error())
 		return
@@ -427,6 +472,14 @@ func (s *Server) handleUpgradeStage(w http.ResponseWriter, r *http.Request) {
 		"state":            st,
 		"effective_source": usedBase,
 	})
+}
+
+// shortSHA 只取校验值前 12 位用于展示（完整值仍在 state 与审计里）。
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 // upgradeHumanBytes 把字节数变成人读形式（只用于升级进度文案）。
@@ -461,8 +514,14 @@ func (s *Server) stageFailed(st *upgrade.State, msg string) {
 // stageFromTarball 解包到暂存目录，并验证新二进制真的能跑、版本可读。
 //
 // 这一步是"早失败"的关键：在**换掉任何东西之前**就确认包是好的。
-func (s *Server) stageFromTarball(tarPath string, st *upgrade.State) error {
+//
+// 2026-09-23 起这里真的会**运行**新版二进制读版本号（此前注释这么写、代码却没做，
+// 界面上那个"试运行"阶段因此是空转）。同时把"解包 / 试运行 / 完成"三个真实阶段
+// 与日志写进 State，用户才能看到"卡在哪一步"。
+func (s *Server) stageFromTarball(ctx context.Context, tarPath string, st *upgrade.State, sw *upgrade.StateWriter) error {
 	dir := s.stagingDirFor()
+	sw.Stage(upgrade.StageExtract)
+	sw.Log("info", "正在解包安装包到暂存目录…")
 	// 清掉上一次的残留，避免新旧文件混在一起
 	if err := os.RemoveAll(dir); err != nil {
 		return err
@@ -475,12 +534,26 @@ func (s *Server) stageFromTarball(tarPath string, st *upgrade.State) error {
 	}); err != nil {
 		return err
 	}
+	sw.Log("ok", fmt.Sprintf("已解出 %s 与 %s", upgrade.PanelBinary, upgrade.HelperBinary))
+
+	sw.Stage(upgrade.StageSmoke)
+	sw.Log("info", "正在试运行新版主程序，读取它报告的版本…")
+	ver, err := upgrade.ProbeVersion(ctx, filepath.Join(dir, upgrade.PanelBinary))
+	if err != nil {
+		return fmt.Errorf("新版主程序试运行失败（安装包可能损坏或架构不对）：%w", err)
+	}
+	if ver != st.To {
+		return fmt.Errorf("安装包里报告的版本是 v%s，与清单声明的 v%s 不一致，已拒绝", ver, st.To)
+	}
+	sw.Log("ok", fmt.Sprintf("试运行通过：新版主程序可执行，报告版本 v%s", ver))
 
 	st.Status = upgrade.StatusStaged
 	st.Stage = "安装包已校验并暂存"
 	st.Message = fmt.Sprintf("已准备好升级到 v%s，可以点击「立即升级」", st.To)
 	st.Error = ""
 	st.FinishedAt = time.Time{}
+	sw.Stage(upgrade.StageDone)
+	sw.Log("ok", st.Message)
 	return upgrade.SaveState(s.Cfg.WorkDir, st)
 }
 
@@ -605,7 +678,13 @@ func (s *Server) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		Message:   fmt.Sprintf("已准备好升级到 v%s，可以点击「立即升级」", ver),
 		StartedAt: time.Now(),
 	}
-	_ = upgrade.SaveState(s.Cfg.WorkDir, newState)
+	// 上传这条路径没有"下载进度"可言（文件已经在浏览器里传完了），
+	// 但仍然要有结构化进度与日志，界面才不会在它之后显示一块空白。
+	sw := upgrade.NewStateWriter(s.Cfg.WorkDir, newState)
+	sw.Log("info", fmt.Sprintf("已接收上传的安装包 %s（%s）", hdr.Filename, upgradeHumanBytes(n)))
+	sw.Log("ok", fmt.Sprintf("解包并试运行通过：包内版本 v%s", ver))
+	sw.Stage(upgrade.StageDone)
+	sw.Log("ok", newState.Message)
 
 	s.audit(r, "upgrade_upload", hdr.Filename,
 		fmt.Sprintf("v%s，%d 字节，sha256=%s", ver, n, sum[:12]), true, "")
