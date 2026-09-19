@@ -70,19 +70,26 @@ func assertTCCGuide(t *testing.T, rec *httptest.ResponseRecorder, wantPath strin
 	}
 	for _, want := range []string{
 		wantPath, "隐私保护",
-		// 解法必须真的可执行：给出确切位置与权限名，而不是含糊的"去授权"。
+		// 解法必须真的可执行：确切位置 + 权限名，而不是含糊的"去授权"。
 		"完全磁盘访问权限", "系统设置", "bin/zizpanel",
+		// 2026-09-19 实测到两条路：弹窗点允许 / 自己去系统设置加。**两条都要在**——
+		// 只写系统设置会让用户白跑一趟，只写弹窗则在没有 UI 会话的机器上无路可走。
+		"点「允许」",
 		// 升级会让二进制变化 → 授权可能失效，必须提前说清楚。
-		"需要再授权一次",
+		"再授权一次",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("%s：错误体缺 %q，实际：%s", sub, want, msg)
 		}
 	}
-	// 已被实测证伪的"解法"不许再出现（见文件头 ②）。
-	for _, forbidden := range []string{"挂载到自定义挂载点", "mount -mountPoint"} {
+	// 被实测证伪的说法不许再出现：
+	//   · 换挂载点是解法（实测：挂载成功但读卷仍被拒）；
+	//   · "连询问窗口都不会弹"（实测 21:15:26 弹了，用户点允许后全通）。
+	for _, forbidden := range []string{
+		"挂载到自定义挂载点", "mount -mountPoint", "连询问窗口都不会弹",
+	} {
 		if strings.Contains(msg, forbidden) {
-			t.Errorf("%s：指引里不得再把换挂载点写成解法（实测证伪）%q，实际：%s", sub, forbidden, msg)
+			t.Errorf("%s：指引里不得出现已被实测证伪的说法 %q，实际：%s", sub, forbidden, msg)
 		}
 	}
 }

@@ -279,8 +279,15 @@ func resolveForCompare(p string) string {
 //    · `diskutil mount -mountPoint /opt/zizpanel/mnt/ZPMirror disk4s1` → 挂载成功；
 //    · 面板读那个新路径 → 仍然 operation not permitted。
 //  系统日志给出原因：`kTCCServiceSystemPolicyRemovableVolumes` + 「Background Session …
-//  record_denial」—— 这条保护按**卷**判定，与挂载路径无关；后台进程没有用户界面，
-//  macOS 连询问窗口都不会弹，只能直接拒绝。所以对外**只能**如实给人工授权这条路。
+//  record_denial」—— 这条保护按「卷」判定，**与挂载路径无关**（换挂载点绕不过去）。
+//
+//  ⚠️ 关于弹窗，同一天的实测又推翻了一半结论，两句都要留着：
+//    · 20:43–20:45 那几次：**没有弹窗**，直接被记成 denial（当时无人在场/无 UI 会话）；
+//    · 21:15:26 那一次：macOS **弹出了**「想要访问可移除宗卷上的文件」，用户点「允许」后，
+//      面板（uid 0）立刻能列目录、建目录、写文件、删文件 —— 全通（日志：
+//      `AUTHREQ_PROMPTING … subject=Sub:{/opt/zizpanel/bin/zizpanel}`）。
+//  所以给用户的指引必须**两条都给**：弹窗就点允许（最快），没弹窗就去系统设置里加（最稳）。
+//  别写"系统连询问窗口都不会弹"——那是被证伪的绝对化说法。
 //
 //  为什么此前测不出来（验证盲区，必须写清楚）：本机调试实例（make run-local）
 //  跑在**用户会话**里，那个终端早已被授权，所以能读 /Volumes/ZPMirror；
@@ -316,20 +323,20 @@ func setPanelBinaryForGuide(binDir string) {
 // 无头/远程场景做不到人工授权，所以面板**不隐瞒**这一点：做不到就如实说，
 // 并给出确切路径与位置（见铁律 11：能谎报成功的功能比没做更糟）。
 func tccSolution() string {
-	return "解法（一次性，需要在有屏幕的这台机器上点）：" +
-		"\n  系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」，选中 " + panelBinaryForGuide + " → 打开开关 → 重启面板。" +
-		"\n  这块盘还要给镜像站/站点（nginx）读的话，把 nginx 的二进制也照同样方式加进去。" +
-		"\n为什么只能人工：这条保护按「卷」判定、与挂载点无关，面板又是无用户会话的后台进程，" +
-		"系统连询问窗口都不会弹，只能直接拒绝。" +
-		"\n（把卷改挂到 /Volumes 之外不能绕过 —— 2026-09-19 实测：挂载本身成功，读它仍被拒。）" +
-		"\n注意：面板二进制升级后系统可能重新拦截（二进制变了），需要再授权一次。"
+	return "解法：给面板这个二进制授权访问可移除宗卷（两种方式都行）：" +
+		"\n  ① 系统弹窗：问「…想要访问可移除宗卷上的文件」时点「允许」——实测点完面板立刻读写全通。" +
+		"\n  ② 手动授权：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」选中 " + panelBinaryForGuide +
+		" → 打开开关 → 重启面板。" +
+		"\n  这块盘还要给镜像站/站点用（nginx 直接读文件），把 nginx 的二进制也照上面加上——它自己也会弹一次窗。" +
+		"\n注意：授权跟二进制绑定。面板升级后二进制变了，可能要再授权一次（可能要再点一次弹窗）。" +
+		"\n注意：把卷改挂到 /Volumes 之外不能绕过——实测挂载本身成功，读它照样被拒。"
 }
 
 // volumeTCCGuide 是给用户的完整指引（前端会把每一行都显示出来，不是一行 errno）。
 func volumeTCCGuide(path string) string {
 	return fmt.Sprintf("macOS 隐私保护拦住了对外接卷 %s 的访问：operation not permitted。"+
-		"面板以 root 的 LaunchDaemon 运行、没有用户会话，系统对可移除宗卷的读写要求用户授权，"+
-		"后台进程连询问窗口都不会弹。\n%s",
+		"面板以 root 的 LaunchDaemon 运行，读写可移除宗卷需要你授权：系统可能弹窗询问，"+
+		"也可能不给弹窗、直接拒绝（两种都实测到过）。\n%s",
 		path, tccSolution())
 }
 
