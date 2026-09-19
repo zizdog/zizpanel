@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS sites (
     domain      TEXT    NOT NULL UNIQUE,
     aliases     TEXT    NOT NULL DEFAULT '',   -- 逗号分隔的附加域名
     root        TEXT    NOT NULL,
+    -- 用户指定的基础根目录（空 = <WWWRoot>/<域名>）；root 是叠加伪静态入口后的运行目录
+    base_root   TEXT    NOT NULL DEFAULT '',
+    -- 目录索引开关。默认 0：老站点升级后生成的 vhost 与加这个字段之前逐字一致
+    autoindex   INTEGER NOT NULL DEFAULT 0,
+    -- 明文 HTTP 监听端口。默认 80：老站点读出来就是 80，vhost 逐字不变
+    listen_port INTEGER NOT NULL DEFAULT 80,
     php_version TEXT    NOT NULL DEFAULT '',   -- 空=纯静态
     rewrite     TEXT    NOT NULL DEFAULT 'none',
     ssl_enabled INTEGER NOT NULL DEFAULT 0,
@@ -290,6 +296,15 @@ func (s *Store) migrate(ctx context.Context) error {
 	// 已有行填默认值 —— ssl_enabled=0 正是"老规则默认关 SSL"。
 	if err := s.ensureColumns(ctx, "services", map[string]string{
 		"stopped_by_user": "INTEGER NOT NULL DEFAULT 0",
+	}); err != nil {
+		return err
+	}
+	// 站点根目录可自定义 + 目录索引（2026-09-19）。老库的表已存在，
+	// CREATE TABLE IF NOT EXISTS 补不了列，必须显式 ADD COLUMN。
+	if err := s.ensureColumns(ctx, "sites", map[string]string{
+		"base_root":   "TEXT NOT NULL DEFAULT ''",
+		"autoindex":   "INTEGER NOT NULL DEFAULT 0",
+		"listen_port": "INTEGER NOT NULL DEFAULT 80",
 	}); err != nil {
 		return err
 	}

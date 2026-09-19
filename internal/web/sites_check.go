@@ -61,28 +61,35 @@ type SiteCheckResult struct {
 	ErrorLog   string   `json:"error_log"`
 }
 
+// siteCheckProbeFn 是诊断探测的注入点（默认 curlSite）；单测据此断言探的是站点真实端口。
+var siteCheckProbeFn = curlSite
+
 // checkSite 对站点做一次真实访问诊断。
 //
 // 为什么绕过 DNS：站点域名通常只在本机 hosts 里解析，或者干脆还没解析。
 // 直接用 --resolve 把域名钉到 127.0.0.1，才能测到 nginx 而不会被 DNS 干扰。
+//
+// 端口取站点自己的（EffectiveListenPort）；SSL 固定 443。
+// 写死 80 会对自定义端口站点探错目标，把默认站点的响应当成它的结论（谎报）。
 func checkSite(ctx context.Context, site *sites.Site, logDir string) *SiteCheckResult {
 	res := &SiteCheckResult{Domain: site.Domain, Issues: []string{}, Hints: []string{}}
 
 	scheme := "http"
-	port := 80
+	port := site.EffectiveListenPort()
 	if site.SSLEnabled {
 		scheme, port = "https", 443
 	}
 	res.HTTPS = site.SSLEnabled
-	res.URL = fmt.Sprintf("%s://%s/", scheme, site.Domain)
+	res.URL = siteCheckURL(scheme, site.Domain, port)
 
 	// 1) 主页可访问性
-	code, _, err := curlSite(ctx, scheme, site.Domain, port, "/", 8*time.Second)
+	code, _, err := siteCheckProbeFn(ctx, scheme, site.Domain, port, "/", 8*time.Second)
 	res.HTTPCode = code
 	switch {
 	case err != nil:
 		res.Issues = append(res.Issues, "无法连接站点："+err.Error())
-		res.Hints = append(res.Hints, "确认 nginx 正在运行：面板「网站管理」页可直接重载；或检查 80/443 端口是否被占用")
+		res.Hints = append(res.Hints, fmt.Sprintf(
+			"确认 nginx 正在运行：面板「网站管理」页可直接重载；或检查 %d 端口是否被占用", port))
 	case code == "000":
 		res.Issues = append(res.Issues, "请求超时或连接被拒绝")
 		res.Hints = append(res.Hints, "检查站点根目录是否存在、nginx 是否已重载")
@@ -104,7 +111,7 @@ func checkSite(ctx context.Context, site *sites.Site, logDir string) *SiteCheckR
 		probe := filepath.Join(site.Root, "__zp_probe.php")
 		if err := os.WriteFile(probe, []byte("<?php echo '"+token+"';"), 0o644); err == nil {
 			// nginx 的 try_files $uri =404 要求文件真实存在，所以先写文件再请求
-			code2, body, _ := curlSite(ctx, scheme, site.Domain, port, "/__zp_probe.php", 8*time.Second)
+			code2, body, _ := siteCheckProbeFn(ctx, scheme, site.Domain, port, "/__zp_probe.php", 8*time.Second)
 			_ = os.Remove(probe)
 			if strings.Contains(body, token) {
 				res.PHPWorks = true
@@ -146,6 +153,15 @@ func checkSite(ctx context.Context, site *sites.Site, logDir string) *SiteCheckR
 		res.Hints = append(res.Hints, "站点访问正常")
 	}
 	return res
+}
+
+// siteCheckURL 拼诊断/展示用的站点地址：非默认端口必须带上，
+// 否则界面显示的地址是错的（自定义端口的站点在 80 上根本不存在）。
+func siteCheckURL(scheme, domain string, port int) string {
+	if (scheme == "http" && port == 80) || (scheme == "https" && port == 443) {
+		return scheme + "://" + domain + "/"
+	}
+	return fmt.Sprintf("%s://%s:%d/", scheme, domain, port)
 }
 
 // curlSite 用 curl 请求站点，返回 HTTP 状态码与响应体。

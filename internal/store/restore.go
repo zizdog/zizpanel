@@ -172,7 +172,7 @@ func (s *Store) ReplaceFromBackup(ctx context.Context, backupDBPath string) (*Re
 	// `backup` 会残留在池里那条连接上，**第二次恢复**直接报
 	// "database backup is already in use"（2026-09-18 本机真机实测）。
 	// 所以：正常路径显式 DETACH + 恢复外键后再 Close；defer 只兜异常路径。
-	// 真机上允许恢复期间几秒"数据库排队"，不做维护模式（用户 2026-09-21 拍板）。
+	// 真机上允许恢复期间几秒"数据库排队"，不做维护模式（用户拍板）。
 	closed := false
 	detached := false
 	cleanup := func() {

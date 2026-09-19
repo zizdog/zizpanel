@@ -290,6 +290,10 @@ func TestGeneratedConfigPassesNginxTest(t *testing.T) {
 	listenPort := "18080"
 
 	// 生成多个不同形态的站点配置
+	spaceDir := filepath.Join(dir, "html space") // 外接盘名常带空格：root 必须加引号
+	if err := os.MkdirAll(spaceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cases := []*Site{
 		{Domain: "static.test", Root: filepath.Join(dir, "html"), Rewrite: "none", Enabled: true},
 		{Domain: "php.test", Root: filepath.Join(dir, "html"), PHPVersion: "8.3", Rewrite: "typecho", Enabled: true},
@@ -299,6 +303,14 @@ func TestGeneratedConfigPassesNginxTest(t *testing.T) {
 		{Domain: "proxy.test", Root: filepath.Join(dir, "html"), ProxyPass: "http://127.0.0.1:19999", Rewrite: "none", Enabled: true},
 		{Domain: "extra.test", Root: filepath.Join(dir, "html"), Rewrite: "none",
 			ExtraConf: "location = /health { return 200 'ok'; }", Enabled: true},
+		// 目录索引 + PHP：autoindex 在 server 级，不能破坏 PHP 转发
+		{Domain: "diridx.test", Root: filepath.Join(dir, "html"), PHPVersion: "8.3",
+			Rewrite: "generic", AutoIndex: true, Enabled: true},
+		// 带空格的根目录（外接盘）：引号写法必须过 nginx -t
+		{Domain: "space.test", Root: spaceDir, Rewrite: "none", AutoIndex: true, Enabled: true},
+		// 自定义监听端口（镜像站独占端口）：nginx -t 不绑端口，这里只校验语法
+		{Domain: "port8090.test", Root: filepath.Join(dir, "html"), Rewrite: "none",
+			ListenPort: 8090, AutoIndex: true, Enabled: true},
 	}
 
 	var vhosts strings.Builder

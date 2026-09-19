@@ -17,6 +17,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/priv"
 	"github.com/zizdog/zizpanel/internal/proxies"
+	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/sites"
 	"github.com/zizdog/zizpanel/internal/tlsx"
 	"github.com/zizdog/zizpanel/internal/upgrade"
@@ -212,6 +213,186 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err := s.verifySiteServed(ctx, site); err != nil {
 		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, err)
 	}
+	// 回读 vhost 里的 root：写进去的必须就是这次算出来的值（用户改根目录却读不回来 = 没生效）。
+	if err := s.confirmVhostRootApplied(site); err != nil {
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, err)
+	}
+	// 回读 listen 端口：改了端口但 vhost 里没变 = 谎报成功。
+	if err := s.confirmVhostListenApplied(site); err != nil {
+		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, err)
+	}
+	return nil
+}
+
+// readVhostRoot 回读 vhost 里真正的 root 指令值。
+func (s *Server) readVhostRoot(domain string) (string, error) {
+	path := filepath.Join(s.Cfg.VhostDir, domain+".conf")
+	b, err := siteReadVhostFn(s, path)
+	if err != nil {
+		return "", err
+	}
+	return sites.FindRootDirective(string(b)), nil
+}
+
+// confirmVhostRootApplied：读得到但不等于期望值 → 如实报错（调用方回滚）；
+// 读不到 → 只记日志并标"未复核"，不谎报成功、也不误拦。
+func (s *Server) confirmVhostRootApplied(site *sites.Site) error {
+	applied, err := s.readVhostRoot(site.Domain)
+	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("回读 %s 的 vhost root 失败，本次根目录改动未复核: %v", site.Domain, err)
+		}
+		return nil
+	}
+	if applied != "" && filepath.Clean(applied) != filepath.Clean(site.Root) {
+		return fmt.Errorf("配置已写入并生效，但回读 %s 的 vhost 发现 root 是 %q、期望 %q —— 根目录没有改成功",
+			site.Domain, applied, site.Root)
+	}
+	return nil
+}
+
+// siteRootConfirm 给接口返回"根目录是否已复核"的字段（读不到就如实说未复核）。
+func (s *Server) siteRootConfirm(site *sites.Site) map[string]any {
+	applied, err := s.readVhostRoot(site.Domain)
+	msg := errString(err)
+	if err == nil && strings.TrimSpace(applied) == "" {
+		msg = "vhost 里没有 root 指令"
+	}
+	return map[string]any{
+		"root_applied":      applied,
+		"root_verified":     err == nil && strings.TrimSpace(applied) != "",
+		"root_verify_error": msg,
+	}
+}
+
+// readVhostListenPort 回读 vhost 里第一条 listen 的端口（HTTP server 写在最前）。
+func (s *Server) readVhostListenPort(domain string) (int, error) {
+	path := filepath.Join(s.Cfg.VhostDir, domain+".conf")
+	b, err := siteReadVhostFn(s, path)
+	if err != nil {
+		return 0, err
+	}
+	ports := siteListenPorts(string(b))
+	if len(ports) == 0 {
+		return 0, fmt.Errorf("vhost 里没有 listen 指令")
+	}
+	return ports[0].Port, nil
+}
+
+// confirmVhostListenApplied：回读端口不一致 → 如实报错（调用方回滚）；读不到 → 标未复核。
+func (s *Server) confirmVhostListenApplied(site *sites.Site) error {
+	got, err := s.readVhostListenPort(site.Domain)
+	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("回读 %s 的 vhost listen 失败，本次端口改动未复核: %v", site.Domain, err)
+		}
+		return nil
+	}
+	if got != site.EffectiveListenPort() {
+		return fmt.Errorf("配置已写入并生效，但回读 %s 的 vhost 发现 listen 是 %d、期望 %d —— 端口没有改成功",
+			site.Domain, got, site.EffectiveListenPort())
+	}
+	return nil
+}
+
+// sitePortConfirm 给接口返回"端口是否已复核"的字段。
+func (s *Server) sitePortConfirm(site *sites.Site) map[string]any {
+	got, err := s.readVhostListenPort(site.Domain)
+	msg := errString(err)
+	if err == nil && got != site.EffectiveListenPort() {
+		msg = fmt.Sprintf("vhost 里是 %d，期望 %d", got, site.EffectiveListenPort())
+	}
+	return map[string]any{
+		"listen_port_applied":      got,
+		"listen_port_verified":     err == nil && got == site.EffectiveListenPort(),
+		"listen_port_verify_error": msg,
+	}
+}
+
+// listenPortFromAddr 从 ":8443" / "127.0.0.1:8443" 里取端口。
+func listenPortFromAddr(addr string) int {
+	addr = strings.TrimSpace(addr)
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		if p, err := strconv.Atoi(addr[i+1:]); err == nil {
+			return p
+		}
+	}
+	return 0
+}
+
+// reservedPortReasons 汇总"面板/内置服务已经占用"的端口及原因（真实来源，不硬编码猜测）：
+// 面板自身监听、PHP-FPM 端点、面板会安装的原生应用目录端口，以及固定的 HTTPS 443。
+//
+// DockerReference 条目不在其列：它们只是参考 compose，面板不安装（否则 activepieces
+// 声明的 8090 会把用户想要的镜像站端口挡掉）。nginx 自身是 Web 服务器，站点本来就
+// 跑在它的端口上，所以 80 不保留。
+func (s *Server) reservedPortReasons() map[int]string {
+	out := map[int]string{}
+	add := func(port int, reason string) {
+		if port < 1 || port > 65535 {
+			return
+		}
+		if _, ok := out[port]; !ok {
+			out[port] = reason
+		}
+	}
+	if p := listenPortFromAddr(s.Cfg.Listen); p > 0 {
+		add(p, fmt.Sprintf("面板自身正在监听 %s", s.Cfg.Listen))
+	}
+	for _, pv := range sites.DiscoverPHPVersions(s.Cfg.BrewPrefix) {
+		for _, ep := range []string{pv.Pass, pv.PreferredPass} {
+			if p := sites.ParsePort(ep); p > 0 {
+				add(p, "PHP "+pv.Version+" 的 FastCGI 端点")
+			}
+		}
+	}
+	for _, app := range services.Catalog() {
+		if app.Port == 0 || app.DockerReference || app.ID == "nginx" {
+			continue
+		}
+		add(app.Port, "面板应用「"+app.Name+"」")
+	}
+	add(443, "HTTPS 端口（SSL 站点固定监听 443）")
+	return out
+}
+
+// validateSiteListenPort 校验端口：范围 → 面板保留 → 站点/反代冲突。
+// 80 是共享端口（多个站点按 server_name 分流，老站点全在 80），不参与冲突判定。
+func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomain string) error {
+	if err := sites.ValidateListenPort(port); err != nil {
+		return err
+	}
+	if reason, ok := s.reservedPortReasons()[port]; ok {
+		return fmt.Errorf("端口 %d 不能用作站点端口：已被%s占用，请换一个（例如 8090）", port, reason)
+	}
+	if port == 80 {
+		return nil
+	}
+	list, err := s.siteMgr().List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, st := range list {
+		if st.Domain == selfDomain {
+			continue
+		}
+		if st.EffectiveListenPort() == port {
+			return fmt.Errorf("端口 %d 已被站点 %s 使用：一个端口只给一个站点独占，请换一个端口",
+				port, st.Domain)
+		}
+	}
+	if rules, rerr := s.proxyRepo().List(ctx); rerr == nil {
+		for _, r := range rules {
+			if r.Listen != port {
+				continue
+			}
+			state := ""
+			if !r.Enabled {
+				state = "（该规则当前停用，启用后会占用这个端口）"
+			}
+			return fmt.Errorf("端口 %d 已被反向代理规则「%s」使用%s，请换一个端口", port, r.Name, state)
+		}
+	}
 	return nil
 }
 
@@ -255,7 +436,7 @@ const siteVhostProbePath = "/.zp-vhost-probe"
 // 探针必须用 curlSite（--resolve 钉到 127.0.0.1），不能走真实 DNS；
 // 窗口耗尽仍拿不到 403 才算失败（reload 是异步的，旧配置还会应答一阵）。
 func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
-	scheme, port := "http", 80
+	scheme, port := "http", site.EffectiveListenPort()
 	if site.SSLEnabled {
 		scheme, port = "https", 443
 	}
@@ -449,17 +630,84 @@ func (s *Server) rollbackVhostWrite(ctx context.Context, snap vhostSnapshot,
 	return cause
 }
 
-// ensureSiteRoot 创建站点根目录；面板以 root 运行，目录必须归属真实用户，否则用户写不进去。
+// siteRootPolicy 组装根目录白名单所需的上下文（外接盘/家目录在站点根里的用法基础）。
+func (s *Server) siteRootPolicy() sites.RootPolicy {
+	return sites.RootPolicy{WWWRoot: s.Cfg.WWWRoot, UserHome: s.Cfg.UserHome, BrewPrefix: s.Cfg.BrewPrefix}
+}
+
+// firstMissingAncestor 返回 root 里**最上层不存在**的那一段；root 已存在则返回空串。
+// 用它限定 chown 范围：只把我们刚创建的目录交给真实用户。
+func firstMissingAncestor(root string) string {
+	top := ""
+	for cur := filepath.Clean(root); ; {
+		if _, err := os.Stat(cur); err == nil {
+			break
+		}
+		top = cur
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return top
+}
+
+// ensureSiteRoot 创建站点根目录，并把**我们新建的**目录归属交还真实用户。
+//
+// 铁律：面板以 root 建了用户目录却不 chown，nginx 读不了、用户也写不了
+// （nginx 日志目录坑 156、Colima 配置坑 163）。做完必须 stat 回读归属；
+// 归属不对就如实报错，绝不谎报成功。
 func (s *Server) ensureSiteRoot(root string) error {
+	newTop := firstMissingAncestor(root)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("创建站点目录失败: %w", err)
 	}
-	if s.Cfg.User != "" && s.Cfg.User != "root" {
-		if uid, gid, err := lookupIDs(s.Cfg.User); err == nil {
-			_ = os.Chown(root, uid, gid)
-		}
+	if s.Cfg.User == "" || s.Cfg.User == "root" {
+		return nil
 	}
-	return nil
+	uid, gid, err := lookupIDs(s.Cfg.User)
+	if err != nil {
+		return nil // 解析不出用户就不猜归属
+	}
+	if newTop != "" {
+		// 只遍历刚创建的目录（此时必为空），不动里面可能已有的用户数据。
+		_ = filepath.Walk(newTop, func(p string, _ os.FileInfo, werr error) error {
+			if werr == nil {
+				_ = os.Chown(p, uid, gid)
+			}
+			return nil
+		})
+	} else if strings.HasPrefix(filepath.Clean(root), filepath.Clean(s.Cfg.WWWRoot)+string(os.PathSeparator)) {
+		// www 下是面板自己管的目录：沿用既有行为，把顶层交还用户。
+		_ = os.Chown(root, uid, gid)
+	}
+	if gotUID, _, oerr := sites.DirOwnerUID(root); oerr == nil && newTop != "" && gotUID != uid {
+		return fmt.Errorf("站点目录 %s 的归属仍是 uid %d（应为 %s/uid %d）：nginx 与用户都可能读写不了，"+
+			"请执行 sudo chown -R %s %s", root, gotUID, s.Cfg.User, uid, s.Cfg.User, root)
+	}
+	// 已存在的目录（外接盘上的镜像目录常是这种）也要复核可读：不可读就必须当场报错，
+	// 否则站点建好了却 403，等于谎报成功。
+	return sites.DirReadableBy(root, uid, gid)
+}
+
+// verifyExistingSiteRoot 在"不创建目录"或复用已有目录时如实复核：
+// 不存在 / 不是目录 / 对站点用户不可读都要报错，不能创建成功后才发现站点 403。
+func (s *Server) verifyExistingSiteRoot(root string) error {
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("站点根目录 %s 不存在：请勾选「自动创建目录」，或先建好目录再填", root)
+		}
+		return fmt.Errorf("读取站点根目录 %s 失败: %w", root, err)
+	}
+	if s.Cfg.User == "" || s.Cfg.User == "root" {
+		return nil
+	}
+	uid, gid, err := lookupIDs(s.Cfg.User)
+	if err != nil {
+		return nil
+	}
+	return sites.DirReadableBy(root, uid, gid)
 }
 
 // ---------- HTTP 接口 ----------
@@ -592,6 +840,12 @@ type siteCreateReq struct {
 	Rewrite    string `json:"rewrite"`
 	ProxyPass  string `json:"proxy_pass"`
 	Remark     string `json:"remark"`
+	// Root 是站点基础根目录；空 = 默认 <WWWRoot>/<域名>。
+	Root string `json:"root"`
+	// AutoIndex 目录索引开关，默认关。
+	AutoIndex bool `json:"autoindex"`
+	// ListenPort 明文 HTTP 监听端口；nil = 默认 80，显式 0/负数会被拒绝。
+	ListenPort *int `json:"listen_port"`
 	// CreateDir 为 false 时不创建目录（站点根目录可能已存在）
 	CreateDir *bool `json:"create_dir"`
 }
@@ -619,17 +873,38 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 根目录：默认 <WWWRoot>/<域名>；用户指定时走白名单校验（挡系统路径与配置注入）。
+	baseRoot := ""
+	if raw := strings.TrimSpace(req.Root); raw != "" {
+		clean, rerr := sites.ValidateRootPath(raw, s.siteRootPolicy())
+		if rerr != nil {
+			fail(w, http.StatusBadRequest, rerr.Error())
+			return
+		}
+		baseRoot = clean
+		root = clean
+	}
 
-	// Laravel/ThinkPHP：运行目录要落到 public 子目录
-	runRoot := root
-	if p, okk := sites.RewritePresetByName(req.Rewrite); okk && p.PublicDir != "" {
-		runRoot = filepath.Join(root, p.PublicDir)
+	// Laravel/ThinkPHP：运行目录要落到 public 子目录（base 已指向 public 时不重复叠加）
+	runRoot := sites.RunRoot(root, req.Rewrite)
+
+	// 监听端口：没给就是 80；给了就按"范围 → 面板保留 → 站点/反代冲突"逐条校验。
+	listenPort := 80
+	if req.ListenPort != nil {
+		if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, ""); perr != nil {
+			fail(w, http.StatusBadRequest, perr.Error())
+			return
+		}
+		listenPort = *req.ListenPort
 	}
 
 	site := &sites.Site{
 		Domain:     req.Domain,
 		Aliases:    strings.TrimSpace(req.Aliases),
+		BaseRoot:   baseRoot,
 		Root:       runRoot,
+		AutoIndex:  req.AutoIndex,
+		ListenPort: listenPort,
 		PHPVersion: req.PHPVersion,
 		Rewrite:    req.Rewrite,
 		ProxyPass:  strings.TrimSpace(req.ProxyPass),
@@ -656,6 +931,10 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		if err := s.seedIndexPHP(runRoot, site); err != nil {
 			s.Log.Warn("写入默认首页失败: %v", err)
 		}
+	} else if err := s.verifyExistingSiteRoot(runRoot); err != nil {
+		// 不创建时也要如实复核：不存在/不可读必须当场报错，不能建完才发现站点 403。
+		fail(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// 先落数据库（拿到 ID），再写 nginx 配置；配置失败则回滚数据库
@@ -680,8 +959,16 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(r, "site_create", site.Domain,
-		fmt.Sprintf("根目录=%s PHP=%s 伪静态=%s", runRoot, req.PHPVersion, req.Rewrite), true, "")
-	ok(w, map[string]any{"site": site, "root": runRoot})
+		fmt.Sprintf("根目录=%s 端口=%d PHP=%s 伪静态=%s 目录索引=%v",
+			runRoot, listenPort, req.PHPVersion, req.Rewrite, req.AutoIndex), true, "")
+	resp := map[string]any{"site": site, "root": runRoot, "listen_port": listenPort}
+	for k, v := range s.siteRootConfirm(site) {
+		resp[k] = v
+	}
+	for k, v := range s.sitePortConfirm(site) {
+		resp[k] = v
+	}
+	ok(w, resp)
 }
 
 func (s *Server) seedIndexPHP(root string, site *sites.Site) error {
@@ -1119,6 +1406,12 @@ type siteUpdateReq struct {
 	ExtraConf  *string `json:"extra_conf"`
 	Remark     *string `json:"remark"`
 	Enabled    *bool   `json:"enabled"`
+	// Root 非 nil 时才改根目录；空串 = 恢复默认 <WWWRoot>/<域名>。
+	Root *string `json:"root"`
+	// AutoIndex 非 nil 时才改目录索引开关。
+	AutoIndex *bool `json:"autoindex"`
+	// ListenPort 非 nil 时才改监听端口（1-65535；0/负数会被拒绝）。
+	ListenPort *int `json:"listen_port"`
 }
 
 func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1157,18 +1450,63 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		site.Enabled = *req.Enabled
 	}
+	if req.AutoIndex != nil {
+		site.AutoIndex = *req.AutoIndex
+	}
+	if req.ListenPort != nil {
+		// 只有真要改端口时才校验：否则"端口后来被别的应用占了"会连带锁死改备注这类无关编辑。
+		if *req.ListenPort != site.EffectiveListenPort() {
+			if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, site.Domain); perr != nil {
+				fail(w, http.StatusBadRequest, perr.Error())
+				return
+			}
+		}
+		site.ListenPort = *req.ListenPort
+	}
+
+	// 根目录：非 nil 时才改（空串 = 回默认）。改了要校验白名单，并按模板重算运行目录。
+	rootChanged := false
+	if req.Root != nil {
+		raw := strings.TrimSpace(*req.Root)
+		if raw == "" {
+			rootChanged = site.BaseRoot != ""
+			site.BaseRoot = ""
+		} else {
+			clean, rerr := sites.ValidateRootPath(raw, s.siteRootPolicy())
+			if rerr != nil {
+				fail(w, http.StatusBadRequest, rerr.Error())
+				return
+			}
+			rootChanged = clean != site.BaseRoot
+			site.BaseRoot = clean
+		}
+	}
 
 	// 伪静态切到 Laravel/ThinkPHP 时运行目录跟着切到 public，切回则退回站点根目录；
-	// 按"域名目录 + 模板要求"重新推导，避免改模板后目录还停在 public 导致 404。
+	// 按"基础目录 + 模板要求"重新推导，避免改模板后目录还停在 public 导致 404。
 	baseDir, err := sites.SiteDir(s.Cfg.WWWRoot, site.Domain)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if p, okk := sites.RewritePresetByName(site.Rewrite); okk && p.PublicDir != "" {
-		site.Root = filepath.Join(baseDir, p.PublicDir)
-	} else if strings.HasPrefix(site.Root, baseDir) {
-		site.Root = baseDir
+	if site.BaseRoot != "" {
+		baseDir = site.BaseRoot
+	}
+	newRoot := sites.RunRoot(baseDir, site.Rewrite)
+	rootChanged = rootChanged || newRoot != site.Root
+	site.Root = newRoot
+
+	if rootChanged {
+		if err := s.ensureSiteRoot(site.Root); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if baseDir != site.Root {
+			if err := s.ensureSiteRoot(baseDir); err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 	}
 
 	if err := mgr.Update(r.Context(), site); err != nil {
@@ -1194,8 +1532,19 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.audit(r, "site_update", domain, "更新站点配置", true, "")
-	ok(w, map[string]any{"site": site})
+	s.audit(r, "site_update", domain,
+		fmt.Sprintf("更新站点配置（根目录=%s 端口=%d 目录索引=%v）",
+			site.Root, site.EffectiveListenPort(), site.AutoIndex), true, "")
+	resp := map[string]any{"site": site}
+	if site.Enabled {
+		for k, v := range s.siteRootConfirm(site) {
+			resp[k] = v
+		}
+		for k, v := range s.sitePortConfirm(site) {
+			resp[k] = v
+		}
+	}
+	ok(w, resp)
 }
 
 func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
@@ -1222,11 +1571,12 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 
 	var filesMsg string
 	if removeFiles {
-		// 只允许删除站点根目录（严格限定在 www 根下，且必须是该域名的目录）
+		// 只允许删除默认站点目录（严格限定在 www 根下，且必须是该域名的目录）。
+		// 自定义根目录（外接盘/家目录）一律不动：那条路径上的数据不归面板管。
 		base := filepath.Join(s.Cfg.WWWRoot, domain)
 		cleanBase := filepath.Clean(base)
-		if filepath.Dir(cleanBase) != filepath.Clean(s.Cfg.WWWRoot) {
-			filesMsg = "目录路径校验失败，未删除文件"
+		if site.BaseRoot != "" || filepath.Dir(cleanBase) != filepath.Clean(s.Cfg.WWWRoot) {
+			filesMsg = "站点根目录不是默认目录，为安全未删除文件"
 		} else if err := os.RemoveAll(cleanBase); err != nil {
 			filesMsg = "删除文件失败: " + err.Error()
 		} else {

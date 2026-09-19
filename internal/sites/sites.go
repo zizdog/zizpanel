@@ -31,8 +31,16 @@ import (
 
 // Site 是一个站点。字段与 sites 表一一对应。
 type Site struct {
-	ID          int64  `json:"id"`
-	Domain      string `json:"domain"`
+	ID     int64  `json:"id"`
+	Domain string `json:"domain"`
+	// BaseRoot 是用户指定的基础根目录；空 = 默认 <WWWRoot>/<域名>。
+	// Root 是最终写进 nginx 的运行目录（BaseRoot 叠加伪静态要求的子目录）。
+	// 老站点 BaseRoot="" 时行为与加这个字段之前逐字一致。
+	BaseRoot  string `json:"base_root"`
+	AutoIndex bool   `json:"autoindex"` // 目录索引，默认关
+	// ListenPort 是站点明文 HTTP 的监听端口（默认 80）。老站点字段缺失/为 0 时按 80，
+	// 生成的 vhost 与加这个字段之前逐字一致。
+	ListenPort  int    `json:"listen_port"`
 	Aliases     string `json:"aliases"` // 逗号分隔
 	Root        string `json:"root"`
 	PHPVersion  string `json:"php_version"` // 空=纯静态
@@ -308,23 +316,32 @@ func (s *Site) Generate(opt Options) (string, error) {
 	}
 
 	// ---------------- HTTP server ----------------
+	// 端口来自站点（默认 80）。自定义端口只作用于明文 HTTP；
+	// 开了 SSL 时 HTTPS 仍固定 443，所以跳转不能带上自定义端口（见下）。
+	listenPort := s.EffectiveListenPort()
 	b.WriteString("server {\n")
-	b.WriteString("\tlisten      80;\n")
+	fmt.Fprintf(&b, "\tlisten      %d;\n", listenPort)
 	if s.SSLEnabled {
 		// 开了 SSL 又把 HTTP 直接放行会产生重复内容，不利于 SEO；
 		// 这里统一 301 到 HTTPS。证书校验路径除外，否则 Let's Encrypt 无法续期。
 		b.WriteString("\tserver_name " + s.ServerNames() + ";\n")
 		b.WriteString("\n\t# 证书续期与健康检查放行\n")
 		b.WriteString("\tlocation ^~ /.well-known/acme-challenge/ {\n")
-		b.WriteString("\t\troot " + s.Root + ";\n")
+		b.WriteString("\t\troot " + nginxQuote(s.Root) + ";\n")
 		b.WriteString("\t}\n")
-		// 301 必须用 $http_host（**保留端口**）而不是 $host（会丢端口）。
-		//
-		// 真机报障（2026-09-17 用户）：站点被反代时，客户端访问的是
-		// https://<域名>:8889；若这里跳到不带端口的 https://<域名>/，而公网只放行了
-		// 8889，浏览器就直接打不开了。$http_host 在客户端本来就没带端口时等于 $host，
-		// 所以直连 443 的站点行为不变。
-		b.WriteString("\n\tlocation / {\n\t\treturn 301 https://$http_host$request_uri;\n\t}\n")
+		if listenPort == 80 {
+			// 301 必须用 $http_host（**保留端口**）而不是 $host（会丢端口）。
+			//
+			// 真机报障（2026-09-17 用户）：站点被反代时，客户端访问的是
+			// https://<域名>:8889；若这里跳到不带端口的 https://<域名>/，而公网只放行了
+			// 8889，浏览器就直接打不开了。$http_host 在客户端本来就没带端口时等于 $host，
+			// 所以直连 443 的站点行为不变。
+			b.WriteString("\n\tlocation / {\n\t\treturn 301 https://$http_host$request_uri;\n\t}\n")
+		} else {
+			// 自定义端口时 HTTPS 仍在 443：用 $host（不带端口），否则会跳到没人监听的
+			// https://<域名>:<自定义端口>。
+			b.WriteString("\n\tlocation / {\n\t\treturn 301 https://$host$request_uri;\n\t}\n")
+		}
 		b.WriteString("}\n\n")
 		b.WriteString("server {\n")
 		b.WriteString("\tlisten      443 ssl;\n")
@@ -332,8 +349,15 @@ func (s *Site) Generate(opt Options) (string, error) {
 	}
 
 	b.WriteString("\tserver_name " + s.ServerNames() + ";\n")
-	fmt.Fprintf(&b, "\troot        %s;\n", s.Root)
-	b.WriteString("\tindex       index.php index.html index.htm;\n\n")
+	fmt.Fprintf(&b, "\troot        %s;\n", nginxQuote(s.Root))
+	b.WriteString("\tindex       index.php index.html index.htm;\n")
+	// 目录索引放在 server 级：一处生效于本站所有 location（伪静态生成的 location /
+	// 与反代 location 都继承它），且不碰 PHP 正则 location。
+	// 关 = 不写这一行（nginx 默认 off，老站点生成的配置因此逐字不变）。
+	if s.AutoIndex {
+		b.WriteString("\tautoindex   on;\n")
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "\taccess_log  %s/%s.access.log;\n", logDir, s.Domain)
 	fmt.Fprintf(&b, "\terror_log   %s/%s.error.log warn;\n\n", logDir, s.Domain)
 	b.WriteString("\tcharset utf-8;\n")
@@ -724,13 +748,13 @@ func NewManager(st *store.Store, opt Options) *Manager {
 // Options 返回生成配置所用的选项（面板保存配置时需要保持一致）。
 func (m *Manager) Options() Options { return m.opt }
 
-const siteCols = `id,domain,aliases,root,php_version,rewrite,ssl_enabled,ssl_cert,ssl_key,
+const siteCols = `id,domain,base_root,autoindex,listen_port,aliases,root,php_version,rewrite,ssl_enabled,ssl_cert,ssl_key,
 	ssl_provider,ssl_expires,proxy_pass,extra_conf,enabled,remark,created_at,updated_at`
 
 func scanSite(sc interface{ Scan(...any) error }) (*Site, error) {
 	var s Site
-	var ssl, enabled int
-	err := sc.Scan(&s.ID, &s.Domain, &s.Aliases, &s.Root, &s.PHPVersion, &s.Rewrite,
+	var ssl, enabled, autoindex int
+	err := sc.Scan(&s.ID, &s.Domain, &s.BaseRoot, &autoindex, &s.ListenPort, &s.Aliases, &s.Root, &s.PHPVersion, &s.Rewrite,
 		&ssl, &s.SSLCert, &s.SSLKey, &s.SSLProvider, &s.SSLExpires, &s.ProxyPass,
 		&s.ExtraConf, &enabled, &s.Remark, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
@@ -738,6 +762,7 @@ func scanSite(sc interface{ Scan(...any) error }) (*Site, error) {
 	}
 	s.SSLEnabled = ssl == 1
 	s.Enabled = enabled == 1
+	s.AutoIndex = autoindex == 1
 	return &s, nil
 }
 
@@ -821,10 +846,10 @@ func (m *Manager) Create(ctx context.Context, s *Site) error {
 	}
 
 	res, err := m.st.DB().ExecContext(ctx,
-		`INSERT INTO sites(domain,aliases,root,php_version,rewrite,proxy_pass,extra_conf,remark,enabled)
-		 VALUES(?,?,?,?,?,?,?,?,?)`,
-		s.Domain, s.Aliases, s.Root, s.PHPVersion, s.Rewrite, s.ProxyPass,
-		s.ExtraConf, s.Remark, boolToInt(s.Enabled))
+		`INSERT INTO sites(domain,base_root,autoindex,listen_port,aliases,root,php_version,rewrite,proxy_pass,extra_conf,remark,enabled)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		s.Domain, s.BaseRoot, boolToInt(s.AutoIndex), s.EffectiveListenPort(), s.Aliases, s.Root, s.PHPVersion, s.Rewrite,
+		s.ProxyPass, s.ExtraConf, s.Remark, boolToInt(s.Enabled))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return fmt.Errorf("%w: 站点 %s 已存在", ErrInvalid, s.Domain)
@@ -861,11 +886,11 @@ func (m *Manager) Update(ctx context.Context, s *Site) error {
 		}
 	}
 	_, err := m.st.DB().ExecContext(ctx,
-		`UPDATE sites SET aliases=?,root=?,php_version=?,rewrite=?,proxy_pass=?,
+		`UPDATE sites SET aliases=?,base_root=?,autoindex=?,listen_port=?,root=?,php_version=?,rewrite=?,proxy_pass=?,
 		 extra_conf=?,remark=?,enabled=?,ssl_enabled=?,ssl_cert=?,ssl_key=?,
 		 ssl_provider=?,ssl_expires=?,updated_at=datetime('now','localtime')
 		 WHERE id=?`,
-		s.Aliases, s.Root, s.PHPVersion, s.Rewrite, s.ProxyPass, s.ExtraConf,
+		s.Aliases, s.BaseRoot, boolToInt(s.AutoIndex), s.EffectiveListenPort(), s.Root, s.PHPVersion, s.Rewrite, s.ProxyPass, s.ExtraConf,
 		s.Remark, boolToInt(s.Enabled), boolToInt(s.SSLEnabled), s.SSLCert, s.SSLKey,
 		s.SSLProvider, s.SSLExpires, s.ID)
 	return err

@@ -367,6 +367,19 @@ func TestReplaceFromBackupOlderBackupFillsDefaults(t *testing.T) {
 		`UPDATE sites SET ssl_provider='le' WHERE domain='old.example.com'`); err != nil {
 		t.Fatalf("恢复后更新新列失败: %v", err)
 	}
+	// 站点根目录可自定义 / 目录索引这两个新列也必须在旧备份恢复后存在且为默认值
+	// （base_root 空 = 默认 <WWWRoot>/<域名>；autoindex 0 = 关，老站点 vhost 逐字不变）。
+	var baseRoot string
+	var autoIndex int
+	if err := dst.db.QueryRowContext(ctx,
+		`SELECT base_root, autoindex FROM sites WHERE domain='old.example.com'`).
+		Scan(&baseRoot, &autoIndex); err != nil {
+		t.Fatalf("旧备份恢复后读不出 base_root/autoindex: %v", err)
+	}
+	if baseRoot != "" || autoIndex != 0 {
+		t.Fatalf("旧备份缺的站点新列应由默认值补齐（base_root='' autoindex=0），实际 base_root=%q autoindex=%d",
+			baseRoot, autoIndex)
+	}
 	if err := dst.CheckForeignKeys(ctx); err != nil {
 		t.Fatalf("外键自检失败: %v", err)
 	}

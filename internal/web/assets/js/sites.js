@@ -1445,7 +1445,12 @@ export function SitesView(content, ctx = {}) {
   function siteRow(s) {
     return h('tr', [
       h('td', [
-        h('div', { style: { fontWeight: '600' } }, [domainLink(s)]),
+        h('div', { style: { fontWeight: '600', display: 'flex', alignItems: 'center', gap: '6px' } }, [
+          domainLink(s),
+          (Number(s.listen_port) || 80) !== 80
+            ? h('span.pill.brand', { text: ':' + s.listen_port, title: '该站点独占端口 ' + s.listen_port })
+            : null,
+        ]),
         s.aliases ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.aliases }) : null,
         s.remark ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.remark }) : null,
         addressInfo(s),
@@ -1480,14 +1485,14 @@ export function SitesView(content, ctx = {}) {
   // 三种形式都列出来 —— 只显示域名文本本身，并且这段文字本身可点、新标签打开。
   //
   // 链接用该站点**实际启用的协议**：开了 SSL 走 https，否则走 http；
-  // 协议、SSL 状态、nginx 配置是否存在等附加信息放进 title 与下面那行小字，
-  // 保证信息不丢（见 addressInfo）。带端口的 domain 与旧实现一样去掉端口 ——
-  // 面板生成的 vhost 按 80/443 监听，拼上端口反而打不开。
+  // 自定义监听端口必须拼进链接，否则会打开 80 上别的站点（HTTPS 仍固定 443）。
   function domainLink(s) {
     const host = String(s.domain || '').replace(/:\d+$/, '');
     if (!host) return h('span', { text: s.domain || '' });
     const scheme = s.ssl_enabled ? 'https' : 'http';
-    const href = scheme + '://' + host + '/';
+    const port = Number(s.listen_port) || 80;
+    const dial = !s.ssl_enabled && port !== 80 ? ':' + port : '';
+    const href = scheme + '://' + host + dial + '/';
     const notes = ['在新窗口打开 ' + href];
     notes.push(s.ssl_enabled
       ? '该站点已开启 SSL：https 可用'
@@ -1505,12 +1510,13 @@ export function SitesView(content, ctx = {}) {
 
   // addressInfo 用小字如实标出协议与可达状态。
   //
-  // 这是"不丢信息"的那一半：不再列出三种网址形态，但协议（http/https）与
-  // "配置在不在、启没启用"仍然看得见；具体状态列还有更细的判定。
+  // 这是"不丢信息"的那一半：不再列出三种网址形态，但协议（http/https）、
+  // 自定义端口与"配置在不在、启没启用"仍然看得见；具体状态列还有更细的判定。
   function addressInfo(s) {
     const host = String(s.domain || '').replace(/:\d+$/, '');
     if (!host) return null;
-    const proto = s.ssl_enabled ? '🔒 https' : 'http';
+    const port = Number(s.listen_port) || 80;
+    const proto = s.ssl_enabled ? '🔒 https' : (port === 80 ? 'http' : 'http:' + port);
     const state = !s.conf_exists
       ? '⚠ nginx 配置缺失'
       : (s.enabled ? '配置存在、已启用' : '配置存在、已停用');
@@ -1977,15 +1983,22 @@ export function SitesView(content, ctx = {}) {
     });
     const proxy = h('input.input', { placeholder: '可选，如 http://127.0.0.1:3000（填了就是反向代理站点）' });
     const presetHint = h('div.hint', { text: '' });
-    const rootPreview = h('code.code', { text: '' });
+    const root = h('input.input', {
+      placeholder: wwwRoot ? `留空用 ${wwwRoot}/<域名>` : '留空用 网站根目录/<域名>',
+    });
+    const port = h('input.input', { type: 'number', min: '1', max: '65535', value: '80' });
+    const autoindex = h('input', { type: 'checkbox' });
+    const rootPreview = h('div.hint', { text: '' });
 
     const updatePreview = () => {
       const d = domain.value.trim().toLowerCase();
       const p = presets.find((x) => x.name === preset.value);
-      const dir = p && p.public_dir ? `${wwwRoot}/${d}/${p.public_dir}` : `${wwwRoot}/${d}`;
-      rootPreview.textContent = d ? dir : '（请输入域名）';
+      const base = root.value.trim() || (d ? `${wwwRoot}/${d}` : '');
+      const dir = base && p && p.public_dir && !base.endsWith('/' + p.public_dir)
+        ? `${base}/${p.public_dir}` : base;
+      rootPreview.textContent = dir ? `运行目录：${dir}` : '运行目录：（请输入域名或根目录）';
       if (p && p.public_dir) {
-        presetHint.textContent = `${p.label}：运行目录会自动设为 public 子目录。${p.description}`;
+        presetHint.textContent = `${p.label}：运行目录会自动设为 ${p.public_dir}/ 子目录。${p.description}`;
       } else {
         presetHint.textContent = p ? p.description : '';
       }
@@ -1997,11 +2010,17 @@ export function SitesView(content, ctx = {}) {
     domain.addEventListener('input', updatePreview);
     preset.addEventListener('change', updatePreview);
     proxy.addEventListener('input', updatePreview);
+    root.addEventListener('input', updatePreview);
     updatePreview();
 
     const submit = async (close) => {
       const d = domain.value.trim().toLowerCase();
       if (!d) { toast('请输入域名', 'warn'); return; }
+      const portNum = Number(port.value.trim() === '' ? 80 : port.value.trim());
+      if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        toast('监听端口必须是 1-65535 的整数', 'warn');
+        return;
+      }
       try {
         const r = await api.siteCreate({
           domain: d,
@@ -2010,8 +2029,15 @@ export function SitesView(content, ctx = {}) {
           rewrite: proxy.value.trim() ? 'none' : preset.value,
           proxy_pass: proxy.value.trim(),
           remark: remark.value.trim(),
+          root: root.value.trim(),
+          listen_port: portNum,
+          autoindex: autoindex.checked,
         });
         toast(`站点 ${d} 创建成功`, 'ok');
+        if (r && (r.root_verified === false || r.listen_port_verified === false)) {
+          const why = r.root_verify_error || r.listen_port_verify_error || '';
+          toast(`有改动未复核${why ? '：' + why : ''}`, 'warn', 9000);
+        }
         close();
         load();
         if (r && r.root) setTimeout(() => openDetail(d), 300);
@@ -2025,10 +2051,32 @@ export function SitesView(content, ctx = {}) {
       body: h('div', [
         h('div.field', [h('label', { text: '域名 *' }), domain, h('div.hint', { text: '不需要输入 www，附加域名写在下一个字段' })]),
         h('div.field', [h('label', { text: '附加域名' }), aliases]),
-        h('div.field', [h('label', { text: '运行目录' }), rootPreview, h('div.hint', { text: '目录会自动创建（已在 ~/www 下）' })]),
+        h('div.field', [h('label', { text: '根目录' }), root, rootPreview,
+          h('div.hint', {
+            text: '留空用默认目录；可填外接盘里的目录',
+            title: '支持 /Volumes 下的外接盘与家目录下的目录；系统目录会被拒绝。' +
+              '选了 Laravel/ThinkPHP 时会自动接上 public 子目录。',
+          })]),
+        h('div.field', [h('label', { text: '监听端口' }), port,
+          h('div.hint', {
+            text: '默认 80；镜像站可独占一个端口',
+            title: '例如 8090。面板/内置服务已占用、或已被别的站点占用时直接报错；' +
+              '自定义端口只作用于 HTTP，开了 HTTPS 时 HTTPS 仍在 443。',
+          })]),
         h('div.field', [h('label', { text: '路由 / 伪静态' }), preset, presetHint]),
         h('div.field', [h('label', { text: 'PHP 版本' }), php, phpHint,
           h('div.hint', { text: '选择"纯静态"时，nginx 会拒绝执行该站点下的 PHP 文件' })]),
+        h('div.field', [
+          h('label', { text: '目录索引' }),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+            autoindex, h('span', { style: { fontSize: '13px' }, text: '开启目录索引（列出目录里的文件）' }),
+          ]),
+          h('div.hint', {
+            text: '默认关闭；目录里没有首页文件时才会列出文件',
+            title: '生成的 vhost 是 server 级 autoindex on，对本站所有目录生效。' +
+              '有 index.php/index.html 的目录仍优先显示首页，不受影响。',
+          }),
+        ]),
         h('div.field', [
           h('label', { text: '反向代理（可选）' }),
           proxy,
@@ -2085,18 +2133,45 @@ export function SitesView(content, ctx = {}) {
     };
 
     function tabBasic() {
+      const wwwRoot = cache?.www_root || '';
       const aliases = h('input.input', { value: site.aliases || '' });
       const remark = h('input.input', { value: site.remark || '' });
       const enabled = h('input', { type: 'checkbox', checked: site.enabled });
+      const root = h('input.input', {
+        value: site.base_root || '',
+        placeholder: wwwRoot ? `留空用 ${wwwRoot}/${site.domain}` : '留空用 网站根目录/<域名>',
+      });
+      const autoindex = h('input', { type: 'checkbox', checked: !!site.autoindex });
+      const port = h('input.input', {
+        type: 'number', min: '1', max: '65535',
+        value: String(site.listen_port || 80),
+      });
+      const rootState = h('div.hint', { text: `当前生效：${site.root}` });
+      const portState = h('div.hint', { text: `当前监听：${site.listen_port || 80}` });
       const save = h('button.btn.btn-primary', {
         text: '保存',
         onclick: async () => {
+          const portNum = Number(port.value.trim() === '' ? 80 : port.value.trim());
+          if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+            toast('监听端口必须是 1-65535 的整数', 'warn');
+            return;
+          }
           save.disabled = true;
           try {
-            await api.siteUpdate(domain, {
+            const r = await api.siteUpdate(domain, {
               aliases: aliases.value.trim(), remark: remark.value.trim(), enabled: enabled.checked,
+              root: root.value.trim(), listen_port: portNum, autoindex: autoindex.checked,
             });
+            if (r && r.site) {
+              Object.assign(site, r.site);
+              rootState.textContent = `当前生效：${r.root_applied || r.site.root}`;
+              portState.textContent = `当前监听：${r.listen_port_applied || r.site.listen_port || 80}`;
+            }
             toast('已保存', 'ok');
+            if (r && (r.root_verified === false || r.listen_port_verified === false)) {
+              const why = r.root_verify_error || r.listen_port_verify_error || '';
+              toast(`有改动未复核${why ? '：' + why : ''}`, 'warn', 9000);
+            }
             load();
           } catch (e) { toast(e.message, 'err', 9000); }
           finally { save.disabled = false; }
@@ -2106,8 +2181,29 @@ export function SitesView(content, ctx = {}) {
         h('div.field', [h('label', { text: '主域名' }), h('div', [h('code.code', { text: site.domain })]),
           h('div.hint', { text: '域名创建后不可修改（改域名等于新建站点，涉及目录与证书）' })]),
         h('div.field', [h('label', { text: '附加域名' }), aliases, h('div.hint', { text: '多个用英文逗号分隔，例如 www.demo.test, m.demo.test' })]),
-        h('div.field', [h('label', { text: '运行目录' }), h('div', [h('code.code', { text: site.root })]),
-          h('div.hint', { text: '由路由模板决定（Laravel/ThinkPHP 会指向 public 子目录）' })]),
+        h('div.field', [h('label', { text: '根目录' }), root, rootState,
+          h('div.hint', {
+            text: '留空用默认目录；可填外接盘里的目录',
+            title: '支持 /Volumes 下的外接盘与家目录下的目录；系统目录会被拒绝。' +
+              '改了会重新生成 nginx 配置并回读生效值。Laravel/ThinkPHP 会自动接上 public 子目录。',
+          })]),
+        h('div.field', [h('label', { text: '监听端口' }), port, portState,
+          h('div.hint', {
+            text: '默认 80；镜像站可独占一个端口',
+            title: '例如 8090。面板/内置服务已占用、或已被别的站点占用时直接报错；' +
+              '自定义端口只作用于 HTTP，开了 HTTPS 时 HTTPS 仍在 443。',
+          })]),
+        h('div.field', [
+          h('label', { text: '目录索引' }),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+            autoindex, h('span', { style: { fontSize: '13px' }, text: '开启目录索引（列出目录里的文件）' }),
+          ]),
+          h('div.hint', {
+            text: '默认关闭；目录里没有首页文件时才会列出文件',
+            title: '生成的 vhost 是 server 级 autoindex on，对本站所有目录生效。' +
+              '有 index.php/index.html 的目录仍优先显示首页，不受影响。',
+          }),
+        ]),
         h('div.field', [h('label', { text: '备注' }), remark]),
         h('div.field', [
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
@@ -2252,7 +2348,7 @@ export function SitesView(content, ctx = {}) {
               h('button.btn.btn-danger', {
                 text: '关闭 HTTPS',
                 onclick: async () => {
-                  if (!await confirmBox('关闭后站点只监听 80 端口。继续？', { danger: true })) return;
+                  if (!await confirmBox('关闭后站点只监听自己的端口（默认 80）。继续？', { danger: true })) return;
                   try {
                     const r = await api.siteSSLDisable(domain);
                     Object.assign(site, r.site);
@@ -2267,7 +2363,7 @@ export function SitesView(content, ctx = {}) {
           return;
         }
         box.append(
-          h('div.hint', { style: { marginBottom: '14px' }, text: '开启 HTTPS 后，80 端口的请求会自动 301 跳转到 443。' }),
+          h('div.hint', { style: { marginBottom: '14px' }, text: '开启 HTTPS 后，站点自己端口上的请求会 301 跳转到 443。' }),
           h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
             h('button.btn.btn-primary', { text: '用 mkcert 签发（推荐）', onclick: () => issue('mkcert') }),
             h('button.btn', { text: '自签证书', onclick: () => issue('self') }),
