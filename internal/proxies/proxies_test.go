@@ -223,7 +223,7 @@ func TestPreserveHostAlsoRewritesPortlessUpstreamLocation(t *testing.T) {
 	}
 }
 
-// TestRuleGenerateWithoutWebsocketHasNoUpgradeLines 锁住用户 2026-09-22 的要求：
+// TestRuleGenerateWithoutWebsocketHasNoUpgradeLines 锁住用户的要求：
 //
 //	"不需要 WebSocket 就不要加 Upgrade 那两行，干净利落。"
 //

@@ -10,12 +10,10 @@
 #  即已跟踪 + 未忽略；gitignore 的私有文档不在内），逐个找出 `20XX-XX-XX`，
 #  与今天做字典序比较（ISO 零填充，字典序即时间序），比今天晚就失败并打印 文件:行。
 #
-#  豁免（都是"本来就该晚于今天"的测试数据，不是注释日期）—— 改这三个数组即可：
+#  豁免（都是"本来就该晚于今天"的测试数据，不是注释日期）—— 改这两个数组即可：
 #    · 行内含 zp-date-ok                 → 单行豁免（临时/特殊情形用）
 #    · ALLOW_DATES                       → 与路径无关的显式占位/哨兵日期
 #    · ALLOW_PATH_DATES "<路径>:<日期>"  → 夹具里的证书到期时间等（被测试断言）
-#    · PENDING_PATHS                     → 🚧 并行同事正在改的文件，暂不判失败但会警告
-#                                          （改完请删掉对应条目；其中剩余数量会打印出来）
 #
 #  用法：bash tools/check-future-dates.sh [今天=YYYY-MM-DD]
 #  退出码 0 通过，1 有未来日期，2 用法/环境不对。
@@ -49,31 +47,10 @@ ALLOW_PATH_DATES=(
   "internal/proxies/proxies_ssl_test.go:2026-12-01"  # SSLExpires 往返断言（第 165/171 行）
 )
 
-# 🚧 并行改动中的文件：**临时**豁免。改完请把这里删空 —— 留着等于这些文件不受门禁保护。
-PENDING_PATHS=(
-  "internal/sites/"
-  "internal/proxies/"
-  "internal/web/api_sites.go"
-  "internal/web/assets/js/sites.js"
-  "internal/web/api_proxies.go"
-  "internal/web/api_appproxy.go"
-  "internal/web/assets/js/reverseproxy.js"
-  "internal/web/assets/js/files.js"
-  "internal/web/api_files.go"
-)
-
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   echo "（不是 git 仓库，跳过未来日期检查）"
   exit 0
 fi
-
-is_pending() {
-  local f="$1" p
-  for p in "${PENDING_PATHS[@]}"; do
-    case "$f" in "$p"*) return 0 ;; esac
-  done
-  return 1
-}
 
 is_allowed() {
   local f="$1" d="$2" a
@@ -83,12 +60,9 @@ is_allowed() {
 }
 
 hits=0
-pending=0
 while IFS= read -r -d '' f; do
   # 本脚本自己的注释里有 20XX 示例，不能自己判自己
   [ "$f" = "tools/check-future-dates.sh" ] && continue
-  pending_file=0
-  is_pending "$f" && pending_file=1
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -98,10 +72,6 @@ while IFS= read -r -d '' f; do
     for d in $(printf '%s\n' "$body" | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}'); do
       [[ "$d" > "$TODAY" ]] || continue
       is_allowed "$f" "$d" && continue
-      if [ "$pending_file" = 1 ]; then
-        pending=$((pending + 1))
-        continue
-      fi
       printf '\033[31m✗ %s:%s\033[0m  %s 晚于今天 %s\n' "$f" "$ln" "$d" "$TODAY"
       hits=$((hits + 1))
     done
@@ -115,8 +85,5 @@ if [ "$hits" -gt 0 ]; then
   exit 1
 fi
 
-if [ "$pending" -gt 0 ]; then
-  echo "⚠ 并行改动中豁免：$pending 处未来日期暂未处理（清单见本脚本 PENDING_PATHS，改完请删空）"
-fi
 echo -e "\033[32m✓ 未来日期检查通过（今天 ${TODAY}）\033[0m"
 exit 0

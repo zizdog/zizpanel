@@ -58,7 +58,7 @@ func (s *Server) registerAppProxy(root *http.ServeMux) {
 
 // withLongUpload 给应用界面的请求解除面板全局 30 秒读超时。
 //
-// 为什么应用界面也要（2026-09-23）：图片压缩的 Web UI 走 /imgcompress/ 别名时，
+// 为什么应用界面也要：图片压缩的 Web UI 走 /imgcompress/ 别名时，
 // 上传体是在**面板进程**里被读进来再转发给 127.0.0.1:8890 的，所以
 // "谁解析 multipart"这件事在这里并不成立 —— 面板根本看不到 multipart，
 // 它只是在流式转发 body。全局 ReadTimeout 仍然按"读完请求体"计时，照样会掐断。

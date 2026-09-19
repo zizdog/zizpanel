@@ -114,7 +114,7 @@ type Rule struct {
 	// proxy_pass 会指向一个没人听的端口。0 = 这条规则不经过面板转发。
 	ForwardPort int `json:"forward_port"`
 
-	// ---- HTTP Basic Auth（"需要用户名密码"，2026-09-25 用户要求，Lucky 式）----
+	// ---- HTTP Basic Auth（"需要用户名密码"，用户要求，Lucky 式）----
 	//
 	// ⚠️ 这几个字段**不进 proxies 表**：proxies 表由仓库层的固定列清单读写，
 	// 这里刻意不加列，避免和其它并行改动抢 store.go / repository.go。

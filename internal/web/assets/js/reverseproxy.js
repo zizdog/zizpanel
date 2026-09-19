@@ -34,7 +34,7 @@ const SSL_PROVIDERS = [
 // authSummary 把后端的「回读生效值」拼成一行文字。
 //
 // 绝不只说"已保存"：verified=true 才说生效；读不到就明确写"未复核"并带上原因
-//（用户 2026-09-25 明确要求"保存后要回读生效值，读不到就如实说未复核"）。
+//（用户明确要求"保存后要回读生效值，读不到就如实说未复核"）。
 function authSummary(it) {
   const a = (it && it.auth) || {};
   if (!a.enabled) return '';
@@ -498,7 +498,7 @@ export function ReverseProxyView(content, ctx = {}) {
       sslReissue: h('input', { type: 'checkbox', checked: false, id: 'zp-proxy-ssl-reissue' }),
       // 明文 HTTP 打到本端口时 301 跳 https（Lucky 同款行为），新建规则默认开。
       redirectHTTP: h('input', { type: 'checkbox', checked: it ? !!it.redirect_http : true }),
-      // ---- 访问鉴权（HTTP Basic Auth，2026-09-25 用户要求）----
+      // ---- 访问鉴权（HTTP Basic Auth，用户要求）----
       // 开启后访问该规则地址必须通过 Basic Auth，否则 401（nginx 直接回）。
       authOn: h('input', { type: 'checkbox', checked: it ? !!it.auth_enabled : false }),
       authUser: h('input.input', { value: it?.auth_user || '', placeholder: '例如：admin' }),
