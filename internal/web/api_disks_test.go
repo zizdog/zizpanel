@@ -25,6 +25,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // diskForbiddenGUIs 是"会在无头机器上永久挂起"的调用黑名单。
@@ -483,6 +486,49 @@ func newDiskServer(t *testing.T, w *fakeWorld) (*Server, *httptest.Server, []*ht
 }
 
 // ============================================================================
+//  危险操作 = 任务中心任务
+// ============================================================================
+
+// runDiskTask 提交一个危险操作并等任务结束：先断言 202 + task_id（走任务中心），
+// 再等任务结束返回任务对象。
+func runDiskTask(t *testing.T, srv *Server, ts *httptest.Server, cookies []*http.Cookie, path string, body any) *tasks.Task {
+	t.Helper()
+	res, out, _ := doJSON(t, ts, "POST", path, body, cookies)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%s 必须走任务中心（202 + task_id），实际 %d: %v", path, res.StatusCode, out["msg"])
+	}
+	return waitTaskDone(t, srv, taskIDFrom(t, out))
+}
+
+// diskTaskInstallResult 取任务结果。后端包成 *services.InstallResult：
+// Steps 里带 before/after 快照与回读摘要（审计也来自它）。
+func diskTaskInstallResult(t *testing.T, tk *tasks.Task) *services.InstallResult {
+	t.Helper()
+	r, _ := tk.Meta().Result.(*services.InstallResult)
+	if r == nil {
+		t.Fatalf("任务结果应为 *services.InstallResult，实际 %#v（error=%q）", tk.Meta().Result, tk.Meta().Error)
+	}
+	return r
+}
+
+// noDiskTaskCreated 断言拒绝路径**没有创建任务**（验收：不建任务、不执行写命令）。
+func noDiskTaskCreated(t *testing.T, srv *Server, why string) {
+	t.Helper()
+	if list := srv.Tasks.List(); len(list) != 0 {
+		t.Errorf("%s：拒绝时不应创建任何任务，实际 %d 个：%v", why, len(list), list)
+	}
+}
+
+func stepsContain(steps []string, sub string) bool {
+	for _, s := range steps {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================================
 //  plist 编码器（只给测试用：把 Go 值编成 plist，喂给假 diskutil）
 // ============================================================================
 
@@ -667,7 +713,7 @@ func TestDiskListReturnsExternalDiskAndPartitions(t *testing.T) {
 
 func TestDiskWriteOpsRefuseSystemDisk(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
 	cases := []struct {
 		name string
@@ -703,6 +749,8 @@ func TestDiskWriteOpsRefuseSystemDisk(t *testing.T) {
 			t.Errorf("系统盘保护失效：真的执行了 %q", prefix)
 		}
 	}
+	// 验收：系统盘被拒时**不创建任务**（不建任务 + 不执行写命令，二者都要）。
+	noDiskTaskCreated(t, srv, "系统盘拒绝")
 }
 
 func TestDiskUnknownAndInvalidID(t *testing.T) {
@@ -917,16 +965,16 @@ func TestValidateVolumeName(t *testing.T) {
 // 2026-09 用户放开限制后：非空容器**也允许**新建卷（addVolume 不动已有卷）。
 func TestDiskVolumeCreateAllowsNonEmptyContainer(t *testing.T) {
 	w := newFakeWorld() // disk4 里有 ZPMirror
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/init-volume",
-		map[string]any{"name": "Mirror1", "confirm": "disk9"}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("非空容器现在应允许建卷，实际 %d: %v", res.StatusCode, out["msg"])
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk9/init-volume",
+		map[string]any{"name": "Mirror1", "confirm": "disk9"})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("非空容器现在应允许建卷，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
-	data, _ := out["data"].(map[string]any)
-	if data["created"] != true {
-		t.Errorf("应回读确认新卷已创建，实际 %v", data)
+	r := diskTaskInstallResult(t, tk)
+	if !stepsContain(r.Steps, "新建卷") || !stepsContain(r.Steps, "回读：") {
+		t.Errorf("结果要含建卷摘要与回读，实际 %v", r.Steps)
 	}
 	if !w.called("apfs addVolume disk4 APFS Mirror1") {
 		t.Errorf("命令构造不对：%v", w.callList())
@@ -937,11 +985,11 @@ func TestDiskVolumeCreateAllowsNonEmptyContainer(t *testing.T) {
 	}
 }
 
-// confirm 不匹配 / 卷名非法时必须拒绝，且不执行命令（旧名 init-volume 仍走同一处理）。
+// confirm 不匹配 / 卷名非法时必须拒绝，且**不创建任务、不执行命令**。
 func TestDiskInitRequiresConfirmAndValidName(t *testing.T) {
 	w := newFakeWorld()
 	w.containerVols["disk4"] = nil // 造一个空容器
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/init-volume",
 		map[string]any{"name": "Mirror1", "confirm": "disk4"}, cookies)
@@ -956,12 +1004,13 @@ func TestDiskInitRequiresConfirmAndValidName(t *testing.T) {
 	if w.called("apfs addVolume") {
 		t.Error("校验失败时绝不能真的执行 addVolume")
 	}
+	noDiskTaskCreated(t, srv, "确认不匹配/卷名非法")
 }
 
 func TestDiskInitEmptyContainerCreatesVolume(t *testing.T) {
 	w := newFakeWorld()
 	w.containerVols["disk4"] = nil // 空 APFS 容器（本机那块 1T 盘的目标形态）
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
 	res, out, _ := doJSON(t, ts, "GET", "/api/v1/system/disks", nil, cookies)
 	if res.StatusCode != 200 {
@@ -979,17 +1028,14 @@ func TestDiskInitEmptyContainerCreatesVolume(t *testing.T) {
 		t.Error("必须把将要执行的命令告诉用户")
 	}
 
-	res, out, _ = doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/init-volume",
-		map[string]any{"name": "ZPMirror", "confirm": "disk9"}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("空容器初始化应 200，实际 %d: %v", res.StatusCode, out["msg"])
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk9/init-volume",
+		map[string]any{"name": "ZPMirror", "confirm": "disk9"})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("空容器初始化应成功，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
-	data, _ := out["data"].(map[string]any)
-	if data["created"] != true {
-		t.Errorf("应回读确认卷已创建，实际 %v", data)
-	}
-	if asString(data["volume_name"]) != "ZPMirror" || asString(data["new_device"]) == "" {
-		t.Errorf("结果要带卷名与新设备号，实际 %v", data)
+	r := diskTaskInstallResult(t, tk)
+	if !stepsContain(r.Steps, "ZPMirror") || !stepsContain(r.Steps, "回读：") {
+		t.Errorf("结果要带卷名与回读摘要，实际 %v", r.Steps)
 	}
 	if !w.called("apfs addVolume disk4 APFS ZPMirror") {
 		t.Errorf("命令构造不对，实际调用：%v", w.callList())
@@ -1000,19 +1046,22 @@ func TestDiskInitFailureReadsBackState(t *testing.T) {
 	w := newFakeWorld()
 	w.containerVols["disk4"] = nil
 	w.addVolumeFails = true
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/init-volume",
-		map[string]any{"name": "ZPMirror", "confirm": "disk9"}, cookies)
-	if res.StatusCode < 400 {
-		t.Fatalf("命令失败必须报错，实际 %d", res.StatusCode)
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk9/init-volume",
+		map[string]any{"name": "ZPMirror", "confirm": "disk9"})
+	if tk.Meta().Status != tasks.StatusFailed {
+		t.Fatalf("命令失败必须让任务失败，实际 %s", tk.Meta().Status)
 	}
-	msg := asString(out["msg"])
+	msg := tk.Meta().Error
 	if !strings.Contains(msg, "simulated failure") {
 		t.Errorf("必须带 stderr 原文，实际 %q", msg)
 	}
 	if !strings.Contains(msg, "回读") {
 		t.Errorf("失败后必须回读真实状态，实际 %q", msg)
+	}
+	if !strings.Contains(msg, "before=") {
+		t.Errorf("失败审计要带动作前快照，实际 %q", msg)
 	}
 }
 
@@ -1048,37 +1097,40 @@ func TestDiskListExposesFilesystemCatalog(t *testing.T) {
 
 func TestDiskEraseVolumeSuccess(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk4s1/erase",
+	srv, ts, cookies := newDiskServer(t, w)
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk4s1/erase",
 		map[string]any{"filesystem": "exfat", "name": "BackupDisk", "confirm": "disk4s1",
-			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("对外接卷 eraseVolume 应 200，实际 %d: %v", res.StatusCode, out["msg"])
+			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("对外接卷 eraseVolume 应成功，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
-	data, _ := out["data"].(map[string]any)
-	if data["verified"] != true || asString(data["volume_name"]) != "BackupDisk" {
-		t.Errorf("回读应确认为 BackupDisk，实际 %v", data)
+	r := diskTaskInstallResult(t, tk)
+	if !strings.Contains(r.Message, "BackupDisk") {
+		t.Errorf("结果摘要应含新卷名，实际 %q", r.Message)
+	}
+	if !stepsContain(r.Steps, "卷名=BackupDisk") {
+		t.Errorf("回读摘要必须给出卷名，实际 %v", r.Steps)
 	}
 	if !w.called("eraseVolume ExFAT BackupDisk disk4s1") {
 		t.Errorf("命令构造不对：%v", w.callList())
 	}
-	if !strings.Contains(asString(data["before_state"]), "ZPMirror") {
-		t.Errorf("before_state 必须记录动作前的卷快照，实际 %q", data["before_state"])
+	if !stepsContain(r.Steps, "ZPMirror") {
+		t.Errorf("before_state 必须记录动作前的卷快照，实际 %v", r.Steps)
 	}
 }
 
 func TestDiskEraseWholeDiskSuccessAndCommandShape(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/erase",
+	srv, ts, cookies := newDiskServer(t, w)
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk9/erase",
 		map[string]any{"filesystem": "exfat", "name": "BigDisk", "confirm": "disk9",
-			"expect_uuid": targetDisk9UUID, "expect_size": int64(1024209543168)}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("整盘 eraseDisk 应 200，实际 %d: %v", res.StatusCode, out["msg"])
+			"expect_uuid": targetDisk9UUID, "expect_size": int64(1024209543168)})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("整盘 eraseDisk 应成功，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
-	data, _ := out["data"].(map[string]any)
-	if data["verified"] != true || asString(data["new_device"]) != "disk9s1" {
-		t.Errorf("应回读到新分区，实际 %v", data)
+	r := diskTaskInstallResult(t, tk)
+	if !stepsContain(r.Steps, "卷名=BigDisk") {
+		t.Errorf("应回读到新卷名 BigDisk，实际 %v", r.Steps)
 	}
 	if !w.called("eraseDisk ExFAT BigDisk disk9") {
 		t.Errorf("整盘应走 eraseDisk，实际：%v", w.callList())
@@ -1087,7 +1139,7 @@ func TestDiskEraseWholeDiskSuccessAndCommandShape(t *testing.T) {
 
 func TestDiskEraseRejectsKeepBadFSAndBadConfirm(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 	cases := []struct {
 		name string
 		body map[string]any
@@ -1119,12 +1171,14 @@ func TestDiskEraseRejectsKeepBadFSAndBadConfirm(t *testing.T) {
 	if w.called("eraseVolume") {
 		t.Errorf("APFS 容器分区绝不能真的 eraseVolume：%v", w.callList())
 	}
+	// 验收：这些拒绝路径**不创建任务**。
+	noDiskTaskCreated(t, srv, "抹盘校验失败")
 }
 
-// TOCTOU：UUID/容量与页面不一致 → 409，且不执行任何写命令。
+// TOCTOU：UUID/容量与页面不一致 → 409，且不创建任务、不执行任何写命令。
 func TestDiskWriteRejectsTOCTOUIdentityMismatch(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 	cases := []struct {
 		name string
 		body map[string]any
@@ -1146,19 +1200,20 @@ func TestDiskWriteRejectsTOCTOUIdentityMismatch(t *testing.T) {
 	if w.called("eraseVolume") {
 		t.Errorf("TOCTOU 不匹配时绝不能执行写命令：%v", w.callList())
 	}
+	noDiskTaskCreated(t, srv, "TOCTOU 不匹配")
 }
 
 func TestDiskEraseTimeoutReadsBackState(t *testing.T) {
 	w := newFakeWorld()
 	w.timeoutErase = true
-	_, ts, cookies := newDiskServer(t, w)
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk4s1/erase",
+	srv, ts, cookies := newDiskServer(t, w)
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk4s1/erase",
 		map[string]any{"filesystem": "apfs", "name": "X", "confirm": "disk4s1",
-			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)}, cookies)
-	if res.StatusCode < 400 {
-		t.Fatalf("超时必须报失败，实际 %d", res.StatusCode)
+			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)})
+	if tk.Meta().Status != tasks.StatusFailed {
+		t.Fatalf("超时必须让任务失败，实际 %s", tk.Meta().Status)
 	}
-	msg := asString(out["msg"])
+	msg := tk.Meta().Error
 	if !strings.Contains(msg, "超时") || !strings.Contains(msg, "回读") {
 		t.Errorf("超时后必须说明超时并回读真实状态，实际 %q", msg)
 	}
@@ -1166,7 +1221,7 @@ func TestDiskEraseTimeoutReadsBackState(t *testing.T) {
 
 func TestDiskVolumeDeleteSuccessAndRejectsNonAPFS(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 
 	// 非 APFS 卷（EFI）不能删
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9s1/volume-delete",
@@ -1174,11 +1229,15 @@ func TestDiskVolumeDeleteSuccessAndRejectsNonAPFS(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest {
 		t.Errorf("非 APFS 卷应 400，实际 %d (%v)", res.StatusCode, out["msg"])
 	}
+	if w.called("apfs deleteVolume") {
+		t.Error("非 APFS 卷绝不能真删")
+	}
+	noDiskTaskCreated(t, srv, "非 APFS 卷删除")
 
-	res, out, _ = doJSON(t, ts, "POST", "/api/v1/system/disks/disk4s1/volume-delete",
-		map[string]any{"confirm": "disk4s1", "expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("删 APFS 卷应 200，实际 %d: %v", res.StatusCode, out["msg"])
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk4s1/volume-delete",
+		map[string]any{"confirm": "disk4s1", "expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("删 APFS 卷应成功，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
 	if !w.called("apfs deleteVolume disk4s1") {
 		t.Errorf("命令构造不对：%v", w.callList())
@@ -1190,16 +1249,16 @@ func TestDiskVolumeDeleteSuccessAndRejectsNonAPFS(t *testing.T) {
 
 func TestDiskVolumeRenameSuccess(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
-	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk4s1/volume-rename",
+	srv, ts, cookies := newDiskServer(t, w)
+	tk := runDiskTask(t, srv, ts, cookies, "/api/v1/system/disks/disk4s1/volume-rename",
 		map[string]any{"name": "ZPArchive", "confirm": "disk4s1",
-			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)}, cookies)
-	if res.StatusCode != 200 {
-		t.Fatalf("重命名应 200，实际 %d: %v", res.StatusCode, out["msg"])
+			"expect_uuid": zpmirrorUUID, "expect_size": int64(1023999787008)})
+	if tk.Meta().Status != tasks.StatusSucceeded {
+		t.Fatalf("重命名应成功，实际 %s: %v", tk.Meta().Status, tk.Meta().Error)
 	}
-	data, _ := out["data"].(map[string]any)
-	if data["verified"] != true || asString(data["volume_name"]) != "ZPArchive" {
-		t.Errorf("回读应确认新卷名，实际 %v", data)
+	r := diskTaskInstallResult(t, tk)
+	if !stepsContain(r.Steps, "卷名=ZPArchive") {
+		t.Errorf("回读应确认新卷名，实际 %v", r.Steps)
 	}
 	if !w.called("rename disk4s1 ZPArchive") {
 		t.Errorf("命令构造不对：%v", w.callList())
@@ -1208,7 +1267,7 @@ func TestDiskVolumeRenameSuccess(t *testing.T) {
 
 func TestDiskVolumeRenameRejectsWholeDisk(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9/volume-rename",
 		map[string]any{"name": "X", "confirm": "disk9",
 			"expect_uuid": targetDisk9UUID, "expect_size": int64(1024209543168)}, cookies)
@@ -1218,11 +1277,12 @@ func TestDiskVolumeRenameRejectsWholeDisk(t *testing.T) {
 	if w.called("rename disk9") {
 		t.Error("整盘重命名必须被拦在命令之前")
 	}
+	noDiskTaskCreated(t, srv, "整盘重命名")
 }
 
 func TestDiskVolumeCreateRejectsNoContainer(t *testing.T) {
 	w := newFakeWorld()
-	_, ts, cookies := newDiskServer(t, w)
+	srv, ts, cookies := newDiskServer(t, w)
 	// disk0s3 在 fake 里是 EFI 之外的分区；用 disk9s1（EFI，无容器）
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/system/disks/disk9s1/volume-create",
 		map[string]any{"name": "X", "confirm": "disk9s1"}, cookies)
@@ -1232,6 +1292,7 @@ func TestDiskVolumeCreateRejectsNoContainer(t *testing.T) {
 	if w.called("apfs addVolume") {
 		t.Error("没有容器时绝不能执行 addVolume")
 	}
+	noDiskTaskCreated(t, srv, "无容器建卷")
 }
 
 func TestLookupDiskFSAndKeys(t *testing.T) {

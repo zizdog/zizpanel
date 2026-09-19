@@ -1058,3 +1058,17 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
   text-align: center;
 }
 .zp-imgview-stage img { transition: none; }
+
+/* 磁盘工具：危险操作走任务中心后的"完成后回读"结果卡片。
+   危险动作（抹盘/建卷/删卷/重命名）提交后进度与日志在任务中心里看，
+   这里在页面上留一份持久的结果摘要（卷名/容量/挂载点/容器剩余空间）。 */
+.disk-task-result {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--brand);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--panel-2);
+}
+.disk-task-result .zp-notes-list { margin-bottom: 0; }
+.disk-task-result .zp-notes-list li { font-size: 12px; color: var(--text-dim); }

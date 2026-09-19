@@ -362,21 +362,6 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		// 上游 release **有** sha256 清单 → 必须核对（回落到第三方加速镜像时它是唯一内容校验）。
 		ChecksumAsset: "filebrowser_2.63.23_checksums.txt",
 		Notes: []string{
-			"安装目录：~/filebrowser（二进制与日志）；数据库在主目录之外的面板工作目录 " +
-				"<面板工作目录>/filebrowser/filebrowser.db（用户要求：它自己不该被自己管）。",
-			"文件根目录默认是**你的家目录**（-r {home}）—— Downloads / Documents / www 等都在里面，" +
-				"不需要额外拼多目录。想换根目录：服务详情里的「主目录」设置（改 plist 的 -r → 重启 → 回读生效值）。",
-			"⚠️ 风险与边界（实测，2026-09-19）：root=家目录意味着**谁能打开这个 Web UI、登录进去，" +
-				"谁就能读写整个家目录**（含 ~/.ssh、~/.panel-credential.local、~/Library/Keychains 等）。" +
-				"当前版本**没有**按目录排除/黑名单机制，也**没有**可靠的隐藏：`--hide-dotfiles` 只是 DB 里的" +
-				"一个显示开关（不是启动参数），实测开了之后列表里不显示 .ssh，但知道路径仍可 stat 到 " +
-				".ssh/id_rsa，并且 /api/raw/.ssh/id_rsa 直接返回文件内容 —— 隐藏 ≠ 安全。",
-			"所以：它只绑 127.0.0.1，只经面板 /filebrowser/ 别名 + 面板会话访问；**不要**把它直接开到局域网/公网。",
-			"如果你只想暴露某几个目录（不管理整个家目录），可以这样做（按推荐度）：" +
-				"① 把要展示的目录放在同一个父目录下，再把 root 改指那个父目录（最稳，等价于旧 Docker 的 /srv）；" +
-				"② 多用户 + 各自的 scope（Web UI：管理 → 用户管理 → 选中用户 → Scope；一个用户只有一个 scope）；" +
-				"③ 软链接：目标在 root 内时默认可用；指向 root 外时会被隐藏，需开 --followExternalSymlinks，" +
-				"而上游把该参数标注为 unsafe，不建议。",
 			"初始管理员凭据（用户名 + 随机口令）由 File Browser 首次启动时生成 —— 面板已从启动日志里抓出来" +
 				"放进上面的凭据区块；日志里抓不到时会如实说明，绝不编造。",
 			"⚠️ 上游项目已于 2026-09-01 归档：之后不再发版、不再修安全问题，请只在内网使用。",

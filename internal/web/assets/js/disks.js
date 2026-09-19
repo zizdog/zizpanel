@@ -15,12 +15,16 @@
 //   HFS+ 旧；FAT32 单文件 ≤ 4 GiB，装不下镜像包。
 
 import { api, apiURL } from './api.js';
+import { taskCenter } from './tasks.js';
 import { h, clear, toast, confirmBox, modal, bytes, appendAll } from './ui.js';
 
 export function DisksView(content, ctx = {}) {
   clear(content);
   const status = h('div.card-body');
   const listBox = h('div');
+  // 危险操作走任务中心：完成后在这里留一块**持久**的结果摘要（含回读），
+  // 而不是一个转瞬即逝的 toast。progress modal 里还能看到完整日志。
+  const resultBox = h('div');
   const refreshBtn = h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: () => load(true) });
   let snapshot = null;
 
@@ -33,6 +37,7 @@ export function DisksView(content, ctx = {}) {
         refreshBtn,
       ]),
       status,
+      resultBox,
     ]),
     listBox,
   );
@@ -58,6 +63,55 @@ export function DisksView(content, ctx = {}) {
     renderStatus(snapshot);
     renderList(snapshot);
     if (showToast) toast('已刷新磁盘状态', 'ok');
+  }
+
+  // ---------- 危险操作：任务中心 ----------
+  //
+  // 后端把这些动作改成**任务中心任务**（202 + task_id）：
+  //   · 提交后立刻能在任务中心看到进度/日志/命令，关掉窗口任务照样跑；
+  //   · 任务结束回调 onDone：刷新磁盘列表 + 展示回读结果摘要。
+  // taskCenter.start 已经负责"提交失败要说话"（4xx/5xx 会 toast 原因，返回 null），
+  // 所以这里**绝不**把提交失败当成功。
+  function submitDiskTask(kind, title, deviceID, pathSuffix, body) {
+    return taskCenter.start({
+      kind,
+      target: deviceID, // 同一设备同时只允许一个危险任务（后端也会 409）
+      title,
+      start: () => api.post(apiURL(`system/disks/${encodeURIComponent(deviceID)}/${pathSuffix}`), body),
+      onDone: afterDiskTask,
+    });
+  }
+
+  function afterDiskTask(m) {
+    load(false); // 任务里已经回读并落进结果；列表再按运行体真实状态刷一次
+    renderTaskResult(m);
+  }
+
+  // renderTaskResult 展示"完成后回读"的结果摘要（卷名/容量/挂载/容器剩余空间）。
+  // 结果来自任务 result（后端 diskTaskResult 的 message + steps）。
+  function renderTaskResult(m) {
+    clear(resultBox);
+    if (!m) return;
+    const done = m.status === 'succeeded';
+    const r = m.result || {};
+    const steps = Array.isArray(r.steps) ? r.steps : [];
+    const msg = r.message || m.error || '';
+    const wrap = h('div.disk-task-result', [
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span.pill' + (done ? '.ok' : '.danger'), { text: done ? '磁盘任务完成' : '磁盘任务未完成' }),
+        h('span.sub', { text: m.title || '' }),
+        h('button.btn.btn-sm', { text: '查看任务日志', onclick: () => taskCenter.openTask(m.id) }),
+      ]),
+      msg ? h('div', { style: { marginTop: '6px' } }, [h('strong', { text: msg })]) : null,
+      steps.length ? (() => {
+        const ul = h('ul.zp-notes-list');
+        steps.forEach((s) => ul.append(h('li.mono', { text: s })));
+        return ul;
+      })() : null,
+    ]);
+    resultBox.append(wrap);
+    if (done && msg) toast(msg, 'ok', 10000);
+    else if (!done) toast('磁盘任务失败：' + (m.error || '未知原因'), 'err', 12000);
   }
 
   function renderStatus(data) {
@@ -334,7 +388,8 @@ export function DisksView(content, ctx = {}) {
   // ---------- 危险动作：共用的强确认弹窗 ----------
   //
   // 必须同时满足：手输设备标识一致 + 勾选警告 + 业务校验通过，才允许点"执行"。
-  function strongDialog({ title, device, warning, body, command, submitLabel, validateExtra, onSubmit }) {
+  // submit 返回任务编号（提交给任务中心）或 null（提交失败，原因已 toast）。
+  function strongDialog({ title, device, warning, body, command, submitLabel, validateExtra, submit }) {
     const confirmInput = h('input.input', { type: 'text', placeholder: '原样输入 ' + device.id });
     const ack = h('input', { type: 'checkbox' });
     const errBox = h('div');
@@ -363,16 +418,22 @@ export function DisksView(content, ctx = {}) {
 
     goBtn.addEventListener('click', async () => {
       errBox.textContent = '';
-      goBtn.disabled = true; goBtn.textContent = '执行中…';
+      goBtn.disabled = true; goBtn.textContent = '提交中…';
+      let taskID = null;
       try {
-        const r = await onSubmit();
-        toast(r && r.message ? r.message : '完成', 'ok', 9000);
-        m.close(); load(false);
+        taskID = await submit();
       } catch (e) {
+        taskID = null;
         errBox.append(h('div', { style: { marginTop: '8px' } }, [
-          h('span.pill.danger', { text: '失败' }),
+          h('span.pill.danger', { text: '提交失败' }),
           h('span.hint', { text: ' ' + (e && e.message ? e.message : String(e)) }),
         ]));
+      }
+      if (taskID) {
+        // 任务已在任务中心跑（进度窗自动打开）。关掉确认框，结果由 onDone 展示。
+        m.close();
+      } else {
+        // 提交失败（参数被 400/409 拦下等）：保留输入让用户改完重试。
         goBtn.textContent = submitLabel; sync();
       }
     });
@@ -430,7 +491,7 @@ export function DisksView(content, ctx = {}) {
       body,
       submitLabel: '格式化',
       validateExtra: () => fsOf().key !== 'keep' && nameInput.value.trim() !== '',
-      onSubmit: () => api.post(apiURL(`system/disks/${encodeURIComponent(d.id)}/erase`), {
+      submit: () => submitDiskTask('disk_erase', '抹盘/格式化 ' + d.id, d.id, 'erase', {
         filesystem: sel.value,
         name: nameInput.value.trim(),
         confirm: d.id,
@@ -466,7 +527,7 @@ export function DisksView(content, ctx = {}) {
       command: init.backend_command || '',
       submitLabel: '新建',
       validateExtra: () => nameInput.value.trim() !== '',
-      onSubmit: () => api.post(apiURL(`system/disks/${encodeURIComponent(d.id)}/volume-create`), {
+      submit: () => submitDiskTask('disk_volume_create', '新建 APFS 卷 ' + d.id, d.id, 'volume-create', {
         name: nameInput.value.trim(), confirm: d.id,
         expect_uuid: d.uuid || '', expect_size: Number(d.size_bytes) || 0,
       }),
@@ -485,7 +546,7 @@ export function DisksView(content, ctx = {}) {
       body,
       command: 'diskutil apfs deleteVolume ' + p.id,
       submitLabel: '删除卷',
-      onSubmit: () => api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/volume-delete`), {
+      submit: () => submitDiskTask('disk_volume_delete', '删除 APFS 卷 ' + p.id, p.id, 'volume-delete', {
         confirm: p.id, expect_uuid: p.uuid || '', expect_size: Number(p.size_bytes) || 0,
       }),
     });
@@ -505,7 +566,7 @@ export function DisksView(content, ctx = {}) {
       command: 'diskutil rename ' + p.id + ' <新卷名>',
       submitLabel: '重命名',
       validateExtra: () => nameInput.value.trim() !== '',
-      onSubmit: () => api.post(apiURL(`system/disks/${encodeURIComponent(p.id)}/volume-rename`), {
+      submit: () => submitDiskTask('disk_volume_rename', '重命名卷 ' + p.id, p.id, 'volume-rename', {
         name: nameInput.value.trim(), confirm: p.id,
         expect_uuid: p.uuid || '', expect_size: Number(p.size_bytes) || 0,
       }),

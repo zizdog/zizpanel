@@ -93,13 +93,26 @@ if [ -z "$PLAN" ]; then
 fi
 echo "    共 $(printf '%s\n' "$PLAN" | wc -l | tr -d ' ') 个应用包"
 
-if [ "$DRY_RUN" != "1" ] && [ -z "$NAS_PASS" ]; then
-  echo "需要 NAS 口令：NAS_PASS='...' bash tools/sync-nas-apps.sh（或用 ssh 密钥 + 自行改这里的传输方式）" >&2
-  exit 1
-fi
-if [ "$DRY_RUN" != "1" ] && ! command -v sshpass >/dev/null 2>&1; then
-  echo "需要 sshpass（brew install hudochenkov/sshpass/sshpass）" >&2
-  exit 1
+# 传输方式：给了 NAS_PASS 就用 sshpass；没给口令但配了 SSH 密钥时直接用密钥。
+#
+# 为什么必须支持密钥：NAS 侧本来就配了密钥登录（发布链路的 push-nas 一直用密钥），
+# 而"同步应用包"只是把文件 rsync 过去 —— 强迫每次手输口令既没必要，也与
+# AGENTS 铁律 8（口令只从环境变量进、绝不落盘）的精神相悖。
+USE_SSHPASS=0
+if [ "$DRY_RUN" != "1" ]; then
+  if [ -n "$NAS_PASS" ]; then
+    USE_SSHPASS=1
+    if ! command -v sshpass >/dev/null 2>&1; then
+      echo "给了 NAS_PASS 但没装 sshpass（brew install hudochenkov/sshpass/sshpass）" >&2
+      exit 1
+    fi
+  elif ! ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+    "$NAS_USER@$NAS_HOST" true </dev/null >/dev/null 2>&1; then
+    echo "既没有 NAS_PASS，也用不了 SSH 密钥登录 ${NAS_USER}@${NAS_HOST}。" >&2
+    echo "两条路选一条：① NAS_PASS='...' bash tools/sync-nas-apps.sh（需要 sshpass）；" >&2
+    echo "             ② 先配好到 NAS 的 SSH 密钥（本机与 NAS 都支持，发布链路一直这么用）。" >&2
+    exit 1
+  fi
 fi
 
 TMP="$(mktemp -d)"
@@ -174,11 +187,19 @@ PY
   # 实测（2026-09-16，注册表里 2 个应用）：需要真上传的那个一旦调用 ssh，
   # 后面待同步的应用整段被吃掉，脚本却报"成功"—— 因为第一个应用确实传上去了，
   # 汇总里 `失败：0`，看不出少传了一个。加 -n 后同样的循环 3 个应用全都跑到。
-  sshpass -p "$NAS_PASS" ssh -n -o StrictHostKeyChecking=accept-new \
-    "$NAS_USER@$NAS_HOST" "mkdir -p '$dest'" </dev/null >/dev/null
-  sshpass -p "$NAS_PASS" rsync -az --no-perms --no-owner --no-group \
-    -e "ssh -o StrictHostKeyChecking=accept-new" \
-    "$dir/" "$NAS_USER@$NAS_HOST:$dest/" </dev/null >/dev/null
+  if [ "$USE_SSHPASS" = "1" ]; then
+    sshpass -p "$NAS_PASS" ssh -n -o StrictHostKeyChecking=accept-new \
+      "$NAS_USER@$NAS_HOST" "mkdir -p '$dest'" </dev/null >/dev/null
+    sshpass -p "$NAS_PASS" rsync -az --no-perms --no-owner --no-group \
+      -e "ssh -o StrictHostKeyChecking=accept-new" \
+      "$dir/" "$NAS_USER@$NAS_HOST:$dest/" </dev/null >/dev/null
+  else
+    ssh -n -o StrictHostKeyChecking=accept-new "$NAS_USER@$NAS_HOST" \
+      "mkdir -p '$dest'" </dev/null >/dev/null
+    rsync -az --no-perms --no-owner --no-group \
+      -e "ssh -o StrictHostKeyChecking=accept-new" \
+      "$dir/" "$NAS_USER@$NAS_HOST:$dest/" </dev/null >/dev/null
+  fi
 
   code="$(http_code "$public")"
   if [ "$code" = "200" ]; then

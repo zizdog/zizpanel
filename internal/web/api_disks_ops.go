@@ -13,14 +13,31 @@ package web
 //   * 写入前把"该设备/容器的卷与容量快照"记进审计（before_state），便于事后追溯；
 //   * diskutil 一律 60s 超时 + stderr 原文；失败/超时后回读真实状态再给结论；
 //   * 不依赖任何 GUI 授权弹窗（无头硬要求，源码 grep 门禁见 api_disks_test.go）。
+//
+// 2026-09 用户报障后的改造：抹盘/建卷/删卷/重命名都是**不可逆的分钟级动作**，
+// 却挂在同步 HTTP 请求上 —— 关掉窗口就找不回进度，用户只能看"请等待"。
+// 现在这四类动作统一走**任务中心**（照抄 handleSiteAppInstall / 文件压缩解压的用法）：
+//   * handler 先做**同步预检**：确认不匹配 / 系统盘 / 身份（UUID/容量）对不上
+//     一律当场 4xx，**不创建任务、不执行任何 diskutil 写命令**；
+//   * 预检通过才 launchTask，立刻 202 + task_id，进度/日志/中断都复用任务中心；
+//   * 任务体里在真正执行 diskutil 之前**再校验一次**（TOCTOU）：排队等调度期间
+//     盘可能被拔掉/换掉，所以 handler 的那次结论不能信；
+//   * 任务日志里的命令**从 cmd.Args 派生**（AGENTS.md 规矩），不手写标签；
+//   * 完成后回读并展示：卷名 / 容量 / 挂载点与挂载状态 / 容器剩余空间；
+//   * 审计仍带动作前快照：成功走任务结果的 Steps（launchTask 会写审计），
+//     失败走错误文本里的 before={...}。
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // diskWriteTimeout 是所有"会改盘"的 diskutil 命令超时（用户要求 30–60s）。
@@ -243,6 +260,9 @@ type diskOpResult struct {
 	NewDevice     string         `json:"new_device,omitempty"`
 	MountPoint    string         `json:"mount_point,omitempty"`
 	Mounted       bool           `json:"mounted"`
+	SizeBytes     int64          `json:"size_bytes,omitempty"`
+	Filesystem    string         `json:"filesystem,omitempty"`
+	FSType        string         `json:"fs_type,omitempty"`
 	ContainerRef  string         `json:"container_ref,omitempty"`
 	ContainerFree int64          `json:"container_free,omitempty"`
 	ContainerSize int64          `json:"container_size,omitempty"`
@@ -279,9 +299,18 @@ func (s *Server) executeDiskWrite(ctx context.Context, action, id, cmdLine strin
 	return res, after, runErr, afterErr
 }
 
-// failWrite 统一处理"命令失败/超时"与"回读失败"，返回给前端人话。
-// 失败也要把**动作前的卷/容量快照**记进审计（before=），便于事后追溯。
-func (s *Server) failDiskWrite(w http.ResponseWriter, r *http.Request, action, id string, res *diskOpResult, runErr, afterErr error) {
+// emitDiskCmd 把"真正要执行的命令"写进任务日志。
+//
+// 命令标签**从 cmd.Args 派生**（AGENTS.md 规矩）：手写的标签很容易和实际执行的
+// 不一致。diskutilBin 是绝对路径，这里构造 *exec.Cmd 只为拿它规范化后的 Args。
+func emitDiskCmd(ctx context.Context, args []string) {
+	cmd := exec.Command(diskutilBin, args...)
+	services.EmitProgress(ctx, tasks.LevelCmd, "$ "+strings.Join(cmd.Args, " "))
+}
+
+// diskWriteFailure 把"命令失败/超时"与"回读失败"翻成任务错误文本。
+// 失败也要把**动作前的卷/容量快照**带上（before=），便于事后追溯审计。
+func diskWriteFailure(res *diskOpResult, runErr, afterErr error) error {
 	detail := func(msg string) string {
 		if res.BeforeState != "" {
 			return "before={" + res.BeforeState + "} " + msg
@@ -298,25 +327,154 @@ func (s *Server) failDiskWrite(w http.ResponseWriter, r *http.Request, action, i
 		} else if res.AfterState != "" {
 			base += "。回读状态：" + res.AfterState
 		}
-		s.audit(r, action, id, detail(base), false, "")
-		fail(w, http.StatusInternalServerError, base)
-		return
+		return errors.New(detail(base))
 	}
 	if afterErr != nil {
-		msg := res.Command + " 已执行，但回读磁盘状态失败，**未复核**结果：" + afterErr.Error()
-		s.audit(r, action, id, detail(msg), false, "")
-		fail(w, http.StatusInternalServerError, msg)
-		return
+		return errors.New(detail(res.Command + " 已执行，但回读磁盘状态失败，**未复核**结果：" + afterErr.Error()))
 	}
 	// 正常情况下不会到这里；留一个兜底，避免"什么都没发生却返回成功"。
-	msg := res.Command + " 结果未知（未复核）"
-	s.audit(r, action, id, detail(msg), false, "")
-	fail(w, http.StatusInternalServerError, msg)
+	return errors.New(detail(res.Command + " 结果未知（未复核）"))
 }
 
-func (s *Server) auditWriteOK(r *http.Request, action, id string, res *diskOpResult, msg string) {
-	detail := "before={" + res.BeforeState + "} after={" + res.AfterState + "} " + msg
-	s.audit(r, action, id, detail, true, "")
+// diskReadbackLine 是"完成后回读"的用户可见摘要：
+// 卷名 / 容量 / 文件系统 / 挂载点与挂载状态 / 容器剩余空间。
+func diskReadbackLine(res *diskOpResult) string {
+	dash := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return "—"
+		}
+		return s
+	}
+	parts := []string{
+		"卷名=" + dash(res.VolumeName),
+		"容量=" + humanBytes(res.SizeBytes),
+		"文件系统=" + dash(res.Filesystem),
+	}
+	if res.Mounted {
+		line := "已挂载"
+		if res.MountPoint != "" {
+			line += "，挂载点=" + res.MountPoint
+		}
+		parts = append(parts, line)
+	} else {
+		parts = append(parts, "未挂载")
+	}
+	if res.ContainerRef != "" {
+		parts = append(parts, fmt.Sprintf("容器=%s 剩余空间=%s（共 %s，%d 个卷：%s）",
+			res.ContainerRef, humanBytes(res.ContainerFree), humanBytes(res.ContainerSize),
+			res.VolumeCount, strings.Join(res.VolumeNames, "、")))
+	}
+	return "回读：" + strings.Join(parts, "，")
+}
+
+// diskTaskResult 把一次写动作的结果包成任务结果。
+//
+// 为什么用 *services.InstallResult：任务中心的审计由 launchTask 在任务结束时统一写，
+// 成功时取的是 summarizeResult(result) —— 它只认 InstallResult，会把 Steps 逐条写进
+// 审计。把 before/after 快照放进 Steps，审计里就自然带上了动作前状态。
+func diskTaskResult(res *diskOpResult, steps []string) *services.InstallResult {
+	return &services.InstallResult{
+		App:     "disk",
+		Name:    res.Action,
+		Message: res.Message,
+		Steps:   steps,
+	}
+}
+
+// ---------- 任务体：真正执行一次会改盘的动作 ----------
+
+// diskWritePlan 描述一次危险动作。extra / args / verify 都接收"任务内重新校验后的"
+// 上下文，保证用到的是运行体此刻的真实结论，而不是 handler 预检时的旧快照。
+type diskWritePlan struct {
+	action     string
+	id         string
+	confirm    string
+	expectUUID string
+	expectSize int64
+	// extra 是动作专属检查；返回 (http状态码, 拒绝理由)，理由非空即拒绝（不执行写命令）。
+	extra func(w *diskWriteCtx) (int, string)
+	// args 用校验后的结论构造真正执行的 diskutil 参数。
+	args func(w *diskWriteCtx) []string
+	// verify 在命令成功、回读快照后校验结果，返回 (结果摘要, 错误)。
+	verify func(w *diskWriteCtx, after *diskSnapshot, res *diskOpResult) (string, string)
+}
+
+// launchDiskWrite 是四个危险动作 handler 的统一入口：
+//  1. 先做**同步预检** —— 拒绝时当场 4xx，**不创建任务、不执行任何写命令**；
+//  2. 预检通过才交给任务中心（202 + task_id），进度/日志/中断复用既有机制。
+func (s *Server) launchDiskWrite(w http.ResponseWriter, r *http.Request, title string, plan *diskWritePlan) {
+	wctx, code, msg := s.beginDiskWrite(r.Context(), plan.id, plan.confirm, plan.expectUUID, plan.expectSize)
+	if msg != "" {
+		s.audit(r, plan.action, plan.id, msg, false, "")
+		fail(w, code, msg)
+		return
+	}
+	if plan.extra != nil {
+		if c, why := plan.extra(wctx); why != "" {
+			if c == 0 {
+				c = http.StatusBadRequest
+			}
+			s.audit(r, plan.action, plan.id, why, false, "")
+			fail(w, c, why)
+			return
+		}
+	}
+	s.launchTask(w, r, plan.action, plan.id, title, plan.action,
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return s.runDiskWritePlan(ctx, log, plan)
+		})
+}
+
+// runDiskWritePlan 是任务体：在**真正执行 diskutil 之前**再校验一次（TOCTOU），
+// 命令标签从 cmd.Args 派生，执行后回读并展示结果。
+func (s *Server) runDiskWritePlan(ctx context.Context, log tasks.LogFunc, plan *diskWritePlan) (any, error) {
+	log(tasks.LevelStep, "执行前二次校验：设备仍在 / 仍非系统盘 / 标识（UUID）与容量一致")
+	// ★ 排队等任务中心调度期间盘可能被换掉，handler 的预检结论不能信，这里必须重做。
+	wctx, _, msg := s.beginDiskWrite(ctx, plan.id, plan.confirm, plan.expectUUID, plan.expectSize)
+	if msg != "" {
+		return nil, errors.New(msg)
+	}
+	if plan.extra != nil {
+		if _, why := plan.extra(wctx); why != "" {
+			return nil, errors.New(why)
+		}
+	}
+	args := plan.args(wctx)
+	cmdLine := "diskutil " + strings.Join(args, " ")
+	emitDiskCmd(ctx, args)
+	log(tasks.LevelStep, "开始执行："+cmdLine)
+
+	res, after, runErr, afterErr := s.executeDiskWrite(ctx, plan.action, plan.id, cmdLine, args, wctx.before)
+	// 命令输出（含 stderr 原文）逐行进任务日志。
+	for _, ln := range strings.Split(res.Stdout, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			log(tasks.LevelOut, ln)
+		}
+	}
+	for _, ln := range strings.Split(res.Stderr, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			log(tasks.LevelErr, ln)
+		}
+	}
+	if runErr != nil || afterErr != nil {
+		return nil, diskWriteFailure(res, runErr, afterErr)
+	}
+	summary, verr := plan.verify(wctx, after, res)
+	if verr != "" {
+		return nil, fmt.Errorf("%s 已执行，但回读校验不通过：%s。回读状态：%s", res.Command, verr, res.AfterState)
+	}
+	res.Verified = true
+	res.Message = summary
+	steps := []string{
+		"before={" + res.BeforeState + "}",
+		"after={" + res.AfterState + "}",
+		summary,
+		diskReadbackLine(res),
+	}
+	for _, ln := range steps {
+		log(tasks.LevelOK, ln)
+	}
+	return diskTaskResult(res, steps), nil
 }
 
 // ---------- 抹盘 / 格式化 ----------
@@ -351,51 +509,52 @@ func (s *Server) handleDiskErase(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "卷名不合法："+err.Error())
 		return
 	}
-	wctx, code, msg := s.beginDiskWrite(r.Context(), id, req.Confirm, req.ExpectUUID, req.ExpectSize)
-	if msg != "" {
-		s.audit(r, "disk_erase", id, msg, false, "")
-		fail(w, code, msg)
-		return
+	plan := &diskWritePlan{
+		action: "disk_erase", id: id, confirm: req.Confirm,
+		expectUUID: req.ExpectUUID, expectSize: req.ExpectSize,
+		extra: func(ww *diskWriteCtx) (int, string) {
+			// APFS 容器分区不能直接 eraseVolume（实测 diskutil 会报
+			// "in use by APFS as a Physical Store"）——提前给可行动的错误。
+			if !ww.info.WholeDisk && ww.info.Content == "Apple_APFS" {
+				return http.StatusBadRequest, "设备 " + id + " 是 APFS 容器（Apple_APFS 物理存储），不能直接格式化。" +
+					"请改用「格式化 / 抹盘这块盘…」（整盘会重建它），或先用 diskutil apfs deleteContainer 删容器。"
+			}
+			return 0, ""
+		},
+		args: func(ww *diskWriteCtx) []string {
+			if ww.info.WholeDisk {
+				return []string{"eraseDisk", fs.DiskutilFormat, name, id}
+			}
+			return []string{"eraseVolume", fs.DiskutilFormat, name, id}
+		},
+		verify: func(ww *diskWriteCtx, after *diskSnapshot, res *diskOpResult) (string, string) {
+			vol, verr := verifyErased(after, id, name, fs.VFSType, ww.info.WholeDisk)
+			if verr != "" {
+				return "", verr
+			}
+			res.VolumeName = vol.VolumeName
+			res.NewDevice = vol.ID
+			res.MountPoint = vol.MountPoint
+			res.Mounted = vol.Mounted
+			res.SizeBytes = vol.SizeBytes
+			res.Filesystem = vol.Filesystem
+			res.FSType = vol.FSType
+			if ref := after.containerRefFor(vol.ID); ref != "" {
+				res.ContainerRef = ref
+				names, free, size := containerInfo(after, ref)
+				res.VolumeNames = names
+				res.VolumeCount = len(names)
+				res.ContainerFree = free
+				res.ContainerSize = size
+			}
+			msg := fmt.Sprintf("已把 %s 格式化为 %s（卷名 %q，设备 %s）", id, fs.Label, vol.VolumeName, vol.ID)
+			if vol.Mounted {
+				msg += "，挂载于 " + vol.MountPoint
+			}
+			return msg, ""
+		},
 	}
-	// APFS 容器分区不能直接 eraseVolume（实测 diskutil 会报
-	// "in use by APFS as a Physical Store"）——提前给可行动的错误，而不是让用户看天书。
-	if !wctx.info.WholeDisk && wctx.info.Content == "Apple_APFS" {
-		m := "设备 " + id + " 是 APFS 容器（Apple_APFS 物理存储），不能直接格式化。" +
-			"请改用「格式化 / 抹盘这块盘…」（整盘会重建它），或先用 diskutil apfs deleteContainer 删容器。"
-		s.audit(r, "disk_erase", id, m, false, "")
-		fail(w, http.StatusBadRequest, m)
-		return
-	}
-	var args []string
-	if wctx.info.WholeDisk {
-		args = []string{"eraseDisk", fs.DiskutilFormat, name, id}
-	} else {
-		args = []string{"eraseVolume", fs.DiskutilFormat, name, id}
-	}
-	cmdLine := "diskutil " + strings.Join(args, " ")
-	res, after, runErr, afterErr := s.executeDiskWrite(r.Context(), "disk_erase", id, cmdLine, args, wctx.before)
-	if runErr != nil || afterErr != nil {
-		s.failDiskWrite(w, r, "disk_erase", id, res, runErr, afterErr)
-		return
-	}
-	vol, verr := verifyErased(after, id, name, fs.VFSType, wctx.info.WholeDisk)
-	if verr != "" {
-		m := res.Command + " 已执行，但回读校验不通过：" + verr + "。回读状态：" + res.AfterState
-		s.audit(r, "disk_erase", id, m, false, "")
-		fail(w, http.StatusInternalServerError, m)
-		return
-	}
-	res.Verified = true
-	res.VolumeName = vol.VolumeName
-	res.NewDevice = vol.ID
-	res.MountPoint = vol.MountPoint
-	res.Mounted = vol.Mounted
-	res.Message = fmt.Sprintf("已把 %s 格式化为 %s（卷名 %q，设备 %s）", id, fs.Label, vol.VolumeName, vol.ID)
-	if vol.Mounted {
-		res.Message += "，挂载于 " + vol.MountPoint
-	}
-	s.auditWriteOK(r, "disk_erase", id, res, res.Message)
-	ok(w, res)
+	s.launchDiskWrite(w, r, "抹盘/格式化 "+id, plan)
 }
 
 // verifyErased 回读确认格式化结果（整盘与分区两条路径）。
@@ -460,57 +619,50 @@ func (s *Server) handleDiskVolumeCreate(w http.ResponseWriter, r *http.Request) 
 		fail(w, http.StatusBadRequest, "卷名不合法："+err.Error())
 		return
 	}
-	wctx, code, msg := s.beginDiskWrite(r.Context(), id, req.Confirm, req.ExpectUUID, req.ExpectSize)
-	if msg != "" {
-		s.audit(r, "disk_volume_create", id, msg, false, "")
-		fail(w, code, msg)
-		return
+	plan := &diskWritePlan{
+		action: "disk_volume_create", id: id, confirm: req.Confirm,
+		expectUUID: req.ExpectUUID, expectSize: req.ExpectSize,
+		extra: func(ww *diskWriteCtx) (int, string) {
+			ref := ww.snap.containerRefFor(id)
+			if ref == "" {
+				return http.StatusBadRequest, "设备 " + id + " 上没有 APFS 容器。要新建卷请先用「格式化」把它做成 APFS。"
+			}
+			if why := ww.snap.guardWrite(ref); why != "" {
+				return http.StatusForbidden, "拒绝新建卷：容器 " + ref + " 属于系统盘（" + why + "）"
+			}
+			return 0, ""
+		},
+		args: func(ww *diskWriteCtx) []string {
+			return []string{"apfs", "addVolume", ww.snap.containerRefFor(id), "APFS", name}
+		},
+		verify: func(ww *diskWriteCtx, after *diskSnapshot, res *diskOpResult) (string, string) {
+			ref := ww.snap.containerRefFor(id)
+			vol, okk := after.findVolumeInContainer(ref, name)
+			if !okk {
+				return "", "回读容器 " + ref + " 后没有找到名为 " + name + " 的卷"
+			}
+			res.Created = true
+			res.VolumeName = name
+			res.NewDevice = vol.ID
+			res.MountPoint = vol.MountPoint
+			res.Mounted = vol.Mounted
+			res.SizeBytes = vol.SizeBytes
+			res.Filesystem = vol.Filesystem
+			res.FSType = vol.FSType
+			res.ContainerRef = ref
+			names, free, size := containerInfo(after, ref)
+			res.VolumeNames = names
+			res.VolumeCount = len(names)
+			res.ContainerFree = free
+			res.ContainerSize = size
+			msg := fmt.Sprintf("已在容器 %s 新建卷 %q（%s）", ref, name, vol.ID)
+			if vol.Mounted {
+				msg += "，挂载于 " + vol.MountPoint
+			}
+			return msg, ""
+		},
 	}
-	ref := wctx.snap.containerRefFor(id)
-	if ref == "" {
-		m := "设备 " + id + " 上没有 APFS 容器。要新建卷请先用「格式化」把它做成 APFS。"
-		s.audit(r, "disk_volume_create", id, m, false, "")
-		fail(w, http.StatusBadRequest, m)
-		return
-	}
-	if why := wctx.snap.guardWrite(ref); why != "" {
-		m := "拒绝新建卷：容器 " + ref + " 属于系统盘（" + why + "）"
-		s.audit(r, "disk_volume_create", id, m, false, "")
-		fail(w, http.StatusForbidden, m)
-		return
-	}
-	args := []string{"apfs", "addVolume", ref, "APFS", name}
-	cmdLine := "diskutil " + strings.Join(args, " ")
-	res, after, runErr, afterErr := s.executeDiskWrite(r.Context(), "disk_volume_create", id, cmdLine, args, wctx.before)
-	if runErr != nil || afterErr != nil {
-		s.failDiskWrite(w, r, "disk_volume_create", id, res, runErr, afterErr)
-		return
-	}
-	vol, okk := after.findVolumeInContainer(ref, name)
-	if !okk {
-		m := res.Command + " 退出正常，但回读容器 " + ref + " 后没有找到名为 " + name + " 的卷。回读状态：" + res.AfterState
-		s.audit(r, "disk_volume_create", id, m, false, "")
-		fail(w, http.StatusInternalServerError, m)
-		return
-	}
-	res.Verified = true
-	res.Created = true
-	res.VolumeName = name
-	res.NewDevice = vol.ID
-	res.MountPoint = vol.MountPoint
-	res.Mounted = vol.Mounted
-	res.ContainerRef = ref
-	names, free, size := containerInfo(after, ref)
-	res.VolumeNames = names
-	res.VolumeCount = len(names)
-	res.ContainerFree = free
-	res.ContainerSize = size
-	res.Message = fmt.Sprintf("已在容器 %s 新建卷 %q（%s）", ref, name, vol.ID)
-	if vol.Mounted {
-		res.Message += "，挂载于 " + vol.MountPoint
-	}
-	s.auditWriteOK(r, "disk_volume_create", id, res, res.Message)
-	ok(w, res)
+	s.launchDiskWrite(w, r, "新建 APFS 卷 "+id, plan)
 }
 
 // ---------- 删除 APFS 卷 ----------
@@ -528,36 +680,39 @@ func (s *Server) handleDiskVolumeDelete(w http.ResponseWriter, r *http.Request) 
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	wctx, code, msg := s.beginDiskWrite(r.Context(), id, req.Confirm, req.ExpectUUID, req.ExpectSize)
-	if msg != "" {
-		s.audit(r, "disk_volume_delete", id, msg, false, "")
-		fail(w, code, msg)
-		return
+	plan := &diskWritePlan{
+		action: "disk_volume_delete", id: id, confirm: req.Confirm,
+		expectUUID: req.ExpectUUID, expectSize: req.ExpectSize,
+		extra: func(ww *diskWriteCtx) (int, string) {
+			if ww.info.WholeDisk || !ww.info.APFSVolume {
+				return http.StatusBadRequest, "设备 " + id + " 不是 APFS 卷，不能删除。只有 APFS 卷支持本操作。"
+			}
+			return 0, ""
+		},
+		args: func(ww *diskWriteCtx) []string {
+			return []string{"apfs", "deleteVolume", id}
+		},
+		verify: func(ww *diskWriteCtx, after *diskSnapshot, res *diskOpResult) (string, string) {
+			if _, still := after.findInfo(id); still {
+				return "", "回读发现设备 " + id + " 仍然存在"
+			}
+			res.VolumeName = ww.info.VolumeName
+			res.SizeBytes = ww.info.SizeBytes
+			res.Filesystem = ww.info.Filesystem
+			res.FSType = ww.info.FSType
+			res.Mounted = false
+			if ref := ww.snap.containerRefFor(id); ref != "" {
+				res.ContainerRef = ref
+				names, free, size := containerInfo(after, ref)
+				res.VolumeNames = names
+				res.VolumeCount = len(names)
+				res.ContainerFree = free
+				res.ContainerSize = size
+			}
+			return fmt.Sprintf("已删除 APFS 卷 %s（%q）及其数据", id, ww.info.VolumeName), ""
+		},
 	}
-	if wctx.info.WholeDisk || !wctx.info.APFSVolume {
-		m := "设备 " + id + " 不是 APFS 卷，不能删除。只有 APFS 卷支持本操作。"
-		s.audit(r, "disk_volume_delete", id, m, false, "")
-		fail(w, http.StatusBadRequest, m)
-		return
-	}
-	args := []string{"apfs", "deleteVolume", id}
-	cmdLine := "diskutil " + strings.Join(args, " ")
-	res, after, runErr, afterErr := s.executeDiskWrite(r.Context(), "disk_volume_delete", id, cmdLine, args, wctx.before)
-	if runErr != nil || afterErr != nil {
-		s.failDiskWrite(w, r, "disk_volume_delete", id, res, runErr, afterErr)
-		return
-	}
-	if _, still := after.findInfo(id); still {
-		m := res.Command + " 退出正常，但回读发现设备 " + id + " 仍然存在。回读状态：" + res.AfterState
-		s.audit(r, "disk_volume_delete", id, m, false, "")
-		fail(w, http.StatusInternalServerError, m)
-		return
-	}
-	res.Verified = true
-	res.VolumeName = wctx.info.VolumeName
-	res.Message = fmt.Sprintf("已删除 APFS 卷 %s（%q）及其数据", id, wctx.info.VolumeName)
-	s.auditWriteOK(r, "disk_volume_delete", id, res, res.Message)
-	ok(w, res)
+	s.launchDiskWrite(w, r, "删除 APFS 卷 "+id, plan)
 }
 
 // ---------- 卷重命名 ----------
@@ -582,41 +737,43 @@ func (s *Server) handleDiskVolumeRename(w http.ResponseWriter, r *http.Request) 
 		fail(w, http.StatusBadRequest, "新卷名不合法："+err.Error())
 		return
 	}
-	wctx, code, msg := s.beginDiskWrite(r.Context(), id, req.Confirm, req.ExpectUUID, req.ExpectSize)
-	if msg != "" {
-		s.audit(r, "disk_volume_rename", id, msg, false, "")
-		fail(w, code, msg)
-		return
+	plan := &diskWritePlan{
+		action: "disk_volume_rename", id: id, confirm: req.Confirm,
+		expectUUID: req.ExpectUUID, expectSize: req.ExpectSize,
+		extra: func(ww *diskWriteCtx) (int, string) {
+			if ww.info.WholeDisk {
+				return http.StatusBadRequest, "设备 " + id + " 是整盘，不能重命名；请选择它的某个卷。"
+			}
+			return 0, ""
+		},
+		args: func(ww *diskWriteCtx) []string {
+			return []string{"rename", id, name}
+		},
+		verify: func(ww *diskWriteCtx, after *diskSnapshot, res *diskOpResult) (string, string) {
+			ni, okk := after.findInfo(id)
+			if !okk || ni.VolumeName != name {
+				got := ""
+				if okk {
+					got = ni.VolumeName
+				}
+				return "", fmt.Sprintf("回读卷名不一致：期望 %s，实际 %q", name, got)
+			}
+			res.VolumeName = name
+			res.MountPoint = ni.MountPoint
+			res.Mounted = ni.Mounted
+			res.SizeBytes = ni.SizeBytes
+			res.Filesystem = ni.Filesystem
+			res.FSType = ni.FSType
+			if ref := after.containerRefFor(id); ref != "" {
+				res.ContainerRef = ref
+				names, free, size := containerInfo(after, ref)
+				res.VolumeNames = names
+				res.VolumeCount = len(names)
+				res.ContainerFree = free
+				res.ContainerSize = size
+			}
+			return fmt.Sprintf("已把 %s 重命名为 %q", id, name), ""
+		},
 	}
-	if wctx.info.WholeDisk {
-		m := "设备 " + id + " 是整盘，不能重命名；请选择它的某个卷。"
-		s.audit(r, "disk_volume_rename", id, m, false, "")
-		fail(w, http.StatusBadRequest, m)
-		return
-	}
-	args := []string{"rename", id, name}
-	cmdLine := "diskutil " + strings.Join(args, " ")
-	res, after, runErr, afterErr := s.executeDiskWrite(r.Context(), "disk_volume_rename", id, cmdLine, args, wctx.before)
-	if runErr != nil || afterErr != nil {
-		s.failDiskWrite(w, r, "disk_volume_rename", id, res, runErr, afterErr)
-		return
-	}
-	ni, okk := after.findInfo(id)
-	if !okk || ni.VolumeName != name {
-		got := ""
-		if okk {
-			got = ni.VolumeName
-		}
-		m := res.Command + " 退出正常，但回读卷名不一致：期望 " + name + "，实际 " + got + "。回读状态：" + res.AfterState
-		s.audit(r, "disk_volume_rename", id, m, false, "")
-		fail(w, http.StatusInternalServerError, m)
-		return
-	}
-	res.Verified = true
-	res.VolumeName = name
-	res.MountPoint = ni.MountPoint
-	res.Mounted = ni.Mounted
-	res.Message = fmt.Sprintf("已把 %s 重命名为 %q", id, name)
-	s.auditWriteOK(r, "disk_volume_rename", id, res, res.Message)
-	ok(w, res)
+	s.launchDiskWrite(w, r, "重命名卷 "+id, plan)
 }
