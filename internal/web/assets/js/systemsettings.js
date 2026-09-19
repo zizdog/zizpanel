@@ -123,22 +123,17 @@ export function SystemSettingsView(content, ctx = {}) {
       ]),
       h('div.card-body', [
         h('p.hint', {
-          text: 'macOS 15 的「本地网络」隐私门会拦住没拿到授权的程序访问局域网。' +
+          text: 'macOS 的「本地网络」隐私门会拦住没拿到授权的程序访问局域网。' +
             'Homebrew 的 nginx 是 ad-hoc 签名、标识随升级变化，无头服务器上没人点授权弹窗，' +
             '所以它的局域网反代会 502。开启这一项会写入 Apple 官方的预授权键' +
             '（com.apple.network.local-network 的两个 CIDR 数组，系统域与真实用户域各一份），' +
             '让系统把这个网段当成"不是本地网络"。',
         }),
-        h('p.hint', [
-          '代价：这个网段在本机上对',
-          h('strong', { text: '所有程序' }),
-          '都不再受这道隐私门限制（不是只对 nginx 或面板）。改动必须重启后才生效；' +
-            '撤销同样是重启后才不再豁免，但不会清除系统里已登记或授权过的程序（例如手动点过「允许」的）。',
-        ]),
+
         lanStatus,
         h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '12px 0 6px' } }, [
           lanToggle,
-          h('span', { text: '写入预授权（勾选后点「保存」写入；取消勾选后点「保存」= 删除）' }),
+          h('span', { text: '是否写入预授权' }),
         ]),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' } }, [
           h('span.hint', { text: '网段（CIDR，逗号分隔）' }),

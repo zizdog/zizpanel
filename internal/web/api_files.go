@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -38,21 +39,72 @@ import (
 // 缓存住旧根目录的后果是「📝 编辑配置文件」报"路径不在允许访问的范围内"，
 // 只有重启面板才好。构造只是几次 os.Stat，代价可以忽略。
 func (s *Server) fileManager() *files.Manager {
-	roots := s.Cfg.FileRoots
-	if len(roots) == 0 {
-		roots = []string{
-			s.Cfg.WWWRoot,
-			s.Cfg.DataDir,
-			s.Cfg.LogDir,
-			s.Cfg.WorkDir,
-		}
-	}
-	roots = append(roots, s.appConfigRoots()...)
+	roots := s.fileRoots()
 	return files.NewManager(files.Options{
 		Roots:    roots,
 		UserName: s.Cfg.User,
 		UserHome: s.Cfg.UserHome,
 	})
+}
+
+// fileRoots 返回允许访问的根目录集合。
+//
+// 2026-09-2X 用户批准的「文件管理大放开」新增：
+//   - 整个用户目录 /Users/<user>；
+//   - 面板安装根（默认 /opt/zizpanel，整个目录，不只是 data/logs/work）；
+//   - /opt/homebrew/etc（nginx / php 配置）；
+//   - 所有非系统卷的挂载点（外接盘，动态枚举，插拔后随下次请求自动刷新）。
+//
+// 系统盘其余部分（/、/System、/Library、/usr、/bin、/private、/etc…）依然拒绝：
+// 它们不在任何根目录之下，越界由 files.Manager.Resolve 返回 ErrForbidden。
+// 软链接逃逸防护也没有被削弱 —— Resolve 仍然先 EvalSymlinks 再做前缀检查。
+func (s *Server) fileRoots() []string {
+	roots := append([]string{}, s.Cfg.FileRoots...)
+	if len(roots) == 0 {
+		roots = s.defaultFileRoots()
+	}
+	roots = append(roots, s.appConfigRoots()...)
+	return roots
+}
+
+// defaultFileRoots 是未显式配置 file_roots 时的默认根集合。
+func (s *Server) defaultFileRoots() []string {
+	roots := []string{
+		s.Cfg.WWWRoot,
+		s.Cfg.DataDir,
+		s.Cfg.LogDir,
+		s.Cfg.WorkDir,
+		// 整个用户目录
+		s.Cfg.UserHome,
+		// 面板安装根。除由配置推导出的安装根外，显式加上编译期默认值
+		// （/opt/zizpanel）：`make run-local` 会把配置指向临时根，
+		// 但验收要求此时仍然能访问真实安装根。
+		config.DefaultRoot,
+	}
+	// Homebrew 的 etc（nginx / php 配置都在这里）
+	if s.Cfg.BrewPrefix != "" {
+		roots = append(roots, filepath.Join(s.Cfg.BrewPrefix, "etc"))
+	}
+	roots = append(roots, s.installRoots()...)
+	// 外接盘：每次构造都重新枚举（读 /Volumes + getfsstat，不 fork 进程、不跑 diskutil）
+	roots = append(roots, files.NonSystemVolumeMounts()...)
+	return roots
+}
+
+// installRoots 由配置里的 BinDir 推导安装根，支持非默认安装位置。
+//
+// 只认 BinDir 的父目录（配置保证它是 <安装根>/bin）。刻意不用 DataDir 的父目录：
+// 测试环境把 DataDir 直接指向临时目录本身，取父目录会意外把 /tmp 整个放进白名单。
+func (s *Server) installRoots() []string {
+	if s.Cfg.BinDir == "" {
+		return nil
+	}
+	parent := filepath.Dir(filepath.Clean(s.Cfg.BinDir))
+	// 绝不把 "/" 或相对路径（"."）当成安装根 —— 那等于放开整块系统盘/当前目录。
+	if parent == "/" || parent == "." || !filepath.IsAbs(parent) {
+		return nil
+	}
+	return []string{parent}
 }
 
 // appConfigRoots 返回"面板安装的应用的配置文件所在目录"。
@@ -106,17 +158,129 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	res, err := mgr.List(p, showHidden)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
+	s.annotateRoots(res)
+	s.markSensitive(res)
 	ok(w, res)
+}
+
+// annotateRoots 给每个根目录标一个用途，供前端「位置」下拉分组显示。
+// fileRootKind* 是给前端"位置"下拉分组用的**根类型标签**（不是路径）。
+//
+// 为什么用常量而不是到处写字面量：① 语义单一来源；② 备份覆盖门禁的正则是
+// `\.(DataDir|WorkDir)[ \t]*,[ \t]*"([^"]+)"`，会把「`s.Cfg.DataDir` 后紧跟一个字符串
+// 字面量」的相邻参数对误判成 `<DataDir>/<那个字符串>` 路径（见 internal/backup/plan_gate_test.go 顶部）。
+// 用常量名就不带引号，从写法上避开这个已知误报，而不是去削弱那条门禁。
+const (
+	fileRootKindWWW      = "www"
+	fileRootKindHome     = "home"
+	fileRootKindData     = "data"
+	fileRootKindPanel    = "panel"
+	fileRootKindHomebrew = "homebrew"
+)
+
+func (s *Server) annotateRoots(res *files.ListResult) {
+	if res == nil {
+		return
+	}
+	known := map[string]string{}
+	add := func(p, kind string) {
+		if rp := resolveForCompare(p); rp != "" {
+			known[rp] = kind
+		}
+	}
+	add(s.Cfg.WWWRoot, fileRootKindWWW)
+	add(s.Cfg.UserHome, fileRootKindHome)
+	// 面板数据目录单独标一类：它嵌在安装根里，前端下拉不再重复列，但要能认出它。
+	add(s.Cfg.DataDir, fileRootKindData)
+	add(config.DefaultRoot, fileRootKindPanel)
+	if s.Cfg.BrewPrefix != "" {
+		add(filepath.Join(s.Cfg.BrewPrefix, "etc"), fileRootKindHomebrew)
+	}
+	for _, r := range s.installRoots() {
+		add(r, fileRootKindPanel)
+	}
+	for _, v := range files.NonSystemVolumeMounts() {
+		add(v, "volume")
+	}
+	kinds := make(map[string]string, len(res.Roots))
+	for _, root := range res.Roots {
+		// 先看**精确匹配**：这样嵌在用户目录里的网站根目录（~/www）仍然是 www，
+		// 不会被父根（用户目录）盖掉；面板数据目录也不会被安装根盖掉。
+		if k, ok := known[root]; ok {
+			kinds[root] = k
+			continue
+		}
+		kinds[root] = classifyRoot(root, known)
+	}
+	res.RootKinds = kinds
+}
+
+// classifyRoot 取"最长匹配"的已知用途；都不匹配时归到 other。
+func classifyRoot(root string, known map[string]string) string {
+	best, bestLen := "other", -1
+	for p, kind := range known {
+		if root == p || strings.HasPrefix(root, p+string(os.PathSeparator)) {
+			if len(p) > bestLen {
+				bestLen, best = len(p), kind
+			}
+		}
+	}
+	return best
+}
+
+// markSensitive 把面板数据目录（SQLite 库与凭据）标出来。
+//
+// 仍然可读写（用户明确要求），只是让界面能打「敏感」标记并在覆盖/删除前二次确认。
+func (s *Server) markSensitive(res *files.ListResult) {
+	if res == nil {
+		return
+	}
+	data := resolveForCompare(s.Cfg.DataDir)
+	if data == "" {
+		return
+	}
+	res.SensitiveRoots = []string{data}
+	for i := range res.Entries {
+		p := res.Entries[i].Path
+		if p == data || strings.HasPrefix(p, data+string(os.PathSeparator)) {
+			res.Entries[i].Sensitive = true
+		}
+	}
+}
+
+// resolveForCompare 把已存在的路径解析成真实路径，用于和 Manager.Roots() 的口径对齐。
+// 不存在/解析失败时退回 Clean 后的原路径。
+func resolveForCompare(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return ""
+	}
+	p = filepath.Clean(p)
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+// failFileErr 把文件操作的错误映射成 HTTP 状态码。
+//
+// 越界（ErrForbidden）必须是 403 而不是 400：前端与测试据此区分"路径不合法"
+// 与"你没有权限访问这里"，也避免把"系统目录被拒绝"误报成"请求写错了"。
+func failFileErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, files.ErrForbidden) {
+		fail(w, http.StatusForbidden, err.Error())
+		return
+	}
+	fail(w, http.StatusBadRequest, err.Error())
 }
 
 func (s *Server) handleFileRead(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	res, err := mgr.Read(r.URL.Query().Get("path"))
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	ok(w, res)
@@ -132,12 +296,12 @@ type fileWriteReq struct {
 func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	var req fileWriteReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if err := mgr.Write(req.Path, req.Content, req.Create); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_write", req.Path, fmt.Sprintf("写入 %d 字节", len(req.Content)), true, "")
@@ -151,12 +315,12 @@ type filePathReq struct {
 func (s *Server) handleFileMkdir(w http.ResponseWriter, r *http.Request) {
 	var req filePathReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if err := mgr.Mkdir(req.Path); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_mkdir", req.Path, "新建目录", true, "")
@@ -166,12 +330,12 @@ func (s *Server) handleFileMkdir(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFileTouch(w http.ResponseWriter, r *http.Request) {
 	var req filePathReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if err := mgr.Touch(req.Path); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_touch", req.Path, "新建文件", true, "")
@@ -186,12 +350,12 @@ type fileRenameReq struct {
 func (s *Server) handleFileRename(w http.ResponseWriter, r *http.Request) {
 	var req fileRenameReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if err := mgr.Rename(req.From, req.To); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_rename", req.From, "重命名为 "+req.To, true, "")
@@ -201,16 +365,71 @@ func (s *Server) handleFileRename(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
 	var req fileRenameReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if err := mgr.Copy(req.From, req.To); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_copy", req.From, "复制到 "+req.To, true, "")
 	ok(w, map[string]any{"msg": "已复制"})
+}
+
+// handleFileMove 移动（剪切粘贴）。
+//
+// 与 copy 的关键区别：非同卷时 os.Rename 会失败（EXDEV），Manager.Move 会回退到
+// "复制 + 删除源"，并且**如实**在响应里报告用的是哪种方式（前端据此提示用户）。
+// on_conflict 处理"目标已存在"：rename（默认，自动改名保留两者）/ overwrite /
+// skip。绝不静默覆盖。
+func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
+	var req fileMoveReq
+	if err := decode(r, &req); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	mgr := s.fileManager()
+	res, err := mgr.Move(req.From, req.To, req.OnConflict)
+	if err != nil {
+		failFileErr(w, err)
+		return
+	}
+	s.audit(r, "file_move", req.From, fmt.Sprintf("移动到 %s（%s）", res.To, res.Way), true, "")
+	ok(w, map[string]any{
+		"from":        res.From,
+		"to":          res.To,
+		"way":         string(res.Way),
+		"skipped":     res.Skipped,
+		"overwritten": res.Overwritten,
+		"msg":         moveMessage(res),
+	})
+}
+
+type fileMoveReq struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// OnConflict 是目标已存在时的处理方式：rename（默认）/ overwrite / skip
+	OnConflict string `json:"on_conflict"`
+}
+
+// moveMessage 把"实际用了哪种方式"翻译成人话。跨卷复制后删除与同卷重命名
+// 对用户的意义不同（前者慢、且中途失败可能留下副本），不能都写成"已移动"。
+func moveMessage(res *files.MoveResult) string {
+	if res.Skipped {
+		return "已跳过（目标已存在）"
+	}
+	switch res.Way {
+	case files.MoveStrategyCopyDelete:
+		return "已移动（跨卷：先复制再删除源文件）"
+	case files.MoveStrategyNone:
+		return "源与目标相同，未做改动"
+	default:
+		if res.Overwritten {
+			return "已移动并覆盖了目标处的原有内容"
+		}
+		return "已移动（同卷重命名）"
+	}
 }
 
 type fileChmodReq struct {
@@ -223,25 +442,25 @@ type fileChmodReq struct {
 func (s *Server) handleFileChmod(w http.ResponseWriter, r *http.Request) {
 	var req fileChmodReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mode, err := files.ParseMode(req.Mode)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	if !req.Recursive {
 		if err := mgr.Chmod(req.Path, mode); err != nil {
-			fail(w, http.StatusBadRequest, err.Error())
+			failFileErr(w, err)
 			return
 		}
 	} else {
 		// 递归修改：逐个走 Resolve 校验，确保不会因软链接越界
 		target, err := mgr.Resolve(req.Path, false)
 		if err != nil {
-			fail(w, http.StatusBadRequest, err.Error())
+			failFileErr(w, err)
 			return
 		}
 		count := 0
@@ -274,7 +493,7 @@ type fileDeleteReq struct {
 func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	var req fileDeleteReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	if len(req.Paths) == 0 {
@@ -315,14 +534,14 @@ type fileCompressReq struct {
 func (s *Server) handleFileCompress(w http.ResponseWriter, r *http.Request) {
 	var req fileCompressReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	// 先做一次**只读**校验（源路径是否存在/是否越界、格式是否支持）：
 	// 参数错了要当场 400，而不是开一个注定失败的任务。
 	if err := mgr.CheckCompressTargets(req.Dir, req.Names, req.Format); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	title := fmt.Sprintf("打包 %d 项为 %s", len(req.Names), filepath.Base(req.Output))
@@ -359,14 +578,14 @@ type fileExtractReq struct {
 func (s *Server) handleFileExtract(w http.ResponseWriter, r *http.Request) {
 	var req fileExtractReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	// 只读预检：归档存在、格式支持、目标目录在允许范围内、归档内没有穿越路径。
 	// 这些问题要**当场**告诉用户（400 + 人话），而不是丢进任务再失败。
 	if err := mgr.CheckExtractTargets(r.Context(), req.Archive, req.Dest); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.launchTask(w, r, "file_extract", req.Archive, "解压 "+filepath.Base(req.Archive),
@@ -398,7 +617,7 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Query().Get("path")
 	f, st, err := mgr.OpenForRead(p)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
@@ -719,7 +938,7 @@ type fileSearchReq struct {
 func (s *Server) handleFileSearch(w http.ResponseWriter, r *http.Request) {
 	var req fileSearchReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	if req.Path == "" {
@@ -729,7 +948,7 @@ func (s *Server) handleFileSearch(w http.ResponseWriter, r *http.Request) {
 	mgr := s.fileManager()
 	res, err := mgr.Search(r.Context(), req.Path, req.Query, req.Mode, req.Limit)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	ok(w, res)
@@ -745,13 +964,13 @@ type fileReplaceReq struct {
 func (s *Server) handleFileReplace(w http.ResponseWriter, r *http.Request) {
 	var req fileReplaceReq
 	if err := decode(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	mgr := s.fileManager()
 	n, err := mgr.ReplaceInFile(req.Path, req.Find, req.Replace, req.All)
 	if err != nil {
-		fail(w, http.StatusBadRequest, err.Error())
+		failFileErr(w, err)
 		return
 	}
 	s.audit(r, "file_replace", req.Path,

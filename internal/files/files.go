@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -171,6 +172,9 @@ type Entry struct {
 	SymlinkTarget string `json:"symlink_target"`
 	// ReadOnly 表示当前用户对该项没有写权限
 	ReadOnly bool `json:"read_only"`
+	// Sensitive 表示这一项落在"敏感目录"里（如面板数据目录：SQLite 库、
+	// 凭据文件）。面板仍允许读写它，但界面要打标记并在覆盖/删除前二次确认。
+	Sensitive bool `json:"sensitive,omitempty"`
 }
 
 // ListResult 是一次目录列举的结果。
@@ -179,6 +183,11 @@ type ListResult struct {
 	Parent  string   `json:"parent"`
 	Entries []Entry  `json:"entries"`
 	Roots   []string `json:"roots"`
+	// RootKinds 给每个根目录标一个用途（www/home/panel/homebrew/volume/other），
+	// 供前端「位置」下拉分组。值与 Roots 里的路径一一对应。
+	RootKinds map[string]string `json:"root_kinds,omitempty"`
+	// SensitiveRoots 是需要特别当心的目录（面板数据目录：库与凭据）。
+	SensitiveRoots []string `json:"sensitive_roots,omitempty"`
 	// Writable 表示该目录是否可写
 	Writable bool `json:"writable"`
 	Total    int  `json:"total"`
@@ -561,6 +570,121 @@ func copyPath(src, dst string) error {
 	defer func() { _ = out.Close() }()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// MoveStrategy 描述一次移动**实际**采用的方式，前端据此如实告诉用户
+// "同卷重命名"还是"跨卷复制后删除"（两者的语义/风险不同，不能合成一句"已移动"）。
+type MoveStrategy string
+
+const (
+	// MoveStrategyNone：源与目标相同，什么都没做。
+	MoveStrategyNone MoveStrategy = "none"
+	// MoveStrategyRename：同卷 os.Rename（原子、瞬时，不复制数据）。
+	MoveStrategyRename MoveStrategy = "rename"
+	// MoveStrategyCopyDelete：跨卷回退 —— 复制整棵树到目标，成功后删除源。
+	MoveStrategyCopyDelete MoveStrategy = "copy+delete"
+)
+
+// 冲突处理策略（与上传的 on_conflict 语义对齐）。
+const (
+	// MoveConflictRename 目标已存在时自动改名（-1/-2…），两个都保留。
+	MoveConflictRename = "rename"
+	// MoveConflictOverwrite 覆盖目标（先删目标再移入）。破坏性，必须由用户显式选择。
+	MoveConflictOverwrite = "overwrite"
+	// MoveConflictSkip 目标已存在时跳过这一项。
+	MoveConflictSkip = "skip"
+)
+
+// MoveResult 是一次移动的结果。
+type MoveResult struct {
+	From string       `json:"from"`
+	To   string       `json:"to"`
+	Way  MoveStrategy `json:"way"`
+	// Skipped 为 true 表示按用户选择跳过了（目标已存在）。
+	Skipped bool `json:"skipped,omitempty"`
+	// Overwritten 为 true 表示确实删掉了目标处的原有内容再移入。
+	Overwritten bool `json:"overwritten,omitempty"`
+}
+
+// renameFunc 是 os.Rename 的注入点。
+//
+// 变量而不是直接调 os.Rename：跨卷回退（EXDEV → 复制后删除）是移动语义里最容易
+// 写错的一条分支，而单测环境里所有临时目录都在同一卷上，根本触发不到 EXDEV。
+// 测试注入一个"永远返回 EXDEV"的实现就能真正跑到那条分支。
+var renameFunc = os.Rename
+
+// Move 移动文件或目录（剪切粘贴用它）。
+//
+// 语义（按顺序）：
+//  1. 源与目标相同 → 直接返回 "none"；
+//  2. 目标已存在 → 按 onConflict 处理：skip 跳过 / overwrite 先删目标再移入 /
+//     其它（默认）自动改名保留两者。**绝不静默覆盖**。
+//  3. 先试 os.Rename（同卷：原子且不复制数据）；
+//  4. Rename 报 EXDEV（跨卷）才回退到 copy + delete，并在结果里如实标记方式。
+//
+// 失败时的清理：跨卷复制阶段失败会把可能写了一半的目标删掉，避免留下一个
+// "看起来成功、其实残缺"的副本；删除源失败时明确报出"已复制但源没删掉"。
+func (m *Manager) Move(from, to, onConflict string) (*MoveResult, error) {
+	src, err := m.Resolve(from, false)
+	if err != nil {
+		return nil, err
+	}
+	dst, err := m.Resolve(to, true)
+	if err != nil {
+		return nil, err
+	}
+	if src == dst {
+		return &MoveResult{From: src, To: dst, Way: MoveStrategyNone}, nil
+	}
+	// 不允许把目录移进它自己的子目录（会失败并可能损坏数据）
+	if strings.HasPrefix(dst, src+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("不能把目录移动到它自己的子目录中")
+	}
+
+	res := &MoveResult{From: src, To: dst}
+	if _, statErr := os.Lstat(dst); statErr == nil {
+		switch strings.ToLower(strings.TrimSpace(onConflict)) {
+		case MoveConflictSkip:
+			res.Skipped = true
+			res.Way = MoveStrategyNone
+			return res, nil
+		case MoveConflictOverwrite:
+			// 覆盖 = 删掉目标原有内容。绝不能把白名单根目录本身删掉。
+			for _, root := range m.roots {
+				if dst == root {
+					return nil, fmt.Errorf("不允许覆盖根目录: %s", root)
+				}
+			}
+			if err := os.RemoveAll(dst); err != nil {
+				return nil, fmt.Errorf("覆盖目标失败: %w", err)
+			}
+			res.Overwritten = true
+		default:
+			res.To = uniquePath(dst)
+			dst = res.To
+		}
+	}
+
+	if err := renameFunc(src, dst); err == nil {
+		res.Way = MoveStrategyRename
+		m.chownRealUser(dst)
+		return res, nil
+	} else if !errors.Is(err, syscall.EXDEV) {
+		return nil, fmt.Errorf("移动失败: %w", err)
+	}
+
+	// 跨卷：Rename 无法跨设备，回退为复制后删除。
+	if err := copyPath(src, dst); err != nil {
+		_ = os.RemoveAll(dst) // 清掉写了一半的目标，别留下残缺副本
+		return nil, fmt.Errorf("跨卷移动失败（复制阶段）: %w", err)
+	}
+	if err := os.RemoveAll(src); err != nil {
+		return nil, fmt.Errorf("跨卷移动：内容已复制到 %s，但删除源 %s 失败（源仍在，请手动清理）: %w",
+			dst, src, err)
+	}
+	res.Way = MoveStrategyCopyDelete
+	m.chownRealUser(dst)
+	return res, nil
 }
 
 // Chmod 修改权限。

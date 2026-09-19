@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
@@ -1046,6 +1047,9 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		//（brew 不可用/超时）。这时列表里的 installed=false 只代表"没查成"，
 		// 前端必须如实标出来，而不是让用户以为东西真的没装（铁律 11）。
 		"brew_probe_ok": brewProbeOK,
+		// 失败时的**真实原因**（brew 的 stderr 尾部 / 超时标志 / sudo 是怎么跑的）。
+		// 只给"未能复核"而不给原因，等于把排查起点也一起藏了（2026-09-19 用户报障）。
+		"brew_probe_error": marketProbeErrorForAPI(),
 		// sections 是市场板块的**顺序与中文名**（services.MarketSections）。
 		// 前端按它渲染板块标题，自己不再写一份分类中文名 ——
 		// 用户要求「其它」改名「基础环境」，改名只改 catalog.go 一处。
@@ -1853,8 +1857,27 @@ func (s *Server) brewVersions(ctx context.Context) map[string]string {
 	return vers
 }
 
+// marketProbeErr 保存"上一次复核本机已装 Homebrew 包"失败的**真实原因**（包级，带时间）。
+//
+// 为什么不放进 Server 结构体：Server 定义在 server.go（那个文件的改动线多），而这份信息
+// 只服务市场列表的"如实降级"展示；单实例面板下包级变量足够，也不扩大结构体。
+var (
+	marketProbeErrMu sync.Mutex
+	marketProbeErr   string
+)
+
+// marketProbeErrorForAPI 把上次的失败原因给前端（成功时是空串）。
+//
+// 2026-09-19 用户报障「未能复核已装软件」**始终显示**：界面只给了一句"brew 不可用或超时"，
+// 真实原因（brew 的 stderr / 超时 / sudo 被拒）在服务端被丢掉了，用户与我们都无从下手。
+func marketProbeErrorForAPI() string {
+	marketProbeErrMu.Lock()
+	defer marketProbeErrMu.Unlock()
+	return marketProbeErr
+}
+
 func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, map[string]string, bool) {
-	vers, ok := s.svcManager().InstalledFormulaVersions(ctx)
+	vers, err := s.svcManager().InstalledFormulaVersionsErr(ctx)
 	if vers == nil {
 		vers = map[string]string{}
 	}
@@ -1862,7 +1885,14 @@ func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, m
 	for f := range vers {
 		set[f] = true
 	}
-	return set, vers, ok
+	marketProbeErrMu.Lock()
+	if err != nil {
+		marketProbeErr = err.Error()
+	} else {
+		marketProbeErr = ""
+	}
+	marketProbeErrMu.Unlock()
+	return set, vers, err == nil
 }
 
 // InvalidateMarketCache 让市场缓存立刻失效（安装/卸载任务结束后调用）。

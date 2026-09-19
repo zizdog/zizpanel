@@ -19,10 +19,20 @@ import { registerCleanup } from './app.js';
 // 两边漂移会让"本地通过、服务端拒收"重现，所以有测试锁死这两个数字相等。
 const MAX_UPLOAD = 4 * 1024 * 1024 * 1024;
 
+// 显示隐藏文件的状态记在 localStorage（刷新/切换板块后保持）。默认关闭。
+const SHOW_HIDDEN_KEY = 'zp-files-show-hidden';
+
 let cwd = '';
-let showHidden = false;
+let showHidden = readLS(SHOW_HIDDEN_KEY) === '1';
 let selection = new Set();
 let lastList = null;
+// selAnchor 是 Shift 范围选择在**当前可见顺序**里的锚点索引。
+let selAnchor = -1;
+// visibleEntries 是最近一次渲染的可见条目顺序（键盘/范围选择都用它）。
+let visibleEntries = [];
+// clipboard = { mode: 'copy' | 'cut', paths: string[] }
+// 只在内存里（不写 localStorage）：剪贴板内容是易失的，刷新页面后失效最不意外。
+let clipboard = null;
 // 当前打开的编辑器窗口（同一时刻最多一个）。**全局存活**：切换路由时不清除，
 // 只有用户点 ✕ / 菜单「关闭编辑器」才会被 dispose（见 createEditorWindow 的 onClosed）。
 let activeEditor = null;
@@ -30,11 +40,13 @@ let activeEditor = null;
 export function FilesView(content, ctx = {}) {
   clear(content);
   selection = new Set();
+  selAnchor = -1;
+  visibleEntries = [];
 
   const crumbs = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', fontSize: '13px' } });
   const toolbar = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } });
   const tableBox = h('div', { style: { overflowX: 'auto', minHeight: '260px' } });
-  const statusBar = h('div', { style: { fontSize: '12px', color: 'var(--text-mute)', padding: '8px 14px', borderTop: '1px solid var(--border-soft)' } });
+  const statusBar = h('div.files-status', { style: { fontSize: '12px', color: 'var(--text-mute)', padding: '8px 14px', borderTop: '1px solid var(--border-soft)' } });
 
   const fileInput = h('input', {
     type: 'file', multiple: true, style: { display: 'none' },
@@ -155,6 +167,7 @@ export function FilesView(content, ctx = {}) {
   async function load(path) {
     if (path) cwd = path;
     selection = new Set();
+    selAnchor = -1;
     clear(tableBox);
     appendAll(tableBox, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取目录…' })]));
     try {
@@ -174,20 +187,102 @@ export function FilesView(content, ctx = {}) {
     renderTable();
   }
 
+  // ---------- 位置下拉：常用 / 磁盘与卷 ----------
+  //
+  // 根目录集合由后端下发（lastList.roots），并带 root_kinds 标出用途。
+  // 下拉只列"没有被别的根包含"的根（/opt/zizpanel/data 在 /opt/zizpanel 之下，
+  // 就不重复列），末尾固定一条「🖥 管理磁盘…」跳到已存在的 #/disks 页。
+  function rootKind(r) {
+    return (lastList && lastList.root_kinds && lastList.root_kinds[r]) || 'other';
+  }
+
+  function rootLabel(r) {
+    switch (rootKind(r)) {
+      case 'www': return 'www 目录';
+      case 'home': return '用户目录';
+      case 'panel': return '/opt/zizpanel（面板安装根）';
+      case 'homebrew': return '/opt/homebrew/etc';
+      case 'volume': return r.replace(/^\/Volumes\//, '') + '（' + r + '）';
+      default: return r;
+    }
+  }
+
+  // dropdownRoots 去掉被其它根包含的子根，但**命名根**（www/用户/安装根/homebrew/卷）
+  // 即使嵌在别的根里也保留 —— 网站根目录就在用户目录之下，不能因为它被折叠掉。
+  function dropdownRoots() {
+    const roots = lastList?.roots || [];
+    const named = new Set(['www', 'home', 'panel', 'homebrew', 'volume']);
+    return roots.filter((r) => {
+      const kind = rootKind(r);
+      if (kind === 'data') return false; // 面板数据目录从安装根进去即可，不重复列
+      if (named.has(kind)) return true;
+      return !roots.some((o) => o !== r && r.startsWith(o + '/'));
+    });
+  }
+
+  // bestRoot 取"最长匹配"的根（面包屑与下拉定位都用它，避免子根被父根盖住）。
+  function bestRoot(p) {
+    const roots = lastList?.roots || [];
+    let best = '';
+    for (const r of roots) {
+      if ((p === r || p.startsWith(r + '/')) && r.length > best.length) best = r;
+    }
+    return best;
+  }
+
+  function locationSelect() {
+    const roots = lastList?.roots || [];
+    const listed = dropdownRoots();
+    const cur = bestRoot(cwd);
+    // 当前目录若落在"被折叠的子根"里，用它的祖先根作为下拉的选中值。
+    const curListed = listed.includes(cur) ? cur : listed.filter((r) => cur.startsWith(r + '/')).sort((a, b) => b.length - a.length)[0] || cur;
+
+    const groups = { common: [], volume: [], other: [] };
+    for (const r of listed) {
+      const k = rootKind(r);
+      if (k === 'volume') groups.volume.push(r);
+      else if (k === 'www' || k === 'home' || k === 'panel' || k === 'homebrew') groups.common.push(r);
+      else groups.other.push(r);
+    }
+    const order = { www: 0, home: 1, panel: 2, homebrew: 3, other: 9 };
+    groups.common.sort((a, b) => (order[rootKind(a)] ?? 9) - (order[rootKind(b)] ?? 9));
+
+    const opt = (r) => h('option', { value: r, text: rootLabel(r) });
+    const optgroup = (label, rs) => (rs.length
+      ? h('optgroup', { label }, rs.map(opt))
+      : null);
+
+    const sel = h('select.select', {
+      title: '位置：常用目录 / 磁盘与卷',
+      style: { width: 'auto', maxWidth: '260px', padding: '3px 26px 3px 8px', fontSize: '12.5px' },
+      onchange: (e) => {
+        if (e.target.value === '__disks__') {
+          e.target.value = curListed;
+          location.hash = '#/disks';
+          return;
+        }
+        if (e.target.value) load(e.target.value);
+      },
+    }, [
+      optgroup('常用', groups.common),
+      optgroup('磁盘与卷', groups.volume),
+      optgroup('其它位置', groups.other),
+      h('option', { value: '__disks__', text: '🖥 管理磁盘…' }),
+    ]);
+    sel.value = curListed;
+    return sel;
+  }
+
   function renderCrumbs() {
     clear(crumbs);
     const roots = lastList?.roots || [];
-    const root = roots.find((r) => cwd === r || cwd.startsWith(r + '/'));
+    const root = bestRoot(cwd);
     const parts = [];
 
-    // 根目录选择器（有多个白名单根时显示下拉）
-    if (roots.length > 1) {
-      const sel = h('select.select', {
-        style: { width: 'auto', padding: '3px 26px 3px 8px', fontSize: '12.5px' },
-        onchange: (e) => load(e.target.value),
-      }, roots.map((r) => h('option', { value: r, text: r, selected: r === root })));
-      parts.push(sel, h('span', { style: { color: 'var(--text-mute)' }, text: '/' }));
-    }
+    // 位置下拉：始终显示（哪怕只有一个根，也要能一键跳到磁盘页）
+    parts.push(locationSelect());
+    parts.push(h('span', { style: { color: 'var(--text-mute)' }, text: '/' }));
+
     if (root) {
       const rel = cwd.slice(root.length).replace(/^\//, '');
       const segs = rel ? rel.split('/') : [];
@@ -204,6 +299,14 @@ export function FilesView(content, ctx = {}) {
       });
     } else {
       parts.push(h('span', { text: cwd }));
+    }
+    // 可访问范围：悬停可见（roots 少时直接列出来也占地方）
+    if (roots.length) {
+      parts.push(h('span.pill', {
+        text: `可访问 ${roots.length} 个位置`,
+        title: '允许访问的范围：\n' + roots.join('\n'),
+        style: { cursor: 'help' },
+      }));
     }
     appendAll(crumbs, ...parts);
     // 父目录按钮
@@ -262,32 +365,98 @@ export function FilesView(content, ctx = {}) {
     else openEditor(entry);
   }
 
+  // ---------- 图片查看器（原图 + 上一张/下一张 + 缩放） ----------
+  //
+  // 用户要求"点开图片走内置查看器"。看图的真实需求是**在同目录的一组图之间翻页**
+  // 与放大看细节，所以这里不是单图弹窗：它把当前目录里所有图片组成一个列表，
+  // 支持 ←/→ 翻页、+/- 缩放、0 复位。非图片仍然走文本编辑器（见 openAny）。
   function previewImage(entry) {
-    const url = api.fileDownloadURL(entry.path);
+    const images = (lastList?.entries || []).filter(isImage);
+    let idx = images.findIndex((x) => x.path === entry.path);
+    if (idx < 0) { images.unshift(entry); idx = 0; }
+    let scale = 1;
+
+    const img = h('img', {
+      alt: '',
+      style: { display: 'block', margin: '0 auto', maxWidth: '100%', borderRadius: '6px', background: 'var(--panel-2)', transformOrigin: 'center center' },
+      onerror: () => toast('图片加载失败（可能不是浏览器支持的格式）', 'warn', 8000),
+    });
+    const caption = h('div.hint', { style: { marginTop: '8px', textAlign: 'center' } });
+    const zoomLabel = h('span.pill', { text: '100%' });
+    const stage = h('div.zp-imgview-stage', [img]);
+    const nav = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', justifyContent: 'center', marginTop: '8px' } });
+
+    function applyZoom() {
+      img.style.transform = `scale(${scale})`;
+      img.style.cursor = scale > 1 ? 'grab' : 'default';
+      zoomLabel.textContent = Math.round(scale * 100) + '%';
+    }
+    function show(i) {
+      idx = (i + images.length) % images.length;
+      const e = images[idx];
+      scale = 1; applyZoom();
+      img.style.width = '';
+      img.src = api.fileDownloadURL(e.path);
+      img.alt = e.name;
+      caption.textContent = `${e.name} · ${humanSize(e.size)} · 第 ${idx + 1}/${images.length} 张`;
+    }
+
+    function onKey(ev) {
+      if (ev.key === 'ArrowLeft') { ev.preventDefault(); show(idx - 1); }
+      else if (ev.key === 'ArrowRight') { ev.preventDefault(); show(idx + 1); }
+      else if (ev.key === '+' || ev.key === '=') { ev.preventDefault(); scale = Math.min(6, scale + 0.25); applyZoom(); }
+      else if (ev.key === '-') { ev.preventDefault(); scale = Math.max(0.25, scale - 0.25); applyZoom(); }
+      else if (ev.key === '0') { ev.preventDefault(); scale = 1; applyZoom(); }
+    }
+    document.addEventListener('keydown', onKey);
+
+    appendAll(nav,
+      h('button.btn.btn-sm', { text: '◀ 上一张', disabled: images.length < 2, onclick: () => show(idx - 1) }),
+      h('button.btn.btn-sm', { text: '下一张 ▶', disabled: images.length < 2, onclick: () => show(idx + 1) }),
+      h('span', { style: { width: '10px' } }),
+      h('button.btn.btn-sm', { text: '－ 缩小', onclick: () => { scale = Math.max(0.25, scale - 0.25); applyZoom(); } }),
+      zoomLabel,
+      h('button.btn.btn-sm', { text: '＋ 放大', onclick: () => { scale = Math.min(6, scale + 0.25); applyZoom(); } }),
+      h('button.btn.btn-sm', { text: '复位', onclick: () => { scale = 1; applyZoom(); } }),
+    );
+
     const m = modal({
-      title: '🖼️ ' + entry.name,
+      title: '🖼️ 图片查看器',
       wide: true,
-      body: h('div', { style: { textAlign: 'center' } }, [
-        h('img', {
-          src: url, alt: entry.name,
-          style: { maxWidth: '100%', maxHeight: '68vh', borderRadius: '6px', background: 'var(--panel-2)' },
-          onerror: () => toast('图片加载失败（可能不是浏览器支持的格式）', 'warn', 8000),
-        }),
-        h('div.hint', { style: { marginTop: '8px' }, text: `${humanSize(entry.size)} · ${entry.path}` }),
+      body: h('div', [
+        stage,
+        caption,
+        nav,
+        h('div.hint', { style: { textAlign: 'center', marginTop: '4px' },
+          text: '快捷键：← / → 切换上一张下一张，+ / - 缩放，0 复位' }),
       ]),
       footer: () => [
-        h('button.btn', { text: '下载', onclick: () => { window.location.href = url; } }),
-        h('button.btn', { text: '仍然用文本编辑器打开', onclick: () => { m.close(); openEditor(entry); } }),
+        h('button.btn', { text: '下载原图', onclick: () => { window.location.href = api.fileDownloadURL(images[idx].path); } }),
+        h('button.btn', { text: '用文本编辑器打开', onclick: () => { m.close(); openEditor(images[idx]); } }),
         h('button.btn.btn-primary', { text: '关闭', onclick: () => m.close() }),
       ],
+      onClose: () => document.removeEventListener('keydown', onKey),
     });
+    show(idx);
+  }
+
+  // wwwRoot 返回网站根目录（kind=www 的根），找不到就退回第一个根。
+  function wwwRoot() {
+    const roots = lastList?.roots || [];
+    return roots.find((r) => rootKind(r) === 'www') || roots[0] || '';
   }
 
   function renderToolbar() {
     clear(toolbar);
     const selCount = selection.size;
+    const clip = clipboard && clipboard.paths.length ? clipboard : null;
     appendAll(toolbar, 
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: () => load(cwd) }),
+      h('button.btn.btn-sm', {
+        text: '🌐 www 目录',
+        title: '一键回到网站根目录',
+        onclick: () => { const w = wwwRoot(); if (w) load(w); },
+      }),
       h('button.btn.btn-sm', { text: '⬆ 上传', onclick: () => fileInput.click() }),
       h('button.btn.btn-sm', { text: '⬆ 上传文件夹', onclick: () => folderInput.click() }),
       h('button.btn.btn-sm', {
@@ -312,15 +481,28 @@ export function FilesView(content, ctx = {}) {
           } catch (e) { toast(e.message, 'err'); }
         },
       }),
-      h('label', { style: { display: 'flex', gap: '5px', alignItems: 'center', fontSize: '12.5px', cursor: 'pointer' } }, [
+      h('label', {
+        style: { display: 'flex', gap: '5px', alignItems: 'center', fontSize: '12.5px', cursor: 'pointer' },
+        title: '只影响列表显示，不是安全边界：知道完整路径仍可直接访问（服务端按可访问范围校验）',
+      }, [
         h('input', {
           type: 'checkbox', checked: showHidden,
-          onchange: (e) => { showHidden = e.target.checked; load(cwd); },
+          onchange: (e) => {
+            showHidden = e.target.checked;
+            try { localStorage.setItem(SHOW_HIDDEN_KEY, showHidden ? '1' : '0'); } catch { /* 存不了就本次生效 */ }
+            load(cwd);
+          },
         }),
         h('span', { text: '显示隐藏文件' }),
       ]),
-      selCount > 0 ? h('div', { style: { flex: 1 } }) : h('div', { style: { flex: 1 } }),
+      h('div', { style: { flex: 1 } }),
       selCount > 0 ? h('span.pill.brand', { text: `已选 ${selCount} 项` }) : null,
+      // 剪贴板状态与粘贴入口：用户按了 Ctrl+C/X 之后要能一眼看到"剪贴板里有什么"。
+      clip ? h('button.btn.btn-sm', {
+        text: `📋 粘贴 ${clip.paths.length} 项${clip.mode === 'cut' ? '（剪切）' : '（复制）'}`,
+        title: '粘贴到当前目录（Ctrl+V）',
+        onclick: pasteClipboard,
+      }) : null,
       // 两个"压缩"必须一眼分得清：这里是**打包**（zip/tar 归档），
       // 「🖼️ 图片压缩」是图片体积优化（另一件事，用 libvips）。
       h('button.btn.btn-sm', {
@@ -338,6 +520,7 @@ export function FilesView(content, ctx = {}) {
     clear(tableBox);
     const list = lastList?.entries || [];
     if (!list.length) {
+      visibleEntries = [];
       appendAll(tableBox, h('div.empty', [
         h('div.big', { text: '📂' }),
         h('h4', { text: '这个目录是空的' }),
@@ -347,14 +530,18 @@ export function FilesView(content, ctx = {}) {
       return;
     }
 
-    const allChecked = list.every((e) => selection.has(e.path));
+    const ordered = sortedEntries(list);
+    visibleEntries = ordered;
+    const allChecked = ordered.length > 0 && ordered.every((e) => selection.has(e.path));
     const head = h('tr', [
       h('th', { style: { width: '34px' } }, [
         h('input', {
           type: 'checkbox', checked: allChecked,
+          title: '全选 / 取消全选（Ctrl+A）',
           onchange: (e) => {
             selection.clear();
-            if (e.target.checked) list.forEach((x) => selection.add(x.path));
+            if (e.target.checked) ordered.forEach((x) => selection.add(x.path));
+            selAnchor = -1;
             renderToolbar(); renderTable();
           },
         }),
@@ -367,14 +554,34 @@ export function FilesView(content, ctx = {}) {
       h('th', { text: '操作' }),
     ]);
 
-    const rows = sortedEntries(list).map((e) => {
+    const rows = ordered.map((e, idx) => {
       const selected = selection.has(e.path);
       return h('tr', {
+        class: selected ? 'zp-row-selected' : '',
         style: selected ? { background: 'var(--brand-soft)' } : {},
-        // 双击行 = 打开（目录进入 / 文件编辑或预览）；单击仍然是勾选/点链接。
+        // 单击 = 选择（Ctrl/⌘ 切换、Shift 范围），双击 = 打开。
         // 这是所有文件管理器的通用肌肉记忆，之前只有"编辑"按钮能点。
+        onclick: (ev) => {
+          if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.closest('button, a, input'))) return;
+          if (ev.shiftKey && selAnchor >= 0) {
+            selectRange(selAnchor, idx);
+          } else if (ev.ctrlKey || ev.metaKey) {
+            if (selection.has(e.path)) selection.delete(e.path); else selection.add(e.path);
+            selAnchor = idx;
+          } else {
+            selection = new Set([e.path]);
+            selAnchor = idx;
+          }
+          renderToolbar(); renderTable();
+        },
+        // 右键：文件/文件夹行的上下文菜单（按类型禁用不适用项）
+        oncontextmenu: (ev) => {
+          ev.preventDefault();
+          if (!selection.has(e.path)) { selection = new Set([e.path]); selAnchor = idx; renderToolbar(); renderTable(); }
+          rowContextMenu(ev.clientX, ev.clientY, e);
+        },
         ondblclick: (ev) => {
-          if (ev.target && ev.target.tagName === 'INPUT') return; // 别抢勾选框
+          if (ev.target && ev.target.closest('input')) return; // 别抢勾选框
           if (e.is_dir) load(e.path); else openAny(e);
         },
       }, [
@@ -383,6 +590,7 @@ export function FilesView(content, ctx = {}) {
             type: 'checkbox', checked: selected,
             onchange: (ev) => {
               if (ev.target.checked) selection.add(e.path); else selection.delete(e.path);
+              selAnchor = idx;
               renderToolbar(); renderTable();
             },
           }),
@@ -397,11 +605,15 @@ export function FilesView(content, ctx = {}) {
               })
               : h('a', {
                 href: 'javascript:void(0)', text: e.name,
-                title: isImage(e) ? '点击预览' : '点击编辑（双击也可以）',
+                title: isImage(e) ? '点击查看' : '点击编辑（双击也可以）',
                 onclick: () => openAny(e),
               }),
             e.symlink ? h('span.pill', { text: '链接', title: '指向 ' + (e.symlink_target || '?') }) : null,
             e.read_only ? h('span.pill.warn', { text: '只读' }) : null,
+            e.sensitive ? h('span.pill.danger', {
+              text: '敏感',
+              title: '面板数据目录（数据库与凭据）。仍可读写，但覆盖/删除前会二次确认。',
+            }) : null,
           ]),
         ]),
         h('td.num', { text: e.is_dir ? '—' : humanSize(e.size) }),
@@ -413,7 +625,7 @@ export function FilesView(content, ctx = {}) {
             e.is_dir
               ? h('button.btn.btn-sm', { text: '打开', onclick: () => load(e.path) })
               : h('button.btn.btn-sm', {
-                text: isImage(e) ? '预览' : '编辑',
+                text: isImage(e) ? '查看' : '编辑',
                 onclick: () => openAny(e),
               }),
             h('button.btn.btn-sm', {
@@ -421,14 +633,120 @@ export function FilesView(content, ctx = {}) {
               disabled: e.is_dir,
               onclick: () => { window.location.href = api.fileDownloadURL(e.path); },
             }),
-            h('button.btn.btn-sm', { text: '⋯', title: '更多操作', onclick: () => moreMenu(e) }),
+            h('button.btn.btn-sm', { text: '⋯', title: '更多操作（右键也可以）', onclick: () => moreMenu(e) }),
           ]),
         ]),
       ]);
     });
 
     appendAll(tableBox, h('table.table', [h('thead', [head]), h('tbody', rows)]));
+    // 点空白处取消选择 / 右键空白处出菜单：挂在 tableBox 的**外层**（.card-body），
+    // 因为表格本身会把 tableBox 撑满，表格下方/右侧的留白属于外层容器。
+    const blankHost = tableBox.parentElement || tableBox;
+    blankHost.onclick = (ev) => {
+      if (ev.target && ev.target.closest('tr')) return;
+      if (!selection.size) return;
+      selection = new Set();
+      selAnchor = -1;
+      renderToolbar(); renderTable();
+    };
+    blankHost.oncontextmenu = (ev) => {
+      if (ev.target && ev.target.closest('tr')) return; // 行菜单优先
+      ev.preventDefault();
+      blankContextMenu(ev.clientX, ev.clientY);
+    };
     updateStatus();
+  }
+
+  // selectRange 把 [a,b] 区间加入选择（按当前可见顺序）。
+  function selectRange(a, b) {
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const next = new Set();
+    for (let i = lo; i <= hi && i < visibleEntries.length; i++) next.add(visibleEntries[i].path);
+    selection = next;
+  }
+
+  // ---------- 右键菜单 ----------
+  //
+  // 自己起一层 .zp-ctx-menu（而不是 modal）：右键菜单要贴着鼠标、点别处就消失。
+  let openCtxMenu = null;
+
+  function closeContextMenu() {
+    if (openCtxMenu) { openCtxMenu.remove(); openCtxMenu = null; }
+  }
+
+  function showContextMenu(x, y, items) {
+    closeContextMenu();
+    const menu = h('div.zp-ctx-menu');
+    for (const it of items) {
+      if (!it) continue;
+      if (it.sep) { menu.appendChild(h('div.zp-ctx-sep')); continue; }
+      if (it.disabled) {
+        menu.appendChild(h('div.zp-ctx-item.zp-ctx-disabled', { text: it.label }));
+        continue;
+      }
+      menu.appendChild(h('button.zp-ctx-item', {
+        type: 'button', text: it.label,
+        onclick: () => { closeContextMenu(); try { it.run(); } catch (e) { toast('操作失败：' + ((e && e.message) || e), 'err'); } },
+      }));
+    }
+    menu.style.visibility = 'hidden';
+    document.body.appendChild(menu);
+    const r = menu.getBoundingClientRect();
+    menu.style.left = Math.max(6, Math.min(x, window.innerWidth - r.width - 6)) + 'px';
+    menu.style.top = Math.max(6, Math.min(y, window.innerHeight - r.height - 6)) + 'px';
+    menu.style.visibility = '';
+    openCtxMenu = menu;
+  }
+
+  // rowContextMenu 是文件/文件夹行的右键菜单，按条目类型禁用不适用项。
+  function rowContextMenu(x, y, e) {
+    const paths = selection.has(e.path) && selection.size > 1 ? [...selection] : [e.path];
+    const multi = paths.length > 1;
+    const target = multi ? paths : e.path;
+    const archive = !e.is_dir && /\.(zip|tar\.gz|tgz|tar)$/i.test(e.name);
+    const hasDirs = (lastList?.entries || []).some((x2) => selection.has(x2.path) && x2.is_dir);
+
+    const items = [
+      {
+        label: e.is_dir ? '打开' : (isImage(e) ? '查看' : '编辑'),
+        run: () => (e.is_dir ? load(e.path) : openAny(e)),
+      },
+      !e.is_dir && !isImage(e) ? { label: '用编辑器打开', run: () => openEditor(e) } : null,
+      { label: '下载', disabled: e.is_dir || multi, run: () => { window.location.href = api.fileDownloadURL(e.path); } },
+      archive ? { label: '解压到当前目录', run: () => extractEntry(e) } : null,
+      { sep: true },
+      { label: '重命名' + (multi ? '（仅单项）' : ''), disabled: multi, run: () => renameEntry(e) },
+      { label: '复制（Ctrl+C）', run: () => copySelection(paths) },
+      { label: '剪切（Ctrl+X）', run: () => cutSelection(paths) },
+      {
+        label: '粘贴（Ctrl+V）',
+        disabled: !(clipboard && clipboard.paths.length),
+        run: pasteClipboard,
+      },
+      { label: '压缩…', run: () => { if (!selection.has(e.path)) selection = new Set([e.path]); compressSelected(); } },
+      { label: '权限…', disabled: multi, run: () => chmodModal(e) },
+      { sep: true },
+      { label: '复制完整路径', run: () => copyFullPath(e.path) },
+      { label: '删除' + (multi ? ` ${paths.length} 项` : ''), run: () => (multi || hasDirs || e.is_dir ? deleteSelectionOrOne(e, paths) : deleteOne(e)) },
+    ];
+    showContextMenu(x, y, items);
+  }
+
+  // blankContextMenu 是空白处的右键菜单。
+  function blankContextMenu(x, y) {
+    showContextMenu(x, y, [
+      { label: '刷新', run: () => load(cwd) },
+      { sep: true },
+      { label: '新建文件夹…', run: () => toolbarNew('dir') },
+      { label: '新建文件…', run: () => toolbarNew('file') },
+      { label: '上传文件…', run: () => fileInput.click() },
+      { label: '上传文件夹…', run: () => folderInput.click() },
+      { sep: true },
+      { label: '粘贴（Ctrl+V）', disabled: !(clipboard && clipboard.paths.length), run: pasteClipboard },
+      { label: `全选（${visibleEntries.length} 项）`, disabled: !visibleEntries.length, run: selectAll },
+      { label: showHidden ? '隐藏点文件' : '显示隐藏文件', run: () => toggleHidden() },
+    ]);
   }
 
   function updateStatus() {
@@ -482,21 +800,11 @@ export function FilesView(content, ctx = {}) {
       },
     });
     const chmod = h('button.btn.btn-block', {
-      text: '修改权限',
-      onclick: async () => {
+      text: '权限…',
+      title: '修改该文件/目录的读/写/执行权限（宝塔式勾选界面）',
+      onclick: () => {
         m.close();
-        const mode = await promptBox({
-          title: '修改权限', label: '八进制权限', value: String(e.mode_num.toString(8)).padStart(3, '0'),
-          hint: '例如 644（文件）、755（目录/可执行）',
-        });
-        if (!mode) return;
-        const recursive = (await confirmBox('是否同时递归修改该目录下的所有内容？', {
-          title: '递归修改权限', okText: '递归修改',
-        }));
-        try {
-          const r = await api.fileChmod(e.path, mode, e.is_dir && recursive);
-          toast(r.msg || '权限已修改', 'ok'); load(cwd);
-        } catch (err) { toast(err.message, 'err'); }
+        chmodModal(e);
       },
     });
     const del = h('button.btn.btn-danger.btn-block', {
@@ -508,6 +816,10 @@ export function FilesView(content, ctx = {}) {
     });
 
     const buttons = [rename, copy, move, chmod];
+    // 剪贴板入口（与 Ctrl+C / Ctrl+X 等价）
+    buttons.splice(1, 0,
+      h('button.btn.btn-block', { text: '复制', onclick: () => { m.close(); copySelection([e.path]); } }),
+      h('button.btn.btn-block', { text: '剪切', onclick: () => { m.close(); cutSelection([e.path]); } }));
     // 归档文件才有解压入口
     if (/\.(zip|tar\.gz|tgz|tar)$/i.test(e.name)) {
       buttons.splice(3, 0, h('button.btn.btn-block', {
@@ -556,8 +868,302 @@ export function FilesView(content, ctx = {}) {
     });
   }
 
+  // ---------- 单项/批量动作（右键菜单、快捷键、工具条共用） ----------
+  //
+  // 这些函数都定义在 FilesView 内部（闭包），所以它们始终读写**当前**这个视图的
+  // cwd / lastList / selection；右键菜单与 Ctrl+C/X/V 调用的就是同一套实现。
+
+  async function renameEntry(e) {
+    const name = await promptBox({ title: '重命名', label: '新名称', value: e.name });
+    if (!name || name === e.name) return;
+    try {
+      await api.fileRename(e.path, `${dirname(e.path)}/${name}`);
+      toast('已重命名', 'ok'); load(cwd);
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  function copySelection(paths) {
+    if (!paths || !paths.length) return;
+    clipboard = { mode: 'copy', paths: [...paths] };
+    toast(`已复制 ${paths.length} 项，到目标目录按 Ctrl+V 粘贴`, 'info', 6000);
+    renderToolbar();
+  }
+
+  function cutSelection(paths) {
+    if (!paths || !paths.length) return;
+    clipboard = { mode: 'cut', paths: [...paths] };
+    toast(`已剪切 ${paths.length} 项，到目标目录按 Ctrl+V 粘贴`, 'info', 6000);
+    renderToolbar();
+  }
+
+  function selectAll() {
+    selection = new Set(visibleEntries.map((e) => e.path));
+    selAnchor = visibleEntries.length ? 0 : -1;
+    renderToolbar(); renderTable();
+  }
+
+  function toggleHidden() {
+    showHidden = !showHidden;
+    try { localStorage.setItem(SHOW_HIDDEN_KEY, showHidden ? '1' : '0'); } catch { /* 本次生效 */ }
+    load(cwd);
+  }
+
+  async function toolbarNew(kind) {
+    const name = await promptBox(kind === 'dir'
+      ? { title: '新建文件夹', label: '文件夹名称', placeholder: '例如 assets' }
+      : { title: '新建文件', label: '文件名', placeholder: '例如 index.php' });
+    if (!name) return;
+    try {
+      if (kind === 'dir') await api.fileMkdir(`${cwd}/${name}`);
+      else await api.fileTouch(`${cwd}/${name}`);
+      toast('已创建', 'ok'); load(cwd);
+    } catch (e) { toast(e.message, 'err'); }
+  }
+
+  function copyFullPath(p) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(p)
+        .then(() => toast('已复制路径：' + p, 'ok', 5000))
+        .catch(() => toast(p, 'warn', 8000));
+    } else {
+      toast(p, 'ok', 8000);
+    }
+  }
+
+  // 解压（走任务中心：大压缩包是分钟级动作，关掉窗口也要能找回进度）
+  async function extractEntry(e) {
+    try {
+      await taskCenter.start({
+        kind: 'file_extract', target: e.path,
+        title: '解压 ' + e.name,
+        start: () => api.fileExtract(e.path, cwd),
+        onDone: (task) => {
+          if (task && task.status && task.status !== 'succeeded') {
+            toast('解压失败：' + (task.error || task.status), 'err', 14000);
+            return;
+          }
+          const r = (task && task.result) || {};
+          toast(r.msg || '已解压到当前目录', 'ok', 9000);
+          load(cwd);
+        },
+      });
+    } catch (err) { toast('解压失败：' + ((err && err.message) || err), 'err', 12000); }
+  }
+
+  // confirmSensitive 对"敏感目录"里的条目追加一道确认。
+  //
+  // 面板数据目录（SQLite 库、凭据）仍然可读写（用户明确要求），但覆盖/删除它
+  // 可能直接让面板起不来 —— 所以单独再问一次，而不是混在普通确认里。
+  async function confirmSensitive(entries, action) {
+    const hit = (entries || []).filter((e) => e && e.sensitive);
+    if (!hit.length) return true;
+    return confirmBox(
+      `⚠️ 涉及 ${hit.length} 项位于**面板数据目录**（数据库与凭据）。\n\n` +
+      `${action}可能让面板无法登录或启动。确定继续？`,
+      { title: '敏感目录确认', danger: true, okText: '我已了解，继续' });
+  }
+
+  // ---------- 粘贴（复制 / 剪切） ----------
+  //
+  // 目标已存在同名项时**必须先问**（保留两者 / 覆盖 / 跳过），绝不静默覆盖。
+  // 剪切走后端 /files/move：同卷是 rename，跨卷回退 copy+delete，结果里带 way。
+  function askPasteConflict(names, total, isCut) {
+    return new Promise((resolve) => {
+      let picked = 'rename';
+      const radios = [
+        { v: 'rename', label: '保留两者（推荐）', desc: '自动改名（如 index-1.php），两个都留着，什么都不丢。' },
+        { v: 'overwrite', label: '覆盖同名项', desc: `用${isCut ? '被剪切的内容' : '复制出来的内容'}替换目标 —— 目标原有内容不可恢复。` },
+        { v: 'skip', label: '跳过同名项', desc: '目标已存在的项不动，只处理不重名的。' },
+      ];
+      const inputs = radios.map((r) => h('input', {
+        type: 'radio', name: 'zp-paste-conflict', value: r.v, checked: r.v === picked,
+        onchange: () => { picked = r.v; },
+      }));
+      const body = h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
+        h('p', { text: `目标目录「${cwd}」里已有 ${names.length} 个同名项（本次共 ${total} 项）：` }),
+        h('ul', { style: { margin: '6px 0 10px 18px', maxHeight: '160px', overflow: 'auto' } },
+          names.slice(0, 50).map((n) => h('li', { text: n }))),
+        ...radios.map((r, i) => h('label', {
+          style: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '8px 10px',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', marginBottom: '8px', cursor: 'pointer' },
+        }, [inputs[i], h('div', [
+          h('div', { style: { fontWeight: '600' }, text: r.label }),
+          h('div', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: r.desc }),
+        ])])),
+      ]);
+      const m = modal({
+        title: '目标已存在同名项',
+        body,
+        footer: [
+          h('button.btn', { text: '取消', onclick: () => { m.close(); resolve(null); } }),
+          h('button.btn.btn-primary', { text: '继续粘贴', onclick: () => { m.close(); resolve(picked); } }),
+        ],
+      });
+    });
+  }
+
+  // uniqueTarget 在目标目录里找一个不冲突的名字。
+  function uniqueTarget(dir, name, taken) {
+    if (!taken.has(name)) return `${dir}/${name}`;
+    const dot = name.lastIndexOf('.');
+    const base = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    for (let i = 1; i < 1000; i++) {
+      const cand = `${base}-${i}${ext}`;
+      if (!taken.has(cand)) return `${dir}/${cand}`;
+    }
+    return `${dir}/${base}-${Date.now()}${ext}`;
+  }
+
+  async function pasteClipboard() {
+    if (!clipboard || !clipboard.paths.length) { toast('剪贴板是空的', 'warn'); return; }
+    const isCut = clipboard.mode === 'cut';
+    // 剪切后粘贴回**同一个目录**是无操作：静默略过，别弹"同名冲突"骚扰用户。
+    const items = clipboard.paths.slice().filter((p) => !(isCut && p === `${cwd}/${basename(p)}`));
+    if (!items.length) {
+      toast(isCut ? '这些项已经在当前目录里' : '没有可粘贴的内容', 'warn');
+      return;
+    }
+    const existing = new Set((lastList?.entries || []).map((e) => e.name));
+    const conflicts = [...new Set(items.map((p) => basename(p)).filter((n) => existing.has(n)))];
+    let strategy = 'rename';
+    if (conflicts.length) {
+      const choice = await askPasteConflict(conflicts, items.length, isCut);
+      if (!choice) return;
+      strategy = choice;
+    }
+
+    const taken = new Set(existing);
+    const okList = [];
+    const renamed = [];
+    const failed = [];
+    let skipped = 0;
+
+    for (const src of items) {
+      const name = basename(src);
+      let dest = `${cwd}/${name}`;
+      // 剪切后粘贴回原目录是无操作；复制到原目录则是"制造一份副本"（走下面的改名分支）。
+      if (isCut && src === dest) { skipped++; continue; }
+      if (taken.has(name) || src === dest) {
+        if (strategy === 'skip') { skipped++; continue; }
+        if (strategy === 'rename') {
+          dest = uniqueTarget(cwd, name, taken);
+          renamed.push(`${name} → ${basename(dest)}`);
+        } else if (strategy === 'overwrite' && src === dest) {
+          // 不能"先删掉自己再复制自己"：那会把唯一一份数据删没。
+          skipped++; continue;
+        }
+      }
+      try {
+        if (isCut) {
+          if (strategy === 'overwrite' && existing.has(name) && entrySensitive(dest)) {
+            if (!await confirmSensitive([{ path: dest, sensitive: true }], `覆盖「${name}」`)) { skipped++; continue; }
+          }
+          const r = await api.fileMove(src, dest, strategy === 'overwrite' ? 'overwrite' : 'rename');
+          if (r && r.skipped) { skipped++; continue; }
+          okList.push({ name, dest: (r && r.to) || dest, way: (r && r.way) || '' });
+        } else {
+          if (strategy === 'overwrite' && existing.has(name)) {
+            if (!await confirmSensitive([{ path: dest, sensitive: entrySensitive(dest) }],
+              `覆盖「${name}」`)) { skipped++; continue; }
+            await api.fileDelete([dest], true);
+          }
+          await api.fileCopy(src, dest);
+          okList.push({ name, dest, way: 'copy' });
+        }
+      } catch (e) { failed.push(`${name}: ${e.message}`); }
+      taken.add(basename(dest));
+    }
+
+    if (isCut && !failed.length) clipboard = null; // 全部成功才清空剪贴板
+    const ways = new Set(okList.map((o) => o.way));
+    let msg = `${isCut ? '移动' : '复制'}完成：成功 ${okList.length} 项`;
+    if (renamed.length) msg += `，自动改名 ${renamed.length} 项`;
+    if (skipped) msg += `，跳过 ${skipped} 项`;
+    if (failed.length) msg += `，失败 ${failed.length} 项`;
+    if (isCut && ways.has('copy+delete')) msg += '（含跨卷：复制后删除源）';
+    toast(msg, failed.length ? 'warn' : 'ok', failed.length ? 15000 : 6000);
+    if (renamed.length) toast('自动改名：' + renamed.slice(0, 5).join('，') + (renamed.length > 5 ? ' …' : ''), 'info', 8000);
+    if (failed.length) {
+      modal({
+        title: '粘贴失败明细',
+        body: h('div', [
+          h('p', { text: `成功 ${okList.length} 项，失败 ${failed.length} 项。失败的文件没有被改动。` }),
+          h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } }, failed.map((f) => h('li', { text: f }))),
+        ]),
+      });
+    }
+    renderToolbar();
+    load(cwd);
+  }
+
+  // entrySensitive 判断某个路径是否落在敏感根里（用于粘贴覆盖前的二次确认）。
+  function entrySensitive(p) {
+    const roots = lastList?.sensitive_roots || [];
+    return roots.some((r) => p === r || p.startsWith(r + '/'));
+  }
+
+  // ---------- 权限修改（勾选式 UI，宝塔式入口） ----------
+  function chmodModal(e) {
+    const cur = Number(e.mode_num) & 0o777;
+    const bits = [
+      { bit: 0o400, who: '属主 u', label: '读' }, { bit: 0o200, who: '属主 u', label: '写' }, { bit: 0o100, who: '属主 u', label: '执行' },
+      { bit: 0o040, who: '同组 g', label: '读' }, { bit: 0o020, who: '同组 g', label: '写' }, { bit: 0o010, who: '同组 g', label: '执行' },
+      { bit: 0o004, who: '其他 o', label: '读' }, { bit: 0o002, who: '其他 o', label: '写' }, { bit: 0o001, who: '其他 o', label: '执行' },
+    ];
+    const boxes = bits.map((b) => h('input', { type: 'checkbox', checked: (cur & b.bit) !== 0, dataset: { bit: String(b.bit) } }));
+    const modeText = h('span.mono', { style: { fontWeight: '600' }, text: cur.toString(8).padStart(3, '0') });
+    const recursive = h('input', { type: 'checkbox' });
+
+    const currentMode = () => boxes.reduce((v, b) => v | (b.checked ? Number(b.dataset.bit) : 0), 0);
+    const sync = () => { modeText.textContent = currentMode().toString(8).padStart(3, '0'); };
+    boxes.forEach((b) => b.addEventListener('change', sync));
+
+    const rows = ['属主 u', '同组 g', '其他 o'].map((who, gi) => h('tr', [
+      h('td', { text: who }),
+      ...boxes.slice(gi * 3, gi * 3 + 3).map((b) => h('td', [b])),
+    ]));
+
+    const m = modal({
+      title: '权限：' + e.name,
+      body: h('div', { style: { fontSize: '13px', lineHeight: '1.7' } }, [
+        h('div.hint', { text: '完整路径：' + e.path + (e.is_dir ? '（目录）' : '（文件）') }),
+        h('table.table', [
+          h('thead', [h('tr', [h('th', { text: '对象' }), h('th', { text: '读 (4)' }), h('th', { text: '写 (2)' }), h('th', { text: '执行 (1)' })])]),
+          h('tbody', rows),
+        ]),
+        h('div', { style: { marginTop: '10px' } }, [h('span', { text: '八进制：' }), modeText]),
+        e.is_dir ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px', cursor: 'pointer' } },
+          [recursive, h('span', { text: '同时递归应用到该目录下的所有内容' })]) : null,
+        h('div.hint', { style: { marginTop: '8px' },
+          text: '常用：644 = 普通文件；755 = 目录或可执行脚本；600 = 仅属主可读写。' }),
+        e.sensitive ? h('div.hint', { style: { color: 'var(--warn)' },
+          text: '⚠️ 这是面板数据目录里的内容，改错权限可能让面板无法读取数据库或凭据。' }) : null,
+      ]),
+      footer: [
+        h('button.btn', { text: '取消', onclick: () => m.close() }),
+        h('button.btn.btn-primary', {
+          text: '应用',
+          onclick: async () => {
+            const mode = currentMode().toString(8).padStart(3, '0');
+            if (!await confirmSensitive([e], `修改「${e.name}」的权限`)) return;
+            if (e.is_dir && recursive.checked && !await confirmBox(
+              `将递归修改「${e.name}」下所有内容的权限为 ${mode}。继续？`,
+              { title: '递归修改权限', okText: '递归修改' })) return;
+            try {
+              const r = await api.fileChmod(e.path, mode, e.is_dir && recursive.checked);
+              toast(r.msg || '权限已修改', 'ok');
+              m.close(); load(cwd);
+            } catch (err) { toast(err.message, 'err'); }
+          },
+        }),
+      ],
+    });
+  }
+
   // ---------- 删除 ----------
   async function deleteOne(e) {
+    if (!await confirmSensitive([e], `删除「${e.name}」`)) return;
     if (e.is_dir) {
       const recursive = await confirmBox(
         `确认删除目录「${e.name}」及其中的全部内容？\n\n此操作不可撤销。`,
@@ -576,9 +1182,18 @@ export function FilesView(content, ctx = {}) {
     } catch (err) { toast(err.message, 'err', 10000); }
   }
 
+  // deleteSelectionOrOne 供右键菜单调用：多选时批量删，单选时走单项删除。
+  async function deleteSelectionOrOne(e, paths) {
+    if (paths && paths.length > 1) return deleteSelected();
+    return deleteOne(e);
+  }
+
   async function deleteSelected() {
     const paths = [...selection];
-    const hasDir = (lastList?.entries || []).some((e) => selection.has(e.path) && e.is_dir);
+    if (!paths.length) return;
+    const entries = (lastList?.entries || []).filter((e) => selection.has(e.path));
+    if (!await confirmSensitive(entries, '删除这些内容')) return;
+    const hasDir = entries.some((e) => e.is_dir);
     const msg = `将删除 ${paths.length} 项${hasDir ? '（包含目录，其中的内容会一并删除）' : ''}。\n\n此操作不可撤销。`;
     if (!await confirmBox(msg, { title: '批量删除', danger: true, okText: '确认删除' })) return;
     try {
@@ -1240,29 +1855,65 @@ export function FilesView(content, ctx = {}) {
     setTimeout(() => query.focus(), 60);
   }
 
-  // 键盘：Enter 打开选中项、Delete 删除选中项、Esc 取消选择。
-  // 输入框/弹窗里有焦点时一律不接管（否则在搜索框里按 Delete 会删文件）。
+  // 键盘：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Delete 删除、F2 重命名、Enter 打开、
+  // Esc 取消选择。输入框/弹窗里有焦点时一律不接管（否则在搜索框里按 Delete 会删文件）。
   function onKeyDown(e) {
     const tag = (document.activeElement && document.activeElement.tagName) || '';
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return;
     if (document.querySelector('.modal-mask')) return;
-    if (e.key === 'Escape' && selection.size) {
-      selection.clear(); renderToolbar(); renderTable(); return;
+    // 编辑器窗口展开时不要抢它的快捷键（最小化成胶囊时文件列表照常可操作）。
+    const edWin = document.querySelector('.zpf-layer .zpf-win');
+    if (edWin && !edWin.classList.contains('zpf-win-min')) return;
+    const mod = e.ctrlKey || e.metaKey;
+    const key = e.key;
+
+    if (mod && (key === 'a' || key === 'A')) {
+      if (!visibleEntries.length) return;
+      e.preventDefault(); selectAll(); return;
     }
-    if ((e.key === 'Delete' || e.key === 'Backspace') && selection.size) {
+    if (mod && (key === 'c' || key === 'C')) {
+      if (!selection.size) return;
+      e.preventDefault(); copySelection([...selection]); return;
+    }
+    if (mod && (key === 'x' || key === 'X')) {
+      if (!selection.size) return;
+      e.preventDefault(); cutSelection([...selection]); return;
+    }
+    if (mod && (key === 'v' || key === 'V')) {
+      if (!(clipboard && clipboard.paths.length)) return;
+      e.preventDefault(); pasteClipboard(); return;
+    }
+    if (key === 'Escape' && selection.size) {
+      selection.clear(); selAnchor = -1; renderToolbar(); renderTable(); return;
+    }
+    if ((key === 'Delete' || key === 'Backspace') && selection.size) {
       e.preventDefault(); deleteSelected(); return;
     }
-    if (e.key === 'Enter' && selection.size) {
-      const list = lastList?.entries || [];
-      const first = list.find((x) => selection.has(x.path));
+    if (key === 'F2' && selection.size) {
+      const first = visibleEntries.find((x) => selection.has(x.path));
+      if (!first) return;
+      e.preventDefault(); renameEntry(first); return;
+    }
+    if (key === 'Enter' && selection.size) {
+      const first = visibleEntries.find((x) => selection.has(x.path));
       if (!first) return;
       e.preventDefault();
       if (first.is_dir) load(first.path); else openAny(first);
     }
   }
   document.addEventListener('keydown', onKeyDown);
+  // 右键菜单：点别处 / 滚动 / Esc 就关掉（与系统菜单一致）。
+  const onDocPointer = (ev) => {
+    if (openCtxMenu && !openCtxMenu.contains(ev.target)) closeContextMenu();
+  };
+  const onDocScroll = () => closeContextMenu();
+  document.addEventListener('mousedown', onDocPointer);
+  window.addEventListener('scroll', onDocScroll, true);
   registerCleanup(() => {
     document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('mousedown', onDocPointer);
+    window.removeEventListener('scroll', onDocScroll, true);
+    closeContextMenu();
     // 编辑器**故意不在这里销毁**：它是全局存活的窗口（用户要求 1 —— 最小化后切成
     // 胶囊，切到别的板块再切回来仍要在、内容不能丢）。模块级的 activeEditor 引用
     // 也不会因为路由切换而失效。关掉它只有两条路：窗口右上角 ✕，或菜单「文件 →

@@ -177,11 +177,21 @@ export function AppsView(content, ctx = {}) {
     //（铁律 11：不许把"不知道"显示成"没有"）。没有这条提示，一次 brew 超时
     // 就会让用户以为自己的软件全被卸了 —— 那正是 2026-09-23 那一类报障。
     if (cache && cache.brew_probe_ok === false) {
+      const why = String(cache.brew_probe_error || '').trim();
       tabBar.appendChild(h('span.pill.warn', {
         text: '⚠ 未能复核已装软件',
-        title: '这次没能读到 Homebrew 的已装清单（brew 不可用或超时）：'
-          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新」重试。',
+        title: '这次没能读到 Homebrew 的已装清单：'
+          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新」重试。'
+          + (why ? '\n\n真实原因：' + why : ''),
       }));
+      // 把真实原因**显示出来**（不只塞进 title）：2026-09-19 用户报障时界面上
+      // 只有一句"brew 不可用或超时"，谁也不知道到底是 brew 坏了、权限问题还是超时。
+      if (why) {
+        tabBar.appendChild(h('span.hint', {
+          text: '原因：' + (why.length > 140 ? why.slice(0, 140) + '…' : why),
+          title: why,
+        }));
+      }
     }
   }
 

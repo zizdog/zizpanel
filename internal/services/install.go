@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -203,18 +204,35 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 //
 // 降权规则与 Homebrew 拒绝 root 运行一致。
 func (m *Manager) InstalledFormulaVersions(ctx context.Context) (map[string]string, bool) {
+	vers, err := m.InstalledFormulaVersionsErr(ctx)
+	return vers, err == nil
+}
+
+// InstalledFormulaVersionsErr 与 InstalledFormulaVersions 相同，但**把失败原因带出来**。
+//
+// 为什么需要它（2026-09-19 用户报障「未能复核已装软件」始终显示）：
+// 界面与接口只给了一句"brew 不可用或超时"，而**真实原因被丢掉了** ——
+// 老实现用的是 `cmd.Output()` 且没有读取 `ExitError.Stderr`，所以
+// "brew 报错" / "sudo -n 被拒" / "30 秒超时"三种完全不同的故障在用户眼里一模一样，
+// 连排查的起点都没有（判据必须可诊断：这里把 stderr 尾部与超时标志带出去）。
+func (m *Manager) InstalledFormulaVersionsErr(ctx context.Context) (map[string]string, error) {
 	// 单测注入点：不碰真实 brew（理由同 brewUsesProbe）。
 	if m.brewInstalledProbe != nil {
 		vers, ok := m.brewInstalledProbe(ctx)
 		if vers == nil {
 			vers = map[string]string{}
 		}
-		return vers, ok
+		if !ok {
+			return vers, errors.New("已装清单探测失败（测试注入的探针返回 false）")
+		}
+		return vers, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
+	asUser := ""
 	if os.Geteuid() == 0 && m.opt.UserName != "" {
+		asUser = m.opt.UserName
 		cmd = exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "-u", m.opt.UserName,
 			m.opt.BrewBin, "list", "--versions")
 	} else {
@@ -222,7 +240,24 @@ func (m *Manager) InstalledFormulaVersions(ctx context.Context) (map[string]stri
 	}
 	out, err := cmd.Output()
 	if err != nil {
-		return map[string]string{}, false
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return map[string]string{}, fmt.Errorf(
+				"`%s list --versions` 超过 30 秒没有返回（超时）", m.opt.BrewBin)
+		}
+		why := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			why = strings.TrimSpace(string(ee.Stderr))
+		}
+		if why == "" {
+			why = err.Error()
+		}
+		how := ""
+		if asUser != "" {
+			how = fmt.Sprintf("（以用户 %s 通过 sudo -n 执行）", asUser)
+		}
+		return map[string]string{}, fmt.Errorf("`%s list --versions` 失败%s：%s",
+			m.opt.BrewBin, how, tailText(why, 400))
 	}
 	// 输出形如：nginx 1.31.5 / php@8.2 8.2.33 / mysql@8.4 8.4.11_4
 	res := map[string]string{}
@@ -232,7 +267,7 @@ func (m *Manager) InstalledFormulaVersions(ctx context.Context) (map[string]stri
 			res[f[0]] = strings.Join(f[1:], " ")
 		}
 	}
-	return res, true
+	return res, nil
 }
 
 // brewRun 以真实用户身份执行 brew 命令。

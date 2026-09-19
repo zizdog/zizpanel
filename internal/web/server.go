@@ -360,6 +360,7 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/files/touch", s.requireAuth(s.handleFileTouch))
 	root.HandleFunc("POST /api/v1/files/rename", s.requireAuth(s.handleFileRename))
 	root.HandleFunc("POST /api/v1/files/copy", s.requireAuth(s.handleFileCopy))
+	root.HandleFunc("POST /api/v1/files/move", s.requireAuth(s.handleFileMove))
 	root.HandleFunc("POST /api/v1/files/chmod", s.requireAuth(s.handleFileChmod))
 	root.HandleFunc("POST /api/v1/files/delete", s.requireAuth(s.handleFileDelete))
 	root.HandleFunc("POST /api/v1/files/compress", s.requireAuth(s.handleFileCompress))

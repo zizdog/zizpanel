@@ -66,10 +66,7 @@ const (
 
 // LANPreauthWarning 是必须原样告诉用户的代价（前端按 textContent 渲染，
 // 所以不要写 Markdown 的 ** —— 用户会看到字面星号）。
-const LANPreauthWarning = "这会在这个网段上关掉 macOS「本地网络」隐私门，而且是对所有程序生效" +
-	"（不只是 nginx 或面板）：网段里的任意机器都能被本机上的任意 App 直接访问。" +
-	"改动必须重启后才生效；撤销同样是重启后才不再豁免，但撤销不会清除系统里" +
-	"已经登记或授权过的程序（例如手动点过「允许」的），它们仍然能访问该网段。"
+const LANPreauthWarning = "这会在这个网段上关掉 macOS「本地网络」隐私门"
 
 // LANPreauthState 是「允许免授权访问内网段」的当前真实状态。
 type LANPreauthState struct {

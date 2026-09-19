@@ -437,6 +437,10 @@ export const api = {
   fileTouch: (path) => request('POST', `${API_BASE}/files/touch`, { path }),
   fileRename: (from, to) => request('POST', `${API_BASE}/files/rename`, { from, to }),
   fileCopy: (from, to) => request('POST', `${API_BASE}/files/copy`, { from, to }),
+  // 剪切粘贴：后端同卷走 rename，跨卷回退 copy+delete 并如实返回 way。
+  // on_conflict：目标已存在时 rename（默认，自动改名）/ overwrite / skip。
+  fileMove: (from, to, onConflict = 'rename') =>
+    request('POST', `${API_BASE}/files/move`, { from, to, on_conflict: onConflict }),
   fileChmod: (path, mode, recursive = false) =>
     request('POST', `${API_BASE}/files/chmod`, { path, mode, recursive }),
   fileDelete: (paths, recursive) => request('POST', `${API_BASE}/files/delete`, { paths, recursive }),
