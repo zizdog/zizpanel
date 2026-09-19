@@ -17,62 +17,30 @@ import (
 	"github.com/zizdog/zizpanel/internal/logx"
 )
 
-// qwenLog 是这个包的日志出口。守温是后台常驻循环，它的失败必须能在
-// 面板日志里看到（否则"网站第一次请求为什么慢"会变成一个查不出来的问题）。
+// qwenLog 是日志出口：守温循环的失败必须能在面板日志里看到，
+// 否则"网站第一次请求为什么慢"会变成一个查不出来的问题。
 var qwenLog = logx.New("services")
 
-// ============================================================================
-//  Qwen3 TTS（mlx-audio）部署
-//
-//  严格按网站插件 TtsVoice 的部署契约实现（zizdog.cn 的
-//  usr/plugins/TtsVoice/DEPLOY-QWEN.md），因为面板装的这个服务
-//  是要给那个插件调用的 —— 端口、路径、模型名、启动方式都不能自由发挥。
-//
-//  与手册的**一处刻意不同**（也是面板存在的意义）：
-//    手册把服务写成 ~/Library/LaunchAgents 下的**用户级** agent。
-//    用户级服务只有在该用户登录进图形界面后才会运行 ——
-//    对一台不接显示器、重启后停在登录界面的服务器来说，这等于开机不自启。
-//    面板改为写 /Library/LaunchDaemons + UserName=<真实用户>：
-//    既开机自启，又以普通用户身份运行（不违反 mlx 的权限预期）。
-//
-//  契约要点（照抄手册，不要"优化"）：
-//    · 端口 8880；**绑哪个地址取决于鉴权**（见 qwenBindHost）——
-//      加鉴权时绑 127.0.0.1，由 8899 的接收端做带密钥的反代；
-//      不加鉴权时才绑 0.0.0.0，此时同内网谁能连上谁就白用这块 GPU。
-//      早期这里写的是"必须 0.0.0.0"，那是引入鉴权前的旧契约，已作废。
-//    · 模型只有一个：Base（克隆）。2026-09-14 起网站侧只支持自定义音色，
-//      CustomVoice（预置音色）整体下线，权重也已从两台机器上删掉腾空间。
-//    · Python 3.11（mlx-audio 在 3.11 上有预编译 wheel）
-//    · pip 走清华源、模型走 hf-mirror
-//    · **HF_HUB_DISABLE_XET=1 必须设**：不设会下载到一半报
-//      "CAS Client Error ... us.gcp.cdn.hf.co"，看着像网络问题，
-//      其实是 hf-mirror 不代理 Xet 后端。这是最容易白折腾半天的一条。
-// ============================================================================
+// ==== Qwen3 TTS（mlx-audio）部署：严格照 TtsVoice 手册的部署契约（端口/路径/模型名/启动方式都不能自由发挥）====
+// 与手册唯一的刻意不同：面板写 /Library/LaunchDaemons + UserName=<真实用户>；用户级 agent 要登录图形界面才跑，等于开机不自启。
+// 契约要点（照抄手册，不要"优化"）：端口 8880，绑 127.0.0.1 还是 0.0.0.0 取决于鉴权（见 qwenBindHost）。
+// 模型只有 Base（克隆）一个（2026-09-14 起 CustomVoice 下线）；Python 3.11 + pip 清华源 + hf-mirror。
+// **HF_HUB_DISABLE_XET=1 必须设**：hf-mirror 不代理 Xet 后端，不设会下载到一半报 CAS Client Error。
 
-// QwenModel 描述一个可用的 TTS 模型。
-//
-// 2026-09-14 起**只有一个模型**（见 usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md）：
-// 网站侧插件已只支持「自定义音色」（克隆），预置音色（CustomVoice）整体下线。
-//
-// 这里保留结构体与列表概念（而不是退化成一个字符串常量），理由是它同时承担
-// 三件事：界面上要显示"下没下载 / 驻没驻留"、下载时要逐个处理、
-// 以及"驻留集合里出现了清单之外的模型就释放掉"（QwenUnloadStale 靠它算差集）。
+// QwenModel 描述一个可用的 TTS 模型。2026-09-14 起只有一个（Base/克隆），
+// 预置音色（CustomVoice）整体下线。保留结构体与列表是因为它还承担界面状态展示
+// 与 QwenUnloadStale 的差集计算。
 type QwenModel struct {
 	// Name 是 HuggingFace 仓库名，同时也是 API 请求里 model 字段的取值
 	Name string `json:"name"`
 	// Role 是能力标签：clone（克隆）/ preset（预置音色）
-	Role string `json:"role"`
-	// Label 是界面上的显示名
+	Role  string `json:"role"`
 	Label string `json:"label"`
-	// Note 说明这个模型能做什么、不能做什么
-	Note string `json:"note"`
+	Note  string `json:"note"`
 }
 
-// QwenModels 是可用模型清单。顺序即界面顺序，第一个是默认。
-//
-// 只有一个：Base（克隆）。CustomVoice 相关的条目已全部移除 ——
-// 网站侧不再发来那个 model 名，留着条目只会让界面显示出"可以切过去"的假选项，
-// 而那个模型的权重已经被删掉腾空间了（点它就是失败）。
+// QwenModels 是可用模型清单。顺序即界面顺序，第一个是默认；只有一个 Base（克隆）。
+// CustomVoice 条目已移除：留着只会让界面显示出"可以切过去"的假选项（权重已删，点它就是失败）。
 var QwenModels = []QwenModel{
 	{
 		Name:  "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
@@ -83,29 +51,27 @@ var QwenModels = []QwenModel{
 }
 
 // qwenDefaultModel 是插件默认该填的那个，也是唯一的那个。
-//
-// 2026-09-14 起网站侧全面切到 1.7B 单模型（见 usr/plugins/TtsVoice/HANDOFF-TO-PANEL-1.7B.md），
-// 0.6B 与 CustomVoice 都不再使用 —— 面板这里必须跟着改，否则面板的"驻留模型"
-// 页面会把已经不用的模型当成可选项，用户点了等于切到一个不存在的权重上。
+// 2026-09-14 起网站侧全面切到 1.7B 单模型，0.6B 与 CustomVoice 都已停用。
+// 面板必须跟着改，否则界面会把已经不用的模型当成可选项。
 const qwenDefaultModel = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
 
 const (
 	qwenPort  = 8880
 	qwenLabel = "com.zizdog.qwen3tts"
-	// 预置的 Python 版本只有一处定义（python_runtime.go 的 panelPythonFormula）——
-	// 换版本时不会漏改解释器路径 / site-packages 路径（那两处以前写死了 python3.11）。
+	// 预置的 Python 版本只有一处定义（python_runtime.go 的 panelPythonFormula），
+	// 换版本不会漏改解释器路径 / site-packages 路径。
 	qwenPythonVer = panelPythonFormula
 	qwenPipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
 	qwenHFMirror  = "https://hf-mirror.com"
 	qwenMinDiskGB = 10
 	qwenMinMemGB  = 15
-	// qwenReadyTimeout 是「等 Qwen 端口监听」的上限。首次加载模型要十几秒，
-	// 取 90 秒给慢机器留余量；超时即**如实失败**（见 waitQwenReady）。
+	// qwenReadyTimeout 是「等 Qwen 端口监听」的上限：首次加载模型要十几秒，取 90 秒给慢机器留余量；
+	// 超时即**如实失败**（见 waitQwenReady）。
 	qwenReadyTimeout = 90 * time.Second
 )
 
-// QwenLabel 是 Qwen 服务的 launchd 标签。别的包（如 web 的服务操作）
-// 需要判断"刚动过的是不是 Qwen 服务"，硬抄字符串迟早会抄错。
+// QwenLabel 是 Qwen 服务的 launchd 标签：别的包判断"刚动过的是不是 Qwen 服务"时用它，
+// 硬抄字符串迟早会抄错。
 const QwenLabel = qwenLabel
 
 // qwenPaths 是这套服务的目录约定（与手册一致）。
@@ -136,17 +102,9 @@ func (m *Manager) qwenPaths() qwenPaths {
 	}
 }
 
-// QwenOptions 是部署 Qwen3 TTS 时用户可做的选择。
-//
-// 为什么把"要不要鉴权"做成选项而不是写死：
-// mlx-audio 上游完全没有鉴权，所以对外暴露与否是一个**真实的取舍**——
-//
-//	· 加鉴权（默认）：Qwen 只监听 127.0.0.1，由 8899 的接收端做带密钥的反代。
-//	  代价是多一个进程，好处是同内网别人用不了你的 GPU。
-//	· 不加鉴权：Qwen 直接监听 0.0.0.0，网站直连 8880、密钥留空。
-//	  只有在自己完全可控的网络里才该这么用。
-//
-// 网站插件两种都支持（`openaiKey` 允许为空），所以选哪种都能对接。
+// QwenOptions 是部署 Qwen3 TTS 时用户可做的选择。mlx-audio 上游完全没有鉴权，所以对外暴露与否是**真实的取舍**：
+// 加鉴权（默认）只监听 127.0.0.1，由 8899 的接收端做带密钥的反代；不加鉴权则绑 0.0.0.0（同内网谁能连上谁就白用这块 GPU）。
+// 网站插件两种都支持（`openaiKey` 允许为空）。
 type QwenOptions struct {
 	// Auth 为 false 时 Qwen 绑 0.0.0.0 且不部署反代
 	Auth bool
@@ -164,26 +122,14 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 
 	// ---- 0a. 依赖链：命令行开发者工具 → Homebrew → python@3.11 ----
-	// 全新 macOS 上三样都没有：/usr/bin/python3 只是占位程序（跑它会弹图形对话框）、
-	// 没有 brew、更没有 python@3.11。这一整套（venv + pip + mlx-audio）全都要它们。
-	// EnsureHomebrew 会先装 CLT 再装 brew；缺什么装什么，已就绪就秒过。
+	// 全新 macOS 上三样都没有（/usr/bin/python3 只是会弹图形对话框的占位程序）；EnsureHomebrew 缺什么装什么。
 	if err := m.EnsureHomebrew(ctx, result); err != nil {
 		return err
 	}
 
-	// ---- 0b. 基础依赖：ffmpeg ----
-	//
-	// 这一步是 2026-09-16 事故的**确切发生点**：mini 被抹机后由面板重装 Qwen TTS，
-	// 整条安装链里没有 ffmpeg（这个文件当时全文搜不到它）。mlx_audio 编码 mp3
-	// 必须靠 ffmpeg，于是装出来的服务"能启动、能回 wav、一合成 mp3 就返回
-	// HTTP 200 + 0 字节 body" —— 接收端只看到 IncompleteRead(0 bytes read)，
-	// 用户所有 TTS 作业全败，而安装任务**显示成功**、健康检查全绿。
-	// （Qwen 日志里 "RuntimeError: ffmpeg not found!" 出现 601 次。）
-	//
-	// 所以放在最前面、并要求致命失败：装不上 ffmpeg 就中止，绝不再交付
-	// 一个"看起来装好了"的半残服务。
-	// 先按目录里声明的 Requires 提示一句"需要 ffmpeg"，再真的装（两个动作分开，
-	// 是为了任务日志里"为什么需要"出现在"正在安装"之前）。
+	// ---- 0b. 基础依赖：ffmpeg（放最前面，装不上就致命中止）----
+	// 2026-09-16 事故：缺 ffmpeg 时服务"能启动、能回 wav、合成 mp3 返回 HTTP 200 + 0 字节 body"，
+	// 而安装任务**显示成功**、健康检查全绿 —— 绝不再交付这种"看起来装好了"的半残服务。
 	m.AnnounceAppDependencies(ctx, "qwen3tts", result)
 	if err := m.EnsureBaseDependencies(ctx, result); err != nil {
 		return fmt.Errorf("缺少基础依赖（TTS 编码 mp3 必需），已中止部署：%w", err)
@@ -197,11 +143,10 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	p := m.qwenPaths()
 
 	// ---- 1. Python 3.11 ----
-	// 指定 3.11 不是偏好：mlx-audio 在该版本有预编译 wheel（cp311），
-	// 更高版本可能没有 wheel，会退化成源码编译甚至装不上。
+	// 指定 3.11 不是偏好：mlx-audio 在该版本有预编译 wheel（cp311），更高版本可能退化成源码编译甚至装不上。
 	if !m.brewHas(ctx, qwenPythonVer) {
 		result.step(ctx, "正在安装 "+qwenPythonVer)
-		// 2026-09-20 事故就是这一步：镜像是坏的（0 字节瓶）→ 必须换源重试；
+		// 2026-09-20 事故就是这一步：镜像是坏的（0 字节瓶）→ 必须换源重试。
 		// python@3.11 的 arm64 瓶国内镜像常常没有，只能靠官方源兜底。
 		if _, err := m.brewInstall(ctx, result, 20*time.Minute, qwenPythonVer); err != nil {
 			return fmt.Errorf("安装 %s 失败: %w", qwenPythonVer, err)
@@ -218,10 +163,8 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	if err := os.MkdirAll(p.Root, 0o755); err != nil {
 		return fmt.Errorf("创建 %s 失败: %w", p.Root, err)
 	}
-	// 必须**递归**改归属：上面是以 root 身份 mkdir 的，
-	// 只 chown 父目录的话，~/tts/qwen3 仍是 root 所有 ——
-	// 接着以用户身份建 .venv 就会 Permission denied。
-	// 真机上就是这么失败的（只差了子目录这一层）。
+	// 必须**递归**改归属：上面是以 root 身份 mkdir 的，只 chown 父目录的话子目录仍是 root 所有 ——
+	// 接着以用户身份建 .venv 就 Permission denied（真机就是这么失败的）。
 	if m.opt.UserName != "" {
 		_ = chownTree(m.opt.UserName, p.Home)
 	}
@@ -234,13 +177,14 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		result.step(ctx, "虚拟环境已存在，跳过创建")
 	}
 	// 2b) 强制 IPv4：这个网络上 IPv6 地址**不可达但会挂住**（不是立刻失败）。
+	// 写不进去只警告，后面下载失败会如实报错。
 	if err := m.installIPv4Sitecustomize(ctx, p, result); err != nil {
 		// 不致命：下不动模型时下载步骤会如实报错，而不是在这里假装成功
 		result.step(ctx, "警告：未能写入 IPv4 优先补丁（"+err.Error()+"），下载可能变慢")
 	}
 
 	// ---- 3. 安装 mlx-audio[server] ----
-	// [server] 这个 extra 是最容易漏的一步：不带它只有库、没有 HTTP 服务。
+	// [server] extra 最容易漏：不带它只有库、没有 HTTP 服务。
 	if err := m.pipInstall(ctx, p, result); err != nil {
 		return err
 	}
@@ -251,21 +195,15 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 
 	// ---- 5. 注册为系统级守护进程 ----
-	// 绑定地址由"要不要鉴权"决定：不加鉴权就必须对外暴露（否则网站连不上）
+	// 绑定地址由"要不要鉴权"决定：不加鉴权就必须对外暴露（否则网站连不上）。
+	// 见 qwenBindHost。
 	if err := m.installQwenService(ctx, p, result, opt.Auth); err != nil {
 		return err
 	}
 
 	// ---- 6. 先登记进服务管理，再验收 ----
-	//
-	// 顺序是刻意的（2026-09-17 审计）：原来登记在验收**之后**，而验收失败
-	// 只写一条 Warning 就 return nil。一旦把验收改成如实失败（见 waitQwenReady），
-	// 登记留在后面就会留下「任务失败、服务管理里又找不到它」的查不下去的半成品。
-	// 先登记，失败时错误信息才能如实说「服务已登记，但端口没监听」。
-	// 登记失败**不**让整个部署失败：launchd 服务本身是好的、网站也连得上，
-	// 只是面板列表里暂时没有它（可在「可纳管」里手工加入）。这是刻意接受的降级，
-	// 理由：「能用但没登记」比「能用却报失败、让用户重装」更不容易造成损失；
-	// 下面的就绪验收仍会如实判定服务到底起没起来，并把登记结果写进失败信息。
+	// 顺序刻意（2026-09-17 审计）：验收失败会如实返回错误，登记留在后面会留下「任务失败、服务管理里又找不到它」的半成品。
+	// 登记失败**不**让整个部署失败：launchd 服务本身是好的，只是面板列表暂时没有它（刻意接受的降级）。
 	registered := true
 	if err := m.RegisterInstalledService(ctx, qwenLabel, "Qwen3 TTS", "🗣️", "ai", qwenPort); err != nil {
 		registered = false
@@ -278,21 +216,16 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 		return err
 	}
 
-	// 预热模型。首次加载需 20-30 秒，放在这里做掉，
-	// 网站上第一次请求就能直接出声，而不是让用户等半分钟以为坏了。
+	// 预热模型：首次加载需 20-30 秒，放在安装时做掉，
+	// 网站第一次请求就能直接出声，而不是让用户等半分钟以为坏了。
 	result.step(ctx, "正在预热模型（首次约 20-30 秒）…")
 	if n := m.EnsureQwenModelsLoaded(ctx); n > 0 {
 		result.step(ctx, fmt.Sprintf("已加载 %d 个模型，音色克隆可立即使用", n))
 	}
 
 	// ---- 6c. 收尾验收：用**服务进程的 PATH** 真的跑一次 ffmpeg ----
-	//
-	// EnsureBaseDependencies 已经装过它，但"brew 说装好了"不等于"服务进程能用"：
-	// 动态库坏了、没链接上、或者服务进程的 PATH 里没有 Homebrew 都可能发生 ——
-	// 真机事故里最难查的正是这种"文件在、跑不通"的状态（服务照常启动，
-	// 只在合成 mp3 时才以"200 + 空 body"的形式暴露）。
-	// 所以这里按服务 plist 的 PATH 实跑 `ffmpeg -version`；失败就明确报错，
-	// 宁可任务显示失败，也不要交付一个一合成 mp3 就返回空 body 的服务。
+	// "brew 说装好了"不等于"服务进程能用"（动态库坏 / PATH 里没 Homebrew）：真机事故里最难查的正是这种"文件在、跑不通"。
+	// 失败就明确报错 —— 宁可任务显示失败，也不要交付一个一合成 mp3 就返回空 body 的服务。
 	if problems := m.VerifyBaseDependencies(ctx); len(problems) > 0 {
 		msg := "基础依赖验收未通过：" + describeDependencyProblems(problems) +
 			"。服务已注册，但合成 mp3 会失败（HTTP 200 + 空 body）；" +
@@ -303,21 +236,14 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 	}
 	result.step(ctx, "已确认 ffmpeg / ffprobe 可执行（mlx_audio 编码 mp3 依赖它）")
 
-	// ---- 7. 把插件要填的东西直接列出来 ----
-	// 这一步是"部署"和"能用"之间的差距：光装好服务，用户还得回去翻手册
-	// 才知道插件里填什么。直接给出来，照抄即可。
+	// ---- 7. 把插件要填的东西直接列出来（照抄即可，不用回去翻手册）----
 	host := m.primaryIP()
 	result.Address = host
 
 	if opt.Auth {
-		// 加了鉴权就必须有反代 —— 此时 Qwen 只监听 127.0.0.1，
-		// 网站**只能**通过 8899 访问。所以顺手把它一起装好，
-		// 否则用户会得到一个"装好了但连不上"的服务。
-		//
-		// 反代失败必须让**整个部署失败**（2026-09-17 审计，第 4 处同族缺陷）：
-		// 原来这里只写一条 Warning 就 return nil，任务显示「✅ 完成」，
-		// 而网站因为反代没起来根本连不上 —— 这正是我们在清的那一族
-		// 「能谎报成功」。详见 finishQwenAuthEntry。
+		// 加鉴权时 Qwen 只监听 127.0.0.1，网站**只能**通过 8899 访问，所以顺手把反代装好。
+		// 反代失败必须让**整个部署失败**（2026-09-17 审计，第 4 处同族缺陷）：任务显示「✅ 完成」而网站根本连不上，
+		// 正是我们在清的那一族「能谎报成功」。详见 finishQwenAuthEntry。
 		return m.finishQwenAuthEntry(ctx, result, opt.Token, m.InstallVoiceReceiver)
 	}
 
@@ -344,14 +270,8 @@ func (m *Manager) InstallQwenTTS(ctx context.Context, result *InstallResult, opt
 }
 
 // waitQwenReady 等 Qwen 服务端口就绪。**超时返回错误，不是警告。**
-//
-// 2026-09-17 审计：原来这里 90 秒没起来只写一条 Warning 就 return nil ——
-// 任务于是显示「任务完成 ✅」，而 8880 根本没监听：qwen3tts 装完不能用，
-// 并且**连带 TtsVoice 全站失联**（网站只连这个端口）。这个早退还顺带跳过了
-// 后面的 ffmpeg 验收与 Address 回填。
-//
-// 现在改成如实失败，并把「装好了什么 / 还差什么 / 能做什么」写进错误里
-// （写法照抄 iopaint.go 的 waitIOPaintReady）。
+// 2026-09-17 审计：原来 90 秒没起来只写一条 Warning 就 return nil，任务显示「任务完成 ✅」而 8880 根本没监听，
+// 连带 TtsVoice 全站失联；现在改成如实失败（写法照抄 iopaint.go 的 waitIOPaintReady）。
 func (m *Manager) waitQwenReady(ctx context.Context, p qwenPaths, registered bool, result *InstallResult) error {
 	wait := readyWaitPort
 	state := "Python 环境、模型权重与 launchd 服务都已就位，服务也已登记进服务管理"
@@ -383,20 +303,9 @@ func (m *Manager) waitQwenReady(ctx context.Context, p qwenPaths, registered boo
 	})
 }
 
-// finishQwenAuthEntry 在「加鉴权」时部署对外入口（音色接收端反代），
-// 并把它失败时的后果**如实升级为整个部署失败**。
-//
-// 为什么这不是「可接受的降级」：加鉴权时 Qwen 只绑定 127.0.0.1，对外访问
-// **只能**经过这个反代。反代没起来 = 网站（TtsVoice）连不上，服务等于还没装成。
-// 让任务报成功只会让用户对着绿灯排查半天（2026-09-17 审计的第 4 处同族缺陷）。
-//
-// 为什么不套 assertReady：这不是「轮询等某个探针就绪」，而是一个子安装动作
-// 本身失败（InstallVoiceReceiver 内部已经做过它自己的就绪验收，并会返回带
-// 日志尾部的错误）。这里做的是「把它的失败升级为整单失败」，并把
-// 「哪一步成了 / 哪一步没成 / 用户能怎么办」讲清楚。
-//
-// deploy 作为参数传入而不是直接调 m.InstallVoiceReceiver：单测需要在不触发
-// 真实安装（要 root、要真 launchd）的前提下，锁死「失败必须升级」这条约束。
+// finishQwenAuthEntry 在「加鉴权」时部署对外入口（音色接收端反代），失败即**整个部署失败**。
+// 加鉴权时 Qwen 只绑 127.0.0.1，反代没起来 = 网站连不上，服务等于还没装成（2026-09-17 审计第 4 处同族缺陷）。
+// deploy 作为参数传入：单测要在不触发真实安装（要 root、要真 launchd）的前提下，锁死「失败必须升级」这条约束。
 func (m *Manager) finishQwenAuthEntry(ctx context.Context, result *InstallResult, token string,
 	deploy func(context.Context, *InstallResult, ReceiverOptions) error) error {
 
@@ -419,11 +328,9 @@ func (m *Manager) finishQwenAuthEntry(ctx context.Context, result *InstallResult
 	return nil
 }
 
-// checkQwenPreconditions 检查内存与磁盘。
-//
-// 为什么要检查：1.7B 单模型常驻约 3GB，加系统与其它服务，
-// 16GB 是舒服的起点；低于它仍能跑，但要在用户动手前就提示，别让他
-// 等 20 分钟下载完才失败。磁盘按实测口径：模型约 2.9GB + 环境约 0.5GB。
+// checkQwenPreconditions 检查内存与磁盘：内存不足只警告（低于 16GB 仍能跑），磁盘不足直接失败。
+// 1.7B 单模型常驻约 3GB；磁盘按实测口径：模型约 2.9GB + 环境约 0.5GB。
+// 要在用户动手前就提示，别让他等 20 分钟下载完才失败。
 func (m *Manager) checkQwenPreconditions(ctx context.Context, result *InstallResult) error {
 	memGB := memoryGB()
 	diskGB := freeDiskGB(m.opt.UserHome)
@@ -446,7 +353,7 @@ func (m *Manager) checkQwenPreconditions(ctx context.Context, result *InstallRes
 func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallResult) error {
 	pip := filepath.Join(p.Venv, "bin", "pip")
 	// pip 索引按"NAS 优先、探不通回落清华"现算（见 pypi_mirror.go），
-	// 选择与原因由它写进任务日志 —— 与 brew/HF 的"优先+回落"是同一套语义。
+	// 选择与原因由它写进任务日志，与 brew/HF 是同一套语义。
 	pipIdx, err := m.pipMirrorArgs(ctx, result)
 	if err != nil {
 		return err
@@ -473,17 +380,12 @@ func (m *Manager) pipInstall(ctx context.Context, p qwenPaths, result *InstallRe
 	return nil
 }
 
-// downloadQwenModel 下载模型。
-//
-// 两个环境变量缺一不可：
-//
-//	HF_ENDPOINT=https://hf-mirror.com   国内直连 huggingface.co 基本不可用
-//	HF_HUB_DISABLE_XET=1                新版 huggingface_hub 默认走 Xet CDN，
-//	                                    而 hf-mirror 不代理那个后端 ——
-//	                                    不关掉会下载到一半报 CAS Client Error，
-//	                                    看着像网络抖动，其实是这个原因。
+// downloadQwenModel 下载模型。两个环境变量缺一不可：
+// HF_ENDPOINT=https://hf-mirror.com 国内直连 huggingface.co 基本不可用；
+// HF_HUB_DISABLE_XET=1 hf-mirror 不代理 Xet 后端，不关会在下载中途报 CAS Client Error。
 func (m *Manager) downloadQwenModel(ctx context.Context, p qwenPaths, result *InstallResult) error {
-	// hf 是新版 CLI 名；旧版叫 huggingface-cli。两个都试一下，避免版本差异卡住。
+	// hf 是新版 CLI 名；旧版叫 huggingface-cli。
+	// 两个都试一下，避免版本差异卡住。
 	hf := filepath.Join(p.Venv, "bin", "hf")
 	if _, err := os.Stat(hf); err != nil {
 		hf = filepath.Join(p.Venv, "bin", "huggingface-cli")
@@ -502,15 +404,9 @@ func (m *Manager) downloadQwenModel(ctx context.Context, p qwenPaths, result *In
 	return nil
 }
 
-// qwenHFEndpoint 按"优先级 + 可用性"挑 HuggingFace 端点。
-//
-// 顺序（2026-09-16 用户要求："能用镜像的尽量用，模型文件也一样"）：
-//  1. 面板设置里的镜像基址 + /hf —— 自建镜像站的 HuggingFace 反代/缓存。
-//     模型动辄 2~3GB，走同城镜像省流量也快得多。
-//     但**必须探通**（HEAD <base>/hf/），不通就跳过；
-//  2. 内置的 hf-mirror.com（国内公共镜像，实测可用）。
-//
-// 探测失败不报错：模型下载本来就有 3 次重试，这里只决定"用哪个端点"。
+// qwenHFEndpoint 按"优先级 + 可用性"挑 HuggingFace 端点（用户要求：能用镜像的尽量用，模型文件也一样）：
+//  1. 面板设置里的镜像基址 + /hf，但**必须探通**（HEAD <base>/hf/），不通就跳过；
+//  2. 内置 hf-mirror.com（国内公共镜像，实测可用）。探测失败不报错，只决定"用哪个端点"。
 func (m *Manager) qwenHFEndpoint(ctx context.Context) string {
 	if m.MirrorEnabled() {
 		base := m.mirrorSubPath("hf")
@@ -522,19 +418,8 @@ func (m *Manager) qwenHFEndpoint(ctx context.Context) string {
 }
 
 // hfEndpointUsable 判断一个 HuggingFace 端点**真的能跑 hf download**。
-//
-// 为什么不能只看 `<base>/hf/` 返回 200（2026-09-18 用户真机事故）：
-// NAS 的 `/hf/` 首页是 200（一个落地页），但 `/hf/api/models/<repo>` 是 **502** ——
-// 而 `hf download` **必须**先调 API 列文件，再走 `/resolve/` 取文件。
-// 浅探测把"首页 200"当成可用 → 面板把 `HF_ENDPOINT` 指向 NAS →
-// CLI 连着 3 次 `Error: Local entry not found. [Errno 60] Operation timed out`，
-// 用户看到的是"下载失败"，而不是"镜像不可用"。
-//
-// 判据贴着 CLI 的真实需求，两件都要成立：
-//  1. API 能列出模型（`/api/models/<repo>` 返回 200 且是 JSON 而不是错误页）；
-//  2. 文件路径能取到（`/<repo>/resolve/main/config.json` 返回 200）。
-//
-// 探针用**正在安装的那个模型**（目录里的第一个），避免"探 A 用 B"的错配。
+// 2026-09-18 真机事故：NAS 的 /hf/ 首页是 200，但 /hf/api/models/<repo> 是 **502** —— 浅探测会把"下载失败"伪装成"网络问题"。
+// 判据贴 CLI 真实需求：① API 能列出模型且是 JSON ② <repo>/resolve/main/config.json 取得到内容；探针用清单第一个模型。
 func (m *Manager) hfEndpointUsable(ctx context.Context, base string) bool {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" || len(QwenModels) == 0 {
@@ -561,7 +446,6 @@ func (m *Manager) hfEndpointUsable(ctx context.Context, base string) bool {
 	if code != http.StatusOK || !strings.HasPrefix(strings.TrimSpace(body), "{") {
 		return false
 	}
-	// ② 文件：必须真能取到内容。
 	code, size, body := get(base + "/" + repo + "/resolve/main/config.json")
 	if code != http.StatusOK || (size == 0 && len(body) == 0) {
 		return false
@@ -615,11 +499,8 @@ func (m *Manager) downloadOneQwenModel(ctx context.Context, hf string, mdl QwenM
 }
 
 // modelDownloaded 粗判模型是否已下载完整。
-//
-// 注意：HuggingFace 缓存里 snapshots/ 下是**指向 blobs/ 的符号链接**，
-// 而 filepath.Walk 给的是 Lstat 信息 —— 直接用 info.Size() 会拿到
-// 链接自身的长度（实测 76 字节），于是"权重明明下好了"却被判成没下好。
-// 所以这里必须用 os.Stat 跟随链接。
+// HuggingFace 缓存的 snapshots/ 下是**指向 blobs/ 的符号链接**，filepath.Walk 给的是 Lstat 信息 ——
+// 直接用 info.Size() 会拿到链接自身的长度（实测 76 字节），"权重明明下好了"却被判成没下好；所以必须 os.Stat 跟随链接。
 func modelDownloaded(userHome, model string) bool {
 	base := filepath.Join(userHome, ".cache", "huggingface", "hub",
 		"models--"+strings.ReplaceAll(model, "/", "--"), "snapshots")
@@ -638,15 +519,11 @@ func modelDownloaded(userHome, model string) bool {
 	return found
 }
 
-// installQwenService 写系统级 plist 并加载。
-//
-// 与手册的关键差异：这里用 LaunchDaemon + UserName，而不是
-// LaunchAgents。理由见文件头。
+// installQwenService 写系统级 plist 并加载（LaunchDaemon + UserName，与手册的差异见文件头）。
+// 先写 .tmp 再 rename，保证 launchd 不会读到半截 plist。
 func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *InstallResult, auth bool) error {
-	// 端点按"NAS 优先"现算后写进 plist：安装期下载模型时已经算过一次，
-	// 但**服务进程**日后自己补拉模型（缓存被动过、换模型）时用的是 plist 里的值。
-	// 原来这里写死 hf-mirror.com —— 与安装期的选择不一致，等于面板配了 NAS
-	// 镜像、服务自己却永远走公网，属于"镜像优先"漏掉的一处。
+	// 端点按"NAS 优先"现算后写进 plist：**服务进程**日后自己补拉模型时用的是 plist 里的值，
+	// 写死 hf-mirror.com 会让"面板配了 NAS 镜像、服务却永远走公网"。
 	hfEndpoint := m.qwenHFEndpoint(ctx)
 	plist := qwenPlist(p, m.opt.UserName, auth, hfEndpoint)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
@@ -665,9 +542,8 @@ func (m *Manager) installQwenService(ctx context.Context, p qwenPaths, result *I
 	return nil
 }
 
-// qwenPlist 生成 LaunchDaemon 定义。
-//
-// hfEndpoint 由调用方按"NAS 优先"现算（m.qwenHFEndpoint）—— 见 installQwenService。
+// qwenPlist 生成 LaunchDaemon 定义；绑定地址由 qwenBindHost(auth) 决定。
+// hfEndpoint 由调用方按"NAS 优先"现算（见 installQwenService）。
 func qwenPlist(p qwenPaths, user string, auth bool, hfEndpoint string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -730,28 +606,18 @@ func execCommandCtx(ctx context.Context, name string, args ...string) *exec.Cmd 
 func (m *Manager) runAsUserEnv(ctx context.Context, timeout time.Duration, env []string, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// **必须用 /usr/bin/env 显式注入环境变量**（2026-09-18 用户真机事故）：
-	// `sudo` 默认 env_reset，会清掉我们设置在 sudo **进程**上的环境变量 ——
-	// 以前这里写 `full := []string{"-n","-u",user,name}` 再把 env 塞进 cmd.Env，
-	// 结果子进程根本收不到 `HF_ENDPOINT`/`HF_HUB_DISABLE_XET`：
-	// `hf download` 于是去连 huggingface.co（国内不可达）→
-	//   Error: Local entry not found. [Errno 60] Operation timed out
-	// 而面板日志里"模型来源：https://…/hf"看起来一切正常 —— 这正是用户看到的
-	// "明明配了镜像却一点速度都没有"。
+	// **必须用 /usr/bin/env 显式注入环境变量**（2026-09-18 用户真机事故）：`sudo` 默认 env_reset，
+	// 把 env 塞进 cmd.Env 子进程收不到 → hf download 去连 huggingface.co 超时，而面板日志看起来一切正常。
 	// brew 那条链路早就踩过同一个坑（见 install.go 的 brewEnvArgs），这里跟进。
 	full := asUserEnvArgs(m.opt.UserName, m.opt.UserHome, env, name, args...)
 	cmd := execCommandCtx(ctx, "/usr/bin/sudo", full...)
-	// 模型下载（hf download）动辄几百 MB，必须逐行流式，
-	// 否则用户在整个下载期间只能看到"正在下载模型"一句。
+	// 模型下载动辄几百 MB，必须逐行流式，否则用户整个下载期间只能看到一句"正在下载模型"。
 	return streamCmd(ctx, cmd)
 }
 
-// asUserEnvArgs 构造"以真实用户身份 + 显式环境变量"执行一条命令的 sudo 参数。
-//
-// 形状：`sudo -n -u <user> /usr/bin/env HOME=<home> KEY=VAL… <cmd> args…`
-// 单独抽出来是为了**能被单测锁住**：`sudo` 默认 env_reset，直接把 KEY=VAL 放在
-// sudo 进程的 Env 里**不会**传给子进程 —— 这个形状错了，`hf download` 就会去连
-// huggingface.co（国内不可达），表现是"配了镜像却零速度"（2026-09-18 用户真机事故）。
+// asUserEnvArgs 构造 `sudo -n -u <user> /usr/bin/env HOME=<home> KEY=VAL… <cmd> args…`。
+// 抽出来是为了**能被单测锁住**：形状错了 hf download 就会去连 huggingface.co，
+// 表现是"配了镜像却零速度"（2026-09-18 真机事故）。
 func asUserEnvArgs(user, home string, env []string, name string, args ...string) []string {
 	full := []string{"-n", "-u", user, "/usr/bin/env"}
 	if home != "" {
@@ -792,12 +658,9 @@ func atoiSafe(s string) int {
 	return n
 }
 
-// primaryIP 返回本机局域网地址，用于拼给插件填的 URL。
-// PrimaryIP 导出给 web 层用：拼"服务实际跑在哪台机器上"的地址。
-//
-// 为什么不能让 web 层直接用请求里的客户端 IP：那是**浏览器**的地址，
-// 不是服务所在机器的地址 —— 2026-09-16 真机踩到，凭据弹窗里显示成了
-// 用户自己电脑的 192.168.1.179，而服务其实装在被管的那台机器上。
+// primaryIP 返回本机局域网地址，用于拼给插件填的 URL；PrimaryIP 导出给 web 层用。
+// 不能让 web 层用请求里的客户端 IP —— 那是**浏览器**的地址，不是服务所在机器的地址
+// （2026-09-16 真机踩到，凭据弹窗显示成了用户自己电脑的 IP）。
 func (m *Manager) PrimaryIP() string { return m.primaryIP() }
 
 func (m *Manager) primaryIP() string {
@@ -809,9 +672,7 @@ func (m *Manager) primaryIP() string {
 }
 
 // chownTree 递归把目录树归属改为指定用户。
-//
-// 只对"我们自己创建的目录"使用（~/tts），不要拿它去动别处 ——
-// 递归改归属是个危险动作，范围必须明确。
+// **只对"我们自己创建的目录"使用**（~/tts），别拿它去动别处 —— 递归改归属是危险动作，范围必须明确。
 func chownTree(user, root string) error {
 	uid, err := strconv.Atoi(strings.TrimSpace(runOutput("/usr/bin/id", "-u", user)))
 	if err != nil {
@@ -830,10 +691,8 @@ func chownTree(user, root string) error {
 	})
 }
 
-// qwenBindHost 决定 Qwen 服务绑哪个地址。
-//
-// 加鉴权时绑回环：对外只由 8899 的接收端提供（带共享密钥）。
-// 不加鉴权时绑 0.0.0.0：网站那台机器要能直接连上 8880。
+// qwenBindHost 决定 Qwen 服务绑哪个地址：加鉴权绑回环（对外只由 8899 的接收端提供）；
+// 不加鉴权绑 0.0.0.0（网站那台机器要能直接连上 8880）。
 func qwenBindHost(auth bool) string {
 	if auth {
 		return "127.0.0.1"
@@ -841,17 +700,9 @@ func qwenBindHost(auth bool) string {
 	return "0.0.0.0"
 }
 
-// ============================================================================
-//  模型切换
-//
-//  Qwen 服务端（mlx_audio.server）本身就带模型管理接口：
-//      GET    /v1/models                     列出**已驻留内存**的模型
-//      POST   /v1/models?model_name=X        加载
-//      DELETE /v1/models?model_name=X        卸载
-//  它是"按请求里的 model 字段按需加载、加载后就一直留着"的策略 ——
-//  没有任何淘汰机制。所以两个模型各用一次之后会同时驻留（约 10GB），
-//  在 16GB 机器上这是危险的。面板因此显式管理：切换时加载目标、卸载其余。
-// ============================================================================
+// ==== 模型切换 ====
+// mlx_audio.server 自带模型管理接口（GET /v1/models 列出驻留、POST 加载、DELETE 卸载）：
+// 按请求 model 字段按需加载、加载后就一直留着，**没有任何淘汰机制** —— 所以面板显式管理：切换时加载目标、卸载其余。
 
 // QwenModelState 是单个模型在界面上的完整状态。
 type QwenModelState struct {
@@ -865,6 +716,7 @@ type QwenModelState struct {
 }
 
 // qwenBaseURL 返回本机 Qwen 服务的地址。
+// 单测用 qwenPortOverride 改端口，隔离真实 8880 上的服务。
 func (m *Manager) qwenBaseURL() string {
 	port := qwenPort
 	if m.qwenPortOverride > 0 {
@@ -914,8 +766,7 @@ func (m *Manager) qwenLoadedModels(ctx context.Context) (map[string]bool, error)
 	return set, nil
 }
 
-// QwenModelsStatus 汇总两个模型的下载与驻留状态。
-//
+// QwenModelsStatus 汇总各模型的下载与驻留状态。
 // 服务没起来时不报错：把 Loaded 全置 false 即可，
 // 界面仍能告诉用户"装没装"，而不是整个接口失败。
 func (m *Manager) QwenModelsStatus(ctx context.Context) []QwenModelState {
@@ -935,14 +786,9 @@ func (m *Manager) QwenModelsStatus(ctx context.Context) []QwenModelState {
 	return out
 }
 
-// SetQwenModel 确保指定模型已加载，可以立即推理。
-//
-// 现在清单里只有一个模型，所以这个方法实际就是"加载 Base"。
-// 保留名字与形状是为了：① 安装流程、常驻守温和界面都用它；
-// ② 万一以后清单再变，调用点不用跟着改。
-//
-// 与 UnloadQwenModel 的分工：加载是幂等的（已驻留直接返回，不重复读权重），
-// 卸载是显式的（mlx-audio 没有淘汰机制，只有 DELETE 才释放内存）。
+// SetQwenModel 确保指定模型已加载，可以立即推理（幂等：已驻留直接返回，不重复读权重）。
+// 清单里只有一个模型，所以实际就是"加载 Base"；保留名字与形状是为了调用点不随清单变化。
+// 与 UnloadQwenModel 的分工：mlx-audio 没有淘汰机制，只有 DELETE 才释放内存。
 func (m *Manager) SetQwenModel(ctx context.Context, name string) error {
 	var target *QwenModel
 	for i := range QwenModels {
@@ -968,10 +814,8 @@ func (m *Manager) SetQwenModel(ctx context.Context, name string) error {
 	return nil
 }
 
-// UnloadQwenModel 把指定模型从内存中释放。
-//
-// 提供这个操作是因为"两个都常驻"虽然实测只占约 4GB，但在同时跑 Docker、
-// 数据库的机器上，用户可能仍想主动腾出内存。释放后下次用到会自动重新加载。
+// UnloadQwenModel 把指定模型从内存中释放；释放后下次用到会自动重新加载。
+// 提供它的理由：同时跑 Docker/数据库的机器上，用户可能仍想主动腾出内存。
 func (m *Manager) UnloadQwenModel(ctx context.Context, name string) error {
 	var target *QwenModel
 	for i := range QwenModels {
@@ -991,18 +835,8 @@ func (m *Manager) UnloadQwenModel(ctx context.Context, name string) error {
 }
 
 // QwenUnloadStale 释放"驻留在内存里、但已不在面板模型清单里"的模型。
-//
-// 为什么需要：模型清单会随网站侧升级而变（2026-09-14 从 0.6B/双模型换成
-// 1.7B 单模型）。老模型仍然占着内存，而 mlx-audio 没有淘汰机制 ——
-// 只有显式 DELETE 才释放。两台机器都是 16GB，本机实测 swap 用到 7GB/8GB，
-// 把 CustomVoice / 0.6B 那些已经不用的（每个约 3GB）还回去是有意义的；
-// 而且**以后换模型也会自动清理**，不用人工重启服务。
-//
-// 这条同时覆盖了旧版 QwenEnforceSingleResident 的职责（"内存吃紧只留一个"）：
-// 现在清单里本来就只有一个模型，任何多余的驻留都是"不在清单里"，
-// 于是"只保留默认模型"就是这条规则的自然结果，不需要再单独写一份策略。
-//
-// 只动"不在 QwenModels 里"的模型：清单内的模型无论如何不碰（那是我们自己的策略）。
+// mlx-audio 没有淘汰机制（只有显式 DELETE 才释放），清单会随网站侧升级而变，
+// 所以换模型后自动回收内存，不用人工重启服务；清单内的模型**无论如何不碰**。
 func (m *Manager) QwenUnloadStale(ctx context.Context) (unloaded []string, failed int) {
 	loaded, err := m.qwenLoadedModels(ctx)
 	if err != nil {
@@ -1031,10 +865,8 @@ func (m *Manager) QwenUnloadStale(ctx context.Context) (unloaded []string, faile
 	return unloaded, failed
 }
 
-// EnsureQwenModelsLoaded 把清单里已下载的模型都加载好。
-//
-// 部署完成后立刻预热：这样网站上第一次请求就不用等 20 多秒的模型加载，直接出声。
-// 现在清单里只有一个（Base），所以就是把它加载好。
+// EnsureQwenModelsLoaded 把清单里已下载的模型都加载好（部署完成后立刻预热）。
+// 这样网站上第一次请求就不用等 20 多秒的模型加载，直接出声。
 func (m *Manager) EnsureQwenModelsLoaded(ctx context.Context) int {
 	n := 0
 	for _, mdl := range QwenModels {
@@ -1062,32 +894,15 @@ func (m *Manager) QwenActiveModel(ctx context.Context) string {
 	return ""
 }
 
-// QwenWarmResident 确保两个已下载的模型都驻留在内存里，返回本次补载的个数。
-//
-// 为什么需要它（这是一个真实的缺口，不是保险丝）：
-//
-//	mlx-audio 的 ModelProvider 就是一个普通 dict —— `load_model` 只增不删，
-//	没有 LRU、没有上限、没有 TTL，加载过就一直驻留。所以"两个模型交替请求
-//	会不会互相挤掉"这件事**不会发生**，网站按请求切 model 是安全的。
-//
-//	但 dict 是**进程内存**：Qwen 服务一重启（重启机器、崩溃自愈、手动
-//	kickstart），两个模型全变冷。冷加载实测要 **25 秒**（同一句话热的时候
-//	只要 2.1 秒），叠加 30~60 秒的合成本身，会逼近网站插件那边的 60 秒超时，
-//	表现成"合成失败"——看起来正像服务端没把模型加载对。
-//
-//	安装流程里已经预热过一次（InstallQwen 第 6 步），这里补的是之后的所有
-//	重启场景：面板后台周期性调用，缺哪个补哪个。SetQwenModel 自己会跳过
-//	已驻留的模型，所以重复调用是廉价的。
+// QwenWarmResident 确保已下载的模型都驻留内存，返回本次补载的个数。
+// mlx-audio 的 ModelProvider 是普通 dict（只增不删、无 LRU/上限/TTL），交替请求不会互相挤掉；
+// 但它是**进程内存**，服务一重启就全变冷 —— 冷加载实测 25 秒（热 2.1 秒），会逼近网站 60 秒超时，故后台周期补载。
 func (m *Manager) QwenWarmResident(ctx context.Context) (warmed, failed int) {
 	loaded, err := m.qwenLoadedModels(ctx)
 	if err != nil {
-		// 服务没起来 / 连不上：静默返回。这是常驻循环每轮都会遇到的正常情况，
-		// 不该每 5 分钟往日志里塞一条错误。
+		// 服务没起来 / 连不上：静默返回（常驻循环每轮都会遇到的正常情况，不该刷日志）。
 		return 0, 0
 	}
-	// 清单里现在只有一个模型（Base），逐项补载即可。
-	// 内存门槛（qwenWarmAllMemGB / canWarmAllQwenModels）随双模型策略一起删掉了：
-	// 那套逻辑存在的唯一理由是"两个 1.7B 同时常驻会吃 10GB"，单模型时没有意义。
 	for _, mdl := range QwenModels {
 		if loaded[mdl.Name] || !modelDownloaded(m.opt.UserHome, mdl.Name) {
 			continue
@@ -1130,29 +945,19 @@ func (m *Manager) qwenServiceRunning(ctx context.Context) bool {
 	return false
 }
 
-// QwenKeepWarmInterval 是后台守温的检查间隔。
-//
-// 每轮只是一次 GET /v1/models（毫秒级），只有缺模型时才会真的触发加载，
-// 所以间隔取得短一点代价很小。取 2 分钟是因为要考虑一个启动竞态：
-// 面板与 Qwen 服务一起开机启动时，第一轮检查可能正好撞上 Qwen 还没起来，
-// 那时只能等下一轮；间隔越长，重启后的空窗就越久。
+// QwenKeepWarmInterval 是后台守温的检查间隔；每轮只是一次 GET /v1/models（毫秒级），间隔短代价很小。
+// 取 2 分钟是为启动竞态：面板与 Qwen 一起开机时第一轮可能撞上它还没起来，间隔越长重启后的空窗越久。
 const QwenKeepWarmInterval = 2 * time.Minute
 
 // StartQwenKeepWarm 常驻守温，直到 ctx 结束。
-//
-// 首次检查**立即**执行（不等第一个 tick），因为最常见的触发场景就是
-// "机器刚重启完、面板与服务一起起来"，这时候越早补载越好。
+// 首次检查**立即**执行（不等第一个 tick）：最常见的场景就是"机器刚重启完、面板与服务一起起来"。
 func (m *Manager) StartQwenKeepWarm(ctx context.Context) {
 	check := func() {
 		if !m.qwenServiceRunning(ctx) {
 			return
 		}
-		// 顺序有讲究：
-		//  ① 先清"已不在清单里"的旧模型（换模型后自动回收内存；
-		//     预置音色下线后，这就是把 CustomVoice 还回去的那一步）
-		//  ② 再补载清单里的模型（现在只有一个 Base）——
-		//     必须在清理**之后**，否则可能出现"先卸掉唯一驻留的模型、
-		//     再慢慢加载"的空窗期，这期间网站请求只能冷加载。
+		// 顺序有讲究：① 先清"已不在清单里"的旧模型 ② 再补载清单里的模型。
+		// 必须在清理**之后**，否则会出现"先卸掉唯一驻留的模型、再慢慢加载"的空窗期。
 		m.QwenUnloadStale(ctx)
 		warmed, _ := m.QwenWarmResident(ctx)
 		if warmed > 0 {
@@ -1175,17 +980,8 @@ func (m *Manager) StartQwenKeepWarm(ctx context.Context) {
 }
 
 // qwenIPv4Sitecustomize 是写进 venv 的 sitecustomize.py 内容。
-//
-// 为什么需要它（真机实测）：这台网络环境下 hf-mirror.com 会解析出 IPv6 地址，
-// 而那条 IPv6 路径**不可达却也不立刻拒绝** —— python 客户端就一直挂在 connect 上，
-// 最终报 `Error: Local entry not found. [Errno 60] Operation timed out`。
-// 同一个 URL 用 curl 走 IPv4 是 5 MB/s，用强制 IPv4 的 python 一次下全 14 个文件。
-//
-// 为什么写 sitecustomize 而不是设 PYTHONSTARTUP：
-//   - PYTHONSTARTUP 只在**交互式**解释器里生效（实测：`python script.py` 下不执行）；
-//   - sitecustomize 是 site 模块在启动时自动 import 的，对 `hf` CLI 这种
-//     控制台入口脚本**一定生效**，而且 venv 自己的 site-packages 里放一份
-//     只影响这个 venv，不动系统 Python。
+// 真机实测：本网络下 hf-mirror 解析出的 IPv6 **不可达却也不立刻拒绝**，python 会挂到 Errno 60 超时；强制 IPv4 后一次下全 14 个文件。
+// 用 sitecustomize 而不是 PYTHONSTARTUP（后者只在**交互式**解释器生效），且只影响这个 venv。
 const qwenIPv4Sitecustomize = `"""由 ZizPanel 生成：让这个虚拟环境优先使用 IPv4。
 
 这台机器所处的网络里，某些域名会解析出**不可达但不会立刻拒绝**的 IPv6 地址，
@@ -1207,9 +1003,7 @@ socket.getaddrinfo = _zizpanel_v4
 `
 
 // installIPv4Sitecustomize 把 IPv4 优先补丁写进 venv 的 site-packages。
-//
-// 刻意不做成"失败就算了"的静默降级：写不进去时要留下痕迹（调用方会写进任务步骤），
-// 因为它的症状是"下载变慢/超时"，没有痕迹的话下次又得从头排查。
+// 刻意不做成"失败就算了"的静默降级：症状是"下载变慢/超时"，写不进去要留下痕迹（调用方写进任务步骤）。
 func (m *Manager) installIPv4Sitecustomize(ctx context.Context, p qwenPaths, result *InstallResult) error {
 	// 目录名随 Python 版本变（python3.11 / python3.12 …），所以从同一个常量推导，
 	// 不写死 —— 写错的表现是补丁文件被写进一个不存在的目录，而且当场不报错。

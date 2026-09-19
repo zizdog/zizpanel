@@ -14,42 +14,10 @@ import (
 )
 
 // ============================================================================
-//  steps：应用安装的小步骤 DSL 与通用执行器
-//
-//  一个应用 = 一份 AppDescriptor（descriptor.go），安装 = 按 Steps 顺序执行。
-//  本文件定义步骤集、执行器，以及执行器需要的**窄接口** Runner。
-//
-//  为什么要有 Runner：执行器要能单测。真实执行会发网络请求、写
-//  /Library/LaunchDaemons、动 launchd —— 单测既不该联网也不该碰真实服务
-//  （AGENTS.md 第三节）。把"副作用"收到一个接口后面，测试注入假 Runner，
-//  就能在 t.TempDir() 里断言"下载 → 校验 → 解压 → 落盘 → 注册"的**完整编排**。
-//
-//  步骤集（与 docs/应用描述符v2.md 一一对应）：
-//    ensure_dir     建目录 + 改归属
-//    download       下载产物（镜像优先、官方优先、加速镜像兜底、失败用磁盘已有）
-//    verify_sha256  内容校验（失败即 error，绝不静默跳过）
-//    verify_arm64   架构复核（绝不放过 amd64 / Rosetta）
-//    extract        解包并挑成员（tar/zip）
-//    copy           复制文件/目录
-//    write_file     写文件（含配置模板的占位符替换）
-//    run            执行命令（超时 / 重试 / 是否降权）
-//    wait_http      等 HTTP 就绪
-//    pip_install    venv 里装 Python 包
-//    pull_model     拉模型权重（HF / 镜像）
-//    create_db      建库建账号
-//    seed_site      铺站点文件（Typecho / WordPress）
-//    register_service 登记进「服务管理」
-//    write_plist    渲染并写入 launchd plist
-//    launchd_bootout 卸载旧实例（重装前必须做，见 bootstrapService 的说明）
-//    launchd_bootstrap 装载并校验真的起来了
-//    assert_ready   就绪判定（**失败即 error**，要降级必须显式写理由）
-//    message        只写一条进度
-//
-//  失败语义总则（贯穿全部步骤）：任何一步失败都**中止安装并返回 error**。
-//  唯一允许"失败但继续"的路径是显式声明的降级：assert_ready 的 Health.Degrade
-//  + Health.DegradeReason，以及 write_file 的 Optional=true（可选文件）。
+//  steps：应用安装的小步骤 DSL 与通用执行器（步骤集见 docs/应用描述符v2.md）。
+//  失败语义总则：任何一步失败都**中止安装并返回 error**；唯一允许"失败但继续"的
+//  是显式降级（assert_ready 的 Degrade + DegradeReason、write_file 的 Optional）。
 //  "能谎报成功的功能，比没做更糟"（AGENTS.md 第一节第 10 条）。
-// ============================================================================
 
 // InstallStep 是描述符里的一个安装步骤。
 type InstallStep interface {
@@ -63,11 +31,8 @@ type InstallStep interface {
 
 // ---------- 步骤：chmod / chown ----------
 
-// ChmodAction 设置权限位。
-//
-// 单独成步而不是并进 extract：解压出来的二进制权限来自归档（可能是 0644），
-// 必须显式 0755 —— 否则 launchd 报 "not executable"，而错误信息完全指不到
-// "权限不对"。
+// ChmodAction 设置权限位。解压出来的二进制权限来自归档（可能 0644），
+// 必须显式 0755，否则 launchd 报 "not executable"（错误信息指不到"权限不对"）。
 type ChmodAction struct {
 	Path string `json:"path"`
 	Mode int    `json:"mode"`
@@ -78,7 +43,6 @@ func (a ChmodAction) Describe(ec *ExecConfig) string {
 	return "设置可执行权限 " + ec.path(a.Path)
 }
 
-// Exec 实现 InstallStep。
 func (a ChmodAction) Exec(ec *ExecConfig) error {
 	path := ec.path(a.Path)
 	mode := os.FileMode(a.Mode)
@@ -92,9 +56,8 @@ func (a ChmodAction) Exec(ec *ExecConfig) error {
 }
 
 // ChownAction 递归改归属（安装目录与其下全部文件交给真实用户）。
-//
-// 为什么必须递归：只 chown 父目录的话子目录仍是 root 所有，服务以用户身份
-// 运行时写不进配置 / 数据目录（真机上踩过）。
+// 必须递归：只 chown 父目录时子目录仍属 root，服务以用户身份运行
+// 时写不进配置 / 数据目录（真机踩过）。
 type ChownAction struct {
 	Path  string `json:"path"`
 	Owner string `json:"owner,omitempty"`
@@ -103,7 +66,6 @@ type ChownAction struct {
 func (a ChownAction) Kind() string                   { return "chown" }
 func (a ChownAction) Describe(ec *ExecConfig) string { return "" }
 
-// Exec 实现 InstallStep。
 func (a ChownAction) Exec(ec *ExecConfig) error {
 	owner := a.Owner
 	if owner == "" {
@@ -117,16 +79,9 @@ func (a ChownAction) Exec(ec *ExecConfig) error {
 
 // ---------- 步骤：ensure_config ----------
 
-// EnsureConfigAction 生成应用的配置文件（含面板随机凭据）。
-//
-// 为什么这是一个**执行期**动作而不是构造步骤时就决定好的 write_file：
-// "要不要保留磁盘上这份配置"取决于**执行那一刻**磁盘上有什么 ——
-// 构造步骤时读磁盘会在重装场景给出错误答案（用户可能刚改过配置）。
-// 而且生成出来的 token/口令必须能被安装结果引用（凭据区块），
-// 那也只有执行期才知道。
-//
-// 判据（唯一实现，见 configKeepsExisting）：含面板 marker 就保留；
-// PreserveExistingConfig（ddns-go）退化成"存在即保留"。
+// EnsureConfigAction 生成应用的配置文件（含面板随机凭据）。必须在**执行期**读盘：
+// 构造步骤时读会在重装场景给出错误答案（用户可能刚改过配置），token/口令也只有执行期才知道。
+// 判据见 configKeepsExisting：含面板 marker 即保留；PreserveExistingConfig 退化成"存在即保留"。
 type EnsureConfigAction struct {
 	// Path 是配置文件路径（支持 {root} 占位符）。
 	Path string `json:"path"`
@@ -141,12 +96,9 @@ type EnsureConfigAction struct {
 func (a EnsureConfigAction) Kind() string                   { return "ensure_config" }
 func (a EnsureConfigAction) Describe(ec *ExecConfig) string { return "" }
 
-// Exec 实现 InstallStep。
 func (a EnsureConfigAction) Exec(ec *ExecConfig) error {
 	path := ec.path(a.Path)
-	// 判据走 configKeepsExisting（与老 ensureReleaseConfig 同一份实现）：
-	// 两份判据漂移会让"重装一次冲掉一次用户配置"这种问题重新出现。
-	// 这里必须**在执行期**读盘，而不是构造步骤时 —— 用户可能刚改过配置。
+	// 判据走 configKeepsExisting：两份判据漂移会让重装冲掉用户配置。
 	if b, err := ec.Runner.ReadFile(path); err == nil {
 		if a.PreserveExistingConfig || strings.Contains(string(b), panelConfigMarker) {
 			ec.Result.step(ec.Ctx, "已保留现有配置 "+path+"（面板不覆盖你的改动）")
@@ -191,10 +143,8 @@ func (ec *ExecConfig) advertisedURL() string {
 // ---------- 步骤：ensure_dir ----------
 
 // EnsureDirAction 建目录并（可选）把归属改给真实用户。
-//
-// 为什么归属是必须的一步而不是可选项：安装目录是面板以 root 建的，
-// 而服务以真实用户身份运行 —— 只 chown 父目录的话子目录仍是 root 所有，
-// 用户身份的 venv / 配置写入会 Permission denied（真机上踩过）。
+// 安装目录由面板以 root 创建、服务以真实用户运行：不递归 chown 时子目录仍属 root，
+// 用户身份的 venv / 配置写入会 Permission denied（真机踩过）。
 type EnsureDirAction struct {
 	// Path 是目录（支持 {root} 占位符；相对路径按安装根目录解析）。
 	Path string `json:"path"`
@@ -209,7 +159,6 @@ func (a EnsureDirAction) Describe(ec *ExecConfig) string {
 	return "创建目录 " + ec.path(a.Path)
 }
 
-// Exec 实现 InstallStep。
 func (a EnsureDirAction) Exec(ec *ExecConfig) error {
 	dir := ec.path(a.Path)
 	mode := os.FileMode(0o755)
@@ -233,22 +182,9 @@ func (a EnsureDirAction) Exec(ec *ExecConfig) error {
 
 // ---------- 步骤：download ----------
 
-// DownloadAction 下载一份产物。
-//
-// 语义与老实现（downloadReleaseBinary）逐条对齐：
-//   - **镜像优先**：MirrorPreflight 为 true 时先探镜像；镜像上有包与清单
-//     （MirrorPreflight 钩子返回镜像地址）时，**把那个地址插到候选列表第一位**
-//     再下载 —— 不是只记一个 bool（0.12.4 的 P0 就是只记 bool、地址没进候选表，
-//     于是日志说"走镜像"、curl 实际打 GitHub）；镜像排第一后不再测速
-//     （它就在局域网，测速反而多花几秒）；
-//   - 截止时间按**来源**给，不按位置：镜像/官方地址 150 秒（镜像在同城本该秒级，
-//     官方"存在且可信"但不一定快），第三方加速镜像 300 秒。实测官方约 46KB/s、
-//     加速镜像约 640KB/s，让用户对着进度条等 10 分钟不可接受 —— 慢过头就换源；
-//   - 先下到 `<dest>.part` 再改名：失败时**不会**破坏用户自己放进来的产物
-//     （下面那条退路要靠它成立）；
-//   - 全部地址失败时，若磁盘上已有这个文件就**用它继续**，并如实写一条步骤 ——
-//     否则错误信息里那句"手动下载放到 <root>"就是一句空话。文件是否真的可用
-//     由后面的 verify_sha256 / verify_arm64 / extract 负责，坏了会明确报错。
+// DownloadAction 下载一份产物。镜像优先：镜像地址插到候选第一位；超时按**来源**给
+// （镜像/官方 150 秒、第三方加速 300 秒；实测官方约 46KB/s、加速镜像约 640KB/s）。
+// 先下 `<dest>.part` 再改名，全部地址失败时用磁盘上已有产物继续（是否可用交给后续校验步骤）。
 type DownloadAction struct {
 	// Artifact 是要下载的产物（Name 是落盘文件名）。
 	Artifact Artifact `json:"artifact"`
@@ -256,19 +192,13 @@ type DownloadAction struct {
 	DestDir string `json:"dest_dir,omitempty"`
 	// MirrorPreflight 为 true 时先探镜像上有没有这个包与清单（默认 false）。
 	MirrorPreflight bool `json:"mirror_preflight,omitempty"`
-	// SkipWhenMirrorUsed 为 true 时：若本次安装里已经有产物**真的从镜像站下到**
-	// （在当前步骤序列中，只有主产物会先于它下载），就跳过这一步。
-	//
-	// 为什么需要：上游校验清单（frp_sha256_checksums.txt / checksums.txt）只存在于
-	// GitHub，镜像站上没有。而走镜像时内容校验用的是**镜像清单**（manifest.json，
-	// 覆盖更全），这份上游清单根本用不到 —— 硬下它等于在"镜像优先"里又塞回一次
-	// 公网访问，GitHub 不可达时还会让整个安装失败。跳过它才是老实现的语义
-	// （老代码 usedMirror 时直接走 verifyMirrorChecksum，从不取上游清单）。
+	// SkipWhenMirrorUsed 为 true 时：本次安装已有产物**真的从镜像站下到**就跳过这一步。
+	// 上游校验清单只存在于 GitHub，而走镜像时用镜像清单（manifest.json，覆盖更全）——
+	// 硬下它等于在"镜像优先"里塞回一次公网访问，GitHub 不可达时还会让安装失败。
 	SkipWhenMirrorUsed bool `json:"skip_when_mirror_used,omitempty"`
 	// ExpectSHA256 非空时，本步直接按它校验（镜像清单里的 sha256 就是这么来的）。
 	ExpectSHA256 string `json:"expect_sha256,omitempty"`
-	// ChecksumSource 是 ExpectSHA256 的来源描述（只写进日志，便于事后判断
-	// "这次校验到底防住了什么"）。
+	// ChecksumSource 是 ExpectSHA256 的来源描述（只写进日志）。
 	ChecksumSource string `json:"checksum_source,omitempty"`
 }
 
@@ -277,27 +207,21 @@ func (a DownloadAction) Describe(ec *ExecConfig) string {
 	return "下载 " + a.Artifact.Name
 }
 
-// Exec 实现 InstallStep。
 func (a DownloadAction) Exec(ec *ExecConfig) error {
 	dest := ec.path(a.destPath())
-	// 走镜像时上游校验清单用不到（镜像清单才是 sha256 来源）：跳过它，
-	// 免得"镜像优先"又退化成一次公网访问。判定看本次安装是否真的从镜像下到过。
+	// 走镜像时上游清单用不到：跳过它，免得"镜像优先"又退化成一次公网访问。
 	if a.SkipWhenMirrorUsed && ec.mirrorDownloadedAny() {
 		ec.Result.step(ec.Ctx, "主产物已从镜像站下到，跳过 "+a.Artifact.Name+
 			" 的下载（sha256 以镜像清单为准，不再访问公网源）")
 		return nil
 	}
-	// 镜像预检只在步骤显式要求、且执行器接入了的时候做：
-	// 不要求预检的步骤（校验清单这类小文件）不该因为没接入就失败。
-	// 要求了却没接入则**明确报错**（静默跳过会让"镜像优先"变成一句空话）。
+	// 要求了预检却没接入则**明确报错**（静默跳过会让"镜像优先"变成一句空话）。
 	if a.MirrorPreflight {
 		if ec.MirrorPreflight == nil {
 			return fmt.Errorf("下载 %s 失败：这一步要求先做镜像预检，但执行器没有接入"+
 				"（面板内部错误）", a.Artifact.Name)
 		}
-		// 预检返回的是**它刚刚 HEAD 成功的那个地址**（不是另拼一份）——
-		// 用它当候选第一位，探测与实际下载就不可能指向两个地方。
-		// 返回空串 = 镜像不可用/缺件，保持产物自带的公网候选顺序。
+		// 用它 HEAD 成功的地址当候选第一位；空串 = 镜像不可用，保持自带候选顺序。
 		if mirrorURL := ec.MirrorPreflight(a.Artifact); mirrorURL != "" {
 			a.Artifact = a.Artifact.withMirrorFirst(mirrorURL)
 		}
@@ -312,12 +236,8 @@ func (a DownloadAction) destPath() string {
 	return strings.TrimRight(a.DestDir, "/") + "/" + a.Artifact.Name
 }
 
-// withMirrorFirst 返回一份"把镜像地址排到候选第一位"的产物副本。
-//
-// 为什么要去重：描述符里已经可能写了一份镜像候选（见 Artifact.URLs 的注释），
-// 执行期预检拿到的地址若与它相同，直接追加会变成"同一个地址下载两次"。
-// 用副本而不是改原描述符：描述符是注册表里的共享值，就地改会污染后续安装
-// （不同安装可能配了不同的镜像基址）。
+// withMirrorFirst 返回一份"镜像地址排候选第一位"的产物副本（去重，避免同一地址下两次）。
+// 用副本而非改原描述符：描述符是注册表共享值，就地改会污染后续安装。
 func (a Artifact) withMirrorFirst(mirrorURL string) Artifact {
 	if mirrorURL == "" {
 		return a
@@ -335,10 +255,8 @@ func (a Artifact) withMirrorFirst(mirrorURL string) Artifact {
 
 // ---------- 步骤：verify_sha256 ----------
 
-// VerifySHA256Action 按给定 sha256 校验产物。
-//
-// **失败即中止**：静默跳过等于把"有校验"变成"看运气"（老实现的原话）。
-// 这正是镜像/网络篡改或损坏的样子，必须明确报错。
+// VerifySHA256Action 按给定 sha256 校验产物。**失败即中止**：
+// 静默跳过等于把"有校验"变成"看运气"（镜像/网络篡改或损坏都会漏过）。
 type VerifySHA256Action struct {
 	// Artifact 是要校验的产物（用它的 Name 定位文件）。
 	Artifact Artifact `json:"artifact"`
@@ -346,8 +264,7 @@ type VerifySHA256Action struct {
 	Expect string `json:"expect,omitempty"`
 	// Source 是期望值的来源描述（如 "官方 frp_sha256_checksums.txt"）。
 	Source string `json:"source"`
-	// SkipIfNoChecksum 为 true 时"上游也没有清单"这种情况放行（默认 false，
-	// 即**必须有清单**，拿不到就中止）。Orbien 客户端是唯一放行的条目。
+	// SkipIfNoChecksum 为 true 时放行"上游也没有清单"（默认必须有清单，拿不到即中止）。Orbien 是唯一放行条目。
 	SkipIfNoChecksum bool `json:"skip_if_no_checksum,omitempty"`
 }
 
@@ -356,7 +273,6 @@ func (a VerifySHA256Action) Describe(ec *ExecConfig) string {
 	return "" // 校验过程由 Exec 自己写更具体的一行
 }
 
-// Exec 实现 InstallStep。
 func (a VerifySHA256Action) Exec(ec *ExecConfig) error {
 	_ = ec
 	return fmt.Errorf("verify_sha256 必须由执行器直接处理（面板内部错误）")
@@ -365,11 +281,8 @@ func (a VerifySHA256Action) Exec(ec *ExecConfig) error {
 // ---------- 步骤：verify_arm64 ----------
 
 // VerifyArm64Action 用 file(1) 复核二进制确实是 arm64。
-//
-// 为什么值得单独一步：Asset 名里有 darwin_arm64 并**不等于**内容一定是 arm64。
-// 上游改过一次命名/挂错产物，用户就会在 macOS 上得到一个跑不起来的服务，
-// 而且报错信息（launchd 的 "Bad CPU type"）完全指不到"下错架构"。
-// 这一步让失败发生在安装阶段，并且原因明确（铁律 8：不许 amd64、不许 Rosetta）。
+// Asset 名里有 darwin_arm64 并**不等于**内容一定是 arm64；这一步让失败发生在安装阶段，
+// 原因明确（铁律 8：不许 amd64、不许 Rosetta）。
 type VerifyArm64Action struct {
 	// Path 是要复核的文件（支持 {root} 占位符）。
 	Path string `json:"path"`
@@ -380,7 +293,6 @@ func (a VerifyArm64Action) Describe(ec *ExecConfig) string {
 	return "复核 " + filepath.Base(ec.path(a.Path)) + " 是原生 arm64"
 }
 
-// Exec 实现 InstallStep。
 func (a VerifyArm64Action) Exec(ec *ExecConfig) error {
 	return ec.verifyArm64(ec.path(a.Path))
 }
@@ -397,16 +309,11 @@ type ExtractAction struct {
 	Member string `json:"member,omitempty"`
 	// StripComponents 剥掉顶层目录层数。
 	StripComponents int `json:"strip_components,omitempty"`
-	// BootoutFirst 为 true 时先 bootout 旧实例再覆盖二进制。
-	//
-	// 为什么需要：macOS 上覆写正在执行的 Mach-O 可能让那个进程被系统直接杀掉
-	// （Killed: 9）。重装场景必须先停旧实例。这一步失败**无所谓** ——
-	// 本来就没装过时 bootout 必然报错，后面 bootstrap 才是决定性的那一步。
+	// BootoutFirst 为 true 时先 bootout 旧实例：覆写正在执行的 Mach-O 会被系统杀掉（Killed: 9）。
+	// 这一步失败无所谓（本来没装过时必然报错），后面 bootstrap 才是决定性的那一步。
 	BootoutFirst bool `json:"bootout_first,omitempty"`
 	// ExpectFile 是"解完之后必须存在这个文件"（空 = 不检查）。
-	//
-	// 解压成功但成员名不对（挑错了目录层级）是最隐蔽的一类失败：tar 退出码 0，
-	// 目录里却什么都没有，直到 launchd 报 "no such file" 才暴露。
+	// 解压成功但成员名不对最隐蔽：tar 退出码 0，目录里却什么都没有。
 	ExpectFile string `json:"expect_file,omitempty"`
 }
 
@@ -415,7 +322,6 @@ func (a ExtractAction) Describe(ec *ExecConfig) string {
 	return "解压 " + a.Artifact.Name
 }
 
-// Exec 实现 InstallStep。
 func (a ExtractAction) Exec(ec *ExecConfig) error {
 	return ec.extract(a)
 }
@@ -439,7 +345,6 @@ func (a CopyAction) Describe(ec *ExecConfig) string {
 	return "复制 " + ec.path(a.From) + " → " + ec.path(a.To)
 }
 
-// Exec 实现 InstallStep。
 func (a CopyAction) Exec(ec *ExecConfig) error { return ec.copyTree(a) }
 
 // ---------- 步骤：write_file ----------
@@ -450,11 +355,8 @@ type WriteFileAction struct {
 	Content string `json:"content"`
 	// Mode 是权限（八进制；0 = 0600，因为这里的文件大多含凭据）。
 	Mode int `json:"mode,omitempty"`
-	// Overwrite 为 true 时覆盖已存在的文件（默认 false）。
-	//
-	// ⚠️ 默认 false 是刻意的：配置里往往有用户填的密钥，重装时默认覆盖
-	// 等于把用户的数据冲掉（ddns-go 的 DNS 密钥就是这么丢过一次）。
-	// 要覆盖必须显式声明，而且构造步骤时就要判断好"这份文件该不该覆盖"。
+	// Overwrite 为 true 时覆盖已存在的文件（默认 false，刻意如此）：
+	// 配置里往往有用户填的密钥，重装时默认覆盖会冲掉用户数据（ddns-go 的 DNS 密钥丢过一次）。
 	Overwrite bool `json:"overwrite,omitempty"`
 	// SkipMessage 是"已存在所以跳过"时写给用户的话（默认给一句通用的）。
 	SkipMessage string `json:"skip_message,omitempty"`
@@ -471,36 +373,29 @@ func (a WriteFileAction) Describe(ec *ExecConfig) string {
 	return "写入 " + ec.path(a.Path)
 }
 
-// Exec 实现 InstallStep。
 func (a WriteFileAction) Exec(ec *ExecConfig) error { return ec.writeFile(a) }
 
 // ---------- 步骤：run ----------
 
 // RunAction 执行一条命令。
 type RunAction struct {
-	// Cmd 是命令路径（如 /usr/bin/curl）。**不接受 shell 字符串**：
-	// 命令与参数分开传，避免把路径/变量拼进 shell（注入与转义问题都在那里）。
+	// Cmd 是命令路径（如 /usr/bin/curl）。**不接受 shell 字符串**：命令与参数分开传，
+	// 避免把路径/变量拼进 shell（注入与转义问题都在那里）。
 	Cmd string `json:"cmd"`
 	// Args 是参数（支持 {root} 占位符）。
 	Args []string `json:"args"`
-	// As 是执行身份："user"（默认，降权到真实用户）/ "root"。
-	//
-	// 为什么默认降权：Homebrew 明确拒绝 root 运行，pip / venv 也是一样；
-	// 而面板自己是 root。反过来，写 /Library/LaunchDaemons 必须 root。
+	// As 是执行身份："user"（默认，降权到真实用户）/ "root"。默认降权：Homebrew、
+	// pip / venv 都拒绝 root 运行；反过来，写 /Library/LaunchDaemons 必须 root。
 	As string `json:"as,omitempty"`
 	// Timeout 是超时（必填；0 = 300 秒）。
 	Timeout time.Duration `json:"timeout,omitempty"`
 	// Env 是追加的环境变量。
 	Env []string `json:"env,omitempty"`
-	// Retries 是"失败后再试几次"（默认 0 = 不重试）。
-	//
-	// 只对**幂等**命令开放（下载 / 探测）：重试一个"装到一半"的写操作
-	// 会造成比失败更糟的状态。所以这个字段在需要它的少数步骤上显式写出来。
+	// Retries 是"失败后再试几次"（默认 0 = 不重试）。只对**幂等**命令开放：
+	// 重试一个"装到一半"的写操作会造成比失败更糟的状态。
 	Retries int `json:"retries,omitempty"`
-	// AllowFailure 为 true 时失败只写一条警告（必须写 Note）。
-	//
-	// 这里与"重装前 bootout"是同一类：目标状态是"没有旧实例"，
-	// 本来就没有旧实例时它必然报错，而那不是失败。
+	// AllowFailure 为 true 时失败只写一条警告（必须写 Note）。与"重装前 bootout"
+	// 同类：目标状态是"没有旧实例"，本来就没有时必然报错，而那不是失败。
 	AllowFailure bool   `json:"allow_failure,omitempty"`
 	Note         string `json:"note,omitempty"`
 }
@@ -513,7 +408,6 @@ func (a RunAction) Describe(ec *ExecConfig) string {
 	return "执行 " + filepath.Base(a.Cmd)
 }
 
-// Exec 实现 InstallStep。
 func (a RunAction) Exec(ec *ExecConfig) error { return ec.run(a) }
 
 // ---------- 步骤：wait_http ----------
@@ -533,7 +427,6 @@ func (a WaitHTTPAction) Describe(ec *ExecConfig) string {
 	return "等待 " + a.URL + " 可访问"
 }
 
-// Exec 实现 InstallStep。
 func (a WaitHTTPAction) Exec(ec *ExecConfig) error { return ec.waitHTTP(a) }
 
 // ---------- 步骤：pip_install ----------
@@ -549,10 +442,8 @@ type PipInstallAction struct {
 	// ExtraArgs 是额外参数（如 --upgrade）。
 	ExtraArgs []string      `json:"extra_args,omitempty"`
 	Timeout   time.Duration `json:"timeout,omitempty"`
-	// Verify 是"装完之后用什么命令验证真的可用"（空 = 不验证）。
-	//
-	// 为什么不省：装不上与装上了但 import 不了是两件事（缺 wheel、
-	// 依赖冲突、缺 extra），而第二种在 pip 退出码上是 0。
+	// Verify 是"装完之后用什么命令验证真的可用"（空 = 不验证）。不可省：装上了但
+	// import 不了在 pip 退出码上仍是 0（缺 wheel / 依赖冲突 / 缺 extra）。
 	Verify     []string `json:"verify,omitempty"`
 	VerifyNote string   `json:"verify_note,omitempty"`
 }
@@ -562,16 +453,11 @@ func (a PipInstallAction) Describe(ec *ExecConfig) string {
 	return "安装 Python 包 " + strings.Join(a.Packages, " ")
 }
 
-// Exec 实现 InstallStep。
 func (a PipInstallAction) Exec(ec *ExecConfig) error { return ec.pipInstall(a) }
 
 // ---------- 步骤：pull_model ----------
 
-// PullModelAction 拉一份模型权重。
-//
-// 这一轨目前只实现"执行器注入的下载器"这一层：真正的 HF 拉取需要
-// hf_transfer / 镜像回落 / 断点续传 / 校验，属于 pip-venv 轨的后续工作
-// （见 docs/应用描述符v2.md 的迁移清单：iopaint / qwen3tts 需要新字段）。
+// PullModelAction 拉一份模型权重（只实现"执行器注入的下载器"这一层）。
 type PullModelAction struct {
 	// Repo 是模型仓库（如 "Sanster/lama-cleaner-lama"）。
 	Repo string `json:"repo"`
@@ -592,7 +478,6 @@ func (a PullModelAction) Describe(ec *ExecConfig) string {
 	return "下载模型 " + a.Repo
 }
 
-// Exec 实现 InstallStep。
 func (a PullModelAction) Exec(ec *ExecConfig) error { return ec.pullModel(a) }
 
 // ---------- 步骤：create_db ----------
@@ -610,7 +495,6 @@ func (a CreateDBAction) Describe(ec *ExecConfig) string {
 	return "创建数据库 " + a.Name
 }
 
-// Exec 实现 InstallStep。
 func (a CreateDBAction) Exec(ec *ExecConfig) error { return ec.createDB(a) }
 
 // ---------- 步骤：seed_site ----------
@@ -630,17 +514,13 @@ func (a SeedSiteAction) Describe(ec *ExecConfig) string {
 	return "铺站点文件到 " + ec.path(a.Dest)
 }
 
-// Exec 实现 InstallStep。
 func (a SeedSiteAction) Exec(ec *ExecConfig) error { return ec.seedSite(a) }
 
 // ---------- 步骤：register_service ----------
 
-// RegisterServiceAction 把服务登记进「服务管理」。
-//
-// 顺序很关键：它必须排在 assert_ready **之前** —— 一旦验收改成如实失败，
-// 登记留在后面就会留下「任务失败、服务管理里又找不到它」的半成品
-// （2026-09-17 审计的原话）。登记失败**不**让整个部署失败（刻意接受的降级）：
-// launchd 服务本身是好的、软件能用，只是面板列表里暂时没有它。
+// RegisterServiceAction 把服务登记进「服务管理」，必须排在 assert_ready **之前**
+// （否则验收如实失败时会留下"任务失败、服务管理里又找不到它"的半成品）。
+// 登记失败**不**让整个部署失败（刻意降级）：launchd 服务本身是好的、软件能用。
 type RegisterServiceAction struct {
 	// Label / Name / Icon / Category 是登记信息（空 = 用描述符里的）。
 	Label    string `json:"label,omitempty"`
@@ -654,7 +534,6 @@ type RegisterServiceAction struct {
 func (a RegisterServiceAction) Kind() string                   { return "register_service" }
 func (a RegisterServiceAction) Describe(ec *ExecConfig) string { return "" }
 
-// Exec 实现 InstallStep。
 func (a RegisterServiceAction) Exec(ec *ExecConfig) error { return ec.registerService(a) }
 
 // ---------- 步骤：write_plist ----------
@@ -675,7 +554,6 @@ func (a WritePlistAction) Describe(ec *ExecConfig) string {
 	return "生成 launchd 服务定义 " + ec.Spec.Service.PlistPath
 }
 
-// Exec 实现 InstallStep。
 func (a WritePlistAction) Exec(ec *ExecConfig) error { return ec.writePlist(a) }
 
 // ---------- 步骤：launchd_bootout ----------
@@ -691,7 +569,6 @@ func (a LaunchdBootoutAction) Describe(ec *ExecConfig) string {
 	return "停止旧实例（如果它在跑）"
 }
 
-// Exec 实现 InstallStep。
 func (a LaunchdBootoutAction) Exec(ec *ExecConfig) error {
 	return ec.bootout(a.Label)
 }
@@ -711,7 +588,6 @@ func (a LaunchdBootstrapAction) Describe(ec *ExecConfig) string {
 	return "装载并启动服务"
 }
 
-// Exec 实现 InstallStep。
 func (a LaunchdBootstrapAction) Exec(ec *ExecConfig) error { return ec.bootstrap(a) }
 
 // ---------- 步骤：assert_ready ----------
@@ -733,30 +609,24 @@ func (a AssertReadyAction) Describe(ec *ExecConfig) string {
 	return "等待服务就绪（" + ec.readyExpect() + "）"
 }
 
-// Exec 实现 InstallStep。
 func (a AssertReadyAction) Exec(ec *ExecConfig) error { return ec.assertReady(a) }
 
 // ---------- 步骤：message ----------
 
 // MessageAction 只写一条进度（不产生任何副作用）。
-//
-// 唯一用途：把老实现里那些**给用户看的话**原样保留下来
-// （"安装目录：… 日志：…"、安装后的 Notes、凭据区块），
-// 换轨不能顺手把这些话弄丢 —— 它们往往就是用户唯一的操作指引。
+// 用途：把**给用户看的话**（安装目录/日志、Notes、凭据区块）原样保留 ——
+// 它们往往就是用户唯一的操作指引。
 type MessageAction struct {
 	// Lines 是要追加的步骤文本，逐条写（空串会写成一个空行，与老实现一致）。
 	Lines []string `json:"lines"`
 	// Secret 为 true 时这些文本只进 Credentials 区块，不进任务步骤。
-	//
-	// 为什么需要：口令/token **只允许出现在 InstallResult.Credentials 里**
-	// （见 InstallResult 的字段注释）—— 任务步骤会被折叠、会进审计日志。
+	// 口令/token **只允许出现在 InstallResult.Credentials 里** —— 任务步骤会进审计日志。
 	Secret bool `json:"secret,omitempty"`
 }
 
 func (a MessageAction) Kind() string                   { return "message" }
 func (a MessageAction) Describe(ec *ExecConfig) string { return "" }
 
-// Exec 实现 InstallStep。
 func (a MessageAction) Exec(ec *ExecConfig) error {
 	if a.Secret {
 		return fmt.Errorf("message 的 secret 文本必须由执行器直接处理（面板内部错误）")
@@ -765,46 +635,28 @@ func (a MessageAction) Exec(ec *ExecConfig) error {
 	return nil
 }
 
-// ============================================================================
 //  Runner：执行器唯一的副作用出口
-// ============================================================================
 
-// Runner 是描述符执行器需要的系统能力。
-//
-// 生产实现是 sysRunner（直接调 os/* + launchctl）；单测注入假实现，
-// 于是"整个安装编排"可以在不联网、不碰 launchd、不动真实家目录的前提下被验证。
+// Runner 是描述符执行器需要的系统能力。生产实现是 sysRunner（os/* + launchctl），
+// 单测注入假实现，于是"整个安装编排"能在不联网、不碰 launchd、不动真实家目录的前提下被验证。
 type Runner interface {
-	// Stat 返回路径是否存在与它的类型（isDir）。
 	Stat(path string) (exists bool, isDir bool, err error)
-	// MkdirAll 建目录。
 	MkdirAll(path string, mode os.FileMode) error
-	// WriteFile 写文件。
 	WriteFile(path string, data []byte, mode os.FileMode) error
-	// ReadFile 读文件。
 	ReadFile(path string) ([]byte, error)
-	// Size 返回文件大小（不存在返回 -1）。
 	Size(path string) int64
-	// Chmod 改权限。
 	Chmod(path string, mode os.FileMode) error
-	// Rename 原子改名。
 	Rename(from, to string) error
-	// Remove 删文件（不存在不算错）。
 	Remove(path string) error
-	// RemoveAll 删目录树。
 	RemoveAll(path string) error
-	// SHA256 算文件的 sha256（十六进制小写）。
 	SHA256(path string) (string, error)
-	// ChownTree 把目录树归属改成指定用户（递归）。
 	ChownTree(user, path string) error
-	// CopyTree 复制文件或目录树。
 	CopyTree(from, to string) error
 	// FileType 返回 `file -b` 的输出（架构复核用）。
 	FileType(ctx context.Context, path string) (string, error)
 	// RunAsUser 以真实用户身份执行（brew / pip / curl 都走这条）。
 	RunAsUser(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error)
-	// RunAsUserEnv 同 RunAsUser，但追加环境变量。
 	RunAsUserEnv(ctx context.Context, timeout time.Duration, env []string, name string, args ...string) (string, error)
-	// RunRoot 以 root 执行。
 	RunRoot(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error)
 	// Bootout 卸载 launchd 作业（幂等）。
 	Bootout(ctx context.Context, label string) error
@@ -812,11 +664,9 @@ type Runner interface {
 	Bootstrap(ctx context.Context, label, plist string) error
 	// LaunchRunning 报告 launchd 作业此刻是否真的在跑。
 	LaunchRunning(label string) (bool, string)
-	// WaitPort 在超时内轮询端口是否开始监听。
 	WaitPort(ctx context.Context, port int, timeout time.Duration) bool
 	// HTTPGet 发一次 HTTP GET（wait_http 用），返回状态码。
 	HTTPGet(ctx context.Context, url string, timeout time.Duration) (int, error)
-	// PrimaryIP 返回面板探测到的主机地址。
 	PrimaryIP(ctx context.Context) string
 }
 
@@ -913,9 +763,7 @@ func (r *sysRunner) PrimaryIP(ctx context.Context) string {
 	return r.m.primaryIP()
 }
 
-// ============================================================================
 //  执行器
-// ============================================================================
 
 // ExecConfig 是一次安装执行的现场。
 type ExecConfig struct {
@@ -928,26 +776,16 @@ type ExecConfig struct {
 	secrets     configSeedSecrets
 	secretLines []string
 	registered  bool
-	// mirrorDownloaded 记录"哪些产物这次是**真的从镜像站下到**的"（按产物 Name）。
-	//
-	// 为什么是集合而不是一个 bool：一次安装里有多个 download 步骤（主产物 +
-	// 上游校验清单）。用一个 bool 时后一个步骤会把前一个的清掉，导致主产物
-	// 明明来自镜像、校验却去取上游清单（0.12.4 的一处隐蔽错位）。
-	// 语义仍是"只有真的从镜像下成功才算"（失败回落到公网就不算）。
+	// mirrorDownloaded 记录"哪些产物这次是真的从镜像站下到的"（按产物 Name）。
+	// 用集合而非一个 bool：一次安装有多个 download 步骤，bool 会被后一步清掉，
+	// 导致主产物明明来自镜像、校验却去取上游清单（0.12.4 的隐蔽错位）。
 	mirrorDownloaded map[string]bool
 	// pathVars 是 {root} 这类占位符的取值。
 	pathVars map[string]string
 
-	// ---- 依赖注入：需要外部能力的步骤走这些钩子 ----
-	//
-	// 为什么用钩子而不是让步骤直接调 Manager：执行器要保持"可用假 Runner 单测"，
-	// 而镜像探测/清单校验/服务登记都是 Manager 的能力（涉及网络与数据库）。
-	// 钩子为 nil 时明确报错，**不静默跳过**（静默跳过正是"谎报成功"的来源）。
-	//
-	// MirrorPreflight：探镜像上有没有这个产物。返回**它实际 HEAD 成功的地址**
-	// （空串 = 镜像不可用/缺件，回落到产物自带地址）。返回值必须是地址而不是
-	// bool —— 只回 bool 时地址永远进不了候选列表，就会出现"日志说走镜像、
-	// curl 打 GitHub"（2026-09-17 真机 P0）。
+	// ---- 依赖注入：需要外部能力的步骤走这些钩子（钩子为 nil 时明确报错，不静默跳过）----
+	// MirrorPreflight 必须返回**它实际 HEAD 成功的地址**而不是 bool：只回 bool 时地址
+	// 永远进不了候选列表，就会出现"日志说走镜像、curl 打 GitHub"（2026-09-17 真机 P0）。
 	MirrorPreflight   func(a Artifact) string
 	VerifyMirror      func(a Artifact) (sha string, source string, err error)
 	FetchChecksumList func(a Artifact) (sha string, source string, err error)
@@ -968,11 +806,8 @@ func (ec *ExecConfig) primaryIP() string {
 	return ec.Runner.PrimaryIP(ec.Ctx)
 }
 
-// path 展开路径里的占位符（{root} 等），并把相对路径按安装根目录解析。
-//
-// 为什么支持相对路径：描述符里的路径绝大多数是"相对安装目录"，写成
-// "{root}/frpc.toml" 与 "frpc.toml" 应该得到同一个结果 —— 少一种写法
-// 就少一类"有的应用这么写、有的那么写"的不一致。
+// path 展开占位符（{root} 等），并把相对路径按安装根目录解析 ——
+// "{root}/frpc.toml" 与 "frpc.toml" 必须得到同一个结果。
 func (ec *ExecConfig) path(p string) string {
 	p = expandVars(p, ec.pathVars)
 	if p == "" {
@@ -989,17 +824,9 @@ func (ec *ExecConfig) path(p string) string {
 	return p
 }
 
-// expandArg 只把 {root} / {home} / {user} 这类占位符换成字面量，**不做路径拼接**。
-//
-// 为什么 plist 的参数不能用 path()：参数里既有路径也有非路径（`server`、`--data`、
-// `-c`、`:9876`、`-l`）。path() 会把"不以 / 或 ~ 开头"的值一律拼到 {root} 前面，
-// 于是 `server` 变成 `<root>/server`、`--data` 变成 `<root>/--data`。
-//
-// 真机复现（2026-09-17，Mac mini，Alist）：launchd 把 `<root>/server` 当成子命令，
-// 进程立刻退出 —— 日志 `Error: unknown command "/Users/zizdog/alist/server" for "alist"`，
-// 端口从未监听。这个坑此前没暴露，是因为 tarball 轨写 plist 这一步**从未在真机上
-// 真正跑过**：frpc / ddns-go 的服务都是旧安装器写的，而幂等闸门让它们没有被重写。
-// 需要路径的参数在描述符里已经写成 `{root}/xxx`，替换即可。
+// expandArg 只把 {root} / {home} / {user} 占位符换成字面量，**不做路径拼接**：
+// plist 参数里既有路径也有非路径（`server`、`--data`），path() 会把后者拼到 {root} 前面。
+// 真机复现（2026-09-17，Alist，这个坑）：launchd 把 `<root>/server` 当子命令，进程立刻退出。
 func (ec *ExecConfig) expandArg(s string) string { return expandVars(s, ec.pathVars) }
 
 // expandVars 做字面量替换（不引入模板引擎：值里带 {root} 也不会被二次展开）。
@@ -1011,8 +838,7 @@ func expandVars(s string, vars map[string]string) string {
 	for k := range vars {
 		keys = append(keys, k)
 	}
-	// 长 key 优先，避免 {root} 与 {rootDir} 这类前缀互相影响（当前没有，
-	// 但排序后行为与 key 的书写顺序无关，更不容易被后来的改动搞坏）。
+	// 长 key 优先（当前无前缀冲突，但排序后行为与 key 的书写顺序无关）。
 	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
 	repl := make([]string, 0, len(keys)*2)
 	for _, k := range keys {
@@ -1027,10 +853,8 @@ type InstallOptions struct {
 	RemoveData bool
 }
 
-// ExecuteInstall 按描述符执行安装：逐个步骤调用 Exec，任何一步失败即中止。
-//
-// 返回的 error 已经是"面向用户"的（说清期望什么/实际什么/怎么办）——
-// 执行器不会再包一层无信息的 "install failed"。
+// ExecuteInstall 按描述符执行安装：任何一步失败即中止。
+// 返回的 error 已是面向用户的（说清期望/实际/怎么办），不会再包一层 "install failed"。
 func ExecuteInstall(ec *ExecConfig) error {
 	if ec.Runner == nil {
 		return fmt.Errorf("描述符执行器缺少 Runner（面板内部错误）")
@@ -1059,10 +883,8 @@ func ExecuteInstall(ec *ExecConfig) error {
 	return nil
 }
 
-// execStep 分发一个步骤。
-//
-// 有两个步骤类型需要执行器的额外上下文（校验清单的取法、秘密文本的去向），
-// 所以在这里显式分派 —— 而不是让它们的 Exec 去报"面板内部错误"。
+// execStep 分发一个步骤。verify_sha256 / message 需要执行器的额外上下文
+// （校验清单的取法、秘密文本的去向），所以在这里显式分派。
 func execStep(ec *ExecConfig, st InstallStep) error {
 	switch a := st.(type) {
 	case VerifySHA256Action:
@@ -1075,8 +897,7 @@ func execStep(ec *ExecConfig, st InstallStep) error {
 			}
 			switch {
 			case ec.mirrorUsed(art.Name) && ec.VerifyMirror != nil:
-				// 走镜像时用**镜像清单**的 sha256：镜像清单覆盖全部条目，
-				// 比"只有 frp 有上游清单"更严（Lucky / Orbien 上游根本没有清单）。
+				// 走镜像时用镜像清单的 sha256（覆盖全部条目，比上游清单更严）。
 				var err error
 				if expect, source, err = ec.VerifyMirror(art); err != nil {
 					return err
@@ -1123,10 +944,8 @@ func execStep(ec *ExecConfig, st InstallStep) error {
 // UserName 返回真实用户名（由调用方在 pathVars 里提供）。
 func (ec *ExecConfig) UserName() string { return ec.pathVars["{user}"] }
 
-// isMirrorURL 判断一个候选地址是不是镜像站上的那一份。
-//
-// 判据用"镜像基址非空且是它的前缀"，而不是把镜像地址另存一份 ——
-// 另存一份就会出现"改了镜像基址、判断还用旧值"的错位。
+// isMirrorURL 判断候选地址是否镜像站上的那一份（镜像基址前缀）。
+// 不另存镜像地址：另存会出现"改了镜像基址、判断还用旧值"的错位。
 func (ec *ExecConfig) isMirrorURL(u string) bool {
 	base := ec.MirrorBase
 	if base == "" {
@@ -1136,9 +955,7 @@ func (ec *ExecConfig) isMirrorURL(u string) bool {
 }
 
 // markMirrorDownload 记下"这个产物这次是不是真的从镜像站下到的"。
-//
-// 只有下载成功那一刻才调用，且由**实际用的候选地址**判定 ——
-// 这样"镜像就在候选里但下载失败、回落到了官方"不会被谎报成走了镜像。
+// 由**实际用的候选地址**判定：镜像在候选里但下载失败回落官方时不许记成走了镜像。
 func (ec *ExecConfig) markMirrorDownload(asset string, fromMirror bool) {
 	if ec.mirrorDownloaded == nil {
 		ec.mirrorDownloaded = map[string]bool{}
@@ -1156,10 +973,8 @@ func (ec *ExecConfig) mirrorUsed(asset string) bool { return ec.mirrorDownloaded
 // mirrorDownloadedAny 报告本次安装是否已经有产物真的从镜像站下到。
 func (ec *ExecConfig) mirrorDownloadedAny() bool { return len(ec.mirrorDownloaded) > 0 }
 
-// mirrorChecksumFor 从镜像清单里取某个产物的 sha256（老 verifyMirrorChecksum 的核心）。
-//
-// 抽出来的原因：执行器需要的是"期望值 + 来源"，而不是"下载 + 校验 + 写日志"
-// 一整段 —— 日志由步骤系统负责，两处各写一遍日志必然不一致。
+// mirrorChecksumFor 从镜像清单里取某个产物的 sha256。
+// 只返回"期望值 + 来源"：日志由步骤系统统一负责，两处各写一遍必然不一致。
 func (m *Manager) mirrorChecksumFor(ctx context.Context, spec releaseBinaryApp) (string, error) {
 	url := m.appManifestURL(spec.ID, spec.Tag)
 	mm, err := m.fetchMirrorManifest(ctx, spec.ID, spec.Tag)
@@ -1215,13 +1030,10 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 			if rerr := ec.Runner.Rename(part, dest); rerr != nil {
 				return fmt.Errorf("下载完成但保存到 %s 失败: %w", dest, rerr)
 			}
-			// 这次到底走没走镜像：决定后面用哪套 sha256 校验
-			// （镜像清单 vs 上游 checksums）。只有**真的从镜像下到了**才算 ——
-			// 镜像在候选里但下载失败、回落到了官方，不许记成走了镜像。
+			// 只有真的从镜像下到才算走了镜像（回落官方不许记成走了镜像）。
 			ec.markMirrorDownload(a.Artifact.Name, fromMirror)
 			size := ec.Runner.Size(dest)
-			// 把"实际用了多久、多快"写进任务日志：慢的时候用户能看出是网络问题，
-			// 我们事后也能一眼判断"该不该再调超时"。
+			// 把实际耗时/速度写进任务日志，便于事后判断该不该调超时。
 			ec.Result.step(ec.Ctx, fmt.Sprintf("下载完成：%s（%.1f 秒，约 %s/s）",
 				humanBytes(size), elapsed,
 				humanBytes(int64(float64(size)/max64(elapsed, 0.1)))))
@@ -1231,8 +1043,7 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 		ec.Result.step(ec.Ctx, "下载失败，换下一个地址："+tailText(out, 200))
 		_ = ec.Runner.Remove(part)
 	}
-	// 自动下载全失败：磁盘上已经有这个产物就用它继续 ——
-	// 否则错误信息里那句"手动下载放到 <root>"就是一句空话。
+	// 自动下载全失败：磁盘上已有该产物就用它继续 —— 否则"手动下载放到 <root>"就是空话。
 	if ok, _, _ := ec.Runner.Stat(dest); ok {
 		ec.Result.step(ec.Ctx, "所有自动下载地址都失败，改用磁盘上已有的 "+dest)
 		return nil
@@ -1242,15 +1053,9 @@ func (ec *ExecConfig) download(a DownloadAction, dest string) error {
 		a.Artifact.Name, len(urls), lastErr, filepath.Dir(dest))
 }
 
-// downloadSource 给出某个候选地址的**来源标签**与**截止时间**。
-//
-// 标签必须与实际地址一致（用户就是靠任务日志判断"这次到底走没走镜像"）：
-//   - 镜像站地址 → "镜像站"，150 秒（同城/局域网，正常秒级完成；失败要快速回落）；
-//   - 官方 GitHub → "官方地址"，150 秒（"存在且可信"但不一定快，实测约 46KB/s）；
-//   - 其余（第三方加速镜像）→ "加速镜像（第三方）"，300 秒（实测约 640KB/s）。
-//
-// 为什么按**来源**而不是候选位置判定：老实现按 i==0 判定，镜像排到第一位后
-// 官方地址（位置变成 1）会拿到 300 秒，与"官方给更短截止时间"的语义相反。
+// downloadSource 给出候选地址的来源标签与截止时间：镜像站/官方 150 秒、
+// 其余（第三方加速镜像）300 秒 —— 实测官方约 46KB/s、加速镜像约 640KB/s。
+// 按**来源**而非候选位置判定：按位置时镜像排第一会让官方地址也拿到 300 秒。
 func (ec *ExecConfig) downloadSource(u string) (label string, maxTime int) {
 	switch {
 	case ec.isMirrorURL(u):
@@ -1307,8 +1112,7 @@ func (ec *ExecConfig) extract(a ExtractAction) error {
 	}
 	dest = ec.path(dest)
 	if a.BootoutFirst {
-		// 重装场景：先停旧实例再覆盖二进制（覆写正在执行的 Mach-O 会被系统杀掉）。
-		// 失败无所谓：本来没装过时 bootout 必然报错。
+		// 重装先停旧实例（覆写正在执行的 Mach-O 会被系统杀掉）；失败无所谓。
 		_ = ec.Runner.Bootout(ec.Ctx, ec.Spec.Service.Label)
 	}
 	switch a.Artifact.Kind {
@@ -1318,8 +1122,7 @@ func (ec *ExecConfig) extract(a ExtractAction) error {
 			return fmt.Errorf("解压失败: %v（%s）", err, tailText(out, 300))
 		}
 	case ArtifactZip:
-		// zip 的 --strip-components 不存在，挑成员靠解后再删；
-		// 这里只做"整体解压 + 断言目标存在"，因为需要挑成员的 zip 目前没有。
+		// zip 无 --strip-components，这里只做整体解压（需要挑成员的 zip 目前没有）。
 		if a.StripComponents != 0 || a.Member != "" {
 			return fmt.Errorf("zip 产物暂不支持 StripComponents/Member（产物 %s）", a.Artifact.Name)
 		}
@@ -1328,7 +1131,6 @@ func (ec *ExecConfig) extract(a ExtractAction) error {
 			return fmt.Errorf("解压失败: %v（%s）", err, tailText(out, 300))
 		}
 	case ArtifactBinary:
-		// 下载下来就是可执行文件：不解包，只保证它在 dest 里。
 		target := filepath.Join(dest, filepath.Base(asset))
 		if target != asset {
 			if err := ec.copyTree(CopyAction{From: asset, To: target}); err != nil {
@@ -1349,18 +1151,9 @@ func (ec *ExecConfig) extract(a ExtractAction) error {
 	return nil
 }
 
-// tarExtractArgs 组装 tar 的解压参数。
-//
-// 默认是 `-xzf <asset> -C <dest>`（tar 的选项必须在成员名前，所以这里返回
-// 全部参数）。挑成员时成员名要不要带顶层目录取决于 StripComponents：
-//   - >0：tarball 里有一层顶层目录（frp 的是 frp_0.71.0_darwin_arm64/），
-//     tar 的成员匹配按归档内的完整路径，所以成员名必须是 <顶层目录>/<binary>；
-//   - ==0：成员就是平级的（ddns-go 的是 ddns-go / README.md / LICENSE），
-//     成员名就是 <binary>。
-//
-// 这条区分是**真机踩出来的**：ddns-go 的产物没有顶层目录，沿用
-// "成员名一定带顶层目录（用 asset 名去掉 .tar.gz 猜）"的老写法，
-// tar 会去找一个不存在的 ddns-go_6.17.7_darwin_arm64/ddns-go，解压直接失败。
+// tarExtractArgs 组装 tar 的解压参数（选项必须在成员名前，所以返回全部参数）。
+// 成员名是否带顶层目录取决于 StripComponents：>0 是 <顶层目录>/<binary>，==0 就是 <binary>。
+// 真机踩过：ddns-go 产物没有顶层目录，按 asset 名猜路径会让 tar 找一个不存在的成员而失败。
 func tarExtractArgs(asset, dest, member string, strip int) []string {
 	args := []string{"-xzf", asset, "-C", dest}
 	if member == "" {
@@ -1826,8 +1619,7 @@ func (ec *ExecConfig) assertReady(a AssertReadyAction) error {
 	}
 	timeout := ec.Spec.Health.TimeoutOr()
 	probe := ec.Spec.Health.Probe
-	// 没声明探针时按端口自动选：不监听任何端口的应用（orbien 客户端是纯出站连接）
-	// 只能看 launchd —— 对它们等端口必然超时，每次安装都会误报一次。
+	// 没声明探针时按端口自动选：不监听端口的应用只能看 launchd，等端口必然误报超时。
 	if probe == ProbePort && port <= 0 {
 		probe = ProbeLaunchd
 	}
@@ -1850,8 +1642,7 @@ func (ec *ExecConfig) assertReady(a AssertReadyAction) error {
 		Probe: func(ctx context.Context) readyVerdict {
 			switch probe {
 			case ProbeLaunchd:
-				// 措辞与老 waitLaunchdRunning 逐字一致：不监听端口的应用
-				// （orbien 客户端是纯出站连接）只能看 launchd 有没有真的把它拉起来。
+				// 不监听端口的应用（纯出站连接）只能看 launchd 有没有真的把它拉起来。
 				ok, detail := ec.Runner.LaunchRunning(ec.Spec.Service.Label)
 				if ok {
 					return readyVerdict{OK: true, Actual: "已就绪，" + detail}
@@ -1902,8 +1693,7 @@ func httpProbeStatus(ctx context.Context, url string, timeout time.Duration) (in
 	client := &http.Client{
 		Timeout: timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			// 不跟随重定向：3xx 本身就是"服务活着"的证据，
-			// 跟随下去反而会被下一个不可达的地址拖住。
+			// 不跟随重定向：3xx 本身就是"服务活着"的证据。
 			return http.ErrUseLastResponse
 		},
 	}
@@ -1951,10 +1741,8 @@ func xmlBool(v bool) string {
 	return "false"
 }
 
-// httpStatusAcceptable 判定 HTTP 状态码是否算"健康"。
-//
-// 判据与 health.go 的既有实现一致：2xx/3xx 都算（ddns-go 未登录时 GET /
-// 返回 307 → /login，能稳定反映"服务活着"）。
+// httpStatusAcceptable 判定 HTTP 状态码是否算"健康"（判据与 health.go 一致）：
+// 2xx/3xx 都算（ddns-go 未登录时 GET / 返回 307 → /login）。
 func httpStatusAcceptable(code int, extra []int) bool {
 	for _, s := range extra {
 		if code == s {

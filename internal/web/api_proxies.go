@@ -27,24 +27,14 @@ import (
 	"github.com/zizdog/zizpanel/internal/tlsx"
 )
 
-// ============================================================================
-//  「反向代理」独立功能
-//
-//  与「网站管理」的区别（这是刻意的分工，不是重复）：
-//    · 网站管理：一个站点 = 域名 + 根目录 + PHP/伪静态（可选带反代）；
-//    · 反向代理：一条规则 = 监听端口 + 域名/Host + 路径前缀 + 目标地址。
-//      它**不需要站点目录**，多数用法就是"把某个端口上的请求转到另一台机器"。
-//
-//  规则存在 proxies 表里，生成的 nginx 配置写进 vhosts/proxy-<id>.conf
-//  （前缀 proxy- 保证与站点文件 <域名>.conf 不撞名），写入与 reload 都
-//  复用已有的 helper（含 nginx -t 校验与失败回滚）。
-// ============================================================================
+// 「反向代理」独立功能：一条规则 = 监听端口 + 域名/Host + 路径前缀 + 目标地址，
+// 不需要站点目录（与「网站管理」的分工）。规则存 proxies 表，配置写进
+// vhosts/proxy-<id>.conf（前缀保证不与站点 <域名>.conf 撞名）；写入与 reload
+// 复用站点侧 helper（含 nginx -t 校验与失败回滚）。
 
 // proxyLogDir 是反代规则自己的日志目录（与站点日志分开，便于按规则排查）。
-//
-// 目录由面板以 root 创建，而真正往里写日志的是**以真实用户运行的 nginx**，
-// 所以建完立刻把归属交还真实用户（目录里的日志文件由 chownProxyLogTrees
-// 在 reload 前整棵递归修正 —— 那才是 reload 静默失败的根源）。
+// 面板以 root 建目录、nginx 以真实用户写日志，建完必须把归属交还真实用户
+// （reload 前由 chownProxyLogTrees 整棵递归修正，否则 reload 静默失败）。
 func (s *Server) proxyLogDir() string {
 	dir := filepath.Join(s.Cfg.LogRoot, "proxy")
 	_ = os.MkdirAll(dir, 0o755)
@@ -56,23 +46,9 @@ func (s *Server) proxyRepo() *proxies.Repository {
 	return proxies.NewRepository(s.Store)
 }
 
-// ============================================================================
-//  反向代理「需要用户名密码」（HTTP Basic Auth）
-//
-//  用户 2026-09-25 要求（类 Lucky）：每条反代规则可单独开启"需要用户名密码"，
-//  开启后访问该规则地址必须通过 HTTP Basic Auth，否则 401 + WWW-Authenticate。
-//
-//  真相存哪：**不新增 DB 列**（proxies 表的列清单在 repository.go 里固定，
-//  本轮的改动范围刻意不包含 store.go / repository.go）。鉴权配置以 JSON 存进
-//  面板已有的 settings 表，键 `proxy_auth.<id>`：{enabled,user,hash}。
-//  applyProxy 在生成配置前把它装回 Rule，所以"一条规则的鉴权"只有这一份真相。
-//
-//  口令哈希用什么：**apr1**（Apache MD5，带 8 字符随机盐 + 1000 轮拉伸）。
-//  项目面板口令用的是 bcrypt，但 nginx 的 auth_basic_user_file 在本机
-//  （macOS + nginx 1.31.5）实测**不支持 bcrypt**：$2a$/$2y$/$2b$ 三种前缀都是
-//  "正确口令也回 401"（2026-09-25 实测）。apr1 是 nginx 自己实现的，实测可用。
-//  无论哪种，仓库里**只有哈希**：明文只存在于这次请求的内存里，绝不落盘/进日志。
-// ============================================================================
+// 反向代理「需要用户名密码」（HTTP Basic Auth）：每条规则可单独开启，否则 401。
+// 真相存 settings 表键 `proxy_auth.<id>`（**不新增 DB 列**），applyProxy 生成配置前装回 Rule。
+// apr1 哈希：本机 nginx 1.31.5 实测**不支持 bcrypt**（2026-09-25 实测）；仓库里只有哈希，明文绝不落盘/进日志。
 
 const proxyAuthSettingPrefix = "proxy_auth."
 
@@ -87,10 +63,8 @@ func proxyAuthKey(id int64) string {
 	return proxyAuthSettingPrefix + strconv.FormatInt(id, 10)
 }
 
-// proxyAuthFile 返回某条规则的 htpasswd 文件路径。
-//
-// 放在 DataDir 下（与证书同一个根），由面板生成、0600、属主对齐 DataDir ——
-// 与 alignProxyCertOwner 同一条真机教训：nginx 读不到就是 401 到底/配置报错。
+// proxyAuthFile 返回某条规则的 htpasswd 文件路径：放 DataDir 下、0600、属主对齐 DataDir
+// —— 与 alignProxyCertOwner 同一条真机教训：nginx 读不到就是 401 到底/配置报错。
 func (s *Server) proxyAuthFile(id int64) string {
 	return filepath.Join(s.Cfg.DataDir, "proxy-auth", fmt.Sprintf("proxy-%d.htpasswd", id))
 }
@@ -129,10 +103,8 @@ func (s *Server) saveProxyAuth(ctx context.Context, id int64, cfg proxyAuthConfi
 }
 
 // hydrateProxyAuth 把持久化的鉴权配置装回 Rule（生成 nginx 配置前必须调用）。
-//
-// 这是唯一把 Auth* 字段填进 Rule 的地方：仓库层读出来的 Rule 永远没有这几个字段，
-// 任何一个"重新生成配置"的路径漏了这一步，鉴权就会被静默抹掉 —— 所以
-// applyProxy 在生成前统一调用它，而不是指望每个调用方自觉。
+// 唯一把 Auth* 字段填进 Rule 的地方：任何"重新生成配置"的路径漏了它，鉴权会被静默
+// 抹掉 —— 所以由 applyProxy 统一调用，而不是指望每个调用方自觉。
 func (s *Server) hydrateProxyAuth(ctx context.Context, rule *proxies.Rule) error {
 	if rule == nil {
 		return nil
@@ -152,9 +124,8 @@ func (s *Server) hydrateProxyAuth(ctx context.Context, rule *proxies.Rule) error
 	return nil
 }
 
-// writeProxyAuthFile 按当前 Rule 的鉴权配置生成/删除 htpasswd 文件。
-//
-// 关闭鉴权时把文件删掉：vhost 已经不再引用它，留着就是一份没用的口令哈希躺在盘上。
+// writeProxyAuthFile 按当前 Rule 的鉴权配置生成/删除 htpasswd 文件：关闭后 vhost
+// 不再引用它，留着一份没用的口令哈希躺在盘上没有意义。
 func (s *Server) writeProxyAuthFile(rule *proxies.Rule) error {
 	if rule == nil {
 		return nil
@@ -181,10 +152,8 @@ func (s *Server) writeProxyAuthFile(rule *proxies.Rule) error {
 	return nil
 }
 
-// alignProxyAuthOwner 把密码文件的属主对齐到 DataDir（与证书同一条真机教训）。
-//
-// 面板以 root 跑、nginx 以真实用户跑；root 用 0600 写出的文件 nginx 读不到，
-// 表现为 nginx 报 permission denied 或一律 401。只改属主、不放宽权限。
+// alignProxyAuthOwner 把密码文件属主对齐 DataDir（与证书同一条真机教训）：root 用
+// 0600 写出的文件 nginx（真实用户）读不到，表现为 permission denied 或一律 401。
 func (s *Server) alignProxyAuthOwner(path string) {
 	if os.Geteuid() != 0 {
 		return
@@ -202,13 +171,9 @@ func (s *Server) alignProxyAuthOwner(path string) {
 	}
 }
 
-// proxyAuthFromRequest 把请求里的鉴权字段合并到已有配置并校验。
-//
-// 语义：
-//   - auth_password 非空才更新哈希；空串 = 保持原密码（前端不回显密码，所以
-//     "只改用户名/改备注"不会被迫重设密码）；
-//   - 关闭鉴权时把用户名与哈希一起清掉（不留残料）；
-//   - 开启时用户名与哈希都必须在 —— 少一个就明确报错，绝不生成一份没有鉴权的配置。
+// proxyAuthFromRequest 把请求里的鉴权字段合并到已有配置并校验：auth_password 非空才
+// 更新哈希（空串 = 沿用原密码，前端不回显，所以改用户名/备注不会被迫重设密码）；
+// 关闭时把用户名与哈希一起清掉；开启时两者都必须在，绝不生成一份没有鉴权的配置。
 func proxyAuthFromRequest(req proxyReq, cur proxyAuthConfig) (proxyAuthConfig, error) {
 	next := cur
 	if req.AuthEnabled != nil {
@@ -242,15 +207,9 @@ func proxyAuthFromRequest(req proxyReq, cur proxyAuthConfig) (proxyAuthConfig, e
 	return next, nil
 }
 
-// proxyAuthView 回读一条规则**磁盘上生效的**鉴权配置。
-//
-// 这是"保存后回读生效值"的实现：不只看数据库里写了什么，而是看
-//
-//	① htpasswd 文件真的在、里面真的有这个用户与哈希；
-//	② 生成的 nginx 配置里真的有 auth_basic 与指向该文件的 auth_basic_user_file。
-//
-// 两者都对才算 verified=true；否则 verified=false + note 写清卡在哪一步 ——
-// 界面据此显示"未复核"，而不是只报一句"已保存"。
+// proxyAuthView 回读一条规则**磁盘上生效的**鉴权配置（"保存后回读生效值"）：
+// ① htpasswd 文件真在且含该用户与哈希；② 生成的 nginx 配置里真有 auth_basic 与
+// auth_basic_user_file。两者都对才 verified=true，否则 note 写清卡在哪一步，界面显示"未复核"。
 func (s *Server) proxyAuthView(ctx context.Context, rule *proxies.Rule) map[string]any {
 	view := map[string]any{
 		"enabled": false, "user": "", "password_set": false,
@@ -304,9 +263,8 @@ func (s *Server) proxyAuthView(ctx context.Context, rule *proxies.Rule) map[stri
 	return view
 }
 
-// parseHtpasswdFirstUser 解析 htpasswd 的第一条有效行，返回 (用户名, 是否带哈希)。
-//
-// 只为回读/展示用，不做校验（校验由 nginx 自己做）。
+// parseHtpasswdFirstUser 解析 htpasswd 的第一条有效行，返回 (用户名, 是否带哈希)；
+// 只为回读/展示，不做校验（校验由 nginx 自己做）。
 func parseHtpasswdFirstUser(content string) (string, bool) {
 	for _, ln := range strings.Split(content, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -346,12 +304,9 @@ func randomApr1Salt() (string, error) {
 	return string(out), nil
 }
 
-// apr1Crypt 实现 Apache 的 apr1（MD5 crypt）口令哈希。
-//
-// 为什么在仓库里自己实现而不是调 `openssl passwd -apr1`：后者要把明文口令
-// 放进命令行参数 —— 同一台机器上 `ps` 就能看到，违反"口令不进日志/进程表"。
-// 算法是 Apache apr_md5.c 的公开实现，输出形如 `$apr1$<salt>$<22 字符>`，
+// apr1Crypt 实现 Apache 的 apr1（MD5 crypt）口令哈希：输出形如 `$apr1$<salt>$<22 字符>`，
 // nginx 的 auth_basic_user_file 原生支持（本机 nginx 1.31.5 实测 200/401 正确）。
+// 自己实现而不调 `openssl passwd -apr1`：后者把明文放进命令行参数，同机 `ps` 就能看到。
 func apr1Crypt(password, salt string) string {
 	if len(salt) > 8 {
 		salt = salt[:8]
@@ -430,35 +385,23 @@ func apr1To64(v, n int) string {
 	return string(out)
 }
 
-// proxyLookupHostFn 是"目标是公网还是局域网"判定用的 DNS 解析器。
-//
-// 做成变量有两个原因：
-//  1. 单测必须能钉住域名解析结果 —— 否则一次 `go test` 就会去查真实 DNS；
-//  2. 生产里它就是 net.LookupHost，行为与面板其它探测一致。
-//
-// 注意：这里只用于**判定与提示**。真正决定"要不要起转发器"的是
-// Manager.NeedsForward（它用注入到 Manager 里的同一个解析器）。
+// proxyLookupHostFn 是"目标是公网还是局域网"判定用的 DNS 解析器，做成变量是为了
+// 单测能钉住解析结果（否则一次 go test 就会去查真实 DNS）。
+// 只用于**判定与提示**：真正决定"要不要起转发器"的是 Manager.NeedsForward。
 var proxyLookupHostFn = net.LookupHost
 
-// proxyProbeTargetFn 是"面板自己能不能直连目标"的探针。
-//
-// 做成变量是为了让 directLANBlockedAdvice 可单测：那条判据要证明
-// "面板连得上、只有 nginx 连不上"，而真去连一个局域网地址在单测里是不允许的。
+// proxyProbeTargetFn 是"面板自己能不能直连目标"的探针，做成变量是为了让
+// directLANBlockedAdvice 可单测（真去连局域网地址在单测里不允许）。
 var proxyProbeTargetFn = probeTarget
 
-// proxyLANForwardAdvice 是"nginx 直连局域网目标失败"时给用户的话。
-//
-// 必须写清楚三件事：是什么（macOS 15 本地网络授权）、为什么无头服务器救不了
-// （没人点弹窗）、怎么修（改成经面板转发，或手工授权）。写不清就是让用户在
-// 502 面前瞎猜 —— 而这正是这个功能存在的理由。
+// proxyLANForwardAdvice 是"nginx 直连局域网目标失败"时给用户的话：必须写清是什么
+// （macOS 15 本地网络授权）、为什么无头服务器救不了、怎么修（改成经面板转发）。
 const proxyLANForwardAdvice = "nginx 连不上局域网目标（macOS 15 本地网络授权）：无头服务器无法弹窗授权；" +
 	"建议把本规则改为『经面板转发』（推荐），或到 系统设置 → 隐私与安全性 → 本地网络 里给 nginx 授权"
 
-// handleProxyList 列出全部规则，并带上每条规则的实时状态。
-//
-// 状态里最要紧的是 `port_listening`：规则"已启用"不等于 nginx 真的在听
-// —— 端口被别的进程占了、或 nginx 没起来时，界面必须如实显示，
-// 否则用户会以为规则生效了却怎么都访问不到。
+// handleProxyList 列出全部规则并带上每条规则的实时状态。最要紧的是 `port_listening`：
+// "已启用"不等于 nginx 真的在听（端口被占 / nginx 没起来），必须如实显示，
+// 否则用户会以为规则生效了却访问不到。
 func (s *Server) handleProxyList(w http.ResponseWriter, r *http.Request) {
 	list, err := s.proxyRepo().List(r.Context())
 	if err != nil {
@@ -478,24 +421,15 @@ func (s *Server) handleProxyList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ============================================================================
-//  规则「实时状态」的 TTL 缓存（2026-09-19 用户报"反向代理页明显变慢"）
-//
-//  根因：handleProxyList 对每条规则都**串行**跑一次真实目标探测
-//  （proxyProbeTargetFn，超时 3s）与一次端口拨号（portListening，超时 800ms）。
-//  目标不可达时每条就是几秒，规则一多整页就是"明显需要等待" ——
-//  这正是 AGENTS 第三节坑 165：昂贵的真实探测不许放在列表/首屏路径上。
-//
-//  修法：列表只读这里的缓存（带检测时间）；探测改为前端渲染后异步触发，
-//  并发、每条短超时（≤500ms），结果写回缓存；缓存的旧结果带检测时间展示。
-// ============================================================================
+// 规则「实时状态」的 TTL 缓存：列表只读缓存，真实探测（目标 3s + 端口拨号 800ms）
+// 改为前端渲染后异步触发（AGENTS 第三节坑 165：昂贵探测不许放在列表/首屏路径上）。
+// 缓存的旧结果带检测时间展示，绝不把过期缓存当成实时状态。
 
 const (
 	// proxyStatusTTL 是"结果还算新鲜"的时长；超过它界面要标出实际检测时间。
 	proxyStatusTTL = 60 * time.Second
-	// proxyStatusProbeTimeout 是单条规则状态探测的超时（端口拨号 + 目标 TCP 连接）。
-	//
-	// 刻意远小于列表接口里原来的 3s：状态是"锦上添花"，不值得让用户等。
+	// proxyStatusProbeTimeout 是单条规则状态探测的超时。刻意远小于列表接口里原来的 3s：
+	// 状态是"锦上添花"，不值得让用户等。
 	proxyStatusProbeTimeout = 500 * time.Millisecond
 	// proxyStatusProbeConcurrency 是并发探测的条数上限（避免一次开太多 fd）。
 	proxyStatusProbeConcurrency = 8
@@ -522,10 +456,8 @@ type proxyStatusSnapshot struct {
 	Age       time.Duration
 }
 
-// proxyStatusCache 进程内缓存。
-//
-// 用包级变量而不是 Server 字段：Server 结构体在 server.go，不在本轮允许改动的
-// 文件范围内。键里带 target/listen，避免测试之间同 id 不同规则串结果。
+// proxyStatusCache 是进程内缓存。用包级变量是因为 Server 结构体不在本轮允许改动的
+// 文件范围内；键里带 target/listen，避免测试之间同 id 不同规则串结果。
 var proxyStatusCache = struct {
 	mu sync.Mutex
 	m  map[string]proxyStatusEntry
@@ -579,10 +511,8 @@ func proxyStatusResetCache() {
 	proxyStatusCache.mu.Unlock()
 }
 
-// probeProxyStatuses 并发探测一批规则的状态，写进缓存并返回逐条结果。
-//
-// 每条都带 500ms 超时；用信号量限制并发。**绝不在 HTTP 列表路径里调用它** ——
-// 只由前端渲染完后的异步探测请求（或用户点「检测」）触发。
+// probeProxyStatuses 并发探测一批规则的状态，写进缓存并返回逐条结果（每条 500ms 超时，
+// 信号量限并发）。**绝不在 HTTP 列表路径里调用它**。
 func (s *Server) probeProxyStatuses(ctx context.Context, rules []*proxies.Rule) map[int64]proxyStatusSnapshot {
 	out := map[int64]proxyStatusSnapshot{}
 	var mu sync.Mutex
@@ -620,7 +550,6 @@ func (s *Server) probeProxyStatuses(ctx context.Context, rules []*proxies.Rule) 
 
 // proxyView 组装一条规则给前端的样子（含实时状态）。
 func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]any {
-	// 鉴权配置装回 Rule（仓库层读出来的 Rule 没有这几个字段）。
 	if err := s.hydrateProxyAuth(ctx, rule); err != nil && s.Log != nil {
 		s.Log.Warn("读取规则 %d 的鉴权配置失败：%v", rule.ID, err)
 	}
@@ -636,8 +565,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 	host, port, _ := rule.TargetHostPort()
 	vhost := filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf")
 	_, statErr := os.Stat(vhost)
-	// 域名兜底块是否存在：界面要能看出"域名限制到底有没有生效"，
-	// 否则用户只能靠"不带 Host 试探"才能发现限制被 nginx 的默认 server 吃掉了。
+	// 域名兜底块是否存在：界面要能看出"域名限制到底有没有生效"。
 	reject := filepath.Join(s.Cfg.VhostDir, proxies.RejectVhostName(rule.Listen)+".conf")
 	_, rejectErr := os.Stat(reject)
 	domainGuard := len(proxies.SplitDomains(rule.Domains)) > 0
@@ -670,8 +598,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"target_port":      port,
 		"target_ok":        st.Reachable,
 		"target_detail":    detail,
-		// 状态探测的元信息：谁在什么时候测的、结果新不新鲜。界面据此显示
-		// "约 N 秒前检测"，绝不把过期缓存当成实时状态（诚实原则）。
+		// 状态探测的元信息：界面据此显示"约 N 秒前检测"，绝不把过期缓存当成实时（诚实原则）。
 		"status_probed":       st.Known,
 		"status_stale":        st.Stale,
 		"status_probe_at":     statusProbeAtString(st),
@@ -681,8 +608,7 @@ func (s *Server) proxyView(ctx context.Context, rule *proxies.Rule) map[string]a
 		"domain_guard":        domainGuard,
 		"reject_written":      rejectErr == nil,
 		"reject_path":         reject,
-		// HTTPS：既要能被列表行直接读（ssl_enabled 等平铺字段），
-		// 也要有一份"证书文件实际内容"的汇总（ssl.days_left / ssl.domains）。
+		// HTTPS：既有平铺字段（ssl_enabled 等），也有"证书文件实际内容"的汇总（ssl.days_left）。
 		"ssl_enabled":  rule.SSLEnabled,
 		"ssl_cert":     rule.SSLCert,
 		"ssl_key":      rule.SSLKey,
@@ -728,11 +654,9 @@ func statusProbeAgeMS(st proxyStatusSnapshot) int64 {
 	return st.Age.Milliseconds()
 }
 
-// proxySSLView 汇总反代规则证书的展示字段（与站点侧 siteSSLView 同一套口径）。
-//
-// 到期时间优先取自**真实证书文件**：文件才是 nginx 实际加载的东西，
-// 数据库里的 ssl_expires 只是上一次写入时的快照（acme 续期后可能还没更新）。
-// 读不到文件时如实标出 renew_hint，绝不显示成"正常"。
+// proxySSLView 汇总反代规则证书的展示字段（与站点侧 siteSSLView 同一套口径）：到期时间
+// 优先取自**真实证书文件**（数据库里的只是上次写入的快照，acme 续期后可能还没更新）；
+// 读不到文件时如实标 renew_hint，绝不显示成"正常"。
 func (s *Server) proxySSLView(rule *proxies.Rule) map[string]any {
 	v := map[string]any{
 		"enabled":        rule.SSLEnabled,
@@ -769,10 +693,8 @@ func (s *Server) proxySSLView(rule *proxies.Rule) map[string]any {
 	return v
 }
 
-// certDomainNames 读取证书覆盖的域名（SAN，缺省退回 CN）。
-//
-// 纯 Go 解析，不起 openssl 子进程：列表页每次刷新都要显示证书域名，
-// 不值得为它 fork。
+// certDomainNames 读取证书覆盖的域名（SAN，缺省退回 CN）。纯 Go 解析不起 openssl
+// 子进程：列表页每次刷新都要显示，不值得 fork。
 func certDomainNames(certPath string) []string {
 	b, err := os.ReadFile(certPath)
 	if err != nil {
@@ -814,10 +736,8 @@ func portListening(ctx context.Context, port int) bool {
 	return true
 }
 
-// probeTarget 探一次目标是否可达（TCP 连接），返回 (是否可达, 给人看的说明)。
-//
-// 只做 TCP 连接、不发 HTTP 请求：目标是 http 还是 https、要不要 Host 头，
-// 由 nginx 去处理；这里只回答用户最关心的问题"这个地址到底通不通"。
+// probeTarget 探一次目标是否可达（TCP 连接）并给出说明。只做 TCP、不发 HTTP：
+// 目标 http/https 与 Host 头由 nginx 处理，这里只回答"这个地址到底通不通"。
 func probeTarget(ctx context.Context, target string) (bool, string) {
 	host, port, err := (&proxies.Rule{Target: target}).TargetHostPort()
 	if err != nil {
@@ -844,11 +764,9 @@ type proxyReq struct {
 	Enabled      *bool   `json:"enabled"`
 	Remark       *string `json:"remark"`
 
-	// HTTPS 字段。**签发/选择证书不走这个接口**，走
-	// POST /api/v1/proxies/{id}/ssl（与站点侧的 SSL Tab 对称）。
-	// 这里带上它们是为了：
-	//   - 前端"关闭 HTTPS"时能一次性把 ssl_enabled=false 落库；
-	//   - 允许高级用法直接指定已有证书路径。
+	// HTTPS 字段。**签发/选择证书不走这个接口**，走 POST /api/v1/proxies/{id}/ssl
+	// （与站点侧 SSL Tab 对称）。带上它们是为了前端"关闭 HTTPS"能一次落库，
+	// 以及允许高级用法直接指定已有证书路径。
 	SSLEnabled  *bool   `json:"ssl_enabled"`
 	SSLCert     *string `json:"ssl_cert"`
 	SSLKey      *string `json:"ssl_key"`
@@ -860,16 +778,12 @@ type proxyReq struct {
 	StandardHeaders *bool   `json:"standard_headers"`
 	RedirectHTTP    *bool   `json:"redirect_http"`
 
-	// 局域网出口三态：auto / on / off。
-	//
-	// 刻意**不接受** forward_port 输入：它是转发器分配出来的回环端口，
-	// 让前端能随便指定会让 nginx 指向一个没人听的端口（或撞上别的服务）。
+	// 局域网出口三态：auto / on / off。刻意**不接受** forward_port 输入：那是转发器
+	// 分配出来的回环端口，让前端指定会让 nginx 指向没人听的端口（或撞上别的服务）。
 	LANForward *string `json:"lan_forward"`
 
-	// ---- HTTP Basic Auth（"需要用户名密码"）----
-	//
-	// AuthPassword 是**只写**字段：请求里非空才更新哈希，空串表示沿用原密码
-	// （前端不回显密码）。响应里永远没有它，也没有哈希（见 Rule.AuthHash 的 json:"-"）。
+	// AuthPassword 是**只写**字段：非空才更新哈希，空串表示沿用原密码（前端不回显）。
+	// 响应里永远没有它，也没有哈希（见 Rule.AuthHash 的 json:"-"）。
 	AuthEnabled  *bool   `json:"auth_enabled"`
 	AuthUser     *string `json:"auth_user"`
 	AuthPassword *string `json:"auth_password"`
@@ -1084,8 +998,8 @@ func (s *Server) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, err.Error())
 		return
 	}
-	// 先按新配置写盘（含 nginx -t 校验、失败回滚），成功后才更新数据库 ——
-	// 反过来的话，配置写失败会留下"数据库说已改、文件还是旧的"的不一致。
+	// 先按新配置写盘（含 nginx -t 校验、失败回滚），成功后才更新数据库：反过来的话
+	// 配置写失败会留下"数据库说已改、文件还是旧的"的不一致。
 	next.ID = cur.ID
 	// 转发器先对齐（起/停/换目标；含不需要转发时把 ForwardPort 清 0），
 	// 这样紧接着生成的 proxy_pass 才会用对端口。
@@ -1177,11 +1091,9 @@ func (s *Server) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"msg": "已删除规则「" + cur.Name + "」并移除它的 nginx 配置"})
 }
 
-// rejectGuardFailed 把"域名兜底拒绝块没生效"如实上报为非 2xx。
-//
-// 为什么不再像以前那样"只写进 detail 仍然返回 200"：那正是本项目最贵的教训
-// ——配置写了但没被 nginx 加载，面板却说成功。主操作确实已经成功，所以消息里
-// 必须写清楚"什么已经成功、什么没生效"，让用户知道该修什么。
+// rejectGuardFailed 把"域名兜底拒绝块没生效"如实上报为非 2xx，并写清"什么已经成功、
+// 什么没生效"。绝不再像以前那样只写 detail 仍返回 200 —— 配置写了没被 nginx 加载
+// 却说成功，是本项目最贵的教训。
 func (s *Server) rejectGuardFailed(w http.ResponseWriter, r *http.Request,
 	action, name, done string, err error) {
 	s.audit(r, action, name, done+"（域名兜底拒绝块未生效: "+err.Error()+"）", false, err.Error())
@@ -1189,10 +1101,8 @@ func (s *Server) rejectGuardFailed(w http.ResponseWriter, r *http.Request,
 		"。副作用：域名对不上的请求可能被转发到后端，请修正后重试")
 }
 
-// handleProxyToggle 启用/停用一条规则。
-//
-// 停用 = 把配置文件删掉再 reload（而不是注释掉配置）：nginx 不加载它就一定不生效，
-// 而"注释掉"要保证注释语法完全正确，多行配置里更容易出错。
+// handleProxyToggle 启用/停用一条规则。停用 = 删配置文件再 reload（而不是注释掉配置）：
+// nginx 不加载它就一定不生效，而"注释掉"更容易写错。
 func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1253,13 +1163,9 @@ func (s *Server) handleProxyToggle(w http.ResponseWriter, r *http.Request) {
 	ok(w, s.proxyView(r.Context(), saved))
 }
 
-// handleProxyTest 在保存前试一次目标可达性（界面上的「测试连通」按钮）。
-//
-// 单独一个接口而不是保存时顺带做：用户想在**不落库**的情况下先确认地址对不对。
-//
-// 同时承接**列表状态的异步探测**：{all:true} 或 {ids:[...]} 时走批量分支，
-// 并发探测（每条 ≤500ms）并把结果写进 TTL 缓存。两种用法共用一个路由，
-// 是为了不新增路由（server.go 不在本轮改动范围）。
+// handleProxyTest 在保存前试一次目标可达性（界面上的「测试连通」按钮），不落库。
+// 同时承接列表状态的异步探测：{all:true} 或 {ids:[...]} 时并发探测（每条 ≤500ms）并写进
+// TTL 缓存；两种用法共用一个路由，是为了不新增路由（server.go 不在本轮改动范围）。
 func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Target string  `json:"target"`
@@ -1314,45 +1220,28 @@ func (s *Server) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"ok": reachable, "detail": detail})
 }
 
-// ============================================================================
-//  反代「大请求体探测」——按需触发，绝不进列表/首屏
-//
-//  为什么需要它：端口在听、目标可达、健康检查全绿，**不等于**能收大请求体。
-//  2026-09-18 生产事故：经反代推 368KB 音色样本一律 500，而那个 500 是 nginx
-//  **自己**的错误页 —— 请求体先被缓冲到 client_body_temp，目录一旦不可写
-//  （属主不对 / 磁盘满），nginx 在转给上游之前就失败了。
-//
-//  所以这里真的发一个 ~64KB 请求体（> nginx 默认 client_body_buffer_size，
-//  足以走"落盘 / 边收边转"的分支），并断言拿到的**不是 nginx 自己的 500/413 页**。
-//  探测只在用户点按钮时跑（见 assets/js/reverseproxy.js），不放在 proxyView /
-//  列表渲染路径上 —— 那是 AGENTS.md 第三节坑 165 的教训。
-// ============================================================================
+// 反代「大请求体探测」——按需触发，绝不进列表/首屏（坑 165）。2026-09-18 事故中经反代推
+// 368KB 样本一律 500，而那是 nginx **自己**的错误页（请求体缓冲到 client_body_temp，目录
+// 不可写就在转给上游之前失败）；这里真的发 ~64KB 请求体并断言拿到的不是 nginx 自己的 500/413 页。
 
 const (
-	// proxyBodyProbeSize 是探测请求体大小：64KB。
-	//
-	// 取这个值的理由：它远大于 nginx 默认 client_body_buffer_size（8k/16k），
-	// 一定会触发"请求体缓冲"这条路径；又足够小，不会把上游或日志撑爆。
+	// proxyBodyProbeSize 是探测请求体大小（64KB）：远大于 nginx 默认 client_body_buffer_size
+	// （8k/16k），一定触发"请求体缓冲"路径；又足够小，不会把上游或日志撑爆。
 	proxyBodyProbeSize = 64 * 1024
 	// proxyBodyProbeTimeout 是单次探测的整体超时。
 	proxyBodyProbeTimeout = 6 * time.Second
 )
 
-// proxyBodyPostFn 是"发一个带请求体的 POST"这一步的可注入点。
-//
-// 生产实现走 curl；单测替换它，就能在完全不碰真实服务的情况下钉住分类判据
-// （尤其是"nginx 回它自己的 500 页 → 判失败"）。
+// proxyBodyPostFn 是"发一个带请求体的 POST"的可注入点：生产走 curl，单测替换它
+// 就能钉住分类判据（尤其是"nginx 回它自己的 500 页 → 判失败"）。
 var proxyBodyPostFn = curlPostBody
 
-// proxyProbeListeningFn 是探测前的"端口在不在听"检查，做成可注入点让单测不必
-// 真的去拨号（单测不许碰真实服务）。
+// proxyProbeListeningFn 是探测前的"端口在不在听"检查，可注入让单测不必真拨号。
 var proxyProbeListeningFn = portListening
 
 // curlPostBody 用 curl 向规则的监听端口 POST 一个请求体，返回 (状态码, 响应体, 错误)。
-//
-// 与 curlSite 同一套做法：--resolve 把 Host 钉到 127.0.0.1，域名没解析也能测到本机
-// nginx；-k 跳过证书校验（自签证书同样要能测）。显式发一个空的 `Expect:` 头，
-// 否则 curl 会先发头部等 100-continue，某些配置下请求体根本不会被发出去。
+// 与 curlSite 同一套做法：--resolve 把 Host 钉到 127.0.0.1、-k 跳过证书校验；显式发空的
+// `Expect:` 头，否则 curl 会先等 100-continue，请求体根本不会被发出去。
 func curlPostBody(ctx context.Context, scheme, host string, port int, path string, body []byte, timeout time.Duration) (code, respBody string, err error) {
 	url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -1394,12 +1283,9 @@ type proxyBodyProbeResult struct {
 	BodyPrefix string `json:"body_prefix"` // 响应体开头（排障用；已截断）
 }
 
-// looksLikeNginxErrorPage 判断响应体是不是 nginx **自己**生成的错误页。
-//
-// nginx 的出厂错误页固定带一行 `<hr><center>nginx</center>`（413/500/502 都一样），
-// 上游应用自己的 5xx 一般没有这个指纹。判据刻意很窄：正文里必须同时出现
-// "nginx" 与出厂页标记才算 —— 宁可漏判成"上游 5xx"，也不要把用户应用自己的
-// 500 页误报成 nginx 的请求体失败。
+// looksLikeNginxErrorPage 判断响应体是不是 nginx **自己**生成的错误页：出厂错误页固定
+// 带一行 `<hr><center>nginx</center>`。判据刻意很窄（必须同时出现 "nginx" 与出厂页标记）
+// —— 宁可漏判成"上游 5xx"，也不要把用户应用自己的 500 页误报成 nginx 的请求体失败。
 func looksLikeNginxErrorPage(body string) bool {
 	low := strings.ToLower(body)
 	if !strings.Contains(low, "nginx") {
@@ -1409,16 +1295,9 @@ func looksLikeNginxErrorPage(body string) bool {
 		strings.Contains(low, "<center>nginx/")
 }
 
-// classifyBodyProbe 把一次响应归类成 好 / 坏 / 未能探测，并写清发生在哪一步。
-//
-//	413                          → 坏：请求体在 nginx 层被 client_max_body_size 拒了；
-//	502/504                      → 坏：nginx 收下了请求体但连不上上游；
-//	5xx 且是 nginx 自己的错误页  → 坏：正是 2026-09-18 事故的形态（请求体落盘失败）；
-//	其它任何 HTTP 响应           → 好：请求体确实被接收并转发了（含上游自己的 4xx/5xx）；
-//	没有拿到任何 HTTP 响应       → 未能探测（连接被拒/断开/超时，不能算"nginx 收了"）。
-//
-// 502/504 必须排在"nginx 自己的错误页"之前：它们本来就是 nginx 生成的 5xx，
-// 但对用户来说要修的是"上游没起来"，不是请求体缓冲。
+// classifyBodyProbe 把一次响应归类成 好 / 坏 / 未能探测，并写清发生在哪一步：413 → 坏（被
+// client_max_body_size 拒）；502/504 → 坏（连不上上游，须排在"nginx 自己的错误页"之前）；
+// 5xx 且是 nginx 自己的错误页 → 坏（2026-09-18 事故形态）；其它响应 → 好；没拿到响应 → 未能探测。
 func classifyBodyProbe(code, body string, listen int) (status, step, detail string) {
 	c := strings.TrimSpace(code)
 	switch {
@@ -1451,10 +1330,8 @@ func truncateProbeBody(s string) string {
 	return s
 }
 
-// probeProxyLargeBody 对一条规则做一次"大请求体"探测，结果如实分类。
-//
-// 每一步失败都写清在哪一步（前置检查 / 发送请求 / nginx 请求体上限 /
-// nginx 自身的错误页 / 转发到上游 / 落到默认站点），绝不把"没探到"说成"通过"。
+// probeProxyLargeBody 对一条规则做一次"大请求体"探测，结果如实分类：每一步失败都写清
+// 在哪一步，绝不把"没探到"说成"通过"。
 func (s *Server) probeProxyLargeBody(ctx context.Context, rule *proxies.Rule) proxyBodyProbeResult {
 	res := proxyBodyProbeResult{Status: "unknown", BodyBytes: proxyBodyProbeSize}
 	if rule != nil {
@@ -1503,10 +1380,8 @@ func (s *Server) probeProxyLargeBody(ctx context.Context, rule *proxies.Rule) pr
 	return res
 }
 
-// handleProxyBodyProbe 是「大请求体探测」的按需接口。
-//
-// 刻意只在用户点按钮时调用：它要真的发一个 64KB 请求体，属于"昂贵且会碰到真实
-// 服务"的探测，绝不能挂在列表 / 首屏渲染路径上（AGENTS.md 坑 165）。
+// handleProxyBodyProbe 是「大请求体探测」的按需接口：要真的发一个 64KB 请求体，属于
+// 昂贵且会碰到真实服务的探测，绝不能挂在列表 / 首屏渲染路径上（AGENTS.md 坑 165）。
 func (s *Server) handleProxyBodyProbe(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1525,38 +1400,26 @@ func (s *Server) handleProxyBodyProbe(w http.ResponseWriter, r *http.Request) {
 	ok(w, s.probeProxyLargeBody(r.Context(), rule))
 }
 
-// ============================================================================
-//  反向代理 SSL
-//
-//  与「网站管理」的 SSL Tab 是同一套体验，只是入口挂到反代规则上：
-//    self / mkcert / manual 三种来源把证书放到 <DataDir>/proxy-certs/<规则>/；
-//    acme **直接引用面板证书库路径**（<DataDir>/certs/<primary>/fullchain.pem），
-//    绝不复制 —— 续期是同路径覆盖，复制一份会让续期后线上还是旧证书。
-//
-//  写盘 → reload → 请求级复核与站点侧一致：复核不通过一律非 2xx。
-// ============================================================================
+// 反向代理 SSL：与「网站管理」的 SSL Tab 同一套体验，挂在反代规则上。self/mkcert/manual 把证书
+// 放到 <DataDir>/proxy-certs/<规则>/；acme **直接引用面板证书库路径**，绝不复制（续期是同路径
+// 覆盖，复制会让续期后线上还是旧证书）。写盘 → reload → 请求级复核，不通过一律非 2xx。
 
-// proxySSLReq 是 POST /api/v1/proxies/{id}/ssl 的请求体。
-//
-// 字段与站点侧 siteSSLReq 刻意保持一致（provider/cert/key/extra_san/
-// cert_primary/domain），这样前端只需要维护一套交互，后端也能复用匹配逻辑。
+// proxySSLReq 是 POST /api/v1/proxies/{id}/ssl 的请求体。字段与站点侧 siteSSLReq
+// 刻意保持一致（provider/cert/key/extra_san/cert_primary/domain）。
 type proxySSLReq struct {
 	Provider string   `json:"provider"` // self / mkcert / manual / acme
 	Cert     string   `json:"cert"`
 	Key      string   `json:"key"`
 	ExtraSAN []string `json:"extra_san"`
 
-	// CertPrimary 指定要绑定的 ACME 证书（primary 名）。
-	// 不给时按规则域名自动匹配（见 matchCertForProxy）。
+	// CertPrimary 指定要绑定的 ACME 证书（primary 名）；不给时按规则域名自动匹配。
 	CertPrimary string `json:"cert_primary"`
 	// Domain 是 cert_primary 的容错写法：前端直接给一个域名也能匹配。
 	Domain string `json:"domain"`
 }
 
-// proxyCertHosts 返回给自签 / mkcert 用的域名列表。
-//
-// 规则可以没有域名（匹配该端口上所有 Host）。那种情况下没有可放进 SAN 的名字，
-// 用 127.0.0.1 兜底（自签与 mkcert 都能签 IP），至少不生成一张空 SAN 的证书。
+// proxyCertHosts 返回给自签 / mkcert 用的域名列表。规则可以没有域名，那种情况下没有
+// 可放进 SAN 的名字，用 127.0.0.1 兜底（两者都能签 IP），至少不生成一张空 SAN 的证书。
 func proxyCertHosts(rule *proxies.Rule) []string {
 	domains := proxies.SplitDomains(rule.Domains)
 	if len(domains) == 0 {
@@ -1565,24 +1428,15 @@ func proxyCertHosts(rule *proxies.Rule) []string {
 	return domains
 }
 
-// proxyCertDir 是 self/mkcert/manual 三种来源的证书目录。
-//
-// 用 VhostName()（proxy-<id>）而不是规则名：规则名是中文且可能重复，
-// 做目录名既危险又不稳。
+// proxyCertDir 是 self/mkcert/manual 三种来源的证书目录：用 VhostName()（proxy-<id>）
+// 而不是规则名 —— 规则名是中文且可能重复，做目录名既危险又不稳。
 func (s *Server) proxyCertDir(rule *proxies.Rule) string {
 	return filepath.Join(s.Cfg.DataDir, "proxy-certs", rule.VhostName())
 }
 
-// alignProxyCertOwner 把证书目录的属主对齐到 DataDir 的属主。
-//
-// 与 internal/acme/store.go 的 alignOwnerWithDataDir 是同一个真机坑：
-// macOS 上 homebrew 的 nginx 以**普通用户**运行，而面板以 root 运行 ——
-// root 用 0600 写出的私钥 nginx 读不到（`nginx -t` 报 Permission denied，
-// 443 直接连不上）。对齐 DataDir 属主即可让同用户的 nginx 读到，同时私钥
-// 仍是 0600，而不是放宽成全局可读。
-//
-// 失败只告警不报错：绑定是否真的成功由随后的请求级 TLS 复核判定
-// （会取回真实证书比对），属主不对一定会在那里被如实挡下。
+// alignProxyCertOwner 把证书目录属主对齐 DataDir（与 acme/store.go 同一个真机坑）：root 用
+// 0600 写出的私钥、以普通用户运行的 nginx 读不到（`nginx -t` 报 Permission denied、443 连不上）。
+// 只对齐属主、不放宽权限；失败只告警，绑定是否真成功由随后的请求级 TLS 复核判定。
 func (s *Server) alignProxyCertOwner(dir string) {
 	if dir == "" || os.Geteuid() != 0 {
 		return
@@ -1611,11 +1465,9 @@ func (s *Server) alignProxyCertOwner(dir string) {
 	}
 }
 
-// handleProxySSL 为一条反代规则签发/绑定证书。四种来源与站点侧完全一致。
-//
-// 顺序：先把新配置写进 nginx（含请求级复核），成功后才落库 ——
-// 与 handleProxyUpdate 同一取舍，避免出现"数据库说开了 HTTPS、nginx 其实没生效"。
-// 失败时会尽力把兜底块恢复成数据库描述的状态，并返回非 2xx。
+// handleProxySSL 为一条反代规则签发/绑定证书（四种来源与站点侧完全一致）。先把新配置
+// 写进 nginx（含请求级复核），成功后才落库 —— 避免"数据库说开了 HTTPS、nginx 其实没
+// 生效"；失败时尽力把兜底块恢复成数据库描述的状态，并返回非 2xx。
 func (s *Server) handleProxySSL(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1770,10 +1622,8 @@ func (s *Server) handleProxySSL(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleProxySSLDisable 关闭一条反代规则的 HTTPS。
-//
-// 与站点侧不同：关掉 SSL 后规则**仍然监听原端口**（只是回到 HTTP），
-// 不做"额外在 80 上 301"那种隐式行为（理由见 handleProxySSL 上方的说明）。
+// handleProxySSLDisable 关闭一条反代规则的 HTTPS。与站点侧不同：关掉 SSL 后规则**仍然
+// 监听原端口**（只是回到 HTTP），不做"额外在 80 上 301"那种隐式行为。
 func (s *Server) handleProxySSLDisable(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1834,11 +1684,9 @@ func (s *Server) handleProxySSLDisable(w http.ResponseWriter, r *http.Request) {
 	ok(w, s.proxyView(r.Context(), saved))
 }
 
-// matchCertForProxy 为一条反代规则找到要用的 ACME 证书。
-//
-// 复用与站点侧同一套匹配逻辑（matchCertForNames）：显式 cert_primary/domain
-// 优先，其次按规则域名精确命中，再退到通配。匹配不到就明确报错并指路，
-// **不在这里就地签发**（签发是几十秒到几分钟的长任务，必须走任务中心）。
+// matchCertForProxy 为一条反代规则找到要用的 ACME 证书（复用站点侧 matchCertForNames）：
+// 显式 cert_primary/domain 优先，其次按规则域名精确命中，再退到通配。匹配不到就明确报错
+// 并指路，**不在这里就地签发**（签发是长任务，必须走任务中心）。
 func (s *Server) matchCertForProxy(rule *proxies.Rule, req proxySSLReq) (*acme.Cert, error) {
 	names := proxies.SplitDomains(rule.Domains)
 	label := strings.Join(names, "、")
@@ -1849,9 +1697,7 @@ func (s *Server) matchCertForProxy(rule *proxies.Rule, req proxySSLReq) (*acme.C
 }
 
 // proxiesUsingCert 返回正在引用该证书的反向代理规则（给证书页展示与删除保护用）。
-//
-// 判定同样用**证书路径**而不是域名：acme 续期是同路径覆盖，只有路径能精确
-// 对应"哪个 vhost 里写着 ssl_certificate <这份文件>"。
+// 判定同样用**证书路径**而不是域名：acme 续期是同路径覆盖，只有路径能精确对应。
 func (s *Server) proxiesUsingCert(c *acme.Cert) []string {
 	if c == nil || c.CertPath == "" {
 		return []string{}
@@ -1872,55 +1718,31 @@ func (s *Server) proxiesUsingCert(c *acme.Cert) []string {
 	return out
 }
 
-// ============================================================================
-//  反代落盘通道：chown 日志树 → reload → 请求级复核
-//
-//  为什么必须先 chown 再 reload：
-//  写 vhost 的提权助手（priv.WriteVhostAtomic）会以 **root** 跑 `nginx -t`，
-//  而 `nginx -t` 在校验时就会把 access_log/error_log **创建出来**（root 属主）。
-//  随后以真实用户运行的 nginx master 打不开这些文件：
-//
-//      [emerg] open() ".../proxy-1.access.log" failed (13: Permission denied)
-//
-//  于是 reload **根本没加载新配置**，但 `nginx -s reload` 的退出码仍然是 0 ——
-//  这正是"面板报成功、配置却没生效"的根因（phpMyAdmin 已经踩过一次）。
-//
-//  为什么必须请求级复核：
-//  reload 命令成功 ≠ 配置被加载。文件写进去了（proxyView 的 config_written
-//  只是 os.Stat）更不等于 nginx 在用。只有真的发一个请求、确认该规则的
-//  **自己的访问日志**长出了新内容，才算证明"nginx 加载了这个 server 块、
-//  并且成功打开了这个日志文件"—— 而这恰好就是失败时打不开的那个文件。
-// ============================================================================
+// 反代落盘通道：chown 日志树 → reload → 请求级复核。必须先 chown 再 reload：写 vhost 的提权助手以
+// **root** 跑 `nginx -t`，而 `-t` 会把日志文件创建成 root 属主 → 以真实用户运行的 nginx 打不开，
+// reload 没加载新配置**但退出码仍是 0**（"报成功却没生效"的根因）；复核就看该规则自己的访问日志增长。
 
 // proxyProbeFn / proxyReloadFn / proxyChownLogsFn 是可注入步骤：
 // 生产环境指向真实实现，单测里替换它们，避免碰真实服务与真实 nginx。
 var (
 	// proxyProbeFn 做一次请求级探测（生产 = curlSite，用 --resolve 钉到 127.0.0.1）。
 	proxyProbeFn = curlSite
-	// proxyReloadFn 重载 nginx（生产 = s.nginxReload，即提权助手的 nginx-reload）。
-	//
-	// 注意：s.nginxReload 内部**只有** `nginx -s reload`，既不做 `nginx -t`，
-	// 也不 chown、更不复核；`-t` 是在 writeVhost（helper）里以 root 跑的。
-	// 所以 chown 与复核必须由本文件的通道补上。
+	// proxyReloadFn 重载 nginx（生产 = s.nginxReload）。注意：它内部**只有** `nginx -s reload`，
+	// 不做 `nginx -t`、不 chown、不复核（`-t` 是 writeVhost 助手以 root 跑的），
+	// 所以 chown 与复核必须由本文件补上。
 	proxyReloadFn = func(s *Server, ctx context.Context) error { return s.nginxReload(ctx) }
 	// proxyChownLogsFn 把 nginx 日志树递归交还真实用户。
 	proxyChownLogsFn = func(s *Server) { s.chownProxyLogTrees() }
-	// proxyWriteVhostFn 写 vhost（生产 = s.writeVhost，helper 内含 nginx -t）。
-	// 做成变量只为让单测能覆盖"写盘 → chown → reload → 复核"这条顺序，
-	// 生产行为与直接调用完全一致（与 api_sites.go 的 siteWriteVhostFn 同一做法）。
+	// proxyWriteVhostFn 写 vhost（生产 = s.writeVhost，helper 内含 nginx -t）。做成变量
+	// 只为让单测能覆盖"写盘 → chown → reload → 复核"这条顺序（与 api_sites.go 同一做法）。
 	proxyWriteVhostFn = func(s *Server, ctx context.Context, name, content string) error {
 		return s.writeVhost(ctx, name, content)
 	}
 )
 
-// proxyVerifyWait / proxyVerifyEvery / proxyLogSettle 控制复核的等待窗口。
-//
-// 为什么要等：`nginx -s reload` 只是给 master 发信号，新监听端口 / 新 server
-// 块生效有很短的延迟；写完立刻探测会把一次正常重载误判成失败。
-// 同时日志是 worker 在响应之后写的，读大小前留一点落盘时间。
-//
-// 与站点侧同一口径：轮询间隔取 200ms（150–250ms 区间），总窗口 6 秒；
-// 两者都可注入，单测压到毫秒级（不许真睡 6 秒）。
+// proxyVerifyWait / proxyVerifyEvery / proxyLogSettle 控制复核的等待窗口：reload 只是给 master
+// 发信号，新 server 块生效有短延迟；日志又是 worker 在响应之后写的，读大小前要留落盘时间。
+// 与站点侧同一口径：间隔 200ms、总窗口 6 秒，两者都可注入（单测不许真睡 6 秒）。
 var (
 	proxyVerifyWait  = 6 * time.Second
 	proxyVerifyEvery = 200 * time.Millisecond
@@ -1937,10 +1759,8 @@ type proxyProbe struct {
 	err  error
 }
 
-// chownTreeToUser 把一棵树递归交给面板的"真实用户"。
-//
-// 抽出来是为了让反代各条路径只有一种改归属的写法（与 applyDefaultVhost /
-// applySite 的判据一致：必须是 root、必须是具体用户）。
+// chownTreeToUser 把一棵树递归交给面板的"真实用户"：抽出来是为了让反代各条路径只有
+// 一种改归属的写法（判据与 applySite 一致：必须是 root、必须是具体用户）。
 func (s *Server) chownTreeToUser(path string) {
 	if path == "" || s.Cfg.User == "" || s.Cfg.User == "root" || os.Geteuid() != 0 {
 		return
@@ -1951,14 +1771,9 @@ func (s *Server) chownTreeToUser(path string) {
 	_ = chownTreeTo(path, s.Cfg.User)
 }
 
-// chownProxyLogTrees 把 nginx 需要写的日志目录**递归**交给真实用户。
-//
-// 必须在 writeVhost（内部以 root 跑 `nginx -t`，会创建 root 属主的日志文件）
-// 之后、`-s reload` 之前调用。覆盖整棵树而不是只改目录本身：
-// 触发故障的正是 `nginx -t` 新建出来的 proxy-*.access.log（文件级属主不对）。
-//
-// 与 services 侧 chownNginxLogTrees / applySite 的 chown 是同一件事，
-// 只是这里覆盖反代用到的目录（含 <brew>/var/log/nginx）。
+// chownProxyLogTrees 把 nginx 需要写的日志目录**递归**交给真实用户：必须在 writeVhost
+// （内部以 root 跑 `nginx -t`，会创建 root 属主的日志文件）之后、`-s reload` 之前调用。
+// 覆盖整棵树而不是只改目录本身 —— 触发故障的正是 `nginx -t` 新建出来的 proxy-*.access.log。
 func (s *Server) chownProxyLogTrees() {
 	for _, root := range s.proxyLogRoots() {
 		s.chownTreeToUser(root)
@@ -1986,16 +1801,13 @@ func (s *Server) proxyLogRoots() []string {
 	return roots
 }
 
-// proxyAccessLogPath 是 Rule.Generate 写进 vhost 的那条 access_log 的路径。
-//
-// 命名必须与 internal/proxies 的 `proxy-<id>.access.log` 一致 ——
-// 复核就是靠"这个文件有没有长出新内容"来判断规则是否真的被 nginx 使用。
+// proxyAccessLogPath 是 Rule.Generate 写进 vhost 的那条 access_log 的路径：命名必须与
+// internal/proxies 的 `proxy-<id>.access.log` 一致 —— 复核就靠"它有没有长出新内容"。
 func proxyAccessLogPath(logDir string, id int64) string {
 	return filepath.Join(logDir, fmt.Sprintf("proxy-%d.access.log", id))
 }
 
-// proxyLogSize 返回日志文件大小；不存在按 0 处理（存在与否不影响判据：
-// 我们只看"有没有增长"）。
+// proxyLogSize 返回日志文件大小；不存在按 0 处理（只看"有没有增长"）。
 func proxyLogSize(path string) int64 {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -2012,14 +1824,9 @@ func proxyProbePath(rule *proxies.Rule) string {
 	return "/"
 }
 
-// proxyProbeHost 选一个"能命中该规则"的 Host。
-//
-// 通配域名（server_name *.example.com）要换成一个能匹配它的具体名字，
-// 否则请求会落到兜底拒绝块上，把"配置正常"误判成失败。
-//
-// 没有域名时 internal/proxies 生成的 server_name 是 `_`（一个**字面**名字，
-// 不是通配），所以必须原样发 `Host: _` 才能命中它 —— 同一端口上如果还有别的
-// 带域名规则，它的兜底拒绝块会把 `Host: 127.0.0.1` 这类请求先抢走（444）。
+// proxyProbeHost 选一个"能命中该规则"的 Host：通配域名（*.example.com）要换成一个能匹配
+// 它的具体名字，否则请求会落到兜底拒绝块上，把"配置正常"误判成失败。没有域名时
+// internal/proxies 生成的是字面的 `_`，必须原样发 `Host: _` 才能命中。
 func proxyProbeHost(rule *proxies.Rule) string {
 	for _, d := range proxies.SplitDomains(rule.Domains) {
 		d = strings.TrimSpace(d)
@@ -2037,10 +1844,8 @@ func proxyProbeHost(rule *proxies.Rule) string {
 	return "_"
 }
 
-// probeProxyScheme 是复核该发 HTTP 还是 HTTPS。
-//
-// 启用 SSL 的规则只监听 TLS，用 http:// 探测只会拿到 "000"（连接被重置），
-// 从而把一条正常规则误判成"没生效"。
+// probeProxyScheme 决定复核该发 HTTP 还是 HTTPS：启用 SSL 的规则只监听 TLS，用 http://
+// 探测只会拿到 "000"（连接被重置），从而把一条正常规则误判成"没生效"。
 func probeProxyScheme(rule *proxies.Rule) string {
 	if rule.SSLEnabled {
 		return "https"
@@ -2055,16 +1860,9 @@ func (s *Server) probeProxyOnce(ctx context.Context, rule *proxies.Rule, host st
 	return proxyProbe{code: code, body: body, err: err}
 }
 
-// proxyProbeServed 判断一次探测的**响应**是否像"被 nginx 处理了"。
-//
-// 判据刻意不是"2xx 就算通"（nginx 的 404/502 页也有内容）：
-//   - 必须真的拿到 HTTP 响应；"000" = 连不上 / 被 444 断开 / 超时 → 没生效；
-//   - 在 80 端口上，响应体是默认站点（000-default）的占位页 → 请求落到了默认
-//     站点，说明这条规则没被加载。只在 80 端口判这条：默认站点只监听 80，
-//     而"反代到本机默认站点"（别的端口 → 127.0.0.1:80）是合法配置，
-//     一律判会把正常规则误判成失败；
-//   - nginx 自己生成的 502/504 也算"已加载"：那说明 location 命中了，
-//     只是上游没起来（上游健康另有 target_ok 字段如实展示）。
+// proxyProbeServed 判断一次探测的**响应**是否像"被 nginx 处理了"。判据刻意不是"2xx 就算通"：
+// 必须真拿到 HTTP 响应（"000" = 连不上/被断开/超时 → 没生效）；80 端口上响应体是默认站点占位页
+// → 规则没被加载（只在 80 判）；nginx 自己的 502/504 也算"已加载"。
 func proxyProbeServed(p proxyProbe, listen int) bool {
 	code := strings.TrimSpace(p.code)
 	if code == "" || code == "000" {
@@ -2090,8 +1888,7 @@ func describeProxyProbe(p proxyProbe, rule *proxies.Rule) string {
 	return msg
 }
 
-// describeProxyProbePlain 是不含"局域网授权"建议的现场描述（供已经自己拼
-// 建议文案的调用方使用，避免同一句话出现两遍）。
+// describeProxyProbePlain 是不含"局域网授权"建议的现场描述（避免同一句话出现两遍）。
 func describeProxyProbePlain(p proxyProbe, rule *proxies.Rule) string {
 	code := strings.TrimSpace(p.code)
 	if code == "" || code == "000" {
@@ -2109,10 +1906,8 @@ func describeProxyProbePlain(p proxyProbe, rule *proxies.Rule) string {
 	return "HTTP " + code
 }
 
-// directToLAN 判断"这条规则是 nginx 直连模式、且目标是局域网地址"。
-//
-// 只在 502/504 的诊断路径上调用：它可能需要一次 DNS 解析，而失败现场本来
-// 就没有性能要求。解析不了按私有处理（与 lan_forward=auto 的语义一致）。
+// directToLAN 判断"这条规则是 nginx 直连模式、且目标是局域网地址"。只在 502/504 的诊断
+// 路径上调用（可能有一次 DNS 解析，失败现场没有性能要求）；解析不了按私有处理。
 func directToLAN(rule *proxies.Rule) bool {
 	if rule == nil || rule.Forwarding() {
 		return false
@@ -2132,11 +1927,9 @@ type proxyServeCheck struct {
 	Probe   proxyProbe // 最后一次探测的响应
 }
 
-// waitProxyServed 轮询到"规则真的生效"，返回完整证据。
-//
-// 最硬的证据是**该规则自己的访问日志增长**：只有 nginx 真的加载了这个
-// server 块、并成功打开了这个日志文件，请求才可能被写进去 —— 而"打不开
-// 日志文件"正是 reload 静默失败的原因。响应内容只作为辅助判据与现场描述。
+// waitProxyServed 轮询到"规则真的生效"，返回完整证据。最硬的证据是**该规则自己的访问
+// 日志增长**：只有 nginx 真的加载了这个 server 块、并成功打开了这个日志文件，请求才可能
+// 被写进去 —— 而"打不开日志文件"正是 reload 静默失败的原因。
 func (s *Server) waitProxyServed(ctx context.Context, rule *proxies.Rule) proxyServeCheck {
 	host := proxyProbeHost(rule)
 	logPath := proxyAccessLogPath(s.proxyLogDir(), rule.ID)
@@ -2167,10 +1960,9 @@ func (s *Server) waitProxyServed(ctx context.Context, rule *proxies.Rule) proxyS
 	}
 }
 
-// reloadProxyAndVerify 是反代**写入/更新**后的统一收尾：
-// chown 日志树 → reload → 请求级复核（该规则必须真的被 nginx 使用）。
-//
-// 复核不通过一律返回错误；调用方据此返回非 2xx（绝不"失败只记日志"）。
+// reloadProxyAndVerify 是反代**写入/更新**后的统一收尾：chown 日志树 → reload →
+// 请求级复核（该规则必须真的被 nginx 使用）。复核不通过一律返回错误，调用方据此返回
+// 非 2xx（绝不"失败只记日志"）。
 func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) error {
 	proxyChownLogsFn(s)
 	if err := proxyReloadFn(s, ctx); err != nil {
@@ -2207,10 +1999,9 @@ func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) e
 	if err := s.verifyProxyTLSServed(ctx, rule); err != nil {
 		return err
 	}
-	// 配置确实生效了，但"生效"不等于"能用"：nginx 返回 502/504 说明它连不上上游。
-	// 直连模式 + 局域网目标 + **面板自己能连上** ⇒ 这不是上游挂了，而是
-	// macOS 15 的本地网络隐私门只拦了 nginx。这时必须明确报错并给出修法，
-	// 否则用户只会看到一个"已生效"的规则和一个永远 502 的页面。
+	// 配置确实生效了，但"生效"不等于"能用"：502/504 说明 nginx 连不上上游。直连模式 +
+	// 局域网目标 + **面板自己能连上** ⇒ 不是上游挂了，而是 macOS 15 本地网络隐私门只拦
+	// 了 nginx。必须明确报错并给出修法，否则用户只看到一个"已生效"的规则和永远 502 的页面。
 	if advice := s.directLANBlockedAdvice(ctx, rule, chk.Probe); advice != "" {
 		return errors.New(advice)
 	}
@@ -2218,13 +2009,8 @@ func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) e
 }
 
 // directLANBlockedAdvice 在"只可能是 macOS 本地网络授权把 nginx 拦了"时返回诊断文本。
-//
-// 判据（缺一不可，避免把"上游本身没起来"误诊成授权问题）：
-//  1. 规则是 nginx 直连模式（没有走面板转发）；
-//  2. 探测拿到 502/504（nginx 命中了规则但连不上上游）；
-//  3. 目标是私有/链路本地地址；
-//  4. 面板自己能直连目标 —— 面板从不受这道门限制，所以这条硬证据说明
-//     "只有 nginx 连不上"，而不是服务没起。
+// 判据缺一不可（避免把"上游本身没起来"误诊成授权问题）：① 直连模式；
+// ② 探测得 502/504；③ 目标是私有/链路本地地址；④ 面板自己能直连（面板不受这道门限制）。
 func (s *Server) directLANBlockedAdvice(ctx context.Context, rule *proxies.Rule, p proxyProbe) string {
 	if rule == nil || rule.Forwarding() {
 		return ""
@@ -2256,10 +2042,8 @@ type tlsPeerInfo struct {
 	Subject  string
 }
 
-// proxyTLSPeerFn 取回该端口上真实提供的证书。
-//
-// 生产实现用 Go 的 crypto/tls 直接拨号。刻意 InsecureSkipVerify：
-// 这里要证明的是"nginx 有没有把这份证书端出来"，不是链路可信性 ——
+// proxyTLSPeerFn 取回该端口上真实提供的证书（生产用 Go 的 crypto/tls 直接拨号）。刻意
+// InsecureSkipVerify：要证明的是"nginx 有没有把这份证书端出来"，不是链路可信性 ——
 // 自签证书同样必须能通过复核，所以不能校验证书链。
 var proxyTLSPeerFn = probeTLSPeerCert
 
@@ -2291,11 +2075,8 @@ func probeTLSPeerCert(ctx context.Context, port int, serverName string, timeout 
 	return tlsPeerInfo{NotAfter: leaf.NotAfter, DNSNames: leaf.DNSNames, Subject: leaf.Subject.String()}, nil
 }
 
-// proxyTLSServerName 选一个能命中该规则的 SNI。
-//
-// `_` 不是合法主机名（internal/proxies 在没有域名时就是这么写 server_name），
-// 拿它做 SNI 没有意义：此时让 nginx 用它自己的默认 server 应答，
-// 而"没有域名的规则"正是该端口的默认 server（这类端口不会生成兜底拒绝块）。
+// proxyTLSServerName 选一个能命中该规则的 SNI。`_` 不是合法主机名（没有域名时
+// server_name 就这么写），拿它做 SNI 没有意义，改用 localhost 让 nginx 用默认 server 应答。
 func proxyTLSServerName(rule *proxies.Rule) string {
 	h := strings.TrimSpace(proxyProbeHost(rule))
 	if h == "" || h == "_" || strings.Contains(h, "*") {
@@ -2304,16 +2085,9 @@ func proxyTLSServerName(rule *proxies.Rule) string {
 	return h
 }
 
-// verifyProxyTLSServed 复核"HTTPS 真的起来了，而且端出来的就是我们配的那份证书"。
-//
-// 判据不是"端口能连上"，而是：
-//  1. 配置里写的证书文件能被解析（读不到就别谈生效）；
-//  2. 对该端口做一次真实 TLS 握手，拿回对端 leaf 证书；
-//  3. 对端证书的 NotAfter 必须与配置文件的 NotAfter 一致 —— 这能抓到
-//     "ssl_certificate 没生效 / 加载的还是旧证书 / 请求落在了别的 server 块"。
-//
-// 这是"失败不许谎报"的落点：证书文件写进去了、`nginx -s reload` 退出码是 0，
-// 都不等于能握手成功。
+// verifyProxyTLSServed 复核"HTTPS 真的起来了，而且端出来的就是我们配的那份证书"：① 证书文件
+// 能解析；② 真实 TLS 握手取回对端 leaf 证书；③ 对端 NotAfter 必须与配置一致（能抓到"加载的
+// 还是旧证书"）。文件写进去了、reload 退出码是 0，都不等于能握手成功。
 func (s *Server) verifyProxyTLSServed(ctx context.Context, rule *proxies.Rule) error {
 	if !rule.SSLEnabled {
 		return nil
@@ -2341,10 +2115,8 @@ func (s *Server) verifyProxyTLSServed(ctx context.Context, rule *proxies.Rule) e
 	return nil
 }
 
-// reloadProxyAndVerifyGone 是反代**删除/停用**后的统一收尾。
-//
-// 只 chown + reload + 复核就够：删除不需要写配置，但"删了却没卸载"同样是
-// 静默失败（reload 退出码 0），所以复核不能省。
+// reloadProxyAndVerifyGone 是反代**删除/停用**后的统一收尾：删除不需要写配置，但
+// "删了却没卸载"同样是静默失败（reload 退出码 0），所以 chown + reload + 复核不能省。
 func (s *Server) reloadProxyAndVerifyGone(ctx context.Context, rule *proxies.Rule) error {
 	proxyChownLogsFn(s)
 	if err := proxyReloadFn(s, ctx); err != nil {
@@ -2353,11 +2125,9 @@ func (s *Server) reloadProxyAndVerifyGone(ctx context.Context, rule *proxies.Rul
 	return s.waitProxyGone(ctx, rule)
 }
 
-// waitProxyGone 轮询到"这条规则真的不再被 nginx 使用"。
-//
-// 判据仍然是**该规则自己的访问日志不再增长**：同一个端口上可能还有别的启用
-// 规则在应答，"端口有没有响应"区分不出到底是谁在服务，而每条规则的 location
-// 只写自己的 access_log —— 日志不再增长才说明这条规则真的被卸载了。
+// waitProxyGone 轮询到"这条规则真的不再被 nginx 使用"。判据是该规则自己的访问日志不再
+// 增长：同一端口上可能还有别的启用规则在应答，"端口有没有响应"区分不出到底是谁在服务，
+// 而每条规则的 location 只写自己的 access_log。
 func (s *Server) waitProxyGone(ctx context.Context, rule *proxies.Rule) error {
 	logPath := proxyAccessLogPath(s.proxyLogDir(), rule.ID)
 	prev := proxyLogSize(logPath)
@@ -2389,12 +2159,9 @@ func (s *Server) waitProxyGone(ctx context.Context, rule *proxies.Rule) error {
 	}
 }
 
-// verifyProxyDomainGuard 复核"域名对不上的 Host 不会被误转发到后端"。
-//
-// 只有该端口确实应该存在兜底拒绝块（文件在）时才检查：
-//   - 端口 80 上 000-default.conf 已经占了 default_server，拒绝块写不进去，
-//     但这不算失败 —— 不匹配的 Host 会被默认站点接住，同样漏不到反代后端；
-//   - 通配规则（domains 为空）本来就该匹配所有 Host，跳过。
+// verifyProxyDomainGuard 复核"域名对不上的 Host 不会被误转发到后端"。只有该端口确实应该
+// 存在兜底拒绝块（文件在）时才检查：80 端口上 000-default.conf 已占了 default_server，
+// 拒绝块写不进去但不算失败（不匹配的 Host 被默认站点接住，漏不到后端）；通配规则跳过。
 func (s *Server) verifyProxyDomainGuard(ctx context.Context, rule *proxies.Rule) error {
 	if len(proxies.SplitDomains(rule.Domains)) == 0 {
 		return nil
@@ -2425,11 +2192,9 @@ func (s *Server) verifyProxyDomainGuard(ctx context.Context, rule *proxies.Rule)
 	}
 }
 
-// isDuplicateDefaultServer 判断"兜底拒绝块写不进去"是不是因为该端口已经有
-// 别的 default_server（典型：000-default.conf 的 `listen 80 default_server`）。
-//
-// 这不是失败：那个默认 server 会把域名对不上的 Host 接住，同样漏不到后端。
-// 把它当失败会让**所有 80 端口上的带域名规则都无法创建**（最常见用法）。
+// isDuplicateDefaultServer 判断"兜底拒绝块写不进去"是不是因为该端口已经有别的 default_server
+// （典型：000-default.conf 的 `listen 80 default_server`）。这不是失败：那个默认 server 会接住
+// 域名对不上的 Host；当失败会让**所有 80 端口上的带域名规则都无法创建**（最常见用法）。
 func isDuplicateDefaultServer(err error) bool {
 	if err == nil {
 		return false
@@ -2437,11 +2202,9 @@ func isDuplicateDefaultServer(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "duplicate default server")
 }
 
-// applyProxy 生成并应用一条规则的 nginx 配置。
-//
-// 与 applySite 一样：失败时撤销本次写入的 vhost（还原旧内容 / 删掉本次新建的）。
-// 反代的调用方（创建/更新/启停/绑证书）都靠这一点才能做到
-// "接口非 2xx = 这次没做成、重试不会被上一次的残留挡住"。
+// applyProxy 生成并应用一条规则的 nginx 配置。与 applySite 一样：失败时撤销本次写入的
+// vhost（还原旧内容 / 删掉本次新建的），调用方才能做到"接口非 2xx = 这次没做成、
+// 重试不会被上一次的残留挡住"。
 func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if !rule.Enabled {
 		return s.removeProxyConfig(ctx, rule)
@@ -2470,15 +2233,9 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	return nil
 }
 
-// syncForwarder 让一条规则的回环转发器与当前配置对齐，并把分配到的端口写回
-// rule.ForwardPort。
-//
-// **必须在 applyProxy / Generate 之前调用**：生成的 proxy_pass 用的是
-// rule.ForwardPort，而端口由管理器分配（优先复用数据库里的旧值，重启后
-// nginx 配置才不会指向一个没人听的端口）。
-//
-// 不需要转发（off / 公网 / 回环目标）时它会停掉监听器并把 ForwardPort 清 0，
-// 渲染随之退回直连 —— 这样"关掉转发"是真的关掉，而不是留个半死不活的监听器。
+// syncForwarder 让一条规则的回环转发器与当前配置对齐，并把端口写回 rule.ForwardPort。
+// **必须在 applyProxy / Generate 之前调用**：proxy_pass 用的是 rule.ForwardPort，端口由管理器
+// 分配（优先复用数据库里的旧值）。不需要转发时停掉监听器并把 ForwardPort 清 0（真的关掉）。
 func (s *Server) syncForwarder(rule *proxies.Rule) error {
 	if rule == nil {
 		return nil
@@ -2493,13 +2250,9 @@ func (s *Server) syncForwarder(rule *proxies.Rule) error {
 	return nil
 }
 
-// reconcileForwarders 在面板启动时把转发器对齐到数据库里的规则。
-//
-// 三件事：
-//  1. 该起的起（enabled 且需要转发）、该停的停（停用/删除/不再需要转发）；
-//  2. 端口分配结果落库（重启后优先复用同一个端口）；
-//  3. 端口变了就重写对应 vhost —— 否则 nginx 里的 proxy_pass 会指向旧端口，
-//     表现为"转发器起来了、规则却是 502"。
+// reconcileForwarders 在面板启动时把转发器对齐到数据库里的规则：该起的起、该停的停；
+// 端口分配结果落库（重启后复用同一个端口）；端口变了就重写对应 vhost —— 否则 nginx 里的
+// proxy_pass 会指向旧端口，表现为"转发器起来了、规则却是 502"。
 func (s *Server) reconcileForwarders(ctx context.Context) {
 	list, err := s.proxyRepo().List(ctx)
 	if err != nil {
@@ -2535,10 +2288,9 @@ func (s *Server) reconcileForwarders(ctx context.Context) {
 	}
 }
 
-// removeProxyConfig 移除一条规则的配置文件并 reload。
-//
-// 复核发现"删了却仍在生效"时**把文件还原回去**：那时记录还在、配置却没了，
-// 是最典型的不一致状态；还原后重试删除才是干净的。
+// removeProxyConfig 移除一条规则的配置文件并 reload。复核发现"删了却仍在生效"时
+// **把文件还原回去**：那时记录还在、配置却没了，是最典型的不一致状态；还原后重试删除
+// 才是干净的。
 func (s *Server) removeProxyConfig(ctx context.Context, rule *proxies.Rule) error {
 	snap := s.snapshotVhost(rule.VhostName())
 	if err := siteDeleteVhostFn(s, ctx, rule.VhostName()); err != nil {
@@ -2550,18 +2302,9 @@ func (s *Server) removeProxyConfig(ctx context.Context, rule *proxies.Rule) erro
 	return nil
 }
 
-// syncRejectBlocks 把"兜底拒绝块"与当前规则集对齐。
-//
-// 每次增删改/启停规则后都要调用：只有这样才能保证
-//   - 端口上出现了带域名的规则 → 立刻补上 default_server 拒绝块；
-//   - 该端口再没有带域名的规则 → 把拒绝块删掉（否则会把通配规则一起打死）。
-//
-// 收尾同样是"chown 日志树 → reload → 请求级复核"：兜底块也是配置，
-// "写了没生效"对用户来说等于域名限制没落实，必须如实上报。
-//
-// 判定用的是**数据库里的**规则集，而不是调用方内存里那条：调用方都应先落库、再调用。
-// 唯一的例外是"删掉域名"的更新 —— 那种情况下数据库还是旧值，会多留一个兜底块；
-// 表现为"该域名仍被保护"，不会把请求漏给后端，属于安全侧的多余，下次改动即收敛。
+// syncRejectBlocks 把"兜底拒绝块"与规则集对齐：端口出现带域名的规则 → 补 default_server
+// 拒绝块；该端口再无带域名规则 → 删掉（否则会把通配规则一起打死）。收尾走"chown → reload →
+// 请求级复核"；判定用**数据库里的**规则集，删域名时会多留一个兜底块（安全侧多余，下次收敛）。
 func (s *Server) syncRejectBlocks(ctx context.Context) error {
 	list, err := s.proxyRepo().List(ctx)
 	if err != nil {
@@ -2588,10 +2331,9 @@ func (s *Server) syncRejectBlocks(ctx context.Context) error {
 		}
 		if err := s.writeVhost(ctx, proxies.RejectVhostName(port), content); err != nil {
 			if isDuplicateDefaultServer(err) {
-				// 这个端口已经有别的 default_server 了（典型就是 000-default.conf
-				// 的 `listen 80 default_server`）。不匹配的 Host 会被那个默认 server
-				// 接住，同样漏不到反代后端 —— 我们的兜底块既是写不进去、也不需要。
-				// 以前这里会把它当成"写入失败"报一笔，其实是虚惊。
+				// 该端口已经有别的 default_server 了（典型就是 000-default.conf 的
+				// `listen 80 default_server`）：不匹配的 Host 会被它接住，我们的兜底块
+				// 既写不进去、也不需要。
 				delete(need, port)
 				delete(rep, port)
 				continue
@@ -2632,11 +2374,9 @@ type proxyRejectSpec struct {
 	Key  string
 }
 
-// proxyRejectSpecs 从规则集推导出每个端口的兜底块形态。
-//
-// 抽成纯函数是为了让单测能直接钉住"SSL 端口必须带证书"这条判据
-// （真机实测：同一端口上只要有一个 server 块写了 ssl，所有 server 块
-// 都必须有 ssl_certificate，否则 `nginx -t` 直接 [emerg]）。
+// proxyRejectSpecs 从规则集推导出每个端口的兜底块形态。抽成纯函数是为了让单测钉住
+// "SSL 端口必须带证书"这条判据（真机实测：同一端口上只要有一个 server 块写了 ssl，
+// 所有 server 块都必须有 ssl_certificate，否则 `nginx -t` 直接 [emerg]）。
 func proxyRejectSpecs(rules []*proxies.Rule) map[int]proxyRejectSpec {
 	out := map[int]proxyRejectSpec{}
 	for _, r := range rules {
@@ -2655,30 +2395,9 @@ func proxyRejectSpecs(rules []*proxies.Rule) map[int]proxyRejectSpec {
 	return out
 }
 
-// proxyPortListenMode 判断某端口上**已有 vhost** 用的 listen 协议选项。
-//
-// 返回：
-//   - hasSSL：至少有一个 `listen <port> ssl`；
-//   - uniformSSL：该端口上所有 `listen <port>` 都带 ssl（没有"有的带有的不带"）。
-//
-// 为什么需要它（2026-09-18 生产 error.log 实测）：
-// nginx 对同一个 `0.0.0.0:<port>` 上重复出现的 listen 有严格规则 ——
-// 选项集**完全一致**（例如全 ssl，或全不带）不会报；一旦出现第二/第三种
-// 不同的协议选项集（典型是"有的 listen ... ssl、有的不带"），就会打
-// `protocol options redefined for 0.0.0.0:<port>`。
-//
-// 兜底拒绝块 `proxy-reject-<port>.conf` 的字典序永远排在 `proxy-<id>.conf`
-// 之后（数字 < 'r'），所以它是不是"那个多余的第二选项集"完全取决于它自己怎么写：
-//
-//	全 ssl 端口 → 兜底块也必须写 ssl（少写 ssl 会被判"选项被移除"）；
-//	混合端口   → 兜底块绝不能写 ssl（那会成为第三个不同的选项集）。
-//
-// 只看数据库里的反代规则不够：同一端口还可能有站点 vhost（站点侧会写
-// `listen <port> ssl`）。所以这里扫描 vhosts 目录里**别的** .conf，
-// 复用站点侧同一套 listen 解析（siteServerBlocks + siteListenPorts）。
-//
-// selfFile 是正在重写的兜底块文件名（不含 .conf 后缀），读目录时跳过它自己，
-// 否则旧内容会影响判断。
+// proxyPortListenMode 判断某端口上**已有 vhost** 用的 listen 协议选项，返回 (hasSSL, uniformSSL)。
+// 实测（2026-09-18 生产 error.log）：nginx 要求同一 `0.0.0.0:<port>` 上重复的 listen 选项集一致，
+// 否则 `protocol options redefined`；兜底块必须跟随（全 ssl 写 ssl、混合端口绝不写）。
 func (s *Server) proxyPortListenMode(port int, selfFile string) (hasSSL, uniformSSL bool) {
 	if port <= 0 {
 		return false, false
@@ -2698,8 +2417,8 @@ func (s *Server) proxyPortListenMode(port int, selfFile string) (hasSSL, uniform
 		if rerr != nil {
 			continue
 		}
-		// 逐 server 块解析：同一份文件里可能有多个块（例如站点 vhost 的
-		// 80/443 两块），siteListenPorts 按块调用才不会把同端口的两种写法去重掉。
+		// 逐 server 块解析：同一份文件里可能有多个块（如站点 vhost 的 80/443），
+		// 按块调用 siteListenPorts 才不会把同端口的两种写法去重掉。
 		for _, block := range siteServerBlocks(string(b)) {
 			for _, lp := range siteListenPorts(block) {
 				if lp.Port != port {
@@ -2719,13 +2438,9 @@ func (s *Server) proxyPortListenMode(port int, selfFile string) (hasSSL, uniform
 	return hasSSL, uniformSSL
 }
 
-// proxyRejectBlockContent 生成某端口「域名兜底拒绝块」的内容。
-//
-// 这是**唯一的生成点**：listen 写不写 ssl、要不要带证书行，都在这里定，
-// 保证与端口上已有 vhost 的 listen 选项一致（见 proxyPortListenMode），
-// 从而不再产生 `protocol options redefined` 警告。
-//
-// 抽成方法是为了让单测能直接钉住生成结果，而不必走"写盘 + reload + 复核"。
+// proxyRejectBlockContent 生成某端口「域名兜底拒绝块」的内容，这是**唯一的生成点**：listen 写
+// 不写 ssl、要不要带证书行都在这里定，保证与端口上已有 vhost 的 listen 选项一致，不再产生
+// `protocol options redefined` 警告。抽成方法是为了让单测直接钉住生成结果。
 func (s *Server) proxyRejectBlockContent(port int, sp proxyRejectSpec) (string, error) {
 	if sp.SSL && (sp.Cert == "" || sp.Key == "") {
 		return "", fmt.Errorf("端口 %d 上有已启用 HTTPS 的规则，但数据库里没有证书路径："+
@@ -2738,30 +2453,16 @@ func (s *Server) proxyRejectBlockContent(port int, sp proxyRejectSpec) (string, 
 		// 都能取到证书；兜底块永远 return 444，证书只是为满足这条要求。
 		cert, key = sp.Cert, sp.Key
 	}
-	// 什么时候兜底块要写 ssl：
-	//   sp.SSL 为真（这条端口的反代规则是 HTTPS）**且**端口上没有任何"不带 ssl
-	//   的邻居"。若真存在不带 ssl 的邻居，那就是混合端口，兜底块再写 ssl 会成为
-	//   第三种选项集 → 警告；此时宁可写不带 ssl 的形态。
-	// 注意不能只看"扫到了 ssl 邻居"：写这份兜底块时，规则自己的 vhost 可能还没
-	// 落盘（例如刚启用一条 HTTPS 规则），此时端口上只有旧文件，按 sp.SSL 判断才对。
+	// 兜底块写 ssl 的条件：sp.SSL 为真**且**端口上没有任何"不带 ssl 的邻居"（混合端口
+	// 再写 ssl 会成为第三种选项集）。不能只看"扫到了 ssl 邻居"：写这份兜底块时，规则自己
+	// 的 vhost 可能还没落盘（例如刚启用一条 HTTPS 规则），此时按 sp.SSL 判断才对。
 	sslListen := sp.SSL && (uniformSSL || !hasSSLPeer)
 	return proxies.GenerateRejectWithCert(port, s.proxyLogDir(), cert, key, sslListen), nil
 }
 
-// stabilizeProxyReject 在 SSL 开关切换的写盘之前，把该端口的兜底块改成
-// "带证书行"的形态，保证切换的**中间态**不会让 `nginx -t` 判 [emerg]。
-//
-// 为什么需要（真机 nginx 1.31.5 实测）：SSL 开/关都要同时改两个文件
-// （规则 vhost 与兜底块），而写每个文件都会跑一次 `nginx -t`。中间态里
-// "有 ssl 的 server + 没证书的 server"会被判 [emerg] 并回滚，导致切换永远失败。
-// 带证书行的 server 在任何组合下都合法，所以先落它、再改规则 vhost。
-//
-// targetSSL 是**切换后**这条规则是否启用 HTTPS，决定 listen 要不要带 ssl：
-//   - 正在切成 HTTPS 且同端口其它 vhost 已经全是 ssl 时，必须保持 ssl
-//     （临时的"不带 ssl 兜底块"会在一个全 ssl 端口上凑出混合协议选项 →
-//     nginx 立刻打 protocol options redefined）；
-//   - 其余情况一律用不带 ssl 的中性形态 —— 尤其是"切成 HTTP"：规则 vhost
-//     马上会变成不带 ssl，兜底块若还带 ssl 会被 nginx 判 [emerg]。
+// stabilizeProxyReject 在 SSL 开关切换写盘之前，把该端口的兜底块改成"带证书行"的形态，保证
+// 中间态不会让 `nginx -t` 判 [emerg]（真机 nginx 1.31.5 实测：开/关都要同时改规则 vhost 与兜底块，
+// 而每次写盘都跑 `nginx -t`；带证书行的 server 任何组合都合法，所以先落它）。targetSSL 决定带不带 ssl。
 func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, keyPath string, targetSSL bool) error {
 	if certPath == "" || keyPath == "" {
 		return nil
@@ -2783,15 +2484,9 @@ func (s *Server) stabilizeProxyReject(ctx context.Context, port int, certPath, k
 	return s.writeVhost(ctx, proxies.RejectVhostName(port), content)
 }
 
-// checkProxySSLPortMix 拦住"同一端口上 HTTP 与 HTTPS 混用"。
-//
-// 为什么必须拦：nginx 的同一 listen 端口只有一种协议 —— 只要有一个 server 块
-// 写了 `ssl`，整个端口就按 TLS 处理，另一个"以为自己是 HTTP"的规则会静默失效
-// （客户端用 http:// 访问会握手失败）。这种失效用户完全看不出来，所以宁可在
-// 保存时明确拒绝，也不写出一份"两条都显示已启用、只有一条能用"的配置。
-//
-// 同时拦住"端口 80 + HTTPS"：80 由面板默认站点（000-default.conf）占着
-// default_server，而它没有证书 —— 一旦该端口出现 ssl，nginx 会直接 [emerg]。
+// checkProxySSLPortMix 拦住"同一端口上 HTTP 与 HTTPS 混用"：只要有一个 server 块写了 `ssl`，
+// 整个 listen 端口就按 TLS 处理，另一个"以为自己是 HTTP"的规则会静默失效（用户看不出来）。
+// 同时拦住"端口 80 + HTTPS"：80 被 000-default.conf 占着 default_server 且无证书 → [emerg]。
 func (s *Server) checkProxySSLPortMix(ctx context.Context, rule *proxies.Rule) error {
 	if rule == nil || !rule.Enabled {
 		return nil // 停用的规则不写配置，不会造成混用
@@ -2812,11 +2507,8 @@ func (s *Server) checkProxySSLPortMix(ctx context.Context, rule *proxies.Rule) e
 			continue
 		}
 		// other 与 rule 的 SSL 一定不同（相同的上面 continue 了），两者的模式互为反面。
-		//
-		// ⚠️ 这里曾经把两个标签写反（赋值与打印顺序对不上）：用户明明"新规则没开
-		// HTTPS、已有规则是 HTTPS"，弹出来的却是「已有HTTP规则…而这条是HTTPS」——
-		// 正好把人往反方向带（2026-09-17 用户实测报障）。
-		// 这条是 HTTPS ⇒ 那条是 HTTP；这条是 HTTP ⇒ 那条是 HTTPS。
+		// ⚠️ 这里曾经把两个标签写反（赋值与打印顺序对不上），正好把人往反方向带
+		// （2026-09-17 用户实测报障）。这条是 HTTPS ⇒ 那条是 HTTP，反之亦然。
 		otherMode, myMode := "HTTP", "HTTPS"
 		if !rule.SSLEnabled {
 			otherMode, myMode = "HTTPS", "HTTP"
@@ -2850,9 +2542,7 @@ func (s *Server) reloadRejectBlocksAndVerify(ctx context.Context, need map[int]b
 	return nil
 }
 
-// deleteVhost 删除 vhost 文件（经提权助手）。
-//
-// 文件本来就不存在时视为成功：删除是幂等的，而"已经没有了"不该报错。
+// deleteVhost 删除 vhost 文件（经提权助手）：文件本来就不存在时视为成功（删除是幂等的）。
 func (s *Server) deleteVhost(ctx context.Context, name string) error {
 	path := filepath.Join(s.Cfg.VhostDir, name+".conf")
 	if _, err := os.Stat(path); err != nil {

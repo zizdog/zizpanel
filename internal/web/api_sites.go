@@ -22,28 +22,19 @@ import (
 	"github.com/zizdog/zizpanel/internal/upgrade"
 )
 
-// ============================================================================
-//  站点管理接口
-//
-//  职责划分：
-//    - 面板侧（本文件）：校验输入、生成 nginx 配置、维护数据库、编排操作顺序
-//    - 助手侧（zizpanel-helper）：白名单路径内原子落盘、语法校验、reload
-//
-//  所有会改动 nginx 的操作都遵循同一个安全顺序：
-//    写配置（helper 内部校验并允许回滚）→ reload → 失败则还原数据库状态
-// ============================================================================
+// 站点管理接口：面板侧校验输入、生成 nginx 配置、维护数据库、编排顺序；
+// 助手侧（zizpanel-helper）在白名单路径内原子落盘、语法校验、reload。
+// 会改动 nginx 的操作统一走：写配置（helper 校验并允许回滚）→ reload → 失败则还原数据库。
 
 // siteLogDir 返回站点日志目录。约定与现有 LNMP 环境一致（~/www/_logs）。
 func (s *Server) siteLogDir() string {
 	return filepath.Join(s.Cfg.WWWRoot, "_logs")
 }
 
-// siteMgr 构造站点管理器。
 func (s *Server) siteMgr() *sites.Manager {
 	return sites.NewManager(s.Store, sites.Options{LogDir: s.siteLogDir()})
 }
 
-// helperCall 调用提权助手并返回解析后的结果（包级函数，便于其它模块复用）。
 func helperCall(ctx context.Context, args ...string) (map[string]any, error) {
 	bin := "/opt/zizpanel/bin/zizpanel-helper"
 	if v := os.Getenv("ZIZPANEL_WORKDIR"); v != "" {
@@ -52,7 +43,6 @@ func helperCall(ctx context.Context, args ...string) (map[string]any, error) {
 	return helperCallBin(ctx, bin, args...)
 }
 
-// helperCallBin 用指定路径的助手执行。
 func helperCallBin(ctx context.Context, bin string, args ...string) (map[string]any, error) {
 	if _, err := os.Stat(bin); err != nil {
 		return nil, fmt.Errorf("提权助手不存在: %s", bin)
@@ -65,10 +55,8 @@ func helperCallBin(ctx context.Context, bin string, args ...string) (map[string]
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	cmd := execCommand(ctx, bin, cmdArgs...)
-	// stderr 必须单独收集并带进错误信息。
-	// 提权失败最常见的原因是 sudoers 规则不对/未生效，而原因只写在 stderr 上
-	// （例如 "sudo: a password is required"）。只用 Output() 会把它丢掉，
-	// 用户看到的是一句毫无信息量的 "exit status 1 ()"，根本没法排查。
+	// stderr 必须单独带进错误信息（sudoers 不对时原因只写在 stderr 上），
+	// 否则用户只看到一句毫无信息量的 "exit status 1 ()"。
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	out, err := cmd.Output()
@@ -92,8 +80,7 @@ func helperCallBin(ctx context.Context, bin string, args ...string) (map[string]
 		return parsed, fmt.Errorf("调用提权助手失败: %v（%s）", err, detail)
 	}
 	if parsed == nil {
-		// 退出码 0 但输出不是 JSON：不能当成成功，
-		// 否则调用方会以为操作生效了（例如"站点已创建"）。
+		// 退出码 0 但输出不是 JSON 不能当成功，否则调用方会以为操作生效了。
 		return nil, fmt.Errorf("提权助手返回了无法解析的结果: %s", strings.TrimSpace(string(out)))
 	}
 	if okv, _ := parsed["ok"].(bool); !okv {
@@ -106,26 +93,15 @@ func helperCallBin(ctx context.Context, bin string, args ...string) (map[string]
 	return parsed, nil
 }
 
-// callHelper 调用提权助手并解析 JSON 结果。
-//
 // 助手必须由 root 调用（sudoers 白名单）或当前进程本身就是 root。
-// 具体执行逻辑统一在 helperCallBin 里，这里只负责解析路径：
-// 两份重复实现曾经分叉过（一处修了错误信息、另一处没修），不要再复制。
+// 实现只有 helperCallBin 一份：曾分叉过（一处修了错误信息、另一处没修），不要再复制。
 func (s *Server) callHelper(ctx context.Context, args ...string) (map[string]any, error) {
 	return helperCallBin(ctx, s.Cfg.ServicePath("zizpanel-helper"), args...)
 }
 
 // writeVhost 把配置写入 nginx vhost 目录（经助手，含语法校验与回滚）。
-//
-// 写之前先确保 nginx 的**基础片段已加载**，失败时若是"变量未定义"再自愈重试一次。
-//
-// 为什么必须这样（2026-09-22 用户报障："反向代理用不了了！规则已保存但 nginx 配置
-// 应用失败：unknown "connection_upgrade" variable"）：brew 重装/升级 nginx 会把
-// nginx.conf **还原成出厂版** —— 里面没有 `include conf.d/*.conf`，面板写在
-// conf.d/upgrade-map.conf 里的 map 就不会被加载，于是任何反代规则都过不了 nginx -t。
-// 面板**自己就会修这件事**（EnsureNginxEnv：补 include + map + 运行时目录），
-// 但过去只在启动时修一次；用户看到的只有一句"配置语法错误，已回滚"，无从下手。
-// 现在：先铺好环境再写；万一中途环境又被人改掉，也由下面的重试兜住。
+// 写前先确保 nginx 基础片段已加载：brew 重装/升级会把 nginx.conf 还原成出厂版、
+// 没有 conf.d include ⇒ 反代规则过不了 nginx -t（2026-09-22 报障）；报变量未定义时自愈重试一次。
 func (s *Server) writeVhost(ctx context.Context, domain, content string) error {
 	s.ensureNginxEnvOnStart(ctx)
 	err := s.writeVhostOnce(ctx, domain, content)
@@ -145,12 +121,8 @@ func (s *Server) writeVhost(ctx context.Context, domain, content string) error {
 	return fmt.Errorf("%w；面板已自动补齐 nginx 的 conf.d 加载与 WebSocket map 后重试，仍然失败", err)
 }
 
-// isNginxEnvVarErr 判断 nginx -t 的报错是不是"面板自己该铺好的变量没定义"。
-//
-// 目前两种，根因相同（nginx.conf 没 include 面板的片段目录）：
-//
-//	· $connection_upgrade —— 面板写在 conf.d/upgrade-map.conf 里的 map，反向代理用；
-//	· $zp_scheme / $zp_https —— 面板生成的 fastcgi 参数块里的 scheme 判断。
+// isNginxEnvVarErr 判断 nginx -t 的报错是不是"面板该铺好的变量没定义"：
+// $connection_upgrade（反代 map）、$zp_scheme / $zp_https（fastcgi 参数块）。
 func isNginxEnvVarErr(err error) bool {
 	if err == nil {
 		return false
@@ -163,12 +135,11 @@ func isNginxEnvVarErr(err error) bool {
 		strings.Contains(msg, "zp_scheme") || strings.Contains(msg, "zp_https")
 }
 
-// writeVhostOnce 是真正执行一次写入（不含自愈与重试）。
 func (s *Server) writeVhostOnce(ctx context.Context, domain, content string) error {
 	bin := s.Cfg.ServicePath("zizpanel-helper")
 	args := []string{"vhost-write", domain}
-	// 用可注入的 root 判据（与整条环境自愈链同一个 seam）：单测以普通用户跑，
-	// 但必须能验证"以 root 运行时直接执行助手、不套 sudo"这条路径。
+	// 用可注入的 root 判据（与环境自愈链同一个 seam）：单测要能验证
+	// "以 root 运行时直接执行助手、不套 sudo"这条路径。
 	if defaultSiteEuid() != 0 {
 		args = append([]string{"-n", bin}, args...)
 		bin = "/usr/bin/sudo"
@@ -193,26 +164,16 @@ func (s *Server) writeVhostOnce(ctx context.Context, domain, content string) err
 	return nil
 }
 
-// nginxReload 重载 nginx。
 func (s *Server) nginxReload(ctx context.Context) error {
 	_, err := s.callHelper(ctx, "nginx-reload")
 	return err
 }
 
-// applySite 生成并应用一个站点的配置。
+// applySite 生成并应用一个站点的配置：写 vhost（helper 内 nginx -t，失败即回滚文件）
+// → reload → 按真实结果复核。失败时撤销本次写入的 vhost，让"接口非 2xx = 这次没做成"成立。
+// PHP 端点用 ResolveEndpoint：端点没在监听就直接失败，不写出指向空气的 vhost。
 //
-// 顺序很关键：先生成内容 → 让 helper 写入并校验 → reload → **按真实结果复核**。
-// helper 在写入前会做 nginx -t，不通过会回滚文件，
-// 因此这里不需要额外处理"配置已写坏"的情况。
-//
-// PHP 端点用 ResolveEndpoint：它要求该端点**真的在监听**。
-// 宁可在保存时明确失败（"PHP 8.4 没在运行"），也不要写出一份
-// 指向空气的 vhost —— 那种情况下站点是 502，用户得翻 nginx 错误日志
-// 才能知道是 PHP 版本没起来。
-//
-// 失败时**撤销本次写入的 vhost**（还原成写入前的内容，或删掉本次新建的）：
-// 只有这样，"接口返回非 2xx"才真的等于"这次没做成"，
-// 用户再点一次也不会撞上 "store 里 ssl_enabled=true、nginx 却没在服务" 的自相矛盾状态。
+// 否则用户再点一次会撞上"store 里 ssl_enabled=true、nginx 却没在服务"的自相矛盾状态。
 func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	pass := ""
 	if site.PHPVersion != "" {
@@ -236,13 +197,9 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err := siteWriteVhostFn(s, ctx, site.Domain, content); err != nil {
 		return err
 	}
-	// 写 vhost 的 helper 会以 root 跑 `nginx -t`，而 nginx **在校验时就会创建
-	// access_log/error_log** —— 于是日志文件是 root 属主；而已启动的 nginx master
-	// 以真实用户运行，reload 时打不开它们：
-	//   [emerg] open() "/Users/zizdog/www/_logs/xxx.access.log" failed (13: Permission denied)
-	// 结果是**配置根本没加载**（站点 404），而 reload 命令仍返回 0。
-	// 所以 reload 之前把日志目录交还真实用户（与"整理默认站点"同一套做法）。
-	// 真机 2026-09-17：mini 上 nginx 已改成以真实用户运行，这条路径必须先修。
+	// nginx -t 会以 root 创建 access_log/error_log，而 nginx master 以真实用户运行，
+	// reload 时打不开 → 配置根本没加载（站点 404），reload 退出码却仍是 0。
+	// 所以 reload 前把日志目录交还真实用户（真机 2026-09-17 确认必须）。
 	if s.Cfg.User != "" && os.Geteuid() == 0 {
 		_ = chownTreeTo(s.siteLogDir(), s.Cfg.User)
 	}
@@ -250,24 +207,16 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn,
 			fmt.Errorf("配置已写入但 nginx 重载失败: %w", err))
 	}
-	// reload 命令成功 ≠ 新配置生效：nginx 读配置失败（例如日志/证书文件打不开）
-	// 时会在错误日志里写 [emerg]，而 `nginx -s reload` **退出码依然是 0**。
-	// 不复核的话，"面板说创建成功、用户打开是 404/502"就是必然结果。
+	// reload 成功 ≠ 新配置生效：nginx 读配置失败（日志/证书打不开）时只写 [emerg]，
+	// nginx -s reload 退出码依然是 0；不复核就必然"面板说成功、用户打开 404/502"。
 	if err := s.verifySiteServed(ctx, site); err != nil {
 		return s.rollbackVhostWrite(ctx, snap, siteWriteVhostFn, siteReloadFn, err)
 	}
 	return nil
 }
 
-// siteWriteVhostFn / siteReloadFn / siteProbeFn / siteDeleteVhostFn 是
-// "写 vhost → reload → 复核"这条通道的可注入步骤。
-//
-// 为什么做成包级变量：这条通道的收尾复核与失败回滚必须能被单测覆盖，而单测
-// **不允许调用提权助手、不允许真发网络请求**。生产环境这些变量指向
-// 真实实现，行为与直接调用完全一致。
-//
-// siteWriteVhostFn 同时被 applyDefaultVhost 与失败回滚（还原旧内容）复用：
-// 只保留一种"把 vhost 写进 nginx 目录"的写法，避免回滚走一条没人测过的路径。
+// 这几个包级变量是"写 vhost → reload → 复核"通道的可注入步骤：单测不允许调用
+// 提权助手、不允许真发网络请求（生产指向真实实现）。回滚走同一条通道，不另开没测过的路径。
 var (
 	siteWriteVhostFn = func(s *Server, ctx context.Context, domain, content string) error {
 		return s.writeVhost(ctx, domain, content)
@@ -275,60 +224,36 @@ var (
 	siteReloadFn = func(s *Server, ctx context.Context) error {
 		return s.nginxReload(ctx)
 	}
-	// siteProbeFn 的签名与 sites_check.go 的 curlSite 一致（用 --resolve 钉到 127.0.0.1）。
-	siteProbeFn = curlSite
-	// siteDeleteVhostFn 删除一份 vhost（回滚"本次新建的"文件时用）。
+	siteProbeFn       = curlSite
 	siteDeleteVhostFn = func(s *Server, ctx context.Context, name string) error {
 		return s.deleteVhost(ctx, name)
 	}
-	// siteReadVhostFn 读取一份 vhost 的当前内容（回滚要还原它，就必须先读出来）。
 	siteReadVhostFn = func(s *Server, path string) ([]byte, error) {
 		return os.ReadFile(path)
 	}
 )
 
-// siteVerifyWait / siteVerifyEvery 控制"等新配置生效"的轮询窗口。
-//
-// 为什么必须等：`nginx -s reload` 只是给 master 发信号，新 worker 接管旧 worker
-// 之间的**旧配置仍然在应答**（真机 2026-09-16：写完立刻探测拿到 404，随后独立
-// 复测同一请求返回期望的 403 —— 配置从头到尾都是对的，只是探测太早）。
-// 所以窗口内的 404/000/"403 与期望不符" 一律视为**还没生效**，不是失败。
-//
-// 做成变量：单测必须能把它压到毫秒级（不许真睡 5 秒）。
+// siteVerifyWait / siteVerifyEvery 是"等新配置生效"的轮询窗口：nginx -s reload 是
+// 异步的，新 worker 接管前旧配置仍在应答（真机 2026-09-16），窗口内 404/000 一律
+// 视为还没生效。做成变量以便单测压到毫秒级。
 var (
 	siteVerifyWait  = 6 * time.Second
 	siteVerifyEvery = 200 * time.Millisecond
 )
 
-// siteProbeTimeout 是单次探针的超时。不能太长：复核要在窗口内轮询多次，
-// 单次探测挂满整个窗口就等于只测了一次。
+// siteProbeTimeout 是单次探针超时；太长会让窗口内只探到一次。
 const siteProbeTimeout = 4 * time.Second
 
-// siteVhostProbePath 是"配置是否真的生效"的探测路径。
+// siteVhostProbePath 是"配置是否真的生效"的探测路径：每个站点 vhost 都带
+// `location ~ /\. { deny all; }`，正则 location 优先于 `location /`，所以
+// 403 = vhost 已加载 / 404（落到默认站点）= 没加载 —— 与站点内容、上游健康无关。
 //
-// 为什么是这个点开头的路径：每个站点 vhost（internal/sites 生成）都带这条规则
-//
-//	location ~ /\. { deny all; access_log off; log_not_found off; }
-//
-// 正则 location 的优先级高于 `location /`，所以**只要该站点的 vhost 真的被
-// nginx 加载了**，这个请求必定返回 403。而如果 vhost 没加载，请求会落到默认
-// 站点（000-default）—— 它没有这条规则，`try_files $uri $uri/ =404` 会返回 404。
-//
-// 于是"403 = 配置生效 / 404 = 配置没生效"是一个与站点自身内容无关的硬判据：
-//   - 不受"站点根目录还没有 index 文件"影响（那种情况首页也是 404，
-//     但那是站点内容问题，不是配置没加载）；
-//   - 不受反向代理上游是否健康影响（正则规则在上游之前命中）；
-//   - 不需要往用户站点目录里写探针文件。
+// vhost 没加载时请求落到默认站点（000-default），它没有这条规则 → 返回 404。
 const siteVhostProbePath = "/.zp-vhost-probe"
 
-// verifySiteServed 在 reload 之后按真实请求复核"这份 vhost 真的生效了"。
-//
-// 注意用 curlSite（--resolve 钉到 127.0.0.1），所以域名没有 DNS 解析也能测；
-// 也不能改成直接 fetchLocal("<域名>/")：那会走真实 DNS。
-//
-// **轮询**而不是一次性判定：`nginx -s reload` 是异步的，旧 worker 在新配置
-// 生效前仍会用旧配置应答。窗口内拿到 404/000/别的状态码只说明"还没轮到新配置"，
-// 不是失败；只有窗口耗尽仍拿不到 403 才算失败。
+// verifySiteServed 在 reload 后按真实请求复核"这份 vhost 真的生效了"（403）。
+// 探针必须用 curlSite（--resolve 钉到 127.0.0.1），不能走真实 DNS；
+// 窗口耗尽仍拿不到 403 才算失败（reload 是异步的，旧配置还会应答一阵）。
 func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
 	scheme, port := "http", 80
 	if site.SSLEnabled {
@@ -366,10 +291,7 @@ func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
 	return s.siteVerifyTimeoutError(site, scheme, port, tries, lastCode, lastErr)
 }
 
-// siteVerifyTimeoutError 是"等了整个窗口仍没生效"时的错误：必须能指导排查。
-//
-// 只写"复核失败"等于让用户自己猜；这里把四个检查点直接写进错误里，
-// 并把 nginx 全局 error_log 的末几行**附在消息里**（用户不必再去翻日志中心）。
+// siteVerifyTimeoutError 必须能指导排查：把四个检查点与 error_log 末几行写进错误里。
 func (s *Server) siteVerifyTimeoutError(site *sites.Site, scheme string, port, tries int,
 	code string, perr error) error {
 	logDir := s.siteLogDir()
@@ -408,7 +330,6 @@ func (s *Server) siteVerifyTimeoutError(site *sites.Site, scheme string, port, t
 	return errors.New(b.String())
 }
 
-// humanWait 把等待窗口写成"6 秒"/"0.2 秒"，用于错误文案。
 func humanWait(d time.Duration) string {
 	if d >= time.Second && d%time.Second == 0 {
 		return fmt.Sprintf("%d 秒", int(d/time.Second))
@@ -416,13 +337,8 @@ func humanWait(d time.Duration) string {
 	return fmt.Sprintf("%.1f 秒", d.Seconds())
 }
 
-// existingLogPath 只在文件**真的存在**时返回该路径，否则返回空串。
-//
-// 为什么不是"推导出来就返回"：用户 2026-09-22 明确要求"不能写死，这是个要公开使用的
-// 面板"。旧实现把 /Users/zizdog/www/_logs/nginx-error.log 与
-// /opt/homebrew/var/log/nginx/error.log 写死在前端 JS 里 —— 换一台机器（另一个用户名、
-// Intel 的 /usr/local、自定义 LogRoot）两行就全是错的。真正的判据是"这个文件在不在"，
-// 读不到就返回空串，由界面显示"路径未知"，绝不拿推导出来的字符串冒充真实路径。
+// existingLogPath 只在文件真的存在时返回路径，否则返回空串 —— 判据必须是"文件在不在"：
+// 绝不拿推导出来的字符串冒充真实路径，读不到就让界面显示"路径未知"（用户 2026-09-22 要求不写死）。
 func existingLogPath(p string) string {
 	if strings.TrimSpace(p) == "" {
 		return ""
@@ -441,7 +357,6 @@ func (s *Server) nginxSiteErrorLog() string {
 	return existingLogPath(filepath.Join(s.Cfg.LogRoot, "nginx-error.log"))
 }
 
-// nginxBrewErrorLog 是 Homebrew nginx 的出厂错误日志位置（由 Cfg.BrewPrefix 推导）。
 func (s *Server) nginxBrewErrorLog() string {
 	if strings.TrimSpace(s.Cfg.BrewPrefix) == "" {
 		return ""
@@ -449,10 +364,7 @@ func (s *Server) nginxBrewErrorLog() string {
 	return existingLogPath(filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log"))
 }
 
-// nginxErrorLogTail 读取 nginx 全局 error_log 的末几行（读不到返回空串）。
-//
-// 复核超时的错误里直接**附上**这几行：用户不必先去日志中心翻，
-// 而 [emerg] 那一行往往就是"reload 退出码是 0 但配置没加载"的全部原因。
+// nginxErrorLogTail 读全局 error_log 末几行（读不到返回空串）；[emerg] 那行往往就是根因。
 func (s *Server) nginxErrorLogTail(lines int) string {
 	path := filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log")
 	tail, _, err := tailFile(path, lines)
@@ -479,14 +391,8 @@ func errSuffix(err error) string {
 	return "（" + err.Error() + "）"
 }
 
-// ============================================================================
-//  vhost 写入的回滚
-//
-//  为什么需要：复核失败时如果只在数据库里回滚、不管磁盘上的 vhost，
-//  就会出现"接口说没做成、nginx 里却留着一份新配置（或旧记录配新配置）"。
-//  更糟的是重试时被上一次的残留挡住。这里保存写入前的字节，
-//  失败时原样写回；本次新建的文件则删掉。
-// ============================================================================
+// vhost 写入的回滚：保存写入前的字节，失败时原样写回、本次新建的删掉。
+// 只管数据库不管磁盘会留下残留，重试还会被它挡住。
 
 // vhostSnapshot 是一份 vhost 文件被本次写入覆盖之前的样子。
 type vhostSnapshot struct {
@@ -497,11 +403,8 @@ type vhostSnapshot struct {
 }
 
 // snapshotVhost 读取 vhost 的当前内容作为回滚依据。
-//
-// 三种情况必须分开，混在一起会**删掉用户的旧配置**：
-//   - 文件不存在 → 本次是新建，回滚删除；
-//   - 读到了内容 → 回滚原样写回；
-//   - 读失败（权限/IO）→ 回滚不安全，标记 unknown，回滚时如实报告而不是删文件。
+// 三种情况必须分开（混在一起会删掉用户的旧配置）：不存在 → 回滚删除；读到内容 →
+// 原样写回；读失败（权限/IO）→ 回滚不安全，标记 unknown，如实报告而不是删文件。
 func (s *Server) snapshotVhost(name string) vhostSnapshot {
 	path := filepath.Join(s.Cfg.VhostDir, name+".conf")
 	b, err := siteReadVhostFn(s, path)
@@ -514,15 +417,9 @@ func (s *Server) snapshotVhost(name string) vhostSnapshot {
 	return vhostSnapshot{name: name, unknown: true}
 }
 
-// rollbackVhostWrite 撤销本次对 vhost 的写入，并尽力让 nginx 与磁盘重新对齐。
-//
-// writeFn / reloadFn 由调用方给（站点侧 = siteWriteVhostFn/siteReloadFn，
-// 反代侧 = proxyWriteVhostFn/proxyReloadFn），这样回滚走的是与写入**完全相同**
-// 的那条通道，不会出现"回滚路径没人测过、真机才发现调不动"的情况。
-//
-// 回滚后再发一次 reload：复核失败只说明"没等到生效"，并不保证 nginx 当前
-// 加载的是哪一份；把文件还原后再 reload 一次，至少让"磁盘 = nginx 正在用的"
-// 重新成立。reload 失败只记日志 —— 绝不能覆盖真正的失败原因。
+// rollbackVhostWrite 撤销本次对 vhost 的写入：writeFn/reloadFn 由调用方给，
+// 回滚走与写入完全相同的通道（避免没人测过的回滚路径）。还原后再 reload 一次，
+// 让"磁盘 = nginx 正在用的"成立；reload 失败只记日志，绝不覆盖真正的失败原因。
 func (s *Server) rollbackVhostWrite(ctx context.Context, snap vhostSnapshot,
 	writeFn func(*Server, context.Context, string, string) error,
 	reloadFn func(*Server, context.Context) error, cause error) error {
@@ -552,14 +449,11 @@ func (s *Server) rollbackVhostWrite(ctx context.Context, snap vhostSnapshot,
 	return cause
 }
 
-// ensureSiteRoot 创建站点根目录。
-//
-// 面板以 root 运行，但站点目录必须归属真实用户，否则用户无法用编辑器/上传文件。
+// ensureSiteRoot 创建站点根目录；面板以 root 运行，目录必须归属真实用户，否则用户写不进去。
 func (s *Server) ensureSiteRoot(root string) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("创建站点目录失败: %w", err)
 	}
-	// 归属真实用户（root 运行时 $HOME 不同，必须用配置里的用户名）
 	if s.Cfg.User != "" && s.Cfg.User != "root" {
 		if uid, gid, err := lookupIDs(s.Cfg.User); err == nil {
 			_ = os.Chown(root, uid, gid)
@@ -570,7 +464,6 @@ func (s *Server) ensureSiteRoot(root string) error {
 
 // ---------- HTTP 接口 ----------
 
-// handleSiteList 列出所有站点（含实时状态）。
 func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 	mgr := s.siteMgr()
 	list, err := mgr.List(r.Context())
@@ -578,7 +471,6 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "读取站点失败: "+err.Error())
 		return
 	}
-	// 探测每个站点的 nginx 配置是否已存在（数据库与文件是否一致）
 	type item struct {
 		*sites.Site
 		ConfExists bool `json:"conf_exists"`
@@ -597,42 +489,27 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 		"log_dir":     s.siteLogDir(),
 		"vhost_dir":   vhostDir,
 		"brew_prefix": s.Cfg.BrewPrefix,
-		// nginx 错误日志的两个真实位置（由配置推导 + 存在性核对）。
-		// 前端不许再自己拼路径（会写死用户名与 brew 前缀），读不到就是空串 → 界面显示"路径未知"。
+		// 前端不许自己拼路径（会写死用户名与 brew 前缀），读不到就是空串 → 界面显示"路径未知"。
 		"nginx_error_log":      s.nginxSiteErrorLog(),
 		"nginx_brew_error_log": s.nginxBrewErrorLog(),
 		"presets":              sites.RewritePresets,
 		"php_versions":         s.detectPHPVersions(r.Context()),
-		// 手工编辑配置文件的入口清单（宝塔式的基本操作，见 api_config_files.go）。
-		// 路径由后端给：brew 前缀在 Apple Silicon / Intel 不同，前端不拼字符串。
+		// 路径由后端给（Apple Silicon/Intel 的 brew 前缀不同），前端不拼字符串。
 		"config_files": s.panelConfigFiles(r.Context()),
 	})
 }
 
-// detectPHPVersions 探测本机已安装的 PHP 版本，并补齐运行时状态。
-//
-// 已安装版本的发现逻辑在 sites.DiscoverPHPVersions（按 Homebrew 实际安装情况推导，
-// 不写死列表）。这里只做两件本层才做得了的事：
-//
-//  1. 探测端点是否真的在监听（界面上"运行中/未运行"必须是真的）；
-//  2. 用一次真实请求探测端点背后实际运行的版本（X-Powered-By）。
-//
-// 为什么不再按 formula 名逐个列出、也不再按端点去重：
-// 旧实现里每个版本都被解析成 127.0.0.1:9000，于是 php@8.3 与 php@8.4 会在
-// 去重后**只剩一个**，用户根本看不到第二个版本、更谈不上按站点选它。
-// 现在每个版本有唯一端点（sites.PreferredEndpoint），去重不再需要，
-// "两个版本共用端点"这种情况反而要**显式暴露**出来（PHPVersion.Conflict）。
+// detectPHPVersions 探测已装 PHP 版本并补齐运行时状态：发现逻辑在
+// sites.DiscoverPHPVersions（不写死列表），这里只探测端点是否真在监听 + 实际运行版本。
+// 每个版本有唯一端点（sites.PreferredEndpoint），"两版本共用端点"要显式暴露（Conflict）。
 func (s *Server) detectPHPVersions(ctx context.Context) []sites.PHPVersion {
 	out := sites.DiscoverPHPVersions(s.Cfg.BrewPrefix)
 	for i := range out {
 		if out[i].Pass != "" {
 			out[i].Running = sites.EndpointLive(out[i].Pass)
 		}
-		// "默认版本"标记：配置里 PHPSvc 指向的就是默认（例如 php@8.3）。
-		//
-		// 注意不能只在 out[i].IsDefault 为 true 时才判断 —— DiscoverPHPVersions
-		// 是按版本号去重的，`php` 别名与 `php@8.4` 会合并成一条，
-		// 保留下来的那条未必叫 php，光看名字会漏掉真正的默认版本。
+		// "默认版本" = 配置里的 PHPSvc 指向它。不能只看名字：DiscoverPHPVersions 按版本号
+		// 去重后 `php` 别名与 `php@8.4` 合并成一条，保留的那条未必叫 php。
 		out[i].IsDefault = s.Cfg.PHPSvc == out[i].Service ||
 			s.Cfg.PHPSvc == "php@"+out[i].Version ||
 			(s.Cfg.PHPSvc == "php" && out[i].Service == "php")
@@ -641,9 +518,7 @@ func (s *Server) detectPHPVersions(ctx context.Context) []sites.PHPVersion {
 	return out
 }
 
-// probePHPVersions 通过一次真实请求探测当前 FPM 实际运行的版本。
-//
-// 让"配置里写的版本"与"实际处理的版本"不一致时一眼可见。
+// probePHPVersions 用一次真实请求探测 FPM 实际运行的版本，让"配置写的"与"实际跑的"一眼可见。
 func (s *Server) probePHPVersions(ctx context.Context, list []sites.PHPVersion) {
 	if len(list) == 0 {
 		return
@@ -658,14 +533,9 @@ func (s *Server) probePHPVersions(ctx context.Context, list []sites.PHPVersion) 
 	}
 	defer func() { _ = os.Remove(probeFile) }()
 
-	// 用 -D - 把响应头打到 stdout，从中读 X-Powered-By。
-	//
-	// Host 必须是 **127.0.0.1**（不是 localhost）：面板写的默认站点是
-	// `server_name _;` + `listen 80 default_server`，而 Homebrew 自带的默认站点是
-	// `server_name localhost;`。用 Host: localhost 会**按名字精确命中 brew 那块**
-	// （root 是 Cellar/nginx/html）→ `__zp_ver.php` 404 —— mini 真机的 error_log 里
-	// 整整一屏都是这个 404，PHP 版本探测因此永远"未复核"。
-	// 用 127.0.0.1 才会落到 default_server（面板的默认站点）上。
+	// 用 -D - 把响应头打到 stdout 读 X-Powered-By。
+	// Host 必须是 127.0.0.1（不是 localhost）：localhost 会精确命中 brew 自带的默认站点
+	// → __zp_ver.php 404，PHP 版本探测永远"未复核"（mini 真机 error_log 证实）。
 	rctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 	out, err := execCommand(rctx, "/usr/bin/curl", "-sS", "-D", "-", "-o", "/dev/null",
@@ -685,7 +555,6 @@ func (s *Server) probePHPVersions(ctx context.Context, list []sites.PHPVersion) 
 	}
 }
 
-// parsePoweredBy 从响应头里提取 X-Powered-By 的版本号。
 func parsePoweredBy(headers string) string {
 	for _, ln := range strings.Split(headers, "\n") {
 		ln = strings.TrimSpace(strings.TrimSuffix(ln, "\r"))
@@ -703,7 +572,6 @@ func parsePoweredBy(headers string) string {
 	return ""
 }
 
-// majorMinor 从 "8.4.7" 提取 "8.4"。
 func majorMinor(v string) string {
 	v = strings.TrimSpace(v)
 	parts := strings.Split(v, ".")
@@ -728,7 +596,6 @@ type siteCreateReq struct {
 	CreateDir *bool `json:"create_dir"`
 }
 
-// handleSiteCreate 新建站点。
 func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 	var req siteCreateReq
 	if err := decode(r, &req); err != nil {
@@ -753,7 +620,7 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 伪静态为 Laravel/ThinkPHP 时，运行目录要落到 public 子目录
+	// Laravel/ThinkPHP：运行目录要落到 public 子目录
 	runRoot := root
 	if p, okk := sites.RewritePresetByName(req.Rewrite); okk && p.PublicDir != "" {
 		runRoot = filepath.Join(root, p.PublicDir)
@@ -797,9 +664,8 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.applySite(r.Context(), site); err != nil {
-		// 回滚：删掉刚建的记录，避免出现"数据库有、nginx 没有"的不一致状态。
-		// 本次写入的 vhost 已由 applySite 自己撤销（见 rollbackVhostWrite）。
-		// 回滚失败要**如实说出来**：否则用户重试会被"站点已存在"挡住却不知道为什么。
+		// 回滚刚建的记录，避免"数据库有、nginx 没有"（vhost 已由 applySite 撤销）。
+		// 回滚失败要如实说出来，否则用户重试会被"站点已存在"挡住却不知道为什么。
 		if derr := mgr.Delete(r.Context(), site.Domain); derr != nil {
 			msg := "创建站点失败: " + err.Error() +
 				"（另外：回滚站点记录失败：" + derr.Error() +
@@ -818,11 +684,9 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"site": site, "root": runRoot})
 }
 
-// seedIndexPHP 为新站点写入一个初始首页，方便建完立刻能看到效果。
 func (s *Server) seedIndexPHP(root string, site *sites.Site) error {
 	indexPath := filepath.Join(root, "index.php")
 	if !strings.HasSuffix(site.Root, "public") && site.PHPVersion == "" {
-		// 纯静态站点写 index.html
 		indexPath = filepath.Join(root, "index.html")
 	}
 	if _, err := os.Stat(indexPath); err == nil {
@@ -883,7 +747,6 @@ echo "</div></body></html>";
 	return nil
 }
 
-// handleSiteGet 返回单个站点的完整信息（含配置内容）。
 func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -894,9 +757,7 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	confPath := filepath.Join(s.Cfg.VhostDir, domain+".conf")
 	conf, _ := os.ReadFile(confPath)
-	// 这里用 ResolveConfigEndpoint 而不是 ResolveEndpoint：
-	// 详情页即使 FPM 没在跑也要能显示"配置里写的是哪个端点"，
-	// 并把错误原文交给界面展示（而不是只给一个空白）。
+	// 用 ResolveConfigEndpoint：FPM 没在跑也要能显示配置里写的端点，并把错误原文交给界面。
 	pass := ""
 	passErr := ""
 	if site.PHPVersion != "" {
@@ -921,17 +782,12 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 		"error_log":    filepath.Join(s.siteLogDir(), domain+".error.log"),
 		"presets":      sites.RewritePresets,
 		"php_versions": s.detectPHPVersions(r.Context()),
-		// 证书来源/到期/剩余天数的完整字段（前端据此显示"哪来的、还剩几天"）。
-		"ssl": s.siteSSLView(site),
+		"ssl":          s.siteSSLView(site),
 	})
 }
 
-// siteSSLView 汇总站点证书的展示字段。
-//
-// 到期时间优先取自**真实证书文件**（tlsx.CertExpiry），而不是数据库里的
-// ssl_expires 字符串：文件才是 nginx 实际加载的东西；数据库字段可能是
-// 上一次写入时的快照（例如 acme 续期后还没重新保存站点记录）。
-// 读不到文件时退回数据库字段，days_left 用 -1 表示"无法判断"，不猜。
+// siteSSLView 汇总证书展示字段：到期时间优先取真实证书文件（tlsx.CertExpiry），
+// 数据库字段只是上次写入的快照；读不到文件退回数据库，days_left = -1 表示不猜。
 func (s *Server) siteSSLView(site *sites.Site) map[string]any {
 	v := map[string]any{
 		"enabled":        site.SSLEnabled,
@@ -947,8 +803,6 @@ func (s *Server) siteSSLView(site *sites.Site) map[string]any {
 	if !site.SSLEnabled || site.SSLCert == "" {
 		return v
 	}
-	// 用 tlsx（纯 Go）直接读证书文件：文件才是 nginx 实际加载的东西，
-	// 而数据库里的 ssl_expires 只是上一次写入时的快照（acme 续期后可能还没更新）。
 	if notAfter, err := tlsx.CertExpiry(site.SSLCert); err == nil && !notAfter.IsZero() {
 		days := int(time.Until(notAfter).Hours() / 24)
 		v["not_after"] = notAfter.Format(time.RFC3339)
@@ -967,21 +821,15 @@ func (s *Server) siteSSLView(site *sites.Site) map[string]any {
 	return v
 }
 
-// handleSiteConfSave 直接保存站点 vhost（「配置」页手工编辑后点保存）。
+// handleSiteConfSave 保存用户手写的整份 vhost（「配置」页手工编辑后点保存）。
+// 与 handleSiteUpdate 的分工：后者按面板站点模型重新生成配置，这里以磁盘上这份为准。
 //
-// 与 handleSiteUpdate 的分工：后者从**面板的站点模型**重新生成配置；这里保存的是
-// 用户手写的整份文件 —— nginx 真正加载的就是磁盘上这一份。用户明确要求
-// （2026-09-17）："站点管理中应该能直接编辑配置文件，我要改默认端口"。
+// 用户 2026-09-17 要求："站点管理中应该能直接编辑配置文件，我要改默认端口"。
 //
-// 安全网一条都不能少（每一层都对应一个真机踩过的坑）：
-//  1. helper 写入前跑 `nginx -t`，不通过就不落盘（见 writeVhost）；
-//  2. reload 失败 → 回滚成写入前的内容；
-//  3. reload 成功但**新配置里的 listen 端口一个都不应答** → 同样回滚 ——
-//     nginx 读配置失败（日志/证书打不开）时 `nginx -s reload` 的退出码依然是 0，
-//     "命令返回 0"不等于"配置生效"。
+// 安全网一条都不能少：① helper 写入前 nginx -t，不通过不落盘；② reload 失败 → 回滚；
+// ③ reload 成功但新配置的 listen 端口一个都不应答 → 同样回滚 —— 命令返回 0 不等于配置生效。
 //
-// 不复用 verifySiteServed：它探的是**站点模型里**的 80/443 并要求 403，
-// 而"把站点统一收到 8889"正是这个页面的主要用途，那样会把正确的手工改动误判成失败。
+// 不复用 verifySiteServed：它探站点模型的 80/443 并要求 403，会误判"统一收到 8889"的手工改动。
 func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	ctx := r.Context()
@@ -1000,8 +848,7 @@ func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "配置内容不能为空（要停用站点请改 enabled 开关或删除站点）")
 		return
 	}
-	// 保存前先拦"同端口 + 同 server_name"的冲突：nginx 只加载其中一份、另一份静默失效，
-	// 用户会看到"站点指向了别的站"（真机事故见 checkVhostCollisionWithFiles 的注释）。
+	// 保存前拦"同端口 + 同 server_name"冲突：nginx 只加载一份，另一份静默失效（事故见下方注释）。
 	if hit, err := checkVhostCollisionWithFiles(s.Cfg.VhostDir, req.Content, domain+".conf"); err != nil {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1015,13 +862,11 @@ func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := s.snapshotVhost(domain)
 	if err := siteWriteVhostFn(s, ctx, domain, req.Content); err != nil {
-		// helper 自己已经做了 nginx -t 且没有落盘（失败即回滚文件），
-		// 所以这里不需要再回滚一次 —— 只把 nginx 的原文交回界面。
+		// helper 已做 nginx -t 且失败不落盘，这里不必再回滚，只把 nginx 原文交回界面。
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// 与 applySite 同一处理：nginx -t 会以 root 创建日志文件，
-	// 而 nginx master 以真实用户运行，属主不对会 reload 失败（且退出码仍是 0）。
+	// nginx -t 以 root 创建日志文件，属主不对会让 reload 失败且退出码仍是 0（同 applySite）。
 	if s.Cfg.User != "" && os.Geteuid() == 0 {
 		_ = chownTreeTo(s.siteLogDir(), s.Cfg.User)
 	}
@@ -1075,16 +920,12 @@ func (s *Server) handleSiteConfSave(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"content": req.Content, "conf_path": filepath.Join(s.Cfg.VhostDir, domain+".conf")})
 }
 
-// siteListenPort 是一条 listen 指令解析出来的结果。
 type siteListenPort struct {
 	Port int
 	SSL  bool
 }
 
-// isNginxTokenBoundary 判断某个下标是不是 nginx 指令词的边界（前一个字符是分隔符）。
-//
-// 用途：按"指令词 + 到分号/花括号"扫描时，避免匹配到 `ssl_listen` 这类以指令词
-// 结尾的标识符。抽成函数是为了 server_name / listen 两处用同一个判据。
+// isNginxTokenBoundary 判断下标是否为 nginx 指令词边界，避免匹配到 ssl_listen 这类标识符。
 func isNginxTokenBoundary(s string, i int) bool {
 	if i <= 0 {
 		return true
@@ -1096,11 +937,8 @@ func isNginxTokenBoundary(s string, i int) bool {
 	return false
 }
 
-// siteServerBlocks 返回内容里每一个 `server { … }` 块的原文（花括号配对）。
-//
-// 为什么按块而不是全文件扫描：同一份 vhost 里通常有 80 与 443 两个 server 块，
-// 它们各自有自己的 server_name。把"全文件的端口 × 全文件的名字"做笛卡尔积会
-// 造出根本不存在的组合（a.com:443），进而产生**误报**式的冲突拦截。
+// siteServerBlocks 返回每个 `server { … }` 块的原文（花括号配对）。
+// 必须按块而非全文件：端口×名字的笛卡尔积会造出 a.com:443 这种不存在的组合，导致误报拦截。
 func siteServerBlocks(content string) []string {
 	var out []string
 	for i := 0; i+len("server") <= len(content); i++ {
@@ -1138,7 +976,6 @@ func siteServerBlocks(content string) []string {
 	return out
 }
 
-// siteServerNames 抽出内容里全部 server_name（跳过 `_` / 正则 / 变量）。
 func siteServerNames(content string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -1187,7 +1024,6 @@ func vhostIdentities(content, fileName string) []vhostIdentity {
 	return out
 }
 
-// collideVhosts 在两组身份里找"同端口 + 同 server_name"的冲突，返回第一条。
 func collideVhosts(mine, others []vhostIdentity) (vhostIdentity, bool) {
 	for _, m := range mine {
 		for _, o := range others {
@@ -1199,14 +1035,11 @@ func collideVhosts(mine, others []vhostIdentity) (vhostIdentity, bool) {
 	return vhostIdentity{}, false
 }
 
-// checkVhostCollisionWithFiles 检查"这份配置的 (端口, server_name)"是否与 vhosts 目录里
-// **别的** .conf 重复（selfFile 是要保存/更新的那份，跳过它自己）。
+// checkVhostCollisionWithFiles 检查这份配置的 (端口, server_name) 是否与 vhosts 目录里
+// 别的 .conf 重复（selfFile 跳过自己）。必须拦：同端口重复 server_name 时 nginx 只加载
+// 先 include 的那份，另一份静默失效、nginx -t 只给一行 warning（真机事故 2026-09-17）。
 //
-// 为什么必须拦：同一端口上重复的 server_name，nginx 只会加载其中一份（按 include
-// 顺序），另一份**静默失效**，`nginx -t` 只给一行 warning。真机事故（2026-09-17）：
-// 用户把 wp.zizdog.com 的 vhost 存成 `listen 8889 ssl` + 同名，撞上反代规则 9
-// （也是 8889 + 同名）；proxy-9.conf 字典序在前，于是站点那份被忽略、443 上又没有
-// wp 的 server 块 → 8889 的流量落到了 blog.zizdog.com，用户看到"我的站变成了别的站"。
+// 真机事故：wp 站存成 8889+同名、撞上反代规则 9，8889 的流量落到了别的站。
 func checkVhostCollisionWithFiles(vhostDir, content, selfFile string) (vhostIdentity, error) {
 	mine := vhostIdentities(content, selfFile)
 	if len(mine) == 0 {
@@ -1232,14 +1065,9 @@ func checkVhostCollisionWithFiles(vhostDir, content, selfFile string) (vhostIden
 	return vhostIdentity{}, nil
 }
 
-// siteListenPorts 从 vhost 内容里提取全部 listen 端口（用于"改完真的在服务吗"的复核）。
-//
-// 按"listen 这个单词 + 到下一个分号"扫描，而不是按行：nginx 的写法有
-// `listen 80;` / `listen 443 ssl;` / `listen 127.0.0.1:8889;` / `listen [::]:80;`，
-// 也可能写在同一行的花括号里（`server { listen 8892; }`）—— 只认"行首 listen"
-// 会漏掉整类写法，而漏掉的后果是**跳过复核**，正是"报告成功但其实没生效"。
-// 前置字符必须是分隔符，避免匹配到 `ssl_listen` 这类以 listen 结尾的标识符。
-// 解析不出端口的（例如 `listen unix:/tmp/x.sock;`）直接跳过 —— 那些不该被探。
+// siteListenPorts 从 vhost 内容提取全部 listen 端口（用于"改完真的在服务吗"的复核）。
+// 按"listen 词 + 到分号"扫描而非按行：一行内的 `server { listen 8892; }` 等写法不能漏，
+// 漏掉就等于跳过复核；前置字符须是分隔符以免匹配 ssl_listen；解析不出的（unix:）跳过。
 func siteListenPorts(content string) []siteListenPort {
 	var out []siteListenPort
 	seen := map[int]bool{}
@@ -1293,7 +1121,6 @@ type siteUpdateReq struct {
 	Enabled    *bool   `json:"enabled"`
 }
 
-// handleSiteUpdate 更新站点并重新生成配置。
 func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -1331,9 +1158,8 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 		site.Enabled = *req.Enabled
 	}
 
-	// 伪静态切到 Laravel/ThinkPHP 时，运行目录要跟着切到 public；
-	// 切回来则要退回站点根目录。这里按"域名目录 + 模板要求"重新推导，
-	// 避免用户改模板后目录还停在 public 导致 404。
+	// 伪静态切到 Laravel/ThinkPHP 时运行目录跟着切到 public，切回则退回站点根目录；
+	// 按"域名目录 + 模板要求"重新推导，避免改模板后目录还停在 public 导致 404。
 	baseDir, err := sites.SiteDir(s.Cfg.WWWRoot, site.Domain)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -1372,7 +1198,6 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"site": site})
 }
 
-// handleSiteDelete 删除站点。
 func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	removeFiles := r.URL.Query().Get("remove_files") == "1"
@@ -1409,7 +1234,6 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 审计里记录被删站点的关键信息，便于事后追溯"删掉了什么"
 	detail := fmt.Sprintf("删除站点（根目录=%s，SSL=%v，PHP=%s）%s",
 		site.Root, site.SSLEnabled, site.PHPVersion, filesMsg)
 	s.audit(r, "site_delete", domain, detail, true, "")
@@ -1425,28 +1249,15 @@ type siteSSLReq struct {
 	ExtraSAN []string `json:"extra_san"`
 	Enable   bool     `json:"enable"`
 
-	// CertPrimary 指定要绑定的 ACME 证书（primary 名）。
-	// 不给时按站点域名/别名自动匹配（见 matchCertForSite）。
+	// CertPrimary 指定要绑定的 ACME 证书（primary 名）；不给时按域名/别名自动匹配。
 	CertPrimary string `json:"cert_primary"`
-	// Domain 是 cert_primary 的容错写法：允许前端直接给一个域名，
-	// 由面板去证书库里找覆盖它的那一张。
+	// Domain 是 cert_primary 的容错写法：前端直接给域名，由面板去证书库里找覆盖它的那张。
 	Domain string `json:"domain"`
 }
 
-// handleSiteSSL 为站点签发/配置证书。支持四种来源：
-//   - self   ：openssl 自签（无需任何外部依赖，浏览器会提示不受信任）
-//   - mkcert ：使用 mkcert 的本地 CA（在已信任 mkcert CA 的机器上无提示）
-//   - manual ：用户粘贴证书与私钥
-//   - acme   ：直接引用 internal/acme 已签发的证书（Let's Encrypt 等）
-//
-// acme 来源**不在这里签发**：签发要等 CA 完成 DNS/HTTP 校验，是几十秒到
-// 几分钟的长任务，必须走任务中心（POST /api/v1/certs）。这里只按域名匹配
-// 已有证书，匹配不到就明确提示先去证书页申请 —— 同步接口挂几分钟既违反
-// "长任务必须走任务中心"的约定，用户也看不到任何进度。
-//
-// 关键点：站点写回的是 acme 引擎自己的路径 `<DataDir>/certs/<primary>/...`，
-// **不是复制一份到 site-certs**。因为续期是原地覆盖同一份文件，
-// 站点 vhost 里的 ssl_certificate 一个字都不用改就能用上新证书。
+// handleSiteSSL 为站点签发/配置证书：self（openssl 自签）、mkcert（本地 CA）、
+// manual（用户粘贴）、acme（引用已签发证书，不在本接口签发 —— 长任务必须走任务中心）。
+// 站点写回 acme 自己的路径（非复制到 site-certs），续期原地覆盖、vhost 不用改。
 func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -1469,8 +1280,7 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Provider {
 	case "self", "mkcert", "manual":
-		// 这三个来源都把证书复制/生成到站点自己的目录里（与 acme 分开存放，
-		// 避免"面板的证书库"和"站点私有证书"混在一起）。
+		// 这三个来源把证书存到站点自己的目录（与 acme 证书库分开存放）。
 		certDir := filepath.Join(s.Cfg.DataDir, "site-certs", domain)
 		if err := os.MkdirAll(certDir, 0o755); err != nil {
 			fail(w, http.StatusInternalServerError, "创建证书目录失败: "+err.Error())
@@ -1507,7 +1317,6 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// 读取证书到期时间，便于前端提示续期
 		if res, err := s.callHelper(r.Context(), "site-cert-info", certPath); err == nil {
 			if data, okk := res["data"].(map[string]any); okk {
 				expires, _ = data["expires"].(string)
@@ -1532,8 +1341,7 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 记下写入前的站点记录：SSL 绑定失败时必须把 store 恢复原样，
-	// 否则会出现"面板说绑了、store 里 ssl_enabled=true，nginx 却没在服务"。
+	// 记下写入前的记录：SSL 绑定失败必须把 store 恢复原样，否则"面板说绑了、nginx 却没服务"。
 	before := *site
 
 	site.SSLEnabled = true
@@ -1546,11 +1354,9 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// acme 来源同样走 applySite —— 因此自动获得"写 vhost → reload →
-	// 403 探针复核"这条完整链路，不会出现"面板说绑定成功、站点其实没生效"。
+	// acme 也走 applySite，因此自动获得"写 vhost → reload → 403 复核"整条链路。
 	if err := s.applySite(r.Context(), site); err != nil {
-		// applySite 已撤销本次写入的 vhost；这里把 store 里的 SSL 字段也退回去，
-		// 让"接口非 2xx = 这次没做成"在数据库、磁盘、界面三处保持一致。
+		// applySite 已撤销 vhost；这里把 store 的 SSL 字段也退回，让"非 2xx = 没做成"三处一致。
 		rbMsg := ""
 		if uerr := mgr.Update(r.Context(), &before); uerr != nil {
 			rbMsg = "（另外：回滚 SSL 字段失败：" + uerr.Error() +
@@ -1565,13 +1371,11 @@ func (s *Server) handleSiteSSL(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "site_ssl", domain, "绑定证书 provider="+req.Provider+" 到期="+expires, true, "")
 	ok(w, map[string]any{
 		"site": site, "cert": certPath, "key": keyPath, "expires": expires,
-		// 前端可直接用这些字段显示"哪来的/还剩几天"，不用自己去解析证书。
 		"provider_label": sslProviderLabel(req.Provider),
 		"days_left":      siteSSLDaysLeft(certPath),
 	})
 }
 
-// handleSiteSSLDisable 关闭 SSL。
 func (s *Server) handleSiteSSLDisable(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -1607,7 +1411,6 @@ func (s *Server) handleSiteSSLDisable(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 校验与诊断 ----------
 
-// handleSiteCheck 用真实 HTTP 请求检查站点是否可访问，并检测 PHP 是否被当静态文件吐出。
 func (s *Server) handleSiteCheck(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	mgr := s.siteMgr()
@@ -1623,14 +1426,11 @@ func (s *Server) handleSiteCheck(w http.ResponseWriter, r *http.Request) {
 	ok(w, result)
 }
 
-// handleNginxTest 校验整个 nginx 配置。
 func (s *Server) handleNginxTest(w http.ResponseWriter, r *http.Request) {
 	res, err := s.callHelper(r.Context(), "nginx-test")
 	if err != nil {
-		// ⚠️ 失败时必须把**助手的原始输出**（`nginx -t` 的正文，含文件名与行号）
-		// 带给界面。2026-09-18 用户报障："配置有问题：nginx 配置检查未通过" ——
-		// 只有这一句，**看不出哪一行错**，用户只能干瞪眼。
-		// 助手在 ok:false 时把正文放在 msg、错误摘要放在 error，这里两个都要给。
+		// ⚠️ 失败时必须把助手的原始输出（nginx -t 正文，含文件名与行号）带给界面：
+		// 2026-09-18 用户只看到"nginx 配置检查未通过"这一句，看不出哪一行错。
 		detail := err.Error()
 		if m, _ := res["msg"].(string); strings.TrimSpace(m) != "" {
 			detail = strings.TrimSpace(m) + "\n\n" + detail
@@ -1768,11 +1568,8 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// Shutdown 在面板退出时清理资源。
-//
-// 必须关掉终端会话：它们持有真实的 shell 子进程，
-// 面板退出后这些 shell 如果继续存在，就成了没人管的孤儿进程，
-// 而且它们的审计上下文（哪个用户开的）也丢失了。
+// Shutdown 在面板退出时清理资源：必须关掉终端会话，否则它们持有的真实 shell
+// 会变成没人管的孤儿进程，审计上下文（哪个用户开的）也会丢失。
 func (s *Server) Shutdown() {
 	if s.termMgr != nil {
 		s.termMgr.CloseAll()
@@ -1784,15 +1581,9 @@ func (s *Server) Shutdown() {
 	}
 }
 
-// Startup 在面板启动时做一次环境准备与自愈。
-//
-// 做三件事：
-//  1. 把 upgrade map 的内容源注入 priv 包（保持单一数据源，避免两处硬编码）
-//  2. 确保站点日志目录存在（nginx 打不开日志目录会直接启动失败）
-//  3. 确保 nginx 有 WebSocket 升级 map 与 conf.d include
-//
-// 这些在安装脚本里也会做一遍，但启动时再检查一次能覆盖
-// "用户换了 nginx 配置""重装了 nginx""恢复了旧备份"等情况。
+// Startup 在启动时做一次环境准备与自愈：注入 upgrade map 内容源（单一数据源）、
+// 确保站点日志目录存在（nginx 打不开日志目录会直接启动失败）、补齐 WebSocket
+// map 与 conf.d include。安装脚本也做，但启动再查一次能覆盖换配置/重装/恢复旧备份。
 func (s *Server) Startup(ctx context.Context) {
 	priv.SetUpgradeMapContent(sites.UpgradeMapConf())
 
@@ -1834,16 +1625,13 @@ func (s *Server) Startup(ctx context.Context) {
 	// 启动路径上不该引入额外的网络等待。
 	s.startCertRenewal(ctx)
 
-	// 安装后自动建一个**纯静态**默认站点（用户 2026-09-21 要求"装完就有"）。
-	// 幂等：成功过就只做一次现场复核；没有 nginx 就如实记"等待 nginx"，不报错刷屏。
-	// 放在 reconcileForwarders 之后：默认站点 vhost 里写着应用代理的 location，
-	// 那些回环端口要先对齐好，否则写出来的 proxy_pass 会指向旧端口。
+	// 安装后自动建一个纯静态默认站点（用户 2026-09-21 要求"装完就有"），幂等：
+	// 成功过只做一次现场复核，没有 nginx 就如实记"等待 nginx"。必须在
+	// reconcileForwarders 之后，否则 vhost 里的 proxy_pass 会指向旧回环端口。
 	s.ensureDefaultSiteOnStart(ctx)
 
-	// 默认站点**持续自愈**：新机器的顺序是"先装面板、再在面板里装 nginx"，
-	// 启动时那一次检查必然看到"没有 nginx"。没有这条巡检，装上 nginx 之后就再也
-	// 没人建默认站点了 —— 用户看到的就是"全新安装的面板，没有默认网站"
-	//（2026-09-22 报障）。巡检间隔与判据见 maybeEnsureDefaultSite。
+	// 默认站点持续自愈：新机器是先装面板再装 nginx，启动那次检查必然"没有 nginx"，
+	// 没有这条巡检就再也没人建默认站点（2026-09-22 报障）。判据见 maybeEnsureDefaultSite。
 	go s.watchWebEnv(ctx)
 
 	// 空闲终端会话回收：
@@ -1862,11 +1650,8 @@ func (s *Server) Startup(ctx context.Context) {
 	}()
 }
 
-// ensureNginxEnvOnStart 在面板启动时确保 nginx 具备所需环境。
-//
-// 这一步是"自愈"：即使安装脚本没跑、或用户换了 nginx 配置，
-// 面板启动后也会把 WebSocket map 与 conf.d include 补齐，
-// 否则反向代理站点会在 nginx -t 阶段直接失败。
+// ensureNginxEnvOnStart 是自愈：安装脚本没跑或用户换了 nginx 配置时，
+// 启动后也补齐 WebSocket map 与 conf.d include，否则反代站点过不了 nginx -t。
 func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 	if defaultSiteEuid() != 0 {
 		// 非 root 时尝试通过助手（sudoers 已授权）
@@ -1880,11 +1665,9 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 	}
 	// ① 环境片段（conf.d include / WebSocket upgrade map）。
 	//
-	// ⚠️ 这里过去是"环境一变就 return"，于是同一轮里的 ②③ **永远轮不到**：
-	// 全新机器上 nginx 是**装完面板之后**才装的，重启面板后的第一轮必然
-	// "环境已更新并重载" → 直接返回 → 全局请求体上限与运行时目录属主都没做。
-	// 表现就是用户 2026-09-22 报的："全新安装的面板，导入数据库文件，phpMyAdmin 也会卡死"
-	//（nginx 还是出厂 1m，client_body_temp 属主也不对）。三步必须互不遮挡。
+	// ⚠️ 三步必须互不遮挡：过去"环境一变就 return"，于是同一轮的 ②③ 永远轮不到
+	//（新机器是装完面板才装 nginx），表现就是 2026-09-22 报的"导入数据库卡死"
+	//（nginx 还是出厂 1m、client_body_temp 属主也不对）。
 	msg, err := priv.EnsureNginxEnv()
 	if err != nil {
 		s.Log.Warn("nginx 环境自愈失败（反向代理可能不可用）: %v", err)
@@ -1900,21 +1683,18 @@ func (s *Server) ensureNginxEnvOnStart(ctx context.Context) {
 		s.Log.Info("nginx 环境检查: %s", msg)
 	}
 
-	// ② 全局请求体上限也要自愈：`brew reinstall/upgrade nginx` 会把 nginx.conf
-	// **还原成 brew 出厂版** —— 那里面既没有 vhosts include（上面刚补），也没有
-	// 面板设的 `client_max_body_size`（出厂的 1m）。真机后果（2026-09-18）：
-	// "文件在、服务在、就是不生效"——4MB 的 SQL 导入直接被 nginx 以 1m 拒掉，
-	// 用户看到的是"phpMyAdmin 导入失败/卡住"，而面板里怎么看都正常。
+	// ② brew reinstall/upgrade 会把 nginx.conf 还原成出厂版（没有 client_max_body_size，
+	// 出厂 1m）。真机后果（2026-09-18）：4MB 的 SQL 导入被 1m 拒掉，用户看到
+	// "phpMyAdmin 导入失败/卡住"，面板里却怎么看都正常。
 	s.ensureGlobalBodySize(ctx)
 
 	// ③ nginx 运行时目录（带请求体的请求要往这里落盘）。
 	s.ensureNginxRuntimeDirs()
 }
 
-// ensureGlobalBodySize 确保 nginx.conf 的 http 块里有面板配置的全局请求体上限。
-//
-// 只读判断 → 不一致才写（写之前会备份、写后 nginx -t、失败回滚，见 priv.NginxTuningWrite）。
-// 这是幂等的：一致时一次文件读 + 一次比较，不做任何改动、不 reload。
+// ensureGlobalBodySize 确保 nginx.conf 的 http 块有面板配置的全局请求体上限。
+// 只读判断 → 不一致才写（备份、nginx -t、失败回滚见 priv.NginxTuningWrite）；
+// 幂等：一致时只读一次文件，不改动、不 reload。
 func (s *Server) ensureGlobalBodySize(ctx context.Context) {
 	want := strings.TrimSpace(s.Cfg.NginxClientMaxBodySize)
 	if want == "" {
@@ -1954,16 +1734,11 @@ func (s *Server) ensureGlobalBodySize(ctx context.Context) {
 		want, cur)
 }
 
-// ensureNginxRuntimeDirs 确保 nginx 的**运行时目录**存在、且属于它真正的 worker 用户。
+// ensureNginxRuntimeDirs 确保 nginx 运行时目录存在且属于真正的 worker 用户：
+// nginx 把超内存缓冲的请求体落盘到 client_body_temp（真机上是 nobody:admin 0700），
+// 属主不对就写不进去 —— GET 正常、一上传就 500/卡死（2026-09-18 mini 真机报障）。
 //
-// 为什么必须自愈（2026-09-18 mini 真机，用户报"phpMyAdmin 导入 4MB 的 SQL 一直卡死、
-// 400/500 都出现过"）：nginx 要把超过内存缓冲（默认 8k）的**请求体**落盘到
-// `<brew>/var/run/nginx/client_body_temp`。真机上那个目录是 `nobody:admin 0700`，
-// 而 nginx worker 跑在**另一个用户**下 → 任何带请求体的请求（上传、导入）都写不进去：
-// 表现就是"GET 一切正常、一上传就 500/卡死"（登录、翻页都没问题，因为它们没有请求体）。
-// 目录属主/权限是 brew 安装/升级时定的，面板不能假设它一定对。
-// runtimeDirChownFn 是 chown 的可注入点：单测要在**非 root** 下验证
-// "属主未知时绝不乱改"这条判据（非 root 的 chown 本来就失败，测不出决策）。
+// runtimeDirChownFn 是可注入点：单测要在非 root 下验证"属主未知时绝不乱改"。
 var runtimeDirChownFn = os.Chown
 
 func (s *Server) ensureNginxRuntimeDirs() {
@@ -1975,12 +1750,8 @@ func (s *Server) ensureNginxRuntimeDirs() {
 	if present, _ := s.nginxPresent(); !present {
 		return
 	}
-	// 属主判据必须来自**运行体**（正在跑的 worker 进程），读不到再退回 nginx.conf，
-	// 都读不到就**不改属主**。
-	//
-	// 旧版这里写的是 `worker == "" → "nobody"`：在 nginx.conf 没有 user 指令的机器上，
-	// 面板会把临时目录 chown 给 nobody，而 worker 跑在别人名下 —— 结果就是
-	// "面板修过了，但大请求体还是 500（nginx 自己的 HTML 页）"。绝不猜。
+	// 属主判据必须来自运行体（正在跑的 worker 进程），读不到再退回 nginx.conf，
+	// 都读不到就不改属主 —— 绝不猜（旧版猜 "nobody" 导致大请求体仍 500）。
 	worker, uid, gid, how, ok := priv.NginxWorkerOwner(s.Cfg.NginxConf)
 	base := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx")
 	for _, sub := range []string{"", "client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"} {
@@ -2011,36 +1782,18 @@ func (s *Server) ensureNginxRuntimeDirs() {
 }
 
 // healWebEnv 是"环境层面自愈"的总入口：nginx 侧 + PHP 侧一次做完。
-//
-// 为什么需要一个总入口（2026-09-22 用户连续两个报障都栽在同一类上：
-// "全新安装的面板，没有默认网站！" / "全新安装的面板，导入数据库文件，
-// phpMyAdmin 也会卡死"）：这些都是**面板启动之后才装上 nginx/PHP** 才会暴露的
-// 问题，而自愈过去只在启动那一刻跑一次。现在三处触发同一个入口：
-//
-//	· 面板启动（Startup）；
-//	· 任何任务收尾（launchTask）—— 装完 LNMP / 装完单个 nginx / 重装，立刻生效；
-//	· 默认站点的巡检 goroutine（watchDefaultSite 那条链另走 maybeEnsureDefaultSite）。
+// 面板启动、任何任务收尾（launchTask）、默认站点巡检三处都触发同一入口 ——
+// "启动之后才装 nginx/PHP"暴露的问题，只在启动时跑一次是覆盖不到的（2026-09-22 报障）。
 func (s *Server) healWebEnv(ctx context.Context) {
 	s.ensureNginxEnvOnStart(ctx)
 	s.ensurePHPLimitsOnStart(ctx)
 }
 
-// ensurePHPLimitsOnStart 把面板配置的上传/执行上限落到每个已装 PHP 版本的
-// `<brew>/etc/php/<版本>/conf.d/99-zizpanel-limits.ini` 上（幂等）。
+// ensurePHPLimitsOnStart 把面板配置的上传/执行上限落到已装 PHP 版本的
+// conf.d/99-zizpanel-limits.ini（幂等）。新机器是先装面板再装 PHP、启动检查早过了，
+// PHP 一直是出厂值（2M/8M/30s），导入稍大 SQL 被掐死（2026-09-22 报障）。
 //
-// 为什么必须自愈（2026-09-22 报障）：面板过去只在用户点「保存上传/执行上限」时
-// 才写这份片段。新机器的顺序是"先装面板、再在面板里装 PHP"，那时启动检查早过了 ——
-// 于是 PHP 一直是 brew 出厂值（upload 2M / post 8M / memory 128M / 30s）：
-// 导入稍大的 SQL 会被 PHP 自己掐死，用户看到的就是"phpMyAdmin 卡死"，
-// 而 nginx 与面板里怎么看都"正常"。默认值本来就是给这种场景定的（512M/300s），
-// 没落到文件上等于没有默认值。
-//
-// 只在片段**不存在**时创建，并只在真的创建了之后重启对应 php-fpm：
-//
-//	· 不覆盖已存在的文件，是因为这个片段的文档语义就是"删掉它即恢复出厂限制" ——
-//	  每次任务收尾都把它重写回去，"删掉"这个退路就失效了，用户手改过的值也会被抹掉
-//	  （用户显式点「保存上传/执行上限」时才会覆盖，那是一次明确动作）。
-//	· 不无条件重启，是因为那会把正在跑的站点一次次打断。
+// 只在片段不存在时创建（片段语义是"删掉即恢复出厂限制"），且只在真的写入后重启。
 func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {
 	if defaultSiteEuid() != 0 {
 		return
@@ -2083,10 +1836,8 @@ func (s *Server) ensurePHPLimitsOnStart(ctx context.Context) {
 	}
 }
 
-// nginxWorkerUserFromConf 从 nginx.conf 读 `user` 指令（worker 以谁的身份跑）。
-//
-// 实现只有一份：priv.NginxWorkerUserFromConf（helper 侧也要用同一个判据）。
-// 读不到（注释掉/没写）时返回空 —— 调用方必须据此**放弃**改属主，而不是猜一个。
+// nginxWorkerUserFromConf 读 nginx.conf 的 `user` 指令（实现只有 priv 一份）。
+// 读不到返回空 —— 调用方必须据此放弃改属主，绝不猜一个。
 func nginxWorkerUserFromConf(confPath string) string {
 	return priv.NginxWorkerUserFromConf(confPath)
 }
@@ -2117,11 +1868,9 @@ func chownToUser(path, user string) (changed bool, err error) {
 	return true, nil
 }
 
-// checkProxyAgainstSiteVhosts 检查一条反代规则是否与 vhosts 目录里已有文件
-// （站点 vhost / 别的规则）在"同端口 + 同 server_name"上冲突。
-//
-// 与 checkVhostCollisionWithFiles 同一判据、反方向调用：那边是"保存站点配置时"，
-// 这边是"新建/修改反代规则时"。两边都要拦，否则谁先谁后决定了哪一份被静默忽略。
+// checkProxyAgainstSiteVhosts 检查一条反代规则是否与已有 vhost 在"同端口 +
+// 同 server_name"上冲突。与 checkVhostCollisionWithFiles 同一判据、反方向调用；
+// 两边都要拦，否则谁先谁后决定了哪一份被静默忽略。
 func (s *Server) checkProxyAgainstSiteVhosts(rule *proxies.Rule, selfFile string) error {
 	if rule == nil || rule.Listen <= 0 {
 		return nil
@@ -2160,12 +1909,9 @@ func (s *Server) checkProxyAgainstSiteVhosts(rule *proxies.Rule, selfFile string
 // 排队只会让最后一个在几秒后再重复一遍已经做完的事。
 var webEnvHealMu sync.Mutex
 
-// kickEnvHeal 在后台跑一次「环境自愈 + 默认站点核对」。
-//
-// 见 launchTask 里的说明：任务中心的"结束"不该被这件事拖住。
-// 用**独立的**后台 ctx（不受任何请求/任务生命周期影响）+ 2 分钟上限：
-// 面板可能在写完配置前就被升级重启，但每一次写入本身是原子+带校验的，
-// 最坏情况只是这次没做完，下一轮巡检会接着做。
+// kickEnvHeal 在后台跑一次「环境自愈 + 默认站点核对」（任务中心的"结束"不该被它拖住）。
+// 用独立后台 ctx + 2 分钟上限：面板可能在写完配置前被升级重启，但每次写入本身
+// 原子且带校验，最坏只是这次没做完，下一轮巡检接着做。
 func (s *Server) kickEnvHeal() {
 	if !webEnvHealMu.TryLock() {
 		return

@@ -1,8 +1,6 @@
 // Package priv 实现 zizpanel-helper 的全部特权操作。
-//
-// 安全模型：本包的所有函数都以 root 执行，因此每个入参都必须在这里
-// 重新做白名单校验 —— 绝不能假设调用方（面板）已经校验过。
-// 这是"面板被攻破也不能提权"这条底线的落点。
+// 本包函数以 root 执行：每个入参都必须在这里重新做白名单校验，绝不假设面板已校验
+// —— 这是"面板被攻破也不能提权"这条底线的落点。
 package priv
 
 import (
@@ -32,11 +30,8 @@ func Root() string {
 
 // HomebrewPrefix 探测 Homebrew 安装前缀。
 func HomebrewPrefix() string {
-	// 环境变量优先：单元测试必须能把它指到临时目录。
-	//
-	// 这不是为了好测而加的钩子 —— 没有它，任何"确保某个 brew 目录存在"的测试
-	// 都会去写真实的 /opt/homebrew，而 make check 的一条铁律就是
-	// **测试不许碰用户真实环境**（历史事故：测试把真实的 LaunchAgents plist 覆盖成空）。
+	// 环境变量优先：没有它，任何"确保某个 brew 目录存在"的测试都会去写真实的
+	// /opt/homebrew；**测试不许碰用户真实环境**（历史事故：真实 LaunchAgents plist 被覆盖成空）。
 	if v := strings.TrimSpace(os.Getenv("ZIZPANEL_BREW_PREFIX")); v != "" {
 		return v
 	}
@@ -46,17 +41,14 @@ func HomebrewPrefix() string {
 	return "/usr/local"
 }
 
-// NginxBin 返回 nginx 可执行文件路径。
 func NginxBin() string {
 	return filepath.Join(HomebrewPrefix(), "bin", "nginx")
 }
 
-// NginxConf 返回主配置文件路径。
 func NginxConf() string {
 	return filepath.Join(HomebrewPrefix(), "etc", "nginx", "nginx.conf")
 }
 
-// VhostDir 返回 vhost 目录。
 func VhostDir() string {
 	return filepath.Join(HomebrewPrefix(), "etc", "nginx", "vhosts")
 }
@@ -68,21 +60,16 @@ const NginxLaunchLabel = "cn.zizdog.nginx"
 const PanelLaunchLabel = "cn.zizpanel.panel"
 
 var (
-	// 域名必须是常规主机名。注意：Go 的 regexp 是 RE2，不支持 (?!...) 负向前瞻，
-	// 所以用 "字母数字开头 + 内部允许连字符" 的结构来表达"标签不能以连字符开头/结尾"。
+	// 域名必须是常规主机名；RE2 不支持负向前瞻，用"首尾字母数字"结构表达。
 	reDomain = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$`)
 	// vhost 文件名只允许安全字符，从根本上排除 ../ 之类穿越
 	reSafeFile = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	// 允许 @：Homebrew 的**版本化**服务名一律带它
-	// （homebrew.mxcl.php@8.3、sh.brew.mysql@8.4、node@20、python@3.12 …）。
-	// 早期正则不含 @，导致这类服务的状态检查直接报
-	// "label 含非法字符"，界面上一律显示"异常" —— 而服务其实好好的。
-	// 真机上就是这么踩到的：php 与 mysql 显示异常，nginx（无 @）正常。
+	// 允许 @：Homebrew 的版本化服务名一律带它（php@8.3、mysql@8.4、node@20 …）。
+	// 早期正则不含 @，状态检查直接报"label 含非法字符" —— 真机上 php/mysql 一律显示异常。
 	reLabel = regexp.MustCompile(`^[A-Za-z0-9._@-]+$`)
 	rePort  = regexp.MustCompile(`^\d{1,5}$`)
 )
 
-// ValidateDomain 校验域名合法性。
 func ValidateDomain(d string) error {
 	d = strings.TrimSpace(d)
 	if d == "" {
@@ -98,14 +85,8 @@ func ValidateDomain(d string) error {
 }
 
 // safeJoin 把用户提供的名称拼到受信目录下，并确保结果没有逃出该目录。
-//
-// 双重防护：字符白名单（排除 / \ ..）+ 结果路径前缀校验。
-// 只做前缀校验不够（符号链接可绕过），只做字符校验也不够
-// （不同文件系统的大小写/Unicode 折叠行为不同），两者都要。
-//
-// macOS 坑：/var、/tmp、/etc 都是指向 /private/... 的软链接。
-// filepath.EvalSymlinks 会解析成 /private/var/...，如果另一边用未解析的
-// /var/... 去比前缀就会误判"路径越界"。因此这里对两侧都做解析。
+// 字符白名单与结果路径前缀校验缺一不可（符号链接可绕过前者）。
+// macOS 坑：/var、/tmp、/etc 是 /private/... 的软链接，两侧都要解析后再比前缀。
 func safeJoin(dir, name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -135,7 +116,6 @@ func resolvePath(p string) string {
 	if real, err := filepath.EvalSymlinks(p); err == nil {
 		return real
 	}
-	// 逐级向上找到第一个存在的祖先，解析它再拼回剩余部分
 	parent := filepath.Dir(p)
 	if parent == p {
 		return p
@@ -160,11 +140,9 @@ func run(name string, args ...string) cmdResult {
 	return cmdResult{stdout: so.String(), stderr: se.String(), err: err}
 }
 
-// runFn 是所有外部命令的注入口（默认就是 run）。
-//
-// 为什么需要：launchd 的域解析与"操作后验证"逻辑必须能脱离真实 launchctl 测试，
-// 否则唯一能证明"bootout 失败时不再谎报成功"的办法就是去真机上停一个真实服务。
-// 参考 internal/services/ready.go 的 readyWaitPort：生产路径不变，测试替换后恢复。
+// runFn 是所有外部命令的注入口（默认就是 run）：launchd 域解析与"操作后验证"
+// 必须能脱离真实 launchctl 测试，否则只能去真机停一个真实服务来证明不谎报成功
+// （同 internal/services/ready.go 的 readyWaitPort，生产路径不变）。
 var runFn = run
 
 func runTimeout(d time.Duration, name string, args ...string) cmdResult {
@@ -195,10 +173,8 @@ func (r cmdResult) combined() string {
 // ---------- nginx ----------
 
 // nginxPIDAlive 判断 nginx 是否存活。
-//
-// 必须用多种方式判断：nginx 启动后会把进程标题改成
-// "nginx: master process ..."，所以 `pgrep -x nginx` 精确匹配必然失败 ——
-// 这正是旧脚本里"80 端口被占用但杀不掉 nginx"的根因。
+// 必须多方式判断：nginx 会把进程标题改成 "nginx: master process ..."，
+// `pgrep -x nginx` 精确匹配必然失败（旧脚本"80 端口占用却杀不掉"的根因）。
 func nginxPIDAlive() bool {
 	pidFile := filepath.Join(HomebrewPrefix(), "var", "run", "nginx.pid")
 	if b, err := os.ReadFile(pidFile); err == nil {
@@ -251,7 +227,6 @@ func NginxStart() error {
 	if nginxPIDAlive() {
 		return nil
 	}
-	// launchd 托管时用 bootstrap/kickstart；失败则退回直接启动
 	r := run("/bin/launchctl", "kickstart", "-k", "system/"+NginxLaunchLabel)
 	if r.err == nil {
 		if waitAlive(5 * time.Second) {
@@ -296,7 +271,6 @@ func NginxRestart() error {
 // NginxHardRestart 强制清场后启动：用于残留进程导致 "Address already in use"。
 func NginxHardRestart() error {
 	_ = nginxKill()
-	// 等端口真正释放
 	for i := 0; i < 20; i++ {
 		if !nginxPIDAlive() {
 			break
@@ -347,7 +321,6 @@ func waitDead(d time.Duration) bool {
 
 // ---------- vhost 文件 ----------
 
-// ListVhosts 列出所有 vhost 配置文件名。
 func ListVhosts() ([]string, error) {
 	entries, err := os.ReadDir(VhostDir())
 	if err != nil {
@@ -366,7 +339,6 @@ func ListVhosts() ([]string, error) {
 	return out, nil
 }
 
-// ReadVhost 读取 vhost 内容。
 func ReadVhost(name string) (string, error) {
 	path, err := safeJoin(VhostDir(), vhostFileName(name))
 	if err != nil {
@@ -379,10 +351,8 @@ func ReadVhost(name string) (string, error) {
 	return string(b), nil
 }
 
-// WriteVhostAtomic 原子写入 vhost：先写临时文件、校验 nginx 语法、再替换。
-//
-// 顺序至关重要：先替换再校验的话，一旦配置有错 nginx 就会在某些时刻
-// 加载到坏配置。这里改成"写临时文件 → nginx -t 校验 → rename"。
+// WriteVhostAtomic 原子写入 vhost：写临时文件 → 替换 → nginx -t 整体校验，不通过就回滚。
+// 顺序至关重要：nginx -t 只看最终配置树，所以必须先替换再校验并保留回滚点。
 func WriteVhostAtomic(name, content string) error {
 	path, err := safeJoin(VhostDir(), vhostFileName(name))
 	if err != nil {
@@ -401,8 +371,7 @@ func WriteVhostAtomic(name, content string) error {
 	}
 	defer func() { _ = os.Remove(tmp) }()
 
-	// 用临时文件替换后再整体校验：nginx -t 只能校验最终配置文件树，
-	// 因此这里先备份原文件、替换、校验，不通过就回滚。
+	// nginx -t 只能校验最终配置树：先备份原文件、替换、校验，不通过就回滚。
 	var backup []byte
 	hadOld := false
 	if old, err := os.ReadFile(path); err == nil {
@@ -422,7 +391,6 @@ func WriteVhostAtomic(name, content string) error {
 	return nil
 }
 
-// DeleteVhost 删除 vhost 配置。
 func DeleteVhost(name string) error {
 	path, err := safeJoin(VhostDir(), vhostFileName(name))
 	if err != nil {
@@ -456,7 +424,6 @@ func HostsAdd(domain string) error {
 	if err != nil {
 		return err
 	}
-	// 已存在同域名的任意解析就不再重复添加
 	if regexp.MustCompile(`(?m)^\s*[^#\n]*\s` + regexp.QuoteMeta(domain) + `(\s|$)`).Match(hosts) {
 		return nil
 	}
@@ -496,9 +463,7 @@ func HostsDel(domain string) error {
 }
 
 // HostsToggle 批量启用/停用由本面板添加的解析（注释/取消注释，而不是删除）。
-//
-// 用注释而不是删除：用户经常需要在"本地测试"和"访问线上站点"之间切换，
-// 注释保留了域名列表，切换回来不需要重新添加。
+// 保留域名列表，用户从"本地测试"切回"访问线上"时不必重新添加。
 func HostsToggle(on bool) error {
 	hosts, err := os.ReadFile("/etc/hosts")
 	if err != nil {
@@ -538,9 +503,8 @@ func toggleHostsContent(content string, on bool) (string, bool) {
 	return strings.Join(lines, "\n"), changed
 }
 
-// writeHosts 原子写 /etc/hosts。
-// 直接截断写入很危险：写入过程中断电会得到一个空的 hosts 文件，
-// 系统解析会立刻出问题。因此先写临时文件再 rename。
+// writeHosts 原子写 /etc/hosts：直接截断写入一旦断电会留下空 hosts，系统解析立刻出问题。
+// 因此先写临时文件再 rename。
 func writeHosts(content string) error {
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
@@ -549,7 +513,6 @@ func writeHosts(content string) error {
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return err
 	}
-	// 保留原文件权限
 	if st, err := os.Stat("/etc/hosts"); err == nil {
 		_ = os.Chmod(tmp, st.Mode().Perm())
 	}
@@ -565,10 +528,8 @@ func flushDNS() error {
 // ---------- launchd ----------
 
 // LaunchState 描述一个 launchd 任务的状态。
-//
-// 向后兼容：字段只增不减（面板与 helper 的 JSON 契约）。
-// ProbedDomains 是本次查询实际探测过的域，便于诊断
-// "为什么状态说未加载"（真机上 brew 的 user/gui 域之争全靠它定位）。
+// 字段只增不减（面板与 helper 的 JSON 契约）。
+// ProbedDomains 是本次实际探测过的域，用于诊断"为什么状态说未加载"。
 type LaunchState struct {
 	Label         string   `json:"label"`
 	Loaded        bool     `json:"loaded"`
@@ -580,11 +541,8 @@ type LaunchState struct {
 }
 
 // launchctlBin 返回 launchctl 的可执行路径。
-//
-// 支持 ZIZPANEL_LAUNCHCTL 覆盖：web 层的端到端回归测试需要把整条
-// "面板 → services → priv → launchctl" 通路指到一个假 launchctl 上，
-// 才能真正验证"底层失败时 HTTP 不许返回 2xx"，而不是只测一层假接口。
-// 与 ZIZPANEL_ROOT / ZIZPANEL_BREW_PREFIX 同类：生产默认值永远是系统路径。
+// 支持 ZIZPANEL_LAUNCHCTL 覆盖：端到端测试要把整条通路指到假 launchctl 上，
+// 才能验证"底层失败时 HTTP 不许返回 2xx"；生产默认值永远是系统路径。
 func launchctlBin() string {
 	if v := strings.TrimSpace(os.Getenv("ZIZPANEL_LAUNCHCTL")); v != "" {
 		return v
@@ -608,24 +566,13 @@ var (
 		return err == nil
 	}
 	// launchDomainsFn 返回 label 的候选域（默认按 plist 位置推断）。
-	//
-	// 抽成变量：单测必须能在不依赖真实 plist / 真实用户目录的前提下
-	// 指定候选域，否则"user/501 与 gui/501 都探测"这条逻辑根本无法锁死。
+	// 抽成变量：单测要能锁死"user/501 与 gui/501 都探测"，不能依赖真实 plist。
 	launchDomainsFn = launchDomainCandidates
 )
 
-// launchDomainCandidates 返回该 label 可能所在的 launchd 域，按优先级排序。
-//
-// 真机事故（Mac mini，面板 0.12.9）：`sh.brew.syncthing` 由面板的
-// `sudo -n -u zizdog brew services ...` 加载，作业落在 **user/501** 域；
-// 而旧代码只看 plist 路径就断定 gui/501。结果：
-//   - stop 打偏域，bootout 报错 → 旧状态查询把"查不到"当"未加载" → HTTP 200 谎报成功；
-//   - start 往 gui/501 bootstrap → `Bootstrap failed: 125: Domain does not support
-//     specified action`（无图形会话时 gui 域不可用）。
-//
-// 所以用户代理必须同时认 user/<uid> 与 gui/<uid>，并且 user 在前
-// （面板自己的 brew 调用就落在这里）。找不到 plist 时也要探测所有候选域：
-// plist 被删掉但作业还挂在 launchd 里是真实存在的情况，漏掉它同样会谎报成功。
+// launchDomainCandidates 返回该 label 可能所在的 launchd 域，按优先级排序：必须同时认
+// user/<uid> 与 gui/<uid>（user 在前），找不到 plist 时也探测全部候选域 —— plist 被删但作业
+// 还挂着是真实情况（真机事故 0.12.9：落在 user/501 的作业被旧代码按 gui/501 打偏 → 谎报成功）。
 func launchDomainCandidates(label string) []string {
 	if fileExistsFn(filepath.Join("/Library/LaunchDaemons", label+".plist")) {
 		return []string{"system"}
@@ -670,15 +617,13 @@ type launchQuery struct {
 	state LaunchState
 	// found=true：该域里确实有这个作业。
 	found bool
-	// inconclusive=true：查询失败且失败原因不是"没有这个作业"
-	// （权限不足、域不支持该动作、launchctl 起不来……）。
-	// 这种结果绝不能当成"未加载"。
+	// inconclusive=true：查询失败且原因不是"没有这个作业"（权限不足、域不支持该动作…）
+	// —— **绝不能当成"未加载"**。
 	inconclusive bool
 	// detail 是无法判定时的原始输出，用于如实上报。
 	detail string
 }
 
-// queryLaunchDomain 查询一个域里的作业。
 func queryLaunchDomain(domain, label string) launchQuery {
 	base := LaunchState{Label: label, Domain: domain, ExitCode: -1}
 	r := launchctl("print", domain+"/"+label)
@@ -697,13 +642,7 @@ func queryLaunchDomain(domain, label string) launchQuery {
 	return launchQuery{state: base, inconclusive: true, detail: out}
 }
 
-// parseLaunchPrint 解析 `launchctl print` 输出。
-//
-// 输出形如：
-//
-//	state = running
-//	pid = 1234
-//	last exit code = 0
+// parseLaunchPrint 解析 `launchctl print` 输出（state / pid / last exit code）。
 func parseLaunchPrint(st *LaunchState, stdout string) {
 	for _, ln := range strings.Split(stdout, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -725,21 +664,9 @@ func parseLaunchPrint(st *LaunchState, stdout string) {
 	}
 }
 
-// launchOutputSaysMissing 判断 launchctl 的输出是否**明确**表示"这个域里没有该作业"。
-//
-// 真机实测（macOS，非 root 与 root 都一样）：
-//
-//	launchctl print gui/501/<不存在>  → exit 113
-//	  Bad request.
-//	  Could not find service "x" in domain for user gui: 501
-//	launchctl print gui/999/<不存在>  → exit 112
-//	  Bad request.
-//	  Could not find domain for user gui: 999
-//
-// 只有上面这类答复才算"未加载"。权限/域能力类的错误
-// （Operation not permitted、Domain does not support specified action、
-// Bootstrap failed…）必须当作"无法判定"，否则就会重演
-// "bootout 报错 → 被当成未加载 → 谎报成功"。
+// launchOutputSaysMissing 判断 launchctl 输出是否**明确**表示"这个域里没有该作业"。
+// 真机实测：只有 `Could not find service … user gui: 501`（113）与 `Could not find domain
+// … user gui: 999`（112）算"未加载"；权限/域能力类错误必须当"无法判定"（否则谎报成功）。
 func launchOutputSaysMissing(out string) bool {
 	low := strings.ToLower(out)
 	if strings.TrimSpace(low) == "" {
@@ -755,23 +682,9 @@ func launchOutputSaysMissing(out string) bool {
 			return true
 		}
 	}
-	// 域本身不存在：这个候选域里当然没有该作业，可以安全地算"没有"。
-	//
-	// 三种真实措辞都要认（2026-09-17 mini 真机）：
-	//   · `Could not find domain: …`（域不存在）
-	//   · `Could not print domain: 125: Domain does not support specified action`
-	//     —— **headless 机器上 `gui/<uid>` 域不存在时，`launchctl print gui/501/x`
-	//     报的就是这一句**（没有图形登录会话）。把这一句当"查不了"是本轮踩到的
-	//     回归：stop 会假失败（服务其实停了）、start 直接起不来 —— 而"服务器模式"
-	//     的机器本来就没有图形会话，这个域永远不存在。
-	//
-	// ⚠️ 必须**同时**匹配 125 那句：同样是 `Could not print domain:` 前缀，
-	// `Could not print domain: 1: Operation not permitted` 是**权限问题**，
-	// 那是真的"查不了"，必须如实报错（不能混成"没有"）。
-	//
-	// 另外仍然**不能**把单独的 "Domain does not support specified action" 混进来：
-	// 它在 bootstrap/bootout **动作**上是"该域不支持这个动作"，必须如实报错
-	// （见 LaunchLoad/LaunchUnload 的动作分支，那里的判定不走这个函数）。
+	// 域本身不存在也算"没有"：必须**同时**匹配 "could not print domain" + "domain does
+	// not support specified action"（125；headless 机器上 gui/<uid> 即如此）。单独的
+	// "Operation not permitted" 是权限问题，必须如实报错、不许混成"没有"。
 	if strings.Contains(low, "could not find domain") {
 		return true
 	}
@@ -780,10 +693,8 @@ func launchOutputSaysMissing(out string) bool {
 }
 
 // launchResolve 按优先级探测候选域，返回作业真正所在域的状态。
-//
-//	(state, nil) 且 Loaded=false：所有候选域都成功查过，确实没有这个作业。
-//	error：至少一个候选域给不出确定答复（权限/域能力问题），
-//	       这时绝不允许假装"未加载"。
+// (state, nil) 且 Loaded=false：所有候选域都成功查过，确实没有这个作业。
+// error：至少一个候选域给不出确定答复（权限/域能力问题），绝不许假装"未加载"。
 func launchResolve(label string, domains []string) (LaunchState, error) {
 	var inconclusive []string
 	for _, d := range domains {
@@ -791,10 +702,8 @@ func launchResolve(label string, domains []string) (LaunchState, error) {
 		if q.found {
 			st := q.state
 			st.ProbedDomains = domains
-			// 兜底：`launchctl print` 对**按需拉起**的服务可能不给 pid 行
-			// （实测 php-fpm 报 `state = spawn scheduled`，没有 pid = ），
-			// 但 `launchctl list` 里它明明有 PID 而且在监听端口。
-			// 少了这个兜底，这类服务会被误判成"未运行"，界面上显示异常。
+			// 兜底（实测）：`launchctl print` 对按需拉起的服务可能不给 pid 行
+			// （php-fpm 报 `state = spawn scheduled`），但 `launchctl list` 里有 PID —— 少了会误判"未运行"。
 			if !st.Running {
 				if pid := pidFromLaunchctlList(label); pid > 0 {
 					st.PID = pid
@@ -819,9 +728,7 @@ func launchResolve(label string, domains []string) (LaunchState, error) {
 }
 
 // LaunchStatus 查询任务状态。
-//
-// 与旧实现的区别：旧代码只查一个域、且**任何**查询错误都返回
-// Loaded=false —— "查不到"与"查不了"被混为一谈，是谎报成功的根源。
+// "查不到"与"查不了"必须分开：把任何查询错误都当 Loaded=false 就是谎报成功的根源。
 func LaunchStatus(label string) (LaunchState, error) {
 	if !reLabel.MatchString(label) {
 		return LaunchState{}, fmt.Errorf("label 含非法字符: %q", label)
@@ -829,9 +736,7 @@ func LaunchStatus(label string) (LaunchState, error) {
 	return launchResolve(label, launchDomainsFn(label))
 }
 
-// pidFromLaunchctlList 从 `launchctl list` 里取某个 label 的 PID。
-//
-// 输出是三列：PID  Status  Label，未运行时 PID 是 "-"。
+// pidFromLaunchctlList 从 `launchctl list` 取 label 的 PID（三列，未运行时 PID 为 "-"）。
 func pidFromLaunchctlList(label string) int {
 	r := launchctl("list")
 	if r.err != nil {
@@ -849,12 +754,9 @@ func pidFromLaunchctlList(label string) int {
 	return 0
 }
 
-// LaunchLoad 加载并启动任务。
-//
-// 规则：
-//   - 作业已加载在任一候选域 → kickstart 到**那个**域（再 bootstrap 会报已加载）；
-//   - 未加载 → 按候选顺序 bootstrap，user/<uid> 在前、gui/<uid> 兜底；
-//   - 每次 bootstrap 之后都必须用一次**新的查询**确认真的加载了。
+// LaunchLoad 加载并启动任务。已加载在任一候选域 → kickstart 到**那个**域；
+// 未加载 → 按候选顺序 bootstrap（user/<uid> 在前、gui/<uid> 兜底），
+// 且每次 bootstrap 后必须用**新查询**确认真的加载了。
 func LaunchLoad(label string) error {
 	if !reLabel.MatchString(label) {
 		return fmt.Errorf("label 含非法字符: %q", label)
@@ -897,23 +799,16 @@ func LaunchLoad(label string) error {
 	return fmt.Errorf("加载 %s 失败: %s", label, strings.Join(errs, "；"))
 }
 
-// bootout 之后的等待参数。
-//
-// 真机教训（install.sh 的 wait_service_stopped 为同一件事写过注释）：
-// `launchctl bootout` 是**异步**的 —— 命令一返回，作业可能还在卸载中，
-// 这期间 `print` 仍能看到它（state = SIGTERMed）。若不等待就断言"还在"，
-// 就会把一次成功的停止报成失败（谎报失败）。
-//
-// 抽成变量是为了单测：hermetic 测试把它设为 0，异步用例再显式设小值。
+// bootout 之后的等待参数。`launchctl bootout` 是**异步**的：命令返回后作业可能还在
+// 卸载中（print 仍能看到 state = SIGTERMed），不等待就会把成功的停止报成失败。
+// 抽成变量是为单测（hermetic 测试设 0）。
 var (
 	launchUnloadWait = 3 * time.Second
 	launchUnloadPoll = 250 * time.Millisecond
 )
 
 // waitLaunchGone 在 launchUnloadWait 内轮询，直到作业从该域消失。
-//
-//	gone=true  → 明确查不到（成功卸载）
-//	gone=false → 超时仍在，或查询无法判定（last 里带着原因）
+// gone=false → 超时仍在，或查询无法判定（last 里带着原因）。
 func waitLaunchGone(domain, label string) (bool, launchQuery) {
 	deadline := time.Now().Add(launchUnloadWait)
 	for {
@@ -929,10 +824,8 @@ func waitLaunchGone(domain, label string) (bool, launchQuery) {
 }
 
 // LaunchUnload 停止并卸载任务。
-//
-// 关键不变量：只有在**成功查询**确认该作业已从所有候选域消失后才返回 nil。
-// 这正是旧实现丢掉的东西 —— bootout 报错后它去查状态，而状态查询又把
-// "查询失败"当"未加载"，于是什么都没做也报成功。
+// 关键不变量：只有**成功查询**确认该作业已从所有候选域消失后才返回 nil
+// —— 旧实现把"查询失败"当"未加载"，于是什么都没做也报成功。
 func LaunchUnload(label string) error {
 	if !reLabel.MatchString(label) {
 		return fmt.Errorf("label 含非法字符: %q", label)
@@ -948,8 +841,7 @@ func LaunchUnload(label string) error {
 		return nil
 	}
 
-	// 逐个卸载**真正加载了它**的域，并等待它从该域消失。
-	// 旧代码只打一个域，打偏就什么都不做还报成功。
+	// 逐个卸载**真正加载了它**的域并等待消失（旧代码只打一个域，打偏就什么都不做还报成功）。
 	var failures []string
 	for _, d := range domains {
 		q := queryLaunchDomain(d, label)
@@ -1040,7 +932,6 @@ func launchKick(label, domain string) error {
 	return nil
 }
 
-// findPlist 定位 plist 文件。
 func findPlist(label string) (string, error) {
 	sys := filepath.Join("/Library/LaunchDaemons", label+".plist")
 	if fileExistsFn(sys) {
@@ -1070,7 +961,6 @@ func userHomes() []string {
 	return out
 }
 
-// uidOfHome 通过 home 目录反查 uid。
 func uidOfHome(home string) string {
 	user := filepath.Base(home)
 	r := run("/usr/bin/id", "-u", user)
@@ -1082,14 +972,12 @@ func uidOfHome(home string) string {
 
 // ---------- 端口 ----------
 
-// PortInfo 描述端口占用情况。
 type PortInfo struct {
 	Port    int      `json:"port"`
 	InUse   bool     `json:"in_use"`
 	Holders []string `json:"holders"`
 }
 
-// CheckPort 检测端口占用。
 func CheckPort(portArg string) (PortInfo, error) {
 	if !rePort.MatchString(portArg) {
 		return PortInfo{}, fmt.Errorf("非法端口: %q", portArg)
@@ -1117,7 +1005,6 @@ func CheckPort(portArg string) (PortInfo, error) {
 
 // ---------- 防火墙 ----------
 
-// FirewallState 返回全局状态描述。
 func FirewallState() (string, error) {
 	r := run("/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate")
 	if r.err != nil {
@@ -1127,9 +1014,8 @@ func FirewallState() (string, error) {
 }
 
 // FirewallOpenPort 尝试放行端口。
-//
-// 说明：macOS 的应用防火墙（ALF）是按"应用"而不是按"端口"放行的，
-// socketfilterfw 没有开放端口的能力。这里返回明确提示而不是假装成功。
+// macOS 应用防火墙（ALF）按"应用"而非端口放行，socketfilterfw 没有开端口的能力
+// —— 这里返回明确提示，不假装成功。
 func FirewallOpenPort(portArg string) (string, error) {
 	if !rePort.MatchString(portArg) {
 		return "", fmt.Errorf("非法端口: %q", portArg)
@@ -1145,9 +1031,7 @@ func FirewallOpenPort(portArg string) (string, error) {
 }
 
 // EnsureFirewallApp 把可执行文件包装成 .app 并在防火墙中放行。
-//
-// 为什么要做成 .app：macOS 应用防火墙只认 .app bundle 或已签名的二进制，
-// 直接添加一个 CLI 二进制会持续弹窗或在更新后失效。
+// macOS 应用防火墙只认 .app bundle 或已签名二进制，直接添加 CLI 会持续弹窗或在更新后失效。
 func EnsureFirewallApp(binPath, appName, appsDir string) (string, error) {
 	if !filepath.IsAbs(binPath) {
 		return "", fmt.Errorf("必须是绝对路径: %s", binPath)
@@ -1179,7 +1063,6 @@ func EnsureFirewallApp(binPath, appName, appsDir string) (string, error) {
 	if err := os.MkdirAll(macOSDir, 0o755); err != nil {
 		return "", fmt.Errorf("创建 App 目录失败: %w", err)
 	}
-	// 用 Info.plist 让系统把它当作正常应用
 	plist := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1229,25 +1112,13 @@ func copyFile(src, dst string, mode os.FileMode) error {
 
 // ---------- nginx 环境自愈 ----------
 
-// NginxConfD 返回 conf.d 目录。
 func NginxConfD() string {
 	return filepath.Join(HomebrewPrefix(), "etc", "nginx", "conf.d")
 }
 
 // NginxIncludesDir 返回存放"只能在特定上下文使用"的配置片段目录。
-//
-// 为什么需要它：项目原有的 php-fpm.conf 里含 fastcgi_pass，
-// 这个指令只在 location 上下文合法。而 conf.d/*.conf 是被 http 级 include 的，
-// 一旦把 php-fpm.conf 留在 conf.d，nginx -t 会直接报
-//
-//	"fastcgi_pass" directive is not allowed here
-//
-// 从而整个 nginx 起不来。
-//
-// 约定：
-//
-//	conf.d/    → 只放 http 上下文合法的配置（map、log_format 等）
-//	includes/  → 放需要被 vhost/location 显式 include 的片段（fastcgi 参数等）
+// conf.d/*.conf 被 http 级 include，含 fastcgi_pass 的片段留在那里会让 nginx -t 直接失败；
+// 约定：conf.d/ 放 http 上下文配置，includes/ 放被 vhost/location 显式 include 的片段。
 func NginxIncludesDir() string {
 	return filepath.Join(HomebrewPrefix(), "etc", "nginx", "includes")
 }
@@ -1257,11 +1128,8 @@ func LegacyFPMIncludePath() string {
 	return filepath.Join(NginxConfD(), "php-fpm.conf")
 }
 
-// MigrateFPMInclude 把 conf.d/php-fpm.conf 迁移到 includes/php-fpm.conf，
-// 并把所有引用它的配置（vhost 与模板）里的路径一并改写。
-//
-// 这是幂等的：迁移过之后再次调用不会有任何变化。
-// 返回是否发生了迁移以及具体做了什么。
+// MigrateFPMInclude 把 conf.d/php-fpm.conf 迁到 includes/php-fpm.conf，并改写所有引用。
+// 幂等；返回是否发生了迁移及具体做了什么。
 func MigrateFPMInclude() (bool, string, error) {
 	legacy := LegacyFPMIncludePath()
 	newPath := filepath.Join(NginxIncludesDir(), "php-fpm.conf")
@@ -1271,7 +1139,6 @@ func MigrateFPMInclude() (bool, string, error) {
 
 	if os.IsNotExist(legacyErr) {
 		if newErr == nil {
-			// 已经迁移过，只需确保引用已更新
 			n, err := rewriteFPMReferences(newPath)
 			if err != nil {
 				return false, "", err
@@ -1316,7 +1183,6 @@ func rewriteFPMReferences(newPath string) (int, error) {
 		if !strings.HasSuffix(path, ".conf") {
 			return nil
 		}
-		// 跳过 includes 目录下的文件自身
 		if strings.HasPrefix(path, NginxIncludesDir()) {
 			return nil
 		}
@@ -1338,13 +1204,9 @@ func rewriteFPMReferences(newPath string) (int, error) {
 	return changed, err
 }
 
-// EnsureNginxContexts 做一次完整的上下文整理：
-//  1. 迁移上下文敏感的 php-fpm.conf
-//  2. 写入 upgrade map
-//  3. 确保 conf.d 被 include
-//
-// 顺序不能颠倒：必须先迁移，再加 include，
-// 否则中间会经过一个 nginx 语法非法的状态。
+// EnsureNginxContexts 做一次完整的上下文整理：迁移上下文敏感的 php-fpm.conf、
+// 写入 upgrade map、确保 conf.d 被 include。
+// 顺序不能颠倒：必须先迁移再加 include，否则中间会经过一个 nginx 语法非法的状态。
 func EnsureNginxContexts(upgradeMapContent string) (string, error) {
 	migrated, msg, err := MigrateFPMInclude()
 	if err != nil {
@@ -1354,20 +1216,14 @@ func EnsureNginxContexts(upgradeMapContent string) (string, error) {
 	if msg != "" {
 		parts = append(parts, msg)
 	}
-	// nginx 的工作目录必须存在，否则 **任何** 配置校验都会失败。
-	//
-	// 真机实测（2026-09-16）：全新装出来的 nginx 没有 /opt/homebrew/var/log/nginx，
-	// 于是 `nginx -t` 直接报
-	//   nginx: [alert] could not open error log file: open() "/opt/homebrew/var/log/nginx/error.log" failed
-	// 反代规则因此写不进去（面板如实回了"配置语法错误，已回滚"），
-	// 而用户看到的是"规则保存不了"，完全联想不到是缺一个日志目录。
-	// 这几个目录由面板负责补齐（nginx 以真实用户运行，所以要改归属）。
+	// nginx 的工作目录必须存在，否则**任何**配置校验都会失败（真机实测 2026-09-16：
+	// 全新安装的 nginx 没有 <brew>/var/log/nginx，`nginx -t` 报 could not open error
+	// log file，反代规则写不进去、用户只看到"规则保存不了"）；这些目录由面板补齐并改归属。
 	if logMsg, lerr := ensureNginxRuntimeDirs(); lerr != nil {
 		return "", lerr
 	} else if logMsg != "" {
 		parts = append(parts, logMsg)
 	}
-	// 记录改动前的状态，用于判断是否真的需要重载 nginx
 	before, _, _ := ConfDIncluded()
 	beforeVhost, _, _ := VhostsIncluded()
 	beforeMap, _ := os.ReadFile(filepath.Join(NginxConfD(), "upgrade-map.conf"))
@@ -1390,13 +1246,8 @@ func EnsureNginxContexts(upgradeMapContent string) (string, error) {
 }
 
 // EnsureUpgradeMap 写入 WebSocket 升级所需的 map 片段，并确保主配置 include 了 conf.d。
-//
-// 为什么必须由面板负责：反向代理配置里用到 $connection_upgrade 变量，
-// 而它只能在 http 上下文用 map 定义，不能写在 server 块内。
-// 如果这个 map 缺失，nginx -t 会直接报 unknown variable，
-// 所有反代站点都无法启用 —— 所以这是面板的职责，而不是用户的。
-//
-// 本函数是幂等的：重复执行不会产生重复的 include，也不会覆盖用户对 map 的修改。
+// $connection_upgrade 只能在 http 上下文用 map 定义，缺失时 nginx -t 报 unknown variable、
+// 所有反代站点都无法启用；本函数幂等，不覆盖用户对 map 的修改。
 func EnsureUpgradeMap(mapContent string) error {
 	confD := NginxConfD()
 	if err := os.MkdirAll(confD, 0o755); err != nil {
@@ -1404,11 +1255,8 @@ func EnsureUpgradeMap(mapContent string) error {
 	}
 	mapPath := filepath.Join(confD, "upgrade-map.conf")
 
-	// 只在内容真的变化时才写入。
-	//
-	// 为什么重要：这个函数会在面板每次启动时被调用（自愈）。
-	// 如果无条件写文件，配合"写后重载 nginx"就会在每次开机时
-	// 触发一次全站 reload —— 没必要，而且 reload 瞬间可能造成请求抖动。
+	// 只在内容真的变化时才写入：本函数每次启动都被调用，无条件写 + 写后重载
+	// 会在每次开机触发一次全站 reload（没必要，且可能造成请求抖动）。
 	changed := true
 	if old, err := os.ReadFile(mapPath); err == nil && string(old) == mapContent {
 		changed = false
@@ -1424,8 +1272,7 @@ func EnsureUpgradeMap(mapContent string) error {
 	return nil
 }
 
-// ensureConfDIncluded 检查 nginx.conf 的 http 块是否 include 了 conf.d/*.conf，
-// 没有则插入（只在 http { 之后插入一次）。
+// ensureConfDIncluded：nginx.conf 的 http 块若没 include conf.d/*.conf 就插入一次。
 func ensureConfDIncluded() error {
 	confPath := NginxConf()
 	b, err := os.ReadFile(confPath)
@@ -1434,7 +1281,6 @@ func ensureConfDIncluded() error {
 	}
 	content := string(b)
 
-	// 已包含（任意形式的 conf.d 通配）就什么都不做
 	if regexp.MustCompile(`(?m)^\s*include\s+\S*conf\.d/\*\.conf\s*;`).MatchString(content) {
 		return nil
 	}
@@ -1445,11 +1291,10 @@ func ensureConfDIncluded() error {
 	if loc == nil {
 		return errors.New("nginx.conf 中未找到 http 块，无法插入 conf.d include")
 	}
-	insertAt := loc[1] // "http {" 的右花括号位置之后
+	insertAt := loc[1]
 	line := "\n    # 由 ZizPanel 添加：加载 conf.d 下的通用片段（如 WebSocket 升级 map）\n" +
 		"    include " + NginxConfD() + "/*.conf;\n"
 
-	// 先备份，再原子替换
 	backup := confPath + ".zizpanel.bak"
 	if err := os.WriteFile(backup, b, 0o644); err != nil {
 		return fmt.Errorf("备份 nginx.conf 失败: %w", err)
@@ -1472,14 +1317,10 @@ func ensureConfDIncluded() error {
 	return nil
 }
 
-// NginxConfBackupPath 返回 nginx.conf 的备份路径（供面板提示用户）。
 func NginxConfBackupPath() string { return NginxConf() + ".zizpanel.bak" }
 
-// EnsureNginxEnv 确保 nginx 具备面板所需的通用环境：
-//   - conf.d/upgrade-map.conf（反向代理的 WebSocket 支持）
-//   - nginx.conf 的 http 块 include 了 conf.d/*.conf
-//
-// 返回人类可读的执行说明，便于面板在日志里记录做了什么。
+// EnsureNginxEnv 确保 nginx 具备面板所需的通用环境（upgrade map + conf.d include）。
+// 返回人类可读的执行说明，便于面板记录做了什么。
 func EnsureNginxEnv() (string, error) {
 	return EnsureNginxContexts(nginxUpgradeMapContent)
 }
@@ -1514,7 +1355,6 @@ func ConfDIncluded() (bool, string, error) {
 	return true, "已包含 " + m[1], nil
 }
 
-// BackupNginxConf 备份 nginx.conf，返回备份路径。
 func BackupNginxConf() (string, error) {
 	b, err := os.ReadFile(NginxConf())
 	if err != nil {
@@ -1529,11 +1369,7 @@ func BackupNginxConf() (string, error) {
 
 // ---------- 证书 ----------
 
-// MakeSelfSignedCert 为指定域名生成自签证书。
-//
-// 用 openssl 而不是自己写 x509：面板自身已经有 tlsx 包生成证书，
-// 但站点证书需要由 root 写入 nginx 可读的路径，且要包含精确的 SAN，
-// 复用 openssl 的命令行参数最直观、也便于用户手工复现。
+// MakeSelfSignedCert 为指定域名生成自签证书（openssl 命令行，便于用户手工复现）。
 func MakeSelfSignedCert(domain, certPath, keyPath string, days int) (string, error) {
 	if err := ValidateDomain(domain); err != nil {
 		return "", err
@@ -1562,7 +1398,6 @@ func MakeSelfSignedCert(domain, certPath, keyPath string, days int) (string, err
 	return certPath, nil
 }
 
-// CertInfo 读取证书信息。
 func CertInfo(certPath string) (subject, issuer string, notAfter time.Time, err error) {
 	r := runTimeout(15*time.Second, "/usr/bin/openssl", "x509", "-in", certPath,
 		"-noout", "-subject", "-issuer", "-enddate")
@@ -1590,8 +1425,7 @@ func CertInfo(certPath string) (subject, issuer string, notAfter time.Time, err 
 
 // ---------- mkcert ----------
 
-// MkcertTrust 用 mkcert 生成并信任本地 CA，让浏览器不再提示证书不受信任。
-// 未安装 mkcert 时返回明确指引，而不是静默失败。
+// MkcertTrust 用 mkcert 生成并信任本地 CA（未安装时返回明确指引，不静默失败）。
 func MkcertTrust() (string, error) {
 	bin := ""
 	for _, p := range []string{
@@ -1613,7 +1447,6 @@ func MkcertTrust() (string, error) {
 	return r.combined(), nil
 }
 
-// MkcertIssue 为指定域名/IP 签发本地受信证书。
 func MkcertIssue(hosts []string, outCert, outKey string) (string, error) {
 	bin := filepath.Join(HomebrewPrefix(), "bin", "mkcert")
 	if _, err := os.Stat(bin); err != nil {
@@ -1648,25 +1481,13 @@ func netIPOK(s string) bool {
 }
 
 // ensureNginxRuntimeDirs 确保 nginx 运行所需的**所有目录**都存在。
-//
-// 为什么必须做（真机 2026-09-16 连环踩到）：
-//   - 缺 <brew>/var/log/nginx     → `nginx -t` 报 could not open error log file
-//   - 缺 <brew>/var/run           → 报 open() nginx.pid failed (13: Permission denied)
-//   - 缺 <brew>/var/run/nginx/client_body_temp 等 → 报 mkdir() ... failed
-//
-// 三者任一缺失，**任何** vhost 都写不进去；面板只会如实回一句
-// "配置语法错误，已回滚"，用户完全看不出是缺目录。
-//
-// 实现上**不写死路径**，而是从 nginx.conf 里把路径类指令（error_log /
-// access_log / pid / *_temp_path / *_temp）解析出来，逐个确保目录存在。
-// 这样用户改了 nginx.conf 或换了前缀，面板依然能自愈。
-// 返回给人看的改动说明（无改动返回空串），调用方据此决定是否 reload。
+// 真机 2026-09-16 连环踩到：缺 var/log/nginx、var/run、*_temp 任一，任何 vhost 都写不进去，
+// 而面板只回"配置语法错误，已回滚" —— 路径一律从 nginx.conf 解析、不写死；返回改动说明。
+
 // ---------- nginx worker 属主判定（判据贴着运行体） ----------
 
 // nginxWorkerProbe 从**正在运行的 worker 进程**反查 uid/gid。
-//
-// 做成可注入的变量：开发机/CI 上真的跑着 nginx，不注入就没法测
-// "没有 worker 时退回配置"这条分支。
+// 做成可注入变量：开发机/CI 上真的跑着 nginx，不注入就没法测"没有 worker"分支。
 var nginxWorkerProbe = func() (uid, gid, pid int, ok bool) {
 	out, err := exec.Command("/usr/bin/pgrep", "-f", "nginx: worker process").Output()
 	if err != nil {
@@ -1694,24 +1515,16 @@ var nginxWorkerProbe = func() (uid, gid, pid int, ok bool) {
 }
 
 // SetNginxWorkerProbeForTest 替换"从 worker 进程反查属主"的实现，返回恢复函数。
-//
-// 只给测试用：web 包也要验证"属主未知时不许 chown"这条判据，而真机上真的跑着
-// nginx，不注入就没法构造"没有 worker"的场景。
+// 只给测试用：web 包要验证"属主未知时不许 chown"，而真机上真的跑着 nginx。
 func SetNginxWorkerProbeForTest(fn func() (uid, gid, pid int, ok bool)) (restore func()) {
 	prev := nginxWorkerProbe
 	nginxWorkerProbe = fn
 	return func() { nginxWorkerProbe = prev }
 }
 
-// NginxWorkerOwner 返回 nginx worker **真正**运行的用户（以及判据来源，给日志用）。
-//
-// 优先级（本项目最贵的纪律之一：判据贴着运行体）：
-//  1. 正在运行的 worker 进程的 uid/gid —— 唯一权威的事实；
-//  2. 退回 nginx.conf 的 `user` 指令；
-//  3. 都拿不到 → ok=false。调用方**不许猜**（尤其不许猜 nobody）：
-//     把临时目录 chown 给一个写不进去的用户，症状和没修一样，还更难查 ——
-//     2026-09-22 用户报障的"推音色样本 500（nginx 自己的 HTML 页面）"就是这个坑，
-//     当时 web 层的兜底写的是 nobody。
+// NginxWorkerOwner 返回 nginx worker **真正**运行的用户（及判据来源，给日志用）。
+// 优先级：运行中的 worker 进程（唯一权威事实）→ nginx.conf 的 `user` 指令 →
+// 都拿不到就 ok=false，调用方**不许猜**（尤其不许猜 nobody：猜错等于没修还藏因，2026-09-22 报障即此坑）。
 func NginxWorkerOwner(confPath string) (name string, uid, gid int, how string, ok bool) {
 	if u, g, pid, pok := nginxWorkerProbe(); pok {
 		n := strconv.Itoa(u)
@@ -1751,12 +1564,9 @@ func NginxWorkerUserFromConf(confPath string) string {
 	return ""
 }
 
-// nginxTempDirs 返回 nginx 落盘请求体/代理响应要用的临时目录。
-//
-// 路径来自 Homebrew nginx 的编译参数（`nginx -V` 里的
-// --http-client-body-temp-path=… 等），全部在 <prefix>/var/run/nginx 下。
-// 这些目录缺失或属主不是 worker 用户时，**任何超过 client_body_buffer_size
-// 的请求体**都会让 nginx 直接回自己的 500 HTML 页面（上传、音色样本、大 SQL 导入）。
+// nginxTempDirs 返回 nginx 落盘请求体/代理响应要用的临时目录（来自 `nginx -V` 编译参数）。
+// 这些目录缺失或属主不是 worker 用户时，**任何超过 client_body_buffer_size 的请求体**
+// 都会让 nginx 直接回自己的 500 HTML 页面（上传、音色样本、大 SQL 导入）。
 func nginxTempDirs() []string {
 	base := filepath.Join(HomebrewPrefix(), "var", "run", "nginx")
 	out := []string{base}
@@ -1815,8 +1625,7 @@ func ensureNginxRuntimeDirs() (string, error) {
 		}
 	}
 	// 归属真实用户：nginx 以该用户身份跑，日志/pid 目录属主不对会写不进去。
-	// 只 chown 我们自己新建的那些目录，不做递归 —— 递归 chown 会误伤
-	// （真实事故：一条 `chown -R` 把 brew 的 etc 目录也改成了 root，配置全废）。
+	// 只 chown 我们自己新建的目录，不递归（真实事故：`chown -R` 把 brew 的 etc 也改成 root，配置全废）。
 	if u := strings.TrimSpace(os.Getenv("ZIZPANEL_USER")); u != "" && u != "root" {
 		if uid, gid, uerr := lookupIDs(u); uerr == nil {
 			for _, d := range changed {
@@ -1840,18 +1649,9 @@ func ensureNginxRuntimeDirs() (string, error) {
 	return msg, nil
 }
 
-// nginxRequiredDirs 从 nginx.conf 里解析出所有需要的目录。
-//
-// 覆盖 brew 默认配置里出现过的全部路径类指令：
-//
-//	error_log /var/log/nginx/error.log;      → 目录
-//	access_log ...;                          → 目录
-//	pid /var/run/nginx.pid;                  → 目录
-//	client_body_temp_path /var/run/nginx/client_body_temp;  → 该目录本身
-//	proxy_temp_path /var/run/nginx/proxy_temp;              → 该目录本身
-//
-// 解析失败（读不到文件）时返回错误；读到但没有任何路径指令时返回空列表
-// —— 那说明用户用了完全自定义的布局，面板不该瞎猜。
+// nginxRequiredDirs 从 nginx.conf 解析出所有需要的目录（error_log/access_log/pid 取所在目录，
+// *_temp_path 与 *_temp 参数本身即目录）。
+// 读不到文件返回错误；读到但没有任何路径指令时返回空列表 —— 用户自定义布局，面板不猜。
 func nginxRequiredDirs(confPath string) ([]string, error) {
 	b, err := os.ReadFile(confPath)
 	if err != nil {
@@ -1886,7 +1686,6 @@ func nginxRequiredDirs(confPath string) ([]string, error) {
 	return out, nil
 }
 
-// dedupeStrings 去重并保持顺序。
 func dedupeStrings(in []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(in))
@@ -1900,7 +1699,6 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// lookupIDs 把用户名解析成 (uid, gid)。
 func lookupIDs(name string) (int, int, error) {
 	u, err := user.Lookup(name)
 	if err != nil {
@@ -1923,13 +1721,8 @@ func VhostsIncluded() (bool, string, error) {
 }
 
 // EnsureVhostsInclude 确保 nginx.conf 加载了 vhosts 目录。
-//
-// 为什么必须由面板保证（真机 2026-09-16 事故）：
-// 站点与反向代理的配置都写在 `<brew>/etc/nginx/vhosts/` 下，而
-// **`brew reinstall nginx` 会把 nginx.conf 还原成 brew 默认版** ——
-// 那时 include 就没了，用户看到的是"配置明明写进去了，访问却 404/连不上"
-// （运维上最难查的一类：文件在、服务在、就是不生效）。
-// 之前只有 LNMP 安装流程会补这条 include，修复/重装 nginx 之后就丢了。
+// 真机事故 2026-09-16：`brew reinstall nginx` 会把 nginx.conf 还原成默认版、include 丢失，
+// 用户看到"配置写进去了却 404/连不上"；所以每次自愈都要补齐。
 func EnsureVhostsInclude() error {
 	vhostDir := VhostDir()
 	if err := os.MkdirAll(vhostDir, 0o755); err != nil {
@@ -1968,7 +1761,6 @@ func EnsureVhostsInclude() error {
 	return nil
 }
 
-// includePresent 检查 nginx.conf 里是否 include 了某个目录下的 *.conf。
 func includePresent(dir string) (bool, string, error) {
 	b, err := os.ReadFile(NginxConf())
 	if err != nil {

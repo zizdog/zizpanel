@@ -20,48 +20,11 @@ import (
 	"time"
 )
 
-// ============================================================================
-//  语音转文字（whisper.cpp）—— 引擎
-//
-//  用户原话（2026-09-25）：
-//    "在市场里加入一个语音转文字服务！要求：不要 docker，不要 gui 软件；
-//      有 webui 或 api（你自行开发配套 webui）。"
-//
-//  选型（完整评估见交付汇报）：**whisper.cpp 的 Homebrew 包**。
-//    · `brew info whisper-cpp` → formula 现在的**正名是 `whisper.cpp`**
-//      （`whisper-cpp` 是它的 Old Name，见下面 STTBrewFormula 的注释）；
-//    · 原生 arm64 瓶，Metal 加速（实测 M4 上初始化时
-//      `ggml_metal_device_init: GPU name: MTL0 (Apple M4)`）；
-//    · **不引入 Python / Docker / GUI**：这正是本项目 2026-09-18
-//      `python@3.11` 被外力删除导致 TTS 挂两小时之后最在意的一条；
-//    · 模型是单个 ggml 文件，可从 NAS / hf-mirror 取（见 STTModelSources）。
-//
-//  为什么用包里的 `whisper-cli` 而不是 `whisper-server`（**两者都实测存在**）：
-//    `ls $(brew --prefix)/bin/whisper*` 里 `whisper-server` 确实在
-//    （`/opt/homebrew/bin/whisper-server`，1,057,456 B 的 Mach-O），
-//    而且它天生就是 OpenAI 兼容的。但本轮的交付里有两条硬要求它做不到：
-//      1. **长音频要有真实进度** —— whisper-server 的 `-pp` 只把进度打到
-//         *服务进程自己的 stdout*，HTTP 客户端拿不到任何中间状态，
-//         面板能给的只会是一个假的转圈；
-//      2. **模型档位可切换** —— 模型路径是 whisper-server 的**启动参数**，
-//         换档必须重启服务并重新加载（首次加载要编译 Metal kernel，实测
-//         二十多秒），面板做不到"这次请求用 medium"。
-//    `whisper-cli`（同一个 formula、同一套 ggml 后端、同一份模型文件）两条都能：
-//      · `-pp/--print-progress` 把 `whisper_print_progress_callback: progress = X%`
-//        打到 stderr，面板逐行解析 → **真实进度**；
-//      · 模型是**每次调用的参数** → 档位按请求切换。
-//    代价是每次请求重新加载模型（实测数据见汇报的"真机验证"一节，秒级）。
-//    这**不是**退路 A/B：没有新增任何 Python/Docker/第二个语言运行时，
-//    仍然只用 whisper.cpp 这一个原生包。
-//
-//  转码链路（为什么必须先过 ffmpeg）：
-//    Homebrew 的 whisper.cpp 瓶只依赖 ggml / llama.cpp / sdl2-compat，
-//    **没有链 ffmpeg**，所以 `whisper-cli` 只吃得下 16 kHz 单声道 PCM WAV。
-//    用户上传的多半是 m4a / mp3，因此面板自己用 ffmpeg 转成
-//    16 kHz / 单声道 / s16le（`-ar 16000 -ac 1 -c:a pcm_s16le`）再喂给引擎。
-//    ffmpeg 是应用市场里已有的基础依赖条目（Requires 声明它），
-//    缺了**如实报错**并指名去「应用市场 → FFmpeg」装，绝不给一个坏结果。
-// ============================================================================
+// 语音转文字（whisper.cpp）引擎：用 brew 包的 whisper-cli 逐片转写，面板先用
+// ffmpeg 转 16 kHz 单声道 WAV（实测 whisper-cli 没链 ffmpeg，只认这种 WAV）。
+// 选 whisper-cli 而非 whisper-server：实测 `-pp` 把进度打到 stderr，面板逐行
+// 解析出真实进度，且模型档位是每次调用的参数；whisper-server 两样都做不到。
+// 不引入 Python / Docker / GUI；ffmpeg 缺失时如实报错，绝不静默降级。
 
 const (
 	// STTAppID 是应用市场里的条目 ID。
@@ -70,45 +33,24 @@ const (
 	STTLabel = "com.zizdog.stt"
 	// STTSlug 是面板别名（目录条目的 UI.Slug）：/<slug>/。
 	STTSlug = "stt"
-	// STTPort 是语音转文字网页界面的默认监听端口（只绑 127.0.0.1）。
-	//
-	// 8892 与目录里其它端口不冲突（8880 Qwen3 TTS / 8890 图片压缩 /
-	// 8891 语音合成 / 8899 音色接收端），TestCatalogPortsAreUnique 会锁住唯一性。
+	// STTPort 是网页界面默认监听端口（只绑 127.0.0.1）；与目录里其它端口
+	// 不冲突（8880 / 8890 / 8891 / 8899），唯一性由 TestCatalogPortsAreUnique 锁死。
 	STTPort = 8892
 
-	// STTBrewFormula 是 Homebrew 包名。
-	//
-	// ⚠️ **必须写正名 `whisper.cpp`，不能写用户习惯的 `whisper-cpp`**：
-	// 实测（2026-09-25 本机）：
-	//   · `brew info whisper-cpp` 能用 —— 输出里写着 "Old Names: whisper-cpp"，
-	//     说明 `whisper-cpp` 只是别名；
-	//   · 但镜像/官方的**清单 JSON 只有正名那一个**：
-	//     `<镜像>/api/formula/whisper.cpp.json` → 200，
-	//     `<镜像>/api/formula/whisper-cpp.json` → **404**。
-	// 而面板挑 brew 镜像的判据正是 `brewMirrorSupportsOCIFor(base, formula)`
-	// （install.go，它去取 `<base>/api/formula/<formula>.json`）。若这里写别名，
-	// 三家国内镜像会**全部**被判为"不可用"，于是静默回落到 ghcr.io ——
-	// 实测同一个 `brew info` 走 USTC 镜像 2.1 秒、走官方默认 **8 分 28 秒**。
-	// 这正是本项目最忌讳的"日志说走镜像、实际打官方源"。
-	// `brew install whisper.cpp` 与 `brew uninstall whisper.cpp` 都按正名工作，
-	// 已在本机实测通过。
+	// STTBrewFormula 是 Homebrew 包名 —— **必须写正名 `whisper.cpp`**，不能写
+	// 别名 `whisper-cpp`：镜像清单 JSON 只有正名（别名 404），写别名会被三家
+	// 国内镜像全判为不可用并静默回落 ghcr.io（实测 2.1 秒 vs 8 分 28 秒）。
 	STTBrewFormula = "whisper.cpp"
 	// STTCLIBinName 是包里的命令行引擎（转写就靠它）。
 	STTCLIBinName = "whisper-cli"
-	// STTServerBinName 是包里官方的 OpenAI 兼容服务端。
-	// 本轮**不用它当引擎**（理由见文件头），但保留常量：面板要能如实告诉用户
-	// "这个包里还有 whisper-server"，/healthz 也把它作为环境事实报出来。
+	// STTServerBinName 是包里官方的 OpenAI 兼容服务端；本轮不当引擎用，
+	// 只用于如实告诉用户"这个包里还有 whisper-server"（/healthz 会报出来）。
 	STTServerBinName = "whisper-server"
 
-	// STTChunkSeconds 是长音频切片的长度（秒）。
-	//
-	// 切片是"真实进度"的唯一来源（与语音合成按句分段同一个道理）：
-	// 10 分钟的音频 = 10 片，界面上的进度就是"真的转完了 3/10 片"。
-	// 60 秒是取舍：片太小会切碎上下文（每片都要重新加载模型），
-	// 太大则进度颗粒度太粗。
+	// STTChunkSeconds 是长音频切片长度（秒），也是"真实进度"的唯一来源：
+	// 10 分钟音频 = 10 片，进度就是真的转完了 3/10 片。60 秒是取舍。
 	STTChunkSeconds = 60
-	// STTSyncMaxSeconds 是不超过它就**同步**返回的音频时长。
-	// 超过它就走任务中心（202 + task_id + SSE 进度）。
+	// STTSyncMaxSeconds 是同步返回的时长上限；超过它走任务中心（202 + task_id + SSE）。
 	STTSyncMaxSeconds = 60
 	// STTMaxAudioSeconds 是单次请求允许的音频时长上限（3 小时）。
 	// 超过一律 413 如实拒绝，不做静默截断（截断会让用户以为整段都转完了）。
@@ -119,29 +61,21 @@ const (
 	// STTModelDirName 是模型目录名（相对 <home>/stt/）。
 	STTModelDirName = "models"
 
-	// STTHealthProbeTTL 是健康探活结果的缓存时长。
-	//
-	// 健康检查是"真的跑一次极短音频转写"（见 STTEngine.Health），
-	// 每次都跑既慢又吵；缓存 20 秒是折中，并且响应里**如实回报**
-	// probe_cached / probe_age_ms，不把缓存结果伪装成刚刚的实测。
+	// STTHealthProbeTTL 是健康探活缓存时长：探活是"真的跑一次极短转写"（见
+	// STTEngine.Health），响应用 probe_cached / probe_age_ms 如实回报，不伪装成实测。
 	STTHealthProbeTTL = 20 * time.Second
 
-	// STTModelDownloadTimeout 是下载**一个**模型档位的超时。
-	//
-	// 最大的 medium 档 1.43 GiB；实测 hf-mirror 约 783 KB/s → 约 32 分钟，
-	// 给足一小时。这个值同时写进 market_downloads.go 的下载点声明 ——
-	// 声明里"代码里真实存在的超时"必须与这里一致（两处漂移会让审计说谎）。
+	// STTModelDownloadTimeout 是下载一个档位的超时：最大档 1.43 GiB，实测
+	// hf-mirror 约 783 KB/s → 约 32 分钟，给足一小时。此值必须与
+	// market_downloads.go 的下载点声明一致（两处漂移会让审计说谎）。
 	STTModelDownloadTimeout = 60 * time.Minute
-	// STTProbeSeconds 是健康探针音频的长度（0.5 秒静音）。
-	// 只要引擎能把它跑完并产出合法 JSON，就说明"模型加载 + 推理链路"是通的。
+	// STTProbeSeconds 是探针音频长度（0.5 秒静音）：跑完并产出合法 JSON 即证明链路通。
 	STTProbeSeconds = 0.5
 	// STTProbeSampleRate 是探针 WAV 的采样率（whisper 要求 16 kHz）。
 	STTProbeSampleRate = 16000
 )
 
-// ---------------------------------------------------------------------------
-//  错误：全部可被 errors.Is 判定，web 层据此如实映射成 4xx / 413 / 503
-// ---------------------------------------------------------------------------
+// 错误：全部可被 errors.Is 判定，web 层据此如实映射成 4xx / 413 / 503。
 
 var (
 	// ErrSTTModelMissing 请求的档位没有安装模型文件。
@@ -158,21 +92,15 @@ var (
 	ErrSTTEngineUnavailable = errors.New("语音转文字引擎不可用")
 	// ErrSTTFfmpegMissing 这台机器没有 ffmpeg（转码链路断了）。
 	ErrSTTFfmpegMissing = errors.New("缺少 ffmpeg")
-	// ErrSTTInvalidRequest 请求参数本身不合法（response_format 拼错等）。
-	// 必须与"引擎不可用"分开：请求方的问题要给 4xx，让人能改。
+	// ErrSTTInvalidRequest 请求参数不合法（response_format 拼错等）；必须与"引擎不可用"分开：前者给 4xx。
 	ErrSTTInvalidRequest = errors.New("请求参数不合法")
 	// ErrSTTExportUnsupported 请求的导出格式不受支持。
 	ErrSTTExportUnsupported = errors.New("不支持的导出格式")
 )
 
-// ---------------------------------------------------------------------------
-//  模型档位
-// ---------------------------------------------------------------------------
+// --- 模型档位 ---
 
-// STTModel 是一个可选的模型档位。
-//
-// 体积是**实测值**（2026-09-25 对 hf-mirror 发 Range 请求读 Content-Range 得到
-// 的精确字节数），不是抄的、也不是估的 —— 本仓库因为编造体积/校验值出过事故。
+// STTModel 是一个可选的模型档位；体积是**实测值**（2026-09-25 读 hf-mirror Content-Range），不是抄的/估的。
 type STTModel struct {
 	// ID 是对外契约（请求里的 model 字段、/v1/models 的 id）。改名等于改协议。
 	ID string `json:"id"`
@@ -192,17 +120,9 @@ type STTModel struct {
 	Default bool `json:"default,omitempty"`
 }
 
-// STTModels 是面板支持的三个档位，**顺序即界面下拉框顺序**。
-//
-// 为什么是这三档（用户要求"至少支持 small / medium / large-v3-turbo(q5)"）：
-//   - small：466 MB，中文可用、速度最快，但精度不如 turbo；
-//   - large-v3-turbo（q5_0 量化）：**默认档**（2026-09-25 用户要求把默认从
-//     small 换成它）。574 MB —— 比 medium **小**、质量**更好**，是这三档里
-//     最划算的一档（turbo 版是 large-v3 的蒸馏解码器）。
-//     ⚠️ 默认档变大（466 MiB → 547 MiB）意味着安装时下载更久一点；
-//     "没装/下到一半"时的行为不变：/healthz 与 /v1/models 如实报缺、
-//     网页界面照旧给「下载」入口，绝不假装已就绪。
-//   - medium：更准但 1.43 GiB、内存 2.1 GB，慢一个量级。
+// STTModels 是面板支持的三个档位，**顺序即界面下拉框顺序**；默认档是
+// large-v3-turbo（q5_0，547 MiB，比 medium 更小更准）。没装/下到一半时
+// /healthz 与 /v1/models 如实报缺、界面照旧给「下载」入口，绝不假装已就绪。
 var STTModels = []STTModel{
 	{
 		ID: "small", Name: "Small（快，466 MiB）", File: "ggml-small.bin",
@@ -224,9 +144,7 @@ var STTModels = []STTModel{
 }
 
 // DefaultSTTModelID 返回默认档位 ID（清单里被标 Default 的那个）。
-//
-// 纯函数，可单测：找不到标记时退回第一个，绝不返回空串 ——
-// 返回空串会让请求在没有 model 字段时报"未知档位"，把默认值这件事搞坏。
+// 纯函数，可单测：找不到标记时退回第一个，绝不返回空串（空串会让请求报"未知档位"）。
 func DefaultSTTModelID() string {
 	for _, m := range STTModels {
 		if m.Default {
@@ -240,9 +158,7 @@ func DefaultSTTModelID() string {
 }
 
 // FindSTTModel 按 ID 查档位（大小写不敏感、允许两端空白；空串 = 默认档）。
-//
-// 这是**可注入的档位解析**入口：web 层与安装器都只通过它把请求里的字符串
-// 变成 STTModel，于是"档位名拼错"只有一处判据。
+// 这是档位解析的唯一入口，"档位名拼错"只有一处判据。
 func FindSTTModel(id string) (STTModel, error) {
 	want := strings.TrimSpace(id)
 	if want == "" {
@@ -274,12 +190,9 @@ func STTModelFilename(id string) (string, error) {
 	return m.File, nil
 }
 
-// ---------------------------------------------------------------------------
-//  路径
-// ---------------------------------------------------------------------------
+// --- 路径 ---
 
-// STTPaths 是这套服务的目录约定（与 qwentts / iopaint 同一条规矩：
-// 面板自己的东西放 `<真实用户家目录>/<应用名>/`）。
+// STTPaths 是目录约定：面板自己的东西放 <真实用户家目录>/stt/（与 qwentts / iopaint 同规矩）。
 type STTPaths struct {
 	Home      string
 	Root      string
@@ -289,12 +202,8 @@ type STTPaths struct {
 	ErrLog    string
 }
 
-// sttPaths 解析路径。
-//
-// **不写死 /opt/homebrew、也不写死用户名**：家目录来自 Manager 的 UserHome /
-// UserName（安装器在 root 下必须显式知道"服务要以谁的身份跑"），
-// plist 路径走 SystemDaemonPlistPath（它自己按平台拼），
-// brew 前缀一律走 m.brewPrefix()（Apple Silicon /opt/homebrew、Intel /usr/local）。
+// sttPaths 解析路径。**不写死 /opt/homebrew、也不写死用户名**：家目录来自
+// Manager 的 UserHome / UserName，brew 前缀一律走 m.brewPrefix()。
 func (m *Manager) sttPaths() STTPaths {
 	home := strings.TrimSpace(m.opt.UserHome)
 	if home == "" && strings.TrimSpace(m.opt.UserName) != "" {
@@ -311,10 +220,7 @@ func (m *Manager) sttPaths() STTPaths {
 	}
 }
 
-// sttModelPath 返回某个档位模型文件在磁盘上的绝对路径。
-//
-// modelsDir 为注入参数（不是从 Manager 现取），所以单测可以喂一个临时目录 ——
-// "档位 → 路径"这条映射必须能脱离真实家目录被验证。
+// sttModelPath 返回档位模型文件绝对路径；modelsDir 是注入参数，单测可喂临时目录。
 func sttModelPath(modelsDir, modelID string) (string, STTModel, error) {
 	m, err := FindSTTModel(modelID)
 	if err != nil {
@@ -327,11 +233,8 @@ func sttModelPath(modelsDir, modelID string) (string, STTModel, error) {
 	return filepath.Join(dir, m.File), m, nil
 }
 
-// STTModelFileExists 报告某个档位的权重是否**真的在磁盘上且不是空壳**。
-//
-// 判据贴着运行体（AGENTS 第三节）：文件在 + 大小与上游一致（或至少 > 1 MiB）。
-// 只 `os.Stat` 不看大小是不够的 —— 下载中断留下的 0 字节文件会让 /healthz
-// 报绿灯，而每次转写都失败。
+// STTModelFileExists 报告权重是否**真的在磁盘上且不是空壳**：文件在 + 大小与
+// 上游一致。只 os.Stat 不看大小不够 —— 0 字节文件会让 /healthz 报绿灯而转写必失败。
 func STTModelFileExists(modelsDir, modelID string) bool {
 	path, m, err := sttModelPath(modelsDir, modelID)
 	if err != nil {
@@ -344,8 +247,7 @@ func STTModelFileExists(modelsDir, modelID string) bool {
 	return st.Size() >= sttMinPlausibleModelBytes && st.Size() == m.Bytes
 }
 
-// sttMinPlausibleModelBytes 是"这个文件可能是个真模型"的绝对下限。
-// 最小的一档也远大于 1 MiB；低于它一定是坏文件或错误页。
+// sttMinPlausibleModelBytes 是"这个文件可能是个真模型"的绝对下限：最小档也远大于 1 MiB。
 const sttMinPlausibleModelBytes = 1 << 20
 
 // STTModelState 是一个档位在**这台机器上**的现状（/v1/models 的 data 项）。
@@ -373,11 +275,7 @@ type STTModelsState struct {
 	Total   int             `json:"total"`
 }
 
-// STTModelsStateFor 组装档位现状。
-//
-// currentID 为"当前档"（可由配置/请求决定；空 = 默认档）。
-// 纯函数式的注入参数（modelsDir 而不是 Manager），所以单测可以完全离线地
-// 断言"缺哪个文件时哪个档显示未安装"。
+// STTModelsStateFor 组装档位现状（currentID 空 = 默认档）；纯注入参数，单测可离线断言缺文件时的显示。
 func STTModelsStateFor(modelsDir, currentID string) STTModelsState {
 	cur := strings.TrimSpace(currentID)
 	if _, err := FindSTTModel(cur); err != nil {
@@ -406,9 +304,7 @@ func STTModelsStateFor(modelsDir, currentID string) STTModelsState {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-//  下载来源（NAS → HF 镜像 → 官方）
-// ---------------------------------------------------------------------------
+// --- 下载来源（NAS → HF 镜像 → 官方）---
 
 // STTModelSource 是一个模型下载来源。
 type STTModelSource struct {
@@ -429,17 +325,12 @@ const sttHFMirror = "https://hf-mirror.com"
 // sttHFUpstream 是官方 HF（国内直连基本不可用，所以排最后）。
 const sttHFUpstream = "https://huggingface.co"
 
-// sttGGMLMagics 是 ggml 权重文件允许的开头 4 字节。
-//
-// 为什么要校验它：下载到的很可能是一个 HTML 错误页 / 登录页 / 空文件，
-// 只看"文件存在且大小对"会被中间层用内容填充骗过；而 ggml 的魔数是硬事实。
-// 实测上游 ggml-small.bin 的前 4 字节是 ASCII "lmgg"。
-// ggml 的 GGML_FILE_MAGIC = 0x67676d6c，按**小端**落盘就是 l/m/g/g ——
-// 这个顺序很容易写反，所以这里列的是**实测的字节序列**，不是想当然的 "ggml"。
+// sttGGMLMagics 是 ggml 权重文件允许的开头 4 字节。必须校验：下载到的很可能
+// 是 HTML 错误页/登录页/空文件，"文件存在且大小对"骗得过。实测 ggml-small.bin
+// 前 4 字节是 ASCII "lmgg"（GGML_FILE_MAGIC=0x67676d6c 小端落盘），顺序容易写反。
 var sttGGMLMagics = [][]byte{[]byte("lmgg"), []byte("ggml"), []byte("fmgg"), []byte("tjgg"), []byte("algm")}
 
-// validateSTTModelFile 检查一个刚下好的模型文件**看起来真的是 ggml 权重**。
-//
+// validateSTTModelFile 检查刚下好的模型文件看起来真的是 ggml 权重；
 // 返回的 error 是给用户看的：说清哪一步不对、怎么办。
 func validateSTTModelFile(path string, want STTModel) error {
 	st, err := os.Stat(path)
@@ -475,15 +366,10 @@ func validateSTTModelFile(path string, want STTModel) error {
 		"多半是下载到了一个网页/错误页，已删除；请检查网络代理后重试", string(head), path)
 }
 
-// ---------------------------------------------------------------------------
-//  引擎
-// ---------------------------------------------------------------------------
+// --- 引擎 ---
 
-// STTCommandRunner 跑一条命令，并把 stderr 逐行回调出去（进度就在这里）。
-//
-// 做成注入点是为了单测：转写/探活**不允许**在单测里真的跑 whisper-cli，
-// 更不允许读真实家目录里的模型（AGENTS 第三节）。
-// onStderrLine 为 nil 时实现可以只收集输出。
+// STTCommandRunner 跑一条命令并把 stderr 逐行回调（进度就在这里）。做成注入点是
+// 为了单测：转写/探活**不允许**在单测里真的跑 whisper-cli 或读真实家目录的模型。
 type STTCommandRunner func(ctx context.Context, timeout time.Duration, bin string, args []string, onStderrLine func(string)) (string, error)
 
 // STTEngine 是"用 whisper.cpp 把音频转成文字"的引擎。
@@ -522,16 +408,12 @@ type STTEngine struct {
 	probeNote string
 }
 
-// STTDefaultChunkTimeout 是单片转写的超时。
-//
-// 一片最长 60 秒音频；即便在很慢的机器上，medium 档也远小于这个数。
-// 30 分钟只针对"机器极慢 + 档位极重"的兜底，不是常见的等待时间。
+// STTDefaultChunkTimeout 是单片转写超时：一片最长 60 秒音频，30 分钟只针对
+// "机器极慢 + 档位极重"的兜底，不是常见的等待时间。
 const STTDefaultChunkTimeout = 30 * time.Minute
 
-// NewSTTEngine 造一个用真实系统工具的引擎。
-//
-// brewPrefix 由调用方注入（面板里走 m.brewPrefix()，Apple Silicon 是
-// /opt/homebrew、Intel 是 /usr/local）—— **本文件不写死任何一个前缀**。
+// NewSTTEngine 造一个用真实系统工具的引擎；brewPrefix 由调用方注入，
+// **本文件不写死任何一个前缀**。
 func NewSTTEngine(brewPrefix, modelsDir, currentModel string) *STTEngine {
 	brewPrefix = strings.TrimRight(strings.TrimSpace(brewPrefix), "/")
 	e := &STTEngine{
@@ -620,10 +502,7 @@ func (e *STTEngine) run() STTCommandRunner {
 }
 
 // runSTTCommand 是生产用的执行器：带超时、stderr 逐行回调、失败时把尾部带进错误。
-//
-// 为什么必须逐行读 stderr（而不是 CombinedOutput）：whisper-cli 的进度
-// （`whisper_print_progress_callback: progress =  X%`）就在 stderr 上，
-// 而且它只有在**边跑边读**时才拿得到 —— 等命令结束再拿，进度已经没意义了。
+// 必须逐行读 stderr —— whisper-cli 的进度只有边跑边读才拿得到，等命令结束就没意义了。
 func runSTTCommand(ctx context.Context, timeout time.Duration, bin string, args []string, onStderrLine func(string)) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -641,9 +520,8 @@ func runSTTCommand(ctx context.Context, timeout time.Duration, bin string, args 
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("启动 %s 失败：%w", filepath.Base(bin), err)
 	}
-	// stdout 与 stderr 都要收，且**必须并发收**：只读一路会让另一路的管道
-	// 缓冲区写满，子进程就卡在 write 上不动了（经典死锁，表现为"命令超时"）。
-	// whisper-cli 的转写文本走 stdout、进度与诊断走 stderr，两路都少不了。
+	// stdout 与 stderr **必须并发收**：只读一路会让管道缓冲区写满，子进程卡在
+	// write 上（经典死锁，表现为"命令超时"）。whisper-cli 的文本走 stdout、进度走 stderr。
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -722,9 +600,7 @@ func (e *STTEngine) Available() STTAvailability {
 	return a
 }
 
-// ---------------------------------------------------------------------------
-//  音频准备（转码 / 切片）
-// ---------------------------------------------------------------------------
+// --- 音频准备（转码 / 切片）---
 
 // STTAudioInfo 是探测到的音频信息。
 type STTAudioInfo struct {
@@ -735,10 +611,8 @@ type STTAudioInfo struct {
 	Format     string  `json:"format,omitempty"`
 }
 
-// ProbeAudio 用 ffprobe 读音频时长与基本参数。
-//
-// 为什么必须真的探一次：时长决定了"同步返回还是走任务"，
-// 也决定了要切几片（真实进度的分母）。猜时长就会给出假进度。
+// ProbeAudio 用 ffprobe 读音频时长与基本参数。时长决定同步还是任务、
+// 也决定切几片（真实进度的分母）—— 猜时长就会给出假进度。
 func (e *STTEngine) ProbeAudio(ctx context.Context, path string) (STTAudioInfo, error) {
 	var info STTAudioInfo
 	if !fileExecutable(e.FfprobeBin) {
@@ -786,11 +660,8 @@ func (e *STTEngine) ProbeAudio(ctx context.Context, path string) (STTAudioInfo, 
 	return info, nil
 }
 
-// ConvertToWAV 把任意音频转成 whisper 要的 16 kHz 单声道 s16le WAV。
-//
-// 为什么固定 16 kHz 单声道：whisper 的 mel 前端就是按 16 kHz 单声道训练的，
-// 预先转好比让引擎自己猜格式稳（brew 的 whisper-cli 没链 ffmpeg，
-// 它自己只认这种 WAV）。
+// ConvertToWAV 把任意音频转成 whisper 要的 16 kHz 单声道 s16le WAV；
+// 实测 brew 的 whisper-cli 没链 ffmpeg，只认这种 WAV。
 func (e *STTEngine) ConvertToWAV(ctx context.Context, src, dst string) error {
 	if !fileExecutable(e.FfmpegBin) {
 		return fmt.Errorf("%w：找不到 ffmpeg，无法把上传的音频转成 16 kHz WAV。"+
@@ -824,10 +695,8 @@ type STTChunk struct {
 	IndexFrom int // 全片段号起点（合并时间戳时用）
 }
 
-// SplitWAV 把一段 16 kHz 单声道 WAV 切成 numChunks 片（ffmpeg 的 segment muxer）。
-//
-// 为什么用 ffmpeg 切片而不是自己切字节：WAV 头必须在每片里都正确重写，
-// 自己切容易切出坏头（本项目的图片压缩/语音合成都栽过"格式头猜错"这类事）。
+// SplitWAV 用 ffmpeg 的 segment muxer 把一段 16 kHz 单声道 WAV 切成 numChunks 片；
+// 不自己切字节 —— WAV 头必须每片都正确重写，切坏了就是坏头。
 func (e *STTEngine) SplitWAV(ctx context.Context, wav string, totalSeconds float64, workDir string) ([]STTChunk, error) {
 	chunk := e.chunkSeconds()
 	if chunk <= 0 || totalSeconds <= float64(chunk) {
@@ -874,9 +743,7 @@ func (e *STTEngine) SplitWAV(ctx context.Context, wav string, totalSeconds float
 	return out, nil
 }
 
-// ---------------------------------------------------------------------------
-//  转写
-// ---------------------------------------------------------------------------
+// --- 转写 ---
 
 // STTOptions 是一次转写请求。
 type STTOptions struct {
@@ -892,8 +759,7 @@ type STTOptions struct {
 	Prompt string
 	// WorkDir 为空时自动建临时目录（结果的 Cleanup 会删掉它）。
 	WorkDir string
-	// Progress 在每片转写完成后被调用（done=已完成片数，total=总片数）。
-	// 有它才有"真实进度"——不是假转圈。
+	// Progress 在每片转写完成后被调用（done=已完成片数，total=总片数）；有它才有真实进度。
 	Progress func(done, total int, note string)
 	// KnownDuration 已知时长（>0 时跳过 ffprobe，避免重复探测）。
 	KnownDuration float64
@@ -915,8 +781,7 @@ type STTResult struct {
 	Language string `json:"language"`
 	// DurationMS 是音频总时长。
 	DurationMS int `json:"duration_ms"`
-	// ModelID / ModelFile 是**实际使用**的档位与权重文件
-	// （请求里传的档位被纠正/回落时，这两个字段就是证据）。
+	// ModelID / ModelFile 是**实际使用**的档位与权重文件（档位被纠正/回落时就是证据）。
 	ModelID   string `json:"model"`
 	ModelFile string `json:"model_file"`
 	// Chunks 是切了几片（真实进度的分母）。
@@ -943,13 +808,9 @@ type whisperCLIJSON struct {
 	} `json:"transcription"`
 }
 
-// parseWhisperCLIJSON 把 whisper-cli 的 `-oj` 输出解析成"语言 + 分段"。
-//
-// 纯函数（不跑进程、不碰文件系统），所以单测可以喂真实/伪造的 JSON 锁住解析 ——
-// 这条规则错了，"转出的文本是空的"或者"时间戳全 0"就是必然。
-//
-// 时间戳优先用 `offsets.{from,to}`（毫秒整数，最稳），拿不到时才去解析
-// `timestamps.from`（"00:00:01,234" 这种字符串）。
+// parseWhisperCLIJSON 把 whisper-cli 的 `-oj` 输出解析成"语言 + 分段"。纯函数，
+// 单测锁住解析 —— 这条错了"文本是空的/时间戳全 0"就是必然。时间戳优先用
+// offsets.{from,to}（毫秒整数最稳），拿不到才解析 timestamps.from 字符串。
 func parseWhisperCLIJSON(data []byte) ([]STTSegment, string, error) {
 	var raw whisperCLIJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -1010,14 +871,11 @@ func parseSRTTime(s string) int {
 	return ((h*60+m)*60+sec)*1000 + ms
 }
 
-// whisperProgressRe 匹配 whisper-cli 的进度行。
-//
-// 实测形状：`whisper_print_progress_callback: progress =  35%`
-// （= 两边有空格、以百分号结尾）。解析不出来就不报进度 —— 绝不编一个假百分比。
+// whisperProgressRe 匹配 whisper-cli 的进度行，实测形状
+// `whisper_print_progress_callback: progress =  35%`；解析不出来就不报进度，绝不编假百分比。
 var whisperProgressRe = regexp.MustCompile(`progress\s*=\s*([0-9]{1,3})\s*%`)
 
-// parseWhisperProgressLine 从一行 stderr 里抠出进度百分比（0~100）。
-// 第二个返回值表示"这行确实是一条进度行"。
+// parseWhisperProgressLine 从一行 stderr 里抠出进度百分比；第二个返回值表示这行是进度行。
 func parseWhisperProgressLine(line string) (int, bool) {
 	m := whisperProgressRe.FindStringSubmatch(line)
 	if m == nil {
@@ -1030,10 +888,7 @@ func parseWhisperProgressLine(line string) (int, bool) {
 	return n, true
 }
 
-// sttLanguageAliases 把常见的语言写法归一到 whisper 的语言码。
-//
-// 为什么要归一：whisper 只认 en / zh / ja / auto 这类短码；用户在界面上
-// 选的是"中文/英语/日语/自动"，接口调用方可能写 "zh-CN"、"Chinese"。
+// sttLanguageAliases 把常见语言写法归一到 whisper 语言码（en / zh / ja / auto…）；
 // 归一化只有这一处实现，避免"界面能用、curl 不能用"。
 var sttLanguageAliases = map[string]string{
 	"": "auto", "auto": "auto", "自动": "auto", "detect": "auto",
@@ -1049,11 +904,8 @@ var sttLanguageAliases = map[string]string{
 	"yue": "yue", "粤语": "yue",
 }
 
-// NormalizeSTTLanguage 把请求里的语言写法归一成 whisper 语言码。
-//
-// 认不出来的写法**原样小写返回**（whisper 自己会拒绝并报错），
-// 而不是猜一个：猜错语言会让转写结果整段变成另一种文字，比报错糟得多。
-// 显式拒绝空串之外的东西由调用方决定（这里空串 = auto）。
+// NormalizeSTTLanguage 把请求里的语言写法归一成 whisper 语言码。认不出来的
+// **原样小写返回**（whisper 自己会拒绝），绝不猜 —— 猜错会让整段变成另一种文字。
 func NormalizeSTTLanguage(lang string) string {
 	key := strings.ToLower(strings.TrimSpace(lang))
 	if v, ok := sttLanguageAliases[key]; ok {
@@ -1082,17 +934,9 @@ var STTLanguageChoices = []STTLanguageChoice{
 	{Code: "ru", Label: "俄语"},
 }
 
-// Transcribe 把音频转成文字。
-//
-// 流程（每一步的产物都真的落盘，任何一步失败都如实报错）：
-//  1. 探时长（ffprobe）—— 决定切几片；
-//  2. 转码成 16 kHz 单声道 WAV（ffmpeg）；
-//  3. 按 STTChunkSeconds 切片（ffmpeg segment）；
-//  4. 逐片跑 whisper-cli（`-oj` 出 JSON），每片完成后回报进度；
-//  5. 合并分段并把每片的时间戳加上它的偏移。
-//
-// 进度是**真的**：分母是片数，分子是"真的转完了的片数"。
-// 片内进度（whisper 的百分比）只写进日志，不拿它冒充总体进度。
+// Transcribe 把音频转成文字：探时长 → 转码 16 kHz WAV → 切片 → 逐片跑
+// whisper-cli（-oj）→ 合并分段并把每片时间戳加上偏移。任何一步失败都如实报错；
+// 进度是**真的**（分母＝片数），片内百分比只进日志，不冒充总体进度。
 func (e *STTEngine) Transcribe(ctx context.Context, opt STTOptions) (*STTResult, error) {
 	started := e.now()
 	audio := strings.TrimSpace(opt.AudioPath)
@@ -1202,8 +1046,7 @@ func (e *STTEngine) Transcribe(ctx context.Context, opt STTOptions) (*STTResult,
 			s.End += float64(ck.OffsetMS) / 1000
 			allSegs = append(allSegs, s)
 		}
-		// 把这一片结尾的文字当作下一片的 prompt：跨片断句更连贯
-		// （实测不加它时，切点上的词会被截成两半）。
+		// 这一片结尾的文字当作下一片的 prompt（实测不加它时切点上的词会被截成两半）。
 		if len(segs) > 0 {
 			prevTail = tailText(strings.Join(segTexts(segs), " "), 220)
 		}
@@ -1223,8 +1066,7 @@ func (e *STTEngine) Transcribe(ctx context.Context, opt STTOptions) (*STTResult,
 		ElapsedMS:  int(e.now().Sub(started).Milliseconds()),
 	}
 	if res.Text == "" {
-		// 引擎跑通了但没有任何文字：如实说清"是静音/没有可识别语音"，
-		// 而不是返回一个空字符串让调用方猜是成功还是失败。
+		// 引擎跑通但没有任何文字：如实说明"静音/无可识别语音"，不让调用方猜成功还是失败。
 		res.Text = ""
 	}
 	return res, nil
@@ -1280,9 +1122,7 @@ func (e *STTEngine) transcribeChunk(ctx context.Context, ck STTChunk, modelPath,
 	return segs, dlang, nil
 }
 
-// ---------------------------------------------------------------------------
-//  输出格式（纯函数，可单测）
-// ---------------------------------------------------------------------------
+// --- 输出格式（纯函数，可单测）---
 
 // STTFormat 是支持的导出格式（OpenAI 的 response_format 取值）。
 type STTFormat string
@@ -1299,8 +1139,7 @@ const (
 // STTFormats 是界面下拉框的顺序，也是"支持哪些 response_format"的唯一来源。
 var STTFormats = []STTFormat{STTFormatJSON, STTFormatText, STTFormatSRT, STTFormatVTT, STTFormatVerboseJSON}
 
-// ParseSTTFormat 解析请求里的 response_format（含常见别名）。
-// 空串 = 默认 json（OpenAI 的默认值）。
+// ParseSTTFormat 解析 response_format（含常见别名）；空串 = 默认 json。
 func ParseSTTFormat(s string) (STTFormat, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "json":
@@ -1326,11 +1165,9 @@ func STTFormatList() string {
 	return strings.Join(parts, " / ")
 }
 
-// ContentType 返回该格式的 MIME。
-//
-// 必须逐格式给对：`response_format=text` 返回 JSON 的 Content-Type 会让
-// 调用方（尤其是按 Content-Type 分派的客户端）把纯文本当 JSON 解析 → 报错。
-// 这是真机测试里被自家契约测试抓出来的一条（OpenAI 的 text 就是 text/plain）。
+// ContentType 返回该格式的 MIME。必须逐格式给对：`response_format=text`
+// 返回 JSON 的 Content-Type 会让按 Content-Type 分派的客户端解析失败
+// （真机契约测试抓出来的一条；OpenAI 的 text 就是 text/plain）。
 func (f STTFormat) ContentType() string {
 	switch f {
 	case STTFormatText:
@@ -1345,12 +1182,8 @@ func (f STTFormat) ContentType() string {
 	}
 }
 
-// FormatTranscript 把转写结果渲染成请求要的格式。
-//
-// 纯函数：json / text / srt / vtt 四种都由**同一份分段数据**生成，
-// 所以"文本里有、字幕里没有"这类不一致不可能发生。
-// verbose_json 与 json 的差别只在 json 会带上语言与时长（OpenAI 的 json
-// 只保证有 text；面板多给不违反兼容性，但 verbose_json 才是完整契约）。
+// FormatTranscript 把结果渲染成请求要的格式。json / text / srt / vtt 都由
+// **同一份分段数据**生成，"文本里有、字幕里没有"这类不一致不可能发生；纯函数。
 func FormatTranscript(res *STTResult, format STTFormat) (string, error) {
 	if res == nil {
 		return "", fmt.Errorf("%w：转写结果为空", ErrSTTEngineUnavailable)
@@ -1455,9 +1288,7 @@ func splitTime(sec float64) (int, int, int, int) {
 	return h, m, s, ms
 }
 
-// ---------------------------------------------------------------------------
-//  健康快照（真实探活）
-// ---------------------------------------------------------------------------
+// --- 健康快照（真实探活）---
 
 // STTHealth 是 /healthz 的返回体，也是"能力到底通不通"的证据。
 type STTHealth struct {
@@ -1494,11 +1325,8 @@ type STTHealth struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// tinyProbeWAV 生成一段 STTProbeSeconds 长的 16 kHz 单声道静音 WAV。
-//
-// 为什么用静音而不是一段语音：探活只需要回答"模型能加载、推理链路能跑通、
-// 能产出一份合法 JSON"。静音不需要额外的音频素材（面板不引入任何素材文件），
-// 而且 whisper 对静音会给出空分段 —— 恰好证明它真的跑完了整个前向。
+// tinyProbeWAV 生成一段 STTProbeSeconds 长的 16 kHz 单声道静音 WAV：
+// 静音不需要任何素材文件，whisper 对静音给空分段 —— 恰好证明它跑完了整个前向。
 func tinyProbeWAV(seconds float64, sampleRate int) []byte {
 	if seconds <= 0 {
 		seconds = STTProbeSeconds
@@ -1526,11 +1354,9 @@ func tinyProbeWAV(seconds float64, sampleRate int) []byte {
 	return out
 }
 
-// ProbeTranscribe 真的用当前档位跑一次极短音频转写。
-//
-// 返回的 error 是给用户看的原因。这就是"能力探活"：
-// 模型文件在、whisper-cli 在，都不等于"现在能转出字" ——
-// 权重损坏、Metal 初始化失败、磁盘写不进去，都只有真跑一次才知道。
+// ProbeTranscribe 真的用当前档位跑一次极短音频转写，error 是给用户看的原因。
+// 文件在、whisper-cli 在都不等于"现在能转出字"—— 权重损坏、Metal 初始化失败、
+// 磁盘写不进去，只有真跑一次才知道。
 func (e *STTEngine) ProbeTranscribe(ctx context.Context) (bool, string, error) {
 	av := e.Available()
 	if !av.OK {
@@ -1571,16 +1397,9 @@ func (e *STTEngine) ProbeTranscribe(ctx context.Context) (bool, string, error) {
 	return true, note, nil
 }
 
-// Health 真的探一次活并把结论组织成对外契约。
-//
-// 判据贴着能力（AGENTS 第三节），四层全过才 ok：
-//  1. 链路三件套（whisper-cli / ffmpeg / ffprobe）都是可执行文件；
-//  2. 当前档位的**权重文件真的在**（大小与上游一致）；
-//  3. 真的跑一次极短音频转写（ProbeTranscribe）；
-//  4. 上面三步都过 —— 绝不因为"进程活着/端口在听"就给绿灯。
-//
-// 探针结果按 ProbeTTL 缓存，响应里用 probe_cached / probe_age_ms 如实说明，
-// 不把缓存结论伪装成刚刚的实测。
+// Health 真的探一次活并把结论组织成对外契约。四层全过才 ok：链路三件套可执行、
+// 当前档位权重真的在、真的跑一次极短转写，**绝不因为"进程活着/端口在听"就给绿灯**。
+// 探针结果按 ProbeTTL 缓存，响应里用 probe_cached / probe_age_ms 如实说明。
 func (e *STTEngine) Health(ctx context.Context) STTHealth {
 	cur := e.CurrentModel
 	if _, err := FindSTTModel(cur); err != nil {
@@ -1630,11 +1449,8 @@ func (e *STTEngine) Health(ctx context.Context) STTHealth {
 	return h
 }
 
-// cachedProbe 按 TTL 缓存探针结果。
-//
-// 返回 (ok, note, age, cached)。探测失败**不缓存失败**之外的东西：
-// 失败也会被缓存一小会儿，避免健康检查的每次轮询都去重跑一遍注定失败的推理
-// （但缓存期一到就重试，所以"治好之后 20 秒内就会转绿"）。
+// cachedProbe 按 TTL 缓存探针结果，返回 (ok, note, age, cached)。失败也缓存
+// 一小会儿，避免每次轮询都重跑注定失败的推理；缓存期一到就重试（20 秒内转绿）。
 func (e *STTEngine) cachedProbe(ctx context.Context) (bool, string, time.Duration, bool) {
 	ttl := e.probeTTL()
 	e.probeMu.Lock()
@@ -1661,10 +1477,8 @@ func (e *STTEngine) cachedProbe(ctx context.Context) (bool, string, time.Duratio
 	return ok, note, 0, false
 }
 
-// InvalidateHealthProbe 让下一次 /healthz 重新真探一次。
-//
-// 安装器在"刚装完/刚下完模型"之后必须调它：否则 20 秒的缓存会把
-// 装之前那次"模型不在"的结论继续报出来（用户看到"装完了还是红灯"）。
+// InvalidateHealthProbe 让下一次 /healthz 重新真探。安装器在"刚装完/刚下完模型"
+// 之后必须调它，否则缓存会把装之前"模型不在"的结论继续报出来（用户看到装完还红灯）。
 func (e *STTEngine) InvalidateHealthProbe() {
 	e.probeMu.Lock()
 	e.probeAt = time.Time{}

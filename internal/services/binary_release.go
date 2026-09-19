@@ -15,53 +15,11 @@ import (
 	"time"
 )
 
-// ============================================================================
-//  「官方 release 原生二进制」安装器
-//
-//  为什么需要它：AGENTS.md 铁律 8 说"能原生就原生"，原生有两条路 ——
-//  Homebrew formula，或者**官方 darwin-arm64 预编译产物**。后一条路原本不存在，
-//  README「应用市场」第 2 条当时写的是"先走 Docker，等通用安装器做出来再换"。
-//
-//  现在这套安装器服务**四个**条目（见 releaseBinaryApps）：
-//    frpc（frp 客户端）、orbien-client（Orbien CLI 客户端）、ddns-go（动态域名解析）
-//    与 alist（文件列表，2026-09-17 新增 —— 它从未进过 homebrew-core，只能走这条路）。
-//  2026-09-16 用户要求**彻底移除**三个条目：Lucky、Orbien 服务端、frps。
-//  它们已从 releaseBinaryApps 与 catalog.go 中删除；不要再加回来。
-//  这三个的共同点是：官方 release 有 darwin-arm64 产物，且在 macOS 上**不适合 Docker**
-//  （理由见 catalog.go 里各条目的注释：Colima 里跑的是 Linux 虚拟机，容器看到的
-//  是虚拟机的网络，不是 Mac 的 —— 内网穿透这类"贴着网络栈"的工具放进容器就是错的）。
-//
-//  ddns-go 为什么也走这条路（而不是 AGENTS.md 铁律 8 里优先的 brew formula）：
-//  homebrew-core 里**有** ddns-go 这个 formula，但它**没有 service 块**
-//  （2026-09-16 在 Mac mini 上实测：`brew info --json=v2 ddns-go` 的 service 字段是
-//  null，`brew services start ddns-go` 直接报
-//  "has not implemented #plist, #service or provided a locatable service file"）。
-//  也就是说 brew 只能把包装上，**给不出任何 launchd 守护进程** —— 用户会得到一个
-//  "装了但从来没在跑、:9876 也打不开"的面板条目。所以这里改用官方 release 产物，
-//  由通用安装器写系统级 LaunchDaemon（上游 release 里还有 checksums.txt 可核对 sha256）。
-//
-//  安装流程（每个应用只有参数不同）：
-//    建目录 → curl 下载官方 tarball（官方直连失败时退到加速镜像）
-//    → **有官方 sha256 清单就核对**（frp 有；Orbien 上游没有）
-//    → tar 解压（含"一个 tarball 里只挑需要的二进制"）
-//    → **/usr/bin/file 复核二进制确实是 arm64**（不是就报错退出，
-//      这条是"绝不用 Rosetta / 绝不放行 amd64"在运行期的兜底）
-//    → 写配置文件（模板 + 随机凭据）→ 由真实用户拥有
-//    → 写系统级 LaunchDaemon（开机自启、不依赖登录）→ bootstrap
-//    → 等端口真的监听 → 登记进「服务管理」（带健康检查地址）
-//
-//  为什么注册成系统级 LaunchDaemon 而不是用户级 LaunchAgent：
-//  与 IOPaint / Qwen3 TTS / 音色接收端一致 —— Mac mini 无人登录时也要在跑。
-//
-//  为什么还要有加速镜像：本机实测（2026-09）官方 release 地址**可达但很慢** ——
-//  12.9MB 的产物直连花了 293 秒（约 46KB/s，几乎顶到 --max-time 300），
-//  同一份产物经 ghfast.top 只要 21 秒。所以顺序是"官方优先"，慢过头或失败才退镜像。
-//  代价要写清楚：加速镜像（ghfast.top / gh-proxy.com）是**第三方**服务，
-//  它转发的就是我们随后以 root 执行的二进制。frp 有官方 sha256 清单可核对；
-//  Orbien 客户端的 release 里**没有** checksums 文件，只能做架构复核。
-//  不接受的用户可以自己下载产物放进安装目录 —— 所有自动地址都失败时面板会
-//  直接用它（下载先落 .part 再改名，不会覆盖你放好的文件；有清单的条目**仍然会校验**）。
-// ============================================================================
+// 「官方 release 原生二进制」安装器：服务 frpc / orbien-client / ddns-go / alist / filebrowser 五个条目。
+// 不变量：官方地址永远第一，慢或失败才退第三方镜像；有官方 sha256 清单就必须核对；解压后用
+// /usr/bin/file 复核确实是 arm64（绝不放行 amd64、绝不走 Rosetta）；注册为系统级 LaunchDaemon。
+// 实测官方 release 直连约 46KB/s、镜像约 640KB/s；ddns-go 的 brew formula 没有 service 块（给不出 launchd）。
+// Lucky / Orbien 服务端 / frps 已于 2026-09-16 按要求彻底移除，不要再加回来。
 
 // releaseBinaryApp 描述一个用官方 GitHub release 的 darwin-arm64 产物安装的应用。
 type releaseBinaryApp struct {
@@ -79,31 +37,20 @@ type releaseBinaryApp struct {
 	Asset string
 	// Binary 是解压后的可执行文件名
 	Binary string
-	// TarStrip / PickBinary：一个 tarball 里含多个二进制时，只解压需要的那一个。
-	// frp 的 frp_0.71.0_darwin_arm64.tar.gz 里同时有 frps、frpc 与一份上游示例
-	// frps.toml —— 全解压会让安装目录里多出一个用不到的 frpc，还会把上游示例配置
-	// 落在我们生成配置的位置上。TarStrip=1 剥掉 tarball 的顶层目录（frp_0.71.0_darwin_arm64/），
-	// PickBinary 只取 Binary 那一个成员。
+	// TarStrip / PickBinary：tarball 含多个二进制时只解压需要的那一个 —— TarStrip 剥顶层目录，
+	// PickBinary 只取 Binary 成员（frp 包里还有 frps 与上游示例配置，全解压会污染安装目录）。
 	TarStrip   int
 	PickBinary bool
 	// Args 是启动参数，{root} 会被替换成安装根目录
 	Args []string
 	// Port 用于端口存活判断（比 launchd 状态更可信）
 	Port int
-	// UIPort 是网页界面的端口，**只在它不等于 Port 时**填。
-	// frps 的 Port 是协议口 bindPort(7000)，UIPort 是 dashboard(7500)：
-	// 健康检查、服务记录端口与「打开」入口都该用后者。
+	// UIPort 是网页界面端口，**只在不等于 Port 时**填：健康检查、服务记录端口与「打开」入口都用它。
 	UIPort int
 	// HealthPath 交给面板做 HTTP 健康检查（空表示只按端口判断）
 	HealthPath string
-	// BindAddress 是应用**自己真正监听**的地址（"127.0.0.1" / "0.0.0.0"）。
-	//
-	// 为什么必须声明而不是一律猜回环：描述符的 Urls.AdvertisedURL 会据此决定
-	// 广告哪个地址 —— 只绑回环的服务广告成 LAN 地址就是"点了必然打不开的按钮"，
-	// 反过来绑 0.0.0.0 的服务只广告 127.0.0.1 又会让用户以为只能用本机。
-	// 空 = 127.0.0.1（这条轨上 frpc / ddns-go / orbien 都是这个默认：
-	// frpc 的 admin UI 只绑回环；ddns-go 用 -l :9876 绑通配，但它已经在目录里
-	// 显式给了 PreferDirect 的端口直连入口，不受这里的广告地址影响）。
+	// BindAddress 是应用**自己真正监听**的地址（"127.0.0.1" / "0.0.0.0"）：描述符据此决定
+	// 广告哪个地址，猜错就是"点了必然打不开的按钮"。空 = 127.0.0.1。
 	BindAddress string
 	// ConfigFile 是安装目录里的配置文件名（空 = 这个应用没有独立配置文件）。
 	// 面板服务详情里的「📝 编辑配置文件」按它定位（见 catalog.App.ConfigPath）。
@@ -111,28 +58,16 @@ type releaseBinaryApp struct {
 	// ConfigSeed 是首次安装时写入配置文件的模板；{token} / {user} / {password}
 	// 会被替换成随机值（见 ensureReleaseConfig）。空表示由应用专属逻辑生成。
 	ConfigSeed string
-	// PreserveExistingConfig 表示这个应用的配置文件由**应用自己维护**
-	// （ddns-go 的网页界面点"保存"时会整体重写 YAML），面板写进去的 marker 注释
-	// 活不过第一次保存。
-	//
-	// 为什么必须单独标出来：默认规则是"有面板 marker 就保留、否则当上游示例覆盖"，
-	// 对 frpc / orbien 成立（那两个应用的配置只有人会改，marker 一直在）。
-	// 但 ddns-go 保存一次后 marker 就没了，重装时会被当成"上游示例"覆盖 ——
-	// 那等于把用户填好的 DNS 服务商密钥与域名直接冲掉。所以这类应用改成
-	// "文件存在就一律保留"（判据见 ensureReleaseConfig）。
+	// PreserveExistingConfig：配置由**应用自己维护**（ddns-go 保存时整体重写 YAML，面板 marker
+	// 活不过第一次保存）。默认规则"有 marker 就保留"对它失效，重装会把用户填好的 DNS 密钥与
+	// 域名直接冲掉，所以这类应用改成"文件存在就一律保留"（判据见 ensureReleaseConfig）。
 	PreserveExistingConfig bool
-	// ChecksumAsset 是上游提供的 SHA-256 清单文件名（空 = 上游不提供，无法校验）。
-	// frp 是这套安装器里唯一提供校验清单的上游；Lucky / Orbien 的 release 里没有，
-	// 那它们就只能靠 file(1) 的架构复核（见 README 的如实说明）。
+	// ChecksumAsset 是上游提供的 SHA-256 清单文件名（空 = 上游不提供，只能靠 file(1)
+	// 架构复核，README 里已如实说明）。
 	ChecksumAsset string
-	// CheckPortConflict 表示安装前要**主动**检查端口有没有被别的进程占用。
-	//
-	// 为什么必须有这一条（filebrowser 加的，2026-09-19）：这条轨的就绪判定是
-	// "端口在监听"（Probe=ProbePort）。如果端口正好被**别人**占着，assertReady 会把
-	// "别人的端口在听"当成"我们装好了"，任务报成功而 filebrowser 其实没起来 ——
-	// 这正是 AGENTS 第三节说的"谎报成功"。所以对端口语义强的应用，宁可安装前就问一次：
-	// 端口被非本应用的服务占着 → 立刻如实失败并点名占用者。
-	// 已被本应用自己的服务记录占用不算冲突（那是"已安装"，前面的幂等门禁已经处理）。
+	// CheckPortConflict：安装前**主动**查端口占用。就绪判定是"端口在监听"，被**别人**占着
+	// 会让 assertReady 把"别人的端口在听"当成"我们装好了"（谎报成功），所以宁可提前如实失败
+	// 并点名占用者。已被本应用自己的服务记录占用不算冲突（前面的幂等门禁已处理）。
 	CheckPortConflict bool
 	// Notes 是安装结果里要额外告诉用户的话
 	Notes []string
@@ -154,21 +89,17 @@ const (
 	releaseBinaryReadyTimeout = 60 * time.Second
 )
 
-// gitHubReleaseMirrors 是 GitHub release 的加速前缀（拼接在完整官方 URL 前面）。
-//
-// 顺序即优先级：官方地址永远排第一，镜像只在它失败或慢到被 --max-time 掐断时用。
-// 实测（2026-09）：官方地址可达但约 46KB/s，镜像约 640KB/s —— 所以退路是必要的，
-// 但不能反过来把第三方放在前面。
+// gitHubReleaseMirrors 是 GitHub release 的加速前缀（拼在完整官方 URL 前面）。
+// 顺序即优先级：官方永远第一，仅在失败或被 --max-time 掐断时退镜像（实测 2026-09：
+// 官方约 46KB/s、镜像约 640KB/s）—— 不能反过来把第三方放在前面。
 var gitHubReleaseMirrors = []string{
 	"https://ghfast.top/",
 	"https://gh-proxy.com/",
 }
 
 // orderBySpeed 按实测速度把候选地址从快到慢排序（速度 <=0 的排最后，保持原相对顺序）。
-//
-// 为什么要先探测：中国大陆无代理时 GitHub Release **完全不通**（实测 20 秒 0 字节），
-// 而官方地址排第一 + `--max-time 150` 意味着每个应用都先白等 150 秒。
-// 探测一次只要几秒，之后直接下最快的那个 —— 有代理/直连快的用户也不会被拖慢。
+// 为什么要先探测：无代理时 GitHub Release 可能完全不通（实测 20 秒 0 字节），
+// 官方排第一 + `--max-time 150` 会让每个应用先白等 150 秒。
 func orderBySpeed(urls []string, speeds []int64) []string {
 	type item struct {
 		url   string
@@ -201,21 +132,16 @@ func orderBySpeed(urls []string, speeds []int64) []string {
 }
 
 // releaseBinaryApps 是被本安装器服务的应用表。
-//
-// 判定顺序（README「应用市场」第 2 条）：官方 release 有 darwin_arm64 产物、
-// 且**没有** brew formula。
-// 这里只放"一项能力服务多个应用"的通用参数，不为单个应用发明专属流程。
+// 判定顺序（README「应用市场」第 2 条）：官方 release 有 darwin_arm64 产物、且没有 brew formula。
+// 只放通用参数，不为单个应用发明专属流程。
 var releaseBinaryApps = map[string]releaseBinaryApp{
-	// 2026-09-16 用户要求彻底移除 Lucky / Orbien 服务端 / frps 三个条目，
-	// 只保留两个客户端。它们的配置与安装目录**不再由面板管理**；
-	// 想把某个条目加回来时注意：市场的安装入口按 IsReleaseBinaryApp(id) 分流，
-	// 注册表与 catalog.go 必须同时有，否则会出现"条目是 compose、
-	// 实际却走 release 安装器去 GitHub 下 darwin 二进制"这种隐蔽错配。
+	// 2026-09-16 按要求彻底移除 Lucky / Orbien 服务端 / frps，不要再加回来。
+	// 加回条目时注意：市场安装入口按 IsReleaseBinaryApp(id) 分流，releaseBinaryApps 与
+	// catalog.go 必须同时有，否则会出现"条目是 compose、实际却走 release 安装器"的隐蔽错配。
 	"frpc": {
 		ID: "frpc", Label: frpcLabel, Name: "frp 客户端 (frpc)", Icon: "🧷",
 		Category: "tool", RootDir: "frpc",
-		// 与 frps **同一个**上游 tarball（里面 frps / frpc 各一个二进制），只挑 frpc 那一个成员。
-		// 面板不提供 frps，但用官方包解出的客户端版本自然与主流服务端一致。
+		// 与 frps 同一个上游 tarball（内含 frps/frpc），只挑 frpc 那一个成员。
 		Repo: "fatedier/frp", Tag: "v0.71.0", Asset: "frp_0.71.0_darwin_arm64.tar.gz",
 		Binary:   "frpc",
 		TarStrip: 1, PickBinary: true,
@@ -235,16 +161,13 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	"orbien-client": {
 		ID: "orbien-client", Label: orbienClientLabel, Name: "Orbien 客户端 (orbien)", Icon: "🛰️",
 		Category: "tool", RootDir: "orbien-client",
-		// arm64 证据：v3.6.0 的资产里有 orbien_3.6.0_darwin_arm64.tar.gz（2,104,350 B）；
-		// 实测解压出的 orbien 用 file 报 Mach-O arm64、`orbien --help` 输出 "orbien client"。
-		// 上游**没有** checksums 文件，所以只能靠 file(1) 复核（如实说明）。
+		// arm64 证据：v3.6.0 资产有 orbien_3.6.0_darwin_arm64.tar.gz（2,104,350 B）；实测解压后
+		// file 报 Mach-O arm64、--help 输出 "orbien client"；上游**没有** checksums，只能靠 file(1)。
 		Repo: "orbien-org/orbien", Tag: "v3.6.0", Asset: "orbien_3.6.0_darwin_arm64.tar.gz",
 		Binary: "orbien",
-		// tarball 里只有 orbien 一个二进制（外加一份上游示例 orbien.toml），整体解压即可；
-		// 示例配置会被面板生成的配置按 marker 覆盖（同 orbien 服务端）。
+		// tarball 里只有 orbien 一个二进制（外加上游示例 orbien.toml）；示例配置会被 marker 覆盖。
 		Args: []string{"-c", "{root}/orbien.toml"},
-		// 客户端不监听端口（纯出站连接），所以没有端口/健康检查；
-		// 是否在跑只看 launchd。
+		// 客户端不监听端口（纯出站连接），没有端口/健康检查；是否在跑只看 launchd。
 		Port:       0,
 		ConfigFile: "orbien.toml",
 		ConfigSeed: orbienClientConfigSeed,
@@ -257,30 +180,24 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	"ddns-go": {
 		ID: "ddns-go", Label: "com.zizdog.ddns-go", Name: "DDNS-Go（动态域名解析）", Icon: "🌐",
 		Category: "tool", RootDir: "ddns-go",
-		// arm64 证据：v6.17.7 的资产里有 ddns-go_6.17.7_darwin_arm64.tar.gz（4,386,545 B，
-		// sha256 9dac9d82…），tarball 内是平级的 ddns-go / README.md / README_EN.md / LICENSE
-		// （2026-09-16 实下核对过目录结构），file(1) 报 Mach-O 64-bit executable arm64。
+		// arm64 证据：v6.17.7 资产 ddns-go_6.17.7_darwin_arm64.tar.gz（4,386,545 B，sha256 9dac9d82…）；
+		// 2026-09-16 实下核对：tarball 内 4 个成员平级，file(1) 报 Mach-O 64-bit executable arm64。
 		Repo: "jeessy2/ddns-go", Tag: "v6.17.7", Asset: "ddns-go_6.17.7_darwin_arm64.tar.gz",
 		Binary: "ddns-go",
-		// tarball **没有**顶层目录（4 个成员平级），所以 TarStrip=0；
-		// PickBinary 只解压 ddns-go 那一个，不把 README / LICENSE 摊进安装目录。
+		// tarball **没有**顶层目录（4 个成员平级）→ TarStrip=0；PickBinary 只解压 ddns-go 那一个。
 		TarStrip: 0, PickBinary: true,
-		// -c 写死到安装目录：ddns-go 的默认值是 $HOME/.ddns_go_config.yaml ——
-		// 那会把它的配置散落在用户家目录根下，面板的「📝 编辑配置文件」也就定位不到
-		// （面板按 <home>/<RootDir>/<ConfigFile> 解析）。
-		// -l 显式写 :9876：上游默认也是它，但写出来才不会因为上游改默认而静默失联。
+		// -c 写死到安装目录：上游默认 $HOME/.ddns_go_config.yaml 会把配置散在家目录根下，
+		// 「📝 编辑配置文件」也定位不到；-l :9876 写出来才不会因上游改默认而静默失联。
 		Args: []string{"-c", "{root}/ddns-go.yaml", "-l", ":9876"},
-		// 9876 是它的网页界面端口，也是它唯一监听的端口。
-		// HealthPath 用 "/"：实测未登录时 GET / 返回 307 → /login，
-		// 而面板的健康判定把 2xx/3xx 都算健康（见 health.go），能稳定反映"服务活着"。
+		// 9876 是它唯一的监听端口；HealthPath "/"：实测未登录 GET / 返回 307 → /login，
+		// 面板健康判定把 2xx/3xx 都算健康（见 health.go），能稳定反映"服务活着"。
 		Port: 9876, HealthPath: "/",
 		ConfigFile: "ddns-go.yaml",
 		ConfigSeed: ddnsGoConfigSeed,
-		// ddns-go 的网页界面保存时会整体重写 YAML，面板 marker 会被抹掉 ——
-		// 所以判据必须是"文件存在就保留"，否则重装会冲掉用户的 DNS 密钥（见字段注释）。
+		// 网页界面保存会整体重写 YAML（marker 被抹掉）→ 判据必须是"文件存在就保留"，
+		// 否则重装会冲掉用户的 DNS 密钥（见字段注释）。
 		PreserveExistingConfig: true,
-		// 上游 release 里有 checksums.txt，且其中一行就是这份 darwin_arm64 产物 ——
-		// 有清单就必须核对（回落到第三方加速镜像时这是唯一的内容校验）。
+		// 上游有 checksums.txt 且含这份产物 —— 有清单就必须核对（回落第三方镜像时它是唯一内容校验）。
 		ChecksumAsset: "checksums.txt",
 		Notes: []string{
 			"ddns-go.yaml 已生成：现在只是一份带说明的骨架，首次配置在它自己的网页界面里做。",
@@ -293,35 +210,25 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	"alist": {
 		ID: "alist", Label: "com.zizdog.alist", Name: "Alist（文件列表）", Icon: "📂",
 		Category: "tool", RootDir: "alist",
-		// 为什么走 release 产物而不是 brew：**alist 从未进过 homebrew-core**。
-		// 2026-09-17 逐条核对过：`brew info alist` → "No available formula"；
-		// formulae.brew.sh/api/formula/alist.json → 404；homebrew-core 的提交历史里
-		// 与 alist 相关的提交是**空数组**（不是"被删掉了"）。唯一的三方 tap 停在
-		// 2024-01 且已死。上游 AlistGo/alist 仍在更新（v3.64.0，2026-09-03）。
-		// arm64 证据：v3.64.0 资产里有 alist-darwin-arm64.tar.gz（43,021,495 B）；
-		// 2026-09-17 实下核对：tarball 内**只有平级的 alist 一个成员**（无顶层目录），
-		// file(1) 报 Mach-O 64-bit executable arm64，`alist --help` 输出正常。
+		// 走 release 而非 brew：alist **从未进过 homebrew-core**（2026-09-17 实测：brew info 无
+		// formula、API 404、提交历史空数组；唯一三方 tap 2024-01 已死）。arm64 证据：v3.64.0 的
+		// alist-darwin-arm64.tar.gz（43,021,495 B），tar 内平级单成员、file(1) 报 Mach-O arm64。
 		Repo: "AlistGo/alist", Tag: "v3.64.0", Asset: "alist-darwin-arm64.tar.gz",
 		Binary: "alist",
-		// tarball 只有 alist 一个成员且平级 → TarStrip=0；PickBinary 仍然开着，
-		// 上游以后若在包里加 README/LICENSE 也不会摊进安装目录。
+		// tarball 只有 alist 一个平级成员 → TarStrip=0；PickBinary 开着，以后加了 README 也不会摊进来。
 		TarStrip: 0, PickBinary: true,
-		// --data 写死到安装目录下的 data/：不写的话 Alist 会在**当前工作目录**
-		// 下建 data/（launchd 的 WorkingDirectory 不是我们想要的），
-		// 面板的「📝 编辑配置文件」也会定位不到。
+		// --data 写死到安装目录下 data/：不写会在**当前工作目录**下建 data/
+		// （launchd 的 WorkingDirectory 不是我们想要的），「📝 编辑配置文件」也会定位不到。
 		Args: []string{"server", "--data", "{root}/data"},
 		Port: 5244, HealthPath: "/",
-		// Alist 默认监听 0.0.0.0:5244（实测：日志 "start HTTP server @ 0.0.0.0:5244"），
-		// 所以广告地址必须是 LAN 地址 —— 否则用户看到 127.0.0.1:5244 会以为
-		// 只能本机用（见 releaseBinaryApp.BindAddress 的注释）。
+		// Alist 默认监听 0.0.0.0:5244（实测日志 "start HTTP server @ 0.0.0.0:5244"），
+		// 广告地址必须是 LAN 地址，否则用户看到 127.0.0.1:5244 会以为只能本机用。
 		BindAddress: "0.0.0.0",
-		// Alist 自己在首次启动时创建 data/config.json（并写入 jwt_secret 等）。
-		// 面板**不**写这个文件（ConfigSeed 为空），只是告诉面板它在哪里，
-		// 让服务详情里的「📝 编辑配置文件」能定位到它。
+		// Alist 首次启动自己创建 data/config.json（并写入 jwt_secret 等）；面板**不**写它，
+		// 只登记位置好让「📝 编辑配置文件」能定位（ConfigSeed 为空）。
 		ConfigFile: "data/config.json",
-		// 上游 release **只有 md5.txt，没有 sha256 清单**，所以 ChecksumAsset 留空：
-		// 这条轨在 ChecksumAsset 为空时的行为是"如实说明只做了架构复核 + md5 互证"，
-		// 而不是假装校验过 sha256（见 tarballDescriptor 里的 else 分支）。
+		// 上游**只有 md5.txt、没有 sha256 清单** → ChecksumAsset 留空：这条轨此时如实说明
+		// "只做了架构复核 + md5 互证"，而不是假装校验过 sha256（见 tarballDescriptor else 分支）。
 		Notes: []string{
 			"安装目录：~/alist（二进制、data/、日志都在这里）。",
 			"初始管理员口令由 Alist 首次启动时随机生成 —— 面板已从启动日志里抓出来放在上面的凭据区块里；" +
@@ -333,25 +240,16 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	"filebrowser": {
 		ID: "filebrowser", Label: "com.zizdog.filebrowser", Name: "File Browser（网页文件管理）", Icon: "🗂️",
 		Category: "tool", RootDir: "filebrowser",
-		// 为什么走 release 产物而不是 brew：homebrew/core 的 filebrowser **没有 service 定义**
-		// （与 ddns-go 同因）—— 通用 brew 路径会留下"装了但永远起不来"的假服务记录。
-		// arm64 证据：v2.63.23 资产 darwin-arm64-filebrowser.tar.gz（15,258,752 B）。
-		// 2026-09-19 本机实测：解压出的 filebrowser 用 file(1) 报 Mach-O 64-bit executable arm64、
-		// `filebrowser version` 输出 "File Browser v2.63.23"；/health 返回 200、`-b /filebrowser` 下
-		// `/filebrowser/` 返回 200。
+		// 走 release 而非 brew：homebrew/core 的 filebrowser **没有 service 定义**（与 ddns-go 同因），
+		// 通用 brew 路径会留下"装了但永远起不来"的假服务记录。arm64 证据：v2.63.23 的
+		// darwin-arm64-filebrowser.tar.gz（15,258,752 B）；2026-09-19 本机实测 file(1) 报 Mach-O arm64。
 		Repo: "filebrowser/filebrowser", Tag: "v2.63.23", Asset: "darwin-arm64-filebrowser.tar.gz",
 		Binary: "filebrowser",
-		// tarball 里是 CHANGELOG.md / LICENSE / README.md / filebrowser 四个**平级**成员
-		// （无顶层目录）→ TarStrip=0；PickBinary 只取 filebrowser 那一个。
+		// tarball 里 4 个**平级**成员（无顶层目录）→ TarStrip=0；PickBinary 只取 filebrowser 那一个。
 		TarStrip: 0, PickBinary: true,
-		// -b /filebrowser 与目录里的 AppUI.SelfBase 一致（应用自己带前缀，面板不改写路径）。
-		// -a 127.0.0.1：**只绑回环**，只经面板 /filebrowser/ 别名 + 面板会话访问，
-		// 不直接开到局域网/公网（家目录里有 .ssh / 凭据，暴露面必须收住）。
-		// -r 指到**真实用户的家目录**（用户 2026-09-19 明确要求管理整个用户目录）：
-		// File Browser 是"单实例一个 root"（-r/--root 决定唯一根），旧 Docker 版能同时显示
-		// /srv/下载、/srv/文档 是因为把多个宿主目录挂到同一个父目录 /srv 下，不是它支持多 root。
-		// -d 指到**面板工作目录**（{vardir}，家目录之外）：数据库里存着用户/权限/设置，
-		// 放在家目录里会被 filebrowser 自己列出来，也更容易被误改。
+		// -b /filebrowser 与 AppUI.SelfBase 一致；-a 127.0.0.1 **只绑回环**（家目录有 .ssh/
+		// 凭据，暴露面必须收住）；-r 指**真实用户家目录**（用户 2026-09-19 要求管理整个目录）；
+		// -d 指面板工作目录 {vardir}（数据库放家目录会被自己列出来、也更容易被误改）。
 		Args: []string{"-b", "/filebrowser", "-a", "127.0.0.1", "-p", "8081",
 			"-r", "{home}", "-d", "{vardir}/filebrowser/filebrowser.db"},
 		Port: 8081, HealthPath: "/health",
@@ -369,24 +267,15 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	},
 }
 
-// frpsConfigSeed / orbienServerConfigSeed 是面板生成配置文件的模板。
-//
-// 占位符（替换逻辑见 generateConfigSecrets / expandConfigSeed）：
-//
-//	{token}    —— 随机 32 位十六进制，用于 auth.token
-//	{user}     —— 随机用户名（模板里出现才生成随机值，否则用 admin）
-//	{password} —— 随机 16 位十六进制口令
-//
-// 为什么不写成"每应用一个生成函数"：两个应用只有字段名与端口不同，
-// 模板 + 占位符既省一份重复逻辑，也让人一眼看清写进磁盘的到底是什么。
+// panelConfigMarker 是"面板生成配置"的标记（重装时据此决定保留还是覆盖）。
+// 模板占位符：{token} 随机 32 位 hex、{user} 随机用户名（模板里不出现则 admin）、
+// {password} 随机 16 位 hex（替换逻辑见 generateConfigSecrets / expandConfigSeed）。
 const (
 	panelConfigMarker = "由 ZizPanel 生成"
 )
 
-// frpcConfigSeed 是 frpc（客户端）的 frpc.toml 模板。
-//
-// 面板**不再提供 frps 服务端**（2026-09-16 用户要求移除），所以这里的
-// serverAddr/serverPort 是占位值：请改成你自己的 frps 地址与端口。
+// frpcConfigSeed 是 frpc.toml 模板；面板**不再提供 frps 服务端**（2026-09-16 按要求移除），
+// serverAddr/serverPort 是占位值，请改成你自己的 frps 地址与端口。
 const frpcConfigSeed = `# ` + panelConfigMarker + `。改完在「服务管理 → frp 客户端」里重启服务生效，
 # 也可以直接在服务详情里点「📝 编辑配置文件」修改本文件。
 #
@@ -425,10 +314,8 @@ webServer.password = "{password}"
 # remotePort = 6000
 `
 
-// orbienClientConfigSeed 是 orbien（CLI 客户端）的 orbien.toml 模板。
-//
-// 面板**不再提供 Orbien 服务端**（2026-09-16 用户要求移除），所以这里的 server
-// 是占位值：请改成你自己的 Orbien 服务端地址。客户端没有 Web 界面。
+// orbienClientConfigSeed 是 orbien.toml 模板；面板**不再提供 Orbien 服务端**
+// （2026-09-16 按要求移除），server 是占位值：请改成你自己的服务端地址。客户端没有 Web 界面。
 const orbienClientConfigSeed = `# ` + panelConfigMarker + `。改完在「服务管理 → Orbien 客户端」里重启服务生效，
 # 也可以直接在服务详情里点「📝 编辑配置文件」修改本文件。
 # ⚠️ Orbien 服务端地址：面板不再提供服务端，请改成你自己的 <IP>:9527。
@@ -446,17 +333,9 @@ server = "127.0.0.1:9527"
 # remotePort = 9000
 `
 
-// ddnsGoConfigSeed 是 ddns-go 的配置骨架。
-//
-// 为什么只写注释、不预填 DNS 字段：ddns-go 的完整配置（服务商 ID/Secret、域名、
-// webhook、登录口令哈希）是它自己的网页界面在"保存"时生成的，面板凭空拼一份
-// 完整 YAML 反而容易拼错字段名；而**只有注释**的 YAML 是合法的 ——
-// yaml.Unmarshal 得到全零 Config，ddns-go 照常起来（真机实测：正常监听 :9876，
-// GET / 307 跳 /login），随后第一次保存会把它覆写成完整配置。
-//
-// 为什么必须让这个文件先存在：服务详情里的「📝 编辑配置文件」按
-// <home>/ddns-go/ddns-go.yaml 定位，文件不存在时点开就是一个"读文件失败"。
-// 用户第一次打开面板就能看到这份说明，而不是先去网页配置一轮才发现按钮点不开。
+// ddnsGoConfigSeed 是 ddns-go 的配置骨架。**只有注释**的 YAML 合法（yaml.Unmarshal 得到全零
+// Config，ddns-go 照常起来，实测正常监听 :9876、GET / 307 跳 /login），首次保存会覆写成完整配置。
+// 文件必须先存在，否则「📝 编辑配置文件」点开就是一个"读文件失败"。
 const ddnsGoConfigSeed = `# ` + panelConfigMarker + `（ddns-go 配置骨架）。改完在
 # 「服务管理 → DDNS-Go」里点「🔄 重启服务」生效，也可以直接点「📝 编辑配置文件」修改本文件。
 #
@@ -493,11 +372,8 @@ func (a releaseBinaryApp) downloadURLs() []string {
 	return urls
 }
 
-// binaryReleasePaths 是这套安装器用到的全部路径。
-//
-// 它现在是**从描述符推导**出来的（见 binaryReleasePathsFor），不是另一份独立的
-// 路径计算 —— 两份路径计算漂移正是"编辑配置文件按钮指向一个不存在的文件"
-// 这类问题的根因。
+// binaryReleasePaths 是这套安装器用到的全部路径，**从描述符推导**（见 binaryReleasePathsFor）——
+// 两份路径计算漂移正是"编辑配置文件按钮指向一个不存在的文件"这类问题的根因。
 type binaryReleasePaths struct {
 	Root   string
 	Binary string
@@ -527,13 +403,12 @@ func (m *Manager) binaryReleasePathsFor(d AppDescriptor) binaryReleasePaths {
 	return p
 }
 
-// binaryReleasePaths（老签名，按参数表查）内部改用描述符。
+// binaryReleasePaths（老签名，按参数表查）内部改用描述符；描述符没注册时退回按参数表算 ——
+// 宁可给出一条正确路径，也不要在这里 panic 掉整个面板。
 func (m *Manager) binaryReleasePaths(a releaseBinaryApp) binaryReleasePaths {
 	if d, ok := FindDescriptor(a.ID); ok {
 		return m.binaryReleasePathsFor(d)
 	}
-	// 描述符没注册（理论上不会发生）时退回按参数表算：宁可给出一条正确路径，
-	// 也不要在这里 panic 掉整个面板。
 	root := filepath.Join(m.opt.UserHome, a.RootDir)
 	p := binaryReleasePaths{
 		Root:   root,
@@ -559,41 +434,21 @@ func descriptorRoot(userHome string, d AppDescriptor) string {
 }
 
 // InstallReleaseBinary 部署一个"官方 release 原生二进制"应用并注册为系统级服务。
-//
-// 2026-09-17 模块化改造：这个函数**已经不再自己实现流程**，它是一层兼容壳 ——
-//
-//	· 参数表（releaseBinaryApps）与流程（steps DSL）都在描述符里
-//	  （见 descriptor.go / steps.go / tarball_descriptor.go）；
-//	· 这里的全部工作是"做前置校验 → 装配执行器 → 执行步骤"。
-//
-// 为什么要保留这个函数名：internal/web 的 install 分流、uninstall_app.go 的
-// 卸载分流、以及一批单测都按它接线；对外契约（202 + task_id + SSE + 进度）
-// 一个字都不能变（用户明确要求）。改的只是"实现放在哪"。
+// 2026-09-17 模块化后它只是一层兼容壳：参数表与 steps DSL 都在描述符里，这里做前置校验 →
+// 装配执行器 → 执行步骤；对外契约（202 + task_id + SSE + 进度）一个字都不能变。
 func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *InstallResult) error {
 	d, ok := FindDescriptor(id)
 	if !ok || d.Rail != RailTarball {
 		return fmt.Errorf("没有 %s 的原生二进制安装器", id)
 	}
-	// 幂等门禁（与 brew / compose 同一份判定，见 install_idempotent.go）：
-	// 已经装过的 tarball 应用再点一次「安装」，必须直接短路成"已装跳过"，
-	// **不执行任何安装命令** —— 否则会重跑下载/解包/bootout/bootstrap，
-	// 既慢又会重启用户正在用的隧道服务（真机 frpc / ddns-go 复现）。
-	//
-	// 位置刻意放在 root / 用户校验**之前**：跳过是纯读判定（面板注册表 +
-	// launchd plist），不需要 root；已经装好的机器上再点一次不该被权限校验挡住。
-	// 判定只看真实注册证据（记录 / plist），不看磁盘产物，所以"卸载（保留数据）
-	// 后重装"不会被误跳过；真冲突（记录属于别的应用、plist 标签对不上）时
-	// 这里返回 false，继续走下面的正常安装，由 registerAppService 如实报错。
+	// 幂等门禁（与 brew / compose 同一份判定）：装过的再点安装必须直接短路成"已装跳过"，
+	// **不执行任何安装命令** —— 否则会重跑下载/解包并重启用户正在用的隧道服务（真机 frpc/ddns-go 复现）。
+	// 位置刻意在 root/用户校验**之前**；判定只看真实注册证据（记录/plist），不看磁盘产物。
 	if app, found := FindApp(id); found {
 		if res, done := m.installedSkipResult(ctx, app); done {
-			// "装过"不等于"现在是好的"：tarball 轨的**登记发生在验收之前**
-			// （见 tarballInstallSteps 的顺序说明），所以一次失败的安装同样会留下
-			// 记录与 plist —— 只凭它们判定，就会把"再点一次安装"永远挡在门外。
-			// 2026-09-17 mini 真机的 Alist 就是这样：plist 参数写错、端口从未监听，
-			// 而市场永远显示"已安装"，用户没有任何恢复入口。
-			//
-			// 所以这里补一条**真实存活**判据：端口真的在监听才跳过。
-			// 没有端口可查的应用（orbien 客户端是纯出站连接）保持原判据不变。
+			// "装过"不等于"现在是好的"：tarball 轨的登记发生在验收**之前**，失败的安装同样会
+			// 留下记录与 plist（2026-09-17 真机 Alist：端口从未监听，市场却永远显示已安装）。所以
+			// 补一条**真实存活**判据：端口真的在监听才跳过；无端口可查的应用保持原判据不变。
 			if app.Port <= 0 || m.portHasListener(app.Port) {
 				adoptInstallResult(result, res)
 				return nil
@@ -612,9 +467,8 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	if m.opt.UserName == "" || m.opt.UserHome == "" {
 		return fmt.Errorf("无法确定运行该服务的真实用户与家目录")
 	}
-	// 端口占用检查（只对显式声明 CheckPortConflict 的应用，见该字段注释）。
-	// 端口被**别人**占着时提前失败，而不是让 assertReady 把"别人的端口在听"
-	// 当成"我们装好了"（那是最危险的一种谎报成功）。
+	// 端口占用检查（只对显式声明 CheckPortConflict 的应用）：被**别人**占着时提前失败，
+	// 而不是让 assertReady 把"别人的端口在听"当成"我们装好了"（最危险的一种谎报成功）。
 	if spec, ok := releaseBinaryApps[d.ID]; ok && spec.CheckPortConflict && spec.Port > 0 {
 		if info, err := m.checkPort(spec.Port); err == nil && info.InUse {
 			var self []string
@@ -630,8 +484,8 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 			}
 		}
 	}
-	// filebrowser 的数据库放在面板工作目录（家目录之外，见 Args 注释）：
-	// 先建目录并把归属交给真实用户（服务以该用户身份运行，要能写 Bolt 库）。
+	// filebrowser 的数据库放面板工作目录（家目录之外）：先建目录并把归属交给真实用户
+	// （服务以该用户身份运行，要能写 Bolt 库）。
 	if d.ID == "filebrowser" {
 		if err := m.prepareFilebrowserDataDir(); err != nil {
 			return err
@@ -640,10 +494,9 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	if err := m.OrchestrateTarballInstall(ctx, d, result); err != nil {
 		return err
 	}
-	// Alist 的初始管理员口令是**它自己**在首次启动时随机生成、并打进启动日志的
-	// （上游没有"由外部指定初始口令"的参数；`alist admin set` 需要把口令放进 argv，
-	// 而本项目有过 argv 泄漏真凭据的事故，不采用）。所以只能在安装完成后从日志里抓，
-	// 抓不到就如实说明、绝不编造口令。
+	// Alist 的初始口令由**它自己**首次启动时随机生成并打进日志（上游没有"由外部指定初始口令"
+	// 的参数，`alist admin set` 要把口令放进 argv，本项目有过 argv 泄漏真凭据的事故，不采用）；
+	// 只能在安装完成后从日志里抓，抓不到就如实说明、绝不编造口令。
 	if d.ID == "alist" {
 		m.appendAlistInitialPassword(d, result)
 	}
@@ -655,21 +508,13 @@ func (m *Manager) InstallReleaseBinary(ctx context.Context, id string, result *I
 	return nil
 }
 
-// alistInitialPasswordRe 匹配 Alist 首次启动时的那行日志。
-//
-// 上游原文（v3.64.0 实测）：Successfully created the admin user and the initial password is: b1bvB58Z
-// 注意这行是 logrus 的 `msg="…"` 字段，口令后面紧跟一个引号 —— 所以字符集
-// 严格限定为字母数字（Alist 生成的就是 [A-Za-z0-9]{8}），否则会把引号一起抓进来。
+// alistInitialPasswordRe 匹配 Alist 首次启动时的那行日志（v3.64.0 实测：上游是 logrus 的
+// msg 字段，口令后紧跟一个引号 → 字符集严格限定 [A-Za-z0-9]，否则会把引号一起抓进来）。
 var alistInitialPasswordRe = regexp.MustCompile(`initial password is:\s*([A-Za-z0-9]+)`)
 
 // appendAlistInitialPassword 把 Alist 日志里的初始口令搬进安装结果的**凭据区**。
-//
-// 为什么值得单写一段：Alist 装好之后用户第一件事就是登录，而初始口令只出现
-// 在服务日志里 —— 让用户自己去翻 launchd 日志才算"装好了但用不了"。
-//
-// 口令**只进 InstallResult.Credentials**（面板 UI 的凭据区），不进任务步骤文本：
-// 步骤会进任务日志 / SSE / 审计，口令出现在那里等于多一份长期留存。
-// 这里只读日志、不写任何东西；日志里没有那行时明说"没抓到"，绝不编造。
+// 口令**只进 InstallResult.Credentials**，不进任务步骤文本：步骤会进任务日志 / SSE / 审计，
+// 口令出现在那里等于多一份长期留存。这里只读日志、不写任何东西；日志里没有那行就明说"没抓到"。
 func (m *Manager) appendAlistInitialPassword(d AppDescriptor, result *InstallResult) {
 	if result == nil {
 		return
@@ -712,31 +557,20 @@ func (m *Manager) appendAlistInitialPassword(d AppDescriptor, result *InstallRes
 	}
 }
 
-// filebrowserInitialCredRe 匹配 File Browser 首次 quick setup 打的那行日志。
-//
-// 上游真实格式（直接取自 v2.63.23 二进制的格式串 `User '%s' initialized with
-// randomly generated password: %s`；本机实测输出：
-//
-//	2026/09/19 14:58:06 User 'admin' initialized with randomly generated password: OMh0r3E_RmVzNFrx
-//
-// ）—— 用户名与口令**都在这一行里**，所以两个都抓，绝不把 admin 写死当默认。
-// 口令字符集含大小写字母、数字与下划线，所以用 \S+ 而不是只认字母数字。
+// filebrowserInitialCredRe 匹配 File Browser 首次 quick setup 打的那行日志（实测输出：
+// "User 'admin' initialized with randomly generated password: OMh0r3E_RmVzNFrx"）—— 用户名与
+// 口令**都在这一行里**，两个都抓，绝不把 admin 写死当默认；口令含下划线，用 \S+ 而非只认字母数字。
 var filebrowserInitialCredRe = regexp.MustCompile(
 	`User '([^']+)' initialized with randomly generated password:\s*(\S+)`)
 
-// filebrowserPasswordOnlyRe 是防御性的兜底：万一上游换成只打口令、不打用户名
-// 的格式（早期/后续版本的另一种写法），也把口令抓出来，但**不编用户名**。
+// filebrowserPasswordOnlyRe 是防御性兜底：上游若换成只打口令、不打用户名的格式也把口令
+// 抓出来，但**不编用户名**。
 var filebrowserPasswordOnlyRe = regexp.MustCompile(
 	`(?i)(?:random(?:ly)? generated )password[:\s]+([A-Za-z0-9_\-]{6,})`)
 
 // appendFilebrowserInitialPassword 把 File Browser 日志里的初始凭据搬进安装结果的**凭据区**。
-//
-// 为什么值得单写一段：File Browser 装好后用户第一件事就是登录，而初始用户名与口令
-// 只出现在服务日志里（上游没有"由外部指定初始口令"的参数，`--password` 要的是 bcrypt 哈希）。
-// 抓不到就明说"没抓到、去哪儿看 + 看什么命令"，绝不编造 —— 这个仓库因为编造凭据出过事。
-//
-// 凭据**只进 InstallResult.Credentials**（面板 UI 的凭据区），不进任务步骤叙述：
-// 步骤会进任务日志 / SSE / 审计，明文口令出现在那里等于多一份长期留存。
+// 上游没有"由外部指定初始口令"的参数（--password 要的是 bcrypt 哈希），抓不到就明说"没抓到、
+// 去哪儿看"，绝不编造 —— 本仓库因编造凭据出过事。凭据**只进 Credentials**，不进步骤叙述。
 func (m *Manager) appendFilebrowserInitialPassword(d AppDescriptor, result *InstallResult) {
 	if result == nil {
 		return
@@ -794,11 +628,8 @@ func (m *Manager) appendFilebrowserInitialPassword(d AppDescriptor, result *Inst
 		"入口 "+uiURL+"（子路径）或 http://"+m.primaryIP()+":8081/ ；登录后请立刻改口令。")
 }
 
-// prepareFilebrowserDataDir 建好"家目录之外"的数据目录并把归属交给真实用户。
-//
-// 用户要求（2026-09-19）：File Browser 管理整个家目录，但它自己的 filebrowser.db
-// 不能放在家目录里（否则会被它自己列出来、也更容易被误改）。所以数据库放
-// <面板工作目录>/filebrowser/，这里负责创建 + chown（服务以真实用户身份运行，要能写）。
+// prepareFilebrowserDataDir 建好**家目录之外**的数据目录并把归属交给真实用户（服务以真实
+// 用户身份运行，要能写）：File Browser 管理整个家目录，但它的 filebrowser.db 不能放家目录里。
 func (m *Manager) prepareFilebrowserDataDir() error {
 	if strings.TrimSpace(m.opt.WorkDir) == "" {
 		return fmt.Errorf("无法确定面板工作目录，不能把 File Browser 数据库放到家目录之外")
@@ -815,11 +646,9 @@ func (m *Manager) prepareFilebrowserDataDir() error {
 	return nil
 }
 
-// portHasListener 判断某个端口此刻真的有进程在监听。
-//
-// 用途：tarball 轨的幂等跳过判据（见 InstallReleaseBinary）。用端口而不是
-// launchd 状态，理由与 assertReady 一致 —— launchd "已加载"不代表进程活着
-// （KeepAlive 会不停重启一个起不来的进程），端口才是"真的在提供能力"的证据。
+// portHasListener 判断某个端口此刻真的有进程在监听（tarball 轨的幂等跳过判据）。用端口而非
+// launchd 状态：launchd "已加载"不代表进程活着（KeepAlive 会不停重启一个起不来的进程），
+// 端口才是"真的在提供能力"的证据。
 func (m *Manager) portHasListener(port int) bool {
 	if port <= 0 {
 		return false
@@ -828,11 +657,8 @@ func (m *Manager) portHasListener(port int) bool {
 	return err == nil && info.InUse
 }
 
-// adoptInstallResult 把幂等跳过的结果原样搬进调用方传入的 result。
-//
-// 为什么是"搬进"而不是让 InstallReleaseBinary 返回新的 *InstallResult：
-// 老签名（error-only + 就地写 result）是 internal/web 与任务中心依赖的契约，
-// 不许改。就地写字段既保住签名，又让任务终态带上"已经装过了，本次跳过"。
+// adoptInstallResult 把幂等跳过的结果原样搬进调用方传入的 result：老签名（error-only + 就地
+// 写 result）是 internal/web 与任务中心依赖的契约，不许改；就地写既保住签名又带上"本次跳过"。
 func adoptInstallResult(dst, src *InstallResult) {
 	if dst == nil || src == nil {
 		return
@@ -851,18 +677,8 @@ func adoptInstallResult(dst, src *InstallResult) {
 }
 
 // waitReleaseBinaryReady 等 release 二进制服务真的就绪。**超时返回错误，不是警告。**
-//
-// 2026-09-17 模块化改造：就绪判定的实现搬进了描述符执行器
-// （ExecConfig.assertReady，见 steps.go），这里只保留**兼容入口** ——
-// 判定语义一个字都没变：
-//   - Port > 0（frpc 7400 / ddns-go 9876）：端口在监听是「服务真的活着」最强的
-//     证据（比 launchd 状态更可信）；
-//   - Port == 0（orbien 客户端是纯出站连接，不监听任何端口）：没有端口可等，
-//     只能看 launchd 有没有把这个作业真的拉起来（原来的 waitPort(0, 60s)
-//     必然超时，每次安装都误报一次）。
-//
-// 失败**如实返回 error**，并附上进程错误日志尾部 —— 绝不再出现
-// 「装完了但用不了」和「任务完成 ✅」同时显示在界面上的情况。
+// Port > 0 时端口在监听是「服务真的活着」最强的证据；Port == 0（纯出站连接）只能看 launchd
+// 有没有把作业真的拉起来。失败**如实返回 error** 并附日志尾部，绝不出现"装完却报任务完成"。
 func (m *Manager) waitReleaseBinaryReady(ctx context.Context, spec releaseBinaryApp,
 	p binaryReleasePaths, registered bool, result *InstallResult) error {
 
@@ -889,21 +705,17 @@ func (m *Manager) waitReleaseBinaryReady(ctx context.Context, spec releaseBinary
 	})
 }
 
-// configSeedSecrets 是生成配置时替换进模板的随机凭据。
-//
-// 为什么要显式带出来：安装结果里要能让用户看到并按需复制（dashboard 账号口令、
-// frpc 要填的 auth.token），而不是让他装完再去翻文件。口令只放结果的可复制区块，
-// 不写进步骤叙述里（步骤会被折叠、也会进审计日志）。
+// configSeedSecrets 是生成配置时替换进模板的随机凭据，显式带出来好让用户在安装结果里看到
+// 并按需复制（dashboard 账号口令、frpc 要填的 auth.token）；口令只放结果的可复制区块，不写进
+// 步骤叙述（步骤会被折叠、也会进审计日志）。
 type configSeedSecrets struct {
 	Token    string
 	User     string
 	Password string
 }
 
-// generateConfigSecrets 按模板里出现的占位符生成凭据。
-//
-// 只生成模板真正用到的那些：模板里没有 {user} 的应用（Orbien 服务端固定 admin）
-// 就不生成随机用户名，避免"生成了却没人用"的假信息。
+// generateConfigSecrets 按模板里出现的占位符生成凭据 —— 只生成模板真正用到的那些，避免
+// "生成了却没人用"的假信息（模板里没有 {user} 的应用就不生成随机用户名）。
 func generateConfigSecrets(seed, reusableToken string) (configSeedSecrets, error) {
 	s := configSeedSecrets{User: "admin"}
 	var err error
@@ -939,12 +751,9 @@ func expandConfigSeed(seed string, s configSeedSecrets) string {
 	return r.Replace(seed)
 }
 
-// writeConfigSeed 把模板展开后写入 path（0600：文件里是明文凭据）。
-//
-// 它会**覆盖**已存在的文件 —— "要不要保留旧文件"由调用方判断：
-// 原生路径用 marker 区分"面板生成的"与"上游示例"（上游示例必须被覆盖），
-// compose 路径则"有就不动"（用户改 serverAddr/token 是常态）。
-// 两种情况语义不同，所以判定不放在这里。
+// writeConfigSeed 把模板展开后写入 path（0600：文件里是明文凭据）。它会**覆盖**已存在的文件 ——
+// "要不要保留旧文件"由调用方判断：原生路径靠 marker 区分"面板生成的"与"上游示例"（上游示例必须
+// 被覆盖），compose 路径则"有就不动"（用户改 serverAddr/token 是常态）。
 func writeConfigSeed(path, seed string, s configSeedSecrets) error {
 	if err := os.WriteFile(path, []byte(expandConfigSeed(seed, s)), 0o600); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", path, err)
@@ -952,11 +761,9 @@ func writeConfigSeed(path, seed string, s configSeedSecrets) error {
 	return nil
 }
 
-// matchChecksum 是校验的判定本身（纯函数，便于单测证明"坏文件真的会被拦住"）。
-//
-// 拆出来的原因：verifyReleaseChecksum 要下载、要 root、要跑 curl，没法在单测里
-// 造一个"哈希不匹配"的真实场景；而这条判定恰恰是整个安全收益的关键一步，
-// 不能只靠人工试一次。单测 TestReleaseBinaryChecksumRejectsMismatch 直接喂错哈希。
+// matchChecksum 是校验的判定本身（纯函数，便于单测证明"坏文件真的会被拦住"——
+// TestReleaseBinaryChecksumRejectsMismatch 直接喂错哈希）。拆出来是因为 verifyReleaseChecksum
+// 要下载、要 root、要跑 curl，没法在单测里造一个"哈希不匹配"的真实场景。
 func matchChecksum(asset, want, got, source, root string) error {
 	if strings.EqualFold(want, got) {
 		return nil
@@ -981,12 +788,9 @@ func (a releaseBinaryApp) checksumURLs() []string {
 	return urls
 }
 
-// fetchChecksumList 下载并返回清单内容，同时返回"来源"用于如实写进日志。
-//
-// 顺序上先试**官方**清单地址（文件只有 1.6KB，慢链路也能秒下），再退镜像：
-// 这样"tarball 来自镜像、清单来自官方"时校验才有真实意义。
-// 局限要说清：如果官方地址完全不可达、清单也只能从同一个镜像取，这一步退化成
-// "防传输损坏"而非"防镜像作恶"——安装日志里会把清单来源写出来。
+// fetchChecksumList 下载并返回清单内容，同时返回"来源"用于如实写进日志。先试**官方**清单
+// 地址（文件只有 1.6KB，慢链路也能秒下）再退镜像 —— 这样"tarball 来自镜像、清单来自官方"时
+// 校验才有真实意义；官方完全不可达时退化成"防传输损坏"，安装日志里会写明清单来源。
 func (m *Manager) fetchChecksumList(ctx context.Context, spec releaseBinaryApp, root string) (string, string, error) {
 	urls := spec.checksumURLs()
 	tmp := filepath.Join(root, spec.ChecksumAsset+".part")
@@ -1015,10 +819,9 @@ func (m *Manager) fetchChecksumList(ctx context.Context, spec releaseBinaryApp, 
 	return "", "", lastErr
 }
 
-// checksumFor 从清单里取出某个文件的期望 sha256。
-//
-// 清单格式是 GNU coreutils 的 "<64位hex>  <文件名>"（两个空格）；这里按空白切分，
-// 对单/双空格都成立。文件名用 base，因为清单里只有文件名、没有路径。
+// checksumFor 从清单里取出某个文件的期望 sha256。清单格式是 GNU coreutils 的
+// "<64位hex>  <文件名>"（两个空格），这里按空白切分，对单/双空格都成立；文件名用 base
+// （清单里只有文件名、没有路径）。
 func checksumFor(list, asset string) (string, error) {
 	want := ""
 	for _, line := range strings.Split(list, "\n") {
@@ -1054,21 +857,9 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// extractArgs 组装 tar 的解压参数。
-//
-// 默认是 `-xzf <asset> -C <root>`（tar 的选项必须在成员名前，所以这里返回
-// "-xzf asset -C root [--strip-components=N] [member]" 的全部参数）。
-// PickBinary 时只解压 Binary 那一个成员；成员名要不要带"顶层目录"取决于
-// TarStrip：
-//   - TarStrip > 0：tarball 里有一层顶层目录（frp 的 tarball 是
-//     frp_0.71.0_darwin_arm64/…），tar 的成员匹配按归档内的完整路径，
-//     所以成员名必须是 <顶层目录>/<binary>；
-//   - TarStrip == 0：tarball 里就是平级的成员（ddns-go 的 tarball 是
-//     ddns-go / README.md / README_EN.md / LICENSE），成员名就是 <binary>。
-//
-// 这条区分是真机踩出来的：ddns-go 的产物没有顶层目录，如果沿用"成员名一定带
-// 顶层目录（用 asset 名去掉 .tar.gz 猜）"的老写法，tar 会去找一个不存在的
-// ddns-go_6.17.7_darwin_arm64/ddns-go，解压直接失败。
+// extractArgs 组装 tar 的解压参数（默认 `-xzf <asset> -C <root>`，tar 的选项必须在成员名前）。
+// PickBinary 时只解压 Binary 那一个成员；成员名带不带顶层目录取决于 TarStrip：>0 时必须是
+// <顶层目录>/<binary>，==0 时就是 <binary>（ddns-go 实测无顶层目录，猜错会让 tar 直接解压失败）。
 func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 	args := []string{"-xzf", asset, "-C", root}
 	if a.PickBinary && a.Binary != "" {
@@ -1085,16 +876,9 @@ func (a releaseBinaryApp) extractArgs(asset, root string) []string {
 	return args
 }
 
-// ensureReleaseConfig 生成"release 二进制"类应用的配置文件。
-//
-// 已有**面板生成**的配置时原样保留（用户可能自己改过端口/口令，重装不该把它抹掉），
-// 其余情况（没有文件 / 只有上游示例 / 上游换了示例内容）一律写面板这份。
-// 为什么靠 marker 而不是"存在即保留"：orbien 客户端的 tarball 自带一份上游示例配置，
-// 解压后正好落在目标路径上；按"存在即保留"处理的话，面板永远写不进自己的配置，
-// 用户装完只有默认值、没有界面入口，而且没有任何报错。
-//
-// 例外是 PreserveExistingConfig（ddns-go）：那个应用的配置由它自己的网页界面重写，
-// marker 活不过第一次保存，所以对它判据退化成"文件存在即保留"（详见字段注释）。
+// ensureReleaseConfig 生成配置文件：已有**面板生成**的（含 marker）原样保留（用户可能改过端口/
+// 口令），其余（没有文件 / 只有上游示例）一律写面板这份 —— "存在即保留"会让面板永远写不进配置、
+// 用户装完只有默认值且没有报错。例外是 PreserveExistingConfig（ddns-go，判据见字段注释）。
 func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePaths) (configSeedSecrets, bool, error) {
 	if configKeepsExisting(spec.PreserveExistingConfig, p.Config) {
 		return configSeedSecrets{}, false, nil
@@ -1109,16 +893,9 @@ func (m *Manager) ensureReleaseConfig(spec releaseBinaryApp, p binaryReleasePath
 	return s, true, nil
 }
 
-// configKeepsExisting 是"要不要保留磁盘上这份配置"的**唯一判据**
-// （老 ensureReleaseConfig 的判据，逐字保留；执行器的 ensure_config 步骤
-// 也调它 —— 两份判据漂移会让重装一次冲掉一次用户配置）。
-//
-//   - preserveExisting（ddns-go）：**文件存在即保留**。它的网页界面保存时会
-//     整体重写 YAML，面板写的 marker 注释活不过第一次保存；按 marker 判断的话，
-//     重装会把用户填好的 DNS 服务商密钥与域名直接冲掉。
-//   - 其余（frpc / orbien-client）：含面板 marker 才保留（用户可能自己改过端口/
-//     口令）；否则视为"上游示例配置"，必须被面板这份覆盖 —— 否则面板永远写不进
-//     自己的配置，用户装完只有默认值、没有界面入口，而且没有任何报错。
+// configKeepsExisting 是"要不要保留磁盘上这份配置"的**唯一判据**（执行器的 ensure_config 步骤
+// 也调它 —— 两份判据漂移会让重装一次冲掉一次用户配置）。preserveExisting（ddns-go）**文件存在
+// 即保留**（其界面会整体重写 YAML）；其余含 marker 才保留，否则视为上游示例、必须被面板覆盖。
 func configKeepsExisting(preserveExisting bool, path string) bool {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1130,10 +907,8 @@ func configKeepsExisting(preserveExisting bool, path string) bool {
 	return strings.Contains(string(b), panelConfigMarker)
 }
 
-// credentialBlock 生成安装结果里的"可复制凭据区块"。
-//
-// 口令与 token 只出现在这里，不写进步骤叙述：步骤会被折叠、也会进审计日志，
-// 明文口令混在叙述里既容易漏看又容易被顺手复制走。
+// credentialBlock 生成安装结果里的"可复制凭据区块"。口令与 token 只出现在这里，不写进步骤
+// 叙述：步骤会被折叠、也会进审计日志，明文口令混在叙述里既容易漏看又容易被顺手复制走。
 func credentialBlock(name, configPath, uiURL string, s configSeedSecrets) []string {
 	if s.Password == "" && s.Token == "" {
 		return nil
@@ -1206,17 +981,15 @@ func releaseBinaryPlist(a releaseBinaryApp, p binaryReleasePaths, user string) s
 `, a.Label, user, b.String(), p.Root, p.OutLog, p.ErrLog)
 }
 
-// xmlEscape 转义放进 plist <string> 里的路径。
-// 家目录理论上不含 & < >，但这是拼进 XML 的字符串，不该靠"理论上"。
+// xmlEscape 转义放进 plist <string> 里的路径。家目录理论上不含 & < >，
+// 但这是拼进 XML 的字符串，不该靠"理论上"。
 func xmlEscape(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return r.Replace(s)
 }
 
-// plistOnlyRunner 是"只算不碰"的兼容入口（渲染 plist、走就绪判定）用的空 Runner。
-//
-// 它不碰文件系统、不碰 launchd、不发网络请求 —— 那正是单测不该做的事。
-// 就绪判定用到的三个探针（WaitPort / LaunchRunning / HTTPGet）走的仍是
+// plistOnlyRunner 是"只算不碰"的兼容入口（渲染 plist、走就绪判定）用的空 Runner：不碰文件
+// 系统、不碰 launchd、不发网络请求 —— 那正是单测不该做的事。就绪判定用到的三个探针走的仍是
 // ready.go 里的包级注入点，所以 ready_test.go 的桩照常生效。
 type plistOnlyRunner struct{}
 
@@ -1280,22 +1053,17 @@ func max64(a float64, b float64) float64 {
 	return b
 }
 
-// IsReleaseBinaryApp 判断某个应用 ID 是否由"官方 release 原生二进制"安装器部署。
-//
-// web 层据此把安装请求分流到 InstallReleaseBinary。用注册表判断而不是在 web 层
-// 再抄一份 ID 列表：抄的那份在加新条目时一定会漏（漏了的后果是市场点了没反应）。
+// IsReleaseBinaryApp 判断某个应用 ID 是否由"官方 release 原生二进制"安装器部署，web 层据此
+// 把安装请求分流到 InstallReleaseBinary。用注册表判断而不是在 web 层再抄一份 ID 列表：
+// 抄的那份在加新条目时一定会漏（漏了的后果是市场点了没反应）。
 func IsReleaseBinaryApp(id string) bool {
 	_, ok := releaseBinaryApps[id]
 	return ok
 }
 
-// ReleaseBinaryAppConfigRelPaths 返回由本安装器部署的应用"家目录下的配置文件"
-// 相对路径（<RootDir>/<ConfigFile>），键是应用 ID。
-//
-// 为什么要有它：这些配置文件里常有第三方服务的 token（ddns-go 的 DNS API token、
-// frpc 的 serverAddr/auth.token、orbien 的隧道凭据），备份功能把它们的勾选权
-// 交给用户（默认不勾）。备份清单**从注册表派生**而不是各写一份：新加一个
-// release-binary 应用时，备份侧不会悄悄漏掉它（有覆盖门禁测试锁死）。
+// ReleaseBinaryAppConfigRelPaths 返回由本安装器部署的应用"家目录下的配置文件"相对路径
+// （<RootDir>/<ConfigFile>），键是应用 ID。这些文件常有第三方 token（ddns-go 的 DNS token、
+// frpc 的 auth.token 等），备份勾选权交给用户（默认不勾）；清单**从注册表派生**（有门禁测试锁死）。
 func ReleaseBinaryAppConfigRelPaths() map[string]string {
 	out := map[string]string{}
 	for id, spec := range releaseBinaryApps {
@@ -1315,11 +1083,9 @@ func hostOf(raw string) string {
 	return raw
 }
 
-// UninstallReleaseBinary 停止并删除服务，按需删除安装目录。
-//
-// 实现体是 m.UninstallByDescriptor（见 tarball_descriptor.go）——
-// 老函数名保留是为了 internal/services/uninstall_app.go 的分流与既有单测，
-// 流程只有一份。
+// UninstallReleaseBinary 停止并删除服务，按需删除安装目录。实现体是 m.UninstallByDescriptor
+// （见 tarball_descriptor.go）—— 老函数名保留是为了 internal/services/uninstall_app.go 的
+// 分流与既有单测，流程只有一份。
 func (m *Manager) UninstallReleaseBinary(ctx context.Context, id string, removeData bool, result *InstallResult) error {
 	d, ok := FindDescriptor(id)
 	if !ok || d.Rail != RailTarball {
