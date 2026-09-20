@@ -115,17 +115,91 @@ func TestMarketCardMatchesPanelRecordForRealMachineApps(t *testing.T) {
 			t.Fatalf("准备记录 %s 失败: %v", r.name, err)
 		}
 	}
+	// ⚠️ 2026-09-20：面板记录**只说明"归面板管"（adopted），不再是"已安装"的证据**
+	//（真机：mysql84 的 keg/plist 都卸了，记录还在，卡片却显示已安装）。
+	// 所以这里必须同时造出**运行体**：原生类 = launchd 里真有它的 plist；
+	// compose 类 = 项目目录在。
+	agents := filepath.Join(srv.Cfg.UserHome, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range records {
+		if r.label != "" {
+			// 写进**用户域**（BrewLabelFor 也只扫这里）——这样连目录里没写
+			// ServiceLabel 的条目（ollama）也能从磁盘推出真实标签并判定运行体。
+			if err := os.WriteFile(filepath.Join(agents, r.label+".plist"), []byte("<plist/>"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(srv.Cfg.WorkDir, "compose", "uptime-kuma"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, id := range []string{"nginx", "mysql84", "ollama", "uptime-kuma", "php82", "php84"} {
 		it := marketItem(t, ts, cookies, id)
 		if it["installed"] != true {
-			t.Errorf("%s 有面板记录，市场卡片必须显示已安装"+
+			t.Errorf("%s 有面板记录**且有运行体**，市场卡片必须显示已安装"+
 				"（否则会出现「卡片说没装、任务说已装」的矛盾）：%v", id, it["installed"])
 		}
 		if it["adopted"] != true {
 			t.Errorf("%s 已登记，市场必须显示已纳管，实际 %v", id, it["adopted"])
 		}
 	}
+}
+
+// TestMarketStaleRecordIsResidualNotInstalled 是 2026-09-20 真机的回归锁：
+//
+//	mysql84 的 keg 与 plist 都已卸载，services 表里还留着 sh-brew-mysql8-4（port 3306），
+//	市场却仍显示"已安装" —— 用户既没有安装入口、也看不出那是残留。
+//
+// 契约：installed 只认**运行体**（keg / launchd / 声明的安装体）；只有记录 ⇒
+// installed=false + artifacts=true（前端 residualOf 据此给「残留数据」+「删除残留数据」），
+// 且必须给得出卸载/清理路径。
+func TestMarketStaleRecordIsResidualNotInstalled(t *testing.T) {
+	t.Run("只有记录 = 残留，不是已安装", func(t *testing.T) {
+		srv, ts := newTestServer(t)
+		_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+			map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+		repo := services.NewRepository(srv.Store)
+		if err := repo.Create(t.Context(), &services.Service{
+			Name: "sh-brew-mysql8-4", DisplayName: "mysql84", Kind: services.KindNative,
+			LaunchLabel: "sh.brew.mysql@8.4", Port: 3306, Managed: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		it := marketItem(t, ts, cookies, "mysql84")
+		if it["installed"] != false {
+			t.Errorf("keg 与 plist 都不在、只有服务记录时绝不能显示已安装（判据要贴运行体）：%v", it)
+		}
+		if it["artifacts"] != true {
+			t.Errorf("只剩服务记录也是残留，artifacts 必须为 true（前端据此给「残留数据」+ 清理入口）：%v", it)
+		}
+		if it["adopted"] != true {
+			t.Errorf("记录还在，仍应显示已纳管（归不归面板管是另一件事）：%v", it)
+		}
+		plan, _ := it["uninstall"].(map[string]any)
+		if asString(plan["kind"]) == "none" {
+			t.Errorf("残留态必须给得出清理路径，实际 kind=none：%v", plan)
+		}
+	})
+
+	t.Run("keg 在 = 已安装", func(t *testing.T) {
+		srv, ts := newTestServer(t)
+		_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+			map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+		seedFakeBrew(t, srv, []string{"mysql@8.4"}, true)
+		srv.InvalidateMarketCache()
+
+		it := marketItem(t, ts, cookies, "mysql84")
+		if it["installed"] != true {
+			t.Errorf("brew 里装着 keg 时必须显示已安装，实际 %v", it["installed"])
+		}
+		if it["artifacts"] == true {
+			t.Errorf("keg 在、记录不在时不该报残留：%v", it)
+		}
+	})
 }
 
 // TestMarketDetectsOrphanInstall 第 6 项：安装产物还在、服务没注册。
@@ -417,27 +491,77 @@ func TestMarketDeletedEntriesAreGone(t *testing.T) {
 //
 // 用户 2026-09-20：MySQL 与 MariaDB 只可能装一个，中途换要自己手动卸载。
 // 后端必须拒绝（见 TestMarketInstallRejectsDatabaseEngineConflictBeforeTask），
-// 卡片上再提前说一句，用户就不用先点一次才知道。
-// 用假 brew 注入"机器上装着 mariadb"（只读 list --versions，不碰真机）。
+// 卡片上再提前说一句。用假 brew 注入"两个引擎都装着 + brew services 状态"。
+//
+// ⚠️ 2026-09-20 真机误报的回归：**目标自己就是当前生效引擎时不显示冲突**。
+// 生效引擎用 `brew services list --json` 的 started 状态判；两个都 started 或都 none
+// 时判不出 → 宁严不宽，仍显示冲突。
 func TestMarketCardShowsDatabaseEngineConflict(t *testing.T) {
-	srv, ts := newTestServer(t)
-	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
-		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
-	bindFakeBrew(t, srv, t.TempDir(),
-		`case "$1 $2" in "list --versions") echo 'mariadb 13.0.2';; esac`)
+	cases := []struct {
+		name               string
+		servicesJSON       string
+		wantMySQL, wantMDB bool
+	}{
+		{"生效是 MariaDB（MySQL 卡片给冲突）",
+			`[{"name":"mariadb","status":"started"}]`, true, false},
+		{"生效是 MySQL（MariaDB 卡片给冲突）",
+			`[{"name":"mysql@8.4","status":"started"}]`, false, true},
+		{"两个都 none（判不出 → 都给冲突）",
+			`[{"name":"mariadb","status":"none"},{"name":"mysql@8.4","status":"none"}]`, true, true},
+		{"两个都 started（异常，判不出 → 都给冲突）",
+			`[{"name":"mariadb","status":"started"},{"name":"mysql@8.4","status":"started"}]`, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, ts := newTestServer(t)
+			_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+				map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+			// 假 brew：两个引擎都装着；services 状态由用例给定。
+			bindFakeBrew(t, srv, t.TempDir(), `case "$1 $2 $3" in
+  "list --versions ") printf 'mariadb 13.0.2\nmysql@8.4 8.4.11_4\n';;
+  "services list --json") printf '%s' '`+c.servicesJSON+`';;
+esac`)
 
-	mysqlIt := marketItem(t, ts, cookies, "mysql84")
-	msg := asString(mysqlIt["engine_conflict"])
-	if msg == "" {
-		t.Fatal("机器上装着 mariadb 时，mysql84 的卡片必须提示冲突（点安装必然被后端拒绝）")
+			gotMySQL := asString(marketItem(t, ts, cookies, "mysql84")["engine_conflict"])
+			gotMDB := asString(marketItem(t, ts, cookies, "mariadb")["engine_conflict"])
+			if (gotMySQL != "") != c.wantMySQL {
+				t.Errorf("mysql84 的 engine_conflict 应为 %v，实际 %q", c.wantMySQL, gotMySQL)
+			}
+			if (gotMDB != "") != c.wantMDB {
+				t.Errorf("mariadb 的 engine_conflict 应为 %v，实际 %q", c.wantMDB, gotMDB)
+			}
+			// 文案不变（点名另一个引擎与可照做的卸载命令）。
+			for _, msg := range []string{gotMySQL, gotMDB} {
+				if msg == "" {
+					continue
+				}
+				if !strings.Contains(msg, "brew uninstall ") {
+					t.Errorf("冲突提示必须给出可照做的卸载命令，实际 %q", msg)
+				}
+			}
+		})
 	}
-	for _, want := range []string{"mariadb", "brew uninstall mariadb"} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("提示里应含 %q，实际 %q", want, msg)
-		}
+}
+
+// TestSingleStartedDBEngine 锁住"当前生效引擎"的判据（只在两个引擎都装着时用）：
+// 恰好一个在跑 → 就是它；两个都跑或都没跑 → 判不出来（""），卡片按冲突显示（宁严不宽）。
+func TestSingleStartedDBEngine(t *testing.T) {
+	cases := []struct {
+		name    string
+		started map[string]bool
+		want    string
+	}{
+		{"只有 MariaDB 在跑", map[string]bool{"mariadb": true}, "mariadb"},
+		{"只有 MySQL 在跑", map[string]bool{"mysql@8.4": true}, "mysql"},
+		{"两个都跑（异常）", map[string]bool{"mariadb": true, "mysql@8.4": true}, ""},
+		{"都没跑", map[string]bool{}, ""},
+		{"无关服务在跑", map[string]bool{"nginx": true}, ""},
 	}
-	// 已装的那个引擎自己的卡片不该跟自己冲突。
-	if got := asString(marketItem(t, ts, cookies, "mariadb")["engine_conflict"]); got != "" {
-		t.Errorf("mariadb 卡片不该报冲突（另一个引擎没装），实际 %q", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := singleStartedDBEngine(c.started); got != c.want {
+				t.Errorf("singleStartedDBEngine(%v) = %q，期望 %q", c.started, got, c.want)
+			}
+		})
 	}
 }

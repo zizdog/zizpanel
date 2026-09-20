@@ -572,7 +572,14 @@ func TestSpeechMarketCardInstalledContract(t *testing.T) {
 		t.Errorf("port_url 应指向直连端口 %d，实际 %q", services.MacSpeechPort, got)
 	}
 
-	// 模拟"面板装好了"的最小证据：一条服务记录（LaunchLabel 与目录声明同源）。
+	// 模拟"面板装好了"的最小证据：服务真的注册进了 launchd（沙箱 LaunchDaemons
+	// 目录里出现它的 plist）—— 面板安装器就是这么装的。
+	// ⚠️ 2026-09-20 起**只有面板服务记录不算已安装**（真机 mysql84 的 keg/plist
+	// 都卸了、记录还在，卡片却显示已安装）：它的运行体证据只能是这条 plist。
+	if err := os.WriteFile(filepath.Join(launchDaemonsDir, services.MacSpeechLabel+".plist"),
+		[]byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	repo := services.NewRepository(srv.Store)
 	if err := repo.Create(t.Context(), &services.Service{
 		Name: "com-zizdog-macosspeech", DisplayName: "macOS 语音合成（say）",
@@ -583,7 +590,7 @@ func TestSpeechMarketCardInstalledContract(t *testing.T) {
 
 	it = marketItem(t, ts, cookies, services.MacSpeechAppID)
 	if it["installed"] != true {
-		t.Fatal("服务记录在、LaunchLabel 与目录一致时，卡片必须显示「已安装」——" +
+		t.Fatal("服务真的在 launchd 里（plist 在）时，卡片必须显示「已安装」——" +
 			"否则用户装完看到的是「安装」按钮（本项目复发过多次的那一族）")
 	}
 	plan, _ := it["uninstall"].(map[string]any)

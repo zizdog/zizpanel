@@ -52,6 +52,10 @@ func dbEngineOfFormula(formula string) string {
 	return ""
 }
 
+// DBEngineOfFormula 是 dbEngineOfFormula 的导出包装：web 层判"当前生效引擎"
+// （读 brew services 状态）时要用同一套 formula→引擎 映射，不能再抄一份。
+func DBEngineOfFormula(formula string) string { return dbEngineOfFormula(formula) }
+
 // DBEngineOtherFormula 返回"另一个数据库引擎"的 formula（不是引擎时 ok=false）。
 // web 层也用它（市场卡片提前提示"装了另一个、点安装会被拒"）。
 func DBEngineOtherFormula(formula string) (string, bool) {

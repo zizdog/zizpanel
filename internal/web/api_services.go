@@ -841,92 +841,72 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 三个候选标签都要认：目录写死的、显式纳管用的、磁盘推出来的
 		cand := []string{a.ServiceLabel, a.AdoptLabel, realLabel}
 
-		isInstalled := installed[a.ID] || installed[a.Name]
+		// 运行体证据之一：服务此刻真的登记在 launchd 里（系统域或用户域）。
+		serviceInLaunchd := false
 		for _, l := range cand {
-			if !isInstalled && l != "" {
-				isInstalled = installed[l]
+			if l != "" && adoptTargetExists(s.Cfg.UserHome, l) {
+				serviceInLaunchd = true
+				break
 			}
 		}
-		// 面板自研安装器部署的系统级服务：/Library/LaunchDaemons 下有 plist 也算
+		// 面板服务记录**只说明"归面板管"（adopted），单独不算已安装**。
 		//
-		// ⚠️ **容器运行时是唯一例外**（2026-09-19 用户实测）：colima 的运行体是
-		// 一个虚拟机和它的 docker socket，而 plist 只是"开机把 VM 拉起来"的
-		// 一次性作业。旧版卸载/换机留下 zombie plist 时，这台机器上
-		// colima 二进制没有、~/.colima 不存在、socket 也不存在，市场却显示
-		// 「Colima 已安装·未纳管」—— 用户既看不到安装入口，也点不出引擎。
-		// 所以这一类的"已安装"必须看现实（见下面的 dockerRuntime），
-		// 不再用 plist 判定；nginx/PHP/MySQL 那些包在磁盘上的应用保持原判据不变。
+		// 真机 2026-09-20：mysql84 的 keg 与 plist 都卸了，services 表里还留着
+		// sh-brew-mysql8-4（port 3306），市场就仍显示"已安装"——用户既没有安装入口、
+		// 也看不出那是残留。判据必须贴运行体（见下面 isInstalled 的四种证据）。
+		recordMatched := installed[a.ID] || installed[a.Name]
+		for _, l := range cand {
+			if !recordMatched && l != "" {
+				recordMatched = installed[l]
+			}
+		}
 		isDockerRuntime := a.PanelInstaller == "docker-runtime" || a.Kind == services.KindColima
-		if !isInstalled && !isDockerRuntime {
-			for _, l := range cand {
-				if l == "" {
-					continue
-				}
-				if _, err := os.Stat(filepath.Join(launchDaemonsDir, l+".plist")); err == nil {
-					isInstalled = true
-					break
-				}
-			}
-		}
-		if !isInstalled && a.BrewFormula != "" {
-			isInstalled = brewSet[a.BrewFormula]
-		}
-		// brew 真实状态（含"目录写 php@8.4、机器上装的是 php 8.4.7"这种等价形态）：
-		// 一条判据同时决定「已安装」与「怎么卸载」，不再让两个地方各猜一次。
-		brewState := services.BrewStateFor(a.BrewFormula, brewVers)
-		if !isInstalled && brewState.Installed {
-			isInstalled = true
-		}
-		// 真实证据之三：目录声明的**安装体**（真实产物）在磁盘上。
-		//
-		// 为什么必须有这一条（用户报障两条的根因）：
-		// 没有常驻服务的应用（App.NoDaemon：vips / ffmpeg / python@x.y，以及
-		// 网页入口型的 phpMyAdmin）在面板里**没有服务记录**，它们的「已安装」
-		// 过去只来自上面那句 brew 结论。于是
-		//   · brew 探测失败（返回空集合）→ 一起显示「安装」；
-		//   · 5 分钟缓存还没失效 → 刚装完也显示「安装」；
-		//   · phpMyAdmin 的 web 根是**用户手工装好**的（不在 brew list 里）→
-		//     永远显示未安装（用户原话："它是有状态的目录，只要判断这个目录在，
-		//     就是安装！"）。
-		// 判据贴着运行体：可执行文件带执行位 / web 目录带入口文件（见
-		// services.DetectRuntimeBody）。只 stat、不执行 —— 列表路径要便宜。
-		runtimeBody := services.DetectRuntimeBody(a, s.Cfg.BrewPrefix, s.Cfg.UserHome)
-		if !isInstalled && runtimeBody.Exists() {
-			isInstalled = true
-		}
-		// 容器运行时：**已安装必须看现实**，不看任何残留文件（见上面的长注释）。
-		//
-		// 关键点：这一段的结论会**覆盖**前面的 brew / 面板记录判据 ——
-		// 因为用户看到的正是"记录在、plist 在、二进制不在"。brewSet 命中也救不了
-		// 僵尸态（colima 已被 brew 卸掉，只是 plist 忘了清）。
-		// 探测结论同时原样带给前端（DockerRuntime），Docker 版块据此决定是显示
-		// 「一键安装」还是「启动」。
+		// 容器运行时：**已安装必须看现实**，不看任何残留文件（见下面的长注释）。
 		var dockerRuntime *services.DockerRuntimeState
 		dockerNote := ""
 		if isDockerRuntime {
 			rt := s.dockerRuntimeStatus(ctx)
 			dockerRuntime = &rt
-			isInstalled = rt.BinaryInstalled
 			if rt.State == services.DockerRuntimeStopped {
 				dockerNote = "已安装但引擎没在运行（可在 Docker 页点启动）"
 			}
+		}
+		// brew 真实状态（含"目录写 php@8.4、机器上装的是 php 8.4.7"这种等价形态）：
+		// 一条判据同时决定「已安装」与「怎么卸载」，不再让两个地方各猜一次。
+		brewState := services.BrewStateFor(a.BrewFormula, brewVers)
+		// 真实证据之三：目录声明的**安装体**（真实产物）在磁盘上。
+		//
+		// 为什么必须有这一条（用户报障两条的根因）：
+		// 没有常驻服务的应用（App.NoDaemon：vips / ffmpeg / python@x.y，以及
+		// 网页入口型的 phpMyAdmin）在面板里**没有服务记录**，它们的「已安装」
+		// 过去只来自 brew 结论。判据贴着运行体：可执行文件带执行位 / web 目录带
+		// 入口文件（见 services.DetectRuntimeBody）。只 stat、不执行 —— 列表要便宜。
+		runtimeBody := services.DetectRuntimeBody(a, s.Cfg.BrewPrefix, s.Cfg.UserHome)
+		isInstalled := serviceInLaunchd || brewSet[a.BrewFormula] || brewState.Installed ||
+			runtimeBody.Exists()
+		if isDockerRuntime {
+			// 这一段的结论会**覆盖**前面的判据：僵尸 plist 与 ~/.colima 都不算数。
+			isInstalled = dockerRuntime.BinaryInstalled
+		}
+		// compose / docker：运行体是**容器**，而列表路径不做 docker ps（见 server.go
+		// 的缓存说明）。所以这一类以"面板记录 + 项目目录都在"为准；缺一即残留。
+		composeBody := false
+		if a.Kind == services.KindCompose || a.Kind == services.KindDocker {
+			composeBody = services.ComposeArtifactExists(s.Cfg.WorkDir, a.ID)
+			isInstalled = recordMatched && composeBody
 		}
 		// 面板自研安装器：磁盘上有产物**不等于已安装**。
 		//
 		// 2026-09-16 用户反馈：卸载时没勾「同时删除数据/产物」（或手动删了服务、
 		// 目录还在）之后，卡片被"有产物就算已安装"这条判据永久钉在"已安装"上：
 		// 没有「安装」入口、残留数据也清不掉 —— 用户无法重装。
-		// 现在产物只作为**残留数据**如实报给界面（artifacts=true 且 installed=false），
-		// 重装入口交给「安装」：安装器本身是幂等的，会复用残留产物、不会重复下载。
-		// 「已安装」的证据只有三种：面板服务记录、launchd 里的 plist/作业、brew formula。
+		//「已安装」的证据只有运行体那四种；产物只作为**残留数据**如实报给界面。
 		artifacts := false
 		if a.PanelInstaller != "" {
 			artifacts = services.InstallerArtifactExists(s.Cfg.UserHome, a.PanelInstaller)
 		}
 		// 容器运行时的残留判据是它**自己的**（僵尸 plist / ~/.colima 配置目录），
 		// InstallerArtifactExists 那张表里没有 docker-runtime，不会命中。
-		// 不补这一条，用户现场那份僵尸 plist 就既不算"已安装"也不报残留 ——
-		// 卡片变成干净的"未安装"，用户不知道磁盘上还有上一轮的东西。
 		if !artifacts && dockerRuntime != nil {
 			artifacts = dockerRuntime.Artifacts
 		}
@@ -936,20 +916,16 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if !artifacts {
 			artifacts = services.LegacyNativeArtifactExists(s.Cfg.UserHome, a.ID, string(a.Kind))
 		}
-		// compose / docker 类应用的产物是**项目目录**（<WorkDir>/compose/<id>）。
-		// 卸载（保留数据）之后目录还在、服务记录不在 —— 与原生类一样必须
-		// 如实报 artifacts=true，否则卡片显示"未安装"却没有任何清理入口，
-		// 那份数据永远删不掉（2026-09-16 用户反馈的同一类问题）。
-		if !artifacts && (a.Kind == services.KindCompose || a.Kind == services.KindDocker) {
-			artifacts = services.ComposeArtifactExists(s.Cfg.WorkDir, a.ID)
+		// compose / docker 的产物是**项目目录**（<WorkDir>/compose/<id>）。
+		if !artifacts && composeBody {
+			artifacts = true
 		}
-		// 服务此刻是否真在 launchd 里（决定能不能"纳管"）
-		serviceInLaunchd := false
-		for _, l := range cand {
-			if l != "" && adoptTargetExists(s.Cfg.UserHome, l) {
-				serviceInLaunchd = true
-				break
-			}
+		// ⚠️ 只有面板记录、运行体已经不在 → 那也是残留（真机 mysql84 的形态）。
+		// 不这样标，卡片会停在"已安装"，用户既没有安装入口、也没有清理入口。
+		// 这里复用仓库既有的 residual 语义：artifacts=true + installed=false
+		//（前端 residualOf() 据此给「残留数据」+「删除残留数据」）。
+		if !isInstalled && recordMatched && !artifacts {
+			artifacts = true
 		}
 
 		// 纳管的判据：任一候选标签已在面板记录里
@@ -963,8 +939,6 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// compose / docker 应用没有 ServiceLabel：它们由面板直接以应用 ID
 		// 登记进服务管理。少了这条判断，刚装好的应用会显示成
 		// "已安装·未纳管"并给出一个点了必然报错的「纳管」按钮。
-		// installed 这张表只由面板的服务记录（名称与 launchd label）构成，
-		// 所以命中 ID 就等于"它确实已在服务管理里"。
 		if !adopted && (installed[a.ID] || installed[a.Name]) {
 			adopted = true
 		}
@@ -1004,14 +978,27 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 		// 数据库引擎互斥（用户 2026-09-20）：另一个引擎已装时，这张卡点安装必然被
 		// 后端拒绝，先把话说在前面。只读**已经批量查好的** brew 结果，不新增探测
-		//（列表路径跑 lsof/brew 会让首屏变慢，见上面的注释）。
+		//（列表路径跑 lsof/brew 会让首屏变慢）。
+		//
+		// ⚠️ 必须套用护栏的例外（真机 2026-09-20 误报）：目标自己就是**当前生效
+		// 引擎**时不显示冲突。生效引擎用 `brew services list --json` 的 started 状态判
+		// （两个都 started / 都 none → 判不出）；这份状态只在"两个引擎都装着"时才查，
+		// 且按 brewBin 带 5 分钟缓存。
 		engineConflict := ""
 		if other, ok := services.DBEngineOtherFormula(a.BrewFormula); ok && brewProbeOK {
-			_, _, byVers := services.ResolveBrewFormula(other, brewVers)
-			if byVers || brewSet[other] {
-				engineConflict = "已安装 " + other + "：MySQL 与 MariaDB 只能装一个；" +
-					"要换成这个请先在终端执行 `brew services stop " + other +
-					" && brew uninstall " + other + "`"
+			_, _, otherByVers := services.ResolveBrewFormula(other, brewVers)
+			if otherByVers || brewSet[other] {
+				_, _, selfByVers := services.ResolveBrewFormula(a.BrewFormula, brewVers)
+				targetInstalled := selfByVers || brewSet[a.BrewFormula]
+				effective := ""
+				if targetInstalled {
+					effective = s.effectiveDBEngine(ctx)
+				}
+				if effective != services.DBEngineOfFormula(a.BrewFormula) {
+					engineConflict = "已安装 " + other + "：MySQL 与 MariaDB 只能装一个；" +
+						"要换成这个请先在终端执行 `brew services stop " + other +
+						" && brew uninstall " + other + "`"
+				}
 			}
 		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
@@ -1947,6 +1934,85 @@ func (s *Server) fetchInstalledFormulas(ctx context.Context) (map[string]bool, m
 	return set, vers, err == nil
 }
 
+// brewStartedCache 缓存 `brew services list --json` 里 **started** 的 formula。
+//
+// 只服务"数据库引擎互斥"的卡片提示：判"当前生效引擎"要知道哪个引擎在跑。
+// 只在**两个引擎都装着**时才查（见 handleMarketList），正常机器一分钱不花；
+// 按 brewBin 分桶（单测里每个 Server 一个临时前缀，互不串味）；包级变量而不是
+// Server 字段，理由同 marketProbeErr（避免动 server.go）。
+var brewStartedCache = struct {
+	sync.Mutex
+	m map[string]brewStartedEntry
+}{m: map[string]brewStartedEntry{}}
+
+type brewStartedEntry struct {
+	started map[string]bool
+	ok      bool
+	at      time.Time
+}
+
+// effectiveDBEngine 返回"当前生效的数据库引擎"（"" = 判不出来）。
+func (s *Server) effectiveDBEngine(ctx context.Context) string {
+	key := s.Cfg.BrewBin
+	brewStartedCache.Lock()
+	e, hit := brewStartedCache.m[key]
+	brewStartedCache.Unlock()
+	if !hit || time.Since(e.at) >= marketCacheTTL {
+		started, ok := s.fetchStartedFormulas(ctx)
+		// 查失败时保留上一次的真实结论（同 refreshMarketCaches 的原则），
+		// 但缓存时间不刷新 —— 让下一次请求很快重试。
+		if ok || !hit {
+			e = brewStartedEntry{started: started, ok: ok, at: time.Now()}
+			brewStartedCache.Lock()
+			brewStartedCache.m[key] = e
+			brewStartedCache.Unlock()
+		}
+	}
+	if !e.ok {
+		return ""
+	}
+	return singleStartedDBEngine(e.started)
+}
+
+// fetchStartedFormulas 批量读一次 `brew services list --json`，返回 started 的 formula 集合。
+// 第二个返回值 = 这次**真的读成了**（失败时不能当成"什么都没在跑"）。
+func (s *Server) fetchStartedFormulas(ctx context.Context) (map[string]bool, bool) {
+	txt, err := s.svcManager().BrewCapture(ctx, 30*time.Second, "services", "list", "--json")
+	if err != nil {
+		return nil, false
+	}
+	var list []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal([]byte(txt), &list) != nil {
+		return nil, false
+	}
+	started := map[string]bool{}
+	for _, e := range list {
+		if strings.EqualFold(strings.TrimSpace(e.Status), "started") {
+			started[e.Name] = true
+		}
+	}
+	return started, true
+}
+
+// singleStartedDBEngine 返回"唯一在跑的数据库引擎"；两个都 started 或都没跑 → ""（判不出）。
+func singleStartedDBEngine(started map[string]bool) string {
+	eff := ""
+	for f := range started {
+		e := services.DBEngineOfFormula(f)
+		if e == "" {
+			continue
+		}
+		if eff != "" && eff != e {
+			return "" // 两个都 started：只能装一个，这本身就是异常，判不出
+		}
+		eff = e
+	}
+	return eff
+}
+
 // InvalidateMarketCache 让市场缓存立刻失效（安装/卸载任务结束后调用）。
 //
 // 为什么必须有它（用户报障"图片压缩安装成功但没变化、不在已安装里、
@@ -1962,6 +2028,10 @@ func (s *Server) InvalidateMarketCache() {
 	s.mktMu.Lock()
 	s.mktBrew, s.mktBrewVer, s.mktBrewAt, s.mktBrewOK = nil, nil, time.Time{}, false
 	s.mktMu.Unlock()
+	// 数据库引擎的 started 缓存也要清：刚卸载/安装完引擎，卡片提示不能停在旧结论。
+	brewStartedCache.Lock()
+	delete(brewStartedCache.m, s.Cfg.BrewBin)
+	brewStartedCache.Unlock()
 	// Docker 侧**不**在这里清空：清空会让下次打开市场去做一次同步 socket 探测
 	//（每个候选路径 800ms 超时），破坏"列表渲染路径要便宜"这条规矩。
 	// 它本来就有 5 秒负缓存，而且每次后台刷新都会重探（cachedDocker /
