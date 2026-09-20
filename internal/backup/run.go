@@ -6,11 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/mysql"
+	"github.com/zizdog/zizpanel/internal/priv"
 	"github.com/zizdog/zizpanel/internal/version"
 )
 
@@ -87,24 +89,19 @@ func mysqlGenerators(cfg *config.Config, targets []string) []GeneratedFile {
 	if !Selected([]string{TargetMySQL}, targets) {
 		return nil
 	}
-	cli := clientFor(cfg)
-	if cli == nil {
-		return nil
+	cli, err := clientFor(cfg)
+	if err != nil {
+		// 定不出"当前生效的引擎"（例如两个引擎都装着又说不出谁在跑）时**如实失败**：
+		// 用错客户端可能导出失败、也可能导出一份看起来正常的坏归档（谎报成功）。
+		return []GeneratedFile{failedMySQLExport(err)}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	dbs, err := cli.ListDatabases(ctx)
 	if err != nil {
-		// MySQL 连不上时**让整次备份如实失败**，而不是产出一个"看起来有数据库"
+		// 连不上时**让整次备份如实失败**，而不是产出一个"看起来有数据库"
 		// 却只有一个说明文件的备份（那正是"谎报成功"）。
-		return []GeneratedFile{{
-			ArchivePath: "mysql/export-failed",
-			Targets:     []string{TargetMySQL},
-			Secrets:     true,
-			Write: func(dest string) error {
-				return fmt.Errorf("连接 MySQL 失败，无法导出数据库（选了「数据库」范围就必须备到）: %w", err)
-			},
-		}}
+		return []GeneratedFile{failedMySQLExport(err)}
 	}
 	var out []GeneratedFile
 	for _, d := range dbs {
@@ -141,14 +138,68 @@ func isSystemDB(n string) bool {
 	return false
 }
 
-// clientFor 按面板配置构造 MySQL 客户端（与「数据库」页同一套路径解析）。
-func clientFor(cfg *config.Config) *mysql.Client {
-	if cfg.BrewPrefix == "" {
+// failedMySQLExport 造一个"必失败"的生成项：备份清单里必须**看得见**这一步，
+// 打开归档时才拿到一句人话原因，而不是一个没有数据库的"成功"备份。
+func failedMySQLExport(cause error) GeneratedFile {
+	return GeneratedFile{
+		ArchivePath: "mysql/export-failed",
+		Targets:     []string{TargetMySQL},
+		Secrets:     true,
+		Write: func(string) error {
+			return fmt.Errorf("连接/导出数据库失败（选了「数据库」范围就必须备到）: %w", cause)
+		},
+	}
+}
+
+// mysqlPortHolders 返回数据库端口上的监听者（lsof，形如 "mariadbd (pid 35985)"）。
+// 变量是为了单测注入：默认实现会真的起 lsof，而单测不许碰真实服务。
+var mysqlPortHolders = func(port int) []string {
+	info, err := priv.CheckPort(strconv.Itoa(port))
+	if err != nil {
 		return nil
 	}
-	binDir := filepath.Join(cfg.BrewPrefix, "opt", "mysql@8.4", "bin")
-	if !Exists(filepath.Join(binDir, "mysql")) {
-		binDir = filepath.Join(cfg.BrewPrefix, "bin")
+	return info.Holders
+}
+
+// resolveDBEngine 解析"当前生效的数据库引擎"（与「数据库」页同一套解析）：
+// 只读磁盘的 keg；两个都装着时用端口监听者判开；判不开 → 返回错误。
+func resolveDBEngine(cfg *config.Config) (mysql.EnginePaths, error) {
+	if cfg.BrewPrefix == "" {
+		return mysql.EnginePaths{}, fmt.Errorf("面板配置里没有 Homebrew 前缀")
+	}
+	port := cfg.MySQLPort
+	if port == 0 {
+		port = 3306
+	}
+	eng, err := mysql.ResolveEnginePreferring(cfg.BrewPrefix, cfg.MySQLSocket, mysqlPortHolders(port))
+	if err != nil {
+		return mysql.EnginePaths{}, fmt.Errorf("无法确定当前生效的数据库引擎：%w", err)
+	}
+	return eng, nil
+}
+
+// clientFor 按面板配置构造数据库客户端（与「数据库」页同一套路径解析）。
+//
+// 客户端目录来自引擎解析结果（mysql@8.4 / mariadb 的 keg）：过去写死
+// opt/mysql@8.4/bin，MariaDB 机器上那条路径不存在 → mysqldump 用不了或用了错的
+// 那个。解析不出 keg 时只在 <brew>/bin 真有客户端时才继续（那不是"猜引擎"，
+// 是这台机器上唯一可用的客户端）；否则如实报错。
+func clientFor(cfg *config.Config) (*mysql.Client, error) {
+	eng, err := resolveDBEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	binDir := eng.BinDir
+	if binDir == "" {
+		linked := filepath.Join(cfg.BrewPrefix, "bin")
+		if !Exists(filepath.Join(linked, "mysql")) && !Exists(filepath.Join(linked, "mariadb")) {
+			note := strings.TrimSpace(eng.Note)
+			if note == "" {
+				note = "没有找到 mysql / mariadb 客户端"
+			}
+			return nil, fmt.Errorf("无法定位数据库客户端：%s", note)
+		}
+		binDir = linked
 	}
 	host, port, socket, user := cfg.MySQLHost, cfg.MySQLPort, cfg.MySQLSocket, cfg.MySQLUser
 	if host == "" {
@@ -156,6 +207,9 @@ func clientFor(cfg *config.Config) *mysql.Client {
 	}
 	if port == 0 {
 		port = 3306
+	}
+	if strings.TrimSpace(eng.Socket) != "" {
+		socket = eng.Socket
 	}
 	if socket == "" {
 		socket = "/tmp/mysql.sock"
@@ -173,5 +227,5 @@ func clientFor(cfg *config.Config) *mysql.Client {
 		Timeout:  30 * time.Second,
 		UserName: cfg.User,
 		UserHome: cfg.UserHome,
-	})
+	}), nil
 }

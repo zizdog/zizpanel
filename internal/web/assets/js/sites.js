@@ -71,9 +71,9 @@ function showNetFailure(errText) {
 // 2026-09-19 起版本由用户在弹窗里选，所以这里不再写死 "PHP 8.2 + MySQL 8.4" ——
 // 写死的话，用户选了 8.4 再看提示就会发现"提示与实际不符"。
 const LNMP_HINT = '一键 LNMP 会先确保运行依赖（命令行开发者工具 CLT / Homebrew），'
-  + '再安装 nginx + PHP + MySQL + phpMyAdmin（数据库管理界面），'
-  + '并完成默认站点、vhosts 目录、MySQL 初始化、系统级守护进程等收尾工作。'
-  + '点开会先让你选 nginx / PHP / MySQL 各自的版本。'
+  + '再安装 nginx + PHP + 数据库 + phpMyAdmin（数据库管理界面），'
+  + '并完成默认站点、vhosts 目录、数据库初始化、系统级守护进程等收尾工作。'
+  + '点开会先让你选 nginx / PHP / 数据库的版本。'
   + '全程约十几分钟（取决于网络与 Homebrew 下载/编译速度）。'
   + '提交后立刻返回任务号，进度在「任务中心」实时显示 —— 关掉窗口、切换页面都不会中断安装。';
 
@@ -82,7 +82,7 @@ const LNMP_HINT = '一键 LNMP 会先确保运行依赖（命令行开发者工�
 // 任务中心里还有一条同义的常驻提示条（tasks.js，按标题 /LNMP/i 匹配），
 // 两处都在：用户决定点确认之前就要知道"装 MySQL 会问口令、可以不干预"，
 // 而不是等任务开起来才看到。
-const LNMP_MYSQL_HINT = '装 MySQL 时会问一次 root 口令（在任务中心里，60 秒不回答就自动生成强随机口令）'
+const LNMP_MYSQL_HINT = '装数据库时会问一次 root 口令（在任务中心里，60 秒不回答就自动生成强随机口令）'
   + ' —— **可以不干预**：装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。';
 
 // lnmpGroupOrder 是弹窗里组件分组的展示顺序（与后端 groups 的 key 对应）。
@@ -93,7 +93,7 @@ const LNMP_MYSQL_HINT = '装 MySQL 时会问一次 root 口令（在任务中心
 const LNMP_GROUP_ORDER = [
   { key: 'nginx', label: 'Nginx', desc: 'Web 服务器（网站入口，只有一个版本）' },
   { key: 'php', label: 'PHP', desc: '站点解析 PHP 用；面板让每个版本监听自己的专属 socket，可以多版本共存' },
-  { key: 'mysql', label: 'MySQL', desc: '数据库（面板的「数据库」页与 phpMyAdmin 依赖它）' },
+  { key: 'mysql', label: '数据库', desc: '二选一：MySQL 8.4 或 MariaDB。两者不能同时运行，默认共用数据目录 /opt/homebrew/var/mysql。' },
 ];
 
 // LNMP_TITLE_TAIL 是「⚡ 一键 LNMP」按钮 tooltip 的后半句（用户 2026-09 指定的
@@ -171,6 +171,8 @@ async function openLNMPDialog() {
       toast('至少要选：' + missing.join('、') + '（三件套必须各选一个版本）', 'warn');
       return null;
     }
+    // 数据库引擎维度：后端用它决定装 mysql@8.4 还是 mariadb（与 mysql 字段必须一致）。
+    sel.db_engine = sel.mysql === 'mariadb' ? 'mariadb' : 'mysql';
     return sel;
   }
 
@@ -265,7 +267,7 @@ async function openLNMPDialog() {
             onclick: () => {
               // 显式默认：body 里仍然带上这三个 formula（不是"留空让后端决定"），
               // 这样日志与审计里能看出"用户就是选的默认"。
-              const def = { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4' };
+              const def = { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4', db_engine: 'mysql' };
               if (m) m.close();
               taskCenter.start({
                 kind: 'install',
@@ -364,11 +366,17 @@ async function openLNMPDialog() {
 
   // syncInstallLabel 让按钮上写着"这次会装什么" —— 用户在点之前就能核对。
   function syncInstallLabel() {
+    const byKey = {};
+    (state.groups || []).forEach((g) => { byKey[g.key] = g; });
     const labels = LNMP_GROUP_ORDER
       .map((g) => {
         const f = state.picked[g.key];
         if (!f) return '';
-        return f.includes('@') ? g.label + ' ' + f.split('@')[1] : f;
+        if (f.includes('@')) return g.label + ' ' + f.split('@')[1];
+        // 没有 @版本 的（nginx / mariadb）用目录展示名，不要露出裸 formula。
+        const opts = (byKey[g.key] && byKey[g.key].options) || [];
+        const hit = opts.find((o) => o.formula === f);
+        return (hit && hit.name) || f;
       })
       .filter(Boolean);
     installBtn.textContent = labels.length ? '开始安装（' + labels.join(' + ') + '）' : '开始安装';

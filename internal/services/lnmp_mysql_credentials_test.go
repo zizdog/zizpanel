@@ -405,15 +405,16 @@ func TestRandomMySQLPasswordIsStrongAndSafe(t *testing.T) {
 }
 
 // TestIsMySQLFormulaCoversBothPaths 两条安装路径都要走凭据闭环。
+// MariaDB 也是数据库引擎（同一个组件位的另一个选择），同样必须覆盖。
 func TestIsMySQLFormulaCoversBothPaths(t *testing.T) {
-	for _, f := range []string{"mysql@8.4", "mysql"} {
+	for _, f := range []string{"mysql@8.4", "mysql", "mysql@8.0", "mariadb", "mariadb@13.0"} {
 		if !isMySQLFormula(f) {
-			t.Errorf("%s 应被识别为 MySQL", f)
+			t.Errorf("%s 应被识别为数据库引擎（MySQL/MariaDB）", f)
 		}
 	}
-	for _, f := range []string{"mysql@8.0", "mariadb", "nginx", ""} {
+	for _, f := range []string{"nginx", "", "postgresql@17"} {
 		if isMySQLFormula(f) {
-			t.Errorf("%s 不该被识别为 MySQL", f)
+			t.Errorf("%s 不该被识别为数据库引擎", f)
 		}
 	}
 }

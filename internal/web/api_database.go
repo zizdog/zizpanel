@@ -35,13 +35,25 @@ func (s *Server) mysqlClient() (*mysql.Client, error) {
 //
 // 用途是"改口令之后立刻拿新口令自检"：那一步必须绕开配置里还存着的旧口令，
 // 否则永远自检不通过（真机事故就是这么发生的，见 mysql/admin.go）。
+//
+// 客户端目录**按当前生效的引擎解析**（MySQL 8.4 / MariaDB）：过去写死
+// opt/mysql@8.4/bin，装了 MariaDB 的机器上那条路径不存在，页面会报
+// "未找到 mysql 客户端"，看起来像面板不支持。解析读不到时沿用历史回退路径
+// （opt/mysql@8.4 → <brew>/bin），让页面如实报"找不到客户端"。
 func (s *Server) mysqlClientWithPassword(password string) (*mysql.Client, error) {
-	binDir := filepath.Join(s.Cfg.BrewPrefix, "opt", "mysql@8.4", "bin")
-	if _, err := os.Stat(filepath.Join(binDir, "mysql")); err != nil {
-		// 回退到 PATH 常见位置
-		binDir = filepath.Join(s.Cfg.BrewPrefix, "bin")
+	eng, err := s.databaseEngine()
+	if err != nil {
+		// 两个引擎都装着（无法判断该连哪个）：如实拒绝，不挑一个默认值。
+		return nil, err
+	}
+	binDir := eng.BinDir
+	if binDir == "" {
+		binDir = fallbackMySQLBinDir(s.Cfg.BrewPrefix)
 	}
 	host, port, socket, user := s.mysqlConn()
+	if strings.TrimSpace(eng.Socket) != "" {
+		socket = eng.Socket
+	}
 	return mysql.NewClient(mysql.Options{
 		BinDir:   binDir,
 		Host:     host,
@@ -53,6 +65,30 @@ func (s *Server) mysqlClientWithPassword(password string) (*mysql.Client, error)
 		UserName: s.Cfg.User,
 		UserHome: s.Cfg.UserHome,
 	}), nil
+}
+
+// fallbackMySQLBinDir 是"一个引擎的 keg 都没读到"时的历史回退路径。
+// 它不是"猜引擎"，只是让页面能继续找一个手工安装的客户端，并在真的没有时报错。
+func fallbackMySQLBinDir(brewPrefix string) string {
+	dir := filepath.Join(brewPrefix, "opt", "mysql@8.4", "bin")
+	if _, err := os.Stat(filepath.Join(dir, "mysql")); err != nil {
+		dir = filepath.Join(brewPrefix, "bin")
+	}
+	return dir
+}
+
+// databaseEngine 解析当前生效的数据库引擎（只读磁盘；两个都装着时按 3306 判）。
+func (s *Server) databaseEngine() (mysql.EnginePaths, error) {
+	return s.svcManager().ResolveDBEngine(s.Cfg.BrewPrefix, s.Cfg.MySQLSocket)
+}
+
+// databaseEngineInfo 是给页面看的引擎块：读不到也如实回（verified=false + note）。
+func (s *Server) databaseEngineInfo() any {
+	eng, err := s.databaseEngine()
+	if err != nil {
+		return map[string]any{"verified": false, "note": err.Error()}
+	}
+	return eng
 }
 
 // mysqlPassword 从 .env.local 读取 root 密码。
@@ -176,8 +212,17 @@ func (s *Server) mysqlCredentialState(verr error) mysqlCredentialView {
 	default:
 		v.State = "unreachable"
 		v.Error = verr.Error()
-		v.Hint = "MySQL 服务没有响应（与口令无关）：请确认服务正在运行" +
-			"（可在「服务管理」里启动 mysql@8.4 并查看日志）"
+		name, service := "数据库", "数据库服务"
+		if eng, err := s.databaseEngine(); err == nil {
+			if strings.TrimSpace(eng.Name) != "" {
+				name = eng.Name
+			}
+			if strings.TrimSpace(eng.Formula) != "" {
+				service = eng.Formula
+			}
+		}
+		v.Hint = name + " 服务没有响应（与口令无关）：请确认服务正在运行" +
+			"（可在「服务管理」里启动 " + service + " 并查看日志）"
 	}
 	return v
 }
@@ -205,6 +250,9 @@ func (s *Server) handleDatabaseOverview(w http.ResponseWriter, r *http.Request) 
 			"databases":  []any{},
 			"users":      []any{},
 			"credential": cred,
+			// engine 是"当前生效的引擎 + 它的 bin/datadir/socket/label"（真实磁盘解析）。
+			// verified=false 时页面必须显示"未复核"，不许假装知道。
+			"engine": s.databaseEngineInfo(),
 			// has_password 的语义**只是**"面板配置里有没有口令"。
 			// 页面不要再把它当成"MySQL 有没有口令"来显示 —— 那是两件事。
 			"has_password": cred.Configured,
@@ -237,6 +285,7 @@ func (s *Server) handleDatabaseOverview(w http.ResponseWriter, r *http.Request) 
 		"databases":  dbs,
 		"users":      []any{},
 		"credential": cred,
+		"engine":     s.databaseEngineInfo(),
 	}
 	if dbErr != nil {
 		res["databases_error"] = dbErr.Error()

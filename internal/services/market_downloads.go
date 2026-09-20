@@ -262,6 +262,18 @@ func brewBottlePoint(formula string, timeout time.Duration, label string) Market
 	}
 }
 
+// mariadbBottlePoint 与 brewBottlePoint 同处置，只把 arm64 证据换成**这个
+// formula 的实测值**：brew cat mariadb 的 bottle 块有 arm64_sequoia / arm64_tahoe /
+// arm64_golden_gate，没有 macOS x86_64 瓶；brew info --json=v2 在本机解析出
+// arm64_sequoia（sha256 062bb10d…）。不许写成"应该可以"。
+func mariadbBottlePoint() MarketDownloadPoint {
+	p := brewBottlePoint("mariadb", 30*time.Minute, "brew install mariadb")
+	p.ARM64 = "brew cat mariadb 实测 bottle 块含 arm64_sequoia / arm64_tahoe / arm64_golden_gate" +
+		"（brew info --json=v2 在本机解析出 arm64_sequoia，sha256 062bb10d938df508…）；" +
+		"该 formula **没有** macOS x86_64 瓶，Intel Mac 上装不了（铁律 10 的 arm64 要求成立）"
+	return p
+}
+
 // pipPoint 造一个 PyPI 下载点（两个 Python 应用都固定走清华源）。
 func pipPoint(pkg string, timeout time.Duration, label, note string) MarketDownloadPoint {
 	simple := strings.ToLower(strings.Split(pkg, "[")[0])
@@ -588,6 +600,21 @@ var marketDownloadApps = []MarketApp{
 		},
 		Downloads: []MarketDownloadPoint{
 			brewBottlePoint("mysql@8.4", 30*time.Minute, "brew install mysql@8.4"),
+		},
+	},
+
+	{
+		// 与 mysql84 同形（都是 brew 原生 + launchd），所以**没有** PanelInstaller：
+		// 通用 brew 流程已经覆盖装/起/登记/卸，互斥护栏在 InstallLNMP 与 Install 里。
+		ID: "mariadb", Kind: KindNative, BrewFormula: "mariadb", ServiceLabel: "sh.brew.mariadb",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "sh.brew.mariadb",
+			LabelSource: "目录 ServiceLabel = Homebrew 7 的 canonical plist 名（service.rb 的 " +
+				"canonical_plist_name = sh.brew.<formula>）；本机 mysql@8.4 的真实 plist 就是 " +
+				"sh.brew.mysql@8.4（brew services list 实测）",
+		},
+		Downloads: []MarketDownloadPoint{
+			mariadbBottlePoint(),
 		},
 	},
 

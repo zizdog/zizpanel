@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -135,4 +137,74 @@ func TestServiceRecordMatchingIsOnlyAboutRegistration(t *testing.T) {
 		t.Errorf("名字里含 nginx 的记录应当被认出来（registered=true，状态 unknown）：%v %v", reg, st)
 	}
 	var _ = http.StatusOK
+}
+
+// listenLocalPort 起一个只接受连接的本地端口，返回端口号（测试里代替真实数据库）。
+func listenLocalPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// TestSitesRuntimeMySQLInstallPathComesFromEngineResolution：
+// 安装路径必须来自**引擎解析结果**（MariaDB 的 opt/mariadb/bin），
+// 不是写死的 <brew>/bin/mysqld（keg-only 的 mysql@8.4 根本不在那里）。
+func TestSitesRuntimeMySQLInstallPathComesFromEngineResolution(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	srv.Cfg.MySQLHost, srv.Cfg.MySQLPort = "127.0.0.1", listenLocalPort(t)
+
+	binDir := filepath.Join(srv.Cfg.BrewPrefix, "opt", "mariadb", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"mysql", "mysqld"} {
+		if err := os.WriteFile(filepath.Join(binDir, n), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/sites/runtime", nil, cookies)
+	data, _ := out["data"].(map[string]any)
+	mysql, _ := data["mysql"].(map[string]any)
+	want := filepath.Join(binDir, "mysqld")
+	if got := asString(mysql["install_path"]); got != want {
+		t.Errorf("安装路径应来自引擎解析（%s），实际 %q", want, got)
+	}
+	if pe := strings.TrimSpace(asString(mysql["probe_error"])); pe != "" {
+		t.Errorf("引擎解析成功时不该报「未复核」：%v", mysql)
+	}
+}
+
+// TestSitesRuntimeMySQLUnverifiedWhenEngineUnreadable：
+// 读不到引擎时**如实标未复核**，绝不回退到一个可能不存在的安装路径。
+func TestSitesRuntimeMySQLUnverifiedWhenEngineUnreadable(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	srv.Cfg.MySQLHost, srv.Cfg.MySQLPort = "127.0.0.1", listenLocalPort(t)
+
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/sites/runtime", nil, cookies)
+	data, _ := out["data"].(map[string]any)
+	mysql, _ := data["mysql"].(map[string]any)
+	if got := asString(mysql["install_path"]); got != "" {
+		t.Errorf("读不到引擎时不许编一个安装路径，实际 %q", got)
+	}
+	if pe := asString(mysql["probe_error"]); !strings.Contains(pe, "未复核") {
+		t.Errorf("读不到引擎时必须如实说「未复核」，实际 probe_error=%q", pe)
+	}
 }

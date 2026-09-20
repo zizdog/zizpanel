@@ -131,16 +131,31 @@ func TestCatalogComposeNeverPinsPlatform(t *testing.T) {
 }
 
 // 端口分配不应重复：两个应用抢同一个端口会让后装的那个直接失败。
+//
+// 例外是**同一个组件位的两个引擎**（MySQL 8.4 与 MariaDB）：它们默认共用数据目录与
+// 3306，同一时刻只能跑一个，装之前有互斥护栏（见 lnmp_engine.go 的 portSharingAllowed）。
 func TestCatalogPortsAreUnique(t *testing.T) {
-	seen := map[int]string{}
+	seen := map[int]App{}
 	for _, a := range Catalog() {
 		if a.Port == 0 {
 			continue
 		}
 		if prev, ok := seen[a.Port]; ok {
-			t.Fatalf("端口 %d 被 %s 与 %s 同时使用", a.Port, prev, a.ID)
+			if !portSharingAllowed(prev, a) {
+				t.Fatalf("端口 %d 被 %s 与 %s 同时使用", a.Port, prev.ID, a.ID)
+			}
+			continue
 		}
-		seen[a.Port] = a.ID
+		seen[a.Port] = a
+	}
+	// 证实例外不是"整条门禁失效"：普通应用与数据库引擎撞端口仍然算冲突。
+	nginx, _ := FindApp("nginx")
+	mariadb, ok := FindApp("mariadb")
+	if !ok {
+		t.Fatal("目录里应有 mariadb 条目")
+	}
+	if portSharingAllowed(nginx, mariadb) {
+		t.Error("nginx 与 mariadb 撞端口不该被放行（例外只覆盖同一组件位的两个引擎）")
 	}
 }
 

@@ -189,10 +189,16 @@ export function DatabaseView(content, ctx = {}) {
       );
       return;
     }
+    // 引擎名由后端解析（MySQL 8.4 / MariaDB）；版本串里已经带引擎名时不重复。
+    // 读不到就写"数据库"，不替后端猜一个引擎名。
+    const engName = (cache.engine && cache.engine.name) || '数据库';
+    const verStr = String(cache.version || '');
+    const verPill = verStr.toLowerCase().includes(engName.toLowerCase())
+      ? verStr : (engName + ' ' + verStr).trim();
     appendAll(headBox,
       pmaBtn,
       connBtn,
-      h('span.pill.ok', { text: 'MySQL ' + (cache.version || '') }),
+      h('span.pill.ok', { text: verPill }),
       h('span.pill', { text: `${(cache.databases || []).length} 个库` }),
       h('span.pill', { text: `${(cache.users || []).length} 个账号` }),
       cache.has_password ? null : h('span.pill.warn', {
@@ -229,6 +235,11 @@ export function DatabaseView(content, ctx = {}) {
         cache?.hint ? h('div', {
           style: { marginTop: '12px', padding: '10px 12px', background: 'var(--panel-2)', borderRadius: '6px', fontSize: '12.5px', maxWidth: '560px', textAlign: 'left' },
           text: cache.hint,
+        }) : null,
+        // 引擎解析读不到就如实说"未复核"，绝不假装知道该连哪个引擎。
+        cache?.engine && cache.engine.verified === false ? h('div', {
+          style: { marginTop: '10px', padding: '8px 12px', background: 'var(--warn-soft)', borderRadius: '6px', fontSize: '12.5px', maxWidth: '560px', textAlign: 'left' },
+          text: '数据库引擎状态未复核：' + (cache.engine.note || '读不到当前生效的引擎，面板不猜默认值'),
         }) : null,
         h('div', { style: { marginTop: '16px', display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' } }, [
           h('button.btn', { text: '⚙️ 连接设置', onclick: connectionModal }),
@@ -426,7 +437,14 @@ export function DatabaseView(content, ctx = {}) {
                 text: (u.databases || []).join(', ') || '—',
               }),
               h('td', [
-                u.is_locked ? h('span.pill.danger', { text: '已锁定' }) : h('span.pill.ok', { text: '正常' }),
+                // MariaDB 的 mysql.user 没有 account_locked 列，读不到锁定状态：
+                // 如实标"不支持"，绝不把读不到的 false 显示成"正常"。
+                u.lock_state_known === false
+                  ? h('span.pill.warn', {
+                    text: '锁定状态不支持',
+                    title: '这个服务端（MariaDB）的 mysql.user 没有 account_locked 列，面板读不到账号锁定状态',
+                  })
+                  : (u.is_locked ? h('span.pill.danger', { text: '已锁定' }) : h('span.pill.ok', { text: '正常' })),
                 u.has_password ? null : h('span.pill.warn', { style: { marginLeft: '4px' }, text: '无密码' }),
               ]),
               h('td', passwordCell(u)),

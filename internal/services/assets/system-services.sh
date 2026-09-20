@@ -135,7 +135,7 @@ install_one() {
 
   # 已有的用户级 agent 必须先摘掉，否则会出现"同一服务两份实例"
   #
-  # 这里**不能**用 $HOME：面板是 LaunchDaemon（root）拉起的，环境里没有 HOME，
+  # 这里**不能**用 ${HOME}：面板是 LaunchDaemon（root）拉起的，环境里没有 HOME，
   # 而本脚本开着 set -u —— 真机实测（2026-09-17 mini）就是这一行让整个注册以
   #   /opt/zizpanel/system-services.sh: line 105: HOME: unbound variable
   # 自杀：一键 LNMP 装完却卡在最后一步，服务管理里一条都没有，而报错只有这一句。
@@ -199,8 +199,8 @@ install_one() {
 
   # 带重试地装载：卸载刚结束的一小段时间内 bootstrap 仍可能失败；
   # 已经加载上（launchd 里有它）就直接 kickstart 拉起，不再重复 bootstrap。
-  local out="" attempt ok=0
-  for attempt in 1 2 3 4 5; do
+  local out="" ok=0
+  for _ in 1 2 3 4 5; do
     if out="$(launchctl bootstrap system "$dst" 2>&1)"; then
       ok=1; break
     fi
@@ -221,42 +221,66 @@ install_one() {
 }
 
 # ---------------------------------------------------------------------------
-#  MySQL 特殊处理：数据目录没初始化会直接启动失败
+#  数据库特殊处理：数据目录没初始化会直接启动失败
+#
+#  两个引擎共用 <prefix>/var/mysql，但初始化命令**不通用**：
+#    · MySQL   → mysqld --initialize-insecure（root 空口令）
+#    · MariaDB → mariadb-install-db（MariaDB 不认 --initialize-insecure）
+#  这里与 internal/services/lnmp.go 的 mysqlInitCommand 保持同一口径。
 # ---------------------------------------------------------------------------
 prepare_mysql() {
+  local formula="$1"
   local datadir="$BREW_PREFIX/var/mysql"
   if [ -d "$datadir" ] && [ -n "$(ls -A "$datadir" 2>/dev/null)" ]; then
     return 0
   fi
-  warn "MySQL 数据目录未初始化（${datadir}），需要先初始化才能启动"
+  warn "数据库数据目录未初始化（${datadir}），需要先初始化才能启动"
+  local -a init_cmd
+  case "$formula" in
+    mariadb*)
+      local mariadb_dir="$BREW_PREFIX/opt/mariadb"
+      init_cmd=("$mariadb_dir/bin/mariadb-install-db" --no-defaults
+        "--basedir=$mariadb_dir" "--datadir=$datadir"
+        --auth-root-authentication-method=normal)
+      ;;
+    *)
+      local mysqld="$BREW_PREFIX/opt/$formula/bin/mysqld"
+      [ -x "$mysqld" ] || mysqld="$BREW_PREFIX/bin/mysqld"
+      init_cmd=("$mysqld" --initialize-insecure "--datadir=$datadir")
+      ;;
+  esac
+  # dry-run 先打印"会执行什么"，再去检查二进制在不在（否则空机器上 dry-run 只会报错）。
   if [ "$DRY_RUN" = "1" ]; then
-    printf '    (dry-run) 以 %s 身份执行 mysqld --initialize-insecure\n' "$REAL_USER"
+    printf '    (dry-run) 以 %s 身份执行 %s\n' "$REAL_USER" "${init_cmd[*]}"
     return 0
+  fi
+  if [ ! -x "${init_cmd[0]}" ]; then
+    fail "找不到 ${init_cmd[0]}（${formula} 没装好？）"
+    return 1
   fi
   mkdir -p "$datadir"
   chown "$REAL_USER" "$datadir" 2>/dev/null || true
   # shellcheck disable=SC2024
   # 重定向由当前（root）shell 打开，日志留给用户排障用
-  if sudo -u "$REAL_USER" -H "$BREW_PREFIX/bin/mysqld" --initialize-insecure \
-       --datadir="$datadir" >/tmp/zizpanel-mysql-init.log 2>&1; then
+  if sudo -u "$REAL_USER" -H "${init_cmd[@]}" >/tmp/zizpanel-mysql-init.log 2>&1; then
     # 不要把"root 初始无密码"当成最终状态：面板的安装流程随后会为它设置
     # 强随机口令（或用户输入的口令）并写进 config.json，见
     # internal/services/lnmp_mysql_credentials.go。这里说清楚，免得用户看到
     # 这句日志就以为"root 一直是空口令"（2026-09-16 真机上正是这种误解）。
-    pass "MySQL 数据目录已初始化（root 初始无密码；面板单跑本脚本时不会改它，装 LNMP 时会设置并记入口令）"
+    pass "数据库数据目录已初始化（root 初始无密码；面板单跑本脚本时不会改它，装 LNMP 时会设置并记入口令）"
   else
-    fail "MySQL 初始化失败，日志末尾："
+    fail "数据库初始化失败，日志末尾："
     tail -8 /tmp/zizpanel-mysql-init.log 2>/dev/null | sed 's/^/      /'
   fi
 }
 
 for f in "${FORMULAS[@]}"; do
   # 注意括号：早先写成 `[ A ] || [ B ] && prepare_mysql`，shell 的 && / || 左结合
-  # 会让它变成"对每个 formula 都初始化 MySQL"（nginx 也触发一次）。虽然初始化
+  # 会让它变成"对每个 formula 都初始化数据库"（nginx 也触发一次）。虽然初始化
   # 本身幂等，但那等于在无关步骤里去动数据目录，属于不该有的副作用。
-  if [ "$f" = "mysql@8.4" ] || [ "$f" = "mysql" ]; then
-    prepare_mysql
-  fi
+  case "$f" in
+    mysql@*|mysql|mariadb|mariadb@*) prepare_mysql "$f" ;;
+  esac
   install_one "$f" || true
 done
 
@@ -317,6 +341,7 @@ if [ "$DRY_RUN" != "1" ]; then
     case "$f" in
       nginx)   check_port "nginx" 80 ;;
       php@8.*|php) check_php_fpm "$f" ;;
+      mariadb|mariadb@*) check_port "mariadb" 3306 ;;
       mysql@8.4|mysql) check_port "mysql" 3306 ;;
     esac
   done

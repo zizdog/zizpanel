@@ -57,6 +57,9 @@ type InstallResult struct {
 	// root 的口令可能正被别的程序使用，替用户改它属于破坏性操作。
 	// 不导出：这是内部判断依据，不该出现在 API 响应里。
 	mysqlFreshInit bool
+	// mysqlFormula 是本次安装/初始化的数据库引擎 formula（mysql@8.4 / mariadb）。
+	// 凭据闭环用它挑一个"与服务器同源"的客户端二进制，也用于人话里的引擎名。
+	mysqlFormula string
 }
 
 // Install 安装一个应用市场里的应用并纳入管理。
@@ -102,6 +105,14 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		}
 	}
 
+	// 数据库引擎互斥护栏：装 MariaDB 前若 MySQL 正在跑（反之亦然）**拒绝**，
+	// 绝不替用户停服务 —— 两者默认共用数据目录 <brew>/var/mysql 与 3306。
+	// 放在 Preflight 之前：端口冲突那句"已被其它进程占用"说不出"共用数据目录"这层。
+	conflict := m.CheckDBEngineConflict(ctx, app.BrewFormula)
+	if conflict.Blocked != "" {
+		return nil, fmt.Errorf("不能安装「%s」：%s", app.Name, conflict.Blocked)
+	}
+
 	// 先做预检查：避免装到一半才发现缺依赖
 	pf := m.Preflight(ctx, app)
 	if !pf.Ready {
@@ -118,6 +129,10 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 	}
 
 	res := &InstallResult{App: app.ID, Name: app.Name}
+	if conflict.Warning != "" {
+		res.Warning = appendWarning(res.Warning, conflict.Warning)
+		res.step(ctx, "警告："+conflict.Warning)
+	}
 
 	switch {
 	case app.Kind == KindNative && app.BrewFormula != "":
@@ -1210,12 +1225,11 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 	// 2) 交给 brew services 托管（它会写 LaunchAgent 并启动）
 	//    先停再起，避免"已运行但不在 brew 管理下"的状态导致 start 报错
 	//
-	// 2a) MySQL 特有：数据目录为空时先初始化。
-	//     不做这一步的话，brew services start 出来的 mysqld 会因为数据目录为空
-	//     直接退出（tools/system-services.sh 里 prepare_mysql 就是干这个的）。
-	//     initMySQLDataDir 自身幂等：数据目录非空就直接返回。
+	// 2a) 数据库特有：数据目录为空时先初始化（命令按引擎选，见 initMySQLDataDir）。
+	//     不做这一步的话，brew services start 出来的服务会因为数据目录为空直接退出
+	//     （tools/system-services.sh 里 prepare_mysql 就是干这个的，只覆盖 MySQL）。
 	if isMySQLFormula(app.BrewFormula) {
-		if err := m.initMySQLDataDir(ctx, res); err != nil {
+		if err := m.initMySQLDataDir(ctx, res, app.BrewFormula); err != nil {
 			return err
 		}
 	}

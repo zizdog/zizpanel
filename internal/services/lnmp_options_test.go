@@ -21,7 +21,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -237,8 +236,8 @@ func TestLNMPOptionsComeFromCatalog(t *testing.T) {
 	if got := byKey["nginx"]; strings.Join(got, ",") != "nginx" {
 		t.Errorf("nginx 只应有一个候选，实际 %v", got)
 	}
-	if got := byKey["mysql"]; strings.Join(got, ",") != "mysql@8.4" {
-		t.Errorf("MySQL 只有 mysql@8.4 一个候选，实际 %v", got)
+	if got := byKey["mysql"]; strings.Join(got, ",") != "mysql@8.4,mariadb" {
+		t.Errorf("数据库候选应为 mysql@8.4 与 mariadb（默认项在前），实际 %v", got)
 	}
 	// ② postgresql 绝不能进 LNMP 候选
 	for _, fs := range byKey {
@@ -512,19 +511,31 @@ func TestCompareFormulaVersion(t *testing.T) {
 }
 
 // TestLNMPOptionsGroupOptionsAreSortedStable：候选顺序要稳定（前端不做二次排序）。
+//
+// 排序规则本身是生产代码 sortLNMPOptions，测试直接调它 —— 两处各写一份比较器必然漂。
 func TestLNMPOptionsGroupOptionsAreSortedStable(t *testing.T) {
-	groups := lnmpOptionsFromCatalog()
-	for _, g := range groups {
+	byKey := map[string]string{}
+	for _, g := range lnmpOptionsFromCatalog() {
 		got := []string{}
 		for _, o := range g.Options {
 			got = append(got, o.Formula)
 		}
-		sorted := append([]string{}, got...)
-		sort.SliceStable(sorted, func(i, j int) bool {
-			return compareFormulaVersion(sorted[i], sorted[j]) > 0
-		})
-		if strings.Join(got, ",") != strings.Join(sorted, ",") {
-			t.Errorf("「%s」组的候选顺序应「由新到旧」，实际 %v", g.Label, got)
+		byKey[g.Key] = strings.Join(got, ",")
+		again := append([]lnmpOption{}, g.Options...)
+		sortLNMPOptions(again)
+		againFormulas := []string{}
+		for _, o := range again {
+			againFormulas = append(againFormulas, o.Formula)
 		}
+		if strings.Join(againFormulas, ",") != strings.Join(got, ",") {
+			t.Errorf("「%s」组的候选顺序不稳定：%v vs %v", g.Label, got, againFormulas)
+		}
+	}
+	if got := byKey["php"]; got != "php@8.4,php@8.2" {
+		t.Errorf("PHP 候选应新版在前，实际 %v", got)
+	}
+	// 数据库位有两个引擎：默认项 mysql@8.4 必须在前（跨引擎不比版本号）。
+	if got := byKey["mysql"]; got != "mysql@8.4,mariadb" {
+		t.Errorf("数据库候选应默认项在前（mysql@8.4,mariadb），实际 %v", got)
 	}
 }

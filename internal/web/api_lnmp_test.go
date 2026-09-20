@@ -1,8 +1,11 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -30,6 +33,38 @@ func jsonBlob(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// bindLNMPTestManager 给测试服务器装一个**完全离线**的服务管理器：
+// 假 brew（一个包都没有）+ 注入的数据库引擎探测（默认"干净机器"）。
+//
+// 没有它，护栏会去跑真实 brew 与 lsof 3306 —— 本机 MySQL 正在跑，
+// 结论就随机器漂，而且真的碰了真实服务（AGENTS 第三节禁止）。
+func bindLNMPTestManager(t *testing.T, srv *Server,
+	probe func(context.Context, string) services.DBEngineProbeResult) *services.Manager {
+	t.Helper()
+	prefix := t.TempDir()
+	brew := filepath.Join(prefix, "bin", "brew")
+	if err := os.MkdirAll(filepath.Dir(brew), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(brew, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := services.NewManager(srv.serviceRepo, services.Options{
+		BrewBin: brew, UserName: "", UserHome: filepath.Join(prefix, "home"),
+		WorkDir: filepath.Join(prefix, "work"),
+	})
+	mgr.SetBrewUsesProbeForTest(func(context.Context, string) ([]string, bool) { return nil, true })
+	mgr.SetLaunchdDirsForTest([]string{filepath.Join(prefix, "LaunchDaemons")})
+	if probe == nil {
+		probe = func(context.Context, string) services.DBEngineProbeResult {
+			return services.DBEngineProbeResult{ProbeOK: true}
+		}
+	}
+	mgr.SetDBEngineProbeForTest(probe)
+	srv.svcManagerOverride = func(*Server) *services.Manager { return mgr }
+	return mgr
 }
 
 // TestLNMPOptionsEndpointShape 锁住候选接口的形状（前端按它渲染三组单选）。
@@ -80,8 +115,20 @@ func TestLNMPOptionsEndpointShape(t *testing.T) {
 	def, _ := data["default"].(map[string]any)
 	want := services.DefaultLNMPSelection()
 	if asString(def["php"]) != want.PHP || asString(def["nginx"]) != want.Nginx ||
-		asString(def["mysql"]) != want.MySQL {
+		asString(def["mysql"]) != want.MySQL || asString(def["db_engine"]) != want.DBEngine() {
 		t.Errorf("default 与 services.DefaultLNMPSelection 不一致：%+v vs %+v", def, want)
+	}
+	// 数据库组要列出两个引擎，且默认选中 MySQL 8.4（不许偷偷改默认）。
+	mysqlGroup := groups[2].(map[string]any)
+	dbFormulas := []string{}
+	for _, o := range mysqlGroup["options"].([]any) {
+		dbFormulas = append(dbFormulas, asString(o.(map[string]any)["formula"]))
+	}
+	if strings.Join(dbFormulas, ",") != "mysql@8.4,mariadb" {
+		t.Errorf("数据库候选应为 mysql@8.4 与 mariadb，实际 %v", dbFormulas)
+	}
+	if !strings.Contains(asString(mysqlGroup["label"]), "MariaDB") {
+		t.Errorf("数据库组的显示名里应出现 MariaDB，实际 %q", asString(mysqlGroup["label"]))
 	}
 	// PostgreSQL 绝不能在候选里（一键 LNMP 的收尾对它无效）
 	if strings.Contains(jsonBlob(t, data), "postgres") {
@@ -106,6 +153,7 @@ func TestLNMPOptionsEndpointShape(t *testing.T) {
 // ——那会装出与用户选择不同的版本，而用户以为装的是自己选的。
 func TestInstallLNMPRejectsBadSelectionBeforeTask(t *testing.T) {
 	srv, ts := newTestServer(t)
+	bindLNMPTestManager(t, srv, nil)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
@@ -153,7 +201,8 @@ func TestInstallLNMPRejectsBadSelectionBeforeTask(t *testing.T) {
 // 老前端/脚本调这个接口时**不带 body**（改造前就是这样），升级面板后
 // 不能让它们突然收到 400 —— 那会把"重跑一次一键 LNMP"变成"表单都没了"。
 func TestInstallLNMPEmptyBodyStillAccepted(t *testing.T) {
-	_, ts := newTestServer(t)
+	srv, ts := newTestServer(t)
+	bindLNMPTestManager(t, srv, nil)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
@@ -169,5 +218,44 @@ func TestInstallLNMPEmptyBodyStillAccepted(t *testing.T) {
 		if res.StatusCode != http.StatusAccepted {
 			t.Errorf("%s 应继续被接受（默认三件套），实际 %d：%v", c.name, res.StatusCode, out)
 		}
+	}
+}
+
+// TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask 锁住**互斥护栏也在 400 里回答**。
+//
+// 装 MariaDB 时若 MySQL 正在跑，用户当场就该看到原因与出路；任务中心里出现红叉
+// 已经太晚了，而"替你停掉正在跑的 MySQL"是绝对不能做的事（那可能是他的生产库）。
+func TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask(t *testing.T) {
+	srv, ts := newTestServer(t)
+	datadir := "/opt/homebrew/var/mysql"
+	bindLNMPTestManager(t, srv, func(_ context.Context, _ string) services.DBEngineProbeResult {
+		return services.DBEngineProbeResult{
+			Installed: true, ProbeOK: true, Holders: []string{"mysqld (pid 950)"},
+			DataDir: datadir, DataDirNonEmpty: true,
+		}
+	})
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/market/install-lnmp",
+		map[string]string{"db_engine": "mariadb"}, cookies)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("引擎冲突应 400（开任务之前），实际 %d：%v", res.StatusCode, out)
+	}
+	msg := asString(out["msg"])
+	for _, want := range []string{"mysqld (pid 950)", "3306", datadir, "不会替你停"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("400 原因里应含 %q，实际 %q", want, msg)
+		}
+	}
+	if n := len(srv.Tasks.List()); n != 0 {
+		t.Errorf("被护栏拒绝时绝不能创建任务，实际有 %d 个", n)
+	}
+
+	// 同一台机器上选 MySQL（它自己在跑）应当照常放行 → 202。
+	res2, out2, _ := doJSON(t, ts, "POST", "/api/v1/market/install-lnmp",
+		map[string]string{"php": "php@8.4"}, cookies)
+	if res2.StatusCode != http.StatusAccepted {
+		t.Errorf("重跑 MySQL 自己应放行（幂等），实际 %d：%v", res2.StatusCode, out2)
 	}
 }

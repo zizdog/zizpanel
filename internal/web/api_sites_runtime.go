@@ -154,9 +154,26 @@ func recordFor(recs []*services.View, prefix string) (bool, string) {
 // 拉起的形态，而"端口能连上"才是"数据库真的在服务"的直接证据。
 func (s *Server) probeMySQL(ctx context.Context, recs []*services.View) runtimeProbe {
 	p := runtimeProbe{}
-	bin := filepath.Join(s.Cfg.BrewPrefix, "bin", "mysqld")
-	if _, err := os.Stat(bin); err == nil {
-		p.InstallPath = bin
+	// 二进制路径按**当前生效的引擎**解析（MySQL 8.4 / MariaDB），不写死：
+	// keg-only 的 mysql@8.4 根本不在 <brew>/bin 下（装了也显示"没装"），
+	// MariaDB 的 mysqld/mariadbd 则在 opt/mariadb/bin。读不到就如实标"未复核"，
+	// **不回退**到一个可能不存在的路径。
+	eng, engErr := s.databaseEngine()
+	switch {
+	case engErr != nil:
+		p.ProbeError = "数据库引擎未复核：" + engErr.Error()
+	case strings.TrimSpace(eng.BinDir) != "":
+		if bin := existingServerBinary(eng.BinDir); bin != "" {
+			p.InstallPath = bin
+		} else {
+			p.ProbeError = "数据库引擎未复核：在 " + eng.BinDir + " 里没找到 mysqld/mariadbd"
+		}
+	default:
+		note := strings.TrimSpace(eng.Note)
+		if note == "" {
+			note = "读不到当前生效的数据库引擎"
+		}
+		p.ProbeError = "数据库引擎未复核：" + note
 	}
 	host := s.Cfg.MySQLHost
 	if host == "" {
@@ -187,4 +204,16 @@ func (s *Server) probeMySQL(ctx context.Context, recs []*services.View) runtimeP
 		}
 	}
 	return p
+}
+
+// existingServerBinary 在解析出的引擎 bin 目录里找服务端二进制。
+// 两个引擎都提供 mysqld（MariaDB 是兼容符号），所以顺序不影响正确性。
+func existingServerBinary(binDir string) string {
+	for _, name := range []string{"mysqld", "mariadbd"} {
+		bin := filepath.Join(binDir, name)
+		if _, err := os.Stat(bin); err == nil {
+			return bin
+		}
+	}
+	return ""
 }

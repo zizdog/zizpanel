@@ -49,10 +49,14 @@ type LNMPSelection struct {
 // MySQL 是数据库。候选版本可以有很多个，但每次只能选一个。
 type lnmpComponent struct {
 	Key   string `json:"key"`   // nginx / php / mysql（前端按它分组，是稳定契约）
-	Label string `json:"label"` // 中文显示名（Nginx / PHP / MySQL）
-	// Prefix 是"哪些 formula 属于这个组件"的判据，例如 "php@"。
+	Label string `json:"label"` // 中文显示名（Nginx / PHP / MySQL）；也是人读文案里的组件名
+	// GroupLabel 是候选分组的标题；空 = 用 Label。
+	// 「数据库」这一位有两个引擎（MySQL 8.4 / MariaDB），只写 MySQL 会让 MariaDB 看不见。
+	GroupLabel string `json:"-"`
+	// Prefixes 是"哪些 formula 属于这个组件"的判据，例如 "php@"。
 	// 用前缀而不是枚举版本号：目录里加一个新版本时这里不用改。
-	Prefix string `json:"-"`
+	// mysql 位有两个引擎，所以是两条前缀（mysql@… 与 mariadb）。
+	Prefixes []string `json:"-"`
 	// Port 是"是否真的起来了"的判定端口（PHP 恒为 0，见 Ports() 的说明）。
 	Port int `json:"port"`
 }
@@ -74,18 +78,21 @@ type lnmpComponent struct {
 //
 // 判据是前缀 + 注释说明，不是把版本号抄一份：将来加 php@8.5 只需目录里加条目。
 var lnmpComponents = []lnmpComponent{
-	{Key: "nginx", Label: "Nginx", Prefix: "nginx", Port: 80},
-	{Key: "php", Label: "PHP", Prefix: "php@", Port: 0},
-	{Key: "mysql", Label: "MySQL", Prefix: "mysql@", Port: 3306},
+	{Key: "nginx", Label: "Nginx", Prefixes: []string{"nginx"}, Port: 80},
+	{Key: "php", Label: "PHP", Prefixes: []string{"php@"}, Port: 0},
+	// 数据库位有两个引擎（MySQL 8.4 / MariaDB），两者默认共用数据目录与 3306，
+	// 所以它们是**同一个组件位的两个候选**，不是两个组件（见 lnmp_engine.go 的护栏）。
+	{Key: "mysql", Label: "MySQL", GroupLabel: "MySQL / MariaDB",
+		Prefixes: []string{"mysql@", "mariadb"}, Port: 3306},
 }
 
 // lnmpUnknownGroupHint 是"这个 formula 不属于 LNMP 三件套"时给出的人话原因。
 //
 // 单独抽出来是因为两处都要用（校验与候选推导），而且这句话是**给用户看的
 // 产品解释**，不该散落在两个地方各写一个版本。模板参数是 formula 名。
-const lnmpUnknownGroupHint = "%s 不属于一键 LNMP 能收尾的组件（只支持 nginx / PHP / MySQL）。" +
+const lnmpUnknownGroupHint = "%s 不属于一键 LNMP 能收尾的组件（只支持 nginx / PHP / MySQL / MariaDB）。" +
 	"PostgreSQL 虽然也在「网站环境」里，但它需要独立的数据目录与账号体系，" +
-	"一键 LNMP 的收尾（默认站点、MySQL 初始化与 root 凭据闭环）会对它无效 —— " +
+	"一键 LNMP 的收尾（默认站点、数据库初始化与 root 凭据闭环）会对它无效 —— " +
 	"请到「应用市场 → 网站环境」里单独安装它"
 
 // lnmpGroupOf 返回某个 formula 属于哪个组件位；不属于三件套时返回 false。
@@ -97,8 +104,10 @@ func lnmpGroupOf(formula string) (lnmpComponent, bool) {
 		return lnmpComponent{}, false
 	}
 	for _, c := range lnmpComponents {
-		if strings.HasPrefix(f, c.Prefix) {
-			return c, true
+		for _, p := range c.Prefixes {
+			if strings.HasPrefix(f, p) {
+				return c, true
+			}
 		}
 	}
 	return lnmpComponent{}, false
@@ -168,7 +177,7 @@ func (s LNMPSelection) ensureComponentsPresent() error {
 		return nil
 	}
 	return fmt.Errorf("一键 LNMP 需要在 %s 各选一个版本，"+
-		"现在没有选：%s（一个都不能少：nginx 是入口、PHP 负责解析站点、MySQL 是数据库）",
+		"现在没有选：%s（一个都不能少：nginx 是入口、PHP 负责解析站点、数据库是 MySQL 或 MariaDB）",
 		lnmpComponentLabels(), strings.Join(missing, "、"))
 }
 
@@ -247,13 +256,39 @@ func (s LNMPSelection) ComponentsText() string {
 		if f == "" {
 			continue
 		}
-		if v := lnmpFormulaVersion(f); v != "" {
-			parts = append(parts, c.Label+" "+v)
-			continue
-		}
-		parts = append(parts, f)
+		parts = append(parts, lnmpComponentTextName(c, f))
 	}
 	return strings.Join(parts, " / ")
+}
+
+// lnmpComponentTextName 返回某个组件在人读清单里的名字。
+//
+// 数据库位有两个引擎：MariaDB 的 formula 没有 @版本，沿用组件名会变成
+// "日志说 MySQL、装的是 MariaDB"。所以按 formula 取名，取不到版本时用
+// 目录展示名（MariaDB 13.0），再取不到才退回 formula 全名。
+func lnmpComponentTextName(c lnmpComponent, formula string) string {
+	mariadb := c.Key == "mysql" && dbEngineOfFormula(formula) == "mariadb"
+	if !mariadb {
+		if v := lnmpFormulaVersion(formula); v != "" {
+			return c.Label + " " + v
+		}
+		return formula
+	}
+	if v := lnmpFormulaVersion(formula); v != "" {
+		return "MariaDB " + v
+	}
+	if a, ok := lnmpCatalogApp(formula); ok && strings.TrimSpace(a.Name) != "" {
+		return a.Name
+	}
+	return formula
+}
+
+// DBEngine 返回本次选择的数据库引擎（"mysql" / "mariadb"；没选/认不出时空串）。
+//
+// 引擎是 formula 的函数（唯一映射见 lnmp_engine.go 的 dbEngineFormulas），
+// 所以不额外存一份状态 —— 两份状态必然漂。
+func (s LNMPSelection) DBEngine() string {
+	return dbEngineOfFormula(strings.TrimSpace(s.MySQL))
 }
 
 // lnmpFormulaVersion 从 formula 里取版本号（"php@8.4" → "8.4"，"nginx" → ""）。
@@ -344,14 +379,40 @@ func lnmpOptionsFromCatalog() []lnmpOptionGroup {
 	out := make([]lnmpOptionGroup, 0, len(lnmpComponents))
 	for _, c := range lnmpComponents {
 		opts := buckets[c.Key].options
-		// 排序：版本新的在前（"8.4" 在 "8.2" 之前），没有版本后缀的（nginx）
-		// 保持目录顺序。这样弹窗里默认推荐（php@8.2）不会因为目录顺序变化而漂。
-		sort.SliceStable(opts, func(i, j int) bool {
-			return compareFormulaVersion(opts[i].Formula, opts[j].Formula) > 0
-		})
-		out = append(out, lnmpOptionGroup{Key: c.Key, Label: c.Label, Options: opts})
+		// 排序：版本新的在前（"8.4" 在 "8.2" 之前），跨引擎保持目录顺序。
+		// 这样弹窗里默认推荐（php@8.2 / MySQL 8.4）不会因为目录顺序变化而漂。
+		sortLNMPOptions(opts)
+		label := strings.TrimSpace(c.GroupLabel)
+		if label == "" {
+			label = c.Label
+		}
+		out = append(out, lnmpOptionGroup{Key: c.Key, Label: label, Options: opts})
 	}
 	return out
+}
+
+// sortLNMPOptions 是候选排序的**唯一实现**（生产与测试都用它，免得两处漂）。
+func sortLNMPOptions(opts []lnmpOption) {
+	sort.SliceStable(opts, func(i, j int) bool {
+		fi, fj := opts[i].Formula, opts[j].Formula
+		// 跨家族（mysql@8.4 vs mariadb）不比版本号：它们的版本不可比，
+		// 硬比会把没有 @版本 的 mariadb 排到默认项前面。
+		if lnmpOptionFamily(fi) != lnmpOptionFamily(fj) {
+			return false
+		}
+		return compareFormulaVersion(fi, fj) > 0
+	})
+}
+
+// lnmpOptionFamily 是候选的"引擎/版本家族"：同族才比版本号。
+func lnmpOptionFamily(formula string) string {
+	if e := dbEngineOfFormula(formula); e != "" {
+		return e
+	}
+	if i := strings.Index(formula, "@"); i > 0 {
+		return formula[:i]
+	}
+	return formula
 }
 
 // compareFormulaVersion 比较两个同组 formula 的版本（"php@8.4" vs "php@8.2"）。
@@ -504,6 +565,10 @@ type lnmpSelectionInput struct {
 	Nginx *string `json:"nginx"`
 	PHP   *string `json:"php"`
 	MySQL *string `json:"mysql"`
+	// DBEngine 是**数据库引擎维度**（"mysql" / "mariadb"）。它决定 mysql 组件位
+	// 装哪个 formula（唯一映射见 lnmp_engine.go 的 dbEngineFormulas）。
+	// 与 MySQL 字段同时出现时必须一致（否则 400）——两者都指同一件事，不一致就是拼错了。
+	DBEngine *string `json:"db_engine"`
 }
 
 // ParseLNMPSelection 把请求体解析成一份**已校验**的选择。
@@ -519,7 +584,20 @@ func ParseLNMPSelection(body []byte) (LNMPSelection, error) {
 		var in lnmpSelectionInput
 		if err := json.Unmarshal([]byte(raw), &in); err != nil {
 			return LNMPSelection{}, fmt.Errorf("请求内容不是合法的版本选择（%v）："+
-				"应为 {\"nginx\":\"nginx\",\"php\":\"php@8.2\",\"mysql\":\"mysql@8.4\"} 这样的 JSON", err)
+				"应为 {\"nginx\":\"nginx\",\"php\":\"php@8.2\",\"db_engine\":\"mysql\"} 这样的 JSON", err)
+		}
+		// 引擎维度先落地（它给 mysql 组件位定 formula），再用显式 mysql 字段覆盖。
+		if in.DBEngine != nil {
+			e := strings.TrimSpace(*in.DBEngine)
+			formula, ok := dbEngineFormulas[e]
+			if !ok {
+				if e == "" {
+					return LNMPSelection{}, fmt.Errorf("db_engine 传了空值：请选 mysql 或 mariadb" +
+						"（要默认值就别传这个字段）")
+				}
+				return LNMPSelection{}, fmt.Errorf("未知的数据库引擎 %q：只支持 mysql（MySQL 8.4）或 mariadb", e)
+			}
+			sel.MySQL = formula
 		}
 		apply := func(p *string, dst *string, label string) error {
 			if p == nil {
@@ -540,6 +618,14 @@ func ParseLNMPSelection(body []byte) (LNMPSelection, error) {
 		}
 		if err := apply(in.MySQL, &sel.MySQL, "MySQL"); err != nil {
 			return LNMPSelection{}, err
+		}
+		// 两个字段都指同一件事，不一致就是拼错了：静默取一个会让用户以为装的是另一个。
+		if in.DBEngine != nil && in.MySQL != nil {
+			if want := strings.TrimSpace(*in.DBEngine); dbEngineOfFormula(sel.MySQL) != want {
+				return LNMPSelection{}, fmt.Errorf("db_engine=%q 与 mysql=%q 不一致："+
+					"引擎决定装哪个 formula，请只按其中一个填（要 mariadb 就写 db_engine=mariadb）",
+					want, sel.MySQL)
+			}
 		}
 	}
 	if err := sel.Validate(); err != nil {

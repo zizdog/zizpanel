@@ -483,6 +483,15 @@ func (m *Manager) brewUninstallPlan(ctx context.Context, app App, brew BrewState
 			"面板也不会碰**；本计划只涉及 " + strings.Join(phpConfig, "、") + "。" +
 			"不勾选「同时删除该版本的配置」时这些也原样保留"
 	}
+	// 数据库引擎（MySQL 8.4 / MariaDB）：数据目录里是用户全部的库。
+	// 只**点名路径**并明确保留，绝不放进 DataPaths —— 那个勾选项会把它删掉。
+	if dbEngineOfFormula(formula) != "" {
+		datadir := filepath.Join(m.brewPrefix(), "var", "mysql")
+		p.Steps = append(p.Steps, "数据目录 "+datadir+" 会原样保留（你的库都在里面）："+
+			"确认不再需要时可手工删除，面板不会自动删")
+		p.KeepNote += "；数据目录 " + datadir + " 保留（你的库都在里面，" +
+			"但两个引擎不能交替使用同一个数据目录：切换要先迁移数据）"
+	}
 	return p
 }
 

@@ -1385,26 +1385,28 @@ func (s *Server) handleLNMPOptions(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{
 		"groups": groups,
 		"default": map[string]string{
-			"nginx": def.Nginx,
-			"php":   def.PHP,
-			"mysql": def.MySQL,
+			"nginx":     def.Nginx,
+			"php":       def.PHP,
+			"mysql":     def.MySQL,
+			"db_engine": def.DBEngine(),
 		},
 	})
 }
 
-// handleInstallLNMP 一键 LNMP（nginx + PHP + MySQL 的组合动作）。
+// handleInstallLNMP 一键 LNMP（nginx + PHP + 数据库的组合动作）。
 //
 // 这是个"组合动作"：会 brew 安装用户选中的三个包，并做四件包管理管不到的
-// 收尾工作（nginx 改 listen 80、建 vhosts/include、初始化 MySQL、
+// 收尾工作（nginx 改 listen 80、建 vhosts/include、初始化数据库、
 // 注册系统级守护进程）。详见 internal/services/lnmp.go 里的说明。
 //
 // 请求体（可空，保证向后兼容）：
 //
-//	{"nginx":"nginx","php":"php@8.2","mysql":"mysql@8.4"}
+//	{"nginx":"nginx","php":"php@8.2","db_engine":"mysql"}
 //
 // 字段全部可选：不传 = 用默认选择（= 改造前的行为：nginx / php@8.2 /
-// mysql@8.4）。传了非法值（未知 formula、postgresql、空串）一律 **400 + 人话**，
-// 绝不用默认值替用户做决定 —— 那会装出与用户选择不同的版本。
+// mysql@8.4）。db_engine 决定数据库装 mysql@8.4 还是 mariadb；与显式 mysql
+// 字段不一致时一律 400。传了非法值（未知 formula、postgresql、空串、未知引擎）
+// 一律 **400 + 人话**，绝不用默认值替用户做决定 —— 那会装出与用户选择不同的版本。
 //
 // 异步执行：这一步动辄十几分钟，同步请求期间用户只能看到"请等待"，
 // 而且任务挂在 r.Context() 上 —— 一刷新就把 brew 杀了。现在交给任务中心，
@@ -1421,6 +1423,13 @@ func (s *Server) handleInstallLNMP(w http.ResponseWriter, r *http.Request) {
 		// 看到一个红叉，而真正的原因（版本选择不合法）本该是表单上的一句话。
 		s.audit(r, "install_lnmp", "lnmp", "版本选择被拒绝: "+err.Error(), false, "")
 		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 数据库引擎互斥护栏也在这里答（同样在开任务之前）：装 MariaDB 时若 MySQL
+	// 正在跑，用户当场就该看到"两者共用数据目录/3306、面板不会替你停它"。
+	if c := s.svcManager().CheckDBEngineConflict(r.Context(), sel.MySQL); c.Blocked != "" {
+		s.audit(r, "install_lnmp", "lnmp", "数据库引擎冲突被拒绝: "+c.Blocked, false, "")
+		fail(w, http.StatusBadRequest, c.Blocked)
 		return
 	}
 	title := "一键 LNMP（" + sel.ComponentsText() + "）"

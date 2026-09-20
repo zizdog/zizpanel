@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -61,13 +60,12 @@ const (
 	mysqlCredUnreachable
 )
 
-// isMySQLFormula 判断某个 brew formula 是不是 MySQL。
+// isMySQLFormula 判断某个 brew formula 是不是"面板要闭环 root 凭据的数据库引擎"。
 //
-// 与 tools/system-services.sh 里的 `mysql@8.4|mysql` 判定保持一致：
-// 两条安装路径（一键 LNMP 与市场单独安装）都必须覆盖到，
-// 否则"从市场单独装 MySQL"就会绕过凭据闭环，又回到不一致的状态。
+// 覆盖 MySQL 8.4 与 MariaDB：两条安装路径（一键 LNMP 与市场单独安装）都必须覆盖到，
+// 否则"从市场单独装"就会绕过凭据闭环，又回到"面板不知道 root 口令"的状态。
 func isMySQLFormula(formula string) bool {
-	return formula == "mysql@8.4" || formula == "mysql"
+	return dbEngineOfFormula(formula) != ""
 }
 
 // mysqlAdminFor 返回生产实现（单测可用 mysqlAdminOverride 替换）。
@@ -89,13 +87,7 @@ type realMySQLAdmin struct {
 }
 
 func (r realMySQLAdmin) client(password string) (*mysql.Client, error) {
-	binDir := filepath.Join(r.m.brewPrefix(), "opt", "mysql@8.4", "bin")
-	if _, err := os.Stat(filepath.Join(binDir, "mysql")); err != nil {
-		binDir = filepath.Join(r.m.brewPrefix(), "bin")
-	}
-	if _, err := os.Stat(filepath.Join(binDir, "mysql")); err != nil {
-		return nil, fmt.Errorf("未找到 mysql 客户端（%s）：MySQL 可能没有装好", binDir)
-	}
+	binDir := r.binDir()
 	user := strings.TrimSpace(r.cred.User)
 	if user == "" {
 		user = "root"
@@ -123,6 +115,27 @@ func (r realMySQLAdmin) client(password string) (*mysql.Client, error) {
 		UserName: r.m.opt.UserName,
 		UserHome: r.m.opt.UserHome,
 	}), nil
+}
+
+// binDir 解析客户端目录：优先"这次在装/在跑的那个引擎"（cred.Formula），
+// 再看装着哪个引擎的 keg，最后退回 <brew>/bin。
+//
+// 刻意**不**因为"两个引擎都装着"就报错：这一步只需要一个能跑的客户端，
+// 连的是谁由 host/socket 决定，而两个引擎的客户端协议兼容（MariaDB 还提供
+// mysql 名字的兼容符号）。真正"该连哪个引擎"的判断在网站运行时与数据库页。
+func (r realMySQLAdmin) binDir() string {
+	prefix := r.m.brewPrefix()
+	if f := strings.TrimSpace(r.cred.Formula); f != "" {
+		if p, ok := mysql.ResolveEngineFor(prefix, r.cred.Socket, f); ok {
+			return p.BinDir
+		}
+	}
+	for _, f := range []string{"mysql@8.4", "mariadb"} {
+		if p, ok := mysql.ResolveEngineFor(prefix, r.cred.Socket, f); ok {
+			return p.BinDir
+		}
+	}
+	return filepath.Join(prefix, "bin")
 }
 
 func (r realMySQLAdmin) Ping(ctx context.Context, password string) error {
@@ -171,47 +184,61 @@ func (m *Manager) ensureMySQLRootCredentialInner(ctx context.Context, result *In
 	if m.opt.MySQLCredential == nil || m.opt.SetMySQLRootPassword == nil {
 		// 未接入面板配置（理论上只有测试/命令行触发会这样）：
 		// 如实说明跳过了，绝不假装"凭据已闭环"。
-		result.step(ctx, "未接入面板配置，跳过 MySQL root 凭据闭环（面板可能连不上数据库）")
+		result.step(ctx, "未接入面板配置，跳过数据库 root 凭据闭环（面板可能连不上数据库）")
 		return nil
 	}
 	cred := m.opt.MySQLCredential()
+	if strings.TrimSpace(cred.Formula) == "" {
+		// 本次装的是哪个引擎：由 initMySQLDataDir 记在结果里（web 层注入的凭据
+		// 只知道 host/socket，不知道引擎）。空 = 未接入，文案退回"数据库"。
+		cred.Formula = result.mysqlFormula
+	}
 	if strings.TrimSpace(cred.User) == "" {
 		cred.User = "root"
 	}
+	// 用户可见文案里的引擎名：装了 MariaDB 就不许写 MySQL（否则用户以为装错了）。
+	name := dbEngineFormulaDisplay(cred.Formula)
+	if name == "" {
+		name = "数据库"
+	}
 	admin := m.mysqlAdminFor(cred)
 
-	// 刚注册完 LaunchDaemon 的 mysqld 要几秒才 bind socket，
+	// 刚注册完 LaunchDaemon 的服务要几秒才 bind socket，
 	// 所以"连不上"要在 30 秒内重试；而"口令不对"是立刻有结论的，不重试。
 	state, probeErr := m.probeUntilAnswered(ctx, admin, cred.Password, m.mysqlProbeWait())
 	switch state {
 	case mysqlCredOK:
 		if strings.TrimSpace(cred.Password) != "" {
-			result.step(ctx, "MySQL root 凭据自检通过：面板持有的口令可以正常连接")
+			result.step(ctx, name+" root 凭据自检通过：面板持有的口令可以正常连接")
 			return nil
 		}
 		// 连上了、而面板持有的口令是空的 —— 服务器此刻确实接受空口令。
 		if !result.mysqlFreshInit {
 			// 不是本次初始化出来的库：**不动**用户的 root 口令（那属于破坏性操作），
-			// 只如实提醒。空口令的 MySQL 意味着任何能连到 3306 的程序都能拿到全部库。
-			msg := "MySQL root 当前没有设置口令（面板用空口令可以连上）。功能不受影响，" +
+			// 只如实提醒。空口令意味着任何能连到 3306 的程序都能拿到全部库。
+			msg := name + " root 当前没有设置口令（面板用空口令可以连上）。功能不受影响，" +
 				"但任何能连到 3306 的程序都能读写全部数据库；" +
 				"建议到「账号与权限」里给 root 点「改密码」设一个（面板会一并记进自己的配置）"
 			result.step(ctx, "警告："+msg)
 			result.Warning = appendLNMPWarning(result.Warning, msg)
 			return nil
 		}
-		// 本次初始化（--initialize-insecure）：现在就把口令定下来并记住。
+		// 本次初始化（root 空口令）：现在就把口令定下来并记住。
 		return m.setAndRecordMySQLPassword(ctx, result, admin, cred)
 
 	case mysqlCredAuthFailed:
-		msg := "MySQL root 凭据与服务器不一致：" + probeErr.Error() +
+		msg := name + " root 凭据与服务器不一致：" + probeErr.Error() +
 			"；面板不会自动改一台已有数据机器上的 root 口令。" + mysql.RecoveryGuide(cred.User)
 		result.Warning = appendLNMPWarning(result.Warning, msg)
 		return errors.New(msg)
 
 	default: // mysqlCredUnreachable
-		msg := "无法连接 MySQL（服务可能没起来或没在监听）：" + probeErr.Error() +
-			"；可在「服务管理」查看 mysql@8.4 的日志，确认 socket/3306 就绪后重跑本任务"
+		where := dbEngineFormulaDisplay(cred.Formula)
+		if where == "" {
+			where = "数据库服务"
+		}
+		msg := "无法连接 " + name + "（服务可能没起来或没在监听）：" + probeErr.Error() +
+			"；可在「服务管理」查看 " + where + " 的日志，确认 socket/3306 就绪后重跑本任务"
 		result.Warning = appendLNMPWarning(result.Warning, msg)
 		return errors.New(msg)
 	}
@@ -265,13 +292,17 @@ func (m *Manager) probeMySQLCredential(ctx context.Context, admin mysqlAdmin, pa
 	}
 }
 
-// setAndRecordMySQLPassword 限时问一次口令，然后把 MySQL 与面板配置一起对齐。
+// setAndRecordMySQLPassword 限时问一次口令，然后把数据库与面板配置一起对齐。
 func (m *Manager) setAndRecordMySQLPassword(ctx context.Context, result *InstallResult, admin mysqlAdmin, cred MySQLCredential) error {
+	name := dbEngineFormulaDisplay(cred.Formula)
+	if name == "" {
+		name = "数据库"
+	}
 	timeout := m.opt.MySQLInputTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	raw, provided := m.askMySQLRootPassword(ctx, timeout)
+	raw, provided := m.askMySQLRootPassword(ctx, timeout, name)
 	// 不 Trim 用户输入的值本身：口令里的空格是合法的，悄悄改掉它会让用户
 	// "照着自己输入的连不上"。只有"全是空白"才当成留空（＝自动生成）。
 	password := raw
@@ -296,14 +327,14 @@ func (m *Manager) setAndRecordMySQLPassword(ctx context.Context, result *Install
 
 	// 这一步的文案里绝不带口令本身：任务步骤会进 InstallResult.Steps，
 	// 而 Steps 会被写进审计（summarizeResult）并被永久保存。
-	result.step(ctx, "正在为 MySQL root 设置口令（"+source+"；口令不会出现在日志或审计里）")
+	result.step(ctx, "正在为 "+name+" root 设置口令（"+source+"；口令不会出现在日志或审计里）")
 	if err := admin.SetRootPassword(ctx, password); err != nil {
-		return fmt.Errorf("设置 MySQL root 口令失败: %w", err)
+		return fmt.Errorf("设置 %s root 口令失败: %w", name, err)
 	}
 	// 自检：用**新口令**真连一次。ALTER USER 之后不再 FLUSH（见 mysql/admin.go），
 	// 所以这里就是权威判定 —— 旧的"改完再 FLUSH"正是把面板锁在门外的原因。
 	if err := admin.Ping(ctx, password); err != nil {
-		msg := "已在 MySQL 上设置 root 口令，但用新口令连接自检失败：" + err.Error() +
+		msg := "已在 " + name + " 上设置 root 口令，但用新口令连接自检失败：" + err.Error() +
 			"。" + mysql.RecoveryGuide(cred.User)
 		result.Warning = appendLNMPWarning(result.Warning, msg)
 		return errors.New(msg)
@@ -312,15 +343,15 @@ func (m *Manager) setAndRecordMySQLPassword(ctx context.Context, result *Install
 	// **在写配置之前就挂上去** —— 万一下面写盘失败，这里是口令唯一的记录。
 	result.Credentials = append(result.Credentials, Credential{
 		Key: "mysql_root_password", Value: password,
-		Label: "MySQL root 口令（" + source + "）",
+		Label: name + " root 口令（" + source + "）",
 	})
 	if err := m.opt.SetMySQLRootPassword(password); err != nil {
-		msg := "MySQL root 口令已设置成功，但写入面板配置失败：" + err.Error() +
+		msg := name + " root 口令已设置成功，但写入面板配置失败：" + err.Error() +
 			"；面板重启后会连不上数据库。请立刻复制本次任务结果里的一次性凭据，并在「数据库 → 连接设置」手工填入"
 		result.Warning = appendLNMPWarning(result.Warning, msg)
 		return errors.New(msg)
 	}
-	result.step(ctx, "MySQL root 凭据已闭环：口令已写入面板配置（0600），不写日志/审计；"+
+	result.step(ctx, name+" root 凭据已闭环：口令已写入面板配置（0600），不写日志/审计；"+
 		"之后面板的所有库操作、以及「数据库」页面都用它。要换成别的口令，到「账号与权限」给 root 改密码即可")
 	return nil
 }
@@ -329,7 +360,7 @@ func (m *Manager) setAndRecordMySQLPassword(ctx context.Context, result *Install
 //
 // 返回值 (口令, 是否由用户提供)。**没有输入通道时直接返回 false（＝自动生成）**：
 // 从命令行/脚本触发的无人值守安装不该在这里白等 60 秒。
-func (m *Manager) askMySQLRootPassword(ctx context.Context, timeout time.Duration) (string, bool) {
+func (m *Manager) askMySQLRootPassword(ctx context.Context, timeout time.Duration, name string) (string, bool) {
 	provider := inputFrom(ctx)
 	if provider == nil {
 		emit(ctx, tasks.LevelStep, "当前没有可用的输入通道，直接自动生成强随机口令")
@@ -338,11 +369,11 @@ func (m *Manager) askMySQLRootPassword(ctx context.Context, timeout time.Duratio
 	// 这条 Level=Input 的日志是给用户看的提示；结构化的 input_required
 	// （key/倒计时/截止时间）由任务中心单独下发给前端，见 tasks.InputRequest。
 	emit(ctx, tasks.LevelInput, fmt.Sprintf(
-		"请在 %d 秒内输入 MySQL root 口令（留空或超时＝自动生成强随机口令后继续）",
-		int(timeout/time.Second)))
+		"请在 %d 秒内输入 %s root 口令（留空或超时＝自动生成强随机口令后继续）",
+		int(timeout/time.Second), name))
 	return provider.WaitInput(ctx, tasks.InputRequest{
 		Key:    "mysql_root_password",
-		Label:  "MySQL root 口令",
+		Label:  name + " root 口令",
 		Hint:   "留空或超时＝自动生成强随机口令。口令只写进面板配置（0600），不进日志、不进审计。",
 		Secret: true,
 	}, timeout)

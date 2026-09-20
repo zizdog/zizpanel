@@ -55,6 +55,19 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 	formulas := sel.Formulas()
 	ports := sel.Ports()
 
+	// ---- 0. 数据库引擎互斥护栏（必须在任何写操作之前）----
+	// MariaDB 与 MySQL 默认共用数据目录 <brew>/var/mysql 与 3306：对方正在跑时
+	// **拒绝**这次安装，绝不替用户停服务（那可能是他的生产库，见 lnmp_engine.go）。
+	mysqlFormula := lnmpSelectedMySQL(formulas)
+	if mysqlFormula != "" {
+		if c := m.CheckDBEngineConflict(ctx, mysqlFormula); c.Blocked != "" {
+			return fmt.Errorf("不能安装 %s：%s", mysqlFormula, c.Blocked)
+		} else if c.Warning != "" {
+			result.Warning = appendLNMPWarning(result.Warning, c.Warning)
+			result.step(ctx, "警告："+c.Warning)
+		}
+	}
+
 	// 全新 macOS 上没有 Homebrew，而 LNMP 三件套全靠它：缺什么装什么（含前置的 CLT），
 	// 不再把用户赶回命令行。
 	if _, err := os.Stat(m.opt.BrewBin); err != nil {
@@ -71,19 +84,8 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 	result.step(ctx, "开始安装 LNMP 环境（"+sel.ComponentsText()+"）")
 
 	// ---- 1. 逐包安装 ----
-	for _, f := range formulas {
-		if m.brewHas(ctx, f) {
-			result.step(ctx, f+" 已安装，跳过")
-			continue
-		}
-		result.Steps = append(result.Steps,
-			fmt.Sprintf("正在 brew install %s（国内镜像下通常几分钟）", f))
-		if _, err := m.brewInstall(ctx, result, 40*time.Minute, f); err != nil {
-			// 失败要能让用户自己救：给出手工命令与镜像提示，不只抛一句 "brew install 失败"。
-			return fmt.Errorf("安装 %s 失败: %w；可在终端手工重试 `brew install %s`"+
-				"（若下载很慢，面板已优先走镜像站，重跑本任务会继续用镜像）", f, err, f)
-		}
-		result.step(ctx, f+" 安装完成")
+	if err := m.installLNMPPackages(ctx, result, formulas); err != nil {
+		return err
 	}
 
 	// ---- 2. 本机约定的收尾工作 ----
@@ -116,13 +118,12 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 	// 整个 80 起不来。启动服务**之前**把这棵树交还真实用户（失败只告警，不阻断）。
 	m.ensureNginxLogOwnership(ctx, result)
 
-	// ---- 2a. MySQL 数据目录 ----
+	// ---- 2a. 数据库数据目录 ----
 	//
-	// 按**本次选的 MySQL formula** 判断：写死版本时用户选了别的版本就会静默跳过
-	// （数据目录没初始化 → mysqld 起不来）。认不出 MySQL 组件就跳过。
-	mysqlFormula := lnmpSelectedMySQL(formulas)
+	// 按**本次选的数据库 formula** 判断：写死版本时用户选了别的版本就会静默跳过
+	// （数据目录没初始化 → 服务起不来）。初始化命令本身也是引擎相关的（见该函数）。
 	if mysqlFormula != "" && m.brewHas(ctx, mysqlFormula) {
-		if err := m.initMySQLDataDir(ctx, result); err != nil {
+		if err := m.initMySQLDataDir(ctx, result, mysqlFormula); err != nil {
 			return err
 		}
 	}
@@ -201,9 +202,9 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 
 	// ---- 5. phpMyAdmin ----
 	// 放最后（依赖 nginx 与 PHP-FPM 都已就绪），失败不阻断整个 LNMP。
-	// 没选 MySQL 就跳过（只会得到一个永远登录不上的入口，比没装更糟），但要如实说明。
+	// 没选数据库就跳过（只会得到一个永远登录不上的入口，比没装更糟），但要如实说明。
 	if mysqlFormula == "" {
-		result.step(ctx, "本次没有选择 MySQL，跳过 phpMyAdmin（数据库管理界面）的部署")
+		result.step(ctx, "本次没有选择数据库，跳过 phpMyAdmin（数据库管理界面）的部署")
 	} else {
 		result.step(ctx, "正在部署 phpMyAdmin（数据库管理界面）")
 		if err := m.InstallPhpMyAdmin(ctx, result); err != nil {
@@ -213,14 +214,36 @@ func (m *Manager) InstallLNMP(ctx context.Context, result *InstallResult, sel LN
 		}
 	}
 
-	// ---- 6. MySQL root 凭据闭环（必须有，见 lnmp_mysql_credentials.go）----
+	// ---- 6. root 凭据闭环（必须有，见 lnmp_mysql_credentials.go）----
 	// 放最后：失败＝任务失败（凭据不一致会让之后每次库操作都撞 1045），但前面装好的不报废。
-	// 没选 MySQL 就没有这一步，绝不因此报"凭据核对失败"。
+	// 没选数据库就没有这一步，绝不因此报"凭据核对失败"。
 	if mysqlFormula != "" {
-		result.step(ctx, "正在核对 MySQL root 凭据（面板配置与服务器是否一致）")
+		result.step(ctx, "正在核对 "+dbEngineFormulaDisplay(mysqlFormula)+" root 凭据（面板配置与服务器是否一致）")
 		if err := m.ensureMySQLRootCredential(ctx, result); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// installLNMPPackages 逐个 brew 安装本次选中的 formula（顺序由调用方给定，nginx 在前）。
+//
+// 单独成函数是为了可测试：InstallLNMP 第一件事就要求 root，单测到不了这个循环；
+// 而"选了 MariaDB 却去装 mysql@8.4"正是最该被门禁钉住的一类错。
+func (m *Manager) installLNMPPackages(ctx context.Context, result *InstallResult, formulas []string) error {
+	for _, f := range formulas {
+		if m.brewHas(ctx, f) {
+			result.step(ctx, f+" 已安装，跳过")
+			continue
+		}
+		result.Steps = append(result.Steps,
+			fmt.Sprintf("正在 brew install %s（国内镜像下通常几分钟）", f))
+		if _, err := m.brewInstall(ctx, result, 40*time.Minute, f); err != nil {
+			// 失败要能让用户自己救：给出手工命令与镜像提示，不只抛一句 "brew install 失败"。
+			return fmt.Errorf("安装 %s 失败: %w；可在终端手工重试 `brew install %s`"+
+				"（若下载很慢，面板已优先走镜像站，重跑本任务会继续用镜像）", f, err, f)
+		}
+		result.step(ctx, f+" 安装完成")
 	}
 	return nil
 }
@@ -292,31 +315,58 @@ func (m *Manager) fixNginxBaseConfig(ctx context.Context, result *InstallResult)
 	return text != orig, nil
 }
 
-// initMySQLDataDir 在数据目录为空时初始化 MySQL。
+// initMySQLDataDir 在数据目录为空时初始化数据库，命令**按引擎**选：
+//   - MySQL 8.4：`mysqld --initialize-insecure`（root 空口令）；
+//   - MariaDB：`mariadb-install-db`（MariaDB 不认 --initialize-insecure；
+//     --auth-root-authentication-method=normal 也是要 root 空口令，面板随后设口令）。
 //
-// 必须降权到真实用户：mysqld 拒绝以 root 运行，而且数据目录的归属必须与后续
+// 二进制走 <brew>/opt/<formula>/bin（keg-only 的 mysql@8.4 不在 <brew>/bin 下，
+// 写 <brew>/bin/mysqld 会得到一个"莫名其妙初始化失败"——真机上跑着的就是
+// /opt/homebrew/opt/mysql@8.4/bin/mysqld）。
+//
+// 必须降权到真实用户：数据库服务拒绝以 root 运行，而且数据目录的归属必须与后续
 // 运行身份一致，否则启动时会报权限错误。
-func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult) error {
+func (m *Manager) initMySQLDataDir(ctx context.Context, result *InstallResult, formula string) error {
+	name := dbEngineFormulaDisplay(formula)
 	datadir := filepath.Join(m.brewPrefix(), "var", "mysql")
+	if result != nil {
+		result.mysqlFormula = formula
+	}
 	if entries, err := os.ReadDir(datadir); err == nil && len(entries) > 0 {
 		return nil // 已经初始化过
 	}
-	result.step(ctx, "MySQL 数据目录未初始化，正在初始化（root 初始无口令，随后会设置一个随机口令并记进面板配置）")
+	result.step(ctx, name+" 数据目录未初始化，正在初始化（root 初始无口令，随后会设置一个随机口令并记进面板配置）")
 	if err := os.MkdirAll(datadir, 0o755); err != nil {
-		return fmt.Errorf("创建 MySQL 数据目录失败: %w", err)
+		return fmt.Errorf("创建 %s 数据目录失败: %w", name, err)
 	}
 	if m.opt.UserName != "" {
 		_ = chownTo(m.opt.UserName, datadir)
 	}
-	mysqld := filepath.Join(m.brewPrefix(), "bin", "mysqld")
-	if _, err := m.runAsUser(ctx, 5*time.Minute, mysqld,
-		"--initialize-insecure", "--datadir="+datadir); err != nil {
-		return fmt.Errorf("MySQL 初始化失败: %w", err)
+	exe, args := mysqlInitCommand(m.brewPrefix(), formula, datadir)
+	if _, err := m.runAsUser(ctx, 5*time.Minute, exe, args...); err != nil {
+		return fmt.Errorf("%s 初始化失败: %w", name, err)
 	}
-	result.step(ctx, "MySQL 数据目录初始化完成")
+	result.step(ctx, name+" 数据目录初始化完成")
 	// 只有本次初始化出来的库，面板才敢设随机口令；已有数据目录的机器不动用户的口令。
 	result.mysqlFreshInit = true
 	return nil
+}
+
+// mysqlInitCommand 返回"初始化数据目录"的命令（**按引擎选**）。
+//
+// 单独抽出来是为了能被门禁钉住：MySQL 用 `mysqld --initialize-insecure`，
+// MariaDB 用 `mariadb-install-db`（MariaDB 不认 --initialize-insecure，
+// 拿 MySQL 的命令去跑只会得到一个看不懂的失败）。
+func mysqlInitCommand(brewPrefix, formula, datadir string) (string, []string) {
+	optDir := filepath.Join(brewPrefix, "opt", formula)
+	binDir := filepath.Join(optDir, "bin")
+	if dbEngineOfFormula(formula) == "mariadb" {
+		return filepath.Join(binDir, "mariadb-install-db"), []string{
+			"--no-defaults", "--basedir=" + optDir, "--datadir=" + datadir,
+			"--auth-root-authentication-method=normal",
+		}
+	}
+	return filepath.Join(binDir, "mysqld"), []string{"--initialize-insecure", "--datadir=" + datadir}
 }
 
 // ensureLNMPPHPEndpoints 对**本次选中的** PHP 版本做专属端点闭环（只对 php@x.y 生效，

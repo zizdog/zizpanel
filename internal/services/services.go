@@ -225,6 +225,11 @@ type Manager struct {
 	// `brew list` 与 /Library/LaunchDaemons（违反"单测不许碰真实服务"），
 	// 结论也会随开发机装没装东西而漂（本机恰好装着 php@8.2 的系统守护进程）。
 	lnmpInstalledProbe func(formula string) bool
+	// dbEngineProbe 仅供测试：替换"另一个数据库引擎装没装/在不在跑"的探测。
+	//
+	// 没有它，互斥护栏的单测会去跑真实 `brew list --versions` 与 lsof 3306
+	// （违反"单测不许碰真实服务"），结论也会随开发机上 MySQL 开没开而漂。
+	dbEngineProbe func(ctx context.Context, formula string) DBEngineProbeResult
 	// mirrorProbeCache 缓存探测结果：一次会话只探一次。
 	//
 	// 为什么必须有：brewEnv 会被**每次 brew 调用**用到（brew list --versions、
@@ -378,6 +383,9 @@ type MySQLCredential struct {
 	Socket   string
 	User     string
 	Password string
+	// Formula 是"当前在装/在跑的那个引擎的 formula"（mysql@8.4 / mariadb；空 = 不知道）。
+	// 只用于两件事：选一个存在的客户端二进制、以及用户可见文案里的引擎名。
+	Formula string
 }
 
 // NewManager 创建服务管理器。
@@ -409,6 +417,17 @@ func (m *Manager) SetBrewInstalledProbeForTest(fn func(ctx context.Context) (map
 	prev := m.brewInstalledProbe
 	m.brewInstalledProbe = fn
 	return func() { m.brewInstalledProbe = prev }
+}
+
+// SetLaunchdDirsForTest 替换"launchd 里找 plist 的目录集合"，返回值供测试恢复。
+//
+// 与 launchdDirsOverride 字段同一个理由（web 层单测够不到未导出字段）：
+// 数据库引擎护栏会按"要装的引擎自己的 launchd 实例"排除误报，默认实现会读
+// 真机 /Library/LaunchDaemons 并可能调 launchctl —— 单测必须能把它钉到临时目录。
+func (m *Manager) SetLaunchdDirsForTest(dirs []string) func() {
+	prev := m.launchdDirsOverride
+	m.launchdDirsOverride = dirs
+	return func() { m.launchdDirsOverride = prev }
 }
 
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，

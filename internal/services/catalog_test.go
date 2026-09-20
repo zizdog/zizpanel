@@ -48,6 +48,7 @@ func TestLNMPEntriesExposeConfigFile(t *testing.T) {
 		"php82":   "/php/8.2/php.ini",
 		"php84":   "/php/8.4/php.ini",
 		"mysql84": "/my.cnf",
+		"mariadb": "/my.cnf",
 	}
 	for id, suffix := range want {
 		app, ok := FindApp(id)

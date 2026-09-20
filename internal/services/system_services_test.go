@@ -41,6 +41,16 @@ func TestEmbeddedSystemServicesScriptMatchesRepoCopy(t *testing.T) {
 	if !strings.Contains(embeddedSystemServices, "check_php_fpm") {
 		t.Error("内置脚本必须按专属 socket 验证 php-fpm：只查 9000 会把装好的机器报成失败")
 	}
+	// MariaDB 与 MySQL 共用数据目录，但初始化命令不通用；端口复核也要认它，
+	// 否则脚本会"注册了 mariadb 却不验证它"（2026-09-20 加 MariaDB 时补）。
+	if !strings.Contains(embeddedSystemServices, "mariadb-install-db") ||
+		!strings.Contains(embeddedSystemServices, "--auth-root-authentication-method=normal") {
+		t.Error("内置脚本必须用 MariaDB 自己的初始化命令：" +
+			"mysqld --initialize-insecure 在 MariaDB 上会失败")
+	}
+	if !strings.Contains(embeddedSystemServices, `check_port "mariadb" 3306`) {
+		t.Error("内置脚本的端口复核必须认 mariadb（否则它的 3306 不会被验证）")
+	}
 }
 
 // TestMaterializeSystemServicesScriptWritesExecutable：

@@ -754,17 +754,24 @@ func TestSTTCatalogEntryIsWired(t *testing.T) {
 }
 
 // TestSTTPortIsUnique 确认新端口没和目录里别的条目撞车。
+//
+// 例外：同一个组件位的两个数据库引擎（MySQL 8.4 / MariaDB）故意共用 3306，
+// 装之前有互斥护栏（见 portSharingAllowed）。
 func TestSTTPortIsUnique(t *testing.T) {
 	seen := map[int]string{}
+	byPort := map[int]App{}
 	for _, a := range Catalog() {
 		for _, p := range []int{a.Port, a.UIPort} {
 			if p <= 0 {
 				continue
 			}
-			if other, dup := seen[p]; dup && other != a.ID {
+			if other, dup := seen[p]; dup && other != a.ID && !portSharingAllowed(byPort[p], a) {
 				t.Errorf("端口 %d 被 %s 与 %s 同时占用", p, other, a.ID)
 			}
-			seen[p] = a.ID
+			if _, ok := seen[p]; !ok {
+				seen[p] = a.ID
+				byPort[p] = a
+			}
 		}
 	}
 	if seen[STTPort] != STTAppID {

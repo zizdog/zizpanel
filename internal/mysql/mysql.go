@@ -28,7 +28,6 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -74,6 +73,11 @@ func lookupUserIDs(name string) (int, int, error) {
 // Client 是 MySQL 管理客户端。
 type Client struct {
 	opt Options
+	// 服务端版本只查一次并缓存：账号列表要据此选 MariaDB 兼容的 SQL，而概览
+	// 已经查过一次版本；不缓存就多付一次进程创建。Client 每请求一个，无过期问题。
+	verProbed bool
+	version   string
+	verErr    error
 }
 
 // NewClient 创建客户端。
@@ -187,9 +191,10 @@ func (c *Client) runSQL(ctx context.Context, sqlText string) ([]string, error) {
 }
 
 func (c *Client) exec(ctx context.Context, extra []string, stdin string) ([]string, error) {
-	bin := filepath.Join(c.opt.BinDir, "mysql")
-	if _, err := os.Stat(bin); err != nil {
-		return nil, fmt.Errorf("未找到 mysql 客户端: %s", bin)
+	// MariaDB 只保证 mariadb 一套名字时也要能用：两套名字都认（见 clientBinary）。
+	bin := clientBinary(c.opt.BinDir, "mysql")
+	if bin == "" {
+		return nil, fmt.Errorf("未找到 mysql / mariadb 客户端: %s", c.opt.BinDir)
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.opt.Timeout)
 	defer cancel()
@@ -315,16 +320,32 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Version 返回服务端版本。
+// Version 返回服务端版本（同一 Client 内只查一次，见 Client 的字段说明）。
 func (c *Client) Version(ctx context.Context) (string, error) {
+	if c.verProbed {
+		return c.version, c.verErr
+	}
+	c.verProbed = true
 	lines, err := c.query(ctx, "SELECT VERSION();")
+	switch {
+	case err != nil:
+		c.verErr = err
+	case len(lines) == 0:
+		c.verErr = errors.New("无法读取版本")
+	default:
+		c.version = lines[0]
+	}
+	return c.version, c.verErr
+}
+
+// isMariaDB 报告服务端是不是 MariaDB（查一次 VERSION()，用它自己的版本串判定，
+// 不靠安装路径猜）。探测失败返回 false：让原查询如实报错，不静默换一种 SQL。
+func (c *Client) isMariaDB(ctx context.Context) bool {
+	v, err := c.Version(ctx)
 	if err != nil {
-		return "", err
+		return false
 	}
-	if len(lines) == 0 {
-		return "", errors.New("无法读取版本")
-	}
-	return lines[0], nil
+	return strings.Contains(strings.ToLower(v), "mariadb")
 }
 
 // ---------- 数据库 ----------
@@ -438,6 +459,12 @@ type DBUser struct {
 	Privileges  []string `json:"privileges"`
 	IsLocked    bool     `json:"is_locked"`
 	HasPassword bool     `json:"has_password"`
+	// LockStateKnown 为 false 表示这个引擎**读不到**账号锁定状态。
+	//
+	// MariaDB 的 mysql.user 没有 account_locked 列（2026-09-20 本机真机实测：
+	// ERROR 1054 (42S22): Unknown column 'account_locked' in 'SELECT'），
+	// 所以 IsLocked=false 在那里**不代表"未锁定"**。界面据此显示"不支持/读不到"。
+	LockStateKnown bool `json:"lock_state_known"`
 	// AuthPlugin 是认证插件（mysql.user.plugin）。
 	//
 	// 为什么要回传它：HasPassword 只反映 authentication_string 是否为空，
@@ -456,14 +483,30 @@ var systemUsers = map[string]bool{
 	"mysql.infoschema": true, "root": true, "mysql": true,
 }
 
-// ListUsers 列出所有账号及其全局权限。
-func (c *Client) ListUsers(ctx context.Context) ([]DBUser, error) {
-	// 先从 mysql.user 拿账号基础信息（MySQL 8 用 authentication_string 判断是否有密码）
-	sqlText := `SELECT User, Host,
+// listUsersSQLMySQL 是 MySQL 的账号列表 SQL（逐字保留历史写法）。
+const listUsersSQLMySQL = `SELECT User, Host,
        IF(account_locked='Y','1','0'),
        IF(LENGTH(IFNULL(authentication_string,''))>0,'1','0'),
        IFNULL(plugin,'')
 FROM mysql.user ORDER BY User, Host;`
+
+// listUsersSQLMariaDB 是 MariaDB 的账号列表 SQL：它没有 account_locked 列，
+// 锁定状态位固定回 '0'，由调用方标成"读不到"（LockStateKnown=false），
+// **不**把 false 当成"未锁定"。
+const listUsersSQLMariaDB = `SELECT User, Host, '0',
+       IF(LENGTH(IFNULL(authentication_string,''))>0,'1','0'),
+       IFNULL(plugin,'')
+FROM mysql.user ORDER BY User, Host;`
+
+// ListUsers 列出所有账号及其全局权限。
+func (c *Client) ListUsers(ctx context.Context) ([]DBUser, error) {
+	// 先从 mysql.user 拿账号基础信息（MySQL 8 用 authentication_string 判断是否有密码）。
+	// MariaDB 的 mysql.user 没有 account_locked（真机实测 ERROR 1054），换它有的列。
+	mariadb := c.isMariaDB(ctx)
+	sqlText := listUsersSQLMySQL
+	if mariadb {
+		sqlText = listUsersSQLMariaDB
+	}
 	lines, err := c.query(ctx, sqlText)
 	if err != nil {
 		return nil, err
@@ -500,10 +543,11 @@ FROM information_schema.SCHEMA_PRIVILEGES ORDER BY GRANTEE;`
 		}
 		u := DBUser{
 			User: f[0], Host: f[1],
-			IsLocked:    f[2] == "1",
-			HasPassword: f[3] == "1",
-			AuthPlugin:  f[4],
-			System:      systemUsers[f[0]],
+			IsLocked:       f[2] == "1",
+			LockStateKnown: !mariadb,
+			HasPassword:    f[3] == "1",
+			AuthPlugin:     f[4],
+			System:         systemUsers[f[0]],
 		}
 		key := "'" + u.User + "'@'" + u.Host + "'"
 		u.Databases = dbPrivs[key]

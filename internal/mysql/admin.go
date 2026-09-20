@@ -321,9 +321,9 @@ func (c *Client) DumpDatabase(ctx context.Context, db, destDir string) (*DumpRes
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建备份目录失败: %w", err)
 	}
-	bin := filepath.Join(c.opt.BinDir, "mysqldump")
-	if _, err := os.Stat(bin); err != nil {
-		return nil, fmt.Errorf("未找到 mysqldump: %s", bin)
+	bin := clientBinary(c.opt.BinDir, "mysqldump")
+	if bin == "" {
+		return nil, fmt.Errorf("未找到 mysqldump / mariadb-dump: %s", c.opt.BinDir)
 	}
 	out := filepath.Join(destDir, fmt.Sprintf("%s-%s.sql", db, time.Now().Format("20060102-150405")))
 
@@ -396,7 +396,10 @@ func (c *Client) ImportDatabaseProgress(ctx context.Context, db, sqlFile string,
 	if st.IsDir() {
 		return "", errors.New("这是一个目录，请选择 .sql 文件")
 	}
-	bin := filepath.Join(c.opt.BinDir, "mysql")
+	bin := clientBinary(c.opt.BinDir, "mysql")
+	if bin == "" {
+		return "", fmt.Errorf("未找到 mysql / mariadb 客户端: %s", c.opt.BinDir)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	args := []string{"-u", c.opt.User, "--default-character-set=utf8mb4", db}
