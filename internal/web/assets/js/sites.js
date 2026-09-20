@@ -7,7 +7,7 @@
 //     （Laravel/ThinkPHP 的运行目录要落到 public）。
 //   - 每个站点提供"诊断"入口，一键做完 HTTP 探测、PHP 探针、证书检查、错误日志。
 
-import { api } from './api.js';
+import { api, apiURL } from './api.js';
 import {
   h, clear, toast, modal, confirmBox, failureToast,
 } from './ui.js';
@@ -1299,6 +1299,12 @@ export function SitesView(content, ctx = {}) {
         onclick: () => openAdjustConfig(),
       }),
       h('button.btn.btn-primary.btn-sm', { text: '+ 新建站点', onclick: newSiteModal }),
+      // 🖼️ Piwigo 一键建站：站点 + PHP + 数据库 + 官方发行包一次做完（见 api_sites_piwigo.go）。
+      h('button.btn.btn-sm', {
+        text: '🖼️ Piwigo 一键建站',
+        title: '一次动作建好站点、专用数据库并解压官方 Piwigo 发行包；装完打开安装向导收尾（需要 PHP 8.2+）',
+        onclick: piwigoModal,
+      }),
     );
     statusBar.append(...bar);
   }
@@ -1412,6 +1418,15 @@ export function SitesView(content, ctx = {}) {
         ]),
         s.aliases ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.aliases }) : null,
         s.remark ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.remark }) : null,
+        // 一键建站建的站点（有 install_db）：把「安装向导」这条收尾入口直接摆在行里。
+        s.install_db
+          ? h('div', { style: { fontSize: '11.5px' } }, [
+            h('a', {
+              href: wizardURL(s), target: '_blank', rel: 'noopener', text: '🧭 安装向导',
+              title: '打开 ' + wizardURL(s) + ' 完成 Piwigo 安装（库名/账号/口令见建站任务结果）',
+            }),
+          ])
+          : null,
         addressInfo(s),
       ]),
       h('td', [
@@ -1486,6 +1501,12 @@ export function SitesView(content, ctx = {}) {
     const port = Number(s.listen_port) || 80;
     const dial = !s.ssl_enabled && port !== 80 ? ':' + port : '';
     return { href: scheme + '://' + host + dial + '/', viaRule: '', note: (pe && pe.note) || '' };
+  }
+
+  // wizardURL 拼一键建站站点的安装向导地址：基址与「打开」同源（不另拼 80 端口）。
+  function wizardURL(s) {
+    const base = siteOpenTarget(s).href || ('http://' + String(s.domain || '') + '/');
+    return base.replace(/\/+$/, '') + '/install.php';
   }
 
   // domainLink 把**域名文本本身**做成链接（用户明确要求）。
@@ -2121,6 +2142,103 @@ export function SitesView(content, ctx = {}) {
     setTimeout(() => domain.focus(), 60);
   }
 
+  // ---------- Piwigo 一键建站 ----------
+  //
+  // 一次动作：站点 + PHP + 专用库/账号 + 官方发行包。装完必须打开安装向导收尾
+  // （管理员由向导创建；Piwigo 的向导只认表单输入，面板预写的配置不会自动带上）。
+  function piwigoModal() {
+    const phps = cache?.php_versions || [];
+    const wwwRoot = cache?.www_root || '';
+    // PHP 8.2+ 才放行（后端也会拒一次，前端先如实说清，不让用户白等一个任务）。
+    const eligible = phps.filter((p) => phpAtLeast82(p.version));
+    const domain = h('input.input', { placeholder: '例如：piwigo.test' });
+    const php = h('select.select', eligible.map((p) => h('option', {
+      value: p.version,
+      text: phpOptionLabel(p),
+      selected: p.is_default,
+    })));
+    const rootHint = h('div.hint', {
+      text: wwwRoot ? `站点目录：${wwwRoot}/<域名>` : '站点目录：网站根目录/<域名>',
+    });
+    const phpHint = h('div.hint', {
+      text: eligible.length
+        ? 'Piwigo 需要 PHP 8.2+（官方系统要求）'
+        : '本机没有 PHP 8.2+：请先到「应用市场」装 PHP 8.2/8.4，再回来建站',
+    });
+    const wizardBox = h('div');
+    if (!eligible.length) {
+      php.disabled = true;
+      php.append(h('option', { value: '', text: '（本机没有 8.2+ 的 PHP）' }));
+    }
+
+    const submit = async (close) => {
+      const d = domain.value.trim().toLowerCase();
+      if (!d) { toast('请输入域名', 'warn'); return; }
+      if (!eligible.length) { toast('本机没有 PHP 8.2+，无法建站', 'err'); return; }
+      const chosenPHP = php.value || eligible[0].version;
+      close();
+      await taskCenter.start({
+        kind: 'site-install',
+        target: d,
+        title: '一键建站 Piwigo（' + d + '）',
+        start: () => api.marketInstallSite('piwigo', { domain: d, php: chosenPHP }),
+        onDone: (task) => {
+          load();
+          if (!task || task.status !== 'succeeded') return;
+          // 装完把"打开安装向导"这条唯一剩下的路直接摆出来（用站点域名）。
+          showWizard(d);
+        },
+      });
+    };
+
+    const m = modal({
+      title: 'Piwigo 一键建站',
+      body: h('div', [
+        h('div.field', [h('label', { text: '域名 *' }), domain,
+          h('div.hint', { text: '校验沿用站点规则；不要填已在用的域名' })]),
+        h('div.field', [h('label', { text: 'PHP 版本 *' }), php, phpHint, rootHint]),
+        h('div.hint', {
+          text: '面板会新建专用数据库与账号（口令随机生成，只显示在任务结果里）',
+        }),
+        h('div.hint', {
+          text: '装完打开安装向导填写库信息并设置管理员；时间较长，进度在任务中心',
+        }),
+        wizardBox,
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', { text: '开始建站', onclick: () => submit(close) }),
+      ],
+    });
+    setTimeout(() => domain.focus(), 60);
+  }
+
+  // phpAtLeast82 只看主次版本（Piwigo 官方要求 PHP 8.2+）。
+  function phpAtLeast82(v) {
+    const m = String(v || '').match(/^(\d+)\.(\d+)/);
+    if (!m) return false;
+    const major = Number(m[1]);
+    const minor = Number(m[2]);
+    return major > 8 || (major === 8 && minor >= 2);
+  }
+
+  // showWizard 给出"打开安装向导"的链接（地址走 siteOpenTarget，带站点域名）。
+  function showWizard(domain) {
+    const target = 'http://' + domain + '/install.php';
+    const a = h('a', { href: target, target: '_blank', rel: 'noopener', text: target });
+    modal({
+      title: '安装向导：' + domain,
+      body: h('div', [
+        h('div', { style: { marginBottom: '10px' }, text: '站点已就绪，请打开安装向导完成最后一步：' }),
+        h('div', { style: { marginBottom: '10px' } }, [a]),
+        h('div.hint', {
+          text: '向导里填安装结果中的库名/用户名/密码，地址选 localhost，管理员账号自己设',
+        }),
+      ]),
+      footer: (close) => [h('button.btn.btn-primary', { text: '知道了', onclick: close })],
+    });
+  }
+
   // ---------- 站点详情 ----------
   async function openDetail(domain) {
     let data;
@@ -2660,7 +2778,10 @@ export function SitesView(content, ctx = {}) {
 
   async function delSite(s) {
     const hasFiles = true;
+    // 一键建站的站点才给"同时删除数据库"：默认保留（勾了才删，且后端只删面板建的那个库）。
+    const installDB = s.install_db || '';
     const removeFiles = h('input', { type: 'checkbox' });
+    const removeDB = h('input', { type: 'checkbox' });
     const m = modal({
       title: '删除站点：' + s.domain,
       body: h('div', [
@@ -2672,7 +2793,16 @@ export function SitesView(content, ctx = {}) {
           removeFiles,
           h('span', { text: '同时删除站点目录及其中所有文件（不可恢复！）' }),
         ]) : null,
-        h('div.hint', { style: { marginTop: '10px' }, text: '不勾选则只删除配置，文件保留，方便之后重新绑定。' }),
+        installDB ? h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', fontSize: '13px', marginTop: '8px' } }, [
+          removeDB,
+          h('span', { text: '同时删除数据库 ' + installDB + ' 及专用账号（不可恢复！）' }),
+        ]) : null,
+        h('div.hint', {
+          style: { marginTop: '10px' },
+          text: installDB
+            ? '不勾选则只删除配置，文件与数据库都保留。'
+            : '不勾选则只删除配置，文件保留，方便之后重新绑定。',
+        }),
       ]),
       footer: (close) => [
         h('button.btn', { text: '取消', onclick: close }),
@@ -2680,8 +2810,12 @@ export function SitesView(content, ctx = {}) {
           text: '确认删除',
           onclick: async () => {
             try {
-              const r = await api.siteDelete(s.domain, removeFiles.checked);
-              toast(r.msg + (r.files ? '（' + r.files + '）' : ''), 'ok');
+              const q = new URLSearchParams();
+              if (removeFiles.checked) q.set('remove_files', '1');
+              if (installDB && removeDB.checked) q.set('remove_db', '1');
+              const qs = q.toString();
+              const r = await api.del(apiURL('sites/' + encodeURIComponent(s.domain) + (qs ? '?' + qs : '')));
+              toast(r.msg + (r.files ? '（' + r.files + '）' : '') + (r.db ? '（' + r.db + '）' : ''), 'ok', 12000);
               close();
               load();
             } catch (e) { failureToast(e, 16000); }

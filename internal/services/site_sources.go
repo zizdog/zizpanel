@@ -139,6 +139,18 @@ var siteSources = map[string]SiteSource{
 			"https://github.com/kalcaddle/kodbox/archive/refs/tags/1.69.03.zip",
 		},
 	},
+	"piwigo": {
+		App: "piwigo", Name: "Piwigo", Version: "16.4.0",
+		File: "piwigo-16.4.0.zip",
+		// 2026-09-20 本机完整下载官方发行包（19,943,808 B）后实算：shasum 与 openssl
+		// 两次结果一致（也用于 web 层"记录并回读 sha256"那条判据）。
+		SHA256: "72c58a337a1a0639b6ad8dc8f5900a2781fc19091b60ae157eb2ee58c5431c17",
+		Size:   19943808,
+		Upstreams: []string{
+			// 官方 dlcounter 的**固定版本**入口（`?code=latest` 是滚动地址，无法登记 sha256）。
+			"https://piwigo.org/download/dlcounter.php?code=16.4.0",
+		},
+	},
 }
 
 // SiteSourceFor 查某个一键建站应用的固定版本源码包。

@@ -52,13 +52,16 @@ type siteInstallResult struct {
 	URL    string `json:"url"`
 	// Version / Source 如实告诉用户"装的是哪个固定版本、实际走的哪个源"
 	// （镜像站 / 官方源）。留空表示这个应用还没登记固定版本。
-	Version   string   `json:"version,omitempty"`
-	Source    string   `json:"source,omitempty"`
-	FinishURL string   `json:"finish_url"`
-	DBName    string   `json:"db_name"`
-	DBUser    string   `json:"db_user"`
-	DBPass    string   `json:"db_pass"`
-	Steps     []string `json:"steps"`
+	Version   string `json:"version,omitempty"`
+	Source    string `json:"source,omitempty"`
+	FinishURL string `json:"finish_url"`
+	DBName    string `json:"db_name"`
+	DBUser    string `json:"db_user"`
+	DBPass    string `json:"db_pass"`
+	// PackageSize / PackageSHA256 是**实算回读**的发行包指纹（Piwigo 要求记录并回读）。
+	PackageSize   int64    `json:"package_size,omitempty"`
+	PackageSHA256 string   `json:"package_sha256,omitempty"`
+	Steps         []string `json:"steps"`
 	// Message 是收尾说明（一句话告诉用户"还差哪一步"）。前端优先展示它，
 	// 因为 Steps 里那句警告很容易被淹没（真机 2026-09-17：用户反代成功后看到 500 就懵了）。
 	Message string `json:"message,omitempty"`
@@ -229,7 +232,7 @@ func parsePHPVersion(v string) [3]int {
 // handleSiteAppInstall 一键建站（长任务：下载 + 解压 + 建库 + 建站点）。
 func (s *Server) handleSiteAppInstall(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	app, found := services.FindApp(id)
+	app, found := siteAppByID(id)
 	if !found || app.SiteApp == nil {
 		fail(w, http.StatusBadRequest, "「"+id+"」不是一键建站类应用")
 		return
@@ -306,6 +309,8 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		res.Steps = append(res.Steps, msg)
 		services.EmitProgress(ctx, tasks.LevelStep, msg)
 	}
+	// 应用专属行为（库名规则 / 预写配置 / 指纹回读 / 收尾验证）：默认应用一样都没有。
+	extra, hasExtra := siteAppExtraFor(app.ID)
 	art := &siteInstallArtifacts{domain: domain}
 	defer func() {
 		if err == nil {
@@ -370,6 +375,14 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		}
 		res.Version, res.Source = fetched.Version, label
 		step("源码包已就绪：%s %s ← %s", fetched.Name, fetched.Version, label)
+		if hasExtra && extra.recordFingerprint {
+			// 记录并回读真实大小/sha256：下载器写完的字节必须自己再证明一次（坑 224）。
+			size, sum, ferr := recordArchiveFingerprint(archive, fetched, step)
+			if ferr != nil {
+				return res, ferr
+			}
+			res.PackageSize, res.PackageSHA256 = size, sum
+		}
 	} else {
 		// 未登记固定版本的站点应用：保持原行为（目录条目里的官方 + 备用地址）。
 		urls := append([]string{spec.DownloadURL}, spec.MirrorURLs...)
@@ -420,8 +433,11 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	step("已解压到站点目录（%d 个顶层条目）", len(entries))
 
 	// ---------- ③ 建库 ----------
-	dbName := dbNameFor(domain)
-	dbUser := dbName
+	// 库名/用户名默认由域名派生；有专属规则的应用（Piwigo）用带站点后缀的专用名。
+	dbName, dbUser := dbNameFor(domain), dbNameFor(domain)
+	if hasExtra && extra.dbIdentifiers != nil {
+		dbName, dbUser = extra.dbIdentifiers(domain)
+	}
 	dbPass := randomPassword(20)
 	if spec.NeedsDB {
 		c, err := s.mysqlClient()
@@ -472,6 +488,14 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 		step("已生成 config.inc.php（数据库信息已写入；安装向导里会自动带上）")
 		configReady = true
 	}
+	if hasExtra && extra.writeConfig != nil {
+		// 专属配置文件（Piwigo：local/config/database.inc.php，Piwigo 自己的格式）。
+		if err := extra.writeConfig(dir, dbName, dbUser, dbPass); err != nil {
+			return res, err
+		}
+		step("已生成 %s 的数据库配置文件", app.Name)
+		configReady = true
+	}
 
 	// ---------- ⑤ 建站点（带伪静态）----------
 	//
@@ -515,8 +539,23 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	scheme := "http"
 	res.URL = scheme + "://" + domain + "/"
 	res.FinishURL = res.URL + strings.TrimPrefix(spec.FinishPath, "/")
+
+	// 应用专属收尾验证（Piwigo：站点 200 / 安装向导非 5xx / 库能连）。
+	// 任一不过就如实失败（"建站完成但用不了"），由上面的 defer 回滚站点记录与新建空库。
+	verifiedByApp := false
+	if hasExtra && extra.verify != nil {
+		if verr := extra.verify(ctx, s, res, site, spec, step); verr != nil {
+			return res, verr
+		}
+		verifiedByApp = true
+	}
+
 	code, body := siteHomeProbeFn(ctx, res.URL)
 	switch {
+	case code == 0 && verifiedByApp:
+		// 上面已用 --resolve 探通（200）；这里是**系统 DNS** 探不到 —— 说清是解析问题，
+		// 别让同一份日志里同时出现"验证通过"与"探测不到响应"两句自相矛盾的话。
+		step("（提示）系统 DNS 解析不到 %s（本地 hosts/DNS 未配置）：浏览器访问前请先加解析", domain)
 	case code == 0:
 		step("（警告）首页探测不到响应 —— 通常是因为这个域名还没做本地解析。"+
 			"请在「网站管理」里给 %s 加 hosts 解析，或把 DNS 指到这台机器", domain)
@@ -527,7 +566,12 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	// 站点却 500「Database Query Error」）。根因是**面板预置了 config.inc.php**（省掉手填数据库），
 	// 而 Typecho/WordPress 看到该文件就认为"已经装好了" —— 于是首页直接去查还不存在的表，
 	// 表现成 500，而不是自动跳到安装向导。用户不知道要去 /install.php，就会以为站点坏了。
-	if configReady {
+	if configReady && hasExtra && extra.finishText != nil {
+		// Piwigo 的向导**不读**预写的配置文件：不能沿用"数据库信息已预填"那句话。
+		st, msg := extra.finishText(app.Name, res.FinishURL)
+		step("%s", st)
+		res.Message = msg
+	} else if configReady {
 		step("⚠️ 还差最后一步：打开 %s 走完安装向导（数据库信息已预填）。"+
 			"**在向导完成之前，访问站点首页会显示 500/数据库错误**，这是应用以为已安装导致的，不是配置坏了。",
 			res.FinishURL)

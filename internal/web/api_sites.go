@@ -1089,16 +1089,24 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 		ConfExists  bool         `json:"conf_exists"`
 		Running     bool         `json:"running"`
 		PublicEntry *publicEntry `json:"public_entry,omitempty"`
+		// InstallDB / InstallDBUser：面板一键建站给这个站点建的库与账号（没有就不出现）。
+		// 前端据此只在删除弹窗里给"同时删除数据库"的勾选项。
+		InstallDB     string `json:"install_db,omitempty"`
+		InstallDBUser string `json:"install_db_user,omitempty"`
 	}
 	out := make([]item, 0, len(list))
 	vhostDir := s.Cfg.VhostDir
 	for _, st := range list {
 		confPath := filepath.Join(vhostDir, st.Domain+".conf")
 		_, err := os.Stat(confPath)
-		out = append(out, item{
+		it := item{
 			Site: st, ConfExists: err == nil, Running: err == nil && st.Enabled,
 			PublicEntry: s.publicEntryFor(r.Context(), st),
-		})
+		}
+		if dbName, dbUser, ok := piwigoSiteInstallDB(st); ok {
+			it.InstallDB, it.InstallDBUser = dbName, dbUser
+		}
+		out = append(out, it)
 	}
 	ok(w, map[string]any{
 		"list":        out,
@@ -1447,7 +1455,17 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 		"php_versions": s.detectPHPVersions(r.Context()),
 		"ssl":          s.siteSSLView(site),
 		"cache":        s.siteCacheView(site),
+		"install_db":   installDBView(site),
 	})
+}
+
+// installDBView 汇总"面板一键建站给这个站点建的库/账号"（没有就返回 nil 字段）。
+func installDBView(site *sites.Site) map[string]any {
+	dbName, dbUser, ok := piwigoSiteInstallDB(site)
+	if !ok {
+		return nil
+	}
+	return map[string]any{"name": dbName, "user": dbUser}
 }
 
 // siteSSLView 汇总证书展示字段：到期时间优先取真实证书文件（tlsx.CertExpiry），
@@ -1959,6 +1977,8 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 	domain := r.PathValue("domain")
 	removeFiles := r.URL.Query().Get("remove_files") == "1"
+	// remove_db：显式勾选才删库（默认保留）。只认面板一键建站建出来的那个库与账号。
+	removeDB := r.URL.Query().Get("remove_db") == "1"
 
 	mgr := s.siteMgr()
 	site, err := mgr.Get(r.Context(), domain)
@@ -2007,10 +2027,21 @@ func (s *Server) handleSiteDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	detail := fmt.Sprintf("删除站点（根目录=%s，SSL=%v，PHP=%s）%s",
-		site.Root, site.SSLEnabled, site.PHPVersion, filesMsg)
+	// 删库排在站点记录删除成功之后：记录删不掉就一个字节都不动（绝不丢用户的库）。
+	var dbMsg string
+	if removeDB {
+		dbMsg = s.dropPiwigoSiteDB(r.Context(), site, func(f string, a ...any) {
+			s.Log.Info("站点 %s 卸载："+f, append([]any{domain}, a...)...)
+		})
+	}
+
+	detail := fmt.Sprintf("删除站点（根目录=%s，SSL=%v，PHP=%s）%s %s",
+		site.Root, site.SSLEnabled, site.PHPVersion, filesMsg, dbMsg)
 	s.audit(r, "site_delete", domain, detail, true, "")
 	resp := map[string]any{"msg": "站点已删除", "files": filesMsg}
+	if dbMsg != "" {
+		resp["db"] = dbMsg
+	}
 	if cacheClearErr != "" {
 		// 站点确实删了，但缓存目录没清掉：如实报出来，别让用户以为磁盘已经干净。
 		resp["cache_clear_error"] = cacheClearErr

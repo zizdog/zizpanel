@@ -166,6 +166,8 @@ var RewritePresets = []RewritePreset{
 	// kodbox：官方 README_zh-CN.md 的「nginx rewrite」小节给的就是
 	// `try_files $uri $uri/ /index.php?$query_string;`（与通用规则同形）。
 	{Name: "kodbox", Label: "可道云（kodbox）", Description: "官方 README 的 nginx rewrite 规则（try_files → index.php）。"},
+	// Piwigo：官方 nginx 指南同样是"文件优先、其余交给 index.php"（坑 223）。
+	{Name: "piwigo", Label: "Piwigo", Description: "Piwigo 相册：文件不存在时交给 index.php（官方 nginx 配置）。"},
 	{Name: "laravel", Label: "Laravel / Lumen", Description: "入口在 public/ 子目录，需要把运行目录指到 public。", PublicDir: "public"},
 	// FreshRSS 只允许暴露它自己的 p/ 目录（上级目录里的 data/ 是用户的全部订阅数据，
 	// 上游明确要求不能进 web 根）——所以这里的 PublicDir 不是"可选优化"，是安全边界。
@@ -217,6 +219,9 @@ func rewriteLocation(name string) string {
 			"\t}"
 	case "kodbox":
 		// 官方 README_zh-CN.md「nginx rewrite」：`try_files $uri $uri/ /index.php?$query_string;`
+		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
+	case "piwigo":
+		// Piwigo 官方 nginx 指南的入口规则（与 kodbox 同形：文件优先，其余给 index.php）。
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
 	case "laravel":
 		return "\tlocation / {\n\t\ttry_files $uri $uri/ /index.php?$query_string;\n\t}"
