@@ -271,7 +271,7 @@ func TestImgConvertRealSips(t *testing.T) {
 		t.Fatalf("产物应落在写根内，实际 %s", out)
 	}
 	res := snap.Result.(*tool.Result)
-	if len(res.Files) != 1 || !strings.Contains(res.Files[0].DownloadURL, "/api/files/download?path=") {
+	if len(res.Files) != 1 || !strings.Contains(res.Files[0].DownloadURL, "api/files/download?path=") {
 		t.Fatalf("产物应带下载链接，实际 %+v", res.Files)
 	}
 

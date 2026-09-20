@@ -114,11 +114,11 @@ const (
 //
 // 它的位置是"镜像站 manifest.json 拿不到时的期望值"—— 公网镜像缺清单时仍然
 // 有内容校验，而不是静默跳过。换版本时**必须**一起改（测试会锁住"版本与它成对"）。
-var MacSaberArchiveSHA256 = "7437172d21522c5fdcb92d8ee1d260121624593a680e5cba442b099e6e553693"
+var MacSaberArchiveSHA256 = "eecc822ac3f5e8aeccb708f641f3af66f7445f1275fbd6ac424bd14c77534e70"
 
 // macSaberArchiveSizeHint 是同一份归档的字节数（2026-09-20 实跑发布脚本得到）。
 // 声明里写它，在线审计就能发现"镜像站上同步了别的版本"。
-const macSaberArchiveSizeHint = int64(3261135)
+const macSaberArchiveSizeHint = int64(3249298)
 
 // MacSaberArtifactName 是产物文件名（镜像站布局 <base>/apps/macsaber/<ver>/<name>）。
 func MacSaberArtifactName(version string) string {
@@ -442,6 +442,12 @@ func (m *Manager) macSaberStageBinary(ctx context.Context, result *InstallResult
 	if err != nil {
 		return "", noop, fmt.Errorf("创建临时目录失败：%w", err)
 	}
+	// MkdirTemp 建的是 0700：后面要用 `sudo -u <真实用户> macsaber version` 复核，
+	// 目标用户连**目录都进不去**（真机报 "unable to execute …: Permission denied"）。
+	if err := os.Chmod(stage, 0o755); err != nil {
+		_ = os.RemoveAll(stage)
+		return "", noop, fmt.Errorf("设置临时目录可遍历权限失败：%w", err)
+	}
 	cleanup := func() { _ = os.RemoveAll(stage) }
 
 	archive := filepath.Join(stage, asset)
@@ -574,6 +580,15 @@ func (m *Manager) macSaberInstallService(ctx context.Context, app App, p MacSabe
 		return fmt.Errorf("mac军刀 的启动参数为空（内部错误）")
 	}
 	content := macSaberPlistContent(MacSaberLabel, args, p.OutLog, p.ErrLog)
+	// ~/Library/LaunchAgents 在新账号上可能根本不存在（真机见过）→ 先建出来并交还用户，
+	// 否则写 plist 直接失败；属主不对 launchd 也会拒绝装载。
+	plistDir := filepath.Dir(p.Plist)
+	if err := os.MkdirAll(plistDir, 0o755); err != nil {
+		return fmt.Errorf("创建 %s 失败：%w", plistDir, err)
+	}
+	if err := chownTree(m.opt.UserName, plistDir); err != nil {
+		return fmt.Errorf("把 %s 交还用户 %s 失败：%w", plistDir, m.opt.UserName, err)
+	}
 	tmp := p.Plist + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("写入 plist %s 失败（面板需要以 root 运行）：%w", p.Plist, err)

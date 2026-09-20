@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -427,6 +428,67 @@ func TestStaticAssetsServed(t *testing.T) {
 	res2, _ := client.Get(f.ts.URL + "/whatever/deep")
 	if res2.StatusCode != 200 {
 		t.Errorf("未知路径应回落 index.html，实际 %d", res2.StatusCode)
+	}
+}
+
+// TestIndexUsesRelativeAssetPaths：index.html 的 css/js 必须是**相对**路径。
+// 绝对路径（/app.css）在"经面板 /macsaber/ 子路径打开"时会让浏览器去请求
+// **面板自己的** /app.css 与 /app.js（真机实测：页面能打开、界面全错）；
+// 相对路径在直连（/）与子路径（/macsaber/）下都对。
+func TestIndexUsesRelativeAssetPaths(t *testing.T) {
+	f := newFixture(t)
+	client := &http.Client{Timeout: 5 * time.Second}
+	res, err := client.Get(f.ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	html := string(body)
+	for _, bad := range []string{`href="/`, `src="/`} {
+		if strings.Contains(html, bad) {
+			t.Errorf("index.html 出现绝对资源路径 %q —— 经面板子路径打开会加载到面板自己的资源", bad)
+		}
+	}
+	if !strings.Contains(html, `href="app.css"`) || !strings.Contains(html, `src="app.js`) {
+		t.Errorf("index.html 应使用相对资源路径 app.css / app.js，实际：%s", html)
+	}
+}
+
+// TestFrontendUsesRelativeURLs：内嵌前端的资源与接口路径必须是**相对**的。
+// 绝对路径（/api/...、/app.css）在"经面板 /macsaber/ 子路径打开"时会打到
+// **面板自己**的接口与资源 —— 真机实测：页面能打开，但 /api/setup/status 打到
+// 面板上 404，页面显示"读取服务状态失败"。
+func TestFrontendUsesRelativeURLs(t *testing.T) {
+	entries, err := assetsFS.ReadDir("assets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			sub, _ := assetsFS.ReadDir("assets/" + e.Name())
+			for _, s := range sub {
+				files = append(files, "assets/"+e.Name()+"/"+s.Name())
+			}
+			continue
+		}
+		files = append(files, "assets/"+e.Name())
+	}
+	for _, f := range files {
+		if !strings.HasSuffix(f, ".js") && !strings.HasSuffix(f, ".html") {
+			continue
+		}
+		data, err := assetsFS.ReadFile(f)
+		if err != nil {
+			t.Fatalf("读 %s 失败：%v", f, err)
+		}
+		text := string(data)
+		for _, bad := range []string{`'/api/`, `"/api/`, `href="/`, `src="/`} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s 出现绝对路径 %q —— 经面板子路径打开会打到面板自己的接口/资源", f, bad)
+			}
+		}
 	}
 }
 

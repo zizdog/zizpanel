@@ -1528,16 +1528,15 @@ func Catalog() []App {
 				// http://127.0.0.1:<Port>/。两条都要求 mac军刀 自己先登录（它不带鉴权
 				// 就没有会话），所以经面板打开**不等于**免登录。
 				//
-				// ⚠️ Port 不是产品事实里的 8899：8899 被音色接收端占着（硬冲突，
-				// 见 services/macsaber.go 里 MacSaberPort 的注释与交付报告）。
+				// Port 用 8895 而不是 8899：8899 被音色接收端占着（硬冲突，且那套
+				// 链路属另一个项目、铁律 2 不许动），见 MacSaberPort 的注释。
 				Note: "网页界面只绑 127.0.0.1:" + strconv.Itoa(MacSaberPort) +
 					"（本机直连 http://127.0.0.1:" + strconv.Itoa(MacSaberPort) + "/）；" +
 					"经面板的 /macsaber/ 打开同样要登录 mac军刀 自己的账号。",
 			},
-			Summary: "macOS 原生小工具箱（图片转换 / 哈希 / 系统概览 / 去隔离）",
-			Description: "macOS 原生小工具箱：一个本地网页界面跑图片转换、哈希、系统概览等，" +
-				"只绑本机回环、不联网、不上传。",
-			Category: CategoryTool, Kind: KindNative,
+			Summary:     "macOS 原生工具箱：图片 / OCR / PDF / 音视频 / 文本 / 系统等 48 个工具",
+			Description: "把 macOS 自带能力包成 48 个网页小工具：只绑本机回环、不联网、不上传。",
+			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: MacSaberAppID, ServiceLabel: MacSaberLabel,
 			Port: MacSaberPort, HealthPath: macSaberHealthPath,
 			PostInstallHint: "首次打开要设置本机用户名与口令（口令至少 8 位，只存在这台机器上）。" +

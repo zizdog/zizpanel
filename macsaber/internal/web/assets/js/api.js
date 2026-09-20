@@ -37,17 +37,17 @@ async function req(method, path, body) {
 }
 
 export const api = {
-  version: () => req('GET', '/api/version'),
-  setupStatus: () => req('GET', '/api/setup/status'),
-  setup: (user, password, confirm) => req('POST', '/api/setup', { user, password, confirm }),
-  login: (user, password) => req('POST', '/api/login', { user, password }),
-  logout: () => req('POST', '/api/logout', {}),
-  session: () => req('GET', '/api/session'),
-  tools: () => req('GET', '/api/tools'),
-  run: (id, params) => req('POST', '/api/tools/' + encodeURIComponent(id) + '/run', params),
-  task: (id) => req('GET', '/api/tasks/' + encodeURIComponent(id)),
-  tasks: () => req('GET', '/api/tasks'),
-  cancel: (id) => req('POST', '/api/tasks/' + encodeURIComponent(id) + '/cancel', {}),
+  version: () => req('GET', 'api/version'),
+  setupStatus: () => req('GET', 'api/setup/status'),
+  setup: (user, password, confirm) => req('POST', 'api/setup', { user, password, confirm }),
+  login: (user, password) => req('POST', 'api/login', { user, password }),
+  logout: () => req('POST', 'api/logout', {}),
+  session: () => req('GET', 'api/session'),
+  tools: () => req('GET', 'api/tools'),
+  run: (id, params) => req('POST', 'api/tools/' + encodeURIComponent(id) + '/run', params),
+  task: (id) => req('GET', 'api/tasks/' + encodeURIComponent(id)),
+  tasks: () => req('GET', 'api/tasks'),
+  cancel: (id) => req('POST', 'api/tasks/' + encodeURIComponent(id) + '/cancel', {}),
 };
 
 // pollTask 轮询任务直到结束；onTick 用来刷新进度条。

@@ -347,7 +347,8 @@ func fillDownloadURLs(res *Result) {
 		if f.Path == "" {
 			continue
 		}
-		f.DownloadURL = "/api/files/download?path=" + base64.RawURLEncoding.EncodeToString([]byte(f.Path))
+		// 相对路径：直连（/）与经面板子路径（/macsaber/）都对；绝对 /api 会打到面板的接口（真机实测 404）。
+		f.DownloadURL = "api/files/download?path=" + base64.RawURLEncoding.EncodeToString([]byte(f.Path))
 		if f.Size == 0 {
 			if st, err := os.Stat(f.Path); err == nil {
 				f.Size = st.Size()

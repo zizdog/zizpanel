@@ -121,10 +121,12 @@ STAGE_PKG="$STAGE/pkg/macsaber"
 
 /bin/mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$ASSET"
-# 归档尽量可复现（同样的源码 → 同样的 sha256）：固定 mtime、不写扩展属性。
+# 归档必须可复现（同样的源码 → 同样的 sha256）：固定 mtime、不写扩展属性，
+# 而且 gzip 头也要 `-n`（否则头里带打包时刻，两次打包哈希不同 —— 实测踩过）。
 # macOS 的 bsdtar 不支持 GNU 的 --mtime/--uid/--gid，所以固定时间用 touch 做。
 /usr/bin/touch -t 202001010000 "$STAGE_PKG/macsaber" "$STAGE_PKG/README.md"
-( cd "$STAGE_PKG" && COPYFILE_DISABLE=1 /usr/bin/tar --no-xattrs -czf "$OUT" macsaber README.md )
+( cd "$STAGE_PKG" && COPYFILE_DISABLE=1 /usr/bin/tar --no-xattrs -cf - macsaber README.md ) \
+  | /usr/bin/gzip -9n > "$OUT"
 
 SHA256="$(/usr/bin/shasum -a 256 "$OUT" | /usr/bin/awk '{print $1}')"
 SIZE="$(/usr/bin/stat -f %z "$OUT" 2>/dev/null || /usr/bin/wc -c <"$OUT")"
