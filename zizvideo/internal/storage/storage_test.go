@@ -39,7 +39,7 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	for _, table := range []string{
 		"schema_migrations", "users", "sessions", "media_libraries", "media",
 		"scan_tasks", "watch_progress", "favorites", "reactions", "audit_log",
-		"series", "series_media", "user_libraries",
+		"series", "series_media", "user_libraries", "job_tasks",
 	} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
@@ -188,9 +188,9 @@ func TestMigration0006FailClosed(t *testing.T) {
 		t.Fatalf("从 0005 升级失败: %v", err)
 	}
 	defer db.Close()
-	// 0006（库授权）+ 0007（默认可见库/source）都跑完，版本是 7。
-	if v, _ := db.SchemaVersion(); v != 7 {
-		t.Fatalf("schema 版本 = %d, 期望 7", v)
+	// 0006（库授权）+ 0007（默认可见库/source）+ 0008（跨库任务）都跑完，版本是 8。
+	if v, _ := db.SchemaVersion(); v != 8 {
+		t.Fatalf("schema 版本 = %d, 期望 8", v)
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_libraries'`).

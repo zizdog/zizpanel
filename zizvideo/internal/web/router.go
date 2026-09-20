@@ -79,6 +79,9 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/admin/series/{id}/media/{mediaId}", s.RequireAdmin(s.HandleRemoveSeriesMedia))
 	mux.HandleFunc("PUT /api/v1/admin/series/{id}/order", s.RequireAdmin(s.HandleReorderSeries))
 	mux.HandleFunc("POST /api/v1/admin/series/{id}/detect", s.RequireAdmin(s.HandleDetectSeries))
+	// P2：批量一键识别（confirm 两段式）+ 跨库任务进度（job_tasks，迁移 0008）。
+	mux.HandleFunc("POST /api/v1/admin/series/detect-all", s.RequireAdmin(s.HandleDetectAll))
+	mux.HandleFunc("GET /api/v1/admin/tasks/{id}", s.RequireAdmin(s.HandleGetJobTask))
 
 	mux.HandleFunc("GET /api/v1/admin/system/info", s.RequireAdmin(s.HandleSystemInfo))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.RequireAdmin(s.HandleAuditList))

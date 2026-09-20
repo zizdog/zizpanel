@@ -46,6 +46,10 @@ func NewServer(cfg *config.Config, db *storage.DB, a *auth.Manager, t *task.Mana
 	roots *config.Roots, r ffmpeg.Runner, log *slog.Logger) *Server {
 	s := &Server{Cfg: cfg, DB: db, Auth: a, Tasks: t, Roots: roots, Runner: r, Log: log,
 		StartedAt: time.Now()}
+	// 扫描成功结束后自动补齐识别（不改变 task.Manager 对 api 的依赖方向）。
+	if t != nil {
+		t.SetAfterScan(s.OnScanFinished)
+	}
 	s.RefreshCapabilities(context.Background())
 	return s
 }

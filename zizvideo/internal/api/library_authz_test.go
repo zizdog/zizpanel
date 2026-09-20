@@ -463,6 +463,13 @@ func TestEmptySeriesVisibleOnlyToAdmin(t *testing.T) {
 	if bob[empty.ID] || bob[f.series["L3"]] {
 		t.Fatalf("普通用户列表出现了不可见剧场: %v", bob)
 	}
+	// 空剧场详情：admin 必须 200（管理抽屉依赖它加集），普通用户仍是 404。
+	if res, _, raw := f.e.do(http.MethodGet, "/api/v1/series/"+empty.ID, nil); res.StatusCode != http.StatusOK {
+		t.Fatalf("admin 空剧场详情 = %d (%s)", res.StatusCode, raw)
+	}
+	if res, _, _ := f.e.doAs(f.clients["bob"], http.MethodGet, "/api/v1/series/"+empty.ID); res.StatusCode != http.StatusNotFound {
+		t.Fatalf("普通用户空剧场详情 = %d, 期望 404", res.StatusCode)
+	}
 }
 
 // 跨库剧场：剧集按 scope 过滤，封面属别的库时 cover_url 置空（B.4#7 / S4）。

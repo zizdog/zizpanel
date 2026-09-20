@@ -110,6 +110,8 @@ export const api = {
   deleteLibrary: (id) => request("DELETE", "/api/v1/libraries/" + encodeURIComponent(id)),
   scanLibrary: (id) => request("POST", "/api/v1/libraries/" + encodeURIComponent(id) + "/scan", { kind: "incremental" }),
   scanTask: (id) => request("GET", "/api/v1/scan-tasks/" + encodeURIComponent(id)),
+  detectAll: (body) => request("POST", "/api/v1/admin/series/detect-all", body),
+  jobTask: (id) => request("GET", "/api/v1/admin/tasks/" + encodeURIComponent(id)),
 
   mediaList: (params) => envelope("GET", "/api/v1/media" + queryString(params), undefined, false),
   media: (id) => request("GET", "/api/v1/media/" + encodeURIComponent(id)),

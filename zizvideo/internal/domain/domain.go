@@ -143,6 +143,37 @@ type ScanTask struct {
 	UpdatedAt  string `json:"updated_at"`
 }
 
+// Job kinds and triggers for the cross-library job_tasks table (0008).
+const (
+	JobKindEpisodeDetect = "episode_detect"
+
+	JobTriggerManualBatch  = "manual_batch"
+	JobTriggerScanFinished = "scan_finished"
+)
+
+// JobTask is a persisted cross-library background job (一键识别 / 扫描后自动识别）。
+// Degraded + DegradeReason 是 A.5 语义：降级必须显式给理由，理由为空即错误。
+type JobTask struct {
+	ID            string `json:"id"`
+	Kind          string `json:"kind"`
+	Trigger       string `json:"trigger"`
+	Status        string `json:"status"`
+	Total         int    `json:"total"`
+	Processed     int    `json:"processed"`
+	Updated       int    `json:"updated"`
+	Failed        int    `json:"failed"`
+	ManualSkipped int    `json:"manual_skipped"`
+	Unidentified  int    `json:"unidentified"`
+	Degraded      bool   `json:"degraded"`
+	DegradeReason string `json:"degrade_reason"`
+	Error         string `json:"error"`
+	Summary       string `json:"-"`
+	StartedAt     string `json:"started_at"`
+	FinishedAt    string `json:"finished_at"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
 // Progress is one user's playback position for one media item.
 type Progress struct {
 	UserID     string `json:"-"`
@@ -191,6 +222,11 @@ var (
 
 	ErrScanRunning  = New("SCAN_ALREADY_RUNNING", "该媒体库已有扫描在进行", 409)
 	ErrTaskNotFound = New("TASK_NOT_FOUND", "任务不存在", 404)
+
+	// 任务中心如实语义（A.5）：写入终态前校验，空理由一律拒绝。
+	ErrJobErrorRequired  = New("JOB_ERROR_REQUIRED", "失败任务必须带错误原因", 409)
+	ErrJobDegradeReason  = New("JOB_DEGRADE_REASON_REQUIRED", "降级任务必须带降级原因", 409)
+	ErrJobErrorOnSuccess = New("JOB_ERROR_ON_SUCCESS", "成功任务不能带错误原因", 409)
 
 	ErrSeriesTitle     = New("SERIES_TITLE_REQUIRED", "剧场标题不能为空", 400)
 	ErrSeriesDuplicate = New("SERIES_DUPLICATE_MEDIA", "该媒体已在本剧场中", 409)

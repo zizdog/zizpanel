@@ -2,9 +2,9 @@ package api
 
 import (
 	"net/http"
-	"path/filepath"
 	"strings"
 
+	"github.com/zizdog/zizvideo/internal/detect"
 	"github.com/zizdog/zizvideo/internal/domain"
 	"github.com/zizdog/zizvideo/internal/media"
 	"github.com/zizdog/zizvideo/internal/storage"
@@ -89,8 +89,9 @@ func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	// 可见集为 0 ⇒ 剧场视为不可见（与不存在同码）；episode_count 只报可见集。
-	if len(eps) == 0 {
+	// 可见集为 0 ⇒ 普通用户视为不可见（与不存在同码）；admin 必须仍能打开管理
+	// 抽屉（否则新建后还没加集的剧场无法管理，与 ListSeries 的管理端偏离一致）。
+	if len(eps) == 0 && !scope.All {
 		s.fail(w, r, domain.ErrNotFound)
 		return
 	}
@@ -125,7 +126,7 @@ func sortSeriesEpisodes(eps []domain.SeriesEpisode, medias []domain.Media) ([]do
 		keys[i] = media.OrderKey{
 			Season: eps[i].Season, Episode: eps[i].Episode,
 			Manual:   eps[i].EpisodeSource == domain.EpisodeSourceManual,
-			Position: eps[i].Position, Name: seriesMediaName(medias[i]),
+			Position: eps[i].Position, Name: detect.MediaName(medias[i]),
 		}
 	}
 	order := media.SortOrderKeys(keys)
@@ -138,16 +139,7 @@ func sortSeriesEpisodes(eps []domain.SeriesEpisode, medias []domain.Media) ([]do
 	return sortedEps, sortedMedias
 }
 
-// seriesMediaName is the filename the parser works on (Title is the fallback
-// for rows whose path was cleared).
-func seriesMediaName(m domain.Media) string {
-	name := m.Path
-	if name == "" {
-		name = m.Title
-	}
-	return filepath.Base(name)
-}
-
+// seriesTitle validates and trims a 剧场 title.
 func (s *Server) seriesTitle(raw string) (string, error) {
 	title := strings.TrimSpace(raw)
 	if title == "" {
@@ -331,11 +323,11 @@ func (s *Server) HandleAddSeriesMedia(w http.ResponseWriter, r *http.Request) {
 // seriesMediaFromMedia derives the nullable numbers for one media row.
 func seriesMediaFromMedia(m domain.Media) storage.SeriesMediaInput {
 	input := storage.SeriesMediaInput{MediaID: m.ID}
-	numbers, ok := media.ParseEpisode(seriesMediaName(m))
+	season, episode, ok := detect.EpisodesFor(m)
 	if !ok {
 		return input
 	}
-	input.Season, input.Episode = media.EpisodePointers(numbers)
+	input.Season, input.Episode = season, episode
 	input.Source = domain.EpisodeSourceFilename
 	return input
 }
@@ -404,6 +396,7 @@ type episodeChangeJSON struct {
 
 // HandleDetectSeries re-derives season/episode from filenames (补丁 R1).
 // Without confirm it only returns the change list; manual rows are never touched.
+// 识别逻辑只在 internal/detect，与批量/后台共用同一份（A.2）。
 func (s *Server) HandleDetectSeries(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := s.DB.GetSeries(id); err != nil {
@@ -415,43 +408,18 @@ func (s *Server) HandleDetectSeries(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	eps, medias, err := s.DB.ListSeriesEpisodes(scopeAll(), id)
+	res, err := detect.Series(r.Context(), s.DB, scopeAll(), id)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	changes := []episodeChangeJSON{}
-	assigns := []storage.EpisodeAssignment{}
-	manualSkipped := 0
-	for i := range eps {
-		if eps[i].EpisodeSource == domain.EpisodeSourceManual {
-			manualSkipped++
-			continue
-		}
-		numbers, ok := media.ParseEpisode(seriesMediaName(medias[i]))
-		if !ok {
-			continue // 识别不到就不写、不改，绝不用猜的值填库
-		}
-		season, episode := media.EpisodePointers(numbers)
-		if intPtrEqual(season, eps[i].Season) && intPtrEqual(episode, eps[i].Episode) &&
-			eps[i].EpisodeSource == domain.EpisodeSourceFilename {
-			continue
-		}
-		changes = append(changes, episodeChangeJSON{
-			MediaID: medias[i].ID, Title: medias[i].Title, Filename: seriesMediaName(medias[i]),
-			OldSeason: eps[i].Season, OldEpisode: eps[i].Episode,
-			OldLabel:  media.EpisodeLabel(eps[i].Season, eps[i].Episode),
-			NewSeason: season, NewEpisode: episode,
-			NewLabel: media.EpisodeLabel(season, episode),
-		})
-		assigns = append(assigns, storage.EpisodeAssignment{
-			MediaID: medias[i].ID, Season: season, Episode: episode,
-			Source: domain.EpisodeSourceFilename,
-		})
+	changes := make([]episodeChangeJSON, 0, len(res.Changes))
+	for _, c := range res.Changes {
+		changes = append(changes, changeJSON(c))
 	}
 	applied := 0
-	if req.Confirm && len(assigns) > 0 {
-		applied, err = s.DB.ApplySeriesEpisodes(id, assigns)
+	if req.Confirm && len(res.Assigns) > 0 {
+		applied, err = detect.Apply(r.Context(), s.DB, id, res.Assigns)
 		if err != nil {
 			s.audit(r, "series.detect", "series:"+id, false, errCode(err))
 			s.fail(w, r, err)
@@ -461,12 +429,14 @@ func (s *Server) HandleDetectSeries(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, http.StatusOK, map[string]any{
 		"applied": req.Confirm, "changed": len(changes), "updated": applied,
-		"manual_skipped": manualSkipped, "total": len(eps), "changes": changes}, nil)
+		"manual_skipped": res.ManualSkipped, "total": res.Total, "changes": changes}, nil)
 }
 
-func intPtrEqual(a, b *int) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
+// changeJSON is the one wire shape for a detect change.
+func changeJSON(c detect.Change) episodeChangeJSON {
+	return episodeChangeJSON{
+		MediaID: c.MediaID, Title: c.Title, Filename: c.Filename,
+		OldSeason: c.OldSeason, OldEpisode: c.OldEpisode, OldLabel: c.OldLabel,
+		NewSeason: c.NewSeason, NewEpisode: c.NewEpisode, NewLabel: c.NewLabel,
 	}
-	return *a == *b
 }

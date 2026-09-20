@@ -459,3 +459,44 @@ func (db *DB) SeriesCount() (int, error) {
 	err := db.QueryRow(`SELECT COUNT(1) FROM series WHERE deleted_at IS NULL`).Scan(&n)
 	return n, err
 }
+
+// SeriesIDsInLibrary returns the live 剧场 having at least one live member media
+// in the library. 内部/管理端用，不是用户读路径（不带 scope）。
+func (db *DB) SeriesIDsInLibrary(libraryID string) ([]string, error) {
+	return db.seriesIDsInLibrary(libraryID, false, "")
+}
+
+// SeriesIDsWithNewMediaSince returns 剧场 with a live member in the library AND
+// at least one media row in that library created at/after since —— "含新增媒体的
+// 剧场"。扫描成功后的自动识别只针对它们（A.4），避免每次重扫全量跑。
+func (db *DB) SeriesIDsWithNewMediaSince(libraryID, since string) ([]string, error) {
+	return db.seriesIDsInLibrary(libraryID, true, since)
+}
+
+func (db *DB) seriesIDsInLibrary(libraryID string, requireNew bool, since string) ([]string, error) {
+	query := `SELECT DISTINCT sm.series_id FROM series_media sm
+		JOIN media m ON m.id = sm.media_id AND m.deleted_at IS NULL
+		JOIN series s ON s.id = sm.series_id AND s.deleted_at IS NULL
+		WHERE m.library_id = ?`
+	args := []any{libraryID}
+	if requireNew {
+		query += ` AND EXISTS (SELECT 1 FROM media nm WHERE nm.library_id = ?
+			AND nm.deleted_at IS NULL AND nm.created_at >= ?)`
+		args = append(args, libraryID, since)
+	}
+	query += ` ORDER BY sm.series_id ASC`
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
