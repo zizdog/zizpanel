@@ -96,12 +96,15 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 
 ### 应用市场
 
-分类：**网站环境**（Nginx、PHP 8.2/8.4、MySQL 8.4、PostgreSQL、Python 3.10–3.13）、
-**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、IOPaint、图片压缩）、**运维工具**
-（phpMyAdmin、Uptime Kuma、Gitea、Miniflux、Syncthing、Alist、frpc、ddns-go、mac军刀 等）、
-**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
+分类：**网站环境**（Nginx、PHP 8.2/8.4、MySQL 8.4 / MariaDB 13.0、PostgreSQL、
+Python 3.10–3.13）、**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、IOPaint、图片压缩）、
+**运维工具**（phpMyAdmin、Uptime Kuma、Gitea、Miniflux、Syncthing、Alist、frpc、
+ddns-go、mac军刀 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
 
-- 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + MySQL 并做收尾配置。
+- 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + 数据库并做收尾配置，
+  数据库可选 **MySQL 8.4**（默认）或 **MariaDB 13.0**。
+- 两者只能二选一：默认共用数据目录 `/opt/homebrew/var/mysql` 与 3306，对方在跑时
+  面板**拒绝安装**并给出出路，绝不替你停正在运行的数据库。
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
 - 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物）；**Docker 应用面板不代装**，
   只在 Docker 页给一份可参考的预配置 compose，镜像必须原生支持 arm64。
@@ -136,8 +139,8 @@ sudo zizpanel reset-password admin    # 重置密码（交互输入，不回显�
 sudo launchctl kickstart -k system/cn.zizpanel.panel   # 重启面板
 tail -f /opt/zizpanel/logs/panel-$(date +%Y%m%d).log   # 查看日志
 
-sudo /opt/zizpanel/uninstall.sh          # 卸载（保留数据）
-sudo /opt/zizpanel/uninstall.sh --purge  # 彻底卸载（含数据）
+sudo /opt/zizpanel/uninstall.sh              # 三档菜单：1 仅面板 / 2 加卸 LNMP / 3 加删所有数据
+sudo /opt/zizpanel/uninstall.sh --mode 1|2|3 # 逐行显示进度；--dry-run 预演；--purge == --mode 3 --yes
 ```
 
 ### 忘记密码
