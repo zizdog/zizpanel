@@ -64,6 +64,7 @@ func (s *Server) HandleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "library.create", "library:"+lib.ID, true, "")
+	s.AutoScanChanged()
 	respond(w, http.StatusCreated, lib, nil)
 }
 
@@ -139,6 +140,7 @@ func (s *Server) HandlePatchLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "library.update", "library:"+id, true, "")
+	s.AutoScanChanged()
 	respond(w, http.StatusOK, lib, nil)
 }
 
@@ -151,6 +153,7 @@ func (s *Server) HandleDeleteLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "library.delete", "library:"+id, true, "")
+	s.AutoScanChanged()
 	respond(w, http.StatusOK, map[string]any{"ok": true}, nil)
 }
 

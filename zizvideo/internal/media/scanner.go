@@ -249,6 +249,10 @@ func ignored(name string, rules []string) bool {
 	return false
 }
 
+// IgnoredName exposes the ignore-rule match so the event watcher and the
+// scanner skip exactly the same directories (不许第二套判据).
+func IgnoredName(name string, rules []string) bool { return ignored(name, rules) }
+
 // processFile probes one file (with backoff retries) and upserts its row.
 func (s *Scanner) processFile(ctx context.Context, lib *domain.Library, e fileEntry, prev storage.MediaState) bool {
 	if prev.ID != "" && prev.Size == e.Size && prev.MtimeNS == e.MtimeNS && prev.Status != domain.MediaProbeFail {

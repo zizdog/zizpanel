@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/autoscan"
 	"github.com/zizdog/zizvideo/internal/config"
 	"github.com/zizdog/zizvideo/internal/domain"
 	"github.com/zizdog/zizvideo/internal/ffmpeg"
@@ -34,6 +35,9 @@ type Server struct {
 	Runner ffmpeg.Runner
 	Log    *slog.Logger
 
+	// Auto 负责定时/事件驱动的增量扫描；StartAutoScan 之前不运行。
+	Auto *autoscan.Scheduler
+
 	StartedAt time.Time
 
 	mu   sync.RWMutex
@@ -50,8 +54,31 @@ func NewServer(cfg *config.Config, db *storage.DB, a *auth.Manager, t *task.Mana
 	if t != nil {
 		t.SetAfterScan(s.OnScanFinished)
 	}
+	// 自动扫描复用 task.Manager.StartScan，扫描结果与后置识别都留在任务中心。
+	s.Auto = autoscan.New(db, t, log)
 	s.RefreshCapabilities(context.Background())
 	return s
+}
+
+// StartAutoScan 启动后先扫一轮（覆盖停机期间的变动），再按设置定时/事件触发。
+func (s *Server) StartAutoScan(ctx context.Context) {
+	if s.Auto != nil {
+		s.Auto.Start(ctx)
+	}
+}
+
+// StopAutoScan stops the timer and the event watcher.
+func (s *Server) StopAutoScan() {
+	if s.Auto != nil {
+		s.Auto.Stop()
+	}
+}
+
+// AutoScanChanged asks the scheduler to re-read settings and rebuild watches.
+func (s *Server) AutoScanChanged() {
+	if s.Auto != nil {
+		s.Auto.Reload()
+	}
 }
 
 // RefreshCapabilities re-detects ffmpeg/ffprobe availability.

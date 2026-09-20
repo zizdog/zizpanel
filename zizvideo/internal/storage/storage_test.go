@@ -188,9 +188,9 @@ func TestMigration0006FailClosed(t *testing.T) {
 		t.Fatalf("从 0005 升级失败: %v", err)
 	}
 	defer db.Close()
-	// 0006（库授权）+ 0007（默认可见库/source）+ 0008（跨库任务）都跑完，版本是 8。
-	if v, _ := db.SchemaVersion(); v != 8 {
-		t.Fatalf("schema 版本 = %d, 期望 8", v)
+	// 0006（库授权）+ 0007（默认可见库/source）+ 0008（跨库任务）+ 0009（自动扫描）都跑完，版本是 9。
+	if v, _ := db.SchemaVersion(); v != 9 {
+		t.Fatalf("schema 版本 = %d, 期望 9", v)
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_libraries'`).

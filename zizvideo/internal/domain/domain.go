@@ -174,6 +174,52 @@ type JobTask struct {
 	UpdatedAt     string `json:"updated_at"`
 }
 
+// AutoScan 触发来源与运行终态（迁移 0009）。status 的四种取值必须能区分
+// "扫了"、"部分失败"、"没扫但如实说明原因"、"触发即失败"（不许把跳过报成成功）。
+const (
+	AutoScanTriggerStartup = "startup"
+	AutoScanTriggerTimer   = "timer"
+	AutoScanTriggerEvents  = "events"
+	AutoScanTriggerManual  = "manual"
+
+	AutoScanSuccess = "success"
+	AutoScanPartial = "partial"
+	AutoScanSkipped = "skipped"
+	AutoScanFailed  = "failed"
+
+	AutoScanIntervalMin = 1
+	AutoScanIntervalMax = 1440
+	AutoScanDebounceMin = 5
+	AutoScanDebounceMax = 10
+)
+
+// AutoScanSettings is the single-row auto-scan configuration.
+type AutoScanSettings struct {
+	Enabled         bool   `json:"enabled"`
+	IntervalMinutes int    `json:"interval_minutes"`
+	EventsEnabled   bool   `json:"events_enabled"`
+	DebounceSeconds int    `json:"debounce_seconds"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+// AutoScanRun is one automatic-scan round with its honest outcome.
+type AutoScanRun struct {
+	Trigger    string `json:"trigger"`
+	Status     string `json:"status"`
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at"`
+	Libraries  int    `json:"libraries"`
+	Started    int    `json:"started"`
+	Skipped    int    `json:"skipped"`
+	Updated    int    `json:"updated"`
+	NewMedia   int    `json:"new_media"`
+	Failed     int    `json:"failed"`
+	Missing    int    `json:"missing"`
+	EventsOK   bool   `json:"events_ok"`
+	EventsNote string `json:"events_note"`
+	Note       string `json:"note"`
+}
+
 // Progress is one user's playback position for one media item.
 type Progress struct {
 	UserID     string `json:"-"`
@@ -222,6 +268,14 @@ var (
 
 	ErrScanRunning  = New("SCAN_ALREADY_RUNNING", "该媒体库已有扫描在进行", 409)
 	ErrTaskNotFound = New("TASK_NOT_FOUND", "任务不存在", 404)
+
+	// 自动扫描设置校验（迁移 0009）。
+	ErrAutoScanInterval = New("AUTOSCAN_INTERVAL_INVALID", "间隔需在 1-1440 分钟之间", 400)
+	ErrAutoScanDebounce = New("AUTOSCAN_DEBOUNCE_INVALID", "去抖需在 5-10 秒之间", 400)
+	ErrAutoScanDisabled = New("AUTOSCAN_DISABLED", "自动扫描已关闭", 409)
+	// 如实语义：跳过/失败必须带原因；监听不可用必须带原因。
+	ErrAutoScanNoteRequired   = New("AUTOSCAN_NOTE_REQUIRED", "跳过或失败必须带原因", 409)
+	ErrAutoScanEventsRequired = New("AUTOSCAN_EVENTS_REASON_REQUIRED", "监听不可用必须带原因", 409)
 
 	// 任务中心如实语义（A.5）：写入终态前校验，空理由一律拒绝。
 	ErrJobErrorRequired  = New("JOB_ERROR_REQUIRED", "失败任务必须带错误原因", 409)

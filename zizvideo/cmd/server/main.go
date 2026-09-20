@@ -87,6 +87,12 @@ func run() error {
 
 	srv := api.NewServer(cfg, db, authMgr, tasks, roots, runner, logger)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// 启动即扫一轮；之后由设置里的定时器/文件事件驱动。
+	srv.StartAutoScan(ctx)
+	defer srv.StopAutoScan()
+
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           web.Router(srv),
@@ -116,8 +122,6 @@ func run() error {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("监听 %s 失败: %w", cfg.Listen, err)
@@ -130,6 +134,7 @@ func run() error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("HTTP 收尾超时", "error", err.Error())
 	}
+	srv.StopAutoScan()
 	tasks.Stop()
 	logger.Info("已停止")
 	return nil

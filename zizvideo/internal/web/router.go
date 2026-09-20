@@ -91,6 +91,11 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/admin/settings", s.RequireAdmin(s.HandlePatchAdminSettings))
 	mux.HandleFunc("POST /api/v1/auth/register", s.HandleRegister)
 
+	// 自动扫描：设置读写、状态回读、立即触发一轮（扫描仍走任务中心 202+task_id）。
+	mux.HandleFunc("GET /api/v1/admin/autoscan", s.RequireAdmin(s.HandleGetAutoScan))
+	mux.HandleFunc("PATCH /api/v1/admin/autoscan", s.RequireAdmin(s.HandlePatchAutoScan))
+	mux.HandleFunc("POST /api/v1/admin/autoscan/run", s.RequireAdmin(s.HandleRunAutoScan))
+
 	// 条目 11：媒体去重（判据 size+duration，默认只删记录）。
 	mux.HandleFunc("GET /api/v1/admin/duplicates", s.RequireAdmin(s.HandleListDuplicates))
 	mux.HandleFunc("POST /api/v1/admin/duplicates/delete-records", s.RequireAdmin(s.HandleDeleteDuplicateRecords))

@@ -134,6 +134,7 @@ func (s *Server) HandleAddMediaRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "media_root.add", "path:"+clean, true, "")
+	s.AutoScanChanged()
 	body := s.rootsBody()
 	body["added"] = clean
 	body["roots_list"] = next
@@ -195,6 +196,7 @@ func (s *Server) HandleRemoveMediaRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "media_root.remove", "path:"+clean, true, "")
+	s.AutoScanChanged()
 	body := s.rootsBody()
 	body["removed"] = clean
 	body["roots_list"] = next

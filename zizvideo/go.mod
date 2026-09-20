@@ -2,7 +2,10 @@ module github.com/zizdog/zizvideo
 
 go 1.25
 
-require modernc.org/sqlite v1.34.4
+require (
+	github.com/fsnotify/fsnotify v1.9.0
+	modernc.org/sqlite v1.34.4
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
