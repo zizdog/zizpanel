@@ -324,7 +324,8 @@ func (m *Manager) syncServiceRecords(ctx context.Context, formula, label, plist 
 func (m *Manager) StartBrewService(ctx context.Context, formula string) error {
 	label := m.appBrewLabel(ctx, formula)
 	if fileExists(SystemDaemonPlistPath(label)) {
-		return priv.LaunchLoad(label)
+		// 幂等启动：运行中的服务不许被 kickstart -k 白杀一次（坑 225）。
+		return priv.LaunchEnsureRunning(label)
 	}
 	_, err := m.brewRun(ctx, 3*time.Minute, "services", "start", formula)
 	return err

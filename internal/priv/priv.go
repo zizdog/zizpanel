@@ -920,6 +920,29 @@ func LaunchKickstart(label string) error {
 	return launchKick(label, after.Domain)
 }
 
+// LaunchEnsureRunning 确保任务在运行：已在跑就**空操作**，未加载才 bootstrap，
+// 已加载但没跑才 kickstart 一次。
+//
+// 不能直接用 LaunchLoad：「启动」一个正在跑的服务时它会 kickstart -k 把服务
+// 白杀一次（实测 pid 变了），刚起过的还会撞 launchd 的 10s 节流窗口（坑 225）。
+func LaunchEnsureRunning(label string) error {
+	if !reLabel.MatchString(label) {
+		return fmt.Errorf("label 含非法字符: %q", label)
+	}
+	domains := launchDomainsFn(label)
+	st, err := launchResolve(label, domains)
+	if err != nil {
+		return fmt.Errorf("启动 %s 失败：%v", label, err)
+	}
+	if !st.Loaded {
+		return LaunchLoad(label) // 未加载：bootstrap，RunAtLoad 会拉起它
+	}
+	if st.Running {
+		return nil // 已在跑：启动是幂等空操作，绝不白踢
+	}
+	return launchKick(label, st.Domain)
+}
+
 // launchKick 在指定域里 kickstart 并复核。
 func launchKick(label, domain string) error {
 	r := launchctl("kickstart", "-k", domain+"/"+label)

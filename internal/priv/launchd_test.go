@@ -35,6 +35,8 @@ type fakeLaunchctl struct {
 	mu sync.Mutex
 	// loaded 记录每个域里是否有该作业。
 	loaded map[string]bool
+	// stopped 表示该域里作业已加载但**进程没在跑**（print 成功但没有 pid 行）。
+	stopped map[string]bool
 	// 各子命令按域返回的错误输出（"" 表示成功）。
 	printErr     map[string]string
 	bootoutErr   map[string]string
@@ -54,6 +56,7 @@ type fakeLaunchctl struct {
 func newFakeLaunchctl(loaded ...string) *fakeLaunchctl {
 	f := &fakeLaunchctl{
 		loaded:       map[string]bool{},
+		stopped:      map[string]bool{},
 		printErr:     map[string]string{},
 		bootoutErr:   map[string]string{},
 		bootstrapErr: map[string]string{},
@@ -107,6 +110,10 @@ func (f *fakeLaunchctl) run(_ string, args ...string) cmdResult {
 				return cmdResult{stderr: msg, err: errors.New("exit status 1")}
 			}
 			if f.loaded[d] {
+				if f.stopped[d] {
+					// 已加载但没在跑：真机上是 `state = spawn scheduled` 且没有 pid 行。
+					return cmdResult{stdout: "state = spawn scheduled\n\tlast exit code = 0\n"}
+				}
 				return cmdResult{stdout: "state = running\n\tpid = 4242\n\tlast exit code = 0\n"}
 			}
 			// 与真机一致的 113 输出（见 launchOutputSaysMissing 的注释）。
@@ -491,7 +498,7 @@ func TestLaunchDomainCandidates(t *testing.T) {
 
 // ---------- 重启（kickstart） ----------
 
-// 门禁（坑 193）：对已加载的作业，重启只能发**一次** kickstart。
+// 门禁（坑 225）：对已加载的作业，重启只能发**一次** kickstart。
 // 连发两次时第二次会撞 launchd 的 10s 节流窗口 —— 真机实测把面板重启拖成 10.0s，
 // 而命令行同级操作 <0.1s。
 func TestLaunchKickstartKicksExactlyOnceWhenLoaded(t *testing.T) {
@@ -506,7 +513,7 @@ func TestLaunchKickstartKicksExactlyOnceWhenLoaded(t *testing.T) {
 	}
 }
 
-// 门禁（坑 193）：未加载时 bootstrap 已按 RunAtLoad 拉起它，不得再补一次 kickstart。
+// 门禁（坑 225）：未加载时 bootstrap 已按 RunAtLoad 拉起它，不得再补一次 kickstart。
 func TestLaunchKickstartDoesNotDoubleKickAfterBootstrap(t *testing.T) {
 	f := newFakeLaunchctl()
 	withFakeLaunch(t, f)
@@ -522,6 +529,61 @@ func TestLaunchKickstartDoesNotDoubleKickAfterBootstrap(t *testing.T) {
 		t.Fatalf("bootstrap 已拉起作业，不该再 kickstart（真机会撞 10s 节流），实际 %d 次：%v",
 			n, f.callList())
 	}
+}
+
+// ---------- 幂等启动（LaunchEnsureRunning） ----------
+
+// 门禁（坑 225）：对**正在运行**的服务执行「启动」必须是空操作 ——
+// 旧实现走 LaunchLoad，它会 kickstart -k 把服务白杀一次（真机实测 pid 变了），
+// 而且刚起过的还会撞 launchd 的 10s 节流窗口（"启动也很慢"）。
+func TestLaunchEnsureRunningIsNoOpWhenAlreadyRunning(t *testing.T) {
+	f := newFakeLaunchctl("user/501")
+	withFakeLaunch(t, f)
+
+	if err := LaunchEnsureRunning(testLabel); err != nil {
+		t.Fatalf("启动已在跑的服务应当成功: %v", err)
+	}
+	if n := f.count("kickstart"); n != 0 {
+		t.Fatalf("已在跑就不该 kickstart（会白杀服务/撞节流），实际 %d 次：%v", n, f.callList())
+	}
+	if f.called("bootstrap") {
+		t.Fatalf("已在跑就不该 bootstrap：%v", f.callList())
+	}
+}
+
+// 门禁（坑 225）：已加载但没在跑 → 只 kickstart 一次；未加载 → 只 bootstrap。
+func TestLaunchEnsureRunningKicksOrBootstrapsExactlyOnce(t *testing.T) {
+	t.Run("已加载但没在跑 → 一次 kickstart", func(t *testing.T) {
+		f := newFakeLaunchctl("user/501")
+		f.stopped["user/501"] = true
+		withFakeLaunch(t, f)
+
+		if err := LaunchEnsureRunning(testLabel); err != nil {
+			t.Fatalf("应当成功: %v", err)
+		}
+		if n := f.count("kickstart"); n != 1 {
+			t.Fatalf("应 kickstart 恰好一次，实际 %d 次：%v", n, f.callList())
+		}
+		if f.called("bootstrap") {
+			t.Fatalf("已加载就不该 bootstrap：%v", f.callList())
+		}
+	})
+
+	t.Run("未加载 → 一次 bootstrap、零 kickstart", func(t *testing.T) {
+		f := newFakeLaunchctl()
+		withFakeLaunch(t, f)
+		withFakePlist(t, "/Library/LaunchDaemons/"+testLabel+".plist")
+
+		if err := LaunchEnsureRunning(testLabel); err != nil {
+			t.Fatalf("应当成功: %v", err)
+		}
+		if !f.called("bootstrap user/501") {
+			t.Fatalf("应当 bootstrap user/501：%v", f.callList())
+		}
+		if n := f.count("kickstart"); n != 0 {
+			t.Fatalf("bootstrap 之后不该再 kickstart，实际 %d 次：%v", n, f.callList())
+		}
+	})
 }
 
 // TestLaunchOutputSaysMissing 用**真机采集到的原文**锁死"没有这个作业"的判据。

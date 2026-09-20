@@ -63,6 +63,24 @@ func TestWaitServiceStateIsBounded(t *testing.T) {
 	}
 }
 
+// 门禁（坑 225）：停止的等待同样"立即判定" —— 第一次探测就确认不再运行时，
+// 不许有任何固定等待（旧实现无论如何先睡 500ms）。
+func TestWaitServiceStateStopReturnsImmediatelyWhenNotRunning(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	st, ok := waitServiceState(context.Background(), func(context.Context) (State, error) {
+		calls++
+		return State{Status: "stopped", Running: false}, nil
+	}, false)
+	cost := time.Since(start)
+	if !ok || st.Running {
+		t.Fatalf("已停止应立即判定为达到终态：ok=%v state=%+v", ok, st)
+	}
+	if calls != 1 || cost > 100*time.Millisecond {
+		t.Fatalf("停止应立即判定，实际探测 %d 次、耗时 %s（旧实现先睡 500ms）", calls, cost)
+	}
+}
+
 // 门禁：新的就绪等待预算必须仍是秒级（≤5s）且步长细粒度（≤200ms）。
 // 谁把它改回"睡 1s、等 30s"就红。
 func TestServiceActionWaitBudget(t *testing.T) {
@@ -76,7 +94,7 @@ func TestServiceActionWaitBudget(t *testing.T) {
 
 // 门禁：动作快路径只做针对性探测 —— 不得调用全局昂贵探测，也不许固定 sleep。
 // 昂贵探测（brew services list / 全量 ListServices）放动作路径就是"面板比命令行慢
-// 一个数量级"的复发点（坑 165/193）。
+// 一个数量级"的复发点（坑 165/225）。
 func TestServiceActionFastPathHasNoGlobalProbe(t *testing.T) {
 	forbidden := []string{
 		"m.List(", "ListServices", "BrewCapture",
@@ -90,7 +108,7 @@ func TestServiceActionFastPathHasNoGlobalProbe(t *testing.T) {
 	for name, body := range bodies {
 		for _, bad := range forbidden {
 			if strings.Contains(body, bad) {
-				t.Errorf("%s 出现全局昂贵探测 %q（坑 165/193）", name, bad)
+				t.Errorf("%s 出现全局昂贵探测 %q（坑 165/225）", name, bad)
 			}
 		}
 	}
@@ -101,6 +119,20 @@ func TestServiceActionFastPathHasNoGlobalProbe(t *testing.T) {
 	// 第二次撞 launchd 的 10s 节流窗口（真机实测 10.0s）。
 	if body := bodies["native.go Restart"]; strings.Contains(body, "LaunchLoad") {
 		t.Error("nativeDriver.Restart 不得先 LaunchLoad：会与 LaunchKickstart 叠成两次 kickstart（坑 225）")
+	}
+	// 「启动」必须幂等：走 LaunchEnsureRunning（已在跑就空操作），不许裸 LaunchLoad
+	// —— 后者对运行中的服务会 kickstart -k 白杀一次（真机实测 pid 变了），坑 225。
+	for _, tc := range []struct{ file, sig string }{
+		{"native.go", "func (d *nativeDriver) Start("},
+		{"systemdaemon.go", "func (m *Manager) StartBrewService("},
+	} {
+		body := mustFuncBody(t, tc.file, tc.sig)
+		if !strings.Contains(body, "LaunchEnsureRunning") {
+			t.Errorf("%s 的启动必须走 priv.LaunchEnsureRunning（幂等启动），否则会白踢运行中的服务（坑 225）", tc.file)
+		}
+		if strings.Contains(body, "priv.LaunchLoad(") {
+			t.Errorf("%s 的启动不得直接用 priv.LaunchLoad：它会把运行中的服务 kickstart -k 白杀一次（坑 225）", tc.file)
+		}
 	}
 }
 

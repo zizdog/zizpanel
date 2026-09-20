@@ -175,7 +175,7 @@ func (d *nativeDriver) Start(ctx context.Context) error {
 			}
 			// brew 注册完再走一次正常路径
 			if p2, _ := d.plistPath(); p2 != "" {
-				if err := priv.LaunchLoad(d.svc.LaunchLabel); err == nil {
+				if err := priv.LaunchEnsureRunning(d.svc.LaunchLabel); err == nil {
 					return nil
 				}
 			}
@@ -197,8 +197,8 @@ func (d *nativeDriver) Start(ctx context.Context) error {
 		}
 		return fmt.Errorf("找不到 %s 的 plist，无法启动", d.svc.LaunchLabel)
 	}
-	// 已加载则用 kickstart 拉起；未加载则 bootstrap
-	if err := priv.LaunchLoad(d.svc.LaunchLabel); err != nil {
+	// 已在跑则空操作，未加载才 bootstrap，已加载没跑才 kickstart 一次（坑 225）。
+	if err := priv.LaunchEnsureRunning(d.svc.LaunchLabel); err != nil {
 		return err
 	}
 	return nil
