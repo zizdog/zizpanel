@@ -91,6 +91,18 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		return m.AdoptApp(ctx, appID)
 	}
 
+	// 数据库引擎互斥护栏：装 MariaDB 前若 MySQL 正在跑（反之亦然）**拒绝**，
+	// 绝不替用户停服务 —— 两者默认共用数据目录 <brew>/var/mysql 与 3306。
+	//
+	// ⚠️ 必须在幂等短路**之前**（真机 2026-09-20）：应用已经登记/装着时，幂等分支
+	// 会直接 succeeded 返回，护栏永远来不及说话 —— 真机上 MariaDB 在跑，点 mysql84
+	// 的「安装」却得到 202 + succeeded（还写着"3306 由它自己占用"）。
+	// 若这个 app 就是当前在跑的那个引擎，CheckDBEngineConflict 不拦（正常重跑）。
+	conflict := m.CheckDBEngineConflict(ctx, app.BrewFormula)
+	if conflict.Blocked != "" {
+		return nil, fmt.Errorf("不能安装「%s」：%s", app.Name, conflict.Blocked)
+	}
+
 	// 幂等：已经装过的应用再点一次「安装」，必须是"已安装（跳过）"这种良性终态，
 	// 而不是 failed。真机（2026-09-16）的 8 个失败场景（nginx / mysql84 / ollama /
 	// uptime-kuma 的"端口被自己占用"、php81-84 的"服务名已存在"）都是这一条。
@@ -103,14 +115,6 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		if res, done := m.installedSkipResult(ctx, app); done {
 			return res, nil
 		}
-	}
-
-	// 数据库引擎互斥护栏：装 MariaDB 前若 MySQL 正在跑（反之亦然）**拒绝**，
-	// 绝不替用户停服务 —— 两者默认共用数据目录 <brew>/var/mysql 与 3306。
-	// 放在 Preflight 之前：端口冲突那句"已被其它进程占用"说不出"共用数据目录"这层。
-	conflict := m.CheckDBEngineConflict(ctx, app.BrewFormula)
-	if conflict.Blocked != "" {
-		return nil, fmt.Errorf("不能安装「%s」：%s", app.Name, conflict.Blocked)
 	}
 
 	// 先做预检查：避免装到一半才发现缺依赖

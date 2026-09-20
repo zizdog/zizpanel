@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zizdog/zizpanel/internal/mysql"
 	"github.com/zizdog/zizpanel/internal/services"
 )
 
@@ -41,7 +42,7 @@ func jsonBlob(t *testing.T, v any) string {
 // 没有它，护栏会去跑真实 brew 与 lsof 3306 —— 本机 MySQL 正在跑，
 // 结论就随机器漂，而且真的碰了真实服务（AGENTS 第三节禁止）。
 func bindLNMPTestManager(t *testing.T, srv *Server,
-	probe func(context.Context, string) services.DBEngineProbeResult) *services.Manager {
+	probe func(context.Context, mysql.DBEngine) services.DBEngineStatus) *services.Manager {
 	t.Helper()
 	prefix := t.TempDir()
 	brew := filepath.Join(prefix, "bin", "brew")
@@ -58,8 +59,8 @@ func bindLNMPTestManager(t *testing.T, srv *Server,
 	mgr.SetBrewUsesProbeForTest(func(context.Context, string) ([]string, bool) { return nil, true })
 	mgr.SetLaunchdDirsForTest([]string{filepath.Join(prefix, "LaunchDaemons")})
 	if probe == nil {
-		probe = func(context.Context, string) services.DBEngineProbeResult {
-			return services.DBEngineProbeResult{ProbeOK: true}
+		probe = func(context.Context, mysql.DBEngine) services.DBEngineStatus {
+			return services.DBEngineStatus{ProbeOK: true}
 		}
 	}
 	mgr.SetDBEngineProbeForTest(probe)
@@ -124,8 +125,8 @@ func TestLNMPOptionsEndpointShape(t *testing.T) {
 	for _, o := range mysqlGroup["options"].([]any) {
 		dbFormulas = append(dbFormulas, asString(o.(map[string]any)["formula"]))
 	}
-	if strings.Join(dbFormulas, ",") != "mysql@8.4,mariadb" {
-		t.Errorf("数据库候选应为 mysql@8.4 与 mariadb，实际 %v", dbFormulas)
+	if strings.Join(dbFormulas, ",") != "mariadb,mysql@8.4" {
+		t.Errorf("数据库候选应为 mariadb 与 mysql@8.4（默认 MariaDB 在前），实际 %v", dbFormulas)
 	}
 	if !strings.Contains(asString(mysqlGroup["label"]), "MariaDB") {
 		t.Errorf("数据库组的显示名里应出现 MariaDB，实际 %q", asString(mysqlGroup["label"]))
@@ -221,18 +222,19 @@ func TestInstallLNMPEmptyBodyStillAccepted(t *testing.T) {
 	}
 }
 
-// TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask 锁住**互斥护栏也在 400 里回答**。
+// TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask 锁住**互斥护栏在开任务之前回答**。
 //
-// 装 MariaDB 时若 MySQL 正在跑，用户当场就该看到原因与出路；任务中心里出现红叉
-// 已经太晚了，而"替你停掉正在跑的 MySQL"是绝对不能做的事（那可能是他的生产库）。
+// 产品规则（用户 2026-09-20）：MySQL 与 MariaDB 只可能装一个。另一个已装
+// （不管在不在跑）就 400 + 可照做的卸载命令，绝不开任务、也绝不替你停/卸。
 func TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask(t *testing.T) {
 	srv, ts := newTestServer(t)
-	datadir := "/opt/homebrew/var/mysql"
-	bindLNMPTestManager(t, srv, func(_ context.Context, _ string) services.DBEngineProbeResult {
-		return services.DBEngineProbeResult{
-			Installed: true, ProbeOK: true, Holders: []string{"mysqld (pid 950)"},
-			DataDir: datadir, DataDirNonEmpty: true,
+	bindLNMPTestManager(t, srv, func(_ context.Context, target mysql.DBEngine) services.DBEngineStatus {
+		if string(target) == "mariadb" {
+			// 这台机器装着 MySQL（本次要装的是 MariaDB）。
+			return services.DBEngineStatus{ProbeOK: true, OtherInstalled: true}
 		}
+		// 本次要装 MySQL 自己：已装 → 幂等重装放行。
+		return services.DBEngineStatus{ProbeOK: true, TargetInstalled: true}
 	})
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
@@ -243,7 +245,8 @@ func TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask(t *testing.T) {
 		t.Fatalf("引擎冲突应 400（开任务之前），实际 %d：%v", res.StatusCode, out)
 	}
 	msg := asString(out["msg"])
-	for _, want := range []string{"mysqld (pid 950)", "3306", datadir, "不会替你停"} {
+	for _, want := range []string{"只能装一个数据库引擎", "mysql@8.4",
+		"brew services stop mysql@8.4 && brew uninstall mysql@8.4"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("400 原因里应含 %q，实际 %q", want, msg)
 		}
@@ -252,10 +255,41 @@ func TestInstallLNMPRejectsDatabaseEngineConflictBeforeTask(t *testing.T) {
 		t.Errorf("被护栏拒绝时绝不能创建任务，实际有 %d 个", n)
 	}
 
-	// 同一台机器上选 MySQL（它自己在跑）应当照常放行 → 202。
+	// 同一台机器上显式选 MySQL（它自己已装）应当照常放行 → 202（幂等重装）。
 	res2, out2, _ := doJSON(t, ts, "POST", "/api/v1/market/install-lnmp",
-		map[string]string{"php": "php@8.4"}, cookies)
+		map[string]string{"db_engine": "mysql"}, cookies)
 	if res2.StatusCode != http.StatusAccepted {
-		t.Errorf("重跑 MySQL 自己应放行（幂等），实际 %d：%v", res2.StatusCode, out2)
+		t.Errorf("重跑已装的引擎自己应放行（幂等），实际 %d：%v", res2.StatusCode, out2)
+	}
+}
+
+// TestMarketInstallRejectsDatabaseEngineConflictBeforeTask：
+// 市场卡片（/market/{id}/install）也必须**同步 4xx**，不能开一个必定失败的任务。
+//
+// 真机 2026-09-20：MariaDB 在跑时点 mysql84 的「安装」得到 202 + succeeded
+// （幂等短路抢在护栏之前），还写着"3306 由它自己占用"——谎报成功。
+func TestMarketInstallRejectsDatabaseEngineConflictBeforeTask(t *testing.T) {
+	srv, ts := newTestServer(t)
+	bindLNMPTestManager(t, srv, func(_ context.Context, target mysql.DBEngine) services.DBEngineStatus {
+		// 两个都装着，3306 上生效的是 MariaDB（本机的异常状态）。
+		return services.DBEngineStatus{ProbeOK: true, TargetInstalled: true, OtherInstalled: true,
+			Holders: []string{"mariadbd (pid 35985)"}}
+	})
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	before := len(srv.Tasks.List())
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/market/mysql84/install", nil, cookies)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("两个引擎都装着时点 mysql84 必须 4xx，实际 %d：%v", res.StatusCode, out)
+	}
+	msg := asString(out["msg"])
+	for _, want := range []string{"两个引擎都装着", "3306 上生效的是 MariaDB", "mariadbd (pid 35985)"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("拒绝原因里应含 %q，实际 %q", want, msg)
+		}
+	}
+	if n := len(srv.Tasks.List()); n != before {
+		t.Errorf("被护栏拒绝时不该创建任务，实际从 %d 变成 %d", before, n)
 	}
 }

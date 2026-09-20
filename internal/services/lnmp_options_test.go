@@ -236,8 +236,8 @@ func TestLNMPOptionsComeFromCatalog(t *testing.T) {
 	if got := byKey["nginx"]; strings.Join(got, ",") != "nginx" {
 		t.Errorf("nginx 只应有一个候选，实际 %v", got)
 	}
-	if got := byKey["mysql"]; strings.Join(got, ",") != "mysql@8.4,mariadb" {
-		t.Errorf("数据库候选应为 mysql@8.4 与 mariadb（默认项在前），实际 %v", got)
+	if got := byKey["mysql"]; strings.Join(got, ",") != "mariadb,mysql@8.4" {
+		t.Errorf("数据库候选应为 mariadb 与 mysql@8.4（默认项在前），实际 %v", got)
 	}
 	// ② postgresql 绝不能进 LNMP 候选
 	for _, fs := range byKey {
@@ -347,8 +347,8 @@ func TestParseLNMPSelectionPartialAndInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("只传 php 应当合法（其余用默认）：%v", err)
 	}
-	if sel.PHP != "php@8.4" || sel.Nginx != "nginx" || sel.MySQL != "mysql@8.4" {
-		t.Errorf("部分字段合并结果不对：%+v", sel)
+	if sel.PHP != "php@8.4" || sel.Nginx != "nginx" || sel.MySQL != "mariadb" {
+		t.Errorf("部分字段合并结果不对（缺省数据库应为 MariaDB）：%+v", sel)
 	}
 
 	// 非法值：400 的判据
@@ -534,8 +534,8 @@ func TestLNMPOptionsGroupOptionsAreSortedStable(t *testing.T) {
 	if got := byKey["php"]; got != "php@8.4,php@8.2" {
 		t.Errorf("PHP 候选应新版在前，实际 %v", got)
 	}
-	// 数据库位有两个引擎：默认项 mysql@8.4 必须在前（跨引擎不比版本号）。
-	if got := byKey["mysql"]; got != "mysql@8.4,mariadb" {
-		t.Errorf("数据库候选应默认项在前（mysql@8.4,mariadb），实际 %v", got)
+	// 数据库位有两个引擎：默认项 mariadb 必须在前（跨引擎不比版本号）。
+	if got := byKey["mysql"]; got != "mariadb,mysql@8.4" {
+		t.Errorf("数据库候选应默认项在前（mariadb,mysql@8.4），实际 %v", got)
 	}
 }

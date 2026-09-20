@@ -23,9 +23,8 @@ import (
 //       前缀分组）—— 将来目录里加 php@8.5，这里自动就多一个候选，不会漏改；
 //    3. Manager.LNMPOptions —— 给前端的只读候选接口数据（含"已安装"探测）。
 //
-//  为什么默认值必须与改造前**逐字一致**（nginx / php@8.2 / mysql@8.4）：
-//  默认值是历史行为的一部分，用户/文档/站点默认版本都按它写。改默认值
-//  属于另一件事，不能混在这次"让用户可选"的改动里偷偷做掉。
+//  默认值（nginx / php@8.2 / mariadb）是**产品默认**，用户 2026-09-20 明确要求
+//  数据库默认 MariaDB（MySQL 仍可选，但两者只能装一个，见 lnmp_engine.go）。
 // ============================================================================
 
 // LNMPSelection 是一次一键 LNMP 安装所选的三件套。
@@ -113,12 +112,13 @@ func lnmpGroupOf(formula string) (lnmpComponent, bool) {
 	return lnmpComponent{}, false
 }
 
-// DefaultLNMPSelection 是"用户不选"时用的默认三件套（= 历史行为）。
+// DefaultLNMPSelection 是"用户不选"时用的默认三件套（= **产品默认**，不是历史行为）。
 //
+// 数据库默认 **MariaDB**（用户 2026-09-20 要求）：老 body 缺 db_engine 时也走它。
 // 与 LNMPFormulas 是**同一件事的两种写法**，由测试锁死它们不许漂
 // （见 TestDefaultLNMPSelectionMatchesLNMPFormulas）。
 func DefaultLNMPSelection() LNMPSelection {
-	return LNMPSelection{Nginx: "nginx", PHP: "php@8.2", MySQL: "mysql@8.4"}
+	return LNMPSelection{Nginx: "nginx", PHP: "php@8.2", MySQL: "mariadb"}
 }
 
 // Validate 校验这次选择能不能装，失败时返回**人话**错误。
@@ -380,7 +380,7 @@ func lnmpOptionsFromCatalog() []lnmpOptionGroup {
 	for _, c := range lnmpComponents {
 		opts := buckets[c.Key].options
 		// 排序：版本新的在前（"8.4" 在 "8.2" 之前），跨引擎保持目录顺序。
-		// 这样弹窗里默认推荐（php@8.2 / MySQL 8.4）不会因为目录顺序变化而漂。
+		// 这样弹窗里默认推荐（php@8.2 / MariaDB）不会因为目录顺序变化而漂。
 		sortLNMPOptions(opts)
 		label := strings.TrimSpace(c.GroupLabel)
 		if label == "" {
@@ -557,8 +557,8 @@ func (m *Manager) brewLabelCandidates(formula string) []string {
 // lnmpSelectionInput 是 POST /market/install-lnmp 的 JSON body 形状。
 //
 // 用指针是为了区分"字段没传"与"字段传了空串"：
-//   - 没传（nil）   → 用默认选择里的那一项（老客户端只发 {} 或干脆不发表格，
-//     必须继续按历史行为装 nginx + PHP 8.2 + MySQL 8.4）；
+//   - 没传（nil）   → 用默认选择里的那一项（老客户端只发 {} 或干脆不发表格：
+//     数据库默认 **MariaDB**，见 DefaultLNMPSelection）；
 //   - 传了空串      → 显式拒绝（400）：这几乎一定是前端拼错了，
 //     静默替它填默认值会让用户以为"我选了 8.4"而实际装的是 8.2。
 type lnmpSelectionInput struct {
@@ -573,8 +573,9 @@ type lnmpSelectionInput struct {
 
 // ParseLNMPSelection 把请求体解析成一份**已校验**的选择。
 //
-// body 为空（nil / 零长度 / 空对象）时返回默认三件套 —— 这是向后兼容的关键：
-// 老前端调 POST /market/install-lnmp 时不带 body，行为必须与改造前完全一致。
+// body 为空（nil / 零长度 / 空对象）时返回默认三件套（数据库 = **MariaDB**）：
+// 老前端不带 body 时也拿到产品默认值；想要 MySQL 必须显式带 db_engine=mysql
+// （或 mysql="mysql@8.4"）——两者只能装一个（见 lnmp_engine.go）。
 //
 // 任何解析/校验失败都返回**人话**错误，由 web 层原样回 400。
 func ParseLNMPSelection(body []byte) (LNMPSelection, error) {

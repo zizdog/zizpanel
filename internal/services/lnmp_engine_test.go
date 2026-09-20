@@ -7,23 +7,25 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/mysql"
 )
 
 // ============================================================================
 //  数据库引擎维度（MySQL 8.4 / MariaDB）的门禁
 //
-//  三类东西：
-//    ① ParseLNMPSelection 的引擎维度：老请求逐字不变、mariadb 装 mariadb、
+//  产品规则（用户 2026-09-20）：**只可能装一个**，面板不帮忙停/卸。
+//    ① ParseLNMPSelection：缺省 db_engine → **MariaDB**；显式 mysql 仍可用；
 //       未知引擎拒绝；
-//    ② 互斥护栏：注入"另一个引擎在跑/已装/端口被占"等现场，断言拒绝或告警，
-//       并锁住"绝不会为了装 A 去停 B"这条产品底线；
+//    ② 互斥护栏：目标自己已装→放行；另一个已装（不管在不在跑）→拒绝并给出
+//       `brew services stop X && brew uninstall X`；两个都装→两个入口都拒、
+//       只有"自己就是当前生效引擎"放行；端口被无关进程占用→拒绝并点名；
 //    ③ 初始化命令按引擎选（MariaDB 不认 --initialize-insecure）。
 //
-//  护栏探测**全部注入**：默认实现会跑真实 brew 与 lsof 3306，而本机 MySQL 正在跑，
-//  结论会随机器漂（违反"单测不许碰真实服务"）。
+//  护栏探测**全部注入**：默认实现会跑真实 brew 与 lsof 3306。
 // ============================================================================
 
-// guardManager 造一个完全离线的 Manager，并注入引擎探测。
+// guardManager 造一个完全离线的 Manager（launchd 目录也隔离）。
 func guardManager(t *testing.T) *Manager {
 	t.Helper()
 	m, _ := sandboxManager(t)
@@ -33,62 +35,57 @@ func guardManager(t *testing.T) *Manager {
 	return m
 }
 
-// TestParseLNMPSelectionDefaultIsByteIdentical 锁住"老请求逐字不变"。
+// TestParseLNMPSelectionDefaultsToMariaDB 锁住**产品默认值**：缺省 → MariaDB。
 //
-// 老前端不带任何字段（或只带老三个字段），生成物必须与加引擎维度之前完全一样：
-// formula 列表、判定端口、任务标题文案三样都锁。
-func TestParseLNMPSelectionDefaultIsByteIdentical(t *testing.T) {
-	for _, body := range []string{"", "{}", "null",
-		`{"nginx":"nginx","php":"php@8.2","mysql":"mysql@8.4"}`,
-		`{"php":"php@8.2"}`} {
+// 用户 2026-09-20 明确要求默认 MariaDB（此前是 MySQL）。只有 body 里**真的没有**
+// 数据库线索（既没 db_engine 也没 mysql）时才走默认；显式给了 mysql 的老客户端
+// 必须继续拿到 MySQL（见下一个用例）。
+func TestParseLNMPSelectionDefaultsToMariaDB(t *testing.T) {
+	for _, body := range []string{"", "  ", "{}", "null", `{"php":"php@8.2"}`} {
 		sel, err := ParseLNMPSelection([]byte(body))
 		if err != nil {
-			t.Fatalf("body=%q 应当合法（向后兼容），实际：%v", body, err)
+			t.Fatalf("body=%q 应当合法（用默认值），实际：%v", body, err)
 		}
-		if got, want := strings.Join(sel.Formulas(), ","), "nginx,php@8.2,mysql@8.4"; got != want {
-			t.Errorf("body=%q：Formulas=%q，期望 %q（老行为不许变）", body, got, want)
+		if got, want := strings.Join(sel.Formulas(), ","), "nginx,php@8.2,mariadb"; got != want {
+			t.Errorf("body=%q：Formulas=%q，期望 %q（默认数据库是 MariaDB）", body, got, want)
 		}
-		if sel.DBEngine() != "mysql" {
-			t.Errorf("body=%q：默认引擎应为 mysql，实际 %q", body, sel.DBEngine())
+		if strings.Contains(strings.Join(sel.Formulas(), ","), "mysql@8.4") {
+			t.Errorf("body=%q：默认值里不该出现 mysql@8.4（两个引擎只能装一个）", body)
 		}
-		if got, want := sel.ComponentsText(), "nginx / PHP 8.2 / MySQL 8.4"; got != want {
-			t.Errorf("body=%q：ComponentsText=%q，期望 %q（任务标题不许变）", body, got, want)
+		if sel.DBEngine() != "mariadb" {
+			t.Errorf("body=%q：默认引擎应为 mariadb，实际 %q", body, sel.DBEngine())
 		}
-		ports := sel.Ports()
-		if ports["mysql@8.4"] != 3306 || ports["nginx"] != 80 || ports["php@8.2"] != 0 {
-			t.Errorf("body=%q：判定端口变了：%v", body, ports)
+		if got, want := sel.ComponentsText(), "nginx / PHP 8.2 / MariaDB 13.0"; got != want {
+			t.Errorf("body=%q：ComponentsText=%q，期望 %q（任务标题必须是 MariaDB）", body, got, want)
+		}
+		if sel.Ports()["mariadb"] != 3306 || sel.Ports()["nginx"] != 80 || sel.Ports()["php@8.2"] != 0 {
+			t.Errorf("body=%q：判定端口不对：%v", body, sel.Ports())
 		}
 	}
 }
 
-// TestParseLNMPSelectionDatabaseEngine 锁住引擎维度的两条映射。
-func TestParseLNMPSelectionDatabaseEngine(t *testing.T) {
-	sel, err := ParseLNMPSelection([]byte(`{"db_engine":"mariadb"}`))
-	if err != nil {
-		t.Fatalf("db_engine=mariadb 应合法：%v", err)
+// TestParseLNMPSelectionExplicitMySQLStillWorks 老客户端要 MySQL 时必须能拿到。
+func TestParseLNMPSelectionExplicitMySQLStillWorks(t *testing.T) {
+	cases := []string{
+		`{"nginx":"nginx","php":"php@8.2","mysql":"mysql@8.4"}`, // 老前端的三字段写法
+		`{"mysql":"mysql@8.4"}`,
+		`{"db_engine":"mysql"}`,
+		`{"db_engine":"mysql","mysql":"mysql@8.4"}`,
 	}
-	if sel.MySQL != "mariadb" || sel.DBEngine() != "mariadb" {
-		t.Fatalf("应选到 mariadb，实际 %+v", sel)
-	}
-	if got, want := strings.Join(sel.Formulas(), ","), "nginx,php@8.2,mariadb"; got != want {
-		t.Errorf("Formulas=%q，期望 %q（不许混进 mysql@8.4）", got, want)
-	}
-	if strings.Contains(strings.Join(sel.Formulas(), ","), "mysql@8.4") {
-		t.Error("选了 MariaDB 就不该再装 mysql@8.4（两个会抢数据目录与 3306）")
-	}
-	if sel.Ports()["mariadb"] != 3306 {
-		t.Errorf("mariadb 的判定端口应为 3306，实际 %v", sel.Ports())
-	}
-	if got, want := sel.ComponentsText(), "nginx / PHP 8.2 / MariaDB 13.0"; got != want {
-		t.Errorf("ComponentsText=%q，期望 %q（标题里不许写 MySQL）", got, want)
-	}
-
-	// 显式两种写法一致时也合法
-	if _, err := ParseLNMPSelection([]byte(`{"db_engine":"mariadb","mysql":"mariadb"}`)); err != nil {
-		t.Errorf("db_engine 与 mysql 一致时应当合法：%v", err)
-	}
-	if _, err := ParseLNMPSelection([]byte(`{"db_engine":"mysql"}`)); err != nil {
-		t.Errorf("db_engine=mysql 应当合法：%v", err)
+	for _, body := range cases {
+		sel, err := ParseLNMPSelection([]byte(body))
+		if err != nil {
+			t.Fatalf("body=%q 应当合法：%v", body, err)
+		}
+		if sel.MySQL != "mysql@8.4" || sel.DBEngine() != "mysql" {
+			t.Errorf("body=%q：应显式选到 mysql@8.4，实际 %+v", body, sel)
+		}
+		if got, want := strings.Join(sel.Formulas(), ","), "nginx,php@8.2,mysql@8.4"; got != want {
+			t.Errorf("body=%q：Formulas=%q，期望 %q", body, got, want)
+		}
+		if got, want := sel.ComponentsText(), "nginx / PHP 8.2 / MySQL 8.4"; got != want {
+			t.Errorf("body=%q：ComponentsText=%q，期望 %q", body, got, want)
+		}
 	}
 }
 
@@ -108,47 +105,125 @@ func TestParseLNMPSelectionRejectsBadEngine(t *testing.T) {
 	}
 }
 
-// TestCheckDBEngineConflictBlocksOtherRunning 是护栏的**核心**：对方在跑就拒绝，
-// 且原因必须点名数据目录、端口与"面板不会替你停它"。
-func TestCheckDBEngineConflictBlocksOtherRunning(t *testing.T) {
+// TestDBEngineGuardBlocksWhenOtherInstalled（规则②）：
+// 另一个引擎已装（**当前没在跑**）→ 拒绝，并给出可直接照做的卸载命令。
+func TestDBEngineGuardBlocksWhenOtherInstalled(t *testing.T) {
 	cases := []struct {
-		name       string
-		installing string
-		holders    []string
+		target, otherFormula, otherCmd string
 	}{
-		{"装 MariaDB 时 MySQL 在跑", "mariadb", []string{"mysqld (pid 950)"}},
-		{"装 MySQL 时 MariaDB 在跑", "mysql@8.4", []string{"mariadbd (pid 951)"}},
+		{"mariadb", "mysql@8.4", "brew services stop mysql@8.4 && brew uninstall mysql@8.4"},
+		{"mysql@8.4", "mariadb", "brew services stop mariadb && brew uninstall mariadb"},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
+		t.Run(c.target, func(t *testing.T) {
 			m := guardManager(t)
-			m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-				return DBEngineProbeResult{ProbeOK: true, Holders: c.holders}
+			m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+				return DBEngineStatus{ProbeOK: true, TargetInstalled: false, OtherInstalled: true}
 			})
-			got := m.CheckDBEngineConflict(context.Background(), c.installing)
+			got := m.CheckDBEngineConflict(context.Background(), c.target)
 			if got.Blocked == "" {
-				t.Fatal("对方正在跑时必须拒绝（否则新引擎会去开另一个引擎的数据目录）")
+				t.Fatal("另一个引擎已装时必须拒绝（两者只可能装一个）")
 			}
-			datadir := filepath.Join(m.brewPrefix(), "var", "mysql")
-			for _, want := range []string{datadir, "3306", c.holders[0], "不会替你停"} {
+			for _, want := range []string{"只能装一个数据库引擎", c.otherFormula, c.otherCmd} {
 				if !strings.Contains(got.Blocked, want) {
 					t.Errorf("拒绝原因里应含 %q，实际：%s", want, got.Blocked)
 				}
-			}
-			if got.Warning != "" {
-				t.Errorf("拒绝时不该同时给告警：%q", got.Warning)
 			}
 		})
 	}
 }
 
-// 两个都没装、端口空闲 → 都能选。
-func TestCheckDBEngineConflictAllowsWhenClean(t *testing.T) {
+// TestDBEngineGuardBlocksOtherEngineRunningWithoutBrewRecord（规则③）：
+// 端口上跑着对方引擎、但 brew 里没有它的记录 → 同样拒绝并点名占用者。
+func TestDBEngineGuardBlocksOtherEngineRunningWithoutBrewRecord(t *testing.T) {
+	m := guardManager(t)
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: true, Holders: []string{"mariadbd (pid 951)"}}
+	})
+	got := m.CheckDBEngineConflict(context.Background(), "mysql@8.4")
+	if got.Blocked == "" {
+		t.Fatal("3306 上跑着另一个引擎时必须拒绝")
+	}
+	for _, want := range []string{"mariadbd (pid 951)", "不会替你停"} {
+		if !strings.Contains(got.Blocked, want) {
+			t.Errorf("拒绝原因里应含 %q，实际：%s", want, got.Blocked)
+		}
+	}
+}
+
+// TestDBEngineGuardBothInstalledOnlyEffectiveEngineAllowed（规则③）：
+// 两个都装着（本机现在的异常状态）→ 只有"当前生效的那个引擎"能重装，
+// 另一个入口必须拒绝并指出 3306 上生效的是谁。
+func TestDBEngineGuardBothInstalledOnlyEffectiveEngineAllowed(t *testing.T) {
+	m := guardManager(t)
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: true, TargetInstalled: true, OtherInstalled: true,
+			Holders: []string{"mariadbd (pid 35985)"}}
+	})
+	ctx := context.Background()
+
+	if got := m.CheckDBEngineConflict(ctx, "mariadb"); got.Blocked != "" {
+		t.Errorf("玛丽亚在 3306 上生效时，装它自己（幂等重装）应当放行，实际：%s", got.Blocked)
+	}
+	got := m.CheckDBEngineConflict(ctx, "mysql@8.4")
+	if got.Blocked == "" {
+		t.Fatal("两个都装着、且生效的是 MariaDB 时，装 MySQL 必须拒绝")
+	}
+	for _, want := range []string{"两个引擎都装着", "mysql@8.4", "mariadb", "3306 上生效的是 MariaDB", "mariadbd (pid 35985)", "<要卸的>"} {
+		if !strings.Contains(got.Blocked, want) {
+			t.Errorf("拒绝原因里应含 %q，实际：%s", want, got.Blocked)
+		}
+	}
+}
+
+// TestDBEngineGuardBothInstalledNeitherRunning：两个都装、谁都没跑 → 两个入口都拒。
+func TestDBEngineGuardBothInstalledNeitherRunning(t *testing.T) {
+	for _, target := range []string{"mariadb", "mysql@8.4"} {
+		m := guardManager(t)
+		m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+			return DBEngineStatus{ProbeOK: true, TargetInstalled: true, OtherInstalled: true}
+		})
+		got := m.CheckDBEngineConflict(context.Background(), target)
+		if got.Blocked == "" {
+			t.Fatalf("%s：两个都装着时必须拒绝（只有当前生效的那个能重装）", target)
+		}
+		if !strings.Contains(got.Blocked, "两个引擎都装着") ||
+			!strings.Contains(got.Blocked, "判断不出该保留哪个") {
+			t.Errorf("要如实说清判断不出生效引擎，实际：%s", got.Blocked)
+		}
+	}
+}
+
+// TestDBEngineGuardAllowsSameEngineInstalled（规则①）：目标自己已装 → 放行。
+func TestDBEngineGuardAllowsSameEngineInstalled(t *testing.T) {
+	for _, c := range []struct{ target, holder string }{
+		{"mariadb", "mariadbd (pid 700)"},
+		{"mysql@8.4", "mysqld (pid 950)"},
+	} {
+		m := guardManager(t)
+		m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+			return DBEngineStatus{ProbeOK: true, TargetInstalled: true, Holders: []string{c.holder}}
+		})
+		if got := m.CheckDBEngineConflict(context.Background(), c.target); got.Blocked != "" || got.Warning != "" {
+			t.Errorf("%s：自己已装且在跑时应当放行，实际 %+v", c.target, got)
+		}
+		// 自己已装但端口空闲（服务停着）→ 也要放行（幂等重装/启动）。
+		m2 := guardManager(t)
+		m2.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+			return DBEngineStatus{ProbeOK: true, TargetInstalled: true}
+		})
+		if got := m2.CheckDBEngineConflict(context.Background(), c.target); got.Blocked != "" {
+			t.Errorf("%s：自己已装、服务没跑时也应当允许重装，实际：%s", c.target, got.Blocked)
+		}
+	}
+}
+
+// 端口空闲、什么都没装 → 放行。
+func TestDBEngineGuardAllowsWhenClean(t *testing.T) {
 	for _, f := range []string{"mariadb", "mysql@8.4"} {
 		m := guardManager(t)
-		m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-			return DBEngineProbeResult{ProbeOK: true,
-				DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
+		m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+			return DBEngineStatus{ProbeOK: true, DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
 		})
 		if got := m.CheckDBEngineConflict(context.Background(), f); got.Blocked != "" || got.Warning != "" {
 			t.Errorf("%s：干净的机器上不该拦也不该告警，实际 %+v", f, got)
@@ -156,76 +231,64 @@ func TestCheckDBEngineConflictAllowsWhenClean(t *testing.T) {
 	}
 }
 
-// 对方"装了但没跑" → 放行 + 告警（必须点名共用数据目录）。
-func TestCheckDBEngineConflictWarnsWhenOtherInstalledIdle(t *testing.T) {
+// 3306 被无关进程占用 → 拒绝并点名占用者（端口冲突这条不许丢）。
+func TestDBEngineGuardBlocksForeignPortHolder(t *testing.T) {
 	m := guardManager(t)
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-		return DBEngineProbeResult{Installed: true, ProbeOK: true,
-			DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
-	})
-	got := m.CheckDBEngineConflict(context.Background(), "mariadb")
-	if got.Blocked != "" {
-		t.Fatalf("对方只是装了没跑，不该拒绝：%s", got.Blocked)
-	}
-	if !strings.Contains(got.Warning, filepath.Join(m.brewPrefix(), "var", "mysql")) {
-		t.Errorf("告警必须点名共用数据目录，实际：%s", got.Warning)
-	}
-	if !strings.Contains(got.Warning, "mysql@8.4") {
-		t.Errorf("告警必须点名是哪个引擎，实际：%s", got.Warning)
-	}
-}
-
-// 3306 被别的东西占着 → 拒绝并点名占用者（装起来也绑不上）。
-func TestCheckDBEngineConflictBlocksForeignPortHolder(t *testing.T) {
-	m := guardManager(t)
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-		return DBEngineProbeResult{ProbeOK: true, Holders: []string{"nginx (pid 12)"}}
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: true, Holders: []string{"nginx (pid 12)"}}
 	})
 	got := m.CheckDBEngineConflict(context.Background(), "mariadb")
 	if got.Blocked == "" {
 		t.Fatal("3306 被别人占着时必须拒绝")
 	}
-	if !strings.Contains(got.Blocked, "nginx (pid 12)") {
-		t.Errorf("要点名占用者，实际：%s", got.Blocked)
+	for _, want := range []string{"nginx (pid 12)", "3306", "不会停别人的进程"} {
+		if !strings.Contains(got.Blocked, want) {
+			t.Errorf("拒绝原因里应含 %q，实际：%s", want, got.Blocked)
+		}
 	}
 }
 
-// 重跑同一个引擎（它自己在跑）→ 不是冲突，放行且不告警。
-func TestCheckDBEngineConflictAllowsSameEngineRunning(t *testing.T) {
+// brew 探测失败 + 数据目录空 = 全新机器：必须放行（否则装不上第一个数据库）。
+func TestDBEngineGuardProbeFailedAllowsFreshMachine(t *testing.T) {
 	m := guardManager(t)
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-		return DBEngineProbeResult{ProbeOK: true, Holders: []string{"mariadbd (pid 700)"}}
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: false, DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
 	})
-	if got := m.CheckDBEngineConflict(context.Background(), "mariadb"); got.Blocked != "" || got.Warning != "" {
-		t.Errorf("MariaDB 自己在跑时重跑应当放行，实际 %+v", got)
+	if got := m.CheckDBEngineConflict(context.Background(), "mariadb"); got.Blocked != "" {
+		t.Errorf("全新机器（没有 brew、数据目录空）必须能装，实际：%s", got.Blocked)
 	}
 }
 
-// brew 探测失败 = 未复核（不是"什么都没装"）：放行但必须说出来。
-func TestCheckDBEngineConflictWarnsWhenProbeFailed(t *testing.T) {
+// brew 探测失败 + 数据目录已有数据 = 说不清是谁的 → 拒绝（不猜）。
+func TestDBEngineGuardProbeFailedWithDataDirBlocks(t *testing.T) {
 	m := guardManager(t)
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-		return DBEngineProbeResult{ProbeOK: false,
-			DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
+	datadir := filepath.Join(m.brewPrefix(), "var", "mysql")
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: false, DataDir: datadir, DataDirNonEmpty: true}
+	})
+	got := m.CheckDBEngineConflict(context.Background(), "mariadb")
+	if got.Blocked == "" {
+		t.Fatal("探测失败而数据目录已有数据时必须拒绝（面板不猜）")
+	}
+	for _, want := range []string{datadir, "无法复核"} {
+		if !strings.Contains(got.Blocked, want) {
+			t.Errorf("拒绝原因里应含 %q，实际：%s", want, got.Blocked)
+		}
+	}
+}
+
+// 数据目录非空、但没装任何引擎 → 放行 + 告警点名路径（不是"共存"分支）。
+func TestDBEngineGuardWarnsDataDirFromPreviousEngine(t *testing.T) {
+	m := guardManager(t)
+	datadir := filepath.Join(m.brewPrefix(), "var", "mysql")
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
+		return DBEngineStatus{ProbeOK: true, DataDir: datadir, DataDirNonEmpty: true}
 	})
 	got := m.CheckDBEngineConflict(context.Background(), "mariadb")
 	if got.Blocked != "" {
-		t.Fatalf("探测失败不能当成冲突：%s", got.Blocked)
+		t.Fatalf("没装任何引擎时不该拦：%s", got.Blocked)
 	}
-	if !strings.Contains(got.Warning, "复核") {
-		t.Errorf("必须如实说'没能复核'，实际：%s", got.Warning)
-	}
-}
-
-// 数据目录已有数据（可能是另一个引擎留下的）→ 放行 + 告警点名路径。
-func TestCheckDBEngineConflictWarnsWhenDataDirNotEmpty(t *testing.T) {
-	m := guardManager(t)
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
-		return DBEngineProbeResult{ProbeOK: true, DataDirNonEmpty: true,
-			DataDir: filepath.Join(m.brewPrefix(), "var", "mysql")}
-	})
-	got := m.CheckDBEngineConflict(context.Background(), "mariadb")
-	if !strings.Contains(got.Warning, filepath.Join(m.brewPrefix(), "var", "mysql")) {
+	if !strings.Contains(got.Warning, datadir) {
 		t.Errorf("告警必须点名数据目录，实际：%s", got.Warning)
 	}
 }
@@ -234,9 +297,9 @@ func TestCheckDBEngineConflictWarnsWhenDataDirNotEmpty(t *testing.T) {
 func TestCheckDBEngineConflictIgnoresNonEngine(t *testing.T) {
 	m := guardManager(t)
 	called := false
-	m.SetDBEngineProbeForTest(func(context.Context, string) DBEngineProbeResult {
+	m.SetDBEngineProbeForTest(func(_ context.Context, _ mysql.DBEngine) DBEngineStatus {
 		called = true
-		return DBEngineProbeResult{}
+		return DBEngineStatus{}
 	})
 	if got := m.CheckDBEngineConflict(context.Background(), "nginx"); got.Blocked != "" || got.Warning != "" {
 		t.Errorf("nginx 不该被数据库护栏影响，实际 %+v", got)

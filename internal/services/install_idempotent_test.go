@@ -52,6 +52,26 @@ func realMachineAlreadyInstalled() []struct {
 	}
 }
 
+// selfHolderFor 复刻"这个应用自己的服务端进程"在 lsof 里的样子。
+//
+// 护栏与幂等提示现在都要求**真实监听者**（旧实现只看记录里有端口就写
+// "由它自己占用"，2026-09-20 真机上那句是假话）。所以夹具要用真实进程名。
+func selfHolderFor(id string) string {
+	switch id {
+	case "mysql84":
+		return "mysqld (pid 1)"
+	case "mariadb":
+		return "mariadbd (pid 1)"
+	case "nginx":
+		return "nginx (pid 1)"
+	case "ollama":
+		return "ollama (pid 1)"
+	case "uptime-kuma":
+		return "com.docker.backend (pid 1)"
+	}
+	return "fakeproc (pid 1)"
+}
+
 // sandboxIdempotentManager 把 launchd 目录与镜像探测也隔离掉。
 //
 // 为什么必须隔离 launchd：开发机/用户机上可能真的装着 nginx、php ——
@@ -126,10 +146,18 @@ func TestInstallSkipsWhenAppAlreadyInstalled(t *testing.T) {
 
 			marker := filepath.Join(t.TempDir(), "brew-called")
 			m.opt.BrewBin = writeFailingFakeBrew(t, marker)
-			// 复刻真机：这 4 个应用的端口正被它们自己占着。
+			// 数据库护栏会核实"brew 里装着哪个引擎"（只读 list），单测把它注入掉：
+			// 否则 marker 里会多出一条 `list --versions`，让下面"没执行任何 brew 命令"
+			// 的断言失去意义（它要拦的是 install/services 这类写操作）。
+			if app, ok := FindApp(c.id); ok && app.BrewFormula != "" {
+				m.SetBrewInstalledProbeForTest(func(context.Context) (map[string]string, bool) {
+					return map[string]string{app.BrewFormula: "9.9.9"}, true
+				})
+			}
+			// 复刻真机：这 4 个应用的端口正被**它们自己**占着（用真实进程名）。
 			m.portCheckOverride = func(port int) (bool, []string, error) {
 				if c.port > 0 && port == c.port {
-					return true, []string{"fakeproc (pid 1)"}, nil
+					return true, []string{selfHolderFor(c.id)}, nil
 				}
 				return false, nil, nil
 			}
@@ -241,7 +269,7 @@ func TestPreflightPortHeldByOwnServiceIsNotAConflict(t *testing.T) {
 			m.opt.BrewBin = writeRecordingFakeBrew(t, filepath.Join(t.TempDir(), "brew-calls"))
 			m.portCheckOverride = func(port int) (bool, []string, error) {
 				if port == c.port {
-					return true, []string{"fakeproc (pid 1)"}, nil
+					return true, []string{selfHolderFor(c.id)}, nil
 				}
 				return false, nil, nil
 			}

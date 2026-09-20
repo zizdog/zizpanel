@@ -392,7 +392,8 @@ func TestSiteListenPortValidationMatrix(t *testing.T) {
 		{"panel", panelPort, "面板自身"},
 		{"https", 443, "HTTPS 端口"},
 		{"iopaint", 8080, "IOPaint"},
-		{"mysql", 3306, "MySQL"},
+		// 3306 现在由数据库引擎声明（目录里 MariaDB 排在 MySQL 前面，默认引擎也是它）。
+		{"mysql", 3306, "MariaDB"},
 	}
 	for _, c := range cases {
 		res, out, _ := doJSON(t, ts, "POST", "/api/v1/sites", map[string]any{

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/mysql"
 	"github.com/zizdog/zizpanel/internal/sites"
 )
 
@@ -225,11 +226,11 @@ type Manager struct {
 	// `brew list` 与 /Library/LaunchDaemons（违反"单测不许碰真实服务"），
 	// 结论也会随开发机装没装东西而漂（本机恰好装着 php@8.2 的系统守护进程）。
 	lnmpInstalledProbe func(formula string) bool
-	// dbEngineProbe 仅供测试：替换"另一个数据库引擎装没装/在不在跑"的探测。
+	// dbEngineProbe 仅供测试：替换"两个数据库引擎各装没装 / 3306 上是谁"的探测。
 	//
 	// 没有它，互斥护栏的单测会去跑真实 `brew list --versions` 与 lsof 3306
-	// （违反"单测不许碰真实服务"），结论也会随开发机上 MySQL 开没开而漂。
-	dbEngineProbe func(ctx context.Context, formula string) DBEngineProbeResult
+	// （违反"单测不许碰真实服务"），结论也会随开发机上装了哪个引擎而漂。
+	dbEngineProbe func(ctx context.Context, target mysql.DBEngine) DBEngineStatus
 	// mirrorProbeCache 缓存探测结果：一次会话只探一次。
 	//
 	// 为什么必须有：brewEnv 会被**每次 brew 调用**用到（brew list --versions、

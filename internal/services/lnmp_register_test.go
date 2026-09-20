@@ -59,12 +59,12 @@ func TestRegisterLNMPComponentsRegistersAllThree(t *testing.T) {
 	ctx := context.Background()
 
 	// formula → 本机真实标签（与目录里写死的 ServiceLabel 不完全一致）
-	// 注意与 LNMPFormulas 保持一致：默认 PHP 已是 8.2（用户 2026-09-17 要求），
-	// 用 8.3 会让这条测试锁住一个过期的默认值。
+	// 注意与 LNMPFormulas 保持一致：默认 PHP 8.2（用户 2026-09-17）、
+	// 默认数据库 MariaDB（用户 2026-09-20）—— 用别的 formula 会锁住过期默认值。
 	wantLabel := map[string]string{
-		"nginx":     "sh.brew.nginx",           // 目录写的是 homebrew.mxcl.nginx
-		"php@8.2":   "sh.brew.php@8.2",         // 目录写的是 homebrew.mxcl.php@8.2
-		"mysql@8.4": "homebrew.mxcl.mysql@8.4", // 目录写的是 sh.brew.mysql@8.4
+		"nginx":   "sh.brew.nginx",         // 目录写的是 homebrew.mxcl.nginx
+		"php@8.2": "sh.brew.php@8.2",       // 目录写的是 homebrew.mxcl.php@8.2
+		"mariadb": "homebrew.mxcl.mariadb", // 目录写的是 sh.brew.mariadb
 	}
 	for _, label := range wantLabel {
 		writeAgentPlist(t, m.opt.UserHome, label)

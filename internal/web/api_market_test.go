@@ -412,3 +412,32 @@ func TestMarketDeletedEntriesAreGone(t *testing.T) {
 		}
 	}
 }
+
+// TestMarketCardShowsDatabaseEngineConflict 锁住市场卡片的"只可能装一个"提示。
+//
+// 用户 2026-09-20：MySQL 与 MariaDB 只可能装一个，中途换要自己手动卸载。
+// 后端必须拒绝（见 TestMarketInstallRejectsDatabaseEngineConflictBeforeTask），
+// 卡片上再提前说一句，用户就不用先点一次才知道。
+// 用假 brew 注入"机器上装着 mariadb"（只读 list --versions，不碰真机）。
+func TestMarketCardShowsDatabaseEngineConflict(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+	bindFakeBrew(t, srv, t.TempDir(),
+		`case "$1 $2" in "list --versions") echo 'mariadb 13.0.2';; esac`)
+
+	mysqlIt := marketItem(t, ts, cookies, "mysql84")
+	msg := asString(mysqlIt["engine_conflict"])
+	if msg == "" {
+		t.Fatal("机器上装着 mariadb 时，mysql84 的卡片必须提示冲突（点安装必然被后端拒绝）")
+	}
+	for _, want := range []string{"mariadb", "brew uninstall mariadb"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("提示里应含 %q，实际 %q", want, msg)
+		}
+	}
+	// 已装的那个引擎自己的卡片不该跟自己冲突。
+	if got := asString(marketItem(t, ts, cookies, "mariadb")["engine_conflict"]); got != "" {
+		t.Errorf("mariadb 卡片不该报冲突（另一个引擎没装），实际 %q", got)
+	}
+}

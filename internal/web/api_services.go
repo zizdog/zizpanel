@@ -814,6 +814,11 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		//（2026-09-18 用户报障："php 和 nginx 的编辑配置文件都是灰色的"）。
 		// 配置路径是**目录的静态属性**，与有没有服务记录无关，这里一律算出来。
 		ConfigAbs string `json:"config_path_abs,omitempty"`
+
+		// EngineConflict 非空 = 另一个数据库引擎已装（用户 2026-09-20：MySQL 与
+		// MariaDB 只可能装一个）：这张卡点「安装」必然被后端 4xx 拒绝，前端据此
+		// 提前给提示。只读已经批量查好的 brew 结果，**不在列表路径上跑新探测**。
+		EngineConflict string `json:"engine_conflict,omitempty"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -997,13 +1002,26 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if isInstalled && plan.Kind == "none" {
 			isInstalled = false
 		}
+		// 数据库引擎互斥（用户 2026-09-20）：另一个引擎已装时，这张卡点安装必然被
+		// 后端拒绝，先把话说在前面。只读**已经批量查好的** brew 结果，不新增探测
+		//（列表路径跑 lsof/brew 会让首屏变慢，见上面的注释）。
+		engineConflict := ""
+		if other, ok := services.DBEngineOtherFormula(a.BrewFormula); ok && brewProbeOK {
+			_, _, byVers := services.ResolveBrewFormula(other, brewVers)
+			if byVers || brewSet[other] {
+				engineConflict = "已安装 " + other + "：MySQL 与 MariaDB 只能装一个；" +
+					"要换成这个请先在终端执行 `brew services stop " + other +
+					" && brew uninstall " + other + "`"
+			}
+		}
 		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			RuntimeBodyPath: runtimeBody.Path,
 			PortURL:         portURL, ProxyURL: proxyURL,
-			DockerRuntime: dockerRuntime,
-			ConfigAbs:     services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
-			Uninstall:     plan}
+			DockerRuntime:  dockerRuntime,
+			ConfigAbs:      services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
+			EngineConflict: engineConflict,
+			Uninstall:      plan}
 		if plan.Kind == "none" && (adopted || artifacts) {
 			// 有记录/产物却给不出计划：如实说明，别让用户对着卡片猜。
 			it.Note = "面板找不到可卸载的对象（Homebrew 里没有这个包、也没有可清理的产物）；" +
@@ -1359,6 +1377,17 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "「"+app.Name+"」只需要把它加入面板（不重新安装）：请在卡片上点「添加到面板」")
 		return
 	}
+
+	// 数据库引擎互斥护栏：MySQL 与 MariaDB 只可能选装一个（用户 2026-09-20 定的规则）。
+	// 必须在**开任务之前**同步 4xx 回答 —— 服务层虽然也挡，但"已登记"的应用会在
+	// 幂等短路处直接 succeeded，用户看到的是一个假成功（真机 2026-09-20）。
+	// 与一键 LNMP 用同一句人话原因。
+	if c := s.svcManager().CheckDBEngineConflict(r.Context(), app.BrewFormula); c.Blocked != "" {
+		s.audit(r, "install", id, "数据库引擎冲突被拒绝: "+c.Blocked, false, "")
+		fail(w, http.StatusConflict, c.Blocked)
+		return
+	}
+
 	s.launchInstallTask(w, r, "install", id, "安装 "+app.Name,
 		"market_install", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			return s.svcManager().Install(ctx, id)

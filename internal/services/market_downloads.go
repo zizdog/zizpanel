@@ -593,17 +593,7 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
-		ID: "mysql84", Kind: KindNative, BrewFormula: "mysql@8.4", ServiceLabel: "sh.brew.mysql@8.4",
-		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: "sh.brew.mysql@8.4",
-			LabelSource: "目录 ServiceLabel（本机 LaunchAgent 就是这个文件名，实测存在）",
-		},
-		Downloads: []MarketDownloadPoint{
-			brewBottlePoint("mysql@8.4", 30*time.Minute, "brew install mysql@8.4"),
-		},
-	},
-
-	{
+		// 面板默认数据库引擎（用户 2026-09-20），所以排在 mysql84 之前（顺序随目录）。
 		// 与 mysql84 同形（都是 brew 原生 + launchd），所以**没有** PanelInstaller：
 		// 通用 brew 流程已经覆盖装/起/登记/卸，互斥护栏在 InstallLNMP 与 Install 里。
 		ID: "mariadb", Kind: KindNative, BrewFormula: "mariadb", ServiceLabel: "sh.brew.mariadb",
@@ -615,6 +605,17 @@ var marketDownloadApps = []MarketApp{
 		},
 		Downloads: []MarketDownloadPoint{
 			mariadbBottlePoint(),
+		},
+	},
+
+	{
+		ID: "mysql84", Kind: KindNative, BrewFormula: "mysql@8.4", ServiceLabel: "sh.brew.mysql@8.4",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "sh.brew.mysql@8.4",
+			LabelSource: "目录 ServiceLabel（本机 LaunchAgent 就是这个文件名，实测存在）",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("mysql@8.4", 30*time.Minute, "brew install mysql@8.4"),
 		},
 	},
 

@@ -102,9 +102,9 @@ Python 3.10–3.13）、**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、I
 ddns-go、mac军刀 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
 
 - 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + 数据库并做收尾配置，
-  数据库可选 **MySQL 8.4**（默认）或 **MariaDB 13.0**。
-- 两者只能二选一：默认共用数据目录 `/opt/homebrew/var/mysql` 与 3306，对方在跑时
-  面板**拒绝安装**并给出出路，绝不替你停正在运行的数据库。
+  数据库默认 **MariaDB 13.0**（可选 **MySQL 8.4**）。
+- 两个引擎只能装一个：默认共用数据目录 `/opt/homebrew/var/mysql` 与 3306。
+  已装另一个时面板**拒绝安装**并给出卸载命令，绝不替你停/卸正在用的数据库。
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
 - 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物）；**Docker 应用面板不代装**，
   只在 Docker 页给一份可参考的预配置 compose，镜像必须原生支持 arm64。

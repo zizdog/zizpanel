@@ -941,6 +941,12 @@ export function AppsView(content, ctx = {}) {
             '点「安装」会复用它们，只想清干净就点「删除残留数据」',
         }) : null,
         !a.available && !a.installed ? h('span.pill.warn', { text: a.note || '暂不可用' }) : null,
+        // 数据库引擎互斥（用户 2026-09-20）：另一个引擎已装时，这张卡点安装必然被拒。
+        // 后端是唯一判据，这里只是提前把话说清（详情在 title 里）。
+        a.engine_conflict ? h('span.pill.warn', {
+          text: '与已装引擎冲突',
+          title: a.engine_conflict,
+        }) : null,
       ],
       // 卡片上只放**一句话**摘要 + 一段描述（两段不重复）。
       // 完整说明仍然在 title 与「⚙️ 管理」面板里，不会丢。

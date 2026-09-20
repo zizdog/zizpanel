@@ -93,7 +93,7 @@ const LNMP_MYSQL_HINT = '装数据库时会问一次 root 口令（在任务中�
 const LNMP_GROUP_ORDER = [
   { key: 'nginx', label: 'Nginx', desc: 'Web 服务器（网站入口，只有一个版本）' },
   { key: 'php', label: 'PHP', desc: '站点解析 PHP 用；面板让每个版本监听自己的专属 socket，可以多版本共存' },
-  { key: 'mysql', label: '数据库', desc: '二选一：MySQL 8.4 或 MariaDB。两者不能同时运行，默认共用数据目录 /opt/homebrew/var/mysql。' },
+  { key: 'mysql', label: '数据库', desc: '默认 MariaDB；可与 MySQL 二选一，两者只装一个。默认共用数据目录 /opt/homebrew/var/mysql。' },
 ];
 
 // LNMP_TITLE_TAIL 是「⚡ 一键 LNMP」按钮 tooltip 的后半句（用户 2026-09 指定的
@@ -259,15 +259,15 @@ async function openLNMPDialog() {
           text: '读取可选版本失败：' + state.err }),
         h('p.hint', { text: '没有拿到候选版本，所以面板**不会**擅自开始安装。' }),
         h('p.hint', { text: '你可以点「重试」再取一次；或者明确选择"用默认版本安装"' +
-          '（nginx + PHP 8.2 + MySQL 8.4）。' }),
+          '（nginx + PHP 8.2 + MariaDB）。' }),
         h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px' } }, [
           h('button.btn', { text: '重试', onclick: () => load() }),
           h('button.btn.btn-primary', {
-            text: '用默认版本安装（nginx + PHP 8.2 + MySQL 8.4）',
+            text: '用默认版本安装（nginx + PHP 8.2 + MariaDB）',
             onclick: () => {
               // 显式默认：body 里仍然带上这三个 formula（不是"留空让后端决定"），
               // 这样日志与审计里能看出"用户就是选的默认"。
-              const def = { nginx: 'nginx', php: 'php@8.2', mysql: 'mysql@8.4', db_engine: 'mysql' };
+              const def = { nginx: 'nginx', php: 'php@8.2', mysql: 'mariadb', db_engine: 'mariadb' };
               if (m) m.close();
               taskCenter.start({
                 kind: 'install',
@@ -355,6 +355,16 @@ async function openLNMPDialog() {
           ]),
         ]));
       });
+      // 数据库位只可能装一个（用户 2026-09-20）：这台机器已装另一个引擎时，
+      // 提交必然被后端拒绝，所以在这里就先说清"装另一个前要先卸载它"。
+      if (meta.key === 'mysql') {
+        const installedOther = g.options.find((o) => o.installed && o.formula !== state.picked[meta.key]);
+        if (installedOther) {
+          row.append(h('div.hint', { style: { color: 'var(--warn, #b8860b)' },
+            text: '这台机器已装 ' + (installedOther.name || installedOther.formula) +
+              '：两个引擎只能装一个，装另一个前请先在终端卸载它。' }));
+        }
+      }
       box.append(row);
     });
 

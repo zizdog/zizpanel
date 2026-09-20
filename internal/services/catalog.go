@@ -703,6 +703,29 @@ func Catalog() []App {
 			DocsURL:      "https://www.php.net",
 		},
 		// macOS 上 brew 版默认用 /tmp/mysql.sock（不是 TCP 3306），连接时按这个来。
+		//
+		// MariaDB 与 MySQL 8.4 **默认共用数据目录 /opt/homebrew/var/mysql 与 3306**
+		// （mariadb 的 cmake 参数 -DMYSQL_DATADIR=#{var}/mysql，brew info 实测），
+		// 所以**只可能装一个**：装之前由 lnmp_engine.go 的互斥护栏拒绝，绝不停用户的库。
+		// 产品默认是 MariaDB（用户 2026-09-20），所以它排在 mysql84 前面（顺序=市场顺序）。
+		//
+		// 为什么不做成 PanelInstaller：brew 自己的 service 块（mariadbd-safe）就能起，
+		// 数据目录由 brew 的 post_install 初始化 —— 与 mysql84 完全同形，通用
+		// brew 流程已经覆盖"装 + 起 + 登记 + 卸"。加自研安装器只会多一条会漂的路径。
+		// 版本与 arm64 证据见 market_downloads.go 的 mariadb 声明（brew info 实测 13.0.2）。
+		{
+			ID: "mariadb", Name: "MariaDB 13.0", Icon: "🦭",
+			Summary:     "MySQL 兼容的关系型数据库（面板默认引擎）",
+			Description: "MariaDB 13.0，MySQL 兼容的数据库；与 MySQL 8.4 二选一，两者默认共用数据目录与 3306。",
+			Category:    "lnmp", Kind: KindNative, ServiceLabel: "sh.brew.mariadb",
+			Port: 3306, HealthPath: "",
+			BrewFormula: "mariadb",
+			ConfigPath:  "{brew}/etc/my.cnf",
+			// 刻意不填 LogPath：brew 的 canonical plist（sh.brew.mariadb）里没有
+			// StandardOutPath，日志由 mariadbd 自己写进数据目录的 <主机名>.err；
+			// 编一个不存在的 ~/Library/Logs/... 只会让「查看日志」点了空白。
+			DocsURL: "https://mariadb.org",
+		},
 		{
 			ID: "mysql84", Name: "MySQL 8.4", Icon: "🐬",
 			Summary:     "关系型数据库，供站点与面板的数据库管理使用",
@@ -713,27 +736,6 @@ func Catalog() []App {
 			ConfigPath:  "{brew}/etc/my.cnf",
 			LogPath:     "~/Library/Logs/homebrew.mxcl.mysql@8.4.log",
 			DocsURL:     "https://dev.mysql.com",
-		},
-		// MariaDB 与 MySQL 8.4 **默认共用数据目录 /opt/homebrew/var/mysql 与 3306**
-		// （mariadb 的 cmake 参数 -DMYSQL_DATADIR=#{var}/mysql，brew info 实测），
-		// 所以两者只能跑一个：装之前由 lnmp_engine.go 的互斥护栏拒绝，绝不停用户的库。
-		//
-		// 为什么不做成 PanelInstaller：brew 自己的 service 块（mariadbd-safe）就能起，
-		// 数据目录由 brew 的 post_install 初始化 —— 与 mysql84 完全同形，通用
-		// brew 流程已经覆盖"装 + 起 + 登记 + 卸"。加自研安装器只会多一条会漂的路径。
-		// 版本与 arm64 证据见 market_downloads.go 的 mariadb 声明（brew info 实测 13.0.2）。
-		{
-			ID: "mariadb", Name: "MariaDB 13.0", Icon: "🦭",
-			Summary:     "MySQL 兼容的关系型数据库，与 MySQL 8.4 二选一",
-			Description: "MariaDB 13.0，MySQL 兼容的数据库；与 MySQL 8.4 二选一，两者默认共用数据目录与 3306。",
-			Category:    "lnmp", Kind: KindNative, ServiceLabel: "sh.brew.mariadb",
-			Port: 3306, HealthPath: "",
-			BrewFormula: "mariadb",
-			ConfigPath:  "{brew}/etc/my.cnf",
-			// 刻意不填 LogPath：brew 的 canonical plist（sh.brew.mariadb）里没有
-			// StandardOutPath，日志由 mariadbd 自己写进数据目录的 <主机名>.err；
-			// 编一个不存在的 ~/Library/Logs/... 只会让「查看日志」点了空白。
-			DocsURL: "https://mariadb.org",
 		},
 
 		// ---------------- 基础环境（原生安装，跨应用运行依赖） ----------------
@@ -2203,7 +2205,8 @@ func (m *Manager) Preflight(ctx context.Context, app App) Preflight {
 
 	// 已经有面板记录 → 这不是"待安装"，而是"已经装过了"。
 	// 界面据此把它显示成"已安装（跳过）"，与安装任务的终态保持一致。
-	if m.installedRecordFor(ctx, app) != nil {
+	rec := m.installedRecordFor(ctx, app)
+	if rec != nil {
 		pf.AlreadyInstalled = true
 	}
 
@@ -2218,14 +2221,22 @@ func (m *Manager) Preflight(ctx context.Context, app App) Preflight {
 				// 本来就在跑、端口被它自己占着，旧代码却一律判成冲突。
 				// 自己占自己的端口不是冲突，是"已安装"。
 				//
-				// 真冲突（占用者是别的服务/进程）仍然失败，并点名占用者 ——
-				// 见下面的两个分支，行为与过去一致。
-				if self := m.selfPortOccupiers(ctx, app); len(self) > 0 {
+				// ⚠️ 判据必须是**真实监听者**：注册记录里写着端口不够（真机
+				// 2026-09-20：mysql84 的记录占着 3306，而 3306 上听的是 mariadbd）。
+				// 记录说是自己、真实监听者却不是 → 按真冲突报，并点名占用者。
+				self := m.selfPortOccupiers(ctx, app)
+				switch {
+				case len(self) > 0 && m.portHeldBySelf(app, rec, info.Holders):
 					pf.PortFree = true
 					pf.AlreadyInstalled = true
 					pf.PortNote = fmt.Sprintf("端口 %d 已被本应用自己的服务占用（%s）——已经装过了，不会重复安装",
 						app.Port, strings.Join(self, ", "))
-				} else {
+				case len(self) > 0:
+					pf.PortFree = false
+					pf.PortNote = fmt.Sprintf("端口 %d 上的监听者不是这个应用自己（%s）："+
+						"面板记录 %s 已经不占这个端口了",
+						app.Port, strings.Join(info.Holders, ", "), strings.Join(self, ", "))
+				default:
 					names, _ := m.repo.CountByPort(ctx, app.Port, "")
 					if len(names) > 0 {
 						pf.PortFree = false

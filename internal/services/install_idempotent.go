@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
+
+	"github.com/zizdog/zizpanel/internal/priv"
 )
 
 // ============================================================================
@@ -163,9 +166,10 @@ func (m *Manager) installedSkipResult(ctx context.Context, app App) (*InstallRes
 func (m *Manager) alreadyInstalledResult(ctx context.Context, app App, rec *Service) *InstallResult {
 	res := &InstallResult{App: app.ID, Name: app.Name, Service: rec}
 	res.Steps = append(res.Steps, fmt.Sprintf("检测到「%s」已经安装：服务记录 %s", app.Name, rec.Name))
-	if rec.Port > 0 {
-		res.Steps = append(res.Steps,
-			fmt.Sprintf("端口 %d 由它自己占用（正常状态，不是端口冲突）", rec.Port))
+	// 端口那一句必须来自**真实监听者**（见 portOccupancyStep）：旧实现只看
+	// "记录里有端口"，在真机 MariaDB 上写出过"3306 由它自己占用"这句假话。
+	if step := m.portOccupancyStep(ctx, app, rec); step != "" {
+		res.Steps = append(res.Steps, step)
 	}
 	if m.reconcileInstalledRecord(ctx, app, rec) {
 		res.Steps = append(res.Steps, "已顺带补齐服务记录里缺失的字段（标签/端口/健康检查地址）")
@@ -176,6 +180,122 @@ func (m *Manager) alreadyInstalledResult(ctx context.Context, app App, rec *Serv
 	)
 	res.Message = fmt.Sprintf("「%s」已经装过了，本次跳过，没有重复安装", app.Name)
 	return res
+}
+
+// portOccupancyStep 返回"这个应用的端口现在到底是谁在占"的人话结论（空 = 不该说）。
+//
+// 判据只能是**真实监听者**，不能是面板记录（真机 2026-09-20：mysql84 的记录还在、
+// 还占着 3306，而 3306 上听的其实是 mariadbd）。读不到就写"未复核（不猜）"，
+// 绝不在占用者是另一个引擎时声称"它自己占用"。
+func (m *Manager) portOccupancyStep(ctx context.Context, app App, rec *Service) string {
+	port := 0
+	if rec != nil {
+		port = rec.Port
+	}
+	if port <= 0 {
+		port = app.Port
+	}
+	if port <= 0 {
+		return ""
+	}
+	info, err := m.checkPort(port)
+	if err != nil {
+		return fmt.Sprintf("端口 %d 的占用情况未复核（不猜）：%v", port, err)
+	}
+	if !info.InUse {
+		return fmt.Sprintf("端口 %d 当前没有进程在监听", port)
+	}
+	if m.portHeldBySelf(app, rec, info.Holders) {
+		return fmt.Sprintf("端口 %d 由它自己占用（正常状态，不是端口冲突）", port)
+	}
+	occupiers := strings.Join(info.Holders, "、")
+	// 数据库引擎的另一种可能：端上是**另一个引擎**（两者不能同时跑）。
+	if other, ok := DBEngineOtherFormula(app.BrewFormula); ok {
+		if _, hit := holderMatching(info.Holders, dbEngineProcName(other)); hit {
+			return fmt.Sprintf("端口 %d 被 %s 占用：那是**另一个数据库引擎**（%s），不是「%s」自己；"+
+				"两者默认共用数据目录与 3306，不能同时运行",
+				port, occupiers, dbEngineFormulaDisplay(other), app.Name)
+		}
+	}
+	return fmt.Sprintf("端口 %d 被 %s 占用：端口占用未复核（不猜）—— 面板无法确认它就是「%s」自己，"+
+		"别据此认为它在正常运行", port, occupiers, app.Name)
+}
+
+// portHeldBySelf 判断端口占用者是不是**这个应用自己**（只认真实证据，不认记录）。
+//
+//   - 数据库引擎：占用者进程名与这个引擎自己的进程名吻合；
+//   - 它自己的 launchd 作业 PID 就是占用者；
+//   - 原生 brew 应用：占用者进程名与 formula 基名吻合（nginx / ollama / frpc…）；
+//   - compose / docker：占用者是容器运行时的端口代理（进程名带 docker）。
+//
+// 都不成立时返回 false —— 调用方据此说"未复核"，绝不写"正常状态"。
+func (m *Manager) portHeldBySelf(app App, rec *Service, holders []string) bool {
+	if len(holders) == 0 {
+		return false
+	}
+	if e := dbEngineOfFormula(app.BrewFormula); e != "" {
+		if _, ok := holderMatching(holders, dbEngineProcName(e)); ok {
+			return true
+		}
+	}
+	for _, label := range m.appLaunchLabels(app, rec) {
+		st, err := priv.LaunchStatus(label)
+		if err == nil && st.PID > 0 && holdersContainPID(holders, st.PID) {
+			return true
+		}
+	}
+	if app.Kind == KindNative && app.BrewFormula != "" {
+		if _, ok := holderMatching(holders, brewFormulaBase(app.BrewFormula)); ok {
+			return true
+		}
+	}
+	if app.Kind == KindCompose || app.Kind == KindDocker {
+		allDocker := true
+		for _, h := range holders {
+			name := strings.ToLower(strings.TrimSpace(strings.SplitN(h, "(", 2)[0]))
+			if name == "" || !strings.Contains(name, "docker") {
+				allDocker = false
+				break
+			}
+		}
+		if allDocker {
+			return true
+		}
+	}
+	return false
+}
+
+// appLaunchLabels 汇总"这个应用可能的 launchd 标签"（记录里的 + 目录声明的 + 磁盘上的）。
+func (m *Manager) appLaunchLabels(app App, rec *Service) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(l string) {
+		l = strings.TrimSpace(l)
+		if l == "" || seen[l] {
+			return
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	if rec != nil {
+		add(rec.LaunchLabel)
+	}
+	add(app.ServiceLabel)
+	add(app.AdoptLabel)
+	if app.BrewFormula != "" {
+		add(m.brewLabelFor(app.BrewFormula))
+		add("homebrew.mxcl." + app.BrewFormula)
+		add("sh.brew." + app.BrewFormula)
+	}
+	return out
+}
+
+// brewFormulaBase 去掉 formula 的版本后缀（mysql@8.4 → mysql；nginx → nginx）。
+func brewFormulaBase(formula string) string {
+	if i := strings.Index(formula, "@"); i > 0 {
+		return formula[:i]
+	}
+	return formula
 }
 
 // reconcileInstalledRecord 只补**缺失**的字段，不覆盖已有信息。

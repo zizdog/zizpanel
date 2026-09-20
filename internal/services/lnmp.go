@@ -23,18 +23,19 @@ import (
 // LaunchAgent，无头开机不加载（坑 130）。收尾统一串在这里；
 // 写系统 plist 复用 tools/system-services.sh（真机验证过）。
 
-// LNMPFormulas 是**默认**三件套（nginx / PHP / MySQL），顺序有意义：nginx 是入口。
+// LNMPFormulas 是**默认**三件套（nginx / PHP / **MariaDB**），顺序有意义：nginx 是入口。
 // ⚠️ 语义已收窄：本次装什么由参数 LNMPSelection 承载；它只剩默认值来源（测试锁死）与
-// 老调用方兼容入口。PHP 默认 **8.2**（用户 2026-09-17 明确要求），市场只上架 8.2/8.4。
-var LNMPFormulas = []string{"nginx", "php@8.2", "mysql@8.4"}
+// 老调用方兼容入口。PHP 默认 **8.2**（用户 2026-09-17 要求），数据库默认 **MariaDB**
+// （用户 2026-09-20 要求；MySQL 仍可选，但两者只能装一个，见 lnmp_engine.go）。
+var LNMPFormulas = []string{"nginx", "php@8.2", "mariadb"}
 
 // LNMPPorts 是**默认**三件套的判定端口，同样是默认值（本次端口见 LNMPSelection.Ports()）。
-// 用端口而不是 HTTP：PHP-FPM 说 FastCGI、MySQL 说 MySQL 协议，过不了 HTTP 检查。
+// 用端口而不是 HTTP：PHP-FPM 说 FastCGI、数据库说 MySQL 协议，过不了 HTTP 检查。
 // PHP 的 0 有意义 —— php@x.y 监听专属 socket（sites.EnsureListen），留个假的 9000 只会误报。
 var LNMPPorts = map[string]int{
-	"nginx":     80,
-	"php@8.2":   0,
-	"mysql@8.4": 3306,
+	"nginx":   80,
+	"php@8.2": 0,
+	"mariadb": 3306,
 }
 
 // InstallLNMP 一键把 LNMP 环境装好并跑起来。sel 是**本次要装的三件套**，空选择当默认三件套。
