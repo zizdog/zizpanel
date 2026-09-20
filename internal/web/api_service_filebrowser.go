@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -83,4 +84,41 @@ func boolText(v bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// ============================================================================
+//  File Browser「重置口令」（用户 2026-09-20 要求）
+//
+//  它的库是 BoltDB：实例运行时 CLI 拿不到锁（会超时/静默失败），所以流程必须是
+//  「停服务 → 改口令 → 起回来 → 回读验证」（见 services/filebrowser_password.go，
+//  坑号见 docs/坑清单.md 坑 221）。这里只做鉴权、参数解析与任务投递。
+// ============================================================================
+
+type filebrowserPasswordReq struct {
+	// Password 留空 = 由面板生成强随机口令（≥16 位）。
+	// 绝不回显、不写审计、不写日志：值只出现在任务结果的凭据区一次。
+	Password string `json:"password"`
+}
+
+// handleFilebrowserPasswordReset 重置口令（仅管理员，走任务中心：202 + task_id）。
+func (s *Server) handleFilebrowserPasswordReset(w http.ResponseWriter, r *http.Request) {
+	if u := userFrom(r.Context()); u == nil || !u.IsAdmin {
+		fail(w, http.StatusForbidden, "只有管理员能重置 File Browser 口令")
+		return
+	}
+	name := r.PathValue("name")
+	if err := s.ensureFilebrowserService(r.Context(), name); err != nil {
+		fail(w, http.StatusBadRequest, "这个操作只支持面板托管的 File Browser："+err.Error())
+		return
+	}
+	var req filebrowserPasswordReq
+	if err := decodeOptional(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mgr := s.svcManager()
+	s.launchTask(w, r, "filebrowser-password", name, "重置 File Browser 口令", "filebrowser_reset_password",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return mgr.FilebrowserResetPassword(ctx, req.Password)
+		})
 }

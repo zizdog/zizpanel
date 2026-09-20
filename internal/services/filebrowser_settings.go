@@ -51,12 +51,12 @@ func (m *Manager) FilebrowserRootInfo() (FilebrowserRootInfo, error) {
 	if !ok {
 		return FilebrowserRootInfo{}, fmt.Errorf("面板内部错误：找不到 filebrowser 的描述符")
 	}
-	p := m.binaryReleasePathsFor(d)
+	plistPath := m.filebrowserPlistPath(d)
 	info := FilebrowserRootInfo{
-		AppID: "filebrowser", Plist: p.Plist,
-		DefaultRoot: m.opt.UserHome, RootSource: "launchd plist 里的 -r 参数（" + p.Plist + "）",
+		AppID: "filebrowser", Plist: plistPath,
+		DefaultRoot: m.opt.UserHome, RootSource: "launchd plist 里的 -r 参数（" + plistPath + "）",
 	}
-	data, err := os.ReadFile(p.Plist)
+	data, err := os.ReadFile(plistPath)
 	if err != nil {
 		return info, nil // 没装/没 plist：Installed=false，Root 为空
 	}
@@ -93,20 +93,20 @@ func (m *Manager) SetFilebrowserRoot(ctx context.Context, newRoot string) (Fileb
 	if !st.IsDir() {
 		return FilebrowserRootInfo{}, fmt.Errorf("%s 不是目录（File Browser 的 -r 只能指向目录）", root)
 	}
-	p := m.binaryReleasePathsFor(d)
-	data, err := os.ReadFile(p.Plist)
+	plistPath := m.filebrowserPlistPath(d)
+	data, err := os.ReadFile(plistPath)
 	if err != nil {
-		return FilebrowserRootInfo{}, fmt.Errorf("读不到 launchd 配置 %s（File Browser 可能没装好）：%v", p.Plist, err)
+		return FilebrowserRootInfo{}, fmt.Errorf("读不到 launchd 配置 %s（File Browser 可能没装好）：%v", plistPath, err)
 	}
 	updated, err := replacePlistArgValue(string(data), "-r", root)
 	if err != nil {
 		return FilebrowserRootInfo{}, err
 	}
-	if err := os.WriteFile(p.Plist, []byte(updated), 0o644); err != nil {
-		return FilebrowserRootInfo{}, fmt.Errorf("写入 launchd 配置 %s 失败：%w", p.Plist, err)
+	if err := os.WriteFile(plistPath, []byte(updated), 0o644); err != nil {
+		return FilebrowserRootInfo{}, fmt.Errorf("写入 launchd 配置 %s 失败：%w", plistPath, err)
 	}
 	// 重新装载（bootout + bootstrap + 重试），让它读新的 plist。
-	if err := m.bootstrapService(ctx, d.Service.Label, p.Plist); err != nil {
+	if err := m.bootstrapService(ctx, d.Service.Label, plistPath); err != nil {
 		return FilebrowserRootInfo{}, fmt.Errorf("已改配置但重启服务失败：%w", err)
 	}
 	// 等端口真的起来（最多 ~10 秒），再回读。
@@ -132,7 +132,7 @@ func (m *Manager) SetFilebrowserRoot(ctx context.Context, newRoot string) (Fileb
 	default:
 		info.Verified = false
 		info.Note = fmt.Sprintf("写入后回读到的 -r 是 %q，与期望的 %q 不一致 —— **未复核**，请检查 %s",
-			info.Root, root, p.Plist)
+			info.Root, root, plistPath)
 	}
 	return info, nil
 }

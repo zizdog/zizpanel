@@ -304,6 +304,15 @@ type Manager struct {
 	// 没有它，单测要么真去连开发机上的 Docker（如果恰好装了，结论随机器变），
 	// 要么只能测到"连不上"一态；返回非空字符串 = 引擎在跑，返回 "" = 连不上。
 	dockerVersionOverride func(ctx context.Context, sock string) string
+	// filebrowserExecOverride 仅供测试：替换 File Browser 口令流程里的外部命令执行
+	// （filebrowser CLI 与 launchctl）。没有它，单测会执行真机二进制与真实 launchd。
+	filebrowserExecOverride func(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error)
+	// filebrowserProbeOverride 仅供测试：替换口令改完后的两次 HTTP 回读验证。
+	// 没有它，单测会去连本机 8081（开发机上恰好有真服务在听，结论随机器变）。
+	filebrowserProbeOverride func(ctx context.Context, method, rawURL string, body []byte) (int, error)
+	// filebrowserPlistOverride 仅供测试：把 File Browser 的 plist 指到临时文件。
+	// 没有它，单测会读真机 /Library/LaunchDaemons（单测不许碰真实环境）。
+	filebrowserPlistOverride string
 }
 
 // Options 是管理器需要的环境信息。
@@ -439,6 +448,34 @@ func (m *Manager) SetPortCheckProbeForTest(fn func(port int) (bool, []string, er
 	prev := m.portCheckOverride
 	m.portCheckOverride = fn
 	return func() { m.portCheckOverride = prev }
+}
+
+// SetFilebrowserExecForTest 替换 File Browser 口令流程的外部命令执行，返回值供测试恢复。
+//
+// 为什么必须导出：web 层单测通过 svcManager() 现造 Manager，够不到未导出字段；
+// 而这条流程要执行真机 filebrowser 二进制与 launchctl（单测绝不许碰）。
+func (m *Manager) SetFilebrowserExecForTest(
+	fn func(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error)) func() {
+
+	prev := m.filebrowserExecOverride
+	m.filebrowserExecOverride = fn
+	return func() { m.filebrowserExecOverride = prev }
+}
+
+// SetFilebrowserProbeForTest 替换口令改完后的 HTTP 回读验证，返回值供测试恢复。
+func (m *Manager) SetFilebrowserProbeForTest(
+	fn func(ctx context.Context, method, rawURL string, body []byte) (int, error)) func() {
+
+	prev := m.filebrowserProbeOverride
+	m.filebrowserProbeOverride = fn
+	return func() { m.filebrowserProbeOverride = prev }
+}
+
+// SetFilebrowserPlistForTest 把 File Browser 的 plist 指到临时文件，返回值供测试恢复。
+func (m *Manager) SetFilebrowserPlistForTest(path string) func() {
+	prev := m.filebrowserPlistOverride
+	m.filebrowserPlistOverride = path
+	return func() { m.filebrowserPlistOverride = prev }
 }
 
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，

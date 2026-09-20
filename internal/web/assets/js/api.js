@@ -278,6 +278,11 @@ export const api = {
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-root`),
   setFilebrowserRoot: (name, root) =>
     request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-root`, { root }),
+  // 重置 File Browser 口令：走任务中心（202 + task_id），新口令只在任务结果里显示一次。
+  // password 留空 = 后端生成强随机口令。口令不进 URL、不进 localStorage。
+  resetFilebrowserPassword: (name, password) =>
+    request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-password`,
+      password ? { password } : {}),
 
   // ---- 任务中心（安装/卸载的实时进度）----
   //

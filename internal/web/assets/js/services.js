@@ -20,6 +20,7 @@
 
 import { api, sseServiceLogs } from './api.js';
 import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
+import { taskCenter } from './tasks.js';
 // 依赖方向：apps.js → servicePanel.js ↔ services.js（两模块互取函数，但都只在
 // 渲染/点击时才调用，不在模块初始化时求值，所以没有初始化顺序问题）。
 // 卡片外壳、唯一那颗「打开」、「启停 / 重启 / 刷新」「状态措辞」全部来自
@@ -1425,6 +1426,44 @@ async function openFilebrowserRootModal(s, parentModal) {
   return m;
 }
 
+// resetFilebrowserPassword 重置 File Browser 的口令（用户 2026-09-20 要求）。
+//
+// 后端固定流程「停服务 → 改口令 → 起回来 → 回读验证」（它的 BoltDB 运行时
+// CLI 拿不到锁，见坑 221）。新口令只在**任务结果**里显示一次
+// （tasks.js 的 resultBlock 是唯一允许出现口令的地方），不进 URL / 不进 localStorage。
+async function resetFilebrowserPassword(s) {
+  const custom = await promptBox({
+    title: '重置 File Browser 口令',
+    label: '新口令（留空＝自动生成 16 位以上强随机口令）',
+    type: 'password',
+    placeholder: '留空则自动生成',
+    hint: '至少 12 位。会先停服务，改完自动把它起回来；原口令立即失效。',
+  });
+  if (custom === null) return;
+  const pwd = (custom || '').trim();
+  if (pwd && pwd.length < 12) { toast('口令至少 12 位', 'err'); return; }
+
+  if (!await confirmBox(
+    '将先停止 File Browser（期间网页打不开），再改口令并重新启动。\n'
+    + '原口令立即失效；新口令只在任务结果里显示这一次。',
+    { title: '确认重置口令', danger: true, okText: '确认重置' })) return;
+
+  return taskCenter.start({
+    kind: 'filebrowser-password',
+    target: s.name,
+    title: '重置 File Browser 口令',
+    start: () => api.resetFilebrowserPassword(s.name, pwd),
+    onDone: (task) => {
+      if (task && task.status && task.status !== 'succeeded') {
+        // 失败必须把后端原文贴出来，绝不沉默（坑 154）。
+        toast('重置口令失败：' + (task.error || '原因见任务进度窗'), 'err', 15000);
+      } else {
+        toast('口令已重置：新口令只在任务结果里显示这一次，请立刻保存', 'ok', 15000);
+      }
+    },
+  });
+}
+
 // WIDGET_BUTTONS：launchd 标签 → 造按钮的函数。
 //
 // 用 label 而不是"应用 ID"当键：服务记录里可靠的就是 launch_label
@@ -1451,12 +1490,17 @@ const WIDGET_BUTTONS = {
       onclick: () => openQwenModels(s),
     }),
   ],
-  // File Browser：文件根目录（-r）设置。改完重启并回读生效值。
+  // File Browser：文件根目录（-r）设置 + 忘记口令时的一键重置。
   [FILEBROWSER_LABEL]: (parentModal, s) => [
     h('button.btn.btn-sm', {
       text: '📁 主目录',
       title: '设置 File Browser 管理的根目录（改 launchd plist 的 -r → 重启 → 回读生效值）',
       onclick: () => openFilebrowserRootModal(s, parentModal),
+    }),
+    h('button.btn.btn-sm.btn-danger', {
+      text: '🔑 重置口令',
+      title: '忘记口令时用：停止服务→改口令→起回来→回读验证；新口令只在任务结果里显示一次',
+      onclick: () => resetFilebrowserPassword(s),
     }),
   ],
 };
