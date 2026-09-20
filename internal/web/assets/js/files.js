@@ -2224,6 +2224,11 @@ const CM_CORE_JS = [
 // 内嵌资源通用加载器（CodeMirror 与 Plyr 共用）：注入 <script>/<link>，同一 URL 只加载一次。
 const assetLoaded = new Set();
 
+// CodeMirror 本体加载的进行中 Promise（成功后复用；失败置空以便重试）。
+// ⚠️ 这一行曾被清理"死代码"时误删 —— 语法照样合法、门禁全绿，但浏览器报
+// `Can't find variable: cmCorePromise`，编辑器直接打不开。门禁：tools/check-js-undeclared.mjs。
+let cmCorePromise = null;
+
 function loadAssetOnce(url, isCss) {
   if (assetLoaded.has(url)) return Promise.resolve();
   return new Promise((resolve, reject) => {
