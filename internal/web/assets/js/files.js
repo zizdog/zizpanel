@@ -2478,7 +2478,7 @@ function ensureEditorStyle() {
 //   · 左侧目录树：展开/折叠、点目录切换浏览目录、点文件切换编辑文件、当前文件高亮、
 //     宽度可拖动（记在 localStorage）；
 //   · 菜单栏把已有能力（保存/另存为/查找/跳行/刷新/下载/关闭…）收进「文件/编辑/视图/帮助」；
-//   · 窗口可拖动，位置记在 localStorage；
+//   · 窗口可拖动，位置/大小记在 localStorage；打开与 resize 都先夹进视口（坑 220）；
 //   · 「最大化」= 铺满**面板 content 区域**（不是浏览器全屏、不是系统全屏）；
 //   · 「最小化」= 右下角胶囊，**不加任何遮罩**。
 //
@@ -2490,15 +2490,13 @@ function ensureEditorStyle() {
 const ZPF_TREE_W_KEY = 'zp-file-editor-tree-w';
 const ZPF_TREE_HIDDEN_KEY = 'zp-file-editor-tree-hidden';
 const ZPF_POS_KEY = 'zp-file-editor-pos';
-// 还原态相对 content 区域的内缩：让它看起来是一个"窗口"，同时仍然充满内容区。
-const ZPF_WIN_INSET = 14;
 
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
 function readLS(key) { try { return localStorage.getItem(key); } catch { return null; } }
 function writeLS(key, v) { try { localStorage.setItem(key, String(v)); } catch { /* 存不了就本次会话生效 */ } }
 
-// contentRect 返回面板内容区（`.content`）的视口坐标。编辑器的所有几何都以它为界。
+// contentRect 返回面板内容区（`.content`）的视口坐标。最大化语义以它为界。
 function contentRect() {
   const el = document.querySelector('.content');
   if (el) {
@@ -2506,6 +2504,66 @@ function contentRect() {
     if (r.width > 80 && r.height > 80) return r;
   }
   return { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight };
+}
+
+// clampEditorGeom 把窗口几何夹进可用区（纯函数，可单测，坑 220）。
+// 越界 → 平移进边界；尺寸非法/装不下 → 回退到居中的默认几何（占可用区 84%），绝不沿用坏几何。
+// g/view 都是 layer 内坐标；返回 {left, top, width, height, fellBack}。
+function clampEditorGeom(g, view) {
+  const MIN_W = 320;   // 与 CSS .zpf-win 的 min-width 一致
+  const MIN_H = 200;   // 与 CSS .zpf-win 的 min-height 一致
+  const RATIO = 0.84;  // 默认几何占可用区的比例（80%~90%）
+  const MARGIN = 8;    // 与视口边缘留的边距
+  const vw = Math.max(1, Math.round(Number(view && view.width) || 0));
+  const vh = Math.max(1, Math.round(Number(view && view.height) || 0));
+  const vx = Math.round(Number(view && view.left) || 0);
+  const vy = Math.round(Number(view && view.top) || 0);
+  // 可用区先按边距收缩；太小就不缩，否则连最小尺寸都放不下。
+  const mx = Math.min(MARGIN, Math.max(0, Math.floor((vw - MIN_W) / 2)));
+  const my = Math.min(MARGIN, Math.max(0, Math.floor((vh - MIN_H) / 2)));
+  const aw = Math.max(1, vw - mx * 2);
+  const ah = Math.max(1, vh - my * 2);
+  const x0 = vx + mx;
+  const y0 = vy + my;
+  const minW = Math.min(MIN_W, aw);
+  const minH = Math.min(MIN_H, ah);
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  const has = !!(g && isNum(g.left) && isNum(g.top) && isNum(g.width) && isNum(g.height));
+  const w = has ? Math.round(g.width) : 0;
+  const h = has ? Math.round(g.height) : 0;
+  const badSize = !has || w < minW || h < minH || w > aw || h > ah;
+  if (!badSize) {
+    return {
+      left: Math.round(Math.min(x0 + aw - w, Math.max(x0, g.left))),
+      top: Math.round(Math.min(y0 + ah - h, Math.max(y0, g.top))),
+      width: w,
+      height: h,
+      fellBack: false,
+    };
+  }
+  const dw = Math.min(aw, Math.max(minW, Math.round(aw * RATIO)));
+  const dh = Math.min(ah, Math.max(minH, Math.round(ah * RATIO)));
+  return {
+    left: Math.round(x0 + (aw - dw) / 2),
+    top: Math.round(y0 + (ah - dh) / 2),
+    width: dw,
+    height: dh,
+    fellBack: true,
+  };
+}
+
+// readStoredGeom 读持久化几何：`{left,top,width,height}`；旧格式 `{x,y}`（相对默认位的偏移）标记成 legacy。
+function readStoredGeom() {
+  try {
+    const v = JSON.parse(readLS(ZPF_POS_KEY) || 'null');
+    if (v && ['left', 'top', 'width', 'height'].every((k) => typeof v[k] === 'number' && Number.isFinite(v[k]))) {
+      return { left: v.left, top: v.top, width: v.width, height: v.height };
+    }
+    if (v && typeof v.x === 'number' && Number.isFinite(v.x) && typeof v.y === 'number' && Number.isFinite(v.y)) {
+      return { legacy: { x: v.x, y: v.y } };
+    }
+  } catch { /* 坏值走默认几何 */ }
+  return null;
 }
 
 // pickTreeRoot 选目录树的根：优先用白名单根目录里**包含该文件**的那个（最长匹配），
@@ -2520,14 +2578,6 @@ function pickTreeRoot(filePath, roots) {
   }
   if (best) return best;
   return dirname(p) || '/';
-}
-
-function readStoredPos() {
-  try {
-    const v = JSON.parse(readLS(ZPF_POS_KEY) || 'null');
-    if (v && Number.isFinite(v.x) && Number.isFinite(v.y)) return { x: v.x, y: v.y };
-  } catch { /* 坏值就按默认位置 */ }
-  return { x: 0, y: 0 };
 }
 
 function cssEsc(s) {
@@ -2595,8 +2645,8 @@ function createEditorWindow(entry0, res0, opts = {}) {
   const treeLoading = new Set();
   let curDir = dirname(entry.path);
 
-  // ---- 位置记忆（还原态默认位置之上的偏移） ----
-  let pos = readStoredPos();
+  // ---- 窗口几何记忆（相对 .zpf-layer 的 left/top/width/height） ----
+  let geom = null;
 
   // ===================== DOM =====================
   const titleText = h('span.zpf-title');
@@ -2637,31 +2687,48 @@ function createEditorWindow(entry0, res0, opts = {}) {
   document.body.appendChild(layer);
 
   // ===================== 几何：窗口 / 最大化 / 最小化 =====================
+
+  // layerViewRect 返回窗口可用区：`.zpf-layer` 的实际矩形（layer 内坐标，layer 是 fixed inset:0）。
+  // 不用 window.innerWidth 猜 —— layer 才是窗口绝对定位的容器（坑 220）。
+  function layerViewRect() {
+    const r = layer.getBoundingClientRect();
+    if (r.width > 80 && r.height > 80) return { left: 0, top: 0, width: r.width, height: r.height };
+    return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  }
+
+  // persistGeom 把**夹过**的几何写回 localStorage（下次打开不再复发）。最大化/最小化不写。
+  function persistGeom() {
+    if (!geom || maximized || minimized) return;
+    writeLS(ZPF_POS_KEY, JSON.stringify(geom));
+  }
+
   function applyGeometry() {
-    if (disposed || minimized) return; // 胶囊的位置由 CSS 固定
-    ensureContentObserver(); // 路由切换会换掉 .content 元素，几何/观察都要贴着**当前**那个
-    const r = contentRect();
-    let left;
-    let top;
-    let width;
-    let height;
+    if (disposed || minimized) return; // 胶囊位置由 CSS 固定（zpf-win-min 带 !important）
+    ensureContentObserver(); // 路由切换会换掉 .content 元素，最大化几何要贴着**当前**那个
     if (maximized) {
-      // 「最大化」= 与 content 区域逐像素重合（不是浏览器全屏）。
-      left = r.left; top = r.top; width = r.width; height = r.height;
-    } else {
-      const inset = Math.min(ZPF_WIN_INSET, Math.max(4, Math.min(r.width, r.height) / 10));
-      width = Math.max(320, r.width - inset * 2);
-      height = Math.max(200, r.height - inset * 2);
-      width = Math.min(width, r.width);
-      height = Math.min(height, r.height);
-      // 拖动范围：至少留 160px 横向、标题栏纵向留在 content 内，别把窗口拖到看不见。
-      left = clamp(r.left + inset + pos.x, r.left - width + 160, r.right - 160);
-      top = clamp(r.top + inset + pos.y, r.top, r.bottom - 46);
+      // 「最大化」= 与 content 区域逐像素重合（不是浏览器全屏），语义不变。
+      const r = contentRect();
+      win.style.left = Math.round(r.left) + 'px';
+      win.style.top = Math.round(r.top) + 'px';
+      win.style.width = Math.round(r.width) + 'px';
+      win.style.height = Math.round(r.height) + 'px';
+      return;
     }
-    win.style.left = Math.round(left) + 'px';
-    win.style.top = Math.round(top) + 'px';
-    win.style.width = Math.round(width) + 'px';
-    win.style.height = Math.round(height) + 'px';
+    const view = layerViewRect();
+    const stored = geom || readStoredGeom();
+    // 旧格式 {x,y} 是相对默认位的偏移：贴到默认几何上再夹，一次迁移。
+    let g = stored;
+    if (stored && stored.legacy) {
+      const d = clampEditorGeom(null, view);
+      g = { left: d.left + stored.legacy.x, top: d.top + stored.legacy.y, width: d.width, height: d.height };
+    }
+    const next = clampEditorGeom(g, view);
+    geom = { left: next.left, top: next.top, width: next.width, height: next.height };
+    win.style.left = next.left + 'px';
+    win.style.top = next.top + 'px';
+    win.style.width = next.width + 'px';
+    win.style.height = next.height + 'px';
+    persistGeom();
   }
 
   function refreshCM() { requestAnimationFrame(() => { if (cm) { cm.setSize(null, '100%'); cm.refresh(); } }); }
@@ -3319,30 +3386,26 @@ function createEditorWindow(entry0, res0, opts = {}) {
     closeMenus();
     if (maximized) setMaximized(false); // 拖最大化窗口 = 先还原再拖（与系统窗口一致）
     e.preventDefault();
-    const rect = win.getBoundingClientRect();
     const sx = e.clientX;
     const sy = e.clientY;
-    const ol = rect.left;
-    const ot = rect.top;
+    const ol = win.offsetLeft; // offsetParent 就是 .zpf-layer
+    const ot = win.offsetTop;
+    const w = win.offsetWidth;
+    const h = win.offsetHeight;
     const move = (ev) => {
-      const r = contentRect();
-      const w = win.offsetWidth;
-      const h = win.offsetHeight;
-      let left = ol + (ev.clientX - sx);
-      let top = ot + (ev.clientY - sy);
-      // 关键约束：窗口**始终留在 content 区域内**（用户要求 f：任何状态下都充满内容区、
-      // 不留大片空白）。还原态只比 content 内缩 14px，所以可拖范围不大，但位置会被记住。
-      left = clamp(left, r.left, Math.max(r.left, r.right - w));
-      top = clamp(top, r.top, Math.max(r.top, r.bottom - h));
+      // 拖动只在可用区里平移（尺寸不变）；越界由这里挡住，落盘前还会再夹一次（坑 220）。
+      const view = layerViewRect();
+      const left = clamp(ol + (ev.clientX - sx), 0, Math.max(0, view.width - w));
+      const top = clamp(ot + (ev.clientY - sy), 0, Math.max(0, view.height - h));
       win.style.left = Math.round(left) + 'px';
       win.style.top = Math.round(top) + 'px';
-      pos = { x: Math.round(left - (r.left + ZPF_WIN_INSET)), y: Math.round(top - (r.top + ZPF_WIN_INSET)) };
+      geom = { left: Math.round(left), top: Math.round(top), width: w, height: h };
     };
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
       document.body.classList.remove('zpf-dragging');
-      writeLS(ZPF_POS_KEY, JSON.stringify(pos));
+      persistGeom();
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
