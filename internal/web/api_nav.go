@@ -8,17 +8,21 @@ package web
 // 导航页的数据量极小，做进面板可以直接复用：面板鉴权、面板风格、备份/恢复、
 // 日志与审计，升级时也只有一个二进制要换。
 //
-// 两个访问面：
+// 三个访问面：
 //   1. 面板内页面 `#/nav`（前端 nav.js）走下面这些 /api/v1/nav/* 接口，**全部 requireAuth**；
 //      所有写操作进审计。
 //   2. 独立别名页 `GET /nav/`（assets/nav/index.html）注册在**安全后缀之外**，
 //      未登录也能看（只读），数据来自同文件的 `GET /nav/data`（公开、只读、无敏感信息）。
 //      编辑必须登录面板：页面通过 `GET /nav/whoami` 问「我登录了吗」，
 //      未登录时不渲染任何编辑入口，登录后才给出回面板编辑的链接。
+//   3. 独立端口（坑 222，见 nav_listen.go）：纯 HTTP、只绑 127.0.0.1，`/` 就是导航页，
+//      供隧道工具映射到公网域名（面板主端口是 HTTPS + 安全后缀，隧道按 http 连不上）。
 //
 // 别名页要求登录吗：不要求 —— 它是用户的浏览器首页，必须能匿名打开。
 // 但它仍受全局 accessControl（IP 白名单）约束：外层 mux 就是被它包住的，
 // 所以「仅本机」模式下 /nav/ 也只能本机访问，与面板一致。
+// 独立端口**不套** accessControl：隧道可能带 X-Forwarded-For 公网 IP，
+// 套白名单会把隧道自己挡在门外；它的边界就是"只绑回环"。
 
 import (
 	"context"
@@ -992,6 +996,11 @@ func (s *Server) handleNavPage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "只支持 GET")
 		return
 	}
+	s.serveNavPath(w, r)
+}
+
+// serveNavPath 按 `/nav/<子路径>` 分发。面板端口与独立端口共用它。
+func (s *Server) serveNavPath(w http.ResponseWriter, r *http.Request) {
 	sub := strings.TrimPrefix(r.URL.Path, "/nav/")
 	switch sub {
 	case "", "index.html":
@@ -1010,6 +1019,71 @@ func (s *Server) handleNavPage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "页面不存在")
 		return
 	}
+}
+
+// ============================================================================
+//  独立端口（127.0.0.1:<nav_listen_port>，见 nav_listen.go）
+//
+//  隧道把域名根映射到 `/`，所以这里必须让 `/` 就是导航页（不能在根上 404）。
+//  `/nav/...` 同时保留：那是这份页面在面板端口上的地址，两条 URL 语义一致。
+//  只读、免登录、不套 accessControl（边界是"只绑回环"，理由见文件头）。
+// ============================================================================
+
+// navStandaloneAliases 把独立端口的根路径映射成与 `/nav/` 一致的形式。
+func navStandaloneAliases(p string) (string, bool) {
+	switch p {
+	case "/", "/index.html", "/nav":
+		return "/nav/", true
+	case "/nav.js":
+		return "/nav/nav.js", true
+	case "/data":
+		return "/nav/data", true
+	case "/whoami":
+		return "/nav/whoami", true
+	}
+	// `/nav/...` 是这份页面在面板端口上的原生地址，原样放行（两条 URL 语义一致）。
+	if strings.HasPrefix(p, "/nav/") {
+		return p, true
+	}
+	if strings.HasPrefix(p, "/icons/") {
+		return "/nav" + p, true // 图标存的是绝对路径 /nav/icons/<name>
+	}
+	return "", false
+}
+
+func (s *Server) navStandaloneHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			writeErr(w, http.StatusMethodNotAllowed, "只读页面，只支持 GET")
+			return
+		}
+		// `/nav` 是浏览器主页那一条 URL 的写法；在独立端口上它相对根多了一层，
+		// 页面里的 `./nav.js` 会解析错，所以直接跳到根。
+		if r.URL.Path == "/nav" {
+			http.Redirect(w, r, "/", http.StatusMovedPermanently)
+			return
+		}
+		target, matched := navStandaloneAliases(r.URL.Path)
+		if !matched {
+			writeErr(w, http.StatusNotFound, "页面不存在")
+			return
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = target
+		if strings.HasPrefix(target, navIconURLBase) {
+			s.handleNavIconFile(w, r2)
+			return
+		}
+		if target == "/nav/whoami" {
+			// 独立面是**公开只读**的：面板会话 cookie 与端口无关，浏览器会把
+			// 主面板的 cookie 带过来，于是"回面板编辑"的链接会指向这个端口上
+			// 并不存在的安全后缀（点了 404）。这里如实回答"未登录、无入口"。
+			ok(w, map[string]any{"authenticated": false, "panel_entry": ""})
+			return
+		}
+		s.serveNavPath(w, r2)
+	})
 }
 
 func (s *Server) serveNavAsset(w http.ResponseWriter, name, ctype string) {

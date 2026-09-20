@@ -2358,6 +2358,10 @@ func (s *Server) Shutdown() {
 	if s.forwarders != nil {
 		s.forwarders.StopAll()
 	}
+	// 导航页独立端口（坑 222）：面板退出后还占着端口，重启会撞"地址已被占用"。
+	if s.navListen != nil {
+		s.navListen.stop()
+	}
 }
 
 // Startup 在启动时做一次环境准备与自愈：注入 upgrade map 内容源（单一数据源）、

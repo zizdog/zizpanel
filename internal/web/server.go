@@ -97,6 +97,10 @@ type Server struct {
 	// （面板重启后"正在安装"本身就是假的，见 SPEC-任务中心.md）。
 	Tasks *tasks.Manager
 
+	// navListen 是「导航页独立端口」的监听管理器（坑 222，见 nav_listen.go）。
+	// 由 cmdServe 在启动时按配置 apply；设置页保存时热生效。
+	navListen *navListener
+
 	// forwarders 是「局域网出口」的回环 TCP 转发器管理器（见 api_proxies.go）。
 	//
 	// 为什么它属于面板而不是 nginx：macOS 15 的「本地网络」隐私门会拦 Homebrew
@@ -174,6 +178,9 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 	// TCC 指引里"要去系统设置里授权"的那个二进制路径按配置解析一次：
 	// 非默认安装根（BinDir 配在别处）也能给出正确路径。
 	setPanelBinaryForGuide(cfg.BinDir)
+	// 导航页独立端口的监听管理器。这里**不**自动起监听：单测构造 Server 时
+	// 不该绑真实端口；由 cmdServe 显式 ApplyNavListener（见 main.go）。
+	s.navListen = &navListener{s: s}
 	// 转发器的解析器走 web 包的可注入变量（proxyLookupHostFn），
 	// 这样单测能把域名解析钉成假数据，绝不碰真实网络。
 	s.forwarders = proxies.NewManager(proxies.ManagerOptions{

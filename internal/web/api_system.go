@@ -392,6 +392,15 @@ func (s *Server) settingsView(ctx context.Context) map[string]any {
 		// 装 MySQL 时"限时询问 root 口令"的秒数（0/缺省按 60）。
 		// 回传它是为了让运维能把它调成 1 秒＝全自动（无人值守安装）。
 		"mysql_input_timeout_seconds": s.Cfg.MySQLInputTimeoutSeconds,
+		// 导航页独立端口（坑 222）：配置值 + **生效状态**一起回传。
+		// 界面要能显示最终可用的本地地址（http://127.0.0.1:<port>/）填进隧道配置，
+		// 并在绑不上时看到后端原文（不谎报"已生效"）。
+		"nav_listen_enabled":     s.Cfg.NavListenEnabled,
+		"nav_listen_port":        s.Cfg.NavListenPort,
+		"nav_listen_running":     s.NavListenerState().Running,
+		"nav_listen_active_port": s.NavListenerState().Port,
+		"nav_listen_url":         s.NavListenerState().URL,
+		"nav_listen_error":       s.NavListenerState().Err,
 		// 上传与执行限制也回传（设置页的「上传与执行限制」Tab 首次渲染就用它，
 		// 不必再多打一个请求；生效值回读仍走 GET /settings/upload-limits）。
 		"nginx_client_max_body_size": s.Cfg.NginxClientMaxBodySize,
@@ -458,6 +467,11 @@ type settingsReq struct {
 	TerminalShell       *string `json:"terminal_shell"`
 	TerminalIdleMins    *int    `json:"terminal_idle_mins"`
 	TerminalMaxSessions *int    `json:"terminal_max_sessions"`
+
+	// 导航页独立端口（坑 222）：开关 + 端口。保存时**先真的绑上**再落库，
+	// 绑定失败就 400 贴后端原文 —— 绝不"存了却没生效"。
+	NavListenEnabled *bool `json:"nav_listen_enabled"`
+	NavListenPort    *int  `json:"nav_listen_port"`
 }
 
 // handleSaveSettings 保存可热更新的设置。
@@ -637,6 +651,29 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.MySQLInputTimeoutSeconds = sec
+	}
+
+	// 导航页独立端口（坑 222）：**先绑成功再落库**。绑定失败时原样返回后端错误
+	// 且不改配置 —— 否则会出现"设置页说改了、实际没生效"这种最糟的状态。
+	if req.NavListenEnabled != nil || req.NavListenPort != nil {
+		enabled := cfg.NavListenEnabled
+		port := cfg.NavListenPort
+		if req.NavListenEnabled != nil {
+			enabled = *req.NavListenEnabled
+		}
+		if req.NavListenPort != nil {
+			if err := ValidateNavListenPort(*req.NavListenPort); err != nil {
+				fail(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			port = *req.NavListenPort
+		}
+		if err := s.ApplyNavListener(enabled, port); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cfg.NavListenEnabled = enabled
+		cfg.NavListenPort = port
 	}
 
 	if err := cfg.Save(); err != nil {

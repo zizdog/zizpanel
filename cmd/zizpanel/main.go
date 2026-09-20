@@ -353,6 +353,15 @@ func cmdServe(args []string) error {
 	// 只调用一次：Startup 内部会跑 nginx -t 并可能重载，重复调用纯属白做一遍。
 	srv.Startup(context.Background())
 
+	// 导航页独立端口（坑 222）：纯 HTTP、只绑 127.0.0.1，供隧道映射到公网域名。
+	// 端口被占用时**不阻断面板启动**：如实在日志与「面板设置」里报错，
+	// 由用户换端口（绝不静默失败、也绝不自作主张换端口）。
+	if err := srv.ApplyNavListener(cfg.NavListenEnabled, cfg.NavListenPort); err != nil {
+		log.Warn("导航页独立端口未生效：%v", err)
+	} else if st := srv.NavListenerState(); st.Running {
+		log.Info("导航页独立入口: %s（隧道可指向 127.0.0.1:%d）", st.URL, st.Port)
+	}
+
 	// 一次性"请求系统授权访问外接卷"（macOS 隐私保护）。
 	//
 	// 🚨 铁律（用户 2026-09-19）：**非真机 / 无人在场时绝不触发任何系统授权弹窗**。

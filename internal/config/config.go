@@ -104,8 +104,20 @@ type Config struct {
 	// ---------- 监听 ----------
 	Listen    string `json:"listen"`     // 面板监听地址，如 :8443
 	TLSEnable bool   `json:"tls_enable"` // 是否启用 HTTPS（自签或自有证书）
-	TLSCert   string `json:"tls_cert"`
-	TLSKey    string `json:"tls_key"`
+
+	// ---------- 导航页独立端口（隧道/外网入口，坑 222）----------
+	//
+	// 导航页原先是面板端口上的一条**公开路径**（GET /nav/，安全后缀之外），
+	// 但它是 HTTPS + 带安全后缀的主端口：隧道工具按 http 连不上、按 https 又要
+	// 处理自签证书。所以给它一个**只绑 127.0.0.1 的纯 HTTP 独立监听**，
+	// 隧道（如 Orbien `service = "127.0.0.1:<port>"`）直接指过来即可。
+	//
+	// NavListenEnabled 默认 true（新建配置）；它在 Default() 里给值而**不进 fill()**，
+	// 这样老配置也继承默认、而用户显式关掉（写进 false）后不会再被填回来。
+	NavListenEnabled bool   `json:"nav_listen_enabled"`
+	NavListenPort    int    `json:"nav_listen_port"`
+	TLSCert          string `json:"tls_cert"`
+	TLSKey           string `json:"tls_key"`
 	// AccessMode: any=任意来源, local=仅本机, whitelist=仅白名单
 	AccessMode  string   `json:"access_mode"`
 	IPWhitelist []string `json:"ip_whitelist"`
@@ -221,6 +233,9 @@ func root() string {
 // 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 
+// DefaultNavListenPort 是「导航页独立端口」的默认值（只绑 127.0.0.1，纯 HTTP）。
+const DefaultNavListenPort = 8896
+
 // DefaultUpgradeSource 是在线升级的**公网主源**（用户要求"以后探测以公网 zizdog.com 为主"）。
 //
 // 它与 internal/upgrade.CandidateSources 里的默认候选是同一个值
@@ -288,6 +303,11 @@ func Default() *Config {
 		Listen:     ":8443",
 		TLSEnable:  true,
 		AccessMode: "any",
+		// 导航页独立端口：默认开、只绑 127.0.0.1 的纯 HTTP（8896 与面板/各
+		// 内置界面端口不冲突）。端口被占用时**不阻断启动**，如实报错并由
+		// 「面板设置」显示生效状态（见 internal/web/nav_listen.go）。
+		NavListenEnabled: true,
+		NavListenPort:    DefaultNavListenPort,
 		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
 		AppProxy: true,
 		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）

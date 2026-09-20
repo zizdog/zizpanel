@@ -883,6 +883,39 @@ export function SettingsView(content, ctx = {}) {
     mirrorInput.addEventListener('input', syncOfflineWarn);
     syncOfflineWarn();
 
+    // 导航页独立端口（坑 222）：纯 HTTP + 只绑 127.0.0.1，供隧道映射到公网域名。
+    // 面板主端口是 HTTPS 自签 + 安全后缀 —— 隧道按 http 连不上，所以这个端口才是入口。
+    const navPortOn = h('input', {
+      type: 'checkbox', checked: s.nav_listen_enabled !== false,
+      dataset: { testid: 'zp-nav-port-enabled' },
+    });
+    const navPortInput = h('input.input', {
+      type: 'number', value: s.nav_listen_port || 8896, min: 1024, max: 65535,
+      dataset: { testid: 'zp-nav-port-input' }, style: { flex: '0 0 130px' },
+    });
+    // 生效地址来自**后端回读**（nav_listen_url），不是拿输入框的值拼的：
+    // "保存成功"不等于"真的在听"（坑 164）。
+    const navPortNow = h('div.hint', { dataset: { testid: 'zp-nav-port-url' } });
+    const navPortSvc = h('div.hint', { dataset: { testid: 'zp-nav-port-service' } });
+    function renderNavPortNow(v) {
+      const url = v && v.nav_listen_url;
+      const port = (v && v.nav_listen_active_port) || (v && v.nav_listen_port) || '';
+      if (v && v.nav_listen_running && url) {
+        navPortNow.style.color = '';
+        navPortNow.textContent = '生效中，本地地址：' + url;
+        navPortSvc.textContent = port ? ('隧道里填：service = "127.0.0.1:' + port + '"') : '';
+      } else if (v && v.nav_listen_enabled === false) {
+        navPortNow.style.color = '';
+        navPortNow.textContent = '已关闭（端口不再监听）';
+        navPortSvc.textContent = '';
+      } else {
+        navPortNow.style.color = '#d97706';
+        navPortNow.textContent = '未生效：' + ((v && v.nav_listen_error) || '后端未报告正在监听');
+        navPortSvc.textContent = '';
+      }
+    }
+    renderNavPortNow(s);
+
     const save = h('button.btn.btn-primary', {
       text: '保存设置',
       onclick: async () => {
@@ -901,8 +934,12 @@ export function SettingsView(content, ctx = {}) {
             mirror_probe_seconds: Number(mirrorProbe.value) || 4,
             mirror_dir: mirrorDir.value.trim(),
             offline_only: offlineOnly.checked,
+            nav_listen_enabled: navPortOn.checked,
+            nav_listen_port: Number(navPortInput.value),
           };
           const saved = await api.saveSettings(patch);
+          // 导航页独立端口：用**后端回读的生效状态**刷新显示（不是拿输入框的值拼）。
+          renderNavPortNow(saved);
           const entry = (saved && saved.panel_entry) || patch.panel_suffix;
           state.session.config = Object.assign({}, state.session.config, {
             access_mode: patch.access_mode,
@@ -923,7 +960,12 @@ export function SettingsView(content, ctx = {}) {
           } else {
             toast('设置已保存并立即生效', 'ok');
           }
-        } catch (e) { toast(e.message, 'err', 7000); }
+        } catch (e) {
+          toast(e.message, 'err', 7000);
+          navPortNow.style.color = '#d97706';
+          navPortNow.textContent = '保存未成功：' + e.message;
+          navPortSvc.textContent = '';
+        }
         finally { save.disabled = false; }
       },
     });
@@ -1006,6 +1048,20 @@ export function SettingsView(content, ctx = {}) {
             h('div.hint', { style: { alignSelf: 'center' }, text: '镜像不可达时不让安装白等；同城/国内镜像正常在 100ms 内应答。' }),
           ]),
           save,
+        ]),
+      ]),
+      h('div.card', [
+        h('div.card-head', [h('h3', { text: '导航页独立端口' }), h('div.spacer'), h('span.sub', { text: '隧道 / 外网入口' })]),
+        h('div.card-body', [
+          h('div.row', [
+            h('label', [h('span', { text: '在 127.0.0.1 上独立提供导航页（纯 HTTP，免登录只读）' })]),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [navPortOn, navPortInput]),
+          ]),
+          navPortNow,
+          navPortSvc,
+          h('div.hint', {
+            text: '隧道把域名指到上面的本机地址即可（面板主端口是 HTTPS 自签 + 安全后缀，隧道按 http 连不上）。',
+          }),
         ]),
       ]),
       h('div.card', [
