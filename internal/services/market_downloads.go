@@ -1721,6 +1721,37 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
+		ID: "piwigo", Kind: KindNative,
+		Runtime: MarketRuntime{Mode: MarketRuntimeSite, LabelSource: "目录 SiteApp 非空（一键建站，产出是网站不是服务）"},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchSiteSource,
+				Label:   "下载 Piwigo 16.4.0 官方发行包",
+				Upstream: MarketUpstream{
+					ID:   "piwigo.org/piwigo@16.4.0/piwigo-16.4.0.zip",
+					URL:  "https://piwigo.org/download/dlcounter.php?code=16.4.0",
+					Size: 19943808,
+					Note: "官方 dlcounter 的固定版本入口（?code=latest 是滚动地址，无法登记 sha256）；" +
+						"2026-09-20 本机完整下载后实算：19,943,808 B / sha256 72c58a33…5431c17（shasum 与 openssl 两次一致）",
+				},
+				NAS: nasMissing("镜像站上没有 Piwigo 发行包（sites/piwigo/16.4.0/piwigo-16.4.0.zip 实测 404）。" +
+					"它是**缺口**：本机实测官方源只有约 16 KB/s，整包 19,943,808 B 约需 21 分钟 —— " +
+					"超过站点包单次 15 分钟超时，直连官方源很可能装不上；" +
+					"建议把该包同步到 sites/piwigo/16.4.0/ 并把候选顺序改成 镜像 → 官方"),
+				Timeout:  15 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					SHA256: "72c58a337a1a0639b6ad8dc8f5900a2781fc19091b60ae157eb2ee58c5431c17",
+					Source: "2026-09-20 本机完整下载官方发行包实算（19,943,808 B；shasum 与 openssl 两次一致）；" +
+						"安装器（services/site_sources.go）按这个值强制校验",
+				},
+				ARM64: "PHP 站点源码（zip），与架构无关",
+				Note:  "官方 zip 内有一层顶层目录 piwigo/ → 必须剥；官网要求 PHP 8.2+ / MySQL 5.6+（MariaDB 10.1+）",
+			},
+		},
+	},
+
+	{
 		ID: "homepage", Kind: KindCompose, ComposeImage: "ghcr.io/gethomepage/homepage:v2.3.0",
 		Runtime: MarketRuntime{Mode: MarketRuntimeContainer, LabelSource: "目录 Kind=KindCompose"},
 		Downloads: []MarketDownloadPoint{
@@ -2188,6 +2219,24 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 					add("%s: 上游校验清单与注册表不一致。声明 %q，注册表是 %q",
 						where, d.Checksum.UpstreamFile, releaseRef.ChecksumAsset)
 				}
+			}
+		}
+		// 8) 站点源码：声明地址必须是目录 SiteApp 的官方/备用地址之一。
+		//    docs/新增应用工作流.md 早把这条写成不变量，但此前没有代码守它：
+		//    两边各写一份 URL，改地址只改一处就是"审计全绿、装的却是别的包"。
+		if d.Purpose == MarketFetchSiteSource && app.SiteApp != nil && strings.TrimSpace(d.Upstream.URL) != "" {
+			matched := d.Upstream.URL == app.SiteApp.DownloadURL
+			for _, u := range app.SiteApp.MirrorURLs {
+				if d.Upstream.URL == u {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				add("%s: 站点源码 URL %q 不在目录 SiteApp 的 DownloadURL/MirrorURLs 里"+
+					"（DownloadURL=%q MirrorURLs=%v）—— 两边必须一致，"+
+					"否则会「审计全绿、装的却是别的包」",
+					where, d.Upstream.URL, app.SiteApp.DownloadURL, app.SiteApp.MirrorURLs)
 			}
 		}
 	}

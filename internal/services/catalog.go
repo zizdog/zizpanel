@@ -1800,6 +1800,32 @@ func Catalog() []App {
 			},
 			DocsURL: "https://docs.kodcloud.com/setup/environment/",
 		},
+		{
+			ID: "piwigo", Name: "Piwigo", Icon: "🖼️",
+			Summary:     "开源相册，一键建好站点与数据库",
+			Description: "Piwigo 相册（PHP + MySQL）：面板建站、建库并解压官方发行包；装完打开安装向导收尾。",
+			Category:    "site", Kind: KindNative, Port: 0,
+			SiteApp: &SiteAppSpec{
+				// 官方 dlcounter 的**固定版本**入口（`?code=latest` 是滚动地址，无法登记 sha256）；
+				// 2026-09-20 本机完整下载 19,943,808 B 后实算 sha256（见 services/site_sources.go）。
+				DownloadURL: "https://piwigo.org/download/dlcounter.php?code=16.4.0",
+				Archive:     "zip",
+				// 官方 zip 内有一层顶层目录 piwigo/，必须剥掉。
+				StripTopDir: true,
+				Rewrite:     "piwigo", FinishPath: "/install.php", NeedsDB: true,
+				// 官网系统要求 PHP 8.2+（7.4 能跑但已停止维护）——低于 8.2 面板直接拒绝。
+				MinPHP: "8.2",
+				// 依据上游代码而非文档猜测：install.php 硬要求 mysqli；官方图形库要 gd（或 imagick，
+				// 本机 PHP 无 imagick）；其余是核心运行时用到的扩展。
+				PHPExts: []string{"mysqli", "gd", "mbstring", "session", "json", "xml", "curl", "openssl", "zip"},
+				Notes: []string{
+					"安装向导在 /install.php：数据库地址填 localhost，库名/用户名/密码照安装结果填",
+					"面板预写了 local/config/database.inc.php；但向导只认表单输入，仍要手填一次",
+					"管理员账号由你在向导里设置（面板不预设）",
+				},
+			},
+			DocsURL: "https://piwigo.org",
+		},
 		// 要显示容器状态需要额外挂 Docker socket —— 面板刻意没有默认挂上
 		// （那等于把 Docker 控制权交给它），需要的话自己往 compose 里加。
 		{
