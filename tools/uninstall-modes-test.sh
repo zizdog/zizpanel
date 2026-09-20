@@ -134,10 +134,14 @@ setup_fixture() {
   printf 'sentinel\n' > "$HOME_DIR/www/SENTINEL"
 
   printf 'data\n' > "$PREFIX/var/mysql/ibdata1"
+  # 切换引擎时特意留下的旧数据副本（等同备份）：模式 3 默认必须保留
+  mkdir -p "$PREFIX/var/mysql.mysql84-old"
+  printf 'old-engine\n' > "$PREFIX/var/mysql.mysql84-old/ibdata1"
   printf '{"x":1}\n' > "$ROOT/data/config.json"
   printf 'cert\n' > "$ROOT/data/zizpanel-codesign.crt"
   printf 'bin\n' > "$ROOT/bin/zizpanel"
   printf 'bin\n' > "$ROOT/bin/zizpanel-helper"
+  printf 'old-bin\n' > "$ROOT/bin/zizpanel.bak"
   printf 'old\n' > "$ROOT/work/backup/panel-2026.tar.gz"
   printf 'cfg\n' > "$PREFIX/etc/nginx/nginx.conf"
   printf 'cfg\n' > "$PREFIX/etc/my.cnf"
@@ -246,6 +250,9 @@ out_has "$SANDBOX/out-dry3.log" "File Browser" && pass "模式 3 从登记表列
 out_has "$SANDBOX/out-dry3.log" ".colima" && pass "模式 3 列出 Colima 数据" || fail "模式 3 未列出 Colima 数据"
 out_has "$SANDBOX/out-dry3.log" "$PREFIX/var/mysql" && pass "模式 3 列出数据库数据目录" || fail "模式 3 未列出数据库数据目录"
 out_has "$SANDBOX/out-dry3.log" "未确认由面板安装" && pass "模式 3 明确保留用户自己纳管的服务" || fail "模式 3 未标注保留项"
+out_has "$SANDBOX/out-dry3.log" "备份/副本（默认保留；--purge-backups 才删）" && pass "计划分「活动数据 vs 备份/副本」两栏" || fail "计划缺备份/副本分栏"
+out_has "$SANDBOX/out-dry3.log" "旧引擎数据副本" && pass "旧引擎数据副本被归为备份/副本" || fail "旧引擎数据副本未归类"
+out_has "$SANDBOX/out-dry3.log" "要求手工输入 DELETE-ALL 确认" && pass "dry-run 打印真跑的 DELETE-ALL 要求" || fail "dry-run 未提示 DELETE-ALL"
 grep -qx -F "  - $ROOT" "$SANDBOX/out-dry3.log" && pass "模式 3 计划整体删面板数据目录" || fail "模式 3 未计划删面板数据"
 [ -f "$HOME_DIR/www/SENTINEL" ] && pass "用户站点目录 www 未被触碰" || fail "用户站点目录 www 被删"
 
@@ -315,7 +322,8 @@ step "沙箱真跑模式 3（--yes）"
 setup_fixture
 if run_u --mode 3 --yes > "$SANDBOX/out-mode3.log" 2>&1; then pass "退出码 0"; else fail "模式 3 真跑失败"; tail -20 "$SANDBOX/out-mode3.log" | sed 's/^/      /'; fi
 [ ! -d "$ROOT" ] && pass "面板数据目录已整体删除" || fail "面板数据目录仍在"
-[ ! -e "$PREFIX/var/mysql" ] && pass "数据库数据目录已删除" || fail "数据库数据目录仍在"
+[ ! -e "$PREFIX/var/mysql" ] && pass "活动数据库数据目录已删除" || fail "活动数据库数据目录仍在"
+[ -f "$PREFIX/var/mysql.mysql84-old/ibdata1" ] && pass "旧引擎数据副本默认保留" || fail "旧引擎数据副本被删"
 [ ! -e "$HOME_DIR/filebrowser" ] && pass "面板应用数据已删除（File Browser）" || fail "File Browser 数据仍在"
 [ ! -e "$HOME_DIR/tts/qwen3" ] && pass "面板应用数据已删除（Qwen3 TTS）" || fail "Qwen3 数据仍在"
 [ ! -e "$HOME_DIR/.colima" ] && pass "Colima 数据已删除" || fail "Colima 数据仍在"
@@ -329,15 +337,38 @@ out_has "$SANDBOX/out-mode3.log" "File Browser（登记表 filebrowser）" && pa
 calls_has "docker compose -f $SANDBOX/compose/uptime-kuma/docker-compose.yml down" && pass "compose 项目已停止" || fail "compose 未停止"
 calls_has "colima delete -f" && pass "Colima 虚拟机已删除" || fail "Colima 未删除"
 bd="$(backup_dir)"
-if [ -n "$bd" ] && [ -d "$bd/panel-backups" ]; then
+if [ -n "$bd" ] && [ -d "$bd/panel-preserved/work/backup" ]; then
   pass "面板旧备份已转移到备份目录（默认不删）"
 else
   fail "面板旧备份未被保留"
 fi
+if [ -n "$bd" ] && [ -f "$bd/panel-preserved/bin/zizpanel.bak" ]; then
+  pass "面板根里的 *.bak 副本已保留（不随根目录删）"
+else
+  fail "面板根里的 *.bak 副本未保留"
+fi
+out_has "$SANDBOX/out-mode3.log" "备份/副本保留：" && pass "结尾汇总列出保留的备份/副本" || fail "结尾汇总缺保留的备份/副本"
 out_has "$SANDBOX/out-mode3.log" "已卸载" && out_has "$SANDBOX/out-mode3.log" "已删除" \
   && out_has "$SANDBOX/out-mode3.log" "已保留" && out_has "$SANDBOX/out-mode3.log" "失败" \
   && pass "结尾有 已卸载/已删除/已保留/失败 四段汇总" || fail "结尾汇总不完整"
 out_has "$SANDBOX/out-mode3.log" "我的 Redis" && pass "保留清单点名用户自己的服务" || fail "保留清单未点名用户服务"
+
+# ------------------------------------------- --purge-backups：备份/副本才删 --
+step "--purge-backups 才删备份/副本"
+setup_fixture
+if run_u --mode 3 --yes --purge-backups > "$SANDBOX/out-purgebackups.log" 2>&1; then
+  pass "退出码 0"
+else
+  fail "--purge-backups 模式 3 失败"
+fi
+[ ! -e "$PREFIX/var/mysql.mysql84-old" ] && pass "--purge-backups 删掉旧引擎数据副本" || fail "旧引擎数据副本未被删"
+[ ! -e "$ROOT/bin/zizpanel.bak" ] && pass "--purge-backups 连面板根里的 *.bak 一起删" || fail "*.bak 未被删"
+bd="$(backup_dir)"
+if [ -z "$bd" ] || [ ! -d "$bd/panel-preserved" ]; then
+  pass "--purge-backups 不再搬出备份（panel-preserved 不存在）"
+else
+  fail "--purge-backups 仍搬出了备份"
+fi
 
 # ------------------------------------------------------ --purge 兼容 --
 step "--purge 向后兼容（== --mode 3 --yes）"

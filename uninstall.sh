@@ -146,8 +146,10 @@ if [ -z "$REAL_HOME" ]; then
 fi
 
 # ------------------------------------------------------------- 计划（清单） --
-PLAN_STOP=(); PLAN_UNINSTALL=(); PLAN_DELETE=(); PLAN_KEEP=()
-PLAN_STOP_KEYS=""; PLAN_UNINSTALL_KEYS=""; PLAN_DELETE_KEYS=""; PLAN_KEEP_KEYS=""
+PLAN_STOP=(); PLAN_UNINSTALL=(); PLAN_DELETE=(); PLAN_BACKUP=(); PLAN_KEEP=()
+PLAN_STOP_KEYS=""; PLAN_UNINSTALL_KEYS=""; PLAN_DELETE_KEYS=""; PLAN_BACKUP_KEYS=""; PLAN_KEEP_KEYS=""
+# 面板根内被判定为"备份/副本"的条目：默认要**搬出去保留**，不能跟着根目录一起删
+PANEL_ROOT_BACKUP_ITEMS=()
 plan_stop() {
   [ -n "$1" ] || return 0
   case "$PLAN_STOP_KEYS" in *$'\x1f'"$1"$'\x1f'*) return 0 ;; esac
@@ -162,6 +164,11 @@ plan_delete() {
   [ -n "$1" ] || return 0
   case "$PLAN_DELETE_KEYS" in *$'\x1f'"$1"$'\x1f'*) return 0 ;; esac
   PLAN_DELETE_KEYS="${PLAN_DELETE_KEYS}"$'\x1f'"$1"$'\x1f'; PLAN_DELETE+=("$1")
+}
+plan_backup() { # 备份/副本：默认保留，只有 --purge-backups 才删
+  [ -n "$1" ] || return 0
+  case "$PLAN_BACKUP_KEYS" in *$'\x1f'"$1"$'\x1f'*) return 0 ;; esac
+  PLAN_BACKUP_KEYS="${PLAN_BACKUP_KEYS}"$'\x1f'"$1"$'\x1f'; PLAN_BACKUP+=("$1")
 }
 plan_keep() {
   [ -n "$1" ] || return 0
@@ -180,8 +187,14 @@ emit_plan() { # emit_plan：把"将要删的清单"打到 stdout（dry-run 预�
   for x in ${PLAN_STOP[@]+"${PLAN_STOP[@]}"}; do printf '  - %s\n' "$x"; done
   printf '\n## 将卸载的软件\n'
   for x in ${PLAN_UNINSTALL[@]+"${PLAN_UNINSTALL[@]}"}; do printf '  - %s\n' "$x"; done
-  printf '\n## 将删除的路径\n'
+  printf '\n## 将删除的路径（活动数据）\n'
   for x in ${PLAN_DELETE[@]+"${PLAN_DELETE[@]}"}; do printf '  - %s\n' "$x"; done
+  if [ "$PURGE_BACKUPS" = "1" ]; then
+    printf '\n## 备份/副本（--purge-backups：本次会删）\n'
+  else
+    printf '\n## 备份/副本（默认保留；--purge-backups 才删）\n'
+  fi
+  for x in ${PLAN_BACKUP[@]+"${PLAN_BACKUP[@]}"}; do printf '  - %s\n' "$x"; done
   printf '\n## 将保留\n'
   for x in ${PLAN_KEEP[@]+"${PLAN_KEEP[@]}"}; do printf '  - %s\n' "$x"; done
 }
@@ -482,11 +495,40 @@ plan_lnmp() {
 }
 
 database_data_paths() { # 仅模式 3：数据库数据目录
+  # var/mysql 是**当前活动**数据目录（模式 3 删）；
+  # var/mysql.* 是切换 MySQL/MariaDB 时特意留下的**旧引擎数据副本**（等同备份）——
+  # 与面板备份同类：默认保留，只有 --purge-backups 才删。
   local p f
   for p in "${BREW_PREFIXES[@]}"; do
     for f in "$p/var/mysql" "$p"/var/mysql.*; do
-      [ -e "$f" ] && plan_delete "$f"
+      [ -e "$f" ] || continue
+      case "$f" in
+        "$p/var/mysql") plan_delete "$f" ;;
+        *) plan_backup "${f}（旧引擎数据副本）" ;;
+      esac
     done
+  done
+}
+
+collect_panel_root_backups() { # 面板根里的备份/副本：默认搬出去保留，不随根目录删
+  PANEL_ROOT_BACKUP_ITEMS=()
+  [ -d "$PANEL_ROOT" ] || return 0
+  local f
+  for f in "$PANEL_ROOT/work/backup" \
+           "$PANEL_ROOT"/*.bak "$PANEL_ROOT"/*.bak-* \
+           "$PANEL_ROOT"/bin/*.bak "$PANEL_ROOT"/bin/*.bak-* \
+           "$PANEL_ROOT"/data/*.bak "$PANEL_ROOT"/data/*.bak-*; do
+    [ -e "$f" ] || continue
+    PANEL_ROOT_BACKUP_ITEMS+=("$f")
+    plan_backup "${f}（面板备份/副本）"
+  done
+}
+
+plan_old_uninstall_backups() { # 以前的卸载备份：默认保留，--purge-backups 才删
+  local d
+  for d in "$REAL_HOME"/zizpanel-uninstall-backup-*; do
+    [ -d "$d" ] || continue
+    plan_backup "${d}（旧卸载备份）"
   done
 }
 
@@ -555,6 +597,8 @@ build_plan_mode3() {
   done
   colima_data_paths
   database_data_paths
+  collect_panel_root_backups
+  plan_old_uninstall_backups
   plan_delete "$PANEL_ROOT"
   PANEL_ROOT_SPECIAL=1
   plan_keep "站点文件：${REAL_HOME}/www（绝不删）"
@@ -562,8 +606,9 @@ build_plan_mode3() {
 }
 
 build_plan() {
-  PLAN_STOP=(); PLAN_UNINSTALL=(); PLAN_DELETE=(); PLAN_KEEP=()
-  PLAN_STOP_KEYS=""; PLAN_UNINSTALL_KEYS=""; PLAN_DELETE_KEYS=""; PLAN_KEEP_KEYS=""
+  PLAN_STOP=(); PLAN_UNINSTALL=(); PLAN_DELETE=(); PLAN_BACKUP=(); PLAN_KEEP=()
+  PLAN_STOP_KEYS=""; PLAN_UNINSTALL_KEYS=""; PLAN_DELETE_KEYS=""; PLAN_BACKUP_KEYS=""; PLAN_KEEP_KEYS=""
+  PANEL_ROOT_BACKUP_ITEMS=()
   PANEL_ROOT_SPECIAL=0
   case "$MODE" in
     1) build_plan_mode1 ;;
@@ -752,32 +797,45 @@ delete_paths_from_plan() {
 
 remove_panel_root() {
   [ "$PANEL_ROOT_SPECIAL" = "1" ] || return 0
-  local bdir="$PANEL_ROOT/work/backup"
-  if [ -d "$bdir" ] && [ "$PURGE_BACKUPS" != "1" ]; then
-    begin "正在保留面板备份（不删）：${bdir}"
-    if [ "$DRY" = "1" ]; then
-      printf '    %s[dry-run]%s 将把 %s 移到 %s/panel-backups\n' "$C_YELLOW" "$C_RESET" "$bdir" "$BACKUP_DIR"
-    else
-      mkdir -p "$BACKUP_DIR" 2>/dev/null
-      if mv "$bdir" "$BACKUP_DIR/panel-backups" 2>/dev/null; then
-        ok "面板备份已转移到 ${BACKUP_DIR}/panel-backups（加 --purge-backups 才删）"
+  # 备份/副本（work/backup、*.bak 等）默认保留：先搬到备份目录再删根；
+  # --purge-backups 才让它们随根目录一起删。搬不动就**不删根**，绝不闷声丢备份。
+  if [ "$PURGE_BACKUPS" != "1" ]; then
+    local item rel dest
+    for item in ${PANEL_ROOT_BACKUP_ITEMS[@]+"${PANEL_ROOT_BACKUP_ITEMS[@]}"}; do
+      [ -e "$item" ] || continue
+      rel="${item#"$PANEL_ROOT"/}"
+      dest="$BACKUP_DIR/panel-preserved/$rel"
+      begin "正在保留备份/副本（不删）：${item}"
+      if [ "$DRY" = "1" ]; then
+        printf '    %s[dry-run]%s 将把 %s 移到 %s\n' "$C_YELLOW" "$C_RESET" "$item" "$dest"
+        continue
+      fi
+      mkdir -p "$(dirname "$dest")" 2>/dev/null
+      if mv "$item" "$dest" 2>/dev/null; then
+        ok "已保留备份/副本：${dest}"
       else
-        bad "面板备份转移失败 —— 为避免丢备份，${PANEL_ROOT} 不再整体删除"
-        record_failed "面板备份转移失败 ${bdir}"
+        bad "备份/副本转移失败：${item} —— 为避免丢备份，${PANEL_ROOT} 不再整体删除"
+        record_failed "备份/副本转移失败 ${item}"
         return 0
       fi
-    fi
+    done
   fi
   remove_path "$PANEL_ROOT" "面板数据（配置/数据库/证书/日志/工作目录）"
 }
 
-purge_old_backups() {
-  [ "$PURGE_BACKUPS" = "1" ] || return 0
-  local d
-  for d in "$REAL_HOME"/zizpanel-uninstall-backup-*; do
-    [ -d "$d" ] || continue
-    [ "$d" = "$BACKUP_DIR" ] && continue
-    remove_path "$d" "旧卸载备份"
+delete_backups_from_plan() { # 面板根内的备份已由 remove_panel_root 搬走；这里处理根外的
+  [ "$PANEL_ROOT_SPECIAL" = "1" ] || return 0
+  local b path
+  for b in ${PLAN_BACKUP[@]+"${PLAN_BACKUP[@]}"}; do
+    path="${b%%（*}"   # 清单条目带中文注释后缀，取路径部分
+    case "$path" in
+      "$PANEL_ROOT"|"$PANEL_ROOT"/*) continue ;;
+    esac
+    if [ "$PURGE_BACKUPS" = "1" ]; then
+      remove_path "$path" "备份/副本（--purge-backups）"
+    else
+      skip "保留备份/副本 ${path}（--purge-backups 才删）"
+    fi
   done
 }
 
@@ -814,7 +872,7 @@ execute_plan() {
   delete_paths_from_plan
   if [ "$MODE" = "3" ]; then
     remove_panel_root
-    purge_old_backups
+    delete_backups_from_plan
   fi
   if [ "$MODE" = "2" ]; then
     mode2_data_notice
@@ -865,6 +923,11 @@ summary() {
   say "  ${C_BOLD}已保留${C_RESET}"
   local any_kept=0 x
   for x in ${PLAN_KEEP[@]+"${PLAN_KEEP[@]}"}; do printf '    · %s\n' "$x"; any_kept=1; done
+  if [ "$MODE" = "3" ] && [ "$PURGE_BACKUPS" != "1" ]; then
+    for x in ${PLAN_BACKUP[@]+"${PLAN_BACKUP[@]}"}; do
+      printf '    · 备份/副本保留：%s\n' "$x"; any_kept=1
+    done
+  fi
   [ "$any_kept" = "1" ] || say "    （无）"
   say "  ${C_BOLD}失败${C_RESET}"
   if [ "$FAILED_COUNT" != "0" ]; then
@@ -1040,6 +1103,10 @@ main() {
   if [ "$DRY" = "1" ]; then
     title "dry-run 清单（以下是将要删除/卸载的全部内容）"
     emit_plan
+    if [ "$MODE" = "3" ]; then
+      say ""
+      say "  真跑时本次会要求手工输入 DELETE-ALL 确认（非交互需 --yes）"
+    fi
   fi
 
   if [ "$MODE" != "1" ]; then
