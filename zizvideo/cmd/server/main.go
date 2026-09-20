@@ -1,4 +1,4 @@
-// Command govideo serves a local short-video library over HTTP.
+// Command zizvideo serves a local short-video library over HTTP.
 package main
 
 import (
@@ -13,19 +13,28 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zizdog/govideo/internal/api"
-	"github.com/zizdog/govideo/internal/auth"
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/ffmpeg"
-	"github.com/zizdog/govideo/internal/media"
-	"github.com/zizdog/govideo/internal/storage"
-	"github.com/zizdog/govideo/internal/task"
-	"github.com/zizdog/govideo/internal/web"
+	"github.com/zizdog/zizvideo/internal/api"
+	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/ffmpeg"
+	"github.com/zizdog/zizvideo/internal/media"
+	"github.com/zizdog/zizvideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/task"
+	"github.com/zizdog/zizvideo/internal/web"
 )
 
 func main() {
+	args := os.Args[1:]
+	// The verb may follow --config, so index it explicitly.
+	if i := indexVerb(args, "roots"); i >= 0 {
+		if err := runRoots(append(append([]string{}, args[:i]...), args[i+1:]...)); err != nil {
+			fmt.Fprintln(os.Stderr, "zizvideo:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "govideo:", err)
+		fmt.Fprintln(os.Stderr, "zizvideo:", err)
 		os.Exit(1)
 	}
 }
@@ -33,9 +42,10 @@ func main() {
 func run() error {
 	configPath := flag.String("config", "", "配置文件路径 (JSON)")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
+	flag.Usage = printUsage
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("govideo", api.Version)
+		fmt.Println("zizvideo", api.Version)
 		return nil
 	}
 
@@ -69,12 +79,13 @@ func run() error {
 	authMgr := auth.NewManager(db, secret, cfg.SessionTTL(), cfg.LockoutThreshold, cfg.LockoutWindow())
 
 	runner := ffmpeg.ExecRunner{}
-	scanner := media.NewScanner(cfg, db, runner, logger)
-	tasks := task.NewManager(cfg, db, scanner, logger)
+	roots := config.NewRoots(used, cfg.MediaAllowRoots)
+	scanner := media.NewScanner(cfg, db, roots, runner, logger)
+	tasks := task.NewManager(cfg, db, roots, scanner, logger)
 	tasks.Recover()
 	defer tasks.Stop()
 
-	srv := api.NewServer(cfg, db, authMgr, tasks, runner, logger)
+	srv := api.NewServer(cfg, db, authMgr, tasks, roots, runner, logger)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Listen,
@@ -92,7 +103,7 @@ func run() error {
 		"listen", cfg.Listen,
 		"data_dir", cfg.DataDir,
 		"config", orNone(used),
-		"allow_roots_count", len(cfg.MediaAllowRoots),
+		"allow_roots_count", len(roots.List()),
 		"scan_workers", cfg.ScanWorkers,
 		"ffmpeg_ok", caps.FFmpegOK,
 		"ffprobe_ok", caps.FFprobeOK,
@@ -137,6 +148,37 @@ func newLogger(level string) *slog.Logger {
 		lv = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv}))
+}
+
+// indexVerb finds a bare subcommand while skipping flag values.
+func indexVerb(args []string, verb string) int {
+	skipNext := false
+	for i, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch {
+		case arg == "--":
+			return -1
+		case arg == "-config" || arg == "--config":
+			skipNext = true
+		case arg == verb:
+			return i
+		}
+	}
+	return -1
+}
+
+func printUsage() {
+	fmt.Fprint(os.Stderr, `zizvideo — 本地短视频服务
+
+用法:
+  zizvideo [--config <file>] [--version]
+  zizvideo roots list|add <绝对路径>|remove <绝对路径> [--config <file>]
+
+root 子命令直接读写同一份 config.json，输出一行 JSON。`)
+	fmt.Fprintln(os.Stderr)
 }
 
 func orNone(s string) string {

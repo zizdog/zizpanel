@@ -41,11 +41,11 @@ func TestDefaultsMatchDocumentedMVP(t *testing.T) {
 }
 
 func TestEnvironmentOverrides(t *testing.T) {
-	t.Setenv("GV_LISTEN", "127.0.0.1:17766")
-	t.Setenv("GV_SCAN_WORKERS", "7")
-	t.Setenv("GV_MEDIA_ALLOW_ROOTS", "/tmp/a, /tmp/b")
-	t.Setenv("GV_MEDIA_EXTENSIONS", "mp4,mkv")
-	t.Setenv("GV_LOG_LEVEL", "debug")
+	t.Setenv("ZV_LISTEN", "127.0.0.1:17766")
+	t.Setenv("ZV_SCAN_WORKERS", "7")
+	t.Setenv("ZV_MEDIA_ALLOW_ROOTS", "/tmp/a, /tmp/b")
+	t.Setenv("ZV_MEDIA_EXTENSIONS", "mp4,mkv")
+	t.Setenv("ZV_LOG_LEVEL", "debug")
 
 	c, used, err := Load("")
 	if err != nil {

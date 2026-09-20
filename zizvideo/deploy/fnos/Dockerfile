@@ -9,23 +9,23 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \
-      -ldflags="-s -w -X github.com/zizdog/govideo/internal/api.Version=${VERSION}" \
-      -o /out/govideo ./cmd/server
+      -ldflags="-s -w -X github.com/zizdog/zizvideo/internal/api.Version=${VERSION}" \
+      -o /out/zizvideo ./cmd/server
 
 FROM debian:bookworm-slim
 # 未验证：基础镜像里装的 ffmpeg 版本没有在 fnOS 上跑过。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/govideo /usr/local/bin/govideo
+COPY --from=builder /out/zizvideo /usr/local/bin/zizvideo
 # 以非 root 运行；UID/GID 需要与媒体目录属主一致，现场确认后再定。
-RUN useradd -r -u 1000 -m -d /var/lib/govideo govideo \
- && mkdir -p /var/lib/govideo/covers && chown -R 1000:1000 /var/lib/govideo
+RUN useradd -r -u 1000 -m -d /var/lib/zizvideo zizvideo \
+ && mkdir -p /var/lib/zizvideo/covers && chown -R 1000:1000 /var/lib/zizvideo
 USER 1000:1000
-ENV GV_LISTEN=0.0.0.0:7766 \
-    GV_DATA_DIR=/var/lib/govideo \
-    GV_DATABASE_PATH=/var/lib/govideo/govideo.db \
-    GV_FFMPEG_BIN=/usr/bin/ffmpeg \
-    GV_FFPROBE_BIN=/usr/bin/ffprobe
+ENV ZV_LISTEN=0.0.0.0:7766 \
+    ZV_DATA_DIR=/var/lib/zizvideo \
+    ZV_DATABASE_PATH=/var/lib/zizvideo/zizvideo.db \
+    ZV_FFMPEG_BIN=/usr/bin/ffmpeg \
+    ZV_FFPROBE_BIN=/usr/bin/ffprobe
 EXPOSE 7766
-ENTRYPOINT ["/usr/local/bin/govideo"]
+ENTRYPOINT ["/usr/local/bin/zizvideo"]

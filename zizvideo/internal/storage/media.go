@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 const mediaCols = `id, library_id, path, title, size, mtime_ns, container,

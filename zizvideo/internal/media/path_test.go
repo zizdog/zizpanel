@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 func mustDir(t *testing.T, path string) string {
@@ -16,6 +16,8 @@ func mustDir(t *testing.T, path string) string {
 	}
 	return path
 }
+
+func mustErr(_ string, err error) error { return err }
 
 func assertErr(t *testing.T, err error, want *domain.Error) {
 	t.Helper()
@@ -122,7 +124,47 @@ func TestValidateMediaFileRules(t *testing.T) {
 	assertErr(t, mustErr(ValidateMediaFile(allow, root, "/etc/passwd")), domain.ErrPathNotAllowed)
 }
 
-func mustErr(_ string, err error) error { return err }
+// TestValidateMediaFileAcceptsRootStoredAsRealPath is the /tmp regression: the
+// allow root is stored resolved (/private/tmp/...) while WalkDir yields the
+// symlinked spelling, so both comparisons must be tried (真机扫出 0 个文件的坑).
+func TestValidateMediaFileAcceptsRootStoredAsRealPath(t *testing.T) {
+	// Deliberately under /tmp so the symlinked spelling really differs from the
+	// resolved one on macOS (/tmp -> /private/tmp).
+	base, err := os.MkdirTemp("/tmp", "zv-alias-")
+	if err != nil {
+		t.Skipf("无法在 /tmp 下建夹具: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realBase == base {
+		t.Skip("/tmp 不是软链接，无法复现该坑")
+	}
+	realRoot := mustDir(t, filepath.Join(realBase, "fixtures"))
+	aliasRoot := filepath.Join(base, "fixtures")
+	mustDir(t, aliasRoot)
+	realFile := filepath.Join(realRoot, "clip.mp4")
+	aliasFile := filepath.Join(aliasRoot, "clip.mp4")
+	if err := os.WriteFile(realFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The allow root is stored resolved; WalkDir yields the alias spelling.
+	if _, err := ValidateMediaFile([]string{realRoot}, aliasRoot, aliasFile); err != nil {
+		t.Fatalf("越界误报: %v", err)
+	}
+	if _, err := ValidateMediaFile([]string{realRoot}, aliasRoot, realFile); err != nil {
+		t.Fatalf("真实路径应通过: %v", err)
+	}
+	// A genuinely outside file must still be refused.
+	outside := mustDir(t, filepath.Join(realBase, "outside"))
+	outFile := filepath.Join(outside, "secret.mp4")
+	if err := os.WriteFile(outFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertErr(t, mustErr(ValidateMediaFile([]string{realRoot}, aliasRoot, outFile)), domain.ErrPathNotAllowed)
+}
 
 func TestIgnoreRules(t *testing.T) {
 	rules := DefaultIgnoreRules

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 const libCols = `id, name, root_path, recursive, enabled, ignore_rules,

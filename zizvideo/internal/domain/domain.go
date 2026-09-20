@@ -150,6 +150,8 @@ var (
 	ErrPathUnreadable  = New("MEDIA_PATH_UNREADABLE", "路径不可读", 403)
 	ErrPathNullByte    = New("MEDIA_PATH_NULL_BYTE", "路径含非法字符", 400)
 	ErrPathEscapes     = New("MEDIA_PATH_ESCAPES_ROOT", "文件解析后落在媒体库之外", 403)
+	ErrPathRootBusy    = New("MEDIA_ROOT_IN_USE", "该允许根正被媒体库使用", 409)
+	ErrPathRootExists  = New("MEDIA_ROOT_EXISTS", "该路径已在允许根里", 409)
 
 	ErrScanRunning  = New("SCAN_ALREADY_RUNNING", "该媒体库已有扫描在进行", 409)
 	ErrTaskNotFound = New("TASK_NOT_FOUND", "任务不存在", 404)

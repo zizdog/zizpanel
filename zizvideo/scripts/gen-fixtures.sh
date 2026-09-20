@@ -1,5 +1,5 @@
 #!/bin/bash
-# Generate small test videos for govideo. Writes only into the target directory.
+# Generate small test videos for zizvideo. Writes only into the target directory.
 set -euo pipefail
 
 FFMPEG="${FFMPEG:-/opt/homebrew/bin/ffmpeg}"
@@ -33,11 +33,11 @@ if "$FFMPEG" -hide_banner -loglevel error -y \
     -f lavfi -i "sine=frequency=660:duration=4" \
     -c:v libx265 -x265-params log-level=error -pix_fmt yuv420p \
     -c:a aac -b:a 96k -tag:v hvc1 -movflags +faststart \
-    hevc_aac.mp4 2>/tmp/govideo-hevc.log; then
+    hevc_aac.mp4 2>/tmp/zizvideo-hevc.log; then
   echo "  hevc_aac.mp4 生成成功"
 else
   echo "  hevc 编码失败（本机 ffmpeg 无 libx265 可用）："
-  sed 's/^/  /' /tmp/govideo-hevc.log || true
+  sed 's/^/  /' /tmp/zizvideo-hevc.log || true
   rm -f hevc_aac.mp4
 fi
 

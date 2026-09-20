@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 // Within reports whether path is root or sits below it.
@@ -35,7 +35,7 @@ func ValidateLibraryPath(allowRoots []string, raw string) (string, error) {
 	if filepath.Clean(raw) != raw {
 		return "", domain.ErrPathNotClean
 	}
-	roots, err := resolvedRoots(allowRoots)
+	roots, _, err := resolvedRoots(allowRoots)
 	if err != nil {
 		return "", err
 	}
@@ -68,22 +68,25 @@ func ValidateLibraryPath(allowRoots []string, raw string) (string, error) {
 }
 
 // resolvedRoots resolves each allow root, tolerating roots that do not exist yet.
-func resolvedRoots(allowRoots []string) ([]string, error) {
+// It also returns the cleaned originals so alias comparison stays 1:1.
+func resolvedRoots(allowRoots []string) ([]string, []string, error) {
 	out := make([]string, 0, len(allowRoots))
+	orig := make([]string, 0, len(allowRoots))
 	for _, r := range allowRoots {
 		if !filepath.IsAbs(r) {
-			return nil, domain.ErrPathNotAllowed
+			return nil, nil, domain.ErrPathNotAllowed
 		}
 		clean := filepath.Clean(r)
+		orig = append(orig, clean)
 		out = append(out, clean)
 		if real, err := filepath.EvalSymlinks(clean); err == nil && real != clean {
 			out = append(out, real)
 		}
 	}
 	if len(out) == 0 {
-		return nil, domain.ErrPathNotAllowed
+		return nil, nil, domain.ErrPathNotAllowed
 	}
-	return out, nil
+	return out, orig, nil
 }
 
 func insideAny(path string, roots []string) bool {
@@ -93,6 +96,49 @@ func insideAny(path string, roots []string) bool {
 		}
 	}
 	return false
+}
+
+// CoveringRoot returns the configured root that already contains candidate, so
+// a redundant add can be rejected with an honest reason.
+func CoveringRoot(allowRoots []string, candidate string) string {
+	real := candidate
+	if r, err := filepath.EvalSymlinks(candidate); err == nil {
+		real = r
+	}
+	for _, root := range allowRoots {
+		if !filepath.IsAbs(root) {
+			continue
+		}
+		clean := filepath.Clean(root)
+		covers := func(base string) bool {
+			return Within(candidate, base) || Within(real, base)
+		}
+		if covers(clean) {
+			return clean
+		}
+		if alias, err := filepath.EvalSymlinks(clean); err == nil && alias != clean && covers(alias) {
+			return clean
+		}
+	}
+	return ""
+}
+
+// ValidateAllowedLibrary re-checks a stored library root against the allow
+// roots. It only calls EvalSymlinks, never reads the directory, so a scan that
+// is about to be rejected cannot enumerate anything (坑 2).
+func ValidateAllowedLibrary(allowRoots []string, root string) error {
+	roots, _, err := resolvedRoots(allowRoots)
+	if err != nil {
+		return err
+	}
+	real := root
+	if r, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		real = r
+	}
+	if !insideAny(real, roots) && !insideAny(root, roots) {
+		return domain.ErrPathNotAllowed
+	}
+	return nil
 }
 
 func checkReadableDir(dir string) error {
@@ -122,11 +168,17 @@ func ValidateMediaFile(allowRoots []string, libraryRoot, path string) (string, e
 	if filepath.Clean(path) != path {
 		return "", domain.ErrPathNotClean
 	}
-	roots, err := resolvedRoots(allowRoots)
+	roots, _, err := resolvedRoots(allowRoots)
 	if err != nil {
 		return "", err
 	}
-	if !insideAny(path, roots) {
+	// An allow root may be stored in its resolved form (/private/tmp/...) while
+	// a WalkDir path keeps the symlinked spelling (/tmp/...): compare both.
+	realPath := path
+	if r, rerr := filepath.EvalSymlinks(filepath.Dir(path)); rerr == nil {
+		realPath = filepath.Join(r, filepath.Base(path))
+	}
+	if !insideAny(path, roots) && !insideAny(realPath, roots) {
 		return "", domain.ErrPathNotAllowed
 	}
 	libReal, err := filepath.EvalSymlinks(libraryRoot)

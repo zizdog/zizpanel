@@ -6,16 +6,17 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/media"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/media"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // Manager starts scans and tracks which libraries are busy.
 type Manager struct {
 	cfg     *config.Config
 	db      *storage.DB
+	Roots   *config.Roots
 	scanner *media.Scanner
 	log     *slog.Logger
 
@@ -28,10 +29,11 @@ type Manager struct {
 }
 
 // NewManager builds a Manager; call Stop to cancel in-flight scans.
-func NewManager(cfg *config.Config, db *storage.DB, sc *media.Scanner, log *slog.Logger) *Manager {
+func NewManager(cfg *config.Config, db *storage.DB, roots *config.Roots,
+	sc *media.Scanner, log *slog.Logger) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		cfg: cfg, db: db, scanner: sc, log: log,
+		cfg: cfg, db: db, Roots: roots, scanner: sc, log: log,
 		baseCtx: ctx, cancel: cancel, active: map[string]bool{},
 	}
 }
@@ -64,6 +66,10 @@ func (m *Manager) StartScan(libraryID, kind string) (*domain.ScanTask, error) {
 	if !lib.Enabled {
 		return nil, &domain.Error{Code: "SCAN_LIBRARY_DISABLED",
 			Message: "媒体库已禁用，请先启用", Status: 409}
+	}
+	// Server-side gate: never queue a scan for a root outside the allow list.
+	if err := media.ValidateAllowedLibrary(m.Roots.List(), lib.RootPath); err != nil {
+		return nil, err
 	}
 	if kind != "full" {
 		kind = "incremental"

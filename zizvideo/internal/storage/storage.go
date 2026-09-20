@@ -13,8 +13,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/migrations"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/migrations"
 )
 
 // DB wraps the connection pool with the repositories.

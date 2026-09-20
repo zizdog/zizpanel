@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 const taskCols = `id, library_id, kind, status, total, scanned, updated, failed, missing,

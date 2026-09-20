@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/zizdog/govideo/internal/auth"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // HandleListUsers returns every live account (admin only).

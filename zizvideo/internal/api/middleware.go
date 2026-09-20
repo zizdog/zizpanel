@@ -8,14 +8,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 // Cookie names. The session cookie is HttpOnly; the CSRF cookie must stay
 // readable so the frontend can echo it in the X-CSRF-Token header.
 const (
-	CookieSession = "gv_session"
-	CookieCSRF    = "gv_csrf"
+	CookieSession = "zv_session"
+	CookieCSRF    = "zv_csrf"
 )
 
 func (s *Server) setSessionCookies(w http.ResponseWriter, r *http.Request, token string) {

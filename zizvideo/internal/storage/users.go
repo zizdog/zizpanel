@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 const userCols = `id, username, display_name, password_hash, role, status,

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 // Runner executes an external program and returns its raw output.

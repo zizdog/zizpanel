@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // Iterations is the PBKDF2 work factor. Stored in the hash so it can grow.
@@ -75,7 +75,7 @@ func HashToken(token string) string {
 
 // LoadSecret reads (or creates) the HMAC secret used to derive CSRF tokens.
 func LoadSecret(dataDir string) ([]byte, error) {
-	if env := os.Getenv("GV_AUTH_SECRET"); env != "" {
+	if env := os.Getenv("ZV_AUTH_SECRET"); env != "" {
 		return []byte(env), nil
 	}
 	path := filepath.Join(dataDir, "secret.key")
@@ -137,7 +137,7 @@ func (m *Manager) Login(ip, username, password string) (*domain.User, string, er
 	u, err := m.DB.GetUserByUsername(username)
 	if err != nil {
 		// Burn comparable work so a missing account is not faster to probe.
-		_, _ = pbkdf2.Key(sha256.New, password, []byte("govideo-dummy-salt"), Iterations, 32)
+		_, _ = pbkdf2.Key(sha256.New, password, []byte("zizvideo-dummy-salt"), Iterations, 32)
 		m.Limiter.Fail(key)
 		return nil, "", domain.ErrUnauthorized
 	}

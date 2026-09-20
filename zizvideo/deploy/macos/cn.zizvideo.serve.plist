@@ -9,13 +9,13 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>cn.govideo.serve</string>
+  <string>cn.zizvideo.serve</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/CHANGE_ME/bin/govideo</string>
+    <string>/Users/CHANGE_ME/bin/zizvideo</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/CHANGE_ME/Library/Application Support/govideo</string>
+  <string>/Users/CHANGE_ME/Library/Application Support/zizvideo</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -33,14 +33,14 @@
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>GV_FFMPEG_BIN</key>
+    <key>ZV_FFMPEG_BIN</key>
     <string>/opt/homebrew/bin/ffmpeg</string>
-    <key>GV_FFPROBE_BIN</key>
+    <key>ZV_FFPROBE_BIN</key>
     <string>/opt/homebrew/bin/ffprobe</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/CHANGE_ME/Library/Logs/govideo.out.log</string>
+  <string>/Users/CHANGE_ME/Library/Logs/zizvideo.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/CHANGE_ME/Library/Logs/govideo.err.log</string>
+  <string>/Users/CHANGE_ME/Library/Logs/zizvideo.err.log</string>
 </dict>
 </plist>

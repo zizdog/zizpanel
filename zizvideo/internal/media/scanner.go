@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/ffmpeg"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/ffmpeg"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // DefaultIgnoreRules always apply on top of a library's own rules.
@@ -27,13 +27,15 @@ var DefaultIgnoreRules = []string{
 type Scanner struct {
 	Cfg    *config.Config
 	DB     *storage.DB
+	Roots  *config.Roots
 	Runner ffmpeg.Runner
 	Log    *slog.Logger
 }
 
-// NewScanner wires a Scanner.
-func NewScanner(cfg *config.Config, db *storage.DB, r ffmpeg.Runner, log *slog.Logger) *Scanner {
-	return &Scanner{Cfg: cfg, DB: db, Runner: r, Log: log}
+// NewScanner wires a Scanner; roots is the live allow-root source of truth.
+func NewScanner(cfg *config.Config, db *storage.DB, roots *config.Roots,
+	r ffmpeg.Runner, log *slog.Logger) *Scanner {
+	return &Scanner{Cfg: cfg, DB: db, Roots: roots, Runner: r, Log: log}
 }
 
 type fileEntry struct {
@@ -70,6 +72,13 @@ type scanResult struct {
 func (s *Scanner) run(ctx context.Context, task *domain.ScanTask, lib *domain.Library) scanResult {
 	var res scanResult
 
+	// Re-check the allow list before touching the filesystem: a root that was
+	// removed from config must not be walked even if a scan was queued (坑 2).
+	if err := ValidateAllowedLibrary(s.Roots.List(), lib.RootPath); err != nil {
+		res.interrupted = true
+		res.errMsg = "媒体库根路径不在允许根内，已拒绝扫描（未遍历任何目录）"
+		return res
+	}
 	st, err := os.Stat(lib.RootPath)
 	if err != nil {
 		res.interrupted = true
@@ -205,7 +214,7 @@ func (s *Scanner) enumerate(ctx context.Context, lib *domain.Library) ([]fileEnt
 		if ierr != nil {
 			return nil
 		}
-		if _, verr := ValidateMediaFile(s.Cfg.MediaAllowRoots, root, filepath.Clean(path)); verr != nil {
+		if _, verr := ValidateMediaFile(s.Roots.List(), root, filepath.Clean(path)); verr != nil {
 			s.Log.Warn("跳过错配文件", "library_id", lib.ID, "error", verr.Error())
 			return nil
 		}

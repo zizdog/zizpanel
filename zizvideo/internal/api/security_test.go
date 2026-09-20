@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // makeMediaRow registers a row for an arbitrary path without validating it, so
@@ -166,7 +166,7 @@ func TestLibraryPathValidation(t *testing.T) {
 func TestFfmpegArgsAreNeverShellInterpolated(t *testing.T) {
 	e := newEnv(t)
 	e.setupAdmin()
-	t.Setenv("GV_TEST_ARGV_LOG", e.ArgvLog)
+	t.Setenv("ZV_TEST_ARZV_LOG", e.ArgvLog)
 	lib := e.newLibrary("l", e.Root)
 
 	// The extension whitelist forces the suffix; the metacharacters are intact.

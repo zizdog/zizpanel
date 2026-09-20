@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/media"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/media"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // mediaItem is the single shape returned by /media, /media/{id} and /feed/next.
@@ -176,7 +176,7 @@ func (s *Server) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Whitelist check happens before the file is opened.
-	if _, err := media.ValidateMediaFile(s.Cfg.MediaAllowRoots, lib.RootPath, m.Path); err != nil {
+	if _, err := media.ValidateMediaFile(s.Roots.List(), lib.RootPath, m.Path); err != nil {
 		s.audit(r, "media.stream", "media:"+m.ID, false, errCode(err))
 		s.fail(w, r, err)
 		return

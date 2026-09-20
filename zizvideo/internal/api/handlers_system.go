@@ -7,7 +7,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 // minFreeBytes is the documented readiness floor for the data volume.
@@ -46,7 +46,7 @@ func (s *Server) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roots := map[string]any{}
-	for _, root := range s.Cfg.MediaAllowRoots {
+	for _, root := range s.Roots.List() {
 		if st, err := os.Stat(root); err != nil || !st.IsDir() {
 			roots[root] = "不存在"
 			ok = false
@@ -129,7 +129,7 @@ func (s *Server) HandleSystemInfo(w http.ResponseWriter, r *http.Request) {
 		"ffprobe": map[string]any{"path": caps.FFprobePath, "version": caps.FFprobeVersion,
 			"ok": caps.FFprobeOK},
 		"tools_error":    caps.Error,
-		"media_roots":    s.Cfg.MediaAllowRoots,
+		"media_roots":    s.Roots.List(),
 		"scan_workers":   s.Cfg.ScanWorkers,
 		"transcode":      map[string]any{"enabled": false, "reason": "Phase2"},
 		"disk":           disk,

@@ -5,9 +5,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/zizdog/govideo/internal/auth"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // audit records every write operation: who, what, on which object, and whether

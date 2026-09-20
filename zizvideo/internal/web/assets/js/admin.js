@@ -1,7 +1,8 @@
-// 管理后台：媒体库 / 媒体 / 用户 / 系统 四个页签
+// 管理后台：媒体库 / 媒体 / 允许根 / 用户 / 系统 页签
 
 import { api } from "./api.js";
 import { el, clear, banner, setBanner, field, input, fmtDuration, fmtBytes, fmtDate } from "./dom.js";
+import { openDirectoryPicker } from "./roots.js";
 
 function button(label, onclick, extraClass) {
   return el("button", {
@@ -48,6 +49,21 @@ function kv(label, value) {
     el("span", { class: "v", text: value === null || value === undefined || value === "" ? "-" : String(value) }));
 }
 
+/* ---------- 允许根共用 ---------- */
+
+function normPath(path) {
+  if (!path || path === "/") return "/";
+  return String(path).replace(/\/+$/, "");
+}
+
+function isUnder(path, roots) {
+  const p = normPath(path);
+  return (roots || []).some((root) => {
+    const r = normPath(root);
+    return p === r || p.startsWith(r + "/");
+  });
+}
+
 /* ---------- 媒体库 ---------- */
 
 function mountLibraries(root) {
@@ -59,12 +75,43 @@ function mountLibraries(root) {
   const recursive = el("input", { type: "checkbox", checked: true });
   const enabled = el("input", { type: "checkbox", checked: true });
   const ignoreInput = input({ placeholder: "忽略规则，逗号分隔" });
+  const rootsHint = el("div", { class: "muted small-note" });
+  let allowed = [];
+  const pick = button("选择目录", () => {
+    openDirectoryPicker({
+      start: pathInput.value.trim() || "/Volumes",
+      roots: () => allowed,
+      onPicked: (picked) => { pathInput.value = picked; renderHint(); },
+      onRootsChanged: loadRoots,
+    });
+  });
   const submit = el("button", { class: "btn primary", type: "submit", text: "新建" });
   const cancel = el("button", { class: "btn", type: "button", text: "取消", hidden: true });
   let editing = null;
 
+  function renderHint() {
+    let text = "允许根：" + (allowed.length ? allowed.slice(0, 3).join("、") : "无");
+    if (allowed.length > 3) text += " 等 " + allowed.length + " 个";
+    const current = pathInput.value.trim();
+    if (current && isUnder(current, allowed)) text = "✓ 已在允许根内";
+    rootsHint.textContent = text;
+  }
+
+  async function loadRoots() {
+    try {
+      const data = await api.mediaRoots();
+      const list = data && Array.isArray(data.roots) ? data.roots : [];
+      allowed = list.map((item) => item.path);
+    } catch (err) {
+      allowed = [];
+    }
+    renderHint();
+  }
+
   const form = el("form", { class: "panel" },
-    el("div", { class: "row" }, field("名称", nameInput), field("根目录", pathInput)),
+    el("div", { class: "row" }, field("名称", nameInput),
+      field("根目录", el("div", { class: "row" }, pathInput, pick))),
+    rootsHint,
     el("div", { class: "row" },
       el("label", { class: "check" }, recursive, el("span", { text: "递归扫描" })),
       el("label", { class: "check" }, enabled, el("span", { text: "启用" }))),
@@ -91,6 +138,7 @@ function mountLibraries(root) {
       submit.textContent = "新建";
       cancel.hidden = true;
     }
+    renderHint();
   }
 
   async function refresh() {
@@ -179,12 +227,98 @@ function mountLibraries(root) {
   });
 
   cancel.addEventListener("click", () => setEditing(null));
+  pathInput.addEventListener("change", renderHint);
   root.append(form, table);
-  refresh();
+  loadRoots().then(refresh);
 
   return () => {
     for (const timer of timers) clearInterval(timer);
   };
+}
+
+/* ---------- 媒体允许根 ---------- */
+
+function mountRoots(root) {
+  const note = banner();
+  const { table, body } = gridOf(["允许根", "状态", "被哪些库使用", "操作"]);
+  const newPath = input({ placeholder: "绝对路径，例如 /Volumes/ZPMirror/video" });
+  const addButton = el("button", { class: "btn primary", type: "submit", text: "添加" });
+  const browseButton = button("浏览目录…", () => {
+    openDirectoryPicker({
+      start: newPath.value.trim() || "/Volumes",
+      roots: () => roots || [],
+      onVisited: (path) => { newPath.value = path; },
+      onPicked: (path) => { newPath.value = path; },
+      onRootsChanged: refresh,
+    });
+  });
+  const form = el("form", { class: "panel" },
+    el("div", { class: "row" }, field("允许根目录", newPath), browseButton, addButton),
+    el("div", { class: "muted small-note", text: "改动直接写回 config.json；环境变量 ZV_MEDIA_ALLOW_ROOTS 覆盖时不生效。" }),
+    note);
+  let roots = [];
+
+  function stateText(item) {
+    if (!item.exists) return "不存在";
+    if (!item.is_dir) return "不是目录";
+    if (!item.readable) return "不可读";
+    return "可读";
+  }
+
+  async function remove(item) {
+    if (!window.confirm("删除允许根「" + item.path + "」？")) return;
+    setBanner(note, "");
+    try {
+      await api.removeMediaRoot(item.path);
+      await refresh();
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "删除失败");
+    }
+  }
+
+  async function refresh() {
+    setBanner(note, "");
+    try {
+      const data = await api.mediaRoots();
+      const list = data && Array.isArray(data.roots) ? data.roots : [];
+      roots = list.map((item) => item.path);
+      clear(body);
+      if (!list.length) body.append(emptyRow(4, "暂无允许根"));
+      for (const item of list) {
+        body.append(rowOf([
+          item.path,
+          stateText(item),
+          item.in_use ? (item.libraries || 0) + " 个" : "-",
+          button("删除", () => remove(item), "danger"),
+        ]));
+      }
+      if (data && data.env_override) {
+        setBanner(note, "ZV_MEDIA_ALLOW_ROOTS 已覆盖，配置改动不生效");
+      }
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "加载失败");
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const path = newPath.value.trim();
+    if (!path) return;
+    setBanner(note, "");
+    addButton.disabled = true;
+    try {
+      await api.addMediaRoot(path);
+      newPath.value = "";
+      await refresh();
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "添加失败");
+    } finally {
+      addButton.disabled = false;
+    }
+  });
+
+  root.append(form, table);
+  refresh();
 }
 
 /* ---------- 媒体 ---------- */
@@ -375,6 +509,7 @@ export function mountAdmin(view) {
   const definitions = [
     { key: "libraries", label: "媒体库", mount: mountLibraries },
     { key: "media", label: "媒体", mount: mountMedia },
+    { key: "roots", label: "媒体允许根", mount: mountRoots },
     { key: "users", label: "用户", mount: mountUsers },
     { key: "system", label: "系统", mount: mountSystem },
   ];

@@ -1,4 +1,4 @@
-// Package config loads JSON config, applies GV_ environment overrides, validates.
+// Package config loads JSON config, applies ZV_ environment overrides, validates.
 package config
 
 import (
@@ -38,11 +38,11 @@ type Config struct {
 // and $HOME/Downloads, matching the documented MVP behaviour.
 func Default() *Config {
 	home, _ := os.UserHomeDir()
-	dataDir := filepath.Join(home, "Library", "Application Support", "govideo")
+	dataDir := filepath.Join(home, "Library", "Application Support", "zizvideo")
 	return &Config{
 		Listen:             "127.0.0.1:7766",
 		DataDir:            dataDir,
-		DatabasePath:       filepath.Join(dataDir, "govideo.db"),
+		DatabasePath:       filepath.Join(dataDir, "zizvideo.db"),
 		MediaAllowRoots:    []string{filepath.Join(home, "Movies"), filepath.Join(home, "Downloads")},
 		MediaExtensions:    []string{"mp4", "mov", "m4v", "mkv", "webm", "ts", "mts", "avi", "flv", "hevc"},
 		ScanWorkers:        4,
@@ -61,12 +61,12 @@ func Default() *Config {
 }
 
 // Load reads the JSON file at path (missing file is not an error), then applies
-// GV_ overrides, then validates. Returns the config and the path actually used.
+// ZV_ overrides, then validates. Returns the config and the path actually used.
 func Load(path string) (*Config, string, error) {
 	c := Default()
 	used := ""
 	if path == "" {
-		if p := os.Getenv("GV_CONFIG"); p != "" {
+		if p := os.Getenv("ZV_CONFIG"); p != "" {
 			path = p
 		}
 	}
@@ -89,29 +89,39 @@ func Load(path string) (*Config, string, error) {
 	return c, used, nil
 }
 
+// setAllowRoots mirrors the store's snapshot for tests and CLI helpers; the
+// running code reads config.Roots instead (坑 1：只有一个真源).
+func (c *Config) setAllowRoots(roots []string) {
+	if c == nil {
+		return
+	}
+	c.MediaAllowRoots = make([]string, len(roots))
+	copy(c.MediaAllowRoots, roots)
+}
+
 func applyEnv(c *Config) {
-	setStr(&c.Listen, "GV_LISTEN")
-	setStr(&c.DataDir, "GV_DATA_DIR")
-	setStr(&c.DatabasePath, "GV_DATABASE_PATH")
-	setStr(&c.FFmpegBin, "GV_FFMPEG_BIN")
-	setStr(&c.FFprobeBin, "GV_FFPROBE_BIN")
-	setStr(&c.LogLevel, "GV_LOG_LEVEL")
-	setInt(&c.ScanWorkers, "GV_SCAN_WORKERS")
-	setInt(&c.ProbeTimeoutSec, "GV_PROBE_TIMEOUT_SECONDS")
-	setInt(&c.LockoutThreshold, "GV_LOCKOUT_THRESHOLD")
-	setInt(&c.SessionTTLHours, "GV_SESSION_TTL_HOURS")
-	setBool(&c.SecureCookie, "GV_SECURE_COOKIE")
-	if v := os.Getenv("GV_MEDIA_ALLOW_ROOTS"); v != "" {
+	setStr(&c.Listen, "ZV_LISTEN")
+	setStr(&c.DataDir, "ZV_DATA_DIR")
+	setStr(&c.DatabasePath, "ZV_DATABASE_PATH")
+	setStr(&c.FFmpegBin, "ZV_FFMPEG_BIN")
+	setStr(&c.FFprobeBin, "ZV_FFPROBE_BIN")
+	setStr(&c.LogLevel, "ZV_LOG_LEVEL")
+	setInt(&c.ScanWorkers, "ZV_SCAN_WORKERS")
+	setInt(&c.ProbeTimeoutSec, "ZV_PROBE_TIMEOUT_SECONDS")
+	setInt(&c.LockoutThreshold, "ZV_LOCKOUT_THRESHOLD")
+	setInt(&c.SessionTTLHours, "ZV_SESSION_TTL_HOURS")
+	setBool(&c.SecureCookie, "ZV_SECURE_COOKIE")
+	if v := os.Getenv("ZV_MEDIA_ALLOW_ROOTS"); v != "" {
 		c.MediaAllowRoots = splitList(v)
 	}
-	if v := os.Getenv("GV_MEDIA_EXTENSIONS"); v != "" {
+	if v := os.Getenv("ZV_MEDIA_EXTENSIONS"); v != "" {
 		c.MediaExtensions = splitList(v)
 	}
-	if v := os.Getenv("GV_TRUSTED_PROXIES"); v != "" {
+	if v := os.Getenv("ZV_TRUSTED_PROXIES"); v != "" {
 		c.TrustedProxies = splitList(v)
 	}
-	if c.DatabasePath == "" || os.Getenv("GV_DATA_DIR") != "" && os.Getenv("GV_DATABASE_PATH") == "" {
-		c.DatabasePath = filepath.Join(c.DataDir, "govideo.db")
+	if c.DatabasePath == "" || os.Getenv("ZV_DATA_DIR") != "" && os.Getenv("ZV_DATABASE_PATH") == "" {
+		c.DatabasePath = filepath.Join(c.DataDir, "zizvideo.db")
 	}
 }
 

@@ -1,6 +1,6 @@
 package storage
 
-import "github.com/zizdog/govideo/internal/domain"
+import "github.com/zizdog/zizvideo/internal/domain"
 
 // AuditEntry is one write-operation record.
 type AuditEntry struct {

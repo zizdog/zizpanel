@@ -26,7 +26,7 @@ export function renderHeader(headerEl, onLogout, hideHeader) {
   if (hideHeader || !user) { headerEl.hidden = true; return; }
   headerEl.hidden = false;
   const nodes = [
-    el("div", { class: "brand", text: "Govideo" }),
+    el("div", { class: "brand", text: "Zizvideo" }),
     el("div", { class: "spacer" }),
     el("span", { class: "who", text: user.display_name || user.username || "" }),
   ];
@@ -42,7 +42,7 @@ export function mountLogin(view, onSuccess) {
   const note = banner();
   const submit = el("button", { class: "btn primary", type: "submit", text: "登录" });
   const form = el("form", { class: "panel narrow" },
-    el("h1", { class: "title", text: "Govideo" }),
+    el("h1", { class: "title", text: "Zizvideo" }),
     field("用户名", username),
     field("口令", password),
     note,
@@ -72,7 +72,7 @@ export function mountSetup(view, onSuccess) {
   const note = banner();
   const submit = el("button", { class: "btn primary", type: "submit", text: "创建管理员" });
   const form = el("form", { class: "panel narrow" },
-    el("h1", { class: "title", text: "初始化 Govideo" }),
+    el("h1", { class: "title", text: "初始化 Zizvideo" }),
     field("用户名", username),
     field("口令", password),
     field("确认口令", confirm),

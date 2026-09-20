@@ -15,15 +15,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zizdog/govideo/internal/api"
-	"github.com/zizdog/govideo/internal/auth"
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/ffmpeg"
-	"github.com/zizdog/govideo/internal/media"
-	"github.com/zizdog/govideo/internal/storage"
-	"github.com/zizdog/govideo/internal/task"
-	"github.com/zizdog/govideo/internal/web"
+	"github.com/zizdog/zizvideo/internal/api"
+	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/ffmpeg"
+	"github.com/zizdog/zizvideo/internal/media"
+	"github.com/zizdog/zizvideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/task"
+	"github.com/zizdog/zizvideo/internal/web"
 )
 
 // env is a fully isolated server: temp data dir, temp media root, stub tools.
@@ -33,6 +33,8 @@ type env struct {
 	DB      *storage.DB
 	Cfg     *config.Config
 	TS      *httptest.Server
+	Roots   *config.Roots
+	CfgPath string
 	Client  *http.Client
 	Base    string
 	Root    string
@@ -59,7 +61,7 @@ func newEnv(t *testing.T, tweak ...func(*config.Config)) *env {
 	ff := filepath.Join(bins, "ffmpeg")
 	writeStub(t, probe, `#!/bin/sh
 if [ "$1" = "-version" ]; then echo "ffprobe version 9.0.1-fake Copyright"; exit 0; fi
-if [ -n "$GV_TEST_ARGV_LOG" ]; then printf '%s\n' "$@" >> "$GV_TEST_ARGV_LOG"; fi
+if [ -n "$ZV_TEST_ARZV_LOG" ]; then printf '%s\n' "$@" >> "$ZV_TEST_ARZV_LOG"; fi
 src=""
 for a in "$@"; do src="$a"; done
 case "$src" in
@@ -81,7 +83,7 @@ echo fake-jpeg > "$out"
 
 	cfg := config.Default()
 	cfg.DataDir = dataDir
-	cfg.DatabasePath = filepath.Join(dataDir, "govideo.db")
+	cfg.DatabasePath = filepath.Join(dataDir, "zizvideo.db")
 	cfg.MediaAllowRoots = []string{root}
 	cfg.FFprobeBin = probe
 	cfg.FFmpegBin = ff
@@ -103,17 +105,33 @@ echo fake-jpeg > "$out"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	authMgr := auth.NewManager(db, []byte("test-secret-key"), cfg.SessionTTL(),
 		cfg.LockoutThreshold, cfg.LockoutWindow())
-	scanner := media.NewScanner(cfg, db, ffmpeg.ExecRunner{}, logger)
-	tasks := task.NewManager(cfg, db, scanner, logger)
-	srv := api.NewServer(cfg, db, authMgr, tasks, ffmpeg.ExecRunner{}, logger)
+	// A real config file so allow-root writes can be exercised and re-read.
+	cfgPath := filepath.Join(base, "config.json")
+	writeConfigFile(t, cfgPath, cfg.MediaAllowRoots)
+	roots := config.NewRoots(cfgPath, cfg.MediaAllowRoots)
+	scanner := media.NewScanner(cfg, db, roots, ffmpeg.ExecRunner{}, logger)
+	tasks := task.NewManager(cfg, db, roots, scanner, logger)
+	srv := api.NewServer(cfg, db, authMgr, tasks, roots, ffmpeg.ExecRunner{}, logger)
 
 	ts := httptest.NewServer(web.Router(srv))
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
-	e := &env{t: t, S: srv, DB: db, Cfg: cfg, TS: ts,
+	e := &env{t: t, S: srv, DB: db, Cfg: cfg, TS: ts, Roots: roots, CfgPath: cfgPath,
 		Client: &http.Client{Jar: jar}, Base: base, Root: root,
 		ArgvLog: filepath.Join(base, "argv.log")}
 	return e
+}
+
+// writeConfigFile writes a minimal config.json holding the allow roots.
+func writeConfigFile(t *testing.T, path string, roots []string) {
+	t.Helper()
+	body, err := json.MarshalIndent(map[string]any{"media_allow_roots": roots}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(body, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeStub(t *testing.T, path, body string) {

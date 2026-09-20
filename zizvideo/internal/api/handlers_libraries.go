@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/media"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/media"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // HandleListLibraries returns every registered library.
@@ -39,7 +39,7 @@ func (s *Server) HandleCreateLibrary(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, domain.New("VALIDATION_NAME", "库名称需 1-64 个字符", 400))
 		return
 	}
-	if _, err := media.ValidateLibraryPath(s.Cfg.MediaAllowRoots, req.RootPath); err != nil {
+	if _, err := media.ValidateLibraryPath(s.Roots.List(), req.RootPath); err != nil {
 		s.audit(r, "library.create", "path:"+req.RootPath, false, errCode(err))
 		s.fail(w, r, err)
 		return
@@ -111,7 +111,7 @@ func (s *Server) HandlePatchLibrary(w http.ResponseWriter, r *http.Request) {
 		patch.Name = &name
 	}
 	if req.RootPath != "" {
-		if _, err := media.ValidateLibraryPath(s.Cfg.MediaAllowRoots, req.RootPath); err != nil {
+		if _, err := media.ValidateLibraryPath(s.Roots.List(), req.RootPath); err != nil {
 			s.fail(w, r, err)
 			return
 		}

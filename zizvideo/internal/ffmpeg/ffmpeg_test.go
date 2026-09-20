@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 // recordingRunner captures the exact argv handed to the process.

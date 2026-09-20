@@ -1,4 +1,4 @@
-module github.com/zizdog/govideo
+module github.com/zizdog/zizvideo
 
 go 1.25
 

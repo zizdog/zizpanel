@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 func newLib(id, name, root string) *domain.Library {
@@ -15,7 +15,7 @@ func newLib(id, name, root string) *domain.Library {
 // TestMigrateCreatesSchemaAndIsIdempotent covers both migration gates: an empty
 // database gets every table, and repeated startups are a no-op.
 func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db", "govideo.db")
+	path := filepath.Join(t.TempDir(), "db", "zizvideo.db")
 
 	db, err := Open(path)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 }
 
 func TestUniqueConstraintsRespectSoftDelete(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "govideo.db"))
+	db, err := Open(filepath.Join(t.TempDir(), "zizvideo.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestUniqueConstraintsRespectSoftDelete(t *testing.T) {
 }
 
 func TestAbandonStaleTasksOnRestart(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "govideo.db"))
+	db, err := Open(filepath.Join(t.TempDir(), "zizvideo.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

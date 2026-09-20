@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/zizdog/govideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/config"
 )
 
 // TestReadyzIsHonestAboutMissingFfmpeg is the anti-lying gate: no ffmpeg means

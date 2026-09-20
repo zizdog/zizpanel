@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 type progressReq struct {

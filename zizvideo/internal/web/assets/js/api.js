@@ -1,6 +1,6 @@
 // API 客户端：统一信封解析 + CSRF 双提交（坑 3：写操作必须带 X-CSRF-Token）
 
-const CSRF_COOKIE = "gv_csrf";
+const CSRF_COOKIE = "zv_csrf";
 
 export class ApiError extends Error {
   constructor(message, code, status) {
@@ -121,4 +121,11 @@ export const api = {
   removeReaction: (id) => request("DELETE", "/api/v1/media/" + encodeURIComponent(id) + "/reactions"),
 
   systemInfo: () => request("GET", "/api/v1/admin/system/info"),
+
+  mediaRoots: () => request("GET", "/api/v1/media/roots"),
+  addMediaRoot: (path) => request("POST", "/api/v1/media/roots", { path }),
+  removeMediaRoot: (path) =>
+    request("DELETE", "/api/v1/media/roots" + queryString({ path })),
+  browse: (path, offset) =>
+    request("GET", "/api/v1/fs/browse" + queryString({ path, offset, limit: 200 })),
 };

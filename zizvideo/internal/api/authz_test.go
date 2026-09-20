@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zizdog/govideo/internal/api"
-	"github.com/zizdog/govideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/api"
+	"github.com/zizdog/zizvideo/internal/domain"
 )
 
 func TestAnonymousRequestsAreRejected(t *testing.T) {

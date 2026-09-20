@@ -13,12 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zizdog/govideo/internal/auth"
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/ffmpeg"
-	"github.com/zizdog/govideo/internal/storage"
-	"github.com/zizdog/govideo/internal/task"
+	"github.com/zizdog/zizvideo/internal/auth"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/ffmpeg"
+	"github.com/zizdog/zizvideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/task"
 )
 
 // Version is the reported build version; overridable with -ldflags.
@@ -30,6 +30,7 @@ type Server struct {
 	DB     *storage.DB
 	Auth   *auth.Manager
 	Tasks  *task.Manager
+	Roots  *config.Roots
 	Runner ffmpeg.Runner
 	Log    *slog.Logger
 
@@ -40,9 +41,10 @@ type Server struct {
 }
 
 // NewServer wires a Server and probes ffmpeg capabilities once at startup.
+// Roots is the single source of truth for media allow roots.
 func NewServer(cfg *config.Config, db *storage.DB, a *auth.Manager, t *task.Manager,
-	r ffmpeg.Runner, log *slog.Logger) *Server {
-	s := &Server{Cfg: cfg, DB: db, Auth: a, Tasks: t, Runner: r, Log: log,
+	roots *config.Roots, r ffmpeg.Runner, log *slog.Logger) *Server {
+	s := &Server{Cfg: cfg, DB: db, Auth: a, Tasks: t, Roots: roots, Runner: r, Log: log,
 		StartedAt: time.Now()}
 	s.RefreshCapabilities(context.Background())
 	return s

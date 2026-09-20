@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zizdog/govideo/internal/config"
-	"github.com/zizdog/govideo/internal/domain"
-	"github.com/zizdog/govideo/internal/ffmpeg"
-	"github.com/zizdog/govideo/internal/storage"
+	"github.com/zizdog/zizvideo/internal/config"
+	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/ffmpeg"
+	"github.com/zizdog/zizvideo/internal/storage"
 )
 
 // fakeTools writes stub ffprobe/ffmpeg scripts so scan tests never touch a real
@@ -24,7 +24,7 @@ func fakeTools(t *testing.T, dir string) (ffprobe, ffmpegBin string) {
 	ffmpegBin = filepath.Join(dir, "ffmpeg")
 	script := `#!/bin/sh
 if [ "$1" = "-version" ]; then echo "ffprobe version 9.0.1-fake Copyright"; exit 0; fi
-if [ -n "$GV_TEST_ARGV_LOG" ]; then printf '%s\n' "$@" >> "$GV_TEST_ARGV_LOG"; fi
+if [ -n "$ZV_TEST_ARZV_LOG" ]; then printf '%s\n' "$@" >> "$ZV_TEST_ARZV_LOG"; fi
 src=""
 for a in "$@"; do src="$a"; done
 case "$src" in
@@ -42,7 +42,7 @@ if [ "$1" = "-version" ]; then echo "ffmpeg version 9.0.1-fake Copyright"; exit 
 if [ "$1" = "-hide_banner" ]; then echo " V....D h264_videotoolbox fake encoder"; exit 0; fi
 out=""
 for a in "$@"; do out="$a"; done
-if [ -n "$GV_TEST_FFMPEG_FAIL" ]; then echo "boom" >&2; exit 1; fi
+if [ -n "$ZV_TEST_FFMPEG_FAIL" ]; then echo "boom" >&2; exit 1; fi
 echo fake-jpeg > "$out"
 `
 	if err := os.WriteFile(ffprobe, []byte(script), 0o755); err != nil {
@@ -61,6 +61,7 @@ type scanEnv struct {
 	lib    *domain.Library
 	root   string
 	argv   string
+	roots  *config.Roots
 	logger *slog.Logger
 }
 
@@ -98,8 +99,10 @@ func newScanEnv(t *testing.T) *scanEnv {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &scanEnv{cfg: cfg, db: db, scan: NewScanner(cfg, db, ffmpeg.ExecRunner{}, logger),
-		lib: lib, root: root, argv: filepath.Join(base, "argv.log"), logger: logger}
+	roots := config.NewRoots("", cfg.MediaAllowRoots)
+	return &scanEnv{cfg: cfg, db: db, roots: roots,
+		scan: NewScanner(cfg, db, roots, ffmpeg.ExecRunner{}, logger),
+		lib:  lib, root: root, argv: filepath.Join(base, "argv.log"), logger: logger}
 }
 
 func (e *scanEnv) write(t *testing.T, rel, body string) {
@@ -170,7 +173,7 @@ func TestScanSkipsUnchangedFilesBySizeAndMtime(t *testing.T) {
 	env := newScanEnv(t)
 	env.write(t, "a.mp4", "a")
 	env.write(t, "b.mp4", "b")
-	t.Setenv("GV_TEST_ARGV_LOG", env.argv)
+	t.Setenv("ZV_TEST_ARZV_LOG", env.argv)
 
 	env.run(t)
 	first := countLines(t, env.argv)
@@ -193,7 +196,7 @@ func TestScanReprobesWhenMtimeChanges(t *testing.T) {
 	env.write(t, "a.mp4", "a")
 	env.run(t)
 
-	t.Setenv("GV_TEST_ARGV_LOG", env.argv)
+	t.Setenv("ZV_TEST_ARZV_LOG", env.argv)
 	p := filepath.Join(env.root, "a.mp4")
 	future := time.Now().Add(2 * time.Second)
 	if err := os.Chtimes(p, future, future); err != nil {
@@ -330,7 +333,7 @@ func TestScannerDoesNotResurrectDeletedRows(t *testing.T) {
 	env.write(t, "a.mp4", "a")
 	env.run(t)
 	_ = os.Remove(env.argv)
-	t.Setenv("GV_TEST_ARGV_LOG", env.argv)
+	t.Setenv("ZV_TEST_ARZV_LOG", env.argv)
 	// Touch nothing; the file is unchanged so it must be skipped, not re-probed.
 	env.run(t)
 	if countLines(t, env.argv) != 0 {
@@ -348,4 +351,29 @@ func countLines(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return len(strings.Split(strings.TrimSpace(string(b)), "\n"))
+}
+
+// TestScannerRefusesLibraryOutsideAllowRoots is the scanner-side guard: even if
+// a scan is queued directly (bypassing the API), a root outside the allow list
+// is refused before any filesystem call, so nothing is walked or probed.
+func TestScannerRefusesLibraryOutsideAllowRoots(t *testing.T) {
+	e := newScanEnv(t)
+	// Remove the only allow root; the library still points at it.
+	e.roots = config.NewRoots("", nil)
+	e.scan.Roots = e.roots
+
+	task := e.run(t)
+	if task.Status != domain.TaskInterrupted {
+		t.Fatalf("状态 = %s, 期望 interrupted", task.Status)
+	}
+	if !strings.Contains(task.Error, "允许根") {
+		t.Fatalf("错误应说明越界: %q", task.Error)
+	}
+	if t.Failed() {
+		return
+	}
+	// A root that does not exist cannot have been traversed.
+	if task.Total != 0 || task.Scanned != 0 {
+		t.Fatalf("越界扫描不得遍历任何文件: %+v", task)
+	}
 }

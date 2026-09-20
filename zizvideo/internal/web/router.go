@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/zizdog/govideo/internal/api"
+	"github.com/zizdog/zizvideo/internal/api"
 )
 
 // assetsFS holds the no-build frontend: plain ESM, hand-written CSS.
@@ -57,6 +57,13 @@ func Router(s *api.Server) http.Handler {
 
 	mux.HandleFunc("GET /api/v1/admin/system/info", s.RequireAdmin(s.HandleSystemInfo))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.RequireAdmin(s.HandleAuditList))
+
+	// Allow roots + the directory picker. The literal "roots" path is registered
+	// before the wildcard, so /media/roots never falls through to /media/{id}.
+	mux.HandleFunc("GET /api/v1/media/roots", s.RequireAdmin(s.HandleListMediaRoots))
+	mux.HandleFunc("POST /api/v1/media/roots", s.RequireAdmin(s.HandleAddMediaRoot))
+	mux.HandleFunc("DELETE /api/v1/media/roots", s.RequireAdmin(s.HandleRemoveMediaRoot))
+	mux.HandleFunc("GET /api/v1/fs/browse", s.RequireAdmin(s.HandleBrowseFS))
 
 	// Unknown API paths must answer JSON, not the SPA shell.
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

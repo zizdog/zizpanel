@@ -1,7 +1,7 @@
 GO      ?= go
 VERSION ?= 0.1.0-mvp
-BIN     ?= dist/govideo
-LDFLAGS := -X github.com/zizdog/govideo/internal/api.Version=$(VERSION)
+BIN     ?= dist/zizvideo
+LDFLAGS := -X github.com/zizdog/zizvideo/internal/api.Version=$(VERSION)
 
 .PHONY: build run test fmt fixtures
 
