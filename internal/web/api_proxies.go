@@ -2895,6 +2895,10 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 	if err != nil {
 		return err
 	}
+	// 规则自己的日志目录也是 nginx 必须打开的本机目录：同样以 worker 身份预检（坑 212）。
+	if err := s.ensureNginxCanReadDir(ctx, s.proxyLogDir(), "反向代理日志目录"); err != nil {
+		return err
+	}
 	snap := s.snapshotVhost(rule.VhostName())
 	// ① 过渡态：旧 vhost 还在磁盘上，它引用的缓存区必须继续有声明，否则提权助手
 	// 跑的 `nginx -t` 会报 unknown "…" zone 并把这次写入整份回滚。

@@ -193,6 +193,10 @@ func (s *Server) applySite(ctx context.Context, site *sites.Site) error {
 	if err != nil {
 		return err
 	}
+	// 写盘前的硬预检：nginx worker 读不到 root 就拒绝写 vhost（坑 212，2026-09-20 事故）。
+	if err := s.ensureNginxCanReadDir(ctx, site.Root, "站点根目录"); err != nil {
+		return err
+	}
 	// 开了回源缓存就先把缓存目录建好并交给真实 worker：拿不到用户如实失败，绝不猜（坑 173）。
 	if site.ProxyCache {
 		if _, err := s.ensureSiteCacheDir(site.ID); err != nil {
