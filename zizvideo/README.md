@@ -1,5 +1,7 @@
 # Zizvideo
 
+> 📄 接手/二次开发请先读 **[HANDOVER.md](HANDOVER.md)**（配置 schema、API 契约、未验证项、fnOS/Docker 适配）。
+
 本地短视频服务：把自己的视频目录扫进 SQLite，用浏览器上下滑着看。
 Go 单二进制 + 内嵌原生 ESM 前端（无构建步骤）+ SQLite（纯 Go 驱动，无 CGO）。
 从 govideo 改名而来；旧数据目录 `~/Library/Application Support/govideo` 需手工迁移（改名不会自动搬）。
