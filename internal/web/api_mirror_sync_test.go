@@ -13,18 +13,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zizdog/zizpanel/internal/upgrade"
 )
 
 // ============================================================================
-//  镜像发布件同步（坑 217，2026-09-20 事故后新增）
+//  镜像发布件同步（坑 217/218）
 //
 //  镜像站文档根在外置盘上、只有面板守护进程有 TCC 授权能写。这个动作的信任链
 //  与在线升级完全一致：清单先验签、资产逐个核 sha256、全部通过才从临时目录就位。
-//  门禁用 httptest 假源覆盖四条：验签失败拒绝写 / 某个资产 sha 不符拒绝写且不留
-//  半截文件 / 成功路径写全布局 / 幂等重跑。
+//  门禁用 httptest 假源覆盖：镜像版清单优先 / 没有则回落并如实提示 / 签名坏一律
+//  拒绝且不留半截文件 / 资产回源站取 / 幂等重跑。
 // ============================================================================
 
 const fakeMirrorVersion = "9.9.9"
@@ -34,18 +35,30 @@ func testSHA256(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-type fakeMirror struct {
-	base      string
-	assetName string
-	manifest  []byte
-	sig       []byte
-	install   []byte
-	asset     []byte
+type fakeMirrorCfg struct {
+	shaOverride  string // 非空：清单里写这个（错的）sha
+	wrongKey     bool   // 用另一把公钥验签
+	withMirror   bool   // 源上提供 manifest-mirror.json
+	mirrorPath   string // 镜像 base 在假源上的路径（默认 /mirror/zizpanel，且不提供资产）
+	badMirrorSig bool   // 镜像版清单用坏签名
+	badSourceSig bool   // 源站清单用坏签名
 }
 
-// startFakeMirror 起一个假发布源。shaOverride 非空时清单里写这个（错的）sha，
-// 用来验证"对不上就失败且不留半截文件"；wrongKey 时用另一把公钥验签。
-func startFakeMirror(t *testing.T, shaOverride string, wrongKey bool) *fakeMirror {
+type fakeMirror struct {
+	base           string
+	mirrorBase     string
+	assetName      string
+	manifest       []byte
+	sig            []byte
+	mirrorManifest []byte
+	mirrorSig      []byte
+	install        []byte
+	asset          []byte
+}
+
+// startFakeMirror 起一个假发布源。镜像版清单的 url 指向 mirrorPath（该路径下**不**提供
+// 资产）：如果同步照清单 url 下载就会 404，从而证明资产确实回源站取（坑 218）。
+func startFakeMirror(t *testing.T, cfg fakeMirrorCfg) *fakeMirror {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -54,7 +67,7 @@ func startFakeMirror(t *testing.T, shaOverride string, wrongKey bool) *fakeMirro
 	// 单测绝不联网升级：把内置发布公钥换成测试公钥。
 	old := upgrade.PubKeyHex
 	t.Cleanup(func() { upgrade.PubKeyHex = old })
-	if wrongKey {
+	if cfg.wrongKey {
 		other, _, oerr := ed25519.GenerateKey(rand.Reader)
 		if oerr != nil {
 			t.Fatal(oerr)
@@ -76,35 +89,73 @@ func startFakeMirror(t *testing.T, shaOverride string, wrongKey bool) *fakeMirro
 	mux.HandleFunc("/download/"+fakeMirrorVersion+"/"+fs.assetName, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(fs.asset)
 	})
+	if cfg.withMirror {
+		mux.HandleFunc("/manifest-mirror.json", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(fs.mirrorManifest) })
+		mux.HandleFunc("/manifest-mirror.json.sig", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(fs.mirrorSig) })
+	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	fs.base = srv.URL
 
 	sha := testSHA256(fs.asset)
-	if shaOverride != "" {
-		sha = shaOverride
+	if cfg.shaOverride != "" {
+		sha = cfg.shaOverride
 	}
-	manifest := map[string]any{
+	fs.manifest = fakeManifestJSON(t, fs.base+"/download/"+fakeMirrorVersion+"/"+fs.assetName, sha)
+	fs.sig = upgrade.SignManifest(priv, fs.manifest)
+	if cfg.badSourceSig {
+		fs.sig[0] ^= 0xFF
+	}
+	if cfg.withMirror {
+		path := cfg.mirrorPath
+		if path == "" {
+			path = "/mirror/zizpanel"
+		}
+		fs.mirrorBase = fs.base + path
+		fs.mirrorManifest = fakeManifestJSON(t, fs.mirrorBase+"/download/"+fakeMirrorVersion+"/"+fs.assetName, sha)
+		fs.mirrorSig = upgrade.SignManifest(priv, fs.mirrorManifest)
+		if cfg.badMirrorSig {
+			fs.mirrorSig[0] ^= 0xFF
+		}
+	}
+	return fs
+}
+
+func fakeManifestJSON(t *testing.T, url, sha string) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
 		"version":      fakeMirrorVersion,
 		"notes":        "测试",
 		"published_at": "2026-09-20T00:00:00Z",
 		"assets": map[string]any{
-			"darwin_arm64": map[string]any{
-				"url":    fs.base + "/download/" + fakeMirrorVersion + "/" + fs.assetName,
-				"sha256": sha,
-				"size":   len(fs.asset),
-			},
+			"darwin_arm64": map[string]any{"url": url, "sha256": sha, "size": 4096},
 		},
-	}
-	fs.manifest, err = json.Marshal(manifest)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	fs.sig = upgrade.SignManifest(priv, fs.manifest)
-	return fs
+	return b
 }
 
-func noopTaskLog(string, string) {}
+type mirrorLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *mirrorLog) log(level, text string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, level+": "+text)
+}
+
+func (l *mirrorLog) has(sub string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Contains(strings.Join(l.lines, "\n"), sub)
+}
+
+// noopMirrorLog 给不检查日志的用例用。
+func noopMirrorLog(string, string) {}
 
 func listLeftovers(t *testing.T, dir string) []string {
 	t.Helper()
@@ -112,12 +163,88 @@ func listLeftovers(t *testing.T, dir string) []string {
 	return left
 }
 
+// assertNothingWritten 断言镜像目录里没有就位的文件、也没留临时目录。
+func assertNothingWritten(t *testing.T, dir string) {
+	t.Helper()
+	for _, rel := range []string{"manifest.json", "manifest.json.sig", "install.sh"} {
+		if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+			t.Errorf("失败时 %s 不许就位（必须整批通过才写）", rel)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "download")); err == nil {
+		t.Error("失败时不许建 download/")
+	}
+	if left := listLeftovers(t, dir); len(left) != 0 {
+		t.Errorf("临时目录必须清干净，残留: %v", left)
+	}
+}
+
+// TestMirrorSyncPrefersMirrorManifest：源上有镜像版清单 ⇒ 写进去的就是它，
+// asset url 指向给定镜像 base，且资产仍回源站取（镜像路径下没有资产）。
+func TestMirrorSyncPrefersMirrorManifest(t *testing.T) {
+	src := startFakeMirror(t, fakeMirrorCfg{withMirror: true})
+	dir := t.TempDir()
+	lg := &mirrorLog{}
+
+	res, err := runMirrorSync(context.Background(), lg.log, dir, src.base, src.mirrorBase)
+	if err != nil {
+		t.Fatalf("有镜像版清单时同步应成功: %v", err)
+	}
+	if res.Manifest != mirrorManifestName {
+		t.Errorf("结果里的清单名 = %q，期望 %q", res.Manifest, mirrorManifestName)
+	}
+	got, rerr := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if rerr != nil {
+		t.Fatalf("读写入的清单失败: %v", rerr)
+	}
+	if string(got) != string(src.mirrorManifest) {
+		t.Error("写进镜像的清单必须原样是镜像版清单（不是源站清单）")
+	}
+	bases := manifestBases(t, got)
+	if len(bases) != 1 || !bases[src.mirrorBase] {
+		t.Errorf("asset url 必须指向镜像 base %s，实际 %v", src.mirrorBase, bases)
+	}
+	if lg.has("镜像分发可能没生效") {
+		t.Error("指向镜像时不该报地址不一致")
+	}
+}
+
+// TestMirrorSyncFallsBackToSourceManifest：源上没有镜像版清单 ⇒ 回落源站清单，
+// 并在日志里如实说明下载地址可能仍指向源站。
+func TestMirrorSyncFallsBackToSourceManifest(t *testing.T) {
+	src := startFakeMirror(t, fakeMirrorCfg{})
+	dir := t.TempDir()
+	mirrorBase := src.base + "/mirror/zizpanel"
+	lg := &mirrorLog{}
+
+	res, err := runMirrorSync(context.Background(), lg.log, dir, src.base, mirrorBase)
+	if err != nil {
+		t.Fatalf("回落源站清单也应能同步: %v", err)
+	}
+	if res.Manifest != "manifest.json" {
+		t.Errorf("结果里的清单名 = %q，期望 manifest.json", res.Manifest)
+	}
+	if !lg.has("源上没有镜像版清单，已用源站清单，下载地址可能仍指向源站") {
+		t.Errorf("回落时必须在日志里如实说明，实际日志:\n%s", strings.Join(lg.lines, "\n"))
+	}
+	got, rerr := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if rerr != nil {
+		t.Fatalf("读写入的清单失败: %v", rerr)
+	}
+	if string(got) != string(src.manifest) {
+		t.Error("没有镜像版清单时就该写源站清单")
+	}
+	if !lg.has("镜像分发可能没生效") {
+		t.Error("源站清单地址与镜像 base 不一致，必须如实报出来（不阻断）")
+	}
+}
+
 // TestMirrorSyncRejectsBadSignature：验签不过时一个字节都不许写进镜像目录。
 func TestMirrorSyncRejectsBadSignature(t *testing.T) {
-	src := startFakeMirror(t, "", true) // 用另一把公钥验签 ⇒ 必失败
+	src := startFakeMirror(t, fakeMirrorCfg{wrongKey: true})
 	dir := t.TempDir()
 
-	res, err := runMirrorSync(context.Background(), noopTaskLog, dir, src.base)
+	res, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase)
 	if err == nil {
 		t.Fatalf("验签失败必须报错，实际成功: %+v", res)
 	}
@@ -135,35 +262,51 @@ func TestMirrorSyncRejectsBadSignature(t *testing.T) {
 	}
 }
 
+// TestMirrorSyncRejectsBothManifestsBadlySigned：两份清单签名都坏（含"镜像版在但签名坏、
+// 不许悄悄回落"与"镜像版没有、源站版也坏"两种）⇒ 拒绝写入、不留半截文件。
+func TestMirrorSyncRejectsBothManifestsBadlySigned(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  fakeMirrorCfg
+	}{
+		{"镜像版清单签名坏", fakeMirrorCfg{withMirror: true, badMirrorSig: true, badSourceSig: true}},
+		{"回落源站清单签名坏", fakeMirrorCfg{badSourceSig: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := startFakeMirror(t, tc.cfg)
+			dir := t.TempDir()
+			_, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase)
+			if err == nil {
+				t.Fatal("签名坏必须拒绝写入")
+			}
+			if !strings.Contains(err.Error(), "验签") {
+				t.Errorf("错误里必须说清是验签失败，实际: %v", err)
+			}
+			assertNothingWritten(t, dir)
+		})
+	}
+}
+
 // TestMirrorSyncRejectsAssetSHA256Mismatch：某个资产 sha 不符 ⇒ 失败，且不留半截文件。
 func TestMirrorSyncRejectsAssetSHA256Mismatch(t *testing.T) {
-	src := startFakeMirror(t, strings.Repeat("0", 64), false)
+	src := startFakeMirror(t, fakeMirrorCfg{shaOverride: strings.Repeat("0", 64)})
 	dir := t.TempDir()
 
-	res, err := runMirrorSync(context.Background(), noopTaskLog, dir, src.base)
+	res, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase)
 	if err == nil {
 		t.Fatalf("资产 sha 不符必须报错，实际成功: %+v", res)
 	}
 	// 校验不通过 ⇒ 什么都没就位（连已经验过签的 manifest.json 也不许先落）
-	for _, rel := range []string{"manifest.json", "manifest.json.sig", "install.sh"} {
-		if _, serr := os.Stat(filepath.Join(dir, rel)); serr == nil {
-			t.Errorf("资产校验失败时 %s 不许就位（必须整批通过才写）", rel)
-		}
-	}
-	if _, serr := os.Stat(filepath.Join(dir, "download", fakeMirrorVersion)); serr == nil {
-		t.Error("下载失败时不许留下 download/<版本>/")
-	}
-	if left := listLeftovers(t, dir); len(left) != 0 {
-		t.Errorf("临时目录必须清干净，残留: %v", left)
-	}
+	assertNothingWritten(t, dir)
 }
 
 // TestMirrorSyncWritesFullLayout：成功路径写全布局（顶层 + download/<版本>/ + latest）。
 func TestMirrorSyncWritesFullLayout(t *testing.T) {
-	src := startFakeMirror(t, "", false)
+	src := startFakeMirror(t, fakeMirrorCfg{withMirror: true})
 	dir := t.TempDir()
 
-	res, err := runMirrorSync(context.Background(), noopTaskLog, dir, src.base)
+	res, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase)
 	if err != nil {
 		t.Fatalf("同步应成功: %v", err)
 	}
@@ -172,8 +315,8 @@ func TestMirrorSyncWritesFullLayout(t *testing.T) {
 	}
 	latestName := "zizpanel_latest_darwin_arm64.tar.gz"
 	want := map[string][]byte{
-		"manifest.json":     src.manifest,
-		"manifest.json.sig": src.sig,
+		"manifest.json":     src.mirrorManifest,
+		"manifest.json.sig": src.mirrorSig,
 		"install.sh":        src.install,
 		filepath.Join("download", fakeMirrorVersion, src.assetName): src.asset,
 		filepath.Join("download", "latest", latestName):             src.asset,
@@ -204,7 +347,7 @@ func TestMirrorSyncWritesFullLayout(t *testing.T) {
 
 // TestMirrorSyncIdempotent：重复跑结果一致（覆盖同版本同 sha 的文件）。
 func TestMirrorSyncIdempotent(t *testing.T) {
-	src := startFakeMirror(t, "", false)
+	src := startFakeMirror(t, fakeMirrorCfg{withMirror: true})
 	dir := t.TempDir()
 
 	snap := func() map[string]string {
@@ -227,7 +370,7 @@ func TestMirrorSyncIdempotent(t *testing.T) {
 		return out
 	}
 
-	if _, err := runMirrorSync(context.Background(), noopTaskLog, dir, src.base); err != nil {
+	if _, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase); err != nil {
 		t.Fatalf("第一次同步应成功: %v", err)
 	}
 	first := snap()
@@ -239,7 +382,7 @@ func TestMirrorSyncIdempotent(t *testing.T) {
 	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runMirrorSync(context.Background(), noopTaskLog, dir, src.base); err != nil {
+	if _, err := runMirrorSync(context.Background(), noopMirrorLog, dir, src.base, src.mirrorBase); err != nil {
 		t.Fatalf("第二次同步应成功: %v", err)
 	}
 	second := snap()
@@ -259,7 +402,9 @@ func TestMirrorSyncIdempotent(t *testing.T) {
 // TestMirrorSyncEndpointAsyncAndAdmin：接口走任务中心（202 + task_id）且真能同步成功。
 func TestMirrorSyncEndpointAsyncAndAdmin(t *testing.T) {
 	srv, ts := newTestServer(t)
-	src := startFakeMirror(t, "", false)
+	src := startFakeMirror(t, fakeMirrorCfg{withMirror: true})
+	// 镜像基址与假源的镜像 base 对齐：面板自证应认为地址指向镜像自己。
+	srv.Cfg.MirrorBase = strings.TrimSuffix(src.mirrorBase, "/zizpanel")
 	dir := t.TempDir()
 	cookies := loginTestPanel(t, ts)
 
@@ -273,12 +418,30 @@ func TestMirrorSyncEndpointAsyncAndAdmin(t *testing.T) {
 	if string(tk.Status()) != "succeeded" {
 		t.Fatalf("假源同步应成功，实际 %s：%v", tk.Status(), tk.Meta().Error)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
-		t.Errorf("任务成功后镜像目录里必须有 manifest.json: %v", err)
+	got, rerr := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if rerr != nil {
+		t.Fatalf("任务成功后镜像目录里必须有 manifest.json: %v", rerr)
+	}
+	if string(got) != string(src.mirrorManifest) {
+		t.Error("接口路径也必须写镜像版清单")
 	}
 	// 没配目录、请求体也空 → 明确 4xx，不猜
 	res, out, _ = doJSON(t, ts, "POST", "/api/v1/system/mirror/sync", map[string]any{}, cookies)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("没给目录必须 400 并提示去设置里填，实际 %d: %v", res.StatusCode, out)
 	}
+}
+
+// manifestBases 解析清单并汇总 asset url 指向的 base（供门禁断言）。
+func manifestBases(t *testing.T, data []byte) map[string]bool {
+	t.Helper()
+	m, err := upgrade.ParseManifest(data)
+	if err != nil {
+		t.Fatalf("解析清单失败: %v", err)
+	}
+	out := map[string]bool{}
+	for _, ref := range m.Assets {
+		out[mirrorURLBase(ref.URL)] = true
+	}
+	return out
 }

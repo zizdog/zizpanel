@@ -10,8 +10,9 @@
 #
 # 地址由调用者提供，仓库里不留任何内网默认值。
 # 用法：
-#   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / 镜像机）
+#   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / 镜像站）
 #   ZIZDOG_VPS_PASS='...' bash tools/publish-release.sh push-zizdog
+#     # 同时把"镜像版清单"作为 manifest-mirror.json(.sig) 放到源站，供面板镜像同步优先取用（坑 218）
 #   NAS_HOST='<你的镜像机>' NAS_USER='<用户>' NAS_ROOT='<镜像目录>' \
 #     bash tools/publish-release.sh push-nas    # 走 SSH 密钥
 #   bash tools/publish-release.sh verify        # 复验公网：HTTP + sha256 + Ed25519 验签
@@ -150,17 +151,22 @@ cmd_push_zizdog() {
   command -v sshpass >/dev/null 2>&1 || die "需要 sshpass（brew install hudochenkov/sshpass/sshpass）"
   local v; v="$(version)"
   [ -f "$RELDIR/manifest-zizdog.json" ] || die "先跑 build（缺 manifest-zizdog.json）"
+  [ -f "$RELDIR/manifest-nas.json" ] || die "先跑 build（缺 manifest-nas.json）"
 
   info "上传发布件到 $ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT"
   # 公网清单必须**重新命名回 manifest.json** 再上传：面板只认这个名字。
   cp "$RELDIR/manifest-zizdog.json" "$RELDIR/manifest.json"
   cp "$RELDIR/manifest-zizdog.json.sig" "$RELDIR/manifest.json.sig"
+  # 镜像版清单也放源上同目录：面板镜像同步优先取它，否则会写入指向源站的清单（坑 218）。
+  cp "$RELDIR/manifest-nas.json" "$RELDIR/manifest-mirror.json"
+  cp "$RELDIR/manifest-nas.json.sig" "$RELDIR/manifest-mirror.json.sig"
   zizdog_scp \
     "$RELDIR/zizpanel_${v}_darwin_arm64.tar.gz" \
     "$RELDIR/zizpanel_${v}_darwin_amd64.tar.gz" \
     "$RELDIR/zizpanel_latest_darwin_arm64.tar.gz" \
     "$RELDIR/zizpanel_latest_darwin_amd64.tar.gz" \
     "$RELDIR/manifest.json" "$RELDIR/manifest.json.sig" \
+    "$RELDIR/manifest-mirror.json" "$RELDIR/manifest-mirror.json.sig" \
     install.sh uninstall.sh \
     "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/" || die "scp 上传失败"
 
@@ -169,11 +175,11 @@ cmd_push_zizdog() {
     mkdir -p download/$v download/latest; \
     cp -f zizpanel_${v}_darwin_arm64.tar.gz zizpanel_${v}_darwin_amd64.tar.gz download/$v/; \
     cp -f zizpanel_latest_darwin_arm64.tar.gz zizpanel_latest_darwin_amd64.tar.gz download/latest/; \
-    chmod 644 manifest.json manifest.json.sig zizpanel_*.tar.gz download/$v/* download/latest/* 2>/dev/null || true; \
+    chmod 644 manifest.json manifest.json.sig manifest-mirror.json manifest-mirror.json.sig zizpanel_*.tar.gz download/$v/* download/latest/* 2>/dev/null || true; \
     chmod 755 install.sh uninstall.sh; \
     chown -R www:www . 2>/dev/null || true; \
-    ls -l manifest.json install.sh download/$v" || die "远端布局/权限失败"
-  ok "已推送（远端 download/$v/ 已就位）"
+    ls -l manifest.json manifest-mirror.json install.sh download/$v" || die "远端布局/权限失败"
+  ok "已推送（远端 download/$v/ 已就位；镜像版清单 = manifest-mirror.json）"
 }
 
 cmd_push_nas() {
@@ -218,6 +224,17 @@ cmd_verify() {
   local pub; pub="$(remote_pubkey)" || die "取公钥失败"
   verify_sig "$tmp/manifest.json" "$tmp/manifest.json.sig" "$pub" || die "公网清单验签失败"
   grep -q "\"version\": \"$v\"" "$tmp/manifest.json" || die "公网清单版本不是 ${v}：$(head -c 200 "$tmp/manifest.json")"
+
+  # 镜像版清单：面板镜像同步优先取它；地址若还指向源站，镜像就白建了（坑 218）。
+  info "复验源上的镜像版清单 manifest-mirror.json"
+  curl -fsS --max-time 30 "$ZIZDOG_URL/manifest-mirror.json" -o "$tmp/manifest-mirror.json" || die "镜像版清单下载失败（push-zizdog 负责上传）"
+  curl -fsS --max-time 30 "$ZIZDOG_URL/manifest-mirror.json.sig" -o "$tmp/manifest-mirror.json.sig" || die "镜像版清单签名下载失败"
+  verify_sig "$tmp/manifest-mirror.json" "$tmp/manifest-mirror.json.sig" "$pub" || die "镜像版清单验签失败"
+  grep -q "\"version\": \"$v\"" "$tmp/manifest-mirror.json" || die "镜像版清单版本不是 ${v}"
+  if grep -qF "$ZIZDOG_URL" "$tmp/manifest-mirror.json"; then
+    die "镜像版清单里的下载地址仍指向源站 $ZIZDOG_URL：镜像不会参与分发"
+  fi
+  ok "镜像版清单可用（签名有效、版本 ${v}、地址不指向源站）"
 
   local arch file url want got
   for arch in arm64 amd64; do
