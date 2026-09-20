@@ -232,7 +232,7 @@ cmd_verify() {
   verify_sig "$tmp/manifest-mirror.json" "$tmp/manifest-mirror.json.sig" "$pub" || die "镜像版清单验签失败"
   grep -q "\"version\": \"$v\"" "$tmp/manifest-mirror.json" || die "镜像版清单版本不是 ${v}"
   if grep -qF "$ZIZDOG_URL" "$tmp/manifest-mirror.json"; then
-    die "镜像版清单里的下载地址仍指向源站 $ZIZDOG_URL：镜像不会参与分发"
+    die "镜像版清单里的下载地址仍指向源站 ${ZIZDOG_URL}：镜像不会参与分发"
   fi
   ok "镜像版清单可用（签名有效、版本 ${v}、地址不指向源站）"
 
