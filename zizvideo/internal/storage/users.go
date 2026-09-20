@@ -43,6 +43,36 @@ func (db *DB) CreateUser(u *domain.User) error {
 	return nil
 }
 
+// CreateUserWithDefaults 自助注册专用：建用户 + 写默认可见库授权在同一事务里，
+// 失败整体回滚（不许"用户建了、授权没写"）。管理员建号走 CreateUser，不继承。
+func (db *DB) CreateUserWithDefaults(u *domain.User) error {
+	now := domain.NowString()
+	u.CreatedAt = now
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO users
+		(id, username, display_name, password_hash, role, status, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?)`,
+		u.ID, u.Username, u.DisplayName, u.PasswordHash, u.Role, u.Status, now, now); err != nil {
+		return fmt.Errorf("创建用户失败: %w", err)
+	}
+	ids, err := defaultLibraryIDs(tx)
+	if err != nil {
+		return err
+	}
+	for _, libID := range ids {
+		if _, err := tx.Exec(`INSERT INTO user_libraries (user_id, library_id, source, created_at)
+			VALUES (?,?, 'default', ?) ON CONFLICT(user_id, library_id) DO NOTHING`,
+			u.ID, libID, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // GetUserByUsername finds a live account by its unique name.
 func (db *DB) GetUserByUsername(username string) (*domain.User, error) {
 	row := db.QueryRow(`SELECT `+userCols+` FROM users WHERE username = ? AND deleted_at IS NULL`, username)

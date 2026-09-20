@@ -49,15 +49,16 @@ type User struct {
 
 // Library is a registered media root.
 type Library struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	RootPath    string   `json:"root_path"`
-	Recursive   bool     `json:"recursive"`
-	Enabled     bool     `json:"enabled"`
-	IgnoreRules []string `json:"ignore_rules"`
-	MountID     string   `json:"-"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	RootPath           string   `json:"root_path"`
+	Recursive          bool     `json:"recursive"`
+	Enabled            bool     `json:"enabled"`
+	IgnoreRules        []string `json:"ignore_rules"`
+	DefaultForNewUsers bool     `json:"default_for_new_users"`
+	MountID            string   `json:"-"`
+	CreatedAt          string   `json:"created_at"`
+	UpdatedAt          string   `json:"updated_at"`
 }
 
 // Codecs holds the stream codec names we act on.

@@ -20,6 +20,13 @@ export function mountMe(view, options) {
     kv("显示名", user.display_name),
     kv("角色", user.role === "admin" ? "管理员" : "普通用户"),
     kv("上次登录", user.last_login_at ? fmtDate(user.last_login_at) : "首次"));
+  // 可访问媒体库：数值来自唯一判据的 /me/libraries（P3 / B.6）
+  const libraryLine = kv("可访问媒体库", "-");
+  account.append(libraryLine);
+  api.myLibraries().then((list) => {
+    const n = Array.isArray(list) ? list.length : 0;
+    libraryLine.lastChild.textContent = n ? (n + " 个") : "未授权任何媒体库";
+  }).catch(() => { libraryLine.lastChild.textContent = "未复核"; });
 
   // 播放设置就地展开：与首页 ⚙ 共用同一份控件与 PATCH /api/v1/feed/settings，不跳走。
   let playSettings = normalizeFeedSettings();

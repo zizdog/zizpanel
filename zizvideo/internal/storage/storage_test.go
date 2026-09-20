@@ -188,8 +188,9 @@ func TestMigration0006FailClosed(t *testing.T) {
 		t.Fatalf("从 0005 升级失败: %v", err)
 	}
 	defer db.Close()
-	if v, _ := db.SchemaVersion(); v != 6 {
-		t.Fatalf("schema 版本 = %d, 期望 6", v)
+	// 0006（库授权）+ 0007（默认可见库/source）都跑完，版本是 7。
+	if v, _ := db.SchemaVersion(); v != 7 {
+		t.Fatalf("schema 版本 = %d, 期望 7", v)
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_libraries'`).
@@ -285,4 +286,74 @@ func TestUserLibrariesCascadeAndSoftDelete(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("硬删用户应 CASCADE 清授权行: %d", rows)
 	}
+}
+
+// TestMigration0007DefaultsAndSource：0007 加列、source CHECK、自助注册同事务继承。
+func TestMigration0007DefaultsAndSource(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "zizvideo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var cols int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM pragma_table_info('media_libraries')
+		WHERE name = 'default_for_new_users'`).Scan(&cols); err != nil || cols != 1 {
+		t.Fatalf("default_for_new_users 列缺失: n=%d err=%v", cols, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM pragma_table_info('user_libraries')
+		WHERE name = 'source'`).Scan(&cols); err != nil || cols != 1 {
+		t.Fatalf("source 列缺失: n=%d err=%v", cols, err)
+	}
+	if _, err := db.Exec(`INSERT INTO user_libraries (user_id, library_id, source, created_at)
+		VALUES ('u','l','bogus','now')`); err == nil {
+		t.Fatal("source CHECK 未拦住非法值")
+	}
+
+	l1, l2 := newLib("lib_1", "L1", "/tmp/l1"), newLib("lib_2", "L2", "/tmp/l2")
+	for _, l := range []*domain.Library{l1, l2} {
+		if err := db.CreateLibrary(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ids, err := db.DefaultLibraryIDs(); err != nil || len(ids) != 0 {
+		t.Fatalf("未设置默认库时必须为空（fail-closed）: %v err=%v", ids, err)
+	}
+	l1.DefaultForNewUsers = true
+	if _, err := db.UpdateLibrary(l1.ID, LibraryPatch{DefaultForNewUsers: &l1.DefaultForNewUsers}); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := db.DefaultLibraryIDs(); len(ids) != 1 || ids[0] != l1.ID {
+		t.Fatalf("默认库集合 = %v, 期望 [%s]", ids, l1.ID)
+	}
+
+	self := &domain.User{ID: "usr_self", Username: "self", PasswordHash: "x",
+		Role: domain.RoleUser, Status: domain.StatusActive}
+	if err := db.CreateUserWithDefaults(self); err != nil {
+		t.Fatal(err)
+	}
+	if src := grantSourceRow(t, db, self.ID, l1.ID); src != "default" {
+		t.Fatalf("自助注册继承 source = %q, 期望 default", src)
+	}
+	manual := &domain.User{ID: "usr_manual", Username: "manual", PasswordHash: "x",
+		Role: domain.RoleUser, Status: domain.StatusActive}
+	if err := db.CreateUser(manual); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM user_libraries WHERE user_id = ?`, manual.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("管理员建号不应继承: %d 行", rows)
+	}
+}
+
+func grantSourceRow(t *testing.T, db *DB, userID, libraryID string) string {
+	t.Helper()
+	var src string
+	if err := db.QueryRow(`SELECT source FROM user_libraries WHERE user_id = ? AND library_id = ?`,
+		userID, libraryID).Scan(&src); err != nil {
+		t.Fatal(err)
+	}
+	return src
 }

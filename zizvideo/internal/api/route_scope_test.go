@@ -163,3 +163,17 @@ func TestLibraryScopeConstructedOnlyInAuthz(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestSourceNotInScopeCriteria：user_libraries.source 只做显示/审计，
+// 判据文件里出现它就是第二个过滤分支（B.8 不变量 / D.5）。
+func TestSourceNotInScopeCriteria(t *testing.T) {
+	for _, name := range []string{"authz.go", filepath.Join("..", "domain", "scope.go")} {
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(strings.ToLower(string(body)), "source") {
+			t.Errorf("%s 出现 source：来源不得参与可见性判据", name)
+		}
+	}
+}

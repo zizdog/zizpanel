@@ -20,11 +20,12 @@ func (s *Server) HandleListLibraries(w http.ResponseWriter, r *http.Request) {
 }
 
 type libraryReq struct {
-	Name        string   `json:"name"`
-	RootPath    string   `json:"root_path"`
-	Recursive   *bool    `json:"recursive"`
-	Enabled     *bool    `json:"enabled"`
-	IgnoreRules []string `json:"ignore_rules"`
+	Name               string   `json:"name"`
+	RootPath           string   `json:"root_path"`
+	Recursive          *bool    `json:"recursive"`
+	Enabled            *bool    `json:"enabled"`
+	IgnoreRules        []string `json:"ignore_rules"`
+	DefaultForNewUsers *bool    `json:"default_for_new_users"`
 }
 
 // HandleCreateLibrary registers a media root after full path validation.
@@ -127,6 +128,9 @@ func (s *Server) HandlePatchLibrary(w http.ResponseWriter, r *http.Request) {
 	if req.IgnoreRules != nil {
 		rules := req.IgnoreRules
 		patch.IgnoreRules = &rules
+	}
+	if req.DefaultForNewUsers != nil {
+		patch.DefaultForNewUsers = req.DefaultForNewUsers
 	}
 	lib, err := s.DB.UpdateLibrary(id, patch)
 	if err != nil {

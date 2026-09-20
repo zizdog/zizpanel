@@ -9,18 +9,19 @@ import (
 )
 
 const libCols = `id, name, root_path, recursive, enabled, ignore_rules,
-	COALESCE(mount_id,''), created_at, updated_at`
+	default_for_new_users, COALESCE(mount_id,''), created_at, updated_at`
 
 func scanLibrary(s interface{ Scan(...any) error }) (*domain.Library, error) {
 	var l domain.Library
-	var recursive, enabled int
+	var recursive, enabled, defaultNew int
 	var rules string
 	if err := s.Scan(&l.ID, &l.Name, &l.RootPath, &recursive, &enabled, &rules,
-		&l.MountID, &l.CreatedAt, &l.UpdatedAt); err != nil {
+		&defaultNew, &l.MountID, &l.CreatedAt, &l.UpdatedAt); err != nil {
 		return nil, err
 	}
 	l.Recursive = recursive != 0
 	l.Enabled = enabled != 0
+	l.DefaultForNewUsers = defaultNew != 0
 	l.IgnoreRules = []string{}
 	if rules != "" {
 		_ = json.Unmarshal([]byte(rules), &l.IgnoreRules)
@@ -94,12 +95,13 @@ func (db *DB) ListEnabledLibraries() ([]domain.Library, error) {
 
 // LibraryPatch is a partial library update.
 type LibraryPatch struct {
-	Name        *string
-	RootPath    *string
-	Recursive   *bool
-	Enabled     *bool
-	IgnoreRules *[]string
-	MountID     *string
+	Name               *string
+	RootPath           *string
+	Recursive          *bool
+	Enabled            *bool
+	IgnoreRules        *[]string
+	DefaultForNewUsers *bool
+	MountID            *string
 }
 
 // UpdateLibrary applies a partial update and returns the fresh row.
@@ -125,6 +127,10 @@ func (db *DB) UpdateLibrary(id string, p LibraryPatch) (*domain.Library, error) 
 	if p.IgnoreRules != nil {
 		sets = append(sets, "ignore_rules = ?")
 		args = append(args, encodeRules(*p.IgnoreRules))
+	}
+	if p.DefaultForNewUsers != nil {
+		sets = append(sets, "default_for_new_users = ?")
+		args = append(args, boolToInt(*p.DefaultForNewUsers))
 	}
 	if p.MountID != nil {
 		sets = append(sets, "mount_id = ?")

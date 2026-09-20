@@ -14,9 +14,9 @@
 | B 库级授权 | **做，且是最高优先级**。fail-closed：普通用户默认 0 个库；管理员全见 | 迁移 `0006`、新增 `authz.go` |
 | B 越权返回码 | **一律 404**（与"不存在"不可区分）；列表类**静默过滤**不报错 | `domain.ErrNotFound`（`domain.go:173`） |
 | C 库分组 + 按组授权 | **本轮不做**（用户 2026-09-20 决定）；诉求改用下面的"新用户默认可见库"满足 | 见 C |
-| 新用户默认可见库（替代分组） | **做**。`media_libraries.default_for_new_users=1` 的集合；空集合 = 未设置（fail-closed）；自助注册时**同事务**写成显式授权（`user_libraries.source='default'`），之后改开关**不追溯** | `0008`、`authz.go`、`handlers_admin.go:84` |
+| 新用户默认可见库（替代分组） | **做**。`media_libraries.default_for_new_users=1` 的集合；空集合 = 未设置（fail-closed）；自助注册时**同事务**写成显式授权（`user_libraries.source='default'`），之后改开关**不追溯** | `0007`、`authz.go`、`handlers_admin.go:84` |
 | 迁移默认 | 老库升级后历史普通用户**被挡在门外**（有意），配一键补授兜底 | `0006` + 管理端入口 |
-| 任务载体 | 跨库识别任务**新建 `job_tasks`**，不复用 `scan_tasks`（后者 `library_id NOT NULL` + 外键指向单库，装不下跨库任务；现有去重已因此把 `library_id` 塞成 `found[0]`，`handlers_admin.go:273`） | 迁移 `0007` |
+| 任务载体 | 跨库识别任务**新建 `job_tasks`**，不复用 `scan_tasks`（后者 `library_id NOT NULL` + 外键指向单库，装不下跨库任务；现有去重已因此把 `library_id` 塞成 `found[0]`，`handlers_admin.go:273`） | 迁移 `0008` |
 
 ---
 
@@ -275,10 +275,10 @@ WHERE ul.user_id = ?
 
 **目标**：管理员勾若干个库为"新注册用户默认可看"；自助注册的用户自动获得这些库；**不引入任何"组"概念**。
 
-**数据模型（迁移草案 `0008_default_visible.sql`）**：
+**数据模型（迁移草案 `0007_default_visible.sql`）**：
 
 ```sql
--- 0008_default_visible: 默认可见库（给新注册用户）+ 授权来源标记。
+-- 0007_default_visible: 默认可见库（给新注册用户）+ 授权来源标记。
 -- 默认可见库集合 = media_libraries.default_for_new_users=1 的行；空集合 = 未设置（fail-closed）。
 ALTER TABLE media_libraries ADD COLUMN default_for_new_users INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_libraries_default_new ON media_libraries(default_for_new_users)
@@ -329,7 +329,7 @@ ALTER TABLE user_libraries ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'
 - 作用域：只处理 `role='user'` 且 `user_libraries` 行数为 0 的用户；已有任何授权的用户**跳过**（不追加、不覆盖）；
 - 写入：把当前默认库逐行 `INSERT ... ON CONFLICT DO NOTHING`，`source='default'`（幂等）；
 - 确认：二次确认弹窗显示预估 `将影响 N 个未授权用户（共 M 个用户）`；
-- 结果如实：走 `job_tasks`（迁移 `0007`，kind=`default_backfill`，202+`task_id`），终态含 `{users_total, users_granted, users_skipped, rows_written}`；部分失败 ⇒ `status='failed'` + `error` 非空（A.5 语义）；
+- 结果如实：P3 先**同步**返回 200（用户数很少）；`job_tasks`（迁移 `0008`）落地后再切 202+`task_id`，终态含 `{users_total, users_granted, users_skipped, rows_written}`；部分失败 ⇒ `status='failed'` + `error` 非空（A.5 语义）；
 - 文案：结果 `已补发 N 个用户，跳过 M 个`（≤40 字）；幂等：重复点第二次 `users_granted=0`。
 
 ---
@@ -362,7 +362,7 @@ ALTER TABLE user_libraries ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'
 | 只填未识别 | 预置空 season/episode → detect confirm 后填充；再跑一次 `changed=0 && updated=0` | `handlers_series.go:422`、`series.go:277` |
 | 不覆盖 manual | 先 `PUT .../order` 标 manual（`series.go:361-363`）→ detect confirm → `manual_skipped≥1` 且该行 season/episode 不变 | `series.go:268-292` |
 | 批量幂等 | 批量 confirm 连跑两次：第 2 次 `updated=0`；`series_ids` 子集不影响其它剧场 | 新端点 |
-| 后台失败如实 | 注入 DB 错误 → `job_tasks.status='failed'` 且 `error!=''`；`degraded=1` 时 `degrade_reason` 非空 | 迁移 `0007` + A.5 |
+| 后台失败如实 | 注入 DB 错误 → `job_tasks.status='failed'` 且 `error!=''`；`degraded=1` 时 `degrade_reason` 非空 | 迁移 `0008` + A.5 |
 | 解析表 | 复用 `internal/media/episode_test.go`（≥20 条真实命名，含 `Movie.2023.1080p.x265.mp4` 不得识别成 2023/1080） | 现有 |
 
 ### D.3 迁移类
@@ -403,8 +403,8 @@ ALTER TABLE user_libraries ADD COLUMN source TEXT NOT NULL DEFAULT 'admin'
 | 阶段 | 内容 | 产出 | 独立验收 | 估时 |
 |---|---|---|---|---|
 | **P1（最大风险，先做）** | 迁移 `0006`；`authz.go` 判据；storage scope 签名改造；B.4 的 16 条用户路径 + `/me/libraries`；矩阵与路由门禁 | 16 条路径 + 4 汇点全部收敛 | 矩阵全绿 + 真机三用户（admin/alice/carol） | 1.5–2 轮 |
-| **P2** | 迁移 `0007 job_tasks`；`detect` 内核抽取；批量接口；扫描结束补齐；前端按钮与进度 | A 全套 | 幂等 / manual / 失败如实门禁 | 1 轮 |
-| **P3** | 迁移 `0008`（`default_for_new_users` + `user_libraries.source`）；用户库权限抽屉 + 回读；库上的「新注册用户默认可看」开关 + 未设置提示；注册继承（同事务快照）；「补发默认可见库」 | B 全套（含替代分组的 B.8） | D.5 八条门禁绿 + 勾选保存后回读一致 | 1 轮 |
+| **P2** | 迁移 `0008 job_tasks`；`detect` 内核抽取；批量接口；扫描结束补齐；前端按钮与进度 | A 全套 | 幂等 / manual / 失败如实门禁 | 1 轮 |
+| **P3** | 迁移 `0007`（`default_for_new_users` + `user_libraries.source`）；用户库权限抽屉 + 回读；库上的「新注册用户默认可看」开关 + 未设置提示；注册继承（同事务快照）；「补发默认可见库」 | B 全套（含替代分组的 B.8） | D.5 八条门禁绿 + 勾选保存后回读一致 | 1 轮 |
 
 > **C 取消后阶段从 4 段缩成 3 段**：原 P4（分组）整体删除，其中"默认可见库 + 注册继承 + 补发 +
 > 用户授权界面"并入 **P3**；**P1/P2 不变**。P3 因此从 0.5 轮上调为 **1 轮**：它多碰一处**注册写路径**

@@ -97,6 +97,11 @@ export const api = {
   users: () => request("GET", "/api/v1/users"),
   createUser: (body) => request("POST", "/api/v1/users", body),
   updateUser: (id, body) => request("PATCH", "/api/v1/users/" + encodeURIComponent(id), body),
+  userLibraries: (id) => request("GET", "/api/v1/admin/users/" + encodeURIComponent(id) + "/libraries"),
+  setUserLibraries: (id, libraryIds) =>
+    request("PUT", "/api/v1/admin/users/" + encodeURIComponent(id) + "/libraries", { library_ids: libraryIds }),
+  defaultLibraries: () => request("GET", "/api/v1/admin/libraries/defaults"),
+  backfillDefaults: () => request("POST", "/api/v1/admin/libraries/defaults/backfill", { confirm: true }),
 
   libraries: () => request("GET", "/api/v1/libraries"),
   library: (id) => request("GET", "/api/v1/libraries/" + encodeURIComponent(id)),

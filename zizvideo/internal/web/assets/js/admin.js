@@ -69,7 +69,16 @@ function isUnder(path, roots) {
 function mountLibraries(root) {
   const note = banner();
   const timers = [];
-  const { table, body } = gridOf(["名称", "根目录", "递归", "启用", "创建时间", "操作"]);
+  const { table, body } = gridOf(["名称", "根目录", "递归", "启用", "新用户默认可看", "创建时间", "操作"]);
+  // 未设置默认库 = 新用户看不到任何内容（fail-closed），常驻提示（B.8）。
+  const defaultHint = el("div", {
+    class: "banner", hidden: true, dataset: { role: "default-unset-hint" },
+    text: "未设置新用户默认可看库，新用户看不到任何内容",
+  });
+  const backfillInfo = el("div", { class: "muted", dataset: { role: "backfill-info" } });
+  const backfill = el("button", {
+    class: "btn", type: "button", text: "把默认可见库补发给未授权用户", dataset: { role: "backfill-defaults" },
+  });
   const nameInput = input({ placeholder: "名称", required: true });
   const pathInput = input({ placeholder: "根目录，例如 /Users/me/Videos", required: true });
   const recursive = el("input", { type: "checkbox", checked: true });
@@ -141,17 +150,33 @@ function mountLibraries(root) {
     renderHint();
   }
 
+  async function loadBackfill() {
+    try {
+      const data = await api.defaultLibraries();
+      const unset = (Number(data && data.default_count) || 0) === 0;
+      const pending = Number(data && data.users_without_libraries) || 0;
+      const total = Number(data && data.users_total) || 0;
+      defaultHint.hidden = !unset;
+      backfillInfo.textContent = unset ? "未设置默认可见库，无法补发"
+        : "将影响 " + pending + " 个未授权用户（共 " + total + " 个用户）";
+      backfill.disabled = unset || pending === 0;
+    } catch (err) {
+      backfillInfo.textContent = "";
+    }
+  }
+
   async function refresh() {
     setBanner(note, "");
     try {
       const result = await api.libraries();
       const list = result && Array.isArray(result.list) ? result.list : [];
       clear(body);
-      if (!list.length) body.append(emptyRow(6, "暂无媒体库"));
+      if (!list.length) body.append(emptyRow(7, "暂无媒体库"));
       for (const library of list) body.append(libraryRow(library));
     } catch (err) {
       setBanner(note, err && err.message ? err.message : "加载失败");
     }
+    await loadBackfill();
   }
 
   function pollScan(taskId, line) {
@@ -199,8 +224,26 @@ function mountLibraries(root) {
         catch (err) { setBanner(note, err && err.message ? err.message : "删除失败"); }
       }, "danger"));
     const holder = el("td", null, actions, line);
+    const isDefault = el("input", {
+      type: "checkbox", checked: !!library.default_for_new_users,
+      dataset: { role: "default-for-new-users", id: library.id },
+    });
+    isDefault.addEventListener("change", async () => {
+      setBanner(note, "");
+      isDefault.disabled = true;
+      try {
+        await api.updateLibrary(library.id, { default_for_new_users: isDefault.checked });
+        await refresh();
+      } catch (err) {
+        isDefault.checked = !isDefault.checked;
+        setBanner(note, err && err.message ? err.message : "保存失败");
+      } finally {
+        isDefault.disabled = false;
+      }
+    });
     return rowOf([library.name, library.root_path, library.recursive ? "是" : "否",
-      library.enabled ? "是" : "否", fmtDate(library.created_at), holder]);
+      library.enabled ? "是" : "否", el("label", { class: "check" }, isDefault),
+      fmtDate(library.created_at), holder]);
   }
 
   form.addEventListener("submit", async (event) => {
@@ -228,7 +271,19 @@ function mountLibraries(root) {
 
   cancel.addEventListener("click", () => setEditing(null));
   pathInput.addEventListener("change", renderHint);
-  root.append(form, table);
+  backfill.addEventListener("click", async () => {
+    setBanner(note, "");
+    backfill.disabled = true;
+    try {
+      const data = await api.backfillDefaults();
+      await refresh();
+      setBanner(note, "已补发 " + (data.users_granted || 0) + " 个用户，跳过 " + (data.users_skipped || 0) + " 个");
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "补发失败");
+      await loadBackfill();
+    }
+  });
+  root.append(form, defaultHint, el("div", { class: "row" }, backfill, backfillInfo), table);
   loadRoots().then(refresh);
 
   return () => {
@@ -391,6 +446,84 @@ function mountMedia(root) {
   loadLibraries().then(refresh);
 }
 
+/* ---------- 用户可访问库（P3，整体替换 + 回读） ---------- */
+
+function openUserLibrariesDrawer(user, onSaved) {
+  const overlay = el("div", { class: "modal-overlay", dataset: { role: "user-libraries-drawer" } });
+  const note = banner();
+  const body = el("div", { class: "panel", dataset: { role: "user-libraries-body" } });
+  const box = el("div", { class: "modal wide" },
+    el("div", { class: "picker-head" },
+      el("span", { text: "媒体库权限：" + (user.username || user.id) }),
+      el("button", { class: "btn small", type: "button", text: "关闭", dataset: { role: "drawer-close" },
+        onclick: () => overlay.remove() })),
+    note, body);
+  overlay.append(box);
+  overlay.addEventListener("click", (event) => { if (event.target === overlay) overlay.remove(); });
+  document.body.append(overlay);
+
+  const checks = new Map();
+  const listBox = el("div", { class: "panel" });
+  const state = el("div", { class: "muted small-note", dataset: { role: "user-libraries-state" } });
+  const save = el("button", { class: "btn primary", type: "button", text: "保存", dataset: { role: "save-user-libraries" } });
+  const selectAll = el("button", { class: "btn small", type: "button", text: "全选" });
+  const selectNone = el("button", { class: "btn small", type: "button", text: "全不选" });
+  let libraries = [];
+
+  function paint(grants) {
+    const sources = new Map();
+    for (const grant of asArray(grants)) sources.set(grant.library_id, grant.source);
+    clear(listBox);
+    checks.clear();
+    if (!libraries.length) { listBox.append(el("div", { class: "muted", text: "暂无媒体库" })); return; }
+    for (const library of libraries) {
+      const check = el("input", { type: "checkbox", checked: sources.has(library.id) });
+      const tag = sources.has(library.id)
+        ? (sources.get(library.id) === "default" ? "（注册时继承）" : "（管理员授权）") : "";
+      checks.set(library.id, check);
+      listBox.append(el("label", { class: "check" }, check,
+        el("span", { text: (library.name || library.id) + tag })));
+    }
+  }
+
+  async function load() {
+    setBanner(note, "");
+    save.disabled = true;
+    state.textContent = "读取中…";
+    try {
+      const result = await api.libraries();
+      libraries = asArray(result && result.list);
+      const view = await api.userLibraries(user.id);
+      paint(view && view.grants);
+      state.textContent = "已回读 " + asArray(view && view.library_ids).length + " 个库";
+    } catch (err) {
+      state.textContent = "";
+      setBanner(note, err && err.message ? err.message : "读取失败");
+    } finally { save.disabled = false; }
+  }
+
+  save.addEventListener("click", async () => {
+    setBanner(note, "");
+    save.disabled = true;
+    state.textContent = "保存中…";
+    const ids = [];
+    for (const [id, check] of checks) if (check.checked) ids.push(id);
+    try {
+      const view = await api.setUserLibraries(user.id, ids);
+      paint(view && view.grants);
+      state.textContent = "已保存，回读 " + asArray(view && view.library_ids).length + " 个库";
+      if (onSaved) onSaved();
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "保存失败");
+    } finally { save.disabled = false; }
+  });
+
+  selectAll.addEventListener("click", () => { for (const check of checks.values()) check.checked = true; });
+  selectNone.addEventListener("click", () => { for (const check of checks.values()) check.checked = false; });
+  body.append(listBox, el("div", { class: "actions" }, selectAll, selectNone, save), state);
+  load();
+}
+
 /* ---------- 用户 ---------- */
 
 function mountUsers(root) {
@@ -416,9 +549,19 @@ function mountUsers(root) {
       clear(body);
       if (!list.length) body.append(emptyRow(6, "暂无用户"));
       for (const user of list) body.append(userRow(user));
+      await loadNoLibraryHint();
     } catch (err) {
       setBanner(note, err && err.message ? err.message : "加载失败");
     }
+  }
+
+  // 有 0 授权的普通用户时常驻提示（提示失败不覆盖列表内容）。
+  async function loadNoLibraryHint() {
+    try {
+      const data = await api.defaultLibraries();
+      const n = Number(data && data.users_without_libraries) || 0;
+      if (n > 0) setBanner(note, n + " 个用户还没有任何库，可在媒体库页补发默认可见库");
+    } catch (err) { /* ignore */ }
   }
 
   function userRow(user) {
@@ -435,7 +578,11 @@ function mountUsers(root) {
       resetBox.classList.add("hidden");
     });
     const resetBox = el("div", { class: "actions hidden" }, newPassword, confirm);
-    const actions = el("div", { class: "actions" },
+    const actions = el("div", { class: "actions" });
+    if (user.role !== "admin") {
+      actions.append(button("媒体库权限", () => openUserLibrariesDrawer(user, refresh)));
+    }
+    actions.append(
       button("改角色", () => patch({ role: user.role === "admin" ? "user" : "admin" })),
       button(user.status === "active" ? "禁用" : "启用", () => patch({ status: user.status === "active" ? "disabled" : "active" })),
       button("重置口令", () => resetBox.classList.remove("hidden")));

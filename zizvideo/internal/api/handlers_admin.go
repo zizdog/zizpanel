@@ -116,7 +116,7 @@ func (s *Server) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	if u.DisplayName == "" {
 		u.DisplayName = u.Username
 	}
-	if err := s.DB.CreateUser(u); err != nil {
+	if err := s.DB.CreateUserWithDefaults(u); err != nil {
 		s.audit(r, "auth.register", "user:"+req.Username, false, errCode(err))
 		s.fail(w, r, err)
 		return

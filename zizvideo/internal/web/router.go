@@ -32,6 +32,11 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("GET /api/v1/users", s.RequireAdmin(s.HandleListUsers))
 	mux.HandleFunc("POST /api/v1/users", s.RequireAdmin(s.HandleCreateUser))
 	mux.HandleFunc("PATCH /api/v1/users/{id}", s.RequireAdmin(s.HandlePatchUser))
+	// P3：某用户的可见库（整体替换，回读一致）+ 默认可见库预览/补发。
+	mux.HandleFunc("GET /api/v1/admin/users/{id}/libraries", s.RequireAdmin(s.HandleGetUserLibraries))
+	mux.HandleFunc("PUT /api/v1/admin/users/{id}/libraries", s.RequireAdmin(s.HandlePutUserLibraries))
+	mux.HandleFunc("GET /api/v1/admin/libraries/defaults", s.RequireAdmin(s.HandleGetDefaultLibraries))
+	mux.HandleFunc("POST /api/v1/admin/libraries/defaults/backfill", s.RequireAdmin(s.HandleBackfillDefaultLibraries))
 
 	mux.HandleFunc("GET /api/v1/libraries", s.RequireAdmin(s.HandleListLibraries))
 	mux.HandleFunc("POST /api/v1/libraries", s.RequireAdmin(s.HandleCreateLibrary))
