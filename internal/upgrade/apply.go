@@ -172,6 +172,31 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 	sw.Log("ok", "二进制已原子替换")
 	_ = SaveState(opt.WorkDir, st)
 
+	// ---- 第 3.5 步：回读随包模块（可选）----
+	// 包里有它就必须真的落在 <BinDir>/zizvideo 且能跑；缺了/跑不起来即回滚，
+	// 绝不"包里有、装完却没有"地静默过去（判据贴运行体）。
+	if _, hasModule := staged[ZizvideoBinary]; hasModule {
+		if err := verifyBundledModule(ctx, opt); err != nil {
+			st.Error = err.Error()
+			addStep(opt, st, "回读随包模块", err.Error(), false)
+			if rbErr := restore(opt); rbErr != nil {
+				st.Status = StatusFailed
+				st.Message = "随包模块复核失败且回滚也失败，面板可能无法启动"
+				st.Error = err.Error() + "；回滚失败: " + rbErr.Error()
+			} else {
+				st.Status = StatusRolledBack
+				st.Message = "随包模块复核失败，已恢复旧版本（未重启）"
+			}
+			st.FinishedAt = opt.Now()
+			sw.Fail(errors.New(st.Error))
+			_ = SaveState(opt.WorkDir, st)
+			return err
+		}
+		addStep(opt, st, "回读随包模块", "zizvideo 已就位且可执行", true)
+		sw.Log("ok", "随包模块 zizvideo 已就位并通过 --version 复核")
+		_ = SaveState(opt.WorkDir, st)
+	}
+
 	// ---- 第 4 步：启动看门狗（必须在重启自己之前） ----
 	if err := startWatchdog(ctx, opt, st, from, to); err != nil {
 		// 看门狗起不来就不能重启自己 —— 否则新版若失败就没人回滚了
@@ -256,7 +281,42 @@ func selfTest(ctx context.Context, opt Options, staged map[string]string, want s
 	if !h.OK {
 		return fmt.Errorf("新版提权助手自检未通过: %s", strings.TrimSpace(string(out)))
 	}
+
+	// 随包的可选模块（zizvideo）：带了就试跑一次，架构不对/损坏在这一步就暴露，
+	// 而不是等替换完才发现。老发布包里没有它 —— 那不是缺口，跳过。
+	if z, ok := staged[ZizvideoBinary]; ok {
+		out, err := opt.Run(ctx, z, "--version")
+		if err != nil {
+			return fmt.Errorf("新版随包模块无法执行: %v（输出：%s）", err, strings.TrimSpace(string(out)))
+		}
+		if strings.TrimSpace(string(out)) == "" {
+			return errors.New("新版随包模块 --version 没有任何输出")
+		}
+	}
 	_ = st
+	return nil
+}
+
+// verifyBundledModule 回读 `<BinDir>/zizvideo`：存在、带执行位、`--version` 能跑。
+//
+// 只在发布包里带了该模块时调用（调用方负责判断）。失败即回滚 —— "包里有、装完却没有"
+// 会在市场里表现成"找不到随面板分发的 zizvideo 二进制"，必须当场红。
+func verifyBundledModule(ctx context.Context, opt Options) error {
+	dst := filepath.Join(opt.BinDir, ZizvideoBinary)
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fmt.Errorf("随包模块 %s 没有落盘：%v", dst, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("随包模块 %s 不是可执行普通文件（权限 %v）", dst, info.Mode().Perm())
+	}
+	out, err := opt.Run(ctx, dst, "--version")
+	if err != nil {
+		return fmt.Errorf("随包模块 %s --version 跑不起来: %v（输出：%s）", dst, err, strings.TrimSpace(string(out)))
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("随包模块 %s --version 没有任何输出", dst)
+	}
 	return nil
 }
 

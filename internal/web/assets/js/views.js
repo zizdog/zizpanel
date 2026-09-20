@@ -18,6 +18,9 @@ import { configFileModal } from './services.js';
 // 作为本页第 4 个 Tab。它的实现仍在 update.js 里，这里只是把它挂进来 ——
 // 不复制一份代码，避免"两处升级界面各改一半"（本项目反复踩过的坑）。
 import { UpdateView } from './update.js';
+// 「权限」（逐项申请 macOS 授权）2026-09-20 从侧栏搬进「面板设置」，作为本页一个 Tab。
+// 实现仍在 permissions.js，这里只是挂进来 —— 不复制代码。
+import { PermissionsView } from './permissions.js';
 
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
@@ -728,15 +731,18 @@ export function SettingsView(content, ctx = {}) {
   //     可编辑入口（「调整配置 → 上传与执行上限」），设置页再放一份就是重复入口。
   //     它的渲染实现 renderLimitsInto 仍保留并导出，nginx/PHP 面板继续用。
   //   · 「文件与终端」的内容**并入「访问与安全」** —— 二者都是"面板自身的访问
-  //     与高危能力"，拆成两个 Tab 只会让用户多点一次。合并后本页只剩 3 个 Tab，
-  //     没有空板块、也没有重复入口。
+  //     与高危能力"，拆成两个 Tab 只会让用户多点一次。
+  //   · 「权限」2026-09-20 从侧栏独立项**搬进本页**（用户要求）：它逐项申请
+  //     macOS 授权，本质属于"面板自己的设置"，与「磁盘管理」那种存储工具不同。
   // 旧 hash 一个都不能白屏：`#/settings/limits`、`#/settings/terminal` 由
-  // app.js 的 SUB_ROUTE_TARGET 别名落到 access Tab（这里也对未知 tab 兜底）。
+  // app.js 的 SUB_ROUTE_TARGET 别名落到 access Tab；`#/permissions` 由
+  // ROUTE_TARGET 落到本页 permissions Tab（这里也对未知 tab 兜底）。
   //
   // 「检查更新」仍排在最后（用户明确要求的顺序），保留直达 hash。
   const tabs = [
     { id: 'access', title: '访问与安全' },
     { id: 'account', title: '账号与两步验证' },
+    { id: 'permissions', title: '权限' },
     { id: 'update', title: '检查更新' },
   ];
   let active = tabs.some((t) => t.id === ctx.tab) ? ctx.tab : 'access';
@@ -764,7 +770,17 @@ export function SettingsView(content, ctx = {}) {
     clear(body);
     if (active === 'access') await renderAccess();
     else if (active === 'update') await renderUpdate();
+    else if (active === 'permissions') renderPermissions();
     else await renderAccount();
+  }
+
+  // ---------- 权限 ----------
+  // 复用侧栏时代就有的 PermissionsView（permissions.js）；它自己渲染卡片与
+  // 「申请」按钮，这里只给一个容器，并带上 testid 方便 ui 用例定位。
+  function renderPermissions() {
+    const box = h('div', { dataset: { testid: 'zp-settings-permissions' } });
+    body.append(box);
+    PermissionsView(box, ctx);
   }
 
   // ---------- 检查更新 ----------

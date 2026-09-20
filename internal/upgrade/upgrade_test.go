@@ -623,6 +623,93 @@ func TestApplyHappyPathSwapsAndRestarts(t *testing.T) {
 	}
 }
 
+// TestApplyInstallsBundledZizvideoAndReadsItBack：随包模块（zizvideo）必须真的落到
+// <BinDir>/zizvideo 且 `--version` 能跑；缺了/跑不起来要红。
+//
+// 为什么必须锁：make release 早就在包里放了 ./zizvideo，但升级只 swap 面板与助手 ——
+// 结果升级到新版的机器上，市场里点安装 zizvideo 会找不到源文件（判据贴运行体，坑 161 同类）。
+func TestApplyInstallsBundledZizvideoAndReadsItBack(t *testing.T) {
+	opt := newTestOptions(t)
+	fakeBinary(t, opt.BinDir, PanelBinary, "0.1.0", true)
+	fakeBinary(t, opt.BinDir, HelperBinary, "0.1.0", true)
+
+	st := stageDirOf(opt)
+	staged := map[string]string{
+		PanelBinary:  fakeBinary(t, st, PanelBinary, "0.2.0", true),
+		HelperBinary: fakeBinary(t, st, HelperBinary, "0.2.0", true),
+	}
+	// 真的会打印版本、且带执行位的"模块二进制"。
+	mod := filepath.Join(st, ZizvideoBinary)
+	if err := os.WriteFile(mod, []byte("#!/bin/bash\necho 'zizvideo 0.1.0-mvp'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged[ZizvideoBinary] = mod
+
+	opt.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "launchctl" {
+			return []byte(""), nil
+		}
+		return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	}
+	if err := Apply(context.Background(), opt, staged, "0.1.0", "0.2.0", "remote"); err != nil {
+		t.Fatalf("带随包模块的正常升级不应出错: %v", err)
+	}
+
+	dst := filepath.Join(opt.BinDir, ZizvideoBinary)
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("升级后 %s 必须存在（随包模块没有自动就位）: %v", dst, err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Errorf("%s 缺可执行位：%v", dst, info.Mode().Perm())
+	}
+	out, err := exec.Command(dst, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s --version 跑不起来: %v（%s）", dst, err, out)
+	}
+	if !strings.Contains(string(out), "zizvideo") {
+		t.Errorf("--version 输出不对：%q", out)
+	}
+}
+
+// TestApplyRollsBackWhenBundledModuleCannotRun：包里带了模块但装完跑不起来（损坏）⇒
+// 必须回滚并在状态里如实说明，不许静默继续。
+func TestApplyRollsBackWhenBundledModuleCannotRun(t *testing.T) {
+	opt := newTestOptions(t)
+	fakeBinary(t, opt.BinDir, PanelBinary, "0.1.0", true)
+	fakeBinary(t, opt.BinDir, HelperBinary, "0.1.0", true)
+
+	st := stageDirOf(opt)
+	staged := map[string]string{
+		PanelBinary:  fakeBinary(t, st, PanelBinary, "0.2.0", true),
+		HelperBinary: fakeBinary(t, st, HelperBinary, "0.2.0", true),
+	}
+	// 自检阶段就用 `--version` 拦下它（无输出），所以这里造一个"哑"模块。
+	mod := filepath.Join(st, ZizvideoBinary)
+	if err := os.WriteFile(mod, []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged[ZizvideoBinary] = mod
+
+	opt.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "launchctl" {
+			return []byte(""), nil
+		}
+		return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	}
+	err := Apply(context.Background(), opt, staged, "0.1.0", "0.2.0", "remote")
+	if err == nil {
+		t.Fatal("随包模块自检/回读失败时必须返回错误")
+	}
+	state := LoadState(opt.WorkDir)
+	if state.Status != StatusFailed {
+		t.Fatalf("自检阶段失败的状态应为 failed，实际 %s", state.Status)
+	}
+	if _, statErr := os.Stat(filepath.Join(opt.BinDir, ZizvideoBinary)); statErr == nil {
+		t.Error("自检失败时不该把模块放进安装目录")
+	}
+}
+
 // TestWatchdogScriptHasSafetyRequisites 检查生成脚本的关键要素。
 // 这些字符串一旦丢失，看门狗就会"看起来在跑但不干活"，
 // 而那正是升级失败时唯一的救命绳。
@@ -635,7 +722,8 @@ func TestWatchdogScriptHasSafetyRequisites(t *testing.T) {
 		"0.1.0",                                // 回滚目标
 		opt.BinDir,                             // 操作目录
 		"$name.bak",                            // 从备份还原（循环变量拼接）
-		"for name in zizpanel zizpanel-helper", // 两个二进制都要还原
+		"for name in zizpanel zizpanel-helper", // 两个必需二进制都要还原
+		"zizvideo.bak",                         // 可选模块（随包分发）也要还原/清理
 		"launchctl kickstart",                  // 回滚后重启
 		"rolled_back",                          // 失败结论
 		"success",                              // 成功结论

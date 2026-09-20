@@ -12,18 +12,33 @@ import (
 	"testing"
 )
 
-func TestPermissionsNavEntryInSystemGroup(t *testing.T) {
-	js := readAssetJS(t, "app.js")
-	re := regexp.MustCompile(`\{\s*id:\s*'permissions',\s*title:\s*'([^']+)'`)
-	m := re.FindStringSubmatch(js)
-	if m == nil {
-		t.Fatal("app.js 的 NAV 里找不到 id 'permissions' 的条目")
+// TestPermissionsMountedInPanelSettings：「权限」2026-09-20 从侧栏独立项搬进
+// 「面板设置」的一个 Tab，且侧栏不再留第二个入口。判据锁"接线"：
+//
+//	· app.js 的 NAV 里**不许**再有 id 'permissions'（否则又是两处入口）；
+//	· 旧 hash `#/permissions` 必须被别名到 settings 的 permissions Tab（书签不白屏）；
+//	· views.js 的 SettingsView 必须真的导入并调用 PermissionsView（不是只写了个标题）。
+func TestPermissionsMountedInPanelSettings(t *testing.T) {
+	appJS := readAssetJS(t, "app.js")
+	if regexp.MustCompile(`\{\s*id:\s*'permissions'`).MatchString(appJS) {
+		t.Error("app.js 的 NAV 里不该再有 'permissions' 条目 —— 它已搬进「面板设置」")
 	}
-	if m[1] != "权限" {
-		t.Errorf("侧栏标题应为「权限」，实际 %q", m[1])
+	if !regexp.MustCompile(`permissions:\s*\{\s*id:\s*'settings',\s*tab:\s*'permissions'\s*\}`).MatchString(appJS) {
+		t.Error("app.js 必须把旧 hash #/permissions 别名到面板设置的 permissions Tab")
 	}
-	if !strings.Contains(js, "import { PermissionsView } from './permissions.js'") {
-		t.Error("app.js 必须真的导入 PermissionsView（否则 NAV 里是空引用）")
+
+	viewsJS := readAssetJS(t, "views.js")
+	if !strings.Contains(viewsJS, "import { PermissionsView } from './permissions.js'") {
+		t.Error("views.js 必须真的导入 PermissionsView（否则设置页里是空引用）")
+	}
+	if !regexp.MustCompile(`\{\s*id:\s*'permissions',\s*title:\s*'权限'\s*\}`).MatchString(viewsJS) {
+		t.Error("面板设置必须有标题「权限」的 Tab")
+	}
+	if !regexp.MustCompile(`active === 'permissions'`).MatchString(viewsJS) {
+		t.Error("SettingsView 的 renderBody 必须处理 permissions Tab")
+	}
+	if !regexp.MustCompile(`PermissionsView\(\s*box`).MatchString(viewsJS) {
+		t.Error("面板设置必须真的调用 PermissionsView(...) 渲染权限内容")
 	}
 }
 
