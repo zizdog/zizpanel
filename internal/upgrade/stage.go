@@ -323,14 +323,27 @@ func short(s string) string {
 	return s
 }
 
-// ExtractBinaries 从 tar.gz 中解出我们需要的二进制到 destDir。
+// ExtractBinaries 从 tar.gz 中解出**必需**的二进制到 destDir；缺一个即错。
+func ExtractBinaries(tarPath, destDir string, wanted []string) (map[string]string, error) {
+	return extractBinaries(tarPath, destDir, wanted, nil)
+}
+
+// ExtractBinariesOptional 解出必需 + 可选二进制；**可选缺失不算错**。
+//
+// 为什么需要它：随面板包分发的可选模块（zizvideo）是后加的 —— 用老版本发布包
+// 升级（手动上传那条路径）时包里没有它，不该因此让升级失败。
+func ExtractBinariesOptional(tarPath, destDir string, required, optional []string) (map[string]string, error) {
+	return extractBinaries(tarPath, destDir, required, optional)
+}
+
+// extractBinaries 是提取本体。
 //
 // 安全要点（每一条都对应一类真实攻击）：
 //   - 路径穿越（zip-slip）：只接受白名单文件名，且断言 Clean 后不含 ".."
 //   - 符号链接：直接拒绝，否则可以用链接把后续写入引到任意位置
 //   - 归档炸弹：限制条目数与单文件大小
 //   - 权限位：不继承归档里的权限，统一用给定的模式
-func ExtractBinaries(tarPath, destDir string, wanted []string) (map[string]string, error) {
+func extractBinaries(tarPath, destDir string, required, optional []string) (map[string]string, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return nil, err
@@ -343,8 +356,8 @@ func ExtractBinaries(tarPath, destDir string, wanted []string) (map[string]strin
 	}
 	defer func() { _ = gz.Close() }()
 
-	want := make(map[string]string, len(wanted))
-	for _, name := range wanted {
+	want := make(map[string]string, len(required)+len(optional))
+	for _, name := range append(append([]string{}, required...), optional...) {
 		want["./"+name] = name // 发布包里的路径形如 ./zizpanel
 		want[name] = name
 	}
@@ -407,7 +420,7 @@ func ExtractBinaries(tarPath, destDir string, wanted []string) (map[string]strin
 		out[target] = dst
 	}
 
-	for _, name := range wanted {
+	for _, name := range required {
 		if _, ok := out[name]; !ok {
 			return nil, fmt.Errorf("升级包里缺少 %s（这可能是一个不完整或伪造的包）", name)
 		}

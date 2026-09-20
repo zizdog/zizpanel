@@ -16,6 +16,9 @@ import (
 const (
 	PanelBinary  = "zizpanel"
 	HelperBinary = "zizpanel-helper"
+	// ZizvideoBinary 是随面板包分发的**可选**模块二进制（短视频服务）。
+	// 它不是升级的必需项：老版本发布包里没有它，缺失时跳过，不让升级失败。
+	ZizvideoBinary = "zizvideo"
 )
 
 // WatchdogLabel 是升级看门狗的 LaunchDaemon 标签。
@@ -276,6 +279,13 @@ func backup(opt Options, st *State) error {
 			return fmt.Errorf("备份 %s 失败: %w", name, err)
 		}
 	}
+	// 可选模块：磁盘上有就备份；没有（上一次升级的面板还没带它）就跳过。
+	zb := filepath.Join(opt.BinDir, ZizvideoBinary)
+	if _, err := os.Stat(zb); err == nil {
+		if err := copyFile(zb, zb+".bak", 0o755); err != nil {
+			return fmt.Errorf("备份 %s 失败: %w", ZizvideoBinary, err)
+		}
+	}
 	_ = st
 	return nil
 }
@@ -299,6 +309,18 @@ func swap(opt Options, staged map[string]string, st *State) error {
 			return fmt.Errorf("替换 %s 失败: %w", name, err)
 		}
 	}
+	// 可选模块：暂存里有才替换；没有就保持磁盘现状（老发布包）。
+	if src, ok := staged[ZizvideoBinary]; ok {
+		dst := filepath.Join(opt.BinDir, ZizvideoBinary)
+		tmp := dst + ".new"
+		if err := copyFile(src, tmp, 0o755); err != nil {
+			return fmt.Errorf("准备 %s 失败: %w", ZizvideoBinary, err)
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("替换 %s 失败: %w", ZizvideoBinary, err)
+		}
+	}
 	_ = st
 	return nil
 }
@@ -317,6 +339,16 @@ func restore(opt Options) error {
 		if err := copyFile(bak, filepath.Join(opt.BinDir, name), 0o755); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	// 可选模块：有 .bak 就还原；没有 .bak 说明升级前磁盘上本来就没有它 ——
+	// 把这次新放进去的删掉，别在回滚后留下一个来历不明的二进制。
+	z := filepath.Join(opt.BinDir, ZizvideoBinary)
+	if _, err := os.Stat(z + ".bak"); err == nil {
+		if err := copyFile(z+".bak", z, 0o755); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if err := os.Remove(z); err != nil && !os.IsNotExist(err) && firstErr == nil {
+		firstErr = err
 	}
 	return firstErr
 }

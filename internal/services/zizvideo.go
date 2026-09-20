@@ -1,10 +1,15 @@
 package services
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -73,8 +78,6 @@ const (
 	ZizvideoAppID = "zizvideo"
 	// ZizvideoLabel 是系统级守护进程的 launchd 标签（面板托管 ⇒ 用面板的域前缀）。
 	ZizvideoLabel = "cn.zizpanel.zizvideo"
-	// ZizvideoSlug 是面板别名（/<slug>/）。
-	ZizvideoSlug = "zizvideo"
 	// ZizvideoVersion 是这一版面板所打包/验收的 zizvideo 版本。
 	ZizvideoVersion = "0.1.0-mvp"
 	// ZizvideoPort 是网页界面端口（只绑 127.0.0.1）。
@@ -153,6 +156,118 @@ func ZizvideoBin() string {
 		root = "/opt/zizvideo"
 	}
 	return filepath.Join(root, "bin", "zizvideo")
+}
+
+// zizvideoBundledBinary 解析"随面板包分发的 zizvideo 二进制"的真实路径。
+//
+// 两条来源，按优先级：
+//
+//	① 面板二进制旁边（<bin>/zizvideo）—— install.sh 与**新版**在线升级都会放到这里；
+//	② 面板**升级下载缓存**里最新的已验签发布包 —— 早于本功能的在线升级只换了
+//	   面板与助手，模块二进制仍留在那个发布包（<WorkDir>/upgrade/download/*.tar.gz）里。
+//
+// 两条都没有就如实失败：**绝不去归档仓库取，也不编一个下载地址**。
+// 本模块由面板托管、不再单独分发。
+func (m *Manager) zizvideoBundledBinary(panelBin string) (string, error) {
+	primary := strings.TrimSpace(zizvideoSourceBin(panelBin))
+	if primary != "" && fileExecutable(primary) {
+		return primary, nil
+	}
+	tarPath, terr := m.newestUpgradeTarball()
+	if terr != nil {
+		return "", fmt.Errorf("找不到随面板分发的 zizvideo 二进制（%s 不存在；升级下载缓存里也没有可用的发布包：%v）。"+
+			"本模块由面板托管、不再单独分发，请用带 zizvideo 的完整发布包安装", primary, terr)
+	}
+	dst := filepath.Join(strings.TrimSpace(m.opt.WorkDir), "zizvideo-bundled", "zizvideo")
+	if err := extractTarMember(tarPath, "zizvideo", dst); err != nil {
+		return "", fmt.Errorf("从发布包 %s 里取出 zizvideo 失败：%w。"+
+			"本模块由面板托管、不再单独分发，请用带 zizvideo 的完整发布包安装",
+			filepath.Base(tarPath), err)
+	}
+	return dst, nil
+}
+
+// newestUpgradeTarball 返回升级下载缓存里最新的发布包（按修改时间）。
+func (m *Manager) newestUpgradeTarball() (string, error) {
+	dir := filepath.Join(strings.TrimSpace(m.opt.WorkDir), "upgrade", "download")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("%s 里没有 .tar.gz", dir)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		fi, ei := os.Stat(filepath.Join(dir, names[i]))
+		fj, ej := os.Stat(filepath.Join(dir, names[j]))
+		if ei != nil || ej != nil {
+			return names[i] < names[j]
+		}
+		return fi.ModTime().After(fj.ModTime())
+	})
+	return filepath.Join(dir, names[0]), nil
+}
+
+// extractTarMember 从 tar.gz 里安全地取出**一个**普通文件到 dst。
+//
+// 安全判定沿用 internal/upgrade 的规矩：只认精确文件名、拒绝路径穿越与链接、
+// 限制尺寸；输出目录建好 0755（降权后的真实用户要能执行它 —— 坑 199）。
+func extractTarMember(tarPath, member, dst string) error {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gz.Close() }()
+
+	const maxMember = 256 << 20
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		name := strings.TrimPrefix(filepath.ToSlash(hdr.Name), "./")
+		if name != member {
+			continue
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			return fmt.Errorf("归档里的 %s 不是普通文件（拒绝链接/目录）", member)
+		}
+		if hdr.Size > maxMember {
+			return fmt.Errorf("归档里的 %s 尺寸 %d 超过上限", member, hdr.Size)
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		w, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(w, io.LimitReader(tr, maxMember+1)); err != nil {
+			_ = w.Close()
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
+		return os.Chmod(dst, 0o755)
+	}
+	return fmt.Errorf("归档里没有 %s", member)
 }
 
 // ZizvideoServeArgs 返回 zizvideo 的启动参数（**不含可执行文件本身**）。
@@ -295,10 +410,9 @@ func (m *Manager) InstallZizvideo(ctx context.Context, app App, result *InstallR
 	if err != nil || strings.TrimSpace(panelBin) == "" {
 		return fmt.Errorf("找不到面板自身的可执行文件路径（系统守护进程要用它执行 zizvideo-supervise）: %v", err)
 	}
-	source := zizvideoSourceBin(panelBin)
-	if !fileExecutable(source) {
-		return fmt.Errorf("找不到随面板分发的 zizvideo 二进制（%s）。"+
-			"本模块由面板托管、不再单独分发，请用带 zizvideo 的完整发布包安装", source)
+	source, err := m.zizvideoBundledBinary(panelBin)
+	if err != nil {
+		return err
 	}
 	if err := zizvideoArm64Fn(m, ctx, source); err != nil {
 		return err
@@ -551,7 +665,7 @@ func (m *Manager) zizvideoInstallPlan() UninstallPlan {
 		"停止并删除系统级守护进程 " + ZizvideoLabel + "（" + p.Plist + "）",
 		"删除安装目录 " + p.Root + "（二进制）",
 		"从「服务管理」移除记录",
-		"⚠️ 卸载后 127.0.0.1:" + fmt.Sprint(ZizvideoPort) + " 与面板别名 /" + ZizvideoSlug + "/ 都会不可用，直到重新安装",
+		"⚠️ 卸载后 127.0.0.1:" + fmt.Sprint(ZizvideoPort) + " 会不可用，直到重新安装",
 	}
 	plan := UninstallPlan{Kind: "installer", Steps: steps}
 	if p.DataDir != "" {

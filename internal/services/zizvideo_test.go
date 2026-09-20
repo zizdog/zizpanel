@@ -8,6 +8,8 @@ package services
 // DataPaths**）并复核终态。
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"os"
 	"path/filepath"
@@ -467,5 +469,122 @@ func TestZizvideoUninstallPlanNeverListsMediaRoot(t *testing.T) {
 		if strings.Contains(d, "Movies") || strings.Contains(d, "volumes") || strings.Contains(d, "Volumes") {
 			t.Errorf("媒体根绝不许进 DataPaths：%v", plan.DataPaths)
 		}
+	}
+}
+
+// TestZizvideoUninstallPlanNamesDaemonPlistAndRoot：计划必须点名守护进程/plist/安装根。
+func TestZizvideoUninstallPlanNamesDaemonPlistAndRoot(t *testing.T) {
+	env := newZizvideoTestEnv(t)
+	p := env.m.ZizvideoPathsFor()
+	plan := env.m.zizvideoInstallPlan()
+	if plan.Kind != "installer" {
+		t.Fatalf("zizvideo 的卸载计划 kind 应为 installer，实际 %q", plan.Kind)
+	}
+	joined := strings.Join(plan.Steps, " | ")
+	for _, want := range []string{ZizvideoLabel, p.Plist, p.Root} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("卸载计划必须点名 %q，实际：%s", want, joined)
+		}
+	}
+}
+
+// TestZizvideoMarketEntryIsWired：上架市场的判据 —— 目录条目 + 市场声明 + 卸载实现三条齐。
+func TestZizvideoMarketEntryIsWired(t *testing.T) {
+	app, ok := FindApp(ZizvideoAppID)
+	if !ok {
+		t.Fatal("应用目录里没有 zizvideo 条目（市场里看不到它，也就装不了）")
+	}
+	if app.Kind != KindNative || app.PanelInstaller != ZizvideoAppID {
+		t.Errorf("应是 KindNative + PanelInstaller=%s，实际 kind=%s installer=%q",
+			ZizvideoAppID, app.Kind, app.PanelInstaller)
+	}
+	if app.ServiceLabel != ZizvideoLabel || app.Port != ZizvideoPort || app.HealthPath != zizvideoHealthPath {
+		t.Errorf("服务契约不对：label=%q port=%d health=%q",
+			app.ServiceLabel, app.Port, app.HealthPath)
+	}
+	if app.SystemDaemon {
+		t.Error("zizvideo 自己写系统 plist，不该标 SystemDaemon（那个字段驱动 brew services 搬迁）")
+	}
+	if app.BrewFormula != "" {
+		t.Errorf("这个条目不该有 BrewFormula（没有 brew 包）：%q", app.BrewFormula)
+	}
+	if !HasInstallerUninstall(app.PanelInstaller) {
+		t.Error("有 PanelInstaller 却查不到卸载实现（装上就卸不掉）")
+	}
+	// 市场声明必须存在，且与目录逐字段一致 + 自身不变量成立（反漂移）。
+	var decl *MarketApp
+	for _, m := range MarketApps() {
+		if m.ID == ZizvideoAppID {
+			mm := m
+			decl = &mm
+			break
+		}
+	}
+	if decl == nil {
+		t.Fatal("market_downloads.go 里没有 zizvideo 的下载点声明")
+	}
+	if problems := MarketDeclarationProblems(*decl, app); len(problems) != 0 {
+		t.Errorf("市场声明与目录/不变量不一致：%v", problems)
+	}
+	if len(decl.Downloads) != 0 || strings.TrimSpace(decl.NoDownloadReason) == "" {
+		t.Errorf("zizvideo 随面板包分发、零网络下载：必须零下载点 + 写清 NoDownloadReason，"+
+			"实际 downloads=%d reason=%q", len(decl.Downloads), decl.NoDownloadReason)
+	}
+}
+
+// writeReleaseTarball 造一个最小发布包（只含给定成员）。
+func writeReleaseTarball(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for name, body := range files {
+		hdr := &tar.Header{Name: "./" + name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInstallZizvideoFallsBackToUpgradeDownloadCache：早于本功能的在线升级只换了面板与
+// 助手，模块二进制仍在那个**已验签的发布包**里（升级下载缓存）—— 安装器必须能取到它，
+// 而不是报"找不到随面板分发的二进制"。
+func TestInstallZizvideoFallsBackToUpgradeDownloadCache(t *testing.T) {
+	env := newZizvideoTestEnv(t)
+	env.stubHealth("ok", 200, nil)
+	if err := os.Remove(env.source); err != nil {
+		t.Fatal(err)
+	}
+	writeReleaseTarball(t,
+		filepath.Join(env.m.opt.WorkDir, "upgrade", "download", "zizpanel_9.9.9_darwin_arm64.tar.gz"),
+		map[string]string{
+			"zizpanel": "panel",
+			"zizvideo": "#!/bin/sh\necho ok\n",
+		})
+
+	app := App{ID: ZizvideoAppID, Name: "zizvideo"}
+	if err := env.m.InstallZizvideo(context.Background(), app, &InstallResult{}); err != nil {
+		t.Fatalf("应从升级下载缓存里取到模块二进制并装好，实际：%v", err)
+	}
+	if _, err := os.Stat(ZizvideoBin()); err != nil {
+		t.Errorf("安装后应落盘 %s：%v", ZizvideoBin(), err)
 	}
 }

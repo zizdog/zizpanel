@@ -515,9 +515,9 @@ func (s *Server) stageFromTarball(ctx context.Context, tarPath string, st *upgra
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if _, err := upgrade.ExtractBinaries(tarPath, dir, []string{
-		upgrade.PanelBinary, upgrade.HelperBinary,
-	}); err != nil {
+	if _, err := upgrade.ExtractBinariesOptional(tarPath, dir,
+		[]string{upgrade.PanelBinary, upgrade.HelperBinary},
+		[]string{upgrade.ZizvideoBinary}); err != nil {
 		return err
 	}
 	sw.Log("ok", fmt.Sprintf("已解出 %s 与 %s", upgrade.PanelBinary, upgrade.HelperBinary))
@@ -640,9 +640,9 @@ func (s *Server) handleUpgradeUpload(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if _, err := upgrade.ExtractBinaries(tarPath, dir, []string{
-		upgrade.PanelBinary, upgrade.HelperBinary,
-	}); err != nil {
+	if _, err := upgrade.ExtractBinariesOptional(tarPath, dir,
+		[]string{upgrade.PanelBinary, upgrade.HelperBinary},
+		[]string{upgrade.ZizvideoBinary}); err != nil {
 		s.audit(r, "upgrade_upload", hdr.Filename, "失败: "+err.Error(), false, "")
 		fail(w, http.StatusBadRequest, "升级包不可用："+err.Error())
 		return
@@ -730,6 +730,11 @@ func (s *Server) handleUpgradeApply(w http.ResponseWriter, r *http.Request) {
 	stagedFiles := map[string]string{
 		upgrade.PanelBinary:  filepath.Join(s.stagingDirFor(), upgrade.PanelBinary),
 		upgrade.HelperBinary: filepath.Join(s.stagingDirFor(), upgrade.HelperBinary),
+	}
+	// 可选模块：暂存里有才带上（老发布包没有它）。它是随面板包分发的 zizvideo 二进制，
+	// 升级时一并放到 <BinDir>/zizvideo，面板的模块安装器就从那里取。
+	if z := filepath.Join(s.stagingDirFor(), upgrade.ZizvideoBinary); fileExists(z) {
+		stagedFiles[upgrade.ZizvideoBinary] = z
 	}
 	from, to, source := version.Version, stagedVer, st.Source
 	log := s.Log

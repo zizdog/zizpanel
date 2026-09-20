@@ -1569,6 +1569,28 @@ func Catalog() []App {
 			DocsURL: "https://github.com/zizdog/zizpanel",
 		},
 
+		// ---------------- zizvideo（本项目自研模块，面板托管） ----------------
+		//
+		// 与 mac军刀 同一类：**它没有上游**。二进制随面板发布包一起分发
+		// （make release 把它打进 tar 顶层，安装器从 <面板二进制目录>/zizvideo 取），
+		// 安装 = 本机复制 + 注册系统级 LaunchDaemon，不需要任何网络下载。
+		//
+		// 服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码
+		// 要求 ⇒ 与面板**共用文件权限**；supervisor 以 root fork 后 setuid 到真实用户
+		// 跑 zizvideo，配置与数据沿用 ~/Library/Application Support/zizvideo。
+		// 刻意不标 SystemDaemon：与 mac军刀 同理，它自己写系统 plist，不经过 brew services。
+		{
+			ID: ZizvideoAppID, Name: "zizvideo", Icon: "🎬",
+			Summary:     "本地短视频库：把视频目录扫进 SQLite，浏览器里上下滑着看",
+			Description: "把本机视频目录扫进 SQLite，浏览器上下滑着看；只绑本机回环。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: ZizvideoAppID, ServiceLabel: ZizvideoLabel,
+			Port: ZizvideoPort, HealthPath: zizvideoHealthPath,
+			PostInstallHint: "装完先打开 http://127.0.0.1:" + strconv.Itoa(ZizvideoPort) +
+				"/ 创建管理员；媒体允许根沿用已有 config.json，不会被覆盖。",
+			DocsURL: "https://github.com/zizdog/zizpanel",
+		},
+
 		// ---------------- 一键建站（Category: site） ----------------
 		{
 			ID: "typecho", Name: "Typecho", Icon: "📝",

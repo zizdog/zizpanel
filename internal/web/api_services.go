@@ -1391,6 +1391,12 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		// 用户的家目录、写该用户的 ~/MacSaberFiles）—— 通用流程一样都做不到。
 		s.handleInstallMacSaber(w, r)
 		return
+	case "zizvideo":
+		// zizvideo：没有上游、没有 brew 包，二进制**随面板发布包分发**
+		// （<面板二进制目录>/zizvideo），要装成系统级 LaunchDaemon
+		// （可执行文件是面板自身的 `zizpanel zizvideo-supervise`）—— 通用流程做不到。
+		s.handleInstallZizvideo(w, r)
+		return
 	}
 
 	app, found := services.FindApp(id)

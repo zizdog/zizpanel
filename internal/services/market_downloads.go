@@ -1324,6 +1324,25 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
+	// ---------------- zizvideo（本项目自研模块，随面板包分发） ----------------
+
+	{
+		ID: "zizvideo", Kind: KindNative, PanelInstaller: "zizvideo", ServiceLabel: ZizvideoLabel,
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: ZizvideoLabel,
+			LabelSource: "目录 ServiceLabel（系统级 LaunchDaemon；可执行文件是面板自身的 zizvideo-supervise）",
+		},
+		// 真的零下载：二进制由 make release 打进面板发布包顶层，安装器只做本机复制
+		// （<面板二进制目录>/zizvideo → /opt/zizvideo/bin/zizvideo）+ launchd 注册。
+		// 不编一个假的镜像 URL 去骗过门禁 —— 如实声明"随包分发"。
+		NoDownloadReason: "二进制随面板发布包一起分发（make release 打进 tar 顶层的 ./zizvideo，安装器从" +
+			"<面板二进制目录>/zizvideo 取），安装时只做本机复制与 launchd 注册，**不需要任何网络下载**；" +
+			"镜像站上也没有它的独立包可指。",
+		Note: "服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码要求 ⇒ " +
+			"与面板共用文件权限；supervisor 以 root fork 后 setuid 到真实用户跑 zizvideo，" +
+			"配置/数据沿用 ~/Library/Application Support/zizvideo（安装器不覆盖已有 config.json）。",
+	},
+
 	// ---------------- 一键建站（站点源码） ----------------
 
 	{

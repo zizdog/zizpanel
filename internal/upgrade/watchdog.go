@@ -209,6 +209,12 @@ for name in zizpanel zizpanel-helper; do
     log "找不到 $BIN/$name.bak，无法还原 $name"
   fi
 done
+# 可选模块 zizvideo：有 .bak 就还原；没有 .bak 说明升级前本来就没有它 —— 删掉新放进去的。
+if [ -f "$BIN/zizvideo.bak" ]; then
+  cp -f "$BIN/zizvideo.bak" "$BIN/zizvideo" && chmod 0755 "$BIN/zizvideo" || log "还原 zizvideo 失败"
+elif [ -f "$BIN/zizvideo" ]; then
+  rm -f "$BIN/zizvideo" || log "删除新放入的 zizvideo 失败"
+fi
 
 launchctl kickstart -k "system/$PANEL_LABEL" >/dev/null 2>&1 || log "重启面板失败"
 

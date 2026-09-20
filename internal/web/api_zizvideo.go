@@ -1,0 +1,46 @@
+package web
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
+)
+
+// zizvideoInstallFn 是安装入口；单测注入假实现（真实安装要碰 launchd，
+// 单测绝不允许跑 —— AGENTS 第三节）。
+var zizvideoInstallFn = func(s *Server, ctx context.Context, app services.App, res *services.InstallResult) error {
+	return s.svcManager().InstallZizvideo(ctx, app, res)
+}
+
+// handleInstallZizvideo 安装应用市场里的「zizvideo」（短视频模块）。
+//
+// 为什么走自研安装器而不是通用流程：
+//   - **没有上游**：二进制随面板发布包一起分发（make release 打进 tar 顶层的
+//     ./zizvideo），安装器从 <面板二进制目录>/zizvideo 取，不需要任何网络下载；
+//   - **服务形态不同**：它的可执行文件是**面板自己的二进制**
+//     （`zizpanel zizvideo-supervise`），装成系统级 LaunchDaemon
+//     （label cn.zizpanel.zizvideo）—— 与面板同一代码要求，所以与面板**共用文件权限**；
+//     supervisor 以 root fork 后 setuid 到真实用户跑 zizvideo。
+//
+// 走任务中心：写 plist + bootstrap + 等 /healthz 就绪不是秒级动作。
+func (s *Server) handleInstallZizvideo(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app, found := services.FindApp(id)
+	if !found || app.PanelInstaller != services.ZizvideoAppID {
+		fail(w, http.StatusBadRequest, "应用市场中找不到 zizvideo 条目 "+id)
+		return
+	}
+	s.launchInstallTask(w, r, "install", id,
+		"安装 "+app.Name+"（随面板包分发）",
+		"install_zizvideo", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+			res := &services.InstallResult{App: app.ID, Steps: []string{}}
+			if err := zizvideoInstallFn(s, ctx, app, res); err != nil {
+				return res, err
+			}
+			res.Name = app.Name
+			res.Message = "zizvideo " + services.ZizvideoVersion + " 已就绪"
+			return res, nil
+		})
+}

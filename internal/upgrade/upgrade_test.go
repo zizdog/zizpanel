@@ -322,6 +322,42 @@ func TestExtractBinariesRequiresAllWanted(t *testing.T) {
 	}
 }
 
+// TestExtractBinariesOptionalKeepsOlderPackagesWorking：可选模块（zizvideo）是后加的 ——
+// 用老发布包升级（里面没有它）不该失败；带它的包则必须把它解出来。
+func TestExtractBinariesOptionalKeepsOlderPackagesWorking(t *testing.T) {
+	older := makeTar(t, []tarEntry{
+		{name: "./zizpanel", body: "panel", typ: tar.TypeReg},
+		{name: "./zizpanel-helper", body: "helper", typ: tar.TypeReg},
+	})
+	dest := t.TempDir()
+	got, err := ExtractBinariesOptional(older, dest,
+		[]string{PanelBinary, HelperBinary}, []string{ZizvideoBinary})
+	if err != nil {
+		t.Fatalf("老包（没有可选模块）不该报错: %v", err)
+	}
+	if _, ok := got[ZizvideoBinary]; ok {
+		t.Error("老包里没有 zizvideo，不该凭空多出它")
+	}
+
+	newer := makeTar(t, []tarEntry{
+		{name: "./zizpanel", body: "panel", typ: tar.TypeReg},
+		{name: "./zizpanel-helper", body: "helper", typ: tar.TypeReg},
+		{name: "./zizvideo", body: "zizvideo", typ: tar.TypeReg},
+	})
+	dest2 := t.TempDir()
+	got2, err := ExtractBinariesOptional(newer, dest2,
+		[]string{PanelBinary, HelperBinary}, []string{ZizvideoBinary})
+	if err != nil {
+		t.Fatalf("带可选模块的包应当解出成功: %v", err)
+	}
+	if _, ok := got2[ZizvideoBinary]; !ok {
+		t.Fatal("带 zizvideo 的包必须把它解出来")
+	}
+	if _, err := os.Stat(filepath.Join(dest2, ZizvideoBinary)); err != nil {
+		t.Fatalf("zizvideo 没有被落盘: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 //  状态与看门狗结果
 // ---------------------------------------------------------------------------

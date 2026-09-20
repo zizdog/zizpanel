@@ -141,6 +141,12 @@ var offlineSelfContained = map[string]string{
 	// 不写这一条就会在报告里冒出一个假缺口，用户会去补一个根本不存在的东西。
 	"macspeech": "无需额外文件：合成引擎 /usr/bin/say 与转换工具 /usr/bin/afconvert 都是 macOS 自带的" +
 		"（不随离线包分发），网页界面由面板自己的二进制提供（cmd/zizpanel 的 speech-serve 子命令）",
+	// zizvideo（短视频）：二进制随**面板发布包**一起分发（make release 打进 tar 顶层的
+	// ./zizvideo），安装时只做本机复制 + 系统级 launchd 注册，不需要从网上取任何文件；
+	// 离线包里**已经有它**（就在面板安装包里）。列出来是为了不报告一个假缺口。
+	"zizvideo": "无需额外文件：zizvideo 二进制随面板发布包一起分发" +
+		"（发布包顶层的 ./zizvideo，装上后落在 <面板二进制目录>/zizvideo），" +
+		"安装只做本机复制 + launchd 注册；离线安装面板即已包含它",
 }
 
 // offlinePythonGaps 是面板自研 Python 安装器**已知还没镜像**的依赖。

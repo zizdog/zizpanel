@@ -851,6 +851,11 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"macsaber": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallMacSaber(ctx, app, removeData, r)
 	},
+	// zizvideo（短视频模块）：bootout system 域 + 删系统 plist + 删 /opt/zizvideo；
+	// 数据目录（DB、封面、config.json）与**媒体根**默认保留（媒体是用户自己的文件）。
+	"zizvideo": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
+		return m.UninstallZizvideo(ctx, app, removeData, r)
+	},
 }
 
 // HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
@@ -1341,6 +1346,10 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		// 计划与执行端共用同一个 macSaberInstallPlan（路径只写一份，避免"计划说删 A、
 		// 实际删 B"）。
 		p = m.macSaberInstallPlan()
+	case "zizvideo":
+		// zizvideo：产物是自研的系统级 LaunchDaemon + /opt/zizvideo，没有 brew 包要卸。
+		// 计划与执行端共用同一个 zizvideoInstallPlan（路径只写一份）；媒体根永不进 DataPaths。
+		p = m.zizvideoInstallPlan()
 	default:
 		p.Blocked = "这个应用没有卸载实现"
 	}
