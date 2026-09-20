@@ -17,6 +17,7 @@ import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
 import { DisksView } from './disks.js';
+import { PermissionsView } from './permissions.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { startUpgradeWatcher, hasUpdate } from './update.js';
@@ -69,6 +70,9 @@ export const NAV = [
   // 放在「系统」组（与「面板设置 / 日志」同组）：它是 OS 级的存储工具，
   // 不是"面板自己的设置"，也不是「mac设置」那种把 macOS 配成服务器的动作集。
   { id: 'disks', title: '磁盘管理', icon: '💾', view: DisksView },
+  // 「权限」：逐项申请 macOS 授权（完全磁盘访问 / 可移除宗卷 / 装了的应用自己申请）。
+  // 与「磁盘管理」同组：它们都属于"OS 级访问能力"，不是面板自己的设置。
+  { id: 'permissions', title: '权限', icon: '🛡️', view: PermissionsView },
   // 「日志」把原「日志中心」与「操作审计」合并成一页两个 Tab（见 logshub.js）：
   // 侧栏只剩一个入口，旧的 #/logs 与 #/audit 仍分别落到对应 Tab（见 ROUTE_TARGET）。
   //

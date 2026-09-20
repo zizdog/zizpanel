@@ -244,6 +244,10 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/system/disks/{id}/volume-rename", s.requireAuth(s.handleDiskVolumeRename))
 	// init-volume 是第一版接口名，保留为 volume-create 的别名，不破坏既有调用。
 	root.HandleFunc("POST /api/v1/system/disks/{id}/init-volume", s.requireAuth(s.handleDiskVolumeCreate))
+	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
+	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
+	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))
+	root.HandleFunc("POST /api/v1/permissions/{id}/apply", s.requireAuth(s.handlePermissionApply))
 	// 操作审计：检索 + 游标分页 + 导出（facets 给下拉框提供真实出现过的动作名）
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
 	root.HandleFunc("GET /api/v1/audit/facets", s.requireAuth(s.handleAuditFacets))
