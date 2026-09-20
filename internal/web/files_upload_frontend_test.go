@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -21,6 +20,10 @@ import (
 //         于是**任何大小**的上传都是彻底无声失败；
 //    2. 用 fetch 上传 → 拿不到 upload.onprogress，大文件只剩一句干等的 toast。
 //  这两条都不是"某一行写错"，而是"下次还会再犯"的类别，所以补成门禁。
+//
+//  真机报障（4.16 GB 文件夹被拒）的类别是"判据用错层级"：拿**整批总大小**去比
+//  **单次请求上限**，还建议用户用同一个功能分流。对应的门禁见
+//  upload_batch_gate_test.go（分批纯函数 + 文案不许把自己当解法）。
 // ============================================================================
 
 func readAssetJS(t *testing.T, name string) string {
@@ -32,54 +35,24 @@ func readAssetJS(t *testing.T, name string) string {
 	return string(b)
 }
 
-// TestFilesFrontendMaxUploadMatchesBackend 锁死"前端本地预检的上限 == 后端上限"。
+// TestFilesFrontendUploadLimitIsReadNotHardcoded 锁"上限只有一个来源"。
 //
-// 两边漂移的后果很具体：前端放行的请求会被后端 413，用户又白传一遍 ——
-// 正是这次报障的形态。
-func TestFilesFrontendMaxUploadMatchesBackend(t *testing.T) {
+// 旧实现把 4 GiB 写死在 files.js（还靠测试锁前后端两个数字相等）。写死必然
+// 出现"提示里的数字不是真实生效的上限"，而上限一旦可配，写死的数字立刻说谎。
+// 现在唯一来源是 config → GET /api/v1/files/upload-limit，前端必须回读。
+func TestFilesFrontendUploadLimitIsReadNotHardcoded(t *testing.T) {
 	js := readAssetJS(t, "files.js")
-	re := regexp.MustCompile(`const\s+MAX_UPLOAD\s*=\s*([0-9][0-9\s*]*);`)
-	m := re.FindStringSubmatch(js)
-	if m == nil {
-		t.Fatal("files.js 里找不到 `const MAX_UPLOAD = ...;` —— 前端本地预检上限不见了？")
+	if regexp.MustCompile(`MAX_UPLOAD`).MatchString(js) {
+		t.Error("files.js 里还有写死的 MAX_UPLOAD —— 上限必须回读（api.fileUploadLimit）")
 	}
-	val, err := evalIntProduct(strings.TrimSpace(m[1]))
-	if err != nil {
-		t.Fatalf("解析 MAX_UPLOAD 表达式 %q 失败: %v", m[1], err)
+	if !strings.Contains(js, "api.fileUploadLimit()") {
+		t.Error("files.js 没有回读面板上传上限（api.fileUploadLimit）—— " +
+			"提示里的数字会与真实生效值脱节")
 	}
-	if val != maxUpload {
-		t.Fatalf("前端 MAX_UPLOAD = %d，后端 maxUpload = %d —— 两边必须一致，"+
-			"否则会出现「本地通过、服务端 413」的白传", val, maxUpload)
+	// 未复核时必须如实说"未复核"，不许拿默认值冒充实测值。
+	if !strings.Contains(js, "上限未复核") {
+		t.Error("files.js 没有「未复核」这条如实说明 —— 读不到配置时会编造数字")
 	}
-	t.Logf("前后端上限一致：%d 字节（%s）", val, js2human(val))
-}
-
-// evalIntProduct 只支持 "a * b * c" 这种常量乘积（够用且不引入 JS 引擎）。
-func evalIntProduct(expr string) (int64, error) {
-	parts := strings.Split(expr, "*")
-	var out int64 = 1
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		n, err := strconv.ParseInt(p, 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		out *= n
-	}
-	return out, nil
-}
-
-func js2human(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return strconv.FormatFloat(float64(n)/float64(int64(1)<<30), 'f', 0, 64) + " GiB"
-	case n >= 1<<20:
-		return strconv.FormatFloat(float64(n)/float64(int64(1)<<20), 'f', 0, 64) + " MiB"
-	}
-	return strconv.FormatInt(n, 10) + " B"
 }
 
 // TestFilesFrontendUploadHasFolderEntry 必须有「上传文件夹」入口（webkitdirectory）。
@@ -171,7 +144,7 @@ func TestFilesFrontendUploadWiring(t *testing.T) {
 		t.Error("files.js 的上传入口没有兜底 try/catch + toast —— 未捕获的异常会再次变成「没反应」")
 	}
 	// 拼 FormData 的异常必须显示在进度窗里
-	if !strings.Contains(js, "'无法准备上传数据'") {
+	if !strings.Contains(js, "无法准备上传数据") {
 		t.Error("files.js 没有处理「拼请求体失败」这条路径（历史上它就是静默的那一条）")
 	}
 }

@@ -457,6 +457,9 @@ export const api = {
     request('POST', `${API_BASE}/files/replace`, { path, find, replace, all }),
   // 下载与上传走原生表单/URL，不经过 JSON 封装
   fileDownloadURL: (path) => apiURL(`files/download?path=${encodeURIComponent(path)}`),
+  // 面板自己单次上传的上限（回读配置，前端**不许**再写死常数）：
+  // 本地预检与分批都用它，提示里的数字也来自它。
+  fileUploadLimit: () => request('GET', `${API_BASE}/files/upload-limit`),
 
   // ---- Web 终端 ----
   terminalInfo: () => request('GET', `${API_BASE}/terminal`),

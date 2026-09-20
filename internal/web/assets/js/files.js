@@ -10,14 +10,18 @@ import { api, apiURL } from './api.js';
 import { taskCenter } from './tasks.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll, esc, rate, duration } from './ui.js';
 import { registerCleanup } from './app.js';
+// 上传分批的**纯函数**放单独模块：它可以被 node 直接跑门禁
+// （见 internal/web/upload_batch_gate_test.go），而本文件依赖 DOM 无法单测。
+import { planUploadBatches, oversizeAdvice } from './uploadplan.js';
 
-// MAX_UPLOAD 必须与后端 internal/web/api_files.go 的 maxUpload 一致（4 GiB）。
+// 面板单次上传上限**从前端写死改成回读**：GET /api/v1/files/upload-limit。
 //
-// 为什么前端要单独知道这个数：用户选中文件后**先本地判一次**，超限就直接给
-// 明确提示、一个字节都不发。旧版是在浏览器把 512MB 传完之后才被服务端拒绝，
-// 用户白等半天只看到一句失败 —— 这正是"点了没反应"的一半原因。
-// 两边漂移会让"本地通过、服务端拒收"重现，所以有测试锁死这两个数字相等。
-const MAX_UPLOAD = 4 * 1024 * 1024 * 1024;
+// 为什么不能写死（用户报障的根因之一）：提示里的数字必须来自真实生效的上限，
+// 而这个上限是可配的（config.json → panel_upload_limit）。写死的 4 GiB 一旦
+// 与配置漂移，提示就在说谎；旧实现还拿它去比**整批总大小**，于是 4.16 GB 的
+// 文件夹被拒、却建议用户用同一个功能分流 —— 自相矛盾。现在：
+//   · 只有单个文件 > 上限才拒绝（点名文件）；
+//   · 总大小任意大，都按"每次请求 ≤ 上限"自动分批。
 
 // 显示隐藏文件的状态记在 localStorage（刷新/切换板块后保持）。默认关闭。
 const SHOW_HIDDEN_KEY = 'zp-files-show-hidden';
@@ -1592,23 +1596,56 @@ export function FilesView(content, ctx = {}) {
 
   // ---------- 上传 ----------
   //
-  // 三条不可退让的规矩（用户报障后定的）：
-  //   1. 绝不静默：选中文件后先本地判大小，超限立刻弹明确提示并且**不发请求**；
-  //   2. 必须能看出"在动"：用 XHR（不是 fetch）拿 upload.onprogress，
-  //      显示百分比 + 已传/总大小 + 速度 + 预计剩余；
-  //   3. 失败必须给出**服务端返回的原因**（HTTP status + body 里的 msg），
-  //      网络中断明说"连接中断"，不许只剩一句干等的 toast。
+  // 四条不可退让的规矩（用户两次报障后定的）：
+  //   1. 判据只能是"单个文件 vs 上限"：总大小任意大都不拒绝，自动分批；
+  //   2. 绝不静默：超限先本地拦下并**点名文件**，一个字节都不发；
+  //   3. 必须能看出"在动"：XHR 的 upload.onprogress + "第 i/N 批"；
+  //   4. 失败必须给出**服务端返回的原因**，且出路不许再提上传功能自己。
+
+  // uploadLimitInfo 缓存回读到的上限（一次会话内有效，避免每次上传都请求）。
+  let uploadLimitInfo = null;
+
+  // getUploadLimit 回读面板真实生效的单次上传上限。
+  //
+  // 读不到就**如实标"未复核"**，绝不写死一个数字（旧实现写死 4 GiB，
+  // 一旦配置漂移提示就在说谎）。未复核时不分批，交给服务端判。
+  async function getUploadLimit() {
+    if (uploadLimitInfo) return uploadLimitInfo;
+    let info;
+    try {
+      const r = await api.fileUploadLimit();
+      const bytes = Number(r && r.limit_bytes) || 0;
+      info = {
+        bytes,
+        source: (r && r.source) || '',
+        verified: !!(r && r.verified),
+        note: (r && r.note) || '',
+        sizeText: bytes > 0 ? humanSize(bytes) : '',
+      };
+    } catch (e) {
+      info = {
+        bytes: 0, source: '', verified: false, sizeText: '',
+        note: '读不到上限接口：' + ((e && e.message) || e),
+      };
+    }
+    // 只缓存**回读成功**的结果：一次网络抖动不该让整个会话都不再分批。
+    if (info.verified) uploadLimitInfo = info;
+    return info;
+  }
 
   // uploadEntries 是所有上传入口（按钮/文件夹按钮/拖拽）的唯一实现。
   //
   // 整体套 try/catch：**任何**没预料到的异常都必须变成用户看得见的提示。
-  // 2026-09-20 那次报障的形态就是"异常抛在任何提示之前 → 彻底无声"，
+  // 那次报障的形态就是"异常抛在任何提示之前 → 彻底无声"，
   // 所以这里不允许再出现没有出口的异常路径。
   async function uploadEntries(entries, opts = {}) {
     try {
       if (!entries.length) return;
-      const problem = precheckUpload(entries);
-      if (problem) { showUploadProblem(problem); return; }
+      const limitInfo = await getUploadLimit();
+      const problem = precheckUpload(entries, limitInfo.bytes);
+      if (problem) { showUploadProblem(problem, limitInfo); return; }
+      // 分批计划：按"每次请求 ≤ 上限"装批。**总大小不参与拒绝**。
+      const plan = planUploadBatches(entries.map((e) => (e.file && e.file.size) || 0), limitInfo.bytes);
       // 同名文件先问清楚：覆盖还是共存（用户明确要求）。
       // 上传文件夹不走这个询问 —— 它的语义本来就是"按原结构覆盖整站"，
       // 进度窗里也明说了；把 index.php 问成 index-1.php 会让站点直接跑不起来。
@@ -1621,7 +1658,7 @@ export function FilesView(content, ctx = {}) {
           onConflict = choice;
         }
       }
-      await runUpload(entries, { folder: !!opts.folder, onConflict });
+      await runUpload(entries, plan, { folder: !!opts.folder, onConflict, limitInfo });
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       toast('上传未能开始：' + msg, 'err', 15000);
@@ -1684,49 +1721,54 @@ export function FilesView(content, ctx = {}) {
     });
   }
 
-  // precheckUpload 在**发请求之前**做本地校验，返回 null 表示可以上传。
+  // precheckUpload 只判**单个文件**是否超过上限，返回 null 表示可以上传。
   //
-  // 为什么总大小也要判：整个 multipart 请求体只受后端 maxUpload 约束，
-  // "每个文件都没超但加起来超了"同样会被服务端拒收 —— 那又是一次白传。
-  function precheckUpload(entries) {
-    const total = entries.reduce((s, e) => s + (e.file.size || 0), 0);
-    const oversize = entries.filter((e) => (e.file.size || 0) > MAX_UPLOAD);
-    if (!oversize.length && total <= MAX_UPLOAD) return null;
-    return { total, oversize };
+  // ⚠️ 这里**刻意不判总大小**：总大小 > 上限只是"要多分几批"，不是拒绝理由。
+  // 旧实现拿整批总大小去比单次请求上限（判据用错层级），把 4.16 GB 的整站
+  // 判成"超限"，还建议用户用同一个功能分流 —— 自相矛盾、必然失败（用户报障）。
+  function precheckUpload(entries, limitBytes) {
+    if (!(limitBytes > 0)) return null; // 上限未复核：不分批、不拦，交给服务端判
+    const oversize = entries.filter((e) => ((e.file && e.file.size) || 0) > limitBytes);
+    return oversize.length ? { oversize } : null;
   }
 
-  // showUploadProblem 把"超限"讲清楚：文件名 + 实际大小 + 上限 + 建议。
-  function showUploadProblem({ total, oversize }) {
+  // showUploadProblem 把"单个文件超过上限"讲清楚：文件名 + 实际大小 + 出路。
+  //
+  // 出路**必须可执行、且不许是**"再用一次上传功能"（那正是用户刚试过、
+  // 必然失败的事）。数字来自回读到的真实上限；未复核时如实说"未复核"。
+  function showUploadProblem({ oversize }, limitInfo) {
     const rows = [];
-    if (oversize.length) {
-      rows.push(h('p', { text: `有 ${oversize.length} 个文件超过单个文件上限：` }));
-      const list = h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } },
-        oversize.slice(0, 20).map((e) => h('li', { text: `${e.rel} — ${humanSize(e.file.size)}` })));
-      rows.push(list);
-      if (oversize.length > 20) rows.push(h('p', { text: `…另有 ${oversize.length - 20} 个同样超限的文件` }));
-    } else {
-      rows.push(h('p', { text: `这一次要传的总大小是 ${humanSize(total)}，超过单次上传上限。` }));
-    }
+    rows.push(h('p', { text: `有 ${oversize.length} 个文件超过单个文件上限：` }));
+    rows.push(h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } },
+      oversize.slice(0, 20).map((e) => h('li', { text: `${e.rel} — ${humanSize((e.file && e.file.size) || 0)}` }))));
+    if (oversize.length > 20) rows.push(h('p', { text: `…另有 ${oversize.length - 20} 个同样超限的文件` }));
     rows.push(h('p', {
       style: { marginTop: '10px' },
-      text: `面板单次上传上限：${humanSize(MAX_UPLOAD)}；你这次总共 ${humanSize(total)}。`,
+      text: limitInfo.verified
+        ? `单文件上限 ${limitInfo.sizeText}（回读自${limitInfo.source || '面板配置'}）。`
+        : `单文件上限未复核，按内置默认 ${limitInfo.sizeText} 拦截。`,
     }));
-    rows.push(h('div', {
-      style: { marginTop: '8px', lineHeight: '1.8' },
-      text: '建议：① 用「⬆ 上传文件夹」把网站按子目录分批传上去（超限的那个文件仍然要单独处理）；' +
-        '② 先在本地分卷压缩（如 site.part1.zip、site.part2.zip）再逐个上传；' +
-        '③ 也可以再把压缩包解压。文件一个字节都没有上传，不需要清理。',
-    }));
+    if (!limitInfo.verified) rows.push(h('div.hint', { text: limitInfo.note || '读不到面板配置。' }));
+    const advice = oversizeAdvice();
+    rows.push(h('div', { style: { marginTop: '8px' }, text: '出路（二选一）：' }));
+    rows.push(h('ol', { style: { margin: '4px 0 0 18px', lineHeight: '1.8' } },
+      advice.map((a) => h('li', { text: a }))));
+    rows.push(h('div.hint', { text: '其余文件不受影响；这次一个字节都没有上传，不需要清理。' }));
     const m = modal({
-      title: '⛔ 超过上传上限，已在上传前拦下',
+      title: '⛔ 单个文件超过上限，已在上传前拦下',
       body: h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, rows),
       footer: [h('button.btn.btn-primary', { text: '知道了', onclick: () => m.close() })],
     });
   }
 
-  // runUpload 真正发请求：XHR + 进度窗。
-  async function runUpload(entries, { folder, onConflict }) {
-    const total = entries.reduce((s, e) => s + (e.file.size || 0), 0);
+  // runUpload 按计划**逐批**发请求：每个请求都 ≤ 上限，总大小不参与拒绝。
+  //
+  // 进度窗显示"第 i/N 批"；失败沿用现有机制（窗口里给出服务端原因，
+  // 已传完的文件留在目标目录，重传即可 —— 文件夹上传是覆盖语义，不会重复）。
+  async function runUpload(entries, plan, { folder, onConflict, limitInfo }) {
+    const batches = ((plan && plan.batches) || []).map((idxs) => idxs.map((i) => entries[i]));
+    const batchCount = batches.length;
+    const total = batches.reduce((s, b) => s + b.reduce((x, e) => x + ((e.file && e.file.size) || 0), 0), 0);
 
     // ---- 进度窗（先建窗口，再拼请求体）----
     //
@@ -1738,25 +1780,33 @@ export function FilesView(content, ctx = {}) {
     const lineRate = h('div', { style: { color: 'var(--text-mute)', marginTop: '4px' }, text: ' ' });
     const lineNote = h('div', { style: { marginTop: '8px', fontSize: '12.5px', color: 'var(--text-mute)' },
       text: folder ? `将在 ${cwd} 下按原目录结构重建（同名文件会被覆盖）` : `目标目录：${cwd}` });
+    if (batchCount > 1) {
+      appendAll(lineNote, h('div', { text: `分 ${batchCount} 批上传（每次请求都不超过上限）。` }));
+    }
+    if (!limitInfo.verified) {
+      appendAll(lineNote, h('div', { style: { color: 'var(--warn)' },
+        text: `上限未复核：${limitInfo.note || '读不到面板配置'}` }));
+    }
 
-    // 状态与 XHR 先声明再接线：按钮回调（取消上传）会引用 xhr。
+    // 状态与当前 XHR 先声明再接线：按钮回调（取消上传）会引用 curXHR。
     const started = Date.now();
     let lastDraw = 0;
-    let loaded = 0;
+    let doneBytes = 0;   // 已传完批次的字节
+    let curSent = 0;     // 当前批已传字节
+    let curNo = 0;       // 当前是第几批
     let finished = false;
-
-    // 上传必须用 XHR：fetch 完全没有"上传进度"能力（只有下载流的 reader），
-    // 这正是旧版只剩一句干等 toast 的原因。XHR 的 upload.onprogress 才有已传字节。
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', apiURL('files/upload'), true);
-    xhr.withCredentials = true;
-    xhr.setRequestHeader('X-CSRF-Token', readCookie('zp_csrf'));
+    let aborted = false;
+    let curXHR = null;
+    const allUploaded = [];
+    const allFailed = [];
 
     let modalRef = null;
-    const cancelBtn = h('button.btn', { text: '取消上传', onclick: () => xhr.abort() });
+    const cancelBtn = h('button.btn', { text: '取消上传', onclick: () => { aborted = true; if (curXHR) curXHR.abort(); } });
     const closeBtn = h('button.btn.btn-primary', { text: '关闭', style: { display: 'none' }, onclick: () => modalRef && modalRef.close() });
     modalRef = modal({
-      title: folder ? `⬆ 上传文件夹（${entries.length} 个文件）` : `⬆ 上传 ${entries.length} 个文件`,
+      title: folder
+        ? `⬆ 上传文件夹（${entries.length} 个文件${batchCount > 1 ? `，${batchCount} 批` : ''}）`
+        : `⬆ 上传 ${entries.length} 个文件${batchCount > 1 ? `（${batchCount} 批）` : ''}`,
       body: h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
         lineMain,
         h('div.bar', [barFill]),
@@ -1772,17 +1822,19 @@ export function FilesView(content, ctx = {}) {
     // 大文件在浏览器决定何时发第一个 progress 事件前可能安静好几秒，
     // 那几秒里用户看到的不能是静止的窗口。
     const ticker = setInterval(() => {
-      if (!finished) draw(loaded);
+      if (!finished) draw(curSent);
     }, 1000);
 
-    function draw(sent) {
+    function draw(batchSent) {
+      const sent = doneBytes + batchSent;
       const now = Date.now();
       const elapsed = Math.max(0.001, (now - started) / 1000);
       const p = total > 0 ? Math.min(100, (sent / total) * 100) : 0;
       barFill.style.width = p.toFixed(1) + '%';
-      lineMain.textContent = total > 0
+      const prefix = batchCount > 1 ? `第 ${curNo}/${batchCount} 批 · ` : '';
+      lineMain.textContent = prefix + (total > 0
         ? `已上传 ${humanSize(sent)} / ${humanSize(total)}（${p.toFixed(1)}%）`
-        : `已上传 ${humanSize(sent)}`;
+        : `已上传 ${humanSize(sent)}`);
       const bps = sent / elapsed;
       let rest = '—';
       if (sent > 0 && total > sent) rest = duration((total - sent) / Math.max(1, bps));
@@ -1808,82 +1860,133 @@ export function FilesView(content, ctx = {}) {
       toast(`${title}：${detail}`, 'err', 15000);
     }
 
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) loaded = e.loaded;
-      const now = Date.now();
-      if (now - lastDraw < 200) return; // 进度事件很密，限制重绘频率
-      lastDraw = now;
-      draw(loaded);
-    };
+    // sendBatch 发一批（XHR + 进度），返回 {ok:true,payload} 或 {ok:false,...}。
+    //
+    // 上传必须用 XHR：fetch 完全没有"上传进度"能力（只有下载流的 reader），
+    // 这正是旧版只剩一句干等 toast 的原因。XHR 的 upload.onprogress 才有已传字节。
+    function sendBatch(batch, no) {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        curXHR = xhr;
+        curNo = no;
+        curSent = 0;
+        xhr.open('POST', apiURL('files/upload'), true);
+        xhr.withCredentials = true;
+        xhr.setRequestHeader('X-CSRF-Token', readCookie('zp_csrf'));
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) curSent = e.loaded;
+          const now = Date.now();
+          if (now - lastDraw < 200) return; // 进度事件很密，限制重绘频率
+          lastDraw = now;
+          draw(curSent);
+        };
+        xhr.onload = () => {
+          let data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (_) { data = null; }
+          const okBody = xhr.status >= 200 && xhr.status < 300 && data && data.ok !== false;
+          if (!okBody) {
+            resolve({
+              ok: false,
+              title: `第 ${no} 批上传失败（HTTP ${xhr.status}${xhr.statusText ? ' ' + xhr.statusText : ''}）`,
+              detail: serverReason(xhr, data),
+            });
+            return;
+          }
+          resolve({ ok: true, payload: data.data || {} });
+        };
+        xhr.onerror = () => resolve({ ok: false, title: `第 ${no} 批连接中断，上传未完成`,
+          detail: '与服务端的连接被中断（网络断开、面板重启、或服务端在读请求时中断）。' });
+        xhr.ontimeout = () => resolve({ ok: false, title: `第 ${no} 批上传超时`,
+          detail: '服务端在限定时间内没有收完数据。' });
+        xhr.onabort = () => resolve({ ok: false, aborted: true, title: '已取消上传',
+          detail: '你点了「取消上传」，请求已中止。' });
 
-    // 拼请求体。FormData 必须用 fd.append(two args) —— appendAll 是 DOM 助手，
-    // 拿它塞 FormData 会抛（见 ui.js 的注释）。这里的异常会显示在进度窗里。
-    let fd;
-    try {
-      fd = new FormData();
-      fd.append('dir', cwd);
-      // on_conflict：用户在上面那个弹窗里的选择（普通上传才有）。
-      // 传空时后端按形态取默认值（普通=rename 保留两者，文件夹=overwrite）。
-      if (onConflict) fd.append('on_conflict', onConflict);
-      if (folder) {
-        // 相对路径按顺序与 files 一一对应；后端 Go 的 multipart 解析对同一字段名保序。
-        fd.append('relpaths', JSON.stringify(entries.map((e) => e.rel)));
-      }
-      for (const e of entries) fd.append('files', e.file, e.file.name);
-    } catch (err) {
-      fail('无法准备上传数据', (err && err.message ? err.message : String(err)));
-      return;
+        // 拼请求体。FormData 必须用 fd.append(two args) —— appendAll 是 DOM 助手，
+        // 拿它塞 FormData 会抛（见 ui.js 的注释）。这里的异常会显示在进度窗里。
+        let fd;
+        try {
+          fd = new FormData();
+          fd.append('dir', cwd);
+          // on_conflict：用户在上面那个弹窗里的选择（普通上传才有）。
+          // 传空时后端按形态取默认值（普通=rename 保留两者，文件夹=overwrite）。
+          if (onConflict) fd.append('on_conflict', onConflict);
+          if (folder) {
+            // 相对路径按顺序与 files 一一对应；Go 的 multipart 解析对同一字段名保序。
+            fd.append('relpaths', JSON.stringify(batch.map((e) => e.rel)));
+          }
+          for (const e of batch) fd.append('files', e.file, e.file.name);
+        } catch (err) {
+          resolve({ ok: false, title: `第 ${no} 批无法准备上传数据`,
+            detail: (err && err.message ? err.message : String(err)) });
+          return;
+        }
+        xhr.send(fd);
+      });
     }
-    xhr.onload = () => {
-      let data = null;
-      try { data = JSON.parse(xhr.responseText); } catch (_) { data = null; }
-      const okBody = xhr.status >= 200 && xhr.status < 300 && data && data.ok !== false;
-      if (!okBody) {
-        fail(`上传失败（HTTP ${xhr.status}${xhr.statusText ? ' ' + xhr.statusText : ''}）`, serverReason(xhr, data));
+
+    if (!batchCount) { finish(); lineMain.textContent = '没有需要上传的文件'; return; }
+
+    // ---- 逐批发送（失败即停，已传完的文件留在目标目录，重传即可）----
+    for (let i = 0; i < batchCount; i++) {
+      if (aborted) {
+        fail('已取消上传', `已传完的文件（${allUploaded.length} 个）留在目标目录里。`);
+        load(cwd);
         return;
       }
-      finish();
-      const payload = data.data || {};
-      const uploaded = payload.uploaded || [];
-      const failed = payload.failed || [];
-      const overwritten = uploaded.filter((u) => u.overwritten).length;
-      barFill.style.width = '100%';
-      lineMain.textContent = `✅ ${payload.msg || `已上传 ${uploaded.length} 个文件`}`;
-      lineMain.style.color = 'var(--ok)';
-      lineRate.textContent = `共 ${humanSize(uploaded.reduce((s, u) => s + (u.size || 0), 0))} · 用时 ${duration((Date.now() - started) / 1000)}`;
-      clear(lineNote);
-      if (overwritten) appendAll(lineNote, h('div', { text: `其中 ${overwritten} 个覆盖了同名文件。` }));
-      else if (payload.on_conflict === 'rename') {
-        const renamed = uploaded.filter((u) => basename(u.rel_path || u.name || '') !== (u.name || ''));
-        if (renamed.length) {
-          appendAll(lineNote, h('div', { text: `其中 ${renamed.length} 个与已有文件重名，已自动改名（两个都保留）：` }),
-            h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } },
-              renamed.slice(0, 10).map((u) => h('li', { text: `${basename(u.rel_path || '')} → ${u.name}` }))));
+      const batchBytes = batches[i].reduce((s, e) => s + ((e.file && e.file.size) || 0), 0);
+      const r = await sendBatch(batches[i], i + 1);
+      if (!r.ok) {
+        if (r.aborted) {
+          fail('已取消上传', `第 ${i + 1}/${batchCount} 批已中止。已传完的文件（${allUploaded.length} 个）留在目标目录里。`);
+        } else {
+          const left = batchCount - i - 1;
+          fail(r.title, `${r.detail}（已传完 ${allUploaded.length} 个文件${left > 0 ? `；还有 ${left} 批没发` : ''}；重传即可，文件夹上传是覆盖语义）`);
         }
+        load(cwd);
+        return;
       }
-      if (failed.length) {
-        appendAll(lineNote,
-          h('div', { style: { color: 'var(--warn)', marginTop: '6px' }, text: `${failed.length} 个文件失败：` }),
-          h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } }, failed.map((f) => h('li', { text: String(f) }))));
-        toast(`已上传 ${uploaded.length} 个，${failed.length} 个失败（详见窗口）`, 'warn', 15000);
-      } else {
-        toast(payload.msg || '上传完成', 'ok');
+      doneBytes += batchBytes;
+      const payload = r.payload || {};
+      allUploaded.push(...(payload.uploaded || []));
+      allFailed.push(...(payload.failed || []));
+      draw(0);
+    }
+
+    // ---- 汇总（所有批次完成后）----
+    finish();
+    const overwritten = allUploaded.filter((u) => u.overwritten).length;
+    barFill.style.width = '100%';
+    lineMain.textContent = `✅ 已上传 ${allUploaded.length} 个文件${batchCount > 1 ? `（分 ${batchCount} 批）` : ''}`;
+    lineMain.style.color = 'var(--ok)';
+    lineRate.textContent = `共 ${humanSize(allUploaded.reduce((s, u) => s + (u.size || 0), 0))} · 用时 ${duration((Date.now() - started) / 1000)}`;
+    clear(lineNote);
+    if (overwritten) {
+      appendAll(lineNote, h('div', { text: `其中 ${overwritten} 个覆盖了同名文件。` }));
+    } else {
+      const renamed = allUploaded.filter((u) => basename(u.rel_path || u.name || '') !== (u.name || ''));
+      if (renamed.length) {
+        appendAll(lineNote, h('div', { text: `其中 ${renamed.length} 个与已有文件重名，已自动改名（两个都保留）：` }),
+          h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } },
+            renamed.slice(0, 10).map((u) => h('li', { text: `${basename(u.rel_path || '')} → ${u.name}` }))));
       }
-      // 文件夹上传后，若所有相对路径都在同一个顶层目录下，给一个"进入"按钮
-      const top = singleTopDir(entries.filter((e) => e.rel.includes('/')).map((e) => e.rel));
-      if (folder && top) {
-        appendAll(lineNote, h('button.btn.btn-sm', {
-          text: `进入 ${top}`, style: { marginTop: '8px' },
-          onclick: () => { modalRef && modalRef.close(); load(`${cwd}/${top}`); },
-        }));
-      }
-      load(cwd);
-    };
-    xhr.onerror = () => fail('连接中断，上传未完成',
-      '与服务端的连接被中断（网络断开、面板重启、或服务端在读请求时中断）。已上传的部分文件可能留在目标目录里，重传即可。');
-    xhr.ontimeout = () => fail('上传超时', '服务端在限定时间内没有收完数据。');
-    xhr.onabort = () => fail('已取消上传', '你点了「取消上传」，请求已中止。已传完的文件会留在目标目录里。');
-    xhr.send(fd);
+    }
+    if (allFailed.length) {
+      appendAll(lineNote,
+        h('div', { style: { color: 'var(--warn)', marginTop: '6px' }, text: `${allFailed.length} 个文件失败：` }),
+        h('ul', { style: { margin: '4px 0 0 18px', lineHeight: '1.7' } }, allFailed.map((f) => h('li', { text: String(f) }))));
+      toast(`已上传 ${allUploaded.length} 个，${allFailed.length} 个失败（详见窗口）`, 'warn', 15000);
+    } else {
+      toast(`已上传 ${allUploaded.length} 个文件${batchCount > 1 ? `（分 ${batchCount} 批）` : ''}`, 'ok');
+    }
+    // 文件夹上传后，若所有相对路径都在同一个顶层目录下，给一个"进入"按钮
+    const top = singleTopDir(entries.filter((e) => e.rel.includes('/')).map((e) => e.rel));
+    if (folder && top) {
+      appendAll(lineNote, h('button.btn.btn-sm', {
+        text: `进入 ${top}`, style: { marginTop: '8px' },
+        onclick: () => { modalRef && modalRef.close(); load(`${cwd}/${top}`); },
+      }));
+    }
+    load(cwd);
   }
 
   // serverReason 把服务端返回的原因原样取出来（这是用户唯一能据此自救的信息）。

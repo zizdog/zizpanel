@@ -140,10 +140,14 @@ func TestFileUploadRejectsOversizeContentLengthBeforeReadingBody(t *testing.T) {
 	}
 	var resp uploadResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	for _, want := range []string{"6.00 GB", "4.00 GB", "上传文件夹", "分卷压缩"} {
+	for _, want := range []string{"6.00 GB", "4.00 GB", "分卷压缩", "命令行"} {
 		if !strings.Contains(resp.Msg, want) {
 			t.Errorf("413 文案里缺少 %q，实际文案：%s", want, resp.Msg)
 		}
+	}
+	// 出路**不许**再提上传功能自己（用户报障的形态：提示建议他用刚用过的同一个功能）。
+	if strings.Contains(resp.Msg, "上传文件夹") {
+		t.Errorf("413 文案把上传功能自己当解法了：%s", resp.Msg)
 	}
 	t.Logf("413 文案 = %s", resp.Msg)
 	// 目标目录必须仍为空（拒绝发生在写盘之前）
@@ -203,8 +207,11 @@ func TestReadUploadFormClassifiesOverLimitAsTooLarge(t *testing.T) {
 	if !strings.Contains(msg, "512 B") {
 		t.Errorf("文案里没有上限 512 B：%s", msg)
 	}
-	if !strings.Contains(msg, "上传文件夹") || !strings.Contains(msg, "分卷压缩") {
-		t.Errorf("文案里没有可执行的建议：%s", msg)
+	if !strings.Contains(msg, "分卷压缩") || !strings.Contains(msg, "命令行") {
+		t.Errorf("文案里没有可执行的出路：%s", msg)
+	}
+	if strings.Contains(msg, "上传文件夹") {
+		t.Errorf("文案把上传功能自己当解法了：%s", msg)
 	}
 	t.Logf("分块超限文案 = %s", msg)
 }
@@ -530,10 +537,13 @@ func TestUpgradeUploadOversizeContentLengthIs413(t *testing.T) {
 	}
 	var resp uploadResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	for _, want := range []string{"256.00 MB", "上传文件夹", "分卷压缩"} {
+	for _, want := range []string{"256.00 MB", "分卷压缩", "命令行"} {
 		if !strings.Contains(resp.Msg, want) {
 			t.Errorf("413 文案里缺少 %q：%s", want, resp.Msg)
 		}
+	}
+	if strings.Contains(resp.Msg, "上传文件夹") {
+		t.Errorf("升级包 413 文案不该建议用「上传文件夹」：%s", resp.Msg)
 	}
 	t.Logf("升级包 413 文案 = %s", resp.Msg)
 }
@@ -842,4 +852,141 @@ func TestFileUploadConflictRenameAndOverwrite(t *testing.T) {
 	if rec3.Code != http.StatusBadRequest {
 		t.Errorf("非法 on_conflict 应当 400，实际 %d：%s", rec3.Code, rec3.Body.String())
 	}
+}
+
+// ============================================================================
+//  ⑦ 上限可注入 + 「总大小」不参与拒绝（真机 4.16 GB 报障的后端一半）
+//
+//  用户用「上传文件夹」传 4.16 GB 整站被拒，根因是拿**整批总大小**比
+//  **单次请求上限**。正确的后端行为是：每个请求只看自己的请求体大小；
+//  前端按"每次请求 ≤ 上限"分批（见 upload_batch_gate_test.go）。
+//  这里用**小上限**等效验证（真机 4 GB 造不出来，如实标"用 8 KiB 等效验证"）。
+// ============================================================================
+
+// TestPanelUploadLimitComesFromConfigAndIsInjectable 锁"上限只有一个来源且可注入"。
+func TestPanelUploadLimitComesFromConfigAndIsInjectable(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// 默认：config.Default() 的值，应视为已验证
+	if v := srv.panelUploadLimit(); !v.Verified || v.LimitBytes != 4<<30 {
+		t.Fatalf("默认上限 = %+v，想要 4 GiB 且 verified=true", v)
+	}
+	// 注入一个小上限：真机端到端就是这么把上限配成 4 MB 的
+	srv.Cfg.PanelUploadLimit = "4m"
+	if v := srv.panelUploadLimit(); !v.Verified || v.LimitBytes != 4<<20 {
+		t.Fatalf("注入 4m 后 = %+v，想要 4 MiB 且 verified=true", v)
+	}
+	// 配置读不到/不合法：退回默认上限，但**如实标未复核**（绝不放开成无限大）
+	srv.Cfg.PanelUploadLimit = "not-a-size"
+	v := srv.panelUploadLimit()
+	if v.Verified {
+		t.Error("非法配置值不该被标成已验证（那是谎报）")
+	}
+	if v.LimitBytes != 4<<30 {
+		t.Errorf("非法配置值时上限 = %d，想要退回默认 %d", v.LimitBytes, int64(4<<30))
+	}
+	if v.Note == "" {
+		t.Error("未复核必须给出原因，否则界面只能编数字")
+	}
+	t.Logf("注入后的未复核视图 = %+v", v)
+}
+
+// TestPanelUploadLimitEndpointReturnsRealValue 锁前端提示数字的来源接口。
+func TestPanelUploadLimitEndpointReturnsRealValue(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.Cfg.PanelUploadLimit = "4m"
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/upload-limit", nil)
+	rec := httptest.NewRecorder()
+	srv.handleGetPanelUploadLimit(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OK   bool                 `json:"ok"`
+		Data panelUploadLimitView `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Data.LimitBytes != 4<<20 || !resp.Data.Verified {
+		t.Fatalf("回读接口返回 %+v，想要 4 MiB / verified", resp.Data)
+	}
+	if resp.Data.Source == "" {
+		t.Error("回读结果必须说明来源（提示里要显示给用户）")
+	}
+}
+
+// TestFileUploadFolderTotalOverLimitSucceedsPerRequest 是后端侧的核心回归。
+//
+// 6 个 2 KiB 文件（总 12 KiB）> 注入的 8 KiB 上限，但**每个文件都小于上限**、
+// **每个请求也都小于上限** ⇒ 分两批必须都成功，6 个文件全部落盘。
+// 总大小不参与任何拒绝判定。
+func TestFileUploadFolderTotalOverLimitSucceedsPerRequest(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.Cfg.PanelUploadLimit = "8k" // 小上限等效验证（真机用 4m）
+	dir := siteDir(t, srv, "batch")
+
+	chunk := strings.Repeat("A", 2048) // 每个 2 KiB
+	batch1Rels := []string{"site/a.txt", "site/b.txt", "site/c.txt"}
+	batch2Rels := []string{"site/d.txt", "site/e.txt", "site/f.txt"}
+	toFiles := func(rels []string) []uploadPart {
+		out := make([]uploadPart, 0, len(rels))
+		for _, rel := range rels {
+			out = append(out, uploadPart{filename: rel[strings.LastIndex(rel, "/")+1:], data: chunk})
+		}
+		return out
+	}
+
+	for i, rels := range [][]string{batch1Rels, batch2Rels} {
+		body, ct := buildUploadBody(t, dir, rels, toFiles(rels))
+		if int64(body.Len()) > 8<<10 {
+			t.Fatalf("第 %d 批请求体 %d 字节，已经超过注入的上限 8 KiB —— 这个测试没证明分批", i+1, body.Len())
+		}
+		rec, resp := postUpload(t, srv, body, ct)
+		if rec.Code != http.StatusOK || !resp.OK {
+			t.Fatalf("第 %d 批上传失败：code=%d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	// 总大小 12 KiB > 8 KiB，但每个请求 ≤ 8 KiB → 6 个文件必须都在
+	for _, rel := range append(batch1Rels, batch2Rels...) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		st, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("%s 没落盘: %v", rel, err)
+		}
+		if st.Size() != 2048 {
+			t.Errorf("%s 大小 = %d，想要 2048", rel, st.Size())
+		}
+	}
+	t.Logf("总 12 KiB > 上限 8 KiB，分 2 批（每批请求体 ≤ 上限）全部成功")
+}
+
+// TestFileUploadSingleFileOverInjectedLimitIsRejected 锁"只有单文件超限才拒绝"，
+// 且文案里的上限是**真实生效值**（注入 8 KiB 就写 8.00 KB，不是写死的 4 GB）。
+func TestFileUploadSingleFileOverInjectedLimitIsRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.Cfg.PanelUploadLimit = "8k"
+	dir := siteDir(t, srv, "single-big")
+
+	body, ct := buildUploadBody(t, dir, nil, []uploadPart{{filename: "big.bin", data: strings.Repeat("B", 9<<10)}})
+	rec, resp := postUpload(t, srv, body, ct)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d，想要 413；body=%s", rec.Code, rec.Body.String())
+	}
+	// 文案里的上限必须是注入的**真实生效值**（8 KiB → 8.00 KB），不是写死的 4 GB。
+	for _, want := range []string{"8.00 KB", "分卷压缩", "命令行"} {
+		if !strings.Contains(resp.Msg, want) {
+			t.Errorf("413 文案里缺少 %q：%s", want, resp.Msg)
+		}
+	}
+	if strings.Contains(resp.Msg, "4.00 GB") {
+		t.Errorf("413 文案里的上限还是写死的 4 GB，不是注入的 8 KiB：%s", resp.Msg)
+	}
+	if strings.Contains(resp.Msg, "上传文件夹") {
+		t.Errorf("413 文案不该建议用上传功能自己：%s", resp.Msg)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Fatalf("被拒的单文件上传在目标目录留下了 %d 项", len(entries))
+	}
+	t.Logf("单文件 9 KiB > 注入上限 8 KiB 的 413 文案 = %s", resp.Msg)
 }

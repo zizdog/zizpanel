@@ -50,7 +50,11 @@ func allowLongUpload(w http.ResponseWriter, r *http.Request) error {
 	return rc.SetReadDeadline(time.Now().Add(longUploadWindow))
 }
 
-// uploadLimitMessage 生成"超过上限"的人话：实际大小、上限、可执行的建议。
+// uploadLimitMessage 生成"超过上限"的人话：实际大小、上限、可执行的出路。
+//
+// ⚠️ 出路里**不许**再提「上传文件夹」：用户报障时就是因为提示让他用同一个
+// 功能去分流（"用上传文件夹按子目录分批"），而他刚用的就是它 —— 自相矛盾且必然失败。
+// 判据见 upload_batch_gate_test.go：文案不得把上传功能自己当解法。
 //
 // got<=0 表示长度未知（分块传输，服务端边收边算），此时不编造数字。
 func uploadLimitMessage(got, limit int64, what string) string {
@@ -58,8 +62,8 @@ func uploadLimitMessage(got, limit int64, what string) string {
 	if got > 0 {
 		gotStr = files.FormatSize(got)
 	}
-	return fmt.Sprintf("%s：你传了 %s，上限是 %s。建议：① 用「⬆ 上传文件夹」把网站按子目录分批传上去；"+
-		"② 先在本地分卷压缩（例如 site.part1.zip）再逐个上传；③ 也可以先把压缩包传上来，再用「解压」。",
+	return fmt.Sprintf("%s：你传了 %s，上限是 %s。出路①：本机分卷压缩后分次上传。"+
+		"出路②：用命令行（终端）直接放到目标目录。",
 		what, gotStr, files.FormatSize(limit))
 }
 
@@ -90,8 +94,8 @@ var errUploadTooLarge = errors.New("上传内容超过上限")
 //  2. MaxBytesReader 边收边算 —— 分块传输（ContentLength=-1）或前端谎报时兜底。
 //
 // 为什么抽成一个带 limit 参数的函数：单测没法真造一个 >4GB 的请求体，
-// 但可以用一个小 limit 走完"MaxBytesReader 截断 → 判成超限"这条路径。
-// 直接把 maxUpload 写死在函数体里，这条路就永远不会被测到。
+// 但可以用一个小 limit（或注入一个小的 panel_upload_limit）走完
+// "MaxBytesReader 截断 → 判成超限"这条路径。
 func readUploadForm(r *http.Request, limit int64) error {
 	if r.ContentLength > limit {
 		return errUploadTooLarge

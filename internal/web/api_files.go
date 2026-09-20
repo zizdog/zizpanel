@@ -1083,35 +1083,15 @@ func urlEncode(s string) string {
 	return b.String()
 }
 
-// maxUpload 是**面板自身**允许的单次上传请求体上限（含 multipart 开销）。
-//
-// 为什么是 4GB：
-//   - 用户报障的真实场景是「新建站点 + 传 978MB 的网站包」。旧的 512MB 太小，
-//     而且超限是在**浏览器已经把 512MB 传完**之后才被服务端拒绝的 ——
-//     用户白等了半天，只得到一句失败。
-//   - 2GB 是很多浏览器的单次请求/文件系统的心理门槛，4GB 留出余量，
-//     也覆盖"一个中等站点 + 一堆图片/视频"的常见情形。
-//
-// 为什么不放进设置项（internal/config）：
-//   - nginx 的 client_max_body_size 与 PHP 的 upload_max_filesize/post_max_size
-//     才是"用户自己网站"的 413 来源，那条链路已经另有面板入口
-//     （「设置 → 上传与执行限制」，见 api_upload_limits.go）。两件事别混在一起：
-//     那条链路限制的是**别的程序**（phpMyAdmin、Typecho 后台）收多大的请求，
-//     这里限制的是**面板自己**收多大的请求。
-//   - 面板自身这个上限的目的是"别让用户在浏览器里白传几个 GB 才被拒"，
-//     不是让用户调的业务参数。做成设置项只会制造"调小了传不动、
-//     调大了内存/磁盘被吃满"的坑。
-//
-// 单文件与总大小都受它约束（整个请求体就是一个 multipart）；「上传文件夹」的
-// 总大小同样受限，但可以做**增量**：传失败的那几个在结果里逐个列出，重传即可。
-const maxUpload = int64(4) << 30 // 4 GiB
-
 // handleFileUpload 上传文件（multipart/form-data）。
 //
 // 支持两种形态，共用一条路由：
 //   - 普通上传：多个 `files` 字段，落在目标目录里；
 //   - 「上传文件夹」：额外带一个 `relpaths` 字段（JSON 数组，与 `files` 顺序一一对应），
 //     后端按相对路径在目标目录下重建目录树。
+//
+// 上限（每次请求的请求体）来自 s.panelUploadLimit() —— 可配、可注入。
+// 「整批总大小」**不是**判据：前端按"每次请求 ≤ 上限"自动分批（见 uploadplan.js）。
 //
 // 同名文件怎么办由 `on_conflict` 决定（前端会先弹窗问用户，再把选择传上来）：
 //   - "rename"（普通上传默认）：保留两者，自动加 -1/-2 序号；
@@ -1129,12 +1109,18 @@ func (s *Server) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	limitView := s.panelUploadLimit()
+	limit := limitView.LimitBytes
 	// 两道判据都在 readUploadForm 里（先看 ContentLength，再用 MaxBytesReader 边收边算），
-	// 超限一律 413 + 人话：含实际大小、上限、以及两条可执行的建议。
-	if err := readUploadForm(r, maxUpload); err != nil {
+	// 超限一律 413 + 人话：含实际大小、上限、以及**可执行**的出路。
+	if err := readUploadForm(r, limit); err != nil {
 		if errors.Is(err, errUploadTooLarge) {
-			fail(w, http.StatusRequestEntityTooLarge,
-				uploadLimitMessage(r.ContentLength, maxUpload, "请求体过大"))
+			msg := uploadLimitMessage(r.ContentLength, limit, "请求体过大")
+			if !limitView.Verified {
+				// 读不到配置就别让用户以为这个数字是真实生效值 —— 如实标"未复核"。
+				msg += "（注意：" + limitView.Note + "）"
+			}
+			fail(w, http.StatusRequestEntityTooLarge, msg)
 			return
 		}
 		fail(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())

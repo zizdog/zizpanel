@@ -179,6 +179,13 @@ type Config struct {
 	PHPMemoryLimit         string `json:"php_memory_limit"`
 	PHPMaxExecutionTime    int    `json:"php_max_execution_time"`
 
+	// PanelUploadLimit 是**面板自己**单次上传请求体的上限（值如 "4g"）。
+	//
+	// 与上面那组限制不是一回事：那组限制的是用户站点（nginx/PHP 收多大），
+	// 这一条限制的是面板自己的路由收多大 multipart。做成配置项是为了**可配/可注入**：
+	// 把它调小（例如 4m）就能在真机上走完"分批上传 + 单文件拒绝"整条链路。
+	PanelUploadLimit string `json:"panel_upload_limit"`
+
 	// DockerSocket 为空表示 Docker 不可用。
 	DockerSocket string `json:"docker_socket"`
 
@@ -188,6 +195,13 @@ type Config struct {
 
 // DefaultRoot 是面板的默认安装根目录。
 const DefaultRoot = "/opt/zizpanel"
+
+// DefaultPanelUploadLimit 是**面板自己**单次上传请求体上限的默认值（唯一默认值来源）。
+//
+// 为什么是 4g：2GB 是很多浏览器单次请求的心理门槛，4GB 留余量，能覆盖
+// "一个中等站点 + 一堆图片/视频"。注意它**不再**是"整批总大小"的判据 ——
+// 文件夹上传按"每次请求 ≤ 这个上限"自动分批，总大小不参与拒绝判定。
+const DefaultPanelUploadLimit = "4g"
 
 // root 返回面板安装根目录。
 //
@@ -325,6 +339,7 @@ func Default() *Config {
 		PHPPostMaxSize:         "512M",
 		PHPMemoryLimit:         "512M",
 		PHPMaxExecutionTime:    300,
+		PanelUploadLimit:       DefaultPanelUploadLimit,
 	}
 	c.applyBrewPrefix(brew)
 	c.TLSCert = filepath.Join(c.DataDir, "tls", "panel.crt")
@@ -641,6 +656,10 @@ func (c *Config) fill() {
 	}
 	if c.PHPMaxExecutionTime <= 0 {
 		c.PHPMaxExecutionTime = d.PHPMaxExecutionTime
+	}
+	// 面板自己的上传上限：老配置没有这个字段 → 补默认。
+	if strings.TrimSpace(c.PanelUploadLimit) == "" {
+		c.PanelUploadLimit = d.PanelUploadLimit
 	}
 }
 
