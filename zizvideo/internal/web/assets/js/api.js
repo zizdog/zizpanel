@@ -109,6 +109,8 @@ export const api = {
   mediaList: (params) => envelope("GET", "/api/v1/media" + queryString(params), undefined, false),
   media: (id) => request("GET", "/api/v1/media/" + encodeURIComponent(id)),
   feedNext: (params) => envelope("GET", "/api/v1/feed/next" + queryString(params), undefined, false),
+  feedSettings: () => request("GET", "/api/v1/feed/settings"),
+  patchFeedSettings: (body) => request("PATCH", "/api/v1/feed/settings", body),
 
   patchProgress: (mediaId, body) => request("PATCH", "/api/v1/me/progress/" + encodeURIComponent(mediaId), body),
   myProgress: () => request("GET", "/api/v1/me/progress"),

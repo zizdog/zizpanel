@@ -469,6 +469,163 @@ function mountUsers(root) {
   refresh();
 }
 
+/* ---------- 注册开关（条目 8） ---------- */
+
+function mountSettings(root) {
+  const note = banner();
+  const box = el("div", { class: "panel" });
+  const state = el("div", { class: "muted small-note" });
+  const toggle = el("input", { type: "checkbox" });
+  const label = el("label", { class: "check" }, toggle, el("span", { text: "允许任何人自助注册" }));
+  const refresh = button("重新回读", () => load());
+  box.append(el("div", { class: "row" }, label, refresh), state,
+    el("div", { class: "muted small-note", text: "默认关；开关写回 config.json，回读一致才算生效。" }));
+  root.append(note, box);
+
+  function render(data) {
+    toggle.checked = !!data.allow_register;
+    const parts = ["生效值：" + (data.allow_register ? "开" : "关")];
+    if (data.verified) parts.push("已回读复核");
+    else parts.push("未复核" + (data.note ? "（" + data.note + "）" : ""));
+    if (data.env_override) parts.push("ZV_ALLOW_REGISTER 已覆盖");
+    state.textContent = parts.join("；");
+  }
+
+  async function load() {
+    setBanner(note, "");
+    try {
+      render(await api.request("GET", "/api/v1/admin/settings"));
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "加载失败");
+    }
+  }
+
+  toggle.addEventListener("change", async () => {
+    setBanner(note, "");
+    toggle.disabled = true;
+    try {
+      render(await api.request("PATCH", "/api/v1/admin/settings", { allow_register: toggle.checked }));
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "保存失败");
+      await load();
+    } finally {
+      toggle.disabled = false;
+    }
+  });
+
+  load();
+}
+
+/* ---------- 媒体去重（条目 11） ---------- */
+
+function mountDuplicates(root) {
+  const note = banner();
+  const timers = [];
+  const detect = el("button", { class: "btn primary", type: "button", text: "检测疑似重复" });
+  const summary = el("div", { class: "muted" });
+  const progress = el("div", { class: "muted" });
+  const confirmInput = input({ placeholder: "输入「删除文件」才可删文件" });
+  const { table, body } = gridOf(["选", "标题", "媒体库", "路径", "时长", "大小", "加入时间", "文件"]);
+  const selected = new Set();
+
+  function render(list) {
+    clear(body);
+    selected.clear();
+    if (!list.length) { body.append(emptyRow(8, "没有疑似重复")); return; }
+    for (const group of list) {
+      body.append(el("tr", null, el("td", { colspan: "8",
+        text: "疑似重复组：大小 " + fmtBytes(group.size_bytes) + "、时长 " + fmtDuration(group.duration_ms) +
+          "（" + group.members.length + " 个）" })));
+      for (const member of group.members) {
+        const check = el("input", { type: "checkbox" });
+        check.addEventListener("change", () => {
+          if (check.checked) selected.add(member.id); else selected.delete(member.id);
+        });
+        body.append(el("tr", null, el("td", null, check), cell(member.title || "-"),
+          cell(member.library_name || member.library_id), cell(member.path),
+          cell(fmtDuration(member.duration_ms)), cell(fmtBytes(member.size_bytes)),
+          cell(fmtDate(member.created_at)), cell(member.file_exists ? "在" : "不在")));
+      }
+    }
+  }
+
+  async function load() {
+    setBanner(note, "");
+    detect.disabled = true;
+    summary.textContent = "检测中…";
+    try {
+      const data = await api.request("GET", "/api/v1/admin/duplicates");
+      render(data.groups || []);
+      summary.textContent = (data.judgement || "") + " 共 " + (data.group_count || 0) +
+        " 组 / " + (data.member_count || 0) + " 个";
+    } catch (err) {
+      summary.textContent = "";
+      setBanner(note, err && err.message ? err.message : "检测失败");
+    } finally {
+      detect.disabled = false;
+    }
+  }
+
+  function pollTask(taskId) {
+    const timer = setInterval(async () => {
+      try {
+        const task = await api.request("GET", "/api/v1/scan-tasks/" + encodeURIComponent(taskId));
+        progress.textContent = "删文件：" + (task.scanned || 0) + "/" + (task.total || 0) +
+          "，成功 " + (task.updated || 0) + "，失败 " + (task.failed || 0);
+        if (task.status === "success" || task.status === "failed" || task.status === "interrupted") {
+          clearInterval(timer);
+          progress.textContent += "（" + task.status + "）" + (task.error ? "：" + task.error : "");
+          load();
+        }
+      } catch (err) {
+        clearInterval(timer);
+        setBanner(note, err && err.message ? err.message : "查询任务失败");
+      }
+    }, 1000);
+    timers.push(timer);
+  }
+
+  const delRecords = button("删除所选面板记录", async () => {
+    const ids = Array.from(selected);
+    if (!ids.length) { setBanner(note, "请先勾选记录"); return; }
+    if (!window.confirm("只删面板记录，磁盘文件保留。继续？")) return;
+    setBanner(note, "");
+    try {
+      const data = await api.request("POST", "/api/v1/admin/duplicates/delete-records", { ids });
+      await load();
+      setBanner(note, "已删除 " + (data.deleted || 0) + " 条记录，文件未动");
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "删除失败");
+    }
+  });
+
+  const delFiles = button("删除所选文件（危险）", async () => {
+    const ids = Array.from(selected);
+    if (!ids.length) { setBanner(note, "请先勾选文件"); return; }
+    const typed = confirmInput.value.trim();
+    if (typed !== "删除文件") { setBanner(note, "请手动输入「删除文件」确认"); return; }
+    if (!window.confirm("永久删除磁盘上的 " + ids.length + " 个文件，不可恢复。继续？")) return;
+    setBanner(note, "");
+    try {
+      const data = await api.request("POST", "/api/v1/admin/duplicates/delete-files",
+        { ids, confirm: typed });
+      confirmInput.value = "";
+      setBanner(note, "任务 " + data.task_id + " 已提交，共 " + (data.total || 0) + " 个");
+      pollTask(data.task_id);
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "提交失败");
+    }
+  }, "danger");
+
+  root.append(note, el("div", { class: "panel" },
+    el("div", { class: "row" }, detect, summary),
+    el("div", { class: "muted small-note", text: "判据：大小 + 时长相同 ⇒ 疑似重复，不代表内容相同。" }),
+    el("div", { class: "row" }, delRecords, confirmInput, delFiles), progress), table);
+  load();
+
+  return () => { for (const timer of timers) clearInterval(timer); };
+}
+
 /* ---------- 系统 ---------- */
 
 function mountSystem(root) {
@@ -506,11 +663,25 @@ export function mountAdmin(view) {
   const note = banner();
   const tabs = el("nav", { class: "tabs" });
   const panel = el("div", { class: "admin-body" });
+  // 条目 12：顶部固定的「返回播放」，Esc 也能回播放页
+  const back = el("a", {
+    class: "btn small admin-back", href: "#/feed", text: "← 返回播放",
+    dataset: { role: "back-to-feed" },
+  });
+  function onBackKey(event) {
+    if (event.key !== "Escape") return;
+    if (document.querySelector(".modal-overlay, .picker-overlay")) return;
+    event.preventDefault();
+    location.hash = "#/feed";
+  }
+  document.addEventListener("keydown", onBackKey);
   const definitions = [
     { key: "libraries", label: "媒体库", mount: mountLibraries },
     { key: "media", label: "媒体", mount: mountMedia },
     { key: "roots", label: "媒体允许根", mount: mountRoots },
     { key: "users", label: "用户", mount: mountUsers },
+    { key: "settings", label: "注册开关", mount: mountSettings },
+    { key: "duplicates", label: "媒体去重", mount: mountDuplicates },
     { key: "system", label: "系统", mount: mountSystem },
   ];
   const tabButtons = new Map();
@@ -533,8 +704,11 @@ export function mountAdmin(view) {
     tabs.append(tabButton);
   }
 
-  view.append(el("div", { class: "admin" }, note, tabs, panel));
+  view.append(el("div", { class: "admin" }, back, note, tabs, panel));
   select("libraries");
 
-  return () => { if (cleanup) cleanup(); };
+  return () => {
+    document.removeEventListener("keydown", onBackKey);
+    if (cleanup) cleanup();
+  };
 }

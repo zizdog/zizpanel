@@ -139,25 +139,7 @@ func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, items[0], nil)
 }
 
-// HandleFeedNext returns the next batch of playable media, newest first.
-func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
-	libraryID := r.URL.Query().Get("library_id")
-	lastID := r.URL.Query().Get("last_id")
-	limit := queryInt(r, "limit", 10, 1, 50)
-	rows, err := s.DB.FeedNext(libraryID, lastID, limit)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	items := s.buildItems(rows, r, false)
-	next := ""
-	if len(items) > 0 {
-		next = items[len(items)-1].ID
-	}
-	respond(w, http.StatusOK, map[string]any{"list": items}, map[string]any{
-		"next_cursor": next, "has_more": len(items) == limit,
-	})
-}
+// HandleFeedNext lives in handlers_feed.go (seeded random cycle).
 
 // HandleStream serves the raw file with full Range semantics.
 func (s *Server) HandleStream(w http.ResponseWriter, r *http.Request) {

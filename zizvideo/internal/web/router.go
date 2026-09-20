@@ -46,17 +46,44 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("GET /api/v1/media/{id}/stream", s.RequireAuth(s.HandleStream))
 	mux.HandleFunc("GET /api/v1/media/{id}/cover", s.RequireAuth(s.HandleCover))
 	mux.HandleFunc("GET /api/v1/feed/next", s.RequireAuth(s.HandleFeedNext))
+	mux.HandleFunc("GET /api/v1/feed/settings", s.RequireAuth(s.HandleGetFeedSettings))
+	mux.HandleFunc("PATCH /api/v1/feed/settings", s.RequireAuth(s.HandlePatchFeedSettings))
 
 	mux.HandleFunc("PATCH /api/v1/me/progress/{mediaId}", s.RequireAuth(s.HandlePatchProgress))
 	mux.HandleFunc("GET /api/v1/me/progress", s.RequireAuth(s.HandleListProgress))
+	mux.HandleFunc("DELETE /api/v1/me/progress", s.RequireAuth(s.HandleClearProgress))
+	mux.HandleFunc("GET /api/v1/me/favorites", s.RequireAuth(s.HandleListFavorites))
+	mux.HandleFunc("DELETE /api/v1/me/favorites", s.RequireAuth(s.HandleClearFavorites))
+	mux.HandleFunc("GET /api/v1/me/likes", s.RequireAuth(s.HandleListLikes))
+	mux.HandleFunc("DELETE /api/v1/me/likes", s.RequireAuth(s.HandleClearLikes))
 	mux.HandleFunc("POST /api/v1/me/favorites/{mediaId}", s.RequireAuth(s.HandleAddFavorite))
 	mux.HandleFunc("DELETE /api/v1/me/favorites/{mediaId}", s.RequireAuth(s.HandleRemoveFavorite))
 	mux.HandleFunc("POST /api/v1/media/{id}/reactions", s.RequireAuth(s.HandleSetReaction))
 	mux.HandleFunc("PATCH /api/v1/media/{id}/reactions", s.RequireAuth(s.HandleSetReaction))
 	mux.HandleFunc("DELETE /api/v1/media/{id}/reactions", s.RequireAuth(s.HandleDeleteReaction))
 
+	// 剧场（短剧）：读给所有登录用户，写只有管理员；剧集只引用已有 media。
+	mux.HandleFunc("GET /api/v1/series", s.RequireAuth(s.HandleListSeries))
+	mux.HandleFunc("GET /api/v1/series/{id}", s.RequireAuth(s.HandleGetSeries))
+	mux.HandleFunc("POST /api/v1/admin/series", s.RequireAdmin(s.HandleCreateSeries))
+	mux.HandleFunc("PATCH /api/v1/admin/series/{id}", s.RequireAdmin(s.HandlePatchSeries))
+	mux.HandleFunc("DELETE /api/v1/admin/series/{id}", s.RequireAdmin(s.HandleDeleteSeries))
+	mux.HandleFunc("POST /api/v1/admin/series/{id}/media", s.RequireAdmin(s.HandleAddSeriesMedia))
+	mux.HandleFunc("DELETE /api/v1/admin/series/{id}/media/{mediaId}", s.RequireAdmin(s.HandleRemoveSeriesMedia))
+	mux.HandleFunc("PUT /api/v1/admin/series/{id}/order", s.RequireAdmin(s.HandleReorderSeries))
+
 	mux.HandleFunc("GET /api/v1/admin/system/info", s.RequireAdmin(s.HandleSystemInfo))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.RequireAdmin(s.HandleAuditList))
+
+	// 条目 8：注册开关（默认关）+ 唯一公开自助注册入口。
+	mux.HandleFunc("GET /api/v1/admin/settings", s.RequireAdmin(s.HandleGetAdminSettings))
+	mux.HandleFunc("PATCH /api/v1/admin/settings", s.RequireAdmin(s.HandlePatchAdminSettings))
+	mux.HandleFunc("POST /api/v1/auth/register", s.HandleRegister)
+
+	// 条目 11：媒体去重（判据 size+duration，默认只删记录）。
+	mux.HandleFunc("GET /api/v1/admin/duplicates", s.RequireAdmin(s.HandleListDuplicates))
+	mux.HandleFunc("POST /api/v1/admin/duplicates/delete-records", s.RequireAdmin(s.HandleDeleteDuplicateRecords))
+	mux.HandleFunc("POST /api/v1/admin/duplicates/delete-files", s.RequireAdmin(s.HandleDeleteDuplicateFiles))
 
 	// Allow roots + the directory picker. The literal "roots" path is registered
 	// before the wildcard, so /media/roots never falls through to /media/{id}.

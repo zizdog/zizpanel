@@ -163,3 +163,65 @@ func (db *DB) Reactions(userID string) (map[string]string, error) {
 	}
 	return out, rows.Err()
 }
+
+// mediaJoin returns media rows joined through a per-user table, newest first.
+// orderCol 由调用方给出：favorites 有 created_at，reactions 只有 updated_at。
+func (db *DB) mediaJoin(table, orderCol, userID string, limit int, extra string) ([]domain.Media, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	q := `SELECT ` + mediaColsQ + ` FROM ` + table + ` t JOIN media m ON m.id = t.media_id
+		WHERE t.user_id = ? AND m.deleted_at IS NULL ` + extra + `
+		ORDER BY ` + orderCol + ` DESC LIMIT ?`
+	rows, err := db.Query(q, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.Media{}
+	for rows.Next() {
+		m, err := scanMedia(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// ListFavorites returns a user's favorited media, newest first.
+func (db *DB) ListFavorites(userID string, limit int) ([]domain.Media, error) {
+	return db.mediaJoin("favorites", "t.created_at", userID, limit, "")
+}
+
+// ListLikes returns a user's liked media, newest first.
+func (db *DB) ListLikes(userID string, limit int) ([]domain.Media, error) {
+	return db.mediaJoin("reactions", "t.updated_at", userID, limit, `AND t.kind = 'like' `)
+}
+
+// ClearFavorites deletes every favorite row of a user and reports the real count.
+func (db *DB) ClearFavorites(userID string) (int64, error) {
+	res, err := db.Exec(`DELETE FROM favorites WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ClearLikes deletes every like row of a user and reports the real count.
+func (db *DB) ClearLikes(userID string) (int64, error) {
+	res, err := db.Exec(`DELETE FROM reactions WHERE user_id = ? AND kind = 'like'`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ClearProgress deletes every watch-history row of a user.
+func (db *DB) ClearProgress(userID string) (int64, error) {
+	res, err := db.Exec(`DELETE FROM watch_progress WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

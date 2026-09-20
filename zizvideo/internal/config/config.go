@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,8 @@ type Config struct {
 	LockoutThreshold   int      `json:"lockout_threshold"`
 	LockoutWindowMin   int      `json:"lockout_window_minutes"`
 	SecureCookie       bool     `json:"secure_cookie"`
+	// AllowRegister 默认关：关闭时唯一公开注册入口 POST /auth/register 直接拒绝。
+	AllowRegister bool `json:"allow_register"`
 }
 
 // Default returns the built-in defaults; allow roots default to $HOME/Movies
@@ -57,6 +61,7 @@ func Default() *Config {
 		SessionTTLHours:    336,
 		LockoutThreshold:   5,
 		LockoutWindowMin:   15,
+		AllowRegister:      false,
 	}
 }
 
@@ -111,6 +116,7 @@ func applyEnv(c *Config) {
 	setInt(&c.LockoutThreshold, "ZV_LOCKOUT_THRESHOLD")
 	setInt(&c.SessionTTLHours, "ZV_SESSION_TTL_HOURS")
 	setBool(&c.SecureCookie, "ZV_SECURE_COOKIE")
+	setBool(&c.AllowRegister, "ZV_ALLOW_REGISTER")
 	if v := os.Getenv("ZV_MEDIA_ALLOW_ROOTS"); v != "" {
 		c.MediaAllowRoots = splitList(v)
 	}
@@ -232,4 +238,133 @@ func AllowRoot(root string) (string, error) {
 		return "", err
 	}
 	return resolved, nil
+}
+
+// ============================================================================
+//  allow_register live switch（条目 8）
+// ============================================================================
+
+// RegisterSwitch is the live allow_register value. Writes go to config.json and
+// are only adopted after a successful read-back, so "保存成功" 永远等于"已生效"
+// （坑 164）。读不到就由 State() 如实标未复核。
+type RegisterSwitch struct {
+	mu    sync.Mutex
+	fpath string
+	on    atomic.Bool
+}
+
+// NewRegisterSwitch builds the switch; ZV_ALLOW_REGISTER wins over the file.
+func NewRegisterSwitch(fpath string, initial bool) *RegisterSwitch {
+	r := &RegisterSwitch{fpath: fpath}
+	if v, ok := os.LookupEnv("ZV_ALLOW_REGISTER"); ok && v != "" {
+		r.on.Store(v == "1" || strings.EqualFold(v, "true"))
+	} else {
+		r.on.Store(initial)
+	}
+	return r
+}
+
+// On reports the value currently in effect.
+func (r *RegisterSwitch) On() bool { return r.on.Load() }
+
+// Path is the config file this switch persists to; "" means no file.
+func (r *RegisterSwitch) Path() string { return r.fpath }
+
+// FileBacked reports whether a write can be persisted at all.
+func (r *RegisterSwitch) FileBacked() bool { return r.fpath != "" }
+
+// EnvOverridden reports whether ZV_ALLOW_REGISTER replaces the file value.
+func (r *RegisterSwitch) EnvOverridden() bool {
+	v, ok := os.LookupEnv("ZV_ALLOW_REGISTER")
+	return ok && v != ""
+}
+
+// RegisterState is what the admin page reads back: effective value plus whether
+// it could actually be re-read from config.json.
+type RegisterState struct {
+	AllowRegister bool   `json:"allow_register"`
+	Verified      bool   `json:"verified"`
+	Source        string `json:"source"`
+	FileValue     *bool  `json:"file_value"`
+	ConfigPath    string `json:"config_path"`
+	EnvOverride   bool   `json:"env_override"`
+	Note          string `json:"note,omitempty"`
+}
+
+// State re-reads the config file and compares it with the live value. A missing
+// or unreadable file yields verified=false with an honest note.
+func (r *RegisterSwitch) State() RegisterState {
+	st := RegisterState{AllowRegister: r.On(), ConfigPath: r.fpath, EnvOverride: r.EnvOverridden()}
+	if st.EnvOverride {
+		st.Source, st.Verified = "env", true
+		st.Note = "ZV_ALLOW_REGISTER 已覆盖配置文件"
+		return st
+	}
+	if r.fpath == "" {
+		st.Source = "default"
+		st.Note = "没有配置文件，无法回读生效值"
+		return st
+	}
+	v, err := RegisterFromFile(r.fpath)
+	if err != nil {
+		st.Source = "unreadable"
+		st.Note = "读取配置文件失败: " + err.Error()
+		return st
+	}
+	st.Source = "config"
+	st.FileValue = &v
+	if v == st.AllowRegister {
+		st.Verified = true
+	} else {
+		st.Note = "配置文件值与进程内生效值不一致（需重启）"
+	}
+	return st
+}
+
+// Set writes allow_register, re-reads it, and only adopts the value when the
+// read-back matches. Env override / missing file are refused with a reason.
+func (r *RegisterSwitch) Set(on bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.EnvOverridden() {
+		return fmt.Errorf("ZV_ALLOW_REGISTER 已覆盖，配置文件不会生效")
+	}
+	if r.fpath == "" {
+		return fmt.Errorf("没有配置文件，无法写入（用 --config 或 ZV_CONFIG 指定）")
+	}
+	raw, err := readConfigMap(r.fpath)
+	if err != nil {
+		return err
+	}
+	raw["allow_register"] = json.RawMessage(strconv.FormatBool(on))
+	if err := writeAtomic(r.fpath, raw); err != nil {
+		return fmt.Errorf("写入配置失败: %w", err)
+	}
+	back, err := RegisterFromFile(r.fpath)
+	if err != nil {
+		return fmt.Errorf("回读配置失败: %w", err)
+	}
+	if back != on {
+		return fmt.Errorf("回读配置与写入不一致，未生效")
+	}
+	r.on.Store(on)
+	return nil
+}
+
+// RegisterFromFile reads allow_register from config.json; a missing key means
+// the documented default (false).
+func RegisterFromFile(path string) (bool, error) {
+	raw, err := readConfigMap(path)
+	if err != nil {
+		return false, err
+	}
+	v, ok := raw["allow_register"]
+	if !ok {
+		return false, nil
+	}
+	var b bool
+	if err := json.Unmarshal(v, &b); err != nil {
+		return false, fmt.Errorf("allow_register 必须是布尔值")
+	}
+	return b, nil
 }

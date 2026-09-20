@@ -16,6 +16,12 @@ func newLib(id, name, root string) *domain.Library {
 // database gets every table, and repeated startups are a no-op.
 func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db", "zizvideo.db")
+	// 版本号从迁移文件数推导：并行加迁移时不会因为写死数字而误报。
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(migs)
 
 	db, err := Open(path)
 	if err != nil {
@@ -25,12 +31,13 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("schema 版本 = %d, 期望 1", v)
+	if v != migs[len(migs)-1].version {
+		t.Fatalf("schema 版本 = %d, 期望 %d", v, migs[len(migs)-1].version)
 	}
 	for _, table := range []string{
 		"schema_migrations", "users", "sessions", "media_libraries", "media",
 		"scan_tasks", "watch_progress", "favorites", "reactions", "audit_log",
+		"series", "series_media",
 	} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
@@ -57,15 +64,30 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v2 != 1 {
-		t.Fatalf("重复启动后 schema 版本 = %d", v2)
+	if v2 != v {
+		t.Fatalf("重复启动后 schema 版本 = %d, 期望 %d", v2, v)
 	}
 	var applied int
 	if err := db2.QueryRow(`SELECT COUNT(1) FROM schema_migrations`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
-	if applied != 1 {
-		t.Fatalf("迁移记录数 = %d, 期望 1", applied)
+	if applied != want {
+		t.Fatalf("迁移记录数 = %d, 期望 %d", applied, want)
+	}
+}
+
+// TestMigrationVersionsAreUnique 锁死"同版本号会被静默跳过"这类问题。
+func TestMigrationVersionsAreUnique(t *testing.T) {
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("迁移加载失败: %v", err)
+	}
+	seen := map[int]string{}
+	for _, m := range migs {
+		if prev, ok := seen[m.version]; ok {
+			t.Fatalf("迁移版本号 %d 重复: %s 与 %s", m.version, prev, m.name)
+		}
+		seen[m.version] = m.name
 	}
 }
 

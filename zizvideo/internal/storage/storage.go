@@ -85,6 +85,12 @@ func loadMigrations() ([]migration, error) {
 		out = append(out, migration{version: v, name: e.Name(), sql: string(body)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
+	// 同版本号会让后一个迁移被静默跳过（Migrate 按 version 判重），必须当错误报出来。
+	for i := 1; i < len(out); i++ {
+		if out[i].version == out[i-1].version {
+			return nil, fmt.Errorf("迁移版本号重复: %s 与 %s", out[i-1].name, out[i].name)
+		}
+	}
 	return out, nil
 }
 

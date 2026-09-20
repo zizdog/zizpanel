@@ -89,6 +89,30 @@ type Media struct {
 	UpdatedAt    string  `json:"updated_at"`
 }
 
+// Series is a 剧场（短剧）: an ordered list of already-scanned media items.
+// It never owns a file; episodes only reference existing media rows.
+type Series struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	CoverMediaID string `json:"cover_media_id,omitempty"`
+	LibraryID    string `json:"library_id,omitempty"`
+	SortOrder    int    `json:"sort_order"`
+	EpisodeCount int    `json:"episode_count"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+}
+
+// SeriesEpisode places one existing media item at a 1-based position; Position
+// doubles as the displayed "第 N 集".
+type SeriesEpisode struct {
+	SeriesID string `json:"series_id"`
+	MediaID  string `json:"media_id"`
+	Position int    `json:"position"`
+	Episode  int    `json:"episode"`
+	AddedAt  string `json:"added_at"`
+}
+
 // ScanTask is a persisted scan job's state.
 type ScanTask struct {
 	ID         string `json:"id"`
@@ -155,4 +179,8 @@ var (
 
 	ErrScanRunning  = New("SCAN_ALREADY_RUNNING", "该媒体库已有扫描在进行", 409)
 	ErrTaskNotFound = New("TASK_NOT_FOUND", "任务不存在", 404)
+
+	ErrSeriesTitle     = New("SERIES_TITLE_REQUIRED", "剧场标题不能为空", 400)
+	ErrSeriesDuplicate = New("SERIES_DUPLICATE_MEDIA", "该媒体已在本剧场中", 409)
+	ErrSeriesOrder     = New("SERIES_ORDER_MISMATCH", "排序列表与剧场成员不一致，请刷新后重试", 409)
 )

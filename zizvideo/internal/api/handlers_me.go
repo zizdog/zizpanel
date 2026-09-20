@@ -136,3 +136,67 @@ func (s *Server) HandleDeleteReaction(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, http.StatusOK, map[string]any{"kind": nil}, nil)
 }
+
+// ============================================================================
+//  收藏页三个 Tab：点赞 / 收藏 / 历史（每个都能清除记录，条数如实回传）
+// ============================================================================
+
+// HandleListFavorites returns the caller's favorites, newest first.
+func (s *Server) HandleListFavorites(w http.ResponseWriter, r *http.Request) {
+	u := UserFrom(r.Context())
+	limit := queryInt(r, "limit", 100, 1, 200)
+	rows, err := s.DB.ListFavorites(u.ID, limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{"list": s.buildItems(rows, r, false)}, nil)
+}
+
+// HandleListLikes returns the caller's liked media, newest first.
+func (s *Server) HandleListLikes(w http.ResponseWriter, r *http.Request) {
+	u := UserFrom(r.Context())
+	limit := queryInt(r, "limit", 100, 1, 200)
+	rows, err := s.DB.ListLikes(u.ID, limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{"list": s.buildItems(rows, r, false)}, nil)
+}
+
+// HandleClearFavorites deletes every favorite row and reports the real count.
+func (s *Server) HandleClearFavorites(w http.ResponseWriter, r *http.Request) {
+	u := UserFrom(r.Context())
+	n, err := s.DB.ClearFavorites(u.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.audit(r, "me.favorites.clear", "user:"+u.ID, true, "")
+	respond(w, http.StatusOK, map[string]any{"cleared": n}, nil)
+}
+
+// HandleClearLikes deletes every like row and reports the real count.
+func (s *Server) HandleClearLikes(w http.ResponseWriter, r *http.Request) {
+	u := UserFrom(r.Context())
+	n, err := s.DB.ClearLikes(u.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.audit(r, "me.likes.clear", "user:"+u.ID, true, "")
+	respond(w, http.StatusOK, map[string]any{"cleared": n}, nil)
+}
+
+// HandleClearProgress deletes the caller's whole watch history.
+func (s *Server) HandleClearProgress(w http.ResponseWriter, r *http.Request) {
+	u := UserFrom(r.Context())
+	n, err := s.DB.ClearProgress(u.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.audit(r, "me.progress.clear", "user:"+u.ID, true, "")
+	respond(w, http.StatusOK, map[string]any{"cleared": n}, nil)
+}

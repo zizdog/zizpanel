@@ -5,6 +5,10 @@ import { clear } from "./js/dom.js";
 import { session, loadMe, renderHeader, mountLogin, mountSetup, doLogout } from "./js/auth.js";
 import { mountFeed } from "./js/feed.js";
 import { mountAdmin } from "./js/admin.js";
+import { mountNav } from "./js/nav.js";
+import { mountSeries, mountSeriesPlay } from "./js/series.js";
+import { mountFavorites } from "./js/favorites.js";
+import { mountMe } from "./js/me.js";
 
 const headerEl = document.getElementById("header");
 const viewEl = document.getElementById("view");
@@ -45,8 +49,32 @@ function route() {
     return;
   }
   if (!session.user) { replace("#/login"); return; }
+  if (path === "/series") {
+    show((view) => withNav(view, "series", () => mountSeries(view)), false);
+    return;
+  }
+  if (path.startsWith("/series/")) {
+    const id = decodeURIComponent(path.slice("/series/".length));
+    show((view) => withNav(view, "series", () => mountSeriesPlay(view, id)), false);
+    return;
+  }
+  if (path === "/favorites") {
+    show((view) => withNav(view, "favorites", () => mountFavorites(view)), false);
+    return;
+  }
+  if (path === "/me") {
+    show((view) => withNav(view, "me", () => mountMe(view, { onLogout })), false);
+    return;
+  }
   if (path !== "/feed") { replace("#/feed"); return; }
   show((view) => mountFeed(view), false);
+}
+
+// withNav 给新页面挂底栏：mount 先执行，底栏固定在底部，路由切换时随 view 一起清空。
+function withNav(view, active, mount) {
+  const cleanup = mount();
+  view.append(mountNav(active));
+  return typeof cleanup === "function" ? cleanup : null;
 }
 
 function go(hash) {

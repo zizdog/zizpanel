@@ -199,7 +199,8 @@ func TestMediaListPaginationBoundaries(t *testing.T) {
 	}
 }
 
-func TestFeedCursorWalksBackwards(t *testing.T) {
+// TestFeedCursorWalksEveryItemOnce 锁死随机游标：一轮之内每条只出现一次。
+func TestFeedCursorWalksEveryItemOnce(t *testing.T) {
 	e := newEnv(t)
 	e.setupAdmin()
 	lib := e.newLibrary("l", e.Root)
@@ -209,10 +210,10 @@ func TestFeedCursorWalksBackwards(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	cursor := ""
-	for page := 0; page < 5; page++ {
+	for page := 0; page < 6 && len(seen) < 12; page++ {
 		path := "/api/v1/feed/next?limit=5"
 		if cursor != "" {
-			path += "&last_id=" + cursor
+			path += "&cursor=" + cursor
 		}
 		res, env, raw := e.do(http.MethodGet, path, nil)
 		if res.StatusCode != http.StatusOK {
@@ -248,16 +249,8 @@ func TestFeedCursorWalksBackwards(t *testing.T) {
 				t.Fatalf("h264 应可直出: %s", it.ID)
 			}
 		}
-		// Newest first: ids are time-sortable, so each page must descend.
-		for i := 1; i < len(list.List); i++ {
-			if list.List[i-1].ID <= list.List[i].ID {
-				t.Fatalf("feed 不是 id 倒序: %s <= %s", list.List[i-1].ID, list.List[i].ID)
-			}
-		}
+		// 默认随机：顺序由 seed+hash 决定，不再按 id 倒序（见 feed_test.go）。
 		cursor = meta.NextCursor
-		if !meta.HasMore {
-			break
-		}
 	}
 	if len(seen) != 12 {
 		t.Fatalf("游标翻了 %d 条, 期望 12", len(seen))

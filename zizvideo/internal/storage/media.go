@@ -12,6 +12,11 @@ const mediaCols = `id, library_id, path, title, size, mtime_ns, container,
 	video_codec, audio_codec, width, height, duration_ms, bitrate, fps,
 	status, error_class, error_message, COALESCE(missing_since,''), created_at, updated_at`
 
+// mediaColsQ is mediaCols qualified for JOINs (created_at 会被别的表撞名).
+const mediaColsQ = `m.id, m.library_id, m.path, m.title, m.size, m.mtime_ns, m.container,
+	m.video_codec, m.audio_codec, m.width, m.height, m.duration_ms, m.bitrate, m.fps,
+	m.status, m.error_class, m.error_message, COALESCE(m.missing_since,''), m.created_at, m.updated_at`
+
 func scanMedia(s interface{ Scan(...any) error }) (*domain.Media, error) {
 	var m domain.Media
 	if err := s.Scan(&m.ID, &m.LibraryID, &m.Path, &m.Title, &m.Size, &m.MtimeNS, &m.Container,
@@ -192,39 +197,7 @@ func (db *DB) ListMedia(f MediaFilter) ([]domain.Media, int, error) {
 	return out, total, rows.Err()
 }
 
-// FeedNext returns playable media older than the cursor, newest first.
-func (db *DB) FeedNext(libraryID, lastID string, limit int) ([]domain.Media, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
-	q := `SELECT ` + mediaCols + ` FROM media
-		WHERE deleted_at IS NULL AND status = ?`
-	args := []any{domain.MediaReady}
-	if libraryID != "" {
-		q += ` AND library_id = ?`
-		args = append(args, libraryID)
-	}
-	if lastID != "" {
-		q += ` AND id < ?`
-		args = append(args, lastID)
-	}
-	q += ` ORDER BY id DESC LIMIT ?`
-	args = append(args, limit)
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []domain.Media{}
-	for rows.Next() {
-		m, err := scanMedia(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *m)
-	}
-	return out, rows.Err()
-}
+// FeedNext 已被 storage/feed.go 的 seed+hash 随机游标取代（默认随机播放）。
 
 // MediaState is the cheap per-file fingerprint used to skip unchanged files.
 type MediaState struct {
