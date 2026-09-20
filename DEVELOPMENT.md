@@ -111,6 +111,9 @@ make release         # dist/release/：darwin/arm64+amd64 包、签名清单
 make mirror-public   # 生成"指向公网镜像"的清单（url=download/<版本>/）并签名，回读断言无内网地址
 make deploy          # release + 推你自己的镜像机(单流 tar) + 升级本机 + 验证版本
 # 分步亦可：make publish-nas（NAS_HOST/NAS_USER/NAS_ROOT/NAS_PASS 全由调用者提供）/ bash tools/deploy.sh
+# 镜像站与本机同一台机器（外置镜像盘）时：make publish-mirror-local
+#   —— 目录由 MIRROR_LOCAL_ROOT 覆盖（默认 /Volumes/ZPMirror/mirror/zizpanel）；
+#      它按清单逐个核 sha256 才复制，同版本不同字节拒绝覆盖（FORCE=1 才覆盖）。
 ```
 
 - **发布产物只允许公网地址**：`make mirror-public` 的基址直接取自

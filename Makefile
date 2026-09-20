@@ -138,7 +138,7 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@bash tools/check-no-real-credentials.sh
 	@echo "==> 未来日期检查（注释/文档里不许有比今天更晚的日期）" && bash tools/check-future-dates.sh
 	@echo "==> Python 工具语法检查"
-	@python3 -m py_compile tools/make-manifest.py tools/gen-release-notes.py && echo "python 语法 OK"
+	@python3 -m py_compile tools/make-manifest.py tools/gen-release-notes.py tools/publish-local-mirror.py && echo "python 语法 OK"
 	@# 前端语法必须用真正的 ES 解析器校验：`node --check` 对"对象字面量少一个 }"
 	@# 这类错误返回 0，而浏览器直接拒绝执行 → 整个面板白屏、连行号都不给。
 	@# 这个坑真踩过（docker-compose.js / docker-services.js），所以设成门禁。
@@ -299,6 +299,9 @@ NAS_ROOT       ?=
 # NAS_APPS_ROOT 是**应用安装包**镜像目录（与面板镜像同级）：
 #   <NAS_APPS_ROOT>/<应用>/<版本>/<文件名> —— 见 tools/sync-nas-apps.sh
 NAS_APPS_ROOT  ?=
+# MIRROR_LOCAL_ROOT 是"镜像站文档根"这个目录本身（发布件落在哪），给镜像站与本机同一台机器时用。
+# 默认是外置镜像盘；盘搬到别的机器（如镜像站迁到 mini）就用 =<路径> 覆盖，别再写死一处。
+MIRROR_LOCAL_ROOT ?= /Volumes/ZPMirror/mirror/zizpanel
 NAS_PASS       ?=
 # APPS_MIRROR_URL 是应用包镜像的对外基址（= 面板设置里的"镜像基址"）。
 # sync-apps 上传后用它验收；面板也按这个基址取包。
@@ -523,6 +526,21 @@ publish-nas: ## 把当前版本 + 公网镜像版清单推送到你自己的镜�
 		 ls -l download/$(VERSION) | head -4"
 	@echo ""
 	@echo "验证（从这台机器）：curl -sI $(PUBLIC_MIRROR_URL)/manifest.json"
+
+.PHONY: check-mirror-local-root
+check-mirror-local-root: ## 发布前先确认镜像目录在（盘不在本机就立刻失败，别跑到一半）
+	@test -d "$(MIRROR_LOCAL_ROOT)" || { \
+		echo "!! 镜像目录不存在：$(MIRROR_LOCAL_ROOT)"; \
+		echo "   镜像盘不在本机 / 已搬到别的机器：make publish-mirror-local MIRROR_LOCAL_ROOT=<镜像站的 zizpanel 目录>"; \
+		exit 1; }
+
+.PHONY: publish-mirror-local
+publish-mirror-local: check-mirror-local-root mirror-public ## 发布件+清单落到本机镜像目录（默认 /Volumes/ZPMirror/mirror/zizpanel）
+	@# 清单里的 sha 与真要放过去的包必须对得上；同版本不同字节拒绝覆盖（要覆盖 FORCE=1）。
+	@python3 tools/publish-local-mirror.py --release-dir "$(RELDIR)" \
+		--dest "$(MIRROR_LOCAL_ROOT)" --install-sh install.sh $(if $(FORCE),--force,)
+	@echo ""
+	@echo "验证（从公网）：curl -s $(PUBLIC_MIRROR_URL)/manifest.json | head -c 200"
 
 .PHONY: deploy
 deploy: ## 一条命令发布：release + 推镜像机（单流）+ 升级本机 + 验证（生产机不许碰，见 AGENTS 铁律 5）
