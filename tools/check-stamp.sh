@@ -30,11 +30,11 @@ STAMP="$REPO_ROOT/.zp-check-stamp"
 # doc_only 判断"这个文件是不是**只当文档、不进发布产物**"。
 #
 # Markdown 不进发布包（包里只有二进制 + install.sh + RUNTIME_TOOLS），改文档不该让你
-# 重跑 3.5 分钟的门禁。**唯一例外是 RELEASE_NOTES.md** —— 它是 manifest.json 里的
-# 更新说明，会随包发布，所以它必须留在指纹里。
+# 重跑 3.5 分钟的门禁。发布说明早已不是仓库里的静态 .md，而是 tools/gen-release-notes.py
+# 按 git 历史生成、放在 dist/（被 gitignore，不进指纹）—— 所以这里不再有例外。
 doc_only() {
   case "$1" in
-    *.md) [ "$(basename "$1")" = "RELEASE_NOTES.md" ] && return 1 || return 0 ;;
+    *.md) return 0 ;;
     *) return 1 ;;
   esac
 }

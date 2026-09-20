@@ -22,7 +22,10 @@ Makefile 的每条 recipe 行都会起一个新 shell，heredoc 会被拆成一�
 
 用法：
     python3 tools/make-manifest.py --version 0.2.0 --dir dist/release \
-        --base-url https://example.com/releases --notes-file RELEASE_NOTES.md
+        --base-url https://example.com/releases --notes-file dist/release/NOTES.md
+
+`--notes-file` 由 tools/gen-release-notes.py 生成（按版本、不超长）；
+给了文件却不存在时**直接报错**，不再静默产出空 notes。
 """
 import argparse
 import datetime
@@ -98,9 +101,15 @@ def main():
     args = ap.parse_args()
 
     notes = ""
-    if args.notes_file and os.path.exists(args.notes_file):
+    if args.notes_file:
+        if not os.path.exists(args.notes_file):
+            raise SystemExit(
+                f"缺少更新说明文件：{args.notes_file}（先跑 python3 tools/gen-release-notes.py）"
+            )
         with open(args.notes_file, encoding="utf-8") as f:
             notes = f.read().strip()
+        if not notes:
+            raise SystemExit(f"更新说明为空：{args.notes_file}")
 
     arches = tuple(a for a in args.arches.replace(",", " ").split() if a)
     for a in arches:

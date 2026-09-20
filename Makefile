@@ -125,12 +125,12 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && bash -n tools/seed-nas-brew.sh && bash -n tools/sync-embedded-uninstaller.sh && bash -n tools/uninstall-modes-test.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && bash -n tools/seed-nas-brew.sh && bash -n tools/sync-embedded-uninstaller.sh && bash -n tools/uninstall-modes-test.sh && bash -n tools/check-release-notes.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh
+	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh tools/check-release-notes.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh tools/check-release-notes.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@# 真实口令不许进仓库 —— 这条坑复发过两次（v0.3.1 基线 + 第九轮新增文件），
 	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
@@ -138,7 +138,7 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@bash tools/check-no-real-credentials.sh
 	@echo "==> 未来日期检查（注释/文档里不许有比今天更晚的日期）" && bash tools/check-future-dates.sh
 	@echo "==> Python 工具语法检查"
-	@python3 -m py_compile tools/make-manifest.py && echo "python 语法 OK"
+	@python3 -m py_compile tools/make-manifest.py tools/gen-release-notes.py && echo "python 语法 OK"
 	@# 前端语法必须用真正的 ES 解析器校验：`node --check` 对"对象字面量少一个 }"
 	@# 这类错误返回 0，而浏览器直接拒绝执行 → 整个面板白屏、连行号都不给。
 	@# 这个坑真踩过（docker-compose.js / docker-services.js），所以设成门禁。
@@ -180,6 +180,8 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory uninstall-test
 	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
 	@$(MAKE) --no-print-directory server-mode-test
+	@echo "==> 发布说明门禁（版本标题 / 长度 / 无旧版本标题 / 清单一致）"
+	@bash tools/check-release-notes.sh
 	@bash tools/check-stamp.sh write
 	@echo "全部检查通过 ✅"
 
@@ -278,8 +280,10 @@ RELEASE_KEY ?= .release-key/zizpanel-ed25519.key
 CODESIGN_CERT ?= .release-key/codesign/zp-codesign.crt
 # 发布包对外可下载的地址前缀（写进 manifest.json 的资源 URL）
 RELEASE_BASE_URL ?= https://github.com/zizdog/zizpanel/releases/download/$(VERSION)
-# 可选：把更新说明写进这个文件，会被放进清单里展示给用户
-NOTES_FILE ?= RELEASE_NOTES.md
+# 更新说明：由 tools/gen-release-notes.py 按版本从 git 历史生成（见该脚本与
+# tools/check-release-notes.sh）。**不许再指向一份静态文件** —— 曾经这么做，
+# 版本涨到 1.6.5、用户看到的"本次更新内容"还停在 v1.3.4 那片旧文。
+NOTES_FILE ?= $(RELDIR)/NOTES.md
 # 自建国内镜像（`make publish-mirror` 用）。面板里的"升级源"也填这个地址。
 MIRROR_BASE_URL ?= https://zizdog.com/zizpanel
 # 公网镜像地址：**唯一真源是 internal/upgrade/source.go 的 MirrorSource**，
@@ -316,12 +320,18 @@ keys: ## 生成发布用 Ed25519 密钥对（只做一次；私钥务必离线�
 	@echo "     私钥丢失后，已安装的面板将无法再接受你签出的升级包。"
 	@echo "     请立即把 $(RELEASE_KEY) 备份到离线介质。"
 
+.PHONY: release-notes
+release-notes: ## 按当前版本从 git 历史生成发布说明（$(NOTES_FILE)）
+	@python3 tools/gen-release-notes.py --out $(NOTES_FILE)
+
 .PHONY: release
 release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；ARCHS="arm64" 只发本机架构）
 	@# ARCHS：`make deploy` 只发 arm64（本机与 mini 都是 Apple Silicon）—— 少构建一次、
 	@# 上传体积减半；手动 `make release` 做正式发布时保持默认双架构，别漏 amd64。
 	@echo "==> 目标架构：$(ARCHS)"
 	@mkdir -p $(RELDIR)
+	@# clean 刚删过 dist，说明必须在它之后生成（否则会被 clean 一起删掉）。
+	@$(MAKE) --no-print-directory release-notes
 	@# 先构建一个本机版本：它既用来推导公钥，也用来给清单签名。
 	@# 这样"签名私钥"与"面板内嵌公钥"必然配对 —— 靠人工填公钥迟早会不一致。
 	@go build -trimpath -o $(DIST)/host-zizpanel ./cmd/zizpanel
@@ -422,6 +432,7 @@ mirror-manifest: host-zizpanel ## 重新生成"指向自建镜像"的清单（�
 	@# 而国内无代理时 GitHub 直连不通 —— 面板能读到清单却下不动包。
 	@# 这个目标把 url 换成自建镜像，签名不变（同一把发布私钥）。
 	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
+	@$(MAKE) --no-print-directory release-notes
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
 		--base-url "$(MIRROR_BASE_URL)" --notes-file "$(NOTES_FILE)"
 	@set -e; \
@@ -461,6 +472,7 @@ mirror-public: host-zizpanel ## 生成"指向公网镜像"的清单（url 用 do
 	@# 基址取自 internal/upgrade/source.go 的 MirrorSource（不写第二份内网/公网地址）。
 	@test -n "$(PUBLIC_MIRROR_URL)" || { echo "!! 读不到 internal/upgrade/source.go 的 MirrorSource"; exit 1; }
 	@test -f $(RELDIR)/zizpanel_$(VERSION)_darwin_arm64.tar.gz || (echo "先跑 make release（要发布包）"; exit 1)
+	@$(MAKE) --no-print-directory release-notes
 	@python3 tools/make-manifest.py --version $(VERSION) --dir $(RELDIR) \
 		--arches "$(ARCHS)" --base-url "$(PUBLIC_MIRROR_URL)/download/{version}/{name}" --notes-file "$(NOTES_FILE)"
 	@# 发布产物是要发给用户的：清单里出现任何 RFC1918 地址就当场失败（2026-09-20 用户要求）。
