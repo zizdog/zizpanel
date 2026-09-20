@@ -281,7 +281,7 @@ function mount(node) {
 }
 
 function renderLogin() {
-  const username = h('input.input', { type: 'text', autocomplete: 'username', placeholder: '用户名', value: 'admin' });
+  const username = h('input.input', { type: 'text', autocomplete: 'username', placeholder: '用户名' });
   const password = h('input.input', { type: 'password', autocomplete: 'current-password', placeholder: '登录密码' });
   const btn = h('button.btn.btn-primary.btn-block', { text: '登 录' });
 
