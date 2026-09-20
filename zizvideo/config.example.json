@@ -1,0 +1,24 @@
+{
+  "listen": "127.0.0.1:7766",
+  "data_dir": "/Users/CHANGE_ME/Library/Application Support/zizvideo",
+  "database_path": "/Users/CHANGE_ME/Library/Application Support/zizvideo/zizvideo.db",
+  "media_allow_roots": [
+    "/Users/CHANGE_ME/Movies",
+    "/Users/CHANGE_ME/Downloads"
+  ],
+  "media_extensions": ["mp4", "mov", "m4v", "mkv", "webm", "ts", "mts", "avi", "flv", "hevc"],
+  "scan_workers": 4,
+  "scan_delete_threshold_ratio": 0.1,
+  "scan_delete_threshold_count": 50,
+  "scan_retry_backoff_ms": [1000, 4000, 16000],
+  "probe_timeout_seconds": 30,
+  "cover_jpeg_quality": 3,
+  "ffmpeg_bin": "/opt/homebrew/bin/ffmpeg",
+  "ffprobe_bin": "/opt/homebrew/bin/ffprobe",
+  "log_level": "info",
+  "trusted_proxies": [],
+  "session_ttl_hours": 336,
+  "lockout_threshold": 5,
+  "lockout_window_minutes": 15,
+  "secure_cookie": false
+}

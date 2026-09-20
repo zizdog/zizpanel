@@ -28,6 +28,10 @@ LDFLAGS    := -s -w \
 	-X github.com/zizdog/zizpanel/internal/version.Version=$(VERSION) \
 	-X github.com/zizdog/zizpanel/internal/version.Commit=$(COMMIT) \
 	-X github.com/zizdog/zizpanel/internal/version.BuildTime=$(BUILD_TIME)
+# ZIZVIDEO_VERSION 锚定 internal/services/zizvideo.go 的 ZizvideoVersion（安装时就按它核对
+# `zizvideo --version`），保证"发布包里的二进制"与"面板要装的版本"同源。
+ZIZVIDEO_VERSION := $(shell sed -n 's/.*ZizvideoVersion *= *"\([^"]*\)".*/\1/p' internal/services/zizvideo.go | head -1)
+ZIZVIDEO_LDFLAGS := -X github.com/zizdog/zizvideo/internal/api.Version=$(ZIZVIDEO_VERSION)
 
 # 国内网络下 proxy.golang.org 常不可达，默认走 goproxy.cn
 export GOPROXY ?= https://goproxy.cn,direct
@@ -66,9 +70,10 @@ dev: ## 本地构建（当前架构）
 	fi; \
 	go build -ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" -o $(DIST)/zizpanel ./cmd/zizpanel; \
 	go build -ldflags "$(LDFLAGS)" -o $(DIST)/zizpanel-helper ./cmd/zizpanel-helper; \
+	( cd zizvideo && CGO_ENABLED=0 go build -trimpath -ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/zizvideo" ./cmd/server ); \
 	if [ -n "$$PUB" ]; then echo "已注入发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
 	else echo "未注入发布公钥（没有 $(RELEASE_KEY)）：网络升级会被拒绝，仅手动上传可用"; fi
-	@echo "构建完成：$(DIST)/zizpanel ($(VERSION)+$(COMMIT))"
+	@echo "构建完成：$(DIST)/zizpanel + $(DIST)/zizvideo ($(VERSION)+$(COMMIT))"
 
 .PHONY: fmt
 fmt: ## 格式化代码
@@ -108,7 +113,14 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	   echo "!! install.sh 的 SCRIPT_VERSION ($$scriptv) 与面板版本 ($$real) 不一致："; \
 	   echo "   安装横幅会显示假版本号。执行 make bump（它现在会同时改两处）。"; \
 	   exit 1; \
-	 fi; echo "   ok：版本号 $$real（version.go 与 install.sh 一致）"
+	 fi; \
+	 zizvmk=$$(sed -n 's/^VERSION ?= \(.*\)$$/\1/p' zizvideo/Makefile | head -1); \
+	 if [ -n "$$zizvmk" ] && [ "$$zizvmk" != "$(ZIZVIDEO_VERSION)" ]; then \
+	   echo "!! zizvideo 版本不一致：zizvideo/Makefile = $${zizvmk}，面板要装的 = $(ZIZVIDEO_VERSION)"; \
+	   echo "   面板安装模块时会按版本核对拒绝，发布包等于白打。"; \
+	   exit 1; \
+	 fi; \
+	 echo "   ok：版本号 $${real}（version.go 与 install.sh 一致；zizvideo $(ZIZVIDEO_VERSION)）"
 	@echo "==> gofmt 检查"
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
@@ -133,15 +145,15 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@echo "==> 前端 JS 语法检查（acorn）"
 	@# assets/nav 是「导航页」的独立别名页（GET /nav/）：它同样会被浏览器
 	@# 当模块解析，语法错误一样是白屏，所以一并纳入门禁。
-	@# macsaber（mac军刀）是独立 module，前端同为原生 ESM。
+	@# macsaber（mac军刀）与 zizvideo（短视频）都是独立 module，前端同为原生 ESM。
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets || exit 1; \
+	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets zizvideo/internal/web/assets || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@# acorn 只查语法、不查名字有没有定义：清理"死代码"时删掉过 `let cmCorePromise = null;`，
 	@# 引用还在 —— 语法合法、门禁全绿，浏览器却是 Can't find variable，编辑器直接打不开。
 	@echo "==> 前端 JS 未声明赋值检查"
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets || exit 1; \
+	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets zizvideo/internal/web/assets || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@echo "==> go vet"
 	@$(MAKE) --no-print-directory vet
@@ -149,8 +161,8 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory test
 	@# 独立软件是各自的 go module，不在面板这个 module 里，`./...` 扫不到 —— 单独跑，
 	@# 否则新代码等于没有门禁（gofmt 除外：仓库根的 `gofmt -l .` 已经覆盖它们）。
-	@echo "==> 独立软件模块自测（mac军刀）"
-	@for m in macsaber; do \
+	@echo "==> 独立软件模块自测（mac军刀 / zizvideo）"
+	@for m in macsaber zizvideo; do \
 	   if [ -d "$$m" ]; then \
 	     echo "  -- $$m"; \
 	     ( cd "$$m" && go vet ./... && go test ./... -count=1 ) || exit 1; \
@@ -330,6 +342,8 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；AR
 			-o $(DIST)/tmp-$$arch/zizpanel ./cmd/zizpanel; \
 		GOOS=darwin GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
 			-o $(DIST)/tmp-$$arch/zizpanel-helper ./cmd/zizpanel-helper; \
+		( cd zizvideo && GOOS=darwin GOARCH=$$arch CGO_ENABLED=0 go build -trimpath \
+			-ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/tmp-$$arch/zizvideo" ./cmd/server ); \
 		if [ "$${SKIP_CODESIGN:-0}" = "1" ]; then \
 			echo "    !! 跳过签名（SKIP_CODESIGN=1）：本次产物是 adhoc 签名，"; \
 			echo "       用户升级后系统会要求重新授权（见 docs/坑清单.md #183）"; \

@@ -1,0 +1,7 @@
+dist/
+fixtures/
+*.db
+*.db-wal
+*.db-shm
+# 发布私钥（绝不进仓库；归档副本里保留在原处）
+.release-key/
