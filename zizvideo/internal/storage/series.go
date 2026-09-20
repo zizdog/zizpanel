@@ -141,9 +141,12 @@ func (db *DB) DeleteSeries(id string) error {
 	return tx.Commit()
 }
 
-// ListSeriesEpisodes returns the ordered episode links plus their media rows.
+// ListSeriesEpisodes returns the episode links plus their media rows, in stored
+// position order. The playback/display order (season→episode→文件名自然序) is
+// applied by the API layer, which may import the filename parser.
 func (db *DB) ListSeriesEpisodes(seriesID string) ([]domain.SeriesEpisode, []domain.Media, error) {
-	rows, err := db.Query(`SELECT sm.series_id, sm.media_id, sm.position, sm.created_at, `+mediaColsQ+`
+	rows, err := db.Query(`SELECT sm.series_id, sm.media_id, sm.position, sm.created_at,
+		sm.season, sm.episode, COALESCE(sm.episode_source,''), `+mediaColsQ+`
 		FROM series_media sm JOIN media m ON m.id = sm.media_id
 		WHERE sm.series_id = ? AND m.deleted_at IS NULL
 		ORDER BY sm.position ASC`, seriesID)
@@ -156,33 +159,59 @@ func (db *DB) ListSeriesEpisodes(seriesID string) ([]domain.SeriesEpisode, []dom
 	for rows.Next() {
 		var e domain.SeriesEpisode
 		var m domain.Media
+		var season, episode sql.NullInt64
 		if err := rows.Scan(&e.SeriesID, &e.MediaID, &e.Position, &e.AddedAt,
+			&season, &episode, &e.EpisodeSource,
 			&m.ID, &m.LibraryID, &m.Path, &m.Title, &m.Size, &m.MtimeNS, &m.Container,
 			&m.Codecs.Video, &m.Codecs.Audio, &m.Width, &m.Height, &m.DurationMS, &m.Bitrate,
 			&m.FPS, &m.Status, &m.ErrorClass, &m.ErrorMessage, &m.MissingSince,
 			&m.CreatedAt, &m.UpdatedAt); err != nil {
 			return nil, nil, err
 		}
-		e.Episode = e.Position
+		e.Season = nullInt(season)
+		e.Episode = nullInt(episode)
 		eps = append(eps, e)
 		medias = append(medias, m)
 	}
 	return eps, medias, rows.Err()
 }
 
+func nullInt(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
+}
+
+func intArg(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// SeriesMediaInput is one media to append together with its derived numbers.
+type SeriesMediaInput struct {
+	MediaID string
+	Season  *int
+	Episode *int
+	Source  string
+}
+
 // AddSeriesMedia appends media to the end of a 剧场, skipping duplicates.
-// Returns how many rows were really added so callers can report it honestly.
-func (db *DB) AddSeriesMedia(seriesID string, mediaIDs []string) (int, error) {
+// Returns the media ids that were really added so callers can report honestly.
+func (db *DB) AddSeriesMedia(seriesID string, items []SeriesMediaInput) ([]string, error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	existing := map[string]bool{}
 	position := 0
 	rows, err := tx.Query(`SELECT media_id, position FROM series_media WHERE series_id = ?`, seriesID)
 	if err != nil {
 		_ = tx.Rollback()
-		return 0, err
+		return nil, err
 	}
 	for rows.Next() {
 		var id string
@@ -190,7 +219,7 @@ func (db *DB) AddSeriesMedia(seriesID string, mediaIDs []string) (int, error) {
 		if err := rows.Scan(&id, &pos); err != nil {
 			rows.Close()
 			_ = tx.Rollback()
-			return 0, err
+			return nil, err
 		}
 		existing[id] = true
 		if pos > position {
@@ -200,27 +229,66 @@ func (db *DB) AddSeriesMedia(seriesID string, mediaIDs []string) (int, error) {
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		_ = tx.Rollback()
-		return 0, err
+		return nil, err
 	}
 	now := domain.NowString()
-	added := 0
-	for _, id := range mediaIDs {
-		if id == "" || existing[id] {
+	added := []string{}
+	for _, item := range items {
+		if item.MediaID == "" || existing[item.MediaID] {
 			continue
 		}
 		position++
-		if _, err := tx.Exec(`INSERT INTO series_media (series_id, media_id, position, created_at)
-			VALUES (?,?,?,?)`, seriesID, id, position, now); err != nil {
+		if _, err := tx.Exec(`INSERT INTO series_media
+			(series_id, media_id, position, created_at, season, episode, episode_source)
+			VALUES (?,?,?,?,?,?,?)`,
+			seriesID, item.MediaID, position, now,
+			intArg(item.Season), intArg(item.Episode), nullStr(item.Source)); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+		existing[item.MediaID] = true
+		added = append(added, item.MediaID)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// EpisodeAssignment is one derived (season, episode) write for a member.
+type EpisodeAssignment struct {
+	MediaID string
+	Season  *int
+	Episode *int
+	Source  string
+}
+
+// ApplySeriesEpisodes writes derived numbers, never touching manual rows (R1:
+// 自动识别不得覆盖 manual). Returns how many rows were really updated.
+func (db *DB) ApplySeriesEpisodes(seriesID string, assigns []EpisodeAssignment) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	updated := 0
+	for _, a := range assigns {
+		res, err := tx.Exec(`UPDATE series_media SET season = ?, episode = ?, episode_source = ?
+			WHERE series_id = ? AND media_id = ?
+			  AND COALESCE(episode_source,'') <> ?`,
+			intArg(a.Season), intArg(a.Episode), a.Source, seriesID, a.MediaID,
+			domain.EpisodeSourceManual)
+		if err != nil {
 			_ = tx.Rollback()
 			return 0, err
 		}
-		existing[id] = true
-		added++
+		if n, _ := res.RowsAffected(); n > 0 {
+			updated += int(n)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return added, nil
+	return updated, nil
 }
 
 // RemoveSeriesMedia drops one episode and keeps positions contiguous.
@@ -245,8 +313,10 @@ func (db *DB) RemoveSeriesMedia(seriesID, mediaID string) error {
 	return tx.Commit()
 }
 
-// ReorderSeries rewrites the episode order; the id list must match the current
-// membership exactly, otherwise a stale UI would silently drop episodes.
+// ReorderSeries rewrites the episode order and marks every listed row as manual
+// so a later 自动识别 never overwrites the admin's choice (补丁 R1). The id list
+// must match the current membership exactly, otherwise a stale UI would
+// silently drop episodes.
 func (db *DB) ReorderSeries(seriesID string, mediaIDs []string) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -288,8 +358,9 @@ func (db *DB) ReorderSeries(seriesID string, mediaIDs []string) error {
 		return err
 	}
 	for i, id := range mediaIDs {
-		if _, err := tx.Exec(`UPDATE series_media SET position = ? WHERE series_id = ? AND media_id = ?`,
-			i+1, seriesID, id); err != nil {
+		if _, err := tx.Exec(`UPDATE series_media SET position = ?, episode_source = ?
+			WHERE series_id = ? AND media_id = ?`,
+			i+1, domain.EpisodeSourceManual, seriesID, id); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

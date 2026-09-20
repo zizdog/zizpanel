@@ -71,6 +71,7 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/series/{id}/media", s.RequireAdmin(s.HandleAddSeriesMedia))
 	mux.HandleFunc("DELETE /api/v1/admin/series/{id}/media/{mediaId}", s.RequireAdmin(s.HandleRemoveSeriesMedia))
 	mux.HandleFunc("PUT /api/v1/admin/series/{id}/order", s.RequireAdmin(s.HandleReorderSeries))
+	mux.HandleFunc("POST /api/v1/admin/series/{id}/detect", s.RequireAdmin(s.HandleDetectSeries))
 
 	mux.HandleFunc("GET /api/v1/admin/system/info", s.RequireAdmin(s.HandleSystemInfo))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.RequireAdmin(s.HandleAuditList))

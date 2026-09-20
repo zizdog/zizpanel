@@ -20,11 +20,15 @@ type seriesBody struct {
 type seriesDetail struct {
 	Series seriesBody `json:"series"`
 	List   []struct {
-		Position int `json:"position"`
-		Episode  int `json:"episode"`
-		Media    struct {
+		Position      int    `json:"position"`
+		Season        *int   `json:"season"`
+		Episode       *int   `json:"episode"`
+		EpisodeSource string `json:"episode_source"`
+		EpisodeLabel  string `json:"episode_label"`
+		Media         struct {
 			ID    string `json:"id"`
 			Title string `json:"title"`
+			Path  string `json:"path"`
 		} `json:"media"`
 	} `json:"list"`
 }
@@ -112,8 +116,8 @@ func TestSeriesEpisodesFollowPositionOrder(t *testing.T) {
 		t.Fatalf("集数 = %d, 期望 3", len(detail.List))
 	}
 	for i, item := range detail.List {
-		if item.Episode != i+1 || item.Position != i+1 {
-			t.Fatalf("第 %d 项 episode=%d position=%d, 期望都是 %d", i, item.Episode, item.Position, i+1)
+		if item.Position != i+1 {
+			t.Fatalf("第 %d 项 position=%d, 期望 %d", i, item.Position, i+1)
 		}
 	}
 	got = e.episodes(series.ID)
@@ -166,8 +170,8 @@ func TestSeriesRemoveCompactsPositions(t *testing.T) {
 	if len(detail.List) != 2 {
 		t.Fatalf("移除后集数 = %d, 期望 2", len(detail.List))
 	}
-	if detail.List[0].Episode != 1 || detail.List[1].Episode != 2 {
-		t.Fatalf("移除后集号 = %d,%d, 期望 1,2", detail.List[0].Episode, detail.List[1].Episode)
+	if detail.List[0].Position != 1 || detail.List[1].Position != 2 {
+		t.Fatalf("移除后 position = %d,%d, 期望 1,2", detail.List[0].Position, detail.List[1].Position)
 	}
 	got := e.episodes(series.ID)
 	if got[0] != a.ID || got[1] != c.ID {

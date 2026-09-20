@@ -126,6 +126,7 @@ export function mountSeriesPlay(view, seriesID) {
 
   const titleEl = el("div", { class: "sp-title", text: "" });
   const countEl = el("div", { class: "sp-count", text: "加载中…", dataset: { role: "episode-label" } });
+  const orderNote = el("div", { class: "muted small-note", hidden: true, dataset: { role: "episode-order-note" } });
   const epSelect = el("select", { class: "input tiny", dataset: { role: "episode-select" } });
   const prev = el("button", { class: "btn small", type: "button", text: "上一集", dataset: { role: "prev-episode" } });
   const next = el("button", { class: "btn small", type: "button", text: "下一集", dataset: { role: "next-episode" } });
@@ -145,7 +146,7 @@ export function mountSeriesPlay(view, seriesID) {
     el("div", { class: "sp-stage" }, video),
     el("div", { class: "sp-top" },
       el("a", { class: "btn small", href: "#/series", text: "← 剧场", dataset: { role: "back-to-series" } }),
-      titleEl, countEl),
+      titleEl, countEl, orderNote),
     center, centerBtn,
     el("div", { class: "sp-bottom" },
       el("div", { class: "row sp-controls" }, prev, epSelect, next, listToggle, sound),
@@ -162,6 +163,13 @@ export function mountSeriesPlay(view, seriesID) {
   }
 
   function current() { return state.items[state.index]; }
+
+  // 补丁 R1：优先用后端给的 episode_label（S1E3 / 第 3 集 / 未识别）。
+  function labelOf(item, index) {
+    if (item && item.episode_label) return item.episode_label;
+    const i = index == null ? state.index : index;
+    return "第 " + (i + 1) + " 集";
+  }
 
   function durationMs() {
     if (Number.isFinite(video.duration) && video.duration > 0) return video.duration * 1000;
@@ -182,7 +190,7 @@ export function mountSeriesPlay(view, seriesID) {
     titleEl.textContent = item.title || ("#" + item.id);
     countEl.textContent = state.ended
       ? "已播完最后一集"
-      : ("第 " + (state.index + 1) + " 集 / 共 " + state.items.length + " 集");
+      : (labelOf(item) + " · 第 " + (state.index + 1) + " / " + state.items.length);
     epSelect.value = String(state.index);
     prev.disabled = state.index <= 0;
     next.disabled = state.index >= state.items.length - 1;
@@ -202,7 +210,7 @@ export function mountSeriesPlay(view, seriesID) {
         dataset: { role: "ep-item", index: String(i) },
         onclick: () => { listBox.hidden = true; state.autoNext = false; playIndex(i, true); },
       },
-        el("span", { class: "ep-no", text: "第 " + (i + 1) + " 集" }),
+        el("span", { class: "ep-no", text: labelOf(item, i) }),
         el("span", { class: "ep-title", text: item.title || ("#" + item.id) }),
         el("span", { class: "ep-pct muted", text: pct > 0 ? pct + "%" : fmtDuration(item.duration_ms) })));
     });
@@ -252,7 +260,7 @@ export function mountSeriesPlay(view, seriesID) {
       state.autoNext = true;
       playIndex(target, true);
       // 自动下一集：只前进一集，绝不跳两集
-      showToast("自动播放 第 " + (target + 1) + " 集");
+      showToast("自动播放 " + labelOf(state.items[target], target));
       return;
     }
     state.ended = true;
@@ -267,8 +275,8 @@ export function mountSeriesPlay(view, seriesID) {
       try { video.currentTime = position / 1000; } catch (err) { /* 跳过 */ }
       // 自动下一集的提示不能被续播提示顶掉，直接合并成一条。
       showToast(state.autoNext
-        ? ("自动播放 第 " + (state.index + 1) + " 集 · 已续播")
-        : ("已续播 第 " + (state.index + 1) + " 集"));
+        ? ("自动播放 " + labelOf(current()) + " · 已续播")
+        : ("已续播 " + labelOf(current())));
       state.autoNext = false;
     }
     paintTime();
@@ -315,11 +323,19 @@ export function mountSeriesPlay(view, seriesID) {
       const data = await api.request("GET", "/api/v1/series/" + encodeURIComponent(seriesID));
       const raw = data && Array.isArray(data.list) ? data.list : [];
       state.series = data && data.series ? data.series : null;
-      state.items = raw.map((entry) => entry.media).filter(Boolean);
+      state.items = raw.map((entry) => {
+        const item = entry.media || {};
+        item.episode_label = entry.episode_label || "";
+        item.episode_source = entry.episode_source || "";
+        return item;
+      }).filter(Boolean);
       titleEl.textContent = (state.series && state.series.title) || "剧场";
+      const unrecognized = state.items.filter((item) => item.episode_label === "未识别").length;
+      orderNote.hidden = unrecognized === 0;
+      orderNote.textContent = unrecognized > 0 ? "未识别（按文件名排）共 " + unrecognized + " 集" : "";
       clear(epSelect);
       state.items.forEach((item, i) => {
-        epSelect.append(el("option", { value: String(i), text: "第 " + (i + 1) + " 集" }));
+        epSelect.append(el("option", { value: String(i), text: labelOf(item, i) }));
       });
       if (!state.items.length) {
         countEl.textContent = "这个剧场还没有剧集";

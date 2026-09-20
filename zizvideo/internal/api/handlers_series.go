@@ -2,9 +2,11 @@ package api
 
 import (
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/internal/media"
 	"github.com/zizdog/zizvideo/internal/storage"
 )
 
@@ -65,7 +67,8 @@ func (s *Server) HandleListSeries(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, map[string]any{"list": list}, nil)
 }
 
-// HandleGetSeries returns one 剧场 with its episodes in playback order.
+// HandleGetSeries returns one 剧场 with its episodes in playback order
+// (补丁 R1：season→episode→文件名自然序，未识别排末尾).
 func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	series, err := s.DB.GetSeries(id)
@@ -78,15 +81,57 @@ func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	eps, medias = sortSeriesEpisodes(eps, medias)
 	u := UserFrom(r.Context())
 	items := s.buildItems(medias, r, u != nil && u.Role == domain.RoleAdmin)
 	list := make([]map[string]any, 0, len(items))
 	for i, item := range items {
-		list = append(list, map[string]any{
-			"position": eps[i].Position, "episode": eps[i].Episode, "media": item,
-		})
+		list = append(list, seriesEpisodeJSON(eps[i], item))
 	}
 	respond(w, http.StatusOK, map[string]any{"series": seriesJSON(*series), "list": list}, nil)
+}
+
+// seriesEpisodeJSON is one episode entry: numbers + the honest 人读标签.
+func seriesEpisodeJSON(e domain.SeriesEpisode, item mediaItem) map[string]any {
+	return map[string]any{
+		"position": e.Position, "season": e.Season, "episode": e.Episode,
+		"episode_source": e.EpisodeSource,
+		"episode_label":  media.EpisodeLabel(e.Season, e.Episode),
+		"media":          item,
+	}
+}
+
+// sortSeriesEpisodes applies the playback order to the two parallel slices.
+func sortSeriesEpisodes(eps []domain.SeriesEpisode, medias []domain.Media) ([]domain.SeriesEpisode, []domain.Media) {
+	if len(eps) != len(medias) || len(eps) == 0 {
+		return eps, medias
+	}
+	keys := make([]media.OrderKey, len(eps))
+	for i := range eps {
+		keys[i] = media.OrderKey{
+			Season: eps[i].Season, Episode: eps[i].Episode,
+			Manual:   eps[i].EpisodeSource == domain.EpisodeSourceManual,
+			Position: eps[i].Position, Name: seriesMediaName(medias[i]),
+		}
+	}
+	order := media.SortOrderKeys(keys)
+	sortedEps := make([]domain.SeriesEpisode, len(eps))
+	sortedMedias := make([]domain.Media, len(medias))
+	for i, idx := range order {
+		sortedEps[i] = eps[idx]
+		sortedMedias[i] = medias[idx]
+	}
+	return sortedEps, sortedMedias
+}
+
+// seriesMediaName is the filename the parser works on (Title is the fallback
+// for rows whose path was cleared).
+func seriesMediaName(m domain.Media) string {
+	name := m.Path
+	if name == "" {
+		name = m.Title
+	}
+	return filepath.Base(name)
 }
 
 func (s *Server) seriesTitle(raw string) (string, error) {
@@ -215,6 +260,7 @@ func (s *Server) HandleDeleteSeries(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleAddSeriesMedia appends existing media to a 剧场 (admin only).
+// 补丁 R1：加入时就从文件名推导 season/episode（识别不到就留空）。
 func (s *Server) HandleAddSeriesMedia(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := s.DB.GetSeries(id); err != nil {
@@ -230,13 +276,16 @@ func (s *Server) HandleAddSeriesMedia(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, domain.New("VALIDATION_SERIES_MEDIA", "每次需要 1-200 个媒体", 400))
 		return
 	}
+	inputs := make([]storage.SeriesMediaInput, 0, len(req.MediaIDs))
 	for _, mediaID := range req.MediaIDs {
-		if _, err := s.DB.GetMedia(mediaID); err != nil {
+		m, err := s.DB.GetMedia(mediaID)
+		if err != nil {
 			s.fail(w, r, domain.New("VALIDATION_NOT_FOUND", "媒体不存在: "+mediaID, 404))
 			return
 		}
+		inputs = append(inputs, seriesMediaFromMedia(*m))
 	}
-	added, err := s.DB.AddSeriesMedia(id, req.MediaIDs)
+	addedIDs, err := s.DB.AddSeriesMedia(id, inputs)
 	if err != nil {
 		s.audit(r, "series.media.add", "series:"+id, false, errCode(err))
 		s.fail(w, r, err)
@@ -247,9 +296,34 @@ func (s *Server) HandleAddSeriesMedia(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	detected := 0
+	for _, input := range inputs {
+		if input.Episode == nil {
+			continue
+		}
+		for _, mediaID := range addedIDs {
+			if mediaID == input.MediaID {
+				detected++
+				break
+			}
+		}
+	}
 	s.audit(r, "series.media.add", "series:"+id, true, "")
 	respond(w, http.StatusOK, map[string]any{
-		"added": added, "requested": len(req.MediaIDs), "episode_count": fresh.EpisodeCount}, nil)
+		"added": len(addedIDs), "requested": len(req.MediaIDs),
+		"detected": detected, "episode_count": fresh.EpisodeCount}, nil)
+}
+
+// seriesMediaFromMedia derives the nullable numbers for one media row.
+func seriesMediaFromMedia(m domain.Media) storage.SeriesMediaInput {
+	input := storage.SeriesMediaInput{MediaID: m.ID}
+	numbers, ok := media.ParseEpisode(seriesMediaName(m))
+	if !ok {
+		return input
+	}
+	input.Season, input.Episode = media.EpisodePointers(numbers)
+	input.Source = domain.EpisodeSourceFilename
+	return input
 }
 
 // HandleRemoveSeriesMedia drops one episode and compacts the order.
@@ -295,4 +369,90 @@ func (s *Server) HandleReorderSeries(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "series.reorder", "series:"+id, true, "")
 	respond(w, http.StatusOK, map[string]any{
 		"episode_count": fresh.EpisodeCount, "media_ids": req.MediaIDs}, nil)
+}
+
+// seriesDetectReq asks for the change list; nothing is written until confirm=true.
+type seriesDetectReq struct {
+	Confirm bool `json:"confirm"`
+}
+
+type episodeChangeJSON struct {
+	MediaID    string `json:"media_id"`
+	Title      string `json:"title"`
+	Filename   string `json:"filename"`
+	OldSeason  *int   `json:"old_season"`
+	OldEpisode *int   `json:"old_episode"`
+	OldLabel   string `json:"old_label"`
+	NewSeason  *int   `json:"new_season"`
+	NewEpisode *int   `json:"new_episode"`
+	NewLabel   string `json:"new_label"`
+}
+
+// HandleDetectSeries re-derives season/episode from filenames (补丁 R1).
+// Without confirm it only returns the change list; manual rows are never touched.
+func (s *Server) HandleDetectSeries(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.DB.GetSeries(id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	var req seriesDetectReq
+	if err := s.decodeJSON(w, r, &req); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	eps, medias, err := s.DB.ListSeriesEpisodes(id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	changes := []episodeChangeJSON{}
+	assigns := []storage.EpisodeAssignment{}
+	manualSkipped := 0
+	for i := range eps {
+		if eps[i].EpisodeSource == domain.EpisodeSourceManual {
+			manualSkipped++
+			continue
+		}
+		numbers, ok := media.ParseEpisode(seriesMediaName(medias[i]))
+		if !ok {
+			continue // 识别不到就不写、不改，绝不用猜的值填库
+		}
+		season, episode := media.EpisodePointers(numbers)
+		if intPtrEqual(season, eps[i].Season) && intPtrEqual(episode, eps[i].Episode) &&
+			eps[i].EpisodeSource == domain.EpisodeSourceFilename {
+			continue
+		}
+		changes = append(changes, episodeChangeJSON{
+			MediaID: medias[i].ID, Title: medias[i].Title, Filename: seriesMediaName(medias[i]),
+			OldSeason: eps[i].Season, OldEpisode: eps[i].Episode,
+			OldLabel:  media.EpisodeLabel(eps[i].Season, eps[i].Episode),
+			NewSeason: season, NewEpisode: episode,
+			NewLabel: media.EpisodeLabel(season, episode),
+		})
+		assigns = append(assigns, storage.EpisodeAssignment{
+			MediaID: medias[i].ID, Season: season, Episode: episode,
+			Source: domain.EpisodeSourceFilename,
+		})
+	}
+	applied := 0
+	if req.Confirm && len(assigns) > 0 {
+		applied, err = s.DB.ApplySeriesEpisodes(id, assigns)
+		if err != nil {
+			s.audit(r, "series.detect", "series:"+id, false, errCode(err))
+			s.fail(w, r, err)
+			return
+		}
+		s.audit(r, "series.detect", "series:"+id, true, "")
+	}
+	respond(w, http.StatusOK, map[string]any{
+		"applied": req.Confirm, "changed": len(changes), "updated": applied,
+		"manual_skipped": manualSkipped, "total": len(eps), "changes": changes}, nil)
+}
+
+func intPtrEqual(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }

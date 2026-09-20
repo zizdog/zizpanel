@@ -25,12 +25,25 @@ export function mountSeriesAdmin(box, series, options) {
     results, el("div", { class: "actions" }, addBtn));
 
   const episodes = el("div", { class: "ep-admin-list", dataset: { role: "series-episodes" } });
-  const epPanel = el("div", { class: "panel" }, el("div", { class: "muted small-note", text: "剧集顺序（↑↓ 调整，✕ 移出）" }), episodes);
+  const epOrderNote = el("div", { class: "muted small-note", hidden: true, dataset: { role: "episode-order-note" } });
+  const epPanel = el("div", { class: "panel" },
+    el("div", { class: "muted small-note", text: "剧集顺序（↑↓ 调整，✕ 移出）" }),
+    epOrderNote, episodes);
+  // 补丁 R1：按文件名识别季/集号；先给变化清单，确认后才落库。
+  const detectBtn = el("button", {
+    class: "btn small", type: "button", text: "自动识别剧集", dataset: { role: "series-detect" },
+  });
+  const detectBox = el("div", { class: "detect-box", hidden: true, dataset: { role: "series-detect-changes" } });
+  const detectPanel = el("div", { class: "panel" },
+    el("div", { class: "row" }, detectBtn),
+    el("div", { class: "muted small-note", text: "按文件名识别，识别不到的不猜；手动排过的不会被覆盖。" }),
+    detectBox);
   const delBtn = el("button", { class: "btn danger", type: "button", text: "删除剧场", dataset: { role: "series-delete" } });
-  box.append(editForm, picker, epPanel, el("div", { class: "actions" }, delBtn));
+  box.append(editForm, picker, detectPanel, epPanel, el("div", { class: "actions" }, delBtn));
 
   let ids = [];
   const mediaByID = {};
+  const entryByID = {};
 
   editForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -101,8 +114,10 @@ export function mountSeriesAdmin(box, series, options) {
       const data = await api.request("POST", "/api/v1/admin/series/" + encodeURIComponent(series.id) + "/media",
         { media_ids: picked });
       const added = data && typeof data.added === "number" ? data.added : 0;
+      const detected = data && typeof data.detected === "number" ? data.detected : 0;
       const skipped = picked.length - added;
-      setBanner(note, "已加入 " + added + " 集" + (skipped > 0 ? "（跳过 " + skipped + " 集已在剧场中）" : ""));
+      setBanner(note, "已加入 " + added + " 集（识别到 " + detected + " 集）"
+        + (skipped > 0 ? "，跳过 " + skipped + " 集已在剧场中" : ""));
       await load();
       await loadPicker();
       if (opts.onChanged) opts.onChanged();
@@ -117,11 +132,18 @@ export function mountSeriesAdmin(box, series, options) {
       episodes.append(el("div", { class: "muted small-note", text: "还没有剧集" }));
       return;
     }
+    let unrecognized = 0;
     ids.forEach((mediaID, index) => {
       const item = mediaByID[mediaID] || {};
+      const entry = entryByID[mediaID] || {};
+      const label = entry.episode_label || ("第 " + (index + 1) + " 集");
+      if (label === "未识别") unrecognized++;
       episodes.append(el("div", { class: "ep-admin-row", dataset: { media: mediaID } },
-        el("span", { class: "ep-no", text: "第 " + (index + 1) + " 集" }),
+        el("span", { class: "ep-no", text: label, dataset: { role: "ep-label" } }),
         el("span", { class: "ep-title", text: item.title || mediaID }),
+        entry.episode_source === "manual"
+          ? el("span", { class: "muted small-note", text: "手动" })
+          : null,
         el("span", { class: "row" },
           moveButton("↑", index, -1), moveButton("↓", index, 1),
           el("button", {
@@ -129,6 +151,8 @@ export function mountSeriesAdmin(box, series, options) {
             onclick: () => removeEpisode(mediaID),
           }))));
     });
+    epOrderNote.hidden = unrecognized === 0;
+    epOrderNote.textContent = unrecognized > 0 ? "未识别（按文件名排）共 " + unrecognized + " 集" : "";
   }
 
   function moveButton(label, index, delta) {
@@ -175,13 +199,73 @@ export function mountSeriesAdmin(box, series, options) {
     }
   }
 
+  function renderChanges(data) {
+    clear(detectBox);
+    const changes = data && Array.isArray(data.changes) ? data.changes : [];
+    const manualSkipped = data && typeof data.manual_skipped === "number" ? data.manual_skipped : 0;
+    if (!changes.length) {
+      detectBox.hidden = false;
+      detectBox.append(el("div", { class: "muted small-note",
+        text: "没有需要变更的剧集" + (manualSkipped > 0 ? "（" + manualSkipped + " 集手动排过，已跳过）" : "") }));
+      return;
+    }
+    const applyBtn = el("button", {
+      class: "btn small primary", type: "button", text: "确认应用（" + changes.length + " 集）",
+      dataset: { role: "series-detect-confirm" },
+      onclick: () => applyChanges(changes),
+    });
+    const cancelBtn = el("button", {
+      class: "btn small", type: "button", text: "取消", dataset: { role: "series-detect-cancel" },
+      onclick: () => { detectBox.hidden = true; },
+    });
+    detectBox.hidden = false;
+    detectBox.append(
+      el("div", { class: "muted small-note", text: "变化清单（确认前不会写库）" }),
+      ...changes.map((c) => el("div", { class: "detect-row", dataset: { role: "detect-row", media: c.media_id } },
+        el("span", { class: "ep-no", text: (c.old_label || "未识别") + " → " + (c.new_label || "未识别") }),
+        el("span", { class: "ep-title", text: c.filename || c.title || c.media_id }))),
+      el("div", { class: "row" }, applyBtn, cancelBtn));
+  }
+
+  async function applyChanges(changes) {
+    try {
+      const data = await api.request("POST", detectURL(), { confirm: true });
+      const updated = data && typeof data.updated === "number" ? data.updated : changes.length;
+      setBanner(note, "已识别 " + updated + " 集");
+      detectBox.hidden = true;
+      await load();
+      if (opts.onChanged) opts.onChanged();
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "识别失败");
+    }
+  }
+
+  function detectURL() {
+    return "/api/v1/admin/series/" + encodeURIComponent(series.id) + "/detect";
+  }
+
+  detectBtn.addEventListener("click", async () => {
+    setBanner(note, "");
+    detectBtn.disabled = true;
+    try {
+      const data = await api.request("POST", detectURL(), { confirm: false });
+      renderChanges(data);
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "识别失败");
+    } finally {
+      detectBtn.disabled = false;
+    }
+  });
+
   async function load() {
     const data = await api.request("GET", "/api/v1/series/" + encodeURIComponent(series.id));
     const list = data && Array.isArray(data.list) ? data.list : [];
     ids = list.map((entry) => entry.media && entry.media.id).filter(Boolean);
     for (const key of Object.keys(mediaByID)) delete mediaByID[key];
+    for (const key of Object.keys(entryByID)) delete entryByID[key];
     for (const entry of list) {
       if (entry.media) mediaByID[entry.media.id] = entry.media;
+      if (entry.media) entryByID[entry.media.id] = entry;
     }
     if (data && data.series) {
       if (document.activeElement !== titleInput) titleInput.value = data.series.title || "";

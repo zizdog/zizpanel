@@ -103,14 +103,23 @@ type Series struct {
 	UpdatedAt    string `json:"updated_at"`
 }
 
+// episode_source values for series_media (补丁 R1).
+const (
+	EpisodeSourceFilename = "filename"
+	EpisodeSourceManual   = "manual"
+)
+
 // SeriesEpisode places one existing media item at a 1-based position; Position
-// doubles as the displayed "第 N 集".
+// doubles as the admin order, while season/episode carry the filename-derived
+// numbers (nil = 未识别, never guessed).
 type SeriesEpisode struct {
-	SeriesID string `json:"series_id"`
-	MediaID  string `json:"media_id"`
-	Position int    `json:"position"`
-	Episode  int    `json:"episode"`
-	AddedAt  string `json:"added_at"`
+	SeriesID      string `json:"series_id"`
+	MediaID       string `json:"media_id"`
+	Position      int    `json:"position"`
+	Season        *int   `json:"season"`
+	Episode       *int   `json:"episode"`
+	EpisodeSource string `json:"episode_source,omitempty"`
+	AddedAt       string `json:"added_at"`
 }
 
 // ScanTask is a persisted scan job's state.
