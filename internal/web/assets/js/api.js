@@ -167,6 +167,8 @@ export const api = {
   upgradeDismiss: () => request('POST', `${API_BASE}/system/upgrade/dismiss`, {}),
   upgradeUpload: (file) => api.upload(`${API_BASE}/system/upgrade/upload`, file),
   saveSettings: (patch) => request('POST', `${API_BASE}/settings`, patch),
+  // 镜像发布件同步：把公网源上的发布件同步到镜像目录（202 + task_id，走任务中心）。
+  mirrorSync: (body) => request('POST', `${API_BASE}/system/mirror/sync`, body),
   // ---- 上传与执行限制（nginx client_max_body_size + PHP 上传/执行上限）----
   // GET 返回配置值 + **回读的生效值**（界面据此区分"已保存"与"已生效"）；
   // POST 校验后返回 202 + task_id，真正的应用（写 vhost + conf.d → reload nginx

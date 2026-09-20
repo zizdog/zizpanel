@@ -346,7 +346,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 // ---------- 设置 ----------
 
 // settingsView 是暴露给前端的可调设置。
-func (s *Server) settingsView() map[string]any {
+func (s *Server) settingsView(ctx context.Context) map[string]any {
 	wl := s.Cfg.IPWhitelist
 	if wl == nil {
 		wl = []string{}
@@ -375,6 +375,10 @@ func (s *Server) settingsView() map[string]any {
 		// （清空 = 关闭镜像、回到公网来源，仅用于镜像站故障时应急）。
 		"mirror_base":          s.Cfg.MirrorBase,
 		"mirror_probe_seconds": s.Cfg.MirrorProbeSeconds,
+		// 镜像发布件同步目录 + 内置源：设置页要能看见并立即同步（坑 217）。
+		// 目录存在面板 settings 表里，不在 config.json（运行时可改）。
+		"mirror_dir":            s.mirrorDirSetting(ctx),
+		"mirror_default_source": s.mirrorDefaultSource(),
 		// 仅走镜像站（离线）模式：设置页要能看见并切换它。
 		// 打开后各安装器禁止回落外网，缺资源就明确失败（见 services/mirror.go）。
 		"offline_only": s.Cfg.OfflineOnly,
@@ -399,7 +403,7 @@ func (s *Server) settingsView() map[string]any {
 }
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	ok(w, s.settingsView())
+	ok(w, s.settingsView(r.Context()))
 }
 
 type settingsReq struct {
@@ -432,6 +436,9 @@ type settingsReq struct {
 	MirrorBase *string `json:"mirror_base"`
 	// MirrorProbeSeconds 是镜像资源探测超时（秒，1~60）。
 	MirrorProbeSeconds *int `json:"mirror_probe_seconds"`
+	// MirrorDir 是镜像发布件要同步到的文档根目录（空串 = 清空）。面板写它、
+	// nginx 读它，所以走站点根目录同一套白名单校验（坑 217）。
+	MirrorDir *string `json:"mirror_dir"`
 	// OfflineOnly = 仅走镜像站（离线）模式：禁止任何外网回落，缺资源即明确失败。
 	// 用于"整机断外网/隔离网络/迁移到新 Mac"，见 services/mirror.go。
 	OfflineOnly *bool `json:"offline_only"`
@@ -550,6 +557,18 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.MirrorProbeSeconds = sec
 	}
+	// 镜像发布件同步目录：存在面板 settings 表里（不在 config.json）。
+	if req.MirrorDir != nil {
+		clean, derr := s.normalizeMirrorDir(*req.MirrorDir)
+		if derr != nil {
+			fail(w, http.StatusBadRequest, derr.Error())
+			return
+		}
+		if err := s.Store.SetSetting(r.Context(), mirrorDirSettingKey, clean); err != nil {
+			fail(w, http.StatusInternalServerError, "保存镜像目录失败: "+err.Error())
+			return
+		}
+	}
 	// 仅走镜像站（离线）模式。
 	//
 	// 允许"离线模式 + 空镜像基址"保存吗？**允许但要求界面提示**：
@@ -625,7 +644,7 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "settings_save", "panel", "更新访问策略/安全设置", true, "")
-	ok(w, s.settingsView())
+	ok(w, s.settingsView(r.Context()))
 }
 
 func validCIDROrIP(s string) bool {

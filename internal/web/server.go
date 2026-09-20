@@ -219,6 +219,9 @@ func (s *Server) routes() http.Handler {
 	// 见 services/baseenv.go 与 api_system.go 的 handleSystemBaseEnv。
 	root.HandleFunc("GET /api/v1/system/base-env", s.requireAuth(s.handleSystemBaseEnv))
 	root.HandleFunc("POST /api/v1/system/base-env/install", s.requireAuth(s.handleSystemBaseEnvInstall))
+	// 镜像发布件同步（管理员）：把公网源上的 manifest/install.sh/包同步到镜像站
+	// 文档根（TCC 授权只有面板守护进程有，scp 写不进去，坑 217）。走任务中心。
+	root.HandleFunc("POST /api/v1/system/mirror/sync", s.requireAuth(s.handleMirrorSync))
 
 	// 系统设置（macOS 服务器化）：状态探测 + 一键动作（动作走任务中心）
 	root.HandleFunc("GET /api/v1/system/settings", s.requireAuth(s.handleSystemSettings))

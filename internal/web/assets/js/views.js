@@ -841,6 +841,32 @@ export function SettingsView(content, ctx = {}) {
       style: { flex: '1 1 320px' },
     });
     const mirrorProbe = h('input.input', { type: 'number', value: s.mirror_probe_seconds || 4, min: 1, max: 60 });
+    // 镜像发布件同步（坑 217）：镜像站文档根在外置盘上，只有面板守护进程有 TCC
+    // 授权能写、本机 scp 写不进去，所以给它一个"立即同步"入口（走任务中心）。
+    const mirrorDir = h('input.input', {
+      value: s.mirror_dir || '',
+      placeholder: '例如 /Volumes/盘名/mirror（镜像站的文档根）',
+      style: { flex: '1 1 320px' },
+    });
+    const mirrorSource = h('input.input', {
+      value: '',
+      placeholder: '留空用内置源：' + (s.mirror_default_source || ''),
+      style: { flex: '1 1 320px' },
+    });
+    const mirrorSyncBtn = h('button.btn', {
+      text: '立即同步',
+      title: '把公网源上的发布件同步到上面的目录：先验签清单、逐个核 sha256，全部通过才就位',
+      onclick: () => {
+        const dir = mirrorDir.value.trim();
+        if (!dir) { toast('请先填写镜像目录', 'warn'); return; }
+        taskCenter.start({
+          kind: 'mirror-sync',
+          target: 'mirror:' + dir,
+          title: '同步镜像发布件到 ' + dir,
+          start: () => api.mirrorSync({ dir, source: mirrorSource.value.trim() }),
+        });
+      },
+    });
     // 仅走镜像站（离线）模式：整机断外网 / 隔离网络 / 迁移到新 Mac 时打开。
     // 打开后各安装器**禁止回落外网**，缺资源就明确失败并列出缺哪个文件。
     // 刻意与 mirror_base 放在同一张卡片里：两者一起看才不会被误解成
@@ -872,6 +898,7 @@ export function SettingsView(content, ctx = {}) {
             login_lock_mins: Number(lockMins.value),
             mirror_base: mirrorInput.value.trim(),
             mirror_probe_seconds: Number(mirrorProbe.value) || 4,
+            mirror_dir: mirrorDir.value.trim(),
             offline_only: offlineOnly.checked,
           };
           const saved = await api.saveSettings(patch);
@@ -950,6 +977,20 @@ export function SettingsView(content, ctx = {}) {
                 '要禁止回落请勾下面的「仅走镜像站（离线）」。<br>' +
                 '留空 = 关闭镜像（各来源回到内置的公网/国内镜像，仅用于镜像站故障时应急）。',
             }),
+          ]),
+          h('div.field', [
+            h('label', { text: '镜像目录（发布件同步到哪）' }),
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [mirrorDir, mirrorSyncBtn]),
+            h('div.hint', {
+              text: '镜像站的文档根；只有面板进程有写授权',
+              title: '把公网源上的 manifest.json / manifest.json.sig / install.sh / 各架构包同步到这里' +
+                '（download/<版本>/、download/latest/ 与顶层 latest 包）。先验签清单、逐个核 sha256，' +
+                '全部通过才从临时目录就位 —— 公网读不到半截文件。',
+            }),
+          ]),
+          h('div.field', [
+            h('label', { text: '同步源（留空用内置公网镜像源）' }),
+            mirrorSource,
           ]),
           h('div.row', [
             h('label', [h('span', { text: '仅走镜像站（离线）：禁止任何外网回落，缺资源即明确失败' })]),
