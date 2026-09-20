@@ -277,6 +277,12 @@ func (m *Manager) fixNginxBaseConfig(ctx context.Context, result *InstallResult)
 		result.step(ctx, "已把 nginx 默认端口 8080 改为 80")
 	}
 
+	// worker_processes=1 时一个请求卡住就全站超时（坑 210）：生成/修复一并纠正为 auto。
+	if normalized, changed := priv.NormalizeWorkerProcesses(text); changed {
+		text = normalized
+		result.step(ctx, "已把 worker_processes 从 1 改为 auto")
+	}
+
 	vhostDir := filepath.Join(m.brewPrefix(), "etc", "nginx", "vhosts")
 	if err := os.MkdirAll(vhostDir, 0o755); err != nil {
 		return false, fmt.Errorf("创建 vhosts 目录失败: %w", err)

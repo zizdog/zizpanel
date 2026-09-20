@@ -1233,10 +1233,18 @@ func EnsureNginxContexts(upgradeMapContent string) (string, error) {
 	if err := EnsureVhostsInclude(); err != nil {
 		return "", err
 	}
+	// worker_processes 不能是 1：一个请求卡住就拖垮全部站点（2026-09-20 外置盘事故）。
+	workerFixed, werr := EnsureNginxWorkerProcesses()
+	if werr != nil {
+		return "", werr
+	}
+	if workerFixed {
+		parts = append(parts, "worker_processes 已从 1 改为 auto（单个请求卡住不再拖垮所有站点）")
+	}
 	after, _, _ := ConfDIncluded()
 	afterVhost, _, _ := VhostsIncluded()
 	afterMap, _ := os.ReadFile(filepath.Join(NginxConfD(), "upgrade-map.conf"))
-	changed := migrated || before != after || beforeVhost != afterVhost || string(beforeMap) != string(afterMap)
+	changed := migrated || before != after || beforeVhost != afterVhost || string(beforeMap) != string(afterMap) || workerFixed
 
 	if !changed {
 		return "nginx 环境已就绪（无变化，未重载）", nil
@@ -1318,6 +1326,54 @@ func ensureConfDIncluded() error {
 }
 
 func NginxConfBackupPath() string { return NginxConf() + ".zizpanel.bak" }
+
+// reWorkerProcesses 只匹配 main 上下文的 worker_processes 指令（非注释行）。
+var reWorkerProcesses = regexp.MustCompile(`(?m)^(\s*worker_processes\s+)([^;\n]+)(;)`)
+
+// NormalizeWorkerProcesses 把 `worker_processes 1;` 纠正为 auto（幂等）。
+// 坑 210：唯一 worker 被一个卡死的请求占住 = 全站（含别的站点）一起超时。
+func NormalizeWorkerProcesses(text string) (string, bool) {
+	changed := false
+	out := reWorkerProcesses.ReplaceAllStringFunc(text, func(m string) string {
+		sub := reWorkerProcesses.FindStringSubmatch(m)
+		if sub == nil || strings.TrimSpace(sub[2]) != "1" {
+			return m
+		}
+		changed = true
+		return sub[1] + "auto" + sub[3]
+	})
+	return out, changed
+}
+
+// EnsureNginxWorkerProcesses 修 nginx.conf 里的 worker_processes=1：备份 → 改写 →
+// `nginx -t` → 失败回滚。幂等：不是 1 就一个字节都不写。
+func EnsureNginxWorkerProcesses() (bool, error) {
+	path := NginxConf()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("读取 nginx.conf 失败: %w", err)
+	}
+	next, changed := NormalizeWorkerProcesses(string(before))
+	if !changed {
+		return false, nil
+	}
+	if _, serr := os.Stat(NginxConfBackupPath()); serr != nil {
+		_ = os.WriteFile(NginxConfBackupPath(), before, 0o644)
+	}
+	tmp := path + ".zizpanel.tmp"
+	if werr := os.WriteFile(tmp, []byte(next), 0o644); werr != nil {
+		return false, fmt.Errorf("写入 nginx.conf 失败: %w", werr)
+	}
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		return false, fmt.Errorf("替换 nginx.conf 失败: %w", rerr)
+	}
+	// 立即校验；失败就回滚，绝不留下一个起不来的 nginx
+	if out, terr := NginxTest(); terr != nil {
+		_ = os.WriteFile(path, before, 0o644)
+		return false, fmt.Errorf("worker_processes 改为 auto 后 nginx -t 未通过，已回滚：\n%s", out)
+	}
+	return true, nil
+}
 
 // EnsureNginxEnv 确保 nginx 具备面板所需的通用环境（upgrade map + conf.d include）。
 // 返回人类可读的执行说明，便于面板记录做了什么。
