@@ -111,9 +111,18 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 握手被拒时浏览器只看到 1006、读不到响应体，所以结论要同时写进日志与接口
+	//（详细文案前端再经 /terminal/ws-diagnose 取回，见 ws_diagnose.go）。
+	if verr := validateWSHandshake(r); verr != nil {
+		v := wsUpgradeFailure(r, verr)
+		s.Log.Warn("WebSocket 升级失败: %v —— %s（%s）", verr, v.Advice, v.Detail)
+		fail(w, http.StatusBadRequest, v.Advice+"\n"+v.Detail)
+		return
+	}
+
 	ws, err := upgradeWebSocket(w, r)
 	if err != nil {
-		s.Log.Warn("WebSocket 升级失败: %v", err)
+		s.Log.Warn("WebSocket 升级失败（接管连接阶段）: %v", err)
 		return
 	}
 	defer func() { _ = ws.Close() }()

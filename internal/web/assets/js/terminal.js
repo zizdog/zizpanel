@@ -53,6 +53,10 @@ let gen = 0;
 // 直到用户点状态栏里的「重连」。
 let sessionClosed = false;
 
+// lastFailure：最近一次"连不上"的结论（advice/detail）。切走板块再回来时
+// screen 会被 term.render 重画，用它把结论补回来，细节不丢。
+let lastFailure = null;
+
 export function TerminalView(content, ctx = {}) {
   clear(content);
   const d = ensureDom();
@@ -195,6 +199,7 @@ export function destroyTerminal() {
   closeWS();
   term = null;
   sessionClosed = false;
+  lastFailure = null;
   follow = true;
   if (dom) {
     clear(dom.screen);
@@ -214,6 +219,8 @@ function reattach() {
   fitSize();
   if (follow) el.scrollTop = el.scrollHeight;
   el.focus();
+  // 上次是"连不上"：结论要补回屏幕上（statusBar 的 pill 还在，细节不能丢）
+  if (lastFailure) showConnectFailure(lastFailure.advice, lastFailure.detail);
 }
 
 // showUnavailable 在终端区域里画一个"读不到状态"的说明（绝不猜一个默认状态）。
@@ -230,10 +237,44 @@ function showUnavailable(title, detail, withRetry) {
   ]));
 }
 
+// showConnectFailure 显示"连不上"的可行动结论：首行 ≤40 字（服务端给），
+// 细节收进折叠项。**绝不只显示错误码** —— 用户要知道去哪儿开 WebSocket 透传。
+function showConnectFailure(advice, detail) {
+  if (!dom) return;
+  lastFailure = { advice, detail };
+  clear(dom.screen);
+  appendAll(dom.screen, h('div.empty', [
+    h('div.big', { text: '⚠️' }),
+    h('h4', { text: advice }),
+    h('details', {
+      style: { marginTop: '8px', textAlign: 'left', maxWidth: '760px' },
+    }, [
+      h('summary', { style: { cursor: 'pointer', color: 'var(--text-dim)' }, text: '详情' }),
+      h('div', { style: { marginTop: '6px', color: 'var(--text-dim)', lineHeight: '1.7' }, text: detail }),
+    ]),
+    h('div', { style: { marginTop: '14px' } }, [
+      h('button.btn.btn-sm', { text: '↻ 重连', onclick: () => start() }),
+    ]),
+  ]));
+}
+
+// diagnoseAndShow：WS 从未连上时浏览器只给 1006、读不到失败原因，
+// 用普通 HTTP 请求向面板要结论（判据与文案都在服务端，前端不改写）。
+async function diagnoseAndShow(my) {
+  let v = null;
+  try { v = await api.terminalWSDiagnose(); } catch { /* 面板都读不到，走兜底 */ }
+  if (my !== gen) return; // 已被登出/重连取代
+  const advice = v && v.advice ? v.advice : '连不上终端：请在反向代理那层开启 WebSocket 透传';
+  const detail = v && v.detail ? v.detail : '浏览器没拿到握手失败的原因，可换直连地址再试。';
+  renderStatus('err', advice);
+  showConnectFailure(advice, detail);
+}
+
 async function start() {
   const d = ensureDom();
   const my = ++gen;
   sessionClosed = false;
+  lastFailure = null;
 
   let info;
   try {
@@ -297,9 +338,14 @@ async function start() {
   }
   const sock = new WebSocket(url);
   ws = sock;
+  // opened：本次连接是否真的升级成功过。没成功过才可能是反代吃掉了
+  // Connection/Upgrade；成功过再断是链路中断，不能给同一句结论。
+  let opened = false;
 
   sock.onopen = () => {
     if (sock !== ws) return; // 已被重连替换
+    opened = true;
+    lastFailure = null;
     renderStatus('ok', '已连接');
     send({ type: 'resize', cols: term.cols, rows: term.rows });
     // 心跳：让服务端知道"对端还活着"（服务端读超时 75s，这里 25s 一次）。
@@ -331,9 +377,17 @@ async function start() {
     if (sock !== ws) return; // 旧 socket（已被重连替换）的关闭事件，忽略
     stopHeartbeat();
     ws = null;
-    if (ev.code !== 1000) {
-      renderStatus('err', `连接已断开（代码 ${ev.code}）。可点"重连"。`);
+    if (ev.code === 1000) return; // 正常关闭（用户点「关闭会话」）
+    if (opened) {
+      // 连上过再断：是链路中断，不能推给 WebSocket 透传。
+      renderStatus('err', `连接中断（代码 ${ev.code}）`);
+      showConnectFailure(`连接中断（代码 ${ev.code}）`,
+        '链路被中间层掐断（常见于反向代理的 WebSocket 超时）。可点「重连」；'
+        + '若反复发生，请检查反向代理那一层的 WebSocket 透传与超时设置。');
+      return;
     }
+    // 从未连上：浏览器只给 1006、读不到原因，去向面板要结论。
+    diagnoseAndShow(my);
   };
 }
 

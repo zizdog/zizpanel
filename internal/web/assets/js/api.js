@@ -471,6 +471,8 @@ export const api = {
     u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
     return u.toString();
   },
+  // WS 连不上时向面板要一条可行动结论（浏览器拿不到失败握手的响应体）
+  terminalWSDiagnose: () => request('GET', `${API_BASE}/terminal/ws-diagnose`),
 
   // ---- mac 设置（把 macOS 配成服务器；页面显示名从「系统设置」改来）----
   // 探测是只读的，随时可刷新；动作一律走任务中心（返回 task_id），

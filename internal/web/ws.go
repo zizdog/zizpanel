@@ -52,30 +52,48 @@ type wsConn struct {
 	closed  bool
 }
 
-// upgradeWebSocket 完成握手，把 HTTP 连接升级为 WebSocket。
+// 握手校验错误：逐跳头这一类可能是被中间层吃掉的（坑 219），
+// 调用方据此给出"去开 WebSocket 透传"的结论，而不是只记日志。
+var (
+	errWSNotGET              = errors.New("WebSocket 握手必须使用 GET")
+	errWSNoConnectionUpgrade = errors.New("缺少 Connection: Upgrade 头")
+	errWSUpgradeNotWebsocket = errors.New("Upgrade 头不是 websocket")
+	errWSBadVersion          = errors.New("不支持的 WebSocket 版本")
+	errWSMissingKey          = errors.New("缺少 Sec-WebSocket-Key")
+)
+
+// validateWSHandshake 校验升级请求；返回 nil 才会接管连接。
 //
 // 关键校验（缺一不可）：
 //   - 必须是 GET
 //   - Connection 头含 "upgrade"，Upgrade 头为 "websocket"
 //   - Sec-WebSocket-Key 存在
 //   - Sec-WebSocket-Version 为 13
-func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
+func validateWSHandshake(r *http.Request) error {
 	if r.Method != http.MethodGet {
-		return nil, errors.New("WebSocket 握手必须使用 GET")
+		return errWSNotGET
 	}
 	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
-		return nil, errors.New("缺少 Connection: Upgrade 头")
+		return errWSNoConnectionUpgrade
 	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return nil, errors.New("Upgrade 头不是 websocket")
+		return errWSUpgradeNotWebsocket
 	}
 	if v := r.Header.Get("Sec-WebSocket-Version"); v != "13" {
-		return nil, fmt.Errorf("不支持的 WebSocket 版本: %s（需要 13）", v)
+		return fmt.Errorf("%w: %s（需要 13）", errWSBadVersion, v)
+	}
+	if r.Header.Get("Sec-WebSocket-Key") == "" {
+		return errWSMissingKey
+	}
+	return nil
+}
+
+// upgradeWebSocket 完成握手，把 HTTP 连接升级为 WebSocket。
+func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
+	if err := validateWSHandshake(r); err != nil {
+		return nil, err
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, errors.New("缺少 Sec-WebSocket-Key")
-	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {

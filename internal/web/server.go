@@ -388,6 +388,8 @@ func (s *Server) routes() http.Handler {
 	// ---------- Web 终端 ----------
 	root.HandleFunc("GET /api/v1/terminal", s.requireAuth(s.handleTerminalStatus))
 	root.HandleFunc("GET /api/v1/terminal/ws", s.handleTerminalWS) // 自行校验会话（WS 无法带自定义头）
+	// WS 连不上时给前端一条可行动结论（浏览器拿不到失败握手的响应体，见 ws_diagnose.go）
+	root.HandleFunc("GET /api/v1/terminal/ws-diagnose", s.requireAuth(s.handleTerminalWSDiagnose))
 	root.HandleFunc("DELETE /api/v1/terminal/{id}", s.requireAuth(s.handleTerminalKill))
 
 	// ---------- 服务管理 ----------
