@@ -431,6 +431,120 @@ func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomai
 	return nil
 }
 
+// publicEntry 是站点的公网入口：该域名被一条反向代理规则前置时给出的真实地址（坑 214）。
+// 没有规则命中时为 nil，界面保持"按站点自己的监听端口打开"的旧行为。
+type publicEntry struct {
+	PublicURL string `json:"public_url"`
+	Scheme    string `json:"scheme"`
+	Port      int    `json:"port"`
+	RuleID    int64  `json:"rule_id"`
+	RuleName  string `json:"rule_name"`
+	// Available=false 表示命中的规则已停用：地址算得出来，但现在打不开。
+	Available bool `json:"available"`
+	// MatchedDomain 是规则里真正命中的域名（可能是站点的附加域名）。
+	MatchedDomain string `json:"matched_domain"`
+	// OtherRules 是同样命中的其它规则名（多条命中时说明选了谁）。
+	OtherRules []string `json:"other_rules,omitempty"`
+	Note       string   `json:"note,omitempty"`
+}
+
+// publicEntryFor 从反向代理规则里挑一条前置该站点的规则算公网入口（坑 214）。
+// 读不到规则就返回 nil（不猜），界面退回旧行为。
+func (s *Server) publicEntryFor(ctx context.Context, site *sites.Site) *publicEntry {
+	if site == nil {
+		return nil
+	}
+	rules, err := s.proxyRepo().List(ctx)
+	if err != nil {
+		return nil
+	}
+	want := map[string]bool{}
+	want[strings.ToLower(strings.TrimSpace(site.Domain))] = true
+	for _, a := range site.AliasList() {
+		want[strings.ToLower(strings.TrimSpace(a))] = true
+	}
+	type hit struct {
+		rule   *proxies.Rule
+		domain string
+	}
+	var hits []hit
+	for _, r := range rules {
+		if r == nil {
+			continue
+		}
+		matched := ""
+		for _, d := range proxies.SplitDomains(r.Domains) {
+			if want[d] {
+				matched = d
+				break
+			}
+		}
+		if matched != "" {
+			hits = append(hits, hit{rule: r, domain: matched})
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	// 启用优先，其次端口小、id 小 —— 稳定且说得清"为什么选它"。
+	chosen := hits[0]
+	for _, h := range hits[1:] {
+		if betterPublicHit(h.rule, chosen.rule) {
+			chosen = h
+		}
+	}
+	pe := &publicEntry{
+		Scheme:        "http",
+		Port:          chosen.rule.Listen,
+		RuleID:        chosen.rule.ID,
+		RuleName:      chosen.rule.Name,
+		Available:     chosen.rule.Enabled,
+		MatchedDomain: chosen.domain,
+	}
+	if chosen.rule.SSLEnabled {
+		pe.Scheme = "https"
+	}
+	seen := map[string]bool{chosen.rule.Name: true}
+	for _, h := range hits {
+		if h.rule.ID == chosen.rule.ID || seen[h.rule.Name] {
+			continue
+		}
+		seen[h.rule.Name] = true
+		pe.OtherRules = append(pe.OtherRules, h.rule.Name)
+	}
+	defPort := 80
+	if pe.Scheme == "https" {
+		defPort = 443
+	}
+	dial := ""
+	if chosen.rule.Listen != defPort {
+		dial = ":" + strconv.Itoa(chosen.rule.Listen)
+	}
+	pe.PublicURL = pe.Scheme + "://" + chosen.domain + dial + ruleEntryPath(chosen.rule.Path)
+	if !pe.Available {
+		pe.Note = "反向代理规则「" + chosen.rule.Name + "」已停用，暂时打不开"
+	}
+	return pe
+}
+
+func betterPublicHit(a, b *proxies.Rule) bool {
+	if a.Enabled != b.Enabled {
+		return a.Enabled
+	}
+	if a.Listen != b.Listen {
+		return a.Listen < b.Listen
+	}
+	return a.ID < b.ID
+}
+
+func ruleEntryPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "/" {
+		return "/"
+	}
+	return "/" + strings.Trim(p, "/") + "/"
+}
+
 // 这几个包级变量是"写 vhost → reload → 复核"通道的可注入步骤：单测不允许调用
 // 提权助手、不允许真发网络请求（生产指向真实实现）。回滚走同一条通道，不另开没测过的路径。
 var (
@@ -913,15 +1027,19 @@ func (s *Server) handleSiteList(w http.ResponseWriter, r *http.Request) {
 	}
 	type item struct {
 		*sites.Site
-		ConfExists bool `json:"conf_exists"`
-		Running    bool `json:"running"`
+		ConfExists  bool         `json:"conf_exists"`
+		Running     bool         `json:"running"`
+		PublicEntry *publicEntry `json:"public_entry,omitempty"`
 	}
 	out := make([]item, 0, len(list))
 	vhostDir := s.Cfg.VhostDir
 	for _, st := range list {
 		confPath := filepath.Join(vhostDir, st.Domain+".conf")
 		_, err := os.Stat(confPath)
-		out = append(out, item{Site: st, ConfExists: err == nil, Running: err == nil && st.Enabled})
+		out = append(out, item{
+			Site: st, ConfExists: err == nil, Running: err == nil && st.Enabled,
+			PublicEntry: s.publicEntryFor(r.Context(), st),
+		})
 	}
 	ok(w, map[string]any{
 		"list":        out,
@@ -1256,6 +1374,7 @@ func (s *Server) handleSiteGet(w http.ResponseWriter, r *http.Request) {
 	})
 	ok(w, map[string]any{
 		"site":         site,
+		"public_entry": s.publicEntryFor(r.Context(), site),
 		"conf":         string(conf),
 		"conf_path":    confPath,
 		"generated":    generated,

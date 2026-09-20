@@ -1407,7 +1407,7 @@ export function SitesView(content, ctx = {}) {
         h('div', { style: { fontWeight: '600', display: 'flex', alignItems: 'center', gap: '6px' } }, [
           domainLink(s),
           (Number(s.listen_port) || 80) !== 80
-            ? h('span.pill.brand', { text: ':' + s.listen_port, title: '该站点独占端口 ' + s.listen_port })
+            ? h('span.pill.brand', { text: ':' + s.listen_port, title: '该站点监听端口 ' + s.listen_port })
             : null,
         ]),
         s.aliases ? h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.aliases }) : null,
@@ -1473,31 +1473,46 @@ export function SitesView(content, ctx = {}) {
     }
   }
 
+  // siteOpenTarget 计算站点「打开」地址：被反向代理规则前置时走公网入口（坑 214）。
+  // 打开地址只在这里算一份 —— 别处再拼一遍就会漏掉规则、退回 80。
+  function siteOpenTarget(s) {
+    const pe = s && s.public_entry;
+    if (pe && pe.available && pe.public_url) {
+      return { href: pe.public_url, viaRule: pe.rule_name || '', note: pe.note || '' };
+    }
+    const host = String(s.domain || '').replace(/:\d+$/, '');
+    if (!host) return { href: '', viaRule: '', note: (pe && pe.note) || '' };
+    const scheme = s.ssl_enabled ? 'https' : 'http';
+    const port = Number(s.listen_port) || 80;
+    const dial = !s.ssl_enabled && port !== 80 ? ':' + port : '';
+    return { href: scheme + '://' + host + dial + '/', viaRule: '', note: (pe && pe.note) || '' };
+  }
+
   // domainLink 把**域名文本本身**做成链接（用户明确要求）。
   //
   // 用户原话：不要 `blog.zizdog.com` / `http://blog.zizdog.com` / `https://blog.zizdog.com`
   // 三种形式都列出来 —— 只显示域名文本本身，并且这段文字本身可点、新标签打开。
-  //
-  // 链接用该站点**实际启用的协议**：开了 SSL 走 https，否则走 http；
-  // 自定义监听端口必须拼进链接，否则会打开 80 上别的站点（HTTPS 仍固定 443）。
+  // 链接地址必须走 siteOpenTarget：有反代规则时用公网入口，而不是站点自己的 80。
   function domainLink(s) {
     const host = String(s.domain || '').replace(/:\d+$/, '');
     if (!host) return h('span', { text: s.domain || '' });
-    const scheme = s.ssl_enabled ? 'https' : 'http';
-    const port = Number(s.listen_port) || 80;
-    const dial = !s.ssl_enabled && port !== 80 ? ':' + port : '';
-    const href = scheme + '://' + host + dial + '/';
-    const notes = ['在新窗口打开 ' + href];
-    notes.push(s.ssl_enabled
-      ? '该站点已开启 SSL：https 可用'
-      : '该站点未开启 SSL：这里用 http 打开；直接访问 https://' + host + '/ 会提示证书不受信任');
+    const target = siteOpenTarget(s);
+    const notes = ['在新窗口打开 ' + target.href];
+    if (target.viaRule) {
+      notes.push('该域名由反向代理规则「' + target.viaRule + '」前置，按公网入口打开');
+    } else {
+      notes.push(s.ssl_enabled
+        ? '该站点已开启 SSL：https 可用'
+        : '该站点未开启 SSL：这里用 http 打开；直接访问 https://' + host + '/ 会提示证书不受信任');
+    }
+    if (target.note) notes.push(target.note);
     if (!s.conf_exists) {
       notes.push('nginx 配置文件不存在（数据库有记录、nginx 没在服务）');
     } else if (!s.enabled) {
       notes.push('站点已停用（nginx 配置文件在，但不服务）');
     }
     return h('a', {
-      href, target: '_blank', rel: 'noopener',
+      href: target.href, target: '_blank', rel: 'noopener',
       text: s.domain, title: notes.join('；'),
     });
   }
@@ -1505,15 +1520,22 @@ export function SitesView(content, ctx = {}) {
   // addressInfo 用小字如实标出协议与可达状态。
   //
   // 这是"不丢信息"的那一半：不再列出三种网址形态，但协议（http/https）、
-  // 自定义端口与"配置在不在、启没启用"仍然看得见；具体状态列还有更细的判定。
+  // 自定义端口与"配置在不在、启没启用"仍然看得见；有反代规则时标明公网入口。
   function addressInfo(s) {
     const host = String(s.domain || '').replace(/:\d+$/, '');
     if (!host) return null;
-    const port = Number(s.listen_port) || 80;
-    const proto = s.ssl_enabled ? '🔒 https' : (port === 80 ? 'http' : 'http:' + port);
+    const target = siteOpenTarget(s);
     const state = !s.conf_exists
       ? '⚠ nginx 配置缺失'
       : (s.enabled ? '配置存在、已启用' : '配置存在、已停用');
+    let proto;
+    if (target.viaRule) {
+      proto = (target.href.indexOf('https://') === 0 ? '🔒 https' : 'http') +
+        ' · 公网入口（规则「' + target.viaRule + '」）';
+    } else {
+      const port = Number(s.listen_port) || 80;
+      proto = s.ssl_enabled ? '🔒 https' : (port === 80 ? 'http' : 'http:' + port);
+    }
     return h('div.zp-addr', [
       h('span', {
         style: { fontSize: '11.5px', color: 'var(--text-mute)' },
@@ -2055,8 +2077,8 @@ export function SitesView(content, ctx = {}) {
           })]),
         h('div.field', [h('label', { text: '监听端口' }), port,
           h('div.hint', {
-            text: '默认 80；镜像站可独占一个端口',
-            title: '例如 8090。面板/内置服务已占用、或已被别的站点占用时直接报错；' +
+            text: '默认 80；同一端口可放多个不同域名的站点',
+            title: '例如 8090。面板/内置服务已占用、或同端口下有站点/反代规则用同一个域名时拒绝；' +
               '自定义端口只作用于 HTTP，开了 HTTPS 时 HTTPS 仍在 443。',
           })]),
         h('div.field', [h('label', { text: '路由 / 伪静态' }), preset, presetHint]),
@@ -2201,8 +2223,8 @@ export function SitesView(content, ctx = {}) {
           })]),
         h('div.field', [h('label', { text: '监听端口' }), port, portState,
           h('div.hint', {
-            text: '默认 80；镜像站可独占一个端口',
-            title: '例如 8090。面板/内置服务已占用、或已被别的站点占用时直接报错；' +
+            text: '默认 80；同一端口可放多个不同域名的站点',
+            title: '例如 8090。面板/内置服务已占用、或同端口下有站点/反代规则用同一个域名时直接报错；' +
               '自定义端口只作用于 HTTP，开了 HTTPS 时 HTTPS 仍在 443。',
           })]),
         h('div.field', [
