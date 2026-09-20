@@ -431,7 +431,7 @@ func TestSiteListenPortValidationMatrix(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("同端口域名重复必须被拒，实际 %d: %v", res.StatusCode, out)
 	}
-	if msg := fmt.Sprint(out["msg"]); !strings.Contains(msg, "taken.test") || !strings.Contains(msg, "域名重复") {
+	if msg := fmt.Sprint(out["msg"]); !strings.Contains(msg, "taken.test") || !strings.Contains(msg, "域名与站点冲突") {
 		t.Errorf("冲突原因应指出重复的域名与占用它的站点，实际: %s", msg)
 	}
 	// 正常值放行

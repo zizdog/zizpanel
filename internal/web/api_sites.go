@@ -436,9 +436,10 @@ func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomai
 			if !want[strings.ToLower(strings.TrimSpace(name))] {
 				continue
 			}
-			return fmt.Errorf("端口 %d 与站点 %s 的域名重复\n"+
-				"同一端口可以放多个站点，但域名/别名必须互不冲突；%s 已被站点 %s 使用，请换端口或换域名",
-				port, st.Domain, name, st.Domain)
+			// 首行固定 ≤40 字结论，具体是谁/哪个域名放在折叠的细节里（坑 211 的文案纪律）。
+			return fmt.Errorf("端口 %d 的域名与站点冲突\n"+
+				"同一端口可以放多个站点，但域名/别名必须互不冲突：%s 已被站点 %s 使用，请换端口或换域名",
+				port, name, st.Domain)
 		}
 	}
 
@@ -452,8 +453,8 @@ func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomai
 				if !want[d] {
 					continue
 				}
-				return fmt.Errorf("端口 %d 与反代规则「%s」域名重复\n"+
-					"域名 %s 已被这条规则在该端口上服务，请换端口或改规则的域名", port, r.Name, d)
+				return fmt.Errorf("端口 %d 的域名与反代规则冲突\n"+
+					"域名 %s 已被反向代理规则「%s」在该端口上服务，请换端口或改规则的域名", port, d, r.Name)
 			}
 		}
 	}
@@ -461,8 +462,8 @@ func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomai
 	// ③ 端口被非 nginx 进程占用：nginx 绑不上（80 上面的旧行为不变）。
 	if holders, herr := sitePortHoldersFn(ctx, port); herr == nil && strings.TrimSpace(holders) != "" {
 		if !strings.Contains(strings.ToLower(holders), "nginx") {
-			return fmt.Errorf("端口 %d 已被 %s 占用\n"+
-				"占用的不是 nginx，站点绑定会失败；请换一个端口或先停掉该进程", port, holderSummary(holders))
+			return fmt.Errorf("端口 %d 已被别的进程占用\n"+
+				"占用者：%s（不是 nginx，站点绑定会失败）；请换一个端口或先停掉它", port, holderSummary(holders))
 		}
 	}
 	return nil

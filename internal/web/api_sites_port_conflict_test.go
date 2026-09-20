@@ -38,6 +38,19 @@ func stubPortHolders(t *testing.T, holders string, err error) {
 	t.Cleanup(func() { sitePortHoldersFn = prev })
 }
 
+// assertHeadShort 锁"用户可见首行 ≤40 字"：前端 failureToast 只显示首行，
+// 具体是谁/哪个域名必须放进换行后的细节（坑 211 的文案纪律）。
+func assertHeadShort(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	head := strings.SplitN(err.Error(), "\n", 2)[0]
+	if n := len([]rune(head)); n > 40 {
+		t.Errorf("错误首行 %d 字（要求 ≤40）：%s", n, head)
+	}
+}
+
 // TestSiteListenPortAllowsSamePortDifferentDomains：同端口不同域名 = 允许。
 func TestSiteListenPortAllowsSamePortDifferentDomains(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -59,7 +72,8 @@ func TestSiteListenPortRejectsDomainOverlap(t *testing.T) {
 	if err == nil {
 		t.Fatal("同端口下别名撞上已有站点的别名必须被拒")
 	}
-	if msg := err.Error(); !strings.Contains(msg, "ov-a.test") || !strings.Contains(msg, "域名重复") {
+	assertHeadShort(t, err)
+	if msg := err.Error(); !strings.Contains(msg, "ov-a.test") || !strings.Contains(msg, "域名与站点冲突") {
 		t.Errorf("拒绝原因必须指出重复的域名与占用它的站点，实际: %s", msg)
 	}
 	// 新站点主域名撞上已有站点的别名，同样是真冲突
@@ -82,6 +96,7 @@ func TestSiteListenPortRejectsNonNginxHolder(t *testing.T) {
 	if err == nil {
 		t.Fatal("端口被非 nginx 进程占用必须被拒（nginx 绑不上）")
 	}
+	assertHeadShort(t, err)
 	if msg := err.Error(); !strings.Contains(msg, "otherd") || !strings.Contains(msg, "占用") {
 		t.Errorf("拒绝原因必须指出是谁占用了，实际: %s", msg)
 	}
@@ -111,7 +126,8 @@ func TestSiteListenPortRejectsProxySameDomain(t *testing.T) {
 	if err == nil {
 		t.Fatal("同端口下反代规则已服务同一域名必须被拒（真冲突）")
 	}
-	if msg := err.Error(); !strings.Contains(msg, "同域规则") || !strings.Contains(msg, "域名重复") {
+	assertHeadShort(t, err)
+	if msg := err.Error(); !strings.Contains(msg, "同域规则") || !strings.Contains(msg, "域名与反代规则冲突") {
 		t.Errorf("拒绝原因必须指出是哪条规则，实际: %s", msg)
 	}
 	// 规则服务别的域名时，同端口可以建站点
