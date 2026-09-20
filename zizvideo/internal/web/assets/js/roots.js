@@ -1,7 +1,7 @@
 // 目录选择器：只显示目录名（接口也只回目录），绝不读取文件内容。
 
 import { api } from "./api.js";
-import { el, clear } from "./dom.js";
+import { el, clear, asArray } from "./dom.js";
 
 // norm 归一化尾斜杠，用于把选中的目录和允许根对齐比较。
 function norm(path) {
@@ -84,46 +84,51 @@ export function openDirectoryPicker(options) {
     }, el("span", { class: "dir-name", text: name }));
   }
 
+  // entryRows 永远返回数组：空目录给一行提示，绝不能回单个节点让调用方展开（坑 13）。
   function entryRows(entries) {
-    if (!entries.length) return el("div", { class: "muted", text: "没有子目录" });
-    return entries.map((entry) => {
-      const row = dirRow(entry.name, entry.path);
-      if (entry.readable === false) {
+    const rows = asArray(entries);
+    if (!rows.length) return [el("div", { class: "muted", text: "没有子目录" })];
+    return rows.map((entry) => {
+      const row = dirRow(entry && entry.name, entry && entry.path);
+      if (!entry || entry.readable === false) {
         row.disabled = true;
-        row.title = entry.path + "（不可读）";
+        row.title = ((entry && entry.path) || "") + "（不可读）";
       }
-      row.append(el("span", { class: "dir-meta", text: (entry.subdirs || 0) + " 个子目录" }));
+      row.append(el("span", { class: "dir-meta", text: ((entry && entry.subdirs) || 0) + " 个子目录" }));
       return row;
     });
   }
 
   function startChips(starts) {
-    if (!starts || !starts.length) return null;
+    const list2 = asArray(starts);
+    if (!list2.length) return null;
     const box = el("div", { class: "chips" });
-    for (const start of starts) box.append(crumbButton(start, start, (p) => load(p).catch(report)));
+    for (const start of list2) box.append(crumbButton(start, start, (p) => load(p).catch(report)));
     return box;
   }
 
   async function render(result, append) {
-    current = result.path;
+    const data = result || {};
+    current = data.path;
     clear(crumbs);
-    crumbs.append(breadcrumb(result.path, (p) => load(p).catch(report)));
+    crumbs.append(breadcrumb(data.path, (p) => load(p).catch(report)));
+    const rows = entryRows(data.entries);
     if (append) {
-      list.append(...entryRows(result.entries));
+      for (const row of rows) list.append(row);
     } else {
       clear(list);
-      if (!startsShown && result.starts && result.starts.length) {
-        list.append(startChips(result.starts));
-        startsShown = true;
+      if (!startsShown) {
+        const chips = startChips(data.starts);
+        if (chips) { list.append(chips); startsShown = true; }
       }
-      list.append(...entryRows(result.entries));
+      for (const row of rows) list.append(row);
     }
     const loaded = list.querySelectorAll(".dir-row").length;
-    more.hidden = !result.has_more;
-    more.onclick = () => load(result.path, loaded).catch(report);
-    upButton.disabled = !result.parent;
-    upButton.onclick = () => { if (result.parent) load(result.parent).catch(report); };
-    const covered = roots().some((root) => isUnder(result.path, root));
+    more.hidden = !data.has_more;
+    more.onclick = () => load(data.path, loaded).catch(report);
+    upButton.disabled = !data.parent;
+    upButton.onclick = () => { if (data.parent) load(data.parent).catch(report); };
+    const covered = roots().some((root) => isUnder(data.path, root));
     addButton.hidden = covered;
     addButton.textContent = "加为允许根";
     selectButton.textContent = "选这个目录";

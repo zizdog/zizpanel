@@ -33,7 +33,7 @@ export function renderHeader(headerEl, onLogout, hideHeader) {
   // append() 会把 null 变成 "null" 文本节点，非管理员必须走条件分支（坑 10）
   if (user.role === "admin") nodes.push(el("a", { class: "link", href: "#/admin", text: "管理" }));
   nodes.push(el("button", { class: "btn small", type: "button", text: "退出", onclick: onLogout }));
-  headerEl.append(...nodes);
+  for (const node of nodes) headerEl.append(node);
 }
 
 export function mountLogin(view, onSuccess) {

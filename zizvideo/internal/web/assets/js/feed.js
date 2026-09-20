@@ -3,6 +3,7 @@
 import { api, patchProgressKeepalive } from "./api.js";
 import { el, fmtDuration } from "./dom.js";
 import { mountNav } from "./nav.js";
+import { createFeedSettingsForm, normalizeFeedSettings, seekSecondsOf, loopEffective } from "./play-settings.js";
 
 const WHEEL_STEP = 40;
 const TOUCH_STEP = 50;
@@ -76,7 +77,7 @@ export function mountFeed(view) {
     active: -1, hasMore: true, loading: false,
     soundOn: readSoundPref(),
     scope: "", scopeName: "", nextCursor: "",
-    settings: { loop_play: false, loop_effective: false, autoplay_next: true, seek_seconds: 10 },
+    settings: normalizeFeedSettings(),
     infoCard: null, emptyCard: null,
   };
   let toastTimer = 0;
@@ -154,7 +155,7 @@ export function mountFeed(view) {
       index, item, layer, video: null, fill: null, elapsed: null, total: null,
       fav: null, like: null, hint: null, soundHint: null, playBtn: null, flash: null,
       bubble: null, bar: null, barWrap: null, sound: null, gear: null, panel: null,
-      setLoop: null, setAuto: null, setSeek: null, setNote: null, seekRatio: 0,
+      settingsForm: null, seekRatio: 0,
       seeking: false, flashTimer: 0, hintTimer: 0,
       resumeDone: false, playRejected: false, broken: false, destroyed: false,
     };
@@ -486,46 +487,24 @@ export function mountFeed(view) {
     entry.barWrap.addEventListener("pointercancel", finish);
   }
 
-  /* ---------- 播放设置（右上 ⚙ 二级面板） ---------- */
+  /* ---------- 播放设置（右上 ⚙ 二级面板，控件与「我的」共用） ---------- */
 
   function loopEnabled() {
-    return !!state.settings.loop_play && !state.settings.autoplay_next;
+    return loopEffective(state.settings);
   }
 
   // 左右键跳转秒数：非法/缺省一律按 10，上限与后端一致（120）。
   function seekSeconds() {
-    const n = Number(state.settings.seek_seconds);
-    if (!Number.isFinite(n) || n < 1) return 10;
-    return Math.min(120, Math.round(n));
+    return seekSecondsOf(state.settings);
   }
 
   function paintPanel(entry) {
-    if (!entry.panel) return;
-    entry.setAuto.checked = !!state.settings.autoplay_next;
-    entry.setLoop.checked = !!state.settings.loop_play;
-    entry.setLoop.disabled = !!state.settings.autoplay_next;
-    entry.setSeek.value = String(seekSeconds());
-    entry.setNote.classList.toggle("hidden", !state.settings.autoplay_next);
+    if (entry.settingsForm) entry.settingsForm.paint(state.settings);
   }
 
   function buildPanel(entry) {
-    entry.setAuto = el("input", { type: "checkbox" });
-    entry.setAuto.addEventListener("change", () => saveSettings({ autoplay_next: entry.setAuto.checked }));
-    entry.setLoop = el("input", { type: "checkbox" });
-    entry.setLoop.addEventListener("change", () => saveSettings({ loop_play: entry.setLoop.checked }));
-    entry.setSeek = el("input", { type: "number", min: "1", max: "120", step: "1" });
-    entry.setSeek.addEventListener("change", () => {
-      const raw = Number(entry.setSeek.value);
-      const next = Number.isFinite(raw) ? Math.max(1, Math.min(120, Math.round(raw))) : seekSeconds();
-      entry.setSeek.value = String(next);
-      saveSettings({ seek_seconds: next });
-    });
-    entry.setNote = el("div", { class: "set-note", text: "连播开启时循环不生效" });
-    entry.panel = el("div", { class: "set-panel hidden" },
-      el("label", { class: "set-row" }, entry.setAuto, el("span", { text: "自动播放下一个" })),
-      el("label", { class: "set-row" }, entry.setLoop, el("span", { text: "循环播放" })),
-      el("label", { class: "set-row" }, el("span", { text: "左右键跳转" }), entry.setSeek, el("span", { text: "秒" })),
-      entry.setNote);
+    entry.settingsForm = createFeedSettingsForm({ settings: state.settings, onChange: saveSettings });
+    entry.panel = el("div", { class: "set-panel hidden" }, entry.settingsForm.node);
     entry.panel.addEventListener("click", (event) => event.stopPropagation());
     return entry.panel;
   }
@@ -559,11 +538,11 @@ export function mountFeed(view) {
 
   async function saveSettings(partial) {
     const before = state.settings;
-    state.settings = Object.assign({}, state.settings, partial);
+    state.settings = normalizeFeedSettings(Object.assign({}, state.settings, partial));
     applySettings();
     try {
       const result = await api.patchFeedSettings(partial);
-      if (result) state.settings = result;
+      if (result) state.settings = normalizeFeedSettings(result);
     } catch (err) {
       state.settings = before;
       showToast(err && err.message ? err.message : "设置保存失败");
@@ -662,7 +641,7 @@ export function mountFeed(view) {
 
   function appendItems(list, meta) {
     if (meta && meta.settings) {
-      state.settings = meta.settings;
+      state.settings = normalizeFeedSettings(meta.settings);
       applySettings();
     }
     for (const item of list) {

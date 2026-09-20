@@ -1,7 +1,9 @@
 // 我的：账号、设置入口、退出登录（条目 10）
 
 import { el, fmtDate } from "./dom.js";
+import { api } from "./api.js";
 import { session } from "./auth.js";
+import { createFeedSettingsForm, normalizeFeedSettings } from "./play-settings.js";
 
 function kv(label, value) {
   return el("div", { class: "kv" },
@@ -19,12 +21,50 @@ export function mountMe(view, options) {
     kv("角色", user.role === "admin" ? "管理员" : "普通用户"),
     kv("上次登录", user.last_login_at ? fmtDate(user.last_login_at) : "首次"));
 
+  // 播放设置就地展开：与首页 ⚙ 共用同一份控件与 PATCH /api/v1/feed/settings，不跳走。
+  let playSettings = normalizeFeedSettings();
+  const playNote = el("div", { class: "muted small-note", dataset: { role: "me-play-settings-note" } });
+  const playForm = createFeedSettingsForm({ settings: playSettings, onChange: savePlaySetting });
+  const playBox = el("div", { class: "set-panel hidden", dataset: { role: "me-play-settings" } },
+    playForm.node, playNote);
+  const playToggle = el("button", {
+    class: "btn small", type: "button", text: "播放设置", dataset: { role: "me-play-settings-toggle" },
+    onclick: () => togglePlaySettings(),
+  });
   const settings = el("div", { class: "panel", dataset: { role: "me-settings" } },
-    el("div", { class: "panel-title", text: "设置" }),
-    el("a", { class: "btn small", href: "#/feed", text: "播放设置" }),
-    el("div", { class: "muted small-note", text: "循环播放、自动播下一集在播放页右上角 ⚙ 里设置。" }));
+    el("div", { class: "panel-title", text: "设置" }), playToggle, playBox);
   if (user.role === "admin") {
     settings.append(el("a", { class: "btn small", href: "#/admin", text: "管理后台" }));
+  }
+
+  async function togglePlaySettings() {
+    if (!playBox.classList.contains("hidden")) { playBox.classList.add("hidden"); return; }
+    playBox.classList.remove("hidden");
+    playNote.textContent = "读取设置…";
+    try {
+      playSettings = normalizeFeedSettings(await api.feedSettings());
+      playForm.paint(playSettings);
+      playNote.textContent = "";
+    } catch (err) {
+      playNote.textContent = err && err.message ? err.message : "读取设置失败";
+    }
+  }
+
+  async function savePlaySetting(partial) {
+    const before = playSettings;
+    playSettings = normalizeFeedSettings(Object.assign({}, playSettings, partial));
+    playForm.paint(playSettings);
+    playNote.textContent = "保存中…";
+    try {
+      const result = await api.patchFeedSettings(partial);
+      playSettings = normalizeFeedSettings(result || playSettings);
+      playForm.paint(playSettings);
+      playNote.textContent = "已保存";
+    } catch (err) {
+      playSettings = before;
+      playForm.paint(playSettings);
+      playNote.textContent = err && err.message ? err.message : "保存失败";
+    }
   }
 
   const logout = el("button", {

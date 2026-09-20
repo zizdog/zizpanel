@@ -29,6 +29,11 @@ export function el(tag, props, ...children) {
   return add(node, children);
 }
 
+// asArray：接口字段不保证是数组时统一收敛，别把非数组喂给遍历或 append 展开（坑 13）
+export function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 export function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
   return node;

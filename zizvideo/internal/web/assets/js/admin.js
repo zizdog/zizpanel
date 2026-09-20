@@ -1,7 +1,7 @@
 // 管理后台：媒体库 / 媒体 / 允许根 / 用户 / 系统 页签
 
 import { api } from "./api.js";
-import { el, clear, banner, setBanner, field, input, fmtDuration, fmtBytes, fmtDate } from "./dom.js";
+import { el, clear, banner, setBanner, field, input, fmtDuration, fmtBytes, fmtDate, asArray } from "./dom.js";
 import { openDirectoryPicker } from "./roots.js";
 
 function button(label, onclick, extraClass) {
@@ -531,12 +531,14 @@ function mountDuplicates(root) {
   function render(list) {
     clear(body);
     selected.clear();
-    if (!list.length) { body.append(emptyRow(8, "没有疑似重复")); return; }
-    for (const group of list) {
+    const groups = asArray(list);
+    if (!groups.length) { body.append(emptyRow(8, "没有疑似重复")); return; }
+    for (const group of groups) {
+      const members = asArray(group && group.members);
       body.append(el("tr", null, el("td", { colspan: "8",
         text: "疑似重复组：大小 " + fmtBytes(group.size_bytes) + "、时长 " + fmtDuration(group.duration_ms) +
-          "（" + group.members.length + " 个）" })));
-      for (const member of group.members) {
+          "（" + members.length + " 个）" })));
+      for (const member of members) {
         const check = el("input", { type: "checkbox" });
         check.addEventListener("change", () => {
           if (check.checked) selected.add(member.id); else selected.delete(member.id);
@@ -555,7 +557,7 @@ function mountDuplicates(root) {
     summary.textContent = "检测中…";
     try {
       const data = await api.request("GET", "/api/v1/admin/duplicates");
-      render(data.groups || []);
+      render(asArray(data && data.groups));
       summary.textContent = (data.judgement || "") + " 共 " + (data.group_count || 0) +
         " 组 / " + (data.member_count || 0) + " 个";
     } catch (err) {

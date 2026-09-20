@@ -265,7 +265,7 @@ func TestFeedSeekSecondsDefaultPersistAndOutOfRange(t *testing.T) {
 }
 
 // 门禁：左右键跳转不许只写一半 —— 两个播放器都要接 ArrowLeft/ArrowRight，
-// 且前后端共用 seek_seconds 字段名。
+// 且前后端共用 seek_seconds 字段名（字段名收在共享设置模块里）。
 func TestSeekKeysWiredInBothPlayersAndBackend(t *testing.T) {
 	for _, name := range []string{
 		filepath.Join("..", "web", "assets", "js", "feed.js"),
@@ -276,10 +276,22 @@ func TestSeekKeysWiredInBothPlayersAndBackend(t *testing.T) {
 			t.Fatalf("读取 %s 失败: %v", name, err)
 		}
 		body := string(raw)
-		for _, token := range []string{"ArrowLeft", "ArrowRight", "seek_seconds"} {
+		for _, token := range []string{"ArrowLeft", "ArrowRight"} {
 			if !strings.Contains(body, token) {
 				t.Fatalf("%s 缺少 %q —— 左右键跳转只写了一半", name, token)
 			}
+		}
+	}
+	for _, name := range []string{
+		filepath.Join("..", "web", "assets", "js", "play-settings.js"),
+		filepath.Join("..", "web", "assets", "js", "series.js"),
+	} {
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("读取 %s 失败: %v", name, err)
+		}
+		if !strings.Contains(string(raw), "seek_seconds") {
+			t.Fatalf("%s 缺少 %q —— 左右键跳转秒数与后端字段名脱节", name, "seek_seconds")
 		}
 	}
 	raw, err := os.ReadFile("handlers_feed.go")
