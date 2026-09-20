@@ -100,6 +100,13 @@ func TestNetworkHintOnMarketInstallEntries(t *testing.T) {
 			}
 			t.Cleanup(func() { syncthingInstallFn = prev })
 		}},
+		{"transmission", func(t *testing.T, err error) {
+			prev := transmissionInstallFn
+			transmissionInstallFn = func(*Server, context.Context, *services.InstallResult) error {
+				return err
+			}
+			t.Cleanup(func() { transmissionInstallFn = prev })
+		}},
 	}
 
 	for _, c := range cases {

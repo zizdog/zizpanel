@@ -276,6 +276,59 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 			"⚠️ 上游项目已于 2026-09-01 归档：之后不再发版、不再修安全问题，请只在内网使用。",
 		},
 	},
+	// memos：官方 darwin-arm64 单二进制 + SQLite，装完即用；**端口必须显式 5230**
+	// （代码默认 8081，与 filebrowser 撞）。校验清单 checksums.txt 覆盖全部平台产物。
+	"memos": {
+		ID: "memos", Label: "com.zizdog.memos", Name: "Memos（笔记）", Icon: "📝",
+		Category: "tool", RootDir: "memos",
+		// arm64 证据：v0.31.0 的 memos_0.31.0_darwin_arm64.tar.gz（21,058,705 B，
+		// sha256 96b40160…）；2026-09-20 本机实下解压后 file(1) 报 Mach-O arm64、
+		// `memos --help` 正常输出。
+		Repo: "usememos/memos", Tag: "v0.31.0", Asset: "memos_0.31.0_darwin_arm64.tar.gz",
+		Binary:   "memos",
+		TarStrip: 0, PickBinary: true,
+		// --data 写死到安装目录下 data/：不写会按上游默认散到当前工作目录。
+		Args: []string{"--port", "5230", "--data", "{root}/data"},
+		Port: 5230, HealthPath: "/healthz",
+		// 实测监听 *:5230（不是只绑回环），广告 LAN 地址。
+		BindAddress: "0.0.0.0",
+		// 数据库由 memos 首次启动自己建（memos_prod.db），面板只登记位置。
+		ConfigFile:    "data/memos_prod.db",
+		ChecksumAsset: "checksums.txt",
+		Notes: []string{
+			"安装目录：~/memos（二进制、data/memos_prod.db、日志都在这里）。",
+			"首次打开 http://<本机地址>:5230 注册的**第一个**账号就是实例管理员（没有默认口令）；" +
+				"在此之后注册的都是普通用户。",
+		},
+	},
+	// navidrome：官方 darwin-arm64 单二进制 + SQLite；**端口 4533 且只绑 127.0.0.1**
+	// （上游默认 address=0.0.0.0，绝不许裸奔）。音乐库目录写进 navidrome.toml。
+	"navidrome": {
+		ID: "navidrome", Label: "com.zizdog.navidrome", Name: "Navidrome（音乐）", Icon: "🎵",
+		Category: "tool", RootDir: "navidrome",
+		// arm64 证据：v0.64.0 的 navidrome_0.64.0_darwin_arm64.tar.gz（23,263,336 B，
+		// sha256 ad35e6f0…）；2026-09-20 本机实下解压后 file(1) 报 Mach-O arm64、
+		// `navidrome --help` 正常输出。
+		Repo: "navidrome/navidrome", Tag: "v0.64.0", Asset: "navidrome_0.64.0_darwin_arm64.tar.gz",
+		Binary:   "navidrome",
+		TarStrip: 0, PickBinary: true,
+		Args: []string{"--address", "127.0.0.1", "--port", "4533",
+			"--datafolder", "{root}/data", "--configfile", "{root}/navidrome.toml"},
+		Port: 4533, HealthPath: "/ping",
+		// 只绑回环：广告地址也用 127.0.0.1（上游默认 0.0.0.0，必须显式收住）。
+		BindAddress: "127.0.0.1",
+		// 配置文件由安装器生成（含 MusicFolder 骨架）；面板保留用户改动。
+		ConfigFile:    "navidrome.toml",
+		ConfigSeed:    navidromeConfigSeed,
+		ChecksumAsset: "navidrome_checksums.txt",
+		Notes: []string{
+			"安装目录：~/navidrome（二进制、data/navidrome.db、navidrome.toml、日志）。",
+			"**音乐库目录默认留空**：在「📝 编辑配置文件」里把 MusicFolder 改成你的音乐目录，" +
+				"再点「🔄 重启服务」；不设置时 Navidrome 照常起来，但扫描会报 'no such file'、一首歌都没有。",
+			"首次打开 http://127.0.0.1:4533 自行创建管理员账号（无默认口令）；" +
+				"它只绑回环，手机在局域网里直连 4533 是打不开的（走面板入口或反代）。",
+		},
+	},
 	// mac军刀（MacSaber）：本项目自研产物，**只在公网镜像站上**。
 	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
 	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
@@ -379,6 +432,30 @@ const ddnsGoConfigSeed = `# ` + panelConfigMarker + `（ddns-go 配置骨架）�
 # ddns-go 每 300 秒检查一次公网 IP（启动参数 -f 可改），只有 IP 变化时才调 DNS 接口。
 # 想改监听端口或检查频率：改的是启动参数，不是这个文件 —— 那要改 launchd 的
 # plist（/Library/LaunchDaemons/com.zizdog.ddns-go.plist）。
+`
+
+// navidromeConfigSeed 是 Navidrome 的配置骨架。**只有注释**是合法 TOML（实测
+// 照常起来，默认 MusicFolder=music → 扫描报 no such file）。用户把 MusicFolder
+// 改成自己的音乐目录后点「🔄 重启服务」生效。
+//
+// ⚠️ 真机实测：改 MusicFolder **只在首次扫描前有效** —— 库路径一旦写进
+// navidrome.db 就不会再被 toml 改掉。换库要删 data/navidrome.db 再重启（会丢播放记录）。
+const navidromeConfigSeed = `# ` + panelConfigMarker + `（Navidrome 配置骨架）。改完在
+# 「服务管理 → Navidrome」里点「🔄 重启服务」生效。
+#
+# ── 音乐库（必填，否则一首歌都没有）────────────────────────────────────
+# MusicFolder = "/Users/你的用户名/Music"
+#
+# 数据目录（面板已用启动参数固定为 ~/navidrome/data，改这里没用）
+# DataFolder = "/Users/你的用户名/navidrome/data"
+#
+# 只绑本机回环（面板启动参数已固定；要局域网访问请用面板入口或反代）
+# Address = "127.0.0.1"
+# Port = 4533
+#
+# ⚠️ 换音乐库目录：MusicFolder 只在 data/navidrome.db 里还没有库记录时生效。
+# 已经启动过一次之后再改目录，必须先删掉 ~/navidrome/data/navidrome.db 并重启
+# （会丢播放记录/收藏），或者在 Web UI 的「设置 → 媒体库」里改。
 `
 
 // frp 的官方校验清单文件名（frpc 安装时用它核对下载产物）。

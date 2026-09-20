@@ -209,9 +209,10 @@ func TestTarballDescriptorsMatchRegistry(t *testing.T) {
 //
 // 2026-09-17 新增 alist（它从未进过 homebrew-core，只能走官方 release 产物）。
 // 2026-09-19 新增 filebrowser（homebrew formula 没有 service 定义，改走官方 darwin-arm64 产物）。
+// 2026-09-20 新增 memos / navidrome（官方 darwin-arm64 release 产物，同一条轨）。
 func TestTarballRailOnlyContainsMigratedApps(t *testing.T) {
 	got := descriptorIDsForRail(RailTarball)
-	want := []string{"alist", "ddns-go", "filebrowser", "frpc", "orbien-client"}
+	want := []string{"alist", "ddns-go", "filebrowser", "frpc", "memos", "navidrome", "orbien-client"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("tarball 轨的应用 = %v，期望 %v", got, want)
 	}

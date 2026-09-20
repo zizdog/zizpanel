@@ -90,6 +90,8 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"ollama":       true,
 		"php82":        true,
 		"php84":        true,
+		// 下载器半夜要接着下，重启后必须自己回来（2026-09-20 新增）。
+		"transmission": true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {

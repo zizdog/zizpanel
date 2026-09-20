@@ -47,6 +47,8 @@ var tarballDescriptors = []string{
 	"ddns-go",
 	"alist",
 	"filebrowser",
+	"memos",
+	"navidrome",
 }
 
 // descriptorsByID / descriptorOrder 是描述符注册表（descriptor.go 的 FindDescriptor 用它）。
@@ -351,6 +353,12 @@ func tarballKeepNote(spec releaseBinaryApp) string {
 	case "filebrowser":
 		return keep + "与 filebrowser.db；filebrowser.db 里有用户、权限与设置，" +
 			"删除它等于重置管理员口令）"
+	case "memos":
+		return keep + "与 data/memos_prod.db；数据库里是你写的全部笔记，" +
+			"删除不可恢复）"
+	case "navidrome":
+		return keep + "、navidrome.toml（音乐库路径）与 data/navidrome.db" +
+			"（播放记录/收藏）；**音乐文件本身不在安装目录里，永不删**）"
 	default:
 		return keep + "与 " + spec.ConfigFile + "，配置里可能有秘密）"
 	}

@@ -1386,6 +1386,12 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		// 通用 brew 流程做不到，所以走自研安装器（见 services/syncthing.go）。
 		s.handleInstallSyncthing(w, r)
 		return
+	case "transmission":
+		// Transmission 默认 rpc-authentication-required=false = 无口令裸奔，
+		// 通用 brew 流程不会去设口令（也就不会去回读确认它生效），
+		// 所以走自研安装器（见 services/transmission.go）。
+		s.handleInstallTransmission(w, r)
+		return
 	case "macsaber":
 		// mac军刀：没有上游、没有 brew 包，产物是本仓库自己打的 darwin/arm64
 		// 单二进制（只发镜像站），而且要装成**真实用户的 LaunchAgent**（它读该

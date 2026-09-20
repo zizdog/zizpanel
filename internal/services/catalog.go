@@ -1532,6 +1532,76 @@ func Catalog() []App {
 			DocsURL: "https://alistgo.com",
 		},
 
+		// ---------------- 自托管应用（原生，2026-09-20 新增 Memos/Navidrome/Transmission） ----------------
+		//
+		// 三个都按「原生应用候选评估」的结论落地：Memos/Navidrome 走官方 release
+		// tarball（同 alist 那条轨），Transmission 走 brew（formula 自带 service 块）。
+		// 端口全部避开面板既有保留端口（memos 上游默认 8081 会撞 filebrowser）。
+		{
+			ID: "memos", Name: "Memos（笔记）", Icon: "📝",
+			UI: &AppUI{
+				Slug:         "memos",
+				PreferDirect: true,
+				Note: "「打开」给端口直连 http://<本机地址>:5230；" +
+					"子路径入口保留作备用（Memos 前端按根路径引资源，不一定认得前缀）。",
+			},
+			Summary:     "自托管碎片笔记：单二进制 + SQLite，Markdown 随手记",
+			Description: "自托管碎片笔记（单二进制 + SQLite）；首个注册的账号就是实例管理员。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: "memos", ServiceLabel: "com.zizdog.memos",
+			// 5230：上游默认 8081 与 filebrowser 撞（评估文档已核实），必须显式改。
+			Port: 5230, HealthPath: "/healthz",
+			ConfigPath: "data/memos_prod.db",
+			PostInstallHint: "打开 http://<本机地址>:5230 注册**第一个**账号 —— 它就是实例管理员；" +
+				"第二个账号起只是普通用户。数据在 ~/memos/data。",
+			DocsURL: "https://www.usememos.com",
+		},
+		{
+			ID: "navidrome", Name: "Navidrome（音乐）", Icon: "🎵",
+			UI: &AppUI{
+				Slug:         "navidrome",
+				PreferDirect: true,
+				Note:         "「打开」给端口直连 http://127.0.0.1:4533；它只绑本机回环，局域网用 IP 打不开是设计如此。",
+			},
+			Summary:     "自托管音乐服务器：Subsonic API，手机用音流/超音波",
+			Description: "自托管音乐服务器；只绑 127.0.0.1，音乐库目录在 ~/navidrome/navidrome.toml 里设置。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: "navidrome", ServiceLabel: "com.zizdog.navidrome",
+			// 4533：上游默认端口；**显式绑 127.0.0.1**（上游默认 0.0.0.0，绝不裸奔）。
+			Port: 4533, HealthPath: "/ping",
+			ConfigPath: "navidrome.toml",
+			PostInstallHint: "① 音乐库目录在「📝 编辑配置文件」（~/navidrome/navidrome.toml 的 MusicFolder）里设置：" +
+				"默认留空 = 未设置媒体库，扫描会报 'no such file'、歌单是空的。改完点「🔄 重启服务」生效。" +
+				"② 首次打开 http://127.0.0.1:4533 自行创建管理员账号。",
+			DocsURL: "https://www.navidrome.org",
+		},
+		{
+			ID: "transmission", Name: "Transmission（下载）", Icon: "🧲",
+			UI: &AppUI{
+				Slug:         "transmission",
+				Target:       "/transmission/",
+				PreferDirect: true,
+				Note: "「打开」走面板子路径；RPC 只绑 127.0.0.1，直链只在本机可用。" +
+					"默认关闭本地网络发现，避免 macOS 反复要授权。",
+			},
+			Summary:     "轻量 BitTorrent 下载器（自带 Web UI 与 RPC）",
+			Description: "轻量下载器；RPC 默认无口令 = 裸奔，面板安装时生成口令并回读核对。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: "transmission", ServiceLabel: "homebrew.mxcl.transmission-cli",
+			// brew formula 是 transmission-cli（不是 cask 的 GUI App），它自带 service 块。
+			BrewFormula: "transmission-cli",
+			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
+			SystemDaemon: true,
+			// 9091：上游默认；数据/配置由 formula 的 service 块写死在 <brew>/var/transmission/。
+			Port: 9091, HealthPath: "/transmission/web/",
+			ConfigPath: "{brew}/var/transmission/settings.json",
+			LogPath:    "{brew}/var/transmission/transmission-daemon.log",
+			PostInstallHint: "RPC 用户名/口令见安装结果凭据区（settings.json 里存的是哈希）；" +
+				"下载目录默认 ~/Downloads，可在 Web UI 里改。" +
+				"默认关了 DHT/LSD/UPnP（免得 macOS 反复要本地网络授权），要开请在设置里自行打开。",
+			DocsURL: "https://transmissionbt.com",
+		},
+
 		// ---------------- mac军刀（本项目自研，系统级 LaunchDaemon） ----------------
 		//
 		// 与目录里别的条目最大的区别：**它没有上游**。产物是本仓库 macsaber/

@@ -1275,8 +1275,105 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
-	// ---------------- mac军刀（本项目自研产物，只在镜像站） ----------------
+	// ---------------- 自托管应用（原生，2026-09-20 新增） ----------------
 
+	{
+		ID: "memos", Kind: KindNative, PanelInstaller: "memos", ServiceLabel: "com.zizdog.memos",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "com.zizdog.memos",
+			LabelSource: "目录 ServiceLabel（与 releaseBinaryApps 注册表里的 Label 一致）",
+		},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 memos_0.31.0_darwin_arm64.tar.gz",
+				Upstream: MarketUpstream{
+					ID:   "github.com/usememos/memos@v0.31.0/memos_0.31.0_darwin_arm64.tar.gz",
+					URL:  "https://github.com/usememos/memos/releases/download/v0.31.0/memos_0.31.0_darwin_arm64.tar.gz",
+					Repo: "usememos/memos", Tag: "v0.31.0", Asset: "memos_0.31.0_darwin_arm64.tar.gz",
+					Size: 21058705,
+					Note: "实测 21,058,705 B（2026-09-20 从 ghfast.top 下载整包实算 sha256，" +
+						"与 https://.../v0.31.0/checksums.txt 里 darwin_arm64 那行逐字一致）；" +
+						"tarball 内只有平级单成员 memos（无顶层目录）",
+				},
+				NAS: nasMissing("镜像站上还没有这个包（apps/memos/v0.31.0/ 不存在）。这是**缺口**不是'不需要'：" +
+					"官方 release 直连不稳，只能靠 ghfast.top / gh-proxy.com 两条加速；" +
+					"建议 tools/sync-nas-apps.sh 同步（它从 ReleaseBinaryAssets() 读清单，会自动带上这个包）"),
+				Timeout:  150 * time.Second,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset:        "上游 checksums.txt + 镜像 manifest.json",
+					UpstreamFile: "checksums.txt",
+					SHA256:       "96b401609154503d4db372ea60f0a9b9c0caf80b698b548a890efb1649911839",
+					Source: "上游 v0.31.0 的 checksums.txt（2026-09-20 实测取到，589 B）里 " +
+						"memos_0.31.0_darwin_arm64.tar.gz 那行；本机整包下载后实算 sha256 与它逐字一致",
+				},
+				ARM64: "上游资产名自带 darwin_arm64；2026-09-20 本机实下解压后 file(1) 报 " +
+					"Mach-O 64-bit executable arm64，`memos --help` 正常输出（并实测 --port 5230 /healthz 返回 200）",
+				Note: "与 alist / filebrowser 同一条回落链（官方 → ghfast.top → gh-proxy.com）；" +
+					"**端口必须显式 5230**：memos 代码默认 8081，会和 filebrowser 抢端口",
+			},
+		},
+	},
+
+	{
+		ID: "navidrome", Kind: KindNative, PanelInstaller: "navidrome", ServiceLabel: "com.zizdog.navidrome",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "com.zizdog.navidrome",
+			LabelSource: "目录 ServiceLabel（与 releaseBinaryApps 注册表里的 Label 一致）",
+		},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 navidrome_0.64.0_darwin_arm64.tar.gz",
+				Upstream: MarketUpstream{
+					ID:   "github.com/navidrome/navidrome@v0.64.0/navidrome_0.64.0_darwin_arm64.tar.gz",
+					URL:  "https://github.com/navidrome/navidrome/releases/download/v0.64.0/navidrome_0.64.0_darwin_arm64.tar.gz",
+					Repo: "navidrome/navidrome", Tag: "v0.64.0", Asset: "navidrome_0.64.0_darwin_arm64.tar.gz",
+					Size: 23263336,
+					Note: "实测 23,263,336 B（2026-09-20 从 ghfast.top 下载整包实算 sha256，" +
+						"与 https://.../v0.64.0/navidrome_checksums.txt 里 darwin_arm64 那行逐字一致）；" +
+						"tarball 内 3 个平级成员（LICENSE / README.md / navidrome），只挑 navidrome",
+				},
+				NAS: nasMissing("镜像站上还没有这个包（apps/navidrome/v0.64.0/ 不存在）。这是**缺口**：" +
+					"ghfast.top 实测只有 361 KB/s（23 MB 下了 64 秒），GitHub 直连更慢；" +
+					"建议 tools/sync-nas-apps.sh 同步（它从 ReleaseBinaryAssets() 读清单，会自动带上这个包）"),
+				Timeout:  300 * time.Second,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset:        "上游 navidrome_checksums.txt + 镜像 manifest.json",
+					UpstreamFile: "navidrome_checksums.txt",
+					SHA256:       "ad35e6f00772c9325b5ce190cfcfaf985feeca406bea8f622dfa32b031b63019",
+					Source: "上游 v0.64.0 的 navidrome_checksums.txt（2026-09-20 实测取到，2506 B）里 " +
+						"navidrome_0.64.0_darwin_arm64.tar.gz 那行；本机整包下载后实算 sha256 与它逐字一致",
+				},
+				ARM64: "上游资产名自带 darwin_arm64；2026-09-20 本机实下解压后 file(1) 报 " +
+					"Mach-O 64-bit executable arm64，`navidrome --help` 正常输出" +
+					"（并实测 --address 127.0.0.1 --port 4533 /ping 返回 200）",
+				Note: "**必须显式 --address 127.0.0.1**：上游默认 address=0.0.0.0（裸奔）；" +
+					"音乐库目录写进 {root}/navidrome.toml，默认留空 = 未设置媒体库",
+			},
+		},
+	},
+
+	{
+		ID: "transmission", Kind: KindNative, BrewFormula: "transmission-cli", PanelInstaller: "transmission",
+		ServiceLabel: "homebrew.mxcl.transmission-cli",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.transmission-cli",
+			LabelSource: "formula 自带 service 块（brew info --json=v2 transmission-cli 的 service.run）；" +
+				"运行期真实 label 由 brewServiceInfo / BrewLabelFor 按磁盘 plist 推 —— " +
+				"本机实测 brew 写的是 **sh.brew.transmission-cli**，两条前缀都认",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("transmission-cli", 30*time.Minute, "brew install transmission-cli"),
+		},
+		Note: "走自研安装器（PanelInstaller=transmission）而不是通用 brew 流程：上游默认 " +
+			"rpc-authentication-required=false 且 rpc-whitelist 只含回环 —— 默认无口令 = 裸奔，" +
+			"必须由安装器生成 rpc-username/rpc-password 并回读 settings.json 核对生效。",
+	},
+
+	// ---------------- mac军刀（本项目自研产物，只在镜像站） ----------------
 	{
 		ID: "macsaber", Kind: KindNative, PanelInstaller: "macsaber", ServiceLabel: MacSaberLabel,
 		Runtime: MarketRuntime{

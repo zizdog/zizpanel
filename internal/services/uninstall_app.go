@@ -826,6 +826,9 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"syncthing": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
 		return m.uninstallSyncthing(ctx, removeData, r)
 	},
+	"transmission": func(m *Manager, ctx context.Context, _ App, removeData, _ bool, r *InstallResult) error {
+		return m.uninstallTransmission(ctx, removeData, r)
+	},
 	// Python 解释器（三个版本共用这一个安装器，见 python_runtime.go）：卸载必须点名"谁还在用它"
 	// （venv 只是指向它，卸掉后那些服务直接起不来）；force 由 UninstallPythonRuntime 处理。
 	"python": func(m *Manager, ctx context.Context, app App, _, force bool, r *InstallResult) error {
@@ -1341,6 +1344,21 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		p.DataPaths = []string{filepath.Join(m.opt.UserHome, "Library", "Application Support", "Syncthing")}
 		p.KeepNote = "默认保留 Syncthing 的数据目录（设备身份与同步索引在里面）；" +
 			"删掉它等于重置本机身份，重新同步要重新配对设备。**同步目录本身不在这个目录里**，不受影响。"
+	case "transmission":
+		// 下载器：配置目录里只有 settings.json（含 RPC 凭据哈希）与日志，
+		// **下载下来的文件不在那里**（默认 ~/Downloads 或用户自己设的目录），
+		// 所以勾选"删除数据"也不会碰任何下载内容。
+		p.Steps = []string{
+			"停止并删除 launchd 服务（" + transmissionLabel + "）",
+			"从「服务管理」移除记录",
+			"brew uninstall " + transmissionFormula,
+			"⚠️ 保留配置目录 " + m.transmissionConfigDir() + "（RPC 凭据与 daemon 日志）",
+			"⚠️ 已下载的文件**一个都不会删**（它们在你设置的下载目录里，默认 ~/Downloads）",
+		}
+		p.DataPaths = []string{m.transmissionConfigDir()}
+		p.KeepNote = "默认保留配置目录（RPC 凭据哈希在里面，重装后仍是同一个口令）；" +
+			"**下载下来的文件永远不动**。要彻底清理请勾选「删除数据」，或手工删除 " +
+			m.transmissionConfigDir()
 	case "macsaber":
 		// mac军刀：产物是自研的 LaunchAgent + /opt/macsaber，没有 brew 包要卸。
 		// 计划与执行端共用同一个 macSaberInstallPlan（路径只写一份，避免"计划说删 A、
