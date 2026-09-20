@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
 )
 
 // ---------------------------------------------------------------------------
@@ -458,6 +460,9 @@ func newTestOptions(t *testing.T) Options {
 		Label:     "cn.zizpanel.panel",
 		HealthURL: "https://127.0.0.1:8443/api/v1/health",
 	}
+	// 模块刷新默认会碰真实 /opt 与 launchd —— 单测一律钉成假的（AGENTS 第三节）。
+	// 需要验证展示的测试自己再覆盖它。
+	opt.RefreshModules = func(context.Context, string) []services.ModuleRefreshResult { return nil }
 	for _, d := range []string{opt.BinDir, opt.WorkDir, opt.PlistDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -707,6 +712,83 @@ func TestApplyRollsBackWhenBundledModuleCannotRun(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(opt.BinDir, ZizvideoBinary)); statErr == nil {
 		t.Error("自检失败时不该把模块放进安装目录")
+	}
+}
+
+// TestApplyRecordsModuleRefreshOutcomes：升级结果里必须如实呈现"哪个模块刷新了 /
+// 哪个跳过了 / 哪个失败并回滚了"（坑 216）。前端读的就是 state.logs 与 state.steps，
+// 所以这里断言的也是这两条通道 —— 不需要改 JS。
+func TestApplyRecordsModuleRefreshOutcomes(t *testing.T) {
+	opt := newTestOptions(t)
+	fakeBinary(t, opt.BinDir, PanelBinary, "0.1.0", true)
+	fakeBinary(t, opt.BinDir, HelperBinary, "0.1.0", true)
+	st := stageDirOf(opt)
+	staged := map[string]string{
+		PanelBinary:  fakeBinary(t, st, PanelBinary, "0.2.0", true),
+		HelperBinary: fakeBinary(t, st, HelperBinary, "0.2.0", true),
+	}
+	opt.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "launchctl" {
+			return []byte(""), nil
+		}
+		return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	}
+	opt.RefreshModules = func(context.Context, string) []services.ModuleRefreshResult {
+		return []services.ModuleRefreshResult{
+			{Name: "zizvideo", Status: services.ModuleRefreshed,
+				Reason:  "已替换并重启，自检：zizvideo 0.2.0",
+				FromSHA: strings.Repeat("a", 64), ToSHA: strings.Repeat("b", 64)},
+			{Name: "macsaber", Status: services.ModuleRolledBack,
+				Reason:  "自检未通过：exit status 1；已回滚旧二进制",
+				FromSHA: strings.Repeat("c", 64), ToSHA: strings.Repeat("d", 64)},
+			{Name: "gizmo", Status: services.ModuleSkipped, Reason: "未安装 gizmo"},
+		}
+	}
+
+	if err := Apply(context.Background(), opt, staged, "0.1.0", "0.2.0", "remote"); err != nil {
+		t.Fatalf("模块刷新结果不该让面板升级失败: %v", err)
+	}
+
+	state := LoadState(opt.WorkDir)
+	byName := map[string]ModuleRefresh{}
+	for _, m := range state.Modules {
+		byName[m.Name] = m
+	}
+	if len(byName) != 3 {
+		t.Fatalf("应记录 3 个模块结果，实际 %+v", state.Modules)
+	}
+	if m := byName["zizvideo"]; m.Status != services.ModuleRefreshed ||
+		m.FromSHA != strings.Repeat("a", 12) || m.ToSHA != strings.Repeat("b", 12) {
+		t.Errorf("zizvideo 结果不对: %+v", m)
+	}
+	if m := byName["macsaber"]; m.Status != services.ModuleRolledBack {
+		t.Errorf("macsaber 应为 rolled-back: %+v", m)
+	}
+	if m := byName["gizmo"]; m.Status != services.ModuleSkipped {
+		t.Errorf("gizmo 应为 skipped: %+v", m)
+	}
+
+	// 用户可见通道（前端渲染 state.logs / state.steps）。
+	var logged strings.Builder
+	for _, l := range state.Logs {
+		logged.WriteString(l.Text + "\n")
+	}
+	for _, want := range []string{"已刷新并重启", "已回滚旧二进制", "已跳过"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("升级日志应包含 %q，实际：\n%s", want, logged.String())
+		}
+	}
+	var stepped bool
+	for _, s := range state.Steps {
+		if s.Stage == "刷新模块 zizvideo" && s.OK {
+			stepped = true
+		}
+		if s.Stage == "刷新模块 macsaber" && s.OK {
+			t.Errorf("回滚的模块不该记成成功：%+v", s)
+		}
+	}
+	if !stepped {
+		t.Errorf("应有一条成功的模块刷新步骤，实际：%+v", state.Steps)
 	}
 }
 

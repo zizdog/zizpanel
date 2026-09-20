@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/services"
 )
 
 // Names 是面板与助手的可执行文件名。
@@ -42,6 +44,10 @@ type Options struct {
 	// Now 取当前时间，便于测试。
 	Now func() time.Time
 
+	// RefreshModules 刷新已安装的"面板托管模块"二进制（默认 services.RefreshInstalledModules）。
+	// 抽成可注入字段：单测绝不允许碰真实的 /opt 与 launchd。
+	RefreshModules func(ctx context.Context, panelBinDir string) []services.ModuleRefreshResult
+
 	// 看门狗的重试次数。生产用默认值（约 90 秒 / 60 秒），
 	// 测试里调小，否则一个回滚测试要跑两分半。
 	// 抽成参数而不是让测试去改脚本文本，是为了让被测试的代码路径
@@ -70,6 +76,9 @@ func (o *Options) withDefaults() {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.RefreshModules == nil {
+		o.RefreshModules = services.RefreshInstalledModules
 	}
 	if o.HealthTries <= 0 {
 		o.HealthTries = 90
@@ -197,6 +206,29 @@ func Apply(ctx context.Context, opt Options, staged map[string]string, from, to,
 		_ = SaveState(opt.WorkDir, st)
 	}
 
+	// ---- 第 3.6 步：刷新已安装的面板托管模块（可选）----
+	// 已安装模块跑的是安装位（如 /opt/zizvideo/bin/zizvideo），不是升级的携带位；
+	// 不刷新就永远是旧构建（坑 216）。单模块失败已就地回滚，不阻断面板升级。
+	sw.Stage(StageModules)
+	sw.Log("info", "正在刷新已安装的面板托管模块…")
+	moduleResults := opt.RefreshModules(ctx, opt.BinDir)
+	st.Modules = nil
+	for _, r := range moduleResults {
+		st.Modules = append(st.Modules, ModuleRefresh{
+			Name:    r.Name,
+			Status:  r.Status,
+			Reason:  r.Reason,
+			FromSHA: shortSHA(r.FromSHA),
+			ToSHA:   shortSHA(r.ToSHA),
+		})
+		addStep(opt, st, "刷新模块 "+r.Name, r.Reason, moduleRefreshOK(r.Status))
+		sw.Log(moduleRefreshLevel(r.Status), moduleRefreshText(r))
+	}
+	if len(moduleResults) == 0 {
+		sw.Log("info", "没有可刷新的面板托管模块")
+	}
+	_ = SaveState(opt.WorkDir, st)
+
 	// ---- 第 4 步：启动看门狗（必须在重启自己之前） ----
 	if err := startWatchdog(ctx, opt, st, from, to); err != nil {
 		// 看门狗起不来就不能重启自己 —— 否则新版若失败就没人回滚了
@@ -323,6 +355,47 @@ func verifyBundledModule(ctx context.Context, opt Options) error {
 // sameVersion 比较两个版本串，忽略 v 前缀与首尾空白。
 func sameVersion(a, b string) bool {
 	return strings.TrimPrefix(strings.TrimSpace(a), "v") == strings.TrimPrefix(strings.TrimSpace(b), "v")
+}
+
+// shortSHA 取 sha256 前 12 位（日志/状态里足够区分，且不刷屏）。
+func shortSHA(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+// moduleRefreshOK 判断一次模块刷新是否算成功（跳过/最新都不算失败）。
+func moduleRefreshOK(status string) bool {
+	return status == services.ModuleRefreshed || status == services.ModuleUpToDate || status == services.ModuleSkipped
+}
+
+func moduleRefreshLevel(status string) string {
+	switch status {
+	case services.ModuleRefreshed:
+		return "ok"
+	case services.ModuleRolledBack, services.ModuleFailed:
+		return "error"
+	}
+	return "info"
+}
+
+// moduleRefreshText 是给用户看的一句话（前端直接展示 state.logs）。
+func moduleRefreshText(r services.ModuleRefreshResult) string {
+	switch r.Status {
+	case services.ModuleRefreshed:
+		return fmt.Sprintf("模块 %s 已刷新并重启（%s → %s）", r.Name, shortSHA(r.FromSHA), shortSHA(r.ToSHA))
+	case services.ModuleUpToDate:
+		return fmt.Sprintf("模块 %s 已是最新（%s），未做改动", r.Name, shortSHA(r.FromSHA))
+	case services.ModuleSkipped:
+		return fmt.Sprintf("模块 %s 已跳过：%s", r.Name, r.Reason)
+	case services.ModuleRolledBack:
+		return fmt.Sprintf("模块 %s 刷新失败，已回滚旧二进制：%s", r.Name, r.Reason)
+	case services.ModuleFailed:
+		return fmt.Sprintf("模块 %s 刷新失败：%s", r.Name, r.Reason)
+	}
+	return fmt.Sprintf("模块 %s：%s", r.Name, r.Reason)
 }
 
 // backup 把现有二进制复制为 *.bak。

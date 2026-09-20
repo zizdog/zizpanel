@@ -33,6 +33,7 @@ const (
 	StageExtract  = "extract"  // 解包
 	StageSmoke    = "smoke"    // 试运行新二进制
 	StageApply    = "apply"    // 替换二进制
+	StageModules  = "modules"  // 刷新已安装的面板托管模块
 	StageRestart  = "restart"  // 重启并等待看门狗结论
 	StageDone     = "done"     // 完成
 	StageFailed   = "failed"   // 失败
@@ -56,6 +57,7 @@ var stageLabels = map[string]string{
 	StageExtract:  "解包",
 	StageSmoke:    "试运行",
 	StageApply:    "替换程序",
+	StageModules:  "刷新模块",
 	StageRestart:  "重启并验证",
 	StageDone:     "完成",
 	StageFailed:   "失败",

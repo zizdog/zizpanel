@@ -45,6 +45,17 @@ type Step struct {
 	OK      bool      `json:"ok"`
 }
 
+// ModuleRefresh 是一次"随包模块刷新"的结果（坑 216）。
+//
+// 状态：refreshed / up-to-date / skipped / rolled-back / failed，语义见 services 里的同名常量。
+type ModuleRefresh struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason,omitempty"`
+	FromSHA string `json:"from_sha,omitempty"`
+	ToSHA   string `json:"to_sha,omitempty"`
+}
+
 // State 是持久化的升级状态。
 //
 // **必须落盘而不是放内存**：升级的最后一步是重启面板，
@@ -76,6 +87,8 @@ type State struct {
 	StartedAt  time.Time `json:"started_at,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 	Steps      []Step    `json:"steps,omitempty"`
+	// Modules 是这次升级对"面板托管模块"逐个刷新的结果（坑 216）。
+	Modules []ModuleRefresh `json:"modules,omitempty"`
 
 	// Progress 是**结构化**的实时进度（阶段 id / 真实字节数 / 百分比 / 速度）。
 	//
