@@ -57,8 +57,17 @@ func (s *Server) mirrorDirSetting(ctx context.Context) string {
 	return strings.TrimSpace(v)
 }
 
-// mirrorDefaultSource 是内置公网镜像源（internal/upgrade/source.go 的 MirrorSource）。
-func (s *Server) mirrorDefaultSource() string { return upgrade.MirrorSource }
+// mirrorDefaultSource 是内置公网发布源（internal/upgrade/source.go 的 DefaultSource，
+// 即 zizdog.com）：镜像同步必须从公网源拉，默认绝不能是镜像自己（坑 218）。
+func (s *Server) mirrorDefaultSource() string { return upgrade.DefaultSource }
+
+// resolveMirrorSource 取本次同步的源：请求体优先，留空用内置公网发布源（绝不默认镜像自己）。
+func (s *Server) resolveMirrorSource(raw string) string {
+	if v := strings.TrimSpace(raw); v != "" {
+		return v
+	}
+	return s.mirrorDefaultSource()
+}
 
 // mirrorPublicBase 是镜像站上 zizpanel 目录的公网基址（写盘自证用）：<mirror_base>/zizpanel；
 // 没配 mirror_base 就用内置公网镜像（坑 218）。
@@ -73,7 +82,7 @@ func (s *Server) mirrorPublicBase() string {
 type mirrorSyncRequest struct {
 	// Dir 是镜像站文档根（留空 = 用面板设置里保存的那个）。
 	Dir string `json:"dir"`
-	// Source 是发布件源基址（留空 = 内置公网镜像源）。
+	// Source 是发布件源基址（留空 = 内置公网发布源 zizdog.com，见坑 218）。
 	Source string `json:"source"`
 }
 
@@ -93,10 +102,7 @@ func (s *Server) handleMirrorSync(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, derr.Error())
 		return
 	}
-	src := strings.TrimSpace(req.Source)
-	if src == "" {
-		src = s.mirrorDefaultSource()
-	}
+	src := s.resolveMirrorSource(req.Source)
 	base, nerr := upgrade.Source{BaseURL: src}.Normalize()
 	if nerr != nil {
 		fail(w, http.StatusBadRequest, "同步源不合法："+nerr.Error())
@@ -171,6 +177,12 @@ func runMirrorSync(ctx context.Context, log tasks.LogFunc, dir, base, mirrorBase
 	out := func(format string, a ...any) { log(tasks.LevelOut, fmt.Sprintf(format, a...)) }
 	warn := func(format string, a ...any) { log(tasks.LevelWarn, fmt.Sprintf(format, a...)) }
 	bad := func(format string, a ...any) { log(tasks.LevelErr, fmt.Sprintf(format, a...)) }
+
+	// 源 == 目标 = "同步到自己"：一定是配置错误（照它写也白写），当场拒绝（坑 218）。
+	if mirrorBase != "" && strings.TrimRight(base, "/") == strings.TrimRight(mirrorBase, "/") {
+		bad("同步源与目标镜像基址相同（%s）：配置错误，已拒绝", mirrorBase)
+		return res, fmt.Errorf("同步源与目标镜像基址相同（%s）：请把同步源改成公网发布源", mirrorBase)
+	}
 
 	step("① 取公网源上的清单并验签")
 	data, sig, err := fetchMirrorManifestRaw(ctx, base)

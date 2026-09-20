@@ -179,6 +179,53 @@ func assertNothingWritten(t *testing.T, dir string) {
 	}
 }
 
+// TestMirrorSyncDefaultSourceIsPublicSource：镜像同步的默认源必须是公网发布源，不许是镜像自己。
+func TestMirrorSyncDefaultSourceIsPublicSource(t *testing.T) {
+	if upgrade.DefaultSource == upgrade.MirrorSource {
+		t.Fatal("公网发布源与镜像源常量相同，测试前提不成立")
+	}
+	srv, _ := newTestServer(t)
+	if got := srv.mirrorDefaultSource(); got != upgrade.DefaultSource {
+		t.Errorf("默认同步源 = %q，必须是公网发布源 %q", got, upgrade.DefaultSource)
+	}
+	if got := srv.mirrorDefaultSource(); got == upgrade.MirrorSource {
+		t.Errorf("默认同步源不许是镜像自己 %q", upgrade.MirrorSource)
+	}
+	// 不传 / 只传空白 source 的解析路径也必须落到公网发布源。
+	for _, raw := range []string{"", "   "} {
+		if got := srv.resolveMirrorSource(raw); got != upgrade.DefaultSource {
+			t.Errorf("source=%q 解析出 %q，必须是公网发布源 %q", raw, got, upgrade.DefaultSource)
+		}
+	}
+	// 显式传的源优先，不被默认值覆盖。
+	if got := srv.resolveMirrorSource("https://example.com/zizpanel/"); got != "https://example.com/zizpanel/" {
+		t.Errorf("显式 source 被改了：%q", got)
+	}
+}
+
+// TestMirrorSyncRejectsSourceEqualToTarget：源 == 目标镜像 base（同步到自己）直接拒绝，
+// 且在任何网络动作之前就失败。
+func TestMirrorSyncRejectsSourceEqualToTarget(t *testing.T) {
+	for _, base := range []string{
+		"https://mirror.zizdog.com:8888/zizpanel",
+		"https://mirror.zizdog.com:8888/zizpanel/", // 尾斜杠不同也算同一个
+	} {
+		dir := t.TempDir()
+		lg := &mirrorLog{}
+		res, err := runMirrorSync(context.Background(), lg.log, dir, base, strings.TrimRight(base, "/"))
+		if err == nil {
+			t.Fatalf("源与目标相同必须拒绝，实际成功: %+v", res)
+		}
+		if !strings.Contains(err.Error(), "相同") {
+			t.Errorf("错误里必须说清源与目标相同，实际: %v", err)
+		}
+		if !lg.has("配置错误") {
+			t.Errorf("日志里要如实说明是配置错误，实际:\n%s", strings.Join(lg.lines, "\n"))
+		}
+		assertNothingWritten(t, dir)
+	}
+}
+
 // TestMirrorSyncPrefersMirrorManifest：源上有镜像版清单 ⇒ 写进去的就是它，
 // asset url 指向给定镜像 base，且资产仍回源站取（镜像路径下没有资产）。
 func TestMirrorSyncPrefersMirrorManifest(t *testing.T) {

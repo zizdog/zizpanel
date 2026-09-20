@@ -848,8 +848,9 @@ export function SettingsView(content, ctx = {}) {
       placeholder: '例如 /Volumes/盘名/mirror（镜像站的文档根）',
       style: { flex: '1 1 320px' },
     });
+    // 同步源默认填公网发布源（后端 mirror_default_source）：源/目标相同会被后端拒绝（坑 218）。
     const mirrorSource = h('input.input', {
-      value: '',
+      value: s.mirror_default_source || '',
       placeholder: '留空用内置源：' + (s.mirror_default_source || ''),
       style: { flex: '1 1 320px' },
     });
