@@ -1509,17 +1509,18 @@ func Catalog() []App {
 			DocsURL: "https://alistgo.com",
 		},
 
-		// ---------------- mac军刀（本项目自研，原生 LaunchAgent） ----------------
+		// ---------------- mac军刀（本项目自研，系统级 LaunchDaemon） ----------------
 		//
 		// 与目录里别的条目最大的区别：**它没有上游**。产物是本仓库 macsaber/
 		// 自己编的 darwin/arm64 单二进制，由 tools/macsaber-release.sh 打包、
 		// 只发公网镜像站 <base>/apps/macsaber/<ver>/，没有 GitHub 回落源。
 		//
-		// 为什么是 LaunchAgent（而不是别的应用那种系统级 LaunchDaemon）：
-		// 它读的是**这个用户**的家目录、写的是**这个用户**的 ~/MacSaberFiles，
-		// 以 root 跑只会看到 /var/root 那一套。label 与 plist 位置沿用
-		// macsaber/README.md 预留的那一份（cn.macsaber.web /
-		// ~/Library/LaunchAgents/）—— 不另发明。
+		// 它的服务体是 `zizpanel macsaber-supervise`（面板自己的二进制），
+		// 与面板同一代码要求 ⇒ 面板的 TCC 授权对 supervisor 及其拉起的 macsaber
+		// 生效（不用第二套授权、升级不失效）；supervisor 以 root fork 后 setuid 到
+		// 真实用户跑 macsaber（读该用户家目录、写 ~/MacSaberFiles）。见坑 202。
+		// 刻意不标 SystemDaemon：那个字段驱动的是"把 brew services 的 agent 搬到
+		// 系统域"，而这个条目自己写系统 plist（同 release 二进制那条轨）。
 		{
 			ID: MacSaberAppID, Name: "mac军刀", Icon: "🔪",
 			UI: &AppUI{
@@ -1532,7 +1533,8 @@ func Catalog() []App {
 				// 链路属另一个项目、铁律 2 不许动），见 MacSaberPort 的注释。
 				Note: "网页界面只绑 127.0.0.1:" + strconv.Itoa(MacSaberPort) +
 					"（本机直连 http://127.0.0.1:" + strconv.Itoa(MacSaberPort) + "/）；" +
-					"经面板的 /macsaber/ 打开同样要登录 mac军刀 自己的账号。",
+					"经面板的 /macsaber/ 打开同样要登录 mac军刀 自己的账号。" +
+					"文件权限与面板共用，可写根是 ~/MacSaberFiles。",
 			},
 			Summary:     "macOS 原生工具箱：图片 / OCR / PDF / 音视频 / 文本 / 系统等 48 个工具",
 			Description: "把 macOS 自带能力包成 48 个网页小工具：只绑本机回环、不联网、不上传。",
@@ -1540,7 +1542,7 @@ func Catalog() []App {
 			PanelInstaller: MacSaberAppID, ServiceLabel: MacSaberLabel,
 			Port: MacSaberPort, HealthPath: macSaberHealthPath,
 			PostInstallHint: "首次打开要设置本机用户名与口令（口令至少 8 位，只存在这台机器上）。" +
-				"它的可读根是家目录、只写 ~/MacSaberFiles；首次用到某些目录时 macOS 可能弹一次隐私授权。",
+				"文件权限与面板共用：面板能读的它就能读。",
 			DocsURL: "https://github.com/zizdog/zizpanel",
 		},
 

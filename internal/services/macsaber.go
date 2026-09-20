@@ -25,10 +25,14 @@ import (
 //  因此安装流程不能走 releaseBinaryApps 那套注册表（它的语义是"去别人家下载"），
 //  这里独立实现，但**复用同一批约定**：
 //    · 安装根 /opt/macsaber（二进制 /opt/macsaber/bin/macsaber）；
-//    · 服务是 **LaunchAgent**（label cn.macsaber.web，plist 落在真实用户的
-//      ~/Library/LaunchAgents/），不是系统级 LaunchDaemon —— 它读的是该用户的
-//      家目录、写的是该用户的 ~/MacSaberFiles，以 root 跑反而看不到用户的东西；
-//    · 下载、校验、解包、复核、起服务、验收，每一步失败都如实报错（铁律 11）。
+//    · 服务是**系统级 LaunchDaemon**（label cn.zizpanel.macsaber，plist 在
+//      /Library/LaunchDaemons/），可执行文件是**面板自己的二进制**
+//      （`zizpanel macsaber-supervise …`）。与面板同一代码要求 ⇒ 面板拿到的 TCC
+//      授权对它及其子进程生效；做成独立的用户级 LaunchAgent 会变成另一个
+//      responsible process，要单独授权、未签名时每次升级失效（坑 202）。
+//    · supervisor 以 root 跑（必须 root 才能 fork 后 setuid 降权），macsaber
+//      子进程以真实用户身份跑（文件归属 + say/osascript/pbcopy 等图形工具）——
+//      取舍见 cmd/zizpanel/macsaber.go 文件头。
 //
 //  判据贴着**运行体**（AGENTS 第三节）：二进制在 + `macsaber version` 对得上
 //  + 127.0.0.1:<MacSaberPort>/api/version 真的返回这个版本，三条都过才算装好。
@@ -46,6 +50,9 @@ var (
 	// MacSaberInstallRoot 是安装根。默认 /opt/macsaber（面板以 root 创建），
 	// 单测指向 t.TempDir()。
 	MacSaberInstallRoot = "/opt/macsaber"
+	// macSaberExecutable 返回面板自身的可执行文件路径：系统守护进程执行的就是它
+	// （`<面板二进制> macsaber-supervise …`）。测试注入，绝不真取 os.Executable。
+	macSaberExecutable = os.Executable
 	// macSaberFetch 把一个 URL 下到本地文件（含停滞看门狗 + .part 原子改名）。
 	macSaberFetch = func(ctx context.Context, url, dest string, onProgress func(got, total int64)) error {
 		return fetchToFile(ctx, &http.Client{}, url, dest, iopaintStallTimeout, onProgress)
@@ -58,10 +65,27 @@ var (
 	// macSaberVerifyArm64 用 file(1) 复核 Mach-O arm64（测试注入：
 	// 单测里的"二进制"是脚本，不可能真是 arm64，而真实那把 file 也不会被跳过）。
 	macSaberVerifyArm64 = verifyMacSaberArm64
-	// macSaberLaunch 装载 launchd 作业（默认走 priv 那套按域探测 + 复核的实现）。
-	macSaberLaunch = func(label, plist string) error { return privLaunchLoad(label) }
-	// macSaberStop 停止并卸载 launchd 作业（幂等）。
-	macSaberStop = func(label, plist string) error { return privLaunchUnload(label) }
+	// macSaberLaunch 在 system 域装载 supervisor（默认 bootout + bootstrap + 复核终态）。
+	macSaberLaunch = func(m *Manager, ctx context.Context, label, plist string) error {
+		return m.bootstrapService(ctx, label, plist)
+	}
+	// macSaberStop 停止并删除系统级服务（幂等：本来没有也算成功）。
+	macSaberStop = func(m *Manager, ctx context.Context, label, plist string) error {
+		return m.stopLaunchdService(ctx, label, plist)
+	}
+	// macSaberLegacyStop 停掉并删除旧的用户级 LaunchAgent（label cn.macsaber.web）。
+	// 按域探测由 priv.LaunchUnload 负责（user/<uid> 与 gui/<uid> 都覆盖）。
+	macSaberLegacyStop = func(m *Manager, ctx context.Context, plist string) error {
+		if err := priv.LaunchUnload(MacSaberLegacyLabel); err != nil {
+			return err
+		}
+		if plist != "" {
+			if err := os.Remove(plist); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
 	// macSaberVersionFn 执行 `macsaber version` 并把输出原样带回（以真实用户身份）。
 	macSaberVersionFn = func(m *Manager, ctx context.Context, bin string) (string, error) {
 		out, err := m.runAsUser(ctx, 30*time.Second, bin, "version")
@@ -74,19 +98,20 @@ var (
 	macSaberHTTPGet = func(ctx context.Context, url string) (body string, code int, err error) {
 		return runCurlCtx(ctx, url, 4)
 	}
+	// macSaberRemovedWait / macSaberRemovedPoll 是卸载终态复核的等待参数
+	// （抽成变量：单测把等待缩到毫秒级，不真等 5 秒）。
+	macSaberRemovedWait = 5 * time.Second
+	macSaberRemovedPoll = 300 * time.Millisecond
 )
-
-// privLaunchLoad / privLaunchUnload 是对 internal/priv 的薄包装。
-// 单独包一层是为了让"默认实现"在同一处可见：它们按 user/<uid> 与 gui/<uid>
-// 两个域探测并**复核终态**，正是 LaunchAgent 需要的做法（不要另发明一套 launchctl）。
-func privLaunchLoad(label string) error   { return priv.LaunchLoad(label) }
-func privLaunchUnload(label string) error { return priv.LaunchUnload(label) }
 
 const (
 	// MacSaberAppID 是应用市场里的条目 ID。
 	MacSaberAppID = "macsaber"
-	// MacSaberLabel 是 launchd 标签（目录 README 预留的就是它）。
-	MacSaberLabel = "cn.macsaber.web"
+	// MacSaberLabel 是系统级守护进程的 launchd 标签。
+	MacSaberLabel = "cn.zizpanel.macsaber"
+	// MacSaberLegacyLabel 是**旧**用户级 LaunchAgent 的标签（cn.macsaber.web）。
+	// 安装时主动清理它：两个实例会抢 8895，后起的那个必然起不来（坑 202）。
+	MacSaberLegacyLabel = "cn.macsaber.web"
 	// MacSaberSlug 是面板别名（/<slug>/）。
 	MacSaberSlug = "macsaber"
 	// MacSaberVersion 是这一版面板所打包/验收的 mac军刀 版本。
@@ -131,17 +156,26 @@ type MacSaberPaths struct {
 	Root string
 	// Bin 是可执行文件（/opt/macsaber/bin/macsaber）。
 	Bin string
-	// Plist 是 LaunchAgent 定义（真实用户家目录下）。
+	// Plist 是**系统级** LaunchDaemon 定义（/Library/LaunchDaemons/）。
 	Plist string
+	// LegacyPlist 是旧用户级 LaunchAgent 的 plist（真实用户家目录下，安装时清理）。
+	LegacyPlist string
 	// DataDir 是应用数据目录（配置与审计日志）—— 卸载时**默认保留**。
 	DataDir string
-	// ReadRoot 是 --read-root（默认整个家目录）。
+	// ReadRoot 是 --read-root（默认整个家目录，权限来自面板的 TCC 授权）。
 	ReadRoot string
 	// WriteRoot 是 --write-root（默认 ~/MacSaberFiles）。
 	WriteRoot string
-	// OutLog / ErrLog 是 launchd 的标准输出/错误。
+	// LogDir 是日志目录（~/Library/Logs）。
+	LogDir string
+	// OutLog / ErrLog 是 macsaber 子进程的标准输出/错误。
 	OutLog string
 	ErrLog string
+	// SuperviseOutLog / SuperviseErrLog 是 supervisor 自身的标准输出/错误。
+	SuperviseOutLog string
+	SuperviseErrLog string
+	// SuperviseLog 是 supervisor 自己写的最少量日志。
+	SuperviseLog string
 }
 
 // MacSaberHome 返回真实用户家目录（拿不到返回空串，调用方必须如实失败）。
@@ -163,19 +197,23 @@ func (m *Manager) MacSaberPathsFor() MacSaberPaths {
 		root = "/opt/macsaber"
 	}
 	p := MacSaberPaths{
-		Root: root,
-		Bin:  filepath.Join(root, "bin", "macsaber"),
+		Root:  root,
+		Bin:   filepath.Join(root, "bin", "macsaber"),
+		Plist: SystemDaemonPlistPath(MacSaberLabel),
 	}
 	if home == "" {
 		return p
 	}
-	p.Plist = filepath.Join(home, "Library", "LaunchAgents", MacSaberLabel+".plist")
+	p.LegacyPlist = filepath.Join(home, "Library", "LaunchAgents", MacSaberLegacyLabel+".plist")
 	p.DataDir = filepath.Join(home, "Library", "Application Support", "macsaber")
 	p.ReadRoot = home
 	p.WriteRoot = filepath.Join(home, "MacSaberFiles")
-	logDir := filepath.Join(home, "Library", "Logs")
-	p.OutLog = filepath.Join(logDir, "macsaber.out.log")
-	p.ErrLog = filepath.Join(logDir, "macsaber.err.log")
+	p.LogDir = filepath.Join(home, "Library", "Logs")
+	p.OutLog = filepath.Join(p.LogDir, "macsaber.out.log")
+	p.ErrLog = filepath.Join(p.LogDir, "macsaber.err.log")
+	p.SuperviseOutLog = filepath.Join(p.LogDir, "macsaber-supervise.out.log")
+	p.SuperviseErrLog = filepath.Join(p.LogDir, "macsaber-supervise.err.log")
+	p.SuperviseLog = filepath.Join(p.LogDir, "macsaber-supervise.log")
 	return p
 }
 
@@ -188,27 +226,43 @@ func MacSaberBin() string {
 	return filepath.Join(root, "bin", "macsaber")
 }
 
-// macSaberServeArgs 拼出 plist 里的 ProgramArguments。
-// 参数以 macsaber/main.go 的 serve 子命令为准（别照文档猜）。
-func macSaberServeArgs(p MacSaberPaths) []string {
-	if p.Bin == "" {
-		return nil
+// MacSaberServeArgs 返回 macsaber serve 子进程的参数（**不含可执行文件本身**）。
+//
+// 参数以 macsaber/main.go 的 serve 子命令为准（别照文档猜）。supervisor
+// （cmd/zizpanel/macsaber.go）直接用它，保证"安装参数"与"真正起子进程的参数"同源。
+func MacSaberServeArgs(dataDir, listen, readRoot, writeRoot string) []string {
+	return []string{
+		"serve",
+		"--data", dataDir,
+		"--listen", listen,
+		"--read-root", readRoot,
+		"--write-root", writeRoot,
 	}
-	args := []string{
-		p.Bin, "serve",
+}
+
+// MacSaberSuperviseArgs 拼出系统 plist 里的 ProgramArguments：
+// **面板自己的二进制** + macsaber-supervise + 真实用户与它的全部路径。
+//
+// 用面板二进制是关键：它与面板同一代码要求，所以面板的 TCC 授权对
+// supervisor 及其拉起的 macsaber 生效，不需要第二套授权（坑 202）。
+func MacSaberSuperviseArgs(panelBin, userName string, p MacSaberPaths) []string {
+	return []string{
+		panelBin, "macsaber-supervise",
+		"--user", userName,
+		"--macsaber", p.Bin,
 		"--data", p.DataDir,
 		"--listen", fmt.Sprintf("127.0.0.1:%d", MacSaberPort),
 		"--read-root", p.ReadRoot,
 		"--write-root", p.WriteRoot,
+		"--log-dir", p.LogDir,
 	}
-	return args
 }
 
-// macSaberPlistContent 渲染 LaunchAgent 定义。
+// macSaberPlistContent 渲染**系统级 LaunchDaemon** 定义。
 //
-// 刻意**不写 UserName**：作业装载在 gui/<uid> 域里，本来就以该用户身份运行；
-// 把 UserName 写进 LaunchAgent 会被 launchd 当成"daemon 语义"（真机上会报警告）。
-// 运行身份由"plist 落在谁的家目录 + 装进哪个域"决定。
+// 刻意**不写 UserName**：这个作业必须以 root 运行 —— supervisor 要 fork 之后
+// setuid 降权到真实用户，普通用户没有 setuid 权限，写了 UserName 它必然起不来。
+// 子进程的身份由 supervisor 的 SysProcAttr.Credential 决定（见 cmd/zizpanel/macsaber.go）。
 func macSaberPlistContent(label string, args []string, outLog, errLog string) string {
 	var b strings.Builder
 	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
@@ -338,50 +392,53 @@ func (m *Manager) MacSaberAssetURL(version string) string {
 // InstallMacSaber 安装 mac军刀。
 //
 // 顺序（每一步都真的复核，不信"上一步退出码 0"）：
-//  1. 下载归档（只从镜像站；没有上游回落源）；
-//  2. sha256 校验（镜像清单优先，回落代码里的声明值）；
-//  3. 解包 + `file -b` 复核 Mach-O arm64；
-//  4. 以真实用户身份跑 `macsaber version`，必须报出打包版本；
-//  5. 落盘 /opt/macsaber/bin/macsaber + 交还归属；
-//  6. 写 LaunchAgent plist（真实用户家目录）并 bootstrap；
-//  7. 登记进「服务管理」；
-//  8. 验收 /api/version 真的返回这一版（**失败即 error**，不是写个 plist 就算完）。
+//  1. 准备目录（安装根 root 所有；数据/可写/日志目录交还真实用户）；
+//  2. **先清理旧的用户级 LaunchAgent**（它占着 8895，不清理新实例起不来）；
+//  3. 下载 + sha256 + 解包 + `file -b` 复核 Mach-O arm64 + `macsaber version`；
+//  4. 落盘 /opt/macsaber/bin/macsaber；
+//  5. 写**系统级** plist（指向 `zizpanel macsaber-supervise`）并在 system 域 bootstrap；
+//  6. 登记进「服务管理」；
+//  7. 验收 /api/version 真的返回这一版（**失败即 error**，不是写个 plist 就算完）。
 func (m *Manager) InstallMacSaber(ctx context.Context, app App, result *InstallResult) error {
 	if result != nil {
 		result.App = app.ID
 	}
 	p := m.MacSaberPathsFor()
 	if p.Plist == "" || p.DataDir == "" {
-		return fmt.Errorf("无法确定运行 mac军刀 的真实用户（UserName/UserHome 为空），" +
-			"它的 LaunchAgent 必须落在该用户家目录下")
+		return fmt.Errorf("无法确定 mac军刀 的运行位置（UserName/UserHome 为空）：" +
+			"数据目录、可读根与 plist 都要从真实用户推导")
 	}
 	if strings.TrimSpace(m.opt.UserName) == "" {
 		return fmt.Errorf("无法确定运行 mac军刀 的真实用户（UserName 为空）：" +
 			"它要读该用户的家目录、写该用户的 ~/MacSaberFiles，不能以 root 运行")
 	}
+	panelBin, err := macSaberExecutable()
+	if err != nil || strings.TrimSpace(panelBin) == "" {
+		return fmt.Errorf("找不到面板自身的可执行文件路径（系统守护进程要用它执行 macsaber-supervise）: %v", err)
+	}
 
-	// ① 准备目录（面板以 root 跑，建完必须把用户那两份交还用户）。
+	// ① 目录：安装根保持 root（系统安装）；用户那三份建好并交还用户。
 	if err := os.MkdirAll(filepath.Dir(p.Bin), 0o755); err != nil {
 		return fmt.Errorf("创建安装目录 %s 失败：%w", filepath.Dir(p.Bin), err)
 	}
-	for _, dir := range []string{p.DataDir, p.WriteRoot, filepath.Dir(p.Plist), filepath.Dir(p.OutLog)} {
+	for _, dir := range []string{p.DataDir, p.WriteRoot, p.LogDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("创建目录 %s 失败：%w", dir, err)
 		}
 	}
-	if err := chownTree(m.opt.UserName, p.DataDir); err != nil {
-		return fmt.Errorf("把数据目录交还用户 %s 失败：%w（服务以该用户运行，属主不对就写不进配置）",
-			m.opt.UserName, err)
-	}
-	if err := chownTree(m.opt.UserName, p.WriteRoot); err != nil {
-		return fmt.Errorf("把可写根交还用户 %s 失败：%w", m.opt.UserName, err)
-	}
-	if err := chownTree(m.opt.UserName, filepath.Dir(p.Plist)); err != nil {
-		return fmt.Errorf("把 LaunchAgents 目录交还用户 %s 失败：%w（launchd 会因属主不对拒绝装载）",
-			m.opt.UserName, err)
+	for _, dir := range []string{p.DataDir, p.WriteRoot, p.LogDir} {
+		if err := chownTree(m.opt.UserName, dir); err != nil {
+			return fmt.Errorf("把 %s 交还用户 %s 失败：%w（服务以该用户运行，属主不对就写不进东西）",
+				dir, m.opt.UserName, err)
+		}
 	}
 
-	// ② 下载 + 校验 + 解包 + 复核，全部在临时目录里做完再落盘 ——
+	// ② 迁移：旧的用户级 agent 与新的系统守护进程会抢同一个端口，必须先清掉。
+	if err := m.macSaberMigrateLegacy(ctx, p, result); err != nil {
+		return err
+	}
+
+	// ③ 下载 + 校验 + 解包 + 复核，全部在临时目录里做完再落盘 ——
 	//    校验不过就中止，绝不把坏二进制写到 /opt。
 	staged, cleanupStage, err := m.macSaberStageBinary(ctx, result)
 	if err != nil {
@@ -389,7 +446,7 @@ func (m *Manager) InstallMacSaber(ctx context.Context, app App, result *InstallR
 	}
 	defer cleanupStage()
 
-	// ③ 落盘 + 架构复核 + 可执行位。
+	// ④ 落盘 + 架构复核 + 可执行位。
 	target := p.Bin + ".new"
 	if err := installFileExecutable(staged, target); err != nil {
 		return fmt.Errorf("写入 %s 失败：%w", target, err)
@@ -403,7 +460,7 @@ func (m *Manager) InstallMacSaber(ctx context.Context, app App, result *InstallR
 	}
 	// 换掉正在执行的 Mach-O 会被系统杀掉，但这时旧实例还没 bootstrap，
 	// 先停一次（幂等：本来没有算成功），再原子改名。
-	if err := macSaberStop(MacSaberLabel, p.Plist); err != nil {
+	if err := macSaberStop(m, ctx, MacSaberLabel, p.Plist); err != nil {
 		if result != nil {
 			result.step(ctx, "提示：停止旧实例时出错（继续安装）："+err.Error())
 		}
@@ -411,14 +468,25 @@ func (m *Manager) InstallMacSaber(ctx context.Context, app App, result *InstallR
 	if err := os.Rename(target, p.Bin); err != nil {
 		return fmt.Errorf("安装二进制到 %s 失败：%w", p.Bin, err)
 	}
-	if err := chownTree(m.opt.UserName, filepath.Dir(p.Bin)); err != nil {
-		if result != nil {
-			result.step(ctx, "警告：安装目录属主没有交还用户："+err.Error())
-		}
-	}
 
-	// ④ plist + bootstrap + 登记 + 验收。
-	return m.macSaberInstallService(ctx, app, p, result)
+	// ⑤ 系统 plist + bootstrap + 登记 + 验收。
+	return m.macSaberInstallService(ctx, app, p, panelBin, result)
+}
+
+// macSaberMigrateLegacy 停掉并删除旧的用户级 LaunchAgent（label cn.macsaber.web）。
+//
+// 为什么必须：旧安装把它装成用户级 agent，它同样监听 8895；不清理就会出现两个
+// 实例抢端口，新起的那个失败 ⇒ 安装看起来"没成功"（坑 202）。幂等：本来没有就空操作。
+func (m *Manager) macSaberMigrateLegacy(ctx context.Context, p MacSaberPaths, result *InstallResult) error {
+	had := p.LegacyPlist != "" && fileExists(p.LegacyPlist)
+	if err := macSaberLegacyStop(m, ctx, p.LegacyPlist); err != nil {
+		return fmt.Errorf("停止旧的用户级 LaunchAgent %s 失败（不清掉它会和新守护进程抢 %d 端口）：%w",
+			MacSaberLegacyLabel, MacSaberPort, err)
+	}
+	if result != nil && had {
+		result.step(ctx, "已停止并删除旧的用户级 LaunchAgent "+MacSaberLegacyLabel+"（迁移为系统级守护进程）")
+	}
+	return nil
 }
 
 // macSaberStageBinary 走完"下载 → 校验 → 解包 → 架构复核 → version 复核"，
@@ -530,8 +598,6 @@ func (m *Manager) macSaberStageBinary(ctx context.Context, result *InstallResult
 	return staged, cleanup, nil
 }
 
-// runRootCtx 已由 macSaberExtract 注入点承担（见文件头的仅测试注入点）。
-
 // installFileExecutable 把一个文件复制到目标路径并给可执行位（复制到 .new 再改名，
 // 避免覆盖正在运行的二进制时留下半个文件）。
 func installFileExecutable(from, to string) error {
@@ -573,43 +639,38 @@ func verifyMacSaberArm64(m *Manager, ctx context.Context, path string) error {
 	return nil
 }
 
-// macSaberInstallService 写 plist、装载、登记、等 /api/version 真的对得上。
-func (m *Manager) macSaberInstallService(ctx context.Context, app App, p MacSaberPaths, result *InstallResult) error {
-	args := macSaberServeArgs(p)
-	if len(args) == 0 {
+// macSaberInstallService 写**系统级** plist、在 system 域装载、登记，并等 /api/version 对得上。
+func (m *Manager) macSaberInstallService(ctx context.Context, app App, p MacSaberPaths, panelBin string, result *InstallResult) error {
+	args := MacSaberSuperviseArgs(panelBin, m.opt.UserName, p)
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("mac军刀 的启动参数为空（内部错误）")
 	}
-	content := macSaberPlistContent(MacSaberLabel, args, p.OutLog, p.ErrLog)
-	// ~/Library/LaunchAgents 在新账号上可能根本不存在（真机见过）→ 先建出来并交还用户，
-	// 否则写 plist 直接失败；属主不对 launchd 也会拒绝装载。
-	plistDir := filepath.Dir(p.Plist)
-	if err := os.MkdirAll(plistDir, 0o755); err != nil {
-		return fmt.Errorf("创建 %s 失败：%w", plistDir, err)
-	}
-	if err := chownTree(m.opt.UserName, plistDir); err != nil {
-		return fmt.Errorf("把 %s 交还用户 %s 失败：%w", plistDir, m.opt.UserName, err)
+	content := macSaberPlistContent(MacSaberLabel, args, p.SuperviseOutLog, p.SuperviseErrLog)
+	if err := os.MkdirAll(filepath.Dir(p.Plist), 0o755); err != nil {
+		return fmt.Errorf("创建 %s 失败：%w", filepath.Dir(p.Plist), err)
 	}
 	tmp := p.Plist + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("写入 plist %s 失败（面板需要以 root 运行）：%w", p.Plist, err)
 	}
-	// 归属必须是真实用户：launchd 对 gui 域里 plist 的属主与权限很敏感，
-	// root:wheel 会被拒绝装载（"Path had bad ownership/permissions"）。
-	if err := chownTree(m.opt.UserName, tmp); err != nil {
+	// 系统域 plist 必须 root:wheel 0644，否则 launchd 拒绝装载。
+	// 非 root（单测）chown 必然 EPERM，但那种情况下面板本来也写不了 /Library/LaunchDaemons。
+	if err := os.Chown(tmp, 0, 0); err != nil && os.Geteuid() == 0 {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("把 plist 交还用户 %s 失败：%w", m.opt.UserName, err)
+		return fmt.Errorf("把 plist 归属改为 root:wheel 失败（%s）：%w", tmp, err)
 	}
 	if err := os.Rename(tmp, p.Plist); err != nil {
 		return fmt.Errorf("安装 plist %s 失败：%w", p.Plist, err)
 	}
-	if err := chownTree(m.opt.UserName, p.Plist); err != nil {
-		return fmt.Errorf("修正 plist 属主失败：%w", err)
+	if err := os.Chown(p.Plist, 0, 0); err != nil && os.Geteuid() == 0 {
+		return fmt.Errorf("修正 plist 属主失败（%s）：%w", p.Plist, err)
 	}
 	if result != nil {
-		result.step(ctx, "正在注册并启动 LaunchAgent "+MacSaberLabel+
-			fmt.Sprintf("（http://127.0.0.1:%d/，以 %s 身份运行）", MacSaberPort, m.opt.UserName))
+		result.step(ctx, "正在注册并启动系统级守护进程 "+MacSaberLabel+
+			fmt.Sprintf("（可执行文件是面板自己：%s macsaber-supervise，服务以 %s 身份运行）",
+				panelBin, m.opt.UserName))
 	}
-	if err := macSaberLaunch(MacSaberLabel, p.Plist); err != nil {
+	if err := macSaberLaunch(m, ctx, MacSaberLabel, p.Plist); err != nil {
 		return fmt.Errorf("启动 mac军刀 网页界面失败：%w", err)
 	}
 	if err := m.RegisterInstalledService(ctx, MacSaberLabel, app.Name, app.Icon, app.Category, MacSaberPort); err != nil {
@@ -621,7 +682,7 @@ func (m *Manager) macSaberInstallService(ctx context.Context, app App, p MacSabe
 	}
 	if result != nil {
 		result.Steps = append(result.Steps,
-			"已注册为用户级 LaunchAgent（"+MacSaberLabel+"，登录后自动启动）",
+			"已注册为系统级守护进程（"+MacSaberLabel+"，与面板共用文件权限，开机自启）",
 			"打开：http://127.0.0.1:"+fmt.Sprint(MacSaberPort)+"/ ，或从「应用市场 → mac军刀」点「打开」走面板别名 /"+
 				MacSaberSlug+"/",
 			"数据目录："+p.DataDir+"（卸载时默认保留；配置与审计日志都在这里）",
@@ -666,11 +727,12 @@ func (m *Manager) waitMacSaberReady(ctx context.Context, p MacSaberPaths, result
 			return readyVerdict{Actual: last}
 		},
 		LogPath: p.ErrLog,
-		State: "二进制已落盘并复核（" + p.Bin + "），LaunchAgent " + MacSaberLabel +
+		State: "二进制已落盘并复核（" + p.Bin + "），系统级守护进程 " + MacSaberLabel +
 			" 已 bootstrap，服务已登记进「服务管理」",
 		Missing: "但网页界面没有返回打包的那一版，市场里的「打开」会打不开",
 		Remedy: "在「服务管理 → mac军刀」里点「重启服务」再试；仍然失败请看下面的日志尾部" +
-			"（常见原因：" + fmt.Sprint(MacSaberPort) + " 端口被别的进程占用、plist 属主不对导致 launchd 拒绝装载）",
+			"（常见原因：" + fmt.Sprint(MacSaberPort) + " 端口被别的进程占用、" +
+			"或旧的用户级 agent " + MacSaberLegacyLabel + " 没清干净）",
 		Result: result,
 	})
 }
@@ -679,7 +741,7 @@ func (m *Manager) waitMacSaberReady(ctx context.Context, p MacSaberPaths, result
 //  卸载
 // ---------------------------------------------------------------------------
 
-// UninstallMacSaber 卸载：bootout + 删 plist + 删安装根。
+// UninstallMacSaber 卸载：bootout system 域 + 删两份 plist + 删安装根，并**复核**。
 //
 // 数据目录（配置里是口令哈希、审计日志里是操作记录）与可写根（工具产物）
 // **默认保留**并如实告知路径 —— 用户以为卸载清干净了、结果密钥还在磁盘上，
@@ -687,11 +749,14 @@ func (m *Manager) waitMacSaberReady(ctx context.Context, p MacSaberPaths, result
 func (m *Manager) UninstallMacSaber(ctx context.Context, app App, removeData bool, result *InstallResult) error {
 	p := m.MacSaberPathsFor()
 	hasPlist := p.Plist != "" && fileExists(p.Plist)
+	if p.LegacyPlist != "" && fileExists(p.LegacyPlist) {
+		hasPlist = true
+	}
 	hasRecord := false
 	if m.repo != nil {
 		if list, err := m.repo.List(ctx); err == nil {
 			for _, s := range list {
-				if s.LaunchLabel == MacSaberLabel {
+				if s.LaunchLabel == MacSaberLabel || s.LaunchLabel == MacSaberLegacyLabel {
 					hasRecord = true
 					break
 				}
@@ -700,18 +765,29 @@ func (m *Manager) UninstallMacSaber(ctx context.Context, app App, removeData boo
 	}
 	if hasPlist || hasRecord {
 		if result != nil {
-			result.step(ctx, "停止并删除 LaunchAgent "+MacSaberLabel)
+			result.step(ctx, "停止并删除系统级守护进程 "+MacSaberLabel)
 		}
-		if err := macSaberStop(MacSaberLabel, p.Plist); err != nil {
+		if err := macSaberStop(m, ctx, MacSaberLabel, p.Plist); err != nil {
 			return fmt.Errorf("停止 mac军刀 网页界面失败：%w", err)
 		}
 	} else if result != nil {
 		result.step(ctx, "mac军刀 的服务本来就没有注册，跳过停止")
 	}
-	// plist 兜底再删一次：macSaberStop 只负责"停止"，文件必须真的没有。
-	if p.Plist != "" {
-		if err := os.Remove(p.Plist); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("删除 plist %s 失败：%w", p.Plist, err)
+	// 兼容清理旧版留下的用户级 agent（新装不会有，但用户可能从旧版本升上来）。
+	if err := macSaberLegacyStop(m, ctx, p.LegacyPlist); err != nil {
+		return fmt.Errorf("清理旧的用户级 LaunchAgent %s 失败：%w", MacSaberLegacyLabel, err)
+	}
+	if result != nil {
+		result.step(ctx, "已确认旧的用户级 LaunchAgent "+MacSaberLegacyLabel+" 不存在")
+	}
+	// plist 兜底再删一次：macSaberStop / macSaberLegacyStop 只负责"停止"，
+	// 文件必须真的没有（假 idempotent stop 会留下僵尸 plist —— 坑 161）。
+	for _, plist := range []string{p.Plist, p.LegacyPlist} {
+		if plist == "" {
+			continue
+		}
+		if err := os.Remove(plist); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删除 plist %s 失败：%w", plist, err)
 		}
 	}
 	// 安装根（二进制）总是删 —— 留着它就是一个"看起来已安装"的假象。
@@ -741,8 +817,44 @@ func (m *Manager) UninstallMacSaber(ctx context.Context, app App, removeData boo
 		result.step(ctx, "按你的选择**保留**数据目录 "+p.DataDir+
 			"（账号与审计日志）与可写根 "+p.WriteRoot+"（工具产物）；要一并清理请勾选「同时删除数据」")
 	}
+	// 复核：目录没了 / 两份 plist 没了 / 8895 不再返回本版 mac军刀。
+	if err := m.macSaberVerifyRemoved(ctx, p); err != nil {
+		return err
+	}
 	if result != nil {
-		result.step(ctx, "提示：mac军刀 不会在系统里留别的东西（不写 /Library、不装系统扩展）")
+		result.step(ctx, "卸载复核通过：安装目录与 plist 都已删除，"+fmt.Sprint(MacSaberPort)+
+			" 端口不再返回 mac军刀")
+	}
+	return nil
+}
+
+// macSaberVerifyRemoved 是卸载的终态复核（判据贴着运行体，不许按"命令退出码 0"收工）。
+//
+// 判据：安装根不存在 + 两份 plist 不存在 + 8895 在 5 秒内不再返回本版 mac军刀。
+// 任一条不成立都返回 error —— 卸载不干净却被界面显示成"已卸载"正是坑 161 那一类。
+func (m *Manager) macSaberVerifyRemoved(ctx context.Context, p MacSaberPaths) error {
+	deadline := time.Now().Add(macSaberRemovedWait)
+	for {
+		if ok, _ := m.MacSaberVersionServing(ctx); !ok {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("卸载后 127.0.0.1:%d 仍在返回 mac军刀 的版本，服务没有被真正停掉", MacSaberPort)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(macSaberRemovedPoll):
+		}
+	}
+	if p.Root != "" && fileExists(p.Root) {
+		return fmt.Errorf("卸载后安装目录 %s 仍然存在", p.Root)
+	}
+	if p.Plist != "" && fileExists(p.Plist) {
+		return fmt.Errorf("卸载后系统 plist %s 仍然存在", p.Plist)
+	}
+	if p.LegacyPlist != "" && fileExists(p.LegacyPlist) {
+		return fmt.Errorf("卸载后旧用户级 plist %s 仍然存在", p.LegacyPlist)
 	}
 	return nil
 }
@@ -751,7 +863,8 @@ func (m *Manager) UninstallMacSaber(ctx context.Context, app App, removeData boo
 func (m *Manager) macSaberInstallPlan() UninstallPlan {
 	p := m.MacSaberPathsFor()
 	steps := []string{
-		"停止并删除 LaunchAgent " + MacSaberLabel + "（" + p.Plist + "）",
+		"停止并删除系统级守护进程 " + MacSaberLabel + "（" + p.Plist + "）",
+		"清理可能残留的旧用户级 LaunchAgent " + MacSaberLegacyLabel + "（" + p.LegacyPlist + "）",
 		"删除安装目录 " + p.Root + "（二进制）",
 		"从「服务管理」移除记录",
 		"⚠️ 卸载后网页界面与面板别名 /" + MacSaberSlug + "/ 都会不可用，直到重新安装",

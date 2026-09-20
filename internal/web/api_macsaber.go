@@ -20,9 +20,10 @@ var macSaberInstallFn = func(s *Server, ctx context.Context, app services.App, r
 //   - **没有上游**：产物是本仓库 macsaber/ 自己编的 darwin/arm64 单二进制，
 //     只发公网镜像站 apps/macsaber/<ver>/，releaseBinaryApps 那套（GitHub 回落）
 //     在这里没有意义；
-//   - **服务形态不同**：其余原生条目都装成系统级 LaunchDaemon，而 mac军刀
-//     要读**这个用户**的家目录、写该用户的 ~/MacSaberFiles，所以是
-//     ~/Library/LaunchAgents 下的用户级 LaunchAgent（label cn.macsaber.web）。
+//   - **服务形态不同**：它的可执行文件是**面板自己的二进制**
+//     （`zizpanel macsaber-supervise`），装成系统级 LaunchDaemon
+//     （label cn.zizpanel.macsaber）—— 与面板同一代码要求，所以共用面板的
+//     TCC 授权；supervisor 以 root fork 后 setuid 到真实用户跑 macsaber。
 //
 // 走任务中心：整包下载 + 起服务不是秒级动作，同步请求会让用户关掉窗口就
 // 找不回进度（任务挂在 r.Context() 上，一刷新就把它杀了）。

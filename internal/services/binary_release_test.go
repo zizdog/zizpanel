@@ -304,7 +304,7 @@ func TestReleaseBinaryUninstallPlans(t *testing.T) {
 	m := &Manager{opt: Options{UserHome: "/Users/tester", UserName: "tester"}}
 	for id := range releaseBinaryApps {
 		// MirrorOnly（自研产物，mac军刀）不走这条轨：它的卸载计划在
-		// macsaber.go 的 macSaberInstallPlan（用户级 LaunchAgent + /opt/macsaber，
+		// macsaber.go 的 macSaberInstallPlan（系统级 LaunchDaemon + /opt/macsaber，
 		// 与"家目录 + 系统级 daemon"的通用计划完全不同）。这里只保证
 		// "登记在注册表里的通用条目都有计划"。
 		if ReleaseBinaryIsMirrorOnly(id) {

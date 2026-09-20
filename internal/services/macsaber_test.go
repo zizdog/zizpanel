@@ -3,13 +3,15 @@ package services
 // macsaber_test.go —— mac军刀（MacSaber）的门禁测试。
 //
 // 纪律（AGENTS 第三节）：
-//   - 单测**绝不**联网（下载由 macSaberFetch 注入伪造）；
-//   - 单测**绝不**碰真实 launchd（macSaberLaunch / macSaberStop 注入记录）；
-//   - 单测**绝不**写 /opt/macsaber 或真实家目录（MacSaberInstallRoot 指向 t.TempDir()，
+//   - 单测**绝不**联网（下载由 macSaberFetch 注入伪造，HTTP 探针默认返回"连接被拒"）；
+//   - 单测**绝不**碰真实 launchd（macSaberLaunch/Stop/LegacyStop 注入记录）；
+//   - 单测**绝不**写 /opt/macsaber、/Library/LaunchDaemons 或真实家目录
+//     （MacSaberInstallRoot 与 SystemLaunchDaemonsDir 都指向 t.TempDir()，
 //     Manager 的 UserHome 是沙箱临时目录）。
 //
 // 判据都是**行为**而不是字符串：installed 必须在"二进制缺失 / version 跑不起来 /
-// 端口不健康 / 版本对不上"时为 false；卸载必须真的删掉该删的、保留该保留的。
+// 端口不健康 / 版本对不上"时为 false；安装必须真的清理旧用户级 agent；卸载必须
+// 真的删掉该删的、保留该保留的，并复核终态。
 
 import (
 	"context"
@@ -26,11 +28,16 @@ import (
 
 // macSaberTestEnv 造一个隔离的安装环境：临时安装根、临时家目录、假 launchd。
 type macSaberTestEnv struct {
-	m      *Manager
-	root   string
-	plist  string
-	launch []string
-	stop   []string
+	m          *Manager
+	root       string
+	plist      string
+	legacy     string
+	panel      string
+	launch     []string
+	stop       []string
+	legacyStop []string
+	// events 是按时间顺序记下的动作（用于锁"先迁移、后 bootstrap"的顺序）。
+	events []string
 }
 
 // newMacSaberTestEnv 建立沙箱并替换全部注入点（t.Cleanup 恢复）。
@@ -41,39 +48,96 @@ func newMacSaberTestEnv(t *testing.T) *macSaberTestEnv {
 	env := &macSaberTestEnv{m: m, root: root}
 
 	prevRoot := MacSaberInstallRoot
-	prevLaunch, prevStop := macSaberLaunch, macSaberStop
+	prevLaunchdDir := SystemLaunchDaemonsDir
+	prevLaunch, prevStop, prevLegacy := macSaberLaunch, macSaberStop, macSaberLegacyStop
 	prevVerify, prevExtract := macSaberVerifyArm64, macSaberExtract
 	prevVer, prevGet := macSaberVersionFn, macSaberHTTPGet
+	prevExec := macSaberExecutable
+	prevRemovedWait := macSaberRemovedWait
 	t.Cleanup(func() {
 		MacSaberInstallRoot = prevRoot
-		macSaberLaunch, macSaberStop = prevLaunch, prevStop
+		SystemLaunchDaemonsDir = prevLaunchdDir
+		macSaberLaunch, macSaberStop, macSaberLegacyStop = prevLaunch, prevStop, prevLegacy
 		macSaberVerifyArm64, macSaberExtract = prevVerify, prevExtract
 		macSaberVersionFn, macSaberHTTPGet = prevVer, prevGet
+		macSaberExecutable = prevExec
+		macSaberRemovedWait = prevRemovedWait
 	})
 
 	MacSaberInstallRoot = root
-	macSaberLaunch = func(label, plist string) error {
-		env.launch = append(env.launch, label+"|"+plist)
-		return nil
+	SystemLaunchDaemonsDir = t.TempDir()
+	// 卸载复核的等待缩到毫秒级（真实实现是 5 秒）。
+	macSaberRemovedWait = 400 * time.Millisecond
+	env.panel = filepath.Join(t.TempDir(), "zizpanel")
+	if err := os.WriteFile(env.panel, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	macSaberStop = func(label, plist string) error {
+	macSaberExecutable = func() (string, error) { return env.panel, nil }
+
+	macSaberLaunch = func(m *Manager, _ context.Context, label, plist string) error {
+		env.launch = append(env.launch, label+"|"+plist)
+		env.events = append(env.events, "launch:"+label)
+		// 模拟 launchd：AdoptCandidate 只认 /Library/LaunchDaemons 与用户级目录，
+		// 单测不能写真实系统目录，所以把系统 plist 复制一份到用户级位置让它找得到
+		// （与 imgcompress 的沙箱做法一致）。
+		b, err := os.ReadFile(plist)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", label+".plist")
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(dst, b, 0o644)
+	}
+	macSaberStop = func(m *Manager, _ context.Context, label, plist string) error {
 		env.stop = append(env.stop, label+"|"+plist)
+		env.events = append(env.events, "stop:"+label)
+		return removeAllPlists([]string{plist, filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", label+".plist")})
+	}
+	macSaberLegacyStop = func(_ *Manager, _ context.Context, plist string) error {
+		env.legacyStop = append(env.legacyStop, plist)
+		env.events = append(env.events, "legacy:"+MacSaberLegacyLabel)
+		if plist != "" {
+			if err := os.Remove(plist); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
 		return nil
 	}
 	// 单测里的"二进制"是一个 shell 脚本，不可能真是 Mach-O arm64；
 	// 架构复核另有专门的用例（见 TestMacSaberArm64CheckIsNotVacuous）。
 	macSaberVerifyArm64 = func(*Manager, context.Context, string) error { return nil }
-	// 假 runtime：不做 version 复核（那是另一个注入点），也不查用户 uid。
+	// 假 runtime：不做 version 复核（那是另一个注入点）。
 	macSaberVersionFn = func(_ *Manager, _ context.Context, bin string) (string, error) {
 		return "mac军刀 macsaber " + MacSaberVersion, nil
 	}
-	env.plist = filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", MacSaberLabel+".plist")
+	// 默认 HTTP 探针 = "没人在听"：卸载复核与就绪等待都不许真的联网。
+	macSaberHTTPGet = func(context.Context, string) (string, int, error) {
+		return "", 0, errString("Connection refused")
+	}
+	p := m.MacSaberPathsFor()
+	env.plist = p.Plist
+	env.legacy = p.LegacyPlist
 	return env
 }
 
 // stubHTTPGet 把 HTTP 探测替换成固定响应。
 func (e *macSaberTestEnv) stubHTTPGet(body string, code int, err error) {
 	macSaberHTTPGet = func(context.Context, string) (string, int, error) { return body, code, err }
+}
+
+// removeAllPlists 删除一组 plist（不存在算成功）。
+func removeAllPlists(paths []string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeFakeBin 在安装根写一个可执行的假二进制。
@@ -87,6 +151,17 @@ func (e *macSaberTestEnv) writeFakeBin(t *testing.T, script string) string {
 		t.Fatal(err)
 	}
 	return bin
+}
+
+// writeLegacyAgent 造出"机器上还留着旧用户级 agent"的夹具。
+func (e *macSaberTestEnv) writeLegacyAgent(t *testing.T) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(e.legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.legacy, []byte("<plist>旧用户级 agent</plist>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -183,75 +258,135 @@ func TestMacSaberHealthProbeUsesRealEndpoint(t *testing.T) {
 	}
 }
 
-// TestMacSaberPortIsLoopbackOnly 安装参数与声明都不许把服务暴露到局域网。
-func TestMacSaberPortIsLoopbackOnly(t *testing.T) {
+// TestMacSaberServeArgsUseRealUserPaths 子进程参数必须来自真实用户的路径。
+//
+// 这是本设计的核心之一：读根就是真实用户家目录（权限来自面板的 TCC 授权，
+// 不再靠"避开受保护目录"），写根是 ~/MacSaberFiles，数据目录在该用户下。
+func TestMacSaberServeArgsUseRealUserPaths(t *testing.T) {
 	env := newMacSaberTestEnv(t)
 	p := env.m.MacSaberPathsFor()
-	args := strings.Join(macSaberServeArgs(p), " ")
-	if !strings.Contains(args, fmt.Sprintf("127.0.0.1:%d", MacSaberPort)) {
-		t.Errorf("serve 必须只绑 127.0.0.1:%d，实际：%s", MacSaberPort, args)
+	listen := fmt.Sprintf("127.0.0.1:%d", MacSaberPort)
+	args := MacSaberServeArgs(p.DataDir, listen, p.ReadRoot, p.WriteRoot)
+	joined := strings.Join(args, " ")
+
+	if p.ReadRoot != env.m.opt.UserHome {
+		t.Errorf("读根必须是真实用户家目录 %s，实际 %s", env.m.opt.UserHome, p.ReadRoot)
 	}
-	if strings.Contains(args, "0.0.0.0") {
-		t.Errorf("serve 参数里出现了 0.0.0.0（会把本机文件工具暴露到局域网）：%s", args)
+	if p.WriteRoot != filepath.Join(env.m.opt.UserHome, "MacSaberFiles") {
+		t.Errorf("写根必须是 ~/MacSaberFiles，实际 %s", p.WriteRoot)
 	}
-	if app, ok := FindApp(MacSaberAppID); !ok || app.Port != MacSaberPort {
-		t.Errorf("目录条目的端口必须是 %d（与 MacSaberPort 同源），实际 %+v", MacSaberPort, app.Port)
+	for _, want := range []string{"serve", "--data", p.DataDir, "--listen", listen, "--read-root", p.ReadRoot, "--write-root", p.WriteRoot} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("serve 参数缺少 %q：%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "0.0.0.0") {
+		t.Errorf("serve 参数里出现了 0.0.0.0（会把本机文件工具暴露到局域网）：%s", joined)
+	}
+	if strings.Contains(joined, "/var/root") {
+		t.Errorf("参数里出现了 /var/root（root 的家目录）：%s", joined)
+	}
+	// 参数顺序必须与 macsaber/main.go 的 serve 子命令一致（--data/--listen/--read-root/--write-root）。
+	wantOrder := []string{"serve", "--data", "--listen", "--read-root", "--write-root"}
+	last := -1
+	for _, flag := range wantOrder {
+		idx := indexOfToken(args, flag)
+		if idx < 0 {
+			t.Fatalf("serve 参数缺少 %q：%v", flag, args)
+		}
+		if idx <= last {
+			t.Errorf("参数顺序不对：%q 出现在 %q 之前：%v", flag, wantOrder, args)
+		}
+		last = idx
 	}
 }
 
+// indexOfToken 返回 token 在 args 里的下标（找不到 -1）。
+func indexOfToken(args []string, token string) int {
+	for i, a := range args {
+		if a == token {
+			return i
+		}
+	}
+	return -1
+}
+
 // ---------------------------------------------------------------------------
-//  plist 生成物
+//  plist 生成物：系统级 LaunchDaemon
 // ---------------------------------------------------------------------------
 
-// TestMacSaberPlistContentIsExact 逐项锁住 plist：label / 参数 / 日志 / 归属语义。
-func TestMacSaberPlistContentIsExact(t *testing.T) {
+// TestMacSaberPlistIsSystemDaemonAndArgsAreExact 逐项锁住系统 plist：
+// label / 可执行文件是面板自己 / 参数顺序 / 日志，且**不含 UserName**。
+func TestMacSaberPlistIsSystemDaemonAndArgsAreExact(t *testing.T) {
 	env := newMacSaberTestEnv(t)
 	p := env.m.MacSaberPathsFor()
-	args := macSaberServeArgs(p)
-	content := macSaberPlistContent(MacSaberLabel, args, p.OutLog, p.ErrLog)
+	args := MacSaberSuperviseArgs(env.panel, env.m.opt.UserName, p)
+	content := macSaberPlistContent(MacSaberLabel, args, p.SuperviseOutLog, p.SuperviseErrLog)
 
-	// label 与参数顺序（main.go 的 serve 子命令：--data / --listen / --read-root / --write-root）。
+	// label 与"可执行文件 = 面板自己的二进制 + 子命令"，参数顺序固定。
 	wantOrder := []string{
+		"<string>" + MacSaberLabel + "</string>",
+		"<string>" + env.panel + "</string>",
+		"<string>macsaber-supervise</string>",
+		"<string>--user</string>",
+		"<string>" + env.m.opt.UserName + "</string>",
+		"<string>--macsaber</string>",
 		"<string>" + p.Bin + "</string>",
-		"<string>serve</string>",
 		"<string>--data</string>",
 		"<string>" + p.DataDir + "</string>",
 		"<string>--listen</string>",
 		"<string>" + fmt.Sprintf("127.0.0.1:%d", MacSaberPort) + "</string>",
 		"<string>--read-root</string>",
-		"<string>" + p.ReadRoot + "</string>",
+		"<string>" + env.m.opt.UserHome + "</string>",
 		"<string>--write-root</string>",
 		"<string>" + p.WriteRoot + "</string>",
+		"<string>--log-dir</string>",
+		"<string>" + p.LogDir + "</string>",
 	}
+	last := -1
 	for _, want := range wantOrder {
-		if !strings.Contains(content, want) {
+		idx := strings.Index(content, want)
+		if idx < 0 {
 			t.Errorf("plist 缺少 %q：\n%s", want, content)
+			continue
 		}
+		if idx <= last {
+			t.Errorf("plist 里 %q 的位置不对（顺序与 MacSaberSuperviseArgs 不一致）：\n%s", want, content)
+		}
+		last = idx
 	}
 	if strings.Contains(content, "<key>UserName</key>") {
-		// LaunchAgent 装在 gui/<uid> 域里，写 UserName 会被 launchd 当 daemon 语义。
-		t.Errorf("LaunchAgent 不该写 UserName（运行身份由域与 plist 位置决定）：\n%s", content)
+		// supervisor 必须以 root 运行才能 fork 后 setuid 降权；写 UserName
+		// 会让 launchd 直接以普通用户启动它，降权那一步必然失败。
+		t.Errorf("系统守护进程不该写 UserName（supervisor 需要 root 才能降权）：\n%s", content)
 	}
 	for _, want := range []string{
 		"<key>RunAtLoad</key>\n    <true/>",
 		"<key>KeepAlive</key>\n    <true/>",
-		"<key>StandardOutPath</key>\n    <string>" + p.OutLog + "</string>",
-		"<key>StandardErrorPath</key>\n    <string>" + p.ErrLog + "</string>",
+		"<key>StandardOutPath</key>\n    <string>" + p.SuperviseOutLog + "</string>",
+		"<key>StandardErrorPath</key>\n    <string>" + p.SuperviseErrLog + "</string>",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("plist 缺少 %q：\n%s", want, content)
 		}
 	}
-	// 真实用户名下的 plist 与日志路径（不许落到 /tmp 或 /Library）。
-	if !strings.Contains(p.Plist, filepath.Join("Library", "LaunchAgents")) {
-		t.Errorf("plist 必须在 ~/Library/LaunchAgents 下，实际 %s", p.Plist)
+	if strings.Contains(content, MacSaberLegacyLabel) {
+		t.Errorf("新系统 plist 里不该出现旧 label %s：\n%s", MacSaberLegacyLabel, content)
+	}
+	// 位置：系统 plist 在 /Library/LaunchDaemons（测试里被替换为临时目录）；
+	// 旧用户级 agent 仍在 ~/Library/LaunchAgents。
+	if filepath.Dir(p.Plist) != SystemLaunchDaemonsDir {
+		t.Errorf("系统 plist 必须在 %s 下，实际 %s", SystemLaunchDaemonsDir, p.Plist)
+	}
+	if !strings.Contains(p.LegacyPlist, filepath.Join("Library", "LaunchAgents")) {
+		t.Errorf("旧 plist 路径必须在 ~/Library/LaunchAgents 下，实际 %s", p.LegacyPlist)
 	}
 	if !strings.Contains(p.OutLog, filepath.Join("Library", "Logs")) {
-		t.Errorf("日志必须在 ~/Library/Logs 下，实际 %s", p.OutLog)
+		t.Errorf("子进程日志必须在 ~/Library/Logs 下，实际 %s", p.OutLog)
 	}
 	// XML 必须能被 plutil 解析（结构错了 launchd 直接拒绝，且不给行号）。
 	if _, err := os.Stat("/usr/bin/plutil"); err == nil {
-		tmp := filepath.Join(t.TempDir(), "cn.macsaber.web.plist")
+		tmp := filepath.Join(t.TempDir(), MacSaberLabel+".plist")
 		if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -267,8 +402,51 @@ func runOutputErr(name string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// TestMacSaberLabelAndPlistPathAreSystemDomain 锁住 label 与 plist 的**系统域**归属。
+func TestMacSaberLabelAndPlistPathAreSystemDomain(t *testing.T) {
+	prev := SystemLaunchDaemonsDir
+	SystemLaunchDaemonsDir = "/Library/LaunchDaemons"
+	t.Cleanup(func() { SystemLaunchDaemonsDir = prev })
+
+	if got := SystemDaemonPlistPath(MacSaberLabel); got != "/Library/LaunchDaemons/cn.zizpanel.macsaber.plist" {
+		t.Errorf("系统 plist 路径不对：%s", got)
+	}
+	if MacSaberLabel != "cn.zizpanel.macsaber" {
+		t.Errorf("launchd label 应是 cn.zizpanel.macsaber（面板前缀），实际 %s", MacSaberLabel)
+	}
+	if MacSaberLegacyLabel != "cn.macsaber.web" {
+		t.Errorf("旧 label 常量必须是 cn.macsaber.web（迁移要按它停旧作业），实际 %s", MacSaberLegacyLabel)
+	}
+	if MacSaberLabel == MacSaberLegacyLabel {
+		t.Error("新旧 label 不能相同（否则迁移会把新守护进程也停掉）")
+	}
+}
+
+// TestMacSaberSuperviseArgsArePanelBinaryAndRealUserPaths 锁住"系统守护进程执行的
+// 是面板自己的二进制"这条关键判据：它保证 supervisor 与面板同一代码要求 ⇒ 共用 TCC 授权。
+func TestMacSaberSuperviseArgsArePanelBinaryAndRealUserPaths(t *testing.T) {
+	env := newMacSaberTestEnv(t)
+	p := env.m.MacSaberPathsFor()
+	args := MacSaberSuperviseArgs(env.panel, env.m.opt.UserName, p)
+	if args[0] != env.panel {
+		t.Fatalf("ProgramArguments[0] 必须是面板自身的二进制（%s），实际 %q", env.panel, args[0])
+	}
+	if args[1] != "macsaber-supervise" {
+		t.Fatalf("ProgramArguments[1] 必须是 macsaber-supervise，实际 %q", args[1])
+	}
+	// 必须点名某个真实用户（supervisor 据此 setuid），且不能是 root。
+	if indexOfToken(args, "--user") < 0 {
+		t.Fatal("必须显式传 --user（supervisor 据此降权）")
+	}
+	for _, a := range args {
+		if a == "root" || a == "0" {
+			t.Errorf("参数里出现了 root（supervisor 只做降权，不许以 root 跑 macsaber）：%v", args)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
-//  安装：幂等 + 如实失败
+//  安装：迁移旧 agent + 幂等 + 如实失败
 // ---------------------------------------------------------------------------
 
 // macSaberTestPayload 是一份"归档字节"（内容随意，全部下载/解包都被注入替换）。
@@ -301,7 +479,69 @@ func newMacSaberInstallManager(t *testing.T) *macSaberTestEnv {
 	return env
 }
 
-// TestInstallMacSaberSandboxed 走一遍安装：二进制落盘、plist 写出、服务登记、验收。
+// TestInstallMacSaberMigratesLegacyAgent 夹具里放一个旧用户级 agent：
+// 安装后必须旧 plist 被删、旧域作业被 bootout、只留新的系统守护进程。
+func TestInstallMacSaberMigratesLegacyAgent(t *testing.T) {
+	env := newMacSaberInstallManager(t)
+	stageFakeInstall(t, env)
+	env.stubHTTPGet(`{"ok":true,"version":"`+MacSaberVersion+`"}`, 200, nil)
+	env.writeLegacyAgent(t)
+
+	app, _ := FindApp(MacSaberAppID)
+	res := &InstallResult{Steps: []string{}}
+	if err := env.m.InstallMacSaber(context.Background(), app, res); err != nil {
+		t.Fatalf("沙箱安装应成功：%v\n步骤：%v", err, res.Steps)
+	}
+	// 旧 plist 必须没了，且旧 label 被 bootout 过一次（不能两个实例抢 8895）。
+	if _, err := os.Stat(env.legacy); !os.IsNotExist(err) {
+		t.Errorf("安装后旧用户级 plist %s 必须被删除，实际 err=%v", env.legacy, err)
+	}
+	if len(env.legacyStop) != 1 || env.legacyStop[0] != env.legacy {
+		t.Errorf("必须恰好清理一次旧用户级 agent，实际 %v", env.legacyStop)
+	}
+	// 只允许 bootstrap 新 label（旧 label 一次都不许被 bootstrap）。
+	if len(env.launch) != 1 || !strings.HasPrefix(env.launch[0], MacSaberLabel+"|") {
+		t.Errorf("必须恰好 bootstrap 一次 %s，实际 %v", MacSaberLabel, env.launch)
+	}
+	for _, l := range env.launch {
+		if strings.Contains(l, MacSaberLegacyLabel) {
+			t.Errorf("不许 bootstrap 旧 label %s：%v", MacSaberLegacyLabel, env.launch)
+		}
+	}
+	// 顺序：必须**先**清理旧 agent，**再** bootstrap 新守护进程 ——
+	// 反过来的话旧实例还占着 8895，新的必然起不来（安装会"看起来失败"）。
+	legacyAt, launchAt := indexOfEvent(env.events, "legacy:"+MacSaberLegacyLabel),
+		indexOfEvent(env.events, "launch:"+MacSaberLabel)
+	if legacyAt < 0 || launchAt < 0 {
+		t.Fatalf("事件记录不完整（legacy=%d launch=%d）：%v", legacyAt, launchAt, env.events)
+	}
+	if legacyAt > launchAt {
+		t.Errorf("必须先清理旧用户级 agent 再 bootstrap 新守护进程，实际顺序：%v", env.events)
+	}
+	// 终态只允许一个系统 daemon。
+	plists, err := filepath.Glob(filepath.Join(SystemLaunchDaemonsDir, "*.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plists) != 1 || filepath.Base(plists[0]) != MacSaberLabel+".plist" {
+		t.Errorf("迁移后只允许一份系统 plist（%s），实际 %v", MacSaberLabel, plists)
+	}
+	if !strings.Contains(strings.Join(res.Steps, "\n"), MacSaberLegacyLabel) {
+		t.Errorf("安装步骤要如实说明迁移了旧 agent：%v", res.Steps)
+	}
+}
+
+// indexOfEvent 返回事件在序列里的下标（找不到 -1）。
+func indexOfEvent(events []string, want string) int {
+	for i, e := range events {
+		if e == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestInstallMacSaberSandboxed 走一遍安装：二进制落盘、系统 plist 写出、服务登记、验收。
 func TestInstallMacSaberSandboxed(t *testing.T) {
 	env := newMacSaberInstallManager(t)
 	stageFakeInstall(t, env)
@@ -319,10 +559,23 @@ func TestInstallMacSaberSandboxed(t *testing.T) {
 		t.Fatalf("安装后 %s 必须存在：%v", MacSaberBin(), err)
 	}
 	if _, err := os.Stat(env.plist); err != nil {
-		t.Fatalf("安装后 plist 必须写出（%s）：%v", env.plist, err)
+		t.Fatalf("安装后系统 plist 必须写出（%s）：%v", env.plist, err)
+	}
+	if st, err := os.Stat(env.plist); err == nil && st.Mode().Perm() != 0o644 {
+		t.Errorf("系统 plist 权限必须是 0644，实际 %v", st.Mode().Perm())
+	}
+	if content, err := os.ReadFile(env.plist); err == nil && strings.Contains(string(content), "<key>UserName</key>") {
+		t.Errorf("系统 plist 不许写 UserName（supervisor 需要 root 才能降权）：\n%s", content)
 	}
 	if len(env.launch) != 1 || !strings.HasPrefix(env.launch[0], MacSaberLabel+"|") {
 		t.Errorf("必须恰好 bootstrap 一次 %s，实际 %v", MacSaberLabel, env.launch)
+	}
+	// plist 内容必须指向面板二进制 + supervisor 子命令。
+	if content, err := os.ReadFile(env.plist); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(string(content), env.panel+"</string>") ||
+		!strings.Contains(string(content), "macsaber-supervise") {
+		t.Errorf("系统 plist 必须用面板自身执行 macsaber-supervise：\n%s", content)
 	}
 	// 服务记录必须登记（否则「服务管理」里找不到它）。
 	list, err := env.m.repo.List(context.Background())
@@ -343,7 +596,7 @@ func TestInstallMacSaberSandboxed(t *testing.T) {
 		t.Errorf("可写根 %s 必须被创建：%v", filepath.Join(env.m.opt.UserHome, "MacSaberFiles"), err)
 	}
 	joined := strings.Join(res.Steps, "\n")
-	for _, want := range []string{"SHA-256 校验通过", "/macsaber/", fmt.Sprintf("127.0.0.1:%d", MacSaberPort)} {
+	for _, want := range []string{"SHA-256 校验通过", "/macsaber/", fmt.Sprintf("127.0.0.1:%d", MacSaberPort), "共用文件权限"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("安装步骤里应包含 %q：\n%s", want, joined)
 		}
@@ -375,6 +628,14 @@ func TestInstallMacSaberIsIdempotent(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("重复安装只允许一条服务记录，实际 %d：%+v", n, list)
+	}
+	// 只允许一个系统 plist（旧的用户级 plist 也不许冒出来）。
+	plists, err := filepath.Glob(filepath.Join(SystemLaunchDaemonsDir, "*.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plists) != 1 || filepath.Base(plists[0]) != MacSaberLabel+".plist" {
+		t.Errorf("重复安装后只允许一份系统 plist，实际 %v", plists)
 	}
 	if _, err := os.Stat(MacSaberBin()); err != nil {
 		t.Errorf("重复安装后二进制必须还在：%v", err)
@@ -474,20 +735,21 @@ func TestMacSaberArm64CheckIsNotVacuous(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-//  卸载：删什么、留什么
+//  卸载：删什么、留什么，并复核终态
 // ---------------------------------------------------------------------------
 
-// TestUninstallMacSaberRemovesPayloadKeepsData 默认卸载 = 删运行体、留数据。
+// TestUninstallMacSaberRemovesPayloadKeepsData 默认卸载 = 删运行体、留数据，
+// 且新旧两份 plist 都要没有、8895 不再返回本版。
 func TestUninstallMacSaberRemovesPayloadKeepsData(t *testing.T) {
 	env := newMacSaberTestEnv(t)
-	bin := env.writeFakeBin(t, "#!/bin/sh\nexit 0\n")
-	_ = bin
+	env.writeFakeBin(t, "#!/bin/sh\nexit 0\n")
 	if err := os.MkdirAll(filepath.Dir(env.plist), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(env.plist, []byte("<plist/>"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	env.writeLegacyAgent(t) // 旧版残留也要一起清掉
 	p := env.m.MacSaberPathsFor()
 	for _, dir := range []string{p.DataDir, p.WriteRoot} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -506,10 +768,16 @@ func TestUninstallMacSaberRemovesPayloadKeepsData(t *testing.T) {
 		t.Errorf("默认卸载必须删掉安装根 %s，实际 err=%v", env.root, err)
 	}
 	if _, err := os.Stat(env.plist); !os.IsNotExist(err) {
-		t.Errorf("默认卸载必须删掉 plist，实际 err=%v", err)
+		t.Errorf("默认卸载必须删掉系统 plist，实际 err=%v", err)
+	}
+	if _, err := os.Stat(env.legacy); !os.IsNotExist(err) {
+		t.Errorf("默认卸载必须清掉旧的用户级 plist，实际 err=%v", err)
 	}
 	if len(env.stop) != 1 || !strings.HasPrefix(env.stop[0], MacSaberLabel+"|") {
 		t.Errorf("必须恰好停止一次 %s，实际 %v", MacSaberLabel, env.stop)
+	}
+	if len(env.legacyStop) != 1 || env.legacyStop[0] != env.legacy {
+		t.Errorf("必须清理一次旧的用户级 agent，实际 %v", env.legacyStop)
 	}
 	for _, dir := range []string{p.DataDir, p.WriteRoot} {
 		if _, err := os.Stat(filepath.Join(dir, "keep.txt")); err != nil {
@@ -517,8 +785,10 @@ func TestUninstallMacSaberRemovesPayloadKeepsData(t *testing.T) {
 		}
 	}
 	joined := strings.Join(res.Steps, "\n")
-	if !strings.Contains(joined, p.DataDir) {
-		t.Errorf("必须如实告知保留了哪个数据目录：\n%s", joined)
+	for _, want := range []string{p.DataDir, "卸载复核通过"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("卸载步骤里应包含 %q：\n%s", want, joined)
+		}
 	}
 }
 
@@ -544,19 +814,34 @@ func TestUninstallMacSaberRemoveDataDeletesEverything(t *testing.T) {
 	}
 }
 
+// TestUninstallMacSaberFailsWhenServiceStillServing 卸载后 8895 还在返回本版时必须报错，
+// 不许"删了文件就说卸干净了"（判据贴着运行体）。
+func TestUninstallMacSaberFailsWhenServiceStillServing(t *testing.T) {
+	env := newMacSaberTestEnv(t)
+	env.writeFakeBin(t, "#!/bin/sh\nexit 0\n")
+	env.stubHTTPGet(`{"ok":true,"version":"`+MacSaberVersion+`"}`, 200, nil)
+	app, _ := FindApp(MacSaberAppID)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := env.m.UninstallMacSaber(ctx, app, false, &InstallResult{Steps: []string{}})
+	if err == nil {
+		t.Fatal("8895 仍在返回 mac军刀 时必须报错（不许谎报卸载成功）")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d", MacSaberPort)) {
+		t.Errorf("错误要点名是哪个端口还在服务：%v", err)
+	}
+}
+
 // TestUninstallMacSaberIsIdempotent 什么都没装时卸载不该报错、也不该动 launchd。
 func TestUninstallMacSaberIsIdempotent(t *testing.T) {
 	env := newMacSaberTestEnv(t)
-	prevRepo := env.m.repo
-	env.m.repo = nil // 没有记录、没有 plist、没有安装根
-	t.Cleanup(func() { env.m.repo = prevRepo })
 	app, _ := FindApp(MacSaberAppID)
 	res := &InstallResult{Steps: []string{}}
 	if err := env.m.UninstallMacSaber(context.Background(), app, false, res); err != nil {
 		t.Fatalf("幂等卸载不该报错：%v", err)
 	}
 	if len(env.stop) != 0 {
-		t.Errorf("本来就没注册时不该去动 launchd，实际 %v", env.stop)
+		t.Errorf("本来就没注册时不该去停止系统服务，实际 %v", env.stop)
 	}
 	if !strings.Contains(strings.Join(res.Steps, "\n"), "本来就没有注册") {
 		t.Errorf("应如实说明「本来就没注册」：%v", res.Steps)
@@ -589,6 +874,13 @@ func TestMacSaberUninstallPlanNamesWhatIsKept(t *testing.T) {
 			t.Errorf("KeepNote 要点名保留了什么（%s），实际 %q", want, plan.KeepNote)
 		}
 	}
+	// 计划里必须同时点名系统 plist 与旧用户级 agent（迁移/兼容清理是真实动作）。
+	joined := strings.Join(plan.Steps, "\n")
+	for _, want := range []string{p.Plist, MacSaberLegacyLabel, p.Root} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("卸载计划缺少 %q：\n%s", want, joined)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -614,19 +906,30 @@ func TestMacSaberCatalogEntry(t *testing.T) {
 		t.Errorf("端口/健康路径不对：port=%d path=%q", app.Port, app.HealthPath)
 	}
 	if app.ServiceLabel != MacSaberLabel {
-		t.Errorf("ServiceLabel 必须是 %s（README 预留的 label），实际 %q", MacSaberLabel, app.ServiceLabel)
+		t.Errorf("ServiceLabel 必须是 %s，实际 %q", MacSaberLabel, app.ServiceLabel)
 	}
 	if app.PanelInstaller != MacSaberAppID {
 		t.Errorf("PanelInstaller 应是 %s，实际 %q", MacSaberAppID, app.PanelInstaller)
 	}
 	if app.SystemDaemon {
-		t.Error("mac军刀 不该标 SystemDaemon：它是用户级 LaunchAgent（要读该用户的家目录）")
+		// 那个字段驱动的是"把 brew services 的 agent 搬到系统域"；这个条目
+		// 自己写系统 plist（同 release 二进制那条轨），所以刻意不标。
+		t.Error("mac军刀 不该标 SystemDaemon：它自己写系统 plist，不经过 brew services 搬迁")
 	}
 	if app.BrewFormula != "" {
 		t.Errorf("这个条目不该有 BrewFormula（没有 brew 包）：%q", app.BrewFormula)
 	}
 	if !HasInstallerUninstall(app.PanelInstaller) {
 		t.Error("有 PanelInstaller 却查不到卸载实现（装上就卸不掉）")
+	}
+	// 文案：必须如实说明"与面板共用文件权限"，且不许再写"首次弹一次隐私授权"。
+	if !strings.Contains(app.PostInstallHint, "文件权限与面板共用") {
+		t.Errorf("PostInstallHint 要如实说明共用文件权限：%q", app.PostInstallHint)
+	}
+	for _, banned := range []string{"隐私授权", "弹一次"} {
+		if strings.Contains(app.PostInstallHint, banned) {
+			t.Errorf("PostInstallHint 还在写旧口径 %q：%q", banned, app.PostInstallHint)
+		}
 	}
 }
 
@@ -638,6 +941,9 @@ func TestMacSaberMarketDeclaration(t *testing.T) {
 	}
 	if len(m.Downloads) != 1 {
 		t.Fatalf("mac军刀 只有一个下载点（镜像站），实际 %d", len(m.Downloads))
+	}
+	if m.Runtime.Label != MacSaberLabel {
+		t.Errorf("市场声明的运行 label 必须是 %s（与目录一致），实际 %q", MacSaberLabel, m.Runtime.Label)
 	}
 	d := m.Downloads[0]
 	if d.Purpose != MarketFetchReleaseBinary {

@@ -646,8 +646,9 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"stt": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallSTT(ctx, app, removeData, false, r)
 	},
-	// mac军刀（MacSaber）：bootout + 删 plist + 删 /opt/macsaber；数据目录与
-	// ~/MacSaberFiles **默认保留**（里面是账号、审计日志与用户自己的文件）。
+	// mac军刀（MacSaber）：bootout system 域 + 删系统 plist（兼容残留的旧用户级
+	// agent）+ 删 /opt/macsaber；数据目录与 ~/MacSaberFiles **默认保留**
+	//（里面是账号、审计日志与用户自己的文件）。
 	"macsaber": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallMacSaber(ctx, app, removeData, r)
 	},

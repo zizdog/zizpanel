@@ -1250,10 +1250,10 @@ var marketDownloadApps = []MarketApp{
 	// ---------------- mac军刀（本项目自研产物，只在镜像站） ----------------
 
 	{
-		ID: "macsaber", Kind: KindNative, PanelInstaller: "macsaber", ServiceLabel: "cn.macsaber.web",
+		ID: "macsaber", Kind: KindNative, PanelInstaller: "macsaber", ServiceLabel: MacSaberLabel,
 		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: "cn.macsaber.web",
-			LabelSource: "目录 ServiceLabel（与 macsaber/README.md 预留的 label 一致）",
+			Mode: MarketRuntimeLaunchd, Label: MacSaberLabel,
+			LabelSource: "目录 ServiceLabel（系统级 LaunchDaemon；可执行文件是面板自身的 macsaber-supervise）",
 		},
 		Downloads: []MarketDownloadPoint{
 			{

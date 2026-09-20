@@ -279,7 +279,8 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	// mac军刀（MacSaber）：本项目自研产物，**只在公网镜像站上**。
 	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
 	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
-	// 它的安装/卸载走 macsaber.go（用户级 LaunchAgent），不走这套通用流程。
+	// 它的安装/卸载走 macsaber.go（系统级 LaunchDaemon，可执行文件是面板自身的
+	// macsaber-supervise），不走这套通用流程。
 	"macsaber": {
 		ID: "macsaber", Label: MacSaberLabel, Name: "mac军刀", Icon: "🔪",
 		Category: "tool", RootDir: "macsaber", MirrorOnly: true,

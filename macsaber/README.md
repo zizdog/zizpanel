@@ -92,19 +92,26 @@ go build -o macsaber .          # 产物就是单文件 macsaber
 
 ---
 
-## 五、开机自启（由面板安装时创建）
+## 五、开机自启（由 ZizPanel 安装时创建）
 
-以**当前用户**运行（LaunchAgent，**不要 root**）。
-预留 label：`cn.macsaber.web`，将来由 ZizPanel 应用市场安装时写入
-`~/Library/LaunchAgents/cn.macsaber.web.plist`，本仓库本轮不提供 plist。
+由 ZizPanel 应用市场安装时写成**系统级 LaunchDaemon** `cn.zizpanel.macsaber`
+（plist 在 `/Library/LaunchDaemons/`）。这个守护进程执行的是**面板自己的二进制**
+（`<面板二进制> macsaber-supervise`）：它与面板同一代码要求，所以**共用面板的
+macOS 文件访问授权**（面板能读的它就能读），不需要单独授权、面板升级也不会失效。
 
-手工临时自启可以参考（**本轮未在真机验证**）：
+supervisor 以 root 运行，fork 子进程后直接 setuid/setgid 降权到真实用户，
+macsaber 本体仍以**当前用户**运行（**不要 root**）—— 因此文件归属与
+`say`/`osascript`/`shortcuts`/`pbcopy` 这类图形工具照旧可用。
+
+手工排查可以参考（**本轮未在真机验证**）：
 
 ```bash
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/cn.macsaber.web.plist
-launchctl kickstart gui/$UID/cn.macsaber.web
-launchctl print gui/$UID/cn.macsaber.web
+launchctl print system/cn.zizpanel.macsaber
+tail -f ~/Library/Logs/macsaber-supervise.log ~/Library/Logs/macsaber.err.log
 ```
+
+旧版本（独立用户级 LaunchAgent `cn.macsaber.web`）由面板安装时自动停用并删除；
+若机器上还有它，两个实例会抢 8895，后起的那个起不来。
 
 ---
 
