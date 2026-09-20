@@ -7,13 +7,19 @@ import (
 	"github.com/zizdog/zizvideo/internal/domain"
 )
 
-// seriesCols 里的封面回落到第一集；剧场只引用 media，永远不碰磁盘文件。
-const seriesCols = `s.id, s.title, s.description,
-	COALESCE(NULLIF(s.cover_media_id,''), (
+// coverExpr 解析有效封面（显式 cover_media_id 或第一集），coverLibExpr 再取它的库
+// 以便按 scope 判封面归属（S4：封面可能属于别的库）。
+const coverExpr = `COALESCE(NULLIF(s.cover_media_id,''), (
 		SELECT sm.media_id FROM series_media sm JOIN media m2 ON m2.id = sm.media_id
 		WHERE sm.series_id = s.id AND m2.deleted_at IS NULL
 		ORDER BY sm.position ASC LIMIT 1
-	), ''),
+	), '')`
+
+const coverLibExpr = `COALESCE((SELECT mc.library_id FROM media mc WHERE mc.id = ` +
+	coverExpr + ` AND mc.deleted_at IS NULL), '')`
+
+// seriesCols 里的封面回落到第一集；剧场只引用 media，永远不碰磁盘文件。
+const seriesCols = `s.id, s.title, s.description, ` + coverExpr + `, ` + coverLibExpr + `,
 	COALESCE(s.library_id,''), s.sort_order, s.created_at, s.updated_at,
 	(SELECT COUNT(1) FROM series_media sm JOIN media m3 ON m3.id = sm.media_id
 		WHERE sm.series_id = s.id AND m3.deleted_at IS NULL)`
@@ -21,7 +27,8 @@ const seriesCols = `s.id, s.title, s.description,
 func scanSeries(s interface{ Scan(...any) error }) (*domain.Series, error) {
 	var out domain.Series
 	if err := s.Scan(&out.ID, &out.Title, &out.Description, &out.CoverMediaID,
-		&out.LibraryID, &out.SortOrder, &out.CreatedAt, &out.UpdatedAt, &out.EpisodeCount); err != nil {
+		&out.CoverLibraryID, &out.LibraryID, &out.SortOrder, &out.CreatedAt, &out.UpdatedAt,
+		&out.EpisodeCount); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -49,21 +56,66 @@ func (db *DB) GetSeries(id string) (*domain.Series, error) {
 	return out, err
 }
 
-// ListSeries returns all live 剧场 ordered by sort_order then creation time.
-func (db *DB) ListSeries() ([]domain.Series, error) {
+// ListSeries returns visible 剧场 ordered by sort_order then creation time.
+// 无可见集且无可见封面 ⇒ 从列表消失；episode_count 只数可见集（B.3 / B.4#6）。
+func (db *DB) ListSeries(scope domain.LibraryScope) ([]domain.Series, error) {
 	rows, err := db.Query(`SELECT ` + seriesCols + ` FROM series s
 		WHERE s.deleted_at IS NULL ORDER BY s.sort_order ASC, s.created_at ASC, s.id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []domain.Series{}
+	all := []domain.Series{}
 	for rows.Next() {
 		s, err := scanSeries(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, *s)
+		all = append(all, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 管理端全见：不过滤空剧场，否则新建后还没加集的剧场会从列表消失、无法管理。
+	// （偏离 ITERATION-2 B.3 的字面写法，安全意图不变：scope.All 不存在越权泄露。）
+	if scope.All {
+		return all, nil
+	}
+	counts, err := db.seriesVisibleCounts(scope)
+	if err != nil {
+		return nil, err
+	}
+	out := []domain.Series{}
+	for _, s := range all {
+		visible := counts[s.ID]
+		coverVisible := s.CoverMediaID != "" && scope.Allows(s.CoverLibraryID)
+		if visible == 0 && !coverVisible {
+			continue
+		}
+		s.EpisodeCount = visible
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// seriesVisibleCounts counts the in-scope live members of every 剧场.
+func (db *DB) seriesVisibleCounts(scope domain.LibraryScope) (map[string]int, error) {
+	w, args := scopeWhere(scope, "m.library_id")
+	rows, err := db.Query(`SELECT sm.series_id, COUNT(1) FROM series_media sm
+		JOIN media m ON m.id = sm.media_id
+		WHERE m.deleted_at IS NULL`+w+` GROUP BY sm.series_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
 	}
 	return out, rows.Err()
 }
@@ -141,15 +193,17 @@ func (db *DB) DeleteSeries(id string) error {
 	return tx.Commit()
 }
 
-// ListSeriesEpisodes returns the episode links plus their media rows, in stored
-// position order. The playback/display order (season→episode→文件名自然序) is
-// applied by the API layer, which may import the filename parser.
-func (db *DB) ListSeriesEpisodes(seriesID string) ([]domain.SeriesEpisode, []domain.Media, error) {
+// ListSeriesEpisodes returns the in-scope episode links plus their media rows, in
+// stored position order. The playback/display order (season→episode→文件名自然序)
+// is applied by the API layer, which may import the filename parser.
+func (db *DB) ListSeriesEpisodes(scope domain.LibraryScope, seriesID string) ([]domain.SeriesEpisode, []domain.Media, error) {
+	w, sargs := scopeWhere(scope, "m.library_id")
+	args := append([]any{seriesID}, sargs...)
 	rows, err := db.Query(`SELECT sm.series_id, sm.media_id, sm.position, sm.created_at,
 		sm.season, sm.episode, COALESCE(sm.episode_source,''), `+mediaColsQ+`
 		FROM series_media sm JOIN media m ON m.id = sm.media_id
-		WHERE sm.series_id = ? AND m.deleted_at IS NULL
-		ORDER BY sm.position ASC`, seriesID)
+		WHERE sm.series_id = ? AND m.deleted_at IS NULL`+w+`
+		ORDER BY sm.position ASC`, args...)
 	if err != nil {
 		return nil, nil, err
 	}

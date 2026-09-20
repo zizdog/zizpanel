@@ -232,7 +232,7 @@ func TestDuplicateDeleteRecordsKeepsFiles(t *testing.T) {
 	if _, err := os.Stat(a.Path); err != nil {
 		t.Fatalf("只删记录绝不能动文件: %v", err)
 	}
-	if _, err := e.DB.GetMedia(a.ID); err == nil {
+	if _, err := e.DB.GetMediaIn(domain.LibraryScope{All: true}, a.ID); err == nil {
 		t.Fatal("面板记录应已被软删")
 	}
 }
@@ -254,7 +254,7 @@ func TestDuplicateDeleteFilesRequiresConfirmation(t *testing.T) {
 	if _, err := os.Stat(a.Path); err != nil {
 		t.Fatalf("被拒的请求不得删文件: %v", err)
 	}
-	if _, err := e.DB.GetMedia(a.ID); err != nil {
+	if _, err := e.DB.GetMediaIn(domain.LibraryScope{All: true}, a.ID); err != nil {
 		t.Fatal("被拒的请求不得删记录")
 	}
 }
@@ -290,7 +290,7 @@ func TestDuplicateDeleteFilesRemovesAndVerifies(t *testing.T) {
 	if _, err := os.Stat(a.Path); !os.IsNotExist(err) {
 		t.Fatalf("文件应已被删除（回读核对）: err=%v", err)
 	}
-	if _, err := e.DB.GetMedia(a.ID); err == nil {
+	if _, err := e.DB.GetMediaIn(domain.LibraryScope{All: true}, a.ID); err == nil {
 		t.Fatal("删文件后记录也应软删")
 	}
 }
@@ -333,7 +333,7 @@ func TestDuplicateDeleteFilesRefusesOutsideRoots(t *testing.T) {
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatalf("越界文件绝不能删: %v", err)
 	}
-	if _, err := e.DB.GetMedia(m.ID); err != nil {
+	if _, err := e.DB.GetMediaIn(domain.LibraryScope{All: true}, m.ID); err != nil {
 		t.Fatal("路径校验失败时记录必须保留")
 	}
 }

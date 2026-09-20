@@ -108,6 +108,7 @@ export const api = {
 
   mediaList: (params) => envelope("GET", "/api/v1/media" + queryString(params), undefined, false),
   media: (id) => request("GET", "/api/v1/media/" + encodeURIComponent(id)),
+  myLibraries: () => request("GET", "/api/v1/me/libraries"),
   feedNext: (params) => envelope("GET", "/api/v1/feed/next" + queryString(params), undefined, false),
   feedSettings: () => request("GET", "/api/v1/feed/settings"),
   patchFeedSettings: (body) => request("PATCH", "/api/v1/feed/settings", body),

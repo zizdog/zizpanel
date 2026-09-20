@@ -95,7 +95,7 @@ func (db *DB) MediaByIDs(ids []string) ([]domain.Media, []string, error) {
 	found := []domain.Media{}
 	missing := []string{}
 	for _, id := range ids {
-		m, err := db.GetMedia(id)
+		m, err := db.getMedia(id)
 		if errors.Is(err, domain.ErrNotFound) {
 			missing = append(missing, id)
 			continue

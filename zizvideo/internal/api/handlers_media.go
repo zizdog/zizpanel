@@ -103,7 +103,7 @@ func (s *Server) HandleListMedia(w http.ResponseWriter, r *http.Request) {
 		sort = "id"
 	}
 	desc := r.URL.Query().Get("order") != "asc"
-	rows, total, err := s.DB.ListMedia(struct2Filter(r, page, per, sort, desc))
+	rows, total, err := s.DB.ListMedia(ScopeFrom(r.Context()), struct2Filter(r, page, per, sort, desc))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -129,7 +129,7 @@ func struct2Filter(r *http.Request, page, per int, sort string, desc bool) stora
 
 // HandleGetMedia returns one item with its path (admins only) and progress.
 func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
-	m, err := s.DB.GetMedia(r.PathValue("id"))
+	m, err := s.canAccessMedia(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -143,7 +143,7 @@ func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
 
 // HandleStream serves the raw file with full Range semantics.
 func (s *Server) HandleStream(w http.ResponseWriter, r *http.Request) {
-	m, err := s.DB.GetMedia(r.PathValue("id"))
+	m, err := s.canAccessMedia(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -252,7 +252,8 @@ func (f *liveFile) Read(p []byte) (int, error) {
 
 // HandleCover serves the extracted JPEG, or a placeholder when there is none.
 func (s *Server) HandleCover(w http.ResponseWriter, r *http.Request) {
-	m, err := s.DB.GetMedia(r.PathValue("id"))
+	// 无权必须 404，绝不回落到占位图（占位 200 会泄露"这个 id 存在"）。
+	m, err := s.canAccessMedia(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.fail(w, r, err)
 		return

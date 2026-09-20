@@ -37,15 +37,23 @@ func (s *Server) buildFeedItems(rows []domain.Media, r *http.Request) []feedItem
 // 换新 seed 重开一轮。scope（library_id）各自独立一轮。
 func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
 	u := UserFrom(r.Context())
-	scope := strings.TrimSpace(r.URL.Query().Get("library_id"))
-	if scope != "" {
-		if _, err := s.DB.GetLibrary(scope); err != nil {
+	scope := ScopeFrom(r.Context())
+	reqLib := strings.TrimSpace(r.URL.Query().Get("library_id"))
+	feedScope := scope
+	if reqLib != "" {
+		// 无权与不存在同码同文案；FeedState 只在判权之后才写（S3）。
+		if !scope.Allows(reqLib) {
 			s.fail(w, r, domain.ErrNotFound)
 			return
 		}
+		if _, err := s.DB.GetLibrary(reqLib); err != nil {
+			s.fail(w, r, domain.ErrNotFound)
+			return
+		}
+		feedScope = scopeOnly(reqLib)
 	}
 	limit := queryInt(r, "limit", 10, 1, 50)
-	st, err := s.DB.GetFeedState(u.ID, scope)
+	st, err := s.DB.GetFeedState(u.ID, reqLib)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -54,7 +62,7 @@ func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
 	if hash, id, seed, ok := parseFeedCursor(r.URL.Query().Get("cursor")); ok && seed == st.Seed {
 		st.CursorHash, st.CursorID = hash, id
 	}
-	rows, err := s.DB.FeedPage(scope, st.Seed, st.CursorHash, st.CursorID, limit)
+	rows, err := s.DB.FeedPage(feedScope, st.Seed, st.CursorHash, st.CursorID, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -62,7 +70,7 @@ func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
 	rotated := false
 	if len(rows) == 0 && st.Played > 0 {
 		st.Seed, st.CursorHash, st.CursorID, st.Played = domain.NewID("s"), 0, "", 0
-		rows, err = s.DB.FeedPage(scope, st.Seed, 0, "", limit)
+		rows, err = s.DB.FeedPage(feedScope, st.Seed, 0, "", limit)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -85,7 +93,7 @@ func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	total, err := s.DB.CountPlayable(scope)
+	total, err := s.DB.CountPlayable(feedScope)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -96,7 +104,7 @@ func (s *Server) HandleFeedNext(w http.ResponseWriter, r *http.Request) {
 		"seed":        st.Seed,
 		"played":      st.Played,
 		"rotated":     rotated,
-		"scope":       scope,
+		"scope":       reqLib,
 		"settings":    feedSettingsBody(prefs),
 	})
 }

@@ -37,7 +37,7 @@ func seedFeedMedia(t *testing.T, db *DB, libID string, n int) map[string]bool {
 }
 
 // collectFeed walks one cycle and returns the ids in visit order.
-func collectFeed(t *testing.T, db *DB, scope, seed string, limit int) []string {
+func collectFeed(t *testing.T, db *DB, scope domain.LibraryScope, seed string, limit int) []string {
 	t.Helper()
 	out := []string{}
 	var hash int64
@@ -82,7 +82,7 @@ func TestFeedPageVisitsEachItemOncePerCycle(t *testing.T) {
 	}
 	want := seedFeedMedia(t, db, lib.ID, 7)
 
-	got := collectFeed(t, db, FeedScopeAll, "seed-1", 3)
+	got := collectFeed(t, db, domain.LibraryScope{All: true}, "seed-1", 3)
 	if len(got) != len(want) {
 		t.Fatalf("一轮覆盖 %d 条, 期望 %d", len(got), len(want))
 	}
@@ -99,7 +99,7 @@ func TestFeedPageVisitsEachItemOncePerCycle(t *testing.T) {
 		}
 	}
 	// 换 seed 重开一轮，仍然覆盖全部（只是顺序不同）
-	if again := collectFeed(t, db, FeedScopeAll, "seed-2", 3); len(again) != len(want) {
+	if again := collectFeed(t, db, domain.LibraryScope{All: true}, "seed-2", 3); len(again) != len(want) {
 		t.Fatalf("新 seed 一轮覆盖 %d 条, 期望 %d", len(again), len(want))
 	}
 }
@@ -117,15 +117,15 @@ func TestFeedPageScopeFiltersLibrary(t *testing.T) {
 	seedFeedMedia(t, db, libA.ID, 3)
 	seedFeedMedia(t, db, libB.ID, 2)
 
-	if got := collectFeed(t, db, FeedScopeAll, "s", 4); len(got) != 5 {
+	if got := collectFeed(t, db, domain.LibraryScope{All: true}, "s", 4); len(got) != 5 {
 		t.Fatalf("全部库 = %d 条, 期望 5", len(got))
 	}
-	scoped := collectFeed(t, db, libA.ID, "s", 4)
+	scoped := collectFeed(t, db, domain.LibraryScope{IDs: map[string]bool{libA.ID: true}}, "s", 4)
 	if len(scoped) != 3 {
 		t.Fatalf("库 A = %d 条, 期望 3", len(scoped))
 	}
 	for _, id := range scoped {
-		m, err := db.GetMedia(id)
+		m, err := db.getMedia(id)
 		if err != nil {
 			t.Fatal(err)
 		}

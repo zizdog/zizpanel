@@ -25,7 +25,7 @@ func (s *Server) HandlePatchProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := UserFrom(r.Context())
-	if _, err := s.DB.GetMedia(mediaID); err != nil {
+	if _, err := s.canAccessMedia(r.Context(), mediaID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -45,7 +45,7 @@ func (s *Server) HandlePatchProgress(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleListProgress(w http.ResponseWriter, r *http.Request) {
 	u := UserFrom(r.Context())
 	limit := queryInt(r, "limit", 50, 1, 200)
-	progs, medias, err := s.DB.ListProgress(u.ID, limit)
+	progs, medias, err := s.DB.ListProgress(ScopeFrom(r.Context()), u.ID, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -65,7 +65,7 @@ func (s *Server) HandleListProgress(w http.ResponseWriter, r *http.Request) {
 // HandleAddFavorite marks a media item as favorite.
 func (s *Server) HandleAddFavorite(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("mediaId")
-	if _, err := s.DB.GetMedia(mediaID); err != nil {
+	if _, err := s.canAccessMedia(r.Context(), mediaID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -80,7 +80,7 @@ func (s *Server) HandleAddFavorite(w http.ResponseWriter, r *http.Request) {
 // HandleRemoveFavorite clears the favorite mark.
 func (s *Server) HandleRemoveFavorite(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("mediaId")
-	if _, err := s.DB.GetMedia(mediaID); err != nil {
+	if _, err := s.canAccessMedia(r.Context(), mediaID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -110,7 +110,7 @@ func (s *Server) HandleSetReaction(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, domain.New("VALIDATION_REACTION", "只能点赞或点踩", 400))
 		return
 	}
-	if _, err := s.DB.GetMedia(mediaID); err != nil {
+	if _, err := s.canAccessMedia(r.Context(), mediaID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -125,7 +125,7 @@ func (s *Server) HandleSetReaction(w http.ResponseWriter, r *http.Request) {
 // HandleDeleteReaction removes the reaction.
 func (s *Server) HandleDeleteReaction(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("id")
-	if _, err := s.DB.GetMedia(mediaID); err != nil {
+	if _, err := s.canAccessMedia(r.Context(), mediaID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -145,7 +145,7 @@ func (s *Server) HandleDeleteReaction(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleListFavorites(w http.ResponseWriter, r *http.Request) {
 	u := UserFrom(r.Context())
 	limit := queryInt(r, "limit", 100, 1, 200)
-	rows, err := s.DB.ListFavorites(u.ID, limit)
+	rows, err := s.DB.ListFavorites(ScopeFrom(r.Context()), u.ID, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -157,7 +157,7 @@ func (s *Server) HandleListFavorites(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleListLikes(w http.ResponseWriter, r *http.Request) {
 	u := UserFrom(r.Context())
 	limit := queryInt(r, "limit", 100, 1, 200)
-	rows, err := s.DB.ListLikes(u.ID, limit)
+	rows, err := s.DB.ListLikes(ScopeFrom(r.Context()), u.ID, limit)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -199,4 +199,15 @@ func (s *Server) HandleClearProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "me.progress.clear", "user:"+u.ID, true, "")
 	respond(w, http.StatusOK, map[string]any{"cleared": n}, nil)
+}
+
+// HandleMyLibraries returns the caller's visible libraries as [{id,name}]; the
+// scope comes from the single判据, and root_path is structurally absent (E.2 #4).
+func (s *Server) HandleMyLibraries(w http.ResponseWriter, r *http.Request) {
+	libs, err := s.DB.ListLibrariesIn(ScopeFrom(r.Context()))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	respond(w, http.StatusOK, libs, nil)
 }

@@ -39,9 +39,23 @@ func (db *DB) MediaByPath(libraryID, normalizedPath string) (*domain.Media, erro
 	return m, err
 }
 
-// GetMedia loads one live media row.
-func (db *DB) GetMedia(id string) (*domain.Media, error) {
+// getMedia loads one live media row without a scope check; only storage may use
+// it. The API must go through GetMediaIn so a missing scope cannot compile.
+func (db *DB) getMedia(id string) (*domain.Media, error) {
 	row := db.QueryRow(`SELECT `+mediaCols+` FROM media WHERE id = ? AND deleted_at IS NULL`, id)
+	m, err := scanMedia(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	return m, err
+}
+
+// GetMediaIn loads one live media row inside the caller's scope; a row outside
+// the scope is ErrNotFound, i.e. indistinguishable from a missing one (B.5).
+func (db *DB) GetMediaIn(scope domain.LibraryScope, id string) (*domain.Media, error) {
+	w, sargs := scopeWhere(scope, "library_id")
+	args := append([]any{id}, sargs...)
+	row := db.QueryRow(`SELECT `+mediaCols+` FROM media WHERE id = ? AND deleted_at IS NULL`+w, args...)
 	m, err := scanMedia(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -133,10 +147,14 @@ type MediaFilter struct {
 	Desc      bool
 }
 
-// ListMedia returns a page of media plus the unpaged total.
-func (db *DB) ListMedia(f MediaFilter) ([]domain.Media, int, error) {
+// ListMedia returns a page of media inside the scope plus the scoped total.
+func (db *DB) ListMedia(scope domain.LibraryScope, f MediaFilter) ([]domain.Media, int, error) {
 	where := `deleted_at IS NULL`
 	args := []any{}
+	if w, sargs := scopeWhere(scope, "library_id"); w != "" {
+		where += w
+		args = append(args, sargs...)
+	}
 	if f.LibraryID != "" {
 		where += ` AND library_id = ?`
 		args = append(args, f.LibraryID)

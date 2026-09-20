@@ -60,19 +60,22 @@ func (db *DB) ProgressMap(userID string) (map[string]domain.Progress, error) {
 	return out, rows.Err()
 }
 
-// ListProgress returns recent progress rows with their media attached.
-func (db *DB) ListProgress(userID string, limit int) ([]domain.Progress, []domain.Media, error) {
+// ListProgress returns recent progress rows with their visible media attached.
+func (db *DB) ListProgress(scope domain.LibraryScope, userID string, limit int) ([]domain.Progress, []domain.Media, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	w, sargs := scopeWhere(scope, "m.library_id")
+	args := append([]any{userID}, sargs...)
+	args = append(args, limit)
 	rows, err := db.Query(`SELECT p.media_id, p.position_ms, p.duration_ms, p.completed, p.updated_at,
 			m.id, m.library_id, m.path, m.title, m.size, m.mtime_ns, m.container,
 			m.video_codec, m.audio_codec, m.width, m.height, m.duration_ms, m.bitrate, m.fps,
 			m.status, m.error_class, m.error_message, COALESCE(m.missing_since,''),
 			m.created_at, m.updated_at
 		FROM watch_progress p JOIN media m ON m.id = p.media_id
-		WHERE p.user_id = ? AND m.deleted_at IS NULL
-		ORDER BY p.updated_at DESC LIMIT ?`, userID, limit)
+		WHERE p.user_id = ? AND m.deleted_at IS NULL`+w+`
+		ORDER BY p.updated_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,16 +167,19 @@ func (db *DB) Reactions(userID string) (map[string]string, error) {
 	return out, rows.Err()
 }
 
-// mediaJoin returns media rows joined through a per-user table, newest first.
-// orderCol 由调用方给出：favorites 有 created_at，reactions 只有 updated_at。
-func (db *DB) mediaJoin(table, orderCol, userID string, limit int, extra string) ([]domain.Media, error) {
+// mediaJoin returns media rows joined through a per-user table, newest first,
+// restricted to the caller's scope so a join can never reveal another library.
+func (db *DB) mediaJoin(scope domain.LibraryScope, table, orderCol, userID string, limit int, extra string) ([]domain.Media, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
+	w, sargs := scopeWhere(scope, "m.library_id")
+	args := append([]any{userID}, sargs...)
+	args = append(args, limit)
 	q := `SELECT ` + mediaColsQ + ` FROM ` + table + ` t JOIN media m ON m.id = t.media_id
-		WHERE t.user_id = ? AND m.deleted_at IS NULL ` + extra + `
+		WHERE t.user_id = ? AND m.deleted_at IS NULL` + w + ` ` + extra + `
 		ORDER BY ` + orderCol + ` DESC LIMIT ?`
-	rows, err := db.Query(q, userID, limit)
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -190,13 +196,13 @@ func (db *DB) mediaJoin(table, orderCol, userID string, limit int, extra string)
 }
 
 // ListFavorites returns a user's favorited media, newest first.
-func (db *DB) ListFavorites(userID string, limit int) ([]domain.Media, error) {
-	return db.mediaJoin("favorites", "t.created_at", userID, limit, "")
+func (db *DB) ListFavorites(scope domain.LibraryScope, userID string, limit int) ([]domain.Media, error) {
+	return db.mediaJoin(scope, "favorites", "t.created_at", userID, limit, "")
 }
 
 // ListLikes returns a user's liked media, newest first.
-func (db *DB) ListLikes(userID string, limit int) ([]domain.Media, error) {
-	return db.mediaJoin("reactions", "t.updated_at", userID, limit, `AND t.kind = 'like' `)
+func (db *DB) ListLikes(scope domain.LibraryScope, userID string, limit int) ([]domain.Media, error) {
+	return db.mediaJoin(scope, "reactions", "t.updated_at", userID, limit, `AND t.kind = 'like' `)
 }
 
 // ClearFavorites deletes every favorite row of a user and reports the real count.

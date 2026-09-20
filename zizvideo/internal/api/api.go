@@ -152,6 +152,7 @@ const (
 	ctxRequestID ctxKey = iota
 	ctxUser
 	ctxClientIP
+	ctxScope
 )
 
 // RequestID returns the per-request correlation id.

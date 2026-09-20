@@ -204,7 +204,7 @@ func TestFfmpegArgsAreNeverShellInterpolated(t *testing.T) {
 			t.Fatalf("参数 %q 里出现了 shell 元字符", l)
 		}
 	}
-	rows, _, err := e.DB.ListMedia(filterAll())
+	rows, _, err := e.DB.ListMedia(domain.LibraryScope{All: true}, filterAll())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -39,30 +39,37 @@ type seriesMediaReq struct {
 	MediaIDs []string `json:"media_ids"`
 }
 
-// seriesJSON is the wire shape shared by list and detail.
-func seriesJSON(s domain.Series) map[string]any {
+// seriesJSON is the wire shape shared by list and detail. cover_url 只在封面
+// media 也落在 scope 内时才给（S4：封面可能属于别的库）。
+func seriesJSON(s domain.Series, scope LibraryScope) map[string]any {
 	coverURL := ""
-	if s.CoverMediaID != "" {
+	if s.CoverMediaID != "" && scope.Allows(s.CoverLibraryID) {
 		coverURL = "/api/v1/media/" + s.CoverMediaID + "/cover"
+	}
+	// 剧场可能显式挂在别的库：范围外就不外发这个 id，避免反推存在性。
+	libraryID := s.LibraryID
+	if libraryID != "" && !scope.Allows(libraryID) {
+		libraryID = ""
 	}
 	return map[string]any{
 		"id": s.ID, "title": s.Title, "description": s.Description,
 		"cover_media_id": s.CoverMediaID, "cover_url": coverURL,
-		"library_id": s.LibraryID, "sort_order": s.SortOrder,
+		"library_id": libraryID, "sort_order": s.SortOrder,
 		"episode_count": s.EpisodeCount, "created_at": s.CreatedAt, "updated_at": s.UpdatedAt,
 	}
 }
 
-// HandleListSeries returns every 剧场.
+// HandleListSeries returns the caller's visible 剧场（列表静默过滤）。
 func (s *Server) HandleListSeries(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.DB.ListSeries()
+	scope := ScopeFrom(r.Context())
+	rows, err := s.DB.ListSeries(scope)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	list := make([]map[string]any, 0, len(rows))
 	for _, item := range rows {
-		list = append(list, seriesJSON(item))
+		list = append(list, seriesJSON(item, scope))
 	}
 	respond(w, http.StatusOK, map[string]any{"list": list}, nil)
 }
@@ -71,16 +78,23 @@ func (s *Server) HandleListSeries(w http.ResponseWriter, r *http.Request) {
 // (补丁 R1：season→episode→文件名自然序，未识别排末尾).
 func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	scope := ScopeFrom(r.Context())
 	series, err := s.DB.GetSeries(id)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	eps, medias, err := s.DB.ListSeriesEpisodes(id)
+	eps, medias, err := s.DB.ListSeriesEpisodes(scope, id)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	// 可见集为 0 ⇒ 剧场视为不可见（与不存在同码）；episode_count 只报可见集。
+	if len(eps) == 0 {
+		s.fail(w, r, domain.ErrNotFound)
+		return
+	}
+	series.EpisodeCount = len(eps)
 	eps, medias = sortSeriesEpisodes(eps, medias)
 	u := UserFrom(r.Context())
 	items := s.buildItems(medias, r, u != nil && u.Role == domain.RoleAdmin)
@@ -88,7 +102,7 @@ func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 	for i, item := range items {
 		list = append(list, seriesEpisodeJSON(eps[i], item))
 	}
-	respond(w, http.StatusOK, map[string]any{"series": seriesJSON(*series), "list": list}, nil)
+	respond(w, http.StatusOK, map[string]any{"series": seriesJSON(*series, scope), "list": list}, nil)
 }
 
 // seriesEpisodeJSON is one episode entry: numbers + the honest 人读标签.
@@ -162,7 +176,7 @@ func (s *Server) HandleCreateSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.CoverMediaID != "" {
-		if _, err := s.DB.GetMedia(req.CoverMediaID); err != nil {
+		if _, err := s.DB.GetMediaIn(scopeAll(), req.CoverMediaID); err != nil {
 			s.fail(w, r, err)
 			return
 		}
@@ -188,7 +202,7 @@ func (s *Server) HandleCreateSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "series.create", "series:"+series.ID, true, "")
-	respond(w, http.StatusCreated, seriesJSON(*fresh), nil)
+	respond(w, http.StatusCreated, seriesJSON(*fresh, scopeAll()), nil)
 }
 
 // HandlePatchSeries applies a partial 剧场 update (admin only).
@@ -218,7 +232,7 @@ func (s *Server) HandlePatchSeries(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CoverMediaID != nil {
 		if *req.CoverMediaID != "" {
-			if _, err := s.DB.GetMedia(*req.CoverMediaID); err != nil {
+			if _, err := s.DB.GetMediaIn(scopeAll(), *req.CoverMediaID); err != nil {
 				s.fail(w, r, err)
 				return
 			}
@@ -244,7 +258,7 @@ func (s *Server) HandlePatchSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "series.update", "series:"+id, true, "")
-	respond(w, http.StatusOK, seriesJSON(*fresh), nil)
+	respond(w, http.StatusOK, seriesJSON(*fresh, scopeAll()), nil)
 }
 
 // HandleDeleteSeries soft-deletes a 剧场; media rows and files stay untouched.
@@ -278,7 +292,7 @@ func (s *Server) HandleAddSeriesMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	inputs := make([]storage.SeriesMediaInput, 0, len(req.MediaIDs))
 	for _, mediaID := range req.MediaIDs {
-		m, err := s.DB.GetMedia(mediaID)
+		m, err := s.DB.GetMediaIn(scopeAll(), mediaID)
 		if err != nil {
 			s.fail(w, r, domain.New("VALIDATION_NOT_FOUND", "媒体不存在: "+mediaID, 404))
 			return
@@ -401,7 +415,7 @@ func (s *Server) HandleDetectSeries(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	eps, medias, err := s.DB.ListSeriesEpisodes(id)
+	eps, medias, err := s.DB.ListSeriesEpisodes(scopeAll(), id)
 	if err != nil {
 		s.fail(w, r, err)
 		return

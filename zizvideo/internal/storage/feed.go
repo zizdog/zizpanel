@@ -111,12 +111,12 @@ func (db *DB) SaveUserPrefs(userID string, p *UserPrefs) error {
 }
 
 // CountPlayable counts the rows a feed scope can ever serve.
-func (db *DB) CountPlayable(scope string) (int, error) {
+func (db *DB) CountPlayable(scope domain.LibraryScope) (int, error) {
 	q := `SELECT COUNT(1) FROM media WHERE deleted_at IS NULL AND status = ?`
 	args := []any{domain.MediaReady}
-	if scope != "" {
-		q += ` AND library_id = ?`
-		args = append(args, scope)
+	if w, sargs := scopeWhere(scope, "library_id"); w != "" {
+		q += w
+		args = append(args, sargs...)
 	}
 	var n int
 	err := db.QueryRow(q, args...).Scan(&n)
@@ -130,7 +130,7 @@ func (db *DB) CountPlayable(scope string) (int, error) {
 // exactly once per cycle, so a client that follows next_cursor never sees a
 // repeat before the cycle is exhausted。排序在 Go 里做：媒体量级是个人库，
 // 每次翻页只读 id 列，换来的是与 SQLite 无关的确定顺序。
-func (db *DB) FeedPage(scope, seed string, afterHash int64, afterID string, limit int) ([]domain.Media, error) {
+func (db *DB) FeedPage(scope domain.LibraryScope, seed string, afterHash int64, afterID string, limit int) ([]domain.Media, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
@@ -173,12 +173,12 @@ func (db *DB) FeedPage(scope, seed string, afterHash int64, afterID string, limi
 }
 
 // feedScopeIDs lists the playable ids of one scope, unordered.
-func (db *DB) feedScopeIDs(scope string) ([]string, error) {
+func (db *DB) feedScopeIDs(scope domain.LibraryScope) ([]string, error) {
 	q := `SELECT id FROM media WHERE deleted_at IS NULL AND status = ?`
 	args := []any{domain.MediaReady}
-	if scope != "" {
-		q += ` AND library_id = ?`
-		args = append(args, scope)
+	if w, sargs := scopeWhere(scope, "library_id"); w != "" {
+		q += w
+		args = append(args, sargs...)
 	}
 	rows, err := db.Query(q, args...)
 	if err != nil {

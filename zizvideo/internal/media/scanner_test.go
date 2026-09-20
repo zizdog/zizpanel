@@ -136,7 +136,7 @@ func (e *scanEnv) run(t *testing.T) *domain.ScanTask {
 
 func (e *scanEnv) media(t *testing.T) []domain.Media {
 	t.Helper()
-	rows, _, err := e.db.ListMedia(storage.MediaFilter{PerPage: 100, Page: 1})
+	rows, _, err := e.db.ListMedia(domain.LibraryScope{All: true}, storage.MediaFilter{PerPage: 100, Page: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

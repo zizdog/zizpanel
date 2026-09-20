@@ -96,11 +96,13 @@ type Series struct {
 	Title        string `json:"title"`
 	Description  string `json:"description"`
 	CoverMediaID string `json:"cover_media_id,omitempty"`
-	LibraryID    string `json:"library_id,omitempty"`
-	SortOrder    int    `json:"sort_order"`
-	EpisodeCount int    `json:"episode_count"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	// CoverLibraryID 只用于判据：封面可能属于另一个库（S4），不外发。
+	CoverLibraryID string `json:"-"`
+	LibraryID      string `json:"library_id,omitempty"`
+	SortOrder      int    `json:"sort_order"`
+	EpisodeCount   int    `json:"episode_count"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 // episode_source values for series_media (补丁 R1).

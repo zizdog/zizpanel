@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
 	"github.com/zizdog/zizvideo/internal/domain"
+	"github.com/zizdog/zizvideo/migrations"
 )
 
 func newLib(id, name, root string) *domain.Library {
@@ -37,7 +39,7 @@ func TestMigrateCreatesSchemaAndIsIdempotent(t *testing.T) {
 	for _, table := range []string{
 		"schema_migrations", "users", "sessions", "media_libraries", "media",
 		"scan_tasks", "watch_progress", "favorites", "reactions", "audit_log",
-		"series", "series_media",
+		"series", "series_media", "user_libraries",
 	} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
@@ -132,5 +134,155 @@ func TestAbandonStaleTasksOnRestart(t *testing.T) {
 	}
 	if got.Status != "interrupted" {
 		t.Fatalf("重启后状态 = %q, 期望 interrupted", got.Status)
+	}
+}
+
+// TestMigration0006FailClosed：真实 0005 结构 + 历史普通用户 → 升级到 0006 后
+// 0 授权（有意），管理员照旧全见。锁死"升级后家人被挡在门外"的预期行为（D.3）。
+func TestMigration0006FailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zizvideo.db")
+	raw, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := []string{"0001_init.sql", "0002_feed.sql", "0003_series.sql",
+		"0004_episode.sql", "0005_seek.sql"}
+	now := domain.NowString()
+	for i, name := range old {
+		body, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(string(body)); err != nil {
+			t.Fatalf("执行 %s: %v", name, err)
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?,?)`,
+			i+1, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO users
+		(id,username,display_name,password_hash,role,status,created_at,updated_at)
+		VALUES ('usr_old','old','Old','x','user','active',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO media_libraries
+		(id,name,root_path,recursive,enabled,ignore_rules,mount_id,created_at,updated_at)
+		VALUES ('lib_old','旧库','/tmp/old',1,1,'[]','',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO media
+		(id,library_id,path,normalized_path,title,size,mtime_ns,container,video_codec,audio_codec,
+		 width,height,duration_ms,bitrate,fps,status,error_class,error_message,probe_attempts,
+		 created_at,updated_at)
+		VALUES ('med_old','lib_old','/tmp/old/a.mp4','/tmp/old/a.mp4','a',1,1,'mp4','h264','aac',
+		 1,1,1,1,1,'ready','','',0,?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("从 0005 升级失败: %v", err)
+	}
+	defer db.Close()
+	if v, _ := db.SchemaVersion(); v != 6 {
+		t.Fatalf("schema 版本 = %d, 期望 6", v)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_libraries'`).
+		Scan(&name); err != nil {
+		t.Fatalf("user_libraries 未创建: %v", err)
+	}
+	ids, err := db.UserLibraryIDs("usr_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("迁移不得回填存量用户: %v", ids)
+	}
+	if briefs, err := db.ListLibrariesIn(domain.LibraryScope{}); err != nil || len(briefs) != 0 {
+		t.Fatalf("空 scope 必须返回空: %v err=%v", briefs, err)
+	}
+	all, err := db.ListLibrariesIn(domain.LibraryScope{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("管理端应看到 1 个库, 得到 %d", len(all))
+	}
+}
+
+// TestUserLibrariesCascadeAndSoftDelete：软删库判据立即失效但授权行保留；
+// 硬删用户 CASCADE 清行；软删后重建的同名库不被旧授权命中（D.3）。
+func TestUserLibrariesCascadeAndSoftDelete(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "zizvideo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateUser(&domain.User{ID: "usr_1", Username: "u1", PasswordHash: "x",
+		Role: domain.RoleUser, Status: domain.StatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	l1, l2 := newLib("lib_1", "L1", "/tmp/l1"), newLib("lib_2", "L2", "/tmp/l2")
+	for _, l := range []*domain.Library{l1, l2} {
+		if err := db.CreateLibrary(l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.GrantUserLibrary("usr_1", l1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GrantUserLibrary("usr_1", l1.ID); err != nil { // 复合主键 ⇒ 幂等
+		t.Fatal(err)
+	}
+	if err := db.GrantUserLibrary("usr_1", l2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := db.UserLibraryIDs("usr_1"); len(ids) != 2 {
+		t.Fatalf("授权数 = %d, 期望 2", len(ids))
+	}
+
+	if err := db.DeleteLibrary(l2.ID); err != nil { // 软删
+		t.Fatal(err)
+	}
+	ids, err := db.UserLibraryIDs("usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids[l2.ID] || len(ids) != 1 {
+		t.Fatalf("软删库不得再进判据: %v", ids)
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM user_libraries WHERE user_id='usr_1'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("软删库的授权行应保留: %d", rows)
+	}
+
+	l3 := newLib("lib_3", "L2", "/tmp/l2b") // 同名重建 = 新 id
+	if err := db.CreateLibrary(l3); err != nil {
+		t.Fatal(err)
+	}
+	ids, _ = db.UserLibraryIDs("usr_1")
+	if ids[l3.ID] {
+		t.Fatal("幽灵授权：旧库授权不得对新库生效")
+	}
+	if briefs, _ := db.ListLibrariesIn(domain.LibraryScope{IDs: map[string]bool{l2.ID: true}}); len(briefs) != 0 {
+		t.Fatalf("软删库的授权范围应返回空: %v", briefs)
+	}
+
+	if _, err := db.Exec(`DELETE FROM users WHERE id='usr_1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(1) FROM user_libraries WHERE user_id='usr_1'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("硬删用户应 CASCADE 清授权行: %d", rows)
 	}
 }

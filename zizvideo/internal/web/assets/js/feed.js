@@ -1,7 +1,7 @@
 // 竖向全屏短视频流：transform 位移 + 手势锁 + seed 随机游标 + 拖动进度
 
 import { api, patchProgressKeepalive } from "./api.js";
-import { el, fmtDuration } from "./dom.js";
+import { el, clear, asArray, fmtDuration } from "./dom.js";
 import { mountNav } from "./nav.js";
 import { createFeedSettingsForm, normalizeFeedSettings, seekSecondsOf, loopEffective } from "./play-settings.js";
 
@@ -66,7 +66,21 @@ export function mountFeed(view) {
   const track = el("div", { class: "track" });
   const chip = el("div", { class: "feed-chip hidden" });
   const toast = el("div", { class: "toast hidden" });
-  feed.append(track, chip);
+  // 选库入口（P1）：库列表只来自 GET /me/libraries，不再从当前视频反推
+  const pickerBtn = el("button", {
+    class: "lib-chip hidden", type: "button", text: "选库",
+    style: { position: "absolute", zIndex: "8", top: "44px", left: "12px" },
+  });
+  const picker = el("div", {
+    class: "set-panel hidden",
+    style: { left: "12px", right: "auto", top: "80px" },
+  });
+  picker.addEventListener("click", (event) => event.stopPropagation());
+  pickerBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    picker.classList.toggle("hidden");
+  });
+  feed.append(track, chip, pickerBtn, picker);
   view.append(feed, toast);
   // 底栏挂载点（条目 10）：只加容器与入口，不改播放/进度逻辑
   view.append(mountNav("feed"));
@@ -77,6 +91,7 @@ export function mountFeed(view) {
     active: -1, hasMore: true, loading: false,
     soundOn: readSoundPref(),
     scope: "", scopeName: "", nextCursor: "",
+    libraries: [], librariesLoaded: false,
     settings: normalizeFeedSettings(),
     infoCard: null, emptyCard: null,
   };
@@ -513,6 +528,7 @@ export function mountFeed(view) {
     for (const entry of state.built.values()) {
       if (entry.panel) entry.panel.classList.add("hidden");
     }
+    picker.classList.add("hidden");
   }
 
   function gearButton(entry) {
@@ -654,7 +670,9 @@ export function mountFeed(view) {
     }
     state.hasMore = !!(meta && meta.has_more);
     if (!state.items.length && !state.hasMore && !state.emptyCard) {
-      state.emptyCard = el("div", { class: "card info", text: "还没有视频" });
+      const noLibrary = state.librariesLoaded && state.libraries.length === 0;
+      state.emptyCard = el("div", { class: "card info",
+        text: noLibrary ? "没有可访问的媒体库，请联系管理员" : "还没有视频" });
       feed.append(state.emptyCard);
     }
     if (state.items.length && state.active < 0) setActive(0, false);
@@ -689,6 +707,37 @@ export function mountFeed(view) {
     if (state.hasMore && !state.loading && index >= state.items.length - 3) loadMore();
   }
 
+  /* ---------- 选库（P1：数据来自 /me/libraries） ---------- */
+
+  function renderPicker() {
+    clear(picker);
+    const all = el("button", { class: "lib-chip" + (state.scope ? "" : " all"),
+      type: "button", text: "全部库" });
+    all.addEventListener("click", () => { closePanels(); switchScope("", ""); });
+    picker.append(all);
+    for (const lib of state.libraries) {
+      const name = lib.name || lib.id;
+      const row = el("button", { class: "lib-chip" + (state.scope === lib.id ? " all" : ""),
+        type: "button", text: name });
+      row.addEventListener("click", () => { closePanels(); switchScope(lib.id, name); });
+      picker.append(row);
+    }
+  }
+
+  async function loadLibraries() {
+    try {
+      state.libraries = asArray(await api.myLibraries());
+    } catch (err) {
+      state.libraries = [];
+    }
+    state.librariesLoaded = true;
+    pickerBtn.classList.toggle("hidden", state.libraries.length <= 1);
+    renderPicker();
+    if (state.emptyCard && state.libraries.length === 0) {
+      state.emptyCard.textContent = "没有可访问的媒体库，请联系管理员";
+    }
+  }
+
   /* ---------- 范围切换（来自 <库名>） ---------- */
 
   function switchScope(libraryID, libraryName) {
@@ -708,6 +757,7 @@ export function mountFeed(view) {
     state.nextCursor = "";
     state.scope = libraryID;
     state.scopeName = libraryName;
+    renderPicker();
     if (state.emptyCard && state.emptyCard.parentNode) state.emptyCard.remove();
     state.emptyCard = null;
     closePanels();
@@ -800,6 +850,7 @@ export function mountFeed(view) {
   window.addEventListener("pagehide", onPageHide);
   document.addEventListener("visibilitychange", onVisibility);
 
+  loadLibraries();
   loadMore();
 
   return function cleanup() {
