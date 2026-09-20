@@ -44,6 +44,10 @@ let defSite = null;
 // 站点详情面板当前所在的 Tab
 let detailTab = 'basic';
 
+// togglePending 是"启停在飞"的域名集合：请求/确认期间重复点击直接忽略（防连点）。
+// 只做防重入，**不改按钮外观** —— 状态一律以回执为准，不做乐观更新。
+const togglePending = new Set();
+
 // NET_HINT_ENTRIES 是本页"去哪改镜像/代理"的入口（各页入口不同）。
 const NET_HINT_ENTRIES = '面板设置 → 访问与安全 →「应用包镜像基址」；Docker 页 →「加速源」（Docker 镜像）。';
 
@@ -1426,12 +1430,47 @@ export function SitesView(content, ctx = {}) {
       h('td.mono', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: s.root }),
       h('td', [
         h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } }, [
+          siteToggleButton(s),
           h('button.btn.btn-sm', { text: '管理', onclick: () => openDetail(s.domain) }),
           h('button.btn.btn-sm', { text: '诊断', onclick: () => runCheck(s.domain) }),
           h('button.btn.btn-danger.btn-sm', { text: '删除', onclick: () => delSite(s) }),
         ]),
       ]),
     ]);
+  }
+
+  // siteToggleButton 是列表行的一键启停：文案只看 s.enabled，与编辑弹窗同一语义。
+  // 停止 = enabled:false（从 nginx 移除 vhost 并 reload），启动 = enabled:true（重建 + reload）。
+  function siteToggleButton(s) {
+    const stopping = !!s.enabled;
+    const btn = h(`button.btn.${stopping ? 'btn-ghost' : 'btn-primary'}.btn-sm`, {
+      text: stopping ? '停止' : '启动',
+      title: stopping ? '停止该站点：从 nginx 移除配置并重载' : '启动该站点：重新生成配置并重载',
+      onclick: () => toggleSite(s),
+    });
+    return btn;
+  }
+
+  // toggleSite 二次确认后切 enabled，成功/失败都重拉列表；失败贴后端原文（不谎报）。
+  async function toggleSite(s) {
+    if (togglePending.has(s.domain)) return; // 防连点：确认框/请求在飞时忽略重复提交
+    const enable = !s.enabled;
+    togglePending.add(s.domain);
+    try {
+      const okBox = await confirmBox(
+        enable
+          ? '启动会重新生成 nginx 配置并重载，站点恢复对外服务。继续？'
+          : '停止会从 nginx 移除配置并重载，站点停止对外服务。继续？',
+        { title: (enable ? '启动站点：' : '停止站点：') + s.domain, danger: !enable });
+      if (!okBox) return;
+      await api.siteUpdate(s.domain, { enabled: enable });
+      toast(enable ? '已启动 ' + s.domain : '已停止 ' + s.domain, 'ok');
+      await load();
+    } catch (e) {
+      toast(e.message, 'err', 9000);
+    } finally {
+      togglePending.delete(s.domain);
+    }
   }
 
   // domainLink 把**域名文本本身**做成链接（用户明确要求）。
