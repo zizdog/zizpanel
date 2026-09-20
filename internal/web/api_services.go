@@ -606,6 +606,28 @@ func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
 // 真在跑却停不掉 → 409 拒绝，并告诉用户先停掉。
 func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	// 残留记录（它自己的运行体已经不在）→ **只删面板记录，不碰系统**。
+	//
+	// 真机 2026-09-20：mysql84 的 keg/plist 都没了、只剩记录，而 3306 上跑着 MariaDB；
+	// 旧实现先"停止"它，再把 MariaDB 的监听当成它还在跑（native 驱动先查端口），
+	// 于是这条记录永远删不掉。判据换成"它自己的运行体在不在"（见 ServiceRuntimeAlive）。
+	if rec := s.svcManager().ServiceRecord(r.Context(), name); rec != nil {
+		if alive, why := s.svcManager().ServiceRuntimeAlive(r.Context(), rec); !alive {
+			if err := s.svcManager().ForgetResidual(r.Context(), name); err != nil {
+				fail(w, http.StatusConflict, err.Error())
+				return
+			}
+			note := residualForgetNote(rec, why)
+			s.audit(r, "service_forget", name, "残留记录（"+why+"）：只删面板记录", true, "")
+			ok(w, map[string]any{
+				"removed":         true,
+				"runtime_touched": false,
+				"stopped":         false,
+				"msg":             note,
+			})
+			return
+		}
+	}
 	stopped, err := s.svcManager().StopAndForget(r.Context(), name)
 	if err != nil {
 		if errors.Is(err, services.ErrServiceNotFound) {
@@ -631,6 +653,22 @@ func (s *Server) handleServiceDelete(w http.ResponseWriter, r *http.Request) {
 		"msg": note + "。软件本身没有被卸载（面板不知道该怎么卸它），" +
 			"磁盘上的文件仍在，需要你自己卸载。",
 	})
+}
+
+// residualForgetNote 生成"只删了面板记录"的人话说明。
+//
+// 数据库引擎那条要额外说清 3306 上跑的是**另一个**引擎（真机 2026-09-20：
+// 用户看到端口还在听，会以为面板把 MariaDB 停了/没删掉）。
+func residualForgetNote(rec *services.Service, why string) string {
+	note := "只删掉了面板记录：这条记录对应的运行体已经不在（" + why + "），" +
+		"没有停止任何正在运行的服务。"
+	if app, ok := services.FindAppByService(rec); ok {
+		if other, isDB := services.DBEngineOtherFormula(app.BrewFormula); isDB {
+			note += "3306 上现在跑的是 " + services.DBEngineFormulaDisplay(other) +
+				"，它不是这条记录、不会被停。"
+		}
+	}
+	return note
 }
 
 // handleServiceUninstall 卸载托管服务。
@@ -1097,7 +1135,43 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 	// 的第三个参数）。它对应 brew uninstall --ignore-dependencies，会破坏依赖它的包，
 	// 所以：默认值永远是 false，且只有计划里 ForceAllowed=true 才准用（见下）。
 	force := r.URL.Query().Get("force") == "1"
+	// forget=1 是**显式的"只删面板记录"**入口（前端残留清理用它，见 apps.js）。
+	// 它不碰系统、也不吃 remove_data：真实数据仍然只走真正的卸载路径。
+	forgetOnly := r.URL.Query().Get("forget") == "1"
 	plan := s.svcManager().PlanUninstall(r.Context(), id)
+	// 残留清理 / 纳管的第三方服务：只删面板记录。
+	//
+	// 为什么它与"依赖拦截"无关（真机 2026-09-20）：zizdog.cn / mirror.zizdog.com
+	// 依赖的是**这台机器上的数据库服务**，不是这条已经没有运行体的死记录；
+	// 而 3306 上跑的是 MariaDB，更不该因为"站点依赖 MySQL"而删不掉这条记录。
+	// 安全边界不变：它自己的运行体还在时一律 409，绝不留"看不到却还在跑"的服务。
+	if forgetOnly || plan.Kind == "forget" {
+		recName := plan.Service
+		if recName == "" {
+			fail(w, http.StatusBadRequest,
+				"「"+app.Name+"」没有可删除的面板记录（只有真实的卸载路径）")
+			return
+		}
+		if rec := s.svcManager().ServiceRecord(r.Context(), recName); rec != nil {
+			if alive, why := s.svcManager().ServiceRuntimeAlive(r.Context(), rec); alive {
+				fail(w, http.StatusConflict, "「"+app.Name+"」自己的运行体还在（"+why+"）："+
+					"不能只删面板记录 —— 那会让它变成你看不到的常驻服务。"+
+					"请先用「卸载」或「从列表移除」把它停掉")
+				return
+			}
+		}
+		s.launchTask(w, r, "uninstall", app.ID, "删除残留记录 "+app.Name,
+			"market_forget_residual", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
+				res := &services.InstallResult{App: app.ID, Steps: []string{}}
+				if err := s.svcManager().ForgetResidual(ctx, recName); err != nil {
+					return res, err
+				}
+				res.Steps = append(res.Steps,
+					"已从「服务管理」删除面板记录 "+recName+"（没有停止任何服务、没有动磁盘）")
+				return res, nil
+			})
+		return
+	}
 	// 计划说有 Homebrew 依赖拦着、用户却**没有**选强制卸载 → 409 + 人话（谁依赖它、
 	// 两个选择）。这正是用户真机看到的那段 brew 英文原文的位置：以前面板把它整段贴回来，
 	// 现在换成"llvm、rust 依赖它，可以先卸载它们，或选择强制卸载（会破坏它们）"。

@@ -431,6 +431,16 @@ func (m *Manager) SetLaunchdDirsForTest(dirs []string) func() {
 	return func() { m.launchdDirsOverride = prev }
 }
 
+// SetPortCheckProbeForTest 替换端口占用探测（lsof），返回值供测试恢复。
+//
+// web 层单测够不到未导出的 portCheckOverride，而"残留记录清理"的判据要读端口
+// 占用者（3306 上是 MariaDB 还是它自己）—— 不注入就会去跑真机 lsof。
+func (m *Manager) SetPortCheckProbeForTest(fn func(port int) (bool, []string, error)) func() {
+	prev := m.portCheckOverride
+	m.portCheckOverride = fn
+	return func() { m.portCheckOverride = prev }
+}
+
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，
 // 按确定性从高到低排列。
 //

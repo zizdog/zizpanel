@@ -39,6 +39,9 @@ func matrixManager(t *testing.T) *Manager {
 		return map[string]string{}, true
 	}
 	m.brewUsesProbe = func(context.Context, string) ([]string, bool) { return nil, true }
+	// 端口探测也隔离：卸载计划现在会核实"记录对应的运行体在不在"，
+	// 默认实现会去跑真机 lsof（单测不许碰真实服务，结论也不该随机器漂）。
+	m.portCheckOverride = func(int) (bool, []string, error) { return false, nil, nil }
 	t.Cleanup(resetBrewUsesCache)
 	return m
 }

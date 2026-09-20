@@ -1103,10 +1103,18 @@ export function AppsView(content, ctx = {}) {
   function uninstallButtons(a) {
     if (!residualOf(a)) return [];
     const plan = a.uninstall || {};
+    // 没有可删的磁盘产物/数据（只剩面板记录，或记录 + 无 data_paths）→ 走
+    // **只删面板记录**的专用入口：不碰任何在跑的引擎（真机 2026-09-20：
+    // mysql84 的死记录被 3306 上 MariaDB 的监听与站点依赖挡住，永远删不掉）。
+    // 有 data_paths 时仍然走真正的卸载（remove_data 语义不变）。
+    const hasData = Array.isArray(plan.data_paths) && plan.data_paths.length > 0;
+    const forgetOnly = !hasData;
     return [h('button.btn.btn-sm.btn-danger', {
-      text: '删除残留数据',
-      title: '这个应用当前没有安装；只删除磁盘上的残留产物/数据',
-      onclick: () => doUninstall(a, plan, true),
+      text: forgetOnly ? '删除残留记录' : '删除残留数据',
+      title: forgetOnly
+        ? '这个应用当前没有安装、也没有磁盘产物；只把这条面板记录删掉（不会停止任何正在运行的服务）'
+        : '这个应用当前没有安装；只删除磁盘上的残留产物/数据',
+      onclick: () => doUninstall(a, plan, true, forgetOnly),
     })];
   }
 
@@ -1116,7 +1124,7 @@ export function AppsView(content, ctx = {}) {
   // 一句"确定卸载吗"是不够的（用户有权知道模型/样本/任务会不会一起没）。
   // 确认框本体只有 servicePanel.confirmUninstallPlan 一份实现（见那里的说明：
   // 这里原来抄的那份会让「确认卸载」永远解析成 false，用户看到的就是"点了没反应"）。
-  async function doUninstall(a, plan, residual = false) {
+  async function doUninstall(a, plan, residual = false, forgetOnly = false) {
     const answer = await confirmUninstallPlan({ name: a.name, plan, residual });
     if (!answer) return;
     // 残留清理的语义就是"删掉产物"，所以直接 remove_data=1，不再让用户勾选。
@@ -1127,18 +1135,20 @@ export function AppsView(content, ctx = {}) {
     taskCenter.start({
       kind: 'uninstall',
       target: a.id,
-      title: (residual ? '删除残留数据 ' : (force ? '强制卸载 ' : '卸载 ')) + a.name,
-      start: () => api.marketUninstall(a.id, wipe, force),
+      title: ((forgetOnly ? '删除残留记录 ' : (residual ? '删除残留数据 ' : (force ? '强制卸载 ' : '卸载 '))) + a.name),
+      start: () => (forgetOnly ? api.marketUninstallForget(a.id) : api.marketUninstall(a.id, wipe, force)),
       // 结果必须显式说出来：用户反馈过"卸载完没有任何提示，卡片还停在旧状态，
       // 看起来像什么都没发生"。任务中心的进度窗给过程，这里给结论。
       onDone: (m) => {
         if (m && m.status && m.status !== 'succeeded') {
-          toast((residual ? '删除残留数据失败：' : '卸载失败：') + (m.error || m.status), 'err', 12000);
+          toast((forgetOnly ? '删除残留记录失败：' : (residual ? '删除残留数据失败：' : '卸载失败：')) + (m.error || m.status), 'err', 12000);
         } else {
           toast(
-            residual
-              ? '已删除「' + a.name + '」的残留数据'
-              : '已卸载「' + a.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）'),
+            forgetOnly
+              ? '已删除「' + a.name + '」的残留记录（没有停止任何服务）'
+              : (residual
+                ? '已删除「' + a.name + '」的残留数据'
+                : '已卸载「' + a.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）')),
             'ok', 9000);
         }
         load();

@@ -309,6 +309,10 @@ export const api = {
   marketUninstall: (id, removeData = false, force = false) =>
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?remove_data=${removeData ? 1 : 0}`
       + (force ? '&force=1' : '')),
+  // 只删面板记录（残留清理）：不碰系统、也不吃 remove_data。
+  // 记录对应的运行体还在时后端会 409（绝不留下"看不到却还在跑"的服务）。
+  marketUninstallForget: (id) =>
+    request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?forget=1`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
   // 卸载前的完整计划（含依赖检测）。市场列表**故意不查依赖** —— 每个条目
   // 一次 `brew uses --installed`，36 条就是 15 秒冷启动（列表卡在"正在读取应用目录…"）。

@@ -37,7 +37,12 @@ func TestPlanUninstallKinds(t *testing.T) {
 		t.Errorf("计划里应带上记录名，实际 %q", plan.Service)
 	}
 
-	// ② 托管服务（compose 应用）：走通用卸载
+	// ② 托管服务（compose 应用）：走通用卸载。
+	// ⚠️ 2026-09-20 起"托管记录"本身不再是运行体证据：项目目录在，才算它还活着
+	//（否则会把一条死记录当成"能安全停掉的服务"，见 ServiceRuntimeAlive）。
+	if err := os.MkdirAll(filepath.Join(m.opt.WorkDir, "compose", "it-tools"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.repo.Create(ctx, &Service{
 		Name: "it-tools", DisplayName: "IT-Tools", Kind: KindCompose, Managed: true,
 	}); err != nil {

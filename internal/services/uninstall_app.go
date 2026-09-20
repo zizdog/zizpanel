@@ -207,7 +207,197 @@ func (m *Manager) PlanUninstallForBrew(ctx context.Context, app App, rec *Servic
 	plan := m.planUninstallForBrewCore(ctx, app, rec, brew, true)
 	m.ApplyDependents(ctx, app, rec, &plan)
 	m.brewDependencyBlockForInstaller(ctx, app, brew, &plan)
+	m.downgradeResidualPlan(ctx, app, rec, &plan)
 	return plan
+}
+
+// ServiceRecord 按名字取面板服务记录（nil = 没有这条记录）。
+func (m *Manager) ServiceRecord(ctx context.Context, name string) *Service {
+	if m == nil || m.repo == nil || strings.TrimSpace(name) == "" {
+		return nil
+	}
+	rec, err := m.repo.Get(ctx, name)
+	if err != nil {
+		return nil
+	}
+	return rec
+}
+
+// plistPath 按标签找真实存在的 plist（系统域/用户域）。
+// 与 plistPathForLabel 的差别：测试可以用 launchdDirsOverride 把它钉到临时目录。
+func (m *Manager) plistPath(label string) string {
+	if strings.TrimSpace(label) == "" {
+		return ""
+	}
+	dirs := m.launchdDirsOverride
+	if dirs == nil {
+		dirs = append([]string{}, launchDaemonsDirs...)
+		if m.opt.UserHome != "" {
+			dirs = append([]string{filepath.Join(m.opt.UserHome, "Library", "LaunchAgents")}, dirs...)
+		}
+	}
+	for _, d := range dirs {
+		if p := filepath.Join(d, label+".plist"); fileExists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// ServiceRuntimeAlive 判断"这条记录对应的运行体现在还在不在"。
+//
+// 这是**残留清理的唯一判据**，也是 2026-09-20 真机缺陷的修复点：旧实现（native
+// 驱动 Status）先看端口，而 MySQL/MariaDB 共用 3306 —— 一条 mysql84 的死记录
+// 把 MariaDB 的监听当成了"它自己在跑"，于是永远删不掉。
+//
+// 只看**它自己**的运行体（任一为真 = 还在）：
+//   - 它自己的 launchd 服务定义还在（系统域/用户域 plist）；
+//   - 它自己的 Homebrew 包还在（keg 真的装着）；
+//   - 它自己的进程名/launchd PID 就是端口占用者（不是共用端口上的别人）；
+//   - 目录声明的安装体还在（纯 CLI / 自研安装器 / compose 项目目录）。
+//
+// 第二个返回值是给用户看的证据：alive 时是"凭什么说它还在"，残留在时是
+// "凭什么说它已经不在"。
+func (m *Manager) ServiceRuntimeAlive(ctx context.Context, rec *Service) (bool, string) {
+	if rec == nil {
+		return false, "没有这条记录"
+	}
+	// ① 它自己的 launchd 服务定义还在。
+	if rec.LaunchLabel != "" {
+		if p := m.plistPath(rec.LaunchLabel); p != "" {
+			return true, "launchd 服务定义还在（" + p + "）"
+		}
+	}
+	app, known := FindAppByService(rec)
+	// ② 它自己的 Homebrew 包还在（keg 真的装着）。
+	brewChecked := false
+	if known && app.BrewFormula != "" {
+		if vers, ok := m.InstalledFormulaVersions(ctx); ok {
+			brewChecked = true
+			if _, _, hit := ResolveBrewFormula(app.BrewFormula, vers); hit {
+				return true, "Homebrew 包还在（" + app.BrewFormula + "）"
+			}
+		}
+	}
+	// ③ 端口占用者是不是**它自己**（绝不用"端口在听"当它还在跑的证据）。
+	portNote := ""
+	if rec.Port > 0 {
+		if info, err := m.checkPort(rec.Port); err == nil && info.InUse {
+			holders := strings.Join(info.Holders, "、")
+			switch {
+			case !known:
+				// 面板不认识这条记录：无法证明端口上是别人 → 保守当它自己（不许隐身运行）。
+				return true, "端口 " + fmt.Sprint(rec.Port) + " 正在监听（" + holders +
+					"），而面板不认识这条记录、无法确认那是别人"
+			case m.portHeldBySelf(app, rec, info.Holders):
+				return true, "端口 " + fmt.Sprint(rec.Port) + " 上就是它自己（" + holders + "）"
+			default:
+				portNote = "端口 " + fmt.Sprint(rec.Port) + " 的占用者是 " + holders + "（不是它）"
+			}
+		}
+	}
+	// ④ 目录声明的安装体还在磁盘上（纯 CLI / 自研安装器 / compose 项目目录）。
+	if known {
+		if body := DetectRuntimeBody(app, m.brewPrefix(), m.opt.UserHome); body.Exists() {
+			return true, "安装体还在（" + body.Path + "）"
+		}
+	}
+	// compose / docker 的运行体是项目目录；记录不在目录里时用记录名当 ID
+	// （面板就是以应用 ID 登记的 compose 记录）。
+	composeID := ""
+	if known {
+		composeID = app.ID
+	} else if rec.Kind == KindCompose || rec.Kind == KindDocker {
+		composeID = rec.Name
+	}
+	if composeID != "" && ComposeArtifactExists(m.opt.WorkDir, composeID) {
+		return true, "compose 项目目录还在（<工作目录>/compose/" + composeID + "）"
+	}
+	// 到这里：它自己的 plist / keg / 进程名 / 安装体都不在。
+	if known && app.BrewFormula != "" && !brewChecked {
+		// brew 探测失败 → 不能断言"keg 不在"，保守当成还活着（宁可拒绝，也不隐身运行）。
+		return true, "无法复核 Homebrew 里是否还装着 " + app.BrewFormula + "（brew 探测失败）"
+	}
+	facts := []string{}
+	if rec.LaunchLabel != "" {
+		facts = append(facts, "launchd 里没有 "+rec.LaunchLabel)
+	}
+	if known && app.BrewFormula != "" {
+		facts = append(facts, "Homebrew 里没有 "+app.BrewFormula)
+	}
+	if portNote != "" {
+		facts = append(facts, portNote)
+	}
+	if len(facts) == 0 {
+		facts = append(facts, "没有找到它自己的运行体")
+	}
+	return false, strings.Join(facts, "；")
+}
+
+// ForgetResidual 只删面板记录（**不碰系统**），用于残留清理。
+//
+// 安全前提由它自己守：运行体还在时**拒绝**，绝不留下"面板里看不到、却还在跑"的服务。
+func (m *Manager) ForgetResidual(ctx context.Context, name string) error {
+	rec := m.ServiceRecord(ctx, name)
+	if rec == nil {
+		return fmt.Errorf("服务 %s 不在面板记录里", name)
+	}
+	if alive, why := m.ServiceRuntimeAlive(ctx, rec); alive {
+		who := rec.DisplayName
+		if who == "" {
+			who = rec.Name
+		}
+		return fmt.Errorf("「%s」自己的运行体还在（%s），不能只删面板记录 —— "+
+			"那会让它变成你看不到的常驻服务。请先把它停掉/卸载，再用「从列表移除」", who, why)
+	}
+	return m.repo.Delete(ctx, name)
+}
+
+// downgradeResidualPlan 把"记录对应的运行体已经不在"的卸载计划降级成**只删面板记录**。
+//
+// 为什么（真机 2026-09-20）：MySQL 与 MariaDB 共用 3306，一条 mysql84 的死记录
+// （keg 与 plist 都没了）被两件事挡住 —— 旧计划让面板去"停止并移除它的服务定义"，
+// 而 native 驱动先看端口、把 MariaDB 的监听当成它还在跑；站点依赖又会先 400。
+// 判据贴运行体：它自己什么都不在了 ⇒ 这次卸载**不会碰任何在跑的东西**，
+// 依赖提示也不构成阻拦（它们连的是这台机器上的服务本身，不是这条死记录）。
+// 有真实数据（DataPaths 非空）时不降级 —— remove_data 的语义必须保持不变。
+func (m *Manager) downgradeResidualPlan(ctx context.Context, app App, rec *Service, plan *UninstallPlan) {
+	if plan == nil || rec == nil || plan.Service == "" || len(plan.DataPaths) > 0 {
+		return
+	}
+	switch plan.Kind {
+	case "service", "forget", "installer":
+	default:
+		return // brew 计划意味着 keg 还在（ServiceRuntimeAlive 会判 alive）
+	}
+	alive, why := m.ServiceRuntimeAlive(ctx, rec)
+	if alive {
+		return
+	}
+	plan.Kind = "forget"
+	plan.Blocked = ""
+	plan.ForceAllowed = false
+	plan.ForceNote = ""
+	plan.Steps = []string{"从「服务管理」里删除这条面板记录（不停止任何服务、不动磁盘上的文件）"}
+	note := "这条记录对应的运行体已经不在（" + why + "）：本次只删面板记录，" +
+		"不会停止任何正在运行的服务。"
+	if other, ok := DBEngineOtherFormula(app.BrewFormula); ok {
+		note += "3306 上现在跑的是 " + dbEngineFormulaDisplay(other) +
+			"（另一个数据库引擎），它不是这条记录、不会被停。"
+	}
+	if len(plan.Dependents) > 0 {
+		names := make([]string, 0, len(plan.Dependents))
+		for _, d := range plan.Dependents {
+			names = append(names, d.Name)
+		}
+		note += "依赖提示里的 " + strings.Join(names, "、") +
+			" 依赖的是这台机器上的服务本身，不是这条已经没有运行体的记录：删记录不影响它们。"
+	}
+	if strings.TrimSpace(plan.KeepNote) != "" {
+		plan.KeepNote = plan.KeepNote + "；" + note
+	} else {
+		plan.KeepNote = note
+	}
 }
 
 // PlanUninstallForBrewFast 是**只算本体、不查依赖**的计划（列表用）：依赖检测是一次真实
