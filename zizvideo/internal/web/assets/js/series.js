@@ -118,7 +118,7 @@ function openDrawer(item, reload) {
 /* ---------- 剧场播放页（按序连播） ---------- */
 
 export function mountSeriesPlay(view, seriesID) {
-  const state = { series: null, items: [], index: -1, soundOn: false, ended: false, autoNext: false };
+  const state = { series: null, items: [], index: -1, soundOn: false, ended: false, autoNext: false, seekSeconds: 10 };
   const toast = el("div", { class: "toast hidden", dataset: { role: "toast" } });
   const video = el("video", { class: "video", playsinline: "", "webkit-playsinline": "", preload: "metadata" });
   video.controls = false;
@@ -182,6 +182,28 @@ export function mountSeriesPlay(view, seriesID) {
     barFill.style.width = (duration > 0 ? Math.min(100, (position / duration) * 100) : 0) + "%";
     elapsed.textContent = fmtDuration(position);
     if (duration > 0) total.textContent = fmtDuration(duration);
+  }
+
+  // 左右键跳转：clamp 到 [0, duration]，不打断播放状态。
+  function seekBy(direction) {
+    if (!current() || !video.getAttribute("src")) return;
+    const seconds = state.seekSeconds;
+    const max = durationMs() / 1000;
+    let target = (Number(video.currentTime) || 0) + direction * seconds;
+    if (target < 0) target = 0;
+    if (max > 0 && target > max) target = max;
+    try { video.currentTime = target; } catch (err) { return; }
+    paintTime();
+    showToast((direction > 0 ? "前进 " : "后退 ") + seconds + " 秒");
+  }
+
+  function onKeyDown(event) {
+    const target = event.target;
+    const tag = target && target.tagName ? target.tagName : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (target && target.isContentEditable)) return;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    seekBy(event.key === "ArrowRight" ? 1 : -1);
   }
 
   function paint() {
@@ -317,6 +339,13 @@ export function mountSeriesPlay(view, seriesID) {
   const onVisibility = () => { if (document.visibilityState === "hidden") flush(true); };
   window.addEventListener("pagehide", onPageHide);
   document.addEventListener("visibilitychange", onVisibility);
+  document.addEventListener("keydown", onKeyDown);
+
+  // 左右键秒数跟随播放页设置；拉取失败就用 state 里的默认 10。
+  api.feedSettings().then((data) => {
+    const n = Number(data && data.seek_seconds);
+    if (Number.isFinite(n) && n >= 1) state.seekSeconds = Math.min(120, Math.round(n));
+  }).catch(() => {});
 
   (async () => {
     try {
@@ -353,6 +382,7 @@ export function mountSeriesPlay(view, seriesID) {
     if (toastTimer) clearTimeout(toastTimer);
     window.removeEventListener("pagehide", onPageHide);
     document.removeEventListener("visibilitychange", onVisibility);
+    document.removeEventListener("keydown", onKeyDown);
     flush(false);
     try { video.pause(); } catch (err) { /* ignore */ }
     video.removeAttribute("src");

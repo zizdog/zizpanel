@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,7 @@ type feedSettingsBody struct {
 	LoopPlay      bool `json:"loop_play"`
 	LoopEffective bool `json:"loop_effective"`
 	AutoplayNext  bool `json:"autoplay_next"`
+	SeekSeconds   int  `json:"seek_seconds"`
 }
 
 type feedMetaBody struct {
@@ -203,5 +206,87 @@ func TestFeedSettingsPersistPerUser(t *testing.T) {
 	decodeInto(t, envB.Data, &bob)
 	if bob.LoopPlay || !bob.AutoplayNext {
 		t.Fatalf("新用户应是默认设置（循环关/连播开）: %+v (%s)", bob, rawB)
+	}
+}
+
+// 门禁：左右键跳转秒数默认 10；PATCH 后回读一致；越界（0/999）保留原值。
+func TestFeedSeekSecondsDefaultPersistAndOutOfRange(t *testing.T) {
+	e := newEnv(t)
+	e.setupAdmin()
+
+	get := func() feedSettingsBody {
+		t.Helper()
+		res, env, raw := e.do(http.MethodGet, "/api/v1/feed/settings", nil)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("GET 设置状态 = %d: %s", res.StatusCode, raw)
+		}
+		var got feedSettingsBody
+		decodeInto(t, env.Data, &got)
+		return got
+	}
+	patch := func(value int) feedSettingsBody {
+		t.Helper()
+		res, env, raw := e.write(http.MethodPatch, "/api/v1/feed/settings",
+			map[string]any{"seek_seconds": value})
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH seek_seconds=%d 状态 = %d: %s", value, res.StatusCode, raw)
+		}
+		var got feedSettingsBody
+		decodeInto(t, env.Data, &got)
+		return got
+	}
+
+	if got := get(); got.SeekSeconds != 10 {
+		t.Fatalf("新用户默认跳转秒数 = %d, 期望 10", got.SeekSeconds)
+	}
+	if got := patch(15); got.SeekSeconds != 15 {
+		t.Fatalf("PATCH 15 后 = %d, 期望 15", got.SeekSeconds)
+	}
+	if got := get(); got.SeekSeconds != 15 {
+		t.Fatalf("PATCH 15 回读 = %d, 期望 15", got.SeekSeconds)
+	}
+	// 越界语义 = 保留原值：不 clamp 到 1/120，也不回落默认 10。
+	if got := patch(0); got.SeekSeconds != 15 {
+		t.Fatalf("PATCH 0 后 = %d, 期望保留原值 15", got.SeekSeconds)
+	}
+	if got := patch(999); got.SeekSeconds != 15 {
+		t.Fatalf("PATCH 999 后 = %d, 期望保留原值 15", got.SeekSeconds)
+	}
+	if got := get(); got.SeekSeconds != 15 {
+		t.Fatalf("越界 PATCH 回读 = %d, 期望仍为 15", got.SeekSeconds)
+	}
+	// 边界值本身必须被接受。
+	if got := patch(1); got.SeekSeconds != 1 {
+		t.Fatalf("PATCH 1 后 = %d, 期望 1", got.SeekSeconds)
+	}
+	if got := patch(120); got.SeekSeconds != 120 {
+		t.Fatalf("PATCH 120 后 = %d, 期望 120", got.SeekSeconds)
+	}
+}
+
+// 门禁：左右键跳转不许只写一半 —— 两个播放器都要接 ArrowLeft/ArrowRight，
+// 且前后端共用 seek_seconds 字段名。
+func TestSeekKeysWiredInBothPlayersAndBackend(t *testing.T) {
+	for _, name := range []string{
+		filepath.Join("..", "web", "assets", "js", "feed.js"),
+		filepath.Join("..", "web", "assets", "js", "series.js"),
+	} {
+		raw, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("读取 %s 失败: %v", name, err)
+		}
+		body := string(raw)
+		for _, token := range []string{"ArrowLeft", "ArrowRight", "seek_seconds"} {
+			if !strings.Contains(body, token) {
+				t.Fatalf("%s 缺少 %q —— 左右键跳转只写了一半", name, token)
+			}
+		}
+	}
+	raw, err := os.ReadFile("handlers_feed.go")
+	if err != nil {
+		t.Fatalf("读取 handlers_feed.go 失败: %v", err)
+	}
+	if !strings.Contains(string(raw), `"seek_seconds"`) {
+		t.Fatal("handlers_feed.go 的响应体没有 seek_seconds 字段")
 	}
 }

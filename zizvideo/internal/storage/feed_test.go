@@ -175,14 +175,28 @@ func TestFeedStateAndPrefsPersist(t *testing.T) {
 	if prefs.LoopPlay || !prefs.AutoplayNext {
 		t.Fatalf("默认应是 循环关 / 连播开: %+v", prefs)
 	}
-	if err := db.SaveUserPrefs("usr_1", &UserPrefs{LoopPlay: true, AutoplayNext: false}); err != nil {
+	if prefs.SeekSeconds != DefaultSeekSeconds {
+		t.Fatalf("默认跳转秒数 = %d, 期望 %d", prefs.SeekSeconds, DefaultSeekSeconds)
+	}
+	if err := db.SaveUserPrefs("usr_1", &UserPrefs{LoopPlay: true, AutoplayNext: false, SeekSeconds: 25}); err != nil {
 		t.Fatal(err)
 	}
 	prefs, err = db.GetUserPrefs("usr_1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !prefs.LoopPlay || prefs.AutoplayNext {
+	if !prefs.LoopPlay || prefs.AutoplayNext || prefs.SeekSeconds != 25 {
 		t.Fatalf("设置没有持久化: %+v", prefs)
+	}
+	// 存量非法值（<=0）必须回落默认，而不是让前端拿到 0 秒跳转。
+	if _, err := db.Exec(`UPDATE user_prefs SET seek_seconds = 0 WHERE user_id = ?`, "usr_1"); err != nil {
+		t.Fatal(err)
+	}
+	prefs, err = db.GetUserPrefs("usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefs.SeekSeconds != DefaultSeekSeconds {
+		t.Fatalf("非法存量值回落 = %d, 期望 %d", prefs.SeekSeconds, DefaultSeekSeconds)
 	}
 }

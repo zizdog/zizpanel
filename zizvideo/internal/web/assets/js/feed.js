@@ -76,7 +76,7 @@ export function mountFeed(view) {
     active: -1, hasMore: true, loading: false,
     soundOn: readSoundPref(),
     scope: "", scopeName: "", nextCursor: "",
-    settings: { loop_play: false, loop_effective: false, autoplay_next: true },
+    settings: { loop_play: false, loop_effective: false, autoplay_next: true, seek_seconds: 10 },
     infoCard: null, emptyCard: null,
   };
   let toastTimer = 0;
@@ -154,7 +154,7 @@ export function mountFeed(view) {
       index, item, layer, video: null, fill: null, elapsed: null, total: null,
       fav: null, like: null, hint: null, soundHint: null, playBtn: null, flash: null,
       bubble: null, bar: null, barWrap: null, sound: null, gear: null, panel: null,
-      setLoop: null, setAuto: null, setNote: null, seekRatio: 0,
+      setLoop: null, setAuto: null, setSeek: null, setNote: null, seekRatio: 0,
       seeking: false, flashTimer: 0, hintTimer: 0,
       resumeDone: false, playRejected: false, broken: false, destroyed: false,
     };
@@ -492,11 +492,19 @@ export function mountFeed(view) {
     return !!state.settings.loop_play && !state.settings.autoplay_next;
   }
 
+  // 左右键跳转秒数：非法/缺省一律按 10，上限与后端一致（120）。
+  function seekSeconds() {
+    const n = Number(state.settings.seek_seconds);
+    if (!Number.isFinite(n) || n < 1) return 10;
+    return Math.min(120, Math.round(n));
+  }
+
   function paintPanel(entry) {
     if (!entry.panel) return;
     entry.setAuto.checked = !!state.settings.autoplay_next;
     entry.setLoop.checked = !!state.settings.loop_play;
     entry.setLoop.disabled = !!state.settings.autoplay_next;
+    entry.setSeek.value = String(seekSeconds());
     entry.setNote.classList.toggle("hidden", !state.settings.autoplay_next);
   }
 
@@ -505,10 +513,18 @@ export function mountFeed(view) {
     entry.setAuto.addEventListener("change", () => saveSettings({ autoplay_next: entry.setAuto.checked }));
     entry.setLoop = el("input", { type: "checkbox" });
     entry.setLoop.addEventListener("change", () => saveSettings({ loop_play: entry.setLoop.checked }));
+    entry.setSeek = el("input", { type: "number", min: "1", max: "120", step: "1" });
+    entry.setSeek.addEventListener("change", () => {
+      const raw = Number(entry.setSeek.value);
+      const next = Number.isFinite(raw) ? Math.max(1, Math.min(120, Math.round(raw))) : seekSeconds();
+      entry.setSeek.value = String(next);
+      saveSettings({ seek_seconds: next });
+    });
     entry.setNote = el("div", { class: "set-note", text: "连播开启时循环不生效" });
     entry.panel = el("div", { class: "set-panel hidden" },
       el("label", { class: "set-row" }, entry.setAuto, el("span", { text: "自动播放下一个" })),
       el("label", { class: "set-row" }, entry.setLoop, el("span", { text: "循环播放" })),
+      el("label", { class: "set-row" }, el("span", { text: "左右键跳转" }), entry.setSeek, el("span", { text: "秒" })),
       entry.setNote);
     entry.panel.addEventListener("click", (event) => event.stopPropagation());
     return entry.panel;
@@ -757,12 +773,31 @@ export function mountFeed(view) {
     if (step) goTo(state.active + step);
   }
 
+  // 左右键跳转：clamp 到 [0, duration]，不打断播放状态；元数据未就绪也不能抛错。
+  function seekBy(direction) {
+    const entry = state.built.get(state.active);
+    if (!entry || entry.destroyed || entry.broken || !entry.video) return;
+    const seconds = seekSeconds();
+    const max = durationMs(entry) / 1000;
+    let target = (Number(entry.video.currentTime) || 0) + direction * seconds;
+    if (target < 0) target = 0;
+    if (max > 0 && target > max) target = max;
+    try { entry.video.currentTime = target; } catch (err) { return; }
+    paintTime(entry);
+    showToast((direction > 0 ? "前进 " : "后退 ") + seconds + " 秒");
+  }
+
   function onKeyDown(event) {
     const target = event.target;
     const tag = target && target.tagName ? target.tagName : "";
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (target && target.isContentEditable)) return;
     if (event.key === " " && tag === "BUTTON") return;
     if (event.key === "Escape") { closePanels(); return; }
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      seekBy(event.key === "ArrowRight" ? 1 : -1);
+      return;
+    }
     if (event.key === "ArrowDown" || event.key === "PageDown" || event.key === " " || event.key === "Spacebar") {
       event.preventDefault();
       goTo(state.active + 1);

@@ -115,7 +115,14 @@ func (s *Server) HandleGetFeedSettings(w http.ResponseWriter, r *http.Request) {
 type feedSettingsReq struct {
 	LoopPlay     *bool `json:"loop_play"`
 	AutoplayNext *bool `json:"autoplay_next"`
+	SeekSeconds  *int  `json:"seek_seconds"`
 }
+
+// 左右键跳转秒数的合法区间；越界/非法保留原值，不改写也不报错。
+const (
+	seekSecondsMin = 1
+	seekSecondsMax = 120
+)
 
 // HandlePatchFeedSettings persists the player settings for one user.
 func (s *Server) HandlePatchFeedSettings(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +143,9 @@ func (s *Server) HandlePatchFeedSettings(w http.ResponseWriter, r *http.Request)
 	if req.AutoplayNext != nil {
 		prefs.AutoplayNext = *req.AutoplayNext
 	}
+	if req.SeekSeconds != nil && *req.SeekSeconds >= seekSecondsMin && *req.SeekSeconds <= seekSecondsMax {
+		prefs.SeekSeconds = *req.SeekSeconds
+	}
 	if err := s.DB.SaveUserPrefs(u.ID, prefs); err != nil {
 		s.fail(w, r, err)
 		return
@@ -150,6 +160,7 @@ func feedSettingsBody(p *storage.UserPrefs) map[string]any {
 		"loop_play":      p.LoopPlay,
 		"loop_effective": p.LoopPlay && !p.AutoplayNext,
 		"autoplay_next":  p.AutoplayNext,
+		"seek_seconds":   p.SeekSeconds,
 	}
 }
 

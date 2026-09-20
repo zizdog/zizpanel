@@ -66,18 +66,22 @@ func (db *DB) SaveFeedState(st *FeedState) error {
 	return err
 }
 
+// DefaultSeekSeconds 是左右键跳转的默认秒数；存量 <=0 一律按默认处理。
+const DefaultSeekSeconds = 10
+
 // UserPrefs is the per-user player settings block.
 type UserPrefs struct {
 	LoopPlay     bool
 	AutoplayNext bool
+	SeekSeconds  int
 }
 
 // GetUserPrefs returns the player settings; autoplay defaults on, loop off.
 func (db *DB) GetUserPrefs(userID string) (*UserPrefs, error) {
-	p := &UserPrefs{AutoplayNext: true}
+	p := &UserPrefs{AutoplayNext: true, SeekSeconds: DefaultSeekSeconds}
 	var loop, auto int
-	err := db.QueryRow(`SELECT loop_play, autoplay_next FROM user_prefs WHERE user_id = ?`, userID).
-		Scan(&loop, &auto)
+	err := db.QueryRow(`SELECT loop_play, autoplay_next, seek_seconds FROM user_prefs WHERE user_id = ?`, userID).
+		Scan(&loop, &auto, &p.SeekSeconds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil
 	}
@@ -85,17 +89,24 @@ func (db *DB) GetUserPrefs(userID string) (*UserPrefs, error) {
 		return nil, err
 	}
 	p.LoopPlay, p.AutoplayNext = loop != 0, auto != 0
+	if p.SeekSeconds <= 0 {
+		p.SeekSeconds = DefaultSeekSeconds
+	}
 	return p, nil
 }
 
 // SaveUserPrefs upserts the player settings block.
 func (db *DB) SaveUserPrefs(userID string, p *UserPrefs) error {
-	_, err := db.Exec(`INSERT INTO user_prefs (user_id, loop_play, autoplay_next, updated_at)
-		VALUES (?,?,?,?)
+	seek := p.SeekSeconds
+	if seek <= 0 {
+		seek = DefaultSeekSeconds
+	}
+	_, err := db.Exec(`INSERT INTO user_prefs (user_id, loop_play, autoplay_next, seek_seconds, updated_at)
+		VALUES (?,?,?,?,?)
 		ON CONFLICT(user_id) DO UPDATE SET
 			loop_play = excluded.loop_play, autoplay_next = excluded.autoplay_next,
-			updated_at = excluded.updated_at`,
-		userID, boolToInt(p.LoopPlay), boolToInt(p.AutoplayNext), domain.NowString())
+			seek_seconds = excluded.seek_seconds, updated_at = excluded.updated_at`,
+		userID, boolToInt(p.LoopPlay), boolToInt(p.AutoplayNext), seek, domain.NowString())
 	return err
 }
 

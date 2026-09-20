@@ -178,7 +178,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //
 // 用户的要求：「面板在线更新要提示更新内容。」
 //
-// 说明文字来自远端清单的 `notes`（RELEASE_NOTES.md 原文），是**外部输入** ——
+// 说明文字来自远端清单的 `notes`（tools/gen-release-notes.py 按版本生成），是**外部输入** ——
 // 发布源一旦被投毒，notes 里放一段 <script> 就能在面板里执行脚本（面板是 root 权限，
 // 后果不需要解释）。所以这里的铁律：
 //
@@ -188,7 +188,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 //      一律退回纯文本，连 href 都不碰。
 //   3. 属性值只来自我们自己写死的字符串；用户内容永远走 textContent。
 //
-// 支持的语法（够 RELEASE_NOTES.md 用就行）：#/##/### 标题、-/* 无序列表、
+// 支持的语法（够发布说明用就行）：#/##/### 标题、-/* 无序列表、
 // 1. 有序列表、段落、**粗体**、`行内代码`、[文字](http链接)、``` 代码块。
 
 // notesInline 把一行里的行内标记渲染成一组节点（返回 DocumentFragment）。

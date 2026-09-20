@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,7 +153,9 @@ func TestSetRootsPreservesOtherFields(t *testing.T) {
 `
 	mustWriteConfig(t, path, body)
 
-	if err := SetRoots(path, []string{"/tmp", "/Volumes/ZPMirror/video"}); err != nil {
+	// 夹具只用临时目录：指向真实外置盘时，盘一摘这个测试就红（环境依赖，非回归；坑 209）。
+	second := t.TempDir()
+	if err := SetRoots(path, []string{"/tmp", second}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _, err := Load(path)
@@ -161,7 +165,7 @@ func TestSetRootsPreservesOtherFields(t *testing.T) {
 	if cfg.ScanWorkers != 2 || len(cfg.MediaExtensions) != 2 || cfg.SecureCookie {
 		t.Fatalf("其它字段被改动: %+v", cfg)
 	}
-	if len(cfg.MediaAllowRoots) != 2 || cfg.MediaAllowRoots[1] != "/Volumes/ZPMirror/video" {
+	if len(cfg.MediaAllowRoots) != 2 || cfg.MediaAllowRoots[1] != second {
 		t.Fatalf("白名单 = %v", cfg.MediaAllowRoots)
 	}
 	var raw map[string]json.RawMessage
@@ -240,5 +244,27 @@ func TestUnwritableConfigIsReported(t *testing.T) {
 	}
 	if !roots.FileBacked() {
 		t.Fatal("FileBacked 应为 true（路径非空）")
+	}
+}
+
+// TestTestFixturesAvoidRealVolumes 锁住"夹具不许指向真实外置卷"：盘一摘 make check 就红，
+// 属环境依赖而非回归（坑 209）。外置卷可达性只能在真机验证，不进单测。
+func TestTestFixturesAvoidRealVolumes(t *testing.T) {
+	needle := []byte("/Vol" + "umes/")
+	err := filepath.WalkDir(filepath.Join("..", ".."), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(body, needle) {
+			t.Errorf("%s 引用了真实外置卷路径，夹具请改用 t.TempDir()", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
