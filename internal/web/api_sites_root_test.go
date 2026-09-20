@@ -411,7 +411,7 @@ func TestSiteListenPortValidationMatrix(t *testing.T) {
 		}
 	}
 
-	// 冲突：同一端口不能给两个站点（80 是共享端口，不在此列）
+	// 同一非 80 端口允许多个站点共存（nginx 支持同端口多 server_name，坑 215）。
 	res, out, _ := doJSON(t, ts, "POST", "/api/v1/sites", map[string]any{
 		"domain": "taken.test", "rewrite": "none", "listen_port": 8098,
 	}, cookies)
@@ -421,11 +421,18 @@ func TestSiteListenPortValidationMatrix(t *testing.T) {
 	res, out, _ = doJSON(t, ts, "POST", "/api/v1/sites", map[string]any{
 		"domain": "clash.test", "rewrite": "none", "listen_port": 8098,
 	}, cookies)
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("同端口必须被拒，实际 %d: %v", res.StatusCode, out)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("同端口不同域名必须允许，实际 %d: %v", res.StatusCode, out)
 	}
-	if msg := fmt.Sprint(out["msg"]); !strings.Contains(msg, "taken.test") {
-		t.Errorf("冲突原因应指出被哪个站点占用，实际: %s", msg)
+	// 真冲突：新站点的别名撞上同端口已有站点的域名/别名
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/sites", map[string]any{
+		"domain": "alias-clash.test", "aliases": "taken.test", "rewrite": "none", "listen_port": 8098,
+	}, cookies)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("同端口域名重复必须被拒，实际 %d: %v", res.StatusCode, out)
+	}
+	if msg := fmt.Sprint(out["msg"]); !strings.Contains(msg, "taken.test") || !strings.Contains(msg, "域名重复") {
+		t.Errorf("冲突原因应指出重复的域名与占用它的站点，实际: %s", msg)
 	}
 	// 正常值放行
 	res, out, _ = doJSON(t, ts, "POST", "/api/v1/sites", map[string]any{

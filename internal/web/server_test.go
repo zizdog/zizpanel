@@ -105,6 +105,12 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// 端口占用探针必须钉住：站点端口的"非 nginx 占用"判定会经提权助手跑真实
+	// `lsof`，而开发机上 /opt/zizpanel/bin/zizpanel-helper 真的存在 ⇒ 单测会去
+	// 调提权助手（甚至 sudo）。默认答"端口空闲"，需要占用场景的用例自己覆盖。
+	prevPortHolders := sitePortHoldersFn
+	sitePortHoldersFn = func(context.Context, int) (string, error) { return "", nil }
+	t.Cleanup(func() { sitePortHoldersFn = prevPortHolders })
 	// 反代目标网段判定用的 DNS 解析器必须钉住：否则带域名目标的测试会去查
 	// 真实 DNS（单测不许碰真实网络）。这里统一返回一个公网地址 —— 对测试来说
 	// 等价于"不需要经面板转发"，因此测试不会意外绑上 47000+ 的回环端口。

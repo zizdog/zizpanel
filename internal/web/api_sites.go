@@ -391,9 +391,13 @@ func (s *Server) reservedPortReasons() map[int]string {
 	return out
 }
 
-// validateSiteListenPort 校验端口：范围 → 面板保留 → 站点/反代冲突。
-// 80 是共享端口（多个站点按 server_name 分流，老站点全在 80），不参与冲突判定。
-func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomain string) error {
+// validateSiteListenPort 校验端口：范围 → 面板保留 → 只拒真冲突（坑 215）。
+// 同一非 80 端口允许多个站点共存（nginx 支持同端口多 server_name）；
+// 只有域名/别名重复、反代规则服务同一域名、或被非 nginx 进程占用才拒绝。
+// 80 是共享端口（老站点全在 80），行为保持不变、不参与冲突判定。
+//
+// selfDomain/selfAliases 是本次要写入的站点身份（更新时传站点自己的，用来排除自己）。
+func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomain, selfAliases string) error {
 	if err := sites.ValidateListenPort(port); err != nil {
 		return err
 	}
@@ -403,32 +407,86 @@ func (s *Server) validateSiteListenPort(ctx context.Context, port int, selfDomai
 	if port == 80 {
 		return nil
 	}
+
+	want := map[string]bool{}
+	addWant := func(d string) {
+		if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
+			want[d] = true
+		}
+	}
+	addWant(selfDomain)
+	for _, a := range strings.Split(selfAliases, ",") {
+		addWant(a)
+	}
+	self := strings.ToLower(strings.TrimSpace(selfDomain))
+
+	// ① 同端口下域名/别名与别的站点重复：nginx 的 server_name 只能择一，真冲突。
 	list, err := s.siteMgr().List(ctx)
 	if err != nil {
 		return err
 	}
 	for _, st := range list {
-		if st.Domain == selfDomain {
+		if st.EffectiveListenPort() != port {
 			continue
 		}
-		if st.EffectiveListenPort() == port {
-			return fmt.Errorf("端口 %d 已被站点 %s 使用：一个端口只给一个站点独占，请换一个端口",
-				port, st.Domain)
+		if self != "" && strings.EqualFold(st.Domain, self) {
+			continue // 更新自己
+		}
+		for _, name := range append([]string{st.Domain}, st.AliasList()...) {
+			if !want[strings.ToLower(strings.TrimSpace(name))] {
+				continue
+			}
+			return fmt.Errorf("端口 %d 与站点 %s 的域名重复\n"+
+				"同一端口可以放多个站点，但域名/别名必须互不冲突；%s 已被站点 %s 使用，请换端口或换域名",
+				port, st.Domain, name, st.Domain)
 		}
 	}
+
+	// ② 同端口下反代规则服务同一个域名：同一域名不能同时给站点和规则。
 	if rules, rerr := s.proxyRepo().List(ctx); rerr == nil {
 		for _, r := range rules {
 			if r.Listen != port {
 				continue
 			}
-			state := ""
-			if !r.Enabled {
-				state = "（该规则当前停用，启用后会占用这个端口）"
+			for _, d := range proxies.SplitDomains(r.Domains) {
+				if !want[d] {
+					continue
+				}
+				return fmt.Errorf("端口 %d 与反代规则「%s」域名重复\n"+
+					"域名 %s 已被这条规则在该端口上服务，请换端口或改规则的域名", port, r.Name, d)
 			}
-			return fmt.Errorf("端口 %d 已被反向代理规则「%s」使用%s，请换一个端口", port, r.Name, state)
+		}
+	}
+
+	// ③ 端口被非 nginx 进程占用：nginx 绑不上（80 上面的旧行为不变）。
+	if holders, herr := sitePortHoldersFn(ctx, port); herr == nil && strings.TrimSpace(holders) != "" {
+		if !strings.Contains(strings.ToLower(holders), "nginx") {
+			return fmt.Errorf("端口 %d 已被 %s 占用\n"+
+				"占用的不是 nginx，站点绑定会失败；请换一个端口或先停掉该进程", port, holderSummary(holders))
 		}
 	}
 	return nil
+}
+
+// sitePortHoldersFn 是"这个端口被谁占着"的探针（生产走提权助手 lsof，见 checkPortHelper）。
+// 做成变量以便单测注入：单测不许调用提权助手，也不许碰真实端口。
+var sitePortHoldersFn = checkPortHelper
+
+// holderSummary 把 "nginx (pid 1), other (pid 2)" 压成一行可读的占用者（最多两个）。
+func holderSummary(holders string) string {
+	parts := strings.Split(holders, ",")
+	out := make([]string, 0, 2)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+		if len(out) == 2 {
+			break
+		}
+	}
+	return strings.Join(out, "、")
 }
 
 // publicEntry 是站点的公网入口：该域名被一条反向代理规则前置时给出的真实地址（坑 214）。
@@ -1203,7 +1261,7 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 	// 监听端口：没给就是 80；给了就按"范围 → 面板保留 → 站点/反代冲突"逐条校验。
 	listenPort := 80
 	if req.ListenPort != nil {
-		if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, ""); perr != nil {
+		if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, req.Domain, req.Aliases); perr != nil {
 			fail(w, http.StatusBadRequest, perr.Error())
 			return
 		}
@@ -1794,7 +1852,7 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.ListenPort != nil {
 		// 只有真要改端口时才校验：否则"端口后来被别的应用占了"会连带锁死改备注这类无关编辑。
 		if *req.ListenPort != site.EffectiveListenPort() {
-			if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, site.Domain); perr != nil {
+			if perr := s.validateSiteListenPort(r.Context(), *req.ListenPort, site.Domain, site.Aliases); perr != nil {
 				fail(w, http.StatusBadRequest, perr.Error())
 				return
 			}
