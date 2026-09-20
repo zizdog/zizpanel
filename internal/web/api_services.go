@@ -339,7 +339,8 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 	// 重启后两个模型全变冷，下一个网站请求要白等约 25 秒。
 	// 后台守温循环也能兜住这件事，但那是分钟级的；用户在这里手动重启，
 	// 几秒内就能恢复才对。QwenWarmResident 对已驻留的模型是空操作。
-	if svc, err := mgr.Get(r.Context(), name); err == nil && svc.LaunchLabel == services.QwenLabel {
+	// 只读服务记录判 label，不走 mgr.Get —— 它会顺带做状态/健康探测，白等（坑 225）。
+	if rec, err := s.serviceRepo.Get(r.Context(), name); err == nil && rec.LaunchLabel == services.QwenLabel {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()

@@ -901,18 +901,23 @@ func LaunchKickstart(label string) error {
 	if st.Loaded {
 		return launchKick(label, st.Domain)
 	}
-	// 未加载时 kickstart 一定失败：先按 load 的规则加载，再 kickstart。
+	// 未加载时 kickstart 一定失败：先 bootstrap（RunAtLoad 的作业同时被拉起）。
+	// 已经跑起来就不要再 kick —— 对刚启动的作业再 kick 会撞 launchd 的 10s
+	// 节流窗口，实测卡 10.0s（坑 225）；只有确实没跑起来时才补一次。
 	if lerr := LaunchLoad(label); lerr != nil {
 		return lerr
 	}
-	st2, rerr := launchResolve(label, domains)
+	after, rerr := launchResolve(label, domains)
 	if rerr != nil {
 		return fmt.Errorf("重启 %s 失败：加载后无法确认状态（%v）", label, rerr)
 	}
-	if !st2.Loaded {
+	if !after.Loaded {
 		return fmt.Errorf("重启 %s 失败：加载后 launchd 里仍查不到该作业", label)
 	}
-	return launchKick(label, st2.Domain)
+	if after.Running {
+		return nil
+	}
+	return launchKick(label, after.Domain)
 }
 
 // launchKick 在指定域里 kickstart 并复核。

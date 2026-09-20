@@ -213,11 +213,10 @@ func (d *nativeDriver) Stop(ctx context.Context) error {
 }
 
 // Restart 重启服务。
+//
+// 只调一次 LaunchKickstart：LaunchLoad 对已加载的作业也会 kick，再叠一次就会落进
+// launchd 的 10s 节流窗口 —— 实测把面板重启拖成 10.0s（坑 225）。
 func (d *nativeDriver) Restart(ctx context.Context) error {
-	// 未加载时 kickstart 会失败，因此先确保已加载
-	if err := priv.LaunchLoad(d.svc.LaunchLabel); err != nil {
-		return err
-	}
 	return priv.LaunchKickstart(d.svc.LaunchLabel)
 }
 

@@ -718,23 +718,15 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 		}
 		return st
 	}
-	// 等待状态稳定（最多 8 秒）
+	// 等待状态稳定：细粒度轮询、就绪即返回，总上限 serviceActionWaitCap。
 	want := action != "stop"
-	var last State
-	for i := 0; i < 16; i++ {
-		time.Sleep(500 * time.Millisecond)
-		st, serr := drv.Status(ctx)
-		if serr == nil {
-			last = st
-			if st.Running == want {
-				return attach(st), nil
-			}
-		}
+	last, settled := waitServiceState(ctx, drv.Status, want)
+	if settled {
+		return attach(last), nil
 	}
 	if last.Status == "" {
 		last = State{Status: "unknown"}
 	}
-	_ = s
 	if !want {
 		// stop 等不到"不再运行"是**真失败**，必须如实报错。
 		//
@@ -748,16 +740,48 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 		if last.Detail != "" {
 			detail += "：" + last.Detail
 		}
-		return last, fmt.Errorf("已请求停止，但 8 秒内它仍在运行%s。"+
+		return last, fmt.Errorf("已请求停止，但 %s 内它仍在运行%s。"+
 			"可能是被 KeepAlive 反复拉起、进程拒绝退出，或它根本不受 launchd 管理；"+
 			"请打开「📜 日志」看原因，或在终端执行 lsof -nP -iTCP:<端口> -sTCP:LISTEN 确认是谁在占用",
-			detail)
+			serviceActionWaitCap, detail)
 	}
 	// start / restart 等不到"已运行"**不一定是失败**（有的服务启动慢、状态上报滞后），
 	// 所以仍然返回成功 —— 但必须让界面显示"还没确认"，不能让用户以为已经好了。
 	last.Warning = appendWarning(last.Warning,
-		"已请求启动，但 8 秒内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）")
+		fmt.Sprintf("已请求启动，但 %s 内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）", serviceActionWaitCap))
 	return attach(last), nil
+}
+
+// serviceActionPollStep 是动作后就绪探测的步长：细粒度、就绪即返回。
+const serviceActionPollStep = 150 * time.Millisecond
+
+// serviceActionWaitCap 是动作后等待"终态可确认"的总上限。3s 足够覆盖
+// launchd/docker 的正常启停；超时就如实说"未确认"，绝不继续干等（坑 225）。
+// 抽成变量：单测把它调小，避免每个用例真等 3 秒（同 launchUnloadWait 的做法）。
+var serviceActionWaitCap = 3 * time.Second
+
+// waitServiceState 在不预先等待的前提下细粒度轮询服务的真实终态。
+// 返回（最后一次真实观测, 是否已达到期望的 running 状态）。抽成独立函数是为了
+// 让单测能注入立即就绪/永不就绪的探针，锁死"立即就绪不引入固定等待"（坑 225）。
+func waitServiceState(ctx context.Context, status func(context.Context) (State, error), want bool) (State, bool) {
+	deadline := time.Now().Add(serviceActionWaitCap)
+	var last State
+	for {
+		if st, err := status(ctx); err == nil {
+			last = st
+			if st.Running == want {
+				return last, true
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return last, false
+		}
+		select {
+		case <-ctx.Done():
+			return last, false
+		case <-time.After(serviceActionPollStep):
+		}
+	}
 }
 
 // ReconcileUserIntentFromAudit 用**审计日志**回填用户意图（升级后的老库）。

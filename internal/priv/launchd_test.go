@@ -183,6 +183,19 @@ func (f *fakeLaunchctl) callList() []string {
 	return append([]string(nil), f.calls...)
 }
 
+// count 数出以 prefix 开头的调用次数（门禁用：连发几次 kickstart）。
+func (f *fakeLaunchctl) count(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
 // withFakeLaunch 用假 launchctl 与固定的候选域替换真实实现，测试结束自动恢复。
 func withFakeLaunch(t *testing.T, f *fakeLaunchctl, domains ...string) {
 	t.Helper()
@@ -473,6 +486,41 @@ func TestLaunchDomainCandidates(t *testing.T) {
 				t.Fatalf("候选域 = %v，期望 %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------- 重启（kickstart） ----------
+
+// 门禁（坑 193）：对已加载的作业，重启只能发**一次** kickstart。
+// 连发两次时第二次会撞 launchd 的 10s 节流窗口 —— 真机实测把面板重启拖成 10.0s，
+// 而命令行同级操作 <0.1s。
+func TestLaunchKickstartKicksExactlyOnceWhenLoaded(t *testing.T) {
+	f := newFakeLaunchctl("user/501")
+	withFakeLaunch(t, f)
+
+	if err := LaunchKickstart(testLabel); err != nil {
+		t.Fatalf("重启应当成功: %v", err)
+	}
+	if n := f.count("kickstart"); n != 1 {
+		t.Fatalf("已加载作业只应 kickstart 一次，实际 %d 次：%v", n, f.callList())
+	}
+}
+
+// 门禁（坑 193）：未加载时 bootstrap 已按 RunAtLoad 拉起它，不得再补一次 kickstart。
+func TestLaunchKickstartDoesNotDoubleKickAfterBootstrap(t *testing.T) {
+	f := newFakeLaunchctl()
+	withFakeLaunch(t, f)
+	withFakePlist(t, "/Library/LaunchDaemons/"+testLabel+".plist")
+
+	if err := LaunchKickstart(testLabel); err != nil {
+		t.Fatalf("未加载时应 bootstrap 后成功: %v", err)
+	}
+	if !f.called("bootstrap user/501") {
+		t.Fatalf("应当 bootstrap user/501：%v", f.callList())
+	}
+	if n := f.count("kickstart"); n != 0 {
+		t.Fatalf("bootstrap 已拉起作业，不该再 kickstart（真机会撞 10s 节流），实际 %d 次：%v",
+			n, f.callList())
 	}
 }
 
