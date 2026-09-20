@@ -657,7 +657,8 @@ func (m *Manager) appendFilebrowserInitialPassword(d AppDescriptor, result *Inst
 				"用户名没能从日志里解析出来，请对照日志里 `User '<用户名>' initialized with randomly generated password` 那一行。")
 	}
 	result.Steps = append(result.Steps,
-		"入口 "+uiURL+"（子路径）或 http://"+m.primaryIP()+":8081/ ；登录后请立刻改口令。")
+		"入口 "+uiURL+"（面板子路径，需登录；登录后请立刻改口令）。"+
+			"它只监听 127.0.0.1:8081，局域网/公网用 IP:8081 打不开是设计如此。")
 }
 
 // prepareFilebrowserDataDir 建好**家目录之外**的数据目录并把归属交给真实用户（服务以真实
