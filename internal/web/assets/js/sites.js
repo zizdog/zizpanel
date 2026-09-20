@@ -9,7 +9,7 @@
 
 import { api } from './api.js';
 import {
-  h, clear, toast, modal, confirmBox,
+  h, clear, toast, modal, confirmBox, failureToast,
 } from './ui.js';
 import { state, registerCleanup } from './app.js';
 // 任务中心：LNMP 是长任务（十几分钟），提交后立刻返回 task_id，进度走 SSE。
@@ -2038,7 +2038,7 @@ export function SitesView(content, ctx = {}) {
         load();
         if (r && r.root) setTimeout(() => openDetail(d), 300);
       } catch (e) {
-        toast(e.message, 'err', 9000);
+        failureToast(e, 16000);
       }
     };
 
@@ -2185,7 +2185,7 @@ export function SitesView(content, ctx = {}) {
               toast(`回源缓存未复核${r.cache_verify_error ? '：' + r.cache_verify_error : ''}`, 'warn', 9000);
             }
             load();
-          } catch (e) { toast(e.message, 'err', 9000); }
+          } catch (e) { failureToast(e, 16000); }
           finally { save.disabled = false; }
         },
       });
@@ -2319,7 +2319,7 @@ export function SitesView(content, ctx = {}) {
             const fresh = await api.site(domain);
             Object.assign(site, fresh.site);
             load();
-          } catch (e) { toast(e.message, 'err', 12000); }
+          } catch (e) { failureToast(e, 16000); }
           finally { save.disabled = false; }
         },
       });
@@ -2377,7 +2377,7 @@ export function SitesView(content, ctx = {}) {
                     Object.assign(site, r.site);
                     toast('已关闭 HTTPS', 'ok');
                     render(); load();
-                  } catch (e) { toast(e.message, 'err', 9000); }
+                  } catch (e) { failureToast(e, 14000); }
                 },
               }),
             ]),
@@ -2409,7 +2409,7 @@ export function SitesView(content, ctx = {}) {
           toast(`${btnText}证书已签发并应用`, 'ok');
           render(); load();
         } catch (e) {
-          toast(e.message, 'err', 14000);
+          failureToast(e, 16000);
         }
       }
 
@@ -2432,7 +2432,7 @@ export function SitesView(content, ctx = {}) {
                   Object.assign(site, r.site);
                   toast('证书已应用', 'ok');
                   close(); render(); load();
-                } catch (e) { toast(e.message, 'err', 12000); }
+                } catch (e) { failureToast(e, 16000); }
               },
             }),
           ],
@@ -2480,7 +2480,7 @@ export function SitesView(content, ctx = {}) {
             // 失败时**保留用户写的内容**（不要用磁盘上的旧内容盖掉他的编辑），
             // 并如实说明后端已回滚、站点仍是旧配置。
             status.textContent = '保存失败（已回滚，站点仍在用修改前的配置）：' + e.message;
-            toast(e.message, 'err', 20000);
+            failureToast(e, 20000);
           } finally {
             saveBtn.disabled = false;
           }
@@ -2517,7 +2517,7 @@ export function SitesView(content, ctx = {}) {
                 editor.value = original;
                 status.textContent = '';
                 load();
-              } catch (e) { toast(e.message, 'err', 12000); }
+              } catch (e) { failureToast(e, 16000); }
             },
           }),
           status,
@@ -2662,7 +2662,7 @@ export function SitesView(content, ctx = {}) {
               toast(r.msg + (r.files ? '（' + r.files + '）' : ''), 'ok');
               close();
               load();
-            } catch (e) { toast(e.message, 'err', 9000); }
+            } catch (e) { failureToast(e, 16000); }
           },
         }),
       ],

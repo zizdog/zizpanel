@@ -76,6 +76,13 @@ func stubSiteApplyChannel(t *testing.T, code string) *siteApplyStub {
 	prevWrite, prevReload, prevProbe := siteWriteVhostFn, siteReloadFn, siteProbeFn
 	prevRead, prevDelete := siteReadVhostFn, siteDeleteVhostFn
 	prevWait, prevEvery := siteVerifyWait, siteVerifyEvery
+	// 失败后的健康探测/恢复动作可注入：不注入会真的碰本机 nginx。
+	prevHealthProbe, prevHealthReload, prevHealthRestart := nginxHealthProbeFn, nginxHealthReloadFn, nginxHealthRestartFn
+	prevRootOwned := nginxRootOwnedFilesFn
+	nginxHealthProbeFn = func(context.Context, string, int) (string, error) { return "200", nil }
+	nginxHealthReloadFn = func(*Server, context.Context) error { return nil }
+	nginxHealthRestartFn = func(*Server, context.Context) error { return nil }
+	nginxRootOwnedFilesFn = func(*Server) []string { return nil }
 
 	siteWriteVhostFn = func(_ *Server, _ context.Context, _, content string) error {
 		st.mu.Lock()
@@ -104,6 +111,8 @@ func stubSiteApplyChannel(t *testing.T, code string) *siteApplyStub {
 		siteWriteVhostFn, siteReloadFn, siteProbeFn = prevWrite, prevReload, prevProbe
 		siteReadVhostFn, siteDeleteVhostFn = prevRead, prevDelete
 		siteVerifyWait, siteVerifyEvery = prevWait, prevEvery
+		nginxHealthProbeFn, nginxHealthReloadFn, nginxHealthRestartFn = prevHealthProbe, prevHealthReload, prevHealthRestart
+		nginxRootOwnedFilesFn = prevRootOwned
 	})
 	return st
 }

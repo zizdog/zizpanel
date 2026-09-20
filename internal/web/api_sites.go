@@ -500,18 +500,22 @@ func (s *Server) verifySiteServed(ctx context.Context, site *sites.Site) error {
 		}
 		break
 	}
-	return s.siteVerifyTimeoutError(site, scheme, port, tries, lastCode, lastErr)
+	return s.siteVerifyTimeoutError(ctx, site, scheme, port, tries, lastCode, lastErr)
 }
 
-// siteVerifyTimeoutError 必须能指导排查：把四个检查点与 error_log 末几行写进错误里。
-func (s *Server) siteVerifyTimeoutError(site *sites.Site, scheme string, port, tries int,
+// siteVerifyTimeoutError 必须能指导排查：第一行是分类结论（≤40 字），细节里给检查点与
+// error_log 末几行。"日志属主是 root"只在**真的发现有 root 属主文件**时才提（坑 211）。
+func (s *Server) siteVerifyTimeoutError(ctx context.Context, site *sites.Site, scheme string, port, tries int,
 	code string, perr error) error {
+	verdict := s.classifyApplyFailure(ctx, scheme, port, code, true)
 	logDir := s.siteLogDir()
 	vhostPath := filepath.Join(s.Cfg.VhostDir, site.Domain+".conf")
 	pidPath := filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid")
 	errLog := filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log")
 
 	var b strings.Builder
+	b.WriteString(verdict.Summary)
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "站点 %s 的配置已写入，nginx 重载也已发出，但 %s 内新配置仍未生效"+
 		"（共探测 %d 次，最后一次 %s://%s:%d%s 期望 403，实际 %s）。"+
 		"先别急着改配置：这类情况多半是 nginx 没有真正加载新配置，而不是配置写错了。请依次检查：",
@@ -524,20 +528,24 @@ func (s *Server) siteVerifyTimeoutError(site *sites.Site, scheme string, port, t
 		vhostPath, s.Cfg.NginxConf)
 	fmt.Fprintf(&b, "④ 全局 error_log 末几行：`tail -n 20 %s`（面板「日志中心 → nginx 主错误日志」）"+
 		"看有没有 [emerg]。", errLog)
+	switch verdict.Kind {
+	case applyFailUpstreamDown:
+		fmt.Fprintf(&b, "\n%s 已加载这份配置，但上游没响应：检查站点的 PHP-FPM 端点或 proxy_pass 目标。", site.Domain)
+	case applyFailNotEffective:
+		fmt.Fprintf(&b, "\n最后一次探测得到 %s（不是 vhost 隐藏文件规则给出的 403）："+
+			"多半是 vhost 没被 include 进来，或 nginx 没有真正加载新配置；"+
+			"若响应来自你的自定义配置（extra_conf），请检查后重试。", describeProbeCode(code, perr))
+	default:
+		if note := recoveryNote(verdict); note != "" {
+			b.WriteString("\n" + note)
+		}
+	}
+	if hint := s.rootOwnedNginxHint(); hint != "" {
+		b.WriteString("\n" + hint)
+	}
 	if tail := s.nginxErrorLogTail(5); tail != "" {
 		b.WriteString("\n（nginx error_log 末几行）\n")
 		b.WriteString(tail)
-	}
-	switch code {
-	case "404":
-		fmt.Fprintf(&b, "\n404 说明请求落到了默认站点：最常见的原因是 %s 里的日志文件"+
-			"归属/权限不对（nginx worker 打不开 access_log 时 reload 会失败但退出码仍是 0），"+
-			"或 vhost 文件没写进 conf.d。", logDir)
-	case "000", "":
-		fmt.Fprintf(&b, "\n连不上 nginx：确认 nginx 正在运行、%d 端口在监听%s。", port, errSuffix(perr))
-	default:
-		b.WriteString("\n该状态码不是站点 vhost 的隐藏文件规则给出的，" +
-			"通常意味着自定义配置（extra_conf）覆盖了 `location ~ /\\.`，请检查后重试。")
 	}
 	return errors.New(b.String())
 }

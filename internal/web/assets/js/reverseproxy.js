@@ -11,7 +11,7 @@
 //   3. **WebSocket**：默认开。关掉它，带界面的服务会"能打开但用不了"。
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
+import { h, clear, toast, modal, confirmBox, appendAll, failureToast } from './ui.js';
 import { registerCleanup } from './app.js';
 // 证书列表的归一化与"按域名挑证书"直接复用「SSL 证书」页的纯函数：
 // 反代与站点两侧必须用同一套匹配规则，否则同一个域名在两个页面会选到不同证书。
@@ -410,7 +410,7 @@ export function ReverseProxyView(content, ctx = {}) {
       toast(it.enabled ? '已停用（nginx 配置已移除）' : '已启用', 'ok');
       load();
     } catch (e) {
-      toast('操作失败：' + e.message, 'err', 10000);
+      failureToast(e, 14000);
     }
   }
 
@@ -840,8 +840,8 @@ export function ReverseProxyView(content, ctx = {}) {
             try {
               saved = isNew ? await api.proxyCreate(payload) : await api.proxyUpdate(it.id, payload);
             } catch (e) {
-              // 后端的校验/冲突信息是给用户看的，原样弹出来
-              toast(e.message, 'err', 12000);
+              // 后端的校验/冲突信息是给用户看的：首行结论 + 详情折叠（坑 211）
+              failureToast(e, 16000);
               return;
             }
 

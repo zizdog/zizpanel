@@ -43,10 +43,29 @@ func stubProxyHooks(t *testing.T) *proxyTestHooks {
 	h := &proxyTestHooks{}
 	prevProbe, prevReload, prevChown := proxyProbeFn, proxyReloadFn, proxyChownLogsFn
 	prevWrite, prevWait, prevEvery, prevSettle := proxyWriteVhostFn, proxyVerifyWait, proxyVerifyEvery, proxyLogSettle
+	// 失败后的健康探测/恢复动作也必须可注入：否则会真的去 reload 真机 nginx。
+	prevHealthProbe, prevHealthReload, prevHealthRestart := nginxHealthProbeFn, nginxHealthReloadFn, nginxHealthRestartFn
+	prevRootOwned := nginxRootOwnedFilesFn
 	t.Cleanup(func() {
 		proxyProbeFn, proxyReloadFn, proxyChownLogsFn = prevProbe, prevReload, prevChown
 		proxyWriteVhostFn, proxyVerifyWait, proxyVerifyEvery, proxyLogSettle = prevWrite, prevWait, prevEvery, prevSettle
+		nginxHealthProbeFn, nginxHealthReloadFn, nginxHealthRestartFn = prevHealthProbe, prevHealthReload, prevHealthRestart
+		nginxRootOwnedFilesFn = prevRootOwned
 	})
+	// 默认：探测认为 nginx 在应答（分到"配置已写入但未生效"），且不发现 root 属主文件。
+	nginxHealthProbeFn = func(context.Context, string, int) (string, error) {
+		h.Order = append(h.Order, "health-probe")
+		return "200", nil
+	}
+	nginxHealthReloadFn = func(*Server, context.Context) error {
+		h.Order = append(h.Order, "health-reload")
+		return nil
+	}
+	nginxHealthRestartFn = func(*Server, context.Context) error {
+		h.Order = append(h.Order, "health-restart")
+		return nil
+	}
+	nginxRootOwnedFilesFn = func(*Server) []string { return nil }
 
 	proxyWriteVhostFn = func(*Server, context.Context, string, string) error {
 		h.Order = append(h.Order, "write")
@@ -228,10 +247,24 @@ func TestApplyProxyFailsWhenConfigNotLoaded(t *testing.T) {
 	if err == nil {
 		t.Fatal("配置没生效时必须返回错误，不能只记日志")
 	}
-	for _, want := range []string{"没有生效", "访问日志", "root"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("错误信息里应说明 %q，实际：%v", want, err)
+	msg := err.Error()
+	// 第一行必须是分类结论（≤40 字），细节在后。
+	first := strings.SplitN(msg, "\n", 2)[0]
+	if !strings.Contains(first, "nginx 无响应") || len([]rune(first)) > 40 {
+		t.Errorf("第一行应当是 ≤40 字的分类结论，实际：%q", first)
+	}
+	for _, want := range []string{"没有生效", "访问日志"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息里应说明 %q，实际：%v", want, msg)
 		}
+	}
+	// nginx 无响应必须真的恢复并复核（健康探测返回 200 → reload 后恢复）。
+	if !strings.Contains(strings.Join(h.Order, ","), "health-reload") {
+		t.Errorf("nginx 无响应时必须真的尝试恢复，实际调用顺序 = %v", h.Order)
+	}
+	// 没有发现 root 属主文件时，不得出现无证据的猜测。
+	if strings.Contains(msg, "属主是 root") || strings.Contains(msg, "日志属主") {
+		t.Errorf("未发现 root 属主文件时不得出现该提示，实际：%s", msg)
 	}
 	// chown 仍然必须在 reload 之前（即使复核失败）。
 	if len(h.Order) < 2 || h.Order[0] != "write" || h.Order[1] != "chown" {
@@ -261,8 +294,8 @@ func TestReloadProxyAndVerifyRejectsDefaultSitePage(t *testing.T) {
 	}
 }
 
-// TestReloadProxyAndVerifyPropagatesReloadError：reload 本身失败要原样上报，
-// 且此时不该去做复核（省得把"重载失败"误说成"复核失败"）。
+// TestReloadProxyAndVerifyPropagatesReloadError：reload 本身失败要原样上报；
+// 失败后按有界探测分类（这里 nginx 仍在应答 → "配置已写入但未生效"），不做恢复动作。
 func TestReloadProxyAndVerifyPropagatesReloadError(t *testing.T) {
 	srv := newProxyTestServer(t)
 	h := stubProxyHooks(t)
@@ -276,8 +309,14 @@ func TestReloadProxyAndVerifyPropagatesReloadError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "nginx 重载失败") {
 		t.Fatalf("reload 失败时应返回明确错误，实际：%v", err)
 	}
-	if !reflect.DeepEqual(h.Order, []string{"chown", "reload"}) {
-		t.Errorf("调用顺序 = %v，期望 chown → reload（失败就不探测）", h.Order)
+	if first := strings.SplitN(err.Error(), "\n", 2)[0]; first != "配置已写入但未生效" {
+		t.Errorf("nginx 仍在应答时的结论应当是「配置已写入但未生效」，实际第一行：%q", first)
+	}
+	// reload 失败就不做请求级复核；失败后只探一次健康，且不触发恢复。
+	for _, step := range h.Order {
+		if step == "probe" || step == "health-reload" || step == "health-restart" {
+			t.Errorf("不该出现 %s，实际调用顺序 = %v", step, h.Order)
+		}
 	}
 }
 

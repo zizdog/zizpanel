@@ -132,6 +132,35 @@ export function toast(message, type = 'info', timeout = 4200) {
   return node;
 }
 
+/**
+ * failureToast(err, timeout) —— 失败回执的分级展示（坑 211）。
+ * 后端约定：错误消息**首行**是用户可见结论（≤40 字），其余是排查细节。
+ * 这里只显示结论，细节折叠进「详情」，避免一坨几十行文字糊在提示里。
+ */
+export function failureToast(err, timeout = 20000) {
+  const raw = String((err && err.message) || err || '');
+  const nl = raw.indexOf('\n');
+  const head = (nl >= 0 ? raw.slice(0, nl) : raw).trim();
+  const rest = (nl >= 0 ? raw.slice(nl + 1) : '').trim();
+  const node = toast(head, 'err', timeout);
+  if (rest) {
+    const msgBox = node.querySelector('.msg');
+    if (msgBox) {
+      msgBox.appendChild(h('details', { style: { marginTop: '4px' } }, [
+        h('summary', { text: '详情', style: { cursor: 'pointer', opacity: '0.85' } }),
+        h('pre', {
+          text: rest,
+          style: {
+            whiteSpace: 'pre-wrap', margin: '4px 0 0', fontSize: '11.5px',
+            maxHeight: '40vh', overflow: 'auto',
+          },
+        }),
+      ]));
+    }
+  }
+  return node;
+}
+
 // ---------------- 弹窗 ----------------
 
 /**

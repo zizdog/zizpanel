@@ -2618,30 +2618,43 @@ func (s *Server) waitProxyServed(ctx context.Context, rule *proxies.Rule) proxyS
 func (s *Server) reloadProxyAndVerify(ctx context.Context, rule *proxies.Rule) error {
 	proxyChownLogsFn(s)
 	if err := proxyReloadFn(s, ctx); err != nil {
-		return fmt.Errorf("配置已写入，但 nginx 重载失败: %w", err)
+		verdict := s.classifyApplyFailure(ctx, probeProxyScheme(rule), rule.Listen, "", false)
+		msg := verdict.Summary + "\n" + fmt.Sprintf("规则「%s」的配置已写入，但 nginx 重载失败: %v",
+			rule.Name, err)
+		if note := recoveryNote(verdict); note != "" {
+			msg += "\n" + note
+		}
+		if hint := s.rootOwnedNginxHint(); hint != "" {
+			msg += "\n" + hint
+		}
+		return errors.New(msg)
 	}
 	chk := s.waitProxyServed(ctx, rule)
 	if !chk.Served {
+		verdict := s.classifyApplyFailure(ctx, probeProxyScheme(rule), rule.Listen, chk.Probe.code, true)
 		why := "以 Host=" + proxyProbeHost(rule) + " 请求 127.0.0.1:" +
 			strconv.Itoa(rule.Listen) + proxyProbePath(rule) + " 得到 " +
 			describeProxyProbe(chk.Probe, rule)
 		if !chk.LogGrew {
 			why += "，且该规则自己的访问日志 " + chk.LogPath + " 没有任何新增"
 		}
-		msg := fmt.Sprintf(
+		msg := verdict.Summary + "\n" + fmt.Sprintf(
 			"规则「%s」的配置已写入，nginx 重载也已发出，但 %s 内新配置仍未生效"+
-				"（复核发现新配置没有生效）：%s。"+
-				"最常见的原因是日志文件属主是 root（写 vhost 时以 root 跑过 `nginx -t`，"+
-				"它会在 %s 下创建 root 属主的日志），以真实用户运行的 nginx 打不开它们 → "+
-				"reload 失败而退出码仍是 0。请依次检查："+
+				"（复核发现新配置没有生效）：%s。请依次检查："+
 				"① `nginx -t` 是否通过；"+
 				"② `ps -o user,pid,command -p $(cat %s)` 里的用户能否读 %s；"+
 				"③ vhost %s 是否被 %s 的 include 覆盖；"+
 				"④ 全局 error_log：`tail -n 20 %s` 看有没有 [emerg]。",
-			rule.Name, humanWait(proxyVerifyWait), why, filepath.Dir(chk.LogPath),
+			rule.Name, humanWait(proxyVerifyWait), why,
 			filepath.Join(s.Cfg.BrewPrefix, "var", "run", "nginx.pid"), chk.LogPath,
 			filepath.Join(s.Cfg.VhostDir, rule.VhostName()+".conf"), s.Cfg.NginxConf,
 			filepath.Join(s.Cfg.BrewPrefix, "var", "log", "nginx", "error.log"))
+		if note := recoveryNote(verdict); note != "" {
+			msg += "\n" + note
+		}
+		if hint := s.rootOwnedNginxHint(); hint != "" {
+			msg += "\n" + hint
+		}
 		if tail := s.nginxErrorLogTail(5); tail != "" {
 			msg += "\n（nginx error_log 末几行）\n" + tail
 		}
@@ -2753,8 +2766,7 @@ func (s *Server) verifyProxyTLSServed(ctx context.Context, rule *proxies.Rule) e
 	info, derr := proxyTLSPeerFn(ctx, rule.Listen, proxyTLSServerName(rule), proxyProbeTimeout)
 	if derr != nil {
 		return fmt.Errorf("规则「%s」的 HTTPS 复核失败：在 127.0.0.1:%d 上做 TLS 握手时 %v。"+
-			"最常见的原因是 nginx 没有真正重载（证书文件属主是 root 时，以普通用户运行的 nginx "+
-			"读不到它 → reload 失败但退出码仍是 0），或该端口上的默认 server 抢先应答了。"+
+			"多半是 nginx 没有真正重载，或该端口上的默认 server 抢先应答了。"+
 			"请到「日志中心 → nginx error_log」看 [emerg] 行",
 			rule.Name, rule.Listen, derr)
 	}
@@ -2801,7 +2813,7 @@ func (s *Server) waitProxyGone(ctx context.Context, rule *proxies.Rule) error {
 			return fmt.Errorf(
 				"规则「%s」的 nginx 配置已删除、重载命令也返回成功，但等待 %s 后复核发现"+
 					"**它仍在生效**（每次请求后它自己的访问日志 %s 仍在增长，最后一次响应 %s）。"+
-					"这通常意味着 nginx 没有真正重载（日志属主是 root 时 reload 会失败但退出码仍是 0）。"+
+					"这通常意味着 nginx 没有真正重载（reload 失败时退出码可能仍是 0）。"+
 					"请检查：`nginx -t`、`ps -o user,pid,command -p $(cat %s)` 的运行用户权限、"+
 					"以及全局 error_log（`tail -n 20 %s`）里的 [emerg]。",
 				rule.Name, humanWait(proxyVerifyWait), logPath, describeProxyProbe(last, rule),
