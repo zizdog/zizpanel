@@ -38,7 +38,7 @@ func TestWSUpgradeFailureTellsUserWhatToDo(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/api/v1/terminal/ws", nil)
 			if c.trail {
-				r.Header.Set("X-Forwarded-For", "10.0.0.9")
+				r.Header.Set("X-Forwarded-For", "203.0.113.9")
 			}
 			v := wsUpgradeFailure(r, c.err)
 			if v.Advice != c.advice {
@@ -59,7 +59,7 @@ func TestWSUpgradeFailureTellsUserWhatToDo(t *testing.T) {
 	// 两类结论都必须能照着做：反代类要点出 WebSocket 透传与那两个头，
 	// 直连类要点出"换浏览器/直连"。
 	proxyReq := httptest.NewRequest(http.MethodGet, "/api/v1/terminal/ws", nil)
-	proxyReq.Header.Set("Forwarded", "for=10.0.0.9")
+	proxyReq.Header.Set("Forwarded", "for=203.0.113.9")
 	pv := wsUpgradeFailure(proxyReq, errWSNoConnectionUpgrade)
 	for _, need := range []string{"WebSocket 透传", "proxy_set_header Upgrade", "proxy_set_header Connection", "map $http_upgrade"} {
 		if !strings.Contains(pv.Detail, need) {
@@ -79,7 +79,7 @@ func TestHasProxyTrail(t *testing.T) {
 		if hasProxyTrail(r) {
 			t.Errorf("%s 未设置却判成有反代痕迹", k)
 		}
-		r.Header.Set(k, "10.0.0.9")
+		r.Header.Set(k, "203.0.113.9")
 		if !hasProxyTrail(r) {
 			t.Errorf("%s 有值却没认出来", k)
 		}
@@ -136,7 +136,7 @@ func TestTerminalWSRejectTellsUserWhatToDo(t *testing.T) {
 		trail  string
 		advice string
 	}{
-		{"经反代", "10.0.0.9", wsAdviceProxy},
+		{"经反代", "203.0.113.9", wsAdviceProxy},
 		{"直连", "", wsAdviceDirect},
 	} {
 		t.Run(c.name, func(t *testing.T) {
