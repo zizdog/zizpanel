@@ -205,6 +205,13 @@ cat > "$STUB/codesign" <<'STUBEOF'
 echo "signed"; exit 0
 STUBEOF
 
+# security 桩：卸载脚本会撤销代码签名证书信任，绝不能碰真实钥匙串
+cat > "$STUB/security" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "security $*" >> "${SANDBOX}/security.log"
+exit 0
+STUBEOF
+
 # df/id/other 保持真实；oepnssl 不需要
 chmod +x "$STUB"/*
 export SANDBOX
@@ -653,12 +660,50 @@ done
 echo "$health2" | grep -q '"status":"ok"' && pass "升级后面板仍可访问" || fail "升级后面板不可访问"
 
 # ---------------------------------------------------------------- 卸载 --
-step "卸载流程（保留数据）"
-# 先停掉桩 launchctl 管理的进程，避免端口残留
-if ZIZPANEL_SANDBOX=1 bash "$SANDBOX/root/uninstall.sh" > "$SANDBOX/uninstall.log" 2>&1; then
-  pass "卸载脚本退出码 0"
+step "卸载流程（模式 1：仅卸载面板，保留数据）"
+
+# 单一真源：安装出的卸载脚本必须与仓库根 uninstall.sh **逐字节一致**
+# （防"生成版"与"仓库版"语义漂移 —— 历史上就漂过一次）。
+if cmp -s "$REPO/uninstall.sh" "$SANDBOX/root/uninstall.sh"; then
+  pass "安装出的卸载脚本与仓库 uninstall.sh 一致"
 else
-  fail "卸载脚本失败："
+  fail "安装出的卸载脚本与仓库 uninstall.sh 不一致（检查 write_uninstaller 嵌入块）"
+fi
+
+# 三档卸载器要一个**可读的**登记表才能跑模式 3；沙箱里放一份空的，
+# 避免误读真实登记表（那上面有用户自己的服务与真实路径）。
+UNINST_DB="$SANDBOX/uninstall-registry.db"
+rm -f "$UNINST_DB"
+sqlite3 "$UNINST_DB" "CREATE TABLE services (name TEXT, display_name TEXT, kind TEXT, category TEXT, managed INTEGER, launch_label TEXT, plist_path TEXT, work_dir TEXT, compose_file TEXT, container TEXT);" 2>/dev/null || true
+mkdir -p "$SANDBOX/homebrew/bin" "$SANDBOX/home"
+cat > "$SANDBOX/homebrew/bin/brew" <<'BREWEOF'
+#!/usr/bin/env bash
+echo "brew $*" >> "${SANDBOX}/uninstall-brew.log"
+exit 0
+BREWEOF
+chmod +x "$SANDBOX/homebrew/bin/brew"
+UNINST_ENV=(ZIZPANEL_SANDBOX=1 "ZIZPANEL_BREW_PREFIX=$SANDBOX/homebrew" "ZIZPANEL_REAL_HOME=$SANDBOX/home" "ZIZPANEL_DB_FILE=$UNINST_DB")
+
+# 新入口必须认三档与 --dry-run（旧生成版只认 --purge）
+for m in 1 2 3; do
+  if env "${UNINST_ENV[@]}" bash "$SANDBOX/root/uninstall.sh" --mode "$m" --dry-run > "$SANDBOX/uninstall-dry-$m.log" 2>&1; then
+    pass "卸载脚本 --mode $m --dry-run 可用"
+  else
+    fail "卸载脚本 --mode $m --dry-run 失败（$SANDBOX/uninstall-dry-$m.log）"
+  fi
+done
+# 向后兼容：--purge == --mode 3
+if env "${UNINST_ENV[@]}" bash "$SANDBOX/root/uninstall.sh" --purge --dry-run > "$SANDBOX/uninstall-purge.log" 2>&1 \
+   && grep -q "模式：3" "$SANDBOX/uninstall-purge.log"; then
+  pass "--purge 向后兼容映射到模式 3"
+else
+  fail "--purge 未映射到模式 3（$SANDBOX/uninstall-purge.log）"
+fi
+
+if env "${UNINST_ENV[@]}" bash "$SANDBOX/root/uninstall.sh" --mode 1 --yes > "$SANDBOX/uninstall.log" 2>&1; then
+  pass "卸载脚本（模式 1）退出码 0"
+else
+  fail "卸载脚本（模式 1）失败："
   tail -15 "$SANDBOX/uninstall.log" | sed 's/^/      /'
 fi
 [ ! -f "$ZIZPANEL_PLIST_DIR/cn.zizpanel.panel.plist" ] && pass "plist 已移除" || fail "plist 未移除"
@@ -666,20 +711,20 @@ fi
 [ ! -f "$SANDBOX/root/bin/zizpanel" ] && pass "程序已移除" || fail "程序未移除"
 [ -f "$SANDBOX/root/data/config.json" ] && pass "数据按预期保留（卸载不删数据）" || fail "数据被意外删除"
 
-step "彻底卸载（--purge）"
-# 重新安装一次再 purge。
-# 安装日志写进沙箱；purge 日志另存一份到固定路径 —— 因为 --purge 成功时会
+step "彻底卸载（模式 3）"
+# 重新安装一次再跑模式 3。
+# 安装日志写进沙箱；模式 3 日志另存一份到固定路径 —— 因为成功时会
 # 把沙箱删掉，失败时 sandbox 里那份也常常跟着没（排障时最需要它）。
 bash "$INSTALL_SH" > "$SANDBOX/install-3.log" 2>&1 || true
 PURGE_LOG="/tmp/zizpanel-purge.log"
-if ZIZPANEL_SANDBOX=1 bash "$SANDBOX/root/uninstall.sh" --purge > "$PURGE_LOG" 2>&1; then
+if env "${UNINST_ENV[@]}" bash "$SANDBOX/root/uninstall.sh" --mode 3 --yes > "$PURGE_LOG" 2>&1; then
   if [ ! -d "$SANDBOX/root" ]; then
-    pass "--purge 彻底删除安装目录"
+    pass "模式 3 彻底删除安装目录"
   else
-    fail "--purge 后目录仍存在"
+    fail "模式 3 后目录仍存在"
   fi
 else
-  fail "--purge 执行失败（日志：${PURGE_LOG}）"
+  fail "模式 3 执行失败（日志：${PURGE_LOG}）"
   sed 's/^/      /' "$PURGE_LOG" 2>/dev/null | tail -15
   if [ -f "$SANDBOX/install-3.log" ]; then
     printf '      重新安装日志（$SANDBOX/install-3.log）末尾：\n'

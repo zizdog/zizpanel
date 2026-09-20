@@ -113,12 +113,12 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@unformatted=$$(gofmt -l . | grep -v '^$$' || true); \
 	 if [ -n "$$unformatted" ]; then echo "以下文件需要 gofmt："; echo "$$unformatted"; exit 1; fi
 	@echo "==> shell 语法检查"
-	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && bash -n tools/seed-nas-brew.sh && echo "shell 语法 OK"
+	@bash -n install.sh && bash -n uninstall.sh && bash -n tools/sandbox-install-test.sh && bash -n tools/takeover-panel-entry.sh && bash -n tools/server-mode.sh && bash -n tools/server-mode-test.sh && bash -n tools/serve-for-install.sh && bash -n tools/install-from-remote.sh && bash -n tools/remote-install-test.sh && bash -n tools/upgrade-e2e.sh && bash -n tools/sync-nas-apps.sh && bash -n tools/check-no-real-credentials.sh && bash -n tools/publish-release.sh && bash -n tools/seed-nas-brew.sh && bash -n tools/sync-embedded-uninstaller.sh && bash -n tools/uninstall-modes-test.sh && echo "shell 语法 OK"
 	@echo "==> shell 变量引用检查（防多字节变量名 bug）"
-	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh tools/seed-nas-brew.sh
+	@python3 tools/check-shell-vars.py install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh
 	@echo "==> shellcheck"
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh tools/seed-nas-brew.sh || exit 1; \
+	   shellcheck -S warning -e SC1091 install.sh uninstall.sh tools/sandbox-install-test.sh tools/takeover-panel-entry.sh tools/server-mode.sh tools/server-mode-test.sh tools/serve-for-install.sh tools/install-from-remote.sh tools/remote-install-test.sh tools/upgrade-e2e.sh tools/check-test-pollution.sh tools/sync-nas-apps.sh tools/check-no-real-credentials.sh tools/publish-release.sh tools/seed-nas-brew.sh tools/sync-embedded-uninstaller.sh tools/uninstall-modes-test.sh || exit 1; \
 	 else echo "（未安装 shellcheck，跳过：brew install shellcheck）"; fi
 	@# 真实口令不许进仓库 —— 这条坑复发过两次（v0.3.1 基线 + 第九轮新增文件），
 	@# 所以做成门禁而不是靠人记。没有凭据文件时它明确打印"跳过"，不假装通过。
@@ -164,6 +164,8 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory install-test
 	@echo "==> 远程一键安装测试（本地 HTTP 服务 + 沙箱）"
 	@$(MAKE) --no-print-directory remote-test
+	@echo "==> 三档卸载脚本沙箱测试"
+	@$(MAKE) --no-print-directory uninstall-test
 	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
 	@$(MAKE) --no-print-directory server-mode-test
 	@bash tools/check-stamp.sh write
@@ -172,6 +174,10 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 .PHONY: install-test
 install-test: ## 安装脚本端到端测试（沙箱，无需 root）
 	@bash tools/sandbox-install-test.sh
+
+.PHONY: uninstall-test
+uninstall-test: ## 三档卸载脚本沙箱测试（无需 root，不碰真机）
+	@bash tools/uninstall-modes-test.sh
 
 .PHONY: remote-test
 remote-test: ## 远程一键安装测试：构建 → 本地 HTTP 共享 → 下载 → 沙箱安装
@@ -527,7 +533,7 @@ install: dev ## 本机安装（需要管理员权限）
 	sudo bash install.sh
 
 .PHONY: uninstall
-uninstall: ## 卸载面板（保留数据）
+uninstall: ## 卸载面板（交互菜单选 1/2/3 三档）
 	sudo bash /opt/zizpanel/uninstall.sh
 
 .PHONY: status
