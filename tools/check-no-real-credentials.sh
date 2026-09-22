@@ -24,10 +24,18 @@ if [ ! -f "$CRED_FILE" ]; then
   exit 0
 fi
 
-# 收集凭据字面值（长度 >= 6 才检查，避免把 "admin" 这类通用词当成口令）
+# 收集凭据字面值。只认**像秘密**的键（*PASS*/*SECRET*/*TOKEN*/*KEY*）：
+# 凭据文件里还有用户名与 URL（如 zizdog、https://panel.zizdog.com:8888）—— 那些不是秘密，
+# 拿它们去搜会把每一份提到域名的文件都判成泄漏（2026-09-22 实测：281 个假红）。
+# 值去掉两端的引号（文件里写 ZP_MINI_PASS='…' 时，要搜的是引号里的那个串）。
 VALUES=()
 while IFS='=' read -r _k v; do
+  case "$_k" in
+    *PASS*|*PASSWORD*|*SECRET*|*TOKEN*|*KEY*) ;;
+    *) continue ;;
+  esac
   v="${v%$'\r'}"
+  v="${v#\'}"; v="${v%\'}"; v="${v#\"}"; v="${v%\"}"
   [ "${#v}" -ge 6 ] && VALUES+=("$v")
 done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$CRED_FILE" 2>/dev/null || true)
 
