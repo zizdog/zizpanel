@@ -109,6 +109,9 @@ type MarketUpstream struct {
 	// 声明了 Repo 时：URL 必须等于 releaseURL() 拼出来的官方地址（防手抄错），
 	// 且 release 二进制条目还要与 ReleaseBinaryAssets() 注册表交叉校验。
 	Repo, Tag, Asset string
+	// Dynamic 表示版本/文件名由镜像上的**应用级索引**运行时决定，面板不写死 Tag/Asset
+	// （改这个应用不必再发面板版本）。此时 URL 必须指向索引，声明与注册表不逐字比对。
+	Dynamic bool
 	// Size 是已知字节数；**0 = 未知（不许猜）**。非 0 时必须在 Note 里写清
 	// 是"实测"还是"上游声明"。
 	Size int64
@@ -1382,33 +1385,32 @@ var marketDownloadApps = []MarketApp{
 			LabelSource: "目录 ServiceLabel（系统级 LaunchDaemon；可执行文件是面板自身的 zizvideo-supervise）",
 		},
 		// 二进制**不随面板包分发**（2026-09-22 用户决定，面板包因此小 ~17 MB）：
-		// 安装时从镜像站按需下载裸二进制（不打包 —— 归档 MTIME 会让 sha256 漂移）。
+		// 版本/文件名/sha256 由镜像上的**应用级索引** apps/zizvideo/manifest.json 运行时决定，
+		// 安装器只读它 —— 改 zizvideo 只要 make release + 传产物 + 更新索引，不必再发面板版本。
 		Downloads: []MarketDownloadPoint{
 			{
 				Purpose: MarketFetchReleaseBinary,
-				Label:   "下载 " + ZizvideoArtifactName(ZizvideoVersion),
+				Label:   "下载 zizvideo 应用包（版本由镜像索引决定）",
 				Upstream: MarketUpstream{
-					ID:  "自建镜像 apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion),
-					URL: "https://mirror.zizdog.com:8888/apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion),
-					// Tag/Asset 必须与 ReleaseBinaryAssets() 注册表逐字一致（门禁比对）；
-					// **不填 Repo**：它不是 GitHub release 产物（自研产物）。
-					Tag:   ZizvideoVersion,
-					Asset: ZizvideoArtifactName(ZizvideoVersion),
+					ID:  "自建镜像 apps/zizvideo/manifest.json（应用级索引）",
+					URL: DefaultMirrorIndexURL(ZizvideoAppID),
+					// Dynamic：Tag/Asset 留空是**刻意的**，版本在运行期从索引解析。
+					Dynamic: true,
 					Note: "本仓库自己编的 darwin/arm64 裸二进制（make release 产出）；" +
-						"**镜像站是唯一来源**，没有 GitHub/公网回落 —— 镜像不可达时这一步如实失败",
+						"**索引与产物都以镜像站为唯一来源**，没有 GitHub/公网回落 —— 索引不可达时这一步如实失败" +
+						"（面板内置常量只做已知可用兜底）",
 				},
-				NAS:      nasMirrored("apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion)),
+				NAS:      nasMirrored("apps/zizvideo/manifest.json"),
 				Timeout:  5 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
-					Asset:  "镜像站 manifest.json",
-					SHA256: ZizvideoBinarySHA256,
-					Source: "make release 实测 sha256（运行期优先取镜像站 manifest.json 的值）",
-					Note:   "下载后**安装之前**核对 sha256；随后还有 file(1) 的 arm64 复核与 `zizvideo --version` 的版本复核",
+					Asset: "镜像站 apps/zizvideo/manifest.json（含每个 asset 的 sha256）",
+					Note: "sha256 由索引里对应 asset 的 sha256 字段给出（安装时读取）；下载后**安装之前**核对，" +
+						"随后还有 file(1) 的 arm64 复核与 `zizvideo --version` 的版本复核",
 				},
 				ARM64: "产物由本仓库 CGO_ENABLED=0 GOARCH=arm64 编译；安装时用 file(1) 复核 Mach-O arm64，" +
 					"并用 `zizvideo --version` 复核版本",
-				Note: "镜像不可达时如实失败并提示同步镜像（make sync-apps）；它没有公网回落地址",
+				Note: "镜像不可达时如实失败并提示同步镜像（make release + 传 apps/zizvideo/）；它没有公网回落地址",
 			},
 		},
 		Note: "服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码要求 ⇒ " +
@@ -2183,7 +2185,14 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 			}
 		}
 		if d.Purpose == MarketFetchReleaseBinary {
-			if releaseRef == nil {
+			// Dynamic：版本/文件名由镜像索引运行时决定 ⇒ 不再与注册表写死的 Tag/Asset 逐字比对
+			//（注册表里这类条目本身就没有 Tag/Asset）。非 Dynamic 条目这条判据**一点不放宽**。
+			if d.Upstream.Dynamic {
+				if !strings.HasSuffix(strings.TrimSpace(d.Upstream.URL), "/"+mirrorManifestName) {
+					add("%s: Dynamic 条目的 URL 必须指向镜像上的应用级索引（以 /%s 结尾），现在是 %q",
+						where, mirrorManifestName, d.Upstream.URL)
+				}
+			} else if releaseRef == nil {
 				add("%s: 声明成 release 二进制，但安装器注册表 ReleaseBinaryAssets() 里**没有** %s —— "+
 					"这种错配会表现为「条目在市场里、装的却是别的东西」", where, m.ID)
 			} else {

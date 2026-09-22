@@ -44,6 +44,9 @@ const (
 	mirrorAppsDir = "apps"
 	// mirrorManifestName 是每个"应用 + 版本"目录下的清单名。
 	mirrorManifestName = "manifest.json"
+	// publicMirrorBase 是公网镜像站基址（与 config.DefaultMirrorBase 同一个值；
+	// services 不 import config，所以在这里留一份给同步/审计/市场声明用）。
+	publicMirrorBase = "https://mirror.zizdog.com:8888"
 	// mirrorDefaultProbeSeconds 是探测超时的兜底值（Options.MirrorProbeSeconds <=0 时用）。
 	mirrorDefaultProbeSeconds = 4
 )
@@ -70,6 +73,8 @@ type ReleaseBinaryAsset struct {
 	ChecksumAsset string `json:"checksum_asset,omitempty"`
 	// UpstreamURL 是官方下载地址（同步工具用它去上游取包）。
 	UpstreamURL string `json:"upstream_url"`
+	// Dynamic 表示版本/文件名由镜像索引运行时决定：Tag/Asset 为空，UpstreamURL 是索引地址。
+	Dynamic bool `json:"dynamic,omitempty"`
 }
 
 // ReleaseBinaryAssets 导出注册表里全部"官方 release 原生二进制"应用的下载信息。
@@ -80,14 +85,25 @@ type ReleaseBinaryAsset struct {
 func ReleaseBinaryAssets() []ReleaseBinaryAsset {
 	out := make([]ReleaseBinaryAsset, 0, len(releaseBinaryApps))
 	for _, spec := range releaseBinaryApps {
+		upstream := spec.releaseURL()
+		if spec.Dynamic {
+			// 版本/文件名由镜像索引运行时决定：给出索引地址，产物由 make release 产出后手工上传。
+			upstream = DefaultMirrorIndexURL(spec.ID)
+		}
 		out = append(out, ReleaseBinaryAsset{
 			ID: spec.ID, Name: spec.Name, Repo: spec.Repo, Tag: spec.Tag,
 			Asset: spec.Asset, ChecksumAsset: spec.ChecksumAsset,
-			UpstreamURL: spec.releaseURL(),
+			UpstreamURL: upstream, Dynamic: spec.Dynamic,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// DefaultMirrorIndexURL 是应用级索引的**公网**地址（镜像同步/审计/市场声明用）。
+// 面板运行期读的是 m.opt.MirrorBase 下的同一路径，不用这个常量。
+func DefaultMirrorIndexURL(appID string) string {
+	return strings.Join([]string{publicMirrorBase, mirrorAppsDir, appID, mirrorManifestName}, "/")
 }
 
 // mirrorBase 返回生效的镜像基址（去掉末尾的 /）。

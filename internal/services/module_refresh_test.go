@@ -9,7 +9,10 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +68,28 @@ func moduleRefreshResultFor(t *testing.T, results []ModuleRefreshResult, name st
 	}
 	t.Fatalf("结果里没有模块 %s：%+v", name, results)
 	return ModuleRefreshResult{}
+}
+
+// zizvideoIndexServer 造一个只提供应用级索引的假镜像（latest 固定，sha 是占位值）。
+// 刷新路径只按"索引说的版本"决定是否替换，不会用到这个 sha。
+func zizvideoIndexServer(t *testing.T, latest string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apps/zizvideo/manifest.json" {
+			http.NotFound(w, r)
+			return
+		}
+		enc := json.NewEncoder(w)
+		_ = enc.Encode(map[string]any{
+			"app": "zizvideo", "latest": latest,
+			"assets": []map[string]any{{
+				"name": "zizvideo_" + latest + "_darwin_arm64", "version": latest,
+				"arch": "arm64", "sha256": strings.Repeat("0", 64), "size": 3,
+			}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
 // 门禁 ①：已安装且 sha 不同 ⇒ 备份 + 原子替换 + 自检 + 重启，并如实记录。
@@ -282,7 +307,7 @@ func TestModuleRefreshNeverTouchesModuleDataDir(t *testing.T) {
 	}
 }
 
-// 不随包分发的模块：按需取件失败要**如实失败**，且一个字节都不许改动安装位。
+// 不随包分发的模块：索引可达、但按需取件失败要**如实失败**，且一个字节都不许改动安装位。
 func TestModuleRefreshFailsHonestlyWhenFetchFails(t *testing.T) {
 	env := newModuleRefreshEnv(t)
 	installed := ZizvideoBin()
@@ -302,7 +327,9 @@ func TestModuleRefreshFailsHonestlyWhenFetchFails(t *testing.T) {
 	}
 	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
 
-	results := RefreshInstalledModules(context.Background(), env.panelDir)
+	// 索引说 0.2.0-index：解析成功 ⇒ 进入取件路径（取件失败必须如实报告）。
+	m := NewManager(nil, Options{MirrorBase: zizvideoIndexServer(t, "0.2.0-index")})
+	results := m.RefreshInstalledModules(context.Background(), env.panelDir)
 	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
 	if r.Status != ModuleFailed {
 		t.Fatalf("取件失败应如实失败，实际 %s（%s）", r.Status, r.Reason)
@@ -315,6 +342,50 @@ func TestModuleRefreshFailsHonestlyWhenFetchFails(t *testing.T) {
 	}
 	if got := readFileOrFail(t, installed); !strings.Contains(got, "old") {
 		t.Errorf("取件失败后安装位不该被改动：%q", got)
+	}
+}
+
+// 索引不可用 + 没有携带位 ⇒ 如实失败，一个字节都不许动已装二进制（绝不谎报"已是最新"）。
+func TestModuleRefreshFailsWhenIndexUnavailableAndNoBundle(t *testing.T) {
+	env := newModuleRefreshEnv(t)
+	installed := ZizvideoBin()
+	writeModuleFile(t, installed, "#!/bin/bash\necho 'zizvideo old'\n", 0o755)
+	writeModuleFile(t, SystemDaemonPlistPath(ZizvideoLabel), "<plist/>", 0o644)
+	before, err := fileSHA256(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	launched := false
+	zizvideoLaunch = func(*Manager, context.Context, string, string) error {
+		launched = true
+		return nil
+	}
+	moduleSelfCheckRun = func(*Manager, context.Context, string, ...string) (string, error) {
+		return "zizvideo 0.9.9", nil
+	}
+	// 没有配镜像基址 ⇒ 索引解析必然失败；携带位也不存在。
+	m := NewManager(nil, Options{})
+	results := m.RefreshInstalledModules(context.Background(), env.panelDir)
+	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
+	if r.Status != ModuleFailed {
+		t.Fatalf("索引不可用且无携带位时必须如实失败，实际 %s（%s）", r.Status, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "镜像索引不可用") || !strings.Contains(r.Reason, "未被改动") {
+		t.Errorf("失败原因要说清是索引不可用且安装位未动，实际 %q", r.Reason)
+	}
+	if launched {
+		t.Error("失败时不该重启守护进程")
+	}
+	after, err := fileSHA256(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Errorf("安装位二进制被改动了：before=%s after=%s", before, after)
+	}
+	if _, err := os.Stat(installed + ".bak"); err == nil {
+		t.Error("失败时不该产生备份")
 	}
 }
 
@@ -344,7 +415,9 @@ func TestModuleRefreshFetchesWhenNotBundled(t *testing.T) {
 	}
 	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
 
-	results := RefreshInstalledModules(context.Background(), env.panelDir)
+	// 索引版本 = 面板内置版本：自检桩对新二进制返回这个版本 ⇒ 应判刷新成功。
+	m := NewManager(nil, Options{MirrorBase: zizvideoIndexServer(t, ZizvideoVersion)})
+	results := m.RefreshInstalledModules(context.Background(), env.panelDir)
 	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
 	if r.Status != ModuleRefreshed {
 		t.Fatalf("应取件并刷新，实际 %s（%s）", r.Status, r.Reason)
@@ -357,7 +430,7 @@ func TestModuleRefreshFetchesWhenNotBundled(t *testing.T) {
 	}
 }
 
-// 已装的就是这一版期望的版本 ⇒ 不取件、零动作。
+// 已装的就是索引/内置期望的版本 ⇒ 不取件、零动作。
 func TestModuleRefreshSkipsFetchWhenVersionMatches(t *testing.T) {
 	env := newModuleRefreshEnv(t)
 	writeModuleFile(t, ZizvideoBin(), "#!/bin/bash\necho 'zizvideo old'\n", 0o755)
@@ -372,7 +445,8 @@ func TestModuleRefreshSkipsFetchWhenVersionMatches(t *testing.T) {
 	}
 	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
 
-	results := RefreshInstalledModules(context.Background(), env.panelDir)
+	m := NewManager(nil, Options{MirrorBase: zizvideoIndexServer(t, ZizvideoVersion)})
+	results := m.RefreshInstalledModules(context.Background(), env.panelDir)
 	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
 	if r.Status != ModuleUpToDate {
 		t.Fatalf("版本相同应零动作，实际 %s（%s）", r.Status, r.Reason)

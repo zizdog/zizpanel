@@ -205,3 +205,44 @@ func TestMarketAccessors(t *testing.T) {
 		t.Fatalf("MarketImageRef 解析错了：host=%q repo=%q tag=%q", host, repo, tag)
 	}
 }
+
+// TestMarketReleaseBinaryDynamicGateIsNarrow：Dynamic 的放宽只对 Dynamic 生效 ——
+// 非 Dynamic 的 Tag/Asset 与注册表不一致仍必须被抓到；Dynamic 的 URL 不指向索引也必须被抓到。
+func TestMarketReleaseBinaryDynamicGateIsNarrow(t *testing.T) {
+	frpc, ok := MarketAppFor("frpc")
+	if !ok {
+		t.Fatal("声明里没有 frpc")
+	}
+	frpcApp, ok := FindApp("frpc")
+	if !ok {
+		t.Fatal("目录里没有 frpc")
+	}
+	if problems := MarketDeclarationProblems(frpc, frpcApp); len(problems) != 0 {
+		t.Fatalf("基准 frpc 声明应干净：%v", problems)
+	}
+	bad := frpc
+	bad.Downloads = append([]MarketDownloadPoint(nil), frpc.Downloads...)
+	for i := range bad.Downloads {
+		if bad.Downloads[i].Purpose == MarketFetchReleaseBinary {
+			bad.Downloads[i].Upstream.Asset = "frp_0.0.0_darwin_arm64.tar.gz"
+		}
+	}
+	if problems := MarketDeclarationProblems(bad, frpcApp); len(problems) == 0 {
+		t.Fatal("非 Dynamic 的 asset 与注册表不一致必须报错（放宽只许对 Dynamic 生效）")
+	}
+
+	zz, ok := MarketAppFor("zizvideo")
+	if !ok {
+		t.Fatal("声明里没有 zizvideo")
+	}
+	zzApp, ok := FindApp("zizvideo")
+	if !ok {
+		t.Fatal("目录里没有 zizvideo")
+	}
+	badZ := zz
+	badZ.Downloads = append([]MarketDownloadPoint(nil), zz.Downloads...)
+	badZ.Downloads[0].Upstream.URL = DefaultMirrorIndexURL("zizvideo") + "/extra"
+	if problems := MarketDeclarationProblems(badZ, zzApp); len(problems) == 0 {
+		t.Fatal("Dynamic 条目的 URL 不指向索引（不以 /manifest.json 结尾）必须报错")
+	}
+}

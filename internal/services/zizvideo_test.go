@@ -534,9 +534,15 @@ func TestZizvideoMarketEntryIsWired(t *testing.T) {
 	if d.Purpose != MarketFetchReleaseBinary || !d.Required {
 		t.Errorf("下载点应是必需（Required）的原生产物：purpose=%s required=%v", d.Purpose, d.Required)
 	}
-	wantAsset := ZizvideoArtifactName(ZizvideoVersion)
-	if d.Upstream.Asset != wantAsset || !strings.Contains(d.Upstream.URL, "/apps/zizvideo/") {
-		t.Errorf("下载点应指向镜像站 %s，实际 asset=%q url=%q", wantAsset, d.Upstream.Asset, d.Upstream.URL)
+	if !d.Upstream.Dynamic {
+		t.Error("版本由镜像索引运行时决定，下载点必须标 Dynamic")
+	}
+	if !strings.HasSuffix(d.Upstream.URL, "/apps/zizvideo/manifest.json") {
+		t.Errorf("下载点应指向镜像应用级索引 apps/zizvideo/manifest.json，实际 url=%q", d.Upstream.URL)
+	}
+	if d.Upstream.Asset != "" || d.Upstream.Tag != "" {
+		t.Errorf("Dynamic 条目的 Tag/Asset 必须留空（否则又变成写死版本）：tag=%q asset=%q",
+			d.Upstream.Tag, d.Upstream.Asset)
 	}
 	if d.Upstream.Repo != "" {
 		t.Error("自研产物不是 GitHub release 产物，不该写 Repo")

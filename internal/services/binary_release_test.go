@@ -20,10 +20,10 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 		t.Fatal("releaseBinaryApps 为空")
 	}
 	for id, spec := range releaseBinaryApps {
-		// 上游命名不统一：frp / ddns-go / orbien 用下划线（darwin_arm64），
-		// Alist 用连字符（darwin-arm64）。判据是"确实是 macOS arm64 产物"，
-		// 所以两种写法都接受 —— 但不接受任何 amd64 / 其它平台的写法。
-		if !strings.Contains(spec.Asset, "darwin_arm64") && !strings.Contains(spec.Asset, "darwin-arm64") {
+		// Dynamic（zizvideo）：版本/文件名由镜像索引 apps/zizvideo/manifest.json 运行时决定
+		// ⇒ 这里**不再校验写死的 asset 名**（面板里根本没有这个名字）。其余条目一条不放宽。
+		// 非 Dynamic 条目：darwin_arm64 / darwin-arm64 两种写法都接受，amd64 一律不接受。
+		if !spec.Dynamic && !strings.Contains(spec.Asset, "darwin_arm64") && !strings.Contains(spec.Asset, "darwin-arm64") {
 			t.Errorf("%s 的产物 %q 不是 darwin-arm64", id, spec.Asset)
 		}
 		// MirrorOnly = 只在镜像站上的自研产物：没有 GitHub tag / 官方地址 /

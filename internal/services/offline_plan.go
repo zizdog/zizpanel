@@ -141,12 +141,6 @@ var offlineSelfContained = map[string]string{
 	// 不写这一条就会在报告里冒出一个假缺口，用户会去补一个根本不存在的东西。
 	"macspeech": "无需额外文件：合成引擎 /usr/bin/say 与转换工具 /usr/bin/afconvert 都是 macOS 自带的" +
 		"（不随离线包分发），网页界面由面板自己的二进制提供（cmd/zizpanel 的 speech-serve 子命令）",
-	// zizvideo（短视频）：二进制随**面板发布包**一起分发（make release 打进 tar 顶层的
-	// ./zizvideo），安装时只做本机复制 + 系统级 launchd 注册，不需要从网上取任何文件；
-	// 离线包里**已经有它**（就在面板安装包里）。列出来是为了不报告一个假缺口。
-	"zizvideo": "无需额外文件：zizvideo 二进制随面板发布包一起分发" +
-		"（发布包顶层的 ./zizvideo，装上后落在 <面板二进制目录>/zizvideo），" +
-		"安装只做本机复制 + launchd 注册；离线安装面板即已包含它",
 }
 
 // offlinePythonGaps 是面板自研 Python 安装器**已知还没镜像**的依赖。
@@ -289,7 +283,7 @@ func OfflinePlan() []OfflineAppPlan {
 		default: // KindNative
 			switch {
 			// MirrorOnly 的自研产物（zizvideo）不在这条轨：它没有公网地址，
-			// 产物由 make release 单独产出、sync-apps 同步到镜像站（见下面的缺口说明）。
+			// 版本/产物由 make release 的应用级索引决定（见下面的缺口说明）。
 			case app.PanelInstaller != "" && binByID[app.PanelInstaller].ID != "" && !binByID[app.PanelInstaller].MirrorOnly:
 				// 面板自研的 release 二进制安装器（frpc / orbien-client / ddns-go）
 				spec := binByID[app.PanelInstaller]
@@ -310,10 +304,10 @@ func OfflinePlan() []OfflineAppPlan {
 					p.InstallMethod = "panel_installer"
 				}
 				if app.ID == ZizvideoAppID {
-					// 它是自研产物、只在镜像站上：离线包不重复打包，但必须如实点名。
-					p.Gaps = append(p.Gaps, "zizvideo 的模块二进制由 make release 单独产出、"+
-						"make sync-apps 同步到 apps/zizvideo/"+ZizvideoVersion+"/（面板安装时按需下载）；"+
-						"离线模式下请确认镜像上已有这个文件，否则 zizvideo 装不上（这是缺口，不是'不需要'）")
+					// 版本/产物由镜像索引运行时决定：离线包必须自带索引与它点名的产物。
+					p.Gaps = append(p.Gaps, "zizvideo 的版本与产物由镜像索引 apps/zizvideo/manifest.json 决定，"+
+						"离线包需自带该索引与对应产物（make release 产出到 dist/apps/zizvideo/，"+
+						"把整目录传到镜像 apps/zizvideo/；只带二进制不带索引会装不上）")
 				}
 				if extra, ok := offlinePythonExtra[app.ID]; ok {
 					p.Artifacts = append(p.Artifacts, extra...)

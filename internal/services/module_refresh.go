@@ -50,8 +50,9 @@ type moduleSpec struct {
 	plist     string // launchd 作业定义（"装没装"的运行体判据之一）
 	selfArgs  []string
 	launch    func(m *Manager, ctx context.Context, label, plist string) error
-	// wantVersion 是这一版面板期望的模块版本（装到位后自检输出里应含它）。
-	wantVersion string
+	// resolveVersion 运行时解析这一版期望的模块版本（镜像索引优先）。
+	// 第二个返回值非空 = 索引不可用：有携带位就走旧逻辑，没有就如实失败，绝不谎报"已是最新"。
+	resolveVersion func(ctx context.Context) (string, error)
 	// fetch 是"不随包分发的模块"的按需取件（从镜像站下载并核 sha256）。
 	// 网络不可达时**如实失败**，绝不谎报"已是最新"。
 	fetch func(m *Manager, ctx context.Context, result *InstallResult) (string, error)
@@ -70,14 +71,20 @@ func (m *Manager) managedModuleSpecs(panelBinDir string) []moduleSpec {
 	zp := m.ZizvideoPathsFor()
 	return []moduleSpec{
 		{
-			name:        ZizvideoAppID,
-			label:       ZizvideoLabel,
-			bundled:     filepath.Join(panelBinDir, ZizvideoAppID),
-			installed:   zp.Bin,
-			plist:       zp.Plist,
-			selfArgs:    []string{"--version"},
-			wantVersion: ZizvideoVersion,
-			launch:      zizvideoLaunch,
+			name:      ZizvideoAppID,
+			label:     ZizvideoLabel,
+			bundled:   filepath.Join(panelBinDir, ZizvideoAppID),
+			installed: zp.Bin,
+			plist:     zp.Plist,
+			selfArgs:  []string{"--version"},
+			resolveVersion: func(ctx context.Context) (string, error) {
+				rel, err := m.resolveZizvideoRelease(ctx)
+				if err != nil {
+					return ZizvideoVersion, err
+				}
+				return rel.Version, nil
+			},
+			launch: zizvideoLaunch,
 			fetch: func(m *Manager, ctx context.Context, result *InstallResult) (string, error) {
 				return zizvideoModuleFetch(m, ctx, result)
 			},
@@ -110,15 +117,26 @@ func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) Modu
 		r.Reason = "未安装 " + spec.name + "（安装位二进制或守护进程不存在）"
 		return r
 	}
-	// ② 已装的就是这一版期望的版本 ⇒ 零动作（不下载、不替换、不重启）。
-	//
-	// 版本优先于 sha：机器上可能残留着旧发布包放下的携带位，光比 sha 会把
-	// "已装的是旧构建、携带位也是旧的" 判成最新（坑 216 的翻版）。
-	if spec.wantVersion != "" {
+	// ② 期望版本运行时解析（镜像索引优先）。已装的就是它 ⇒ 零动作（不下载、不替换、不重启）。
+	// 版本优先于 sha：残留的旧携带位会让"旧构建 + 旧携带位"被判成最新（坑 216 的翻版）。
+	wantVer := ""
+	var resolveErr error
+	if spec.resolveVersion != nil {
+		wantVer, resolveErr = spec.resolveVersion(ctx)
+	}
+	// 索引不可用 + 没有携带位：无法确定该装哪个版本，如实失败且一个字节都不动。
+	if resolveErr != nil && !fileExecutable(spec.bundled) {
+		r.Status = ModuleFailed
+		r.Reason = "镜像索引不可用（" + resolveErr.Error() + "），本地也没有携带位 " + spec.bundled +
+			"：无法确定该装哪个版本，已安装的 " + spec.name + " 未被改动"
+		return r
+	}
+	// 解析失败但有携带位：走旧逻辑（拿面板兜底版本比版本，再比 sha）。
+	if wantVer != "" {
 		if out, err := moduleSelfCheckRun(m, ctx, spec.installed, spec.selfArgs...); err == nil &&
-			strings.Contains(out, spec.wantVersion) {
+			strings.Contains(out, wantVer) {
 			r.Status = ModuleUpToDate
-			r.Reason = "已安装的 " + spec.name + " 就是 " + spec.wantVersion + "，未做任何改动"
+			r.Reason = "已安装的 " + spec.name + " 就是 " + wantVer + "，未做任何改动"
 			return r
 		}
 	}
@@ -177,8 +195,8 @@ func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) Modu
 
 	// ⑤ 自检：跑模块自己的版本命令；跑不起来、没有输出、或版本不是这一版期望的，都算失败。
 	ver, err := moduleSelfCheckRun(m, ctx, spec.installed, spec.selfArgs...)
-	if err == nil && spec.wantVersion != "" && !strings.Contains(ver, spec.wantVersion) {
-		err = fmt.Errorf("自检报的版本不是 %s（%s）", spec.wantVersion, tailText(strings.TrimSpace(ver), 120))
+	if err == nil && wantVer != "" && !strings.Contains(ver, wantVer) {
+		err = fmt.Errorf("自检报的版本不是 %s（%s）", wantVer, tailText(strings.TrimSpace(ver), 120))
 		ver = ""
 	}
 	if err != nil || strings.TrimSpace(ver) == "" {

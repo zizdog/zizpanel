@@ -81,6 +81,10 @@ type releaseBinaryApp struct {
 	// LaunchDaemon + 家目录安装"），由它自己的安装器负责；登记在这里是因为市场
 	// 门禁要求 release_binary 下载点在 ReleaseBinaryAssets() 里有一份可核对的事实。
 	MirrorOnly bool
+	// Dynamic 表示版本与产物名由镜像上的应用级索引 apps/<id>/manifest.json 运行时决定，
+	// 面板不写死 Tag/Asset（改这个应用只需更新索引 + 传产物，不必再发面板版本）。
+	// 只有 Dynamic 才允许 Tag/Asset 为空；其余条目仍按写死的 darwin-arm64 产物校验。
+	Dynamic bool
 }
 
 // webPort 返回网页界面/健康检查应当使用的端口（UIPort 为 0 时等于 Port）。
@@ -330,14 +334,13 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 	},
 	// zizvideo：本项目自研模块的产物，**只在公网镜像站上**（自 2026-09-22 起不随
 	// 面板包分发，面板包因此少了 ~17 MB 的模块二进制）。
-	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
-	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
+	// Dynamic：版本/文件名/sha256 由镜像索引 apps/zizvideo/manifest.json 运行时决定，
+	// 所以这里不写死 Tag/Asset/SHA256（改 zizvideo 不必再 bump 面板）。
 	// 安装/卸载走 zizvideo.go（系统级 LaunchDaemon，可执行文件是面板自身的
-	// zizvideo-supervise），不走这套通用流程。
+	// zizvideo-supervise），不走这套通用流程；登记它只为市场门禁与索引地址一致。
 	"zizvideo": {
 		ID: ZizvideoAppID, Label: ZizvideoLabel, Name: "zizvideo", Icon: "🎬",
-		Category: "tool", RootDir: "zizvideo", MirrorOnly: true,
-		Tag: ZizvideoVersion, Asset: ZizvideoArtifactName(ZizvideoVersion),
+		Category: "tool", RootDir: "zizvideo", MirrorOnly: true, Dynamic: true,
 		Binary: "zizvideo",
 		// 裸二进制（不是归档）：不剥层、直接当可执行文件用。
 		TarStrip: 0, PickBinary: true,
