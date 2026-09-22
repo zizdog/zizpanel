@@ -109,6 +109,9 @@ function saveDataCache() {
 
 // cacheAt 是这一轮结论的取得时刻（缓存年龄照它算）。
 let cacheAt = '';
+// preheat 是登录预热正在进行的那次"拉齐数据"（见 bootstrapAppUpdates）。
+// 进度：预热与用户进页面撞在一起时，页面**等它**而不是再发一遍相同的两个请求。
+let preheat = null;
 // 进页面时先恢复上一次的缓存：有它就直接渲染（不发请求）。
 const restoredMarketCache = loadDataCache();
 if (restoredMarketCache) {
@@ -226,16 +229,27 @@ function lastBackgroundCheckAt() {
 //   ③ 检查完立刻把"有 N 个可更新"写进 localStorage + 派发事件，侧栏红点**不用等访问应用页**。
 export async function bootstrapAppUpdates() {
   if (!loadDataCache()) {
-    try {
-      cache = await api.market();
+    // ⚠️ 市场与服务记录必须**一起**就位再写进 cache（2026-09-22 真机撞到的竞态）：
+    // 以前先 `cache = await api.market()`、再单独等服务记录，中间那段窗口里
+    // `cache` 已非空而 `svcList` 还是空的 —— 用户这时（登录后立刻）进「应用 → 已安装」
+    // 会看到**所有**应用的卡片都写「已安装（面板里暂无记录）」、按钮全是「启动」，
+    // 而且不会自己变回来（页面只在 cache 为空时拉数据，预热完成不重画）。
+    // 现在两者都拿到才赋值，页面要么读到完整数据、要么走自己的 fetchAll。
+    preheat = (async () => {
+      const [mkt, svc] = await Promise.allSettled([api.market(), api.services(true)]);
+      if (mkt.status !== 'fulfilled') throw mkt.reason;
+      cache = mkt.value;
+      if (svc.status === 'fulfilled') svcList = (svc.value && svc.value.list) || [];
       cacheAt = new Date().toISOString();
-      try {
-        const svc = await api.services(true);
-        svcList = (svc && svc.list) || [];
-      } catch (e) { /* 服务记录拿不到不影响更新检查 */ }
       saveDataCache();
+    })();
+    try {
+      await preheat;
     } catch (e) {
-      return; // 市场列表都拿不到就不猜"有没有新版"：等心跳或用户自己打开应用页
+      // 市场列表都拿不到就不猜"有没有新版"：等心跳或用户自己打开应用页。
+      return;
+    } finally {
+      preheat = null;
     }
   }
   startAppUpdateWatcher();
@@ -622,7 +636,12 @@ export function AppsView(content, ctx = {}) {
     }
     clear(body);
     appendAll(body, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取应用目录…（首次）' })]));
-    await fetchAll();
+    // 登录预热可能正在拉同一份数据（见 bootstrapAppUpdates）：等它，别再发一遍
+    // 完全相同的两个请求；预热失败（preheat 已清空）就自己拉。
+    const inFlight = preheat;
+    if (inFlight) { await inFlight.catch(() => {}); }
+    if (!cache) await fetchAll();
+    rebuildSvcState();
     renderTabBar();
     renderBody();
     // 首次加载没得读缓存，这一次探测顺带把更新检查也做了。

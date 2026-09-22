@@ -4,7 +4,7 @@
 // hash 路由不需要服务端配合改写，也避免了刷新 404。
 
 import { api, ApiError } from './api.js';
-import { h, clear, toast, $ } from './ui.js';
+import { h, clear, toast, appendAll, $ } from './ui.js';
 import { DashboardView, SettingsView } from './views.js';
 import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
@@ -19,7 +19,7 @@ import { NavView } from './nav.js';
 import { DisksView } from './disks.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
-import { startUpgradeWatcher, hasUpdate } from './update.js';
+import { startUpgradeWatcher, hasUpdate, upgradeNotice, dismissUpgradeNotice } from './update.js';
 import { taskCenter } from './tasks.js';
 
 // ---------------- 全局状态 ----------------
@@ -500,6 +500,9 @@ function renderApp() {
   // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
   const target = routeFor();
   const item = NAV_BY_ID[target.id] || NAV_BY_ID.dashboard;
+  // 升级页里**不**再挂顶部横幅：那一页本来就有"有新版本 + 一键升级"的卡片，
+  // 两处说同一件事是用户点名要去掉的重复（2026-09-22："去掉一处！"）。
+  onUpdatePage = target.id === 'settings' && String(target.tab || '') === 'update';
 
   const nav = h('nav.nav');
   NAV.forEach((n) => {
@@ -607,7 +610,18 @@ function renderApp() {
     h('span', { text: footerStatus() }),
   ]);
 
-  const main = h('main.main', [topbar, content, footer]);
+  // 面板有新版本时的**显著提醒**：常驻在每一页的最上方，不只在设置页里。
+  // 用户 2026-09-22 第二次报障："还是没有 panel 更新提示，要点进去才行" ——
+  // 检测一直在跑，但只有侧栏那颗小圆点时用户根本不知道（见 update.js 的 upgradeNotice）。
+  upgradeBar = h('div#zp-upgrade-notice', {
+    style: {
+      background: 'var(--warn-soft)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius)', padding: '11px 14px', marginBottom: '13px',
+      fontSize: '12.5px', lineHeight: '1.8',
+    },
+  });
+
+  const main = h('main.main', [topbar, upgradeBar, content, footer]);
   const layout = h('div.layout', [sidebar, main, h('div.overlay', { onclick: () => document.body.classList.remove('nav-open') })]);
 
   mount(layout);
@@ -645,15 +659,59 @@ function renderApp() {
   document.title = `${item.title} · ZizPanel`;
 }
 
-// syncUpdateBadge 原地亮/灭侧栏「检查更新」的小红点。
+// syncUpdateBadge 原地亮/灭侧栏「检查更新」的小红点 **以及顶部的新版本横幅**。
 //
 // 为什么不靠重渲染外壳：renderApp() 会把页面打回默认状态（正在填的表单会丢）。
-// update.js 检测完只派发一个事件，这里负责把徽标改掉。
+// update.js 检测完只派发一个事件，这里负责把徽标与横幅改掉。
 function syncUpdateBadge() {
   const show = hasUpdate();
   document.querySelectorAll('.zp-update-dot').forEach((el) => { el.hidden = !show; });
+  if (upgradeBar) renderUpgradeNotice(upgradeBar);
 }
-window.addEventListener('zp:update-state', syncUpdateBadge);
+
+// upgradeBar 是当前这份外壳里的横幅元素（renderApp 每次重建，见那边的注释）。
+let upgradeBar = null;
+// onUpdatePage 由 renderApp 每次按当前路由更新（升级页里不重复提醒）。
+let onUpdatePage = false;
+
+// renderUpgradeNotice 画/收顶部横幅。内容只在真的有新版时才有 ——
+// 判据全在 update.js（含"用户点过稍后"的版本记忆），这里只负责渲染。
+function renderUpgradeNotice(box) {
+  const info = onUpdatePage ? null : upgradeNotice();
+  box.hidden = !info;
+  clear(box);
+  if (!info) return;
+  const cur = info.current || state.session?.version || '';
+  appendAll(box, [
+    h('div', { text: '🔔 面板有新版本 v' + info.latest + (cur ? '（当前 v' + cur + '）' : '') }),
+    h('div.hint', {
+      text: '点「去更新」查看更新内容并一键升级；升级时面板会重启约 10 秒。',
+    }),
+    h('div', { style: { display: 'flex', gap: '8px', marginTop: '8px' } }, [
+      h('button.btn.btn-sm.btn-primary', {
+        text: '去更新',
+        onclick: () => { location.hash = '#/update'; },
+      }),
+      h('button.btn.btn-sm', {
+        text: '稍后',
+        title: '这个版本不再提醒（出了更新的版本会再提醒）',
+        onclick: () => { dismissUpgradeNotice(); renderUpgradeNotice(box); },
+      }),
+    ]),
+  ]);
+}
+
+// 新版本第一次被发现时补一条 toast：横幅在页面顶部，用户可能正在页面下方操作，
+// 只有 toast 能让"刚刚检测到"这件事立刻可见（同一个版本一次会话只提一次）。
+let noticeToastedVersion = '';
+window.addEventListener('zp:update-state', () => {
+  syncUpdateBadge();
+  const info = upgradeNotice();
+  if (info && info.latest !== noticeToastedVersion) {
+    noticeToastedVersion = info.latest;
+    toast('面板有新版本 v' + info.latest + '：点顶部「去更新」即可升级', 'warn', 12000);
+  }
+});
 
 // ---------------- 页面级资源清理 ----------------
 // View 通过 ctx.onLeave(fn) 注册清理函数；切换路由时统一执行。

@@ -79,6 +79,30 @@ export function lastCheckedAt() {
   return info ? (info.checked_at || 0) : 0;
 }
 
+// upgradeNotice 返回"该不该在每一页顶部提醒面板有新版本"，不需要就是 null。
+//
+// 为什么要有它（用户 2026-09-22 第二次报障："还是没有 panel 更新提示，要点进去才行"）：
+// 检测本身在登录时就跑了，但唯一的信号是侧栏「面板设置」上那颗小圆点 —— 用户根本不知道。
+// 「稍后」按**版本号**记：出了更新的版本会自己再冒出来，不用用户去清缓存。
+const DISMISS_KEY = 'zp-upgrade-notice-dismissed';
+
+export function upgradeNotice() {
+  const info = updateInfo();
+  if (!info || !info.has_update || !info.latest) return null;
+  try {
+    if (localStorage.getItem(DISMISS_KEY) === info.latest) return null;
+  } catch { /* 隐私模式：不记，就每次都提醒 */ }
+  return info;
+}
+
+// dismissUpgradeNotice 记住"这个版本用户说稍后了"，并让外壳当场收起横幅。
+export function dismissUpgradeNotice() {
+  const info = updateInfo();
+  if (!info || !info.latest) return;
+  try { localStorage.setItem(DISMISS_KEY, info.latest); } catch { /* 同上 */ }
+  emit();
+}
+
 function emit() {
   // 侧边栏是每次路由重建的，徽标要能"当场"亮/灭，所以用事件通知 app.js 原地同步。
   try { window.dispatchEvent(new Event('zp:update-state')); } catch { /* 老浏览器 */ }
