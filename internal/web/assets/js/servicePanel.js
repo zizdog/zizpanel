@@ -60,11 +60,16 @@ const KNOWN_LABEL_PREFIXES = [
   'cn.zizdog.', 'cn-zizdog-', 'com.zizdog.', 'com-zizdog-',
 ];
 
-// appKeyOf 把一个应用/服务归一化成一个去重 key（顺序固定）：标识类字段（launch_label →
-// service_label → id → uninstall.service → name）→ 小写 → 去掉一个已知前缀（只去一次）→
-// 把 @ . - _ 与空白全部删掉。**绝不能只看 name**（市场条目的 name 是展示名，同一条会出现两行）。
+// appKeyOf 把一个应用/服务归一化成一个去重 key。
+//
+// **稳定键优先**：后端解析出的目录 ID（市场条目的 app_id / 服务记录的 app_id）。
+// 一个应用换过部署方式后会留下旧标签的记录（mac军刀 的 cn.macsaber.web），
+// 光按 label 归一化认不出它们是同一个应用 —— 那正是"两个 mac军刀"的根因（坑 228）。
+// 没有 app_id 时才退回 label 归一化（用户自建的服务）。
 export function appKeyOf(x) {
   if (!x) return '';
+  const appID = typeof x.app_id === 'string' ? x.app_id.trim().toLowerCase() : '';
+  if (appID) return 'id:' + appID;
   const raw = x.launch_label || x.service_label
     || (typeof x.id === 'string' ? x.id : '')
     || (x.uninstall && x.uninstall.service)
@@ -98,10 +103,20 @@ function svcInfoScore(s) {
 }
 
 // pickAndMergeSvc：挑一条，其余记录的字段按"非空者优先、运行中优先"补进来。
-function pickAndMergeSvc(pool) {
+//
+// preferred 是目录声明的服务标识（service_label / adopt_label / uninstall.service）；
+// 命中的那条就是**当前那只**服务，必须当代表。旧标签的残留记录即使状态探测看起来
+// 也在跑（端口被同一应用占着），也不能当代表 —— 否则卡片上的启停按钮打的是旧记录（坑 228）。
+function pickAndMergeSvc(pool, preferred = []) {
   if (!pool || !pool.length) return null;
-  let best = pool[0];
-  for (const s of pool.slice(1)) if (svcInfoScore(s) > svcInfoScore(best)) best = s;
+  const want = preferred.filter(Boolean);
+  const matched = want.length
+    ? pool.find((s) => s && (want.includes(s.launch_label) || want.includes(s.name)))
+    : null;
+  let best = matched || pool[0];
+  if (!matched) {
+    for (const s of pool.slice(1)) if (svcInfoScore(s) > svcInfoScore(best)) best = s;
+  }
   const out = { ...best };
   for (const other of pool) {
     if (other === best) continue;
@@ -166,7 +181,11 @@ export function mergeAppEntries(marketList, svcList) {
     if (e) e._svcPool.push(s);
   }
   for (const e of entries.values()) {
-    e.svc = pickAndMergeSvc(e._svcPool);
+    // 目录声明的服务标识是权威：命中的那条记录才是当前服务（见 pickAndMergeSvc）。
+    const prefer = e.market
+      ? [e.market.service_label, e.market.adopt_label, e.market.uninstall && e.market.uninstall.service]
+      : [];
+    e.svc = pickAndMergeSvc(e._svcPool, prefer);
     delete e._svcPool;
   }
   return [...entries.values()].sort(compareEntries);

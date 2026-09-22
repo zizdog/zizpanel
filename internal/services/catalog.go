@@ -39,6 +39,10 @@ type App struct {
 	DockerReference bool `json:"docker_reference,omitempty"`
 	// AdoptLabel 非空表示这是一个"纳管"应用：不安装，只把已存在的服务接进来
 	AdoptLabel string `json:"adopt_label"`
+	// AliasLabels 是这个应用**历史用过的** launchd 标签（换过部署方式留下的旧记录）。
+	// 它们与 ServiceLabel 指向同一个应用：解析服务记录时必须认，否则一条旧记录会
+	// 在「已安装」里多渲染成一张同名的卡片（坑 228）。
+	AliasLabels []string `json:"alias_labels,omitempty"`
 
 	Port        int    `json:"port"`
 	HealthPath  string `json:"health_path"`
@@ -1633,7 +1637,9 @@ func Catalog() []App {
 			Description: "把 macOS 自带能力包成 48 个网页小工具：只绑本机回环、不联网、不上传。",
 			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: MacSaberAppID, ServiceLabel: MacSaberLabel,
-			Port: MacSaberPort, HealthPath: macSaberHealthPath,
+			// 旧用户级 agent 的标签：升级上来的机器会留下它的服务记录（坑 228）。
+			AliasLabels: []string{MacSaberLegacyLabel},
+			Port:        MacSaberPort, HealthPath: macSaberHealthPath,
 			PostInstallHint: "首次打开要设置本机用户名与口令（口令至少 8 位，只存在这台机器上）。" +
 				"文件权限与面板共用：面板能读的它就能读。",
 			DocsURL: "https://github.com/zizdog/zizpanel",

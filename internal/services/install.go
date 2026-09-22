@@ -1971,7 +1971,7 @@ func catalogEntryForLabel(label string) (App, bool) {
 	return App{}, false
 }
 
-// FindAppByService 按服务记录找出对应的目录条目（label / 名称 / ID 三种写法都认）。
+// FindAppByService 按服务记录找出对应的目录条目（label / 名称 / ID / 旧标签别名都认）。
 //
 // 给 web 层用：服务详情要知道"这个服务在目录里声明的配置文件是哪个"，
 // 才能给出「📝 编辑配置文件」入口。找不到目录条目时返回 false（纯自定义服务）。
@@ -1985,12 +1985,26 @@ func FindAppByService(svc *Service) (App, bool) {
 			if k == "" {
 				continue
 			}
-			if a.ServiceLabel == k || a.AdoptLabel == k || a.ID == k || a.Name == k {
+			if appMatchesServiceKey(a, k) {
 				return a, true
 			}
 		}
 	}
 	return App{}, false
+}
+
+// appMatchesServiceKey 判断一个服务记录的标识（label / 名称）是否属于这个目录条目。
+// AliasLabels 是历史标签：不认它，同一应用的一条旧记录就会变成第二张卡片（坑 228）。
+func appMatchesServiceKey(a App, k string) bool {
+	if a.ServiceLabel == k || a.AdoptLabel == k || a.ID == k || a.Name == k {
+		return true
+	}
+	for _, al := range a.AliasLabels {
+		if al != "" && al == k {
+			return true
+		}
+	}
+	return false
 }
 
 // catalogAppForRecord 按**一条服务记录**在应用目录里找对应条目。

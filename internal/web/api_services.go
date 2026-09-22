@@ -175,6 +175,7 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 		d := serviceDetail{View: v}
 		if app, found := services.FindAppByService(v.Service); found {
 			d.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
+			d.AppID = app.ID
 		}
 		views = append(views, d)
 	}
@@ -193,14 +194,18 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// serviceDetail 在服务记录之外，额外带上"目录条目声明的配置文件路径"。
+// serviceDetail 在服务记录之外，额外带上"目录条目声明的配置文件路径"与**目录应用 ID**。
 //
 // 为什么不在 Service 表里加字段：配置路径是目录（代码里）的静态属性，不是运行时状态；
 // 存进库只会多一份会漂的副本。这里按 launchd label / 名字现查目录，返回时摊平
 // （嵌入 *Service，JSON 里字段仍是平的，前端不用改读法）。
+//
+// AppID 是前端合并去重的**稳定键**：一条旧记录（换标签留下的）与目录条目只有靠
+// 它才能收敛成同一张卡片（坑 228）。
 type serviceDetail struct {
 	*services.View
 	ConfigPath string `json:"config_path,omitempty"`
+	AppID      string `json:"app_id,omitempty"`
 }
 
 func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
@@ -215,6 +220,7 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 	detail := serviceDetail{View: v}
 	if app, ok := services.FindAppByService(v.Service); ok {
 		detail.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
+		detail.AppID = app.ID
 	}
 	ok(w, detail)
 }
@@ -788,6 +794,10 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 
 	type item struct {
 		services.App
+		// AppID 是**目录应用 ID**（= App.ID），给前端当合并去重的稳定键用：
+		// 与服务记录的 app_id 同名同值，同一应用的多条记录/条目才能收敛成一张卡片
+		// （坑 228）。
+		AppID string `json:"app_id"`
 		// Adopted 表示"这个服务已经在服务管理里登记过了"。
 		// 必须与 Installed 分开：一个应用可能**装了但没纳管**
 		// （用户自己装的、或换机器后没登记），这时该给的是「纳管」按钮，
@@ -1040,7 +1050,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		it := item{App: a, Installed: isInstalled, Adopted: adopted, Available: true,
+		it := item{App: a, AppID: a.ID, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
 			RuntimeBodyPath: runtimeBody.Path,
 			PortURL:         portURL, ProxyURL: proxyURL,
