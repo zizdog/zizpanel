@@ -23,6 +23,7 @@ package services
 //
 //    ✅ 数据库 postgresql17、Web 服务 miniflux、同步守护 syncthing、
 //       推理后端 ollama、站点赖以运行的 PHP-FPM php@8.x
+//    ✅ 下载器 transmission / aria2：半夜要接着下，重启后必须自己回来
 //    ❌ ffmpeg / phpMyAdmin：没有常驻进程（NoDaemon）
 //    ❌ typecho / wordpress：产物是文件+数据库，不是服务
 //    ❌ Docker 类：常驻的是 Colima（早已是系统级），容器靠 compose 的

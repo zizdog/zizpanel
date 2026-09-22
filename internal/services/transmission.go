@@ -199,28 +199,9 @@ var (
 // ensureTransmissionDownloadDir 确保下载目录存在、归属运行用户、且**实测可写**。
 // 不可写时如实报错并给出可照做的动作，绝不"能登录但什么都下不了"（坑 226）。
 func (m *Manager) ensureTransmissionDownloadDir(ctx context.Context, dir string) error {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return fmt.Errorf("下载目录为空：请在面板里选一个绝对路径")
-	}
-	if !filepath.IsAbs(dir) {
-		return fmt.Errorf("下载目录必须是绝对路径（收到 %q）", dir)
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("创建下载目录 %s 失败: %w；请在面板里换一个可写目录", dir, err)
-	}
-	if m.opt.UserName != "" {
-		if err := chownTo(m.opt.UserName, dir); err != nil {
-			return fmt.Errorf("把下载目录 %s 归属改为 %s 失败: %w", dir, m.opt.UserName, err)
-		}
-	}
-	probe := filepath.Join(dir, ".zizpanel-write-test")
-	if err := transmissionWriteProbe(m, ctx, probe); err != nil {
-		return fmt.Errorf("下载目录 %s 不可写（Transmission 以 %s 身份运行）：%v。"+
-			"请在面板里改成一个可写目录，不要手工改 settings.json（会被回写覆盖）",
-			dir, transmissionRunAsName(m), err)
-	}
-	return nil
+	return m.ensureUserWritableDir(ctx, dir, "下载目录",
+		"Transmission 以 "+transmissionRunAsName(m)+" 身份运行",
+		"请在面板里改成一个可写目录，不要手工改 settings.json（会被回写覆盖）")
 }
 
 func transmissionRunAsName(m *Manager) string {

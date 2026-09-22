@@ -43,6 +43,9 @@ type Server struct {
 	// serviceRepo 是服务注册表（服务管理与应用市场共用）
 	serviceRepo *services.Repository
 
+	// aria2UI 是内置的 AriaNg 界面资源（挂在 /aria/，见 aria2_web.go）。
+	aria2UI fs.FS
+
 	// ---- 应用市场用的短缓存 ----
 	//
 	// 为什么需要：市场列表要为每个条目判断"装了没有"，
@@ -187,6 +190,11 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		Tasks:       tasks.NewManager(),
 		static:      sub,
 		startAt:     time.Now(),
+	}
+	// aria2 的内置界面（AriaNg）单独取一个子树；取不到就是 nil —— handler 会如实报错，
+	// 而不是假装"界面在这儿"。
+	if ariaUI, err := fs.Sub(assetsFS, aria2AssetDir); err == nil {
+		s.aria2UI = ariaUI
 	}
 	// TCC 指引里"要去系统设置里授权"的那个二进制路径按配置解析一次：
 	// 非默认安装根（BinDir 配在别处）也能给出正确路径。
@@ -633,6 +641,11 @@ func (s *Server) routes() http.Handler {
 	// 应用入口全变成 404（真机验证时抓到）。
 	outer := http.NewServeMux()
 	s.registerAppProxy(outer)
+	// aria2 的下载界面（内置 AriaNg）与它的 RPC 代理：外层与应用界面同层
+	// （用户可能直接把 /aria/ 存成书签，不该先知道面板安全后缀），
+	// 内层再挂一份（前端「打开」用的是 panelPath('aria/') = /<后缀>/aria/）。
+	s.registerAria2UI(outer)
+	s.registerAria2UI(root)
 	// 面板自带的「导航页」匿名别名入口（GET /nav/，见 api_nav.go）。
 	// 与应用界面代理同层：都必须在安全后缀之外，用户才能直接当浏览器首页用。
 	s.registerNavPage(outer)

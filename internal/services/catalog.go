@@ -1698,6 +1698,38 @@ func builtinCatalog() []App {
 				"手改 settings.json 再重启会被 daemon 退出时的回写覆盖；默认关 LSD/UPnP（DHT 保持开启，磁力链要用）。",
 			DocsURL: "https://transmissionbt.com",
 		},
+		// ---------------- aria2（下载器 + 面板托管的 AriaNg 界面） ----------------
+		//
+		// 为什么必须走面板安装器（通用 brew 轨做不到）：
+		//   · brew 的 aria2 formula **没有 service 块**（`brew info --json=v2` 里
+		//     service 为 null）⇒ `brew services start aria2` 起不来；
+		//   · 它本身只是个 JSON-RPC 服务（6800），界面 AriaNg 是静态页、由**面板**
+		//     托管在 /aria/（见 internal/web/aria2_web.go；UI.SelfConf=true 表示
+		//     不生成 app-proxy，面板只给「打开」入口）；
+		//   · 下载目录（用户点名 ~/Downloads）、RPC 密钥、会话续传都要真复核。
+		{
+			ID: Aria2AppID, Name: "aria2（下载器）", Icon: "⬇️",
+			UI: &AppUI{
+				Slug:     Aria2Slug,
+				SelfConf: true, // 界面由面板自己的路由托管，不要生成 app-proxy
+				Note: "「打开」是面板托管的 AriaNg 界面（/" + Aria2Slug +
+					"/，需先登录面板）；RPC 只绑 127.0.0.1，浏览器经面板代理访问。",
+			},
+			Summary:     "多协议下载器（HTTP/FTP/BT/磁力）+ 网页界面，多线程、可续传",
+			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/Downloads，重启后队列还能续上。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: "aria2", BrewFormula: Aria2Formula, ServiceLabel: Aria2Label,
+			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
+			SystemDaemon: true,
+			// 6800：上游默认 RPC 端口（只绑回环）。没有 HealthPath —— aria2 的
+			// RPC 只认 POST，GET 会 4xx，健康判据用「launchd 在跑 + 端口在听」。
+			Port: Aria2RPCPort,
+			// 配置文件在安装目录里（「📝 编辑配置文件」直接读写它；改完点重启生效）。
+			ConfigPath: "~/" + Aria2Slug + "/" + Aria2ConfName,
+			PostInstallHint: "网页界面在「/" + Aria2Slug + "/」（面板托管，需先登录面板），首次打开会自动连上本机 RPC；" +
+				"下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
+			DocsURL: "https://aria2.github.io/",
+		},
 
 		// ---------------- zizvideo（独立项目，面板托管） ----------------
 		//

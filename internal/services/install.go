@@ -711,6 +711,21 @@ func (m *Manager) UpgradeBrewApp(ctx context.Context, app App, res *InstallResul
 			}
 		}
 	}
+	// 已经跑起来的长驻进程用的还是**旧的那份二进制**（磁盘换了、进程没换）——
+	// 与坑 216 ③ 同一类："升级了但新功能没生效"。所以：作业在 launchd 里**正跑着**
+	// 就主动重启一次（新版本当场生效）；用户自己停掉的不碰（不把他的暂停复活）。
+	if label := firstServiceLabel(app); label != "" {
+		if pid, err := brewUpgradeServicePID(label); err == nil && pid > 0 {
+			if rerr := brewUpgradeServiceRestart(label); rerr == nil {
+				if res != nil {
+					res.step(ctx, "已重启 "+label+"，新版本当场生效")
+				}
+			} else if res != nil {
+				res.step(ctx, "⚠️ 新版本已就位，但重启 "+label+" 失败："+rerr.Error()+
+					"；到「服务管理」点一次「重启」")
+			}
+		}
+	}
 	// 升级不会自动重启 `brew services` 管着的旧进程：端口没在听就明说，别让用户以为万事大吉。
 	if app.Port > 0 && res != nil && !portListening(ctx, app.Port) {
 		res.step(ctx, fmt.Sprintf("提示：升级已完成，但 %d 端口现在没有监听 —— "+
@@ -718,6 +733,19 @@ func (m *Manager) UpgradeBrewApp(ctx context.Context, app App, res *InstallResul
 	}
 	return nil
 }
+
+// brewUpgradeServicePID / Restart 是"升级后重启面板管理的服务"的注入点
+// （单测绝不允许碰真实 launchd —— AGENTS 第三节）。
+var (
+	brewUpgradeServicePID = func(label string) (int, error) {
+		st, err := priv.LaunchStatus(label)
+		if err != nil {
+			return 0, err
+		}
+		return st.PID, nil
+	}
+	brewUpgradeServiceRestart = func(label string) error { return priv.LaunchKickstart(label) }
+)
 
 // brewInstallRun 跑一次尝试。测试通过 brewSourceRunOverride 注入假执行器，
 // 这样"换源顺序 / 校验失败要换源"能在不执行真实 brew 的前提下被验证。

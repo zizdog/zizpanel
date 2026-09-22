@@ -1453,6 +1453,11 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	case "docker-runtime":
 		s.handleInstallDockerRuntime(w, r)
 		return
+	case "aria2":
+		// aria2（下载器）：brew 的 aria2 formula **没有 service 块**，而它本体只是
+		// JSON-RPC、界面由面板托管（/aria/）—— 通用 brew 流程做不了这三件事。
+		s.handleInstallAria2(w, r)
+		return
 	case "miniflux":
 		// Miniflux 只能配 PostgreSQL，而且建库/写配置/迁移/建管理员这一串
 		// 通用 brew 流程做不了，所以走自研安装器（见 services/miniflux.go）。

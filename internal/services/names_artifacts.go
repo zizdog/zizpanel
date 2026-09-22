@@ -32,6 +32,9 @@ var installerArtifactPaths = map[string][]string{
 	"voicereceiver": {filepath.Join("tts", "voice-receiver", "receiver.py")},
 	// stt：模型权重（几百 MB ~ 1.5 GB）默认在卸载时**保留**，是这里唯一要看的产物。
 	"stt": {filepath.Join("stt", "models")},
+	// aria2：配置与会话文件（~/aria）默认保留（重装后密钥不变、队列还能续上）。
+	// 下载目录 ~/Downloads **不算**产物 —— 那是用户的文件，卸载永远不碰。
+	"aria2": {filepath.Join(Aria2Slug, Aria2ConfName)},
 }
 
 // installerArtifactExempt 说明"为什么这个面板安装器不需要产物探测"。

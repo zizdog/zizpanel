@@ -92,6 +92,8 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"php84":        true,
 		// 下载器半夜要接着下，重启后必须自己回来（2026-09-20 新增）。
 		"transmission": true,
+		// 同上，aria2 也是下载器（2026-09-22 新增）。
+		"aria2": true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {

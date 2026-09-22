@@ -100,13 +100,15 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 分类：**网站环境**（Nginx、PHP 8.2/8.4、MySQL 8.4 / MariaDB 13.0、PostgreSQL、
 Python 3.10–3.13）、**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、IOPaint、图片压缩）、
 **运维工具**（phpMyAdmin、Uptime Kuma、Gitea、Miniflux、Syncthing、Alist、frpc、
-ddns-go 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
+ddns-go、Transmission、aria2 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
 
 - 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + 数据库并做收尾配置，
   数据库默认 **MariaDB 13.0**（可选 **MySQL 8.4**）。
 - 两个引擎只能装一个：默认共用数据目录 `/opt/homebrew/var/mysql` 与 3306。
   已装另一个时面板**拒绝安装**并给出卸载命令，绝不替你停/卸正在用的数据库。
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
+- **下载器**：Transmission、aria2（面板托管 AriaNg 界面，入口 `/<面板入口>/aria/`）；
+  下载目录默认 `~/Downloads`，卸载**不动**里面的文件。
 - **基础环境组件不参与"有新版"提醒**（「网站环境」整类：Nginx / PHP / MySQL / MariaDB /
   PostgreSQL，以及 Python 3.10–3.13、FFmpeg）：站点与其它应用都建在它们上面，有版本依赖，
   要升级请自己决定（面板不替你动）。其余应用（如 zizvideo）会正常提醒并支持一键更新。

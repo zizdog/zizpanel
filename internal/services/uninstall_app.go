@@ -848,6 +848,11 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"stt": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallSTT(ctx, app, removeData, false, r)
 	},
+	// aria2（下载器）：停服务 + 撤 plist + brew uninstall + （可选）删 ~/aria
+	// （配置与会话文件）；**绝不碰 ~/Downloads** —— 那是用户自己的文件。
+	"aria2": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
+		return m.UninstallAria2(ctx, app, removeData, r)
+	},
 	// zizvideo（短视频模块）：bootout system 域 + 删系统 plist + 删 /opt/zizvideo；
 	// 数据目录（DB、封面、config.json）与**媒体根**默认保留（媒体是用户自己的文件）。
 	"zizvideo": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
@@ -1312,6 +1317,21 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 			p.KeepNote = "磁盘上没有模型权重文件，没有要清理的数据；" +
 				"重新安装会重新下载默认档模型（约 466 MiB）"
 		}
+	case "aria2":
+		// aria2 = brew 引擎 + 面板注册的系统级服务 + ~/aria（配置与会话文件）。
+		// 铁律：**绝不删 ~/Downloads** —— 那是用户下载的文件，卸载应用不是删文件。
+		ap := m.aria2Paths()
+		p.Steps = []string{
+			"停止并删除 launchd 服务 " + Aria2Label,
+			"从「服务管理」移除记录",
+			"brew uninstall " + Aria2Formula,
+			"⚠️ 不碰下载目录 " + ap.DownloadDir + "（里面的文件是你的，面板一个都不会删）",
+			"⚠️ 卸载后面板托管的下载界面 /" + Aria2Slug + "/ 会显示「还没有安装」，直到重新安装",
+		}
+		p.DataPaths = append(p.DataPaths, ap.Conf, ap.Session)
+		p.KeepNote = "默认保留配置与会话文件（" + ap.Root + "）：重装后 RPC 密钥不变、" +
+			"未下完的队列还能续上；要清掉请在确认框里勾选「同时删除数据」。"
+		return p
 	case "miniflux":
 		// 铁律：卸载应用**不删数据**。Miniflux 库里是订阅源与已读状态，删掉不可恢复 ——
 		// PostgreSQL 与库一律保留，确认框里写清楚。
