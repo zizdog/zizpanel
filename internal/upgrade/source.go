@@ -24,11 +24,18 @@ import (
 // ============================================================================
 
 const (
-	// DefaultSource 是公网主源。直接引用 config 里的常量，避免两处各写一份以后漂移。
+	// DefaultSource 是默认源 = 公网镜像站。直接引用 config 里的常量，避免两处各写一份以后漂移。
+	// （2026-09-22 起默认就是镜像站：用户要求"新安装的 panel 一定得是 mirror"。）
 	DefaultSource = config.DefaultUpgradeSource
 
-	// MirrorSource 是备用公网镜像（面板其余下载也用它，见 DefaultMirrorBase）。
+	// MirrorSource 是公网镜像站（面板其余下载也用它，见 DefaultMirrorBase）。
+	// 与 DefaultSource 当前同值；保留成独立的常量，是因为它同时被别处当"镜像站"引用。
 	MirrorSource = "https://mirror.zizdog.com:8888/zizpanel"
+
+	// FallbackSource 是 zizdog.com（腾讯云，只有 4 Mbps）。**只当兜底**：
+	// 默认值改成镜像站之后，它必须显式留在候选链里 —— 否则镜像站不可达时
+	// 面板就没得回落，只能去撞国内基本不通的 GitHub。
+	FallbackSource = "https://zizdog.com/zizpanel"
 
 	// GitHubSource 是最后的兜底：GitHub Releases 的 latest/download 固定地址。
 	// DNS 被污染时它可能失败，这属于预期 —— 前面还有两个公网候选。
@@ -73,6 +80,7 @@ func CandidateSources(configured string) []string {
 	// 这个顺序取镜像（清单里的下载地址指向镜像，包就从快的那台拉）。
 	add(MirrorSource)
 	add(DefaultSource)
+	add(FallbackSource)
 	add(GitHubSource)
 	return out
 }

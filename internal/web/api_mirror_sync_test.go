@@ -179,22 +179,26 @@ func assertNothingWritten(t *testing.T, dir string) {
 	}
 }
 
-// TestMirrorSyncDefaultSourceIsPublicSource：镜像同步的默认源必须是公网发布源，不许是镜像自己。
+// TestMirrorSyncDefaultSourceIsPublicSource：镜像同步的默认源必须是**公网发布源**
+// （zizdog.com = upgrade.FallbackSource），不许是镜像自己。
+//
+// ⚠️ 2026-09-22：默认升级源（DefaultSource）改成镜像站之后，这里必须跟着改成
+// FallbackSource —— 否则"同步来源"会变成镜像自己（循环，必然失败）。
 func TestMirrorSyncDefaultSourceIsPublicSource(t *testing.T) {
-	if upgrade.DefaultSource == upgrade.MirrorSource {
+	if upgrade.FallbackSource == upgrade.MirrorSource {
 		t.Fatal("公网发布源与镜像源常量相同，测试前提不成立")
 	}
 	srv, _ := newTestServer(t)
-	if got := srv.mirrorDefaultSource(); got != upgrade.DefaultSource {
-		t.Errorf("默认同步源 = %q，必须是公网发布源 %q", got, upgrade.DefaultSource)
+	if got := srv.mirrorDefaultSource(); got != upgrade.FallbackSource {
+		t.Errorf("默认同步源 = %q，必须是公网发布源 %q", got, upgrade.FallbackSource)
 	}
 	if got := srv.mirrorDefaultSource(); got == upgrade.MirrorSource {
 		t.Errorf("默认同步源不许是镜像自己 %q", upgrade.MirrorSource)
 	}
 	// 不传 / 只传空白 source 的解析路径也必须落到公网发布源。
 	for _, raw := range []string{"", "   "} {
-		if got := srv.resolveMirrorSource(raw); got != upgrade.DefaultSource {
-			t.Errorf("source=%q 解析出 %q，必须是公网发布源 %q", raw, got, upgrade.DefaultSource)
+		if got := srv.resolveMirrorSource(raw); got != upgrade.FallbackSource {
+			t.Errorf("source=%q 解析出 %q，必须是公网发布源 %q", raw, got, upgrade.FallbackSource)
 		}
 	}
 	// 显式传的源优先，不被默认值覆盖。

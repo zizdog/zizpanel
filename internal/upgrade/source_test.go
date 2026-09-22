@@ -31,24 +31,46 @@ func assertSourceOrder(t *testing.T, got, want []string) {
 func TestCandidateSourcesOrder(t *testing.T) {
 	custom := "https://custom.example/zizpanel"
 
+	// 2026-09-22 用户要求："请确保新安装的 panel 一定得是
+	// https://mirror.zizdog.com:8888/zizpanel" ⇒ 内置默认源必须是镜像站。
+	t.Run("内置默认源 = 公网镜像站", func(t *testing.T) {
+		if DefaultSource != MirrorSource {
+			t.Fatalf("新装默认源应是镜像站 %q，实际 %q", MirrorSource, DefaultSource)
+		}
+	})
+
+	// 而默认值改成镜像站之后，zizdog.com **必须显式留在候选链里**：
+	// 否则镜像站不可达时面板就只剩国内基本不通的 GitHub。
+	t.Run("zizdog.com 仍是兜底候选（默认改成镜像站后没被挤掉）", func(t *testing.T) {
+		found := false
+		for _, s := range CandidateSources("") {
+			if s == FallbackSource {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("候选链里必须有 %q，实际 %v", FallbackSource, CandidateSources(""))
+		}
+	})
+
 	t.Run("显式配置优先", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(custom),
-			[]string{custom, MirrorSource, DefaultSource, GitHubSource})
+			[]string{custom, MirrorSource, FallbackSource, GitHubSource})
 	})
 
-	t.Run("未配置时：镜像站 → 公网主源 → GitHub（用户 2026-09-22：优先快镜像）", func(t *testing.T) {
+	t.Run("未配置时：镜像站 → zizdog 兜底 → GitHub", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(""),
-			[]string{MirrorSource, DefaultSource, GitHubSource})
+			[]string{MirrorSource, FallbackSource, GitHubSource})
 	})
 
-	t.Run("配置成默认主源时去重（用户显式设置仍然最前）", func(t *testing.T) {
+	t.Run("配置成默认源时去重（用户显式设置仍然最前）", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(DefaultSource),
-			[]string{DefaultSource, MirrorSource, GitHubSource})
+			[]string{DefaultSource, FallbackSource, GitHubSource})
 	})
 
 	t.Run("去重且去掉尾部斜杠", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(MirrorSource+"/"),
-			[]string{MirrorSource, DefaultSource, GitHubSource})
+			[]string{MirrorSource, FallbackSource, GitHubSource})
 	})
 
 	// 2026-09-20 用户要求：面板发布给所有人用，局域网镜像入口已删除，别的用户的

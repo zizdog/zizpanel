@@ -236,14 +236,18 @@ const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 // DefaultNavListenPort 是「导航页独立端口」的默认值（只绑 127.0.0.1，纯 HTTP）。
 const DefaultNavListenPort = 8896
 
-// DefaultUpgradeSource 是在线升级的**公网主源**（用户要求"以后探测以公网 zizdog.com 为主"）。
+// DefaultUpgradeSource 是在线升级的**默认源 = 公网镜像站**（用户 2026-09-22：
+// "请确保新安装的 panel 一定得是 https://mirror.zizdog.com:8888/zizpanel"）。
 //
-// 它与 internal/upgrade.CandidateSources 里的默认候选是同一个值
-// （那里直接引用本常量，保证不会漂移）。注意语义：
-//   - 它只是默认配置值，不代表"用户显式选了它"；
-//   - UpgradeSource 被显式清空后，候选列表会照常包含它 —— 清空配置
-//     不等于禁用网络升级，只等于"让面板自己按优先级选"。
-const DefaultUpgradeSource = "https://zizdog.com/zizpanel"
+// 为什么从 zizdog.com 改成镜像站：zizdog.com 只有 4 Mbps，面板包 25MB 要下很久；
+// 镜像站实测快一个数量级。zizdog.com 仍是 CandidateSources 里的**兜底候选**
+// （见 upgrade.FallbackSource），所以默认值变了不等于失去那个源。
+//
+// 注意语义：
+//   - 它只是默认配置值，不代表"用户显式选了它"；老机器配置里存的 zizdog.com
+//     是**用户设置**，升级/更新**不会**改写（只有设置页与显式传源的检查会写）；
+//   - UpgradeSource 被显式清空后，候选列表会照常按优先级选（镜像 → zizdog → GitHub）。
+const DefaultUpgradeSource = "https://mirror.zizdog.com:8888/zizpanel"
 
 func DefaultConfigPath() string {
 	return filepath.Join(root(), "data", "config.json")

@@ -57,9 +57,13 @@ func (s *Server) mirrorDirSetting(ctx context.Context) string {
 	return strings.TrimSpace(v)
 }
 
-// mirrorDefaultSource 是内置公网发布源（internal/upgrade/source.go 的 DefaultSource，
-// 即 zizdog.com）：镜像同步必须从公网源拉，默认绝不能是镜像自己（坑 218）。
-func (s *Server) mirrorDefaultSource() string { return upgrade.DefaultSource }
+// mirrorDefaultSource 是内置公网发布源 = zizdog.com（upgrade.FallbackSource）：
+// 镜像同步必须从公网源拉，默认绝不能是镜像自己（坑 218）。
+//
+// ⚠️ 2026-09-22：这里**不能**再用 upgrade.DefaultSource —— 它现在等于镜像站自己
+// （新装默认升级源已改成镜像站），拿它当同步来源就是让镜像从自己同步（循环、必然失败）。
+// 门禁锁住这条（TestMirrorSyncDefaultSource*）。
+func (s *Server) mirrorDefaultSource() string { return upgrade.FallbackSource }
 
 // resolveMirrorSource 取本次同步的源：请求体优先，留空用内置公网发布源（绝不默认镜像自己）。
 func (s *Server) resolveMirrorSource(raw string) string {
