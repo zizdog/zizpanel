@@ -738,7 +738,7 @@ func TestApplyRecordsModuleRefreshOutcomes(t *testing.T) {
 			{Name: "zizvideo", Status: services.ModuleRefreshed,
 				Reason:  "已替换并重启，自检：zizvideo 0.2.0",
 				FromSHA: strings.Repeat("a", 64), ToSHA: strings.Repeat("b", 64)},
-			{Name: "macsaber", Status: services.ModuleRolledBack,
+			{Name: "widget", Status: services.ModuleRolledBack,
 				Reason:  "自检未通过：exit status 1；已回滚旧二进制",
 				FromSHA: strings.Repeat("c", 64), ToSHA: strings.Repeat("d", 64)},
 			{Name: "gizmo", Status: services.ModuleSkipped, Reason: "未安装 gizmo"},
@@ -761,8 +761,8 @@ func TestApplyRecordsModuleRefreshOutcomes(t *testing.T) {
 		m.FromSHA != strings.Repeat("a", 12) || m.ToSHA != strings.Repeat("b", 12) {
 		t.Errorf("zizvideo 结果不对: %+v", m)
 	}
-	if m := byName["macsaber"]; m.Status != services.ModuleRolledBack {
-		t.Errorf("macsaber 应为 rolled-back: %+v", m)
+	if m := byName["widget"]; m.Status != services.ModuleRolledBack {
+		t.Errorf("widget 应为 rolled-back: %+v", m)
 	}
 	if m := byName["gizmo"]; m.Status != services.ModuleSkipped {
 		t.Errorf("gizmo 应为 skipped: %+v", m)
@@ -783,7 +783,7 @@ func TestApplyRecordsModuleRefreshOutcomes(t *testing.T) {
 		if s.Stage == "刷新模块 zizvideo" && s.OK {
 			stepped = true
 		}
-		if s.Stage == "刷新模块 macsaber" && s.OK {
+		if s.Stage == "刷新模块 widget" && s.OK {
 			t.Errorf("回滚的模块不该记成成功：%+v", s)
 		}
 	}

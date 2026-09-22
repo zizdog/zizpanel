@@ -1,6 +1,7 @@
 package web
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -10,9 +11,9 @@ import (
 // ============================================================================
 //  合并结果的 ID 唯一性门禁（坑 228）
 //
-//  用户报障：「软件市场里出现了两个 mac军刀」。真机证据：services 表里同时有
-//  cn.zizpanel.macsaber（当前系统守护进程）与 cn.macsaber.web（旧用户级 agent 的
-//  残留记录），前端按 label 归一化去重认不出它们是同一个应用 ⇒ 两张卡片。
+//  用户报障：「软件市场里出现了两个同应用卡片」。真机证据：services 表里同时有
+//  当前标签的记录与一条旧标签的残留记录，前端按 label 归一化去重认不出它们是
+//  同一个应用 ⇒ 两张卡片。这里用 zizvideo 复刻同一类数据。
 //
 //  修法：接口把**目录 ID**（app_id）交给前端当稳定键。下面这条遍历门禁锁死：
 //    · /api/v1/market 每条都有 app_id == id，且 app_id 全局唯一；
@@ -49,24 +50,28 @@ func TestMarketListAppIDsAreUniqueAndStable(t *testing.T) {
 	}
 }
 
-// TestServiceRecordsCarryCatalogAppID 服务记录必须带目录 app_id；旧标签的记录也认。
-func TestServiceRecordsCarryCatalogAppID(t *testing.T) {
-	srv, ts := newTestServer(t)
-	cookies := loginTestPanel(t, ts)
-
-	// 复刻本机实况：当前系统守护进程 + 旧用户级 agent 的残留记录，display_name 都是 "mac军刀"。
-	repo := services.NewRepository(srv.Store)
+// seedLegacyLabelRecords 复刻真机实况：同一个应用的两条记录 —— 当前标签一条、
+// 换过部署方式留下的旧标签一条（旧标签靠"记录名 == 目录 ID"认回同一个应用）。
+func seedLegacyLabelRecords(t *testing.T, repo *services.Repository) {
+	t.Helper()
 	for _, r := range []struct{ name, label string }{
-		{"cn-zizpanel-macsaber", services.MacSaberLabel},
-		{"cn-macsaber-web", services.MacSaberLegacyLabel},
+		{"cn-zizpanel-zizvideo", services.ZizvideoLabel},
+		{services.ZizvideoAppID, "cn.zizvideo.legacy"},
 	} {
 		if err := repo.Create(t.Context(), &services.Service{
-			Name: r.name, DisplayName: "mac军刀", Kind: services.KindNative,
-			LaunchLabel: r.label, Icon: "🔪", Port: services.MacSaberPort,
+			Name: r.name, DisplayName: "zizvideo", Kind: services.KindNative,
+			LaunchLabel: r.label, Icon: "🎬", Port: services.ZizvideoPort,
 		}); err != nil {
 			t.Fatalf("准备记录 %s 失败: %v", r.name, err)
 		}
 	}
+}
+
+// TestServiceRecordsCarryCatalogAppID 服务记录必须带目录 app_id；旧标签的记录也认。
+func TestServiceRecordsCarryCatalogAppID(t *testing.T) {
+	srv, ts := newTestServer(t)
+	cookies := loginTestPanel(t, ts)
+	seedLegacyLabelRecords(t, services.NewRepository(srv.Store))
 
 	_, out, _ := doJSON(t, ts, "GET", "/api/v1/services?health=0", nil, cookies)
 	list, _ := out["data"].(map[string]any)["list"].([]any)
@@ -75,10 +80,10 @@ func TestServiceRecordsCarryCatalogAppID(t *testing.T) {
 	}
 	for _, it := range list {
 		m, _ := it.(map[string]any)
-		if got := asString(m["app_id"]); got != services.MacSaberAppID {
+		if got := asString(m["app_id"]); got != services.ZizvideoAppID {
 			t.Errorf("记录 %s（label %s）的 app_id 应是 %s，实际 %q —— "+
 				"旧标签的记录认不出来就会多出一张卡片",
-				asString(m["name"]), asString(m["launch_label"]), services.MacSaberAppID, got)
+				asString(m["name"]), asString(m["launch_label"]), services.ZizvideoAppID, got)
 		}
 	}
 }
@@ -90,19 +95,7 @@ func TestServiceRecordsCarryCatalogAppID(t *testing.T) {
 func TestInstalledMergeYieldsOneCardPerAppID(t *testing.T) {
 	srv, ts := newTestServer(t)
 	cookies := loginTestPanel(t, ts)
-
-	repo := services.NewRepository(srv.Store)
-	for _, r := range []struct{ name, label string }{
-		{"cn-zizpanel-macsaber", services.MacSaberLabel},
-		{"cn-macsaber-web", services.MacSaberLegacyLabel},
-	} {
-		if err := repo.Create(t.Context(), &services.Service{
-			Name: r.name, DisplayName: "mac军刀", Kind: services.KindNative,
-			LaunchLabel: r.label, Port: services.MacSaberPort,
-		}); err != nil {
-			t.Fatalf("准备记录 %s 失败: %v", r.name, err)
-		}
-	}
+	seedLegacyLabelRecords(t, services.NewRepository(srv.Store))
 
 	_, mout, _ := doJSON(t, ts, "GET", "/api/v1/market", nil, cookies)
 	mlist, _ := mout["data"].(map[string]any)["list"].([]any)
@@ -111,13 +104,12 @@ func TestInstalledMergeYieldsOneCardPerAppID(t *testing.T) {
 
 	// 卡片 = 按 app_id 分组；没有 app_id 的（纯自建服务）按记录名各算一张。
 	cards := map[string][]string{}
+	marketCards := 0
 	for _, it := range mlist {
 		m, _ := it.(map[string]any)
-		if m["installed"] != true && m["adopted"] != true {
-			continue // 未安装的市场条目留在市场 Tab，不进「已安装」
-		}
 		if id := asString(m["app_id"]); id != "" {
 			cards[id] = append(cards[id], "market:"+asString(m["id"]))
+			marketCards++
 		}
 	}
 	for _, it := range slist {
@@ -128,20 +120,14 @@ func TestInstalledMergeYieldsOneCardPerAppID(t *testing.T) {
 		}
 		cards[id] = append(cards[id], "svc:"+asString(m["name"]))
 	}
-	if got := cards[services.MacSaberAppID]; len(got) < 2 {
-		t.Fatalf("复刻数据没生效：macsaber 的 app_id 分组只有 %v（应有市场条目+两条记录）", got)
+	// 该应用的两条记录 + 那一条市场条目必须落在同一个分组里。
+	if got := cards[services.ZizvideoAppID]; len(got) != 3 {
+		t.Fatalf("zizvideo 应合成一张卡片（1 条市场条目 + 2 条记录），实际分组 %v", got)
 	}
-	// macsaber 的**卡片**只有一张（分组键唯一即一张卡片）。
-	macCards := 0
-	for id := range cards {
-		if id == services.MacSaberAppID {
-			macCards++
-		}
+	// 市场条目数 == 分组数 ⇒ 没有任何条目因为键不同而单独成卡。
+	if marketCards != len(cards) {
+		t.Errorf("市场条目 %d 个，分组 %d 个 —— 有应用被拆成了多张卡片", marketCards, len(cards))
 	}
-	if macCards != 1 {
-		t.Fatalf("macsaber 应只对应 1 张卡片，实际 %d", macCards)
-	}
-	// 每条服务记录都必须落进某一组，且组内不重复出现同一个 app_id 的分组。
 	for id, members := range cards {
 		if id == "" {
 			t.Errorf("有条目落进了空分组：%v", members)
@@ -151,7 +137,7 @@ func TestInstalledMergeYieldsOneCardPerAppID(t *testing.T) {
 
 // TestFrontendMergeKeysByAppID 前端必须以 app_id 为合并键。
 //
-// 静态钉住：把这条从 appKeyOf 里删掉就退回"按 label 猜身份"，正是两个 mac军刀 的成因。
+// 静态钉住：把这条从 appKeyOf 里删掉就退回"按 label 猜身份"，正是重复卡片的成因。
 func TestFrontendMergeKeysByAppID(t *testing.T) {
 	sp := readAssetJS(t, "servicePanel.js")
 	mustContain(t, "servicePanel.js", sp, "const appID = typeof x.app_id === 'string' ? x.app_id.trim().toLowerCase() : '';")
@@ -163,5 +149,26 @@ func TestFrontendMergeKeysByAppID(t *testing.T) {
 	apps := readAssetJS(t, "apps.js")
 	if !strings.Contains(apps, "dedupeMarketEntries((cache?.list || [])") {
 		t.Error("apps.js 的市场渲染必须走 dedupeMarketEntries（按稳定键去重），不能自己 set 一遍")
+	}
+}
+
+// TestMarketUninstallForgetsEveryAppIdentityLabel 卸载后必须按**全部身份键**删记录。
+//
+// 只删 app.ServiceLabel 的旧写法会留下旧标签的残留记录，卸载后它以残留卡片再冒出来
+// （坑 228）。这里静态钉住调用点，行为面由 internal/services 的
+// TestForgetByLabelsRemovesEveryAppIdentity 遍历全目录锁死。
+func TestMarketUninstallForgetsEveryAppIdentityLabel(t *testing.T) {
+	src, err := os.ReadFile("api_services.go")
+	if err != nil {
+		t.Fatalf("读不到 api_services.go: %v", err)
+	}
+	s := string(src)
+	mustContain(t, "api_services.go", s, "labels := services.AppIdentityLabels(app)")
+	mustContain(t, "api_services.go", s, "ForgetByLabels(ctx, labels...)")
+	if strings.Contains(s, "ForgetByLabel(ctx, app.ServiceLabel)") {
+		t.Error("卸载路径又退回只删 ServiceLabel —— 旧标签的残留记录会以残留卡片冒出来（坑 228）")
+	}
+	if got := strings.Count(s, "labels := services.AppIdentityLabels(app)"); got != 2 {
+		t.Errorf("installer 与 brew 两条卸载路径都应覆盖全部身份键，实际只有 %d 处调用", got)
 	}
 }

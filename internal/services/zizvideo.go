@@ -295,7 +295,7 @@ func ZizvideoSuperviseArgs(panelBin, userName string, p ZizvideoPaths) []string 
 // zizvideoPlistContent 渲染**系统级 LaunchDaemon** 定义。
 //
 // 刻意**不写 UserName**：这个作业必须以 root 运行 —— supervisor 要 fork 之后
-// setuid 降权到真实用户（同 macsaber，见 docs/坑清单.md 202）。
+// setuid 降权到真实用户（见 docs/坑清单.md 202）。
 func zizvideoPlistContent(label string, args []string, outLog, errLog string) string {
 	var b strings.Builder
 	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
@@ -675,4 +675,25 @@ func (m *Manager) zizvideoInstallPlan() UninstallPlan {
 		"媒体根由 media_allow_roots 指向的文件**任何情况下都不会动**；" +
 		"要一并删除数据请在确认框里勾选「同时删除数据」"
 	return plan
+}
+
+// installFileExecutable 把一个文件复制到目标路径并给可执行位（先写 .part 再改名，
+// 避免覆盖正在运行的二进制时留下半个文件）。
+func installFileExecutable(from, to string) error {
+	data, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+		return err
+	}
+	tmp := to + ".part"
+	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, to); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

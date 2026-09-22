@@ -52,10 +52,9 @@ type moduleSpec struct {
 	launch    func(m *Manager, ctx context.Context, label, plist string) error
 }
 
-// managedModuleSpecs 返回要刷新的模块清单（zizvideo 与 macsaber 共用这一套逻辑）。
+// managedModuleSpecs 返回要刷新的模块清单。
 func (m *Manager) managedModuleSpecs(panelBinDir string) []moduleSpec {
 	zp := m.ZizvideoPathsFor()
-	mp := m.MacSaberPathsFor()
 	return []moduleSpec{
 		{
 			name:      ZizvideoAppID,
@@ -65,15 +64,6 @@ func (m *Manager) managedModuleSpecs(panelBinDir string) []moduleSpec {
 			plist:     zp.Plist,
 			selfArgs:  []string{"--version"},
 			launch:    zizvideoLaunch,
-		},
-		{
-			name:      MacSaberAppID,
-			label:     MacSaberLabel,
-			bundled:   filepath.Join(panelBinDir, MacSaberAppID),
-			installed: mp.Bin,
-			plist:     mp.Plist,
-			selfArgs:  []string{"version"},
-			launch:    macSaberLaunch,
 		},
 	}
 }
@@ -97,7 +87,7 @@ func (m *Manager) RefreshInstalledModules(ctx context.Context, panelBinDir strin
 func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) ModuleRefreshResult {
 	r := ModuleRefreshResult{Name: spec.name}
 
-	// ① 携带位没有这个模块（老发布包 / macsaber 本来就不随包）⇒ 跳过，绝不顺手安装。
+	// ① 携带位没有这个模块（老发布包 / 模块改为按需下载后不随包）⇒ 跳过，绝不顺手安装。
 	if !fileExecutable(spec.bundled) {
 		r.Status = ModuleSkipped
 		r.Reason = "发布包未携带 " + spec.name + " 二进制（" + spec.bundled + "）"

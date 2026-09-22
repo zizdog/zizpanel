@@ -18,31 +18,28 @@ import (
 type moduleRefreshEnv struct {
 	panelDir string // 携带位所在目录（面板 BinDir）
 	zRoot    string // zizvideo 安装根（临时）
-	msRoot   string // macsaber 安装根（临时）
 	daemons  string // 系统 plist 目录（临时）
 }
 
 func newModuleRefreshEnv(t *testing.T) *moduleRefreshEnv {
 	t.Helper()
-	prevZ, prevMS := ZizvideoInstallRoot, MacSaberInstallRoot
+	prevZ := ZizvideoInstallRoot
 	prevDaemons := SystemLaunchDaemonsDir
 	prevSelf := moduleSelfCheckRun
-	prevZLaunch, prevMSLaunch := zizvideoLaunch, macSaberLaunch
+	prevZLaunch := zizvideoLaunch
 	t.Cleanup(func() {
-		ZizvideoInstallRoot, MacSaberInstallRoot = prevZ, prevMS
+		ZizvideoInstallRoot = prevZ
 		SystemLaunchDaemonsDir = prevDaemons
 		moduleSelfCheckRun = prevSelf
-		zizvideoLaunch, macSaberLaunch = prevZLaunch, prevMSLaunch
+		zizvideoLaunch = prevZLaunch
 	})
 
 	env := &moduleRefreshEnv{
 		panelDir: t.TempDir(),
 		zRoot:    t.TempDir(),
-		msRoot:   t.TempDir(),
 		daemons:  t.TempDir(),
 	}
 	ZizvideoInstallRoot = env.zRoot
-	MacSaberInstallRoot = env.msRoot
 	SystemLaunchDaemonsDir = env.daemons
 	return env
 }
@@ -276,43 +273,6 @@ func TestModuleRefreshNeverTouchesModuleDataDir(t *testing.T) {
 	}
 	if before != after {
 		t.Errorf("模块数据目录被改动了：\nbefore=%s\nafter=%s", before, after)
-	}
-}
-
-// macsaber（已冻结但已安装）走同一套刷新逻辑，不写第二份。
-func TestModuleRefreshAppliesToMacSaberViaSharedLogic(t *testing.T) {
-	env := newModuleRefreshEnv(t)
-	installed := MacSaberBin()
-	plist := SystemDaemonPlistPath(MacSaberLabel)
-	writeModuleFile(t, installed, "#!/bin/bash\necho 'macsaber old'\n", 0o755)
-	writeModuleFile(t, plist, "<plist/>", 0o644)
-	writeModuleFile(t, filepath.Join(env.panelDir, MacSaberAppID), "#!/bin/bash\necho new\n", 0o755)
-
-	var checked []string
-	moduleSelfCheckRun = func(_ *Manager, _ context.Context, bin string, args ...string) (string, error) {
-		checked = append(checked, bin+" "+strings.Join(args, " "))
-		return "macsaber v0.2.0", nil
-	}
-	var launched []string
-	macSaberLaunch = func(_ *Manager, _ context.Context, label, plist string) error {
-		launched = append(launched, label)
-		return nil
-	}
-
-	results := RefreshInstalledModules(context.Background(), env.panelDir)
-	r := moduleRefreshResultFor(t, results, MacSaberAppID)
-	if r.Status != ModuleRefreshed {
-		t.Fatalf("macsaber 应被刷新，实际 %s（%s）", r.Status, r.Reason)
-	}
-	if len(checked) != 1 || !strings.HasPrefix(checked[0], installed+" version") {
-		t.Errorf("macsaber 自检命令应是 `version`，实际 %v", checked)
-	}
-	if len(launched) != 1 || launched[0] != MacSaberLabel {
-		t.Errorf("应重启 %s，实际 %v", MacSaberLabel, launched)
-	}
-	// zizvideo 未安装（本环境没造它），应作为 skipped 一并如实回报。
-	if z := moduleRefreshResultFor(t, results, ZizvideoAppID); z.Status != ModuleSkipped {
-		t.Errorf("zizvideo 未安装应 skipped，实际 %s", z.Status)
 	}
 }
 

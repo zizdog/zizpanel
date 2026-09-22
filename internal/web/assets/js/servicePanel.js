@@ -63,8 +63,8 @@ const KNOWN_LABEL_PREFIXES = [
 // appKeyOf 把一个应用/服务归一化成一个去重 key。
 //
 // **稳定键优先**：后端解析出的目录 ID（市场条目的 app_id / 服务记录的 app_id）。
-// 一个应用换过部署方式后会留下旧标签的记录（mac军刀 的 cn.macsaber.web），
-// 光按 label 归一化认不出它们是同一个应用 —— 那正是"两个 mac军刀"的根因（坑 228）。
+// 一个应用换过部署方式后会留下旧标签的记录，光按 label 归一化认不出它们是同一个
+// 应用 —— 那正是"同一应用显示两张卡片"的根因（坑 228）。
 // 没有 app_id 时才退回 label 归一化（用户自建的服务）。
 export function appKeyOf(x) {
   if (!x) return '';

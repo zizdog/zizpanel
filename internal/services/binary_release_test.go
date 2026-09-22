@@ -26,9 +26,9 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 		if !strings.Contains(spec.Asset, "darwin_arm64") && !strings.Contains(spec.Asset, "darwin-arm64") {
 			t.Errorf("%s 的产物 %q 不是 darwin-arm64", id, spec.Asset)
 		}
-		// MirrorOnly = 自研产物，只在镜像站上有（mac军刀）：
-		// 没有 GitHub tag / 官方地址 / 加速镜像，所以下面那三条"官方地址"的判据
-		// 对它不适用 —— 但**架构、目录一致性**这些判据一条都不放宽。
+		// MirrorOnly = 只在镜像站上的自研产物：没有 GitHub tag / 官方地址 /
+		// 加速镜像，所以下面那三条"官方地址"的判据对它不适用 ——
+		// 但**架构、目录一致性**这些判据一条都不放宽。
 		if !spec.MirrorOnly {
 			if !strings.HasPrefix(spec.Tag, "v") {
 				t.Errorf("%s 的 tag %q 应当写死成 vX.Y.Z（跟着 latest 漂会装错版本）", id, spec.Tag)
@@ -303,10 +303,9 @@ func TestReleaseBinaryChecksumRejectsMismatch(t *testing.T) {
 func TestReleaseBinaryUninstallPlans(t *testing.T) {
 	m := &Manager{opt: Options{UserHome: "/Users/tester", UserName: "tester"}}
 	for id := range releaseBinaryApps {
-		// MirrorOnly（自研产物，mac军刀）不走这条轨：它的卸载计划在
-		// macsaber.go 的 macSaberInstallPlan（系统级 LaunchDaemon + /opt/macsaber，
-		// 与"家目录 + 系统级 daemon"的通用计划完全不同）。这里只保证
-		// "登记在注册表里的通用条目都有计划"。
+		// MirrorOnly（自研产物）不走这条轨：它的卸载计划由它自己的安装器给
+		// （系统级 LaunchDaemon + 独立安装根，与"家目录 + 系统级 daemon"的通用
+		// 计划完全不同）。这里只保证"登记在注册表里的通用条目都有计划"。
 		if ReleaseBinaryIsMirrorOnly(id) {
 			continue
 		}

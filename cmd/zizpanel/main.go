@@ -91,12 +91,6 @@ func main() {
 		// 拉起（com.zizdog.stt，见 cmd/zizpanel/stt.go）。
 		// 引擎是 Homebrew 的 whisper.cpp（whisper-cli），转码用 ffmpeg。
 		err = cmdSTTServe(rest)
-	case "macsaber-supervise":
-		// mac军刀 的常驻 supervisor：由**系统级** LaunchDaemon
-		// cn.zizpanel.macsaber 以 root 拉起，fork 后 setuid 到真实用户运行
-		// macsaber —— 与面板同一代码要求，所以共用面板的 TCC 授权
-		// （见 cmd/zizpanel/macsaber.go 与 docs/坑清单.md 202）。
-		err = cmdMacSaberSupervise(rest)
 	case "zizvideo-supervise":
 		// zizvideo（短视频）的常驻 supervisor：由**系统级** LaunchDaemon
 		// cn.zizpanel.zizvideo 以 root 拉起，fork 后 setuid 到真实用户运行
@@ -169,7 +163,6 @@ func usage() {
   zizpanel imgcompress-serve       启动图片压缩网页界面（由 launchd 托管，默认 127.0.0.1:8890）
   zizpanel speech-serve            启动语音合成网页界面（由 launchd 托管，默认 127.0.0.1:8891；引擎为系统自带 say）
   zizpanel stt-serve               启动语音转文字网页界面（由 launchd 托管，默认 127.0.0.1:8892；引擎为 whisper.cpp + ffmpeg）
-  zizpanel macsaber-supervise      拉起并保活 mac军刀（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel zizvideo-supervise      拉起并保活 zizvideo（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel version                 显示版本
 

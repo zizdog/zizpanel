@@ -15,7 +15,7 @@
 //  用法：node tools/check-js-undeclared.mjs <目录或文件> [更多…]
 //  退出码 0 通过，1 有发现，2 用法/环境不对。
 // ============================================================================
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 let acorn;
@@ -48,6 +48,9 @@ if (args.length === 0) {
 }
 
 function walk(p, out) {
+  // 目录不存在就跳过：调用方会把"可能没有这个模块"的路径一起传进来
+  // （模块下线后 Makefile 没同步，整个 make check 会死在这里）。
+  if (!existsSync(p)) return;
   const st = statSync(p);
   if (st.isDirectory()) {
     if (basename(p) === 'vendor' || basename(p) === 'node_modules') return;

@@ -145,15 +145,15 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@echo "==> 前端 JS 语法检查（acorn）"
 	@# assets/nav 是「导航页」的独立别名页（GET /nav/）：它同样会被浏览器
 	@# 当模块解析，语法错误一样是白屏，所以一并纳入门禁。
-	@# macsaber（mac军刀）与 zizvideo（短视频）都是独立 module，前端同为原生 ESM。
+	@# zizvideo（短视频）是独立 module，前端同为原生 ESM。
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets zizvideo/internal/web/assets || exit 1; \
+	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav zizvideo/internal/web/assets || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@# acorn 只查语法、不查名字有没有定义：清理"死代码"时删掉过 `let cmCorePromise = null;`，
 	@# 引用还在 —— 语法合法、门禁全绿，浏览器却是 Can't find variable，编辑器直接打不开。
 	@echo "==> 前端 JS 未声明赋值检查"
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav macsaber/internal/web/assets zizvideo/internal/web/assets || exit 1; \
+	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav zizvideo/internal/web/assets || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@echo "==> go vet"
 	@$(MAKE) --no-print-directory vet
@@ -161,8 +161,8 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	@$(MAKE) --no-print-directory test
 	@# 独立软件是各自的 go module，不在面板这个 module 里，`./...` 扫不到 —— 单独跑，
 	@# 否则新代码等于没有门禁（gofmt 除外：仓库根的 `gofmt -l .` 已经覆盖它们）。
-	@echo "==> 独立软件模块自测（mac军刀 / zizvideo）"
-	@for m in macsaber zizvideo; do \
+	@echo "==> 独立软件模块自测（zizvideo）"
+	@for m in zizvideo; do \
 	   if [ -d "$$m" ]; then \
 	     echo "  -- $$m"; \
 	     ( cd "$$m" && go vet ./... && go test ./... -count=1 ) || exit 1; \
@@ -556,10 +556,6 @@ sync-apps: ## 把应用安装包同步到你自己的镜像机（apps/<应用>/<
 	@NAS_HOST="$(NAS_HOST)" NAS_USER="$(NAS_USER)" NAS_ROOT="$(NAS_APPS_ROOT)" \
 	 NAS_PASS="$(NAS_PASS)" MIRROR_BASE_URL="$(APPS_MIRROR_URL)" \
 	 bash tools/sync-nas-apps.sh $(SYNC_ARGS)
-
-.PHONY: macsaber-release
-macsaber-release: ## 打包 mac军刀（默认只产出到 dist/macsaber/，上传要显式 --host）
-	@bash tools/macsaber-release.sh $(MACSABER_ARGS)
 
 # ---------------------------------------------------------------- 版本号 --
 .PHONY: bump

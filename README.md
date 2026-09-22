@@ -100,7 +100,7 @@ curl -fsSL https://zizdog.com/zizpanel/install.sh | sudo bash
 分类：**网站环境**（Nginx、PHP 8.2/8.4、MySQL 8.4 / MariaDB 13.0、PostgreSQL、
 Python 3.10–3.13）、**AI 服务**（Qwen3 TTS、TtsVoice 音色接收端、IOPaint、图片压缩）、
 **运维工具**（phpMyAdmin、Uptime Kuma、Gitea、Miniflux、Syncthing、Alist、frpc、
-ddns-go、mac军刀 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
+ddns-go 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Emlog、Kodbox 等）。
 
 - 「网站管理」顶部有「⚡ 一键安装 LNMP 环境」：装 nginx + PHP + 数据库并做收尾配置，
   数据库默认 **MariaDB 13.0**（可选 **MySQL 8.4**）。
@@ -109,8 +109,6 @@ ddns-go、mac军刀 等）、**一键建站**（Typecho、WordPress、FreshRSS�
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
 - 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物）；**Docker 应用面板不代装**，
   只在 Docker 页给一份可参考的预配置 compose，镜像必须原生支持 arm64。
-- **mac军刀** 是本机 macOS 工具箱（图片格式转换、哈希计算、系统概览、去下载隔离）：
-  装完点卡片上的「打开」进它的网页界面（首次要设本机用户名与口令）。
 
 ### 任务中心
 

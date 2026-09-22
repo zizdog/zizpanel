@@ -1373,54 +1373,6 @@ var marketDownloadApps = []MarketApp{
 			"必须由安装器生成 rpc-username/rpc-password 并回读 settings.json 核对生效。",
 	},
 
-	// ---------------- mac军刀（本项目自研产物，只在镜像站） ----------------
-	{
-		ID: "macsaber", Kind: KindNative, PanelInstaller: "macsaber", ServiceLabel: MacSaberLabel,
-		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: MacSaberLabel,
-			LabelSource: "目录 ServiceLabel（系统级 LaunchDaemon；可执行文件是面板自身的 macsaber-supervise）",
-		},
-		Downloads: []MarketDownloadPoint{
-			{
-				Purpose: MarketFetchReleaseBinary,
-				Label:   "下载 macsaber_" + MacSaberVersion + "_darwin_arm64.tar.gz",
-				Upstream: MarketUpstream{
-					ID:  "自建镜像 apps/macsaber/" + MacSaberVersion + "/" + MacSaberArtifactName(MacSaberVersion),
-					URL: "https://mirror.zizdog.com:8888/apps/macsaber/" + MacSaberVersion + "/" + MacSaberArtifactName(MacSaberVersion),
-					// Tag/Asset 必须与 ReleaseBinaryAssets() 注册表逐字一致（门禁比对）；
-					// **不填 Repo**：这个包不是 GitHub release 产物（自研产物），填了会被
-					// 拿去与注册表比对而报错，也会让审计去拼一个不存在的 github.com 地址。
-					Tag:   MacSaberVersion,
-					Asset: MacSaberArtifactName(MacSaberVersion),
-					Size:  macSaberArchiveSizeHint,
-					Note: "自研产物实测 " + humanBytes(macSaberArchiveSizeHint) + "（tools/macsaber-release.sh 打出来的包）；" +
-						"**公网镜像站是唯一来源**，没有 GitHub / 第三方加速回落 —— 镜像不可达时这一步就装不上，" +
-						"这是如实的事实而不是缺口（本仓库自己发的包，作者能控制镜像）",
-				},
-				NAS:     nasMirrored("apps/macsaber/" + MacSaberVersion + "/" + MacSaberArtifactName(MacSaberVersion)),
-				Timeout: macSaberDownloadTimeout,
-				// 唯一来源：没有它安装必然失败（不是"可选"）。
-				Required: true,
-				Checksum: MarketChecksum{
-					Asset: "镜像站 manifest.json（与包同目录；make sync-apps 生成）",
-					// 期望值在这里写不下来：sha256 由 tools/macsaber-release.sh 每次构建
-					// 现算，写进代码就一定会与下一次构建漂移（而漂移的后果是"镜像永不命中"）。
-					// 所以：镜像有 manifest.json 时用清单的值；没有时用 MacSaberArchiveSHA256
-					// （打包实测值，测试锁住"换版本必须同时更新它"）。
-					SHA256: MacSaberArchiveSHA256,
-					Source: "本机实跑 tools/macsaber-release.sh 得到的归档 sha256（发布脚本会打印；" +
-						"镜像站 manifest.json 是运行期优先来源）",
-					Note: "校验在**解包之前**（verifyMacSaberSHA256）；解出来还有 file(1) 的 arm64 复核" +
-						"与 `macsaber version` 的版本复核（三道，缺一不可）",
-				},
-				ARM64: "上游资产名自带 darwin_arm64，且产物是本仓库 CGO_ENABLED=0 GOARCH=arm64 亲自编的；" +
-					"安装时用 file(1) 复核 Mach-O arm64，并用 `macsaber version` 复核它真的能在这台机器上跑起来",
-				Note: "回落顺序只有一条：镜像站。装不上时的下一步是 `make sync-apps`（把包推到镜像站），" +
-					"不是换个公网地址 —— 它没有公网地址",
-			},
-		},
-	},
-
 	// ---------------- zizvideo（本项目自研模块，随面板包分发） ----------------
 
 	{

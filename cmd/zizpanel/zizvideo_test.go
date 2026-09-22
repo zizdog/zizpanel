@@ -163,3 +163,13 @@ func TestZizvideoSuperviseRefusesNonRoot(t *testing.T) {
 		t.Errorf("错误信息要说清需要 root，实际 %v", err)
 	}
 }
+
+// envHas 判断环境变量切片里有没有某个完整键值。
+func envHas(env []string, kv string) bool {
+	for _, e := range env {
+		if e == kv {
+			return true
+		}
+	}
+	return false
+}

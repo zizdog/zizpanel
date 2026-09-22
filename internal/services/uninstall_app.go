@@ -848,12 +848,6 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"stt": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallSTT(ctx, app, removeData, false, r)
 	},
-	// mac军刀（MacSaber）：bootout system 域 + 删系统 plist（兼容残留的旧用户级
-	// agent）+ 删 /opt/macsaber；数据目录与 ~/MacSaberFiles **默认保留**
-	//（里面是账号、审计日志与用户自己的文件）。
-	"macsaber": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
-		return m.UninstallMacSaber(ctx, app, removeData, r)
-	},
 	// zizvideo（短视频模块）：bootout system 域 + 删系统 plist + 删 /opt/zizvideo；
 	// 数据目录（DB、封面、config.json）与**媒体根**默认保留（媒体是用户自己的文件）。
 	"zizvideo": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
@@ -1359,11 +1353,6 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		p.KeepNote = "默认保留配置目录（RPC 凭据哈希在里面，重装后仍是同一个口令）；" +
 			"**下载下来的文件永远不动**。要彻底清理请勾选「删除数据」，或手工删除 " +
 			m.transmissionConfigDir()
-	case "macsaber":
-		// mac军刀：产物是自研的 LaunchAgent + /opt/macsaber，没有 brew 包要卸。
-		// 计划与执行端共用同一个 macSaberInstallPlan（路径只写一份，避免"计划说删 A、
-		// 实际删 B"）。
-		p = m.macSaberInstallPlan()
 	case "zizvideo":
 		// zizvideo：产物是自研的系统级 LaunchDaemon + /opt/zizvideo，没有 brew 包要卸。
 		// 计划与执行端共用同一个 zizvideoInstallPlan（路径只写一份）；媒体根永不进 DataPaths。

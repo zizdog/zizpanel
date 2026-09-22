@@ -12,6 +12,7 @@ import (
 	"compress/gzip"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -588,3 +589,37 @@ func TestInstallZizvideoFallsBackToUpgradeDownloadCache(t *testing.T) {
 		t.Errorf("安装后应落盘 %s：%v", ZizvideoBin(), err)
 	}
 }
+
+// removeAllPlists 删除一组 plist（不存在算成功）。
+func removeAllPlists(paths []string) error {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexOfToken 返回 token 在 args 里的下标（找不到 -1）。
+func indexOfToken(args []string, token string) int {
+	for i, a := range args {
+		if a == token {
+			return i
+		}
+	}
+	return -1
+}
+
+// runOutputErr 跑一个命令并把输出与错误一起带回（测试用，只用于 plutil 校验）。
+func runOutputErr(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	return string(out), err
+}
+
+// errString 是测试用的最小 error（不引额外依赖）。
+type errString string
+
+func (e errString) Error() string { return string(e) }

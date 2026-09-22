@@ -1402,12 +1402,6 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		// 所以走自研安装器（见 services/transmission.go）。
 		s.handleInstallTransmission(w, r)
 		return
-	case "macsaber":
-		// mac军刀：没有上游、没有 brew 包，产物是本仓库自己打的 darwin/arm64
-		// 单二进制（只发镜像站），而且要装成**真实用户的 LaunchAgent**（它读该
-		// 用户的家目录、写该用户的 ~/MacSaberFiles）—— 通用流程一样都做不到。
-		s.handleInstallMacSaber(w, r)
-		return
 	case "zizvideo":
 		// zizvideo：没有上游、没有 brew 包，二进制**随面板发布包分发**
 		// （<面板二进制目录>/zizvideo），要装成系统级 LaunchDaemon
@@ -1442,15 +1436,6 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 	// 只看注册表会绕过 compose 安装器去 GitHub 下 darwin 二进制 ——
 	// 真机复现：任务日志里出现 lucky_2.27.2_darwin_arm64.tar.gz 的镜像检查，
 	// 而目录条目明明是 compose，用户看到的就是"装不上"。
-	//
-	// mac军刀 是同一个陷阱的反面：它在注册表里（市场门禁要求 release_binary
-	// 下载点与 ReleaseBinaryAssets 对得上），但**不能**走这套通用流程 ——
-	// 它没有 GitHub 地址，而且服务是用户级 LaunchAgent 不是系统级 LaunchDaemon
-	// （它要读该用户的家目录）。它在上面按 PanelInstaller 分流，这里再挡一道。
-	if app.PanelInstaller == services.MacSaberAppID {
-		s.handleInstallMacSaber(w, r)
-		return
-	}
 	if services.IsReleaseBinaryApp(id) && !services.ReleaseBinaryIsMirrorOnly(id) &&
 		app.Kind != services.KindCompose && app.Kind != services.KindDocker {
 		s.handleInstallReleaseBinary(w, r)

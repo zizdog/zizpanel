@@ -9,7 +9,7 @@
 //
 // 为什么以 root 跑 supervisor、以真实用户跑子进程：LaunchDaemon 在系统域，root 才能
 // fork 后 setuid；zizvideo 写的是用户数据目录，以 root 跑产物会变成 root 所有。
-// 降权用 SysProcAttr.Credential 直接 setuid/setgid，**不经 sudo**（理由同 macsaber）。
+// 降权用 SysProcAttr.Credential 直接 setuid/setgid，**不经 sudo**。
 package main
 
 import (

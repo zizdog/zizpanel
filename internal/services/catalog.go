@@ -1586,7 +1586,7 @@ func Catalog() []App {
 				Target:       "/transmission/",
 				PreferDirect: true,
 				Note: "「打开」走面板子路径；RPC 只绑 127.0.0.1，直链只在本机可用。" +
-					"默认关闭本地网络发现，避免 macOS 反复要授权。",
+					"改 RPC 用户名/口令与下载目录请用卡片上的「⚙️ RPC 设置」，别手改 settings.json。",
 			},
 			Summary:     "轻量 BitTorrent 下载器（自带 Web UI 与 RPC）",
 			Description: "轻量下载器；RPC 默认无口令 = 裸奔，面板安装时生成口令并回读核对。",
@@ -1601,60 +1601,21 @@ func Catalog() []App {
 			ConfigPath: "{brew}/var/transmission/settings.json",
 			LogPath:    "{brew}/var/transmission/transmission-daemon.log",
 			PostInstallHint: "RPC 用户名/口令见安装结果凭据区（settings.json 里存的是哈希）；" +
-				"下载目录默认 ~/Downloads，可在 Web UI 里改。" +
-				"默认关了 DHT/LSD/UPnP（免得 macOS 反复要本地网络授权），要开请在设置里自行打开。",
+				"要改用户名/口令或下载目录，用卡片上的「⚙️ RPC 设置」（面板会停→写→起→回读）。" +
+				"手改 settings.json 再重启会被 daemon 退出时的回写覆盖；默认关 LSD/UPnP（DHT 保持开启，磁力链要用）。",
 			DocsURL: "https://transmissionbt.com",
-		},
-
-		// ---------------- mac军刀（本项目自研，系统级 LaunchDaemon） ----------------
-		//
-		// 与目录里别的条目最大的区别：**它没有上游**。产物是本仓库 macsaber/
-		// 自己编的 darwin/arm64 单二进制，由 tools/macsaber-release.sh 打包、
-		// 只发公网镜像站 <base>/apps/macsaber/<ver>/，没有 GitHub 回落源。
-		//
-		// 它的服务体是 `zizpanel macsaber-supervise`（面板自己的二进制），
-		// 与面板同一代码要求 ⇒ 面板的 TCC 授权对 supervisor 及其拉起的 macsaber
-		// 生效（不用第二套授权、升级不失效）；supervisor 以 root fork 后 setuid 到
-		// 真实用户跑 macsaber（读该用户家目录、写 ~/MacSaberFiles）。见坑 202。
-		// 刻意不标 SystemDaemon：那个字段驱动的是"把 brew services 的 agent 搬到
-		// 系统域"，而这个条目自己写系统 plist（同 release 二进制那条轨）。
-		{
-			ID: MacSaberAppID, Name: "mac军刀", Icon: "🔪",
-			UI: &AppUI{
-				Slug: MacSaberSlug,
-				// 面板的 /macsaber/ 反代是"给打开入口"的实现；本机直连走
-				// http://127.0.0.1:<Port>/。两条都要求 mac军刀 自己先登录（它不带鉴权
-				// 就没有会话），所以经面板打开**不等于**免登录。
-				//
-				// Port 用 8895 而不是 8899：8899 被音色接收端占着（硬冲突，且那套
-				// 链路属另一个项目、铁律 2 不许动），见 MacSaberPort 的注释。
-				Note: "网页界面只绑 127.0.0.1:" + strconv.Itoa(MacSaberPort) +
-					"（本机直连 http://127.0.0.1:" + strconv.Itoa(MacSaberPort) + "/）；" +
-					"经面板的 /macsaber/ 打开同样要登录 mac军刀 自己的账号。" +
-					"文件权限与面板共用，可写根是 ~/MacSaberFiles。",
-			},
-			Summary:     "macOS 原生工具箱：图片 / OCR / PDF / 音视频 / 文本 / 系统等 48 个工具",
-			Description: "把 macOS 自带能力包成 48 个网页小工具：只绑本机回环、不联网、不上传。",
-			Category:    CategoryTool, Kind: KindNative,
-			PanelInstaller: MacSaberAppID, ServiceLabel: MacSaberLabel,
-			// 旧用户级 agent 的标签：升级上来的机器会留下它的服务记录（坑 228）。
-			AliasLabels: []string{MacSaberLegacyLabel},
-			Port:        MacSaberPort, HealthPath: macSaberHealthPath,
-			PostInstallHint: "首次打开要设置本机用户名与口令（口令至少 8 位，只存在这台机器上）。" +
-				"文件权限与面板共用：面板能读的它就能读。",
-			DocsURL: "https://github.com/zizdog/zizpanel",
 		},
 
 		// ---------------- zizvideo（本项目自研模块，面板托管） ----------------
 		//
-		// 与 mac军刀 同一类：**它没有上游**。二进制随面板发布包一起分发
+		// **它没有上游**。二进制随面板发布包一起分发
 		// （make release 把它打进 tar 顶层，安装器从 <面板二进制目录>/zizvideo 取），
 		// 安装 = 本机复制 + 注册系统级 LaunchDaemon，不需要任何网络下载。
 		//
 		// 服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码
 		// 要求 ⇒ 与面板**共用文件权限**；supervisor 以 root fork 后 setuid 到真实用户
 		// 跑 zizvideo，配置与数据沿用 ~/Library/Application Support/zizvideo。
-		// 刻意不标 SystemDaemon：与 mac军刀 同理，它自己写系统 plist，不经过 brew services。
+		// 刻意不标 SystemDaemon：它自己写系统 plist，不经过 brew services。
 		{
 			ID: ZizvideoAppID, Name: "zizvideo", Icon: "🎬",
 			Summary:     "本地短视频库：把视频目录扫进 SQLite，浏览器里上下滑着看",

@@ -7,7 +7,7 @@ import (
 // ============================================================================
 //  目录身份唯一性门禁（坑 228）
 //
-//  「两个 mac军刀」的根因是合并层按 label 归一化猜身份，而一个应用换过部署方式后
+//  重复卡片的根因是合并层按 label 归一化猜身份，而一个应用换过部署方式后
 //  会留下旧标签的服务记录。修法是让后端解析出**目录 ID** 当稳定键。这条门禁遍历
 //  整个目录，锁死"一个 ID / 标签只属于一个应用"与"每种写法都能唯一解析回去"——
 //  任何新条目抢用别人的标签、或同一个 ID 出现两次，都在这里失败。
@@ -87,37 +87,6 @@ func TestEveryCatalogIdentityResolvesToItsOwnApp(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("一个目录标识都没检查到 —— 门禁等于没跑")
-	}
-}
-
-// TestMacSaberLegacyLabelResolvesToMacSaber 锁死本机报障的那一对标签。
-//
-// 升级上来的机器 services 表里同时有 cn.zizpanel.macsaber 与旧 cn.macsaber.web，
-// 两者必须都解析到 macsaber（否则就是两张卡片）。
-func TestMacSaberLegacyLabelResolvesToMacSaber(t *testing.T) {
-	if MacSaberLabel == MacSaberLegacyLabel {
-		t.Fatal("新旧标签不该相同 —— 测试本身写错了")
-	}
-	for _, label := range []string{MacSaberLabel, MacSaberLegacyLabel} {
-		app, ok := FindAppByService(&Service{LaunchLabel: label})
-		if !ok || app.ID != MacSaberAppID {
-			t.Fatalf("标签 %q 应解析到 %s，实际 app=%q ok=%v", label, MacSaberAppID, app.ID, ok)
-		}
-	}
-	// 旧标签必须显式声明在目录条目上，而不是靠 display_name 巧合命中。
-	app, ok := FindApp(MacSaberAppID)
-	if !ok {
-		t.Fatalf("目录里应有 %s", MacSaberAppID)
-	}
-	found := false
-	for _, al := range app.AliasLabels {
-		if al == MacSaberLegacyLabel {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("%s 的 AliasLabels 必须声明旧标签 %s，实际 %v",
-			MacSaberAppID, MacSaberLegacyLabel, app.AliasLabels)
 	}
 }
 

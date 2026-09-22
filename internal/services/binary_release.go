@@ -73,14 +73,13 @@ type releaseBinaryApp struct {
 	Notes []string
 	// MirrorOnly 表示这个包**只在镜像站上有**（没有 GitHub 官方地址，也没有第三方加速源）。
 	//
-	// 为什么需要它：mac军刀 是本仓库自己编的产物，`releaseURL()` 对它没有意义
+	// 为什么需要它：自研产物没有上游，`releaseURL()` 对它没有意义
 	// （Repo/Tag 留空会拼出一个不存在的 github.com//releases/... 地址）。
 	// 声明它之后下载候选只保留镜像站地址 —— 而不是"先试一个假地址再回落"。
 	//
-	// ⚠️ 这类应用**不走** releaseBinaryApps 的通用安装流程（那套是"系统级 LaunchDaemon +
-	// 家目录安装"），安装入口由 web 层的分流与 internal/services/macsaber.go 负责；
-	// 这里登记它是因为市场门禁要求 release_binary 下载点必须在
-	// ReleaseBinaryAssets() 注册表里有一份可核对的事实（版本/文件名）。
+	// ⚠️ 这类应用**不走** releaseBinaryApps 的通用安装/卸载流程（那套是"系统级
+	// LaunchDaemon + 家目录安装"），由它自己的安装器负责；登记在这里是因为市场
+	// 门禁要求 release_binary 下载点在 ReleaseBinaryAssets() 里有一份可核对的事实。
 	MirrorOnly bool
 }
 
@@ -328,22 +327,6 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 			"首次打开 http://127.0.0.1:4533 自行创建管理员账号（无默认口令）；" +
 				"它只绑回环，手机在局域网里直连 4533 是打不开的（走面板入口或反代）。",
 		},
-	},
-	// mac军刀（MacSaber）：本项目自研产物，**只在公网镜像站上**。
-	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
-	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
-	// 它的安装/卸载走 macsaber.go（系统级 LaunchDaemon，可执行文件是面板自身的
-	// macsaber-supervise），不走这套通用流程。
-	"macsaber": {
-		ID: "macsaber", Label: MacSaberLabel, Name: "mac军刀", Icon: "🔪",
-		Category: "tool", RootDir: "macsaber", MirrorOnly: true,
-		Tag: MacSaberVersion, Asset: MacSaberArtifactName(MacSaberVersion),
-		Binary: "macsaber",
-		// 归档是平铺的（macsaber + README.md，无顶层目录），不剥层、只挑 macsaber。
-		TarStrip: 0, PickBinary: true,
-		Port: MacSaberPort, HealthPath: macSaberHealthPath,
-		BindAddress:       "127.0.0.1",
-		CheckPortConflict: true,
 	},
 }
 

@@ -52,6 +52,7 @@ PANEL_APP_LABELS=(
   com.zizdog.imgcompress com.zizdog.macosspeech com.zizdog.stt
   com.zizdog.colima com.zizdog.filebrowser com.zizdog.frpc
   com.zizdog.orbien-client com.zizdog.ddns-go com.zizdog.alist
+  # 已下线应用的历史残留（mac军刀）：不再提供安装，但老机器上的记录仍要能清掉。
   cn.zizpanel.macsaber cn.macsaber.web
 )
 
@@ -580,6 +581,7 @@ build_plan_mode3() {
       fi
       [ -n "$formula" ] && plan_uninstall "${formula}（brew formula）"
       case "$label" in
+        # mac军刀 已下线：只为老机器的残留保留这条清理路径。
         cn.zizpanel.macsaber|cn.macsaber.web)
           [ -e /opt/macsaber ] && plan_delete "/opt/macsaber" ;;
         com.zizdog.colima) : ;;   # 数据目录在 colima_data_paths 里
