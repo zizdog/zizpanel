@@ -345,11 +345,6 @@ build_from_source() {
     export GOFLAGS=-mod=mod
     go build -trimpath -ldflags "-s -w" -o "$TMP_DIR/zizpanel" ./cmd/zizpanel &&
       go build -trimpath -ldflags "-s -w" -o "$TMP_DIR/$HELPER_NAME" ./cmd/zizpanel-helper
-    # zizvideo 是可选的面板托管模块：它自己的 module，编不出来不影响面板本身。
-    if [ -d "$src_root/zizvideo" ]; then
-      ( cd "$src_root/zizvideo" && go build -trimpath -ldflags "-s -w" -o "$TMP_DIR/zizvideo" ./cmd/server ) \
-        || warn "zizvideo 模块构建失败（可选模块；面板本身不受影响）"
-    fi
   ) || die "构建失败，请检查 Go 环境"
   SOURCE_BIN="$TMP_DIR/zizpanel"
   SOURCE_HELPER="$TMP_DIR/$HELPER_NAME"
@@ -805,10 +800,6 @@ install_binaries() {
   fi
 
   install -m 0755 "$SOURCE_BIN" "$BIN_DIR/zizpanel" || die "安装主程序失败"
-  # zizvideo（可选的面板托管模块）：发布包把它放在面板二进制旁边，面板安装模块时从这里取。
-  if [ -x "$(dirname "$SOURCE_BIN")/zizvideo" ]; then
-    install -m 0755 "$(dirname "$SOURCE_BIN")/zizvideo" "$BIN_DIR/zizvideo" || die "安装 zizvideo 模块失败"
-  fi
   if [ -n "$SOURCE_HELPER" ] && [ -f "$SOURCE_HELPER" ]; then
     install -m 0755 "$SOURCE_HELPER" "$BIN_DIR/$HELPER_NAME" || die "安装提权助手失败"
   elif [ -x "$BIN_DIR/$HELPER_NAME" ]; then

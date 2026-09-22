@@ -44,7 +44,7 @@ func TestFrontendAssetsGate(t *testing.T) {
 		}
 		args := []string{
 			filepath.Join("tools", "check-js-syntax.mjs"),
-			"internal/web/assets/js", "internal/web/assets/nav", "zizvideo/internal/web/assets",
+			"internal/web/assets/js", "internal/web/assets/nav",
 		}
 		cmd := exec.Command(node, args...)
 		cmd.Dir = root

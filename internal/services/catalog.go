@@ -1606,11 +1606,11 @@ func Catalog() []App {
 			DocsURL: "https://transmissionbt.com",
 		},
 
-		// ---------------- zizvideo（本项目自研模块，面板托管） ----------------
+		// ---------------- zizvideo（独立项目，面板托管） ----------------
 		//
-		// **它没有上游**。二进制随面板发布包一起分发
-		// （make release 把它打进 tar 顶层，安装器从 <面板二进制目录>/zizvideo 取），
-		// 安装 = 本机复制 + 注册系统级 LaunchDaemon，不需要任何网络下载。
+		// **它没有上游，也不再随面板包分发**：zizvideo 自 2026-09-22 起是独立仓库
+		// （本机 ../zizvideo，GitHub zizdog/zizvideo）；面板安装/刷新时读镜像上的
+		// apps/zizvideo/manifest.json → 按需下载 + 校验 sha256。
 		//
 		// 服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码
 		// 要求 ⇒ 与面板**共用文件权限**；supervisor 以 root fork 后 setuid 到真实用户

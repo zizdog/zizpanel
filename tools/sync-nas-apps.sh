@@ -16,9 +16,11 @@
 #    NAS_PASS='...' bash tools/sync-nas-apps.sh     # 真同步（需要 sshpass）
 #    只同步一个应用：加 --app frpc
 #
-#  上游第 4 列是 `local:<绝对路径>` 时（自研产物，如 zizvideo）：跳过所有网络候选，
+#  上游第 4 列是 `local:<绝对路径>` 时（自研产物）：跳过所有网络候选，
 #  直接用该本地文件上传；文件不存在就如实失败（绝不回落去下载）。清单 upstream 写
 #  "本地构建（make release）"。
+#  zizvideo 已移出面板仓库（独立项目，本机 ../zizvideo）：它**不走本脚本**，
+#  由它自己的 `make release && make publish` 传镜像 apps/zizvideo/（见那边 AGENTS.md）。
 #
 #  环境变量：NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS / MIRROR_BASE_URL
 #  ⚠️ 地址由调用者提供，仓库里不留任何内网默认值（NAS_HOST/NAS_USER/NAS_ROOT 非 dry-run 必填）。

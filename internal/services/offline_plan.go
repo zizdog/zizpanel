@@ -306,7 +306,7 @@ func OfflinePlan() []OfflineAppPlan {
 				if app.ID == ZizvideoAppID {
 					// 版本/产物由镜像索引运行时决定：离线包必须自带索引与它点名的产物。
 					p.Gaps = append(p.Gaps, "zizvideo 的版本与产物由镜像索引 apps/zizvideo/manifest.json 决定，"+
-						"离线包需自带该索引与对应产物（make release 产出到 dist/apps/zizvideo/，"+
+						"离线包需自带该索引与对应产物（在 zizvideo 仓库跑 make release 产出 dist/apps/zizvideo/，"+
 						"把整目录传到镜像 apps/zizvideo/；只带二进制不带索引会装不上）")
 				}
 				if extra, ok := offlinePythonExtra[app.ID]; ok {
