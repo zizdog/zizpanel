@@ -31,7 +31,7 @@ fi
 VALUES=()
 while IFS='=' read -r _k v; do
   case "$_k" in
-    *PASS*|*PASSWORD*|*SECRET*|*TOKEN*|*KEY*) ;;
+    *PASS*|*SECRET*|*TOKEN*|*KEY*) ;;
     *) continue ;;
   esac
   v="${v%$'\r'}"
