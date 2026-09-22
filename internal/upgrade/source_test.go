@@ -33,15 +33,15 @@ func TestCandidateSourcesOrder(t *testing.T) {
 
 	t.Run("显式配置优先", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(custom),
-			[]string{custom, DefaultSource, MirrorSource, GitHubSource})
+			[]string{custom, MirrorSource, DefaultSource, GitHubSource})
 	})
 
-	t.Run("未配置时：公网主源 → 备用镜像 → GitHub", func(t *testing.T) {
+	t.Run("未配置时：镜像站 → 公网主源 → GitHub（用户 2026-09-22：优先快镜像）", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(""),
-			[]string{DefaultSource, MirrorSource, GitHubSource})
+			[]string{MirrorSource, DefaultSource, GitHubSource})
 	})
 
-	t.Run("配置成默认主源时去重", func(t *testing.T) {
+	t.Run("配置成默认主源时去重（用户显式设置仍然最前）", func(t *testing.T) {
 		assertSourceOrder(t, CandidateSources(DefaultSource),
 			[]string{DefaultSource, MirrorSource, GitHubSource})
 	})

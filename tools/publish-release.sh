@@ -10,7 +10,9 @@
 #
 # 地址由调用者提供，仓库里不留任何内网默认值。
 # 用法：
-#   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / 镜像站）
+#   bash tools/publish-release.sh publish        # ⚡一条命令发版（推荐）：
+#     # 构建 → **先发镜像站**（成功即报"发布完成"，可以马上测）→ zizdog.com 后台补推
+#   bash tools/publish-release.sh build          # 只构建 + 生成并签名两份清单（zizdog / 镜像站）
 #   ZIZDOG_VPS_PASS='...' bash tools/publish-release.sh push-zizdog
 #     # 同时把"镜像版清单"作为 manifest-mirror.json(.sig) 放到源站，供面板镜像同步优先取用（坑 218）
 #     # ⚡ latest 在源站本地复制（不重传）；两个架构并行上传（2026-09-22 提速）
@@ -286,7 +288,7 @@ PY
 )
     if [ "$remote_ok" = "1" ]; then
       got="$(zizdog_ssh "sha256sum '$ZIZDOG_ROOT/download/$v/$file' 2>/dev/null | cut -d' ' -f1" | tr -d '\r' | tail -1)"
-      [ -n "$got" ] || die "远端 sha256 计算失败：$file（可用 VERIFY_DEEP=1 走整包下载）"
+      [ -n "$got" ] || die "远端 sha256 计算失败：${file}（可用 VERIFY_DEEP=1 走整包下载）"
     else
       curl -fsS --max-time 600 "$url" -o "$tmp/$file" || die "下载失败：$url"
       got="$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1)"
@@ -369,16 +371,41 @@ cmd_push_mirror() {
   for arch in arm64 amd64; do
     curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
       -d "{\"from\":\"$dir/download/$v/zizpanel_${v}_darwin_${arch}.tar.gz\",\"to\":\"$dir/download/latest/zizpanel_latest_darwin_${arch}.tar.gz\"}" \
-      "$base/api/v1/files/copy" >/dev/null || die "复制 latest（$arch）失败"
+      "$base/api/v1/files/copy" >/dev/null || die "复制 latest（${arch}）失败"
   done
   ok "已直传（清单 + 包 + latest；latest 是镜像侧复制，未重传）"
 }
 
+# cmd_publish_fast：用户 2026-09-22 定的发布顺序 ——
+#   ① 构建；
+#   ② **先发镜像站**（快：实测 53MB ≈ 9s）—— 镜像一成就算"发布完成"，用户可以立刻测；
+#   ③ zizdog.com 随后**后台**慢慢传（4 Mbps，1~2 分钟），传完自动复验。
+# 这样"能不能测新版本"不用再等那台慢机器。
+cmd_publish_fast() {
+  local v; v="$(version)"
+  cmd_build || die "构建失败"
+  cmd_push_mirror || die "镜像站推送失败（用户要的「先发镜像」没成功，不谎报完成）"
+  local log
+  log="/tmp/zp-push-zizdog-${v}-$(date +%Y%m%dT%H%M%S).log"
+  nohup bash "$0" push-zizdog-and-verify >"$log" 2>&1 &
+  info "✅ 发布完成：镜像站已是 v${v}，现在就能在面板里「检查更新 → 升级」"
+  info "   zizdog.com 正在后台补推（不影响你测试），日志：$log"
+  info "   看进度：tail -f $log"
+}
+
+# cmd_push_zizdog_and_verify：后台那条链（推源站 + 复验）。
+cmd_push_zizdog_and_verify() {
+  cmd_push_zizdog || die "zizdog.com 推送失败（镜像站已经好了，用户不受影响）"
+  cmd_verify
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
+  publish)     cmd_publish_fast ;;
   push-zizdog) cmd_push_zizdog ;;
+  push-zizdog-and-verify) cmd_push_zizdog_and_verify ;;
   push-mirror) cmd_push_mirror ;;
   push-nas)    cmd_push_nas ;;
   verify)      cmd_verify ;;
-  *) sed -n '2,22p' "$0"; exit 1 ;;
+  *) sed -n '2,26p' "$0"; exit 1 ;;
 esac

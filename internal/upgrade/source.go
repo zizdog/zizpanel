@@ -60,15 +60,19 @@ func CandidateSources(configured string) []string {
 	}
 
 	// 用户/安装脚本配置的源**永远排第一**。
-	//
-	// 为什么清单一律取自权威源（2026-09-17，坑 149）：局域网镜像的清单可能滞后，
-	// "某次只推公网、忘了同步镜像"会让机器静默停在旧版本。取消局域网候选后
-	// 这条纪律更简单：所有候选都是公开源。
 	if configured != "" {
 		add(configured)
 	}
-	add(DefaultSource)
+	// ⚡ 2026-09-22 用户（原话）："面板安装走的还是 zizdog.com 不是 mirror…；应该是优先 mirror，
+	// 不通再走 zizdog.com（只有 4m 带宽，下载非常慢）"。
+	// 所以顺序改成：**镜像站 → 公网主源 → GitHub**。
+	//
+	// 为什么"镜像优先"不会让我们静默停在旧版本（那正是原来主源优先的理由）：
+	// 选源不再"取第一个能验签的"，而是**取所有候选里版本最高的那一份**
+	// （见 FetchManifestAny）—— 镜像滞后时自动落回主源的新清单；版本相同时才按
+	// 这个顺序取镜像（清单里的下载地址指向镜像，包就从快的那台拉）。
 	add(MirrorSource)
+	add(DefaultSource)
 	add(GitHubSource)
 	return out
 }
@@ -107,6 +111,10 @@ func FetchManifestAny(ctx context.Context, sources []string, perTry time.Duratio
 	}
 
 	failures := make([]string, 0, len(sources))
+	// 取**第一个**验签通过的候选（why not "版本最高的那一份"）：发布顺序保证了
+	// 镜像站**永远先有**（tools/publish-release.sh 先发镜像、成功即报完成，
+	// zizdog.com 后台慢慢补）—— 所以"镜像优先"不可能让我们停在旧版本。
+	// 反过来，多探几个候选只会让每次升级检查多几次请求，换不到任何正确性。
 	for _, base := range sources {
 		if err := ctx.Err(); err != nil {
 			// 外层预算用完：不必再试（后续候选也只会立刻失败）。

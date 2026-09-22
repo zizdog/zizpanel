@@ -21,8 +21,10 @@ ZIZPANEL_LISTEN="${ZIZPANEL_LISTEN:-:8443}"
 PANEL_PATH="${ZIZPANEL_PANEL_PATH:-/_panel}"
 ZIZPANEL_VERSION="${ZIZPANEL_VERSION:-latest}"
 # 下载源：镜像优先，官方源只兜底；候选顺序见 detect_source。
+# ⚡ 2026-09-22 用户："面板安装走的还是 zizdog.com 不是 mirror…；应该优先 mirror，
+# 不通再走 zizdog.com（只有 4m 带宽，下载非常慢）" —— 所以镜像排第一。
 ZIZPANEL_DOWNLOAD_BASE="${ZIZPANEL_DOWNLOAD_BASE:-}"
-# 内置国内镜像（自建源/NAS 公网入口）。大陆无代理时 GitHub Release 完全不通（2026-09 实测）。
+# 内置国内镜像（自建源/NAS 公网入口）。**只做兜底**（4 Mbps，慢）。
 BUILTIN_MIRROR="${ZIZPANEL_BUILTIN_MIRROR:-https://zizdog.com/zizpanel}"
 # 官方源（GitHub Releases）：**只做最后兜底**，国内直连通常会卡。
 GITHUB_RELEASE_BASE="${ZIZPANEL_GITHUB_BASE:-https://github.com/zizdog/zizpanel/releases}"
@@ -60,9 +62,15 @@ BASEDEP_FORMULAS=(ffmpeg)
 
 # DEFAULT_MIRROR_BASE：自建 NAS 镜像默认基址（与面板 config.DefaultMirrorBase 一致）。
 DEFAULT_MIRROR_BASE="${ZIZPANEL_MIRROR_BASE_DEFAULT:-https://mirror.zizdog.com:8888}"
-# 面板在线升级源（写进 config.json 的 upgrade_source）：**只有公网**。
-# 判据是"清单 + 签名都在"；实测 2026-09-17 公网 manifest.json(+.sig) 200。
-PANEL_UPGRADE_SOURCE_PUBLIC="${ZIZPANEL_UPGRADE_SOURCE:-https://zizdog.com/zizpanel}"
+# 面板发布件在镜像站上的基址（<mirror>/zizpanel）：面板包与清单都在这里。
+# 这是**首选**下载源（实测比 4 Mbps 的 zizdog.com 快一个数量级）。
+PANEL_MIRROR_BASE="${ZIZPANEL_PANEL_MIRROR_BASE:-${DEFAULT_MIRROR_BASE}/zizpanel}"
+# 面板在线升级源（写进 config.json 的 upgrade_source）。
+# ⚡ 2026-09-22：默认改成**镜像站**（用户要求优先 mirror；面板候选顺序里
+# "用户配置的源"永远第一，所以这里写镜像 = 每次升级都走快的那台）。
+# 镜像清单不可达时才回落 zizdog.com（见 probe_upgrade_source 的候选循环）。
+PANEL_UPGRADE_SOURCE_PUBLIC="${ZIZPANEL_UPGRADE_SOURCE:-$PANEL_MIRROR_BASE}"
+PANEL_UPGRADE_SOURCE_FALLBACK="${ZIZPANEL_UPGRADE_SOURCE_FALLBACK:-$BUILTIN_MIRROR}"
 # 升级源是否可用以"清单 + 签名都在"为准（只有清单没有签名，面板会拒绝升级）。
 UPGRADE_MANIFEST_PATH="/manifest.json"
 
@@ -219,7 +227,7 @@ detect_source() {
   if [ -n "$ZIZPANEL_DOWNLOAD_BASE" ]; then
     bases+=("${ZIZPANEL_DOWNLOAD_BASE%/}")
   fi
-  bases+=("$BUILTIN_MIRROR" "$GITHUB_RELEASE_BASE")
+  bases+=("$PANEL_MIRROR_BASE" "$BUILTIN_MIRROR" "$GITHUB_RELEASE_BASE")
   for base in "${bases[@]}"; do
     [ -n "$base" ] || continue
     base="${base%/}"
@@ -621,17 +629,20 @@ clt_mirror_note() {
 }
 
 # ------------------------------------------------------------ 在线升级源 --
-# 只有公网 zizdog.com 一个候选（可由 ZIZPANEL_UPGRADE_SOURCE 覆盖）。
+# 候选：**镜像站优先** → zizdog.com 兜底（可由 ZIZPANEL_UPGRADE_SOURCE 覆盖第一个）。
 # 判据是"清单 + 签名都在"，缺签名面板会拒绝升级。
+# ⚡ 2026-09-22：原来只探 zizdog.com（4 Mbps），于是每台机器的 upgrade_source 都被
+# 写成慢源；现在优先写镜像站（面板候选顺序里"用户配置的源"永远第一 = 升级走快的那台）。
 probe_upgrade_source() {
-  # 只有一个公网候选，不需要循环（写成 `for x in "$VAR"` 只会跑一次，shellcheck 会报 SC2066）。
-  local cand="${PANEL_UPGRADE_SOURCE_PUBLIC%/}"
-  if [ -n "$cand" ] &&
-     curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}" >/dev/null 2>&1 &&
-     curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}.sig" >/dev/null 2>&1; then
-    PANEL_UPGRADE_SOURCE="$cand"
-    return 0
-  fi
+  local cand
+  for cand in "${PANEL_UPGRADE_SOURCE_PUBLIC%/}" "${PANEL_UPGRADE_SOURCE_FALLBACK%/}"; do
+    [ -n "$cand" ] || continue
+    if curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}" >/dev/null 2>&1 &&
+       curl -fsSI --max-time 8 "${cand}${UPGRADE_MANIFEST_PATH}.sig" >/dev/null 2>&1; then
+      PANEL_UPGRADE_SOURCE="$cand"
+      return 0
+    fi
+  done
   PANEL_UPGRADE_SOURCE=""
   return 1
 }
@@ -639,9 +650,9 @@ probe_upgrade_source() {
 # upgrade_source_note：只读探测并如实汇报（探不到就说探不到，界面里再让用户填）。
 upgrade_source_note() {
   if probe_upgrade_source; then
-    ok "在线升级源：${PANEL_UPGRADE_SOURCE}（公网 zizdog.com，已确认清单与签名都在）"
+    ok "在线升级源：${PANEL_UPGRADE_SOURCE}（已确认清单与签名都在）"
   else
-    warn "公网升级源没探通（面板仍可用，升级源留空，可在「面板设置 → 在线升级」里手工填写）"
+    warn "升级源没探通（面板仍可用，升级源留空，可在「面板设置 → 在线升级」里手工填写）"
   fi
 }
 
@@ -3502,7 +3513,7 @@ main() {
   if dry_run; then
     # 干跑必须把整条计划走完（SSH 提问与内网预授权提示都是用户要求的分支）。
     title "干跑：将要执行的动作"
-    info "下载源候选（公网 zizdog.com 优先）：${ZIZPANEL_DOWNLOAD_BASE:+$ZIZPANEL_DOWNLOAD_BASE → }$BUILTIN_MIRROR → $GITHUB_RELEASE_BASE"
+    info "下载源候选（镜像站优先，zizdog.com 兜底）：${ZIZPANEL_DOWNLOAD_BASE:+$ZIZPANEL_DOWNLOAD_BASE → }$PANEL_MIRROR_BASE → $BUILTIN_MIRROR → $GITHUB_RELEASE_BASE"
     info "镜像基址：${DEFAULT_MIRROR_BASE}（brew/CLT/应用包都挂它下面；公网镜像站）"
     install_deps
   fi

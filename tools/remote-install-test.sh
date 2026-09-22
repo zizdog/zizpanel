@@ -72,7 +72,7 @@ step "构建发布包"
 #      在 check-full 里重建一遍、正式发布时再重建一遍是纯重复）。
 PKG_ARM="$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz"
 if [ -f "$PKG_ARM" ] && [ "${ZP_FORCE_REBUILD:-0}" != "1" ]; then
-  pass "复用已有发布包（$PKG_ARM）"
+  pass "复用已有发布包（${PKG_ARM}）"
 elif ( cd "$REPO" && make release ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
   pass "make release（arm64）成功"
 else

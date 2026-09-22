@@ -532,6 +532,29 @@ bump: ## 按约定递增版本号（+0.0.1，到 10 后 +0.1）
 	@python3 tools/bump-version.py
 	@python3 -m py_compile tools/bump-version.py
 
+# ⚡ 2026-09-22 用户定的发布顺序："先发给 mirror，成功后就提示完成，同时再慢慢传 zizdog.com；
+# 这样你传的同时我就可以测试新版本了。" 这条命令就是那个顺序：
+#   ① 门禁（同一棵树跑过就按指纹跳过，见 check-full）
+#   ② 工作树必须干净（**不把未提交的改动替你塞进发布提交**）
+#   ③ bump + 只提交版本文件
+#   ④ 构建 → **先发镜像站**（成功即报"发布完成"，可以立刻在面板里升级）→ zizdog 后台补推
+#
+# 想省掉第 ① 步又确认过这棵树是绿的：SKIP_CHECK=1 make publish
+# （check 标记在 .zp-check-stamp-full，可自查：bash tools/check-stamp.sh verify-full）
+.PHONY: publish
+publish: ## 一条命令发版：门禁 → bump → 构建 → 先发镜像（成功即可测）→ zizdog 后台补推
+	@dirty="$$(git status --porcelain | grep -vE '^.. (internal/version/version.go|install.sh)$$' || true)"; \
+	 if [ -n "$$dirty" ]; then \
+	   echo "!! 工作树有未提交改动，先提交（或确认丢弃）再发版："; printf '%s\n' "$$dirty"; exit 1; \
+	 fi
+	@if [ "${SKIP_CHECK:-0}" != "1" ]; then \
+	   $(MAKE) --no-print-directory check-full || exit 1; \
+	 else echo "==> SKIP_CHECK=1：跳过门禁（你自己确认过这棵树是绿的）"; fi
+	@$(MAKE) --no-print-directory bump
+	@git add internal/version/version.go install.sh && \
+	 git commit -q -m "version: → $$(sed -n 's/^var Version = \"\([0-9.]*\)\".*/\1/p' internal/version/version.go | head -1)"
+	@bash tools/publish-release.sh publish
+
 .PHONY: version
 version: ## 显示当前版本号
 	@python3 tools/bump-version.py --show

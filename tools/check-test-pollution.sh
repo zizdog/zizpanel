@@ -119,15 +119,73 @@ fi
 snapshot "$FP.before"
 rm -f "$FP"
 # ⚠️ 默认**不传 -count=1**（2026-09-22 用户要求"大幅缩短发布时间"）：
-# -count=1 会禁掉 go 的测试缓存，于是**同一棵没变的树**每次发布都要重跑全部测试
-# （实测 make check 264s，其中大头就是它）。go 的测试缓存是**按内容**失效的：
-# 包源码、命令行参数、环境变量、以及测试打开过的文件变了都会重跑 —— 所以缓存
-# 不会掩盖改动。要强制全量重跑（怀疑缓存本身有问题时）：ZP_TEST_NO_CACHE=1 make check。
+# -count=1 会禁掉 go 的测试缓存（`testcache: caching disabled for test argument: -test.count=1`），
+# 于是**同一棵没变的树**每次发布都要重跑全部测试。go 的测试缓存是**按内容**失效的：
+# 包源码、命令行参数、环境变量、以及测试打开过的文件变了都会重跑 —— 所以缓存不会掩盖改动。
+# 要强制全量重跑（怀疑缓存本身有问题时）：ZP_TEST_NO_CACHE=1 make check。
 TEST_ARGS=""
 if [ "${ZP_TEST_NO_CACHE:-0}" = "1" ]; then TEST_ARGS="-count=1"; fi
-printf '\n%s▸ go test ./... %s%s\n' "$C_BOLD" "$TEST_ARGS" "$C_RESET"
-( cd "$REPO" && go test ./... $TEST_ARGS )
-TEST_RC=$?
+
+# ⚡ 2026-09-22 发版提速：**重包拆进程并行**。
+# 为什么必须拆：go 只在**包之间**并行，包内测试是串行的；而 internal/web 一个包就有
+# 692 个测试、墙钟 ~200s（实测占 make check 的 3/4）。这些测试靠全局变量注入探针
+# （launchDaemonsDir / sitePortHoldersFn / proxyLookupHostFn / config 的 brew 前缀…），
+# 加 t.Parallel() 会互相踩，所以不能靠"包内并行"提速；**拆成独立进程**各持一套全局，
+# 既安全又能吃满多核。
+SHARDS="${ZP_TEST_SHARDS:-}"
+if [ -z "$SHARDS" ]; then
+  # 默认按核数（实测 6 片 88s、10 片 78s；上限 8 避免和别的检查抢核）。
+  ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+  [ "$ncpu" -gt 8 ] && ncpu=8
+  SHARDS="$ncpu"
+fi
+HEAVY_PKGS="internal/web internal/services"
+WORK_SHARDS="$(mktemp -d)"
+trap 'rm -rf "$WORK_SHARDS"' EXIT
+
+# shard_names <pkg> <n>：把该包的测试名轮转分成 n 组，各起一个 go test 进程。
+shard_names() {
+  local pkg="$1" n="$2" names i=0 s
+  names="$( cd "$REPO" && go test -list '.*' "$pkg" 2>/dev/null | grep -E '^Test' || true )"
+  [ -n "$names" ] || return 0
+  local -a groups=()
+  for ((s=0; s<n; s++)); do groups[$s]=""; done
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    groups[$(( i % n ))]="${groups[$(( i % n ))]:+${groups[$(( i % n ))]}|}$line"
+    i=$(( i + 1 ))
+  done <<< "$names"
+  local -a pids=()
+  for ((s=0; s<n; s++)); do
+    [ -n "${groups[$s]}" ] || continue
+    # shellcheck disable=SC2086
+    ( cd "$REPO" && go test $TEST_ARGS "$pkg" -run "^(${groups[$s]})$" ) \
+      > "$WORK_SHARDS/$(echo "$pkg" | tr '/' '_')-$s.log" 2>&1 &
+    pids+=("$!")
+  done
+  local rc=0 p
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  cat "$WORK_SHARDS/$(echo "$pkg" | tr '/' '_')"-*.log
+  return "$rc"
+}
+
+printf '\n%s▸ go test（重包分 %s 片并行）：%s%s\n' "$C_BOLD" "$SHARDS" "$HEAVY_PKGS" "$C_RESET"
+TEST_RC=0
+SHARD_PIDS=()
+for pkg in $HEAVY_PKGS; do
+  shard_names "./$pkg" "$SHARDS" &
+  SHARD_PIDS+=("$!")
+done
+
+# 其余包一次跑完（go 自己在包之间并行）。
+REST="$( cd "$REPO" && go list ./... | grep -vE '/(internal/web|internal/services)$' || true )"
+if [ -n "$REST" ]; then
+  printf '%s▸ go test（其余包）%s\n' "$C_BOLD" "$C_RESET"
+  # shellcheck disable=SC2086
+  ( cd "$REPO" && go test $TEST_ARGS $REST ) || TEST_RC=1
+fi
+for p in "${SHARD_PIDS[@]}"; do wait "$p" || TEST_RC=1; done
+
 snapshot "$FP"
 verify "$FP.before" "$FP"
 rm -f "$FP.before" "$FP"
