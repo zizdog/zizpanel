@@ -52,17 +52,21 @@ func TestMarketListSupportsUpdateCheckIsStaticNoProbe(t *testing.T) {
 	if _, has := ziz["update_available"]; has {
 		t.Error("列表不该带探测结论（update_available 是按需接口的字段）")
 	}
-	for _, id := range []string{"nginx", "php82"} {
+	for _, id := range []string{"ollama"} {
 		it := marketItem(t, ts, cookies, id)
 		if it["supports_update_check"] != true {
 			t.Errorf("%s 是 brew 条目（真源是 brew outdated），列表必须给 supports_update_check=true，实际 %v",
 				id, it["supports_update_check"])
 		}
 	}
-	for _, id := range []string{"frpc", "iopaint"} {
+	for _, id := range []string{"nginx", "php82", "mysql84", "python311", "ffmpeg", "frpc", "iopaint"} {
 		it := marketItem(t, ts, cookies, id)
+		why := "没有版本真源"
+		if it["env_component"] == true {
+			why = "是基础环境组件（有版本依赖），按用户要求不报更新"
+		}
 		if it["supports_update_check"] != false {
-			t.Errorf("%s 没有版本真源，不该支持更新检查，实际 %v", id, it["supports_update_check"])
+			t.Errorf("%s %s，不该支持更新检查，实际 %v", id, why, it["supports_update_check"])
 		}
 	}
 
@@ -166,8 +170,8 @@ func TestMarketUpdatesBatchesBrewAndSharesZizvideo(t *testing.T) {
 
 	// 本机装着 nginx 1.27.0（预置已装清单；测试环境没有真的 brew）。
 	srv.mktMu.Lock()
-	srv.mktBrew = map[string]bool{"nginx": true}
-	srv.mktBrewVer = map[string]string{"nginx": "1.27.0"}
+	srv.mktBrew = map[string]bool{"ollama": true}
+	srv.mktBrewVer = map[string]string{"ollama": "0.11.0"}
 	srv.mktBrewOK = true
 	srv.mktBrewAt = time.Now()
 	srv.mktMu.Unlock()
@@ -194,19 +198,25 @@ func TestMarketUpdatesBatchesBrewAndSharesZizvideo(t *testing.T) {
 		t.Fatalf("响应缺少 items：%v", data)
 	}
 
-	// nginx：已装版本必须给出来；brew 清单这次查不成 ⇒ unknown，且不许说有新版。
-	nginx, _ := items["nginx"].(map[string]any)
-	if nginx == nil {
+	// ollama：已装版本必须给出来；brew 清单这次查不成 ⇒ unknown，且不许说有新版。
+	ollama, _ := items["ollama"].(map[string]any)
+	if ollama == nil {
 		t.Fatalf("已安装的 brew 条目必须出现在批量结论里：%v", items)
 	}
-	if nginx["installed"] != "1.27.0" {
-		t.Errorf("nginx 的已装版本应来自 brew list，实际 %v", nginx["installed"])
+	if ollama["installed"] != "0.11.0" {
+		t.Errorf("ollama 的已装版本应来自 brew list，实际 %v", ollama["installed"])
 	}
-	if nginx["update_available"] == true {
-		t.Errorf("brew 可升级清单没查成时不许说有新版：%v", nginx)
+	if ollama["update_available"] == true {
+		t.Errorf("brew 可升级清单没查成时不许说有新版：%v", ollama)
 	}
-	if nginx["unknown"] != true {
-		t.Errorf("brew 可升级清单没查成时必须如实 unknown（不许当成已是最新）：%v", nginx)
+	if ollama["unknown"] != true {
+		t.Errorf("brew 可升级清单没查成时必须如实 unknown（不许当成已是最新）：%v", ollama)
+	}
+	// 基础环境组件（LNMP/python/ffmpeg）**不许出现在批量结论里**。
+	for _, id := range []string{"nginx", "php82", "mysql84", "python311", "ffmpeg"} {
+		if _, has := items[id]; has {
+			t.Errorf("%s 是基础环境组件，不该出现在更新结论里", id)
+		}
 	}
 	if data["brew_ok"] == true {
 		t.Errorf("测试环境没有可用的 brew，brew_ok 应为 false：%v", data)

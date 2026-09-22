@@ -27,6 +27,11 @@ type App struct {
 	Category    string `json:"category"`
 	// Kind 决定用哪种方式安装与管理
 	Kind Kind `json:"kind"`
+	// EnvComponent 表示这是**基础环境组件**（站点/应用依赖它，版本有依赖关系）：
+	// 显式标记的 python@x.y / ffmpeg 走这条；「网站环境」板块（LNMP）由
+	// IsEnvComponent 按分类一并算进来。它们**不参与"有新版"提醒，也不给一键更新**
+	//（用户 2026-09-22："lnmp环境不应该报更新，这是基础环境且有版本依赖"）。
+	EnvComponent bool `json:"env_component,omitempty"`
 	// DockerReference 为 true 表示这是一个「推荐的 Docker 项目」：
 	// 面板**不代用户安装**（安装接口会明确拒绝并给出 compose 地址），只在应用市场
 	// 的 docker Tab 里列出，并提供预配置的 compose 参考文件（内容 + 镜像站下载地址）。
@@ -515,6 +520,13 @@ func CategoryLabels() map[string]string {
 // 选品原则：优先"这台机器上真的用得上、且能自动装起来"的。
 // 每个条目的端口、健康检查路径、日志路径都经过实际验证，
 // 而不是从文档里抄一个大概 —— 端口写错会让用户装完发现打不开。
+// IsEnvComponent 判断"这是不是基础环境组件"：LNMP（网站环境）整类 + 显式标记的
+// 基础依赖（python@x.y / ffmpeg）。理由：站点与自研应用都建在它们上面，随手升级会把
+// 依赖它的东西弄坏；用户 2026-09-22 明确"lnmp环境不应该报更新"。
+func IsEnvComponent(a App) bool {
+	return a.EnvComponent || a.Category == CategoryLNMP
+}
+
 func Catalog() []App {
 	audioHealth := "/v1/models"
 	return []App{
@@ -773,6 +785,7 @@ func Catalog() []App {
 			Summary:     "音视频转码基础工具（TTS 编码 mp3 依赖它）",
 			Description: "音视频转码命令行工具；Qwen TTS 编码 mp3 必须依赖它，没有网页界面。",
 			Category:    CategoryOther, Kind: KindNative,
+			EnvComponent:   true, // 基础环境（别的应用依赖它）：不参与更新提醒
 			PanelInstaller: "ffmpeg",
 			BrewFormula:    "ffmpeg",
 			// 纯命令行工具：没有守护进程、没有端口、没有网页界面。
@@ -957,6 +970,7 @@ func Catalog() []App {
 			Summary:     "Python 解释器（老项目/Intel Mac 需要时的稳妥选择）",
 			Description: "Python 3.10 解释器（含 pip）；Intel Mac 与老项目选它，3.12+ 无 Intel 包。",
 			Category:    CategoryOther, Kind: KindNative,
+			EnvComponent:   true, // 基础环境（别的应用依赖它）：不参与更新提醒
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.10",
 			NoDaemon:       true,
@@ -973,6 +987,7 @@ func Catalog() []App {
 			Summary:     "Python 解释器（面板自研运行时 Qwen3 TTS / IOPaint 的预置版本）",
 			Description: "Python 3.11 解释器（含 pip）；面板的 Qwen3 TTS / IOPaint 默认用这一版。",
 			Category:    CategoryOther, Kind: KindNative,
+			EnvComponent:   true, // 基础环境（别的应用依赖它）：不参与更新提醒
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.11",
 			// 解释器没有守护进程、没有端口、没有网页界面（与 ffmpeg 同类）。
@@ -987,6 +1002,7 @@ func Catalog() []App {
 			Summary:     "Python 解释器（较新的稳定版本，适合需要 3.12 的应用）",
 			Description: "Python 3.12 解释器（含 pip）；⚠️ Intel Mac 装不了（上游无 Intel 包）。",
 			Category:    CategoryOther, Kind: KindNative,
+			EnvComponent:   true, // 基础环境（别的应用依赖它）：不参与更新提醒
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.12",
 			NoDaemon:       true,
@@ -1000,6 +1016,7 @@ func Catalog() []App {
 			Summary:     "Python 解释器（最新稳定版，尝鲜/新项目用）",
 			Description: "Python 3.13 解释器（含 pip）；⚠️ Intel Mac 装不了，部分 ML 包可能未适配。",
 			Category:    CategoryOther, Kind: KindNative,
+			EnvComponent:   true, // 基础环境（别的应用依赖它）：不参与更新提醒
 			PanelInstaller: "python",
 			BrewFormula:    "python@3.13",
 			NoDaemon:       true,

@@ -70,11 +70,19 @@ step "构建发布包"
 #      —— 双架构 31s、单架构 15s，白花 16s；
 #   ② 已经有同一版本的 arm64 包时直接复用（`make release` 内部会 `clean` 掉 dist，
 #      在 check-full 里重建一遍、正式发布时再重建一遍是纯重复）。
-PKG_ARM="$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz"
-if [ -f "$PKG_ARM" ] && [ "${ZP_FORCE_REBUILD:-0}" != "1" ]; then
+# ⚡ 2026-09-22：构建到**自己的临时 DIST**。原来用仓库的 dist/，而 `make release` 开头会
+# `rm -rf dist` —— 与 check-full 里并行跑的 install-test 抢同一个目录（它把开发二进制
+# 写进 dist/）。隔离之后 check-full 才能把三个端到端测试真正并行起来。
+RELDIR="$WORK/dist/release"
+SERVE_DIST="$WORK/dist"
+PKG_ARM="$RELDIR/zizpanel_${VERSION}_darwin_arm64.tar.gz"
+if [ -f "$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz" ] && [ "${ZP_FORCE_REBUILD:-0}" != "1" ]; then
+  RELDIR="$REPO/dist/release"
+  SERVE_DIST="$REPO/dist"
+  PKG_ARM="$RELDIR/zizpanel_${VERSION}_darwin_arm64.tar.gz"
   pass "复用已有发布包（${PKG_ARM}）"
-elif ( cd "$REPO" && make release ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
-  pass "make release（arm64）成功"
+elif ( cd "$REPO" && DIST="$WORK/dist" make release ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
+  pass "make release（arm64，临时 DIST）成功"
 else
   fail "make release 失败："
   tail -25 "$WORK/release.log" | sed 's/^/      /'
@@ -112,7 +120,7 @@ done
 # --------------------------------------------------------- 启动共享服务 --
 step "启动远程安装共享服务"
 HTTP_LOG="$WORK/http.log"
-ZP_PORT="$HTTP_PORT" bash "$REPO/tools/serve-for-install.sh" --no-build \
+ZP_PORT="$HTTP_PORT" DIST="$SERVE_DIST" bash "$REPO/tools/serve-for-install.sh" --no-build \
   --bind 127.0.0.1 --port "$HTTP_PORT" > "$HTTP_LOG" 2>&1 &
 HTTP_PID=$!
 

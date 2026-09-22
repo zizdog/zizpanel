@@ -95,8 +95,19 @@ jobs-test: ## receiver.py 的 /jobs 验收（本地假上游，不需要 GPU）
 test-short: ## 只跑单测（跳过真实系统采集）
 	go test ./... -short -count=1
 
-.PHONY: check
-check: ## 日常提交前检查（约 1 分钟；发版前再跑 check-full）
+# ⚡ 2026-09-22 提速（用户："跑门禁太慢了，得想办法"）：
+# **同一棵树跑过就跳过**——判据是 tools/check-stamp.sh 的工作树指纹（改一个字节即失效），
+# 跳过时**打印版本+时间+指纹**，不是静默跳过。强制重跑：ZP_FORCE_CHECK=1 make check。
+.PHONY: check check-real
+check: ## 日常提交前检查（同一棵树跑过 ⇒ 按指纹跳过；ZP_FORCE_CHECK=1 强制）
+	@if [ "${ZP_FORCE_CHECK:-0}" != "1" ] && bash tools/check-stamp.sh verify >/dev/null 2>&1; then \
+	   echo "==> 跳过 make check：$$(bash tools/check-stamp.sh verify)"; \
+	 else \
+	   $(MAKE) --no-print-directory check-real; \
+	 fi
+
+.PHONY: check-real
+check-real:
 	@echo "==> 版本号来源检查（注释里的历史版本不许遮蔽 var Version；install.sh 的 SCRIPT_VERSION 必须一致）"
 	@real="$(VERSION)"; loose=$$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
 	 scriptv=$$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)".*/\1/p' install.sh | head -1); \
@@ -179,12 +190,10 @@ check-full: ## 发版前全量检查（同一棵树跑过 ⇒ 按指纹跳过；
 check-full-real:
 	@$(MAKE) --no-print-directory check
 	@echo "（zizvideo 是独立仓库：它自己的门禁在 ../zizvideo 里跑 make check）"
-	@echo "==> receiver /jobs 测试"
-	@$(MAKE) --no-print-directory jobs-test
-	@echo "==> 安装脚本端到端测试（沙箱）"
-	@$(MAKE) --no-print-directory install-test
-	@echo "==> 远程一键安装测试（本地 HTTP 服务 + 沙箱）"
-	@$(MAKE) --no-print-directory remote-test
+	@# ⚡ 三个端到端测试**并行**（2026-09-22）：各自独立目录/端口，remote-test 构建到自己的
+	@# 临时 DIST（不再与 install-test 抢 dist/），互不干扰。串行 128s → 并行约 65s。
+	@echo "==> 三个端到端测试并行：receiver /jobs、安装沙箱、远程安装"
+	@$(MAKE) -j3 --no-print-directory jobs-test install-test remote-test
 	@echo "==> 发布说明门禁（版本标题 / 长度 / 无旧版本标题 / 清单一致）"
 	@bash tools/check-release-notes.sh
 	@bash tools/check-stamp.sh write-full

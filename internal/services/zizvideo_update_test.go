@@ -125,9 +125,22 @@ func TestSupportsUpdateCheckCoversBrewAndDynamicOnly(t *testing.T) {
 		t.Error("zizvideo 是动态版本条目，supports_update_check 必须为 true")
 	}
 	// brew 条目：能查（`brew outdated`），这里只验静态判据，不跑 brew。
-	for _, id := range []string{"nginx", "php82", "mysql84", "ollama"} {
+	for _, id := range []string{"ollama"} {
 		if !SupportsUpdateCheck(id) {
 			t.Errorf("%s 是 brew 条目，更新真源是 brew outdated，supports_update_check 应为 true", id)
+		}
+	}
+	// ⚠️ 基础环境组件**一律不报更新**（用户 2026-09-22："lnmp环境不应该报更新，
+	// 这是基础环境且有版本依赖"）：LNMP 整类 + 显式标记的 python/ffmpeg。
+	for _, id := range []string{"nginx", "php82", "php84", "mysql84", "mariadb", "postgresql17", "python311", "ffmpeg"} {
+		if SupportsUpdateCheck(id) {
+			t.Errorf("%s 是基础环境组件（有版本依赖），不该参与更新检查", id)
+		}
+	}
+	// 目录里每个"基础环境组件"都必须被判出来（防止有人新加一个 php@8.5 忘了归类）。
+	for _, a := range Catalog() {
+		if a.Category == CategoryLNMP && !IsEnvComponent(a) {
+			t.Errorf("%s 属于「网站环境」但没被当成基础环境组件", a.ID)
 		}
 	}
 	// 没有版本真源的条目：必须为 false（自研安装器多数如此）。

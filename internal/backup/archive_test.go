@@ -270,3 +270,36 @@ func TestPruneRemovesOldArchives(t *testing.T) {
 		t.Fatal("未过期的归档被误删")
 	}
 }
+
+// TestCreateTwiceInSameSecondDoesNotCollide 锁住"同一秒内两次备份不许互相踩"。
+//
+// 2026-09-22 门禁在"重包拆进程并行"下抓到：归档名是秒级时间戳，第二次备份的
+// `out.tmp` 与第一次同名 —— 一个 rename 走之后另一个 chmod 报
+// "no such file or directory"（测试红）；即使侥幸不报错，后一次也会**覆盖**前一次，
+// 用户无声丢一份备份。
+func TestCreateTwiceInSameSecondDoesNotCollide(t *testing.T) {
+	ctx := context.Background()
+	plan, st, _ := fixture(t)
+	outDir := filepath.Join(t.TempDir(), "backup")
+	fixed := time.Date(2026, 9, 22, 12, 0, 0, 0, time.Local)
+	req := CreateRequest{
+		OutDir: outDir, Targets: []string{TargetPanel}, PanelVersion: "9.9.9", Plan: plan,
+		Now: func() time.Time { return fixed }, // 强制造出"同一秒"的两次备份
+	}
+	first, err := Create(ctx, st, req)
+	if err != nil {
+		t.Fatalf("第一次备份失败: %v", err)
+	}
+	second, err := Create(ctx, st, req)
+	if err != nil {
+		t.Fatalf("同一秒内第二次备份失败（典型报错：chmod …tmp: no such file or directory）: %v", err)
+	}
+	if first.FileName == second.FileName {
+		t.Fatalf("同一秒内两次备份必须落成两个文件，实际都是 %q（后一次会覆盖前一次）", first.FileName)
+	}
+	for _, r := range []*Result{first, second} {
+		if _, err := os.Stat(r.Path); err != nil {
+			t.Errorf("备份文件不存在: %s: %v", r.Path, err)
+		}
+	}
+}

@@ -75,6 +75,19 @@ func Create(ctx context.Context, snap Snapshotter, req CreateRequest) (*Result, 
 		return nil, fmt.Errorf("归档文件名必须以 .tar.gz 结尾: %s", name)
 	}
 	out := filepath.Join(req.OutDir, name)
+	// 同一秒内的第二次备份**不许覆盖第一次**（用户会无声丢一份备份）。
+	// 归档名是秒级时间戳，连点两次"立即备份"就会撞（2026-09-22 门禁在并行分片下抓到）。
+	if _, statErr := os.Stat(out); statErr == nil {
+		base := strings.TrimSuffix(name, ".tar.gz")
+		for i := 2; i < 100; i++ {
+			cand := filepath.Join(req.OutDir, fmt.Sprintf("%s-%d.tar.gz", base, i))
+			if _, e := os.Stat(cand); os.IsNotExist(e) {
+				out = cand
+				name = filepath.Base(cand)
+				break
+			}
+		}
+	}
 
 	// 临时目录放在输出目录内：rename 才是原子的（跨文件系统会失败）。
 	stage, err := os.MkdirTemp(req.OutDir, ".zpb-stage-")
@@ -155,7 +168,9 @@ func Create(ctx context.Context, snap Snapshotter, req CreateRequest) (*Result, 
 	}
 
 	// 6) 打包 + 原子落位 + 权限 0600（含明文口令与私钥）。
-	tmpOut := out + ".tmp"
+	// ⚠️ 临时名必须**每次唯一**：同秒两次备份会撞同一个 `out.tmp`，一个 rename 走之后
+	// 另一个 chmod 就报 no such file or directory（2026-09-22 门禁在并行分片下抓到）。
+	tmpOut := fmt.Sprintf("%s.tmp-%d-%d", out, os.Getpid(), time.Now().UnixNano())
 	if err := tarGzDir(stage, tmpOut); err != nil {
 		_ = os.Remove(tmpOut)
 		return nil, err

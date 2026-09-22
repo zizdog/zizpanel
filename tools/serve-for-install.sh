@@ -57,7 +57,9 @@ info "使用网卡 ${BIND_IFACE:-手动指定}，地址 $BIND_ADDR"
 # ------------------------------------------------------------------- 构建包 --
 VERSION="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "$PROJECT_DIR/internal/version/version.go" | head -1)"
 [ -n "$VERSION" ] || die "无法读取版本号"
-RELDIR="$PROJECT_DIR/dist/release"
+# DIST 可覆盖（默认 <仓库>/dist）：check-full 的远程安装测试会在自己的临时目录里构建，
+# 免得 `make release` 的 clean 与并行跑的其它端到端测试抢 dist/（2026-09-22）。
+RELDIR="${DIST:-$PROJECT_DIR/dist}/release"
 
 if [ "$DO_BUILD" -eq 1 ]; then
   info "构建发布包（版本 ${VERSION}，arm64 + amd64）…"

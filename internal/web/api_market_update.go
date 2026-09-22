@@ -191,6 +191,10 @@ func (s *Server) probeMarketUpdates(ctx context.Context) marketUpdatesResponse {
 	}
 
 	for _, a := range marketVisibleApps(services.Catalog()) {
+		// 基础环境组件（LNMP / python / ffmpeg）不进批量结论（理由见 IsEnvComponent）。
+		if services.IsEnvComponent(a) {
+			continue
+		}
 		if a.BrewFormula != "" {
 			formula, inst, installed := services.ResolveBrewFormula(a.BrewFormula, brewVers)
 			if !installed {

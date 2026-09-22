@@ -1906,8 +1906,16 @@ func MarketAppFor(id string) (MarketApp, bool) {
 // 其余条目（面板自研安装器多数没有版本真源）如实返回 false —— 前端不给入口，
 // 而不是给一个点了必然说"未知"的按钮。
 func SupportsUpdateCheck(id string) bool {
-	if a, ok := FindApp(id); ok && strings.TrimSpace(a.BrewFormula) != "" {
-		return true
+	// 基础环境组件（LNMP 整类 + python/ffmpeg）**一律不参与更新检查**：
+	// 它们有版本依赖（站点建在 nginx/PHP/MySQL 上，自研应用依赖 python/ffmpeg），
+	// 随手升级会把依赖它的东西弄坏（用户 2026-09-22 明确要求）。
+	if a, ok := FindApp(id); ok {
+		if IsEnvComponent(a) {
+			return false
+		}
+		if strings.TrimSpace(a.BrewFormula) != "" {
+			return true
+		}
 	}
 	if a, ok := MarketAppFor(id); ok {
 		for _, d := range a.Downloads {
