@@ -7,7 +7,7 @@
 package version
 
 // Version 是当前面板版本。语义化版本：主版本.次版本.修订号
-var Version = "1.7.1"
+var Version = "1.7.2"
 
 // 递增规则：修订号 +1 到 10 后进位并归零（见 tools/bump-version.py）。
 //

@@ -1,5 +1,5 @@
 GO      ?= go
-VERSION ?= 0.1.0-mvp
+VERSION ?= 0.1.1-mvp
 BIN     ?= dist/zizvideo
 LDFLAGS := -X github.com/zizdog/zizvideo/internal/api.Version=$(VERSION)
 

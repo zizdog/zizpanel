@@ -87,11 +87,11 @@ const (
 	// ZizvideoLabel 是系统级守护进程的 launchd 标签（面板托管 ⇒ 用面板的域前缀）。
 	ZizvideoLabel = "cn.zizpanel.zizvideo"
 	// ZizvideoVersion 是这一版面板所验收的 zizvideo 版本（make release 也按它打产物）。
-	ZizvideoVersion = "0.1.0-mvp"
+	ZizvideoVersion = "0.1.1-mvp"
 	// ZizvideoBinarySHA256 是 arm64 产物的 sha256（make release 每次打印；改 zizvideo
 	// 源码或换版本都要同步它）。运行期**优先用镜像站 manifest.json 里的值**，
 	// 这个常量只在镜像没有清单时兜底。
-	ZizvideoBinarySHA256 = "deadf5ba1a07cbccad80b8afb86c45dd44e300393c726cf22f65f6d20efa111c"
+	ZizvideoBinarySHA256 = "d639e133be7f9db9245b7be03a299aff0cc0948071445ae085fb2182c6bfe42a"
 	// ZizvideoPort 是网页界面端口（只绑 127.0.0.1）。
 	ZizvideoPort = 7766
 	// zizvideoHealthPath 是公开的就绪端点，进程活着就返回 ok。

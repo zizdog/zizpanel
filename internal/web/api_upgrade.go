@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/upgrade"
 	"github.com/zizdog/zizpanel/internal/version"
 )
@@ -78,6 +79,11 @@ func (s *Server) upgradeOptions() upgrade.Options {
 		WorkDir:   s.Cfg.WorkDir,
 		Label:     "cn.zizpanel.panel",
 		HealthURL: s.upgradeHealthURL(),
+		// 模块（zizvideo）已不随包分发，刷新时要**从镜像站按需下载** ——
+		// 默认实现用的是空 Options（拿不到 MirrorBase/WorkDir），会如实失败但刷不动。
+		RefreshModules: func(ctx context.Context, panelBinDir string) []services.ModuleRefreshResult {
+			return s.svcManager().RefreshInstalledModules(ctx, panelBinDir)
+		},
 	}
 }
 
