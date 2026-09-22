@@ -1222,14 +1222,13 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 				if err := s.svcManager().UninstallApp(ctx, app.ID, removeData, force, res); err != nil {
 					return res, err
 				}
-				// 卸载成功后必须**同时**把服务记录删掉：只删文件与 plist 的话，
-				// 用户在「服务管理」里还会看到它，观感就是"根本没卸掉"
-				// （2026-09-16 用户反馈）。按 label 删，label 从目录条目取。
-				if app.ServiceLabel != "" {
-					if n, ferr := s.svcManager().ForgetByLabel(ctx, app.ServiceLabel); ferr == nil && n > 0 {
-						res.Steps = append(res.Steps,
-							fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, app.ServiceLabel))
-					}
+				// 卸载成功后必须**同时**把服务记录删掉（只删文件与 plist 观感就是"没卸掉"）。
+				// 按**全部身份键**删（当前标签 + 纳管标签 + 旧标签别名 + ID/名）：只删当前
+				// label 会留下旧标签残留记录，卸载后它以残留卡片再冒出来（坑 228）。
+				labels := services.AppIdentityLabels(app)
+				if n, ferr := s.svcManager().ForgetByLabels(ctx, labels...); ferr == nil && n > 0 {
+					res.Steps = append(res.Steps,
+						fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, strings.Join(labels, "、")))
 				}
 				// 卸载后护栏：phpMyAdmin 这类会跑 `brew uninstall`，而 brew 的
 				// autoremove 有可能把作为共享依赖的 ffmpeg 一起带走 ——
@@ -1249,11 +1248,12 @@ func (s *Server) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 				if err := s.svcManager().UninstallBrewApp(ctx, app, plan, removeData, force, res); err != nil {
 					return res, err
 				}
-				if app.ServiceLabel != "" {
-					if n, ferr := s.svcManager().ForgetByLabel(ctx, app.ServiceLabel); ferr == nil && n > 0 {
-						res.Steps = append(res.Steps,
-							fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, app.ServiceLabel))
-					}
+				// 按**全部身份键**删（当前标签 + 纳管标签 + 旧标签别名 + ID/名）：
+				// 只删当前 label 会留下旧标签的残留记录，卸载后它以残留卡片再冒出来（坑 228）。
+				labels := services.AppIdentityLabels(app)
+				if n, ferr := s.svcManager().ForgetByLabels(ctx, labels...); ferr == nil && n > 0 {
+					res.Steps = append(res.Steps,
+						fmt.Sprintf("已从「服务管理」移除 %d 条记录（%s）", n, strings.Join(labels, "、")))
 				}
 				s.svcManager().GuardBaseDependenciesAfterUninstall(ctx, res, plan.Formula)
 				return res, nil

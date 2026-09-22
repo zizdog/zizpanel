@@ -931,6 +931,66 @@ func (m *Manager) ForgetByLabel(ctx context.Context, label string) (int, error) 
 	return n, nil
 }
 
+// AppIdentityLabels 返回一个目录条目在服务注册表里的**全部身份键**：
+// 当前标签、纳管标签、历史标签别名，外加目录 ID 与展示名（记录可能以其中任一登记）。
+//
+// 卸载后要按它把该应用的所有记录一并清掉：换过部署方式的应用会留下旧标签的记录，
+// 只删当前标签就会剩一张"残留卡片"（坑 228）。
+func AppIdentityLabels(app App) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	add(app.ServiceLabel)
+	add(app.AdoptLabel)
+	for _, al := range app.AliasLabels {
+		add(al)
+	}
+	add(app.ID)
+	add(app.Name)
+	return out
+}
+
+// ForgetByLabels 按身份键（launchd label / 记录名 / 展示名）把服务记录从注册表里删掉。
+//
+// 与 ForgetByLabel 的差别只有一处：**一次覆盖一个应用的全部身份键** —— 旧标签的残留
+// 记录必须跟着当前记录一起消失，否则卸载后它会以残留卡片再冒出来（坑 228）。不触碰系统：只删面板记录。
+func (m *Manager) ForgetByLabels(ctx context.Context, labels ...string) (int, error) {
+	want := map[string]bool{}
+	for _, l := range labels {
+		if l = strings.TrimSpace(l); l != "" {
+			want[l] = true
+		}
+	}
+	if len(want) == 0 {
+		return 0, nil
+	}
+	list, err := m.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range list {
+		if s == nil {
+			continue
+		}
+		if !want[s.LaunchLabel] && !want[s.Name] && !want[s.DisplayName] {
+			continue
+		}
+		if err := m.repo.Delete(ctx, s.Name); err != nil {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 // Forget 从注册表移除（不触碰系统）。
 //
 // 注意：HTTP 的「只删记录」通路（DELETE /api/v1/services/{name}）**刻意不用它**，
