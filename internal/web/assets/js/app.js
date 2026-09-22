@@ -10,7 +10,7 @@ import { SystemSettingsView } from './systemsettings.js';
 import { SitesView } from './sites.js';
 import { ReverseProxyView } from './reverseproxy.js';
 import { CertsView } from './certs.js';
-import { AppsView } from './apps.js';
+import { AppsView, bootstrapAppUpdates } from './apps.js';
 import { FilesView } from './files.js';
 import { TerminalView, destroyTerminal } from './terminal.js';
 import { CronView } from './cron.js';
@@ -483,6 +483,18 @@ function goto2FASettings() {
   location.hash = wanted;
 }
 
+// kickAppUpdates：登录后（或刷新页面后）由外壳统一预热一次应用更新检查。
+//
+// 为什么放在外壳而不是应用页（用户 2026-09-22）：检查原来挂在应用页的挂载里，
+// "不访问应用版块就永远不提示"；而这条提醒的意义就是**在任何页面都能看见**。
+// 预热同时会把市场列表缓存好（点开「应用市场」秒进）。
+let appUpdatesKicked = false;
+function kickAppUpdates() {
+  if (appUpdatesKicked || !state.session) return;
+  appUpdatesKicked = true;
+  bootstrapAppUpdates().catch(() => { /* 失败不打扰用户：心跳与打开应用页都会再试 */ });
+}
+
 function renderApp() {
   // 路由先过别名表：`#/services` 会落到 apps 版块的「已安装」Tab（见 ROUTE_TARGET）；
   // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
@@ -612,6 +624,8 @@ function renderApp() {
   // 结果变化会派发 zp:update-state，由下面的监听原地同步侧栏小红点。
   startUpgradeWatcher();
   syncUpdateBadge();
+  // 登录后预热一次应用更新检查（顺带把市场列表缓存好）—— 只在第一帧生效一次。
+  kickAppUpdates();
 
   // 渲染前先清理上一个页面的长连接（SSE / 定时器），避免叠加泄漏
   runCleanup();

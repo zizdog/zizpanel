@@ -216,12 +216,38 @@ function lastBackgroundCheckAt() {
   }
 }
 
-// startBackgroundUpdateChecks 只起一次定时器（模块级，页面切走也不停）。
+// bootstrapAppUpdates 是**外壳在登录后（含刷新页面）调用的一次性预热**。
+//
+// 用户 2026-09-22 的三条报障都落在这里：
+//   ① "不访问应用版块就永远不提示" —— 检查原来挂在应用页的挂载里；
+//   ② "登入后后台就该检测一次，并生成缓存，点击软件市场秒进" —— 没有缓存时先拉一次
+//      市场列表（缓存 = 秒进；同时它也是更新检查判断"装了哪些应用"的输入，原来没缓存
+//      就直接跳过检查，于是不打开应用页就永远没有提醒）；
+//   ③ 检查完立刻把"有 N 个可更新"写进 localStorage + 派发事件，侧栏红点**不用等访问应用页**。
+export async function bootstrapAppUpdates() {
+  if (!loadDataCache()) {
+    try {
+      cache = await api.market();
+      cacheAt = new Date().toISOString();
+      try {
+        const svc = await api.services(true);
+        svcList = (svc && svc.list) || [];
+      } catch (e) { /* 服务记录拿不到不影响更新检查 */ }
+      saveDataCache();
+    } catch (e) {
+      return; // 市场列表都拿不到就不猜"有没有新版"：等心跳或用户自己打开应用页
+    }
+  }
+  startAppUpdateWatcher();
+  await runBackgroundUpdateCheck();
+}
+
+// startAppUpdateWatcher 只起一次定时器（模块级，与当前在哪个页面无关）。
 //
 // 心跳 30 秒、但**只在距上次成功检查超过 1 小时时才真查**。为什么不用
 // `setInterval(run, 1h)`：那一轮可能正好撞上页面自己的探测而被互斥保护跳过，
 // 于是这次后台检查被推迟整整一小时 —— 用户会以为"后台检查没生效"。
-function startBackgroundUpdateChecks() {
+function startAppUpdateWatcher() {
   if (appUpdateTimer) return;
   // 首次：3s 后试；若正好撞上页面自己那轮探测（互斥保护会跳过），5s 后再试，
   // 最多 6 次 —— 不让"有新版"的提醒因为一次撞车而拖到 30s 心跳。
@@ -583,8 +609,7 @@ export function AppsView(content, ctx = {}) {
   // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「⟳ 更新」。
   async function load() {
     if (!proxyState) proxyState = { enabled: true, items: [], _stale: true };
-    // 后台定时检查（1 小时一次）由模块级定时器负责，只起一次；这里只挂"查完重画"的订阅。
-    startBackgroundUpdateChecks();
+    // 后台检查由外壳在登录后预热（bootstrapAppUpdates）；这里只挂"查完重画"的订阅。
     if (cache) {
       // 恢复出来的服务记录也要派生一次"服务名 → state"（卡片首颗按钮要它）。
       rebuildSvcState();
@@ -729,6 +754,19 @@ export function AppsView(content, ctx = {}) {
   // 后端按轨分流（brew → `brew upgrade`；动态索引条目 → 复用安装流程）。
   // 刻意不复用 preflight：应用已经装着在跑，更新不需要端口/依赖预检；
   // 而 `brew install` 对已装包是**幂等跳过**，拿它当更新就是"点了没反应还报成功"。
+  // syncAfterAppUpgrade 在"某个应用升级完成"后同步一次（用户 2026-09-22："执行软件更新后
+  // 就应该同步一次，然后调整显示"）：重拉市场列表（已装版本变了）→ 强制重查 → 重算红点，
+  // 避免"更新完了提示还挂着"或"红点与页面状态对不上"。
+  async function syncAfterAppUpgrade() {
+    try {
+      cache = await api.market();
+      cacheAt = new Date().toISOString();
+      saveDataCache();
+    } catch (e) { /* 保留旧缓存，等下一轮 */ }
+    await runBackgroundUpdateCheck();
+    try { window.dispatchEvent(new CustomEvent('zp:app-update-checked', { detail: {} })); } catch (e) { /* 忽略 */ }
+  }
+
   function startUpgrade(a) {
     if (!a || !a.id) return;
     // 升级前后都让结论失效：任务结束时后端已经把缓存清掉了，前端再**强制重探一次**，
@@ -741,8 +779,9 @@ export function AppsView(content, ctx = {}) {
       start: () => api.marketUpgrade(a.id),
       onDone: () => {
         invalidateUpdateCheck(a.id);
-        ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, true);
-        refreshSilently();
+        // 后端在任务收尾时已经失效过缓存；这里"重拉列表 + 强制重查 + 重算红点"一次做完，
+        // 页面上的徽标、顶部横幅与侧栏红点就会同时切到新状态。
+        syncAfterAppUpgrade().then(() => refreshSilently());
       },
     });
   }
