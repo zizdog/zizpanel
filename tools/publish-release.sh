@@ -367,10 +367,15 @@ cmd_push_mirror() {
   [ "$rc" = "0" ] || die "直传包失败（可改用旧的镜像同步任务：POST /api/v1/system/mirror/sync）"
 
   # latest 用**服务端复制**：同样的字节不再走一遍网络。
+  # ⚠️ copy 接口**拒绝覆盖已存在的目标**（保护性默认，返回 400）——旧版本的 latest
+  # 文件还在（上一版同步留下的），所以必须先删目标再复制（2026-09-22 实测踩到）。
   info "镜像上复制出 download/latest/"
   for arch in arm64 amd64; do
+    local dst="$dir/download/latest/zizpanel_latest_darwin_${arch}.tar.gz"
     curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
-      -d "{\"from\":\"$dir/download/$v/zizpanel_${v}_darwin_${arch}.tar.gz\",\"to\":\"$dir/download/latest/zizpanel_latest_darwin_${arch}.tar.gz\"}" \
+      -d "{\"paths\":[\"$dst\"]}" "$base/api/v1/files/delete" >/dev/null 2>&1 || true
+    curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
+      -d "{\"from\":\"$dir/download/$v/zizpanel_${v}_darwin_${arch}.tar.gz\",\"to\":\"$dst\"}" \
       "$base/api/v1/files/copy" >/dev/null || die "复制 latest（${arch}）失败"
   done
   ok "已直传（清单 + 包 + latest；latest 是镜像侧复制，未重传）"
