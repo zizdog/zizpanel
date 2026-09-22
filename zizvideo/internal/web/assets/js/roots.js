@@ -171,6 +171,7 @@ export function openDirectoryPicker(options) {
 
   document.addEventListener("keydown", onKey);
   document.body.append(overlay);
-  load((options && options.start) || "/Volumes").catch(report);
+  // 默认从文件系统根开始：不写死外置盘挂载点（盘不在场时那只是个空目录）。
+  load((options && options.start) || "/").catch(report);
   return { close };
 }

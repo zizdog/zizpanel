@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -15,7 +14,7 @@ func TestDefaultsMatchDocumentedMVP(t *testing.T) {
 	if c.ScanWorkers != 4 {
 		t.Fatalf("scan_workers = %d", c.ScanWorkers)
 	}
-	if len(c.MediaAllowRoots) != 2 {
+	if len(c.MediaAllowRoots) != 1 {
 		t.Fatalf("默认白名单 = %v", c.MediaAllowRoots)
 	}
 	for _, root := range c.MediaAllowRoots {
@@ -24,8 +23,8 @@ func TestDefaultsMatchDocumentedMVP(t *testing.T) {
 		}
 	}
 	home, _ := os.UserHomeDir()
-	if !strings.HasPrefix(c.MediaAllowRoots[0], home) {
-		t.Fatalf("默认白名单未落在用户家目录: %v", c.MediaAllowRoots)
+	if want := filepath.Join(home, "Movies"); c.MediaAllowRoots[0] != want {
+		t.Fatalf("默认白名单 = %v, 期望只有 %s", c.MediaAllowRoots, want)
 	}
 	for _, ext := range []string{"mp4", "mov", "mkv", "webm", "hevc"} {
 		if !c.ExtAllowed("." + ext) {

@@ -38,8 +38,8 @@ type Config struct {
 	AllowRegister bool `json:"allow_register"`
 }
 
-// Default returns the built-in defaults; allow roots default to $HOME/Movies
-// and $HOME/Downloads, matching the documented MVP behaviour.
+// Default returns the built-in defaults; the only allow root is $HOME/Movies
+// (a system folder on every Mac), so nothing points at an external volume.
 func Default() *Config {
 	home, _ := os.UserHomeDir()
 	dataDir := filepath.Join(home, "Library", "Application Support", "zizvideo")
@@ -47,7 +47,7 @@ func Default() *Config {
 		Listen:             "127.0.0.1:7766",
 		DataDir:            dataDir,
 		DatabasePath:       filepath.Join(dataDir, "zizvideo.db"),
-		MediaAllowRoots:    []string{filepath.Join(home, "Movies"), filepath.Join(home, "Downloads")},
+		MediaAllowRoots:    []string{filepath.Join(home, "Movies")},
 		MediaExtensions:    []string{"mp4", "mov", "m4v", "mkv", "webm", "ts", "mts", "avi", "flv", "hevc"},
 		ScanWorkers:        4,
 		ScanDeleteRatio:    0.10,

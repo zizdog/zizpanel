@@ -62,6 +62,12 @@ func run() error {
 	if err := os.MkdirAll(cfg.CoversDir(), 0o700); err != nil {
 		return fmt.Errorf("创建封面目录失败: %w", err)
 	}
+	// 默认允许根 ~/Movies 不存在就建出来（不建外置盘上的任何东西）。
+	if created, cerr := config.EnsureDefaultMovies(); cerr != nil {
+		logger.Warn("默认媒体目录不可用", "error", cerr.Error())
+	} else if created != "" {
+		logger.Info("已创建默认媒体目录", "dir", created)
+	}
 
 	db, err := storage.Open(cfg.DatabasePath)
 	if err != nil {

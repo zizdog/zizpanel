@@ -56,8 +56,8 @@ func Validate(raw string) (string, error) {
 }
 
 // Browse lists the child directories of dir, dropping every non-directory
-// entry. A symlink to a directory is offered (so /Volumes and /tmp work on
-// macOS); registering it still re-validates the real path in the API.
+// entry. A symlink to a directory is offered (so a mounted volume and /tmp
+// work on macOS); registering it still re-validates the real path in the API.
 // limit/offset page the listing so a huge directory cannot blow up a response.
 func Browse(dir string, starts []string, offset, limit int) (*Result, error) {
 	clean, err := Validate(dir)

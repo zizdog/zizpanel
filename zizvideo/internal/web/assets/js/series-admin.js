@@ -21,6 +21,7 @@ export function mountSeriesAdmin(box, series, options) {
   const addBtn = el("button", { class: "btn primary", type: "button", text: "加入所选", disabled: true });
   const picker = el("div", { class: "panel" },
     el("div", { class: "muted small-note", text: "只能引用已扫描到的媒体，不会复制文件。" }),
+    el("div", { class: "muted small-note", text: "文件名带 S01E01/EP03/第3集 才会认成集号" }),
     el("div", { class: "row" }, searchInput, searchBtn),
     results, el("div", { class: "actions" }, addBtn));
 

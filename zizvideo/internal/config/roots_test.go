@@ -130,7 +130,7 @@ func TestRejectedRootLeavesConfigUntouched(t *testing.T) {
 	}
 	// The failing paths must also be refused by the writer itself.
 	for _, p := range []string{"relative", filepath.Join(dir, "nope"), filePath} {
-		if err := SetRoots(cfgPath, []string{media, p}); err == nil {
+		if err := SetRoots(cfgPath, []string{media, p}, []string{p}); err == nil {
 			t.Fatalf("SetRoots 不应接受 %q", p)
 		}
 	}
@@ -155,7 +155,7 @@ func TestSetRootsPreservesOtherFields(t *testing.T) {
 
 	// 夹具只用临时目录：指向真实外置盘时，盘一摘这个测试就红（环境依赖，非回归；坑 209）。
 	second := t.TempDir()
-	if err := SetRoots(path, []string{"/tmp", second}); err != nil {
+	if err := SetRoots(path, []string{"/tmp", second}, []string{second}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _, err := Load(path)
@@ -175,6 +175,40 @@ func TestSetRootsPreservesOtherFields(t *testing.T) {
 	}
 	if string(raw["listen"]) != `"127.0.0.1:7766"` {
 		t.Fatalf("listen 被重写: %s", raw["listen"])
+	}
+}
+
+// TestOfflineRootDoesNotBlockOtherWrites 是用户 2026-09-22 报的那条：旧根所在
+// 外接盘已拔掉时，加/删别的根不许被它连坐（只有新增条目要求存在）。
+func TestOfflineRootDoesNotBlockOtherWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	offline := filepath.Join(dir, "unplugged-drive") // 故意不创建：模拟盘已摘
+	live := filepath.Join(dir, "movies")
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteConfig(t, path, `{"media_allow_roots":["`+offline+`"]}`+"\n")
+	roots := NewRoots(path, []string{offline})
+
+	if _, err := roots.Add(live); err != nil {
+		t.Fatalf("旧根脱机时加新根必须成功: %v", err)
+	}
+	if back, _ := RootsFromFile(path); len(back) != 2 || back[1] != live {
+		t.Fatalf("回读 = %v", back)
+	}
+	if _, err := roots.Remove(offline); err != nil {
+		t.Fatalf("脱机旧根必须能删: %v", err)
+	}
+	if back, _ := RootsFromFile(path); len(back) != 1 || back[0] != live {
+		t.Fatalf("回读 = %v", back)
+	}
+	if _, err := roots.Remove(live); err == nil {
+		t.Fatal("删最后一个根必须报错")
+	}
+	// 新增的路径自己不存在时仍要拒绝（相对/不存在照旧）。
+	if _, err := roots.Add(filepath.Join(dir, "nope")); err == nil {
+		t.Fatal("新增不存在的路径必须被拒")
 	}
 }
 

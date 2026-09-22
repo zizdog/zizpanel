@@ -2,7 +2,7 @@
 // 顺序完全由后端的 position 决定；播放端自己按数组顺序推进，不吃随机游标。
 
 import { api, patchProgressKeepalive } from "./api.js";
-import { el, clear, banner, setBanner, field, fmtDuration } from "./dom.js";
+import { el, clear, banner, setBanner, field, fmtDuration, asArray } from "./dom.js";
 import { session } from "./auth.js";
 import { confirmDialog } from "./confirm.js";
 import { mountSeriesAdmin } from "./series-admin.js";
@@ -35,26 +35,36 @@ export function mountSeries(view) {
       onclick: () => { form.hidden = !form.hidden; if (!form.hidden) titleInput.focus(); },
     }));
   }
-  view.append(el("div", { class: "page" }, head, form, note, detectNote, box));
+  view.append(el("div", { class: "page" }, head,
+    el("div", { class: "muted small-note", text: "剧场成员在剧场「管理」里；媒体库/允许根/用户在后台" }),
+    form, note, detectNote, box));
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     setBanner(note, "");
     submit.disabled = true;
     try {
-      await api.request("POST", "/api/v1/admin/series", {
+      const created = await api.request("POST", "/api/v1/admin/series", {
         title: titleInput.value.trim(), description: descInput.value.trim(),
       });
       titleInput.value = "";
       descInput.value = "";
       form.hidden = true;
-      load();
+      // 新建后直接进剧场页看"下一步做什么"，不把用户丢回空列表。
+      if (created && created.id) openSeries(created.id);
+      else load();
     } catch (err) {
       setBanner(note, err && err.message ? err.message : "新建失败");
     } finally {
       submit.disabled = false;
     }
   });
+
+  function openSeries(id) {
+    const hash = "#/series/" + encodeURIComponent(id);
+    if (location.hash === hash) load();
+    else location.hash = hash;
+  }
 
   async function load() {
     clear(box);
@@ -70,7 +80,8 @@ export function mountSeries(view) {
     }
     clear(box);
     if (!list.length) {
-      box.append(el("div", { class: "muted", text: isAdmin() ? "还没有剧场，点右上角新建" : "还没有剧场" }));
+      box.append(el("div", { class: "muted",
+        text: isAdmin() ? "还没有剧场，点右上角新建；文件放在允许根目录的子文件夹里" : "还没有剧场" }));
       return;
     }
     for (const item of list) box.append(seriesCard(item, load));
@@ -230,18 +241,63 @@ export function mountSeriesPlay(view, seriesID) {
     class: "center-btn", type: "button", text: "点击播放", hidden: true, dataset: { role: "play" },
     onclick: () => { centerBtn.hidden = true; tryPlay(); },
   });
+  // 管理入口也放在剧场页：entries 只在后台会让用户找不到（B.2）。
+  const manageBtn = isAdmin()
+    ? el("button", {
+        class: "btn small", type: "button", text: "管理这个剧场", dataset: { role: "series-manage-play" },
+        onclick: () => {
+          if (!state.series) { showToast("还在加载，请稍候"); return; }
+          openDrawer(state.series, () => loadSeries());
+        },
+      })
+    : null;
 
-  view.append(el("div", { class: "series-play" },
+  const playBox = el("div", { class: "series-play" },
     el("div", { class: "sp-stage" }, video),
     el("div", { class: "sp-top" },
       el("a", { class: "btn small", href: "#/series", text: "← 剧场", dataset: { role: "back-to-series" } }),
-      titleEl, countEl, orderNote),
+      titleEl, manageBtn, countEl, orderNote),
     center, centerBtn,
     el("div", { class: "sp-bottom" },
       el("div", { class: "row sp-controls" }, prev, epSelect, next, listToggle, sound),
       el("div", { class: "bar" }, barFill),
       el("div", { class: "times" }, elapsed, total)),
-    listBox, toast));
+    listBox, toast);
+  // 新剧场没有剧集时不留空页面：给"下一步做什么"的卡片（放哪/怎么命名/两条路）。
+  const guideBox = el("div", { class: "series-guide", hidden: true, dataset: { role: "series-empty-guide" } });
+  view.append(playBox, guideBox);
+
+  const STEP_LABELS = { scan: "扫描", detect: "识别", add_existing: "加入已有媒体" };
+
+  function renderGuide(guide) {
+    const data = guide || {};
+    const usable = asArray(data.usable_roots);
+    const all = asArray(data.roots);
+    const steps = asArray(data.steps);
+    const card = el("div", { class: "panel guide-box" },
+      el("div", { class: "panel-title", text: data.title || "这个剧场还没有剧集" }),
+      el("div", { class: "muted small-note", text: data.where || "文件放在某个允许根目录下的子文件夹里" }),
+      usable.length
+        ? el("div", { class: "muted small-note", text: "可用允许根：" + usable.join("、") })
+        : el("div", { class: "row" },
+            el("span", { class: "muted small-note", text: all.length ? "已配置的允许根都不可用" : "还没有允许根" }),
+            el("a", { class: "btn small primary", href: data.roots_url || "#/admin/roots", text: "去加允许根" })),
+      el("div", { class: "muted small-note", text: data.naming || "" }),
+      el("div", { class: "muted small-note", text: data.naming_note || "" }),
+      ...steps.map((step) => el("div", { class: "guide-step" },
+        el("span", { class: "guide-key", text: STEP_LABELS[step.key] || step.key || "步骤" }),
+        el("span", { class: "ep-title", text: step.text || "" }))),
+      el("div", { class: "actions" },
+        isAdmin() ? el("button", {
+          class: "btn primary", type: "button", text: "管理这个剧场（加入已有媒体）",
+          dataset: { role: "series-manage-empty" },
+          onclick: () => { if (state.series) openDrawer(state.series, () => loadSeries()); },
+        }) : null,
+        isAdmin() ? el("a", { class: "btn small", href: "#/admin/libraries", text: "去后台建库扫描" }) : null,
+        el("a", { class: "btn small", href: "#/series", text: "← 返回剧场列表" })));
+    clear(guideBox);
+    guideBox.append(card);
+  }
 
   let toastTimer = 0;
   function showToast(message) {
@@ -436,7 +492,7 @@ export function mountSeriesPlay(view, seriesID) {
     if (Number.isFinite(n) && n >= 1) state.seekSeconds = Math.min(120, Math.round(n));
   }).catch(() => {});
 
-  (async () => {
+  async function loadSeries() {
     try {
       const data = await api.request("GET", "/api/v1/series/" + encodeURIComponent(seriesID));
       const raw = data && Array.isArray(data.list) ? data.list : [];
@@ -449,22 +505,30 @@ export function mountSeriesPlay(view, seriesID) {
       }).filter(Boolean);
       titleEl.textContent = (state.series && state.series.title) || "剧场";
       const unrecognized = state.items.filter((item) => item.episode_label === "未识别").length;
-      orderNote.hidden = unrecognized === 0;
-      orderNote.textContent = unrecognized > 0 ? "未识别（按文件名排）共 " + unrecognized + " 集" : "";
       clear(epSelect);
       state.items.forEach((item, i) => {
         epSelect.append(el("option", { value: String(i), text: labelOf(item, i) }));
       });
       if (!state.items.length) {
         countEl.textContent = "这个剧场还没有剧集";
+        orderNote.hidden = true;
+        renderGuide(data && data.guide);
+        playBox.hidden = true;
+        guideBox.hidden = false;
         return;
       }
-      playIndex(0, true);
+      guideBox.hidden = true;
+      playBox.hidden = false;
+      orderNote.hidden = unrecognized === 0;
+      orderNote.textContent = unrecognized > 0 ? "未识别（按文件名排）共 " + unrecognized + " 集" : "";
+      if (state.index < 0 || state.index >= state.items.length) playIndex(0, true);
+      else paint();
     } catch (err) {
       countEl.textContent = "加载失败";
       showToast(err && err.message ? err.message : "加载失败");
     }
-  })();
+  }
+  loadSeries();
 
   return function cleanup() {
     clearInterval(timer);

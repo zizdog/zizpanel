@@ -15,11 +15,14 @@ import (
 )
 
 // rootState is one allow root plus the honest probe of its current state.
+// status 把"为什么不可用"说成一句人话，UI 直接显示（旧根脱机也要能看见/能删）。
 type rootState struct {
 	Path      string `json:"path"`
 	Exists    bool   `json:"exists"`
 	IsDir     bool   `json:"is_dir"`
 	Readable  bool   `json:"readable"`
+	Status    string `json:"status"`
+	Note      string `json:"note,omitempty"`
 	InUse     bool   `json:"in_use"`
 	Libraries int    `json:"libraries"`
 }
@@ -32,12 +35,20 @@ func (s *Server) rootsBody() map[string]any {
 	}
 	out := make([]rootState, 0, len(raw))
 	for _, r := range raw {
-		st := rootState{Path: r}
+		st := rootState{Path: r, Status: "ok"}
 		if info, serr := os.Stat(r); serr == nil {
 			st.Exists = true
 			st.IsDir = info.IsDir()
 		}
 		st.Readable = st.IsDir && readableDir(r)
+		switch {
+		case !st.Exists:
+			st.Status, st.Note = "unavailable", "不可用（路径不存在）"
+		case !st.IsDir:
+			st.Status, st.Note = "unavailable", "不可用（不是目录）"
+		case !st.Readable:
+			st.Status, st.Note = "unavailable", "不可用（不可读）"
+		}
 		names := librariesUnder(libs, r)
 		st.Libraries = len(names)
 		st.InUse = len(names) > 0
@@ -103,7 +114,8 @@ func (s *Server) HandleAddMediaRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	clean, verr := config.ValidateAllowRoot(req.Path)
 	if verr != nil {
-		s.fail(w, r, domain.New("MEDIA_ROOT_INVALID", verr.Error(), 400))
+		// 说清是"这条路径不可用"，别让用户以为是 config.json 写不进去。
+		s.fail(w, r, domain.New("MEDIA_ROOT_INVALID", "不能加为允许根："+verr.Error(), 400))
 		return
 	}
 	if !s.Roots.FileBacked() {
@@ -189,6 +201,12 @@ func (s *Server) HandleRemoveMediaRoot(w http.ResponseWriter, r *http.Request) {
 			"以下媒体库正在使用，请先处理: "+strings.Join(names, "、"), 409))
 		return
 	}
+	// 删空会让媒体库整体不可用：在接口层拒绝，错误文案不许说成"写入失败"。
+	if len(current) <= 1 {
+		s.fail(w, r, domain.New("MEDIA_ROOT_LAST",
+			"至少要保留一个允许根，先添加一个可用目录再删", 409))
+		return
+	}
 	next, err := s.Roots.Remove(clean)
 	if err != nil {
 		s.audit(r, "media_root.remove", "path:"+clean, false, errCode(err))
@@ -216,7 +234,8 @@ func (s *Server) HandleBrowseFS(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, res, nil)
 }
 
-// browseStarts are convenient entry points: /Volumes, $HOME and the allow roots.
+// browseStarts are convenient entry points: $HOME first, then the allow roots.
+// 不写死外置盘挂载点：盘不在场时它只是个空目录，入口交给用户自己选。
 func (s *Server) browseStarts() []string {
 	out := []string{}
 	seen := map[string]bool{}
@@ -227,7 +246,6 @@ func (s *Server) browseStarts() []string {
 		seen[p] = true
 		out = append(out, p)
 	}
-	add("/Volumes")
 	if home, err := os.UserHomeDir(); err == nil {
 		add(home)
 	}

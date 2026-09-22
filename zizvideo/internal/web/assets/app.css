@@ -246,6 +246,11 @@ body {
 .nav-icon { font-size: 17px; line-height: 1.1; }
 
 .series-list { display: flex; flex-direction: column; gap: 8px; }
+/* 新剧场空状态：放哪/怎么命名/下一步，别留一个空页面（用户 2026-09-22） */
+.series-guide { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px; }
+.guide-box { max-width: 720px; margin: 0 auto; }
+.guide-step { display: flex; gap: 8px; align-items: baseline; }
+.guide-key { min-width: 64px; color: var(--accent); font-size: 12px; white-space: nowrap; }
 .series-row { display: flex; gap: 8px; align-items: center; }
 .series-row .series-card { flex: 1 1 auto; min-width: 0; }
 .series-card {

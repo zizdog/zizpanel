@@ -47,7 +47,7 @@ JSON 文件（`--config` 或 `ZV_CONFIG`）+ `ZV_` 环境变量覆盖，两者�
 
 | 键 | 含义 | 示例 | 生效 |
 |---|---|---|---|
-| `media_allow_roots` | 媒体根白名单（JSON 字符串数组） | `["/Volumes/ZPMirror/video"]` | 立即（服务每次读快照）；也可用界面/CLI 改 |
+| `media_allow_roots` | 媒体根白名单（JSON 字符串数组） | `["/Users/你/Movies"]` | 立即（服务每次读快照）；也可用界面/CLI 改 |
 | `listen` | 监听地址 | `"127.0.0.1:7766"` | 重启后 |
 | `scan_workers` | 扫描并发 1–16 | `4` | 重启后 |
 | `media_extensions` | 扩展名白名单 | `["mp4","mkv"]` | 重启后 |
@@ -61,11 +61,15 @@ JSON 文件（`--config` 或 `ZV_CONFIG`）+ `ZV_` 环境变量覆盖，两者�
 `ZV_MEDIA_ALLOW_ROOTS` 一旦设置就覆盖文件里的值，此时界面与 CLI 会明确拒绝写入。
 
 ```bash
-zizvideo roots list                       --config config.json
-zizvideo roots add    /Volumes/ZPMirror/video --config config.json
-zizvideo roots remove /Volumes/ZPMirror/video --config config.json
+zizvideo roots list                        --config config.json
+zizvideo roots add    "$HOME/Movies"       --config config.json
+zizvideo roots remove "$HOME/Movies"       --config config.json
 # 每条输出一行 JSON：{"action":"add","ok":true,"path":"...","roots":[...],"config_path":"..."}
 ```
+
+只要求**新增**的那条路径存在：旧根所在外接盘拔掉后，加/删别的根不会被它连坐；
+旧根会以「不可用（路径不存在）」显示，可直接删除。配置文件永远在数据目录
+（`~/Library/Application Support/zizvideo/config.json`），与允许根无关。
 
 媒体库根路径必须：绝对路径、`filepath.Clean` 后与原串完全一致、存在且是目录、可读、
 且落在允许根内（`EvalSymlinks` 之后仍在白名单内，`/tmp` → `/private/tmp` 这类别名按真实路径比对）。

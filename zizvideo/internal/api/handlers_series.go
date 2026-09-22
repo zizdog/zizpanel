@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/zizdog/zizvideo/internal/detect"
@@ -103,7 +104,54 @@ func (s *Server) HandleGetSeries(w http.ResponseWriter, r *http.Request) {
 	for i, item := range items {
 		list = append(list, seriesEpisodeJSON(eps[i], item))
 	}
-	respond(w, http.StatusOK, map[string]any{"series": seriesJSON(*series, scope), "list": list}, nil)
+	respond(w, http.StatusOK, map[string]any{
+		"series": seriesJSON(*series, scope), "list": list, "guide": s.seriesGuide()}, nil)
+}
+
+// guideStep is one concrete next action for an empty 剧场.
+type guideStep struct {
+	Key  string `json:"key"`
+	Text string `json:"text"`
+}
+
+// seriesGuide answers "新建剧场后下一步做什么" without making the user guess:
+// where the files live, how filenames are recognised, and the two entry points.
+// Naming mirrors internal/media.ParseEpisode（唯一内核，不许另编一套）.
+type seriesGuide struct {
+	Title       string      `json:"title"`
+	Where       string      `json:"where"`
+	Naming      string      `json:"naming"`
+	NamingNote  string      `json:"naming_note"`
+	Roots       []string    `json:"roots"`
+	UsableRoots []string    `json:"usable_roots"`
+	Steps       []guideStep `json:"steps"`
+	AdminURL    string      `json:"admin_url"`
+	RootsURL    string      `json:"roots_url"`
+}
+
+func (s *Server) seriesGuide() seriesGuide {
+	all := s.Roots.List()
+	usable := make([]string, 0, len(all))
+	for _, root := range all {
+		if info, err := os.Stat(root); err == nil && info.IsDir() && readableDir(root) {
+			usable = append(usable, root)
+		}
+	}
+	return seriesGuide{
+		Title:       "这个剧场还没有剧集",
+		Where:       "文件放在某个允许根目录下的子文件夹里",
+		Naming:      "文件名带 S01E01、EP03、第3集，或结尾独立数字",
+		NamingNote:  "只看文件名，识别不到留「未识别」，绝不猜",
+		Roots:       all,
+		UsableRoots: usable,
+		Steps: []guideStep{
+			{Key: "scan", Text: "先在后台「媒体库」建库指向该子文件夹并扫描"},
+			{Key: "detect", Text: "剧场「管理」→ 自动识别剧集"},
+			{Key: "add_existing", Text: "剧场「管理」→ 搜索并勾选 → 加入所选"},
+		},
+		AdminURL: "#/admin",
+		RootsURL: "#/admin/roots",
+	}
 }
 
 // seriesEpisodeJSON is one episode entry: numbers + the honest 人读标签.

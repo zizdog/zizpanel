@@ -42,10 +42,12 @@ function route() {
     show((view) => mountLogin(view, () => go("#/feed")), true);
     return;
   }
-  if (path === "/admin") {
+  if (path === "/admin" || path.startsWith("/admin/")) {
     if (!session.user) { replace("#/login"); return; }
     if (session.user.role !== "admin") { replace("#/feed"); return; }
-    show((view) => mountAdmin(view), false);
+    // #/admin/roots 直达允许根页签，剧场空状态卡片的「去加允许根」用得到。
+    const tab = path.startsWith("/admin/") ? decodeURIComponent(path.slice("/admin/".length)) : "";
+    show((view) => mountAdmin(view, tab), false);
     return;
   }
   if (!session.user) { replace("#/login"); return; }

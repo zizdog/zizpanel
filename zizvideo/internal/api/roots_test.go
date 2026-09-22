@@ -63,8 +63,9 @@ func TestMediaRootsListReportsRealState(t *testing.T) {
 	if body.EnvOverride {
 		t.Fatal("未设置环境变量时 env_override 应为 false")
 	}
-	if len(body.Starts) == 0 || body.Starts[0] != "/Volumes" {
-		t.Fatalf("starts 应包含 /Volumes: %v", body.Starts)
+	home, _ := os.UserHomeDir()
+	if len(body.Starts) == 0 || body.Starts[0] != home {
+		t.Fatalf("starts 应以 $HOME 打头: %v", body.Starts)
 	}
 }
 

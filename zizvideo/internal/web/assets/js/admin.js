@@ -88,7 +88,7 @@ function mountLibraries(root) {
   let allowed = [];
   const pick = button("选择目录", () => {
     openDirectoryPicker({
-      start: pathInput.value.trim() || "/Volumes",
+      start: pathInput.value.trim() || "/",
       roots: () => allowed,
       onPicked: (picked) => { pathInput.value = picked; renderHint(); },
       onRootsChanged: loadRoots,
@@ -296,11 +296,11 @@ function mountLibraries(root) {
 function mountRoots(root) {
   const note = banner();
   const { table, body } = gridOf(["允许根", "状态", "被哪些库使用", "操作"]);
-  const newPath = input({ placeholder: "绝对路径，例如 /Volumes/ZPMirror/video" });
+  const newPath = input({ placeholder: "绝对路径，例如 /Users/你/Movies" });
   const addButton = el("button", { class: "btn primary", type: "submit", text: "添加" });
   const browseButton = button("浏览目录…", () => {
     openDirectoryPicker({
-      start: newPath.value.trim() || "/Volumes",
+      start: newPath.value.trim() || "/",
       roots: () => roots || [],
       onVisited: (path) => { newPath.value = path; },
       onPicked: (path) => { newPath.value = path; },
@@ -314,7 +314,9 @@ function mountRoots(root) {
   let roots = [];
 
   function stateText(item) {
-    if (!item.exists) return "不存在";
+    if (item && item.status === "ok") return "可读";
+    if (item && item.status === "unavailable") return item.note || "不可用";
+    if (!item.exists) return "不可用（路径不存在）";
     if (!item.is_dir) return "不是目录";
     if (!item.readable) return "不可读";
     return "可读";
@@ -349,6 +351,10 @@ function mountRoots(root) {
       }
       if (data && data.env_override) {
         setBanner(note, "ZV_MEDIA_ALLOW_ROOTS 已覆盖，配置改动不生效");
+      } else {
+        // 脱机的旧根要能看见、能删、如实标注，不阻塞整页。
+        const bad = list.filter((item) => item.status === "unavailable");
+        if (bad.length) setBanner(note, bad.length + " 条允许根不可用（外接盘拔了？），可直接删除");
       }
     } catch (err) {
       setBanner(note, err && err.message ? err.message : "加载失败");
@@ -910,7 +916,7 @@ function mountSystem(root) {
 
 /* ---------- 容器 ---------- */
 
-export function mountAdmin(view) {
+export function mountAdmin(view, initialTab) {
   const note = banner();
   const tabs = el("nav", { class: "tabs" });
   const panel = el("div", { class: "admin-body" });
@@ -956,8 +962,10 @@ export function mountAdmin(view) {
     tabs.append(tabButton);
   }
 
-  view.append(el("div", { class: "admin" }, back, note, tabs, panel));
-  select("libraries");
+  view.append(el("div", { class: "admin" }, back, note,
+    el("div", { class: "muted small-note", text: "后台管媒体库/媒体/允许根/用户；剧场成员在剧场页「管理」里" }),
+    tabs, panel));
+  select(tabButtons.has(initialTab) ? initialTab : "libraries");
 
   return () => {
     document.removeEventListener("keydown", onBackKey);
