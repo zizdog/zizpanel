@@ -71,6 +71,15 @@ type Server struct {
 	mktDockerV  string
 	mktDockerAt time.Time
 
+	// ---- 市场「检查更新」的进程内缓存（见 api_market_update.go）----
+	// 一次检查要打镜像索引 + 起 `--version` 子进程，属昂贵探测（AGENTS 第三节 7）：按需做、TTL 内不重复。
+	// 放 Server 上而不是 Manager：svcManager() 每次请求都新建，挂它上面活不过一次请求。
+	updateMu      sync.Mutex
+	updateChecks  map[string]cachedUpdateCheck
+	updateProbeMu sync.Mutex // 串行化探测：并发请求同一应用时只有一个真的去打镜像
+	// marketUpdateCheckOverride 仅供单测：替换真实探测（会联网 + 起子进程）。
+	marketUpdateCheckOverride func(ctx context.Context, id string) services.ZizvideoUpdateCheck
+
 	// ---- Docker 加速源「上次检测」的内存缓存（带时间戳）----
 	//
 	// 为什么放在 Server 而不是 services.Manager：svcManager() **每次请求都新建**
@@ -438,6 +447,8 @@ func (s *Server) routes() http.Handler {
 	// ---------- 应用市场 ----------
 	root.HandleFunc("GET /api/v1/market", s.requireAuth(s.handleMarketList))
 	root.HandleFunc("GET /api/v1/market/{id}/preflight", s.requireAuth(s.handleMarketPreflight))
+	// 按需检查"装了但镜像上有更新吗"（只对动态版本条目有意义；见 api_market_update.go）
+	root.HandleFunc("GET /api/v1/market/{id}/update-check", s.requireAuth(s.handleMarketUpdateCheck))
 	root.HandleFunc("POST /api/v1/market/{id}/install", s.requireAuth(s.handleMarketInstall))
 	// 一键装 LNMP：比逐个装市场条目多做了四件收尾工作，见 services/lnmp.go
 	// 先取版本候选（弹窗用）再开任务：POST 的 body 里就是用户在这次弹窗里的选择。

@@ -156,6 +156,68 @@ function dockerImagesOf(a) {
 // 服务记录"（内部概念）。两者对用户都是"已经装好了"，所以合并成同一个判断。
 function isInstalled(a) { return !!(a && (a.installed || a.adopted)); }
 
+// ---------------------------------------------------------------------------
+//  市场卡片的「更新检查」（按需探测 + sessionStorage 缓存）
+// ---------------------------------------------------------------------------
+//
+// 只在 supports_update_check 且**已安装**的条目上按需打 update-check：昂贵探测绝不进
+// 列表/首屏（AGENTS 第三节 7）。sessionStorage 让同一次会话刷新页面不重复探测、不抖顺序。
+// TTL 10 分钟 > 后端缓存的 9 分钟：到期再问时后端一定已过期，不会把旧 checked_at 发回来。
+const UPDATE_CHECK_TTL_MS = 10 * 60 * 1000;
+const UPDATE_CHECK_STORE = 'zp.market.updateCheck';
+
+// updateChecks: 应用 ID → {installed, latest, update_available, unknown, checked_at, error}
+// updateChecking: 应用 ID → true（这个条目正在探测，卡片上显示"检查更新中…"）
+// updateInflight: 正在跑的那一轮探测（Promise）；页面切走再回来时接在它后面重画，
+// 不会因为"上一轮还没回来"而永远看不到徽标。
+let updateChecks = loadUpdateCheckStore();
+let updateChecking = {};
+let updateInflight = null;
+
+function loadUpdateCheckStore() {
+  try {
+    const raw = sessionStorage.getItem(UPDATE_CHECK_STORE);
+    const obj = raw ? JSON.parse(raw) : null;
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveUpdateCheckStore() {
+  try {
+    sessionStorage.setItem(UPDATE_CHECK_STORE, JSON.stringify(updateChecks));
+  } catch (e) { /* 隐私模式/配额满：只是不缓存，不影响本次结论 */ }
+}
+
+// updateCheckFresh 判断一条结论是否在 TTL 内（判据是后端给的 checked_at）。
+function updateCheckFresh(c) {
+  if (!c || !c.checked_at) return false;
+  const at = Date.parse(c.checked_at);
+  return Number.isFinite(at) && (Date.now() - at) < UPDATE_CHECK_TTL_MS;
+}
+
+// updateCheckOf 取这个条目**可信且未过期**的检查结论（没有/过期 → null）。
+function updateCheckOf(a) {
+  if (!a || !a.id) return null;
+  const c = updateChecks[a.id];
+  return updateCheckFresh(c) ? c : null;
+}
+
+// updatePendingOf 是"徽标 + 置顶"的唯一判据：只有**确定**有更新才算。
+// unknown（索引不可达/拿不到期望值）一律不算 —— 绝不能把"不知道"说成"有新版"。
+function updatePendingOf(a) {
+  const c = updateCheckOf(a);
+  return !!(c && c.update_available === true && !c.unknown);
+}
+
+// invalidateUpdateCheck 让某个条目的结论立刻失效（安装/更新完成后调用）。
+function invalidateUpdateCheck(id) {
+  if (!id) return;
+  delete updateChecks[id];
+  saveUpdateCheckStore();
+}
+
 export function AppsView(content, ctx = {}) {
   clear(content);
 
@@ -168,6 +230,10 @@ export function AppsView(content, ctx = {}) {
   // netFailure：最近一次安装/探测失败的原文，**仅当判定为网络问题时**才存。
   // 存下来是为了在本页内容最上方常驻一条醒目的网络提示（见 renderBody）。
   let netFailure = '';
+  // alive：本页还挂着吗 —— 按需的更新检查是异步的，回来时页面可能已经切走，
+  // 不许再往卸掉的 DOM 上写东西。
+  let alive = true;
+  registerCleanup(() => { alive = false; });
 
   const tabBar = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '14px', flexWrap: 'wrap' } });
   const body = h('div');
@@ -297,6 +363,125 @@ export function AppsView(content, ctx = {}) {
   //   · 按归一化 key 去重后渲染（与「已安装」Tab 同一套去重规则）。
   function marketApps() {
     return dedupeMarketEntries((cache?.list || []).filter((a) => a && !isDockerRec(a) && !a.site_app));
+  }
+
+  // ---------- 更新检查（按需；见文件头 10 分钟 TTL 的说明）----------
+
+  // eligibleForUpdateCheck 是"这个条目该不该探测"的唯一判据：
+  // supports_update_check（静态声明）+ 已安装 + 结论已过期 + 当前没有在查。
+  // 未安装的**不发请求** —— 市场本来显示「安装」，没有"更新"可言。
+  function eligibleForUpdateCheck(a) {
+    return !!(a && a.id && a.supports_update_check && isInstalled(a)
+      && !updateChecking[a.id] && !updateCheckFresh(updateChecks[a.id]));
+  }
+
+  // ensureUpdateChecks 对当前可见列表里符合条件的条目各探测一次，全部落定后只重画一次
+  //（这样"可更新"分组只跳一次）。已有一轮在飞时不重复发请求，只把 onDone 接在它后面。
+  function ensureUpdateChecks(list, onDone) {
+    if (updateInflight) {
+      if (typeof onDone === 'function') updateInflight.then(() => onDone());
+      return;
+    }
+    const targets = (list || []).filter(eligibleForUpdateCheck);
+    if (!targets.length) return;
+    const jobs = targets.map((a) => {
+      updateChecking[a.id] = true;
+      return api.marketUpdateCheck(a.id)
+        .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
+        .catch((e) => {
+          // 接口本身失败（网络/权限）也存成 unknown：否则每次重画都会再打一次。
+          updateChecks[a.id] = updateCheckFailure(e);
+        })
+        .finally(() => { delete updateChecking[a.id]; });
+    });
+    const round = Promise.allSettled(jobs).then(() => { saveUpdateCheckStore(); });
+    updateInflight = round;
+    round.then(() => {
+      if (updateInflight === round) updateInflight = null;
+      if (typeof onDone === 'function') onDone();
+    });
+  }
+
+  // updateCheckFailure 把接口/网络失败折叠成一条**如实的 unknown**（不猜结论）。
+  function updateCheckFailure(e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    return {
+      installed: '', latest: '', update_available: false, unknown: true,
+      checked_at: new Date().toISOString(), error: '检查失败：' + msg,
+    };
+  }
+
+  // forceUpdateCheck 是卡片上「检查更新」这颗按钮：忽略 TTL 重新查这一个条目
+  //（unknown 之后用户要有个重试的办法）。fresh=1 让后端也绕开它的进程内缓存。
+  function forceUpdateCheck(a) {
+    if (!a || !a.id || updateChecking[a.id]) return;
+    invalidateUpdateCheck(a.id);
+    updateChecking[a.id] = true;
+    renderGrid(); // 让"检查更新中…"立刻可见
+    api.marketUpdateCheck(a.id, true)
+      .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
+      .catch((e) => { updateChecks[a.id] = updateCheckFailure(e); })
+      .finally(() => {
+        delete updateChecking[a.id];
+        saveUpdateCheckStore();
+        afterUpdateChecks();
+      });
+  }
+
+  // afterUpdateChecks 是探测落定后的重画（页面已切走就不再动 DOM）。
+  function afterUpdateChecks() {
+    if (!alive || active !== 'market' || !marketGrid) return;
+    renderHead();
+    renderGrid();
+  }
+
+  // updateBadgeOf 只给**确定有更新**的条目一枚徽标；unknown/已最新/没查 一律不给。
+  function updateBadgeOf(a) {
+    if (!updatePendingOf(a)) return null;
+    const latest = String((updateCheckOf(a) || {}).latest || '');
+    return h('span.pill.warn', {
+      text: '有新版' + (latest ? ' v' + latest : ''),
+      title: '镜像站上已经有更新的版本' + (latest ? ' v' + latest : '') + '；点「更新」按安装同一套流程升级',
+    });
+  }
+
+  // updateCheckNoteOf 是被动位置上的一行小字：只在 unknown 时说明失败原因，
+  // **绝不显示"已是最新"**（用户明确要求）。
+  function updateCheckNoteOf(a) {
+    if (!a || !a.supports_update_check) return null;
+    const c = updateCheckOf(a);
+    if (!c || !c.unknown) return null;
+    const why = String(c.error || '检查没有返回结论');
+    return h('div', {
+      style: { fontSize: '11.5px', lineHeight: '1.6', color: 'var(--text-mute)' },
+      title: why,
+      text: '更新检查失败：' + (why.length > 80 ? why.slice(0, 80) + '…' : why),
+    });
+  }
+
+  // updateAction 给已安装的 supports_update_check 卡片那颗按钮：
+  // 探测中 → 可见的「检查更新中…」；确定有更新 → 主按钮「更新」（走现有安装任务流）；
+  // 其余 → 「检查更新」重试入口。
+  function updateAction(a) {
+    if (!a || !a.supports_update_check || !isInstalled(a)) return [];
+    if (updateChecking[a.id]) {
+      return [h('button.btn.btn-sm', {
+        text: '检查更新中…', disabled: true,
+        title: '正在读镜像索引并与已装模块的版本比对',
+      })];
+    }
+    if (updatePendingOf(a)) {
+      return [h('button.btn.btn-sm.btn-primary', {
+        text: '更新',
+        title: '按镜像索引安装最新版（与「安装」同一套流程：复核 sha256、架构与版本后重启服务）',
+        onclick: () => openInstaller(a),
+      })];
+    }
+    return [h('button.btn.btn-sm', {
+      text: '检查更新',
+      title: '读一次镜像索引，与已装模块的版本比对',
+      onclick: () => forceUpdateCheck(a),
+    })];
   }
 
   // ---------- 应用市场 Tab ----------
@@ -731,8 +916,8 @@ export function AppsView(content, ctx = {}) {
   function renderGrid() {
     if (!marketGrid) return;
     clear(marketGrid);
-    const list = marketApps();
-    if (!list.length) {
+    const all = marketApps();
+    if (!all.length) {
       appendAll(marketGrid, h('div.empty', [
         h('div.big', { text: '🧩' }),
         h('h4', { text: '应用目录为空' }),
@@ -740,6 +925,23 @@ export function AppsView(content, ctx = {}) {
       ]));
       return;
     }
+
+    // 按需探测：在**渲染之前**就标记"检查中"并发请求，这样首屏卡片上
+    // 立刻能看到可见的「检查更新中…」；只对 supports_update_check 且已安装的条目发，
+    // 全部落定后重画一次（徽标 + 置顶才出现/消失）。
+    ensureUpdateChecks(all, afterUpdateChecks);
+
+    // 置顶：只有**确定**有更新（update_available=true）的条目提前到一个显式分组；
+    // unknown/没查/已最新保持原顺序 —— 顺序不因为"还没查完"抖一下。
+    // 只在这一屏可见列表内生效，不动 Tab 分流、去重与筛选语义。
+    const pinned = all.filter(updatePendingOf);
+    const list = pinned.length ? all.filter((a) => !updatePendingOf(a)) : all;
+    const pinnedBlock = pinned.length
+      ? h('div', [
+        h('div.section-title', { text: `可更新（${pinned.length}）` }),
+        h('div.grid.grid-3', pinned.map((a) => appCard(a))),
+      ])
+      : null;
 
     // 分类板块的**顺序与中文名全部来自后端**（GET /api/v1/market 的 sections，
     // 单一来源在 internal/services/catalog.go 的 MarketSections）。
@@ -751,13 +953,16 @@ export function AppsView(content, ctx = {}) {
     if (!sections.length) {
       // 后端没给 sections（旧版本 / 接口异常）时的降级：不按分类分板块，
       // 但**必须把应用都显示出来**，不能因为拿不到板块定义就留一片空白。
-      appendAll(marketGrid,
-        h('div.section-title', { text: '全部应用' }),
+      appendAll(marketGrid, pinnedBlock,
+        h('div.section-title', {
+          style: { marginTop: pinnedBlock ? '20px' : '0' }, text: '全部应用',
+        }),
         h('div.grid.grid-3', list.map((a) => appCard(a))),
       );
       return;
     }
 
+    if (pinnedBlock) marketGrid.appendChild(pinnedBlock);
     const namedKeys = sections.filter((s) => !s.fallback).map((s) => s.key);
     const fallback = sections.find((s) => s.fallback);
     const covered = new Set();
@@ -867,6 +1072,8 @@ export function AppsView(content, ctx = {}) {
       // 「打开」的地址判定在 servicePanel.openTargetOf：支持子路径走子路径，
       // 不支持走端口直连（port_url，或 location.hostname + 端口拼）。
       // 不支持子路径时，卡片下方会有一行逐字提示（portAccessWarning）。
+      // 更新检查那一组按钮放在最前：确定有更新时「更新」是这张卡的主按钮。
+      actions.push(...updateAction(a));
       actions.push(...openOnlyAction(a, { svc: svcOfApp(a) }));
       // 常用动作：启动/停止、重启、⟳ 刷新、⚙️ 管理（**同一份** serviceActions
       // 实现）。「⚙️ 管理」打开的是与「已安装」卡片**同一个**面板 ——
@@ -948,11 +1155,15 @@ export function AppsView(content, ctx = {}) {
           text: '与已装引擎冲突',
           title: a.engine_conflict,
         }) : null,
+        // 更新徽标：只有**确定**有更新才给（unknown/已最新/没查都不给）。
+        installed ? updateBadgeOf(a) : null,
       ],
       // 卡片上只放**一句话**摘要 + 一段描述（两段不重复）。
       // 完整说明仍然在 title 与「⚙️ 管理」面板里，不会丢。
       text: (a.description && a.description !== subtitle) ? a.description : '',
       textTitle: a.description || '',
+      // 次要位置只放"更新检查失败：<原因>"这一行；成功/最新都不在这里说话。
+      extra: [updateCheckNoteOf(a)],
       actions,
       // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
       warning: installed ? portAccessWarning(a, { svc: svcOfApp(a) }) : null,
@@ -1336,6 +1547,9 @@ export function AppsView(content, ctx = {}) {
       // "安装、卸载后面板中的软件状态要及时更新"）。以前只靠任务状态变化重画，
       // 而任务结束时市场数据还是旧的，卡片就停留在"可安装"。
       onDone: (m) => {
+        // 装/更新结束（无论成败）都让本条的更新结论失效：成功时徽标与置顶必须
+        // 一起消失；失败时也不能把旧结论当成本次结果继续用。
+        invalidateUpdateCheck(a.id);
         if (m && m.status && m.status !== 'succeeded') {
           const msg = m.error || m.status;
           // 安装失败里最常见的真实原因是网络（brew 瓶 / GitHub / docker 镜像）。

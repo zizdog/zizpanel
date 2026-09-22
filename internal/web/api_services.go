@@ -868,6 +868,11 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// MariaDB 只可能装一个）：这张卡点「安装」必然被后端 4xx 拒绝，前端据此
 		// 提前给提示。只读已经批量查好的 brew 结果，**不在列表路径上跑新探测**。
 		EngineConflict string `json:"engine_conflict,omitempty"`
+
+		// SupportsUpdateCheck 表示这个条目的版本由镜像上的应用级索引运行时决定 ⇒
+		// 前端可以按需打 GET /api/v1/market/{id}/update-check 拿"装了但镜像上有更新吗"。
+		// **纯静态声明派生**：这里只读注册表，列表路径不联网、不起进程（AGENTS 第三节 7）。
+		SupportsUpdateCheck bool `json:"supports_update_check"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -1057,7 +1062,9 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			DockerRuntime:  dockerRuntime,
 			ConfigAbs:      services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
 			EngineConflict: engineConflict,
-			Uninstall:      plan}
+			// 静态派生（注册表），列表路径里**不做**任何网络/exec。
+			SupportsUpdateCheck: services.SupportsUpdateCheck(a.ID),
+			Uninstall:           plan}
 		if plan.Kind == "none" && (adopted || artifacts) {
 			// 有记录/产物却给不出计划：如实说明，别让用户对着卡片猜。
 			it.Note = "面板找不到可卸载的对象（Homebrew 里没有这个包、也没有可清理的产物）；" +

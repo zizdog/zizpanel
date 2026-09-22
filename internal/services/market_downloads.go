@@ -1895,6 +1895,21 @@ func MarketAppFor(id string) (MarketApp, bool) {
 	return MarketApp{}, false
 }
 
+// SupportsUpdateCheck 报告这个应用的版本是否由镜像上的应用级索引**运行时决定** ——
+// 只有这种条目才谈得上"装了但镜像上有更新"。判据全部来自静态声明/注册表：
+// 列表路径据此给前端 supports_update_check，**不联网、不起进程**（AGENTS 第三节 7）。
+func SupportsUpdateCheck(id string) bool {
+	if a, ok := MarketAppFor(id); ok {
+		for _, d := range a.Downloads {
+			if d.Purpose == MarketFetchReleaseBinary && d.Upstream.Dynamic {
+				return true
+			}
+		}
+	}
+	a, ok := releaseBinaryApps[id]
+	return ok && a.Dynamic
+}
+
 // declaredComposeImages 把声明里的镜像归一化成一个**有序集合**
 // （单容器的 ComposeImage 与多容器的 ComposeImages 统一处理）。
 func (m MarketApp) declaredComposeImages() []string {

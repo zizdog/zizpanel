@@ -327,6 +327,12 @@ export const api = {
   marketUninstallForget: (id) =>
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?forget=1`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
+  // 按需检查"装了但镜像上有更新吗"（只对 supports_update_check 的条目有意义）。
+  // 昂贵探测（打镜像索引 + 起 `--version` 子进程）只在用户打开市场时按需触发，
+  // 列表接口本身**不做**探测。结果由前端按 checked_at 缓存 10 分钟；fresh=true 是
+  // 用户手动点「检查更新」时绕过后端缓存重探一次。
+  marketUpdateCheck: (id, fresh = false) =>
+    request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/update-check${fresh ? '?fresh=1' : ''}`),
   // 卸载前的完整计划（含依赖检测）。市场列表**故意不查依赖** —— 每个条目
   // 一次 `brew uses --installed`，36 条就是 15 秒冷启动（列表卡在"正在读取应用目录…"）。
   // 所以前端在用户点「卸载」时才调这个接口，拿到真正带 blocked/dependents 的计划。

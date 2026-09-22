@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -496,6 +497,118 @@ func (m *Manager) ZizvideoReady(ctx context.Context) (bool, string) {
 		return false, detail
 	}
 	return m.ZizvideoServing(ctx)
+}
+
+// ---------------------------------------------------------------------------
+//  更新检查（"装了但镜像上有更新吗"；只在用户要看时才探测一次）
+// ---------------------------------------------------------------------------
+
+// ZizvideoUpdateCheck 是"已装版本 vs 镜像最新版本"的结论。
+//
+// Unknown=true 表示**没拿到可信的期望值**（索引不可达 / 已装模块跑不起来 /
+// 版本号解析不了）：此时调用方既不能说"有更新"、也不能说"已是最新"。
+type ZizvideoUpdateCheck struct {
+	App             string `json:"app"`
+	Installed       string `json:"installed"`
+	Latest          string `json:"latest"`
+	UpdateAvailable bool   `json:"update_available"`
+	Unknown         bool   `json:"unknown"`
+	CheckedAt       string `json:"checked_at"`
+	Error           string `json:"error"`
+}
+
+// CheckZizvideoUpdate 按需探测一次：先跑已装模块的 --version，再读镜像索引比对。
+//
+// 未安装（二进制不在）⇒ Installed 为空，前端据此不给徽标（市场本来显示「安装」）；
+// 其余拿不到可信值的路径一律 Unknown，**绝不假装**有更新或已最新（铁律 11）。
+func (m *Manager) CheckZizvideoUpdate(ctx context.Context) ZizvideoUpdateCheck {
+	out := ZizvideoUpdateCheck{App: ZizvideoAppID, CheckedAt: time.Now().Format(time.RFC3339)}
+	bin := m.ZizvideoPathsFor().Bin
+	if !fileExecutable(bin) {
+		return out
+	}
+	raw, err := zizvideoVersionFn(m, ctx, bin)
+	if err != nil {
+		out.Unknown, out.Error = true, "读不到已装版本："+err.Error()
+		return out
+	}
+	if out.Installed = installedVersionFromOutput(raw); out.Installed == "" {
+		out.Unknown, out.Error = true,
+			"已装模块的 --version 输出里没有版本号（"+tailText(strings.TrimSpace(raw), 120)+"）"
+		return out
+	}
+	rel, err := m.resolveZizvideoRelease(ctx)
+	if err != nil {
+		out.Unknown, out.Error = true, "读不到镜像上的最新版本："+err.Error()
+		return out
+	}
+	out.Latest = rel.Version
+	cmp, ok := compareDottedVersions(out.Installed, out.Latest)
+	if !ok {
+		out.Unknown, out.Error = true,
+			"版本号无法比较（已装 "+out.Installed+"，镜像 "+out.Latest+"）"
+		return out
+	}
+	out.UpdateAvailable = cmp < 0
+	return out
+}
+
+// installedVersionFromOutput 从 `zizvideo --version` 的输出里取版本号
+// （"zizvideo 0.1.1-mvp" → "0.1.1-mvp"）；找不到就返回空串。
+func installedVersionFromOutput(out string) string {
+	for _, f := range strings.Fields(out) {
+		if _, ok := numericVersionParts(f); ok {
+			return strings.TrimPrefix(f, "v")
+		}
+	}
+	return ""
+}
+
+// compareDottedVersions 比对点分数字版本（忽略 -/+ 后缀）：返回 -1/0/1 与"可比较"标志。
+// 解析不了就返回 false —— 调用方据此报 unknown，而不是猜一个大小。
+func compareDottedVersions(a, b string) (int, bool) {
+	na, oka := numericVersionParts(a)
+	nb, okb := numericVersionParts(b)
+	if !oka || !okb {
+		return 0, false
+	}
+	for i := 0; i < len(na) || i < len(nb); i++ {
+		x, y := 0, 0
+		if i < len(na) {
+			x = na[i]
+		}
+		if i < len(nb) {
+			y = nb[i]
+		}
+		if x != y {
+			if x < y {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+// numericVersionParts 把 "v0.1.1-mvp" 拆成 [0,1,1]；有任何非数字段就报 false。
+func numericVersionParts(v string) ([]int, bool) {
+	core := strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexAny(core, "-+"); i >= 0 {
+		core = core[:i]
+	}
+	if core == "" {
+		return nil, false
+	}
+	parts := strings.Split(core, ".")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		out = append(out, n)
+	}
+	return out, true
 }
 
 // ---------------------------------------------------------------------------
