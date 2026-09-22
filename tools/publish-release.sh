@@ -160,26 +160,31 @@ cmd_push_zizdog() {
   # 镜像版清单也放源上同目录：面板镜像同步优先取它，否则会写入指向源站的清单（坑 218）。
   cp "$RELDIR/manifest-nas.json" "$RELDIR/manifest-mirror.json"
   cp "$RELDIR/manifest-nas.json.sig" "$RELDIR/manifest-mirror.json.sig"
+  # 站点**根目录只放脚本与清单**：包一律进 download/<版本>/ 与 download/latest/
+  # （install.sh 与清单里的 url 都是 download/ 布局；根目录再放一份是 1.7.x 之前的旧布局，
+  #   2026-09-22 用户点名清理，别再放回去）。
   zizdog_scp \
-    "$RELDIR/zizpanel_${v}_darwin_arm64.tar.gz" \
-    "$RELDIR/zizpanel_${v}_darwin_amd64.tar.gz" \
-    "$RELDIR/zizpanel_latest_darwin_arm64.tar.gz" \
-    "$RELDIR/zizpanel_latest_darwin_amd64.tar.gz" \
     "$RELDIR/manifest.json" "$RELDIR/manifest.json.sig" \
     "$RELDIR/manifest-mirror.json" "$RELDIR/manifest-mirror.json.sig" \
     install.sh uninstall.sh \
     "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/" || die "scp 上传失败"
 
-  info "在远端建 download/$v/ 与 download/latest/ 布局"
+  info "上传包到 download/$v/ 与 download/latest/"
+  zizdog_ssh "set -e; cd '$ZIZDOG_ROOT'; mkdir -p download/$v download/latest" || die "远端建目录失败"
+  zizdog_scp \
+    "$RELDIR/zizpanel_${v}_darwin_arm64.tar.gz" \
+    "$RELDIR/zizpanel_${v}_darwin_amd64.tar.gz" \
+    "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/download/$v/" || die "scp 上传 $v 失败"
+  zizdog_scp \
+    "$RELDIR/zizpanel_latest_darwin_arm64.tar.gz" \
+    "$RELDIR/zizpanel_latest_darwin_amd64.tar.gz" \
+    "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/download/latest/" || die "scp 上传 latest 失败"
   zizdog_ssh "set -e; cd '$ZIZDOG_ROOT'; \
-    mkdir -p download/$v download/latest; \
-    cp -f zizpanel_${v}_darwin_arm64.tar.gz zizpanel_${v}_darwin_amd64.tar.gz download/$v/; \
-    cp -f zizpanel_latest_darwin_arm64.tar.gz zizpanel_latest_darwin_amd64.tar.gz download/latest/; \
-    chmod 644 manifest.json manifest.json.sig manifest-mirror.json manifest-mirror.json.sig zizpanel_*.tar.gz download/$v/* download/latest/* 2>/dev/null || true; \
+    chmod 644 manifest.json manifest.json.sig manifest-mirror.json manifest-mirror.json.sig download/$v/* download/latest/*; \
     chmod 755 install.sh uninstall.sh; \
     chown -R www:www . 2>/dev/null || true; \
-    ls -l manifest.json manifest-mirror.json install.sh download/$v" || die "远端布局/权限失败"
-  ok "已推送（远端 download/$v/ 已就位；镜像版清单 = manifest-mirror.json）"
+    ls -l manifest.json manifest-mirror.json install.sh download/$v download/latest" || die "远端布局/权限失败"
+  ok "已推送（根目录只有脚本+清单，包在 download/$v/ 与 download/latest/；镜像版清单 = manifest-mirror.json）"
 }
 
 cmd_push_nas() {
