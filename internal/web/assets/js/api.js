@@ -307,7 +307,9 @@ export const api = {
   taskStreamURL: (id) => apiURL(`tasks/${encodeURIComponent(id)}/stream`),
 
   // ---- 应用市场 ----
-  market: () => request('GET', `${API_BASE}/market`),
+  // fresh=true 只在用户点「刷新列表」时传：后端会失效进程内探测缓存、重跑一次
+  // brew/docker 复核。平时（含首次自动加载）不传，直接吃后端缓存。
+  market: (fresh) => request('GET', `${API_BASE}/market${fresh ? '?fresh=1' : ''}`),
   // 应用界面子路径：探测（每个应用"现在能不能真的打开"）+ 生成 nginx 入口。
   // 探测不是看 HTTP 200：它还会取页面里引用的 js/css，代理没改写对时
   // 页面照样 200、资源全 404（白屏），只看状态码会得出错误结论。

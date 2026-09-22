@@ -77,6 +77,47 @@ let proxyState = null;
 let svcState = {};
 
 // ---------------------------------------------------------------------------
+//  市场数据缓存（用户 2026-09-22：打开这一页直接读缓存，只有点「刷新列表」才刷新）
+// ---------------------------------------------------------------------------
+//
+// 为什么落 sessionStorage：内存里的 cache 能覆盖面板内切页，但**整页刷新/重开浏览器**
+// 就没了 —— 那正是"应用市场打开慢"的场景。缓存只存上一轮探测的结论，界面必须如实
+// 标出它有多旧（见 renderTabBar 的「缓存 · N 分钟前」），绝不假装实时。
+const MARKET_CACHE_STORE = 'zp.market.dataCache';
+
+// loadDataCache 读回上一次的 {market, services, at}；形状不对一律当没有（不猜）。
+function loadDataCache() {
+  try {
+    const raw = sessionStorage.getItem(MARKET_CACHE_STORE);
+    const o = raw ? JSON.parse(raw) : null;
+    if (!o || typeof o !== 'object' || !o.market || !Array.isArray(o.market.list)) return null;
+    return { market: o.market, services: Array.isArray(o.services) ? o.services : [], at: String(o.at || '') };
+  } catch (e) {
+    return null;
+  }
+}
+
+// saveDataCache 把这一轮结论落盘；存不下（隐私模式/配额满）只在本次会话生效，不影响结论。
+function saveDataCache() {
+  if (!cache) return;
+  try {
+    sessionStorage.setItem(MARKET_CACHE_STORE, JSON.stringify({
+      market: cache, services: svcList, at: cacheAt || new Date().toISOString(),
+    }));
+  } catch (e) { /* 存不了就算了 */ }
+}
+
+// cacheAt 是这一轮结论的取得时刻（缓存年龄照它算）。
+let cacheAt = '';
+// 进页面时先恢复上一次的缓存：有它就直接渲染（不发请求）。
+const restoredMarketCache = loadDataCache();
+if (restoredMarketCache) {
+  cache = restoredMarketCache.market;
+  svcList = restoredMarketCache.services;
+  cacheAt = restoredMarketCache.at;
+}
+
+// ---------------------------------------------------------------------------
 //  一级 Tab（用户 2026-09-17：已安装 / 应用市场 / docker / 一键建站）
 // ---------------------------------------------------------------------------
 //
@@ -248,6 +289,19 @@ export function AppsView(content, ctx = {}) {
         onclick: () => { if (active === t.id) return; active = t.id; renderTabBar(); renderBody(); },
       }));
     }
+    // 缓存年龄：如实说明这一屏是缓存（打开即显示、不发请求）以及它有多旧。
+    // 没有这条提示，用户会把"缓存里的已安装/健康状态"当成此刻的真实状态。
+    if (cache) {
+      const age = cacheAgeText();
+      tabBar.appendChild(h('span.pill', {
+        text: age ? '缓存 · ' + age : '缓存',
+        title: '打开这一页直接读本地缓存，不发请求；只有点「⟳ 刷新列表」才重新探测。'
+          + (age ? '\n\n这份数据是 ' + age + '的。' : ''),
+      }));
+    }
+    if (refreshing) {
+      tabBar.appendChild(h('span.pill.warn', { text: '刷新中…', title: '正在重新探测已装软件与可用更新' }));
+    }
     // 后端这次**没能复核**「本机装了哪些 Homebrew 包」（brew_probe_ok=false）时，
     // 如实说出来：列表里那些「安装」只代表"没查成"，不代表东西真的没装
     //（铁律 11：不许把"不知道"显示成"没有"）。没有这条提示，一次 brew 超时
@@ -257,7 +311,7 @@ export function AppsView(content, ctx = {}) {
       tabBar.appendChild(h('span.pill.warn', {
         text: '⚠ 未能复核已装软件',
         title: '这次没能读到 Homebrew 的已装清单：'
-          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新」重试。'
+          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新列表」重试。'
           + (why ? '\n\n真实原因：' + why : ''),
       }));
       // 把真实原因**显示出来**（不只塞进 title）：2026-09-19 用户报障时界面上
@@ -298,7 +352,7 @@ export function AppsView(content, ctx = {}) {
     }
     // 合并去重、卡片动作、状态筛选都在 services.js 的 renderInstalledApps 里
     // （它同时握着市场条目与服务记录，见那边文件头的说明）。
-    renderInstalledApps(body, { market: cache, list: svcList, onReload: load });
+    renderInstalledApps(body, { market: cache, list: svcList, onReload: refreshSilently });
   }
 
 
@@ -316,24 +370,70 @@ export function AppsView(content, ctx = {}) {
   // 注意：这里用的是 api.services(true)（**带健康检查**，比市场自己以前用的
   // false 慢一点），因为「已安装」每张卡片要给出健康检查结果。两个请求并行发出，
   // 首屏等待没有叠加。
-  async function fetchAll() {
-    const [mkt, svc] = await Promise.allSettled([api.market(), api.services(true)]);
-    if (mkt.status === 'fulfilled') { cache = mkt.value; loadError = null; }
-    else if (!cache) loadError = mkt.reason;
+  async function fetchAll(opts = {}) {
+    const [mkt, svc] = await Promise.allSettled([api.market(!!opts.fresh), api.services(true)]);
+    if (mkt.status === 'fulfilled') {
+      cache = mkt.value;
+      loadError = null;
+      cacheAt = new Date().toISOString();
+      saveDataCache();
+    } else if (!cache) {
+      loadError = mkt.reason;
+    }
     if (svc.status === 'fulfilled') svcList = (svc.value && svc.value.list) || [];
     rebuildSvcState();
   }
 
+  // cacheAgeText 把缓存年龄说成人话（拿不到时间就返回空串，不编）。
+  function cacheAgeText() {
+    const t = Date.parse(cacheAt || '');
+    if (!Number.isFinite(t)) return '';
+    const mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
+    if (mins < 1) return '刚刚';
+    if (mins < 60) return mins + ' 分钟前';
+    const hours = Math.floor(mins / 60);
+    return hours < 24 ? hours + ' 小时前' : Math.floor(hours / 24) + ' 天前';
+  }
+
+  // load 是进页面的入口：**有缓存就直接渲染，一个请求都不发**（缓存优先，2026-09-22 用户要求）。
+  // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「刷新列表」。
   async function load() {
-    clear(body);
-    appendAll(body, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取应用目录…' })]));
-    await fetchAll();
-    // 探测是"能不能打开"的依据，但它要跑十几条网络请求（含 8 秒超时）。
-    // **不在打开页面时自动跑** —— 用户反馈"应用市场打开较慢，其它页面都是秒开"。
-    // 改为：结果缓存在内存里；点「检测可用性」时才真跑；生成入口后刷新一次。
     if (!proxyState) proxyState = { enabled: true, items: [], _stale: true };
+    if (cache) {
+      // 恢复出来的服务记录也要派生一次"服务名 → state"（卡片首颗按钮要它）。
+      rebuildSvcState();
+      renderTabBar();
+      renderBody();
+      return;
+    }
+    clear(body);
+    appendAll(body, h('div.empty', [h('div.big', { text: '⏳' }), h('p', { text: '正在读取应用目录…（首次）' })]));
+    await fetchAll();
     renderTabBar();
     renderBody();
+    // 首次加载没得读缓存，这一次探测顺带把更新检查也做了。
+    if (active === 'market' && marketGrid) ensureUpdateChecks(marketApps(), afterUpdateChecks, false);
+  }
+
+  // refreshing 是「刷新列表」正在跑的标志（按钮可见地禁用，避免连点打出一串探测）。
+  let refreshing = false;
+
+  // refresh 是「刷新列表」的**唯一**入口：fresh=1 让后端也重跑一次真实复核，
+  // 落定后把这一屏的更新检查也重做一遍（force：忽略 10 分钟 TTL）。
+  // 装/卸/启停之后的自动更新走 refreshSilently：后端在那条路径上已经失效过缓存。
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    renderTabBar();
+    if (active === 'market') renderHead();
+    try {
+      await fetchAll({ fresh: true });
+    } finally {
+      refreshing = false;
+    }
+    renderTabBar();
+    renderBody();
+    if (active === 'market' && marketGrid) ensureUpdateChecks(marketApps(), afterUpdateChecks, true);
   }
 
   // stateOfApp 取这个应用在服务记录里的状态（给市场卡片上的启停按钮用）。
@@ -370,23 +470,24 @@ export function AppsView(content, ctx = {}) {
   // eligibleForUpdateCheck 是"这个条目该不该探测"的唯一判据：
   // supports_update_check（静态声明）+ 已安装 + 结论已过期 + 当前没有在查。
   // 未安装的**不发请求** —— 市场本来显示「安装」，没有"更新"可言。
-  function eligibleForUpdateCheck(a) {
+  // force=true（用户点「刷新列表」）时忽略 TTL，把已有的结论也重查一遍。
+  function eligibleForUpdateCheck(a, force) {
     return !!(a && a.id && a.supports_update_check && isInstalled(a)
-      && !updateChecking[a.id] && !updateCheckFresh(updateChecks[a.id]));
+      && !updateChecking[a.id] && (force || !updateCheckFresh(updateChecks[a.id])));
   }
 
   // ensureUpdateChecks 对当前可见列表里符合条件的条目各探测一次，全部落定后只重画一次
   //（这样"可更新"分组只跳一次）。已有一轮在飞时不重复发请求，只把 onDone 接在它后面。
-  function ensureUpdateChecks(list, onDone) {
+  function ensureUpdateChecks(list, onDone, force) {
     if (updateInflight) {
       if (typeof onDone === 'function') updateInflight.then(() => onDone());
       return;
     }
-    const targets = (list || []).filter(eligibleForUpdateCheck);
+    const targets = (list || []).filter((a) => eligibleForUpdateCheck(a, !!force));
     if (!targets.length) return;
     const jobs = targets.map((a) => {
       updateChecking[a.id] = true;
-      return api.marketUpdateCheck(a.id)
+      return api.marketUpdateCheck(a.id, !!force)
         .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
         .catch((e) => {
           // 接口本身失败（网络/权限）也存成 unknown：否则每次重画都会再打一次。
@@ -515,7 +616,14 @@ export function AppsView(content, ctx = {}) {
       installed > 0 ? h('span.pill.ok', { text: `已安装 ${installed}` }) : null,
       // 安装状态筛选（全部/未安装/已安装，默认未安装）与「原生/Docker」分类筛选
       // 都已删除：用户明确要求市场**始终显示全部**，docker 类也搬去了 docker Tab。
-      h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+      // 平时打开这一页直接读缓存（缓存优先，见 load 的说明）；这颗按钮是唯一的刷新入口。
+      h('button.btn.btn-sm', {
+        text: refreshing ? '刷新中…' : '⟳ 刷新列表',
+        disabled: refreshing,
+        title: '重新探测本机装了哪些软件、有没有新版（要跑一次 brew / docker 复核，约几秒）。'
+          + '平时打开应用市场直接读缓存、不发请求；装好软件后点这里更新状态。',
+        onclick: () => refresh(),
+      }),
       // 「一键安装 LNMP 环境」已从这里**搬到「网站管理」页**（用户要求：它属于网站板块）。
       // 为什么市场里不再保留这个入口：LNMP 是**组合动作**（nginx + PHP + MySQL
       // + 默认站点 / vhosts / 系统级守护进程等收尾工作），不是单个可安装条目；
@@ -566,7 +674,12 @@ export function AppsView(content, ctx = {}) {
             ? 'Docker socket: ' + (docker.socket || '')
             : '这些 compose 文件可以直接取用；要真正跑起来需要一个 Docker 运行时（可用「应用市场」里的 Colima / OrbStack）',
         }),
-        h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+        h('button.btn.btn-sm', {
+          text: refreshing ? '刷新中…' : '⟳ 刷新',
+          disabled: refreshing,
+          title: '重新探测一次 Docker 运行时与已装软件（约几秒）',
+          onclick: () => refresh(),
+        }),
       ]),
     ]);
     const box = h('div.card-body');
@@ -690,7 +803,12 @@ export function AppsView(content, ctx = {}) {
       h('div.spacer'),
       h('div#sites-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
         h('span.pill', { text: `共 ${list.length} 个建站程序` }),
-        h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: load }),
+        h('button.btn.btn-sm', {
+          text: refreshing ? '刷新中…' : '⟳ 刷新',
+          disabled: refreshing,
+          title: '重新探测一次 Docker 运行时与已装软件（约几秒）',
+          onclick: () => refresh(),
+        }),
       ]),
     ]);
     const box = h('div.card-body');
@@ -926,10 +1044,9 @@ export function AppsView(content, ctx = {}) {
       return;
     }
 
-    // 按需探测：在**渲染之前**就标记"检查中"并发请求，这样首屏卡片上
-    // 立刻能看到可见的「检查更新中…」；只对 supports_update_check 且已安装的条目发，
-    // 全部落定后重画一次（徽标 + 置顶才出现/消失）。
-    ensureUpdateChecks(all, afterUpdateChecks);
+    // 更新探测**不在这里触发**：它很贵（读镜像索引 / 起 `--version` 子进程），
+    // 只在首次加载或用户点「刷新列表」时各跑一次（见 load / refresh）。
+    // 挂在每次重画上会让"切个页签"就重新探测一轮。
 
     // 置顶：只有**确定**有更新（update_available=true）的条目提前到一个显式分组；
     // unknown/没查/已最新保持原顺序 —— 顺序不因为"还没查完"抖一下。
@@ -1362,7 +1479,8 @@ export function AppsView(content, ctx = {}) {
                 : '已卸载「' + a.name + '」' + (wipe ? '（含数据/产物）' : '（数据/产物已保留）')),
             'ok', 9000);
         }
-        load();
+        // 卸载改的是本机真实状态：必须重拉（不能走"有缓存就直接渲染"的 load()）。
+        refreshSilently();
       },
     });
   }

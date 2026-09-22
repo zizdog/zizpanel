@@ -7,9 +7,52 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
 )
+
+// TestMarketFreshBypassesProbeCache 锁住「刷新列表」的语义（用户 2026-09-22：
+// 打开页面直接读缓存，只有点「刷新列表」才刷新）：
+//   - 普通 GET /api/v1/market 不许动进程内探测缓存（列表路径不重探）；
+//   - GET /api/v1/market?fresh=1 必须失效它，本次请求去真复核。
+//
+// 判据用哨兵值：预置一份"可信的旧结论"，fresh 之后它必须不见了。
+func TestMarketFreshBypassesProbeCache(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	seed := func() {
+		srv.mktMu.Lock()
+		srv.mktBrew = map[string]bool{"nginx-sentinel": true}
+		srv.mktBrewVer = map[string]string{"nginx-sentinel": "1.0.0"}
+		srv.mktBrewOK = true
+		srv.mktBrewAt = time.Now()
+		srv.mktMu.Unlock()
+	}
+	hasSentinel := func() bool {
+		srv.mktMu.Lock()
+		defer srv.mktMu.Unlock()
+		return srv.mktBrew["nginx-sentinel"]
+	}
+
+	seed()
+	if res, _, _ := doJSON(t, ts, "GET", "/api/v1/market", nil, cookies); res.StatusCode != 200 {
+		t.Fatalf("普通列表请求应 200，实际 %d", res.StatusCode)
+	}
+	if !hasSentinel() {
+		t.Errorf("不带 fresh 的列表请求不该清掉进程内探测缓存（那会让每次打开市场都重跑 brew）")
+	}
+
+	seed()
+	if res, _, _ := doJSON(t, ts, "GET", "/api/v1/market?fresh=1", nil, cookies); res.StatusCode != 200 {
+		t.Fatalf("fresh=1 的列表请求应 200，实际 %d", res.StatusCode)
+	}
+	if hasSentinel() {
+		t.Errorf("fresh=1 必须失效探测缓存并重探；哨兵值还在说明它没有生效")
+	}
+}
 
 // ============================================================================
 //  应用市场的状态判定（第 5、6 项的真实回归）

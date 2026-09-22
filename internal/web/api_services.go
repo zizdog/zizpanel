@@ -748,6 +748,12 @@ func marketVisibleApps(apps []services.App) []services.App {
 
 func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// fresh=1 只给用户手动点的「刷新列表」用（2026-09-22 用户要求：打开页面读缓存，
+	// 只有点了才刷新）：先失效进程内探测缓存（brew / 引擎 started），本次请求走一次
+	// 真实复核。不带它时保持原样 —— 列表路径不重探。
+	if r.URL.Query().Get("fresh") == "1" {
+		s.InvalidateMarketCache()
+	}
 	// 「已安装」必须看两个来源，缺一不可：
 	//
 	//  1. 面板自己的服务记录 —— 面板装过的；
