@@ -27,7 +27,7 @@ import { taskCenter } from './tasks.js';
 // servicePanel.js —— 与市场 / docker / 建站卡片、管理面板**同一份实现**。
 // mergeAppEntries（去重）与 appCardShell（卡片 DOM）逻辑都只此一份。
 import {
-  openServicePanel, openOnlyAction, portAccessWarning, appCardShell,
+  openServicePanel, openOrRepairActions, portAccessWarning, appCardShell,
   mergeAppEntries, statusLine, marketQuickActions, portCheckNote,
 } from './servicePanel.js';
 
@@ -248,7 +248,9 @@ export function renderInstalledApps(container, opts = {}) {
 
     const actions = [
       ...updateActs,
-      ...openOnlyAction(m, { svc: s }),
+      // 「打开」or「重新部署」：服务定义不在 launchd 里时，打开必然打不开 ——
+      // 这一格改成唯一真的能修的那一步（判据来自后端 service_repair，坑 231）。
+      ...openOrRepairActions(m, { svc: s }),
       ...marketQuickActions(m, {
         svc: s,
         onDone: afterAction,
@@ -304,9 +306,18 @@ export function renderInstalledApps(container, opts = {}) {
         text: (health.message || '') + ' —— 该地址要求登录，服务本身是正常的',
       })]
       : [];
-    // 装了、但面板里没有它的服务记录（用户发火的那一类）：
-    // 卡片上要**主动说清楚**，而不是让用户去猜"它到底跑没跑"。
-    // 端口是否监听只用后端真的做过的健康检查结论；没查过就明写"未检测"。
+    // 服务定义不在 launchd 里（plist 丢了 / 从没注册成功）：后端给的下一步才是真的
+    // （坑 231）—— 有服务记录时也要说：那时卡片只写"已停止"，用户点「启动」只会得到
+    // "找不到 plist"。修法（重跑安装 / 去「已安装」Tab 启动 / 重装基础环境）由后端判。
+    const repair = m && m.service_repair;
+    const repairNote = (repair && repair.needed)
+      ? [h('div', {
+        style: { fontSize: '11.5px', color: 'var(--warn, #fbbf24)' },
+        text: repair.hint || '',
+      })]
+      : [];
+    // 装了、但面板里没有它的服务记录（用户发火的那一类）：卡片上要**主动说清楚**，
+    // 而不是让用户去猜"它到底跑没跑"。端口是否监听只用后端真的做过的健康检查结论。
     const noRecordNote = (!s && m && (m.installed || m.adopted) && !m.no_daemon)
       ? [h('div', {
         style: { fontSize: '11.5px', color: 'var(--text-mute)' },
@@ -353,7 +364,7 @@ export function renderInstalledApps(container, opts = {}) {
       subtitle,
       pills,
       text,
-      extra: [...extra, ...authNote, ...noRecordNote],
+      extra: [...extra, ...authNote, ...repairNote, ...noRecordNote],
       // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，别删这一行）。
       actions,
       // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。

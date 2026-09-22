@@ -195,7 +195,21 @@ func (d *nativeDriver) Start(ctx context.Context) error {
 				"请确认这个 formula 是否支持 brew services",
 				formula, d.svc.LaunchLabel, real)
 		}
-		return fmt.Errorf("找不到 %s 的 plist，无法启动", d.svc.LaunchLabel)
+		// 面板自己写的服务定义（com.zizdog.stt / cn.zizdog.nginx 这类）brew 补不出来：
+		// 只说"找不到 plist"用户不知道下一步干什么（2026-09-22 whisper.cpp 报障，坑 231）。
+		// 这里按目录条目说清**唯一能修的那一步**（面板安装器重跑安装 / 基础环境重装）。
+		if a, ok := catalogEntryForLabel(d.svc.LaunchLabel); ok {
+			if IsEnvComponent(a) {
+				return fmt.Errorf("找不到 %s 的 plist，无法启动：这是基础环境的服务，服务定义由面板的"+
+					"环境安装器写 —— 到「网站」页重新安装一次基础环境即可重建（brew 补不上这个标签）", d.svc.LaunchLabel)
+			}
+			if a.PanelInstaller != "" {
+				return fmt.Errorf("找不到 %s 的 plist，无法启动：到「应用市场 → %s」点「重新部署」"+
+					"重跑一遍安装即可重建服务定义（brew 补不上这个标签）", d.svc.LaunchLabel, a.Name)
+			}
+		}
+		return fmt.Errorf("找不到 %s 的 plist，无法启动："+
+			"这个服务定义不在 launchd 里，需要在它自己的安装入口重跑一次安装", d.svc.LaunchLabel)
 	}
 	// 已在跑则空操作，未加载才 bootstrap，已加载没跑才 kickstart 一次（坑 225）。
 	if err := priv.LaunchEnsureRunning(d.svc.LaunchLabel); err != nil {

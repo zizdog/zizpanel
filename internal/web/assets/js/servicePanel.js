@@ -310,6 +310,37 @@ export function openOnlyAction(m, opts = {}) {
   })];
 }
 
+// serviceRepairButton 是"服务没注册"时唯一真的能修的那一步（坑 231）。
+//
+// 判据来自后端（services.ServiceRepairFor → 市场条目 service_repair）：修法与应用
+// 怎么部署有关 —— brew 服务能靠 `brew services start` 补出 plist，面板安装器托管的
+// （com.zizdog.stt）只能重跑安装。只有 action=reinstall 在**本页**能点才给按钮；
+// installed_tab / env_install 的下一步在别的页，写进 pill 的提示里，不给死按钮。
+export function serviceRepairButton(m, { onReinstall } = {}) {
+  const r = m && m.service_repair;
+  if (!r || !r.needed || r.action !== 'reinstall' || !m.id) return null;
+  return h('button.btn.btn-sm.btn-primary', {
+    text: '重新部署',
+    title: r.hint || '重跑一遍安装：会重建服务定义并启动（已下载的产物会复用）',
+    onclick: () => {
+      if (typeof onReinstall === 'function') { onReinstall(); return; }
+      taskCenter.start({
+        kind: 'install', target: m.id, title: '重新部署 ' + (m.name || m.id),
+        start: () => api.marketInstall(m.id),
+      });
+    },
+  });
+}
+
+// openOrRepairActions 决定卡片这一格给什么：**服务缺失时给「重新部署」**，
+// 否则给「打开」—— 打开指向的服务此刻并不存在（点了必然 502），
+// 死按钮比没有按钮更糟。市场卡片与「已安装」卡片共用这一份判据。
+export function openOrRepairActions(m, { svc = null, onReinstall } = {}) {
+  const rb = serviceRepairButton(m, { onReinstall });
+  if (rb) return [rb];
+  return openOnlyAction(m, { svc });
+}
+
 // PORT_ACCESS_WARNING 是用户要求的**逐字**提示（不要改写、不要加前后缀）。
 export const PORT_ACCESS_WARNING = '该应用不支持子路径，请用端口访问，或自行配置反代。';
 
@@ -492,6 +523,14 @@ export function statusLine(st, m, s = null) {
   }
   if (m && m.no_daemon) return noDaemonLine(m);
   if (m && isInstalledMarketItem(m)) {
+    // 装了，但 launchd 里也没有它的服务定义 —— 这是「服务未注册」，不是"没登记"。
+    // ⚠️ 绝不能说"用「+ 注册服务」加进来"：注册读的是**已存在的 plist**，
+    // 服务定义都不在了，那条路点了必然报"找不到服务"（2026-09-22 whisper.cpp 报障，坑 231）。
+    // 唯一的下一步由后端给（service_repair：重跑安装 / 去「已安装」Tab 启动 / 重装基础环境）。
+    const rep = m.service_repair;
+    if (rep && rep.needed) {
+      return { cls: 'warn', text: '已安装·服务未注册', title: rep.hint || '' };
+    }
     // 装了但面板里没有记录（例如本机 nginx 在 :80 上跑着只是没登记）：**绝不能**写「已停止」。
     return {
       cls: '',

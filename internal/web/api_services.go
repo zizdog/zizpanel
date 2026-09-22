@@ -854,6 +854,11 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 「纳管」按钮必须以此为准：plist 不存在时点纳管必然报
 		// "找不到 xxx 的 plist，且该服务未在 launchd 中加载"。
 		ServiceInLaunchd bool `json:"service_in_launchd"`
+		// ServiceRepair 是"装了运行体、但服务没注册"时**该怎么修**的唯一判据（见
+		// services.ServiceRepairFor）：修法不唯一（brew 补 plist / 重跑面板安装器 /
+		// 重跑基础环境），前端过去一律说"brew services start 补上"，
+		// 对 whisper.cpp 这类面板托管服务是假话（坑 231）。
+		ServiceRepair services.ServiceRepair `json:"service_repair"`
 		// PortURL 是"直连端口"的入口（http://<本机局域网地址>:<端口>/）。
 		// 有界面的应用会给两个入口：子路径（/<slug>/，经面板或 nginx）
 		// 与直连端口。子路径探测不通过时（应用必须自己设 base path 才能挂子路径），
@@ -1100,6 +1105,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		}
 		it := item{App: a, AppID: a.ID, Installed: isInstalled, Adopted: adopted, Available: true,
 			Artifacts: artifacts, ServiceInLaunchd: serviceInLaunchd,
+			ServiceRepair:   services.ServiceRepairFor(a, isInstalled, adopted, serviceInLaunchd),
 			RuntimeBodyPath: runtimeBody.Path,
 			PortURL:         portURL, ProxyURL: proxyURL,
 			DockerRuntime:  dockerRuntime,

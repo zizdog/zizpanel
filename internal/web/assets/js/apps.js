@@ -40,15 +40,15 @@ import { renderInstalledApps } from './services.js';
 // （用户 2026-09-16 的核心要求：同一个应用的能力不分散在两个页面）。
 //
 // appCardShell  四个 Tab 共用的卡片 DOM（用户要求"卡片样式统一"）
-// openOnlyAction / openTargetOf / portAccessWarning
-//               卡片上那颗「打开」的**唯一**判定与"不支持子路径"的逐字提示
+// openOrRepairActions / openTargetOf / portAccessWarning
+//               卡片上「打开 / 重新部署」的**唯一**判定与"不支持子路径"的逐字提示
 //               （用户 2026-09-17 第六条：只显示打开、不显示直链；不支持子路径的
 //                用 ip:端口打开并提示"该应用不支持子路径，请用端口访问，或自行配置反代。"）
 // dedupeMarketEntries 市场/docker 列表按归一化 key 去重（与「已安装」的去重同一套规则）
 // hasPanelUI    与面板同一条"有没有面板托管的界面"判据
 import {
   openServicePanel, marketQuickActions, hasPanelUI, appCardShell,
-  openOnlyAction, portAccessWarning, dedupeMarketEntries, appKeyOf,
+  openOrRepairActions, portAccessWarning, dedupeMarketEntries, appKeyOf,
   // 卸载确认只有一份实现（servicePanel.confirmUninstallPlan）：这里曾经抄过
   // 一份，而那份的确认按钮 `close(); resolve(true)` 会被 modal 的 onClose
   // 里的 resolve(false) 抢先定稿 —— 用户点「确认卸载」后什么都不发生。
@@ -1380,6 +1380,13 @@ export function AppsView(content, ctx = {}) {
   // 于是这种状态会如实落到下面的「残留数据」+「安装」。
   function residualOf(a) { return !!a.artifacts && !a.installed; }
 
+  // serviceRepairOf 读后端给的"服务缺失该怎么修"（唯一判据在后端，见
+  // services.ServiceRepairFor）：修法与应用怎么部署有关，前端不猜（坑 231）。
+  function serviceRepairOf(a) {
+    const r = a && a.service_repair;
+    return r && r.needed ? r : null;
+  }
+
   // primaryButton 按"这个应用此刻处于什么状态"给出唯一正确的下一步。
   //
   // 判定顺序（改之前先读完这段）：
@@ -1452,7 +1459,9 @@ export function AppsView(content, ctx = {}) {
       // 不支持子路径时，卡片下方会有一行逐字提示（portAccessWarning）。
       // 更新检查那一组按钮放在最前：确定有更新时「更新」是这张卡的主按钮。
       actions.push(...updateAction(a));
-      actions.push(...openOnlyAction(a, { svc: svcOfApp(a) }));
+      // 「打开」or「重新部署」：服务缺失（plist 丢了/没注册成功）时打开指向的服务
+      // 并不存在（点了必然 502），这一格改成真的能修的那一步（见 openOrRepairActions）。
+      actions.push(...openOrRepairActions(a, { svc: svcOfApp(a), onReinstall: () => openInstaller(a) }));
       // 常用动作：启动/停止、重启、⟳ 刷新、⚙️ 管理（**同一份** serviceActions
       // 实现）。「⚙️ 管理」打开的是与「已安装」卡片**同一个**面板 ——
       // 配置文件编辑、凭据、日志、重装、文档、直链、卸载都在那里面。
@@ -1479,13 +1488,15 @@ export function AppsView(content, ctx = {}) {
         versionPillOf(a),
         a.kind === 'native' ? h('span.pill.brand', { text: '原生' }) : null,
         a.kind === 'compose' ? h('span.pill.brand', { text: 'Docker' }) : null,
-        // 原生 brew 服务：记录在、但 plist 不在 = 服务其实没注册（ollama 就是这样，
-        // 用户看到"已安装"却在服务里启动失败）。这一条要显式说出来。
-        (a.kind === 'native' && a.service_label && a.installed && !a.service_in_launchd)
+        // 装了运行体、但服务没注册（plist 丢了/从没注册成功）：说清缺什么 + **真的**
+        // 下一步点哪里。修法与提示都来自后端（services.ServiceRepairFor）—— brew 服务
+        // 能靠 `brew services start` 补出 plist，面板安装器托管的（com.zizdog.stt）
+        // 只能重跑安装。前端过去一律说"面板会用 brew services start 补上"，
+        // whisper.cpp 用户照着点什么也不会发生（坑 231）。
+        serviceRepairOf(a)
           ? h('span.pill.warn', {
             text: '已安装·服务未注册',
-            title: '这个 brew 服务还没在 launchd 里注册（plist 不存在）。' +
-              '到「已安装」Tab 点一次启动即可自动注册（面板会用 brew services start 补上）',
+            title: serviceRepairOf(a).hint || '安装产物在，但 launchd 里找不到这个服务',
           })
           : (a.adopted
             // 面板里有这条记录（内部叫"纳管"）。对用户来说就是**已安装**：
@@ -1584,10 +1595,16 @@ export function AppsView(content, ctx = {}) {
   // 回调走到这里 —— 保留这条路径而不是让按钮直接 openServicePanel，
   // 就是为了把本页的安装器上下文（onReinstall）带进面板。
   function openAppDetail(a, opts = {}) {
+    const r = serviceRepairOf(a);
     return openServicePanel({
       market: a,
       onDone: refreshSilently,
       onReinstall: () => openInstaller(a),
+      // 服务缺失且本页能修时，把「重新部署」放在管理面板的第一颗按钮上 ——
+      // 卡片与面板给的是**同一个**下一步，不让用户在两处看到不同说法。
+      ...(r && r.action === 'reinstall'
+        ? { primaryText: '重新部署', primaryRun: () => openInstaller(a) }
+        : {}),
       ...opts,
     });
   }
