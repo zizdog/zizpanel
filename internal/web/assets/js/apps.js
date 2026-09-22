@@ -77,7 +77,7 @@ let proxyState = null;
 let svcState = {};
 
 // ---------------------------------------------------------------------------
-//  市场数据缓存（用户 2026-09-22：打开这一页直接读缓存，只有点「刷新列表」才刷新）
+//  市场数据缓存（用户 2026-09-22：打开这一页直接读缓存，只有点「⟳ 更新」才刷新）
 // ---------------------------------------------------------------------------
 //
 // 为什么落 sessionStorage：内存里的 cache 能覆盖面板内切页，但**整页刷新/重开浏览器**
@@ -115,6 +115,129 @@ if (restoredMarketCache) {
   cache = restoredMarketCache.market;
   svcList = restoredMarketCache.services;
   cacheAt = restoredMarketCache.at;
+}
+
+// ---------------------------------------------------------------------------
+//  「有可更新应用」的常驻提醒 + 后台定时检查（用户 2026-09-22 要求）
+// ---------------------------------------------------------------------------
+//
+// 用户原话："后台就在固定时间主动检查一次，如有更新，显著提醒。如 1h 一次。"
+// 所以：① 计数写 localStorage（刷新页面后侧栏徽标仍在）；② 每小时**真查**一次（fresh=1，
+// 不是读缓存 —— 读缓存的后台检查没有意义）；③ 有更新就派发事件让外壳显示侧栏徽标，
+// 应用页顶部再常驻一条横幅；④ 新发现时补一条 toast。
+const APP_UPDATE_STORE = 'zp.appUpdates';      // {count, checked_at}
+const APP_UPDATE_INTERVAL_MS = 60 * 60 * 1000; // 1 小时
+const APP_UPDATE_FIRST_DELAY_MS = 3000;        // 进面板先查一次（延迟 3s，别跟首屏抢）
+
+function loadAppUpdateCount() {
+  try {
+    const o = JSON.parse(localStorage.getItem(APP_UPDATE_STORE) || 'null');
+    return o && typeof o.count === 'number' ? o.count : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function saveAppUpdateCount(count) {
+  try {
+    localStorage.setItem(APP_UPDATE_STORE, JSON.stringify({ count, checked_at: Date.now() }));
+  } catch (e) { /* 存不下：本次会话的事件仍然生效 */ }
+  try {
+    // 外壳（app.js）监听这个事件更新侧栏徽标 —— 两个模块不互相 import。
+    window.dispatchEvent(new CustomEvent('zp:app-updates', { detail: { count } }));
+  } catch (e) { /* 事件不可用就等下次渲染 */ }
+}
+
+// applyUpdatesResponse 把批量结论并进 updateChecks（两个子 Tab 共用同一份）。
+// 目标里**没有出现在 items** 的条目 = 面板拿不到可比版本 ⇒ 如实记 unknown，
+// 绝不写成"已是最新"。
+function applyUpdatesResponse(resp, ids) {
+  const items = (resp && resp.items) || {};
+  const at = (resp && resp.checked_at) || new Date().toISOString();
+  for (const id of ids) {
+    if (items[id] && typeof items[id] === 'object') {
+      updateChecks[id] = items[id];
+      continue;
+    }
+    updateChecks[id] = {
+      installed: '', latest: '', update_available: false, unknown: true, checked_at: at,
+      error: '面板现在拿不到这个应用的可比版本（它没有版本真源）',
+    };
+  }
+}
+
+let appUpdateTimer = null;
+let appUpdateInflight = false;
+let appUpdateAnnounced = 0;
+
+// runBackgroundUpdateCheck 后台主动查一次（定时器用，与任何视图无关）。
+//
+// 数据源是**缓存里的市场列表**（模块级 loadDataCache），所以即使当前不在「应用」页、
+// 或者用户已经切走，它照样能工作。
+async function runBackgroundUpdateCheck() {
+  // 与页面自己的那一轮探测互斥：两轮同时打后端只会重复跑一次 brew outdated。
+  if (appUpdateInflight || updateInflight) return;
+  const data = loadDataCache();
+  const list = (data && data.market && Array.isArray(data.market.list)) ? data.market.list : null;
+  if (!list) return; // 还没拉过市场列表：等下一轮（面板刚启动时可能还没人打开过应用页）
+  const targets = list.filter((a) => a && a.id && a.supports_update_check && isInstalled(a));
+  if (!targets.length) {
+    saveAppUpdateCount(0);
+    return;
+  }
+  appUpdateInflight = true;
+  try {
+    const resp = await api.marketUpdates(true);
+    applyUpdatesResponse(resp, targets.map((a) => a.id));
+    saveUpdateCheckStore();
+    const pending = targets.filter(updatePendingOf);
+    saveAppUpdateCount(pending.length);
+    if (pending.length > appUpdateAnnounced) {
+      appUpdateAnnounced = pending.length;
+      const names = pending.slice(0, 3).map((a) => a.name).join('、');
+      toast('发现 ' + pending.length + ' 个应用有新版本：' + names + (pending.length > 3 ? ' 等' : ''),
+        'info', 12000);
+    }
+    try { window.dispatchEvent(new CustomEvent('zp:app-update-checked', { detail: { count: pending.length } })); } catch (e) { /* 忽略 */ }
+  } catch (e) {
+    // 查不成**不动计数**：把"没查成"显示成"没有更新"就是谎报。
+  } finally {
+    appUpdateInflight = false;
+  }
+}
+
+// lastBackgroundCheckAt 读上一次"真的查成了"的时刻（0 = 还没成功过）。
+function lastBackgroundCheckAt() {
+  try {
+    const o = JSON.parse(localStorage.getItem(APP_UPDATE_STORE) || 'null');
+    return (o && typeof o.checked_at === 'number') ? o.checked_at : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// startBackgroundUpdateChecks 只起一次定时器（模块级，页面切走也不停）。
+//
+// 心跳 30 秒、但**只在距上次成功检查超过 1 小时时才真查**。为什么不用
+// `setInterval(run, 1h)`：那一轮可能正好撞上页面自己的探测而被互斥保护跳过，
+// 于是这次后台检查被推迟整整一小时 —— 用户会以为"后台检查没生效"。
+function startBackgroundUpdateChecks() {
+  if (appUpdateTimer) return;
+  // 首次：3s 后试；若正好撞上页面自己那轮探测（互斥保护会跳过），5s 后再试，
+  // 最多 6 次 —— 不让"有新版"的提醒因为一次撞车而拖到 30s 心跳。
+  let tries = 0;
+  const first = () => {
+    if (appUpdateInflight || updateInflight) {
+      if (++tries < 6) setTimeout(first, 5000);
+      return;
+    }
+    runBackgroundUpdateCheck();
+  };
+  setTimeout(first, APP_UPDATE_FIRST_DELAY_MS);
+  appUpdateTimer = setInterval(() => {
+    if (Date.now() - lastBackgroundCheckAt() < APP_UPDATE_INTERVAL_MS) return;
+    runBackgroundUpdateCheck();
+  }, 30 * 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +409,10 @@ export function AppsView(content, ctx = {}) {
   // 不许再往卸掉的 DOM 上写东西。
   let alive = true;
   registerCleanup(() => { alive = false; });
+  // 后台定时检查完成（可能是别的视图起的定时器）→ 本视图跟着重画；切走就退订。
+  const onAppUpdateChecked = () => { if (alive) { renderTabBar(); renderBody(); } };
+  window.addEventListener('zp:app-update-checked', onAppUpdateChecked);
+  registerCleanup(() => window.removeEventListener('zp:app-update-checked', onAppUpdateChecked));
 
   const tabBar = h('div', { style: { display: 'flex', gap: '6px', marginBottom: '14px', flexWrap: 'wrap' } });
   const body = h('div');
@@ -306,12 +433,15 @@ export function AppsView(content, ctx = {}) {
       const age = cacheAgeText();
       tabBar.appendChild(h('span.pill', {
         text: age ? '缓存 · ' + age : '缓存',
-        title: '打开这一页直接读本地缓存，不发请求；只有点「⟳ 刷新列表」才重新探测。'
+        title: '打开这一页直接读本地缓存，不发请求；只有点「⟳ 更新」才重新探测。'
           + (age ? '\n\n这份数据是 ' + age + '的。' : ''),
       }));
     }
     if (refreshing) {
-      tabBar.appendChild(h('span.pill.warn', { text: '刷新中…', title: '正在重新探测已装软件与可用更新' }));
+      tabBar.appendChild(h('span.pill.warn', {
+        text: refreshPhase || '更新中…',
+        title: '正在重跑本机探测（brew/docker）并检查有没有新版',
+      }));
     }
     // 后端这次**没能复核**「本机装了哪些 Homebrew 包」（brew_probe_ok=false）时，
     // 如实说出来：列表里那些「安装」只代表"没查成"，不代表东西真的没装
@@ -322,7 +452,7 @@ export function AppsView(content, ctx = {}) {
       tabBar.appendChild(h('span.pill.warn', {
         text: '⚠ 未能复核已装软件',
         title: '这次没能读到 Homebrew 的已装清单：'
-          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 刷新列表」重试。'
+          + '下面标着「安装」的应用可能其实已经装着。点「⟳ 更新」重试。'
           + (why ? '\n\n真实原因：' + why : ''),
       }));
       // 把真实原因**显示出来**（不只塞进 title）：2026-09-19 用户报障时界面上
@@ -348,10 +478,36 @@ export function AppsView(content, ctx = {}) {
     // 有网络失败时，先在最上方摆出醒目提示（pill + 能照做的镜像入口 + 原文）。
     // 放在内容之前：用户打开这一页第一眼就知道"是网络，不是功能坏了"。
     if (netFailure) body.append(netHintBlock(netFailure));
+    // 「有可更新应用」的常驻横幅（用户 2026-09-22：后台每小时检查，有更新要**显著提醒**）。
+    // 放在内容之前、与网络提示同级；计数来自后台检查 + 手动更新的结论。
+    const pending = pendingUpdates();
+    if (pending.length) body.append(appUpdatesBanner(pending));
     if (active === 'installed') renderInstalledTab();
     else if (active === 'docker') renderDockerTab();
     else if (active === 'sites') renderSitesTab();
     else renderMarketTab();
+  }
+
+  // appUpdatesBanner 是"有新版"的显著提醒：常驻到更新做完为止，并给一个直达入口。
+  function appUpdatesBanner(list) {
+    const names = list.slice(0, 4).map((a) => a.name).join('、');
+    return h('div#app-updates-banner', {
+      style: {
+        background: 'var(--warn-soft)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)', padding: '12px 14px', marginBottom: '14px',
+        fontSize: '12.5px', lineHeight: '1.8',
+      },
+    }, [
+      h('div', { text: '🔔 有 ' + list.length + ' 个应用可以更新：' + names + (list.length > 4 ? ' 等' : '') }),
+      h('div.hint', { text: '点右上角「⟳ 更新」重新检查；已安装的卡片上有「更新」按钮，点一下即可升级。' }),
+      active === 'market'
+        ? null
+        : h('button.btn.btn-sm', {
+          style: { marginTop: '6px' },
+          text: '去「应用市场」看',
+          onclick: () => { active = 'market'; renderTabBar(); renderBody(); },
+        }),
+    ]);
   }
 
   function renderInstalledTab() {
@@ -424,16 +580,18 @@ export function AppsView(content, ctx = {}) {
   }
 
   // load 是进页面的入口：**有缓存就直接渲染，一个请求都不发**（缓存优先，2026-09-22 用户要求）。
-  // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「刷新列表」。
+  // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「⟳ 更新」。
   async function load() {
     if (!proxyState) proxyState = { enabled: true, items: [], _stale: true };
+    // 后台定时检查（1 小时一次）由模块级定时器负责，只起一次；这里只挂"查完重画"的订阅。
+    startBackgroundUpdateChecks();
     if (cache) {
       // 恢复出来的服务记录也要派生一次"服务名 → state"（卡片首颗按钮要它）。
       rebuildSvcState();
       renderTabBar();
       renderBody();
-      // 缓存只省"列表数据"这一次请求；更新结论另有 TTL（10 分钟），过期就该重探 ——
-      // 与子 Tab 无关地跑，两个 Tab 共用结果。
+      // 缓存只省"列表数据"这一次请求；更新结论**每次进页面都问一次后端**
+      //（后端自己 9 分钟缓存 + 安装/升级后失效）—— 与子 Tab 无关地跑，两个 Tab 共用结果。
       ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, false);
       return;
     }
@@ -446,25 +604,44 @@ export function AppsView(content, ctx = {}) {
     ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, false);
   }
 
-  // refreshing 是「刷新列表」正在跑的标志（按钮可见地禁用，避免连点打出一串探测）。
+  // refreshing/refreshPhase 是「⟳ 更新」的进度状态：按钮与顶部都要**看得见**在做事
+  // （用户 2026-09-22 报障："刷新点击后没有反应"—— 数据没变时尤其像没反应）。
   let refreshing = false;
+  let refreshPhase = '';
 
-  // refresh 是「刷新列表」的**唯一**入口：fresh=1 让后端也重跑一次真实复核，
-  // 落定后把这一屏的更新检查也重做一遍（force：忽略 10 分钟 TTL）。
-  // 装/卸/启停之后的自动更新走 refreshSilently：后端在那条路径上已经失效过缓存。
+  // refresh 是「⟳ 更新」的唯一入口（用户 2026-09-22：把"检查更新"合并进刷新、就叫「更新」）：
+  // ① fresh=1 重拉列表（后端重跑 brew/docker 真实复核）
+  // ② 强制重查一次更新（fresh=1）
+  // ③ 一条汇总 toast，告诉用户到底做了什么、有没有新版。
+  // 装/卸/启停之后的自动更新仍走 refreshSilently（后端在那条路径上已经失效过缓存）。
   async function refresh() {
     if (refreshing) return;
     refreshing = true;
+    refreshPhase = '正在刷新应用列表…';
     renderTabBar();
     if (active === 'market') renderHead();
     try {
       await fetchAll({ fresh: true });
+      refreshPhase = '正在检查更新…';
+      renderTabBar();
+      if (active === 'market') renderHead();
+      await ensureUpdateChecks(updateCheckTargets(), null, true);
     } finally {
       refreshing = false;
+      refreshPhase = '';
     }
     renderTabBar();
     renderBody();
-    ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, true);
+    const pending = pendingUpdates();
+    saveAppUpdateCount(pending.length);
+    toast('已更新应用列表：共 ' + ((cache && cache.list) ? cache.list.length : 0) + ' 个应用' +
+      (pending.length ? '，其中 ' + pending.length + ' 个有新版' : '，这次没有检测到新版'),
+      pending.length ? 'warn' : 'ok', 9000);
+  }
+
+  // pendingUpdates 是当前"确定有新版"的条目（唯一判据 updatePendingOf）。
+  function pendingUpdates() {
+    return updateCheckTargets().filter(updatePendingOf);
   }
 
   // stateOfApp 取这个应用在服务记录里的状态（给市场卡片上的启停按钮用）。
@@ -513,14 +690,15 @@ export function AppsView(content, ctx = {}) {
   // ensureUpdateChecks 一次批量拿**全部**结论（后端一次 `brew outdated` + 动态索引），
   // 写进同一份 updateChecks —— 「已安装」与「应用市场」两个子 Tab 共用它。
   // 按卡片逐个探测会跑 N 次联网比对（13 个 brew 应用 = 13 次），所以这里必须批量。
-  // force=true（用户点刷新/检查更新）时带 fresh=1 让后端重跑真实探测。
+  // force=true（用户点「⟳ 更新」）时带 fresh=1 让后端重跑真实探测。
+  // 返回这一轮的 Promise：调用方（刷新）要等它落定才能如实汇报"更新完了"。
   function ensureUpdateChecks(list, onDone, force) {
     if (updateInflight) {
       if (typeof onDone === 'function') updateInflight.then(() => onDone());
-      return;
+      return updateInflight;
     }
     const targets = (list || []).filter(eligibleForUpdateCheck);
-    if (!targets.length) return;
+    if (!targets.length) return Promise.resolve();
     const ids = targets.map((a) => a.id);
     for (const id of ids) updateChecking[id] = true;
     const round = api.marketUpdates(!!force)
@@ -535,25 +713,7 @@ export function AppsView(content, ctx = {}) {
       if (updateInflight === round) updateInflight = null;
       if (typeof onDone === 'function') onDone();
     });
-  }
-
-  // applyUpdatesResponse 把批量结论并进 updateChecks。
-  //
-  // 目标里**没有出现在 items** 的条目 = 面板现在拿不到这个应用的可比版本
-  // ⇒ 如实记 unknown（界面不给徽标、也不说"已是最新"）。
-  function applyUpdatesResponse(resp, ids) {
-    const items = (resp && resp.items) || {};
-    const at = (resp && resp.checked_at) || new Date().toISOString();
-    for (const id of ids) {
-      if (items[id] && typeof items[id] === 'object') {
-        updateChecks[id] = items[id];
-        continue;
-      }
-      updateChecks[id] = {
-        installed: '', latest: '', update_available: false, unknown: true, checked_at: at,
-        error: '面板现在拿不到这个应用的可比版本（它没有版本真源）',
-      };
-    }
+    return round;
   }
 
   // updateCheckFailure 把接口/网络失败折叠成一条**如实的 unknown**（不猜结论）。
@@ -563,32 +723,6 @@ export function AppsView(content, ctx = {}) {
       installed: '', latest: '', update_available: false, unknown: true,
       checked_at: new Date().toISOString(), error: '检查失败：' + msg,
     };
-  }
-
-  // forceUpdateCheck 是卡片上「检查更新」这颗按钮：忽略 TTL 重新查。
-  // brew 条目走批量接口（fresh=1，后端重跑一次 `brew outdated`）；
-  // 动态索引条目（zizvideo 这类没有 brew_formula 的）走单条按需接口。
-  function forceUpdateCheck(a) {
-    if (!a || !a.id || updateChecking[a.id]) return;
-    invalidateUpdateCheck(a.id);
-    updateChecking[a.id] = true;
-    renderGrid(); // 让"检查更新中…"立刻可见
-    const done = () => {
-      delete updateChecking[a.id];
-      saveUpdateCheckStore();
-      afterUpdateChecks();
-    };
-    if (a.brew_formula) {
-      api.marketUpdates(true)
-        .then((resp) => { applyUpdatesResponse(resp, [a.id]); })
-        .catch((e) => { updateChecks[a.id] = updateCheckFailure(e); })
-        .then(done);
-      return;
-    }
-    api.marketUpdateCheck(a.id, true)
-      .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
-      .catch((e) => { updateChecks[a.id] = updateCheckFailure(e); })
-      .then(done);
   }
 
   // startUpgrade 是「更新」按钮的动作：统一打 POST /market/{id}/upgrade，
@@ -668,11 +802,9 @@ export function AppsView(content, ctx = {}) {
         onclick: () => startUpgrade(a),
       })];
     }
-    return [h('button.btn.btn-sm', {
-      text: '检查更新',
-      title: '读一次镜像索引，与已装模块的版本比对',
-      onclick: () => forceUpdateCheck(a),
-    })];
+    // 「检查更新」按钮已按用户要求**合并进右上角的「⟳ 更新」**（一次查全部，
+    // 不再每张卡片各给一个按钮）。这里没有新版就什么都不给，只留徽标/备注。
+    return [];
   }
 
   // ---------- 应用市场 Tab ----------
@@ -708,7 +840,7 @@ export function AppsView(content, ctx = {}) {
       // 都已删除：用户明确要求市场**始终显示全部**，docker 类也搬去了 docker Tab。
       // 平时打开这一页直接读缓存（缓存优先，见 load 的说明）；这颗按钮是唯一的刷新入口。
       h('button.btn.btn-sm', {
-        text: refreshing ? '刷新中…' : '⟳ 刷新列表',
+        text: refreshing ? (refreshPhase || '更新中…') : '⟳ 更新',
         disabled: refreshing,
         title: '重新探测本机装了哪些软件、有没有新版（要跑一次 brew / docker 复核，约几秒）。'
           + '平时打开应用市场直接读缓存、不发请求；装好软件后点这里更新状态。',
@@ -1135,7 +1267,7 @@ export function AppsView(content, ctx = {}) {
     }
 
     // 更新探测**不在这里触发**：它很贵（读镜像索引 / 起 `--version` 子进程），
-    // 只在首次加载或用户点「刷新列表」时各跑一次（见 load / refresh）。
+    // 只在首次加载、点「⟳ 更新」或后台定时检查时各跑一次（见 load / refresh / runBackgroundUpdateCheck）。
     // 挂在每次重画上会让"切个页签"就重新探测一轮。
 
     // 置顶：只有**确定**有更新（update_available=true）的条目提前到一个显式分组；

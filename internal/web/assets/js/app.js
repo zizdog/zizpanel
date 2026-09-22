@@ -385,6 +385,28 @@ function renderSetup() {
 //
 // 为什么记在 localStorage：用户折叠侧栏是"我习惯这样用"的长期偏好，
 // 刷新一次就弹回来会让他每次都要再折一遍。
+// 「应用市场有可更新应用」的计数（用户 2026-09-22：后台每小时自检，有更新要显著提醒）。
+// 由 apps.js 的定时检查写进 localStorage 并派发 zp:app-updates 事件；外壳持有计数是因为
+// 侧栏每次路由切换都会重建，徽标必须从一个不随 DOM 消失的地方取值（刷新页面也还在）。
+const APP_UPDATE_STORE = 'zp.appUpdates';
+let appUpdatesCount = (() => {
+  try {
+    const o = JSON.parse(localStorage.getItem(APP_UPDATE_STORE) || 'null');
+    return o && typeof o.count === 'number' && o.count > 0 ? o.count : 0;
+  } catch (e) {
+    return 0;
+  }
+})();
+window.addEventListener('zp:app-updates', (e) => {
+  const n = Number((e && e.detail && e.detail.count) || 0);
+  appUpdatesCount = Number.isFinite(n) && n > 0 ? n : 0;
+  const dot = document.querySelector('[data-testid="zp-app-update-badge"]');
+  if (!dot) return;
+  dot.hidden = appUpdatesCount <= 0;
+  dot.textContent = appUpdatesCount > 0 ? String(appUpdatesCount) : '';
+  dot.title = appUpdatesCount > 0 ? ('应用市场：' + appUpdatesCount + ' 个应用有新版') : '';
+});
+
 const SIDEBAR_KEY = 'zp-sidebar-collapsed';
 
 function sidebarCollapsed() {
@@ -484,6 +506,16 @@ function renderApp() {
         hidden: !hasUpdate(),
       })
       : null;
+    // 「应用」也有新版红点/计数（apps.js 的定时检查发现可更新应用时亮起）。
+    const appDot = n.id === 'apps'
+      ? h('span.badge.zp-app-update-dot', {
+        dataset: { testid: 'zp-app-update-badge' },
+        text: appUpdatesCount > 0 ? String(appUpdatesCount) : '',
+        title: appUpdatesCount > 0 ? ('应用市场：' + appUpdatesCount + ' 个应用有新版') : '',
+        style: { background: 'var(--danger)', color: '#fff', border: '1px solid transparent' },
+        hidden: appUpdatesCount <= 0,
+      })
+      : null;
     nav.appendChild(h(`div.nav-item${active ? '.active' : ''}`, {
       // 折叠后只剩图标，所以 title 是用户唯一能看到的名称提示。
       title: n.title,
@@ -492,6 +524,7 @@ function renderApp() {
       h('span.ico', { text: n.icon }),
       h('span', { text: n.title }),
       n.phase ? h('span.badge', { text: n.phase }) : null,
+      appDot,
       dot,
     ]));
   });

@@ -343,7 +343,11 @@ func (s *Server) installSiteApp(ctx context.Context, app services.App, domain st
 	// 写死的 jsdelivr 备用地址早已 404 —— 一旦 GitHub 不通就完全装不上。
 	logf := func(msg string) { step("%s", msg) }
 	pinned, hasPinned := services.SiteSourceFor(app.ID)
-	archiveName := "zizpanel-site-" + app.ID + "-" + fmt.Sprint(time.Now().Unix())
+	// ⚠️ 临时包名必须**每次调用唯一**（2026-09-22 门禁抓到的真 bug）：原来是
+	// "应用ID + 秒级时间戳"，同一秒内两次装同一个应用就是同一个路径 —— 一个安装的
+	// `defer os.Remove` 会把另一个正在解压的文件删掉（unzip 报 "cannot find or open"）。
+	// 生产上就是"连点两次安装 / 两个标签页同时装"这种形态。用 UnixNano + PID 保证唯一。
+	archiveName := fmt.Sprintf("zizpanel-site-%s-%d-%d", app.ID, os.Getpid(), time.Now().UnixNano())
 	if hasPinned {
 		// 临时文件名是给 extractArchive **按后缀判格式**用的：
 		// filepath.Ext("FreshRSS-1.30.0.tar.gz") 只给出 ".gz"，解压器会以
