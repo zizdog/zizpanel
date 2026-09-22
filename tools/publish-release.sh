@@ -329,7 +329,11 @@ cmd_push_mirror() {
   cp "$RELDIR/manifest-nas.json.sig" "$RELDIR/manifest.json.sig"
 
   local jar tok
-  jar="$(mktemp)"; trap 'rm -f "$jar"' RETURN 2>/dev/null || true
+  jar="$(mktemp)"
+  # ⚠️ trap 里必须用 "${jar:-}"：RETURN 陷阱在函数返回时执行，那时 `local jar` 可能
+  # 已经被销毁，`set -u` 下 "$jar" 会报 unbound variable（2026-09-22 实测：镜像已发成功，
+  # 却因为这一行让 make publish 退出码变成 2）。
+  trap 'rm -f "${jar:-}"' RETURN
   csrf() { awk '$6=="zp_csrf"{print $7}' "$jar" | tail -1; }
   info "登录 mini 面板 $base"
   curl -fsSk -c "$jar" -o /dev/null "$base/" || die "打不开 mini 面板"
