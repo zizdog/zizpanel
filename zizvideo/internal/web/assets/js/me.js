@@ -28,18 +28,9 @@ export function mountMe(view, options) {
     libraryLine.lastChild.textContent = n ? (n + " 个") : "未授权任何媒体库";
   }).catch(() => { libraryLine.lastChild.textContent = "未复核"; });
 
-  // 播放设置就地展开：与首页 ⚙ 共用同一份控件与 PATCH /api/v1/feed/settings，不跳走。
-  let playSettings = normalizeFeedSettings();
-  const playNote = el("div", { class: "muted small-note", dataset: { role: "me-play-settings-note" } });
-  const playForm = createFeedSettingsForm({ settings: playSettings, onChange: savePlaySetting });
-  const playBox = el("div", { class: "set-panel hidden", dataset: { role: "me-play-settings" } },
-    playForm.node, playNote);
-  const playToggle = el("button", {
-    class: "btn small", type: "button", text: "播放设置", dataset: { role: "me-play-settings-toggle" },
-    onclick: () => togglePlaySettings(),
-  });
+  // 「我的」里不再放播放设置（用户 2026-09-22 要求去掉）：入口只留在首页右上 ⚙。
   const settings = el("div", { class: "panel", dataset: { role: "me-settings" } },
-    el("div", { class: "panel-title", text: "设置" }), playToggle, playBox);
+    el("div", { class: "panel-title", text: "设置" }));
   if (user.role === "admin") {
     settings.append(el("a", { class: "btn small", href: "#/admin", text: "管理后台" }));
   }
