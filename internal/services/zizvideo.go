@@ -96,7 +96,7 @@ const (
 	ZizvideoVersion = "0.1.1-mvp"
 	// ZizvideoBinarySHA256 是兜底版本 arm64 产物的 sha256（已知可用）；运行期以
 	// 镜像索引 apps/zizvideo/manifest.json 的 sha256 为准，这个常量只在读不到索引时用。
-	ZizvideoBinarySHA256 = "d639e133be7f9db9245b7be03a299aff0cc0948071445ae085fb2182c6bfe42a"
+	ZizvideoBinarySHA256 = "b7a78e4c9be3af217d149d138a244fadd60944bf47bab6030bc590e04b9f40ec"
 	// ZizvideoPort 是网页界面端口（只绑 127.0.0.1）。
 	ZizvideoPort = 7766
 	// zizvideoHealthPath 是公开的就绪端点，进程活着就返回 ok。

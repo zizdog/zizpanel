@@ -327,6 +327,9 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；zi
 		( cd zizvideo && GOOS=darwin GOARCH=$$arch CGO_ENABLED=0 go build -trimpath -buildvcs=false \
 			-ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch" ./cmd/server ); \
 		chmod 0755 $(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch; \
+		if [ -f $(CODESIGN_CERT) ] && [ "$${SKIP_CODESIGN:-0}" != "1" ]; then \
+			bash tools/codesign-release.sh $(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch com.zizvideo.server; \
+		fi; \
 		if [ "$${SKIP_CODESIGN:-0}" = "1" ]; then \
 			echo "    !! 跳过签名（SKIP_CODESIGN=1）：本次产物是 adhoc 签名，"; \
 			echo "       用户升级后系统会要求重新授权（见 docs/坑清单.md #183）"; \
