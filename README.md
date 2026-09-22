@@ -109,6 +109,8 @@ ddns-go 等）、**一键建站**（Typecho、WordPress、FreshRSS、Flarum、Em
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
 - 能原生装就原生装（Homebrew / 官方 darwin-arm64 产物）；**Docker 应用面板不代装**，
   只在 Docker 页给一份可参考的预配置 compose，镜像必须原生支持 arm64。
+- 自研的 **zizvideo**（本地短视频/短剧）是独立项目（GitHub `zizdog/zizvideo`）：
+  面板按它发布在镜像上的版本清单安装/更新，市场卡片显示「可更新」，数据与配置不动。
 
 ### 任务中心
 

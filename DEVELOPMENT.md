@@ -50,8 +50,10 @@ make check        # 提交前唯一入口（见第四节）
 make test-short   # 只跑 Go 单测
 ```
 
-其他常用：`make test-modules`（zizvideo 等独立 module 自测）、
-`make market-audit` / `market-audit-offline` / `market-audit-verify`、`make bump`。
+其他常用：`make market-audit` / `market-audit-offline` / `market-audit-verify`、`make bump`。
+zizvideo 是**独立项目**（本机 `../zizvideo`，GitHub `zizdog/zizvideo`）：它自己的
+`make check / release / publish` 都在那边跑；本仓库只用它的产物（读镜像索引 `apps/zizvideo/manifest.json`）
+——见 `AGENTS.md` 的「zizvideo 是独立项目」。
 
 ---
 
@@ -60,7 +62,7 @@ make test-short   # 只跑 Go 单测
 - **`make check`（日常，约 1 分钟）**：版本号一致性 → `gofmt` → `bash -n` 全部脚本 →
   `check-shell-vars` → `shellcheck` → `check-no-real-credentials` → `check-future-dates` →
   Python 语法 → acorn 两项（语法 + 未声明赋值）→ `go vet` → `go test ./...`（含真实家目录指纹门禁）→
-  zizvideo 独立 module 自测 → 卸载脚本三档沙箱 → 服务器模式（SSH/电源）→ 写 check 指纹。
+  卸载脚本三档沙箱 → 服务器模式（SSH/电源）→ 写 check 指纹。
 - **`make check-full`（发版前）**：在 `check` 之上加真起进程的重活 —— receiver `/jobs`、
   安装脚本端到端、远程一键安装、发布说明门禁。这些一次几分钟，日常提交不跑。
 - 退出码**不许过管道**：`go build ... | head`、`make check | tail` 都会掩盖失败。

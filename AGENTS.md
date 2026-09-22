@@ -21,6 +21,18 @@
 - **NAS（`192.168.1.8`）＝ 镜像与备份**，不是本项目机器。
 - 版本号以 `internal/version/version.go` 为准（本文不写死）。
 
+### zizvideo 是**独立项目**（2026-09-22 移出本仓库）
+
+- 位置：本机 `../zizvideo`（`/Users/zizdog/Documents/DeepSeek/zizvideo`），GitHub **`zizdog/zizvideo`**（public）。
+  它有自己的 `AGENTS.md` + `ZizVideo-当前状态.md`，**由另一个会话负责**；本仓库不再包含它的源码。
+- 面板侧只留三件事：① 托管入口的 shim（`cmd/zizpanel/zizvideo.go`：`<面板二进制> zizvideo-supervise …`，
+  参数是**冻结契约**）；② 读镜像索引 `apps/zizvideo/manifest.json` 决定版本/产物（`internal/services/zizvideo.go`，
+  `ZizvideoVersion` 只是索引读不到时的兜底常量）；③ 市场卡片 + 「可更新」徽标 + 互斥检查。
+- 发 zizvideo **不需要发面板**：在 `../zizvideo` 里 `make check` → `make release` → `make publish`
+  （走 mini 面板接口传镜像，凭据在那个仓库的 `.panel-credential.local`），然后**用户在面板后台手动更新**。
+- 两个运行接口（面板托管 / 独立部署）都必须长期存在，契约写在 `../zizvideo/CONTRACT.md`；改任一入口参数 =
+  破坏兼容，必须同步另一侧。
+
 ---
 
 ## 一、铁律（违反会破坏用户环境，没有例外）
