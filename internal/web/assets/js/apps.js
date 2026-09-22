@@ -352,7 +352,15 @@ export function AppsView(content, ctx = {}) {
     }
     // 合并去重、卡片动作、状态筛选都在 services.js 的 renderInstalledApps 里
     // （它同时握着市场条目与服务记录，见那边文件头的说明）。
-    renderInstalledApps(body, { market: cache, list: svcList, onReload: refreshSilently });
+    renderInstalledApps(body, {
+      market: cache,
+      list: svcList,
+      onReload: refreshSilently,
+      // 「已安装」卡片复用**同一份**更新结论与同一套渲染（别新造一套）：
+      // 用户默认落地的就是这个 Tab（2026-09-22 zizvideo 报障：有新版却看不见入口）。
+      updateBadgeOf,
+      updateAction,
+    });
   }
 
 
@@ -395,6 +403,14 @@ export function AppsView(content, ctx = {}) {
     return hours < 24 ? hours + ' 小时前' : Math.floor(hours / 24) + ' 天前';
   }
 
+  // updateCheckTargets 是"这一轮该探测更新的条目"：市场列表全集（含 docker / 建站条目），
+  // 再由 eligibleForUpdateCheck 筛（supports_update_check + 已安装 + 结论已过期）。
+  // 关键：**与当前是哪个子 Tab 无关** —— 用户默认落在「已安装」，探测也必须照跑，
+  // 否则那个 Tab 上的卡片永远等不到徽标（2026-09-22 的真实报障）。
+  function updateCheckTargets() {
+    return (cache && Array.isArray(cache.list)) ? cache.list : [];
+  }
+
   // load 是进页面的入口：**有缓存就直接渲染，一个请求都不发**（缓存优先，2026-09-22 用户要求）。
   // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「刷新列表」。
   async function load() {
@@ -404,6 +420,9 @@ export function AppsView(content, ctx = {}) {
       rebuildSvcState();
       renderTabBar();
       renderBody();
+      // 缓存只省"列表数据"这一次请求；更新结论另有 TTL（10 分钟），过期就该重探 ——
+      // 与子 Tab 无关地跑，两个 Tab 共用结果。
+      ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, false);
       return;
     }
     clear(body);
@@ -412,7 +431,7 @@ export function AppsView(content, ctx = {}) {
     renderTabBar();
     renderBody();
     // 首次加载没得读缓存，这一次探测顺带把更新检查也做了。
-    if (active === 'market' && marketGrid) ensureUpdateChecks(marketApps(), afterUpdateChecks, false);
+    ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, false);
   }
 
   // refreshing 是「刷新列表」正在跑的标志（按钮可见地禁用，避免连点打出一串探测）。
@@ -433,7 +452,7 @@ export function AppsView(content, ctx = {}) {
     }
     renderTabBar();
     renderBody();
-    if (active === 'market' && marketGrid) ensureUpdateChecks(marketApps(), afterUpdateChecks, true);
+    ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, true);
   }
 
   // stateOfApp 取这个应用在服务记录里的状态（给市场卡片上的启停按钮用）。
@@ -530,10 +549,16 @@ export function AppsView(content, ctx = {}) {
   }
 
   // afterUpdateChecks 是探测落定后的重画（页面已切走就不再动 DOM）。
+  // **当前在哪个子 Tab 就重画哪个**：探测本身与子 Tab 无关，结论两个 Tab 共用。
   function afterUpdateChecks() {
-    if (!alive || active !== 'market' || !marketGrid) return;
-    renderHead();
-    renderGrid();
+    if (!alive) return;
+    if (active === 'market' && marketGrid) {
+      renderHead();
+      renderGrid();
+      return;
+    }
+    // 「已安装」等其它子 Tab：整块重画（徽标 + 「更新」按钮就在 installedCard 上）。
+    renderBody();
   }
 
   // updateBadgeOf 只给**确定有更新**的条目一枚徽标；unknown/已最新/没查 一律不给。

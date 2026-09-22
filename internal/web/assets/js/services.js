@@ -239,7 +239,15 @@ export function renderInstalledApps(container, opts = {}) {
     // 端口直连；「直链」仍然住在「⚙️ 管理」面板里，卡片上不再出现。
     // 启停判据由 marketQuickActions 决定：有服务记录就一定给，否则看
     // adopted / service_in_launchd（跟市场卡片完全同一条规则）。
+    // 更新徽标 / 「更新」按钮：结论与触发都在 apps.js（updateChecks 是那份模块级状态，
+    // 两个子 Tab 共用同一份结论），这里只把**同一个结论**画在「已安装」卡片上。
+    // 为什么必须有（2026-09-22 zizvideo 报障）：用户默认落地的就是「已安装」Tab，
+    // 而更新入口当时只在「应用市场」Tab 上，等于"有新版用户看不见"。
+    const updatePill = (typeof opts.updateBadgeOf === 'function') ? opts.updateBadgeOf(m) : null;
+    const updateActs = (typeof opts.updateAction === 'function') ? opts.updateAction(m) : [];
+
     const actions = [
+      ...updateActs,
       ...openOnlyAction(m, { svc: s }),
       ...marketQuickActions(m, {
         svc: s,
@@ -251,6 +259,7 @@ export function renderInstalledApps(container, opts = {}) {
     const pills = [
       h('span.pill' + (line.cls ? '.' + line.cls : ''), { text: line.text, title: line.title || '' }),
       port > 0 ? h('span.pill', { text: ':' + port }) : null,
+      updatePill,
       // 「面板托管 / 仅纳管」pill 已删除（用户："弱化管纳这个概念"）。
       // 为什么不换成"由面板安装 / 本机已有"：记录里的 managed=false 并不能证明
       // 软件是用户装的 —— 面板自研安装器装出来的应用（Miniflux / Qwen3 TTS /
