@@ -36,7 +36,7 @@ import { isNetworkFailureText, networkHintText, networkHintBlock, NET_HINT_MARKE
 // ---------------- 主动检测：状态、周期、持久化 ----------------
 
 const LS_KEY = 'zp-upgrade-check'; // {has_update, latest, current, checked_at, effective_source}
-const CHECK_INTERVAL = 6 * 60 * 60 * 1000; // 周期检测：6 小时
+const CHECK_INTERVAL = 60 * 60 * 1000; // 周期检测：1 小时（原 6 小时：发布后可能半天都不提示）
 const BOOT_COOLDOWN = 10 * 60 * 1000;      // 进面板时：距上次检测超过 10 分钟就重测一次
 const SCAN_INTERVAL = 5 * 60 * 1000;       // 每 5 分钟看一次"到点没"，只有到点且页面可见才真发请求
 const FRESH_SUCCESS_MS = 2 * 60 * 1000;    // 2 分钟内完成的成功态 = "刚刚发生"，才值得弹横幅
@@ -132,10 +132,16 @@ function scan() {
 export function startUpgradeWatcher() {
   if (started) return;
   started = true;
-  // 进入面板时自动检测一次。用 10 分钟冷却而不是"每次刷新都打"：
-  // 频繁刷新不该把发布清单当心跳接口压。
+  // 登录后立刻检测一次。
+  //
+  // ⚠️ 判定不能只看"结论新不新鲜"（2026-09-22 用户报障："进入后台不再提示系统更新的
+  // 小红点，必须手动进面板设置→检查更新才会提示"）：升级完面板那一刻写下的正是
+  // 「没有新版」的**新鲜**结论 ⇒ 旧逻辑直接跳过登录检查，而定期扫描要等 6 小时，
+  // 于是之后发布的新版长时间不提示。现在只有"已经知道有新版且结论还新鲜"才跳过，
+  // 其余（没有结论 / 结论说没新版 / 结论过期）一律当场查一次——一次几 KB 的清单请求。
   const saved = readSaved();
-  if (!saved || Date.now() - (saved.checked_at || 0) > BOOT_COOLDOWN) {
+  const fresh = !!(saved && (Date.now() - (saved.checked_at || 0)) < BOOT_COOLDOWN);
+  if (!fresh || !saved.has_update) {
     checkUpgrades({ force: true, silent: true });
   }
   scanTimer = setInterval(scan, SCAN_INTERVAL);
