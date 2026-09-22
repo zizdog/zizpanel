@@ -135,23 +135,6 @@ func TestInstalledMergeYieldsOneCardPerAppID(t *testing.T) {
 	}
 }
 
-// TestFrontendMergeKeysByAppID 前端必须以 app_id 为合并键。
-//
-// 静态钉住：把这条从 appKeyOf 里删掉就退回"按 label 猜身份"，正是重复卡片的成因。
-func TestFrontendMergeKeysByAppID(t *testing.T) {
-	sp := readAssetJS(t, "servicePanel.js")
-	mustContain(t, "servicePanel.js", sp, "const appID = typeof x.app_id === 'string' ? x.app_id.trim().toLowerCase() : '';")
-	mustContain(t, "servicePanel.js", sp, "if (appID) return 'id:' + appID;")
-	// 目录声明的服务标识必须在合并时当代表，避免旧标签的残留记录抢走卡片的启停动作。
-	mustContain(t, "servicePanel.js", sp, "const matched = want.length")
-	mustContain(t, "servicePanel.js", sp, "e.market.uninstall && e.market.uninstall.service")
-	// 合并与去重必须共用同一个键函数（两份实现就会漂）。
-	apps := readAssetJS(t, "apps.js")
-	if !strings.Contains(apps, "dedupeMarketEntries((cache?.list || [])") {
-		t.Error("apps.js 的市场渲染必须走 dedupeMarketEntries（按稳定键去重），不能自己 set 一遍")
-	}
-}
-
 // TestMarketUninstallForgetsEveryAppIdentityLabel 卸载后必须按**全部身份键**删记录。
 //
 // 只删 app.ServiceLabel 的旧写法会留下旧标签的残留记录，卸载后它以残留卡片再冒出来

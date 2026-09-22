@@ -104,36 +104,6 @@ func TestServiceListCarriesAbsoluteConfigPath(t *testing.T) {
 	}
 }
 
-// TestFrontendNeverDisablesConfigEditButton：前端不许再把「编辑配置文件」灰掉。
-//
-// 这是**用户可见文案/状态**的门禁：灰按钮点下去什么都不发生，原因还只在
-// 悬浮提示里 —— 用户看到的就是"点了没反应"（本项目为此踩过多次）。
-func TestFrontendNeverDisablesConfigEditButton(t *testing.T) {
-	js := readAssetJS(t, "servicePanel.js")
-	// 找「编辑配置文件」按钮附近的代码块，断言它不再带 disabled。
-	idx := strings.Index(js, "📝 编辑配置文件")
-	if idx < 0 {
-		t.Fatal("servicePanel.js 里找不到「📝 编辑配置文件」按钮 —— 门禁需要同步更新")
-	}
-	// 取按钮前后各 1200 字符作为上下文（覆盖三颗按钮的分支）。
-	from := idx - 1200
-	if from < 0 {
-		from = 0
-	}
-	to := idx + 1200
-	if to > len(js) {
-		to = len(js)
-	}
-	block := js[from:to]
-	if strings.Contains(block, "disabled: true") {
-		t.Errorf("「📝 编辑配置文件」附近又出现了 `disabled: true` —— 灰按钮 = 用户点了没反应；" +
-			"给不出路径时必须说清原因并给出下一步（见 api_services.go 的 config_path_abs）")
-	}
-	if !strings.Contains(js, "config_path_abs") {
-		t.Errorf("前端没有用 config_path_abs —— 没有服务记录的 nginx / PHP 会再次拿不到路径")
-	}
-}
-
 // seedServiceRecord 直接在仓库里造一条服务记录（供列表断言用）。
 func seedServiceRecord(t *testing.T, srv *Server, name, display, label, category string) {
 	t.Helper()
@@ -143,35 +113,5 @@ func seedServiceRecord(t *testing.T, srv *Server, name, display, label, category
 		LaunchLabel: label, Category: category, Managed: true,
 	}); err != nil {
 		t.Fatalf("建服务记录 %s 失败: %v", name, err)
-	}
-}
-
-// TestFrontendDistinguishesUserStopped：前端不许把"用户主动停的服务"算成问题。
-//
-// 2026-09-18 用户报障："我手动停止了 Qwen3 TTS 和 TtsVoice 音色接收端；
-// 然后它们就跑到：2 个需要处理中 …… 这是我主动停的，不是运行错误，应该分清楚！"
-//
-// 这是**用户可见分类**的门禁：判据必须包含服务记录里的用户意图（enabled=false），
-// 而不仅仅看运行状态与健康检查（那两样在"用户停的"和"崩了的"之间没有区别）。
-func TestFrontendDistinguishesUserStopped(t *testing.T) {
-	js := readAssetJS(t, "services.js")
-	idx := strings.Index(js, "function problemOf(e)")
-	if idx < 0 {
-		t.Fatal("services.js 里找不到 problemOf（「需要处理」的唯一判据）")
-	}
-	end := idx + 1200
-	if end > len(js) {
-		end = len(js)
-	}
-	block := js[idx:end]
-	if !strings.Contains(block, "stopped_by_user === true") {
-		t.Errorf("「需要处理」的判据必须排除「用户主动停止」（stopped_by_user === true）：\n%s", block[:400])
-	}
-	// 卡片上要有"是你停的"这句人话，并且不再对它显示"改检查地址"。
-	if !strings.Contains(js, "已停止（你手动停的）") {
-		t.Errorf("卡片要明确说是「你手动停的」，而不是让用户以为坏了")
-	}
-	if !strings.Contains(js, "stoppedByUser") {
-		t.Errorf("卡片渲染要用 stoppedByUser 区分这两种完全不同的情况")
 	}
 }

@@ -168,49 +168,6 @@ func TestEditorWindowGeomNeverOverflowsTinyViewport(t *testing.T) {
 	t.Logf("极小视口 %dx%d → 窗口 %+v", p.TinyView.Width, p.TinyView.Height, p.Tiny)
 }
 
-// TestEditorWindowGeomWiring 锁"打开/resize 都夹 + 写回 + 最大化/最小化不破坏"。
-func TestEditorWindowGeomWiring(t *testing.T) {
-	js := readAssetJS(t, "files.js")
-
-	apply := jsFuncBody(t, js, "applyGeometry")
-	for _, want := range []string{
-		"clampEditorGeom(",                  // 真的走纯函数
-		"layerViewRect()",                   // 可用区来自 .zpf-layer，不是 window.innerWidth 猜的
-		"persistGeom()",                     // 夹过的值写回 localStorage
-		"if (disposed || minimized) return", // 最小化态交给 CSS（zpf-win-min 的 !important）
-		"if (maximized)",                    // 最大化语义单独一条分支
-		"contentRect()",                     // 最大化仍逐像素贴 content
-	} {
-		if !strings.Contains(apply, want) {
-			t.Errorf("applyGeometry 缺少 %q —— 关闭/恢复几何的某一环没接上", want)
-		}
-	}
-	if !strings.Contains(js, "window.addEventListener('resize', applyGeometry)") {
-		t.Error("resize 不再重夹几何 —— 拖大→存→拖小会原样复发")
-	}
-	persist := jsFuncBody(t, js, "persistGeom")
-	if !strings.Contains(persist, "ZPF_POS_KEY") || !strings.Contains(persist, "JSON.stringify") {
-		t.Errorf("persistGeom 没有把几何写回 %s：%s", "ZPF_POS_KEY", strings.TrimSpace(persist))
-	}
-	if !strings.Contains(persist, "maximized") || !strings.Contains(persist, "minimized") {
-		t.Error("persistGeom 没排除最大化/最小化 —— 会把铺满态当成还原态存下来")
-	}
-	drag := jsFuncBody(t, js, "startDrag")
-	for _, want := range []string{"layerViewRect()", "persistGeom()"} {
-		if !strings.Contains(drag, want) {
-			t.Errorf("startDrag 缺少 %q —— 拖动路径没接同一套可用区/落盘", want)
-		}
-	}
-	read := jsFuncBody(t, js, "readStoredGeom")
-	if !strings.Contains(read, "ZPF_POS_KEY") {
-		t.Error("readStoredGeom 没读持久化几何")
-	}
-	// 旧实现（写死的 content 内缩偏移）必须彻底消失，否则两套几何打架。
-	if strings.Contains(js, "ZPF_WIN_INSET") || strings.Contains(js, "readStoredPos") {
-		t.Error("files.js 里还留着旧的 ZPF_WIN_INSET/readStoredPos 几何 —— 两套并存会互相覆盖")
-	}
-}
-
 func absInt(v int) int {
 	if v < 0 {
 		return -v

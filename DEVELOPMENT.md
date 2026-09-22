@@ -50,7 +50,7 @@ make check        # 提交前唯一入口（见第四节）
 make test-short   # 只跑 Go 单测
 ```
 
-其他常用：`make uitest`（需先 `make run-local`）、`make uitest-live`（对真实安装跑，含特权步骤）、
+其他常用：`make test-modules`（zizvideo 等独立 module 自测）、
 `make market-audit` / `market-audit-offline` / `market-audit-verify`、`make bump`。
 
 ---
@@ -70,8 +70,8 @@ make test-short   # 只跑 Go 单测
   `~/Library/LaunchAgents/*.plist` 覆盖成空文件，服务在跑所以零症状、重启后永久起不来；
   `check-no-real-credentials.sh` —— 真实口令进仓库复发过两次。
   **这几条删了会出事的清单在 `AGENTS.md` 第三节**，其余纪律细节见 `docs/坑清单.md`。
-- 按钮接线这类"前端哪个按钮出现"要靠真模块端到端验（`tools/appdetail-verify.mjs`，手动跑）；
-  语法检查永远是绿的，抓不到它。
+- 前端接线只靠一条运行体门禁（`internal/web/frontend_assets_gate_test.go`：真 ES 解析 +
+  模块引用存在 + appKeyOf 稳定键），不再堆"读源码找字符串"的静态断言。
 
 ## 五、发布与升级（现状：只在本机，不发 GitHub）
 
@@ -125,8 +125,8 @@ make deploy          # release + 推你自己的镜像机(单流 tar) + 升级�
 ## 七、系统设置（把 macOS 配成服务器）
 
 「系统设置」页把需要终端的事做成开关：合盖不睡、断电自恢复、关 Spotlight 索引、调 TCP 参数、开远程登录等。
-底层命令在 `tools/system-services.sh`、`tools/server-mode.sh`：每一步都有"做了 / 跳过 / 失败"三态，
-`make smoke` 覆盖（特权步骤跳过并单独列出）。参考命令：`pmset -a sleep 0 disksleep 0 displaysleep 0` /
+底层命令在 `tools/system-services.sh`、`tools/server-mode.sh`：每一步都有"做了 / 跳过 / 失败"三态。
+参考命令：`pmset -a sleep 0 disksleep 0 displaysleep 0` /
 `womp 1` / `autorestart 1` / `powernap 0`；`mdutil -a -i off`；`defaults write .../com.apple.SoftwareUpdate ...`。
 
 **每一项都先探测"这台机器支不支持"**，不支持就如实报"不支持"。最危险的一次：`pmset -a autorestart 1`

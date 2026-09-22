@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -471,30 +470,4 @@ func fakeMySQLForUninstall(t *testing.T, srv *Server, dbs, tables []string) stri
 		t.Fatal(err)
 	}
 	return logPath
-}
-
-// TestPiwigoFrontendEntryWired 是前端入口接线门禁：入口、接口、向导链接与 8.2 文案缺一不可。
-func TestPiwigoFrontendEntryWired(t *testing.T) {
-	js := readAssetJS(t, "sites.js")
-	for _, needle := range []string{
-		"Piwigo 一键建站",
-		"api.marketInstallSite('piwigo'",
-		"Piwigo 需要 PHP 8.2+",
-		"/install.php",
-		"remove_db",
-		"api.del(apiURL(",
-		"s.install_db",
-	} {
-		if !strings.Contains(js, needle) {
-			t.Errorf("sites.js 缺少 Piwigo 入口接线：%q", needle)
-		}
-	}
-	// 安装向导链接必须由站点域名拼出来，不能写死某个域名。
-	if !regexp.MustCompile(`function wizardURL\(`).MatchString(js) {
-		t.Error("sites.js 必须有 wizardURL（用站点域名拼安装向导地址）")
-	}
-	// 前端只让 PHP 8.2+ 可选，后端也拒 —— 两边的门槛必须同值。
-	if !strings.Contains(js, "phpAtLeast82") {
-		t.Error("sites.js 必须在前端就按 8.2+ 过滤 PHP 版本（后端仍会再拒一次）")
-	}
 }

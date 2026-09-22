@@ -17,7 +17,7 @@ __pycache__/
 # —— 含明文口令的交接文档：仅存本机，不要提交 ——
 ZizPanel-当前状态.md
 
-# —— 真实面板口令（make uitest-live 用）——
+# —— 真实面板口令（本机私人凭据）——
 .panel-credential.local
 
 # —— 历史下载包（二进制产物）——

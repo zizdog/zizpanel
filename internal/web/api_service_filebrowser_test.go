@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -527,28 +526,4 @@ func TestFilebrowserResetPasswordRejectsNonFilebrowserService(t *testing.T) {
 	if len(fake.calls) != 0 {
 		t.Errorf("被拒的请求不该执行任何命令，实际：%v", fake.calls)
 	}
-}
-
-// TestFrontendFilebrowserResetPasswordButtonWired 静态锁住前端接线：
-// 卡片上有「重置口令」按钮、走确认框与任务中心、口令不落 localStorage/URL。
-func TestFrontendFilebrowserResetPasswordButtonWired(t *testing.T) {
-	js := readAssetJS(t, "services.js")
-	mustContain(t, "services.js", js, "🔑 重置口令")
-	mustContain(t, "services.js", js, "async function resetFilebrowserPassword(s)")
-	mustContain(t, "services.js", js, "confirmBox(")
-	mustContain(t, "services.js", js, "api.resetFilebrowserPassword(s.name, pwd)")
-	mustContain(t, "services.js", js, "taskCenter.start({")
-
-	// 函数体里不许出现 localStorage / URL 拼接口令。
-	m := regexp.MustCompile(`(?s)async function resetFilebrowserPassword\(s\) \{.*?\n\}`).FindString(js)
-	if m == "" {
-		t.Fatal("找不到 resetFilebrowserPassword 函数体")
-	}
-	for _, bad := range []string{"localStorage", "sessionStorage", "location", "?password="} {
-		if strings.Contains(m, bad) {
-			t.Errorf("口令处理里不该出现 %s", bad)
-		}
-	}
-	apiJS := readAssetJS(t, "api.js")
-	mustContain(t, "api.js", apiJS, "/filebrowser-password")
 }

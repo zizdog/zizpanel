@@ -1059,7 +1059,7 @@ function init() {
 // 同样的上限在面板首屏查询里早就有（servicePanel.js 的 PANEL_QUERY_TIMEOUT_MS）。
 const SUBMIT_TIMEOUT_MS = 20000;
 
-// submitTimeoutMs 允许测试收紧（tools/uitest.mjs 要在几秒内确定性地验证"超时要说话"）。
+// submitTimeoutMs 允许测试收紧（在几秒内确定性地验证"超时要说话"）。
 // setSubmitTimeoutMs(ms)：ms 为正数时生效；不传 / 非正数 = 恢复默认。
 let submitTimeoutMs = SUBMIT_TIMEOUT_MS;
 function setSubmitTimeoutMs(ms) {

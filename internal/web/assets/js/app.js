@@ -90,9 +90,6 @@ const NAV_BY_ID = Object.fromEntries(NAV.filter((n) => n.id).map((n) => [n.id, n
 // "去已安装启动 MySQL"、Docker 页的"去服务管理"、仪表盘的快捷卡）里。
 // 合并导航后如果它变成 404/仪表盘，用户会以为功能没了。
 //   services → apps 版块，并**自动切到「已安装」Tab**（那里就是原服务管理的清单）。
-//
-// 这个函数导出只有一个原因：tools/appdetail-verify.mjs 用它断言
-// "#/services 落到已安装 Tab"，而不是靠人肉点。运行时没有别的调用方。
 const ROUTE_TARGET = {
   services: { id: 'apps', tab: 'installed' },
   // 2026-09：「日志中心」与「操作审计」合并成侧栏「日志」一页两个 Tab。

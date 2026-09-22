@@ -767,8 +767,10 @@ body.zp-sidebar-collapsed .nav-group { display: none; }
 body.zp-sidebar-collapsed .nav-item { position: relative; justify-content: center; gap: 0; padding: 10px 0; }
 body.zp-sidebar-collapsed .nav-item > span:not(.ico) { display: none; }
 body.zp-sidebar-collapsed .nav-item .ico { width: auto; font-size: 17px; }
-/* 新版本小红点保留成角标：折叠态下它是唯一常驻的升级信号 */
-body.zp-sidebar-collapsed .nav-item > span.zp-update-dot {
+/* 新版本小红点保留成角标：折叠态下它是唯一常驻的升级信号。
+   `:not([hidden])` 不能省：这条 display 会盖掉 hidden 属性自带的 display:none，
+   于是"没有新版本"时角标也一直挂着（用户 2026-09-22 报的"收起时'新'始终显示"）。 */
+body.zp-sidebar-collapsed .nav-item > span.zp-update-dot:not([hidden]) {
   display: inline-flex; position: absolute; top: 3px; right: 10px; margin: 0;
   font-size: 9px; padding: 0 3px;
 }

@@ -5,7 +5,6 @@
 #    make dev        本地构建（快速，用于开发）
 #    make test       跑全部单元测试
 #    make check      格式检查 + vet + 测试（提交前跑这个）
-#    make uitest     端到端 UI 验证（需要先 make run-local）
 #    make run-local  在临时目录以调试模式启动面板
 #    make release    产出可分发压缩包到 dist/release/
 #    make install    本机安装（等价于 sudo bash install.sh）
@@ -47,7 +46,7 @@ RELDIR  := $(DIST)/release
 ARCHS   ?= arm64 amd64
 LOCAL_PORT ?= 18443
 LOCAL_ROOT ?= /tmp/zizpanel-dev
-# 本地调试实例的安全后缀：固定值，方便 uitest 直接访问。
+# 本地调试实例的安全后缀：固定值，方便本地调试直接访问。
 # 真机安装时由 config.Bootstrap 随机生成（见 internal/config）。
 LOCAL_SUFFIX ?= dev
 SHOTS   ?= /tmp/zizpanel-shots
@@ -71,7 +70,7 @@ dev: ## 本地构建（当前架构）
 	fi; \
 	go build -ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" -o $(DIST)/zizpanel ./cmd/zizpanel; \
 	go build -ldflags "$(LDFLAGS)" -o $(DIST)/zizpanel-helper ./cmd/zizpanel-helper; \
-	@# -buildvcs=false：产物 sha256 不随 commit 漂（镜像上写死的校验值才稳定，坑 200）。
+	@# -buildvcs=false：产物 sha256 不随 commit 漂（镜像上写死的校验值才稳定）。
 	( cd zizvideo && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/zizvideo" ./cmd/server ); \
 	if [ -n "$$PUB" ]; then echo "已注入发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
 	else echo "未注入发布公钥（没有 $(RELEASE_KEY)）：网络升级会被拒绝，仅手动上传可用"; fi
@@ -161,15 +160,6 @@ check: ## 日常提交前检查（约 1 分钟；发版前再跑 check-full）
 	@$(MAKE) --no-print-directory vet
 	@echo "==> 单元测试"
 	@$(MAKE) --no-print-directory test
-	@# 独立软件是各自的 go module，不在面板这个 module 里，`./...` 扫不到 —— 单独跑，
-	@# 否则新代码等于没有门禁（gofmt 除外：仓库根的 `gofmt -l .` 已经覆盖它们）。
-	@echo "==> 独立软件模块自测（zizvideo）"
-	@for m in zizvideo; do \
-	   if [ -d "$$m" ]; then \
-	     echo "  -- $$m"; \
-	     ( cd "$$m" && go vet ./... && go test ./... -count=1 ) || exit 1; \
-	   fi; \
-	 done; echo "  独立模块自测 OK"
 	@# receiver.py 的 /jobs 是纯 Python，go test 覆盖不到。
 	@# 它又是「关掉网站也能跑完」的唯一保障，所以进 check 门禁。
 	@echo "==> 三档卸载脚本沙箱测试"
@@ -179,10 +169,21 @@ check: ## 日常提交前检查（约 1 分钟；发版前再跑 check-full）
 	@bash tools/check-stamp.sh write
 	@echo "常规检查通过 ✅（发版前请再跑一次 make check-full）"
 
+# 独立软件是各自的 go module，不在面板这个 module 里，`./...` 扫不到 —— 单独跑。
+# 约 14 秒，日常 check 不跑，放 check-full（2026-09-22 门禁提速）。
+.PHONY: test-modules
+test-modules: ## 独立软件模块自测（zizvideo）
+	@for m in zizvideo; do \
+	   if [ -d "$$m" ]; then \
+	     echo "  -- $$m"; \
+	     ( cd "$$m" && go vet ./... && go test ./... -count=1 ) || exit 1; \
+	   fi; \
+	 done; echo "  独立模块自测 OK"
+
 # 发版前才需要的重活（每次几分钟，日常提交不跑）：真起进程的安装端到端、
 # 依赖已发布 dist 包的远程安装、以及只与发版有关的发布说明检查。
 .PHONY: check-full
-check-full: check ## 发版前全量检查（check + 安装/远程安装端到端 + receiver /jobs + 发布说明）
+check-full: check test-modules ## 发版前全量检查（check + 独立模块 + 安装/远程安装端到端 + receiver /jobs + 发布说明）
 	@echo "==> receiver /jobs 测试"
 	@$(MAKE) --no-print-directory jobs-test
 	@echo "==> 安装脚本端到端测试（沙箱）"
@@ -213,9 +214,6 @@ server-mode-test: ## 服务器模式测试（SSH 开启路径、pmset 能力探�
 serve-install: ## 把本机变成安装源，供另一台 Mac 用一条 curl 命令安装
 	@bash tools/serve-for-install.sh
 
-.PHONY: ui-test
-ui-test: smoke ## 别名：启动本地实例并做 UI 验证
-
 # ------------------------------------------------------------- 本地试运行 --
 .PHONY: run-local
 run-local: dev ## 在临时目录以调试模式启动（端口 $(LOCAL_PORT)）
@@ -237,40 +235,6 @@ run-local: dev ## 在临时目录以调试模式启动（端口 $(LOCAL_PORT)）
 .PHONY: stop-local
 stop-local: ## 停止本地试运行实例
 	@pkill -f 'zizpanel serve --config $(LOCAL_ROOT)' 2>/dev/null && echo "已停止" || echo "没有运行中的实例"
-
-.PHONY: uitest
-uitest: ## 端到端 UI 验证（需要先 make run-local；特权步骤会显示为"跳过"）
-	ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS)
-
-# 真实面板口令放本机、**不进仓库**（.panel-credential.local 已在 .gitignore 里）。
-# 内容就一行：ZP_PASS=你的面板口令
-CRED_FILE ?= .panel-credential.local
-
-.PHONY: uitest-live
-uitest-live: ## 对本机真实安装实例跑完整 UI 验证（含建站等特权步骤，需要已安装）
-	@curl -fsSk --max-time 5 https://127.0.0.1:8443/api/v1/health >/dev/null \
-	  || { echo "本机 8443 没有运行中的面板，请先 sudo bash install.sh"; exit 1; }
-	@test -f $(CRED_FILE) || { \
-	  echo "缺少 $(CRED_FILE) —— 它存真实面板口令，不进仓库。"; \
-	  echo "创建方式："; \
-	  echo "    printf 'ZP_PASS=你的面板口令\\n' > $(CRED_FILE) && chmod 600 $(CRED_FILE)"; \
-	  exit 1; }
-	@echo "注意：会在这台真实面板上创建再删除测试站点 $(ZP_TEST_SITE)"
-	@# 真实实例带安全后缀，入口不是根路径 —— 从配置里读出来，别写死
-	@SUFFIX=$$(python3 -c "import json;print(json.load(open('/opt/zizpanel/data/config.json')).get('panel_suffix',''))" 2>/dev/null); \
-	 BASE="https://127.0.0.1:8443/$$SUFFIX/"; \
-	 set -a; . ./$(CRED_FILE); set +a; node tools/uitest.mjs "$$BASE" $(SHOTS)
-
-.PHONY: smoke
-smoke: run-local ## 启动本地实例并做 UI 验证（特权步骤跳过，用 uitest-live 补全）
-	@# ⚠️ 必须**无论成败都 stop-local**：以前写成 `smoke: run-local uitest`，
-	# uitest 一失败 make 就中断，调试实例被留在用户机器上（真机发生过，
-	# 遗留进程监听 127.0.0.1:18443 好几轮才被发现）。
-	@# ⚠️ **必须带 ZP_SKIP_PRIV=1**：本地实例不是 root，建站/nginx 校验这类要动
-	# 系统配置的步骤在这里必然失败（实测建站返回 500「sudo: a password is required」）。
-	# uitest 会给这些步骤打印"跳过"并把清单汇总出来 —— 那是**如实跳过**，不是假装通过；
-	# 完整的特权链路请对真实安装实例跑 `make uitest-live`。
-	@ZP_SKIP_PRIV=1 node tools/uitest.mjs http://127.0.0.1:$(LOCAL_PORT)/$(LOCAL_SUFFIX)/ $(SHOTS); rc=$$?; $(MAKE) --no-print-directory stop-local >/dev/null 2>&1 || true; exit $$rc
 
 # ---------------------------------------------------------------- 发布打包 --
 # install.sh 在目标机上会用到这些脚本（入口接管 / 服务器模式 / 自检工具）。

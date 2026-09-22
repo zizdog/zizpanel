@@ -100,7 +100,7 @@ export function renderInstalledApps(container, opts = {}) {
   //
   // 合并前的两个筛选是「异常」（前两项）与「仅健康检查失败」（第三项），
   // 而第三项本来就是「异常」判据的一部分 —— 所以合并**不会**漏掉任何原本能被
-  // 这两个筛选命中的卡片（appdetail-verify.mjs 里有一条按旧定义反推的断言锁着）。
+  // 这两个筛选命中的卡片。
   function problemOf(e) {
     const st = (e.svc && e.svc.state) || {};
     const health = (e.svc && e.svc.health) || {};
@@ -343,8 +343,7 @@ export function renderInstalledApps(container, opts = {}) {
       pills,
       text,
       extra: [...extra, ...authNote, ...noRecordNote],
-      // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，
-      // 是 make smoke 的"必须能点到管理/卸载"断言抓到的 —— 别删这一行）。
+      // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，别删这一行）。
       actions,
       // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
       warning: portAccessWarning(m, { svc: s }),

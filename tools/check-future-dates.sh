@@ -40,10 +40,6 @@ ALLOW_DATES=(
 
 # 夹具里的"真实未来"日期：证书到期时间必须晚于今天，且被对应脚本/测试断言。
 ALLOW_PATH_DATES=(
-  "tools/certs-verify.mjs:2026-09-20"          # created_at/updated_at 夹具
-  "tools/certs-verify.mjs:2026-10-01"          # not_after（脚本第 820 行断言"到期：2026-10-01"）
-  "tools/certs-verify.mjs:2026-11-18"          # not_after 夹具
-  "tools/certs-verify.mjs:2026-12-01"          # ssl_expires（脚本第 807 行断言 /2026-12-01/）
   "internal/proxies/proxies_ssl_test.go:2026-12-01"  # SSLExpires 往返断言（第 165/171 行）
 )
 

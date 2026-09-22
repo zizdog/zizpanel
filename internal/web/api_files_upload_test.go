@@ -787,8 +787,7 @@ func makeTestZip(t *testing.T, path string, files map[string]string) error {
 // ============================================================================
 //  ⑥ 同名文件：用户必须先被问"覆盖还是共存"（用户要求）
 //
-//  这条门禁锁的是**行为**（后端的两种策略与 overwritten 标记），前端的询问弹窗
-//  由 files_upload_frontend_test.go 里的静态断言 + uitest 覆盖。
+//  这条门禁锁的是**行为**（后端的两种策略与 overwritten 标记）。
 //  两条不变量：
 //    · 普通上传默认 **不覆盖**（改名保留两者）—— 静默覆盖是不可原谅的默认值；
 //    · 用户明确选 overwrite 时必须真的覆盖，并且如实回 overwritten=true。

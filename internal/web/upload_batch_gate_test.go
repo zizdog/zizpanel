@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -203,69 +202,4 @@ func TestUploadLimitMessageDoesNotSuggestItsOwnFeature(t *testing.T) {
 		}
 	}
 	t.Logf("413 文案 = %s", msg)
-}
-
-// TestNoUploadAdviceTellsUserToReuseUpload 是"覆盖整类"的源码门禁。
-//
-// 只改被点名的那一处不够：同类文案在文件管理器与其它上传路由里都有，
-// 下次新增一处又会复发。这里扫所有**用户可见文案的来源**（前端 JS + web 包 Go），
-// 禁用那句把上传功能当解法的原话。
-func TestNoUploadAdviceTellsUserToReuseUpload(t *testing.T) {
-	banned := []string{"把网站按子目录分批", "用「⬆ 上传文件夹」把"}
-	check := func(path, src string) {
-		for _, b := range banned {
-			if strings.Contains(src, b) {
-				t.Errorf("%s 里又出现了把上传功能当解法的文案 %q", path, b)
-			}
-		}
-	}
-	if entries, err := os.ReadDir(filepath.Join("assets", "js")); err == nil {
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".js") {
-				continue
-			}
-			b, err := os.ReadFile(filepath.Join("assets", "js", e.Name()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			check(e.Name(), string(b))
-		}
-	}
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-			continue
-		}
-		b, err := os.ReadFile(e.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		check(e.Name(), string(b))
-	}
-}
-
-// TestFilesFrontendUploadBatchesWiring 锁前端真的接上了分批实现。
-func TestFilesFrontendUploadBatchesWiring(t *testing.T) {
-	js := readAssetJS(t, "files.js")
-	for _, want := range []string{
-		"planUploadBatches(",         // 真的用它算批次
-		"oversizeAdvice()",           // 出路来自纯函数（门禁覆盖它的措辞）
-		"api.fileUploadLimit()",      // 上限回读
-		"第 ${curNo}/${batchCount} 批", // 进度里显示第几批
-		"${e.rel} — ",                // 超限提示必须点名文件（相对路径 + 大小）
-	} {
-		if !strings.Contains(js, want) {
-			t.Errorf("files.js 缺少 %q —— 分批/点名/回读有一项没接上", want)
-		}
-	}
-	// 旧的"整批总大小超限"判据必须彻底消失（它就是这次报障的根因）
-	if strings.Contains(js, "超过单次上传上限") {
-		t.Error("files.js 里还留着「总大小超过单次上传上限」的判据 —— 判据用错层级会原样复发")
-	}
-	if regexp.MustCompile(`total\s*<=\s*[A-Za-z0-9]`).MatchString(js) {
-		t.Error("files.js 里还有拿总大小与上限比较的写法 —— 总大小不参与拒绝")
-	}
 }

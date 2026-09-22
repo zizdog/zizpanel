@@ -58,7 +58,6 @@ func TestProductPathHasNoLANMirrorAddress(t *testing.T) {
 		"internal/sites/sites_test.go":                "站点反代地址的测试夹具",
 		"internal/store/store_test.go":                "存储层的测试夹具",
 		"cmd/zizpanel/http_test.go":                   "明文 HTTP 跳转的测试夹具（Host 头示例）",
-		"tools/uitest.mjs":                            "端到端 UI 验证夹具（「免授权网段」输入框的 CIDR 示例）",
 		"tools/sandbox-install-test.sh":               "安装脚本沙箱测试夹具（SSH_CONNECTION 与免授权网段样例，不碰真机）",
 	}
 

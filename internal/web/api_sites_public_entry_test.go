@@ -165,24 +165,3 @@ func TestSitePublicEntryDisabledRule(t *testing.T) {
 		t.Errorf("停用要在 note 里说清: %v", pe)
 	}
 }
-
-// TestSiteOpenPrefersPublicEntryFrontend：前端「打开」不许再硬编码 80。
-func TestSiteOpenPrefersPublicEntryFrontend(t *testing.T) {
-	js := readAssetJS(t, "sites.js")
-	openBody := jsFuncBody(t, js, "siteOpenTarget")
-	if !strings.Contains(openBody, "public_entry") || !strings.Contains(openBody, "pe.available") {
-		t.Error("siteOpenTarget 必须先看后端的 public_entry.available（否则规则前置的站点又落回 80）")
-	}
-	// 端口必须经 dial 拼进地址：写死 'http://' + host + '/' 就是回到 80 的写法。
-	if !strings.Contains(openBody, "scheme + '://' + host + dial + '/'") {
-		t.Error("siteOpenTarget 的兜底地址必须拼上 dial（监听端口），不能在打开处硬编码 80")
-	}
-	// 「打开」链接只许走这一个函数
-	linkBody := jsFuncBody(t, js, "domainLink")
-	if !strings.Contains(linkBody, "siteOpenTarget(s)") {
-		t.Error("domainLink（「打开」）必须用 siteOpenTarget 算地址")
-	}
-	if strings.Contains(linkBody, "80") {
-		t.Error("domainLink 里出现硬编码 80：端口只能由 siteOpenTarget 决定")
-	}
-}

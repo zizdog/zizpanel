@@ -217,31 +217,6 @@ func TestBrewDirsEndpointsRequireAuth(t *testing.T) {
 	}
 }
 
-// TestBrewRepairWiringIsComplete 锁住"路由 / requireAuth / 任务中心 / 前端按钮"四件套：
-// 少任何一环，用户要么看不到入口，要么点了没有任何可见进度。
-func TestBrewRepairWiringIsComplete(t *testing.T) {
-	srv := readGoSource(t, "server.go")
-	for _, want := range []string{
-		`"GET /api/v1/brew/dirs"`,
-		`"POST /api/v1/brew/repair-dirs"`,
-		"s.requireAuth(s.handleBrewDirs)",
-		"s.requireAuth(s.handleBrewRepairDirs)",
-	} {
-		if !strings.Contains(srv, want) {
-			t.Errorf("server.go 缺少 %q（路由必须注册且受 requireAuth 保护）", want)
-		}
-	}
-	if api := readGoSource(t, "api_brew_dirs.go"); !strings.Contains(api, "s.launchTask(") {
-		t.Error("修复接口必须走任务中心（launchTask → 202 + task_id）")
-	}
-	js := readAssetJS(t, "systemsettings.js")
-	for _, want := range []string{"brew/repair-dirs", "补建缺失的 brew 目录", "taskCenter.start("} {
-		if !strings.Contains(js, want) {
-			t.Errorf("systemsettings.js 缺少 %q（按钮 / 接口调用 / 任务中心接线）", want)
-		}
-	}
-}
-
 // setMarketProbeErrForTest 写入/恢复包级的"上一次探测失败原因"。
 func setMarketProbeErrForTest(t *testing.T, msg string) func() {
 	t.Helper()

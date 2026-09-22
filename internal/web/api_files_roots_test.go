@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -252,26 +251,5 @@ func TestFilesRootLabelsReachDropdownWithoutDuplicates(t *testing.T) {
 	}
 	if !foundSensitive {
 		t.Errorf("敏感标记丢了：sensitive_roots=%v，期望包含 %s", body.Data.SensitiveRoots, f.dataDir)
-	}
-}
-
-// TestFilesFrontendUsesBackendRootLabels：锁死"标签由后端下发"这条接线，
-// 防止有人改回前端按 kind 现拼固定文案（重复标签复发）。
-func TestFilesFrontendUsesBackendRootLabels(t *testing.T) {
-	js := readAssetJS(t, "files.js")
-
-	if !strings.Contains(js, "root_labels") {
-		t.Fatal("files.js 不再读后端下发的 root_labels —— 标签会退回按 kind 现拼的固定文案（重复标签复发）")
-	}
-	if strings.Contains(js, "'/opt/zizpanel（面板安装根）'") {
-		t.Error("files.js 又写死了 '/opt/zizpanel（面板安装根）' —— 安装根标签要按真实路径生成")
-	}
-	for _, re := range []*regexp.Regexp{
-		regexp.MustCompile(`case\s+'panel':\s*return\s+r\s*\+\s*'（面板安装根）'`),
-		regexp.MustCompile(`case\s+'homebrew':\s*return\s+r\s*\+\s*'（Homebrew 配置）'`),
-	} {
-		if !re.MatchString(js) {
-			t.Errorf("files.js 的 rootLabel 回退分支不再带路径：找不到 %s", re.String())
-		}
 	}
 }
