@@ -4,9 +4,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/zizdog/zizvideo/internal/domain"
 )
+
+// batchSize 是导入/登记的分块大小：每块一个事务，避免逐行 autocommit 的 fsync
+// 把两万文件的导入拖成分钟级。
+const batchSize = 500
 
 const mediaCols = `id, library_id, path, title, size, mtime_ns, container,
 	video_codec, audio_codec, width, height, duration_ms, bitrate, fps,
@@ -216,6 +221,87 @@ func (db *DB) ListMedia(scope domain.LibraryScope, f MediaFilter) ([]domain.Medi
 }
 
 // FeedNext 已被 storage/feed.go 的 seed+hash 随机游标取代（默认随机播放）。
+
+// MediaIDsByPaths maps normalized_path -> id for one library（分块 IN 查询：
+// 5000 文件的预览不能变成 5000 次 SELECT）。
+func (db *DB) MediaIDsByPaths(libraryID string, paths []string) (map[string]string, error) {
+	out := map[string]string{}
+	for start := 0; start < len(paths); start += batchSize {
+		end := start + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, libraryID)
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		q := `SELECT normalized_path, id FROM media WHERE library_id = ? AND deleted_at IS NULL
+			AND normalized_path IN (?` + strings.Repeat(",?", len(chunk)-1) + `)`
+		rows, err := db.Query(q, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p, id string
+			if err := rows.Scan(&p, &id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[p] = id
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// InsertMediaBatch 登记未探测的媒体记录（upload/按目录导入共用）：status=pending、
+// mtime_ns 留 0，这样下次库扫描的 size+mtime 跳过判据不会命中，会补探测。
+// 用 INSERT OR IGNORE 容忍并发重复；调用方插入后回读 id 拿权威值。
+func (db *DB) InsertMediaBatch(rows []*domain.Media) (int, error) {
+	inserted := 0
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return inserted, err
+		}
+		stmt, err := tx.Prepare(`INSERT OR IGNORE INTO media (id, library_id, path, normalized_path,
+			title, size, mtime_ns, container, video_codec, audio_codec, width, height, duration_ms,
+			bitrate, fps, status, error_class, error_message, probe_attempts, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,0,'','','',0,0,0,0,0,?, '', '',0,?,?)`)
+		if err != nil {
+			_ = tx.Rollback()
+			return inserted, err
+		}
+		now := domain.NowString()
+		for _, m := range rows[start:end] {
+			res, eerr := stmt.Exec(m.ID, m.LibraryID, m.Path, m.Path, m.Title, m.Size,
+				domain.MediaPending, now, now)
+			if eerr != nil {
+				stmt.Close()
+				_ = tx.Rollback()
+				return inserted, eerr
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				inserted += int(n)
+			}
+		}
+		stmt.Close()
+		if err := tx.Commit(); err != nil {
+			return inserted, err
+		}
+	}
+	return inserted, nil
+}
 
 // MediaState is the cheap per-file fingerprint used to skip unchanged files.
 type MediaState struct {

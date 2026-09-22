@@ -169,6 +169,32 @@ func TestScanIgnoresJunkAndFilteredExtensions(t *testing.T) {
 	}
 }
 
+// 门禁：导入/上传登记的 pending 行（mtime_ns=0）必须在下次扫描补探测转 ready，
+// 否则它们永远进不了 feed（feed 只吃 ready）。这是 upload/import 与扫描器的接口。
+func TestScanProbesImportedPendingRows(t *testing.T) {
+	env := newScanEnv(t)
+	env.write(t, "a.mp4", "a")
+	p := filepath.Join(env.root, "a.mp4")
+	if _, err := env.db.InsertMediaBatch([]*domain.Media{{
+		ID: domain.NewID("med"), LibraryID: env.lib.ID, Path: p, Title: "a", Size: 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZV_TEST_ARZV_LOG", env.argv)
+	env.run(t)
+
+	rows := env.media(t)
+	if len(rows) != 1 {
+		t.Fatalf("应只有一条记录（按路径复用，不重复登记），实际 %d 条", len(rows))
+	}
+	if rows[0].Status != domain.MediaReady {
+		t.Fatalf("导入登记的 pending 行必须在扫描时补探测转 ready，实际状态 = %s", rows[0].Status)
+	}
+	if countLines(t, env.argv) == 0 {
+		t.Fatal("扫描没有对 pending 行调用 ffprobe")
+	}
+}
+
 func TestScanSkipsUnchangedFilesBySizeAndMtime(t *testing.T) {
 	env := newScanEnv(t)
 	env.write(t, "a.mp4", "a")

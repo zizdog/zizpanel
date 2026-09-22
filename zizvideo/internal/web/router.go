@@ -82,6 +82,15 @@ func Router(s *api.Server) http.Handler {
 	// P2：批量一键识别（confirm 两段式）+ 跨库任务进度（job_tasks，迁移 0008）。
 	mux.HandleFunc("POST /api/v1/admin/series/detect-all", s.RequireAdmin(s.HandleDetectAll))
 	mux.HandleFunc("GET /api/v1/admin/tasks/{id}", s.RequireAdmin(s.HandleGetJobTask))
+	// P4：按目录建剧场。A=剧场内导入一个目录；B=按一级子目录批量建剧场（走任务中心）。
+	mux.HandleFunc("POST /api/v1/admin/series/{id}/import-dir/preview", s.RequireAdmin(s.HandlePreviewSeriesDirImport))
+	mux.HandleFunc("POST /api/v1/admin/series/{id}/import-dir", s.RequireAdmin(s.HandleSeriesDirImport))
+	mux.HandleFunc("POST /api/v1/admin/series/import-dirs/preview", s.RequireAdmin(s.HandlePreviewSeriesDirs))
+	mux.HandleFunc("POST /api/v1/admin/series/import-dirs", s.RequireAdmin(s.HandleSeriesDirsImport))
+	// P5：上传（start / PUT 流式 / finish）。PUT 单独放开读超时（见 handlers_uploads.go）。
+	mux.HandleFunc("POST /api/v1/admin/uploads/start", s.RequireAdmin(s.HandleUploadStart))
+	mux.HandleFunc("PUT /api/v1/admin/uploads/{id}/{index}", s.RequireAdmin(s.HandleUploadPut))
+	mux.HandleFunc("POST /api/v1/admin/uploads/{id}/finish", s.RequireAdmin(s.HandleUploadFinish))
 
 	mux.HandleFunc("GET /api/v1/admin/system/info", s.RequireAdmin(s.HandleSystemInfo))
 	mux.HandleFunc("GET /api/v1/admin/audit", s.RequireAdmin(s.HandleAuditList))

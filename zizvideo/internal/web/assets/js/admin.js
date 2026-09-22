@@ -3,6 +3,7 @@
 import { api } from "./api.js";
 import { el, clear, banner, setBanner, field, input, fmtDuration, fmtBytes, fmtDate, asArray } from "./dom.js";
 import { openDirectoryPicker } from "./roots.js";
+import { uploadToLibrary } from "./uploads.js";
 
 function button(label, onclick, extraClass) {
   return el("button", {
@@ -216,6 +217,7 @@ function mountLibraries(root) {
   function libraryRow(library) {
     const line = el("div", { class: "scan-line" });
     const actions = el("div", { class: "actions" },
+      button("上传", () => uploadToLibrary(refresh, library.id)),
       button("扫描", () => startScan(library, line)),
       button("编辑", () => { setEditing(library); nameInput.focus(); }),
       button("删除", async () => {
@@ -283,7 +285,8 @@ function mountLibraries(root) {
       await loadBackfill();
     }
   });
-  root.append(form, defaultHint, el("div", { class: "row" }, backfill, backfillInfo), table);
+  const uploadTop = button("上传视频", () => uploadToLibrary(refresh));
+  root.append(form, defaultHint, el("div", { class: "row" }, uploadTop, backfill, backfillInfo), table);
   loadRoots().then(refresh);
 
   return () => {

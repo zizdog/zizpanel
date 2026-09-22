@@ -4,6 +4,8 @@
 import { api } from "./api.js";
 import { el, clear, banner, setBanner, field, input, fmtDuration } from "./dom.js";
 import { confirmDialog } from "./confirm.js";
+import { importDirIntoSeries } from "./series-import.js";
+import { uploadToSeries } from "./uploads.js";
 
 export function mountSeriesAdmin(box, series, options) {
   const opts = options || {};
@@ -25,6 +27,23 @@ export function mountSeriesAdmin(box, series, options) {
     el("div", { class: "row" }, searchInput, searchBtn),
     results, el("div", { class: "actions" }, addBtn));
 
+  // 主路径：选一个目录，只处理这个目录，按文件名排好集号（不扫全库、不搜全库）。
+  const dirImportBtn = el("button", {
+    class: "btn primary", type: "button", text: "从目录导入剧集", dataset: { role: "series-dir-import" },
+  });
+  const dirUploadBtn = el("button", {
+    class: "btn", type: "button", text: "上传到本剧场", dataset: { role: "series-upload" },
+  });
+  const dirPanel = el("div", { class: "panel" },
+    el("div", { class: "muted small-note", text: "选一个目录，只处理这个目录，按文件名排集号" }),
+    el("div", { class: "actions" }, dirImportBtn, dirUploadBtn));
+  dirImportBtn.addEventListener("click", () => {
+    importDirIntoSeries(series, async () => { await load(); if (opts.onChanged) opts.onChanged(); });
+  });
+  dirUploadBtn.addEventListener("click", () => {
+    uploadToSeries(series, async () => { await load(); if (opts.onChanged) opts.onChanged(); });
+  });
+
   const episodes = el("div", { class: "ep-admin-list", dataset: { role: "series-episodes" } });
   const epOrderNote = el("div", { class: "muted small-note", hidden: true, dataset: { role: "episode-order-note" } });
   const epPanel = el("div", { class: "panel" },
@@ -40,7 +59,7 @@ export function mountSeriesAdmin(box, series, options) {
     el("div", { class: "muted small-note", text: "按文件名识别，识别不到的不猜；手动排过的不会被覆盖。" }),
     detectBox);
   const delBtn = el("button", { class: "btn danger", type: "button", text: "删除剧场", dataset: { role: "series-delete" } });
-  box.append(editForm, picker, detectPanel, epPanel, el("div", { class: "actions" }, delBtn));
+  box.append(editForm, dirPanel, picker, detectPanel, epPanel, el("div", { class: "actions" }, delBtn));
 
   let ids = [];
   const mediaByID = {};

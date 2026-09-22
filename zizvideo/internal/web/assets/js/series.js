@@ -6,6 +6,8 @@ import { el, clear, banner, setBanner, field, fmtDuration, asArray } from "./dom
 import { session } from "./auth.js";
 import { confirmDialog } from "./confirm.js";
 import { mountSeriesAdmin } from "./series-admin.js";
+import { importDirIntoSeries, batchImportSeries } from "./series-import.js";
+import { uploadToSeries, uploadNewSeries } from "./uploads.js";
 
 const PROGRESS_EVERY_MS = 5000;
 const COMPLETE_TAIL_MS = 1500;
@@ -26,6 +28,14 @@ export function mountSeries(view) {
     field("标题", titleInput), field("简介", descInput), el("div", { class: "actions" }, submit));
   const head = el("div", { class: "page-head" }, el("h2", { class: "page-title", text: "剧场" }));
   if (isAdmin()) {
+    head.append(el("button", {
+      class: "btn small", type: "button", text: "新建剧场并上传", dataset: { role: "series-upload-new" },
+      onclick: () => uploadNewSeries(load),
+    }));
+    head.append(el("button", {
+      class: "btn small", type: "button", text: "按子目录批量建剧场", dataset: { role: "series-dirs-import" },
+      onclick: () => batchImportSeries(load),
+    }));
     head.append(el("button", {
       class: "btn small", type: "button", text: "一键识别全部", dataset: { role: "series-detect-all" },
       onclick: (event) => runDetectAll(event.currentTarget),
@@ -252,11 +262,30 @@ export function mountSeriesPlay(view, seriesID) {
       })
     : null;
 
+  const importBtn = isAdmin()
+    ? el("button", {
+        class: "btn small", type: "button", text: "从目录导入剧集", dataset: { role: "series-dir-import-play" },
+        onclick: () => {
+          if (!state.series) { showToast("还在加载，请稍候"); return; }
+          importDirIntoSeries(state.series, () => loadSeries());
+        },
+      })
+    : null;
+  const uploadBtn = isAdmin()
+    ? el("button", {
+        class: "btn small", type: "button", text: "上传到本剧场", dataset: { role: "series-upload-play" },
+        onclick: () => {
+          if (!state.series) { showToast("还在加载，请稍候"); return; }
+          uploadToSeries(state.series, () => loadSeries());
+        },
+      })
+    : null;
+
   const playBox = el("div", { class: "series-play" },
     el("div", { class: "sp-stage" }, video),
     el("div", { class: "sp-top" },
       el("a", { class: "btn small", href: "#/series", text: "← 剧场", dataset: { role: "back-to-series" } }),
-      titleEl, manageBtn, countEl, orderNote),
+      titleEl, manageBtn, importBtn, uploadBtn, countEl, orderNote),
     center, centerBtn,
     el("div", { class: "sp-bottom" },
       el("div", { class: "row sp-controls" }, prev, epSelect, next, listToggle, sound),
@@ -267,7 +296,7 @@ export function mountSeriesPlay(view, seriesID) {
   const guideBox = el("div", { class: "series-guide", hidden: true, dataset: { role: "series-empty-guide" } });
   view.append(playBox, guideBox);
 
-  const STEP_LABELS = { scan: "扫描", detect: "识别", add_existing: "加入已有媒体" };
+  const STEP_LABELS = { import_dir: "从目录导入", upload: "上传", batch: "批量建" };
 
   function renderGuide(guide) {
     const data = guide || {};
@@ -276,7 +305,7 @@ export function mountSeriesPlay(view, seriesID) {
     const steps = asArray(data.steps);
     const card = el("div", { class: "panel guide-box" },
       el("div", { class: "panel-title", text: data.title || "这个剧场还没有剧集" }),
-      el("div", { class: "muted small-note", text: data.where || "文件放在某个允许根目录下的子文件夹里" }),
+      el("div", { class: "muted small-note", text: data.where || "文件放在某个媒体库目录的子文件夹里" }),
       usable.length
         ? el("div", { class: "muted small-note", text: "可用允许根：" + usable.join("、") })
         : el("div", { class: "row" },
@@ -289,11 +318,21 @@ export function mountSeriesPlay(view, seriesID) {
         el("span", { class: "ep-title", text: step.text || "" }))),
       el("div", { class: "actions" },
         isAdmin() ? el("button", {
-          class: "btn primary", type: "button", text: "管理这个剧场（加入已有媒体）",
+          class: "btn primary", type: "button", text: "从目录导入剧集",
+          dataset: { role: "series-dir-import-empty" },
+          onclick: () => { if (state.series) importDirIntoSeries(state.series, () => loadSeries()); },
+        }) : null,
+        isAdmin() ? el("button", {
+          class: "btn", type: "button", text: "上传到本剧场",
+          dataset: { role: "series-upload-empty" },
+          onclick: () => { if (state.series) uploadToSeries(state.series, () => loadSeries()); },
+        }) : null,
+        isAdmin() ? el("button", {
+          class: "btn small", type: "button", text: "管理这个剧场",
           dataset: { role: "series-manage-empty" },
           onclick: () => { if (state.series) openDrawer(state.series, () => loadSeries()); },
         }) : null,
-        isAdmin() ? el("a", { class: "btn small", href: "#/admin/libraries", text: "去后台建库扫描" }) : null,
+        isAdmin() ? el("a", { class: "btn small", href: "#/admin/libraries", text: "去后台建库" }) : null,
         el("a", { class: "btn small", href: "#/series", text: "← 返回剧场列表" })));
     clear(guideBox);
     guideBox.append(card);

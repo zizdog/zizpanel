@@ -49,7 +49,7 @@ func TestEmptySeriesReturnsNextStepGuide(t *testing.T) {
 	for _, step := range body.Guide.Steps {
 		keys[step.Key] = true
 	}
-	for _, want := range []string{"scan", "add_existing"} {
+	for _, want := range []string{"import_dir", "batch"} {
 		if !keys[want] {
 			t.Fatalf("缺少后续路径 %q: %+v", want, body.Guide.Steps)
 		}

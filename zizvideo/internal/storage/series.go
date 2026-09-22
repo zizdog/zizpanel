@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"errors"
+	"strings"
 
 	"github.com/zizdog/zizvideo/internal/domain"
 )
@@ -20,18 +21,73 @@ const coverLibExpr = `COALESCE((SELECT mc.library_id FROM media mc WHERE mc.id =
 
 // seriesCols 里的封面回落到第一集；剧场只引用 media，永远不碰磁盘文件。
 const seriesCols = `s.id, s.title, s.description, ` + coverExpr + `, ` + coverLibExpr + `,
-	COALESCE(s.library_id,''), s.sort_order, s.created_at, s.updated_at,
+	COALESCE(s.library_id,''), COALESCE(s.dir_path,''), s.sort_order, s.created_at, s.updated_at,
 	(SELECT COUNT(1) FROM series_media sm JOIN media m3 ON m3.id = sm.media_id
 		WHERE sm.series_id = s.id AND m3.deleted_at IS NULL)`
 
 func scanSeries(s interface{ Scan(...any) error }) (*domain.Series, error) {
 	var out domain.Series
 	if err := s.Scan(&out.ID, &out.Title, &out.Description, &out.CoverMediaID,
-		&out.CoverLibraryID, &out.LibraryID, &out.SortOrder, &out.CreatedAt, &out.UpdatedAt,
-		&out.EpisodeCount); err != nil {
+		&out.CoverLibraryID, &out.LibraryID, &out.DirPath, &out.SortOrder,
+		&out.CreatedAt, &out.UpdatedAt, &out.EpisodeCount); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// SeriesRef is one (series, title) membership of a media row.
+type SeriesRef struct {
+	ID    string
+	Title string
+}
+
+// SeriesRefsByMedia maps media_id -> the live 剧场 that contain it（分块查询）。
+// 导入预览用它回答"已在剧场?"与"已是别的剧场的集?"。
+func (db *DB) SeriesRefsByMedia(mediaIDs []string) (map[string][]SeriesRef, error) {
+	out := map[string][]SeriesRef{}
+	for start := 0; start < len(mediaIDs); start += batchSize {
+		end := start + batchSize
+		if end > len(mediaIDs) {
+			end = len(mediaIDs)
+		}
+		chunk := mediaIDs[start:end]
+		args := make([]any, 0, len(chunk))
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		rows, err := db.Query(`SELECT sm.media_id, s.id, s.title FROM series_media sm
+			JOIN series s ON s.id = sm.series_id AND s.deleted_at IS NULL
+			WHERE sm.media_id IN (?`+strings.Repeat(",?", len(chunk)-1)+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var mediaID string
+			var ref SeriesRef
+			if err := rows.Scan(&mediaID, &ref.ID, &ref.Title); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[mediaID] = append(out[mediaID], ref)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// SeriesByTitle returns the oldest live 剧场 with an exact title, or nil.
+func (db *DB) SeriesByTitle(title string) (*domain.Series, error) {
+	row := db.QueryRow(`SELECT `+seriesCols+` FROM series s
+		WHERE s.deleted_at IS NULL AND s.title = ? ORDER BY s.created_at ASC, s.id ASC LIMIT 1`, title)
+	out, err := scanSeries(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return out, err
 }
 
 // CreateSeries inserts a 剧场 row.
@@ -39,10 +95,17 @@ func (db *DB) CreateSeries(s *domain.Series) error {
 	now := domain.NowString()
 	s.CreatedAt, s.UpdatedAt = now, now
 	_, err := db.Exec(`INSERT INTO series
-		(id, title, description, cover_media_id, library_id, sort_order, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?)`,
+		(id, title, description, cover_media_id, library_id, dir_path, sort_order, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.Title, s.Description, nullStr(s.CoverMediaID), nullStr(s.LibraryID),
-		s.SortOrder, now, now)
+		s.DirPath, s.SortOrder, now, now)
+	return err
+}
+
+// SetSeriesDir persists the upload landing directory once and for all.
+func (db *DB) SetSeriesDir(id, dir string) error {
+	_, err := db.Exec(`UPDATE series SET dir_path = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		dir, domain.NowString(), id)
 	return err
 }
 

@@ -135,6 +135,46 @@ func TestFeedPageScopeFiltersLibrary(t *testing.T) {
 	}
 }
 
+// 门禁（用户 2026-09-22 明确）：普通视频 feed 的范围与顺序不受剧场影响 ——
+// 加入剧场的某一集仍在本轮里，且 (scope, seed) 的顺序一字不变。
+func TestFeedOrderIgnoresSeriesMembership(t *testing.T) {
+	db := openFeedDB(t)
+	lib := newLib("lib_f", "F", "/tmp/f")
+	if err := db.CreateLibrary(lib); err != nil {
+		t.Fatal(err)
+	}
+	want := seedFeedMedia(t, db, lib.ID, 5)
+
+	before := collectFeed(t, db, domain.LibraryScope{All: true}, "seed-fixed", 2)
+	if len(before) != len(want) {
+		t.Fatalf("加入剧场前一轮覆盖 %d 条, 期望 %d", len(before), len(want))
+	}
+
+	series := &domain.Series{ID: domain.NewID("ser"), Title: "剧场"}
+	if err := db.CreateSeries(series); err != nil {
+		t.Fatal(err)
+	}
+	inSeries := before[0]
+	if _, err := db.AddSeriesMedia(series.ID, []SeriesMediaInput{{MediaID: inSeries}}); err != nil {
+		t.Fatal(err)
+	}
+
+	after := collectFeed(t, db, domain.LibraryScope{All: true}, "seed-fixed", 2)
+	if len(after) != len(want) {
+		t.Fatalf("加入剧场后一轮覆盖 %d 条, 期望 %d（剧集不许被 feed 排除）", len(after), len(want))
+	}
+	seen := map[string]bool{}
+	for i, id := range after {
+		seen[id] = true
+		if id != before[i] {
+			t.Fatalf("剧场成员改变了 feed 的种子随机顺序: before=%v after=%v", before, after)
+		}
+	}
+	if !seen[inSeries] {
+		t.Fatalf("已加入剧场的那一集 %s 必须仍在 feed 的 id 集合里", inSeries)
+	}
+}
+
 // 门禁：seed / 游标 / 已播计数 / 播放设置按用户持久化，scope 各一轮。
 func TestFeedStateAndPrefsPersist(t *testing.T) {
 	db := openFeedDB(t)

@@ -188,9 +188,14 @@ func TestMigration0006FailClosed(t *testing.T) {
 		t.Fatalf("从 0005 升级失败: %v", err)
 	}
 	defer db.Close()
-	// 0006（库授权）+ 0007（默认可见库/source）+ 0008（跨库任务）+ 0009（自动扫描）都跑完，版本是 9。
-	if v, _ := db.SchemaVersion(); v != 9 {
-		t.Fatalf("schema 版本 = %d, 期望 9", v)
+	// 从 0005 升级后必须把剩下的迁移全部跑完：期望值直接取内嵌迁移的最高版本，
+	// 以后加迁移不用再改这个数字。
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.SchemaVersion(); v != migs[len(migs)-1].version {
+		t.Fatalf("schema 版本 = %d, 期望 %d（全部迁移跑完）", v, migs[len(migs)-1].version)
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='user_libraries'`).

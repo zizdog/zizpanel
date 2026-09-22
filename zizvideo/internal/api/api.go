@@ -38,6 +38,9 @@ type Server struct {
 	// Auto 负责定时/事件驱动的增量扫描；StartAutoScan 之前不运行。
 	Auto *autoscan.Scheduler
 
+	// Uploads 是三步上传的进程内会话（start/PUT/finish）。
+	Uploads *uploadStore
+
 	StartedAt time.Time
 
 	mu   sync.RWMutex
@@ -49,7 +52,7 @@ type Server struct {
 func NewServer(cfg *config.Config, db *storage.DB, a *auth.Manager, t *task.Manager,
 	roots *config.Roots, r ffmpeg.Runner, log *slog.Logger) *Server {
 	s := &Server{Cfg: cfg, DB: db, Auth: a, Tasks: t, Roots: roots, Runner: r, Log: log,
-		StartedAt: time.Now()}
+		Uploads: newUploadStore(), StartedAt: time.Now()}
 	// 扫描成功结束后自动补齐识别（不改变 task.Manager 对 api 的依赖方向）。
 	if t != nil {
 		t.SetAfterScan(s.OnScanFinished)

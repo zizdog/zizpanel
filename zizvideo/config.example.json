@@ -12,6 +12,7 @@
   "scan_retry_backoff_ms": [1000, 4000, 16000],
   "probe_timeout_seconds": 30,
   "cover_jpeg_quality": 3,
+  "upload_max_file_mb": 8192,
   "ffmpeg_bin": "/opt/homebrew/bin/ffmpeg",
   "ffprobe_bin": "/opt/homebrew/bin/ffprobe",
   "log_level": "info",

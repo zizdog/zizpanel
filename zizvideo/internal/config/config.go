@@ -34,6 +34,8 @@ type Config struct {
 	LockoutThreshold   int      `json:"lockout_threshold"`
 	LockoutWindowMin   int      `json:"lockout_window_minutes"`
 	SecureCookie       bool     `json:"secure_cookie"`
+	// UploadMaxFileMB 是单个上传文件的上限（MB）；超过就人话拒绝，不截断。
+	UploadMaxFileMB int `json:"upload_max_file_mb"`
 	// AllowRegister 默认关：关闭时唯一公开注册入口 POST /auth/register 直接拒绝。
 	AllowRegister bool `json:"allow_register"`
 }
@@ -61,6 +63,7 @@ func Default() *Config {
 		SessionTTLHours:    336,
 		LockoutThreshold:   5,
 		LockoutWindowMin:   15,
+		UploadMaxFileMB:    8192,
 		AllowRegister:      false,
 	}
 }
@@ -115,6 +118,7 @@ func applyEnv(c *Config) {
 	setInt(&c.ProbeTimeoutSec, "ZV_PROBE_TIMEOUT_SECONDS")
 	setInt(&c.LockoutThreshold, "ZV_LOCKOUT_THRESHOLD")
 	setInt(&c.SessionTTLHours, "ZV_SESSION_TTL_HOURS")
+	setInt(&c.UploadMaxFileMB, "ZV_UPLOAD_MAX_FILE_MB")
 	setBool(&c.SecureCookie, "ZV_SECURE_COOKIE")
 	setBool(&c.AllowRegister, "ZV_ALLOW_REGISTER")
 	if v := os.Getenv("ZV_MEDIA_ALLOW_ROOTS"); v != "" {
@@ -190,6 +194,9 @@ func (c *Config) Validate() error {
 	if c.ProbeTimeoutSec <= 0 {
 		return fmt.Errorf("probe_timeout_seconds 必须为正")
 	}
+	if c.UploadMaxFileMB <= 0 {
+		return fmt.Errorf("upload_max_file_mb 必须为正")
+	}
 	if c.CoverQuality < 2 || c.CoverQuality > 31 {
 		return fmt.Errorf("cover_jpeg_quality 必须在 2-31 之间")
 	}
@@ -205,6 +212,9 @@ func (c *Config) Validate() error {
 func (c *Config) ProbeTimeout() time.Duration {
 	return time.Duration(c.ProbeTimeoutSec) * time.Second
 }
+
+// UploadMaxBytes is the per-file upload cap in bytes.
+func (c *Config) UploadMaxBytes() int64 { return int64(c.UploadMaxFileMB) << 20 }
 
 // SessionTTL returns the session lifetime.
 func (c *Config) SessionTTL() time.Duration {

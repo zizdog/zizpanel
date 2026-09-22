@@ -21,6 +21,9 @@ function readCookie(name) {
   return "";
 }
 
+// csrfToken 给 XHR 上传用（fetch 封装走不到那一步）。
+export function csrfToken() { return readCookie(CSRF_COOKIE); }
+
 function queryString(params) {
   if (!params) return "";
   const parts = [];
@@ -112,6 +115,16 @@ export const api = {
   scanTask: (id) => request("GET", "/api/v1/scan-tasks/" + encodeURIComponent(id)),
   detectAll: (body) => request("POST", "/api/v1/admin/series/detect-all", body),
   jobTask: (id) => request("GET", "/api/v1/admin/tasks/" + encodeURIComponent(id)),
+  // 按目录建剧场：A=剧场内导入一个目录，B=按一级子目录批量建。
+  seriesDirPreview: (id, body) =>
+    request("POST", "/api/v1/admin/series/" + encodeURIComponent(id) + "/import-dir/preview", body),
+  seriesDirImport: (id, body) =>
+    request("POST", "/api/v1/admin/series/" + encodeURIComponent(id) + "/import-dir", body),
+  seriesDirsPreview: (body) => request("POST", "/api/v1/admin/series/import-dirs/preview", body),
+  seriesDirsImport: (body) => request("POST", "/api/v1/admin/series/import-dirs", body),
+  // 上传三步：start → PUT（XHR，见 uploads.js） → finish。
+  uploadStart: (body) => request("POST", "/api/v1/admin/uploads/start", body),
+  uploadFinish: (id) => request("POST", "/api/v1/admin/uploads/" + encodeURIComponent(id) + "/finish", {}),
 
   mediaList: (params) => envelope("GET", "/api/v1/media" + queryString(params), undefined, false),
   media: (id) => request("GET", "/api/v1/media/" + encodeURIComponent(id)),

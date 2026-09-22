@@ -100,10 +100,12 @@ type Series struct {
 	// CoverLibraryID 只用于判据：封面可能属于另一个库（S4），不外发。
 	CoverLibraryID string `json:"-"`
 	LibraryID      string `json:"library_id,omitempty"`
-	SortOrder      int    `json:"sort_order"`
-	EpisodeCount   int    `json:"episode_count"`
-	CreatedAt      string `json:"created_at"`
-	UpdatedAt      string `json:"updated_at"`
+	// DirPath 是上传落点（迁移 0010）；空 = 未定，按标题在库根下推导。
+	DirPath      string `json:"dir_path,omitempty"`
+	SortOrder    int    `json:"sort_order"`
+	EpisodeCount int    `json:"episode_count"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // episode_source values for series_media (补丁 R1).
@@ -146,9 +148,11 @@ type ScanTask struct {
 // Job kinds and triggers for the cross-library job_tasks table (0008).
 const (
 	JobKindEpisodeDetect = "episode_detect"
+	JobKindSeriesImport  = "series_import"
 
 	JobTriggerManualBatch  = "manual_batch"
 	JobTriggerScanFinished = "scan_finished"
+	JobTriggerDirBatch     = "dir_batch"
 )
 
 // JobTask is a persisted cross-library background job (一键识别 / 扫描后自动识别）。

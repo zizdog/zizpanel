@@ -139,15 +139,15 @@ func (s *Server) seriesGuide() seriesGuide {
 	}
 	return seriesGuide{
 		Title:       "这个剧场还没有剧集",
-		Where:       "文件放在某个允许根目录下的子文件夹里",
+		Where:       "文件放在某个媒体库目录的子文件夹里",
 		Naming:      "文件名带 S01E01、EP03、第3集，或结尾独立数字",
 		NamingNote:  "只看文件名，识别不到留「未识别」，绝不猜",
 		Roots:       all,
 		UsableRoots: usable,
 		Steps: []guideStep{
-			{Key: "scan", Text: "先在后台「媒体库」建库指向该子文件夹并扫描"},
-			{Key: "detect", Text: "剧场「管理」→ 自动识别剧集"},
-			{Key: "add_existing", Text: "剧场「管理」→ 搜索并勾选 → 加入所选"},
+			{Key: "import_dir", Text: "选一个目录一次性导入：剧场页或「管理」→「从目录导入剧集」"},
+			{Key: "upload", Text: "直接上传视频：剧场页或「管理」→「上传到本剧场」"},
+			{Key: "batch", Text: "多个子目录各成一个剧场：剧场列表「按子目录批量建剧场」"},
 		},
 		AdminURL: "#/admin",
 		RootsURL: "#/admin/roots",
