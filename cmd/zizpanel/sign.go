@@ -29,6 +29,7 @@ func cmdSignManifest(args []string) error {
 	in := fs.String("in", "manifest.json", "要签名的清单文件")
 	out := fs.String("out", "manifest.json.sig", "签名输出路径")
 	genKey := fs.String("gen-key", "", "生成新密钥对到该路径，并打印公钥")
+	raw := fs.Bool("raw", false, "不解析内容，直接对文件字节签名（给非升级清单的文件用，如应用目录 catalog.json）")
 	pubFromKey := fs.String("pub-from-key", "", "从私钥推导公钥并打印（构建时注入用）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -83,8 +84,13 @@ func cmdSignManifest(args []string) error {
 	}
 	// 先解析一遍：签一份自己都解析不了的清单没有意义，
 	// 而且会把错误推迟到用户升级时才暴露。
-	if _, err := upgrade.ParseManifest(data); err != nil {
-		return fmt.Errorf("清单内容不合法，拒绝签名: %w", err)
+	//
+	// --raw 例外：应用目录（catalog.json）等**非升级清单**的文件也要用同一把发布私钥签名
+	// （面板内嵌的公钥是同一个信任根），但它们的结构不是 Manifest，严格解析会直接拒绝。
+	if !*raw {
+		if _, err := upgrade.ParseManifest(data); err != nil {
+			return fmt.Errorf("清单内容不合法，拒绝签名: %w", err)
+		}
 	}
 	sig := upgrade.SignManifest(priv, data)
 	if err := os.WriteFile(*out, sig, 0o644); err != nil {

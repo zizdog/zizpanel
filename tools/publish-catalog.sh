@@ -68,7 +68,7 @@ if [ -z "$BIN" ]; then
   BIN=dist/host-zizpanel
 fi
 cp "$DATA" "$OUT"
-"$BIN" sign-manifest --key "$KEY" --in "$OUT" --out "${OUT}.sig" >/dev/null || die "签名失败"
+"$BIN" sign-manifest --raw --key "$KEY" --in "$OUT" --out "${OUT}.sig" >/dev/null || die "签名失败"
 ok "已签名：$OUT + ${OUT}.sig"
 
 if [ "$DRY" = "1" ]; then
@@ -98,7 +98,7 @@ curl -fsSk -b "$JAR" -X POST -H "X-CSRF-Token: $TOK" -H 'Content-Type: applicati
   -d "{\"path\":\"$DIR/apps\"}" "$BASE/api/v1/files/mkdir" >/dev/null 2>&1 || true
 # 目标叫 catalog.json：面板拉的就是这个固定名字（签名文件同名 + .sig）。
 cp "$OUT" /tmp/zp-catalog.json
-"$BIN" sign-manifest --key "$KEY" --in /tmp/zp-catalog.json --out /tmp/zp-catalog.json.sig >/dev/null
+"$BIN" sign-manifest --raw --key "$KEY" --in /tmp/zp-catalog.json --out /tmp/zp-catalog.json.sig >/dev/null
 curl -fsSk -b "$JAR" -X POST -H "X-CSRF-Token: $TOK" \
   -F "dir=$DIR/apps" -F "on_conflict=overwrite" \
   -F "files=@/tmp/zp-catalog.json;filename=catalog.json" \
