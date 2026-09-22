@@ -80,16 +80,24 @@ zizvideo 是**独立项目**（本机 `../zizvideo`，GitHub `zizdog/zizvideo`�
 仓库只在本机，**不配远程、不 push、不发 GitHub Releases**。发布链路：
 
 ```bash
+make publish         # ⚡发版就这一条（用户 2026-09-22 定的顺序）：
+#   门禁（同一棵树跑过 ⇒ 按指纹跳过）→ 工作树必须干净 → bump + 只提交版本文件 →
+#   构建 → **先发镜像站**（成功即报"发布完成"，用户当场可以升级测试）→ zizdog.com **后台**补推
+#   想省门禁（确认过这棵树是绿的）：SKIP_CHECK=1 make publish
 make bump            # 只在用户同意发版时；patch 到 10 进位（见 AGENTS 第二节）
 make check           # 必须真绿（第四节）
 make release         # dist/release/：darwin/arm64+amd64 包、签名清单
 make mirror-public   # 生成"指向公网镜像"的清单（url=download/<版本>/）并签名，回读断言无内网地址
-make deploy          # release + 推你自己的镜像机(单流 tar) + 升级本机 + 验证版本
-# 分步亦可：make publish-nas（NAS_HOST/NAS_USER/NAS_ROOT/NAS_PASS 全由调用者提供）/ bash tools/deploy.sh
-# 镜像站与本机同一台机器（外置镜像盘）时：make publish-mirror-local
-#   —— 目录由 MIRROR_LOCAL_ROOT 覆盖（默认 /Volumes/ZPMirror/mirror/zizpanel）；
-#      它按清单逐个核 sha256 才复制，同版本不同字节拒绝覆盖（FORCE=1 才覆盖）。
+make deploy          # release + 推镜像机 + 升级本机 + 验证（不发公网，用于只更新本机）
+# 分步亦可：bash tools/publish-release.sh build|push-mirror|push-zizdog|verify
+#   push-mirror = 直传 mini 面板文件接口（实测 5.9 MB/s，53MB≈9s；latest 走服务端复制）
+#   push-zizdog = 只传版本包（latest 在源站本地复制）+ 两架构并行；verify 在源站算 sha256（零公网带宽）
 ```
+
+**发版耗时（2026-09-22 实测，用户要求"大幅缩短发布时间"）**：发布本身 ≈ 40s
+（构建 31s + 镜像 9s）；门禁是唯一的可变项 —— 同一棵树按指纹跳过，改过代码时
+`make check` 130s（go 测试缓存 + 重包拆进程分片）＋ `check-full` 的端到端 ~130s。
+历史对照：改造前一次发版 ≈ 9.5 分钟（门禁 456s、网络三条整包传输 355s、编译 31s）。
 
 - **发布产物只允许公网地址**：`make mirror-public` 的基址直接取自
   `internal/upgrade/source.go` 的 `MirrorSource`（`https://mirror.zizdog.com:8888/zizpanel`），
