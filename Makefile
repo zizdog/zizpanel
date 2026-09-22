@@ -71,7 +71,8 @@ dev: ## 本地构建（当前架构）
 	fi; \
 	go build -ldflags "$(LDFLAGS) -X github.com/zizdog/zizpanel/internal/upgrade.PubKeyHex=$$PUB" -o $(DIST)/zizpanel ./cmd/zizpanel; \
 	go build -ldflags "$(LDFLAGS)" -o $(DIST)/zizpanel-helper ./cmd/zizpanel-helper; \
-	( cd zizvideo && CGO_ENABLED=0 go build -trimpath -ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/zizvideo" ./cmd/server ); \
+	@# -buildvcs=false：产物 sha256 不随 commit 漂（镜像上写死的校验值才稳定，坑 200）。
+	( cd zizvideo && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/zizvideo" ./cmd/server ); \
 	if [ -n "$$PUB" ]; then echo "已注入发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
 	else echo "未注入发布公钥（没有 $(RELEASE_KEY)）：网络升级会被拒绝，仅手动上传可用"; fi
 	@echo "构建完成：$(DIST)/zizpanel + $(DIST)/zizvideo ($(VERSION)+$(COMMIT))"
@@ -362,7 +363,7 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；zi
 			-o $(DIST)/tmp-$$arch/zizpanel ./cmd/zizpanel; \
 		GOOS=darwin GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
 			-o $(DIST)/tmp-$$arch/zizpanel-helper ./cmd/zizpanel-helper; \
-		( cd zizvideo && GOOS=darwin GOARCH=$$arch CGO_ENABLED=0 go build -trimpath \
+		( cd zizvideo && GOOS=darwin GOARCH=$$arch CGO_ENABLED=0 go build -trimpath -buildvcs=false \
 			-ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch" ./cmd/server ); \
 		chmod 0755 $(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch; \
 		if [ "$${SKIP_CODESIGN:-0}" = "1" ]; then \
