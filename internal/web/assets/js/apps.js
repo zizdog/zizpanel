@@ -496,27 +496,30 @@ export function AppsView(content, ctx = {}) {
     return dedupeMarketEntries((cache?.list || []).filter((a) => a && !isDockerRec(a) && !a.site_app));
   }
 
-  // ---------- 更新检查（按需；见文件头 10 分钟 TTL 的说明）----------
+  // ---------- 更新检查（每次进页面问后端一次；后端自己 9 分钟缓存 + 安装/升级后失效）----------
 
   // eligibleForUpdateCheck 是"这个条目该不该探测"的唯一判据：
-  // supports_update_check（静态声明）+ 已安装 + 结论已过期 + 当前没有在查。
-  // 未安装的**不发请求** —— 市场本来显示「安装」，没有"更新"可言。
-  // force=true（用户点「刷新列表」）时忽略 TTL，把已有的结论也重查一遍。
-  function eligibleForUpdateCheck(a, force) {
-    return !!(a && a.id && a.supports_update_check && isInstalled(a)
-      && !updateChecking[a.id] && (force || !updateCheckFresh(updateChecks[a.id])));
+  // supports_update_check（静态声明）+ 已安装 + 当前没有在查。
+  //
+  // ⚠️ **刻意不看前端的 10 分钟 TTL**（2026-09-22 zizvideo 报障）：后端批量接口自己
+  // 有 9 分钟缓存、而且安装/升级完会主动失效它；前端再压一层 TTL 的后果是
+  // "镜像上刚发布的新版在界面上消失"——用户看到的旧结论要等 10 分钟才刷新。
+  // 所以每次进页面都向后端问一次（后端命中缓存时几乎零成本）；force 只决定要不要
+  // 带 fresh=1 让后端重跑真实探测。
+  function eligibleForUpdateCheck(a) {
+    return !!(a && a.id && a.supports_update_check && isInstalled(a) && !updateChecking[a.id]);
   }
 
   // ensureUpdateChecks 一次批量拿**全部**结论（后端一次 `brew outdated` + 动态索引），
   // 写进同一份 updateChecks —— 「已安装」与「应用市场」两个子 Tab 共用它。
   // 按卡片逐个探测会跑 N 次联网比对（13 个 brew 应用 = 13 次），所以这里必须批量。
-  // force=true（用户点刷新/检查更新）时忽略 TTL 重查。
+  // force=true（用户点刷新/检查更新）时带 fresh=1 让后端重跑真实探测。
   function ensureUpdateChecks(list, onDone, force) {
     if (updateInflight) {
       if (typeof onDone === 'function') updateInflight.then(() => onDone());
       return;
     }
-    const targets = (list || []).filter((a) => eligibleForUpdateCheck(a, !!force));
+    const targets = (list || []).filter(eligibleForUpdateCheck);
     if (!targets.length) return;
     const ids = targets.map((a) => a.id);
     for (const id of ids) updateChecking[id] = true;
@@ -594,11 +597,19 @@ export function AppsView(content, ctx = {}) {
   // 而 `brew install` 对已装包是**幂等跳过**，拿它当更新就是"点了没反应还报成功"。
   function startUpgrade(a) {
     if (!a || !a.id) return;
+    // 升级前后都让结论失效：任务结束时后端已经把缓存清掉了，前端再**强制重探一次**，
+    // 这样"更新"按钮点完徽标立刻按新版本刷新（不用等前台缓存过期）。
+    invalidateUpdateCheck(a.id);
     taskCenter.start({
       kind: 'upgrade',
       target: a.id,
       title: '更新 ' + (a.name || a.id),
       start: () => api.marketUpgrade(a.id),
+      onDone: () => {
+        invalidateUpdateCheck(a.id);
+        ensureUpdateChecks(updateCheckTargets(), afterUpdateChecks, true);
+        refreshSilently();
+      },
     });
   }
 
