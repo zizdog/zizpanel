@@ -65,14 +65,21 @@ printf '版本: %s\nHTTP 端口: %s\n面板沙箱端口: %s\n临时目录: %s\n'
 
 # ------------------------------------------------------------- 构建发布包 --
 step "构建发布包"
-if ( cd "$REPO" && make release > "$WORK/release.log" 2>&1 ); then
-  pass "make release 成功"
+# ⚡ 两个提速点（2026-09-22 用户："以大幅缩短发布时间为第一原则"）：
+#   ① 这个测试**只下载 arm64 包**（见下面的 pkg 断言），却一直跑双架构 `make release`
+#      —— 双架构 31s、单架构 15s，白花 16s；
+#   ② 已经有同一版本的 arm64 包时直接复用（`make release` 内部会 `clean` 掉 dist，
+#      在 check-full 里重建一遍、正式发布时再重建一遍是纯重复）。
+PKG_ARM="$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz"
+if [ -f "$PKG_ARM" ] && [ "${ZP_FORCE_REBUILD:-0}" != "1" ]; then
+  pass "复用已有发布包（$PKG_ARM）"
+elif ( cd "$REPO" && make release ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
+  pass "make release（arm64）成功"
 else
   fail "make release 失败："
   tail -25 "$WORK/release.log" | sed 's/^/      /'
 fi
 
-PKG_ARM="$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz"
 if [ -f "$PKG_ARM" ]; then
   pass "产出 arm64 安装包（$(du -h "$PKG_ARM" | cut -f1 | tr -d ' ')）"
 else

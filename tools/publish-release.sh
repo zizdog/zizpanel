@@ -13,11 +13,16 @@
 #   bash tools/publish-release.sh build          # 构建 + 生成并签名两份清单（zizdog / 镜像站）
 #   ZIZDOG_VPS_PASS='...' bash tools/publish-release.sh push-zizdog
 #     # 同时把"镜像版清单"作为 manifest-mirror.json(.sig) 放到源站，供面板镜像同步优先取用（坑 218）
+#     # ⚡ latest 在源站本地复制（不重传）；两个架构并行上传（2026-09-22 提速）
+#   bash tools/publish-release.sh push-mirror     # ⚡ 直传 mini 面板文件接口（5.9 MB/s ≈ 9s，
+#     # 比旧的「镜像同步」任务回源拉 53MB@4Mbps（115s）快一个数量级；latest 走服务端复制）
 #   NAS_HOST='<你的镜像机>' NAS_USER='<用户>' NAS_ROOT='<镜像目录>' \
 #     bash tools/publish-release.sh push-nas    # 走 SSH 密钥
 #   bash tools/publish-release.sh verify        # 复验公网：HTTP + sha256 + Ed25519 验签
+#     # ⚡ 默认在源站上算 sha256（零公网带宽，几秒）；VERIFY_DEEP=1 才整包下载复算
 #
 # 口令来源：优先环境变量 ZIZDOG_VPS_PASS，其次 `.panel-credential.local`（gitignored）。
+# 镜像直传另需同文件的 ZP_MINI_URL / ZP_MINI_USER / ZP_MINI_PASS / ZP_MIRROR_DIR。
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,6 +60,16 @@ load_pass() {
     . ./.panel-credential.local
   fi
   [ -n "${ZIZDOG_VPS_PASS:-}" ] || die "缺少 ZIZDOG_VPS_PASS（放环境变量或 .panel-credential.local）"
+}
+
+# load_pass_soft 与 load_pass 一样取口令，但**没有口令时不退出** ——
+# 给"能省就省"的路径用（例如 verify 优先在远端算 sha256，没口令才回落到整包下载）。
+load_pass_soft() {
+  if [ -z "${ZIZDOG_VPS_PASS:-}" ] && [ -f .panel-credential.local ]; then
+    # shellcheck disable=SC1091
+    . ./.panel-credential.local
+  fi
+  [ -n "${ZIZDOG_VPS_PASS:-}" ]
 }
 
 # sshpass 需要显式给口令：非交互 SSH 里没有别的办法把口令送进去。
@@ -169,16 +184,24 @@ cmd_push_zizdog() {
     install.sh uninstall.sh \
     "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/" || die "scp 上传失败"
 
-  info "上传包到 download/$v/ 与 download/latest/"
+  info "上传包到 download/$v/（latest 由源站本地复制，不再重传一遍）"
   zizdog_ssh "set -e; cd '$ZIZDOG_ROOT'; mkdir -p download/$v download/latest" || die "远端建目录失败"
-  zizdog_scp \
-    "$RELDIR/zizpanel_${v}_darwin_arm64.tar.gz" \
-    "$RELDIR/zizpanel_${v}_darwin_amd64.tar.gz" \
-    "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/download/$v/" || die "scp 上传 $v 失败"
-  zizdog_scp \
-    "$RELDIR/zizpanel_latest_darwin_arm64.tar.gz" \
-    "$RELDIR/zizpanel_latest_darwin_amd64.tar.gz" \
-    "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/download/latest/" || die "scp 上传 latest 失败"
+  # ⚡ 2026-09-22 发版提速：原来把 4 个包（版本包 + latest 包，内容完全一样）
+  # 从本机经 4 Mbps 上传 ≈ 106s。现在只传**版本包**，latest 在源站上 `cp` 出来
+  # —— 零公网带宽（省掉整整一半上传量）。
+  # 两个架构**并行**传：VPS 若按单连接限速，并行能把墙钟时间再压一半。
+  local pids=() rc=0
+  for arch in arm64 amd64; do
+    file="zizpanel_${v}_darwin_${arch}.tar.gz"
+    zizdog_scp "$RELDIR/$file" "$ZIZDOG_USER@$ZIZDOG_HOST:$ZIZDOG_ROOT/download/$v/" &
+    pids+=("$!")
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [ "$rc" = "0" ] || die "scp 上传 $v 失败"
+  zizdog_ssh "set -e; cd '$ZIZDOG_ROOT/download'; \
+    cp -f $v/zizpanel_${v}_darwin_arm64.tar.gz latest/zizpanel_latest_darwin_arm64.tar.gz; \
+    cp -f $v/zizpanel_${v}_darwin_amd64.tar.gz latest/zizpanel_latest_darwin_amd64.tar.gz" \
+    || die "源站本地复制 latest 失败"
   zizdog_ssh "set -e; cd '$ZIZDOG_ROOT'; \
     chmod 644 manifest.json manifest.json.sig manifest-mirror.json manifest-mirror.json.sig download/$v/* download/latest/*; \
     chmod 755 install.sh uninstall.sh; \
@@ -241,20 +264,39 @@ cmd_verify() {
   fi
   ok "镜像版清单可用（签名有效、版本 ${v}、地址不指向源站）"
 
-  local arch file url want got
+  local arch file url want got size size_now
+  # ⚡ 2026-09-22 发版提速：**不再把 53MB 整包下载回来复算 sha256**（4 Mbps ≈ 130s，
+  # 而且只是把我们刚上传的文件再拉一遍）。判据改成"在源站上真的算一遍"：
+  # 远端 `sha256sum` 同一个文件（几秒、零公网带宽）+ 远端大小 + 清单签名。
+  # 要强制走整包下载的老路径：VERIFY_DEEP=1。
+  local remote_ok=0
+  if [ "${VERIFY_DEEP:-0}" != "1" ] && load_pass_soft 2>/dev/null && command -v sshpass >/dev/null 2>&1; then
+    remote_ok=1
+  elif [ "${VERIFY_DEEP:-0}" != "1" ]; then
+    warn "没有 VPS 口令/sshpass：回落到整包下载复算（会慢 ~2 分钟）"
+  fi
   for arch in arm64 amd64; do
     file="zizpanel_${v}_darwin_${arch}.tar.gz"
     url="$ZIZDOG_URL/download/$v/$file"
-    want="$(python3 - "$tmp/manifest.json" "$arch" <<'PY'
+    read -r want size < <(python3 - "$tmp/manifest.json" "$arch" <<'PY'
 import json,sys
-d=json.load(open(sys.argv[1]))
-print(d["assets"]["darwin_"+sys.argv[2]]["sha256"])
+a=json.load(open(sys.argv[1]))["assets"]["darwin_"+sys.argv[2]]
+print(a["sha256"], a.get("size", 0))
 PY
-)"
-    curl -fsS --max-time 600 "$url" -o "$tmp/$file" || die "下载失败：$url"
-    got="$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1)"
+)
+    if [ "$remote_ok" = "1" ]; then
+      got="$(zizdog_ssh "sha256sum '$ZIZDOG_ROOT/download/$v/$file' 2>/dev/null | cut -d' ' -f1" | tr -d '\r' | tail -1)"
+      [ -n "$got" ] || die "远端 sha256 计算失败：$file（可用 VERIFY_DEEP=1 走整包下载）"
+    else
+      curl -fsS --max-time 600 "$url" -o "$tmp/$file" || die "下载失败：$url"
+      got="$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1)"
+    fi
     [ "$want" = "$got" ] || die "$file sha256 与清单不一致：清单 $want / 实际 $got"
-    ok "$file sha256 一致（$(stat -f%z "$tmp/$file") 字节）"
+    # 远端大小（HEAD，零带宽）——"文件在、但被截断/换过"能被这条逮到。
+    size_now="$(curl -fsSI --max-time 30 "$url" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1}/^content-length:/{print $2}' | tail -1)"
+    [ -z "$size" ] || [ "$size" = "0" ] || [ "$size_now" = "$size" ] \
+      || die "$file 远端大小 $size_now 与清单 $size 不一致"
+    ok "$file sha256 一致（${got:0:12}…，$size_now 字节）"
   done
   curl -fsS --max-time 30 "$ZIZDOG_URL/install.sh" -o "$tmp/install.sh" || die "install.sh 下载失败"
   grep -q "SCRIPT_VERSION=\"$v\"" "$tmp/install.sh" || die "线上 install.sh 的 SCRIPT_VERSION 不是 $v"
@@ -263,10 +305,80 @@ PY
   info "公网复验全部通过 ✅"
 }
 
+# cmd_push_mirror：把发布件**直传** mini 面板的文件接口（写进镜像盘）。
+#
+# ⚡ 2026-09-22 发版提速（用户："以大幅缩短发布时间为第一原则"）：
+# 原来走 mini 面板的「镜像同步」任务 —— 它从 zizdog.com（4 Mbps）把 53MB 拉一遍，
+# 实测 115s。而本机直传 mini 实测 **5.9 MB/s**（53MB ≈ 9s）；latest 目录用 mini 的
+# **服务端复制**接口造，不重传一份。省下约 105s。
+#
+# 凭据：.panel-credential.local 的 ZP_MINI_URL / ZP_MINI_USER / ZP_MINI_PASS，
+#      以及 ZP_MIRROR_DIR（镜像上的 zizpanel 目录，默认 /Volumes/ZPMirror/mirror/zizpanel）。
+cmd_push_mirror() {
+  local v; v="$(version)"
+  [ -f "$RELDIR/manifest-nas.json" ] || die "先跑 build（缺 manifest-nas.json）"
+  [ -f .panel-credential.local ] && . ./.panel-credential.local
+  : "${ZP_MINI_USER:?缺 ZP_MINI_USER（.panel-credential.local）}"
+  : "${ZP_MINI_PASS:?缺 ZP_MINI_PASS（.panel-credential.local）}"
+  local base="${ZP_MINI_URL:-https://panel.zizdog.com:8888}"
+  local dir="${ZP_MIRROR_DIR:-/Volumes/ZPMirror/mirror/zizpanel}"
+  # 镜像版清单在镜像上就叫 manifest.json（面板只认这个名字）。
+  cp "$RELDIR/manifest-nas.json" "$RELDIR/manifest.json"
+  cp "$RELDIR/manifest-nas.json.sig" "$RELDIR/manifest.json.sig"
+
+  local jar tok
+  jar="$(mktemp)"; trap 'rm -f "$jar"' RETURN 2>/dev/null || true
+  csrf() { awk '$6=="zp_csrf"{print $7}' "$jar" | tail -1; }
+  info "登录 mini 面板 $base"
+  curl -fsSk -c "$jar" -o /dev/null "$base/" || die "打不开 mini 面板"
+  curl -fsSk -b "$jar" -c "$jar" -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+    -d "{\"username\":\"$ZP_MINI_USER\",\"password\":\"$ZP_MINI_PASS\"}" "$base/api/v1/login" >/dev/null \
+    || die "mini 面板登录失败"
+  tok="$(csrf)"
+  [ -n "$tok" ] || die "登录后没拿到 CSRF token"
+
+  # 小文件：清单 + 签名 + 安装/卸载脚本。
+  info "上传清单与脚本到 $dir"
+  curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" \
+    -F "dir=$dir" -F "on_conflict=overwrite" \
+    -F "files=@$RELDIR/manifest.json" -F "files=@$RELDIR/manifest.json.sig" \
+    -F "files=@install.sh" -F "files=@uninstall.sh" \
+    "$base/api/v1/files/upload" >/dev/null || die "上传清单/脚本失败"
+
+  # 包：先建目录，再**并行**传两个架构。
+  local mkdir_json="{\"path\":\"$dir/download/$v\"}"
+  curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
+    -d "$mkdir_json" "$base/api/v1/files/mkdir" >/dev/null 2>&1 || true
+  curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
+    -d "{\"path\":\"$dir/download/latest\"}" "$base/api/v1/files/mkdir" >/dev/null 2>&1 || true
+
+  info "直传两个架构的包（并行）"
+  local arch rc=0 pids=()
+  for arch in arm64 amd64; do
+    curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" \
+      -F "dir=$dir/download/$v" -F "on_conflict=overwrite" \
+      -F "files=@$RELDIR/zizpanel_${v}_darwin_${arch}.tar.gz" \
+      "$base/api/v1/files/upload" >/dev/null &
+    pids+=("$!")
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [ "$rc" = "0" ] || die "直传包失败（可改用旧的镜像同步任务：POST /api/v1/system/mirror/sync）"
+
+  # latest 用**服务端复制**：同样的字节不再走一遍网络。
+  info "镜像上复制出 download/latest/"
+  for arch in arm64 amd64; do
+    curl -fsSk -b "$jar" -X POST -H "X-CSRF-Token: $tok" -H 'Content-Type: application/json' \
+      -d "{\"from\":\"$dir/download/$v/zizpanel_${v}_darwin_${arch}.tar.gz\",\"to\":\"$dir/download/latest/zizpanel_latest_darwin_${arch}.tar.gz\"}" \
+      "$base/api/v1/files/copy" >/dev/null || die "复制 latest（$arch）失败"
+  done
+  ok "已直传（清单 + 包 + latest；latest 是镜像侧复制，未重传）"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   push-zizdog) cmd_push_zizdog ;;
+  push-mirror) cmd_push_mirror ;;
   push-nas)    cmd_push_nas ;;
   verify)      cmd_verify ;;
-  *) sed -n '2,20p' "$0"; exit 1 ;;
+  *) sed -n '2,22p' "$0"; exit 1 ;;
 esac

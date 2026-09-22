@@ -162,8 +162,22 @@ check: ## 日常提交前检查（约 1 分钟；发版前再跑 check-full）
 
 # 发版前才需要的重活（每次几分钟，日常提交不跑）：真起进程的安装端到端、
 # 依赖已发布 dist 包的远程安装、以及只与发版有关的发布说明检查。
+#
+# ⚡ 2026-09-22 发版提速（用户："以大幅缩短发布时间为第一原则"）：
+# 同一棵**没变过的树**重复跑这三项没有任何新信息，所以按工作树指纹跳过
+# （实测这三项 192s，check 264s）。指纹规则与 make check 的标记完全一样：
+# 改一个字节就失效、强制重跑。显式重跑：ZP_FORCE_CHECK_FULL=1 make check-full。
 .PHONY: check-full
-check-full: check ## 发版前全量检查（check + 安装/远程安装端到端 + receiver /jobs + 发布说明）
+check-full: ## 发版前全量检查（同一棵树跑过 ⇒ 按指纹跳过；ZP_FORCE_CHECK_FULL=1 强制）
+	@if [ "${ZP_FORCE_CHECK_FULL:-0}" != "1" ] && bash tools/check-stamp.sh verify-full >/dev/null 2>&1; then \
+	   echo "==> 全量检查跳过：$$(bash tools/check-stamp.sh verify-full)"; \
+	 else \
+	   $(MAKE) --no-print-directory check-full-real; \
+	 fi
+
+.PHONY: check-full-real
+check-full-real:
+	@$(MAKE) --no-print-directory check
 	@echo "（zizvideo 是独立仓库：它自己的门禁在 ../zizvideo 里跑 make check）"
 	@echo "==> receiver /jobs 测试"
 	@$(MAKE) --no-print-directory jobs-test
@@ -173,6 +187,7 @@ check-full: check ## 发版前全量检查（check + 安装/远程安装端到�
 	@$(MAKE) --no-print-directory remote-test
 	@echo "==> 发布说明门禁（版本标题 / 长度 / 无旧版本标题 / 清单一致）"
 	@bash tools/check-release-notes.sh
+	@bash tools/check-stamp.sh write-full
 	@echo "全量检查通过 ✅"
 
 .PHONY: install-test

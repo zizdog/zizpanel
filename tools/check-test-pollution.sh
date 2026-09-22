@@ -118,8 +118,15 @@ fi
 # 默认模式：拍 → 跑测试 → 比对。go test 的退出码必须原样保留（它才是主结果）。
 snapshot "$FP.before"
 rm -f "$FP"
-printf '\n%s▸ go test ./... -count=1%s\n' "$C_BOLD" "$C_RESET"
-( cd "$REPO" && go test ./... -count=1 )
+# ⚠️ 默认**不传 -count=1**（2026-09-22 用户要求"大幅缩短发布时间"）：
+# -count=1 会禁掉 go 的测试缓存，于是**同一棵没变的树**每次发布都要重跑全部测试
+# （实测 make check 264s，其中大头就是它）。go 的测试缓存是**按内容**失效的：
+# 包源码、命令行参数、环境变量、以及测试打开过的文件变了都会重跑 —— 所以缓存
+# 不会掩盖改动。要强制全量重跑（怀疑缓存本身有问题时）：ZP_TEST_NO_CACHE=1 make check。
+TEST_ARGS=""
+if [ "${ZP_TEST_NO_CACHE:-0}" = "1" ]; then TEST_ARGS="-count=1"; fi
+printf '\n%s▸ go test ./... %s%s\n' "$C_BOLD" "$TEST_ARGS" "$C_RESET"
+( cd "$REPO" && go test ./... $TEST_ARGS )
 TEST_RC=$?
 snapshot "$FP"
 verify "$FP.before" "$FP"

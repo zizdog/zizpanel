@@ -78,8 +78,27 @@ case "$cmd" in
     fi
     echo "这棵树已通过 make check：版本 ${ver}，时间 ${ts}（指纹 ${fp:0:12}…）"
     ;;
+  write-full)
+    STAMP="$STAMP-full"
+    mkdir -p "$(dirname "$STAMP")"
+    fp="$(fingerprint)"
+    ver="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "$REPO_ROOT/internal/version/version.go" | head -1)"
+    printf '%s %s %s\n' "$fp" "$ver" "$(date '+%Y-%m-%d %H:%M:%S')" > "$STAMP"
+    echo "已记录 check-full 标记：$ver @ $(date '+%H:%M:%S')（指纹 ${fp:0:12}…）"
+    ;;
+  verify-full)
+    STAMP="$STAMP-full"
+    [ -f "$STAMP" ] || { echo "没有 check-full 标记（还没在这棵树上跑过 make check-full）"; exit 1; }
+    read -r fp ver ts < "$STAMP" || true
+    now="$(fingerprint)"
+    if [ "$fp" != "$now" ]; then
+      echo "工作树自上次 check-full 后已变化（标记 ${fp:0:12}… → 现在 ${now:0:12}…），必须重跑"
+      exit 1
+    fi
+    echo "这棵树已通过 make check-full：版本 ${ver}，时间 ${ts}（指纹 ${fp:0:12}…）"
+    ;;
   *)
-    echo "用法：$0 fingerprint|write|verify" >&2
+    echo "用法：$0 fingerprint|write|verify|write-full|verify-full" >&2
     exit 2
     ;;
 esac
