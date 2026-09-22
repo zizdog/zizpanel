@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/priv"
@@ -27,6 +28,12 @@ type App struct {
 	Category    string `json:"category"`
 	// Kind 决定用哪种方式安装与管理
 	Kind Kind `json:"kind"`
+	// Rail 是"远端目录条目用哪条通用轨安装"（brew / compose）。内置条目留空 ——
+	// 内置条目的安装方式由 Kind / PanelInstaller 决定，不走这里。
+	Rail string `json:"rail,omitempty"`
+	// Remote 表示这条目录来自**镜像站下发的签名目录**（不是编在二进制里的）。
+	// 用户 2026-09-22 的目标："不发新版面板也能加应用"。
+	Remote bool `json:"remote,omitempty"`
 	// EnvComponent 表示这是**基础环境组件**（站点/应用依赖它，版本有依赖关系）：
 	// 显式标记的 python@x.y / ffmpeg 走这条；「网站环境」板块（LNMP）由
 	// IsEnvComponent 按分类一并算进来。它们**不参与"有新版"提醒，也不给一键更新**
@@ -527,7 +534,76 @@ func IsEnvComponent(a App) bool {
 	return a.EnvComponent || a.Category == CategoryLNMP
 }
 
+// remoteCatalog 是**镜像站下发的目录条目**（已在 web 层验签）。
+//
+// 默认空 ⇒ Catalog() 完全等于内置目录，行为与以前一模一样（老机器没配镜像/没数据时不受影响）。
+// 合并规则（保守、fail-closed）：**只追加新 ID，绝不覆盖内置条目** ——
+// 否则一份远端数据就能改掉内置应用（比如把 nginx 指向别的 formula）的安装行为，
+// 那是把"面板发布"这一层信任整个绕过去。要改动内置条目只能发面板版。
+var remoteCatalog struct {
+	mu     sync.RWMutex
+	apps   []App
+	source string // remote / cache / ""（没数据）
+	at     time.Time
+}
+
+// SetRemoteCatalog 装上已验签的远端目录（source 说明来源：remote / cache）。
+// 传 nil/空表示清空（回到纯内置目录）。
+func SetRemoteCatalog(apps []App, source string, at time.Time) {
+	remoteCatalog.mu.Lock()
+	defer remoteCatalog.mu.Unlock()
+	remoteCatalog.apps = apps
+	remoteCatalog.source = source
+	remoteCatalog.at = at
+}
+
+// RemoteCatalogInfo 汇报远端目录状态：(来源, 条目数, 时间)。没有远端数据时 source 为空。
+func RemoteCatalogInfo() (string, int, time.Time) {
+	remoteCatalog.mu.RLock()
+	defer remoteCatalog.mu.RUnlock()
+	return remoteCatalog.source, len(remoteCatalog.apps), remoteCatalog.at
+}
+
+// Catalog 返回**实际生效的目录** = 内置 + 远端（远端只追加新 ID）。
+//
+// 所有消费方（市场列表 / FindApp / 服务详情…）都只认这一个入口，所以远端条目
+// 一旦装上就能"像内置的一样"被市场显示与安装，不需要改任何调用点。
 func Catalog() []App {
+	base := builtinCatalog()
+	remoteCatalog.mu.RLock()
+	remote := remoteCatalog.apps
+	remoteCatalog.mu.RUnlock()
+	if len(remote) == 0 {
+		return base
+	}
+	have := make(map[string]bool, len(base))
+	for _, a := range base {
+		have[a.ID] = true
+	}
+	out := make([]App, 0, len(base)+len(remote))
+	out = append(out, base...)
+	for _, a := range remote {
+		if a.ID == "" || have[a.ID] {
+			continue // 空 ID / 与内置撞 ID：忽略（不覆盖内置）
+		}
+		have[a.ID] = true
+		out = append(out, a)
+	}
+	return out
+}
+
+// BuiltinCatalogIDs 返回内置目录的 ID 集合（远端目录合并时用来判"撞 ID"）。
+func BuiltinCatalogIDs() []string {
+	base := builtinCatalog()
+	out := make([]string, 0, len(base))
+	for _, a := range base {
+		out = append(out, a.ID)
+	}
+	return out
+}
+
+// builtinCatalog 是编在二进制里的目录（原 Catalog 的字面量）。
+func builtinCatalog() []App {
 	audioHealth := "/v1/models"
 	return []App{
 		// ---------------- 面板一键部署（自研安装器） ----------------

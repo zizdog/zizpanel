@@ -238,6 +238,9 @@ func DataExcludedNames() map[string]string {
 		"panel.db-shm": "同上",
 		"logs":         "日志可重建、体积大",
 		"proxy-cache":  "反向代理缓存（可回源重建，动辄上 GB，不该进备份）",
+		// 远端应用目录的本地缓存：内容来自镜像站（**已验签**），随时可重新拉取；
+		// 备份它没有意义，恢复后第一次打开市场就会重新拉（见 internal/web/remote_catalog.go）。
+		"cache": "远端应用目录缓存（镜像站下发、已验签、可重新拉取）",
 	}
 }
 

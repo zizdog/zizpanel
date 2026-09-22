@@ -770,8 +770,17 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	// fresh=1 只给用户手动点的「刷新列表」用（2026-09-22 用户要求：打开页面读缓存，
 	// 只有点了才刷新）：先失效进程内探测缓存（brew / 引擎 started），本次请求走一次
 	// 真实复核。不带它时保持原样 —— 列表路径不重探。
-	if r.URL.Query().Get("fresh") == "1" {
+	fresh := r.URL.Query().Get("fresh") == "1"
+	if fresh {
 		s.InvalidateMarketCache()
+		// 用户点「⟳ 更新」：同步刷一次**远端应用目录**（镜像站下发的签名目录，
+		// 决定"不更新面板能不能看到新应用"）。失败不挡列表，但下面会如实汇报原因。
+		refreshCtx, cancel := context.WithTimeout(ctx, remoteCatalogTimeout)
+		_ = s.refreshRemoteCatalog(refreshCtx)
+		cancel()
+	} else {
+		// 平时：先把上次验签通过、落盘的远端目录装上（重启后立即生效），再按 TTL 后台刷一次。
+		s.ensureRemoteCatalog(ctx)
 	}
 	// 「已安装」必须看两个来源，缺一不可：
 	//
@@ -1159,6 +1168,9 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 用户要求「其它」改名「基础环境」，改名只改 catalog.go 一处。
 		"sections": services.MarketSections(),
 		"docker":   map[string]any{"available": sock != "", "socket": sock, "version": ver},
+		// 远端目录（镜像站下发）的状态：来源 / 时间 / 失败原因 / 被拒条目。
+		// 如实汇报：没配镜像、取不到、验签失败都要能被看见（不许假装"没有远端目录"）。
+		"remote_catalog": remoteCatalogReport(),
 	})
 }
 

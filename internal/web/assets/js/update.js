@@ -700,9 +700,37 @@ export function UpdateView(content, ctx = {}) {
   let netFailure = '';
 
   const srcInput = h('input.input', {
-    placeholder: 'https://example.com/zizpanel/releases（放着 manifest.json 的目录）',
+    placeholder: 'https://mirror.zizdog.com:8888/zizpanel（放着 manifest.json 的目录）',
     value: '',
+    // 回车=保存：输入框旁边那颗按钮才是唯一的保存入口（用户 2026-09-22：
+    // "后台升级源地址设置没有保存按钮"—— 而且原来这个框**根本没接线**：
+    // 检查更新时不带 source，输入的值既不保存也不生效，等于装饰）。
+    onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveSource(); } },
   });
+  // 「保存」按钮：只做最基本形状校验，真正的可用性交给紧接着的那次检查更新去验。
+  const btnSaveSrc = h('button.btn.btn-sm', {
+    dataset: { testid: 'zp-save-upgrade-source' },
+    text: '保存',
+    title: '保存升级源（留空 = 让面板按候选源自动选：镜像站 → zizdog.com → GitHub）',
+    onclick: () => saveSource(),
+  });
+  async function saveSource() {
+    const v = srcInput.value.trim();
+    btnSaveSrc.disabled = true;
+    const old = btnSaveSrc.textContent;
+    btnSaveSrc.textContent = '保存中…';
+    try {
+      await api.saveSettings({ upgrade_source: v });
+      toast(v ? ('升级源已保存：' + v) : '升级源已清空（面板会按候选源自动选）', 'ok', 8000);
+      // 保存后立刻按新源查一次：用户要的是"改完就生效"，而不是再点一次。
+      await runCheck(true, btnCheck);
+    } catch (e) {
+      toast('保存失败：' + ((e && e.message) || e), 'err', 12000);
+    } finally {
+      btnSaveSrc.disabled = false;
+      btnSaveSrc.textContent = old;
+    }
+  }
   const notice = h('div');
   // 卡片头的版本小标是这一页**唯一**显示版本的地方（2026-09-22 用户："两个地方提示
   // 差不多的内容，去掉一处"—— 原来卡片体内还有一行"当前版本 vX（arch）"与它重复）。
@@ -1015,7 +1043,10 @@ export function UpdateView(content, ctx = {}) {
     if (!srcInput.value) srcInput.value = data.source || '';
     bodyEl.append(h('div.field', [
       h('label', { text: '升级源地址' }),
-      srcInput,
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        srcInput,
+        btnSaveSrc,
+      ]),
       h('div.hint', {
         text: data.can_remote
           ? '该目录需同时提供 manifest.json 与 manifest.json.sig，面板会用内嵌公钥验签后才会安装。留空则按候选源自动选择。'
