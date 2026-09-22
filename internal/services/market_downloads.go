@@ -406,11 +406,11 @@ var marketDownloadApps = []MarketApp{
 					// 1374 B），661,802,053 是它声明的**载荷总字节**（两个 pkg 之和）。
 					// 把载荷体积挂在清单 URL 上，审计会报"体积变了"的假警报 ——
 					// 体积写进 Note，别挂在错误的 URL 上。
-					Note: "镜像整包走 <base>/clt/index.json（先 <base>/clt，再 <base>/zizpanel/clt，都不通回落静态常量 zizdog.com）；" +
-						// 2026-09-17 用户定的分工：zizdog.com 只当**安装脚本与面板本体/在线升级**的源（数据量小）；
-						// 市场里的软件、CLT（632MB）这类大件一律走**快镜像**（mirror.zizdog.com:8888 = 镜像站，
-						// 实测 5.6–8.9MB/s；镜像站对 /zizpanel/ 有按需回源，首次取完即缓存）。
-						// 实测：<mirror>/zizpanel/clt/index.json = 200（<mirror>/clt/index.json 是 404）。" +
+					Note: "镜像整包走 <base>/clt/index.json（先 <base>/clt，再 <base>/zizpanel/clt；" +
+						// 2026-09-17 用户定的分工：大件一律走**快镜像**。2026-09-22 进一步：
+						// zizdog.com（腾讯云 4 Mbps）上的 /zizpanel/clt 已删除 —— 加速源只有镜像站。
+						// 实测：<mirror>/zizpanel/clt/index.json = 200（<mirror>/clt/index.json 是 404），
+						// 静态兜底常量也指向镜像站（本地 5.6–8.9 MB/s）；" +
 						"清单 bytes=661,802,053（含 CLTools_Executables.pkg 604,642,024 + CLTools_macOSNMOS_SDK.pkg）；" +
 						"镜像路失败还有 softwareupdate -l(3 min) / softwareupdate -i(40 min) / xcode-select --install 弹窗(1 min + 轮询 30 min) 两条退路",
 				},
@@ -418,8 +418,8 @@ var marketDownloadApps = []MarketApp{
 				Timeout:  45 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
-					Asset: "index.json 里逐文件的 sha256（清单自带两条）",
-					Note:  "⚠️ 已知不一致：homebrew_clt_mirror.go 注释宣称「每片单独校验」，实际 fetchParts 只校验**大小**，没有逐片 sha256",
+					Asset: "index.json 里的逐包 sha256，以及逐片 sha256（镜像站当前清单 2 包 / 21 片全有）",
+					Note:  "fetchParts 逐片校验：清单给了该片 sha256 就比对内容，没给才只校验大小、靠整体 sha256 兜底",
 				},
 				ARM64: "pkg 是通用二进制（上游同一份给 Apple Silicon 与 Intel）；清单 max_os=15 只覆盖到 macOS 15",
 				Note: "⚠️ 清单只有一条 max_os=15：目标机若是 macOS 26（Tahoe）会选不中条目 → 静默回落苹果 CDN（历史记录：15 分钟只下 1 MB）。" +
@@ -517,16 +517,17 @@ var marketDownloadApps = []MarketApp{
 				Label:   "EnsureCLT（与 qwen3tts 同一条路）",
 				Upstream: MarketUpstream{
 					ID:   "Command Line Tools 16.2（clt/index.json 清单）",
-					URL:  "https://zizdog.com/zizpanel/clt/index.json",
-					Size: 0, // 同 qwen3tts：URL 指向清单（1374 B），661,802,053 是载荷总量，别挂错地方
-					Note: "与 qwen3tts 的 CLT 完全同一条路（同一份清单、同一份 pkg；载荷 661,802,053 B）",
+					URL:  "https://mirror.zizdog.com:8888/zizpanel/clt/index.json",
+					Size: 0, // 同 qwen3tts：URL 指向清单，661,802,053 是载荷总量，别挂错地方
+					Note: "与 qwen3tts 的 CLT 完全同一条路（同一份清单、同一份 pkg；载荷 661,802,053 B）。" +
+						"zizdog.com 上的 clt 已于 2026-09-22 删除，加速源只有镜像站",
 				},
 				NAS:      nasMirrored("zizpanel/clt/index.json"),
 				Timeout:  45 * time.Minute,
 				Required: true,
 				Checksum: MarketChecksum{
-					Asset: "index.json 里逐文件的 sha256",
-					Note:  "同 qwen3tts：分片只校验大小，不校验逐片 sha256",
+					Asset: "index.json 里的逐包 sha256 与逐片 sha256（镜像站当前清单全有）",
+					Note:  "同 qwen3tts：给了逐片 sha256 就逐片校验，没给才只校验大小",
 				},
 				ARM64: "pkg 是通用二进制",
 				Note:  "失败即中止安装",

@@ -13,6 +13,7 @@
 #    2. 幂等：再跑一次不重复下载；
 #    3. 增量修复：目标侧"大小对、内容坏"的分片会被发现并只重下这一片；
 #    4. 源侧坏件：绝不写半成品清单，退出码非 0，并明确报告缺了什么。
+#    5. 没给源：明确拒绝（zizdog.com 上的 clt 已删除，不许猜默认源）。
 #
 #  用法：bash tools/test-sync-clt-mirror.sh
 # ============================================================================
@@ -128,6 +129,14 @@ set -e
 [ "$rc" != "0" ] && ok "缺文件时退出码非 0" || bad "缺文件时不该报成功"
 want "报告里点名缺了哪个文件" "CLTools_macOSNMOS_SDK.pkg.part-001" "$TMP/run5.log"
 want "明确说了不上传半成品清单" "不上传半成品清单" "$TMP/run5.log"
+
+echo "--- 6) 没给源（zizdog.com 上的 clt 已于 2026-09-22 删除）：必须明确拒绝，不许猜默认源"
+set +e
+bash "$TOOL" --local-dest "$TMP/dst-nosrc" --work "$TMP/work-nosrc" > "$TMP/run6.log" 2>&1
+rc=$?
+set -e
+[ "$rc" != "0" ] && ok "没给源时退出码非 0" || bad "没给源时不该继续（会去猜一个已删除的源）"
+want "说清了 zizdog.com 上的 clt 已删除" "已于 2026-09-22 删除" "$TMP/run6.log"
 
 echo
 echo "结果：通过 $PASS 项，失败 $FAIL 项"

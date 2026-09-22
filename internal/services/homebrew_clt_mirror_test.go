@@ -254,10 +254,12 @@ func TestCLTIndexFilesBase(t *testing.T) {
 		item         cltIndexItem
 		mirror, want string
 	}{
-		{cltIndexItem{Path: "clt/072-44426-A"}, "https://zizdog.com/zizpanel", "https://zizdog.com/zizpanel/clt/072-44426-A"},
-		{cltIndexItem{Dir: "16.2"}, "https://zizdog.com/zizpanel", "https://zizdog.com/zizpanel/clt/16.2"},
+		// 基址只是拼接用的输入，故意用中性域名：zizdog.com 上的 clt 已于 2026-09-22 删除，
+		// 别再让测试里出现一个已经不存在的载荷地址（那会误导下一个人）。
+		{cltIndexItem{Path: "clt/072-44426-A"}, "https://mirror.example.com/zizpanel", "https://mirror.example.com/zizpanel/clt/072-44426-A"},
+		{cltIndexItem{Dir: "16.2"}, "https://mirror.example.com/zizpanel", "https://mirror.example.com/zizpanel/clt/16.2"},
 		// 结尾带 / 的基址不能拼出 //
-		{cltIndexItem{Path: "/clt/x/"}, "https://zizdog.com/zizpanel/", "https://zizdog.com/zizpanel/clt/x"},
+		{cltIndexItem{Path: "/clt/x/"}, "https://mirror.example.com/zizpanel/", "https://mirror.example.com/zizpanel/clt/x"},
 	}
 	for i, c := range cases {
 		if got := c.item.filesBase(c.mirror); got != c.want {
@@ -613,24 +615,25 @@ func TestQwenIPv4PatchIsValidPython(t *testing.T) {
 	}
 }
 
-// TestCLTStaticFallbackIsPublic：CLT 的**静态兜底**必须是公网可达的源。
+// TestCLTStaticFallbackIsMirror：CLT 的**静态兜底** = 唯一的加速源（公网镜像站）。
 //
-// 2026-09-18 真机（重装后的 mini，用户原话："难道没有自建镜像这个面板就用不了吗"）：
-// 兜底常量当时写的是自建镜像 `https://mirror.zizdog.com:8888/zizpanel` ——
-// 那个公网入口一旦坏掉，CLT 的三条路就断了两条（镜像探不通、softwareupdate 目录也取不到），
-// 只剩"弹 Apple 的 GUI 对话框让用户手点"。而 zizdog.com（安装源，一直可达）上
-// 有同一份清单与整套包。
-//
-// 门禁：兜底地址**不许**指向任何自建/内网域名（那是"可选加速"，不是"唯一来源"）。
-func TestCLTStaticFallbackIsPublic(t *testing.T) {
+// 2026-09-22 用户决定：zizdog.com 上的 /zizpanel/clt 已删除（4 Mbps 带宽 + 1.3 GB
+// 载荷没有意义），CLT 只剩镜像站这一条加速路。这条门禁因此**反过来**：
+// 兜底必须指向镜像站，且**不许**再指回已删除的 zizdog.com/clt（那会 404，
+// 而症状是"镜像这条路整个走不通、静默去弹 Apple 对话框"）。
+// 仍然禁止内网/本机地址：镜像站是公网入口，不是局域网镜像（那个入口已删）。
+func TestCLTStaticFallbackIsMirror(t *testing.T) {
 	base := cltMirrorBaseDefault
-	for _, bad := range []string{"mirror.zizdog.com:8888", "192.168.", "127.0.0.1", "localhost"} {
+	for _, bad := range []string{"192.168.", "127.0.0.1", "localhost", "10.", "172.16."} {
 		if strings.Contains(base, bad) {
-			t.Errorf("CLT 静态兜底基址 %q 指向了自建/内网地址 %q —— "+
-				"镜像挂掉时新机器将无法安装 CLT（真机事故）", base, bad)
+			t.Errorf("CLT 静态兜底基址 %q 指向了内网/本机地址 %q —— "+
+				"面板是发给所有人用的，局域网镜像入口已删除", base, bad)
 		}
 	}
-	if !strings.HasPrefix(base, "https://zizdog.com/") {
-		t.Errorf("CLT 静态兜底应为公网安装源 https://zizdog.com/zizpanel，实际 %q", base)
+	if !strings.Contains(base, "mirror.zizdog.com:8888/zizpanel") {
+		t.Errorf("CLT 静态兜底应为唯一加速源 https://mirror.zizdog.com:8888/zizpanel，实际 %q", base)
+	}
+	if strings.HasPrefix(base, "https://zizdog.com/") {
+		t.Errorf("CLT 静态兜底指向了 zizdog.com（该目录已于 2026-09-22 删除，会 404）：%q", base)
 	}
 }

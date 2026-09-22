@@ -8,6 +8,11 @@
 #  zizdog.com 一挂，首次安装就只能回落苹果 CDN，实测 15 分钟只下 1 MB）。
 #  本工具把载荷**预先**放到 NAS 本地，面板之后就从同城/局域网取。
 #
+#  ⚠️ 2026-09-22：zizdog.com 上的 /zizpanel/clt 已删除（4 Mbps 带宽 + 1.3 GB
+#  载荷没有意义，用户决定加速源只有 mirror.zizdog.com:8888）。所以 SOURCE_BASE
+#  不再有默认值 —— 源没了。要新增/重铺 CLT 载荷必须显式给 --source-dir（手持
+#  苹果原始 pkg 的本地目录）或 --source-base（别的可达源）。
+#
 #  布局（与 internal/services/homebrew_clt_mirror.go 的约定一致）：
 #      <clt-root>/index.json                         清单（本工具生成，sha256 真实计算）
 #      <clt-root>/<产品号>/<pkg>.pkg.part-NNN        苹果原始包切成 32 MB 的分片
@@ -21,8 +26,8 @@
 #
 #  环境变量（地址由调用者提供，仓库里不留任何内网默认值）：
 #      NAS_HOST / NAS_USER / NAS_PASS / NAS_CLT_ROOT   （非沙箱模式必须显式提供）
-#      SOURCE_BASE   （默认 https://zizdog.com/zizpanel，CLT 载荷的现存来源）
-#      SOURCE_DIR    （沙箱：把本地目录当源，完全不碰网络）
+#      SOURCE_BASE   （**无默认值**：zizdog.com 上的 clt 已删除，源由调用者显式提供）
+#      SOURCE_DIR    （把本地目录当源，完全不碰网络；现在是新增版本的主路）
 #      MIRROR_CLT_URL（验收基址，必须显式提供，如 https://mirror.example.com/zizpanel/clt）
 #      WORK_DIR      （本地缓存；默认 $TMPDIR/zizpanel-clt-sync）
 #
@@ -43,12 +48,12 @@
 #       实测：本机连不上 swscan；mini 也连不上；NAS 能连到 ksyun 边缘，
 #       但对 /content/catalogs/... 一律 404（swdist 的 pkg 反而 200）。
 #       所以这一步不要在这两台机器上耗时间。
-#    2. 把苹果**原始** pkg 放到源侧的 clt/<产品号>/ 下（或先切好 32MB 分片），
-#       并在源侧 index.json 里加一条 item：pkgs 里至少要有
+#    2. 把苹果**原始** pkg 放进一个本地源目录 clt/<产品号>/（或先切好 32MB 分片），
+#       并在该目录的 index.json 里加一条 item：pkgs 里至少要有
 #       CLTools_Executables.pkg 与 CLTools_macOSNMOS_SDK.pkg，
 #       max_os 填该版本对应的 macOS 主版本（macOS 26 → 26）。
 #       **绝对不要手写 sha256**：留空即可，本工具会从目标侧的真实字节算出来。
-#    3. NAS_PASS='...' bash tools/sync-clt-mirror.sh --product <产品号>
+#    3. NAS_PASS='...' bash tools/sync-clt-mirror.sh --source-dir <该目录> --product <产品号>
 #    4. 清单**顺序即优先级**：老系统的条目留在前面、新系统的条目放后面 ——
 #       pickCLTItem 的语义是"macOS 主版本 ≤ max_os"，于是 macOS 15 的机器命中
 #       max_os=15 那条，macOS 26 的机器跳过它、命中新加的那条。
@@ -60,7 +65,7 @@ NAS_USER="${NAS_USER:-}"
 NAS_PASS="${NAS_PASS:-}"
 NAS_CLT_ROOT="${NAS_CLT_ROOT:-}"
 
-SOURCE_BASE="${SOURCE_BASE:-https://zizdog.com/zizpanel}"
+SOURCE_BASE="${SOURCE_BASE:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 MIRROR_CLT_URL="${MIRROR_CLT_URL:-}"
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}/zizpanel-clt-sync}"
@@ -110,6 +115,11 @@ if [ -z "$LOCAL_DEST" ]; then
   [ -n "$NAS_USER" ] || die "请传 NAS_USER=<镜像机用户>"
   [ -n "$NAS_CLT_ROOT" ] || die "请传 NAS_CLT_ROOT=<镜像上的 clt 目录>（或用 --dest）"
   [ -n "$MIRROR_CLT_URL" ] || die "请传 MIRROR_CLT_URL=<镜像的 clt 验收基址>（或用 --mirror-url）"
+fi
+
+if [ -z "$SOURCE_DIR" ] && [ -z "$SOURCE_BASE" ]; then
+  die "缺少源：zizdog.com 上的 /zizpanel/clt 已于 2026-09-22 删除（加速源只有 mirror.zizdog.com:8888）。" \
+      "请用 --source-dir DIR 指向本地 clt 载荷目录（含 index.json 与 <产品号>/），或显式 --source-base URL"
 fi
 
 if [ "$CLEAN" = "1" ]; then

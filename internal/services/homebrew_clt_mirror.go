@@ -39,27 +39,14 @@ import (
 //  这样同型号机器第二次安装几乎不会踩到已经失败的条目。
 // ============================================================================
 
-// cltMirrorBaseDefault 是 CLT 的静态兜底基址（自建镜像站的"面板发布目录"
-// 对外地址就是 <mirror>:8888/zizpanel，与这个常量同一份内容）。
+// cltMirrorBaseDefault 是 CLT 的静态兜底基址 = **唯一加速源**（公网镜像站）。
 //
-// 注意：它**不是**在线升级的源。在线升级读的是 Cfg.UpgradeSource，
-// 默认留空（不启用网络升级）。原注释写"面板升级也用它"是错的，已纠正。
-// 2026-09-17 用户定的分工：**大件一律走快镜像**。zizdog.com（腾讯云北京 VPS）
-// 只当"安装脚本 + 面板本体/在线升级"的源（数据量小）；CLT 整包 632MB，
-// 实测 zizdog.com 只有 298–654 KB/s 且整条链路限速（见下方注释里的复测），
-// 所以默认基址改成自建镜像站（5.6–8.9 MB/s）。镜像站对 /zizpanel/ 有**按需回源**
-// （nginx @pull → zizdog.com），首次取完即缓存，之后走本地。
-// 注意：它**不是**在线升级的源（升级源是 Cfg.UpgradeSource）。
-// ⚠️ 2026-09-18 修正：这个常量过去写的是 `https://mirror.zizdog.com:8888/zizpanel`
-// —— 而那个**公网入口本身**已经用不了（TLS 能握手、随后空响应/连接被拒）。
-// 真机后果（重装后的 mini）：面板设置里的镜像基址探不通（正常回落），接着探这个
-// 静态兜底也探不通，于是"CLT 镜像这条路整个走不通"，只能去弹 Apple 的 GUI 对话框；
-// 而 **zizdog.com 上的同一份清单是好的**（实测 200，且有 632MB 的包），
-// 镜像站局域网入口上也有整套 CLT。
-//
-// 所以静态兜底改成 zizdog.com（它是安装源，一直可达），局域网入口由
-// cltMirrorBaseFor 的候选链负责（优先、更快）。
-const cltMirrorBaseDefault = "https://zizdog.com/zizpanel"
+// 2026-09-22 用户决定：删掉 zizdog.com 上的 /zizpanel/clt（腾讯云 4 Mbps，1.3 GB
+// 载荷没有意义），CLT 的加速只有镜像站这一条 —— 整套 21 片与逐片 sha256 都在镜像
+// 本地（实测 2026-09-22：<base>/zizpanel/clt/index.json 200、抽样分片 sha256 逐位一致）。
+// 代价如实说：镜像站不可达时，CLT 只剩苹果 softwareupdate / 弹窗那条路。
+// 它**不是**在线升级的源（升级源是 Cfg.UpgradeSource）。
+const cltMirrorBaseDefault = "https://mirror.zizdog.com:8888/zizpanel"
 
 // cltInstallPkgs 是真正需要安装的组件：CLTools_Executables.pkg（576 MB，真正的
 // 工具链，`/usr/bin/python3`、`clang`、`git` 都在里面）与 CLTools_macOSNMOS_SDK.pkg
