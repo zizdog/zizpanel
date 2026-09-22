@@ -258,3 +258,107 @@ func TestProxiesSSLColumnsMigrateBackwardCompatible(t *testing.T) {
 	}
 	_ = st2.Close()
 }
+
+// TestServicesInstalledVersionMigratesBackwardCompatible 锁住 2026-09-22 新增的
+// services.installed_version 列对老库向后兼容：
+//   - 老库（没有这一列）升级后必须补上，且默认空串；
+//   - 老记录一个字节都不许变（用户的服务记录不能因为加列而丢）；
+//   - 二次打开必须幂等（ALTER TABLE 不能重复执行）。
+//
+// 为什么值得一条：版本是"装了但镜像上有新版"的唯一依据；若老库升级后这一列缺失，
+// 查询会整条失败 —— 服务列表与已安装卡片会一起消失，比功能少一点严重得多。
+func TestServicesInstalledVersionMigratesBackwardCompatible(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "panel.db")
+
+	// 1) 造一个"加版本列之前"的老库，并塞一条服务记录。
+	old, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(context.Background(), `
+		CREATE TABLE services (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			name         TEXT    NOT NULL UNIQUE,
+			display_name TEXT    NOT NULL,
+			kind         TEXT    NOT NULL,
+			category     TEXT    NOT NULL DEFAULT 'other',
+			icon         TEXT    NOT NULL DEFAULT '',
+			description  TEXT    NOT NULL DEFAULT '',
+			port         INTEGER NOT NULL DEFAULT 0,
+			launch_label TEXT NOT NULL DEFAULT '',
+			plist_path   TEXT NOT NULL DEFAULT '',
+			work_dir     TEXT NOT NULL DEFAULT '',
+			start_cmd    TEXT NOT NULL DEFAULT '',
+			container    TEXT NOT NULL DEFAULT '',
+			compose_file TEXT NOT NULL DEFAULT '',
+			image        TEXT NOT NULL DEFAULT '',
+			health_url   TEXT NOT NULL DEFAULT '',
+			health_expect TEXT NOT NULL DEFAULT '',
+			log_path     TEXT NOT NULL DEFAULT '',
+			autostart    INTEGER NOT NULL DEFAULT 0,
+			enabled      INTEGER NOT NULL DEFAULT 1,
+			managed      INTEGER NOT NULL DEFAULT 0,
+			stopped_by_user INTEGER NOT NULL DEFAULT 0,
+			created_at   TEXT NOT NULL DEFAULT '',
+			updated_at   TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(context.Background(),
+		`INSERT INTO services(name,display_name,kind,created_at,updated_at)
+		 VALUES('老服务','老服务','native','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2) 当前版本打开：必须补列，且老记录还在、版本为空。
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatalf("老库升级失败（迁移不向后兼容）: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+
+	found := false
+	rows, err := st.DB().QueryContext(ctx, "PRAGMA table_info(services)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == "installed_version" {
+			found = true
+		}
+	}
+	_ = rows.Close()
+	if !found {
+		t.Fatalf("迁移没有补上 services.installed_version 列")
+	}
+
+	var name, version string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT display_name, installed_version FROM services WHERE name='老服务'`).
+		Scan(&name, &version); err != nil {
+		t.Fatalf("老记录读不出来（加列把数据弄丢了）: %v", err)
+	}
+	if name != "老服务" || version != "" {
+		t.Fatalf("老记录应原样保留且版本为空，实际 display_name=%q version=%q", name, version)
+	}
+
+	// 3) 二次打开幂等。
+	st2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("二次打开失败（迁移不幂等）: %v", err)
+	}
+	_ = st2.Close()
+}

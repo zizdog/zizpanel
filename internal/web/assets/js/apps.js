@@ -197,6 +197,17 @@ function dockerImagesOf(a) {
 // 服务记录"（内部概念）。两者对用户都是"已经装好了"，所以合并成同一个判断。
 function isInstalled(a) { return !!(a && (a.installed || a.adopted)); }
 
+// versionPillOf 给"本机装着的版本"一枚 pill（拿不到就不给）。
+//
+// 数据来自后端 installed_version：brew 类现查 `brew list --versions`，其余轨来自
+// 安装时记录（见 services.Manager.RecordInstalledVersion）。**空就是空** ——
+// 面板没有版本真源时如实不显示，绝不编一个版本号（目录声明版本不是本机事实）。
+function versionPillOf(a) {
+  const v = String((a && a.installed_version) || '').trim();
+  if (!v) return null;
+  return h('span.pill', { text: v, title: '本机装着的版本（brew 类现查 brew list --versions；其余来自安装时记录）' });
+}
+
 // ---------------------------------------------------------------------------
 //  市场卡片的「更新检查」（按需探测 + sessionStorage 缓存）
 // ---------------------------------------------------------------------------
@@ -360,6 +371,7 @@ export function AppsView(content, ctx = {}) {
       // 用户默认落地的就是这个 Tab（2026-09-22 zizvideo 报障：有新版却看不见入口）。
       updateBadgeOf,
       updateAction,
+      versionPillOf,
     });
   }
 
@@ -495,8 +507,10 @@ export function AppsView(content, ctx = {}) {
       && !updateChecking[a.id] && (force || !updateCheckFresh(updateChecks[a.id])));
   }
 
-  // ensureUpdateChecks 对当前可见列表里符合条件的条目各探测一次，全部落定后只重画一次
-  //（这样"可更新"分组只跳一次）。已有一轮在飞时不重复发请求，只把 onDone 接在它后面。
+  // ensureUpdateChecks 一次批量拿**全部**结论（后端一次 `brew outdated` + 动态索引），
+  // 写进同一份 updateChecks —— 「已安装」与「应用市场」两个子 Tab 共用它。
+  // 按卡片逐个探测会跑 N 次联网比对（13 个 brew 应用 = 13 次），所以这里必须批量。
+  // force=true（用户点刷新/检查更新）时忽略 TTL 重查。
   function ensureUpdateChecks(list, onDone, force) {
     if (updateInflight) {
       if (typeof onDone === 'function') updateInflight.then(() => onDone());
@@ -504,22 +518,39 @@ export function AppsView(content, ctx = {}) {
     }
     const targets = (list || []).filter((a) => eligibleForUpdateCheck(a, !!force));
     if (!targets.length) return;
-    const jobs = targets.map((a) => {
-      updateChecking[a.id] = true;
-      return api.marketUpdateCheck(a.id, !!force)
-        .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
-        .catch((e) => {
-          // 接口本身失败（网络/权限）也存成 unknown：否则每次重画都会再打一次。
-          updateChecks[a.id] = updateCheckFailure(e);
-        })
-        .finally(() => { delete updateChecking[a.id]; });
-    });
-    const round = Promise.allSettled(jobs).then(() => { saveUpdateCheckStore(); });
+    const ids = targets.map((a) => a.id);
+    for (const id of ids) updateChecking[id] = true;
+    const round = api.marketUpdates(!!force)
+      .then((resp) => { applyUpdatesResponse(resp, ids); })
+      .catch((e) => { for (const id of ids) updateChecks[id] = updateCheckFailure(e); })
+      .then(() => {
+        for (const id of ids) delete updateChecking[id];
+        saveUpdateCheckStore();
+      });
     updateInflight = round;
     round.then(() => {
       if (updateInflight === round) updateInflight = null;
       if (typeof onDone === 'function') onDone();
     });
+  }
+
+  // applyUpdatesResponse 把批量结论并进 updateChecks。
+  //
+  // 目标里**没有出现在 items** 的条目 = 面板现在拿不到这个应用的可比版本
+  // ⇒ 如实记 unknown（界面不给徽标、也不说"已是最新"）。
+  function applyUpdatesResponse(resp, ids) {
+    const items = (resp && resp.items) || {};
+    const at = (resp && resp.checked_at) || new Date().toISOString();
+    for (const id of ids) {
+      if (items[id] && typeof items[id] === 'object') {
+        updateChecks[id] = items[id];
+        continue;
+      }
+      updateChecks[id] = {
+        installed: '', latest: '', update_available: false, unknown: true, checked_at: at,
+        error: '面板现在拿不到这个应用的可比版本（它没有版本真源）',
+      };
+    }
   }
 
   // updateCheckFailure 把接口/网络失败折叠成一条**如实的 unknown**（不猜结论）。
@@ -531,21 +562,44 @@ export function AppsView(content, ctx = {}) {
     };
   }
 
-  // forceUpdateCheck 是卡片上「检查更新」这颗按钮：忽略 TTL 重新查这一个条目
-  //（unknown 之后用户要有个重试的办法）。fresh=1 让后端也绕开它的进程内缓存。
+  // forceUpdateCheck 是卡片上「检查更新」这颗按钮：忽略 TTL 重新查。
+  // brew 条目走批量接口（fresh=1，后端重跑一次 `brew outdated`）；
+  // 动态索引条目（zizvideo 这类没有 brew_formula 的）走单条按需接口。
   function forceUpdateCheck(a) {
     if (!a || !a.id || updateChecking[a.id]) return;
     invalidateUpdateCheck(a.id);
     updateChecking[a.id] = true;
     renderGrid(); // 让"检查更新中…"立刻可见
+    const done = () => {
+      delete updateChecking[a.id];
+      saveUpdateCheckStore();
+      afterUpdateChecks();
+    };
+    if (a.brew_formula) {
+      api.marketUpdates(true)
+        .then((resp) => { applyUpdatesResponse(resp, [a.id]); })
+        .catch((e) => { updateChecks[a.id] = updateCheckFailure(e); })
+        .then(done);
+      return;
+    }
     api.marketUpdateCheck(a.id, true)
       .then((c) => { updateChecks[a.id] = (c && typeof c === 'object') ? c : {}; })
       .catch((e) => { updateChecks[a.id] = updateCheckFailure(e); })
-      .finally(() => {
-        delete updateChecking[a.id];
-        saveUpdateCheckStore();
-        afterUpdateChecks();
-      });
+      .then(done);
+  }
+
+  // startUpgrade 是「更新」按钮的动作：统一打 POST /market/{id}/upgrade，
+  // 后端按轨分流（brew → `brew upgrade`；动态索引条目 → 复用安装流程）。
+  // 刻意不复用 preflight：应用已经装着在跑，更新不需要端口/依赖预检；
+  // 而 `brew install` 对已装包是**幂等跳过**，拿它当更新就是"点了没反应还报成功"。
+  function startUpgrade(a) {
+    if (!a || !a.id) return;
+    taskCenter.start({
+      kind: 'upgrade',
+      target: a.id,
+      title: '更新 ' + (a.name || a.id),
+      start: () => api.marketUpgrade(a.id),
+    });
   }
 
   // afterUpdateChecks 是探测落定后的重画（页面已切走就不再动 DOM）。
@@ -599,8 +653,8 @@ export function AppsView(content, ctx = {}) {
     if (updatePendingOf(a)) {
       return [h('button.btn.btn-sm.btn-primary', {
         text: '更新',
-        title: '按镜像索引安装最新版（与「安装」同一套流程：复核 sha256、架构与版本后重启服务）',
-        onclick: () => openInstaller(a),
+        title: '更新到最新版：brew 条目走 `brew upgrade`；独立产物条目按最新版重装并复核 sha256 与版本',
+        onclick: () => startUpgrade(a),
       })];
     }
     return [h('button.btn.btn-sm', {
@@ -1240,6 +1294,7 @@ export function AppsView(content, ctx = {}) {
       subtitleTitle: a.description || '',
       pills: [
         a.port > 0 ? h('span.pill', { text: ':' + a.port }) : null,
+        versionPillOf(a),
         a.kind === 'native' ? h('span.pill.brand', { text: '原生' }) : null,
         a.kind === 'compose' ? h('span.pill.brand', { text: 'Docker' }) : null,
         // 原生 brew 服务：记录在、但 plist 不在 = 服务其实没注册（ollama 就是这样，

@@ -617,11 +617,25 @@ func brewErrorLineish(l string) bool {
 //   - 每次尝试都写 result.step（用了哪个源、成功还是失败、失败的真实原因）；
 //   - 全部失败时把每个源的真实错误**逐条**列进 error，并给出可行动的下一步。
 func (m *Manager) brewInstall(ctx context.Context, res *InstallResult, timeout time.Duration, formulas ...string) (string, error) {
+	return m.brewVerb(ctx, res, "install", "安装", timeout, formulas...)
+}
+
+// brewUpgrade 把已装的 formula 升到最新版（与 install 共用同一套换源/坏包/诊断逻辑）。
+//
+// 为什么必须单独一个 verb 而不能复用 brewInstall：`brew install <已装的包>` 是
+// **幂等跳过**（"already installed" 直接返回 0），于是"点了更新却什么都没做"——
+// 那是最典型的谎报成功形态。升级只有 `brew upgrade` 一条路。
+func (m *Manager) brewUpgrade(ctx context.Context, res *InstallResult, timeout time.Duration, formulas ...string) (string, error) {
+	return m.brewVerb(ctx, res, "upgrade", "更新", timeout, formulas...)
+}
+
+// brewVerb 是 install / upgrade 的共同实现（只有动词与文案不同）。
+func (m *Manager) brewVerb(ctx context.Context, res *InstallResult, verb, verbCN string, timeout time.Duration, formulas ...string) (string, error) {
 	formulaList := strings.Join(formulas, "、")
 	if len(formulas) == 0 {
-		return "", fmt.Errorf("brewInstall 没有指定任何 formula")
+		return "", fmt.Errorf("brew %s 没有指定任何 formula", verb)
 	}
-	args := append([]string{"install"}, formulas...)
+	args := append([]string{verb}, formulas...)
 	srcs := m.brewInstallSources(ctx, formulas[0])
 
 	var (
@@ -641,7 +655,7 @@ func (m *Manager) brewInstall(ctx context.Context, res *InstallResult, timeout t
 		lastText = text
 		if err == nil {
 			if res != nil {
-				res.step(ctx, "安装成功（源："+src.Name+"）："+formulaList)
+				res.step(ctx, verbCN+"成功（源："+src.Name+"）："+formulaList)
 			}
 			return text, nil
 		}
@@ -660,17 +674,49 @@ func (m *Manager) brewInstall(ctx context.Context, res *InstallResult, timeout t
 	detail := strings.Join(failures, "\n  ")
 	if m.opt.OfflineOnly {
 		return lastText, fmt.Errorf(
-			"安装 %s 失败：离线模式（仅走镜像站）下不允许回落公网/官方源，因此只试了 1 个源。\n  %s\n"+
+			"%s %s 失败：离线模式（仅走镜像站）下不允许回落公网/官方源，因此只试了 1 个源。\n  %s\n"+
 				"请确认镜像站已同步该瓶，或关闭「仅走镜像站（离线）」后重试。",
-			formulaList, detail)
+			verbCN, formulaList, detail)
 	}
 	return lastText, fmt.Errorf(
-		"安装 %s 失败：面板试过的 %d 个源都不可用，各源的真实错误如下：\n  %s\n"+
+		"%s %s 失败：面板试过的 %d 个源都不可用，各源的真实错误如下：\n  %s\n"+
 			"若错误里出现 `Bottle reports different checksum` / 0 字节（e3b0c442…），"+
 			"说明这些镜像上还没有这个版本的 arm64 bottle（实测 USTC 403、清华/阿里云/腾讯 404），"+
 			"而官方源也不通；建议稍后重试（镜像侧同步有延迟），"+
-			"或先清掉 brew 下载缓存再手工执行 `brew install %s`。",
-		formulaList, len(srcs), detail, strings.Join(formulas, " "))
+			"或先清掉 brew 下载缓存再手工执行 `brew %s %s`。",
+		verbCN, formulaList, len(srcs), detail, verb, strings.Join(formulas, " "))
+}
+
+// UpgradeBrewApp 把某个 brew 应用更新到最新版，并把升级后的真实版本写回服务记录。
+//
+// 只升这一个 formula；依赖是否连带由 brew 自己决定（面板不替 brew 脑补）。
+// 升级成功但端口没在听时**如实写一条提示**（不是装作失败，也不是装作一切正常）。
+func (m *Manager) UpgradeBrewApp(ctx context.Context, app App, res *InstallResult) error {
+	formula := strings.TrimSpace(app.BrewFormula)
+	if formula == "" {
+		return fmt.Errorf("「%s」不是 Homebrew 应用，不能走 brew upgrade", app.Name)
+	}
+	if res != nil {
+		res.step(ctx, "更新 "+formula+" 到最新版（`brew upgrade "+formula+"`；已装应用不能用 install，那是幂等跳过）")
+	}
+	if _, err := m.brewUpgrade(ctx, res, 30*time.Minute, formula); err != nil {
+		return err
+	}
+	// 写入升级后的真实版本（更新检测据此判断"还有没有新版"）。
+	if vers, err := m.InstalledFormulaVersionsErr(ctx); err == nil {
+		if _, v, ok := ResolveBrewFormula(formula, vers); ok {
+			m.RecordInstalledVersion(ctx, app.ID, v)
+			if res != nil {
+				res.step(ctx, "已装版本现在是 "+v)
+			}
+		}
+	}
+	// 升级不会自动重启 `brew services` 管着的旧进程：端口没在听就明说，别让用户以为万事大吉。
+	if app.Port > 0 && res != nil && !portListening(ctx, app.Port) {
+		res.step(ctx, fmt.Sprintf("提示：升级已完成，但 %d 端口现在没有监听 —— "+
+			"到「服务管理」或这里点一次「重启」让新版本生效", app.Port))
+	}
+	return nil
 }
 
 // brewInstallRun 跑一次尝试。测试通过 brewSourceRunOverride 注入假执行器，
@@ -2066,6 +2112,42 @@ func healthURLFor(a App) string {
 		return ""
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d%s", a.WebPort(), a.HealthPath)
+}
+
+// RecordInstalledVersion 按 launchd 标签把"这次装出来的版本"写进服务记录。
+//
+// 为什么需要：独立产物类（frpc / alist / memos …）没有统一的 `--version` 真源，
+// 而"装了但镜像上有新版"必须拿**已装版本**跟镜像索引的 latest 比 —— 不记就只能
+// 永远显示"未知"（用户 2026-09-22 要求给每个应用加版本号）。
+//
+// 为什么按标签查而不是按服务名：记录的 name 由纳管流程从 plist 推导
+// （可能是 sh.brew.xxx 这种），安装器手上确定有的只有 label。
+//
+// 尽力而为：写不进去不影响"这次装成功没有"（版本只是展示与更新检测的输入），
+// 所以只记一条日志，不返回错误 —— 但**不谎报**：没写进去就是没写进去。
+func (m *Manager) RecordInstalledVersion(ctx context.Context, label, version string) {
+	if label == "" || strings.TrimSpace(version) == "" || m.repo == nil {
+		return
+	}
+	version = strings.TrimSpace(version)
+	list, err := m.repo.List(ctx)
+	if err != nil {
+		reconcileLog.Warn("记录已装版本失败（读服务记录）：%v", err)
+		return
+	}
+	for _, s := range list {
+		if s.LaunchLabel != label {
+			continue
+		}
+		if s.InstalledVersion == version {
+			return
+		}
+		if err := m.repo.SetInstalledVersion(ctx, s.Name, version); err != nil {
+			reconcileLog.Warn("记录已装版本失败（%s=%s）：%v", s.Name, version, err)
+		}
+		return
+	}
+	reconcileLog.Info("没有找到 label=%s 的服务记录，已装版本 %s 没有落库", label, version)
 }
 
 // RegisterInstalledService 把面板刚装好的服务登记进「服务管理」。

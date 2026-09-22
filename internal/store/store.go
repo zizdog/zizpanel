@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS services (
     container    TEXT NOT NULL DEFAULT '',
     compose_file TEXT NOT NULL DEFAULT '',
     image        TEXT NOT NULL DEFAULT '',
+    -- 本机真实装着的版本（安装时由 services.Manager.RecordInstalledVersion 写入）。
+    -- 空 = 没有版本真源（brew 类由 brew list --versions 现查）—— 空不是"已是最新"。
+    installed_version TEXT NOT NULL DEFAULT '',
     -- 通用
     health_url   TEXT NOT NULL DEFAULT '',
     health_expect TEXT NOT NULL DEFAULT '',
@@ -297,7 +300,8 @@ func (s *Store) migrate(ctx context.Context) error {
 	// 多了几列就让规则失效或让启动报错。ADD COLUMN 带 NOT NULL DEFAULT 会给
 	// 已有行填默认值 —— ssl_enabled=0 正是"老规则默认关 SSL"。
 	if err := s.ensureColumns(ctx, "services", map[string]string{
-		"stopped_by_user": "INTEGER NOT NULL DEFAULT 0",
+		"stopped_by_user":   "INTEGER NOT NULL DEFAULT 0",
+		"installed_version": "TEXT NOT NULL DEFAULT ''",
 	}); err != nil {
 		return err
 	}

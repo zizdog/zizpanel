@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,64 @@ import (
 	"strings"
 	"time"
 )
+
+// OutdatedFormulas 返回"有新版可升级"的 brew formula → 上游当前版本。
+//
+// 为什么它是 brew 应用更新检测的唯一真源：面板**不 pin** brew 版本
+// （services.AppVersion 对 brew 条目返回空），版本该不该升只有 brew 自己知道
+// （`brew outdated` 读 formula API 比对），拿目录里的数字去比就是编。
+//
+// 返回 (map, ok)：**ok=false = 这次没查成**（brew 不可用/超时/联网失败）。
+// 调用方必须如实显示"未知" —— 绝不许把空 map 当成"已是最新"（那正是谎报）。
+// 只读、不装不卸；但要联网取元数据（比 `brew list` 慢），所以调用方按需跑 + 缓存。
+func (m *Manager) OutdatedFormulas(ctx context.Context) (map[string]string, bool) {
+	if m.brewOutdatedProbe != nil {
+		vers, ok := m.brewOutdatedProbe(ctx)
+		if vers == nil {
+			vers = map[string]string{}
+		}
+		return vers, ok
+	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	// 复用既有的 brew 执行通道（它会以真实用户降权执行 —— Homebrew 拒绝 root）。
+	out, err := m.BrewCapture(ctx, 90*time.Second, "outdated", "--json=v2")
+	if err != nil {
+		return nil, false
+	}
+	return parseBrewOutdatedJSON([]byte(out))
+}
+
+// parseBrewOutdatedJSON 解析 `brew outdated --json=v2` 的输出。
+//
+// 单独抽出来是为了**可测**，也为了处理一个真实细节：执行通道把 stderr 与 stdout
+// 合成一路（进度/提示行会混进来），所以只取最外层 `{...}`。解析失败必须 ok=false ——
+// 把"没看懂"当成"没有可升级的"，就是在谎报"已是最新"。
+func parseBrewOutdatedJSON(out []byte) (map[string]string, bool) {
+	text := strings.TrimSpace(string(out))
+	if i := strings.Index(text, "{"); i > 0 {
+		text = text[i:]
+	}
+	if j := strings.LastIndex(text, "}"); j >= 0 {
+		text = text[:j+1]
+	}
+	var parsed struct {
+		Formulae []struct {
+			Name           string `json:"name"`
+			CurrentVersion string `json:"current_version"`
+		} `json:"formulae"`
+	}
+	if json.Unmarshal([]byte(text), &parsed) != nil {
+		return nil, false
+	}
+	res := make(map[string]string, len(parsed.Formulae))
+	for _, f := range parsed.Formulae {
+		if n := strings.TrimSpace(f.Name); n != "" {
+			res[n] = f.CurrentVersion
+		}
+	}
+	return res, true
+}
 
 // ============================================================================
 //  面板内安装 Homebrew（含命令行开发者工具）

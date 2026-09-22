@@ -52,10 +52,17 @@ func TestMarketListSupportsUpdateCheckIsStaticNoProbe(t *testing.T) {
 	if _, has := ziz["update_available"]; has {
 		t.Error("列表不该带探测结论（update_available 是按需接口的字段）")
 	}
-	for _, id := range []string{"nginx", "php82", "frpc"} {
+	for _, id := range []string{"nginx", "php82"} {
+		it := marketItem(t, ts, cookies, id)
+		if it["supports_update_check"] != true {
+			t.Errorf("%s 是 brew 条目（真源是 brew outdated），列表必须给 supports_update_check=true，实际 %v",
+				id, it["supports_update_check"])
+		}
+	}
+	for _, id := range []string{"frpc", "iopaint"} {
 		it := marketItem(t, ts, cookies, id)
 		if it["supports_update_check"] != false {
-			t.Errorf("%s 不该支持更新检查，实际 %v", id, it["supports_update_check"])
+			t.Errorf("%s 没有版本真源，不该支持更新检查，实际 %v", id, it["supports_update_check"])
 		}
 	}
 
@@ -130,7 +137,8 @@ func TestMarketUpdateCheckEndpointAndCache(t *testing.T) {
 	}
 }
 
-// TestMarketUpdateCheckRejectsUnsupportedApp 非动态版本条目直接 4xx，不假装能检查。
+// TestMarketUpdateCheckRejectsUnsupportedApp 没有版本真源的条目直接 4xx，不假装能检查。
+// （brew 条目不在这个接口里：它们走批量接口 GET /api/v1/market/updates，一次问 brew。）
 func TestMarketUpdateCheckRejectsUnsupportedApp(t *testing.T) {
 	srv, ts := newTestServer(t)
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
@@ -140,8 +148,93 @@ func TestMarketUpdateCheckRejectsUnsupportedApp(t *testing.T) {
 		return services.ZizvideoUpdateCheck{}
 	}
 
-	res, _, _ := doJSON(t, ts, "GET", "/api/v1/market/nginx/update-check", nil, cookies)
+	res, _, _ := doJSON(t, ts, "GET", "/api/v1/market/frpc/update-check", nil, cookies)
 	if res.StatusCode != http.StatusBadRequest {
-		t.Errorf("nginx 不支持更新检查，应 400，实际 %d", res.StatusCode)
+		t.Errorf("frpc 没有版本真源，不支持更新检查，应 400，实际 %d", res.StatusCode)
+	}
+}
+
+// TestMarketUpdatesBatchesBrewAndSharesZizvideo 锁住批量接口的三件事：
+//
+//	① 一次请求给全部条目结论（不是每张卡各问一次）；
+//	② brew 清单**没查成**时如实 unknown，绝不写成"已是最新"；
+//	③ 动态索引条目复用同一条按需探测与缓存（两个子 Tab 共用一份结论）。
+func TestMarketUpdatesBatchesBrewAndSharesZizvideo(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	// 本机装着 nginx 1.27.0（预置已装清单；测试环境没有真的 brew）。
+	srv.mktMu.Lock()
+	srv.mktBrew = map[string]bool{"nginx": true}
+	srv.mktBrewVer = map[string]string{"nginx": "1.27.0"}
+	srv.mktBrewOK = true
+	srv.mktBrewAt = time.Now()
+	srv.mktMu.Unlock()
+
+	var probes atomic.Int64
+	srv.marketUpdateCheckOverride = func(_ context.Context, id string) services.ZizvideoUpdateCheck {
+		probes.Add(1)
+		return services.ZizvideoUpdateCheck{
+			App: id, Installed: "0.1.1-mvp", Latest: "0.1.2-mvp",
+			UpdateAvailable: true, CheckedAt: time.Now().Format(time.RFC3339), Source: "mirror-index",
+		}
+	}
+
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/market/updates?fresh=1", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("批量更新检查应 200，实际 %d", res.StatusCode)
+	}
+	data, _ := out["data"].(map[string]any)
+	if data == nil {
+		t.Fatalf("响应缺少 data：%v", out)
+	}
+	items, _ := data["items"].(map[string]any)
+	if items == nil {
+		t.Fatalf("响应缺少 items：%v", data)
+	}
+
+	// nginx：已装版本必须给出来；brew 清单这次查不成 ⇒ unknown，且不许说有新版。
+	nginx, _ := items["nginx"].(map[string]any)
+	if nginx == nil {
+		t.Fatalf("已安装的 brew 条目必须出现在批量结论里：%v", items)
+	}
+	if nginx["installed"] != "1.27.0" {
+		t.Errorf("nginx 的已装版本应来自 brew list，实际 %v", nginx["installed"])
+	}
+	if nginx["update_available"] == true {
+		t.Errorf("brew 可升级清单没查成时不许说有新版：%v", nginx)
+	}
+	if nginx["unknown"] != true {
+		t.Errorf("brew 可升级清单没查成时必须如实 unknown（不许当成已是最新）：%v", nginx)
+	}
+	if data["brew_ok"] == true {
+		t.Errorf("测试环境没有可用的 brew，brew_ok 应为 false：%v", data)
+	}
+
+	// zizvideo：动态条目走同一条按需探测。
+	ziz, _ := items["zizvideo"].(map[string]any)
+	if ziz == nil || ziz["update_available"] != true || ziz["latest"] != "0.1.2-mvp" {
+		t.Fatalf("动态条目应给出有新版结论：%v", items["zizvideo"])
+	}
+	if n := probes.Load(); n != 1 {
+		t.Errorf("一次批量请求只该探一次动态条目，实际 %d 次", n)
+	}
+
+	// TTL 内再来一次：不许重复探测（两个子 Tab 共用这份结论）。
+	res2, _, _ := doJSON(t, ts, "GET", "/api/v1/market/updates", nil, cookies)
+	if res2.StatusCode != 200 {
+		t.Fatalf("第二次批量检查应 200，实际 %d", res2.StatusCode)
+	}
+	if n := probes.Load(); n != 1 {
+		t.Errorf("TTL 内应命中批量缓存，实际探测 %d 次", n)
+	}
+
+	// 安装/升级完成后必须能立刻失效（api_tasks.go 的收尾钩子）。
+	srv.forgetMarketUpdates()
+	srv.forgetUpdateCheck("zizvideo")
+	_, _, _ = doJSON(t, ts, "GET", "/api/v1/market/updates", nil, cookies)
+	if n := probes.Load(); n != 2 {
+		t.Errorf("失效后应重新探测，实际 %d 次", n)
 	}
 }

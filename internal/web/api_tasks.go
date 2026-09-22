@@ -73,7 +73,7 @@ type taskRunner func(ctx context.Context, log tasks.LogFunc) (any, error)
 // 让它们背这份等待没有意义。
 func marketAffectingTask(kind string) bool {
 	switch kind {
-	case "install", "uninstall", "site-install":
+	case "install", "uninstall", "site-install", "upgrade":
 		return true
 	}
 	return false
@@ -128,6 +128,7 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 			// 更新检查的结论也必须失效：刚装/刚更新完，旧结论（"有新版"）留着会让
 			// 前端刷新时又拿到它，徽标清不掉（target 就是应用 ID）。
 			s.forgetUpdateCheck(target)
+			s.forgetMarketUpdates()
 		}
 		s.kickEnvHeal()
 		return res, err

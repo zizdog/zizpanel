@@ -746,6 +746,25 @@ func marketVisibleApps(apps []services.App) []services.App {
 	return out
 }
 
+// installedVersionOf 取"本机装着的版本"（真实版本，不是目录声明）。
+//
+// 本机版本只有两个可信来源，都不许猜：
+//   - brew 类：`brew list --versions` 的批量结果（列表路径本来就有，零额外开销）；
+//     经 ResolveBrewFormula 处理 `php@8.4` ↔ 机器上 `php 8.4.7` 这种等价形态；
+//   - 其余轨（独立产物 / 自研安装器）：安装时写进服务记录的版本，见
+//     services.Service.InstalledVersion。
+//
+// 拿不到返回空字符串 —— 调用方必须如实显示"未知"，**不许**拿它当"已是最新"。
+func installedVersionOf(brewFormula string, brewVers map[string]string) string {
+	if brewFormula == "" {
+		return ""
+	}
+	if _, v, ok := services.ResolveBrewFormula(brewFormula, brewVers); ok {
+		return v
+	}
+	return ""
+}
+
 func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	// fresh=1 只给用户手动点的「刷新列表」用（2026-09-22 用户要求：打开页面读缓存，
@@ -879,6 +898,15 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 前端可以按需打 GET /api/v1/market/{id}/update-check 拿"装了但镜像上有更新吗"。
 		// **纯静态声明派生**：这里只读注册表，列表路径不联网、不起进程（AGENTS 第三节 7）。
 		SupportsUpdateCheck bool `json:"supports_update_check"`
+
+		// Version 是**目录声明的版本**（面板认为该装的版本），空 = 面板这边没有
+		// 版本真源（brew 交给 brew、动态条目真源在镜像索引）—— 前端不许把空当
+		// "已是最新"，只能如实说"未知"。
+		Version string `json:"version,omitempty"`
+		// InstalledVersion 是**本机真实装着的版本**：brew 类来自
+		// `brew list --versions`（一次批量探测，列表路径已有），其余轨来自安装时
+		// 记录在服务记录里的版本。拿不到就空（前端如实说"未知"）。
+		InstalledVersion string `json:"installed_version,omitempty"`
 	}
 	lanIP := s.lanIP()
 	apps := marketVisibleApps(services.Catalog())
@@ -1070,7 +1098,16 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			EngineConflict: engineConflict,
 			// 静态派生（注册表），列表路径里**不做**任何网络/exec。
 			SupportsUpdateCheck: services.SupportsUpdateCheck(a.ID),
-			Uninstall:           plan}
+			// 版本：声明版本取各轨的事实源（services.AppVersion）；已装版本这里只算
+			// brew 那一半（批量探测结果就在手上），其余轨由安装时记录补上。
+			Version:          services.AppVersion(a),
+			InstalledVersion: installedVersionOf(a.BrewFormula, brewVers),
+			Uninstall:        plan}
+		// 其余轨的已装版本来自安装时记录（见 services.Manager.RecordInstalledVersion）：
+		// brew 那一半上面已经算过，有就以 brew 为准（它才是本机事实）。
+		if it.InstalledVersion == "" && rec != nil {
+			it.InstalledVersion = rec.InstalledVersion
+		}
 		if plan.Kind == "none" && (adopted || artifacts) {
 			// 有记录/产物却给不出计划：如实说明，别让用户对着卡片猜。
 			it.Note = "面板找不到可卸载的对象（Homebrew 里没有这个包、也没有可清理的产物）；" +

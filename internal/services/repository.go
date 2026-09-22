@@ -30,7 +30,7 @@ func NewRepository(st *store.Store) *Repository { return &Repository{st: st} }
 func (r *Repository) Store() *store.Store { return r.st }
 
 const cols = `id,name,display_name,kind,category,icon,description,port,
-	launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,
+	launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,installed_version,
 	health_url,health_expect,log_path,autostart,enabled,managed,stopped_by_user,created_at,updated_at`
 
 func scanService(sc interface{ Scan(...any) error }) (*Service, error) {
@@ -39,7 +39,7 @@ func scanService(sc interface{ Scan(...any) error }) (*Service, error) {
 	var autostart, enabled, managed, stoppedByUser int
 	err := sc.Scan(&s.ID, &s.Name, &s.DisplayName, &kind, &s.Category, &s.Icon,
 		&s.Description, &s.Port, &s.LaunchLabel, &s.PlistPath, &s.WorkDir, &s.StartCmd,
-		&s.Container, &s.ComposeFile, &s.Image, &s.HealthURL, &s.HealthExpect,
+		&s.Container, &s.ComposeFile, &s.Image, &s.InstalledVersion, &s.HealthURL, &s.HealthExpect,
 		&s.LogPath, &autostart, &enabled, &managed, &stoppedByUser, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -115,12 +115,13 @@ func (r *Repository) Create(ctx context.Context, s *Service) error {
 	}
 	res, err := r.st.DB().ExecContext(ctx,
 		`INSERT INTO services(name,display_name,kind,category,icon,description,port,
-		 launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,
+		 launch_label,plist_path,work_dir,start_cmd,container,compose_file,image,installed_version,
 		 health_url,health_expect,log_path,autostart,enabled,managed,stopped_by_user)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.Name, s.DisplayName, string(s.Kind), s.Category, s.Icon, s.Description, s.Port,
 		s.LaunchLabel, s.PlistPath, s.WorkDir, s.StartCmd, s.Container, s.ComposeFile, s.Image,
-		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled), boolInt(s.Managed),
+		s.InstalledVersion, s.HealthURL, s.HealthExpect, s.LogPath,
+		boolInt(s.Autostart), boolInt(s.Enabled), boolInt(s.Managed),
 		boolInt(s.StoppedByUser))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -137,13 +138,27 @@ func (r *Repository) Update(ctx context.Context, s *Service) error {
 	_, err := r.st.DB().ExecContext(ctx,
 		`UPDATE services SET display_name=?,kind=?,category=?,icon=?,description=?,port=?,
 		 launch_label=?,plist_path=?,work_dir=?,start_cmd=?,container=?,compose_file=?,image=?,
+		 installed_version=?,
 		 health_url=?,health_expect=?,log_path=?,autostart=?,enabled=?,stopped_by_user=?,
 		 updated_at=datetime('now','localtime')
 		 WHERE name=?`,
 		s.DisplayName, string(s.Kind), s.Category, s.Icon, s.Description, s.Port,
 		s.LaunchLabel, s.PlistPath, s.WorkDir, s.StartCmd, s.Container, s.ComposeFile, s.Image,
-		s.HealthURL, s.HealthExpect, s.LogPath, boolInt(s.Autostart), boolInt(s.Enabled),
+		s.InstalledVersion, s.HealthURL, s.HealthExpect, s.LogPath,
+		boolInt(s.Autostart), boolInt(s.Enabled),
 		boolInt(s.StoppedByUser), s.Name)
+	return err
+}
+
+// SetInstalledVersion 只更新"已装版本"这一列（其余字段一个字都不动）。
+//
+// 为什么要单独的窄接口，而不是让调用方 Get→改→Update：Update 会整行覆写，
+// 安装过程中别处（reconcile/纳管）刚补上的字段可能被旧快照覆盖回去。
+// 装完只改这一列，最不容易出事。
+func (r *Repository) SetInstalledVersion(ctx context.Context, name, version string) error {
+	_, err := r.st.DB().ExecContext(ctx,
+		`UPDATE services SET installed_version=?, updated_at=datetime('now','localtime') WHERE name=?`,
+		version, name)
 	return err
 }
 

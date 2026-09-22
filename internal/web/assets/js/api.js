@@ -310,6 +310,10 @@ export const api = {
   // fresh=true 只在用户点「刷新列表」时传：后端会失效进程内探测缓存、重跑一次
   // brew/docker 复核。平时（含首次自动加载）不传，直接吃后端缓存。
   market: (fresh) => request('GET', `${API_BASE}/market${fresh ? '?fresh=1' : ''}`),
+  // 批量检查更新：一次问 brew（`brew outdated`）+ 动态索引条目，两个子 Tab 共用结论。
+  marketUpdates: (fresh) => request('GET', `${API_BASE}/market/updates${fresh ? '?fresh=1' : ''}`),
+  // 更新到最新版：后端按轨分流（brew → `brew upgrade`；动态索引条目 → 复用安装流程）。
+  marketUpgrade: (id) => request('POST', `${API_BASE}/market/${encodeURIComponent(id)}/upgrade`, {}),
   // 应用界面子路径：探测（每个应用"现在能不能真的打开"）+ 生成 nginx 入口。
   // 探测不是看 HTTP 200：它还会取页面里引用的 js/css，代理没改写对时
   // 页面照样 200、资源全 404（白屏），只看状态码会得出错误结论。

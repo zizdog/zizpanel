@@ -515,6 +515,9 @@ func (m *Manager) OrchestrateTarballInstall(ctx context.Context, d AppDescriptor
 	if err := ExecuteInstall(ec); err != nil {
 		return err
 	}
+	// 把这一版记进服务记录：安装器装的就是描述符里写死的这一版（spec.Tag）。
+	// 没有它，"装了但镜像上有新版"只能显示"未知" —— 目录声明（AppVersion）不是本机事实。
+	m.RecordInstalledVersion(ctx, d.Service.Label, spec.Tag)
 
 	result.Address = m.primaryIP()
 	// 凭据区块：口令/token **只**出现在这里（任务步骤与审计里不许有明文）。

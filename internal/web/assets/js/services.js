@@ -259,6 +259,8 @@ export function renderInstalledApps(container, opts = {}) {
     const pills = [
       h('span.pill' + (line.cls ? '.' + line.cls : ''), { text: line.text, title: line.title || '' }),
       port > 0 ? h('span.pill', { text: ':' + port }) : null,
+      // 本机装着的版本（后端 installed_version；拿不到就不显示，绝不编）。
+      (typeof opts.versionPillOf === 'function') ? opts.versionPillOf(m || s) : null,
       updatePill,
       // 「面板托管 / 仅纳管」pill 已删除（用户："弱化管纳这个概念"）。
       // 为什么不换成"由面板安装 / 本机已有"：记录里的 managed=false 并不能证明

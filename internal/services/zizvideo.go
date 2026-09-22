@@ -507,22 +507,16 @@ func (m *Manager) ZizvideoReady(ctx context.Context) (bool, string) {
 //
 // Unknown=true 表示**没拿到可信的期望值**（索引不可达 / 已装模块跑不起来 /
 // 版本号解析不了）：此时调用方既不能说"有更新"、也不能说"已是最新"。
-type ZizvideoUpdateCheck struct {
-	App             string `json:"app"`
-	Installed       string `json:"installed"`
-	Latest          string `json:"latest"`
-	UpdateAvailable bool   `json:"update_available"`
-	Unknown         bool   `json:"unknown"`
-	CheckedAt       string `json:"checked_at"`
-	Error           string `json:"error"`
-}
+// ZizvideoUpdateCheck 是 AppUpdate 的历史名字（zizvideo 是第一个有更新检查的条目）。
+// 保留别名是为了不动既有调用点与门禁；新代码一律用 AppUpdate。
+type ZizvideoUpdateCheck = AppUpdate
 
 // CheckZizvideoUpdate 按需探测一次：先跑已装模块的 --version，再读镜像索引比对。
 //
 // 未安装（二进制不在）⇒ Installed 为空，前端据此不给徽标（市场本来显示「安装」）；
 // 其余拿不到可信值的路径一律 Unknown，**绝不假装**有更新或已最新（铁律 11）。
-func (m *Manager) CheckZizvideoUpdate(ctx context.Context) ZizvideoUpdateCheck {
-	out := ZizvideoUpdateCheck{App: ZizvideoAppID, CheckedAt: time.Now().Format(time.RFC3339)}
+func (m *Manager) CheckZizvideoUpdate(ctx context.Context) AppUpdate {
+	out := AppUpdate{App: ZizvideoAppID, Source: "mirror-index", CheckedAt: time.Now().Format(time.RFC3339)}
 	bin := m.ZizvideoPathsFor().Bin
 	if !fileExecutable(bin) {
 		return out
@@ -698,7 +692,12 @@ func (m *Manager) InstallZizvideo(ctx context.Context, app App, result *InstallR
 	}
 
 	// ③ 系统 plist + bootstrap + 登记 + 验收。
-	return m.zizvideoInstallService(ctx, app, p, panelBin, result)
+	if err := m.zizvideoInstallService(ctx, app, p, panelBin, result); err != nil {
+		return err
+	}
+	// 把这一版记进服务记录（rel.Version 上面已经用它复核过二进制真的报这个版本）。
+	m.RecordInstalledVersion(ctx, ZizvideoLabel, rel.Version)
+	return nil
 }
 
 // zizvideoInstallService 写系统级 plist、装载、登记，并等 /healthz 返回 ok。

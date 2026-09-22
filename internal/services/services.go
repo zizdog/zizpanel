@@ -99,6 +99,11 @@ type Service struct {
 	Container   string `json:"container"`
 	ComposeFile string `json:"compose_file"`
 	Image       string `json:"image"`
+	// InstalledVersion 是本机**真实装着的版本**，安装时记录（见 RecordInstalledVersion）。
+	//
+	// 空 = 没有版本真源（面板自研安装器多数如此），调用方必须如实显示"未知" ——
+	// 空**不是**"已是最新"（brew 类的已装版本另有来源：`brew list --versions`）。
+	InstalledVersion string `json:"installed_version,omitempty"`
 
 	// 通用
 	HealthURL    string `json:"health_url"`
@@ -203,6 +208,10 @@ type Manager struct {
 	// 它必须能被表达出来：空集合 + ok=false 的含义是"**未复核**"，与"确实什么都没装"
 	// 完全不同 —— 混为一谈就会把全部 brew 应用谎报成"未安装"（2026-09-18 那一类）。
 	brewInstalledProbe func(ctx context.Context) (map[string]string, bool)
+	// brewOutdatedProbe 仅供测试：替换 `brew outdated --json=v2`（更新检测的真源）。
+	// 没有它，单测会真的去联网比版本，结论还随开发机装了什么而漂。
+	// 第二个返回值 = 这次探测**真的成功了**（false = brew 不可用/超时/联网失败）。
+	brewOutdatedProbe func(ctx context.Context) (map[string]string, bool)
 	// brewUsesProbe 仅供测试：替换 `brew uses --installed <formula>` 的探测。
 	// 返回 (依赖它的已装包, 这次查询是否真的成功)，后者决定计划里写"已检查"还是"未检查"。
 	brewUsesProbe func(ctx context.Context, formula string) ([]string, bool)
@@ -427,6 +436,14 @@ func (m *Manager) SetBrewInstalledProbeForTest(fn func(ctx context.Context) (map
 	prev := m.brewInstalledProbe
 	m.brewInstalledProbe = fn
 	return func() { m.brewInstalledProbe = prev }
+}
+
+// SetBrewOutdatedProbeForTest 替换 `brew outdated` 的探测，返回值供测试恢复。
+// 第二个返回值表示这次探测真的成功了（空 map + true 才是"确实没有可升级的包"）。
+func (m *Manager) SetBrewOutdatedProbeForTest(fn func(ctx context.Context) (map[string]string, bool)) func() {
+	prev := m.brewOutdatedProbe
+	m.brewOutdatedProbe = fn
+	return func() { m.brewOutdatedProbe = prev }
 }
 
 // SetLaunchdDirsForTest 替换"launchd 里找 plist 的目录集合"，返回值供测试恢复。

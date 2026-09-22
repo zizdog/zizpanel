@@ -77,6 +77,10 @@ type Server struct {
 	updateMu      sync.Mutex
 	updateChecks  map[string]cachedUpdateCheck
 	updateProbeMu sync.Mutex // 串行化探测：并发请求同一应用时只有一个真的去打镜像
+	// updateBatch 是**批量**更新检查的结论（一次 brew outdated + 动态索引）：
+	// 「已安装」与「应用市场」两个子 Tab 共用同一份（见 api_market_update.go）。
+	updateBatch   marketUpdatesResponse
+	updateBatchAt time.Time
 	// marketUpdateCheckOverride 仅供单测：替换真实探测（会联网 + 起子进程）。
 	marketUpdateCheckOverride func(ctx context.Context, id string) services.ZizvideoUpdateCheck
 
@@ -447,9 +451,14 @@ func (s *Server) routes() http.Handler {
 	// ---------- 应用市场 ----------
 	root.HandleFunc("GET /api/v1/market", s.requireAuth(s.handleMarketList))
 	root.HandleFunc("GET /api/v1/market/{id}/preflight", s.requireAuth(s.handleMarketPreflight))
-	// 按需检查"装了但镜像上有更新吗"（只对动态版本条目有意义；见 api_market_update.go）
+	// 按需检查"装了但镜像上有更新吗"（动态索引条目：单条强制复查；见 api_market_update.go）
 	root.HandleFunc("GET /api/v1/market/{id}/update-check", s.requireAuth(s.handleMarketUpdateCheck))
+	// 批量检查更新（一次 brew outdated + 动态索引）：两个子 Tab 共用一份结论。
+	root.HandleFunc("GET /api/v1/market/updates", s.requireAuth(s.handleMarketUpdates))
 	root.HandleFunc("POST /api/v1/market/{id}/install", s.requireAuth(s.handleMarketInstall))
+	// 更新到最新版：brew 条目走 `brew upgrade`（install 对已装包是幂等跳过），
+	// 动态索引条目复用安装流程（见 api_market_update.go 的 handleMarketUpgrade）。
+	root.HandleFunc("POST /api/v1/market/{id}/upgrade", s.requireAuth(s.handleMarketUpgrade))
 	// 一键装 LNMP：比逐个装市场条目多做了四件收尾工作，见 services/lnmp.go
 	// 先取版本候选（弹窗用）再开任务：POST 的 body 里就是用户在这次弹窗里的选择。
 	root.HandleFunc("GET /api/v1/market/lnmp-options", s.requireAuth(s.handleLNMPOptions))

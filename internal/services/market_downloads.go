@@ -1896,10 +1896,19 @@ func MarketAppFor(id string) (MarketApp, bool) {
 	return MarketApp{}, false
 }
 
-// SupportsUpdateCheck 报告这个应用的版本是否由镜像上的应用级索引**运行时决定** ——
-// 只有这种条目才谈得上"装了但镜像上有更新"。判据全部来自静态声明/注册表：
-// 列表路径据此给前端 supports_update_check，**不联网、不起进程**（AGENTS 第三节 7）。
+// SupportsUpdateCheck 报告这个条目**能不能检查更新**（前端据此显示「检查更新」入口）。
+//
+// 两条判据，都是纯静态的（列表路径**不联网、不起进程**，见 AGENTS 第三节 7）：
+//   - **brew 条目**：能。`brew outdated` 是唯一真源（面板不 pin brew 版本），
+//     批量检查时一次问 brew，不是每个卡片各问一次；
+//   - **动态索引条目**（zizvideo）：能。最新版来自镜像站的应用级索引。
+//
+// 其余条目（面板自研安装器多数没有版本真源）如实返回 false —— 前端不给入口，
+// 而不是给一个点了必然说"未知"的按钮。
 func SupportsUpdateCheck(id string) bool {
+	if a, ok := FindApp(id); ok && strings.TrimSpace(a.BrewFormula) != "" {
+		return true
+	}
 	if a, ok := MarketAppFor(id); ok {
 		for _, d := range a.Downloads {
 			if d.Purpose == MarketFetchReleaseBinary && d.Upstream.Dynamic {

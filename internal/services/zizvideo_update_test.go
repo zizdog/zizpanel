@@ -115,19 +115,31 @@ func TestZizvideoUpdateCheckNotInstalledSkipsProbe(t *testing.T) {
 	}
 }
 
-// ⑤ supports_update_check 只能由静态声明派生；当前动态版本条目**只有 zizvideo**。
+// ⑤ supports_update_check 只能由静态声明派生（列表路径不联网、不起进程）。
 //
-// 后端接口对非动态条目直接 400（api_market_update.go），所以"只有它"是那个
-// 硬编码分支的护栏：将来新增动态条目时这里会先红。
-func TestSupportsUpdateCheckIsStaticAndOnlyZizvideo(t *testing.T) {
+// 2026-09-22 起判据有两条：brew 条目（brew outdated 是唯一真源）与动态索引条目
+// （当前只有 zizvideo）。后端对动态条目以外的条目仍走 400 的按需接口，批量检查
+// 走 GET /api/v1/market/updates（bench: 一次问 brew，而不是每个卡片各问一次）。
+func TestSupportsUpdateCheckCoversBrewAndDynamicOnly(t *testing.T) {
 	if !SupportsUpdateCheck(ZizvideoAppID) {
 		t.Error("zizvideo 是动态版本条目，supports_update_check 必须为 true")
 	}
-	for _, id := range []string{"frpc", "nginx", "php82", "iopaint", "typecho"} {
-		if SupportsUpdateCheck(id) {
-			t.Errorf("%s 的版本不由镜像索引决定，不该支持更新检查", id)
+	// brew 条目：能查（`brew outdated`），这里只验静态判据，不跑 brew。
+	for _, id := range []string{"nginx", "php82", "mysql84", "ollama"} {
+		if !SupportsUpdateCheck(id) {
+			t.Errorf("%s 是 brew 条目，更新真源是 brew outdated，supports_update_check 应为 true", id)
 		}
 	}
+	// 没有版本真源的条目：必须为 false（自研安装器多数如此）。
+	for _, id := range []string{"iopaint", "typecho", "frpc"} {
+		if a, ok := FindApp(id); ok && a.BrewFormula != "" {
+			continue // 将来若给它加了 brew formula，这条断言就不该再管它
+		}
+		if SupportsUpdateCheck(id) {
+			t.Errorf("%s 没有版本真源（不是 brew、也不是动态索引），不该支持更新检查", id)
+		}
+	}
+	// 动态索引条目仍然只有 zizvideo（新加动态条目时这里会红，提醒接线）。
 	var dynamic []string
 	for _, a := range MarketApps() {
 		for _, d := range a.Downloads {
