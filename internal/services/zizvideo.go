@@ -235,6 +235,12 @@ func (m *Manager) downloadZizvideoBinary(ctx context.Context, result *InstallRes
 		return "", fmt.Errorf("%s 的 sha256 不匹配：期望 %s，实际 %s（文件已删除；"+
 			"镜像上的包与面板内置值不一致，请重新同步 apps/zizvideo）", asset, want, got)
 	}
+	// curl 以 root 下载默认是 0644：没有执行位时，紧接着"以真实用户跑 --version"会报
+	// `command not found`（2026-09-22 真机就是这么失败的）。
+	if err := os.Chmod(dst, 0o755); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("设置可执行位失败（%s）：%w", dst, err)
+	}
 	return dst, nil
 }
 

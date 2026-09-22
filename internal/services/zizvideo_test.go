@@ -565,11 +565,15 @@ func TestInstallZizvideoDownloadsFromMirrorWhenNotBundled(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantURL := srv.URL + "/apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion)
+	// curl 以 root 下载默认是 0644 —— 下载桩必须照实写成 0644，否则测不到"没给执行位"
+	// 就会在真机上以 `command not found` 失败（2026-09-22 真机事故）。
+	var downloaded string
 	zizvideoFetch = func(_ *Manager, _ context.Context, url, dst string, _ *InstallResult) error {
 		if url != wantURL {
 			t.Errorf("下载地址不对：%q（期望 %q）", url, wantURL)
 		}
-		return os.WriteFile(dst, payload, 0o755)
+		downloaded = dst
+		return os.WriteFile(dst, payload, 0o644)
 	}
 	zizvideoExpectedSHA256 = func() string { return sha256OfFile(stub) }
 	t.Cleanup(func() {
@@ -582,6 +586,13 @@ func TestInstallZizvideoDownloadsFromMirrorWhenNotBundled(t *testing.T) {
 	}
 	if _, err := os.Stat(ZizvideoBin()); err != nil {
 		t.Errorf("安装后应落盘 %s：%v", ZizvideoBin(), err)
+	}
+	st, err := os.Stat(downloaded)
+	if err != nil {
+		t.Fatalf("下载文件不见了：%v", err)
+	}
+	if st.Mode().Perm()&0o111 == 0 {
+		t.Errorf("下载下来的二进制没有执行位（%v）—— 紧接着以真实用户跑 --version 会 command not found", st.Mode().Perm())
 	}
 }
 
