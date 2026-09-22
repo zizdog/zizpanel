@@ -94,6 +94,7 @@ export const api = {
   setupStatus: () => request("GET", "/api/v1/setup/status"),
   setup: (body) => request("POST", "/api/v1/setup", body),
   login: (body) => request("POST", "/api/v1/auth/login", body),
+  register: (body) => request("POST", "/api/v1/auth/register", body),
   logout: () => request("POST", "/api/v1/auth/logout", {}),
   me: () => request("GET", "/api/v1/auth/me"),
 
@@ -151,6 +152,8 @@ export const api = {
   runAutoScan: () => request("POST", "/api/v1/admin/autoscan/run", {}),
 
   mediaRoots: () => request("GET", "/api/v1/media/roots"),
+  // 前台删除（仅管理员）：body {delete_file, confirm}
+  deleteMedia: (id, body) => request("DELETE", "/api/v1/admin/media/" + encodeURIComponent(id), body),
   addMediaRoot: (path) => request("POST", "/api/v1/media/roots", { path }),
   removeMediaRoot: (path) =>
     request("DELETE", "/api/v1/media/roots" + queryString({ path })),

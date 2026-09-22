@@ -63,6 +63,63 @@ export function mountLogin(view, onSuccess) {
   });
   view.append(form);
   username.focus();
+  // 「注册」入口只在管理员开着注册时出现（判据 = 公开的 setup/status.allow_register）。
+  const registerEntry = el("div", { class: "muted small-note", hidden: true, dataset: { role: "register-entry" } });
+  form.append(registerEntry);
+  api.setupStatus().then((status) => {
+    if (!(status && status.allow_register && !status.needs_setup)) return;
+    registerEntry.append(el("span", { text: "还没有账号？" }),
+      el("a", { class: "link", href: "#/register", text: "注册" }));
+    registerEntry.hidden = false;
+  }).catch(() => {});
+}
+
+export function mountRegister(view, onSuccess) {
+  const username = input({ type: "text", autocomplete: "username", placeholder: "用户名（3-32 位字母数字或 _-.）", required: true });
+  const displayName = input({ type: "text", autocomplete: "nickname", placeholder: "显示名（可选）" });
+  const password = input({ type: "password", autocomplete: "new-password", placeholder: "口令（至少 8 位）", required: true });
+  const confirm = input({ type: "password", autocomplete: "new-password", placeholder: "再输一次口令", required: true });
+  const note = banner();
+  const submit = el("button", { class: "btn primary", type: "submit", text: "注册并登录" });
+  const form = el("form", { class: "panel narrow" },
+    el("h1", { class: "title", text: "注册 Zizvideo" }),
+    field("用户名", username),
+    field("显示名", displayName),
+    field("口令", password),
+    field("确认口令", confirm),
+    note,
+    submit,
+    el("div", { class: "actions" }, el("a", { class: "link", href: "#/login", text: "← 返回登录" }))
+  );
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    setBanner(note, "");
+    if (password.value.length < 8) { setBanner(note, "口令至少 8 位"); return; }
+    if (password.value !== confirm.value) { setBanner(note, "两次输入的口令不一致"); return; }
+    submit.disabled = true;
+    try {
+      const name = username.value.trim();
+      await api.register({
+        username: name, password: password.value, display_name: displayName.value.trim() || name,
+      });
+      session.user = await api.login({ username: name, password: password.value });
+      onSuccess();
+    } catch (err) {
+      setBanner(note, err && err.message ? err.message : "注册失败");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  view.append(form);
+  username.focus();
+  // 未初始化 → 去初始化；管理员已关注册 → 不让提交（接口仍会再拦一次）。
+  api.setupStatus().then((status) => {
+    if (status && status.needs_setup) { location.hash = "#/setup"; return; }
+    if (!(status && status.allow_register)) {
+      submit.disabled = true;
+      setBanner(note, "管理员已关闭注册");
+    }
+  }).catch(() => {});
 }
 
 export function mountSetup(view, onSuccess) {

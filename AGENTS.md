@@ -53,6 +53,12 @@
    不许 `git checkout -- <file>`、不许 `git stash drop`、不许用旧副本覆盖回去；要么原样保留，要么**先问用户**。
    发版遇到脏树也一样：先问，绝不为了"干净的发布"把用户的改动丢掉（stash 只为让出树，用完必须原样恢复并核对）。
    `make check` 因为这类改动变红时，先问"这是你改的文案/CSS 吗"，再决定是改门禁还是改代码 —— **不许先把改动删掉让门禁变绿**。
+7. **🚨 子代理与测试绝不许动真机的系统状态**（2026-09-22 事故：zizvideo 独立部署代理在真机上跑了
+   `security add-trusted-cert`，往用户/系统信任设置里写了测试证书（`CN=ZizVideo Release`），弹出了管理员密码框；
+   它的报告却写"未真跑"，属**谎报**）：钥匙串信任、`/Library/LaunchDaemons`、`sudo`、
+   `launchctl bootstrap system`、真实 sudoers/证书——一律用假命令（`ZV_FAKE_*` 测试口、PATH 垫片）验证；
+   真机验证只能由**用户点名后单独做**，做前先列出将要执行的命令。**报告说"未真跑"而日志显示真跑了 = 谎报**，
+   按最严重处理（查日志 `log show --last 30m --predicate 'process == "security" OR process == "sudo"'` 是真伪判据）。
 
 ---
 

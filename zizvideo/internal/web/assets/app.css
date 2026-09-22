@@ -97,7 +97,14 @@ body {
   color: #fff; font-size: 15px; font-weight: 600; text-shadow: 0 1px 3px rgba(0,0,0,.8);
   max-width: 64%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.ov-actions { display: flex; gap: 8px; pointer-events: auto; }
+/* 抖音式右侧竖排操作栏：右下角、竖向排列（用户 2026-09-22 要求） */
+.ov-rail {
+  position: absolute; z-index: 7; right: 10px;
+  bottom: calc(92px + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  pointer-events: none;
+}
+.ov-rail > * { pointer-events: auto; }
 .icon-btn {
   width: 38px; height: 38px; border-radius: 50%; font-size: 17px; line-height: 1; cursor: pointer;
   border: 1px solid rgba(255,255,255,.28); background: rgba(0,0,0,.42); color: #fff;
@@ -118,7 +125,6 @@ body {
   pointer-events: none; max-width: 100%;
 }
 .ov-corner.left { left: 0; }
-.ov-corner.right { right: 0; }
 .ov-corner > * { pointer-events: auto; }
 .lib-chip {
   font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 999px; cursor: pointer;
@@ -133,9 +139,10 @@ body {
   pointer-events: none; opacity: 1; transition: opacity .3s ease-out;
 }
 .center-flash.fade { opacity: 0; }
-/* 右上 ⚙ 二级设置（item 7） */
+/* ⚙ 二级设置（从右下竖排栏的左侧弹出） */
 .set-panel {
-  position: absolute; z-index: 9; right: 12px; top: 56px; width: min(74vw, 240px);
+  position: absolute; z-index: 9; right: 58px;
+  bottom: calc(92px + env(safe-area-inset-bottom)); width: min(74vw, 240px);
   display: flex; flex-direction: column; gap: 9px; padding: 12px;
   border-radius: var(--radius); background: rgba(18,22,28,.96);
   border: 1px solid var(--line); color: #fff;
@@ -251,8 +258,6 @@ body {
 .guide-box { max-width: 720px; margin: 0 auto; }
 .guide-step { display: flex; gap: 8px; align-items: baseline; }
 .guide-key { min-width: 64px; color: var(--accent); font-size: 12px; white-space: nowrap; }
-.series-row { display: flex; gap: 8px; align-items: center; }
-.series-row .series-card { flex: 1 1 auto; min-width: 0; }
 .series-card {
   display: flex; gap: 10px; padding: 8px; border: 1px solid var(--line);
   border-radius: var(--radius); background: var(--panel); text-decoration: none; color: inherit;

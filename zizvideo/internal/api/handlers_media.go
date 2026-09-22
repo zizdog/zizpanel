@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -277,3 +278,86 @@ func (s *Server) HandleCover(w http.ResponseWriter, r *http.Request) {
 const placeholderCover = `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="640">` +
 	`<rect width="100%" height="100%" fill="#111"/><text x="50%" y="50%" fill="#666" ` +
 	`font-family="sans-serif" font-size="20" text-anchor="middle">无封面</text></svg>`
+
+// HandleDeleteMedia 是管理员在**前台播放页**的删除入口：默认只删面板记录
+// （磁盘文件不动，重扫会回来）；delete_file=true 时先验路径再删文件，**文件删不掉就不删记录**
+// 并如实报错（否则会出现"记录没了、文件还在"的谎报）。
+func (s *Server) HandleDeleteMedia(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		s.fail(w, r, domain.New("VALIDATION_ID", "缺少媒体 id", 400))
+		return
+	}
+	var req struct {
+		DeleteFile bool   `json:"delete_file"`
+		Confirm    string `json:"confirm"`
+	}
+	if err := s.decodeJSON(w, r, &req); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	found, missing, err := s.DB.MediaByIDs([]string{id})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if len(missing) > 0 || len(found) == 0 {
+		s.fail(w, r, domain.New("VALIDATION_ID", "这条记录已不存在，请刷新后重试", 404))
+		return
+	}
+	m := found[0]
+
+	fileDeleted := false
+	if req.DeleteFile {
+		if strings.TrimSpace(req.Confirm) != deleteFilesConfirm {
+			s.audit(r, "media.delete_file", m.ID, false, "missing_confirm")
+			s.fail(w, r, domain.New("MEDIA_CONFIRM_REQUIRED",
+				"危险操作：请手动输入「删除文件」确认", 400))
+			return
+		}
+		if s.Tasks.Busy(m.LibraryID) {
+			s.fail(w, r, domain.New("MEDIA_LIBRARY_BUSY", "该媒体库正在扫描，请稍后再试", 409))
+			return
+		}
+		lib, lerr := s.DB.GetLibrary(m.LibraryID)
+		if lerr != nil {
+			s.fail(w, r, lerr)
+			return
+		}
+		canonical, verr := media.ValidateMediaFile(s.Roots.List(), lib.RootPath, m.Path)
+		if verr != nil {
+			s.audit(r, "media.delete_file", m.ID, false, pathReason(verr))
+			s.fail(w, r, domain.New("MEDIA_PATH_REFUSED", "路径校验未通过，未删文件："+pathReason(verr), 400))
+			return
+		}
+		if rerr := os.Remove(canonical); rerr != nil {
+			s.audit(r, "media.delete_file", m.ID, false, rerr.Error())
+			s.fail(w, r, domain.New("MEDIA_FILE_DELETE_FAILED", "删除文件失败："+rerr.Error(), 500))
+			return
+		}
+		// 删完必须回读核对：文件还在就是没删掉，不许当成成功。
+		if _, serr := os.Stat(canonical); serr == nil {
+			s.fail(w, r, domain.New("MEDIA_FILE_DELETE_FAILED", "删除后文件仍在，未确认成功", 500))
+			return
+		} else if !os.IsNotExist(serr) {
+			s.fail(w, r, domain.New("MEDIA_FILE_DELETE_FAILED", "删除后核对失败："+serr.Error(), 500))
+			return
+		}
+		fileDeleted = true
+	}
+
+	n, err := s.DB.SoftDeleteMedia([]string{m.ID})
+	if err != nil {
+		s.audit(r, "media.delete", m.ID, false, errCode(err))
+		s.fail(w, r, err)
+		return
+	}
+	action, note := "media.delete", "仅删除面板记录，磁盘文件未动；重新扫描会再登记"
+	if fileDeleted {
+		action, note = "media.delete_file", "记录与磁盘文件都已删除，不可恢复"
+	}
+	s.audit(r, action, m.ID, true, fmt.Sprintf("file=%v", fileDeleted))
+	respond(w, http.StatusOK, map[string]any{
+		"deleted": n, "file_deleted": fileDeleted, "note": note,
+	}, nil)
+}

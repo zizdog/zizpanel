@@ -1,80 +1,20 @@
 // 剧场（短剧）：列表 + 按序连播的独立播放器（条目 9）
 // 顺序完全由后端的 position 决定；播放端自己按数组顺序推进，不吃随机游标。
+// 观看面只负责看与播：剧场的新建/导入/识别/上传/管理都在后台（#/admin/series）。
 
 import { api, patchProgressKeepalive } from "./api.js";
-import { el, clear, banner, setBanner, field, fmtDuration, asArray } from "./dom.js";
-import { session } from "./auth.js";
-import { confirmDialog } from "./confirm.js";
-import { mountSeriesAdmin } from "./series-admin.js";
-import { importDirIntoSeries, batchImportSeries } from "./series-import.js";
-import { uploadToSeries, uploadNewSeries } from "./uploads.js";
+import { el, clear, banner, setBanner, fmtDuration, asArray } from "./dom.js";
 
 const PROGRESS_EVERY_MS = 5000;
 const COMPLETE_TAIL_MS = 1500;
-
-function isAdmin() { return !!(session.user && session.user.role === "admin"); }
 
 /* ---------- 剧场列表 ---------- */
 
 export function mountSeries(view) {
   const note = banner();
-  const detectNote = el("div", { class: "banner", hidden: true, dataset: { role: "series-detect-note" } });
-  let detectTimer = null;
   const box = el("div", { class: "series-list", dataset: { role: "series-list" } });
-  const titleInput = el("input", { class: "input", placeholder: "剧场标题", required: true });
-  const descInput = el("input", { class: "input", placeholder: "简介（可选）" });
-  const submit = el("button", { class: "btn primary", type: "submit", text: "新建" });
-  const form = el("form", { class: "panel", hidden: true, dataset: { role: "series-create" } },
-    field("标题", titleInput), field("简介", descInput), el("div", { class: "actions" }, submit));
   const head = el("div", { class: "page-head" }, el("h2", { class: "page-title", text: "剧场" }));
-  if (isAdmin()) {
-    head.append(el("button", {
-      class: "btn small", type: "button", text: "新建剧场并上传", dataset: { role: "series-upload-new" },
-      onclick: () => uploadNewSeries(load),
-    }));
-    head.append(el("button", {
-      class: "btn small", type: "button", text: "按子目录批量建剧场", dataset: { role: "series-dirs-import" },
-      onclick: () => batchImportSeries(load),
-    }));
-    head.append(el("button", {
-      class: "btn small", type: "button", text: "一键识别全部", dataset: { role: "series-detect-all" },
-      onclick: (event) => runDetectAll(event.currentTarget),
-    }));
-    head.append(el("button", {
-      class: "btn small", type: "button", text: "＋ 新建剧场", dataset: { role: "series-create-toggle" },
-      onclick: () => { form.hidden = !form.hidden; if (!form.hidden) titleInput.focus(); },
-    }));
-  }
-  view.append(el("div", { class: "page" }, head,
-    el("div", { class: "muted small-note", text: "剧场成员在剧场「管理」里；媒体库/允许根/用户在后台" }),
-    form, note, detectNote, box));
-
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    setBanner(note, "");
-    submit.disabled = true;
-    try {
-      const created = await api.request("POST", "/api/v1/admin/series", {
-        title: titleInput.value.trim(), description: descInput.value.trim(),
-      });
-      titleInput.value = "";
-      descInput.value = "";
-      form.hidden = true;
-      // 新建后直接进剧场页看"下一步做什么"，不把用户丢回空列表。
-      if (created && created.id) openSeries(created.id);
-      else load();
-    } catch (err) {
-      setBanner(note, err && err.message ? err.message : "新建失败");
-    } finally {
-      submit.disabled = false;
-    }
-  });
-
-  function openSeries(id) {
-    const hash = "#/series/" + encodeURIComponent(id);
-    if (location.hash === hash) load();
-    else location.hash = hash;
-  }
+  view.append(el("div", { class: "page" }, head, note, box));
 
   async function load() {
     clear(box);
@@ -90,101 +30,16 @@ export function mountSeries(view) {
     }
     clear(box);
     if (!list.length) {
-      box.append(el("div", { class: "muted",
-        text: isAdmin() ? "还没有剧场，点右上角新建；文件放在允许根目录的子文件夹里" : "还没有剧场" }));
+      box.append(el("div", { class: "muted", text: "还没有剧场" }));
       return;
     }
-    for (const item of list) box.append(seriesCard(item, load));
-  }
-
-  // 一键识别：先预览变化（不落库）→ 确认 → 任务进度 → 结果（文案 ≤40 字）。
-  async function runDetectAll(button) {
-    setBanner(detectNote, "正在统计变化…");
-    button.disabled = true;
-    let preview;
-    try {
-      preview = await api.detectAll({ confirm: false });
-    } catch (err) {
-      setBanner(detectNote, err && err.message ? err.message : "预览失败");
-      button.disabled = false;
-      return;
-    }
-    button.disabled = false;
-    const failed = Number(preview && preview.failed_total) || 0;
-    if (failed > 0) {
-      setBanner(detectNote, "预览失败 " + failed + " 个剧场：" + firstDetectError(preview));
-      return;
-    }
-    const changes = Number(preview && preview.changes_total) || 0;
-    const manual = Number(preview && preview.manual_skipped_total) || 0;
-    if (changes === 0) {
-      setBanner(detectNote, "没有需要识别的新集");
-      return;
-    }
-    const ok = await confirmDialog({
-      title: "一键识别全部", danger: false, confirmText: "开始识别",
-      message: "将更新 " + changes + " 集，跳过 " + manual + " 集手动",
-    });
-    if (!ok) { setBanner(detectNote, ""); return; }
-    let task;
-    try {
-      task = await api.detectAll({ confirm: true });
-    } catch (err) {
-      setBanner(detectNote, err && err.message ? err.message : "提交失败");
-      return;
-    }
-    const taskId = task && task.task_id;
-    if (!taskId) {
-      setBanner(detectNote, (task && task.note) || "没有需要识别的剧场");
-      return;
-    }
-    pollDetect(taskId);
-  }
-
-  function pollDetect(taskId) {
-    if (detectTimer) clearInterval(detectTimer);
-    setBanner(detectNote, "识别中…");
-    detectTimer = setInterval(async () => {
-      let task;
-      try {
-        task = await api.jobTask(taskId);
-      } catch (err) {
-        clearInterval(detectTimer);
-        detectTimer = null;
-        setBanner(detectNote, err && err.message ? err.message : "查询失败");
-        return;
-      }
-      if (task.status === "pending" || task.status === "running") {
-        setBanner(detectNote, "识别中 " + (Number(task.processed) || 0) + "/" + (Number(task.total) || 0) + "…");
-        return;
-      }
-      clearInterval(detectTimer);
-      detectTimer = null;
-      const updated = Number(task.updated) || 0;
-      const skipped = Number(task.manual_skipped) || 0;
-      const label = task.status === "success" ? "已更新 " : task.status === "failed" ? "识别失败：" : "识别已中断：";
-      let text = label + updated + " 集，跳过 " + skipped + " 集手动";
-      if (task.error) text += "；" + task.error;
-      if (task.degraded && task.degrade_reason) text += "；" + task.degrade_reason;
-      setBanner(detectNote, text);
-      load();
-    }, 1000);
-  }
-
-  function firstDetectError(preview) {
-    const rows = Array.isArray(preview && preview.per_series) ? preview.per_series : [];
-    for (const row of rows) { if (row && row.error) return row.error; }
-    return "请重试";
+    for (const item of list) box.append(seriesCard(item));
   }
 
   load();
-  return function cleanup() {
-    if (detectTimer) clearInterval(detectTimer);
-    detectTimer = null;
-  };
 }
 
-function seriesCard(item, reload) {
+function seriesCard(item) {
   const cover = item.cover_url
     ? el("img", { class: "series-cover", src: item.cover_url, alt: "", loading: "lazy" })
     : el("div", { class: "series-cover no-cover", text: "无封面" });
@@ -195,34 +50,7 @@ function seriesCard(item, reload) {
     el("div", { class: "series-title", text: item.title || "-" }),
     el("div", { class: "muted small-note", text: "共 " + (item.episode_count || 0) + " 集" }),
     item.description ? el("div", { class: "series-desc muted small-note", text: item.description }) : null));
-  if (!isAdmin()) return card;
-
-  const wrap = el("div", { class: "series-row" }, card,
-    el("button", {
-      class: "btn small", type: "button", text: "管理", dataset: { role: "series-manage", id: String(item.id) },
-      onclick: (event) => { event.preventDefault(); openDrawer(item, reload); },
-    }));
-  return wrap;
-}
-
-function openDrawer(item, reload) {
-  const overlay = el("div", { class: "modal-overlay", dataset: { role: "series-admin-drawer" } });
-  const body = el("div", { class: "panel series-admin-body" });
-  const box = el("div", { class: "modal wide" },
-    el("div", { class: "picker-head" },
-      el("span", { text: "管理剧场：" + (item.title || "") }),
-      el("button", {
-        class: "btn small", type: "button", text: "关闭", dataset: { role: "drawer-close" },
-        onclick: () => overlay.remove(),
-      })),
-    body);
-  overlay.append(box);
-  overlay.addEventListener("click", (event) => { if (event.target === overlay) overlay.remove(); });
-  document.body.append(overlay);
-  mountSeriesAdmin(body, item, {
-    onChanged: () => reload(),
-    onDeleted: () => { overlay.remove(); reload(); },
-  });
+  return card;
 }
 
 /* ---------- 剧场播放页（按序连播） ---------- */
@@ -251,41 +79,12 @@ export function mountSeriesPlay(view, seriesID) {
     class: "center-btn", type: "button", text: "点击播放", hidden: true, dataset: { role: "play" },
     onclick: () => { centerBtn.hidden = true; tryPlay(); },
   });
-  // 管理入口也放在剧场页：entries 只在后台会让用户找不到（B.2）。
-  const manageBtn = isAdmin()
-    ? el("button", {
-        class: "btn small", type: "button", text: "管理这个剧场", dataset: { role: "series-manage-play" },
-        onclick: () => {
-          if (!state.series) { showToast("还在加载，请稍候"); return; }
-          openDrawer(state.series, () => loadSeries());
-        },
-      })
-    : null;
-
-  const importBtn = isAdmin()
-    ? el("button", {
-        class: "btn small", type: "button", text: "从目录导入剧集", dataset: { role: "series-dir-import-play" },
-        onclick: () => {
-          if (!state.series) { showToast("还在加载，请稍候"); return; }
-          importDirIntoSeries(state.series, () => loadSeries());
-        },
-      })
-    : null;
-  const uploadBtn = isAdmin()
-    ? el("button", {
-        class: "btn small", type: "button", text: "上传到本剧场", dataset: { role: "series-upload-play" },
-        onclick: () => {
-          if (!state.series) { showToast("还在加载，请稍候"); return; }
-          uploadToSeries(state.series, () => loadSeries());
-        },
-      })
-    : null;
-
+  // 观看面不放管理入口：剧场管理在后台「剧场」页签（#/admin/series）。
   const playBox = el("div", { class: "series-play" },
     el("div", { class: "sp-stage" }, video),
     el("div", { class: "sp-top" },
       el("a", { class: "btn small", href: "#/series", text: "← 剧场", dataset: { role: "back-to-series" } }),
-      titleEl, manageBtn, importBtn, uploadBtn, countEl, orderNote),
+      titleEl, countEl, orderNote),
     center, centerBtn,
     el("div", { class: "sp-bottom" },
       el("div", { class: "row sp-controls" }, prev, epSelect, next, listToggle, sound),
@@ -309,30 +108,13 @@ export function mountSeriesPlay(view, seriesID) {
       usable.length
         ? el("div", { class: "muted small-note", text: "可用允许根：" + usable.join("、") })
         : el("div", { class: "row" },
-            el("span", { class: "muted small-note", text: all.length ? "已配置的允许根都不可用" : "还没有允许根" }),
-            el("a", { class: "btn small primary", href: data.roots_url || "#/admin/roots", text: "去加允许根" })),
+            el("span", { class: "muted small-note", text: all.length ? "已配置的允许根都不可用" : "还没有允许根" })),
       el("div", { class: "muted small-note", text: data.naming || "" }),
       el("div", { class: "muted small-note", text: data.naming_note || "" }),
       ...steps.map((step) => el("div", { class: "guide-step" },
         el("span", { class: "guide-key", text: STEP_LABELS[step.key] || step.key || "步骤" }),
         el("span", { class: "ep-title", text: step.text || "" }))),
       el("div", { class: "actions" },
-        isAdmin() ? el("button", {
-          class: "btn primary", type: "button", text: "从目录导入剧集",
-          dataset: { role: "series-dir-import-empty" },
-          onclick: () => { if (state.series) importDirIntoSeries(state.series, () => loadSeries()); },
-        }) : null,
-        isAdmin() ? el("button", {
-          class: "btn", type: "button", text: "上传到本剧场",
-          dataset: { role: "series-upload-empty" },
-          onclick: () => { if (state.series) uploadToSeries(state.series, () => loadSeries()); },
-        }) : null,
-        isAdmin() ? el("button", {
-          class: "btn small", type: "button", text: "管理这个剧场",
-          dataset: { role: "series-manage-empty" },
-          onclick: () => { if (state.series) openDrawer(state.series, () => loadSeries()); },
-        }) : null,
-        isAdmin() ? el("a", { class: "btn small", href: "#/admin/libraries", text: "去后台建库" }) : null,
         el("a", { class: "btn small", href: "#/series", text: "← 返回剧场列表" })));
     clear(guideBox);
     guideBox.append(card);

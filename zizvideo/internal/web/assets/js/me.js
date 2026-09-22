@@ -3,7 +3,6 @@
 import { el, fmtDate } from "./dom.js";
 import { api } from "./api.js";
 import { session } from "./auth.js";
-import { createFeedSettingsForm, normalizeFeedSettings } from "./play-settings.js";
 
 function kv(label, value) {
   return el("div", { class: "kv" },
@@ -33,36 +32,6 @@ export function mountMe(view, options) {
     el("div", { class: "panel-title", text: "设置" }));
   if (user.role === "admin") {
     settings.append(el("a", { class: "btn small", href: "#/admin", text: "管理后台" }));
-  }
-
-  async function togglePlaySettings() {
-    if (!playBox.classList.contains("hidden")) { playBox.classList.add("hidden"); return; }
-    playBox.classList.remove("hidden");
-    playNote.textContent = "读取设置…";
-    try {
-      playSettings = normalizeFeedSettings(await api.feedSettings());
-      playForm.paint(playSettings);
-      playNote.textContent = "";
-    } catch (err) {
-      playNote.textContent = err && err.message ? err.message : "读取设置失败";
-    }
-  }
-
-  async function savePlaySetting(partial) {
-    const before = playSettings;
-    playSettings = normalizeFeedSettings(Object.assign({}, playSettings, partial));
-    playForm.paint(playSettings);
-    playNote.textContent = "保存中…";
-    try {
-      const result = await api.patchFeedSettings(partial);
-      playSettings = normalizeFeedSettings(result || playSettings);
-      playForm.paint(playSettings);
-      playNote.textContent = "已保存";
-    } catch (err) {
-      playSettings = before;
-      playForm.paint(playSettings);
-      playNote.textContent = err && err.message ? err.message : "保存失败";
-    }
   }
 
   const logout = el("button", {

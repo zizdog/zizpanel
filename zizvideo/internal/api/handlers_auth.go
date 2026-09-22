@@ -47,14 +47,19 @@ func validUsername(name string) bool {
 
 var setupMu sync.Mutex
 
-// HandleSetupStatus tells the frontend whether an admin has been created.
+// HandleSetupStatus tells the frontend whether an admin has been created and
+// whether self-registration is open —— 登录页靠它决定要不要显示「注册」入口
+// （开关开了而登录页没入口，是用户报过的低级错误）。
 func (s *Server) HandleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	n, err := s.DB.CountUsers()
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	respond(w, http.StatusOK, map[string]any{"needs_setup": n == 0}, nil)
+	respond(w, http.StatusOK, map[string]any{
+		"needs_setup":    n == 0,
+		"allow_register": s.registerSwitch().On(),
+	}, nil)
 }
 
 type setupReq struct {

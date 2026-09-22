@@ -100,39 +100,38 @@ func TestFrontendArrayFieldsGuarded(t *testing.T) {
 	}
 }
 
-// 门禁：后台「播放设置」必须就地展开并复用同一份设置语义与同一个 PATCH，不许跳去播放页。
-func TestMePlaySettingsOpensInPlace(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(assetsDir(), "js", "me.js"))
-	if err != nil {
-		t.Fatal(err)
+// 门禁：剧场管理只在后台「剧场」页签，观看面（#/series）不许出现管理入口。
+// 现象：新建/导入/上传/管理按钮铺在剧场页，用户看剧时被管理操作挡住（用户 2026-09-22 反馈）。
+func TestSeriesManagementOnlyInBackend(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(assetsDir(), "js", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
 	}
-	me := string(raw)
-	if strings.Contains(me, `href: "#/feed"`) {
-		t.Fatal(`me.js 的「播放设置」还在 href="#/feed" 跳走`)
-	}
-	for _, token := range []string{"play-settings.js", "createFeedSettingsForm", "patchFeedSettings"} {
-		if !strings.Contains(me, token) {
-			t.Fatalf("me.js 缺少 %q —— 播放设置没有复用共享实现", token)
+	for _, token := range []string{"mountSeriesAdmin", "importDirIntoSeries", "batchImportSeries",
+		"uploadToSeries", "uploadNewSeries", "/api/v1/admin/"} {
+		if strings.Contains(read("series.js"), token) {
+			t.Fatalf("series.js 出现 %q —— 观看页只负责看与播，剧场管理必须留在后台", token)
 		}
 	}
-	shared, err := os.ReadFile(filepath.Join(assetsDir(), "js", "play-settings.js"))
-	if err != nil {
-		t.Fatal(err)
+	tab := read("admin-series.js")
+	for _, token := range []string{"mountSeriesAdmin", "importDirIntoSeries", "batchImportSeries",
+		"uploadToSeries", "uploadNewSeries", "api.detectAll"} {
+		if !strings.Contains(tab, token) {
+			t.Fatalf("admin-series.js 缺少 %q —— 后台「剧场」页签没接上这个能力", token)
+		}
 	}
-	if !strings.Contains(string(shared), "seek_seconds") {
-		t.Fatal("play-settings.js 没有共用 seek_seconds 字段语义")
+	if !strings.Contains(read("admin.js"), "admin-series.js") {
+		t.Fatal("admin.js 没有挂载后台「剧场」页签")
 	}
-	feed, err := os.ReadFile(filepath.Join(assetsDir(), "js", "feed.js"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(feed), "createFeedSettingsForm") {
-		t.Fatal("feed.js 的 ⚙ 没有复用 play-settings.js，语义会漂移")
-	}
-	// 两个入口都必须落到同一个 PATCH /api/v1/feed/settings。
-	for _, f := range []struct{ name, body string }{{"me.js", me}, {"feed.js", string(feed)}} {
-		if !strings.Contains(f.body, "patchFeedSettings") {
-			t.Fatalf("%s 没有走 patchFeedSettings", f.name)
+	// 播放设置的唯一入口是首页右上 ⚙，仍复用同一份共享实现（「我的」入口已按用户要求去掉）。
+	feed := read("feed.js")
+	for _, token := range []string{"createFeedSettingsForm", "patchFeedSettings"} {
+		if !strings.Contains(feed, token) {
+			t.Fatalf("feed.js 缺少 %q —— ⚙ 没有复用 play-settings.js，语义会漂移", token)
 		}
 	}
 }

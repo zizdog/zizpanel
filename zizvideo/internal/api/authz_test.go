@@ -276,16 +276,30 @@ func TestSetupStatusReportsFirstRun(t *testing.T) {
 		t.Fatalf("状态 %d", res.StatusCode)
 	}
 	var st struct {
-		NeedsSetup bool `json:"needs_setup"`
+		NeedsSetup    bool `json:"needs_setup"`
+		AllowRegister bool `json:"allow_register"`
 	}
 	decodeInto(t, env.Data, &st)
 	if !st.NeedsSetup {
 		t.Fatal("空库应需要初始化")
+	}
+	if st.AllowRegister {
+		t.Fatal("注册开关默认必须为关")
 	}
 	e.setupAdmin()
 	_, env, _ = e.do(http.MethodGet, "/api/v1/setup/status", nil)
 	decodeInto(t, env.Data, &st)
 	if st.NeedsSetup {
 		t.Fatal("已初始化后不应再要求初始化")
+	}
+	// 登录页靠这个公开字段决定要不要显示「注册」入口（开关开了却没入口 = 用户报过的低级错误）。
+	if _, env, _ = e.write(http.MethodPatch, "/api/v1/admin/settings",
+		map[string]any{"allow_register": true}); env.Error != nil {
+		t.Fatalf("打开注册失败: %+v", env.Error)
+	}
+	_, env, _ = e.do(http.MethodGet, "/api/v1/setup/status", nil)
+	decodeInto(t, env.Data, &st)
+	if !st.AllowRegister {
+		t.Fatal("开了注册后 setup/status.allow_register 必须为 true")
 	}
 }

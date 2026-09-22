@@ -3,6 +3,8 @@
 import { api, patchProgressKeepalive } from "./api.js";
 import { el, clear, asArray, fmtDuration } from "./dom.js";
 import { mountNav } from "./nav.js";
+import { session } from "./auth.js";
+import { choiceDialog } from "./confirm.js";
 import { createFeedSettingsForm, normalizeFeedSettings, seekSecondsOf, loopEffective } from "./play-settings.js";
 
 const WHEEL_STEP = 40;
@@ -182,6 +184,13 @@ export function mountFeed(view) {
     entry.like.classList.toggle("on", item.reaction === "like");
     entry.fav.addEventListener("click", () => toggleFavorite(entry));
     entry.like.addEventListener("click", () => toggleLike(entry));
+    // 删除入口只给管理员（前台也不放宽权限，接口侧再拦一次）
+    entry.del = isAdmin()
+      ? el("button", { class: "icon-btn", type: "button", title: "删除这个视频", text: "🗑" })
+      : null;
+    if (entry.del) {
+      entry.del.addEventListener("click", (event) => { event.stopPropagation(); askDelete(entry); });
+    }
 
     entry.fill = el("span", { class: "bar-fill" });
     entry.elapsed = el("span", { text: "0:00" });
@@ -193,15 +202,17 @@ export function mountFeed(view) {
 
     layer.append(el("div", { class: "overlay" },
       el("div", { class: "ov-top" },
-        el("div", { class: "ov-title", text: item.title || ("#" + item.id) }),
-        el("div", { class: "ov-actions" }, entry.fav, entry.like)),
+        el("div", { class: "ov-title", text: item.title || ("#" + item.id) })),
       entry.barWrap,
       el("div", { class: "times" }, entry.elapsed, entry.total)
     ));
 
-    // 左上角"来自 <库名>"（点击切范围），右上角声音与设置
-    layer.append(libraryCorner(item),
-      el("div", { class: "ov-corner right" }, soundButton(entry), gearButton(entry)));
+    // 抖音式：操作图标竖排在右下角（收藏/喜欢/声音/设置，管理员多一个删除）
+    layer.append(el("div", { class: "ov-rail" },
+      entry.fav, entry.like, soundButton(entry), gearButton(entry), entry.del));
+
+    // 左上角"来自 <库名>"（点击切范围）
+    layer.append(libraryCorner(item));
 
     if (!isPlayable(item)) {
       const reason = item.compatibility && item.compatibility.reason
@@ -608,6 +619,43 @@ export function mountFeed(view) {
     }
   }
 
+  /* ---------- 前台删除（仅管理员） ---------- */
+
+  function isAdmin() { return !!(session.user && session.user.role === "admin"); }
+
+  // 两个选项都算确认：只删记录（文件保留）或连文件一起删（不可恢复）。
+  async function askDelete(entry) {
+    const item = entry.item || {};
+    if (entry.deleting) return;
+    const choice = await choiceDialog({
+      role: "media-delete-modal",
+      title: "删除这个视频",
+      message: (item.title || ("#" + item.id)) + "：只删记录则文件保留、重扫会再出现；连文件一起删不可恢复。",
+      cancelText: "取消",
+      choices: [
+        { value: "record", label: "只删记录" },
+        { value: "file", label: "连文件一起删", danger: true },
+      ],
+    });
+    if (!choice) return;
+    entry.deleting = true;
+    entry.del.disabled = true;
+    try {
+      await api.deleteMedia(item.id, {
+        delete_file: choice === "file",
+        // 危险操作的后端口令（缺了会被后端按"没确认"拒绝，不是摆设）
+        confirm: choice === "file" ? "删除文件" : "",
+      });
+      dropItem(entry.index);
+      showToast(choice === "file" ? "已删除记录和文件" : "已删除记录（文件保留）");
+    } catch (err) {
+      showToast(err && err.message ? err.message : "删除失败");
+    } finally {
+      entry.deleting = false;
+      if (entry.del) entry.del.disabled = false;
+    }
+  }
+
   /* ---------- 进度上报 ---------- */
 
   function progressPayload(entry) {
@@ -676,6 +724,26 @@ export function mountFeed(view) {
       feed.append(state.emptyCard);
     }
     if (state.items.length && state.active < 0) setActive(0, false);
+  }
+
+  // 删除成功后本地下掉这一条：重建窗口 + 重排 top/下标，不整页重置（保持当前位置）。
+  function dropItem(index) {
+    for (const key of Array.from(state.built.keys())) destroyEntry(key);
+    const shell = state.shells[index];
+    if (shell) shell.remove();
+    state.items.splice(index, 1);
+    state.shells.splice(index, 1);
+    state.shells.forEach((node, i) => {
+      node.style.top = (i * 100) + "%";
+      node.dataset.index = String(i);
+    });
+    state.active = -1;
+    paintTrack(false);
+    gate.settle();
+    if (!state.items.length) { loadMore(); return; }
+    const next = Math.min(index, state.items.length - 1);
+    setActive(next, false);
+    maybeLoadMore(next);
   }
 
   async function loadMore() {

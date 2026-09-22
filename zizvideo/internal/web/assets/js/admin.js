@@ -4,6 +4,7 @@ import { api } from "./api.js";
 import { el, clear, banner, setBanner, field, input, fmtDuration, fmtBytes, fmtDate, asArray } from "./dom.js";
 import { openDirectoryPicker } from "./roots.js";
 import { uploadToLibrary } from "./uploads.js";
+import { mountSeriesTab } from "./admin-series.js";
 
 function button(label, onclick, extraClass) {
   return el("button", {
@@ -938,6 +939,7 @@ export function mountAdmin(view, initialTab) {
   const definitions = [
     { key: "libraries", label: "媒体库", mount: mountLibraries },
     { key: "media", label: "媒体", mount: mountMedia },
+    { key: "series", label: "剧场", mount: mountSeriesTab },
     { key: "roots", label: "媒体允许根", mount: mountRoots },
     { key: "users", label: "用户", mount: mountUsers },
     { key: "settings", label: "注册开关", mount: mountSettings },
@@ -966,7 +968,7 @@ export function mountAdmin(view, initialTab) {
   }
 
   view.append(el("div", { class: "admin" }, back, note,
-    el("div", { class: "muted small-note", text: "后台管媒体库/媒体/允许根/用户；剧场成员在剧场页「管理」里" }),
+    el("div", { class: "muted small-note", text: "剧场的新建/导入/识别/上传/管理都在「剧场」页签" }),
     tabs, panel));
   select(tabButtons.has(initialTab) ? initialTab : "libraries");
 

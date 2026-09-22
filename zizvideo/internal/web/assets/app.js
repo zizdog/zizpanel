@@ -2,7 +2,7 @@
 
 import { api } from "./js/api.js";
 import { clear } from "./js/dom.js";
-import { session, loadMe, renderHeader, mountLogin, mountSetup, doLogout } from "./js/auth.js";
+import { session, loadMe, renderHeader, mountLogin, mountRegister, mountSetup, doLogout } from "./js/auth.js";
 import { mountFeed } from "./js/feed.js";
 import { mountAdmin } from "./js/admin.js";
 import { mountNav } from "./js/nav.js";
@@ -40,6 +40,12 @@ function route() {
   if (path === "/login") {
     if (session.user) { replace("#/feed"); return; }
     show((view) => mountLogin(view, () => go("#/feed")), true);
+    return;
+  }
+  // 自助注册：只由登录页「注册」链接进入；开关由后端再拦一次（AUTH_REGISTER_DISABLED）。
+  if (path === "/register") {
+    if (session.user) { replace("#/feed"); return; }
+    show((view) => mountRegister(view, () => go("#/feed")), true);
     return;
   }
   if (path === "/admin" || path.startsWith("/admin/")) {

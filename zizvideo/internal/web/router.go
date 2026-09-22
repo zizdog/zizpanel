@@ -51,6 +51,8 @@ func Router(s *api.Server) http.Handler {
 	mux.HandleFunc("GET /api/v1/media/{id}", s.RequireAuth(s.WithLibraryScope(s.HandleGetMedia)))
 	mux.HandleFunc("GET /api/v1/media/{id}/stream", s.RequireAuth(s.WithLibraryScope(s.HandleStream)))
 	mux.HandleFunc("GET /api/v1/media/{id}/cover", s.RequireAuth(s.WithLibraryScope(s.HandleCover)))
+	// 前台播放页的删除入口（仅管理员）：默认只删记录，delete_file=true 才动磁盘文件。
+	mux.HandleFunc("DELETE /api/v1/admin/media/{id}", s.RequireAdmin(s.HandleDeleteMedia))
 	mux.HandleFunc("GET /api/v1/feed/next", s.RequireAuth(s.WithLibraryScope(s.HandleFeedNext)))
 	mux.HandleFunc("GET /api/v1/feed/settings", s.RequireAuth(s.HandleGetFeedSettings))
 	mux.HandleFunc("PATCH /api/v1/feed/settings", s.RequireAuth(s.HandlePatchFeedSettings))

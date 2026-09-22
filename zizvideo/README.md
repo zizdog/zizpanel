@@ -104,6 +104,7 @@ zizvideo roots remove "$HOME/Movies"       --config config.json
 - 首启初始化（PBKDF2-SHA256 + 随机盐，无明文）、登录/登出、会话 cookie（HttpOnly + SameSite=Strict）、
   写操作 CSRF 双提交（只认 `X-CSRF-Token` 头）、登录失败指数退避 + 账号锁定。
 - 用户管理：建号、改角色、禁用、重置口令；禁用与改角色下一次请求即生效（鉴权每次回查数据库）。
+- 注册开关（默认关）：开关打开后**登录页会出现「注册」入口**，自助注册即登录；关掉立刻失效。
 - 媒体库增删改查 + 后台异步扫描（默认 4 worker，1 秒内返回 202 + task_id，进度写库、前端轮询）。
 - 媒体允许根：`GET|POST|DELETE /api/v1/media/roots`（admin）读/加/删，原子写回 config.json 并回读复核；
   `GET /api/v1/fs/browse?path=`（admin）只回子目录名，供后台目录浏览器用。
@@ -112,7 +113,11 @@ zizvideo roots remove "$HOME/Movies"       --config config.json
   扫描前再校验一次允许根，越界直接拒绝且不遍历任何目录。
 - 播放：`GET /api/v1/media/{id}/stream` 走 `http.ServeContent`，天然支持 `Accept-Ranges` / 206 /
   `Content-Range` / 416；多段 Range 回退 200 全量；文件被删则结束流并释放 fd。
-- feed：游标分页、单一播放实例、进度续播、收藏、点赞；后台页有库/媒体/允许根/用户/系统信息。
+- feed：游标分页、单一播放实例、进度续播、收藏、点赞；操作图标竖排在右下角（抖音式），
+  管理员在这一栏多一个「删除」（默认只删记录，可选连文件一起删）。后台页有库/媒体/剧场/允许根/用户/注册开关/
+  自动扫描/去重/系统信息；**剧场的全部管理**（新建、上传、按目录导入、一键识别、成员排序）都在后台「剧场」页签，
+  观看页只负责看与播。
+- 上传与导入：网页上传到媒体库/剧场（流式 PUT，任务进度可见），按目录导入一个剧场、按一级子目录批量建剧场。
 - JSON 结构日志（不写媒体文件路径，只写 media_id）+ 写操作审计。
 - `GET /healthz` 只查进程；`GET /readyz` 查 DB + ffmpeg/ffprobe + 允许根 + 磁盘余量，
   **工具缺失时如实报 not ready，绝不返回 200**。
@@ -121,7 +126,6 @@ zizvideo roots remove "$HOME/Movies"       --config config.json
 
 - HLS / 后台转码 / 实时转码：`direct:false` 只如实提示，不生成兼容版本。
 - 分类、标签、批量编辑、推荐排序、评论/关注等社交功能。
-- **上传**：服务器不接收任何用户上传，前端也没有入口。
 - 对象存储、多实例、Prometheus 指标、SBOM/CI、备份子命令。
 
 ## 已知限制
