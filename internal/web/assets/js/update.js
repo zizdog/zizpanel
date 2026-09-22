@@ -698,6 +698,9 @@ export function UpdateView(content, ctx = {}) {
     value: '',
   });
   const notice = h('div');
+  // 卡片头的版本小标是这一页**唯一**显示版本的地方（2026-09-22 用户："两个地方提示
+  // 差不多的内容，去掉一处"—— 原来卡片体内还有一行"当前版本 vX（arch）"与它重复）。
+  // 架构信息并到这里，不再丢。
   const versionTag = h('span#zp-up-ver', { dataset: { testid: 'zp-up-ver' }, style: { color: 'var(--text-mute)', fontSize: '12px' }, text: '读取中…' });
   const bodyEl = h('div.card-body');
   // 「检查更新」只留**一颗**按钮，放在卡片标题栏右侧。
@@ -905,15 +908,13 @@ export function UpdateView(content, ctx = {}) {
         h('div', { style: mutedStyle, text: '面板即将短暂断开，页面会自动重连；成功后会自动刷新整个网页。请不要关闭这个页面。' }),
       ]));
     } else if (status === 'success') {
+      // ⚠️ 这里**刻意不再画"升级成功"横幅**（2026-09-22 用户："升级页每次有两处说差不多的事"）：
+      // 刚升级完时，页面顶部已有「已是最新版本 vX」（页面状态），下面还有进度面板
+      // （✅ + 后端 message + 100% + 步骤/日志）。再叠一条 30 秒后自动消失的绿色横幅
+      // 就是第三处重复 —— 用户说的"会消失、变化"的那个正是它。
       const finished = st.finished_at ? Date.parse(st.finished_at) : 0;
       const fresh = finished && (Date.now() - finished) < FRESH_SUCCESS_MS;
-      if (fresh) {
-        bodyEl.append(banner('ok', [
-          h('strong', { text: '升级成功：' }),
-          h('span', { text: `${st.message || ''}（当前 v${st.to || '?'}）` }),
-          h('div', { style: mutedStyle, text: `这条提示会在 ${Math.round(AUTO_DISMISS_MS / 1000)} 秒后自动消失。` }),
-        ]));
-      } else {
+      if (!fresh) {
         // 历史成功态：绝不再弹横幅（这正是"提示永远不消失"的来源），只留一行。
         bodyEl.append(h('div', {
           style: { color: 'var(--text-mute)', fontSize: '12px', marginBottom: '13px' },
@@ -986,9 +987,9 @@ export function UpdateView(content, ctx = {}) {
     stopElapsedTimer();
     if (inProgress && st.started_at) startElapsedTimer(st.started_at);
 
-    // ---- 版本与来源 ----
+    // ---- 来源与校验依据 ----
+    // 版本号不在这里重复（卡片头的小标已经有了）：这一段只讲"这个包是谁签的、什么时候构建的"。
     bodyEl.append(h('dl.kv', [
-      h('dt', { text: '当前版本' }), h('dd', { text: `v${data.current_version || '—'}（${data.arch || '—'}）` }),
       h('dt', { text: '构建时间' }), h('dd', { text: data.build_time || '-' }),
       h('dt', { text: '内嵌发布公钥' }), h('dd', {
         text: data.can_remote ? data.pubkey + '…' : '未配置（无法从网络升级）',
@@ -1106,7 +1107,9 @@ export function UpdateView(content, ctx = {}) {
       ]));
     }
 
-    versionTag.textContent = `v${data.current_version}`;
+    versionTag.textContent = data.arch
+      ? `v${data.current_version} · ${data.arch}`
+      : `v${data.current_version}`;
   }
 
   async function refresh(showError) {
@@ -1305,7 +1308,8 @@ export function UpdateView(content, ctx = {}) {
         if (st.status === 'success' && await pingHealth()) {
           stopPoll();
           clearDismissTimer();
-          toast('升级完成，正在刷新页面…', 'ok', 6000);
+          // 不再弹「✅升级完成」toast（2026-09-22 用户：升级页每次有两处说差不多的事）——
+          // 刷新后页面顶部那条「已是最新版本 vX。最后检测：…」就是结论，一条就够。
           location.reload();
           return;
         }

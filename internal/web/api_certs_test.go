@@ -238,16 +238,24 @@ func seedSite(t *testing.T, srv *Server, domain string) *sites.Site {
 }
 
 // waitTaskDone 等任务中心的某个任务结束（假引擎是瞬时的，这里只防竞态）。
+// testTaskDeadline 是单测"等一个后台任务结束"的预算。
+//
+// 原来是写死的 5 秒：在 `make check` 把重包拆 8 进程并行之后（2026-09-22 提速），
+// 机器被压满，任务偶尔要 5 秒以上才落定 ⇒ 偶发假红（实测
+// TestBrewRepairDirsEndpointFailsHonestlyWhenReadbackFails）。断言的本意是
+// "任务最终结束了、且结论正确"，不是"它必须 5 秒内跑完"，所以给足预算。
+const testTaskDeadline = 30 * time.Second
+
 func waitTaskDone(t *testing.T, srv *Server, id string) *tasks.Task {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testTaskDeadline)
 	for time.Now().Before(deadline) {
 		if tk := srv.Tasks.Get(id); tk != nil && tk.Status() != tasks.StatusRunning {
 			return tk
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("任务 %s 没有在 5 秒内结束", id)
+	t.Fatalf("任务 %s 没有在 %s 内结束", id, testTaskDeadline)
 	return nil
 }
 

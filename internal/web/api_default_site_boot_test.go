@@ -383,7 +383,7 @@ func TestDefaultSiteHealedAfterNginxInstalledLater(t *testing.T) {
 	// 也顺带避开与巡检 goroutine 同时读写 *written 的数据竞争。
 	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")
 	vhostPath := filepath.Join(srv.Cfg.VhostDir, "000-default.conf")
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testTaskDeadline)
 	var vhostBody string
 	for time.Now().Before(deadline) {
 		if b, err := os.ReadFile(vhostPath); err == nil {
@@ -496,7 +496,7 @@ func TestTaskCompletionTriggersEnvHealAndDefaultSite(t *testing.T) {
 
 	// 等任务结束（RunningFor 返回 nil 即已完成）——钩子是**后台**跑的，
 	// 任务本身不该被自愈拖住（这正是第一版写成同步后踩到的坑）。
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testTaskDeadline)
 	for time.Now().Before(deadline) {
 		if srv.Tasks.RunningFor("hook-env-heal") == nil {
 			break
@@ -504,13 +504,13 @@ func TestTaskCompletionTriggersEnvHealAndDefaultSite(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if srv.Tasks.RunningFor("hook-env-heal") != nil {
-		t.Fatal("测试任务没有在 5 秒内结束")
+		t.Fatal("测试任务没有在预算内结束")
 	}
 
 	// 后台自愈完成时必须已经建好默认站点（nginx 是"任务开始前"就装好的，
 	// 等价于"用户刚装完 nginx 的那个任务"）。
 	index := filepath.Join(srv.Cfg.WWWRoot, "localhost", "index.html")
-	deadline = time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(testTaskDeadline)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(index); err == nil {
 			break
