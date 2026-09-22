@@ -414,6 +414,10 @@ func (s *Server) routes() http.Handler {
 	// File Browser「重置口令」：仅管理员；停服务→CLI 改口令→起回来→回读验证，走任务中心。
 	// 比上面的 {name}/{action} 更具体，Go 1.22 的 mux 会优先匹配它（否则会被当成服务动作）。
 	root.HandleFunc("POST /api/v1/services/{name}/filebrowser-password", s.requireAuth(s.handleFilebrowserPasswordReset))
+	// Transmission「RPC 设置」：读当前用户名/下载目录；改走任务中心（停→等→写→起→回读，坑 226）。
+	// 同样比 {name}/{action} 更具体，Go 1.22 的 mux 优先匹配。
+	root.HandleFunc("GET /api/v1/services/{name}/transmission", s.requireAuth(s.handleTransmissionSettingsGet))
+	root.HandleFunc("POST /api/v1/services/{name}/transmission", s.requireAuth(s.handleTransmissionSettingsSet))
 	// brew 的真实状态（服务/可升级/已装），面板直接渲染它，不再只信自己的记录表。
 	root.HandleFunc("GET /api/v1/brew/overview", s.requireAuth(s.handleBrewOverview))
 	// Homebrew 目录缺失（「未能复核已装软件」的修复入口，坑 186）：

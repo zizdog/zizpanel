@@ -275,25 +275,25 @@ func TestVerifyTransmissionCredentialsApplied(t *testing.T) {
 	path := filepath.Join(dir, "settings.json")
 
 	good := `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"{abc123def456",` +
-		`"dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":false}`
+		`"dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":false}`
 	cases := []struct {
 		name, body, user, want string
 	}{
 		{"全部生效", good, "zpu", ""},
 		{"明文还在", `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"PlainTextPw123",` +
-			`"dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":false}`, "zpu", "明文"},
+			`"dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":false}`, "zpu", "明文"},
 		{"auth-required 被回写成 false", `{"rpc-authentication-required":false,"rpc-username":"zpu",` +
-			`"rpc-password":"{abc123",` + `"dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":false}`,
+			`"rpc-password":"{abc123",` + `"dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":false}`,
 			"zpu", "rpc-authentication-required"},
 		{"用户名被回写成空", `{"rpc-authentication-required":true,"rpc-username":"",` +
-			`"rpc-password":"{abc123","dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":false}`,
+			`"rpc-password":"{abc123","dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":false}`,
 			"zpu", "rpc-username"},
-		{"dht 没关", `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"{abc123",` +
-			`"dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":false}`, "zpu", "dht-enabled"},
+		{"dht 被关了", `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"{abc123",` +
+			`"dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":false}`, "zpu", "dht-enabled"},
 		{"lpd 没关", `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"{abc123",` +
-			`"dht-enabled":false,"lpd-enabled":true,"port-forwarding-enabled":false}`, "zpu", "lpd-enabled"},
+			`"dht-enabled":true,"lpd-enabled":true,"port-forwarding-enabled":false}`, "zpu", "lpd-enabled"},
 		{"port-forwarding 没关", `{"rpc-authentication-required":true,"rpc-username":"zpu","rpc-password":"{abc123",` +
-			`"dht-enabled":false,"lpd-enabled":false,"port-forwarding-enabled":true}`, "zpu", "port-forwarding-enabled"},
+			`"dht-enabled":true,"lpd-enabled":false,"port-forwarding-enabled":true}`, "zpu", "port-forwarding-enabled"},
 		{"字段缺失", `{}`, "zpu", "rpc-authentication-required"},
 	}
 	for _, c := range cases {
@@ -323,11 +323,15 @@ func TestVerifyTransmissionCredentialsApplied(t *testing.T) {
 }
 
 // TestTransmissionDefaultsDisableLocalNetworkDiscovery 门禁：默认值必须是
-// dht-enabled / lpd-enabled / port-forwarding-enabled 三项 false
-// （macOS「本地网络」授权弹窗的来源，用户 2026-09-20 明确要求默认关掉）。
+// lpd-enabled / port-forwarding-enabled 两项 false（局域网组播会触发 macOS
+// 「本地网络」授权弹窗），而 dht-enabled 必须 **true** —— 真机实测（2026-09-20）
+// dht 关了以后加磁力链永远 peers=0 / metadata=0% 且不报错，就是"没反应"（坑 226）。
 func TestTransmissionDefaultsDisableLocalNetworkDiscovery(t *testing.T) {
 	got := transmissionDesiredSettings("u", "p")
-	for _, key := range []string{"dht-enabled", "lpd-enabled", "port-forwarding-enabled"} {
+	if v, ok := got["dht-enabled"]; !ok || v != true {
+		t.Errorf("dht-enabled 默认必须是 true（否则无 tracker 的磁力链永远不动），实际 %v", got["dht-enabled"])
+	}
+	for _, key := range []string{"lpd-enabled", "port-forwarding-enabled"} {
 		v, ok := got[key]
 		if !ok {
 			t.Errorf("默认值里必须有 %s=false（否则 macOS 会反复要本地网络授权）", key)
@@ -337,16 +341,16 @@ func TestTransmissionDefaultsDisableLocalNetworkDiscovery(t *testing.T) {
 			t.Errorf("%s 的默认值必须是 false，实际 %v", key, v)
 		}
 	}
-	// 合并写回时也必须带上这三项（不然只写口令、开关还是上游默认 true）
-	out, _, err := transmissionSettingsWithCredentials([]byte(`{"dht-enabled":true,"lpd-enabled":true,"port-forwarding-enabled":true}`), "u", "p")
+	// 合并写回时也必须带上这几项（不然只写口令、开关还是上游默认值）。
+	out, _, err := transmissionSettingsWithCredentials([]byte(`{"dht-enabled":false,"lpd-enabled":true,"port-forwarding-enabled":true}`), "u", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if problem := transmissionCredentialsProblem(out, "u", "p"); problem != "" {
-		// 明文口令还没被哈希，这一条必然命中；单独核对三个开关确实被写成 false。
-		if strings.Contains(problem, "dht-enabled") || strings.Contains(problem, "lpd-enabled") ||
-			strings.Contains(problem, "port-forwarding-enabled") {
-			t.Errorf("合并写回没有关掉本地网络发现开关：%s\n%s", problem, out)
+	// 明文口令还没被哈希，这一条必然命中；单独核对三个开关确实被写成了目标值。
+	problem := transmissionCredentialsProblem(out, "u", "p")
+	for _, key := range []string{"dht-enabled", "lpd-enabled", "port-forwarding-enabled"} {
+		if strings.Contains(problem, key) {
+			t.Errorf("合并写回没有把 %s 写成目标值：%s\n%s", key, problem, out)
 		}
 	}
 }
@@ -615,5 +619,179 @@ func TestInstallTransmissionRequiresHomebrew(t *testing.T) {
 	m.opt.BrewBin = filepath.Join(t.TempDir(), "nope", "brew")
 	if err := m.InstallTransmission(context.Background(), res); err == nil {
 		t.Fatal("Homebrew 不存在时必须失败")
+	}
+}
+
+// useTransmissionWriteProbe 注入下载目录写探针（负向对照用：不可写时必须失败）。
+func useTransmissionWriteProbe(t *testing.T, fn func(*Manager, context.Context, string) error) {
+	t.Helper()
+	old := transmissionWriteProbe
+	if fn != nil {
+		transmissionWriteProbe = fn
+	}
+	t.Cleanup(func() { transmissionWriteProbe = old })
+}
+
+// TestInstallTransmissionFailsWhenDownloadDirNotWritable 是"不许谎报"的负向对照：
+// 下载目录不可写时安装必须**失败**并点名目录，不许出现"能登录但什么都下不了"（坑 226）。
+func TestInstallTransmissionFailsWhenDownloadDirNotWritable(t *testing.T) {
+	m, _, res := transmissionHarness(t)
+	useTransmissionProbes(t, func(*Manager, context.Context, string, string, string) (int, error) {
+		return http.StatusUnauthorized, nil
+	}, nil, func(*Manager, context.Context) error { return nil })
+	useTransmissionWriteProbe(t, func(*Manager, context.Context, string) error {
+		return fmt.Errorf("operation not permitted")
+	})
+	err := m.InstallTransmission(t.Context(), res)
+	if err == nil {
+		t.Fatal("下载目录不可写时安装必须失败（不许报成功）")
+	}
+	if !strings.Contains(err.Error(), "不可写") || !strings.Contains(err.Error(), "settings.json") {
+		t.Errorf("失败原因必须点名目录不可写并劝退手改 settings.json，实际：%v", err)
+	}
+}
+
+// TestSetTransmissionRPCSettingsOrderAndReadback 主路径：改凭据/下载目录必须
+// 「停 → 写 → 启动 → 回读」，并把路径、用户名、开关写对（坑 226）。
+func TestSetTransmissionRPCSettingsOrderAndReadback(t *testing.T) {
+	m, _, res := transmissionHarness(t)
+	cfgPath := m.transmissionSettingsPath()
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"download-dir":"`+m.opt.UserHome+`/Downloads","peer-port":51413,"lpd-enabled":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopped, started := false, false
+	plain := ""
+	useTransmissionProbes(t, func(_ *Manager, _ context.Context, url, user, _ string) (int, error) {
+		if strings.Contains(url, "/transmission/rpc") {
+			if user == "" {
+				return http.StatusUnauthorized, nil
+			}
+			return http.StatusConflict, nil
+		}
+		return http.StatusOK, nil
+	}, func(*Manager, context.Context) error {
+		stopped = true
+		return nil
+	}, func(*Manager, context.Context) error {
+		if !stopped {
+			return fmt.Errorf("没有先停服务就写配置（会被回写覆盖）")
+		}
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return err
+		}
+		plain = transmissionSettingsString(raw, "rpc-password")
+		started = true
+		hashTransmissionSettingsLikeDaemon(t, cfgPath)
+		return nil
+	})
+	newDir := filepath.Join(t.TempDir(), "torrents")
+	info, err := m.SetTransmissionRPCSettings(t.Context(), res, "newuser", "NewPassPlain123456", newDir)
+	if err != nil {
+		t.Fatalf("改设置应成功，实际: %v", err)
+	}
+	if !stopped || !started {
+		t.Fatalf("必须先停再起（stopped=%v started=%v）", stopped, started)
+	}
+	if plain != "NewPassPlain123456" {
+		t.Fatalf("明文口令必须先落盘再被 daemon 哈希，实际 %q", plain)
+	}
+	if info.Username != "newuser" || info.DownloadDir != newDir {
+		t.Errorf("回读结果不符：%+v", info)
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	if got := transmissionSettingsString(raw, "download-dir"); got != newDir {
+		t.Errorf("download-dir 应为 %s，实际 %s", newDir, got)
+	}
+	if v, _ := transmissionSettingsBool(raw, "dht-enabled"); !v {
+		t.Error("dht-enabled 必须被写回 true（磁力链要用）")
+	}
+	if v, _ := transmissionSettingsBool(raw, "lpd-enabled"); v {
+		t.Error("lpd-enabled 必须被写回 false")
+	}
+	if !strings.Contains(string(raw), `"peer-port": 51413`) {
+		t.Errorf("用户其它字段必须保留，实际：%s", raw)
+	}
+	if steps := strings.Join(res.Steps, "\n"); strings.Contains(steps, "NewPassPlain123456") {
+		t.Error("明文口令不许出现在任务步骤里")
+	}
+}
+
+// TestSetTransmissionRPCSettingsFailsWhenPlaintextStays 负向对照：服务没把明文
+// 换成哈希（= 新口令没生效）时，改设置必须失败，不许报成功。
+func TestSetTransmissionRPCSettingsFailsWhenPlaintextStays(t *testing.T) {
+	m, _, res := transmissionHarness(t)
+	cfgPath := m.transmissionSettingsPath()
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`{"download-dir":"`+m.opt.UserHome+`/Downloads"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	useTransmissionProbes(t, func(*Manager, context.Context, string, string, string) (int, error) {
+		return http.StatusOK, nil
+	}, func(*Manager, context.Context) error { return nil }, func(*Manager, context.Context) error { return nil })
+	if _, err := m.SetTransmissionRPCSettings(t.Context(), res, "u", "Plain123456789012", ""); err == nil {
+		t.Fatal("新口令没生效时必须失败（不许谎报成功）")
+	} else if !strings.Contains(err.Error(), "没有生效") {
+		t.Errorf("失败原因应说清「没有生效」，实际：%v", err)
+	}
+}
+
+// TestTransmissionSettingsInfoFrom 锁死回读字段：不能把哈希当用户名、不能编默认值。
+func TestTransmissionSettingsInfoFrom(t *testing.T) {
+	raw := []byte(`{"rpc-username":"u1","rpc-password":"{abc","download-dir":"/data/dl",` +
+		`"rpc-authentication-required":true,"dht-enabled":true,"rpc-bind-address":"127.0.0.1"}`)
+	info := transmissionSettingsInfoFrom("/tmp/settings.json", raw)
+	if info.Username != "u1" || info.DownloadDir != "/data/dl" || !info.AuthRequired || !info.DHTEnabled {
+		t.Errorf("回读字段不符：%+v", info)
+	}
+	empty := transmissionSettingsInfoFrom("/tmp/x.json", []byte(`{}`))
+	if empty.Username != "" || empty.DownloadDir != "" || empty.AuthRequired || empty.DHTEnabled {
+		t.Errorf("缺字段时必须如实留空/false，实际：%+v", empty)
+	}
+}
+
+// TestSetTransmissionRPCSettingsKeepsPasswordWhenBlank：口令留空 = 不重设（保留原哈希），
+// 且不许用空明文去做"带凭据自检"（那必然 401，会把成功谎报成失败）。
+func TestSetTransmissionRPCSettingsKeepsPasswordWhenBlank(t *testing.T) {
+	m, _, res := transmissionHarness(t)
+	cfgPath := m.transmissionSettingsPath()
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const oldHash = "{deadbeefdeadbeefdeadbeefdeadbeefdeadbeefAAA"
+	body := `{"rpc-username":"old","rpc-password":"` + oldHash + `","download-dir":"` + m.opt.UserHome + `/Downloads"}`
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authProbed := false
+	useTransmissionProbes(t, func(_ *Manager, _ context.Context, _ string, user, _ string) (int, error) {
+		if user != "" {
+			authProbed = true
+			return http.StatusUnauthorized, nil // 空明文必然被拒；走这条路就是 bug
+		}
+		return http.StatusUnauthorized, nil
+	}, func(*Manager, context.Context) error { return nil }, func(*Manager, context.Context) error { return nil })
+	if _, err := m.SetTransmissionRPCSettings(t.Context(), res, "newuser", "", ""); err != nil {
+		t.Fatalf("留空口令应成功（保留原哈希），实际：%v", err)
+	}
+	if authProbed {
+		t.Error("口令留空时不得用空明文做带凭据自检（会把成功判成失败）")
+	}
+	raw, _ := os.ReadFile(cfgPath)
+	if got := transmissionSettingsString(raw, "rpc-password"); got != oldHash {
+		t.Errorf("口令留空时原哈希必须原样保留，实际 %q", got)
+	}
+	if got := transmissionSettingsString(raw, "rpc-username"); got != "newuser" {
+		t.Errorf("用户名应更新为 newuser，实际 %q", got)
+	}
+	for _, c := range res.Credentials {
+		if c.Key == "transmission_rpc_password" {
+			t.Error("没重设口令时不该在凭据区给出口令")
+		}
 	}
 }

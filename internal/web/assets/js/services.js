@@ -1464,10 +1464,92 @@ async function resetFilebrowserPassword(s) {
   });
 }
 
+// TRANSMISSION_LABELS 是 Transmission 的 launchd label（brew 两套前缀都可能）。
+const TRANSMISSION_LABELS = ['homebrew.mxcl.transmission-cli', 'sh.brew.transmission-cli'];
+
+// openTransmissionSettingsModal 改 Transmission 的 RPC 用户名 / 口令 / 下载目录。
+//
+// 顺序由后端固定为「停 → 等端口释放 → 写 → 启动 → 回读逐字段核对」（坑 226）：
+// 手工编辑 settings.json 再重启会被 daemon 退出时的内存回写覆盖，所以这里明确劝退。
+async function openTransmissionSettingsModal(s, parentModal) {
+  const status = h('div.muted', { text: '正在读取当前设置…' });
+  const userInput = h('input', { type: 'text', placeholder: 'RPC 用户名', style: { width: '100%', boxSizing: 'border-box' } });
+  const pwInput = h('input', { type: 'password', placeholder: '留空＝保留当前口令；填了立即替换', style: { width: '100%', boxSizing: 'border-box' } });
+  const dirInput = h('input', { type: 'text', placeholder: '/Users/你的用户名/Downloads', style: { width: '100%', boxSizing: 'border-box' } });
+  const saveBtn = h('button.btn.btn-ok', { text: '保存并重启' });
+
+  const body = h('div', [
+    h('p', { text: 'RPC 用户名：' }), userInput,
+    h('p', { style: { marginTop: '8px' }, text: 'RPC 口令（留空则不改）：' }), pwInput,
+    h('p', { style: { marginTop: '8px' }, text: '下载目录（绝对路径）：' }), dirInput,
+    h('div', { style: { margin: '8px 0' } }, [saveBtn]),
+    status,
+    h('hr'),
+    h('p.hint', {
+      text: '⚠️ 不要手工编辑 settings.json 后直接重启：daemon 退出时会把内存里的旧配置'
+        + '回写覆盖你的修改，表现就是"改了不生效"。改这里才走「停→写→起→回读」。',
+    }),
+    h('p.hint', { text: '下载目录必须是运行 Transmission 的用户可写的目录；不可写会当场报错，不会假装成功。' }),
+    h('p.hint', { text: 'DHT 保持开启：关掉后没有 tracker 的磁力链会一直 0% 且不报错。局域网发现与 UPnP 仍关闭。' }),
+  ]);
+  const m = modal({ title: 'Transmission RPC 设置', wide: true, body });
+
+  async function load() {
+    try {
+      const info = await api.transmissionSettings(s.name);
+      userInput.value = info.username || '';
+      dirInput.value = info.download_dir || '';
+      status.textContent = `当前生效：用户 ${info.username || '(空)'}、下载目录 ${info.download_dir || '(空)'}`
+        + `、认证 ${info.auth_required ? '已开启' : '未开启'}、DHT ${info.dht_enabled ? '开' : '关'}`;
+    } catch (e) {
+      status.textContent = '读取失败：' + e.message;
+    }
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    const username = (userInput.value || '').trim();
+    const downloadDir = (dirInput.value || '').trim();
+    if (!username) { toast('RPC 用户名不能为空', 'err'); return; }
+    if (!downloadDir) { toast('下载目录不能为空', 'err'); return; }
+    if (!await confirmBox(
+      '将先停止 Transmission（期间网页打不开），改完自动起回来并回读逐字段核对。\n'
+      + '口令留空表示不改；填了则旧口令立即失效（新口令只在任务结果里显示一次）。',
+      { title: '确认修改 RPC 设置', okText: '确认修改' })) return;
+    saveBtn.disabled = true;
+    // 走任务中心：停/起与回读要几秒，失败原因在任务结果里显示（不静默）。
+    taskCenter.start({
+      kind: 'transmission-settings',
+      target: s.name,
+      title: '修改 Transmission RPC 设置',
+      start: () => api.setTransmissionSettings(s.name, { username, password: pwInput.value, download_dir: downloadDir }),
+      onDone: (task) => {
+        saveBtn.disabled = false;
+        if (task && task.status && task.status !== 'succeeded') {
+          // 失败必须把后端原文贴出来，绝不沉默（坑 154）。
+          toast('修改失败：' + (task.error || '原因见任务进度窗'), 'err', 15000);
+        } else {
+          toast('已保存并回读生效', 'ok', 12000);
+          load();
+        }
+      },
+    });
+  });
+
+  await load();
+  return m;
+}
+
 // WIDGET_BUTTONS：launchd 标签 → 造按钮的函数。
 //
 // 用 label 而不是"应用 ID"当键：服务记录里可靠的就是 launch_label
 // （Qwen 那条还有 name 的兼容写法），目录 ID 在服务记录里并不存在。
+function transmissionWidgetButtons(parentModal, s) {
+  return [h('button.btn.btn-sm', {
+    text: '⚙️ RPC 设置',
+    title: '改 RPC 用户名/口令与下载目录；面板按「停→等→写→起→回读」执行，请勿手改 settings.json',
+    onclick: () => openTransmissionSettingsModal(s, parentModal),
+  })];
+}
 const WIDGET_BUTTONS = {
   // 音色接收端：调用密钥（多密钥 + 每把额度 + 用量）与各来源（每站一份参考音频）
   [RECEIVER_LABEL]: (parentModal) => [
@@ -1503,6 +1585,9 @@ const WIDGET_BUTTONS = {
       onclick: () => resetFilebrowserPassword(s),
     }),
   ],
+  // Transmission：RPC 用户名/口令 + 下载目录（后端固定「停→等→写→起→回读」，坑 226）。
+  [TRANSMISSION_LABELS[0]]: (parentModal, s) => transmissionWidgetButtons(parentModal, s),
+  [TRANSMISSION_LABELS[1]]: (parentModal, s) => transmissionWidgetButtons(parentModal, s),
 };
 
 /**

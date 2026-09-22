@@ -283,6 +283,12 @@ export const api = {
   resetFilebrowserPassword: (name, password) =>
     request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-password`,
       password ? { password } : {}),
+  // Transmission 的 RPC 用户名 / 下载目录：写后后端会「停→等→写→起→回读」，走任务中心。
+  // 口令只随任务结果返回一次，绝不进 URL / localStorage。
+  transmissionSettings: (name) =>
+    request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/transmission`),
+  setTransmissionSettings: (name, body) =>
+    request('POST', `${API_BASE}/services/${encodeURIComponent(name)}/transmission`, body),
 
   // ---- 任务中心（安装/卸载的实时进度）----
   //
