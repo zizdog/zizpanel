@@ -16,6 +16,10 @@
 #    NAS_PASS='...' bash tools/sync-nas-apps.sh     # 真同步（需要 sshpass）
 #    只同步一个应用：加 --app frpc
 #
+#  上游第 4 列是 `local:<绝对路径>` 时（自研产物，如 zizvideo）：跳过所有网络候选，
+#  直接用该本地文件上传；文件不存在就如实失败（绝不回落去下载）。清单 upstream 写
+#  "本地构建（make release）"。
+#
 #  环境变量：NAS_HOST / NAS_USER / NAS_ROOT / NAS_PASS / MIRROR_BASE_URL
 #  ⚠️ 地址由调用者提供，仓库里不留任何内网默认值（NAS_HOST/NAS_USER/NAS_ROOT 非 dry-run 必填）。
 #  ⚠️ 口令只从环境变量进、只交给 sshpass，绝不写进任何文件、也不打印。
@@ -35,7 +39,7 @@ MIRROR_BASE_URL="${MIRROR_BASE_URL:-https://mirror.zizdog.com:8888}"
 DRY_RUN=0
 ONLY_APP=""
 
-usage() { sed -n '2,25p' "$0"; }
+usage() { sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/d;p;}' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -140,14 +144,24 @@ while IFS=$'\t' read -r id tag asset upstream; do
   dest="$NAS_ROOT/$id/$tag"
   public="$MIRROR_BASE_URL/apps/$id/$tag/$asset"
   had="$(remote_sha256 "$id" "$tag" "$asset")"
+  local_src=""
+  case "$upstream" in local:*) local_src="${upstream#local:}" ;; esac
+  manifest_upstream="$upstream"
+  if [ -n "$local_src" ]; then manifest_upstream="本地构建（make release）"; fi
 
   if [ "$DRY_RUN" = "1" ]; then
     if [ -n "$had" ]; then
       echo "  [dry-run] $id ${tag}：镜像上已有 ${asset}（sha256 ${had:0:12}…）→ 会跳过"
+    elif [ -n "$local_src" ]; then
+      echo "  [dry-run] $id ${tag}：镜像上没有 $asset → 上传本地产物到 $dest/"
     else
       echo "  [dry-run] $id ${tag}：镜像上没有 $asset → 下载并上传到 $dest/"
     fi
-    echo "            上游：$upstream"
+    if [ -n "$local_src" ]; then
+      echo "            本地来源：$local_src"
+    else
+      echo "            上游：$upstream"
+    fi
     echo "            验收：$public"
     printf 'dry\t%s\n' "$id" >> "$RESULTS"
     continue
@@ -156,17 +170,29 @@ while IFS=$'\t' read -r id tag asset upstream; do
   dir="$TMP/$id/$tag"
   mkdir -p "$dir"
   ok=0
-  for cand in $(upstream_candidates "$upstream"); do
-    echo "  下载 $id $tag $asset"
-    echo "    候选：$cand"
-    if /usr/bin/curl -fL --http1.1 --retry 1 --connect-timeout 20 --max-time 900 \
-        --speed-limit 1024 --speed-time 30 -o "$dir/$asset.part" "$cand" 2>/dev/null; then
-      mv "$dir/$asset.part" "$dir/$asset"
-      ok=1
-      break
+  if [ -n "$local_src" ]; then
+    # 自研产物：没有上游可下载，缺文件就如实失败（不回落去试网络候选）
+    if [ ! -f "$local_src" ]; then
+      echo "  ✗ $id ${tag}：本地产物不存在：${local_src}（先跑 make release）"
+      printf 'fail\t%s\n' "$id" >> "$RESULTS"
+      continue
     fi
-    echo "    这个源不通，换下一个"
-  done
+    echo "  本地 $id $tag $asset"
+    cp -p "$local_src" "$dir/$asset"
+    ok=1
+  else
+    for cand in $(upstream_candidates "$upstream"); do
+      echo "  下载 $id $tag $asset"
+      echo "    候选：$cand"
+      if /usr/bin/curl -fL --http1.1 --retry 1 --connect-timeout 20 --max-time 900 \
+          --speed-limit 1024 --speed-time 30 -o "$dir/$asset.part" "$cand" 2>/dev/null; then
+        mv "$dir/$asset.part" "$dir/$asset"
+        ok=1
+        break
+      fi
+      echo "    这个源不通，换下一个"
+    done
+  fi
   if [ "$ok" != "1" ]; then
     echo "  ✗ $id ${tag}：所有上游都不通，跳过（镜像上仍是旧状态）"
     printf 'fail\t%s\n' "$id" >> "$RESULTS"
@@ -181,7 +207,7 @@ while IFS=$'\t' read -r id tag asset upstream; do
   fi
 
   # 清单与包放在同一目录：面板下载前会 HEAD 包 + 取清单做 sha256 校验
-  python3 - "$id" "$tag" "$asset" "$sum" "$(wc -c < "$dir/$asset" | tr -d ' ')" "$upstream" > "$dir/manifest.json" <<'PY'
+  python3 - "$id" "$tag" "$asset" "$sum" "$(wc -c < "$dir/$asset" | tr -d ' ')" "$manifest_upstream" > "$dir/manifest.json" <<'PY'
 import json, sys, time
 app, tag, asset, sha, size, upstream = sys.argv[1:7]
 print(json.dumps({

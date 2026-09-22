@@ -45,25 +45,42 @@ var moduleSelfCheckRun = func(m *Manager, ctx context.Context, bin string, args 
 type moduleSpec struct {
 	name      string
 	label     string
-	bundled   string // 携带位：随面板包分发的二进制
+	bundled   string // 携带位：随面板包分发的二进制（空/不存在时用 fetch 按需取件）
 	installed string // 安装位：模块实际运行的二进制
 	plist     string // launchd 作业定义（"装没装"的运行体判据之一）
 	selfArgs  []string
 	launch    func(m *Manager, ctx context.Context, label, plist string) error
+	// wantVersion 是这一版面板期望的模块版本（装到位后自检输出里应含它）。
+	wantVersion string
+	// fetch 是"不随包分发的模块"的按需取件（从镜像站下载并核 sha256）。
+	// 网络不可达时**如实失败**，绝不谎报"已是最新"。
+	fetch func(m *Manager, ctx context.Context, result *InstallResult) (string, error)
 }
+
+// defaultZizvideoModuleFetch 是"不随包分发的 zizvideo"的真实取件口；
+// zizvideoModuleFetch 可被单测替换（单测绝不联网），替换后用它恢复。
+var defaultZizvideoModuleFetch = func(m *Manager, ctx context.Context, result *InstallResult) (string, error) {
+	return m.downloadZizvideoBinary(ctx, result)
+}
+
+var zizvideoModuleFetch = defaultZizvideoModuleFetch
 
 // managedModuleSpecs 返回要刷新的模块清单。
 func (m *Manager) managedModuleSpecs(panelBinDir string) []moduleSpec {
 	zp := m.ZizvideoPathsFor()
 	return []moduleSpec{
 		{
-			name:      ZizvideoAppID,
-			label:     ZizvideoLabel,
-			bundled:   filepath.Join(panelBinDir, ZizvideoAppID),
-			installed: zp.Bin,
-			plist:     zp.Plist,
-			selfArgs:  []string{"--version"},
-			launch:    zizvideoLaunch,
+			name:        ZizvideoAppID,
+			label:       ZizvideoLabel,
+			bundled:     filepath.Join(panelBinDir, ZizvideoAppID),
+			installed:   zp.Bin,
+			plist:       zp.Plist,
+			selfArgs:    []string{"--version"},
+			wantVersion: ZizvideoVersion,
+			launch:      zizvideoLaunch,
+			fetch: func(m *Manager, ctx context.Context, result *InstallResult) (string, error) {
+				return zizvideoModuleFetch(m, ctx, result)
+			},
 		},
 	}
 }
@@ -87,17 +104,39 @@ func (m *Manager) RefreshInstalledModules(ctx context.Context, panelBinDir strin
 func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) ModuleRefreshResult {
 	r := ModuleRefreshResult{Name: spec.name}
 
-	// ① 携带位没有这个模块（老发布包 / 模块改为按需下载后不随包）⇒ 跳过，绝不顺手安装。
-	if !fileExecutable(spec.bundled) {
-		r.Status = ModuleSkipped
-		r.Reason = "发布包未携带 " + spec.name + " 二进制（" + spec.bundled + "）"
-		return r
-	}
-	// ② 只处理真的装了的：安装位二进制 + 它的 launchd 作业都得在，缺一即未安装。
+	// ① 只处理真的装了的：安装位二进制 + 它的 launchd 作业都得在，缺一即未安装。
 	if !fileExecutable(spec.installed) || strings.TrimSpace(spec.plist) == "" || !fileExists(spec.plist) {
 		r.Status = ModuleSkipped
 		r.Reason = "未安装 " + spec.name + "（安装位二进制或守护进程不存在）"
 		return r
+	}
+	// ② 已装的就是这一版期望的版本 ⇒ 零动作（不下载、不替换、不重启）。
+	//
+	// 版本优先于 sha：机器上可能残留着旧发布包放下的携带位，光比 sha 会把
+	// "已装的是旧构建、携带位也是旧的" 判成最新（坑 216 的翻版）。
+	if spec.wantVersion != "" {
+		if out, err := moduleSelfCheckRun(m, ctx, spec.installed, spec.selfArgs...); err == nil &&
+			strings.Contains(out, spec.wantVersion) {
+			r.Status = ModuleUpToDate
+			r.Reason = "已安装的 " + spec.name + " 就是 " + spec.wantVersion + "，未做任何改动"
+			return r
+		}
+	}
+	// ③ 需要刷新：优先用随包携带位；不随包分发的模块从镜像站按需取件（取不到如实失败）。
+	bundled := spec.bundled
+	if !fileExecutable(bundled) {
+		if spec.fetch == nil {
+			r.Status = ModuleSkipped
+			r.Reason = "发布包未携带 " + spec.name + " 二进制（" + bundled + "），它也不支持按需取件"
+			return r
+		}
+		src, err := spec.fetch(m, ctx, nil)
+		if err != nil {
+			r.Status = ModuleFailed
+			r.Reason = "按需取件失败，未改动已安装的 " + spec.name + "：" + err.Error()
+			return r
+		}
+		bundled = src
 	}
 	from, err := fileSHA256(spec.installed)
 	if err != nil {
@@ -105,7 +144,7 @@ func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) Modu
 		r.Reason = "读取安装位二进制失败：" + err.Error()
 		return r
 	}
-	to, err := fileSHA256(spec.bundled)
+	to, err := fileSHA256(bundled)
 	if err != nil {
 		r.Status = ModuleFailed
 		r.Reason = "读取携带位二进制失败：" + err.Error()
@@ -126,7 +165,7 @@ func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) Modu
 		r.Reason = "备份旧二进制失败，未替换：" + err.Error()
 		return r
 	}
-	if err := installFileExecutable(spec.bundled, spec.installed); err != nil {
+	if err := installFileExecutable(bundled, spec.installed); err != nil {
 		r.Status = ModuleRolledBack
 		r.Reason = "原子替换失败：" + err.Error()
 		if rbErr := installFileExecutable(bak, spec.installed); rbErr != nil {
@@ -136,8 +175,12 @@ func (m *Manager) refreshModuleBinary(ctx context.Context, spec moduleSpec) Modu
 		return r
 	}
 
-	// ⑤ 自检：跑模块自己的版本命令，跑不起来或没有输出都算失败。
+	// ⑤ 自检：跑模块自己的版本命令；跑不起来、没有输出、或版本不是这一版期望的，都算失败。
 	ver, err := moduleSelfCheckRun(m, ctx, spec.installed, spec.selfArgs...)
+	if err == nil && spec.wantVersion != "" && !strings.Contains(ver, spec.wantVersion) {
+		err = fmt.Errorf("自检报的版本不是 %s（%s）", spec.wantVersion, tailText(strings.TrimSpace(ver), 120))
+		ver = ""
+	}
 	if err != nil || strings.TrimSpace(ver) == "" {
 		why := "自检未通过"
 		if err != nil {

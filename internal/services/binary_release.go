@@ -328,6 +328,23 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 				"它只绑回环，手机在局域网里直连 4533 是打不开的（走面板入口或反代）。",
 		},
 	},
+	// zizvideo：本项目自研模块的产物，**只在公网镜像站上**（自 2026-09-22 起不随
+	// 面板包分发，面板包因此少了 ~17 MB 的模块二进制）。
+	// 登记它的两个理由：市场门禁要求 release_binary 下载点与注册表对得上；
+	// 镜像同步工具（ReleaseBinaryAssets）据此知道要同步哪个文件。
+	// 安装/卸载走 zizvideo.go（系统级 LaunchDaemon，可执行文件是面板自身的
+	// zizvideo-supervise），不走这套通用流程。
+	"zizvideo": {
+		ID: ZizvideoAppID, Label: ZizvideoLabel, Name: "zizvideo", Icon: "🎬",
+		Category: "tool", RootDir: "zizvideo", MirrorOnly: true,
+		Tag: ZizvideoVersion, Asset: ZizvideoArtifactName(ZizvideoVersion),
+		Binary: "zizvideo",
+		// 裸二进制（不是归档）：不剥层、直接当可执行文件用。
+		TarStrip: 0, PickBinary: true,
+		Port: ZizvideoPort, HealthPath: zizvideoHealthPath,
+		BindAddress:       "127.0.0.1",
+		CheckPortConflict: true,
+	},
 }
 
 // panelConfigMarker 是"面板生成配置"的标记（重装时据此决定保留还是覆盖）。

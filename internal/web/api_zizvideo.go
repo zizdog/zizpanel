@@ -17,8 +17,8 @@ var zizvideoInstallFn = func(s *Server, ctx context.Context, app services.App, r
 // handleInstallZizvideo 安装应用市场里的「zizvideo」（短视频模块）。
 //
 // 为什么走自研安装器而不是通用流程：
-//   - **没有上游**：二进制随面板发布包一起分发（make release 打进 tar 顶层的
-//     ./zizvideo），安装器从 <面板二进制目录>/zizvideo 取，不需要任何网络下载；
+//   - **没有上游**：二进制不随面板包分发（2026-09-22 起），安装时从应用包镜像
+//     apps/zizvideo/<版本>/ 按需下载并核 sha256（本地开发用面板旁的 <bin>/zizvideo）；
 //   - **服务形态不同**：它的可执行文件是**面板自己的二进制**
 //     （`zizpanel zizvideo-supervise`），装成系统级 LaunchDaemon
 //     （label cn.zizpanel.zizvideo）—— 与面板同一代码要求，所以与面板**共用文件权限**；
@@ -33,7 +33,7 @@ func (s *Server) handleInstallZizvideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.launchInstallTask(w, r, "install", id,
-		"安装 "+app.Name+"（随面板包分发）",
+		"安装 "+app.Name+"（从镜像站下载）",
 		"install_zizvideo", func(ctx context.Context, _ tasks.LogFunc) (any, error) {
 			res := &services.InstallResult{App: app.ID, Steps: []string{}}
 			if err := zizvideoInstallFn(s, ctx, app, res); err != nil {

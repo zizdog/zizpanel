@@ -29,7 +29,8 @@ LDFLAGS    := -s -w \
 	-X github.com/zizdog/zizpanel/internal/version.Commit=$(COMMIT) \
 	-X github.com/zizdog/zizpanel/internal/version.BuildTime=$(BUILD_TIME)
 # ZIZVIDEO_VERSION 锚定 internal/services/zizvideo.go 的 ZizvideoVersion（安装时就按它核对
-# `zizvideo --version`），保证"发布包里的二进制"与"面板要装的版本"同源。
+# `zizvideo --version`）。zizvideo 自 2026-09-22 起**不随面板包分发**：make release 单独产出
+# 裸二进制，make sync-apps 同步到镜像站，安装时按需下载。
 ZIZVIDEO_VERSION := $(shell sed -n 's/.*ZizvideoVersion *= *"\([^"]*\)".*/\1/p' internal/services/zizvideo.go | head -1)
 ZIZVIDEO_LDFLAGS := -X github.com/zizdog/zizvideo/internal/api.Version=$(ZIZVIDEO_VERSION)
 
@@ -99,7 +100,7 @@ test-short: ## 只跑单测（跳过真实系统采集）
 	go test ./... -short -count=1
 
 .PHONY: check
-check: ## 提交前检查：格式 + shell 校验 + vet + 测试
+check: ## 日常提交前检查（约 1 分钟；发版前再跑 check-full）
 	@echo "==> 版本号来源检查（注释里的历史版本不许遮蔽 var Version；install.sh 的 SCRIPT_VERSION 必须一致）"
 	@real="$(VERSION)"; loose=$$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
 	 scriptv=$$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)".*/\1/p' install.sh | head -1); \
@@ -170,20 +171,26 @@ check: ## 提交前检查：格式 + shell 校验 + vet + 测试
 	 done; echo "  独立模块自测 OK"
 	@# receiver.py 的 /jobs 是纯 Python，go test 覆盖不到。
 	@# 它又是「关掉网站也能跑完」的唯一保障，所以进 check 门禁。
+	@echo "==> 三档卸载脚本沙箱测试"
+	@$(MAKE) --no-print-directory uninstall-test
+	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
+	@$(MAKE) --no-print-directory server-mode-test
+	@bash tools/check-stamp.sh write
+	@echo "常规检查通过 ✅（发版前请再跑一次 make check-full）"
+
+# 发版前才需要的重活（每次几分钟，日常提交不跑）：真起进程的安装端到端、
+# 依赖已发布 dist 包的远程安装、以及只与发版有关的发布说明检查。
+.PHONY: check-full
+check-full: check ## 发版前全量检查（check + 安装/远程安装端到端 + receiver /jobs + 发布说明）
 	@echo "==> receiver /jobs 测试"
 	@$(MAKE) --no-print-directory jobs-test
 	@echo "==> 安装脚本端到端测试（沙箱）"
 	@$(MAKE) --no-print-directory install-test
 	@echo "==> 远程一键安装测试（本地 HTTP 服务 + 沙箱）"
 	@$(MAKE) --no-print-directory remote-test
-	@echo "==> 三档卸载脚本沙箱测试"
-	@$(MAKE) --no-print-directory uninstall-test
-	@echo "==> 服务器模式测试（SSH/电源/更新策略）"
-	@$(MAKE) --no-print-directory server-mode-test
 	@echo "==> 发布说明门禁（版本标题 / 长度 / 无旧版本标题 / 清单一致）"
 	@bash tools/check-release-notes.sh
-	@bash tools/check-stamp.sh write
-	@echo "全部检查通过 ✅"
+	@echo "全量检查通过 ✅"
 
 .PHONY: install-test
 install-test: ## 安装脚本端到端测试（沙箱，无需 root）
@@ -328,7 +335,7 @@ release-notes: ## 按当前版本从 git 历史生成发布说明（$(NOTES_FILE
 	@python3 tools/gen-release-notes.py --out $(NOTES_FILE)
 
 .PHONY: release
-release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；ARCHS="arm64" 只发本机架构）
+release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；zizvideo 单独产出供 sync-apps）
 	@# ARCHS：`make deploy` 只发 arm64（本机与 mini 都是 Apple Silicon）—— 少构建一次、
 	@# 上传体积减半；手动 `make release` 做正式发布时保持默认双架构，别漏 amd64。
 	@echo "==> 目标架构：$(ARCHS)"
@@ -356,7 +363,8 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；AR
 		GOOS=darwin GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" \
 			-o $(DIST)/tmp-$$arch/zizpanel-helper ./cmd/zizpanel-helper; \
 		( cd zizvideo && GOOS=darwin GOARCH=$$arch CGO_ENABLED=0 go build -trimpath \
-			-ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(DIST)/tmp-$$arch/zizvideo" ./cmd/server ); \
+			-ldflags "$(ZIZVIDEO_LDFLAGS)" -o "$(CURDIR)/$(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch" ./cmd/server ); \
+		chmod 0755 $(RELDIR)/zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch; \
 		if [ "$${SKIP_CODESIGN:-0}" = "1" ]; then \
 			echo "    !! 跳过签名（SKIP_CODESIGN=1）：本次产物是 adhoc 签名，"; \
 			echo "       用户升级后系统会要求重新授权（见 docs/坑清单.md #183）"; \
@@ -395,8 +403,31 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；AR
 			echo "    ✓ 已内嵌发布公钥 $$(printf '%s' "$$PUB" | cut -c1-16)…"; \
 		fi; \
 		( cd $(DIST)/tmp-$$arch && tar -czf ../release/zizpanel_$(VERSION)_darwin_$$arch.tar.gz . ); \
+		if tar -tzf $(RELDIR)/zizpanel_$(VERSION)_darwin_$$arch.tar.gz | grep -q zizvideo; then \
+			echo "!! 发布包里出现了 zizvideo —— 它自 2026-09-22 起改为镜像站按需下载，不再随包分发"; exit 1; \
+		fi; \
 		rm -rf $(DIST)/tmp-$$arch; \
 	done
+	@# zizvideo 不随包分发：上面已产出裸二进制到 $(RELDIR)，这里再放一份"应用包本地布局"，
+	@# 供 make sync-apps 直传镜像站（cmd/zizpanel-assets 对自研产物输出 local: 路径）。
+	@set -e; \
+	APPDIR="$(DIST)/apps/zizvideo/$(ZIZVIDEO_VERSION)"; \
+	mkdir -p "$$APPDIR"; \
+	for arch in $(ARCHS); do \
+		f="zizvideo_$(ZIZVIDEO_VERSION)_darwin_$$arch"; \
+		[ -f "$(RELDIR)/$$f" ] || { echo "!! 缺少 zizvideo 产物：$(RELDIR)/$$f"; exit 1; }; \
+		install -m 0755 "$(RELDIR)/$$f" "$$APPDIR/$$f"; \
+	done; \
+	printf '%s\n' \
+		'import hashlib, json, os, sys, time' \
+		'd, ver = sys.argv[1], sys.argv[2]' \
+		'assets = [{"name": n, "sha256": hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest(),' \
+		'           "size": os.path.getsize(os.path.join(d, n)), "upstream": "本地构建（make release）"}' \
+		'          for n in sorted(os.listdir(d)) if n.startswith("zizvideo_")]' \
+		'print(json.dumps({"app": "zizvideo", "version": ver,' \
+		'                  "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),' \
+		'                  "assets": assets}, ensure_ascii=False, indent=2))' \
+		| python3 - "$$APPDIR" "$(ZIZVIDEO_VERSION)" > "$$APPDIR/manifest.json"
 	@# 同时产出一份"通用"名字的最新包，便于固定 URL 下载
 	@for a in $(ARCHS); do cp $(RELDIR)/zizpanel_$(VERSION)_darwin_$$a.tar.gz $(RELDIR)/zizpanel_latest_darwin_$$a.tar.gz 2>/dev/null || true; done
 	@# 生成清单：面板"检查更新"读的就是它。清单里带每个架构的 URL 与 SHA-256。
@@ -424,6 +455,13 @@ release: clean ## 产出可分发压缩包 + 签名清单（默认双架构；AR
 	@shasum -a 256 $(RELDIR)/*.tar.gz | sed 's|$(RELDIR)/||'
 	@echo ""
 	@echo "面板「在线升级」需要把 manifest.json 与 manifest.json.sig 一起放到升级源目录。"
+	@echo ""
+	@echo "zizvideo 产物 sha256（不随包分发，安装时从镜像站按需下载）："
+	@shasum -a 256 $(RELDIR)/zizvideo_* 2>/dev/null | sed 's|$(RELDIR)/||' || true
+	@echo ""
+	@echo "👉 把 zizvideo_$(ZIZVIDEO_VERSION)_darwin_arm64 的 sha256 写进 internal/services/zizvideo.go 的"
+	@echo "   ZizvideoBinarySHA256：镜像站 manifest.json 是运行期优先来源，这个常量只在镜像缺清单时兜底。"
+	@echo "   （不会因为不一致让本次 release 失败，但常量过期时无清单的镜像会装不上。）"
 
 .PHONY: host-zizpanel
 host-zizpanel: ## 构建本机版（只用来给清单签名；make release 也会用到它）

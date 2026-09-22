@@ -1,15 +1,10 @@
 package services
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -17,8 +12,11 @@ import (
 // ============================================================================
 //  zizvideo（短视频服务）的安装 / 卸载
 //
-//  zizvideo 是**本仓库自己的模块**（仓库 zizvideo/，module github.com/zizdog/zizvideo），
-//  随面板一起构建，不再单独分发。它由面板托管：系统级 LaunchDaemon
+//  zizvideo 是**本仓库自己的模块**（仓库 zizvideo/，module github.com/zizdog/zizvideo）。
+//  自 2026-09-22 起**不随面板发布包分发**（面板包瘦身）：安装时从应用包镜像
+//  `apps/zizvideo/<版本>/zizvideo_<版本>_darwin_arm64` 按需下载并核 sha256；
+//  本地开发（make dev）仍可用面板二进制旁边的 <bin>/zizvideo 直接装。
+//  它由面板托管：系统级 LaunchDaemon
 //  cn.zizpanel.zizvideo 执行 `<面板二进制> zizvideo-supervise`，supervisor 以 root
 //  fork 后 setuid 到真实用户跑 zizvideo —— 与面板同一代码要求 ⇒ 与面板**共用文件
 //  权限**（AGENTS 铁律 12、docs/坑清单.md 202）。
@@ -39,11 +37,21 @@ var (
 	ZizvideoInstallRoot = "/opt/zizvideo"
 	// zizvideoPanelExecutable 返回面板自身的可执行文件路径（系统守护进程执行它）。
 	zizvideoPanelExecutable = os.Executable
-	// zizvideoSourceBin 由面板二进制路径推导要安装的 zizvideo 二进制：它由面板
-	// 发布包放在面板二进制旁边，随面板一起分发（不再有独立下载源）。
+	// zizvideoSourceBin 由面板二进制路径推导"本地开发/旧发布包"里的 zizvideo：
+	// 它就在面板二进制旁边（<bin>/zizvideo）。正式发布包**不再携带**它。
 	zizvideoSourceBin = func(panelBin string) string {
 		return filepath.Join(filepath.Dir(panelBin), "zizvideo")
 	}
+	// zizvideoFetch 下载这一版的 zizvideo 产物（默认 curl；单测注入假实现，绝不联网）。
+	zizvideoFetch = func(m *Manager, ctx context.Context, url, dst string, result *InstallResult) error {
+		_, err := m.downloadToFile(ctx, url, dst, 5*time.Minute, result, "下载 zizvideo "+ZizvideoVersion)
+		return err
+	}
+	// defaultZizvideoFetch / defaultZizvideoExpectedSHA256 保存默认实现（单测替换后恢复）。
+	defaultZizvideoFetch = zizvideoFetch
+	// zizvideoExpectedSHA256 返回镜像没有 manifest.json 时的期望 sha256（单测注入）。
+	zizvideoExpectedSHA256        = func() string { return ZizvideoBinarySHA256 }
+	defaultZizvideoExpectedSHA256 = zizvideoExpectedSHA256
 	// zizvideoLaunch 在 system 域装载 supervisor。
 	zizvideoLaunch = func(m *Manager, ctx context.Context, label, plist string) error {
 		return m.bootstrapService(ctx, label, plist)
@@ -78,8 +86,12 @@ const (
 	ZizvideoAppID = "zizvideo"
 	// ZizvideoLabel 是系统级守护进程的 launchd 标签（面板托管 ⇒ 用面板的域前缀）。
 	ZizvideoLabel = "cn.zizpanel.zizvideo"
-	// ZizvideoVersion 是这一版面板所打包/验收的 zizvideo 版本。
+	// ZizvideoVersion 是这一版面板所验收的 zizvideo 版本（make release 也按它打产物）。
 	ZizvideoVersion = "0.1.0-mvp"
+	// ZizvideoBinarySHA256 是 arm64 产物的 sha256（make release 每次打印；改 zizvideo
+	// 源码或换版本都要同步它）。运行期**优先用镜像站 manifest.json 里的值**，
+	// 这个常量只在镜像没有清单时兜底。
+	ZizvideoBinarySHA256 = "2f348ce154c54d49c451debe7131369c9b9d3a47ca7cfb55e7061e531dedd348"
 	// ZizvideoPort 是网页界面端口（只绑 127.0.0.1）。
 	ZizvideoPort = 7766
 	// zizvideoHealthPath 是公开的就绪端点，进程活着就返回 ok。
@@ -87,6 +99,12 @@ const (
 	// zizvideoReadyTimeout 是等网页界面就绪的上限。
 	zizvideoReadyTimeout = 60 * time.Second
 )
+
+// ZizvideoArtifactName 是镜像站上的产物文件名（**裸二进制**，不打包：归档头里的
+// MTIME 会让同源码两次构建的 sha256 不同，校验就永远对不上）。
+func ZizvideoArtifactName(ver string) string {
+	return "zizvideo_" + ver + "_darwin_arm64"
+}
 
 // ZizvideoPaths 是一次安装要落盘的全部位置。
 type ZizvideoPaths struct {
@@ -158,116 +176,66 @@ func ZizvideoBin() string {
 	return filepath.Join(root, "bin", "zizvideo")
 }
 
-// zizvideoBundledBinary 解析"随面板包分发的 zizvideo 二进制"的真实路径。
+// zizvideoSourceBinary 返回"这一版要装进去的 zizvideo 二进制"的本地路径。
 //
-// 两条来源，按优先级：
+//	① 面板二进制旁边（<bin>/zizvideo）：本地开发（make dev）与旧发布包；
+//	② 否则从应用包镜像按需下载（本模块自 2026-09-22 起**不随面板包分发**）。
 //
-//	① 面板二进制旁边（<bin>/zizvideo）—— install.sh 与**新版**在线升级都会放到这里；
-//	② 面板**升级下载缓存**里最新的已验签发布包 —— 早于本功能的在线升级只换了
-//	   面板与助手，模块二进制仍留在那个发布包（<WorkDir>/upgrade/download/*.tar.gz）里。
-//
-// 两条都没有就如实失败：**绝不去归档仓库取，也不编一个下载地址**。
-// 本模块由面板托管、不再单独分发。
-func (m *Manager) zizvideoBundledBinary(panelBin string) (string, error) {
-	primary := strings.TrimSpace(zizvideoSourceBin(panelBin))
-	if primary != "" && fileExecutable(primary) {
-		return primary, nil
+// 两条都没有就如实失败 —— 绝不去别处找、也不编下载地址。
+func (m *Manager) zizvideoSourceBinary(ctx context.Context, panelBin string, result *InstallResult) (string, error) {
+	if f := strings.TrimSpace(zizvideoSourceBin(panelBin)); f != "" && fileExecutable(f) {
+		// 升级上来的机器会残留旧发布包放下的携带位：版本对不上就改走镜像站
+		// 按需下载（否则会一直装旧构建，坑 216 的翻版）。
+		if out, err := zizvideoVersionFn(m, ctx, f); err == nil && strings.Contains(out, ZizvideoVersion) {
+			return f, nil
+		} else if result != nil {
+			result.step(ctx, "本地的 "+f+" 不是 zizvideo "+ZizvideoVersion+"，改用镜像站按需下载")
+		}
 	}
-	tarPath, terr := m.newestUpgradeTarball()
-	if terr != nil {
-		return "", fmt.Errorf("找不到随面板分发的 zizvideo 二进制（%s 不存在；升级下载缓存里也没有可用的发布包：%v）。"+
-			"本模块由面板托管、不再单独分发，请用带 zizvideo 的完整发布包安装", primary, terr)
-	}
-	dst := filepath.Join(strings.TrimSpace(m.opt.WorkDir), "zizvideo-bundled", "zizvideo")
-	if err := extractTarMember(tarPath, "zizvideo", dst); err != nil {
-		return "", fmt.Errorf("从发布包 %s 里取出 zizvideo 失败：%w。"+
-			"本模块由面板托管、不再单独分发，请用带 zizvideo 的完整发布包安装",
-			filepath.Base(tarPath), err)
-	}
-	return dst, nil
+	return m.downloadZizvideoBinary(ctx, result)
 }
 
-// newestUpgradeTarball 返回升级下载缓存里最新的发布包（按修改时间）。
-func (m *Manager) newestUpgradeTarball() (string, error) {
-	dir := filepath.Join(strings.TrimSpace(m.opt.WorkDir), "upgrade", "download")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+// downloadZizvideoBinary 从镜像站取这一版的 zizvideo：先核 sha256，再交给调用方复核架构与版本。
+//
+// sha256 优先用镜像站同目录 manifest.json 的值（发布流程生成）；镜像没有清单时用面板
+// 内置常量兜底。两者都拿不到就**拒绝安装**一个无法校验的二进制（AGENTS 第七节）。
+func (m *Manager) downloadZizvideoBinary(ctx context.Context, result *InstallResult) (string, error) {
+	asset := ZizvideoArtifactName(ZizvideoVersion)
+	if !m.MirrorEnabled() {
+		return "", fmt.Errorf("zizvideo %s 不再随面板包分发，需要从应用包镜像下载，"+
+			"但面板没有配置镜像基址（设置 → 应用包镜像）；"+
+			"也可以把二进制放到面板二进制旁边（<面板二进制目录>/zizvideo）再装", ZizvideoVersion)
+	}
+	url := m.appAssetURL(ZizvideoAppID, ZizvideoVersion, asset)
+	if err := m.MirrorOfflinePreflight(ctx, "zizvideo "+ZizvideoVersion, url); err != nil {
 		return "", err
 	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.gz") {
-			continue
+	want := zizvideoExpectedSHA256()
+	if mm, err := m.fetchMirrorManifest(ctx, ZizvideoAppID, ZizvideoVersion); err == nil {
+		if sum := mm.sha256For(asset); sum != "" {
+			want = sum
 		}
-		names = append(names, e.Name())
+	} else if result != nil {
+		result.step(ctx, "提示：镜像上没有 "+asset+" 的 manifest.json，改用面板内置的 sha256 校验（"+err.Error()+"）")
 	}
-	if len(names) == 0 {
-		return "", fmt.Errorf("%s 里没有 .tar.gz", dir)
+	dst := filepath.Join(strings.TrimSpace(m.opt.WorkDir), "zizvideo-download", asset)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", fmt.Errorf("创建下载目录 %s 失败：%w", filepath.Dir(dst), err)
 	}
-	sort.Slice(names, func(i, j int) bool {
-		fi, ei := os.Stat(filepath.Join(dir, names[i]))
-		fj, ej := os.Stat(filepath.Join(dir, names[j]))
-		if ei != nil || ej != nil {
-			return names[i] < names[j]
-		}
-		return fi.ModTime().After(fj.ModTime())
-	})
-	return filepath.Join(dir, names[0]), nil
-}
-
-// extractTarMember 从 tar.gz 里安全地取出**一个**普通文件到 dst。
-//
-// 安全判定沿用 internal/upgrade 的规矩：只认精确文件名、拒绝路径穿越与链接、
-// 限制尺寸；输出目录建好 0755（降权后的真实用户要能执行它 —— 坑 199）。
-func extractTarMember(tarPath, member, dst string) error {
-	f, err := os.Open(tarPath)
-	if err != nil {
-		return err
+	if err := zizvideoFetch(m, ctx, url, dst, result); err != nil {
+		return "", err
 	}
-	defer func() { _ = f.Close() }()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
+	if want == "" {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("镜像上没有 %s 的 sha256（manifest.json 缺这一项），面板内置常量也为空："+
+			"拒绝安装一个无法校验的二进制", asset)
 	}
-	defer func() { _ = gz.Close() }()
-
-	const maxMember = 256 << 20
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		name := strings.TrimPrefix(filepath.ToSlash(hdr.Name), "./")
-		if name != member {
-			continue
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			return fmt.Errorf("归档里的 %s 不是普通文件（拒绝链接/目录）", member)
-		}
-		if hdr.Size > maxMember {
-			return fmt.Errorf("归档里的 %s 尺寸 %d 超过上限", member, hdr.Size)
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		w, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(w, io.LimitReader(tr, maxMember+1)); err != nil {
-			_ = w.Close()
-			return err
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-		return os.Chmod(dst, 0o755)
+	if got := sha256OfFile(dst); got != want {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("%s 的 sha256 不匹配：期望 %s，实际 %s（文件已删除；"+
+			"镜像上的包与面板内置值不一致，请重新同步 apps/zizvideo）", asset, want, got)
 	}
-	return fmt.Errorf("归档里没有 %s", member)
+	return dst, nil
 }
 
 // ZizvideoServeArgs 返回 zizvideo 的启动参数（**不含可执行文件本身**）。
@@ -410,7 +378,7 @@ func (m *Manager) InstallZizvideo(ctx context.Context, app App, result *InstallR
 	if err != nil || strings.TrimSpace(panelBin) == "" {
 		return fmt.Errorf("找不到面板自身的可执行文件路径（系统守护进程要用它执行 zizvideo-supervise）: %v", err)
 	}
-	source, err := m.zizvideoBundledBinary(panelBin)
+	source, err := m.zizvideoSourceBinary(ctx, panelBin, result)
 	if err != nil {
 		return err
 	}

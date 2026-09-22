@@ -9,6 +9,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,13 +94,16 @@ func TestModuleRefreshReplacesInstalledBinaryAndRestarts(t *testing.T) {
 	var checked []string
 	moduleSelfCheckRun = func(_ *Manager, _ context.Context, bin string, args ...string) (string, error) {
 		checked = append(checked, bin+" "+strings.Join(args, " "))
-		return "zizvideo 0.2.0", nil
+		if strings.Contains(readFileOrFail(t, bin), "zizvideo new") {
+			return "zizvideo " + ZizvideoVersion, nil
+		}
+		return "zizvideo 0.0.0-old", nil // 已装的是旧版本 ⇒ 该刷新
 	}
 
 	results := RefreshInstalledModules(context.Background(), env.panelDir)
 	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
 	if r.Status != ModuleRefreshed {
-		t.Fatalf("sha 不同时应刷新，实际 %s（%s）", r.Status, r.Reason)
+		t.Fatalf("版本不同时应刷新，实际 %s（%s）", r.Status, r.Reason)
 	}
 	if r.FromSHA != oldSHA || r.ToSHA != newSHA {
 		t.Errorf("结果里的 sha 不对：from=%s to=%s", r.FromSHA, r.ToSHA)
@@ -110,16 +114,16 @@ func TestModuleRefreshReplacesInstalledBinaryAndRestarts(t *testing.T) {
 	if got := readFileOrFail(t, installed+".bak"); !strings.Contains(got, "zizvideo old") {
 		t.Errorf("旧二进制没有备份：%q", got)
 	}
-	if len(checked) != 1 || !strings.HasPrefix(checked[0], installed+" --version") {
-		t.Errorf("应在安装位跑一次 --version 自检，实际 %v", checked)
+	if len(checked) < 2 || !strings.HasPrefix(checked[len(checked)-1], installed+" --version") {
+		t.Errorf("应在安装位跑 --version 自检（刷新前后各一次），实际 %v", checked)
 	}
 	if len(launched) != 1 || !strings.HasPrefix(launched[0], ZizvideoLabel) {
 		t.Errorf("通过自检后应重启守护进程 %s，实际 %v", ZizvideoLabel, launched)
 	}
 }
 
-// 门禁 ②：sha256 相同 ⇒ 零动作（尤其**不许重启**，否则每次升级都抖动一次服务）。
-func TestModuleRefreshIsNoOpWhenBundledMatchesInstalled(t *testing.T) {
+// 门禁 ②：已装的就是这一版期望的版本 ⇒ 零动作（尤其**不许重启**，否则每次升级都抖动一次服务）。
+func TestModuleRefreshIsNoOpWhenInstalledVersionMatches(t *testing.T) {
 	env := newModuleRefreshEnv(t)
 	installed := ZizvideoBin()
 	plist := SystemDaemonPlistPath(ZizvideoLabel)
@@ -136,8 +140,7 @@ func TestModuleRefreshIsNoOpWhenBundledMatchesInstalled(t *testing.T) {
 		return nil
 	}
 	moduleSelfCheckRun = func(*Manager, context.Context, string, ...string) (string, error) {
-		t.Error("sha 相同时不该跑自检")
-		return "", nil
+		return "zizvideo " + ZizvideoVersion, nil
 	}
 
 	results := RefreshInstalledModules(context.Background(), env.panelDir)
@@ -261,8 +264,11 @@ func TestModuleRefreshNeverTouchesModuleDataDir(t *testing.T) {
 	writeModuleFile(t, p.Plist, "<plist/>", 0o644)
 	writeModuleFile(t, filepath.Join(env.panelDir, ZizvideoAppID), "#!/bin/bash\necho new\n", 0o755)
 	zizvideoLaunch = func(*Manager, context.Context, string, string) error { return nil }
-	moduleSelfCheckRun = func(*Manager, context.Context, string, ...string) (string, error) {
-		return "zizvideo 0.2.0", nil
+	moduleSelfCheckRun = func(_ *Manager, _ context.Context, bin string, _ ...string) (string, error) {
+		if strings.Contains(readFileOrFail(t, bin), "new") {
+			return "zizvideo " + ZizvideoVersion, nil
+		}
+		return "zizvideo 0.0.0-old", nil
 	}
 
 	before := fingerprintTree(t, p.DataDir)
@@ -276,8 +282,8 @@ func TestModuleRefreshNeverTouchesModuleDataDir(t *testing.T) {
 	}
 }
 
-// 发布包没携带某个模块 ⇒ 跳过并说明，不报"刷新失败"也不去别处找。
-func TestModuleRefreshSkipsWhenBundledMissing(t *testing.T) {
+// 不随包分发的模块：按需取件失败要**如实失败**，且一个字节都不许改动安装位。
+func TestModuleRefreshFailsHonestlyWhenFetchFails(t *testing.T) {
 	env := newModuleRefreshEnv(t)
 	installed := ZizvideoBin()
 	writeModuleFile(t, installed, "#!/bin/bash\necho 'zizvideo old'\n", 0o755)
@@ -288,19 +294,103 @@ func TestModuleRefreshSkipsWhenBundledMissing(t *testing.T) {
 		launched = true
 		return nil
 	}
+	moduleSelfCheckRun = func(*Manager, context.Context, string, ...string) (string, error) {
+		return "zizvideo 0.0.0-old", nil // 已装的是旧版本 ⇒ 触发取件
+	}
+	zizvideoModuleFetch = func(*Manager, context.Context, *InstallResult) (string, error) {
+		return "", fmt.Errorf("镜像站访问不了")
+	}
+	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
+
 	results := RefreshInstalledModules(context.Background(), env.panelDir)
 	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
-	if r.Status != ModuleSkipped {
-		t.Fatalf("携带位缺失应跳过，实际 %s（%s）", r.Status, r.Reason)
+	if r.Status != ModuleFailed {
+		t.Fatalf("取件失败应如实失败，实际 %s（%s）", r.Status, r.Reason)
 	}
-	if !strings.Contains(r.Reason, "未携带") {
-		t.Errorf("跳过原因应说明发布包未携带，实际 %q", r.Reason)
+	if !strings.Contains(r.Reason, "取件失败") || !strings.Contains(r.Reason, "镜像站访问不了") {
+		t.Errorf("失败原因要带上真正的原因，实际 %q", r.Reason)
 	}
 	if launched {
-		t.Error("携带位缺失时不该重启")
+		t.Error("取件失败时不该重启守护进程")
 	}
 	if got := readFileOrFail(t, installed); !strings.Contains(got, "old") {
-		t.Errorf("跳过后安装位不该被改动：%q", got)
+		t.Errorf("取件失败后安装位不该被改动：%q", got)
+	}
+}
+
+// 不随包分发的模块：已装版本不是这一版期望的 ⇒ 从镜像取件、替换、自检、重启。
+func TestModuleRefreshFetchesWhenNotBundled(t *testing.T) {
+	env := newModuleRefreshEnv(t)
+	installed := ZizvideoBin()
+	writeModuleFile(t, installed, "#!/bin/bash\necho 'zizvideo old'\n", 0o755)
+	writeModuleFile(t, SystemDaemonPlistPath(ZizvideoLabel), "<plist/>", 0o644)
+
+	fetched := filepath.Join(t.TempDir(), "zizvideo")
+	writeModuleFile(t, fetched, "#!/bin/bash\necho 'zizvideo new'\n", 0o755)
+
+	var launched []string
+	zizvideoLaunch = func(_ *Manager, _ context.Context, label, plist string) error {
+		launched = append(launched, label)
+		return nil
+	}
+	moduleSelfCheckRun = func(_ *Manager, _ context.Context, bin string, _ ...string) (string, error) {
+		if strings.Contains(readFileOrFail(t, bin), "zizvideo new") {
+			return "zizvideo " + ZizvideoVersion, nil
+		}
+		return "zizvideo 0.0.0-old", nil
+	}
+	zizvideoModuleFetch = func(*Manager, context.Context, *InstallResult) (string, error) {
+		return fetched, nil
+	}
+	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
+
+	results := RefreshInstalledModules(context.Background(), env.panelDir)
+	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
+	if r.Status != ModuleRefreshed {
+		t.Fatalf("应取件并刷新，实际 %s（%s）", r.Status, r.Reason)
+	}
+	if got := readFileOrFail(t, installed); !strings.Contains(got, "zizvideo new") {
+		t.Errorf("安装位没有被替换成取到的二进制：%q", got)
+	}
+	if len(launched) != 1 || launched[0] != ZizvideoLabel {
+		t.Errorf("应重启 %s，实际 %v", ZizvideoLabel, launched)
+	}
+}
+
+// 已装的就是这一版期望的版本 ⇒ 不取件、零动作。
+func TestModuleRefreshSkipsFetchWhenVersionMatches(t *testing.T) {
+	env := newModuleRefreshEnv(t)
+	writeModuleFile(t, ZizvideoBin(), "#!/bin/bash\necho 'zizvideo old'\n", 0o755)
+	writeModuleFile(t, SystemDaemonPlistPath(ZizvideoLabel), "<plist/>", 0o644)
+	moduleSelfCheckRun = func(*Manager, context.Context, string, ...string) (string, error) {
+		return "zizvideo " + ZizvideoVersion, nil
+	}
+	fetched := false
+	zizvideoModuleFetch = func(*Manager, context.Context, *InstallResult) (string, error) {
+		fetched = true
+		return "", fmt.Errorf("不该被调用")
+	}
+	t.Cleanup(func() { zizvideoModuleFetch = defaultZizvideoModuleFetch })
+
+	results := RefreshInstalledModules(context.Background(), env.panelDir)
+	r := moduleRefreshResultFor(t, results, ZizvideoAppID)
+	if r.Status != ModuleUpToDate {
+		t.Fatalf("版本相同应零动作，实际 %s（%s）", r.Status, r.Reason)
+	}
+	if fetched {
+		t.Error("版本相同却仍去取件了")
+	}
+}
+
+// 不随包分发 + 没装（安装位或守护进程缺）⇒ 绝不顺手安装、也不去取件。
+func TestModuleRefreshSkipsWhenNotBundledAndNotInstalled(t *testing.T) {
+	env := newModuleRefreshEnv(t)
+	if r := moduleRefreshResultFor(t, RefreshInstalledModules(context.Background(), env.panelDir), ZizvideoAppID); r.Status != ModuleSkipped {
+		t.Fatalf("未安装应跳过，实际 %s（%s）", r.Status, r.Reason)
+	}
+	writeModuleFile(t, ZizvideoBin(), "#!/bin/bash\necho old\n", 0o755)
+	if r := moduleRefreshResultFor(t, RefreshInstalledModules(context.Background(), env.panelDir), ZizvideoAppID); r.Status != ModuleSkipped {
+		t.Fatalf("只有二进制没有守护进程也应跳过，实际 %s（%s）", r.Status, r.Reason)
 	}
 }
 

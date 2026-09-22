@@ -57,48 +57,21 @@ make test-short   # 只跑 Go 单测
 
 ## 四、测试策略与门禁
 
-`make check` 的每一步（缺工具时**明确打印跳过**，不假装通过）：
-
-| # | 步骤 | 拦什么 |
-|---|---|---|
-| 1 | `gofmt -l .` | 未格式化 |
-| 2 | `bash -n` 全部脚本 | shell 语法 |
-| 3 | `tools/check-shell-vars.py` | `$VAR` 后紧跟中文标点 → 多字节并入变量名，`set -u` 直接退出 |
-| 4 | `shellcheck -S warning` | shell 常见错误（未装则跳过） |
-| 5 | `tools/check-no-real-credentials.sh` | 真实面板口令进仓库（见下） |
-| 6 | `python3 -m py_compile tools/make-manifest.py` | Python 工具语法 |
-| 7 | `tools/check-js-syntax.mjs`（acorn） | 前端语法（见下） |
-| 8 | `go vet ./...` | 静态检查 |
-| 9 | `make test` → `tools/check-test-pollution.sh` | 真实家目录被测试污染（见下） |
-| 10 | `make jobs-test` | receiver `/jobs`（假上游，不碰真实服务） |
-| 11 | `make install-test` / `remote-test` / `server-mode-test` | 安装脚本沙箱、远程一键安装、服务器模式 |
-
-三道专项门禁：
-
-- **`tools/check-test-pollution.sh`（真实家目录指纹）**：给 `~/Library/LaunchAgents`、`~/www`、
-  安装产物根拍**内容**指纹 → `go test ./... -count=1` → 再拍一次比对，`go test` 退出码原样保留。
-  来历：2026-09-14 `newTestServer` 漏隔离 `UserHome`，`make check` 把真实
-  `~/Library/LaunchAgents/sh.brew.*.plist` 覆盖成空 plist —— 服务在跑所以**零症状**，
-  但只要重启或点一次"重启服务"就永久起不来。另有护栏测试 `TestTestServerSandboxedAwayFromRealHome`。
-- **`tools/check-js-syntax.mjs`（acorn）**：`node --check` 会放过浏览器拒绝的语法，表现是整页白屏且
-  **不给文件名、不给行号**；acorn 精确到行列。未装 acorn 时跳过并打印提示。
-- **`tools/check-no-real-credentials.sh`（新增）**：拿 `.panel-credential.local` 里每个长度 ≥6 的值，
-  去搜**将要提交的文件**（`git ls-files --cached --others --exclude-standard` = tracked + untracked 非忽略），
-  命中即失败，只回显掩码。**只扫 `git ls-files` 会漏掉新增文件**。没有凭据文件时明确打印跳过。
-
-其他硬纪律：
-
-- **单测不许碰真实服务、生产配置、用户真实家目录**：本机 8880 是 TtsVoice 的 Qwen（用
-  `qwenPortOverride` 隔离）；nginx vhost 测试必须沙箱化并断言生产 `000-default.conf` 一字未变。
-- **退出码不能过管道**：`go build ... | head`、`make check | tail` 都会掩盖失败。
-  固定写法 `make check > /tmp/check.log 2>&1; echo "EXIT=$?"; tail -40 /tmp/check.log`。
-- **前端"哪个按钮出现"必须用真模块端到端验**：`node tools/appdetail-verify.mjs`
-  （Playwright + 假 fetch，加载真实 `apps.js`/`services.js`/`servicePanel.js`，对比两处按钮清单）。
-  它当场抓到过静态检查抓不到的 bug（市场条目 `name` 是展示名）——**语法检查永远是绿的**。
-- **手工调面板 API**：基址必须带面板后缀；写接口带 `X-CSRF-Token`（值取可读的 `zp_csrf` cookie），
-  否则 403「CSRF 校验失败」；`GET /api/v1/services` 的键是 `list`。
-
----
+- **`make check`（日常，约 1 分钟）**：版本号一致性 → `gofmt` → `bash -n` 全部脚本 →
+  `check-shell-vars` → `shellcheck` → `check-no-real-credentials` → `check-future-dates` →
+  Python 语法 → acorn 两项（语法 + 未声明赋值）→ `go vet` → `go test ./...`（含真实家目录指纹门禁）→
+  zizvideo 独立 module 自测 → 卸载脚本三档沙箱 → 服务器模式（SSH/电源）→ 写 check 指纹。
+- **`make check-full`（发版前）**：在 `check` 之上加真起进程的重活 —— receiver `/jobs`、
+  安装脚本端到端、远程一键安装、发布说明门禁。这些一次几分钟，日常提交不跑。
+- 退出码**不许过管道**：`go build ... | head`、`make check | tail` 都会掩盖失败。
+  固定写法：`make check > /tmp/check.log 2>&1; echo "EXIT=$?"`。
+- 为什么留这几道（历史事故）：`check-js-syntax.mjs`（acorn）—— `node --check` 放过浏览器拒绝的语法 =
+  整页白屏且不给行号；`check-test-pollution.sh` —— 2026-09-14 测试把真实
+  `~/Library/LaunchAgents/*.plist` 覆盖成空文件，服务在跑所以零症状、重启后永久起不来；
+  `check-no-real-credentials.sh` —— 真实口令进仓库复发过两次。
+  **这几条删了会出事的清单在 `AGENTS.md` 第三节**，其余纪律细节见 `docs/坑清单.md`。
+- 按钮接线这类"前端哪个按钮出现"要靠真模块端到端验（`tools/appdetail-verify.mjs`，手动跑）；
+  语法检查永远是绿的，抓不到它。
 
 ## 五、发布与升级（现状：只在本机，不发 GitHub）
 

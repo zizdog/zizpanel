@@ -1373,7 +1373,7 @@ var marketDownloadApps = []MarketApp{
 			"必须由安装器生成 rpc-username/rpc-password 并回读 settings.json 核对生效。",
 	},
 
-	// ---------------- zizvideo（本项目自研模块，随面板包分发） ----------------
+	// ---------------- zizvideo（本项目自研模块，镜像站按需下载） ----------------
 
 	{
 		ID: "zizvideo", Kind: KindNative, PanelInstaller: "zizvideo", ServiceLabel: ZizvideoLabel,
@@ -1381,12 +1381,36 @@ var marketDownloadApps = []MarketApp{
 			Mode: MarketRuntimeLaunchd, Label: ZizvideoLabel,
 			LabelSource: "目录 ServiceLabel（系统级 LaunchDaemon；可执行文件是面板自身的 zizvideo-supervise）",
 		},
-		// 真的零下载：二进制由 make release 打进面板发布包顶层，安装器只做本机复制
-		// （<面板二进制目录>/zizvideo → /opt/zizvideo/bin/zizvideo）+ launchd 注册。
-		// 不编一个假的镜像 URL 去骗过门禁 —— 如实声明"随包分发"。
-		NoDownloadReason: "二进制随面板发布包一起分发（make release 打进 tar 顶层的 ./zizvideo，安装器从" +
-			"<面板二进制目录>/zizvideo 取），安装时只做本机复制与 launchd 注册，**不需要任何网络下载**；" +
-			"镜像站上也没有它的独立包可指。",
+		// 二进制**不随面板包分发**（2026-09-22 用户决定，面板包因此小 ~17 MB）：
+		// 安装时从镜像站按需下载裸二进制（不打包 —— 归档 MTIME 会让 sha256 漂移）。
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 " + ZizvideoArtifactName(ZizvideoVersion),
+				Upstream: MarketUpstream{
+					ID:  "自建镜像 apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion),
+					URL: "https://mirror.zizdog.com:8888/apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion),
+					// Tag/Asset 必须与 ReleaseBinaryAssets() 注册表逐字一致（门禁比对）；
+					// **不填 Repo**：它不是 GitHub release 产物（自研产物）。
+					Tag:   ZizvideoVersion,
+					Asset: ZizvideoArtifactName(ZizvideoVersion),
+					Note: "本仓库自己编的 darwin/arm64 裸二进制（make release 产出）；" +
+						"**镜像站是唯一来源**，没有 GitHub/公网回落 —— 镜像不可达时这一步如实失败",
+				},
+				NAS:      nasMirrored("apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion)),
+				Timeout:  5 * time.Minute,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset:  "镜像站 manifest.json",
+					SHA256: ZizvideoBinarySHA256,
+					Source: "make release 实测 sha256（运行期优先取镜像站 manifest.json 的值）",
+					Note:   "下载后**安装之前**核对 sha256；随后还有 file(1) 的 arm64 复核与 `zizvideo --version` 的版本复核",
+				},
+				ARM64: "产物由本仓库 CGO_ENABLED=0 GOARCH=arm64 编译；安装时用 file(1) 复核 Mach-O arm64，" +
+					"并用 `zizvideo --version` 复核版本",
+				Note: "镜像不可达时如实失败并提示同步镜像（make sync-apps）；它没有公网回落地址",
+			},
+		},
 		Note: "服务体是 `zizpanel zizvideo-supervise`（面板自己的二进制），与面板同一代码要求 ⇒ " +
 			"与面板共用文件权限；supervisor 以 root fork 后 setuid 到真实用户跑 zizvideo，" +
 			"配置/数据沿用 ~/Library/Application Support/zizvideo（安装器不覆盖已有 config.json）。",

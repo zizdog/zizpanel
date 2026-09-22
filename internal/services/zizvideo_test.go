@@ -8,9 +8,9 @@ package services
 // DataPaths**）并复核终态。
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -350,10 +350,10 @@ func TestInstallZizvideoRefusesWithoutSourceBinary(t *testing.T) {
 	}
 	err := env.m.InstallZizvideo(context.Background(), App{ID: ZizvideoAppID}, &InstallResult{})
 	if err == nil {
-		t.Fatal("没有随面板分发的二进制时必须如实失败")
+		t.Fatal("既没有本地二进制、又没有镜像时必须如实失败")
 	}
-	if !strings.Contains(err.Error(), "不再单独分发") {
-		t.Errorf("错误要说清模块由面板托管、不再单独分发，实际：%v", err)
+	if !strings.Contains(err.Error(), "不再随面板包分发") || !strings.Contains(err.Error(), "镜像基址") {
+		t.Errorf("错误要说清「不再随包、需要镜像」，实际：%v", err)
 	}
 }
 
@@ -527,66 +527,91 @@ func TestZizvideoMarketEntryIsWired(t *testing.T) {
 	if problems := MarketDeclarationProblems(*decl, app); len(problems) != 0 {
 		t.Errorf("市场声明与目录/不变量不一致：%v", problems)
 	}
-	if len(decl.Downloads) != 0 || strings.TrimSpace(decl.NoDownloadReason) == "" {
-		t.Errorf("zizvideo 随面板包分发、零网络下载：必须零下载点 + 写清 NoDownloadReason，"+
-			"实际 downloads=%d reason=%q", len(decl.Downloads), decl.NoDownloadReason)
+	if len(decl.Downloads) != 1 {
+		t.Fatalf("zizvideo 不随面板包分发：必须声明恰好一个镜像下载点，实际 %d 个", len(decl.Downloads))
+	}
+	d := decl.Downloads[0]
+	if d.Purpose != MarketFetchReleaseBinary || !d.Required {
+		t.Errorf("下载点应是必需（Required）的原生产物：purpose=%s required=%v", d.Purpose, d.Required)
+	}
+	wantAsset := ZizvideoArtifactName(ZizvideoVersion)
+	if d.Upstream.Asset != wantAsset || !strings.Contains(d.Upstream.URL, "/apps/zizvideo/") {
+		t.Errorf("下载点应指向镜像站 %s，实际 asset=%q url=%q", wantAsset, d.Upstream.Asset, d.Upstream.URL)
+	}
+	if d.Upstream.Repo != "" {
+		t.Error("自研产物不是 GitHub release 产物，不该写 Repo")
+	}
+	if strings.TrimSpace(decl.NoDownloadReason) != "" {
+		t.Errorf("有下载点就不该再写 NoDownloadReason：%q", decl.NoDownloadReason)
 	}
 }
 
-// writeReleaseTarball 造一个最小发布包（只含给定成员）。
-func writeReleaseTarball(t *testing.T, path string, files map[string]string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gz := gzip.NewWriter(f)
-	tw := tar.NewWriter(gz)
-	for name, body := range files {
-		hdr := &tar.Header{Name: "./" + name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}
-		if err := tw.WriteHeader(hdr); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tw.Write([]byte(body)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestInstallZizvideoFallsBackToUpgradeDownloadCache：早于本功能的在线升级只换了面板与
-// 助手，模块二进制仍在那个**已验签的发布包**里（升级下载缓存）—— 安装器必须能取到它，
-// 而不是报"找不到随面板分发的二进制"。
-func TestInstallZizvideoFallsBackToUpgradeDownloadCache(t *testing.T) {
+// 不随包分发：本地没有携带位时，从镜像站按需下载、核 sha256 通过才安装。
+func TestInstallZizvideoDownloadsFromMirrorWhenNotBundled(t *testing.T) {
 	env := newZizvideoTestEnv(t)
 	env.stubHealth("ok", 200, nil)
 	if err := os.Remove(env.source); err != nil {
 		t.Fatal(err)
 	}
-	writeReleaseTarball(t,
-		filepath.Join(env.m.opt.WorkDir, "upgrade", "download", "zizpanel_9.9.9_darwin_arm64.tar.gz"),
-		map[string]string{
-			"zizpanel": "panel",
-			"zizvideo": "#!/bin/sh\necho ok\n",
-		})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r) // 没有 manifest.json ⇒ 用面板内置值兜底
+	}))
+	defer srv.Close()
+	env.m.opt.MirrorBase = srv.URL
 
-	app := App{ID: ZizvideoAppID, Name: "zizvideo"}
-	if err := env.m.InstallZizvideo(context.Background(), app, &InstallResult{}); err != nil {
-		t.Fatalf("应从升级下载缓存里取到模块二进制并装好，实际：%v", err)
+	payload := []byte("#!/bin/sh\necho ok\n")
+	stub := filepath.Join(t.TempDir(), "zizvideo-dl")
+	if err := os.WriteFile(stub, payload, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wantURL := srv.URL + "/apps/zizvideo/" + ZizvideoVersion + "/" + ZizvideoArtifactName(ZizvideoVersion)
+	zizvideoFetch = func(_ *Manager, _ context.Context, url, dst string, _ *InstallResult) error {
+		if url != wantURL {
+			t.Errorf("下载地址不对：%q（期望 %q）", url, wantURL)
+		}
+		return os.WriteFile(dst, payload, 0o755)
+	}
+	zizvideoExpectedSHA256 = func() string { return sha256OfFile(stub) }
+	t.Cleanup(func() {
+		zizvideoFetch = defaultZizvideoFetch
+		zizvideoExpectedSHA256 = defaultZizvideoExpectedSHA256
+	})
+
+	if err := env.m.InstallZizvideo(context.Background(), App{ID: ZizvideoAppID, Name: "zizvideo"}, &InstallResult{}); err != nil {
+		t.Fatalf("应从镜像站取到二进制并装好，实际：%v", err)
 	}
 	if _, err := os.Stat(ZizvideoBin()); err != nil {
 		t.Errorf("安装后应落盘 %s：%v", ZizvideoBin(), err)
+	}
+}
+
+// 镜像上的包 sha256 与期望不符 ⇒ 拒绝安装，且不落安装位（不许把坏包装上去）。
+func TestInstallZizvideoRejectsMirrorSHA256Mismatch(t *testing.T) {
+	env := newZizvideoTestEnv(t)
+	env.stubHealth("ok", 200, nil)
+	if err := os.Remove(env.source); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	env.m.opt.MirrorBase = srv.URL
+	zizvideoFetch = func(_ *Manager, _ context.Context, _ string, dst string, _ *InstallResult) error {
+		return os.WriteFile(dst, []byte("#!/bin/sh\necho tampered\n"), 0o755)
+	}
+	zizvideoExpectedSHA256 = func() string { return strings.Repeat("a", 64) }
+	t.Cleanup(func() {
+		zizvideoFetch = defaultZizvideoFetch
+		zizvideoExpectedSHA256 = defaultZizvideoExpectedSHA256
+	})
+
+	err := env.m.InstallZizvideo(context.Background(), App{ID: ZizvideoAppID}, &InstallResult{})
+	if err == nil || !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("sha256 对不上必须拒绝安装，实际：%v", err)
+	}
+	if fileExecutable(ZizvideoBin()) {
+		t.Error("坏包不该落到安装位")
 	}
 }
 

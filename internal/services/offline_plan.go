@@ -288,7 +288,9 @@ func OfflinePlan() []OfflineAppPlan {
 
 		default: // KindNative
 			switch {
-			case app.PanelInstaller != "" && binByID[app.PanelInstaller].ID != "":
+			// MirrorOnly 的自研产物（zizvideo）不在这条轨：它没有公网地址，
+			// 产物由 make release 单独产出、sync-apps 同步到镜像站（见下面的缺口说明）。
+			case app.PanelInstaller != "" && binByID[app.PanelInstaller].ID != "" && !binByID[app.PanelInstaller].MirrorOnly:
 				// 面板自研的 release 二进制安装器（frpc / orbien-client / ddns-go）
 				spec := binByID[app.PanelInstaller]
 				p.InstallMethod = "binary_release"
@@ -306,6 +308,12 @@ func OfflinePlan() []OfflineAppPlan {
 					p.BrewFormula = app.BrewFormula
 				} else {
 					p.InstallMethod = "panel_installer"
+				}
+				if app.ID == ZizvideoAppID {
+					// 它是自研产物、只在镜像站上：离线包不重复打包，但必须如实点名。
+					p.Gaps = append(p.Gaps, "zizvideo 的模块二进制由 make release 单独产出、"+
+						"make sync-apps 同步到 apps/zizvideo/"+ZizvideoVersion+"/（面板安装时按需下载）；"+
+						"离线模式下请确认镜像上已有这个文件，否则 zizvideo 装不上（这是缺口，不是'不需要'）")
 				}
 				if extra, ok := offlinePythonExtra[app.ID]; ok {
 					p.Artifacts = append(p.Artifacts, extra...)

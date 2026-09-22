@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/zizdog/zizpanel/internal/services"
 )
@@ -40,7 +41,21 @@ func main() {
 	switch cmd {
 	case "apps":
 		// 默认输出保持不变：sync-nas-apps.sh 按 {"apps":[...]} 解析。
-		payload = map[string]any{"apps": services.ReleaseBinaryAssets()}
+		// MirrorOnly（自研产物，如 zizvideo）没有 GitHub 上游：upstream_url 改指
+		// make release 的本地产物，同步脚本据此走"本地文件"直传而非编一个假地址。
+		apps := services.ReleaseBinaryAssets()
+		root := repoRoot()
+		for i := range apps {
+			if !services.ReleaseBinaryIsMirrorOnly(apps[i].ID) {
+				continue
+			}
+			if root == "" {
+				fmt.Fprintln(os.Stderr, "找不到仓库根（go.mod）：自研产物的本地产物路径无法确定")
+				os.Exit(1)
+			}
+			apps[i].UpstreamURL = "local:" + filepath.Join(root, "dist", "release", apps[i].Asset)
+		}
+		payload = map[string]any{"apps": apps}
 	case "plan":
 		payload = map[string]any{
 			"schema": services.OfflineSchemaVersion,
@@ -78,5 +93,24 @@ func main() {
 
 	if err := enc.Encode(payload); err != nil {
 		os.Exit(1)
+	}
+}
+
+// repoRoot 从工作目录向上找 go.mod：输出 local: 路径必须是绝对路径，
+// 相对路径会被同步脚本当成"用户目录下的文件"而报不存在。
+func repoRoot() string {
+	d, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+		d = parent
 	}
 }
