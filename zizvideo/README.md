@@ -1,6 +1,6 @@
 # Zizvideo
 
-> 本模块由面板托管运行、与面板共用文件权限；不再单独分发。
+> 既可面板托管（与面板共用文件权限），也可独立部署；两种方式互斥，见「独立部署」。
 
 本地短视频服务：把自己的视频目录扫进 SQLite，用浏览器上下滑着看。
 Go 单二进制 + 内嵌原生 ESM 前端（无构建步骤）+ SQLite（纯 Go 驱动，无 CGO）。
@@ -23,6 +23,29 @@ cp config.example.json config.json   # 按需改 media_allow_roots / 端口
 
 `make fixtures` 会用 ffmpeg 生成几个几秒的测试视频，默认写进 `fixtures/`；
 也可以 `./scripts/gen-fixtures.sh /某个目录`。
+
+## 独立部署
+
+不装面板也能跑，命令行一条：
+
+```bash
+curl -fsSL https://mirror.zizdog.com:8888/apps/zizvideo/install-zizvideo.sh | bash
+```
+
+- 默认 **system 模式**：装系统级 LaunchDaemon，开机即起、**不需要任何人登录**。
+- 写 `/Library/LaunchDaemons` 并 bootstrap 系统域，这一步**会提示 sudo**。
+- 无头 Mac 必须用默认模式；`--user` 模式只在有人登录后运行。
+- 装到 `~/.local/bin/zizvideo`，日志在 `~/Library/Logs/zizvideo.out.log|err.log`。
+- 数据目录 `~/Library/Application Support/zizvideo`，卸载默认保留。
+- 升级 `--upgrade`；卸载 `--uninstall`；连数据删 `--purge`（需二次确认）。
+- 与面板托管**互斥**：装了面板就不要再独立装，反之亦然。
+
+**外置盘权限**：读 `~/Movies` 不用授权。读 `/Volumes/*` 要在
+「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里给该二进制授权一次；
+无头机器需要有人到机器前，或用 MDM 下发。
+
+**签名**：镜像有 `zizvideo-codesign.crt` 时安装器导入并信任它，授权一次跨升级有效。
+镜像没有 crt 就是未签名部署，每次升级都要重新授权。
 
 ## 配置
 
