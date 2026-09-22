@@ -444,7 +444,8 @@ fi
 
 EXT_YES_LOG="$SANDBOX/dryrun-ext-yes.log"
 rm -rf "$SANDBOX/dryrun-ext-yes-root"
-ZP_EXTERNAL_DISK=1 ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
+ZP_EXTERNAL_DISK=1 ZP_FAKE_EXTERNAL_VOLUMES="/Volumes/ZPSandboxDisk" \
+  ZIZPANEL_SANDBOX=1 ZIZPANEL_DRY_RUN=1 ZP_PASS=testpass123 \
   ZIZPANEL_ROOT="$SANDBOX/dryrun-ext-yes-root" ZIZPANEL_LISTEN=":$PORT" \
   bash "$INSTALL_SH" > "$EXT_YES_LOG" 2>&1 || true
 if grep -q "请\*\*现在把它插上\*\*" "$EXT_YES_LOG" \

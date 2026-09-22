@@ -5,7 +5,7 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 
 # ----------------------------------------------------------------- 基础变量 --
 ZIZPANEL_ROOT="${ZIZPANEL_ROOT:-/opt/zizpanel}"
@@ -2855,6 +2855,11 @@ install_codesign_trust() {
 
 # external_volume_list：列出当前挂载的非系统卷（与面板 files.NonSystemVolumeMounts 同口径）。
 external_volume_list() {
+  # 沙箱夹具：真机没插外接盘时也要能走到"授权确认"分支（门禁不许依赖真硬件，坑 209）。
+  if [ "${ZIZPANEL_SANDBOX:-0}" = "1" ] && [ -n "${ZP_FAKE_EXTERNAL_VOLUMES:-}" ]; then
+    printf '%s\n' "$ZP_FAKE_EXTERNAL_VOLUMES"
+    return 0
+  fi
   local v
   for v in /Volumes/*; do
     [ -e "$v" ] || continue
