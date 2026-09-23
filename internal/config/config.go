@@ -117,9 +117,15 @@ type Config struct {
 	NavListenEnabled bool `json:"nav_listen_enabled"`
 	NavListenPort    int  `json:"nav_listen_port"`
 	// Aria2UIPort 是 AriaNg 独立端口（见 DefaultAria2UIPort 的说明）。
-	Aria2UIPort int    `json:"aria2_ui_port"`
-	TLSCert     string `json:"tls_cert"`
-	TLSKey      string `json:"tls_key"`
+	Aria2UIPort int `json:"aria2_ui_port"`
+	// Aria2APIToken 是**脚本/外部客户端**用的专用凭证（头 X-Aria2-Token），
+	// 让"不是浏览器页面"的调用方（油猴 GM_xmlhttpRequest、其它机器上的脚本）
+	// 跳过面板对 RPC 代理的浏览器来源校验。与 aria2 自己的 rpc-secret 分开：
+	// 泄漏它只能绕过那道来源校验，仍然要带 rpc-secret 才能操纵 aria2。
+	// 首次启动随机生成并落盘（换掉它即等于吊销旧脚本，见 fill 里的生成与 Load 的落盘）。
+	Aria2APIToken string `json:"aria2_api_token"`
+	TLSCert       string `json:"tls_cert"`
+	TLSKey        string `json:"tls_key"`
 	// AccessMode: any=任意来源, local=仅本机, whitelist=仅白名单
 	AccessMode  string   `json:"access_mode"`
 	IPWhitelist []string `json:"ip_whitelist"`
@@ -213,6 +219,9 @@ type Config struct {
 	// migratedAliasOff 只在本进程内有效：表示这次加载刚刚做过"别名下线"迁移，
 	// 需要立刻落盘（见 Load 里的 Save）。
 	migratedAliasOff bool
+	// generatedAria2Token 只在本进程内有效：这次加载刚给老配置补了 aria2 脚本凭证，
+	// 必须立刻落盘 —— 否则每次重启都换一个值，用户的脚本立刻失效。
+	generatedAria2Token bool
 }
 
 // DefaultRoot 是面板的默认安装根目录。
@@ -498,7 +507,7 @@ func Load(path string) (*Config, error) {
 	c.path = path
 	c.fill()
 	// 迁移过就立刻落盘，避免"每次启动都重算"以及"设置里刚打开又被关掉"。
-	if c.migratedAliasOff {
+	if c.migratedAliasOff || c.generatedAria2Token {
 		_ = c.Save()
 	}
 	// 修正在"面板先于 Homebrew 存在"那一刻写下的 /usr/local 前缀。
@@ -627,6 +636,10 @@ func (c *Config) fill() {
 	}
 	// 老配置里没有这个字段（或被人手工清零）时补回默认端口：
 	// 否则启动时会拿 0 去绑（校验直接失败 ⇒ 独立端口永远不生效）。
+	if strings.TrimSpace(c.Aria2APIToken) == "" {
+		c.Aria2APIToken = randomHex(24)
+		c.generatedAria2Token = true
+	}
 	if c.Aria2UIPort <= 0 {
 		c.Aria2UIPort = d.Aria2UIPort
 	}

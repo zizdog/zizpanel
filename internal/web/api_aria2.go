@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -38,4 +39,24 @@ func (s *Server) handleInstallAria2(w http.ResponseWriter, r *http.Request) {
 			}
 			return res, nil
 		})
+}
+
+// handleAria2ScriptToken 把"非浏览器脚本调用 RPC"要用的专用凭证交给管理员。
+//
+// 为什么要一个接口：这个值不是给浏览器页面用的（页面走同源代理就行），而是给
+// 油猴/其它机器上的脚本用的 —— 它们需要一个能贴进脚本的字符串，而面板配置在
+// /opt/zizpanel/data/config.json（要 root 才读得到）。只有登录会话能取，
+// 且它单独泄漏也操纵不了 aria2（仍要 rpc-secret）。
+func (s *Server) handleAria2ScriptToken(w http.ResponseWriter, r *http.Request) {
+	tok := strings.TrimSpace(s.Cfg.Aria2APIToken)
+	if tok == "" {
+		writeErr(w, http.StatusConflict, "面板还没有生成 aria2 脚本凭证（重启面板会补上）")
+		return
+	}
+	ok(w, map[string]any{
+		"header": Aria2APITokenHeader,
+		"token":  tok,
+		"usage": "POST " + Aria2APITokenHeader + ": <token> 到 AriaNg 的 /jsonrpc（独立端口或反代域名）" +
+			"；body 里仍要 aria2 自己的 token:<rpc-secret>",
+	})
 }

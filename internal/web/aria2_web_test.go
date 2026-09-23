@@ -314,3 +314,93 @@ func TestAria2RPCTimesOutWhenUpstreamHangs(t *testing.T) {
 		t.Errorf("端口没人听时不能说成「没有应答」（那是卡死的说法），实际：%s", body2)
 	}
 }
+
+// TestAria2RPCTokenBypassesBrowserOriginCheck 锁住"扩展/脚本通道"的正当入口。
+//
+// 背景（真机报障）：油猴脚本用 GM_xmlhttpRequest 打反代域名上的 /jsonrpc，被面板的
+// 来源校验 403「拒绝跨站来源的 RPC 请求」。那条校验只看浏览器自己打的 Sec-Fetch-Site，
+// 而扩展通道**改不了也躲不掉**它（不受同源策略约束 ≠ 能伪造该头）⇒ 客户端侧无解。
+// 所以给非浏览器调用方一条凭证通道：X-Aria2-Token（面板生成的独立凭证）。
+//
+// 判据（正反对照都在）：
+//
+//	① 跨站 + 对凭证 → 200；
+//	② 跨站 + 错凭证 → 403；
+//	③ 跨站 + 不带凭证 → 403（老行为不许被放宽）；
+//	④ 同源（AriaNg 页面）→ 200；
+//	⑤ 配置里没生成凭证时，随便带什么都 → 403（别出现"空值全放行"）。
+func TestAria2RPCTokenBypassesBrowserOriginCheck(t *testing.T) {
+	srv, ts := newTestServer(t)
+	cookies := loginTestPanel(t, ts)
+	writeAria2Conf(t, srv, "tok-secret")
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"z","result":{"version":"1.37.0"}}`))
+	}))
+	defer upstream.Close()
+	u, _ := url.Parse(upstream.URL)
+	old := aria2RPCUpstream
+	aria2RPCUpstream = func() *url.URL { return &url.URL{Scheme: "http", Host: u.Host, Path: "/jsonrpc"} }
+	t.Cleanup(func() { aria2RPCUpstream = old })
+
+	const token = "script-token-fixture-0123456789"
+	srv.Cfg.Aria2APIToken = token
+	t.Cleanup(func() { srv.Cfg.Aria2APIToken = "" })
+
+	payload := `{"jsonrpc":"2.0","id":"z","method":"aria2.getVersion","params":["token:x"]}`
+	call := func(hdr map[string]string) int {
+		req, _ := http.NewRequest("POST", ts.URL+"/aria/jsonrpc", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		return res.StatusCode
+	}
+
+	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: token}); got != http.StatusOK {
+		t.Errorf("① 跨站 + 对凭证应放行（200），实际 %d", got)
+	}
+	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: "wrong"}); got != http.StatusForbidden {
+		t.Errorf("② 跨站 + 错凭证应 403，实际 %d", got)
+	}
+	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site"}); got != http.StatusForbidden {
+		t.Errorf("③ 跨站 + 不带凭证应保持 403（这条通道不能变成人人可过），实际 %d", got)
+	}
+	if got := call(map[string]string{"Sec-Fetch-Site": "same-origin"}); got != http.StatusOK {
+		t.Errorf("④ 同源（AriaNg 页面）应 200，实际 %d", got)
+	}
+	// ⑤ 配置里没有凭证（老配置/生成失败）：带**任何**值都不许过 ——
+	// 否则就成了"空凭证 = 人人可过"。
+	srv.Cfg.Aria2APIToken = ""
+	for _, bogus := range []string{"", "x", token} {
+		if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: bogus}); got != http.StatusForbidden {
+			t.Errorf("⑤ 没有生成凭证时不该放行（带 %q），实际 %d", bogus, got)
+		}
+	}
+	// ⑥ **刻意不做 CORS 预检**（方向问题，不是漏做）：扩展通道不受同源策略约束、
+	// GM_xmlhttpRequest 也不发预检；给页面加 ACAO/预检等于把 CORS 当解法。
+	// 这里把"OPTIONS 不被特殊对待"钉住，免得以后有人顺手加回一套 CORS。
+	srv.Cfg.Aria2APIToken = token
+	req, _ := http.NewRequest("OPTIONS", ts.URL+"/aria/jsonrpc", nil)
+	req.Header.Set(Aria2APITokenHeader, token)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNoContent || res.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("⑥ 不该为这条通道做 CORS 预检/放行（实际 %d，ACAO=%q）", res.StatusCode, res.Header.Get("Access-Control-Allow-Origin"))
+	}
+}

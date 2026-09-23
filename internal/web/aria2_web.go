@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -209,12 +210,43 @@ func ariaSlugPath() string { return services.Aria2Slug }
 // 用户既看不到错也点不动。超时后回 502 + 能照做的提示。
 var aria2RPCTimeout = 8 * time.Second
 
+// Aria2APITokenHeader 是脚本/外部客户端用的**专用凭证头**（值 = 面板设置里的
+// aria2_api_token）。它绕过下面那道浏览器来源校验，理由见 aria2RPCProxy 的注释。
+const Aria2APITokenHeader = "X-Aria2-Token"
+
+// aria2TokenOK 判断请求是否带了正确的专用凭证（空值一律不算，避免"配置没生成时
+// 谁都能过"）。比较用 ConstantTimeCompare：这个值不该通过响应时间泄漏。
+func (s *Server) aria2TokenOK(r *http.Request) bool {
+	want := strings.TrimSpace(s.Cfg.Aria2APIToken)
+	got := strings.TrimSpace(r.Header.Get(Aria2APITokenHeader))
+	if want == "" || got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
+}
+
 // aria2RPCProxy 是两条入口共用的代理实现（是否要求会话由调用方先判）。
+//
+// 来源校验只认 **Sec-Fetch-Site**（浏览器自己打的，页面改不了）。它的目的是挡住
+// "别的网站上的页面顺手打本机 RPC"，代价是会误伤**扩展通道**：油猴的
+// GM_xmlhttpRequest 不受同源策略约束、也改不了 Origin/Sec-Fetch-Site，浏览器照样
+// 打上 cross-site ⇒ 一律 403。这类调用方不是 CSRF 风险（它得自己拿着凭证），
+// 所以给它们一条正当入口：带 X-Aria2-Token（面板生成的独立凭证，与 rpc-secret
+// 分开；泄漏它也只能过这道门，操纵 aria2 仍要 rpc-secret）。
+//
+// 顺序就是"专用凭证优先，其次浏览器来源"：带对凭证 → 放行；否则照旧看 Sec-Fetch-Site。
 func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
-	if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
-		site != "same-origin" && site != "none" {
-		writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求")
-		return
+	// 刻意**不做 CORS 预检**：这条通道是给"不受同源策略约束"的扩展/脚本用的
+	// （GM_xmlhttpRequest 不发预检），浏览器页面本来就有同源入口。加了预检 +
+	// Access-Control-Allow-* 反而是把 CORS 当解法 —— 方向错了（用户 2026-09-23 明确）。
+	if !s.aria2TokenOK(r) {
+		if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
+			site != "same-origin" && site != "none" {
+			writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求"+
+				"（油猴/外部脚本等扩展通道请带 "+Aria2APITokenHeader+" 凭证，"+
+				"值可用 GET /api/v1/market/aria2/script-token 取）")
+			return
+		}
 	}
 	if ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); !strings.HasPrefix(ct, "application/json") {
 		writeErr(w, http.StatusUnsupportedMediaType, "aria2 的 RPC 只接受 application/json")
