@@ -136,11 +136,17 @@ type Health struct {
 	Interval string `json:"interval,omitempty"`
 }
 
-// Uninstall 声明"删什么、留什么"。默认保留用户数据，删的必须列清。
+// Uninstall 声明"删什么、留什么"。
+//
+// 与面板卸载对话框的语义一一对应（别混）：
+//   - Always：卸载一定删的（launchd plist、面板记录、共享二进制）；
+//   - OptionalData：**勾选「删除数据」才删**的用户数据/配置目录（默认保留）；
+//   - KeepNote：给用户看的一句话（纯文案，门禁不比对）。
 type Uninstall struct {
-	Artifacts []string `json:"artifacts"`
-	Keep      []string `json:"keep,omitempty"`
-	Formula   string   `json:"formula,omitempty"`
+	Always       []string `json:"always,omitempty"`
+	OptionalData []string `json:"optional_data,omitempty"`
+	Formula      string   `json:"formula,omitempty"`
+	KeepNote     string   `json:"keep_note,omitempty"`
 }
 
 // Update 说明怎么判断有没有新版本。
@@ -328,17 +334,17 @@ func (s *Spec) Validate() error {
 	}
 
 	// ---- uninstall ----
-	if s.Run.Mode != "none" && len(s.Uninstall.Artifacts) == 0 {
-		add("uninstall.artifacts 不能为空（除 run.mode=none）：装了必须说得清卸的时候删什么")
+	if s.Run.Mode != "none" && len(s.Uninstall.Always) == 0 && len(s.Uninstall.OptionalData) == 0 {
+		add("uninstall 至少要声明 always 或 optional_data：装了必须说得清卸的时候删什么")
 	}
-	for i, a := range s.Uninstall.Artifacts {
+	for i, a := range s.Uninstall.Always {
 		if !isAbsOrHome(a) {
-			add("uninstall.artifacts[%d] 必须是绝对路径或用 ~/ 开头，实际 %q", i, a)
+			add("uninstall.always[%d] 必须是绝对路径或用 ~/ 开头，实际 %q", i, a)
 		}
 	}
-	for i, k := range s.Uninstall.Keep {
-		if !isAbsOrHome(k) {
-			add("uninstall.keep[%d] 必须是绝对路径或用 ~/ 开头，实际 %q", i, k)
+	for i, a := range s.Uninstall.OptionalData {
+		if !isAbsOrHome(a) {
+			add("uninstall.optional_data[%d] 必须是绝对路径或用 ~/ 开头，实际 %q", i, a)
 		}
 	}
 
@@ -489,9 +495,19 @@ func PlanText(s *Spec) string {
 
 	// ⑦ 登记 + 卸载
 	fmt.Fprintf(&b, "  7. 登记：服务管理 + 市场卡片；已安装判据与卸载计划由面板统一生成\n")
-	fmt.Fprintf(&b, "  8. 卸载：停服务 → 删 %s\n", strings.Join(s.Uninstall.Artifacts, ", "))
-	if len(s.Uninstall.Keep) > 0 {
-		fmt.Fprintf(&b, "     保留（用户数据）：%s\n", strings.Join(s.Uninstall.Keep, ", "))
+	fmt.Fprintf(&b, "  8. 卸载：停服务")
+	if len(s.Uninstall.Always) > 0 {
+		fmt.Fprintf(&b, " → 删 %s", strings.Join(s.Uninstall.Always, ", "))
+	}
+	if s.Uninstall.Formula != "" {
+		fmt.Fprintf(&b, " → brew uninstall %s", s.Uninstall.Formula)
+	}
+	b.WriteString("\n")
+	if len(s.Uninstall.OptionalData) > 0 {
+		fmt.Fprintf(&b, "     勾选「删除数据」才会删：%s（默认保留）\n", strings.Join(s.Uninstall.OptionalData, ", "))
+	}
+	if strings.TrimSpace(s.Uninstall.KeepNote) != "" {
+		fmt.Fprintf(&b, "     说明：%s\n", s.Uninstall.KeepNote)
 	}
 	if s.Update != nil {
 		fmt.Fprintf(&b, "  9. 更新检测：%s\n", s.Update.Kind)

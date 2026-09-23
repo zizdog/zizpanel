@@ -15,13 +15,18 @@
   },
   "run": {
     "mode": "brew-service",
-    "hooks": ["syncthing-gui-lan"]
+    "hooks": [
+      "syncthing-gui-lan"
+    ]
   },
   "config": {
     "path": "~/Library/Application Support/Syncthing/config.xml",
     "mode": "0600",
     "own": "user",
-    "secrets": ["gui-user", "gui-password"]
+    "secrets": [
+      "gui-user",
+      "gui-password"
+    ]
   },
   "expose": {
     "port": 8384,
@@ -31,7 +36,12 @@
   },
   "verify": {
     "any_of": [
-      { "kind": "http", "path": "/rest/noauth/health", "expect": "ok", "timeout": "60s" }
+      {
+        "kind": "http",
+        "path": "/rest/noauth/health",
+        "expect": "ok",
+        "timeout": "60s"
+      }
     ]
   },
   "health": {
@@ -41,18 +51,23 @@
     "interval": "30s"
   },
   "uninstall": {
-    "artifacts": [
-      "/opt/homebrew/bin/syncthing",
-      "/Library/LaunchDaemons/homebrew.mxcl.syncthing.plist",
-      "/opt/homebrew/var/log/syncthing.log"
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.syncthing.plist"
     ],
-    "keep": ["~/Library/Application Support/Syncthing"],
-    "formula": "syncthing"
+    "optional_data": [
+      "~/Library/Application Support/Syncthing"
+    ],
+    "formula": "syncthing",
+    "keep_note": "默认保留数据目录（设备身份与同步索引在里面）；删掉它等于重置本机身份。同步目录本身不在那里，不受影响。"
   },
-  "update": { "kind": "brew" },
+  "update": {
+    "kind": "brew"
+  },
   "requires": {
     "local_network": true,
     "system_daemon": true,
-    "ports": [8384]
+    "ports": [
+      8384
+    ]
   }
 }

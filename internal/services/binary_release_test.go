@@ -90,11 +90,18 @@ func TestReleaseBinarySpecsStayDarwinArm64(t *testing.T) {
 			t.Errorf("%s 的健康检查路径与安装器不一致：目录 %q / 安装器 %q",
 				id, app.HealthPath, spec.HealthPath)
 		}
-		// ConfigPath 是「📝 编辑配置文件」定位文件用的（相对安装目录），
-		// 必须与安装器的 ConfigFile 一致，否则按钮会打开一个不存在的路径。
-		if app.ConfigPath != spec.ConfigFile {
-			t.Errorf("%s 的配置文件与安装器不一致：目录 %q / 安装器 %q",
-				id, app.ConfigPath, spec.ConfigFile)
+		// ConfigPath 是「📝 编辑配置文件」定位文件用的，必须与安装器的 ConfigFile
+		// 指向**同一个文件**。比解析后的绝对路径而不是字面量：目录里允许写
+		// ~/…（插件表就是这么写的），安装器侧写的是相对安装目录的相对路径。
+		const home = "/Users/tester"
+		gotConf := ConfigFilePath(app, home, filepath.Join(home, "work"))
+		wantConf := filepath.Join(home, spec.RootDir, spec.ConfigFile)
+		if spec.ConfigFile == "" {
+			wantConf = ""
+		}
+		if gotConf != wantConf {
+			t.Errorf("%s 的配置文件与安装器不一致：目录解析 %q / 安装器解析 %q",
+				id, gotConf, wantConf)
 		}
 	}
 }

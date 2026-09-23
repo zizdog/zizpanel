@@ -3,7 +3,7 @@
   "id": "alist",
   "name": "Alist（文件列表）",
   "icon": "📂",
-  "summary": "聚合网盘与本地文件，挂到一个网页里浏览",
+  "summary": "把网盘、对象存储、本地目录挂成一个网页文件站",
   "notes": [
     "上游只有 md5 清单、没有 sha256：这条轨只做架构复核 + md5 互证，不假装校验过 sha256。",
     "首次打开后用面板给的初始口令登录（安装结果里有），登录后请自行改掉。"
@@ -21,7 +21,11 @@
   "run": {
     "mode": "app-daemon",
     "bin": "~/alist/alist",
-    "args": ["server", "--data", "~/alist/data"]
+    "args": [
+      "server",
+      "--data",
+      "~/alist/data"
+    ]
   },
   "config": {
     "path": "~/alist/data/config.json",
@@ -36,8 +40,16 @@
   },
   "verify": {
     "any_of": [
-      { "kind": "http", "path": "/", "expect": "", "timeout": "60s" },
-      { "kind": "process", "label": "com.zizdog.alist" }
+      {
+        "kind": "http",
+        "path": "/",
+        "expect": "",
+        "timeout": "60s"
+      },
+      {
+        "kind": "process",
+        "label": "com.zizdog.alist"
+      }
     ]
   },
   "health": {
@@ -46,12 +58,20 @@
     "interval": "30s"
   },
   "uninstall": {
-    "artifacts": ["~/alist"],
-    "keep": []
+    "always": [
+      "/Library/LaunchDaemons/com.zizdog.alist.plist"
+    ],
+    "optional_data": [
+      "~/alist"
+    ],
+    "keep_note": "~/alist 里还有 data/（账号与存储配置）：勾选「删除数据」才会删。"
   },
-  "update": { "kind": "release-index" },
+  "update": {
+    "kind": "release-index"
+  },
   "requires": {
-    "system_daemon": true,
-    "ports": [5244]
+    "ports": [
+      5244
+    ]
   }
 }

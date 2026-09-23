@@ -569,7 +569,9 @@ func RemoteCatalogInfo() (string, int, time.Time) {
 // 所有消费方（市场列表 / FindApp / 服务详情…）都只认这一个入口，所以远端条目
 // 一旦装上就能"像内置的一样"被市场显示与安装，不需要改任何调用点。
 func Catalog() []App {
-	base := builtinCatalog()
+	// 内建插件表（B1）覆盖"表已覆盖字段"：等价性由 plugin_equiv_test.go 逐字段保证，
+	// 所以在迁移完成前这一步是零行为变化（见 catalog_plugin.go）。
+	base := applyPluginTable(builtinCatalog())
 	remoteCatalog.mu.RLock()
 	remote := remoteCatalog.apps
 	remoteCatalog.mu.RUnlock()
@@ -589,7 +591,7 @@ func Catalog() []App {
 		have[a.ID] = true
 		out = append(out, a)
 	}
-	return out
+	return applyPluginTable(out)
 }
 
 // BuiltinCatalogIDs 返回内置目录的 ID 集合（远端目录合并时用来判"撞 ID"）。

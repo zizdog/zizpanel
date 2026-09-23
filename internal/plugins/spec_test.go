@@ -2,7 +2,6 @@ package plugins_test
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,17 +10,21 @@ import (
 )
 
 // TestFixturesAreValid 两份真实应用的声明必须过校验（P0 的"能不能覆盖现实"判据）。
-func TestFixturesAreValid(t *testing.T) {
-	for _, f := range []string{"alist.json", "syncthing.json"} {
-		s, err := plugins.Load(filepath.Join("testdata", f))
-		if err != nil {
-			t.Fatalf("%s 应该合法：%v", f, err)
+func TestBuiltinSpecsAreValid(t *testing.T) {
+	ids := plugins.BuiltinIDs()
+	if len(ids) == 0 {
+		t.Fatal("内建插件表为空：embed 没生效，或两份声明都不合法（打包事故，必须红）")
+	}
+	for _, id := range ids {
+		s, ok := plugins.Builtin(id)
+		if !ok {
+			t.Fatalf("%s 应当能被 Builtin 取到", id)
 		}
 		if s.Schema != plugins.SchemaV1 {
-			t.Errorf("%s 的 schema 应为 %s", f, plugins.SchemaV1)
+			t.Errorf("%s 的 schema 应为 %s", id, plugins.SchemaV1)
 		}
 		if plugins.PlanText(s) == "" {
-			t.Errorf("%s 的 plan 不该为空", f)
+			t.Errorf("%s 的 plan 不该为空", id)
 		}
 	}
 }
@@ -29,14 +32,14 @@ func TestFixturesAreValid(t *testing.T) {
 // TestFixturesMatchBuiltinCatalog 是**防漂移**门禁：只要这份表与 Go 里的目录定义同时存在，
 // 就断言它们说的是同一件事（端口、健康路径、安装根）。P1（由表驱动目录）做完后这条会被替换。
 func TestFixturesMatchBuiltinCatalog(t *testing.T) {
-	cases := []struct{ file, id, rootDir string }{
-		{"alist.json", "alist", "alist"},
-		{"syncthing.json", "syncthing", ""},
+	cases := []struct{ id, rootDir string }{
+		{"alist", "alist"},
+		{"syncthing", ""},
 	}
 	for _, c := range cases {
-		s, err := plugins.Load(filepath.Join("testdata", c.file))
-		if err != nil {
-			t.Fatal(err)
+		s, ok := plugins.Builtin(c.id)
+		if !ok {
+			t.Fatalf("内建表里没有 %s", c.id)
 		}
 		app, ok := services.FindApp(c.id)
 		if !ok {
@@ -49,12 +52,13 @@ func TestFixturesMatchBuiltinCatalog(t *testing.T) {
 			t.Errorf("%s：表里健康路径 %q，目录里 %q", c.id, s.Health.Path, app.HealthPath)
 		}
 		if c.rootDir != "" {
-			if len(s.Uninstall.Artifacts) == 0 {
-				t.Fatalf("%s：卸载产物为空", c.id)
+			if len(s.Uninstall.OptionalData) == 0 {
+				t.Fatalf("%s：卸载的 optional_data 为空", c.id)
 			}
 			want := "~/" + c.rootDir
-			if !strings.HasPrefix(s.Uninstall.Artifacts[0], want) {
-				t.Errorf("%s：安装根应是 %s，表里写的是 %q", c.id, want, s.Uninstall.Artifacts[0])
+			got := strings.Join(s.Uninstall.OptionalData, ",")
+			if !strings.Contains(got, want) {
+				t.Errorf("%s：安装根应在 optional_data 里（%s），表里写的是 %q", c.id, want, got)
 			}
 		}
 	}
@@ -100,7 +104,7 @@ func baseSpec() map[string]any {
 		"expose":    map[string]any{"port": 1234, "bind": "0.0.0.0", "ui": "app"},
 		"verify":    map[string]any{"any_of": []any{map[string]any{"kind": "rpc", "url": "http://127.0.0.1:1234/jsonrpc", "method": "demo.version"}}},
 		"health":    map[string]any{"kind": "rpc", "url": "http://127.0.0.1:1234/jsonrpc", "method": "demo.version"},
-		"uninstall": map[string]any{"artifacts": []string{"~/demo"}, "keep": []string{"~/Downloads"}},
+		"uninstall": map[string]any{"always": []string{"~/demo/lib"}, "optional_data": []string{"~/demo"}},
 		"update":    map[string]any{"kind": "release-index"},
 	}
 }
@@ -141,8 +145,9 @@ func TestValidateRejectsUnsafeOrIncomplete(t *testing.T) {
 		{"walk 探针 kind 不存在", func(m map[string]any) {
 			m["verify"].(map[string]any)["any_of"] = []any{map[string]any{"kind": "shell", "path": "/"}}
 		}, "verify.any_of"},
-		{"卸载产物为空", func(m map[string]any) { m["uninstall"].(map[string]any)["artifacts"] = []string{} }, "artifacts"},
-		{"卸载产物相对路径", func(m map[string]any) { m["uninstall"].(map[string]any)["artifacts"] = []string{"demo"} }, "绝对路径"},
+		{"卸载产物为空", func(m map[string]any) { m["uninstall"] = map[string]any{} }, "always"},
+		{"卸载产物相对路径", func(m map[string]any) { m["uninstall"].(map[string]any)["always"] = []string{"demo"} }, "绝对路径"},
+		{"可选删数据相对路径", func(m map[string]any) { m["uninstall"].(map[string]any)["optional_data"] = []string{"demo"} }, "绝对路径"},
 		{"缺 health", func(m map[string]any) { delete(m, "health") }, "health"},
 		{"verify 为空", func(m map[string]any) { m["verify"] = map[string]any{"any_of": []any{}} }, "verify"},
 		{"未知内建补丁", func(m map[string]any) {
@@ -169,7 +174,7 @@ func TestValidateRejectsUnsafeOrIncomplete(t *testing.T) {
 
 // TestLoadMissingFile 给 CLI 一个明确错误（别 panic）。
 func TestLoadMissingFile(t *testing.T) {
-	if _, err := plugins.Load(filepath.Join("testdata", "nope.json")); err == nil {
+	if _, err := plugins.Load("/nonexistent/plugins/nope.json"); err == nil {
 		t.Fatal("文件不存在应当报错")
 	}
 }
