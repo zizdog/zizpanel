@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
 )
@@ -219,4 +221,96 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestAria2RPCTimesOutWhenUpstreamHangs 是"aria2 卡死"的真机形态回归（2026-09-23）：
+// 进程还在、端口还在听、TCP 连得上，但**一个字节都不回**（写 .aria2 控制文件抛异常后
+// 事件循环不再服务 HTTP）。没有超时的话面板的代理会一直等，界面永远停在"连接中…"。
+//
+// 判据：① 必须在超时附近返回（不是无限等）；② 必须是 502 且文案点明"没有应答"，
+// 并把"去点重启"这条出路写出来；③ 不能把"上游拒连"也说成"没有应答"（负向对照）。
+func TestAria2RPCTimesOutWhenUpstreamHangs(t *testing.T) {
+	_, ts := newTestServer(t)
+	cookies := loginTestPanel(t, ts)
+
+	// 半开上游：接受连接、读到请求，然后什么都不回。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c // 故意不读不写：模拟卡死的 aria2
+		}
+	}()
+
+	oldUp, oldTimeout := aria2RPCUpstream, aria2RPCTimeout
+	aria2RPCUpstream = func() *url.URL {
+		return &url.URL{Scheme: "http", Host: ln.Addr().String(), Path: "/jsonrpc"}
+	}
+	aria2RPCTimeout = 400 * time.Millisecond
+	t.Cleanup(func() { aria2RPCUpstream, aria2RPCTimeout = oldUp, oldTimeout })
+
+	payload := `{"jsonrpc":"2.0","id":"zizpanel","method":"aria2.getVersion","params":["token:x"]}`
+	req, _ := http.NewRequest("POST", ts.URL+"/aria/jsonrpc", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	start := time.Now()
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Errorf("应当按超时返回（约 0.4s），实际等了 %s —— 界面会一直停在「连接中…」", elapsed)
+	}
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("卡死的上游应回 502，实际 %d：%s", res.StatusCode, body)
+	}
+	msg := string(body)
+	if !strings.Contains(msg, "没有应答") {
+		t.Errorf("文案要点明「没有应答」（这是卡死而不是配置错的唯一线索），实际：%s", msg)
+	}
+	if !strings.Contains(msg, "重启") {
+		t.Errorf("文案要给出可照做的出路（点「重启」），实际：%s", msg)
+	}
+
+	// 负向对照：**没人听**（立刻拒连）不能被说成"卡死"—— 两者的出路不同
+	// （一个是"去启动"，一个是"去重启"），混为一谈等于给错药方。
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+	aria2RPCUpstream = func() *url.URL {
+		return &url.URL{Scheme: "http", Host: deadAddr, Path: "/jsonrpc"}
+	}
+	req2, _ := http.NewRequest("POST", ts.URL+"/aria/jsonrpc", strings.NewReader(payload))
+	req2.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req2.AddCookie(c)
+	}
+	res2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res2.Body.Close()
+	body2, _ := io.ReadAll(res2.Body)
+	if res2.StatusCode != http.StatusBadGateway {
+		t.Fatalf("拒连也应回 502，实际 %d：%s", res2.StatusCode, body2)
+	}
+	if strings.Contains(string(body2), "没有应答") {
+		t.Errorf("端口没人听时不能说成「没有应答」（那是卡死的说法），实际：%s", body2)
+	}
 }

@@ -9,7 +9,7 @@
 //   - SQL 执行区明确说明"只允许单条语句、不允许注释"
 
 import { api, apiURL } from './api.js';
-import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
+import { h, clear, stickyToast, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
 import { state, registerCleanup, panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
 
@@ -725,7 +725,7 @@ export function DatabaseView(content, ctx = {}) {
       if (r.warning) {
         // 口令已在 MySQL 生效，但面板没能保存它用于回显 —— 此后列表里看不到，
         // 必须让用户当场记下来。
-        toast(r.msg + '。⚠️ ' + r.warning + '｜新密码：' + pwd, 'warn', 0);
+        stickyToast(r.msg + '。⚠️ ' + r.warning + '｜新密码：' + pwd, 'warn');
       } else {
         toast(r.msg + '，新密码：' + pwd + '（已保存，之后可在列表里点 👁 查看）', 'ok', 15000);
       }
@@ -926,7 +926,7 @@ export function DatabaseView(content, ctx = {}) {
   }
 
   async function dumpDB(name) {
-    const t = toast(`正在导出 ${name}…`, 'info', 0);
+    const t = stickyToast(`正在导出 ${name}…`, 'info');
     try {
       const r = await api.databaseDump(name);
       t.remove();

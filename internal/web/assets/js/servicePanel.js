@@ -3,7 +3,7 @@
 // ② **动作只有一份实现**（从 services.js 复用）；③ **市场条目与服务记录形状不同，在这里归一化**。
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll } from './ui.js';
+import { h, clear, stickyToast, toast, modal, confirmBox, appendAll } from './ui.js';
 import { panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
 import {
@@ -450,7 +450,7 @@ export async function doServiceAction(name, action, m = {}, onDone) {
   }
 
   const labels = { start: '启动', stop: '停止', restart: '重启' };
-  const t = toast(`${labels[action] || action}「${label}」中…`, 'info', 0);
+  const t = stickyToast(`${labels[action] || action}「${label}」中…`, 'info');
   let failed = false;
   let warning = '';
   try {

@@ -111,7 +111,13 @@ export const $ = (sel, root = document) => root.querySelector(sel);
 
 // ---------------- Toast ----------------
 
-export function toast(message, type = 'info', timeout = 4200) {
+const TOAST_MS = 4200;
+
+// timeout 的语义（刻意做成"写错也不会挂住"）：
+//   >0 停留毫秒数；省略 / 0 / 非法值 → 默认 4200ms；**负数 = 常驻**。
+// 常驻请用 stickyToast，别自己传数字 —— 早先 0 就是"常驻"，于是有人在"默认值"
+// 的位置写了 `let hold = 0`，成功提示便永远挂在屏幕上（用户报障「规则已创建一直显示」）。
+export function toast(message, type = 'info', timeout = TOAST_MS) {
   // 反馈通道本身不能失败：所有写操作（启停/卸载/升级…）的失败提示都走这里。
   // 一旦它抛异常（例如 #toasts 不在 DOM 里），调用方 catch 里的那句提示就跟着
   // 一起没了 —— 用户看到的正是"点了没反应"（见 坑清单 坑 154）。
@@ -128,9 +134,15 @@ export function toast(message, type = 'info', timeout = 4200) {
     h('span.close', { text: '×', onclick: () => node.remove() }),
   ]);
   box.appendChild(node);
-  if (timeout > 0) setTimeout(() => node.remove(), timeout);
+  const t = Number(timeout);
+  if (t >= 0) setTimeout(() => node.remove(), t > 0 ? t : TOAST_MS);
   return node;
 }
+
+// stickyToast 是**常驻**提示：不会自己消失，调用方必须自己 `node.remove()`。
+// 只该用在两类消息上：「正在做…」（做完/失败都要显式撤掉），
+// 以及不能让用户错过的口令/警告。
+export function stickyToast(message, type = 'info') { return toast(message, type, -1); }
 
 /**
  * failureToast(err, timeout) —— 失败回执的分级展示（坑 211）。

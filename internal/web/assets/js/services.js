@@ -19,7 +19,7 @@
 //   - 日志用 SSE 实时推送，不靠前端轮询
 
 import { api, sseServiceLogs } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
+import { h, clear, stickyToast, toast, modal, confirmBox, appendAll, bytes, promptBox } from './ui.js';
 import { taskCenter } from './tasks.js';
 // 依赖方向：apps.js → servicePanel.js ↔ services.js（两模块互取函数，但都只在
 // 渲染/点击时才调用，不在模块初始化时求值，所以没有初始化顺序问题）。
@@ -1859,7 +1859,7 @@ export function configFileModal(s, reload) {
   async function save() {
     if (!editor) return;
     if (editor.value === saved) { toast('内容没有变化', 'warn'); return; }
-    const t = toast('保存中…', 'info', 0);
+    const t = stickyToast('保存中…', 'info');
     try {
       await api.fileWrite(path, editor.value);
       saved = editor.value;
@@ -1872,7 +1872,7 @@ export function configFileModal(s, reload) {
   }
 
   async function restart() {
-    const t = toast(`重启「${s.display_name}」中…`, 'info', 0);
+    const t = stickyToast(`重启「${s.display_name}」中…`, 'info');
     try {
       await api.serviceAction(s.name, 'restart');
       t.remove();

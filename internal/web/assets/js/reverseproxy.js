@@ -11,7 +11,7 @@
 //   3. **WebSocket**：默认开。关掉它，带界面的服务会"能打开但用不了"。
 
 import { api } from './api.js';
-import { h, clear, toast, modal, confirmBox, appendAll, failureToast } from './ui.js';
+import { h, clear, stickyToast, toast, modal, confirmBox, appendAll, failureToast } from './ui.js';
 import { registerCleanup } from './app.js';
 // 证书列表的归一化与"按域名挑证书"直接复用「SSL 证书」页的纯函数：
 // 反代与站点两侧必须用同一套匹配规则，否则同一个域名在两个页面会选到不同证书。
@@ -376,7 +376,7 @@ export function ReverseProxyView(content, ctx = {}) {
             + '只在点这一下时跑，不会自动探测；失败会写清是哪一步'
             + '（nginx 请求体上限 / nginx 自身的 500 页 / 转发到上游）。',
           onclick: async () => {
-            const pending = toast('正在向 :' + it.listen + ' 发送 64KB 请求体…', 'info', 0);
+            const pending = stickyToast('正在向 :' + it.listen + ' 发送 64KB 请求体…', 'info');
             try {
               const r = await api.probeProxyBody(it.id);
               pending.remove();
@@ -878,7 +878,10 @@ export function ReverseProxyView(content, ctx = {}) {
             const a = (saved && saved.auth) || {};
             let msg = isNew ? '规则已创建' : '规则已保存';
             let level = 'ok';
-            let hold = 0;
+            // 留空 = 用 toast 的默认时长。**别写成 0**：0 是"常驻"，会让这条成功提示
+            // 永远挂在屏幕上（用户报障「规则已创建一直显示」）；只有下面两条 warn
+            // 分支需要把停留时间拉长。
+            let hold;
             if (saved && saved.auth_enabled) {
               if (a.verified) {
                 msg += '；访问鉴权已生效（用户名 ' + (a.user || '') + '）';

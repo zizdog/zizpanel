@@ -1,13 +1,16 @@
 package web
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
 )
@@ -198,6 +201,14 @@ func (s *Server) handleAria2RPCLoopback(w http.ResponseWriter, r *http.Request) 
 // "独立端口根路径"两处引用同一个常量，避免改名时漏掉一处。
 func ariaSlugPath() string { return services.Aria2Slug }
 
+// aria2RPCTimeout 是面板等 aria2 RPC 应答的上限。
+//
+// 没有它，**卡死的 aria2 会让界面永远停在"连接中…"**：真机撞到过 —— aria2 写
+// `.aria2` 控制文件抛异常后进程还在、端口还在听（lsof 是它、launchd 也 running），
+// 但 HTTP/RPC 一个字都不回（连 `GET /` 都超时），于是面板的代理跟着一直等，
+// 用户既看不到错也点不动。超时后回 502 + 能照做的提示。
+var aria2RPCTimeout = 8 * time.Second
+
 // aria2RPCProxy 是两条入口共用的代理实现（是否要求会话由调用方先判）。
 func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 	if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
@@ -218,10 +229,31 @@ func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 			req.Host = up.Host
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			where := "127.0.0.1:" + fmt.Sprint(services.Aria2RPCPort)
+			if aria2RPCTimedOut(r.Context(), err) {
+				writeErr(w, http.StatusBadGateway,
+					"aria2 在 "+fmt.Sprint(int(aria2RPCTimeout.Seconds()))+" 秒内没有应答（"+where+
+						"）：进程可能还在跑但已经卡死；到「应用 → 已安装 → aria2」点一次「重启」")
+				return
+			}
 			writeErr(w, http.StatusBadGateway,
-				"连不上 aria2（127.0.0.1:"+fmt.Sprint(services.Aria2RPCPort)+"）："+err.Error()+
+				"连不上 aria2（"+where+"）："+err.Error()+
 					"；到「应用 → 已安装 → aria2」点一次「启动」再试")
 		},
 	}
-	proxy.ServeHTTP(w, r)
+	ctx, cancel := context.WithTimeout(r.Context(), aria2RPCTimeout)
+	defer cancel()
+	proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// aria2RPCTimedOut 判断这次失败是不是"上游不应答"（而不是拒连/配置错）。
+// ReverseProxy 把上下文取消包装成多层错误，errors.Is 与文案两条判据都要留。
+func aria2RPCTimedOut(ctx context.Context, err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "Client.Timeout")
 }

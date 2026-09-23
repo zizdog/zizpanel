@@ -17,7 +17,7 @@
 // 失败会如实报错；装完本页自己刷新到可用状态，用户不用去别的页面找。
 
 import { api } from './api.js';
-import { h, clear, toast } from './ui.js';
+import { h, clear, stickyToast, toast } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
 import { renderContainers } from './docker-containers.js';
@@ -263,7 +263,7 @@ function installRuntime(appId, refresh) {
 //   · 失败 → 如实报错并停在这个页面。
 async function startRuntime(appId, refresh) {
   const name = appId || 'docker-runtime';
-  const t = toast('正在启动 Docker 运行时（首次启动约需 40 秒）…', 'info', 0);
+  const t = stickyToast('正在启动 Docker 运行时（首次启动约需 40 秒）…', 'info');
   try {
     const resp = await api.serviceAction(name, 'start');
     t.remove();

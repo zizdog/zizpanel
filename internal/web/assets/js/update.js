@@ -28,7 +28,7 @@
 //   · 已用时长每秒刷新，下载/重启期间持续轮询状态（面板重启时的失败是预期，保持安静）。
 
 import { api, apiURL } from './api.js';
-import { h, clear, toast, modal } from './ui.js';
+import { h, clear, stickyToast, toast, modal } from './ui.js';
 import { state } from './app.js';
 // 网络失败判据与统一文案（唯一前端真源，见 netfail.js；后端同名判据见 services/netfail.go）。
 import { isNetworkFailureText, networkHintText, networkHintBlock, NET_HINT_MARKER } from './netfail.js';
@@ -1383,7 +1383,7 @@ export function UpdateView(content, ctx = {}) {
       }
     }
     stopPoll();
-    toast('等待面板重启超时：请手动刷新本页查看结果', 'err', 0);
+    stickyToast('等待面板重启超时：请手动刷新本页查看结果', 'err');
     try { render(await api.upgradeStatus()); } catch { /* 面板仍不可达 */ }
   }
 
