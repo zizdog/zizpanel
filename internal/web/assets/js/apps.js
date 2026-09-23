@@ -641,6 +641,9 @@ export function AppsView(content, ctx = {}) {
     const inFlight = preheat;
     if (inFlight) { await inFlight.catch(() => {}); }
     if (!cache) await fetchAll();
+    // 本地插件与目录一起预取：renderGrid 里那块插件是**同步**渲染的，
+    // 不再"先画再补"（那样在慢机器上会看到分区里写着 0 条，过一会儿才变）。
+    await loadPlugins();
     rebuildSvcState();
     renderTabBar();
     renderBody();
@@ -1306,6 +1309,109 @@ export function AppsView(content, ctx = {}) {
     });
   }
 
+  // ---------------- 本地插件（P2） ----------------
+  //
+  // 为什么单独一块：插件是"用户自己放进来的应用"，与面板自带目录的信任级别不同 ——
+  // 默认关闭、要显式启用；坏文件也要列出来并说明原因（"放进去了什么都不发生"最难查）。
+  // 启用/停用会改变市场目录（后端 Catalog 会并进已启用的插件），所以切换后必须重载。
+  let pluginsCache = null; // { dir, items[] } | null（null = 还没拉过）
+  let pluginPlanId = '';   // 正在展开「计划」的那一条
+
+  async function loadPlugins(force) {
+    if (pluginsCache && !force) return pluginsCache;
+    try {
+      // api.request 已经把 {ok,data} 解包成 data 了 —— 别再取 .data（会拿到 undefined，
+      // 现象是"分区在、但永远显示 0 条"）。
+      const r = await api.plugins();
+      pluginsCache = (r && Array.isArray(r.items)) ? r : { dir: '', items: [] };
+    } catch (e) {
+      pluginsCache = { dir: '', items: [], error: String(e.message || e) };
+    }
+    return pluginsCache;
+  }
+
+  function pluginRow(it) {
+    const id = it.id || '';
+    const meta = [];
+    if (it.source_kind) meta.push('来源 ' + it.source_kind);
+    if (it.run_mode) meta.push('运行 ' + it.run_mode);
+    if (it.file) meta.push(it.file);
+    const row = h('div.card', { style: { padding: '10px 12px' } });
+    const head = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } });
+    head.appendChild(h('span', { text: it.icon || '🧩' }));
+    head.appendChild(h('strong', { text: it.name || it.file || '(未命名)' }));
+    head.appendChild(h('span.sub', { text: id ? '(' + id + ')' : '' }));
+    head.appendChild(h('div.spacer', { style: { flex: '1' } }));
+    if (!it.valid) {
+      head.appendChild(h('span.badge.badge-warn', { text: '声明有问题' }));
+    } else if (it.enabled) {
+      head.appendChild(h('span.badge.badge-ok', { text: '已启用' }));
+    } else {
+      head.appendChild(h('span.badge', { text: '未启用' }));
+    }
+    row.appendChild(head);
+    if (meta.length) row.appendChild(h('div.sub', { text: meta.join(' · ') }));
+    if (!it.valid) {
+      row.appendChild(h('div.sub', { style: { color: 'var(--danger, #d9534f)' }, text: it.error || '声明不合法' }));
+    } else if (!it.installable) {
+      row.appendChild(h('div.sub', { text: it.reason || '暂不支持安装' }));
+    }
+    const btns = h('div', { style: { display: 'flex', gap: '6px', marginTop: '8px', flexWrap: 'wrap' } });
+    if (it.valid && it.installable) {
+      btns.appendChild(h('button.btn.btn-sm' + (it.enabled ? '' : '.btn-primary'), {
+        text: it.enabled ? '停用' : '启用',
+        onclick: async () => {
+          try {
+            await api.pluginToggle(id, !it.enabled);
+            toast(it.enabled ? '已停用（已装的东西不会被删）' : '已启用，正在刷新应用目录…', 'ok');
+            pluginsCache = null;
+            await load();
+          } catch (e) { toast(e.message, 'err'); }
+        },
+      }));
+    }
+    if (it.plan) {
+      btns.appendChild(h('button.btn.btn-sm', {
+        text: pluginPlanId === id ? '收起计划' : '看计划',
+        onclick: () => { pluginPlanId = pluginPlanId === id ? '' : id; renderGrid(); },
+      }));
+    }
+    row.appendChild(btns);
+    if (it.plan && pluginPlanId === id) {
+      row.appendChild(h('pre', {
+        text: it.plan,
+        style: { whiteSpace: 'pre-wrap', fontSize: '11.5px', maxHeight: '220px', overflow: 'auto', margin: '8px 0 0' },
+      }));
+    }
+    return row;
+  }
+
+  function renderPluginsBlock(grid) {
+    const info = pluginsCache;
+    if (!info) {
+      // 正常情况下 load() 已经预取过；万一没有（例如从缓存直接画），这里补一次拉取并重画。
+      loadPlugins().then(() => { if (marketGrid) renderGrid(); });
+      return;
+    }
+    const items = info.items || [];
+    appendAll(grid, h('div.section-title', {
+      style: { marginTop: grid.childElementCount ? '20px' : '0' },
+      text: '本地插件（' + items.length + '）',
+    }));
+    if (info.error) {
+      appendAll(grid, h('div.empty', [h('p', { text: '读本地插件失败：' + info.error })]));
+      return;
+    }
+    if (!items.length) {
+      appendAll(grid, h('div.empty', [h('p', {
+        text: '把一份 JSON 放进 ' + (info.dir || '<安装根>/plugins') + ' 就能新增应用；' +
+          '格式见 docs/插件规范.md，或跑 `zizpanel plugin init` 生成模板。',
+      })]));
+      return;
+    }
+    appendAll(grid, h('div.grid.grid-3', items.map(pluginRow)));
+  }
+
   // renderGrid 重画「应用市场」的卡片网格。
   //
   // 数据是 marketApps()：**全部**可安装的原生应用（已安装的与未安装的**同时**
@@ -1387,6 +1493,8 @@ export function AppsView(content, ctx = {}) {
         h('div.grid.grid-3', rest.map((a) => appCard(a))),
       );
     }
+    // 本地插件单列一块（默认关闭、要显式启用；坏文件也列出来说明原因）。
+    renderPluginsBlock(marketGrid);
   }
 
   // residualOf 判断"没装、但磁盘上还留着上次卸载保留下来的产物/数据"。

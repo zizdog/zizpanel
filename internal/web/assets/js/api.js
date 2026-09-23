@@ -310,6 +310,11 @@ export const api = {
   // fresh=true 只在用户点「刷新列表」时传：后端会失效进程内探测缓存、重跑一次
   // brew/docker 复核。平时（含首次自动加载）不传，直接吃后端缓存。
   market: (fresh) => request('GET', `${API_BASE}/market${fresh ? '?fresh=1' : ''}`),
+  // 本地插件（P2）：目录里的声明 + 启用状态。启用后它才出现在市场目录里，
+  // 所以前端在切换后必须重新拉一次 market（见 apps.js 的切插件逻辑）。
+  plugins: () => request('GET', `${API_BASE}/plugins`),
+  pluginToggle: (id, enabled) =>
+    request('POST', `${API_BASE}/plugins/${encodeURIComponent(id)}/toggle`, { enabled: !!enabled }),
   // 批量检查更新：一次问 brew（`brew outdated`）+ 动态索引条目，两个子 Tab 共用结论。
   marketUpdates: (fresh) => request('GET', `${API_BASE}/market/updates${fresh ? '?fresh=1' : ''}`),
   // 更新到最新版：后端按轨分流（brew → `brew upgrade`；动态索引条目 → 复用安装流程）。
