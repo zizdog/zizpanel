@@ -247,6 +247,8 @@ Web 接口在 `internal/web/api_backup.go`，CLI 在 `cmd/zizpanel/backup.go`。
   `子机返回 HTTP 403（凭证不对）` 且**没有摘要** → 非回环 http 与"https 缺指纹"都被 400 拒绝。
 - 门禁：`internal/web -run 'TestPeer|TestAgent|TestValidatePeerURL|TestFetchPeerSummary'`
   6 条（含用 httptest 自签 TLS 服务器验"指纹对能连、指纹错必须拒"）。
+  **未验证**：「多机」页本身只过了 acorn 语法/未声明赋值两项门禁 + 接口级双实例验收，
+  没有真浏览器点过（下一次有余力时补一个 tools/peers-check.mjs）。
 - **未做**：跨机的写操作（重启子机服务等）、子机侧的操作审计与授权范围、离线时的状态语义。
 
 ---
