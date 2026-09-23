@@ -177,6 +177,29 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
 
 ---
 
+## 六点七、整机搬家 / 备份恢复（C2）
+
+换机器的路径本来就是一条：**老机器 `zizpanel backup create` → 新机器装面板 → 备份页上传 → 恢复**。
+引擎在 `internal/backup`（`Plan`/`Create`/`Verify`/`Extract`/`RestoreItem`/`CheckCompatibility`），
+Web 接口在 `internal/web/api_backup.go`，CLI 在 `cmd/zizpanel/backup.go`。本轮做的是**端到端验收**（不改协议）：
+
+- 范围：`panel`（config.json、panel.db 的 `VACUUM INTO` 一致性快照、tls/certs/site-certs/proxy-certs/
+  proxy-auth/acme、filebrowser/compose）、`nginx`（nginx.conf + vhosts/conf.d/includes + phpMyAdmin 配置 +
+  各 PHP 版本的上限片段）、`sites`（网站文件）、`mysql`（库导出）、`apps:<id>`（含密的客户端配置，默认不勾）。
+- 归档带 `manifest.json`：逐文件 size+sha256、表清单、`contains_secrets`；`Verify` 整包校验；
+  `CheckCompatibility` 比表结构（备份比本程序旧 → 恢复后重放迁移）。
+- 恢复**先做快照**（`pre-restore-*.tar.gz`，回滚凭据），再替换数据库、落盘、重建 nginx、重放计划任务；
+  结果按"真正失败（`unapplied`）/ 明确不做（`skipped`，带原因）/ 提示（`warnings`）/ `partial`"如实分类。
+- **本机端到端验收（2026-09-24）**：用真实面板数据打 15 个文件/0.1 MB 的包 → `verify` 逐文件 sha256 一致 →
+  恢复进**全新调试实例**（非 root）→ 任务 `succeeded`、`partial=false`、外键检查通过、14 张表 3125 行、
+  2 个站点（zizdog.cn / mirror.zizdog.com）、1 条计划任务、10 条服务登记；恢复后**用来源机器的面板口令**登录
+  （旧会话被清 126 条，这是对的）。
+- **未覆盖/未验证**（如实）：① 站点文件与数据库内容要另行搬（面板只给清单，恢复不自动覆盖非面板数据）；
+  ② 非 root 调试实例会跳过 nginx 重建与计划任务重放（真机是 root，这条在真机才成立）；
+  ③ 「恢复后站点真的能访问」需要以 root 跑正式面板才验得了，本轮只验到"记录与文件回读到"。
+
+---
+
 ## 七、系统设置（把 macOS 配成服务器）
 
 「系统设置」页把需要终端的事做成开关：合盖不睡、断电自恢复、关 Spotlight 索引、调 TCP 参数、开远程登录等。
