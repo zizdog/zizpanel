@@ -371,3 +371,39 @@ func TestUpgradeBrewAppRestartsRunningService(t *testing.T) {
 		t.Errorf("重启失败必须如实报告并给出出路，实际步骤：\n%s", steps)
 	}
 }
+
+// TestAria2ReadyRemedyNamesMacPrivacyTrap 锁住 2026-09-23 真机那次排查最久的一条：
+// aria2 起来但 RPC 不回，绝大多数时候**不是**"端口被占/配置坏"，而是 macOS 隐私保护
+// 挡住了后台服务访问 ~/Downloads（挂在 open() 上，界面永远"连接中…"）。
+// 旧文案只写前者，我们照着它查了一上午 —— 所以这里把两种文案都钉死。
+func TestAria2ReadyRemedyNamesMacPrivacyTrap(t *testing.T) {
+	home := "/Users/zizdog"
+	got := aria2ReadyRemedy(home+"/Downloads", home)
+	if !strings.Contains(got, "完全磁盘访问权限") {
+		t.Errorf("下载目录被隐私保护时必须给出授权出路，实际：%s", got)
+	}
+	if !strings.Contains(got, "/opt/homebrew/bin/aria2c") {
+		t.Errorf("要写明给哪个二进制授权（否则用户不知道该加谁），实际：%s", got)
+	}
+	if !strings.Contains(got, home+"/Downloads") {
+		t.Errorf("要写清当前下载目录，实际：%s", got)
+	}
+	// 子目录同样算（~/Downloads/aria2 也在保护范围内）
+	if g := aria2ReadyRemedy(home+"/Downloads/sub", home); !strings.Contains(g, "完全磁盘访问权限") {
+		t.Errorf("保护目录的子目录也应给出授权出路，实际：%s", g)
+	}
+	// 非保护目录：给原来的出路（不能把"卡死"当成万能解释）
+	plain := aria2ReadyRemedy(home+"/aria/downloads", home)
+	if strings.Contains(plain, "完全磁盘访问权限") {
+		t.Errorf("不受保护的目录不该提隐私授权，实际：%s", plain)
+	}
+	if !strings.Contains(plain, "重启服务") {
+		t.Errorf("兜底文案要给出下一步，实际：%s", plain)
+	}
+	// 负向对照：别的用户的 /data/Downloads、空值都不许误报
+	for _, bad := range []string{"/data/Downloads", "", ".", "/Users/zizdog/Down"} {
+		if strings.Contains(aria2ReadyRemedy(bad, home), "完全磁盘访问权限") {
+			t.Errorf("%q 不该被判成 macOS 保护目录", bad)
+		}
+	}
+}

@@ -422,9 +422,8 @@ func (m *Manager) waitAria2Ready(ctx context.Context, p Aria2Paths, secret strin
 		LogPath: p.ErrLog,
 		State:   "服务 " + Aria2Label + " 已注册并启动，配置与会话文件已就绪",
 		Missing: "但 RPC 不可用，面板托管的界面（/" + Aria2Slug + "/）连不上它",
-		Remedy: "在「服务管理 → aria2」里点「重启服务」再试；仍然失败看下面的日志尾部" +
-			"（常见原因：6800 被别的程序占用 / 配置文件被手工改坏）",
-		Result: result,
+		Remedy:  aria2ReadyRemedy(p.DownloadDir, m.opt.UserHome),
+		Result:  result,
 	})
 	if err != nil {
 		if lastErr != nil {
@@ -433,6 +432,47 @@ func (m *Manager) waitAria2Ready(ctx context.Context, p Aria2Paths, secret strin
 		return "", err
 	}
 	return ver, nil
+}
+
+// aria2ReadyRemedy 给"服务起来了但 RPC 不可用"配一条**具体**的出路。
+//
+// 为什么要按目录分岔（mini 真机 2026-09-23，用户报"永远连接中…"）：aria2 是后台
+// LaunchDaemon，macOS 隐私保护（文件与文件夹 → 下载/桌面/文稿）会让它访问这些目录时
+// **挂在 open() 上**（不是拒绝、也不报错：连不需要凭据的 GET / 都不回），界面表现就是
+// 一直"连接中…"。查这个坑花了很久，因为旧文案只说"6800 被占用 / 配置被改坏"。
+//
+// 用户 2026-09-23 明确"下载路径就是 ~/Downloads"，所以这里**不改默认值**，
+// 只把"要么授权、要么换目录"两条路写清楚。
+func aria2ReadyRemedy(downloadDir, home string) string {
+	const base = "在「服务管理 → aria2」里点「重启服务」再试"
+	if name := tccProtectedFolderName(downloadDir, home); name != "" {
+		return "先给 /opt/homebrew/bin/aria2c 开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」" +
+			"（后台服务弹不出授权框，不开就是卡死），再点「重启服务」；" +
+			"或者把「📝 编辑配置文件」里的 dir= 换成不受保护的位置（例如 ~/aria2/downloads）" +
+			"—— 下载目录现在是 " + downloadDir + "（macOS 的" + name + "受隐私保护）。"
+	}
+	return base + "；仍然失败看下面的日志尾部" +
+		"（常见原因：6800 被别的程序占用 / 配置文件被手工改坏）"
+}
+
+// tccProtectedFolderName 判断目录是不是落在 macOS 保护的那三个文件夹里
+// （返回中文名，"" 表示不在）。只认家目录下的那一层，避免把 /data/Downloads 也误报。
+func tccProtectedFolderName(dir, home string) string {
+	dir, home = filepath.Clean(strings.TrimSpace(dir)), filepath.Clean(strings.TrimSpace(home))
+	if dir == "" || dir == "." || home == "" || home == "." {
+		return ""
+	}
+	for _, c := range []struct{ dir, label string }{
+		{"Downloads", "下载文件夹"},
+		{"Desktop", "桌面文件夹"},
+		{"Documents", "文稿文件夹"},
+	} {
+		root := filepath.Join(home, c.dir)
+		if dir == root || strings.HasPrefix(dir, root+string(filepath.Separator)) {
+			return c.label
+		}
+	}
+	return ""
 }
 
 // Aria2RPCPortInUse 报告 6800 是否已被别人占着（安装前检查用）。

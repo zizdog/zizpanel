@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +18,28 @@ import (
 //  2026-09-20 事故：root 指向外置盘、nginx 没有 TCC 授权 ⇒ 唯一 worker 卡死。
 //  门禁：不可读 ⇒ 不写 vhost、不 reload、返回明确原因与出路；可读 ⇒ 正常写入。
 // ============================================================================
+
+// stubNginxWorkerOwner 把"nginx 以哪个用户跑"钉成确定的，不再依赖真机上
+// 运行中的 worker 进程或真实 nginx.conf。
+//
+// 为什么需要（2026-09-23 偶发假红）：ensureNginxCanReadDir 在**认不出 worker 身份**
+// 时会直接放行（内建盘 + 身份未知 = 维持旧行为），于是注入的"读不到"根本没被问到，
+// 断言就红了。真机上那次身份探测（ps / 读 nginx.conf）在 `make check` 并行压满时
+// 会失败 —— 判据不该依赖运行环境。
+func stubNginxWorkerOwner(t *testing.T, srv *Server) {
+	t.Helper()
+	me, err := user.Current()
+	if err != nil || me.Username == "" {
+		t.Fatalf("拿不到当前用户名，无法构造 nginx.conf：%v", err)
+	}
+	conf := filepath.Join(t.TempDir(), "nginx.conf")
+	if err := os.WriteFile(conf, []byte("user "+me.Username+" staff;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := srv.Cfg.NginxConf
+	srv.Cfg.NginxConf = conf
+	t.Cleanup(func() { srv.Cfg.NginxConf = prev })
+}
 
 // stubNginxReadPrecheck 注入"worker 读目录"的判据，返回一个可改写的错误开关。
 func stubNginxReadPrecheck(t *testing.T, fail *error) {
@@ -36,6 +59,7 @@ func TestSiteApplyRefusesUnreadableRoot(t *testing.T) {
 
 	readErr := errors.New("ls: /Volumes/X/mirror: Operation not permitted")
 	stubNginxReadPrecheck(t, &readErr)
+	stubNginxWorkerOwner(t, srv)
 	reloads := 0
 	prevReload := siteReloadFn
 	siteReloadFn = func(*Server, context.Context) error { reloads++; return nil }
