@@ -543,3 +543,53 @@ func listDirNames(dir string) []string {
 	}
 	return names
 }
+
+// TestProxyEnableStaysOKWhenUpstreamUnreachable 锁住用户 2026-09-23 的要求：
+// **上游（目标）连不上不能算启用失败，更不能报错** —— 参考 Lucky：目标挂了只反映在
+// 状态（target 不可达）里，规则该启用就启用。
+//
+// 与 TestApplyProxyFailsWhenConfigNotLoaded 是**正反对照**：那条是"nginx 根本没生效"
+// （真失败，必须报错）；这条是"规则已生效、只是 502"，属于上游自己的事。
+func TestProxyEnableStaysOKWhenUpstreamUnreachable(t *testing.T) {
+	srv := newProxyTestServer(t)
+	h := stubProxyHooks(t)
+	rule := testProxyRule(50, 18095, "")
+	logPath := proxyAccessLogPath(srv.proxyLogDir(), rule.ID)
+	// 探针拿到 502 + 该规则自己的访问日志确实长了 = 新配置已生效，只是上游连不上。
+	proxyProbeFn = func(context.Context, string, string, int, string, time.Duration) (string, string, error) {
+		h.Order = append(h.Order, "probe")
+		appendToFile(t, logPath)
+		return "502", "Bad Gateway", nil
+	}
+	if err := srv.reloadProxyAndVerify(context.Background(), rule); err != nil {
+		t.Fatalf("上游连不上不该让启用失败（只该在状态里显示目标不可达），实际：%v", err)
+	}
+	// 端到端也要一样：applyProxy 不能因为上游不可达而返回错误（否则前半段会回滚配置）。
+	if err := srv.applyProxy(context.Background(), rule); err != nil {
+		t.Fatalf("applyProxy 不该因上游不可达而失败，实际：%v", err)
+	}
+}
+
+// TestProxyEnableStaysOKWhenUpstreamHangs 锁住 2026-09-23 那条真机对照：
+// 上游**连得上但不响应**（探针超时 "000"）时，规则仍然算"已生效、可启用"，
+// 只把"目标不健康"留在状态里。
+//
+// 真机证据（用户在同一天给的对照）：pve 那条（上游立刻拒连 → 502）能启用；
+// ariaserver 那条（上游半开、不回数据 → i/o timeout）启不了 —— 差别只在这里。
+// ⚠️ 负向对照仍然有效：日志没增长（nginx 根本没加载这条规则）→ 必须报错，
+// 见 TestApplyProxyFailsWhenConfigNotLoaded；80 端口落到默认站点占位页 → 必须报错，
+// 见 TestReloadProxyAndVerifyRejectsDefaultSitePage。
+func TestProxyEnableStaysOKWhenUpstreamHangs(t *testing.T) {
+	srv := newProxyTestServer(t)
+	h := stubProxyHooks(t)
+	rule := testProxyRule(51, 18096, "")
+	logPath := proxyAccessLogPath(srv.proxyLogDir(), rule.ID)
+	proxyProbeFn = func(context.Context, string, string, int, string, time.Duration) (string, string, error) {
+		h.Order = append(h.Order, "probe")
+		appendToFile(t, logPath) // nginx 确实按这条规则处理了请求（日志长了）
+		return "000", "", fmt.Errorf("Get \"http://127.0.0.1:18096/\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
+	}
+	if err := srv.reloadProxyAndVerify(context.Background(), rule); err != nil {
+		t.Fatalf("上游半开（连得上但不响应）不该让启用失败：%v", err)
+	}
+}

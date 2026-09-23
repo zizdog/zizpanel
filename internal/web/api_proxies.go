@@ -2396,13 +2396,16 @@ var (
 // 发信号，新 server 块生效有短延迟；日志又是 worker 在响应之后写的，读大小前要留落盘时间。
 // 与站点侧同一口径：间隔 200ms、总窗口 6 秒，两者都可注入（单测不许真睡 6 秒）。
 var (
-	proxyVerifyWait  = 6 * time.Second
-	proxyVerifyEvery = 200 * time.Millisecond
-	proxyLogSettle   = 150 * time.Millisecond
+	// 窗口刻意压短（2026-09-23 用户报障："点启用后过很久，提示无法连接面板服务"）：
+	// 复核要等 reload 生效，而这段时间用户在页面上是干等的；2 秒足够覆盖绝大多数情况，
+	// 真没生效就立刻如实报错，而不是让用户等到手机浏览器先超时。
+	proxyVerifyWait  = 2 * time.Second
+	proxyVerifyEvery = 150 * time.Millisecond
+	proxyLogSettle   = 120 * time.Millisecond
 )
 
 // proxyProbeTimeout 是单次请求级探测的超时。不能太长：面板要在这个请求里等复核。
-const proxyProbeTimeout = 4 * time.Second
+const proxyProbeTimeout = 2 * time.Second
 
 // proxyProbe 是一次请求级复核拿到的原始结果。
 type proxyProbe struct {
@@ -2512,6 +2515,24 @@ func (s *Server) probeProxyOnce(ctx context.Context, rule *proxies.Rule, host st
 	return proxyProbe{code: code, body: body, err: err}
 }
 
+// proxyProbeTimedOut 报告"探针连得上 nginx、但一直没等到响应"（上游半开/不响应）。
+//
+// 这种形态**不能**判成"配置没生效"：pve 那条规则（上游立刻拒连 → 502）能启用，
+// aria2 那条（上游被别的进程半开占着、连上但不回数据 → 探针超时）却启不了 ——
+// 差别只在这里。规则是否生效的判据必须是"该规则自己的访问日志有没有增长"。
+func proxyProbeTimedOut(p proxyProbe) bool {
+	code := strings.TrimSpace(p.code)
+	if code != "" && code != "000" {
+		return false
+	}
+	if p.err == nil {
+		return false
+	}
+	msg := strings.ToLower(p.err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "i/o timeout")
+}
+
 // proxyProbeServed 判断一次探测的**响应**是否像"被 nginx 处理了"。判据刻意不是"2xx 就算通"：
 // 必须真拿到 HTTP 响应（"000" = 连不上/被断开/超时 → 没生效）；80 端口上响应体是默认站点占位页
 // → 规则没被加载（只在 80 判）；nginx 自己的 502/504 也算"已加载"。
@@ -2597,7 +2618,12 @@ func (s *Server) waitProxyServed(ctx context.Context, rule *proxies.Rule) proxyS
 			}
 		}
 		chk.LogGrew = proxyLogSize(logPath) > before
-		chk.Served = chk.LogGrew && proxyProbeServed(chk.Probe, rule.Listen)
+		// 判据（2026-09-23 用户报障后收紧口径）：**这条规则有没有被 nginx 用上**，
+		// 看的是它自己的访问日志有没有增长；响应码只用来挡"落到默认站点占位页"。
+		// 上游"连不上/不响应"（502/504、或探针直接超时 "000"）都只说明**目标不健康**，
+		// 不算配置没生效 —— 用户明确要求："连不上也不能报错"（参考 Lucky）。
+		// 反例仍然抓住：日志没增长（nginx 根本没这条规则）或 80 端口落到默认站点占位页。
+		chk.Served = chk.LogGrew && (proxyProbeServed(chk.Probe, rule.Listen) || proxyProbeTimedOut(chk.Probe))
 		if chk.Served {
 			return chk
 		}
@@ -2922,7 +2948,10 @@ func (s *Server) applyProxy(ctx context.Context, rule *proxies.Rule) error {
 					fmt.Errorf("缓存区声明已更新，但 nginx 配置校验未通过：%w", terr)))
 		}
 	}
-	// **写盘之后、reload 之前**把日志树交还真实用户，并在 reload 后做请求级复核。
+	// 生效收尾（chown → reload → 请求级复核）**在请求内完成**：配置没生效属于真失败，
+	// 必须让用户看到（门禁也锁着"不许只记日志"）。等待窗口刻意压到 2 秒级 ——
+	// 目标是**上游**连不上不算失败（那只是状态栏里的 target 不可达，用户 2026-09-23
+	// 明确要求"连不上也不能报错"），但重载/生效这类真问题仍如实返回错误。
 	if err := s.reloadProxyAndVerify(ctx, rule); err != nil {
 		return s.rollbackVhostWrite(ctx, snap, proxyWriteVhostFn, proxyReloadFn,
 			s.restoreCacheConf(zoneSnap, err))
