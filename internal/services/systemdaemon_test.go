@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zizdog/zizpanel/internal/plugins"
 )
 
 // 假 launchctl：单测绝不允许调真实的 /bin/launchctl（那会动到开发机上的服务）。
@@ -397,5 +399,83 @@ func TestSyncServiceRecordsAlignsStaleLabel(t *testing.T) {
 	}
 	if otherGot.LaunchLabel != "sh.brew.ollama" || otherGot.PlistPath != "/tmp/sh.brew.ollama.plist" {
 		t.Errorf("不该改别的服务：label=%q plist=%q", otherGot.LaunchLabel, otherGot.PlistPath)
+	}
+}
+
+// TestNoDaemonAppsGetNoServiceRecord 锁住"没有常驻进程的应用不建服务记录"这条判断。
+//
+// 为什么值得一条门禁：过去 Install() 对 KindNative+brew 的应用**无条件**写服务记录，
+// 于是一个命令行工具（ffmpeg / python@x.y / vips）装完，服务列表里会多一条永远 unknown
+// 的假卡片 —— 正是 catalog.go 的 NoDaemon 注释说要避免的那一类"假状态"。
+func TestNoDaemonAppsGetNoServiceRecord(t *testing.T) {
+	// 目录里明确"没有常驻进程"的：命令行工具 / 解释器 / 网页入口 / 插件表 run.mode=none
+	for _, id := range []string{"ffmpeg", "python310", "python311", "python312", "python313", "phpmyadmin"} {
+		app, ok := FindApp(id)
+		if !ok {
+			t.Fatalf("目录里找不到 %s", id)
+		}
+		if !app.NoDaemon {
+			t.Errorf("「%s」应当标着 NoDaemon（没有常驻进程）", id)
+			continue
+		}
+		if shouldRegisterServiceRecord(app) {
+			t.Errorf("「%s」是 NoDaemon，不该写服务记录（会变成永远 unknown 的假卡片）", id)
+		}
+	}
+	// 反向对照：常驻服务必须照旧写记录
+	for _, id := range []string{"nginx", "ollama", "redis", "code-server"} {
+		app, ok := FindApp(id)
+		if !ok {
+			t.Fatalf("目录里找不到 %s", id)
+		}
+		if !shouldRegisterServiceRecord(app) {
+			t.Errorf("「%s」是常驻服务，必须写服务记录", id)
+		}
+	}
+}
+
+// TestTableNoneModeBecomesNoDaemon 插件表里 run.mode=none 的条目必须映射成 NoDaemon
+// ——否则"用表加一个命令行工具"就会凭空多出一条假服务记录。
+func TestTableNoneModeBecomesNoDaemon(t *testing.T) {
+	spec, err := plugins.Parse([]byte(`{
+	  "schema": "zizpanel.app/v1", "id": "clitool", "name": "命令行工具", "icon": "🔧",
+	  "source": {"kind": "brew", "formula": "clitool", "checksum": "sha256"},
+	  "run": {"mode": "none"},
+	  "verify": {"any_of": [{"kind": "process", "label": "homebrew.mxcl.clitool", "timeout": "30s"}]},
+	  "health": {"kind": "process", "label": "homebrew.mxcl.clitool"},
+	  "uninstall": {"formula": "clitool"}
+	}`), "clitool.json")
+	if err != nil {
+		t.Fatalf("声明应当合法：%v", err)
+	}
+	app, err := SpecToApp(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !app.NoDaemon {
+		t.Error("run.mode=none 的条目必须映射成 NoDaemon")
+	}
+	if shouldRegisterServiceRecord(app) {
+		t.Error("run.mode=none 的条目不该写服务记录")
+	}
+	// 反向对照：brew-service 的条目不是 NoDaemon
+	svcSpec, err := plugins.Parse([]byte(`{
+	  "schema": "zizpanel.app/v1", "id": "svcapp", "name": "服务", "icon": "🧩",
+	  "source": {"kind": "brew", "formula": "svcapp", "checksum": "sha256"},
+	  "run": {"mode": "brew-service"},
+	  "expose": {"port": 19998, "bind": "0.0.0.0"},
+	  "verify": {"any_of": [{"kind": "port", "port": 19998, "timeout": "30s"}]},
+	  "health": {"kind": "port", "port": 19998},
+	  "uninstall": {"optional_data": ["{brew}/var/svcapp"], "formula": "svcapp"}
+	}`), "svcapp.json")
+	if err != nil {
+		t.Fatalf("声明应当合法：%v", err)
+	}
+	svcApp, err := SpecToApp(svcSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svcApp.NoDaemon || !shouldRegisterServiceRecord(svcApp) {
+		t.Errorf("brew-service 的条目应当是常驻服务：NoDaemon=%v", svcApp.NoDaemon)
 	}
 }

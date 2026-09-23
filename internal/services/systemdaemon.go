@@ -81,6 +81,13 @@ var systemDaemonEnsureFn = func(m *Manager, ctx context.Context, app App, res *I
 	return m.ensureSystemDaemon(ctx, app, res)
 }
 
+// shouldRegisterServiceRecord 报告这次安装要不要写一条**服务记录**。
+//
+// NoDaemon 的应用（ffmpeg / python@x.y / phpMyAdmin / 插件表里 run.mode=none 的条目）
+// 根本没有常驻进程：给它们建记录只会得到一条永远 unknown 的假卡片，而「已安装」
+// 本来就有更贴运行体的判据（DetectRuntimeBody / brew 证据）。
+func shouldRegisterServiceRecord(app App) bool { return !app.NoDaemon }
+
 // systemDaemonNeeded 报告这个应用是否必须装成系统级 LaunchDaemon。
 func systemDaemonNeeded(app App) bool {
 	return app.SystemDaemon && !app.NoDaemon && strings.TrimSpace(app.BrewFormula) != ""

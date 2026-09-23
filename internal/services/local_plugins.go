@@ -123,6 +123,11 @@ func SpecToApp(spec *plugins.Spec) (App, error) {
 	if spec.Requires != nil && spec.Requires.SystemDaemon {
 		app.SystemDaemon = true
 	}
+	if spec.Run.Mode == "none" {
+		// 纯网页入口 / 命令行工具：没有常驻进程。不标这一条，安装器会给它建一条
+		// 永远 unknown 的服务记录（"假记录"，见 catalog.go 的 NoDaemon 注释）。
+		app.NoDaemon = true
+	}
 	if spec.Run.Mode == "brew-service" && spec.Requires == nil {
 		// brew 服务默认要服务化成系统级守护进程（无头机器重启后要能自己起来），
 		// 与目录里其它 brew 条目的取舍一致；requires 显式写了就听 requires 的。

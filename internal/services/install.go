@@ -152,6 +152,18 @@ func (m *Manager) Install(ctx context.Context, appID string) (*InstallResult, er
 		return nil, fmt.Errorf("「%s」暂不支持自动安装。%s", app.Name, app.ManualHint)
 	}
 
+	// 没有常驻进程的应用（ffmpeg / python@x.y / phpMyAdmin 这类 NoDaemon）**不建服务记录**：
+	// 建了就是"永远没有状态的假记录"—— catalog.go 里写着这条取舍，而这里过去真的会建
+	// （用户点「安装」装一个命令行工具，服务列表里就多一条永远 unknown 的记录）。
+	// 它们的「已安装」由**运行体/brew 证据**判定（见 api_services.go 的 DetectRuntimeBody）。
+	if !shouldRegisterServiceRecord(app) {
+		res.Message = fmt.Sprintf("「%s」已安装（它没有常驻进程，面板不建服务记录）", app.Name)
+		if app.PostInstallHint != "" {
+			res.Message += "。" + app.PostInstallHint
+		}
+		return res, nil
+	}
+
 	// 写入注册表（managed=true 表示面板负责其生命周期）
 	port := app.Port
 	health := ""
