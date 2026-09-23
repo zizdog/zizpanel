@@ -1,0 +1,57 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "alist",
+  "name": "Alist（文件列表）",
+  "icon": "📂",
+  "summary": "聚合网盘与本地文件，挂到一个网页里浏览",
+  "notes": [
+    "上游只有 md5 清单、没有 sha256：这条轨只做架构复核 + md5 互证，不假装校验过 sha256。",
+    "首次打开后用面板给的初始口令登录（安装结果里有），登录后请自行改掉。"
+  ],
+  "source": {
+    "kind": "release",
+    "repo": "AlistGo/alist",
+    "tag": "v3.64.0",
+    "asset": "alist-darwin-arm64.tar.gz",
+    "binary": "alist",
+    "targz": true,
+    "pick_one": true,
+    "checksum": "md5"
+  },
+  "run": {
+    "mode": "app-daemon",
+    "bin": "~/alist/alist",
+    "args": ["server", "--data", "~/alist/data"]
+  },
+  "config": {
+    "path": "~/alist/data/config.json",
+    "mode": "0600",
+    "own": "user"
+  },
+  "expose": {
+    "port": 5244,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      { "kind": "http", "path": "/", "expect": "", "timeout": "60s" },
+      { "kind": "process", "label": "com.zizdog.alist" }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "artifacts": ["~/alist"],
+    "keep": []
+  },
+  "update": { "kind": "release-index" },
+  "requires": {
+    "system_daemon": true,
+    "ports": [5244]
+  }
+}

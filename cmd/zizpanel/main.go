@@ -97,6 +97,10 @@ func main() {
 		// 与面板同一代码要求，所以继承面板的 TCC 授权（`dir=~/Downloads` 才写得进去，
 		// 见 cmd/zizpanel/aria2.go 与 internal/services/aria2.go 的 Aria2SuperviseArgs）。
 		err = cmdAria2Supervise(rest)
+	case "plugin":
+		// 应用插件声明（zizpanel.app/v1）的校验与干跑：`plugin validate|plan <file.json>`。
+		// 只读文件、不碰机器 —— 这是"把能力抽成一张表"的第一步（见 docs/插件规范.md）。
+		err = cmdPlugin(rest)
 	case "zizvideo-supervise":
 		// zizvideo（短视频）的常驻 supervisor：由**系统级** LaunchDaemon
 		// cn.zizpanel.zizvideo 以 root 拉起，fork 后 setuid 到真实用户运行
@@ -170,6 +174,8 @@ func usage() {
   zizpanel speech-serve            启动语音合成网页界面（由 launchd 托管，默认 127.0.0.1:8891；引擎为系统自带 say）
   zizpanel stt-serve               启动语音转文字网页界面（由 launchd 托管，默认 127.0.0.1:8892；引擎为 whisper.cpp + ffmpeg）
   zizpanel aria2-supervise         拉起并保活 aria2（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
+  zizpanel plugin validate <file…> 校验应用插件声明（zizpanel.app/v1）
+  zizpanel plugin plan <file>      干跑：打印"装这台机器会做什么"（不碰机器）
   zizpanel zizvideo-supervise      拉起并保活 zizvideo（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel version                 显示版本
 

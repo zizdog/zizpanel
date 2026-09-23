@@ -737,8 +737,12 @@ func TestFileExtractAndCompressGoThroughTaskCenter(t *testing.T) {
 		t.Errorf("没有选中任何项时应 400，实际 %d（%v）", res.StatusCode, out)
 	}
 
-	// 解压（归档先造出来，测试里直接用 unzip 生成，避免依赖任务完成时序）
-	zipPath := filepath.Join(dir, "pack.zip")
+	// 解压（归档先造出来，测试里直接用 unzip 生成，避免依赖任务完成时序）。
+	//
+	// ⚠️ 文件名必须与上面那条异步打包任务的目标（pack.zip）**不同**：它在后台跑，
+	// 若与这里手写的文件同名，任务完成时的写入/清理会把文件删掉，解压就变成
+	// "文件不存在: …/pack.zip"（偶发假红，2026-09-23 之前挂过三次）。
+	zipPath := filepath.Join(dir, "hand.zip")
 	if err := makeTestZip(t, zipPath, map[string]string{"b.txt": "world"}); err != nil {
 		t.Fatal(err)
 	}

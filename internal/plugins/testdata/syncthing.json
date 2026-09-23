@@ -1,0 +1,58 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "syncthing",
+  "name": "Syncthing（文件同步）",
+  "icon": "🔄",
+  "summary": "去中心化文件同步（不经过云盘）",
+  "notes": [
+    "面板安装时会同时做两件事：把 GUI 监听到 0.0.0.0:8384、并设置随机登录口令 —— 只做前者等于把同步界面裸奔在局域网。",
+    "局域网内同步需要 macOS 的「本地网络」权限（系统设置 → 隐私与安全性 → 本地网络）。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "syncthing",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service",
+    "hooks": ["syncthing-gui-lan"]
+  },
+  "config": {
+    "path": "~/Library/Application Support/Syncthing/config.xml",
+    "mode": "0600",
+    "own": "user",
+    "secrets": ["gui-user", "gui-password"]
+  },
+  "expose": {
+    "port": 8384,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      { "kind": "http", "path": "/rest/noauth/health", "expect": "ok", "timeout": "60s" }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/rest/noauth/health",
+    "expect": "ok",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "artifacts": [
+      "/opt/homebrew/bin/syncthing",
+      "/Library/LaunchDaemons/homebrew.mxcl.syncthing.plist",
+      "/opt/homebrew/var/log/syncthing.log"
+    ],
+    "keep": ["~/Library/Application Support/Syncthing"],
+    "formula": "syncthing"
+  },
+  "update": { "kind": "brew" },
+  "requires": {
+    "local_network": true,
+    "system_daemon": true,
+    "ports": [8384]
+  }
+}
