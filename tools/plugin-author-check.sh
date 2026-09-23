@@ -93,6 +93,39 @@ assert c.get('health_path')=='/healthz', c.get('health_path')
 print('  卡片：', c.get('name'), c.get('port'), c.get('health_path'))
 PY
 
+say "⑤b 负向对照：端口撞自带应用（3000 = Gitea）必须被拒，且不能出现在市场里"
+python3 - "$WORK/authorapp.json" "$PLUGDIR/clashapp.json" <<'PYEOF'
+import json,sys
+d=json.load(open(sys.argv[1]))
+d['id']='clashapp'; d['name']='撞端口的应用'; d['summary']='用于负向对照（不该被允许启用）'
+d['expose']['port']=3000; d['requires']={'system_daemon':True,'ports':[3000]}
+json.dump(d,open(sys.argv[2],'w'),ensure_ascii=False,indent=2)
+print('  已写入 clashapp.json（port=3000，与 Gitea 撞）')
+PYEOF
+curl -s -b "$JAR" "$ENTRY/api/v1/plugins" -o "$WORK/plugins2.json"
+python3 - "$WORK/plugins2.json" <<'PYEOF' && ok "列表里如实标出不可安装并说清撞的是谁" || bad "撞端口的条目没被拒 / 理由不完整"
+import json,sys
+d=(json.load(open(sys.argv[1])).get('data') or {})
+it=[x for x in (d.get('items') or []) if x.get('id')=='clashapp']
+assert it, d
+assert not it[0].get('installable'), it[0]
+err=it[0].get('error') or ''
+assert '3000' in err and '自带' in err, err
+print('  理由：', err[:80])
+PYEOF
+curl -s -b "$JAR" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+  -d '{"enabled":true}' "$ENTRY/api/v1/plugins/clashapp/toggle" -o "$WORK/toggle2.json"
+grep -q '"ok":false' "$WORK/toggle2.json" && ok "强行启用被拒（400）" || bad "撞端口竟然能启用：$(cat "$WORK/toggle2.json")"
+curl -s -b "$JAR" "$ENTRY/api/v1/market?fresh=1" -o "$WORK/market2.json"
+python3 - "$WORK/market2.json" <<'PYEOF' && ok "被拒的插件没有溜进市场" || bad "被拒的插件出现在了市场里"
+import json,sys
+d=(json.load(open(sys.argv[1])).get('data') or {})
+items = d.get('list') if isinstance(d,dict) else d
+items = items or []
+assert not [x for x in items if x.get('id')=='clashapp'], '被拒的插件不该出现在市场'
+PYEOF
+rm -f "$PLUGDIR/clashapp.json"
+
 say "⑥ 收尾：停用并移出（不留残留）"
 curl -s -b "$JAR" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
   -d '{"enabled":false}' "$ENTRY/api/v1/plugins/authorapp/toggle" -o /dev/null
