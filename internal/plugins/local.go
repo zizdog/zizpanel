@@ -52,7 +52,8 @@ func LoadDir(dir string) []LocalPlugin {
 	var out []LocalPlugin
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".json") || name == EnabledFile {
+		// 点开头的（.remote.json 之类）是面板自己的记录，不是插件声明。
+		if e.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") || name == EnabledFile {
 			continue
 		}
 		full := filepath.Join(dir, name)
