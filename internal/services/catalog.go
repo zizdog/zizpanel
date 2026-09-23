@@ -95,6 +95,12 @@ type App struct {
 	// 复用既有的 /api/v1/files/read 与 /api/v1/files/write（不新写一套文件读写）。
 	// 绝对路径由 services.ConfigFilePath 解析（原生装在用户家目录、compose 装在 work/compose）。
 	ConfigPath string `json:"config_path,omitempty"`
+	// ConfigMode 是"面板维护的这个配置文件"的权限（如 "0600"）。空 = 按 0600。
+	//
+	// 为什么要它：配置文件里可能有随机口令（code-server 的访问密码就写在 config.yaml 里），
+	// 面板**新建**它时必须用声明的权限，而不是写死 0644 —— 那是把口令摊给同机所有用户看。
+	// 文件已存在时不动它的权限（那是用户的文件，面板只改内容）。
+	ConfigMode string `json:"config_mode,omitempty"`
 
 	// Native 安装：brew 包名
 	BrewFormula string `json:"brew_formula"`

@@ -209,12 +209,13 @@ func TestBuiltinTableOnlyAppsReachCatalog(t *testing.T) {
 		port    int
 		health  string
 	}{
-		"redis":      {"redis", 6379, ""},
-		"mosquitto":  {"mosquitto", 1883, ""},
-		"memcached":  {"memcached", 11211, ""},
-		"prometheus": {"prometheus", 9090, "/-/healthy"},
-		"netdata":    {"netdata", 19999, "/api/v1/info"},
-		"grafana":    {"grafana", 3002, "/api/health"},
+		"redis":       {"redis", 6379, ""},
+		"mosquitto":   {"mosquitto", 1883, ""},
+		"memcached":   {"memcached", 11211, ""},
+		"prometheus":  {"prometheus", 9090, "/-/healthy"},
+		"netdata":     {"netdata", 19999, "/api/v1/info"},
+		"grafana":     {"grafana", 3002, "/api/health"},
+		"code-server": {"code-server", 8092, "/healthz"},
 	}
 	for id, w := range want {
 		app, ok := FindApp(id)

@@ -133,6 +133,7 @@ func SpecToApp(spec *plugins.Spec) (App, error) {
 	}
 	if spec.Config != nil {
 		app.ConfigPath = spec.Config.Path
+		app.ConfigMode = spec.Config.Mode
 		// 深拷贝：插件声明可能在别处被复用/改动，App 不能拿着共享的 map/slice。
 		for _, p := range spec.Config.PatchList() {
 			set := make(map[string]string, len(p.Set))

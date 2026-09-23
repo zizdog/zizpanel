@@ -1,0 +1,77 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "code-server",
+  "name": "code-server（浏览器里的 VS Code）",
+  "icon": "🧑‍💻",
+  "summary": "在浏览器里写代码：把 VS Code 搬到服务器上",
+  "notes": [
+    "面板安装时会写它的配置：监听 0.0.0.0:8092、开密码登录、口令随机生成且只在安装结果里显示一次（配置文件 0600）。",
+    "不写这份配置的话，brew 的默认是只监听 127.0.0.1:8080 —— 局域网里打不开（官方 caveats 自己写着这一点）。",
+    "它是**完整终端**：能在这台机器上跑任意命令。口令泄漏等于机器沦陷，暴露到公网前务必先确认口令强度与访问范围。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "code-server",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "~/.config/code-server/config.yaml",
+    "format": "yaml",
+    "if_missing": "create",
+    "mode": "0600",
+    "own": "user",
+    "set": {
+      "bind-addr": "0.0.0.0:8092",
+      "auth": "password",
+      "cert": "false"
+    },
+    "secrets": [
+      "password"
+    ]
+  },
+  "expose": {
+    "port": 8092,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "http",
+        "path": "/healthz",
+        "expect": "alive",
+        "timeout": "90s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/healthz",
+    "expect": "alive",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.code-server.plist"
+    ],
+    "optional_data": [
+      "~/.local/share/code-server",
+      "~/.config/code-server"
+    ],
+    "formula": "code-server",
+    "keep_note": "默认保留扩展、工作区数据与配置（~/.local/share/code-server、~/.config/code-server）；勾选「删除数据」才会删 —— 里面的配置含访问口令。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      8092
+    ]
+  }
+}

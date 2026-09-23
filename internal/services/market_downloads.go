@@ -1277,6 +1277,18 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 	{
+		ID: "code-server", Kind: KindNative, BrewFormula: "code-server",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.code-server",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-24 实测：run = code-server；caveats 明确写默认只监听 127.0.0.1:8080）",
+			CatalogGap:  "同 redis：label 由 brew 决定，安装器运行期读取后登记",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("code-server", 25*time.Minute,
+				"brew install code-server（面板安装时会写 ~/.config/code-server/config.yaml：监听 0.0.0.0:8092、随机口令，见声明的 config.set/secrets）"),
+		},
+	},
+	{
 		ID: "grafana", Kind: KindNative, BrewFormula: "grafana",
 		Runtime: MarketRuntime{
 			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.grafana",

@@ -486,9 +486,6 @@ func PlanText(s *Spec) string {
 		}
 		fmt.Fprintf(&b, "  2. 配置：%s（权限 %s，归属 %s，模板：%s）\n",
 			s.Config.Path, orDefault(s.Config.Mode, "0600"), orDefault(s.Config.Own, "user"), seed)
-		if len(s.Config.Secrets) > 0 {
-			fmt.Fprintf(&b, "     随机密钥（只展示一次）：%s\n", strings.Join(s.Config.Secrets, ", "))
-		}
 	}
 
 	// ③ 运行方式（这一条是重点）
@@ -571,7 +568,7 @@ func PlanText(s *Spec) string {
 		fmt.Fprintf(&b, "     说明：%s\n", s.Uninstall.KeepNote)
 	}
 	if s.Update != nil {
-		fmt.Fprintf(&b, "  9. 更新检测：%s\n", s.Update.Kind)
+		fmt.Fprintf(&b, "  10. 更新检测：%s\n", s.Update.Kind)
 	}
 	if s.Requires != nil {
 		var need []string

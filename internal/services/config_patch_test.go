@@ -324,3 +324,65 @@ func TestConfigPatchMultiplePatches(t *testing.T) {
 		t.Errorf("第二次跑不该再报凭据：%+v", res2.Credentials)
 	}
 }
+
+// TestConfigPatchHonorsDeclaredFileMode 新建配置文件必须用**声明的权限**。
+//
+// 为什么值得一条门禁：code-server 的 config.yaml 里有随机访问口令，面板新建它时若写成
+// 0644，等于把口令摊给这台机器上所有用户看。声明 0600 就必须真是 0600。
+func TestConfigPatchHonorsDeclaredFileMode(t *testing.T) {
+	dir := t.TempDir()
+	brew := filepath.Join(dir, "brew")
+	if err := os.MkdirAll(filepath.Join(brew, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{opt: Options{BrewBin: filepath.Join(brew, "bin", "brew")}}
+	path := filepath.Join(brew, "etc", "secret.conf")
+
+	// ① 默认（没声明 mode）：按 0600 建（宁可用户改宽，也别面板替他把口令公开）
+	app := App{
+		ID: "sec1", Kind: KindNative, ConfigPath: "{brew}/etc/secret.conf",
+		ConfigPatches: []plugins.Patch{{
+			IfMissing: "create", Set: map[string]string{"token": "t"},
+		}},
+	}
+	m.applyConfigPatchStep(context.Background(), app, &InstallResult{App: app.ID})
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("默认应当是 0600，实际 %04o", got)
+	}
+
+	// ② 声明的 mode 被真的用上（0644 的配置文件：grafana.ini 那种不含口令的）
+	path2 := filepath.Join(brew, "etc", "plain.conf")
+	app2 := App{
+		ID: "sec2", Kind: KindNative, ConfigPath: "{brew}/etc/plain.conf", ConfigMode: "0644",
+		ConfigPatches: []plugins.Patch{{
+			IfMissing: "create", Set: map[string]string{"port": "1"},
+		}},
+	}
+	m.applyConfigPatchStep(context.Background(), app2, &InstallResult{App: app2.ID})
+	fi2, err := os.Stat(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi2.Mode().Perm(); got != 0o644 {
+		t.Errorf("声明 0644 时应当是 0644，实际 %04o", got)
+	}
+
+	// ③ 已存在的文件：面板只改内容，**不动它的权限**（那是用户的文件）
+	path3 := filepath.Join(brew, "etc", "mine.conf")
+	if err := os.WriteFile(path3, []byte("port = 1\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	app3 := App{
+		ID: "sec3", Kind: KindNative, ConfigPath: "{brew}/etc/mine.conf", ConfigMode: "0600",
+		ConfigPatches: []plugins.Patch{{Set: map[string]string{"port": "2"}}},
+	}
+	m.applyConfigPatchStep(context.Background(), app3, &InstallResult{App: app3.ID})
+	fi3, _ := os.Stat(path3)
+	if got := fi3.Mode().Perm(); got != 0o640 {
+		t.Errorf("已存在文件的权限不该被改，实际 %04o", got)
+	}
+}

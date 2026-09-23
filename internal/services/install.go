@@ -2494,7 +2494,17 @@ func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *Instal
 		res.step(ctx, "配置补丁：已经是目标值，无需修改（"+path+"）")
 		return
 	}
-	mode := os.FileMode(0o644)
+	// 新建时用声明的权限（默认 0600：配置文件里可能有随机口令）；
+	// 已存在时保持它自己的权限 —— 那是用户的文件，面板只改内容。
+	mode := os.FileMode(0o600)
+	if m := strings.TrimSpace(app.ConfigMode); m != "" {
+		if parsed, perr := strconv.ParseUint(m, 8, 32); perr == nil {
+			mode = os.FileMode(parsed)
+		} else {
+			res.Warning = appendWarning(res.Warning,
+				"config.mode "+m+" 不是合法的八进制权限，已按 0600 处理")
+		}
+	}
 	if fileExists {
 		if fi, statErr := os.Stat(path); statErr == nil {
 			mode = fi.Mode().Perm()
