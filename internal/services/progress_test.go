@@ -183,6 +183,28 @@ func TestStreamCmdReturnsOutputAndError(t *testing.T) {
 	}
 }
 
+// TestStreamCmdKeepsTailOnHugeOutput 输出很大时，保留的必须是**尾部**（报错在那儿）。
+//
+// 这条门禁是确定性的：旧实现（超过 256KB 就停止收集）会留下开头、丢掉尾部，
+// 于是"失败原因"永远到不了调用方 —— 实测 2MB 输出时尾部标记完全不在结果里。
+// 现在超限时丢前一半、留最近一半，所以尾部标记必须在。
+func TestStreamCmdKeepsTailOnHugeOutput(t *testing.T) {
+	// 2MB 填充行 + 最后一行才是关键线索（真实的安装失败就是这样：一屏进度 + 最后一句报错）
+	script := "yes 填充行填充行填充行 | head -c 2000000; echo 尾部线索; exit 4"
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", script)
+	out, err := streamCmd(context.Background(), cmd)
+	if err == nil {
+		t.Fatal("退出码非 0 应返回 error")
+	}
+	if !strings.Contains(out, "尾部线索") {
+		t.Fatalf("保留的应当是尾部（失败原因），实际拿到 %d 字节且没有尾部线索", len(out))
+	}
+	// 也不该把缓冲区无限撑大（上限的 2 倍以内）
+	if len(out) > 2*maxCollectedOutput {
+		t.Errorf("累计输出应当被限制在 %d 附近，实际 %d 字节", maxCollectedOutput, len(out))
+	}
+}
+
 // TestStreamCmdCancelKillsProcess：中断必须真的杀掉子进程，
 // 否则"中断"只是前端上的一个按钮。
 func TestStreamCmdCancelKillsProcess(t *testing.T) {

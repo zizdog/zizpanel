@@ -102,10 +102,19 @@ func streamCmd(ctx context.Context, cmd *exec.Cmd) (string, error) {
 	collect := func(text string) {
 		mu.Lock()
 		defer mu.Unlock()
-		// 只留尾部：错误信息只需要最后一段，而一次性输出可能很大。
-		if buf.Len() < maxCollectedOutput {
-			buf.WriteString(text)
-			buf.WriteByte('\n')
+		buf.WriteString(text)
+		buf.WriteByte('\n')
+		// 只留**尾部**：错误信息要的是最后一段（失败原因几乎总在最后）。
+		//
+		// 旧实现是"超过上限就整段不再收集"，留下的是**头部**、丢掉的正是尾部 ——
+		// 与这里的意图正好相反。客户端因此拿到 256KB 的开头（一堆进度日志）却看不到
+		// 最后那句报错（2026-09-24 实测：2MB 输出时"尾部线索"完全不在结果里）。
+		// 现在超限时丢掉前一半、保留最近的一半，摊还成本很低。
+		if buf.Len() > maxCollectedOutput {
+			b := buf.Bytes()
+			keep := append([]byte(nil), b[len(b)-maxCollectedOutput/2:]...)
+			buf.Reset()
+			buf.Write(keep)
 		}
 	}
 	scan := func(r io.Reader, level string) {
@@ -140,17 +149,27 @@ func streamCmd(ctx context.Context, cmd *exec.Cmd) (string, error) {
 		}
 	}()
 
-	waitErr := cmd.Wait()
+	// ⚠️ 顺序很重要：**必须先让读取 goroutine 把管道读干净，再 cmd.Wait()**。
+	//
+	// os/exec 的契约写着"Wait 会关闭管道，所以在所有读取完成之前调用 Wait 是不对的"——
+	// 先 Wait 就有机会把还没读出来的输出丢掉。这正是"失败时 error 里没有输出"的根因：
+	// 单跑还好，全量跑 `make check`（机器负载高）时偶发（2026-09-24 实测
+	// TestStreamCmdReturnsOutputAndError 报"实际 """）。
+	// 进程正常退出时，它的退出会关掉写端 ⇒ 读取端拿到 EOF ⇒ wg.Wait() 返回，不会死等。
 	if ctx.Err() != nil {
-		// 超时/取消：连同管道一起收尾，并如实返回 ctx 的错误（调用方据此判"未检查"）。
+		// 超时/取消：主动关掉读端，保证读取 goroutine 一定看得到 EOF
+		// （孙子进程可能还持有写端，见上面的长注释），然后照常收尾。
 		_ = stdout.Close()
 		_ = stderr.Close()
+		wg.Wait()
+		waitErr := cmd.Wait()
 		if waitErr == nil {
 			waitErr = ctx.Err()
 		}
+		return buf.String(), waitErr
 	}
 	wg.Wait()
-	return buf.String(), waitErr
+	return buf.String(), cmd.Wait()
 }
 
 // maxCollectedOutput 是保留给错误信息用的输出上限。

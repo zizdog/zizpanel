@@ -66,10 +66,12 @@ func (s *Spec) InstallSteps() []string {
 		steps = append(steps, "写 docker compose 并拉起容器")
 	}
 	if s.Config != nil {
-		if strings.TrimSpace(s.Config.Seed) == "" {
-			steps = append(steps, "登记配置文件位置（内容由应用自己创建）")
+		// 注意：**不要**在这里承诺"按模板写配置" —— config.seed 还没有执行通路
+		// （校验阶段已经如实拒绝它）。面板真正会做的是：登记位置 + 应用声明过的键值补丁。
+		if len(s.Config.PatchList()) > 0 {
+			steps = append(steps, "按声明改配置文件里的键值（已有内容与注释保留）")
 		} else {
-			steps = append(steps, "写入配置（模板 "+s.Config.Seed+"，权限 "+orDefault(s.Config.Mode, "0600")+"）")
+			steps = append(steps, "登记配置文件位置（内容由应用自己创建）")
 		}
 	}
 	switch s.Run.Mode {

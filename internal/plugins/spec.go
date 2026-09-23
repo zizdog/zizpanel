@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -201,10 +202,26 @@ type Requires struct {
 // 这是"声明式"与"可编程"的分界线：需要定制逻辑的动作由面板实现一次、所有插件复用，
 // 插件本身永远不能带代码。
 var builtinHooks = map[string]string{
-	"syncthing-gui-lan":  "把 Syncthing 的 GUI 监听改成 0.0.0.0:<port> 并设置随机登录口令",
-	"filebrowser-root":   "按 plist 里的 -r 回读并锁定 File Browser 的文件根目录",
-	"transmission-rpc":   "写 settings.json：关白名单、开认证、绑 0.0.0.0（停→等端口→写→起→回读）",
-	"miniflux-provision": "建库、写 LISTEN_ADDR=:port、跑迁移、建管理员",
+	"syncthing-gui-lan":  "把 Syncthing 的 GUI 监听改成 0.0.0.0:<port> 并设置随机登录口令（实现：internal/services/syncthing.go 的 InstallSyncthing 第 5 步）",
+	"filebrowser-root":   "按 plist 里的 -r 回读并锁定 File Browser 的文件根目录（实现：internal/services 的 filebrowser 安装器）",
+	"transmission-rpc":   "写 settings.json：关白名单、开认证、绑 0.0.0.0（停→等端口→写→起→回读）（实现：internal/services/transmission.go）",
+	"miniflux-provision": "建库、写 LISTEN_ADDR=:port、跑迁移、建管理员（实现：internal/services/miniflux.go）",
+}
+
+// HookIsAllowed 报告某个名字是不是受支持的内建补丁（门禁与调用方共用同一份判断）。
+func HookIsAllowed(name string) bool {
+	_, ok := builtinHooks[name]
+	return ok
+}
+
+// BuiltinHookNames 返回**允许声明**的内建补丁名（给门禁交叉核对"名字必须有真实实现"用）。
+func BuiltinHookNames() []string {
+	out := make([]string, 0, len(builtinHooks))
+	for k := range builtinHooks {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Load 读入并校验一份插件声明。**严格模式**：任何未知键都直接失败（安全边界）。
@@ -307,9 +324,12 @@ func (s *Spec) Validate() error {
 	default:
 		add("run.mode 必须是 panel-daemon / app-daemon / brew-service / compose / none 之一，实际 %q", s.Run.Mode)
 	}
+	// run.hooks 是**依赖声明**：它说"这个应用要靠面板的一个内建补丁才能好用"，
+	// 而补丁由面板实现（名字必须对应已实现的补丁）。JSON 本身永远不带代码 —— 这是安全边界。
 	for _, h := range s.Run.Hooks {
 		if _, ok := builtinHooks[h]; !ok {
-			add("run.hooks 里的 %q 不是面板内建补丁（插件不许带自己的代码；内建补丁见 docs/插件规范.md）", h)
+			add("run.hooks 里的 %q 不是面板已实现的内建补丁（插件不许带自己的代码；"+
+				"可用名字与它们的实现位置见 docs/插件规范.md）", h)
 		}
 	}
 
@@ -325,6 +345,13 @@ func (s *Spec) Validate() error {
 		case "", "user", "root":
 		default:
 			add("config.own 只能是 user / root，实际 %q", s.Config.Own)
+		}
+		// config.seed（从模板生成配置文件）**还没有执行通路**：面板不会拿它去生成任何东西，
+		// 所以这里如实拒绝，而不是让作者以为写了就会生效（旧计划文本还写着"写入配置（模板 …）"，
+		// 那更是彻头彻尾的谎报）。等这条能力做出来再放开。
+		if strings.TrimSpace(s.Config.Seed) != "" {
+			add("config.seed（模板文件）还没有执行通路：面板不会拿它生成配置，" +
+				"现在如实拒绝（用 config.set / config.secrets 改键值，或把模板写进面板实现）。见 docs/插件规范.md")
 		}
 		// 声明式配置补丁（patch.go）：格式/键名形状/值不许带换行/secret 与 set 不许撞键。
 		if len(s.Config.Patches) > 0 && (len(s.Config.Set) > 0 || len(s.Config.Secrets) > 0) {
