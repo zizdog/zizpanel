@@ -7,6 +7,11 @@
 <meta name="robots" content="noindex, nofollow">
 <title>ZizPanel 管理面板</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M9 11h14l-9 10h9' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<!-- 加到手机主屏（PWA，C4）：manifest 与苹果图标都由 js/pwa.js 按**面板入口**注入
+     绝对路径 —— 面板可能挂在 /<安全后缀>/ 下，写死相对路径在那种部署下会 404；
+     而图标本身是后端按尺寸现画的（/pwa/icon-192.png），不是静态文件，
+     写在这里还会让「前端资源引用必须存在」那条门禁误报。 -->
+<meta name="theme-color" content="#2563eb">
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>

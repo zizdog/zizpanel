@@ -665,6 +665,16 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsGet))
 	root.HandleFunc("POST /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsSave))
 
+	// ---------- PWA（C4，见 pwa.go）----------
+	//
+	// manifest 与图标必须**在内层**（带安全后缀）注册：加主屏后的 start_url /
+	// 图标地址都指向 `/<后缀>/...`，注册在外层会让带后缀的部署 404。
+	// sw.js 是静态文件（assets/sw.js，进 acorn 语法门禁），由 handleStatic 提供；
+	// 它自己的目录就是作用域，所以不需要 Service-Worker-Allowed。
+	root.HandleFunc("GET /manifest.webmanifest", s.handlePWAManifest)
+	root.HandleFunc("GET /pwa/icon-192.png", s.handlePWAIcon)
+	root.HandleFunc("GET /pwa/icon-512.png", s.handlePWAIcon)
+
 	// ---------- 前端静态资源 ----------
 	// 必须注册在 handleStatic 之前 —— 后者是 SPA 回落，任何未知路径都会
 	// 返回面板自己的 index.html（**状态码还是 200**），

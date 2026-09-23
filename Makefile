@@ -150,13 +150,13 @@ check-real:
 	@# 当模块解析，语法错误一样是白屏，所以一并纳入门禁。
 	@# （zizvideo 前端已随其独立仓库移出，它的 acorn 门禁在那边 make check 里。）
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav || exit 1; \
+	   node tools/check-js-syntax.mjs internal/web/assets/js internal/web/assets/nav internal/web/assets/sw.js || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@# acorn 只查语法、不查名字有没有定义：清理"死代码"时删掉过 `let cmCorePromise = null;`，
 	@# 引用还在 —— 语法合法、门禁全绿，浏览器却是 Can't find variable，编辑器直接打不开。
 	@echo "==> 前端 JS 未声明赋值检查"
 	@if [ -d node_modules/acorn ]; then \
-	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav || exit 1; \
+	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav internal/web/assets/sw.js || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
 	@echo "==> go vet"
 	@$(MAKE) --no-print-directory vet
