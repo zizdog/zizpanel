@@ -133,6 +133,8 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
   改过之后的版本）；面板是 root 时写完把归属交还真实用户（AGENTS 第三节第 8 条）。
 - **失败不谎报**：读不到/写不进 → `Warning` 里写清"配置补丁没生效 + 原因"；文件还不存在且
   没声明 `if_missing=create` → 如实记"跳过（该应用通常是首次启动才生成配置）"。
+- 「照文档从零接入一个应用」的全链路：`tools/plugin-author-check.sh`（init → 改 → validate/plan →
+  放进插件目录 → 面板启用 → 回读市场卡片逐字段核对 → 停用清干净）。**不含安装**（B2c）。
 - 门禁：`internal/plugins` 的补丁用例（kv/ini/yaml、前缀不误伤、section 隔离、幂等、缩进与
   注释保留、注入拒绝、PlanText 必须写出补丁）+ `internal/services` 的接线用例（写入/备份/幂等/
   跳过/写失败进 Warning/声明→App 的值是拷贝）。
