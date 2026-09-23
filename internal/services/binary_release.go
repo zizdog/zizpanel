@@ -160,8 +160,9 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		Binary:   "frpc",
 		TarStrip: 1, PickBinary: true,
 		Args: []string{"-c", "{root}/frpc.toml"},
-		// frpc 是主动往外连的客户端，唯一监听的端口是它自己的 admin UI(7400)。
-		Port: 7400, HealthPath: "/",
+		// frpc 是主动往外连的客户端，唯一监听的端口是它自己的 admin UI(7400)；
+		// 绑 0.0.0.0（与 ConfigSeed 里的 webServer.addr 一致，2026-09-23 局域网直连）。
+		Port: 7400, HealthPath: "/", BindAddress: "0.0.0.0",
 		ConfigFile:    "frpc.toml",
 		ConfigSeed:    frpcConfigSeed,
 		ChecksumAsset: frpChecksumAsset,
@@ -205,7 +206,8 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		Args: []string{"-c", "{root}/ddns-go.yaml", "-l", ":9876"},
 		// 9876 是它唯一的监听端口；HealthPath "/"：实测未登录 GET / 返回 307 → /login，
 		// 面板健康判定把 2xx/3xx 都算健康（见 health.go），能稳定反映"服务活着"。
-		Port: 9876, HealthPath: "/",
+		// -l :9876 本身就是通配地址 → 广告 LAN 地址（2026-09-23 局域网直连）。
+		Port: 9876, HealthPath: "/", BindAddress: "0.0.0.0",
 		ConfigFile: "ddns-go.yaml",
 		ConfigSeed: ddnsGoConfigSeed,
 		// 网页界面保存会整体重写 YAML（marker 被抹掉）→ 判据必须是"文件存在就保留"，
@@ -261,14 +263,15 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		Binary: "filebrowser",
 		// tarball 里 4 个**平级**成员（无顶层目录）→ TarStrip=0；PickBinary 只取 filebrowser 那一个。
 		TarStrip: 0, PickBinary: true,
-		// -b /filebrowser 与 AppUI.SelfBase 一致；-a 127.0.0.1 **只绑回环**（家目录有 .ssh/
-		// 凭据，暴露面必须收住）；-r 指**真实用户家目录**（用户 2026-09-19 要求管理整个目录）；
-		// -d 指面板工作目录 {vardir}（数据库放家目录会被自己列出来、也更容易被误改）。
-		Args: []string{"-b", "/filebrowser", "-a", "127.0.0.1", "-p", "8081",
+		// -b /filebrowser 与 AppUI.SelfBase 一致；-a 0.0.0.0 是用户要求的**局域网直连**
+		// （它管着整个家目录，登录口令是唯一防线，见 Notes）；-r 指**真实用户家目录**
+		// （用户 2026-09-19 要求管理整个目录）；-d 指面板工作目录 {vardir}
+		// （数据库放家目录会被自己列出来、也更容易被误改）。
+		Args: []string{"-b", "/filebrowser", "-a", "0.0.0.0", "-p", "8081",
 			"-r", "{home}", "-d", "{vardir}/filebrowser/filebrowser.db"},
 		Port: 8081, HealthPath: "/health",
-		// 只绑回环：广告地址也用 127.0.0.1（见 releaseBinaryApp.BindAddress 的注释）。
-		BindAddress: "127.0.0.1",
+		// 绑 0.0.0.0 → 广告地址用面板主机名，局域网设备才能点开。
+		BindAddress: "0.0.0.0",
 		// 端口语义强（就绪判定就看它）→ 安装前主动查占用，避免把别人的端口当成自己的。
 		CheckPortConflict: true,
 		// 上游 release **有** sha256 清单 → 必须核对（回落到第三方加速镜像时它是唯一内容校验）。
@@ -304,8 +307,8 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 				"在此之后注册的都是普通用户。",
 		},
 	},
-	// navidrome：官方 darwin-arm64 单二进制 + SQLite；**端口 4533 且只绑 127.0.0.1**
-	// （上游默认 address=0.0.0.0，绝不许裸奔）。音乐库目录写进 navidrome.toml。
+	// navidrome：官方 darwin-arm64 单二进制 + SQLite；**端口 4533，绑 0.0.0.0**
+	// （用户要求局域网直连；首建管理员账号前任何人都能访问安装页）。
 	"navidrome": {
 		ID: "navidrome", Label: "com.zizdog.navidrome", Name: "Navidrome（音乐）", Icon: "🎵",
 		Category: "tool", RootDir: "navidrome",
@@ -315,11 +318,11 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		Repo: "navidrome/navidrome", Tag: "v0.64.0", Asset: "navidrome_0.64.0_darwin_arm64.tar.gz",
 		Binary:   "navidrome",
 		TarStrip: 0, PickBinary: true,
-		Args: []string{"--address", "127.0.0.1", "--port", "4533",
+		Args: []string{"--address", "0.0.0.0", "--port", "4533",
 			"--datafolder", "{root}/data", "--configfile", "{root}/navidrome.toml"},
 		Port: 4533, HealthPath: "/ping",
-		// 只绑回环：广告地址也用 127.0.0.1（上游默认 0.0.0.0，必须显式收住）。
-		BindAddress: "127.0.0.1",
+		// 绑 0.0.0.0 → 广告地址用面板主机名，局域网设备才能点开。
+		BindAddress: "0.0.0.0",
 		// 配置文件由安装器生成（含 MusicFolder 骨架）；面板保留用户改动。
 		ConfigFile:    "navidrome.toml",
 		ConfigSeed:    navidromeConfigSeed,
@@ -329,7 +332,7 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 			"**音乐库目录默认留空**：在「📝 编辑配置文件」里把 MusicFolder 改成你的音乐目录，" +
 				"再点「🔄 重启服务」；不设置时 Navidrome 照常起来，但扫描会报 'no such file'、一首歌都没有。",
 			"首次打开 http://127.0.0.1:4533 自行创建管理员账号（无默认口令）；" +
-				"它只绑回环，手机在局域网里直连 4533 是打不开的（走面板入口或反代）。",
+				"**创建之前同网段任何人都能打开安装页**，建完账号即受保护。",
 		},
 	},
 	// zizvideo：本项目自研模块的产物，**只在公网镜像站上**（自 2026-09-22 起不随
@@ -345,7 +348,7 @@ var releaseBinaryApps = map[string]releaseBinaryApp{
 		// 裸二进制（不是归档）：不剥层、直接当可执行文件用。
 		TarStrip: 0, PickBinary: true,
 		Port: ZizvideoPort, HealthPath: zizvideoHealthPath,
-		BindAddress:       "127.0.0.1",
+		BindAddress:       "0.0.0.0",
 		CheckPortConflict: true,
 	},
 }

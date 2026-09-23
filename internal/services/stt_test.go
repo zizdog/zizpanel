@@ -1126,7 +1126,7 @@ func TestSTTPlistRunsAsRealUserAndCarriesMirrorConfig(t *testing.T) {
 		"<string>" + STTLabel + "</string>",
 		"<string>someone</string>", // UserName：以真实用户运行
 		"stt-serve",
-		"<string>127.0.0.1:" + strconv.Itoa(STTPort) + "</string>",
+		"<string>0.0.0.0:" + strconv.Itoa(STTPort) + "</string>", // 局域网直连（2026-09-23）
 		"--brew-prefix", "--root", "--model",
 		"/Users/someone/stt", "small",
 		"https://mirror.example.com",
@@ -1141,9 +1141,9 @@ func TestSTTPlistRunsAsRealUserAndCarriesMirrorConfig(t *testing.T) {
 	if !strings.Contains(plist, "/opt/homebrew/bin:") {
 		t.Errorf("plist 的 PATH 里应包含注入的 brew 前缀：\n%s", plist)
 	}
-	// 只绑回环：这个服务读用户上传的音频，不该默认暴露给局域网。
-	if strings.Contains(plist, "0.0.0.0") {
-		t.Error("plist 里出现了 0.0.0.0 —— 默认只能绑 127.0.0.1")
+	// 绑 0.0.0.0（用户 2026-09-23 要求局域网直连）；这个服务读用户上传的音频且**无鉴权**。
+	if !strings.Contains(plist, "<string>0.0.0.0:8892</string>") {
+		t.Errorf("plist 里缺少 \"<string>0.0.0.0:8892</string>\"（局域网直连）：\n%s", plist)
 	}
 }
 
@@ -1161,14 +1161,14 @@ func TestSTTPlistEscapesXMLInMirrorBase(t *testing.T) {
 	}
 }
 
-// TestSTTListenOnlyLoopback：默认只绑回环，且测试可注入覆盖。
-func TestSTTListenOnlyLoopback(t *testing.T) {
+// TestSTTListenBindsAllInterfaces：默认绑 0.0.0.0（局域网直连），且测试可注入覆盖。
+func TestSTTListenBindsAllInterfaces(t *testing.T) {
 	sttListenOverride = func() string { return "" }
 	t.Cleanup(func() { sttListenOverride = func() string { return "" } })
-	if got := STTListen(STTPort); got != "127.0.0.1:8892" {
+	if got := STTListen(STTPort); got != "0.0.0.0:8892" {
 		t.Errorf("默认监听地址不对：%q", got)
 	}
-	if got := STTHealthURL(); got != "http://127.0.0.1:8892/healthz" {
+	if got := STTHealthURL(); got != "http://127.0.0.1:8892/healthz" { // 探活仍走回环（本机自检）
 		t.Errorf("健康检查地址不对：%q", got)
 	}
 	sttListenOverride = func() string { return "127.0.0.1:19999" }

@@ -1074,7 +1074,7 @@ func TestSTTAliasPathWorksThroughAppProxy(t *testing.T) {
 	}
 
 	// ⑥ nginx 那段 location 也必须会包含 /stt/（80 端口入口走它）。
-	block := appProxyBlock(appProxyEntries(), "127.0.0.1:8443")
+	block := appProxyBlock(appProxyEntries(true), "127.0.0.1:8443")
 	// 生成的形状是 `location ^~ /stt/`（^~ 表示前缀匹配优先，见 appProxyBlock）。
 	if !strings.Contains(block, "location ^~ /"+services.STTSlug+"/") {
 		t.Errorf("nginx 应用代理块里没有 /%s/ —— http://<主机>/%s/ 会 404\n%s",

@@ -8,11 +8,11 @@ package web
 // 为什么不能只靠面板端口上的 /nav/：
 //   · 面板主端口是 HTTPS 自签 + 安全后缀 —— 隧道按 `protocol="http"` 连不上，
 //     按 https 又要处理证书，用户侧多一层无谓的坑；
-//   · 独立端口是**纯 HTTP + 只绑回环**：外网只能经隧道进（隧道自己跑在本机）。
+//   · 独立端口是**纯 HTTP + 绑 0.0.0.0**（用户 2026-09-23 要求局域网直连）。
 //
 // 鉴权：这一面**不要求面板登录**（公网首页），且**不套 accessControl** ——
 // 隧道带来的请求 X-Forwarded-For 可能是公网 IP，套白名单会把隧道自己挡在门外；
-// 真正的边界是"只绑 127.0.0.1"（只有本机进程/隧道能连）。
+// 代价：同网段任何人可读写（导航页本来就是公开面；写操作要口令的仍需登录）。
 // 只读：这一面只暴露页面、静态资源、公开数据与图标，写接口一个都不挂。
 
 import (
@@ -87,7 +87,8 @@ func (l *navListener) apply(enabled bool, port int) error {
 	if l.ln != nil && l.port == port {
 		return nil // 幂等：端口没变就不动它
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// 绑 0.0.0.0：用户 2026-09-23 要求局域网可直连（导航页本来就是公开面）。
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		msg := navListenErrText(port, err)
@@ -140,7 +141,7 @@ func navListenErrText(port int, err error) string {
 		return fmt.Sprintf("导航页独立端口 %d 已被占用（后端原文：%v）。"+
 			"请换一个端口，或先停掉占用它的程序：终端执行 lsof -nP -iTCP:%d -sTCP:LISTEN", port, err, port)
 	}
-	return fmt.Sprintf("导航页独立端口 %d 监听失败（只绑 127.0.0.1，后端原文：%v）", port, err)
+	return fmt.Sprintf("导航页独立端口 %d 监听失败（后端原文：%v）", port, err)
 }
 
 // ApplyNavListener 应用端口配置并回读生效值（面板设置保存时调用）。

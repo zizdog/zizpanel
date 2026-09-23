@@ -121,14 +121,14 @@ func (m *Manager) STTEngineFor() *STTEngine {
 
 // STTListen 返回服务应当监听的地址。
 //
-// 只绑回环：转写要读用户上传的音频、要跑本机推理，对局域网没有意义，
-// 也不该在用户没明确要的情况下扩大暴露面。要给别人用就走面板的 /stt/ 别名
-// （那条路要求先登录面板）。
+// 监听地址：**绑 0.0.0.0**（用户 2026-09-23 明确要求："所有应用 ip:端口都要允许
+// 0.0.0.0:端口，我需要局域网访问"）—— 统一端口访问之后，局域网设备必须能直连它。
+// ⚠️ 这个界面**没有登录保护**（谁能连上谁就能转写），只在可信局域网里这样用。
 func STTListen(port int) string {
 	if override := strings.TrimSpace(sttListenOverride()); override != "" {
 		return override
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	return fmt.Sprintf("0.0.0.0:%d", port)
 }
 
 // STTHealthURL 是网页界面的健康检查地址（面板的服务健康检查也打它；

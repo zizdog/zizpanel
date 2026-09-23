@@ -8,7 +8,7 @@ package web
 //   · 幂等（同一端口重复保存不重绑）与"改端口真的换监听"；
 //   · **未登录（无面板会话）时独立端口可访问**（需求核心）。
 //
-// 全部用 127.0.0.1 上的临时端口；不碰真实面板、不碰 8443、不碰生产机。
+// 全部用临时端口；占用端口必须绑 0.0.0.0（服务本身绑通配，绑回环占不住，坑 233）。
 
 import (
 	"encoding/json"
@@ -42,7 +42,7 @@ func TestValidateNavListenPort(t *testing.T) {
 // 且**不许谎报运行**。
 func TestNavListenerRejectsOccupiedPort(t *testing.T) {
 	srv, _ := newTestServer(t)
-	held, err := net.Listen("tcp", "127.0.0.1:0")
+	held, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestNavListenerChangeFailureKeepsOldPort(t *testing.T) {
 	srv, _ := newTestServer(t)
 	good := freePortForTest(t)
 	t.Cleanup(func() { srv.ApplyNavListener(false, good) })
-	held, err := net.Listen("tcp", "127.0.0.1:0")
+	held, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestNavListenSettingsEndpointAppliesAndReports(t *testing.T) {
 	}
 
 	// 被占用：报错并**不落库**（GET 回读仍是上一个合法值）
-	held, err := net.Listen("tcp", "127.0.0.1:0")
+	held, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}

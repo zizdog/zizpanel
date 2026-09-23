@@ -40,7 +40,7 @@ import (
 // 注意它**不等于** URL 里的 slug（/aria/）：目录名跟着上游项目名，路径跟着用户看得懂的短名。
 const aria2AssetDir = "assets/ariang"
 
-// aria2RPCUpstream 是 RPC 的真实地址（只绑回环，见 services/aria2.go 的配置生成）。
+// aria2RPCUpstream 是 RPC 的本机地址（RPC 绑 0.0.0.0，见 services/aria2.go）。
 // 做成变量是为了单测能把它指到假上游（绝不在单测里连真实 6800）。
 var aria2RPCUpstream = func() *url.URL {
 	return &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", services.Aria2RPCPort), Path: "/jsonrpc"}
@@ -109,7 +109,7 @@ func (s *Server) handleAria2UI(w http.ResponseWriter, r *http.Request) {
 // aria2IndexHTML 往 AriaNg 的 index.html 里注入一段"自动配好 RPC"的脚本。
 //
 // 为什么要注入（用户体验的全部意义所在）：AriaNg 默认连 http://localhost:6800，
-// 而我们的 RPC 只绑回环、浏览器要经面板的 /aria/jsonrpc 走 —— 不注入的话，
+// 而面板仍让浏览器走 /aria/jsonrpc 同源入口 —— 不注入的话，
 // 用户打开界面看到的是"未连接"，还得自己去设置页填主机/端口/密钥。
 //
 // 注入的行为（刻意保守，别加码）：
@@ -187,7 +187,7 @@ func (s *Server) handleAria2RPC(w http.ResponseWriter, r *http.Request) {
 
 // handleAria2RPCLoopback 是 **AriaNg 独立端口**上的 RPC 代理：不要求面板会话。
 //
-// 边界是"独立端口只绑 127.0.0.1"（只有本机进程 / 隧道 / 用户自己的反代能连），
+// 边界是**自带 access-control 口令**（端口绑 0.0.0.0，同网段可直连），
 // 与导航页独立端口同一取舍；RPC 本身仍由 aria2 的 `rpc-secret` 保护。
 // 少了它，用户把独立端口反代出去后 AriaNg 依然连不上（浏览器没有面板 Cookie）。
 func (s *Server) handleAria2RPCLoopback(w http.ResponseWriter, r *http.Request) {

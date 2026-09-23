@@ -898,7 +898,7 @@ export function SettingsView(content, ctx = {}) {
     mirrorInput.addEventListener('input', syncOfflineWarn);
     syncOfflineWarn();
 
-    // 导航页独立端口（坑 222）：纯 HTTP + 只绑 127.0.0.1，供隧道映射到公网域名。
+    // 导航页独立端口（坑 222）：纯 HTTP，供隧道映射到公网域名 / 局域网直连。
     // 面板主端口是 HTTPS 自签 + 安全后缀 —— 隧道按 http 连不上，所以这个端口才是入口。
     const navPortOn = h('input', {
       type: 'checkbox', checked: s.nav_listen_enabled !== false,

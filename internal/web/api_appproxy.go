@@ -208,7 +208,7 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "「应用界面代理」已在面板设置里关闭，请先开启再生成 nginx 入口")
 		return
 	}
-	entries := appProxyEntries()
+	entries := appProxyEntries(s.Cfg.AppProxy)
 	if len(entries) == 0 {
 		fail(w, http.StatusInternalServerError, "目录里没有任何带界面的应用")
 		return
@@ -253,11 +253,19 @@ func (s *Server) handleAppProxyApply(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"count": len(entries), "slugs": slugs})
 }
 
-func appProxyEntries() []appEntry {
-	apps := appproxy.Slugs()
-	out := make([]appEntry, 0, len(apps)+1)
-	for _, a := range apps {
-		out = append(out, appEntry{Slug: a.UI.Slug, Name: a.Name, Port: a.WebPort()})
+// appProxyEntries 返回要写进 nginx 的子路径条目；appsEnabled=false 时**只留导航页**。
+//
+// 为什么留导航页（用户 2026-09-23 要求"彻底去掉别名、统一端口访问"）：导航页不是
+// "某个应用的别名"，它是面板自己的首页入口（还有独立端口 8896 那一份）；把它一起
+// 删掉只会让 `http://<主机>/nav/` 这个浏览器首页失效，与"统一端口访问"无关。
+func appProxyEntries(appsEnabled bool) []appEntry {
+	var out []appEntry
+	if appsEnabled {
+		apps := appproxy.Slugs()
+		out = make([]appEntry, 0, len(apps)+1)
+		for _, a := range apps {
+			out = append(out, appEntry{Slug: a.UI.Slug, Name: a.Name, Port: a.WebPort()})
+		}
 	}
 	// 面板自带的「导航页」（见 api_nav.go）也走同一段 nginx location：
 	// 它的页面由面板进程直接提供（Port=0，upstream 就是面板），

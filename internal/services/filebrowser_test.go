@@ -24,19 +24,19 @@ func TestFilebrowserReleaseBinaryWiring(t *testing.T) {
 	if spec.ChecksumAsset != "filebrowser_2.63.23_checksums.txt" {
 		t.Errorf("上游有 sha256 清单就必须登记：%q", spec.ChecksumAsset)
 	}
-	// 端口与绑定：只绑回环（家目录暴露面必须收住）。
+	// 端口与绑定：绑 0.0.0.0（用户 2026-09-23 要求局域网直连；登录口令是唯一防线）。
 	if spec.Port != 8081 {
 		t.Errorf("端口应是 8081，实际 %d", spec.Port)
 	}
-	if spec.BindAddress != "127.0.0.1" {
-		t.Errorf("只应绑回环 127.0.0.1，实际 %q", spec.BindAddress)
+	if spec.BindAddress != "0.0.0.0" {
+		t.Errorf("应绑 0.0.0.0（局域网直连），实际 %q", spec.BindAddress)
 	}
 	if !spec.CheckPortConflict {
 		t.Error("端口语义强的应用必须开 CheckPortConflict（否则会把别人的端口当成自己装好了）")
 	}
-	// 启动参数：子路径、根目录=家目录、数据库在家目录之外、只绑回环。
+	// 启动参数：子路径、根目录=家目录、数据库在家目录之外、绑 0.0.0.0。
 	joined := strings.Join(spec.Args, " ")
-	for _, want := range []string{"-b /filebrowser", "-a 127.0.0.1", "-r {home}", "-d {vardir}/filebrowser/filebrowser.db"} {
+	for _, want := range []string{"-b /filebrowser", "-a 0.0.0.0", "-r {home}", "-d {vardir}/filebrowser/filebrowser.db"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("启动参数里缺少 %q，实际：%s", want, joined)
 		}

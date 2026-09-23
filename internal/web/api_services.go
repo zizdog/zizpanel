@@ -936,7 +936,17 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 写死的 homebrew.mxcl.*：实测同一台机器上 sh.brew.php@8.3 与
 		// homebrew.mxcl.httpd 两套前缀并存。用错标签的后果就是用户看到的
 		// "PHP 8.3 显示已安装·未纳管，点纳管报找不到 plist"。
+		// 子路径别名下线后，**不再把 ui.slug 下发给前端**：前端的「打开」会自动退回
+		// "端口直连"（openTargetOf 在没有 slug 时用 port_url），不会再给一个 404 的子路径。
+		// SelfConf 的条目（phpMyAdmin 的 nginx alias、aria2 的面板内 /aria/）自带入口，
+		// 与别名无关，原样保留。
+		if !s.Cfg.AppProxy && a.UI != nil && a.UI.Slug != "" && !a.UI.SelfConf {
+			ui := *a.UI
+			ui.Slug = ""
+			a.UI = &ui
+		}
 		realLabel := ""
+		// brew 类应用的真实 launchd 标签必须**按磁盘上的 plist 推**，不能信目录里
 		if a.BrewFormula != "" {
 			realLabel = services.BrewLabelFor(s.Cfg.UserHome, a.BrewFormula)
 		}

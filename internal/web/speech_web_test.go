@@ -512,7 +512,7 @@ func TestSpeechBodyLimit(t *testing.T) {
 // 就指向一个不存在的 location（表现是 404 或打到面板 SPA），而**单元测试之外
 // 很难发现**（真机上要点开才知道）。
 func TestSpeechAppProxyBlockIncludesSpeechAlias(t *testing.T) {
-	entries := appProxyEntries()
+	entries := appProxyEntries(true)
 	found := false
 	for _, e := range entries {
 		if e.Slug != services.MacSpeechSlug {
@@ -525,7 +525,7 @@ func TestSpeechAppProxyBlockIncludesSpeechAlias(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("appProxyEntries() 里没有 %s —— nginx 的 /%s/ 入口不会被生成",
+		t.Fatalf("appProxyEntries(true) 里没有 %s —— nginx 的 /%s/ 入口不会被生成",
 			services.MacSpeechSlug, services.MacSpeechSlug)
 	}
 	block := appProxyBlock(entries, "127.0.0.1:8443")
@@ -561,15 +561,26 @@ func TestSpeechMarketCardInstalledContract(t *testing.T) {
 	if it["installed"] != false {
 		t.Error("沙箱里什么都没装，不能显示已安装（谎报「已安装」和谎报「未安装」一样糟）")
 	}
-	if ui, _ := it["ui"].(map[string]any); asString(ui["slug"]) != services.MacSpeechSlug {
-		t.Errorf("市场条目必须带界面别名 ui.slug=%s（否则卡片没有「打开」入口）：%v",
-			services.MacSpeechSlug, it["ui"])
+	// 别名已下线（用户 2026-09-23："彻底去掉别名，统一改为端口访问"）：
+	// 默认配置下**不再下发 ui.slug**，卡片的「打开」走端口直连 port_url。
+	if ui, _ := it["ui"].(map[string]any); asString(ui["slug"]) != "" {
+		t.Errorf("别名下线后不应再下发 ui.slug，实际 %v", it["ui"])
 	}
-	if got := asString(it["proxy_url"]); !strings.Contains(got, "/"+services.MacSpeechSlug+"/") {
-		t.Errorf("proxy_url 应指向面板别名 /%s/，实际 %q", services.MacSpeechSlug, got)
+	if got := asString(it["proxy_url"]); got != "" {
+		t.Errorf("别名下线后不该有 proxy_url，实际 %q", got)
 	}
 	if got := asString(it["port_url"]); !strings.Contains(got, strconv.Itoa(services.MacSpeechPort)) {
-		t.Errorf("port_url 应指向直连端口 %d，实际 %q", services.MacSpeechPort, got)
+		t.Errorf("别名下线后「打开」必须靠 port_url（否则卡片没有入口），实际 %q", got)
+	}
+	// 对照：显式把别名打开时，slug/proxy_url 必须回来（能力还在，只是默认关）。
+	srv.Cfg.AppProxy = true
+	t.Cleanup(func() { srv.Cfg.AppProxy = false })
+	it2 := marketItem(t, ts, cookies, services.MacSpeechAppID)
+	if ui, _ := it2["ui"].(map[string]any); asString(ui["slug"]) != services.MacSpeechSlug {
+		t.Errorf("显式开启别名时必须恢复 ui.slug=%s，实际 %v", services.MacSpeechSlug, it2["ui"])
+	}
+	if got := asString(it2["proxy_url"]); !strings.Contains(got, "/"+services.MacSpeechSlug+"/") {
+		t.Errorf("显式开启别名时 proxy_url 应指向 /%s/，实际 %q", services.MacSpeechSlug, got)
 	}
 
 	// 模拟"面板装好了"的最小证据：服务真的注册进了 launchd（沙箱 LaunchDaemons

@@ -22,9 +22,9 @@ import (
 
 // TestNativeMarketEntries20260920 锁住三个条目的硬参数。
 //
-// 这些值不是"随手填的"：memos 5230 避开 filebrowser 的 8081、navidrome 4533 且
-// 只绑回环（上游默认 0.0.0.0）、transmission 9091 + 必须有 PanelInstaller
-// （通用 brew 流程不会设 RPC 口令）。改它们等于改产品行为，必须是有意的。
+// 这些值不是"随手填的"：memos 5230 避开 filebrowser 的 8081、navidrome 4533、
+// transmission 9091 + 必须有 PanelInstaller（通用 brew 流程不会设 RPC 口令）。
+// 绑定地址统一 0.0.0.0（用户 2026-09-23 要求局域网直连）。改它们等于改产品行为。
 func TestNativeMarketEntries20260920(t *testing.T) {
 	cases := []struct {
 		id, name, health, rootDir, bind string
@@ -32,7 +32,7 @@ func TestNativeMarketEntries20260920(t *testing.T) {
 		panelInstaller                  bool
 	}{
 		{"memos", "Memos（笔记）", "/healthz", "memos", "0.0.0.0", 5230, true},
-		{"navidrome", "Navidrome（音乐）", "/ping", "navidrome", "127.0.0.1", 4533, true},
+		{"navidrome", "Navidrome（音乐）", "/ping", "navidrome", "0.0.0.0", 4533, true},
 		{"transmission", "Transmission（下载）", "/transmission/web/", "", "", 9091, true},
 	}
 	for _, c := range cases {
@@ -72,7 +72,7 @@ func TestNativeMarketEntries20260920(t *testing.T) {
 				t.Errorf("%s 的安装根应为 ~/%s，实际 ~/%s", c.id, c.rootDir, spec.RootDir)
 			}
 			if spec.BindAddress != c.bind {
-				t.Errorf("%s 的绑定地址应为 %q（navidrome 上游默认 0.0.0.0，必须显式收住），实际 %q",
+				t.Errorf("%s 的绑定地址应为 %q（局域网直连，2026-09-23），实际 %q",
 					c.id, c.bind, spec.BindAddress)
 			}
 			// 版本/资产必须与目录声明对得上（能自动核就自动核）。
@@ -102,19 +102,19 @@ func TestMemosPortIsExplicitlyNotDefault(t *testing.T) {
 	}
 }
 
-// TestNavidromeBindsLoopbackExplicitly 上游默认 address=0.0.0.0，绝不裸奔：
-// 启动参数里必须出现 --address 127.0.0.1。
-func TestNavidromeBindsLoopbackExplicitly(t *testing.T) {
+// TestNavidromeBindsAllInterfacesExplicitly：必须**显式**写 --address 0.0.0.0
+// （用户 2026-09-23 要求局域网直连），别靠上游默认值。
+func TestNavidromeBindsAllInterfacesExplicitly(t *testing.T) {
 	spec, ok := releaseBinaryApps["navidrome"]
 	if !ok {
 		t.Fatal("releaseBinaryApps 里没有 navidrome")
 	}
 	joined := strings.Join(spec.Args, " ")
-	if !strings.Contains(joined, "--address") || !strings.Contains(joined, "127.0.0.1") {
-		t.Errorf("navidrome 必须显式 --address 127.0.0.1（上游默认 0.0.0.0），实际 %v", spec.Args)
+	if !strings.Contains(joined, "--address 0.0.0.0") {
+		t.Errorf("navidrome 必须显式 --address 0.0.0.0，实际 %v", spec.Args)
 	}
-	if spec.BindAddress != "127.0.0.1" {
-		t.Errorf("navidrome 的 BindAddress 应为 127.0.0.1，实际 %q", spec.BindAddress)
+	if spec.BindAddress != "0.0.0.0" {
+		t.Errorf("navidrome 的 BindAddress 应为 0.0.0.0，实际 %q", spec.BindAddress)
 	}
 }
 
@@ -245,8 +245,8 @@ func TestTransmissionCredentialMergeKeepsOtherSettings(t *testing.T) {
 		`"rpc-authentication-required": true`,
 		`"rpc-username": "zizpaneluser"`,
 		`"rpc-password": "SuperSecretPass123456"`,
-		`"rpc-bind-address": "127.0.0.1"`,
-		`"rpc-whitelist": "127.0.0.1,::1"`,
+		`"rpc-bind-address": "0.0.0.0"`,
+		`"rpc-whitelist-enabled": false`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("合并后的 settings.json 里缺少 %s：\n%s", want, s)

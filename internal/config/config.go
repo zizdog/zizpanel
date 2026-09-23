@@ -109,7 +109,7 @@ type Config struct {
 	//
 	// 导航页原先是面板端口上的一条**公开路径**（GET /nav/，安全后缀之外），
 	// 但它是 HTTPS + 带安全后缀的主端口：隧道工具按 http 连不上、按 https 又要
-	// 处理自签证书。所以给它一个**只绑 127.0.0.1 的纯 HTTP 独立监听**，
+	// 处理自签证书。所以给它一个**纯 HTTP 独立监听（绑 0.0.0.0）**，
 	// 隧道（如 Orbien `service = "127.0.0.1:<port>"`）直接指过来即可。
 	//
 	// NavListenEnabled 默认 true（新建配置）；它在 Default() 里给值而**不进 fill()**，
@@ -161,6 +161,11 @@ type Config struct {
 	// 默认开是因为直连端口本来就在局域网上开着、且这是用户明确要的便利；
 	// 但只要用户觉得不合适，一个开关就能全关掉（页面上的入口也会跟着消失）。
 	AppProxy bool `json:"app_proxy"`
+	// AppProxyRetired 记录"子路径别名已经下线迁移过"。
+	// 用户 2026-09-23 明确要求"彻底去掉别名、统一改为端口访问"：老配置里的
+	// app_proxy=true 会在第一次加载时被改成 false 并落盘；此后想临时开回来，
+	// 在设置里打开即可（迁移标记保证不会被再次自动关掉）。
+	AppProxyRetired bool `json:"app_proxy_retired"`
 
 	// ---------- 环境（LNMP 等由面板管理的系统组件） ----------
 	User     string `json:"user"`      // 面板运行用户（安装时确定）
@@ -205,6 +210,9 @@ type Config struct {
 
 	mu   sync.RWMutex
 	path string
+	// migratedAliasOff 只在本进程内有效：表示这次加载刚刚做过"别名下线"迁移，
+	// 需要立刻落盘（见 Load 里的 Save）。
+	migratedAliasOff bool
 }
 
 // DefaultRoot 是面板的默认安装根目录。
@@ -235,10 +243,10 @@ func root() string {
 // 面板里所有安装过程都**先**检查它：有就用它，它缺件/不可达时才回落公网源。
 const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 
-// DefaultNavListenPort 是「导航页独立端口」的默认值（只绑 127.0.0.1，纯 HTTP）。
+// DefaultNavListenPort 是「导航页独立端口」的默认值（绑 0.0.0.0，纯 HTTP）。
 const DefaultNavListenPort = 8896
 
-// DefaultAria2UIPort 是 AriaNg 独立端口的默认值（只绑 127.0.0.1，纯 HTTP）。
+// DefaultAria2UIPort 是 AriaNg 独立端口的默认值（绑 0.0.0.0，纯 HTTP）。
 //
 // 为什么要有它（用户 2026-09-23）：面板内的 /aria/ 要面板会话，反代出去用不了；
 // 而 AriaNg 在 https 页面里连 http 的 RPC 会被浏览器按混合内容拦掉。独立端口把
@@ -316,14 +324,14 @@ func Default() *Config {
 		Listen:     ":8443",
 		TLSEnable:  true,
 		AccessMode: "any",
-		// 导航页独立端口：默认开、只绑 127.0.0.1 的纯 HTTP（8896 与面板/各
+		// 导航页独立端口：默认开、绑 0.0.0.0 的纯 HTTP（8896 与面板/各
 		// 内置界面端口不冲突）。端口被占用时**不阻断启动**，如实报错并由
 		// 「面板设置」显示生效状态（见 internal/web/nav_listen.go）。
 		NavListenEnabled: true,
 		Aria2UIPort:      DefaultAria2UIPort,
 		NavListenPort:    DefaultNavListenPort,
 		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
-		AppProxy: true,
+		AppProxy: false,
 		// 且默认要求先登录面板（Squoosh 这类应用自己没有鉴权）
 		AppProxyAuth: true,
 		// 应用包镜像：默认指向自建镜像站（公网域名）。面板所有安装过程**优先**
@@ -489,6 +497,10 @@ func Load(path string) (*Config, error) {
 	}
 	c.path = path
 	c.fill()
+	// 迁移过就立刻落盘，避免"每次启动都重算"以及"设置里刚打开又被关掉"。
+	if c.migratedAliasOff {
+		_ = c.Save()
+	}
 	// 修正在"面板先于 Homebrew 存在"那一刻写下的 /usr/local 前缀。
 	// 放在 Load 里而不是各个调用点：每个功能都去关心"brew 前缀对不对"
 	// 是重复的，而且总有人忘记。
@@ -605,6 +617,13 @@ func (c *Config) fill() {
 	}
 	if c.Listen == "" {
 		c.Listen = d.Listen
+	}
+	// 别名下线的一次性迁移（见 AppProxyRetired 的说明）：老配置是 true 的，
+	// 第一次加载就关掉并落盘。只做一次，之后尊重用户在设置里的选择。
+	if c.AppProxy && !c.AppProxyRetired {
+		c.AppProxy = false
+		c.AppProxyRetired = true
+		c.migratedAliasOff = true
 	}
 	// 老配置里没有这个字段（或被人手工清零）时补回默认端口：
 	// 否则启动时会拿 0 去绑（校验直接失败 ⇒ 独立端口永远不生效）。

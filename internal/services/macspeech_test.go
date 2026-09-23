@@ -559,7 +559,7 @@ func TestMacSpeechPlistContent(t *testing.T) {
 	for _, want := range []string{
 		"<string>" + MacSpeechLabel + "</string>",
 		"<string>speech-serve</string>",
-		"<string>127.0.0.1:8891</string>",
+		"<string>0.0.0.0:8891</string>", // 用户 2026-09-23：局域网直连（无鉴权，已知代价）
 		"<string>zizdog</string>",
 		"<string>/tmp/out.log</string>",
 		"<key>UserName</key>", // 必须以真实用户运行（音色与临时文件都按该身份）
@@ -568,8 +568,8 @@ func TestMacSpeechPlistContent(t *testing.T) {
 			t.Errorf("plist 缺少 %q：\n%s", want, plist)
 		}
 	}
-	if strings.Contains(plist, "0.0.0.0") {
-		t.Error("plist 不该把服务暴露到 0.0.0.0（只绑回环）")
+	if strings.Contains(plist, "<string>127.0.0.1:8891</string>") {
+		t.Error("退回回环会让局域网打不开（用户 2026-09-23 要求直连）")
 	}
 }
 

@@ -45,7 +45,7 @@ import (
 //  诚实标注：它的任务**不会**出现在面板的「任务中心」列表里（那是另一个进程）。
 //
 //  安全边界：
-//    · 只绑 127.0.0.1（见 imgcompress.go 的 plist）；走别名时还要过面板登录；
+//    · 绑 0.0.0.0 但**无鉴权**（见 imgcompress.go 的 plist）；走别名时还要过面板登录；
 //    · 上传只接受白名单图片扩展名、单文件与单次总量都有上限；
 //    · 每个任务一个私有临时目录，输出文件只能通过任务 id + 索引取，路径不可由
 //      请求方指定（不构成任意文件读取）。
@@ -148,7 +148,7 @@ type imgCompressResult struct {
 // NewImgCompressServer 构造独立服务（不监听，调用方自己起 http.Server）。
 func NewImgCompressServer(opt ImgCompressOptions) *ImgCompressServer {
 	if strings.TrimSpace(opt.Listen) == "" {
-		opt.Listen = fmt.Sprintf("127.0.0.1:%d", services.ImgCompressPort)
+		opt.Listen = fmt.Sprintf("0.0.0.0:%d", services.ImgCompressPort) // 用户 2026-09-23：局域网直连
 	}
 	if opt.MaxFileBytes <= 0 {
 		opt.MaxFileBytes = imgCompressDefaultMaxFileBytes

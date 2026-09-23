@@ -38,7 +38,7 @@ import (
 //  诚实标注：这个任务中心是本进程内的，**不会**出现在面板的「任务中心」列表里
 //  （那是另一个进程的 Manager）——与「图片压缩」的说明一致。
 //
-//  安全边界：只绑 127.0.0.1（见 macspeech_install.go 的 plist）；走别名时还要
+//  安全边界：绑 0.0.0.0 但**无鉴权**（见 macspeech_install.go 的 plist）；走别名时还要
 //  过面板登录；请求体有硬上限；临时音频只存在于任务私有目录里，
 //  路径不可由请求方指定（不构成任意文件读取）。
 // ============================================================================
@@ -97,7 +97,7 @@ type speechJob struct {
 // NewSpeechServer 造一个服务实例。
 func NewSpeechServer(opt SpeechOptions) *SpeechServer {
 	if strings.TrimSpace(opt.Listen) == "" {
-		opt.Listen = fmt.Sprintf("127.0.0.1:%d", services.MacSpeechPort)
+		opt.Listen = fmt.Sprintf("0.0.0.0:%d", services.MacSpeechPort) // 用户 2026-09-23：局域网直连
 	}
 	if opt.SyncMaxChars <= 0 {
 		opt.SyncMaxChars = speechDefaultSyncMaxChars

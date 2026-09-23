@@ -219,7 +219,9 @@ func (s *Server) buildDefaultVhost() string {
 	// upsertAppProxyBlock 找不到旧块，于是**再插一份** → nginx 报
 	// `duplicate location "/filebrowser"`，整份配置回滚（用户 2026-09-15 实测）。
 	// 两处生成同一份内容、同一套标记，才谈得上幂等。
-	entries := appProxyEntries()
+	// 应用子路径别名已下线（用户 2026-09-23："彻底去掉别名、统一端口访问"）：
+	// 这里不再写应用 location，只有导航页那一条由 appProxyEntries(false) 保留。
+	entries := appProxyEntries(s.Cfg.AppProxy)
 	if len(entries) > 0 {
 		b.WriteString(appProxyBlock(entries, s.proxyUpstream()))
 		b.WriteString("\n")

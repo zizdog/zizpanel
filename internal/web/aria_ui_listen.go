@@ -12,7 +12,7 @@ package web
 //   反代 <域名>:8888 → http://127.0.0.1:<aria2_ui_port> 即可用；界面里的 RPC 走**同源相对路径**，
 //   https 反代下自动就是 https，不再报安全模式。
 //
-// 边界（与导航页独立端口坑 222 同一取舍）：**只绑 127.0.0.1**、不套面板会话与 accessControl
+// 边界：**绑 0.0.0.0**（用户要求局域网直连）、不套面板会话与 accessControl
 // —— 只有本机进程/隧道/反代能连到它。RPC 自身由 aria2 的 `rpc-secret` 保护（AriaNg 会带 token）。
 
 import (
@@ -71,7 +71,9 @@ func (l *ariaUIListener) apply(port int) error {
 	if l.ln != nil && l.port == port {
 		return nil // 幂等
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// 绑 0.0.0.0：用户 2026-09-23 要求局域网直连端口访问（⚠️ 界面无登录保护，
+	// 页面里还会带 RPC 密钥 —— 只在可信局域网这样用）。
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		msg := ariaUIPortErrText(port, err)
@@ -129,7 +131,7 @@ func (s *Server) AriaUIListenerState() ariaUIState { return s.ariaUI.state() }
 // ariaStandaloneHandler 是独立端口上的路由。
 //
 //   - 界面与静态资源：复用面板内 /aria/ 的**同一份实现**（路径改写到 slug 前缀下）；
-//   - /jsonrpc：转发到 127.0.0.1:6800（**不要求面板会话** —— 边界是"只绑回环"，
+//   - /jsonrpc：转发到 127.0.0.1:6800（**不要求面板会话** —— 边界是 RPC 口令，
 //     RPC 自身由 aria2 的 rpc-secret 保护）。
 func (s *Server) ariaStandaloneHandler() http.Handler {
 	slug := "/" + ariaSlugPath()

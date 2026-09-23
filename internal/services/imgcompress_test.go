@@ -73,7 +73,7 @@ func TestImgCompressPlistRunsPanelSubcommand(t *testing.T) {
 		"<string>/opt/zizpanel/bin/zizpanel</string>",
 		"<string>imgcompress-serve</string>",
 		"<string>--listen</string>",
-		"<string>127.0.0.1:8890</string>",
+		"<string>0.0.0.0:8890</string>",
 		"<string>--brew-prefix</string>",
 		"<string>/opt/homebrew</string>",
 		"<string>zizdog</string>",
@@ -86,9 +86,10 @@ func TestImgCompressPlistRunsPanelSubcommand(t *testing.T) {
 			t.Errorf("plist 里缺少 %q\n---\n%s", want, plist)
 		}
 	}
-	// 只绑回环：界面里能做的事（spawn vips、读上传的图）不该在用户没要求时暴露到局域网。
-	if strings.Contains(plist, "0.0.0.0") {
-		t.Error("网页界面服务不该绑 0.0.0.0（那会把它暴露到局域网）")
+	// 绑 0.0.0.0（用户 2026-09-23 要求局域网直连）：界面里能 spawn vips、读上传的图，
+	// 且**没有鉴权** —— 这是已知代价，但别退回回环（那样局域网又打不开）。
+	if strings.Contains(plist, "<string>127.0.0.1:8890</string>") {
+		t.Error("退回回环会让局域网打不开（用户 2026-09-23 要求直连）")
 	}
 }
 

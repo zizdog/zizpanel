@@ -50,7 +50,7 @@ import (
 //  诚实标注：这个任务中心是本进程内的，**不会**出现在面板的「任务中心」列表里
 //  （那是另一个进程的 Manager）——与「图片压缩」「语音合成」的说明一致。
 //
-//  安全边界：只绑 127.0.0.1（见 stt_install.go 的 plist）；走别名时还要过面板
+//  安全边界：绑 0.0.0.0 但**无鉴权**（见 stt_install.go 的 plist）；走别名时还要过面板
 //  登录；上传体有硬上限；上传文件与转写产物只存在于任务私有目录里，
 //  路径不可由请求方指定（不构成任意文件读取）；模型删除只允许删**清单里那三个
 //  文件名**（不允许任意路径删除）。
@@ -121,7 +121,7 @@ type sttJob struct {
 // NewSTTServer 造一个服务实例。
 func NewSTTServer(opt STTOptions) *STTServer {
 	if strings.TrimSpace(opt.Listen) == "" {
-		opt.Listen = fmt.Sprintf("127.0.0.1:%d", services.STTPort)
+		opt.Listen = fmt.Sprintf("0.0.0.0:%d", services.STTPort) // 用户 2026-09-23：局域网直连
 	}
 	if opt.SyncMaxSeconds <= 0 {
 		opt.SyncMaxSeconds = services.STTSyncMaxSeconds

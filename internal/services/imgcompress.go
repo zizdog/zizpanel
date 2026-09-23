@@ -142,7 +142,8 @@ func (m *Manager) imgCompressPaths() imgCompressPaths {
 // 也不该在用户没明确要的情况下扩大暴露面。要给别人用就走面板的 /imgcompress/
 // 别名（那条路要求先登录面板）。
 func imgCompressListen(port int) string {
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	// 绑 0.0.0.0（用户 2026-09-23 要求局域网直连端口）。⚠️ 界面无登录保护。
+	return fmt.Sprintf("0.0.0.0:%d", port)
 }
 
 // imgCompressPlist 生成 LaunchDaemon 定义。

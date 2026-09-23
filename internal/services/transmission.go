@@ -71,8 +71,8 @@ func (m *Manager) transmissionLogPath() string {
 
 // transmissionDesiredSettings 是面板**负责**的那几个键（其余字段原样保留）。
 //
-// rpc-whitelist-enabled 保持 true 而不是放开：它只绑回环 + 白名单只含回环，
-// 等于"即使口令被猜到也进不来"的第二道门。用户要局域网访问时自行改这两项。
+// rpc-whitelist-enabled 必须关掉：绑 0.0.0.0 而白名单只含回环 = 局域网仍然进不来
+// （用户 2026-09-23 要求局域网直连）。门只剩 rpc-username/口令（随机生成、必填）。
 //
 // dht / lpd（LSD 局域网发现）/ port-forwarding（UPnP-NAT-PMP）的取舍：
 //   - lpd 与 port-forwarding 走**局域网组播**，会触发 macOS「本地网络」授权弹窗
@@ -86,8 +86,8 @@ func transmissionDesiredSettings(user, password string) map[string]any {
 		"rpc-authentication-required": true,
 		"rpc-username":                user,
 		"rpc-password":                password,
-		"rpc-bind-address":            "127.0.0.1",
-		"rpc-whitelist-enabled":       true,
+		"rpc-bind-address":            "0.0.0.0", // 用户 2026-09-23：局域网直连（RPC 有用户名/口令保护）
+		"rpc-whitelist-enabled":       false,
 		"rpc-whitelist":               "127.0.0.1,::1",
 		"rpc-port":                    transmissionPort,
 		// dht 必须开：磁力链没有 tracker 时唯一能找到 peer 的途径（不上本地网络）。

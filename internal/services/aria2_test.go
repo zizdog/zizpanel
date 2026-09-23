@@ -110,10 +110,11 @@ func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 	conf := aria2Conf(p, "SECRET123")
 	for _, want := range []string{
 		"dir=" + filepath.Join(home, "Downloads"), // 用户要的默认下载目录
-		"rpc-listen-all=false",                    // RPC 只绑回环（浏览器走面板代理）
+		"rpc-listen-all=true",                     // 用户 2026-09-23：局域网直连（靠 rpc-secret 保护）
 		fmt.Sprintf("rpc-listen-port=%d", Aria2RPCPort),
 		"rpc-secret=SECRET123",
 		"enable-rpc=true",
+		"rpc-listen-all=true", // 用户 2026-09-23：局域网直连（RPC 有 rpc-secret）
 		"bt-enable-lpd=false", // 关 lpd：macOS 的"查找本地网络设备"弹窗就是它引起的
 		"enable-dht=true",     // DHT 是公网单播，不弹窗，磁力链要靠它
 		"save-session=" + p.Session,
@@ -123,8 +124,8 @@ func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 			t.Errorf("配置里缺少 %q\n实际：\n%s", want, conf)
 		}
 	}
-	if strings.Contains(conf, "rpc-listen-all=true") {
-		t.Error("RPC 绝不能绑到局域网：浏览器经面板的 /aria/jsonrpc 代理就够了")
+	if !strings.Contains(conf, "rpc-secret=SECRET123") {
+		t.Error("RPC 绑了局域网就必须有 rpc-secret，否则同网段任何人都能操纵下载器")
 	}
 }
 

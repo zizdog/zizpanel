@@ -173,7 +173,7 @@ func TestZizvideoSuperviseArgsArePanelBinaryAndRealUserPaths(t *testing.T) {
 		{"--config", p.ConfigPath},
 		{"--home", p.Home},
 		{"--log-dir", p.LogDir},
-		{"--listen", "127.0.0.1:7766"},
+		{"--listen", "0.0.0.0:7766"}, // 用户 2026-09-23：局域网直连
 	} {
 		i := indexOfToken(args, kv.flag)
 		if i < 0 || i+1 >= len(args) || args[i+1] != kv.want {
@@ -201,7 +201,7 @@ func TestZizvideoPlistIsSystemDaemonAndArgsAreExact(t *testing.T) {
 		"<string>--home</string>",
 		"<string>" + p.Home + "</string>",
 		"<string>--listen</string>",
-		"<string>127.0.0.1:7766</string>",
+		"<string>0.0.0.0:7766</string>",
 	}
 	last := -1
 	for _, want := range wantOrder {

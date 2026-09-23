@@ -422,7 +422,7 @@ func TestNavStandalonePageIsPublicAndReadOnly(t *testing.T) {
 // 这样 `http://<主机>/nav/` 才能当浏览器首页。
 // （生成出来的整段 location 会在用户点「打开」/整理默认站点时写进 000-default.conf。）
 func TestNavAliasInAppProxyEntries(t *testing.T) {
-	entries := appProxyEntries()
+	entries := appProxyEntries(true)
 	found := false
 	for _, e := range entries {
 		if e.Slug == "nav" {
@@ -433,7 +433,7 @@ func TestNavAliasInAppProxyEntries(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("appProxyEntries() 里缺少 nav 条目 —— /nav/ 别名不会进 nginx 配置")
+		t.Fatal("appProxyEntries(true) 里缺少 nav 条目 —— /nav/ 别名不会进 nginx 配置")
 	}
 	block := appProxyBlock(entries, "127.0.0.1:8443")
 	for _, need := range []string{

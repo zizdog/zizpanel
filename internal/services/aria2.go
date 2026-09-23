@@ -202,7 +202,7 @@ func aria2Conf(p Aria2Paths, secret string) string {
 	b.WriteString("file-allocation=none\n")
 	b.WriteString("max-concurrent-downloads=5\n")
 	b.WriteString("enable-rpc=true\n")
-	b.WriteString("rpc-listen-all=false\n")
+	b.WriteString("rpc-listen-all=true\n") // 用户 2026-09-23：局域网要直连 RPC（有 rpc-secret 保护）
 	fmt.Fprintf(&b, "rpc-listen-port=%d\n", Aria2RPCPort)
 	fmt.Fprintf(&b, "rpc-secret=%s\n", secret)
 	fmt.Fprintf(&b, "save-session=%s\n", p.Session)

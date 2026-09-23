@@ -77,7 +77,7 @@ func TestAriaStandalonePortServesUIAndRPC(t *testing.T) {
 func TestAriaUIListenerReportsPortConflictHonestly(t *testing.T) {
 	srv, _ := newTestServer(t)
 	// 先占一个端口，再让监听器去绑同一个端口。
-	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	busy, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}

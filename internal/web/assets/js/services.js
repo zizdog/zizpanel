@@ -1394,7 +1394,7 @@ async function openFilebrowserRootModal(s, parentModal) {
       text: '⚠️ 风险与边界：root 指向家目录时，**谁能登录这个 Web UI，谁就能读写整个家目录**'
         + '（含 ~/.ssh、凭据、~/Library/Keychains）。当前版本没有按目录排除的机制，'
         + 'db 里的 --hide-dotfiles 只隐藏列表显示、实测能用 /api/raw/.ssh/id_rsa 直接绕过 —— 隐藏 ≠ 安全。'
-        + '它只绑 127.0.0.1、只经面板 /filebrowser/ 入口访问，不要直接开到局域网/公网。',
+        + '它绑 0.0.0.0 且管着整个家目录（含 .ssh）：登录口令是唯一防线，务必设强口令。',
     }),
   ]);
 
