@@ -91,6 +91,12 @@ func main() {
 		// 拉起（com.zizdog.stt，见 cmd/zizpanel/stt.go）。
 		// 引擎是 Homebrew 的 whisper.cpp（whisper-cli），转码用 ffmpeg。
 		err = cmdSTTServe(rest)
+	case "aria2-supervise":
+		// aria2（下载器）的常驻 supervisor：由**系统级** LaunchDaemon
+		// com.zizdog.aria2 以 root 拉起，fork 后 setuid 到真实用户运行 aria2c ——
+		// 与面板同一代码要求，所以继承面板的 TCC 授权（`dir=~/Downloads` 才写得进去，
+		// 见 cmd/zizpanel/aria2.go 与 internal/services/aria2.go 的 Aria2SuperviseArgs）。
+		err = cmdAria2Supervise(rest)
 	case "zizvideo-supervise":
 		// zizvideo（短视频）的常驻 supervisor：由**系统级** LaunchDaemon
 		// cn.zizpanel.zizvideo 以 root 拉起，fork 后 setuid 到真实用户运行
@@ -163,6 +169,7 @@ func usage() {
   zizpanel imgcompress-serve       启动图片压缩网页界面（由 launchd 托管，默认 127.0.0.1:8890）
   zizpanel speech-serve            启动语音合成网页界面（由 launchd 托管，默认 127.0.0.1:8891；引擎为系统自带 say）
   zizpanel stt-serve               启动语音转文字网页界面（由 launchd 托管，默认 127.0.0.1:8892；引擎为 whisper.cpp + ffmpeg）
+  zizpanel aria2-supervise         拉起并保活 aria2（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel zizvideo-supervise      拉起并保活 zizvideo（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel version                 显示版本
 

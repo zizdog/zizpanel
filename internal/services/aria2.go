@@ -58,9 +58,11 @@ type Aria2Paths struct {
 	Conf        string
 	Session     string
 	DownloadDir string
-	Plist       string
-	OutLog      string
-	ErrLog      string
+	// Bin 是 aria2c 可执行文件（brew 装的），plist 里交给 supervisor 去跑。
+	Bin    string
+	Plist  string
+	OutLog string
+	ErrLog string
 }
 
 func (m *Manager) aria2Paths() Aria2Paths {
@@ -75,10 +77,21 @@ func (m *Manager) aria2Paths() Aria2Paths {
 		Conf:        filepath.Join(root, Aria2ConfName),
 		Session:     filepath.Join(root, Aria2SessionName),
 		DownloadDir: filepath.Join(home, "Downloads"),
+		Bin:         m.aria2cBin(),
 		Plist:       aria2PlistPath(),
 		OutLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.out.log"),
 		ErrLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.err.log"),
 	}
+}
+
+// aria2cBin 返回 brew 装出来的 aria2c 绝对路径（与安装时那条 os.Stat 同源）。
+// 拿不到 brew 前缀就返回空串：宁可让安装器当场拒绝，也不要写出一条指向
+// "某个碰巧叫 aria2c" 的 plist（launchd 的工作目录不是用户家目录，相对路径必挂）。
+func (m *Manager) aria2cBin() string {
+	if b := strings.TrimSpace(m.opt.BrewBin); b != "" {
+		return filepath.Join(filepath.Dir(b), "aria2c")
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +111,8 @@ var (
 	}
 	// aria2RPCProbe 真的问一次 aria2.getVersion（默认实现打本机回环 RPC）。
 	aria2RPCProbe = aria2RPCVersion
+	// aria2Executable 返回面板二进制自身的路径（plist 用它跑 supervisor）。
+	aria2Executable = os.Executable
 	// aria2ReadyTimeout / aria2ReadyInterval 是"等 RPC 起来"的上限与轮询间隔
 	// （单测把它们压到毫秒级，绝不真等 60 秒）。
 	aria2ReadyTimeout  = 60 * time.Second
@@ -215,48 +230,57 @@ func aria2Conf(p Aria2Paths, secret string) string {
 	return b.String()
 }
 
-// aria2Plist 生成系统级 LaunchDaemon 的 plist。
+// Aria2SuperviseArgs 拼出系统 plist 里的 ProgramArguments：**面板自己的二进制** +
+// aria2-supervise + 真实用户与 aria2 的全部路径（冻结契约，改它等于改兼容）。
 //
-// 以**真实用户**身份跑（UserName）：下载文件必须属于用户，root 跑出来的文件
-// 用户在 Finder 里删都删不掉。系统级（不是 ~/Library/LaunchAgents）是无头
-// macOS 重启后它还能自己起来（见 App.SystemDaemon 的说明）。
-func aria2Plist(brewBin, user, root, conf, outLog, errLog string) string {
-	bin := filepath.Join(filepath.Dir(brewBin), "aria2c")
-	if strings.TrimSpace(brewBin) == "" {
-		bin = "aria2c"
+// 为什么让面板托管 aria2（与 zizvideo 同一套，2026-09-23 用户点名）：
+// macOS 的 TCC 授权按 responsible process 的**代码要求**判定。supervisor 与面板同一
+// 代码要求（/opt/zizpanel/bin/zizpanel，固定自签身份 com.zizpanel.panel）⇒ 面板在安装时
+// 拿到的那次「完全磁盘访问权限」直接继承给 aria2，`dir=~/Downloads` 才写得进去。
+//
+// 直跑 `/opt/homebrew/bin/aria2c` 不行：它是 adhoc 签名、身份里带二进制哈希
+// （aria2c-55554944…），每次 brew 升级都变，给它的授权会失效；而后台服务弹不出
+// 授权框，系统会把 open() **挂住**（表现为端口在听、界面永远"连接中…"）。
+func Aria2SuperviseArgs(panelBin, userName string, p Aria2Paths) []string {
+	return []string{
+		panelBin, "aria2-supervise",
+		"--user", userName,
+		"--bin", p.Bin,
+		"--conf", p.Conf,
+		"--root", p.Root,
+		"--home", p.Home,
 	}
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>%s</string>
-    <key>UserName</key>
-    <string>%s</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>%s</string>
-        <string>--conf-path=%s</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>%s</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>%s</string>
-    <key>StandardErrorPath</key>
-    <string>%s</string>
-</dict>
-</plist>
-`, Aria2Label, xmlEscape(user), xmlEscape(bin), xmlEscape(conf), xmlEscape(root),
-		xmlEscape(outLog), xmlEscape(errLog))
+}
+
+// aria2Plist 生成系统级 LaunchDaemon 的 plist（跑的是**面板二进制**的 supervisor）。
+//
+// 刻意**不写 UserName**：这个作业必须以 root 运行 —— supervisor fork 之后用
+// SysProcAttr.Credential 降到真实用户（同 zizvideo，见坑 202）。下载文件必须属于用户，
+// root 跑出来的文件用户在 Finder 里删都删不掉。
+// 系统级（不是 ~/Library/LaunchAgents）是无头 macOS 重启后它还能自己起来。
+func aria2Plist(panelBin, user, root, bin, conf, outLog, errLog string) string {
+	args := Aria2SuperviseArgs(panelBin, user, Aria2Paths{Bin: bin, Conf: conf, Root: root, Home: filepath.Dir(root)})
+	var b strings.Builder
+	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+	b.WriteString("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
+	b.WriteString("<plist version=\"1.0\">\n<dict>\n")
+	fmt.Fprintf(&b, "    <key>Label</key>\n    <string>%s</string>\n", xmlEscape(Aria2Label))
+	b.WriteString("    <key>ProgramArguments</key>\n    <array>\n")
+	for _, a := range args {
+		fmt.Fprintf(&b, "        <string>%s</string>\n", xmlEscape(a))
+	}
+	b.WriteString("    </array>\n")
+	fmt.Fprintf(&b, "    <key>WorkingDirectory</key>\n    <string>%s</string>\n", xmlEscape(root))
+	b.WriteString("    <key>RunAtLoad</key>\n    <true/>\n")
+	b.WriteString("    <key>KeepAlive</key>\n    <true/>\n")
+	b.WriteString("    <key>EnvironmentVariables</key>\n    <dict>\n")
+	b.WriteString("        <key>PATH</key>\n")
+	b.WriteString("        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n")
+	b.WriteString("    </dict>\n")
+	fmt.Fprintf(&b, "    <key>StandardOutPath</key>\n    <string>%s</string>\n", xmlEscape(outLog))
+	fmt.Fprintf(&b, "    <key>StandardErrorPath</key>\n    <string>%s</string>\n", xmlEscape(errLog))
+	b.WriteString("</dict>\n</plist>\n")
+	return b.String()
 }
 
 // InstallAria2 安装 aria2 + 写配置 + 注册系统级服务 + 复核 RPC 真的可用。
@@ -341,7 +365,14 @@ func (m *Manager) InstallAria2(ctx context.Context, app App, result *InstallResu
 	if strings.TrimSpace(p.Plist) == "" {
 		return fmt.Errorf("aria2 的 plist 路径为空")
 	}
-	plist := aria2Plist(m.opt.BrewBin, m.opt.UserName, p.Root, p.Conf, p.OutLog, p.ErrLog)
+	panelBin, err := aria2Executable()
+	if err != nil || strings.TrimSpace(panelBin) == "" {
+		return fmt.Errorf("找不到面板自身的可执行文件路径（supervisor 要用它启动 aria2）: %w", err)
+	}
+	if !filepath.IsAbs(panelBin) || !filepath.IsAbs(strings.TrimSpace(p.Bin)) {
+		return fmt.Errorf("拒绝写入 launchd 起不来的 plist：面板二进制=%q，aria2c=%q（两者都必须是绝对路径）", panelBin, p.Bin)
+	}
+	plist := aria2Plist(panelBin, m.opt.UserName, p.Root, p.Bin, p.Conf, p.OutLog, p.ErrLog)
 	if err := os.WriteFile(p.Plist+".tmp", []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("写入 plist %s 失败（面板需要以 root 运行）：%w", p.Plist, err)
 	}

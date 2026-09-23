@@ -407,3 +407,137 @@ func TestAria2ReadyRemedyNamesMacPrivacyTrap(t *testing.T) {
 		}
 	}
 }
+
+// TestAria2SuperviseArgsPointAtPanelBinary 锁住 2026-09-23 的结构性决定：
+// aria2 由**面板自己的二进制**托管（`<面板> aria2-supervise …`），而不是裸跑
+// /opt/homebrew/bin/aria2c。
+//
+// 为什么必须这样（不是风格问题）：macOS 的 TCC 授权按 responsible process 的代码要求
+// 判定。supervisor 与面板同一代码要求 ⇒ 面板安装时拿到的那次「完全磁盘访问权限」
+// 继承给 aria2，`dir=~/Downloads` 才写得进去；裸跑 aria2c 的 adhoc 身份每次 brew
+// 升级都会变，给它的授权随即失效（真机表现：端口在听、界面永远"连接中…"）。
+func TestAria2SuperviseArgsPointAtPanelBinary(t *testing.T) {
+	home := t.TempDir()
+	// BrewBin 必须给：aria2c 的路径由它推导，拿不到就该在安装时拒绝写 plist。
+	m := NewManager(nil, Options{UserName: "zizdog", UserHome: home,
+		WorkDir: filepath.Join(home, "work"), BrewBin: filepath.Join(home, "bin", "brew")})
+	old := aria2Executable
+	aria2Executable = func() (string, error) { return "/opt/zizpanel/bin/zizpanel", nil }
+	t.Cleanup(func() { aria2Executable = old })
+
+	p := m.aria2Paths()
+	args := Aria2SuperviseArgs("/opt/zizpanel/bin/zizpanel", "zizdog", p)
+
+	if args[0] != "/opt/zizpanel/bin/zizpanel" {
+		t.Fatalf("ProgramArguments[0] 必须是面板自身的二进制，实际 %q", args[0])
+	}
+	if args[1] != "aria2-supervise" {
+		t.Fatalf("ProgramArguments[1] 必须是 aria2-supervise，实际 %q", args[1])
+	}
+	for _, kv := range []struct{ flag, want string }{
+		{"--user", "zizdog"},
+		{"--bin", p.Bin},
+		{"--conf", p.Conf},
+		{"--root", p.Root},
+		{"--home", p.Home},
+	} {
+		i := indexOfToken(args, kv.flag)
+		if i < 0 || i+1 >= len(args) || args[i+1] != kv.want {
+			t.Errorf("%s 后面应是 %q，实际 %v", kv.flag, kv.want, args)
+		}
+	}
+	// 每个路径参数都必须是绝对路径：supervisor 会拒绝相对路径，写在 plist 里等
+	// launchd 起来才报错就太晚了。
+	for _, a := range args {
+		if strings.HasPrefix(a, "--") || a == "aria2-supervise" || a == "/opt/zizpanel/bin/zizpanel" || a == "zizdog" {
+			continue
+		}
+		if !filepath.IsAbs(a) {
+			t.Errorf("参数 %q 不是绝对路径（launchd 的工作目录不是用户家目录）", a)
+		}
+	}
+	// 下载目录仍是 ~/Downloads（用户 2026-09-23 明确要求）：托管只改"谁拉起它"。
+	if p.DownloadDir != filepath.Join(home, "Downloads") {
+		t.Errorf("下载目录默认值必须仍然是 ~/Downloads，实际 %q", p.DownloadDir)
+	}
+}
+
+// TestAria2PlistRunsPanelSupervisorNotBareAria2c 锁住 plist 形态：
+//
+//	· ProgramArguments[0] 是面板二进制、[1] 是 aria2-supervise；
+//	· **不写 UserName**（作业以 root 跑，由 supervisor fork 后降权到真实用户）；
+//	· 仍然带着 aria2c 的绝对路径（supervisor 拿它去 exec）；
+//	· label 与面板自己的 label 不同 —— aria2 是**独立守护进程**，面板重启/升级
+//	  不会顺带杀掉它（下载不中断）。
+func TestAria2PlistRunsPanelSupervisorNotBareAria2c(t *testing.T) {
+	plist := aria2Plist("/opt/zizpanel/bin/zizpanel", "zizdog", "/Users/zizdog/aria",
+		"/opt/homebrew/bin/aria2c", "/Users/zizdog/aria/aria2.conf",
+		"/tmp/o.log", "/tmp/e.log")
+	for _, want := range []string{
+		"<string>/opt/zizpanel/bin/zizpanel</string>",
+		"<string>aria2-supervise</string>",
+		"<string>--user</string>",
+		"<string>zizdog</string>",
+		"<string>/opt/homebrew/bin/aria2c</string>",
+		"<string>/Users/zizdog/aria/aria2.conf</string>",
+		"<string>/Users/zizdog/aria</string>",
+		"<string>/Users/zizdog</string>",
+		"<key>KeepAlive</key>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("plist 里缺少 %q：\n%s", want, plist)
+		}
+	}
+	if strings.Contains(plist, "UserName") {
+		t.Errorf("这个作业必须由 root 跑（supervisor 要 fork 后 setuid 降权），不能写 UserName：\n%s", plist)
+	}
+	if strings.Contains(plist, "--conf-path=") {
+		t.Errorf("不该在 plist 里直接给 aria2c 传 --conf-path（那是 supervisor 的活）：\n%s", plist)
+	}
+	// label 必须与面板自己的守护进程（cn.zizpanel.panel，见 install.sh 的 PANEL_LABEL）
+	// 不同：它们是**兄弟**，面板重启/升级不会顺带杀掉 aria2，下载不中断。
+	if Aria2Label == "cn.zizpanel.panel" {
+		t.Errorf("aria2 必须是与面板不同的独立守护进程（label %q 撞了）", Aria2Label)
+	}
+}
+
+// TestInstallAria2WritesSupervisePlist 端到端锁住"写出来的是托管 plist"：
+// 走一遍 InstallAria2（brew/launchd/RPC 全注入假实现），把真写出来的 plist 读回来断言。
+// 只测 aria2Plist 不够 —— 参数是从安装器那条路上拼出来的。
+func TestInstallAria2WritesSupervisePlist(t *testing.T) {
+	m, _, p, _, _ := aria2Harness(t, true)
+	old := aria2Executable
+	aria2Executable = func() (string, error) { return "/opt/zizpanel/bin/zizpanel", nil }
+	t.Cleanup(func() { aria2Executable = old })
+	oldProbe := aria2RPCProbe
+	aria2RPCProbe = func(context.Context, int, string, time.Duration) (string, error) { return "1.37.0", nil }
+	t.Cleanup(func() { aria2RPCProbe = oldProbe })
+
+	app, ok := FindApp(Aria2AppID)
+	if !ok {
+		t.Fatal("目录里没有 aria2")
+	}
+	if err := m.InstallAria2(context.Background(), app, &InstallResult{App: Aria2AppID, Steps: []string{}}); err != nil {
+		t.Fatalf("安装应当成功：%v", err)
+	}
+	raw, err := os.ReadFile(p.Plist)
+	if err != nil {
+		t.Fatalf("plist 没写出来：%v", err)
+	}
+	plist := string(raw)
+	for _, want := range []string{
+		"<string>/opt/zizpanel/bin/zizpanel</string>",
+		"<string>aria2-supervise</string>",
+		"<string>--bin</string>",
+		"<string>" + p.Bin + "</string>",
+		"<string>--conf</string>",
+		"<string>" + p.Conf + "</string>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("装完的 plist 里缺少 %q：\n%s", want, plist)
+		}
+	}
+	if strings.Contains(plist, "UserName") {
+		t.Errorf("supervisor 作业必须由 root 跑（fork 后降权），不该有 UserName：\n%s", plist)
+	}
+}
