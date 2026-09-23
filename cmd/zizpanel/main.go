@@ -355,6 +355,15 @@ func cmdServe(args []string) error {
 		log.Info("导航页独立入口: %s（隧道可指向 127.0.0.1:%d）", st.URL, st.Port)
 	}
 
+	// AriaNg 独立端口（用户 2026-09-23）：界面 + 同源 RPC 代理只绑 127.0.0.1，
+	// 用户把它反代/隧道出去就能在 https 域名下直接用（界面里 RPC 走同源，不会被
+	// 浏览器的混合内容策略拦成"必须 SSL/WebSocket"）。绑定失败**不阻断启动**。
+	if err := srv.ApplyAriaUIListener(cfg.Aria2UIPort); err != nil {
+		log.Warn("AriaNg 独立端口未生效：%v", err)
+	} else if st := srv.AriaUIListenerState(); st.Running {
+		log.Info("AriaNg 独立入口: %s（反代可指向 127.0.0.1:%d）", st.URL, st.Port)
+	}
+
 	// 一次性"请求系统授权访问外接卷"（macOS 隐私保护）。
 	//
 	// 🚨 铁律（用户 2026-09-19）：**非真机 / 无人在场时绝不触发任何系统授权弹窗**。

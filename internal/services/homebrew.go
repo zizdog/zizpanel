@@ -115,20 +115,39 @@ func brewInstallScriptCandidates() []string {
 // 只看 /usr/bin/xcode-select -p 是不够的：它可能返回一个**并不存在**的路径
 // （苹果的已知行为：装过又删掉 CLT 之后仍然打印路径）。所以再 stat 一下。
 func (m *Manager) cltInstalled(ctx context.Context) bool {
+	ok, _ := m.cltProbe(ctx)
+	return ok
+}
+
+// cltProbe 比 cltInstalled 多交代一件事：**这次到底复核成了没有**。
+//
+// 为什么必须分开（用户 2026-09-23 报障："偶发后台报缺少运行依赖：命令行开发者工具，
+// 刷新后消失"）：`xcode-select -p` 偶发跑不起来（超时/被 kill/系统忙）时，
+// 旧实现一律 return false —— 界面就把"**没查成**"说成"**没装**"，刷新一次又好了。
+// 现在：执行失败 = 未复核（probeErr 非空），只有"命令成功但目录不存在"才是真的没装。
+func (m *Manager) cltProbe(ctx context.Context) (bool, error) {
+	if m.baseEnvCLTProbe != nil { // 单测注入：这是"已复核"的结论
+		return m.baseEnvCLTProbe(ctx), nil
+	}
+	if m.baseEnvCLTFailProbe != nil { // 单测注入：模拟"这次没复核成"
+		if err := m.baseEnvCLTFailProbe(ctx); err != nil {
+			return false, err
+		}
+	}
 	out, err := m.runRoot(ctx, 20*time.Second, "/usr/bin/xcode-select", "-p")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("`xcode-select -p` 没能执行成功：%w", err)
 	}
 	dir := strings.TrimSpace(out)
 	if dir == "" {
-		return false
+		return false, nil // 命令成功但没给出目录 = 确实没装
 	}
 	if _, serr := os.Stat(dir); serr != nil {
-		return false
+		return false, nil // 目录不在了（装过又删）= 确实没装
 	}
 	// 真正的 CLT 在 /Library/Developer/CommandLineTools；
 	// 若指向 Xcode.app，也说明工具可用（有完整 Xcode 的用户不该再被要求装 CLT）
-	return true
+	return true, nil
 }
 
 // parseCLTLabel 从 `softwareupdate -l` 的输出里找出命令行工具的条目名。

@@ -45,6 +45,8 @@ type Server struct {
 
 	// aria2UI 是内置的 AriaNg 界面资源（挂在 /aria/，见 aria2_web.go）。
 	aria2UI fs.FS
+	// ariaUI 管理 AriaNg 的**独立端口**（用户 2026-09-23 要求；见 aria_ui_listen.go）。
+	ariaUI *ariaUIListener
 
 	// ---- 应用市场用的短缓存 ----
 	//
@@ -196,6 +198,7 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 	if ariaUI, err := fs.Sub(assetsFS, aria2AssetDir); err == nil {
 		s.aria2UI = ariaUI
 	}
+	s.ariaUI = &ariaUIListener{s: s}
 	// TCC 指引里"要去系统设置里授权"的那个二进制路径按配置解析一次：
 	// 非默认安装根（BinDir 配在别处）也能给出正确路径。
 	setPanelBinaryForGuide(cfg.BinDir)

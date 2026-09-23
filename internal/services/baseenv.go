@@ -43,14 +43,23 @@ type BaseEnvStatus struct {
 	Ready bool `json:"ready"`
 	// Missing 是缺失项的人类可读名（CLT → Homebrew → ffmpeg/ffprobe 的顺序）。
 	Missing []string `json:"missing"`
+	// ProbeError 非空表示**这次没能复核**（例如 `xcode-select -p` 超时/被杀）。
+	// 未复核 ≠ 缺少：界面必须如实说"没查成、点刷新重试"，不许把它说成"缺依赖"
+	// ——用户 2026-09-23 报的"偶发报缺少命令行开发者工具、刷新后消失"就是这个。
+	ProbeError string `json:"probe_error,omitempty"`
 }
 
 // BaseEnvStatus 只读探测「运行依赖层」缺什么。不装任何东西。
 func (m *Manager) BaseEnvStatus(ctx context.Context) BaseEnvStatus {
 	st := BaseEnvStatus{Missing: []string{}}
 
-	st.CLTOK = m.cltReady(ctx)
-	if !st.CLTOK {
+	cltOK, cltErr := m.cltProbe(ctx)
+	st.CLTOK = cltOK
+	switch {
+	case cltErr != nil:
+		// 没复核成：不列缺失项，只如实交代原因（见 ProbeError 的说明）。
+		st.ProbeError = "命令行开发者工具状态未复核：" + cltErr.Error()
+	case !cltOK:
 		st.Missing = append(st.Missing, "命令行开发者工具")
 	}
 

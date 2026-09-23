@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -190,5 +191,52 @@ func TestBaseEnvironmentSourceNeverInstallsLNMP(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("基础环境安装链里出现了 %q —— 它属于网站环境（一键 LNMP），绝不能装", forbidden)
 		}
+	}
+}
+
+// TestBaseEnvStatusDoesNotClaimMissingCLTWhenProbeFails 锁住用户 2026-09-23 的偶发误报：
+// "后台偶发报缺少运行依赖：命令行开发者工具，刷新后消失"。
+//
+// 真因：`xcode-select -p` 偶发跑不起来（超时/被杀）时被当成"没装 CLT"。
+// 判据：**未复核 ≠ 缺少** —— 探测失败时不许把"命令行开发者工具"列进 missing，
+// 而要给出 probe_error 让界面如实说"没查成、点刷新重试"。
+// 负向对照：命令成功但确实没装（baseEnvCLTProbe 返回 false）时必须照旧报缺失。
+func TestBaseEnvStatusDoesNotClaimMissingCLTWhenProbeFails(t *testing.T) {
+	m, _ := sandboxIdempotentManager(t)
+
+	// ① 探测失败（模拟 xcode-select 超时/被杀）
+	oldProbe, oldFail := m.baseEnvCLTProbe, m.baseEnvCLTFailProbe
+	t.Cleanup(func() { m.baseEnvCLTProbe, m.baseEnvCLTFailProbe = oldProbe, oldFail })
+	m.baseEnvCLTProbe = nil
+	m.baseEnvCLTFailProbe = func(context.Context) error { return errors.New("signal: killed") }
+
+	st := m.BaseEnvStatus(t.Context())
+	if st.CLTOK {
+		t.Error("探测失败时不能报 CLT 已就绪")
+	}
+	for _, miss := range st.Missing {
+		if strings.Contains(miss, "命令行开发者工具") {
+			t.Errorf("探测失败≠缺少：不许把它列成缺失项，实际 missing=%v", st.Missing)
+		}
+	}
+	if st.ProbeError == "" || !strings.Contains(st.ProbeError, "命令行开发者工具") {
+		t.Errorf("必须如实交代「未复核」及原因，实际 probe_error=%q", st.ProbeError)
+	}
+
+	// ② 负向对照：命令成功但没有 CLT → 必须报缺失，且没有 probe_error
+	m.baseEnvCLTFailProbe = nil
+	m.baseEnvCLTProbe = func(context.Context) bool { return false }
+	st2 := m.BaseEnvStatus(t.Context())
+	found := false
+	for _, miss := range st2.Missing {
+		if strings.Contains(miss, "命令行开发者工具") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("确实没装时必须报缺失，实际 missing=%v", st2.Missing)
+	}
+	if st2.ProbeError != "" {
+		t.Errorf("已复核成功时不该有 probe_error，实际 %q", st2.ProbeError)
 	}
 }

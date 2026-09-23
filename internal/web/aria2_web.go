@@ -182,6 +182,24 @@ func (s *Server) handleAria2RPC(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "未登录或会话已过期：请先在面板里登录，再刷新下载界面")
 		return
 	}
+	s.aria2RPCProxy(w, r)
+}
+
+// handleAria2RPCLoopback 是 **AriaNg 独立端口**上的 RPC 代理：不要求面板会话。
+//
+// 边界是"独立端口只绑 127.0.0.1"（只有本机进程 / 隧道 / 用户自己的反代能连），
+// 与导航页独立端口同一取舍；RPC 本身仍由 aria2 的 `rpc-secret` 保护。
+// 少了它，用户把独立端口反代出去后 AriaNg 依然连不上（浏览器没有面板 Cookie）。
+func (s *Server) handleAria2RPCLoopback(w http.ResponseWriter, r *http.Request) {
+	s.aria2RPCProxy(w, r)
+}
+
+// ariaSlugPath 返回界面 slug（不带斜杠）。抽出来是为了让"面板内 /aria/"与
+// "独立端口根路径"两处引用同一个常量，避免改名时漏掉一处。
+func ariaSlugPath() string { return services.Aria2Slug }
+
+// aria2RPCProxy 是两条入口共用的代理实现（是否要求会话由调用方先判）。
+func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 	if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
 		site != "same-origin" && site != "none" {
 		writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求")

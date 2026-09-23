@@ -114,10 +114,12 @@ type Config struct {
 	//
 	// NavListenEnabled 默认 true（新建配置）；它在 Default() 里给值而**不进 fill()**，
 	// 这样老配置也继承默认、而用户显式关掉（写进 false）后不会再被填回来。
-	NavListenEnabled bool   `json:"nav_listen_enabled"`
-	NavListenPort    int    `json:"nav_listen_port"`
-	TLSCert          string `json:"tls_cert"`
-	TLSKey           string `json:"tls_key"`
+	NavListenEnabled bool `json:"nav_listen_enabled"`
+	NavListenPort    int  `json:"nav_listen_port"`
+	// Aria2UIPort 是 AriaNg 独立端口（见 DefaultAria2UIPort 的说明）。
+	Aria2UIPort int    `json:"aria2_ui_port"`
+	TLSCert     string `json:"tls_cert"`
+	TLSKey      string `json:"tls_key"`
 	// AccessMode: any=任意来源, local=仅本机, whitelist=仅白名单
 	AccessMode  string   `json:"access_mode"`
 	IPWhitelist []string `json:"ip_whitelist"`
@@ -236,6 +238,13 @@ const DefaultMirrorBase = "https://mirror.zizdog.com:8888"
 // DefaultNavListenPort 是「导航页独立端口」的默认值（只绑 127.0.0.1，纯 HTTP）。
 const DefaultNavListenPort = 8896
 
+// DefaultAria2UIPort 是 AriaNg 独立端口的默认值（只绑 127.0.0.1，纯 HTTP）。
+//
+// 为什么要有它（用户 2026-09-23）：面板内的 /aria/ 要面板会话，反代出去用不了；
+// 而 AriaNg 在 https 页面里连 http 的 RPC 会被浏览器按混合内容拦掉。独立端口把
+// "界面 + 同源 /jsonrpc 代理"一起端出来，反代 <域名>:<端口> → 127.0.0.1:8898 即可用。
+const DefaultAria2UIPort = 8898
+
 // DefaultUpgradeSource 是在线升级的**默认源 = 公网镜像站**（用户 2026-09-22：
 // "请确保新安装的 panel 一定得是 https://mirror.zizdog.com:8888/zizpanel"）。
 //
@@ -311,6 +320,7 @@ func Default() *Config {
 		// 内置界面端口不冲突）。端口被占用时**不阻断启动**，如实报错并由
 		// 「面板设置」显示生效状态（见 internal/web/nav_listen.go）。
 		NavListenEnabled: true,
+		Aria2UIPort:      DefaultAria2UIPort,
 		NavListenPort:    DefaultNavListenPort,
 		// 有界面的应用默认挂到 /<slug>/ 下（用户明确要求；可在设置里关掉）
 		AppProxy: true,

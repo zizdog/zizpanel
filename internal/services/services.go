@@ -189,6 +189,9 @@ type Manager struct {
 	// 测试机是否装了 CLT 而变 —— 那正是"单测不许碰真实环境"禁止的
 	// （见 baseenv.go 的 BaseEnvStatus）。
 	baseEnvCLTProbe func(ctx context.Context) bool
+	// baseEnvCLTFailProbe 仅供测试：模拟"这次没复核成"（xcode-select 超时/被杀），
+	// 用来锁住"未复核 ≠ 缺少"（用户 2026-09-23 的偶发误报）。
+	baseEnvCLTFailProbe func(ctx context.Context) error
 	// launchdDirsOverride 仅供测试：替换 launchd 里找 plist 的目录集合。
 	//
 	// 没有它，单测会去读真机 /Library/LaunchDaemons —— 本机恰好把 php@8.2

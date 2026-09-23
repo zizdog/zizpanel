@@ -397,6 +397,7 @@ func (s *Server) settingsView(ctx context.Context) map[string]any {
 		// 并在绑不上时看到后端原文（不谎报"已生效"）。
 		"nav_listen_enabled":     s.Cfg.NavListenEnabled,
 		"nav_listen_port":        s.Cfg.NavListenPort,
+		"aria2_ui_port":          s.Cfg.Aria2UIPort,
 		"nav_listen_running":     s.NavListenerState().Running,
 		"nav_listen_active_port": s.NavListenerState().Port,
 		"nav_listen_url":         s.NavListenerState().URL,
@@ -472,6 +473,8 @@ type settingsReq struct {
 	// 绑定失败就 400 贴后端原文 —— 绝不"存了却没生效"。
 	NavListenEnabled *bool `json:"nav_listen_enabled"`
 	NavListenPort    *int  `json:"nav_listen_port"`
+	// Aria2UIPort 是 AriaNg 独立端口（见 config.DefaultAria2UIPort）。
+	Aria2UIPort *int `json:"aria2_ui_port"`
 }
 
 // handleSaveSettings 保存可热更新的设置。
@@ -674,6 +677,20 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.NavListenEnabled = enabled
 		cfg.NavListenPort = port
+	}
+
+	// AriaNg 独立端口：同样**先绑成功再落库**（换端口失败时旧监听继续服务）。
+	if req.Aria2UIPort != nil {
+		port := *req.Aria2UIPort
+		if err := ValidateAria2UIPort(port); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.ApplyAriaUIListener(port); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cfg.Aria2UIPort = port
 	}
 
 	if err := cfg.Save(); err != nil {

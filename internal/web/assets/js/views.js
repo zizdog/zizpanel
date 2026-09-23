@@ -200,7 +200,9 @@ export function DashboardView(content, ctx = {}) {
     const arr = Array.isArray(data && data.missing) ? data.missing.filter(Boolean) : [];
     if (arr.length) return arr.map((x) => String(x));
     const out = [];
-    if (data && data.clt_ok === false) out.push('命令行开发者工具');
+    // ⚠️ probe_error 非空 = 这次**没复核成**（例如 xcode-select 超时/被杀）：
+    // 不许把它当成"缺命令行开发者工具"（用户 2026-09-23 的偶发误报就是这条兜底干的）。
+    if (data && data.clt_ok === false && !data.probe_error) out.push('命令行开发者工具');
     if (data && data.brew_ok === false) out.push('Homebrew');
     if (data && data.deps_ok === false) out.push('ffmpeg');
     return out;
@@ -225,6 +227,19 @@ export function DashboardView(content, ctx = {}) {
 
   // 运行依赖有缺项：逐项列出缺什么。
   function renderBaseEnvMissing(data) {
+    // 后端说"这次没复核成"时，如实说未复核 + 原因，**不**列缺项、也不给"安装"按钮的误导。
+    if (data && data.probe_error) {
+      baseEnvNotice.replaceChildren();
+      baseEnvNotice.append(h('div.card', {
+        style: { borderLeft: '4px solid #e6a23c', marginBottom: '14px' },
+      }, [
+        h('div.card-body', [
+          h('div', { style: { fontWeight: '600', marginBottom: '6px' }, text: '⚠ 运行依赖状态未复核' }),
+          h('div.hint', { text: String(data.probe_error) + '　点页面右上角的「🔄」重试一次。' }),
+        ]),
+      ]));
+      return;
+    }
     const missing = missingList(data);
     const known = missing.length > 0;
     // 只有后端明确说 CLT 已就绪时才加这句（否则就是在替后端编状态）。
