@@ -1,10 +1,12 @@
 package web
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -649,4 +651,54 @@ func TestMarketProxyURLOnlyWhenAliasEnabled(t *testing.T) {
 	check(false)
 	t.Cleanup(func() { srv.Cfg.AppProxy = false })
 	check(true)
+}
+
+// TestAria2CardUsesStandaloneUIPortNotPanelSubpath 锁住用户 2026-09-23 的第二条：
+// 「统一改为端口访问」——aria2 的卡片不能再把面板子路径 /aria/ 当主入口。
+//
+// 为什么要单测：aria2 的「打开」原来是 SelfConf 子路径（需先登录面板），而它的界面
+// 其实由面板端在**独立端口**上（绑 0.0.0.0、免会话）。而它自己的端口 6800 只是
+// JSON-RPC，浏览器打开是空的 —— 所以"改端口访问"在这里不是换个数字，必须换成
+// AriaNg 那个端口。同时保留退路：独立端口没在听时仍给 /aria/，不给必然打不开的链接。
+func TestAria2CardUsesStandaloneUIPortNotPanelSubpath(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	// ① 独立端口没在听：保留面板子路径（否则点开必然打不开）
+	srv.Cfg.Aria2UIPort = 0
+	it := marketItem(t, ts, cookies, services.Aria2AppID)
+	ui, _ := it["ui"].(map[string]any)
+	if asString(ui["slug"]) == "" {
+		t.Errorf("独立端口没在听时应保留 /aria/ 子路径入口，实际 %v", it["ui"])
+	}
+
+	// ② 端口真在听：必须给端口直连，并且不再下发子路径
+	free := freeTCPPort(t)
+	srv.Cfg.Aria2UIPort = free
+	if err := srv.ApplyAriaUIListener(free); err != nil {
+		t.Fatalf("起 AriaNg 独立端口失败：%v", err)
+	}
+	t.Cleanup(func() { srv.Cfg.Aria2UIPort = 0 })
+
+	it2 := marketItem(t, ts, cookies, services.Aria2AppID)
+	want := ":" + strconv.Itoa(free) + "/"
+	if got := asString(it2["port_url"]); !strings.Contains(got, want) {
+		t.Errorf("「打开」应指向 AriaNg 独立端口 %d（实际 port_url=%q）—— 6800 只是 RPC，不是界面", free, got)
+	}
+	if ui2, _ := it2["ui"].(map[string]any); asString(ui2["slug"]) != "" {
+		t.Errorf("端口在听时不该再把面板子路径当主入口，实际 %v", it2["ui"])
+	}
+}
+
+// freeTCPPort 借一个当前空闲的端口号（绑了就放，测试里够用）。
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
 }

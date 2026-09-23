@@ -1712,8 +1712,8 @@ func builtinCatalog() []App {
 			UI: &AppUI{
 				Slug:     Aria2Slug,
 				SelfConf: true, // 界面由面板自己的路由托管，不要生成 app-proxy
-				Note: "「打开」是面板托管的 AriaNg 界面（/" + Aria2Slug +
-					"/，需先登录面板）；也有独立端口 http://<本机IP>:8898/，RPC 绑 0.0.0.0（靠 rpc-secret 保护）。",
+				Note: "「打开」走 AriaNg 的独立端口（默认 8898，绑 0.0.0.0、免面板登录）；" +
+					"那个端口没在听时退回面板内 /" + Aria2Slug + "/。RPC 在 6800（绑 0.0.0.0，靠 rpc-secret 保护），不是网页入口。",
 			},
 			Summary:     "多协议下载器（HTTP/FTP/BT/磁力）+ 网页界面，多线程、可续传",
 			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/Downloads，重启后队列还能续上。",

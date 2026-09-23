@@ -1070,6 +1070,20 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if s.Cfg.AppProxy && a.UI != nil && a.UI.Slug != "" && lanIP != "" {
 			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
 		}
+		// aria2 的界面**不在它自己的端口上**（6800 只是 JSON-RPC，浏览器打开是空的/报错）：
+		// 面板把 AriaNg 端在独立端口上（绑 0.0.0.0、免面板会话，见 aria_ui_listen.go）。
+		// 那个端口真的在听时，「打开」给**端口直连**并去掉子路径 —— 用户 2026-09-23：
+		// "统一改为端口访问"，别再把面板子路径 /aria/ 当成主入口；没在听就退回 /aria/。
+		if a.ID == services.Aria2AppID && s.Cfg.Aria2UIPort > 0 && lanIP != "" {
+			if st := s.AriaUIListenerState(); st.Running && st.Port > 0 {
+				portURL = fmt.Sprintf("http://%s:%d/", lanIP, st.Port)
+				if a.UI != nil && a.UI.Slug != "" {
+					ui := *a.UI
+					ui.Slug = ""
+					a.UI = &ui
+				}
+			}
+		}
 		// 找这条目录对应的面板记录（label / 名称 / ID 三种写法都认）
 		var rec *services.Service
 		for _, key := range []string{a.ServiceLabel, a.AdoptLabel, a.ID, a.Name} {
