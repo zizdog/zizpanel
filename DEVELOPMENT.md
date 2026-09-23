@@ -135,6 +135,9 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
   没声明 `if_missing=create` → 如实记"跳过（该应用通常是首次启动才生成配置）"。
 - 「照文档从零接入一个应用」的全链路：`tools/plugin-author-check.sh`（init → 改 → validate/plan →
   放进插件目录 → 面板启用 → 回读市场卡片逐字段核对 → 停用清干净）。**不含安装**（B2c）。
+- 本地插件的**端口撞车当场拒绝**（撞自带应用或别的插件）：端口是面板的不变量，撞了就是
+  "卡片能出现、两个应用抢一个端口，一个起不来"，用户只会看到"装完打不开"。
+  门禁 `TestLocalPluginPortConflict`（撞自带 3000 / 两个插件互撞 / 独立端口三组，按 id 升序判、结果稳定）。
 - 门禁：`internal/plugins` 的补丁用例（kv/ini/yaml、前缀不误伤、section 隔离、幂等、缩进与
   注释保留、注入拒绝、PlanText 必须写出补丁）+ `internal/services` 的接线用例（写入/备份/幂等/
   跳过/写失败进 Warning/声明→App 的值是拷贝）。

@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -215,6 +216,22 @@ func LocalPluginStatus(enabled map[string]bool) []LocalPluginStatusView {
 		}
 		out = append(out, v)
 	}
+	// 端口撞车：本地插件自己选端口，很容易撞上自带应用（3000 是 Gitea、8080 是 IOPaint…）。
+	// 撞了就是"卡片能出现、两个应用抢一个端口" ⇒ 面板的不变量（端口唯一）被用户输入破坏，
+	// 而用户只会看到"装完起不来"。所以**当场拒绝**并说清撞的是谁 —— 与 B2a 的
+	// "不支持的形态如实拒绝"同一条路子。
+	ports := map[string]int{}
+	for _, e := range entries {
+		if e.Spec != nil && e.Spec.Expose != nil {
+			if e.Spec.Expose.Port > 0 {
+				ports[e.ID] = e.Spec.Expose.Port
+			} else if e.Spec.Expose.UIPort > 0 {
+				ports[e.ID] = e.Spec.Expose.UIPort
+			}
+		}
+	}
+	markPortConflicts(out, ports)
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ID != out[j].ID {
 			return out[i].ID < out[j].ID
@@ -248,3 +265,53 @@ var builtinCatalogIDs = func() map[string]struct{} {
 	}
 	return m
 }()
+
+// markPortConflicts 给"端口与自带应用/其它插件撞车"的条目打上不可安装的理由。
+//
+// 判据（顺序固定，结果确定）：
+//
+//	· 先收自带应用占用的端口（含插件表新增的那几个：prometheus/netdata/grafana/code-server…）；
+//	· 再按 id 升序扫本地插件，谁先声明谁占住，后来的那个被拒；
+//	  —— 这样两个插件撞车时，**不会因为 map 遍历顺序不同而这次拒 A、下次拒 B**。
+func markPortConflicts(items []LocalPluginStatusView, ports map[string]int) {
+	taken := map[int]string{}
+	for _, a := range builtinCatalog() {
+		if a.Port > 0 {
+			if _, ok := taken[a.Port]; !ok {
+				taken[a.Port] = "面板自带应用「" + a.Name + "」"
+			}
+		}
+	}
+	for _, a := range builtinPluginOnlyApps() {
+		if a.Port > 0 {
+			if _, ok := taken[a.Port]; !ok {
+				taken[a.Port] = "面板自带应用「" + a.Name + "」"
+			}
+		}
+	}
+	ids := make([]string, 0, len(items))
+	byID := map[string]*LocalPluginStatusView{}
+	for i := range items {
+		if items[i].Valid {
+			ids = append(ids, items[i].ID)
+			byID[items[i].ID] = &items[i]
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		v := byID[id]
+		port := ports[v.ID]
+		if port <= 0 {
+			continue
+		}
+		if owner, ok := taken[port]; ok {
+			v.Valid = false
+			v.Installable = false
+			v.Plan = ""
+			v.Error = "端口 " + strconv.Itoa(port) + " 已被" + owner + "占用：换一个端口（面板的每个应用必须有独立端口，" +
+				"否则两个应用抢同一个端口，先起来的那个赢、另一个起不来）"
+			continue
+		}
+		taken[port] = "本地插件「" + v.Name + "」"
+	}
+}

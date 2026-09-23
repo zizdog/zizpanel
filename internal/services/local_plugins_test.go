@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -144,5 +145,53 @@ func TestLocalPluginAppRejectsUnsupported(t *testing.T) {
 	}
 	if _, err := LocalPluginApp(spec); err == nil {
 		t.Error("内建 syncthing 的 id 与目录重名，映射应当拒绝")
+	}
+}
+
+// TestLocalPluginPortConflict 本地插件撞上自带应用的端口必须**当场拒绝**（不是装上再失败）。
+//
+// 为什么值得一条门禁：端口是面板的不变量（每个应用一个独立端口）。用户随手填 3000
+// （Gitea）或 8080（IOPaint）时，卡片能出现、两个应用抢同一个端口，先起来的赢、
+// 另一个起不来 —— 用户只会看到"装完打不开"。所以这里如实拒绝并说清撞的是谁。
+func TestLocalPluginPortConflict(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := func(id string, port int) string {
+		return `{
+		  "schema": "zizpanel.app/v1", "id": "` + id + `", "name": "` + id + `", "icon": "🧩",
+		  "source": {"kind": "brew", "formula": "` + id + `", "checksum": "sha256"},
+		  "run": {"mode": "brew-service"},
+		  "expose": {"port": ` + strconv.Itoa(port) + `, "bind": "0.0.0.0"},
+		  "verify": {"any_of": [{"kind": "port", "port": ` + strconv.Itoa(port) + `, "timeout": "30s"}]},
+		  "health": {"kind": "port", "port": ` + strconv.Itoa(port) + `},
+		  "uninstall": {"optional_data": ["~/` + id + `"], "formula": "` + id + `"}
+		}`
+	}
+	write("a-builtin-clash.json", spec("aaa-clash", 3000)) // 3000 = Gitea（自带）
+	write("b-plugin-clash.json", spec("bbb-clash", 19991))
+	write("c-plugin-same.json", spec("ccc-same", 19991)) // 与 b 撞
+	write("d-free.json", spec("ddd-free", 19992))
+	SetLocalPluginDir(dir)
+	t.Cleanup(func() { SetLocalPluginDir("") })
+
+	got := map[string]LocalPluginStatusView{}
+	for _, v := range LocalPluginStatus(nil) {
+		got[v.ID] = v
+	}
+	if v := got["aaa-clash"]; v.Installable || !strings.Contains(v.Error, "3000") || !strings.Contains(v.Error, "自带") {
+		t.Errorf("撞自带端口的条目必须被拒并说清撞的是谁：%+v", v)
+	}
+	if v := got["bbb-clash"]; !v.Installable {
+		t.Errorf("没撞车的条目应当可安装：%+v", v)
+	}
+	if v := got["ccc-same"]; v.Installable || !strings.Contains(v.Error, "19991") {
+		t.Errorf("两个插件撞同一个端口时，按 id 升序后者被拒：%+v", v)
+	}
+	if v := got["ddd-free"]; !v.Installable {
+		t.Errorf("独立端口的条目应当可安装：%+v", v)
 	}
 }
