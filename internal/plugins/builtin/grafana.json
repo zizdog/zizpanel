@@ -1,0 +1,72 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "grafana",
+  "name": "Grafana（可视化面板）",
+  "icon": "📉",
+  "summary": "把 Prometheus 之类的指标画成看板",
+  "notes": [
+    "面板安装时会把它的监听端口改成 3002：grafana 默认的 3000 会与 Gitea 撞端口（谁先起来谁占住，另一个起不来）。",
+    "默认还没有数据源：装完在 grafana 里加一个 Prometheus（本机 http://127.0.0.1:9090）就能出图。",
+    "首次打开要求改管理员口令（默认 admin/admin），没改之前不要暴露到公网。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "grafana",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/grafana/grafana.ini",
+    "format": "ini",
+    "section": "server",
+    "mode": "0644",
+    "own": "user",
+    "set": {
+      "http_addr": "",
+      "http_port": "3002"
+    }
+  },
+  "expose": {
+    "port": 3002,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "http",
+        "path": "/api/health",
+        "expect": "ok",
+        "timeout": "90s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/api/health",
+    "expect": "ok",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.grafana.plist"
+    ],
+    "optional_data": [
+      "{brew}/var/lib/grafana"
+    ],
+    "formula": "grafana",
+    "keep_note": "默认保留看板数据库与插件（{brew}/var/lib/grafana）；勾选「删除数据」才会删 —— 看板都在里面。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      3002
+    ]
+  }
+}

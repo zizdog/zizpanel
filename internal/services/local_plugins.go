@@ -114,7 +114,11 @@ func SpecToApp(spec *plugins.Spec) (App, error) {
 		Category:    CategoryTool,
 		Kind:        KindNative,
 		BrewFormula: spec.Source.Formula,
-		Port:        spec.Expose.Port,
+	}
+	// expose 是可选字段（不带界面的应用可以不写）—— 直接解引用会让面板 panic，
+	// 于是一条合法声明就能把整个市场接口搞挂（单测抓到过）。
+	if spec.Expose != nil {
+		app.Port = spec.Expose.Port
 	}
 	if spec.Requires != nil && spec.Requires.SystemDaemon {
 		app.SystemDaemon = true
@@ -129,6 +133,17 @@ func SpecToApp(spec *plugins.Spec) (App, error) {
 	}
 	if spec.Config != nil {
 		app.ConfigPath = spec.Config.Path
+		if len(spec.Config.Set) > 0 {
+			// 值拷贝一份：插件声明可能被复用/复用后又被改，别让 App 拿着共享 map。
+			set := make(map[string]string, len(spec.Config.Set))
+			for k, v := range spec.Config.Set {
+				set[k] = v
+			}
+			app.ConfigPatch = &plugins.Patch{
+				Format: spec.Config.Format, Section: spec.Config.Section,
+				Set: set, IfMissing: spec.Config.IfMissing,
+			}
+		}
 	}
 	// 给用户的说明：本地插件的身份与"停用 ≠ 卸载"，别让人以为停用就把东西删了。
 	app.PostInstallHint = strings.Join(spec.Notes, "") +

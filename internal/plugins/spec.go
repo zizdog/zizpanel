@@ -97,6 +97,16 @@ type Config struct {
 	Mode    string   `json:"mode,omitempty"`    // 默认 0600
 	Secrets []string `json:"secrets,omitempty"` // 随机生成并只展示一次的密钥名（安装结果凭据区）
 	Own     string   `json:"own,omitempty"`     // user（默认）| root
+	// Set 是**声明式配置补丁**：装上之后把配置里的这几个键改成这些值
+	// （见 patch.go）。有了它，"只差一行配置"的应用（改监听地址/端口）才能靠填表上架，
+	// 而不必为每个应用写一个面板内建补丁。
+	Set map[string]string `json:"set,omitempty"`
+	// Format 是配置文件格式：kv（默认）/ ini / yaml。
+	Format string `json:"format,omitempty"`
+	// Section 只在 ini 里有意义（限定改哪一节）。
+	Section string `json:"section,omitempty"`
+	// IfMissing：配置文件还不存在时怎么办：skip（默认，不动）/ create（新建最小文件）。
+	IfMissing string `json:"if_missing,omitempty"`
 }
 
 // Expose 是"用户从哪里打开它"。**一个应用只有一个规范入口。**
@@ -295,6 +305,19 @@ func (s *Spec) Validate() error {
 		default:
 			add("config.own 只能是 user / root，实际 %q", s.Config.Own)
 		}
+		// 声明式配置补丁（patch.go）：键名形状、值不许带换行、格式与 section 的搭配。
+		for _, e := range ValidatePatch(&Patch{
+			Format: s.Config.Format, Section: s.Config.Section,
+			Set: s.Config.Set, IfMissing: s.Config.IfMissing,
+		}) {
+			add("config：%s", e)
+		}
+		// 补丁与"随机密钥"写同一个键会互相覆盖，必须当场说清（静默的覆盖最难查）。
+		for _, name := range s.Config.Secrets {
+			if _, dup := s.Config.Set[name]; dup {
+				add("config.secrets 里的 %q 与 config.set 撞了同一个键（两者都会写它，谁赢取决于顺序）", name)
+			}
+		}
 	}
 
 	// ---- expose ----
@@ -473,13 +496,23 @@ func PlanText(s *Spec) string {
 		b.WriteString("  3. 服务：无守护进程（纯网页/由 nginx 提供）\n")
 	}
 
-	// ④ 暴露
+	// ④ 配置补丁与暴露
+	if s.Config != nil && len(s.Config.Set) > 0 {
+		fmt.Fprintf(&b, "  4. 配置补丁：改 %s（%s）→ %s\n",
+			s.Config.Path, NormalizeFormat(s.Config.Format), PatchText(&Patch{
+				Format: s.Config.Format, Section: s.Config.Section,
+				Set: s.Config.Set, IfMissing: s.Config.IfMissing,
+			}))
+		if s.Config.IfMissing != "create" {
+			b.WriteString("     文件还不存在时不动它（不少应用是首次启动才生成配置）\n")
+		}
+	}
 	if s.Expose != nil {
 		port := s.Expose.Port
 		if port == 0 {
 			port = s.Expose.UIPort
 		}
-		fmt.Fprintf(&b, "  4. 入口：http://<本机IP>:%d/（绑定 %s）", port, orDefault(s.Expose.Bind, "0.0.0.0"))
+		fmt.Fprintf(&b, "  5. 入口：http://<本机IP>:%d/（绑定 %s）", port, orDefault(s.Expose.Bind, "0.0.0.0"))
 		if s.Expose.UI != "" {
 			fmt.Fprintf(&b, "，界面形态 %s", s.Expose.UI)
 		}
@@ -491,15 +524,15 @@ func PlanText(s *Spec) string {
 	for _, p := range s.Verify.AnyOf {
 		vs = append(vs, probeText(p))
 	}
-	fmt.Fprintf(&b, "  5. 安装收尾验收（真的跑一次，失败即报错）：%s\n", strings.Join(vs, " 或 "))
-	fmt.Fprintf(&b, "  6. 健康判据（列表/卡片用，%s）：%s\n", orDefault(s.Health.Interval, "默认间隔"), probeText(s.Health.Probe))
+	fmt.Fprintf(&b, "  6. 安装收尾验收（真的跑一次，失败即报错）：%s\n", strings.Join(vs, " 或 "))
+	fmt.Fprintf(&b, "  7. 健康判据（列表/卡片用，%s）：%s\n", orDefault(s.Health.Interval, "默认间隔"), probeText(s.Health.Probe))
 	if s.Health.Kind == "process" || s.Health.Kind == "port" {
 		b.WriteString("     ⚠️ process/port 只证明「进程在跑/端口在听」，不证明服务可用 —— 卡片必须如实这么写\n")
 	}
 
 	// ⑦ 登记 + 卸载
-	fmt.Fprintf(&b, "  7. 登记：服务管理 + 市场卡片；已安装判据与卸载计划由面板统一生成\n")
-	fmt.Fprintf(&b, "  8. 卸载：停服务")
+	fmt.Fprintf(&b, "  8. 登记：服务管理 + 市场卡片；已安装判据与卸载计划由面板统一生成\n")
+	fmt.Fprintf(&b, "  9. 卸载：停服务")
 	if len(s.Uninstall.Always) > 0 {
 		fmt.Fprintf(&b, " → 删 %s", strings.Join(s.Uninstall.Always, ", "))
 	}

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/plugins"
 	"github.com/zizdog/zizpanel/internal/priv"
 )
 
@@ -81,6 +82,13 @@ type App struct {
 	// 但字段与 EntryPort() 保留：那是通用能力，不是 MinIO 专用。
 	// 所以入口 URL 单独一个字段：它只影响 api_services.go 生成的 port_url。
 	DirectPort int `json:"direct_port,omitempty"`
+	// ConfigPatch 是"装完之后要改的配置键值"（声明式补丁，见 plugins.Patch）。
+	//
+	// 为什么放在 App 上而不是让安装器去读插件表：**卡片事实与安装行为必须来自同一个
+	// 真源**。放在这里，`plugin validate/plan` 能预览、安装器照着做、市场卡片显示的端口
+	// 与磁盘上真的监听一致 —— 三者不会漂。
+	ConfigPatch *plugins.Patch `json:"config_patch,omitempty"`
+
 	// ConfigPath 是这个应用的配置文件名（**相对它自己的安装目录**，如 frps.toml）。
 	//
 	// 非空时，服务详情里会多一个「📝 编辑配置文件」入口：面板直接读写这个文件，

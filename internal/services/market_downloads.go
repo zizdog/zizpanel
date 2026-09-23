@@ -1277,6 +1277,17 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 	{
+		ID: "grafana", Kind: KindNative, BrewFormula: "grafana",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.grafana",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-24 实测：run = grafana server --config /opt/homebrew/etc/grafana/grafana.ini）",
+			CatalogGap:  "同 redis",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("grafana", 25*time.Minute, "brew install grafana（面板安装时会把监听端口改成 3002，见插件声明的 config.set）"),
+		},
+	},
+	{
 		ID: "netdata", Kind: KindNative, BrewFormula: "netdata",
 		Runtime: MarketRuntime{
 			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.netdata",

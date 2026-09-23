@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/plugins"
 	"github.com/zizdog/zizpanel/internal/priv"
 )
 
@@ -1303,6 +1304,12 @@ func (m *Manager) installViaBrew(ctx context.Context, app App, res *InstallResul
 	// 2) 交给 brew services 托管（它会写 LaunchAgent 并启动）
 	//    先停再起，避免"已运行但不在 brew 管理下"的状态导致 start 报错
 	//
+	// 2-present) 声明式配置补丁（plugins.Patch）：必须在 **brew services start 之前**改，
+	//     服务起来就是对的配置（监听地址/端口这类改完不重启不生效）。
+	//     失败不让安装失败（与下面的 PHP 端点同一条取舍）：包已经装好，用户仍有
+	//     重启/改配置的入口；但必须如实写进 Warning/Steps，绝不谎报"已按声明配置好"。
+	m.applyConfigPatchStep(ctx, app, res)
+
 	// 2a) 数据库特有：数据目录为空时先初始化（命令按引擎选，见 initMySQLDataDir）。
 	//     不做这一步的话，brew services start 出来的服务会因为数据目录为空直接退出
 	//     （tools/system-services.sh 里 prepare_mysql 就是干这个的，只覆盖 MySQL）。
@@ -2405,4 +2412,102 @@ func appendWarning(cur, add string) string {
 		return add
 	}
 	return cur + "\n" + add
+}
+
+// applyConfigPatchStep 执行应用声明的配置补丁（见 internal/plugins/patch.go）。
+//
+// 三条纪律：
+//
+//	· 只换值：缩进、分隔符写法、行尾注释、其它键与注释**原样保留**；
+//	· 文件不存在且声明的是 if_missing=skip（默认）时**如实跳过**并说明原因 ——
+//	  不少应用是首次启动才生成配置，抢先写一个"最小文件"会把它的默认值全抹掉；
+//	· 面板以 root 写用户目录时必须把归属交还真实用户（AGENTS 第三节第 8 条）。
+func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *InstallResult) {
+	patch := app.ConfigPatch
+	if patch == nil || len(patch.Set) == 0 {
+		return
+	}
+	path := m.appConfigFilePath(app)
+	if path == "" {
+		res.Warning = appendWarning(res.Warning,
+			"配置补丁没生效：这个应用声明了要改配置键值，但面板不知道改哪个文件（缺 config.path）")
+		return
+	}
+	raw, err := os.ReadFile(path)
+	fileExists := true
+	switch {
+	case err != nil && os.IsNotExist(err):
+		fileExists = false
+		raw = nil
+	case err != nil:
+		res.Warning = appendWarning(res.Warning,
+			"配置补丁没生效（"+plugins.PatchText(patch)+"）：读不到 "+path+"（"+err.Error()+"）")
+		return
+	}
+	if !fileExists && patch.IfMissing != "create" {
+		res.step(ctx, "配置补丁：跳过（"+path+" 还不存在；该应用通常是首次启动才生成配置，面板不去抢着写它）")
+		return
+	}
+
+	out, changed := plugins.ApplyPatch(string(raw), *patch)
+	if !changed {
+		res.step(ctx, "配置补丁：已经是目标值，无需修改（"+path+"）")
+		return
+	}
+	mode := os.FileMode(0o644)
+	if fileExists {
+		if fi, statErr := os.Stat(path); statErr == nil {
+			mode = fi.Mode().Perm()
+		}
+		// 只在第一次改之前留一份备份（反复安装不会把备份覆盖成"改过之后"的版本）。
+		if backup := path + ".zizpanel.bak"; !fileExistsAt(backup) {
+			if werr := os.WriteFile(backup, raw, mode); werr != nil {
+				res.Warning = appendWarning(res.Warning, "配置备份写入失败（改动仍会进行）："+werr.Error())
+			}
+		}
+	}
+	if !fileExists {
+		// 声明了 create：连目录一起建（应用还没启动过时它的配置目录可能都不存在）。
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			res.Warning = appendWarning(res.Warning,
+				"配置补丁没生效（"+plugins.PatchText(patch)+"）：建目录失败："+err.Error())
+			return
+		}
+	}
+	if err := os.WriteFile(path, []byte(out), mode); err != nil {
+		res.Warning = appendWarning(res.Warning,
+			"配置补丁没生效（"+plugins.PatchText(patch)+"）：写 "+path+" 失败："+err.Error())
+		return
+	}
+	// 面板是 root，写进用户目录的文件属主必须交还真实用户，否则以该用户身份跑的应用
+	// 可能写不回去（AGENTS 第三节第 8 条）。
+	if os.Geteuid() == 0 && m.opt.UserName != "" {
+		if err := chownPath(m.opt.UserName, path); err != nil {
+			res.Warning = appendWarning(res.Warning,
+				"配置补丁已写入，但没能把 "+path+" 的归属交还用户 "+m.opt.UserName+"："+err.Error())
+		}
+	}
+	note := ""
+	if fileExists {
+		note = "（原文件已备份为 " + path + ".zizpanel.bak）"
+	}
+	res.step(ctx, "配置补丁已应用："+plugins.PatchText(patch)+note)
+}
+
+// appConfigFilePath 解析应用的配置文件绝对路径。
+//
+// {brew} 优先用管理器的 BrewBin 推导——市场/安装路径用的是面板自己那份 Homebrew，
+// 与"编辑配置文件"入口（走 brewPrefixDefault()）可能不同（沙箱/自定义前缀）。
+func (m *Manager) appConfigFilePath(app App) string {
+	rel := strings.TrimPrefix(app.ConfigPath, "{brew}/")
+	if rel != app.ConfigPath && m.opt.BrewBin != "" {
+		return filepath.Join(filepath.Dir(filepath.Dir(m.opt.BrewBin)), rel)
+	}
+	return ConfigFilePath(app, m.opt.UserHome, m.opt.WorkDir)
+}
+
+// fileExistsAt 是 os.Stat 的可读包装（只关心"在不在"）。
+func fileExistsAt(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }

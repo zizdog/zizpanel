@@ -120,6 +120,26 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
 
 ---
 
+## 五点五、用表新增应用：声明式配置补丁
+
+表原来只能描述"装完不用改任何配置"的应用。需要改一行配置的（换监听端口/地址）过去只能
+写一个面板内建补丁 —— 那就退回"一个一个造轮子"。现在表里有 `config.set`：
+
+- 声明写法见 `docs/插件规范.md`；引擎是 `internal/plugins/patch.go`（纯函数 `ApplyPatch`）。
+- **只换值**：缩进、`=`/`:` 的写法、行尾注释、其它键与注释一律原样保留（grafana.ini 整篇
+  是注释掉的默认值，round-trip 解析会把它们吃掉 —— 那是面板偷偷重写用户配置）。
+- 安装路径在 `brew services start` **之前**应用（`services.applyConfigPatchStep`）：服务起来
+  就是对的配置；改动前留 `<file>.zizpanel.bak`（**只留第一次的原文**，反复安装不会把它覆盖成
+  改过之后的版本）；面板是 root 时写完把归属交还真实用户（AGENTS 第三节第 8 条）。
+- **失败不谎报**：读不到/写不进 → `Warning` 里写清"配置补丁没生效 + 原因"；文件还不存在且
+  没声明 `if_missing=create` → 如实记"跳过（该应用通常是首次启动才生成配置）"。
+- 门禁：`internal/plugins` 的补丁用例（kv/ini/yaml、前缀不误伤、section 隔离、幂等、缩进与
+  注释保留、注入拒绝、PlanText 必须写出补丁）+ `internal/services` 的接线用例（写入/备份/幂等/
+  跳过/写失败进 Warning/声明→App 的值是拷贝）。
+- 仍未做：`config.secrets`（随机口令写进配置）、`config.seed`（模板文件）、`run.hooks` 的执行通路。
+
+---
+
 ## 六、应用市场、离线与镜像
 
 - 加一个应用 = 5 步：**`docs/新增应用工作流.md`**（声明 → 静态门禁 → 在线审计 → 真机验收）。

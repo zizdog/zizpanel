@@ -102,6 +102,7 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		// 2026-09-24 插件表新增的监控类应用：指标连续采集要求开机就在。
 		"netdata":    true,
 		"prometheus": true,
+		"grafana":    true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {
