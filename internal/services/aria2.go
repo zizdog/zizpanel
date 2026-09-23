@@ -38,7 +38,7 @@ const (
 	Aria2Label = "com.zizdog.aria2"
 	// Aria2Slug 是面板托管界面的子路径（/aria/）。
 	Aria2Slug = "aria"
-	// Aria2RPCPort 是 aria2 的 JSON-RPC 端口（只绑回环）。
+	// Aria2RPCPort 是 aria2 的 JSON-RPC 端口（绑 0.0.0.0，靠 rpc-secret 保护）。
 	Aria2RPCPort = 6800
 	// Aria2Formula 是 Homebrew 包名。
 	Aria2Formula = "aria2"
@@ -185,8 +185,8 @@ func aria2SecretFromConf(confPath string) string {
 // aria2Conf 生成配置文件内容。
 //
 // 逐条都是"有理由"的，别顺手删：
-//   - rpc-listen-all=false：RPC 只绑回环。浏览器走面板的 /aria/jsonrpc 代理
-//     （见 aria2_web.go），所以**不需要**把它暴露到局域网；
+//   - rpc-listen-all=true：用户 2026-09-23 要求局域网直连；rpc-secret 是唯一防线
+//     （面板仍提供 /aria/jsonrpc 同源代理，见 aria2_web.go）；
 //   - rpc-secret：面板随机生成，用户不必也不该手工设；
 //   - dir：用户要求的默认下载目录（~/Downloads，Finder 里显示为「下载」）；
 //   - bt-enable-lpd=false：lpd 走局域网组播，会触发 macOS 的"查找本地网络设备"
@@ -349,7 +349,7 @@ func (m *Manager) InstallAria2(ctx context.Context, app App, result *InstallResu
 		return fmt.Errorf("安装 plist %s 失败：%w", p.Plist, err)
 	}
 	if result != nil {
-		result.step(ctx, "正在注册并启动系统级服务 "+Aria2Label+"（RPC 只绑 127.0.0.1:"+fmt.Sprint(Aria2RPCPort)+"）")
+		result.step(ctx, "正在注册并启动系统级服务 "+Aria2Label+"（RPC 绑 0.0.0.0:"+fmt.Sprint(Aria2RPCPort)+"）")
 	}
 	if err := aria2Launch(m, ctx, Aria2Label, p.Plist); err != nil {
 		return fmt.Errorf("启动 aria2 失败：%w", err)
@@ -377,7 +377,7 @@ func (m *Manager) InstallAria2(ctx context.Context, app App, result *InstallResu
 			"网页界面：面板托管在 /"+Aria2Slug+"/（从卡片点「打开」，需先登录面板）",
 			"下载目录："+p.DownloadDir+"（卸载时不会动这里的文件）",
 			"会话文件："+p.Session+"（重启后队列还能续上）",
-			"RPC：http://127.0.0.1:"+fmt.Sprint(Aria2RPCPort)+"/jsonrpc（只绑回环；浏览器经面板的 /"+Aria2Slug+"/jsonrpc 代理访问）",
+			"RPC：http://<本机IP>:"+fmt.Sprint(Aria2RPCPort)+"/jsonrpc（绑 0.0.0.0，需带 rpc-secret；也可走面板同源代理）",
 			"引擎版本："+ver,
 		)
 		if reused {

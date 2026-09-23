@@ -608,3 +608,45 @@ func TestSingleStartedDBEngine(t *testing.T) {
 		})
 	}
 }
+
+// TestMarketProxyURLOnlyWhenAliasEnabled 锁住别名下线后的**整类**契约：
+// proxy_url 指的是 nginx 别名入口（http://<lanIP>/<slug>/），只有 app_proxy 打开时
+// 才会真被写进 nginx；关掉时它必然 404。
+//
+// 为什么按条目遍历而不是只看一个：SelfConf 条目（aria2 的 /aria/）当初被当成
+// "自带入口、与别名无关"放过，结果市场卡片照旧下发一个 404 的 proxy_url
+// ——漏一个条目就多一个"点了打不开"的链接。
+func TestMarketProxyURLOnlyWhenAliasEnabled(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	check := func(alias bool) {
+		t.Helper()
+		srv.Cfg.AppProxy = alias
+		res, out, _ := doJSON(t, ts, "GET", "/api/v1/market", nil, cookies)
+		if res.StatusCode != 200 {
+			t.Fatalf("市场应 200，实际 %d", res.StatusCode)
+		}
+		items, _ := out["data"].(map[string]any)["list"].([]any)
+		if len(items) == 0 {
+			t.Fatal("市场列表为空，门禁等于没跑")
+		}
+		for _, raw := range items {
+			it, _ := raw.(map[string]any)
+			got := asString(it["proxy_url"])
+			if alias && got == "" {
+				continue // 别名开着时不要求每条都有（有些条目没有 slug）
+			}
+			if !alias && got != "" {
+				t.Errorf("别名关闭时 %v 不该下发 proxy_url（会 404），实际 %q", it["id"], got)
+			}
+			if alias && got != "" && !strings.Contains(got, "/") {
+				t.Errorf("%v 的 proxy_url 形状不对：%q", it["id"], got)
+			}
+		}
+	}
+	check(false)
+	t.Cleanup(func() { srv.Cfg.AppProxy = false })
+	check(true)
+}

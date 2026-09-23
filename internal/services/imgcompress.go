@@ -48,7 +48,7 @@ const ImgCompressBinName = "vips"
 const (
 	// ImgCompressLabel 是面板托管的「图片压缩网页界面」launchd 标签。
 	ImgCompressLabel = "com.zizdog.imgcompress"
-	// ImgCompressPort 是网页界面默认监听端口（只绑 127.0.0.1）。
+	// ImgCompressPort 是网页界面默认监听端口（绑 0.0.0.0，无鉴权）。
 	//
 	// 8890 与面板自研的两个 Python 服务（8880 Qwen3 TTS / 8899 音色接收端）
 	// 相邻但不冲突，且不在目录里任何其它条目的占用清单里
@@ -138,9 +138,8 @@ func (m *Manager) imgCompressPaths() imgCompressPaths {
 
 // imgCompressListen 返回服务应当监听的地址。
 //
-// 只绑回环：界面里能做的事（读用户上传的图片、spawn vips）对局域网没有意义，
-// 也不该在用户没明确要的情况下扩大暴露面。要给别人用就走面板的 /imgcompress/
-// 别名（那条路要求先登录面板）。
+// 绑 0.0.0.0（用户 2026-09-23 要求局域网直连）。
+// ⚠️ 这个界面**没有登录保护**：同网段任何人打开就能读上传的图片、spawn vips。
 func imgCompressListen(port int) string {
 	// 绑 0.0.0.0（用户 2026-09-23 要求局域网直连端口）。⚠️ 界面无登录保护。
 	return fmt.Sprintf("0.0.0.0:%d", port)

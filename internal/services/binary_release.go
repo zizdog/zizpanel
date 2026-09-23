@@ -455,8 +455,8 @@ const navidromeConfigSeed = `# ` + panelConfigMarker + `（Navidrome 配置骨�
 # 数据目录（面板已用启动参数固定为 ~/navidrome/data，改这里没用）
 # DataFolder = "/Users/你的用户名/navidrome/data"
 #
-# 只绑本机回环（面板启动参数已固定；要局域网访问请用面板入口或反代）
-# Address = "127.0.0.1"
+# 绑 0.0.0.0（面板启动参数已固定，局域网可直连）
+# Address = "0.0.0.0"
 # Port = 4533
 #
 # ⚠️ 换音乐库目录：MusicFolder 只在 data/navidrome.db 里还没有库记录时生效。

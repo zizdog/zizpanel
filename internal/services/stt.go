@@ -33,7 +33,7 @@ const (
 	STTLabel = "com.zizdog.stt"
 	// STTSlug 是面板别名（目录条目的 UI.Slug）：/<slug>/。
 	STTSlug = "stt"
-	// STTPort 是网页界面默认监听端口（只绑 127.0.0.1）；与目录里其它端口
+	// STTPort 是网页界面默认监听端口（绑 0.0.0.0，无鉴权）；与目录里其它端口
 	// 不冲突（8880 / 8890 / 8891 / 8899），唯一性由 TestCatalogPortsAreUnique 锁死。
 	STTPort = 8892
 

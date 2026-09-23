@@ -1390,7 +1390,7 @@ var marketDownloadApps = []MarketApp{
 			brewBottlePoint("aria2", 15*time.Minute, "brew install aria2"),
 		},
 		Note: "走自研安装器（PanelInstaller=aria2）而不是通用 brew 流程：aria2 formula 没有 service 块、" +
-			"本体只是 JSON-RPC（6800，只绑回环）、界面由面板托管在 /aria/（UI.SelfConf=true）；" +
+			"本体只是 JSON-RPC（6800，绑 0.0.0.0 + rpc-secret）、界面由面板托管在 /aria/（UI.SelfConf=true）；" +
 			"安装器另做三件通用流程做不到的事：写归档配置（随机 rpc-secret + ~/Downloads + 会话续传）、" +
 			"注册系统级 LaunchDaemon、拿 aria2.getVersion 真复核。" +
 			"界面 AriaNg 1.3.14（MIT）**内置在面板二进制里**（assets/ariang，3.1 MiB，见那里的 PROVENANCE.md），" +

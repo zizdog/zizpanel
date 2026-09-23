@@ -53,7 +53,7 @@ const (
 	MacSpeechLabel = "com.zizdog.macosspeech"
 	// MacSpeechSlug 是面板别名（目录条目的 UI.Slug）：/<slug>/。
 	MacSpeechSlug = "speech"
-	// MacSpeechPort 是网页界面默认监听端口（只绑 127.0.0.1）。
+	// MacSpeechPort 是网页界面默认监听端口（绑 0.0.0.0，无鉴权）。
 	//
 	// 8891 与目录里其它端口不冲突（8880 Qwen3 TTS / 8890 图片压缩 / 8899 音色接收端），
 	// TestCatalogPortsAreUnique 会锁住唯一性。

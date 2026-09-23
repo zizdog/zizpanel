@@ -422,8 +422,8 @@ func (m *Manager) InstallTransmission(ctx context.Context, res *InstallResult) e
 		res.step(ctx, "（自动登记到面板失败："+err.Error()+"，可在「应用 → 已安装」里点「+ 注册服务」手动加入）")
 	}
 
-	// 只绑回环：广告 LAN 地址等于给一个打不开的链接（与 BindAddress 的约定一致）。
-	res.Address = "http://127.0.0.1:" + strconv.Itoa(transmissionPort) + "/transmission/web/"
+	// 绑 0.0.0.0（2026-09-23 局域网直连）⇒ 广告面板探测到的主机地址。
+	res.Address = "http://" + m.primaryIP() + ":" + strconv.Itoa(transmissionPort) + "/transmission/web/"
 	res.Message = "「Transmission（下载）」已安装并纳入管理"
 	res.step(ctx,
 		"打开 "+res.Address+"，用凭据区里的用户名与口令登录",

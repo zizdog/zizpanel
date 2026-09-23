@@ -1065,7 +1065,9 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		if p := a.EntryPort(); p > 0 && lanIP != "" {
 			portURL = fmt.Sprintf("http://%s:%d/", lanIP, p)
 		}
-		if a.UI != nil && a.UI.Slug != "" && lanIP != "" {
+		// proxy_url 是**nginx 别名入口**，只有开了 app_proxy 才真会被写进 nginx；
+		// 关掉时它必然 404（SelfConf 的 aria2 也照样下发，别以为"自带入口"就有别名）。
+		if s.Cfg.AppProxy && a.UI != nil && a.UI.Slug != "" && lanIP != "" {
 			proxyURL = fmt.Sprintf("http://%s/%s/", lanIP, a.UI.Slug)
 		}
 		// 找这条目录对应的面板记录（label / 名称 / ID 三种写法都认）

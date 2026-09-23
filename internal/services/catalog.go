@@ -1359,8 +1359,8 @@ func builtinCatalog() []App {
 				"**用户名与口令**都读出来显示在安装结果里（日志里没读到时会明说，不会编）。没看到就去" +
 				"「服务管理 → File Browser → 日志」找 `randomly generated password` 那一行，登录后请立刻改掉。" +
 				"文件根目录默认是你的**整个家目录**；想换目录用服务详情里的「主目录」设置（改 -r → 重启 → 回读生效值）。" +
-				"⚠️ 谁能登录这个 Web UI，谁就能读写整个家目录（含 .ssh 等）；它只绑 127.0.0.1、只经面板入口访问，" +
-				"不要直接开到局域网/公网。⚠️ 上游项目已于 2026-09-01 归档，之后不再发版、不再修安全问题。",
+				"⚠️ 谁能登录这个 Web UI，谁就能读写整个家目录（含 .ssh 等）；它绑 0.0.0.0（局域网可直连），" +
+				"口令是唯一防线，务必设强口令。⚠️ 上游项目已于 2026-09-01 归档，之后不再发版、不再修安全问题。",
 			DocsURL: "https://filebrowser.org",
 		},
 		{
@@ -1658,10 +1658,10 @@ func builtinCatalog() []App {
 			UI: &AppUI{
 				Slug:         "navidrome",
 				PreferDirect: true,
-				Note:         "「打开」给端口直连 http://127.0.0.1:4533；它只绑本机回环，局域网用 IP 打不开是设计如此。",
+				Note:         "「打开」给端口直连；它绑 0.0.0.0，局域网用 http://<本机IP>:4533 直接打开（先自建管理员账号）。",
 			},
 			Summary:     "自托管音乐服务器：Subsonic API，手机用音流/超音波",
-			Description: "自托管音乐服务器；只绑 127.0.0.1，音乐库目录在 ~/navidrome/navidrome.toml 里设置。",
+			Description: "自托管音乐服务器；绑 0.0.0.0，音乐库目录在 ~/navidrome/navidrome.toml 里设置。",
 			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: "navidrome", ServiceLabel: "com.zizdog.navidrome",
 			// 4533：上游默认端口；**显式绑 127.0.0.1**（上游默认 0.0.0.0，绝不裸奔）。
@@ -1678,7 +1678,7 @@ func builtinCatalog() []App {
 				Slug:         "transmission",
 				Target:       "/transmission/",
 				PreferDirect: true,
-				Note: "「打开」走面板子路径；RPC 只绑 127.0.0.1，直链只在本机可用。" +
+				Note: "「打开」走面板子路径；RPC 绑 0.0.0.0，局域网可直连 9091（用户名/口令已生成）。" +
 					"改 RPC 用户名/口令与下载目录请用卡片上的「⚙️ RPC 设置」，别手改 settings.json。",
 			},
 			Summary:     "轻量 BitTorrent 下载器（自带 Web UI 与 RPC）",
@@ -1713,7 +1713,7 @@ func builtinCatalog() []App {
 				Slug:     Aria2Slug,
 				SelfConf: true, // 界面由面板自己的路由托管，不要生成 app-proxy
 				Note: "「打开」是面板托管的 AriaNg 界面（/" + Aria2Slug +
-					"/，需先登录面板）；RPC 只绑 127.0.0.1，浏览器经面板代理访问。",
+					"/，需先登录面板）；也有独立端口 http://<本机IP>:8898/，RPC 绑 0.0.0.0（靠 rpc-secret 保护）。",
 			},
 			Summary:     "多协议下载器（HTTP/FTP/BT/磁力）+ 网页界面，多线程、可续传",
 			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/Downloads，重启后队列还能续上。",
@@ -1721,13 +1721,13 @@ func builtinCatalog() []App {
 			PanelInstaller: "aria2", BrewFormula: Aria2Formula, ServiceLabel: Aria2Label,
 			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
 			SystemDaemon: true,
-			// 6800：上游默认 RPC 端口（只绑回环）。没有 HealthPath —— aria2 的
+			// 6800：上游默认 RPC 端口（绑 0.0.0.0，靠 rpc-secret）。没有 HealthPath —— aria2 的
 			// RPC 只认 POST，GET 会 4xx，健康判据用「launchd 在跑 + 端口在听」。
 			Port: Aria2RPCPort,
 			// 配置文件在安装目录里（「📝 编辑配置文件」直接读写它；改完点重启生效）。
 			ConfigPath: "~/" + Aria2Slug + "/" + Aria2ConfName,
 			PostInstallHint: "两个界面入口：① 面板内「/" + Aria2Slug + "/」（需先登录面板）；" +
-				"② **独立端口** http://127.0.0.1:8898/（只绑回环、免面板会话）——" +
+				"② **独立端口** http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
 				"要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
 				"下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
 			DocsURL: "https://aria2.github.io/",
@@ -1746,7 +1746,7 @@ func builtinCatalog() []App {
 		{
 			ID: ZizvideoAppID, Name: "zizvideo", Icon: "🎬",
 			Summary:     "本地短视频库：把视频目录扫进 SQLite，浏览器里上下滑着看",
-			Description: "把本机视频目录扫进 SQLite，浏览器上下滑着看；只绑本机回环。",
+			Description: "把本机视频目录扫进 SQLite，浏览器上下滑着看；绑 0.0.0.0，局域网可直连。",
 			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: ZizvideoAppID, ServiceLabel: ZizvideoLabel,
 			Port: ZizvideoPort, HealthPath: zizvideoHealthPath,
