@@ -67,9 +67,20 @@ func BuiltinIDs() []string {
 
 // Home 展开 `~/` 前缀（插件表里允许写 ~/，运行期统一按真实家目录解析）。
 func Home(path, home string) string {
+	return Expand(path, home, "")
+}
+
+// Expand 展开声明里的占位符：
+//   - `~/…`  → 真实家目录；
+//   - `{brew}/…` → Homebrew 前缀（Apple Silicon 是 /opt/homebrew、Intel 是 /usr/local，
+//     写死前缀在另一种架构上就是错的 —— 与目录条目的 ConfigPath 约定一致）。
+func Expand(path, home, brew string) string {
 	p := strings.TrimSpace(path)
 	if strings.HasPrefix(p, "~/") && strings.TrimSpace(home) != "" {
 		return strings.TrimRight(home, "/") + p[1:]
+	}
+	if strings.HasPrefix(p, "{brew}/") && strings.TrimSpace(brew) != "" {
+		return strings.TrimRight(brew, "/") + p[len("{brew}"):]
 	}
 	return p
 }

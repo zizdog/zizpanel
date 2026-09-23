@@ -1225,6 +1225,43 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 
+	// 2026-09-23：插件表新增的三个 brew 服务型应用（"填表就能加应用"的第一批）。
+	// 它们没有自研安装器（PanelInstaller 为空）—— 走通用 brew 轨 + 面板的系统级守护进程，
+	// 所以运行时 label 就是 brew 的 homebrew.mxcl.<formula>（与 syncthing 同一形态）。
+	{
+		ID: "redis", Kind: KindNative, BrewFormula: "redis",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.redis",
+			LabelSource: "通用 brew 轨 + 面板系统化（formula 有 service 块，实测 2026-09-23：brew info --json 里 service 存在）",
+			CatalogGap:  "目录里没写死 ServiceLabel：label 由 brew 决定，安装器运行期读取后登记",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("redis", 20*time.Minute, "brew install redis"),
+		},
+	},
+	{
+		ID: "mosquitto", Kind: KindNative, BrewFormula: "mosquitto",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.mosquitto",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-23 实测）",
+			CatalogGap:  "同 redis",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("mosquitto", 20*time.Minute, "brew install mosquitto"),
+		},
+	},
+	{
+		ID: "memcached", Kind: KindNative, BrewFormula: "memcached",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.memcached",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-23 实测）",
+			CatalogGap:  "同 redis",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("memcached", 20*time.Minute, "brew install memcached"),
+		},
+	},
+
 	{
 		ID: "syncthing", Kind: KindNative, BrewFormula: "syncthing", PanelInstaller: "syncthing",
 		Runtime: MarketRuntime{

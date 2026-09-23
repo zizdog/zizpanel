@@ -70,13 +70,21 @@ type LocalPluginStatusView struct {
 	Plan        string `json:"plan,omitempty"`
 }
 
-// localPluginIssue 判断一份声明能不能接进目录，返回"不能"的原因（"" = 可以）。
+// localPluginIssue 判断一份**本地**声明能不能接进目录（比 SpecToApp 多一条"撞 id"）。
 func localPluginIssue(spec *plugins.Spec) string {
 	if spec == nil {
 		return "声明不合法"
 	}
 	if _, exists := builtinCatalogIDs[spec.ID]; exists {
 		return "id 与面板自带应用重名（" + spec.ID + "）：换一个 id，或用面板自带的那个"
+	}
+	return specMappableIssue(spec)
+}
+
+// specMappableIssue 判断一份声明能不能映射成应用条目（与"从哪来"无关）。
+func specMappableIssue(spec *plugins.Spec) string {
+	if spec == nil {
+		return "声明不合法"
 	}
 	if spec.Source.Kind != "brew" {
 		return "这个来源（" + spec.Source.Kind + "）的 JSON 装载还没做：目前只支持 brew 来源（见 docs/平台化路线图.md 的 B4）"
@@ -92,9 +100,10 @@ func localPluginIssue(spec *plugins.Spec) string {
 	return ""
 }
 
-// LocalPluginApp 把一份声明映射成应用目录条目（只支持上面 localPluginIssue 放行的形态）。
-func LocalPluginApp(spec *plugins.Spec) (App, error) {
-	if issue := localPluginIssue(spec); issue != "" {
+// SpecToApp 把一份声明映射成应用目录条目（只支持 localPluginIssue 放行的形态）。
+// 内建表与本地插件共用同一条映射 —— 这就是"新增应用 = 填表"的兑现点。
+func SpecToApp(spec *plugins.Spec) (App, error) {
+	if issue := specMappableIssue(spec); issue != "" {
 		return App{}, fmt.Errorf("%s", issue)
 	}
 	app := App{
@@ -126,6 +135,38 @@ func LocalPluginApp(spec *plugins.Spec) (App, error) {
 		"这是**本地插件**（" + spec.ID + "）：声明在 <安装根>/plugins，改完刷新「应用」页生效；" +
 		"停用它只是不再显示/不再安装，已装的东西仍在机器上。"
 	return app, nil
+}
+
+// LocalPluginApp 保留旧名字（本地插件侧调用点），行为同 SpecToApp 减去"撞 id"检查 ——
+// 本地插件必须查重，见 localPluginIssue。
+func LocalPluginApp(spec *plugins.Spec) (App, error) {
+	if issue := localPluginIssue(spec); issue != "" {
+		return App{}, fmt.Errorf("%s", issue)
+	}
+	return SpecToApp(spec)
+}
+
+// builtinPluginOnlyApps 返回"只在插件表里"的内建应用（表驱动新增的应用靠它上架）。
+//
+// 判定：表里有、目录里没有 ⇒ 映射成 App 追加进目录。映射不出来的（例如 release 轨还没做
+// JSON 装载）**跳过**并留给门禁报错 —— 绝不往目录里塞半成品。
+func builtinPluginOnlyApps() []App {
+	var out []App
+	for _, id := range plugins.BuiltinIDs() {
+		if _, exists := builtinCatalogIDs[id]; exists {
+			continue
+		}
+		spec, ok := plugins.Builtin(id)
+		if !ok {
+			continue
+		}
+		app, err := SpecToApp(spec)
+		if err != nil {
+			continue
+		}
+		out = append(out, app)
+	}
+	return out
 }
 
 // LocalPluginStatus 汇总本地插件的状态（列表接口与门禁共用一份判断）。

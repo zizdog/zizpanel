@@ -572,6 +572,8 @@ func Catalog() []App {
 	// 内建插件表（B1）覆盖"表已覆盖字段"：等价性由 plugin_equiv_test.go 逐字段保证，
 	// 所以在迁移完成前这一步是零行为变化（见 catalog_plugin.go）。
 	base := applyPluginTable(builtinCatalog())
+	// 只在插件表里、目录里没有的内建应用（表驱动新增：填一张表 + 随面板发版即可上架）。
+	base = append(base, builtinPluginOnlyApps()...)
 	// 本地插件（P2）：已启用的接在内建条目后面；id 撞车在启用前就被拒（见 local_plugins.go）。
 	base = append(base, localPluginApps(LocalPluginEnabledState())...)
 	remoteCatalog.mu.RLock()

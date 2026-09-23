@@ -1,0 +1,61 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "redis",
+  "name": "Redis（键值数据库）",
+  "icon": "🧱",
+  "summary": "内存键值数据库，缓存/队列/会话都用它",
+  "notes": [
+    "默认只允许本机访问（bind 127.0.0.1）：要给别人连就在配置文件里改 bind 并设 requirepass。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "redis",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/redis.conf",
+    "mode": "0600",
+    "own": "user"
+  },
+  "expose": {
+    "port": 6379,
+    "bind": "127.0.0.1",
+    "ui": "app"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "port",
+        "port": 6379,
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "port",
+    "port": 6379,
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.redis.plist"
+    ],
+    "optional_data": [
+      "{brew}/var/db/redis"
+    ],
+    "formula": "redis",
+    "keep_note": "默认保留数据库文件（{brew}/var/db/redis）；勾选「删除数据」才会删。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      6379
+    ]
+  }
+}

@@ -400,6 +400,10 @@ func isAbsOrHome(p string) bool {
 	if strings.HasPrefix(p, "~/") {
 		return len(p) > 2
 	}
+	// {brew}/… 交给运行期按本机 Homebrew 前缀展开（Intel/ARM 前缀不同）。
+	if strings.HasPrefix(p, "{brew}/") {
+		return len(p) > len("{brew}/")
+	}
 	return filepath.IsAbs(p)
 }
 

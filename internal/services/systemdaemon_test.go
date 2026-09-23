@@ -94,6 +94,11 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"transmission": true,
 		// 同上，aria2 也是下载器（2026-09-22 新增）。
 		"aria2": true,
+		// 2026-09-23 起"填表就能加应用"：下三个是插件表里新增的 brew 服务型应用，
+		// 都要求开机就在（缓存/MQTT/Git 服务，重启后必须自己回来）。
+		"redis":     true,
+		"mosquitto": true,
+		"memcached": true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {

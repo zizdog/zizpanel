@@ -1,0 +1,58 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "memcached",
+  "name": "Memcached（内存缓存）",
+  "icon": "⚡",
+  "summary": "内存对象缓存，给站点/应用做加速",
+  "notes": [
+    "默认只允许本机连接（-l 127.0.0.1）：要给别人连就改配置文件里的 -l 并加 SASL 认证。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "memcached",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/memcached.conf",
+    "mode": "0600",
+    "own": "user"
+  },
+  "expose": {
+    "port": 11211,
+    "bind": "127.0.0.1",
+    "ui": "app"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "port",
+        "port": 11211,
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "port",
+    "port": 11211,
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.memcached.plist"
+    ],
+    "formula": "memcached",
+    "keep_note": "内存缓存没有持久化数据：卸载只停服务、删定义与包。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      11211
+    ]
+  }
+}

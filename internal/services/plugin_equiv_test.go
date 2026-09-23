@@ -199,3 +199,57 @@ func TestPluginTableDrivesCatalogWithoutChangingIt(t *testing.T) {
 		}
 	}
 }
+
+// TestBuiltinTableOnlyAppsReachCatalog 锁住"表驱动新增应用"这条路：
+// 只在插件表里、目录里没有的内建应用，必须真的出现在应用目录里（否则"填表就能加应用"是空话）。
+func TestBuiltinTableOnlyAppsReachCatalog(t *testing.T) {
+	// 目前用表新增的三个 brew 服务型应用
+	want := map[string]struct {
+		formula string
+		port    int
+		health  string
+	}{
+		"redis":     {"redis", 6379, ""},
+		"mosquitto": {"mosquitto", 1883, ""},
+		"memcached": {"memcached", 11211, ""},
+	}
+	for id, w := range want {
+		app, ok := FindApp(id)
+		if !ok {
+			t.Errorf("%s 只在插件表里，但没进应用目录 —— 表驱动新增应用这条链断了", id)
+			continue
+		}
+		if app.BrewFormula != w.formula {
+			t.Errorf("%s：formula 应为 %q，实际 %q", id, w.formula, app.BrewFormula)
+		}
+		if app.Port != w.port {
+			t.Errorf("%s：端口应为 %d，实际 %d", id, w.port, app.Port)
+		}
+		if app.HealthPath != w.health {
+			t.Errorf("%s：健康路径应为 %q，实际 %q", id, w.health, app.HealthPath)
+		}
+		if !app.SystemDaemon {
+			t.Errorf("%s：brew 服务型应用应当服务化成系统级守护进程", id)
+		}
+		if app.Kind != KindNative || app.Category != CategoryTool {
+			t.Errorf("%s：映射出来的 Kind/Category 不对：%v/%v", id, app.Kind, app.Category)
+		}
+		// {brew} 占位符必须能展开（Intel/ARM 前缀不同），展开后不许再有占位符
+		spec, _ := plugins.Builtin(id)
+		facts := spec.UninstallFactsFor("/Users/tester", "/opt/homebrew")
+		for _, p := range append(append([]string{}, facts.Always...), facts.OptionalData...) {
+			if strings.Contains(p, "{brew}") || strings.Contains(p, "~") {
+				t.Errorf("%s：卸载路径没展开干净：%q", id, p)
+			}
+		}
+		if spec.Config != nil && strings.HasPrefix(spec.Config.Path, "{brew}/") {
+			if got := plugins.Expand(spec.Config.Path, "/Users/tester", "/opt/homebrew"); !strings.HasPrefix(got, "/opt/homebrew/") {
+				t.Errorf("%s：配置路径的 {brew} 展开不对：%q", id, got)
+			}
+		}
+	}
+	// 反面对照：release 来源的表条目映射不出来，就**不该**出现在目录里（不许塞半成品）
+	if _, ok := FindApp("nosuchapp"); ok {
+		t.Error("不存在的应用不该在目录里")
+	}
+}

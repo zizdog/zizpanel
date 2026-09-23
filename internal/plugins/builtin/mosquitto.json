@@ -1,0 +1,58 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "mosquitto",
+  "name": "Mosquitto（MQTT 消息代理）",
+  "icon": "📡",
+  "summary": "轻量 MQTT 代理，智能家居/物联网设备常用",
+  "notes": [
+    "默认只允许本机连接：要接设备就在配置文件里加 listener 1883 0.0.0.0 并设 allow_anonymous false + 口令。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "mosquitto",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/mosquitto/mosquitto.conf",
+    "mode": "0600",
+    "own": "user"
+  },
+  "expose": {
+    "port": 1883,
+    "bind": "127.0.0.1",
+    "ui": "app"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "port",
+        "port": 1883,
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "port",
+    "port": 1883,
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.mosquitto.plist"
+    ],
+    "formula": "mosquitto",
+    "keep_note": "默认保留配置文件与日志；勾选「删除数据」才会删。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      1883
+    ]
+  }
+}

@@ -96,14 +96,17 @@ type UninstallFacts struct {
 	KeepNote     string
 }
 
-// UninstallFacts 派生卸载计划（home 用于展开 ~/）。
-func (s *Spec) UninstallFacts(home string) UninstallFacts {
+// UninstallFacts 派生卸载计划（home/brew 用于展开 ~/ 与 {brew}/）。
+func (s *Spec) UninstallFacts(home string) UninstallFacts { return s.UninstallFactsFor(home, "") }
+
+// UninstallFactsFor 同上，但能展开 {brew}（brew 应用的数据目录常在 Homebrew 前缀下）。
+func (s *Spec) UninstallFactsFor(home, brew string) UninstallFacts {
 	f := UninstallFacts{Formula: s.Uninstall.Formula, KeepNote: s.Uninstall.KeepNote}
 	for _, p := range s.Uninstall.Always {
-		f.Always = append(f.Always, Home(p, home))
+		f.Always = append(f.Always, Expand(p, home, brew))
 	}
 	for _, p := range s.Uninstall.OptionalData {
-		f.OptionalData = append(f.OptionalData, Home(p, home))
+		f.OptionalData = append(f.OptionalData, Expand(p, home, brew))
 	}
 	return f
 }
