@@ -262,9 +262,12 @@ type Peer struct {
 	Fingerprint string `json:"fingerprint,omitempty"`
 	// LastAt / LastError / Summary 是最近一次拉取的**真实结果**：
 	// 成功记时间与摘要，失败原样记错误（界面必须能看出"这台没连上"而不是显示旧数据）。
-	LastAt    string          `json:"last_at,omitempty"`
-	LastError string          `json:"last_error,omitempty"`
-	Summary   json.RawMessage `json:"summary,omitempty"`
+	LastAt    string `json:"last_at,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+	// LastAdvice 是"这个失败通常怎么修"的一句话（由面板按错误类型给出，界面直接显示）。
+	// 与 LastError 分开：错误是**事实**（子机返回了什么），建议是**推断**，两者不能混着写。
+	LastAdvice string          `json:"last_advice,omitempty"`
+	Summary    json.RawMessage `json:"summary,omitempty"`
 }
 
 // FindPeer 按 id 找一台子机。

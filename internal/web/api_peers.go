@@ -143,14 +143,17 @@ const agentCertWarnDays = 14
 
 // peerSummaryView 是给界面的子机视图（**不带 token**：界面不需要看到别人的凭证）。
 type peerSummaryView struct {
-	ID          int64           `json:"id"`
-	Name        string          `json:"name"`
-	URL         string          `json:"url"`
-	Fingerprint string          `json:"fingerprint,omitempty"`
-	MaskedToken string          `json:"masked_token"`
-	LastAt      string          `json:"last_at,omitempty"`
-	LastError   string          `json:"last_error,omitempty"`
-	Summary     json.RawMessage `json:"summary,omitempty"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	MaskedToken string `json:"masked_token"`
+	LastAt      string `json:"last_at,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	// LastAdvice 是"这个失败通常怎么修"的一句话（面板按错误类型给，界面直接显示）。
+	// 与 LastError 分开：错误是**事实**（子机说了什么），建议是**推断**，两者别混着写。
+	LastAdvice string          `json:"last_advice,omitempty"`
+	Summary    json.RawMessage `json:"summary,omitempty"`
 }
 
 func (s *Server) peerViews() []peerSummaryView {
@@ -159,7 +162,7 @@ func (s *Server) peerViews() []peerSummaryView {
 		out = append(out, peerSummaryView{
 			ID: p.ID, Name: p.Name, URL: p.URL, Fingerprint: p.Fingerprint,
 			MaskedToken: maskToken(p.Token),
-			LastAt:      p.LastAt, LastError: p.LastError, Summary: p.Summary,
+			LastAt:      p.LastAt, LastError: p.LastError, LastAdvice: p.LastAdvice, Summary: p.Summary,
 		})
 	}
 	return out
@@ -348,12 +351,14 @@ func (s *Server) refreshPeer(ctx context.Context, id int64) {
 	now := time.Now().Format(time.RFC3339)
 	if err != nil {
 		s.Cfg.Peers[idx].LastError = err.Error()
+		s.Cfg.Peers[idx].LastAdvice = peerAdvice(err)
 		_ = s.Cfg.Save()
 		return
 	}
 	s.Cfg.Peers[idx].Summary = raw
 	s.Cfg.Peers[idx].LastAt = now
 	s.Cfg.Peers[idx].LastError = ""
+	s.Cfg.Peers[idx].LastAdvice = ""
 	_ = s.Cfg.Save()
 }
 
@@ -436,6 +441,33 @@ func fetchPeerSummary(ctx context.Context, p config.Peer) (json.RawMessage, erro
 		return nil, errors.New("子机响应不是面板的摘要格式（地址可能指到了别的服务）")
 	}
 	return envelope.Data, nil
+}
+
+// peerAdvice 把"连不上"翻译成用户能**自己动手**的一句话。
+//
+// 纪律：只匹配**本文件自己产生的**错误措辞（403 / 指纹 / 回环限制 / 摘要格式），
+// 不猜第三方库的随机文案 —— 猜错方向比不给建议更糟（用户会照着一个错的方向折腾）。
+// 拿不准就返回空串，让原始错误自己说话。
+func peerAdvice(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "403") || strings.Contains(msg, "凭证不对"):
+		return "子机不认这个凭证：去它的「多机」页重新生成，再把新凭证填到这里（旧的会立即失效）"
+	case strings.Contains(msg, "指纹"):
+		return "子机换过证书：在子机上确认新的 sha256 指纹后更新这里，不用删掉这台"
+	case strings.Contains(msg, "只有 127.0.0.1"):
+		return "局域网子机请用它的 https 地址 + 证书指纹（http 只允许回环，凭证明文过网会被抄走）"
+	case strings.Contains(msg, "连不上子机"):
+		return "确认子机开着、面板入口地址与端口可达：可以先用浏览器打开那个地址试试"
+	case strings.Contains(msg, "HTTP 5"):
+		return "子机面板自己在报错：去它的「日志」页看，或先在浏览器里打开确认"
+	case strings.Contains(msg, "摘要格式"):
+		return "这个地址可能指到了别的服务：要填子机的**面板入口**（含安全后缀，例如 https://m4.lan:8443/ab12cd/）"
+	}
+	return ""
 }
 
 // validatePeerURL 校验子机地址与指纹的搭配。

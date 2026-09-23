@@ -156,8 +156,9 @@ export function PeersView(content) {
     ]);
     const rows = [];
     if (p.last_error) {
-      // 失败原因原样显示：用户能据此判断是网络、凭证还是证书指纹。
+      // 失败原因原样显示（事实），再给一句面板的推断（怎么修）—— 两者分开写，别混成一句。
       rows.push(h('div.hint', { text: '上次失败：' + p.last_error }));
+      if (p.last_advice) rows.push(h('div.hint', { text: '→ ' + p.last_advice }));
     }
     if (s) {
       const memPct = s.mem_total ? ((s.mem_total - s.mem_free) / s.mem_total) * 100 : 0;

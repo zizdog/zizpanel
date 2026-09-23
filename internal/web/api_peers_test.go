@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -319,5 +320,36 @@ func TestPeerAddRejectsBadInput(t *testing.T) {
 	}
 	if len(srv.Cfg.Peers) != 0 {
 		t.Errorf("校验不过时不该写进配置：%+v", srv.Cfg.Peers)
+	}
+}
+
+// TestPeerAdviceTellsUserWhatToDo 失败建议必须**贴合原因**，拿不准就不给建议（别把人带偏）。
+func TestPeerAdviceTellsUserWhatToDo(t *testing.T) {
+	cases := []struct {
+		err  string
+		want string // 建议里必须出现的关键词（空 = 必须不给建议）
+	}{
+		{"子机返回 HTTP 403（{\"msg\":\"凭证不对\"）", "重新生成"},
+		{"子机证书指纹不匹配（期望 abcd…，实际 1234…）：换过证书就要在面板里更新指纹", "指纹"},
+		{"只有 127.0.0.1 / localhost 允许用 http（凭证明文过网会被局域网里任何人抄走）", "https"},
+		{"连不上子机：dial tcp 192.0.2.9:8443: connect: connection refused", "浏览器"},
+		{"子机返回 HTTP 500（internal error）", "日志"},
+		{"子机响应不是面板的摘要格式（地址可能指到了别的服务）", "面板入口"},
+		{"some totally unknown failure", ""},
+	}
+	for _, c := range cases {
+		got := peerAdvice(errors.New(c.err))
+		if c.want == "" {
+			if got != "" {
+				t.Errorf("拿不准的错误不该给建议，实际 %q（错误：%s）", got, c.err)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want) {
+			t.Errorf("建议里应当提到 %q，实际 %q（错误：%s）", c.want, got, c.err)
+		}
+	}
+	if peerAdvice(nil) != "" {
+		t.Error("没有错误就没有建议")
 	}
 }

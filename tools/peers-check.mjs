@@ -111,6 +111,7 @@ const afterBad = await parent.page.locator('body').innerText();
 check('凭证错时显示「没连上」', /没连上/.test(afterBad), afterBad.replace(/\n+/g, ' | ').slice(0, 240));
 check('失败原因如实显示在卡片上（403 + 凭证不对）', /403/.test(afterBad) && /凭证不对/.test(afterBad));
 check('失败的那台没有摘要数字（不拿旧数据冒充）', !/没连上[\s\S]{0,80}\d+\/\d+ 运行/.test(afterBad));
+check('给出可操作的修法（不是只有一句报错）', /重新生成/.test(afterBad), afterBad.replace(/\n+/g, ' | ').slice(-260));
 
 await browser.close();
 const failed = results.filter((r) => !r.ok);
