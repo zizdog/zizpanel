@@ -246,6 +246,21 @@ func root() string {
 	return DefaultRoot
 }
 
+// PluginsDir 是「本地插件」目录：与 logs/work 同级的 <安装根>/plugins。
+//
+// 为什么放在安装根而不是数据目录：插件是**可执行能力**（会以 root 安装与运行），
+// 用户要能一眼找到、能手工编辑/备份；放进 data/ 会与数据库、证书混在一起。
+func (c *Config) PluginsDir() string {
+	base := strings.TrimSpace(c.DataDir)
+	if base == "" && strings.TrimSpace(c.path) != "" {
+		base = filepath.Dir(c.path)
+	}
+	if base == "" {
+		return filepath.Join(DefaultRoot, "plugins")
+	}
+	return filepath.Join(filepath.Dir(base), "plugins")
+}
+
 // DefaultConfigPath 返回默认配置文件路径（受 ZIZPANEL_ROOT 影响）。
 // DefaultMirrorBase 是应用包镜像的默认基址（自建镜像站，公网 mirror.zizdog.com）。
 //

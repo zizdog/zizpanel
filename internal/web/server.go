@@ -199,6 +199,9 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		s.aria2UI = ariaUI
 	}
 	s.ariaUI = &ariaUIListener{s: s}
+	// 本地插件（P2）：把插件目录接给 services —— 目录里**已启用**的声明会出现在应用市场里。
+	// 目录不存在是正常状态（没装插件），LoadDir 返回空列表，不报错。
+	services.SetLocalPluginDir(cfg.PluginsDir())
 	// TCC 指引里"要去系统设置里授权"的那个二进制路径按配置解析一次：
 	// 非默认安装根（BinDir 配在别处）也能给出正确路径。
 	setPanelBinaryForGuide(cfg.BinDir)
@@ -281,6 +284,10 @@ func (s *Server) routes() http.Handler {
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
 	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))
+
+	// 本地插件（P2）：列出 / 启用 / 停用。目录见 config.PluginsDir()，规范见 docs/插件规范.md。
+	root.HandleFunc("GET /api/v1/plugins", s.requireAuth(s.handlePluginList))
+	root.HandleFunc("POST /api/v1/plugins/{id}/toggle", s.requireAuth(s.handlePluginToggle))
 	root.HandleFunc("POST /api/v1/permissions/{id}/apply", s.requireAuth(s.handlePermissionApply))
 	// 操作审计：检索 + 游标分页 + 导出（facets 给下拉框提供真实出现过的动作名）
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
