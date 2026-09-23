@@ -192,8 +192,8 @@ func runAria2Supervisor(ctx context.Context, o aria2SuperviseOptions) error {
 	}
 }
 
-// cmdAria2Supervise 是 `zizpanel aria2-supervise` 的入口。
-func cmdAria2Supervise(args []string) error {
+// aria2OptionsFromArgs 解析 supervisor 的 argv（供入口与"参数咬合"门禁共用）。
+func aria2OptionsFromArgs(args []string) (aria2SuperviseOptions, error) {
 	fs := flag.NewFlagSet("aria2-supervise", flag.ContinueOnError)
 	userName := fs.String("user", "", "以哪个真实用户的身份运行 aria2（必填）")
 	bin := fs.String("bin", "/opt/homebrew/bin/aria2c", "aria2c 可执行文件")
@@ -201,9 +201,14 @@ func cmdAria2Supervise(args []string) error {
 	root := fs.String("root", "", "aria2 的安装/工作目录（必填，作为子进程的工作目录）")
 	home := fs.String("home", "", "真实用户家目录（必填，作为子进程 HOME）")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return aria2SuperviseOptions{}, err
 	}
-	o, err := aria2SuperviseOptionsFrom(*userName, *bin, *conf, *root, *home)
+	return aria2SuperviseOptionsFrom(*userName, *bin, *conf, *root, *home)
+}
+
+// cmdAria2Supervise 是 `zizpanel aria2-supervise` 的入口。
+func cmdAria2Supervise(args []string) error {
+	o, err := aria2OptionsFromArgs(args)
 	if err != nil {
 		return err
 	}

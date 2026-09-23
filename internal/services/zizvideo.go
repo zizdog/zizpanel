@@ -406,6 +406,11 @@ func ZizvideoSuperviseArgs(panelBin, userName string, p ZizvideoPaths) []string 
 		"--zizvideo", p.Bin,
 		"--config", p.ConfigPath,
 		"--home", p.Home,
+		// 用户 2026-09-23：zizvideo 也走局域网直连 ⇒ 0.0.0.0。
+		// supervisor 会用 **ZV_LISTEN** 把它传给 zizvideo（它不认命令行参数，
+		// 见 zizvideo 的 internal/config/config.go applyEnv）。
+		// ⚠️ ../zizvideo/CONTRACT.md 还写着 `--listen 127.0.0.1:7766` + "只绑回环"，
+		// 那份文档要跟着改，否则又是一次"生成侧/契约侧各说各话"。
 		"--listen", fmt.Sprintf("0.0.0.0:%d", ZizvideoPort),
 		"--log-dir", p.LogDir,
 	}

@@ -109,11 +109,12 @@ func TestZizvideoSuperviseOptionsRejectsBadInput(t *testing.T) {
 	}{
 		{"缺用户名", "", "501", "20", "127.0.0.1:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "--user"},
 		{"uid 是 0（root）", "zizdog", "0", "0", "127.0.0.1:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "root"},
-		{"监听非回环", "zizdog", "501", "20", "0.0.0.0:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "回环"},
+		{"监听写成具体内网地址", "zizdog", "501", "20", "192.0.2.7:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "回环"},
 		{"二进制非绝对路径", "zizdog", "501", "20", "127.0.0.1:7766", "zizvideo", goodCfg, home, "绝对路径"},
 		{"配置非绝对路径", "zizdog", "501", "20", "127.0.0.1:7766", "/opt/zizvideo/bin/zizvideo", "config.json", home, "绝对路径"},
 		{"家目录为空", "zizdog", "501", "20", "127.0.0.1:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, "", "绝对路径"},
 		{"监听缺端口", "zizdog", "501", "20", "127.0.0.1", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "回环"},
+		{"监听写主机名", "zizdog", "501", "20", "example.com:7766", "/opt/zizvideo/bin/zizvideo", goodCfg, home, "回环"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,17 +130,17 @@ func TestZizvideoSuperviseOptionsRejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestZizvideoLoopbackListen 只允许回环监听（这个界面能读写本机文件）。
-func TestZizvideoLoopbackListen(t *testing.T) {
-	for _, ok := range []string{"127.0.0.1:7766", "localhost:7766", "[::1]:7766"} {
-		if !zizvideoLoopbackListen(ok) {
-			t.Errorf("%q 是回环地址，应放行", ok)
+// TestZizvideoListenAllowed 监听地址**只放行回环**（zizvideo/CONTRACT.md 的约定）。
+func TestZizvideoListenAllowed(t *testing.T) {
+	for _, ok := range []string{"127.0.0.1:7766", "localhost:7766", "[::1]:7766", "0.0.0.0:7766", "[::]:7766"} {
+		if !zizvideoListenAllowed(ok) {
+			t.Errorf("%q 是回环/通配地址，应放行", ok)
 		}
 	}
 	// 203.0.113.0/24 是 RFC 5737 文档保留地址（仓库门禁禁止作者家里的内网地址）。
-	for _, bad := range []string{"0.0.0.0:7766", ":7766", "203.0.113.5:7766", "127.0.0.1", "example.com:7766"} {
-		if zizvideoLoopbackListen(bad) {
-			t.Errorf("%q 不是回环地址，必须拒绝", bad)
+	for _, bad := range []string{":7766", "192.0.2.7:7766", "127.0.0.1", "example.com:7766"} {
+		if zizvideoListenAllowed(bad) {
+			t.Errorf("%q 既不是回环也不是通配，必须拒绝", bad)
 		}
 	}
 }
@@ -172,4 +173,50 @@ func envHas(env []string, kv string) bool {
 		}
 	}
 	return false
+}
+
+// TestZizvideoSuperviseForwardsListenToChild 是 2026-09-23 那次"装不上 zizvideo"的
+// **三段咬合**门禁：面板写进 plist 的参数 → supervisor 接受 → 真的传给了子进程。
+//
+// 为什么必须三段一起断言：老门禁只查"plist 里出现过 --listen 0.0.0.0:7766"，
+// 所以生成侧绿、校验侧绿、整条链却是死的（supervisor 起来即 exit 1；就算放行，
+// 这个值在当时也**没有**任何字段承载、从来没传给 zizvideo）。
+func TestZizvideoSuperviseForwardsListenToChild(t *testing.T) {
+	stubZizvideoUser(t, "501", "20")
+	home := t.TempDir()
+	p := services.ZizvideoPaths{
+		Home:       home,
+		Root:       "/opt/zizvideo",
+		Bin:        "/opt/zizvideo/bin/zizvideo",
+		Plist:      "/Library/LaunchDaemons/cn.zizpanel.zizvideo.plist",
+		DataDir:    filepath.Join(home, "Library", "Application Support", "zizvideo"),
+		ConfigPath: filepath.Join(home, "Library", "Application Support", "zizvideo", "config.json"),
+		LogDir:     filepath.Join(home, "Library", "Logs"),
+	}
+
+	// ① 校验侧接受面板生成的参数（含 0.0.0.0）
+	args := services.ZizvideoSuperviseArgs("/opt/zizpanel/bin/zizpanel", "zizdog", p)
+	o, err := zizvideoOptionsFromArgs(args[2:])
+	if err != nil {
+		t.Fatalf("面板生成的参数被 supervisor 拒了：%v（参数 %v）", err, args)
+	}
+	if o.Listen != "0.0.0.0:7766" {
+		t.Fatalf("--listen 没被解析进 options（这正是当时「传不下去」的原因）：%+v", o)
+	}
+
+	// ② 子进程 env 里必须真的有 ZV_LISTEN —— zizvideo 只认 config.json 的 listen
+	//    或环境变量 ZV_LISTEN（internal/config/config.go applyEnv），不认命令行。
+	cmd := zizvideoChildCmd(o)
+	if !envHas(cmd.Env, "ZV_LISTEN=0.0.0.0:7766") {
+		t.Errorf("子进程没拿到 ZV_LISTEN=0.0.0.0:7766（局域网直连就是假的）：%v", cmd.Env)
+	}
+	if envHas(cmd.Env, "ZV_LISTEN=127.0.0.1:7766") {
+		t.Errorf("不该把回环地址传下去：%v", cmd.Env)
+	}
+	// ③ 参数里不许出现 --listen（zizvideo 不认它，出现即误导）
+	for _, a := range cmd.Args {
+		if strings.HasPrefix(a, "--listen") {
+			t.Errorf("不要把 --listen 传给 zizvideo（它只认 config.json / ZV_LISTEN）：%v", cmd.Args)
+		}
+	}
 }

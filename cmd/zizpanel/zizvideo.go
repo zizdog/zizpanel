@@ -42,7 +42,11 @@ type zizvideoSuperviseOptions struct {
 	Zizvideo   string
 	ConfigPath string
 	Home       string
-	LogDir     string
+	// Listen 是**要转发给子进程**的监听地址（经环境变量 ZV_LISTEN，见 zizvideo 的
+	// internal/config/config.go applyEnv）。它以前只被解析、从来没传下去 ——
+	// 于是 plist 写 0.0.0.0 既会被校验拒掉，就算放行也根本不会生效。
+	Listen string
+	LogDir string
 }
 
 // zizvideoSuperviseOptionsFrom 校验参数并解析真实用户的 uid/gid。
@@ -73,8 +77,9 @@ func zizvideoSuperviseOptionsFrom(userName, zizvideoBin, configPath, home, liste
 			return o, fmt.Errorf("%s 必须是绝对路径，实际 %q", kv.name, kv.val)
 		}
 	}
-	if !zizvideoLoopbackListen(listen) {
-		return o, fmt.Errorf("--listen 只允许回环地址（实际 %q）：这个界面能读写本机文件，不能裸奔", listen)
+	if !zizvideoListenAllowed(listen) {
+		return o, fmt.Errorf("--listen 只允许回环地址或通配地址（实际 %q）：这个界面能读写本机文件，"+
+			"不接受具体的内网/公网地址写法（要局域网访问请用 0.0.0.0）", listen)
 	}
 	logDir = strings.TrimSpace(logDir)
 	if logDir == "" {
@@ -90,13 +95,27 @@ func zizvideoSuperviseOptionsFrom(userName, zizvideoBin, configPath, home, liste
 		Zizvideo:   filepath.Clean(strings.TrimSpace(zizvideoBin)),
 		ConfigPath: filepath.Clean(strings.TrimSpace(configPath)),
 		Home:       filepath.Clean(strings.TrimSpace(home)),
+		Listen:     strings.TrimSpace(listen),
 		LogDir:     filepath.Clean(logDir),
 	}
 	return o, nil
 }
 
-// zizvideoLoopbackListen 判断监听地址是否只绑回环（127.0.0.1 / ::1 / localhost）。
-func zizvideoLoopbackListen(addr string) bool {
+// zizvideoListenAllowed 判断监听地址能不能接受：**回环或通配**。
+//
+// 用户 2026-09-23 要求所有应用端口都允许 0.0.0.0（局域网直连），zizvideo 也一样。
+// 这条地址会经 ZV_LISTEN 真正转发给子进程（见 zizvideoChildCmd），所以放宽校验是
+// 诚实的：面板说暴露了，就是真暴露了。
+//
+// 仍然拒绝具体的内网/公网地址与主机名：那要么是写错了，要么是把"给局域网用"写成了
+// 某一个碰巧的地址，换网络就静默失效。
+//
+// 2026-09-23 的事故（别重演）：面板把参数改成 0.0.0.0 而这里只放行回环 ⇒ supervisor
+// 起来即退、launchd KeepAlive 反复重启，装 zizvideo 三次全失败，日志只有
+// `--listen 只允许回环地址（实际 "0.0.0.0:7766"）`。所以现在有一条"生成侧 × 校验侧 ×
+// 子进程"三段咬合的门禁：cmd/zizpanel/zizvideo_test.go 的
+// TestZizvideoSuperviseForwardsListenToChild 与 supervise_contract_test.go。
+func zizvideoListenAllowed(addr string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
 		return false
@@ -105,7 +124,7 @@ func zizvideoLoopbackListen(addr string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 // zizvideoChildCmd 返回**尚未启动**的 zizvideo 子进程。
@@ -120,6 +139,12 @@ func zizvideoChildCmd(o zizvideoSuperviseOptions) *exec.Cmd {
 		"USER=" + o.User,
 		"LOGNAME=" + o.User,
 		"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+	}
+	// 监听地址**只能这样传下去**：zizvideo 不认命令行，它只读 config.json 的 listen
+	// 或环境变量 ZV_LISTEN（internal/config/config.go 的 applyEnv），env 优先。
+	// 少了这一行，plist 里的 --listen 就只是个装饰（曾经如此）。
+	if o.Listen != "" {
+		cmd.Env = append(cmd.Env, "ZV_LISTEN="+o.Listen)
 	}
 	// 直接 fork+setuid，不经 sudo：理由见文件头（TCC 归属 + 少一个进程）。
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
@@ -276,19 +301,24 @@ func runZizvideoSupervisor(ctx context.Context, o zizvideoSuperviseOptions) erro
 	}
 }
 
-// cmdZizvideoSupervise 是 `zizpanel zizvideo-supervise` 的入口。
-func cmdZizvideoSupervise(args []string) error {
+// zizvideoOptionsFromArgs 解析 supervisor 的 argv（供入口与"参数咬合"门禁共用）。
+func zizvideoOptionsFromArgs(args []string) (zizvideoSuperviseOptions, error) {
 	fs := flag.NewFlagSet("zizvideo-supervise", flag.ContinueOnError)
 	userName := fs.String("user", "", "以哪个真实用户的身份运行 zizvideo（必填）")
 	zizvideoBin := fs.String("zizvideo", "/opt/zizvideo/bin/zizvideo", "zizvideo 可执行文件")
 	configPath := fs.String("config", "", "zizvideo 的 config.json（必填，数据目录下）")
 	home := fs.String("home", "", "真实用户家目录（必填，作为子进程 HOME）")
-	listen := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", services.ZizvideoPort), "监听地址（只允许回环）")
+	listen := fs.String("listen", fmt.Sprintf("0.0.0.0:%d", services.ZizvideoPort), "监听地址（回环或通配；经 ZV_LISTEN 转发给 zizvideo）")
 	logDir := fs.String("log-dir", "", "日志目录（默认 <home>/Library/Logs）")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return zizvideoSuperviseOptions{}, err
 	}
-	o, err := zizvideoSuperviseOptionsFrom(*userName, *zizvideoBin, *configPath, *home, *listen, *logDir)
+	return zizvideoSuperviseOptionsFrom(*userName, *zizvideoBin, *configPath, *home, *listen, *logDir)
+}
+
+// cmdZizvideoSupervise 是 `zizpanel zizvideo-supervise` 的入口。
+func cmdZizvideoSupervise(args []string) error {
+	o, err := zizvideoOptionsFromArgs(args)
 	if err != nil {
 		return err
 	}
