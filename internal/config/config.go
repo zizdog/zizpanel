@@ -606,6 +606,11 @@ func (c *Config) fill() {
 	if c.Listen == "" {
 		c.Listen = d.Listen
 	}
+	// 老配置里没有这个字段（或被人手工清零）时补回默认端口：
+	// 否则启动时会拿 0 去绑（校验直接失败 ⇒ 独立端口永远不生效）。
+	if c.Aria2UIPort <= 0 {
+		c.Aria2UIPort = d.Aria2UIPort
+	}
 	if c.SessionHours <= 0 {
 		c.SessionHours = d.SessionHours
 	}
