@@ -1730,10 +1730,10 @@ func builtinCatalog() []App {
 			Port: Aria2RPCPort,
 			// 配置文件在安装目录里（「📝 编辑配置文件」直接读写它；改完点重启生效）。
 			ConfigPath: "~/" + Aria2Slug + "/" + Aria2ConfName,
-			PostInstallHint: "两个界面入口：① 面板内「/" + Aria2Slug + "/」（需先登录面板）；" +
-				"② **独立端口** http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
-				"要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
-				"下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
+			PostInstallHint: "1，入口：http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
+				"2，反代：要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
+				"3，下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。" +
+				"4,三方调用：（如油猴脚本）加X-Aria2-Token头验证；取凭证：https://<mini面板>/api/v1/market/aria2/script-token",
 			DocsURL: "https://aria2.github.io/",
 		},
 

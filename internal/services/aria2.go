@@ -225,6 +225,13 @@ func aria2Conf(p Aria2Paths, secret string) string {
 	b.WriteString("save-session-interval=30\n")
 	b.WriteString("bt-enable-lpd=false\n")
 	b.WriteString("enable-dht=true\n")
+	// 走**系统解析器**而不是内置的 c-ares：macOS 上两者可能给出不同结果 ——
+	// 真机撞到过 aria2 报 `Name resolution for mirror.zizdog.com failed:
+	// DNS server returned answer with no data`，而同一台机器上 curl 解析正常
+	// （系统解析器走 mDNSResponder，c-ares 只读 /etc/resolv.conf，
+	// 遇到 CNAME/加密 DNS 配置就会分叉）。下载器要的是"能解析"，
+	// 代价是 DNS 查询期间事件循环阻塞，可以接受。
+	b.WriteString("async-dns=false\n")
 	b.WriteString("follow-torrent=true\n")
 	b.WriteString("console-log-level=warn\n")
 	return b.String()

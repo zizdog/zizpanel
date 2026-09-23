@@ -116,7 +116,8 @@ func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 		"enable-rpc=true",
 		"rpc-listen-all=true", // 用户 2026-09-23：局域网直连（RPC 有 rpc-secret）
 		"bt-enable-lpd=false", // 关 lpd：macOS 的"查找本地网络设备"弹窗就是它引起的
-		"enable-dht=true",     // DHT 是公网单播，不弹窗，磁力链要靠它
+		"enable-dht=true",
+		"async-dns=false", // 用系统解析器：c-ares 在 macOS 上会与系统解析器分叉（真机 DNS 报错）     // DHT 是公网单播，不弹窗，磁力链要靠它
 		"save-session=" + p.Session,
 		"input-file=" + p.Session,
 	} {
@@ -126,6 +127,10 @@ func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 	}
 	if !strings.Contains(conf, "rpc-secret=SECRET123") {
 		t.Error("RPC 绑了局域网就必须有 rpc-secret，否则同网段任何人都能操纵下载器")
+	}
+	if !strings.Contains(conf, "async-dns=false") {
+		t.Error("必须用系统解析器：aria2 默认的 c-ares 在 macOS 上会和系统解析器分叉，" +
+			"真机表现是某些域名报 'DNS server returned answer with no data' 而 curl 却正常")
 	}
 }
 
