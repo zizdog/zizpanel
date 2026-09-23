@@ -100,6 +100,18 @@ check('卡片显示「已连接」与真实摘要', /已连接/.test(body) && /�
 check('摘要里有聚合数字（X/Y 运行、磁盘百分比）', /\d+\/\d+ 运行/.test(body) && /%/.test(body));
 check('页面没有报错文案', !/读取子机列表失败|添加失败/.test(body));
 
+// ⑨ 诚实性：故意填错凭证，界面必须显示「没连上」+ 原因，而不是继续显示"已连接"
+const inputs2 = parent.page.locator('#app input.input');
+await inputs2.nth(0).fill('bad-token');
+await inputs2.nth(1).fill(CHILD + '/');
+await inputs2.nth(2).fill('definitely-wrong-token');
+await parent.page.locator('button', { hasText: '添加' }).first().click();
+await parent.page.waitForTimeout(3000);
+const afterBad = await parent.page.locator('body').innerText();
+check('凭证错时显示「没连上」', /没连上/.test(afterBad), afterBad.replace(/\n+/g, ' | ').slice(0, 240));
+check('失败原因如实显示在卡片上（403 + 凭证不对）', /403/.test(afterBad) && /凭证不对/.test(afterBad));
+check('失败的那台没有摘要数字（不拿旧数据冒充）', !/没连上[\s\S]{0,80}\d+\/\d+ 运行/.test(afterBad));
+
 await browser.close();
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} 项通过`);

@@ -120,15 +120,36 @@ export function PeersView(content) {
     listBox.append(h('div.card-body', peers.map((p) => peerCard(p))));
   }
 
+  // 摘要"多久没更新了"必须显示出来：一台子机三天前失联、界面却只写"已连接"，
+  // 那是最容易骗到人的假状态（它看起来和刚拉过一模一样）。
+  const STALE_AFTER_MS = 15 * 60 * 1000;
+  function peerFreshness(p) {
+    if (!p.last_at) return { stale: false, text: '' };
+    const at = Date.parse(p.last_at);
+    if (Number.isNaN(at)) return { stale: false, text: '' };
+    const mins = Math.floor((Date.now() - at) / 60000);
+    if (mins < 1) return { stale: false, text: '' };
+    const text = mins < 60 ? mins + ' 分钟前' : Math.floor(mins / 60) + ' 小时前';
+    return { stale: Date.now() - at > STALE_AFTER_MS, text };
+  }
+
   function peerCard(p) {
     const s = p.summary || null;
+    const fresh = peerFreshness(p);
+    const stale = fresh.stale;
+    const ageText = fresh.text;
     const head = h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
       h('strong', { text: p.name }),
       h('span.hint.mono', { text: p.url }),
+      // 三态都要如实：失败 / 从没拉到过 / 数据可能过期 —— 只有"刚拉到"才显示「已连接」。
       p.last_error
         ? h('span.pill.danger', { text: '没连上', title: p.last_error })
-        : h('span.pill.ok', { text: '已连接' }),
-      h('span.hint', { text: p.last_at ? '最后成功：' + p.last_at : '还没有成功过' }),
+        : (!p.last_at
+          ? h('span.pill.warn', { text: '还没拉到数据', title: '添加之后还没成功拉到过它的状态' })
+          : (stale
+            ? h('span.pill.warn', { text: '数据可能过期', title: '很久没有成功拉到过它的状态了' })
+            : h('span.pill.ok', { text: '已连接' }))),
+      h('span.hint', { text: p.last_at ? '最后成功：' + p.last_at + (stale ? '（' + ageText + '）' : '') : '还没有成功过' }),
       h('div', { style: { flex: '1' } }),
       h('button.btn.btn-sm', { text: '刷新', onclick: () => refreshOne(p.id) }),
       h('button.btn.btn-sm', { text: '移除', onclick: () => removePeer(p) }),
