@@ -185,6 +185,12 @@ type Server struct {
 	notifySinkMaker func(notify.Options) []notify.Sink
 	notifyFactsFn   func(ctx context.Context) notifyFacts
 
+	// ---- 多机管理（C5，见 api_peers.go）----
+	// peerMu 串行化"拉取 + 写回配置"：并发刷新同一台子机时别互相踩。
+	peerMu sync.Mutex
+	// peerFetchFn 是单测注入点：默认实现会真的发网络请求（单测绝不许联网）。
+	peerFetchFn func(ctx context.Context, p config.Peer) (json.RawMessage, error)
+
 	loginSvc loginLimiter
 	procMu   sync.Mutex
 	procAt   time.Time
@@ -664,6 +670,18 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/nav/background", s.requireAuth(s.handleNavBackgroundUpload))
 	root.HandleFunc("GET /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsGet))
 	root.HandleFunc("POST /api/v1/nav/settings", s.requireAuth(s.handleNavSettingsSave))
+
+	// ---------- 多机管理（C5，见 api_peers.go）----------
+	//
+	// agent/summary 刻意**不 requireAuth**：主面板没有子机的登录态。它的鉴权是
+	// X-ZizPanel-Agent 头里的只读凭证（子机没开启时一律 403），见 handler 注释。
+	root.HandleFunc("GET /api/v1/agent/summary", s.handleAgentSummary)
+	root.HandleFunc("GET /api/v1/peers", s.requireAuth(s.handlePeersGet))
+	root.HandleFunc("POST /api/v1/peers", s.requireAuth(s.handlePeerAdd))
+	root.HandleFunc("DELETE /api/v1/peers/{id}", s.requireAuth(s.handlePeerDelete))
+	root.HandleFunc("POST /api/v1/peers/refresh", s.requireAuth(s.handlePeerRefresh))
+	root.HandleFunc("POST /api/v1/peers/{id}/refresh", s.requireAuth(s.handlePeerRefresh))
+	root.HandleFunc("POST /api/v1/agent/token", s.requireAuth(s.handleAgentToken))
 
 	// ---------- PWA（C4，见 pwa.go）----------
 	//

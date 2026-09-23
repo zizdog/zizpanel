@@ -17,6 +17,7 @@ import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
 import { MobileView } from './mobile.js';
+import { PeersView } from './peers.js';
 import { setupPWA } from './pwa.js';
 import { DisksView } from './disks.js';
 import { DatabaseView } from './database.js';
@@ -43,6 +44,8 @@ export const NAV = [
   // 「手机一屏」（C4）：手机上真正要看的是「有没有事」和「点一下能不能恢复」，
   // 桌面版的信息密度在 6 寸屏上等于什么都看不见（详见 mobile.js）。
   { id: 'mobile', title: '手机一屏', icon: '📱', view: MobileView },
+  // 「多机」（C5）：一台面板只读聚合另外几台 Mac 的状态（见 peers.js）。
+  { id: 'peers', title: '多机', icon: '🖧', view: PeersView },
   // 「系统监控」已改成「mac设置」（2026-09 用户要求把显示名从「系统设置」改成
   // 「mac设置」：原名与「面板设置」并列时歧义太大）。**只改显示名**，
   // 路由 id 仍是 'system'，`#/system` 与所有旧链接照旧可用。

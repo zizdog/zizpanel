@@ -224,6 +224,33 @@ Web 接口在 `internal/web/api_backup.go`，CLI 在 `cmd/zizpanel/backup.go`。
 
 ---
 
+## 六点八、多机管理（C5，只读聚合）
+
+一台面板把另外几台 Mac 的状态集中在一屏。这一版**只读**：主面板定期拉子机的
+版本/负载/服务计数，**不代它执行任何写操作** —— 写操作的信任模型（主面板持有什么权限、
+子机怎么撤销、离线时怎么算）没定清楚之前不做，半成品的"远程控制"比没有更危险。
+
+- 代码：`internal/web/api_peers.go`（两端都在这里）+ `assets/js/peers.js`（「多机」页）。
+  子机侧 `GET /api/v1/agent/summary`（**不 requireAuth**，只认 `X-ZizPanel-Agent` 头里的只读凭证）；
+  主面板侧 `GET/POST /api/v1/peers`、`DELETE /api/v1/peers/{id}`、`POST /api/v1/peers/refresh`、
+  `POST /api/v1/agent/token`（开关"被主面板管理"）。
+- **安全边界（四条，缺一不可）**：① 子机默认不接受任何主面板（凭证为空 ⇒ 一律 403）；
+  ② 凭证只读、常量时间比较、可随时重新生成（旧的立即失效）；③ 摘要**只有聚合数字**
+  （不含站点名/路径/口令/日志）；④ 主面板连子机：https **必须固定证书指纹**
+  （`InsecureSkipVerify` + `VerifyPeerCertificate` 严格比 sha256），http 只放行回环
+  —— 凭证不能明文过网。
+- **失败必须如实**：拉不到就把错误原样写进 `peer.last_error`、**不保留旧摘要冒充最新**，
+  界面显示「没连上」+ 原因（网络/凭证/指纹各不相同，用户能据此自己修）。
+- 本机双实例验收（2026-09-24，两个**独立面板进程**，都在 /tmp 调试实例里）：
+  子机未开凭证 403 → 开启后拿 64 位凭证 → 错凭证 403 / 对凭证 200 → 主面板添加并**真拉到**
+  摘要（版本 1.8.9、服务 10/10、磁盘 68.5%、CPU 31.5%）→ 故意填错凭证时记下
+  `子机返回 HTTP 403（凭证不对）` 且**没有摘要** → 非回环 http 与"https 缺指纹"都被 400 拒绝。
+- 门禁：`internal/web -run 'TestPeer|TestAgent|TestValidatePeerURL|TestFetchPeerSummary'`
+  6 条（含用 httptest 自签 TLS 服务器验"指纹对能连、指纹错必须拒"）。
+- **未做**：跨机的写操作（重启子机服务等）、子机侧的操作审计与授权范围、离线时的状态语义。
+
+---
+
 ## 七、系统设置（把 macOS 配成服务器）
 
 「系统设置」页把需要终端的事做成开关：合盖不睡、断电自恢复、关 Spotlight 索引、调 TCP 参数、开远程登录等。

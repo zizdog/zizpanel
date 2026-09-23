@@ -19,6 +19,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/appproxy"
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
 // ============================================================================
@@ -871,6 +872,34 @@ func TestSTTModelDownloadGoesToTask(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "task_id") {
 		t.Errorf("202 必须带 task_id：%s", rec.Body.String())
 	}
+	// 这个 202 **真的起了后台下载任务**（会联网、会往 t.TempDir() 里写）：测试结束前必须
+	// 取消并等它真的停下来 —— 否则清理 TempDir 时会撞上 "directory not empty"
+	// （全量跑 `make check` 时偶发过一次，单跑永远看不到）。
+	if id := sttTaskID(t, rec.Body.Bytes()); id != "" {
+		if _, err := srv.tasks.Cancel(id); err != nil {
+			t.Logf("取消下载任务失败（%v）：等它自己结束", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if tk := srv.tasks.Get(id); tk == nil || tk.Status() != tasks.StatusRunning {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Logf("下载任务 5 秒内没停下来，TempDir 清理可能报 not empty（与本次改动无关的既有测试卫生问题）")
+	}
+}
+
+// sttTaskID 从 202 响应里取 task_id（取不到就返回空串：调用方按"没有任务"处理）。
+func sttTaskID(t *testing.T, body []byte) string {
+	t.Helper()
+	var out struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return ""
+	}
+	return out.TaskID
 }
 
 // TestSTTSelectModelRequiresInstalled：不能把当前档切成没下载的档。

@@ -167,6 +167,15 @@ export const api = {
   upgradeDismiss: () => request('POST', `${API_BASE}/system/upgrade/dismiss`, {}),
   upgradeUpload: (file) => api.upload(`${API_BASE}/system/upgrade/upload`, file),
   saveSettings: (patch) => request('POST', `${API_BASE}/settings`, patch),
+  // ---- 多机管理（C5）----
+  // 只读聚合：peers() 列出子机与各自最近一次摘要；agentToken() 开关"被主面板管理"。
+  peers: () => request('GET', `${API_BASE}/peers`),
+  peerAdd: (body) => request('POST', `${API_BASE}/peers`, body),
+  peerDelete: (id) => request('DELETE', `${API_BASE}/peers/${id}`, null),
+  peerRefresh: (id) => request('POST', `${API_BASE}/peers/${id}/refresh`, {}),
+  peerRefreshAll: () => request('POST', `${API_BASE}/peers/refresh`, {}),
+  agentToken: (enabled) => request('POST', `${API_BASE}/agent/token`, { enabled }),
+
   // ---- 主动通知（C3）----
   // 面板发现异常时主动说一声（本机通知 / Webhook）。notifyCheck 立刻巡检一次
   // 并把发现的问题**如实返回**：即使通知关着也会列出问题，只是不发送。

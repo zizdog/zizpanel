@@ -186,6 +186,18 @@ type Config struct {
 	NotifyCertDays    int `json:"notify_cert_days"`
 	NotifyDiskPercent int `json:"notify_disk_percent"`
 
+	// ---------- 多机管理（C5，见 internal/web/api_peers.go）----------
+	//
+	// 这一版刻意只做**只读聚合**：主面板定期拉每台子机的"摘要"（版本/负载/服务计数），
+	// 不代它执行任何写操作 —— 写操作的信任模型比只读复杂得多，没定清楚之前不做。
+	//
+	// AgentToken 是**子机给主面板用的凭证**：空 = 不接受任何主面板（默认）。
+	// 只读、可随时重新生成/清空（清空即吊销所有主面板）。
+	AgentToken string `json:"agent_token"`
+	// Peers 是主面板要聚合的子机列表。数量少（家用几台），存在配置里即可，
+	// 不必为它建表；每台的最近一次摘要与失败原因都如实存着，界面直接显示。
+	Peers []Peer `json:"peers,omitempty"`
+
 	// ---------- 环境（LNMP 等由面板管理的系统组件） ----------
 	User     string `json:"user"`      // 面板运行用户（安装时确定）
 	UserHome string `json:"user_home"` // 该用户家目录
@@ -235,6 +247,45 @@ type Config struct {
 	// generatedAria2Token 只在本进程内有效：这次加载刚给老配置补了 aria2 脚本凭证，
 	// 必须立刻落盘 —— 否则每次重启都换一个值，用户的脚本立刻失效。
 	generatedAria2Token bool
+}
+
+// Peer 是一台被本面板聚合的子机。
+type Peer struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// URL 是子机的**面板入口**（含安全后缀），例如 https://m4.lan:8443/ab12cd/
+	URL string `json:"url"`
+	// Token 是子机生成的只读凭证（粘贴过来）。
+	Token string `json:"token"`
+	// Fingerprint 是子机 HTTPS 证书的 sha256 指纹（十六进制，可带冒号）。
+	// https 子机**必须**固定指纹：面板之间多用自签证书，不固定就等于信任任何中间人。
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// LastAt / LastError / Summary 是最近一次拉取的**真实结果**：
+	// 成功记时间与摘要，失败原样记错误（界面必须能看出"这台没连上"而不是显示旧数据）。
+	LastAt    string          `json:"last_at,omitempty"`
+	LastError string          `json:"last_error,omitempty"`
+	Summary   json.RawMessage `json:"summary,omitempty"`
+}
+
+// FindPeer 按 id 找一台子机。
+func (c *Config) FindPeer(id int64) (int, *Peer) {
+	for i := range c.Peers {
+		if c.Peers[i].ID == id {
+			return i, &c.Peers[i]
+		}
+	}
+	return -1, nil
+}
+
+// NextPeerID 返回下一个可用的子机 id（删除后不复用，避免界面串台）。
+func (c *Config) NextPeerID() int64 {
+	var max int64
+	for _, p := range c.Peers {
+		if p.ID > max {
+			max = p.ID
+		}
+	}
+	return max + 1
 }
 
 // DefaultRoot 是面板的默认安装根目录。

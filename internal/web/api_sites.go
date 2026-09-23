@@ -2448,6 +2448,9 @@ func (s *Server) Startup(ctx context.Context) {
 	// 没有这条巡检就再也没人建默认站点（此前报障）。判据见 maybeEnsureDefaultSite。
 	go s.watchWebEnv(ctx)
 
+	// 多机聚合（C5）：定期拉每台子机的摘要。只读，不做任何写操作。
+	go s.watchPeers(ctx)
+
 	// 主动通知巡检（C3）：发现异常时主动说一声，而不是等用户点进来。
 	// 第一次巡检延后（见 notifyFirstDelay），不在启动路径上抢资源。
 	go s.watchNotifications(ctx)
