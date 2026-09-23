@@ -22,11 +22,7 @@
   "config": {
     "path": "~/Library/Application Support/Syncthing/config.xml",
     "mode": "0600",
-    "own": "user",
-    "secrets": [
-      "gui-user",
-      "gui-password"
-    ]
+    "own": "user"
   },
   "expose": {
     "port": 8384,

@@ -133,16 +133,16 @@ func SpecToApp(spec *plugins.Spec) (App, error) {
 	}
 	if spec.Config != nil {
 		app.ConfigPath = spec.Config.Path
-		if len(spec.Config.Set) > 0 {
-			// 值拷贝一份：插件声明可能被复用/复用后又被改，别让 App 拿着共享 map。
-			set := make(map[string]string, len(spec.Config.Set))
-			for k, v := range spec.Config.Set {
+		// 深拷贝：插件声明可能在别处被复用/改动，App 不能拿着共享的 map/slice。
+		for _, p := range spec.Config.PatchList() {
+			set := make(map[string]string, len(p.Set))
+			for k, v := range p.Set {
 				set[k] = v
 			}
-			app.ConfigPatch = &plugins.Patch{
-				Format: spec.Config.Format, Section: spec.Config.Section,
-				Set: set, IfMissing: spec.Config.IfMissing,
-			}
+			app.ConfigPatches = append(app.ConfigPatches, plugins.Patch{
+				Format: p.Format, Section: p.Section, Set: set,
+				IfMissing: p.IfMissing, Secrets: append([]string{}, p.Secrets...),
+			})
 		}
 	}
 	// 给用户的说明：本地插件的身份与"停用 ≠ 卸载"，别让人以为停用就把东西删了。

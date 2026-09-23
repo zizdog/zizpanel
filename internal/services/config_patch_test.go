@@ -30,10 +30,10 @@ func TestApplyConfigPatchStepWritesAndBacksUp(t *testing.T) {
 	app := App{
 		ID: "patchtest", Name: "补丁测试", Kind: KindNative, BrewFormula: "patchtest",
 		ConfigPath: "{brew}/etc/app.ini",
-		ConfigPatch: &plugins.Patch{
+		ConfigPatches: []plugins.Patch{{
 			Format: plugins.PatchINI, Section: "server",
 			Set: map[string]string{"http_port": "3002"},
-		},
+		}},
 	}
 	res := &InstallResult{App: app.ID, Name: app.Name}
 	m.applyConfigPatchStep(context.Background(), app, res)
@@ -91,8 +91,10 @@ func TestApplyConfigPatchStepSkipsMissingFile(t *testing.T) {
 	path := filepath.Join(brew, "etc", "not-yet.conf")
 	app := App{
 		ID: "pending", Name: "还没生成配置", Kind: KindNative,
-		ConfigPath:  "{brew}/etc/not-yet.conf",
-		ConfigPatch: &plugins.Patch{Set: map[string]string{"bind": "0.0.0.0"}},
+		ConfigPath: "{brew}/etc/not-yet.conf",
+		// 声明了随机口令也一样：文件不存在又没写 create ⇒ **不生成、不进凭据区**
+		// （否则用户会拿着一个根本不在配置里的口令去登录）。
+		ConfigPatches: []plugins.Patch{{Set: map[string]string{"bind": "0.0.0.0"}, Secrets: []string{"token"}}},
 	}
 	res := &InstallResult{App: app.ID}
 	m.applyConfigPatchStep(context.Background(), app, res)
@@ -105,17 +107,23 @@ func TestApplyConfigPatchStepSkipsMissingFile(t *testing.T) {
 	if res.Warning != "" {
 		t.Errorf("可预期的跳过不该算告警：%s", res.Warning)
 	}
+	if len(res.Credentials) != 0 {
+		t.Errorf("跳过时绝不能给出凭据（那个口令没被写进任何文件）：%+v", res.Credentials)
+	}
 
 	// 声明了 create 才新建（且只包含声明的键）
-	app.ConfigPatch.IfMissing = "create"
+	app.ConfigPatches[0].IfMissing = "create"
 	res2 := &InstallResult{App: app.ID}
 	m.applyConfigPatchStep(context.Background(), app, res2)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("声明 create 后应当新建文件：%v", err)
 	}
-	if strings.TrimSpace(string(b)) != "bind = 0.0.0.0" {
-		t.Errorf("新建内容只该有声明的键：%q", string(b))
+	if !strings.Contains(string(b), "bind = 0.0.0.0") {
+		t.Errorf("新建内容必须包含声明的键：%q", string(b))
+	}
+	if len(res2.Credentials) != 1 || !strings.Contains(string(b), "token = "+res2.Credentials[0].Value) {
+		t.Errorf("create 分支生成的随机口令必须真的写进新文件：%q / %+v", string(b), res2.Credentials)
 	}
 }
 
@@ -143,7 +151,9 @@ func TestApplyConfigPatchStepReportsFailure(t *testing.T) {
 	m := &Manager{opt: Options{BrewBin: filepath.Join(brew, "bin", "brew")}}
 	app := App{
 		ID: "readonly", Kind: KindNative, ConfigPath: "{brew}/etc/app.conf",
-		ConfigPatch: &plugins.Patch{Set: map[string]string{"a": "2"}},
+		ConfigPatches: []plugins.Patch{{
+			Set: map[string]string{"a": "2"}, Secrets: []string{"token"},
+		}},
 	}
 	res := &InstallResult{App: app.ID}
 	m.applyConfigPatchStep(context.Background(), app, res)
@@ -155,6 +165,10 @@ func TestApplyConfigPatchStepReportsFailure(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(res.Steps, "\n"), "配置补丁已应用") {
 		t.Error("失败时绝不能写「已应用」")
+	}
+	// 写失败时刚生成的口令根本没进配置 —— 绝不能留在凭据区让用户拿着它去登录。
+	if len(res.Credentials) != 0 {
+		t.Errorf("写失败后凭据区必须清空，实际 %+v", res.Credentials)
 	}
 }
 
@@ -177,12 +191,136 @@ func TestConfigPatchFlowsFromSpecToApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.ConfigPatch == nil || app.ConfigPatch.Set["port"] != "7700" {
-		t.Fatalf("补丁没有从声明流到 App：%+v", app.ConfigPatch)
+	if len(app.ConfigPatches) != 1 || app.ConfigPatches[0].Set["port"] != "7700" {
+		t.Fatalf("补丁没有从声明流到 App：%+v", app.ConfigPatches)
 	}
 	// 值必须是**拷贝**：改 App 上的补丁不该污染声明（否则界面/日志会跟着漂）
-	app.ConfigPatch.Set["port"] = "1"
+	app.ConfigPatches[0].Set["port"] = "1"
 	if spec.Config.Set["port"] != "7700" {
 		t.Error("App 与声明共享了同一个 map（必须拷贝）")
+	}
+}
+
+// TestConfigPatchSecrets 随机口令的三条语义：
+//
+//	① 文件里没有 → 生成、写进去、进凭据区（且只在这里出现一次）；
+//	② 已有非空值 → **复用，不轮换**（重装一次换一次口令 = 把应用弄坏）；
+//	③ 写失败 → 凭据区必须清空（用户不该拿到一个不在配置里的口令）。
+func TestConfigPatchSecrets(t *testing.T) {
+	dir := t.TempDir()
+	brew := filepath.Join(dir, "brew")
+	etc := filepath.Join(brew, "etc")
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{opt: Options{BrewBin: filepath.Join(brew, "bin", "brew")}}
+	app := App{
+		ID: "couchlike", Kind: KindNative, ConfigPath: "{brew}/etc/app.ini",
+		ConfigPatches: []plugins.Patch{{
+			Format: plugins.PatchINI, Section: "admins", IfMissing: "create",
+			Secrets: []string{"admin"},
+		}},
+	}
+	cfg := filepath.Join(etc, "app.ini")
+
+	// ① 首次：生成 + 写盘 + 凭据
+	res := &InstallResult{App: app.ID}
+	m.applyConfigPatchStep(context.Background(), app, res)
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("声明 create 后应当建出配置文件：%v", err)
+	}
+	if len(res.Credentials) != 1 || res.Credentials[0].Key != "admin" || res.Credentials[0].Value == "" {
+		t.Fatalf("应当把随机口令带进凭据区：%+v", res.Credentials)
+	}
+	first := res.Credentials[0].Value
+	if len(first) < 16 {
+		t.Errorf("口令太短：%q", first)
+	}
+	if !strings.Contains(string(body), "admin = "+first) {
+		t.Errorf("凭据里的口令必须真的写进了配置：\n%s", body)
+	}
+
+	// ② 再装一次：复用已有值，不轮换、不再出现在凭据区
+	res2 := &InstallResult{App: app.ID}
+	m.applyConfigPatchStep(context.Background(), app, res2)
+	body2, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(body2), "admin = "+first) {
+		t.Errorf("重装不该轮换口令：\n%s", body2)
+	}
+	if len(res2.Credentials) != 0 {
+		t.Errorf("复用时不该再报一次凭据（用户已有）：%+v", res2.Credentials)
+	}
+	if !strings.Contains(strings.Join(res2.Steps, "\n"), "复用") {
+		t.Errorf("复用时步骤里要写明：%v", res2.Steps)
+	}
+
+	// ③ 空值等于没设：应当重新生成（"admin = " 这种半成品配置必须补上口令）
+	if err := os.WriteFile(cfg, []byte("[admins]\nadmin = \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res3 := &InstallResult{App: app.ID}
+	m.applyConfigPatchStep(context.Background(), app, res3)
+	if len(res3.Credentials) != 1 || res3.Credentials[0].Value == "" {
+		t.Fatalf("空值应当重新生成口令：%+v", res3.Credentials)
+	}
+	body3, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(body3), "admin = "+res3.Credentials[0].Value) {
+		t.Errorf("新口令必须写进配置：\n%s", body3)
+	}
+}
+
+// TestConfigPatchMultiplePatches 一个文件里改多个 section（couchdb 那种形态）：
+// 一次落盘、一次备份，两条补丁都生效。
+func TestConfigPatchMultiplePatches(t *testing.T) {
+	dir := t.TempDir()
+	brew := filepath.Join(dir, "brew")
+	etc := filepath.Join(brew, "etc")
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(etc, "local.ini")
+	orig := "[chttpd]\n;bind_address = 127.0.0.1\n\n[admins]\n;admin = x\n"
+	if err := os.WriteFile(cfg, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{opt: Options{BrewBin: filepath.Join(brew, "bin", "brew")}}
+	app := App{
+		ID: "couchdb", Kind: KindNative, ConfigPath: "{brew}/etc/local.ini",
+		ConfigPatches: []plugins.Patch{
+			{Format: plugins.PatchINI, Section: "chttpd", Set: map[string]string{"bind_address": "0.0.0.0"}},
+			{Format: plugins.PatchINI, Section: "admins", Secrets: []string{"admin"}},
+		},
+	}
+	res := &InstallResult{App: app.ID}
+	m.applyConfigPatchStep(context.Background(), app, res)
+	body, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(body), "bind_address = 0.0.0.0") {
+		t.Errorf("第一条补丁没生效：\n%s", body)
+	}
+	if len(res.Credentials) != 1 {
+		t.Fatalf("第二条补丁应当生成口令：%+v", res.Credentials)
+	}
+	if !strings.Contains(string(body), "admin = "+res.Credentials[0].Value) {
+		t.Errorf("第二条补丁没生效：\n%s", body)
+	}
+	// 只留一份备份，内容是改动前的原文
+	backup, err := os.ReadFile(cfg + ".zizpanel.bak")
+	if err != nil {
+		t.Fatalf("应当留一份备份：%v", err)
+	}
+	if string(backup) != orig {
+		t.Errorf("备份必须是改动前的原文：\n%s", backup)
+	}
+	// 幂等：再跑一次不该改文件，也不该再生成口令
+	before, _ := os.ReadFile(cfg)
+	res2 := &InstallResult{App: app.ID}
+	m.applyConfigPatchStep(context.Background(), app, res2)
+	after, _ := os.ReadFile(cfg)
+	if string(before) != string(after) {
+		t.Errorf("第二次跑不该改文件：\n%s", after)
+	}
+	if len(res2.Credentials) != 0 {
+		t.Errorf("第二次跑不该再报凭据：%+v", res2.Credentials)
 	}
 }

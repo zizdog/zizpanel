@@ -43,6 +43,11 @@ type Patch struct {
 	// 为什么默认 skip：不少应用是**首次启动才生成**配置（netdata.conf、code-server
 	// 的 config.yaml），抢先写一个"最小配置"会把应用的默认值全抹掉。
 	IfMissing string `json:"if_missing,omitempty"`
+	// Secrets 是"这些键的值由面板随机生成、只展示一次"（例如数据库管理员口令）。
+	//
+	// 关键语义：**已经存在且非空的值一律复用**，绝不轮换 —— 重装一次就把口令换掉，
+	// 等于把用户已经配好的应用弄坏。只有真的生成了新值，才会出现在安装结果的凭据区。
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // NormalizeFormat 返回规范化的格式（空 = kv）。
@@ -61,6 +66,32 @@ func (p Patch) Keys() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// CurrentValue 取文件里某个键现在的值（不存在返回空串 + false）。
+//
+// 用途：随机密钥必须**先看有没有**再决定生不生成（重装不许轮换口令）。
+func CurrentValue(content string, p Patch, key string) (string, bool) {
+	format := NormalizeFormat(p.Format)
+	section := ""
+	for _, raw := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if format == PatchINI && strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			continue
+		}
+		if format == PatchINI && p.Section != "" && section != p.Section {
+			continue
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		k, v, _, _, ok := parseLine(raw, format)
+		if ok && k == key {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // ApplyPatch 在文本层面应用补丁，返回新内容与"是否真的改了"。
@@ -219,6 +250,14 @@ func ValidatePatch(p *Patch) []string {
 	case "", "skip", "create":
 	default:
 		errs = append(errs, fmt.Sprintf("config.if_missing 只能是 skip / create，实际 %q", p.IfMissing))
+	}
+	for _, k := range p.Secrets {
+		if !patchKeyRe.MatchString(k) {
+			errs = append(errs, fmt.Sprintf("config.secrets 的键 %q 形状不对（只允许字母数字与 _ . -）", k))
+		}
+		if _, dup := p.Set[k]; dup {
+			errs = append(errs, fmt.Sprintf("config.secrets 里的 %q 与同一处 config.set 撞了同一个键（两者都要写它）", k))
+		}
 	}
 	for k, v := range p.Set {
 		if !patchKeyRe.MatchString(k) {

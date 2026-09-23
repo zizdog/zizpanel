@@ -136,7 +136,11 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
 - 门禁：`internal/plugins` 的补丁用例（kv/ini/yaml、前缀不误伤、section 隔离、幂等、缩进与
   注释保留、注入拒绝、PlanText 必须写出补丁）+ `internal/services` 的接线用例（写入/备份/幂等/
   跳过/写失败进 Warning/声明→App 的值是拷贝）。
-- 仍未做：`config.secrets`（随机口令写进配置）、`config.seed`（模板文件）、`run.hooks` 的执行通路。
+- 随机口令（`config.patches[].secrets`）：值由面板生成、写进配置、只在安装结果的凭据区出现一次；
+  **已有非空值一律复用**（重装换口令 = 把应用弄坏），写盘失败时凭据区清空（不给用户一个假口令）。
+- 一个文件要改多个 section 时用 `config.patches[]`（couchdb 那种形态：既要 `[admins]` 口令、
+  又要 `[chttpd]` 监听地址）；多条补丁**只在最后落一次盘**（一次备份、一次写入）。
+- 仍未做：`config.seed`（模板文件）、`run.hooks` 的执行通路。
 
 ---
 

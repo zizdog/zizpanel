@@ -2422,9 +2422,12 @@ func appendWarning(cur, add string) string {
 //	· 文件不存在且声明的是 if_missing=skip（默认）时**如实跳过**并说明原因 ——
 //	  不少应用是首次启动才生成配置，抢先写一个"最小文件"会把它的默认值全抹掉；
 //	· 面板以 root 写用户目录时必须把归属交还真实用户（AGENTS 第三节第 8 条）。
+//
+// 多条补丁写同一个文件：**只在最后落一次盘**（一次备份、一次写入），
+// 免得"改到一半失败"留下半套配置。
 func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *InstallResult) {
-	patch := app.ConfigPatch
-	if patch == nil || len(patch.Set) == 0 {
+	patches := app.ConfigPatches
+	if len(patches) == 0 {
 		return
 	}
 	path := m.appConfigFilePath(app)
@@ -2441,15 +2444,52 @@ func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *Instal
 		raw = nil
 	case err != nil:
 		res.Warning = appendWarning(res.Warning,
-			"配置补丁没生效（"+plugins.PatchText(patch)+"）：读不到 "+path+"（"+err.Error()+"）")
-		return
-	}
-	if !fileExists && patch.IfMissing != "create" {
-		res.step(ctx, "配置补丁：跳过（"+path+" 还不存在；该应用通常是首次启动才生成配置，面板不去抢着写它）")
+			"配置补丁没生效（"+plugins.PatchText(&patches[0])+"）：读不到 "+path+"（"+err.Error()+"）")
 		return
 	}
 
-	out, changed := plugins.ApplyPatch(string(raw), *patch)
+	content := string(raw)
+	changed := false
+	var applied, notes []string
+	for i := range patches {
+		p := patches[i]
+		if !fileExists && p.IfMissing != "create" {
+			res.step(ctx, "配置补丁：跳过（"+path+" 还不存在；该应用通常是首次启动才生成配置，面板不去抢着写它）")
+			continue
+		}
+		// 随机密钥：**已有非空值一律复用**（重装一次换一次口令 = 把应用弄坏），
+		// 只有真的生成了新值才进凭据区 —— 否则用户会拿着一个不在配置里的口令去登录。
+		if len(p.Secrets) > 0 {
+			if p.Set == nil {
+				p.Set = map[string]string{}
+			}
+			for _, key := range p.Secrets {
+				if cur, ok := plugins.CurrentValue(content, p, key); ok && strings.TrimSpace(cur) != "" {
+					res.step(ctx, "配置里的 "+key+" 已有值：复用，不轮换")
+					continue
+				}
+				val, err := generateConfigSecret()
+				if err != nil {
+					res.Warning = appendWarning(res.Warning, "生成随机口令失败（"+key+"）："+err.Error())
+					continue
+				}
+				p.Set[key] = val
+				res.Credentials = append(res.Credentials, Credential{
+					Key: key, Value: val, Label: credentialLabelFor(key),
+				})
+				notes = append(notes, key+"（随机生成，只在这里显示一次）")
+			}
+			if len(p.Set) == 0 {
+				continue
+			}
+		}
+		out, didChange := plugins.ApplyPatch(content, p)
+		if didChange {
+			content = out
+			changed = true
+			applied = append(applied, plugins.PatchText(&p))
+		}
+	}
 	if !changed {
 		res.step(ctx, "配置补丁：已经是目标值，无需修改（"+path+"）")
 		return
@@ -2465,18 +2505,19 @@ func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *Instal
 				res.Warning = appendWarning(res.Warning, "配置备份写入失败（改动仍会进行）："+werr.Error())
 			}
 		}
-	}
-	if !fileExists {
+	} else {
 		// 声明了 create：连目录一起建（应用还没启动过时它的配置目录可能都不存在）。
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			res.Warning = appendWarning(res.Warning,
-				"配置补丁没生效（"+plugins.PatchText(patch)+"）：建目录失败："+err.Error())
+				"配置补丁没生效（"+strings.Join(applied, "、")+"）：建目录失败："+err.Error())
 			return
 		}
 	}
-	if err := os.WriteFile(path, []byte(out), mode); err != nil {
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		res.Warning = appendWarning(res.Warning,
-			"配置补丁没生效（"+plugins.PatchText(patch)+"）：写 "+path+" 失败："+err.Error())
+			"配置补丁没生效（"+strings.Join(applied, "、")+"）：写 "+path+" 失败："+err.Error())
+		// 写失败时刚生成的口令根本没进配置，绝不能留在凭据区里让用户以为能用。
+		res.Credentials = nil
 		return
 	}
 	// 面板是 root，写进用户目录的文件属主必须交还真实用户，否则以该用户身份跑的应用
@@ -2491,7 +2532,37 @@ func (m *Manager) applyConfigPatchStep(ctx context.Context, app App, res *Instal
 	if fileExists {
 		note = "（原文件已备份为 " + path + ".zizpanel.bak）"
 	}
-	res.step(ctx, "配置补丁已应用："+plugins.PatchText(patch)+note)
+	msg := "配置补丁已应用：" + strings.Join(applied, "、") + note
+	if len(notes) > 0 {
+		msg += "；随机生成：" + strings.Join(notes, "、")
+	}
+	res.step(ctx, msg)
+}
+
+// generateConfigSecret 生成一个随机口令（20 字符，字母数字 —— 不引入引号/转义问题）。
+func generateConfigSecret() (string, error) {
+	const alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b), nil
+}
+
+// credentialLabelFor 给凭据一句人话（前端直接显示）。
+func credentialLabelFor(key string) string {
+	switch strings.ToLower(key) {
+	case "password", "admin", "passwd", "admin-password":
+		return "管理员口令"
+	case "user", "username", "admin-user":
+		return "管理员用户名"
+	case "token", "secret", "api-key", "apikey":
+		return "访问令牌"
+	}
+	return ""
 }
 
 // appConfigFilePath 解析应用的配置文件绝对路径。

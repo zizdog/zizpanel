@@ -92,11 +92,10 @@ type Supervise struct {
 
 // Config 是"面板维护的配置文件"。
 type Config struct {
-	Path    string   `json:"path"`
-	Seed    string   `json:"seed,omitempty"`    // 相对插件目录的模板文件；空 = 应用自己创建
-	Mode    string   `json:"mode,omitempty"`    // 默认 0600
-	Secrets []string `json:"secrets,omitempty"` // 随机生成并只展示一次的密钥名（安装结果凭据区）
-	Own     string   `json:"own,omitempty"`     // user（默认）| root
+	Path string `json:"path"`
+	Seed string `json:"seed,omitempty"` // 相对插件目录的模板文件；空 = 应用自己创建
+	Mode string `json:"mode,omitempty"` // 默认 0600
+	Own  string `json:"own,omitempty"`  // user（默认）| root
 	// Set 是**声明式配置补丁**：装上之后把配置里的这几个键改成这些值
 	// （见 patch.go）。有了它，"只差一行配置"的应用（改监听地址/端口）才能靠填表上架，
 	// 而不必为每个应用写一个面板内建补丁。
@@ -107,6 +106,28 @@ type Config struct {
 	Section string `json:"section,omitempty"`
 	// IfMissing：配置文件还不存在时怎么办：skip（默认，不动）/ create（新建最小文件）。
 	IfMissing string `json:"if_missing,omitempty"`
+	// Secrets 是单补丁简写：等价于第一条补丁的 secrets（随机生成、只展示一次）。
+	Secrets []string `json:"secrets,omitempty"`
+	// Patches 是**多条**补丁：一个文件里可能要改多个 section（couchdb 既要写 [admins]
+	// 口令、又要把 [chttpd] 的监听地址改成 0.0.0.0）。写了 patches 就不能再用上面的简写。
+	Patches []Patch `json:"patches,omitempty"`
+}
+
+// PatchList 返回这份配置声明**真正要执行的补丁**（简写与列表二选一）。
+func (c *Config) PatchList() []Patch {
+	if c == nil {
+		return nil
+	}
+	if len(c.Patches) > 0 {
+		return c.Patches
+	}
+	if len(c.Set) == 0 && len(c.Secrets) == 0 {
+		return nil
+	}
+	return []Patch{{
+		Format: c.Format, Section: c.Section, Set: c.Set,
+		IfMissing: c.IfMissing, Secrets: c.Secrets,
+	}}
 }
 
 // Expose 是"用户从哪里打开它"。**一个应用只有一个规范入口。**
@@ -305,17 +326,16 @@ func (s *Spec) Validate() error {
 		default:
 			add("config.own 只能是 user / root，实际 %q", s.Config.Own)
 		}
-		// 声明式配置补丁（patch.go）：键名形状、值不许带换行、格式与 section 的搭配。
-		for _, e := range ValidatePatch(&Patch{
-			Format: s.Config.Format, Section: s.Config.Section,
-			Set: s.Config.Set, IfMissing: s.Config.IfMissing,
-		}) {
-			add("config：%s", e)
+		// 声明式配置补丁（patch.go）：格式/键名形状/值不许带换行/secret 与 set 不许撞键。
+		if len(s.Config.Patches) > 0 && (len(s.Config.Set) > 0 || len(s.Config.Secrets) > 0) {
+			add("config：写了 config.patches 就不要再写 config.set / config.secrets（两处会打架）")
 		}
-		// 补丁与"随机密钥"写同一个键会互相覆盖，必须当场说清（静默的覆盖最难查）。
-		for _, name := range s.Config.Secrets {
-			if _, dup := s.Config.Set[name]; dup {
-				add("config.secrets 里的 %q 与 config.set 撞了同一个键（两者都会写它，谁赢取决于顺序）", name)
+		// 注意：这里**不**强制"有 secrets 就必须 if_missing=create" —— 装完就有配置文件的
+		// 应用（couchdb 的 local.ini）用默认的 skip 本来就对。文件真的不存在时的后果由
+		// 运行期兜住：跳过写入 ⇒ 不生成口令、凭据区也不出现（见 services.applyConfigPatchStep）。
+		for i, p := range s.Config.PatchList() {
+			for _, e := range ValidatePatch(&p) {
+				add("config.patches[%d]：%s", i, e)
 			}
 		}
 	}
@@ -497,14 +517,18 @@ func PlanText(s *Spec) string {
 	}
 
 	// ④ 配置补丁与暴露
-	if s.Config != nil && len(s.Config.Set) > 0 {
-		fmt.Fprintf(&b, "  4. 配置补丁：改 %s（%s）→ %s\n",
-			s.Config.Path, NormalizeFormat(s.Config.Format), PatchText(&Patch{
-				Format: s.Config.Format, Section: s.Config.Section,
-				Set: s.Config.Set, IfMissing: s.Config.IfMissing,
-			}))
-		if s.Config.IfMissing != "create" {
-			b.WriteString("     文件还不存在时不动它（不少应用是首次启动才生成配置）\n")
+	if patches := s.Config.PatchList(); len(patches) > 0 {
+		fmt.Fprintf(&b, "  4. 配置补丁：改 %s\n", s.Config.Path)
+		for _, p := range patches {
+			fmt.Fprintf(&b, "     · %s（%s）→ %s\n", orDefault(p.Section, "默认段"),
+				NormalizeFormat(p.Format), PatchText(&p))
+			if len(p.Secrets) > 0 {
+				fmt.Fprintf(&b, "       其中 %s 的值由面板随机生成、只展示一次（已有值一律复用，不轮换）\n",
+					strings.Join(p.Secrets, ", "))
+			}
+			if p.IfMissing != "create" {
+				b.WriteString("       文件还不存在时不动它（不少应用是首次启动才生成配置）\n")
+			}
 		}
 	}
 	if s.Expose != nil {
