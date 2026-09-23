@@ -1,0 +1,65 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "prometheus",
+  "name": "Prometheus（指标采集）",
+  "icon": "📈",
+  "summary": "时序指标库：采集机器/服务指标并出图",
+  "notes": [
+    "默认监听所有网卡的 9090，局域网可直接打开；暴露到公网前先在 prometheus.yml 里加 basic_auth 或用反向代理加登录。",
+    "抓取目标写在 {brew}/etc/prometheus.yml 里；改完在面板里重启一次即可生效。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "prometheus",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/prometheus.yml",
+    "mode": "0644",
+    "own": "user"
+  },
+  "expose": {
+    "port": 9090,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "http",
+        "path": "/-/healthy",
+        "expect": "Healthy",
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/-/healthy",
+    "expect": "Healthy",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.prometheus.plist"
+    ],
+    "optional_data": [
+      "{brew}/var/prometheus"
+    ],
+    "formula": "prometheus",
+    "keep_note": "默认保留指标数据（{brew}/var/prometheus，压缩后的时序库）；勾选「删除数据」才会删。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      9090
+    ]
+  }
+}

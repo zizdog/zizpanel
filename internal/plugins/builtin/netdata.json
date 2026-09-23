@@ -1,0 +1,66 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "netdata",
+  "name": "Netdata（实时监控）",
+  "icon": "📊",
+  "summary": "秒级实时监控：CPU/内存/磁盘/网络一屏看完",
+  "notes": [
+    "默认监听所有网卡的 19999，且访问白名单默认放行所有来源（netdata 的 allow connections from = localhost *）：暴露到公网前先改这一项。",
+    "它自己带告警（health），配置在 {brew}/etc/netdata/ 下；面板通知与它是两套，不要重复配。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "netdata",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/netdata/netdata.conf",
+    "mode": "0644",
+    "own": "user"
+  },
+  "expose": {
+    "port": 19999,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "http",
+        "path": "/api/v1/info",
+        "expect": "version",
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/api/v1/info",
+    "expect": "version",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.netdata.plist"
+    ],
+    "optional_data": [
+      "{brew}/var/lib/netdata",
+      "{brew}/var/cache/netdata"
+    ],
+    "formula": "netdata",
+    "keep_note": "默认保留监控历史与节点身份（{brew}/var/lib/netdata）；勾选「删除数据」才会删。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      19999
+    ]
+  }
+}

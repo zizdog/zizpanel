@@ -1261,6 +1261,32 @@ var marketDownloadApps = []MarketApp{
 			brewBottlePoint("memcached", 20*time.Minute, "brew install memcached"),
 		},
 	},
+	// 2026-09-24：插件表新增的两个**监控类** brew 服务型应用。
+	// 选它们是因为不需要任何定制（默认就监听所有网卡、默认端口没被别的条目占用、
+	// 自带 HTTP 健康端点）—— 这正是"表能干净表达"的能力边界；需要改应用配置的条目
+	// 目前还得靠面板内建补丁（见 docs/平台化路线图.md 的 C1 说明）。
+	{
+		ID: "prometheus", Kind: KindNative, BrewFormula: "prometheus",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.prometheus",
+			LabelSource: "通用 brew 轨（实测 2026-09-24：brew info --json 的 service 指向 prometheus_brew_services）",
+			CatalogGap:  "同 redis：label 由 brew 决定，安装器运行期读取后登记",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("prometheus", 20*time.Minute, "brew install prometheus"),
+		},
+	},
+	{
+		ID: "netdata", Kind: KindNative, BrewFormula: "netdata",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.netdata",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-24 实测：run = netdata -D）",
+			CatalogGap:  "同 redis",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("netdata", 20*time.Minute, "brew install netdata"),
+		},
+	},
 
 	{
 		ID: "syncthing", Kind: KindNative, BrewFormula: "syncthing", PanelInstaller: "syncthing",
