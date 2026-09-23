@@ -173,6 +173,19 @@ type Config struct {
 	// 在设置里打开即可（迁移标记保证不会被再次自动关掉）。
 	AppProxyRetired bool `json:"app_proxy_retired"`
 
+	// ---------- 主动通知（见 internal/notify）----------
+	//
+	// 面板发现异常时主动说一声（本机通知 / Webhook），而不是等用户点进来。
+	// **默认关闭**：会打扰用户的东西不许默认打开。
+	NotifyEnabled bool   `json:"notify_enabled"`
+	NotifyMacOS   bool   `json:"notify_macos"`
+	NotifyWebhook string `json:"notify_webhook"`
+	// NotifyIntervalMins 是巡检间隔（分钟），默认 15。
+	NotifyIntervalMins int `json:"notify_interval_mins"`
+	// NotifyCertDays / NotifyDiskPercent 是两条规则的阈值。
+	NotifyCertDays    int `json:"notify_cert_days"`
+	NotifyDiskPercent int `json:"notify_disk_percent"`
+
 	// ---------- 环境（LNMP 等由面板管理的系统组件） ----------
 	User     string `json:"user"`      // 面板运行用户（安装时确定）
 	UserHome string `json:"user_home"` // 该用户家目录
@@ -378,10 +391,16 @@ func Default() *Config {
 		TerminalEnabled:     false,
 		TerminalIdleMins:    30,
 		TerminalMaxSessions: 3,
-		MySQLHost:           "127.0.0.1",
-		MySQLPort:           3306,
-		MySQLSocket:         "/tmp/mysql.sock",
-		MySQLUser:           "root",
+		// 主动通知：默认关闭（不许默认打扰用户）；打开时默认只开本机通知。
+		NotifyEnabled:      false,
+		NotifyMacOS:        true,
+		NotifyIntervalMins: 15,
+		NotifyCertDays:     14,
+		NotifyDiskPercent:  90,
+		MySQLHost:          "127.0.0.1",
+		MySQLPort:          3306,
+		MySQLSocket:        "/tmp/mysql.sock",
+		MySQLUser:          "root",
 		// 60 秒：够用户看清楚提示并输入，又不至于让"人不在"的安装白等太久。
 		MySQLInputTimeoutSeconds: 60,
 		User:                     u,
@@ -660,6 +679,20 @@ func (c *Config) fill() {
 	}
 	if c.SessionHours <= 0 {
 		c.SessionHours = d.SessionHours
+	}
+	// 主动通知的三个数值阈值缺省补默认；macOS 通道只在"从没配过、且通知关着"
+	// 时补成 true —— 否则用户自己关掉通知后，下次加载又会被打开。
+	if c.NotifyIntervalMins <= 0 {
+		c.NotifyIntervalMins = d.NotifyIntervalMins
+	}
+	if c.NotifyCertDays <= 0 {
+		c.NotifyCertDays = d.NotifyCertDays
+	}
+	if c.NotifyDiskPercent <= 0 {
+		c.NotifyDiskPercent = d.NotifyDiskPercent
+	}
+	if !c.NotifyEnabled && !c.NotifyMacOS && strings.TrimSpace(c.NotifyWebhook) == "" {
+		c.NotifyMacOS = true
 	}
 	if c.LoginMaxFail <= 0 {
 		c.LoginMaxFail = d.LoginMaxFail

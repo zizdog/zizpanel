@@ -132,6 +132,29 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
 
 ---
 
+## 六点五、主动通知（C3）
+
+面板发现异常时**主动说一声**（服务异常 / 证书将到期 / 磁盘水位），而不是等用户点进来。
+后端 `internal/notify`（纯规则 + 通道）＋ `internal/web/api_notify.go`（取事实、发、存设置）；
+前端「面板设置 → 主动通知」。默认**关闭**，同一 key 30 分钟内只提醒一次，单轮最多 5 条（超出合并成一条汇总）。
+
+- **判据必须与界面一致**：报的问题 = 服务页「需要处理」那一类（启动失败 / 运行时不可用 /
+  健康检查没过），且**排除用户主动停掉的服务**（`stopped_by_user`）—— 两边漂移就会"界面说没事、通知说有事"。
+- **通道两个**：macOS 系统通知（`osascript`）、Webhook（POST JSON）。面板是 root LaunchDaemon，
+  不在用户的 Aqua 会话里，所以系统通知走 `launchctl asuser <uid>`（坑：直接 osascript 返回成功但屏幕上什么都没有）。
+- **读不到 ≠ 没问题**：服务列表 / 证书 / statfs 任一部分失败都进 `errors` 并显示，绝不当成"一切正常"。
+- 门禁：`go test ./internal/notify/`（冷却去重、通道失败如实返回、规则正反对照、AppleScript 转义、
+  溢出合并）+ `go test ./internal/web/ -run Notify`（设置校验/落盘/生效、巡检发送链路、关闭时不发送、
+  逐通道报错、GET 契约）。
+- **本机实测（2026-09-23，root + `launchctl asuser 501`）**：`usernoted` 日志出现
+  `Delivering … shouldDeliver: true` → `.alert .lockScreen .notificationCenter`，即通道真的投递了。
+  两个坑：① 通知来源显示为**「脚本编辑器」（com.apple.ScriptEditor2）**——osascript 的固有身份，
+  想显示 ZizPanel 需要 `terminal-notifier -sender`（未做）；② 退出码 0 **不能**证明投递
+  （root 直接 `osascript` 也返回 0），判据只能看 `usernoted` 日志。
+  当时系统处于「专注模式」（`dndEnabled: true`），所以横幅是否弹出取决于用户的专注设置。
+
+---
+
 ## 七、系统设置（把 macOS 配成服务器）
 
 「系统设置」页把需要终端的事做成开关：合盖不睡、断电自恢复、关 Spotlight 索引、调 TCP 参数、开远程登录等。

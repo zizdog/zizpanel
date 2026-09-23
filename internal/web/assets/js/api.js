@@ -167,6 +167,13 @@ export const api = {
   upgradeDismiss: () => request('POST', `${API_BASE}/system/upgrade/dismiss`, {}),
   upgradeUpload: (file) => api.upload(`${API_BASE}/system/upgrade/upload`, file),
   saveSettings: (patch) => request('POST', `${API_BASE}/settings`, patch),
+  // ---- 主动通知（C3）----
+  // 面板发现异常时主动说一声（本机通知 / Webhook）。notifyCheck 立刻巡检一次
+  // 并把发现的问题**如实返回**：即使通知关着也会列出问题，只是不发送。
+  notify: () => request('GET', `${API_BASE}/notify`),
+  notifySave: (patch) => request('POST', `${API_BASE}/notify/settings`, patch),
+  notifyTest: (patch) => request('POST', `${API_BASE}/notify/test`, patch),
+  notifyCheck: () => request('POST', `${API_BASE}/notify/check`, {}),
   // 镜像发布件同步：把公网源上的发布件同步到镜像目录（202 + task_id，走任务中心）。
   mirrorSync: (body) => request('POST', `${API_BASE}/system/mirror/sync`, body),
   // ---- 上传与执行限制（nginx client_max_body_size + PHP 上传/执行上限）----

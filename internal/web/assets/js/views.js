@@ -758,6 +758,7 @@ export function SettingsView(content, ctx = {}) {
     { id: 'access', title: '访问与安全' },
     { id: 'account', title: '账号与两步验证' },
     { id: 'permissions', title: '权限' },
+    { id: 'notify', title: '主动通知' },
     { id: 'update', title: '检查更新' },
   ];
   let active = tabs.some((t) => t.id === ctx.tab) ? ctx.tab : 'access';
@@ -785,8 +786,200 @@ export function SettingsView(content, ctx = {}) {
     clear(body);
     if (active === 'access') await renderAccess();
     else if (active === 'update') await renderUpdate();
+    else if (active === 'notify') await renderNotify();
     else if (active === 'permissions') renderPermissions();
     else await renderAccount();
+  }
+
+  // ---------- 主动通知 ----------
+  //
+  // 面板发现异常时主动说一声（本机通知 / Webhook），而不是等用户点进来。
+  // 纪律：只有后端**真的**返回成功才提示成功；一条都不会"看起来发出去了"。
+  // 规则判据与「服务」页的「需要处理」保持一致（后端同一份事实），
+  // 所以这里不重复解释什么算问题 —— 只显示发现了几条、发出去了几条。
+  async function renderNotify() {
+    let st;
+    try { st = await api.notify(); }
+    catch (e) { body.append(h('div.card', [h('div.card-body', { text: '读取通知设置失败: ' + e.message })])); return; }
+    const s = st.settings || {};
+
+    const enabled = h('input', { type: 'checkbox', checked: !!s.enabled });
+    const macos = h('input', { type: 'checkbox', checked: !!s.macos });
+    const webhook = h('input.input', {
+      value: s.webhook || '',
+      placeholder: '例如 https://example.com/hook（POST 一份 JSON）',
+      style: { flex: '1 1 320px' },
+    });
+    const interval = h('input.input', { type: 'number', value: s.interval_mins || 15, min: 1, max: 1440 });
+    const certDays = h('input.input', { type: 'number', value: s.cert_days || 14, min: 1, max: 90 });
+    const diskPct = h('input.input', { type: 'number', value: s.disk_percent || 90, min: 50, max: 99 });
+    const msg = h('div');
+    const recentBox = h('div');
+
+    // 本机通知能不能发：后端如实回答（root 运行时要经 launchctl asuser 进用户会话）。
+    const macosReady = !!(st.macos && st.macos.ready);
+    if (!macosReady) macos.disabled = true;
+    const statusPill = s.enabled
+      ? h('span.pill.ok', { text: '已开启' })
+      : h('span.pill.warn', { text: '已关闭（默认）' });
+
+    function payload() {
+      return {
+        enabled: enabled.checked,
+        macos: macos.checked,
+        webhook: webhook.value.trim(),
+        interval_mins: Number(interval.value) || 15,
+        cert_days: Number(certDays.value) || 14,
+        disk_percent: Number(diskPct.value) || 90,
+      };
+    }
+
+    function showMsg(text, tone) {
+      clear(msg);
+      msg.append(h('div', { style: { marginTop: '10px' } }, [
+        tone === 'ok' ? h('span.pill.ok', { text: '✓ ' + text }) : h('span.pill.danger', { text: '⚠️ ' + text }),
+      ]));
+    }
+
+    const saveBtn = h('button.btn.btn-sm.btn-primary', { text: '保存', onclick: () => save() });
+    const testBtn = h('button.btn.btn-sm', { text: '发送测试通知', onclick: () => sendTest() });
+    const checkBtn = h('button.btn.btn-sm', { text: '立即检查一次', onclick: () => checkNow() });
+
+    async function save() {
+      clear(msg);
+      try {
+        await api.notifySave(payload());
+        showMsg('已保存（面板重启后仍然生效）', 'ok');
+        await refresh();
+      } catch (e) { showMsg('保存失败：' + (e && e.message ? e.message : e)); }
+    }
+
+    async function sendTest() {
+      clear(msg);
+      msg.append(h('div.hint', { text: '正在发送…' }));
+      try {
+        const r = await api.notifyTest(payload());
+        clear(msg);
+        const rows = (r && r.results) || [];
+        // 逐通道如实显示：失败的通道必须把原因写出来（"发成功了"不许瞎报）。
+        rows.forEach((x) => {
+          msg.append(h('div', { style: { marginTop: '6px', display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
+            x.ok ? h('span.pill.ok', { text: '✓ ' + x.channel }) : h('span.pill.danger', { text: '✗ ' + x.channel }),
+            x.ok ? null : h('span.hint', { text: x.error || '发送失败' }),
+          ]));
+        });
+        if (!rows.length) msg.append(h('div.hint', { text: '没有任何通道被调用。' }));
+      } catch (e) {
+        clear(msg);
+        showMsg('测试失败：' + (e && e.message ? e.message : e));
+      }
+    }
+
+    async function checkNow() {
+      clear(msg);
+      msg.append(h('div.hint', { text: '正在检查（会跑一遍服务状态、证书、磁盘）…' }));
+      try {
+        const r = await api.notifyCheck();
+        clear(msg);
+        const events = (r && r.events) || [];
+        msg.append(h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [
+          events.length
+            ? h('span.pill.warn', { text: `发现 ${events.length} 个问题` })
+            : h('span.pill.ok', { text: '没有发现问题' }),
+          h('span.hint', { text: `发出 ${(r && r.sent) || 0} 条` + (((r && r.skipped) || 0) ? `，${r.skipped} 条在冷却期内未重复` : '') }),
+        ]));
+        if (r && r.note) msg.append(h('div.hint', { text: r.note }));
+        // 采集失败的部分必须显示：读不到 ≠ 没问题。
+        ((r && r.errors) || []).forEach((x) => msg.append(h('div.hint', { text: '⚠️ ' + x })));
+        events.slice(0, 8).forEach((ev) => msg.append(h('div.hint', { text: '· ' + ev.title })));
+        await refresh();
+      } catch (e) {
+        clear(msg);
+        showMsg('检查失败：' + (e && e.message ? e.message : e));
+      }
+    }
+
+    function renderRecent(list) {
+      clear(recentBox);
+      if (!list || !list.length) {
+        recentBox.append(h('div.hint', { text: '还没有发过通知。' }));
+        return;
+      }
+      list.slice(0, 8).forEach((ev) => {
+        recentBox.append(h('div', { style: { display: 'flex', gap: '8px', padding: '4px 0', flexWrap: 'wrap' } }, [
+          ev.level === 'error' ? h('span.pill.danger', { text: '异常' })
+            : ev.level === 'warn' ? h('span.pill.warn', { text: '提醒' })
+              : h('span.pill.ok', { text: '信息' }),
+          h('span', { text: ev.title }),
+          h('span.hint', { text: ev.at || '' }),
+        ]));
+      });
+    }
+
+    async function refresh() {
+      try {
+        const fresh = await api.notify();
+        const fs = fresh.settings || {};
+        enabled.checked = !!fs.enabled;
+        macos.checked = !!fs.macos;
+        webhook.value = fs.webhook || '';
+        interval.value = fs.interval_mins || 15;
+        certDays.value = fs.cert_days || 14;
+        diskPct.value = fs.disk_percent || 90;
+        clear(statusPillWrap);
+        statusPillWrap.append(fs.enabled ? h('span.pill.ok', { text: '已开启' }) : h('span.pill.warn', { text: '已关闭（默认）' }));
+        if (fresh.last_note) lastNote.textContent = `上次检查：${fresh.last_check || ''} ${fresh.last_note}`;
+        renderRecent(fresh.recent);
+      } catch { /* 刷新失败不影响已经保存的事实 */ }
+    }
+
+    const statusPillWrap = h('span', [statusPill]);
+    const lastNote = h('span.hint', { text: st.last_note ? `上次检查：${st.last_check || ''} ${st.last_note}` : '还没有检查过。' });
+
+    body.append(
+      h('div.card', [
+        h('div.card-head', [
+          h('h3', { text: '主动通知' }),
+          h('div.spacer'),
+          statusPillWrap,
+        ]),
+        h('div.card-body', [
+          h('p.hint', {
+            text: '面板发现异常时主动通知你（服务崩了、证书快到期、磁盘快满），不用自己盯着。' +
+              '同一件事在 30 分钟内只提醒一次。',
+          }),
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '12px 0 6px' } }, [
+            enabled, h('span', { text: '开启主动通知（默认关闭）' }),
+          ]),
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } }, [
+            macos,
+            h('span', { text: 'macOS 系统通知' }),
+            macosReady
+              ? h('span.hint', { text: st.macos && st.macos.note ? st.macos.note : '' })
+              : h('span.hint', { text: (st.macos && st.macos.note) || '本机无法发系统通知' }),
+          ]),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '10px' } }, [
+            h('span.hint', { text: 'Webhook（可选）' }),
+            webhook,
+          ]),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+            h('span.hint', { text: '检查间隔（分钟）' }), interval,
+            h('span.hint', { text: '证书提前提醒（天）' }), certDays,
+            h('span.hint', { text: '磁盘提醒阈值（%）' }), diskPct,
+          ]),
+          h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' } }, [
+            saveBtn, testBtn, checkBtn,
+          ]),
+          h('div.hint', { style: { marginTop: '8px' } }, [lastNote]),
+          msg,
+        ]),
+      ]),
+      h('div.card', [
+        h('div.card-head', [h('h3', { text: '最近通知' })]),
+        h('div.card-body', [recentBox]),
+      ]),
+    );
+    renderRecent(st.recent);
   }
 
   // ---------- 权限 ----------

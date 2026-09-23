@@ -19,6 +19,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/logs"
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/notify"
 	"github.com/zizdog/zizpanel/internal/proxies"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
@@ -168,6 +169,21 @@ type Server struct {
 	static  fs.FS
 	handler http.Handler
 	startAt time.Time
+
+	// ---- 主动通知（见 api_notify.go）----
+	//
+	// notifyMgr 是进程内单例：去重状态（冷却表）必须跨请求活着，否则每次巡检
+	// 都从零开始、"同一件事只提醒一次"就不成立。
+	notifyMu       sync.Mutex
+	notifyMgr      *notify.Notifier
+	notifyWake     chan struct{} // 设置改了 ⇒ 让巡检循环按新间隔重排
+	notifyLastAt   string
+	notifyLastNote string
+	// notifySinkMaker / notifyFactsFn 是单测注入点：
+	// 默认通道会真的弹系统通知，默认事实来自 launchctl/证书/statfs ——
+	// 单测既不许弹窗也不许依赖测试机装了什么。
+	notifySinkMaker func(notify.Options) []notify.Sink
+	notifyFactsFn   func(ctx context.Context) notifyFacts
 
 	loginSvc loginLimiter
 	procMu   sync.Mutex
@@ -609,6 +625,15 @@ func (s *Server) routes() http.Handler {
 	// 「大文件上传自检」：磁盘空间 / nginx 临时目录可写性 / error_log 相关行。
 	// 用户报 500 时用它一眼看出卡在哪（413 与 500 是两件事，见 handler 注释）。
 	root.HandleFunc("GET /api/v1/settings/upload-doctor", s.requireAuth(s.handleUploadDoctor))
+
+	// ---------- 主动通知（C3，见 api_notify.go）----------
+	//
+	// 面板发现异常时主动说一声（本机通知 / Webhook）。默认关闭；
+	// 每 IntervalMins 巡检一次，同一件事在冷却期内只提醒一次。
+	root.HandleFunc("GET /api/v1/notify", s.requireAuth(s.handleNotifyGet))
+	root.HandleFunc("POST /api/v1/notify/settings", s.requireAuth(s.handleNotifySettings))
+	root.HandleFunc("POST /api/v1/notify/test", s.requireAuth(s.handleNotifyTest))
+	root.HandleFunc("POST /api/v1/notify/check", s.requireAuth(s.handleNotifyCheck))
 
 	// ---------- 导航页（sun-panel 风格图标网格首页，见 api_nav.go）----------
 	//
