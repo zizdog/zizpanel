@@ -203,15 +203,18 @@ func TestPluginTableDrivesCatalogWithoutChangingIt(t *testing.T) {
 // TestBuiltinTableOnlyAppsReachCatalog 锁住"表驱动新增应用"这条路：
 // 只在插件表里、目录里没有的内建应用，必须真的出现在应用目录里（否则"填表就能加应用"是空话）。
 func TestBuiltinTableOnlyAppsReachCatalog(t *testing.T) {
-	// 目前用表新增的三个 brew 服务型应用
+	// 用表新增的 brew 服务型应用（监控/可视化三个 + 早期三个）
 	want := map[string]struct {
 		formula string
 		port    int
 		health  string
 	}{
-		"redis":     {"redis", 6379, ""},
-		"mosquitto": {"mosquitto", 1883, ""},
-		"memcached": {"memcached", 11211, ""},
+		"redis":      {"redis", 6379, ""},
+		"mosquitto":  {"mosquitto", 1883, ""},
+		"memcached":  {"memcached", 11211, ""},
+		"prometheus": {"prometheus", 9090, "/-/healthy"},
+		"netdata":    {"netdata", 19999, "/api/v1/info"},
+		"grafana":    {"grafana", 3002, "/api/health"},
 	}
 	for id, w := range want {
 		app, ok := FindApp(id)
@@ -251,5 +254,33 @@ func TestBuiltinTableOnlyAppsReachCatalog(t *testing.T) {
 	// 反面对照：release 来源的表条目映射不出来，就**不该**出现在目录里（不许塞半成品）
 	if _, ok := FindApp("nosuchapp"); ok {
 		t.Error("不存在的应用不该在目录里")
+	}
+}
+
+// TestTableConfigPatchReachesApp 表里声明的配置补丁必须流到 App —— 那是安装器真正照着做的那份。
+//
+// 为什么值得一条门禁：卡片上的端口（3002）与"安装时改的端口"必须来自同一个真源；
+// 哪天有人只改了一边（例如把 patch 去掉、或把 expose.port 改回去），
+// 用户会得到一个"卡片说 3002、实际还在 3000"的谎报。
+func TestTableConfigPatchReachesApp(t *testing.T) {
+	app, ok := FindApp("grafana")
+	if !ok {
+		t.Fatal("grafana 应当来自插件表")
+	}
+	if len(app.ConfigPatches) == 0 {
+		t.Fatal("grafana 声明的配置补丁没有流到 App：安装器不会去改端口")
+	}
+	p := app.ConfigPatches[0]
+	if plugins.NormalizeFormat(p.Format) != plugins.PatchINI || p.Section != "server" {
+		t.Errorf("补丁的格式/段不对：%+v", p)
+	}
+	if p.Set["http_port"] != "3002" {
+		t.Errorf("补丁要把 http_port 改成 3002（与卡片端口一致），实际 %q", p.Set["http_port"])
+	}
+	if app.Port != 3002 {
+		t.Errorf("卡片端口应当与补丁一致：%d", app.Port)
+	}
+	if app.ConfigPath != "{brew}/etc/grafana/grafana.ini" {
+		t.Errorf("配置文件路径不对：%q", app.ConfigPath)
 	}
 }
