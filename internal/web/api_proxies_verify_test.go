@@ -584,9 +584,11 @@ func TestProxyEnableStaysOKWhenUpstreamHangs(t *testing.T) {
 	h := stubProxyHooks(t)
 	rule := testProxyRule(51, 18096, "")
 	logPath := proxyAccessLogPath(srv.proxyLogDir(), rule.ID)
+	// ⚠️ 刻意**不**让访问日志增长：上游半开时 nginx 卡在等上游，access log 在响应之后
+	// 才写 —— 真机就是这么失败的（第一版门禁给它 appendToFile，等于自己骗自己）。
+	_ = logPath
 	proxyProbeFn = func(context.Context, string, string, int, string, time.Duration) (string, string, error) {
 		h.Order = append(h.Order, "probe")
-		appendToFile(t, logPath) // nginx 确实按这条规则处理了请求（日志长了）
 		return "000", "", fmt.Errorf("Get \"http://127.0.0.1:18096/\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
 	}
 	if err := srv.reloadProxyAndVerify(context.Background(), rule); err != nil {

@@ -2623,7 +2623,14 @@ func (s *Server) waitProxyServed(ctx context.Context, rule *proxies.Rule) proxyS
 		// 上游"连不上/不响应"（502/504、或探针直接超时 "000"）都只说明**目标不健康**，
 		// 不算配置没生效 —— 用户明确要求："连不上也不能报错"（参考 Lucky）。
 		// 反例仍然抓住：日志没增长（nginx 根本没这条规则）或 80 端口落到默认站点占位页。
-		chk.Served = chk.LogGrew && (proxyProbeServed(chk.Probe, rule.Listen) || proxyProbeTimedOut(chk.Probe))
+		// 判据分两支（真机 2026-09-23 验证后修正：**上游半开时 nginx 不会写 access log**
+		// —— 日志是响应之后才写的，所以"日志增长"不能作为超时场景的门槛）：
+		//   ① 拿到响应：要求该规则自己的访问日志确实长了（挡住"落到默认站点占位页"与
+		//      "nginx 根本没这条规则"）；
+		//   ② 探针**超时**（连得上 nginx、但一直没等到响应 = 上游半开/不响应）：
+		//      这本身就说明请求被 nginx 接住了，上游不健康**不算配置没生效**
+		//      （用户明确要求："连不上也不能报错"，参考 Lucky）。
+		chk.Served = (chk.LogGrew && proxyProbeServed(chk.Probe, rule.Listen)) || proxyProbeTimedOut(chk.Probe)
 		if chk.Served {
 			return chk
 		}
