@@ -386,3 +386,49 @@ func TestConfigPatchHonorsDeclaredFileMode(t *testing.T) {
 		t.Errorf("已存在文件的权限不该被改，实际 %04o", got)
 	}
 }
+
+// TestCodeServerConfigFromTableIsUsable 「表里的 code-server 声明」真的能生成可用的配置。
+//
+// 这条门禁的价值在"声明的**具体内容**"：引擎（ApplyPatch）早就测过了，但键名写错
+// （bind-addr 写成 bind_addr）、路径写错、权限没声明，都不会被引擎发现 —— 而用户看到的
+// 就是"装完了，8092 打不开"。所以这里直接拿目录里的 App（由内建表映射而来）跑一遍。
+func TestCodeServerConfigFromTableIsUsable(t *testing.T) {
+	app, ok := FindApp("code-server")
+	if !ok {
+		t.Fatal("目录里没有 code-server（插件表没加载？）")
+	}
+	home := t.TempDir()
+	m := &Manager{opt: Options{UserHome: home, UserName: ""}}
+	res := &InstallResult{App: app.ID, Name: app.Name}
+	m.applyConfigPatchStep(context.Background(), app, res)
+
+	// 官方文档里的路径：~/.config/code-server/config.yaml
+	path := filepath.Join(home, ".config", "code-server", "config.yaml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("应当生成配置文件 %s：%v（步骤：%v）", path, err, res.Steps)
+	}
+	cfg := string(b)
+	// 官方四个键 + 面板的口径：监听所有网卡、开密码、不走 HTTPS（自签证书会被浏览器拦）
+	for _, want := range []string{"bind-addr: 0.0.0.0:8092", "auth: password", "cert: false", "password: "} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("配置里应当有 %q：\n%s", want, cfg)
+		}
+	}
+	// 口令必须与安装结果里给用户的那一个完全一致（否则用户拿着假口令登录）
+	if len(res.Credentials) != 1 || !strings.Contains(cfg, "password: "+res.Credentials[0].Value) {
+		t.Errorf("凭据区的口令必须就是配置里的那个：%+v\n%s", res.Credentials, cfg)
+	}
+	// 文件里有口令 ⇒ 权限必须是声明的 0600
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("含访问口令的配置必须是 0600，实际 %04o", got)
+	}
+	// 卡片端口必须与配置里监听的端口一致（不然健康检查永远打空）
+	if app.Port != 8092 {
+		t.Errorf("卡片端口应当是 8092（与 bind-addr 一致），实际 %d", app.Port)
+	}
+}
