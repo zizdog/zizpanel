@@ -218,7 +218,12 @@ func TestInstallLNMPEmptyBodyStillAccepted(t *testing.T) {
 		res, out, _ := doJSON(t, ts, "POST", "/api/v1/market/install-lnmp", c.body, cookies)
 		if res.StatusCode != http.StatusAccepted {
 			t.Errorf("%s 应继续被接受（默认三件套），实际 %d：%v", c.name, res.StatusCode, out)
+			continue
 		}
+		// 等第一个任务落定再发第二个：这个接口有"同一个安装任务只允许一个在跑"的护栏，
+		// 不等就会拿到 409「正在进行中」—— `make check` 并行压满时必现（偶发假红）。
+		// 断言的本意是"空 body 不该被拒成 400"，不是"允许并发重入"。
+		waitTaskDone(t, srv, taskIDFrom(t, out))
 	}
 }
 

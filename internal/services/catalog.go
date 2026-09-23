@@ -702,7 +702,11 @@ func builtinCatalog() []App {
 			ID: "phpmyadmin", Name: "phpMyAdmin", Icon: "🐬",
 			// phpMyAdmin 没有守护进程（nginx alias + php-fpm），装完就是一个网页入口。
 			// 它的 nginx location 由安装器自己写，所以 SelfConf=true：面板只给「打开」。
-			UI:          &AppUI{Slug: "phpmyadmin", SelfConf: true},
+			// 「打开」给的是**面板子路径**（相对 /phpmyadmin/）而不是端口直连：它的 nginx
+			// location 写死了 `allow 127.0.0.1; deny all`（数据库管理界面不公开到局域网），
+			// 所以只有经面板登录后反代过去能用 —— 用户 2026-09-23 确认保持这样。
+			UI: &AppUI{Slug: "phpmyadmin", SelfConf: true,
+				Note: "「打开」经面板进入（需先登录面板）：它的 nginx 入口只允许 127.0.0.1，局域网直连是 403 —— 数据库管理界面不对外暴露。"},
 			NoDaemon:    true,
 			Summary:     "数据库管理界面（推荐入口）",
 			Description: "库表管理界面（面板自带的只作应急）；依赖 nginx + PHP，装完从面板打开。",
