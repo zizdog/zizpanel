@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -593,5 +594,44 @@ func TestProxyEnableStaysOKWhenUpstreamHangs(t *testing.T) {
 	}
 	if err := srv.reloadProxyAndVerify(context.Background(), rule); err != nil {
 		t.Fatalf("上游半开（连得上但不响应）不该让启用失败：%v", err)
+	}
+}
+
+// TestProxyProbeTimeoutRecognizedFromRealCurl 锁住"超时"判据的**真实信号**：
+// 探针生产实现是 `curl --max-time`，超时时拿到的是 `exit status 28`（里面没有
+// "timeout" 字样）—— 只看文案会在真机上漏判（2026-09-23 用户二次报障就是这个）。
+//
+// 这里真起一个"只 accept、不回数据"的半开端口，真跑 curlSite（与生产同一条路径），
+// 再断言 proxyProbeTimedOut 认得出它。文案漂移/退出码变化都会让这条门禁红。
+func TestProxyProbeTimeoutRecognizedFromRealCurl(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	hold := make(chan struct{})
+	defer close(hold)
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			// 只接不接受数据：HTTP 请求永远得不到响应 —— 半开。
+			go func(conn net.Conn) { <-hold; _ = conn.Close() }(c)
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	code, body, cerr := curlSite(context.Background(), "http", "halfopen.test", port, "/", 1*time.Second)
+	if code != "000" {
+		t.Fatalf("半开上游应探测到 000（拿到响应说明环境不对），实际 code=%q body=%q", code, body)
+	}
+	probe := proxyProbe{code: code, body: body, err: cerr}
+	if !proxyProbeTimedOut(probe) {
+		t.Fatalf("curl 超时（真实错误：%v）必须被判成「探针超时」，否则上游半开的规则永远启不了", cerr)
+	}
+	// 负向对照：连不上（立刻被拒）不是超时 —— 那种情况该继续按"没生效"处理。
+	if proxyProbeTimedOut(proxyProbe{code: "000", err: errors.New("exit status 7")}) {
+		t.Error("连接被拒（curl 7）不该被判成「探针超时」")
 	}
 }

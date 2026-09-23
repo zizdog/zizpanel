@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -2527,6 +2528,14 @@ func proxyProbeTimedOut(p proxyProbe) bool {
 	}
 	if p.err == nil {
 		return false
+	}
+	// ⚠️ 先看**结构化**信号再退回文案：探针生产实现走 `curl --max-time`，超时时
+	// `Output()` 返回的是 `exit status 28`（curl 的 Operation timeout）—— 里面
+	// **没有 "timeout" 字样**。只看字符串会在真机上漏判：本修复的第一版就是这么
+	// 被单测里的合成文案骗过去的（真机仍然启不了，2026-09-23 二次报障）。
+	var ee *exec.ExitError
+	if errors.As(p.err, &ee) && ee.ExitCode() == 28 {
+		return true
 	}
 	msg := strings.ToLower(p.err.Error())
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") ||

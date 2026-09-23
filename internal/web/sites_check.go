@@ -178,6 +178,13 @@ func curlSite(ctx context.Context, scheme, domain string, port int, path string,
 	}
 	out, err := execCommand(ctx, "/usr/bin/curl", args...).Output()
 	if err != nil && len(out) == 0 {
+		// 超时要**说清是超时**：真跑时 `execCommand` 到点会杀掉子进程，错误是
+		// `signal: killed`（不是 curl 自己的 `exit status 28`，也没有 "timeout" 字样）——
+		// 上层（反代复核）据此判断"连得上但上游不响应"，只看原文会漏判
+		// （2026-09-23 真机二次报障就是这么来的）。
+		if ctx.Err() != nil {
+			return "000", "", fmt.Errorf("探针超时：%w", ctx.Err())
+		}
 		return "000", "", err
 	}
 	s := string(out)
