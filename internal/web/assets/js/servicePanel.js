@@ -216,20 +216,6 @@ export function portDirectURL(port) {
   return 'http://' + host + ':' + p + '/';
 }
 
-// subpathWarning 把"子路径实测不可用"渲染成按钮下方一行**始终可见**的小字：
-// 只在按钮上加 title 不够（不悬浮就看不到，用户以为按钮坏了，2026-09-17 第四条抱怨）。
-export function subpathWarning(m) {
-  if (!hasPanelUI(m)) return null;
-  const ui = m.ui || {};
-  if (!ui.prefer_direct) return null;
-  const note = String(ui.note || '').trim() || '该应用实测不能挂在子路径下';
-  return h('div', {
-    style: { flexBasis: '100%', fontSize: '11.5px', lineHeight: '1.6', color: 'var(--warn, #fbbf24)' },
-    title: '子路径入口 /' + (ui.slug || '') + '/ —— ' + note,
-    text: '⚠️ 该应用不支持子路径：' + note + '；请用「直链」',
-  });
-}
-
 // ---------------------------------------------------------------------------
 //  卡片外壳：四个 Tab（已安装 / 应用市场 / docker / 一键建站）共用同一套 DOM
 // ---------------------------------------------------------------------------
@@ -296,7 +282,7 @@ export function openTargetOf(m, opts = {}) {
   if (!direct) return null;
   return {
     href: direct, subpath: false, port, direct,
-    title: '该应用不支持子路径，直接访问它的端口：' + direct,
+    title: '打开它自己的端口：' + direct,
   };
 }
 
@@ -339,21 +325,6 @@ export function openOrRepairActions(m, { svc = null, onReinstall } = {}) {
   const rb = serviceRepairButton(m, { onReinstall });
   if (rb) return [rb];
   return openOnlyAction(m, { svc });
-}
-
-// PORT_ACCESS_WARNING 是用户要求的**逐字**提示（不要改写、不要加前后缀）。
-export const PORT_ACCESS_WARNING = '该应用不支持子路径，请用端口访问，或自行配置反代。';
-
-// portAccessWarning：只在「打开」真的指向端口直连时给一行**始终可见**的小字；
-// 支持子路径或没有入口的卡片不给。管理面板里用 subpathWarning（带 ui.note 原文）。
-export function portAccessWarning(m, opts = {}) {
-  const t = openTargetOf(m, opts);
-  if (!t || t.subpath) return null;
-  return h('div', {
-    style: { flexBasis: '100%', fontSize: '11.5px', lineHeight: '1.6', color: 'var(--warn, #fbbf24)' },
-    title: '打开地址是 ' + t.href,
-    text: PORT_ACCESS_WARNING,
-  });
 }
 
 // vendorImage 取 Docker 目录条目里的镜像名（在面板里显示"官方镜像是什么"）。
@@ -406,10 +377,12 @@ async function resolvePanelData(market, svc) {
 //  动作：按钮只有这一份实现，卡片与面板都从这里取
 // ---------------------------------------------------------------------------
 
-// serviceActions 生成"启停/重启/刷新"三颗按钮（首颗是启动还是停止看状态）。
+// serviceActions 生成这三颗按钮（首颗是启动还是停止看状态），**按需取舍**（用户 2026-09-24）：
+//   · 卡片：启停 + 重启；**不给「⟳ 刷新」**（一级菜单上几乎没人点，状态靠卡片自身与刷新页刷新）；
+//   · 管理面板：只给「⟳ 刷新」——启停/重启在卡片上已经有了，重复摆一遍是噪音。
 // 市场卡片**没有** state（不能在渲染时逐张请求），于是退化成"启动"——后端对已在跑的服务
 // 执行 start 是幂等的，不会谎报；点「⟳ 刷新」即可确认。
-export function serviceActions(m, { onDone } = {}) {
+export function serviceActions(m, { onDone, lifecycle = true, restart = true, refresh = true } = {}) {
   const name = serviceNameOf(m);
   const st = (m && m.state) || {};
   const canControl = !m || m.driver_ready !== false;
@@ -421,14 +394,16 @@ export function serviceActions(m, { onDone } = {}) {
     title: title || `${text}「${label}」`,
     onclick: () => doServiceAction(name, action, m, onDone),
   });
-  return [
-    st.running === true
-      ? btn('停止', 'stop')
-      : btn('启动', 'start', '.btn-ok'),
-    btn('重启', 'restart'),
+  const out = [];
+  if (lifecycle) {
+    out.push(st.running === true ? btn('停止', 'stop') : btn('启动', 'start', '.btn-ok'));
+  }
+  if (restart) out.push(btn('重启', 'restart'));
+  if (refresh) {
     // 状态刷新不是"动作"：只重新查一次，不改动服务。
-    btn('⟳ 刷新', 'status', '', '重新查询它在系统里的真实状态（不改动服务）'),
-  ];
+    out.push(btn('⟳ 刷新', 'status', '', '重新查询它在系统里的真实状态（不改动服务）'));
+  }
+  return out;
 }
 
 // doServiceAction 执行一次服务动作并如实报告结果。
@@ -481,7 +456,7 @@ export function marketQuickActions(m, { state, onDone, onManage, svc = null } = 
   const canControl = !!s || !!(m && (m.adopted || m.service_in_launchd));
   const target = s || (state ? { ...m, state } : m);
   return [
-    ...(canControl ? serviceActions(target, { onDone }) : []),
+    ...(canControl ? serviceActions(target, { onDone, refresh: false }) : []),
     h('button.btn.btn-sm', {
       text: '⚙️ 管理',
       title: '状态 / 启停 / 配置 / 日志 / 凭据 / 重装 / 文档 / 卸载 —— 都在这里，不用跳到别的页面',
@@ -580,76 +555,6 @@ export function portCheckNote(m, s = null) {
     : '没有可用端口，无从检测它是否在运行';
 }
 
-// openDirectActions 渲染「打开 / 直链」这一对入口 —— **唯一的一份实现**（三处调用方必须一致）。
-// 语义固定（2026-09-17）：「打开」**永远**是子路径、「直链」**永远**是端口地址；prefer_direct 时
-// 「打开」**不换成**直连，只加 ⚠️ 与 title；不看 /market/proxies 探测（不带会话，几乎恒 false）。
-export function openDirectActions(m, opts = {}) {
-  const svc = opts.svc || null;
-  const explain = !!opts.explain;
-  const ui = (m && m.ui) || null;
-  const slug = (ui && ui.slug) || '';
-  const panelUI = !!(ui && ui.slug && !ui.console_only);
-  const port = (svc && svc.port) || (m && m.port) || 0;
-  const explicit = (m && m.port_url) || '';
-  const direct = explicit || portDirectURL(port);
-  const synthesized = !explicit && !!direct;
-  const note = (ui && ui.note) || '';
-
-  const directButton = () => h('a.btn.btn-sm', {
-    href: direct, target: '_blank', rel: 'noopener', text: '直链',
-    title: synthesized
-      ? '按当前访问地址与端口拼出来的：' + direct +
-        '（面板拿不到局域网 IP，也不保证这个端口就是网页界面，可能不适用）'
-      : '绕过面板、直接访问应用自己的端口：' + direct,
-  });
-
-  // console_only（frpc 自带控制台）：两个入口都不给；只有市场条目才带 ui。
-  if (m && ui && ui.console_only) return [];
-
-  // 没有面板界面：见函数头的说明。
-  if (!panelUI) {
-    if (svc && direct) return [directButton()];
-    if (explain) {
-      return [h('span', {
-        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
-        title: m
-          ? '这个应用在目录里没有界面（没有 ui.slug），也没有可用的端口，拼不出打开地址'
-          : '这条服务记录没有端口，也没有面板界面，拼不出打开地址',
-        text: '没有可用的打开入口',
-      })];
-    }
-    return [];
-  }
-
-  // SelfConf（phpMyAdmin）：nginx location 只允许本机，唯一入口是**面板自己**那条；
-  // 相对路径会打到面板 SPA 的回落页（200 却是面板首页），所以走 panelPath。
-  if (ui.self_conf) {
-    const out = [h('a.btn.btn-sm.btn-primary', {
-      href: panelPath((slug || 'phpmyadmin') + '/'), target: '_blank', rel: 'noopener', text: '打开',
-      title: '经面板打开（需先登录面板）' +
-        (direct ? '；也可以直连：' + direct
-          : '；这个应用只能从面板打开，没有可直连的端口，所以没有「直链」'),
-    })];
-    if (direct) out.push(directButton());
-    return out;
-  }
-
-  const path = '/' + slug + '/';
-  // prefer_direct 是**人工实测**结论（自动探测发现不了"资源全 200、前端路由不认前缀"）：
-  // 只加警示，不改按钮归属。
-  const warn = !!ui.prefer_direct;
-  const why = warn ? (note || '这个应用实测不支持子路径') : note;
-  const out = [h('a.btn.btn-sm.btn-primary', {
-    href: path, target: '_blank', rel: 'noopener',
-    text: warn ? '⚠️ 打开' : '打开',
-    title: '经面板的 /' + slug + '/ 打开' +
-      (why ? '。' + why : '') +
-      (warn ? '。点开可能是空白页，请用旁边的「直链」' : '') +
-      (direct ? '' : '。没有可用的端口直连地址，所以没有「直链」'),
-  })];
-  if (direct) out.push(directButton());
-  return out;
-}
 
 // reinstallButton 把「重装」放进**管理面板**（用户 2026-09-17）。安装器住在 apps.js，调用方通过
 // `onReinstall` 把现有重装动作递进来；只在**真的可重装**时给（卸载计划是 installer/service 两类）。
@@ -751,12 +656,12 @@ export async function openServicePanel(o = {}) {
     // 只在"服务确实可管"时才给：装了但没有服务的应用点启停只会报"找不到服务"，
     // 反复被投诉的正是"点了没用的按钮比没有按钮更糟"。
     const canControl = !!s || !!(mi && (mi.adopted || mi.service_in_launchd));
-    if (canControl) out.push(...serviceActions(s || mi, { onDone: afterAction }));
+    // 只留「⟳ 刷新」：启停/重启在卡片上就有，重复摆一遍是噪音（用户 2026-09-24 要求去掉）。
+    if (canControl) out.push(...serviceActions(s || mi, { onDone: afterAction, lifecycle: false, restart: false }));
 
-    // ③ 界面：与市场卡片同一份实现（openDirectActions）；console_only 不渲染。
-    // 纯纳管服务没有 port_url，用 location.hostname + 端口拼一颗直链并在 title 里说明；
-    // 两者都没有时 explain 会渲染一行"为什么没有"。
-    out.push(...openDirectActions(mi, { svc: s, explain: true }));
+    // ③ 界面：**只给「打开」**（与卡片同一份判定）。「直链」已按用户要求去掉 ——
+    // 别名访问下线后"打开"本来就是端口地址，两颗按钮说的是同一件事。
+    out.push(...openOnlyAction(mi, { svc: s }));
 
     // ③b 重装：卡片上不再直接给，统一收进管理面板。
     const rb = reinstallButton(mi, { onReinstall, onDone: afterAction });
@@ -912,8 +817,6 @@ export async function openServicePanel(o = {}) {
     // ---- 操作 ----
     clear(actionBox);
     appendAll(actionBox, ...renderActions(res));
-    // prefer_direct 时按钮下方补一行**始终可见**的说明（与「我的应用」行、市场卡片同一份）。
-    appendAll(actionBox, subpathWarning(mi));
 
     // ---- 详情 ----
     // 只 push 有值的行：以前写死一串字段并打印可能为空的项，界面上出现一堆空白行。

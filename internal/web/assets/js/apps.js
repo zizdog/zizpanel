@@ -40,15 +40,13 @@ import { renderInstalledApps } from './services.js';
 // （用户 2026-09-16 的核心要求：同一个应用的能力不分散在两个页面）。
 //
 // appCardShell  四个 Tab 共用的卡片 DOM（用户要求"卡片样式统一"）
-// openOrRepairActions / openTargetOf / portAccessWarning
-//               卡片上「打开 / 重新部署」的**唯一**判定与"不支持子路径"的逐字提示
-//               （用户 2026-09-17 第六条：只显示打开、不显示直链；不支持子路径的
-//                用 ip:端口打开并提示"该应用不支持子路径，请用端口访问，或自行配置反代。"）
+// openOrRepairActions / openTargetOf
+//               卡片上「打开 / 重新部署」的**唯一**判定（入口只有一颗「打开」）
 // dedupeMarketEntries 市场/docker 列表按归一化 key 去重（与「已安装」的去重同一套规则）
 // hasPanelUI    与面板同一条"有没有面板托管的界面"判据
 import {
   openServicePanel, marketQuickActions, hasPanelUI, appCardShell,
-  openOrRepairActions, portAccessWarning, dedupeMarketEntries, appKeyOf,
+  openOrRepairActions, dedupeMarketEntries, appKeyOf,
   // 卸载确认只有一份实现（servicePanel.confirmUninstallPlan）：这里曾经抄过
   // 一份，而那份的确认按钮 `close(); resolve(true)` 会被 modal 的 onClose
   // 里的 resolve(false) 抢先定稿 —— 用户点「确认卸载」后什么都不发生。
@@ -1583,7 +1581,6 @@ export function AppsView(content, ctx = {}) {
     } else if (installed) {
       // 「打开」的地址判定在 servicePanel.openTargetOf：支持子路径走子路径，
       // 不支持走端口直连（port_url，或 location.hostname + 端口拼）。
-      // 不支持子路径时，卡片下方会有一行逐字提示（portAccessWarning）。
       // 更新检查那一组按钮放在最前：确定有更新时「更新」是这张卡的主按钮。
       actions.push(...updateAction(a));
       // 「打开」or「重新部署」：服务缺失（plist 丢了/没注册成功）时打开指向的服务
@@ -1682,16 +1679,13 @@ export function AppsView(content, ctx = {}) {
       // 次要位置只放"更新检查失败：<原因>"这一行；成功/最新都不在这里说话。
       extra: [updateCheckNoteOf(a)],
       actions,
-      // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
-      warning: installed ? portAccessWarning(a, { svc: svcOfApp(a) }) : null,
     });
   }
 
-  // openDirectActions（旧的"打开 / 直链"两颗按钮）在卡片上已不再使用：
-  //   用户 2026-09-17 第六条要求卡片**只显示「打开」**，不支持子路径时改用
-  //   ip:端口打开并显示那句逐字提示 —— 判定收敛到 servicePanel.openTargetOf /
-  //   openOnlyAction / portAccessWarning。管理面板里仍然给「打开 + 直链」两颗
-  //   （这是上一轮用户明确要的），实现仍在 openDirectActions，一行未改。
+  // 入口只有一颗「打开」（判定收敛到 servicePanel.openTargetOf / openOrRepairActions）：
+  //   · 2026-09-17 起卡片只显示「打开」；
+  //   · 2026-09-24 别名访问下线后，「直链」与管理面板里那句"不支持子路径"提示一并删除
+  //     —— 打开本来就是端口地址，旧的「打开 / 直链」实现已整段删除。
 
   // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
   //
@@ -1709,7 +1703,7 @@ export function AppsView(content, ctx = {}) {
   // hasPanelUI 从 servicePanel.js 导入（与面板、「已安装」卡片**同一条判据**）；
   // openAppDetail 不传 proxyState ——卡片上那颗「打开」的地址由数据
   // （ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关；
-  // 管理面板里的「打开 / 直链」仍由 openDirectActions 给（两颗都给）。
+  // 管理面板里也只给一颗「打开」（「直链」2026-09-24 已删）。
 
   // openAppDetail 打开「应用管理」面板 —— 市场卡片上唯一的"进面板"入口。
   //

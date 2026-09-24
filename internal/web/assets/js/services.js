@@ -27,7 +27,7 @@ import { taskCenter } from './tasks.js';
 // servicePanel.js —— 与市场 / docker / 建站卡片、管理面板**同一份实现**。
 // mergeAppEntries（去重）与 appCardShell（卡片 DOM）逻辑都只此一份。
 import {
-  openServicePanel, openOrRepairActions, portAccessWarning, appCardShell,
+  openServicePanel, openOrRepairActions, appCardShell,
   mergeAppEntries, statusLine, marketQuickActions, portCheckNote,
 } from './servicePanel.js';
 
@@ -367,8 +367,6 @@ export function renderInstalledApps(container, opts = {}) {
       extra: [...extra, ...authNote, ...repairNote, ...noRecordNote],
       // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，别删这一行）。
       actions,
-      // 不支持子路径时，卡片上始终显示那句逐字提示（用户 2026-09-17 第六条）。
-      warning: portAccessWarning(m, { svc: s }),
       dataset: { appKey: e.key, appName: name },
     });
   }
