@@ -107,6 +107,7 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"grafana":     true,
 		"code-server": true,
 		"rabbitmq":    true,
+		"nats-server": true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {

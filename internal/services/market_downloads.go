@@ -1277,6 +1277,19 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 	{
+		ID: "nats-server", Kind: KindNative, BrewFormula: "nats-server",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.nats-server",
+			LabelSource: "通用 brew 轨（formula 自带 service 块）。**本机真机装过**：实际 label 是 " +
+				"`sh.brew.nats-server`（本机 brew services 的命名），安装器运行期读真实 label 后登记，" +
+				"所以这里写的只是约定默认值",
+			CatalogGap: "同 redis：label 由 brew 决定，不写死在目录里",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("nats-server", 20*time.Minute, "brew install nats-server"),
+		},
+	},
+	{
 		ID: "rabbitmq", Kind: KindNative, BrewFormula: "rabbitmq",
 		Runtime: MarketRuntime{
 			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.rabbitmq",

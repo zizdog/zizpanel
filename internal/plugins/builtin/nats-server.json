@@ -1,0 +1,55 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "nats-server",
+  "name": "NATS（轻量消息总线）",
+  "icon": "📮",
+  "summary": "极轻量的消息总线：发布/订阅、请求/响应",
+  "notes": [
+    "它没有 HTTP 接口，所以健康判据只能用「端口在听」——那只证明进程起来了、端口占住了，**不证明消息发得出去**；真要用请拿客户端连一次。",
+    "默认监听 0.0.0.0:4222（本机真机装卸验收时实测：4222 在 * 上听）。要开监控/管理接口需要它自己的命令行参数，面板改不了启动参数，所以这里不提供。",
+    "没有账号体系时任何能连上 4222 的程序都能收发消息 —— 对外暴露前先在它自己的配置里加认证（同样需要命令行参数，属于进阶操作）。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "nats-server",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "expose": {
+    "port": 4222,
+    "bind": "0.0.0.0",
+    "ui": "app"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "port",
+        "port": 4222,
+        "timeout": "60s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "port",
+    "port": 4222,
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.nats-server.plist"
+    ],
+    "formula": "nats-server",
+    "keep_note": "nats-server 本身不落数据（消息在内存里，没有持久化流），所以没有要保留的数据目录。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      4222
+    ]
+  }
+}

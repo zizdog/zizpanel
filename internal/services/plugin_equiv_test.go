@@ -217,6 +217,7 @@ func TestBuiltinTableOnlyAppsReachCatalog(t *testing.T) {
 		"grafana":     {"grafana", 3002, "/api/health"},
 		"code-server": {"code-server", 8092, "/healthz"},
 		"rabbitmq":    {"rabbitmq", 15672, "/"},
+		"nats-server": {"nats-server", 4222, ""},
 	}
 	for id, w := range want {
 		app, ok := FindApp(id)
