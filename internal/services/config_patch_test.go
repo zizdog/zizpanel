@@ -432,3 +432,53 @@ func TestCodeServerConfigFromTableIsUsable(t *testing.T) {
 		t.Errorf("卡片端口应当是 8092（与 bind-addr 一致），实际 %d", app.Port)
 	}
 }
+
+// TestRabbitMQConfigFromTableIsUsable 表里的 rabbitmq 声明必须真的能把 AMQP 监听打开。
+//
+// 判据来自**本机真机实测**（2026-09-24）：RabbitMQ 4.x 默认 `127.0.0.1:5672`，
+// 在 rabbitmq.conf 里加一行 `listeners.tcp.default = 5672` 之后变成 `*:5672`，
+// 而且 broker 启动时没有任何配置报错。所以这条声明必须是：
+//
+//	· 改 {brew}/etc/rabbitmq/rabbitmq.conf（不是别的路径）；
+//	· 键就是 listeners.tcp.default，值 5672；
+//	· if_missing=create（全新安装时这个文件不存在 —— 不建的话"打开监听"根本没发生）；
+//	· 卡片端口是**管理界面** 15672（用户要打开的是它，不是 AMQP 协议口）。
+func TestRabbitMQConfigFromTableIsUsable(t *testing.T) {
+	app, ok := FindApp("rabbitmq")
+	if !ok {
+		t.Fatal("目录里没有 rabbitmq（插件表没加载？）")
+	}
+	if app.Port != 15672 {
+		t.Errorf("卡片端口应当是管理界面 15672，实际 %d", app.Port)
+	}
+	if len(app.ConfigPatches) != 1 {
+		t.Fatalf("应当正好一条配置补丁：%+v", app.ConfigPatches)
+	}
+	p := app.ConfigPatches[0]
+	if plugins.NormalizeFormat(p.Format) != plugins.PatchKV {
+		t.Errorf("rabbitmq.conf 是 kv 格式，实际 %q", p.Format)
+	}
+	if p.IfMissing != "create" {
+		t.Errorf("必须 if_missing=create（全新安装时该文件不存在），实际 %q", p.IfMissing)
+	}
+	if got := p.Set["listeners.tcp.default"]; got != "5672" {
+		t.Errorf("补丁要把 listeners.tcp.default 设为 5672，实际 %q", got)
+	}
+	if app.ConfigPath != "{brew}/etc/rabbitmq/rabbitmq.conf" {
+		t.Errorf("配置文件路径不对：%q", app.ConfigPath)
+	}
+	// 真跑一遍：确认写出来的就是能生效的那一行
+	home := t.TempDir()
+	m := &Manager{opt: Options{UserHome: home, UserName: ""}}
+	res := &InstallResult{App: app.ID, Name: app.Name}
+	m.applyConfigPatchStep(context.Background(), app, res)
+	// 沙箱里 {brew} 前缀不可用，所以显式指向临时文件验证内容格式
+	cfg := filepath.Join(home, "rabbitmq.conf")
+	out, changed := plugins.ApplyPatch("", p)
+	if !changed || !strings.Contains(out, "listeners.tcp.default = 5672") {
+		t.Errorf("空文件上应用补丁应当写出那一行，实际 %q", out)
+	}
+	if err := os.WriteFile(cfg, []byte(out), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

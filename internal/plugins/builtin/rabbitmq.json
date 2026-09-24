@@ -1,0 +1,71 @@
+{
+  "schema": "zizpanel.app/v1",
+  "id": "rabbitmq",
+  "name": "RabbitMQ（消息队列）",
+  "icon": "🐰",
+  "summary": "AMQP 消息队列服务，自带管理界面",
+  "notes": [
+    "面板安装时会给它写一份最小配置，把 AMQP 监听开到所有网卡：RabbitMQ 4.x 默认只绑 127.0.0.1:5672，别的机器连不上（本机真机实测过：加与不加这行，绑定从 127.0.0.1:5672 变成 *:5672）。",
+    "管理界面在 15672（默认账号 guest 只允许本机登录）。要从别的机器用，先在本机执行：rabbitmqctl add_user 用户名 口令，再 rabbitmqctl set_permissions -p / 用户名 \".*\" \".*\" \".*\" —— 面板不替你建用户。",
+    "它是 Erlang 应用，装完占几百 MB；不用了就在面板里卸载。"
+  ],
+  "source": {
+    "kind": "brew",
+    "formula": "rabbitmq",
+    "checksum": "sha256"
+  },
+  "run": {
+    "mode": "brew-service"
+  },
+  "config": {
+    "path": "{brew}/etc/rabbitmq/rabbitmq.conf",
+    "format": "kv",
+    "if_missing": "create",
+    "mode": "0644",
+    "own": "user",
+    "set": {
+      "listeners.tcp.default": "5672"
+    }
+  },
+  "expose": {
+    "port": 15672,
+    "bind": "0.0.0.0",
+    "ui": "app",
+    "path": "/"
+  },
+  "verify": {
+    "any_of": [
+      {
+        "kind": "http",
+        "path": "/",
+        "timeout": "150s"
+      }
+    ]
+  },
+  "health": {
+    "kind": "http",
+    "path": "/",
+    "interval": "30s"
+  },
+  "uninstall": {
+    "always": [
+      "/Library/LaunchDaemons/homebrew.mxcl.rabbitmq.plist"
+    ],
+    "optional_data": [
+      "{brew}/var/lib/rabbitmq",
+      "{brew}/etc/rabbitmq"
+    ],
+    "formula": "rabbitmq",
+    "keep_note": "默认保留队列数据与配置（{brew}/var/lib/rabbitmq、{brew}/etc/rabbitmq）；勾选「删除数据」才会删 —— 队列里的消息都在里面。"
+  },
+  "update": {
+    "kind": "brew"
+  },
+  "requires": {
+    "system_daemon": true,
+    "ports": [
+      15672,
+      5672
+    ]
+  }
+}

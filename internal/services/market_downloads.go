@@ -1277,6 +1277,20 @@ var marketDownloadApps = []MarketApp{
 		},
 	},
 	{
+		ID: "rabbitmq", Kind: KindNative, BrewFormula: "rabbitmq",
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.rabbitmq",
+			LabelSource: "同 redis：formula 自带 service 块（2026-09-24 实测：run = rabbitmq-server；本机真机装过）",
+			CatalogGap:  "同 redis：label 由 brew 决定，安装器运行期读取后登记",
+		},
+		Downloads: []MarketDownloadPoint{
+			brewBottlePoint("rabbitmq", 30*time.Minute, "brew install rabbitmq（Erlang 应用；面板还会写一份最小配置把 AMQP 监听开到所有网卡）"),
+			// 第二个下载点如实单列：它是 Erlang 应用，运行时（erlang）比本体大得多，
+			// 审计要能看见"装这一个应用其实要下两份东西"（与 miniflux→postgresql@17 同一处理）。
+			brewBottlePoint("erlang@28", 30*time.Minute, "brew install erlang@28（RabbitMQ 的运行时依赖，brew 会自动带上）"),
+		},
+	},
+	{
 		ID: "code-server", Kind: KindNative, BrewFormula: "code-server",
 		Runtime: MarketRuntime{
 			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.code-server",

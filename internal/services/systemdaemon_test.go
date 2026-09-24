@@ -106,6 +106,7 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"prometheus":  true,
 		"grafana":     true,
 		"code-server": true,
+		"rabbitmq":    true,
 	}
 	got := map[string]bool{}
 	for _, app := range Catalog() {
