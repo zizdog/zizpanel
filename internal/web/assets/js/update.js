@@ -615,19 +615,11 @@ function upProgressPanel(st, status) {
     dataset: { testid: 'zp-upgrade-panel' },
   });
 
-  // ---- 顶部：警示条（运行中）或结果条（已结束）----
-  if (running) {
-    panel.append(h('div', {
-      class: 'zp-upg-warn',
-      dataset: { testid: 'zp-upgrade-warning' },
-    }, [
-      h('span', { class: 'zp-upg-warn-ico', text: '⚠️' }),
-      h('div', {}, [
-        h('strong', { text: '升级进行中，请勿退出或刷新页面' }),
-        h('div', { class: 'zp-upg-warn-sub', text: '进度由面板实时写入，刷新/关闭会让你看不到进展；面板重启期间页面会自动重连。' }),
-      ]),
-    ]));
-  } else {
+  // ---- 顶部：结果条（只在升级结束后画；运行中的警示见 render() 顶部那一条）----
+  //
+  // 2026-09-24 用户："升级提示信息重复" —— 这里原来在运行中会再画一条几乎同样的
+  // 黄色警示，与卡片顶部的状态条重复，删掉。
+  if (!running) {
     panel.append(h('div', {
       class: 'zp-upg-result ' + (done ? 'ok' : (failed ? 'err' : '')),
       dataset: { testid: 'zp-upgrade-result' },
@@ -827,19 +819,12 @@ export function UpdateView(content, ctx = {}) {
   // ---------- 顶部醒目提示：有没有新版本 ----------
   function renderNoticeInner() {
     clear(notice);
-    // 升级进行中：顶部不再劝用户"一键更新"（那样自相矛盾），
-    // 改成最醒目的"请勿退出或刷新页面"。进度面板里也有一条同样的警示，
-    // 这里是页面最顶上的那一份，滚动到任何位置都能看到。
+    // 升级进行中：顶部这块**什么都不画**。
+    //
+    // 别在这里再放一条"请勿退出或刷新页面"——卡片顶部已经有一条（2026-09-24 用户
+    // 第二次报"提示重复"）；也**不能**回退成"一键更新"横幅：升级途中劝用户点更新
+    // 是自相矛盾的。
     if (upRunning) {
-      const warnTop = banner('warn', [
-        h('div', { style: { display: 'flex', gap: '9px', alignItems: 'center', flexWrap: 'wrap' } }, [
-          h('span', { style: { fontSize: '18px' }, text: '⚠️' }),
-          h('strong', { text: '升级进行中，请勿退出或刷新页面' }),
-        ]),
-        h('div', { style: mutedStyle, text: '下载 / 校验 / 安装都在面板后台继续；刷新虽然不会中断下载，但你会看不到实时进度。' }),
-      ], { border: '1px solid var(--warn)' });
-      warnTop.dataset.testid = 'zp-upgrade-warning-top';
-      notice.append(warnTop);
       return;
     }
     if (checkInfo && checkInfo.has_update) {
@@ -958,12 +943,17 @@ export function UpdateView(content, ctx = {}) {
     // 每次重渲染先作废旧的成功自动消失定时器；只有 success 会重新排一个。
     clearDismissTimer();
 
-    // ---- 顶部状态条：把"正在发生什么"讲清楚 ----
-    if (status === 'applying' || status === 'restarting') {
+    // ---- 顶部状态条：把"正在发生什么"讲清楚（升级中的警示**只有这一条**）----
+    //
+    // 2026-09-24 用户第二次报"升级提示信息重复"：这条 + 页面顶部横幅 + 进度面板里的
+    // 警示条，同一个页面同时喊三遍。现在只留这一条（含"正在做什么"与"会自动重连"）。
+    const upgrading = status === 'checking' || status === 'downloading'
+      || status === 'applying' || status === 'restarting';
+    if (upgrading) {
       bodyEl.append(banner('warn', [
-        h('strong', { text: '升级进行中：' }),
-        h('span', { text: st.message || st.stage || '正在替换程序并重启面板…' }),
-        h('div', { style: mutedStyle, text: '面板即将短暂断开，页面会自动重连；成功后会自动刷新整个网页。请不要关闭这个页面。' }),
+        h('strong', { text: '升级进行中，请勿退出或刷新页面' }),
+        h('div', { style: mutedStyle, text: (st.message || st.stage || '正在准备升级包…')
+          + '；面板重启期间页面会自动重连。' }),
       ]));
     } else if (status === 'success') {
       // ⚠️ 这里**刻意不再画"升级成功"横幅**（2026-09-22 用户："升级页每次有两处说差不多的事"）：
