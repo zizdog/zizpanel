@@ -29,6 +29,10 @@ func fileOwner(fi os.FileInfo) string {
 	return uname + ":" + gname
 }
 
+// ChownRealUser 是 chownRealUser 的导出形式：别的包（视频压缩产物）也要把
+// root 建出来的文件交还真实用户，否则用户在 Finder 里改不动自己目录里的产物。
+func (m *Manager) ChownRealUser(p string) { m.chownRealUser(p) }
+
 // chownRealUser 把新建的文件归属给真实用户。
 //
 // 面板以 root 运行，新建的文件默认属于 root，

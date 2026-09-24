@@ -35,8 +35,8 @@ func (s *Server) imgEngine() imgopt.Engine {
 	return imgopt.DetectEngine(s.Cfg.BrewPrefix)
 }
 
-// imgDefaultDir 把请求里的目录解析成白名单内的真实路径。
-func (s *Server) imgResolveDir(raw string, allowMissing bool) (string, error) {
+// fileResolveDir 把请求里的目录解析成白名单内的真实路径（图片/视频压缩共用）。
+func (s *Server) fileResolveDir(raw string, allowMissing bool) (string, error) {
 	mgr := s.fileManager()
 	dir := strings.TrimSpace(raw)
 	if dir == "" {
@@ -92,7 +92,7 @@ func (s *Server) handleImageEngine(w http.ResponseWriter, r *http.Request) {
 		MaxEdge:     []int{0, 1280, 1920, 2560, 3840},
 		MarketAppID: imgCompressAppID,
 	}
-	dir, err := s.imgResolveDir(r.URL.Query().Get("dir"), false)
+	dir, err := s.fileResolveDir(r.URL.Query().Get("dir"), false)
 	if err != nil {
 		resp.ScanError = err.Error()
 		ok(w, resp)
@@ -214,7 +214,7 @@ func (s *Server) handleImageCompress(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, eng.Reason)
 		return
 	}
-	dir, err := s.imgResolveDir(req.Dir, false)
+	dir, err := s.fileResolveDir(req.Dir, false)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return

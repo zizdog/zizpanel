@@ -460,6 +460,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/files/upload-limit", s.requireAuth(s.handleGetPanelUploadLimit))
 	root.HandleFunc("POST /api/v1/files/search", s.requireAuth(s.handleFileSearch))
 	root.HandleFunc("POST /api/v1/files/replace", s.requireAuth(s.handleFileReplace))
+	// 视频压缩（走任务中心：202 + task_id）与目录收藏（存服务端 settings KV）。
+	root.HandleFunc("POST /api/v1/files/video-plan", s.requireAuth(s.handleFileVideoPlan))
+	root.HandleFunc("POST /api/v1/files/video-compress", s.requireAuth(s.handleFileVideoCompress))
+	root.HandleFunc("GET /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesList))
+	root.HandleFunc("POST /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesSet))
 
 	// ---------- Web 终端 ----------
 	root.HandleFunc("GET /api/v1/terminal", s.requireAuth(s.handleTerminalStatus))

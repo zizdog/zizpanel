@@ -41,6 +41,9 @@ let headCheckbox = null;
 // clipboard = { mode: 'copy' | 'cut', paths: string[] }
 // 只在内存里（不写 localStorage）：剪贴板内容是易失的，刷新页面后失效最不意外。
 let clipboard = null;
+// 目录收藏：**存在服务端**（settings KV），所以手机上打开面板也是同一份。
+// null = 还没拉到（拉之前工具栏不显示"已收藏"状态，绝不猜）。
+let favorites = null;
 // 当前打开的编辑器窗口（同一时刻最多一个）。**全局存活**：切换路由时不清除，
 // 只有用户点 ✕ / 菜单「关闭编辑器」才会被 dispose（见 createEditorWindow 的 onClosed）。
 let activeEditor = null;
@@ -608,6 +611,17 @@ export function FilesView(content, ctx = {}) {
         title: '一键回到网站根目录',
         onclick: () => { const w = wwwRoot(); if (w) load(w); },
       }),
+      // 收藏当前目录 / 打开收藏夹（点一下直接跳过去）。状态来自服务端列表。
+      h('button.btn.btn-sm', {
+        text: isFavorite(cwd) ? '★ 已收藏' : '☆ 收藏',
+        title: isFavorite(cwd) ? '取消收藏当前目录' : '收藏当前目录（服务端保存，手机上也能看到）',
+        onclick: toggleFavorite,
+      }),
+      h('button.btn.btn-sm', {
+        text: '⭐ 收藏夹' + (favList().length ? '（' + favList().length + '）' : ''),
+        title: '点一下直接跳到收藏的目录',
+        onclick: favoritesModal,
+      }),
       h('button.btn.btn-sm', { text: '⬆ 上传', onclick: () => fileInput.click() }),
       h('button.btn.btn-sm', { text: '⬆ 上传文件夹', onclick: () => folderInput.click() }),
       h('button.btn.btn-sm', {
@@ -666,10 +680,109 @@ export function FilesView(content, ctx = {}) {
         title: '把当前目录里的图片压小（质量 / 最长边 / 输出格式可选；默认另存为 xxx.min.<ext>，不动原文件）',
         onclick: imageCompressModal,
       }),
+      h('button.btn.btn-sm', {
+        text: '🎬 压缩视频',
+        title: '把当前目录里的视频压小（360p/480p/720p，产物写进 output/；绝不越压越大）',
+        onclick: videoCompressModal,
+      }),
       h('button.btn.btn-sm', { text: '打包压缩', disabled: selCount === 0, onclick: compressSelected }),
       h('button.btn.btn-sm.btn-danger', { text: '删除', disabled: selCount === 0, onclick: deleteSelected }),
       h('button.btn.btn-sm', { text: '🔍 搜索', onclick: searchModal }),
     );
+  }
+
+  // ---------- 目录收藏 ----------
+  //
+  // 存服务端（settings KV）而不是 localStorage：手机上打开面板也要看得到同一份。
+  // "已收藏"状态只信服务端列表（没拉到就显示「☆ 收藏」，绝不猜）。
+  function favList() {
+    return (favorites && favorites.items) || [];
+  }
+
+  function isFavorite(p) {
+    return !!p && favList().some((it) => it.path === p);
+  }
+
+  async function refreshFavorites() {
+    try {
+      favorites = await api.fileFavorites();
+    } catch {
+      // 拉不到就保留上一次的结论（没有就当作空），绝不让工具栏卡住不渲染。
+      if (!favorites) favorites = { items: [], missing: 0 };
+    }
+    renderToolbar();
+  }
+
+  // setFavorite 是**唯一**的收藏写入口（加/移除都走它，成功后用服务端返回的
+  // 最新列表覆盖本地状态并重画工具栏）。
+  async function setFavorite(action, path) {
+    try {
+      favorites = await api.fileFavoriteSet(action, path);
+      renderToolbar();
+      return true;
+    } catch (e) {
+      toast((action === 'add' ? '收藏失败：' : '移除失败：') + ((e && e.message) || e), 'err', 10000);
+      return false;
+    }
+  }
+
+  async function toggleFavorite() {
+    if (!cwd) return;
+    const on = isFavorite(cwd);
+    if (await setFavorite(on ? 'remove' : 'add', cwd)) {
+      toast(on ? '已取消收藏' : '已收藏（手机上也能看到）', 'ok');
+    }
+  }
+
+  // favoritesModal 是收藏夹：点「跳转」直接进目录；目录不在了就**如实**标出来
+  // （"目录不存在"），并且照样允许移除 —— 绝不静默消失、也绝不假装能跳。
+  function favoritesModal() {
+    const body = h('div');
+    const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } });
+    const m = modal({ title: '⭐ 收藏夹', body, footer: [foot] });
+
+    function draw() {
+      clear(body);
+      clear(foot);
+      const items = favList();
+      if (!items.length) {
+        body.append(h('div.hint', { text: '还没有收藏：在工具栏点「☆ 收藏」把当前目录加进来。' }));
+        foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+        return;
+      }
+      for (const it of items) {
+        body.append(h('div', {
+          style: {
+            display: 'flex', gap: '8px', alignItems: 'center', padding: '7px 0',
+            borderBottom: '1px solid var(--border-soft)',
+          },
+        }, [
+          h('div', { style: { flex: '1', minWidth: '0' } }, [
+            h('div', { text: (it.exists ? '📁 ' : '⚠️ ') + it.name, style: { fontWeight: '550' } }),
+            h('div.hint', { text: it.path, style: { wordBreak: 'break-all' } }),
+            it.exists ? null : h('div.hint', {
+              text: it.reason || '目录不存在',
+              style: { color: 'var(--warn)' },
+            }),
+          ]),
+          it.exists
+            ? h('button.btn.btn-sm', {
+              text: '跳转',
+              onclick: () => { m.close(); load(it.path); },
+            })
+            : h('button.btn.btn-sm', {
+              text: '无法跳转', disabled: true,
+              title: it.reason || '目录不存在',
+            }),
+          h('button.btn.btn-sm', {
+            text: '移除',
+            onclick: async () => { if (await setFavorite('remove', it.path)) draw(); },
+          }),
+        ]));
+      }
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+    }
+    draw();
   }
 
   // 文件名不是"打开"按钮：单击只选中，双击才打开（handleRowOpen）。
@@ -1545,6 +1658,147 @@ export function FilesView(content, ctx = {}) {
     draw();
   }
 
+  // videoCompressModal 是「🎬 压缩视频」弹窗：档位 + 码率 + 计划表 + 走任务中心。
+  //
+  // 用户点名的三条硬要求都在这里：
+  //   · 绝不放大（档位只是"封顶"，目标分辨率不会超过原尺寸）；
+  //   · 绝不越压越大（那句口径直接写在面板上，执行时还会回读产物大小）；
+  //   · 后台跑（关掉这个窗口/整个页面都不影响，进度与中断都在任务中心）。
+  // 档位与码率选项**全部来自后端**（计划响应里带回），前端不重复写一份数字。
+  async function videoCompressModal() {
+    const body = h('div');
+    const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
+    const m = modal({ title: '🎬 压缩视频', body, footer: [foot], wide: true });
+
+    let preset = '480p';
+    let kbps = 0; // 0 = 用档位下限（默认的"能用下限"码率）
+    let plan = null;
+
+    async function reload() {
+      clear(body); clear(foot);
+      body.append(h('div.hint', { text: '正在读取目录与视频信息…' }));
+      try {
+        plan = await api.fileVideoPlan({ dir: cwd, preset, kbps });
+      } catch (e) {
+        body.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '读取失败：' + ((e && e.message) || e) }));
+        foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+        return;
+      }
+      draw();
+    }
+
+    function draw() {
+      clear(body); clear(foot);
+
+      if (!plan.available) {
+        body.append(h('div', { style: { lineHeight: '1.8' } }, [
+          h('div', { style: { fontWeight: '620', color: 'var(--warn)' }, text: '引擎还没装（缺 FFmpeg）' }),
+          h('div', { text: plan.reason || '' }),
+          h('div.hint', { text: '装好后这个弹窗就能用（应用市场 → FFmpeg）' }),
+        ]));
+        foot.append(h('button.btn.btn-primary', {
+          text: '一键安装 FFmpeg',
+          onclick: async () => {
+            await taskCenter.start({
+              kind: 'install', target: plan.market_app_id, title: '安装 FFmpeg（音视频工具）',
+              start: () => api.marketInstall(plan.market_app_id),
+              onDone: (task) => {
+                if (task && task.status && task.status !== 'succeeded') {
+                  toast('安装失败：' + (task.error || task.status), 'err', 12000);
+                  return;
+                }
+                toast('FFmpeg 已装好，正在重新规划…', 'ok', 8000);
+                reload();
+              },
+            });
+          },
+        }));
+        foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+        return;
+      }
+
+      const presetRow = h('div', { style: { display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        (plan.presets || []).map((p) => h('label', {
+          style: { display: 'flex', gap: '5px', alignItems: 'center', cursor: 'pointer' },
+        }, [
+          h('input', {
+            type: 'radio', name: 'zp-video-preset', value: p.id, checked: p.id === plan.preset,
+            onchange: () => { preset = p.id; kbps = 0; reload(); },
+          }),
+          h('span', { text: p.label }),
+        ])));
+
+      const bitrate = h('select.select', (plan.bitrate_choices || []).map((c) => h('option', {
+        value: String(c.kbps), text: c.label,
+      })));
+      bitrate.value = String(plan.kbps);
+      bitrate.addEventListener('change', () => { kbps = Number(bitrate.value) || 0; reload(); });
+
+      const rows = (plan.rows || []).map((r) => h('tr', [
+        h('td', { text: r.name }),
+        h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
+        h('td', { text: r.source_video_kbps ? r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '—' }),
+        h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
+        h('td', { text: r.video_kbps ? r.video_kbps + ' kbps' + (r.audio_disabled ? '（无音轨）' : '') : '—' }),
+        h('td', { text: r.est_bytes ? humanSize(r.est_bytes) : '—' }),
+        h('td', {
+          style: { color: r.skip_reason ? 'var(--warn)' : 'var(--text-mute)' },
+          text: r.skip_reason || r.note || '—',
+        }),
+      ]));
+
+      body.append(h('div', { style: { lineHeight: '1.7' } }, [
+        h('div.field', [h('label', { text: '目标档位（只封顶，绝不放大）' }), presetRow]),
+        h('div.field', [h('label', { text: '码率' }), bitrate]),
+        h('div.hint', {
+          text: '目录 ' + (plan.dir || cwd) + '：' + plan.total + ' 个视频，可压 '
+            + plan.runnable + ' 个，跳过 ' + plan.skipped + ' 个',
+        }),
+        h('div.hint', { text: plan.note || '' }),
+        h('div', { style: { overflowX: 'auto', marginTop: '8px' } }, [
+          h('table.table', { style: { fontSize: '12px' } }, [
+            h('thead', [h('tr', ['文件', '原分辨率', '原码率', '目标', '目标码率', '预计大小', '说明']
+              .map((t) => h('th', { text: t })))]),
+            h('tbody', rows.length ? rows : [h('tr', [h('td', { colspan: '7', text: '这个目录里没有视频' })])]),
+          ]),
+        ]),
+        h('div.hint', { style: { marginTop: '8px' }, text: '产物写进 output/；关掉窗口也在后台跑' }),
+      ]));
+
+      const start = h('button.btn.btn-primary', {
+        text: '开始压缩' + (plan.runnable ? '（' + plan.runnable + ' 个）' : ''),
+        disabled: !plan.runnable,
+        title: plan.runnable ? '在任务中心后台执行；关掉页面不受影响' : '没有可压缩的视频',
+      });
+      start.addEventListener('click', async () => {
+        const opts = { dir: cwd, preset: plan.preset, kbps: plan.kbps };
+        m.close();
+        await taskCenter.start({
+          kind: 'video_compress', target: opts.dir,
+          title: '压缩视频（' + plan.runnable + ' 个 · ' + plan.preset + '）',
+          start: () => api.fileVideoCompress(opts),
+          onDone: (task) => {
+            if (task && task.status && task.status !== 'succeeded') {
+              toast('视频压缩失败：' + (task.error || task.status), 'err', 14000);
+              load(cwd);
+              return;
+            }
+            const r = (task && task.result) || {};
+            // 如实汇总"N 个完成 / M 个跳过"，并刷新列表（能看到 output/）。
+            toast('视频压缩完成：' + (r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过（共省 '
+              + humanSize(r.saved_bytes || 0) + '）', r.failed ? 'warn' : 'ok', 14000);
+            load(cwd);
+          },
+        });
+      });
+      foot.append(start);
+      foot.append(h('button.btn', { text: '重新规划', onclick: reload }));
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+    }
+
+    reload();
+  }
+
   async function compressSelected() {
     const paths = [...selection];
     const names = paths.map((p) => basename(p));
@@ -2214,6 +2468,8 @@ export function FilesView(content, ctx = {}) {
   // 重新绑到当前这个视图，否则保存后的文件列表刷新会打在已经脱离文档的旧 DOM 上。
   if (activeEditor) activeEditor.setOptions(editorOptions());
   load(cwd || undefined);
+  // 收藏存在服务端：进页面时拉一次（拿到之前工具栏不显示"已收藏"，不猜）。
+  refreshFavorites();
 }
 
 // ============================================================================

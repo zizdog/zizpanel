@@ -145,11 +145,19 @@ func (m *Manager) commandProbe() func(string) (string, error) {
 // 用户以为坏了）。而服务 plist 里显式给了 Homebrew 前缀，服务是用得到的，
 // 所以"服务能用"才是判据 —— 探测必须与它对齐。
 func (m *Manager) defaultCommandProbe(command string) (string, error) {
+	return LocateCommand(command, m.brewPrefix())
+}
+
+// LocateCommand 探测一个命令此刻能不能用：先 PATH，再 Homebrew 前缀。
+//
+// 导出给 web 层（视频压缩要跑 ffmpeg/ffprobe）复用**同一套判据** ——
+// 两处各写一份的话，"面板说 ffmpeg 可用、压缩却报找不到"这类漂移迟早出现。
+func LocateCommand(command, brewPrefix string) (string, error) {
 	if p, err := exec.LookPath(command); err == nil {
 		return p, nil
 	}
 	var dirs []string
-	if prefix := m.brewPrefix(); prefix != "" && prefix != "." {
+	if prefix := strings.TrimSpace(brewPrefix); prefix != "" && prefix != "." {
 		dirs = append(dirs, filepath.Join(prefix, "bin"))
 	}
 	dirs = append(dirs, "/opt/homebrew/bin", "/usr/local/bin")

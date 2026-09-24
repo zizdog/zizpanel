@@ -509,6 +509,15 @@ export const api = {
   // 面板自己单次上传的上限（回读配置，前端**不许**再写死常数）：
   // 本地预检与分批都用它，提示里的数字也来自它。
   fileUploadLimit: () => request('GET', `${API_BASE}/files/upload-limit`),
+  // 视频压缩：plan 是只读规划（每个视频一行，含"为什么压不了"），
+  // compress 走任务中心（202 + task_id，进度走 SSE；关掉页面也照跑）。
+  fileVideoPlan: (payload) => request('POST', `${API_BASE}/files/video-plan`, payload),
+  fileVideoCompress: (payload) => request('POST', `${API_BASE}/files/video-compress`, payload),
+  // 目录收藏存在服务端（settings KV），手机上打开也是同一份。
+  // action 只能是 'add' / 'remove'；两个动作都会过文件白名单校验。
+  fileFavorites: () => request('GET', `${API_BASE}/files/favorites`),
+  fileFavoriteSet: (action, path) =>
+    request('POST', `${API_BASE}/files/favorites`, { action, path }),
 
   // ---- Web 终端 ----
   terminalInfo: () => request('GET', `${API_BASE}/terminal`),
