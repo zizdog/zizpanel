@@ -109,6 +109,12 @@ type Server struct {
 	// 一次请求（2026-09-24 实际踩到）。不落库：丢了大不了退回"已停止"的旧显示。
 	startHints *services.StartHintStore
 
+	// ---- 健康检查结论的进程级缓存（跨请求）----
+	//
+	// 理由同上：预算内没答完的服务如实报「未确认」，后台探针跑完把真实结论
+	// 写进这份缓存，下一次请求就能拿到（否则会永远停在「未确认」）。
+	healthCache *services.HealthCache
+
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog
 	logOnce sync.Once
@@ -218,6 +224,7 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		Log:         logx.New("web"),
 		serviceRepo: services.NewRepository(st),
 		startHints:  &services.StartHintStore{},
+		healthCache: &services.HealthCache{},
 		Tasks:       tasks.NewManager(),
 		static:      sub,
 		startAt:     time.Now(),

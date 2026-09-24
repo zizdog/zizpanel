@@ -97,6 +97,8 @@ func (s *Server) svcManager() *services.Manager {
 		WorkDir:      s.Cfg.WorkDir,
 		// 启动记忆必须是**进程级**的：Manager 每次请求都新建，挂在自己身上等于没记。
 		StartHints: s.startHints,
+		// 健康检查缓存同理：预算内没答完的服务靠它在下一次请求拿到真实结论。
+		HealthCache: s.healthCache,
 		// 应用包镜像基址：面板里所有安装过程都从这里取资源（见 services/mirror.go）。
 		// svcManager() 每次都按当前 Cfg 新建，所以设置页保存后立刻生效。
 		MirrorBase:         s.Cfg.MirrorBase,

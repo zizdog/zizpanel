@@ -812,16 +812,19 @@ export async function openServicePanel(o = {}) {
           ? (health.ok
             ? pill('ok', '健康', health.message + '（' + (health.latency_ms || 0) + 'ms）')
             : pill('danger', '健康检查失败', health.message))
-          : null,
+          : (health.unconfirmed ? pill('warn', '未确认（超时）', health.message) : null),
         s && s.driver_error ? pill('warn', '驱动不可用', s.driver_error) : null,
         // 容器类应用：标出目录里的官方镜像，给用户一个"我这版是不是旧的"的参照。
         mi && mi.kind === 'compose' && vendorImage(mi) ? pill('', '官方镜像 ' + vendorImage(mi)) : null,
       ]),
       st && st.detail ? h('div.hint', { text: st.detail }) : null,
       // 健康检查失败时把"是什么、为什么、怎么办"摆出来 —— 与市场/服务卡片同一套话术。
+      // 「未确认（超时）」不走这条：它不是故障（那是谎报）。
       health.checked && !health.ok
         ? h('div.hint', { style: { color: 'var(--danger)' }, text: '检查地址：' + (health.url || '（未配置）') + ' —— ' + healthHint(health) })
-        : null,
+        : (health.unconfirmed
+          ? h('div.hint', { text: health.message || '健康检查未在预算内返回：结果未确认，稍后刷新再看' })
+          : null),
     );
 
     // ---- 操作 ----
@@ -838,7 +841,9 @@ export async function openServicePanel(o = {}) {
     push('端口', (s && s.port) || (mi && mi.port) || '');
     push('运行状态', st && (st.status + (st.detail ? '（' + st.detail + '）' : '')));
     push('进程 PID', st && st.pid);
-    push('健康检查', health.checked ? (health.ok ? '正常' : '失败') + '：' + health.message : '');
+    push('健康检查', health.checked
+      ? (health.ok ? '正常' : '失败') + '：' + health.message
+      : (health.unconfirmed ? '未确认：' + health.message : ''));
     push('检查地址', health.url);
     push('访问地址', st && st.endpoint);
     push('配置文件', s && s.config_path);

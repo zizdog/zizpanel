@@ -142,13 +142,19 @@ type State struct {
 
 // Health 是健康检查结果。
 type Health struct {
-	Checked   bool   `json:"checked"`
-	OK        bool   `json:"ok"`
-	URL       string `json:"url"`
-	Code      int    `json:"code"`
-	Latency   int64  `json:"latency_ms"`
-	Message   string `json:"message"`
-	CheckedAt string `json:"checked_at"`
+	Checked bool `json:"checked"`
+	OK      bool `json:"ok"`
+	// Unconfirmed = 这次检查**预算内没拿到结论**（超时/无响应）。
+	//
+	// 它既不是健康、也不是确定故障：Checked=false 让前端不把它算进「需要处理」，
+	// Unconfirmed=true 让前端能单独标「未确认（超时）」。后台探针跑完会写进
+	// HealthCache，下一次请求就给出真实结论（见 healthbudget.go）。
+	Unconfirmed bool   `json:"unconfirmed,omitempty"`
+	URL         string `json:"url"`
+	Code        int    `json:"code"`
+	Latency     int64  `json:"latency_ms"`
+	Message     string `json:"message"`
+	CheckedAt   string `json:"checked_at"`
 }
 
 // Driver 是服务操作接口。所有实现都必须满足：
@@ -326,6 +332,12 @@ type Manager struct {
 	// filebrowserPlistOverride 仅供测试：把 File Browser 的 plist 指到临时文件。
 	// 没有它，单测会读真机 /Library/LaunchDaemons（单测不许碰真实环境）。
 	filebrowserPlistOverride string
+	// healthProbeOverride 仅供测试：替换单条服务的健康探针（默认是
+	// health.go 里真的起 /usr/bin/curl 的 httpHealth）。
+	//
+	// 没有它，"一个 10 秒才回的探针不许让 List 超过预算"这条门禁只能真跑 curl，
+	// 也就只能去连真实端口/服务 —— 那正是单测禁止的（AGENTS.md 第三节）。
+	healthProbeOverride func(ctx context.Context, s *Service) Health
 }
 
 // Options 是管理器需要的环境信息。
@@ -401,6 +413,14 @@ type Options struct {
 	// Manager 上活不过一次请求 —— 点完启动的那次刷新就查不到了（2026-09-24 踩到）。
 	// nil = 不记（状态照旧，不报错）。
 	StartHints *StartHintStore
+
+	// HealthCache 是健康检查结论的进程级缓存（见 HealthCache）。
+	//
+	// 为什么由调用方注入：理由同上（Manager 每次请求都新建）。预算内没答完的
+	// 服务会如实报「未确认」，后台探针跑完把真实结论写进这份缓存 —— 下一次请求
+	// （或列表的后续刷新）就能拿到真实结果，不会永远停在「未确认」。
+	// nil = NewManager 自己造一份（单测/独立调用够用，但不跨请求）。
+	HealthCache *HealthCache
 }
 
 // MySQLCredential 是"面板持有的 MySQL 超级账号凭据"（来自 config.json）。
@@ -421,6 +441,11 @@ type MySQLCredential struct {
 // NewManager 创建服务管理器。
 func NewManager(repo *Repository, opt Options) *Manager {
 	opt.DockerSocket = resolveDockerSocket(opt)
+	if opt.HealthCache == nil {
+		// 没注入时也给一份：否则健康检查的缓存分支全部退化成 nil 判断，
+		// 单测与独立调用就永远拿不到"预算外探针的后台结论"。
+		opt.HealthCache = &HealthCache{}
+	}
 	return &Manager{repo: repo, opt: opt}
 }
 
@@ -504,6 +529,18 @@ func (m *Manager) SetFilebrowserPlistForTest(path string) func() {
 	prev := m.filebrowserPlistOverride
 	m.filebrowserPlistOverride = path
 	return func() { m.filebrowserPlistOverride = prev }
+}
+
+// SetHealthProbeForTest 替换单条服务的健康探针（默认真的起 /usr/bin/curl），
+// 返回值供测试恢复。
+//
+// 为什么必须导出：web 层单测通过 svcManager() 现造 Manager，够不到未导出字段；
+// 而"整批健康检查有预算"这条约束必须能用一个**慢的假探针**来验证 ——
+// 真跑 curl 就只能连真实端口/服务（单测禁止）。
+func (m *Manager) SetHealthProbeForTest(fn func(ctx context.Context, s *Service) Health) func() {
+	prev := m.healthProbeOverride
+	m.healthProbeOverride = fn
+	return func() { m.healthProbeOverride = prev }
 }
 
 // dockerSocketCandidates 是"这台机器上 Docker socket 可能在哪"的**唯一**清单，
@@ -622,10 +659,18 @@ func (m *Manager) List(ctx context.Context, withHealth bool) ([]*View, error) {
 				return
 			}
 			r.ready = true
+			// 健康探针与状态查询**并行**起：这样列表总耗时是
+			// max(状态查询上限, 健康预算)，健康那一路再也不会额外叠加。
+			// 唯一要等状态的例外是"用户手动停过"的服务（见下）。
+			wantHealth := withHealth && s.HealthURL != ""
+			var hch <-chan Health
+			if wantHealth && !s.StoppedByUser {
+				hch = m.startHealthProbe(s, drv)
+			}
 			// 状态查询单独限时，避免某个服务卡住整个列表
 			sctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-			defer cancel()
 			st, err := drv.Status(sctx)
+			cancel()
 			if err != nil {
 				r.state = State{Status: "error", Detail: err.Error()}
 			} else {
@@ -640,16 +685,18 @@ func (m *Manager) List(ctx context.Context, withHealth bool) ([]*View, error) {
 			// 健康检查是"这个服务**应该**在跑、它答不答得上来"的问题；
 			// 用户已经明确停掉它时，它当然答不上来 —— 那不是故障，不该进"需要处理"。
 			// 这里如实标 Checked=false（前端据此不再算问题），并写明原因。
-			if withHealth && s.HealthURL != "" {
-				if skipHealthForUserStopped(s, r.state) {
+			if wantHealth {
+				switch {
+				case skipHealthForUserStopped(s, r.state):
 					r.health = Health{
 						Checked: false, URL: s.HealthURL,
 						Message: "服务已被你手动停止：不做健康检查（它不是故障）。点「▶ 启动」即可恢复",
 					}
-				} else {
-					hctx, hcancel := context.WithTimeout(ctx, 8*time.Second)
-					defer hcancel()
-					r.health = drv.Health(hctx)
+				case hch != nil:
+					r.health = m.awaitHealth(hch, s, drv)
+				default:
+					// "用户手动停过、但它其实在跑"：这时才起探针（罕见路径）。
+					r.health = m.awaitHealth(m.startHealthProbe(s, drv), s, drv)
 				}
 			}
 			ch <- r

@@ -280,7 +280,10 @@ export function renderInstalledApps(container, opts = {}) {
             title: (health.message || '') + '（' + (health.latency_ms || 0) + 'ms）',
           })
           : h('span.pill.danger', { text: '健康检查失败', title: health.message || '' }))
-        : null,
+        : (health.unconfirmed
+          // 预算内没答完：既不是健康、也不是故障，单独标一颗中性标签。
+          ? h('span.pill.warn', { text: '未确认（超时）', title: health.message || '' })
+          : null),
       s && s.driver_error ? h('span.pill.warn', { text: '驱动不可用', title: s.driver_error }) : null,
       // 装了但面板里没有服务记录（孤儿态）时 statusLine 已经如实说「面板里暂无记录」，
       // 这里不再补第二颗同义 pill —— 卡片本来就要短，重复说两遍只会更乱。
@@ -328,6 +331,14 @@ export function renderInstalledApps(container, opts = {}) {
     // 用户**手动停掉**的服务：说清"是你停的，不是坏了"，并给「▶ 启动」——
     // 绝不再显示"检查未通过 / 改检查地址"（那是在把一个正常状态说成故障）。
     const userStopped = stoppedByUser(e);
+    // 健康检查"未确认（超时）"：预算内没答完，既不是健康也不是故障 ——
+    // 卡片上单独说一句，绝不能走下面那条"健康检查失败"的红字（那是谎报故障）。
+    const unconfirmedNote = health.unconfirmed
+      ? [h('div', {
+        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
+        text: health.message || '健康检查未在预算内返回：结果未确认，稍后刷新再看',
+      })]
+      : [];
     const extra = userStopped
       ? [h('div', { style: { fontSize: '11.5px', color: 'var(--text-mute)' } }, [
         h('div', { text: '已停止（你手动停的）：面板不会对它做健康检查，也不会计入「需要处理」。' }),
@@ -364,7 +375,7 @@ export function renderInstalledApps(container, opts = {}) {
       subtitle,
       pills,
       text,
-      extra: [...extra, ...authNote, ...repairNote, ...noRecordNote],
+      extra: [...extra, ...authNote, ...unconfirmedNote, ...repairNote, ...noRecordNote],
       // ⚠️ actions 必须传：漏掉它整张卡就一颗按钮都没有（2026-09-18 真的漏过一次，别删这一行）。
       actions,
       dataset: { appKey: e.key, appName: name },
