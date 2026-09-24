@@ -69,6 +69,34 @@ function statusLabel(s) { return STATUS_LABEL[s] || s || '未知'; }
 
 function statusPillCls(s) { return 'pill' + (STATUS_PILL[s] ? ' ' + STATUS_PILL[s] : ''); }
 
+/**
+ * progressPercent 由结构化进度算百分比；总数还没统计出来时返回 null
+ * （null ⇒ 画"不确定进度"，绝不编一个假百分比）。
+ */
+function progressPercent(p) {
+  if (!p || !(Number(p.total) > 0)) return null;
+  const pct = Math.round((Number(p.done) || 0) / Number(p.total) * 100);
+  return Math.max(0, Math.min(100, pct));
+}
+
+/**
+ * progressNode 画一条进度条；pct 为 null 表示"不确定进度"（半边灰条）。
+ * 任务窗与文件管理器的就地进度条共用它，免得两处画得不一样。
+ */
+function progressNode(pct) {
+  const fill = h('div', {
+    style: {
+      height: '100%', borderRadius: '999px', background: 'var(--brand)',
+      transition: 'width .2s linear',
+      width: pct == null ? '100%' : pct + '%',
+      opacity: pct == null ? '.35' : '1',
+    },
+  });
+  return h('div', {
+    style: { height: '6px', borderRadius: '999px', background: 'var(--border)', overflow: 'hidden' },
+  }, [fill]);
+}
+
 /** 实时耗时（秒）。运行中的任务按 started_at 现算，结束的用 elapsed_ms。 */
 function elapsedSec(m) {
   if (!m) return 0;
@@ -183,6 +211,25 @@ function mergeInputState(id, payload) {
   if (payload.input_result) next.input_result = payload.input_result;
   STATE.metas.set(id, next);
   syncInput(next);
+  emit('meta', { id });
+}
+
+/**
+ * mergeProgress 处理 SSE 的 progress 事件（字节级结构化进度）。
+ *
+ * 只改 progress 一个字段，其余保持原样 —— 进度事件与 status/input 是独立通道，
+ * 顺序不保证，整体覆盖会互相踩掉。
+ *   data: {"progress": {…}}   有进度
+ *   data: {"progress": null}  进度被清空（任务结束/没有可量化的进度）
+ */
+function mergeProgress(id, p) {
+  if (!id) return;
+  const cur = STATE.metas.get(id);
+  if (!cur) return; // meta 还没到：等它到了自然带上 progress
+  const next = Object.assign({}, cur);
+  if (p) next.progress = p;
+  else delete next.progress;
+  STATE.metas.set(id, next);
   emit('meta', { id });
 }
 
@@ -317,6 +364,13 @@ function ensureStream(id) {
     let payload = null;
     try { payload = JSON.parse(e.data); } catch { return; }
     mergeInputState(id, payload);
+  });
+  // 结构化进度（字节级）。**结构以这条事件为准**，前端绝不去解析日志文本里的百分比
+  // （改一次文案就崩）。任务是"推"进度的，所以进度条不需要轮询。
+  es.addEventListener('progress', (e) => {
+    let payload = null;
+    try { payload = JSON.parse(e.data); } catch { return; }
+    mergeProgress(id, payload && payload.progress);
   });
   es.addEventListener('open', () => { r.state = 'live'; emit('stream', { id }); });
   es.onerror = () => {
@@ -555,6 +609,9 @@ function openTask(id) {
 
   const resultBox = h('div.tc-result');
 
+  // 结构化进度（字节级）：复制/移动/删除这类任务在这里画进度条。
+  const progressBox = h('div.tc-progress', { style: { display: 'none', marginBottom: '10px' } });
+
   // ---- 限时输入（如 MySQL root 口令）的挂载点 ----
   const inputBox = h('div.tc-input');
 
@@ -603,7 +660,7 @@ function openTask(id) {
       + '装完后到「数据库 → 账号与权限」里直接点一下就能改成你想要的口令。',
   });
 
-  const body = h('div', [head, errBox, inputBox, resultBox, trimHint, lnmpHint, logWrap, hint]);
+  const body = h('div', [head, progressBox, errBox, inputBox, resultBox, trimHint, lnmpHint, logWrap, hint]);
 
   // 只在「一键 LNMP」这个任务上显示口令提示（标题由后端给出，形如
   // 「一键 LNMP（nginx / PHP 8.2 / MySQL 8.4）」；有的快照只带 target）。
@@ -896,6 +953,22 @@ function openTask(id) {
     const count = meta.line_count != null ? meta.line_count : (STATE.lines.get(id) || []).length;
     metaLine.textContent = `耗时 ${duration(elapsedSec(meta))} · ${count} 行`;
 
+    // 结构化进度（有就画；没有就不占版面）。
+    const prog = meta.progress;
+    if (prog && (prog.message || prog.total > 0 || prog.files_total > 0)) {
+      progressBox.style.display = '';
+      clear(progressBox);
+      appendAll(progressBox, [
+        progressNode(progressPercent(prog)),
+        h('div', {
+          style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '5px' },
+          text: prog.message || '',
+        }),
+      ]);
+    } else {
+      progressBox.style.display = 'none';
+    }
+
     if (meta.error) {
       errBox.style.display = '';
       errBox.textContent = '失败原因：' + meta.error;
@@ -1099,7 +1172,7 @@ function idOf(res) {
  * 正常提交与"迟到但最终成功"的提交共用这一份（后者见 start 的超时分支）——
  * 同一个动作只有一条实现，不会出现"补开的那条路少做了一步"。
  */
-function adopt(id, res, { kind, target, title, onDone } = {}) {
+function adopt(id, res, { kind, target, title, onDone, openWindow = true } = {}) {
   const meta = Object.assign({
     id,
     kind: kind || 'install',
@@ -1114,7 +1187,9 @@ function adopt(id, res, { kind, target, title, onDone } = {}) {
   ensureStream(id);
   emit('meta', { id });
   refresh();          // 后台刷新列表；不 await，免得挡住进度窗
-  openTask(id);
+  // openWindow=false：文件管理器这类"就地有进度条"的入口不需要再弹一个窗口，
+  // 任务仍然照常登记/接流，随时能在任务中心里找到。
+  if (openWindow) openTask(id);
 
   // onDone：任务结束时回调一次，给调用方"刷列表/提示结果"用。
   // 用 onChange 订阅而不是轮询：状态变化本来就会广播（徽标就是靠它更新的）。
@@ -1131,7 +1206,7 @@ function adopt(id, res, { kind, target, title, onDone } = {}) {
 }
 
 /**
- * start({kind, target, title, start, onDone, timeoutMs}) 提交一个任务。
+ * start({kind, target, title, start, onDone, timeoutMs, openWindow}) 提交一个任务。
  *
  * start 是调用方给的 Promise（`() => api.installXxx()`）：后端立刻返回
  * `{ok:true, data:{task_id, title}}`，进度靠任务中心看。返回任务编号；
@@ -1141,7 +1216,7 @@ function adopt(id, res, { kind, target, title, onDone } = {}) {
  * timeoutMs 只给测试用（默认 SUBMIT_TIMEOUT_MS）：提交超过这个时间还没落定，
  * 就如实说"没收到确认"，绝不假装成功。
  */
-async function start({ kind, target, title, start: run, onDone, timeoutMs } = {}) {
+async function start({ kind, target, title, start: run, onDone, timeoutMs, openWindow = true } = {}) {
   if (typeof run !== 'function') { toast('内部错误：缺少任务执行函数', 'err'); return null; }
 
   // 同一个 target 已经在跑：后端也会拒绝（并发安装各自独立，仅禁止重复启动同一个），
@@ -1195,7 +1270,7 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs } = {}
       const lateId = idOf(late);
       if (!lateId) return;
       toast((title || '任务') + '：它其实已经创建（提交只是回得慢），正在打开进度窗', 'warn', 9000);
-      adopt(lateId, late, { kind, target, title, onDone });
+      adopt(lateId, late, { kind, target, title, onDone, openWindow });
     }).catch((e) => {
       toast((title ? title + '：' : '') + '提交最终失败：' + ((e && e.message) || String(e)), 'err', 12000);
     });
@@ -1210,7 +1285,7 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs } = {}
     return null;
   }
 
-  return adopt(id, res, { kind, target, title, onDone });
+  return adopt(id, res, { kind, target, title, onDone, openWindow });
 }
 
 // RETRYABLE_KINDS 与后端 tasks.retryableKind 保持一致（install/upgrade）。
@@ -1242,4 +1317,9 @@ function retryTask(m) {
 
 export const taskCenter = {
   button, init, openList, openTask, start, findByTarget, onChange, setSubmitTimeoutMs,
+  // 下面三个给"就地显示进度"的页面用（文件管理器）：读某任务的 meta、
+  // 由结构化进度算百分比、画进度条节点。**不新开订阅通道** —— 仍走 onChange。
+  meta: (id) => STATE.metas.get(id) || null,
+  progressPercent,
+  progressNode,
 };

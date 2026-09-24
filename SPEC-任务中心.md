@@ -189,7 +189,47 @@ POST /api/v1/tasks/{id}/input
    建议在「数据库」页提供一个**常驻**的连接设置入口（现在只有连接失败时才显示那个表单），
    一次性凭据区块只负责"装完立刻能看见"。
 
-## 四、非目标（本轮不做）
+## 四、结构化进度（字节级）
+
+> 为什么加：文件管理器的复制/移动/删除改成了长任务（用户报障"跨盘粘贴 80 个
+> 100MB 文件时没有任何进度提示"）。只靠日志行的话，前端要画进度条就得从文本里
+> 抠百分比 —— 改一次文案就崩。
+
+`TaskMeta` 新增字段（GET 列表/详情、SSE 的 `meta`/`status` 事件都会带）：
+
+```json
+{
+  "progress": {
+    "phase": "scan|copy|move|delete",
+    "done": 1288490188,       // 已完成字节数
+    "total": 10307921510,     // 总字节数（0 = 还没统计出来 ⇒ 画"不确定"进度）
+    "files_done": 12,         // 已完成条目数
+    "files_total": 80,
+    "message": "复制 12/80 文件 · 1.2 GB / 9.6 GB · 45% · 当前：xxx.mov"
+  }
+}
+```
+
+- 「统计大小」阶段用 `phase:"scan"`，`message` 形如「正在统计大小…（已扫 3 项 · 120 MB）」，
+  此时 `total` 还是 0（**不编百分比**）。
+- 有进度就一定有 `message`；没有可量化进度的任务不带 `progress` 字段。
+
+SSE 新增一个事件（其它事件不变）：
+
+```
+event: progress
+data: {"progress": {…}}     # 最新快照（整体覆盖，不是增量，没有 seq）
+data: {"progress": null}    # 进度被清空
+```
+
+后端上报走 `tasks.WithProgress(ctx, …)` / `tasks.ReportProgress(ctx, p)`
+（业务包不必拿到 `*Task`），任务侧是 `Task.SetProgress`。
+
+前端只用三个出口：`taskCenter.meta(id)`、`taskCenter.progressPercent(p)`、
+`taskCenter.progressNode(pct)` —— 任务窗与文件管理器的就地进度条共用同一份渲染，
+订阅仍然只有 `taskCenter.onChange` 这一条（不另开通道）。
+
+## 五、非目标（本轮不做）
 
 - 不做安装队列的串行化（并发安装各自独立；仅禁止**同一个 target** 重复启动）。
 - 不做任务持久化（见上）。

@@ -99,9 +99,14 @@ export function FilesView(content, ctx = {}) {
     text: '把文件或整个文件夹拖到这里上传（文件夹会保留目录结构）',
   });
 
+  // opBar 是复制/移动/删除的**就地进度条**：用户一般盯着文件管理器，
+  // 不该逼他跑去任务中心看进度（任务窗也可以看，数据是同一份）。
+  const opBar = h('div.files-opbar', { style: { display: 'none', padding: '9px 14px', borderBottom: '1px solid var(--border-soft)' } });
+
   const card = h('div.card', [
     h('div.card-head', [crumbs]),
     h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border-soft)', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [toolbar]),
+    opBar,
     dropZone,
     h('div.card-body.tight', [tableBox]),
     statusBar,
@@ -194,7 +199,116 @@ export function FilesView(content, ctx = {}) {
     renderCrumbs();
     renderToolbar();
     renderTable();
+    // 回到这个目录时，如果还有文件操作在后台跑，把就地进度条接回来。
+    resumeOpBar();
   }
+
+  // ---------- 复制 / 移动 / 删除：走任务中心 + 就地进度条 ----------
+  //
+  // 为什么不再是同步请求：用户报障"从一个盘向另一个盘剪切粘贴 80 个文件、
+  // 每个 100 多 MB，过程中没有任何进度提示" —— 同步请求会干等几分钟，
+  // 刷新页面还会掐断它。现在一次粘贴 = 一个任务（202 + task_id），
+  // 进度是后端的**结构化字节进度**（tasks 的 progress），关掉页面也照跑。
+  //
+  // 订阅只有一个来源：tasks.js 的 onChange（复用它的 SSE），这里不另写一套。
+  let opTaskId = '';
+
+  const OP_KINDS = /^file_(copy|move|delete)$/;
+
+  // 进度条内部节点**只建一次**，之后原地更新：
+  // 重建 DOM 会让节点的位置/尺寸每 200ms 变一次（点击「中断」时按钮正被替换，
+  // 浏览器/自动化都会判成"不稳"），原地更新还顺带没有闪烁。
+  const opFill = h('div', { style: { height: '100%', width: '0%', borderRadius: '999px', background: 'var(--brand)' } });
+  const opMsg = h('div', { style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '5px', wordBreak: 'break-word' }, text: '' });
+  const opCancel = h('button.btn.btn-sm.btn-danger', {
+    text: '中断',
+    title: '中断后：已完成的保持不变，没写完的半成品会删掉',
+    onclick: async () => {
+      if (!opTaskId) return;
+      try {
+        await api.taskCancel(opTaskId);
+        toast('已请求中断…', 'warn', 5000);
+      } catch (e) { toast('中断失败：' + ((e && e.message) || e), 'err', 10000); }
+    },
+  });
+  appendAll(opBar, h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } }, [
+    h('div', { style: { flex: '1', minWidth: '0' } }, [
+      h('div', { style: { height: '6px', borderRadius: '999px', background: 'var(--border)', overflow: 'hidden' } }, [opFill]),
+      opMsg,
+    ]),
+    opCancel,
+  ]));
+
+  function renderOpBar() {
+    const meta = opTaskId ? taskCenter.meta(opTaskId) : null;
+    if (!meta || String(meta.status || 'running') !== 'running') {
+      opBar.style.display = 'none';
+      return;
+    }
+    const p = meta.progress || null;
+    const pct = taskCenter.progressPercent(p);
+    opFill.style.width = pct == null ? '100%' : pct + '%';
+    opFill.style.opacity = pct == null ? '.35' : '1';
+    opMsg.textContent = (p && p.message) || meta.title || '正在处理…';
+    opBar.style.display = '';
+  }
+
+  // resumeOpBar 在进入/回到这个目录时把仍在跑的文件操作进度条接回来
+  // （切走再切回来不该"看不见进度"，任务本身一直在后台跑）。
+  function resumeOpBar() {
+    if (opTaskId && taskCenter.meta(opTaskId)) return;
+    const t = taskCenter.findByTarget(cwd);
+    if (t && OP_KINDS.test(String(t.kind || ''))) {
+      opTaskId = t.id;
+      renderOpBar();
+    }
+  }
+
+  // startFileOp 是复制/移动/删除的唯一入口：走任务中心、就地显示进度、如实收尾。
+  async function startFileOp({ kind, title, run, target, onSettled }) {
+    const id = await taskCenter.start({
+      kind, title, target: target || cwd,
+      start: run,
+      // 就地有进度条了，不再自动弹任务窗；任务照常登记，任务中心随时能查。
+      openWindow: false,
+      onDone: (task) => {
+        opTaskId = '';
+        renderOpBar();
+        load(cwd);
+        if (onSettled) { try { onSettled(task); } catch { /* 收尾失败不影响结果展示 */ } }
+        showFileOpResult(task);
+      },
+    });
+    if (id) { opTaskId = id; renderOpBar(); }
+    return id;
+  }
+
+  // showFileOpResult 如实收尾：成功/跳过/失败逐条说清，失败项列出来。
+  function showFileOpResult(task) {
+    if (!task) return;
+    const canceled = String(task.status || '') === 'canceled';
+    const r = task.result || {};
+    const msg = r.msg || (canceled ? '已中断' : '已完成');
+    toast(msg, (canceled || Number(r.failed) > 0) ? 'warn' : 'ok', (canceled || Number(r.failed) > 0) ? 15000 : 7000);
+    const bad = (r.items || []).filter((it) => it && it.error);
+    if (!bad.length) return;
+    modal({
+      title: canceled ? '已中断：未完成的项' : '失败明细',
+      body: h('div', [
+        h('p', { text: `成功 ${r.done || 0} 项，失败 ${bad.length} 项`
+          + (r.pending ? `，未处理 ${r.pending} 项` : '') + '。' }),
+        h('div.hint', { text: '失败的文件没有被改动；跨卷移动中断时源文件一定保留。' }),
+        h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8', maxHeight: '260px', overflow: 'auto' } },
+          bad.slice(0, 200).map((it) => h('li', { text: (it.name || it.from) + '：' + it.error }))),
+      ]),
+    });
+  }
+
+  const unsubOpBar = taskCenter.onChange((kind, payload) => {
+    if (kind === 'lines') return;
+    if (payload && payload.id && opTaskId && payload.id !== opTaskId) return;
+    renderOpBar();
+  });
 
   // renderOpenError 把后端的错误按行显示出来。
   //
@@ -1086,10 +1200,11 @@ export function FilesView(content, ctx = {}) {
           hint: '必须是允许访问的目录内的绝对路径',
         });
         if (!dest) return;
-        try {
-          await api.fileCopy(e.path, dest);
-          toast('已复制', 'ok'); load(cwd);
-        } catch (err) { toast(err.message, 'err'); }
+        // 复制是长任务（可能几 GB）；同目录内复制也要有进度可见。
+        await startFileOp({
+          kind: 'file_copy', title: `复制到 ${basename(dest)}`,
+          run: () => api.fileCopy([{ from: e.path, to: dest }]),
+        });
       },
     });
     const move = h('button.btn.btn-block', {
@@ -1338,68 +1453,53 @@ export function FilesView(content, ctx = {}) {
       strategy = choice;
     }
 
+    // 目标路径在这里定下来（一次请求带上全部条目），冲突策略同时交给后端复核：
+    // rename 时前端先给一个不冲突的名字；skip/overwrite 由后端按策略处理。
     const taken = new Set(existing);
-    const okList = [];
-    const renamed = [];
-    const failed = [];
-    let skipped = 0;
-
+    const pairs = [];
+    const skippedNames = [];
     for (const src of items) {
       const name = basename(src);
       let dest = `${cwd}/${name}`;
-      // 剪切后粘贴回原目录是无操作；复制到原目录则是"制造一份副本"（走下面的改名分支）。
-      if (isCut && src === dest) { skipped++; continue; }
+      // 剪切后粘贴回原目录是无操作；复制到原目录则是"制造一份副本"（走改名分支）。
+      if (isCut && src === dest) { skippedNames.push(`${name}（已在当前目录）`); continue; }
       if (taken.has(name) || src === dest) {
-        if (strategy === 'skip') { skipped++; continue; }
+        if (strategy === 'skip') { skippedNames.push(`${name}（同名已存在）`); continue; }
         if (strategy === 'rename') {
           dest = uniqueTarget(cwd, name, taken);
-          renamed.push(`${name} → ${basename(dest)}`);
         } else if (strategy === 'overwrite' && src === dest) {
           // 不能"先删掉自己再复制自己"：那会把唯一一份数据删没。
-          skipped++; continue;
+          skippedNames.push(`${name}（源与目标相同）`); continue;
         }
       }
-      try {
-        if (isCut) {
-          if (strategy === 'overwrite' && existing.has(name) && entrySensitive(dest)) {
-            if (!await confirmSensitive([{ path: dest, sensitive: true }], `覆盖「${name}」`)) { skipped++; continue; }
-          }
-          const r = await api.fileMove(src, dest, strategy === 'overwrite' ? 'overwrite' : 'rename');
-          if (r && r.skipped) { skipped++; continue; }
-          okList.push({ name, dest: (r && r.to) || dest, way: (r && r.way) || '' });
-        } else {
-          if (strategy === 'overwrite' && existing.has(name)) {
-            if (!await confirmSensitive([{ path: dest, sensitive: entrySensitive(dest) }],
-              `覆盖「${name}」`)) { skipped++; continue; }
-            await api.fileDelete([dest], true);
-          }
-          await api.fileCopy(src, dest);
-          okList.push({ name, dest, way: 'copy' });
+      if (strategy === 'overwrite' && existing.has(name) && entrySensitive(dest)) {
+        if (!await confirmSensitive([{ path: dest, sensitive: true }], `覆盖「${name}」`)) {
+          skippedNames.push(`${name}（未确认覆盖）`); continue;
         }
-      } catch (e) { failed.push(`${name}: ${e.message}`); }
+      }
+      pairs.push({ from: src, to: dest });
       taken.add(basename(dest));
     }
-
-    if (isCut && !failed.length) clipboard = null; // 全部成功才清空剪贴板
-    const ways = new Set(okList.map((o) => o.way));
-    let msg = `${isCut ? '移动' : '复制'}完成：成功 ${okList.length} 项`;
-    if (renamed.length) msg += `，自动改名 ${renamed.length} 项`;
-    if (skipped) msg += `，跳过 ${skipped} 项`;
-    if (failed.length) msg += `，失败 ${failed.length} 项`;
-    if (isCut && ways.has('copy+delete')) msg += '（含跨卷：复制后删除源）';
-    toast(msg, failed.length ? 'warn' : 'ok', failed.length ? 15000 : 6000);
-    if (renamed.length) toast('自动改名：' + renamed.slice(0, 5).join('，') + (renamed.length > 5 ? ' …' : ''), 'info', 8000);
-    if (failed.length) {
-      modal({
-        title: '粘贴失败明细',
-        body: h('div', [
-          h('p', { text: `成功 ${okList.length} 项，失败 ${failed.length} 项。失败的文件没有被改动。` }),
-          h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8' } }, failed.map((f) => h('li', { text: f }))),
-        ]),
-      });
+    if (!pairs.length) {
+      toast(skippedNames.length ? `没有可处理的内容（跳过 ${skippedNames.length} 项）` : '没有可粘贴的内容', 'warn', 9000);
+      return;
     }
-    renderToolbar();
-    load(cwd);
+
+    const verb = isCut ? '移动' : '复制';
+    await startFileOp({
+      kind: isCut ? 'file_move' : 'file_copy',
+      title: `${verb} ${pairs.length} 项到 ${basename(cwd)}`,
+      run: () => (isCut ? api.fileMove(pairs, strategy) : api.fileCopy(pairs, strategy)),
+      onSettled: (task) => {
+        // 剪切**全部成功**才清空剪贴板：中断/失败时保留，用户能重试。
+        if (isCut && String(task.status || '') === 'succeeded') clipboard = null;
+        if (skippedNames.length) {
+          toast(`另有 ${skippedNames.length} 项按你的选择跳过：` + skippedNames.slice(0, 3).join('，')
+            + (skippedNames.length > 3 ? ' …' : ''), 'info', 9000);
+        }
+        renderToolbar();
+      },
+    });
   }
 
   // entrySensitive 判断某个路径是否落在敏感根里（用于粘贴覆盖前的二次确认）。
@@ -1466,7 +1566,7 @@ export function FilesView(content, ctx = {}) {
     });
   }
 
-  // ---------- 删除 ----------
+  // ---------- 删除（走任务中心：大目录/海量小文件的删除也是分钟级动作） ----------
   async function deleteOne(e) {
     if (!await confirmSensitive([e], `删除「${e.name}」`)) return;
     if (e.is_dir) {
@@ -1474,17 +1574,17 @@ export function FilesView(content, ctx = {}) {
         `确认删除目录「${e.name}」及其中的全部内容？\n\n此操作不可撤销。`,
         { title: '删除目录', danger: true, okText: '递归删除' });
       if (!recursive) return;
-      try {
-        await api.fileDelete([e.path], true);
-        toast('已删除', 'ok'); load(cwd);
-      } catch (err) { toast(err.message, 'err', 10000); }
+      await startFileOp({
+        kind: 'file_delete', title: `删除 ${e.name}`,
+        run: () => api.fileDelete([e.path], true),
+      });
       return;
     }
     if (!await confirmBox(`确认删除文件「${e.name}」？`, { title: '删除文件', danger: true, okText: '删除' })) return;
-    try {
-      await api.fileDelete([e.path], false);
-      toast('已删除', 'ok'); load(cwd);
-    } catch (err) { toast(err.message, 'err', 10000); }
+    await startFileOp({
+      kind: 'file_delete', title: `删除 ${e.name}`,
+      run: () => api.fileDelete([e.path], false),
+    });
   }
 
   // deleteSelectionOrOne 供右键菜单调用：多选时批量删，单选时走单项删除。
@@ -1501,12 +1601,10 @@ export function FilesView(content, ctx = {}) {
     const hasDir = entries.some((e) => e.is_dir);
     const msg = `将删除 ${paths.length} 项${hasDir ? '（包含目录，其中的内容会一并删除）' : ''}。\n\n此操作不可撤销。`;
     if (!await confirmBox(msg, { title: '批量删除', danger: true, okText: '确认删除' })) return;
-    try {
-      const r = await api.fileDelete(paths, true);
-      if (r.error) toast(r.msg, 'warn', 12000);
-      else toast(r.msg, 'ok');
-      load(cwd);
-    } catch (e) { toast(e.message, 'err', 10000); }
+    await startFileOp({
+      kind: 'file_delete', title: `删除 ${paths.length} 项`,
+      run: () => api.fileDelete(paths, true),
+    });
   }
 
   // imageCompressModal 是「图片压缩」弹窗：引擎状态 + 选项 + 走任务中心。
@@ -2455,6 +2553,7 @@ export function FilesView(content, ctx = {}) {
   document.addEventListener('mousedown', onDocPointer);
   window.addEventListener('scroll', onDocScroll, true);
   registerCleanup(() => {
+    unsubOpBar();
     document.removeEventListener('keydown', onKeyDown);
     document.removeEventListener('mousedown', onDocPointer);
     window.removeEventListener('scroll', onDocScroll, true);

@@ -106,6 +106,23 @@ type pendingInput struct {
 	ch  chan string
 }
 
+// Progress 是任务的**结构化进度**（字节级 + 文件级）。
+//
+// 为什么不只用日志行：任务中心与文件管理器都要画进度条，而从日志文本里抠
+// 百分比是脆的（改一次文案就崩）。这里给的是数字，前端自己算百分比。
+type Progress struct {
+	// Phase 是当前阶段：scan（统计大小）/ copy / move / delete 等。
+	Phase string `json:"phase,omitempty"`
+	// Done/Total 是字节数。Total==0 表示还没统计出来 ⇒ 前端画"不确定"进度。
+	Done  int64 `json:"done"`
+	Total int64 `json:"total"`
+	// FilesDone/FilesTotal 是顶层条目数（文件/目录个数）。
+	FilesDone  int `json:"files_done"`
+	FilesTotal int `json:"files_total"`
+	// Message 是一句人话（"正在统计大小…" / "12/80 文件 · 1.2 GB / 9.6 GB · 45%"）。
+	Message string `json:"message,omitempty"`
+}
+
 // Meta 是任务的元信息（列表页与进度窗标题都用它）。
 type Meta struct {
 	ID        string    `json:"id"`
@@ -121,6 +138,8 @@ type Meta struct {
 	LineCount  int64     `json:"line_count"`
 	// Last 是最后一行日志，列表里直接显示，省得为"看一眼在干什么"再拉详情。
 	Last string `json:"last"`
+	// Progress 是结构化进度（nil = 这个任务没有可量化的进度）。
+	Progress *Progress `json:"progress,omitempty"`
 	// Error 是失败原因（status=failed 时有值）。
 	Error string `json:"error"`
 	// InputRequired 非 nil 表示任务此刻正在等用户输入（见 InputRequest）。
@@ -173,6 +192,8 @@ type Task struct {
 	input *pendingInput
 	// inputResult 是最近一次等待的结局（submitted/timeout/canceled）。
 	inputResult string
+	// progress 是结构化进度（nil = 没有可量化的进度）。
+	progress *Progress
 	// stateSubs 是"任务状态变化"的通知通道（开始等输入 / 输入已落定 / 任务结束）。
 	//
 	// 为什么不能只靠日志行通知：输入请求是有结构的（key/倒计时/截止时间），
@@ -410,6 +431,55 @@ func (t *Task) setInputResult(v string) {
 	t.mu.Unlock()
 }
 
+// SetProgress 上报结构化进度（线程安全；传 nil 表示清空）。
+//
+// 每次上报都会唤醒状态订阅者 ⇒ SSE 立刻把新 Meta 推给前端，
+// 所以进度条是"推"出来的，前端不需要轮询。
+// 调用方负责限流（文件复制会按块回调，逐块都推会把 SSE 打爆）。
+func (t *Task) SetProgress(p *Progress) {
+	t.mu.Lock()
+	if p == nil {
+		t.progress = nil
+	} else {
+		cp := *p
+		t.progress = &cp
+	}
+	t.notifyStateLocked()
+	t.mu.Unlock()
+}
+
+// Progress 返回当前进度快照（没有则 nil）。
+func (t *Task) Progress() *Progress {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.progress == nil {
+		return nil
+	}
+	cp := *t.progress
+	return &cp
+}
+
+// ProgressSetter 是投喂结构化进度的函数（可从 ctx 取，见 WithProgress）。
+// 与 Task.SetProgress 同形，所以 launchTask 可以直接把方法值塞进 ctx。
+type ProgressSetter func(p *Progress)
+
+type progressCtxKey struct{}
+
+// WithProgress 把"上报进度"的函数放进 ctx。
+//
+// 与 services.WithProgress 同一套思路：业务代码通过 ctx 拿到能力，
+// 不必依赖 *Task 的内部结构（视频/文件这些业务包不该知道任务中心长什么样）。
+func WithProgress(ctx context.Context, fn ProgressSetter) context.Context {
+	return context.WithValue(ctx, progressCtxKey{}, fn)
+}
+
+// ReportProgress 从 ctx 取上报函数并调用；没有就什么都不做（nil 安全）。
+func ReportProgress(ctx context.Context, p Progress) {
+	if fn, ok := ctx.Value(progressCtxKey{}).(ProgressSetter); ok && fn != nil {
+		fn(&p)
+	}
+}
+
 // SubmitInput 投递一次用户输入。
 //
 // 只在"任务正在等这个 key"时接受，否则返回可读错误 ——
@@ -478,6 +548,10 @@ func (t *Task) metaLocked() Meta {
 		m.InputRequired = &req
 	}
 	m.InputResult = t.inputResult
+	if t.progress != nil {
+		cp := *t.progress
+		m.Progress = &cp
+	}
 	if n := len(t.lines); n > 0 {
 		m.Last = t.lines[n-1].Text
 	}

@@ -489,13 +489,18 @@ export const api = {
   fileMkdir: (path) => request('POST', `${API_BASE}/files/mkdir`, { path }),
   fileTouch: (path) => request('POST', `${API_BASE}/files/touch`, { path }),
   fileRename: (from, to) => request('POST', `${API_BASE}/files/rename`, { from, to }),
-  fileCopy: (from, to) => request('POST', `${API_BASE}/files/copy`, { from, to }),
+  // 复制/移动/删除都是**长任务**（202 + task_id）：几 GB 跨盘复制不能靠同步请求
+  // 干等，也不能让刷新页面掐断它。items = [{from, to}]，一次粘贴 = 一个任务，
+  // 进度由后端按字节上报（tasks 的 progress 字段，前端画进度条）。
+  fileCopy: (items, onConflict = 'rename') =>
+    request('POST', `${API_BASE}/files/copy`, { items, on_conflict: onConflict }),
   // 剪切粘贴：后端同卷走 rename，跨卷回退 copy+delete 并如实返回 way。
   // on_conflict：目标已存在时 rename（默认，自动改名）/ overwrite / skip。
-  fileMove: (from, to, onConflict = 'rename') =>
-    request('POST', `${API_BASE}/files/move`, { from, to, on_conflict: onConflict }),
+  fileMove: (items, onConflict = 'rename') =>
+    request('POST', `${API_BASE}/files/move`, { items, on_conflict: onConflict }),
   fileChmod: (path, mode, recursive = false) =>
     request('POST', `${API_BASE}/files/chmod`, { path, mode, recursive }),
+  // 删除同样是长任务（海量小文件/大目录的删除也是分钟级动作）。
   fileDelete: (paths, recursive) => request('POST', `${API_BASE}/files/delete`, { paths, recursive }),
   fileCompress: (dir, names, format, output) =>
     request('POST', `${API_BASE}/files/compress`, { dir, names, format, output }),

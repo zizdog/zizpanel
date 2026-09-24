@@ -16,6 +16,7 @@
 package files
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +25,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 )
 
 // Manager 管理允许访问的根目录集合。
@@ -518,65 +518,17 @@ func (m *Manager) Rename(from, to string) error {
 	return nil
 }
 
-// Copy 复制文件或目录。
+// Copy 复制文件或目录（单条目、无进度；批量与带进度的实现见 ops.go 的 CopyItems）。
+//
+// 目标已存在时报错，**绝不静默覆盖**（覆盖语义由 CopyItems 的 on_conflict 显式选择）。
 func (m *Manager) Copy(from, to string) error {
-	src, err := m.Resolve(from, false)
-	if err != nil {
-		return err
-	}
-	dst, err := m.Resolve(to, true)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(dst); err == nil {
-		return fmt.Errorf("目标已存在: %s", to)
-	}
-	if strings.HasPrefix(dst, src+string(os.PathSeparator)) {
-		return fmt.Errorf("不能把目录复制到它自己的子目录中")
-	}
-	return copyPath(src, dst)
+	_, err := m.copyOne(context.Background(), from, to, "", nil)
+	return err
 }
 
+// copyPath 复制一棵树（老的同步入口）；带 ctx 与字节进度的实现在 ops.go。
 func copyPath(src, dst string) error {
-	st, err := os.Lstat(src)
-	if err != nil {
-		return err
-	}
-	if st.Mode()&os.ModeSymlink != 0 {
-		// 复制软链接本身，而不是它指向的内容（避免意外复制到根目录之外）
-		target, err := os.Readlink(src)
-		if err != nil {
-			return err
-		}
-		return os.Symlink(target, dst)
-	}
-	if st.IsDir() {
-		if err := os.MkdirAll(dst, st.Mode().Perm()); err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(src)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if err := copyPath(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, st.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	_, err = io.Copy(out, in)
-	return err
+	return copyTreeProgress(context.Background(), src, dst, nil)
 }
 
 // MoveStrategy 描述一次移动**实际**采用的方式，前端据此如实告诉用户
@@ -632,66 +584,7 @@ var renameFunc = os.Rename
 // 失败时的清理：跨卷复制阶段失败会把可能写了一半的目标删掉，避免留下一个
 // "看起来成功、其实残缺"的副本；删除源失败时明确报出"已复制但源没删掉"。
 func (m *Manager) Move(from, to, onConflict string) (*MoveResult, error) {
-	src, err := m.Resolve(from, false)
-	if err != nil {
-		return nil, err
-	}
-	dst, err := m.Resolve(to, true)
-	if err != nil {
-		return nil, err
-	}
-	if src == dst {
-		return &MoveResult{From: src, To: dst, Way: MoveStrategyNone}, nil
-	}
-	// 不允许把目录移进它自己的子目录（会失败并可能损坏数据）
-	if strings.HasPrefix(dst, src+string(os.PathSeparator)) {
-		return nil, fmt.Errorf("不能把目录移动到它自己的子目录中")
-	}
-
-	res := &MoveResult{From: src, To: dst}
-	if _, statErr := os.Lstat(dst); statErr == nil {
-		switch strings.ToLower(strings.TrimSpace(onConflict)) {
-		case MoveConflictSkip:
-			res.Skipped = true
-			res.Way = MoveStrategyNone
-			return res, nil
-		case MoveConflictOverwrite:
-			// 覆盖 = 删掉目标原有内容。绝不能把白名单根目录本身删掉。
-			for _, root := range m.roots {
-				if dst == root {
-					return nil, fmt.Errorf("不允许覆盖根目录: %s", root)
-				}
-			}
-			if err := os.RemoveAll(dst); err != nil {
-				return nil, fmt.Errorf("覆盖目标失败: %w", err)
-			}
-			res.Overwritten = true
-		default:
-			res.To = uniquePath(dst)
-			dst = res.To
-		}
-	}
-
-	if err := renameFunc(src, dst); err == nil {
-		res.Way = MoveStrategyRename
-		m.chownRealUser(dst)
-		return res, nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return nil, fmt.Errorf("移动失败: %w", err)
-	}
-
-	// 跨卷：Rename 无法跨设备，回退为复制后删除。
-	if err := copyPath(src, dst); err != nil {
-		_ = os.RemoveAll(dst) // 清掉写了一半的目标，别留下残缺副本
-		return nil, fmt.Errorf("跨卷移动失败（复制阶段）: %w", err)
-	}
-	if err := os.RemoveAll(src); err != nil {
-		return nil, fmt.Errorf("跨卷移动：内容已复制到 %s，但删除源 %s 失败（源仍在，请手动清理）: %w",
-			dst, src, err)
-	}
-	res.Way = MoveStrategyCopyDelete
-	m.chownRealUser(dst)
-	return res, nil
+	return m.moveOne(context.Background(), from, to, onConflict, nil)
 }
 
 // Chmod 修改权限。

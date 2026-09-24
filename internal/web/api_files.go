@@ -746,74 +746,277 @@ func (s *Server) handleFileRename(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"msg": "已重命名"})
 }
 
-func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
-	var req fileRenameReq
-	if err := decode(r, &req); err != nil {
-		failFileErr(w, err)
-		return
-	}
-	mgr := s.fileManager()
-	if err := mgr.Copy(req.From, req.To); err != nil {
-		failFileErr(w, err, req.From, req.To)
-		return
-	}
-	s.audit(r, "file_copy", req.From, "复制到 "+req.To, true, "")
-	ok(w, map[string]any{"msg": "已复制"})
-}
-
-// handleFileMove 移动（剪切粘贴）。
+// ============================================================================
+//  复制 / 移动 / 删除：走任务中心的长任务
 //
-// 与 copy 的关键区别：非同卷时 os.Rename 会失败（EXDEV），Manager.Move 会回退到
-// "复制 + 删除源"，并且**如实**在响应里报告用的是哪种方式（前端据此提示用户）。
-// on_conflict 处理"目标已存在"：rename（默认，自动改名保留两者）/ overwrite /
-// skip。绝不静默覆盖。
-func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
-	var req fileMoveReq
-	if err := decode(r, &req); err != nil {
-		failFileErr(w, err)
-		return
-	}
-	mgr := s.fileManager()
-	res, err := mgr.Move(req.From, req.To, req.OnConflict)
-	if err != nil {
-		failFileErr(w, err, req.From, req.To)
-		return
-	}
-	s.audit(r, "file_move", req.From, fmt.Sprintf("移动到 %s（%s）", res.To, res.Way), true, "")
-	ok(w, map[string]any{
-		"from":        res.From,
-		"to":          res.To,
-		"way":         string(res.Way),
-		"skipped":     res.Skipped,
-		"overwritten": res.Overwritten,
-		"msg":         moveMessage(res),
-	})
-}
+//  为什么必须改（用户报障原文）："从一个盘向另一个盘剪切粘贴 80 个文件、
+//  每个 100 多 MB，过程中没有任何进度提示"。老实现是**同步请求** ——
+//  请求里直接干完才返回，几 GB 跨盘复制会让浏览器干等几分钟，
+//  中途刷新还会掐断请求。
+//
+//  现在：只读预检（越界当场 403）→ 202 + task_id → 任务中心后台跑、可中断。
+//  重命名 / 新建 / 改权限这类毫秒级操作**保持同步**（不该为进度把它们也变成任务）。
+// ============================================================================
 
-type fileMoveReq struct {
+// fileOpPair 是批量复制/移动里的一条（from → to）。
+type fileOpPair struct {
 	From string `json:"from"`
 	To   string `json:"to"`
-	// OnConflict 是目标已存在时的处理方式：rename（默认）/ overwrite / skip
-	OnConflict string `json:"on_conflict"`
 }
 
-// moveMessage 把"实际用了哪种方式"翻译成人话。跨卷复制后删除与同卷重命名
-// 对用户的意义不同（前者慢、且中途失败可能留下副本），不能都写成"已移动"。
-func moveMessage(res *files.MoveResult) string {
-	if res.Skipped {
-		return "已跳过（目标已存在）"
-	}
-	switch res.Way {
-	case files.MoveStrategyCopyDelete:
-		return "已移动（跨卷：先复制再删除源文件）"
-	case files.MoveStrategyNone:
-		return "源与目标相同，未做改动"
-	default:
-		if res.Overwritten {
-			return "已移动并覆盖了目标处的原有内容"
+// fileOpReq 是复制/移动的请求体，兼容两种形态：
+//
+//	单条目：{"from": "...", "to": "..."}
+//	批量（粘贴 80 个文件）：{"items": [{"from","to"}...], "on_conflict": "rename"}
+//
+// 批量的意义：一次粘贴 = **一个任务**（80 个文件开 80 个任务会把任务中心刷爆，
+// 也没法给出"12/80 文件 · 1.2 GB / 9.6 GB"这种整体进度）。
+type fileOpReq struct {
+	From       string       `json:"from"`
+	To         string       `json:"to"`
+	Items      []fileOpPair `json:"items"`
+	OnConflict string       `json:"on_conflict"`
+}
+
+// pairs 把两种形态归一成文件层要的 FilePair 列表。
+func (r fileOpReq) pairs() []files.FilePair {
+	if len(r.Items) > 0 {
+		out := make([]files.FilePair, 0, len(r.Items))
+		for _, it := range r.Items {
+			out = append(out, files.FilePair{From: it.From, To: it.To})
 		}
-		return "已移动（同卷重命名）"
+		return out
 	}
+	if strings.TrimSpace(r.From) != "" && strings.TrimSpace(r.To) != "" {
+		return []files.FilePair{{From: r.From, To: r.To}}
+	}
+	return nil
+}
+
+// checkFileOpContainment 只读预检：每个路径都必须落在允许的根内。
+//
+// 刻意**不**检查源是否存在：80 个文件里正好有一个刚被删掉时，整单 400
+// 会让另外 79 个白做；那种情况应该由任务逐条如实报失败。
+// 越界（ErrForbidden）是攻击特征/配置错误，必须当场 403 拒绝。
+func (s *Server) checkFileOpContainment(pairs []files.FilePair) error {
+	if len(pairs) == 0 {
+		return fmt.Errorf("请选择要操作的内容")
+	}
+	mgr := s.fileManager()
+	for _, p := range pairs {
+		// 源必须**真实存在**：这样外接卷被 macOS 隐私保护拒绝时（stat 返回 EPERM）
+		// 能当场 403 + 完整指引，而不是开一个注定失败的任务。
+		if _, err := mgr.Resolve(p.From, false); err != nil {
+			return err
+		}
+		// 目标是"将要创建"的路径，允许不存在（但白名单照样生效）。
+		if strings.TrimSpace(p.To) != "" {
+			if _, err := mgr.Resolve(p.To, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// fileOpTarget 是任务的 target（同一目标只允许一个任务在跑）。
+// 复制/移动到同一目录、或同一目录里的删除，都会被它挡住重复启动。
+func fileOpTarget(pairs []files.FilePair) string {
+	if len(pairs) == 0 {
+		return ""
+	}
+	if pairs[0].To != "" {
+		return filepath.Dir(pairs[0].To)
+	}
+	return filepath.Dir(pairs[0].From)
+}
+
+// fileOpProgressAdapter 把文件层的字节进度转成任务中心的结构化进度 + 有限条日志。
+//
+// 限流是必须的：复制按 1MB 块回调，逐块推结构化进度会把 SSE 打爆；
+// 日志最少 1 秒一行（或每完成一个条目一行），任务日志有 4000 行上限。
+type fileOpProgressAdapter struct {
+	log      tasks.LogFunc
+	lastPush time.Time
+	lastLog  time.Time
+	lastDone int
+	last     files.OpProgress
+	hasLast  bool
+}
+
+// milestone 判断这次是不是"越过了一个节点"（阶段变化 / 全部完成）——
+// 节点必须立刻推给前端，否则进度条会停在 99%。
+func (p *fileOpProgressAdapter) milestone(op files.OpProgress) bool {
+	if !p.hasLast || op.Phase != p.last.Phase {
+		return true
+	}
+	return op.FilesTotal > 0 && op.FilesDone >= op.FilesTotal
+}
+
+func (p *fileOpProgressAdapter) report(ctx context.Context, op files.OpProgress) {
+	now := time.Now()
+	msg := fileOpMessage(op)
+	mile := p.milestone(op)
+	// 结构化进度：最多每 200ms 推一次。**不能**按"每个文件都推" ——
+	// 粘贴几万个小文件时会把 SSE 打爆（限流是这一层的责任）。
+	if mile || now.Sub(p.lastPush) >= 200*time.Millisecond {
+		tasks.ReportProgress(ctx, tasks.Progress{
+			Phase: string(op.Phase), Done: op.DoneBytes, Total: op.TotalBytes,
+			FilesDone: op.FilesDone, FilesTotal: op.FilesTotal, Message: msg,
+		})
+		p.lastPush = now
+	}
+	// 日志：节点 + 最多 2 秒一行（任务日志有 4000 行上限，绝不刷屏）。
+	if mile || now.Sub(p.lastLog) >= 2*time.Second {
+		if p.log != nil {
+			p.log(tasks.LevelOut, msg)
+		}
+		p.lastLog = now
+	}
+	p.last, p.hasLast = op, true
+}
+
+// lastProgress 返回最近一次上报的状态（收尾时把进度钉在终点用）。
+func (p *fileOpProgressAdapter) lastProgress() files.OpProgress { return p.last }
+
+// fileOpMessage 是一句人话进度（日志与前端进度条都用它）。
+func fileOpMessage(p files.OpProgress) string {
+	switch p.Phase {
+	case files.OpPhaseScan:
+		// 统计阶段总量还没出来：报"已扫多少项/多少字节"，不编百分比。
+		return fmt.Sprintf("正在统计大小…（已扫 %d 项 · %s）", p.Scanned, humanBytes(p.TotalBytes))
+	}
+	pct := 0
+	if p.TotalBytes > 0 {
+		pct = int(float64(p.DoneBytes) / float64(p.TotalBytes) * 100)
+		if pct > 100 {
+			pct = 100
+		}
+	}
+	verb := "处理"
+	switch p.Phase {
+	case files.OpPhaseCopy:
+		verb = "复制"
+	case files.OpPhaseMove:
+		verb = "移动"
+	case files.OpPhaseDelete:
+		verb = "删除"
+	}
+	msg := fmt.Sprintf("%s %d/%d 文件 · %s / %s · %d%%",
+		verb, p.FilesDone, p.FilesTotal, humanBytes(p.DoneBytes), humanBytes(p.TotalBytes), pct)
+	if p.Current != "" {
+		msg += " · 当前：" + p.Current
+	}
+	return msg
+}
+
+// runFileOpTask 是复制/移动/删除三个任务共用的执行体：
+// 进度上报、日志、以及"如实收尾"的汇总都只有这一份实现。
+func (s *Server) runFileOpTask(ctx context.Context, log tasks.LogFunc, phase files.OpPhase,
+	run func(context.Context, files.OpProgressFunc) (*files.BatchResult, error)) (any, error) {
+
+	adapter := &fileOpProgressAdapter{log: log}
+	res, err := run(ctx, func(op files.OpProgress) { adapter.report(ctx, op) })
+	if res == nil {
+		return nil, err
+	}
+	// 收尾：用**最后一次真实上报的计数**（成功时正好到 100%；失败/中断时停在
+	// 真实完成的位置，绝不假装跑满），只把 message 换成汇总。
+	last := adapter.lastProgress()
+	tasks.ReportProgress(ctx, tasks.Progress{
+		Phase: string(phase), Done: last.DoneBytes, Total: last.TotalBytes,
+		FilesDone: last.FilesDone, FilesTotal: last.FilesTotal,
+		Message: res.Msg,
+	})
+	// 失败逐条如实报（任务日志也要能看到是哪一项、为什么）。
+	for i := range res.Items {
+		if res.Items[i].Error != "" {
+			log(tasks.LevelErr, "✗ "+res.Items[i].Name+"："+res.Items[i].Error)
+		}
+	}
+	// 外接卷被 macOS 隐私保护拒绝时，日志里要给**可照做的指引**（不是一行 errno）。
+	for _, e := range res.SrcErrors() {
+		if tccPath, isTCC := volumeTCCPath(e); isTCC {
+			log(tasks.LevelErr, volumeTCCGuide(tccPath))
+			break
+		}
+	}
+	if err != nil {
+		log(tasks.LevelWarn, res.Msg)
+		return res, err
+	}
+	log(tasks.LevelOK, res.Msg)
+	return res, nil
+}
+
+// fileOpTitle 给任务起一个一眼能看懂的标题（≤40 字）。
+func fileOpTitle(verb string, pairs []files.FilePair) string {
+	title := fmt.Sprintf("%s %d 项", verb, len(pairs))
+	if len(pairs) > 0 {
+		if dir := filepath.Dir(pairs[0].To); dir != "" && dir != "." {
+			title += "到 " + filepath.Base(dir)
+		}
+	}
+	return title
+}
+
+// handleFileCopy 复制（走任务中心：长任务 + 字节级进度 + 可中断）。
+func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
+	var req fileOpReq
+	if err := decode(r, &req); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	pairs := req.pairs()
+	if err := s.checkFileOpContainment(pairs); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	// 复制默认 rename（保留两者）；空串是"目标已存在就报错"的老 Copy 语义，
+	// 由单条目调用方按需使用。
+	onConflict := strings.ToLower(strings.TrimSpace(req.OnConflict))
+	if onConflict == "" {
+		onConflict = files.MoveConflictRename
+	}
+	mgr := s.fileManager()
+	title := fileOpTitle("复制", pairs)
+	s.launchTask(w, r, "file_copy", fileOpTarget(pairs), title, "file_copy",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return s.runFileOpTask(ctx, log, files.OpPhaseCopy,
+				func(c context.Context, onProgress files.OpProgressFunc) (*files.BatchResult, error) {
+					return mgr.CopyItems(c, pairs, onConflict, onProgress)
+				})
+		})
+}
+
+// handleFileMove 移动（剪切粘贴）：语义与老实现完全一致 —— 同卷 rename、
+// 跨卷回退"复制 + 删源"，目标已存在时按 on_conflict 处理（绝不静默覆盖）。
+//
+// 关键差别只在**取消**：跨卷复制中断时删掉半成品，**绝不删源文件**。
+func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
+	var req fileOpReq
+	if err := decode(r, &req); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	pairs := req.pairs()
+	if err := s.checkFileOpContainment(pairs); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	onConflict := strings.ToLower(strings.TrimSpace(req.OnConflict))
+	if onConflict == "" {
+		onConflict = files.MoveConflictRename
+	}
+	mgr := s.fileManager()
+	title := fileOpTitle("移动", pairs)
+	s.launchTask(w, r, "file_move", fileOpTarget(pairs), title, "file_move",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return s.runFileOpTask(ctx, log, files.OpPhaseMove,
+				func(c context.Context, onProgress files.OpProgressFunc) (*files.BatchResult, error) {
+					return mgr.MoveItems(c, pairs, onConflict, onProgress)
+				})
+		})
 }
 
 type fileChmodReq struct {
@@ -874,6 +1077,10 @@ type fileDeleteReq struct {
 	Recursive bool `json:"recursive"`
 }
 
+// handleFileDelete 删除（走任务中心：海量小文件/大目录的删除也是分钟级动作）。
+//
+// 语义完全照旧：recursive 决定目录能不能递归删；逐条失败如实报，绝不报一个
+// 干净的"已完成"。外接卷被 macOS 隐私保护拒绝时，预检当场 403 + 完整指引。
 func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	var req fileDeleteReq
 	if err := decode(r, &req); err != nil {
@@ -884,30 +1091,23 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "请选择要删除的文件")
 		return
 	}
-	mgr := s.fileManager()
-	var done []string
+	pairs := make([]files.FilePair, 0, len(req.Paths))
 	for _, p := range req.Paths {
-		if err := mgr.Delete(p, req.Recursive); err != nil {
-			// 外接卷被 macOS 隐私保护拒绝：整单 403 + 完整指引，
-			// 而不是 200 + 一行 errno（同一类问题的其它入口也都这么映射）。
-			if tccPath, isTCC := volumeTCCPath(err, p); isTCC {
-				s.audit(r, "file_delete", p, "删除失败: "+err.Error(), false, "")
-				fail(w, http.StatusForbidden, volumeTCCGuide(tccPath))
-				return
-			}
-			// 部分失败时返回已删列表与失败原因，便于前端准确展示
-			s.audit(r, "file_delete", p, "删除失败: "+err.Error(), false, "")
-			ok(w, map[string]any{
-				"deleted": done, "failed": p, "error": err.Error(),
-				"msg": fmt.Sprintf("已删除 %d 项，%s 失败：%v", len(done), filepath.Base(p), err),
-			})
-			return
-		}
-		done = append(done, p)
+		pairs = append(pairs, files.FilePair{From: p})
 	}
-	s.audit(r, "file_delete", strings.Join(done, ", "),
-		fmt.Sprintf("删除 %d 项（recursive=%v）", len(done), req.Recursive), true, "")
-	ok(w, map[string]any{"msg": fmt.Sprintf("已删除 %d 项", len(done)), "deleted": done})
+	if err := s.checkFileOpContainment(pairs); err != nil {
+		failFileErr(w, err, req.Paths...)
+		return
+	}
+	mgr := s.fileManager()
+	title := fmt.Sprintf("删除 %d 项", len(req.Paths))
+	s.launchTask(w, r, "file_delete", fileOpTarget(pairs), title, "file_delete",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			return s.runFileOpTask(ctx, log, files.OpPhaseDelete,
+				func(c context.Context, onProgress files.OpProgressFunc) (*files.BatchResult, error) {
+					return mgr.DeleteItems(c, req.Paths, req.Recursive, onProgress)
+				})
+		})
 }
 
 type fileCompressReq struct {

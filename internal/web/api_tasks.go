@@ -99,6 +99,9 @@ func (s *Server) launchTask(w http.ResponseWriter, r *http.Request,
 		// services 层。
 		ctx = services.WithProgress(ctx, t.LogFunc())
 		ctx = services.WithInput(ctx, t)
+		// 结构化进度（字节级）也走 ctx：文件复制/移动/删除要画进度条，
+		// 但业务包不该依赖 *Task 的内部结构。
+		ctx = tasks.WithProgress(ctx, t.SetProgress)
 		res, err := run(ctx, t.LogFunc())
 		if err != nil {
 			s.auditAs(info, auditAction, target, "失败: "+err.Error(), false, "")
@@ -417,6 +420,11 @@ func (s *Server) handleTaskStream(w http.ResponseWriter, r *http.Request) {
 			// 先把攒着的日志发出去：输入请求与它前面那句提示文案（Level=Input）
 			// 的顺序不能颠倒，否则前端会先看到输入框、再看到"请在 60 秒内…"。
 			if !flush() {
+				return
+			}
+			// 结构化进度（字节级）：与输入共用"状态变化"这条通道 ——
+			// 它没有序号、也不是增量，前端每次都用最新快照整体覆盖。
+			if !send("progress", map[string]any{"progress": t.Progress()}, cursor) {
 				return
 			}
 			// input_required 为 null = 这次等待已经落定（提交/超时/任务被中断），
