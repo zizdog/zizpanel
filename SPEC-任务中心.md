@@ -56,6 +56,11 @@ GET  /api/v1/tasks/{id}/stream            # SSE
 POST /api/v1/tasks/{id}/cancel            # 中断（会 kill 子进程，可能留下半装状态）
      data: { task: TaskMeta }
 
+POST /api/v1/tasks/{id}/retry             # 按原样重跑一个**已结束**的任务（202 + 新 task_id）
+     202 → data: { task_id: "t-...", title: "安装 PHP 8.3 (FPM)" }
+     404 → 任务不存在
+     409 → 任务还在跑 / 类型不可重试（只允许 install 与 upgrade）
+
 POST /api/v1/market/{id}/install          # 改为异步：立刻返回 task_id（HTTP 202）
 POST /api/v1/market/install-lnmp          # 同上
 POST /api/v1/market/install-phpmyadmin    # 同上
@@ -81,7 +86,8 @@ DELETE /api/v1/services/{name}/uninstall  # 同上
   "line_count": 812,
   "last": "==> Downloading https://…",   // 最后一行，列表页直接展示
   "error": "",                            // 失败原因（status=failed 时）
-  "result": { }                           // 成功后的 InstallResult（含 token/address/service）
+  "result": { },                          // 成功后的 InstallResult（含 token/address/service）
+  "retryable": false                      // 已结束且类型可重试（install/upgrade）⇒ 前端显示「重试」
 }
 ```
 

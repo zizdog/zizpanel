@@ -132,6 +132,9 @@ type Meta struct {
 	// Result 是业务返回值（*services.InstallResult），只在成功后有值。
 	// 用 any 是为了不反向依赖 services 包。
 	Result any `json:"result,omitempty"`
+	// Retryable 表示这个**已结束**的任务可以按原样重跑（见 Manager.Retry）。
+	// 前端据此决定要不要显示「重试」按钮，避免按钮点了才被后端拒绝。
+	Retryable bool `json:"retryable"`
 }
 
 // Task 是一次长任务。
@@ -147,6 +150,10 @@ type Task struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
+	// runner 是原样重跑这个任务用的执行体（创建后不再改动；nil = 不可重试）。
+	// web 层把审计、缓存失效等收尾逻辑都装在传进来的闭包里，所以重跑必须复用它 ——
+	// 这样「重试」与「首次执行」是同一条路径，不会少做一步。
+	runner func(ctx context.Context, t *Task) (any, error)
 
 	mu         sync.Mutex
 	status     Status
@@ -176,7 +183,7 @@ type Task struct {
 }
 
 // newTask 建立任务对象（不启动）。id 由 Manager 生成。
-func newTask(id, kind, target, title string) *Task {
+func newTask(id, kind, target, title string, runner func(ctx context.Context, t *Task) (any, error)) *Task {
 	return &Task{
 		id:        id,
 		kind:      kind,
@@ -188,6 +195,7 @@ func newTask(id, kind, target, title string) *Task {
 		subs:      map[int]chan Line{},
 		stateSubs: map[int]chan struct{}{},
 		nextSeq:   1,
+		runner:    runner,
 	}
 }
 
@@ -460,6 +468,7 @@ func (t *Task) metaLocked() Meta {
 		LineCount:  t.total,
 		Error:      t.errMsg,
 		Result:     t.result,
+		Retryable:  t.status != StatusRunning && t.runner != nil && retryableKind(t.kind),
 		FinishedAt: t.finishedAt,
 	}
 	// 只暴露"在等什么"，**不放用户已经输入的值**：Meta 会被 GET 任务与 SSE
@@ -543,7 +552,7 @@ func (m *Manager) Start(kind, target, title string, fn func(ctx context.Context,
 // 还可能让输入通道静默变成 nil ⇒ 提示不出现、口令被默默自动生成）。
 func (m *Manager) StartWithTask(kind, target, title string, fn func(ctx context.Context, t *Task) (any, error)) *Task {
 	id := fmt.Sprintf("t-%d-%d", time.Now().UnixMilli(), m.seq.Add(1))
-	t := newTask(id, kind, target, title)
+	t := newTask(id, kind, target, title, fn)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
@@ -658,4 +667,50 @@ func (m *Manager) Cancel(id string) (*Task, error) {
 	}
 	t.cancel()
 	return t, nil
+}
+
+// retryableKind 限定允许「原样重跑」的任务类型。
+//
+// 只列安装与升级：这两类失败的下一步通常就是重试（网络抖动/端口被占/磁盘满）。
+// 备份、恢复、导入、部署这些重跑可能覆盖用户数据，一键重试的风险大于收益。
+func retryableKind(kind string) bool {
+	switch kind {
+	case "install", "upgrade":
+		return true
+	}
+	return false
+}
+
+// Retry 按原样重跑一个**已结束**的任务：复用当初的 runner，新开一个 task_id。
+//
+// 为什么新开任务而不是把旧任务改回 running：任务对象的日志、订阅与生命周期都按
+// 「一次执行」设计，复活会让两轮日志混在一起，用户看不出哪一行属于哪一轮。
+//
+// 三种拒绝都如实报错（前端据此提示，而不是假装点过了）：
+// 任务不存在、还在跑、类型不可重试。
+func (m *Manager) Retry(id string) (string, error) {
+	src := m.Get(id)
+	if src == nil {
+		return "", fmt.Errorf("任务不存在（可能已被更早的任务挤出列表）")
+	}
+	if src.Status() == StatusRunning {
+		return "", fmt.Errorf("任务还在运行，等它结束再重试")
+	}
+	if !retryableKind(src.kind) {
+		return "", fmt.Errorf("「%s」类型的任务不支持重试", src.kind)
+	}
+	if src.runner == nil {
+		return "", fmt.Errorf("这个任务没有可重跑的执行体")
+	}
+	// 同一个 target 上已经有别的任务在跑时不能重跑：brew 有全局锁，
+	// 后一个只会卡住并最终失败（与 launchTask 的 409 是同一条理由）。
+	if t := m.RunningFor(src.target); t != nil {
+		return "", fmt.Errorf("「%s」正在进行中，请等它结束再重试", t.Meta().Title)
+	}
+	// 先写一行"这是重试"，否则新任务的日志与原任务一模一样，排障时分不清跑的是哪一轮。
+	nt := m.StartWithTask(src.kind, src.target, src.title, func(ctx context.Context, t *Task) (any, error) {
+		t.Log(LevelStep, "重试：沿用原任务的参数（原任务 "+src.id+"）")
+		return src.runner(ctx, t)
+	})
+	return nt.ID(), nil
 }

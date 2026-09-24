@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -643,4 +644,82 @@ func waitTaskPending(t *testing.T, task *tasks.Task) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("任务没有进入等待输入状态")
+}
+
+// TestTaskRetryEndpoint 是「安装失败一键重试」的唯一门禁：正向要求已结束的安装
+// 任务能重试出**新的** task_id 并复用原执行体；负向要求运行中、不可重试的类型、
+// 不存在的任务都被拒 —— 只测正向等于没测（把校验全删了也会绿）。
+func TestTaskRetryEndpoint(t *testing.T) {
+	srv, ts := newTestServer(t)
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	// 一个已失败的安装任务：runner 只返回错误，不跑任何真实命令。
+	failed := srv.Tasks.Start("install", "retry-demo", "安装 retry-demo",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			log(tasks.LevelOut, "模拟安装失败")
+			return nil, errors.New("模拟安装失败")
+		})
+	<-failed.Done()
+	if failed.Status() != tasks.StatusFailed {
+		t.Fatalf("前置任务应为失败，实际 %s", failed.Status())
+	}
+	if !failed.Meta().Retryable {
+		t.Fatal("已失败的安装任务应标记为可重试（前端据此显示按钮）")
+	}
+
+	// 正向：202 + 新 task_id。
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/tasks/"+failed.ID()+"/retry", nil, cookies)
+	if res.StatusCode != 202 {
+		t.Fatalf("重试应 202，实际 %d: %v", res.StatusCode, out)
+	}
+	data, _ := out["data"].(map[string]any)
+	newID := asString(data["task_id"])
+	if newID == "" {
+		t.Fatalf("重试响应缺少 task_id: %v", out)
+	}
+	if newID == failed.ID() {
+		t.Fatalf("重试必须新开任务，不能复用旧 id %s", newID)
+	}
+	// 新任务真的跑起来，且用的是原来那个执行体（同样失败 ⇒ 不是空壳任务）。
+	nt := srv.Tasks.Get(newID)
+	if nt == nil {
+		t.Fatalf("重试后的任务 %s 不在任务中心里", newID)
+	}
+	select {
+	case <-nt.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("重试任务没有结束")
+	}
+	if nt.Status() != tasks.StatusFailed {
+		t.Errorf("重试应复用原执行体（仍失败），实际 %s", nt.Status())
+	}
+
+	// 负向 1：运行中的任务不能重试。
+	release := make(chan struct{})
+	running := startStubTask(t, srv, "retry-running", release)
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/tasks/"+running.ID()+"/retry", nil, cookies)
+	if res.StatusCode != 409 {
+		t.Errorf("运行中的任务必须被拒（409），实际 %d: %v", res.StatusCode, out)
+	}
+	close(release)
+	<-running.Done()
+
+	// 负向 2：不可重试的类型（备份重跑可能覆盖用户数据）。
+	other := srv.Tasks.Start("backup", "retry-backup", "备份 retry-backup",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) { return nil, nil })
+	<-other.Done()
+	if other.Meta().Retryable {
+		t.Error("备份类任务不该被标记为可重试")
+	}
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/tasks/"+other.ID()+"/retry", nil, cookies)
+	if res.StatusCode != 409 {
+		t.Errorf("不可重试的类型必须被拒（409），实际 %d: %v", res.StatusCode, out)
+	}
+
+	// 负向 3：不存在的任务 404。
+	res, _, _ = doJSON(t, ts, "POST", "/api/v1/tasks/t-不存在/retry", nil, cookies)
+	if res.StatusCode != 404 {
+		t.Errorf("不存在的任务应 404，实际 %d", res.StatusCode)
+	}
 }

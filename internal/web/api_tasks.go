@@ -257,6 +257,31 @@ func (s *Server) handleTaskCancel(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"task": t.Meta()})
 }
 
+// handleTaskRetry 按原样重跑一个已结束的可重试任务（安装/升级），新开一个 task_id。
+//
+// 202 与 launchTask 一致：请求立刻返回，真正的工作在任务中心的 goroutine 里跑；
+// 重跑复用任务上记着的 runner，所以审计、市场缓存失效等收尾逻辑与首次执行相同。
+func (s *Server) handleTaskRetry(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t := s.Tasks.Get(id)
+	if t == nil {
+		fail(w, http.StatusNotFound, "任务不存在（面板重启后不再保留历史任务）")
+		return
+	}
+	newID, err := s.Tasks.Retry(id)
+	if err != nil {
+		// 409：任务在，但此刻不能重试（还在跑 / 类型不可重试）。如实说明原因。
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
+	meta := t.Meta()
+	s.audit(r, "task_retry", meta.Target, "重试 "+meta.Title+"（新任务 "+newID+"）", true, "")
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":   true,
+		"data": map[string]any{"task_id": newID, "title": meta.Title},
+	})
+}
+
 // handleTaskStream 是任务的 SSE 进度流。
 //
 // 断点续传：EventSource 重连时会自动带上 Last-Event-ID 头，这里据此从该 seq

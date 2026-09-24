@@ -314,6 +314,9 @@ export const api = {
   task: (id, after = 0, limit = 800) =>
     request('GET', `${API_BASE}/tasks/${encodeURIComponent(id)}?after=${after}&limit=${limit}`),
   taskCancel: (id) => request('POST', `${API_BASE}/tasks/${encodeURIComponent(id)}/cancel`, {}),
+  // 重试一个**已结束**的安装/升级任务：按原样重跑，返回新的 task_id（HTTP 202）。
+  // 还在跑、或不可重试的类型会被后端 409 拒绝，调用方必须把原因显示出来。
+  taskRetry: (id) => request('POST', `${API_BASE}/tasks/${encodeURIComponent(id)}/retry`, {}),
   // 提交任务的限时输入（如 MySQL root 口令）。
   // 值只在这一个请求里发送：后端不回显、不写日志、不进审计，前端也不保存它
   // （不写 localStorage、不写 URL、不 console.log）。

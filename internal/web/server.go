@@ -328,6 +328,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/tasks/{id}", s.requireAuth(s.handleTaskGet))
 	root.HandleFunc("GET /api/v1/tasks/{id}/stream", s.requireAuth(s.handleTaskStream))
 	root.HandleFunc("POST /api/v1/tasks/{id}/cancel", s.requireAuth(s.handleTaskCancel))
+	// 重试：把已结束的安装/升级任务按原样重跑，新开一个 task_id（见 handleTaskRetry）。
+	root.HandleFunc("POST /api/v1/tasks/{id}/retry", s.requireAuth(s.handleTaskRetry))
 	// 任务输入：安装过程中"限时询问"的通道（如 MySQL root 口令）。
 	// 只有正在等待该 key 的任务才接受，见 tasks.Task.SubmitInput。
 	root.HandleFunc("POST /api/v1/tasks/{id}/input", s.requireAuth(s.handleTaskInput))

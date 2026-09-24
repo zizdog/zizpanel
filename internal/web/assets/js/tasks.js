@@ -461,6 +461,12 @@ function openList() {
     // 在等输入的任务要一眼能认出来：徽标只说"有几个在跑"，用户关掉进度窗后
     // 若不知道有人在等他，限时输入就会静默超时。
     STATE.inputs.has(t.id) ? h('span.pill.warn', { text: '⏳ 等待输入' }) : null,
+    // 失败的可重试任务给一颗「重试」：点它按原样新开一个任务并接进进度窗。
+    canRetry(t) ? h('button.btn.btn-sm', {
+      text: '🔄 重试',
+      title: '按原来的方式重新跑一次',
+      onclick: (e) => { e.stopPropagation(); m.close(); retryTask(t); },
+    }) : null,
   ]);
 
   function render() {
@@ -806,12 +812,25 @@ function openTask(id) {
     },
   });
 
+  // 失败且类型可重试时才显示（由 updateStatus 控制显隐），点击按原样重跑。
+  const retryBtn = h('button.btn', {
+    text: '🔄 重试',
+    title: '按原来的方式重新跑一次',
+    style: { display: 'none' },
+    onclick: () => {
+      const meta = STATE.metas.get(id) || initial;
+      m.close();
+      retryTask(meta);
+    },
+  });
+
   const m = modal({
     title: initial.title || '任务详情',
     wide: true,
     body,
     footer: (close) => [
       copyBtn,
+      retryBtn,
       cancelBtn,
       h('button.btn', { text: '关闭窗口（后台继续）', onclick: close }),
     ],
@@ -884,6 +903,7 @@ function openTask(id) {
       errBox.style.display = 'none';
     }
     cancelBtn.disabled = !isRunning(meta);
+    retryBtn.style.display = canRetry(meta) ? '' : 'none';
     setTitle(meta.title);
 
     const oldest = STATE.oldest.get(id) || 0;
@@ -1191,6 +1211,33 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs } = {}
   }
 
   return adopt(id, res, { kind, target, title, onDone });
+}
+
+// RETRYABLE_KINDS 与后端 tasks.retryableKind 保持一致（install/upgrade）。
+// 只在 meta 还没带上后端的 retryable 字段时兜底（本地刚建立的 meta）。
+const RETRYABLE_KINDS = new Set(['install', 'upgrade']);
+
+/** canRetry：只有**已失败**、且类型可重试的任务才显示重试按钮。 */
+function canRetry(m) {
+  if (!m || isRunning(m) || m.status !== 'failed') return false;
+  if (typeof m.retryable === 'boolean') return m.retryable;
+  return RETRYABLE_KINDS.has(m.kind);
+}
+
+/**
+ * retryTask 调后端重试接口，把**新任务**接进现有进度窗。
+ *
+ * 复用 start()：登记 meta、接 SSE、刷列表、开进度窗、提交失败的提示都由它负责，
+ * 不再另写一套订阅（否则两条路的进度/续传语义必然跑偏）。
+ */
+function retryTask(m) {
+  if (!m || !m.id) return null;
+  return start({
+    kind: m.kind,
+    target: m.target,
+    title: m.title,
+    start: () => api.taskRetry(m.id),
+  });
 }
 
 export const taskCenter = {
