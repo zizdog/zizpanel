@@ -433,8 +433,8 @@ type settingsReq struct {
 	// AppProxy / AppProxyAuth：应用界面总开关与"是否要求登录面板"
 	AppProxy     *bool `json:"app_proxy"`
 	AppProxyAuth *bool `json:"app_proxy_auth"`
-	// Aria2StrictRPCSources：aria2 的 RPC 代理是否只收"同源浏览器"或带
-	// X-Aria2-Token 的请求。默认关（兼容扩展/脚本/手机 App；保护交给 rpc-secret）。
+	// Aria2StrictRPCSources：aria2 的 RPC 代理是否按浏览器来源判（只收同源页面）。
+	// 默认关（兼容扩展/脚本/手机 App；保护交给 rpc-secret）。
 	Aria2StrictRPCSources *bool `json:"aria2_strict_rpc_sources"`
 	// UpgradeSource 是在线升级的默认源地址。传空串表示"清空"。
 	//

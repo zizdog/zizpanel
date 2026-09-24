@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -37,7 +36,8 @@ import (
 //      客户端（浏览器扩展 / 油猴 / 手机 App / 命令行）**全部 403** —— 而它们正是 aria2 的
 //      常用形态，用户明确要求"至少可以是可选的"。现在默认只要求 aria2 自己的 rpc-secret，
 //      想收紧就在「面板设置 → 访问与安全」勾「aria2 严格模式」（见 Cfg.Aria2StrictRPCSources）。
-//    · 严格模式下：带 X-Aria2-Token 的脚本放行，其余按浏览器来源判。
+//    · 严格模式（可选）下：浏览器**跨站**来源一律拒；同源页面与"不带来源头"的
+//      客户端（curl / 手机 App / 命令行 —— 它们本来就不带 Sec-Fetch-Site）照常放行。
 //    · 界面与应用界面同一策略（AppProxyAuth 打开时要求登录，见 requireAppProxyAuth）；
 //    · RPC 是**控制面**（能删文件、能加下载），无论 AppProxyAuth 怎么配都要求登录；
 //    · RPC 只收 application/json，并拒绝跨站来源（Sec-Fetch-Site）——
@@ -215,31 +215,18 @@ func ariaSlugPath() string { return services.Aria2Slug }
 // 用户既看不到错也点不动。超时后回 502 + 能照做的提示。
 var aria2RPCTimeout = 8 * time.Second
 
-// Aria2APITokenHeader 是脚本/外部客户端用的**专用凭证头**（值 = 面板设置里的
-// aria2_api_token）。它绕过下面那道浏览器来源校验，理由见 aria2RPCProxy 的注释。
-const Aria2APITokenHeader = "X-Aria2-Token"
-
-// aria2TokenOK 判断请求是否带了正确的专用凭证（空值一律不算，避免"配置没生成时
-// 谁都能过"）。比较用 ConstantTimeCompare：这个值不该通过响应时间泄漏。
-func (s *Server) aria2TokenOK(r *http.Request) bool {
-	want := strings.TrimSpace(s.Cfg.Aria2APIToken)
-	got := strings.TrimSpace(r.Header.Get(Aria2APITokenHeader))
-	if want == "" || got == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
-}
-
 // aria2RPCProxy 是两条入口共用的代理实现（是否要求会话由调用方先判）。
 //
-// 来源校验只认 **Sec-Fetch-Site**（浏览器自己打的，页面改不了）。它的目的是挡住
-// "别的网站上的页面顺手打本机 RPC"，代价是会误伤**扩展通道**：油猴的
-// GM_xmlhttpRequest 不受同源策略约束、也改不了 Origin/Sec-Fetch-Site，浏览器照样
-// 打上 cross-site ⇒ 一律 403。这类调用方不是 CSRF 风险（它得自己拿着凭证），
-// 所以给它们一条正当入口：带 X-Aria2-Token（面板生成的独立凭证，与 rpc-secret
-// 分开；泄漏它也只能过这道门，操纵 aria2 仍要 rpc-secret）。
+// 来源校验（**可选**，见 Cfg.Aria2StrictRPCSources）只认 **Sec-Fetch-Site**
+// （浏览器自己打的，页面改不了）：它的目的是挡住"别的网站上的页面顺手打本机 RPC"。
 //
-// 顺序就是"专用凭证优先，其次浏览器来源"：带对凭证 → 放行；否则照旧看 Sec-Fetch-Site。
+// 默认**关**：aria2 的价值一大半在"各种客户端都能连它"（AriaNg / 浏览器扩展 /
+// 油猴 / 手机 App / 命令行），而按来源拦会把它们**全部挡在门外** —— 它们既不是
+// 同源页面，也加不了自定义头。真正的保护是 aria2 自己的 `rpc-secret`：没有它，
+// 任何来源都操纵不了 aria2。用户 2026-09-24 明确要求"至少可以是可选的"。
+//
+// 打开严格模式后：浏览器**跨站**来源一律 403；同源页面、以及**不带 Sec-Fetch-Site**
+// 的客户端（curl / 手机 App / 命令行 / 插件）照常放行 —— 后者没有 CSRF 面。
 func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 	// 刻意**不做 CORS 预检**：这条通道是给"不受同源策略约束"的扩展/脚本用的
 	// （GM_xmlhttpRequest 不发预检），浏览器页面本来就有同源入口。加了预检 +
@@ -247,12 +234,12 @@ func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 	// 默认**只要求 rpc-secret**，不做出处校验 —— 否则 AriaNg 之外的客户端
 	// （扩展 / 油猴 / 手机 App / 命令行）全部 403，而它们正是 aria2 的常用形态。
 	// 想收紧就在设置里打开「严格模式」（用户 2026-09-24 明确要求"至少可以是可选的"）。
-	if s.Cfg.Aria2StrictRPCSources && !s.aria2TokenOK(r) {
+	if s.Cfg.Aria2StrictRPCSources {
 		if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
 			site != "same-origin" && site != "none" {
-			writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求"+
-				"（油猴/外部脚本等扩展通道请带 "+Aria2APITokenHeader+" 凭证，"+
-				"值可用 GET /api/v1/market/aria2/script-token 取）")
+			writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求（严格模式）："+
+				"浏览器里的其它网站不能借面板的会话操纵 aria2。扩展/脚本请改用"+
+				"「访问与安全」里关掉严格模式（默认就是关的）—— 那时保护由 aria2 自己的 rpc-secret 承担")
 			return
 		}
 	}

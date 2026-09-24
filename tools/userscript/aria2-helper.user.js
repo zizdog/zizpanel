@@ -15,13 +15,13 @@
 // @noframes
 // ==/UserScript==
 //
-// 为什么需要两个值（都填进「设置」，点「测试连接」会告诉你哪一步错了）：
-//   ① RPC 密钥（rpc-secret）：aria2 自己的凭据，body 里 token:<rpc-secret>；
-//   ② X-Aria2-Token：面板发的**接口凭证**，只用来过"浏览器来源校验"那道门
-//      （扩展通道改不了也躲不掉 Sec-Fetch-Site，所以必须由服务端凭证放行）。
-//      取值（浏览器里已登录面板时直接打开）：
-//        https://<面板>/api/v1/market/aria2/script-token
-//      rpc-secret 在推流的那台机器上：cat ~/aria/aria2.conf | grep rpc-secret
+// 只需要一个值（填进「设置」，点「测试连接」会告诉你对不对）：
+//   RPC 密钥（rpc-secret）：aria2 自己的凭据，body 里 token:<rpc-secret>。
+//   在跑 aria2 的那台机器上：grep rpc-secret ~/aria/aria2.conf
+//
+// 面板**不再**要求额外的 X-Aria2-Token：默认（兼容）模式下它不按浏览器来源拦，
+// 保护由 rpc-secret 承担；只有你在「面板设置 → 访问与安全」里打开严格模式后，
+// 浏览器里**别的网站**才打不进来（扩展仍能连 —— 它不带 Sec-Fetch-Site 头）。
 //
 // 刻意不做的事（上一版在这些地方翻车）：WebSocket 传输、伪造 Origin/Referer、
 // 自动去面板抓凭证（跨站带 cookie 读响应会被 CORS 挡住）、跳转页二次解析。
@@ -33,7 +33,6 @@
   const DEFAULTS = {
     rpc: 'https://aria2.zizdog.com:8888/jsonrpc',
     rpcSecret: '',
-    apiToken: '',
     dir: '',
     altClick: true,
     exts: 'zip,rar,7z,tar,gz,tgz,bz2,xz,zst,iso,img,dmg,pkg,msi,deb,rpm,apk,exe,mp4,mkv,avi,mov,flv,webm,wmv,mp3,flac,wav,ape,pdf,epub,mobi,azw3,torrent,bin',
@@ -74,7 +73,6 @@
     const url = clean(cfg.rpc);
     if (!/^https?:\/\/.+/i.test(url)) throw new Error('RPC 地址没填对：' + (cfg.rpc || '(空)'));
     const headers = { 'Content-Type': 'application/json' };
-    if (clean(cfg.apiToken)) headers['X-Aria2-Token'] = clean(cfg.apiToken);
     const all = clean(cfg.rpcSecret) ? ['token:' + clean(cfg.rpcSecret)].concat(params || []) : (params || []);
     const body = JSON.stringify({ jsonrpc: '2.0', id: 'a2h-' + Date.now(), method, params: all });
 
@@ -82,7 +80,7 @@
     const raw = String(res.responseText != null ? res.responseText : (res.response || ''));
     if (res.status === 403) {
       throw new Error('被面板拒了（403）：' + (raw.slice(0, 160) || '来源校验未通过') +
-        '\n→ 到「设置」把 X-Aria2-Token 填上（面板：/api/v1/market/aria2/script-token）');
+        '\n→ 面板开了「aria2 严格模式」：到「面板设置 → 访问与安全」把它关掉（默认就是关的）');
     }
     if (res.status !== 200) throw new Error('HTTP ' + res.status + '：' + (raw.slice(0, 200) || '(空响应)'));
     let data;
@@ -366,7 +364,6 @@
     const fields = [
       ['rpc', 'RPC 地址', 'text'],
       ['rpcSecret', 'aria2 密钥', 'password'],
-      ['apiToken', 'X-Aria2-Token', 'password'],
       ['dir', '下载目录(可空)', 'text'],
       ['exts', '可推送扩展名', 'text'],
       ['headers', '额外请求头(每行一条)', 'textarea'],
@@ -402,7 +399,7 @@
     aria.onclick = () => window.open(clean(cfg.rpc).replace(/\/jsonrpc\/?$/i, '/'), '_blank', 'noopener');
     btns.appendChild(save); btns.appendChild(test); btns.appendChild(aria);
     b.appendChild(btns);
-    b.appendChild(h('div', 'hint', 'X-Aria2-Token 取值：登录面板后打开 /api/v1/market/aria2/script-token；aria2 密钥在跑 aria2 的机器上 `grep rpc-secret ~/aria/aria2.conf`。'));
+    b.appendChild(h('div', 'hint', 'aria2 密钥在跑 aria2 的机器上取：`grep rpc-secret ~/aria/aria2.conf`。面板默认不按来源拦，所以不需要额外凭证；若报 403，去「面板设置 → 访问与安全」关掉「aria2 严格模式」。'));
     const diag = h('div', 'diag', state.lastLog || '（点「测试连接」看结果）');
     b.appendChild(diag);
   }
@@ -417,7 +414,7 @@
       try { const g = await rpc('aria2.getGlobalStat', []); log.push('   活动 ' + g.numActive + ' / 等待 ' + g.numWaiting); } catch (e) {}
     } catch (err) {
       log.push('⛔ ' + String(err.message || err));
-      if (!clean(cfg.apiToken)) log.push('   （没填 X-Aria2-Token：被 403 拒时就是它的问题）');
+      if (/403/.test(String(err.message || err))) log.push('   （403 = 面板开了「aria2 严格模式」：到「面板设置 → 访问与安全」关掉它）');
     }
     state.lastLog = log.join('\n');
     toast(log[0], log[0][0] === '✅' ? 'ok' : 'err');

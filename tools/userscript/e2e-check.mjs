@@ -17,22 +17,10 @@ import { execSync } from 'node:child_process';
 const SRC = readFileSync('tools/userscript/aria2-helper.user.js', 'utf8');
 const RPC = 'http://127.0.0.1:8898/jsonrpc';
 
-// 取真实凭证：aria2 的 rpc-secret + 面板的 X-Aria2-Token（走面板登录会话）
+// 只需要 aria2 自己的 rpc-secret —— 面板默认不按浏览器来源拦（2026-09-24 起），
+// 所以脚本这条路只用这一个凭据就够（X-Aria2-Token 机制已按用户要求删除）。
 const secret = execSync(`sed -n 's/^rpc-secret=//p' ${process.env.HOME}/aria/aria2.conf`).toString().trim();
-const pw = execSync(`grep -o 'ZP_PASS=.*' .panel-credential.local | cut -d= -f2`).toString().trim();
-
-// 取面板的 X-Aria2-Token（管理员会话；自签证书用 NODE_TLS_REJECT_UNAUTHORIZED=0 跑）
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-const login = await fetch('https://127.0.0.1:8443/api/v1/login', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ username: 'admin', password: pw }),
-});
-const cookie = (login.headers.getSetCookie ? login.headers.getSetCookie() : [login.headers.get('set-cookie')])
-  .filter(Boolean).map((c) => c.split(';')[0]).join('; ');
-const tokResp = await (await fetch('https://127.0.0.1:8443/api/v1/market/aria2/script-token', { headers: { cookie } })).json();
-const panelToken = tokResp?.data?.token || '';
-if (!panelToken) { console.error('拿不到面板凭证：', JSON.stringify(tokResp)); process.exit(2); }
-console.log('（凭据已取：rpc-secret ' + secret.length + ' 位，X-Aria2-Token ' + panelToken.length + ' 位）');
+console.log('（凭据已取：rpc-secret ' + secret.length + ' 位）');
 
 const browser = await chromium.launch();
 const page = await browser.newContext({ ignoreHTTPSErrors: true }).then((c) => c.newPage());
@@ -78,11 +66,11 @@ check('① 页面可推送链接=zip+磁力（html 被过滤）', links.length =
 
 // ② 连接测试（真 RPC，带密钥 + 凭证）
 const v = await page.evaluate(async ({ rpc, secret, token }) => {
-  window.__A2H.cfg.rpc = rpc; window.__A2H.cfg.rpcSecret = secret; window.__A2H.cfg.apiToken = token;
+  window.__A2H.cfg.rpc = rpc; window.__A2H.cfg.rpcSecret = secret;
   try { return { ok: true, version: (await window.__A2H.rpc('aria2.getVersion', [])).version }; }
   catch (e) { return { ok: false, err: String(e.message || e) }; }
-}, { rpc: RPC, secret, token: panelToken });
-check('② RPC 通（带 rpc-secret + X-Aria2-Token）', v.ok && !!v.version, JSON.stringify(v));
+}, { rpc: RPC, secret });
+check('② RPC 通（只用 rpc-secret，不需要额外头）', v.ok && !!v.version, JSON.stringify(v));
 
 // ③ 真推送一条，并确认落到下载目录
 const gid = await page.evaluate(async () => {
@@ -95,11 +83,11 @@ check('③ 推送链接拿到 gid', gid.ok && /^[0-9a-f]{8,}$/.test(gid.gid || '
 if (gid.ok) {
   let st = null;
   for (let i = 0; i < 12; i++) {
-    st = await page.evaluate(async ({ rpc, secret, token, gid }) => {
-      window.__A2H.cfg.rpc = rpc; window.__A2H.cfg.rpcSecret = secret; window.__A2H.cfg.apiToken = token;
+    st = await page.evaluate(async ({ rpc, secret, gid }) => {
+      window.__A2H.cfg.rpc = rpc; window.__A2H.cfg.rpcSecret = secret;
       try { return await window.__A2H.rpc('aria2.tellStatus', [gid, ['status', 'files', 'completedLength', 'errorMessage']]); }
       catch (e) { return { err: String(e.message || e) }; }
-    }, { rpc: RPC, secret, token: panelToken, gid: gid.gid });
+    }, { rpc: RPC, secret, gid: gid.gid });
     if (st && (st.status === 'complete' || st.status === 'error')) break;
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -107,13 +95,13 @@ if (gid.ok) {
   check('③b 任务完成且落在下载目录', st && st.status === 'complete' && path.includes('/Downloads/'), st && (st.status + ' ' + path + ' ' + (st.errorMessage || '')));
 }
 
-// ④ 负向：凭证写错必须给出"能照做"的错误（而不是静默失败）
+// ④ 负向：**密钥**写错必须给出能照做的错误（而不是静默失败）
 const bad = await page.evaluate(async () => {
-  window.__A2H.cfg.apiToken = 'definitely-wrong';
+  window.__A2H.cfg.rpcSecret = 'definitely-wrong';
   try { await window.__A2H.rpc('aria2.getVersion', []); return { ok: true }; }
   catch (e) { return { ok: false, err: String(e.message || e) }; }
 });
-check('④ 凭证错时报错并指出 X-Aria2-Token', !bad.ok && /403/.test(bad.err || '') && /X-Aria2-Token/.test(bad.err || ''), JSON.stringify(bad));
+check('④ 密钥写错时如实报错', !bad.ok && /Unauthorized|error/i.test(bad.err || ''), JSON.stringify(bad));
 
 await browser.close();
 console.log(results.every((r) => r[1]) ? '\n全部通过' : '\n有失败项');

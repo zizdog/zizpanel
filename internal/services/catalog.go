@@ -1753,7 +1753,7 @@ func builtinCatalog() []App {
 			PostInstallHint: "1，入口：http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
 				"2，反代：要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
 				"3，下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。" +
-				"4,三方调用：（如油猴脚本）加X-Aria2-Token头验证；取凭证：https://<mini面板>/api/v1/market/aria2/script-token",
+				"4,第三方调用（油猴脚本/浏览器扩展/手机 App/命令行）：直接用面板地址或独立端口的 /jsonrpc，带上 aria2 自己的 rpc-secret 即可 —— 面板不按来源拦（严格模式见「面板设置 → 访问与安全」）",
 			DocsURL: "https://aria2.github.io/",
 		},
 

@@ -1208,7 +1208,7 @@ export function SettingsView(content, ctx = {}) {
             h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '8px' } }, [
               aria2Strict,
               h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' },
-                text: 'aria2：只允许面板界面与专用凭证访问 RPC（严格模式）。默认**关闭** —— 关着时 AriaNg / 浏览器扩展 / 油猴脚本 / 手机 App / 命令行都能连它，保护靠 aria2 自己的 rpc-secret；打开后只有面板页面（同源）和带 X-Aria2-Token 的脚本能连。' }),
+                text: 'aria2：只允许同源页面访问 RPC（严格模式）。默认**关闭** —— 关着时 AriaNg / 浏览器扩展 / 油猴脚本 / 手机 App / 命令行都能连它，保护靠 aria2 自己的 rpc-secret；打开后浏览器里**别的网站**打不进来（同源页面与不带来源头的客户端照常可用）。' }),
             ]),
           ]),
           h('div.row', [

@@ -498,7 +498,6 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/{id}/install", s.requireAuth(s.handleMarketInstall))
 	// aria2 的**脚本凭证**（非浏览器调用 RPC 用的专用头，见 api_aria2.go）：
 	// 只有登录会话能取；它单独泄漏也操纵不了 aria2（仍要 rpc-secret）。
-	root.HandleFunc("GET /api/v1/market/aria2/script-token", s.requireAuth(s.handleAria2ScriptToken))
 	// 更新到最新版：brew 条目走 `brew upgrade`（install 对已装包是幂等跳过），
 	// 动态索引条目复用安装流程（见 api_market_update.go 的 handleMarketUpgrade）。
 	root.HandleFunc("POST /api/v1/market/{id}/upgrade", s.requireAuth(s.handleMarketUpgrade))

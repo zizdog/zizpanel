@@ -155,22 +155,10 @@ func TestAria2RPCStrictModeBlocksCrossSite(t *testing.T) {
 	if res := postRPC(t, ts, cookies, ""); res.StatusCode == http.StatusForbidden {
 		t.Errorf("严格模式也不该拦「没有浏览器来源头」的请求（插件/脚本正是这种）")
 	}
-	// 带专用凭证 → 严格模式下也放行
-	srv.Cfg.Aria2APIToken = "tok-123456"
-	req, _ := http.NewRequest("POST", ts.URL+"/jsonrpc", strings.NewReader(`{"jsonrpc":"2.0"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	req.Header.Set(Aria2APITokenHeader, "tok-123456")
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = res.Body.Close()
-	if res.StatusCode == http.StatusForbidden {
-		t.Error("带了正确专用凭证就不该被来源校验拦下")
+	// 关闭严格模式 → 跨站又放行（这就是"可选的"的含义）
+	srv.Cfg.Aria2StrictRPCSources = false
+	if res := postRPC(t, ts, cookies, "cross-site"); res.StatusCode == http.StatusForbidden {
+		t.Error("关掉严格模式后不该再按来源拦")
 	}
 }
 
@@ -362,20 +350,6 @@ func TestAria2RPCTimesOutWhenUpstreamHangs(t *testing.T) {
 	}
 }
 
-// TestAria2RPCTokenBypassesBrowserOriginCheck 锁住"扩展/脚本通道"的正当入口。
-//
-// 背景（真机报障）：油猴脚本用 GM_xmlhttpRequest 打反代域名上的 /jsonrpc，被面板的
-// 来源校验 403「拒绝跨站来源的 RPC 请求」。那条校验只看浏览器自己打的 Sec-Fetch-Site，
-// 而扩展通道**改不了也躲不掉**它（不受同源策略约束 ≠ 能伪造该头）⇒ 客户端侧无解。
-// 所以给非浏览器调用方一条凭证通道：X-Aria2-Token（面板生成的独立凭证）。
-//
-// 判据（正反对照都在）：
-//
-//	① 跨站 + 对凭证 → 200；
-//	② 跨站 + 错凭证 → 403；
-//	③ 跨站 + 不带凭证 → 403（老行为不许被放宽）；
-//	④ 同源（AriaNg 页面）→ 200；
-//	⑤ 配置里没生成凭证时，随便带什么都 → 403（别出现"空值全放行"）。
 func TestAria2RPCTokenBypassesBrowserOriginCheck(t *testing.T) {
 	srv, ts := newTestServer(t)
 	cookies := loginTestPanel(t, ts)
@@ -391,12 +365,10 @@ func TestAria2RPCTokenBypassesBrowserOriginCheck(t *testing.T) {
 	aria2RPCUpstream = func() *url.URL { return &url.URL{Scheme: "http", Host: u.Host, Path: "/jsonrpc"} }
 	t.Cleanup(func() { aria2RPCUpstream = old })
 
-	const token = "script-token-fixture-0123456789"
-	srv.Cfg.Aria2APIToken = token
-	// 专用凭证只在**严格模式**下才有意义：默认（兼容）模式根本不看来源，
-	// 也就不需要这条旁路。这里显式打开严格模式，验证"凭证能过、别的都被拦"。
+	// 这条用例验证**严格模式**下的来源判定（凭证机制 2026-09-24 已按用户要求删除：
+	// 它只服务"严格模式 + 油猴"这一个自相矛盾的组合，而那种需求本该用默认的兼容模式）。
 	srv.Cfg.Aria2StrictRPCSources = true
-	t.Cleanup(func() { srv.Cfg.Aria2APIToken = ""; srv.Cfg.Aria2StrictRPCSources = false })
+	t.Cleanup(func() { srv.Cfg.Aria2StrictRPCSources = false })
 
 	payload := `{"jsonrpc":"2.0","id":"z","method":"aria2.getVersion","params":["token:x"]}`
 	call := func(hdr map[string]string) int {
@@ -416,32 +388,22 @@ func TestAria2RPCTokenBypassesBrowserOriginCheck(t *testing.T) {
 		return res.StatusCode
 	}
 
-	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: token}); got != http.StatusOK {
-		t.Errorf("① 跨站 + 对凭证应放行（200），实际 %d", got)
-	}
-	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: "wrong"}); got != http.StatusForbidden {
-		t.Errorf("② 跨站 + 错凭证应 403，实际 %d", got)
-	}
 	if got := call(map[string]string{"Sec-Fetch-Site": "cross-site"}); got != http.StatusForbidden {
-		t.Errorf("③ 跨站 + 不带凭证应保持 403（这条通道不能变成人人可过），实际 %d", got)
+		t.Errorf("① 严格模式下跨站来源应 403，实际 %d", got)
 	}
 	if got := call(map[string]string{"Sec-Fetch-Site": "same-origin"}); got != http.StatusOK {
-		t.Errorf("④ 同源（AriaNg 页面）应 200，实际 %d", got)
+		t.Errorf("② 同源（AriaNg 页面）应 200，实际 %d", got)
 	}
-	// ⑤ 配置里没有凭证（老配置/生成失败）：带**任何**值都不许过 ——
-	// 否则就成了"空凭证 = 人人可过"。
-	srv.Cfg.Aria2APIToken = ""
-	for _, bogus := range []string{"", "x", token} {
-		if got := call(map[string]string{"Sec-Fetch-Site": "cross-site", Aria2APITokenHeader: bogus}); got != http.StatusForbidden {
-			t.Errorf("⑤ 没有生成凭证时不该放行（带 %q），实际 %d", bogus, got)
-		}
+	// ③ **不带浏览器来源头**的客户端（curl / 手机 App / 命令行 / 插件）照常放行 ——
+	// 它们不是浏览器页面，没有 CSRF 面；严格模式只针对"浏览器跨站"。
+	if got := call(map[string]string{}); got != http.StatusOK {
+		t.Errorf("③ 不带 Sec-Fetch-Site 的客户端应放行，实际 %d", got)
 	}
 	// ⑥ **刻意不做 CORS 预检**（方向问题，不是漏做）：扩展通道不受同源策略约束、
 	// GM_xmlhttpRequest 也不发预检；给页面加 ACAO/预检等于把 CORS 当解法。
 	// 这里把"OPTIONS 不被特殊对待"钉住，免得以后有人顺手加回一套 CORS。
-	srv.Cfg.Aria2APIToken = token
 	req, _ := http.NewRequest("OPTIONS", ts.URL+"/aria/jsonrpc", nil)
-	req.Header.Set(Aria2APITokenHeader, token)
+
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}
