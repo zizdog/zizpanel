@@ -90,6 +90,71 @@ func TestServiceActionWaitBudget(t *testing.T) {
 	if serviceActionPollStep <= 0 || serviceActionPollStep > 200*time.Millisecond {
 		t.Fatalf("就绪轮询步长应为 (0,200ms]，实际 %s", serviceActionPollStep)
 	}
+	// 启动记忆窗口：太短等于没记（启动慢的服务又显示成"已停止"），太长会把真的启动
+	// 失败一直说成"启动中"（窗口内 status=starting，健康检查照样会报出来）。
+	if serviceStartHintWindow < 10*time.Second || serviceStartHintWindow > 3*time.Minute {
+		t.Fatalf("启动记忆窗口应在 10s~3min，实际 %s", serviceStartHintWindow)
+	}
+}
+
+// 门禁：刚点过启动/重启、系统还没报告它在运行时，状态必须报「启动中·未确认」，
+// 不许把**正在启动**的服务说成「已停止」（2026-09-24 真机：imgcompress 启动 3s+）；
+// 但 error / unavailable 这类更确定的证据不许被"可能还在启动"盖掉，超窗后要如实回到
+// stopped，收到停止请求要立刻忘掉启动记忆。
+func TestStartHintReportsStartingNotStopped(t *testing.T) {
+	prevWin := serviceStartHintWindow
+	serviceStartHintWindow = 50 * time.Millisecond
+	t.Cleanup(func() { serviceStartHintWindow = prevWin })
+
+	m := &Manager{}
+	m.markStartRequested("com-zizdog-imgcompress")
+	got := m.applyStartHint("com-zizdog-imgcompress", State{Status: "stopped", Detail: "已加载但未运行"})
+	if got.Status != StatusStarting {
+		t.Fatalf("刚请求启动的服务应报 %q，实际 %q", StatusStarting, got.Status)
+	}
+	if got.Detail == "" {
+		t.Fatal("改报「启动中」不得丢掉原始说明（用户要能看到 launchd 到底怎么报的）")
+	}
+
+	// 已在运行：原样返回，并忘掉启动记忆 —— 否则下次停掉它会在窗口内又显示"启动中"。
+	if got := m.applyStartHint("com-zizdog-imgcompress", State{Status: "running", Running: true}); !got.Running {
+		t.Fatalf("运行中的状态不该被改动，实际 %+v", got)
+	}
+	if got := m.applyStartHint("com-zizdog-imgcompress", State{Status: "stopped"}); got.Status != "stopped" {
+		t.Fatalf("已确认运行过之后应忘掉启动记忆，实际 %q", got.Status)
+	}
+
+	// 记忆按服务名，别串台。
+	m2 := &Manager{}
+	m2.markStartRequested("a")
+	if got := m2.applyStartHint("b", State{Status: "stopped"}); got.Status != "stopped" {
+		t.Fatalf("启动记忆不得串到别的服务，实际 %q", got.Status)
+	}
+
+	// 更确定的证据（异常/环境不可用/未安装/未知）不许被盖成"启动中"。
+	for _, st := range []string{"error", "unavailable", "not-installed", "unknown"} {
+		m3 := &Manager{}
+		m3.markStartRequested("x")
+		if got := m3.applyStartHint("x", State{Status: st}); got.Status != st {
+			t.Fatalf("状态 %q 有更确定的证据，不该被改成 %q", st, got.Status)
+		}
+	}
+
+	// 超窗：不再有"可能正在启动"的证据，如实回到 stopped。
+	m4 := &Manager{}
+	m4.markStartRequested("y")
+	time.Sleep(serviceStartHintWindow + 30*time.Millisecond)
+	if got := m4.applyStartHint("y", State{Status: "stopped"}); got.Status != "stopped" {
+		t.Fatalf("超过启动记忆窗口后应如实报 stopped，实际 %q", got.Status)
+	}
+
+	// 停止请求要清掉记忆：刚停掉的服务不许在窗口内显示成"启动中"。
+	m5 := &Manager{}
+	m5.markStartRequested("z")
+	m5.clearStartHint("z")
+	if got := m5.applyStartHint("z", State{Status: "stopped"}); got.Status != "stopped" {
+		t.Fatalf("收到停止请求后不该再报启动中，实际 %q", got.Status)
+	}
 }
 
 // 门禁：动作快路径只做针对性探测 —— 不得调用全局昂贵探测，也不许固定 sleep。

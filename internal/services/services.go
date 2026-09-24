@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/mysql"
@@ -325,6 +326,13 @@ type Manager struct {
 	// filebrowserPlistOverride 仅供测试：把 File Browser 的 plist 指到临时文件。
 	// 没有它，单测会读真机 /Library/LaunchDaemons（单测不许碰真实环境）。
 	filebrowserPlistOverride string
+	// startRequested 记录"面板刚请求过启动/重启"的时刻（进程内记忆，不落库）。
+	//
+	// 为什么要它：launchd 在进程真正起来之前先报"已加载但未运行"，照抄就会把
+	// **正在启动**的服务显示成「已停止」（2026-09-24 真机：imgcompress 启动要 3s 以上，
+	// 点完启动看到的却是「已停止」）。见 applyStartHint。
+	startRequested map[string]time.Time
+	startMu        sync.Mutex
 }
 
 // Options 是管理器需要的环境信息。
@@ -621,7 +629,7 @@ func (m *Manager) List(ctx context.Context, withHealth bool) ([]*View, error) {
 			if err != nil {
 				r.state = State{Status: "error", Detail: err.Error()}
 			} else {
-				r.state = st
+				r.state = m.applyStartHint(s.Name, st)
 			}
 			// 用户**主动停掉**的服务（Enabled=false）不做健康检查。
 			//
@@ -679,7 +687,7 @@ func (m *Manager) Get(ctx context.Context, name string) (*View, error) {
 	if err != nil {
 		v.State = State{Status: "error", Detail: err.Error()}
 	} else {
-		v.State = st
+		v.State = m.applyStartHint(s.Name, st)
 	}
 	if s.HealthURL != "" {
 		v.Health = drv.Health(ctx)
@@ -726,6 +734,12 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	// start / restart ⇒ Enabled=true。健康检查与「需要处理」的判据都看这个字段 ——
 	// "用户主动停的"与"它自己崩了"是两件事，必须分得清（2026-09-18 用户报障）。
 	intentWarning := m.rememberUserIntent(ctx, s, action)
+	// 记下"刚请求过启动/重启"，供 Status 在窗口内报「启动中·未确认」（见 applyStartHint）。
+	if action == "stop" {
+		m.clearStartHint(name)
+	} else {
+		m.markStartRequested(name)
+	}
 	// attach 把"意图没记下来"的警告挂到返回状态上（每个返回点都要带上）。
 	attach := func(st State) State {
 		if intentWarning == "" {
@@ -767,9 +781,64 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	}
 	// start / restart 等不到"已运行"**不一定是失败**（有的服务启动慢、状态上报滞后），
 	// 所以仍然返回成功 —— 但必须让界面显示"还没确认"，不能让用户以为已经好了。
+	last = m.applyStartHint(name, last)
 	last.Warning = appendWarning(last.Warning,
 		fmt.Sprintf("已请求启动，但 %s 内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）", serviceActionWaitCap))
 	return attach(last), nil
+}
+
+// StatusStarting 是"已经发出启动请求，但还没确认它在运行"的状态。
+// 它与「已停止」不是一回事：launchd 在进程起来之前就报"已加载但未运行"。
+const StatusStarting = "starting"
+
+// serviceStartHintWindow 是启动请求的"记忆窗口"：窗口内且 launchd 还没报它运行时，
+// 状态报 starting（未确认）；超过窗口就如实回到 stopped（"可能正在启动"的证据已经过期，
+// 健康检查会按"应该在跑却没跑"把它报出来）。抽成变量：单测调小它，避免真等。
+var serviceStartHintWindow = 60 * time.Second
+
+// markStartRequested 记下"刚请求过启动/重启"的时刻。
+func (m *Manager) markStartRequested(name string) {
+	if name == "" {
+		return
+	}
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	if m.startRequested == nil {
+		m.startRequested = map[string]time.Time{}
+	}
+	m.startRequested[name] = time.Now()
+}
+
+// clearStartHint 忘掉启动记忆（收到停止请求、或已确认在运行时）。
+func (m *Manager) clearStartHint(name string) {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	delete(m.startRequested, name)
+}
+
+// applyStartHint 把"刚请求过启动、还没确认"的服务从「已停止」改报「启动中·未确认」。
+//
+// 只改 stopped 一态：error / unavailable / not-installed / unknown 都有更确定的证据，
+// 不许被"可能还在启动"盖掉（那会把真故障说成正常）。
+func (m *Manager) applyStartHint(name string, st State) State {
+	if st.Running {
+		m.clearStartHint(name)
+		return st
+	}
+	if st.Status != "stopped" {
+		return st
+	}
+	m.startMu.Lock()
+	t, ok := m.startRequested[name]
+	if ok && time.Since(t) >= serviceStartHintWindow {
+		delete(m.startRequested, name) // 过期的记忆没有意义，顺手清掉，不让它无限攒
+		ok = false
+	}
+	m.startMu.Unlock()
+	if ok {
+		st.Status = StatusStarting
+	}
+	return st
 }
 
 // serviceActionPollStep 是动作后就绪探测的步长：细粒度、就绪即返回。

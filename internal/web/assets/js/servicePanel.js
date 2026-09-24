@@ -492,6 +492,16 @@ export function statusLine(st, m, s = null) {
     if (st.status === 'unavailable') return { cls: 'warn', text: '环境不可用', title: st.detail || '' };
     if (st.status === 'not-installed') return { cls: 'warn', text: '未安装', title: st.detail || '' };
     if (st.status === 'unknown') return { cls: '', text: '未知', title: st.detail || '' };
+    // 刚点过启动/重启、系统还没报告它在运行：这时 launchd 报的是"已加载但未运行"，
+    // 照抄就变成「已停止」——那是假信息，也没告诉用户"再等一下"（2026-09-24 用户报障）。
+    if (st.status === 'starting') {
+      return {
+        cls: 'warn',
+        text: '启动中·未确认',
+        title: '已发出启动请求，但系统还没报告它在运行；等一两秒点「⟳ 刷新」再看'
+          + (st.detail ? '（' + st.detail + '）' : ''),
+      };
+    }
     // 有记录、没在跑、也没报错 → 这才是真的「已停止」；no_daemon 万一有记录也要按实说。
     if (m && m.no_daemon) return noDaemonLine(m);
     return { cls: '', text: '已停止', title: st.detail || '服务记录报的是停止状态，可以在这里启动它' };
