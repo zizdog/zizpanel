@@ -657,8 +657,15 @@ func parseLaunchPrint(st *LaunchState, stdout string) {
 				st.Running = true
 			}
 		case strings.HasPrefix(ln, "last exit code = "):
-			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(ln, "last exit code = "))); err == nil {
-				st.ExitCode = v
+			// 两种真机格式：`last exit code = 0` 与 `last exit code = 78: EX_CONFIG`
+			// （launchd 初始化失败时会带符号名）。只认第一种会把退出码整条丢掉，
+			// 而那正是"这个作业起不来"最关键的线索（2026-09-24 真机踩到）。
+			v := strings.TrimSpace(strings.TrimPrefix(ln, "last exit code = "))
+			if i := strings.IndexByte(v, ':'); i >= 0 {
+				v = strings.TrimSpace(v[:i])
+			}
+			if n, err := strconv.Atoi(v); err == nil {
+				st.ExitCode = n
 			}
 		}
 	}
@@ -941,6 +948,25 @@ func LaunchEnsureRunning(label string) error {
 		return nil // 已在跑：启动是幂等空操作，绝不白踢
 	}
 	return launchKick(label, st.Domain)
+}
+
+// LaunchReload 卸载后重新装载任务（bootout + bootstrap），用于"必须重建 launchd
+// 记录"的场合。
+//
+// 什么时候必须这么做（2026-09-24 真机证据）：面板在线升级把自己那个二进制换掉后，
+// launchd 为"跑同一个二进制的作业"缓存的签名记录（LWCR）就过期了 —— 它想刷新却找不到
+// 旧进程，于是每次拉起都失败：
+//
+//	Service could not initialize: Unable to get updated LWCR ... error 0x3 - No such process
+//
+// 表现是 `launchctl print` 里 `state = spawn scheduled` + `last exit code = 78: EX_CONFIG`；
+// kickstart **救不回来**（真机实测：点重启只会继续失败）。bootout + bootstrap 会让 launchd
+// 重新读盘上的二进制并重建记录 —— 真机实测这一步能立刻恢复（imgcompress 恢复运行）。
+func LaunchReload(label string) error {
+	if err := LaunchUnload(label); err != nil {
+		return err
+	}
+	return LaunchLoad(label)
 }
 
 // launchKick 在指定域里 kickstart 并复核。

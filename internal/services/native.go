@@ -234,6 +234,14 @@ func (d *nativeDriver) Restart(ctx context.Context) error {
 	return priv.LaunchKickstart(d.svc.LaunchLabel)
 }
 
+// Reload 重新装载服务定义（bootout + bootstrap），只在"launchd 记录层坏了、
+// kickstart 救不回来"时用（判据见 services.go 的 serviceLaunchConfigFailed）。
+// 典型成因：在线升级换掉了作业跑的那个二进制，launchd 的签名记录（LWCR）过期
+// 且刷新失败（真机 2026-09-24，见 priv.LaunchReload）。
+func (d *nativeDriver) Reload(ctx context.Context) error {
+	return priv.LaunchReload(d.svc.LaunchLabel)
+}
+
 // logPaths 返回该服务的日志文件路径（可能多个）。
 //
 // launchd 的日志由 plist 里的 StandardOutPath / StandardErrorPath 指定，

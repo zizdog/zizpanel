@@ -167,6 +167,35 @@ func TestStartHintReportsStartingNotStopped(t *testing.T) {
 	}
 }
 
+// 门禁：只有"launchd 记录层起不来"的确定性证据（已加载 + 没在跑 + EX_CONFIG 78）
+// 才许触发"重装服务定义"，别的失败一律照旧如实上报（真机 2026-09-24：
+// 在线升级换掉二进制后 imgcompress 每次拉起都是 78: EX_CONFIG，kickstart 救不回来）。
+func TestServiceLaunchConfigFailedOnlyOnConfigExit(t *testing.T) {
+	if !serviceLaunchConfigFailed(State{Status: "stopped", ExitCode: launchConfigErrorExit}) {
+		t.Fatal("已加载、没在跑、退出码 EX_CONFIG(78) 应当判为 launchd 配置层失败")
+	}
+	for _, st := range []State{
+		{Status: "running", Running: true, ExitCode: launchConfigErrorExit}, // 正在跑：不是失败
+		{Status: "stopped", ExitCode: 1},                                    // 别的退出码：可能是它自己崩的
+		{Status: "stopped"},                                                 // 没有退出码：拿不准，不猜
+		{Status: "error", ExitCode: launchConfigErrorExit},                  // 别的错误态：另有更确定的证据
+		{Status: "unknown", ExitCode: launchConfigErrorExit},
+	} {
+		if serviceLaunchConfigFailed(st) {
+			t.Errorf("%+v 不该被判为 launchd 配置层失败", st)
+		}
+	}
+}
+
+// 门禁：动作路径必须真的有"重装服务定义"这一步 —— 只写判据不接线等于没修
+// （真机 2026-09-24：作业卡在 launchd 记录层时，点「重启」只会一直失败）。
+func TestServiceActionWiresLaunchConfigRepair(t *testing.T) {
+	body := mustFuncBody(t, "services.go", "func (m *Manager) Action(")
+	if !strings.Contains(body, "serviceLaunchConfigFailed(last)") || !strings.Contains(body, "Reload(ctx)") {
+		t.Error("Action 必须在确认是 launchd 记录层失败时调用 Reload 重装服务定义")
+	}
+}
+
 // 门禁：动作快路径只做针对性探测 —— 不得调用全局昂贵探测，也不许固定 sleep。
 // 昂贵探测（brew services list / 全量 ListServices）放动作路径就是"面板比命令行慢
 // 一个数量级"的复发点（坑 165/225）。

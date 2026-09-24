@@ -608,3 +608,75 @@ func TestLaunchOutputSaysMissing(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 重新装载（bootout + bootstrap）与退出码解析 ----------
+
+// 门禁：`launchctl print` 的退出码有两种真机格式，带符号名的那种（78: EX_CONFIG）
+// 也必须解析出来 —— 它是"作业在配置层就起不来"的唯一线索，丢了就只能干瞪眼。
+// 真机证据（2026-09-24）：在线升级换掉二进制后 imgcompress 每次拉起都失败，
+// print 里就是 `state = spawn scheduled` + `last exit code = 78: EX_CONFIG`。
+func TestParseLaunchPrintKeepsExitCodeWithSymbol(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want int
+	}{
+		{"带符号名（真机格式）", "state = spawn scheduled\n\tlast exit code = 78: EX_CONFIG\n", 78},
+		{"纯数字", "state = running\n\tpid = 42\n\tlast exit code = 0\n", 0},
+		{"没有退出码行", "state = running\n\tpid = 42\n", -1},
+	}
+	for _, tc := range cases {
+		st := LaunchState{ExitCode: -1}
+		parseLaunchPrint(&st, tc.out)
+		if st.ExitCode != tc.want {
+			t.Errorf("%s: 退出码 = %d，期望 %d", tc.name, st.ExitCode, tc.want)
+		}
+	}
+}
+
+// 门禁：重新装载必须"先卸再装"，且严格各一次 —— 这是唯一能救回
+// "launchd 签名记录过期"（kickstart 救不回来）的办法（真机 2026-09-24）。
+func TestLaunchReloadUnloadsThenBootstraps(t *testing.T) {
+	f := newFakeLaunchctl("user/501")
+	withFakeLaunch(t, f)
+	withFakePlist(t, "/Library/LaunchDaemons/"+testLabel+".plist")
+
+	if err := LaunchReload(testLabel); err != nil {
+		t.Fatalf("重新装载应当成功: %v", err)
+	}
+	calls := f.callList()
+	var ops []string
+	for _, c := range calls {
+		if strings.HasPrefix(c, "bootout ") || strings.HasPrefix(c, "bootstrap ") {
+			ops = append(ops, strings.Fields(c)[0])
+		}
+	}
+	if len(ops) != 2 || ops[0] != "bootout" || ops[1] != "bootstrap" {
+		t.Fatalf("应当先 bootout 再 bootstrap 各一次，实际：%v（全部调用 %v）", ops, calls)
+	}
+	st, err := LaunchStatus(testLabel)
+	if err != nil {
+		t.Fatalf("重新装载后应当能查到状态: %v", err)
+	}
+	if !st.Loaded || !st.Running {
+		t.Fatalf("重新装载后必须真的在跑，实际 %+v", st)
+	}
+}
+
+// 门禁：本来就没加载时，重新装载就是**一次** bootstrap（bootout 幂等空操作），
+// 不许因为"卸载失败"就报错、也不许把作业留在卸载态。
+func TestLaunchReloadOnUnloadedJobJustBootstraps(t *testing.T) {
+	f := newFakeLaunchctl()
+	withFakeLaunch(t, f)
+	withFakePlist(t, "/Library/LaunchDaemons/"+testLabel+".plist")
+
+	if err := LaunchReload(testLabel); err != nil {
+		t.Fatalf("未加载时的重新装载应当成功: %v", err)
+	}
+	if n := f.count("bootout"); n != 0 {
+		t.Fatalf("本来就没加载，不该 bootout，实际 %d 次：%v", n, f.callList())
+	}
+	if n := f.count("bootstrap"); n != 1 {
+		t.Fatalf("应当 bootstrap 恰好一次，实际 %d 次：%v", n, f.callList())
+	}
+}

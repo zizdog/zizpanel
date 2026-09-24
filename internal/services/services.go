@@ -755,7 +755,23 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	// 等待状态稳定：细粒度轮询、就绪即返回，总上限 serviceActionWaitCap。
 	want := action != "stop"
 	last, settled := waitServiceState(ctx, drv.Status, want)
+	// launchd 记录层坏了（EX_CONFIG）时 kickstart 救不回来，必须重装一次服务定义再等
+	// （真机 2026-09-24：在线升级换掉二进制后 imgcompress 一直起不来，点重启也没用）。
+	reloaded, reloadErr := false, error(nil)
+	if !settled && want && serviceLaunchConfigFailed(last) {
+		if rl, ok := drv.(interface {
+			Reload(ctx context.Context) error
+		}); ok {
+			if reloadErr = rl.Reload(ctx); reloadErr == nil {
+				reloaded = true
+				last, settled = waitServiceState(ctx, drv.Status, want)
+			}
+		}
+	}
 	if settled {
+		if reloaded {
+			last.Detail = joinDetail(last.Detail, "已重装服务定义后恢复运行")
+		}
 		return attach(last), nil
 	}
 	if last.Status == "" {
@@ -782,9 +798,37 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	// start / restart 等不到"已运行"**不一定是失败**（有的服务启动慢、状态上报滞后），
 	// 所以仍然返回成功 —— 但必须让界面显示"还没确认"，不能让用户以为已经好了。
 	last = m.applyStartHint(name, last)
-	last.Warning = appendWarning(last.Warning,
-		fmt.Sprintf("已请求启动，但 %s 内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）", serviceActionWaitCap))
+	warning := fmt.Sprintf("已请求启动，但 %s 内还没确认它在运行（可能仍在启动中，请点「⟳ 刷新」确认）", serviceActionWaitCap)
+	switch {
+	case reloadErr != nil:
+		warning += "；重装服务定义也失败：" + reloadErr.Error()
+	case reloaded:
+		warning += "；已重装服务定义，仍未确认在运行"
+	}
+	last.Warning = appendWarning(last.Warning, warning)
 	return attach(last), nil
+}
+
+// launchConfigErrorExit 是 launchd 报"作业在配置层就起不来"的退出码（EX_CONFIG）。
+const launchConfigErrorExit = 78
+
+// joinDetail 把一句补充说明接在状态说明后面（没有原说明时就是它本身）。
+func joinDetail(cur, add string) string {
+	if strings.TrimSpace(cur) == "" {
+		return add
+	}
+	return cur + "；" + add
+}
+
+// serviceLaunchConfigFailed 判断"起不来"是不是 launchd 记录层的失败。
+//
+// 只认确定性证据：作业已加载、没在跑、上次退出码就是 EX_CONFIG(78)。真机证据
+// （2026-09-24）：在线升级换掉作业跑的那个二进制后，每次拉起都
+// `Service could not initialize: Unable to get updated LWCR … error 0x3 - No such process`，
+// `launchctl print` 里正是 `state = spawn scheduled` + `last exit code = 78: EX_CONFIG`。
+// 拿不准（别的退出码 / 别的状态）一律不当成它 —— 那种情况照旧如实上报，不自作主张重装。
+func serviceLaunchConfigFailed(st State) bool {
+	return !st.Running && st.Status == "stopped" && st.ExitCode == launchConfigErrorExit
 }
 
 // StatusStarting 是"已经发出启动请求，但还没确认它在运行"的状态。
