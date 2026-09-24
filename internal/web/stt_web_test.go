@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -844,6 +845,15 @@ func TestSTTModelDownloadGoesToTask(t *testing.T) {
 	sttSparseModel(t, modelsDir, "small")
 	eng := newSTTFakeEngine(t, modelsDir, sttFakeEngineOptions{})
 	srv := newSTTTestServer(t, eng, root, 60)
+	// 把下载换成"立刻失败"：这个用例只断言 202 + task_id 的契约，
+	// 真去联网下载的话任务会在测试结束后继续往 t.TempDir() 里写（全量跑时偶发
+	// "directory not empty"）。注入口见 stt_web.go 的 sttDownloadFn。
+	prevDownload := sttDownloadFn
+	sttDownloadFn = func(_ context.Context, _ []services.STTModelSource, _ string, _ services.STTModel,
+		_ services.STTFetchFunc, _ func(string)) (*services.STTDownloadResult, error) {
+		return nil, errors.New("单测不让它真下载")
+	}
+	t.Cleanup(func() { sttDownloadFn = prevDownload })
 
 	// 已下载的档位：直接返回 already，不该建任务。
 	req := httptest.NewRequest(http.MethodPost, "/v1/models/small/download", nil)

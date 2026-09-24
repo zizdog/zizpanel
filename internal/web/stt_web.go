@@ -378,6 +378,14 @@ func (s *STTServer) handleModelDelete(w http.ResponseWriter, r *http.Request) {
 // 下载是**长任务**（medium 档 1.43 GiB / 实测 783 KB/s ≈ 32 分钟），
 // 所以必须走任务中心：同步返回会让用户只能对着转圈，关掉窗口就找不回进度，
 // 而且任务挂在 r.Context() 上 —— 用户一刷新就把下载杀了（AGENTS 第三节）。
+// sttDownloadFn 是模型下载的**注入口**。
+//
+// 为什么需要它：这个处理器会起一个**后台任务**去下载（真实网络、几十分钟超时）。
+// 单测只断言"202 + task_id"这个契约，任务却会在测试返回后继续往 t.TempDir() 里写，
+// 于是清理临时目录时偶发 `directory not empty` —— 全量跑 `make check` 时真的红过一次
+// （2026-09-24）。测试把这里换成"立刻失败"，任务瞬间终态，竞争就没了。
+var sttDownloadFn = services.DownloadSTTModelTo
+
 func (s *STTServer) handleModelDownload(w http.ResponseWriter, r *http.Request) {
 	model, err := services.FindSTTModel(r.PathValue("id"))
 	if err != nil {
@@ -402,7 +410,7 @@ func (s *STTServer) handleModelDownload(w http.ResponseWriter, r *http.Request) 
 				model.ID, humanSize(model.Bytes), dst, len(srcs)))
 			dctx, cancel := context.WithTimeout(ctx, services.STTModelDownloadTimeout)
 			defer cancel()
-			res, derr := services.DownloadSTTModelTo(dctx, srcs, dst, model, services.STTDefaultFetch,
+			res, derr := sttDownloadFn(dctx, srcs, dst, model, services.STTDefaultFetch,
 				func(note string) { log(tasks.LevelStep, note) })
 			if derr != nil {
 				return nil, derr
