@@ -1415,16 +1415,27 @@ func dockerReferenceInstallMessage(app services.App, mirrorBase string) string {
 
 // netHinted 包一层任务体：失败原因是网络问题时附统一提示（判据见 services/netfail.go）。
 func netHinted(run taskRunner) taskRunner {
+	return netHintedFor("", run)
+}
+
+// netHintedFor 与 netHinted 同义，但知道**是哪个应用**：失败时除了网络提示，还会
+// 按证据补一句"下一步怎么做"（磁盘满 / 端口被占 / 被隐私保护挡住 / formula 不存在 /
+// launchd 拒绝装载 / 产物架构不对 —— 见 services/install_failure.go）。
+// appID 为空或不在目录里时只做网络提示（例如一键 LNMP 走的不是应用条目）。
+func netHintedFor(appID string, run taskRunner) taskRunner {
 	return func(ctx context.Context, log tasks.LogFunc) (any, error) {
 		res, err := run(ctx, log)
-		return res, services.AppendNetworkHint(err)
+		err = services.AppendNetworkHint(err)
+		err = services.AppendInstallAdviceFor(appID, err)
+		return res, err
 	}
 }
 
 // launchInstallTask 与 launchTask 同语义，只是给失败原因补网络提示（市场安装入口统一走它）。
 func (s *Server) launchInstallTask(w http.ResponseWriter, r *http.Request,
 	kind, target, title, auditAction string, run taskRunner) {
-	s.launchTask(w, r, kind, target, title, auditAction, netHinted(run))
+	// target 就是应用 ID（市场安装/升级都是），用它把失败建议说具体（端口/名字）。
+	s.launchTask(w, r, kind, target, title, auditAction, netHintedFor(target, run))
 }
 
 // handleMarketInstall 安装应用。
