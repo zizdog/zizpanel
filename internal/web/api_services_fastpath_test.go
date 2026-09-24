@@ -22,6 +22,22 @@ func TestHandleServiceActionHasNoGlobalProbe(t *testing.T) {
 	}
 }
 
+// 门禁：启动记忆必须是**进程级单例**。svcManager() 每次请求都新建 Manager，
+// 记忆若建在 Manager 身上，点完启动的那一次刷新又会显示「已停止」
+// （2026-09-24 实际踩到）。
+func TestServiceManagerSharesProcessStartHints(t *testing.T) {
+	body := funcBodyForTest(t, "api_services.go", "func (s *Server) svcManager(")
+	if !strings.Contains(body, "s.startHints") {
+		t.Error("svcManager 必须注入 Server 自己那一份 StartHints（进程级单例）")
+	}
+	if strings.Contains(body, "&services.StartHintStore{") {
+		t.Error("svcManager 不得每次请求新建 StartHintStore —— 那样启动记忆活不过一次请求")
+	}
+	if !strings.Contains(funcBodyForTest(t, "server.go", "func New("), "startHints:") {
+		t.Error("New() 必须为 Server 初始化 startHints 单例")
+	}
+}
+
 // funcBodyForTest 取出 path 里以 sig 开头那个顶层函数的源码（到下一个顶层 func 为止）。
 func funcBodyForTest(t *testing.T, path, sig string) string {
 	t.Helper()

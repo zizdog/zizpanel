@@ -326,13 +326,6 @@ type Manager struct {
 	// filebrowserPlistOverride 仅供测试：把 File Browser 的 plist 指到临时文件。
 	// 没有它，单测会读真机 /Library/LaunchDaemons（单测不许碰真实环境）。
 	filebrowserPlistOverride string
-	// startRequested 记录"面板刚请求过启动/重启"的时刻（进程内记忆，不落库）。
-	//
-	// 为什么要它：launchd 在进程真正起来之前先报"已加载但未运行"，照抄就会把
-	// **正在启动**的服务显示成「已停止」（2026-09-24 真机：imgcompress 启动要 3s 以上，
-	// 点完启动看到的却是「已停止」）。见 applyStartHint。
-	startRequested map[string]time.Time
-	startMu        sync.Mutex
 }
 
 // Options 是管理器需要的环境信息。
@@ -401,6 +394,13 @@ type Options struct {
 	// 1m，用户一导入就 413）；装 PHP 时还要写 conf.d 限制片段。两者都用这里的值，
 	// 空值由 sites.Limits.Normalize() 补默认 512m/512M。
 	UploadLimits sites.Limits
+
+	// StartHints 是"面板刚请求过启动/重启"的进程级记忆（见 StartHintStore）。
+	//
+	// 为什么由调用方注入：web 层每次请求都新建 Manager（svcManager），记忆挂在
+	// Manager 上活不过一次请求 —— 点完启动的那次刷新就查不到了（2026-09-24 踩到）。
+	// nil = 不记（状态照旧，不报错）。
+	StartHints *StartHintStore
 }
 
 // MySQLCredential 是"面板持有的 MySQL 超级账号凭据"（来自 config.json）。
@@ -734,11 +734,11 @@ func (m *Manager) Action(ctx context.Context, name, action string) (State, error
 	// start / restart ⇒ Enabled=true。健康检查与「需要处理」的判据都看这个字段 ——
 	// "用户主动停的"与"它自己崩了"是两件事，必须分得清（2026-09-18 用户报障）。
 	intentWarning := m.rememberUserIntent(ctx, s, action)
-	// 记下"刚请求过启动/重启"，供 Status 在窗口内报「启动中·未确认」（见 applyStartHint）。
+	// 记下"刚请求过启动/重启"，供状态在窗口内报「启动中·未确认」（见 applyStartHint）。
 	if action == "stop" {
-		m.clearStartHint(name)
+		m.opt.StartHints.Clear(name)
 	} else {
-		m.markStartRequested(name)
+		m.opt.StartHints.Mark(name)
 	}
 	// attach 把"意图没记下来"的警告挂到返回状态上（每个返回点都要带上）。
 	attach := func(st State) State {
@@ -796,24 +796,58 @@ const StatusStarting = "starting"
 // 健康检查会按"应该在跑却没跑"把它报出来）。抽成变量：单测调小它，避免真等。
 var serviceStartHintWindow = 60 * time.Second
 
-// markStartRequested 记下"刚请求过启动/重启"的时刻。
-func (m *Manager) markStartRequested(name string) {
-	if name == "" {
-		return
-	}
-	m.startMu.Lock()
-	defer m.startMu.Unlock()
-	if m.startRequested == nil {
-		m.startRequested = map[string]time.Time{}
-	}
-	m.startRequested[name] = time.Now()
+// StartHintStore 是"面板刚请求过启动/重启"的**进程级**记忆。
+//
+// 为什么必须跨请求（2026-09-24 实际踩到）：web 层每次请求都新建 Manager
+// （见 api_services.go 的 svcManager），记忆挂在 Manager 上活不过一次请求 ——
+// 点完启动后的那次刷新就查不到了。所以由调用方（Server）持有一份并经
+// Options.StartHints 注入；不落库：丢了大不了退回旧显示。
+//
+// 方法都容忍 nil 接收者：没注入 = 不记，绝不因此报错。
+type StartHintStore struct {
+	mu   sync.Mutex
+	when map[string]time.Time
 }
 
-// clearStartHint 忘掉启动记忆（收到停止请求、或已确认在运行时）。
-func (m *Manager) clearStartHint(name string) {
-	m.startMu.Lock()
-	defer m.startMu.Unlock()
-	delete(m.startRequested, name)
+// Mark 记下"刚请求过启动"的时刻。
+func (s *StartHintStore) Mark(name string) {
+	if s == nil || name == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.when == nil {
+		s.when = map[string]time.Time{}
+	}
+	s.when[name] = time.Now()
+}
+
+// Clear 忘掉启动记忆（收到停止请求、或已确认在运行时）。
+func (s *StartHintStore) Clear(name string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.when, name)
+}
+
+// Pending 报告 name 是否还在窗口内。过期的记忆顺手清掉，不让它无限攒。
+func (s *StartHintStore) Pending(name string, window time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.when[name]
+	if !ok {
+		return false
+	}
+	if time.Since(t) >= window {
+		delete(s.when, name)
+		return false
+	}
+	return true
 }
 
 // applyStartHint 把"刚请求过启动、还没确认"的服务从「已停止」改报「启动中·未确认」。
@@ -822,20 +856,13 @@ func (m *Manager) clearStartHint(name string) {
 // 不许被"可能还在启动"盖掉（那会把真故障说成正常）。
 func (m *Manager) applyStartHint(name string, st State) State {
 	if st.Running {
-		m.clearStartHint(name)
+		m.opt.StartHints.Clear(name)
 		return st
 	}
 	if st.Status != "stopped" {
 		return st
 	}
-	m.startMu.Lock()
-	t, ok := m.startRequested[name]
-	if ok && time.Since(t) >= serviceStartHintWindow {
-		delete(m.startRequested, name) // 过期的记忆没有意义，顺手清掉，不让它无限攒
-		ok = false
-	}
-	m.startMu.Unlock()
-	if ok {
+	if m.opt.StartHints.Pending(name, serviceStartHintWindow) {
 		st.Status = StatusStarting
 	}
 	return st

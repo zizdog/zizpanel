@@ -103,6 +103,12 @@ type Server struct {
 	dockerMirrorProbes  []services.DockerMirrorProbe
 	dockerMirrorChecked time.Time
 
+	// ---- 服务"刚请求过启动/重启"的记忆（进程级）----
+	//
+	// 理由同上：svcManager() 每次请求都新建 Manager，记忆挂在 Manager 上活不过
+	// 一次请求（2026-09-24 实际踩到）。不落库：丢了大不了退回"已停止"的旧显示。
+	startHints *services.StartHintStore
+
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog
 	logOnce sync.Once
@@ -211,6 +217,7 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		Procs:       sysinfo.NewProcSampler(),
 		Log:         logx.New("web"),
 		serviceRepo: services.NewRepository(st),
+		startHints:  &services.StartHintStore{},
 		Tasks:       tasks.NewManager(),
 		static:      sub,
 		startAt:     time.Now(),

@@ -106,8 +106,8 @@ func TestStartHintReportsStartingNotStopped(t *testing.T) {
 	serviceStartHintWindow = 50 * time.Millisecond
 	t.Cleanup(func() { serviceStartHintWindow = prevWin })
 
-	m := &Manager{}
-	m.markStartRequested("com-zizdog-imgcompress")
+	m := &Manager{opt: Options{StartHints: &StartHintStore{}}}
+	m.opt.StartHints.Mark("com-zizdog-imgcompress")
 	got := m.applyStartHint("com-zizdog-imgcompress", State{Status: "stopped", Detail: "已加载但未运行"})
 	if got.Status != StatusStarting {
 		t.Fatalf("刚请求启动的服务应报 %q，实际 %q", StatusStarting, got.Status)
@@ -125,35 +125,45 @@ func TestStartHintReportsStartingNotStopped(t *testing.T) {
 	}
 
 	// 记忆按服务名，别串台。
-	m2 := &Manager{}
-	m2.markStartRequested("a")
+	m2 := &Manager{opt: Options{StartHints: &StartHintStore{}}}
+	m2.opt.StartHints.Mark("a")
 	if got := m2.applyStartHint("b", State{Status: "stopped"}); got.Status != "stopped" {
 		t.Fatalf("启动记忆不得串到别的服务，实际 %q", got.Status)
 	}
 
 	// 更确定的证据（异常/环境不可用/未安装/未知）不许被盖成"启动中"。
 	for _, st := range []string{"error", "unavailable", "not-installed", "unknown"} {
-		m3 := &Manager{}
-		m3.markStartRequested("x")
+		m3 := &Manager{opt: Options{StartHints: &StartHintStore{}}}
+		m3.opt.StartHints.Mark("x")
 		if got := m3.applyStartHint("x", State{Status: st}); got.Status != st {
 			t.Fatalf("状态 %q 有更确定的证据，不该被改成 %q", st, got.Status)
 		}
 	}
 
 	// 超窗：不再有"可能正在启动"的证据，如实回到 stopped。
-	m4 := &Manager{}
-	m4.markStartRequested("y")
+	m4 := &Manager{opt: Options{StartHints: &StartHintStore{}}}
+	m4.opt.StartHints.Mark("y")
 	time.Sleep(serviceStartHintWindow + 30*time.Millisecond)
 	if got := m4.applyStartHint("y", State{Status: "stopped"}); got.Status != "stopped" {
 		t.Fatalf("超过启动记忆窗口后应如实报 stopped，实际 %q", got.Status)
 	}
 
 	// 停止请求要清掉记忆：刚停掉的服务不许在窗口内显示成"启动中"。
-	m5 := &Manager{}
-	m5.markStartRequested("z")
-	m5.clearStartHint("z")
+	m5 := &Manager{opt: Options{StartHints: &StartHintStore{}}}
+	m5.opt.StartHints.Mark("z")
+	m5.opt.StartHints.Clear("z")
 	if got := m5.applyStartHint("z", State{Status: "stopped"}); got.Status != "stopped" {
 		t.Fatalf("收到停止请求后不该再报启动中，实际 %q", got.Status)
+	}
+
+	// 记忆必须跨 Manager 生效：web 层每次请求都新建 Manager，若记忆挂在自己身上，
+	// 点完启动后的那次刷新就查不到（2026-09-24 实际踩到）。
+	shared := &StartHintStore{}
+	first := &Manager{opt: Options{StartHints: shared}}
+	first.opt.StartHints.Mark("svc")
+	second := &Manager{opt: Options{StartHints: shared}}
+	if got := second.applyStartHint("svc", State{Status: "stopped"}); got.Status != StatusStarting {
+		t.Fatalf("另一个 Manager 也必须看得到启动记忆（进程级），实际 %q", got.Status)
 	}
 }
 
