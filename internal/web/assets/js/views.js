@@ -1038,6 +1038,9 @@ export function SettingsView(content, ctx = {}) {
       },
     });
     const proxyAuth = h('input', { type: 'checkbox', checked: s.app_proxy_auth !== false });
+    // aria2 的 RPC 代理：默认**不**校验来源（各种第三方客户端/脚本才连得上），
+    // 想收紧（例如面板暴露到公网）就勾上；保护本来主要是 aria2 自己的 rpc-secret。
+    const aria2Strict = h('input', { type: 'checkbox', checked: s.aria2_strict_rpc_sources === true });
     const sessionHours = h('input.input', { type: 'number', value: s.session_hours, min: 1, max: 720 });
     const maxFail = h('input.input', { type: 'number', value: s.login_max_fail, min: 1, max: 50 });
     const lockMins = h('input.input', { type: 'number', value: s.login_lock_mins, min: 1, max: 1440 });
@@ -1135,6 +1138,7 @@ export function SettingsView(content, ctx = {}) {
             trust_proxy: trustProxy.checked,
             panel_suffix: suffixInput.value.trim(),
             app_proxy_auth: proxyAuth.checked,
+            aria2_strict_rpc_sources: aria2Strict.checked,
             session_hours: Number(sessionHours.value),
             login_max_fail: Number(maxFail.value),
             login_lock_mins: Number(lockMins.value),
@@ -1200,6 +1204,11 @@ export function SettingsView(content, ctx = {}) {
             h('label', [h('span', { text: '应用界面（/iopaint/、/squoosh/ 等）要求先登录面板' })]),
             h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
               proxyAuth, h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' }, text: '默认要求登录：这些界面挂在面板端口上，而 Squoosh 这类应用本身没有鉴权。' }),
+            ]),
+            h('label', { style: { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '8px' } }, [
+              aria2Strict,
+              h('span', { style: { fontSize: '12.5px', color: 'var(--text-dim)' },
+                text: 'aria2：只允许面板界面与专用凭证访问 RPC（严格模式）。默认**关闭** —— 关着时 AriaNg / 浏览器扩展 / 油猴脚本 / 手机 App / 命令行都能连它，保护靠 aria2 自己的 rpc-secret；打开后只有面板页面（同源）和带 X-Aria2-Token 的脚本能连。' }),
             ]),
           ]),
           h('div.row', [

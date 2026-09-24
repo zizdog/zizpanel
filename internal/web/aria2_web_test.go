@@ -132,21 +132,68 @@ func TestAria2RPCGuards(t *testing.T) {
 		t.Errorf("非 JSON 的 RPC 请求应 415，实际 %d", res2.StatusCode)
 	}
 
-	// ③ 跨站来源 → 403
-	req3, _ := http.NewRequest("POST", ts.URL+"/jsonrpc", strings.NewReader(`{"jsonrpc":"2.0"}`))
-	req3.Header.Set("Content-Type", "application/json")
-	req3.Header.Set("Sec-Fetch-Site", "cross-site")
-	for _, c := range cookies {
-		req3.AddCookie(c)
+	// ③ 默认（兼容模式）：跨站来源**不再**被 403 拦下 —— 各种第三方客户端
+	//（AriaNg / 浏览器扩展 / 油猴 / 手机 App / 命令行）都不是同源浏览器页面，
+	// 拦它们等于把 aria2 的常用形态全废掉；真正的保护是 aria2 自己的 rpc-secret。
+	// 这一条以前的期望是 403，2026-09-24 用户明确要求"至少可以是可选的"后改成默认放行。
+	if res3 := postRPC(t, ts, cookies, "cross-site"); res3.StatusCode == http.StatusForbidden {
+		t.Errorf("默认（兼容）模式下不该因来源被拒，实际 403")
 	}
-	res3, err := http.DefaultClient.Do(req3)
+}
+
+// TestAria2RPCStrictModeBlocksCrossSite 严格模式（设置里打开）才按来源校验。
+func TestAria2RPCStrictModeBlocksCrossSite(t *testing.T) {
+	srv, ts := newTestServer(t)
+	cookies := loginTestPanel(t, ts)
+
+	// 严格模式下：跨站来源 → 403
+	srv.Cfg.Aria2StrictRPCSources = true
+	if res := postRPC(t, ts, cookies, "cross-site"); res.StatusCode != http.StatusForbidden {
+		t.Errorf("严格模式下跨站来源应 403，实际 %d", res.StatusCode)
+	}
+	// 同源/无来源（none，例如命令行或插件）不受影响：这里没有 Sec-Fetch-Site 头
+	if res := postRPC(t, ts, cookies, ""); res.StatusCode == http.StatusForbidden {
+		t.Errorf("严格模式也不该拦「没有浏览器来源头」的请求（插件/脚本正是这种）")
+	}
+	// 带专用凭证 → 严格模式下也放行
+	srv.Cfg.Aria2APIToken = "tok-123456"
+	req, _ := http.NewRequest("POST", ts.URL+"/jsonrpc", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.Header.Set(Aria2APITokenHeader, "tok-123456")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = res3.Body.Close()
-	if res3.StatusCode != http.StatusForbidden {
-		t.Errorf("跨站来源应 403，实际 %d", res3.StatusCode)
+	_ = res.Body.Close()
+	if res.StatusCode == http.StatusForbidden {
+		t.Error("带了正确专用凭证就不该被来源校验拦下")
 	}
+}
+
+// postRPC 发一条 RPC（带会话 cookie；site 非空则带上 Sec-Fetch-Site）。
+func postRPC(t *testing.T, ts *httptest.Server, cookies []*http.Cookie, site string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest("POST", ts.URL+"/jsonrpc", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if site != "" {
+		req.Header.Set("Sec-Fetch-Site", site)
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	return res
 }
 
 func TestAria2RPCProxiesToUpstream(t *testing.T) {
@@ -346,7 +393,10 @@ func TestAria2RPCTokenBypassesBrowserOriginCheck(t *testing.T) {
 
 	const token = "script-token-fixture-0123456789"
 	srv.Cfg.Aria2APIToken = token
-	t.Cleanup(func() { srv.Cfg.Aria2APIToken = "" })
+	// 专用凭证只在**严格模式**下才有意义：默认（兼容）模式根本不看来源，
+	// 也就不需要这条旁路。这里显式打开严格模式，验证"凭证能过、别的都被拦"。
+	srv.Cfg.Aria2StrictRPCSources = true
+	t.Cleanup(func() { srv.Cfg.Aria2APIToken = ""; srv.Cfg.Aria2StrictRPCSources = false })
 
 	payload := `{"jsonrpc":"2.0","id":"z","method":"aria2.getVersion","params":["token:x"]}`
 	call := func(hdr map[string]string) int {

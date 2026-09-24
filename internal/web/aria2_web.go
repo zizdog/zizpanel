@@ -32,7 +32,12 @@ import (
 //      （另外挂一个 POST /jsonrpc：AriaNg 的默认 interface 就是 jsonrpc，
 //        挂上它，"RPC 界面"那一栏可以保持默认值）
 //
-//  鉴权说明（别顺手删）：
+//  鉴权说明（2026-09-24 改过一次默认值，别顺手删注释只看代码）：
+//    · **来源校验默认关闭**：过去一律用 Sec-Fetch-Site 拦跨站来源，结果是 AriaNg 之外的
+//      客户端（浏览器扩展 / 油猴 / 手机 App / 命令行）**全部 403** —— 而它们正是 aria2 的
+//      常用形态，用户明确要求"至少可以是可选的"。现在默认只要求 aria2 自己的 rpc-secret，
+//      想收紧就在「面板设置 → 访问与安全」勾「aria2 严格模式」（见 Cfg.Aria2StrictRPCSources）。
+//    · 严格模式下：带 X-Aria2-Token 的脚本放行，其余按浏览器来源判。
 //    · 界面与应用界面同一策略（AppProxyAuth 打开时要求登录，见 requireAppProxyAuth）；
 //    · RPC 是**控制面**（能删文件、能加下载），无论 AppProxyAuth 怎么配都要求登录；
 //    · RPC 只收 application/json，并拒绝跨站来源（Sec-Fetch-Site）——
@@ -239,7 +244,10 @@ func (s *Server) aria2RPCProxy(w http.ResponseWriter, r *http.Request) {
 	// 刻意**不做 CORS 预检**：这条通道是给"不受同源策略约束"的扩展/脚本用的
 	// （GM_xmlhttpRequest 不发预检），浏览器页面本来就有同源入口。加了预检 +
 	// Access-Control-Allow-* 反而是把 CORS 当解法 —— 方向错了（用户 2026-09-23 明确）。
-	if !s.aria2TokenOK(r) {
+	// 默认**只要求 rpc-secret**，不做出处校验 —— 否则 AriaNg 之外的客户端
+	// （扩展 / 油猴 / 手机 App / 命令行）全部 403，而它们正是 aria2 的常用形态。
+	// 想收紧就在设置里打开「严格模式」（用户 2026-09-24 明确要求"至少可以是可选的"）。
+	if s.Cfg.Aria2StrictRPCSources && !s.aria2TokenOK(r) {
 		if site := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); site != "" &&
 			site != "same-origin" && site != "none" {
 			writeErr(w, http.StatusForbidden, "拒绝跨站来源的 RPC 请求"+

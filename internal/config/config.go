@@ -124,8 +124,17 @@ type Config struct {
 	// 泄漏它只能绕过那道来源校验，仍然要带 rpc-secret 才能操纵 aria2。
 	// 首次启动随机生成并落盘（换掉它即等于吊销旧脚本，见 fill 里的生成与 Load 的落盘）。
 	Aria2APIToken string `json:"aria2_api_token"`
-	TLSCert       string `json:"tls_cert"`
-	TLSKey        string `json:"tls_key"`
+	// Aria2StrictRPCSources 控制 aria2 的 **RPC 代理**是否只收"浏览器同源"或
+	// 带专用凭证（X-Aria2-Token）的请求。
+	//
+	// 默认 **false（兼容优先）**：aria2 的价值一大半在"各种客户端都能连它"
+	// （AriaNg / 浏览器扩展 / 油猴脚本 / 手机 App / 命令行），而来源校验会把这些
+	// **全部挡在门外**（它们既不是同源浏览器页面，也没法加自定义头）。真正的保护是
+	// aria2 自己的 `rpc-secret`：没有它，任何来源都操纵不了 aria2。
+	// 想收紧（例如把面板端口暴露到公网）就在「面板设置 → 访问与安全」里打开它。
+	Aria2StrictRPCSources bool   `json:"aria2_strict_rpc_sources"`
+	TLSCert               string `json:"tls_cert"`
+	TLSKey                string `json:"tls_key"`
 	// AccessMode: any=任意来源, local=仅本机, whitelist=仅白名单
 	AccessMode  string   `json:"access_mode"`
 	IPWhitelist []string `json:"ip_whitelist"`

@@ -368,6 +368,8 @@ func (s *Server) settingsView(ctx context.Context) map[string]any {
 		"panel_entry":    s.PanelEntryPath(),
 		"app_proxy":      s.Cfg.AppProxy,
 		"app_proxy_auth": s.Cfg.AppProxyAuth,
+		// aria2 RPC 代理是否只收同源/带专用凭证的请求（默认关 = 兼容各种客户端）
+		"aria2_strict_rpc_sources": s.Cfg.Aria2StrictRPCSources,
 		// 升级源也要回传：设置页要能显示当前值并允许清空。
 		// 少了它，用户在页面上既看不到、也清不掉在线升级写进去的地址。
 		"upgrade_source": s.Cfg.UpgradeSource,
@@ -431,6 +433,9 @@ type settingsReq struct {
 	// AppProxy / AppProxyAuth：应用界面总开关与"是否要求登录面板"
 	AppProxy     *bool `json:"app_proxy"`
 	AppProxyAuth *bool `json:"app_proxy_auth"`
+	// Aria2StrictRPCSources：aria2 的 RPC 代理是否只收"同源浏览器"或带
+	// X-Aria2-Token 的请求。默认关（兼容扩展/脚本/手机 App；保护交给 rpc-secret）。
+	Aria2StrictRPCSources *bool `json:"aria2_strict_rpc_sources"`
 	// UpgradeSource 是在线升级的默认源地址。传空串表示"清空"。
 	//
 	// 为什么必须能在这里改：在线升级的"检查更新"会把用过的源**写进配置**，
@@ -530,6 +535,9 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AppProxy != nil {
 		cfg.AppProxy = *req.AppProxy
+	}
+	if req.Aria2StrictRPCSources != nil {
+		cfg.Aria2StrictRPCSources = *req.Aria2StrictRPCSources
 	}
 	if req.AppProxyAuth != nil {
 		cfg.AppProxyAuth = *req.AppProxyAuth
