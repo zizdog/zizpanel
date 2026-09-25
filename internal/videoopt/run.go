@@ -47,10 +47,79 @@ type Progress struct {
 type TranscodeRequest struct {
 	Src, Dst      string
 	Width, Height int
-	// VideoKbps 是实际视频码率；AudioKbps<=0 表示产物不要音轨（-an）。
-	VideoKbps   int
+	// VideoKbps 是目标视频码率；质量优先模式下是 -maxrate 上限（不超原片码率）。
+	VideoKbps int
+	// AudioKbps<=0 表示产物不要音轨（-an）。
 	AudioKbps   int
 	DurationSec float64
+	// Encoder 是 EncoderHardware / EncoderCPU；Mode 是 ModeBitrate / ModeQuality。
+	Encoder string
+	Mode    string
+	// Quality 是质量档：CPU=CRF（越小越好）、硬件=-q:v（越大越好）。
+	Quality int
+	// TwoPass 为 true 时先跑第一遍分析（只写 -passlogfile），再跑第二遍出片。
+	TwoPass bool
+	// PassLog 是 2-pass 的日志前缀（必须落在临时目录，任务结束清理）。
+	PassLog string
+}
+
+// TranscodeArgs 返回**一遍**转码的完整 ffmpeg 参数（pass=0 单遍，1/2 是两遍）。
+//
+// 这里是"面板选项 → ffmpeg 命令行"的**唯一映射点**：门禁直接断言它，
+// 不用真跑 ffmpeg 就能保证硬件/CPU、目标码率/质量优先、2-pass 真的传到了命令行。
+//
+// quality 与 passlogfile 都走参数，绝不落进 shell 字符串拼接。
+func TranscodeArgs(req TranscodeRequest, pass int) []string {
+	args := []string{"-hide_banner", "-nostdin", "-y", "-i", req.Src}
+	if ResolveEncoder(req.Encoder) == EncoderHardware {
+		// VideoToolbox：硬件编码，快很多；同码率画质略逊于 x264，码率控制也不够准。
+		args = append(args, "-c:v", "h264_videotoolbox")
+	} else {
+		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main")
+	}
+	args = append(args, "-pix_fmt", "yuv420p")
+
+	if ResolveMode(req.Mode) == ModeQuality {
+		if ResolveEncoder(req.Encoder) == EncoderHardware {
+			// -q:v 越大文件越大/画质越好（与 CRF 相反），实测见 plan.go 的常量注释。
+			args = append(args, "-q:v", strconv.Itoa(req.Quality))
+		} else {
+			args = append(args, "-crf", strconv.Itoa(req.Quality))
+		}
+	} else {
+		args = append(args, "-b:v", fmt.Sprintf("%dk", req.VideoKbps))
+	}
+	// 上限：目标码率模式下 -b:v 本身就是上限（同值）；质量优先模式靠 -maxrate
+	// 保证码率不超原片（没有它，CRF/q:v 可能压出比原片还大的文件）。
+	if req.VideoKbps > 0 {
+		args = append(args, "-maxrate", fmt.Sprintf("%dk", req.VideoKbps),
+			"-bufsize", fmt.Sprintf("%dk", req.VideoKbps*2))
+	}
+	if req.Width > 0 && req.Height > 0 {
+		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", req.Width, req.Height))
+	}
+	if req.TwoPass && pass > 0 {
+		args = append(args, "-pass", strconv.Itoa(pass), "-passlogfile", req.PassLog)
+	}
+	if pass == 1 {
+		// 第一遍只做分析：不要音轨、不写成品（唯一产物是 passlog）。
+		args = append(args, "-an", "-f", "null", os.DevNull)
+		return args
+	}
+	if req.AudioKbps > 0 {
+		args = append(args, "-c:a", "aac", "-b:a", fmt.Sprintf("%dk", req.AudioKbps))
+	} else {
+		args = append(args, "-an")
+	}
+	// -f mp4 是必须的：半成品文件名是 .part.mp4 之外的形态也无所谓，
+	// 但显式指定容器才不会因为临时名后缀而让 ffmpeg 猜错封装。
+	args = append(args,
+		"-movflags", "+faststart",
+		"-f", "mp4",
+		"-progress", "pipe:1", "-nostats", "-loglevel", "error",
+		req.Dst,
+	)
+	return args
 }
 
 // Runner 是"探测一个文件 + 转码一个文件"的能力。
@@ -129,35 +198,24 @@ func (r *FFmpegRunner) Probe(ctx context.Context, path string) (MediaInfo, error
 }
 
 // Transcode 转码一个文件；onProgress 只在有意义的进度点被调用（由调用方限流）。
+//
+// 2-pass 在这里展开成两次 ffmpeg 调用：第一遍只分析（进度不报），第二遍出片。
 func (r *FFmpegRunner) Transcode(ctx context.Context, req TranscodeRequest, onProgress func(Progress)) error {
 	if r == nil || r.Ffmpeg == "" {
 		return ErrEngineMissing
 	}
-	args := []string{
-		"-hide_banner", "-nostdin", "-y",
-		"-i", req.Src,
-		"-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main",
-		"-pix_fmt", "yuv420p",
-		"-b:v", fmt.Sprintf("%dk", req.VideoKbps),
-		"-maxrate", fmt.Sprintf("%dk", req.VideoKbps),
-		"-bufsize", fmt.Sprintf("%dk", req.VideoKbps*2),
-		"-vf", fmt.Sprintf("scale=%d:%d", req.Width, req.Height),
+	if req.TwoPass {
+		if err := r.runPass(ctx, req, 1, nil); err != nil {
+			return err
+		}
+		return r.runPass(ctx, req, 2, onProgress)
 	}
-	if req.AudioKbps > 0 {
-		args = append(args, "-c:a", "aac", "-b:a", fmt.Sprintf("%dk", req.AudioKbps))
-	} else {
-		args = append(args, "-an")
-	}
-	// -f mp4 是必须的：半成品文件名是 .part.mp4 之外的形态也无所谓，
-	// 但显式指定容器才不会因为临时名后缀而让 ffmpeg 猜错封装。
-	args = append(args,
-		"-movflags", "+faststart",
-		"-f", "mp4",
-		"-progress", "pipe:1", "-nostats", "-loglevel", "error",
-		req.Dst,
-	)
+	return r.runPass(ctx, req, 0, onProgress)
+}
 
-	cmd := exec.CommandContext(ctx, r.Ffmpeg, args...)
+// runPass 跑一遍 ffmpeg（参数由 TranscodeArgs 生成，这里只负责进程与进度解析）。
+func (r *FFmpegRunner) runPass(ctx context.Context, req TranscodeRequest, pass int, onProgress func(Progress)) error {
+	cmd := exec.CommandContext(ctx, r.Ffmpeg, TranscodeArgs(req, pass)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -282,9 +340,10 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 	if strings.TrimSpace(req.OutDir) == "" {
 		req.OutDir = filepath.Join(req.Dir, OutputDirName)
 	}
-	kbps := ResolveKBps(req.Preset, req.KBps)
+	opts := NormalizeOptions(req.Options)
 	res := PlanResult{
-		Dir: req.Dir, OutDir: req.OutDir, Preset: req.Preset, KBps: kbps,
+		Dir: req.Dir, OutDir: req.OutDir, Preset: opts.Preset, KBps: ResolveKBps(opts.Preset, opts.KBps),
+		Encoder: opts.Encoder, Mode: opts.Mode, Quality: opts.Quality, TwoPass: opts.TwoPass,
 		Rows: []Plan{},
 	}
 	sources, err := Scan(req.Dir)
@@ -295,28 +354,40 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
-		outPath := filepath.Join(req.OutDir, OutputName(src.Name, req.Preset.ID))
+		outPath := filepath.Join(req.OutDir, OutputName(src.Name, opts.Preset.ID))
 		_, statErr := os.Stat(outPath)
 		outExists := statErr == nil
 		info, perr := runner.Probe(ctx, src.Path)
 		if perr != nil {
 			res.Rows = append(res.Rows, Plan{
 				Name: src.Name, Path: src.Path,
-				OutName: OutputName(src.Name, req.Preset.ID), OutPath: outPath,
+				OutName: OutputName(src.Name, opts.Preset.ID), OutPath: outPath,
 				SourceBytes: src.Bytes,
 				SkipReason:  "读不出视频信息（不是视频或文件损坏）",
 			})
 			res.Skipped++
 			continue
 		}
-		row := PlanOne(src.Name, src.Path, req.OutDir, info, req.Preset, kbps, outExists)
+		row := PlanOne(src.Name, src.Path, req.OutDir, info, opts, outExists)
 		if row.Runnable() {
 			res.Runnable++
 			res.EstBytes += row.EstBytes
+			res.TotalSourceBytes += row.SourceBytes
+			if row.Capped {
+				res.CappedRunnable++
+			}
+			if row.EstimateUnknown {
+				res.EstimateUnknown = true
+			}
 		} else {
 			res.Skipped++
 		}
 		res.Rows = append(res.Rows, row)
+	}
+	res.AllCapped = res.Runnable > 0 && res.CappedRunnable == res.Runnable
+	if !res.EstimateUnknown {
+		res.EstSavedBytes = res.TotalSourceBytes - res.EstBytes
+		res.EstPercent = savePercent(res.TotalSourceBytes, res.EstBytes)
 	}
 	return res, nil
 }
@@ -384,6 +455,17 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		hooks.Chown(outDir)
 	}
 
+	// 2-pass 的 passlogfile 必须落在临时目录，任务结束（含中断）整目录清掉。
+	passDir := ""
+	if hasTwoPass(rows) {
+		d, terr := os.MkdirTemp("", "zizpanel-2pass-")
+		if terr != nil {
+			return res, fmt.Errorf("创建 2-pass 临时目录失败: %w", terr)
+		}
+		passDir = d
+		defer os.RemoveAll(passDir)
+	}
+
 	total := len(rows)
 	for i, row := range rows {
 		item := RunItem{Index: i, Name: row.Name, Before: row.SourceBytes}
@@ -406,9 +488,17 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			continue
 		}
 
-		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%d kbps）",
+		modeTag := fmt.Sprintf("%d kbps", row.VideoKbps)
+		if row.Mode == ModeQuality {
+			modeTag = fmt.Sprintf("质量档 %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
+		}
+		passTag := ""
+		if row.TwoPass {
+			passTag = " · 2-pass"
+		}
+		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s%s）",
 			i+1, total, row.Name, row.SourceWidth, row.SourceHeight,
-			row.TargetWidth, row.TargetHeight, row.VideoKbps))
+			row.TargetWidth, row.TargetHeight, modeTag, passTag))
 		if row.Capped && row.Note != "" {
 			hooks.log(tasks.LevelWarn, row.Note)
 		}
@@ -420,12 +510,18 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		part := row.OutPath + ".part.mp4"
 		_ = os.Remove(part)
 
+		passLog := ""
+		if row.TwoPass && passDir != "" {
+			passLog = filepath.Join(passDir, fmt.Sprintf("pass%d", i))
+		}
 		throttle := &progressThrottle{}
 		rerr := runner.Transcode(ctx, TranscodeRequest{
 			Src: row.Path, Dst: part,
 			Width: row.TargetWidth, Height: row.TargetHeight,
 			VideoKbps: row.VideoKbps, AudioKbps: row.AudioKbps,
 			DurationSec: row.DurationSec,
+			Encoder:     row.Encoder, Mode: row.Mode, Quality: row.Quality,
+			TwoPass: row.TwoPass, PassLog: passLog,
 		}, func(p Progress) {
 			if !throttle.allow(p.Percent) {
 				return
@@ -504,6 +600,16 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 func cancelledErr(res *RunResult) error {
 	return fmt.Errorf("任务被取消（已成功 %d，跳过 %d，失败 %d，共 %d 个）",
 		res.Done, res.Skipped, res.Failed, res.Total)
+}
+
+// hasTwoPass 判断这批计划里有没有 2-pass（没有就不建临时目录）。
+func hasTwoPass(rows []Plan) bool {
+	for _, r := range rows {
+		if r.Runnable() && r.TwoPass {
+			return true
+		}
+	}
+	return false
 }
 
 // maxProgressLines 是单个文件的进度行上限（任务日志有行数上限，绝不刷屏）。

@@ -30,8 +30,8 @@ import (
 // videoEngineAppID 是市场里提供 ffmpeg/ffprobe 的条目 ID（引擎缺失时的下一步）。
 const videoEngineAppID = "ffmpeg"
 
-// videoShrinkNote 是计划面板上必须写清楚的一句话（用户点名的口径）。
-const videoShrinkNote = "产物只会更小：实际码率 = min(你选的, 原视频码率×0.95)"
+// videoShrinkNote 是计划面板上必须写清楚的一句话（用户点名的口径；两种模式都成立）。
+const videoShrinkNote = "产物只会更小：码率封顶在原片码率×0.95 以内"
 
 // videoRunnerOverride 仅供单测：门禁不许跑真 ffmpeg（慢、且结论随开发机装没装而变），
 // 但又必须能断言执行期的"产物更大就删掉"判据 —— 注入假 Runner 后全用假文件断言。
@@ -48,11 +48,19 @@ func (s *Server) videoRunner() videoopt.Runner {
 }
 
 // fileVideoReq 是视频压缩两个接口共用的请求体。
+//
+// 新字段（encoder/mode/quality/two_pass）全部**可选**：老请求不带时按 videoopt
+// 的具名默认值走（DefaultEncoder + DefaultMode），接口形状只增不改。
 type fileVideoReq struct {
 	Dir    string `json:"dir"`
 	Preset string `json:"preset"`
 	// KBps 是用户选的码率（0 = 用档位下限）。
-	KBps int `json:"kbps"`
+	KBps    int    `json:"kbps"`
+	Encoder string `json:"encoder"`
+	Mode    string `json:"mode"`
+	// Quality 是质量档（CPU=CRF、硬件=-q:v；0 = 用该编码器默认档）。
+	Quality int  `json:"quality"`
+	TwoPass bool `json:"two_pass"`
 }
 
 // videoPlanResponse 是 POST /api/v1/files/video-plan 的响应。
@@ -71,42 +79,90 @@ type videoPlanResponse struct {
 	Presets        []videoopt.Preset        `json:"presets"`
 	BitrateChoices []videoopt.BitrateChoice `json:"bitrate_choices"`
 
+	// 编码器 / 模式 / 质量档：默认值与选项都由后端给，前端不重复写数字。
+	Encoder        string                   `json:"encoder"`
+	Mode           string                   `json:"mode"`
+	Quality        int                      `json:"quality"`
+	TwoPass        bool                     `json:"two_pass"`
+	Encoders       []videoopt.Choice        `json:"encoders"`
+	Modes          []videoopt.Choice        `json:"modes"`
+	QualityChoices []videoopt.QualityChoice `json:"quality_choices"`
+
 	Total    int             `json:"total"`
 	Runnable int             `json:"runnable"`
 	Skipped  int             `json:"skipped"`
 	EstBytes int64           `json:"est_bytes"`
 	Rows     []videoopt.Plan `json:"rows"`
 	Note     string          `json:"note"`
+
+	// 体积对比与"这样压不会变小"的警告（判据全部来自 planner）。
+	TotalSourceBytes int64  `json:"total_source_bytes"`
+	EstSavedBytes    int64  `json:"est_saved_bytes"`
+	EstPercent       int    `json:"est_percent"`
+	EstimateUnknown  bool   `json:"estimate_unknown"`
+	CappedRunnable   int    `json:"capped_runnable"`
+	AllCapped        bool   `json:"all_capped"`
+	Warning          string `json:"warning,omitempty"`
 }
 
-// parseVideoReq 校验共用的请求参数（档位 / 码率）。
-func parseVideoReq(req fileVideoReq) (videoopt.Preset, error) {
+// parseVideoReq 校验共用的请求参数（档位 / 码率 / 编码器 / 模式 / 质量档 / 2-pass）。
+//
+// 空字段 = 用默认（向后兼容）；非法组合当场 400（2-pass 与硬件/质量优先互斥）。
+func parseVideoReq(req fileVideoReq) (videoopt.Options, error) {
 	id := strings.TrimSpace(req.Preset)
 	if id == "" {
 		id = videoopt.DefaultPresetID
 	}
 	preset, ok := videoopt.FindPreset(id)
 	if !ok {
-		return videoopt.Preset{}, fmt.Errorf("档位只能是 360p / 480p / 720p")
+		return videoopt.Options{}, fmt.Errorf("档位只能是 360p / 480p / 720p")
 	}
 	if req.KBps != 0 && (req.KBps < videoopt.MinKBps || req.KBps > videoopt.MaxKBps) {
-		return videoopt.Preset{}, fmt.Errorf("码率必须是 %d~%d kbps 的整数", videoopt.MinKBps, videoopt.MaxKBps)
+		return videoopt.Options{}, fmt.Errorf("码率必须是 %d~%d kbps 的整数", videoopt.MinKBps, videoopt.MaxKBps)
 	}
-	return preset, nil
+	opts := videoopt.Options{
+		Preset: preset, KBps: req.KBps,
+		Encoder: req.Encoder, Mode: req.Mode, Quality: req.Quality, TwoPass: req.TwoPass,
+	}
+	if err := videoopt.ValidateOptions(opts); err != nil {
+		return videoopt.Options{}, err
+	}
+	return videoopt.NormalizeOptions(opts), nil
 }
 
-// newVideoPlanResponse 填好与目录无关的字段（档位/码率选项始终要有，
+// newVideoPlanResponse 填好与目录无关的字段（档位/码率/选项始终要有，
 // 引擎缺失时前端也要能把面板画出来，并给出「一键安装 FFmpeg」）。
-func newVideoPlanResponse(preset videoopt.Preset, kbps int) videoPlanResponse {
+func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
 	return videoPlanResponse{
-		Preset:         preset.ID,
-		KBps:           videoopt.ResolveKBps(preset, kbps),
+		Preset:         opts.Preset.ID,
+		KBps:           videoopt.ResolveKBps(opts.Preset, opts.KBps),
 		Presets:        videoopt.Presets(),
-		BitrateChoices: videoopt.BitrateChoices(preset),
+		BitrateChoices: videoopt.BitrateChoices(opts.Preset),
+		Encoder:        opts.Encoder,
+		Mode:           opts.Mode,
+		Quality:        opts.Quality,
+		TwoPass:        opts.TwoPass,
+		Encoders:       videoopt.EncoderChoices(),
+		Modes:          videoopt.ModeChoices(),
+		QualityChoices: videoopt.QualityChoices(opts.Encoder),
 		MarketAppID:    videoEngineAppID,
 		Rows:           []videoopt.Plan{},
 		Note:           videoShrinkNote,
 	}
+}
+
+// videoCapWarning 是"用户选的码率 ≥ 原片码率"时那句必须醒目的话（判据来自 planner 的 capped）。
+//
+// 全部文件都这样时说得更直接；只有一部分时逐行标（行内 Note 已有）。
+func videoCapWarning(preset videoopt.Preset, capped, runnable int) string {
+	if capped == 0 || runnable == 0 {
+		return ""
+	}
+	if capped >= runnable {
+		return fmt.Sprintf("原码率都不高：这样压基本不会变小。建议 ≤ %d kbps 或改用质量优先", preset.DefaultKbps)
+	}
+	return fmt.Sprintf("有 %d 个视频原码率不高，压完基本不变小（见下表）；建议 ≤ %d kbps",
+		capped, preset.DefaultKbps)
 }
 
 // handleFileVideoPlan 只读规划：每个视频一行（原分辨率/原码率/目标/预计大小/跳过原因）。
@@ -116,12 +172,12 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 		failFileErr(w, err)
 		return
 	}
-	preset, err := parseVideoReq(req)
+	opts, err := parseVideoReq(req)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp := newVideoPlanResponse(preset, req.KBps)
+	resp := newVideoPlanResponse(opts)
 
 	runner := s.videoRunner()
 	if err := runner.Available(); err != nil {
@@ -136,7 +192,7 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, berr := videoopt.BuildPlan(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Preset: preset, KBps: req.KBps,
+		Dir: dir, Options: opts,
 	}, runner)
 	if berr != nil {
 		failFileErr(w, berr, dir)
@@ -148,6 +204,10 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	resp.KBps = res.KBps
 	resp.Total, resp.Runnable, resp.Skipped, resp.EstBytes = len(res.Rows), res.Runnable, res.Skipped, res.EstBytes
 	resp.Rows = res.Rows
+	resp.TotalSourceBytes, resp.EstSavedBytes = res.TotalSourceBytes, res.EstSavedBytes
+	resp.EstPercent, resp.EstimateUnknown = res.EstPercent, res.EstimateUnknown
+	resp.CappedRunnable, resp.AllCapped = res.CappedRunnable, res.AllCapped
+	resp.Warning = videoCapWarning(opts.Preset, res.CappedRunnable, res.Runnable)
 	ok(w, resp)
 }
 
@@ -161,7 +221,7 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		failFileErr(w, err)
 		return
 	}
-	preset, err := parseVideoReq(req)
+	opts, err := parseVideoReq(req)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
@@ -178,7 +238,7 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	plan, berr := videoopt.BuildPlan(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Preset: preset, KBps: req.KBps,
+		Dir: dir, Options: opts,
 	}, runner)
 	if berr != nil {
 		failFileErr(w, berr, dir)
@@ -192,7 +252,7 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 	}
 
 	mgr := s.fileManager()
-	title := fmt.Sprintf("压缩视频（%d 个 · %s）", plan.Runnable, preset.ID)
+	title := fmt.Sprintf("压缩视频（%d 个 · %s）", plan.Runnable, opts.Preset.ID)
 	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress",
 		func(ctx context.Context, log tasks.LogFunc) (any, error) {
 			res, rerr := videoopt.RunPlan(ctx, plan.OutDir, plan.Rows, runner, videoopt.Hooks{

@@ -28,6 +28,7 @@ func IsVideoName(name string) bool {
 type probeJSON struct {
 	Streams []struct {
 		CodecType string `json:"codec_type"`
+		CodecName string `json:"codec_name"`
 		Width     int    `json:"width"`
 		Height    int    `json:"height"`
 		BitRate   string `json:"bit_rate"`
@@ -67,6 +68,7 @@ func ParseProbeJSON(raw []byte, fileBytes int64) (MediaInfo, error) {
 				info.HasVideo = true
 				info.Width, info.Height = s.Width, s.Height
 				info.VideoKbps = kbpsFromBits(s.BitRate)
+				info.Codec = s.CodecName
 			}
 		case "audio":
 			info.HasAudio = true
@@ -110,6 +112,25 @@ func kbpsFromBits(s string) int {
 		return 0
 	}
 	return int(n / 1000)
+}
+
+// codecLabels 是 ffprobe 的 codec_name → 面板显示名（没有就原样大写）。
+var codecLabels = map[string]string{
+	"h264": "H.264", "hevc": "H.265/HEVC", "vp9": "VP9", "av1": "AV1",
+	"vp8": "VP8", "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2", "prores": "ProRes",
+	"theora": "Theora", "wmv3": "WMV3", "vc1": "VC-1",
+}
+
+// CodecLabel 把 codec_name 变成给用户看的一行文字（读不到返回空串）。
+func CodecLabel(codec string) string {
+	c := strings.ToLower(strings.TrimSpace(codec))
+	if c == "" {
+		return ""
+	}
+	if l, ok := codecLabels[c]; ok {
+		return l
+	}
+	return strings.ToUpper(c)
 }
 
 // parseSeconds 解析 ffprobe 的时长字符串（"N/A" 或空值算 0）。

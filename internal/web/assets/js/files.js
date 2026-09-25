@@ -1756,13 +1756,13 @@ export function FilesView(content, ctx = {}) {
     draw();
   }
 
-  // videoCompressModal 是「🎬 压缩视频」弹窗：档位 + 码率 + 计划表 + 走任务中心。
+  // videoCompressModal 是「🎬 压缩视频」弹窗：档位 + 编码器 + 模式 + 计划表 + 走任务中心。
   //
-  // 用户点名的三条硬要求都在这里：
+  // 用户点名的硬要求都在这里：
   //   · 绝不放大（档位只是"封顶"，目标分辨率不会超过原尺寸）；
-  //   · 绝不越压越大（那句口径直接写在面板上，执行时还会回读产物大小）；
+  //   · 绝不越压越大（计划表白纸黑字写体积对比，执行时回读产物大小）；
   //   · 后台跑（关掉这个窗口/整个页面都不影响，进度与中断都在任务中心）。
-  // 档位与码率选项**全部来自后端**（计划响应里带回），前端不重复写一份数字。
+  // 档位/码率/编码器/模式/质量档的选项与默认值**全部来自后端**，前端不重复写数字。
   async function videoCompressModal() {
     const body = h('div');
     const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
@@ -1770,19 +1770,54 @@ export function FilesView(content, ctx = {}) {
 
     let preset = '480p';
     let kbps = 0; // 0 = 用档位下限（默认的"能用下限"码率）
+    let encoder = ''; // 空 = 用后端默认（首次响应回填）
+    let mode = '';
+    let quality = 0; // 0 = 用该编码器的默认质量档
+    let twoPass = false;
     let plan = null;
 
     async function reload() {
       clear(body); clear(foot);
       body.append(h('div.hint', { text: '正在读取目录与视频信息…' }));
       try {
-        plan = await api.fileVideoPlan({ dir: cwd, preset, kbps });
+        plan = await api.fileVideoPlan({
+          dir: cwd, preset, kbps, encoder, mode, quality, two_pass: twoPass,
+        });
       } catch (e) {
         body.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '读取失败：' + ((e && e.message) || e) }));
         foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
         return;
       }
+      // 后端归一化后的值回填本地状态（默认值只由后端定义一次）。
+      encoder = plan.encoder || encoder;
+      mode = plan.mode || mode;
+      quality = plan.quality || 0;
+      twoPass = !!plan.two_pass;
       draw();
+    }
+
+    // 单选一行（选项与说明都来自后端；选中项的 hint 显示在下面）。
+    function radioRow(name, choices, current, onPick) {
+      const row = h('div', { style: { display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
+        (choices || []).map((c) => h('label', {
+          style: { display: 'flex', gap: '5px', alignItems: 'center', cursor: 'pointer' },
+        }, [
+          h('input', {
+            type: 'radio', name, value: c.value, checked: c.value === current,
+            onchange: () => onPick(c.value),
+          }),
+          h('span', { text: c.label }),
+        ])));
+      const cur = (choices || []).find((c) => c.value === current);
+      return [row, cur && cur.hint ? h('div.hint', { text: cur.hint }) : null];
+    }
+
+    // 一行体积对比：「原 → 预计（-XX%）」；质量优先如实说不可预估，不编数字。
+    function sizeText(before, after, pct, unknown) {
+      const b = humanSize(before || 0);
+      if (unknown) return b + ' → 不可预估';
+      if (!after) return b + ' → —';
+      return b + ' → ' + humanSize(after) + '（-' + (pct || 0) + '%）';
     }
 
     function draw() {
@@ -1826,38 +1861,104 @@ export function FilesView(content, ctx = {}) {
           h('span', { text: p.label }),
         ])));
 
-      const bitrate = h('select.select', (plan.bitrate_choices || []).map((c) => h('option', {
-        value: String(c.kbps), text: c.label,
-      })));
-      bitrate.value = String(plan.kbps);
-      bitrate.addEventListener('change', () => { kbps = Number(bitrate.value) || 0; reload(); });
+      const [encoderRow, encoderHint] = radioRow('zp-video-encoder', plan.encoders, plan.encoder, (v) => {
+        encoder = v; quality = 0; // 质量档数值在两种编码器里含义不同，切了就回默认
+        if (v !== 'cpu') twoPass = false; // 2-pass 只支持 CPU
+        reload();
+      });
+      const [modeRow, modeHint] = radioRow('zp-video-mode', plan.modes, plan.mode, (v) => {
+        mode = v; quality = 0;
+        if (v !== 'bitrate') twoPass = false; // 质量优先没有 2-pass
+        reload();
+      });
 
-      const rows = (plan.rows || []).map((r) => h('tr', [
-        h('td', { text: r.name }),
-        h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
-        h('td', { text: r.source_video_kbps ? r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '—' }),
-        h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
-        h('td', { text: r.video_kbps ? r.video_kbps + ' kbps' + (r.audio_disabled ? '（无音轨）' : '') : '—' }),
-        h('td', { text: r.est_bytes ? humanSize(r.est_bytes) : '—' }),
-        h('td', {
-          style: { color: r.skip_reason ? 'var(--warn)' : 'var(--text-mute)' },
-          text: r.skip_reason || r.note || '—',
-        }),
-      ]));
+      // 目标码率 / 质量档：二选一（由模式决定）
+      let tuneField;
+      if (plan.mode === 'quality') {
+        const q = h('select.select', (plan.quality_choices || []).map((c) => h('option', {
+          value: String(c.value), text: c.label,
+        })));
+        q.value = String(plan.quality);
+        q.addEventListener('change', () => { quality = Number(q.value) || 0; reload(); });
+        tuneField = h('div.field', [h('label', {
+          text: plan.encoder === 'cpu' ? '质量档 CRF（越小画质越好）' : '质量档 -q:v（越大越好，实测标定）',
+        }), q]);
+      } else {
+        const bitrate = h('select.select', (plan.bitrate_choices || []).map((c) => h('option', {
+          value: String(c.kbps), text: c.label,
+        })));
+        bitrate.value = String(plan.kbps);
+        bitrate.addEventListener('change', () => { kbps = Number(bitrate.value) || 0; reload(); });
+        tuneField = h('div.field', [h('label', { text: '目标码率' }), bitrate]);
+      }
+
+      // 2-pass：勾上即**自动锁定** CPU + 目标码率（硬件不支持 2-pass；CRF 本来就是单遍）。
+      const passBox = h('input', { type: 'checkbox', checked: plan.two_pass });
+      const passAllowed = plan.encoder === 'cpu' && plan.mode === 'bitrate';
+      passBox.addEventListener('change', () => {
+        twoPass = passBox.checked;
+        if (twoPass) { encoder = 'cpu'; mode = 'bitrate'; }
+        reload();
+      });
+
+      const rows = (plan.rows || []).map((r) => {
+        let tune = '—';
+        if (r.video_kbps) {
+          tune = r.mode === 'quality'
+            ? (r.encoder === 'cpu' ? 'CRF ' + r.quality : '质量档 ' + r.quality) + '（上限 ' + r.maxrate_kbps + ' kbps）'
+            : r.video_kbps + ' kbps' + (r.audio_disabled ? '（无音轨）' : '');
+          if (r.two_pass) tune += ' · 2-pass';
+        }
+        const src = (r.source_codec_label || r.source_codec || '')
+          + (r.source_video_kbps ? ' · ' + r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '');
+        return h('tr', [
+          h('td.zp-plan-name', { text: r.name }),
+          h('td', { text: src || '—' }),
+          h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
+          h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
+          h('td', { text: tune }),
+          h('td', { text: sizeText(r.source_bytes, r.est_bytes, r.est_percent, r.estimate_unknown) }),
+          h('td', {
+            style: { color: r.skip_reason ? 'var(--warn)' : (r.capped ? 'var(--warn)' : 'var(--text-mute)') },
+            text: (r.capped ? '⚠ ' : '') + (r.skip_reason || r.note || '—'),
+          }),
+        ]);
+      });
+
+      const totalRow = h('tr', [
+        h('td', { text: '合计' }),
+        h('td', { colspan: '4', text: plan.runnable + ' 个可压' }),
+        h('td', { text: plan.total_source_bytes ? sizeText(plan.total_source_bytes, plan.est_bytes, plan.est_percent, plan.estimate_unknown) : '—' }),
+        h('td', { text: '' }),
+      ]);
 
       body.append(h('div', { style: { lineHeight: '1.7' } }, [
+        // 「这样压不会变小」的警告必须是第一眼看到的（判据来自后端 capped）。
+        plan.warning ? h('div.banner-warn', [
+          h('strong', { text: '⚠ 可能压不小' }), h('span', { text: plan.warning }),
+        ]) : null,
         h('div.field', [h('label', { text: '目标档位（只封顶，绝不放大）' }), presetRow]),
-        h('div.field', [h('label', { text: '码率' }), bitrate]),
+        h('div.field', [h('label', { text: '编码器' }), encoderRow, encoderHint]),
+        h('div.field', [h('label', { text: '模式' }), modeRow, modeHint]),
+        tuneField,
+        h('div.field', [
+          h('label', { text: '高级：2-pass 编码（更慢约 2 倍，同体积更清晰）' }),
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center' } }, [
+            passBox,
+            h('span', { text: passAllowed ? '开启 2-pass（自动锁定 CPU + 目标码率）' : '仅 CPU + 目标码率可用' }),
+          ]),
+        ]),
         h('div.hint', {
           text: '目录 ' + (plan.dir || cwd) + '：' + plan.total + ' 个视频，可压 '
             + plan.runnable + ' 个，跳过 ' + plan.skipped + ' 个',
         }),
         h('div.hint', { text: plan.note || '' }),
-        h('div', { style: { overflowX: 'auto', marginTop: '8px' } }, [
+        h('div.zp-plan-scroll', [
           h('table.table', { style: { fontSize: '12px' } }, [
-            h('thead', [h('tr', ['文件', '原分辨率', '原码率', '目标', '目标码率', '预计大小', '说明']
+            h('thead', [h('tr', ['文件', '源格式', '原分辨率', '目标', '目标码率/质量', '体积（原→预计）', '说明']
               .map((t) => h('th', { text: t })))]),
             h('tbody', rows.length ? rows : [h('tr', [h('td', { colspan: '7', text: '这个目录里没有视频' })])]),
+            h('tfoot', rows.length ? [totalRow] : []),
           ]),
         ]),
         h('div.hint', { style: { marginTop: '8px' }, text: '产物写进 output/；关掉窗口也在后台跑' }),
@@ -1869,7 +1970,10 @@ export function FilesView(content, ctx = {}) {
         title: plan.runnable ? '在任务中心后台执行；关掉页面不受影响' : '没有可压缩的视频',
       });
       start.addEventListener('click', async () => {
-        const opts = { dir: cwd, preset: plan.preset, kbps: plan.kbps };
+        const opts = {
+          dir: cwd, preset: plan.preset, kbps: plan.kbps,
+          encoder: plan.encoder, mode: plan.mode, quality: plan.quality, two_pass: plan.two_pass,
+        };
         m.close();
         await taskCenter.start({
           kind: 'video_compress', target: opts.dir,

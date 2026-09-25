@@ -322,24 +322,33 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ---------- 弹窗 ---------- */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(3px);
-  display: grid; place-items: center; z-index: 250; padding: 20px;
+  /* minmax(0,1fr) 是**手机不超宽**的关键：auto 轨道会被弹窗内容的 min-content 撑到
+     max-width（视频计划表很宽），弹窗就顶出视口；minmax(0,..) 允许轨道缩到 0。 */
+  display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; z-index: 250; padding: 20px;
   animation: zpFadeIn .16s ease both;
 }
 .modal {
   background: linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--panel) 96%, var(--bg)));
   border: 1px solid var(--border); border-radius: 14px;
-  width: 100%; max-width: 520px; box-shadow: var(--shadow); max-height: 88vh; display: flex; flex-direction: column;
+  /* min-width:0 同理：grid 子项默认 min-width:auto = 内容最小宽度，
+     宽内容（如计划表）会让弹窗不肯缩到手机宽度。 */
+  width: 100%; max-width: 520px; min-width: 0; box-shadow: var(--shadow); max-height: 88vh; display: flex; flex-direction: column;
   /* 淡入 + 轻微缩放：弹窗"弹出来"而不是硬切 */
   animation: zpModalIn .18s cubic-bezier(.2, .8, .3, 1) both;
 }
-.modal.wide { max-width: 800px; }
+.modal.wide { max-width: min(800px, 100%); }
 .modal-head { padding: 15px 18px; border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; }
-.modal-head h3 { margin: 0; font-size: 14.5px; font-weight: 620; }
+.modal-head h3 { margin: 0; font-size: 14.5px; font-weight: 620; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .modal-head .spacer { flex: 1; }
-.modal-body { padding: 18px; overflow-y: auto; }
-.modal-foot { padding: 13px 18px; border-top: 1px solid var(--border-soft); display: flex; gap: 9px; justify-content: flex-end; }
+.modal-body { padding: 18px; overflow-y: auto; min-width: 0; }
+.modal-foot { padding: 13px 18px; border-top: 1px solid var(--border-soft); display: flex; gap: 9px; justify-content: flex-end; flex-wrap: wrap; }
 .modal-close { cursor: pointer; color: var(--text-mute); font-size: 19px; line-height: 1; background: none; border: none; padding: 0 4px; }
 .modal-close:hover { color: var(--text); }
+
+/* 视频压缩计划表：弹窗先缩进视口，表再宽就**只在表内**横向滚动。 */
+.zp-plan-scroll { overflow-x: auto; max-width: 100%; min-width: 0; }
+.zp-plan-scroll table { min-width: 640px; }
+.zp-plan-scroll .zp-plan-name { max-width: 220px; word-break: break-all; }
 
 /* ---------- 日志 / 代码 ---------- */
 .logbox {
@@ -640,6 +649,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 @media (max-width: 760px) {
   .zp-nav-grid { grid-template-columns: 1fr; }
   .zp-nav-search { max-width: none; }
+  .zp-2fa-pill{display: none;}
 }
 @media (prefers-reduced-motion: reduce) {
   .zp-nav-card:hover { transform: none !important; }

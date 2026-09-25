@@ -98,7 +98,7 @@ func TestVideoCompressGate(t *testing.T) {
 			Width: 1280, Height: 720, DurationSec: 10, FileBytes: 5 << 20,
 			VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
 		}
-		p := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, preset720, 2000, false)
+		p := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 2000}, false)
 		if p.SkipReason != "" {
 			t.Fatalf("这个视频应该可压，却被跳过：%s", p.SkipReason)
 		}
@@ -132,7 +132,7 @@ func TestVideoCompressGate(t *testing.T) {
 				Width: c.w, Height: c.h, DurationSec: 5, FileBytes: 1 << 20,
 				VideoKbps: 2000, AudioKbps: 0, HasVideo: true,
 			}
-			p := videoopt.PlanOne("v.mp4", "/tmp/v.mp4", "/tmp/out", info, c.preset, 0, false)
+			p := videoopt.PlanOne("v.mp4", "/tmp/v.mp4", "/tmp/out", info, videoopt.Options{Preset: c.preset}, false)
 			if p.SkipReason != "" {
 				t.Fatalf("%s：不该跳过（%s）", c.name, p.SkipReason)
 			}
@@ -166,7 +166,7 @@ func TestVideoCompressGate(t *testing.T) {
 				VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
 			}},
 		}
-		row := videoopt.PlanOne("big.mp4", src, outDir, runner.infos[src], preset480, 800, false)
+		row := videoopt.PlanOne("big.mp4", src, outDir, runner.infos[src], videoopt.Options{Preset: preset480, KBps: 800}, false)
 		if !row.Runnable() {
 			t.Fatalf("计划本身应该是可压的：%s", row.SkipReason)
 		}
