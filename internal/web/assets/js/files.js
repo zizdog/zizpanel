@@ -772,7 +772,7 @@ export function FilesView(content, ctx = {}) {
             load(cwd);
           },
         }),
-        h('span', { text: '显示隐藏文件' }),
+        h('span', { text: '显示隐藏' }),
       ]),
       h('div', { style: { flex: 1 } }),
       // 选中相关控件**始终占位**（空选时隐藏/禁用）：一旦让工具栏因选中而换行，
@@ -795,7 +795,7 @@ export function FilesView(content, ctx = {}) {
         onclick: imageCompressModal,
       }),
       h('button.btn.btn-sm', {
-        text: '🎬 压缩视频',
+        text: '🎬 视频压缩',
         title: '把当前目录里的视频压小（360p/480p/720p，产物写进 output/；绝不越压越大）',
         onclick: videoCompressModal,
       }),
