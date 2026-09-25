@@ -715,15 +715,8 @@ export function FilesView(content, ctx = {}) {
     return roots.find((r) => rootKind(r) === 'www') || roots[0] || '';
   }
 
-  // 上传/新建/压缩箱的二级菜单项：都是"工具栏入口"的菜单，与行操作菜单无关
+  // 新建/压缩箱的二级菜单项：都是"工具栏入口"的菜单，与行操作菜单无关
   // （行操作菜单只能来自 rowMenuItems，见那里）。
-  function uploadMenuItems() {
-    return [
-      { label: '上传文件…', run: () => fileInput.click() },
-      { label: '上传文件夹…', run: () => folderInput.click() },
-    ];
-  }
-
   function newMenuItems() {
     return [
       { label: '新建文件夹', run: () => toolbarNew('dir') },
@@ -737,7 +730,7 @@ export function FilesView(content, ctx = {}) {
     return [
       { label: '🖼️ 图片压缩', title: '把当前目录里的图片压小（默认另存为 xxx.min.<ext>，不动原文件）', run: imageCompressModal },
       { label: '🎬 视频压缩', title: '把当前目录里的视频压小（产物写进 output/；绝不越压越大）', run: videoCompressModal },
-      { label: '打包压缩' + (selection.size ? `（${selection.size} 项）` : ''), title: '把选中的项打成 zip/tar 归档', disabled: selection.size === 0, run: compressSelected },
+      { label: '📦 打包压缩' + (selection.size ? `（${selection.size} 项）` : ''), title: '把选中的项打成 zip/tar 归档', disabled: selection.size === 0, run: compressSelected },
     ];
   }
 
@@ -759,19 +752,13 @@ export function FilesView(content, ctx = {}) {
         title: '打开收藏列表（加入/取消收藏在右键或「更多」菜单）',
         onclick: favoritesModal,
       }),
-      // 上传是**分体按钮**：左半点开上传面板，右半 ▾ 是「上传文件 / 上传文件夹」。
-      h('div', { style: { display: 'inline-flex', gap: '2px' } }, [
-        h('button.btn.btn-sm', {
-          text: '⬆ 上传',
-          title: '打开上传面板（也可把文件/文件夹拖进面板）',
-          onclick: uploadPanel,
-        }),
-        h('button.btn.btn-sm', {
-          text: '▾', title: '上传文件 / 上传文件夹',
-          style: { padding: '3px 7px' },
-          onclick: (ev) => toggleDropdown(ev.currentTarget, uploadMenuItems()),
-        }),
-      ]),
+      // 上传只有一颗（用户要求去掉那个 ▾）：点它直接打开上传面板，
+      // 面板里本来就有「选择文件 / 选择文件夹」，再挂一个二级菜单是多余的。
+      h('button.btn.btn-sm', {
+        text: '⬆ 上传',
+        title: '打开上传面板（可选文件/文件夹，也可把文件拖进面板）',
+        onclick: uploadPanel,
+      }),
       h('button.btn.btn-sm', {
         text: '＋ 新建',
         title: '新建文件夹 / 新建文件',
