@@ -115,14 +115,15 @@ export function FilesView(content, ctx = {}) {
   ]);
 
   appendAll(content, card);
-  wireDropZone(card);
+  wireDropZone(card, { show: (on) => { dropZone.style.display = on ? '' : 'none'; } });
 
   // wireDropZone 让"拖文件/拖文件夹进来"走与按钮完全相同的上传路径。
   //
   // 为什么要走同一条路：拖拽只是另一个入口，校验、进度、错误提示、相对路径
   // 重建目录树的行为必须与「上传文件夹」按钮一模一样，否则会出现
   // "按钮传没问题、拖进来就静默失败"这种最难查的差异。
-  function wireDropZone(el) {
+  // zone.show(on) 由调用方决定怎么表现：列表上的提示条是显隐，上传面板里是加高亮。
+  function wireDropZone(el, zone) {
     const hasFiles = (e) => {
       const dt = e.dataTransfer;
       if (!dt) return false;
@@ -130,7 +131,7 @@ export function FilesView(content, ctx = {}) {
       return types.includes('Files');
     };
     let depth = 0; // dragenter/dragleave 会随子元素反复触发，用计数避免提示闪烁
-    const show = (on) => { dropZone.style.display = on ? '' : 'none'; };
+    const show = (on) => { zone.show(on); };
     el.addEventListener('dragenter', (e) => {
       if (!hasFiles(e)) return;
       e.preventDefault(); depth++; show(true);
@@ -714,10 +715,37 @@ export function FilesView(content, ctx = {}) {
     return roots.find((r) => rootKind(r) === 'www') || roots[0] || '';
   }
 
+  // 上传/新建/压缩箱的二级菜单项：都是"工具栏入口"的菜单，与行操作菜单无关
+  // （行操作菜单只能来自 rowMenuItems，见那里）。
+  function uploadMenuItems() {
+    return [
+      { label: '上传文件…', run: () => fileInput.click() },
+      { label: '上传文件夹…', run: () => folderInput.click() },
+    ];
+  }
+
+  function newMenuItems() {
+    return [
+      { label: '新建文件夹', run: () => toolbarNew('dir') },
+      { label: '新建文件', run: () => toolbarNew('file') },
+    ];
+  }
+
+  // 压缩箱：原来右侧那三颗（图片压缩 / 视频压缩 / 打包压缩）合并成一个菜单，
+  // 位置仍在工具栏右侧；三项各自的弹窗与功能一字未改。
+  function compressMenuItems() {
+    return [
+      { label: '🖼️ 图片压缩', title: '把当前目录里的图片压小（默认另存为 xxx.min.<ext>，不动原文件）', run: imageCompressModal },
+      { label: '🎬 视频压缩', title: '把当前目录里的视频压小（产物写进 output/；绝不越压越大）', run: videoCompressModal },
+      { label: '打包压缩' + (selection.size ? `（${selection.size} 项）` : ''), title: '把选中的项打成 zip/tar 归档', disabled: selection.size === 0, run: compressSelected },
+    ];
+  }
+
   function renderToolbar() {
     clear(toolbar);
     const selCount = selection.size;
     const clip = clipboard && clipboard.paths.length ? clipboard : null;
+    const favCount = favList().length;
     appendAll(toolbar, 
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: () => load(cwd) }),
       h('button.btn.btn-sm', {
@@ -725,40 +753,29 @@ export function FilesView(content, ctx = {}) {
         title: '一键回到网站根目录',
         onclick: () => { const w = wwwRoot(); if (w) load(w); },
       }),
-      // 收藏当前目录 / 打开收藏夹（点一下直接跳过去）。状态来自服务端列表。
+      // 收藏只有这一颗：点它打开收藏列表。加入/取消收藏在行右键与「更多」菜单里。
       h('button.btn.btn-sm', {
-        text: isFavorite(cwd) ? '★ 已收藏' : '☆ 收藏',
-        title: isFavorite(cwd) ? '取消收藏当前目录' : '收藏当前目录（服务端保存，手机上也能看到）',
-        onclick: toggleFavorite,
-      }),
-      h('button.btn.btn-sm', {
-        text: '⭐ 收藏夹' + (favList().length ? '（' + favList().length + '）' : ''),
-        title: '点一下直接跳到收藏的目录',
+        text: (isFavorite(cwd) ? '★ ' : '') + '收藏' + (favCount ? '（' + favCount + '）' : ''),
+        title: '打开收藏列表（加入/取消收藏在右键或「更多」菜单）',
         onclick: favoritesModal,
       }),
-      h('button.btn.btn-sm', { text: '⬆ 上传', onclick: () => fileInput.click() }),
-      h('button.btn.btn-sm', { text: '⬆ 上传文件夹', onclick: () => folderInput.click() }),
+      // 上传是**分体按钮**：左半点开上传面板，右半 ▾ 是「上传文件 / 上传文件夹」。
+      h('div', { style: { display: 'inline-flex', gap: '2px' } }, [
+        h('button.btn.btn-sm', {
+          text: '⬆ 上传',
+          title: '打开上传面板（也可把文件/文件夹拖进面板）',
+          onclick: uploadPanel,
+        }),
+        h('button.btn.btn-sm', {
+          text: '▾', title: '上传文件 / 上传文件夹',
+          style: { padding: '3px 7px' },
+          onclick: (ev) => toggleDropdown(ev.currentTarget, uploadMenuItems()),
+        }),
+      ]),
       h('button.btn.btn-sm', {
-        text: '＋ 新建文件夹',
-        onclick: async () => {
-          const name = await promptBox({ title: '新建文件夹', label: '文件夹名称', placeholder: '例如 assets' });
-          if (!name) return;
-          try {
-            await api.fileMkdir(`${cwd}/${name}`);
-            toast('已创建', 'ok'); load(cwd);
-          } catch (e) { toast(e.message, 'err'); }
-        },
-      }),
-      h('button.btn.btn-sm', {
-        text: '＋ 新建文件',
-        onclick: async () => {
-          const name = await promptBox({ title: '新建文件', label: '文件名', placeholder: '例如 index.php' });
-          if (!name) return;
-          try {
-            await api.fileTouch(`${cwd}/${name}`);
-            toast('已创建', 'ok'); load(cwd);
-          } catch (e) { toast(e.message, 'err'); }
-        },
+        text: '＋ 新建',
+        title: '新建文件夹 / 新建文件',
+        onclick: (ev) => toggleDropdown(ev.currentTarget, newMenuItems()),
       }),
       h('label', {
         style: { display: 'flex', gap: '5px', alignItems: 'center', fontSize: '12.5px', cursor: 'pointer' },
@@ -787,19 +804,12 @@ export function FilesView(content, ctx = {}) {
         title: '粘贴到当前目录（Ctrl+V）',
         onclick: pasteClipboard,
       }) : null,
-      // 两个"压缩"必须一眼分得清：这里是**打包**（zip/tar 归档），
-      // 「🖼️ 图片压缩」是图片体积优化（另一件事，用 libvips）。
+      // 压缩箱在右侧（原来三颗压缩按钮的位置）。
       h('button.btn.btn-sm', {
-        text: '🖼️ 图片压缩',
-        title: '把当前目录里的图片压小（质量 / 最长边 / 输出格式可选；默认另存为 xxx.min.<ext>，不动原文件）',
-        onclick: imageCompressModal,
+        text: '压缩箱 ▾',
+        title: '图片压缩 / 视频压缩 / 打包压缩',
+        onclick: (ev) => toggleDropdown(ev.currentTarget, compressMenuItems()),
       }),
-      h('button.btn.btn-sm', {
-        text: '🎬 视频压缩',
-        title: '把当前目录里的视频压小（360p/480p/720p，产物写进 output/；绝不越压越大）',
-        onclick: videoCompressModal,
-      }),
-      h('button.btn.btn-sm', { text: '打包压缩', disabled: selCount === 0, onclick: compressSelected }),
       h('button.btn.btn-sm.btn-danger', { text: '删除', disabled: selCount === 0, onclick: deleteSelected }),
       h('button.btn.btn-sm', { text: '🔍 搜索', onclick: searchModal }),
     );
@@ -808,7 +818,7 @@ export function FilesView(content, ctx = {}) {
   // ---------- 目录收藏 ----------
   //
   // 存服务端（settings KV）而不是 localStorage：手机上打开面板也要看得到同一份。
-  // "已收藏"状态只信服务端列表（没拉到就显示「☆ 收藏」，绝不猜）。
+  // "已收藏"标记只信服务端列表（没拉到就不显示 ★，绝不猜）。
   function favList() {
     return (favorites && favorites.items) || [];
   }
@@ -840,10 +850,11 @@ export function FilesView(content, ctx = {}) {
     }
   }
 
-  async function toggleFavorite() {
-    if (!cwd) return;
-    const on = isFavorite(cwd);
-    if (await setFavorite(on ? 'remove' : 'add', cwd)) {
+  // toggleFavorite 是收藏写入口，收/放传路径（工具栏那颗只负责打开列表）。
+  async function toggleFavorite(p) {
+    if (!p) return;
+    const on = isFavorite(p);
+    if (await setFavorite(on ? 'remove' : 'add', p)) {
       toast(on ? '已取消收藏' : '已收藏（手机上也能看到）', 'ok');
     }
   }
@@ -860,7 +871,7 @@ export function FilesView(content, ctx = {}) {
       clear(foot);
       const items = favList();
       if (!items.length) {
-        body.append(h('div.hint', { text: '还没有收藏：在工具栏点「☆ 收藏」把当前目录加进来。' }));
+        body.append(h('div.hint', { text: '还没有收藏：在文件夹上右键或用「更多」菜单 →「加入收藏」。' }));
         foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
         return;
       }
@@ -1037,20 +1048,8 @@ export function FilesView(content, ctx = {}) {
         h('td', { style: { fontSize: '11.5px' }, text: e.owner || '—' }),
         h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: e.mod_time }),
         h('td', [
-          h('div', { style: { display: 'flex', gap: '4px', flexWrap: 'wrap' } }, [
-            e.is_dir
-              ? h('button.btn.btn-sm', { text: '打开', onclick: () => load(e.path) })
-              : h('button.btn.btn-sm', {
-                text: openLabel(e),
-                onclick: () => openAny(e),
-              }),
-            h('button.btn.btn-sm', {
-              text: '下载',
-              disabled: e.is_dir,
-              onclick: () => { window.location.href = api.fileDownloadURL(e.path); },
-            }),
-            h('button.btn.btn-sm', { text: '⋯', title: '更多操作（右键也可以）', onclick: () => moreMenu(e) }),
-          ]),
+          // 「操作」列只有这一颗「更多」：打开/下载/重命名/… 全在菜单里（与行右键同一份内容）。
+          h('button.btn.btn-sm', { text: '更多', title: '更多操作（与行右键菜单同一份内容）', onclick: () => rowMoreMenu(e) }),
         ]),
       ]);
       rowEls.push(tr);
@@ -1087,10 +1086,13 @@ export function FilesView(content, ctx = {}) {
   // ---------- 右键菜单 ----------
   //
   // 自己起一层 .zp-ctx-menu（而不是 modal）：右键菜单要贴着鼠标、点别处就消失。
+  // 工具栏的「上传 ▾ / 新建 / 压缩箱」下拉也复用它（见 toggleDropdown）。
   let openCtxMenu = null;
+  let dropdownAnchor = null;
 
   function closeContextMenu() {
     if (openCtxMenu) { openCtxMenu.remove(); openCtxMenu = null; }
+    dropdownAnchor = null;
   }
 
   function showContextMenu(x, y, items) {
@@ -1100,11 +1102,11 @@ export function FilesView(content, ctx = {}) {
       if (!it) continue;
       if (it.sep) { menu.appendChild(h('div.zp-ctx-sep')); continue; }
       if (it.disabled) {
-        menu.appendChild(h('div.zp-ctx-item.zp-ctx-disabled', { text: it.label }));
+        menu.appendChild(h('div.zp-ctx-item.zp-ctx-disabled', { text: it.label, title: it.title || '当前选择不适用' }));
         continue;
       }
-      menu.appendChild(h('button.zp-ctx-item', {
-        type: 'button', text: it.label,
+      menu.appendChild(h('button.zp-ctx-item' + (it.danger ? '.zp-ctx-danger' : ''), {
+        type: 'button', text: it.label, title: it.title || '',
         onclick: () => { closeContextMenu(); try { it.run(); } catch (e) { toast('操作失败：' + ((e && e.message) || e), 'err'); } },
       }));
     }
@@ -1117,25 +1119,35 @@ export function FilesView(content, ctx = {}) {
     openCtxMenu = menu;
   }
 
-  // rowContextMenu 是文件/文件夹行的右键菜单，按条目类型禁用不适用项。
-  function rowContextMenu(x, y, e) {
-    const paths = selection.has(e.path) && selection.size > 1 ? [...selection] : [e.path];
-    const multi = paths.length > 1;
-    const target = multi ? paths : e.path;
-    const archive = !e.is_dir && /\.(zip|tar\.gz|tgz|tar)$/i.test(e.name);
-    const hasDirs = (lastList?.entries || []).some((x2) => selection.has(x2.path) && x2.is_dir);
+  // toggleDropdown 把工具栏按钮当锚点：菜单贴在按钮下方，内容与右键菜单同一个渲染器。
+  function toggleDropdown(anchor, items) {
+    if (openCtxMenu && dropdownAnchor === anchor) { closeContextMenu(); return; }
+    const r = anchor.getBoundingClientRect();
+    showContextMenu(r.left, r.bottom + 4, items);
+    dropdownAnchor = anchor;
+  }
 
-    const items = [
-      {
-        label: openLabel(e),
-        run: () => (e.is_dir ? load(e.path) : openAny(e)),
-      },
+  // menuPaths 是行操作的选中集合：右键的那一行若在多选里就整批操作，否则只操作它。
+  function menuPaths(e) {
+    return selection.has(e.path) && selection.size > 1 ? [...selection] : [e.path];
+  }
+
+  // rowMenuItems 是**行操作菜单的唯一来源**：行右键与「操作」列的「更多」都调它。
+  // 只允许存在这一处定义（门禁 TestFilesRowMenuSingleSourceGate 盯着）。
+  function rowMenuItems(e, paths) {
+    const multi = paths.length > 1;
+    const archive = !e.is_dir && /\.(zip|tar\.gz|tgz|tar)$/i.test(e.name);
+    const hasDirs = (lastList?.entries || []).some((x) => selection.has(x.path) && x.is_dir);
+    return [
+      { label: openLabel(e), run: () => (e.is_dir ? load(e.path) : openAny(e)) },
       // 媒体不走文本编辑器（点开就是乱码/二进制提示），只留播放与下载。
       !e.is_dir && !isImage(e) && !mediaKind(e) ? { label: '用编辑器打开', run: () => openEditor(e) } : null,
-      { label: '下载', disabled: e.is_dir || multi, run: () => { window.location.href = api.fileDownloadURL(e.path); } },
-      archive ? { label: '解压到当前目录', run: () => extractEntry(e) } : null,
+      { label: '下载', title: '下载到本机（多选时请逐个下载）', disabled: e.is_dir || multi, run: () => { window.location.href = api.fileDownloadURL(e.path); } },
+      archive ? { label: '解压到当前目录', title: '大压缩包会在任务中心里跑，并逐条显示进度', run: () => extractEntry(e) } : null,
       { sep: true },
       { label: '重命名' + (multi ? '（仅单项）' : ''), disabled: multi, run: () => renameEntry(e) },
+      { label: '复制到…', disabled: multi, run: () => copyEntryTo(e) },
+      { label: '移动到…', disabled: multi, run: () => moveEntryTo(e) },
       { label: '复制（Ctrl+C）', run: () => copySelection(paths) },
       { label: '剪切（Ctrl+X）', run: () => cutSelection(paths) },
       {
@@ -1144,12 +1156,17 @@ export function FilesView(content, ctx = {}) {
         run: pasteClipboard,
       },
       { label: '压缩…', run: () => { if (!selection.has(e.path)) selection = new Set([e.path]); compressSelected(); } },
-      { label: '权限…', disabled: multi, run: () => chmodModal(e) },
+      { label: '权限…', title: '修改该文件/目录的读/写/执行权限（宝塔式勾选界面）', disabled: multi, run: () => chmodModal(e) },
+      { label: isFavorite(e.path) ? '取消收藏' : '加入收藏', title: '收藏存服务端，手机上也能看到', run: () => toggleFavorite(e.path) },
       { sep: true },
       { label: '复制完整路径', run: () => copyFullPath(e.path) },
-      { label: '删除' + (multi ? ` ${paths.length} 项` : ''), run: () => (multi || hasDirs || e.is_dir ? deleteSelectionOrOne(e, paths) : deleteOne(e)) },
+      { label: '删除' + (multi ? ` ${paths.length} 项` : ''), danger: true, run: () => (multi || hasDirs || e.is_dir ? deleteSelectionOrOne(e, paths) : deleteOne(e)) },
     ];
-    showContextMenu(x, y, items);
+  }
+
+  // rowContextMenu 是文件/文件夹行的右键菜单（内容来自 rowMenuItems）。
+  function rowContextMenu(x, y, e) {
+    showContextMenu(x, y, rowMenuItems(e, menuPaths(e)));
   }
 
   // blankContextMenu 是空白处的右键菜单。
@@ -1178,97 +1195,46 @@ export function FilesView(content, ctx = {}) {
       `　路径：${l.path}${l.writable ? '' : '（当前不可写）'}`;
   }
 
-  function moreMenu(e) {
-    const rename = h('button.btn.btn-block', {
-      text: '重命名',
-      onclick: async () => {
-        m.close();
-        const name = await promptBox({ title: '重命名', label: '新名称', value: e.name });
-        if (!name || name === e.name) return;
-        try {
-          await api.fileRename(e.path, `${dirname(e.path)}/${name}`);
-          toast('已重命名', 'ok'); load(cwd);
-        } catch (err) { toast(err.message, 'err'); }
-      },
+  // copyEntryTo / moveEntryTo 是「复制到…」「移动到…」的唯一实现（右键与「更多」共用）。
+  async function copyEntryTo(e) {
+    const dest = await promptBox({
+      title: '复制到', label: '目标完整路径', value: e.path + '-copy',
+      hint: '必须是允许访问的目录内的绝对路径',
     });
-    const copy = h('button.btn.btn-block', {
-      text: '复制到…',
-      onclick: async () => {
-        m.close();
-        const dest = await promptBox({
-          title: '复制到', label: '目标完整路径', value: e.path + '-copy',
-          hint: '必须是允许访问的目录内的绝对路径',
-        });
-        if (!dest) return;
-        // 复制是长任务（可能几 GB）；同目录内复制也要有进度可见。
-        await startFileOp({
-          kind: 'file_copy', title: `复制到 ${basename(dest)}`,
-          run: () => api.fileCopy([{ from: e.path, to: dest }]),
-        });
-      },
+    if (!dest) return;
+    // 复制是长任务（可能几 GB）；同目录内复制也要有进度可见。
+    await startFileOp({
+      kind: 'file_copy', title: `复制到 ${basename(dest)}`,
+      run: () => api.fileCopy([{ from: e.path, to: dest }]),
     });
-    const move = h('button.btn.btn-block', {
-      text: '移动到…',
-      onclick: async () => {
-        m.close();
-        const dest = await promptBox({ title: '移动到', label: '目标完整路径', value: e.path, hint: '会重命名或移动到该位置' });
-        if (!dest || dest === e.path) return;
-        try {
-          await api.fileRename(e.path, dest);
-          toast('已移动', 'ok'); load(cwd);
-        } catch (err) { toast(err.message, 'err'); }
-      },
-    });
-    const chmod = h('button.btn.btn-block', {
-      text: '权限…',
-      title: '修改该文件/目录的读/写/执行权限（宝塔式勾选界面）',
-      onclick: () => {
-        m.close();
-        chmodModal(e);
-      },
-    });
-    const del = h('button.btn.btn-danger.btn-block', {
-      text: '删除',
-      onclick: async () => {
-        m.close();
-        await deleteOne(e);
-      },
-    });
+  }
 
-    const buttons = [rename, copy, move, chmod];
-    // 剪贴板入口（与 Ctrl+C / Ctrl+X 等价）
-    buttons.splice(1, 0,
-      h('button.btn.btn-block', { text: '复制', onclick: () => { m.close(); copySelection([e.path]); } }),
-      h('button.btn.btn-block', { text: '剪切', onclick: () => { m.close(); cutSelection([e.path]); } }));
-    // 归档文件才有解压入口
-    if (/\.(zip|tar\.gz|tgz|tar)$/i.test(e.name)) {
-      buttons.splice(3, 0, h('button.btn.btn-block', {
-        text: '解压到当前目录',
-        title: '大压缩包会在任务中心里跑，并逐条显示"已解压 N/M：文件名"',
-        onclick: async () => {
+  async function moveEntryTo(e) {
+    const dest = await promptBox({ title: '移动到', label: '目标完整路径', value: e.path, hint: '会重命名或移动到该位置' });
+    if (!dest || dest === e.path) return;
+    try {
+      await api.fileRename(e.path, dest);
+      toast('已移动', 'ok'); load(cwd);
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  // rowMoreMenu 是「操作」列那颗「更多」：同一份 rowMenuItems，外加这个条目的元信息。
+  // （两个入口一份内容 —— 改菜单项只需改 rowMenuItems 一处。）
+  function rowMoreMenu(e) {
+    const paths = menuPaths(e);
+    const buttons = rowMenuItems(e, paths).filter(Boolean).map((it) => {
+      if (it.sep) return h('div', { style: { height: '1px', margin: '5px 2px', background: 'var(--border-soft)' } });
+      if (it.disabled) {
+        return h('button.btn.btn-block', { text: it.label, disabled: true, title: it.title || '当前选择不适用' });
+      }
+      return h('button.btn.btn-block' + (it.danger ? '.btn-danger' : ''), {
+        text: it.label, title: it.title || '',
+        onclick: () => {
           m.close();
-          // 走任务中心：解压 900MB 是分钟级动作，关掉窗口也要能找回进度
-          //（用户 2026-09-18 报障："一点反应都没有！没有任何进度"）。
-          try {
-            await taskCenter.start({
-              kind: 'file_extract', target: e.path,
-              title: '解压 ' + e.name,
-              start: () => api.fileExtract(e.path, cwd),
-              onDone: (task) => {
-                if (task && task.status && task.status !== 'succeeded') {
-                  toast('解压失败：' + (task.error || task.status), 'err', 14000);
-                  return;
-                }
-                const r = (task && task.result) || {};
-                toast(r.msg || '已解压到当前目录', 'ok', 9000);
-                load(cwd);
-              },
-            });
-          } catch (err) { toast('解压失败：' + ((err && err.message) || err), 'err', 12000); }
+          try { it.run(); } catch (err) { toast('操作失败：' + ((err && err.message) || err), 'err'); }
         },
-      }));
-    }
-    buttons.push(del);
+      });
+    });
 
     const m = modal({
       title: e.name,
@@ -2089,6 +2055,105 @@ export function FilesView(content, ctx = {}) {
     return info;
   }
 
+  // ---------- 上传面板 / 上传进度（唯一实现） ----------
+  //
+  // 用户要求（宝塔式）：上传面板里有「选择文件 / 选择文件夹」+ 拖拽区 + 进度。
+  // 进度**只有这一份实现**：host 为空时照旧弹独立进度窗，host 存在时就地画进面板。
+  let uploadHost = null;      // 面板里的进度容器（面板关闭即清空）
+  let uploadHostClose = null; // 关掉整个上传面板（进度完成后的「进入 xxx」要用）
+
+  function mountUploadProgress({ folder, entries, batchCount, limitInfo, host, hostClose, onCancel }) {
+    const barFill = h('i', { style: { width: '0%' } });
+    const lineMain = h('div', { style: { fontWeight: '600' }, text: '正在准备…' });
+    const lineRate = h('div', { style: { color: 'var(--text-mute)', marginTop: '4px' }, text: ' ' });
+    const lineNote = h('div', { style: { marginTop: '8px', fontSize: '12.5px', color: 'var(--text-mute)' },
+      text: folder ? `将在 ${cwd} 下按原目录结构重建（同名文件会被覆盖）` : `目标目录：${cwd}` });
+    if (batchCount > 1) {
+      appendAll(lineNote, h('div', { text: `分 ${batchCount} 批上传（每次请求都不超过上限）。` }));
+    }
+    if (!limitInfo.verified) {
+      appendAll(lineNote, h('div', { style: { color: 'var(--warn)' },
+        text: `上限未复核：${limitInfo.note || '读不到面板配置'}` }));
+    }
+
+    const cancelBtn = h('button.btn.btn-sm', { text: '取消上传', onclick: () => onCancel && onCancel() });
+    const closeBtn = h('button.btn.btn-sm.btn-primary', { text: '关闭', style: { display: 'none' } });
+    const el = h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
+      lineMain,
+      h('div.bar', [barFill]),
+      lineRate,
+      lineNote,
+      h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '10px' } }, [cancelBtn, closeBtn]),
+    ]);
+
+    // host 模式：进度就地在面板里；独立模式：进度窗（与旧版一致的两个按钮在页脚）。
+    const inPanel = !!(host && host.isConnected);
+    let modalRef = null;
+    if (inPanel) {
+      clear(host);
+      appendAll(host, el);
+      closeBtn.onclick = () => { clear(host); };
+    } else {
+      modalRef = modal({
+        title: folder
+          ? `⬆ 上传文件夹（${entries.length} 个文件${batchCount > 1 ? `，${batchCount} 批` : ''}）`
+          : `⬆ 上传 ${entries.length} 个文件${batchCount > 1 ? `（${batchCount} 批）` : ''}`,
+        body: el,
+        footer: null,
+        closeOnBackdrop: false, // 上传中误点遮罩不该让窗口消失（那看起来又像"没反应"）
+        closeOnEsc: false,
+      });
+      closeBtn.onclick = () => { if (modalRef) modalRef.close(); };
+    }
+
+    return {
+      barFill, lineMain, lineRate, lineNote, inPanel,
+      finish() {
+        cancelBtn.style.display = 'none';
+        closeBtn.style.display = '';
+      },
+      // fail 把失败原因写进同一个进度区（用户不用去找别的地方），再补一条 toast。
+      fail(title, detail) {
+        barFill.style.background = 'var(--danger)';
+        lineMain.textContent = title;
+        lineMain.style.color = 'var(--danger)';
+        lineRate.textContent = '';
+        clear(lineNote);
+        appendAll(lineNote, h('div', { text: detail }));
+        toast(`${title}：${detail}`, 'err', 15000);
+      },
+      closeAll() {
+        if (inPanel) { if (hostClose) hostClose(); } else if (modalRef) modalRef.close();
+      },
+    };
+  }
+
+  // uploadPanel 是「上传」那颗按钮点开的面板：选择文件/文件夹 + 拖拽区 + 进度。
+  function uploadPanel() {
+    const host = h('div.files-upload-progress');
+    const drop = h('div.files-drop', { text: '把文件或整个文件夹拖到这里上传（文件夹会保留目录结构）' });
+    const pick = (input) => { input.click(); };
+    const body = h('div', [
+      h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' } }, [
+        h('button.btn.btn-primary', { text: '选择文件', onclick: () => pick(fileInput) }),
+        h('button.btn', { text: '选择文件夹', onclick: () => pick(folderInput) }),
+      ]),
+      drop,
+      h('div.hint', { style: { margin: '8px 0' }, text: `目标目录：${cwd}` }),
+      host,
+    ]);
+    const m = modal({
+      title: '⬆ 上传',
+      body,
+      footer: [h('button.btn', { text: '关闭', onclick: () => m.close() })],
+      onClose: () => { uploadHost = null; uploadHostClose = null; },
+    });
+    uploadHost = host;
+    uploadHostClose = () => m.close();
+    // 面板自己的拖拽区与列表上的拖拽走同一条路（见 wireDropZone）。
+    wireDropZone(drop, { show: (on) => drop.classList.toggle('active', on) });
+  }
+
   // uploadEntries 是所有上传入口（按钮/文件夹按钮/拖拽）的唯一实现。
   //
   // 整体套 try/catch：**任何**没预料到的异常都必须变成用户看得见的提示。
@@ -2114,7 +2179,12 @@ export function FilesView(content, ctx = {}) {
           onConflict = choice;
         }
       }
-      await runUpload(entries, plan, { folder: !!opts.folder, onConflict, limitInfo });
+      await runUpload(entries, plan, {
+        folder: !!opts.folder, onConflict, limitInfo,
+        // 上传面板开着时进度就画在面板里；关了就回到独立进度窗。
+        host: uploadHost && uploadHost.isConnected ? uploadHost : null,
+        hostClose: uploadHostClose,
+      });
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       toast('上传未能开始：' + msg, 'err', 15000);
@@ -2219,30 +2289,12 @@ export function FilesView(content, ctx = {}) {
 
   // runUpload 按计划**逐批**发请求：每个请求都 ≤ 上限，总大小不参与拒绝。
   //
-  // 进度窗显示"第 i/N 批"；失败沿用现有机制（窗口里给出服务端原因，
-  // 已传完的文件留在目标目录，重传即可 —— 文件夹上传是覆盖语义，不会重复）。
-  async function runUpload(entries, plan, { folder, onConflict, limitInfo }) {
+  // 进度区复用 mountUploadProgress（上传面板里就地显示，或独立进度窗）：
+  // 失败时给出服务端原因；已传完的文件留在目标目录，重传即可（文件夹上传是覆盖语义）。
+  async function runUpload(entries, plan, { folder, onConflict, limitInfo, host, hostClose }) {
     const batches = ((plan && plan.batches) || []).map((idxs) => idxs.map((i) => entries[i]));
     const batchCount = batches.length;
     const total = batches.reduce((s, b) => s + b.reduce((x, e) => x + ((e.file && e.file.size) || 0), 0), 0);
-
-    // ---- 进度窗（先建窗口，再拼请求体）----
-    //
-    // 顺序很重要：拼 FormData 也可能抛（历史上 appendAll 就抛在这里，
-    // 而窗口还没建 → 用户什么都看不到）。先把窗口立起来，任何后续异常
-    // 都能显示在窗口里。
-    const barFill = h('i', { style: { width: '0%' } });
-    const lineMain = h('div', { style: { fontWeight: '600' } , text: '正在准备…' });
-    const lineRate = h('div', { style: { color: 'var(--text-mute)', marginTop: '4px' }, text: ' ' });
-    const lineNote = h('div', { style: { marginTop: '8px', fontSize: '12.5px', color: 'var(--text-mute)' },
-      text: folder ? `将在 ${cwd} 下按原目录结构重建（同名文件会被覆盖）` : `目标目录：${cwd}` });
-    if (batchCount > 1) {
-      appendAll(lineNote, h('div', { text: `分 ${batchCount} 批上传（每次请求都不超过上限）。` }));
-    }
-    if (!limitInfo.verified) {
-      appendAll(lineNote, h('div', { style: { color: 'var(--warn)' },
-        text: `上限未复核：${limitInfo.note || '读不到面板配置'}` }));
-    }
 
     // 状态与当前 XHR 先声明再接线：按钮回调（取消上传）会引用 curXHR。
     const started = Date.now();
@@ -2256,23 +2308,16 @@ export function FilesView(content, ctx = {}) {
     const allUploaded = [];
     const allFailed = [];
 
-    let modalRef = null;
-    const cancelBtn = h('button.btn', { text: '取消上传', onclick: () => { aborted = true; if (curXHR) curXHR.abort(); } });
-    const closeBtn = h('button.btn.btn-primary', { text: '关闭', style: { display: 'none' }, onclick: () => modalRef && modalRef.close() });
-    modalRef = modal({
-      title: folder
-        ? `⬆ 上传文件夹（${entries.length} 个文件${batchCount > 1 ? `，${batchCount} 批` : ''}）`
-        : `⬆ 上传 ${entries.length} 个文件${batchCount > 1 ? `（${batchCount} 批）` : ''}`,
-      body: h('div', { style: { fontSize: '13.5px', lineHeight: '1.7' } }, [
-        lineMain,
-        h('div.bar', [barFill]),
-        lineRate,
-        lineNote,
-      ]),
-      footer: [cancelBtn, closeBtn],
-      closeOnBackdrop: false, // 上传中误点遮罩不该让窗口消失（那看起来又像"没反应"）
-      closeOnEsc: false,
+    // ---- 进度区（先立起来，再拼请求体）----
+    //
+    // 顺序很重要：拼 FormData 也可能抛（历史上 appendAll 就抛在这里，
+    // 而窗口还没建 → 用户什么都看不到）。先把进度区立起来，任何后续异常
+    // 都能显示在里面。
+    const up = mountUploadProgress({
+      folder, entries, batchCount, limitInfo, host, hostClose,
+      onCancel: () => { aborted = true; if (curXHR) curXHR.abort(); },
     });
+    const { barFill, lineMain, lineRate, lineNote } = up;
 
     // 每 200ms~1s 刷新一次界面：**即使一个进度事件都没有**也要能看出"在动" ——
     // 大文件在浏览器决定何时发第一个 progress 事件前可能安静好几秒，
@@ -2300,20 +2345,13 @@ export function FilesView(content, ctx = {}) {
     function finish() {
       finished = true;
       clearInterval(ticker);
-      cancelBtn.style.display = 'none';
-      closeBtn.style.display = '';
+      up.finish();
     }
 
-    // fail 把失败原因写进同一个窗口（用户不用去找别的地方），再补一条 toast。
+    // fail 把失败原因写进同一个进度区（用户不用去找别的地方），再补一条 toast。
     function fail(title, detail) {
       finish();
-      barFill.style.background = 'var(--danger)';
-      lineMain.textContent = title;
-      lineMain.style.color = 'var(--danger)';
-      lineRate.textContent = '';
-      clear(lineNote);
-      appendAll(lineNote, h('div', { text: detail }));
-      toast(`${title}：${detail}`, 'err', 15000);
+      up.fail(title, detail);
     }
 
     // sendBatch 发一批（XHR + 进度），返回 {ok:true,payload} 或 {ok:false,...}。
@@ -2439,7 +2477,7 @@ export function FilesView(content, ctx = {}) {
     if (folder && top) {
       appendAll(lineNote, h('button.btn.btn-sm', {
         text: `进入 ${top}`, style: { marginTop: '8px' },
-        onclick: () => { modalRef && modalRef.close(); load(`${cwd}/${top}`); },
+        onclick: () => { up.closeAll(); load(`${cwd}/${top}`); },
       }));
     }
     load(cwd);
@@ -2650,8 +2688,11 @@ export function FilesView(content, ctx = {}) {
   }
   document.addEventListener('keydown', onKeyDown);
   // 右键菜单：点别处 / 滚动 / Esc 就关掉（与系统菜单一致）。
+  // 锚点按钮自己例外 —— mousedown 先关、click 再开会让"再点一次收起"失效。
   const onDocPointer = (ev) => {
-    if (openCtxMenu && !openCtxMenu.contains(ev.target)) closeContextMenu();
+    if (!openCtxMenu || openCtxMenu.contains(ev.target)) return;
+    if (dropdownAnchor && dropdownAnchor.contains(ev.target)) return;
+    closeContextMenu();
   };
   const onDocScroll = () => closeContextMenu();
   document.addEventListener('mousedown', onDocPointer);

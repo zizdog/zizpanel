@@ -1065,16 +1065,19 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
    不引入动效就不存在"忘了写媒体查询"的问题。
    ========================================================================== */
 
-/* 右键菜单：贴着鼠标、点别处即消失（由 files.js 管理生命周期） */
+/* 右键菜单 / 工具栏下拉：贴着鼠标或按钮、点别处即消失（由 files.js 管理生命周期）。
+   max-height + 滚动是手机上的硬要求：菜单比视口高时会被顶出屏幕，最后几项点不到。 */
 .zp-ctx-menu {
   position: fixed; z-index: 3000;
   min-width: 180px; max-width: 320px;
+  max-height: calc(100vh - 12px); overflow-y: auto;
   padding: 5px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm, 8px);
   box-shadow: 0 10px 28px rgba(0, 0, 0, .38);
   user-select: none;
+  -webkit-overflow-scrolling: touch;
 }
 .zp-ctx-item {
   display: block; width: 100%;
@@ -1084,9 +1087,14 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
   cursor: pointer; white-space: nowrap;
 }
 .zp-ctx-item:hover { background: var(--brand-soft); color: var(--brand); }
+.zp-ctx-danger { color: var(--danger); }
+.zp-ctx-danger:hover { background: var(--danger-soft, var(--brand-soft)); color: var(--danger); }
 .zp-ctx-disabled { color: var(--text-mute); cursor: not-allowed; opacity: .55; }
 .zp-ctx-disabled:hover { background: transparent; color: var(--text-mute); }
 .zp-ctx-sep { height: 1px; margin: 5px 6px; background: var(--border-soft); }
+
+/* 上传面板里的进度区：只在有进度时才占地方（空的时候高度为 0）。 */
+.files-upload-progress:empty { display: none; }
 
 /* 图片查看器：stage 负责滚动，图片用 transform 缩放（不改布局、不重排） */
 .zp-imgview-stage {
