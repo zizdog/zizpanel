@@ -188,7 +188,7 @@ func TestVideoOptionsGate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// 用户实测场景：480p + 码率填 1200 → 必须给醒目警告 + 源编码信息 + 体积对比。
+		// 用户实测场景：480p + 码率填 1200（≥ 原片 1200×0.95）→ 必须标"封顶即跳过"。
 		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{
 			"dir": dir, "preset": "480p", "kbps": 1200,
 		})
@@ -197,12 +197,16 @@ func TestVideoOptionsGate(t *testing.T) {
 		}
 		var plan struct {
 			Data struct {
-				Warning        string `json:"warning"`
-				CappedRunnable int    `json:"capped_runnable"`
-				EstPercent     int    `json:"est_percent"`
-				TotalSource    int64  `json:"total_source_bytes"`
-				Rows           []struct {
+				Warning       string `json:"warning"`
+				WarningDetail string `json:"warning_detail"`
+				CappedSkipped int    `json:"capped_skipped"`
+				PlaceCount    int    `json:"place_count"`
+				EstPercent    int    `json:"est_percent"`
+				TotalSource   int64  `json:"total_source_bytes"`
+				Rows          []struct {
 					Capped      bool   `json:"capped"`
+					SkipReason  string `json:"skip_reason"`
+					PlaceInOut  bool   `json:"place_in_output"`
 					SourceCodec string `json:"source_codec"`
 					SourceBytes int64  `json:"source_bytes"`
 					EstBytes    int64  `json:"est_bytes"`
@@ -212,28 +216,45 @@ func TestVideoOptionsGate(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &plan); err != nil {
 			t.Fatalf("计划响应不是 JSON: %v", err)
 		}
-		if plan.Data.CappedRunnable != 1 || !plan.Data.Rows[0].Capped {
-			t.Fatalf("码率 1200 ≥ 原片 1200×0.95，必须标 capped：%s", rec.Body.String())
+		if plan.Data.CappedSkipped != 1 || !plan.Data.Rows[0].Capped {
+			t.Fatalf("码率 1200 ≥ 原片 1200×0.95，必须标 capped 跳过：%s", rec.Body.String())
 		}
-		if plan.Data.Warning == "" || !strings.Contains(plan.Data.Warning, "800") {
-			t.Errorf("必须给出「建议 ≤ 800 kbps」的警告，实际 %q", plan.Data.Warning)
+		if !strings.Contains(plan.Data.Rows[0].SkipReason, "码率") || !plan.Data.Rows[0].PlaceInOut {
+			t.Errorf("封顶的行必须标跳过（原因含「码率」）且要原样放进 output：%+v", plan.Data.Rows[0])
+		}
+		// 面板必须明确提醒"不会转码、但会原样放进 output"（细节走 warning_detail）。
+		if plan.Data.Warning == "" || plan.Data.WarningDetail == "" {
+			t.Errorf("必须有「码率已到极限」的提醒与细节，实际 %q / %q", plan.Data.Warning, plan.Data.WarningDetail)
+		}
+		if plan.Data.PlaceCount != 1 {
+			t.Errorf("必须说明有 1 个会被原样放进 output，实际 %d", plan.Data.PlaceCount)
 		}
 		if !strings.Contains(plan.Data.Rows[0].SourceCodec, "h264") {
 			t.Errorf("计划行必须带源编码（面板显示 H.264），实际 %q", plan.Data.Rows[0].SourceCodec)
 		}
-		if plan.Data.TotalSource != 2<<20 || plan.Data.Rows[0].EstBytes <= 0 {
-			t.Errorf("体积对比字段缺失：total_source_bytes=%d est_bytes=%d", plan.Data.TotalSource, plan.Data.Rows[0].EstBytes)
-		}
-		// 同一场景选 800（= 档位下限，低于原片）时不许报警。
+		// 同一场景选 800（< 原片 1200×0.95，不会被封顶）时：没有提醒，且体积对比字段有效。
 		rec = postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "480p", "kbps": 800})
 		var quiet struct {
 			Data struct {
-				Warning string `json:"warning"`
+				Warning     string `json:"warning"`
+				CappedSkip  int    `json:"capped_skipped"`
+				TotalSource int64  `json:"total_source_bytes"`
+				EstBytes    int64  `json:"est_bytes"`
+				EstPercent  int    `json:"est_percent"`
+				Rows        []struct {
+					Capped   bool  `json:"capped"`
+					EstBytes int64 `json:"est_bytes"`
+				} `json:"rows"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &quiet)
-		if quiet.Data.Warning != "" {
-			t.Errorf("码率 800 < 原片 1200×0.95，不该报警告，实际 %q", quiet.Data.Warning)
+		if quiet.Data.Warning != "" || quiet.Data.CappedSkip != 0 {
+			t.Errorf("码率 800 < 原片 1200×0.95，不该有封顶提醒，实际 %q（capped=%d）",
+				quiet.Data.Warning, quiet.Data.CappedSkip)
+		}
+		if quiet.Data.TotalSource != 2<<20 || quiet.Data.Rows[0].EstBytes <= 0 {
+			t.Errorf("体积对比字段缺失：total_source_bytes=%d est_bytes=%d",
+				quiet.Data.TotalSource, quiet.Data.Rows[0].EstBytes)
 		}
 
 		// 质量优先：计划阶段就要标"体积不可预估"、且不给假体积（前端显示 —）。

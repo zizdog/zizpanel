@@ -121,6 +121,8 @@ type Progress struct {
 	FilesTotal int `json:"files_total"`
 	// Message 是一句人话（"正在统计大小…" / "12/80 文件 · 1.2 GB / 9.6 GB · 45%"）。
 	Message string `json:"message,omitempty"`
+	// Placed 是"未转码、原样放进 output/"的个数（视频压缩用；0 时不出现）。
+	Placed int `json:"placed,omitempty"`
 }
 
 // Meta 是任务的元信息（列表页与进度窗标题都用它）。

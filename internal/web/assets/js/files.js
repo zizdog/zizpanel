@@ -1934,16 +1934,19 @@ export function FilesView(content, ctx = {}) {
         }
         const src = (r.source_codec_label || r.source_codec || '')
           + (r.source_video_kbps ? ' · ' + r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '');
+        // 码率已到极限 ⇒ 不转码、原样放进 output（体积不变小）；原因细节收进 title。
+        const cappedSkip = !!(r.capped && r.skip_reason);
         return h('tr', [
           h('td.zp-plan-name', { text: r.name }),
           h('td', { text: src || '—' }),
           h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
           h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
           h('td', { text: tune }),
-          h('td', { text: sizeText(r.source_bytes, r.est_bytes, r.est_percent, r.estimate_unknown) }),
+          h('td', { text: cappedSkip ? '原样（不变小）' : sizeText(r.source_bytes, r.est_bytes, r.est_percent, r.estimate_unknown) }),
           h('td', {
             style: { color: r.skip_reason ? 'var(--warn)' : (r.capped ? 'var(--warn)' : 'var(--text-mute)') },
-            text: (r.capped ? '⚠ ' : '') + (r.skip_reason || r.note || '—'),
+            title: cappedSkip ? r.skip_reason : '',
+            text: cappedSkip ? '已跳过（码率已到极限）→ 会原样放入 output' : (r.skip_reason || r.note || '—'),
           }),
         ]);
       });
@@ -1956,9 +1959,10 @@ export function FilesView(content, ctx = {}) {
       ]);
 
       body.append(h('div', { style: { lineHeight: '1.7' } }, [
-        // 「这样压不会变小」的警告必须是第一眼看到的（判据来自后端 capped）。
+        // 码率已到极限的提醒必须是第一眼看到的（判据来自后端 capped）；
+        // 细节（硬链接 / 清单文件名）收进 title，不占主句。
         plan.warning ? h('div.banner-warn', [
-          h('strong', { text: '⚠ 可能压不小' }), h('span', { text: plan.warning }),
+          h('span', { text: '⚠ ' + plan.warning, title: plan.warning_detail || '' }),
         ]) : null,
         h('div.field', [h('label', { text: '目标档位（只封顶，绝不放大）' }), presetRow]),
         h('div.field', [h('label', { text: '编码器' }), encoderRow, encoderHint]),
@@ -1988,10 +1992,12 @@ export function FilesView(content, ctx = {}) {
         submitHint,
       ]));
 
+      // 可压为 0 但"跳过的文件要原样放进 output"时也要能开始：这一趟产出完整一套。
+      const canStart = !!plan.runnable || !!plan.place_count;
       const start = h('button.btn.btn-primary', {
         text: '开始压缩' + (plan.runnable ? '（' + plan.runnable + ' 个）' : ''),
-        disabled: !plan.runnable,
-        title: plan.runnable ? '在任务中心后台执行；关掉页面不受影响' : '没有可压缩的视频',
+        disabled: !canStart,
+        title: canStart ? '在任务中心后台执行；关掉页面不受影响' : '没有可处理的内容',
       });
       // 提交提示每次重画都归零（上一次的"提交失败"不该留在新计划上）。
       submitHint.style.display = 'none';
@@ -2027,10 +2033,9 @@ export function FilesView(content, ctx = {}) {
               return;
             }
             const r = (task && task.result) || {};
-            // 如实汇总"N 个完成 / M 个跳过"，体积与百分比都显示（百分比判据在后端）。
-            const pct = r.saved_percent_text ? '（' + r.saved_percent_text + '）' : '';
-            toast('视频压缩完成：' + (r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过（共省 '
-              + humanSize(r.saved_bytes || 0) + pct + '）', r.failed ? 'warn' : 'ok', 14000);
+            // 汇总文案由后端分开计数（压缩 / 原样放入 output / 其它跳过），前端不重算。
+            toast('视频压缩完成：' + (r.summary_text || ((r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过')),
+              r.failed ? 'warn' : 'ok', 14000);
             load(cwd);
           },
         });

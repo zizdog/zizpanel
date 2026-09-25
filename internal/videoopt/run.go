@@ -379,11 +379,16 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		if perr != nil {
 			res.Rows = append(res.Rows, Plan{
 				Name: src.Name, Path: src.Path,
-				OutName: OutputName(src.Name, opts.Preset.ID), OutPath: outPath,
-				SourceBytes: src.Bytes,
-				SkipReason:  "读不出视频信息（不是视频或文件损坏）",
+				OutName:       OutputName(src.Name, opts.Preset.ID),
+				OutPath:       outPath,
+				PlaceName:     PlaceName(src.Name, opts.Preset.ID),
+				PlacePath:     filepath.Join(req.OutDir, PlaceName(src.Name, opts.Preset.ID)),
+				SourceBytes:   src.Bytes,
+				PlaceInOutput: true,
+				SkipReason:    "读不出视频信息（不是视频或文件损坏）",
 			})
 			res.Skipped++
+			res.PlaceCount++
 			continue
 		}
 		row := PlanOne(src.Name, src.Path, req.OutDir, info, opts, outExists)
@@ -391,24 +396,29 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		if row.Runnable() {
 			if skip := expectSkip(req.Expect, row); skip != "" {
 				row.SkipReason = skip
+				// 源文件还在，照样原样放进 output/（保证 output 是完整一套）。
+				row.PlaceInOutput = true
 			}
 		}
 		if row.Runnable() {
 			res.Runnable++
 			res.EstBytes += row.EstBytes
 			res.TotalSourceBytes += row.SourceBytes
-			if row.Capped {
-				res.CappedRunnable++
-			}
 			if row.EstimateUnknown {
 				res.EstimateUnknown = true
 			}
 		} else {
 			res.Skipped++
+			if row.PlaceInOutput {
+				res.PlaceCount++
+			}
+			if row.Capped {
+				res.CappedSkipped++
+			}
 		}
 		res.Rows = append(res.Rows, row)
 	}
-	// 计划表里有、这次扫不到的（文件被删/移走）：补一行并如实说明。
+	// 计划表里有、这次扫不到的（文件被删/移走）：补一行并如实说明（没有源可放）。
 	for name, bytes := range req.Expect {
 		if seen[name] {
 			continue
@@ -422,7 +432,6 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		})
 		res.Skipped++
 	}
-	res.AllCapped = res.Runnable > 0 && res.CappedRunnable == res.Runnable
 	if !res.EstimateUnknown {
 		res.EstSavedBytes = res.TotalSourceBytes - res.EstBytes
 		res.EstPercent = savePercent(res.TotalSourceBytes, res.EstBytes)
@@ -487,18 +496,28 @@ func (h Hooks) progress(p ItemProgress) {
 
 // RunItem 是单个文件的执行结果（任务结果 JSON，前端据此汇总）。
 type RunItem struct {
-	Index      int    `json:"index"`
-	Name       string `json:"name"`
-	OutName    string `json:"out_name,omitempty"`
-	OutPath    string `json:"out_path,omitempty"`
-	Before     int64  `json:"before"`
-	After      int64  `json:"after,omitempty"`
-	Width      int    `json:"width,omitempty"`
-	Height     int    `json:"height,omitempty"`
-	VideoKbps  int    `json:"video_kbps,omitempty"`
-	Capped     bool   `json:"capped,omitempty"`
-	SkipReason string `json:"skip_reason,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Index     int    `json:"index"`
+	Name      string `json:"name"`
+	RelPath   string `json:"rel_path,omitempty"`
+	OutName   string `json:"out_name,omitempty"`
+	OutPath   string `json:"out_path,omitempty"`
+	Before    int64  `json:"before"`
+	After     int64  `json:"after,omitempty"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	VideoKbps int    `json:"video_kbps,omitempty"`
+	Capped    bool   `json:"capped,omitempty"`
+	// SourceKbps/SourceWidth/SourceHeight 是原片信息（《已跳过清单》要逐条写清楚）。
+	SourceKbps   int    `json:"source_kbps,omitempty"`
+	SourceWidth  int    `json:"source_width,omitempty"`
+	SourceHeight int    `json:"source_height,omitempty"`
+	SkipReason   string `json:"skip_reason,omitempty"`
+	Error        string `json:"error,omitempty"`
+	// Placement 是这个文件"原样放进 output/"的方式：link / copy / none；
+	// PlaceReason 是放法（或没放）的原因，PlaceName 是放进 output/ 的名字。
+	Placement   string `json:"placement,omitempty"`
+	PlaceReason string `json:"place_reason,omitempty"`
+	PlaceName   string `json:"place_name,omitempty"`
 	// SavedPercentText 是这个文件省下的百分比文本（如 "-44.6%"）；
 	// 源 0 字节/读不到大小时为空（面板只显示体积，绝不写 NaN%）。
 	SavedPercentText string `json:"saved_percent_text,omitempty"`
@@ -513,9 +532,14 @@ type RunResult struct {
 	BeforeBytes int64 `json:"before_bytes"`
 	AfterBytes  int64 `json:"after_bytes"`
 	SavedBytes  int64 `json:"saved_bytes"`
+	// Placed 是"原样放进 output/"（没转码）的个数；CappedSkipped 是其中因码率已到极限的。
+	Placed        int `json:"placed"`
+	CappedSkipped int `json:"capped_skipped"`
 	// SavedPercentText 是汇总百分比文本（如 "-44.6%"）；源 0 字节时为空。
-	SavedPercentText string    `json:"saved_percent_text,omitempty"`
-	Items            []RunItem `json:"items"`
+	SavedPercentText string `json:"saved_percent_text,omitempty"`
+	// SummaryText 是分开计数的汇总：压缩 N 个（省 X，-Y%）· 原样放入 output M 个 · 其它跳过 K 个。
+	SummaryText string    `json:"summary_text,omitempty"`
+	Items       []RunItem `json:"items"`
 }
 
 // RunPlan 顺序执行计划里的每个文件（一个任务压完整个目录）。
@@ -572,14 +596,38 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		}
 		if row.SkipReason != "" {
 			item.SkipReason = row.SkipReason
+			item.Capped = row.Capped
+			item.SourceKbps, item.SourceWidth, item.SourceHeight = row.SourceVideoKbps, row.SourceWidth, row.SourceHeight
+			item.RelPath = relName(row)
 			res.Skipped++
+			if row.Capped {
+				res.CappedSkipped++
+			}
+			// 跳过的文件也原样放进 output/（硬链接优先），保证 output/ 是完整一套。
+			if row.PlaceInOutput {
+				if placeInOutput(row, &item, hooks) {
+					res.Placed++
+				}
+			} else {
+				item.Placement = PlacementNone
+				// 产物已存在 vs 源已不存在：原因必须如实区分，不能都说成"已有产物"。
+				if _, err := os.Stat(row.OutPath); err == nil {
+					item.PlaceReason = "output 里已有产物，未重复放入"
+				} else {
+					item.PlaceReason = "没有可放入的源文件"
+				}
+			}
 			res.Items = append(res.Items, item)
 			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"："+row.SkipReason)
 			continue
 		}
 		// 幂等：产物已存在就不再压（计划里可能还是"可压"，执行时再确认一次）。
+		// 这种情况 output/ 里已经有东西，**不要再链接/复制**（用户点名区分）。
 		if _, err := os.Stat(row.OutPath); err == nil {
 			item.SkipReason = "产物已存在，跳过"
+			item.Placement = PlacementNone
+			item.PlaceReason = "output 里已有产物，未重复放入"
+			item.RelPath = relName(row)
 			res.Skipped++
 			res.Items = append(res.Items, item)
 			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：产物已存在，跳过")
@@ -650,12 +698,18 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		item.After = afterBytes
 		item.Width, item.Height, item.VideoKbps, item.Capped = row.TargetWidth, row.TargetHeight, row.VideoKbps, row.Capped
 
-		// 硬要求：产物绝不比原文件大。大了就删掉并如实跳过（绝不留下更大的文件）。
+		// 硬要求：产物绝不比原文件大。大了就删掉并如实跳过，然后把**源文件**原样
+		// 放进 output/（用户要的完整一套；放进去的是原片，不是那个更大的产物）。
 		if afterBytes <= 0 || afterBytes >= srcBytes {
 			_ = os.Remove(part)
 			item.After = 0
 			item.SkipReason = "压不小，已跳过（产物不小于原文件）"
+			item.SourceKbps, item.SourceWidth, item.SourceHeight = row.SourceVideoKbps, row.SourceWidth, row.SourceHeight
+			item.RelPath = relName(row)
 			res.Skipped++
+			if placeInOutput(row, &item, hooks) {
+				res.Placed++
+			}
 			res.Items = append(res.Items, item)
 			hooks.log(tasks.LevelWarn, fmt.Sprintf("↷ %s：压不小，已跳过（%s ≥ 原 %s）",
 				row.Name, humanBytes(afterBytes), humanBytes(srcBytes)))
@@ -695,12 +749,64 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		return res, cancelledErr(res)
 	}
 	res.SavedPercentText = FormatSavedPercent(res.BeforeBytes, res.AfterBytes)
-	hooks.log(tasks.LevelStep, fmt.Sprintf("完成：成功 %d，跳过 %d，失败 %d；%s",
-		res.Done, res.Skipped, res.Failed, SummarySavedText(res.BeforeBytes, res.AfterBytes)))
+	res.SummaryText = SummaryRunText(res)
+	hooks.log(tasks.LevelStep, "完成："+res.SummaryText)
+	// 跳过清单是**给人看的**（UTF-8 纯文本），只在真有跳过时写。
+	if res.Skipped > 0 {
+		listPath, lerr := writeSkippedList(outDir, res, res.Items)
+		if lerr != nil {
+			hooks.log(tasks.LevelWarn, "写《"+SkippedListName+"》失败："+oneLine(lerr.Error()))
+		} else {
+			if hooks.Chown != nil {
+				hooks.Chown(listPath)
+			}
+			hooks.log(tasks.LevelStep, "已跳过清单："+listPath)
+		}
+	}
 	if res.Failed == res.Total && res.Total > 0 {
 		return res, fmt.Errorf("全部 %d 个都失败了，第一个的原因见日志", res.Failed)
 	}
 	return res, nil
+}
+
+// relName 是文件在任务目录里的相对路径（清单里"原相对路径"那一行）。
+func relName(row Plan) string {
+	if rel, err := filepath.Rel(filepath.Dir(row.Path), row.Path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	return row.Name
+}
+
+// placeInOutput 把跳过的源文件原样放进 output/，并把放法与原因写进 item。
+//
+// 硬链接共享 inode ⇒ **绝不 chown**（那会改到源文件本身的属主）；只有复制才交还属主。
+func placeInOutput(row Plan, item *RunItem, hooks Hooks) bool {
+	dst := row.PlacePath
+	if strings.TrimSpace(dst) == "" {
+		if strings.TrimSpace(row.PlaceName) == "" {
+			item.Placement = PlacementNone
+			item.PlaceReason = "缺少源文件或目标路径"
+			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：未放入 output（"+item.PlaceReason+"）")
+			return false
+		}
+		dst = filepath.Join(filepath.Dir(row.OutPath), row.PlaceName)
+	}
+	pr := placeFile(row.Path, dst)
+	item.Placement, item.PlaceReason, item.PlaceName = pr.Placement, pr.Reason, filepath.Base(dst)
+	switch pr.Placement {
+	case PlacementLink:
+		hooks.log(tasks.LevelOK, "🔗 "+row.Name+"：原样放入 output（硬链接，不占额外空间）")
+		return true
+	case PlacementCopy:
+		if hooks.Chown != nil {
+			hooks.Chown(dst)
+		}
+		hooks.log(tasks.LevelOK, "📄 "+row.Name+"：原样放入 output（"+pr.Reason+"）")
+		return true
+	default:
+		hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：未放入 output（"+pr.Reason+"）")
+		return false
+	}
 }
 
 // cancelledErr 是中断时的错误：任务中心会据此如实标「已中断」。
@@ -726,6 +832,37 @@ func SummarySavedText(before, after int64) string {
 		txt += fmt.Sprintf(" · 源 %s → %s", humanBytes(before), humanBytes(after))
 	}
 	return txt
+}
+
+// SummaryRunText 是分开计数的任务汇总（用户点名）：
+// 压缩 N 个（省 X，-Y%）· 原样放入 output M 个（码率已到极限）· 其它跳过 K 个。
+//
+// "其它跳过" = 跳过里没能放进 output 的那部分（产物已存在 / 空间不足 / 源已不存在…）。
+func SummaryRunText(res *RunResult) string {
+	if res == nil {
+		return ""
+	}
+	saved := res.BeforeBytes - res.AfterBytes
+	if saved < 0 {
+		saved = 0
+	}
+	savedTxt := "省 " + humanBytes(saved)
+	if pct := FormatSavedPercent(res.BeforeBytes, res.AfterBytes); pct != "" {
+		savedTxt += "，" + pct
+	}
+	other := res.Skipped - res.Placed
+	if other < 0 {
+		other = 0
+	}
+	parts := []string{
+		fmt.Sprintf("压缩 %d 个（%s）", res.Done, savedTxt),
+		fmt.Sprintf("原样放入 output %d 个（码率已到极限）", res.Placed),
+		fmt.Sprintf("其它跳过 %d 个", other),
+	}
+	if res.Failed > 0 {
+		parts = append(parts, fmt.Sprintf("失败 %d 个", res.Failed))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // hasTwoPass 判断这批计划里有没有 2-pass（没有就不建临时目录）。

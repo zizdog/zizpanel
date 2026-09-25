@@ -319,9 +319,18 @@ type Plan struct {
 	AudioKbps     int   `json:"audio_kbps"`
 	AudioDisabled bool  `json:"audio_disabled"`
 	EstBytes      int64 `json:"est_bytes"`
-	// Capped 表示"因原视频码率低而封顶"（面板必须讲清楚，见 Note）。
+	// Capped 表示"因原视频码率低而封顶"，这类文件**封顶即跳过**（不再转码）。
 	Capped bool   `json:"capped"`
 	Note   string `json:"note,omitempty"`
+
+	// PlaceInOutput 表示这一行不转码，但要把源文件**原样放进 output/**：
+	// 硬链接优先（同卷、零额外空间），失败退复制。跳过的文件也保证 output/ 是完整一套。
+	// "产物已存在"与"文件已不存在"为 false（前者 output 里已经有东西，后者没源可放）。
+	PlaceInOutput bool `json:"place_in_output,omitempty"`
+	// PlaceName/PlacePath 是原样放入时的目标：**保留源扩展名/容器**
+	// （源 a.mkv ⇒ output/a.<档位>.mkv），绝不把 mkv 内容改名成 .mp4（那是谎报格式）。
+	PlaceName string `json:"place_name,omitempty"`
+	PlacePath string `json:"place_path,omitempty"`
 
 	// 下面这些是"面板选项 → 执行"的同一份记录（执行器不再重算一遍）。
 	Encoder string `json:"encoder"`
@@ -373,10 +382,11 @@ type PlanResult struct {
 	EstPercent    int   `json:"est_percent"`
 	// EstimateUnknown 表示"至少有一行是质量优先，体积不可预估"。
 	EstimateUnknown bool `json:"estimate_unknown"`
-	// CappedRunnable / AllCapped 是"用户选的码率 ≥ 原码率×0.95"的行数，
-	// 面板据此给醒目警告（判据只在 planBitrates 里，不在前端重复实现）。
-	CappedRunnable int  `json:"capped_runnable"`
-	AllCapped      bool `json:"all_capped"`
+	// CappedSkipped 是"因原视频码率已到极限而跳过"的行数，
+	// 面板据此提醒"不会转码，但会原样放进 output"（判据只在 planBitrates 里）。
+	CappedSkipped int `json:"capped_skipped"`
+	// PlaceCount 是"不转码但要原样放进 output/"的行数（含码率封顶与其它跳过原因）。
+	PlaceCount int `json:"place_count"`
 }
 
 // OutputDirName 是产物子目录名（写进 <当前目录>/output/）。
@@ -395,6 +405,21 @@ func OutputName(srcName, presetID string) string {
 		base = "video"
 	}
 	return base + "." + presetID + ".mp4"
+}
+
+// PlaceName 是"原样放进 output/"时的文件名：**保留源扩展名/容器**。
+//
+// 源 a.mkv ⇒ a.<档位>.mkv —— 绝不能把 mkv 内容改名成 .mp4（那是谎报格式）。
+func PlaceName(srcName, presetID string) string {
+	base := filepath.Base(srcName)
+	ext := filepath.Ext(base)
+	if ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	if strings.TrimSpace(base) == "" {
+		base = "video"
+	}
+	return base + "." + presetID + ext
 }
 
 // targetSize 按档位封顶算出目标宽高：绝不放大，宽高都是偶数且都 ≤ 原尺寸。
@@ -449,7 +474,8 @@ func evenDown(n int) int {
 //	质量优先模式：不设目标码率，只把 -maxrate 封在原码率×0.95 以内
 //	音频码率     = min(96k, 原音频码率)；无音轨则 -an
 //
-// capped 只表示"用户选的码率 ≥ 原码率×0.95"（面板据此警告"这样压基本不会变小"）。
+// capped 只表示"用户选的码率 ≥ 原码率×0.95"（这种文件**封顶即跳过**，
+// 不再转码，改为原样放进 output/；判据见 PlanOne）。
 func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate int, capped bool, note, skip string) {
 	if info.VideoKbps <= 0 {
 		return 0, 0, 0, false, "", "读不到原视频码率，无法保证压完更小"
@@ -494,6 +520,7 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		Name:             name,
 		Path:             srcPath,
 		OutName:          OutputName(name, preset.ID),
+		PlaceName:        PlaceName(name, preset.ID),
 		SourceWidth:      info.Width,
 		SourceHeight:     info.Height,
 		SourceVideoKbps:  info.VideoKbps,
@@ -509,22 +536,27 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	}
 	if outDir != "" {
 		p.OutPath = filepath.Join(outDir, p.OutName)
+		p.PlacePath = filepath.Join(outDir, p.PlaceName)
 	}
 
 	switch {
 	case !info.HasVideo || info.Width <= 0 || info.Height <= 0:
+		p.PlaceInOutput = true
 		p.SkipReason = "没有视频流（不是视频或文件损坏）"
 		return p
 	case info.Width < minSide || info.Height < minSide:
+		p.PlaceInOutput = true
 		p.SkipReason = fmt.Sprintf("分辨率太小（%dx%d）", info.Width, info.Height)
 		return p
 	case info.DurationSec <= 0:
+		p.PlaceInOutput = true
 		p.SkipReason = "读不到时长，无法保证压完更小"
 		return p
 	}
 
 	w, h := targetSize(info.Width, info.Height, preset.CapHeight)
 	if w == 0 || h == 0 {
+		p.PlaceInOutput = true
 		p.SkipReason = "分辨率不可用，无法转码"
 		return p
 	}
@@ -532,7 +564,19 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 
 	vKbps, aKbps, maxRate, capped, note, skip := planBitrates(info, opts)
 	if skip != "" {
+		p.PlaceInOutput = true
 		p.SkipReason = skip
+		return p
+	}
+	// 封顶即跳过（用户拍板）：请求码率 ≥ 原片×0.95 时实际码率被迫等于原片，
+	// 再压只会更糊、体积几乎不变 —— 不转码，改为原样放进 output/。
+	if capped {
+		p.Capped = true
+		p.VideoKbps, p.AudioKbps, p.MaxRateKbps = vKbps, aKbps, maxRate
+		p.AudioDisabled = !info.HasAudio
+		p.PlaceInOutput = true
+		p.SkipReason = fmt.Sprintf("原视频码率已经很低（%d kbps @ %dx%d），再压只会更糊、体积几乎不变",
+			info.VideoKbps, info.Width, info.Height)
 		return p
 	}
 	p.VideoKbps, p.AudioKbps, p.Capped, p.Note = vKbps, aKbps, capped, note

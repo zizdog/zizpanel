@@ -104,14 +104,16 @@ type videoPlanResponse struct {
 	Rows     []videoopt.Plan `json:"rows"`
 	Note     string          `json:"note"`
 
-	// 体积对比与"这样压不会变小"的警告（判据全部来自 planner）。
+	// 体积对比与"码率已到极限 ⇒ 不转码、原样放进 output"的提醒（判据全部来自 planner）。
 	TotalSourceBytes int64  `json:"total_source_bytes"`
 	EstSavedBytes    int64  `json:"est_saved_bytes"`
 	EstPercent       int    `json:"est_percent"`
 	EstimateUnknown  bool   `json:"estimate_unknown"`
-	CappedRunnable   int    `json:"capped_runnable"`
-	AllCapped        bool   `json:"all_capped"`
+	CappedSkipped    int    `json:"capped_skipped"`
+	PlaceCount       int    `json:"place_count"`
 	Warning          string `json:"warning,omitempty"`
+	// WarningDetail 是那句提醒的细节（硬链接 / 清单文件名），面板放进 title。
+	WarningDetail string `json:"warning_detail,omitempty"`
 }
 
 // parseVideoReq 校验共用的请求参数（档位 / 码率 / 编码器 / 模式 / 质量档 / 2-pass）。
@@ -160,19 +162,19 @@ func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
 	}
 }
 
-// videoCapWarning 是"用户选的码率 ≥ 原片码率"时那句必须醒目的话（判据来自 planner 的 capped）。
+// videoSkipNotice 是"码率已到极限 ⇒ 不转码、原样放进 output"的提醒（判据来自 planner 的 Capped）。
 //
-// 全部文件都这样时说得更直接；只有一部分时逐行标（行内 Note 已有）。
-func videoCapWarning(preset videoopt.Preset, capped, runnable int) string {
-	if capped == 0 || runnable == 0 {
+// 主句一句话 ≤40 字；细节（硬链接 / 清单文件名）走 WarningDetail，面板放进 title。
+func videoSkipNotice(capped int) string {
+	if capped <= 0 {
 		return ""
 	}
-	if capped >= runnable {
-		return fmt.Sprintf("原码率都不高：这样压基本不会变小。建议 ≤ %d kbps 或改用质量优先", preset.DefaultKbps)
-	}
-	return fmt.Sprintf("有 %d 个视频原码率不高，压完基本不变小（见下表）；建议 ≤ %d kbps",
-		capped, preset.DefaultKbps)
+	return fmt.Sprintf("有 %d 个视频码率已到极限：不会转码，但会原样放进 output，方便你整体处理", capped)
 }
+
+// videoSkipNoticeDetail 是那条提醒的细节（收进 title / 折叠，不占主句）。
+const videoSkipNoticeDetail = "跳过的文件仍会放进 output：同卷用硬链接、不占额外空间；并写了 " +
+	videoopt.SkippedListName
 
 // handleFileVideoPlan 只读规划：每个视频一行（原分辨率/原码率/目标/预计大小/跳过原因）。
 func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
@@ -215,8 +217,11 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	resp.Rows = res.Rows
 	resp.TotalSourceBytes, resp.EstSavedBytes = res.TotalSourceBytes, res.EstSavedBytes
 	resp.EstPercent, resp.EstimateUnknown = res.EstPercent, res.EstimateUnknown
-	resp.CappedRunnable, resp.AllCapped = res.CappedRunnable, res.AllCapped
-	resp.Warning = videoCapWarning(opts.Preset, res.CappedRunnable, res.Runnable)
+	resp.CappedSkipped, resp.PlaceCount = res.CappedSkipped, res.PlaceCount
+	resp.Warning = videoSkipNotice(res.CappedSkipped)
+	if resp.Warning != "" {
+		resp.WarningDetail = videoSkipNoticeDetail
+	}
 	ok(w, resp)
 }
 
@@ -287,13 +292,15 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 		Phase: "scan", FilesDone: len(plan.Rows), FilesTotal: len(plan.Rows),
 		Message: fmt.Sprintf("读取完成：%d 个可压，%d 个跳过", plan.Runnable, plan.Skipped),
 	})
-	if plan.Runnable == 0 {
-		// 一个都压不了：任务如实失败（接口已经回了 202，不能在这里假装成功）。
+	// 一个都压不了但**有跳过的文件要放进 output/** 时照跑：这一趟的产出就是"完整一套"
+	// （用户要的工作流）—— 绝不在这里提前退出，否则 output/ 会缺那些文件。
+	if plan.Runnable == 0 && plan.PlaceCount == 0 {
 		msg := fmt.Sprintf("没有可压缩的视频：%d 个都跳过了（原因见上方日志）", plan.Skipped)
 		tasks.ReportProgress(ctx, tasks.Progress{Phase: "done", Message: msg})
 		return nil, fmt.Errorf("%s", msg)
 	}
-	log(tasks.LevelStep, fmt.Sprintf("计划：%d 个可压、%d 个跳过", plan.Runnable, plan.Skipped))
+	log(tasks.LevelStep, fmt.Sprintf("计划：%d 个可压、%d 个跳过（其中 %d 个原样放进 output）",
+		plan.Runnable, plan.Skipped, plan.PlaceCount))
 
 	mgr := s.fileManager()
 	res, rerr := videoopt.RunPlan(ctx, plan.OutDir, plan.Rows, runner, videoopt.Hooks{
@@ -315,19 +322,21 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 			})
 		},
 	})
-	// 收尾：把汇总（含百分比）落进进度窗 —— 任务结束后进度不会再变，用户随时能回看。
+	// 收尾：把汇总（含百分比与原样放入 output 的个数）落进进度窗 —— 任务结束后进度
+	// 不会再变，用户随时能回看。
 	final := tasks.Progress{Phase: "done"}
 	if res != nil {
 		final.FilesDone, final.FilesTotal = res.Done, res.Total
+		final.Placed = res.Placed
 	}
 	switch {
 	case rerr != nil:
 		// 失败/中断：不确定走到哪了，进度条保持"不确定"，只如实写原因。
 		final.Message = "失败：" + rerr.Error()
 	case res != nil:
-		// 全部文件处理完：进度条拉满，文案给体积与百分比（源 0 字节时只有体积）。
+		// 全部文件处理完：进度条拉满，文案分开计数（压缩 / 原样放入 output / 其它跳过）。
 		final.Done, final.Total = res.BeforeBytes, res.BeforeBytes
-		final.Message = videoopt.SummarySavedText(res.BeforeBytes, res.AfterBytes)
+		final.Message = res.SummaryText
 	default:
 		final.Message = "未产生结果"
 	}

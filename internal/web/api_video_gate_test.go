@@ -54,6 +54,14 @@ func (f *fakeVideoRunner) Probe(_ context.Context, path string) (videoopt.MediaI
 	if info, ok := f.infos[path]; ok {
 		return info, nil
 	}
+	// 目录可能被解析过（/tmp → /private/tmp）：按文件名再找一次，
+	// 否则夹具会静默失效、退回下面的默认值（曾经因此误判"可压"）。
+	base := filepath.Base(path)
+	for p, info := range f.infos {
+		if filepath.Base(p) == base {
+			return info, nil
+		}
+	}
 	return videoopt.MediaInfo{
 		Width: 640, Height: 360, DurationSec: 2, FileBytes: 4000,
 		VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
@@ -102,24 +110,29 @@ func TestVideoCompressGate(t *testing.T) {
 	}
 	preset480, _ := videoopt.FindPreset("480p")
 
-	t.Run("① 选的码率高于原视频时必须被原码率封顶", func(t *testing.T) {
+	t.Run("① 选的码率高于原视频时封顶即跳过（不再照压）", func(t *testing.T) {
 		info := videoopt.MediaInfo{
 			Width: 1280, Height: 720, DurationSec: 10, FileBytes: 5 << 20,
 			VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
 		}
 		p := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 2000}, false)
-		if p.SkipReason != "" {
-			t.Fatalf("这个视频应该可压，却被跳过：%s", p.SkipReason)
+		// 负向对照：改前是"照压 + 警告"（SkipReason 为空）；现在封顶即跳过。
+		if p.SkipReason == "" || !strings.Contains(p.SkipReason, "码率") {
+			t.Fatalf("被原码率封顶的文件必须标跳过（原因含「码率」），实际 %q", p.SkipReason)
 		}
-		// 负向对照：改前（直接信用户选的 2000kbps）这里会是 2000 > 760。
-		if float64(p.VideoKbps) > float64(info.VideoKbps)*0.95+0.001 {
-			t.Errorf("实际码率 %d kbps 超过了原码率×0.95（%d kbps）", p.VideoKbps, int(float64(info.VideoKbps)*0.95))
+		if !p.Capped || !p.PlaceInOutput {
+			t.Errorf("必须标 Capped 且要原样放进 output：Capped=%v PlaceInOutput=%v", p.Capped, p.PlaceInOutput)
 		}
-		if !p.Capped || p.Note == "" {
-			t.Errorf("因原码率低而封顶时必须如实说明：Capped=%v Note=%q", p.Capped, p.Note)
+		// 负向对照的另一半：请求码率低于原片×0.95 时仍应可压，且绝不超原码率。
+		q := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 400}, false)
+		if q.SkipReason != "" {
+			t.Fatalf("请求码率 400 < 800×0.95 时不该跳过，实际 %q", q.SkipReason)
 		}
-		if p.AudioKbps != 96 {
-			t.Errorf("音频码率应封顶到 96 kbps（原 128），实际 %d", p.AudioKbps)
+		if float64(q.VideoKbps) > float64(info.VideoKbps)*0.95+0.001 {
+			t.Errorf("实际码率 %d kbps 超过了原码率×0.95", q.VideoKbps)
+		}
+		if q.AudioKbps != 96 {
+			t.Errorf("音频码率应封顶到 96 kbps（原 128），实际 %d", q.AudioKbps)
 		}
 	})
 
@@ -172,7 +185,7 @@ func TestVideoCompressGate(t *testing.T) {
 			outBytes: 5000, // 产物 5000 > 原 1000
 			infos: map[string]videoopt.MediaInfo{src: {
 				Width: 1280, Height: 720, DurationSec: 3, FileBytes: 1000,
-				VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
+				VideoKbps: 2000, AudioKbps: 128, HasVideo: true, HasAudio: true,
 			}},
 		}
 		row := videoopt.PlanOne("big.mp4", src, outDir, runner.infos[src], videoopt.Options{Preset: preset480, KBps: 800}, false)
@@ -190,8 +203,18 @@ func TestVideoCompressGate(t *testing.T) {
 		if res.Items[0].SkipReason == "" {
 			t.Error("跳过必须带原因（面板要如实显示）")
 		}
-		if _, err := os.Stat(row.OutPath); !os.IsNotExist(err) {
-			t.Errorf("产物必须被删掉，实际还在：%s", row.OutPath)
+		// 那个 5000 字节的产物必须被删掉；output 里那份是**源文件本身**
+		// （原样放进来的硬链接，1000 字节），不是更大的转码产物。
+		st, serr := os.Stat(row.OutPath)
+		if serr != nil {
+			t.Fatalf("跳过的源文件应被原样放进 output：%v", serr)
+		}
+		if st.Size() != 1000 {
+			t.Errorf("output 里必须是原文件（1000 字节），实际 %d", st.Size())
+		}
+		srcSt, _ := os.Stat(src)
+		if !os.SameFile(srcSt, st) {
+			t.Error("output 里那份应该是源文件的硬链接")
 		}
 		if _, err := os.Stat(row.OutPath + ".part.mp4"); !os.IsNotExist(err) {
 			t.Errorf("半成品也必须清掉：%s.part.mp4", row.OutPath)
@@ -229,7 +252,7 @@ func TestVideoCompressGate(t *testing.T) {
 		}
 		fake.infos = map[string]videoopt.MediaInfo{src: {
 			Width: 640, Height: 360, DurationSec: 2, FileBytes: 4000,
-			VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
+			VideoKbps: 2000, AudioKbps: 128, HasVideo: true, HasAudio: true,
 		}}
 
 		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "1080p"})
@@ -325,13 +348,13 @@ func TestVideoCompressGate(t *testing.T) {
 			}
 			fake.infos[p] = videoopt.MediaInfo{
 				Width: 1280, Height: 720, DurationSec: 3, FileBytes: 4000,
-				VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
+				VideoKbps: 4000, AudioKbps: 128, HasVideo: true, HasAudio: true,
 			}
 		}
 		withFakeVideoRunner(t, fake)
 
 		started := time.Now()
-		// kbps=2000：执行期必须仍被 planner 封顶到 800×0.95=760（证明用的是同一份 planner）。
+		// kbps=2000：执行期必须走同一份 planner（源 4000 kbps，选 2000 不封顶）。
 		rec := postVideoJSON(t, srv.handleFileVideoCompress,
 			map[string]any{"dir": dir, "preset": "480p", "kbps": 2000})
 		elapsed := time.Since(started)
@@ -365,10 +388,10 @@ func TestVideoCompressGate(t *testing.T) {
 		if len(fake.reqs) != 2 {
 			t.Fatalf("应该有 2 次转码，实际 %d", len(fake.reqs))
 		}
-		want := int(float64(800) * 0.95)
+		want := 2000
 		for _, r := range fake.reqs {
 			if r.VideoKbps != want {
-				t.Errorf("执行期码率 %d，期望被 planner 封顶到 %d", r.VideoKbps, want)
+				t.Errorf("执行期码率 %d，期望 planner 定的 %d", r.VideoKbps, want)
 			}
 		}
 		if _, err := os.Stat(filepath.Join(dir, videoopt.OutputDirName, "a.480p.mp4")); err != nil {
@@ -456,7 +479,7 @@ func TestVideoCompressGate(t *testing.T) {
 		a, b := mk("a.mp4", 4000), mk("b.mp4", 4000)
 		info := videoopt.MediaInfo{
 			Width: 1280, Height: 720, DurationSec: 3, FileBytes: 4000,
-			VideoKbps: 800, AudioKbps: 0, HasVideo: true,
+			VideoKbps: 4000, AudioKbps: 0, HasVideo: true,
 		}
 		fake := &fakeVideoRunner{outBytes: 100, infos: map[string]videoopt.MediaInfo{a: info, b: info}}
 		withFakeVideoRunner(t, fake)
