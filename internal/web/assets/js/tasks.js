@@ -1206,18 +1206,31 @@ function adopt(id, res, { kind, target, title, onDone, openWindow = true } = {})
 }
 
 /**
- * start({kind, target, title, start, onDone, timeoutMs, openWindow}) 提交一个任务。
+ * start({kind, target, title, start, onDone, onError, timeoutMs, openWindow}) 提交一个任务。
  *
  * start 是调用方给的 Promise（`() => api.installXxx()`）：后端立刻返回
  * `{ok:true, data:{task_id, title}}`，进度靠任务中心看。返回任务编号；
  * **提交失败一律不在界面上沉默**：给出带原因的 toast 并返回 null。不抛异常
  * （调用方不需要写 try/catch），但应当检查返回值再决定要不要刷新界面。
  *
+ * onError 可选：提交失败时**额外**把同一句原因交给调用方（弹窗要留在原地显示错误，
+ * 不能只靠会消失的 toast）。
+ *
  * timeoutMs 只给测试用（默认 SUBMIT_TIMEOUT_MS）：提交超过这个时间还没落定，
  * 就如实说"没收到确认"，绝不假装成功。
  */
-async function start({ kind, target, title, start: run, onDone, timeoutMs, openWindow = true } = {}) {
-  if (typeof run !== 'function') { toast('内部错误：缺少任务执行函数', 'err'); return null; }
+async function start({ kind, target, title, start: run, onDone, onError, timeoutMs, openWindow = true } = {}) {
+  // 提交失败的两条可见通道：toast（全局）+ onError（调用方的原地提示）。
+  const notifyFail = (msg, level, ms) => {
+    toast(msg, level, ms);
+    if (typeof onError === 'function') {
+      try { onError(msg); } catch (e) { console.warn('task onError failed', e); }
+    }
+  };
+  if (typeof run !== 'function') {
+    notifyFail('内部错误：缺少任务执行函数', 'err');
+    return null;
+  }
 
   // 同一个 target 已经在跑：后端也会拒绝（并发安装各自独立，仅禁止重复启动同一个），
   // 这里直接把用户带到那个任务的进度窗，而不是让他看到一个 409 错误。
@@ -1233,7 +1246,7 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs, openW
   try {
     submit = Promise.resolve(run());
   } catch (e) {
-    toast((title ? title + '：' : '') + ((e && e.message) || String(e)), 'err', 9000);
+    notifyFail((title ? title + '：' : '') + ((e && e.message) || String(e)), 'err', 9000);
     return null;
   }
 
@@ -1254,13 +1267,13 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs, openW
   }
 
   if (fail) {
-    toast((title ? title + '：' : '') + ((fail && fail.message) || String(fail)), 'err', 9000);
+    notifyFail((title ? title + '：' : '') + ((fail && fail.message) || String(fail)), 'err', 9000);
     return null;
   }
 
   if (res === TIMEOUT) {
     // 请求没落定：**绝不能**当成成功（那是谎报），也绝不能沉默（那正是本 bug）。
-    toast((title || '任务') +
+    notifyFail((title || '任务') +
       `：提交后 ${Math.max(1, Math.round(budget / 1000))} 秒内没有收到面板确认（请求被挂住了）。` +
       '请点顶栏「任务中心」确认它有没有真的开始；没有就再试一次。', 'err', 15000);
     refresh(); // 后端可能其实已经建好了任务：列表是权威的，让它有机会显示出来
@@ -1272,7 +1285,7 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs, openW
       toast((title || '任务') + '：它其实已经创建（提交只是回得慢），正在打开进度窗', 'warn', 9000);
       adopt(lateId, late, { kind, target, title, onDone, openWindow });
     }).catch((e) => {
-      toast((title ? title + '：' : '') + '提交最终失败：' + ((e && e.message) || String(e)), 'err', 12000);
+      notifyFail((title ? title + '：' : '') + '提交最终失败：' + ((e && e.message) || String(e)), 'err', 12000);
     });
     return null;
   }
@@ -1281,7 +1294,7 @@ async function start({ kind, target, title, start: run, onDone, timeoutMs, openW
   if (!id) {
     // 后端还没切到异步版本：如实说，绝不假装任务已经启动（那会让用户以为在装，
     // 实际什么都没发生）。
-    toast((title || '任务') + '：服务端没有返回任务编号（后端可能尚未启用任务中心）', 'warn', 10000);
+    notifyFail((title || '任务') + '：服务端没有返回任务编号（后端可能尚未启用任务中心）', 'warn', 10000);
     return null;
   }
 

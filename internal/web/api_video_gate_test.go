@@ -9,8 +9,9 @@ package web
 // 没有这条门禁，"请求 2000kbps、原视频只有 800kbps"就会真的产出比原片更大的文件。
 //
 // 一条门禁覆盖整类问题：纯 planner 的三条负向对照（码率封顶 / 不放大 /
-// 产物更大就删掉）+ 两个 HTTP 接口的根白名单校验。
-// 全用 t.TempDir() 与假 Runner，不跑真 ffmpeg、不碰真实目录。
+// 产物更大就删掉）+ 两个 HTTP 接口的根白名单校验 + 接口时序（探测在任务里，
+// 202 不许等探测，且两次探测之间文件变了就如实跳过）+ 百分比边界
+// （0 字节源不出现 NaN/Infinity）。全用 t.TempDir() 与假 Runner，不跑真 ffmpeg、不碰真实目录。
 
 import (
 	"bytes"
@@ -33,6 +34,10 @@ type fakeVideoRunner struct {
 	// outBytes 是"转码"产物的大小（用来构造"产物比原文件大"的场景）。
 	outBytes int64
 	probeErr error
+	// probeDelay 让探测变慢：门禁用它证明"接口没有在返回前做耗时探测"。
+	probeDelay time.Duration
+	// reqs 记录每次转码的请求（证明执行期仍走同一份 planner）。
+	reqs []videoopt.TranscodeRequest
 }
 
 func (f *fakeVideoRunner) Available() error { return nil }
@@ -40,6 +45,9 @@ func (f *fakeVideoRunner) Available() error { return nil }
 func (f *fakeVideoRunner) Version(context.Context) string { return "fake-1.0" }
 
 func (f *fakeVideoRunner) Probe(_ context.Context, path string) (videoopt.MediaInfo, error) {
+	if f.probeDelay > 0 {
+		time.Sleep(f.probeDelay)
+	}
 	if f.probeErr != nil {
 		return videoopt.MediaInfo{}, f.probeErr
 	}
@@ -53,6 +61,7 @@ func (f *fakeVideoRunner) Probe(_ context.Context, path string) (videoopt.MediaI
 }
 
 func (f *fakeVideoRunner) Transcode(_ context.Context, req videoopt.TranscodeRequest, onProgress func(videoopt.Progress)) error {
+	f.reqs = append(f.reqs, req)
 	if onProgress != nil {
 		onProgress(videoopt.Progress{Percent: 50, Speed: "2x"})
 		onProgress(videoopt.Progress{Percent: 100, Speed: "2x"})
@@ -288,6 +297,217 @@ func TestVideoCompressGate(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dir, videoopt.OutputDirName, "a.480p.mp4")); err != nil {
 			t.Errorf("产物没落在 output/ 里：%v", err)
+		}
+	})
+
+	// ⑥ 是本次新增的那一类（用户实测的空档）：**接口不许在返回前做耗时探测**。
+	//
+	// 为什么此前两条视频门禁都抓不到：TestVideoCompressGate 只断言 planner 判据
+	// （码率封顶/不放大/产物更大就删）与白名单校验，TestVideoOptionsGate 只断言
+	// "选项 → ffmpeg 命令行"；两者注入的假 Runner 的 Probe 都是**瞬时返回**的，
+	// 于是"请求里同步跑 N 次 ffprobe 才回 202"这个时序缺陷完全没有判据 ——
+	// 它只在真机上以"面板消失后干等"的体验暴露。
+	t.Run("⑥ 接口必须在探测之前返回 202（探测在任务里）", func(t *testing.T) {
+		srv, _ := newTestServer(t)
+		dir := filepath.Join(srv.Cfg.WWWRoot, "slowvideos")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fake := &fakeVideoRunner{
+			outBytes:   1000,
+			probeDelay: 800 * time.Millisecond, // 故意慢：同步探测会 ≥1.6s
+			infos:      map[string]videoopt.MediaInfo{},
+		}
+		for _, name := range []string{"a.mp4", "b.mp4"} {
+			p := filepath.Join(dir, name)
+			if err := os.WriteFile(p, bytes.Repeat([]byte{2}, 4000), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fake.infos[p] = videoopt.MediaInfo{
+				Width: 1280, Height: 720, DurationSec: 3, FileBytes: 4000,
+				VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
+			}
+		}
+		withFakeVideoRunner(t, fake)
+
+		started := time.Now()
+		// kbps=2000：执行期必须仍被 planner 封顶到 800×0.95=760（证明用的是同一份 planner）。
+		rec := postVideoJSON(t, srv.handleFileVideoCompress,
+			map[string]any{"dir": dir, "preset": "480p", "kbps": 2000})
+		elapsed := time.Since(started)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("video-compress 必须 202，实际 %d：%s", rec.Code, rec.Body.String())
+		}
+		// 负向对照：把 BuildPlan 挪回请求里（改回同步探测）这里会 ≥1.6s ⇒ 变红。
+		if elapsed > 500*time.Millisecond {
+			t.Errorf("POST 花了 %v 才返回 202（>500ms）：探测又跑回请求里了", elapsed)
+		}
+		var accepted struct {
+			Data struct {
+				TaskID string `json:"task_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil || accepted.Data.TaskID == "" {
+			t.Fatalf("没有拿到 task_id：%s", rec.Body.String())
+		}
+		task := srv.Tasks.Get(accepted.Data.TaskID)
+		if task == nil {
+			t.Fatal("任务不存在（202 之后必须能查到）")
+		}
+		select {
+		case <-task.Done():
+		case <-time.After(20 * time.Second):
+			t.Fatal("任务没结束")
+		}
+		if got := task.Status(); got != "succeeded" {
+			t.Fatalf("任务状态 %s，错误=%v", got, task.Meta().Error)
+		}
+		if len(fake.reqs) != 2 {
+			t.Fatalf("应该有 2 次转码，实际 %d", len(fake.reqs))
+		}
+		want := int(float64(800) * 0.95)
+		for _, r := range fake.reqs {
+			if r.VideoKbps != want {
+				t.Errorf("执行期码率 %d，期望被 planner 封顶到 %d", r.VideoKbps, want)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(dir, videoopt.OutputDirName, "a.480p.mp4")); err != nil {
+			t.Errorf("按计划执行后应有产物：%v", err)
+		}
+	})
+
+	// ⑦ 百分比边界：源 0 字节 / 读不到大小时不许出现 NaN% 或 -Infinity%。
+	t.Run("⑦ 百分比：0 字节源不出现 NaN/Infinity", func(t *testing.T) {
+		cases := []struct {
+			before, after int64
+			want          string
+		}{
+			{0, 0, ""},   // 源 0 字节：只说体积，不算百分比
+			{0, 100, ""}, // 源读不到
+			{100, 0, ""}, // 产物读不到
+			{1000, 500, "-50.0%"},
+			{1000, 990, "-1.0%"},
+			{1000, 1000, ""}, // 没变小：不写 -0.0%
+		}
+		for _, c := range cases {
+			if got := videoopt.FormatSavedPercent(c.before, c.after); got != c.want {
+				t.Errorf("FormatSavedPercent(%d, %d) = %q，期望 %q", c.before, c.after, got, c.want)
+			}
+			if txt := videoopt.SummarySavedText(c.before, c.after); strings.Contains(txt, "NaN") || strings.Contains(txt, "Inf") {
+				t.Errorf("汇总文本出现了 NaN/Inf：%q", txt)
+			}
+		}
+
+		// 端到端：0 字节源跑完任务，进度窗的汇总文本里也不许有 NaN/Inf。
+		srv, _ := newTestServer(t)
+		dir := filepath.Join(srv.Cfg.WWWRoot, "zerovideos")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		zero := filepath.Join(dir, "zero.mp4")
+		if err := os.WriteFile(zero, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		fake := &fakeVideoRunner{outBytes: 0, infos: map[string]videoopt.MediaInfo{zero: {
+			Width: 640, Height: 360, DurationSec: 2, FileBytes: 0,
+			VideoKbps: 800, AudioKbps: 0, HasVideo: true,
+		}}}
+		withFakeVideoRunner(t, fake)
+		rec := postVideoJSON(t, srv.handleFileVideoCompress, map[string]any{"dir": dir, "preset": "480p"})
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("必须 202（0 字节源也要开任务如实说）：%d %s", rec.Code, rec.Body.String())
+		}
+		var accepted struct {
+			Data struct {
+				TaskID string `json:"task_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil || accepted.Data.TaskID == "" {
+			t.Fatalf("没有拿到 task_id：%s", rec.Body.String())
+		}
+		task := srv.Tasks.Get(accepted.Data.TaskID)
+		select {
+		case <-task.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("任务没结束")
+		}
+		if p := task.Progress(); p != nil {
+			if strings.Contains(p.Message, "NaN") || strings.Contains(p.Message, "Inf") {
+				t.Errorf("进度窗文本出现了 NaN/Inf：%q", p.Message)
+			}
+		}
+	})
+
+	// ⑧ 规划搬进任务后必须核对"两次探测之间文件变了吗"：变了/不见了如实跳过，
+	//    绝不静默按旧计划压（用户点名）。
+	t.Run("⑧ 两次探测之间文件变了/不见了就如实跳过", func(t *testing.T) {
+		srv, _ := newTestServer(t)
+		dir := filepath.Join(srv.Cfg.WWWRoot, "changed")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mk := func(name string, n int) string {
+			p := filepath.Join(dir, name)
+			if err := os.WriteFile(p, bytes.Repeat([]byte{3}, n), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}
+		a, b := mk("a.mp4", 4000), mk("b.mp4", 4000)
+		info := videoopt.MediaInfo{
+			Width: 1280, Height: 720, DurationSec: 3, FileBytes: 4000,
+			VideoKbps: 800, AudioKbps: 0, HasVideo: true,
+		}
+		fake := &fakeVideoRunner{outBytes: 100, infos: map[string]videoopt.MediaInfo{a: info, b: info}}
+		withFakeVideoRunner(t, fake)
+
+		rec := postVideoJSON(t, srv.handleFileVideoCompress, map[string]any{
+			"dir": dir, "preset": "480p",
+			"sources": []map[string]any{
+				{"name": "a.mp4", "bytes": 9999}, // 计划表说 9999，实际 4000 ⇒ 变了
+				{"name": "b.mp4", "bytes": 4000}, // 一致 ⇒ 照压
+				{"name": "gone.mp4", "bytes": 5000},
+			},
+		})
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("必须 202：%d %s", rec.Code, rec.Body.String())
+		}
+		var accepted struct {
+			Data struct {
+				TaskID string `json:"task_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil || accepted.Data.TaskID == "" {
+			t.Fatalf("没有拿到 task_id：%s", rec.Body.String())
+		}
+		task := srv.Tasks.Get(accepted.Data.TaskID)
+		select {
+		case <-task.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("任务没结束")
+		}
+		if len(fake.reqs) != 1 {
+			t.Fatalf("只该压没变过的 b.mp4，实际转码 %d 次", len(fake.reqs))
+		}
+		if filepath.Base(fake.reqs[0].Src) != "b.mp4" {
+			t.Errorf("压错了文件：%s", fake.reqs[0].Src)
+		}
+		res, ok := task.Meta().Result.(*videoopt.RunResult)
+		if !ok || res == nil {
+			t.Fatalf("任务结果类型不对：%#v", task.Meta().Result)
+		}
+		reasons := map[string]string{}
+		for _, it := range res.Items {
+			reasons[it.Name] = it.SkipReason
+		}
+		if !strings.Contains(reasons["a.mp4"], "已变化") {
+			t.Errorf("变过的文件必须如实说明跳过原因，实际 %q", reasons["a.mp4"])
+		}
+		if !strings.Contains(reasons["gone.mp4"], "已不存在") {
+			t.Errorf("不见了的文件必须如实说明跳过原因，实际 %q", reasons["gone.mp4"])
+		}
+		if res.Done != 1 || res.Skipped != 2 {
+			t.Errorf("应 1 完成 2 跳过，实际 done=%d skipped=%d", res.Done, res.Skipped)
 		}
 	})
 }

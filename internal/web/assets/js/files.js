@@ -742,7 +742,7 @@ export function FilesView(content, ctx = {}) {
     appendAll(toolbar, 
       h('button.btn.btn-sm', { text: '⟳ 刷新', onclick: () => load(cwd) }),
       h('button.btn.btn-sm', {
-        text: '🌐 www 目录',
+        text: '🌐 www',
         title: '一键回到网站根目录',
         onclick: () => { const w = wwwRoot(); if (w) load(w); },
       }),
@@ -1728,6 +1728,9 @@ export function FilesView(content, ctx = {}) {
     let quality = 0; // 0 = 用该编码器的默认质量档
     let twoPass = false;
     let plan = null;
+    // 提交期的原地反馈：用户实测的空档是"弹窗先消失、进度窗还没来"。
+    // 拿到 202 之前不关弹窗，一直显示"正在提交压缩任务…"。
+    const submitHint = h('div.hint', { style: { display: 'none' } });
 
     async function reload() {
       clear(body); clear(foot);
@@ -1915,6 +1918,7 @@ export function FilesView(content, ctx = {}) {
           ]),
         ]),
         h('div.hint', { style: { marginTop: '8px' }, text: '产物写进 output/；关掉窗口也在后台跑' }),
+        submitHint,
       ]));
 
       const start = h('button.btn.btn-primary', {
@@ -1922,16 +1926,33 @@ export function FilesView(content, ctx = {}) {
         disabled: !plan.runnable,
         title: plan.runnable ? '在任务中心后台执行；关掉页面不受影响' : '没有可压缩的视频',
       });
+      // 提交提示每次重画都归零（上一次的"提交失败"不该留在新计划上）。
+      submitHint.style.display = 'none';
+      submitHint.style.color = '';
+      submitHint.textContent = '';
       start.addEventListener('click', async () => {
         const opts = {
           dir: cwd, preset: plan.preset, kbps: plan.kbps,
           encoder: plan.encoder, mode: plan.mode, quality: plan.quality, two_pass: plan.two_pass,
+          // 计划表指纹（可压行的名字+字节数）：任务重新探测后逐条核对，
+          // 文件变了/不见了就如实跳过 —— 绝不静默按旧计划压。
+          sources: (plan.rows || []).filter((r) => !r.skip_reason)
+            .map((r) => ({ name: r.name, bytes: r.source_bytes || 0 })),
         };
-        m.close();
-        await taskCenter.start({
+        start.disabled = true;
+        submitHint.style.color = '';
+        submitHint.style.display = '';
+        submitHint.textContent = '正在提交压缩任务…';
+        const id = await taskCenter.start({
           kind: 'video_compress', target: opts.dir,
           title: '压缩视频（' + plan.runnable + ' 个 · ' + plan.preset + '）',
           start: () => api.fileVideoCompress(opts),
+          onError: (msg) => {
+            // 提交失败：弹窗留在原地显示错误（toast 会消失，不足以让用户看清原因）。
+            submitHint.style.color = 'var(--danger)';
+            submitHint.textContent = '提交失败：' + msg;
+            start.disabled = false;
+          },
           onDone: (task) => {
             if (task && task.status && task.status !== 'succeeded') {
               toast('视频压缩失败：' + (task.error || task.status), 'err', 14000);
@@ -1939,12 +1960,15 @@ export function FilesView(content, ctx = {}) {
               return;
             }
             const r = (task && task.result) || {};
-            // 如实汇总"N 个完成 / M 个跳过"，并刷新列表（能看到 output/）。
+            // 如实汇总"N 个完成 / M 个跳过"，体积与百分比都显示（百分比判据在后端）。
+            const pct = r.saved_percent_text ? '（' + r.saved_percent_text + '）' : '';
             toast('视频压缩完成：' + (r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过（共省 '
-              + humanSize(r.saved_bytes || 0) + '）', r.failed ? 'warn' : 'ok', 14000);
+              + humanSize(r.saved_bytes || 0) + pct + '）', r.failed ? 'warn' : 'ok', 14000);
             load(cwd);
           },
         });
+        // 拿到 202（有任务编号）才关弹窗、开进度窗；失败留在弹窗里显示原因。
+        if (id) m.close();
       });
       foot.append(start);
       foot.append(h('button.btn', { text: '重新规划', onclick: reload }));

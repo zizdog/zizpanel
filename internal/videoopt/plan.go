@@ -344,6 +344,11 @@ type PlanRequest struct {
 	Dir    string
 	OutDir string
 	Options
+	// Expect 是面板计划表的指纹（文件名 → 源字节数），可空。
+	//
+	// 非空时规划会**核对两次探测之间文件有没有变**：大小不一致、或计划表里
+	// 有而这次扫不到，都如实跳过并说明 —— 绝不静默按旧计划压（见 BuildPlanProgress）。
+	Expect map[string]int64
 }
 
 // PlanResult 是一次规划的结果。
@@ -561,4 +566,25 @@ func savePercent(before, after int64) int {
 		return 0
 	}
 	return int(math.Round(float64(before-after) / float64(before) * 100))
+}
+
+// SavedPercent 返回实际省下的百分比（before 是分母）。
+//
+// before/after 任一 <=0（源 0 字节 / 读不到大小）时 ok=false：调用方据此
+// **只写体积、不写百分比**，绝不出现 -Infinity% / NaN%（用户点名的边界）。
+func SavedPercent(before, after int64) (float64, bool) {
+	if before <= 0 || after <= 0 {
+		return 0, false
+	}
+	return float64(before-after) / float64(before) * 100, true
+}
+
+// FormatSavedPercent 是日志与汇总用的百分比文本（如 "-44.6%"）；
+// 算不出（源 0 字节 / 读不到大小 / 没变小）时返回空串。
+func FormatSavedPercent(before, after int64) string {
+	pct, ok := SavedPercent(before, after)
+	if !ok || pct <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("-%.1f%%", pct)
 }

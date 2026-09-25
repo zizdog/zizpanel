@@ -330,10 +330,22 @@ func Scan(dir string) ([]Source, error) {
 	return out, nil
 }
 
+// PlanProgressFunc 是规划期的探测进度回调（done 是已探测个数，total 是本目录候选数）。
+type PlanProgressFunc func(done, total int, name string)
+
 // BuildPlan 扫目录并逐条规划 —— **/video-plan 与 /video-compress 共用这一份**。
 //
 // runner.Probe 会碰真实文件（ffprobe），但所有决策都在纯函数里（PlanOne）。
 func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult, error) {
+	return BuildPlanProgress(ctx, req, runner, nil)
+}
+
+// BuildPlanProgress 与 BuildPlan 是同一份实现，只是多了"探测进度"回调。
+//
+// 为什么需要它（用户实测的空档）：视频压缩接口以前在**请求里**同步跑完这个函数
+// 才回 202，前端此时已经把弹窗关掉 ⇒ "面板消失 → 干等 → 进度窗才出现"。
+// 现在探测挪进任务，任务靠这个回调如实上报 `phase=scan`（第几个/共几个）。
+func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onProgress PlanProgressFunc) (PlanResult, error) {
 	if strings.TrimSpace(req.Dir) == "" {
 		return PlanResult{}, fmt.Errorf("缺少目录")
 	}
@@ -350,10 +362,16 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 	if err != nil {
 		return res, fmt.Errorf("读取目录失败: %w", err)
 	}
-	for _, src := range sources {
+	// seen 记录计划表指纹里"这次真的扫到"的文件（用于收尾补"已不存在"的行）。
+	seen := make(map[string]bool, len(sources))
+	for i, src := range sources {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if onProgress != nil {
+			onProgress(i, len(sources), src.Name)
+		}
+		seen[src.Name] = true
 		outPath := filepath.Join(req.OutDir, OutputName(src.Name, opts.Preset.ID))
 		_, statErr := os.Stat(outPath)
 		outExists := statErr == nil
@@ -369,6 +387,12 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 			continue
 		}
 		row := PlanOne(src.Name, src.Path, req.OutDir, info, opts, outExists)
+		// 与面板计划表核对：文件变了/不在表里就如实跳过，绝不按旧计划压。
+		if row.Runnable() {
+			if skip := expectSkip(req.Expect, row); skip != "" {
+				row.SkipReason = skip
+			}
+		}
 		if row.Runnable() {
 			res.Runnable++
 			res.EstBytes += row.EstBytes
@@ -384,12 +408,44 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 		}
 		res.Rows = append(res.Rows, row)
 	}
+	// 计划表里有、这次扫不到的（文件被删/移走）：补一行并如实说明。
+	for name, bytes := range req.Expect {
+		if seen[name] {
+			continue
+		}
+		res.Rows = append(res.Rows, Plan{
+			Name: name, Path: filepath.Join(req.Dir, name),
+			OutName:     OutputName(name, opts.Preset.ID),
+			OutPath:     filepath.Join(req.OutDir, OutputName(name, opts.Preset.ID)),
+			SourceBytes: bytes,
+			SkipReason:  "文件已不存在，已跳过",
+		})
+		res.Skipped++
+	}
 	res.AllCapped = res.Runnable > 0 && res.CappedRunnable == res.Runnable
 	if !res.EstimateUnknown {
 		res.EstSavedBytes = res.TotalSourceBytes - res.EstBytes
 		res.EstPercent = savePercent(res.TotalSourceBytes, res.EstBytes)
 	}
 	return res, nil
+}
+
+// expectSkip 用面板计划表的指纹核对这一次探测结果；空串 = 一致（照压）。
+//
+// 用户点名：两次探测之间变了/读不到了要**如实跳过并说明**，不许静默按旧计划压。
+func expectSkip(expect map[string]int64, row Plan) string {
+	if len(expect) == 0 {
+		return ""
+	}
+	want, ok := expect[row.Name]
+	if !ok {
+		return "不在计划表里（目录有变化），已跳过"
+	}
+	if want != row.SourceBytes {
+		return fmt.Sprintf("文件已变化（计划 %s → 实际 %s），已跳过",
+			humanBytes(want), humanBytes(row.SourceBytes))
+	}
+	return ""
 }
 
 // ----------------------------------------------------------------------------
@@ -400,11 +456,32 @@ func BuildPlan(ctx context.Context, req PlanRequest, runner Runner) (PlanResult,
 type Hooks struct {
 	Log   tasks.LogFunc
 	Chown func(path string)
+	// OnProgress 回报执行期的结构化进度（nil = 不上报）。
+	OnProgress func(ItemProgress)
+}
+
+// ItemProgress 是执行期"开始处理第 N 个文件"时的一次进度快照。
+type ItemProgress struct {
+	// Done 是**已完成**的个数（处理 Row 之前的值）；Total 是本批总数。
+	Done  int
+	Total int
+	Row   Plan
+	// SavedBytes 是到此刻已经省下的字节（只算已成功写出的文件）。
+	SavedBytes int64
+	// BytesDone/BytesTotal 是源字节进度（Total = 可压行的源大小合计）。
+	BytesDone  int64
+	BytesTotal int64
 }
 
 func (h Hooks) log(level, msg string) {
 	if h.Log != nil {
 		h.Log(level, msg)
+	}
+}
+
+func (h Hooks) progress(p ItemProgress) {
+	if h.OnProgress != nil {
+		h.OnProgress(p)
 	}
 }
 
@@ -422,18 +499,23 @@ type RunItem struct {
 	Capped     bool   `json:"capped,omitempty"`
 	SkipReason string `json:"skip_reason,omitempty"`
 	Error      string `json:"error,omitempty"`
+	// SavedPercentText 是这个文件省下的百分比文本（如 "-44.6%"）；
+	// 源 0 字节/读不到大小时为空（面板只显示体积，绝不写 NaN%）。
+	SavedPercentText string `json:"saved_percent_text,omitempty"`
 }
 
 // RunResult 是一次批量压缩的汇总。
 type RunResult struct {
-	Total       int       `json:"total"`
-	Done        int       `json:"done"`
-	Skipped     int       `json:"skipped"`
-	Failed      int       `json:"failed"`
-	BeforeBytes int64     `json:"before_bytes"`
-	AfterBytes  int64     `json:"after_bytes"`
-	SavedBytes  int64     `json:"saved_bytes"`
-	Items       []RunItem `json:"items"`
+	Total       int   `json:"total"`
+	Done        int   `json:"done"`
+	Skipped     int   `json:"skipped"`
+	Failed      int   `json:"failed"`
+	BeforeBytes int64 `json:"before_bytes"`
+	AfterBytes  int64 `json:"after_bytes"`
+	SavedBytes  int64 `json:"saved_bytes"`
+	// SavedPercentText 是汇总百分比文本（如 "-44.6%"）；源 0 字节时为空。
+	SavedPercentText string    `json:"saved_percent_text,omitempty"`
+	Items            []RunItem `json:"items"`
 }
 
 // RunPlan 顺序执行计划里的每个文件（一个任务压完整个目录）。
@@ -467,10 +549,26 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 	}
 
 	total := len(rows)
+	// 源字节前缀和：开始第 i 个文件时，前 i 个的源大小合计（进度条用）。
+	prefix := make([]int64, total+1)
+	for i, r := range rows {
+		prefix[i+1] = prefix[i]
+		if r.SkipReason == "" {
+			prefix[i+1] += r.SourceBytes
+		}
+	}
+	bytesTotal := prefix[total]
 	for i, row := range rows {
 		item := RunItem{Index: i, Name: row.Name, Before: row.SourceBytes}
 		if err := ctx.Err(); err != nil {
 			return res, cancelledErr(res)
+		}
+		// 结构化进度：只对真会压的行回报（跳过的行不算"正在压缩"）。
+		if row.Runnable() {
+			hooks.progress(ItemProgress{
+				Done: i, Total: total, Row: row,
+				SavedBytes: res.SavedBytes, BytesDone: prefix[i], BytesTotal: bytesTotal,
+			})
 		}
 		if row.SkipReason != "" {
 			item.SkipReason = row.SkipReason
@@ -576,20 +674,29 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			hooks.Chown(row.OutPath)
 		}
 		item.OutName, item.OutPath = row.OutName, row.OutPath
+		item.SavedPercentText = FormatSavedPercent(srcBytes, afterBytes)
 		res.Done++
 		res.BeforeBytes += srcBytes
 		res.AfterBytes += afterBytes
 		res.SavedBytes += srcBytes - afterBytes
 		res.Items = append(res.Items, item)
-		hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s）",
-			row.Name, humanBytes(srcBytes), humanBytes(afterBytes), humanBytes(srcBytes-afterBytes)))
+		// 明细行同时给体积与百分比（算不出百分比时只写体积，绝不写 NaN%）。
+		if item.SavedPercentText != "" {
+			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s，%s）",
+				row.Name, humanBytes(srcBytes), humanBytes(afterBytes),
+				humanBytes(srcBytes-afterBytes), item.SavedPercentText))
+		} else {
+			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s）",
+				row.Name, humanBytes(srcBytes), humanBytes(afterBytes), humanBytes(srcBytes-afterBytes)))
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
 		return res, cancelledErr(res)
 	}
-	hooks.log(tasks.LevelStep, fmt.Sprintf("完成：成功 %d，跳过 %d，失败 %d；共省 %s",
-		res.Done, res.Skipped, res.Failed, humanBytes(res.SavedBytes)))
+	res.SavedPercentText = FormatSavedPercent(res.BeforeBytes, res.AfterBytes)
+	hooks.log(tasks.LevelStep, fmt.Sprintf("完成：成功 %d，跳过 %d，失败 %d；%s",
+		res.Done, res.Skipped, res.Failed, SummarySavedText(res.BeforeBytes, res.AfterBytes)))
 	if res.Failed == res.Total && res.Total > 0 {
 		return res, fmt.Errorf("全部 %d 个都失败了，第一个的原因见日志", res.Failed)
 	}
@@ -600,6 +707,25 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 func cancelledErr(res *RunResult) error {
 	return fmt.Errorf("任务被取消（已成功 %d，跳过 %d，失败 %d，共 %d 个）",
 		res.Done, res.Skipped, res.Failed, res.Total)
+}
+
+// SummarySavedText 是"省了 X（-Y%）· 源 A → B"的汇总文本（日志与任务进度共用）。
+//
+// 源 0 字节 / 读不到大小时**不写百分比**（用户点名：不许 NaN% / -Infinity%），
+// 只如实说"省了 X"。
+func SummarySavedText(before, after int64) string {
+	saved := before - after
+	if saved < 0 {
+		saved = 0
+	}
+	txt := "省了 " + humanBytes(saved)
+	if pct := FormatSavedPercent(before, after); pct != "" {
+		txt += "（" + pct + "）"
+	}
+	if before > 0 && after > 0 {
+		txt += fmt.Sprintf(" · 源 %s → %s", humanBytes(before), humanBytes(after))
+	}
+	return txt
 }
 
 // hasTwoPass 判断这批计划里有没有 2-pass（没有就不建临时目录）。

@@ -61,6 +61,15 @@ type fileVideoReq struct {
 	// Quality 是质量档（CPU=CRF、硬件=-q:v；0 = 用该编码器默认档）。
 	Quality int  `json:"quality"`
 	TwoPass bool `json:"two_pass"`
+	// Sources 是弹窗计划表里"可压行"的指纹（文件名 + 源字节数，可空）。
+	// 任务里重新探测时用它核对文件有没有在两次探测之间变过（见 videoopt.PlanRequest.Expect）。
+	Sources []fileVideoSource `json:"sources,omitempty"`
+}
+
+// fileVideoSource 是计划表一行的指纹（只用来发现"文件变了"，不参与规划判据）。
+type fileVideoSource struct {
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes"`
 }
 
 // videoPlanResponse 是 POST /api/v1/files/video-plan 的响应。
@@ -213,8 +222,14 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 
 // handleFileVideoCompress 开始压缩（202 + task_id，长任务中心）。
 //
-// 与 /video-plan 共用 videoopt.BuildPlan：这里是"规划一次 → 按同一个计划执行"，
-// 所以任务里压的每一条、每个码率都与用户在计划表上看到的一致。
+// **接口在返回前绝不跑 ffprobe**（用户实测的空档根因）：以前这里同步调
+// videoopt.BuildPlan（每个视频一次探测）才回 202，而前端此时已把弹窗关掉 ⇒
+// "面板消失 → 干等 → 进度窗才出现"。现在规划/探测整体挪进任务，任务第一段
+// 就是 `phase=scan` 的探测阶段（结构化进度如实上报第几个/共几个）。
+//
+// 规划仍只有 videoopt 那一份实现（BuildPlanProgress → PlanOne）：弹窗计划表
+// 与真正执行是同一套判据；请求里带的是计划表指纹（Sources），任务重新探测后
+// 逐条核对，变了/不见了就如实跳过（绝不静默按旧计划压）。
 func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request) {
 	var req fileVideoReq
 	if err := decode(r, &req); err != nil {
@@ -237,32 +252,88 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		failFileErr(w, derr, req.Dir)
 		return
 	}
-	plan, berr := videoopt.BuildPlan(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Options: opts,
-	}, runner)
-	if berr != nil {
-		failFileErr(w, berr, dir)
-		return
+	expect := make(map[string]int64, len(req.Sources))
+	for _, src := range req.Sources {
+		if strings.TrimSpace(src.Name) != "" {
+			expect[src.Name] = src.Bytes
+		}
 	}
-	if plan.Runnable == 0 {
-		// 一个都压不了就**别开任务**：开一个只会立刻失败的任务等于让用户白等。
-		fail(w, http.StatusBadRequest, fmt.Sprintf(
-			"没有可压缩的视频：%d 个都跳过了（原因见计划表）", plan.Skipped))
-		return
-	}
-
-	mgr := s.fileManager()
-	title := fmt.Sprintf("压缩视频（%d 个 · %s）", plan.Runnable, opts.Preset.ID)
+	// 标题不带个数：个数要等任务里探测完才知道（接口不许为它等）。
+	title := fmt.Sprintf("压缩视频（%s）", opts.Preset.ID)
 	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress",
 		func(ctx context.Context, log tasks.LogFunc) (any, error) {
-			res, rerr := videoopt.RunPlan(ctx, plan.OutDir, plan.Rows, runner, videoopt.Hooks{
-				Log: log,
-				// 面板以 root 跑：产物必须交还真实用户，否则用户在 Finder 里改不动。
-				Chown: mgr.ChownRealUser,
-			})
-			if rerr != nil {
-				return res, rerr
-			}
-			return res, nil
+			return s.runVideoCompress(ctx, dir, opts, expect, runner, log)
 		})
+}
+
+// runVideoCompress 是任务体：先探测规划（如实上报 scan 进度），再按同一份计划执行。
+func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt.Options,
+	expect map[string]int64, runner videoopt.Runner, log tasks.LogFunc) (*videoopt.RunResult, error) {
+
+	tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "正在读取视频信息…"})
+	plan, err := videoopt.BuildPlanProgress(ctx, videoopt.PlanRequest{
+		Dir: dir, Options: opts, Expect: expect,
+	}, runner, func(done, total int, name string) {
+		tasks.ReportProgress(ctx, tasks.Progress{
+			Phase: "scan", FilesDone: done, FilesTotal: total,
+			Message: fmt.Sprintf("正在读取视频信息 %d/%d：%s", done+1, total, name),
+		})
+	})
+	if err != nil {
+		tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "读取视频信息失败：" + err.Error()})
+		return nil, err
+	}
+	tasks.ReportProgress(ctx, tasks.Progress{
+		Phase: "scan", FilesDone: len(plan.Rows), FilesTotal: len(plan.Rows),
+		Message: fmt.Sprintf("读取完成：%d 个可压，%d 个跳过", plan.Runnable, plan.Skipped),
+	})
+	if plan.Runnable == 0 {
+		// 一个都压不了：任务如实失败（接口已经回了 202，不能在这里假装成功）。
+		msg := fmt.Sprintf("没有可压缩的视频：%d 个都跳过了（原因见上方日志）", plan.Skipped)
+		tasks.ReportProgress(ctx, tasks.Progress{Phase: "done", Message: msg})
+		return nil, fmt.Errorf("%s", msg)
+	}
+	log(tasks.LevelStep, fmt.Sprintf("计划：%d 个可压、%d 个跳过", plan.Runnable, plan.Skipped))
+
+	mgr := s.fileManager()
+	res, rerr := videoopt.RunPlan(ctx, plan.OutDir, plan.Rows, runner, videoopt.Hooks{
+		Log: log,
+		// 面板以 root 跑：产物必须交还真实用户，否则用户在 Finder 里改不动。
+		Chown: mgr.ChownRealUser,
+		OnProgress: func(p videoopt.ItemProgress) {
+			msg := fmt.Sprintf("正在压缩 %d/%d：%s", p.Done+1, p.Total, p.Row.Name)
+			if p.SavedBytes > 0 {
+				msg += " · 已省 " + humanBytes(p.SavedBytes)
+				// 已处理源体积作分母；分母为 0（还没压出一个）时不写百分比。
+				if pct := videoopt.FormatSavedPercent(p.BytesDone, p.BytesDone-p.SavedBytes); pct != "" {
+					msg += "（" + pct + "）"
+				}
+			}
+			tasks.ReportProgress(ctx, tasks.Progress{
+				Phase: "compress", Done: p.BytesDone, Total: p.BytesTotal,
+				FilesDone: p.Done, FilesTotal: p.Total, Message: msg,
+			})
+		},
+	})
+	// 收尾：把汇总（含百分比）落进进度窗 —— 任务结束后进度不会再变，用户随时能回看。
+	final := tasks.Progress{Phase: "done"}
+	if res != nil {
+		final.FilesDone, final.FilesTotal = res.Done, res.Total
+	}
+	switch {
+	case rerr != nil:
+		// 失败/中断：不确定走到哪了，进度条保持"不确定"，只如实写原因。
+		final.Message = "失败：" + rerr.Error()
+	case res != nil:
+		// 全部文件处理完：进度条拉满，文案给体积与百分比（源 0 字节时只有体积）。
+		final.Done, final.Total = res.BeforeBytes, res.BeforeBytes
+		final.Message = videoopt.SummarySavedText(res.BeforeBytes, res.AfterBytes)
+	default:
+		final.Message = "未产生结果"
+	}
+	tasks.ReportProgress(ctx, final)
+	if rerr != nil {
+		return res, rerr
+	}
+	return res, nil
 }
