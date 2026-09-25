@@ -307,6 +307,27 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	ok(w, fileListPayload{ListResult: res, RootLabels: rootLabelsFor(res, entries)})
 }
 
+// dirSizeLimits 是目录大小统计的预算，也是门禁的注入点（把预算调到极小，
+// 验证"超预算必定 truncated=true"）。理由与默认值见 files.DirSizeLimits。
+var dirSizeLimits = files.DirSizeLimits{
+	Budget:     files.DirSizeDefaultBudget,
+	MaxEntries: files.DirSizeDefaultMaxEntries,
+}
+
+// handleFileDirSize 递归统计一个目录的大小（列表里目录行的「计算」按需调用）。
+//
+// 路径与列表走同一套白名单校验（越界 403）、非目录 400；超预算返回已统计的
+// 部分并标 truncated（如实说"没统计完"）。
+func (s *Server) handleFileDirSize(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Query().Get("path")
+	res, err := s.fileManager().DirSize(p, dirSizeLimits)
+	if err != nil {
+		failFileErr(w, err, p)
+		return
+	}
+	ok(w, res)
+}
+
 // fileListPayload：文件列表响应 = ListResult + 下拉标签表 root_labels。
 // 标签属展示层，故不改 files.ListResult（本轮也只许改 web 包）。
 type fileListPayload struct {

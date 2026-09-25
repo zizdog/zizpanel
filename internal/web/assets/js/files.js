@@ -48,6 +48,12 @@ let favorites = null;
 // 只有用户点 ✕ / 菜单「关闭编辑器」才会被 dispose（见 createEditorWindow 的 onClosed）。
 let activeEditor = null;
 
+// 目录大小（宝塔式按需计算）的结果缓存：key = 目录路径。
+// **只活在当前页面会话**（模块级 Map，刷新即失效）：重绘/切目录/切路由都复用，
+// 绝不因为一次重绘就重算；点已显示的结果 = 强制重算（覆盖缓存）。
+// 运行中的条目用它挡住重复请求。目录内容被改后缓存**不自动失效**，靠再点一次。
+const dirSizeCache = new Map();
+
 export function FilesView(content, ctx = {}) {
   clear(content);
   selection = new Set();
@@ -960,6 +966,67 @@ export function FilesView(content, ctx = {}) {
     }
   }
 
+  // sizeCell 生成「大小」单元格：文件行原样显示，目录行是可点的按需计算。
+  function sizeCell(e) {
+    const td = h('td.num');
+    fillSizeCell(td, e);
+    return td;
+  }
+
+  // ---------- 目录大小：按需计算 ----------
+  //
+  // 文件行的大小原样显示；目录行不再显示"—"，而是可点的「计算」
+  // （宝塔同款：递归统计很贵，绝不进列表请求）。缓存策略见 dirSizeCache。
+  function fillSizeCell(td, e) {
+    if (!e.is_dir) { td.textContent = humanSize(e.size); return; }
+    clear(td);
+    const st = dirSizeCache.get(e.path);
+    const btn = (cls, text, title) => h('button.zpf-dirsize' + (cls ? '.' + cls : ''), {
+      type: 'button', text, title,
+      onclick: (ev) => { ev.stopPropagation(); startDirSize(e, td); },
+      ondblclick: (ev) => ev.stopPropagation(), // 双击不该顺手把目录打开
+    });
+    if (!st || st.state === 'idle') {
+      td.appendChild(btn('', '计算', '统计这个文件夹的递归大小（不跟随符号链接）'));
+      return;
+    }
+    if (st.state === 'running') {
+      td.appendChild(h('span.zpf-dirsize.is-run', { text: '计算中…' }));
+      return;
+    }
+    if (st.state === 'error') {
+      td.appendChild(btn('is-err', '计算失败', st.message || '计算失败'));
+      return;
+    }
+    // 没统计完必须带标记：一个看起来精确的数字会骗人
+    const text = humanSize(st.bytes) + (st.truncated ? '+（未统计完）' : '');
+    const bits = [st.files + ' 个文件', st.dirs + ' 个目录'];
+    if (st.truncated) bits.push(st.reason || '超出预算，没统计完');
+    if (st.skipped) bits.push('跳过 ' + st.skipped + ' 项（读不到）');
+    if (st.symlinks) bits.push('跳过 ' + st.symlinks + ' 个符号链接');
+    bits.push('用时 ' + (st.ms / 1000).toFixed(2) + 's', '点击重新计算');
+    td.appendChild(btn('is-done', text, bits.join(' · ')));
+  }
+
+  async function startDirSize(e, td) {
+    if ((dirSizeCache.get(e.path) || {}).state === 'running') return;
+    dirSizeCache.set(e.path, { state: 'running' });
+    fillSizeCell(td, e);
+    try {
+      const r = await api.fileDirSize(e.path);
+      dirSizeCache.set(e.path, {
+        state: 'done',
+        bytes: (r && r.bytes) || 0, files: (r && r.files) || 0, dirs: (r && r.dirs) || 0,
+        skipped: (r && r.skipped) || 0, symlinks: (r && r.symlinks) || 0,
+        truncated: !!(r && r.truncated), reason: (r && r.reason) || '', ms: (r && r.ms) || 0,
+      });
+    } catch (err) {
+      dirSizeCache.set(e.path, { state: 'error', message: (err && err.message) || String(err) });
+    }
+    // 等待期间表格可能已重绘（td 已脱离文档）：缓存已写好，下次渲染自然显示。
+    if (td.isConnected) fillSizeCell(td, e);
+  }
+
   function renderTable() {
     clear(tableBox);
     const list = lastList?.entries || [];
@@ -1030,7 +1097,7 @@ export function FilesView(content, ctx = {}) {
           }),
         ]),
         h('td', [nameCell(e)]),
-        h('td.num', { text: e.is_dir ? '—' : humanSize(e.size) }),
+        sizeCell(e),
         h('td.mono', { style: { fontSize: '11.5px' }, text: String(e.mode_num.toString(8)).padStart(3, '0') }),
         h('td', { style: { fontSize: '11.5px' }, text: e.owner || '—' }),
         h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: e.mod_time }),

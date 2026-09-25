@@ -458,6 +458,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/files/upload", s.requireAuth(s.handleFileUpload))
 	// 面板自己的单次上传上限（前端本地预检与分批都靠它，不许再写死常数）。
 	root.HandleFunc("GET /api/v1/files/upload-limit", s.requireAuth(s.handleGetPanelUploadLimit))
+	// 目录递归大小：按需触发（列表里目录行的大小列显示「计算」）。
+	root.HandleFunc("GET /api/v1/files/dir-size", s.requireAuth(s.handleFileDirSize))
 	root.HandleFunc("POST /api/v1/files/search", s.requireAuth(s.handleFileSearch))
 	root.HandleFunc("POST /api/v1/files/replace", s.requireAuth(s.handleFileReplace))
 	// 视频压缩（走任务中心：202 + task_id）与目录收藏（存服务端 settings KV）。

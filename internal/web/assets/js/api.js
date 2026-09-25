@@ -507,6 +507,8 @@ export const api = {
   fileExtract: (archive, dest) => request('POST', `${API_BASE}/files/extract`, { archive, dest }),
   fileSearch: (path, query, mode = 'name', limit = 200) =>
     request('POST', `${API_BASE}/files/search`, { path, query, mode, limit }),
+  // 目录递归大小（按需：列表里目录行点「计算」才调；有界，可能 truncated）。
+  fileDirSize: (path) => request('GET', `${API_BASE}/files/dir-size?path=${encodeURIComponent(path)}`),
   fileReplace: (path, find, replace, all = true) =>
     request('POST', `${API_BASE}/files/replace`, { path, find, replace, all }),
   // 下载与上传走原生表单/URL，不经过 JSON 封装

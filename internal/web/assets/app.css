@@ -447,6 +447,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .files-drop.active { border-color: var(--brand); background: var(--brand-soft); color: var(--text); }
 
+/* 目录行「大小」列：递归统计很贵，默认只给一颗「计算」，点了才统计（宝塔同款）。
+   结果本身就是按钮 —— 再点一次 = 强制重算。 */
+.zpf-dirsize {
+  font: inherit; font-size: 12px; padding: 1px 7px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text-dim);
+  white-space: nowrap; /* "1.2 GB+（未统计完）"不许在按钮里折行（窄屏实测会折成两行） */
+}
+.zpf-dirsize:hover { border-color: var(--brand); color: var(--text); }
+.zpf-dirsize.is-run { border-style: dashed; color: var(--text-mute); cursor: default; }
+.zpf-dirsize.is-err { border-color: rgba(239,68,68,.45); color: #f87171; }
+
 /* 页面级警示横幅：用于"缺少前置依赖"这类必须让用户看见、不能只靠 title 悬浮提示的状态。
    例：反向代理页在没装 nginx 时提示"先去应用市场装 nginx"。 */
 .banner-warn {
