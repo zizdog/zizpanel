@@ -448,6 +448,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/files/mkdir", s.requireAuth(s.handleFileMkdir))
 	root.HandleFunc("POST /api/v1/files/touch", s.requireAuth(s.handleFileTouch))
 	root.HandleFunc("POST /api/v1/files/rename", s.requireAuth(s.handleFileRename))
+	// 批量改名：预览与执行共用 internal/rename 的同一份规则引擎（执行时后端重算 + 指纹核对）。
+	root.HandleFunc("POST /api/v1/files/rename-plan", s.requireAuth(s.handleFileRenamePlan))
+	root.HandleFunc("POST /api/v1/files/rename-apply", s.requireAuth(s.handleFileRenameApply))
 	root.HandleFunc("POST /api/v1/files/copy", s.requireAuth(s.handleFileCopy))
 	root.HandleFunc("POST /api/v1/files/move", s.requireAuth(s.handleFileMove))
 	root.HandleFunc("POST /api/v1/files/chmod", s.requireAuth(s.handleFileChmod))

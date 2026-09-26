@@ -489,6 +489,10 @@ export const api = {
   fileMkdir: (path) => request('POST', `${API_BASE}/files/mkdir`, { path }),
   fileTouch: (path) => request('POST', `${API_BASE}/files/touch`, { path }),
   fileRename: (from, to) => request('POST', `${API_BASE}/files/rename`, { from, to }),
+  // 批量改名：plan 只读预览（逐条 + 汇总 + 指纹），apply 让后端按**同一份规则重算**
+  // （不信任前端传来的新名），指纹不一致/有冲突就整批拒绝。
+  fileRenamePlan: (payload) => request('POST', `${API_BASE}/files/rename-plan`, payload),
+  fileRenameApply: (payload) => request('POST', `${API_BASE}/files/rename-apply`, payload),
   // 复制/移动/删除都是**长任务**（202 + task_id）：几 GB 跨盘复制不能靠同步请求
   // 干等，也不能让刷新页面掐断它。items = [{from, to}]，一次粘贴 = 一个任务，
   // 进度由后端按字节上报（tasks 的 progress 字段，前端画进度条）。

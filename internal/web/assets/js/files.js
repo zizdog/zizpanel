@@ -1200,6 +1200,7 @@ export function FilesView(content, ctx = {}) {
       archive ? { label: '解压到当前目录', title: '大压缩包会在任务中心里跑，并逐条显示进度', run: () => extractEntry(e) } : null,
       { sep: true },
       { label: '重命名' + (multi ? '（仅单项）' : ''), disabled: multi, run: () => renameEntry(e) },
+      { label: '批量改名' + (multi ? `（${paths.length} 项）` : ''), title: `对选中的 ${paths.length} 项批量改名`, run: () => batchRename(paths) },
       { label: '复制到…', disabled: multi, run: () => copyEntryTo(e) },
       { label: '移动到…', disabled: multi, run: () => moveEntryTo(e) },
       { label: '复制（Ctrl+C）', run: () => copySelection(paths) },
@@ -1320,6 +1321,301 @@ export function FilesView(content, ctx = {}) {
       await api.fileRename(e.path, `${dirname(e.path)}/${name}`);
       toast('已重命名', 'ok'); load(cwd);
     } catch (err) { toast(err.message, 'err'); }
+  }
+
+  // ---------- 批量改名 ----------
+  //
+  // 规则引擎只有后端一份（internal/rename）：预览与执行都调它，前端**不自己算新名**。
+  // 入口只有 rowMenuItems 里的「批量改名」（右键与「更多」共用同一份）。
+
+  const RENAME_PRESETS = [
+    { label: '第二十集 → 第20集', rules: [{ type: 'cnnum', scope: 'episode' }] },
+    { label: '第二十集 → EP20', rules: [{ type: 'episode', prefix: 'EP', width: 0 }] },
+    { label: 'EP20 → EP020（补零 3 位）', rules: [{ type: 'episode', prefix: 'EP', width: 3 }] },
+    { label: '删除 [组名] 标签', rules: [{ type: 'replace', mode: 'regex', find: '\\[[^\\]]*\\]\\s*', replace: '' }] },
+    { label: '空格转下划线', rules: [{ type: 'replace', mode: 'literal', find: ' ', replace: '_' }] },
+  ];
+  const RENAME_TYPES = [
+    ['replace', '替换 / 删除文本'], ['insert', '插入文本'], ['delete', '删除匹配'],
+    ['cnnum', '中文数字 → 数字'], ['episode', '集数 → EP'],
+  ];
+  const RENAME_MODES = [['literal', '字面'], ['wildcard', '通配符 * ?'], ['regex', '正则']];
+  const RENAME_POSITIONS = [['prefix', '最前'], ['suffix', '最后'], ['after', '第 N 个字符后']];
+  const RENAME_HINT = { fontSize: '11.5px', color: 'var(--text-mute)', marginTop: '4px', lineHeight: '1.5' };
+  const RENAME_DIFF = { background: 'rgba(245,158,11,.30)', borderRadius: '3px' };
+
+  // renameDefaultRule 返回某类型的初始参数（切换类型时重置）。
+  function renameDefaultRule(type) {
+    if (type === 'insert') return { type: 'insert', position: 'prefix', at: 0, text: '' };
+    if (type === 'delete') return { type: 'delete', mode: 'literal', find: '' };
+    if (type === 'cnnum') return { type: 'cnnum', scope: 'episode' };
+    if (type === 'episode') return { type: 'episode', prefix: 'EP', width: 0 };
+    return { type: 'replace', mode: 'literal', find: '', replace: '' };
+  }
+
+  // renameDiff 返回 [公共前缀, 原名中段, 新名中段, 公共后缀]，只标真正改动的部分。
+  function renameDiff(a, b) {
+    if (a === b) return [a, '', '', ''];
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i += 1;
+    let j = 0;
+    while (j < a.length - i && j < b.length - i && a[a.length - 1 - j] === b[b.length - 1 - j]) j += 1;
+    return [a.slice(0, i), a.slice(i, a.length - j), b.slice(i, b.length - j), a.slice(a.length - j)];
+  }
+
+  function batchRename(paths) {
+    const names = [...paths].map((p) => basename(p));
+    if (!names.length) return;
+
+    let rules = [];
+    let plan = null;
+    let timer = null;
+    let seq = 0;
+    let applying = false;
+
+    const presetSel = h('select.select', [h('option', { value: '', text: '选择预设…' })].concat(
+      RENAME_PRESETS.map((p, i) => h('option', { value: String(i), text: p.label }))));
+    const includeExt = h('input', { type: 'checkbox' });
+    const rulesBox = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } });
+    const previewBox = h('div');
+    const statusHint = h('div', { style: { ...RENAME_HINT, marginTop: '8px' } });
+    const applyBtn = h('button.btn.btn-primary', { text: '应用', disabled: true });
+
+    function payload() {
+      return { dir: cwd, names, rules, options: { include_ext: !!includeExt.checked } };
+    }
+
+    function field(labelText, control) {
+      return h('div.field', [h('label', { text: labelText }), control]);
+    }
+
+    function renderRules() {
+      clear(rulesBox);
+      if (!rules.length) {
+        rulesBox.appendChild(h('div', { style: RENAME_HINT, text: '还没有规则：选一个预设，或点下面「加一条规则」。' }));
+      }
+      rules.forEach((r, i) => rulesBox.appendChild(ruleCard(r, i)));
+      schedulePreview();
+    }
+
+    function ruleCard(r, i) {
+      const typeSel = h('select.select', { style: { maxWidth: '180px' } },
+        RENAME_TYPES.map(([v, t]) => h('option', { value: v, text: t, selected: r.type === v })));
+      typeSel.addEventListener('change', () => { rules[i] = renameDefaultRule(typeSel.value); renderRules(); });
+      const move = (d) => {
+        const j = i + d;
+        if (j < 0 || j >= rules.length) return;
+        const tmp = rules[i]; rules[i] = rules[j]; rules[j] = tmp;
+        renderRules();
+      };
+      const head = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } }, [
+        h('span', { text: '规则 ' + (i + 1), style: { fontSize: '12px', color: 'var(--text-mute)' } }),
+        typeSel,
+        h('div', { style: { flex: '1' } }),
+        h('button.btn.btn-sm', { text: '↑', title: '上移', onclick: () => move(-1) }),
+        h('button.btn.btn-sm', { text: '↓', title: '下移', onclick: () => move(1) }),
+        h('button.btn.btn-sm.btn-danger', { text: '✕', title: '删除这条规则', onclick: () => { rules.splice(i, 1); renderRules(); } }),
+      ]);
+
+      const textInput = (value, placeholder, onChange) => {
+        const inp = h('input.input', { value, placeholder });
+        inp.addEventListener('input', () => { onChange(inp.value); schedulePreview(); });
+        return inp;
+      };
+      const cell = (labelText, control) =>
+        h('div', { style: { flex: '1 1 160px', minWidth: '0' } }, [h('label', { style: RENAME_HINT, text: labelText }), control]);
+      const body = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '8px', minWidth: '0' } });
+
+      if (r.type === 'replace' || r.type === 'delete') {
+        const modeSel = h('select.select', RENAME_MODES.map(([v, t]) =>
+          h('option', { value: v, text: t, selected: (r.mode || 'literal') === v })));
+        modeSel.addEventListener('change', () => { r.mode = modeSel.value; schedulePreview(); });
+        body.appendChild(cell('匹配方式', modeSel));
+        body.appendChild(cell('查找', textInput(r.find || '', r.mode === 'regex' ? '如 第([0-9]+)集' : '如 第二十集', (v) => { r.find = v; })));
+        if (r.type === 'replace') {
+          body.appendChild(cell('替换为（留空 = 删除；$1 引用捕获）', textInput(r.replace || '', '留空即删除', (v) => { r.replace = v; })));
+        }
+      } else if (r.type === 'insert') {
+        const posSel = h('select.select', RENAME_POSITIONS.map(([v, t]) =>
+          h('option', { value: v, text: t, selected: (r.position || 'prefix') === v })));
+        posSel.addEventListener('change', () => { r.position = posSel.value; renderRules(); });
+        body.appendChild(cell('位置', posSel));
+        if ((r.position || 'prefix') === 'after') {
+          const atInput = h('input.input', { type: 'number', value: String(r.at || 0), min: '0' });
+          atInput.addEventListener('input', () => { r.at = Number(atInput.value) || 0; schedulePreview(); });
+          body.appendChild(cell('第几个字符后（中文按字算）', atInput));
+        }
+        body.appendChild(cell('插入的文本', textInput(r.text || '', '如 _', (v) => { r.text = v; })));
+      } else if (r.type === 'cnnum') {
+        const scopeSel = h('select.select', [
+          h('option', { value: 'episode', text: '只在集数语境（推荐）', selected: (r.scope || 'episode') === 'episode' }),
+          h('option', { value: 'all', text: '整个名字', selected: r.scope === 'all' }),
+        ]);
+        scopeSel.addEventListener('change', () => { r.scope = scopeSel.value; schedulePreview(); });
+        body.appendChild(cell('替换范围', scopeSel));
+        body.appendChild(h('div', { style: { ...RENAME_HINT, flex: '2 1 220px' }, text: '集数语境 = 第X集/话/期/回/部/季/卷/章、EPx、Ex。' }));
+      } else if (r.type === 'episode') {
+        const widthSel = h('select.select', [0, 1, 2, 3].map((w) =>
+          h('option', { value: String(w), text: w <= 1 ? '不补零' : '补零到 ' + w + ' 位', selected: Number(r.width || 0) === w })));
+        widthSel.addEventListener('change', () => { r.width = Number(widthSel.value); schedulePreview(); });
+        body.appendChild(cell('前缀', textInput(r.prefix || '', 'EP', (v) => { r.prefix = v; })));
+        body.appendChild(cell('数字宽度', widthSel));
+      }
+      return h('div', {
+        style: { border: '1px solid var(--border-soft)', borderRadius: '8px', padding: '8px 10px', minWidth: '0' },
+      }, [head, body]);
+    }
+
+    function schedulePreview() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(refreshPlan, 220);
+    }
+
+    async function refreshPlan() {
+      timer = null;
+      if (!rules.length) {
+        plan = null;
+        renderPreview('还没有规则。');
+        return;
+      }
+      const mine = ++seq;
+      let res;
+      try {
+        res = await api.fileRenamePlan(payload());
+      } catch (e) {
+        if (mine !== seq) return;
+        plan = null;
+        renderPreview('预览失败：' + ((e && e.message) || e));
+        return;
+      }
+      if (mine !== seq) return;
+      plan = res;
+      renderPreview('');
+    }
+
+    function previewCell(it) {
+      const bad = it.status === 'conflict' || it.status === 'invalid';
+      const [, , newMid, post] = renameDiff(it.name, it.new_name);
+      const newPre = it.new_name.slice(0, it.new_name.length - newMid.length - post.length);
+      const label = it.status === 'ok' ? '将改名'
+        : it.status === 'unchanged' ? '无变化'
+          : (it.status === 'conflict' ? '冲突：' : '非法：') + (it.reason || '');
+      const style = bad ? { color: 'var(--danger)' } : (it.status === 'unchanged' ? { color: 'var(--text-mute)' } : {});
+      return h('tr', { style: bad ? { background: 'rgba(239,68,68,.10)' } : {} }, [
+        h('td.zp-plan-name', { text: it.name }),
+        h('td.zp-plan-name', [
+          h('span', { text: newPre }),
+          newMid ? h('span', { style: RENAME_DIFF, text: newMid }) : null,
+          h('span', { text: post }),
+        ]),
+        h('td', { text: label, style }),
+      ]);
+    }
+
+    function renderPreview(errText) {
+      clear(previewBox);
+      if (errText) {
+        previewBox.appendChild(h('div', { style: RENAME_HINT, text: errText }));
+        statusHint.style.color = '';
+        statusHint.textContent = errText;
+        applyBtn.disabled = true;
+        return;
+      }
+      if (!plan) { applyBtn.disabled = true; return; }
+      const rows = (plan.items || []).map(previewCell);
+      previewBox.appendChild(h('div.zp-plan-scroll', [
+        h('table.table', { style: { fontSize: '12px' } }, [
+          h('thead', [h('tr', ['原名', '新名', '状态'].map((t) => h('th', { text: t })))]),
+          h('tbody', rows.length ? rows : [h('tr', [h('td', { colspan: '3', text: '没有条目' })])]),
+        ]),
+      ]));
+      const blocked = (plan.conflict || 0) + (plan.invalid || 0);
+      applyBtn.disabled = applying || blocked > 0 || !plan.ok;
+      if (blocked > 0) {
+        statusHint.style.color = 'var(--danger)';
+        statusHint.textContent = `有 ${plan.conflict} 项冲突、${plan.invalid} 项不合法：先改规则再应用`;
+      } else if (!plan.ok) {
+        statusHint.style.color = '';
+        statusHint.textContent = '没有需要改名的项。';
+      } else {
+        statusHint.style.color = '';
+        statusHint.textContent = `将改名 ${plan.ok} 项，${plan.unchanged} 项无变化。`;
+      }
+    }
+
+    function showResult(result) {
+      clear(body);
+      const rows = ((result && result.items) || []).map((it) => {
+        const bad = it.status === 'failed';
+        const skipped = it.status === 'skipped';
+        return h('tr', { style: bad ? { background: 'rgba(239,68,68,.10)' } : {} }, [
+          h('td.zp-plan-name', { text: it.name }),
+          h('td.zp-plan-name', { text: it.new_name }),
+          h('td', { text: it.status === 'ok' ? '成功' : (skipped ? '跳过' : '失败'), style: bad ? { color: 'var(--danger)' } : (skipped ? { color: 'var(--text-mute)' } : {}) }),
+          h('td', { text: it.reason || '—' }),
+        ]);
+      });
+      body.appendChild(h('div', [
+        h('div', { style: { fontWeight: '600', marginBottom: '8px' }, text: (result && result.summary) || '完成' }),
+        h('div.zp-plan-scroll', [
+          h('table.table', { style: { fontSize: '12px' } }, [
+            h('thead', [h('tr', ['原名', '新名', '结果', '原因'].map((t) => h('th', { text: t })))]),
+            h('tbody', rows.length ? rows : [h('tr', [h('td', { colspan: '4', text: '没有条目' })])]),
+          ]),
+        ]),
+      ]));
+    }
+
+    presetSel.addEventListener('change', () => {
+      const preset = RENAME_PRESETS[Number(presetSel.value)];
+      if (!preset) return;
+      rules = preset.rules.map((r) => ({ ...r }));
+      renderRules();
+    });
+    includeExt.addEventListener('change', schedulePreview);
+
+    const body = h('div', { style: { minWidth: '0' } }, [
+      h('div', { style: RENAME_HINT, text: `目录：${cwd}` }),
+      field('预设', presetSel),
+      h('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', fontSize: '12.5px' } }, [
+        includeExt, h('span', { text: '规则也作用于扩展名（默认只改主名）' }),
+      ]),
+      rulesBox,
+      h('button.btn.btn-sm', { text: '＋ 加一条规则', onclick: () => { rules.push(renameDefaultRule('replace')); renderRules(); } }),
+      h('div', { style: { margin: '14px 0 6px', fontWeight: '600', fontSize: '13px' }, text: '预览' }),
+      previewBox,
+      statusHint,
+    ]);
+
+    modal({
+      title: `对选中的 ${names.length} 项批量改名`,
+      body,
+      wide: true,
+      footer: (close) => [applyBtn, h('button.btn', { text: '关闭', onclick: close })],
+    });
+
+    applyBtn.addEventListener('click', async () => {
+      if (applying || !plan) return;
+      applying = true;
+      applyBtn.disabled = true;
+      statusHint.style.color = '';
+      statusHint.textContent = '正在改名…';
+      try {
+        const res = await api.fileRenameApply({ ...payload(), fingerprint: plan.fingerprint });
+        const result = res && res.result;
+        showResult(result);
+        applyBtn.textContent = '已完成';
+        toast((result && result.summary) || '批量改名完成', (result && result.failed) ? 'warn' : 'ok', 12000);
+        load(cwd);
+      } catch (e) {
+        applying = false;
+        statusHint.style.color = 'var(--danger)';
+        statusHint.textContent = '应用失败：' + ((e && e.message) || e);
+        refreshPlan();
+      }
+    });
+
+    renderRules();
   }
 
   function copySelection(paths) {
