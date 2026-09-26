@@ -16,9 +16,7 @@ import { TerminalView, destroyTerminal } from './terminal.js';
 import { CronView } from './cron.js';
 import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
-import { MobileView } from './mobile.js';
 import { PeersView } from './peers.js';
-import { setupPWA } from './pwa.js';
 import { DisksView } from './disks.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
@@ -41,9 +39,6 @@ export const NAV = [
   // 放在「总览」组：它是用户每天第一眼看的页面，不是运维工具。
   // 数据量极小，直接做进面板（复用鉴权/备份/审计），不引入第二套运行时。
   { id: 'nav', title: '导航页', icon: '🧭', view: NavView },
-  // 「手机一屏」（C4）：手机上真正要看的是「有没有事」和「点一下能不能恢复」，
-  // 桌面版的信息密度在 6 寸屏上等于什么都看不见（详见 mobile.js）。
-  { id: 'mobile', title: '手机一屏', icon: '📱', view: MobileView },
   // C5「多机」（只读聚合另外几台 Mac）：**2026-09-24 用户判断"暂缓"** ——
   // Mac 是家用设备、几乎不涉及多机，这个入口先不给用户看（后端接口与页面代码保留，
   // 想开回来只要把下面这行取消注释）。
@@ -499,8 +494,6 @@ function goto2FASettings() {
 // "不访问应用版块就永远不提示"；而这条提醒的意义就是**在任何页面都能看见**。
 // 预热同时会把市场列表缓存好（点开「应用市场」秒进）。
 let appUpdatesKicked = false;
-// pwaReady：PWA 的 manifest/图标/SW 只注入一次（renderApp 每次路由切换都会跑）。
-let pwaReady = false;
 function kickAppUpdates() {
   if (appUpdatesKicked || !state.session) return;
   appUpdatesKicked = true;
@@ -508,15 +501,6 @@ function kickAppUpdates() {
 }
 
 function renderApp() {
-  // PWA（C4）：manifest / 主屏图标 / Service Worker。
-  //
-  // 放在这里而不是 boot() 里：**首次初始化**与**登录**成功走的是 renderApp()，
-  // 不重跑 boot()（实测踩到过：初始化完的那一次会话里一直没有 manifest 链接）。
-  // 用 session 里的入口拼**绝对**路径，带安全后缀的部署才不会指向 404。
-  if (!pwaReady && state.session) {
-    pwaReady = true;
-    setupPWA(state.session?.config?.panel_entry || '/', state.session?.version || '');
-  }
   // 路由先过别名表：`#/services` 会落到 apps 版块的「已安装」Tab（见 ROUTE_TARGET）；
   // `#/apps/docker` 这类带 Tab 的 hash 由 routeFor 解析出 tab 传进页面。
   const target = routeFor();
@@ -619,7 +603,7 @@ function renderApp() {
       'aria-label': '刷新',
       onclick: () => render(),
     }),
-    h('button.btn.btn-ghost.btn-icon', { text: '⏻', title: '退出登录', onclick: doLogout }),
+    h('button.btn.btn-ghost.btn-icon', { text: '⏏', title: '退出登录', onclick: doLogout }),
   ]);
 
   // 底部 footer：版本号 + 一句状态。放在 main 的**正常流**里（不是 fixed），

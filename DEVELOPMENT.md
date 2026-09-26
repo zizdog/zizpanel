@@ -191,28 +191,6 @@ make deploy          # release + 推镜像机 + 升级本机 + 验证（不发�
 
 ---
 
-## 六点六、PWA 与手机一屏（C4）
-
-「加到手机主屏」＋一页只为手机准备的状态/操作页。前端 `assets/sw.js`、`assets/js/pwa.js`、`assets/js/mobile.js`；
-后端 `internal/web/pwa.go`（manifest 与图标，见「面板设置」之外的路由 `/manifest.webmanifest`、`/pwa/icon-*.png`）。
-
-- **manifest 由后端生成**：面板可能挂在 `/<安全后缀>/` 下，`start_url`/`scope`/图标地址都必须带前缀 ——
-  写成静态文件会让"加主屏"后打开 404（带后缀部署下必现）。
-- **图标用代码画**（`image/png`，192/512，圆角蓝底 + 白色 Z）：不引入二进制资源、不加构建步骤，
-  改配色只改一处。`purpose: any/maskable` 两种都给。
-- **Service Worker 只碰面板自己的静态外壳**（入口页/CSS/JS/图标），`/api/` 一律走网络**绝不缓存**
-  （拿旧数据糊弄用户比打不开更糟），代理出去的应用界面与导航页完全不插手；缓存名带面板版本，
-  就地升级后自动换 worker 与空缓存。
-- 注册放在 `renderApp()`（首次初始化/登录走的是它、不重跑 `boot()`，放 boot 里会漏掉这两种路径）。
-- 门禁：`go test ./internal/web/ -run 'PWA|ServiceWorker'`（后缀感知的 manifest、PNG 真解码 + 圆角透明 +
-  未支持尺寸 404、sw.js 必须绕开 `/api/` 且 no-cache）；真浏览器 `tools/pwa-check.mjs` 15 项
-  （iPhone 13 视口登录 → manifest/图标/SW/手机一屏）。
-- **未验证：离线可用性**。SW 注册、作用域、install 阶段预热的入口页都验到了，但这个 Playwright/Chromium
-  对 SW 断网行为的模拟不可靠（同一探针时而应答时而 `Failed to fetch`；`setOffline` 与 `route().abort()`
-  都会在请求进入 SW 之前拒掉它），所以**不声称断网可用**。
-
----
-
 ## 六点七、整机搬家 / 备份恢复（C2）
 
 换机器的路径本来就是一条：**老机器 `zizpanel backup create` → 新机器装面板 → 备份页上传 → 恢复**。
