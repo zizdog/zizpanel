@@ -1152,3 +1152,76 @@ h6.zp-notes-h { font-size: 12px; color: var(--text-dim); }
 }
 .files-denied-head { color: var(--text-dim); font-size: 12.5px; font-weight: 600; }
 .files-denied-line { color: var(--text-dim); font-size: 12px; line-height: 1.65; margin-top: 6px; white-space: pre-wrap; }
+
+/* ---------- 上传浮动面板（宝塔式：分文件详情列表 + 逐文件进度） ----------
+   挂 document.body、fixed 定位：切页面/切目录都不销毁（用户要求），上传照跑。
+   width 用 min(560px, 100vw - 24px) 保证窄屏（360/390）不把页面撑出横向滚动。 */
+.zp-upload-float {
+  position: fixed; right: 16px; bottom: 16px; z-index: 240;
+  width: min(560px, calc(100vw - 24px)); max-width: 100%;
+  max-height: min(74vh, 640px); display: flex; flex-direction: column; min-width: 0;
+  background: linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--panel) 96%, var(--bg)));
+  border: 1px solid var(--border); border-radius: 13px; box-shadow: var(--shadow);
+  overflow: hidden; animation: zpModalIn .18s cubic-bezier(.2, .8, .3, 1) both;
+}
+/* 拖拽时整体高亮（用户要求"明显高亮"）：边框 + 外发光，不只改内部虚线框。 */
+.zp-upload-float.zp-drop-active { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft), var(--shadow); }
+.zp-upload-head {
+  display: flex; align-items: center; gap: 8px; padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft); min-width: 0;
+}
+.zp-upload-float.zp-min .zp-upload-head { border-bottom: none; cursor: pointer; }
+.zp-upload-ico { color: var(--brand); font-size: 15px; }
+.zp-upload-title {
+  font-size: 13.5px; font-weight: 620; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.zp-upload-iconbtn {
+  background: none; border: none; color: var(--text-mute); font-size: 16px; line-height: 1;
+  cursor: pointer; padding: 0 4px;
+}
+.zp-upload-iconbtn:hover { color: var(--text); }
+.zp-upload-body { padding: 11px 13px 13px; overflow-y: auto; min-width: 0; }
+.zp-upload-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.zp-upload-drop { margin-top: 10px; padding: 14px; cursor: pointer; }
+.zp-upload-drop.active { border-color: var(--brand); background: var(--brand-soft); color: var(--text); }
+.files-upload-progress-host:empty { display: none; }
+.files-upload-progress { margin-top: 10px; min-width: 0; }
+.zp-up-total { font-size: 12.5px; font-weight: 600; }
+/* 总进度条与每文件进度条统一 6px 高；.bar 自带的 margin-top:10px 在这里太松。 */
+.zp-up-totalbar, .zp-up-bar { margin-top: 6px; }
+.zp-up-rate { margin-top: 5px; font-size: 12px; color: var(--text-mute); min-height: 15px; }
+.zp-up-limit, .zp-up-empty { margin-top: 7px; }
+.zp-up-enter { margin-top: 8px; }
+.zp-upload-list { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; max-height: 290px; overflow-y: auto; }
+/* 一行 = 一个文件：名称/大小/操作一行，进度条独占一行，百分比·速度·状态一行。
+   每列 min-width:0 且名称可截断 —— 窄屏只截断，不许把面板撑宽。 */
+.zp-up-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 3px 8px;
+  align-items: center; min-width: 0; padding: 7px 9px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--panel-2);
+}
+.zp-up-row.is-failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--border-soft)); }
+.zp-up-name { min-width: 0; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zp-up-size { font-size: 11.5px; color: var(--text-mute); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.zp-up-act { display: flex; gap: 4px; justify-self: end; }
+.zp-up-act .btn { padding: 1px 7px; font-size: 11.5px; }
+.zp-up-bar { grid-column: 1 / -1; }
+.zp-up-meta {
+  grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
+  font-size: 11.5px; color: var(--text-mute); min-width: 0;
+}
+.zp-up-pct { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.zp-up-speed { white-space: nowrap; }
+.zp-up-status { margin-left: auto; min-width: 0; text-align: right; word-break: break-word; }
+.zp-up-status.is-done { color: var(--ok); }
+.zp-up-status.is-failed { color: var(--danger); }
+.zp-up-status.is-canceled { color: var(--text-mute); }
+
+/* 手机上：面板贴底占满宽度，行内操作换行（进度条不许把面板撑破）。 */
+@media (max-width: 760px) {
+  .zp-upload-float { right: 8px; bottom: 8px; width: calc(100vw - 16px); max-height: 82vh; }
+  .zp-up-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .zp-up-act { grid-column: 1 / -1; justify-self: start; }
+  .zp-upload-list { max-height: 46vh; }
+}
