@@ -147,19 +147,59 @@ func (m *Manager) Resolve(p string, allowMissing bool) (string, error) {
 			if errors.Is(err, fs.ErrPermission) {
 				return "", err
 			}
+			// 悬空软链接：链接本身在（Lstat 成功）但目标没了（Stat 失败）。
+			// 报"文件不存在"是假信息——用户刚在列表里看到它。删除走 ResolveNoFollow。
+			if li, lerr := os.Lstat(real); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("链接已失效（目标不存在）: %s", p)
+			}
 			return "", fmt.Errorf("文件不存在: %s", p)
 		}
 	}
 
-	for _, root := range m.roots {
-		if real == root {
-			return real, nil
+	if !m.withinRoot(real) {
+		return "", fmt.Errorf("%w: %s（允许的根目录：%s）", ErrForbidden, p, strings.Join(m.roots, ", "))
+	}
+	return real, nil
+}
+
+// ResolveNoFollow 校验路径并返回**不跟随最后一段软链接**的路径（删除专用）。
+//
+// 存在性用 Lstat（链接本身在就算在）；白名单用"父目录真实路径 + 链接名"判定，
+// 中间路径的软链接全程解析（穿越根边界照旧 403）。返回的是条目本身，
+// os.Remove 它只删这一个条目，**绝不跟随链接去删目标**——比旧行为更安全。
+func (m *Manager) ResolveNoFollow(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", fmt.Errorf("%w: 路径为空", ErrForbidden)
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("%w: 路径含非法字符", ErrForbidden)
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("%w: 必须使用绝对路径", ErrForbidden)
+	}
+	clean := filepath.Clean(p)
+	if _, err := os.Lstat(clean); err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return "", err
 		}
-		if strings.HasPrefix(real, root+string(os.PathSeparator)) {
-			return real, nil
+		return "", fmt.Errorf("文件不存在: %s", p)
+	}
+	real := filepath.Join(resolveParent(filepath.Dir(clean)), filepath.Base(clean))
+	if !m.withinRoot(real) {
+		return "", fmt.Errorf("%w: %s（允许的根目录：%s）", ErrForbidden, p, strings.Join(m.roots, ", "))
+	}
+	return real, nil
+}
+
+// withinRoot 判断已解析的真实路径是否落在某个白名单根内（含根本身）。
+func (m *Manager) withinRoot(real string) bool {
+	for _, root := range m.roots {
+		if real == root || strings.HasPrefix(real, root+string(os.PathSeparator)) {
+			return true
 		}
 	}
-	return "", fmt.Errorf("%w: %s（允许的根目录：%s）", ErrForbidden, p, strings.Join(m.roots, ", "))
+	return false
 }
 
 // ---------- 数据结构 ----------
@@ -177,6 +217,9 @@ type Entry struct {
 	// Symlink 为 true 表示这是软链接；SymlinkTarget 是它指向的位置
 	Symlink       bool   `json:"symlink"`
 	SymlinkTarget string `json:"symlink_target"`
+	// SymlinkBroken 表示软链接的目标不存在（悬空链接）。条目照样列出，
+	// 只是前端要标"链接已失效"——报"文件不存在"或整条跳过都是假信息。
+	SymlinkBroken bool `json:"symlink_broken,omitempty"`
 	// ReadOnly 表示当前用户对该项没有写权限
 	ReadOnly bool `json:"read_only"`
 	// Sensitive 表示这一项落在"敏感目录"里（如面板数据目录：SQLite 库、
@@ -270,7 +313,12 @@ func (m *Manager) List(p string, showHidden bool) (*ListResult, error) {
 				e.Size = si.Size()
 				e.ReadOnly = !isWritable(filepath.Dir(full))
 			} else {
-				e.ReadOnly = true
+				// 悬空链接：目标没了也必须列出来。大小退回链接本身（Lstat），
+				// 并标 SymlinkBroken 让前端提示"链接已失效"。
+				e.SymlinkBroken = true
+				e.IsDir = false
+				e.Size = li.Size()
+				e.ReadOnly = !isWritable(filepath.Dir(full))
 			}
 		} else {
 			e.IsDir = li.IsDir()
@@ -429,7 +477,8 @@ func (m *Manager) Mkdir(p string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(real); err == nil {
+	// Lstat：悬空软链接也算"已存在"，别让 MkdirAll 顺着它去动目标位置。
+	if _, err := os.Lstat(real); err == nil {
 		return fmt.Errorf("已存在同名文件或目录")
 	}
 	if err := os.MkdirAll(real, 0o755); err != nil {
@@ -445,7 +494,9 @@ func (m *Manager) Touch(p string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(real); err == nil {
+	// Lstat：O_CREATE 会跟随软链接。悬空链接若按 Stat 判"不存在"，
+	// 这里就会在链接指向的位置（可能在根外）凭空建出文件 —— 必须挡住。
+	if _, err := os.Lstat(real); err == nil {
 		return fmt.Errorf("已存在同名文件")
 	}
 	f, err := os.OpenFile(real, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -460,8 +511,12 @@ func (m *Manager) Touch(p string) error {
 // Delete 删除文件或目录。
 //
 // 删除目录必须显式传 recursive=true —— 界面上也应该二次确认。
+//
+// 用 ResolveNoFollow + Lstat：**删的是条目本身，绝不跟随软链接去删目标**。
+// 这比旧实现更安全——旧实现经 Resolve 解析到链接目标，指向根内目录的链接
+// 会被连带删掉整棵目标树；悬空链接则因 Stat 失败被误报"文件不存在"。
 func (m *Manager) Delete(p string, recursive bool) error {
-	real, err := m.Resolve(p, false)
+	real, err := m.ResolveNoFollow(p)
 	if err != nil {
 		return err
 	}
@@ -712,6 +767,18 @@ func (m *Manager) SaveUploadAs(dir, relPath string, r io.Reader, overwrite bool)
 		return "", 0, false, fmt.Errorf("%w: %s", ErrForbidden, relPath)
 	}
 
+	// 悬空软链接：上面的 Resolve 解析不到目标，返回的就是链接路径本身，
+	// 而 O_CREATE 会跟随它、在链接指向的位置（可能根外）建文件。
+	// 覆盖语义下只删掉**悬空**的链接本身，再落一个普通文件；
+	// 能解析的软链接完全不受影响。
+	if overwrite {
+		if li, lerr := os.Lstat(final); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
+			if _, serr := os.Stat(final); serr != nil {
+				_ = os.Remove(final)
+			}
+		}
+	}
+
 	f, err := os.OpenFile(final, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return "", 0, false, fmt.Errorf("创建文件失败: %w", err)
@@ -809,8 +876,11 @@ func CleanRelPath(p string) (string, error) {
 }
 
 // uniquePath 在同名文件存在时追加 -1 / -2 后缀。
+//
+// 用 Lstat：悬空软链接也是一个占位条目，必须被当成"已存在"；
+// 否则上传会 O_CREATE 顺着它写到目标位置（可能在根外）。
 func uniquePath(p string) string {
-	if _, err := os.Stat(p); err != nil {
+	if _, err := os.Lstat(p); err != nil {
 		return p
 	}
 	dir, name := filepath.Split(p)
@@ -818,7 +888,7 @@ func uniquePath(p string) string {
 	base := strings.TrimSuffix(name, ext)
 	for i := 1; i < 1000; i++ {
 		cand := filepath.Join(dir, fmt.Sprintf("%s-%d%s", base, i, ext))
-		if _, err := os.Stat(cand); err != nil {
+		if _, err := os.Lstat(cand); err != nil {
 			return cand
 		}
 	}

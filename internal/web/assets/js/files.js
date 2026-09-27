@@ -1413,7 +1413,12 @@ export function FilesView(content, ctx = {}) {
           href: 'javascript:void(0)', text: e.name,
           title: '双击' + openLabel(e) + '（单击只选中）',
         }),
-      e.symlink ? h('span.pill', { text: '链接', title: '指向 ' + (e.symlink_target || '?') }) : null,
+      e.symlink ? h('span.pill' + (e.symlink_broken ? '.warn' : ''), {
+        text: e.symlink_broken ? '链接失效' : '链接',
+        title: e.symlink_broken
+          ? '链接已失效（目标不存在）：' + (e.symlink_target || '?')
+          : '符号链接 → ' + (e.symlink_target || '?'),
+      }) : null,
       e.read_only ? h('span.pill.warn', { text: '只读' }) : null,
       e.sensitive ? h('span.pill.danger', {
         text: '敏感',
@@ -1790,13 +1795,18 @@ export function FilesView(content, ctx = {}) {
       body: h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } }, [
         h('dl.kv', [
           h('dt', { text: '完整路径' }), h('dd', { text: e.path }),
-          h('dt', { text: '类型' }), h('dd', { text: e.is_dir ? '目录' : '文件' }),
+          h('dt', { text: '类型' }), h('dd', {
+            text: e.symlink ? (e.symlink_broken ? '符号链接（已失效）' : '符号链接') : (e.is_dir ? '目录' : '文件'),
+          }),
           h('dt', { text: '权限' }), h('dd', { text: e.mode + '（' + String(e.mode_num.toString(8)).padStart(3, '0') + '）' }),
           h('dt', { text: '属主' }), h('dd', { text: e.owner }),
           h('dt', { text: '大小' }), h('dd', { text: e.is_dir ? '—' : `${humanSize(e.size)}（${e.size} 字节）` }),
           h('dt', { text: '修改时间' }), h('dd', { text: e.mod_time }),
           e.symlink ? h('dt', { text: '指向' }) : null,
-          e.symlink ? h('dd', { text: e.symlink_target }) : null,
+          e.symlink ? h('dd', {
+            text: (e.symlink_target || '?') + (e.symlink_broken ? '（目标不存在）' : ''),
+            style: e.symlink_broken ? { color: 'var(--warn)' } : null,
+          }) : null,
         ]),
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' } }, buttons),
       ]),
@@ -2379,6 +2389,18 @@ export function FilesView(content, ctx = {}) {
   // ---------- 删除（走任务中心：大目录/海量小文件的删除也是分钟级动作） ----------
   async function deleteOne(e) {
     if (!await confirmSensitive([e], `删除「${e.name}」`)) return;
+    // 符号链接：只删链接本身，绝不跟随去删目标（后端 Delete 也保证这一点）。
+    // 按 is_dir 走"递归删目录"的措辞会骗人——链接里的内容一个都不会动。
+    if (e.symlink) {
+      if (!await confirmBox(
+        `确认删除符号链接「${e.name}」？\n\n只删除链接本身，不会删除它指向的内容。`,
+        { title: '删除链接', danger: true, okText: '删除链接' })) return;
+      await startFileOp({
+        kind: 'file_delete', title: `删除 ${e.name}`,
+        run: () => api.fileDelete([e.path], false),
+      });
+      return;
+    }
     if (e.is_dir) {
       const recursive = await confirmBox(
         `确认删除目录「${e.name}」及其中的全部内容？\n\n此操作不可撤销。`,
@@ -2408,7 +2430,7 @@ export function FilesView(content, ctx = {}) {
     if (!paths.length) return;
     const entries = (lastList?.entries || []).filter((e) => selection.has(e.path));
     if (!await confirmSensitive(entries, '删除这些内容')) return;
-    const hasDir = entries.some((e) => e.is_dir);
+    const hasDir = entries.some((e) => e.is_dir && !e.symlink);
     const msg = `将删除 ${paths.length} 项${hasDir ? '（包含目录，其中的内容会一并删除）' : ''}。\n\n此操作不可撤销。`;
     if (!await confirmBox(msg, { title: '批量删除', danger: true, okText: '确认删除' })) return;
     await startFileOp({

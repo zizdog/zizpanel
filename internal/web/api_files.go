@@ -816,18 +816,28 @@ func (r fileOpReq) pairs() []files.FilePair {
 
 // checkFileOpContainment 只读预检：每个路径都必须落在允许的根内。
 //
+// noFollowSource 为 true 时（删除）源用 ResolveNoFollow：悬空软链接目标不在、
+// 链接本身却在，Stat 口径会误报"文件不存在"而删不掉（实测镜像站 71 个悬空链接
+// 返回 400）；删除的也只是链接本身，所以按 Lstat 口径判定。
+//
 // 刻意**不**检查源是否存在：80 个文件里正好有一个刚被删掉时，整单 400
 // 会让另外 79 个白做；那种情况应该由任务逐条如实报失败。
 // 越界（ErrForbidden）是攻击特征/配置错误，必须当场 403 拒绝。
-func (s *Server) checkFileOpContainment(pairs []files.FilePair) error {
+func (s *Server) checkFileOpContainment(pairs []files.FilePair, noFollowSource bool) error {
 	if len(pairs) == 0 {
 		return fmt.Errorf("请选择要操作的内容")
 	}
 	mgr := s.fileManager()
 	for _, p := range pairs {
-		// 源必须**真实存在**：这样外接卷被 macOS 隐私保护拒绝时（stat 返回 EPERM）
+		// 源必须能判定：这样外接卷被 macOS 隐私保护拒绝时（Lstat 也返回 EPERM）
 		// 能当场 403 + 完整指引，而不是开一个注定失败的任务。
-		if _, err := mgr.Resolve(p.From, false); err != nil {
+		var err error
+		if noFollowSource {
+			_, err = mgr.ResolveNoFollow(p.From)
+		} else {
+			_, err = mgr.Resolve(p.From, false)
+		}
+		if err != nil {
 			return err
 		}
 		// 目标是"将要创建"的路径，允许不存在（但白名单照样生效）。
@@ -989,7 +999,7 @@ func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pairs := req.pairs()
-	if err := s.checkFileOpContainment(pairs); err != nil {
+	if err := s.checkFileOpContainment(pairs, false); err != nil {
 		failFileErr(w, err)
 		return
 	}
@@ -1021,7 +1031,7 @@ func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pairs := req.pairs()
-	if err := s.checkFileOpContainment(pairs); err != nil {
+	if err := s.checkFileOpContainment(pairs, false); err != nil {
 		failFileErr(w, err)
 		return
 	}
@@ -1116,7 +1126,8 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	for _, p := range req.Paths {
 		pairs = append(pairs, files.FilePair{From: p})
 	}
-	if err := s.checkFileOpContainment(pairs); err != nil {
+	// 删除的源按"不跟随最后一段软链接"判定：悬空链接也必须可删（删的只是链接本身）。
+	if err := s.checkFileOpContainment(pairs, true); err != nil {
 		failFileErr(w, err, req.Paths...)
 		return
 	}
