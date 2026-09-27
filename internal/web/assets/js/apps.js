@@ -700,8 +700,8 @@ export function AppsView(content, ctx = {}) {
     return null;
   }
 
-  // svcOfApp 找这个市场条目对应的服务记录（卡片上的「打开」在没给 port_url 时
-  // 要靠它拿服务端口）。按归一化 key 对齐 —— 与合并去重同一套规则。
+  // svcOfApp 找这个市场条目对应的服务记录（「打开」的地址兜底读它、
+  // 服务缺失时的「重新部署」判据也读它）。按归一化 key 对齐 —— 与合并去重同一套规则。
   function svcOfApp(a) {
     const key = appKeyOf(a);
     if (!key) return null;
@@ -1579,13 +1579,18 @@ export function AppsView(content, ctx = {}) {
       actions.push(...siteInstallButtons(a));
       if (a.docs_url) actions.push(docLink(a.docs_url));
     } else if (installed) {
-      // 「打开」的地址判定在 servicePanel.openTargetOf：支持子路径走子路径，
-      // 不支持走端口直连（port_url，或 location.hostname + 端口拼）。
+      // 「打开」的地址判定在 servicePanel.openTargetOf：**只认用户配的访问地址**
+      // （access_url，反代/局域网），没配就不给「打开」（用户 2026-09-27）。
       // 更新检查那一组按钮放在最前：确定有更新时「更新」是这张卡的主按钮。
       actions.push(...updateAction(a));
       // 「打开」or「重新部署」：服务缺失（plist 丢了/没注册成功）时打开指向的服务
       // 并不存在（点了必然 502），这一格改成真的能修的那一步（见 openOrRepairActions）。
-      actions.push(...openOrRepairActions(a, { svc: svcOfApp(a), onReinstall: () => openInstaller(a) }));
+      // 没配访问地址时这一格给「设置访问地址」，点了直接进本卡的管理面板并聚焦输入框。
+      actions.push(...openOrRepairActions(a, {
+        svc: svcOfApp(a),
+        onReinstall: () => openInstaller(a),
+        onConfigure: () => openAppDetail(a, { focusAccess: true }),
+      }));
       // 常用动作：启动/停止、重启、⟳ 刷新、⚙️ 管理（**同一份** serviceActions
       // 实现）。「⚙️ 管理」打开的是与「已安装」卡片**同一个**面板 ——
       // 配置文件编辑、凭据、日志、重装、文档、直链、卸载都在那里面。
@@ -1684,8 +1689,8 @@ export function AppsView(content, ctx = {}) {
 
   // 入口只有一颗「打开」（判定收敛到 servicePanel.openTargetOf / openOrRepairActions）：
   //   · 2026-09-17 起卡片只显示「打开」；
-  //   · 2026-09-24 别名访问下线后，「直链」与管理面板里那句"不支持子路径"提示一并删除
-  //     —— 打开本来就是端口地址，旧的「打开 / 直链」实现已整段删除。
+  //   · 2026-09-27 起「打开」只认用户配的访问地址（反代/局域网）；没配就改显示
+  //     「设置访问地址」，面板不再自己拼端口当打开目标。
 
   // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
   //
@@ -1697,13 +1702,12 @@ export function AppsView(content, ctx = {}) {
   //
   // 现在只有一个入口：**应用管理面板**（servicePanel.js）。卡片上给常用动作
   // （打开/启停/重启/刷新）+「⚙️ 管理」，「已安装」卡片点开的也是同一个面板。
-  // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / ui.slug /
-  // ui.console_only / 凭据接口是否为空），这里不再按应用 ID 写任何分支。
+  // 哪颗按钮出现仍然**全部由数据决定**（config_path / managed / access_url /
+  // 凭据接口是否为空），这里不再按应用 ID 写任何分支。
   //
-  // hasPanelUI 从 servicePanel.js 导入（与面板、「已安装」卡片**同一条判据**）；
-  // openAppDetail 不传 proxyState ——卡片上那颗「打开」的地址由数据
-  // （ui.slug / ui.prefer_direct / port_url）决定，与探测结果无关；
-  // 管理面板里也只给一颗「打开」（「直链」2026-09-24 已删）。
+  // openAppDetail 不传 proxyState ——卡片上那颗「打开」的地址只看
+  // access_url（用户配的反代/局域网地址），与探测结果无关；
+  // 管理面板里也只给一颗「打开」（没配地址时它就不出现）。
 
   // openAppDetail 打开「应用管理」面板 —— 市场卡片上唯一的"进面板"入口。
   //

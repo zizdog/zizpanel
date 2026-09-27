@@ -175,12 +175,23 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 	// config_path，前端只能按"没有路径"处理。配置路径是目录的静态属性，
 	// 与"面板有没有这条记录"无关，列表这里就该算出来。
 	views := make([]serviceDetail, 0, len(list))
+	// 访问地址整表读一次（settings KV），列表路径不再逐个查库。
+	accessURLs, accessErr := s.loadAppAccessURLs(r)
+	if accessErr != nil {
+		fail(w, http.StatusInternalServerError, accessErr.Error())
+		return
+	}
 	for _, v := range list {
 		d := serviceDetail{View: v}
+		appID := ""
 		if app, found := services.FindAppByService(v.Service); found {
+			appID = app.ID
 			d.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
 			d.AppID = app.ID
 		}
+		// 目录里没有这条应用（用户自建服务）时读**服务名键** —— 这类卡片同样要能配访问地址
+		// （见 api_app_access.go 的键规则）。
+		d.AccessURL = accessURLFor(accessURLs, appID, v.Service.Name)
 		views = append(views, d)
 	}
 
@@ -210,6 +221,9 @@ type serviceDetail struct {
 	*services.View
 	ConfigPath string `json:"config_path,omitempty"`
 	AppID      string `json:"app_id,omitempty"`
+	// AccessURL 是用户为这个目录条目填的访问地址（见 api_app_access.go）：
+	// 「已安装」列表可以直接读它，不必再单独拉一次市场列表。
+	AccessURL string `json:"access_url,omitempty"`
 }
 
 func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
@@ -222,10 +236,18 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 	}
 	// 只透出路径；真正的读写仍走既有的 /api/v1/files/read|write（白名单不变）。
 	detail := serviceDetail{View: v}
+	appID := ""
 	if app, ok := services.FindAppByService(v.Service); ok {
+		appID = app.ID
 		detail.ConfigPath = services.ConfigFilePath(app, s.Cfg.UserHome, s.Cfg.WorkDir)
 		detail.AppID = app.ID
 	}
+	urls, aerr := s.loadAppAccessURLs(r)
+	if aerr != nil {
+		fail(w, http.StatusInternalServerError, aerr.Error())
+		return
+	}
+	detail.AccessURL = accessURLFor(urls, appID, v.Service.Name)
 	ok(w, detail)
 }
 
@@ -873,6 +895,10 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// 但这个绝对地址有两个用处：显示给用户看，以及给 SelfConf 应用
 		// （如 phpMyAdmin，它的 location 只在 nginx 上）当打开入口。
 		ProxyURL string `json:"proxy_url,omitempty"`
+		// AccessURL 是用户自己填的访问地址（settings KV app_access_urls；反向代理或
+		// 局域网地址）。空 = 没配 —— 卡片上就不给「打开」，面板不再自己拼端口
+		// 当打开目标（用户 2026-09-27：家用几乎都走反代，端口直连多半打不开）。
+		AccessURL string `json:"access_url,omitempty"`
 		// Uninstall 是"这个应用该怎么卸载"的说明（步骤 + 可选删除的产物路径）。
 		// 给界面在确认框里如实展示 —— 卸载不可逆，用户必须知道具体会删什么。
 		Uninstall services.UninstallPlan `json:"uninstall"`
@@ -927,6 +953,13 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		InstalledVersion string `json:"installed_version,omitempty"`
 	}
 	lanIP := s.lanIP()
+	// 访问地址整表读一次（settings KV）：读不到就**如实报错**，绝不当作"都没配"
+	// （那会让卡片静默少一个入口 —— AGENTS 第三节 2：读不到就拒绝、绝不猜默认值）。
+	accessURLs, accessErr := s.loadAppAccessURLs(r)
+	if accessErr != nil {
+		fail(w, http.StatusInternalServerError, accessErr.Error())
+		return
+	}
 	apps := marketVisibleApps(services.Catalog())
 	out := make([]item, 0, len(apps))
 	for _, a := range apps {
@@ -1138,6 +1171,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			ServiceRepair:   services.ServiceRepairFor(a, isInstalled, adopted, serviceInLaunchd),
 			RuntimeBodyPath: runtimeBody.Path,
 			PortURL:         portURL, ProxyURL: proxyURL,
+			AccessURL:      accessURLs[a.ID],
 			DockerRuntime:  dockerRuntime,
 			ConfigAbs:      services.ConfigFilePath(a, s.Cfg.UserHome, s.Cfg.WorkDir),
 			EngineConflict: engineConflict,

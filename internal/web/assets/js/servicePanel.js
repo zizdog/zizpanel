@@ -4,7 +4,6 @@
 
 import { api } from './api.js';
 import { h, clear, stickyToast, toast, modal, confirmBox, appendAll } from './ui.js';
-import { panelPath } from './app.js';
 import { taskCenter } from './tasks.js';
 import {
   configFileModal, credentialsModal, openLogs, healthHint, loginCredsOf, appWidgets,
@@ -205,17 +204,6 @@ export function dedupeMarketEntries(list) {
   return [...byKey.values()];
 }
 
-// portDirectURL 用**当前访问面板的主机名** + 服务端口拼直链（后端不返回局域网 IP）。
-// 拼出来的通常可用，但服务可能只监听 127.0.0.1 或根本不是 HTTP 界面 —— 调用方必须在 title
-// 里如实写上这层不确定性。协议固定 http://（面板自己可能是 https，应用端口不是）。
-export function portDirectURL(port) {
-  const p = Number(port) || 0;
-  if (!p) return '';
-  const host = (typeof location !== 'undefined' && location.hostname) || '';
-  if (!host) return '';
-  return 'http://' + host + ':' + p + '/';
-}
-
 // ---------------------------------------------------------------------------
 //  卡片外壳：四个 Tab（已安装 / 应用市场 / docker / 一键建站）共用同一套 DOM
 // ---------------------------------------------------------------------------
@@ -261,38 +249,54 @@ export function appCardShell({
   ]);
 }
 
-// openTargetOf 计算卡片上的「打开」按钮指向哪里（用户 2026-09-17 第六条的唯一判定）：有 ui.slug →
-// "/<slug>/"；否则端口直连（优先 port_url）；两者都没有 → 没有入口。console_only **不给**任何入口；
-// self_conf（phpMyAdmin）必须走 panelPath（相对路径会打到 SPA 回落页）。返回 { href, subpath, port } 或 null。
-export function openTargetOf(m, opts = {}) {
-  const svc = opts.svc || null;
-  const ui = (m && m.ui) || null;
-  const slug = (ui && ui.slug) || '';
-  if (ui && ui.console_only) return null;
-  const port = (svc && svc.port) || (m && m.port) || 0;
-  const explicit = (m && m.port_url) || '';
-  const direct = explicit || portDirectURL(port);
-  if (ui && ui.self_conf && slug) {
-    const href = panelPath(slug + '/');
-    return { href, subpath: true, port, direct, title: '经面板打开（需先登录面板）：' + href };
-  }
-  if (hasPanelUI(m) && !(ui && ui.prefer_direct)) {
-    return { href: '/' + slug + '/', subpath: true, port, direct, title: '经面板的 /' + slug + '/ 打开' };
-  }
-  if (!direct) return null;
-  return {
-    href: direct, subpath: false, port, direct,
-    title: '打开它自己的端口：' + direct,
-  };
+// accessURLOf 取这条应用的**自定义访问地址**（市场条目优先，服务记录兜底）。
+// 空 = 用户还没配 —— 面板**不再**自己拼端口当打开目标（用户 2026-09-27）。
+export function accessURLOf(m, s = null) {
+  return String((m && m.access_url) || (s && s.access_url) || '').trim();
 }
 
-// openOnlyAction 渲染卡片上**唯一**的「打开」按钮（用户 2026-09-17："只显示打开，不显示直链"）。
-// 没有可用入口时返回空数组，绝不给出点开必然打不开的按钮。
+// accessKeyOf 取"存访问地址用的键"：目录 app id 优先（后端按目录 id 存）；
+// 目录里没有这条应用（用户自建服务）时回退成**服务名**（后端存成 svc:<服务名>，
+// 规则见 api_app_access.go）。两者都没有 → 空，前端就不给入口。
+export function accessKeyOf(m, s = null) {
+  const appID = String((m && (m.id || m.app_id)) || (s && s.app_id) || '').trim();
+  if (appID) return appID;
+  return String((s && s.name) || '').trim();
+}
+
+// accessPanelRef 给「设置访问地址」用：市场条目缺失（用户自建服务）时，用服务名
+// 拼一个最小条目交给管理面板（面板只需要键与当前地址）。拿不到键返回 null。
+export function accessPanelRef(m, s = null) {
+  if (m && (m.id || m.app_id)) return m;
+  const key = accessKeyOf(null, s);
+  if (!key) return null;
+  return { id: key, name: (s && (s.display_name || s.name)) || key, access_url: accessURLOf(null, s) };
+}
+
+// openTargetOf 计算卡片上的「打开」指向哪里 —— **唯一**的目标是用户配的访问地址
+// （反向代理 / 局域网地址）。没配就返回 null：绝不再回落端口直连或面板子路径
+// （用户 2026-09-27："直接默认加端口，实际是不可用的"）。返回 { href, title } 或 null。
+export function openTargetOf(m, opts = {}) {
+  const url = accessURLOf(m, opts.svc);
+  if (!url) return null;
+  return { href: url, title: '打开你设置的访问地址：' + url };
+}
+
+// openOnlyAction 渲染卡片上**唯一**的「打开」按钮。
+// 没配地址时**不显示任何"打开"入口**，改显示「设置访问地址」（点击进管理面板并聚焦输入框）。
+// 调用方不给 onConfigure（例如管理面板内部）时，未配地址就什么都不给。
 export function openOnlyAction(m, opts = {}) {
   const t = openTargetOf(m, opts);
-  if (!t) return [];
-  return [h('a.btn.btn-sm.btn-primary', {
-    href: t.href, target: '_blank', rel: 'noopener', text: '打开', title: t.title,
+  if (t) {
+    return [h('a.btn.btn-sm.btn-primary', {
+      href: t.href, target: '_blank', rel: 'noopener', text: '🌐 打开', title: t.title,
+    })];
+  }
+  if (typeof opts.onConfigure !== 'function') return [];
+  return [h('button.btn.btn-sm', {
+    text: '设置访问地址',
+    title: '这个应用还没有访问地址。填一个你实际访问它的地址（反向代理或局域网），卡片上才会出现「打开」',
+    onclick: () => opts.onConfigure(),
   })];
 }
 
@@ -319,12 +323,12 @@ export function serviceRepairButton(m, { onReinstall } = {}) {
 }
 
 // openOrRepairActions 决定卡片这一格给什么：**服务缺失时给「重新部署」**，
-// 否则给「打开」—— 打开指向的服务此刻并不存在（点了必然 502），
+// 否则给「打开」或「设置访问地址」—— 打开指向的服务此刻并不存在（点了必然 502），
 // 死按钮比没有按钮更糟。市场卡片与「已安装」卡片共用这一份判据。
-export function openOrRepairActions(m, { svc = null, onReinstall } = {}) {
+export function openOrRepairActions(m, { svc = null, onReinstall, onConfigure } = {}) {
   const rb = serviceRepairButton(m, { onReinstall });
   if (rb) return [rb];
-  return openOnlyAction(m, { svc });
+  return openOnlyAction(m, { svc, onConfigure });
 }
 
 // vendorImage 取 Docker 目录条目里的镜像名（在面板里显示"官方镜像是什么"）。
@@ -608,13 +612,18 @@ export function reinstallButton(m, { onReinstall, onDone } = {}) {
  * @returns {Promise<object>} modal 句柄
  */
 export async function openServicePanel(o = {}) {
-  const { market, svc, onDone, onReinstall, primaryText, primaryRun } = o;
+  const { market, svc, onDone, onReinstall, primaryText, primaryRun, focusAccess } = o;
   const m0 = market || null;
   const title = (svc && svc.display_name) || (m0 && m0.name) || '应用管理';
 
   const statusBox = h('div', [h('div.hint', { text: '正在读取服务状态…' })]);
+  const accessBox = h('div');
   const actionBox = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } });
   const detailBox = h('div', [h('div.hint', { text: '正在读取服务详情…' })]);
+  // 保存/清除后在**面板内**立即生效的值：不依赖调用方重新拉一次市场列表
+  // （列表刷新是异步的，等它会有一瞬间显示旧值）。null = 还没在本面板改过。
+  let accessSaved = null;
+  let accessFocused = false;
 
   const m = modal({
     // 标题 2026-09-16 改成「应用管理」：市场上通往它的按钮只剩「⚙️ 管理」，标题跟着按钮走。
@@ -622,7 +631,9 @@ export async function openServicePanel(o = {}) {
     wide: true,
     body: h('div', [
       statusBox,
-      h('div.section-title', { style: { marginTop: '4px' }, text: '操作' }),
+      h('div.section-title', { style: { marginTop: '4px' }, text: '访问地址（自定义）' }),
+      accessBox,
+      h('div.section-title', { style: { marginTop: '14px' }, text: '操作' }),
       actionBox,
       h('div.section-title', { style: { marginTop: '14px' }, text: '信息' }),
       detailBox,
@@ -669,8 +680,8 @@ export async function openServicePanel(o = {}) {
     // 只留「⟳ 刷新」：启停/重启在卡片上就有，重复摆一遍是噪音（用户 2026-09-24 要求去掉）。
     if (canControl) out.push(...serviceActions(s || mi, { onDone: afterAction, lifecycle: false, restart: false }));
 
-    // ③ 界面：**只给「打开」**（与卡片同一份判定）。「直链」已按用户要求去掉 ——
-    // 别名访问下线后"打开"本来就是端口地址，两颗按钮说的是同一件事。
+    // ③ 界面：**只给「打开」，且只认用户配的访问地址**（与卡片同一份判定）。
+    // 没配地址时这里什么都不给 —— 输入框就在上面，重复摆一颗是噪音。
     out.push(...openOnlyAction(mi, { svc: s }));
 
     // ③b 重装：卡片上不再直接给，统一收进管理面板。
@@ -826,6 +837,68 @@ export async function openServicePanel(o = {}) {
           ? h('div.hint', { text: health.message || '健康检查未在预算内返回：结果未确认，稍后刷新再看' })
           : null),
     );
+
+    // ---- 访问地址（自定义）----
+    // 卡片上的「打开」只认这个地址（用户 2026-09-27：家用都走反代/局域网，
+    // 端口直连多半打不开）。端口只作为**只读信息行**保留，不再是打开目标。
+    clear(accessBox);
+    const accessId = accessKeyOf(mi, s);
+    if (!accessId) {
+      // 既没有目录 id 也没有服务名（理论上不存在的条目）：后端没有可存的键 ——
+      // 不给点了必然 404 的输入框。
+      appendAll(accessBox, h('div.hint', { text: '读不到这个条目的标识，无法保存访问地址。' }));
+    } else {
+      const cur = accessSaved !== null ? accessSaved : accessURLOf(mi, s);
+      const input = h('input', {
+        type: 'text', value: cur, placeholder: 'https://demo.example.com/app/',
+        dataset: { testid: 'access-url-input' },
+        style: { flex: '1', minWidth: '180px' },
+      });
+      const errBox = h('div.hint', { style: { color: 'var(--danger)', display: 'none' } });
+      const showErr = (msg) => { errBox.textContent = msg || ''; errBox.style.display = msg ? '' : 'none'; };
+      const run = async (url, verb) => {
+        try {
+          const r = await api.marketAccessURLSet(accessId, url);
+          accessSaved = (r && r.access_url) || '';
+          showErr('');
+          input.value = accessSaved;
+          if (typeof onDone === 'function') onDone();
+          await afterAction();
+        } catch (e) {
+          // 后端的拒绝原因**原样**显示（400 = 非法地址），绝不吞掉。
+          showErr(verb + '失败：' + ((e && e.message) ? e.message : e));
+        }
+      };
+      const port = (s && s.port) || (mi && mi.port) || 0;
+      appendAll(accessBox,
+        h('div.hint', { text: '家里通常走反向代理或局域网地址；端口直连多半打不开' }),
+        h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } }, [
+          input,
+          h('button.btn.btn-sm.btn-primary', {
+            text: '保存', dataset: { testid: 'access-url-save' },
+            onclick: () => {
+              const v = String(input.value || '').trim();
+              // 空值不等同于"清除"：清除有独立的一颗按钮，避免误触把配好的地址删掉。
+              if (!v) { showErr('要清除访问地址请点「清除」'); return null; }
+              return run(v, '保存');
+            },
+          }),
+          h('button.btn.btn-sm', {
+            text: '清除', dataset: { testid: 'access-url-clear' },
+            title: '清掉这个应用的访问地址；卡片上的「打开」会一起消失',
+            onclick: () => run('', '清除'),
+          }),
+        ]),
+        errBox,
+        port > 0
+          ? h('div.hint', { text: '本机直连 http://127.0.0.1:' + port + '/（仅本机可用）' })
+          : null,
+      );
+      if (focusAccess && !accessFocused) {
+        accessFocused = true;
+        try { input.focus(); } catch { /* 聚焦失败不影响功能 */ }
+      }
+    }
 
     // ---- 操作 ----
     clear(actionBox);

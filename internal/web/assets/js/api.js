@@ -357,6 +357,10 @@ export const api = {
   marketUninstallForget: (id) =>
     request('DELETE', `${API_BASE}/market/${encodeURIComponent(id)}?forget=1`),
   marketPreflight: (id) => request('GET', `${API_BASE}/market/${encodeURIComponent(id)}/preflight`),
+  // 应用「访问地址（自定义）」：url 为空串 = 清除这一条。后端只接受 http/https，
+  // 非法地址 400 且带原因；id 不在目录里 404。卡片上的「打开」只认这个地址。
+  marketAccessURLSet: (id, url) =>
+    request('PUT', `${API_BASE}/market/access-url`, { id, url: String(url == null ? '' : url) }),
   // 按需检查"装了但镜像上有更新吗"（只对 supports_update_check 的条目有意义）。
   // 昂贵探测（打镜像索引 + 起 `--version` 子进程）只在用户打开市场时按需触发，
   // 列表接口本身**不做**探测。结果由前端按 checked_at 缓存 10 分钟；fresh=true 是

@@ -27,7 +27,7 @@ import { taskCenter } from './tasks.js';
 // servicePanel.js —— 与市场 / docker / 建站卡片、管理面板**同一份实现**。
 // mergeAppEntries（去重）与 appCardShell（卡片 DOM）逻辑都只此一份。
 import {
-  openServicePanel, openOrRepairActions, appCardShell,
+  openServicePanel, openOrRepairActions, appCardShell, accessPanelRef,
   mergeAppEntries, statusLine, marketQuickActions, portCheckNote,
 } from './servicePanel.js';
 
@@ -232,11 +232,10 @@ export function renderInstalledApps(container, opts = {}) {
     const longText = (m && m.description) || '';
     const text = longText && longText !== subtitle ? longText : '';
 
-    // 卡片上的动作组：**只有一颗「打开」**（用户 2026-09-17："只显示打开，
-    // 不显示直链"）+ 停止(启动)/重启/⟳ 刷新（serviceActions，经 marketQuickActions
-    // 统一给）+ ⚙️ 管理。
-    // 「打开」的判定在 servicePanel.openTargetOf：支持子路径走子路径，不支持走
-    // 端口直连；「直链」仍然住在「⚙️ 管理」面板里，卡片上不再出现。
+    // 卡片上的动作组：**只有一颗「打开」**（且只认用户配的访问地址）+ 停止(启动)/
+    // 重启/⟳ 刷新（serviceActions，经 marketQuickActions 统一给）+ ⚙️ 管理。
+    // 「打开」的判定在 servicePanel.openTargetOf：只认 access_url（反代/局域网），
+    // **没配就完全不显示「打开」**，改显示「设置访问地址」（用户 2026-09-27）。
     // 启停判据由 marketQuickActions 决定：有服务记录就一定给，否则看
     // adopted / service_in_launchd（跟市场卡片完全同一条规则）。
     // 更新徽标 / 「更新」按钮：结论与触发都在 apps.js（updateChecks 是那份模块级状态，
@@ -245,12 +244,21 @@ export function renderInstalledApps(container, opts = {}) {
     // 而更新入口当时只在「应用市场」Tab 上，等于"有新版用户看不见"。
     const updatePill = (typeof opts.updateBadgeOf === 'function') ? opts.updateBadgeOf(m) : null;
     const updateActs = (typeof opts.updateAction === 'function') ? opts.updateAction(m) : [];
+    const cfgRef = accessPanelRef(m, s);
 
     const actions = [
       ...updateActs,
       // 「打开」or「重新部署」：服务定义不在 launchd 里时，打开必然打不开 ——
       // 这一格改成唯一真的能修的那一步（判据来自后端 service_repair，坑 231）。
-      ...openOrRepairActions(m, { svc: s }),
+      // 没配访问地址时这一格是「设置访问地址」，点了直接进管理面板并聚焦输入框。
+      ...openOrRepairActions(m, {
+        svc: s,
+        ...(cfgRef ? {
+          onConfigure: () => openServicePanel({
+            market: cfgRef, svc: s, onDone: () => afterAction(), focusAccess: true,
+          }),
+        } : {}),
+      }),
       ...marketQuickActions(m, {
         svc: s,
         onDone: afterAction,

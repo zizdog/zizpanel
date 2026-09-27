@@ -522,6 +522,8 @@ func (s *Server) routes() http.Handler {
 
 	// ---------- 应用市场 ----------
 	root.HandleFunc("GET /api/v1/market", s.requireAuth(s.handleMarketList))
+	// 应用「访问地址（自定义）」：卡片上的「打开」只认它（见 api_app_access.go）。
+	root.HandleFunc("PUT /api/v1/market/access-url", s.requireAuth(s.handleMarketAccessURLSet))
 	root.HandleFunc("GET /api/v1/market/{id}/preflight", s.requireAuth(s.handleMarketPreflight))
 	// 按需检查"装了但镜像上有更新吗"（动态索引条目：单条强制复查；见 api_market_update.go）
 	root.HandleFunc("GET /api/v1/market/{id}/update-check", s.requireAuth(s.handleMarketUpdateCheck))
