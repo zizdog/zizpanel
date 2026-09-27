@@ -441,6 +441,12 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/backups/{name}", s.requireAuth(s.handleBackupDelete))
 	root.HandleFunc("GET /api/v1/backups/{name}/download", s.requireAuth(s.handleBackupDownload))
 
+	// ---------- 异地备份（SMTP / FTP / FTPS；入口在备份与计划任务两处）----------
+	root.HandleFunc("GET /api/v1/offsite", s.requireAuth(s.handleOffsiteGet))
+	root.HandleFunc("PUT /api/v1/offsite", s.requireAuth(s.handleOffsiteSave))
+	root.HandleFunc("POST /api/v1/offsite/test", s.requireAuth(s.handleOffsiteTest))
+	root.HandleFunc("POST /api/v1/offsite/send", s.requireAuth(s.handleOffsiteSend))
+
 	// ---------- 文件管理器 ----------
 	root.HandleFunc("GET /api/v1/files", s.requireAuth(s.handleFileList))
 	root.HandleFunc("GET /api/v1/files/read", s.requireAuth(s.handleFileRead))

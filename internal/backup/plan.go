@@ -251,6 +251,7 @@ func WorkCoveredNames() []string { return []string{"compose", "filebrowser"} }
 func WorkExcludedNames() map[string]string {
 	return map[string]string{
 		"backup":    "备份输出目录自身（否则越备越大）",
+		"offsite":   "异地发送账本：只记 <WorkDir>/backup 里哪些归档发过，而 backup 本身不进备份，恢复后没有意义",
 		"db-backup": "数据库导出暂存目录，可重建",
 		"services":  "服务代码可重新下载",
 		"upgrade":   "升级暂存包/看门狗，一次性产物",

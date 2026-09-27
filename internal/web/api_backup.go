@@ -224,6 +224,9 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	title := "立即备份（" + strings.Join(targets, ",") + "）"
+	// 备份成功后要追加"异地发送"任务，而那个任务在请求返回后才创建，
+	// 所以审计信息必须在这里抓（见 auditInfo 的说明）。
+	autoInfo := s.captureAudit(r)
 	s.launchTask(w, r, "backup", backupManualTarget, title, "backup_create",
 		func(ctx context.Context, log tasks.LogFunc) (any, error) {
 			logf := taskLogf(log)
@@ -241,6 +244,8 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 			for _, wrn := range res.Manifest.Warnings {
 				logf("warn", "%s", wrn)
 			}
+			// 异地备份配置启用时，备份完成后追加发送任务（失败不影响本地备份）。
+			s.maybeAutoOffsite(autoInfo, "立即备份")
 			return map[string]any{
 				"path": res.Path, "file_name": res.FileName, "size": res.Size,
 				"contains_secrets": res.Manifest.ContainsSecrets,

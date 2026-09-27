@@ -481,6 +481,12 @@ export const api = {
   // 下载用浏览器直接跳转（带 Cookie 认证），不要走 fetch 把大归档读进内存。
   backupDownloadURL: (name) => `${API_BASE}/backups/${encodeURIComponent(name)}/download`,
 
+  // ---- 异地备份（SMTP / FTP / FTPS；口令只在服务端，前端只拿到 password_set）----
+  offsite: () => request('GET', `${API_BASE}/offsite`),
+  offsiteSave: (payload) => request('PUT', `${API_BASE}/offsite`, payload),
+  offsiteTest: () => request('POST', `${API_BASE}/offsite/test`, {}),
+  offsiteSend: (payload) => request('POST', `${API_BASE}/offsite/send`, payload || {}),
+
   // ---- 文件管理 ----
   files: (path, hidden = false) =>
     request('GET', `${API_BASE}/files?path=${encodeURIComponent(path)}&hidden=${hidden ? 1 : 0}`),

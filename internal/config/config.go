@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/zizdog/zizpanel/internal/offsite"
 )
 
 // Config 是面板的完整运行时配置。
@@ -188,6 +190,12 @@ type Config struct {
 	// NotifyCertDays / NotifyDiskPercent 是两条规则的阈值。
 	NotifyCertDays    int `json:"notify_cert_days"`
 	NotifyDiskPercent int `json:"notify_disk_percent"`
+
+	// ---------- 异地备份（见 internal/offsite）----------
+	//
+	// 本地备份按配置自动发到异地（SMTP 邮件附件 / FTP / FTPS）。
+	// **口令只存在这里**（config.json，0600/root）：不进日志、审计、任务日志与 HTTP 响应。
+	Offsite *offsite.Settings `json:"offsite,omitempty"`
 
 	// ---------- 多机管理（C5，见 internal/web/api_peers.go）----------
 	//

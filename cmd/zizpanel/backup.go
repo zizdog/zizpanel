@@ -13,6 +13,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/backup"
 	"github.com/zizdog/zizpanel/internal/config"
+	"github.com/zizdog/zizpanel/internal/offsite"
 	"github.com/zizdog/zizpanel/internal/store"
 )
 
@@ -115,7 +116,40 @@ func cmdBackupCreate(args []string) error {
 	for _, w := range res.Manifest.Warnings {
 		fmt.Printf("  提示：%s\n", w)
 	}
+	// 计划任务的备份由 launchd 以独立进程执行（脚本只调本命令），
+	// 所以"备份完成后自动异地发送"这条触发在这里落地（与面板内自动发送同一套实现）。
+	autoOffsiteAfterBackup(ctx, cfg, dir)
 	return nil
+}
+
+// autoOffsiteAfterBackup 在本地备份成功后把新增归档发到异地。
+//
+// 异地发送失败**不改退出码**：退出码非 0 会让 cron 脚本打印"备份失败"，
+// 而本地备份其实已经成功 —— 那是谎报。失败原因逐条打印在任务日志里。
+func autoOffsiteAfterBackup(ctx context.Context, cfg *config.Config, dir string) {
+	if cfg.Offsite == nil || !cfg.Offsite.Enabled {
+		return
+	}
+	st := *cfg.Offsite
+	st.Normalize()
+	if err := st.Validate(); err != nil {
+		fmt.Printf("  提示：异地备份配置不完整，已跳过自动发送（%v）\n", err)
+		return
+	}
+	fmt.Printf("[%s] 异地备份：发送新增归档…\n", time.Now().Format("2006-01-02 15:04:05"))
+	ledger := filepath.Join(cfg.WorkDir, "offsite", "ledger.json")
+	res, err := offsite.DefaultSender().Send(ctx, st, dir, ledger, offsite.Options{},
+		nil, func(level, text string) { fmt.Printf("  [%s] %s\n", level, text) })
+	if err != nil {
+		fmt.Printf("  ⚠️ 异地发送未完成：%v（本地备份已完成，不受影响）\n", err)
+		return
+	}
+	if res.NoNew {
+		fmt.Println("  没有新增备份，未发送")
+		return
+	}
+	fmt.Printf("  异地发送结果：成功 %d，失败 %d，跳过 %d（本地备份不受影响）\n",
+		len(res.Sent), len(res.Failed), len(res.Skipped))
 }
 
 func cmdBackupVerify(args []string) error {

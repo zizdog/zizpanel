@@ -12,6 +12,7 @@ import { api } from './api.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll } from './ui.js';
 import { registerCleanup } from './app.js';
 import { taskCenter } from './tasks.js';
+import { openOffsiteModal } from './offsite.js';
 
 let cache = null;
 
@@ -71,6 +72,11 @@ export function CronView(content, ctx = {}) {
             load();
           } catch (e) { toast(e.message, 'err', 9000); }
         },
+      }),
+      h('button.btn.btn-sm', {
+        text: '🌐 异地备份',
+        title: '把新增的备份通过 SMTP / FTP 自动发到异地',
+        onclick: () => openOffsiteModal(load),
       }),
       h('button.btn.btn-primary.btn-sm', { text: '+ 新建任务', onclick: () => jobModal(null, load) }),
     );
@@ -168,21 +174,46 @@ export function CronView(content, ctx = {}) {
     let data = { list: [], dir: '', targets: [] };
     let loadErr = '';
     try { data = await api.backups() || data; } catch (e) { loadErr = e.message || String(e); }
+    // 异地备份状态：有本地备份却没配时，在入口旁给一句明确提示。
+    // 读不到状态就不提示（不影响备份列表本身的展示）。
+    let offsiteReady = false;
+    try {
+      const os = await api.offsite();
+      offsiteReady = !!(os && os.settings && os.settings.ready);
+    } catch { /* 忽略 */ }
 
     const head = h('div.card-head', [
       h('h3', { text: '已有备份' }),
       h('div.spacer'),
-      h('span.sub', { text: data.dir || '' }),
-      h('button.btn.btn-sm', {
-        text: '⬆ 上传备份恢复',
-        title: '上传本机或其他机器导出的 .tar.gz 备份归档（上传后立即校验 sha256，坏包会被拒绝）',
-        onclick: () => uploadBackup(data),
-      }),
-      h('button.btn.btn-primary.btn-sm', {
-        text: '立即备份',
-        title: '马上生成一份新的备份归档（数据库用一致性快照，带 sha256 清单）',
-        onclick: () => instantBackupModal(data),
-      }),
+      // 右侧说明 + 按钮必须能换行并且允许收缩：.card-head 本身不换行，
+      // 窄屏（390/360）下这几件东西会把页面顶宽（实测 390 溢出 85px）。
+      h('div', {
+        style: {
+          display: 'flex', gap: '8px', alignItems: 'center', justifyContent: 'flex-end',
+          flexWrap: 'wrap', minWidth: '0', flex: '0 1 auto',
+        },
+      }, [
+        h('span.sub', { style: { minWidth: '0', maxWidth: '100%' }, text: data.dir || '' }),
+        (!offsiteReady && (data.list || []).length) ? h('span.pill.warn', {
+          text: '还没配置异地备份',
+          title: '点旁边的「🌐 异地备份」配置：新增归档会自动通过 SMTP / FTP 发到异地',
+        }) : null,
+        h('button.btn.btn-sm', {
+          text: '🌐 异地备份',
+          title: '把新增的备份通过 SMTP / FTP 自动发到异地',
+          onclick: () => openOffsiteModal(renderBackups),
+        }),
+        h('button.btn.btn-sm', {
+          text: '⬆ 上传备份恢复',
+          title: '上传本机或其他机器导出的 .tar.gz 备份归档（上传后立即校验 sha256，坏包会被拒绝）',
+          onclick: () => uploadBackup(data),
+        }),
+        h('button.btn.btn-primary.btn-sm', {
+          text: '立即备份',
+          title: '马上生成一份新的备份归档（数据库用一致性快照，带 sha256 清单）',
+          onclick: () => instantBackupModal(data),
+        }),
+      ]),
     ]);
 
     const list = data.list || [];
