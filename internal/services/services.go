@@ -135,6 +135,10 @@ type State struct {
 	ExitCode int `json:"exit_code"`
 	// Endpoint 实际访问地址（若已知）
 	Endpoint string `json:"endpoint"`
+	// Listen / ListenAddr 是端口**真实监听范围**（见 priv.ClassifyListen）：
+	// loopback / all / lan / unknown。空 = 没探测（前端据此不显示任何直连提示）。
+	Listen     string `json:"listen,omitempty"`
+	ListenAddr string `json:"listen_addr,omitempty"`
 	// Warning 是"操作完成但结果没被确认"的如实说明（例如启动请求已发出、8 秒内
 	// 还没看到它跑起来）。界面必须显示它，否则用户会把"没确认"当成"已经好了"。
 	Warning string `json:"warning,omitempty"`

@@ -50,6 +50,7 @@ func TestProductPathHasNoLANMirrorAddress(t *testing.T) {
 		"internal/services/compose_reference_test.go": "compose 推荐项目的测试夹具",
 		"internal/services/pypi_mirror_test.go":       "pip 镜像参数的测试夹具",
 		"internal/services/syncthing_test.go":         "应用安装器的测试夹具",
+		"internal/priv/listen_scope_gate_test.go":     "端口监听范围门禁的 lsof 真实样本夹具（绑具体网卡的地址），与镜像无关",
 		"internal/web/api_audit_test.go":              "操作审计的测试夹具（来源 IP）",
 		"internal/web/api_docker_test.go":             "Docker 接口的测试夹具",
 		"internal/web/server_test.go":                 "IP 白名单/CIDR 判定的测试夹具",

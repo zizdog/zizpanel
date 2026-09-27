@@ -181,8 +181,10 @@ func (s *Server) handleServiceList(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, accessErr.Error())
 		return
 	}
+	// 本机局域网地址整表只查一次（每次都要 fork ipconfig）。
+	lanIP := s.lanIP()
 	for _, v := range list {
-		d := serviceDetail{View: v}
+		d := serviceDetail{View: v, LANIP: lanIP}
 		appID := ""
 		if app, found := services.FindAppByService(v.Service); found {
 			appID = app.ID
@@ -224,6 +226,8 @@ type serviceDetail struct {
 	// AccessURL 是用户为这个目录条目填的访问地址（见 api_app_access.go）：
 	// 「已安装」列表可以直接读它，不必再单独拉一次市场列表。
 	AccessURL string `json:"access_url,omitempty"`
+	// LANIP 是本机局域网地址（Server.lanIP）：端口在 all 上监听时直连提示要用它。
+	LANIP string `json:"lan_ip,omitempty"`
 }
 
 func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +252,7 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail.AccessURL = accessURLFor(urls, appID, v.Service.Name)
+	detail.LANIP = s.lanIP()
 	ok(w, detail)
 }
 

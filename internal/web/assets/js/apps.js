@@ -1585,11 +1585,11 @@ export function AppsView(content, ctx = {}) {
       actions.push(...updateAction(a));
       // 「打开」or「重新部署」：服务缺失（plist 丢了/没注册成功）时打开指向的服务
       // 并不存在（点了必然 502），这一格改成真的能修的那一步（见 openOrRepairActions）。
-      // 没配访问地址时这一格给「设置访问地址」，点了直接进本卡的管理面板并聚焦输入框。
+      // 没配访问地址时这一格什么都不给：地址在「⚙️ 管理」面板里填（用户 2026-09-27：
+      // 很多软件本来就没有打开入口）。
       actions.push(...openOrRepairActions(a, {
         svc: svcOfApp(a),
         onReinstall: () => openInstaller(a),
-        onConfigure: () => openAppDetail(a, { focusAccess: true }),
       }));
       // 常用动作：启动/停止、重启、⟳ 刷新、⚙️ 管理（**同一份** serviceActions
       // 实现）。「⚙️ 管理」打开的是与「已安装」卡片**同一个**面板 ——
@@ -1689,8 +1689,8 @@ export function AppsView(content, ctx = {}) {
 
   // 入口只有一颗「打开」（判定收敛到 servicePanel.openTargetOf / openOrRepairActions）：
   //   · 2026-09-17 起卡片只显示「打开」；
-  //   · 2026-09-27 起「打开」只认用户配的访问地址（反代/局域网）；没配就改显示
-  //     「设置访问地址」，面板不再自己拼端口当打开目标。
+  //   · 2026-09-27 起「打开」只认用户配的访问地址（反代/局域网）；没配就什么入口都不给，
+  //     面板不再自己拼端口当打开目标（地址在「⚙️ 管理」面板里填）。
 
   // ---------- 详情面板（卡片上的"全部动作"都收在这里）----------
   //

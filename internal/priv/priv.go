@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -1030,6 +1031,100 @@ type PortInfo struct {
 	Port    int      `json:"port"`
 	InUse   bool     `json:"in_use"`
 	Holders []string `json:"holders"`
+	// Listen 是端口的**真实监听范围**（见 ClassifyListen）：loopback / all / lan / unknown。
+	// 探测不到、权限不够、端口没在听一律 unknown —— 调用方据此宁可不提示，也不写死 127.0.0.1。
+	Listen string `json:"listen"`
+	// ListenAddr 仅在 Listen=="lan" 时给出绑定的具体地址。
+	ListenAddr string `json:"listen_addr,omitempty"`
+}
+
+// 端口真实监听范围的三态（+ unknown）。
+const (
+	ListenLoopback = "loopback" // 只听 127.0.0.1 / ::1
+	ListenAll      = "all"      // * / 0.0.0.0 / ::
+	ListenLAN      = "lan"      // 绑某个具体地址（另给 ListenAddr）
+	ListenUnknown  = "unknown"  // 探测不到 / 权限不够 / 端口没在听
+)
+
+// listenHost 从 lsof NAME 列取主机部分（`127.0.0.1:9876` / `[::1]:9876` / `*:9876`）。
+func listenHost(name string) string {
+	s := strings.TrimSpace(name)
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// ClassifyListen 判断监听地址集合的范围。判据只用 lsof NAME 列：
+// 任一 `*` / `0.0.0.0` / `::` ⇒ all；任一具体非回环地址 ⇒ lan（附该地址）；
+// 全是回环 ⇒ loopback；认不出来 ⇒ unknown。all 优先于 lan 优先于 loopback。
+func ClassifyListen(names []string) (string, string) {
+	scope, addr := ListenUnknown, ""
+	for _, raw := range names {
+		host := listenHost(raw)
+		if host == "" {
+			continue
+		}
+		switch host {
+		case "*", "0.0.0.0", "::", "[::]":
+			return ListenAll, ""
+		}
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() {
+			if scope == ListenUnknown {
+				scope = ListenLoopback
+			}
+			continue
+		}
+		if scope != ListenLAN {
+			scope, addr = ListenLAN, ip.String()
+		}
+	}
+	return scope, addr
+}
+
+// parseListenRows 解析 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 的输出：
+// 返回 holders（"cmd (pid N)"）与 NAME 列（监听地址）。
+func parseListenRows(out string) (holders, names []string) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return nil, nil
+	}
+	// 按表头定位 NAME 列：lsof 的 STATE（(LISTEN)）列可能有无，不能按"最后一个字段"猜。
+	nameIdx := -1
+	for i, f := range strings.Fields(lines[0]) {
+		if f == "NAME" {
+			nameIdx = i
+			break
+		}
+	}
+	for _, ln := range lines[1:] {
+		f := strings.Fields(ln)
+		if len(f) < 2 {
+			continue
+		}
+		holders = append(holders, f[0]+" (pid "+f[1]+")")
+		if nameIdx >= 0 && nameIdx < len(f) {
+			names = append(names, f[nameIdx])
+		}
+	}
+	return holders, names
+}
+
+// portInfoFromLsof 是 CheckPort 的纯解析部分（门禁用真实样本直接驱动它，不碰真实端口）。
+func portInfoFromLsof(out string, port int) PortInfo {
+	info := PortInfo{Port: port, Listen: ListenUnknown}
+	holders, names := parseListenRows(out)
+	if len(holders) == 0 {
+		return info
+	}
+	info.InUse = true
+	info.Holders = holders
+	info.Listen, info.ListenAddr = ClassifyListen(names)
+	return info
 }
 
 func CheckPort(portArg string) (PortInfo, error) {
@@ -1040,21 +1135,9 @@ func CheckPort(portArg string) (PortInfo, error) {
 	if p < 1 || p > 65535 {
 		return PortInfo{}, fmt.Errorf("端口超出范围: %d", p)
 	}
-	info := PortInfo{Port: p}
+	// lsof 无匹配时退出码为 1，这是正常的"端口空闲"（stderr 里也可能有权限报错）。
 	r := run("/usr/sbin/lsof", "-nP", fmt.Sprintf("-iTCP:%d", p), "-sTCP:LISTEN")
-	// lsof 无匹配时退出码为 1，这是正常的"端口空闲"
-	if strings.TrimSpace(r.stdout) == "" {
-		return info, nil
-	}
-	info.InUse = true
-	lines := strings.Split(strings.TrimSpace(r.stdout), "\n")
-	for _, ln := range lines[1:] {
-		f := strings.Fields(ln)
-		if len(f) >= 2 {
-			info.Holders = append(info.Holders, f[0]+" (pid "+f[1]+")")
-		}
-	}
-	return info, nil
+	return portInfoFromLsof(r.stdout, p), nil
 }
 
 // ---------- 防火墙 ----------

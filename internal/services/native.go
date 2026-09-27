@@ -74,11 +74,16 @@ func (d *nativeDriver) Status(ctx context.Context) (State, error) {
 	// 且带历史退出码 78；mysql 的 label 含 @ 曾直接校验失败。
 	// 这两种情况都会把好好的服务显示成"异常"，而端口检查都能救回来。
 	if d.svc.Port > 0 && portListening(ctx, d.svc.Port) {
+		// 监听范围按真实 lsof 结论给（探测不到就 unknown）；写死 127.0.0.1 会误导用户
+		// （ddns-go 在 * 上听，局域网其实能连，用户 2026-09-27 报障）。
+		scope, addr := portListenScope(d.svc.Port)
 		return State{
-			Status:   "running",
-			Running:  true,
-			Detail:   fmt.Sprintf("端口 %d 正在监听", d.svc.Port),
-			Endpoint: d.endpoint(),
+			Status:     "running",
+			Running:    true,
+			Detail:     fmt.Sprintf("端口 %d 正在监听", d.svc.Port),
+			Endpoint:   d.endpoint(),
+			Listen:     scope,
+			ListenAddr: addr,
 		}, nil
 	}
 
@@ -145,7 +150,7 @@ func (d *nativeDriver) statusByPort(ctx context.Context) (State, error) {
 	if err != nil {
 		return State{Status: "unknown", Detail: err.Error()}, nil
 	}
-	st := State{Endpoint: d.endpoint()}
+	st := State{Endpoint: d.endpoint(), Listen: info.Listen, ListenAddr: info.ListenAddr}
 	if info.InUse {
 		st.Running = true
 		st.Status = "running"
@@ -478,6 +483,19 @@ func portListening(ctx context.Context, port int) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// portListenScope 探测端口的真实监听范围（lsof，判据见 priv.ClassifyListen）。
+// 探测不到 / 权限不够 / 没在听 → unknown：调用方宁可不提示，也绝不说错。
+func portListenScope(port int) (string, string) {
+	if port <= 0 {
+		return priv.ListenUnknown, ""
+	}
+	info, err := priv.CheckPort(strconv.Itoa(port))
+	if err != nil || !info.InUse {
+		return priv.ListenUnknown, ""
+	}
+	return info.Listen, info.ListenAddr
 }
 
 // brewPath 返回 brew 可执行文件路径（macOS 上两种前缀都可能）。

@@ -82,6 +82,7 @@ func (d *commandDriver) Status(ctx context.Context) (State, error) {
 		st.PID = pid
 		st.Status = "running"
 		st.Detail = "由面板托管的子进程运行中（面板重启后该进程会停止）"
+		st.Listen, st.ListenAddr = portListenScope(d.svc.Port)
 		return st, nil
 	}
 	st.Status = "stopped"

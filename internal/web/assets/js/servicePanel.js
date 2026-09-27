@@ -264,15 +264,6 @@ export function accessKeyOf(m, s = null) {
   return String((s && s.name) || '').trim();
 }
 
-// accessPanelRef 给「设置访问地址」用：市场条目缺失（用户自建服务）时，用服务名
-// 拼一个最小条目交给管理面板（面板只需要键与当前地址）。拿不到键返回 null。
-export function accessPanelRef(m, s = null) {
-  if (m && (m.id || m.app_id)) return m;
-  const key = accessKeyOf(null, s);
-  if (!key) return null;
-  return { id: key, name: (s && (s.display_name || s.name)) || key, access_url: accessURLOf(null, s) };
-}
-
 // openTargetOf 计算卡片上的「打开」指向哪里 —— **唯一**的目标是用户配的访问地址
 // （反向代理 / 局域网地址）。没配就返回 null：绝不再回落端口直连或面板子路径
 // （用户 2026-09-27："直接默认加端口，实际是不可用的"）。返回 { href, title } 或 null。
@@ -283,20 +274,13 @@ export function openTargetOf(m, opts = {}) {
 }
 
 // openOnlyAction 渲染卡片上**唯一**的「打开」按钮。
-// 没配地址时**不显示任何"打开"入口**，改显示「设置访问地址」（点击进管理面板并聚焦输入框）。
-// 调用方不给 onConfigure（例如管理面板内部）时，未配地址就什么都不给。
+// **没配访问地址就什么都不给**（用户 2026-09-27）：地址在「⚙️ 管理」面板里填，
+// 卡片上不再摆「设置访问地址」——很多软件本来就没有打开入口。
 export function openOnlyAction(m, opts = {}) {
   const t = openTargetOf(m, opts);
-  if (t) {
-    return [h('a.btn.btn-sm.btn-primary', {
-      href: t.href, target: '_blank', rel: 'noopener', text: '🌐 打开', title: t.title,
-    })];
-  }
-  if (typeof opts.onConfigure !== 'function') return [];
-  return [h('button.btn.btn-sm', {
-    text: '设置访问地址',
-    title: '这个应用还没有访问地址。填一个你实际访问它的地址（反向代理或局域网），卡片上才会出现「打开」',
-    onclick: () => opts.onConfigure(),
+  if (!t) return [];
+  return [h('a.btn.btn-sm.btn-primary', {
+    href: t.href, target: '_blank', rel: 'noopener', text: '🌐 打开', title: t.title,
   })];
 }
 
@@ -323,12 +307,12 @@ export function serviceRepairButton(m, { onReinstall } = {}) {
 }
 
 // openOrRepairActions 决定卡片这一格给什么：**服务缺失时给「重新部署」**，
-// 否则给「打开」或「设置访问地址」—— 打开指向的服务此刻并不存在（点了必然 502），
-// 死按钮比没有按钮更糟。市场卡片与「已安装」卡片共用这一份判据。
-export function openOrRepairActions(m, { svc = null, onReinstall, onConfigure } = {}) {
+// 否则给「打开」（没配访问地址就什么都不给）—— 打开指向的服务此刻并不存在
+// （点了必然 502），死按钮比没有按钮更糟。市场卡片与「已安装」卡片共用这一份判据。
+export function openOrRepairActions(m, { svc = null, onReinstall } = {}) {
   const rb = serviceRepairButton(m, { onReinstall });
   if (rb) return [rb];
-  return openOnlyAction(m, { svc, onConfigure });
+  return openOnlyAction(m, { svc });
 }
 
 // vendorImage 取 Docker 目录条目里的镜像名（在面板里显示"官方镜像是什么"）。
@@ -336,6 +320,24 @@ function vendorImage(m) {
   const yaml = (m && m.compose_yaml) || '';
   const mm = yaml.match(/^\s*image:\s*(\S+)/m);
   return mm ? mm[1] : '';
+}
+
+// directHint 按端口**真实监听范围**给一句直连提示（scope 来自后端 priv.ClassifyListen）：
+// loopback ⇒ 本机；all / lan ⇒ 局域网；unknown / 探测不到 ⇒ 一句话都不说。
+// 以前这里写死 127.0.0.1 并说"仅本机可用"，对在 * 上监听的服务是错的（用户 2026-09-27 报障）。
+function directHint(st, port, lanIP) {
+  if (!(port > 0) || !st) return null;
+  const scope = String(st.listen || '');
+  if (scope === 'loopback') {
+    return '本机直连 http://127.0.0.1:' + port + '/（仅本机可用）';
+  }
+  // all 用本机局域网地址（后端 s.lanIP()）；lan 用 lsof 给出的真实绑定地址。
+  const raw = scope === 'lan' ? String(st.listen_addr || '')
+    : (scope === 'all' ? String(lanIP || '') : '');
+  if (!raw) return null;
+  // IPv6 字面量要加方括号才是合法 URL。
+  const host = raw.includes(':') ? '[' + raw.replace(/^\[|\]$/g, '') + ']' : raw;
+  return '局域网直连 http://' + host + ':' + port + '/';
 }
 
 // resolvePanelData 把调用方给的东西补全成"面板能完整渲染"的数据。
@@ -870,6 +872,7 @@ export async function openServicePanel(o = {}) {
         }
       };
       const port = (s && s.port) || (mi && mi.port) || 0;
+      const direct = directHint(st, port, s && s.lan_ip);
       appendAll(accessBox,
         h('div.hint', { text: '家里通常走反向代理或局域网地址；端口直连多半打不开' }),
         h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } }, [
@@ -890,9 +893,7 @@ export async function openServicePanel(o = {}) {
           }),
         ]),
         errBox,
-        port > 0
-          ? h('div.hint', { text: '本机直连 http://127.0.0.1:' + port + '/（仅本机可用）' })
-          : null,
+        direct ? h('div.hint', { text: direct }) : null,
       );
       if (focusAccess && !accessFocused) {
         accessFocused = true;
