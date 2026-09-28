@@ -93,6 +93,8 @@ func permItemTitle(id string) string {
 		return "完全磁盘访问权限"
 	case permissions.ItemRemovable:
 		return "可移除宗卷"
+	case permissions.ItemLocalNetwork:
+		return "本地网络"
 	}
 	if spec, ok := permLookupAppFn(id); ok {
 		if spec.Name != "" {
@@ -151,6 +153,26 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 		CanApply: hasConsole, LastCheckedAt: at, LastResult: res,
 		Targets:    mounts,
 		ManualPath: diskVolumeAuthManualPath(),
+	})
+
+	// 「本地网络」（macOS 15 隐私门）：面板是系统守护进程，通常不需要它 —— 所以
+	// "没预授权"**不是错误**（unknown + 说明），只有真访问局域网失败时才要处理。
+	// 申请入口在既有「系统设置 → 局域网访问」那套里，所以这里 CanApply=false。
+	lan := lanPreauthProbeFn(ctx)
+	lanStatus, lanHint := permissions.StatusUnknown, "未预授权；访问局域网（如挂 NAS）失败时再开"
+	switch {
+	case lan.Enabled:
+		lanStatus, lanHint = permissions.StatusGranted, "已预授权网段："+strings.Join(lan.CIDRs, "、")
+	case lan.Partial:
+		lanHint = "预授权只写了一半（不完整）；去「系统设置 → 局域网访问」重做一次"
+	}
+	items = append(items, permissions.Item{
+		ID: permissions.ItemLocalNetwork, Title: "本地网络（NAS / 局域网设备）",
+		Why:    "让面板与它拉起的应用访问局域网设备（例如挂载 SMB 共享）",
+		Status: lanStatus, StatusHint: lanHint, ConsoleUser: consoleUser, IsRemote: remote,
+		CanApply: false,
+		ManualPath: "去「系统设置 → 局域网访问」点一下写入预授权（对所有程序生效，需重启面板）；" +
+			"或到 系统设置 → 隐私与安全性 → 本地网络 给对应程序打开开关。",
 	})
 
 	for _, spec := range permRegistryFn() {

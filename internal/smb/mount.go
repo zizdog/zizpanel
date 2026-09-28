@@ -637,13 +637,15 @@ func classifyMount(out string, exit int, err error) (reason, msg, remedy string)
 	case strings.Contains(low, "share connection failed"):
 		return "share", "连上了 NAS，但共享不存在或账号无权访问。", "核对共享名（不是路径、不含斜杠）；在 NAS 上看这个账号的共享权限。"
 	case strings.Contains(low, "server connection failed") || exit == 68:
-		return "unreachable", "连不上 NAS（地址不对、网络不通、或 NAS 关机）。", "确认 NAS 地址可从本机 ping 通、共享服务已开；面板会按退避自动重试。"
+		return "unreachable", "连不上 NAS（地址不对、网络不通、或 NAS 关机）。", "确认 NAS 地址可从本机 ping 通、共享服务已开；面板会按退避自动重试。" +
+			"若网络确实通，看 macOS 15 的「本地网络」隐私门：面板 系统设置 → 局域网访问（需重启面板），或 系统设置 → 隐私与安全性 → 本地网络。"
 	case strings.Contains(low, "url parsing failed"):
 		return "bad_url", "NAS 地址或共享名不合法，mount_smbfs 拒绝解析。", "地址只填 IP/主机名；共享名不要带斜杠。"
 	case strings.Contains(low, "could not find mount point") || strings.Contains(low, "can't mount on"):
 		return "mount_point", "挂载点不可用：" + raw, "确认挂载点目录存在且面板有权限写它。"
 	case strings.Contains(low, "operation not permitted") || strings.Contains(low, "permission denied"):
-		return "denied", "系统拒绝了这次挂载（权限/隐私保护）。", "确认面板以 root 的 LaunchDaemon 运行。"
+		return "denied", "系统拒绝了这次挂载（权限/隐私保护）。", "确认面板以 root 的 LaunchDaemon 运行；" +
+			"也可能是 macOS 15 的「本地网络」门：面板 系统设置 → 局域网访问（需重启面板），或 系统设置 → 隐私与安全性 → 本地网络。"
 	case exit != 0:
 		return "failed", "mount_smbfs 失败（退出码 " + fmt.Sprint(exit) + "）：" + raw, "看下面的原样输出定位；改完点「重新挂载」。"
 	default:

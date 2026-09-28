@@ -1346,6 +1346,14 @@ finish() {
     printf '  %s⚠ 你要求写入的「免授权访问内网段」已写入，但要重启电脑才生效。%s\n' "$C_BOLD" "$C_RESET"
     printf '     重启前一切照旧（面板的 Plan B 回环转发器已经在工作），想生效就找时间重启一次。\n'
     printf '\n'
+  else
+    # 没预授权**不是错误**：面板是 launchd 系统守护进程，通常能直接访问局域网
+    # （「经面板转发」能通、Homebrew nginx 被拦就是这条）。这里只给"要不到时怎么开"。
+    printf '  局域网设备（NAS / SMB 共享）若报「连不上 / 被拒绝」，可能是 macOS 15 的「本地网络」隐私门：\n'
+    printf '    · 面板「系统设置 → 局域网访问」点一下（%s对所有程序生效，需重启面板%s）\n' "$C_BOLD" "$C_RESET"
+    printf '    · 或重装时带 %sZP_LAN_PREAUTH=1 ZP_LAN_CIDR=<你的网段>%s 预授权\n' "$C_BOLD" "$C_RESET"
+    printf '    · 或 系统设置 → 隐私与安全性 → 本地网络 给对应程序打开开关\n'
+    printf '\n'
   fi
 }
 

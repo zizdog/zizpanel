@@ -273,6 +273,7 @@ func (s *Server) handleSMBList(w http.ResponseWriter, r *http.Request) {
 		"notes": []string{
 			"网络盘挂在 " + s.customMountBase() + " 下（默认只读优先；Jellyfin 直接选这个目录即可）。",
 			"口令只存在面板数据库里，接口只回 password_set，日志与响应里都不会出现它。",
+			"挂载报「连不上/被拒绝」但网络确实通时，先看 macOS 15 的「本地网络」隐私门：面板 系统设置 → 局域网访问，或 系统设置 → 隐私与安全性 → 本地网络。",
 		},
 	}
 	if terr != nil {

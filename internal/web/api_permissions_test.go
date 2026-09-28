@@ -20,6 +20,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/permissions"
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/sysconfig"
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
@@ -82,6 +83,12 @@ func stubPermissionsEnv(t *testing.T, o permEnvOpts) *permCounters {
 	}
 	permConsoleUserFn = func() string { return o.consoleUser }
 	permVolumeMountsFn = func() []string { return o.mounts }
+	// 「本地网络」那一项会用局域网预授权探针：门禁里换成假的，绝不真的读偏好域。
+	prevLAN := lanPreauthProbeFn
+	lanPreauthProbeFn = func(context.Context) sysconfig.LANPreauthState {
+		return sysconfig.LANPreauthState{Supported: true, Readable: true}
+	}
+	t.Cleanup(func() { lanPreauthProbeFn = prevLAN })
 	permUserHomeFn = func(string) (string, error) { return "/Users/zizdog", nil }
 	permProbeFn = func(context.Context, []string) []permissions.PathResult {
 		c.probe++
@@ -190,8 +197,14 @@ func TestPermissionsCopyIsShort(t *testing.T) {
 
 	_, out, _ := doJSON(t, ts, "GET", "/api/v1/permissions", nil, cookies)
 	items := permItems(t, out)
-	if len(items) != 3 {
-		t.Fatalf("应有 3 项（完全磁盘访问 / 可移除宗卷 / 已装的假外部应用），实际 %d", len(items))
+	// 面板自己 3 项（完全磁盘访问 / 可移除宗卷 / 本地网络）+ 已装的假外部应用。
+	if len(items) != 4 {
+		t.Fatalf("应有 4 项（完全磁盘访问 / 可移除宗卷 / 本地网络 / 已装的假外部应用），实际 %d", len(items))
+	}
+	if it := permFindItem(t, out, permissions.ItemLocalNetwork); it == nil {
+		t.Errorf("「本地网络」那一项必须出现在权限页（NAS/SMB 要授权的就是这个门）")
+	} else if it["can_apply"] == true {
+		t.Errorf("「本地网络」的申请入口在「系统设置 → 局域网访问」，这一页不该给 apply 按钮")
 	}
 	for _, it := range items {
 		for _, field := range []string{"why", "status_hint"} {

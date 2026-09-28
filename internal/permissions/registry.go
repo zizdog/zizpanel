@@ -15,6 +15,9 @@ const (
 	ItemFullDisk  = "full_disk"
 	ItemRemovable = "removable"
 	ItemZizvideo  = "zizvideo"
+	// ItemLocalNetwork 是 macOS 15 的「本地网络」隐私门（访问 NAS/局域网设备），
+	// 走既有「系统设置 → 局域网访问」那套预授权，不是外部应用条目。
+	ItemLocalNetwork = "local_network"
 )
 
 // zizvideo 的冻结契约（注册表条目的取值来源）。
