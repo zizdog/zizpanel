@@ -2866,10 +2866,11 @@ export function FilesView(content, ctx = {}) {
               + '（上限 ' + r.maxrate_kbps + ' kbps）';
           } else {
             // 原始档的码率是"按这个文件的源分辨率建议"来的；被原片封顶时要写清楚。
+            const basis = r.suggested_from === 'rate70' ? '原片码率 70%' : '源分辨率';
             const bySource = !r.suggested_kbps ? ''
               : (r.video_kbps !== r.suggested_kbps
-                ? '（源分辨率建议 ' + r.suggested_kbps + ' kbps，已被原片封顶）'
-                : '（源分辨率建议）');
+                ? '（建议 ' + r.suggested_kbps + ' kbps，已被原片封顶）'
+                : '（按' + basis + '建议）');
             tune = codec + r.video_kbps + ' kbps' + bySource + (r.audio_disabled ? '（无音轨）' : '');
           }
           if (r.two_pass) tune += ' · 2-pass';
@@ -2979,9 +2980,11 @@ export function FilesView(content, ctx = {}) {
               return;
             }
             const r = (task && task.result) || {};
-            // 汇总文案由后端分开计数（压缩 / 原样放入 output / 其它跳过），前端不重算。
-            toast('视频压缩完成：' + (r.summary_text || ((r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过')),
-              r.failed ? 'warn' : 'ok', 14000);
+            // 汇总文案由后端分开计数（压缩 / 原样放入 output / 其它跳过），前端不重算；
+            // 末尾附上本次转码用时（后端给整句，细节在进度窗的日志里）。
+            toast('视频压缩完成：' + (r.summary_text || ((r.done || 0) + ' 个完成 / ' + (r.skipped || 0) + ' 个跳过'))
+              + (r.duration_text ? ' · ' + r.duration_text : ''),
+            r.failed ? 'warn' : 'ok', 14000);
             load(cwd);
           },
         });

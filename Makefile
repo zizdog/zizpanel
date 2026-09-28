@@ -100,7 +100,7 @@ test-short: ## 只跑单测（跳过真实系统采集）
 # 跳过时**打印版本+时间+指纹**，不是静默跳过。强制重跑：ZP_FORCE_CHECK=1 make check。
 .PHONY: check check-real
 check: ## 日常提交前检查（同一棵树跑过 ⇒ 按指纹跳过；ZP_FORCE_CHECK=1 强制）
-	@if [ "${ZP_FORCE_CHECK:-0}" != "1" ] && bash tools/check-stamp.sh verify >/dev/null 2>&1; then \
+	@if [ "$${ZP_FORCE_CHECK:-0}" != "1" ] && bash tools/check-stamp.sh verify >/dev/null 2>&1; then \
 	   echo "==> 跳过 make check：$$(bash tools/check-stamp.sh verify)"; \
 	 else \
 	   $(MAKE) --no-print-directory check-real; \
@@ -180,7 +180,7 @@ check-real:
 # 改一个字节就失效、强制重跑。显式重跑：ZP_FORCE_CHECK_FULL=1 make check-full。
 .PHONY: check-full
 check-full: ## 发版前全量检查（同一棵树跑过 ⇒ 按指纹跳过；ZP_FORCE_CHECK_FULL=1 强制）
-	@if [ "${ZP_FORCE_CHECK_FULL:-0}" != "1" ] && bash tools/check-stamp.sh verify-full >/dev/null 2>&1; then \
+	@if [ "$${ZP_FORCE_CHECK_FULL:-0}" != "1" ] && bash tools/check-stamp.sh verify-full >/dev/null 2>&1; then \
 	   echo "==> 全量检查跳过：$$(bash tools/check-stamp.sh verify-full)"; \
 	 else \
 	   $(MAKE) --no-print-directory check-full-real; \

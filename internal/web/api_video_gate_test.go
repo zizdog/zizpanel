@@ -37,6 +37,8 @@ type fakeVideoRunner struct {
 	probeErr error
 	// probeDelay 让探测变慢：门禁用它证明"接口没有在返回前做耗时探测"。
 	probeDelay time.Duration
+	// transcodeDelay 让"转码"慢一点：门禁据此断言结果里的耗时字段真的 > 0。
+	transcodeDelay time.Duration
 	// probeCount 数**真的探测了几次**（缓存命中不算）：探测缓存门禁的唯一判据。
 	// 用原子量：压缩任务在后台 goroutine 里探测，测试在任务结束后读取。
 	probeCount atomic.Int64
@@ -80,6 +82,9 @@ func (f *fakeVideoRunner) Probe(_ context.Context, path string) (videoopt.MediaI
 
 func (f *fakeVideoRunner) Transcode(_ context.Context, req videoopt.TranscodeRequest, onProgress func(videoopt.Progress)) error {
 	f.reqs = append(f.reqs, req)
+	if f.transcodeDelay > 0 {
+		time.Sleep(f.transcodeDelay)
+	}
 	if onProgress != nil {
 		onProgress(videoopt.Progress{Percent: 50, Speed: "2x"})
 		onProgress(videoopt.Progress{Percent: 100, Speed: "2x"})

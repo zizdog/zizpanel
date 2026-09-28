@@ -41,7 +41,7 @@ func argValue(args []string, flag string) string {
 // TestVideoPresetsGate 是这一条门禁。
 func TestVideoPresetsGate(t *testing.T) {
 	// ① 五档分辨率 + 1080p 建议码率常量 + 下拉暴露。
-	t.Run("① 分辨率五档（默认原始）且 1080p 建议码率进下拉", func(t *testing.T) {
+	t.Run("① 分辨率五档（默认 480p）且 1080p 建议码率进下拉", func(t *testing.T) {
 		got := map[string]videoopt.Preset{}
 		for _, p := range videoopt.Presets() {
 			got[p.ID] = p
@@ -54,10 +54,18 @@ func TestVideoPresetsGate(t *testing.T) {
 				t.Errorf("缺少档位 %q", id)
 			}
 		}
-		// 默认 = 原始（不缩放；"原始"的语义就是 CapHeight 不封顶）。
+		// 默认 = 480p（用户拍板：默认必须真的在压）。负向对照：改回 "source" ⇒ 红。
+		if videoopt.DefaultPresetID != "480p" {
+			t.Fatalf("默认档必须是 480p，实际 %q", videoopt.DefaultPresetID)
+		}
 		def, ok := videoopt.FindPreset(videoopt.DefaultPresetID)
-		if !ok || !videoopt.IsSourcePreset(def) || def.CapHeight != 0 {
-			t.Fatalf("默认档必须是「原始」（不缩放），实际 %+v", def)
+		if !ok || def.CapHeight != 480 {
+			t.Fatalf("默认档必须是把画面封顶到 480，实际 %+v", def)
+		}
+		// 「原始」档仍必须可用（不缩放，CapHeight=0）。
+		src, ok := videoopt.FindPreset(videoopt.PresetSource)
+		if !ok || !videoopt.IsSourcePreset(src) || src.CapHeight != 0 {
+			t.Fatalf("「原始」档必须存在且不缩放，实际 %+v", src)
 		}
 		// 建议码率常量（网络视频能用下限，实测经验值）必须存在且被下拉暴露。
 		if videoopt.Kbps360p != 400 || videoopt.Kbps480p != 800 ||
@@ -78,7 +86,7 @@ func TestVideoPresetsGate(t *testing.T) {
 		}
 		// 原始档默认项是"按源分辨率建议"（0 = 逐文件取档位下限），不是"跟随原片"
 		//（跟随原片 = 实际码率被压到原码率×0.95 ⇒ 封顶即跳过，默认就什么都压不了）。
-		sc := videoopt.BitrateChoices(def)
+		sc := videoopt.BitrateChoices(src)
 		if len(sc) < 2 || sc[0].KBps != 0 || !strings.Contains(sc[0].Hint, "1080p→3000") {
 			t.Errorf("原始档码率下拉默认项应为「按源分辨率建议」（0，含档位映射细节），实际 %+v", sc)
 		}
@@ -111,8 +119,10 @@ func TestVideoPresetsGate(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatal(err)
 		}
-		if resp.Data.Preset != videoopt.PresetSource {
-			t.Errorf("接口默认档位必须是 %q，实际 %q", videoopt.PresetSource, resp.Data.Preset)
+		// 默认档位 = 480p（用户拍板：默认必须真的在压）。
+		// 负向对照：改回 "source" ⇒ 这条立刻红。
+		if videoopt.DefaultPresetID != "480p" || resp.Data.Preset != "480p" {
+			t.Errorf("默认档位必须是 480p（常量=%q 接口=%q）", videoopt.DefaultPresetID, resp.Data.Preset)
 		}
 		if len(resp.Data.Presets) != 5 {
 			t.Errorf("接口必须回 5 档，实际 %d", len(resp.Data.Presets))
@@ -133,10 +143,23 @@ func TestVideoPresetsGate(t *testing.T) {
 		if resp.Data.EncoderCodec != "libx264" {
 			t.Errorf("CPU 档的 -c:v 必须是 libx264，实际 %q", resp.Data.EncoderCodec)
 		}
-		// 默认（原始 + 目标码率）不能是"跟随原片"（那等于封顶即跳过、默认什么都不压）：
-		// 下拉默认项必须是 0 = 按源分辨率建议。
-		if len(resp.Data.BitrateChoices) < 2 || resp.Data.BitrateChoices[0].KBps != 0 {
-			t.Errorf("原始档码率下拉默认项应为「按源分辨率建议」（0），实际 %+v", resp.Data.BitrateChoices)
+		// 默认 480p 的下拉必须给出 800 kbps（档位下限）。
+		if len(resp.Data.BitrateChoices) == 0 || resp.Data.BitrateChoices[0].KBps != videoopt.Kbps480p {
+			t.Errorf("480p 档码率下拉首项应为 %d，实际 %+v", videoopt.Kbps480p, resp.Data.BitrateChoices)
+		}
+		// 「原始」档的下拉默认项必须是 0 = 按建议值（不是"跟随原片"=封顶即跳过）。
+		recSrc := postVideoJSON(t, srv.handleFileVideoPlan,
+			map[string]any{"dir": srv.Cfg.WWWRoot, "preset": "source", "mode": "bitrate"})
+		var respSrc struct {
+			Data struct {
+				BitrateChoices []struct {
+					KBps int `json:"kbps"`
+				} `json:"bitrate_choices"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(recSrc.Body.Bytes(), &respSrc)
+		if len(respSrc.Data.BitrateChoices) < 2 || respSrc.Data.BitrateChoices[0].KBps != 0 {
+			t.Errorf("原始档码率下拉默认项应为建议值（0），实际 %+v", respSrc.Data.BitrateChoices)
 		}
 		dir1080 := filepath.Join(srv.Cfg.WWWRoot, "presets1080")
 		if err := os.MkdirAll(dir1080, 0o755); err != nil {
@@ -332,13 +355,14 @@ func TestVideoPresetsGate(t *testing.T) {
 		}
 	})
 
-	// ⑥ 默认组合（原始 + 目标码率）下，码率建议**逐文件按源分辨率**取档位下限。
-	//    负向对照：① 默认仍是 CRF ⇒ 这里拿不到 SuggestedKbps；② 建议值写死成常数 ⇒ 三档数值相同 ⇒ 红。
-	t.Run("⑥ 原始+目标码率的建议码率按源分辨率取档", func(t *testing.T) {
+	// ⑥「原始」档的建议码率 = min(该源分辨率的档位建议, 源码率×0.7)（用户拍板 A 方案），
+	//    且这种建议值**不会**被判"封顶即跳过"（真的会转码）。
+	//    负向对照：只取档位建议（忽略 ×0.7）⇒ 三个用例的数值全错 + 1500k 的 720p 会被封顶 ⇒ 红。
+	t.Run("⑥ 原始档建议值 = min(档位建议, 源×0.7) 且不被封顶", func(t *testing.T) {
 		if videoopt.DefaultMode != videoopt.ModeBitrate {
 			t.Fatalf("默认模式必须是目标码率，实际 %q（负向对照：默认 CRF 时这条会红）", videoopt.DefaultMode)
 		}
-		// 映射本身：1080p/720p/480p/360p 与竖屏（按宽）、两档之间取更接近的档。
+		// 档位映射本身（源码率给到足够高，让"×0.7"那一档不生效）。
 		for _, c := range []struct {
 			w, h, want int
 			name       string
@@ -354,58 +378,146 @@ func TestVideoPresetsGate(t *testing.T) {
 			{1280, 576, 800, "576 落在 480/720 之间 ⇒ 取更接近的 480 档"},
 			{1280, 640, 1500, "640 落在 480/720 之间 ⇒ 取更接近的 720 档"},
 		} {
-			if got := videoopt.SuggestedKBps(c.w, c.h); got != c.want {
+			if got := videoopt.SuggestedKBps(c.w, c.h, 100000); got != c.want {
 				t.Errorf("%s：建议 %d kbps，期望 %d", c.name, got, c.want)
+			}
+		}
+		// 用户拍板的三个数：min(档位建议, 源码率×0.7)。
+		for _, c := range []struct {
+			w, h, srcKbps, want int
+			name                string
+		}{
+			{1280, 720, 1500, 1050, "1500k 的 720p ⇒ min(1500, 1050)"},
+			{1920, 1080, 3000, 2100, "3000k 的 1080p ⇒ min(3000, 2100)"},
+			{854, 480, 250, 175, "250k 的 480p ⇒ min(800, 175)"},
+			// 源码率很高时仍然是档位建议。
+			{1280, 720, 12000, 1500, "12000k 的 720p ⇒ min(1500, 8400)=1500"},
+		} {
+			if got := videoopt.SuggestedKBps(c.w, c.h, c.srcKbps); got != c.want {
+				t.Errorf("%s：建议 %d，期望 %d", c.name, got, c.want)
 			}
 		}
 
 		pSource, _ := videoopt.FindPreset(videoopt.PresetSource)
-		cases := []struct {
-			w, h     int
-			wantKbps int
+		// 端到端：这三档建议值都必须**不被封顶、真的能压**（负向对照：只取档位建议 ⇒ 1500 那档被跳过）。
+		for _, c := range []struct {
+			w, h, srcKbps, want int
 		}{
-			{1920, 1080, videoopt.Kbps1080p},
-			{1280, 720, videoopt.Kbps720p},
-			{854, 480, videoopt.Kbps480p},
-		}
-		seen := map[int]bool{}
-		for _, c := range cases {
+			{1280, 720, 1500, 1050},
+			{1920, 1080, 3000, 2100},
+			{854, 480, 250, 175},
+		} {
 			info := videoopt.MediaInfo{
-				Width: c.w, Height: c.h, DurationSec: 10, FileBytes: 8 << 20,
-				// 源码率给得很高 ⇒ 不封顶，看得到纯粹的建议值。
-				VideoKbps: 12000, HasVideo: true,
+				Width: c.w, Height: c.h, DurationSec: 10, FileBytes: 4 << 20,
+				VideoKbps: c.srcKbps, HasVideo: true,
 			}
 			p := videoopt.PlanOne("v.mp4", "/tmp/v.mp4", "/tmp/out", info, videoopt.Options{
-				Preset: pSource, Mode: videoopt.ModeBitrate, // 空 KBps = 默认"按源分辨率建议"
+				Preset: pSource, Mode: videoopt.ModeBitrate, // 空 KBps = 默认建议值
 			}, false)
-			if p.SkipReason != "" {
-				t.Fatalf("%dx%d：不该跳过（%s）", c.w, c.h, p.SkipReason)
+			if !p.Runnable() {
+				t.Fatalf("%dx%d/源 %d kbps：建议值下必须能压（真的转码），实际跳过=%q（建议 %d）",
+					c.w, c.h, c.srcKbps, p.SkipReason, p.SuggestedKbps)
 			}
-			if p.SuggestedKbps != c.wantKbps || p.VideoKbps != c.wantKbps {
-				t.Errorf("%dx%d：建议 %d / 实际 %d，期望都是 %d",
-					c.w, c.h, p.SuggestedKbps, p.VideoKbps, c.wantKbps)
+			if p.Capped {
+				t.Errorf("%dx%d/源 %d kbps：建议值不该触发封顶（建议 %d / 实际 %d）",
+					c.w, c.h, c.srcKbps, p.SuggestedKbps, p.VideoKbps)
 			}
-			if p.Note == "" {
-				t.Errorf("%dx%d：计划行必须有一句说明（面板要看得出用了哪个建议值）", c.w, c.h)
+			if p.SuggestedKbps != c.want || p.VideoKbps != c.want {
+				t.Errorf("%dx%d/源 %d kbps：建议 %d / 实际 %d，期望 %d",
+					c.w, c.h, c.srcKbps, p.SuggestedKbps, p.VideoKbps, c.want)
 			}
-			seen[p.VideoKbps] = true
-		}
-		// 负向对照自检：三档必须真的不同（写死常数时这里只剩 1 个值 ⇒ 红）。
-		if len(seen) != 3 {
-			t.Errorf("三档源分辨率的建议值必须不同，实际只有 %d 种：%v", len(seen), seen)
+			// 计划行必须写清依据（面板 title/说明要能看出是"原片 70%"还是"源分辨率"）。
+			if p.SuggestedFrom != "rate70" {
+				t.Errorf("%dx%d：建议依据应为 rate70，实际 %q（note=%q）", c.w, c.h, p.SuggestedFrom, p.Note)
+			}
+			if !strings.Contains(p.Note, "70%") || !strings.Contains(p.Note, "建议") {
+				t.Errorf("%dx%d：说明必须写清「按原片 70%%」的依据，实际 %q", c.w, c.h, p.Note)
+			}
 		}
 
-		// 源码率低时照旧封顶：建议 1500、原码率只有 1000 ⇒ 实际 ≤ 950 且标跳过。
+		// 用户**手动**把码率拉到 ≥ 原片×0.95 时，封顶即跳过的规则照旧不变。
 		low := videoopt.PlanOne("low.mp4", "/tmp/low.mp4", "/tmp/out", videoopt.MediaInfo{
 			Width: 1280, Height: 720, DurationSec: 10, FileBytes: 1 << 20,
 			VideoKbps: 1000, HasVideo: true,
-		}, videoopt.Options{Preset: pSource, Mode: videoopt.ModeBitrate}, false)
+		}, videoopt.Options{Preset: pSource, KBps: 2000, Mode: videoopt.ModeBitrate}, false)
 		if !low.Capped || low.VideoKbps > 950 || !low.PlaceInOutput {
-			t.Errorf("建议值也要受原码率封顶：capped=%v kbps=%d place=%v（建议 %d）",
-				low.Capped, low.VideoKbps, low.PlaceInOutput, low.SuggestedKbps)
+			t.Errorf("手动码率 ≥ 原片×0.95 仍要封顶即跳过：capped=%v kbps=%d place=%v",
+				low.Capped, low.VideoKbps, low.PlaceInOutput)
 		}
-		if low.SuggestedKbps != videoopt.Kbps720p {
-			t.Errorf("封顶行仍要如实记录建议值 %d，实际 %d", videoopt.Kbps720p, low.SuggestedKbps)
+	})
+
+	// ⑧ 本次转码用时：结果里带总耗时与单文件耗时，进度窗最终文案也带上。
+	//    负向对照：不填耗时（DurationText 空 / DurationSec=0）⇒ 这条红。
+	t.Run("⑧ 本次转码用时写进结果与进度", func(t *testing.T) {
+		// 文案格式（用户给的例子：1 分 23 秒）。
+		if got := videoopt.SummaryDurationText(83*time.Second, 3); got != "本次转码用时 1 分 23 秒（3 个文件）" {
+			t.Errorf("耗时文案不对：%q", got)
+		}
+		if got := videoopt.FormatDuration(83 * time.Second); got != "1 分 23 秒" {
+			t.Errorf("FormatDuration(83s)=%q", got)
+		}
+		if got := videoopt.FormatDuration(30 * time.Millisecond); got != "<1 秒" {
+			t.Errorf("亚秒不该谎报 0 秒：%q", got)
+		}
+
+		srv, _ := newTestServer(t)
+		dir := filepath.Join(srv.Cfg.WWWRoot, "timing")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		info := videoopt.MediaInfo{
+			Width: 1280, Height: 720, DurationSec: 3, FileBytes: 4000,
+			VideoKbps: 4000, HasVideo: true,
+		}
+		fake := &fakeVideoRunner{outBytes: 100, transcodeDelay: 30 * time.Millisecond, infos: map[string]videoopt.MediaInfo{}}
+		for _, n := range []string{"a.mp4", "b.mp4"} {
+			p := filepath.Join(dir, n)
+			if err := os.WriteFile(p, bytes.Repeat([]byte{5}, 4000), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fake.infos[p] = info
+		}
+		withFakeVideoRunner(t, fake)
+
+		rec := postVideoJSON(t, srv.handleFileVideoCompress, map[string]any{"dir": dir, "preset": "480p", "kbps": 800})
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("必须 202：%d %s", rec.Code, rec.Body.String())
+		}
+		var accepted struct {
+			Data struct {
+				TaskID string `json:"task_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil || accepted.Data.TaskID == "" {
+			t.Fatalf("没有拿到 task_id：%s", rec.Body.String())
+		}
+		task := srv.Tasks.Get(accepted.Data.TaskID)
+		select {
+		case <-task.Done():
+		case <-time.After(15 * time.Second):
+			t.Fatal("任务没结束")
+		}
+		res, ok := task.Meta().Result.(*videoopt.RunResult)
+		if !ok || res == nil {
+			t.Fatalf("任务结果类型不对：%#v", task.Meta().Result)
+		}
+		if res.DurationSec <= 0 || res.DurationText == "" {
+			t.Errorf("结果必须带本次总耗时：sec=%v text=%q", res.DurationSec, res.DurationText)
+		}
+		if !strings.Contains(res.DurationText, "本次转码用时") || !strings.Contains(res.DurationText, "2 个文件") {
+			t.Errorf("总耗时文案不对：%q", res.DurationText)
+		}
+		if len(res.Items) != 2 {
+			t.Fatalf("应处理 2 个文件，实际 %d", len(res.Items))
+		}
+		for _, it := range res.Items {
+			if it.DurationSec <= 0 || it.DurationText == "" {
+				t.Errorf("%s 必须带单文件耗时：%v/%q", it.Name, it.DurationSec, it.DurationText)
+			}
+		}
+		// 进度窗最终文案必须能看到耗时（用户点名）。
+		if p := task.Progress(); p == nil || !strings.Contains(p.Message, "本次转码用时") {
+			t.Errorf("进度窗最终文案必须带耗时，实际 %+v", task.Progress())
 		}
 	})
 

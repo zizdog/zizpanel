@@ -57,12 +57,27 @@ var sourceTiers = []struct{ Side, KBps int }{
 	{360, Kbps360p}, {480, Kbps480p}, {720, Kbps720p}, {1080, Kbps1080p},
 }
 
-// SuggestedKBps 按**这个文件**的源分辨率给建议码率（原始档不缩放，只能按画面尺寸估）。
+// SuggestedKBps 是「原始」档的建议码率：**min(该源分辨率的档位建议, 源码率×0.7)**。
 //
-// 封顶边与 targetSize 同口径：横屏取高、竖屏取宽。源落在两档之间时取更接近的那一档
-// （正好居中取上限档，宁可清晰些）；低于 360 取 400，高于 1080 取 3000。
-// 结果照旧受"≤ 原码率×0.95"封顶，封顶后是否跳过仍由 PlanOne 决定（规则不变）。
-func SuggestedKBps(w, h int) int {
+// 用户拍板的口径（A 方案）：档位建议按源分辨率取（封顶边与 targetSize 同口径：
+// 横屏取高、竖屏取宽；落在两档之间取更接近的那一档，正好居中取上限档；低于 360 取 400、
+// 高于 1080 取 3000），再用源码率×0.7 压一档 —— 这样常见源（如 720p/1500k）
+// 建议 1050 而不是 1500，**不会被"封顶即跳过"整片跳过**，真的能压小约 30%。
+//
+// 0.7 < 0.95（bitrateSafety）⇒ 建议值天然不会触发封顶；
+// 用户**手动**把码率拉到 ≥ 原片×0.95 时，封顶即跳过的规则照旧不变（判据在 planBitrates）。
+func SuggestedKBps(w, h, srcKbps int) int {
+	sug := tierKBps(w, h)
+	if srcKbps > 0 {
+		if byRate := int(math.Floor(float64(srcKbps) * sourceRateFactor)); byRate > 0 && byRate < sug {
+			return byRate
+		}
+	}
+	return sug
+}
+
+// tierKBps 只按源分辨率给档位建议（不含"源码率×0.7"那一档）。
+func tierKBps(w, h int) int {
 	side := h
 	if w > 0 && w < h {
 		side = w
@@ -90,8 +105,11 @@ func Presets() []Preset {
 	return out
 }
 
-// DefaultPresetID 是默认档位：原始（不动分辨率，用户点名）。
-const DefaultPresetID = PresetSource
+// DefaultPresetID 是默认档位：480p。
+//
+// 为什么不是「原始」：用户拍板 —— 「原始 + 目标码率」在常见源上会因"封顶即跳过"
+// 整片跳过（实测 `压缩 0 个 · 原样放入 output 2 个`），默认必须真的在压。
+const DefaultPresetID = "480p"
 
 // IsSourcePreset 判断这一档是不是"原始"（不缩放）。
 func IsSourcePreset(p Preset) bool {
@@ -167,6 +185,9 @@ const (
 	audioMaxKbps = 96
 	// bitrateSafety 是"绝不越压越大"的安全系数：实际视频码率还要再乘它。
 	bitrateSafety = 0.95
+	// sourceRateFactor 是「原始」档建议码率的"按原片压一档"系数（用户拍板 0.7）：
+	// 建议 = min(源分辨率的档位建议, 源码率×0.7) ⇒ 默认能真的压小约 30%。
+	sourceRateFactor = 0.7
 	// minSide 是能转码的最小边长（再小的视频没有压缩意义，也过不了 yuv420p 的偶数要求）。
 	minSide = 16
 )
@@ -399,9 +420,12 @@ type Plan struct {
 	TargetWidth  int `json:"target_width"`
 	TargetHeight int `json:"target_height"`
 	VideoKbps    int `json:"video_kbps"`
-	// SuggestedKbps 是"原始档按源分辨率给出的建议码率"（0 = 不适用/用户手填了码率）。
-	// 面板据此显示"每个文件用的是哪个建议值"；实际码率仍可能被原码率封顶。
+	// SuggestedKbps 是"原始档给出的建议码率"（0 = 不适用/用户手填了码率）：
+	// min(该源分辨率的档位建议, 源码率×0.7)。面板据此显示"每个文件用的是哪个建议值"。
 	SuggestedKbps int `json:"suggested_kbps,omitempty"`
+	// SuggestedFrom 是建议值的依据："rate70"（按原片码率 70%，用户拍板口径）或
+	// "res"（按源分辨率的档位下限）。面板把依据写进 title，不占主句。
+	SuggestedFrom string `json:"suggested_from,omitempty"`
 	// AudioKbps 为 0 且 AudioDisabled 为 true 表示产物不带音轨（-an）。
 	AudioKbps     int   `json:"audio_kbps"`
 	AudioDisabled bool  `json:"audio_disabled"`
@@ -655,13 +679,13 @@ func evenDown(n int) int {
 // capped 只表示"实际码率 ≥ 原码率×0.95"（这种文件**封顶即跳过**，
 // 不再转码，改为原样放进 output/；判据见 PlanOne）。
 // suggested 是"源分辨率建议值"（仅原始档给），面板据此显示每个文件用的建议值。
-func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggested int, capped bool, note, skip string) {
+func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggested int, suggestedByRate, capped bool, note, skip string) {
 	if info.VideoKbps <= 0 {
-		return 0, 0, 0, 0, false, "", "读不到原视频码率，无法保证压完更小"
+		return 0, 0, 0, 0, false, false, "", "读不到原视频码率，无法保证压完更小"
 	}
 	capKbps := int(math.Floor(float64(info.VideoKbps) * bitrateSafety))
 	if capKbps < 1 {
-		return 0, 0, 0, 0, false, "", "原视频码率太低，没有可压空间"
+		return 0, 0, 0, 0, false, false, "", "原视频码率太低，没有可压空间"
 	}
 	maxRate = capKbps
 	if opts.Mode == ModeQuality {
@@ -670,28 +694,36 @@ func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggeste
 	} else {
 		vKbps = ResolveKBps(opts.Preset, opts.KBps)
 		if vKbps <= 0 {
-			suggested = SuggestedKBps(info.Width, info.Height)
+			suggested = SuggestedKBps(info.Width, info.Height, info.VideoKbps)
 			vKbps = suggested
+			suggestedByRate = suggested < tierKBps(info.Width, info.Height)
 		}
 		if vKbps > capKbps {
 			vKbps = capKbps
 			capped = true
 			if suggested > 0 {
-				note = fmt.Sprintf("按源分辨率建议 %d kbps，已被原码率封顶到 %d kbps", suggested, capKbps)
+				note = fmt.Sprintf("建议 %d kbps，已被原码率封顶到 %d kbps", suggested, capKbps)
 			} else {
 				note = fmt.Sprintf("原码率低（%d kbps），已封顶到 %d kbps", info.VideoKbps, capKbps)
+			}
+		} else if suggested > 0 {
+			// 建议值本身要能看出依据（用户点名）：是按源分辨率，还是按原片 70%。
+			if suggestedByRate {
+				note = fmt.Sprintf("原始档按原片码率 70%% 建议 %d kbps（源 %d）", suggested, info.VideoKbps)
+			} else {
+				note = fmt.Sprintf("原始档按源分辨率建议 %d kbps", suggested)
 			}
 		}
 		maxRate = vKbps
 	}
 	if !info.HasAudio {
-		return vKbps, 0, maxRate, suggested, capped, note, ""
+		return vKbps, 0, maxRate, suggested, suggestedByRate, capped, note, ""
 	}
 	aKbps = audioMaxKbps
 	if info.AudioKbps > 0 && info.AudioKbps < aKbps {
 		aKbps = info.AudioKbps
 	}
-	return vKbps, aKbps, maxRate, suggested, capped, note, ""
+	return vKbps, aKbps, maxRate, suggested, suggestedByRate, capped, note, ""
 }
 
 // PlanOne 是**唯一的单文件规划实现**（纯函数：不碰文件系统）。
@@ -750,14 +782,21 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	}
 	p.TargetWidth, p.TargetHeight = w, h
 
-	vKbps, aKbps, maxRate, suggested, capped, note, skip := planBitrates(info, opts)
+	vKbps, aKbps, maxRate, suggested, suggestedByRate, capped, note, skip := planBitrates(info, opts)
 	if skip != "" {
 		p.PlaceInOutput = true
 		p.SkipReason = skip
 		return p
 	}
-	// 建议值（仅原始档）要逐文件记在计划里：面板才看得出"这个文件用了哪个建议值"。
+	// 建议值（仅原始档）要逐文件记在计划里：面板才看得出"这个文件用了哪个建议值、依据是什么"。
 	p.SuggestedKbps = suggested
+	if suggested > 0 {
+		if suggestedByRate {
+			p.SuggestedFrom = "rate70"
+		} else {
+			p.SuggestedFrom = "res"
+		}
+	}
 	// 封顶即跳过（用户拍板）：实际码率被迫等于原片×0.95 时再压只会更糊、体积几乎不变
 	// —— 不转码，改为原样放进 output/（规则不变）。
 	if capped {
@@ -772,7 +811,7 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	p.VideoKbps, p.AudioKbps, p.Capped, p.Note = vKbps, aKbps, capped, note
 	// 原始档要有一句清楚的语义：不缩放，只可能降码率 / 换编码。
 	if IsSourcePreset(preset) && p.Note == "" {
-		p.Note = "原始档不缩放：按源分辨率建议码率"
+		p.Note = "原始档不缩放（码率按你选的走）"
 	}
 	p.MaxRateKbps = maxRate
 	p.AudioDisabled = !info.HasAudio

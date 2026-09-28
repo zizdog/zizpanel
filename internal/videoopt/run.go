@@ -590,6 +590,9 @@ type RunItem struct {
 	// SavedPercentText 是这个文件省下的百分比文本（如 "-44.6%"）；
 	// 源 0 字节/读不到大小时为空（面板只显示体积，绝不写 NaN%）。
 	SavedPercentText string `json:"saved_percent_text,omitempty"`
+	// DurationSec/DurationText 是**这个文件**的转码耗时（用户点名：明细行能看到）。
+	DurationSec  float64 `json:"duration_sec,omitempty"`
+	DurationText string  `json:"duration_text,omitempty"`
 }
 
 // RunResult 是一次批量压缩的汇总。
@@ -607,8 +610,11 @@ type RunResult struct {
 	// SavedPercentText 是汇总百分比文本（如 "-44.6%"）；源 0 字节时为空。
 	SavedPercentText string `json:"saved_percent_text,omitempty"`
 	// SummaryText 是分开计数的汇总：压缩 N 个（省 X，-Y%）· 原样放入 output M 个 · 其它跳过 K 个。
-	SummaryText string    `json:"summary_text,omitempty"`
-	Items       []RunItem `json:"items"`
+	SummaryText string `json:"summary_text,omitempty"`
+	// DurationSec/DurationText 是**本次任务**的总耗时（进度窗与完成 toast 都显示）。
+	DurationSec  float64   `json:"duration_sec,omitempty"`
+	DurationText string    `json:"duration_text,omitempty"`
+	Items        []RunItem `json:"items"`
 }
 
 // RunPlan 顺序执行计划里的每个文件（一个任务压完整个目录）。
@@ -616,6 +622,7 @@ type RunResult struct {
 // 顺序而不是并发：libx264 veryfast 本身就吃满多核，并发只会互相抢 CPU
 // 且让"第几个"的进度彻底失序。
 func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hooks Hooks) (*RunResult, error) {
+	startedAt := time.Now()
 	res := &RunResult{Total: len(rows), Items: make([]RunItem, 0, len(rows))}
 	if len(rows) == 0 {
 		return res, nil
@@ -734,6 +741,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		if row.TwoPass && passDir != "" {
 			passLog = filepath.Join(passDir, fmt.Sprintf("pass%d", i))
 		}
+		itemStart := time.Now()
 		throttle := &progressThrottle{}
 		rerr := runner.Transcode(ctx, TranscodeRequest{
 			Src: row.Path, Dst: part,
@@ -756,6 +764,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			_ = os.Remove(part)
 			if ctx.Err() != nil {
 				hooks.log(tasks.LevelWarn, "已中断，删掉没写完的半成品："+row.OutName)
+				fillDuration(res, startedAt)
 				return res, cancelledErr(res)
 			}
 			item.Error = rerr.Error()
@@ -803,28 +812,35 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		}
 		item.OutName, item.OutPath = row.OutName, row.OutPath
 		item.SavedPercentText = FormatSavedPercent(srcBytes, afterBytes)
+		// 单文件耗时（顺手给，不是必须的判据）：明细日志行与结果 JSON 都带上。
+		item.DurationSec = time.Since(itemStart).Seconds()
+		item.DurationText = FormatDuration(time.Since(itemStart))
 		res.Done++
 		res.BeforeBytes += srcBytes
 		res.AfterBytes += afterBytes
 		res.SavedBytes += srcBytes - afterBytes
 		res.Items = append(res.Items, item)
 		// 明细行同时给体积与百分比（算不出百分比时只写体积，绝不写 NaN%）。
+		used := " · 用时 " + item.DurationText
 		if item.SavedPercentText != "" {
-			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s，%s）",
+			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s，%s%s）",
 				row.Name, humanBytes(srcBytes), humanBytes(afterBytes),
-				humanBytes(srcBytes-afterBytes), item.SavedPercentText))
+				humanBytes(srcBytes-afterBytes), item.SavedPercentText, used))
 		} else {
-			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s）",
-				row.Name, humanBytes(srcBytes), humanBytes(afterBytes), humanBytes(srcBytes-afterBytes)))
+			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s%s）",
+				row.Name, humanBytes(srcBytes), humanBytes(afterBytes),
+				humanBytes(srcBytes-afterBytes), used))
 		}
 	}
 
 	if err := ctx.Err(); err != nil {
+		fillDuration(res, startedAt)
 		return res, cancelledErr(res)
 	}
 	res.SavedPercentText = FormatSavedPercent(res.BeforeBytes, res.AfterBytes)
+	fillDuration(res, startedAt)
 	res.SummaryText = SummaryRunText(res)
-	hooks.log(tasks.LevelStep, "完成："+res.SummaryText)
+	hooks.log(tasks.LevelStep, "完成："+res.SummaryText+" · "+res.DurationText)
 	// 跳过清单是**给人看的**（UTF-8 纯文本），只在真有跳过时写。
 	if res.Skipped > 0 {
 		listPath, lerr := writeSkippedList(outDir, res, res.Items)
@@ -937,6 +953,37 @@ func SummaryRunText(res *RunResult) string {
 		parts = append(parts, fmt.Sprintf("失败 %d 个", res.Failed))
 	}
 	return strings.Join(parts, " · ")
+}
+
+// FormatDuration 把耗时写成给用户看的短句（<1 秒不谎报成 0 秒）。
+func FormatDuration(d time.Duration) string {
+	if d < time.Second {
+		return "<1 秒"
+	}
+	sec := int(d.Round(time.Second) / time.Second)
+	switch {
+	case sec < 60:
+		return fmt.Sprintf("%d 秒", sec)
+	case sec < 3600:
+		return fmt.Sprintf("%d 分 %d 秒", sec/60, sec%60)
+	default:
+		return fmt.Sprintf("%d 小时 %d 分", sec/3600, (sec%3600)/60)
+	}
+}
+
+// SummaryDurationText 是"本次转码用时 X（N 个文件）"那一句（进度窗与 toast 共用）。
+func SummaryDurationText(d time.Duration, done int) string {
+	return fmt.Sprintf("本次转码用时 %s（%d 个文件）", FormatDuration(d), done)
+}
+
+// fillDuration 把总耗时写进结果（成功/中断两条路径都调它，绝不漏）。
+func fillDuration(res *RunResult, startedAt time.Time) {
+	if res == nil {
+		return
+	}
+	d := time.Since(startedAt)
+	res.DurationSec = d.Seconds()
+	res.DurationText = SummaryDurationText(d, res.Done)
 }
 
 // hasTwoPass 判断这批计划里有没有 2-pass（没有就不建临时目录）。

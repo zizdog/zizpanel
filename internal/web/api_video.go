@@ -456,9 +456,13 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 		// 失败/中断：不确定走到哪了，进度条保持"不确定"，只如实写原因。
 		final.Message = "失败：" + rerr.Error()
 	case res != nil:
-		// 全部文件处理完：进度条拉满，文案分开计数（压缩 / 原样放入 output / 其它跳过）。
+		// 全部文件处理完：进度条拉满，文案分开计数（压缩 / 原样放入 output / 其它跳过）
+		// + 本次转码用时（用户点名：进度窗要看到耗时）。
 		final.Done, final.Total = res.BeforeBytes, res.BeforeBytes
 		final.Message = res.SummaryText
+		if res.DurationText != "" {
+			final.Message += " · " + res.DurationText
+		}
 	default:
 		final.Message = "未产生结果"
 	}
