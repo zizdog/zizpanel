@@ -140,12 +140,30 @@ func (s *Server) handleJellyfinMediaGet(w http.ResponseWriter, r *http.Request) 
 	if dirs == nil {
 		dirs = []string{}
 	}
-	ok(w, map[string]any{
+	ok(w, s.jellyfinMediaPayload(r.Context(), dirs))
+}
+
+// jellyfinMediaPayload 组装媒体目录响应：目录 + 试读结论 + **已挂载的网络盘**候选。
+//
+// 为什么要带网络盘：网络共享挂载点（<安装根>/mnt/…）对用户不是显而易见的路径，
+// 让他手打一遍纯属为难人；这里把"当前真的挂上了的"列出来，点一下就填进去，
+// 之后照旧走"用 Jellyfin 身份真的试读"这一步。
+func (s *Server) jellyfinMediaPayload(ctx context.Context, dirs []string) map[string]any {
+	out := map[string]any{
 		"dirs":   dirs,
-		"checks": s.jellyfinMediaChecks(r.Context(), dirs),
+		"checks": s.jellyfinMediaChecks(ctx, dirs),
 		"note": "Jellyfin 的媒体库路径要在它自己的安装向导/后台里添加；" +
 			"面板在这里验证的是「Jellyfin 那个身份读不读得到」，读不到就会是空库。",
-	})
+	}
+	mounts, err := s.mountedSMBMounts(ctx)
+	if err != nil {
+		out["smb_mounts_error"] = err.Error()
+	}
+	if mounts == nil {
+		mounts = []map[string]any{}
+	}
+	out["smb_mounts"] = mounts
+	return out
 }
 
 // handleJellyfinMediaSet 保存媒体目录（PUT {dirs:[...]}），并返回试读结论。
@@ -172,10 +190,7 @@ func (s *Server) handleJellyfinMediaSet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.audit(r, "jellyfin_media", services.JellyfinAppID, "保存媒体目录（"+strings.Join(clean, ", ")+"）", true, "")
-	ok(w, map[string]any{
-		"dirs":   clean,
-		"checks": s.jellyfinMediaChecks(r.Context(), clean),
-	})
+	ok(w, s.jellyfinMediaPayload(r.Context(), clean))
 }
 
 // handleJellyfinMediaCheck 对单个目录跑一次试读（前端“试读”按钮）。

@@ -417,6 +417,10 @@ func cmdServe(args []string) error {
 	// 用户第一次打开市场就能命中缓存，不必等 brew。
 	go srv.WarmMarket(context.Background())
 
+	// 网络磁盘（SMB）：SMB 挂载重启不保留，这里按配置自动重挂。
+	// 内部是后台循环 + 退避重试，**不阻塞启动**（NAS 离线只是状态显示未挂载 + 原因）。
+	srv.StartSMBAutoMount(context.Background())
+
 	// Qwen 守温：mlx-audio 把模型放在进程内存的 dict 里，服务一重启
 	// 两个模型就全变冷，而冷加载实测要 25 秒。这里常驻补载，让网站
 	// 无论何时发来哪个 model 名都能立刻出声。首轮立即执行，

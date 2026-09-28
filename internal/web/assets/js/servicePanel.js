@@ -813,12 +813,18 @@ export async function openServicePanel(o = {}) {
     mediaBox.style.display = on ? '' : 'none';
     if (!on) { clear(mediaBox); return; }
     const token = ++mediaToken;
-    let data = { dirs: [], checks: [] };
+    let data = { dirs: [], checks: [], smb_mounts: [] };
     try {
       const r = await api.jellyfinMediaGet();
-      data = { dirs: (r && r.dirs) || [], checks: (r && r.checks) || [] };
+      data = {
+        dirs: (r && r.dirs) || [],
+        checks: (r && r.checks) || [],
+        // 已挂载的网络盘（面板挂的 SMB）：点一下直接填进去，省得手打挂载点路径。
+        smb_mounts: (r && r.smb_mounts) || [],
+        smb_error: (r && r.smb_mounts_error) || '',
+      };
     } catch (e) {
-      data = { dirs: [], checks: [], error: String((e && e.message) || e) };
+      data = { dirs: [], checks: [], smb_mounts: [], error: String((e && e.message) || e) };
     }
     if (token !== mediaToken) return; // 期间面板重画过：丢弃这次结果，别覆盖新的
     drawMedia(data, token);
@@ -837,15 +843,31 @@ export async function openServicePanel(o = {}) {
       try {
         const r = await api.jellyfinMediaSet(dirs);
         if (token !== mediaToken) return;
-        drawMedia({ dirs: (r && r.dirs) || [], checks: (r && r.checks) || [] }, token);
+        drawMedia({
+          dirs: (r && r.dirs) || [],
+          checks: (r && r.checks) || [],
+          smb_mounts: (r && r.smb_mounts) || [],
+          smb_error: (r && r.smb_mounts_error) || '',
+        }, token);
       } catch (e) {
         // 后端的拒绝原因（不存在/不是绝对路径）原样显示，绝不吞掉。
         showErr(String((e && e.message) || e));
       }
     };
+    const smbButtons = (data.smb_mounts || []).map((s) => h('button.btn.btn-sm', {
+      text: '🖧 ' + s.name, dataset: { testid: 'jellyfin-media-smb' },
+      title: '面板已挂载的网络盘：' + s.mount_point + '（点它会保存并真的试读一次）',
+      onclick: () => apply([...(data.dirs || []), s.mount_point]),
+    }));
     appendAll(mediaBox,
       h('div.hint', { text: 'Jellyfin 的媒体库路径要在它自己的安装向导/后台里添加；' +
         '这里先验证「Jellyfin 那个身份读不读得到」——读不到就会是空库。' }),
+      smbButtons.length
+        ? h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } }, [
+          h('span.sub', { text: '已挂载的网络盘：' }),
+          ...smbButtons,
+        ])
+        : null,
       h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } }, [
         input,
         h('button.btn.btn-sm.btn-primary', {
@@ -860,6 +882,7 @@ export async function openServicePanel(o = {}) {
       err,
     );
     if (data.error) appendAll(mediaBox, h('div.hint', { text: '读取媒体目录失败：' + data.error }));
+    if (data.smb_error) appendAll(mediaBox, h('div.hint', { style: { color: 'var(--warn)' }, text: '网络盘状态未复核：' + data.smb_error }));
     for (const c of (data.checks || [])) {
       appendAll(mediaBox, h('div', { style: { marginTop: '8px' } }, [
         h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } }, [

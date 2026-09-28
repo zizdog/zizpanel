@@ -488,6 +488,19 @@ function goto2FASettings() {
   location.hash = wanted;
 }
 
+// gotoSMBDisks 跳到「磁盘管理 → 网络磁盘（SMB）」并把那一段滚进视野。
+// 文件管理器卡片头上的「网络盘」入口用它（见 files.js）。
+export function gotoSMBDisks() {
+  pendingAnchor = 'zp-smb-section';
+  const wanted = '#/disks';
+  if ((location.hash || '#/dashboard') === wanted) {
+    // hash 没变不会触发 hashchange —— 手动重渲染一次，让新视图消费锚点。
+    render();
+    return;
+  }
+  location.hash = wanted;
+}
+
 // kickAppUpdates：登录后（或刷新页面后）由外壳统一预热一次应用更新检查。
 //
 // 为什么放在外壳而不是应用页（用户 2026-09-22）：检查原来挂在应用页的挂载里，

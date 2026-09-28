@@ -200,6 +200,15 @@ type Server struct {
 	handler http.Handler
 	startAt time.Time
 
+	// ---- 网络磁盘（SMB，见 api_smb.go）----
+	//
+	// 运行状态（上次尝试/上次失败原因/退避/是否正在处理）必须跨请求活着：
+	// web 层每次请求都可能新建对象，挂别处活不过一次请求（与 healthCache 同理）。
+	// 不落库：面板重启后本来就该重新挂一次，旧的"上次失败"没有意义。
+	smbMu       sync.Mutex
+	smbRun      map[string]*smbRuntime
+	smbLoopOnce sync.Once
+
 	// ---- 主动通知（见 api_notify.go）----
 	//
 	// notifyMgr 是进程内单例：去重状态（冷却表）必须跨请求活着，否则每次巡检
@@ -338,6 +347,15 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/system/disks/{id}/volume-rename", s.requireAuth(s.handleDiskVolumeRename))
 	// init-volume 是第一版接口名，保留为 volume-create 的别名，不破坏既有调用。
 	root.HandleFunc("POST /api/v1/system/disks/{id}/init-volume", s.requireAuth(s.handleDiskVolumeCreate))
+	// 网络磁盘（SMB，见 api_smb.go）：把 NAS 共享挂到 <安装根>/mnt 下，给 Jellyfin 当媒体库。
+	// 口令不进 argv（pty 提示通道）、不进响应/日志（只回 password_set）。
+	root.HandleFunc("GET /api/v1/system/smb", s.requireAuth(s.handleSMBList))
+	root.HandleFunc("POST /api/v1/system/smb", s.requireAuth(s.handleSMBCreate))
+	root.HandleFunc("PUT /api/v1/system/smb/{id}", s.requireAuth(s.handleSMBUpdate))
+	root.HandleFunc("DELETE /api/v1/system/smb/{id}", s.requireAuth(s.handleSMBDelete))
+	root.HandleFunc("POST /api/v1/system/smb/{id}/mount", s.requireAuth(s.handleSMBMount))
+	root.HandleFunc("POST /api/v1/system/smb/{id}/unmount", s.requireAuth(s.handleSMBUnmount))
+	root.HandleFunc("POST /api/v1/system/smb/{id}/remount", s.requireAuth(s.handleSMBRemount))
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
 	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))

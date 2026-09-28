@@ -18,7 +18,8 @@
 
 import { api, apiURL } from './api.js';
 import { taskCenter } from './tasks.js';
-import { h, clear, toast, modal, bytes, appendAll, confirmBox } from './ui.js';
+import { h, clear, toast, failureToast, modal, bytes, appendAll, confirmBox } from './ui.js';
+import { consumePendingAnchor } from './app.js';
 
 export function DisksView(content, ctx = {}) {
   clear(content);
@@ -41,8 +42,23 @@ export function DisksView(content, ctx = {}) {
       status,
       resultBox,
     ]),
+    // 网络磁盘（SMB）与 diskutil 那条线无关，是独立一节（见文件末尾）。
+    smbSection(),
     listBox,
   );
+
+  // 文件管理器的「网络盘」入口跳进来时（app.js gotoSMBDisks），把这一节滚进视野并闪一下。
+  const anchorId = consumePendingAnchor();
+  if (anchorId === 'zp-smb-section') {
+    setTimeout(() => {
+      const el = document.getElementById(anchorId);
+      if (!el) return;
+      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+      el.classList.add('zp-anchor-flash');
+      setTimeout(() => el.classList.remove('zp-anchor-flash'), 1800);
+    }, 80);
+  }
 
   // loading 状态放在卡片头旁边，不在正文里塞一大段"读取中…"——
   // 刷新时**保留旧内容**（避免整页闪白），只有第一次才显示骨架。
@@ -616,4 +632,191 @@ export function DisksView(content, ctx = {}) {
     });
     bindDialogRefresh(m, [nameInput]);
   }
+}
+
+// ============================================================================
+//  网络磁盘（SMB）
+//
+//  口令是**只写**字段：提交后前端不留存，接口只回 password_set（绝不回原文）。
+//  状态一律来自服务端回读（真实挂载表 + 目录真的读一次），本页不猜、不假装成功。
+// ============================================================================
+function smbSection() {
+  const body = h('div.card-body');
+  const card = h('div.card', { id: 'zp-smb-section' }, [
+    h('div.card-head', [
+      h('h3', { text: '🖧 网络磁盘（SMB）' }),
+      h('div.spacer'),
+      h('span.sub', { text: 'NAS 共享挂到本机，给 Jellyfin 当媒体库' }),
+      h('button.btn.btn-sm', { text: '⟳ 刷新', dataset: { testid: 'zp-smb-refresh' }, onclick: () => load(true) }),
+    ]),
+    body,
+  ]);
+  let data = { mounts: [] };
+  let first = true;
+
+  load(false);
+
+  async function load(showToast) {
+    if (first) {
+      clear(body);
+      body.append(h('div.hint', { text: '正在读取网络磁盘…' }));
+    }
+    try {
+      data = (await api.get(apiURL('system/smb'))) || { mounts: [] };
+    } catch (e) {
+      first = false;
+      clear(body);
+      body.append(h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('span.pill.danger', { text: '读取失败' }),
+        h('span.sub', { text: (e && e.message) || String(e) }),
+      ]));
+      return;
+    }
+    first = false;
+    render();
+    if (showToast) toast('已刷新网络磁盘', 'ok');
+  }
+
+  function render() {
+    clear(body);
+    const list = data.mounts || [];
+    appendAll(body,
+      h('div.hint', { text: '挂载点在 ' + (data.mount_base || '') + ' 下；口令只存在面板数据库里，接口只回「已设置」。' }),
+      h('div', { style: { marginTop: '8px', display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+        h('button.btn.btn-sm.btn-primary', {
+          text: '＋ 新增网络盘', dataset: { testid: 'zp-smb-add' }, onclick: () => openForm(null),
+        }),
+      ]),
+    );
+    if (data.table_error) {
+      body.append(h('div.hint', { style: { color: 'var(--warn)', marginTop: '6px' }, text: '挂载表读不到，状态未复核：' + data.table_error }));
+    }
+    if (!list.length) {
+      body.append(h('div.hint', { style: { marginTop: '10px' }, text: '还没有网络盘。点「＋ 新增网络盘」填 NAS 地址 / 共享名 / 账号。' }));
+      return;
+    }
+    for (const m of list) body.append(smbRow(m));
+  }
+
+  function smbRow(m) {
+    const mounted = !!m.mounted;
+    const target = (m.user || '') + '@' + (m.host || '') + '/' + (m.share || '');
+    const marks = [
+      h(`span.pill.${mounted ? 'ok' : ''}`, { text: mounted ? '已挂载' : '未挂载', dataset: { testid: 'zp-smb-status' } }),
+      m.read_only ? h('span.pill', { text: '只读' }) : null,
+      m.password_set ? h('span.pill', { text: '口令已保存' }) : h('span.pill.warn', { text: '未设口令' }),
+      m.busy ? h('span.pill.warn', { text: '处理中' }) : null,
+    ];
+    const errBox = m.last_error
+      ? h('div', { style: { marginTop: '6px', color: 'var(--danger)', fontSize: '12.5px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }, dataset: { testid: 'zp-smb-error' }, text: m.last_error })
+      : null;
+    const when = [
+      m.last_attempt_at ? '上次尝试 ' + m.last_attempt_at : '',
+      m.last_success_at ? '上次成功 ' + m.last_success_at : '',
+      (!mounted && m.next_attempt_at) ? '下次自动重挂 ' + m.next_attempt_at : '',
+    ].filter(Boolean).join(' · ');
+
+    const btn = (text, testid, fn, opts = {}) => h(`button.btn.btn-sm${opts.danger ? '.btn-danger' : ''}`, {
+      text, dataset: { testid }, title: opts.title || '', disabled: !!opts.disabled, onclick: fn,
+    });
+
+    return h('div', {
+      dataset: { testid: 'zp-smb-row', id: m.id },
+      style: { marginTop: '10px', padding: '10px', border: '1px solid var(--border-soft)', borderRadius: '8px', minWidth: '0' },
+    }, [
+      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('strong', { text: m.name }),
+        ...marks.filter(Boolean),
+      ]),
+      h('div', { style: { marginTop: '4px', fontSize: '12.5px', color: 'var(--text-mute)', wordBreak: 'break-all' }, text: target }),
+      h('div.mono', { style: { marginTop: '4px', fontSize: '12px', wordBreak: 'break-all' }, text: m.mount_point || '' }),
+      when ? h('div.hint', { style: { marginTop: '4px' }, text: when }) : null,
+      errBox,
+      h('div', { style: { marginTop: '8px', display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+        btn(mounted ? '重新挂载' : '挂载', 'zp-smb-mount', () => act(m, mounted ? 'remount' : 'mount'), { disabled: m.busy }),
+        btn('卸载', 'zp-smb-unmount', () => act(m, 'unmount'), { disabled: !mounted || m.busy }),
+        btn('编辑', 'zp-smb-edit', () => openForm(m)),
+        btn('删除', 'zp-smb-remove', () => remove(m), { danger: true }),
+      ]),
+    ]);
+  }
+
+  async function act(m, action) {
+    try {
+      await api.post(apiURL(`system/smb/${encodeURIComponent(m.id)}/${action}`), {});
+      toast(action === 'unmount' ? '已卸载' : '已挂载 ' + m.name, 'ok');
+    } catch (e) {
+      // 失败原因（首行结论 + 折叠的 mount_smbfs 原样输出）一律原样显示，绝不吞掉。
+      failureToast(e, 20000);
+    }
+    load(false);
+  }
+
+  async function remove(m) {
+    const okDel = await confirmBox(
+      '删除网络盘「' + m.name + '」？会先卸载它；共享里的文件一个都不会动。',
+      { title: '删除网络盘', danger: true, okText: '删除' });
+    if (!okDel) return;
+    try {
+      await api.del(apiURL(`system/smb/${encodeURIComponent(m.id)}`), {});
+      toast('已删除 ' + m.name, 'ok');
+    } catch (e) {
+      failureToast(e, 20000);
+    }
+    load(false);
+  }
+
+  // openForm 是新增/编辑的**唯一**入口（existing 为 null = 新增）。
+  function openForm(existing) {
+    const isEdit = !!existing;
+    const nameI = h('input.input', { type: 'text', value: isEdit ? existing.name : '', placeholder: '例如 nas-media', maxlength: 40 });
+    const hostI = h('input.input', { type: 'text', value: isEdit ? existing.host : '', placeholder: 'nas.local 或 192.0.2.10' });
+    const shareI = h('input.input', { type: 'text', value: isEdit ? existing.share : '', placeholder: '共享名，例如 Media（不要带斜杠）' });
+    const userI = h('input.input', { type: 'text', value: isEdit ? existing.user : '', placeholder: 'NAS 账号；公开共享填 guest' });
+    const domainI = h('input.input', { type: 'text', value: isEdit ? (existing.domain || '') : '', placeholder: '域（可选）' });
+    const passI = h('input.input', { type: 'password', value: '', placeholder: isEdit && existing.password_set ? '留空 = 不改口令' : 'NAS 口令' });
+    const roI = h('input', { type: 'checkbox', checked: isEdit ? !!existing.read_only : false });
+    const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' }, dataset: { testid: 'zp-smb-form-error' } });
+    const setErr = (m) => { err.textContent = m || ''; err.style.display = m ? '' : 'none'; };
+
+    const save = async (close) => {
+      const payload = {
+        name: nameI.value.trim(), host: hostI.value.trim(), share: shareI.value.trim(),
+        user: userI.value.trim(), domain: domainI.value.trim(), password: passI.value,
+        read_only: !!roI.checked,
+      };
+      try {
+        if (isEdit) await api.put(apiURL(`system/smb/${encodeURIComponent(existing.id)}`), payload);
+        else await api.post(apiURL('system/smb'), payload);
+        passI.value = '';
+        close();
+        toast(isEdit ? '已保存' : '已新增，点「挂载」连上它', 'ok');
+        load(false);
+      } catch (e) {
+        // 校验/保存失败：弹窗**不关**，原因原样显示（用户改完接着提交）。
+        setErr((e && e.message) || String(e));
+      }
+    };
+
+    modal({
+      title: isEdit ? '编辑网络盘 · ' + existing.name : '新增网络盘（SMB）',
+      body: h('div', [
+        h('div.hint', { text: '口令只在提交时发一次，面板只回「是否已设置」，日志与响应里不会有它。' }),
+        h('div.field', [h('label', { text: '名字（= 挂载点目录名）' }), nameI]),
+        h('div.field', [h('label', { text: 'NAS 地址' }), hostI]),
+        h('div.field', [h('label', { text: '共享名' }), shareI]),
+        h('div.field', [h('label', { text: '用户名' }), userI]),
+        h('div.field', [h('label', { text: '域（可留空）' }), domainI]),
+        h('div.field', [h('label', { text: '口令' }), passI]),
+        h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' } }, [roI, h('span', { text: '只读挂载（Jellyfin 媒体库建议勾上）' })]),
+        err,
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', { text: isEdit ? '保存' : '新增', dataset: { testid: 'zp-smb-save' }, onclick: () => save(close) }),
+      ],
+    });
+  }
+
+  return card;
 }
