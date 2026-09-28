@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -32,6 +33,40 @@ type panelUploadLimitView struct {
 	// 不许拿内置默认值冒充用户配置（"保存成功"≠"已生效"的同类纪律）。
 	Verified bool   `json:"verified"`
 	Note     string `json:"note,omitempty"`
+	// MaxBytes / MaxText 是可填的上界（界面提示与 400 报错共用，避免两处写死）。
+	MaxBytes int64  `json:"max_bytes"`
+	MaxText  string `json:"max_text"`
+}
+
+// PanelUploadLimitMaxBytes 是面板单次上传上限的硬上界（64 GiB）。
+//
+// 为什么要有上界：这个值就是面板**单次 HTTP 请求**的读入上限，浏览器一次
+// 传几十 GB 既不现实、断了还要重来；再往上只会把失败推得更晚。媒体文件
+// （电影等）本来就该直接放到磁盘（文件管理的复制/移动，或 Finder/SMB/NAS
+// 同步），Jellyfin 只负责扫描媒体库。所以给一个诚实的上界而不是"随便填"。
+const PanelUploadLimitMaxBytes = 64 << 30
+
+// panelUploadLimitMaxText 是上界的人话写法（错误信息与界面共用）。
+const panelUploadLimitMaxText = "64g"
+
+// validatePanelUploadLimit 校验用户填的面板单次上传上限，返回规整后的值。
+//
+// 复用 sites 包的尺寸解析（全仓库唯一解析处）；非法值返回人话错误（供 400）。
+func validatePanelUploadLimit(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if err := sites.ValidateSizeValue("面板单次上传上限", v); err != nil {
+		return "", err
+	}
+	n, ok := sites.ParseSizeBytes(v)
+	if !ok {
+		return "", fmt.Errorf("面板单次上传上限无法解析：%q（示例：4g / 8g / 12288m）", v)
+	}
+	if n > PanelUploadLimitMaxBytes {
+		return "", fmt.Errorf("面板单次上传上限不能超过 %s（当前填的是 %s）：单次 HTTP 请求再大，浏览器也传不动、"+
+			"断线就得重来。更大的媒体文件请直接放到磁盘（文件管理的复制/移动，或 Finder/SMB/NAS 同步），"+
+			"再让 Jellyfin 扫描媒体库", panelUploadLimitMaxText, v)
+	}
+	return v, nil
 }
 
 // panelUploadLimit 解析**面板自己**的单次上传上限（全仓库唯一解析处）。
@@ -47,12 +82,14 @@ func (s *Server) panelUploadLimit() panelUploadLimitView {
 		return panelUploadLimitView{
 			LimitBytes: n, LimitText: raw,
 			Source: "面板配置（config.json）", Verified: true,
+			MaxBytes: PanelUploadLimitMaxBytes, MaxText: panelUploadLimitMaxText,
 		}
 	}
 	n, _ := sites.ParseSizeBytes(config.DefaultPanelUploadLimit)
 	v := panelUploadLimitView{
 		LimitBytes: n, LimitText: config.DefaultPanelUploadLimit,
 		Source: "内置默认值", Verified: false,
+		MaxBytes: PanelUploadLimitMaxBytes, MaxText: panelUploadLimitMaxText,
 	}
 	if raw == "" {
 		v.Note = "面板配置里没有 panel_upload_limit，用的是内置默认值（未复核）"

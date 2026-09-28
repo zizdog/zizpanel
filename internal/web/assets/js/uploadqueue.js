@@ -134,13 +134,24 @@ export function createUploadQueue({ send, concurrency = UPLOAD_CONCURRENCY } = {
     return added;
   }
 
-  // setLimit 回读上限后调用；对**还没发出去**的超限项补标失败。
+  // setLimit 回读上限后调用：对**还没发出去**的超限项补标失败；上限变大时把本地
+  // 预检误拦的项放回队列（真机踩过：页面缓存旧上限，服务端其实允许）。
   function setLimit(info) {
-    limitBytes = Math.max(0, Number(info && info.bytes) || 0);
-    limitText = (info && info.text) || '';
+    const next = Math.max(0, Number(info && info.bytes) || 0);
+    const text = (info && (info.text || info.sizeText || info.limit_text)) || '';
+    const grew = next > limitBytes;
+    limitBytes = next;
+    limitText = text;
     if (limitBytes > 0) {
       for (const it of items) {
-        if (it.status === UPLOAD_STATUS.WAITING && it.size > limitBytes) markOversize(it);
+        if (it.status === UPLOAD_STATUS.WAITING && it.size > limitBytes) {
+          markOversize(it);
+        } else if (grew && it.status === UPLOAD_STATUS.FAILED && it.oversize && it.size <= limitBytes) {
+          // 上限已放宽：之前的"超限"结论不再成立，按未发送处理，等服务端判。
+          it.oversize = false;
+          it.error = '';
+          it.status = UPLOAD_STATUS.WAITING;
+        }
       }
     }
     notify(true);

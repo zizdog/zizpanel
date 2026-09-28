@@ -9,12 +9,15 @@
 import { api, apiURL } from './api.js';
 import { taskCenter } from './tasks.js';
 import { h, clear, toast, modal, confirmBox, promptBox, appendAll, esc, rate, duration } from './ui.js';
-import { registerCleanup } from './app.js';
+import { registerCleanup, gotoSMBDisks } from './app.js';
 // 上传分批的**纯函数**放单独模块：它可以被 node 直接跑门禁
 // （见 internal/web/upload_batch_gate_test.go），而本文件依赖 DOM 无法单测。
 import { oversizeAdvice } from './uploadlimit.js';
 // 上传队列的**唯一**数据结构（入队/逐文件进度/总计）。本文件只负责把它画出来。
 import { createUploadQueue, UPLOAD_STATUS } from './uploadqueue.js';
+// 「改上限」小窗复用设置页同一份实现（panellimit.js）：同一处校验、同一处回读，
+// 绝不在这里再写一套保存逻辑。
+import { openPanelLimitEditor } from './panellimit.js';
 
 // 面板单次上传上限**从前端写死改成回读**：GET /api/v1/files/upload-limit。
 //
@@ -82,27 +85,64 @@ let uploadLimitInfo = null;
 // 读不到就**如实标"未复核"**，绝不写死一个数字（旧实现写死 4 GiB，
 // 一旦配置漂移提示就在说谎）。未复核时不拦，交给服务端判。
 async function getUploadLimit() {
-  if (uploadLimitInfo) return uploadLimitInfo;
+  // 每次调用都**重新回读**：上限能改（设置页/小窗），也可能改了 config.json 后
+  // 重启面板才生效 —— 缓存过的数字会让老页面拿旧值把文件误判成超限（真机踩过）。
+  // 只有回读失败时才退回上一次**已复核**的值，避免一次网络抖动就丢掉拦超限的能力。
   let info;
   try {
     const r = await api.fileUploadLimit();
     const bytes = Number(r && r.limit_bytes) || 0;
+    const sizeText = bytes > 0 ? humanSize(bytes) : '';
     info = {
       bytes,
+      limit_bytes: bytes,
+      text: sizeText,
+      sizeText,
       source: (r && r.source) || '',
       verified: !!(r && r.verified),
       note: (r && r.note) || '',
-      sizeText: bytes > 0 ? humanSize(bytes) : '',
     };
   } catch (e) {
+    if (uploadLimitInfo && uploadLimitInfo.verified) return uploadLimitInfo;
     info = {
-      bytes: 0, source: '', verified: false, sizeText: '',
+      bytes: 0, limit_bytes: 0, text: '', sizeText: '', source: '', verified: false,
       note: '读不到上限接口：' + ((e && e.message) || e),
     };
   }
-  // 只缓存**回读成功**的结果：一次网络抖动不该让整个会话都不再拦超限文件。
-  if (info.verified) uploadLimitInfo = info;
+  uploadLimitInfo = info;
   return info;
+}
+
+// applyPanelLimitView 把一次**服务端回读**的上限结果同时喂给上传面板那行与队列
+// （队列的超限预检用同一份值），不整页刷新。
+function applyPanelLimitView(p) {
+  const n = Number(p && (p.limit_bytes != null ? p.limit_bytes : p.bytes)) || 0;
+  const sizeText = n > 0 ? humanSize(n) : '';
+  uploadLimitInfo = {
+    bytes: n,
+    limit_bytes: n,
+    text: sizeText,
+    sizeText,
+    source: (p && p.source) || '',
+    verified: !!(p && p.verified),
+    note: (p && p.note) || '',
+  };
+  const q = ensureUploadQueue();
+  q.setLimit(uploadLimitInfo);
+  if (uploadPanelState && uploadPanelState.refresh) uploadPanelState.refresh();
+}
+
+// openPanelLimitFromFiles 是上传面板那行「改上限」的入口：先回读当前生效值，
+// 再用两处共用的 panellimit.js 小窗改；保存后立刻把这一行刷成新的回读值。
+async function openPanelLimitFromFiles() {
+  let cur;
+  try {
+    cur = await api.fileUploadLimit();
+  } catch (e) {
+    toast('读不到当前上限：' + ((e && e.message) || e), 'err', 10000);
+    return;
+  }
+  openPanelLimitEditor(cur, (fresh) => applyPanelLimitView(fresh));
 }
 
 // ---------- 队列单例 ----------
@@ -374,7 +414,17 @@ function mountUploadProgress(host) {
   const totalFill = h('i', { style: { width: '0%' } });
   const totalBar = h('div.bar.zp-up-totalbar', [totalFill]);
   const rateLine = h('div.zp-up-rate');
-  const limitLine = h('div.hint.zp-up-limit', { style: { display: 'none' } });
+  // 上限那一行从"只读提示"变成入口：点「改上限」就地弹小窗（复用设置页同一套
+  // 保存 + 回读实现）。文本节点与按钮分开，刷新时只改文本、不重建按钮。
+  const limitText = h('span.zp-up-limit-text');
+  const limitEditBtn = h('button.btn.btn-sm', {
+    text: '改上限',
+    style: { marginLeft: '6px' },
+    dataset: { testid: 'zp-up-limit-edit' },
+    title: '修改面板单次上传上限（只写面板配置，不碰站点 nginx/PHP）',
+    onclick: openPanelLimitFromFiles,
+  });
+  const limitLine = h('div.hint.zp-up-limit', { style: { display: 'none' } }, [limitText, limitEditBtn]);
   const enterBox = h('div.zp-up-enter');
   const empty = h('div.hint.zp-up-empty', {
     text: '队列是空的：点上面的「选择文件 / 选择文件夹」，或把文件拖进这个面板的任意位置。',
@@ -396,10 +446,10 @@ function mountUploadProgress(host) {
     const li = uploadLimitInfo;
     if (li && !li.verified) {
       limitLine.style.display = '';
-      limitLine.textContent = `上传上限未复核：${li.note || '读不到面板配置'}（超限文件由服务端拒收）`;
+      limitText.textContent = `上传上限未复核：${li.note || '读不到面板配置'}（超限文件由服务端拒收）`;
     } else if (li && li.sizeText) {
       limitLine.style.display = '';
-      limitLine.textContent = `单文件上限 ${li.sizeText} · 来源：${li.source || '面板配置'}`;
+      limitText.textContent = `单文件上限 ${li.sizeText} · 来源：${li.source || '面板配置'}`;
     } else {
       limitLine.style.display = 'none';
     }
@@ -518,6 +568,9 @@ function openUploadPanel(dir) {
 
   uploadPanelState = { root, refresh: progress.refresh, setMinimized, destroy, sync };
   progress.refresh();
+  // 面板一打开就回读上限并显示那一行（不能等用户真的传过一次才显示 ——
+  // 否则"当前上限是多少、能不能改"在他上传前根本看不到）。
+  getUploadLimit().then((info) => applyPanelLimitView(info));
   return uploadPanelState;
 }
 
@@ -664,7 +717,14 @@ export function FilesView(content, ctx = {}) {
   const opBar = h('div.files-opbar', { style: { display: 'none', padding: '9px 14px', borderBottom: '1px solid var(--border-soft)' } });
 
   const card = h('div.card', [
-    h('div.card-head', [crumbs]),
+    // 「网络盘」入口放卡片头（面包屑那一行）而不是工具栏：工具栏在 390px 上已经很挤，
+    // 再塞一颗会把行高顶开、列表整体下移（工具栏注释里记过这个坑）。
+    h('div.card-head', [crumbs, h('div.spacer'), h('button.btn.btn-sm', {
+      text: '🖧 网络盘',
+      title: '挂载 NAS 共享（SMB）给 Jellyfin 当媒体库 —— 跳到「磁盘管理 → 网络磁盘（SMB）」',
+      dataset: { testid: 'zp-smb-entry' },
+      onclick: () => gotoSMBDisks(),
+    })]),
     h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border-soft)', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [toolbar]),
     opBar,
     dropZone,

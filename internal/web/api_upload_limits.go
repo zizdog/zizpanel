@@ -146,6 +146,9 @@ func readPHPLimitsFromIni(path string) map[string]string {
 type uploadLimitsView struct {
 	Limits   sites.Limits `json:"limits"`
 	Defaults sites.Limits `json:"defaults"`
+	// Panel 是**面板自己**单次上传上限的实时回读（保存后读回，不是请求值）。
+	// 它与上面的站点限制（nginx/PHP）互不影响，却和它们共用同一个保存入口。
+	Panel panelUploadLimitView `json:"panel"`
 	// Nginx 是每个 vhost 文件里生效的 client_max_body_size。
 	Nginx    []limitFileState `json:"nginx"`
 	NginxDir string           `json:"nginx_dir"`
@@ -169,6 +172,9 @@ type uploadLimitsReq struct {
 	PostMaxSize       *string `json:"post_max_size"`
 	MemoryLimit       *string `json:"memory_limit"`
 	MaxExecutionTime  *int    `json:"max_execution_time"`
+	// PanelUploadLimit 是**面板自己**的单次上传上限（如 "4g"）。
+	// 它不是站点限制的一段，写的是 config.json，不碰 nginx/PHP。
+	PanelUploadLimit *string `json:"panel_upload_limit"`
 }
 
 // merge 把请求合并到当前配置上。
@@ -199,23 +205,46 @@ func (s *Server) handleGetUploadLimits(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSaveUploadLimits 校验 → 落配置 → 走任务中心应用 → 回读。
+//
+// 面板自己的上限（panel_upload_limit）只写 config.json，不需要改 nginx/PHP：
+// 因此**只有它变化**时同步回 200 + 回读，不建任务（文件管理器里那个小窗走这条路，
+// 点一次「保存」不该顺手重启 php-fpm）。站点限制变了才走任务中心那套。
 func (s *Server) handleSaveUploadLimits(w http.ResponseWriter, r *http.Request) {
 	var req uploadLimitsReq
 	if err := decode(r, &req); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	lim := req.merge(s.uploadLimits())
+	cur := s.uploadLimits()
+	lim := req.merge(cur)
 	// 校验必须在建任务之前：非法输入给 400 + 人话，别丢进后台再失败。
 	if err := lim.Validate(); err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 面板自己的上限同样是"先校验再落盘"：非法值一个字节都不写。
+	panelVal := ""
+	if req.PanelUploadLimit != nil {
+		v, err := validatePanelUploadLimit(*req.PanelUploadLimit)
+		if err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		panelVal = v
+	}
 	// 先把值写进内存配置并落盘：即使任务在应用阶段失败，用户的设置也不会白填
 	// （重试时不必重新输入）。应用结果由任务如实报告。
 	s.setUploadLimits(lim)
+	if req.PanelUploadLimit != nil {
+		s.Cfg.PanelUploadLimit = panelVal
+	}
 	if err := s.Cfg.Save(); err != nil {
 		fail(w, http.StatusInternalServerError, "保存面板配置失败: "+err.Error())
+		return
+	}
+	// 站点限制没变：没有 nginx/PHP 要写、要 reload、要重启 —— 直接回读，不建任务。
+	if lim == cur {
+		ok(w, s.collectUploadLimits(lim))
 		return
 	}
 	s.launchTask(w, r, "settings", "upload-limits",
@@ -394,6 +423,12 @@ func (s *Server) applyUploadLimits(ctx context.Context, log tasks.LogFunc, lim s
 	// ---- 7. 回读生效值（不能只报"已保存"）----
 	view := s.collectUploadLimits(lim)
 	log(tasks.LevelStep, "回读生效值：")
+	if view.Panel.Verified {
+		log(tasks.LevelOK, "面板单次上传上限（面板自己的上传路由）→ "+view.Panel.LimitText+
+			"（"+humanBytes(view.Panel.LimitBytes)+"，来源："+view.Panel.Source+"）")
+	} else {
+		log(tasks.LevelWarn, "面板单次上传上限未能复核："+view.Panel.Note)
+	}
 	for _, f := range view.Nginx {
 		if f.OK {
 			log(tasks.LevelOK, "nginx "+f.File+" → client_max_body_size "+f.Value)
@@ -456,6 +491,8 @@ func (s *Server) collectUploadLimits(lim sites.Limits) uploadLimitsView {
 		Limits: lim, Defaults: sites.DefaultLimits(),
 		Nginx: []limitFileState{}, PHP: []phpHardLimitState{},
 		NginxDir: s.Cfg.VhostDir,
+		// 面板自己的上限：**从配置回读**（不是把请求里的值回显）。
+		Panel: s.panelUploadLimit(),
 	}
 	// ---- nginx 侧 ----
 	//

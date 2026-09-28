@@ -21,6 +21,9 @@ import { UpdateView } from './update.js';
 // 「权限」（逐项申请 macOS 授权）2026-09-20 从侧栏搬进「面板设置」，作为本页一个 Tab。
 // 实现仍在 permissions.js，这里只是挂进来 —— 不复制代码。
 import { PermissionsView } from './permissions.js';
+// 「面板单次上传上限」的编辑/保存/回读只有一份实现：设置页这里与文件管理器的
+// 「改上限」小窗共用它（同一处后端校验 + 同一处回读，绝不写第二份）。
+import { buildPanelLimitField, savePanelLimitOnly } from './panellimit.js';
 
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
@@ -540,6 +543,11 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
     h('div.hint', { text: '导入大 SQL 会跑很久；出厂的 30 秒会让大文件导入中途失败。改这个值会同时对齐 phpMyAdmin 的 $cfg[\'ExecTimeLimit\']。' }),
   ]);
 
+  // 面板自己的单次上传上限：与上面那组站点限制**不是一回事** —— 它只写 config.json，
+  // 不碰 nginx/PHP、不重启服务。编辑/保存/回读的实现只有 panellimit.js 一份，
+  // 文件管理器上传面板那行的「改上限」小窗共用同一份。
+  const panelField = buildPanelLimitField(v.panel);
+
   // nginx 请求体上限：**只读展示 + 直达入口**（见上面 renderLimitsInto 的说明）
   const nginxValue = lim.client_max_body_size || def.client_max_body_size || '（未设置）';
   const nginxJump = opts.openNginxTuning
@@ -585,6 +593,10 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
     onclick: async () => {
       save.disabled = true;
       try {
+        // 1) 面板自己的上限：走两处入口共用的保存 + 回读路径。只改它时后端不建任务
+        //    （不必为一行 config.json 去 reload nginx）；非法值在这里就抛 400 人话。
+        const freshPanel = await savePanelLimitOnly(panelField.input.value);
+        panelField.set(freshPanel); // 界面上的数字来自服务端回读，不是本地变量
         const patch = {
           // nginx 值不在这里编辑（只有一个可编辑入口：调整配置 → nginx → 性能调整）。
           // 仍然原样回传当前值：应用 PHP 上限时会把同一个值写进各站点 vhost 与
@@ -595,6 +607,17 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
           memory_limit: memField.input.value.trim(),
           max_execution_time: Number(execInput.value),
         };
+        // 2) 站点侧（nginx/PHP）没改就到此为止：没有配置要写、没有服务要重启。
+        const siteChanged = patch.client_max_body_size !== (lim.client_max_body_size || '')
+          || patch.upload_max_filesize !== (lim.upload_max_filesize || '')
+          || patch.post_max_size !== (lim.post_max_size || '')
+          || patch.memory_limit !== (lim.memory_limit || '')
+          || patch.max_execution_time !== Number(lim.max_execution_time);
+        if (!siteChanged) {
+          toast('面板单次上传上限已保存并回读', 'ok', 6000);
+          return;
+        }
+        // 3) 站点侧变了才走任务中心（写 vhost/conf.d、reload nginx、重启 php-fpm）。
         // 后端会先校验（非法 400 + 人话）；通过则 202 + task_id，进度在任务中心。
         const id = await taskCenter.start({
           kind: 'settings',
@@ -741,6 +764,7 @@ export async function renderLimitsInto(container, refresh, opts = {}) {
             '（升级会覆盖、手改会丢），PHP 真正读取的是这个片段，右边的回读值就是它。' }),
         ]),
         nginxInfo,
+        h('div.row', [panelField.field]),
         h('div.row', [uploadField.field]),
         h('div.row', [postField.field, memField.field, execField]),
         h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '4px' } }, [
