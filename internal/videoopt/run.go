@@ -35,6 +35,8 @@ type Source struct {
 	Name  string
 	Path  string
 	Bytes int64
+	// ModTime 是文件的修改时间（探测缓存的失效判据之一）。
+	ModTime time.Time
 }
 
 // Progress 是一次转码进度（Percent 0~100）。
@@ -324,7 +326,10 @@ func Scan(dir string) ([]Source, error) {
 		if ierr != nil {
 			continue
 		}
-		out = append(out, Source{Name: e.Name(), Path: filepath.Join(dir, e.Name()), Bytes: info.Size()})
+		out = append(out, Source{
+			Name: e.Name(), Path: filepath.Join(dir, e.Name()),
+			Bytes: info.Size(), ModTime: info.ModTime(),
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
@@ -375,7 +380,18 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		outPath := filepath.Join(req.OutDir, OutputName(src.Name, opts.Preset.ID))
 		_, statErr := os.Stat(outPath)
 		outExists := statErr == nil
-		info, perr := runner.Probe(ctx, src.Path)
+		// 探测结果按「路径 + size + mtime」缓存：配置变更（档位/码率/编码器/模式/2-pass）
+		// 只走下面的纯函数重算 ⇒ 0 次 ffprobe（用户点名的性能硬要求）。
+		// 文件一变（size 或 mtime）就是未命中，必须重探 —— 绝不拿旧数据糊。
+		info, cached := req.Cache.Get(src.Path, src.Bytes, src.ModTime)
+		var perr error
+		if !cached {
+			info, perr = runner.Probe(ctx, src.Path)
+			res.Probed++
+			if perr == nil {
+				req.Cache.Put(src.Path, src.Bytes, src.ModTime, info)
+			}
+		}
 		if perr != nil {
 			res.Rows = append(res.Rows, Plan{
 				Name: src.Name, Path: src.Path,

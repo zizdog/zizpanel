@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -33,11 +34,15 @@ const videoEngineAppID = "ffmpeg"
 // videoShrinkNote 是计划面板上必须写清楚的一句话（用户点名的口径；两种模式都成立）。
 const videoShrinkNote = "产物只会更小：码率封顶在原片码率×0.95 以内"
 
+// videoEngineTTL 是 ffmpeg 版本串的缓存存活期（版本只在装/升级 ffmpeg 时变）。
+const videoEngineTTL = 5 * time.Minute
+
 // videoRunnerOverride 仅供单测：门禁不许跑真 ffmpeg（慢、且结论随开发机装没装而变），
 // 但又必须能断言执行期的"产物更大就删掉"判据 —— 注入假 Runner 后全用假文件断言。
 var videoRunnerOverride videoopt.Runner
 
-// videoRunner 返回这台机器上的 ffmpeg 执行器（就地探测，不缓存：用户可能刚装完）。
+// videoRunner 返回这台机器上的 ffmpeg 执行器（路径就地定位，不缓存：用户可能刚装完；
+// 探到的**视频信息**另有进程级缓存 ProbeCache）。
 func (s *Server) videoRunner() videoopt.Runner {
 	if videoRunnerOverride != nil {
 		return videoRunnerOverride
@@ -64,6 +69,9 @@ type fileVideoReq struct {
 	// Sources 是弹窗计划表里"可压行"的指纹（文件名 + 源字节数，可空）。
 	// 任务里重新探测时用它核对文件有没有在两次探测之间变过（见 videoopt.PlanRequest.Expect）。
 	Sources []fileVideoSource `json:"sources,omitempty"`
+	// Rescan 为 true 时先让该目录的探测缓存失效再规划 ——「⟳ 重新扫描」按钮走它，
+	// 用于"文件内容变了但 size/mtime 没变"或用户就是想强制重读一遍。
+	Rescan bool `json:"rescan,omitempty"`
 }
 
 // fileVideoSource 是计划表一行的指纹（只用来发现"文件变了"，不参与规划判据）。
@@ -103,6 +111,8 @@ type videoPlanResponse struct {
 	EstBytes int64           `json:"est_bytes"`
 	Rows     []videoopt.Plan `json:"rows"`
 	Note     string          `json:"note"`
+	// Probed 是这一次真正跑了 ffprobe 的次数（缓存命中不算）。
+	Probed int `json:"probed"`
 
 	// 体积对比与"码率已到极限 ⇒ 不转码、原样放进 output"的提醒（判据全部来自 planner）。
 	TotalSourceBytes int64  `json:"total_source_bytes"`
@@ -202,17 +212,23 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 		failFileErr(w, derr, req.Dir)
 		return
 	}
+	// 「⟳ 重新扫描」：显式丢掉这个目录的探测结论后重探一次。
+	if req.Rescan {
+		s.probeCache.InvalidateDir(dir)
+	}
 	res, berr := videoopt.BuildPlan(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Options: opts,
+		Dir: dir, Options: opts, Cache: s.probeCache,
 	}, runner)
 	if berr != nil {
 		failFileErr(w, berr, dir)
 		return
 	}
 	resp.Available = true
-	resp.Engine = runner.Version(r.Context())
+	// 引擎版本串走进程级短缓存：热路径上每次都 spawn `ffmpeg -version` 是纯浪费。
+	resp.Engine = s.engineVer.Get(func() string { return runner.Version(r.Context()) })
 	resp.Dir, resp.OutDir = res.Dir, res.OutDir
 	resp.KBps = res.KBps
+	resp.Probed = res.Probed
 	resp.Total, resp.Runnable, resp.Skipped, resp.EstBytes = len(res.Rows), res.Runnable, res.Skipped, res.EstBytes
 	resp.Rows = res.Rows
 	resp.TotalSourceBytes, resp.EstSavedBytes = res.TotalSourceBytes, res.EstSavedBytes
@@ -277,7 +293,7 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 
 	tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "正在读取视频信息…"})
 	plan, err := videoopt.BuildPlanProgress(ctx, videoopt.PlanRequest{
-		Dir: dir, Options: opts, Expect: expect,
+		Dir: dir, Options: opts, Expect: expect, Cache: s.probeCache,
 	}, runner, func(done, total int, name string) {
 		tasks.ReportProgress(ctx, tasks.Progress{
 			Phase: "scan", FilesDone: done, FilesTotal: total,

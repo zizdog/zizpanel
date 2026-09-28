@@ -358,6 +358,9 @@ type PlanRequest struct {
 	// 非空时规划会**核对两次探测之间文件有没有变**：大小不一致、或计划表里
 	// 有而这次扫不到，都如实跳过并说明 —— 绝不静默按旧计划压（见 BuildPlanProgress）。
 	Expect map[string]int64
+	// Cache 是进程级探测缓存（由 Server 持有并注入，见 ProbeCache）。
+	// nil = 不缓存（每次现探）；命中即 0 次 ffprobe，配置变更只做纯函数重算。
+	Cache *ProbeCache
 }
 
 // PlanResult 是一次规划的结果。
@@ -387,6 +390,9 @@ type PlanResult struct {
 	CappedSkipped int `json:"capped_skipped"`
 	// PlaceCount 是"不转码但要原样放进 output/"的行数（含码率封顶与其它跳过原因）。
 	PlaceCount int `json:"place_count"`
+	// Probed 是这一次真正跑了 ffprobe 的次数（缓存命中不算）——
+	// 面板与门禁据此如实判断"配置变更有没有又去重探一遍"。
+	Probed int `json:"probed"`
 }
 
 // OutputDirName 是产物子目录名（写进 <当前目录>/output/）。

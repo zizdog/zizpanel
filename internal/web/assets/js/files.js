@@ -2595,10 +2595,17 @@ export function FilesView(content, ctx = {}) {
   //   · 绝不越压越大（计划表白纸黑字写体积对比，执行时回读产物大小）；
   //   · 后台跑（关掉这个窗口/整个页面都不影响，进度与中断都在任务中心）。
   // 档位/码率/编码器/模式/质量档的选项与默认值**全部来自后端**，前端不重复写数字。
+  //
+  // 性能（用户报障）：改配置不再重新探测。后端按「路径+大小+时间」缓存 ffprobe 结论，
+  // 所以改档位/码率/编码器/模式只做纯函数重算。刷新期间保留已画好的计划表与用户刚点的
+  // 选项，只显示一行"正在刷新计划…"；连点多项时只认最后一次响应。
   async function videoCompressModal() {
     const body = h('div');
+    // 刷新提示与计划表分开：刷新时不动已画好的表，也不把用户刚点的选项弹回去。
+    const refreshHint = h('div.hint', { style: { display: 'none' }, text: '正在刷新计划…' });
+    const shell = h('div', [refreshHint, body]);
     const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
-    const m = modal({ title: '🎬 压缩视频', body, footer: [foot], wide: true });
+    const m = modal({ title: '🎬 压缩视频', body: shell, footer: [foot], wide: true });
 
     let preset = '480p';
     let kbps = 0; // 0 = 用档位下限（默认的"能用下限"码率）
@@ -2607,27 +2614,59 @@ export function FilesView(content, ctx = {}) {
     let quality = 0; // 0 = 用该编码器的默认质量档
     let twoPass = false;
     let plan = null;
+    // reqSeq：连点 3 个选项会有 3 个请求，只让最后一次的响应落地（旧的直接丢弃）。
+    let reqSeq = 0;
+    let startBtn = null;
     // 提交期的原地反馈：用户实测的空档是"弹窗先消失、进度窗还没来"。
     // 拿到 202 之前不关弹窗，一直显示"正在提交压缩任务…"。
     const submitHint = h('div.hint', { style: { display: 'none' } });
 
-    async function reload() {
-      clear(body); clear(foot);
-      body.append(h('div.hint', { text: '正在读取目录与视频信息…' }));
-      try {
-        plan = await api.fileVideoPlan({
-          dir: cwd, preset, kbps, encoder, mode, quality, two_pass: twoPass,
-        });
-      } catch (e) {
-        body.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '读取失败：' + ((e && e.message) || e) }));
-        foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
-        return;
-      }
-      // 后端归一化后的值回填本地状态（默认值只由后端定义一次）。
+    // 后端归一化后的值回填本地状态（默认值只由后端定义一次）。
+    function syncFromPlan() {
       encoder = plan.encoder || encoder;
       mode = plan.mode || mode;
       quality = plan.quality || 0;
       twoPass = !!plan.two_pass;
+    }
+
+    async function reload(opts) {
+      const o = opts || {};
+      const my = ++reqSeq;
+      if (!plan) {
+        // 冷路径（第一次打开）：只有这里才真的在等服务端逐文件探测。
+        clear(body); clear(foot);
+        refreshHint.style.display = 'none';
+        body.append(h('div.hint', { text: '正在读取目录与视频信息…' }));
+      } else {
+        refreshHint.style.display = '';
+        if (startBtn) startBtn.disabled = true; // 刷新期间不许提交，避免提交到上一份计划
+      }
+      let next;
+      try {
+        next = await api.fileVideoPlan({
+          dir: cwd, preset, kbps, encoder, mode, quality, two_pass: twoPass, rescan: !!o.rescan,
+        });
+      } catch (e) {
+        if (my !== reqSeq) return; // 过期响应：只留最后一次
+        refreshHint.style.display = 'none';
+        if (!plan) {
+          clear(body); clear(foot);
+          body.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '读取失败：' + ((e && e.message) || e) }));
+          foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+        } else {
+          // 刷新失败：退回到上一份可用计划（选项显示与本地状态一起退回，绝不错位）。
+          preset = plan.preset || preset;
+          kbps = plan.kbps || 0;
+          syncFromPlan();
+          draw();
+          toast('刷新计划失败：' + ((e && e.message) || e), 'err', 10000);
+        }
+        return;
+      }
+      if (my !== reqSeq) return; // 过期响应：只留最后一次
+      refreshHint.style.display = 'none';
+      plan = next;
+      syncFromPlan();
       draw();
     }
 
@@ -2657,6 +2696,7 @@ export function FilesView(content, ctx = {}) {
 
     function draw() {
       clear(body); clear(foot);
+      startBtn = null;
 
       if (!plan.available) {
         body.append(h('div', { style: { lineHeight: '1.8' } }, [
@@ -2811,6 +2851,7 @@ export function FilesView(content, ctx = {}) {
         disabled: !canStart,
         title: canStart ? '在任务中心后台执行；关掉页面不受影响' : '没有可处理的内容',
       });
+      startBtn = start;
       // 提交提示每次重画都归零（上一次的"提交失败"不该留在新计划上）。
       submitHint.style.display = 'none';
       submitHint.style.color = '';
@@ -2855,7 +2896,13 @@ export function FilesView(content, ctx = {}) {
         if (id) m.close();
       });
       foot.append(start);
-      foot.append(h('button.btn', { text: '重新规划', onclick: reload }));
+      // 「重新扫描」= 显式让服务端丢掉本目录的探测缓存并重探（正常改配置走缓存、不重探）。
+      // title 必须写清它是干什么的，否则用户会以为它是普通的"刷新"。
+      foot.append(h('button.btn', {
+        text: '⟳ 重新扫描',
+        title: '丢掉本目录的缓存并重新读取视频信息（文件已换但大小/时间没变时用它）',
+        onclick: () => reload({ rescan: true }),
+      }));
       foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
     }
 

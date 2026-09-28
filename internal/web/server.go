@@ -27,6 +27,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/tasks"
 	"github.com/zizdog/zizpanel/internal/term"
 	"github.com/zizdog/zizpanel/internal/version"
+	"github.com/zizdog/zizpanel/internal/videoopt"
 )
 
 //go:embed all:assets
@@ -114,6 +115,18 @@ type Server struct {
 	// 理由同上：预算内没答完的服务如实报「未确认」，后台探针跑完把真实结论
 	// 写进这份缓存，下一次请求就能拿到（否则会永远停在「未确认」）。
 	healthCache *services.HealthCache
+
+	// ---- 视频探测（ffprobe）结论的进程级缓存（跨请求）----
+	//
+	// 理由同 startHints / healthCache：web 层每次请求都新建对象（这里是
+	// videoRunner()），缓存挂在它上面活不过一次请求。用户点「压缩视频」后每改一次
+	// 配置都会重新请求 /video-plan，没有这份缓存就会把目录里每个视频重跑一遍
+	// ffprobe（用户报障："动任何一处都要重新『正在读取目录与视频信息…』"）。
+	probeCache *videoopt.ProbeCache
+
+	// engineVer 是 ffmpeg 版本串的短缓存：改配置走探测缓存后（0 次 ffprobe），
+	// 每次请求都 spawn 一次 `ffmpeg -version` 就成了热路径上最大的开销。
+	engineVer *videoopt.VersionCache
 
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog
@@ -225,6 +238,8 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		serviceRepo: services.NewRepository(st),
 		startHints:  &services.StartHintStore{},
 		healthCache: &services.HealthCache{},
+		probeCache:  videoopt.NewProbeCache(videoopt.DefaultProbeTTL, videoopt.DefaultProbeMaxEntries),
+		engineVer:   videoopt.NewVersionCache(videoEngineTTL),
 		Tasks:       tasks.NewManager(),
 		static:      sub,
 		startAt:     time.Now(),

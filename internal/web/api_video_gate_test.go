@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,15 +37,24 @@ type fakeVideoRunner struct {
 	probeErr error
 	// probeDelay 让探测变慢：门禁用它证明"接口没有在返回前做耗时探测"。
 	probeDelay time.Duration
+	// probeCount 数**真的探测了几次**（缓存命中不算）：探测缓存门禁的唯一判据。
+	// 用原子量：压缩任务在后台 goroutine 里探测，测试在任务结束后读取。
+	probeCount atomic.Int64
+	// versionCount 数 `ffmpeg -version` 被 spawn 了几次（版本串缓存门禁用）。
+	versionCount atomic.Int64
 	// reqs 记录每次转码的请求（证明执行期仍走同一份 planner）。
 	reqs []videoopt.TranscodeRequest
 }
 
 func (f *fakeVideoRunner) Available() error { return nil }
 
-func (f *fakeVideoRunner) Version(context.Context) string { return "fake-1.0" }
+func (f *fakeVideoRunner) Version(context.Context) string {
+	f.versionCount.Add(1)
+	return "fake-1.0"
+}
 
 func (f *fakeVideoRunner) Probe(_ context.Context, path string) (videoopt.MediaInfo, error) {
+	f.probeCount.Add(1)
 	if f.probeDelay > 0 {
 		time.Sleep(f.probeDelay)
 	}
