@@ -71,12 +71,12 @@ func gatePlan(t *testing.T, dir, name string, bytes int64, kbps, reqKbps int) (P
 		infos:    map[string]MediaInfo{src: gateInfo(bytes, kbps)},
 		outBytes: 100,
 	}
-	preset, ok := FindPreset(DefaultPresetID)
+	preset, ok := FindPreset("480p")
 	if !ok {
-		t.Fatal("默认预设不存在")
+		t.Fatal("预设 480p 不存在")
 	}
 	plan, err := BuildPlan(context.Background(), PlanRequest{
-		Dir: dir, Options: Options{Preset: preset, KBps: reqKbps},
+		Dir: dir, Options: Options{Preset: preset, KBps: reqKbps, Mode: ModeBitrate},
 	}, runner)
 	if err != nil {
 		t.Fatal(err)

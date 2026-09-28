@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -31,8 +32,14 @@ import (
 // videoEngineAppID 是市场里提供 ffmpeg/ffprobe 的条目 ID（引擎缺失时的下一步）。
 const videoEngineAppID = "ffmpeg"
 
-// videoShrinkNote 是计划面板上必须写清楚的一句话（用户点名的口径；两种模式都成立）。
+// videoShrinkNote 是计划面板上必须写清楚的一句话（用户点名的口径）。
+//
+// 两种模式分开说：目标码率体积可预估；质量优先（CRF/q:v）**体积不可预估**，
+// 可能压不小 —— 那时执行兜底会删掉产物、原样放进 output 并如实说明。
 const videoShrinkNote = "产物只会更小：码率封顶在原片码率×0.95 以内"
+
+// videoQualityNote 是质量优先模式下必须写出的那句风险提示（用户点名）。
+const videoQualityNote = "质量优先不预估体积：可能不小于原文件，届时会跳过并说明"
 
 // videoEngineTTL 是 ffmpeg 版本串的缓存存活期（版本只在装/升级 ffmpeg 时变）。
 const videoEngineTTL = 5 * time.Minute
@@ -72,6 +79,9 @@ type fileVideoReq struct {
 	// Rescan 为 true 时先让该目录的探测缓存失效再规划 ——「⟳ 重新扫描」按钮走它，
 	// 用于"文件内容变了但 size/mtime 没变"或用户就是想强制重读一遍。
 	Rescan bool `json:"rescan,omitempty"`
+	// Names 是"只处理选中的这些视频"（当前目录下的**文件名**）；空 = 处理全部视频。
+	// 不合法（带路径/..）当场 400；不是视频或不存在则逐条如实标记；全不合法整体 400。
+	Names []string `json:"names,omitempty"`
 }
 
 // fileVideoSource 是计划表一行的指纹（只用来发现"文件变了"，不参与规划判据）。
@@ -97,13 +107,19 @@ type videoPlanResponse struct {
 	BitrateChoices []videoopt.BitrateChoice `json:"bitrate_choices"`
 
 	// 编码器 / 模式 / 质量档：默认值与选项都由后端给，前端不重复写数字。
-	Encoder        string                   `json:"encoder"`
+	Encoder string `json:"encoder"`
+	// EncoderCodec 是真正传给 ffmpeg 的 -c:v（硬件档 = hevc_videotoolbox）。
+	EncoderCodec   string                   `json:"encoder_codec"`
 	Mode           string                   `json:"mode"`
 	Quality        int                      `json:"quality"`
 	TwoPass        bool                     `json:"two_pass"`
 	Encoders       []videoopt.Choice        `json:"encoders"`
 	Modes          []videoopt.Choice        `json:"modes"`
 	QualityChoices []videoopt.QualityChoice `json:"quality_choices"`
+
+	// Names/Rejects 回显"只处理选中的这些"（Names 空 = 全部视频）与逐条拒绝原因。
+	Names   []string              `json:"names,omitempty"`
+	Rejects []videoopt.NameReject `json:"rejects,omitempty"`
 
 	Total    int             `json:"total"`
 	Runnable int             `json:"runnable"`
@@ -136,7 +152,7 @@ func parseVideoReq(req fileVideoReq) (videoopt.Options, error) {
 	}
 	preset, ok := videoopt.FindPreset(id)
 	if !ok {
-		return videoopt.Options{}, fmt.Errorf("档位只能是 360p / 480p / 720p")
+		return videoopt.Options{}, fmt.Errorf("档位只能是 360p / 480p / 720p / 1080p / 原始")
 	}
 	if req.KBps != 0 && (req.KBps < videoopt.MinKBps || req.KBps > videoopt.MaxKBps) {
 		return videoopt.Options{}, fmt.Errorf("码率必须是 %d~%d kbps 的整数", videoopt.MinKBps, videoopt.MaxKBps)
@@ -151,6 +167,32 @@ func parseVideoReq(req fileVideoReq) (videoopt.Options, error) {
 	return videoopt.NormalizeOptions(opts), nil
 }
 
+// parseVideoNames 校验"只处理选中的这些文件"的名字（路径安全：只能是本目录下的文件名）。
+func parseVideoNames(names []string) ([]string, error) {
+	return videoopt.NormalizeNames(names)
+}
+
+// requestedNamesErr 把 planner 的"一个都不是视频"错误映射成 400（其余照旧）。
+func requestedNamesErr(w http.ResponseWriter, err error) bool {
+	var rn *videoopt.RequestedNamesError
+	if errors.As(err, &rn) {
+		fail(w, http.StatusBadRequest, rn.Error())
+		return true
+	}
+	return false
+}
+
+// namesPreflight 在**建任务之前**做一次"选了但一个都不是视频"的预检（同步、不跑 ffprobe）。
+//
+// 为什么不在任务里 400：接口已经回了 202，用户拿到的是一个注定失败的任务。
+func namesPreflight(dir string, names []string) error {
+	usable, rejects := videoopt.CheckRequestedNames(dir, names)
+	if len(usable) == 0 {
+		return &videoopt.RequestedNamesError{Rejects: rejects}
+	}
+	return nil
+}
+
 // newVideoPlanResponse 填好与目录无关的字段（档位/码率/选项始终要有，
 // 引擎缺失时前端也要能把面板画出来，并给出「一键安装 FFmpeg」）。
 func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
@@ -160,6 +202,7 @@ func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
 		Presets:        videoopt.Presets(),
 		BitrateChoices: videoopt.BitrateChoices(opts.Preset),
 		Encoder:        opts.Encoder,
+		EncoderCodec:   videoopt.EncoderCodec(opts.Encoder),
 		Mode:           opts.Mode,
 		Quality:        opts.Quality,
 		TwoPass:        opts.TwoPass,
@@ -168,8 +211,16 @@ func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
 		QualityChoices: videoopt.QualityChoices(opts.Encoder),
 		MarketAppID:    videoEngineAppID,
 		Rows:           []videoopt.Plan{},
-		Note:           videoShrinkNote,
+		Note:           videoPlanNote(opts.Mode),
 	}
+}
+
+// videoPlanNote 按模式给计划面板那句说明（质量优先必须明说"体积不可预估"）。
+func videoPlanNote(mode string) string {
+	if videoopt.ResolveMode(mode) == videoopt.ModeQuality {
+		return videoQualityNote
+	}
+	return videoShrinkNote
 }
 
 // videoSkipNotice 是"码率已到极限 ⇒ 不转码、原样放进 output"的提醒（判据来自 planner 的 Capped）。
@@ -198,6 +249,11 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	names, err := parseVideoNames(req.Names)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	resp := newVideoPlanResponse(opts)
 
 	runner := s.videoRunner()
@@ -216,14 +272,26 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	if req.Rescan {
 		s.probeCache.InvalidateDir(dir)
 	}
-	res, berr := videoopt.BuildPlan(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Options: opts, Cache: s.probeCache,
-	}, runner)
+	// 首次扫描要能看到"读到第几个/共几个 + 当前文件名"：扫的过程中把进度记进
+	// scanProgress，前端在请求飞行期间轮询 /video-plan-progress（改配置走缓存时
+	// 整个扫描是毫秒级、也一次 ffprobe 都不跑 ⇒ 轮询拿到的 active=false）。
+	s.scanProgress.Begin(dir)
+	res, berr := videoopt.BuildPlanProgress(r.Context(), videoopt.PlanRequest{
+		Dir: dir, Options: opts, Cache: s.probeCache, Names: names,
+		OnProbe: func() { s.scanProgress.CountProbe(dir) },
+	}, runner, func(done, total int, name string) {
+		s.scanProgress.Update(dir, done, total, name)
+	})
+	s.scanProgress.End(dir)
 	if berr != nil {
+		if requestedNamesErr(w, berr) {
+			return
+		}
 		failFileErr(w, berr, dir)
 		return
 	}
 	resp.Available = true
+	resp.Names, resp.Rejects = res.Names, res.Rejects
 	// 引擎版本串走进程级短缓存：热路径上每次都 spawn `ffmpeg -version` 是纯浪费。
 	resp.Engine = s.engineVer.Get(func() string { return runner.Version(r.Context()) })
 	resp.Dir, resp.OutDir = res.Dir, res.OutDir
@@ -239,6 +307,32 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 		resp.WarningDetail = videoSkipNoticeDetail
 	}
 	ok(w, resp)
+}
+
+// videoPlanProgress 是首次扫描的进度响应（前端在 /video-plan 飞行期间轮询）。
+type videoPlanProgress struct {
+	// Active=false 表示这个目录当前没有"真在探测"的扫描（已缓存/空闲/刚跑完）。
+	Active  bool   `json:"active"`
+	Done    int    `json:"done"`
+	Total   int    `json:"total"`
+	Name    string `json:"name,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// handleFileVideoPlanProgress 只读回"这次扫描读到第几个了"。
+//
+// 只在扫描**真的在跑 ffprobe** 时 active=true：缓存命中的扫描（改配置/二次打开）
+// 是毫秒级且 0 次 ffprobe ⇒ 前端不会再闪出「正在读取视频信息…」这个过程。
+func (s *Server) handleFileVideoPlanProgress(w http.ResponseWriter, r *http.Request) {
+	dir, derr := s.fileResolveDir(r.URL.Query().Get("dir"), false)
+	if derr != nil {
+		failFileErr(w, derr, r.URL.Query().Get("dir"))
+		return
+	}
+	p, _ := s.scanProgress.Get(dir)
+	ok(w, videoPlanProgress{
+		Active: p.Probed > 0, Done: p.Done, Total: p.Total, Name: p.Name, Message: p.Message,
+	})
 }
 
 // handleFileVideoCompress 开始压缩（202 + task_id，长任务中心）。
@@ -262,6 +356,11 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	names, err := parseVideoNames(req.Names)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	runner := s.videoRunner()
 	if err := runner.Available(); err != nil {
 		// 引擎缺失：409 + 可照做的下一步（不建一个注定失败的任务）。
@@ -273,6 +372,13 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		failFileErr(w, derr, req.Dir)
 		return
 	}
+	// 选了但一个都不是视频：当场 400（绝不建一个注定失败的任务）。
+	if len(names) > 0 {
+		if nerr := namesPreflight(dir, names); nerr != nil {
+			fail(w, http.StatusBadRequest, nerr.Error())
+			return
+		}
+	}
 	expect := make(map[string]int64, len(req.Sources))
 	for _, src := range req.Sources {
 		if strings.TrimSpace(src.Name) != "" {
@@ -283,17 +389,17 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 	title := fmt.Sprintf("压缩视频（%s）", opts.Preset.ID)
 	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress",
 		func(ctx context.Context, log tasks.LogFunc) (any, error) {
-			return s.runVideoCompress(ctx, dir, opts, expect, runner, log)
+			return s.runVideoCompress(ctx, dir, opts, names, expect, runner, log)
 		})
 }
 
 // runVideoCompress 是任务体：先探测规划（如实上报 scan 进度），再按同一份计划执行。
 func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt.Options,
-	expect map[string]int64, runner videoopt.Runner, log tasks.LogFunc) (*videoopt.RunResult, error) {
+	names []string, expect map[string]int64, runner videoopt.Runner, log tasks.LogFunc) (*videoopt.RunResult, error) {
 
 	tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "正在读取视频信息…"})
 	plan, err := videoopt.BuildPlanProgress(ctx, videoopt.PlanRequest{
-		Dir: dir, Options: opts, Expect: expect, Cache: s.probeCache,
+		Dir: dir, Options: opts, Expect: expect, Cache: s.probeCache, Names: names,
 	}, runner, func(done, total int, name string) {
 		tasks.ReportProgress(ctx, tasks.Progress{
 			Phase: "scan", FilesDone: done, FilesTotal: total,

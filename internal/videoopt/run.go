@@ -65,28 +65,44 @@ type TranscodeRequest struct {
 	PassLog string
 }
 
+// EncoderCodec 是"编码器选项 → ffmpeg -c:v"的**唯一映射点**（面板/日志/执行都读它）。
+//
+// 硬件档固定用 HEVC（hevc_videotoolbox）：用户点名"选硬件加速时默认用 HEVC"。
+// `-tag:v hvc1` 是 macOS/QuickTime 的硬要求：ffmpeg 默认写 hev1，QuickTime 放不了。
+func EncoderCodec(encoder string) string {
+	if ResolveEncoder(encoder) == EncoderHardware {
+		return "hevc_videotoolbox"
+	}
+	return "libx264"
+}
+
 // TranscodeArgs 返回**一遍**转码的完整 ffmpeg 参数（pass=0 单遍，1/2 是两遍）。
 //
 // 这里是"面板选项 → ffmpeg 命令行"的**唯一映射点**：门禁直接断言它，
 // 不用真跑 ffmpeg 就能保证硬件/CPU、目标码率/质量优先、2-pass 真的传到了命令行。
 //
 // quality 与 passlogfile 都走参数，绝不落进 shell 字符串拼接。
+//
+// 硬件档只换 -c:v，码率/质量参数与 CPU **逐字节相同**（用户点名"码率不变"）。
 func TranscodeArgs(req TranscodeRequest, pass int) []string {
 	args := []string{"-hide_banner", "-nostdin", "-y", "-i", req.Src}
 	if ResolveEncoder(req.Encoder) == EncoderHardware {
-		// VideoToolbox：硬件编码，快很多；同码率画质略逊于 x264，码率控制也不够准。
-		args = append(args, "-c:v", "h264_videotoolbox")
+		// VideoToolbox 硬件编码，快很多；同码率画质略逊于 x264，码率控制也不够准。
+		args = append(args, "-c:v", EncoderCodec(req.Encoder), "-tag:v", "hvc1")
 	} else {
-		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main")
+		args = append(args, "-c:v", EncoderCodec(req.Encoder), "-preset", "veryfast", "-profile:v", "main")
 	}
 	args = append(args, "-pix_fmt", "yuv420p")
 
 	if ResolveMode(req.Mode) == ModeQuality {
+		// 质量档在这里也归一化一次：0 = 该编码器的默认档（-crf 0 是"无损"，
+		// 绝不是"没设置"的意思，漏掉归一化会静默压出巨大文件）。
+		q := ResolveQuality(req.Encoder, req.Quality)
 		if ResolveEncoder(req.Encoder) == EncoderHardware {
 			// -q:v 越大文件越大/画质越好（与 CRF 相反），实测见 plan.go 的常量注释。
-			args = append(args, "-q:v", strconv.Itoa(req.Quality))
+			args = append(args, "-q:v", strconv.Itoa(q))
 		} else {
-			args = append(args, "-crf", strconv.Itoa(req.Quality))
+			args = append(args, "-crf", strconv.Itoa(q))
 		}
 	} else {
 		args = append(args, "-b:v", fmt.Sprintf("%dk", req.VideoKbps))
@@ -363,9 +379,34 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		Encoder: opts.Encoder, Mode: opts.Mode, Quality: opts.Quality, TwoPass: opts.TwoPass,
 		Rows: []Plan{},
 	}
+	// "只处理选中的文件"：names 非空时只计划这些（探测也只探这些，缓存键不变）。
+	names, nerr := NormalizeNames(req.Names)
+	if nerr != nil {
+		return res, nerr
+	}
+	res.Names = names
 	sources, err := Scan(req.Dir)
 	if err != nil {
 		return res, fmt.Errorf("读取目录失败: %w", err)
+	}
+	if len(names) > 0 {
+		usable, rejects := CheckRequestedNames(req.Dir, names)
+		res.Rejects = rejects
+		if len(usable) == 0 {
+			// 一个都不合法：整体报错（接口层 400），绝不假装"计划为空、无事可做"。
+			return res, &RequestedNamesError{Rejects: rejects}
+		}
+		want := make(map[string]bool, len(usable))
+		for _, n := range usable {
+			want[n] = true
+		}
+		filtered := make([]Source, 0, len(usable))
+		for _, src := range sources {
+			if want[src.Name] {
+				filtered = append(filtered, src)
+			}
+		}
+		sources = filtered
 	}
 	// seen 记录计划表指纹里"这次真的扫到"的文件（用于收尾补"已不存在"的行）。
 	seen := make(map[string]bool, len(sources))
@@ -388,6 +429,9 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		if !cached {
 			info, perr = runner.Probe(ctx, src.Path)
 			res.Probed++
+			if req.OnProbe != nil {
+				req.OnProbe()
+			}
 			if perr == nil {
 				req.Cache.Put(src.Path, src.Bytes, src.ModTime, info)
 			}
@@ -433,6 +477,15 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 			}
 		}
 		res.Rows = append(res.Rows, row)
+	}
+	// names 里被拒的（不是视频 / 不存在）：逐条如实标记，绝不静默忽略。
+	for _, rj := range res.Rejects {
+		res.Rows = append(res.Rows, Plan{
+			Name:       rj.Name,
+			Path:       filepath.Join(req.Dir, rj.Name),
+			SkipReason: "已跳过：" + rj.Reason,
+		})
+		res.Skipped++
 	}
 	// 计划表里有、这次扫不到的（文件被删/移走）：补一行并如实说明（没有源可放）。
 	for name, bytes := range req.Expect {
@@ -652,15 +705,20 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 
 		modeTag := fmt.Sprintf("%d kbps", row.VideoKbps)
 		if row.Mode == ModeQuality {
-			modeTag = fmt.Sprintf("质量档 %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
+			// CRF（越小越好）与 -q:v（越大越好）不是同一把尺子，日志分开写名称。
+			if row.Encoder == EncoderCPU {
+				modeTag = fmt.Sprintf("CRF %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
+			} else {
+				modeTag = fmt.Sprintf("质量档 %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
+			}
 		}
 		passTag := ""
 		if row.TwoPass {
 			passTag = " · 2-pass"
 		}
-		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s%s）",
+		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s %s%s）",
 			i+1, total, row.Name, row.SourceWidth, row.SourceHeight,
-			row.TargetWidth, row.TargetHeight, modeTag, passTag))
+			row.TargetWidth, row.TargetHeight, EncoderCodec(row.Encoder), modeTag, passTag))
 		if row.Capped && row.Note != "" {
 			hooks.log(tasks.LevelWarn, row.Note)
 		}

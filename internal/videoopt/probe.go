@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -22,6 +23,19 @@ var videoExts = map[string]bool{
 // IsVideoName 判断文件名是否可能是视频（只看扩展名）。
 func IsVideoName(name string) bool {
 	return videoExts[strings.ToLower(filepath.Ext(name))]
+}
+
+// VideoExts 返回候选视频扩展名（升序副本）。
+//
+// 面板前端要按**同一口径**判断"选中的是不是视频"（只处理选中的视频），
+// 走这个接口取清单，绝不两边各写一份（门禁会比对前端那份有没有走样）。
+func VideoExts() []string {
+	out := make([]string, 0, len(videoExts))
+	for ext := range videoExts {
+		out = append(out, ext)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // probeJSON 是 ffprobe -print_format json 的响应形状（只取用得到的字段）。

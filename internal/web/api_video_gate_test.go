@@ -125,7 +125,7 @@ func TestVideoCompressGate(t *testing.T) {
 			Width: 1280, Height: 720, DurationSec: 10, FileBytes: 5 << 20,
 			VideoKbps: 800, AudioKbps: 128, HasVideo: true, HasAudio: true,
 		}
-		p := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 2000}, false)
+		p := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 2000, Mode: videoopt.ModeBitrate}, false)
 		// 负向对照：改前是"照压 + 警告"（SkipReason 为空）；现在封顶即跳过。
 		if p.SkipReason == "" || !strings.Contains(p.SkipReason, "码率") {
 			t.Fatalf("被原码率封顶的文件必须标跳过（原因含「码率」），实际 %q", p.SkipReason)
@@ -134,7 +134,7 @@ func TestVideoCompressGate(t *testing.T) {
 			t.Errorf("必须标 Capped 且要原样放进 output：Capped=%v PlaceInOutput=%v", p.Capped, p.PlaceInOutput)
 		}
 		// 负向对照的另一半：请求码率低于原片×0.95 时仍应可压，且绝不超原码率。
-		q := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 400}, false)
+		q := videoopt.PlanOne("a.mp4", "/tmp/a.mp4", "/tmp/out", info, videoopt.Options{Preset: preset720, KBps: 400, Mode: videoopt.ModeBitrate}, false)
 		if q.SkipReason != "" {
 			t.Fatalf("请求码率 400 < 800×0.95 时不该跳过，实际 %q", q.SkipReason)
 		}
@@ -164,7 +164,7 @@ func TestVideoCompressGate(t *testing.T) {
 				Width: c.w, Height: c.h, DurationSec: 5, FileBytes: 1 << 20,
 				VideoKbps: 2000, AudioKbps: 0, HasVideo: true,
 			}
-			p := videoopt.PlanOne("v.mp4", "/tmp/v.mp4", "/tmp/out", info, videoopt.Options{Preset: c.preset}, false)
+			p := videoopt.PlanOne("v.mp4", "/tmp/v.mp4", "/tmp/out", info, videoopt.Options{Preset: c.preset, Mode: videoopt.ModeBitrate}, false)
 			if p.SkipReason != "" {
 				t.Fatalf("%s：不该跳过（%s）", c.name, p.SkipReason)
 			}
@@ -198,7 +198,7 @@ func TestVideoCompressGate(t *testing.T) {
 				VideoKbps: 2000, AudioKbps: 128, HasVideo: true, HasAudio: true,
 			}},
 		}
-		row := videoopt.PlanOne("big.mp4", src, outDir, runner.infos[src], videoopt.Options{Preset: preset480, KBps: 800}, false)
+		row := videoopt.PlanOne("big.mp4", src, outDir, runner.infos[src], videoopt.Options{Preset: preset480, KBps: 800, Mode: videoopt.ModeBitrate}, false)
 		if !row.Runnable() {
 			t.Fatalf("计划本身应该是可压的：%s", row.SkipReason)
 		}
@@ -265,17 +265,24 @@ func TestVideoCompressGate(t *testing.T) {
 			VideoKbps: 2000, AudioKbps: 128, HasVideo: true, HasAudio: true,
 		}}
 
-		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "1080p"})
+		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "4k"})
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("不存在的档位必须 400，实际 %d", rec.Code)
+		}
+		// 1080p 与「原始」现在是**合法档位**（新增）：不许再被当成未知档位。
+		for _, id := range []string{"1080p", "source"} {
+			if r2 := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": id}); r2.Code != http.StatusOK {
+				t.Errorf("档位 %s 必须合法（200），实际 %d", id, r2.Code)
+			}
 		}
 		rec = postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "480p", "kbps": 5})
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("越界码率必须 400，实际 %d", rec.Code)
 		}
 
-		// 计划：360p 选 720p 也不能放大，且面板要拿到那句"产物只会更小"。
-		rec = postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "720p"})
+		// 计划：360p 选 720p 也不能放大（显式走目标码率模式，体积可预估）。
+		rec = postVideoJSON(t, srv.handleFileVideoPlan,
+			map[string]any{"dir": dir, "preset": "720p", "mode": "bitrate"})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("video-plan 应该成功：%d %s", rec.Code, rec.Body.String())
 		}
@@ -285,6 +292,7 @@ func TestVideoCompressGate(t *testing.T) {
 				Available bool            `json:"available"`
 				Runnable  int             `json:"runnable"`
 				Note      string          `json:"note"`
+				EstBytes  int64           `json:"est_bytes"`
 				Rows      []videoopt.Plan `json:"rows"`
 			} `json:"data"`
 		}
@@ -298,8 +306,10 @@ func TestVideoCompressGate(t *testing.T) {
 		if row.TargetWidth > 640 || row.TargetHeight > 360 {
 			t.Errorf("计划里放大了：%dx%d", row.TargetWidth, row.TargetHeight)
 		}
-		if !strings.Contains(planBody.Data.Note, "产物只会更小") {
-			t.Errorf("面板必须有那句「产物只会更小」的说明，实际 %q", planBody.Data.Note)
+		// 提示文案是用户可改的东西 ⇒ 门禁只断言**行为**：目标码率模式给得出体积预估与一句说明。
+		if planBody.Data.Note == "" || planBody.Data.EstBytes <= 0 || row.EstBytes <= 0 {
+			t.Errorf("目标码率模式必须给体积预估与一句说明，实际 note=%q est=%d row=%d",
+				planBody.Data.Note, planBody.Data.EstBytes, row.EstBytes)
 		}
 
 		// 执行：202 + task_id，并且任务真的按同一个计划跑完（假 Runner，不碰真 ffmpeg）。
@@ -364,9 +374,9 @@ func TestVideoCompressGate(t *testing.T) {
 		withFakeVideoRunner(t, fake)
 
 		started := time.Now()
-		// kbps=2000：执行期必须走同一份 planner（源 4000 kbps，选 2000 不封顶）。
+		// kbps=2000 + 目标码率：执行期必须走同一份 planner（源 4000 kbps，选 2000 不封顶）。
 		rec := postVideoJSON(t, srv.handleFileVideoCompress,
-			map[string]any{"dir": dir, "preset": "480p", "kbps": 2000})
+			map[string]any{"dir": dir, "preset": "480p", "kbps": 2000, "mode": "bitrate"})
 		elapsed := time.Since(started)
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("video-compress 必须 202，实际 %d：%s", rec.Code, rec.Body.String())

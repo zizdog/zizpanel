@@ -990,6 +990,9 @@ export function FilesView(content, ctx = {}) {
   const AUDIO_EXT = /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac)$/i;
   // 已知放不了的容器/编码：mkv/avi/wmv/flv/rmvb 等，浏览器基本解不了（坑 188）。
   const NO_PLAY_EXT = /\.(mkv|avi|wmv|flv|rmvb|rm|mpg|mpeg|ts|m2ts|3gp|asf|wma|mka|ape|vob|f4v)$/i;
+  // 视频压缩的**候选**扩展名：与后端 internal/videoopt 的 videoExts 同一口径
+  // （门禁会比对两边有没有走样）。注意它比 VIDEO_EXT 宽 —— 后者只是"浏览器能播的"。
+  const VIDEO_CANDIDATE_EXT = /\.(mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|ts|m2ts|mts|3gp|rmvb|rm|vob|ogv|asf|f4v)$/i;
   let sortKey = 'name';   // name | size | time
   let sortDir = 1;        // 1 升序 / -1 降序
 
@@ -2603,12 +2606,23 @@ export function FilesView(content, ctx = {}) {
     const body = h('div');
     // 刷新提示与计划表分开：刷新时不动已画好的表，也不把用户刚点的选项弹回去。
     const refreshHint = h('div.hint', { style: { display: 'none' }, text: '正在刷新计划…' });
-    const shell = h('div', [refreshHint, body]);
+    // scopeHint 是"这次处理哪些视频"的唯一说明 + 切换入口（用户点名：别让人以为漏压了）。
+    const scopeHint = h('div.zp-video-scope', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } });
+    const shell = h('div', [refreshHint, scopeHint, body]);
     const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
-    const m = modal({ title: '🎬 压缩视频', body: shell, footer: [foot], wide: true });
+    // 关掉弹窗要能收场：中断进行中的计划请求（服务端规划循环会看 ctx），并停掉进度轮询。
+    let abortPlan = null;
+    let progressTimer = null;
+    const m = modal({
+      title: '🎬 压缩视频', body: shell, footer: [foot], wide: true,
+      onClose: () => {
+        if (abortPlan) abortPlan.abort();
+        stopProgress();
+      },
+    });
 
-    let preset = '480p';
-    let kbps = 0; // 0 = 用档位下限（默认的"能用下限"码率）
+    let preset = ''; // 空 = 用后端默认（首次响应回填 = 原始档）
+    let kbps = 0; // 0 = 用档位下限；原始档 = 按该文件的源分辨率建议（再受原码率×0.95 封顶）
     let encoder = ''; // 空 = 用后端默认（首次响应回填）
     let mode = '';
     let quality = 0; // 0 = 用该编码器的默认质量档
@@ -2621,22 +2635,85 @@ export function FilesView(content, ctx = {}) {
     // 拿到 202 之前不关弹窗，一直显示"正在提交压缩任务…"。
     const submitHint = h('div.hint', { style: { display: 'none' } });
 
+    // 打开弹窗那一刻的选择集：**只把视频候选带进请求**（扩展名口径与后端 videoExts 一致）；
+    // 选择集里没有视频 ⇒ 不带 names（= 处理整个目录），与用户点名的语义一致。
+    const selDirs = new Set(((lastList && lastList.entries) || []).filter((e) => e.is_dir).map((e) => e.name));
+    const selNames = [...selection].map((p) => basename(p))
+      .filter((n) => n && !selDirs.has(n) && VIDEO_CANDIDATE_EXT.test(n));
+    const selOthers = [...selection].map((p) => basename(p))
+      .filter((n) => n && !selDirs.has(n) && !VIDEO_CANDIDATE_EXT.test(n));
+    let onlySelected = selNames.length > 0;
+
+    // renderScope 画"只处理选中的 N 个 / 处理全部 M 个"+ 一颗切换按钮（状态一目了然）。
+    function renderScope() {
+      clear(scopeHint);
+      if (onlySelected) {
+        scopeHint.append(h('span', { text: '只处理选中的 ' + selNames.length + ' 个视频'
+          + (selOthers.length ? '（另有 ' + selOthers.length + ' 项不是视频，已忽略）' : '') }));
+        scopeHint.append(h('button.btn.btn-sm', {
+          text: '改为处理全部', title: '忽略当前选择，处理这个目录里的全部视频',
+          onclick: () => { onlySelected = false; reload(); },
+        }));
+      } else {
+        scopeHint.append(h('span', { text: '处理当前目录的全部'
+          + (plan && plan.total ? ' ' + plan.total + ' 个' : '') + '视频' }));
+        if (selNames.length) {
+          scopeHint.append(h('button.btn.btn-sm', {
+            text: '只处理选中', title: '只处理你在文件列表里选中的那些视频',
+            onclick: () => { onlySelected = true; reload(); },
+          }));
+        }
+      }
+    }
+
+    renderScope();
+
     // 后端归一化后的值回填本地状态（默认值只由后端定义一次）。
     function syncFromPlan() {
+      preset = plan.preset || preset;
+      kbps = plan.kbps || 0;
       encoder = plan.encoder || encoder;
       mode = plan.mode || mode;
       quality = plan.quality || 0;
       twoPass = !!plan.two_pass;
     }
 
+    // stopProgress 停掉首次扫描的进度轮询。
+    function stopProgress() {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+    }
+
+    // startProgress 在**冷路径**（第一次打开这个目录）轮询服务端的实时扫描进度，
+    // 把那一行静态文案换成「正在读取视频信息 3/20：xxx.mp4」（用户：不然以为卡死了）。
+    // 已缓存/改配置时服务端毫秒级返回且 0 次探测 ⇒ 轮询永远拿不到 active=true。
+    function startProgress(line, my) {
+      stopProgress();
+      const tick = async () => {
+        if (my !== reqSeq) return;
+        try {
+          const p = await api.fileVideoPlanProgress(cwd);
+          if (my !== reqSeq) return;
+          if (p && p.active && p.message) line.textContent = p.message;
+        } catch { /* 轮询失败不影响主请求：保持静态文案 */ }
+      };
+      tick();
+      progressTimer = setInterval(tick, 150);
+    }
+
     async function reload(opts) {
       const o = opts || {};
       const my = ++reqSeq;
+      // 上一次还没回来就再点（连点选项/关窗）：中断它，绝不让旧响应覆盖新状态。
+      if (abortPlan) abortPlan.abort();
+      abortPlan = new AbortController();
+      stopProgress();
       if (!plan) {
         // 冷路径（第一次打开）：只有这里才真的在等服务端逐文件探测。
         clear(body); clear(foot);
         refreshHint.style.display = 'none';
-        body.append(h('div.hint', { text: '正在读取目录与视频信息…' }));
+        const line = h('div.hint', { text: '正在读取目录与视频信息…' });
+        body.append(line);
+        startProgress(line, my);
       } else {
         refreshHint.style.display = '';
         if (startBtn) startBtn.disabled = true; // 刷新期间不许提交，避免提交到上一份计划
@@ -2645,9 +2722,14 @@ export function FilesView(content, ctx = {}) {
       try {
         next = await api.fileVideoPlan({
           dir: cwd, preset, kbps, encoder, mode, quality, two_pass: twoPass, rescan: !!o.rescan,
-        });
+          // 只处理选中的视频时才带 names；不带 = 处理整个目录（后端语义）。
+          ...(onlySelected ? { names: selNames } : {}),
+        }, { signal: abortPlan.signal });
       } catch (e) {
+        // 自己中断的（关弹窗 / 被下一次请求顶掉）：静默收场。
+        if (e && e.name === 'AbortError') return;
         if (my !== reqSeq) return; // 过期响应：只留最后一次
+        stopProgress();
         refreshHint.style.display = 'none';
         if (!plan) {
           clear(body); clear(foot);
@@ -2664,6 +2746,7 @@ export function FilesView(content, ctx = {}) {
         return;
       }
       if (my !== reqSeq) return; // 过期响应：只留最后一次
+      stopProgress();
       refreshHint.style.display = 'none';
       plan = next;
       syncFromPlan();
@@ -2696,6 +2779,7 @@ export function FilesView(content, ctx = {}) {
 
     function draw() {
       clear(body); clear(foot);
+      renderScope();
       startBtn = null;
 
       if (!plan.available) {
@@ -2725,21 +2809,15 @@ export function FilesView(content, ctx = {}) {
         return;
       }
 
-      const presetRow = h('div', { style: { display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' } },
-        (plan.presets || []).map((p) => h('label', {
-          style: { display: 'flex', gap: '5px', alignItems: 'center', cursor: 'pointer' },
-        }, [
-          h('input', {
-            type: 'radio', name: 'zp-video-preset', value: p.id, checked: p.id === plan.preset,
-            onchange: () => { preset = p.id; kbps = 0; reload(); },
-          }),
-          h('span', { text: p.label }),
-        ])));
+      // 第一项 = 分辨率（5 档，默认「原始」；选项与文案都来自后端）。
+      const [presetRow, presetHint] = radioRow('zp-video-preset',
+        (plan.presets || []).map((p) => ({ value: p.id, label: p.label, hint: p.hint })),
+        plan.preset, (v) => { preset = v; kbps = 0; reload(); });
 
       const [encoderRow, encoderHint] = radioRow('zp-video-encoder', plan.encoders, plan.encoder, (v) => {
         encoder = v; quality = 0; // 质量档数值在两种编码器里含义不同，切了就回默认
         if (v !== 'cpu') twoPass = false; // 2-pass 只支持 CPU
-        reload();
+        reload(); // 只换编码器，码率/档位一个字都不动（码率参数与 CPU 时逐字相同）
       });
       const [modeRow, modeHint] = radioRow('zp-video-mode', plan.modes, plan.mode, (v) => {
         mode = v; quality = 0;
@@ -2747,7 +2825,8 @@ export function FilesView(content, ctx = {}) {
         reload();
       });
 
-      // 目标码率 / 质量档：二选一（由模式决定）
+      // 目标码率 / 质量档：二选一（由模式决定）。
+      // 两者的刻度**方向相反**（CRF 越小越好 / -q:v 越大越好），标签必须写清。
       let tuneField;
       if (plan.mode === 'quality') {
         const q = h('select.select', (plan.quality_choices || []).map((c) => h('option', {
@@ -2756,11 +2835,13 @@ export function FilesView(content, ctx = {}) {
         q.value = String(plan.quality);
         q.addEventListener('change', () => { quality = Number(q.value) || 0; reload(); });
         tuneField = h('div.field', [h('label', {
-          text: plan.encoder === 'cpu' ? '质量档 CRF（越小画质越好）' : '质量档 -q:v（越大越好，实测标定）',
+          text: plan.encoder === 'cpu'
+            ? '质量档 CRF（1~51，越小画质越好、文件越大）'
+            : '质量档 -q:v（1~100，越大画质越好、文件越大，与 CRF 相反）',
         }), q]);
       } else {
         const bitrate = h('select.select', (plan.bitrate_choices || []).map((c) => h('option', {
-          value: String(c.kbps), text: c.label,
+          value: String(c.kbps), text: c.label, title: c.hint || '',
         })));
         bitrate.value = String(plan.kbps);
         bitrate.addEventListener('change', () => { kbps = Number(bitrate.value) || 0; reload(); });
@@ -2779,9 +2860,18 @@ export function FilesView(content, ctx = {}) {
       const rows = (plan.rows || []).map((r) => {
         let tune = '—';
         if (r.video_kbps) {
-          tune = r.mode === 'quality'
-            ? (r.encoder === 'cpu' ? 'CRF ' + r.quality : '质量档 ' + r.quality) + '（上限 ' + r.maxrate_kbps + ' kbps）'
-            : r.video_kbps + ' kbps' + (r.audio_disabled ? '（无音轨）' : '');
+          const codec = r.encoder_codec ? r.encoder_codec + ' · ' : '';
+          if (r.mode === 'quality') {
+            tune = codec + (r.encoder === 'cpu' ? 'CRF ' + r.quality : '质量档 ' + r.quality)
+              + '（上限 ' + r.maxrate_kbps + ' kbps）';
+          } else {
+            // 原始档的码率是"按这个文件的源分辨率建议"来的；被原片封顶时要写清楚。
+            const bySource = !r.suggested_kbps ? ''
+              : (r.video_kbps !== r.suggested_kbps
+                ? '（源分辨率建议 ' + r.suggested_kbps + ' kbps，已被原片封顶）'
+                : '（源分辨率建议）');
+            tune = codec + r.video_kbps + ' kbps' + bySource + (r.audio_disabled ? '（无音轨）' : '');
+          }
           if (r.two_pass) tune += ' · 2-pass';
         }
         const src = (r.source_codec_label || r.source_codec || '')
@@ -2816,7 +2906,7 @@ export function FilesView(content, ctx = {}) {
         plan.warning ? h('div.banner-warn', [
           h('span', { text: '⚠ ' + plan.warning, title: plan.warning_detail || '' }),
         ]) : null,
-        h('div.field', [h('label', { text: '目标档位（只封顶，绝不放大）' }), presetRow]),
+        h('div.field', [h('label', { text: '分辨率' }), presetRow, presetHint]),
         h('div.field', [h('label', { text: '编码器' }), encoderRow, encoderHint]),
         h('div.field', [h('label', { text: '模式' }), modeRow, modeHint]),
         tuneField,
@@ -2829,7 +2919,8 @@ export function FilesView(content, ctx = {}) {
         ]),
         h('div.hint', {
           text: '目录 ' + (plan.dir || cwd) + '：' + plan.total + ' 个视频，可压 '
-            + plan.runnable + ' 个，跳过 ' + plan.skipped + ' 个',
+            + plan.runnable + ' 个，跳过 ' + plan.skipped + ' 个'
+            + (plan.encoder_codec ? ' · 编码器 ' + plan.encoder_codec : ''),
         }),
         h('div.hint', { text: plan.note || '' }),
         h('div.zp-plan-scroll', [
@@ -2860,6 +2951,8 @@ export function FilesView(content, ctx = {}) {
         const opts = {
           dir: cwd, preset: plan.preset, kbps: plan.kbps,
           encoder: plan.encoder, mode: plan.mode, quality: plan.quality, two_pass: plan.two_pass,
+          // 与计划表同口径：只处理选中的就必须把 names 一起交给任务（任务会重新规划）。
+          ...(onlySelected ? { names: selNames } : {}),
           // 计划表指纹（可压行的名字+字节数）：任务重新探测后逐条核对，
           // 文件变了/不见了就如实跳过 —— 绝不静默按旧计划压。
           sources: (plan.rows || []).filter((r) => !r.skip_reason)

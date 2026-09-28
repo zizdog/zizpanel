@@ -35,6 +35,8 @@ export class ApiError extends Error {
 async function request(method, path, body, opts = {}) {
   const headers = { Accept: 'application/json' };
   const init = { method, headers, credentials: 'same-origin' };
+  // signal：调用方用来中断自己发起的请求（关弹窗 / 连点选项时丢弃旧请求）。
+  if (opts.signal) init.signal = opts.signal;
 
   if (body !== undefined && body !== null) {
     headers['Content-Type'] = 'application/json';
@@ -49,6 +51,8 @@ async function request(method, path, body, opts = {}) {
   try {
     res = await fetch(path, init);
   } catch (e) {
+    // 主动中断不是"连不上面板"：原样抛给调用方（它知道这是自己取消的）。
+    if (e && (e.name === 'AbortError' || (opts.signal && opts.signal.aborted))) throw e;
     throw new ApiError('无法连接面板服务，请检查网络或面板是否在运行', 0);
   }
 
@@ -532,7 +536,10 @@ export const api = {
   fileUploadLimit: () => request('GET', `${API_BASE}/files/upload-limit`),
   // 视频压缩：plan 是只读规划（每个视频一行，含"为什么压不了"），
   // compress 走任务中心（202 + task_id，进度走 SSE；关掉页面也照跑）。
-  fileVideoPlan: (payload) => request('POST', `${API_BASE}/files/video-plan`, payload),
+  fileVideoPlan: (payload, opts) => request('POST', `${API_BASE}/files/video-plan`, payload, opts),
+  // 首次扫描的实时进度（i/N + 当前文件名）；plan 请求飞行期间轮询它。
+  fileVideoPlanProgress: (dir) =>
+    request('GET', `${API_BASE}/files/video-plan-progress?dir=${encodeURIComponent(dir)}`),
   fileVideoCompress: (payload) => request('POST', `${API_BASE}/files/video-compress`, payload),
   // 目录收藏存在服务端（settings KV），手机上打开也是同一份。
   // action 只能是 'add' / 'remove'；两个动作都会过文件白名单校验。

@@ -9,6 +9,7 @@ package videoopt
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -22,23 +23,80 @@ type Preset struct {
 	Label       string `json:"label"`
 	CapHeight   int    `json:"cap_height"`
 	DefaultKbps int    `json:"default_kbps"`
+	// Hint 是选中这一档时给用户看的一句话（前端不重复写文案）。
+	Hint string `json:"hint,omitempty"`
 }
+
+// 各档的"能用下限"建议码率（kbps）：网络视频口径（能发给别人看就行），
+// 来自 2026-09 真机实测的经验值，不是标准里的数字。
+const (
+	Kbps360p  = 400
+	Kbps480p  = 800
+	Kbps720p  = 1500
+	Kbps1080p = 3000
+)
+
+// PresetSource 是"原始"档：**不缩放**，只可能降码率/换编码（CapHeight=0 即不封顶）。
+const PresetSource = "source"
 
 var presets = []Preset{
-	{ID: "360p", Label: "360p", CapHeight: 360, DefaultKbps: 400},
-	{ID: "480p", Label: "480p", CapHeight: 480, DefaultKbps: 800},
-	{ID: "720p", Label: "720p", CapHeight: 720, DefaultKbps: 1500},
+	{ID: "360p", Label: "360p", CapHeight: 360, DefaultKbps: Kbps360p,
+		Hint: "封顶 360p；只降不升，小画面绝不放大"},
+	{ID: "480p", Label: "480p", CapHeight: 480, DefaultKbps: Kbps480p,
+		Hint: "封顶 480p；只降不升，小画面绝不放大"},
+	{ID: "720p", Label: "720p", CapHeight: 720, DefaultKbps: Kbps720p,
+		Hint: "封顶 720p；只降不升，小画面绝不放大"},
+	{ID: "1080p", Label: "1080p", CapHeight: 1080, DefaultKbps: Kbps1080p,
+		Hint: "封顶 1080p；只降不升，720p 源仍是 720p"},
+	{ID: PresetSource, Label: "原始", CapHeight: 0, DefaultKbps: 0,
+		Hint: "不缩放：只可能降码率或换编码；码率按源分辨率建议"},
 }
 
-// Presets 返回三档预设（副本，调用方改不动包内状态）。
+// sourceTiers 是"原始档按源分辨率给建议码率"用的档位（升序）。
+var sourceTiers = []struct{ Side, KBps int }{
+	{360, Kbps360p}, {480, Kbps480p}, {720, Kbps720p}, {1080, Kbps1080p},
+}
+
+// SuggestedKBps 按**这个文件**的源分辨率给建议码率（原始档不缩放，只能按画面尺寸估）。
+//
+// 封顶边与 targetSize 同口径：横屏取高、竖屏取宽。源落在两档之间时取更接近的那一档
+// （正好居中取上限档，宁可清晰些）；低于 360 取 400，高于 1080 取 3000。
+// 结果照旧受"≤ 原码率×0.95"封顶，封顶后是否跳过仍由 PlanOne 决定（规则不变）。
+func SuggestedKBps(w, h int) int {
+	side := h
+	if w > 0 && w < h {
+		side = w
+	}
+	if side <= sourceTiers[0].Side {
+		return sourceTiers[0].KBps
+	}
+	for i := 1; i < len(sourceTiers); i++ {
+		lo, hi := sourceTiers[i-1], sourceTiers[i]
+		if side > hi.Side {
+			continue
+		}
+		if side-lo.Side >= hi.Side-side {
+			return hi.KBps
+		}
+		return lo.KBps
+	}
+	return sourceTiers[len(sourceTiers)-1].KBps
+}
+
+// Presets 返回五档预设（副本，调用方改不动包内状态）。
 func Presets() []Preset {
 	out := make([]Preset, len(presets))
 	copy(out, presets)
 	return out
 }
 
-// DefaultPresetID 是默认档位（480p：网络视频最常用的"能看且省流量"档）。
-const DefaultPresetID = "480p"
+// DefaultPresetID 是默认档位：原始（不动分辨率，用户点名）。
+const DefaultPresetID = PresetSource
+
+// IsSourcePreset 判断这一档是不是"原始"（不缩放）。
+func IsSourcePreset(p Preset) bool {
+	return strings.EqualFold(strings.TrimSpace(p.ID), PresetSource)
+}
 
 // FindPreset 按 ID 找档位。
 func FindPreset(id string) (Preset, bool) {
@@ -55,16 +113,30 @@ func FindPreset(id string) (Preset, bool) {
 type BitrateChoice struct {
 	KBps  int    `json:"kbps"`
 	Label string `json:"label"`
+	// Hint 是这一项的细节（前端放进 option 的 title，不占主句）。
+	Hint string `json:"hint,omitempty"`
 }
 
 // BitrateChoices 返回某一档的码率选项：档位下限 / 1.5× / 2×。
 //
-// 默认用**网络视频能用下限**（360p=400、480p=800、720p=1500 kbps）：
+// 默认用**网络视频能用下限**（360p=400、480p=800、720p=1500、1080p=3000 kbps）：
 // 用户要的往往是"能发给别人看就行"，更大的码率只是浪费流量。
+//
+// 原始档不缩放 ⇒ 默认项是"按源分辨率建议"（0 = 规划时逐文件取档位下限），
+// 也可以手动指定一个绝对码率；两种都照旧受原码率×0.95 封顶。
 func BitrateChoices(p Preset) []BitrateChoice {
+	if IsSourcePreset(p) {
+		return []BitrateChoice{
+			{KBps: 0, Label: "按源分辨率建议（默认）",
+				Hint: "源 1080p→3000 / 720p→1500 / 480p→800 / 360p→400 kbps；再受原码率×0.95 封顶"},
+			{KBps: Kbps360p, Label: fmt.Sprintf("%d kbps · 更小", Kbps360p)},
+			{KBps: Kbps720p, Label: fmt.Sprintf("%d kbps · 清晰些", Kbps720p)},
+			{KBps: Kbps1080p, Label: fmt.Sprintf("%d kbps · 更清晰", Kbps1080p)},
+		}
+	}
 	base := p.DefaultKbps
 	if base <= 0 {
-		base = 800
+		base = Kbps480p
 	}
 	return []BitrateChoice{
 		{KBps: base, Label: fmt.Sprintf("%d kbps · %s 能用下限", base, p.ID)},
@@ -73,15 +145,18 @@ func BitrateChoices(p Preset) []BitrateChoice {
 	}
 }
 
-// ResolveKBps 把请求里的 kbps 归一化成实际要用的值（0 = 用档位下限）。
+// ResolveKBps 把请求里的 kbps 归一化成实际要用的值（0 = 档位下限；原始档 = 按源分辨率建议）。
 func ResolveKBps(p Preset, kbps int) int {
 	if kbps > 0 {
 		return kbps
 	}
+	if IsSourcePreset(p) {
+		return 0 // 0 = 规划时按该文件的源分辨率取档位下限（见 SuggestedKBps）
+	}
 	if p.DefaultKbps > 0 {
 		return p.DefaultKbps
 	}
-	return 800
+	return Kbps480p
 }
 
 const (
@@ -114,9 +189,11 @@ const (
 	//
 	// 实测来源（2026-09-25，M4 + ffmpeg 9.0.1，源 H.264 1280x720 1474kbps 701s 136.9MB，
 	// 目标 852x480）：CPU 25s / SSIM 0.9670 与硬件 22s / SSIM 0.9523 耗时接近
-	//（瓶颈在解码+缩放），但**同码率 CPU 画质明显更好** ⇒ 默认用 CPU。
+	//（瓶颈在解码+缩放），但**同码率 CPU 画质明显更好** ⇒ 默认 CPU。
 	DefaultEncoder = EncoderCPU
-	DefaultMode    = ModeBitrate
+	// 默认模式是目标码率（用户拍板：体积可预估）。CRF 仍是可选项，
+	// 选它时面板照旧标"体积不可预估、可能不小于原文件"。
+	DefaultMode = ModeBitrate
 
 	// CPU 质量优先 = libx264 -crf N：**越小画质越好、文件越大**。
 	// 实测：CRF 26 → 81.9MB / 957kbps / SSIM 0.9737（省 37%）；
@@ -127,14 +204,15 @@ const (
 	// DefaultCRF 是 CPU 质量优先的默认 CRF。
 	DefaultCRF = CRFBalanced
 
-	// VideoToolbox 质量优先 = h264_videotoolbox -q:v N：**越大画质越好、文件越大**
-	//（方向与 CRF 相反）。实测同源：q:v 40 → 105.4MB / 1231kbps / SSIM 0.9699；
-	// q:v 70 → **414.8MB / 4842kbps（是源的 3 倍，会被"压不小"兜底删掉）**。
-	VTQualitySmall    = 40
-	VTQualityBalanced = 55
-	VTQualityHigh     = 70
-	// DefaultVTQuality 是硬件质量优先的默认质量档（实测 q:v 40 体积最接近源、最省）。
-	DefaultVTQuality = VTQualitySmall
+	// 硬件质量优先 = hevc_videotoolbox -q:v N：**越大画质越好、文件越大**
+	//（方向与 CRF 相反 —— 不是同一把尺子，面板必须如实说明）。
+	// 2026-09-28 真机标定（同源 720p/1474kbps）：q:v 35≈SSIM 0.963、45≈0.972、50≈0.980；
+	// x264 crf26≈0.9725 ⇒ **q:v 45 才与 crf26 同观感**，故默认 45。
+	VTQualitySmall    = 35
+	VTQualityBalanced = 45
+	VTQualityHigh     = 50
+	// DefaultVTQuality 是硬件质量优先的默认质量档（q:v 45 = 与 CPU 默认 crf26 同观感）。
+	DefaultVTQuality = VTQualityBalanced
 )
 
 // Options 是一次规划的全部可选项（纯值，无副作用）。
@@ -200,6 +278,12 @@ func ResolveQuality(encoder string, q int) int {
 
 // NormalizeOptions 填好所有默认值（老请求不带新字段时行为 = 现在的默认）。
 func NormalizeOptions(o Options) Options {
+	if _, ok := FindPreset(o.Preset.ID); !ok {
+		// 空档位 = 默认档（原始）；未知档位由接口层拦成 400，不会走到这里。
+		if p, ok := FindPreset(DefaultPresetID); ok {
+			o.Preset = p
+		}
+	}
 	o.Encoder = ResolveEncoder(o.Encoder)
 	o.Mode = ResolveMode(o.Mode)
 	o.Quality = ResolveQuality(o.Encoder, o.Quality)
@@ -238,23 +322,23 @@ func ValidateOptions(o Options) error {
 
 // EncoderChoices 是面板的编码器单选（默认项由 DefaultEncoder 决定）。
 //
-// 硬件留给"1080p/4K 源或想省电"；480p 实测两者耗时接近（22s vs 25s）而画质 CPU 更好。
+// 硬件档**只换编码器（HEVC）**：码率/质量设置一个都不动（用户点名"码率不变！"）。
 func EncoderChoices() []Choice {
 	return []Choice{
-		{Value: EncoderHardware, Label: "硬件加速（VideoToolbox）",
-			Hint: "快一些（高清源更明显）；同码率画质略逊于 CPU（实测 SSIM 0.95 vs 0.97）"},
 		{Value: EncoderCPU, Label: "CPU（x264）",
-			Hint: "同码率画质更好、码率控制更准（实测 480p 不比硬件慢）"},
+			Hint: "默认：同码率画质更好、码率控制更准"},
+		{Value: EncoderHardware, Label: "硬件加速（HEVC）",
+			Hint: "改用 hevc_videotoolbox（更快）；码率设置不变，只有质量档刻度不同"},
 	}
 }
 
-// ModeChoices 是面板的模式单选。
+// ModeChoices 是面板的模式单选（默认项由 DefaultMode 决定 = 质量优先）。
 func ModeChoices() []Choice {
 	return []Choice{
+		{Value: ModeQuality, Label: "CRF（质量优先）",
+			Hint: "按画质档压；体积不可预估、可能不小于原文件，届时会跳过并说明"},
 		{Value: ModeBitrate, Label: "目标码率（体积可预估）",
 			Hint: "按你选的码率压；体积 ≈ 码率×时长，基本能算出来"},
-		{Value: ModeQuality, Label: "质量优先（体积不可预估，通常明显更小）",
-			Hint: "按画质档压；体积看画面复杂程度，算不出来"},
 	}
 }
 
@@ -262,15 +346,15 @@ func ModeChoices() []Choice {
 func QualityChoices(encoder string) []QualityChoice {
 	if ResolveEncoder(encoder) == EncoderCPU {
 		return []QualityChoice{
-			{CRFHigh, fmt.Sprintf("CRF %d · 高画质", CRFHigh)},
+			{CRFHigh, fmt.Sprintf("CRF %d · 高画质（更小数字=更清楚）", CRFHigh)},
 			{CRFBalanced, fmt.Sprintf("CRF %d · 均衡（默认）", CRFBalanced)},
 			{CRFSmall, fmt.Sprintf("CRF %d · 更小", CRFSmall)},
 		}
 	}
 	return []QualityChoice{
-		{VTQualitySmall, fmt.Sprintf("质量档 %d · 更小（默认）", VTQualitySmall)},
-		{VTQualityBalanced, fmt.Sprintf("质量档 %d · 均衡", VTQualityBalanced)},
-		{VTQualityHigh, fmt.Sprintf("质量档 %d · 高画质（越大越好，实测标定）", VTQualityHigh)},
+		{VTQualitySmall, fmt.Sprintf("质量档 %d · 更小", VTQualitySmall)},
+		{VTQualityBalanced, fmt.Sprintf("质量档 %d · 均衡（默认，≈CRF %d 观感）", VTQualityBalanced, CRFBalanced)},
+		{VTQualityHigh, fmt.Sprintf("质量档 %d · 高画质", VTQualityHigh)},
 	}
 }
 
@@ -315,6 +399,9 @@ type Plan struct {
 	TargetWidth  int `json:"target_width"`
 	TargetHeight int `json:"target_height"`
 	VideoKbps    int `json:"video_kbps"`
+	// SuggestedKbps 是"原始档按源分辨率给出的建议码率"（0 = 不适用/用户手填了码率）。
+	// 面板据此显示"每个文件用的是哪个建议值"；实际码率仍可能被原码率封顶。
+	SuggestedKbps int `json:"suggested_kbps,omitempty"`
 	// AudioKbps 为 0 且 AudioDisabled 为 true 表示产物不带音轨（-an）。
 	AudioKbps     int   `json:"audio_kbps"`
 	AudioDisabled bool  `json:"audio_disabled"`
@@ -334,9 +421,12 @@ type Plan struct {
 
 	// 下面这些是"面板选项 → 执行"的同一份记录（执行器不再重算一遍）。
 	Encoder string `json:"encoder"`
-	Mode    string `json:"mode"`
-	Quality int    `json:"quality,omitempty"`
-	TwoPass bool   `json:"two_pass,omitempty"`
+	// EncoderCodec 是真正传给 ffmpeg 的 -c:v（libx264 / hevc_videotoolbox）：
+	// 面板与任务日志直接显示它，用户能看到"硬件档到底用了什么编码器"。
+	EncoderCodec string `json:"encoder_codec,omitempty"`
+	Mode         string `json:"mode"`
+	Quality      int    `json:"quality,omitempty"`
+	TwoPass      bool   `json:"two_pass,omitempty"`
 	// MaxRateKbps 是给编码器的 -maxrate 上限：目标码率模式下等于目标码率，
 	// 质量优先模式下等于 floor(原码率×0.95)（保证不超原片码率）。
 	MaxRateKbps int `json:"maxrate_kbps,omitempty"`
@@ -361,6 +451,77 @@ type PlanRequest struct {
 	// Cache 是进程级探测缓存（由 Server 持有并注入，见 ProbeCache）。
 	// nil = 不缓存（每次现探）；命中即 0 次 ffprobe，配置变更只做纯函数重算。
 	Cache *ProbeCache
+	// OnProbe 在真的跑了一次 ffprobe 之后被调用（缓存命中不调用）：
+	// 首次扫描的实时进度据此知道"这次到底有没有在探测"。
+	OnProbe func()
+	// Names 是"只处理这些文件"（当前目录下的**文件名**，不含路径）；空 = 处理全部视频。
+	//
+	// 用户点名的语义：文件管理器里选了视频就只处理选中的，没选就处理整个目录。
+	// 不是视频/不存在的名字**逐条如实标记**（绝不静默忽略）；全不合法则整体报错。
+	Names []string
+}
+
+// NameReject 是 names 里被拒的一条（带原因，面板要如实展示）。
+type NameReject struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+}
+
+// ErrNoRequestedVideo 表示 names 里没有任何一个是本目录下的视频（接口层据此 400）。
+var ErrNoRequestedVideo = fmt.Errorf("选中的文件都不是本目录下的视频")
+
+// RequestedNamesError 带上逐条原因，便于接口层把"为什么一个都处理不了"说清楚。
+type RequestedNamesError struct{ Rejects []NameReject }
+
+func (e *RequestedNamesError) Error() string {
+	parts := make([]string, 0, len(e.Rejects))
+	for _, r := range e.Rejects {
+		parts = append(parts, r.Name+"（"+r.Reason+"）")
+	}
+	return ErrNoRequestedVideo.Error() + "：" + strings.Join(parts, "、")
+}
+
+func (e *RequestedNamesError) Is(target error) bool { return target == ErrNoRequestedVideo }
+
+// NormalizeNames 去掉空项与重复项（顺序保留），并做**路径安全**校验：
+// 只允许当前目录下的文件名，带路径分隔符或 `..` 一律拒绝（防越界）。
+func NormalizeNames(names []string) ([]string, error) {
+	out := make([]string, 0, len(names))
+	seen := map[string]bool{}
+	for _, raw := range names {
+		n := strings.TrimSpace(raw)
+		if n == "" {
+			continue
+		}
+		if n == "." || n == ".." || strings.ContainsAny(n, `:/\`) || strings.Contains(n, "..") {
+			return nil, fmt.Errorf("文件名不合法（只能是本目录下的文件名）：%s", raw)
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// CheckRequestedNames 逐个核对 names：可用的（本目录下的视频文件）与逐条拒绝原因。
+//
+// 只 Stat（不跑 ffprobe）：够回答"这个名字现在还是不是一个视频文件"。
+func CheckRequestedNames(dir string, names []string) (usable []string, rejects []NameReject) {
+	for _, n := range names {
+		if !IsVideoName(n) {
+			rejects = append(rejects, NameReject{Name: n, Reason: "不是视频文件"})
+			continue
+		}
+		st, err := os.Stat(filepath.Join(dir, n))
+		if err != nil || st.IsDir() {
+			rejects = append(rejects, NameReject{Name: n, Reason: "文件不存在"})
+			continue
+		}
+		usable = append(usable, n)
+	}
+	return usable, rejects
 }
 
 // PlanResult 是一次规划的结果。
@@ -393,6 +554,9 @@ type PlanResult struct {
 	// Probed 是这一次真正跑了 ffprobe 的次数（缓存命中不算）——
 	// 面板与门禁据此如实判断"配置变更有没有又去重探一遍"。
 	Probed int `json:"probed"`
+	// Names 是这一次"只处理这些文件"（空 = 全部视频）；Rejects 是其中被如实拒掉的条目。
+	Names   []string     `json:"names,omitempty"`
+	Rejects []NameReject `json:"rejects,omitempty"`
 }
 
 // OutputDirName 是产物子目录名（写进 <当前目录>/output/）。
@@ -431,10 +595,15 @@ func PlaceName(srcName, presetID string) string {
 // targetSize 按档位封顶算出目标宽高：绝不放大，宽高都是偶数且都 ≤ 原尺寸。
 //
 // 横屏（含正方形）按高度封顶、竖屏按宽度封顶；封顶后按比例缩放，
-// 向下取偶数（yuv420p 要求偶数）。返回 0,0 表示这个尺寸不该转码。
+// 向下取偶数（yuv420p 要求偶数）。cap<=0（原始档）表示**不缩放**，只取偶数。
+// 返回 0,0 表示这个尺寸不该转码。
 func targetSize(srcW, srcH, cap int) (int, int) {
-	if srcW < minSide || srcH < minSide || cap <= 0 {
+	if srcW < minSide || srcH < minSide {
 		return 0, 0
+	}
+	if cap <= 0 {
+		// 原始档：不缩放（只把奇数边向下取到偶数，yuv420p 的硬要求）。
+		return evenDown(srcW), evenDown(srcH)
 	}
 	scale := 1.0
 	if srcW >= srcH { // 横屏：按高度封顶
@@ -480,15 +649,19 @@ func evenDown(n int) int {
 //	质量优先模式：不设目标码率，只把 -maxrate 封在原码率×0.95 以内
 //	音频码率     = min(96k, 原音频码率)；无音轨则 -an
 //
-// capped 只表示"用户选的码率 ≥ 原码率×0.95"（这种文件**封顶即跳过**，
+// 原始档没带码率（kbps=0）时：按**这个文件**的源分辨率取档位下限（见 SuggestedKBps），
+// 再照旧受原码率×0.95 封顶 —— 绝不"跟随原片"（那等于封顶即跳过、默认什么都不压）。
+//
+// capped 只表示"实际码率 ≥ 原码率×0.95"（这种文件**封顶即跳过**，
 // 不再转码，改为原样放进 output/；判据见 PlanOne）。
-func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate int, capped bool, note, skip string) {
+// suggested 是"源分辨率建议值"（仅原始档给），面板据此显示每个文件用的建议值。
+func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggested int, capped bool, note, skip string) {
 	if info.VideoKbps <= 0 {
-		return 0, 0, 0, false, "", "读不到原视频码率，无法保证压完更小"
+		return 0, 0, 0, 0, false, "", "读不到原视频码率，无法保证压完更小"
 	}
 	capKbps := int(math.Floor(float64(info.VideoKbps) * bitrateSafety))
 	if capKbps < 1 {
-		return 0, 0, 0, false, "", "原视频码率太低，没有可压空间"
+		return 0, 0, 0, 0, false, "", "原视频码率太低，没有可压空间"
 	}
 	maxRate = capKbps
 	if opts.Mode == ModeQuality {
@@ -496,21 +669,29 @@ func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate int, capp
 		vKbps = capKbps
 	} else {
 		vKbps = ResolveKBps(opts.Preset, opts.KBps)
-		if vKbps <= 0 || vKbps > capKbps {
+		if vKbps <= 0 {
+			suggested = SuggestedKBps(info.Width, info.Height)
+			vKbps = suggested
+		}
+		if vKbps > capKbps {
 			vKbps = capKbps
 			capped = true
-			note = fmt.Sprintf("原码率低（%d kbps），已封顶到 %d kbps", info.VideoKbps, capKbps)
+			if suggested > 0 {
+				note = fmt.Sprintf("按源分辨率建议 %d kbps，已被原码率封顶到 %d kbps", suggested, capKbps)
+			} else {
+				note = fmt.Sprintf("原码率低（%d kbps），已封顶到 %d kbps", info.VideoKbps, capKbps)
+			}
 		}
 		maxRate = vKbps
 	}
 	if !info.HasAudio {
-		return vKbps, 0, maxRate, capped, note, ""
+		return vKbps, 0, maxRate, suggested, capped, note, ""
 	}
 	aKbps = audioMaxKbps
 	if info.AudioKbps > 0 && info.AudioKbps < aKbps {
 		aKbps = info.AudioKbps
 	}
-	return vKbps, aKbps, maxRate, capped, note, ""
+	return vKbps, aKbps, maxRate, suggested, capped, note, ""
 }
 
 // PlanOne 是**唯一的单文件规划实现**（纯函数：不碰文件系统）。
@@ -536,6 +717,7 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		SourceCodec:      info.Codec,
 		SourceCodecLabel: CodecLabel(info.Codec),
 		Encoder:          opts.Encoder,
+		EncoderCodec:     EncoderCodec(opts.Encoder),
 		Mode:             opts.Mode,
 		Quality:          opts.Quality,
 		TwoPass:          opts.TwoPass,
@@ -568,17 +750,19 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	}
 	p.TargetWidth, p.TargetHeight = w, h
 
-	vKbps, aKbps, maxRate, capped, note, skip := planBitrates(info, opts)
+	vKbps, aKbps, maxRate, suggested, capped, note, skip := planBitrates(info, opts)
 	if skip != "" {
 		p.PlaceInOutput = true
 		p.SkipReason = skip
 		return p
 	}
-	// 封顶即跳过（用户拍板）：请求码率 ≥ 原片×0.95 时实际码率被迫等于原片，
-	// 再压只会更糊、体积几乎不变 —— 不转码，改为原样放进 output/。
+	// 建议值（仅原始档）要逐文件记在计划里：面板才看得出"这个文件用了哪个建议值"。
+	p.SuggestedKbps = suggested
+	// 封顶即跳过（用户拍板）：实际码率被迫等于原片×0.95 时再压只会更糊、体积几乎不变
+	// —— 不转码，改为原样放进 output/（规则不变）。
 	if capped {
 		p.Capped = true
-		p.VideoKbps, p.AudioKbps, p.MaxRateKbps = vKbps, aKbps, maxRate
+		p.VideoKbps, p.AudioKbps, p.MaxRateKbps, p.Note = vKbps, aKbps, maxRate, note
 		p.AudioDisabled = !info.HasAudio
 		p.PlaceInOutput = true
 		p.SkipReason = fmt.Sprintf("原视频码率已经很低（%d kbps @ %dx%d），再压只会更糊、体积几乎不变",
@@ -586,6 +770,10 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		return p
 	}
 	p.VideoKbps, p.AudioKbps, p.Capped, p.Note = vKbps, aKbps, capped, note
+	// 原始档要有一句清楚的语义：不缩放，只可能降码率 / 换编码。
+	if IsSourcePreset(preset) && p.Note == "" {
+		p.Note = "原始档不缩放：按源分辨率建议码率"
+	}
 	p.MaxRateKbps = maxRate
 	p.AudioDisabled = !info.HasAudio
 	if opts.Mode == ModeQuality {

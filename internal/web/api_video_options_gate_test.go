@@ -79,30 +79,30 @@ func TestVideoOptionsGate(t *testing.T) {
 				name:    "默认（空字段）= CPU + 目标码率（实测默认）",
 				req:     base,
 				want:    [][2]string{{"-c:v", "libx264"}, {"-b:v", "800k"}},
-				notWant: []string{"h264_videotoolbox", "-crf", "-q:v", "-pass"},
+				notWant: []string{"hevc_videotoolbox", "-crf", "-q:v", "-pass"},
 			},
 			{
-				name:    "硬件 + 目标码率",
+				name:    "硬件 + 目标码率 = HEVC，码率参数与 CPU 时逐字相同",
 				req:     withOpts(base, videoopt.EncoderHardware, videoopt.ModeBitrate, 0, false),
-				want:    [][2]string{{"-c:v", "h264_videotoolbox"}, {"-b:v", "800k"}, {"-maxrate", "800k"}},
+				want:    [][2]string{{"-c:v", "hevc_videotoolbox"}, {"-b:v", "800k"}, {"-maxrate", "800k"}},
 				notWant: []string{"libx264", "-crf", "-q:v"},
 			},
 			{
 				name:    "CPU + 目标码率",
 				req:     withOpts(base, videoopt.EncoderCPU, videoopt.ModeBitrate, 0, false),
 				want:    [][2]string{{"-c:v", "libx264"}, {"-preset", "veryfast"}, {"-b:v", "800k"}},
-				notWant: []string{"h264_videotoolbox", "-crf", "-q:v"},
+				notWant: []string{"hevc_videotoolbox", "-crf", "-q:v"},
 			},
 			{
 				name:    "CPU + 质量优先 = -crf，且不许有 -b:v",
 				req:     withOpts(base, videoopt.EncoderCPU, videoopt.ModeQuality, videoopt.DefaultCRF, false),
 				want:    [][2]string{{"-c:v", "libx264"}, {"-crf", "26"}},
-				notWant: []string{"-b:v", "-q:v", "h264_videotoolbox"},
+				notWant: []string{"-b:v", "-q:v", "hevc_videotoolbox"},
 			},
 			{
 				name:    "硬件 + 质量优先 = -q:v（实测越大越好），且不许有 -b:v",
-				req:     withOpts(base, videoopt.EncoderHardware, videoopt.ModeQuality, 55, false),
-				want:    [][2]string{{"-c:v", "h264_videotoolbox"}, {"-q:v", "55"}},
+				req:     withOpts(base, videoopt.EncoderHardware, videoopt.ModeQuality, videoopt.DefaultVTQuality, false),
+				want:    [][2]string{{"-c:v", "hevc_videotoolbox"}, {"-q:v", "45"}},
 				notWant: []string{"-b:v", "-crf", "libx264"},
 			},
 		}
@@ -190,7 +190,7 @@ func TestVideoOptionsGate(t *testing.T) {
 
 		// 用户实测场景：480p + 码率填 1200（≥ 原片 1200×0.95）→ 必须标"封顶即跳过"。
 		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{
-			"dir": dir, "preset": "480p", "kbps": 1200,
+			"dir": dir, "preset": "480p", "kbps": 1200, "mode": "bitrate",
 		})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("video-plan 应该成功：%d %s", rec.Code, rec.Body.String())
@@ -233,7 +233,8 @@ func TestVideoOptionsGate(t *testing.T) {
 			t.Errorf("计划行必须带源编码（面板显示 H.264），实际 %q", plan.Data.Rows[0].SourceCodec)
 		}
 		// 同一场景选 800（< 原片 1200×0.95，不会被封顶）时：没有提醒，且体积对比字段有效。
-		rec = postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "480p", "kbps": 800})
+		rec = postVideoJSON(t, srv.handleFileVideoPlan,
+			map[string]any{"dir": dir, "preset": "480p", "kbps": 800, "mode": "bitrate"})
 		var quiet struct {
 			Data struct {
 				Warning     string `json:"warning"`

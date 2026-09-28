@@ -128,6 +128,11 @@ type Server struct {
 	// 每次请求都 spawn 一次 `ffmpeg -version` 就成了热路径上最大的开销。
 	engineVer *videoopt.VersionCache
 
+	// scanProgress 是"首次扫描进行到第几个"的进程级小表：/video-plan 同步跑，
+	// 前端在请求飞行期间轮询 /video-plan-progress 拿 `正在读取视频信息 3/20：x.mp4`。
+	// 只在扫描进行中有条目 ⇒ 缓存命中（改配置）时轮询拿不到东西，不会闪出这个过程。
+	scanProgress *videoopt.ScanProgressStore
+
 	// logCat 是日志目录（惰性初始化，因为要读取服务注册表）
 	logCat  *logs.Catalog
 	logOnce sync.Once
@@ -229,20 +234,21 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, col *sysinfo.Col
 		return nil, fmt.Errorf("加载内置前端资源失败: %w", err)
 	}
 	s := &Server{
-		Cfg:         cfg,
-		Store:       st,
-		Auth:        am,
-		Info:        col,
-		Procs:       sysinfo.NewProcSampler(),
-		Log:         logx.New("web"),
-		serviceRepo: services.NewRepository(st),
-		startHints:  &services.StartHintStore{},
-		healthCache: &services.HealthCache{},
-		probeCache:  videoopt.NewProbeCache(videoopt.DefaultProbeTTL, videoopt.DefaultProbeMaxEntries),
-		engineVer:   videoopt.NewVersionCache(videoEngineTTL),
-		Tasks:       tasks.NewManager(),
-		static:      sub,
-		startAt:     time.Now(),
+		Cfg:          cfg,
+		Store:        st,
+		Auth:         am,
+		Info:         col,
+		Procs:        sysinfo.NewProcSampler(),
+		Log:          logx.New("web"),
+		serviceRepo:  services.NewRepository(st),
+		startHints:   &services.StartHintStore{},
+		healthCache:  &services.HealthCache{},
+		probeCache:   videoopt.NewProbeCache(videoopt.DefaultProbeTTL, videoopt.DefaultProbeMaxEntries),
+		engineVer:    videoopt.NewVersionCache(videoEngineTTL),
+		scanProgress: videoopt.NewScanProgressStore(),
+		Tasks:        tasks.NewManager(),
+		static:       sub,
+		startAt:      time.Now(),
 	}
 	// aria2 的内置界面（AriaNg）单独取一个子树；取不到就是 nil —— handler 会如实报错，
 	// 而不是假装"界面在这儿"。
@@ -488,6 +494,7 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/files/replace", s.requireAuth(s.handleFileReplace))
 	// 视频压缩（走任务中心：202 + task_id）与目录收藏（存服务端 settings KV）。
 	root.HandleFunc("POST /api/v1/files/video-plan", s.requireAuth(s.handleFileVideoPlan))
+	root.HandleFunc("GET /api/v1/files/video-plan-progress", s.requireAuth(s.handleFileVideoPlanProgress))
 	root.HandleFunc("POST /api/v1/files/video-compress", s.requireAuth(s.handleFileVideoCompress))
 	root.HandleFunc("GET /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesList))
 	root.HandleFunc("POST /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesSet))
