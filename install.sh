@@ -114,6 +114,9 @@ ZP_EXTERNAL_MODE=""
 ZP_EXTERNAL_ACK=0
 # ZP_EXTERNAL_WANT：用户是否说"会用到外接硬盘"（1/0）。不用的人全程不碰外接卷、不弹任何窗。
 ZP_EXTERNAL_WANT=0
+# 完全磁盘访问授权状态：与外接盘同一套（MODE = local/remote/""；ACK=1 表示用户当面同意）。
+ZP_FULL_DISK_MODE=""
+ZP_FULL_DISK_ACK=0
 # 脚本所在目录（用于定位随包分发的工具脚本）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 
@@ -1307,6 +1310,11 @@ finish() {
     printf '  消除提示：%sbrew install mkcert nss && mkcert -install%s 后重启面板。\n' "$C_BOLD" "$C_RESET"
   fi
   printf '\n'
+  # 完全磁盘访问权限的醒目区块（远程安装在这里**再强调一次**，用户点名要求）。
+  case "${ZP_FULL_DISK_MODE:-}" in
+    remote) notice_full_disk_remote ;;
+    local)  notice_full_disk_local ;;
+  esac
   printf '  常用命令：\n'
   printf '    zizpanel status                     查看状态与访问地址\n'
   printf '    sudo zizpanel reset-password <用户>  忘记密码时重置\n'
@@ -3001,6 +3009,166 @@ request_external_volume_auth() {
   return 0
 }
 
+# ============================================================================
+#  完全磁盘访问权限（面板读桌面/文稿/下载）
+#
+#  与上面外接盘同一套纪律：只有**真机安装 + 用户当面同意**时才在启动前写一次性标记，
+#  守护进程看到标记且当前有图形登录会话才读一次受保护目录（那一次读才会弹窗）。
+#  用户点名的三条必须写在输出里：① 会弹什么、② 没弹出来的 macOS 手工路径、
+#  ③ 面板是固定自签身份 —— 授权一次以后升级都不用再授。
+# ============================================================================
+
+# panel_access_url：安装完成时给用户看的面板地址（含安全后缀，用现有变量拼）。
+panel_access_url() {
+  local ip port suffix scheme="https"
+  ip="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -1)"
+  [ -z "$ip" ] && ip="127.0.0.1"
+  port="${ZIZPANEL_LISTEN##*:}"
+  suffix="$(zcfg_get panel_suffix)"
+  [ -n "$suffix" ] || suffix="${PANEL_SUFFIX_INPUT:-}"
+  if [ -n "$suffix" ]; then
+    printf '%s://%s:%s/%s/' "$scheme" "$ip" "$port" "$suffix"
+  else
+    printf '%s://%s:%s/' "$scheme" "$ip" "$port"
+  fi
+}
+
+# full_disk_manual_steps：macOS 手工授权路径（用户点名必须写全；用实际安装根的二进制）。
+full_disk_manual_steps() {
+  printf '    系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」→ 在文件选择框按 ⌘⇧G\n'
+  printf '    → 粘贴 %s → 打开 → 打开开关\n' "$BIN_DIR/zizpanel"
+}
+
+# notice_full_disk_local：本机安装收尾的**醒目区块**（分隔线 + 加粗 + 空行）。
+notice_full_disk_local() {
+  printf '\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$C_BOLD" "$C_RESET"
+  if [ "${ZP_FULL_DISK_ACK:-0}" = "1" ]; then
+    printf '  %s⚠ 屏幕上应弹出「完全磁盘访问权限」请求 → 请点『允许』%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n  没弹出来？按这个路径手动加上（30 秒）：\n'
+    full_disk_manual_steps
+  else
+    printf '  %s⚠ 完全磁盘访问权限还没授权%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n  这次没有申请（安装过程没触发任何系统弹窗）。要用桌面/文稿/下载时：\n'
+    printf '    · 到「面板设置 → 权限」点一次「申请」（要在这台机器前）\n'
+    printf '    · 或按这个路径手动加上：\n'
+    full_disk_manual_steps
+  fi
+  printf '\n  面板是固定自签身份，%s授权一次以后升级都不用再授%s。\n' "$C_BOLD" "$C_RESET"
+  printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$C_BOLD" "$C_RESET"
+}
+
+# notice_full_disk_remote：远程安装的醒目区块（不触发弹窗，指向屏幕前操作 + 手工路径）。
+notice_full_disk_remote() {
+  printf '\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s⚠ 你现在是远程安装，无法在这里授权%s\n' "$C_BOLD" "$C_RESET"
+  printf '\n  请到这台机器的屏幕上操作：\n'
+  printf '    打开面板 →「面板设置 → 权限」→ 逐项点「申请」\n'
+  printf '    面板地址：%s\n' "$(panel_access_url)"
+  printf '\n  也可以直接手动授权（完全磁盘访问权限）：\n'
+  full_disk_manual_steps
+  printf '\n  外接盘/可移动卷：macOS 没有独立列项 —— 正常首次读取会弹「允许访问外接卷」；\n'
+  printf '  不弹就给面板二进制开完全磁盘访问，插上该卷后再点一次「申请」。\n'
+  printf '\n  面板是固定自签身份，%s授权一次以后升级都不用再授%s。\n' "$C_BOLD" "$C_RESET"
+  printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$C_BOLD" "$C_RESET"
+}
+
+# setup_full_disk_auth_notice：先判定本机/远程，再问一次"准备好了吗"。
+#   · 远程/非图形会话：绝不触发弹窗，直接打醒目区块；
+#   · 真机：默认申请（用户可答 n 跳过）；ZP_FULL_DISK=0 可无人值守跳过。
+setup_full_disk_auth_notice() {
+  title "完全磁盘访问权限（面板读桌面/文稿/下载）"
+
+  if is_remote_session; then
+    ZP_FULL_DISK_MODE="remote"
+    ZP_FULL_DISK_ACK=0
+    warn "你是从别的电脑（SSH/远程）跑安装的：本次**不会触发任何系统授权弹窗** ——"
+    info "没人能在机器前点按钮，弹窗只会被系统记成拒绝。"
+    notice_full_disk_remote
+    return 0
+  fi
+
+  ZP_FULL_DISK_MODE="local"
+  case "${ZP_FULL_DISK:-}" in
+    0|no|n|off)
+      ZP_FULL_DISK_ACK=0
+      info "已按 ZP_FULL_DISK=0 跳过：安装过程不会触发任何授权弹窗。"
+      return 0 ;;
+  esac
+
+  warn "安装收尾会向系统申请一次「完全磁盘访问权限」（面板要读桌面/文稿/下载）。"
+  info "请**留在这台机器前**：弹出请求时点「允许」，授权就做完了（只需这一次）。"
+  if zp_yes "确认现在申请完全磁盘访问授权（接下来你要在屏幕上点「允许」）？" "y"; then
+    ZP_FULL_DISK_ACK=1
+  else
+    ZP_FULL_DISK_ACK=0
+    warn "好 —— 这次不申请（不会触发任何弹窗）。"
+    info "以后想用：到「面板设置 → 权限」点「申请」，或按安装完成时给的手动路径授权。"
+  fi
+  return 0
+}
+
+# request_full_disk_auth：把"一次性完全磁盘访问授权请求"标记写给面板（启动前写）。
+# 只在①真机安装 ②用户确认申请 ③有图形登录会话 ④非沙箱/干跑 时写；
+# 守护进程只读一次（internal/permissions/fulldiskauth.go），绝不反复弹窗。
+request_full_disk_auth() {
+  local marker="$DATA_DIR/request-full-disk-auth.once"
+  [ "${ZIZPANEL_SANDBOX:-0}" = "1" ] && return 0
+  [ "${ZP_FULL_DISK_MODE:-}" = "local" ] || return 0
+  [ "${ZP_FULL_DISK_ACK:-0}" = "1" ] || return 0
+
+  if dry_run; then
+    info "（干跑）真机安装且已确认：将写入一次性完全磁盘访问授权请求 $marker"
+    return 0
+  fi
+
+  local console_user=""
+  console_user="$(console_login_user)"
+  case "$console_user" in
+    ""|root|loginwindow)
+      info "当前没有图形登录会话（控制台用户：${console_user:-无}）→ 不写完全磁盘访问授权请求。"
+      info "原因：没人在屏幕前时绝不触发系统弹窗（弹了只会被记成拒绝）。"
+      return 0
+      ;;
+  esac
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  if printf '1\n' > "$marker" 2>/dev/null; then
+    chmod 600 "$marker" 2>/dev/null || true
+    ok "已记录一次性完全磁盘访问授权请求（${marker}）"
+    info "面板启动后会替你申请一次：屏幕上弹出「完全磁盘访问权限」请求时点「允许」。"
+  else
+    warn "写授权请求失败：${marker}（请稍后按安装完成时给的手动路径授权）"
+  fi
+  return 0
+}
+
+# write_install_permissions_marker：安装期状态标记（面板仪表盘常驻提醒读它选文案）。
+# 只记**确定的事实**：是不是远程安装、这次有没有申请过完全磁盘访问/外接盘；
+# "有没有真的授权"由面板按权限页的真实状态判，这里不猜。
+write_install_permissions_marker() {
+  dry_run && return 0
+  local f="$DATA_DIR/install-permissions.json"
+  local remote="false" fd="false" rm="false"
+  [ "${ZP_FULL_DISK_MODE:-}" = "remote" ] && remote="true"
+  [ "${ZP_FULL_DISK_ACK:-0}" = "1" ] && fd="true"
+  [ "${ZP_EXTERNAL_ACK:-0}" = "1" ] && rm="true"
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  if cat > "$f" 2>/dev/null <<EOF
+{
+  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "remote_install": $remote,
+  "full_disk_requested": $fd,
+  "removable_requested": $rm
+}
+EOF
+  then
+    chmod 600 "$f" 2>/dev/null || true
+    info "已记录安装期权限状态：$f"
+  else
+    warn "写安装期权限状态失败：$f"
+  fi
+  return 0
+}
+
 # ------------------------------------------------------- 是否开启 SSH --
 setup_ssh_choice() {
   title "远程访问（SSH）"
@@ -3501,6 +3669,8 @@ main() {
 
   # 外接硬盘与授权必须早问：用户还得有时间把外接盘插上（用户 2026-09-19 的铁律）。
   setup_external_volume_notice
+  # 完全磁盘访问权限同一套：早判定/早确认，收尾才由守护进程读一次触发弹窗。
+  setup_full_disk_auth_notice
 
   # 在线升级源探测放在最前面：只做几次 HEAD，很快，且结果要写进 config.json。
   title "面板在线升级源"
@@ -3546,6 +3716,8 @@ main() {
   install_sudoers
   # 让面板（守护进程）在启动时替用户申请一次外接盘授权：标记必须在启动**之前**写好。
   request_external_volume_auth
+  # 完全磁盘访问授权同一套：安装收尾主动触发一次弹窗（真机 + 用户已确认）。
+  request_full_disk_auth
   install_daemon
   setup_nginx_env
   setup_cert
@@ -3561,6 +3733,8 @@ main() {
   create_admin_account
   # 安装收尾的可选动作：免授权访问内网段（选"是"才写入，且必须说清要重启）
   prompt_lan_preauth
+  # 安装期权限状态标记：面板仪表盘常驻提醒读它选文案（不决定要不要提醒）。
+  write_install_permissions_marker
   finish
   return 0
 }

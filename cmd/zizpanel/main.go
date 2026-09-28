@@ -32,6 +32,7 @@ import (
 	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/files"
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/permissions"
 	"github.com/zizdog/zizpanel/internal/services"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/sysinfo"
@@ -107,6 +108,12 @@ func main() {
 		// zizvideo —— 与面板同一代码要求，所以共用面板的 TCC 授权
 		// （见 cmd/zizpanel/zizvideo.go 与 docs/坑清单.md 202）。
 		err = cmdZizvideoSupervise(rest)
+	case "jellyfin-supervise":
+		// Jellyfin（媒体服务器）的常驻 supervisor：由**系统级** LaunchDaemon
+		// com.zizdog.jellyfin 以 root 拉起，fork 后 setuid 到真实用户运行
+		// jellyfin —— 与面板同一代码要求，所以共用面板的 TCC 授权
+		// （读外接盘媒体库不需要第二套授权；见 cmd/zizpanel/jellyfin.go）。
+		err = cmdJellyfinSupervise(rest)
 	case "reset-password", "passwd":
 		err = cmdResetPassword(rest)
 	case "hash-password":
@@ -177,6 +184,7 @@ func usage() {
   zizpanel plugin validate <file…> 校验应用插件声明（zizpanel.app/v1）
   zizpanel plugin plan <file>      干跑：打印"装这台机器会做什么"（不碰机器）
   zizpanel zizvideo-supervise      拉起并保活 zizvideo（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
+  zizpanel jellyfin-supervise      拉起并保活 Jellyfin（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel version                 显示版本
 
 常用参数:
@@ -391,6 +399,18 @@ func cmdServe(args []string) error {
 		}
 		log.Info("外接卷授权请求处理完毕：可访问 %d 个，被系统拒绝 %d 个（控制台用户 %q）",
 			len(res.Okay), len(res.Attempted), res.ConsoleUser)
+	}()
+
+	// 一次性"请求完全磁盘访问授权"（安装脚本真机安装 + 用户当面同意时写下标记）。
+	// 与上面同一套纪律：没人在屏幕前一个字节都不读（见 internal/permissions/fulldiskauth.go）。
+	go func() {
+		marker := permissions.FullDiskAuthMarkerPath(cfg.DataDir)
+		res := permissions.RequestFullDiskAuthorizationOnce(context.Background(), marker, cfg.UserHome, files.ConsoleUser(), 90*time.Second, log.Info)
+		if !res.MarkerConsumed {
+			return
+		}
+		log.Info("完全磁盘访问授权请求处理完毕：可读 %d 个受保护目录，被拒 %d 个（控制台用户 %q）",
+			res.Readable, res.Denied, res.ConsoleUser)
 	}()
 
 	// 预热市场缓存。`brew list` 要约 1.5 秒，放在这里异步做掉，

@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ============================================================================
@@ -51,10 +52,29 @@ var installerArtifactExempt = map[string]string{
 	"docker-runtime": "容器运行时由它自己的探测报产物（见 market 的 artifacts 分流）",
 }
 
+// installerArtifactAbsPath 返回"产物不在家目录"的安装器的**绝对**产物路径。
+//
+// jellyfin 解包到 <面板根>/apps/jellyfin（版本目录 + current 链接）：家目录里只有
+// 用户数据（默认保留），所以不能拿家目录产物当"已安装"判据 —— 那里永远会有东西。
+// 空串 = 这个安装器没有这种产物。
+func installerArtifactAbsPath(appID string) string {
+	if appID == JellyfinAppID {
+		root := strings.TrimSpace(JellyfinInstallRoot)
+		if root == "" {
+			root = "/opt/zizpanel/apps/jellyfin"
+		}
+		return root
+	}
+	return ""
+}
+
 // installerArtifactProbed 报告某个 PanelInstaller 是否已被产物探测覆盖
 // （自家产物表，或"官方 release 原生二进制"注册表）。
 func installerArtifactProbed(appID string) bool {
 	if _, ok := installerArtifactPaths[appID]; ok {
+		return true
+	}
+	if installerArtifactAbsPath(appID) != "" {
 		return true
 	}
 	_, ok := releaseBinaryApps[appID]
@@ -71,6 +91,10 @@ func installerArtifactProbed(appID string) bool {
 // 而每次构造 Manager 都会顺带做一次 Docker socket 探测（没装 Docker 时要等
 // 800ms 超时）—— 那会让市场页白白变慢。这里只需要一个家目录。
 func InstallerArtifactExists(userHome, appID string) bool {
+	// 不在家目录的产物（jellyfin 装在面板应用目录）：按绝对路径探测，与家目录无关。
+	if p := installerArtifactAbsPath(appID); p != "" {
+		return dirExists(p)
+	}
 	home := userHome
 	if home == "" {
 		if h, err := os.UserHomeDir(); err == nil {

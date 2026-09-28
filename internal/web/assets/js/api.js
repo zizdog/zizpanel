@@ -118,6 +118,9 @@ export const api = {
   // 旧面板没有这两个接口 → request() 会抛 status=404 的 ApiError，调用方必须如实提示。
   baseEnv: () => request('GET', `${API_BASE}/system/base-env`),
   installBaseEnv: () => request('POST', `${API_BASE}/system/base-env/install`, {}),
+  // 「权限」页（macOS 授权）：只在仪表盘取"要不要提醒 + 跳去哪"。
+  // 判据与权限页一致（关键项真实授权状态），GET 同样不碰受保护路径。
+  permissionsNotice: () => request('GET', `${API_BASE}/permissions/notice`),
   // 审计：列表（带检索与游标分页）、筛选项、导出。
   // audit() 保留原样给仪表盘用（它只关心最近的记录）。
   audit: (limit = 60) => request('GET', `${API_BASE}/audit?limit=${limit}`),
@@ -365,6 +368,11 @@ export const api = {
   // 非法地址 400 且带原因；id 不在目录里 404。卡片上的「打开」只认这个地址。
   marketAccessURLSet: (id, url) =>
     request('PUT', `${API_BASE}/market/access-url`, { id, url: String(url == null ? '' : url) }),
+  // Jellyfin 媒体目录：面板保存目录，并用 Jellyfin 的身份（真实用户）真的试读一次。
+  // checks[].message / remedy 由后端给全，前端原样展示（读不到时的"出路"在后端一处定义）。
+  jellyfinMediaGet: () => request('GET', `${API_BASE}/jellyfin/media`),
+  jellyfinMediaSet: (dirs) => request('PUT', `${API_BASE}/jellyfin/media`, { dirs: dirs || [] }),
+  jellyfinMediaCheck: (dir) => request('POST', `${API_BASE}/jellyfin/media/check`, { dir }),
   // 按需检查"装了但镜像上有更新吗"（只对 supports_update_check 的条目有意义）。
   // 昂贵探测（打镜像索引 + 起 `--version` 子进程）只在用户打开市场时按需触发，
   // 列表接口本身**不做**探测。结果由前端按 checked_at 缓存 10 分钟；fresh=true 是

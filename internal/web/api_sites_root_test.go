@@ -356,18 +356,19 @@ func TestSiteCreateCustomListenPortAndReadback(t *testing.T) {
 		t.Fatalf("store 未记录端口: %+v err=%v", got, err)
 	}
 
-	// 编辑改端口 → vhost 必须真的变
+	// 编辑改端口 → vhost 必须真的变（8098：避开目录里各应用声明的端口 ——
+	// 8096 是 Jellyfin 的，站点端口撞上会被 validateSiteListenPort 正当地拒掉）。
 	res, out, _ = doJSON(t, ts, "POST", "/api/v1/sites/mirror8095.test",
-		map[string]any{"listen_port": 8096}, cookies)
+		map[string]any{"listen_port": 8098}, cookies)
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("改端口应成功: %v", out)
 	}
 	data = apiData(t, out)
-	if fmt.Sprint(data["listen_port_applied"]) != "8096" || data["listen_port_verified"] != true {
+	if fmt.Sprint(data["listen_port_applied"]) != "8098" || data["listen_port_verified"] != true {
 		t.Errorf("改端口后回读不对：%v", data)
 	}
-	if conf := readVhost(t, srv, "mirror8095.test"); !strings.Contains(conf, "listen      8096;") {
-		t.Errorf("vhost 的 listen 没改成 8096：\n%s", conf)
+	if conf := readVhost(t, srv, "mirror8095.test"); !strings.Contains(conf, "listen      8098;") {
+		t.Errorf("vhost 的 listen 没改成 8098：\n%s", conf)
 	}
 }
 

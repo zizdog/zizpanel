@@ -193,6 +193,74 @@ func (s *Server) handlePermissionsList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// permKeyItemIDs 是"关键项"：这两项没授权就值得在仪表盘常驻提醒。
+var permKeyItemIDs = []string{permissions.ItemFullDisk, permissions.ItemRemovable}
+
+// permNoticeTarget 是"一键去授权"的前端落点（旧 hash `#/permissions` 由 ROUTE_TARGET 兜底）。
+const permNoticeTarget = "#/permissions"
+
+// permNoticeMessage 是横幅那一句话（用户要求 ≤40 字；细节进 detail/title）。
+// 关键项都在时不产出文案（needed=false，前端不渲染；消费方也拿不到误导性文案）。
+func permNoticeMessage(missing []string, remote bool) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	if remote {
+		return "缺 macOS 授权：请到这台机器的屏幕上点「申请」"
+	}
+	if len(missing) >= 2 {
+		return "面板缺 2 项 macOS 授权，点这里去申请"
+	}
+	if len(missing) == 1 && missing[0] == permissions.ItemFullDisk {
+		return "缺「完全磁盘访问权限」，点这里申请"
+	}
+	return "缺「可移除宗卷」授权，点这里申请"
+}
+
+// permNoticeDetail 是横幅折叠起来的手工路径（完全磁盘访问 + 外接盘各自怎么办）。
+func permNoticeDetail() string {
+	return "完全磁盘访问权限：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 点「+」→ " +
+		"在文件选择框按 ⌘⇧G → 粘贴 " + panelBinaryForGuide + " → 打开 → 打开开关。" +
+		"外接盘没有独立列项：正常首次读取会弹「允许访问外接卷」；不弹就给面板二进制开完全磁盘访问，插上盘后再点一次「申请」。"
+}
+
+// handlePermissionsNotice 是仪表盘常驻提醒：只回答"要不要提醒 + 跳去哪"。
+// 判据与权限页一致（关键项真实授权状态），授权成功后 needed 立刻变 false；GET 不碰受保护路径（坑 191）。
+// 安装期标记只用来选文案（远程安装 → 指向"到屏幕上点申请"），不决定要不要提醒。
+func (s *Server) handlePermissionsNotice(w http.ResponseWriter, r *http.Request) {
+	consoleUser := strings.TrimSpace(permConsoleUserFn())
+	h := permissions.HistoryFor(permHistoryPath(s.Cfg.DataDir))
+
+	missing := make([]string, 0, len(permKeyItemIDs))
+	for _, id := range permKeyItemIDs {
+		if st, _, _, _ := permItemStatus(h, id, consoleUser); st != permissions.StatusGranted {
+			missing = append(missing, id)
+		}
+	}
+	remote := permClientIsRemote(s, r)
+
+	view := map[string]any{
+		"needed":              len(missing) > 0,
+		"target":              permNoticeTarget,
+		"unauthorized":        missing,
+		"has_console_session": permissions.ConsoleOK(consoleUser),
+		"is_remote":           remote,
+		"message":             permNoticeMessage(missing, remote),
+		"detail":              permNoticeDetail(),
+	}
+	view["install_phase_known"] = false
+	if phase, known := permissions.ReadInstallPhase(s.Cfg.DataDir); known {
+		view["install_phase_known"] = true
+		view["install"] = map[string]any{
+			"remote_install":      phase.RemoteInstall,
+			"full_disk_requested": phase.FullDiskRequested,
+			"removable_requested": phase.RemovableRequested,
+			"at":                  phase.At.Format(time.RFC3339),
+		}
+	}
+	ok(w, view)
+}
+
 // permErrView 是拒绝响应的正文：msg 给人看，reason 给机器断言。
 type permErrView struct {
 	OK     bool   `json:"ok"`

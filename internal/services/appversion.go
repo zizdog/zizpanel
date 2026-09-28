@@ -41,6 +41,12 @@ func AppVersion(a App) string {
 		}
 		return "" // Dynamic 条目：真源在镜像索引，不猜
 	}
+	// 面板自研安装器自己 pin 版本的条目（jellyfin）：镜像站上没有应用级索引
+	// （apps/jellyfin/manifest.json 实测 404），所以版本真源就是安装器常量。
+	// 新版本要同步到 apps/jellyfin/vX.Y/ 并同时更新那个常量 —— 面板不猜、不爬网。
+	if a.ID == JellyfinAppID {
+		return JellyfinVersion
+	}
 	if a.Kind == KindCompose || a.Kind == KindDocker {
 		return composeImageVersion(a.ComposeYAML)
 	}

@@ -1491,6 +1491,48 @@ var marketDownloadApps = []MarketApp{
 	},
 
 	{
+		ID: JellyfinAppID, Kind: KindNative, PanelInstaller: JellyfinAppID, ServiceLabel: JellyfinLabel,
+		Runtime: MarketRuntime{
+			Mode: MarketRuntimeLaunchd, Label: JellyfinLabel,
+			LabelSource: "目录 ServiceLabel（面板安装器写系统级 LaunchDaemon；" +
+				"服务注册的运行身份方案待用户拍板，接线点见 internal/services/jellyfin.go 的 jellyfinServiceUp）",
+		},
+		Downloads: []MarketDownloadPoint{
+			{
+				Purpose: MarketFetchReleaseBinary,
+				Label:   "下载 Jellyfin " + JellyfinVersion + "（镜像站唯一来源）",
+				Upstream: MarketUpstream{
+					ID:  JellyfinAppID + "@" + JellyfinVersionDir + "/" + JellyfinAsset,
+					URL: publicMirrorBase + "/" + JellyfinMirrorPath(),
+					Tag: JellyfinVersionDir, Asset: JellyfinAsset,
+					Size: JellyfinArtifactBytes,
+					Note: "**本轮实测**（2026-09-29 对镜像站 HEAD + 整包下载）：85,662,936 B；" +
+						"整包复算的 sha256 与 MD5 都与 Jellyfin 官网公布值一致（MD5 11c3638a…）。" +
+						"它**没有 GitHub 公网源**（上游按 OS 分包，macOS 产物只此一份），镜像站是唯一来源",
+				},
+				NAS:      nasMirrored(JellyfinMirrorPath()),
+				Timeout:  JellyfinDownloadTimeout,
+				Required: true,
+				Checksum: MarketChecksum{
+					Asset:  JellyfinAsset,
+					SHA256: JellyfinSHA256,
+					Source: "本轮对镜像站上的整包实测复算（shasum -a 256）；同一份文件的 MD5 " +
+						"11c3638ae93dc356ab444ca36b110828 与 Jellyfin 官网公布值一致",
+					Note: "安装器下载后**逐字节核对 sha256，不一致立刻中止且什么都不装**；面板不使用 MD5。" +
+						"镜像站上没有 apps/jellyfin/manifest.json（实测 404），版本真源是目录常量，不是索引",
+				},
+				ARM64: "产物名 jellyfin_12.1-arm64.tar.xz 即 macOS arm64；本轮实测解包后 " +
+					"jellyfin/jellyfin 是 Mach-O arm64 可执行文件，jellyfin-web/ 齐全",
+				Note: "解包到 <面板根>/apps/jellyfin/v12.1/ 并切 current 符号链接（版本目录便于回退）；" +
+					"下载包落在 WorkDir/jellyfin-download/，装完即删",
+			},
+		},
+		Note: "走面板自研安装器而不是通用 release 轨：那条轨的解包参数写死 -xzf（Jellyfin 是 .tar.xz），" +
+			"产物名里也没有 darwin；本安装器自己完成 镜像下载 → sha256 → 解包 → 版本目录/current → 服务注册。" +
+			"用户数据在 ~/Library/Application Support/jellyfin，**卸载默认保留**。",
+	},
+
+	{
 		ID: "aria2", Kind: KindNative, BrewFormula: "aria2", PanelInstaller: "aria2",
 		ServiceLabel: Aria2Label,
 		Runtime: MarketRuntime{
@@ -2357,6 +2399,24 @@ func MarketDeclarationProblems(m MarketApp, app App) []string {
 				if !strings.HasSuffix(strings.TrimSpace(d.Upstream.URL), "/"+mirrorManifestName) {
 					add("%s: Dynamic 条目的 URL 必须指向镜像上的应用级索引（以 /%s 结尾），现在是 %q",
 						where, mirrorManifestName, d.Upstream.URL)
+				}
+			} else if pf, ok := PanelInstallerArtifacts()[m.PanelInstaller]; ok {
+				// 面板自研安装器自己管的镜像产物（jellyfin）：与安装器的常量比对 ——
+				// 这类条目不在 releaseBinaryApps 注册表里，如果这里不比，声明就可以
+				// 随便写而不被发现（"审计全绿、装的却是别的东西"）。
+				if d.Upstream.Tag != pf.Version || d.Upstream.Asset != pf.Asset {
+					add("%s: 与面板安装器（PanelInstaller=%s）声明的产物不一致。声明 %s/%s，安装器是 %s/%s",
+						where, m.PanelInstaller, d.Upstream.Tag, d.Upstream.Asset, pf.Version, pf.Asset)
+				}
+				if m.PanelInstaller == pf.AppID && d.NAS.State == NASMirrored && d.NAS.Path != pf.NASPath {
+					add("%s: 镜像站路径与安装器不一致。声明 %q，安装器是 %q", where, d.NAS.Path, pf.NASPath)
+				}
+				if !strings.EqualFold(strings.TrimSpace(d.Checksum.SHA256), pf.SHA256) {
+					add("%s: sha256 与安装器不一致。声明 %q，安装器是 %q（写错=装不上或装到坏包）",
+						where, d.Checksum.SHA256, pf.SHA256)
+				}
+				if d.Upstream.Size > 0 && d.Upstream.Size != pf.Size {
+					add("%s: 体积与安装器不一致。声明 %d，安装器是 %d", where, d.Upstream.Size, pf.Size)
 				}
 			} else if releaseRef == nil {
 				add("%s: 声明成 release 二进制，但安装器注册表 ReleaseBinaryAssets() 里**没有** %s —— "+

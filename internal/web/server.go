@@ -341,6 +341,9 @@ func (s *Server) routes() http.Handler {
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
 	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))
+	// 仪表盘常驻提醒（见 api_permissions.go）：只回答"要不要提醒 + 跳去哪"，
+	// 判据与权限页一致（关键项的真实授权状态），GET 同样不碰受保护路径。
+	root.HandleFunc("GET /api/v1/permissions/notice", s.requireAuth(s.handlePermissionsNotice))
 
 	// 本地插件（P2）：列出 / 启用 / 停用。目录见 config.PluginsDir()，规范见 docs/插件规范.md。
 	root.HandleFunc("GET /api/v1/plugins", s.requireAuth(s.handlePluginList))
@@ -566,6 +569,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/market/install-qwentts", s.requireAuth(s.handleInstallQwenTTS))
 	// 音色样本接收端 + 带鉴权的反向代理（网站唯一该访问的入口）
 	root.HandleFunc("POST /api/v1/market/install-voicereceiver", s.requireAuth(s.handleInstallVoiceReceiver))
+	// Jellyfin 媒体目录：面板保存用户挑的目录，并用 Jellyfin 的身份（真实用户）
+	// **真的试读一次** —— 读不到就当场说清并给可执行出路（见 api_jellyfin.go）。
+	root.HandleFunc("GET /api/v1/jellyfin/media", s.requireAuth(s.handleJellyfinMediaGet))
+	root.HandleFunc("PUT /api/v1/jellyfin/media", s.requireAuth(s.handleJellyfinMediaSet))
+	root.HandleFunc("POST /api/v1/jellyfin/media/check", s.requireAuth(s.handleJellyfinMediaCheck))
 	// 多密钥 + 每密钥额度 + 用量统计（receiver v1.6.0），见 api_voice_keys.go
 	root.HandleFunc("GET /api/v1/voice/receiver/keys", s.requireAuth(s.handleVoiceKeys))
 	root.HandleFunc("POST /api/v1/voice/receiver/keys", s.requireAuth(s.handleVoiceKeyAdd))

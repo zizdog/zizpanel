@@ -2224,15 +2224,22 @@ func (m *Manager) RegisterInstalledService(ctx context.Context, label, displayNa
 		//     路径都 404）→ 把旧记录里那条会误导的健康地址**清掉**。
 		// 只补不清的话，策略一改，老记录会永远带着一条假红灯。
 		hu := healthURLFor(app)
+		// 目录声明了期望响应内容（HealthExact，如 Jellyfin 的 "Healthy"）时一并对齐：
+		// 没有期望值的条目（当前绝大多数）保持原样，绝不清掉用户手工设的值。
+		wantExpect := strings.TrimSpace(app.HealthExact)
 		if list, err := m.repo.List(ctx); err == nil {
 			for _, s := range list {
 				if s.LaunchLabel != label {
 					continue
 				}
-				if s.HealthURL == hu && (port <= 0 || s.Port == port) {
+				sameExpect := wantExpect == "" || s.HealthExpect == wantExpect
+				if s.HealthURL == hu && sameExpect && (port <= 0 || s.Port == port) {
 					return nil
 				}
 				s.HealthURL = hu
+				if wantExpect != "" {
+					s.HealthExpect = wantExpect
+				}
 				if port > 0 {
 					s.Port = port
 				}
@@ -2325,11 +2332,16 @@ func (m *Manager) ReconcileHealthURLs(ctx context.Context) (int, error) {
 				continue
 			}
 			want := healthURLFor(app)
-			if s.HealthURL == want {
+			// 目录声明了期望响应内容（HealthExact）时一并对齐；没声明的条目保持原样。
+			wantExpect := strings.TrimSpace(app.HealthExact)
+			if s.HealthURL == want && (wantExpect == "" || s.HealthExpect == wantExpect) {
 				continue
 			}
 			before := s.HealthURL
 			s.HealthURL = want
+			if wantExpect != "" {
+				s.HealthExpect = wantExpect
+			}
 			if err := m.repo.Update(ctx, s); err != nil {
 				s.HealthURL = before
 				continue

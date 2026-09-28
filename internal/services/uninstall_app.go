@@ -858,6 +858,11 @@ var installerUninstalls = map[string]func(m *Manager, ctx context.Context, app A
 	"zizvideo": func(m *Manager, ctx context.Context, app App, removeData, _ bool, r *InstallResult) error {
 		return m.UninstallZizvideo(ctx, app, removeData, r)
 	},
+	// Jellyfin（媒体服务器）：停系统级守护进程 + 删 /opt/zizpanel/apps/jellyfin；
+	// 用户数据（配置/元数据/播放记录）默认保留，媒体文件**永远不动**。
+	"jellyfin": func(m *Manager, ctx context.Context, app App, removeData, force bool, r *InstallResult) error {
+		return m.UninstallJellyfin(ctx, app, removeData, force, r)
+	},
 }
 
 // HasInstallerUninstall 报告某个面板安装器有没有卸载实现。
@@ -1377,6 +1382,19 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 		// zizvideo：产物是自研的系统级 LaunchDaemon + /opt/zizvideo，没有 brew 包要卸。
 		// 计划与执行端共用同一个 zizvideoInstallPlan（路径只写一份）；媒体根永不进 DataPaths。
 		p = m.zizvideoInstallPlan()
+	case "jellyfin":
+		// Jellyfin：产物是系统级 LaunchDaemon（面板二进制的 jellyfin-supervise）+ 面板应用目录。
+		// 用户数据（配置/元数据/播放记录）只在用户勾选「删除数据」时才删；媒体文件永不进 DataPaths。
+		jp := m.jellyfinPaths()
+		p.Steps = []string{
+			"停止并删除 launchd 服务 " + JellyfinLabel,
+			"从「服务管理」移除记录",
+			"删除安装目录 " + jp.Root + "（应用包与 current 链接）",
+		}
+		p.DataPaths = []string{jp.UserDataDir}
+		p.KeepNote = "默认保留用户数据目录 " + jp.UserDataDir +
+			"（配置、元数据、播放记录）；要一并清理请在确认框勾选「同时删除数据」。" +
+			"你的媒体文件不在这个目录里，卸载**永远不会动**它们。"
 	default:
 		p.Blocked = "这个应用没有卸载实现"
 	}

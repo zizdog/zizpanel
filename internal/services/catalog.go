@@ -1722,6 +1722,32 @@ func builtinCatalog() []App {
 				"手改 settings.json 再重启会被 daemon 退出时的回写覆盖；默认关 LSD/UPnP（DHT 保持开启，磁力链要用）。",
 			DocsURL: "https://transmissionbt.com",
 		},
+		// ---------------- Jellyfin（媒体服务器，面板自研安装器） ----------------
+		//
+		// 为什么走面板安装器：Homebrew 没有 jellyfin（上游给的是 macOS arm64 的
+		// .tar.xz），通用 brew 轨会去装一个不存在的包；通用 release 轨的 extractArgs
+		// 写死 -xzf（Jellyfin 是 .tar.xz），产物名里也没有 darwin。安装器自己
+		// 从镜像站取件、校验 sha256、解包到面板应用目录（版本目录 + current 链接），
+		// 见 internal/services/jellyfin.go。
+		//
+		// 不给 UI（也**不生成**默认端口「打开」）：用户 1.10.7 起要求「打开」必须
+		// 由用户自填访问地址；端口只作管理面板里的只读提示。首次访问是**安装向导**
+		// （未配置前没有鉴权），所以更不能替用户点开。
+		{
+			ID: JellyfinAppID, Name: "Jellyfin", Icon: "🎬",
+			Summary:     "开源自托管影音服务器：刮削电影/剧集/音乐",
+			Description: "媒体库服务器；首次访问需在浏览器里走安装向导。",
+			Category:    CategoryTool, Kind: KindNative,
+			PanelInstaller: "jellyfin", ServiceLabel: JellyfinLabel,
+			// 8096：Jellyfin 默认 HTTP 端口（绑 0.0.0.0）；/health 返回 Healthy。
+			Port: JellyfinPort, HealthPath: JellyfinHealthPath, HealthExact: JellyfinHealthExpect,
+			// ffmpeg 是转码链路的硬前置（包内**不含** ffmpeg，用面板的基础依赖）：
+			// 由 EnsureBaseDependencies 幂等补齐，缺了在安装第一步就如实报出来。
+			Requires: []Requirement{{Type: "brew_formula", Value: "ffmpeg",
+				Hint: "Jellyfin 转码/刮削要用 ffmpeg（面板基础依赖，会自动一并装好）"}},
+			PostInstallHint: "首次访问需在浏览器里走安装向导（未配置前无鉴权）。",
+			DocsURL:         "https://jellyfin.org",
+		},
 		// ---------------- aria2（下载器 + 面板托管的 AriaNg 界面） ----------------
 		//
 		// 为什么必须走面板安装器（通用 brew 轨做不到）：

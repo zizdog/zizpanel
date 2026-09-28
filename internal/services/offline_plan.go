@@ -182,6 +182,19 @@ var offlineInstallerExtra = map[string][]OfflineArtifact{
 				"按需下载、不在离线包的必需件里 —— 要真离线也必须把用得到的档位一起落盘。",
 		},
 	},
+	// Jellyfin 的整包只在镜像站上（没有 GitHub 源），所以离线包必须自带它。
+	// 路径从安装器常量派生（PanelInstallerArtifacts），不手抄文件名/sha256。
+	JellyfinAppID: {
+		{
+			Kind:        OfflineKindOther,
+			Path:        "artifacts/" + JellyfinMirrorPath(),
+			MirrorPath:  JellyfinMirrorPath(),
+			UpstreamURL: publicMirrorBase + "/" + JellyfinMirrorPath(),
+			Note: "Jellyfin " + JellyfinVersion + " 的 macOS arm64 整包（" +
+				humanBytes(JellyfinArtifactBytes) + "，sha256 " + JellyfinSHA256 +
+				"）；它没有公网源，镜像站是唯一来源 —— 离线包缺了它 Jellyfin 就装不上",
+		},
+	},
 }
 
 // offlinePythonExtra 是"面板自研 Python 安装器"需要但**不在目录里**的文件。

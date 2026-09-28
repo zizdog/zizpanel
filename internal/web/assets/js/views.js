@@ -187,6 +187,50 @@ export function DashboardView(content, ctx = {}) {
   // 刻意**不做硬门禁**：镜像不可用时不让人进门，比不提示更糟。所以是"提示 + 一键装 + 稍后"。
   const baseEnvNotice = h('div');
 
+  // ---------- macOS 授权未完成的常驻提醒（仪表盘最上面）----------
+  // 判据来自后端 GET /permissions/notice（与「权限」页同一套真实状态）；
+  // 授权成功后 needed=false，横幅自然消失；接口读不到就不显示（不猜状态）。
+  const permNotice = h('div');
+
+  function goPermissions(target) {
+    // 仪表盘上当前 hash 一定不是权限页，赋值必然触发 hashchange。
+    location.hash = target || '#/permissions';
+  }
+
+  async function checkPermNotice() {
+    permNotice.replaceChildren();
+    let data = null;
+    try {
+      data = await api.permissionsNotice();
+    } catch (e) {
+      return; // 旧面板没有这个接口：如实沉默，不猜状态
+    }
+    if (!data || data.needed !== true) return;
+    const detail = String(data.detail || '');
+    const detailBox = h('div.hint', { style: { display: 'none', marginTop: '8px' }, text: detail });
+    permNotice.append(h('div.card', {
+      dataset: { testid: 'zp-perm-notice' },
+      title: detail,
+      style: { borderLeft: '4px solid #e6a23c', marginBottom: '14px' },
+    }, [
+      h('div.card-body', [
+        h('div', { style: { fontWeight: '600' }, text: '⚠ ' + (data.message || '面板缺 macOS 授权') }),
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          h('button.btn.btn-primary', { text: '去授权', onclick: () => goPermissions(data.target) }),
+          detail ? h('button.btn.btn-sm', {
+            text: '手动授权路径',
+            onclick: (e) => {
+              const show = detailBox.style.display === 'none';
+              detailBox.style.display = show ? '' : 'none';
+              e.currentTarget.textContent = show ? '收起手动路径' : '手动授权路径';
+            },
+          }) : null,
+        ]),
+        detailBox,
+      ]),
+    ]));
+  }
+
   // baseEnvDismissed 只认"用户点了稍后"这一个持久标记。
   // 刻意**不缓存"已就绪"**：缓存会把"这次读不到"当成"已就绪"永久跳过提示。
   function baseEnvDismissed() {
@@ -318,6 +362,7 @@ export function DashboardView(content, ctx = {}) {
   }
 
   content.append(
+    permNotice,
     baseEnvNotice,
     topGrid,
     h('div.grid.grid-2', [sysCard, charts]),
@@ -331,6 +376,8 @@ export function DashboardView(content, ctx = {}) {
   loadServices();
   // 运行依赖横幅独立于服务列表拉取（见 checkBaseEnv 的注释）。
   void checkBaseEnv();
+  // macOS 授权提醒同样独立拉取：接口挂了不该让别的卡片变空白。
+  void checkPermNotice();
 
   function update(s) {
     state.metrics = s;

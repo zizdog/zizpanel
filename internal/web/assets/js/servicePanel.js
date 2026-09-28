@@ -620,6 +620,9 @@ export async function openServicePanel(o = {}) {
 
   const statusBox = h('div', [h('div.hint', { text: '正在读取服务状态…' })]);
   const accessBox = h('div');
+  // 媒体目录区：只有目录条目声明了 media_dirs 的应用才显示（数据决定，不写应用 ID）。
+  const mediaTitle = h('div.section-title', { style: { marginTop: '14px', display: 'none' }, text: '媒体目录' });
+  const mediaBox = h('div', { style: { display: 'none' } });
   const actionBox = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } });
   const detailBox = h('div', [h('div.hint', { text: '正在读取服务详情…' })]);
   // 保存/清除后在**面板内**立即生效的值：不依赖调用方重新拉一次市场列表
@@ -635,6 +638,8 @@ export async function openServicePanel(o = {}) {
       statusBox,
       h('div.section-title', { style: { marginTop: '4px' }, text: '访问地址（自定义）' }),
       accessBox,
+      mediaTitle,
+      mediaBox,
       h('div.section-title', { style: { marginTop: '14px' }, text: '操作' }),
       actionBox,
       h('div.section-title', { style: { marginTop: '14px' }, text: '信息' }),
@@ -797,6 +802,80 @@ export async function openServicePanel(o = {}) {
     render(res);
   }
 
+  // ---- 媒体目录（只有声明了 media_dirs 的条目才有）----
+  // 为什么必须有：Jellyfin 的库路径由它自己的界面管理，但"Jellyfin 那个身份读不读得到
+  // 这个目录"只有面板能提前验证（外接盘的隐私授权属于面板）。不验证的后果是用户在
+  // Jellyfin 里看到一个空库却不知道为什么 —— 所以这里读不到就**当场给可执行出路**。
+  let mediaToken = 0;
+  async function renderMedia(mi) {
+    const on = !!(mi && mi.media_dirs);
+    mediaTitle.style.display = on ? '' : 'none';
+    mediaBox.style.display = on ? '' : 'none';
+    if (!on) { clear(mediaBox); return; }
+    const token = ++mediaToken;
+    let data = { dirs: [], checks: [] };
+    try {
+      const r = await api.jellyfinMediaGet();
+      data = { dirs: (r && r.dirs) || [], checks: (r && r.checks) || [] };
+    } catch (e) {
+      data = { dirs: [], checks: [], error: String((e && e.message) || e) };
+    }
+    if (token !== mediaToken) return; // 期间面板重画过：丢弃这次结果，别覆盖新的
+    drawMedia(data, token);
+  }
+
+  function drawMedia(data, token) {
+    clear(mediaBox);
+    const input = h('input', {
+      type: 'text', placeholder: '/Volumes/Media 或 ~/Movies',
+      dataset: { testid: 'jellyfin-media-input' },
+      style: { flex: '1', minWidth: '220px' },
+    });
+    const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' } });
+    const showErr = (msg) => { err.textContent = msg || ''; err.style.display = msg ? '' : 'none'; };
+    const apply = async (dirs) => {
+      try {
+        const r = await api.jellyfinMediaSet(dirs);
+        if (token !== mediaToken) return;
+        drawMedia({ dirs: (r && r.dirs) || [], checks: (r && r.checks) || [] }, token);
+      } catch (e) {
+        // 后端的拒绝原因（不存在/不是绝对路径）原样显示，绝不吞掉。
+        showErr(String((e && e.message) || e));
+      }
+    };
+    appendAll(mediaBox,
+      h('div.hint', { text: 'Jellyfin 的媒体库路径要在它自己的安装向导/后台里添加；' +
+        '这里先验证「Jellyfin 那个身份读不读得到」——读不到就会是空库。' }),
+      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } }, [
+        input,
+        h('button.btn.btn-sm.btn-primary', {
+          text: '添加并试读', dataset: { testid: 'jellyfin-media-add' },
+          onclick: () => {
+            const v = String(input.value || '').trim();
+            if (!v) { showErr('先填一个目录'); return null; }
+            return apply([...(data.dirs || []), v]);
+          },
+        }),
+      ]),
+      err,
+    );
+    if (data.error) appendAll(mediaBox, h('div.hint', { text: '读取媒体目录失败：' + data.error }));
+    for (const c of (data.checks || [])) {
+      appendAll(mediaBox, h('div', { style: { marginTop: '8px' } }, [
+        h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } }, [
+          pill(c.ok ? 'ok' : 'danger', c.ok ? '已试读' : '读不到'),
+          h('code', { text: c.dir }),
+          h('button.btn.btn-sm', {
+            text: '移除', title: '只从面板的清单里移除；媒体文件一个都不会动',
+            onclick: () => apply((data.dirs || []).filter((d) => d !== c.dir)),
+          }),
+        ]),
+        h('div.hint', { text: c.message }),
+        c.remedy ? h('div.hint', { style: { color: 'var(--warn)' }, text: '出路：' + c.remedy }) : null,
+      ]));
+    }
+  }
+
   function render(res) {
     resolved = res;
     const s = res.svc;
@@ -900,6 +979,10 @@ export async function openServicePanel(o = {}) {
         try { input.focus(); } catch { /* 聚焦失败不影响功能 */ }
       }
     }
+
+    // ---- 媒体目录（由数据决定：mi.media_dirs）----
+    // 面板保存目录，并用应用自己的身份真的试读一次；读不到时把"出路"原样展示。
+    void renderMedia(mi);
 
     // ---- 操作 ----
     clear(actionBox);

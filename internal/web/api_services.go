@@ -948,6 +948,11 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 		// **纯静态声明派生**：这里只读注册表，列表路径不联网、不起进程（AGENTS 第三节 7）。
 		SupportsUpdateCheck bool `json:"supports_update_check"`
 
+		// MediaDirs 表示这个条目有「媒体目录」配置（面板保存目录，并用应用自己的
+		// 身份真的试读一次；见 api_jellyfin.go）。前端据此渲染那一块 ——
+		// 纯静态声明派生，列表路径不做任何探测。
+		MediaDirs bool `json:"media_dirs,omitempty"`
+
 		// Version 是**目录声明的版本**（面板认为该装的版本），空 = 面板这边没有
 		// 版本真源（brew 交给 brew、动态条目真源在镜像索引）—— 前端不许把空当
 		// "已是最新"，只能如实说"未知"。
@@ -1182,6 +1187,7 @@ func (s *Server) handleMarketList(w http.ResponseWriter, r *http.Request) {
 			EngineConflict: engineConflict,
 			// 静态派生（注册表），列表路径里**不做**任何网络/exec。
 			SupportsUpdateCheck: services.SupportsUpdateCheck(a.ID),
+			MediaDirs:           services.SupportsMediaDirs(a.ID),
 			// 版本：声明版本取各轨的事实源（services.AppVersion）；已装版本这里只算
 			// brew 那一半（批量探测结果就在手上），其余轨由安装时记录补上。
 			Version:          services.AppVersion(a),
@@ -1560,6 +1566,13 @@ func (s *Server) handleMarketInstall(w http.ResponseWriter, r *http.Request) {
 		// （<面板二进制目录>/zizvideo），要装成系统级 LaunchDaemon
 		// （可执行文件是面板自身的 `zizpanel zizvideo-supervise`）—— 通用流程做不到。
 		s.handleInstallZizvideo(w, r)
+		return
+	case "jellyfin":
+		// Jellyfin：Homebrew 没有它，通用 release 轨的解包参数也不认 .tar.xz。
+		// 面板自研安装器从镜像站取件、校验 sha256、解包到面板应用目录，
+		// 并注册系统级 LaunchDaemon（执行面板自身的 `jellyfin-supervise`，
+		// 从而继承面板的文件访问授权）。
+		s.handleInstallJellyfin(w, r)
 		return
 	}
 
