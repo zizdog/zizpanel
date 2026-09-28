@@ -101,6 +101,9 @@ export const api = {
 
   // ---- 具体接口 ----
   ping: () => request('GET', `${API_BASE}/ping`),
+  // health 是轻量公开接口（不查库、无需登录）：应用页用它取**当前面板版本**，
+  // 当"本地缓存要不要丢弃"的判据（面板升级后旧缓存必须整份失效）。
+  health: () => request('GET', `${API_BASE}/health`),
   setupStatus: () => request('GET', `${API_BASE}/setup/status`),
   setup: (username, password) => request('POST', `${API_BASE}/setup`, { username, password }),
   login: (username, password) => request('POST', `${API_BASE}/login`, { username, password }),

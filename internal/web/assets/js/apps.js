@@ -83,24 +83,50 @@ let svcState = {};
 // 标出它有多旧（见 renderTabBar 的「缓存 · N 分钟前」），绝不假装实时。
 const MARKET_CACHE_STORE = 'zp.market.dataCache';
 
-// loadDataCache 读回上一次的 {market, services, at}；形状不对一律当没有（不猜）。
+// panelVersion 是**当前面板版本**（GET /api/v1/health），也是缓存判据的一部分：
+// 升级会换掉应用目录与安装判据，旧版本存的结论必须整份丢弃（用户报障"升级后
+// 市场里搜不到新上架的 Jellyfin"就是这个根因）。版本没取到之前一律不认缓存。
+let panelVersion = '';
+let panelVersionInflight = null;
+
+// ensurePanelVersion 只问一次 /api/v1/health（轻量、不查库、无需登录）。
+// 拿不到就返回空串 —— 调用方据此**不认缓存**（宁可多拉一次，绝不显示旧版本数据）。
+function ensurePanelVersion() {
+  if (panelVersion) return Promise.resolve(panelVersion);
+  if (!panelVersionInflight) {
+    panelVersionInflight = api.health()
+      .then((r) => { panelVersion = String((r && r.version) || '').trim(); return panelVersion; })
+      // 失败不缓存这个 promise：下次进页面/心跳再试一次（一次网络抖动不该让缓存整场失效）。
+      .catch(() => { panelVersionInflight = null; return ''; });
+  }
+  return panelVersionInflight;
+}
+
+// loadDataCache 读回上一次的 {market, services, at, version}；形状或**版本**不对一律当没有（不猜）。
 function loadDataCache() {
   try {
     const raw = sessionStorage.getItem(MARKET_CACHE_STORE);
     const o = raw ? JSON.parse(raw) : null;
     if (!o || typeof o !== 'object' || !o.market || !Array.isArray(o.market.list)) return null;
-    return { market: o.market, services: Array.isArray(o.services) ? o.services : [], at: String(o.at || '') };
+    const cachedVersion = String(o.version || '');
+    // 版本不一致（含旧格式没存版本、当前版本没取到）⇒ 丢弃，让调用方重新拉取。
+    if (!panelVersion || cachedVersion !== panelVersion) return null;
+    return {
+      market: o.market, services: Array.isArray(o.services) ? o.services : [],
+      at: String(o.at || ''), version: cachedVersion,
+    };
   } catch (e) {
     return null;
   }
 }
 
-// saveDataCache 把这一轮结论落盘；存不下（隐私模式/配额满）只在本次会话生效，不影响结论。
+// saveDataCache 把这一轮结论落盘（**连面板版本一起存**，否则读的时候没有可比的东西）；
+// 存不下（隐私模式/配额满）只在本次会话生效，不影响结论。
 function saveDataCache() {
   if (!cache) return;
   try {
     sessionStorage.setItem(MARKET_CACHE_STORE, JSON.stringify({
-      market: cache, services: svcList, at: cacheAt || new Date().toISOString(),
+      market: cache, services: svcList, at: cacheAt || new Date().toISOString(), version: panelVersion,
     }));
   } catch (e) { /* 存不了就算了 */ }
 }
@@ -110,12 +136,25 @@ let cacheAt = '';
 // preheat 是登录预热正在进行的那次"拉齐数据"（见 bootstrapAppUpdates）。
 // 进度：预热与用户进页面撞在一起时，页面**等它**而不是再发一遍相同的两个请求。
 let preheat = null;
-// 进页面时先恢复上一次的缓存：有它就直接渲染（不发请求）。
-const restoredMarketCache = loadDataCache();
-if (restoredMarketCache) {
-  cache = restoredMarketCache.market;
-  svcList = restoredMarketCache.services;
-  cacheAt = restoredMarketCache.at;
+
+// restoreDataCache 进页面时先恢复上一次的缓存：**先验证版本**再认它。
+// 验证要问一次 /api/v1/health，所以是异步的；load 与 bootstrap 都等这一个 promise
+//（同一个页面里只验证/恢复一次）。版本对不上就把落盘那份也删掉，别留着被下次误用。
+let restoreInflight = null;
+function restoreDataCache() {
+  if (restoreInflight) return restoreInflight;
+  restoreInflight = ensurePanelVersion().then(() => {
+    const restored = loadDataCache();
+    if (!restored) {
+      try { sessionStorage.removeItem(MARKET_CACHE_STORE); } catch (e) { /* 忽略 */ }
+      return null;
+    }
+    cache = restored.market;
+    svcList = restored.services;
+    cacheAt = restored.at;
+    return restored;
+  });
+  return restoreInflight;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +217,7 @@ let appUpdateAnnounced = 0;
 async function runBackgroundUpdateCheck() {
   // 与页面自己的那一轮探测互斥：两轮同时打后端只会重复跑一次 brew outdated。
   if (appUpdateInflight || updateInflight) return;
+  await ensurePanelVersion(); // 版本没取到之前 loadDataCache 一律返回空
   const data = loadDataCache();
   const list = (data && data.market && Array.isArray(data.market.list)) ? data.market.list : null;
   if (!list) return; // 还没拉过市场列表：等下一轮（面板刚启动时可能还没人打开过应用页）
@@ -226,7 +266,9 @@ function lastBackgroundCheckAt() {
 //      就直接跳过检查，于是不打开应用页就永远没有提醒）；
 //   ③ 检查完立刻把"有 N 个可更新"写进 localStorage + 派发事件，侧栏红点**不用等访问应用页**。
 export async function bootstrapAppUpdates() {
-  if (!loadDataCache()) {
+  // 先把缓存按**面板版本**校验一遍（版本不符会被丢掉并删掉落盘那份）。
+  await restoreDataCache();
+  if (!cache) {
     // ⚠️ 市场与服务记录必须**一起**就位再写进 cache（2026-09-22 真机撞到的竞态）：
     // 以前先 `cache = await api.market()`、再单独等服务记录，中间那段窗口里
     // `cache` 已非空而 `svcList` 还是空的 —— 用户这时（登录后立刻）进「应用 → 已安装」
@@ -370,6 +412,64 @@ function versionPillOf(a) {
 }
 
 // ---------------------------------------------------------------------------
+//  应用市场的搜索与排序
+// ---------------------------------------------------------------------------
+//
+// 状态放模块级：切子 Tab、切到别的页面再回来都保持一致（用户要求"别一换标签就重置"）。
+// 只有两个入口会清空：搜索框的 ✕ / 整页刷新（sessionStorage 里不存它，避免悄悄残留）。
+let marketQuery = '';
+// marketSort 三档。**市场条目里没有"更新时间"字段**（只有目录声明的
+// version、本机 installed_version 与目录顺序，2026-09-29 逐字段查过），所以第三档用真实字段 version 按版本号
+// 从新到旧，UI 上写明是"版本"—— 绝不拿 Date.now() 之类编一个排序键。
+let marketSort = 'default';
+const MARKET_SORTS = [
+  { id: 'default', label: '默认排序' },
+  { id: 'name', label: '名字排序' },
+  { id: 'version', label: '版本从新' },
+];
+
+// marketSearchText 拼一条应用的可搜索文本：名称 / 摘要 / 描述 / 分类（原始 key 与
+// 中文板块名）/ 应用 id。全部转小写 ⇒ 大小写不敏感，中文直接按字面匹配。
+function marketSearchText(a, categoryLabels) {
+  if (!a) return '';
+  const key = a.category || 'other';
+  const label = (categoryLabels && categoryLabels.get) ? (categoryLabels.get(key) || '') : '';
+  return [a.name, a.summary, a.description, a.app_id, a.id, key, label]
+    .filter((x) => typeof x === 'string' && x)
+    .join(' ')
+    .toLowerCase();
+}
+
+// versionParts 把版本号拆成数字段（v0.71.0 → [0,71,0]）；没有数字 ⇒ null（排最后，不猜）。
+function versionParts(v) {
+  const m = String(v || '').match(/\d+/g);
+  return m ? m.map(Number) : null;
+}
+
+// compareMarketVersions 版本从新到旧；**没有版本真源的条目一律排在后面**（保持原相对顺序）。
+function compareMarketVersions(a, b) {
+  const x = versionParts(a && a.version);
+  const y = versionParts(b && b.version);
+  if (!x || !y) {
+    if (!x && !y) return 0;
+    return x ? -1 : 1;
+  }
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const dx = x[i] || 0;
+    const dy = y[i] || 0;
+    if (dx !== dy) return dy - dx;
+  }
+  return 0;
+}
+
+// compareMarketNames 名字排序：中文按浏览器自带的 zh 排序（拼音），数字按数值比。
+function compareMarketNames(a, b) {
+  const an = String((a && (a.name || a.id)) || '');
+  const bn = String((b && (b.name || b.id)) || '');
+  return an.localeCompare(bn, 'zh-Hans-CN', { sensitivity: 'base', numeric: true });
+}
+
+// ---------------------------------------------------------------------------
 //  市场卡片的「更新检查」（按需探测 + sessionStorage 缓存）
 // ---------------------------------------------------------------------------
 //
@@ -440,6 +540,9 @@ export function AppsView(content, ctx = {}) {
   let loadError = null;
   let marketGrid = null;
   let marketHead = null;
+  // 搜索命中数 pill 与清空按钮：输入时只更新它们（不重画工具栏，否则输入框会失焦）。
+  let marketCountPill = null;
+  let marketClearBtn = null;
   // netFailure：最近一次安装/探测失败的原文，**仅当判定为网络问题时**才存。
   // 存下来是为了在本页内容最上方常驻一条醒目的网络提示（见 renderBody）。
   let netFailure = '';
@@ -621,6 +724,9 @@ export function AppsView(content, ctx = {}) {
   // 只有"从来没有缓存"（首次用面板/换了浏览器）才拉一次；此后一律等用户点「⟳ 更新」。
   async function load() {
     if (!proxyState) proxyState = { enabled: true, items: [], _stale: true };
+    // 先按**面板版本**校验缓存：版本变了（刚升级过面板）就丢掉重新拉，
+    // 版本没变照旧直接渲染。验证是异步的（一次 health），所以放在最前面等它。
+    await restoreDataCache();
     // 后台检查由外壳在登录后预热（bootstrapAppUpdates）；这里只挂"查完重画"的订阅。
     if (cache) {
       // 恢复出来的服务记录也要派生一次"服务名 → state"（卡片首颗按钮要它）。
@@ -811,7 +917,8 @@ export function AppsView(content, ctx = {}) {
   function afterUpdateChecks() {
     if (!alive) return;
     if (active === 'market' && marketGrid) {
-      renderHead();
+      // 只重画网格：工具栏里有搜索输入框，重画它会让正在打字的用户失焦
+      //（"共 N / 已安装 N"只跟安装状态有关，更新检查不会改它）。
       renderGrid();
       return;
     }
@@ -870,9 +977,10 @@ export function AppsView(content, ctx = {}) {
   function renderMarketTab() {
     const grid = h('div');
     const head = h('div.card-head', [
-      h('h3', { text: '应用市场' }),
+      // 标题不参与收缩（min-width:0 的 h3 会被工具栏挤成一条竖线，390px 实测）。
+      h('h3', { text: '应用市场', style: { flex: '0 0 auto' } }),
       h('div.spacer'),
-      h('div#apps-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }),
+      h('div#apps-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', minWidth: '0' } }),
     ]);
     appendAll(body, h('div.card', [head, h('div.card-body', [grid])]));
     marketGrid = grid;
@@ -892,7 +1000,34 @@ export function AppsView(content, ctx = {}) {
     clear(marketHead);
     const all = marketApps();
     const installed = all.filter(isInstalled).length;
+    // 搜索框与排序下拉放工具栏（不塞进卡片）：输入时只重画网格 + 命中数，不重建工具栏
+    // （重建会让输入框失焦）。宽度用 flex 自适应 + maxWidth，360px 下不会横向溢出。
+    marketCountPill = h('span.pill', { style: { display: 'none' } });
+    marketClearBtn = h('button.btn.btn-sm', {
+      text: '✕',
+      title: '清空搜索',
+      style: { visibility: marketQuery.trim() ? 'visible' : 'hidden' },
+      onclick: () => { marketQuery = ''; renderHead(); renderGrid(); },
+    });
     appendAll(marketHead,
+      h('input.input', {
+        type: 'search', value: marketQuery, spellcheck: 'false',
+        placeholder: '搜索名称 / 分类 / ID',
+        dataset: { role: 'market-search' },
+        title: '搜索应用：匹配名称 / 摘要 / 描述 / 分类 / 应用 ID，不区分大小写',
+        style: { flex: '1 1 160px', width: 'auto', minWidth: '0', maxWidth: '240px' },
+        oninput: (e) => { marketQuery = e.target.value; renderGrid(); },
+      }),
+      marketClearBtn,
+      marketCountPill,
+      h('select.select', {
+        dataset: { role: 'market-sort' },
+        title: '排序方式：默认排序保持目录顺序并把有更新的应用置顶；名字 / 版本排序会打平列表重排',
+        style: { flex: '0 0 auto', width: 'auto', maxWidth: '150px' },
+        onchange: (e) => { marketSort = e.target.value; renderGrid(); },
+      }, MARKET_SORTS.map((s) => h('option', {
+        value: s.id, text: s.label, selected: s.id === marketSort,
+      }))),
       h('span.pill', { text: `共 ${all.length} 个应用` }),
       installed > 0 ? h('span.pill.ok', { text: `已安装 ${installed}` }) : null,
       // 安装状态筛选（全部/未安装/已安装，默认未安装）与「原生/Docker」分类筛选
@@ -1384,14 +1519,18 @@ export function AppsView(content, ctx = {}) {
     return row;
   }
 
-  function renderPluginsBlock(grid) {
+  function renderPluginsBlock(grid, query = '') {
     const info = pluginsCache;
     if (!info) {
       // 正常情况下 load() 已经预取过；万一没有（例如从缓存直接画），这里补一次拉取并重画。
       loadPlugins().then(() => { if (marketGrid) renderGrid(); });
       return;
     }
-    const items = info.items || [];
+    const q = String(query || '').trim().toLowerCase();
+    const items = (info.items || []).filter((it) => !q
+      || [it.name, it.id, it.file, it.summary].filter(Boolean).join(' ').toLowerCase().includes(q));
+    // 搜索时一个插件都没命中 ⇒ 不占版面（也不弹"本地插件（0）"那段安装说明）。
+    if (q && !items.length) return;
     appendAll(grid, h('div.section-title', {
       style: { marginTop: grid.childElementCount ? '20px' : '0' },
       text: '本地插件（' + items.length + '）',
@@ -1410,16 +1549,34 @@ export function AppsView(content, ctx = {}) {
     appendAll(grid, h('div.grid.grid-3', items.map(pluginRow)));
   }
 
+  // updateMarketCount 更新工具栏上的「命中 N 个」与清空按钮（不重建工具栏，输入框不失焦）。
+  function updateMarketCount(n) {
+    const q = marketQuery.trim();
+    if (marketClearBtn) marketClearBtn.style.visibility = q ? 'visible' : 'hidden';
+    if (!marketCountPill) return;
+    if (!q) {
+      marketCountPill.style.display = 'none';
+      marketCountPill.textContent = '';
+      return;
+    }
+    marketCountPill.style.display = '';
+    marketCountPill.textContent = '命中 ' + n + ' 个';
+  }
+
   // renderGrid 重画「应用市场」的卡片网格。
   //
   // 数据是 marketApps()：**全部**可安装的原生应用（已安装的与未安装的**同时**
   // 显示在一个列表里，不再分两块、也不再默认只显示未安装）。docker 类与站点
   // 应用各有自己的 Tab，不在这里。
+  //
+  // 搜索或显式排序时**打平成一个列表**：分区标题与"可更新置顶"只服务默认视图，
+  // 用户显式选了顺序时再插入置顶分组就不是真的按名字/版本排了。
   function renderGrid() {
     if (!marketGrid) return;
     clear(marketGrid);
     const all = marketApps();
     if (!all.length) {
+      updateMarketCount(0);
       appendAll(marketGrid, h('div.empty', [
         h('div.big', { text: '🧩' }),
         h('h4', { text: '应用目录为空' }),
@@ -1431,6 +1588,30 @@ export function AppsView(content, ctx = {}) {
     // 更新探测**不在这里触发**：它很贵（读镜像索引 / 起 `--version` 子进程），
     // 只在首次加载、点「⟳ 更新」或后台定时检查时各跑一次（见 load / refresh / runBackgroundUpdateCheck）。
     // 挂在每次重画上会让"切个页签"就重新探测一轮。
+
+    const q = marketQuery.trim().toLowerCase();
+    const labels = new Map();
+    for (const s of (cache?.sections || [])) if (s && s.key) labels.set(s.key, s.label || '');
+    const matched = q ? all.filter((a) => marketSearchText(a, labels).includes(q)) : all;
+    updateMarketCount(matched.length);
+
+    if (q || marketSort !== 'default') {
+      const sorted = matched.slice();
+      if (marketSort === 'name') sorted.sort(compareMarketNames);
+      else if (marketSort === 'version') sorted.sort(compareMarketVersions);
+      if (!sorted.length) {
+        appendAll(marketGrid, h('div.empty', [
+          h('div.big', { text: '🔍' }),
+          h('h4', { text: '没有匹配的应用' }),
+          h('p', { text: '没有找到「' + marketQuery.trim() + '」；换个词，或点搜索框旁的 ✕ 清空。' }),
+        ]));
+      } else {
+        appendAll(marketGrid, h('div.grid.grid-3', sorted.map((a) => appCard(a))));
+      }
+      // 本地插件跟着同一份搜索词过滤（排序只作用于市场条目）。
+      renderPluginsBlock(marketGrid, q);
+      return;
+    }
 
     // 置顶：只有**确定**有更新（update_available=true）的条目提前到一个显式分组；
     // unknown/没查/已最新保持原顺序 —— 顺序不因为"还没查完"抖一下。
