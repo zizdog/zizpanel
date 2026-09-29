@@ -793,7 +793,9 @@ function smbSection() {
     const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' }, dataset: { testid: 'zp-smb-form-error' } });
     const setErr = (m) => { err.textContent = m || ''; err.style.display = m ? '' : 'none'; };
 
-    const shareLabel = h('label', { text: '共享名' });
+    // 文案要点：**名字**是本机随便起的挂载点目录名；**共享名**必须是 NAS 上真实存在的那个
+    // （真机事故：用户把本机名字 fnnas-media 填进了共享名，服务端回 0xC0000225，无从下手）。
+    const shareLabel = h('label', { text: '共享名（NAS 上真实存在的）' });
     // 「列出共享」：真机踩过 —— 用户把**挂载名**当共享名填，服务端只回一句 0xC0000225
     // （Unknown error），完全无从下手。smbutil view 走同一个 pty 口令通道，列出来点一下就行。
     const shareList = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' }, dataset: { testid: 'zp-smb-share-list' } });
@@ -828,9 +830,12 @@ function smbSection() {
         }
       },
     });
-    const nameField = h('div.field', { dataset: { testid: 'zp-smb-field-name' } }, [h('label', { text: '名字（= 挂载点目录名）' }), nameI]);
+    const nameField = h('div.field', { dataset: { testid: 'zp-smb-field-name' } }, [h('label', { text: '名字（本机用，随便起）' }), nameI]);
     const hostField = h('div.field', { dataset: { testid: 'zp-smb-field-host' } }, [h('label', { text: 'NAS 地址' }), hostI]);
-    const listWrap = h('div', { style: { marginTop: '6px' }, dataset: { testid: 'zp-smb-list-wrap' } }, [listBtn]);
+    const listWrap = h('div', { style: { marginTop: '6px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, dataset: { testid: 'zp-smb-list-wrap' } }, [
+      listBtn,
+      h('span.hint', { text: '这块 NAS 上有什么共享名，点一下就看得到' }),
+    ]);
     const shareField = h('div.field', { dataset: { testid: 'zp-smb-field-share' } }, [shareLabel, shareI, listWrap, shareList]);
     const userField = h('div.field', { dataset: { testid: 'zp-smb-field-user' } }, [h('label', { text: '用户名' }), userI]);
     const domainField = h('div.field', { dataset: { testid: 'zp-smb-field-domain' } }, [h('label', { text: '域（可留空）' }), domainI]);
@@ -839,8 +844,8 @@ function smbSection() {
     const kindOf = () => (kindI.value === 'nfs' ? 'nfs' : 'smb');
     const syncKind = () => {
       const nfs = kindOf() === 'nfs';
-      shareLabel.textContent = nfs ? '导出路径' : '共享名';
-      shareI.placeholder = nfs ? '例如 /volume1/media（以 / 开头）' : '共享名，例如 Media（不要带斜杠）';
+      shareLabel.textContent = nfs ? '导出路径（NAS 上真实存在的）' : '共享名（NAS 上真实存在的）';
+      shareI.placeholder = nfs ? '例如 /fs/1000/nfs（以 / 开头）' : 'NAS 上的共享名，例如 media（不要带斜杠）';
       for (const f of [userField, domainField, passField, credHint, listWrap, shareList]) f.style.display = nfs ? 'none' : '';
     };
     kindI.addEventListener('change', syncKind);
