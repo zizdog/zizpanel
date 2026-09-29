@@ -553,6 +553,10 @@ export const api = {
   fileVideoPlanProgress: (dir) =>
     request('GET', `${API_BASE}/files/video-plan-progress?dir=${encodeURIComponent(dir)}`),
   fileVideoCompress: (payload) => request('POST', `${API_BASE}/files/video-compress`, payload),
+  // 去广告（无损）：plan 只读统计（扩展名口径，不跑 ffmpeg）给确认窗一个真数字；
+  // clean 走任务中心（202 + task_id），成功/跳过/失败逐条在结果里。
+  fileMediaCleanPlan: (paths) => request('POST', `${API_BASE}/files/media-clean-plan`, { paths }),
+  fileMediaClean: (paths) => request('POST', `${API_BASE}/files/media-clean`, { paths }),
   // 目录收藏存在服务端（settings KV），手机上打开也是同一份。
   // action 只能是 'add' / 'remove'；两个动作都会过文件白名单校验。
   fileFavorites: () => request('GET', `${API_BASE}/files/favorites`),

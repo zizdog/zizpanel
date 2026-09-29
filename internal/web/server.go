@@ -519,6 +519,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/files/video-plan", s.requireAuth(s.handleFileVideoPlan))
 	root.HandleFunc("GET /api/v1/files/video-plan-progress", s.requireAuth(s.handleFileVideoPlanProgress))
 	root.HandleFunc("POST /api/v1/files/video-compress", s.requireAuth(s.handleFileVideoCompress))
+	// 去广告（无损）：plan 只读统计（给确认窗一个真数字），clean 走任务中心。
+	root.HandleFunc("POST /api/v1/files/media-clean-plan", s.requireAuth(s.handleFileMediaCleanPlan))
+	root.HandleFunc("POST /api/v1/files/media-clean", s.requireAuth(s.handleFileMediaClean))
 	root.HandleFunc("GET /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesList))
 	root.HandleFunc("POST /api/v1/files/favorites", s.requireAuth(s.handleFileFavoritesSet))
 

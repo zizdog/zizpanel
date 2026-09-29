@@ -36,6 +36,8 @@ const (
 	OpPhaseCopy   OpPhase = "copy"
 	OpPhaseMove   OpPhase = "move"
 	OpPhaseDelete OpPhase = "delete"
+	// OpPhaseClean 是「去广告（无损）」的处理阶段（复用同一套进度与结果结构）。
+	OpPhaseClean OpPhase = "clean"
 )
 
 // OpProgress 是一次批量操作的结构化进度（字节级 + 文件级）。
@@ -79,6 +81,10 @@ type OpItem struct {
 	// Way 是移动实际采用的方式：rename / copy+delete。
 	Way   string `json:"way,omitempty"`
 	Bytes int64  `json:"bytes,omitempty"`
+	// SavedBytes 是「去广告（无损）」省下的字节（原大小 − 新大小，可为负 = 没变小）。
+	SavedBytes int64 `json:"saved_bytes,omitempty"`
+	// Note 是成功项"去掉了什么"的一句话（去广告的结果行显示）。
+	Note  string `json:"note,omitempty"`
 	Error string `json:"error,omitempty"`
 	// err 是原始错误（不导出、不进 JSON）：单条目路径靠它保住错误链
 	// （调用方要用 errors.Is 判 ErrForbidden / EXDEV）。
@@ -96,10 +102,12 @@ type BatchResult struct {
 	Pending int `json:"pending"`
 	// CrossVolume 是移动里"跨卷：复制后删除源"的条目数（用户要能一眼看出这次
 	// 移动是瞬时的 rename 还是搬了数据 —— 两者的风险与耗时完全不同）。
-	CrossVolume int      `json:"cross_volume,omitempty"`
-	Bytes       int64    `json:"bytes"`
-	Msg         string   `json:"msg"`
-	Items       []OpItem `json:"items"`
+	CrossVolume int   `json:"cross_volume,omitempty"`
+	Bytes       int64 `json:"bytes"`
+	// SavedBytes 是「去广告（无损）」整批省下的字节（负数如实表示没变小）。
+	SavedBytes int64    `json:"saved_bytes,omitempty"`
+	Msg        string   `json:"msg"`
+	Items      []OpItem `json:"items"`
 }
 
 // SetRenameFuncForTest 替换 rename 实现，返回恢复函数。

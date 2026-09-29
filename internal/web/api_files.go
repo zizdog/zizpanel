@@ -938,6 +938,8 @@ func fileOpMessage(p files.OpProgress) string {
 		verb = "移动"
 	case files.OpPhaseDelete:
 		verb = "删除"
+	case files.OpPhaseClean:
+		verb = "清理"
 	}
 	msg := fmt.Sprintf("%s %d/%d 文件 · %s / %s · %d%%",
 		verb, p.FilesDone, p.FilesTotal, humanBytes(p.DoneBytes), humanBytes(p.TotalBytes), pct)

@@ -719,7 +719,8 @@ export function FilesView(content, ctx = {}) {
   const card = h('div.card', [
     // 「网络盘」入口放卡片头（面包屑那一行）而不是工具栏：工具栏在 390px 上已经很挤，
     // 再塞一颗会把行高顶开、列表整体下移（工具栏注释里记过这个坑）。
-    h('div.card-head', [crumbs, h('div.spacer'), h('button.btn.btn-sm', {
+    // flexWrap：360px 上面包屑 + 这颗按钮放不进一行（实测溢出 25px），允许换行。
+    h('div.card-head', { style: { flexWrap: 'wrap' } }, [crumbs, h('div.spacer'), h('button.btn.btn-sm', {
       text: '🖧 网络盘',
       title: '挂载 NAS 共享（SMB）给 Jellyfin 当媒体库 —— 跳到「磁盘管理 → 网络磁盘（SMB）」',
       dataset: { testid: 'zp-smb-entry' },
@@ -774,7 +775,7 @@ export function FilesView(content, ctx = {}) {
   // 订阅只有一个来源：tasks.js 的 onChange（复用它的 SSE），这里不另写一套。
   let opTaskId = '';
 
-  const OP_KINDS = /^file_(copy|move|delete)$/;
+  const OP_KINDS = /^file_(copy|move|delete|media_clean)$/;
 
   // 进度条内部节点**只建一次**，之后原地更新：
   // 重建 DOM 会让节点的位置/尺寸每 200ms 变一次（点击「中断」时按钮正被替换，
@@ -851,6 +852,8 @@ export function FilesView(content, ctx = {}) {
     const r = task.result || {};
     const msg = r.msg || (canceled ? '已中断' : '已完成');
     toast(msg, (canceled || Number(r.failed) > 0) ? 'warn' : 'ok', (canceled || Number(r.failed) > 0) ? 15000 : 7000);
+    // 去广告是"成功/跳过/失败"三态明细（每个文件一行 + 省下的体积），单独画一张表。
+    if (String(task.kind || '') === 'file_media_clean') { showCleanResult(r, canceled); return; }
     const bad = (r.items || []).filter((it) => it && it.error);
     if (!bad.length) return;
     modal({
@@ -861,6 +864,41 @@ export function FilesView(content, ctx = {}) {
         h('div.hint', { text: '失败的文件没有被改动；跨卷移动中断时源文件一定保留。' }),
         h('ul', { style: { margin: '6px 0 0 18px', lineHeight: '1.8', maxHeight: '260px', overflow: 'auto' } },
           bad.slice(0, 200).map((it) => h('li', { text: (it.name || it.from) + '：' + it.error }))),
+      ]),
+    });
+  }
+
+  // showCleanResult 是「🧹 去广告（无损）」的结果明细：三态逐条 + 省下的体积 +
+  // "这一趟去掉了什么"，失败原因原样显示（后端给什么就显示什么）。
+  function showCleanResult(r, canceled) {
+    const items = r.items || [];
+    const stateOf = (it) => (it.error ? '失败' : (it.skipped ? '跳过' : '成功'));
+    const savedText = (it) => {
+      if (it.error || it.skipped) return '—';
+      const n = Number(it.saved_bytes || 0);
+      return n > 0 ? '省 ' + humanSize(n) : '没有变小';
+    };
+    const rows = items.map((it) => h('tr', [
+      h('td.zp-plan-name', { text: it.name || it.from || '' }),
+      h('td', { text: stateOf(it) }),
+      h('td', { text: savedText(it) }),
+      h('td', {
+        text: it.error || it.skipped_reason || it.note || '',
+        style: { color: it.error ? 'var(--danger)' : (it.skipped ? 'var(--warn)' : 'var(--text-mute)') },
+      }),
+    ]));
+    modal({
+      title: '🧹 去广告（无损）结果',
+      wide: true,
+      body: h('div', [
+        h('p', { text: (canceled ? '已中断：' : '') + (r.msg || '') }),
+        items.length
+          ? h('div.zp-plan-scroll', [h('table.table', { style: { fontSize: '12px' } }, [
+            h('thead', [h('tr', ['文件', '状态', '体积', '原因'].map((t) => h('th', { text: t })))]),
+            h('tbody', rows),
+          ])])
+          : h('div.hint', { text: '没有可显示的条目' }),
+        h('div.hint', { text: '原文件保留为 .bak；失败/取消时临时文件已删除，源文件未改动。' }),
       ]),
     });
   }
@@ -1278,7 +1316,7 @@ export function FilesView(content, ctx = {}) {
     return roots.find((r) => rootKind(r) === 'www') || roots[0] || '';
   }
 
-  // 新建/压缩箱的二级菜单项：都是"工具栏入口"的菜单，与行操作菜单无关
+  // 新建/魔法箱的二级菜单项：都是"工具栏入口"的菜单，与行操作菜单无关
   // （行操作菜单只能来自 rowMenuItems，见那里）。
   function newMenuItems() {
     return [
@@ -1287,12 +1325,13 @@ export function FilesView(content, ctx = {}) {
     ];
   }
 
-  // 压缩箱：原来右侧那三颗（图片压缩 / 视频压缩 / 打包压缩）合并成一个菜单，
-  // 位置仍在工具栏右侧；三项各自的弹窗与功能一字未改。
+  // 魔法箱：原来右侧那三颗（图片压缩 / 视频压缩 / 打包压缩）合并成一个菜单，
+  // 位置仍在工具栏右侧；各项的弹窗与功能一字未改（另加「去广告（无损）」）。
   function compressMenuItems() {
     return [
       { label: '🖼️ 图片压缩', title: '把当前目录里的图片压小（默认另存为 xxx.min.<ext>，不动原文件）', run: imageCompressModal },
       { label: '🎬 视频压缩', title: '把当前目录里的视频压小（产物写进 output/；绝不越压越大）', run: videoCompressModal },
+      { label: '🧹 去广告（无损）', title: '去掉内嵌封面/广告图，清空 title/comment/description；不重编码，原文件保留为 .bak', run: mediaCleanModal },
       { label: '📦 打包压缩' + (selection.size ? `（${selection.size} 项）` : ''), title: '把选中的项打成 zip/tar 归档', disabled: selection.size === 0, run: compressSelected },
     ];
   }
@@ -1354,10 +1393,10 @@ export function FilesView(content, ctx = {}) {
         title: '粘贴到当前目录（Ctrl+V）',
         onclick: pasteClipboard,
       }) : null,
-      // 压缩箱在右侧（原来三颗压缩按钮的位置）。
+      // 魔法箱在右侧（原来三颗压缩按钮的位置）。
       h('button.btn.btn-sm', {
-        text: '压缩箱 ▾',
-        title: '图片压缩 / 视频压缩 / 打包压缩',
+        text: '魔法箱 ▾',
+        title: '图片压缩 / 视频压缩 / 去广告（无损）/ 打包压缩',
         onclick: (ev) => toggleDropdown(ev.currentTarget, compressMenuItems()),
       }),
       h('button.btn.btn-sm.btn-danger', { text: '删除', disabled: selCount === 0, onclick: deleteSelected }),
@@ -1702,7 +1741,7 @@ export function FilesView(content, ctx = {}) {
   // ---------- 右键菜单 ----------
   //
   // 自己起一层 .zp-ctx-menu（而不是 modal）：右键菜单要贴着鼠标、点别处就消失。
-  // 工具栏的「上传 ▾ / 新建 / 压缩箱」下拉也复用它（见 toggleDropdown）。
+  // 工具栏的「上传 ▾ / 新建 / 魔法箱」下拉也复用它（见 toggleDropdown）。
   let openCtxMenu = null;
   let dropdownAnchor = null;
 
@@ -2649,6 +2688,84 @@ export function FilesView(content, ctx = {}) {
       recursive.addEventListener('change', () => { /* 需要重新扫描才准 */ });
     }
     draw();
+  }
+
+  // mediaCleanModal 是「🧹 去广告（无损）」入口：没选中先说明；有选中就先只读统计
+  // （后端按扩展名递归数，不跑 ffmpeg），再弹确认窗，最后走任务中心。
+  //
+  // 确认窗必须写清四件事（用户点名）：不重编码 / 原文件留 .bak / 先写临时文件核对
+  // 时长才替换 / 本次处理 N 个（数字来自后端统计，前端不猜、不谎报）。
+  async function mediaCleanModal() {
+    if (!selection.size) {
+      modal({
+        title: '🧹 去广告（无损）',
+        body: h('div', [
+          h('p', { text: '先在列表里选中要处理的视频或文件夹。' }),
+          h('div.hint', { text: '文件夹会递归找里面的视频；支持 .mkv .mp4 .m4v .mov .avi .ts .webm。' }),
+        ]),
+        footer: (close) => [h('button.btn', { text: '知道了', onclick: close })],
+      });
+      return;
+    }
+    const paths = [...selection];
+    const loading = modal({
+      title: '🧹 去广告（无损）',
+      body: h('div.hint', { text: '正在统计要处理的视频…' }),
+      footer: [],
+    });
+    let plan;
+    try {
+      plan = await api.fileMediaCleanPlan(paths);
+    } catch (e) {
+      loading.close();
+      toast('统计失败：' + ((e && e.message) || e), 'err', 12000);
+      return;
+    }
+    loading.close();
+    const total = Number(plan.total || 0);
+    const ignored = Number(plan.ignored || 0) + Number(plan.skipped || 0);
+    const ignoredNote = ignored ? '（另有 ' + ignored + ' 个不是支持的视频类型，会跳过）' : '';
+    if (!total) {
+      modal({
+        title: '🧹 去广告（无损）',
+        body: h('div', [
+          h('p', { text: '选中的内容里没有可处理的视频。' }),
+          ignored ? h('div.hint', { text: '另有 ' + ignored + ' 个不是支持的视频类型。' }) : null,
+          h('div.hint', { text: '支持 ' + ((plan.exts || []).join(' / ')) + '。' }),
+        ]),
+        footer: (close) => [h('button.btn', { text: '知道了', onclick: close })],
+      });
+      return;
+    }
+    modal({
+      title: '🧹 去广告（无损）',
+      body: h('div', [
+        h('p', { text: '将处理 ' + total + ' 个视频' + ignoredNote + '。' }),
+        h('div.hint', { text: '去掉内嵌封面/广告图（视频流封面 + MKV 图片附件）与 title/comment/description；字幕字体附件保留。' }),
+        h('ol', { style: { margin: '6px 0 0 18px', lineHeight: '1.9' } }, [
+          h('li', { text: '不重编码：画质与音轨不变。' }),
+          h('li', { text: '原文件改名为 .bak 保留（已存在时加 -2/-3 序号）。' }),
+          h('li', { text: '先写临时文件，核对时长通过后才替换。' }),
+          h('li', { text: '本次会处理 ' + total + ' 个文件。' }),
+        ]),
+        h('div.hint', { text: '失败或取消时临时文件会删掉，源文件不动。' }),
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', {
+          text: '开始处理',
+          title: '在任务中心后台执行；关掉页面也在跑',
+          onclick: () => {
+            close();
+            startFileOp({
+              kind: 'file_media_clean',
+              title: '去广告（无损）' + total + ' 个',
+              run: () => api.fileMediaClean(paths),
+            });
+          },
+        }),
+      ],
+    });
   }
 
   // videoCompressModal 是「🎬 压缩视频」弹窗：档位 + 编码器 + 模式 + 计划表 + 走任务中心。
