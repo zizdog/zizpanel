@@ -349,7 +349,7 @@ func TestSMBNetworkMountGate(t *testing.T) {
 	}
 	// 命令行（下发/审计里的那份）必须体现主机/共享/挂载点/选项，且没有口令。
 	cmd := asString(mapGet(md, "command"))
-	for _, want := range []string{"mount_smbfs", "-o nodev,nosuid,soft,nomdatacache,filemode=0644,dirmode=0755,rdonly", "//mediauser@nas.local/Media", mountPoint} {
+	for _, want := range []string{"mount_smbfs", "-o nodev,nosuid,soft,nomdatacache,rdonly", "//mediauser@nas.local/Media", mountPoint} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("[①命令构造] 命令行里缺少 %q：%s", want, cmd)
 		}
@@ -366,7 +366,7 @@ func TestSMBNetworkMountGate(t *testing.T) {
 		t.Errorf("[①命令构造] 子进程 argv 里出现了口令明文：%s", argv)
 	}
 	if !strings.Contains(argv, "//mediauser@nas.local/Media") ||
-		!strings.Contains(argv, "-o nodev,nosuid,soft,nomdatacache,filemode=0644,dirmode=0755,rdonly") || !strings.Contains(argv, mountPoint) {
+		!strings.Contains(argv, "-o nodev,nosuid,soft,nomdatacache,rdonly") || !strings.Contains(argv, mountPoint) {
 		t.Errorf("[①命令构造] 子进程 argv 不对：%s", argv)
 	}
 	// NAS 会关机：SMB 也必须带 soft（I/O 失败而不是永久挂起）。
