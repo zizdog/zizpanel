@@ -892,7 +892,7 @@ func TestNFSConfigPure(t *testing.T) {
 	if got, want := nfs.Source(), "nas.local:/volume1/media"; got != want {
 		t.Fatalf("NFS Source 不对：%q", got)
 	}
-	wantArgv := strings.Join([]string{smb.LookBin("mount_nfs"), "-o", "nosuid,nodev,soft,timeo=10,retrans=2,vers=3,ro", "nas.local:/volume1/media", "/mnt/nfsmedia"}, " ")
+	wantArgv := strings.Join([]string{smb.LookBin("mount_nfs"), "-o", "nosuid,nodev,soft,timeo=10,retrans=2,vers=3,rsize=1048576,wsize=1048576,ro", "nas.local:/volume1/media", "/mnt/nfsmedia"}, " ")
 	if got := strings.Join(smb.MountArgs(nfs, "/mnt/nfsmedia"), " "); got != wantArgv {
 		t.Fatalf("NFS argv 不对：\n got %q\nwant %q", got, wantArgv)
 	}
