@@ -420,7 +420,10 @@ func (e *Executor) timeout() time.Duration {
 //     轮超时后失败，timeo 单位是十分之一秒；soft+只读会自动带 deadtimeout=60），只读再加 ro。
 func mountOptions(m Mount) []string {
 	if m.KindOrDefault() == KindNFS {
-		opts := []string{"nosuid", "nodev", "soft", "timeo=10", "retrans=2", "vers=3"}
+		// rsize/wsize 必须显式给大：macOS NFS 客户端默认块很小，本机真机实测同一个
+		// 1.1GB 片源 29 MB/s → 51 MB/s（128K 与 1M 一样，取 1M）。
+		opts := []string{"nosuid", "nodev", "soft", "timeo=10", "retrans=2", "vers=3",
+			"rsize=1048576", "wsize=1048576"}
 		if m.ReadOnly {
 			opts = append(opts, "ro")
 		}

@@ -613,7 +613,7 @@ func TestNFSNetworkMountGate(t *testing.T) {
 		t.Errorf("[②挂载] 回读到的目录内容不对：%v", got)
 	}
 	cmd := asString(mapGet(md, "command"))
-	for _, want := range []string{"mount_nfs", "-o nosuid,nodev,soft,timeo=10,retrans=2,vers=3,ro", nfsHost + ":" + nfsExport, mountPoint} {
+	for _, want := range []string{"mount_nfs", "-o nosuid,nodev,soft,timeo=10,retrans=2,vers=3,rsize=1048576,wsize=1048576,ro", nfsHost + ":" + nfsExport, mountPoint} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("[②命令构造] 命令行里缺少 %q：%s", want, cmd)
 		}
@@ -625,7 +625,7 @@ func TestNFSNetworkMountGate(t *testing.T) {
 	if strings.TrimSpace(argv) == "" {
 		t.Fatal("[②命令构造] 假 mount_nfs 一次都没被调用")
 	}
-	for _, want := range []string{"-o nosuid,nodev,soft,timeo=10,retrans=2,vers=3,ro", nfsHost + ":" + nfsExport, mountPoint} {
+	for _, want := range []string{"-o nosuid,nodev,soft,timeo=10,retrans=2,vers=3,rsize=1048576,wsize=1048576,ro", nfsHost + ":" + nfsExport, mountPoint} {
 		if !strings.Contains(argv, want) {
 			t.Errorf("[②命令构造] 假 mount_nfs 的 argv 缺少 %q：%s", want, argv)
 		}
