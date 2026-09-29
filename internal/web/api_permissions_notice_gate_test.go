@@ -77,3 +77,37 @@ func TestPermissionsNoticeGate(t *testing.T) {
 		t.Fatalf("提醒接口绝不许读受保护路径，实际读了 %d 次", c.probe)
 	}
 }
+
+// TestPermissionsNoticeNoExternalVolume —— 没插外接盘时不许提「可移除宗卷」。
+//
+// 用户 2026-09-29 报障：本机没有外接盘，仪表盘却天天喊「缺可移除宗卷授权」。
+// 判据：mounts 为空（网络盘不算，见 files.extraVolumeMounts）⇒ 提醒里不能出现 removable；
+// 全盘访问已授权时 needed 必须是 false（横幅要能消失）。
+func TestPermissionsNoticeNoExternalVolume(t *testing.T) {
+	srv, ts, cookies := newPermissionsServer(t)
+	stubPermissionsEnv(t, permEnvOpts{
+		consoleUser: "zizdog", mounts: nil, registry: permRegistryFull(),
+	})
+	h := permissions.HistoryFor(permHistoryPath(srv.Cfg.DataDir))
+	h.Record(permissions.Entry{ID: permissions.ItemFullDisk, At: time.Now(), Status: permissions.StatusGranted, Result: "已授权（门禁用例）"})
+
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/permissions/notice", nil, cookies)
+	d := apiData(t, out)
+	if d["needed"] != false {
+		t.Errorf("没有外接盘、全盘访问已授权时不该再提醒，实际 needed=%v（unauthorized=%v）", d["needed"], d["unauthorized"])
+	}
+	for _, id := range asSlice(d["unauthorized"]) {
+		if asString(id) == permissions.ItemRemovable {
+			t.Errorf("没有外接盘时不许把「可移除宗卷」列进未授权")
+		}
+	}
+
+	// 负向对照：插上盘且未授权 ⇒ 必须重新提醒（不能把这个提醒整个废掉）。
+	stubPermissionsEnv(t, permEnvOpts{
+		consoleUser: "zizdog", mounts: []string{"/Volumes/Ext"}, registry: permRegistryFull(),
+	})
+	_, out2, _ := doJSON(t, ts, "GET", "/api/v1/permissions/notice", nil, cookies)
+	if apiData(t, out2)["needed"] != true {
+		t.Errorf("有外接盘且未授权时必须提醒")
+	}
+}

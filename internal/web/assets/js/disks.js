@@ -799,10 +799,9 @@ function smbSection() {
     // 「列出共享」：真机踩过 —— 用户把**挂载名**当共享名填，服务端只回一句 0xC0000225
     // （Unknown error），完全无从下手。smbutil view 走同一个 pty 口令通道，列出来点一下就行。
     const shareList = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' }, dataset: { testid: 'zp-smb-share-list' } });
-    const listBtn = h('button.btn.btn-sm', {
-      text: '列出共享', dataset: { testid: 'zp-smb-list-shares' },
-      title: '用当前填的地址/账号连一次 NAS，列出它上面的共享名（口令同样不留）',
-      onclick: async () => {
+    // doList 是「列出共享」的唯一实现；按钮与"自动列"共用。
+    let listed = false;
+    const doList = async () => {
         setErr('');
         clear(shareList);
         listBtn.disabled = true;
@@ -812,6 +811,7 @@ function smbSection() {
             password: passI.value, id: isEdit ? existing.id : '',
           });
           const shares = (d && d.shares) || [];
+          if (shares.length) listed = true;
           if (!shares.length) {
             setErr('没列到共享：这台 NAS 上没有可用的磁盘共享');
             return;
@@ -828,8 +828,22 @@ function smbSection() {
         } finally {
           listBtn.disabled = false;
         }
-      },
+    };
+    const listBtn = h('button.btn.btn-sm', {
+      text: '列出共享', dataset: { testid: 'zp-smb-list-shares' },
+      title: '用当前填的地址/账号连一次 NAS，列出它上面的共享名（口令同样不留）',
+      onclick: doList,
     });
+    // 真机事故：没人知道 NAS 上共享名是什么（飞牛面板里根本没有这一项）。所以能自动列就自动列：
+    // 编辑已有配置（库里已有口令）时打开就列；新增时口令框填完失焦、且地址/账号都填了也列。
+    const autoList = () => {
+      if (listed || kindOf() !== 'smb') return;
+      if (!hostI.value.trim() || !userI.value.trim() || !passI.value) return;
+      listed = true;
+      doList();
+    };
+    passI.addEventListener('blur', autoList);
+    if (isEdit && existing.password_set) setTimeout(autoList, 0);
     const nameField = h('div.field', { dataset: { testid: 'zp-smb-field-name' } }, [h('label', { text: '名字（本机用，随便起）' }), nameI]);
     const hostField = h('div.field', { dataset: { testid: 'zp-smb-field-host' } }, [h('label', { text: 'NAS 地址' }), hostI]);
     const listWrap = h('div', { style: { marginTop: '6px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, dataset: { testid: 'zp-smb-list-wrap' } }, [

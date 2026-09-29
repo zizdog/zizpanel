@@ -28,6 +28,11 @@ func extraVolumeMounts() []string {
 		switch fsType {
 		case "devfs", "autofs", "fdesc", "procfs":
 			continue
+		// 网络卷不是"可移除宗卷"：用户 2026-09-29 报障 —— 本机没插任何外接盘、
+		// 只挂着两条网络盘，面板却天天提醒「缺可移除宗卷授权」。网络盘永远不需要
+		// 这个授权，所以不把它算进"非系统卷"。
+		case "smbfs", "nfs", "afpfs", "webdav":
+			continue
 		}
 		mp := cString(buf[i].Mntonname[:])
 		if mp == "" || isSystemMountPoint(mp) {

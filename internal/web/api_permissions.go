@@ -146,6 +146,10 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 
 	st, hint, at, res = permItemStatus(h, permissions.ItemRemovable, consoleUser)
 	mounts := permVolumeMountsFn()
+	if len(mounts) == 0 {
+		// 没插外接盘时如实说清"现在没什么可授权的"（网络盘不算，见 files.extraVolumeMounts）。
+		hint = "现在没有外接盘：插上盘再来申请（网络盘不需要这一项）"
+	}
 	items = append(items, permissions.Item{
 		ID: permissions.ItemRemovable, Title: "可移除宗卷",
 		Why:    "让面板能读 /Volumes 下的外接盘",
@@ -254,7 +258,13 @@ func (s *Server) handlePermissionsNotice(w http.ResponseWriter, r *http.Request)
 	h := permissions.HistoryFor(permHistoryPath(s.Cfg.DataDir))
 
 	missing := make([]string, 0, len(permKeyItemIDs))
+	// 没有外接卷就别提「可移除宗卷」（用户 2026-09-29 报障：本机没插任何外接盘，横幅天天喊它）——
+	// 没盘的时候这个授权没有任何可授权对象，提醒只会让人以为哪里坏了。
+	hasVolumes := len(permVolumeMountsFn()) > 0
 	for _, id := range permKeyItemIDs {
+		if id == permissions.ItemRemovable && !hasVolumes {
+			continue
+		}
 		if st, _, _, _ := permItemStatus(h, id, consoleUser); st != permissions.StatusGranted {
 			missing = append(missing, id)
 		}
