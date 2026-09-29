@@ -431,6 +431,9 @@ func mountOptions(m Mount) []string {
 	// 目录列表里（本机真机实测：关掉后 0.0s 就出现）—— 用户要"传文件"，看不见就是不能用。
 	// 只关元数据；文件数据缓存照旧（播放/下载性能不受影响）。
 	opts = append(opts, "nomdatacache")
+	// 其他用户（Jellyfin 跑在真实用户名下）要能读：服务端报的 0700 会把非属主挡在门外，
+	// 这里显式放开成"其他用户只读"（真机实测 dirmode 确实覆盖服务端模式）。
+	opts = append(opts, "filemode=0644", "dirmode=0755")
 	if m.ReadOnly {
 		opts = append(opts, "rdonly")
 	}

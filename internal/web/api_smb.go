@@ -23,11 +23,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/user"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/smb"
 )
 
@@ -59,7 +59,25 @@ type smbRuntime struct {
 // RunAs = 面板的真实用户（Jellyfin 也用它跑）：root 挂的 smbfs 别的用户读不到
 // （真机实测 Permission denied），所以挂载要降权到用户身份，挂载才归它所有。
 func (s *Server) smbExecFor() *smb.Executor {
-	return &smb.Executor{Timeout: 90 * time.Second, RunAs: config.PanelUser()}
+	// 2026-09-29 真机两条相反的证据，最后定在这里：
+	//   ① 以 root 挂载、不给 filemode/dirmode：真实用户连目录都进不去（Jellyfin 空库）；
+	//   ② 降权到真实用户挂载：真实用户读写正常，但**面板自己**（root）看目录列表永远是旧的
+	//      —— 文件传上去了、面板里看不见（实测：面板 >40s 看不到，同一台机器上那个用户 0.6s 看到）。
+	// 所以改成：以面板自己的身份（root）挂载，并用 filemode/dirmode 显式把"其他用户只读"
+	// 打开（真机实测 dirmode=0755 确实覆盖了服务端报的 0700）⇒ 面板列表新鲜 + Jellyfin 读得到。
+	// 挂载身份由 smbMountIdentity() 如实回报给界面。
+	return &smb.Executor{Timeout: 90 * time.Second}
+}
+
+// smbMountIdentity 是挂载实际使用的身份（界面如实显示）。
+func smbMountIdentity() string {
+	if os.Geteuid() == 0 {
+		return "root（面板）"
+	}
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "当前用户"
 }
 
 // ---------- 持久化 ----------
@@ -246,7 +264,7 @@ func (s *Server) smbViewOf(m smb.Mount, table []smb.Entry, tableErr error) smbVi
 	v := smbView{
 		ID: m.ID, Name: m.Name, Kind: m.KindOrDefault(), Host: m.Host, Share: m.Share, User: m.User,
 		Domain: m.Domain, ReadOnly: m.ReadOnly, PasswordSet: m.Password != "",
-		MountPoint: mp, RunAs: config.PanelUser(),
+		MountPoint: mp, RunAs: smbMountIdentity(),
 	}
 	if tableErr == nil {
 		v.Verified = true
