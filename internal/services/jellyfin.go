@@ -673,13 +673,17 @@ type JellyfinMediaCheck struct {
 
 // JellyfinPickMediaSample 在目录里找一个用于试读的普通文件（有界遍历）。
 //
-// 有界是硬要求：媒体库里可能有几十万文件；这里最多看 walkBudget 个条目。
+// 有界是硬要求：媒体库里可能有几十万文件，这里最多看 walkBudget 个条目；
+// ctx 到期也立刻停（网络盘离线时别继续扫）。
 // 跳过隐藏文件与隐藏子目录；返回第一个普通文件的路径，找不到返回空串。
-func JellyfinPickMediaSample(dir string) string {
+func JellyfinPickMediaSample(ctx context.Context, dir string) string {
 	const walkBudget = 4000
 	seen := 0
 	var found string
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll
+		}
 		if err != nil {
 			return nil // 读不动的子项跳过，不影响其它
 		}
@@ -738,7 +742,7 @@ func (m *Manager) JellyfinMediaReadCheck(ctx context.Context, dir string) Jellyf
 		out.Remedy = "先在面板设置里确认运行用户，再重试。"
 		return out
 	}
-	sample := JellyfinPickMediaSample(dir)
+	sample := JellyfinPickMediaSample(ctx, dir)
 	if sample == "" {
 		out.OK = false
 		out.Message = "目录里一个普通文件都没有：Jellyfin 会把它当空库。"

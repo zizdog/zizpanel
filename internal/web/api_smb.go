@@ -1,7 +1,7 @@
 package web
 
-// api_smb.go —— 「网络磁盘（SMB）」：把 NAS 的共享挂到 <安装根>/mnt/<名字>，
-// 给面板应用（尤其 Jellyfin）当媒体库用。
+// api_smb.go —— 「网络磁盘（SMB / NFS）」：把 NAS 的共享/导出挂到 <安装根>/mnt/<名字>，
+// 给面板应用（尤其 Jellyfin）当媒体库用。两条路的 API 路径、settings KV 键与字段名完全一致。
 //
 // 为什么面板来挂：面板是 root LaunchDaemon，且已经拿到「完全磁盘访问」授权；
 // Jellyfin 以面板子进程（jellyfin-supervise）的身份运行 ⇒ **继承面板的 TCC 授权**
@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -169,9 +170,53 @@ func smbBackoff(fails int) time.Duration {
 
 // ---------- 视图 ----------
 
+// smbSharesReq 是「列出共享」的请求体：口令不落盘、不回显（只用于这一次 smbutil）。
+type smbSharesReq struct {
+	Host     string `json:"host"`
+	User     string `json:"user"`
+	Domain   string `json:"domain"`
+	Password string `json:"password"`
+	// ID 可选：编辑已有配置且没重填口令时，用库里那份（用户不必再输一遍）。
+	ID string `json:"id"`
+}
+
+// handleSMBListShares 列一台 NAS 上的 SMB 共享名。
+//
+// 为什么要有它：真机事故 —— 用户把「名字（挂载点）」当成了共享名填，服务端只回
+// "Unknown error: -1073741275"（0xC0000225 = 找不到共享），完全无从下手。
+func (s *Server) handleSMBListShares(w http.ResponseWriter, r *http.Request) {
+	var req smbSharesReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	pw := req.Password
+	if pw == "" && strings.TrimSpace(req.ID) != "" {
+		list, err := s.loadSMBMounts(r.Context())
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if m, found := smbFind(list, req.ID); found {
+			pw = m.Password
+		}
+	}
+	shares, raw, err := s.smbExecFor().ListShares(r.Context(), req.Host, req.User, req.Domain, pw)
+	if err != nil {
+		msg := smb.Scrub(err.Error(), pw)
+		s.audit(r, "smb_shares", req.Host, "列出共享失败："+msg, false, "")
+		fail(w, http.StatusBadGateway, msg)
+		return
+	}
+	s.audit(r, "smb_shares", req.Host, fmt.Sprintf("列出共享 %d 个", len(shares)), true, "")
+	ok(w, map[string]any{"shares": shares, "raw": smb.Scrub(smbTail(raw, 1200), pw)})
+}
+
 type smbView struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Kind 是类型（smb / nfs）；老配置不落这个字段，视图里统一回 smb。
+	Kind        string `json:"kind"`
 	Host        string `json:"host"`
 	Share       string `json:"share"`
 	User        string `json:"user"`
@@ -199,7 +244,7 @@ func (s *Server) smbViewOf(m smb.Mount, table []smb.Entry, tableErr error) smbVi
 	base := s.customMountBase()
 	mp := smb.MountPoint(base, m.Name)
 	v := smbView{
-		ID: m.ID, Name: m.Name, Host: m.Host, Share: m.Share, User: m.User,
+		ID: m.ID, Name: m.Name, Kind: m.KindOrDefault(), Host: m.Host, Share: m.Share, User: m.User,
 		Domain: m.Domain, ReadOnly: m.ReadOnly, PasswordSet: m.Password != "",
 		MountPoint: mp, RunAs: config.PanelUser(),
 	}
@@ -279,8 +324,8 @@ func (s *Server) handleSMBList(w http.ResponseWriter, r *http.Request) {
 		"mount_base": s.customMountBase(),
 		"is_root":    os.Geteuid() == 0,
 		"notes": []string{
-			"网络盘挂在 " + s.customMountBase() + " 下（默认只读优先；Jellyfin 直接选这个目录即可）。",
-			"口令只存在面板数据库里，接口只回 password_set，日志与响应里都不会出现它。",
+			"网络盘挂在 " + s.customMountBase() + " 下（默认只读优先；Jellyfin 直接选这个目录即可，SMB 与 NFS 都支持）。",
+			"口令只存在面板数据库里（NFS 不需要口令），接口只回 password_set，日志与响应里都不会出现它。",
 			"挂载报「连不上/被拒绝」但网络确实通时，先看 macOS 15 的「本地网络」隐私门：面板 系统设置 → 局域网访问，或 系统设置 → 隐私与安全性 → 本地网络。",
 		},
 	}
@@ -291,6 +336,7 @@ func (s *Server) handleSMBList(w http.ResponseWriter, r *http.Request) {
 }
 
 type smbSaveReq struct {
+	Kind     string `json:"kind"`
 	Name     string `json:"name"`
 	Host     string `json:"host"`
 	Share    string `json:"share"`
@@ -298,6 +344,14 @@ type smbSaveReq struct {
 	Domain   string `json:"domain"`
 	Password string `json:"password"`
 	ReadOnly bool   `json:"read_only"`
+}
+
+// smbTargetDesc 是审计里的人话目标（SMB = user@host/share，NFS = host:/export）。
+func smbTargetDesc(m smb.Mount) string {
+	if m.KindOrDefault() == smb.KindNFS {
+		return m.Source()
+	}
+	return m.User + "@" + m.Host + "/" + m.Share
 }
 
 // handleSMBCreate POST /api/v1/system/smb —— 新增一条（不自动挂载）。
@@ -308,7 +362,7 @@ func (s *Server) handleSMBCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := smb.Mount{
-		Name: req.Name, Host: req.Host, Share: req.Share, User: req.User,
+		Kind: req.Kind, Name: req.Name, Host: req.Host, Share: req.Share, User: req.User,
 		Domain: req.Domain, Password: req.Password, ReadOnly: req.ReadOnly,
 	}
 	if err := smb.Normalize(&m); err != nil {
@@ -331,7 +385,7 @@ func (s *Server) handleSMBCreate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "保存失败："+err.Error())
 		return
 	}
-	s.audit(r, "smb_create", m.ID, "新增网络盘 "+m.Name+"（"+m.User+"@"+m.Host+"/"+m.Share+"）", true, "")
+	s.audit(r, "smb_create", m.ID, "新增网络盘 "+m.Name+"（"+smbTargetDesc(m)+"）", true, "")
 	table, terr := smb.MountTable(r.Context())
 	ok(w, s.smbViewOf(m, table, terr))
 }
@@ -355,6 +409,7 @@ func (s *Server) handleSMBUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := old
+	m.Kind = req.Kind
 	m.Name = req.Name
 	m.Host, m.Share, m.User, m.Domain = req.Host, req.Share, req.User, req.Domain
 	m.ReadOnly = req.ReadOnly
@@ -381,7 +436,7 @@ func (s *Server) handleSMBUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "保存失败："+err.Error())
 		return
 	}
-	s.audit(r, "smb_update", id, "修改网络盘 "+m.Name+"（"+m.User+"@"+m.Host+"/"+m.Share+"）", true, "")
+	s.audit(r, "smb_update", id, "修改网络盘 "+m.Name+"（"+smbTargetDesc(m)+"）", true, "")
 	table, terr := smb.MountTable(r.Context())
 	ok(w, s.smbViewOf(m, table, terr))
 }
@@ -552,6 +607,7 @@ func (s *Server) handleSMBUnmount(w http.ResponseWriter, r *http.Request) {
 // ---------- 给 Jellyfin 用：已挂载的网络盘路径 ----------
 
 // mountedSMBMounts 返回**当前真的挂载了**的网络盘（给媒体目录选择器当候选）。
+// SMB 与 NFS 走同一份配置列表（settings KV 键 smb_mounts 不变），所以两类都在这里。
 // 读不到挂载表就返回 nil + 错误，让调用方如实说明，绝不猜。
 func (s *Server) mountedSMBMounts(ctx context.Context) ([]map[string]any, error) {
 	list, err := s.loadSMBMounts(ctx)
@@ -572,7 +628,8 @@ func (s *Server) mountedSMBMounts(ctx context.Context) ([]map[string]any, error)
 			continue
 		}
 		out = append(out, map[string]any{
-			"id": m.ID, "name": m.Name, "mount_point": mp, "read_only": m.ReadOnly,
+			"id": m.ID, "name": m.Name, "kind": m.KindOrDefault(),
+			"mount_point": mp, "read_only": m.ReadOnly,
 		})
 	}
 	return out, nil
@@ -602,7 +659,12 @@ func (s *Server) smbAutoMountLoop(ctx context.Context) {
 	}
 }
 
-// smbAutoMountPass 巡一遍：没挂上的按各自退避重试一次。任一条失败只记状态，不影响别人。
+// smbAutoMountPass 巡一遍：
+//   - 没挂上的：按各自退避重试一次；
+//   - **已挂载**的：做一次有界读探测（挂着≠活着）；读不到就记错并按退避 remount
+//     （unmount+mount），这样 NAS 开机回来能自愈。
+//
+// 任一条失败只记状态，不影响别人；用户手动卸载过的（Suppressed）不自动挂回。
 func (s *Server) smbAutoMountPass(ctx context.Context) {
 	list, err := s.loadSMBMounts(ctx)
 	if err != nil {
@@ -619,36 +681,90 @@ func (s *Server) smbAutoMountPass(ctx context.Context) {
 	for _, m := range list {
 		mp := smb.MountPoint(s.customMountBase(), m.Name)
 		if _, mounted := smb.EntryAt(table, mp); mounted {
-			s.smbMu.Lock()
-			if st := s.smbRun[m.ID]; st != nil {
-				st.Suppressed, st.LastError, st.Fails, st.NextAttempt = false, "", 0, time.Time{}
+			if _, rerr := smb.ReadDirBounded(mp); rerr == nil {
+				s.smbMu.Lock()
+				if st := s.smbRun[m.ID]; st != nil {
+					st.Suppressed, st.LastError, st.Fails, st.NextAttempt = false, "", 0, time.Time{}
+				}
+				s.smbMu.Unlock()
+				continue
+			} else if !smb.IsMountUnresponsive(rerr) {
+				// 读不到但不是"失去响应"（例如权限）：只如实记原因，**不重挂** ——
+				// 重挂一百次也没用，还会把正在用它扫库的 Jellyfin 打断。
+				s.smbSetLastError(m.ID, "挂载点读不到内容："+rerr.Error())
+				continue
+			} else {
+				// 挂着但已经不响应：如实记下人话原因，再按退避安排一次 remount。
+				s.smbSetLastError(m.ID, "网络盘无响应（NAS 可能离线）："+rerr.Error())
 			}
-			s.smbMu.Unlock()
-			continue
-		}
-		s.smbMu.Lock()
-		st := s.smbRun[m.ID]
-		if st == nil {
-			st = &smbRuntime{}
-			if s.smbRun == nil {
-				s.smbRun = map[string]*smbRuntime{}
+			if !s.smbRetryAllowed(m.ID, now) {
+				continue
 			}
-			s.smbRun[m.ID] = st
-		}
-		skip := st.Busy || st.Suppressed || (!st.NextAttempt.IsZero() && now.Before(st.NextAttempt))
-		s.smbMu.Unlock()
-		if skip {
+			s.smbRemountOne(ctx, m, mp)
 			continue
 		}
-		if !s.smbBegin(m.ID) {
+		if !s.smbRetryAllowed(m.ID, now) {
 			continue
 		}
-		cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		res := s.mountOne(cctx, m)
-		cancel()
-		s.smbEnd(m.ID)
-		if res.Error == "" && res.Mounted {
-			s.Log.Info("[smb] 自动挂载 %s → %s", m.Name, mp)
-		}
+		s.smbMountOne(ctx, m, mp)
+	}
+}
+
+// smbRetryAllowed 报告现在能不能自动动手：不忙、没被用户抑制、且过了退避。
+func (s *Server) smbRetryAllowed(id string, now time.Time) bool {
+	s.smbMu.Lock()
+	defer s.smbMu.Unlock()
+	st := s.smbRun[id]
+	if st == nil {
+		return true
+	}
+	return !st.Busy && !st.Suppressed && (st.NextAttempt.IsZero() || !now.Before(st.NextAttempt))
+}
+
+// smbSetLastError 只更新人话原因（不动退避计数；LastAttempt 由真实尝试记）。
+func (s *Server) smbSetLastError(id, msg string) {
+	s.smbMu.Lock()
+	defer s.smbMu.Unlock()
+	if s.smbRun == nil {
+		s.smbRun = map[string]*smbRuntime{}
+	}
+	st := s.smbRun[id]
+	if st == nil {
+		st = &smbRuntime{}
+		s.smbRun[id] = st
+	}
+	st.LastError = msg
+}
+
+// smbMountOne 是一次"没挂上 ⇒ 挂"的自动尝试；begin/end 用 defer 成对释放。
+func (s *Server) smbMountOne(ctx context.Context, m smb.Mount, mp string) {
+	if !s.smbBegin(m.ID) {
+		return
+	}
+	defer s.smbEnd(m.ID)
+	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	res := s.mountOne(cctx, m)
+	if res.Error == "" && res.Mounted {
+		s.Log.Info("[smb] 自动挂载 %s → %s", m.Name, mp)
+	}
+}
+
+// smbRemountOne 是"挂着但已死 ⇒ remount"的自动尝试（先卸再挂，全程有限时）。
+func (s *Server) smbRemountOne(ctx context.Context, m smb.Mount, mp string) {
+	if !s.smbBegin(m.ID) {
+		return
+	}
+	defer s.smbEnd(m.ID)
+	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if u := s.smbExecFor().Unmount(cctx, mp); u.Verified && u.Mounted {
+		// 卸不下来（有进程在用）：如实记下，绝不硬卸。
+		s.smbRecord(m.ID, u)
+		return
+	}
+	res := s.mountOne(cctx, m)
+	if res.Error == "" && res.Mounted {
+		s.Log.Info("[smb] 自动重挂（原挂载无响应）%s → %s", m.Name, mp)
 	}
 }

@@ -635,16 +635,17 @@ export function DisksView(content, ctx = {}) {
 }
 
 // ============================================================================
-//  网络磁盘（SMB）
+//  网络磁盘（SMB / NFS）
 //
 //  口令是**只写**字段：提交后前端不留存，接口只回 password_set（绝不回原文）。
+//  NFS 无账号口令，表单按类型收起那些字段。
 //  状态一律来自服务端回读（真实挂载表 + 目录真的读一次），本页不猜、不假装成功。
 // ============================================================================
 function smbSection() {
   const body = h('div.card-body');
   const card = h('div.card', { id: 'zp-smb-section' }, [
     h('div.card-head', [
-      h('h3', { text: '🖧 网络磁盘（SMB）' }),
+      h('h3', { text: '🖧 网络磁盘（SMB / NFS）' }),
       h('div.spacer'),
       h('span.sub', { text: 'NAS 共享挂到本机，给 Jellyfin 当媒体库' }),
       h('button.btn.btn-sm', { text: '⟳ 刷新', dataset: { testid: 'zp-smb-refresh' }, onclick: () => load(true) }),
@@ -692,19 +693,26 @@ function smbSection() {
       body.append(h('div.hint', { style: { color: 'var(--warn)', marginTop: '6px' }, text: '挂载表读不到，状态未复核：' + data.table_error }));
     }
     if (!list.length) {
-      body.append(h('div.hint', { style: { marginTop: '10px' }, text: '还没有网络盘。点「＋ 新增网络盘」填 NAS 地址 / 共享名 / 账号。' }));
+      body.append(h('div.hint', { style: { marginTop: '10px' }, text: '还没有网络盘。点「＋ 新增网络盘」选 SMB 或 NFS，再填地址与共享名/导出路径。' }));
       return;
     }
     for (const m of list) body.append(smbRow(m));
   }
 
   function smbRow(m) {
+    const nfs = String(m.kind || 'smb').toLowerCase() === 'nfs';
     const mounted = !!m.mounted;
-    const target = (m.user || '') + '@' + (m.host || '') + '/' + (m.share || '');
+    const target = nfs
+      ? (m.host || '') + ':' + (m.share || '')
+      : (m.user || '') + '@' + (m.host || '') + '/' + (m.share || '');
     const marks = [
+      h('span.pill', {
+        text: nfs ? 'NFS' : 'SMB', dataset: { testid: 'zp-smb-kind-pill' },
+        title: nfs ? 'NFS 导出（无账号口令）' : 'SMB 共享（账号/口令）',
+      }),
       h(`span.pill.${mounted ? 'ok' : ''}`, { text: mounted ? '已挂载' : '未挂载', dataset: { testid: 'zp-smb-status' } }),
       m.read_only ? h('span.pill', { text: '只读' }) : null,
-      m.password_set ? h('span.pill', { text: '口令已保存' }) : h('span.pill.warn', { text: '未设口令' }),
+      nfs ? null : (m.password_set ? h('span.pill', { text: '口令已保存' }) : h('span.pill.warn', { text: '未设口令' })),
       m.busy ? h('span.pill.warn', { text: '处理中' }) : null,
     ];
     const errBox = m.last_error
@@ -770,20 +778,82 @@ function smbSection() {
   // openForm 是新增/编辑的**唯一**入口（existing 为 null = 新增）。
   function openForm(existing) {
     const isEdit = !!existing;
+    const kindI = h('select.input', { dataset: { testid: 'zp-smb-kind' } }, [
+      h('option', { value: 'smb', text: 'SMB 共享（账号/口令）' }),
+      h('option', { value: 'nfs', text: 'NFS 导出（无账号口令）' }),
+    ]);
+    kindI.value = isEdit ? String(existing.kind || 'smb').toLowerCase() : 'smb';
     const nameI = h('input.input', { type: 'text', value: isEdit ? existing.name : '', placeholder: '例如 nas-media', maxlength: 40 });
     const hostI = h('input.input', { type: 'text', value: isEdit ? existing.host : '', placeholder: 'nas.local 或 192.0.2.10' });
-    const shareI = h('input.input', { type: 'text', value: isEdit ? existing.share : '', placeholder: '共享名，例如 Media（不要带斜杠）' });
+    const shareI = h('input.input', { type: 'text', value: isEdit ? existing.share : '' });
     const userI = h('input.input', { type: 'text', value: isEdit ? existing.user : '', placeholder: 'NAS 账号；公开共享填 guest' });
     const domainI = h('input.input', { type: 'text', value: isEdit ? (existing.domain || '') : '', placeholder: '域（可选）' });
     const passI = h('input.input', { type: 'password', value: '', placeholder: isEdit && existing.password_set ? '留空 = 不改口令' : 'NAS 口令' });
-    const roI = h('input', { type: 'checkbox', checked: isEdit ? !!existing.read_only : false });
+    const roI = h('input', { type: 'checkbox', checked: isEdit ? !!existing.read_only : false, dataset: { testid: 'zp-smb-readonly' } });
     const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' }, dataset: { testid: 'zp-smb-form-error' } });
     const setErr = (m) => { err.textContent = m || ''; err.style.display = m ? '' : 'none'; };
 
+    const shareLabel = h('label', { text: '共享名' });
+    // 「列出共享」：真机踩过 —— 用户把**挂载名**当共享名填，服务端只回一句 0xC0000225
+    // （Unknown error），完全无从下手。smbutil view 走同一个 pty 口令通道，列出来点一下就行。
+    const shareList = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' }, dataset: { testid: 'zp-smb-share-list' } });
+    const listBtn = h('button.btn.btn-sm', {
+      text: '列出共享', dataset: { testid: 'zp-smb-list-shares' },
+      title: '用当前填的地址/账号连一次 NAS，列出它上面的共享名（口令同样不留）',
+      onclick: async () => {
+        setErr('');
+        clear(shareList);
+        listBtn.disabled = true;
+        try {
+          const d = await api.post(apiURL('system/smb/shares'), {
+            host: hostI.value.trim(), user: userI.value.trim(), domain: domainI.value.trim(),
+            password: passI.value, id: isEdit ? existing.id : '',
+          });
+          const shares = (d && d.shares) || [];
+          if (!shares.length) {
+            setErr('没列到共享：这台 NAS 上没有可用的磁盘共享');
+            return;
+          }
+          shareList.append(h('span.hint', { text: '点一个填入：' }));
+          for (const s of shares) {
+            shareList.append(h('button.btn.btn-sm', {
+              text: s.name, dataset: { testid: 'zp-smb-share-pick' },
+              onclick: () => { shareI.value = s.name; clear(shareList); },
+            }));
+          }
+        } catch (e) {
+          setErr((e && e.message) || String(e));
+        } finally {
+          listBtn.disabled = false;
+        }
+      },
+    });
+    const nameField = h('div.field', { dataset: { testid: 'zp-smb-field-name' } }, [h('label', { text: '名字（= 挂载点目录名）' }), nameI]);
+    const hostField = h('div.field', { dataset: { testid: 'zp-smb-field-host' } }, [h('label', { text: 'NAS 地址' }), hostI]);
+    const listWrap = h('div', { style: { marginTop: '6px' }, dataset: { testid: 'zp-smb-list-wrap' } }, [listBtn]);
+    const shareField = h('div.field', { dataset: { testid: 'zp-smb-field-share' } }, [shareLabel, shareI, listWrap, shareList]);
+    const userField = h('div.field', { dataset: { testid: 'zp-smb-field-user' } }, [h('label', { text: '用户名' }), userI]);
+    const domainField = h('div.field', { dataset: { testid: 'zp-smb-field-domain' } }, [h('label', { text: '域（可留空）' }), domainI]);
+    const passField = h('div.field', { dataset: { testid: 'zp-smb-field-pass' } }, [h('label', { text: '口令' }), passI]);
+    const credHint = h('div.hint', { dataset: { testid: 'zp-smb-cred-hint' }, text: '口令只在提交时发一次，面板只回「是否已设置」，日志与响应里不会有它。' });
+    const kindOf = () => (kindI.value === 'nfs' ? 'nfs' : 'smb');
+    const syncKind = () => {
+      const nfs = kindOf() === 'nfs';
+      shareLabel.textContent = nfs ? '导出路径' : '共享名';
+      shareI.placeholder = nfs ? '例如 /volume1/media（以 / 开头）' : '共享名，例如 Media（不要带斜杠）';
+      for (const f of [userField, domainField, passField, credHint, listWrap, shareList]) f.style.display = nfs ? 'none' : '';
+    };
+    kindI.addEventListener('change', syncKind);
+    syncKind();
+
     const save = async (close) => {
+      const nfs = kindOf() === 'nfs';
       const payload = {
+        kind: kindOf(),
         name: nameI.value.trim(), host: hostI.value.trim(), share: shareI.value.trim(),
-        user: userI.value.trim(), domain: domainI.value.trim(), password: passI.value,
+        user: nfs ? '' : userI.value.trim(),
+        domain: nfs ? '' : domainI.value.trim(),
+        password: nfs ? '' : passI.value,
         read_only: !!roI.checked,
       };
       try {
@@ -800,15 +870,12 @@ function smbSection() {
     };
 
     modal({
-      title: isEdit ? '编辑网络盘 · ' + existing.name : '新增网络盘（SMB）',
+      title: isEdit ? '编辑网络盘 · ' + existing.name : '新增网络盘（SMB / NFS）',
       body: h('div', [
-        h('div.hint', { text: '口令只在提交时发一次，面板只回「是否已设置」，日志与响应里不会有它。' }),
-        h('div.field', [h('label', { text: '名字（= 挂载点目录名）' }), nameI]),
-        h('div.field', [h('label', { text: 'NAS 地址' }), hostI]),
-        h('div.field', [h('label', { text: '共享名' }), shareI]),
-        h('div.field', [h('label', { text: '用户名' }), userI]),
-        h('div.field', [h('label', { text: '域（可留空）' }), domainI]),
-        h('div.field', [h('label', { text: '口令' }), passI]),
+        h('div.field', [h('label', { text: '类型' }), kindI]),
+        credHint,
+        nameField, hostField,
+        shareField, userField, domainField, passField,
         h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' } }, [roI, h('span', { text: '只读挂载（Jellyfin 媒体库建议勾上）' })]),
         err,
       ]),

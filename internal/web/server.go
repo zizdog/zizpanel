@@ -351,6 +351,8 @@ func (s *Server) routes() http.Handler {
 	// 口令不进 argv（pty 提示通道）、不进响应/日志（只回 password_set）。
 	root.HandleFunc("GET /api/v1/system/smb", s.requireAuth(s.handleSMBList))
 	root.HandleFunc("POST /api/v1/system/smb", s.requireAuth(s.handleSMBCreate))
+	// 「列出共享」比 {id} 更具体，Go 1.22 的 ServeMux 优先命中它（真机踩过：共享名靠猜）。
+	root.HandleFunc("POST /api/v1/system/smb/shares", s.requireAuth(s.handleSMBListShares))
 	root.HandleFunc("PUT /api/v1/system/smb/{id}", s.requireAuth(s.handleSMBUpdate))
 	root.HandleFunc("DELETE /api/v1/system/smb/{id}", s.requireAuth(s.handleSMBDelete))
 	root.HandleFunc("POST /api/v1/system/smb/{id}/mount", s.requireAuth(s.handleSMBMount))

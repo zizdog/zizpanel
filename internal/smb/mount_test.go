@@ -7,6 +7,7 @@ package smb
 import (
 	"errors"
 	"os/user"
+	"strings"
 	"testing"
 )
 
@@ -45,5 +46,37 @@ func TestResolveRunAsMapsUserAndRefusesToGuess(t *testing.T) {
 	}
 	if resolveRunAs("root") != nil {
 		t.Errorf("目标是 root 时没有降权意义，必须返回 nil")
+	}
+}
+
+// TestParseShareTableAndStatusHints —— 「列出共享」解析 + SMB 状态码翻译（纯函数）。
+func TestParseShareTableAndStatusHints(t *testing.T) {
+	out := `Password for 192.0.2.10: 
+Share                                           Type    Comments
+-------------------------------
+Media                                           Disk    
+Photos                                          Disk    
+IPC$                                            Pipe    IPC Service (fake nas)
+
+3 shares listed
+`
+	got := ParseShareTable(out)
+	if len(got) != 2 || got[0].Name != "Media" || got[1].Name != "Photos" {
+		t.Fatalf("解析共享表不对（只该留 Disk）：%+v", got)
+	}
+	if len(ParseShareTable("smbutil: server rejected the authentication")) != 0 {
+		t.Errorf("没有表格时不该猜出共享")
+	}
+
+	// 真机事故：mini 上共享名填成 fnnas-media ⇒ 服务端回 -1073741275（0xC0000225）。
+	h, ok := smbStatusHint("mount_smbfs: mount error: /opt/zizpanel/mnt/x: unknown error: -1073741275")
+	if !ok || !strings.Contains(h.msg, "找不到这个共享") {
+		t.Errorf("0xC0000225 必须翻成「找不到共享」，实际 ok=%v %+v", ok, h)
+	}
+	if _, ok := smbStatusHint("mount_smbfs: mount error: /x: unknown error: c000006d"); !ok {
+		t.Errorf("十六进制状态码也要认")
+	}
+	if _, ok := smbStatusHint("mount_smbfs: ok"); ok {
+		t.Errorf("没有状态码时不该硬套结论")
 	}
 }
