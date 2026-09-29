@@ -253,3 +253,41 @@ func TestFilesRootLabelsReachDropdownWithoutDuplicates(t *testing.T) {
 		t.Errorf("敏感标记丢了：sensitive_roots=%v，期望包含 %s", body.Data.SensitiveRoots, f.dataDir)
 	}
 }
+
+// TestFilesDropdownHasNetworkMountBase —— 网络盘挂载点必须出现在「位置」下拉里。
+//
+// 用户 2026-09-29 报障："文件管理里面找不到挂载的内容"——挂载点埋在安装根深处，
+// 不在下拉里就等于没人找得到。这条钉住"下拉里有它 + 归到磁盘与卷分组"。
+func TestFilesDropdownHasNetworkMountBase(t *testing.T) {
+	s, f := newFakeFileRootsServer(t)
+	base := s.customMountBase()
+	if strings.TrimSpace(base) == "" {
+		t.Fatal("测试前置：网络盘挂载基目录不该为空")
+	}
+	// 真实机器上这个目录由挂载动作建出来；不存在时管理器本来就不会把它列成可浏览的根。
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	q := url.Values{}
+	q.Set("path", f.www)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	s.handleFileList(rec, req)
+
+	var body struct {
+		Data struct {
+			RootLabels map[string]string `json:"root_labels"`
+			RootKinds  map[string]string `json:"root_kinds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是 JSON: %v", err)
+	}
+	key := resolveForCompare(base)
+	if _, ok := body.Data.RootLabels[key]; !ok {
+		t.Fatalf("网络盘挂载点 %s 必须在「位置」下拉里；现有 labels=%v", key, body.Data.RootLabels)
+	}
+	if k := body.Data.RootKinds[key]; k != "volume" {
+		t.Errorf("网络盘挂载点该归到「磁盘与卷」分组，实际 kind=%q", k)
+	}
+}

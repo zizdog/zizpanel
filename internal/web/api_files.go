@@ -109,6 +109,12 @@ func (s *Server) defaultFileRootEntries() []fileRootEntry {
 	for _, a := range s.appConfigRootEntries() {
 		add(a.Path, fileRootKindApp, a.Label, true)
 	}
+	// 网络盘（SMB/NFS）挂载点：用户报障"文件管理里找不到挂载的内容"（挂载点埋在安装根深处）。
+	// 只列基目录、**不逐盘探测挂载状态** —— 列表接口不许 fork `mount`（昂贵的真实探测不上列表）；
+	// 没挂上的盘进去就是个空目录，怎么挂/怎么传由磁盘页那颗「网络盘」入口负责。
+	if base := strings.TrimSpace(s.customMountBase()); base != "" {
+		add(base, "volume", "网络盘（SMB / NFS 挂载点）", true)
+	}
 	// 外接盘：每次重新枚举；走 nonSystemVolumeMountsFn 便于单测注入固定挂载点。
 	for _, v := range nonSystemVolumeMountsFn() {
 		add(v, "volume", volumeRootLabel(v), true)
