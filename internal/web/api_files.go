@@ -1030,6 +1030,9 @@ func (s *Server) handleFileCopy(w http.ResponseWriter, r *http.Request) {
 // 跨卷回退"复制 + 删源"，目标已存在时按 on_conflict 处理（绝不静默覆盖）。
 //
 // 关键差别只在**取消**：跨卷复制中断时删掉半成品，**绝不删源文件**。
+// onReadOnlyFSFn 是"所在文件系统只读吗"的注入点（门禁要能造出只读挂载）。
+var onReadOnlyFSFn = files.OnReadOnlyFS
+
 func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
 	var req fileOpReq
 	if err := decode(r, &req); err != nil {
@@ -1040,6 +1043,14 @@ func (s *Server) handleFileMove(w http.ResponseWriter, r *http.Request) {
 	if err := s.checkFileOpContainment(pairs, false); err != nil {
 		failFileErr(w, err)
 		return
+	}
+	// 源在只读挂载上就当场拒绝：移动最后一步必须删源，只读上必然失败 ——
+	// 真机踩过：整份 4GB 已经拷过去才报 `read-only file system`，白拷一遍。
+	for _, p := range pairs {
+		if onReadOnlyFSFn(p.From) {
+			fail(w, http.StatusForbidden, p.From+" 在只读挂载上，移动需要删除源：到「磁盘管理」把这条网络盘改成读写并重新挂载，或改用「复制」")
+			return
+		}
 	}
 	onConflict := strings.ToLower(strings.TrimSpace(req.OnConflict))
 	if onConflict == "" {

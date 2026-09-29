@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // 外接盘（非系统卷）的枚举。
@@ -113,4 +114,20 @@ func NonSystemVolumeMounts() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// mntReadOnly 是 darwin mount(2) 的 MNT_RDONLY 标志位。
+const mntReadOnly = 0x00000001
+
+// OnReadOnlyFS 报告这个路径所在的文件系统是不是**只读挂载**。
+//
+// 为什么需要它：网络盘勾了「只读」（或外接盘写保护）时，"移动"必然在最后一步
+// 删源失败 —— 用户 2026-09-29 实测：4GB 已经整份拷过去，才报 `read-only file system`，
+// 白拷一遍。读不到 statfs 就返回 false（不猜，让真实操作去报错）。
+func OnReadOnlyFS(path string) bool {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return false
+	}
+	return st.Flags&mntReadOnly != 0
 }
