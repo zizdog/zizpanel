@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zizdog/zizpanel/internal/config"
 	"github.com/zizdog/zizpanel/internal/smb"
 )
 
@@ -53,7 +54,12 @@ type smbRuntime struct {
 }
 
 // smbExecFor 返回执行器。单测用路径垫片替换命令，不需要注入执行器本身。
-func (s *Server) smbExecFor() *smb.Executor { return &smb.Executor{Timeout: 90 * time.Second} }
+//
+// RunAs = 面板的真实用户（Jellyfin 也用它跑）：root 挂的 smbfs 别的用户读不到
+// （真机实测 Permission denied），所以挂载要降权到用户身份，挂载才归它所有。
+func (s *Server) smbExecFor() *smb.Executor {
+	return &smb.Executor{Timeout: 90 * time.Second, RunAs: config.PanelUser()}
+}
 
 // ---------- 持久化 ----------
 
@@ -185,6 +191,8 @@ type smbView struct {
 	LastSuccess string   `json:"last_success_at,omitempty"`
 	NextAttempt string   `json:"next_attempt_at,omitempty"`
 	Command     string   `json:"command,omitempty"`
+	// RunAs 是挂载降权到的本地用户（Jellyfin 也用它跑，挂载归它所有）。
+	RunAs string `json:"run_as,omitempty"`
 }
 
 func (s *Server) smbViewOf(m smb.Mount, table []smb.Entry, tableErr error) smbView {
@@ -193,7 +201,7 @@ func (s *Server) smbViewOf(m smb.Mount, table []smb.Entry, tableErr error) smbVi
 	v := smbView{
 		ID: m.ID, Name: m.Name, Host: m.Host, Share: m.Share, User: m.User,
 		Domain: m.Domain, ReadOnly: m.ReadOnly, PasswordSet: m.Password != "",
-		MountPoint: mp,
+		MountPoint: mp, RunAs: config.PanelUser(),
 	}
 	if tableErr == nil {
 		v.Verified = true

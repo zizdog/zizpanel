@@ -730,6 +730,7 @@ function smbSection() {
       ]),
       h('div', { style: { marginTop: '4px', fontSize: '12.5px', color: 'var(--text-mute)', wordBreak: 'break-all' }, text: target }),
       h('div.mono', { style: { marginTop: '4px', fontSize: '12px', wordBreak: 'break-all' }, text: m.mount_point || '' }),
+      m.run_as ? h('div.hint', { style: { marginTop: '4px' }, text: '挂载身份 ' + m.run_as + '（挂载归它所有，Jellyfin 用它读）' }) : null,
       when ? h('div.hint', { style: { marginTop: '4px' }, text: when }) : null,
       errBox,
       h('div', { style: { marginTop: '8px', display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [

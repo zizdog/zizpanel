@@ -23,8 +23,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -286,11 +288,50 @@ type Result struct {
 	Error      string   `json:"error,omitempty"`
 	Remedy     string   `json:"remedy,omitempty"`
 	Note       string   `json:"note,omitempty"`
+	// RunAs 是这次挂载实际降权到的本地用户（空 = 当前身份）。
+	RunAs string `json:"run_as,omitempty"`
 }
 
-// Executor 执行挂载/卸载。零值可用；单测只改 Timeout。
+// Executor 执行挂载/卸载。零值可用；单测只改 Timeout/RunAs。
 type Executor struct {
 	Timeout time.Duration // 单次挂载总超时（默认 90s）
+	// RunAs 是"以哪个本地用户身份挂载"（空 = 当前身份）。面板以 root 运行时**必须**给：
+	// 挂载归执行身份所有，root 挂的 smbfs 别的用户连目录都进不去（2026-09-29 真机实测：
+	// 面板 root 挂上后 zizdog `ls` 直接 Permission denied ⇒ Jellyfin 会是空库）。
+	RunAs string
+}
+
+// RunAsUser 是一次挂载要降权到的本地用户。
+type RunAsUser struct {
+	Name string
+	UID  uint32
+	GID  uint32
+	Home string
+}
+
+// runAsLookupFn / runAsEUIDFn 是注入点（门禁里换成假的：绝不真的 setuid）。
+var (
+	runAsLookupFn = user.Lookup
+	runAsEUIDFn   = os.Geteuid
+)
+
+// resolveRunAs 把用户名解析成 uid/gid/家目录。解析不到、空名、root、或自己不是 root
+// ⇒ 返回 nil（就按当前身份跑，绝不猜）。
+func resolveRunAs(name string) *RunAsUser {
+	name = strings.TrimSpace(name)
+	if name == "" || runAsEUIDFn() != 0 {
+		return nil
+	}
+	u, err := runAsLookupFn(name)
+	if err != nil || u == nil {
+		return nil
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil || uid == 0 {
+		return nil
+	}
+	return &RunAsUser{Name: u.Username, UID: uint32(uid), GID: uint32(gid), Home: u.HomeDir}
 }
 
 func (e *Executor) timeout() time.Duration {
@@ -343,10 +384,18 @@ func (e *Executor) Mount(ctx context.Context, m Mount, mountPoint string) Result
 		res.Remedy = "确认面板进程有权限写 " + filepath.Dir(mountPoint) + "。"
 		return res
 	}
+	// 以"要用它的那个用户"（Jellyfin 的真实用户）身份挂载：挂载归执行身份所有。
+	as := resolveRunAs(e.RunAs)
+	if as != nil {
+		res.RunAs = as.Name
+		if err := os.Chown(mountPoint, int(as.UID), int(as.GID)); err != nil {
+			res.Note = "挂载点归属交给 " + as.Name + " 失败：" + err.Error()
+		}
+	}
 	argv := MountArgs(m, mountPoint)
 	res.Command = strings.Join(argv, " ")
 
-	out, exit, err := runWithPTY(ctx, e.timeout(), argv, m.Password)
+	out, exit, err := runWithPTY(ctx, e.timeout(), argv, m.Password, as)
 	out = Scrub(out, m.Password)
 	res.Output, res.ExitCode = out, exit
 
@@ -520,14 +569,22 @@ func tail(s string, n int) string {
 const PromptMarker = "assword for"
 
 // runWithPTY 用 `script` 分配一个 pty 跑命令，看到口令提示后写入口令。
+// as 非空时把整个 pty 链降权到该本地用户（挂载归它所有）。
 // 返回：合并输出（未 scrub）、退出码、错误。
-func runWithPTY(ctx context.Context, timeout time.Duration, argv []string, password string) (string, int, error) {
+func runWithPTY(ctx context.Context, timeout time.Duration, argv []string, password string, as *RunAsUser) (string, int, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	// 独立进程组：超时/取消时连 script 的子进程一起杀掉，不留孤儿。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	attr := &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = os.Environ()
+	if as != nil {
+		attr.Credential = &syscall.Credential{Uid: as.UID, Gid: as.GID}
+		// HOME 必须跟着换：mount_smbfs 会去读 ~/Library/Preferences/nsmb.conf。
+		cmd.Env = append(cmd.Env, "HOME="+as.Home, "USER="+as.Name, "LOGNAME="+as.Name)
+	}
+	cmd.SysProcAttr = attr
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil

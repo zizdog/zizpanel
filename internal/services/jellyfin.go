@@ -761,7 +761,8 @@ func (m *Manager) JellyfinMediaReadCheck(ctx context.Context, dir string) Jellyf
 		default:
 			out.Message = m.opt.UserName + " 读不到 " + sample + "：" + tailText(strings.TrimSpace(rerr.Error()), 200)
 			out.Remedy = "检查目录权限（ls -lde " + dir + "）与卷是否挂载；外接盘请先给面板" +
-				"「完全磁盘访问」再重试。"
+				"「完全磁盘访问」再重试；网络盘（SMB）到磁盘页看那一行的「挂载身份」——" +
+				"必须挂在 " + m.opt.UserName + " 名下，root 挂的盘这个用户读不到。"
 		}
 		return out
 	}
