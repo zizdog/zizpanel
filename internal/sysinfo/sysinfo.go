@@ -52,19 +52,26 @@ type Sample struct {
 	LoadAvg5  float64 `json:"load_5"`
 	LoadAvg15 float64 `json:"load_15"`
 	MemTotal  uint64  `json:"mem_total"` // 字节
-	MemUsed   uint64  `json:"mem_used"`
-	MemFree   uint64  `json:"mem_free"`
-	MemCached uint64  `json:"mem_cached"` // inactive + purgeable，实为可回收
-	SwapTotal uint64  `json:"swap_total"`
-	SwapUsed  uint64  `json:"swap_used"`
-	DiskTotal uint64  `json:"disk_total"`
-	DiskUsed  uint64  `json:"disk_used"`
-	DiskFree  uint64  `json:"disk_free"`
-	NetRx     uint64  `json:"net_rx"` // 累计字节
-	NetTx     uint64  `json:"net_tx"`
-	NetRxRate float64 `json:"net_rx_rate"` // 字节/秒
-	NetTxRate float64 `json:"net_tx_rate"`
-	CPUTemp   float64 `json:"cpu_temp"` // 摄氏度，取不到为 0
+	MemUsed   uint64  `json:"mem_used"`  // 活动监视器口径：应用+有线+压缩
+	MemApp    uint64  `json:"mem_app"`   // 应用 = anonymous − purgeable
+	MemWired  uint64  `json:"mem_wired"` // 有线
+	MemCompr  uint64  `json:"mem_compr"` // 压缩
+	MemCached uint64  `json:"mem_cached"`
+	MemFree   uint64  `json:"mem_free"` // total − used − cached
+	// MemVerified=false 表示 vm_stat 没解析全（缺页大小/行），数值别当准的；
+	// MemNote 说明原因，前端如实展示而不是拿 top 的虚高值冒充。
+	MemVerified bool    `json:"mem_verified"`
+	MemNote     string  `json:"mem_note"`
+	SwapTotal   uint64  `json:"swap_total"`
+	SwapUsed    uint64  `json:"swap_used"`
+	DiskTotal   uint64  `json:"disk_total"`
+	DiskUsed    uint64  `json:"disk_used"`
+	DiskFree    uint64  `json:"disk_free"`
+	NetRx       uint64  `json:"net_rx"` // 累计字节
+	NetTx       uint64  `json:"net_tx"`
+	NetRxRate   float64 `json:"net_rx_rate"` // 字节/秒
+	NetTxRate   float64 `json:"net_tx_rate"`
+	CPUTemp     float64 `json:"cpu_temp"` // 摄氏度，取不到为 0
 	// CPUTempNote 说明温度的来源，或者"为什么取不到"。
 	// 以前前端写死显示"不可读取（需 root）"—— 那句话在 Apple Silicon 上**是错的**
 	// （真实原因是 powermetrics 没有 smc 采样器），所以要如实回报原因。
@@ -166,7 +173,7 @@ func (c *Collector) Collect(ctx context.Context) (Sample, error) {
 	out.Uptime = bootUptime()
 
 	// ---- 主路径：top -l 1 -n 0（Apple Silicon 上唯一可靠的 CPU 来源）----
-	tp, topOK := readTop(ctx)
+	tp, topRaw, topOK := readTop(ctx)
 	if topOK {
 		if tp.HasCPU {
 			out.CPUUsed = round2(tp.CPUUser + tp.CPUSys)
@@ -205,16 +212,27 @@ func (c *Collector) Collect(ctx context.Context) (Sample, error) {
 		out.Procs = procCount(ctx)
 	}
 
-	// ---- 内存：vm_stat 精确计算；top 的 PhysMem 仅作交叉校验 ----
-	out.MemFree, out.MemCached, out.SwapTotal, out.SwapUsed = readMem(ctx)
-	if out.MemTotal > out.MemFree {
-		used := out.MemTotal - out.MemFree - out.MemCached
-		out.MemUsed = used
-	}
-	// vm_stat 与 top 的口径可能相差"压缩内存"，取较大值更贴近"关于本机"的显示，
-	// 避免用户看到面板内存占用明显低于活动监视器而产生疑虑。
-	if topOK && tp.HasMem && tp.MemUsed > out.MemUsed {
-		out.MemUsed = tp.MemUsed
+	// ---- 内存：以 vm_stat 为准（活动监视器口径：应用+有线+压缩）----
+	ms, swapTotal, swapUsed := readMem(ctx, out.MemTotal)
+	out.SwapTotal, out.SwapUsed = swapTotal, swapUsed
+	out.MemApp, out.MemWired, out.MemCompr = ms.App, ms.Wired, ms.Compr
+	out.MemCached, out.MemFree, out.MemUsed = ms.Cached, ms.Free, ms.Used
+	out.MemVerified, out.MemNote = ms.Verified, ms.Note
+	if !ms.Verified {
+		// vm_stat 解析不全：退回 top 的 PhysMem used（含文件缓存，偏高），
+		// 并保持 Verified=false，界面如实标"未复核"而不是冒充新口径。
+		if topOK {
+			if v, ok := parseTopPhysMemUsed(topRaw); ok {
+				out.MemUsed = v
+				out.MemApp, out.MemWired, out.MemCompr, out.MemCached = 0, 0, 0, 0
+				if v < out.MemTotal {
+					out.MemFree = out.MemTotal - v
+				} else {
+					out.MemFree = 0
+				}
+				out.MemNote = strings.TrimSpace(ms.Note + "；已退回 top 口径（含文件缓存，偏高）")
+			}
+		}
 	}
 
 	// ---- 磁盘 ----
@@ -383,11 +401,10 @@ func readCPUTicks(ctx context.Context) cpuTicks {
 	return cpuTicks{user: vals[0], nice: vals[1], sys: vals[2], idle: vals[3]}
 }
 
-// readMem 用 vm_stat + sysctl 计算内存。解析逻辑见 macos.go 的 parseVMStat，
-// 那里有关于 macOS 内存语义（free / inactive / purgeable）的说明。
-func readMem(ctx context.Context) (free, cached uint64, swapTotal, swapUsed uint64) {
-	out := runCmd(ctx, "vm_stat")
-	free, cached, _ = parseVMStat(out)
+// readMem 用 vm_stat 算内存（活动监视器口径）+ sysctl 读 swap。
+// 口径与"未复核"规则见 macos.go 的 parseVMStat。
+func readMem(ctx context.Context, total uint64) (m memSample, swapTotal, swapUsed uint64) {
+	m = parseVMStat(runCmd(ctx, "vm_stat"), total)
 	swapTotal, swapUsed = parseSwap(runCmd(ctx, "sysctl", "-n", "vm.swapusage"))
 	return
 }

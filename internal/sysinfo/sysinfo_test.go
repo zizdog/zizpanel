@@ -1,6 +1,7 @@
 package sysinfo
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,74 +41,115 @@ func TestParseTopExtractsAllMetrics(t *testing.T) {
 	if !s.HasProcs || s.Procs != 499 {
 		t.Fatalf("进程数解析错误: %d", s.Procs)
 	}
-	if !s.HasMem {
-		t.Fatal("未解析出内存")
-	}
-	// 15G
-	if s.MemUsed != 15*1024*1024*1024 {
-		t.Fatalf("已用内存解析错误: %d", s.MemUsed)
-	}
-	// 2544M wired
-	if s.MemWired != 2544*1024*1024 {
-		t.Fatalf("wired 内存解析错误: %d", s.MemWired)
-	}
-	// 5953M compressor
-	if s.MemCompr != 5953*1024*1024 {
-		t.Fatalf("compressor 解析错误: %d", s.MemCompr)
-	}
-	// 523M unused
-	if s.MemUnused != 523*1024*1024 {
-		t.Fatalf("未用内存解析错误: %d", s.MemUnused)
-	}
 }
 
 func TestParseTopHandlesEmptyAndGarbage(t *testing.T) {
 	for _, raw := range []string{"", "top: something went wrong", "\n\n"} {
 		s := parseTop(raw)
-		if s.HasCPU || s.HasLoad || s.HasMem {
+		if s.HasCPU || s.HasLoad || s.HasProcs {
 			t.Fatalf("非法输入不应解析出指标: %+v (%q)", s, raw)
 		}
 	}
 }
 
-const sampleVMStat = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
-Pages free:                               29022.
-Pages active:                            219692.
-Pages inactive:                          213680.
-Pages speculative:                         5385.
+// ---------- 内存口径门禁（活动监视器语义）----------
+//
+// 真机事故：面板显示内存 93.8%（top 的 PhysMem used = total − unused，把
+// inactive/文件缓存算成"已用"），用户以为内存要满了。这里用固定文本锁死新口径：
+// used + cached + free == total，且明显低于同一组数字下 top 的口径。
+
+// sampleVMStatPages 是字段齐全的固定 vm_stat 文本（页大小 16384，同 Apple Silicon）。
+const sampleVMStatPages = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               20000.
+Pages active:                            200000.
+Pages inactive:                          210000.
+Pages speculative:                         5000.
 Pages throttled:                              0.
-Pages wired down:                        160286.
-Pages purgeable:                           3856.
+Pages wired down:                        160000.
+Pages purgeable:                           4000.
 "Translation faults":                  12345678.
+Pages copy-on-write:                       1000.
+Pages zero filled:                         2000.
+Pages reactivated:                         3000.
+Pages purged:                              4000.
+File-backed pages:                       130000.
+Anonymous pages:                         300000.
+Pages stored in compressor:              500000.
+Pages occupied by compressor:            400000.
+Decompressions:                            1000.
+Compressions:                              2000.
+Pageins:                                  30000.
+Pageouts:                                  4000.
+Swapins:                                   5000.
+Swapouts:                                  6000.
 `
 
-func TestParseVMStatRespectsPageSize(t *testing.T) {
-	free, cached, pageSize := parseVMStat(sampleVMStat)
+// sampleTopPhysMem 是同一组数字下 top 的 PhysMem 行，只用于对照口径差异。
+const sampleTopPhysMem = `PhysMem: 15G used (2544M wired, 5953M compressor), 523M unused.`
 
-	// 必须采用输出里的 page size（16384），而不是假定的 4096
-	if pageSize != 16384 {
-		t.Fatalf("页大小未按输出解析: %d", pageSize)
+func TestParseVMStatActivityMonitorSemantics(t *testing.T) {
+	const total = 16 * 1024 * 1024 * 1024
+	const ps = uint64(16384)
+	m := parseVMStat(sampleVMStatPages, total)
+
+	if !m.Verified {
+		t.Fatalf("字段齐全却标未复核: %s", m.Note)
 	}
-	// free = (29022 + 5385) * 16384
-	wantFree := uint64((29022 + 5385) * 16384)
-	if free != wantFree {
-		t.Fatalf("空闲内存计算错误: got=%d want=%d", free, wantFree)
+	// 分项：应用 = (300000−4000)×ps，有线 160000×ps，压缩 400000×ps，缓存 130000×ps
+	if want := uint64(296000) * ps; m.App != want {
+		t.Fatalf("应用内存错误: got=%d want=%d", m.App, want)
 	}
-	// cached = (213680 + 3856) * 16384
-	wantCached := uint64((213680 + 3856) * 16384)
-	if cached != wantCached {
-		t.Fatalf("可回收内存计算错误: got=%d want=%d", cached, wantCached)
+	if want := uint64(160000) * ps; m.Wired != want {
+		t.Fatalf("有线内存错误: got=%d want=%d", m.Wired, want)
+	}
+	if want := uint64(400000) * ps; m.Compr != want {
+		t.Fatalf("压缩内存错误: got=%d want=%d", m.Compr, want)
+	}
+	if want := uint64(130000) * ps; m.Cached != want {
+		t.Fatalf("缓存(文件缓存)错误: got=%d want=%d", m.Cached, want)
+	}
+	if m.Used != m.App+m.Wired+m.Compr {
+		t.Fatalf("已用 ≠ 应用+有线+压缩: %d vs %d", m.Used, m.App+m.Wired+m.Compr)
+	}
+	// 三种口径必须自洽（这一条就是变异验证的靶子：把 cached 折进 used 就变红）
+	if m.Used+m.Cached+m.Free != total || m.Total != total {
+		t.Fatalf("used + cached + free ≠ total: %d + %d + %d = %d, total=%d",
+			m.Used, m.Cached, m.Free, m.Used+m.Cached+m.Free, total)
+	}
+	// 同一组数字里 top 的 PhysMem used 明显更高（把文件缓存算成已用）
+	topUsed, ok := parseTopPhysMemUsed(sampleTopPhysMem)
+	if !ok {
+		t.Fatal("未解析出 top 的 PhysMem used 作对照")
+	}
+	if m.Used >= topUsed {
+		t.Fatalf("新口径应小于 top 口径: new=%d top=%d", m.Used, topUsed)
+	}
+	pctNew := float64(m.Used) / float64(total) * 100
+	pctTop := float64(topUsed) / float64(total) * 100
+	if pctTop-pctNew < 5 {
+		t.Fatalf("新口径与 top 口径的百分比差应 >5 个点: new=%.1f%% top=%.1f%%", pctNew, pctTop)
+	}
+
+	// purgeable 大于 anonymous 时应用内存夹到 0，不许出现负数回绕
+	clamped := strings.Replace(sampleVMStatPages,
+		"Pages purgeable:                           4000.",
+		"Pages purgeable:                         400000.", 1)
+	if c := parseVMStat(clamped, total); c.App != 0 {
+		t.Fatalf("purgeable > anonymous 时应用内存应夹到 0，实际 %d", c.App)
 	}
 }
 
-func TestParseVMStatFallbackPageSize(t *testing.T) {
-	// 缺少页大小说明时必须退回 4096，而不是崩溃或返回 0
-	free, _, pageSize := parseVMStat("Pages free: 100.\n")
-	if pageSize != 4096 {
-		t.Fatalf("缺少页大小时应退回 4096，实际 %d", pageSize)
+func TestParseVMStatMissingFieldMeansUnverified(t *testing.T) {
+	const total = 16 * 1024 * 1024 * 1024
+	// 缺 File-backed pages：必须标未复核，且给出原因（不许拿 0 冒充）
+	noCached := strings.Replace(sampleVMStatPages, "File-backed pages:", "File-backed pagess:", 1)
+	if m := parseVMStat(noCached, total); m.Verified || m.Note == "" {
+		t.Fatalf("缺 File-backed pages 必须标未复核并说明原因: verified=%v note=%q", m.Verified, m.Note)
 	}
-	if free != 100*4096 {
-		t.Fatalf("空闲内存计算错误: %d", free)
+	// 缺页面大小：必须标未复核（不许退回 4096 猜）
+	noPage := strings.Replace(sampleVMStatPages, "page size of 16384 bytes", "page size unknown", 1)
+	if m := parseVMStat(noPage, total); m.Verified || m.Note == "" {
+		t.Fatalf("缺页面大小必须标未复核: verified=%v note=%q", m.Verified, m.Note)
 	}
 }
 
@@ -214,6 +256,19 @@ func TestCollectOnThisMachine(t *testing.T) {
 	// CPU 使用率必须在 0-100 之间（top 路径应能给出真实值）
 	if s1.CPUUsed < 0 || s1.CPUUsed > 100 {
 		t.Fatalf("CPU 使用率越界: %v", s1.CPUUsed)
+	}
+	// 真机上 vm_stat 应能解析全：三种口径自洽，且 used 不吞掉缓存
+	if s1.MemVerified {
+		if s1.MemUsed+s1.MemCached+s1.MemFree != s1.MemTotal {
+			t.Fatalf("内存三种口径不自洽: %d + %d + %d ≠ %d",
+				s1.MemUsed, s1.MemCached, s1.MemFree, s1.MemTotal)
+		}
+		if s1.MemUsed != s1.MemApp+s1.MemWired+s1.MemCompr {
+			t.Fatalf("已用 ≠ 应用+有线+压缩: %d vs %d",
+				s1.MemUsed, s1.MemApp+s1.MemWired+s1.MemCompr)
+		}
+	} else {
+		t.Logf("本机 vm_stat 未复核（按设计不判失败）: %s", s1.MemNote)
 	}
 	t.Logf("采集成功: host=%s cpu=%.2f%% cores=%d mem=%d/%d disk=%d/%d procs=%d load=%.2f",
 		s1.Hostname, s1.CPUUsed, s1.CPUCores, s1.MemUsed, s1.MemTotal,

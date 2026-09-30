@@ -161,7 +161,9 @@ export function PeersView(content) {
       if (p.last_advice) rows.push(h('div.hint', { text: '→ ' + p.last_advice }));
     }
     if (s) {
-      const memPct = s.mem_total ? ((s.mem_total - s.mem_free) / s.mem_total) * 100 : 0;
+      // 用 mem_used/mem_total（活动监视器口径），别拿 total−free 当已用：
+      // 那样会把文件缓存算进去，与主面板本机显示不一致（见 internal/sysinfo/macos.go）。
+      const memPct = s.mem_total ? (s.mem_used / s.mem_total) * 100 : 0;
       const diskPct = s.disk_total ? (s.disk_used / s.disk_total) * 100 : 0;
       rows.push(h('div', { style: { display: 'flex', gap: '14px', flexWrap: 'wrap', marginTop: '6px' } }, [
         metric('版本', s.version || '—'),

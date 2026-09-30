@@ -37,18 +37,22 @@ import (
 
 // agentSummary 是子机交给主面板的摘要。**只有聚合数字**（见文件头的安全边界）。
 type agentSummary struct {
-	Panel     string        `json:"panel"`
-	Version   string        `json:"version"`
-	Entry     string        `json:"entry"`
-	Hostname  string        `json:"hostname"`
-	OS        string        `json:"os"`
-	Arch      string        `json:"arch"`
-	Uptime    int64         `json:"uptime"`
-	CPUUsed   float64       `json:"cpu_used"`
-	CPUCores  int           `json:"cpu_cores"`
-	Load1     float64       `json:"load_1"`
-	MemTotal  uint64        `json:"mem_total"`
+	Panel    string  `json:"panel"`
+	Version  string  `json:"version"`
+	Entry    string  `json:"entry"`
+	Hostname string  `json:"hostname"`
+	OS       string  `json:"os"`
+	Arch     string  `json:"arch"`
+	Uptime   int64   `json:"uptime"`
+	CPUUsed  float64 `json:"cpu_used"`
+	CPUCores int     `json:"cpu_cores"`
+	Load1    float64 `json:"load_1"`
+	MemTotal uint64  `json:"mem_total"`
+	// MemUsed 是活动监视器口径（应用+有线+压缩），与主面板本机一致；
+	// MemFree/MemCached 同口径保留给既有前端，三者相加恒等于 MemTotal。
 	MemUsed   uint64        `json:"mem_used"`
+	MemFree   uint64        `json:"mem_free"`
+	MemCached uint64        `json:"mem_cached"`
 	DiskTotal uint64        `json:"disk_total"`
 	DiskUsed  uint64        `json:"disk_used"`
 	Services  agentServices `json:"services"`
@@ -98,6 +102,7 @@ func (s *Server) buildAgentSummary(ctx context.Context) agentSummary {
 		sum.Hostname, sum.OS, sum.Arch = snap.Hostname, snap.OS, snap.Arch
 		sum.Uptime, sum.CPUUsed, sum.CPUCores, sum.Load1 = snap.Uptime, snap.CPUUsed, snap.CPUCores, snap.LoadAvg1
 		sum.MemTotal, sum.MemUsed = snap.MemTotal, snap.MemUsed
+		sum.MemFree, sum.MemCached = snap.MemFree, snap.MemCached
 		sum.DiskTotal, sum.DiskUsed = snap.DiskTotal, snap.DiskUsed
 	}
 	// 服务状态用**不带健康检查**的那一档：摘要要快，而"卡死但端口在听"由子机自己的

@@ -28,6 +28,23 @@ import { buildPanelLimitField, savePanelLimitOnly } from './panellimit.js';
 // 用于在渲染器内部切换路由的小工具（app.js 的 render 无法被 import 循环引用）
 function go(id) { location.hash = '#/' + id; }
 
+// 内存口径说明（详情进 title）。真机事故：top 的 PhysMem used = total − unused，
+// 把 inactive/文件缓存算成"已用"，面板曾显示 93.8% 让用户以为内存要满。
+const MEM_NOTE = 'macOS 会把文件缓存算进 top 的 used，看可用/内存压力更准。' +
+  '已用 = 应用（匿名 − 可清除）+ 有线 + 压缩；缓存 = 文件缓存。';
+
+// memLine 是概览卡片与「系统信息」列表共用的那一行内存明细。
+function memLine(s) {
+  if (!s || !s.mem_total) return '—';
+  const head = `已用 ${pct((s.mem_used / s.mem_total) * 100)}`;
+  const swap = s.swap_total ? ` · Swap ${bytes(s.swap_used)}/${bytes(s.swap_total)}` : '';
+  if (!s.mem_verified) {
+    return `${head}（口径未复核：${s.mem_note || 'vm_stat 不可用'}）${swap}`;
+  }
+  return `${head}（应用 ${bytes(s.mem_app)} · 有线 ${bytes(s.mem_wired)} · 压缩 ${bytes(s.mem_compr)}）` +
+    ` · 缓存 ${bytes(s.mem_cached)} · 可用 ${bytes(s.mem_free)}${swap}`;
+}
+
 // ============================================================================
 //  仪表盘
 // ============================================================================
@@ -399,8 +416,8 @@ export function DashboardView(content, ctx = {}) {
     const memLevel = levelOf(memPct, 80, 92);
     metrics.mem.card.className = 'metric' + (memLevel ? ' ' + memLevel : '');
     metrics.mem.value.innerHTML = `${pct(memPct)}<small>${bytes(s.mem_used)} / ${bytes(s.mem_total)}</small>`;
-    metrics.mem.meta.textContent = `可用 ${bytes(s.mem_free + s.mem_cached)}（含可回收 ${bytes(s.mem_cached)}）` +
-      (s.swap_total ? ` · Swap ${bytes(s.swap_used)}/${bytes(s.swap_total)}` : '');
+    metrics.mem.meta.textContent = memLine(s);
+    metrics.mem.card.title = MEM_NOTE;
     metrics.mem.bar.style.width = Math.min(100, memPct) + '%';
     metrics.mem.bar.parentElement.className = 'bar' + (memLevel ? ' ' + memLevel : '');
     memSpark.push(memPct);
@@ -429,6 +446,8 @@ export function DashboardView(content, ctx = {}) {
       ['操作系统', `macOS ${s.os || '?'} (${s.arch})`],
       ['处理器', s.cpu_model || '-'],
       ['运行时长', duration(s.uptime)],
+      // 内存明细放这里（口径与 title 说明同概览卡片，见 MEM_NOTE）。
+      ['内存', memLine(s), MEM_NOTE],
       // 系统负载与 Swap 原先只出现在「系统监控」页；那一页已改造成「mac设置」，
       // 于是把这两项搬进仪表盘，避免页面改造反而丢掉信息。
       ['系统负载 (1/5/15)', `${s.load_1.toFixed(2)} / ${s.load_5.toFixed(2)} / ${s.load_15.toFixed(2)}`],
@@ -443,8 +462,8 @@ export function DashboardView(content, ctx = {}) {
       ['面板地址', location.origin],
       ['服务端时间', new Date().toLocaleString('zh-CN')],
     ];
-    rows.forEach(([k, v]) => {
-      sysList.append(h('dt', { text: k }), h('dd', { text: v }));
+    rows.forEach(([k, v, t]) => {
+      sysList.append(h('dt', { text: k }), h('dd', { text: v, title: t || '' }));
     });
   }
 
