@@ -26,6 +26,25 @@ func fileOwner(fi os.FileInfo) string {
 	if g, err := user.LookupGroupId(gid); err == nil {
 		gname = g.Name
 	}
+	return ownerLabel(uname, gname, st.Uid, st.Gid)
+}
+
+// unknownID 是 macOS 的保留身份 uid/gid（(uid_t)-2）。"忽略所有权"（noowners）的卷
+// 上所有文件都报这个数字，目录服务里它的名字是 "_unknown"。
+const unknownID = 4294967294
+
+// ownerLabel 把 (名字, 数字) 拼成界面上的属主："用户:组"。
+//
+// 用户 2026-09-29：外置盘（noowners）上满屏 `_unknown:_unknown`，要求简洁些 ——
+// 这种"系统占位身份"统一显示成 `-`；查不到名字的**普通数字**（如 NAS 的 1000:1001）
+// 照旧显示数字（那是有用信息，不能也变成 `-`）。
+func ownerLabel(uname, gname string, uid, gid uint32) string {
+	if uname == "_unknown" || uid == unknownID {
+		uname = "-"
+	}
+	if gname == "_unknown" || gid == unknownID {
+		gname = "-"
+	}
 	return uname + ":" + gname
 }
 

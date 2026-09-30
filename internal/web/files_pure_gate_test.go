@@ -4,14 +4,16 @@ package web
 //
 // tools/check-files-pure.mjs 断言的是逻辑本身；这一条断言的是"浏览器真的用它"：
 // 纯模块如果只是躺在 assets/js 里而 files.js/tasks.js 各自又写了一份比较器/滑窗，
-// 那边界门禁全绿、界面行为却是旧的第二份实现。所以两件事一起锁：
+// 那边界门禁全绿、界面行为却是旧的第二份实现。所以三件事一起锁：
 //   ① 比较器只有 sortfiles.js 有，files.js 的 sortedEntries 必须委托给它；
+//      排序入口只有"点表头"——工具栏不得再有「排序 ▾」菜单，「类型」列表头必须用
+//      同一个 sortHeader 渲染、单元格走 extOf；
 //   ② 速度/ETA 只有 transfereta.js 有，且 files.js 与 tasks.js 都通过
 //      taskCenter.progressRateText 取用（同一个采样，不各写一份）；
 //   ③ 内存里的纯函数门禁脚本必须能跑（node 缺失时明确跳过，不假装通过）。
 //
 // 负向对照（已实测变红）：把 sortedEntries 改回内联比较器 ⇒ ① 红；
-// 把 transfereta.js 的窗口裁剪删掉 ⇒ check-files-pure.mjs 红（见变异记录）。
+// 加回工具栏「排序 ▾」⇒ ① 红；把 transfereta.js 的窗口裁剪删掉 ⇒ check-files-pure.mjs 红。
 
 import (
 	"os/exec"
@@ -40,6 +42,19 @@ func TestFilesPureWiringGate(t *testing.T) {
 	}
 	if n := strings.Count(files, "localeCompare(String(a.name || ''), 'zh')"); n != 0 {
 		t.Errorf("files.js 里残留 %d 处内联名字比较 —— 排序逻辑必须只有 sortfiles.js 一份", n)
+	}
+	// 排序入口只有"点表头"这一种：工具栏那颗「排序 ▾」菜单必须不存在（用户点名删掉）。
+	if strings.Contains(files, "排序 ▾") {
+		t.Error("files.js 里还有工具栏「排序 ▾」—— 排序入口只能是表头点击")
+	}
+	if strings.Contains(files, "sortMenuItems") {
+		t.Error("files.js 里还有 sortMenuItems —— 排序菜单没删干净")
+	}
+	// 「类型」列：表头必须用同一个 sortHeader 渲染（可点、有 ▲/▼），单元格走 extOf。
+	for _, want := range []string{"sortHeader('type', '类型')", "function typeLabel(", "extOf(e.name)"} {
+		if !strings.Contains(files, want) {
+			t.Errorf("files.js 缺 %q —— 「类型」列没接上", want)
+		}
 	}
 
 	// ② 速度/ETA 只有一处，两个消费方都走同一个入口。

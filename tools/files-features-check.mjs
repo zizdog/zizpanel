@@ -7,8 +7,9 @@
 // 覆盖：
 //   ① 去广告默认不保留 .bak（勾选框默认不勾；结果行说"未保留"；磁盘无 .bak），
 //      勾选后 .bak 必须在且结果行写出备份文件名；
-//   ② 排序控件（名字/类型/时间/大小 + 升降序）：点"时间"降序后断言 **DOM 行顺序**
-//      确实变了（不是只看下拉文字），且刷新后仍保持（localStorage）；
+//   ② 排序只走表头点击（工具栏不得有「排序 ▾」）：「类型」列表头存在且可点、列位置在
+//      大小之后修改时间之前、单元格=目录/小写扩展名/—；点「类型」表头后断言 **DOM 行
+//      顺序**确实变了（不是只看箭头），同列再点切降序；刷新后仍保持（localStorage）；
 //   ③ 文件操作进度显示速度：注入一个慢速假 file_copy 任务（拦截 /tasks 列表），
 //      断言文件管理就地进度条与任务中心进度行都出现 "MB/s"。
 //   另：390 / 360 宽度横向溢出必须为 0，pageerror 必须为 0。
@@ -161,62 +162,89 @@ async function enterDir(name) {
 }
 
 const rowNames = () => page.$$eval('table.table tbody tr', (rows) => rows.map((r) => {
-  const a = r.querySelectorAll('td')[1] && r.querySelectorAll('td')[1].querySelector('a');
+  const tds = r.querySelectorAll('td');
+  const a = tds[1] && tds[1].querySelector('a');
   return a ? a.textContent.trim() : '';
 }));
 
-async function clickSortMenu(item) {
-  await page.click('button:has-text("排序 ▾")');
-  await page.waitForTimeout(250);
-  await page.click(`.zp-ctx-item:has-text("${item}")`);
+// 「类型」列（大小后面、修改时间前面 = td[3]）。
+const typeCells = () => page.$$eval('table.table tbody tr', (rows) => rows.map((r) => {
+  const tds = r.querySelectorAll('td');
+  return tds[3] ? tds[3].textContent.trim() : '';
+}));
+
+// 排序入口只有表头：点同一个表头两次 = 反向。
+async function headerClick(label) {
+  await page.click(`table.table thead th button:has-text("${label}")`);
   await page.waitForTimeout(600);
 }
 
-function eqList(got, want, what) {
-  const g = JSON.stringify(got);
-  const w = JSON.stringify(want);
-  if (g !== w) return { ok: false, extra: what + '：得到 ' + g + '，期望 ' + w };
-  return { ok: true, extra: g };
-}
-
 await login();
-console.log('\n=== ② 排序（名字/类型/时间/大小 + 升降序）===');
+console.log('\n=== ② 排序（只走表头点击：名称 / 大小 / 类型 / 修改时间）===');
 await openFiles();
 await selectRoot();
 await enterDir('e2e');
 await enterDir('sortdir');
 
+check('工具栏里没有「排序 ▾」按钮', await page.locator('button:has-text("排序 ▾")').count() === 0);
+const typeHead = page.locator('table.table thead th button:has-text("类型")');
+check('「类型」列表头存在且可点', (await typeHead.count()) === 1 && (await typeHead.first().isEnabled()));
+
+// 表头从左到右：名称 / 大小 / 类型 / 权限 / 属主 / 修改时间 / 操作（「类型」在大小之后）。
+const headLabels = await page.$$eval('table.table thead th', (ths) => ths.map((t) => t.textContent.trim()));
+const idxSize = headLabels.findIndex((t) => t.startsWith('大小'));
+const idxType = headLabels.findIndex((t) => t.startsWith('类型'));
+const idxTime = headLabels.findIndex((t) => t.startsWith('修改时间'));
+check('「类型」列位置在大小之后、修改时间之前',
+  idxSize >= 0 && idxType === idxSize + 1 && idxTime > idxType, JSON.stringify(headLabels));
+
 const base = await rowNames();
 check('默认名字升序（目录永远在前）',
   JSON.stringify(base) === JSON.stringify(['zdir_a', 'zdir_b', 'alpha.txt', 'beta.mkv', 'gamma.zip', 'noext']),
   JSON.stringify(base));
+check('「类型」列内容：目录=目录 / 小写扩展名 / 无扩展名=—',
+  JSON.stringify(await typeCells()) === JSON.stringify(['目录', '目录', 'txt', 'mkv', 'zip', '—']),
+  JSON.stringify(await typeCells()));
 
-// 类型升序：目录在前（无扩展名垫底），其后 .mkv → .txt → .zip → 无扩展名
-await clickSortMenu('类型');
-const byType = await rowNames();
-check('类型升序（扩展名序，无扩展名垫底）',
-  JSON.stringify(byType) === JSON.stringify(['zdir_a', 'zdir_b', 'beta.mkv', 'alpha.txt', 'gamma.zip', 'noext']),
-  JSON.stringify(byType));
+// 点「类型」表头 ⇒ 类型升序（扩展名序，无扩展名垫底），DOM 行顺序必须真的变化。
+await headerClick('类型');
+const typeAsc = await rowNames();
+check('点「类型」表头后 DOM 行顺序确实变化',
+  JSON.stringify(typeAsc) === JSON.stringify(['zdir_a', 'zdir_b', 'beta.mkv', 'alpha.txt', 'gamma.zip', 'noext'])
+  && JSON.stringify(typeAsc) !== JSON.stringify(base), JSON.stringify(typeAsc));
+// 再点一次同列 ⇒ 类型降序（扩展名反向，无扩展名仍垫底）。
+await headerClick('类型');
+const typeDesc = await rowNames();
+check('再点「类型」表头 ⇒ 降序（无扩展名仍垫底）',
+  JSON.stringify(typeDesc) === JSON.stringify(['zdir_a', 'zdir_b', 'gamma.zip', 'alpha.txt', 'beta.mkv', 'noext']),
+  JSON.stringify(typeDesc));
 
-// 时间降序（用户点名要断言 DOM 顺序真的变了）
-await clickSortMenu('时间');
-await clickSortMenu('改为降序');
-const byTimeDesc = await rowNames();
-check('时间降序：DOM 行顺序确实变了（新→旧，目录仍在前）',
-  JSON.stringify(byTimeDesc) === JSON.stringify(['zdir_a', 'zdir_b', 'beta.mkv', 'gamma.zip', 'noext', 'alpha.txt']),
-  JSON.stringify(byTimeDesc));
-check('时间降序与默认名字升序不同', JSON.stringify(byTimeDesc) !== JSON.stringify(base));
+// 修改时间：第一次升序、再点降序。
+await headerClick('修改时间');
+const timeAsc = await rowNames();
+check('点「修改时间」表头 ⇒ 时间升序（旧→新，目录在前）',
+  JSON.stringify(timeAsc) === JSON.stringify(['zdir_b', 'zdir_a', 'alpha.txt', 'noext', 'gamma.zip', 'beta.mkv']),
+  JSON.stringify(timeAsc));
+await headerClick('修改时间');
+const timeDesc = await rowNames();
+check('再点「修改时间」⇒ 时间降序（新→旧）',
+  JSON.stringify(timeDesc) === JSON.stringify(['zdir_a', 'zdir_b', 'beta.mkv', 'gamma.zip', 'noext', 'alpha.txt']),
+  JSON.stringify(timeDesc));
 
-// 大小降序：alpha 292 > gamma 192 > beta 97 > noext 22
-await clickSortMenu('大小');
-await clickSortMenu('改为降序');
-const bySizeDesc = await rowNames();
-check('大小降序（大→小）',
-  JSON.stringify(bySizeDesc) === JSON.stringify(['zdir_a', 'zdir_b', 'alpha.txt', 'gamma.zip', 'beta.mkv', 'noext']),
-  JSON.stringify(bySizeDesc));
+// 大小：第一次升序、再点降序。
+await headerClick('大小');
+const sizeAsc = await rowNames();
+check('点「大小」表头 ⇒ 大小升序（小→大）',
+  JSON.stringify(sizeAsc) === JSON.stringify(['zdir_a', 'zdir_b', 'noext', 'beta.mkv', 'gamma.zip', 'alpha.txt']),
+  JSON.stringify(sizeAsc));
+await headerClick('大小');
+const sizeDesc = await rowNames();
+check('再点「大小」表头 ⇒ 大小降序（大→小）',
+  JSON.stringify(sizeDesc) === JSON.stringify(['zdir_a', 'zdir_b', 'alpha.txt', 'gamma.zip', 'beta.mkv', 'noext']),
+  JSON.stringify(sizeDesc));
 
 const stored = await page.evaluate(() => localStorage.getItem('zp-files-sort'));
-check('选择持久化到 localStorage', stored === 'size:-1', 'zp-files-sort=' + stored);
+check('表头选择持久化到 localStorage', stored === 'size:-1', 'zp-files-sort=' + stored);
 
 // 刷新后保持：重新载入页面再进目录，顺序仍是上次选的降序
 await page.reload({ waitUntil: 'domcontentloaded' });
@@ -227,7 +255,7 @@ await enterDir('e2e');
 await enterDir('sortdir');
 const afterReload = await rowNames();
 check('刷新后仍保持所选排序（localStorage 生效）',
-  JSON.stringify(afterReload) === JSON.stringify(bySizeDesc), JSON.stringify(afterReload));
+  JSON.stringify(afterReload) === JSON.stringify(sizeDesc), JSON.stringify(afterReload));
 
 console.log('\n=== ① 去广告默认不保留 .bak ===');
 // 回到 e2e 再进 task1
@@ -300,8 +328,7 @@ console.log('\n=== 布局：390 / 360 横向溢出 + pageerror ===');
 for (const w of [390, 360]) {
   await page.setViewportSize({ width: w, height: 844 });
   await page.waitForTimeout(500);
-  // 打开排序菜单也算一次布局检查（控件在窄屏最容易顶开行）
-  await page.click('button:has-text("排序 ▾")').catch(() => {});
+  // 新增「类型」列后窄屏更容易顶宽：检查列表页本身（含表头）就够。
   await page.waitForTimeout(300);
   const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   check(`文件管理 ${w}px 横向溢出 0`, over <= 2, 'over=' + over);

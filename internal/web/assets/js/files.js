@@ -17,7 +17,7 @@ import { oversizeAdvice } from './uploadlimit.js';
 import { createUploadQueue, UPLOAD_STATUS } from './uploadqueue.js';
 // 列表排序的**唯一**比较实现：纯函数放在单独模块，node 门禁能直接断言它
 // （见 tools/check-files-pure.mjs）；这里只负责把结果与用户选择接上去。
-import { sortEntries, normalizeSortKey, normalizeSortDir } from './sortfiles.js';
+import { sortEntries, normalizeSortKey, normalizeSortDir, extOf } from './sortfiles.js';
 // 「改上限」小窗复用设置页同一份实现（panellimit.js）：同一处校验、同一处回读，
 // 绝不在这里再写一套保存逻辑。
 import { openPanelLimitEditor } from './panellimit.js';
@@ -1116,21 +1116,18 @@ export function FilesView(content, ctx = {}) {
   const VIDEO_CANDIDATE_EXT = /\.(mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|ts|m2ts|mts|3gp|rmvb|rm|vob|ogv|asf|f4v)$/i;
   // 排序状态：默认名字升序（= 旧行为）；用户的选择记 localStorage，刷新后保持。
   // 目录永远排在文件前面这条由 sortfiles.js 的 compareEntries 保证（唯一的比较器）。
+  // 排序入口只有**表头点击**这一种（用户点名：不要工具栏的排序菜单）。
   const sortPref0 = readSortPref();
   let sortKey = sortPref0.key; // name | type | time | size
   let sortDir = sortPref0.dir; // 1 升序 / -1 降序
 
-  const SORT_LABEL = { name: '名字', type: '类型', time: '时间', size: '大小' };
-
   function persistSort() { writeLS(SORT_PREF_KEY, sortKey + ':' + sortDir); }
 
-  // setSort 是排序状态的**唯一**写入口（表头与工具栏菜单都走它）：
-  // 写偏好 → 重画工具栏（菜单里的 ✓ 要跟着变）→ 重画表格。
+  // setSort 是排序状态的**唯一**写入口（表头点击走它）：写偏好 → 重画表格。
   function setSort(key, dir) {
     sortKey = normalizeSortKey(key);
     sortDir = normalizeSortDir(dir);
     persistSort();
-    renderToolbar();
     renderTable();
   }
 
@@ -1158,7 +1155,7 @@ export function FilesView(content, ctx = {}) {
     return sortEntries(list, sortKey, sortDir);
   }
 
-  // sortHeader 是表头那颗排序按钮（与工具栏「排序 ▾」共享同一份状态）。
+  // sortHeader 是表头那颗排序按钮（唯一的排序入口：点同列切升/降序）。
   function sortHeader(key, text) {
     const on = sortKey === key;
     return h('th', [
@@ -1169,6 +1166,14 @@ export function FilesView(content, ctx = {}) {
         onclick: () => setSort(key, on ? -sortDir : 1),
       }),
     ]);
+  }
+
+  // typeLabel 是「类型」列的单元格文本：目录=「目录」，文件=小写扩展名（不带点），
+  // 无扩展名=「—」（排序时它永远垫底，见 sortfiles.js）。
+  function typeLabel(e) {
+    if (e.is_dir) return '目录';
+    const ext = extOf(e.name);
+    return ext ? ext.slice(1) : '—';
   }
 
   // openAny 是按文件类型选动作的唯一入口：图片 → 预览，音视频 → 播放器，其余 → 文本编辑器。
@@ -1365,26 +1370,6 @@ export function FilesView(content, ctx = {}) {
     ];
   }
 
-  // 排序菜单：四个键 + 升/降序切换，与「魔法箱 ▾」同一个下拉渲染器。
-  // 菜单里用 ✓ 标出当前键，用箭头标出方向；选择记 localStorage（见 setSort）。
-  function sortMenuItems() {
-    const items = [{ label: '当前：' + SORT_LABEL[sortKey] + (sortDir > 0 ? ' ↑ 升序' : ' ↓ 降序'), disabled: true, title: '目录永远排在文件前面' }];
-    for (const key of ['name', 'type', 'time', 'size']) {
-      items.push({
-        label: (sortKey === key ? '✓ ' : '　') + SORT_LABEL[key],
-        title: '按' + SORT_LABEL[key] + '排序',
-        run: () => setSort(key, 1),
-      });
-    }
-    items.push({ sep: true });
-    items.push({
-      label: sortDir > 0 ? '改为降序 ↓' : '改为升序 ↑',
-      title: '只切换方向，按键不变',
-      run: () => setSort(sortKey, -sortDir),
-    });
-    return items;
-  }
-
   function renderToolbar() {
     clear(toolbar);
     const selCount = selection.size;
@@ -1430,13 +1415,6 @@ export function FilesView(content, ctx = {}) {
         h('span', { text: '显示隐藏' }),
       ]),
       h('div', { style: { flex: 1 } }),
-      // 排序控件：名字 / 类型 / 时间 / 大小 + 升序/降序（选择记 localStorage）。
-      // 与「魔法箱 ▾」同一个下拉渲染器；目录永远在前那条规则不随方向变。
-      h('button.btn.btn-sm', {
-        text: '排序 ▾',
-        title: '按名字 / 类型 / 时间 / 大小排序，可切换升序降序；目录永远排在文件前面',
-        onclick: (ev) => toggleDropdown(ev.currentTarget, sortMenuItems()),
-      }),
       // 选中相关控件**始终占位**（空选时隐藏/禁用）：一旦让工具栏因选中而换行，
       // 列表整体下移，双击的第二下会落到别的行上（1280 宽实测打开了错误的文件）。
       h('span.pill.brand', {
@@ -1718,6 +1696,7 @@ export function FilesView(content, ctx = {}) {
       h('th', { style: { width: '34px' } }, [headCheckbox]),
       sortHeader('name', '名称'),
       sortHeader('size', '大小'),
+      sortHeader('type', '类型'),
       h('th', { text: '权限' }),
       h('th', { text: '属主' }),
       sortHeader('time', '修改时间'),
@@ -1755,6 +1734,7 @@ export function FilesView(content, ctx = {}) {
         ]),
         h('td', [nameCell(e)]),
         sizeCell(e),
+        h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: typeLabel(e) }),
         h('td.mono', { style: { fontSize: '11.5px' }, text: String(e.mode_num.toString(8)).padStart(3, '0') }),
         h('td', { style: { fontSize: '11.5px' }, text: e.owner || '—' }),
         h('td', { style: { fontSize: '11.5px', color: 'var(--text-mute)' }, text: e.mod_time }),
