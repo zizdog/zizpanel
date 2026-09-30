@@ -15,6 +15,9 @@ import { registerCleanup, gotoSMBDisks } from './app.js';
 import { oversizeAdvice } from './uploadlimit.js';
 // 上传队列的**唯一**数据结构（入队/逐文件进度/总计）。本文件只负责把它画出来。
 import { createUploadQueue, UPLOAD_STATUS } from './uploadqueue.js';
+// 列表排序的**唯一**比较实现：纯函数放在单独模块，node 门禁能直接断言它
+// （见 tools/check-files-pure.mjs）；这里只负责把结果与用户选择接上去。
+import { sortEntries, normalizeSortKey, normalizeSortDir } from './sortfiles.js';
 // 「改上限」小窗复用设置页同一份实现（panellimit.js）：同一处校验、同一处回读，
 // 绝不在这里再写一套保存逻辑。
 import { openPanelLimitEditor } from './panellimit.js';
@@ -30,6 +33,15 @@ import { openPanelLimitEditor } from './panellimit.js';
 
 // 显示隐藏文件的状态记在 localStorage（刷新/切换板块后保持）。默认关闭。
 const SHOW_HIDDEN_KEY = 'zp-files-show-hidden';
+
+// 列表排序偏好也记 localStorage（"name:1" = 名字升序；刷新后保持）。
+const SORT_PREF_KEY = 'zp-files-sort';
+
+// readSortPref 把存的偏好收敛成合法值（坏了就回落名字升序，绝不报错）。
+function readSortPref() {
+  const parts = String(readLS(SORT_PREF_KEY) || '').split(':');
+  return { key: normalizeSortKey(parts[0]), dir: normalizeSortDir(Number(parts[1])) };
+}
 
 let cwd = '';
 let showHidden = readLS(SHOW_HIDDEN_KEY) === '1';
@@ -811,7 +823,10 @@ export function FilesView(content, ctx = {}) {
     const pct = taskCenter.progressPercent(p);
     opFill.style.width = pct == null ? '100%' : pct + '%';
     opFill.style.opacity = pct == null ? '.35' : '1';
-    opMsg.textContent = (p && p.message) || meta.title || '正在处理…';
+    // 速度/ETA 走任务中心同一份采样（progressRateText）：跨盘/网络盘复制时
+    // 用户最需要"还要多久"。数据不够时它返回"计算中…"，不编数字。
+    const rate = taskCenter.progressRateText(opTaskId, p);
+    opMsg.textContent = ((p && p.message) || meta.title || '正在处理…') + (rate ? ' · ' + rate : '');
     opBar.style.display = '';
   }
 
@@ -869,7 +884,7 @@ export function FilesView(content, ctx = {}) {
   }
 
   // showCleanResult 是「🧹 去广告（无损）」的结果明细：三态逐条 + 省下的体积 +
-  // "这一趟去掉了什么"，失败原因原样显示（后端给什么就显示什么）。
+  // "这一趟去掉了什么" + 备份文件名（只有保留备份的条目才有），失败原因原样显示。
   function showCleanResult(r, canceled) {
     const items = r.items || [];
     const stateOf = (it) => (it.error ? '失败' : (it.skipped ? '跳过' : '成功'));
@@ -878,15 +893,19 @@ export function FilesView(content, ctx = {}) {
       const n = Number(it.saved_bytes || 0);
       return n > 0 ? '省 ' + humanSize(n) : '没有变小';
     };
+    // 不备份时绝不显示"已备份"：只有后端回报了 backup 名才写出来。
+    const backupText = (it) => (it.error || it.skipped ? '—' : (it.backup || '未保留'));
     const rows = items.map((it) => h('tr', [
       h('td.zp-plan-name', { text: it.name || it.from || '' }),
       h('td', { text: stateOf(it) }),
       h('td', { text: savedText(it) }),
+      h('td', { text: backupText(it) }),
       h('td', {
         text: it.error || it.skipped_reason || it.note || '',
         style: { color: it.error ? 'var(--danger)' : (it.skipped ? 'var(--warn)' : 'var(--text-mute)') },
       }),
     ]));
+    const keepBackup = !!r.keep_backup;
     modal({
       title: '🧹 去广告（无损）结果',
       wide: true,
@@ -894,11 +913,15 @@ export function FilesView(content, ctx = {}) {
         h('p', { text: (canceled ? '已中断：' : '') + (r.msg || '') }),
         items.length
           ? h('div.zp-plan-scroll', [h('table.table', { style: { fontSize: '12px' } }, [
-            h('thead', [h('tr', ['文件', '状态', '体积', '原因'].map((t) => h('th', { text: t })))]),
+            h('thead', [h('tr', ['文件', '状态', '体积', '备份', '原因'].map((t) => h('th', { text: t })))]),
             h('tbody', rows),
           ])])
           : h('div.hint', { text: '没有可显示的条目' }),
-        h('div.hint', { text: '原文件保留为 .bak；失败/取消时临时文件已删除，源文件未改动。' }),
+        h('div.hint', {
+          text: keepBackup
+            ? '原文件已保留为 .bak（上表「备份」列）；失败/取消时临时文件已删除，源文件未改动。'
+            : '原文件已直接替换（未保留备份）；失败/取消时临时文件已删除，源文件未改动。',
+        }),
       ]),
     });
   }
@@ -1091,8 +1114,25 @@ export function FilesView(content, ctx = {}) {
   // 视频压缩的**候选**扩展名：与后端 internal/videoopt 的 videoExts 同一口径
   // （门禁会比对两边有没有走样）。注意它比 VIDEO_EXT 宽 —— 后者只是"浏览器能播的"。
   const VIDEO_CANDIDATE_EXT = /\.(mp4|m4v|mov|mkv|avi|webm|flv|wmv|mpg|mpeg|ts|m2ts|mts|3gp|rmvb|rm|vob|ogv|asf|f4v)$/i;
-  let sortKey = 'name';   // name | size | time
-  let sortDir = 1;        // 1 升序 / -1 降序
+  // 排序状态：默认名字升序（= 旧行为）；用户的选择记 localStorage，刷新后保持。
+  // 目录永远排在文件前面这条由 sortfiles.js 的 compareEntries 保证（唯一的比较器）。
+  const sortPref0 = readSortPref();
+  let sortKey = sortPref0.key; // name | type | time | size
+  let sortDir = sortPref0.dir; // 1 升序 / -1 降序
+
+  const SORT_LABEL = { name: '名字', type: '类型', time: '时间', size: '大小' };
+
+  function persistSort() { writeLS(SORT_PREF_KEY, sortKey + ':' + sortDir); }
+
+  // setSort 是排序状态的**唯一**写入口（表头与工具栏菜单都走它）：
+  // 写偏好 → 重画工具栏（菜单里的 ✓ 要跟着变）→ 重画表格。
+  function setSort(key, dir) {
+    sortKey = normalizeSortKey(key);
+    sortDir = normalizeSortDir(dir);
+    persistSort();
+    renderToolbar();
+    renderTable();
+  }
 
   function isImage(entry) { return !entry.is_dir && IMAGE_EXT.test(entry.name || ''); }
 
@@ -1113,20 +1153,12 @@ export function FilesView(content, ctx = {}) {
     return mediaKind(entry) ? '播放' : '编辑';
   }
 
+  // sortedEntries 只做接线：比较逻辑全在 sortfiles.js 的纯函数里（门禁直接断言它）。
   function sortedEntries(list) {
-    const arr = list.slice();
-    arr.sort((a, b) => {
-      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1; // 目录永远排在文件前面
-      let r = 0;
-      if (sortKey === 'size') r = (a.size || 0) - (b.size || 0);
-      else if (sortKey === 'time') r = String(a.mod_time || '').localeCompare(String(b.mod_time || ''));
-      else r = String(a.name || '').localeCompare(String(b.name || ''), 'zh');
-      if (r === 0) r = String(a.name || '').localeCompare(String(b.name || ''), 'zh');
-      return r * sortDir;
-    });
-    return arr;
+    return sortEntries(list, sortKey, sortDir);
   }
 
+  // sortHeader 是表头那颗排序按钮（与工具栏「排序 ▾」共享同一份状态）。
   function sortHeader(key, text) {
     const on = sortKey === key;
     return h('th', [
@@ -1134,10 +1166,7 @@ export function FilesView(content, ctx = {}) {
         text: text + (on ? (sortDir > 0 ? ' ▲' : ' ▼') : ''),
         title: '按' + text + '排序（再点一次反向）',
         style: { padding: '2px 6px', fontSize: '12px' },
-        onclick: () => {
-          if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = 1; }
-          renderTable();
-        },
+        onclick: () => setSort(key, on ? -sortDir : 1),
       }),
     ]);
   }
@@ -1331,9 +1360,29 @@ export function FilesView(content, ctx = {}) {
     return [
       { label: '🖼️ 图片压缩', title: '把当前目录里的图片压小（默认另存为 xxx.min.<ext>，不动原文件）', run: imageCompressModal },
       { label: '🎬 视频压缩', title: '把当前目录里的视频压小（产物写进 output/；绝不越压越大）', run: videoCompressModal },
-      { label: '🧹 去广告（无损）', title: '去掉内嵌封面/广告图，清空 title/comment/description；不重编码，原文件保留为 .bak', run: mediaCleanModal },
+      { label: '🧹 去广告（无损）', title: '彻底清理：清空全局标签与轨道标题、删非字体附件与多余视频流；不重编码，默认直接替换原文件', run: mediaCleanModal },
       { label: '📦 打包压缩' + (selection.size ? `（${selection.size} 项）` : ''), title: '把选中的项打成 zip/tar 归档', disabled: selection.size === 0, run: compressSelected },
     ];
+  }
+
+  // 排序菜单：四个键 + 升/降序切换，与「魔法箱 ▾」同一个下拉渲染器。
+  // 菜单里用 ✓ 标出当前键，用箭头标出方向；选择记 localStorage（见 setSort）。
+  function sortMenuItems() {
+    const items = [{ label: '当前：' + SORT_LABEL[sortKey] + (sortDir > 0 ? ' ↑ 升序' : ' ↓ 降序'), disabled: true, title: '目录永远排在文件前面' }];
+    for (const key of ['name', 'type', 'time', 'size']) {
+      items.push({
+        label: (sortKey === key ? '✓ ' : '　') + SORT_LABEL[key],
+        title: '按' + SORT_LABEL[key] + '排序',
+        run: () => setSort(key, 1),
+      });
+    }
+    items.push({ sep: true });
+    items.push({
+      label: sortDir > 0 ? '改为降序 ↓' : '改为升序 ↑',
+      title: '只切换方向，按键不变',
+      run: () => setSort(sortKey, -sortDir),
+    });
+    return items;
   }
 
   function renderToolbar() {
@@ -1381,6 +1430,13 @@ export function FilesView(content, ctx = {}) {
         h('span', { text: '显示隐藏' }),
       ]),
       h('div', { style: { flex: 1 } }),
+      // 排序控件：名字 / 类型 / 时间 / 大小 + 升序/降序（选择记 localStorage）。
+      // 与「魔法箱 ▾」同一个下拉渲染器；目录永远在前那条规则不随方向变。
+      h('button.btn.btn-sm', {
+        text: '排序 ▾',
+        title: '按名字 / 类型 / 时间 / 大小排序，可切换升序降序；目录永远排在文件前面',
+        onclick: (ev) => toggleDropdown(ev.currentTarget, sortMenuItems()),
+      }),
       // 选中相关控件**始终占位**（空选时隐藏/禁用）：一旦让工具栏因选中而换行，
       // 列表整体下移，双击的第二下会落到别的行上（1280 宽实测打开了错误的文件）。
       h('span.pill.brand', {
@@ -2693,8 +2749,9 @@ export function FilesView(content, ctx = {}) {
   // mediaCleanModal 是「🧹 去广告（无损）」入口：没选中先说明；有选中就先只读统计
   // （后端按扩展名递归数，不跑 ffmpeg），再弹确认窗，最后走任务中心。
   //
-  // 确认窗必须写清四件事（用户点名）：不重编码 / 原文件留 .bak / 先写临时文件核对
-  // 时长才替换 / 本次处理 N 个（数字来自后端统计，前端不猜、不谎报）。
+  // 确认窗必须写清五件事（用户点名）：不重编码 / 彻底清理哪些东西 /
+  // 默认不保留 .bak（勾选才留）/ 先写临时文件核对时长才替换 / 本次处理 N 个
+  // （数字来自后端统计，前端不猜、不谎报）。
   async function mediaCleanModal() {
     if (!selection.size) {
       modal({
@@ -2737,18 +2794,24 @@ export function FilesView(content, ctx = {}) {
       });
       return;
     }
+    // 默认不勾：用户报障 .bak 极难清理。勾了才有备份（可回滚）。
+    const keepBackup = h('input', { type: 'checkbox' });
     modal({
       title: '🧹 去广告（无损）',
       body: h('div', [
         h('p', { text: '将处理 ' + total + ' 个视频' + ignoredNote + '。' }),
-        h('div.hint', { text: '去掉内嵌封面/广告图（视频流封面 + MKV 图片附件）与 title/comment/description；字幕字体附件保留。' }),
+        h('div.hint', { text: '彻底清理：清空全部全局标签与各轨道标题，删掉非字体附件（保留字体）与多余视频流（保留第一条视频）；内嵌封面一并删掉。' }),
         h('ol', { style: { margin: '6px 0 0 18px', lineHeight: '1.9' } }, [
           h('li', { text: '不重编码：画质与音轨不变。' }),
-          h('li', { text: '原文件改名为 .bak 保留（已存在时加 -2/-3 序号）。' }),
-          h('li', { text: '先写临时文件，核对时长通过后才替换。' }),
+          h('li', { text: '默认直接替换原文件（不留备份）；勾选下方选项才保留 .bak。' }),
+          h('li', { text: '先写临时文件，核对时长通过（差 <1 秒）才替换。' }),
           h('li', { text: '本次会处理 ' + total + ' 个文件。' }),
         ]),
-        h('div.hint', { text: '失败或取消时临时文件会删掉，源文件不动。' }),
+        h('label', {
+          style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px', cursor: 'pointer' },
+          title: '默认不勾：查过时长的产物直接盖回原文件名。勾了才有回滚余地，但要自己清理 .bak。',
+        }, [keepBackup, h('span', { text: '保留原文件为 .bak（默认不勾；勾了才备份）' })]),
+        h('div.hint', { text: '彻底清理在未勾选备份时不可逆（但会先核对时长）；失败或取消时临时文件会删掉，源文件不动。' }),
       ]),
       footer: (close) => [
         h('button.btn', { text: '取消', onclick: close }),
@@ -2756,11 +2819,12 @@ export function FilesView(content, ctx = {}) {
           text: '开始处理',
           title: '在任务中心后台执行；关掉页面也在跑',
           onclick: () => {
+            const backup = !!keepBackup.checked;
             close();
             startFileOp({
               kind: 'file_media_clean',
               title: '去广告（无损）' + total + ' 个',
-              run: () => api.fileMediaClean(paths),
+              run: () => api.fileMediaClean(paths, backup),
             });
           },
         }),
@@ -4207,12 +4271,8 @@ function createEditorWindow(entry0, res0, opts = {}) {
   }
 
   function sortedKids(list) {
-    const arr = list.slice();
-    arr.sort((a, b) => {
-      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-      return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
-    });
-    return arr;
+    // 目录树同样走唯一的比较器（名字升序 + 目录在前），不再留第二份实现。
+    return sortEntries(list, 'name', 1);
   }
 
   function treeRow(e, depth) {

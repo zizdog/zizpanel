@@ -1,16 +1,15 @@
 package mediaclean
 
-// probe.go —— ffprobe 的只读查询（内嵌封面 / 图片附件 / 广告标签 / 时长）。
+// probe.go —— ffprobe 的只读查询（全局标签 / 轨道标题 / 附件 / 视频流 / 时长）。
 //
 // 为什么不复用 internal/videoopt 的 Runner：那个接口回答的是"这个视频能不能压、
 // 压到多少码率"（MediaInfo），拿不到 attached_pic、MKV 附件与容器标签；把这几件事
 // 塞进同一个接口只会让两边都变形。命令定位那一步仍然复用面板既有的
 // services.LocateCommand（见 web 层），所以"这台机器装没装 ffmpeg"只有一份判据。
 //
-// 封面有两种形态（都要清）：
-//   · MP4/MOV 的 attached_pic 视频流（disposition=attached_pic）；
-//   · **MKV 的图片附件**（attachment / codec_type=video 的 cover.jpg）——
-//     MKV 没有 attached_pic 概念，只查 attached_pic 会把内嵌封面整张漏掉。
+// 一次 ffprobe 拿全"彻底清理"需要的依据（见 inspect）：全局标签、每条流的
+// codec_type/attached_pic/title/filename/mimetype。判据只有一处（planClean），
+// 命令构造只有一处（CopyArgs），改判据不会漏掉 argv。
 
 import (
 	"bytes"
@@ -69,42 +68,94 @@ func (e *Engine) runProbe(ctx context.Context, args ...string) ([]byte, error) {
 	return out, nil
 }
 
-// attachedPics 返回 attached_pic（内嵌封面/广告图）的视频流号。
+// attachedPic / 附件 / 轨道标题 / 全局标签都由下面这一次 ffprobe 拿全。
 //
-// 命令按用户点名的那一条写死：csv 每行是 "index,attached_pic"。
-// 读不出来 ⇒ 返回错误（绝不当作"没有封面"，那会静默跳过该清的广告）。
-func (e *Engine) attachedPics(ctx context.Context, path string) ([]int, error) {
-	out, err := e.runProbe(ctx, "-v", "error", "-select_streams", "v",
-		"-show_entries", "stream=index:stream_disposition=attached_pic",
-		"-of", "csv=p=0", path)
+// 判据（用户点名"能去多少去多少"）：
+//   · attached_pic 视频流全删；
+//   · 非 attached_pic 的视频流只保留第一条，其余全删（内嵌推广视频属于这类）；
+//   · 附件只保留字体（mimetype 含 font，或扩展名 ttf/otf/woff/woff2/ttc），其余全删；
+//   · 任何非空的全局标签都要清（-map_metadata -1）；
+//   · 任何轨道标题都要清（-metadata:s:v/a/s title=）。
+//
+// 例外：muxer 自己生成的 ENCODER 标签不算"可清理项"（ffmpeg 每次都会重新写回，
+// 算进去的话任何文件第二次跑都不会命中"本来就是干净的"，跳过分支等于死代码）。
+//
+// ⚠️ -map_metadata -1 连**轨道级**元数据一起丢：language 与 MKV 附件的 filename
+// 都会没掉（matroska 缺 filename 直接 mux 失败），所以 inspect 必须把它们读出来，
+// 由 CopyArgs 逐项还原（章节/语言/字体附件一个都不能丢，见 planClean）。
+
+// StreamInfo 是一条流的只读结论。
+type StreamInfo struct {
+	Index       int
+	CodecType   string
+	AttachedPic bool
+	Title       string
+	Filename    string
+	Mimetype    string
+	// Language 是轨道语言（-map_metadata -1 会连它一起丢，必须显式还原）。
+	Language string
+}
+
+// MediaInfo 是一次 ffprobe 得到的全部判据依据。
+type MediaInfo struct {
+	// GlobalTags 是容器级非空标签名（小写、升序；encoder 已排除）。
+	GlobalTags []string
+	Streams    []StreamInfo
+}
+
+// inspect 跑一次 ffprobe 读出所有可清理项的判据。读不出来 ⇒ 返回错误。
+func (e *Engine) inspect(ctx context.Context, path string) (*MediaInfo, error) {
+	out, err := e.runProbe(ctx, "-v", "error",
+		"-show_entries",
+		"stream=index,codec_type:stream_tags=title,filename,mimetype,language:stream_disposition=attached_pic:format_tags",
+		"-of", "json", path)
 	if err != nil {
 		return nil, err
 	}
-	var idxs []int
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, ",")
-		if len(parts) < 2 {
-			continue
-		}
-		idx, ierr := strconv.Atoi(strings.TrimSpace(parts[0]))
-		if ierr != nil {
-			continue
-		}
-		if strings.TrimSpace(parts[len(parts)-1]) == "1" {
-			idxs = append(idxs, idx)
-		}
+	var doc struct {
+		Format struct {
+			Tags map[string]string `json:"tags"`
+		} `json:"format"`
+		Streams []struct {
+			Index       int    `json:"index"`
+			CodecType   string `json:"codec_type"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
+			Tags struct {
+				Title    string `json:"title"`
+				Filename string `json:"filename"`
+				Mimetype string `json:"mimetype"`
+				Language string `json:"language"`
+			} `json:"tags"`
+		} `json:"streams"`
 	}
-	sort.Ints(idxs)
-	return idxs, nil
-}
-
-// imageAttachmentExts 是会被当成内嵌封面/广告图的图片扩展名。
-var imageAttachmentExts = map[string]bool{
-	".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true, ".bmp": true,
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return nil, fmt.Errorf("ffprobe 输出不是合法 JSON: %w", err)
+	}
+	info := &MediaInfo{}
+	for k, v := range doc.Format.Tags {
+		name := strings.ToLower(strings.TrimSpace(k))
+		// ENCODER 是 muxer 自加的，不算可清理项（见文件头注释）。
+		if name == "" || name == "encoder" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		info.GlobalTags = append(info.GlobalTags, name)
+	}
+	sort.Strings(info.GlobalTags)
+	for _, s := range doc.Streams {
+		info.Streams = append(info.Streams, StreamInfo{
+			Index:       s.Index,
+			CodecType:   strings.ToLower(strings.TrimSpace(s.CodecType)),
+			AttachedPic: s.Disposition.AttachedPic == 1,
+			Title:       s.Tags.Title,
+			Filename:    s.Tags.Filename,
+			Mimetype:    s.Tags.Mimetype,
+			Language:    s.Tags.Language,
+		})
+	}
+	sort.Slice(info.Streams, func(i, j int) bool { return info.Streams[i].Index < info.Streams[j].Index })
+	return info, nil
 }
 
 // fontAttachmentExts 是字体附件：**必须保留**（丢了会毁掉 ASS 字幕的字体）。
@@ -112,97 +163,12 @@ var fontAttachmentExts = map[string]bool{
 	".ttf": true, ".otf": true, ".woff": true, ".woff2": true, ".ttc": true,
 }
 
-// coverBaseNames 是常见封面/广告图的文件名主干（小写、不含扩展名）。
-var coverBaseNames = map[string]bool{
-	"cover": true, "poster": true, "folder": true, "promo": true, "广告": true,
-}
-
-// attachmentStream 是 ffprobe 的一条流（附件查询只取用得到的字段）。
-type attachmentStream struct {
-	Index     int    `json:"index"`
-	CodecType string `json:"codec_type"`
-	Tags      struct {
-		Filename string `json:"filename"`
-		Mimetype string `json:"mimetype"`
-	} `json:"tags"`
-}
-
-// imageAttachments 返回 MKV 图片附件（内嵌封面/广告图）的流号。
-//
-// 判据（用户点名）：mimetype 以 image/ 开头，或文件名是 cover/poster/folder/promo/广告
-// 且扩展名是图片；attachment 流只要是图片扩展名也算。**字体附件一律排除**。
-func (e *Engine) imageAttachments(ctx context.Context, path string) ([]int, error) {
-	out, err := e.runProbe(ctx, "-v", "error",
-		"-show_entries", "stream=index,codec_type:stream_tags=filename,mimetype",
-		"-of", "json", path)
-	if err != nil {
-		return nil, err
-	}
-	var doc struct {
-		Streams []attachmentStream `json:"streams"`
-	}
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return nil, fmt.Errorf("ffprobe 附件输出不是合法 JSON: %w", err)
-	}
-	var idxs []int
-	for _, s := range doc.Streams {
-		if isImageAttachment(s.CodecType, s.Tags.Filename, s.Tags.Mimetype) {
-			idxs = append(idxs, s.Index)
-		}
-	}
-	sort.Ints(idxs)
-	return idxs, nil
-}
-
-// isImageAttachment 判断一条流是不是"该去掉的图片附件"（字体永远返回 false）。
-func isImageAttachment(codecType, filename, mimetype string) bool {
-	mt := strings.ToLower(strings.TrimSpace(mimetype))
-	fn := strings.ToLower(strings.TrimSpace(filename))
-	ext := filepath.Ext(fn)
-	if strings.Contains(mt, "font") || fontAttachmentExts[ext] {
-		return false
-	}
-	if strings.HasPrefix(mt, "image/") {
+// isFontAttachment 判断一条附件是不是字体（mimetype 含 font，或字体扩展名）。
+func isFontAttachment(mimetype, filename string) bool {
+	if strings.Contains(strings.ToLower(mimetype), "font") {
 		return true
 	}
-	if !imageAttachmentExts[ext] {
-		return false
-	}
-	// 有图片扩展名：attachment 流本身就是图片；有些容器 codec_type 给 video，
-	// 那种靠文件名主干（cover/poster/…）认。
-	if strings.EqualFold(strings.TrimSpace(codecType), "attachment") {
-		return true
-	}
-	return coverBaseNames[strings.TrimSuffix(fn, ext)]
-}
-
-// junkTags 返回容器里非空的 title/comment/description 标签名（升序，供日志说明）。
-func (e *Engine) junkTags(ctx context.Context, path string) ([]string, error) {
-	out, err := e.runProbe(ctx, "-v", "error",
-		"-show_entries", "format_tags=title,comment,description", "-of", "json", path)
-	if err != nil {
-		return nil, err
-	}
-	// 标签名大小写随容器（mp4 可能给 TITLE），所以按小写比较。
-	var doc struct {
-		Format struct {
-			Tags map[string]string `json:"tags"`
-		} `json:"format"`
-	}
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return nil, fmt.Errorf("ffprobe 标签输出不是合法 JSON: %w", err)
-	}
-	var hit []string
-	for k, v := range doc.Format.Tags {
-		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "title", "comment", "description":
-			if strings.TrimSpace(v) != "" {
-				hit = append(hit, strings.ToLower(strings.TrimSpace(k)))
-			}
-		}
-	}
-	sort.Strings(hit)
-	return hit, nil
+	return fontAttachmentExts[filepath.Ext(strings.ToLower(filename))]
 }
 
 // duration 读一个文件的时长（秒）。读不到 ⇒ 返回错误，调用方据此拒绝替换。

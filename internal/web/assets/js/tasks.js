@@ -14,6 +14,8 @@
 
 import { api } from './api.js';
 import { h, clear, appendAll, toast, modal, confirmBox, duration } from './ui.js';
+// 速度/ETA 的**唯一**纯函数：采样窗口算法放单独模块，node 门禁能直接断言它。
+import { createRateSampler, remainingBytes, rateEtaText } from './transfereta.js';
 
 // 客户端缓存的行数上限。服务端每任务最多 4000 行，这里留点余量；
 // 真正的"历史"在服务端，客户端这份只用于渲染。
@@ -64,6 +66,35 @@ const LEVEL_STYLE = {
 };
 
 const isRunning = (m) => !!m && (m.status || 'running') === 'running';
+
+// ---- 传输速度 / 预计剩余（文件操作与任务中心共用同一份采样）----
+//
+// 采样状态**只在这里**：按 task id 一个采样器。所有调用方（就地进度条、任务进度窗、
+// 任务列表行）都通过 progressRateText(id, progress) 取值，绝不各自维护一份 —— 否则
+// 同一条任务会显示两个互相打架的速度。数据不够时它返回"计算中…"（不瞎猜）。
+const rateSamplers = new Map();
+
+/**
+ * progressRateText 给某任务的 progress 追加一句"12.3 MB/s · 约剩 2 分 10 秒"。
+ * progress.done/total 是后端推来的字节数（tasks.Progress），前端只做滑动窗口采样。
+ * 返回空串表示"这一步没有可显示的速度信息"（调用方据此不追加）。
+ */
+function progressRateText(id, prog) {
+  if (!id || !prog) return '';
+  const done = Number(prog.done) || 0;
+  const total = Number(prog.total) || 0;
+  // 没有字节口径的进度（done/total 都是 0）不显示速度，免得对文件个数瞎算。
+  if (!(total > 0) && !(done > 0)) return '';
+  let meter = rateSamplers.get(id);
+  if (!meter) { meter = createRateSampler(); rateSamplers.set(id, meter); }
+  const bps = meter.note(done);
+  return rateEtaText(bps, remainingBytes(done, total));
+}
+
+/** dropRateSampler 在任务被列表清理时丢掉采样（防 Map 无限增长）。 */
+function dropRateSampler(id) {
+  if (id) rateSamplers.delete(id);
+}
 
 function statusLabel(s) { return STATUS_LABEL[s] || s || '未知'; }
 
@@ -282,6 +313,7 @@ function applyList(list) {
     STATE.oldest.delete(id);
     STATE.fallback.delete(id);
     STATE.inputs.delete(id);
+    dropRateSampler(id);
     closeStream(id);
   }
   // 页面加载 / 切回时，把仍在跑的任务的流接上（徽标与进度靠它保持实时）。
@@ -488,6 +520,17 @@ function openList() {
     },
   });
 
+  // rateLine 是任务列表行里的"速度 · 约剩"小行；没有可显示的信息就返回 null。
+  const rateLine = (t) => {
+    if (!isRunning(t) || !t.progress) return null;
+    const text = progressRateText(t.id, t.progress);
+    if (!text) return null;
+    return h('div.tc-rate', {
+      style: { fontSize: '11.5px', color: 'var(--brand)', marginTop: '2px' },
+      text: '⏱ ' + text,
+    });
+  };
+
   const row = (t) => h('div.tc-row', {
     style: {
       padding: '10px 12px', borderBottom: '1px solid var(--border-soft)', cursor: 'pointer',
@@ -510,6 +553,9 @@ function openList() {
         },
         text: t.last,
       }) : null,
+      // 运行中且有字节进度的任务：额外一行"速度 · 约剩"（同一份采样，见 progressRateText）。
+      // 数据不够时只显示"计算中…"，绝不编一个速度出来。
+      rateLine(t),
     ]),
     h('span', { class: statusPillCls(t.status), text: statusLabel(t.status) }),
     // 在等输入的任务要一眼能认出来：徽标只说"有几个在跑"，用户关掉进度窗后
@@ -559,6 +605,7 @@ function openList() {
   const update = () => {
     const sig = STATE.listErr + '#' + sortedMetas()
       .map((t) => [t.id, t.status, t.line_count, t.last, t.elapsed_ms,
+        t.progress ? t.progress.done + '/' + t.progress.total : '',
         STATE.inputs.has(t.id) ? 'in' : ''].join('|')).join(';');
     if (sig === signature) return;
     signature = sig;
@@ -958,11 +1005,13 @@ function openTask(id) {
     if (prog && (prog.message || prog.total > 0 || prog.files_total > 0)) {
       progressBox.style.display = '';
       clear(progressBox);
+      // 只在运行中追加"速度 · 约剩"：结束后的汇总行后面挂一句"计算中…"没有意义。
+      const rate = isRunning(meta) ? progressRateText(id, prog) : '';
       appendAll(progressBox, [
         progressNode(progressPercent(prog)),
         h('div', {
           style: { fontSize: '12px', color: 'var(--text-dim)', marginTop: '5px' },
-          text: prog.message || '',
+          text: (prog.message || '') + (rate ? ' · ' + rate : ''),
         }),
       ]);
     } else {
@@ -1330,9 +1379,11 @@ function retryTask(m) {
 
 export const taskCenter = {
   button, init, openList, openTask, start, findByTarget, onChange, setSubmitTimeoutMs,
-  // 下面三个给"就地显示进度"的页面用（文件管理器）：读某任务的 meta、
-  // 由结构化进度算百分比、画进度条节点。**不新开订阅通道** —— 仍走 onChange。
+  // 下面几个给"就地显示进度"的页面用（文件管理器）：读某任务的 meta、
+  // 由结构化进度算百分比、画进度条节点、算"速度 · 约剩"。
+  // **不新开订阅通道** —— 仍走 onChange。
   meta: (id) => STATE.metas.get(id) || null,
   progressPercent,
   progressNode,
+  progressRateText,
 };

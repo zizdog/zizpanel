@@ -158,6 +158,12 @@ check-real:
 	@if [ -d node_modules/acorn ]; then \
 	   node tools/check-js-undeclared.mjs internal/web/assets/js internal/web/assets/nav || exit 1; \
 	 else echo "（未安装 acorn，跳过：npm install）"; fi
+	@# acorn 两项只管"能不能解析/名字有没有定义"，不管逻辑对不对。排序方向、速度窗口
+	@# 这类错误在界面上全绿、用户看到的却是错的，所以用同一份纯函数源码跑真断言。
+	@echo "==> 前端纯函数门禁（列表排序 / 传输速度与 ETA）"
+	@if command -v node >/dev/null 2>&1; then \
+	   node tools/check-files-pure.mjs || exit 1; \
+	 else echo "（未安装 node，跳过：brew install node）"; fi
 	@echo "==> go vet"
 	@$(MAKE) --no-print-directory vet
 	@echo "==> 单元测试"

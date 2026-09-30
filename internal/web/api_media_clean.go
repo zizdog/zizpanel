@@ -25,6 +25,8 @@ import (
 // mediaCleanReq 是两个接口共用的请求体（选中项的绝对路径，文件与文件夹都支持）。
 type mediaCleanReq struct {
 	Paths []string `json:"paths"`
+	// KeepBackup 为 true 才把原文件改名 .bak 保留；默认直接替换（用户报障 .bak 难清理）。
+	KeepBackup bool `json:"keep_backup"`
 }
 
 // mediaCleanEngine 定位这台机器上的 ffmpeg/ffprobe（复用面板既有的 LocateCommand）。
@@ -124,10 +126,10 @@ func (s *Server) handleFileMediaClean(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusConflict, aerr.Error())
 		return
 	}
-	// 源在只读挂载上就当场拒绝：去广告要写临时文件、还要把源改名成 .bak（与移动同一条判据）。
+	// 源在只读挂载上就当场拒绝：去广告要写临时文件、还要把新文件改名回源路径（与移动同一条判据）。
 	for _, p := range resolved {
 		if onReadOnlyFSFn(p) {
-			fail(w, http.StatusForbidden, p+" 在只读挂载上，去广告需要写入与改名：到「磁盘管理」把这条盘改成读写并重新挂载，或先把文件复制到本地盘")
+			fail(w, http.StatusForbidden, p+" 在只读挂载上，去广告需要写入与替换：到「磁盘管理」把这条盘改成读写并重新挂载，或先把文件复制到本地盘")
 			return
 		}
 	}
@@ -149,6 +151,7 @@ func (s *Server) handleFileMediaClean(w http.ResponseWriter, r *http.Request) {
 					}
 					res, rerr := mediaclean.CleanBatch(c, col.Items, eng, mediaclean.Hooks{
 						OnProgress: onProgress,
+						KeepBackup: req.KeepBackup,
 						// 面板以 root 跑：新文件必须交还真实用户，否则用户改不动。
 						Chown: mgr.ChownRealUser,
 					})

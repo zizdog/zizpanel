@@ -83,6 +83,9 @@ type OpItem struct {
 	Bytes int64  `json:"bytes,omitempty"`
 	// SavedBytes 是「去广告（无损）」省下的字节（原大小 − 新大小，可为负 = 没变小）。
 	SavedBytes int64 `json:"saved_bytes,omitempty"`
+	// Backup 是「去广告（无损）」保留备份时的 .bak 基名（不保留时为空）。
+	// 结果行只在它非空时才说明"已备份"。
+	Backup string `json:"backup,omitempty"`
 	// Note 是成功项"去掉了什么"的一句话（去广告的结果行显示）。
 	Note  string `json:"note,omitempty"`
 	Error string `json:"error,omitempty"`
@@ -105,7 +108,9 @@ type BatchResult struct {
 	CrossVolume int   `json:"cross_volume,omitempty"`
 	Bytes       int64 `json:"bytes"`
 	// SavedBytes 是「去广告（无损）」整批省下的字节（负数如实表示没变小）。
-	SavedBytes int64    `json:"saved_bytes,omitempty"`
+	SavedBytes int64 `json:"saved_bytes,omitempty"`
+	// KeepBackup 表示这批「去广告（无损）」是否保留了 .bak（结果文案据此区分）。
+	KeepBackup bool     `json:"keep_backup,omitempty"`
 	Msg        string   `json:"msg"`
 	Items      []OpItem `json:"items"`
 }
