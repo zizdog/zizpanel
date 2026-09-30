@@ -44,6 +44,8 @@ export function DisksView(content, ctx = {}) {
     ]),
     // 网络磁盘（SMB）与 diskutil 那条线无关，是独立一节（见文件末尾）。
     smbSection(),
+    // 反向能力：把本机目录共享出去（见文件末尾 shareSection）。
+    shareSection(),
     listBox,
   );
 
@@ -901,6 +903,268 @@ function smbSection() {
       footer: (close) => [
         h('button.btn', { text: '取消', onclick: close }),
         h('button.btn.btn-primary', { text: isEdit ? '保存' : '新增', dataset: { testid: 'zp-smb-save' }, onclick: () => save(close) }),
+      ],
+    });
+  }
+
+  return card;
+}
+
+// ============================================================================
+//  文件共享（本机对外提供：SMB / NFS）
+//
+//  与上一节相反：这一节是把**本机目录**共享出去给别的设备挂。
+//  状态一律来自服务端回读；读不到就显示「未复核」，绝不猜已开启/已关闭。
+//  开关与增删都是系统写操作：接口只报服务端回读确认过的结论。
+// ============================================================================
+const SHARE_STATUS_TEXT = { running: '运行中', stopped: '已停止', unknown: '未复核' };
+const SHARE_WARN = '开启后局域网内设备可访问这些目录；隐私目录可能读不到；可在此关闭。';
+const SHARE_WARN_DETAIL = '开启后，同一局域网内的电脑/手机/电视可以挂载这些目录并读写；受 macOS「隐私与安全性」保护的目录（桌面/文稿/下载等）可能读不到。不需要时回到这里点两个开关即可关闭。';
+
+function shareStatusPill(status) {
+  const st = String(status || 'unknown');
+  const cls = st === 'running' ? '.ok' : (st === 'unknown' ? '.warn' : '');
+  return h(`span.pill${cls}`, { text: SHARE_STATUS_TEXT[st] || '未复核', dataset: { testid: 'zp-share-status' } });
+}
+
+function shareCopy(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast('已复制 ' + text, 'ok', 5000)).catch(() => toast(text, 'warn', 8000));
+    return;
+  }
+  toast(text, 'ok', 8000);
+}
+
+function shareSection() {
+  const body = h('div.card-body');
+  const card = h('div.card', { id: 'zp-share-section' }, [
+    h('div.card-head', [
+      h('h3', { text: '🖧 文件共享（本机对外提供）' }),
+      h('div.spacer'),
+      h('span.sub', { text: '把本机目录共享给别的设备挂' }),
+      h('button.btn.btn-sm', { text: '⟳ 刷新', dataset: { testid: 'zp-share-refresh' }, onclick: () => load(true) }),
+    ]),
+    body,
+  ]);
+  let data = { smb: { shares: [] }, nfs: { shares: [] } };
+  let first = true;
+  let busy = false;
+
+  load(false);
+
+  async function load(showToast) {
+    if (first) {
+      clear(body);
+      body.append(h('div.hint', { text: '正在读取共享状态…' }));
+    }
+    try {
+      data = (await api.get(apiURL('system/sharing'))) || data;
+    } catch (e) {
+      first = false;
+      clear(body);
+      body.append(h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('span.pill.danger', { text: '读取失败' }),
+        h('span.sub', { text: (e && e.message) || String(e) }),
+      ]));
+      return;
+    }
+    first = false;
+    render();
+    if (showToast) toast('已刷新共享状态', 'ok');
+  }
+
+  async function act(kind, enable) {
+    if (busy) return;
+    busy = true;
+    try {
+      await api.post(apiURL(`system/sharing/${kind}/${enable ? 'enable' : 'disable'}`), {});
+      toast((kind === 'smb' ? 'SMB' : 'NFS') + (enable ? ' 已开启' : ' 已关闭'), 'ok');
+    } catch (e) {
+      // 失败原因（多为"退出码 0 但回读对不上"）原样显示，绝不吞掉。
+      failureToast(e, 20000);
+    }
+    busy = false;
+    load(false);
+  }
+
+  function serviceCard(kind, title, svc) {
+    const status = String((svc && svc.status) || 'unknown');
+    const running = status === 'running';
+    const toggle = h(`button.zp-switch${running ? '.on' : ''}`, {
+      type: 'button',
+      dataset: { testid: `zp-share-${kind}-toggle` },
+      title: running ? '点一下关闭' : '点一下开启',
+      onclick: () => act(kind, !running),
+    }, [h('span.zp-switch-knob')]);
+    const warnLine = (txt) => h('div', { style: { marginTop: '4px', color: 'var(--warn)', fontSize: '12px', wordBreak: 'break-word' }, text: txt });
+    return h('div', {
+      dataset: { testid: `zp-share-${kind}-row` },
+      style: { marginTop: '8px', padding: '10px', border: '1px solid var(--border-soft)', borderRadius: '8px', minWidth: '0' },
+    }, [
+      h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('strong', { text: title }),
+        toggle,
+        shareStatusPill(status),
+        status === 'unknown' ? h('span.sub', { text: '读不到真实状态，不猜' }) : null,
+      ]),
+      (svc && svc.state && svc.state.error) ? warnLine(svc.state.error) : null,
+      (svc && svc.shares_error) ? warnLine('列表未复核：' + svc.shares_error) : null,
+    ]);
+  }
+
+  function shareRow(kind, s) {
+    const url = s.url || '';
+    // 系统里原有、不是面板写的 NFS 导出行：只读显示，删不了（面板不替用户删别人的行）。
+    const unmanaged = kind === 'nfs' && s.managed === false;
+    return h('div', {
+      dataset: { testid: 'zp-share-row', name: s.name },
+      style: { marginTop: '10px', padding: '10px', border: '1px solid var(--border-soft)', borderRadius: '8px', minWidth: '0' },
+    }, [
+      h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('span.pill', { text: kind === 'smb' ? 'SMB' : 'NFS' }),
+        h('strong', { text: s.name }),
+        s.read_only ? h('span.pill', { text: '只读' }) : null,
+        unmanaged ? h('span.pill.warn', { text: '系统原有', title: '这一行不是面板写的，只读显示，面板不删它' }) : null,
+        shareStatusPill(s.status),
+      ]),
+      h('div', { style: { marginTop: '4px', fontSize: '12.5px', color: 'var(--text-mute)', wordBreak: 'break-all' }, text: '路径：' + (s.path || '') }),
+      h('div', { style: { marginTop: '6px', display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, [
+        h('span.mono', { dataset: { testid: 'zp-share-url' }, style: { fontSize: '12px', wordBreak: 'break-all' }, text: url || '（地址未知：读不到本机 IP）' }),
+        url ? h('button.btn.btn-sm', { text: '复制', dataset: { testid: 'zp-share-copy' }, onclick: () => shareCopy(url) }) : null,
+        unmanaged ? null : h('button.btn.btn-sm.btn-danger', { text: '删除', dataset: { testid: 'zp-share-remove' }, onclick: () => removeShare(kind, s) }),
+      ]),
+    ]);
+  }
+
+  function render() {
+    clear(body);
+    const smb = data.smb || {};
+    const nfs = data.nfs || {};
+    appendAll(body,
+      h('div.hint', { text: '把本机目录共享给别的设备；状态来自真实回读，读不到就写「未复核」。' }),
+      h('div', {
+        dataset: { testid: 'zp-share-warning' },
+        style: { marginTop: '6px', fontSize: '12px', color: 'var(--warn)' },
+        title: SHARE_WARN_DETAIL,
+        text: SHARE_WARN,
+      }),
+      serviceCard('smb', 'SMB 共享', smb),
+      serviceCard('nfs', 'NFS 导出', nfs),
+      data.root_error ? h('div', {
+        style: { marginTop: '6px', color: 'var(--warn)', fontSize: '12px' },
+        dataset: { testid: 'zp-share-root-error' }, text: data.root_error,
+      }) : null,
+      h('div', { style: { marginTop: '12px', display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
+        h('button.btn.btn-sm.btn-primary', { text: '＋ 添加共享', dataset: { testid: 'zp-share-add' }, onclick: openForm }),
+      ]),
+    );
+
+    // 访问组（SMB）：只读显示，面板不自动改组成员。
+    const acc = data.access || {};
+    let groupText;
+    if (!acc.verified) {
+      groupText = '访问组未复核：' + (acc.error || '读不到成员信息');
+    } else if (!acc.exists) {
+      groupText = '这台机器上还没有 ' + (acc.group || 'com.apple.access_smb') + ' 组；要让某个用户能连 SMB，需要把它加入该组（面板不自动改）。';
+    } else {
+      const members = (acc.members && acc.members.length) ? acc.members.join('、') : '（成员列不出来）';
+      const me = acc.user_member_known ? (acc.user_member ? '；当前用户已在组里' : '；当前用户不在组里，需要加进去才能访问') : '';
+      groupText = '访问组 ' + (acc.group || '') + '：' + members + me;
+    }
+    body.append(h('div.hint', { dataset: { testid: 'zp-share-access' }, style: { marginTop: '8px' }, text: groupText }));
+
+    const all = [];
+    for (const s of (smb.shares || [])) all.push(['smb', s]);
+    for (const s of (nfs.shares || [])) all.push(['nfs', s]);
+    if (!all.length) {
+      body.append(h('div.hint', { style: { marginTop: '10px' }, text: '还没有共享。点「＋ 添加共享」选一个目录、起个名字即可。' }));
+    }
+    for (const [kind, s] of all) body.append(shareRow(kind, s));
+  }
+
+  async function removeShare(kind, s) {
+    const what = kind === 'smb' ? '共享' : '导出';
+    const okDel = await confirmBox(
+      '删除' + what + '「' + s.name + '」？只删' + what + '设置，目录里的文件一个都不动。',
+      { title: '删除' + what, danger: true, okText: '删除' });
+    if (!okDel) return;
+    try {
+      await api.del(apiURL('system/sharing/shares'), { kind, name: s.name });
+      toast('已删除 ' + s.name, 'ok');
+    } catch (e) {
+      failureToast(e, 20000);
+    }
+    load(false);
+  }
+
+  // openForm 是添加共享的唯一入口。路径可以从「可访问目录」里选，也可以手填。
+  function openForm() {
+    const kindI = h('select.input', { dataset: { testid: 'zp-share-kind' } }, [
+      h('option', { value: 'smb', text: 'SMB 共享（Windows / macOS 都能连）' }),
+      h('option', { value: 'nfs', text: 'NFS 导出（Linux / macOS）' }),
+    ]);
+    const rootSel = h('select.select', { dataset: { testid: 'zp-share-root' } }, [
+      h('option', { value: '', text: '从可访问目录里选…' }),
+    ]);
+    const pathI = h('input.input', { type: 'text', placeholder: '/Users/…（目录必须已存在）', dataset: { testid: 'zp-share-path' } });
+    const nameI = h('input.input', { type: 'text', placeholder: '例如 media（中英文/数字/-_.，≤40）', maxlength: 40, dataset: { testid: 'zp-share-name' } });
+    const roI = h('input', { type: 'checkbox', checked: true, dataset: { testid: 'zp-share-readonly' } });
+    const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' }, dataset: { testid: 'zp-share-form-error' } });
+    const setErr = (m) => { err.textContent = m || ''; err.style.display = m ? '' : 'none'; };
+
+    const pathLabel = h('label', { text: '目录路径' });
+    const nameField = h('div.field', { dataset: { testid: 'zp-share-field-name' } }, [h('label', { text: '共享名（别的设备看到的名字）' }), nameI]);
+    const syncKind = () => {
+      const nfs = kindI.value === 'nfs';
+      nameField.style.display = nfs ? 'none' : '';
+      pathLabel.textContent = nfs ? '导出路径（以 / 开头，不能有空格/引号）' : '目录路径';
+      pathI.placeholder = nfs ? '/Users/…（以 / 开头，不能有空格）' : '/Users/…（目录必须已存在）';
+    };
+    kindI.addEventListener('change', syncKind);
+    syncKind();
+
+    // 白名单目录：没有专门的接口，文件管理列表里带 roots / root_labels。
+    (async () => {
+      try {
+        const d = await api.files('');
+        const roots = (d && d.roots) || [];
+        const labels = (d && d.root_labels) || {};
+        for (const r of roots) rootSel.append(h('option', { value: r, text: labels[r] || r }));
+      } catch (e) {
+        setErr('可访问目录读不到，直接手填完整路径：' + ((e && e.message) || String(e)));
+      }
+    })();
+    rootSel.addEventListener('change', () => { if (rootSel.value) pathI.value = rootSel.value; });
+
+    const save = async (close) => {
+      const kind = kindI.value;
+      const path = pathI.value.trim();
+      const name = kind === 'nfs' ? path : nameI.value.trim();
+      try {
+        await api.post(apiURL('system/sharing/shares'), { kind, path, name, read_only: !!roI.checked });
+        close();
+        toast('已添加 ' + (name || path), 'ok');
+        load(false);
+      } catch (e) {
+        setErr((e && e.message) || String(e));
+      }
+    };
+
+    modal({
+      title: '添加共享（本机对外提供）',
+      body: h('div', [
+        h('div.field', [h('label', { text: '类型' }), kindI]),
+        h('div.field', [pathLabel, pathI, rootSel]),
+        nameField,
+        h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' } }, [
+          roI, h('span', { text: '只读（建议：只给别人看就别开写权限）' }),
+        ]),
+        h('div.hint', { text: 'NFS 导出会写进 /etc/exports（改动前自动备份，只增删面板自己那一行）。' }),
+        err,
+      ]),
+      footer: (close) => [
+        h('button.btn', { text: '取消', onclick: close }),
+        h('button.btn.btn-primary', { text: '添加', dataset: { testid: 'zp-share-save' }, onclick: () => save(close) }),
       ],
     });
   }

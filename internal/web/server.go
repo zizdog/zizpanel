@@ -209,6 +209,12 @@ type Server struct {
 	smbRun      map[string]*smbRuntime
 	smbLoopOnce sync.Once
 
+	// ---- 文件共享（本机对外提供，见 api_sharing.go）----
+	//
+	// sharingExportsPath 只在门禁/隔离实例里被指到临时文件（绝不写 /etc/exports）。
+	// 空 = sharing.DefaultExportsPath。
+	sharingExportsPath string
+
 	// ---- 主动通知（见 api_notify.go）----
 	//
 	// notifyMgr 是进程内单例：去重状态（冷却表）必须跨请求活着，否则每次巡检
@@ -358,6 +364,12 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/system/smb/{id}/mount", s.requireAuth(s.handleSMBMount))
 	root.HandleFunc("POST /api/v1/system/smb/{id}/unmount", s.requireAuth(s.handleSMBUnmount))
 	root.HandleFunc("POST /api/v1/system/smb/{id}/remount", s.requireAuth(s.handleSMBRemount))
+	// 文件共享（本机对外提供，见 api_sharing.go）：SMB 共享 + NFS 导出。
+	// 写操作全部回读确认（sharing 包），成功后共享列表跟着变；读不到一律「未复核」。
+	root.HandleFunc("GET /api/v1/system/sharing", s.requireAuth(s.handleSharingStatus))
+	root.HandleFunc("POST /api/v1/system/sharing/{kind}/{action}", s.requireAuth(s.handleSharingServiceAction))
+	root.HandleFunc("POST /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareCreate))
+	root.HandleFunc("DELETE /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareDelete))
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
 	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))
