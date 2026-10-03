@@ -10,11 +10,13 @@ package videoopt
 //   · `.` 开头的隐藏目录跳过（与文件管理器默认隐藏点条目的口径一致）。
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -22,7 +24,41 @@ const (
 	DefaultMaxScanDepth = 12
 	// DefaultMaxScanFiles 是单次递归扫描的视频文件数上限。
 	DefaultMaxScanFiles = 5000
+	// scanReportEveryDirs / scanReportEveryTime 是扫描进度的节流阈值：
+	// 每读这么多目录、或距上次上报这么久，才回调一次（大目录树逐文件回调等于刷屏）。
+	scanReportEveryDirs = 50
+	scanReportEveryTime = 200 * time.Millisecond
 )
+
+// ScanProgressFunc 是递归扫描过程中的真实进度回调（已按节流回调）。
+//
+// dirs = 已读完的目录数（含基准目录）、videos = 已发现的视频数、
+// cur = 当前正在读的目录（相对基准目录、斜杠分隔；基准目录为 ""）。
+// 三个值都是真的数出来的，不是估算。
+type ScanProgressFunc func(dirs, videos int, cur string)
+
+// scanReporter 是扫描进度的节流器：首个目录立刻上报一次，之后按目录数/时间节流；
+// 收尾时必须用 force 补一次终值（终值要与最终结果逐字一致）。
+type scanReporter struct {
+	onScan   ScanProgressFunc
+	lastDirs int
+	lastTime time.Time
+	started  bool
+}
+
+func (r *scanReporter) report(dirs, videos int, cur string, force bool) {
+	if r == nil || r.onScan == nil {
+		return
+	}
+	if !force && r.started &&
+		dirs-r.lastDirs < scanReportEveryDirs &&
+		time.Since(r.lastTime) < scanReportEveryTime {
+		return
+	}
+	r.started = true
+	r.lastDirs, r.lastTime = dirs, time.Now()
+	r.onScan(dirs, videos, cur)
+}
 
 // ScanLimits 是一次递归扫描的上限；零值表示用默认值（见 normalized）。
 type ScanLimits struct {
@@ -50,17 +86,24 @@ type ScanSkip struct {
 type ScanReport struct {
 	Skipped []ScanSkip `json:"skipped,omitempty"`
 	Notes   []string   `json:"notes,omitempty"`
+	// DirsScanned 是这次真的读完的目录数（含基准目录）—— 进度回调的终值必须等于它。
+	DirsScanned int `json:"dirs_scanned,omitempty"`
 }
 
 // scanTree 递归扫描 dir 下的视频，outDir 是产物目录（必须跳过）。
 //
 // 返回的 Source.RelPath 是相对 dir 的斜杠路径（如 `第1季/01.mkv`）；
 // 单个子目录读不到只记入 report，绝不整体失败。
-func scanTree(dir, outDir string, limits ScanLimits) ([]Source, ScanReport, error) {
+//
+// ctx 取消时在每个目录/每条目循环处立即返回 ctx.Err()（调用方不得再产生计划）；
+// onScan 在扫描过程中按节流回调真实进度（可为 nil）。
+func scanTree(ctx context.Context, dir, outDir string, limits ScanLimits, onScan ScanProgressFunc) ([]Source, ScanReport, error) {
 	lim := limits.normalized()
 	var out []Source
 	var rep ScanReport
+	prog := &scanReporter{onScan: onScan}
 	stopped := false
+	lastRel := ""
 
 	hitFiles := func() bool {
 		if len(out) < lim.MaxFiles {
@@ -76,6 +119,9 @@ func scanTree(dir, outDir string, limits ScanLimits) ([]Source, ScanReport, erro
 
 	var walk func(cur, rel string, depth int) error
 	walk = func(cur, rel string, depth int) error {
+		if err := ctx.Err(); err != nil {
+			return err // 取消：立刻停，绝不继续扫
+		}
 		if hitFiles() {
 			return nil
 		}
@@ -88,7 +134,13 @@ func scanTree(dir, outDir string, limits ScanLimits) ([]Source, ScanReport, erro
 				Reason: "读不到子目录（无权限或已失效）：" + oneLine(err.Error())})
 			return nil
 		}
+		rep.DirsScanned++
+		lastRel = rel
+		prog.report(rep.DirsScanned, len(out), rel, false)
 		for _, e := range ents {
+			if err := ctx.Err(); err != nil {
+				return err // 目录里条目很多时也要能立刻停（每层循环都查）
+			}
 			if hitFiles() {
 				return nil
 			}
@@ -128,12 +180,15 @@ func scanTree(dir, outDir string, limits ScanLimits) ([]Source, ScanReport, erro
 				RelPath: filepath.ToSlash(filepath.Join(rel, name)),
 				Bytes:   info.Size(), ModTime: info.ModTime(),
 			})
+			prog.report(rep.DirsScanned, len(out), rel, false)
 		}
 		return nil
 	}
 	if err := walk(dir, "", 0); err != nil {
 		return nil, rep, err
 	}
+	// 收尾补一次终值：与最终结果逐字一致（调用方据此断言"进度不是估的"）。
+	prog.report(rep.DirsScanned, len(out), lastRel, true)
 	sort.Slice(out, func(i, j int) bool { return out[i].RelPath < out[j].RelPath })
 	return out, rep, nil
 }

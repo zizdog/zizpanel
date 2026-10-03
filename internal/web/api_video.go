@@ -283,18 +283,25 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	if req.Rescan {
 		s.probeCache.InvalidateDir(dir)
 	}
-	// 首次扫描要能看到"读到第几个/共几个 + 当前文件名"：扫的过程中把进度记进
-	// scanProgress，前端在请求飞行期间轮询 /video-plan-progress（改配置走缓存时
-	// 整个扫描是毫秒级、也一次 ffprobe 都不跑 ⇒ 轮询拿到的 active=false）。
-	s.scanProgress.Begin(dir)
+	// 首次扫描要能看到真实进度：递归时是「已扫描 N 个目录 · 发现 M 个视频 · 当前：…」，
+	// 非递归是「已读取第几个/共几个 + 文件名」。前端在请求飞行期间轮询
+	// /video-plan-progress（改配置走缓存时整个扫描是毫秒级、也一次 ffprobe 都不跑
+	// ⇒ 轮询拿到的 active=false）。
+	gen := s.scanProgress.Begin(dir, req.Recursive)
 	res, berr := videoopt.BuildPlanProgress(r.Context(), videoopt.PlanRequest{
 		Dir: dir, Options: opts, Cache: s.probeCache, Names: names, Recursive: req.Recursive,
-		OnProbe: func() { s.scanProgress.CountProbe(dir) },
+		OnProbe: func() { s.scanProgress.CountProbe(dir, gen) },
+		OnScan:  func(dirs, videos int, cur string) { s.scanProgress.UpdateScan(dir, gen, dirs, videos, cur) },
 	}, runner, func(done, total int, name string) {
-		s.scanProgress.Update(dir, done, total, name)
+		s.scanProgress.Update(dir, gen, done, total, name)
 	})
-	s.scanProgress.End(dir)
+	s.scanProgress.End(dir, gen)
 	if berr != nil {
+		// 用户点了「取消」（前端 abort）或断开连接：请求已经没了，绝不再写一个
+		// 失败响应（那会让界面误报失败）；进度条目也已删掉，不留陈旧状态。
+		if errors.Is(berr, context.Canceled) || errors.Is(berr, context.DeadlineExceeded) {
+			return
+		}
 		if requestedNamesErr(w, berr) {
 			return
 		}
@@ -323,18 +330,25 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 
 // videoPlanProgress 是首次扫描的进度响应（前端在 /video-plan 飞行期间轮询）。
 type videoPlanProgress struct {
-	// Active=false 表示这个目录当前没有"真在探测"的扫描（已缓存/空闲/刚跑完）。
-	Active  bool   `json:"active"`
+	// Active=false 表示这个目录当前没有值得显示的过程（已缓存/空闲/刚跑完）。
+	Active bool   `json:"active"`
+	Phase  string `json:"phase,omitempty"`
+	// Dirs/Videos/CurrentPath 是递归扫描阶段的真实计数（"已扫描 N 个目录/发现 M 个视频"）。
+	Dirs        int    `json:"dirs"`
+	Videos      int    `json:"videos"`
+	CurrentPath string `json:"current_path,omitempty"`
+	// Done/Total/Name 是探测阶段（读取视频信息 i/N）。
 	Done    int    `json:"done"`
 	Total   int    `json:"total"`
 	Name    string `json:"name,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
-// handleFileVideoPlanProgress 只读回"这次扫描读到第几个了"。
+// handleFileVideoPlanProgress 只读回"这次扫描进行到哪了"。
 //
-// 只在扫描**真的在跑 ffprobe** 时 active=true：缓存命中的扫描（改配置/二次打开）
-// 是毫秒级且 0 次 ffprobe ⇒ 前端不会再闪出「正在读取视频信息…」这个过程。
+// 只读内存快照，**绝不重新扫描**；只在扫描真的在进行（递归扫描中 / 真在跑 ffprobe）时
+// active=true：缓存命中的扫描（改配置/二次打开）是毫秒级且 0 次 ffprobe ⇒ 前端不会
+// 再闪出「正在读取视频信息…」这个过程。
 func (s *Server) handleFileVideoPlanProgress(w http.ResponseWriter, r *http.Request) {
 	dir, derr := s.fileResolveDir(r.URL.Query().Get("dir"), false)
 	if derr != nil {
@@ -343,7 +357,9 @@ func (s *Server) handleFileVideoPlanProgress(w http.ResponseWriter, r *http.Requ
 	}
 	p, _ := s.scanProgress.Get(dir)
 	ok(w, videoPlanProgress{
-		Active: p.Probed > 0, Done: p.Done, Total: p.Total, Name: p.Name, Message: p.Message,
+		Active: p.Active(), Phase: p.Phase,
+		Dirs: p.DirsScanned, Videos: p.VideosFound, CurrentPath: p.CurrentPath,
+		Done: p.Done, Total: p.Total, Name: p.Name, Message: p.Message,
 	})
 }
 

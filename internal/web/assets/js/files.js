@@ -21,6 +21,9 @@ import { sortEntries, normalizeSortKey, normalizeSortDir, extOf } from './sortfi
 // 「改上限」小窗复用设置页同一份实现（panellimit.js）：同一处校验、同一处回读，
 // 绝不在这里再写一套保存逻辑。
 import { openPanelLimitEditor } from './panellimit.js';
+// 「约剩」的速度/剩余口径**只有一份**（transfereta.js）：样本不足或总数未知一律
+// 不显示（宁可不给，也不编一个假时间）。视频计划进度条复用它，不另写一套。
+import { pushSample, rateBps, formatEta } from './transfereta.js';
 
 // 面板单次上传上限**从前端写死改成回读**：GET /api/v1/files/upload-limit。
 //
@@ -2825,15 +2828,40 @@ export function FilesView(content, ctx = {}) {
   // 选项，只显示一行"正在刷新计划…"；连点多项时只认最后一次响应。
   async function videoCompressModal() {
     const body = h('div');
-    // 刷新提示与计划表分开：刷新时不动已画好的表，也不把用户刚点的选项弹回去。
-    const refreshHint = h('div.hint', { style: { display: 'none' }, text: '正在刷新计划…' });
+    // 进度区与计划表分开：刷新时不动已画好的表，也不把用户刚点的选项弹回去。
+    // 主行是后端给的唯一文案（递归时含真实计数：已扫描目录数 / 发现视频数 / 当前目录）；
+    // 第二行是「约剩」，只在总数已知且样本足够时才有内容（数据不足就不显示）。
+    const progressText = h('div.hint', { text: '正在刷新计划…' });
+    const progressEta = h('div.hint', { style: { display: 'none' } });
+    const cancelBtn = h('button.btn.btn-sm', {
+      text: '取消',
+      title: '停止这次扫描：不会产生计划；已画好的计划保持原样',
+      onclick: () => {
+        // 只置标志 + abort：请求被中断后由 reload 的收场统一显示"已取消"，
+        // 避免"取消与响应擦肩"时两边都去改界面。
+        canceledByUser = true;
+        stopProgress();
+        if (abortPlan) abortPlan.abort();
+      },
+    });
+    // 不确定态动画（CSS 只新增）：只表示"还在跑"，不写任何假百分比。
+    const progressBar = h('div.zp-plan-prog', [h('i')]);
+    const progressBox = h('div', { style: { display: 'none' } }, [
+      h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [progressText, cancelBtn]),
+      progressEta,
+      progressBar,
+    ]);
     // scopeHint 是"这次处理哪些视频"的唯一说明 + 切换入口（用户点名：别让人以为漏压了）。
     const scopeHint = h('div.zp-video-scope', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '8px' } });
-    const shell = h('div', [refreshHint, scopeHint, body]);
+    const shell = h('div', [progressBox, scopeHint, body]);
     const foot = h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' } });
     // 关掉弹窗要能收场：中断进行中的计划请求（服务端规划循环会看 ctx），并停掉进度轮询。
     let abortPlan = null;
     let progressTimer = null;
+    // canceledByUser 区分"用户点取消"与"被下一次请求顶掉/关窗"：只有前者要显示已取消。
+    let canceledByUser = false;
+    // progressSamples 是「约剩」的采样（进度单位/秒），复用 transfereta 的窗口算法。
+    let progressSamples = [];
     const m = modal({
       title: '🎬 压缩视频', body: shell, footer: [foot], wide: true,
       onClose: () => {
@@ -2900,6 +2928,7 @@ export function FilesView(content, ctx = {}) {
     renderScope();
 
     // 后端归一化后的值回填本地状态（默认值只由后端定义一次）。
+    // recursive 也以后端回显为准：取消刷新时就靠它把勾选状态滚回"已画出的那份计划"。
     function syncFromPlan() {
       preset = plan.preset || preset;
       kbps = plan.kbps || 0;
@@ -2907,48 +2936,95 @@ export function FilesView(content, ctx = {}) {
       mode = plan.mode || mode;
       quality = plan.quality || 0;
       twoPass = !!plan.two_pass;
+      recursive = !!plan.recursive;
     }
 
-    // stopProgress 停掉首次扫描的进度轮询。
+    // stopProgress 停掉进度轮询。
     function stopProgress() {
       if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
     }
 
-    // startProgress 在**冷路径**（第一次打开这个目录）轮询服务端的实时扫描进度，
-    // 把那一行静态文案换成「正在读取视频信息 3/20：xxx.mp4」（用户：不然以为卡死了）。
-    // 已缓存/改配置时服务端毫秒级返回且 0 次探测 ⇒ 轮询永远拿不到 active=true。
-    function startProgress(line, my) {
+    // applyProgress 把服务端的进度快照画出来：主行直接用后端文案（唯一措辞来源，
+    // 递归时是「已扫描 N 个目录 · 发现 M 个视频 · 已用 T 秒 · 当前：…」，三个数都是真的）。
+    // 「约剩」只在**总数已知**时才算：递归扫描阶段总目录数不可知 ⇒ 数据不足就不显示；
+    // 探测阶段总数已知，按"已读取个数/秒"外推（口径与文件操作那套 transfereta 完全一致：
+    // 样本 <2 或跨度 <0.5s 一律不编数字）。
+    function applyProgress(p) {
+      if (p.message) progressText.textContent = p.message;
+      let eta = '';
+      if (p.phase === 'probe' && p.total > 0) {
+        progressSamples = pushSample(progressSamples, Date.now(), p.done || 0, 60000);
+        const perSec = rateBps(progressSamples, 0.5);
+        const rem = p.total - (p.done || 0);
+        if (perSec > 0 && rem > 0) eta = '约剩 ' + formatEta(rem / perSec);
+      }
+      progressEta.textContent = eta;
+      progressEta.style.display = eta ? '' : 'none';
+    }
+
+    // startProgress 在请求飞行期间轮询服务端的实时进度（只读内存快照，不重新扫描）。
+    // 冷路径与"刷新路径"都轮询：勾「包含子目录」是在已有计划上刷新，过去只显示一句
+    // 「正在刷新计划…」、看不到任何进度（用户报障的正是这里）。
+    function startProgress(my) {
       stopProgress();
+      progressSamples = [];
+      progressEta.textContent = '';
+      progressEta.style.display = 'none';
       const tick = async () => {
         if (my !== reqSeq) return;
         try {
           const p = await api.fileVideoPlanProgress(cwd);
           if (my !== reqSeq) return;
-          if (p && p.active && p.message) line.textContent = p.message;
-        } catch { /* 轮询失败不影响主请求：保持静态文案 */ }
+          if (p && p.active) applyProgress(p);
+        } catch { /* 轮询失败不影响主请求：保持已有文案 */ }
       };
       tick();
       progressTimer = setInterval(tick, 150);
     }
 
+    // showCanceled 是取消后的如实收场：显示"已取消"，绝不显示假计划、绝不误报失败。
+    // 有上一份完整计划就原样退回它（连勾选/选项一起滚回去），没有就显示可重试的空页。
+    function showCanceled() {
+      stopProgress();
+      progressBox.style.display = '';
+      cancelBtn.style.display = 'none';
+      progressBar.style.display = 'none'; // 已停下就别再转（不然"已取消"配一个转圈=自相矛盾）
+      progressText.textContent = '已取消';
+      progressEta.textContent = '';
+      progressEta.style.display = 'none';
+      if (plan) {
+        syncFromPlan();
+        draw();
+        return;
+      }
+      clear(body); clear(foot);
+      body.append(h('div.hint', { text: '已取消，没有生成计划。' }));
+      foot.append(h('button.btn', { text: '重新规划', onclick: () => reload() }));
+      foot.append(h('button.btn', { text: '关闭', onclick: () => m.close() }));
+    }
+
     async function reload(opts) {
       const o = opts || {};
       const my = ++reqSeq;
+      canceledByUser = false;
       // 上一次还没回来就再点（连点选项/关窗）：中断它，绝不让旧响应覆盖新状态。
       if (abortPlan) abortPlan.abort();
       abortPlan = new AbortController();
       stopProgress();
+      // 进度区在两种路径都显示；文案保留既有的两句（冷路径/刷新路径各一句）。
+      progressBox.style.display = '';
+      cancelBtn.style.display = '';
+      progressBar.style.display = '';
+      progressText.textContent = plan ? '正在刷新计划…' : '正在读取目录与视频信息…';
+      progressEta.textContent = '';
+      progressEta.style.display = 'none';
       if (!plan) {
         // 冷路径（第一次打开）：只有这里才真的在等服务端逐文件探测。
         clear(body); clear(foot);
-        refreshHint.style.display = 'none';
-        const line = h('div.hint', { text: '正在读取目录与视频信息…' });
-        body.append(line);
-        startProgress(line, my);
-      } else {
-        refreshHint.style.display = '';
-        if (startBtn) startBtn.disabled = true; // 刷新期间不许提交，避免提交到上一份计划
+      } else if (startBtn) {
+        startBtn.disabled = true; // 刷新期间不许提交，避免提交到上一份计划
       }
+      startProgress(my);
       let next;
       try {
         next = await api.fileVideoPlan({
@@ -2959,11 +3035,14 @@ export function FilesView(content, ctx = {}) {
           ...(onlySelected && !recursive ? { names: selNames } : {}),
         }, { signal: abortPlan.signal });
       } catch (e) {
-        // 自己中断的（关弹窗 / 被下一次请求顶掉）：静默收场。
-        if (e && e.name === 'AbortError') return;
+        // 自己中断的：用户点了「取消」就如实显示已取消；被下一次请求顶掉/关窗则静默收场。
+        if (e && e.name === 'AbortError') {
+          if (canceledByUser && my === reqSeq) showCanceled();
+          return;
+        }
         if (my !== reqSeq) return; // 过期响应：只留最后一次
         stopProgress();
-        refreshHint.style.display = 'none';
+        progressBox.style.display = 'none';
         if (!plan) {
           clear(body); clear(foot);
           body.append(h('div.hint', { style: { color: 'var(--danger)' }, text: '读取失败：' + ((e && e.message) || e) }));
@@ -2979,8 +3058,9 @@ export function FilesView(content, ctx = {}) {
         return;
       }
       if (my !== reqSeq) return; // 过期响应：只留最后一次
+      if (canceledByUser) { showCanceled(); return; } // 取消与响应擦肩：按用户意图收场
       stopProgress();
-      refreshHint.style.display = 'none';
+      progressBox.style.display = 'none';
       plan = next;
       syncFromPlan();
       draw();

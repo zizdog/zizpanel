@@ -392,7 +392,7 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 	var report ScanReport
 	if req.Recursive {
 		var serr error
-		sources, report, serr = scanTree(req.Dir, req.OutDir, req.Limits)
+		sources, report, serr = scanTree(ctx, req.Dir, req.OutDir, req.Limits, req.OnScan)
 		if serr != nil {
 			return res, fmt.Errorf("读取目录失败: %w", serr)
 		}
@@ -405,6 +405,10 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 	}
 	res.Recursive = req.Recursive
 	res.ScanSkipped, res.ScanNotes = report.Skipped, report.Notes
+	// 扫描阶段的真实计数只属于递归（非递归响应形状必须与既有行为逐字节一致）。
+	if req.Recursive {
+		res.ScanDirs, res.ScanVideos = report.DirsScanned, len(sources)
+	}
 	if len(names) > 0 {
 		usable, rejects := CheckRequestedNames(req.Dir, names)
 		if req.Recursive {

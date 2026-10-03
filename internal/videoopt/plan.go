@@ -493,6 +493,9 @@ type PlanRequest struct {
 	// OnProbe 在真的跑了一次 ffprobe 之后被调用（缓存命中不调用）：
 	// 首次扫描的实时进度据此知道"这次到底有没有在探测"。
 	OnProbe func()
+	// OnScan 在**递归扫描**过程中按节流被调用（非递归一次都不调）：
+	// 已读目录数 / 已发现视频数 / 当前相对目录（见 ScanProgressFunc）。
+	OnScan ScanProgressFunc
 	// Names 是"只处理这些文件"（当前目录下的**文件名**，不含路径）；空 = 处理全部视频。
 	//
 	// 用户点名的语义：文件管理器里选了视频就只处理选中的，没选就处理整个目录。
@@ -601,6 +604,10 @@ type PlanResult struct {
 	Recursive   bool       `json:"recursive,omitempty"`
 	ScanSkipped []ScanSkip `json:"scan_skipped,omitempty"`
 	ScanNotes   []string   `json:"scan_notes,omitempty"`
+	// ScanDirs 是递归扫描真的读完的目录数、ScanVideos 是发现的视频数
+	// （都在"只处理选中"过滤之前；非递归为 0）—— 进度回调的终值必须等于它们。
+	ScanDirs   int `json:"scan_dirs,omitempty"`
+	ScanVideos int `json:"scan_videos,omitempty"`
 }
 
 // OutputDirName 是产物子目录名（写进 <当前目录>/output/）。
