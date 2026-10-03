@@ -399,8 +399,10 @@ type MediaInfo struct {
 
 // Plan 是一个视频文件的压缩计划（同时是 /video-plan 的一行）。
 type Plan struct {
-	Name    string `json:"name"`
-	Path    string `json:"path"`
+	Name string `json:"name"`
+	Path string `json:"path"`
+	// RelPath 是相对**基准目录**的路径（如 `第1季/01.mkv`）；递归扫描时才有，非递归为空。
+	RelPath string `json:"rel_path,omitempty"`
 	OutName string `json:"out_name"`
 	OutPath string `json:"out_path"`
 	// SkipReason 非空表示这个文件不压，且原因要如实展示给用户。
@@ -462,11 +464,24 @@ type Plan struct {
 // Runnable 表示这一行真的会被压缩。
 func (p Plan) Runnable() bool { return p.SkipReason == "" && p.VideoKbps > 0 }
 
+// DisplayName 是面板与任务日志显示用的名字：递归时带相对目录（`第1季/01.mkv`），
+// 否则就是文件名 —— 同名文件在不同子目录里靠它区分。
+func (p Plan) DisplayName() string {
+	if strings.TrimSpace(p.RelPath) != "" {
+		return p.RelPath
+	}
+	return p.Name
+}
+
 // PlanRequest 是一次规划请求（dir 必须已经过白名单校验）。
 type PlanRequest struct {
 	Dir    string
 	OutDir string
 	Options
+	// Recursive 为 true 时连子目录里的视频一起处理，产物按原目录结构放进 output/。
+	Recursive bool
+	// Limits 覆盖递归扫描的深度/数量上限（零值 = DefaultScanLimits）。
+	Limits ScanLimits
 	// Expect 是面板计划表的指纹（文件名 → 源字节数），可空。
 	//
 	// 非空时规划会**核对两次探测之间文件有没有变**：大小不一致、或计划表里
@@ -581,6 +596,11 @@ type PlanResult struct {
 	// Names 是这一次"只处理这些文件"（空 = 全部视频）；Rejects 是其中被如实拒掉的条目。
 	Names   []string     `json:"names,omitempty"`
 	Rejects []NameReject `json:"rejects,omitempty"`
+	// Recursive 回显这次是否扫了子目录；ScanSkipped/ScanNotes 是递归扫描的如实说明
+	// （跳过了哪些子目录、哪里到了深度/数量上限）。
+	Recursive   bool       `json:"recursive,omitempty"`
+	ScanSkipped []ScanSkip `json:"scan_skipped,omitempty"`
+	ScanNotes   []string   `json:"scan_notes,omitempty"`
 }
 
 // OutputDirName 是产物子目录名（写进 <当前目录>/output/）。

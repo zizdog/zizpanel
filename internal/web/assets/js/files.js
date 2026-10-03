@@ -2848,6 +2848,9 @@ export function FilesView(content, ctx = {}) {
     let mode = '';
     let quality = 0; // 0 = 用该编码器的默认质量档
     let twoPass = false;
+    // recursive 默认 **不勾**：不勾 = 只看当前这一层（与既有行为逐字节一致）。
+    // 勾上后扫描/规划/执行都带 recursive: true，产物按原目录结构放进 output/。
+    let recursive = false;
     let plan = null;
     // reqSeq：连点 3 个选项会有 3 个请求，只让最后一次的响应落地（旧的直接丢弃）。
     let reqSeq = 0;
@@ -2868,6 +2871,13 @@ export function FilesView(content, ctx = {}) {
     // renderScope 画"只处理选中的 N 个 / 处理全部 M 个"+ 一颗切换按钮（状态一目了然）。
     function renderScope() {
       clear(scopeHint);
+      // 勾了「包含子目录」就没有"只处理选中"这回事：选中的是当前这层的文件，
+      // 勾子目录表示要连子目录一起处理（切换时前端已把 onlySelected 关掉）。
+      if (recursive) {
+        scopeHint.append(h('span', { text: '处理当前目录及子目录的全部'
+          + (plan && plan.total ? ' ' + plan.total + ' 个' : '') + '视频' }));
+        return;
+      }
       if (onlySelected) {
         scopeHint.append(h('span', { text: '只处理选中的 ' + selNames.length + ' 个视频'
           + (selOthers.length ? '（另有 ' + selOthers.length + ' 项不是视频，已忽略）' : '') }));
@@ -2943,8 +2953,10 @@ export function FilesView(content, ctx = {}) {
       try {
         next = await api.fileVideoPlan({
           dir: cwd, preset, kbps, encoder, mode, quality, two_pass: twoPass, rescan: !!o.rescan,
+          // 勾了「包含子目录」才带 recursive：不勾时请求与既有行为逐字节一致。
+          ...(recursive ? { recursive: true } : {}),
           // 只处理选中的视频时才带 names；不带 = 处理整个目录（后端语义）。
-          ...(onlySelected ? { names: selNames } : {}),
+          ...(onlySelected && !recursive ? { names: selNames } : {}),
         }, { signal: abortPlan.signal });
       } catch (e) {
         // 自己中断的（关弹窗 / 被下一次请求顶掉）：静默收场。
@@ -3078,6 +3090,16 @@ export function FilesView(content, ctx = {}) {
         reload();
       });
 
+      // 「包含子目录」：默认不勾（不勾时请求与既有行为逐字节一致）。
+      // 勾上后扫描/规划/执行都带 recursive: true，产物按原目录结构放进 output/。
+      const recBox = h('input', { type: 'checkbox', id: 'zp-video-recursive', checked: recursive });
+      recBox.addEventListener('change', () => {
+        recursive = recBox.checked;
+        // 勾了子目录就不能再"只处理选中的这些"（选中的是当前这层的文件）。
+        if (recursive) onlySelected = false;
+        reload();
+      });
+
       const rows = (plan.rows || []).map((r) => {
         let tune = '—';
         if (r.video_kbps) {
@@ -3101,7 +3123,7 @@ export function FilesView(content, ctx = {}) {
         // 码率已到极限 ⇒ 不转码、原样放进 output（体积不变小）；原因细节收进 title。
         const cappedSkip = !!(r.capped && r.skip_reason);
         return h('tr', [
-          h('td.zp-plan-name', { text: r.name }),
+          h('td.zp-plan-name', { text: r.rel_path || r.name, title: r.rel_path ? r.name : '' }),
           h('td', { text: src || '—' }),
           h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
           h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
@@ -3144,6 +3166,21 @@ export function FilesView(content, ctx = {}) {
             + plan.runnable + ' 个，跳过 ' + plan.skipped + ' 个'
             + (plan.encoder_codec ? ' · 编码器 ' + plan.encoder_codec : ''),
         }),
+        // 勾上后连子目录一起处理，产物按原目录结构放进 output/（默认不勾）。
+        h('div.field', { style: { marginTop: '6px' } }, [
+          h('label', { style: { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' } }, [
+            recBox,
+            h('span', { text: '包含子目录（保持目录结构）' }),
+          ]),
+          h('div.hint', { text: '含子目录：连子目录里的视频一起处理，产物按原目录结构放进 output/' }),
+        ]),
+        // 递归扫描的如实说明：跳过的子目录 / 深度或数量上限。
+        ...(plan.scan_notes || []).map((t) => h('div.hint', {
+          style: { color: 'var(--warn)' }, text: '⚠ ' + t,
+        })),
+        ...(plan.scan_skipped || []).map((s) => h('div.hint', {
+          text: '已跳过子目录 ' + s.rel_path + '：' + s.reason,
+        })),
         h('div.hint', { text: plan.note || '' }),
         h('div.zp-plan-scroll', [
           h('table.table', { style: { fontSize: '12px' } }, [
@@ -3173,12 +3210,17 @@ export function FilesView(content, ctx = {}) {
         const opts = {
           dir: cwd, preset: plan.preset, kbps: plan.kbps,
           encoder: plan.encoder, mode: plan.mode, quality: plan.quality, two_pass: plan.two_pass,
+          // 勾了子目录才带 recursive（与计划表同口径）。
+          ...(recursive ? { recursive: true } : {}),
           // 与计划表同口径：只处理选中的就必须把 names 一起交给任务（任务会重新规划）。
-          ...(onlySelected ? { names: selNames } : {}),
-          // 计划表指纹（可压行的名字+字节数）：任务重新探测后逐条核对，
+          ...(onlySelected && !recursive ? { names: selNames } : {}),
+          // 计划表指纹（可压行的名字/相对路径+字节数）：任务重新探测后逐条核对，
           // 文件变了/不见了就如实跳过 —— 绝不静默按旧计划压。
           sources: (plan.rows || []).filter((r) => !r.skip_reason)
-            .map((r) => ({ name: r.name, bytes: r.source_bytes || 0 })),
+            .map((r) => ({
+              name: r.name, bytes: r.source_bytes || 0,
+              ...(r.rel_path ? { rel_path: r.rel_path } : {}),
+            })),
         };
         start.disabled = true;
         submitHint.style.color = '';
@@ -3186,7 +3228,7 @@ export function FilesView(content, ctx = {}) {
         submitHint.textContent = '正在提交压缩任务…';
         const id = await taskCenter.start({
           kind: 'video_compress', target: opts.dir,
-          title: '压缩视频（' + plan.runnable + ' 个 · ' + plan.preset + '）',
+          title: '压缩视频（' + plan.runnable + ' 个 · ' + plan.preset + (recursive ? ' · 含子目录' : '') + '）',
           start: () => api.fileVideoCompress(opts),
           onError: (msg) => {
             // 提交失败：弹窗留在原地显示错误（toast 会消失，不足以让用户看清原因）。

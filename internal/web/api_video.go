@@ -76,6 +76,9 @@ type fileVideoReq struct {
 	// Sources 是弹窗计划表里"可压行"的指纹（文件名 + 源字节数，可空）。
 	// 任务里重新探测时用它核对文件有没有在两次探测之间变过（见 videoopt.PlanRequest.Expect）。
 	Sources []fileVideoSource `json:"sources,omitempty"`
+	// Recursive 为 true 时连子目录里的视频一起处理，产物按原目录结构放进 output/。
+	// 缺省 false = 与既有行为逐字节一致（只看当前这一层）。
+	Recursive bool `json:"recursive,omitempty"`
 	// Rescan 为 true 时先让该目录的探测缓存失效再规划 ——「⟳ 重新扫描」按钮走它，
 	// 用于"文件内容变了但 size/mtime 没变"或用户就是想强制重读一遍。
 	Rescan bool `json:"rescan,omitempty"`
@@ -85,9 +88,11 @@ type fileVideoReq struct {
 }
 
 // fileVideoSource 是计划表一行的指纹（只用来发现"文件变了"，不参与规划判据）。
+// 递归时带 rel_path（同名文件散在不同子目录时靠它区分）。
 type fileVideoSource struct {
-	Name  string `json:"name"`
-	Bytes int64  `json:"bytes"`
+	Name    string `json:"name"`
+	RelPath string `json:"rel_path,omitempty"`
+	Bytes   int64  `json:"bytes"`
 }
 
 // videoPlanResponse 是 POST /api/v1/files/video-plan 的响应。
@@ -140,6 +145,12 @@ type videoPlanResponse struct {
 	Warning          string `json:"warning,omitempty"`
 	// WarningDetail 是那句提醒的细节（硬链接 / 清单文件名），面板放进 title。
 	WarningDetail string `json:"warning_detail,omitempty"`
+
+	// Recursive 回显这次是否扫了子目录；ScanSkipped/ScanNotes 是递归扫描的如实说明
+	// （跳过了哪些子目录、哪里到了深度/数量上限），面板逐条展示。
+	Recursive   bool                `json:"recursive,omitempty"`
+	ScanSkipped []videoopt.ScanSkip `json:"scan_skipped,omitempty"`
+	ScanNotes   []string            `json:"scan_notes,omitempty"`
 }
 
 // parseVideoReq 校验共用的请求参数（档位 / 码率 / 编码器 / 模式 / 质量档 / 2-pass）。
@@ -277,7 +288,7 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	// 整个扫描是毫秒级、也一次 ffprobe 都不跑 ⇒ 轮询拿到的 active=false）。
 	s.scanProgress.Begin(dir)
 	res, berr := videoopt.BuildPlanProgress(r.Context(), videoopt.PlanRequest{
-		Dir: dir, Options: opts, Cache: s.probeCache, Names: names,
+		Dir: dir, Options: opts, Cache: s.probeCache, Names: names, Recursive: req.Recursive,
 		OnProbe: func() { s.scanProgress.CountProbe(dir) },
 	}, runner, func(done, total int, name string) {
 		s.scanProgress.Update(dir, done, total, name)
@@ -302,6 +313,7 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	resp.TotalSourceBytes, resp.EstSavedBytes = res.TotalSourceBytes, res.EstSavedBytes
 	resp.EstPercent, resp.EstimateUnknown = res.EstPercent, res.EstimateUnknown
 	resp.CappedSkipped, resp.PlaceCount = res.CappedSkipped, res.PlaceCount
+	resp.Recursive, resp.ScanSkipped, resp.ScanNotes = res.Recursive, res.ScanSkipped, res.ScanNotes
 	resp.Warning = videoSkipNotice(res.CappedSkipped)
 	if resp.Warning != "" {
 		resp.WarningDetail = videoSkipNoticeDetail
@@ -373,7 +385,8 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	// 选了但一个都不是视频：当场 400（绝不建一个注定失败的任务）。
-	if len(names) > 0 {
+	// 递归时不在这一层预检（子目录里的文件名字在基准目录里 Stat 不到，会误拒）。
+	if len(names) > 0 && !req.Recursive {
 		if nerr := namesPreflight(dir, names); nerr != nil {
 			fail(w, http.StatusBadRequest, nerr.Error())
 			return
@@ -381,25 +394,34 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 	}
 	expect := make(map[string]int64, len(req.Sources))
 	for _, src := range req.Sources {
-		if strings.TrimSpace(src.Name) != "" {
-			expect[src.Name] = src.Bytes
+		// 指纹键与 planner 同口径：递归用相对路径，非递归用文件名。
+		key := strings.TrimSpace(src.RelPath)
+		if key == "" {
+			key = strings.TrimSpace(src.Name)
+		}
+		if key != "" {
+			expect[key] = src.Bytes
 		}
 	}
 	// 标题不带个数：个数要等任务里探测完才知道（接口不许为它等）。
-	title := fmt.Sprintf("压缩视频（%s）", opts.Preset.ID)
+	suffix := ""
+	if req.Recursive {
+		suffix = " · 含子目录"
+	}
+	title := fmt.Sprintf("压缩视频（%s%s）", opts.Preset.ID, suffix)
 	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress",
 		func(ctx context.Context, log tasks.LogFunc) (any, error) {
-			return s.runVideoCompress(ctx, dir, opts, names, expect, runner, log)
+			return s.runVideoCompress(ctx, dir, opts, names, expect, req.Recursive, runner, log)
 		})
 }
 
 // runVideoCompress 是任务体：先探测规划（如实上报 scan 进度），再按同一份计划执行。
 func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt.Options,
-	names []string, expect map[string]int64, runner videoopt.Runner, log tasks.LogFunc) (*videoopt.RunResult, error) {
+	names []string, expect map[string]int64, recursive bool, runner videoopt.Runner, log tasks.LogFunc) (*videoopt.RunResult, error) {
 
 	tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "正在读取视频信息…"})
 	plan, err := videoopt.BuildPlanProgress(ctx, videoopt.PlanRequest{
-		Dir: dir, Options: opts, Expect: expect, Cache: s.probeCache, Names: names,
+		Dir: dir, Options: opts, Expect: expect, Cache: s.probeCache, Names: names, Recursive: recursive,
 	}, runner, func(done, total int, name string) {
 		tasks.ReportProgress(ctx, tasks.Progress{
 			Phase: "scan", FilesDone: done, FilesTotal: total,
@@ -409,6 +431,13 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 	if err != nil {
 		tasks.ReportProgress(ctx, tasks.Progress{Phase: "scan", Message: "读取视频信息失败：" + err.Error()})
 		return nil, err
+	}
+	// 递归扫描的如实说明（跳过哪些子目录 / 哪里到了上限）必须先于执行说清楚。
+	for _, sk := range plan.ScanSkipped {
+		log(tasks.LevelWarn, "↷ 已跳过子目录 "+sk.RelPath+"："+sk.Reason)
+	}
+	for _, note := range plan.ScanNotes {
+		log(tasks.LevelWarn, "⚠ "+note)
 	}
 	tasks.ReportProgress(ctx, tasks.Progress{
 		Phase: "scan", FilesDone: len(plan.Rows), FilesTotal: len(plan.Rows),
@@ -430,7 +459,7 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 		// 面板以 root 跑：产物必须交还真实用户，否则用户在 Finder 里改不动。
 		Chown: mgr.ChownRealUser,
 		OnProgress: func(p videoopt.ItemProgress) {
-			msg := fmt.Sprintf("正在压缩 %d/%d：%s", p.Done+1, p.Total, p.Row.Name)
+			msg := fmt.Sprintf("正在压缩 %d/%d：%s", p.Done+1, p.Total, p.Row.DisplayName())
 			if p.SavedBytes > 0 {
 				msg += " · 已省 " + humanBytes(p.SavedBytes)
 				// 已处理源体积作分母；分母为 0（还没压出一个）时不写百分比。

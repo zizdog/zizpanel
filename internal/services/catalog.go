@@ -934,7 +934,7 @@ func builtinCatalog() []App {
 			// 用户级 agent 搬进系统域"这条迁移路径，而 vips 没有 brew service。
 			// 这里的网页界面由面板安装器**自己**写系统级 LaunchDaemon
 			// （RunAtLoad=true），开机自启不依赖 SystemDaemon 字段。
-			PostInstallHint: "网页界面：直连 http://127.0.0.1:8890/ ，或从卡片点「打开」走面板别名 /imgcompress/。" +
+			PostInstallHint: "网页界面：直连 http://127.0.0.1:8890/ 。" +
 				"也可以到「文件管理」选中目录点工具条上的「🖼️ 图片压缩」批量处理目录：" +
 				"可调质量 / 最长边 / 输出格式（保持原格式、WebP、AVIF、JPEG、PNG）。" +
 				"默认**另存为 xxx.min.jpg**（不动原文件）；压完更大时会自动保留原文件。",

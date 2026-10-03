@@ -30,11 +30,13 @@ import (
 //  <产物>.part.mp4，失败/取消后删除 —— 绝不留一个没写完的 mp4 冒充成品。
 // ============================================================================
 
-// Source 是一个候选视频文件（目录这一层的扫描结果）。
+// Source 是一个候选视频文件（扫描结果）。
 type Source struct {
-	Name  string
-	Path  string
-	Bytes int64
+	Name string
+	Path string
+	// RelPath 是相对基准目录的斜杠路径（非递归时 == Name；递归时含子目录）。
+	RelPath string
+	Bytes   int64
 	// ModTime 是文件的修改时间（探测缓存的失效判据之一）。
 	ModTime time.Time
 }
@@ -343,7 +345,7 @@ func Scan(dir string) ([]Source, error) {
 			continue
 		}
 		out = append(out, Source{
-			Name: e.Name(), Path: filepath.Join(dir, e.Name()),
+			Name: e.Name(), Path: filepath.Join(dir, e.Name()), RelPath: e.Name(),
 			Bytes: info.Size(), ModTime: info.ModTime(),
 		})
 	}
@@ -385,12 +387,31 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		return res, nerr
 	}
 	res.Names = names
-	sources, err := Scan(req.Dir)
-	if err != nil {
-		return res, fmt.Errorf("读取目录失败: %w", err)
+	// 扫描：默认只看这一层（与既有行为逐字节一致）；recursive 时走上限受控的 scanTree。
+	var sources []Source
+	var report ScanReport
+	if req.Recursive {
+		var serr error
+		sources, report, serr = scanTree(req.Dir, req.OutDir, req.Limits)
+		if serr != nil {
+			return res, fmt.Errorf("读取目录失败: %w", serr)
+		}
+	} else {
+		var serr error
+		sources, serr = Scan(req.Dir)
+		if serr != nil {
+			return res, fmt.Errorf("读取目录失败: %w", serr)
+		}
 	}
+	res.Recursive = req.Recursive
+	res.ScanSkipped, res.ScanNotes = report.Skipped, report.Notes
 	if len(names) > 0 {
 		usable, rejects := CheckRequestedNames(req.Dir, names)
+		if req.Recursive {
+			// 递归时不能只在基准目录这一层查"名字还在不在"（会误拒子目录里的文件）：
+			// 改成在扫描结果里按文件名匹配，同名散在不同子目录时全部命中。
+			usable, rejects = matchScannedNames(sources, names)
+		}
 		res.Rejects = rejects
 		if len(usable) == 0 {
 			// 一个都不合法：整体报错（接口层 400），绝不假装"计划为空、无事可做"。
@@ -402,7 +423,7 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		}
 		filtered := make([]Source, 0, len(usable))
 		for _, src := range sources {
-			if want[src.Name] {
+			if want[src.Name] || want[src.RelPath] {
 				filtered = append(filtered, src)
 			}
 		}
@@ -415,10 +436,17 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 			return res, err
 		}
 		if onProgress != nil {
-			onProgress(i, len(sources), src.Name)
+			onProgress(i, len(sources), src.RelPath)
 		}
-		seen[src.Name] = true
-		outPath := filepath.Join(req.OutDir, OutputName(src.Name, opts.Preset.ID))
+		rel := src.RelPath
+		if rel == "" {
+			rel = src.Name
+		}
+		seen[rel] = true
+		// 递归：产物按源相对目录分层（`动漫/第1季/01.mkv` → `output/动漫/第1季/01.480p.mp4`）。
+		rowOutDir := outputDirFor(req.OutDir, rel, req.Recursive)
+		outName := OutputName(src.Name, opts.Preset.ID)
+		outPath := filepath.Join(rowOutDir, outName)
 		_, statErr := os.Stat(outPath)
 		outExists := statErr == nil
 		// 探测结果按「路径 + size + mtime」缓存：配置变更（档位/码率/编码器/模式/2-pass）
@@ -438,11 +466,11 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		}
 		if perr != nil {
 			res.Rows = append(res.Rows, Plan{
-				Name: src.Name, Path: src.Path,
-				OutName:       OutputName(src.Name, opts.Preset.ID),
+				Name: src.Name, Path: src.Path, RelPath: planRelPath(req.Recursive, rel),
+				OutName:       outName,
 				OutPath:       outPath,
 				PlaceName:     PlaceName(src.Name, opts.Preset.ID),
-				PlacePath:     filepath.Join(req.OutDir, PlaceName(src.Name, opts.Preset.ID)),
+				PlacePath:     filepath.Join(rowOutDir, PlaceName(src.Name, opts.Preset.ID)),
 				SourceBytes:   src.Bytes,
 				PlaceInOutput: true,
 				SkipReason:    "读不出视频信息（不是视频或文件损坏）",
@@ -451,7 +479,8 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 			res.PlaceCount++
 			continue
 		}
-		row := PlanOne(src.Name, src.Path, req.OutDir, info, opts, outExists)
+		row := PlanOne(src.Name, src.Path, rowOutDir, info, opts, outExists)
+		row.RelPath = planRelPath(req.Recursive, rel)
 		// 与面板计划表核对：文件变了/不在表里就如实跳过，绝不按旧计划压。
 		if row.Runnable() {
 			if skip := expectSkip(req.Expect, row); skip != "" {
@@ -488,14 +517,18 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 		res.Skipped++
 	}
 	// 计划表里有、这次扫不到的（文件被删/移走）：补一行并如实说明（没有源可放）。
-	for name, bytes := range req.Expect {
-		if seen[name] {
+	// 指纹的键在递归时是相对路径，非递归时就是文件名（与面板 sources 同口径）。
+	for key, bytes := range req.Expect {
+		if seen[key] {
 			continue
 		}
+		name := filepath.Base(filepath.FromSlash(key))
+		rowOutDir := outputDirFor(req.OutDir, filepath.FromSlash(key), req.Recursive)
 		res.Rows = append(res.Rows, Plan{
-			Name: name, Path: filepath.Join(req.Dir, name),
+			Name: name, Path: filepath.Join(req.Dir, filepath.FromSlash(key)),
+			RelPath:     planRelPath(req.Recursive, key),
 			OutName:     OutputName(name, opts.Preset.ID),
-			OutPath:     filepath.Join(req.OutDir, OutputName(name, opts.Preset.ID)),
+			OutPath:     filepath.Join(rowOutDir, OutputName(name, opts.Preset.ID)),
 			SourceBytes: bytes,
 			SkipReason:  "文件已不存在，已跳过",
 		})
@@ -508,6 +541,55 @@ func BuildPlanProgress(ctx context.Context, req PlanRequest, runner Runner, onPr
 	return res, nil
 }
 
+// planRelPath 只在递归时把相对路径写进 Plan（非递归为空：响应形状与既有行为一致）。
+func planRelPath(recursive bool, rel string) string {
+	if recursive {
+		return rel
+	}
+	return ""
+}
+
+// outputDirFor 算出某个源文件对应的产物目录：递归时按相对目录分层，
+// 非递归恒为 outDir（与既有行为逐字节一致）。
+func outputDirFor(outDir, rel string, recursive bool) string {
+	if !recursive {
+		return outDir
+	}
+	if d := filepath.Dir(filepath.FromSlash(rel)); d != "." && d != "" {
+		return filepath.Join(outDir, d)
+	}
+	return outDir
+}
+
+// matchScannedNames 在**扫描结果**里按文件名匹配"只处理选中的这些"（递归模式）。
+//
+// NormalizeNames 已拒绝带路径分隔符的名字，所以这里只按文件名比；
+// 同名文件散在不同子目录时全部命中（面板会逐条列出相对路径）。
+func matchScannedNames(sources []Source, names []string) ([]string, []NameReject) {
+	used := map[string]bool{}
+	for _, src := range sources {
+		for _, n := range names {
+			if src.Name == n {
+				used[n] = true
+			}
+		}
+	}
+	var usable []string
+	var rejects []NameReject
+	for _, n := range names {
+		if used[n] {
+			usable = append(usable, n)
+			continue
+		}
+		reason := "含子目录的扫描结果里没有这个视频"
+		if !IsVideoName(n) {
+			reason = "不是视频文件"
+		}
+		rejects = append(rejects, NameReject{Name: n, Reason: reason})
+	}
+	return usable, rejects
+}
+
 // expectSkip 用面板计划表的指纹核对这一次探测结果；空串 = 一致（照压）。
 //
 // 用户点名：两次探测之间变了/读不到了要**如实跳过并说明**，不许静默按旧计划压。
@@ -515,7 +597,11 @@ func expectSkip(expect map[string]int64, row Plan) string {
 	if len(expect) == 0 {
 		return ""
 	}
-	want, ok := expect[row.Name]
+	key := row.RelPath
+	if strings.TrimSpace(key) == "" {
+		key = row.Name
+	}
+	want, ok := expect[key]
 	if !ok {
 		return "不在计划表里（目录有变化），已跳过"
 	}
@@ -659,7 +745,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 	}
 	bytesTotal := prefix[total]
 	for i, row := range rows {
-		item := RunItem{Index: i, Name: row.Name, Before: row.SourceBytes}
+		item := RunItem{Index: i, Name: row.Name, RelPath: relName(row), Before: row.SourceBytes}
 		if err := ctx.Err(); err != nil {
 			return res, cancelledErr(res)
 		}
@@ -681,7 +767,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			}
 			// 跳过的文件也原样放进 output/（硬链接优先），保证 output/ 是完整一套。
 			if row.PlaceInOutput {
-				if placeInOutput(row, &item, hooks) {
+				if placeInOutput(row, &item, hooks, outDir) {
 					res.Placed++
 				}
 			} else {
@@ -694,7 +780,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 				}
 			}
 			res.Items = append(res.Items, item)
-			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"："+row.SkipReason)
+			hooks.log(tasks.LevelWarn, "↷ "+row.DisplayName()+"："+row.SkipReason)
 			continue
 		}
 		// 幂等：产物已存在就不再压（计划里可能还是"可压"，执行时再确认一次）。
@@ -706,7 +792,16 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			item.RelPath = relName(row)
 			res.Skipped++
 			res.Items = append(res.Items, item)
-			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：产物已存在，跳过")
+			hooks.log(tasks.LevelWarn, "↷ "+row.DisplayName()+"：产物已存在，跳过")
+			continue
+		}
+
+		// 递归产物按源目录结构分层：先把这一层的目录建好（并交还属主）。
+		if derr := ensureDir(filepath.Dir(row.OutPath), outDir, hooks.Chown); derr != nil {
+			item.Error = "创建产物目录失败：" + oneLine(derr.Error())
+			res.Failed++
+			res.Items = append(res.Items, item)
+			hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+item.Error)
 			continue
 		}
 
@@ -724,7 +819,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			passTag = " · 2-pass"
 		}
 		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s %s%s）",
-			i+1, total, row.Name, row.SourceWidth, row.SourceHeight,
+			i+1, total, row.DisplayName(), row.SourceWidth, row.SourceHeight,
 			row.TargetWidth, row.TargetHeight, EncoderCodec(row.Encoder), modeTag, passTag))
 		if row.Capped && row.Note != "" {
 			hooks.log(tasks.LevelWarn, row.Note)
@@ -770,7 +865,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			item.Error = rerr.Error()
 			res.Failed++
 			res.Items = append(res.Items, item)
-			hooks.log(tasks.LevelErr, "✗ "+row.Name+"："+rerr.Error())
+			hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+rerr.Error())
 			continue
 		}
 
@@ -790,12 +885,12 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			item.SourceKbps, item.SourceWidth, item.SourceHeight = row.SourceVideoKbps, row.SourceWidth, row.SourceHeight
 			item.RelPath = relName(row)
 			res.Skipped++
-			if placeInOutput(row, &item, hooks) {
+			if placeInOutput(row, &item, hooks, outDir) {
 				res.Placed++
 			}
 			res.Items = append(res.Items, item)
 			hooks.log(tasks.LevelWarn, fmt.Sprintf("↷ %s：压不小，已跳过（%s ≥ 原 %s）",
-				row.Name, humanBytes(afterBytes), humanBytes(srcBytes)))
+				row.DisplayName(), humanBytes(afterBytes), humanBytes(srcBytes)))
 			continue
 		}
 
@@ -804,7 +899,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			item.Error = "写出产物失败：" + err.Error()
 			res.Failed++
 			res.Items = append(res.Items, item)
-			hooks.log(tasks.LevelErr, "✗ "+row.Name+"："+item.Error)
+			hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+item.Error)
 			continue
 		}
 		if hooks.Chown != nil {
@@ -824,11 +919,11 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		used := " · 用时 " + item.DurationText
 		if item.SavedPercentText != "" {
 			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s，%s%s）",
-				row.Name, humanBytes(srcBytes), humanBytes(afterBytes),
+				row.DisplayName(), humanBytes(srcBytes), humanBytes(afterBytes),
 				humanBytes(srcBytes-afterBytes), item.SavedPercentText, used))
 		} else {
 			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s%s）",
-				row.Name, humanBytes(srcBytes), humanBytes(afterBytes),
+				row.DisplayName(), humanBytes(srcBytes), humanBytes(afterBytes),
 				humanBytes(srcBytes-afterBytes), used))
 		}
 	}
@@ -860,41 +955,82 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 }
 
 // relName 是文件在任务目录里的相对路径（清单里"原相对路径"那一行）。
+//
+// 递归时用 Plan.RelPath（含子目录）；非递归为空时回落到"相对源目录"== 文件名，
+// 与既有清单输出逐字节一致。
 func relName(row Plan) string {
+	if strings.TrimSpace(row.RelPath) != "" {
+		return row.RelPath
+	}
 	if rel, err := filepath.Rel(filepath.Dir(row.Path), row.Path); err == nil && !strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(rel)
 	}
 	return row.Name
 }
 
+// ensureDir 建出产物目录（递归产物按源目录结构分层），并把新建的每一层交还属主 ——
+// 面板以 root 跑，目录留给 root 的话用户在 Finder 里写不进去。
+//
+// root 是这次任务的 output 根：只在它之内逐层 chown，绝不往上 chown 到用户目录。
+func ensureDir(dir, root string, chown func(string)) error {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if chown == nil {
+		return nil
+	}
+	root = filepath.Clean(root)
+	for p := filepath.Clean(dir); ; {
+		chown(p)
+		if root == "" || root == "." || p == root {
+			return nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p || (parent != root && !strings.HasPrefix(parent, root+string(filepath.Separator))) {
+			return nil
+		}
+		p = parent
+	}
+}
+
 // placeInOutput 把跳过的源文件原样放进 output/，并把放法与原因写进 item。
 //
 // 硬链接共享 inode ⇒ **绝不 chown**（那会改到源文件本身的属主）；只有复制才交还属主。
-func placeInOutput(row Plan, item *RunItem, hooks Hooks) bool {
+// 目录是另说的：递归产物的子目录由面板（root）新建，必须交还属主。
+func placeInOutput(row Plan, item *RunItem, hooks Hooks, root string) bool {
 	dst := row.PlacePath
 	if strings.TrimSpace(dst) == "" {
 		if strings.TrimSpace(row.PlaceName) == "" {
 			item.Placement = PlacementNone
 			item.PlaceReason = "缺少源文件或目标路径"
-			hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：未放入 output（"+item.PlaceReason+"）")
+			hooks.log(tasks.LevelWarn, "↷ "+row.DisplayName()+"：未放入 output（"+item.PlaceReason+"）")
 			return false
 		}
 		dst = filepath.Join(filepath.Dir(row.OutPath), row.PlaceName)
+	}
+	if derr := ensureDir(filepath.Dir(dst), root, hooks.Chown); derr != nil {
+		item.Placement = PlacementNone
+		item.PlaceReason = "创建 output 目录失败：" + oneLine(derr.Error())
+		hooks.log(tasks.LevelWarn, "↷ "+row.DisplayName()+"：未放入 output（"+item.PlaceReason+"）")
+		return false
 	}
 	pr := placeFile(row.Path, dst)
 	item.Placement, item.PlaceReason, item.PlaceName = pr.Placement, pr.Reason, filepath.Base(dst)
 	switch pr.Placement {
 	case PlacementLink:
-		hooks.log(tasks.LevelOK, "🔗 "+row.Name+"：原样放入 output（硬链接，不占额外空间）")
+		hooks.log(tasks.LevelOK, "🔗 "+row.DisplayName()+"：原样放入 output（硬链接，不占额外空间）")
 		return true
 	case PlacementCopy:
 		if hooks.Chown != nil {
 			hooks.Chown(dst)
 		}
-		hooks.log(tasks.LevelOK, "📄 "+row.Name+"：原样放入 output（"+pr.Reason+"）")
+		hooks.log(tasks.LevelOK, "📄 "+row.DisplayName()+"：原样放入 output（"+pr.Reason+"）")
 		return true
 	default:
-		hooks.log(tasks.LevelWarn, "↷ "+row.Name+"：未放入 output（"+pr.Reason+"）")
+		hooks.log(tasks.LevelWarn, "↷ "+row.DisplayName()+"：未放入 output（"+pr.Reason+"）")
 		return false
 	}
 }
