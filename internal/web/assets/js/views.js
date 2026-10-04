@@ -381,7 +381,36 @@ export function DashboardView(content, ctx = {}) {
     renderBaseEnvMissing(data || {});
   }
 
+  // ---------- 镜像站「有新货」提醒 ----------
+  //
+  // 计数由后端公告接口 + 既有更新检查写进 localStorage（见 apps.js），这里只**展示**：
+  // 刷新/切路由都还在。拉不到公告时那边不会改计数 —— 所以这里不会凭空冒出提示。
+  const appUpdatesNotice = h('div#dashboard-app-updates');
+  function renderAppUpdatesNotice() {
+    let count = 0;
+    try {
+      const o = JSON.parse(localStorage.getItem('zp.appUpdates') || 'null');
+      count = o && typeof o.count === 'number' && o.count > 0 ? o.count : 0;
+    } catch (e) { count = 0; }
+    appUpdatesNotice.replaceChildren();
+    if (count <= 0) return;
+    appUpdatesNotice.append(h('div', {
+      style: {
+        background: 'var(--warn-soft)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)', padding: '12px 14px', marginBottom: '14px',
+        display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '12.5px',
+      },
+    }, [
+      h('span', { text: '🔔 镜像站有新版本：有 ' + count + ' 个应用可以更新' }),
+      h('button.btn.btn-sm', { text: '去应用市场', onclick: () => go('apps') }),
+    ]));
+  }
+  renderAppUpdatesNotice();
+  window.addEventListener('zp:app-updates', renderAppUpdatesNotice);
+  if (ctx.onLeave) ctx.onLeave(() => window.removeEventListener('zp:app-updates', renderAppUpdatesNotice));
+
   content.append(
+    appUpdatesNotice,
     permNotice,
     baseEnvNotice,
     topGrid,
@@ -1169,6 +1198,21 @@ export function SettingsView(content, ctx = {}) {
         });
       },
     });
+    const mirrorPrefetchBtn = h('button.btn', {
+      text: '预取应用包',
+      title: '遍历市场目录里各应用的上游产物，缺什么下什么；校验通过才原子发布索引与公告（走任务中心）',
+      onclick: () => {
+        const dir = mirrorDir.value.trim();
+        if (!dir) { toast('请先填写镜像目录', 'warn'); return; }
+        // 与「立即同步」共用同一个 target：同一目录不会被点成两个并发任务。
+        taskCenter.start({
+          kind: 'mirror-prefetch',
+          target: 'mirror:' + dir,
+          title: '预取应用包到镜像 ' + dir,
+          start: () => api.mirrorPrefetch({ dir }),
+        });
+      },
+    });
     // 仅走镜像站（离线）模式：整机断外网 / 隔离网络 / 迁移到新 Mac 时打开。
     // 打开后各安装器**禁止回落外网**，缺资源就明确失败并列出缺哪个文件。
     // 刻意与 mirror_base 放在同一张卡片里：两者一起看才不会被误解成
@@ -1330,7 +1374,7 @@ export function SettingsView(content, ctx = {}) {
           ]),
           h('div.field', [
             h('label', { text: '镜像目录（发布件同步到哪）' }),
-            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [mirrorDir, mirrorSyncBtn]),
+            h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, [mirrorDir, mirrorSyncBtn, mirrorPrefetchBtn]),
             h('div.hint', {
               text: '镜像站的文档根；只有面板进程有写授权',
               title: '把公网源上的 manifest.json / manifest.json.sig / install.sh / 各架构包同步到这里' +

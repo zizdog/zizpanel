@@ -90,6 +90,9 @@ type Server struct {
 	updateBatchAt time.Time
 	// marketUpdateCheckOverride 仅供单测：替换真实探测（会联网 + 起子进程）。
 	marketUpdateCheckOverride func(ctx context.Context, id string) services.ZizvideoUpdateCheck
+	// mirrorPrefetchOptionsOverride 仅供单测：替换镜像预取的真实上游注册表
+	//（生产会去打 GitHub release，单测一律用 htptest 假上游，绝不联网）。
+	mirrorPrefetchOptionsOverride func(dir string) mirrorPrefetchOptions
 
 	// ---- Docker 加速源「上次检测」的内存缓存（带时间戳）----
 	//
@@ -328,6 +331,9 @@ func (s *Server) routes() http.Handler {
 	// 镜像发布件同步（管理员）：把公网源上的 manifest/install.sh/包同步到镜像站
 	// 文档根（TCC 授权只有面板守护进程有，scp 写不进去，坑 217）。走任务中心。
 	root.HandleFunc("POST /api/v1/system/mirror/sync", s.requireAuth(s.handleMirrorSync))
+	// 镜像应用包预取（管理员）：遍历市场目录里各应用的上游产物，缺什么下什么，
+	// 校验通过才原子发布索引 + 公告（见 api_mirror_prefetch.go）。走任务中心。
+	root.HandleFunc("POST /api/v1/system/mirror/prefetch", s.requireAuth(s.handleMirrorAppPrefetch))
 
 	// 系统设置（macOS 服务器化）：状态探测 + 一键动作（动作走任务中心）
 	root.HandleFunc("GET /api/v1/system/settings", s.requireAuth(s.handleSystemSettings))
@@ -589,6 +595,8 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/market/{id}/update-check", s.requireAuth(s.handleMarketUpdateCheck))
 	// 批量检查更新（一次 brew outdated + 动态索引）：两个子 Tab 共用一份结论。
 	root.HandleFunc("GET /api/v1/market/updates", s.requireAuth(s.handleMarketUpdates))
+	// 镜像站公告（轻量）：启动后 + 每 6 小时拉一次，只有公告变化才重算"可更新"计数。
+	root.HandleFunc("GET /api/v1/market/announce", s.requireAuth(s.handleMarketAnnounce))
 	root.HandleFunc("POST /api/v1/market/{id}/install", s.requireAuth(s.handleMarketInstall))
 	// aria2 的**脚本凭证**（非浏览器调用 RPC 用的专用头，见 api_aria2.go）：
 	// 只有登录会话能取；它单独泄漏也操纵不了 aria2（仍要 rpc-secret）。

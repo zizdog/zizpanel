@@ -2439,6 +2439,11 @@ func (s *Server) Startup(ctx context.Context) {
 	// 启动路径上不该引入额外的网络等待。
 	s.startCertRenewal(ctx)
 
+	// 镜像应用包预取：登记到同一个每日调度器（默认每天 04:30 一次，见
+	// api_mirror_prefetch.go）。只登记，不在启动路径上做网络等待；没配镜像目录时
+	// 任务体自己如实报"未配置镜像路径"，不静默跳过。
+	s.startMirrorAppPrefetch(ctx)
+
 	// 安装后自动建一个纯静态默认站点（用户要求"装完就有"），幂等：
 	// 成功过只做一次现场复核，没有 nginx 就如实记"等待 nginx"。必须在
 	// reconcileForwarders 之后，否则 vhost 里的 proxy_pass 会指向旧回环端口。

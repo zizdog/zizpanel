@@ -293,6 +293,7 @@ export async function bootstrapAppUpdates() {
     }
   }
   startAppUpdateWatcher();
+  startMirrorAnnounceWatcher();
   await runBackgroundUpdateCheck();
 }
 
@@ -318,6 +319,62 @@ function startAppUpdateWatcher() {
     if (Date.now() - lastBackgroundCheckAt() < APP_UPDATE_INTERVAL_MS) return;
     runBackgroundUpdateCheck();
   }, 30 * 1000);
+}
+
+// ---------------------------------------------------------------------------
+//  镜像站公告：启动后 + 每 6 小时拉一次（用户 2026-09 要求"先备好、再广播"）
+// ---------------------------------------------------------------------------
+//
+// 公告只有几百字节，带 If-None-Match：命中 304 就什么都不做。
+// **只有**后端说 changed=true 时才动计数 —— 拉取失败就当没这回事，绝不猜"没有更新"
+// 也绝不猜"有更新"（会谎报）。
+const MIRROR_ANNOUNCE_STORE = 'zp.mirrorAnnounceAt'; // {at}
+const MIRROR_ANNOUNCE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 小时
+const MIRROR_ANNOUNCE_FIRST_DELAY_MS = 4000;            // 启动后先缓一下，别抢首屏
+
+let announceTimer = null;
+let announceInflight = false;
+
+function lastAnnounceCheckAt() {
+  try {
+    const o = JSON.parse(localStorage.getItem(MIRROR_ANNOUNCE_STORE) || 'null');
+    return (o && typeof o.at === 'number') ? o.at : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// runMirrorAnnounceCheck 轻量拉一次公告；只有"公告真的变了"才更新计数。
+async function runMirrorAnnounceCheck() {
+  if (announceInflight) return;
+  announceInflight = true;
+  try {
+    const r = await api.marketAnnounce();
+    if (r && r.ready === true && r.changed === true) {
+      const n = Number(r.available || 0);
+      saveAppUpdateCount(n > 0 ? n : 0);
+      if (n > 0) {
+        toast('镜像站有新版本：' + n + ' 个应用可以更新', 'info', 12000);
+      }
+    }
+    // ready!==true（没配镜像 / 拉不到 / 没数据）⇒ 不动计数、不提示（诚实优先）。
+  } catch (e) {
+    // 后端/网络失败：什么都不做（把失败显示成结论就是谎报）。
+  } finally {
+    // 无论成败都记一次尝试时刻：节奏固定为 6 小时，失败也不许每分钟重试打镜像。
+    try { localStorage.setItem(MIRROR_ANNOUNCE_STORE, JSON.stringify({ at: Date.now() })); } catch (e) { /* 存不下只影响本次节奏 */ }
+    announceInflight = false;
+  }
+}
+
+// startMirrorAnnounceWatcher 只起一次；启动后先拉一次，之后每 6 小时一次。
+function startMirrorAnnounceWatcher() {
+  if (announceTimer) return;
+  setTimeout(() => { void runMirrorAnnounceCheck(); }, MIRROR_ANNOUNCE_FIRST_DELAY_MS);
+  announceTimer = setInterval(() => {
+    if (Date.now() - lastAnnounceCheckAt() < MIRROR_ANNOUNCE_INTERVAL_MS) return;
+    void runMirrorAnnounceCheck();
+  }, 60 * 1000);
 }
 
 // ---------------------------------------------------------------------------

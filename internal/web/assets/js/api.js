@@ -196,6 +196,10 @@ export const api = {
   notifyCheck: () => request('POST', `${API_BASE}/notify/check`, {}),
   // 镜像发布件同步：把公网源上的发布件同步到镜像目录（202 + task_id，走任务中心）。
   mirrorSync: (body) => request('POST', `${API_BASE}/system/mirror/sync`, body),
+  // 镜像应用包预取：把市场目录里各应用的缺件下载进镜像（202 + task_id）。
+  mirrorPrefetch: (body) => request('POST', `${API_BASE}/system/mirror/prefetch`, body),
+  // 镜像站公告（几百字节）：启动后 + 每 6 小时拉一次；只有公告变化才重算"可更新"数。
+  marketAnnounce: () => request('GET', `${API_BASE}/market/announce`),
   // ---- 上传与执行限制（nginx client_max_body_size + PHP 上传/执行上限）----
   // GET 返回配置值 + **回读的生效值**（界面据此区分"已保存"与"已生效"）；
   // POST 校验后返回 202 + task_id，真正的应用（写 vhost + conf.d → reload nginx
