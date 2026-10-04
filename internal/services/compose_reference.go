@@ -26,6 +26,7 @@ import (
 //    /compose/README.md                          总索引（项目、端口、网络方式）
 //    /compose/<id>/docker-compose.yml            预配置 compose（含 ${VAR} 占位符）
 //    /compose/<id>/.env.example                  变量样例（复制成 .env 再改）
+//    /compose/<id>/env.example                   同上内容的**可访问副本**（nginx 拒点开头 ⇒ 前者 403）
 // ============================================================================
 
 // mirrorComposeDir 是镜像站上"推荐 Docker 项目"的目录名。
@@ -33,10 +34,15 @@ import (
 // 对外路径：<base>/compose/<id>/docker-compose.yml。
 const mirrorComposeDir = "compose"
 
-// composeFileName / composeEnvExampleName 是每个项目目录下的两个固定文件名。
+// composeFileName 等是每个项目目录下的固定文件名。
+//
+// composeEnvName 是**本地/压缩包**里的常规名（点开头）；composeEnvPlainName 是
+// 镜像站上的**可访问副本**：nginx 有一条"拒绝点开头路径"的规则，`/.env.example`
+// 一律 403（2026-10-04 用户实测），所以发布脚本额外放一份同名不带点的副本。
 const (
 	composeFileName      = "docker-compose.yml"
 	composeEnvName       = ".env.example"
+	composeEnvPlainName  = "env.example"
 	composeIndexFileName = "README.md"
 )
 
@@ -108,8 +114,26 @@ func ComposeYAMLURL(base, appID string) string {
 	return ComposeReferenceURL(base, appID, composeFileName)
 }
 
+// ComposeEnvExampleURL 指向镜像站上**不带点**的 env.example 副本。
+//
+// 为什么不用常规名 `.env.example`：镜像站 nginx 拒绝点开头路径，`/.env.example`
+// 返回 403（2026-10-04 用户实测；`env.example` 是发布脚本同步放出的同一份内容）。
+// 面板的主路径已改成自己出内容（GET /api/v1/services/{name}/compose-env），
+// 这条链接只是"在镜像站打开原文件"的次要入口。
 func ComposeEnvExampleURL(base, appID string) string {
-	return ComposeReferenceURL(base, appID, composeEnvName)
+	return ComposeReferenceURL(base, appID, composeEnvPlainName)
+}
+
+// composeSuspectSecretRe 与 tools/sync-nas-compose.sh 的发布自检同义：
+// `KEY/PASSWORD/SECRET=` 后面跟 24 位以上的长随机串就当成疑似真密钥。
+var composeSuspectSecretRe = regexp.MustCompile(`(SECRET|PASSWORD|KEY)=[A-Za-z0-9+/=_-]{24,}`)
+
+// ComposeEnvSuspectSecret 返回样例里第一条疑似真实密钥的匹配（空串 = 干净）。
+//
+// 为什么在 Go 侧再写一份：面板现在自己把样例发给浏览器（compose-env 接口），
+// 发送前必须能自查；发布脚本那份只拦镜像站那一份，拦不住接口。
+func ComposeEnvSuspectSecret(content string) string {
+	return composeSuspectSecretRe.FindString(content)
 }
 
 // composeNetworkMode 如实读出 compose 用的是 host 还是默认 bridge 网络。
@@ -244,7 +268,7 @@ func ComposeReferenceReadme(ref ComposeReference) string {
 	b.WriteString("# 1. 建目录并取文件\n")
 	fmt.Fprintf(&b, "mkdir -p ~/docker/%s && cd ~/docker/%s\n", ref.ID, ref.ID)
 	b.WriteString("curl -fsSLO <镜像站>/compose/" + ref.ID + "/docker-compose.yml\n")
-	b.WriteString("curl -fsSL  <镜像站>/compose/" + ref.ID + "/.env.example -o .env.example\n\n")
+	b.WriteString("curl -fsSL  <镜像站>/compose/" + ref.ID + "/env.example -o .env.example\n\n")
 	b.WriteString("# 2. 按需改 .env（数据目录、密钥）；然后把 .env.example 复制成 .env\n")
 	b.WriteString("cp .env.example .env && vi .env\n\n")
 	b.WriteString("# 3. 起容器\n")
@@ -287,7 +311,8 @@ func ComposeReferenceIndexMarkdown(host string) string {
 	b.WriteString("# ZizPanel 推荐的 Docker 项目（预配置 compose）\n\n")
 	b.WriteString("这些是面板建议的 Docker 项目。**面板不代你安装** —— 这里给出预配置好的\n")
 	b.WriteString("`docker-compose.yml` 与 `.env.example`，改完自己 `docker compose up -d`。\n\n")
-	b.WriteString("每个项目一个目录：`compose/<id>/docker-compose.yml` + `compose/<id>/.env.example`。\n\n")
+	b.WriteString("每个项目一个目录：`compose/<id>/docker-compose.yml` + `compose/<id>/env.example`" +
+		"（镜像站 nginx 拒绝点开头路径，所以 `.env.example` 在镜像上 403；`env.example` 是同一份内容）。\n\n")
 	b.WriteString("数据目录统一用 `${DATA_ROOT:-.}` 变量：默认放在 compose 文件旁边，\n")
 	b.WriteString("把 `.env` 里的 `DATA_ROOT` 指到 `${HOME}/docker/<项目>` 就能集中管理\n")
 	b.WriteString("（**别写 `~`**：`~` 的展开随 compose 版本变化，老版本会生成一个字面叫 `~` 的目录）。\n\n")

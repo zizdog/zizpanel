@@ -11,6 +11,9 @@ package services
 //   · .env.example 只有占位符，绝不能出现真实密钥。
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -131,7 +134,7 @@ func TestComposeReferenceURLs(t *testing.T) {
 	if got := ComposeYAMLURL(base, "it-tools"); got != "http://192.168.1.8:8090/compose/it-tools/docker-compose.yml" {
 		t.Errorf("ComposeYAMLURL 拼错了：%q", got)
 	}
-	if got := ComposeEnvExampleURL(base, "immich"); got != "http://192.168.1.8:8090/compose/immich/.env.example" {
+	if got := ComposeEnvExampleURL(base, "immich"); got != "http://192.168.1.8:8090/compose/immich/env.example" {
 		t.Errorf("ComposeEnvExampleURL 拼错了：%q", got)
 	}
 	if got := ComposeReferenceIndexURL(base); got != "http://192.168.1.8:8090/compose/README.md" {
@@ -140,6 +143,68 @@ func TestComposeReferenceURLs(t *testing.T) {
 	// 没配镜像基址时必须是空串（前端据此隐藏下载链接，而不是给个坏地址）。
 	if got := ComposeYAMLURL("", "it-tools"); got != "" {
 		t.Errorf("镜像基址为空时应返回空串，实际 %q", got)
+	}
+}
+
+// TestComposeEnvExampleURLAvoidsDotPrefixAndMatchesScript 把"面板给的地址"和
+// "发布脚本实际放出的文件名"钉在一起。
+//
+// 2026-10-04 用户实测：镜像站 nginx 拒绝点开头路径，`/compose/<id>/.env.example`
+// 返回 403。所以两边都必须用非点开头的 `env.example` —— 只改一边，用户点开就是 404。
+func TestComposeEnvExampleURLAvoidsDotPrefixAndMatchesScript(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "tools", "sync-nas-compose.sh"))
+	if err != nil {
+		t.Fatalf("读不到发布脚本：%v", err)
+	}
+	// 只匹配**非点开头**的 env 样例发布项：("env.example", "env_example")。
+	// `.env.example` 因为 "(" 后紧跟 `.`，匹配不上这个正则。
+	m := regexp.MustCompile(`\("([A-Za-z0-9_-]+\.example)",\s*"env_example"\)`).
+		FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatal("tools/sync-nas-compose.sh 里找不到非点开头的 env 样例发布项（env_example）—— " +
+			"镜像站上就没有可访问的副本了")
+	}
+	want := m[1]
+	url := ComposeEnvExampleURL("http://mirror.example", "immich")
+	last := url[strings.LastIndex(url, "/")+1:]
+	if strings.HasPrefix(last, ".") {
+		t.Errorf("变量样例地址末段 %q 以点开头：镜像站 nginx 会拒绝（403）", last)
+	}
+	if last != want {
+		t.Errorf("面板地址末段 %q 与脚本发布的名字 %q 不一致（改一边必须改另一边）", last, want)
+	}
+}
+
+// TestComposeEnvExampleHasNoSuspectSecret 是安全锁（与发布脚本同一条判据）：
+// 面板现在自己把样例发给浏览器，发送前必须能自查"没有长随机串"。
+//
+// 判据与 tools/sync-nas-compose.sh 的 grep 完全同义（KEY/PASSWORD/SECRET= + ≥24 位）。
+func TestComposeEnvExampleHasNoSuspectSecret(t *testing.T) {
+	n := 0
+	for _, a := range Catalog() {
+		if !a.DockerReference {
+			continue
+		}
+		n++
+		if got := ComposeEnvSuspectSecret(ComposeEnvExample(a)); got != "" {
+			t.Errorf("%s 的变量样例里出现疑似真实密钥：%q —— 绝不能发给任何用户", a.ID, got)
+		}
+	}
+	if n == 0 {
+		t.Fatal("一个推荐 Docker 项目都没有？这条测试就失去意义了")
+	}
+}
+
+// TestComposeSuspectSecretCatchesLongRandomValue 是上面那条安全锁的**负向对照**：
+// 判据必须真的能失败，否则等于没测。
+func TestComposeSuspectSecretCatchesLongRandomValue(t *testing.T) {
+	bad := "IMMICH_DB_PASSWORD=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c\n"
+	if ComposeEnvSuspectSecret(bad) == "" {
+		t.Fatal("24 位以上的长随机串没有被判据抓到 —— 安全锁等于没跑")
+	}
+	okCase := "IMMICH_DB_PASSWORD=CHANGE_ME\n"
+	if got := ComposeEnvSuspectSecret(okCase); got != "" {
+		t.Errorf("占位符 CHANGE_ME 被误判成真密钥：%q", got)
 	}
 }
 

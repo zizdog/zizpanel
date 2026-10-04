@@ -304,6 +304,10 @@ export const api = {
   // 没有这个接口时，用户装完 frpc/Orbien 根本不知道 admin UI 的账号口令。
   serviceCredentials: (name) =>
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/credentials`),
+  // 推荐 Docker 项目的变量样例（.env.example 内容）：面板本地生成，
+  // 不依赖镜像站（镜像的 nginx 拒绝点开头路径 ⇒ 直链 403）。
+  serviceComposeEnv: (name) =>
+    request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/compose-env`),
   // File Browser 的「主目录」：读/写的是 launchd plist 的 -r，写后后端会回读核对。
   filebrowserRoot: (name) =>
     request('GET', `${API_BASE}/services/${encodeURIComponent(name)}/filebrowser-root`),

@@ -558,6 +558,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("DELETE /api/v1/services/{name}", s.requireAuth(s.handleServiceDelete))
 	root.HandleFunc("POST /api/v1/services/{name}/{action}", s.requireAuth(s.handleServiceAction))
 	root.HandleFunc("GET /api/v1/services/{name}/credentials", s.requireAuth(s.handleServiceCredentials))
+	// 推荐 Docker 项目的变量样例（.env.example 内容）。面板本地生成，
+	// 不依赖镜像站（镜像的 nginx 拒绝点开头路径 ⇒ 旧直链 403）。
+	root.HandleFunc("GET /api/v1/services/{name}/compose-env", s.requireAuth(s.handleServiceComposeEnv))
 	// File Browser「主目录」设置：读取/修改 launchd plist 的 -r 并回读核对。
 	// 这两条比上面的 {name}/{action} 更具体，Go 1.22 的 mux 会优先匹配它们。
 	root.HandleFunc("GET /api/v1/services/{name}/filebrowser-root", s.requireAuth(s.handleFilebrowserRootGet))

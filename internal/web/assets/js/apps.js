@@ -400,7 +400,8 @@ const APP_TAB_IDS = new Set(APP_TABS.map((t) => t.id));
 //     → 这是"面板推荐的 Docker 项目"：卡片进 docker Tab，**不给安装动作**；
 //   · compose_yaml           → 预配置 compose 文件的内容（卡片上「复制 compose 配置」）；
 //   · compose_url            → 镜像站上同一份文件的下载/查看地址（卡片上「打开 compose 文件」）；
-//   · compose_env_url        → 变量样例 .env.example 的地址（卡片上「变量样例文件 ↗」）；
+//   · compose_env_url        → 镜像站上变量样例的**次要**直链（弹窗里「在镜像站打开原文件」；
+//                              主内容是面板接口 /services/{id}/compose-env，不依赖它）；
 //   · compose_readme_url     → 全部推荐项目的总索引（顶部提示里的链接）。
 // 这里仍然多认几个历史/备用写法（docker_rec / recommended_docker / compose /
 // compose_file_content …），是为了**接口字段变更时不至于把条目漏出 docker Tab**；
@@ -1034,8 +1035,8 @@ export function AppsView(content, ctx = {}) {
   function renderMarketTab() {
     const grid = h('div');
     const head = h('div.card-head', [
-      // 标题不参与收缩（min-width:0 的 h3 会被工具栏挤成一条竖线，390px 实测）。
-      h('h3', { text: '应用市场', style: { flex: '0 0 auto' } }),
+      // 标题独占一行由 .card-head > h3（flex:1 0 100%）保证，不再需要旧的 flex:0 0 auto 防挤压。
+      h('h3', { text: '应用市场' }),
       h('div.spacer'),
       h('div#apps-head', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', minWidth: '0' } }),
     ]);
@@ -1205,12 +1206,60 @@ export function AppsView(content, ctx = {}) {
     return dedupeMarketEntries((cache?.list || []).filter(isDockerRec));
   }
 
+  // openComposeEnvModal 显示变量样例（内容来自面板自己的接口）。
+  //
+  // 为什么不再直接开镜像链接：镜像站 nginx 拒绝点开头路径，`/.env.example`
+  // 一律 403（2026-10-04 用户实测）。主路径必须由面板出内容 ——
+  // 镜像链接只作为次要入口保留，镜像打不开也不影响使用。
+  function openComposeEnvModal(a) {
+    const mirrorURL = composeEnvURLOf(a);
+    const pre = h('pre.logbox', { text: '正在读取变量样例…' });
+    let content = '';
+    const copyBtn = h('button.btn.btn-primary', {
+      text: '复制',
+      title: '复制这份变量样例，粘贴成 .env 后按需修改',
+      disabled: true,
+      onclick: () => {
+        if (!content) { toast('内容还没读出来，请稍候', 'warn'); return; }
+        navigator.clipboard.writeText(content)
+          .then(() => { copyBtn.textContent = '已复制 ✓'; toast(`已复制「${a.name}」的变量样例`, 'ok'); })
+          .catch(() => toast('复制失败（浏览器限制），请在窗口里手动选中复制', 'warn', 9000));
+      },
+    });
+    const foot = [];
+    if (mirrorURL) {
+      foot.push(h('a', {
+        href: mirrorURL, target: '_blank', rel: 'noopener',
+        style: { marginRight: 'auto', fontSize: '12px', color: 'var(--text-dim)' },
+        text: '在镜像站打开原文件 ↗',
+        title: '镜像站上的同一份文件（需镜像机已重跑发布脚本）：' + mirrorURL,
+      }));
+    }
+    foot.push(copyBtn);
+    modal({
+      title: `变量样例 · ${a.name}`,
+      body: h('div', [
+        h('div.hint', { text: '只有占位符，没有真实密钥；复制成 .env 后按需修改。' }),
+        pre,
+      ]),
+      footer: foot,
+    });
+    api.serviceComposeEnv(a.id).then((d) => {
+      content = String((d && d.content) || '');
+      pre.textContent = content || '（这个项目没有变量样例）';
+      copyBtn.disabled = !content;
+    }).catch((e) => {
+      const msg = (e && e.message) ? e.message : String(e);
+      pre.textContent = '读取失败：' + msg;
+      toast('读取变量样例失败：' + msg, 'warn', 9000);
+    });
+  }
+
   // dockerCard 是一张纯展示卡片：图标 / 名称 / 描述 / 默认端口 / 需要的镜像 /
   // compose 文件的操作。**没有安装、部署、启停、卸载按钮**。
   function dockerCard(a) {
     const images = dockerImagesOf(a);
     const url = composeURLOf(a);
-    const envURL = composeEnvURLOf(a);
     const text = composeTextOf(a);
     const pills = [
       a.port > 0 ? h('span.pill', { text: '默认端口 :' + a.port }) : null,
@@ -1244,20 +1293,12 @@ export function AppsView(content, ctx = {}) {
         title: '打开/下载面板为这个项目准备好的 compose 文件：' + url,
       }));
     }
-    if (envURL) {
-      actions.push(h('a.btn.btn-sm', {
-        href: envURL, target: '_blank', rel: 'noopener', text: '变量样例文件 ↗',
-        title: '从面板镜像站取这个项目需要的环境变量样例（.env.example）：照着里面的说明改，'
-          + '再复制成 .env 就行（新标签页打开）',
-      }));
-    }
-    if (!actions.length) {
-      // 接口没给内容/地址时把位置留出来，并如实说明（绝不摆一颗点了没用的按钮）。
-      actions.push(h('span', {
-        style: { fontSize: '11.5px', color: 'var(--text-mute)' },
-        text: '接口还没有提供这个项目的 compose 文件内容/地址',
-      }));
-    }
+    // 变量样例走面板自己的接口（不依赖镜像站，镜像 403 也能看）。
+    actions.push(h('button.btn.btn-sm', {
+      text: '变量样例',
+      title: '查看这个项目需要的环境变量样例（只有占位符，无真实密钥），可一键复制成 .env',
+      onclick: () => openComposeEnvModal(a),
+    }));
     return appCardShell({
       icon: a.icon, name: a.name, subtitle: a.summary,
       pills, text: a.description || '', extra, actions,

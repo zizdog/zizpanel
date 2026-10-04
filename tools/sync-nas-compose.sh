@@ -10,6 +10,9 @@
 #    <mirror-root>/compose/README.md                  总索引（项目 / 端口 / 网络方式）
 #    <mirror-root>/compose/<id>/docker-compose.yml    预配置 compose（含 ${VAR} 占位符）
 #    <mirror-root>/compose/<id>/.env.example          变量样例（只有占位符，无真密钥）
+#    <mirror-root>/compose/<id>/env.example           同上内容的可访问副本
+#      （镜像站 nginx 拒绝点开头路径 ⇒ /.env.example 一律 403；面板的「在镜像站打开
+#       原文件」指向 env.example，两份内容必须一致）
 #    <mirror-root>/compose/<id>/README.md             单个项目的用法说明
 #  对外 URL：<mirror-base>/compose/<id>/docker-compose.yml
 #
@@ -43,7 +46,7 @@ DRY_RUN=0
 PRUNE=0
 ONLY_APP=""
 
-usage() { sed -n '2,32p' "$0"; }
+usage() { sed -n '2,33p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -107,6 +110,7 @@ for it in items:
     os.makedirs(d, exist_ok=True)
     for name, key in (("docker-compose.yml", "compose"),
                       (".env.example", "env_example"),
+                      ("env.example", "env_example"),
                       ("README.md", "readme")):
         with open(os.path.join(d, name), "w", encoding="utf-8") as f:
             f.write(it.get(key, ""))
@@ -118,13 +122,21 @@ echo "    项目数：$COUNT"
 echo "    目标：$NAS_USER@$NAS_HOST:$DEST/"
 echo "    验收基址：$MIRROR_BASE_URL/compose/..."
 
-# .env.example 必须只有占位符：这是发布到公网镜像的文件，泄一个真密钥就全完了。
-# 这里做一次静态自检（生成物里出现明显的长随机串就拒绝发布）。
+# .env.example / env.example 必须只有占位符：这是发布到公网镜像的文件，
+# 泄一个真密钥就全完了。这里对**两份**都做静态自检（生成物里出现明显的长随机串就拒绝）。
 if grep -RInE '(SECRET|PASSWORD|KEY)=[A-Za-z0-9+/=_-]{24,}' "$TREE/compose" >/dev/null 2>&1; then
-  echo "✗ 自检失败：生成的 .env.example 里出现了疑似真实密钥（长随机串）—— 拒绝发布：" >&2
+  echo "✗ 自检失败：生成的变量样例里出现了疑似真实密钥（长随机串）—— 拒绝发布：" >&2
   grep -RInE '(SECRET|PASSWORD|KEY)=[A-Za-z0-9+/=_-]{24,}' "$TREE/compose" >&2
   exit 1
 fi
+
+# 两份变量样例必须逐字节一致（面板/README 指向 env.example，本地习惯用 .env.example）。
+while IFS= read -r d; do
+  if ! cmp -s "$d/.env.example" "$d/env.example"; then
+    echo "✗ 自检失败：$d 下的 .env.example 与 env.example 内容不一致" >&2
+    exit 1
+  fi
+done < <(find "$TREE/compose" -mindepth 1 -maxdepth 1 -type d)
 
 if [ "$DRY_RUN" = "1" ]; then
   echo
@@ -169,7 +181,9 @@ check() { # <相对路径> <必须包含的片段（留空 = 只查 HTTP 200）>
 while IFS= read -r id; do
   [ -n "$id" ] || continue
   check "compose/$id/docker-compose.yml" "services:"
-  check "compose/$id/.env.example" ""
+  # 只验收不带点的 env.example：/.env.example 被镜像站 nginx 拒绝（403），
+  # 它只是本地/压缩包里的常规名，两份内容已在上面 cmp 过一致性。
+  check "compose/$id/env.example" "CHANGE_ME"
 done < <(find "$TREE/compose" -mindepth 1 -maxdepth 1 -type d | sed 's|.*/||' | sort)
 if [ -z "$ONLY_APP" ]; then
   check "compose/README.md" "DATA_ROOT"
@@ -187,3 +201,7 @@ if [ "$bad" != "0" ]; then
   exit 1
 fi
 echo "完成。"
+echo
+echo "⚠️ 注意：env.example 是本次新增的可访问副本。镜像机上还没重跑过本脚本时，"
+echo "   面板里的「在镜像站打开原文件」会是 404（面板自己的变量样例不受影响）。"
+echo "   需要**用户自己**在能写镜像目录的机器上再重跑一次本脚本才会生效。"

@@ -101,6 +101,24 @@ func TestFrontendAssetsGate(t *testing.T) {
 			t.Error("app_id 分支必须排在 launch_label/service_label 兜底之前")
 		}
 	})
+
+	// ④ 变量样例必须走面板自己的接口，不能把镜像直链当主路径（2026-10-04 报障：
+	//    镜像站 nginx 拒绝点开头路径，`/.env.example` 一律 403）。
+	//    这是**接线**断言（主路径连的是哪条接口），不是文案断言。
+	t.Run("变量样例走面板接口", func(t *testing.T) {
+		src := readAssetJS(t, "apps.js")
+		card := jsFuncBody(t, src, "dockerCard")
+		if !strings.Contains(card, "openComposeEnvModal") {
+			t.Error("dockerCard 不再调用 openComposeEnvModal：变量样例入口丢了")
+		}
+		if strings.Contains(card, "href: envURL") {
+			t.Error("dockerCard 又把镜像 env 直链当主路径打开了（镜像 403 时用户什么也看不到）")
+		}
+		open := jsFuncBody(t, src, "openComposeEnvModal")
+		if !strings.Contains(open, "api.serviceComposeEnv(") {
+			t.Error("openComposeEnvModal 没有走面板接口 /services/{id}/compose-env")
+		}
+	})
 }
 
 // ---- 共享助手（原分散在已删的 *_frontend_test.go 里） ----

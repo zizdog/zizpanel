@@ -471,8 +471,10 @@ func TestMarketDockerReferenceContract(t *testing.T) {
 		if got := asString(it["compose_url"]); !strings.HasSuffix(got, "/compose/"+id+"/docker-compose.yml") {
 			t.Errorf("%s 的 compose_url 应指向镜像站 /compose/%s/docker-compose.yml，实际 %q", id, id, got)
 		}
-		if got := asString(it["compose_env_url"]); !strings.HasSuffix(got, "/compose/"+id+"/.env.example") {
-			t.Errorf("%s 的 compose_env_url 应指向镜像站 /compose/%s/.env.example，实际 %q", id, id, got)
+		// 不带点的 env.example：镜像站 nginx 拒绝点开头路径（`/.env.example` ⇒ 403，
+		// 2026-10-04 报障），发布脚本同步放出的可访问副本才是这条链接的目标。
+		if got := asString(it["compose_env_url"]); !strings.HasSuffix(got, "/compose/"+id+"/env.example") {
+			t.Errorf("%s 的 compose_env_url 应指向镜像站 /compose/%s/env.example，实际 %q", id, id, got)
 		}
 		if got := asString(it["compose_readme_url"]); !strings.HasSuffix(got, "/compose/README.md") {
 			t.Errorf("%s 缺少总索引地址 compose_readme_url，实际 %q", id, got)

@@ -353,6 +353,32 @@ func (s *Server) handleServiceCredentials(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// handleServiceComposeEnv 返回推荐 Docker 项目的变量样例（.env.example 内容）。
+//
+// 为什么面板自己给：镜像站的 nginx 拒绝点开头路径，`/compose/<id>/.env.example`
+// 一律 403（2026-10-04 用户实测），而这份内容本来就在面板里生成
+// （services.ComposeEnvExample），根本不依赖镜像。只读接口。
+//
+// 未知 id / 不是推荐项目 ⇒ 404 + 人话（前端据此在弹窗里如实报错）。
+func (s *Server) handleServiceComposeEnv(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("name")
+	app, found := services.FindApp(id)
+	if !found {
+		fail(w, http.StatusNotFound, "没有这个应用："+id)
+		return
+	}
+	if !app.DockerReference {
+		fail(w, http.StatusNotFound, "「"+app.Name+"」不是面板推荐的 Docker 项目，没有变量样例")
+		return
+	}
+	content := services.ComposeEnvExample(app)
+	if strings.TrimSpace(content) == "" {
+		fail(w, http.StatusNotFound, "「"+app.Name+"」没有可用的变量样例")
+		return
+	}
+	ok(w, map[string]any{"id": app.ID, "name": app.Name, "content": content})
+}
+
 // ---------- 服务操作 ----------
 
 func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
