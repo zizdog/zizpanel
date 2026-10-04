@@ -3311,9 +3311,18 @@ export function FilesView(content, ctx = {}) {
           title: '压缩视频（' + plan.runnable + ' 个 · ' + plan.preset + (recursive ? ' · 含子目录' : '') + '）',
           start: () => api.fileVideoCompress(opts),
           onError: (msg) => {
-            // 提交失败：弹窗留在原地显示错误（toast 会消失，不足以让用户看清原因）。
+            // 提交失败：弹窗留在原地显示**后端原话**（toast 会消失，不足以让用户看清原因）。
+            // 409 的原因是"已有压缩任务在跑"，原样显示，绝不吞成"创建失败"。
             submitHint.style.color = 'var(--danger)';
             submitHint.textContent = '提交失败：' + msg;
+            // 顺手指到那个正在跑的任务（同一时间只允许一个，两个一起跑都会变慢）。
+            const run = taskCenter.findByKind('video_compress');
+            if (run) {
+              submitHint.append(' ', h('button.btn.btn-sm', {
+                text: '打开进行中的压缩任务',
+                onclick: () => taskCenter.openTask(run.id),
+              }));
+            }
             start.disabled = false;
           },
           onDone: (task) => {

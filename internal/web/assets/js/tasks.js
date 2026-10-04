@@ -1179,6 +1179,21 @@ function findByTarget(target) {
   return null;
 }
 
+/**
+ * findByKind：按**任务类型**找正在跑的任务（不限 target）。
+ *
+ * 为什么需要（2026-10-05）：视频压缩同一时间只许跑一个，但两个任务可能在不同
+ * 目录（target 不同）—— 按 target 查不出来。后端也会 409，这里只是把用户
+ * 直接带到那个任务的进度窗。
+ */
+function findByKind(kind) {
+  if (!kind) return null;
+  for (const m of STATE.metas.values()) {
+    if (m.kind === kind && isRunning(m)) return m;
+  }
+  return null;
+}
+
 /** init 只在第一次渲染外壳时拉一次列表（app.js 每次 renderApp 都会调，内部幂等）。 */
 let initPromise = null;
 function init() {
@@ -1378,7 +1393,7 @@ function retryTask(m) {
 }
 
 export const taskCenter = {
-  button, init, openList, openTask, start, findByTarget, onChange, setSubmitTimeoutMs,
+  button, init, openList, openTask, start, findByTarget, findByKind, onChange, setSubmitTimeoutMs,
   // 下面几个给"就地显示进度"的页面用（文件管理器）：读某任务的 meta、
   // 由结构化进度算百分比、画进度条节点、算"速度 · 约剩"。
   // **不新开订阅通道** —— 仍走 onChange。

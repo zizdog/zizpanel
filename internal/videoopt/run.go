@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/tasks"
@@ -45,6 +46,13 @@ type Source struct {
 type Progress struct {
 	Percent float64
 	Speed   string
+	// Frame 是 ffmpeg -progress 的已编码帧数（读不到为 0）。
+	// 用途：心跳行如实写"编码仍在进行（帧数 N）"—— 帧数在涨就是真的在编码。
+	Frame int64
+	// Pass 是第几遍（0 单遍 / 1、2 是 2-pass 的两遍）。
+	// 第一遍只做分析、没有"出片进度"可显示，但**必须喂看门狗**，
+	// 否则一遍健康的分析会被当成卡死（见 RunPlan 的进度回调）。
+	Pass int
 }
 
 // TranscodeRequest 是一次转码的全部参数（已由 planner 定死）。
@@ -125,7 +133,10 @@ func TranscodeArgs(req TranscodeRequest, pass int) []string {
 	}
 	if pass == 1 {
 		// 第一遍只做分析：不要音轨、不写成品（唯一产物是 passlog）。
-		args = append(args, "-an", "-f", "null", os.DevNull)
+		// 仍要 -progress：看门狗靠它区分"正在分析"与"真的卡死"，
+		// 没有进度输出的话一遍 10 分钟以上的健康分析会被误杀。
+		args = append(args, "-an", "-f", "null",
+			"-progress", "pipe:1", "-nostats", os.DevNull)
 		return args
 	}
 	if req.AudioKbps > 0 {
@@ -227,7 +238,8 @@ func (r *FFmpegRunner) Transcode(ctx context.Context, req TranscodeRequest, onPr
 		return ErrEngineMissing
 	}
 	if req.TwoPass {
-		if err := r.runPass(ctx, req, 1, nil); err != nil {
+		// 第一遍也把进度回调传下去：RunPlan 只用它喂看门狗、不打印（Pass==1）。
+		if err := r.runPass(ctx, req, 1, onProgress); err != nil {
 			return err
 		}
 		return r.runPass(ctx, req, 2, onProgress)
@@ -248,8 +260,9 @@ func (r *FFmpegRunner) runPass(ctx context.Context, req TranscodeRequest, pass i
 		return err
 	}
 
-	// 读 -progress 的 key=value 流；speed 与 out_time 分两行到达，所以先缓存 speed。
+	// 读 -progress 的 key=value 流；speed/frame 与 out_time 分几行到达，所以先缓存。
 	var curSpeed string
+	var curFrame int64
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 256*1024)
 	for sc.Scan() {
@@ -260,6 +273,10 @@ func (r *FFmpegRunner) runPass(ctx context.Context, req TranscodeRequest, pass i
 		switch key {
 		case "speed":
 			curSpeed = strings.TrimSpace(val)
+		case "frame":
+			if n, ferr := strconv.ParseInt(strings.TrimSpace(val), 10, 64); ferr == nil {
+				curFrame = n
+			}
 		case "out_time_us", "out_time_ms":
 			// 注意：ffmpeg 的 out_time_ms 实际也是**微秒**（历史命名问题），
 			// 两者都按微秒处理，否则进度会差 1000 倍。
@@ -274,7 +291,7 @@ func (r *FFmpegRunner) runPass(ctx context.Context, req TranscodeRequest, pass i
 			if pct > 100 {
 				pct = 100
 			}
-			onProgress(Progress{Percent: pct, Speed: curSpeed})
+			onProgress(Progress{Percent: pct, Speed: curSpeed, Frame: curFrame, Pass: pass})
 		}
 	}
 	werr := cmd.Wait()
@@ -631,6 +648,9 @@ type Hooks struct {
 	// EnvNotes 返回任务期如实观察到的环境提示（nil = 不检测，单测默认）。
 	// 只写日志：绝不改参数、绝不动别人的进程。
 	EnvNotes func() []string
+	// Stall 是"卡死看门狗"的参数（零值 = 默认 3 分钟警告 / 10 分钟中止）。
+	// 门禁注入假时钟与毫秒级阈值，不必真等 10 分钟。
+	Stall StallPolicy
 }
 
 // ItemProgress 是执行期"开始处理第 N 个文件"时的一次进度快照。
@@ -685,6 +705,9 @@ type RunItem struct {
 	// SavedPercentText 是这个文件省下的百分比文本（如 "-44.6%"）；
 	// 源 0 字节/读不到大小时为空（面板只显示体积，绝不写 NaN%）。
 	SavedPercentText string `json:"saved_percent_text,omitempty"`
+	// EncoderFallback 表示这个文件硬件编码失败后**回退软件编码**才成功
+	// （结果与日志都必须如实标出来，绝不假装没发生）。
+	EncoderFallback bool `json:"encoder_fallback,omitempty"`
 	// DurationSec/DurationText 是**这个文件**的转码耗时（用户点名：明细行能看到）。
 	DurationSec  float64 `json:"duration_sec,omitempty"`
 	DurationText string  `json:"duration_text,omitempty"`
@@ -854,6 +877,12 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		if row.Capped && row.Note != "" {
 			hooks.log(tasks.LevelWarn, row.Note)
 		}
+		if row.Aligned && row.AlignFrom != "" {
+			// 对齐只改编码尺寸（比例算出来的是 AlignFrom）：必须说出来，
+			// 别让用户以为分辨率写错了。
+			hooks.log(tasks.LevelStep, fmt.Sprintf("尺寸按硬件编码器要求对齐：%s → %dx%d",
+				row.AlignFrom, row.TargetWidth, row.TargetHeight))
+		}
 
 		srcBytes := row.SourceBytes
 		if st, err := os.Stat(row.Path); err == nil {
@@ -867,24 +896,51 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			passLog = filepath.Join(passDir, fmt.Sprintf("pass%d", i))
 		}
 		itemStart := time.Now()
-		throttle := &progressThrottle{}
-		rerr := runner.Transcode(ctx, TranscodeRequest{
+		req := TranscodeRequest{
 			Src: row.Path, Dst: part,
 			Width: row.TargetWidth, Height: row.TargetHeight,
 			VideoKbps: row.VideoKbps, AudioKbps: row.AudioKbps,
 			DurationSec: row.DurationSec,
 			Encoder:     row.Encoder, Mode: row.Mode, Quality: row.Quality,
 			TwoPass: row.TwoPass, PassLog: passLog,
-		}, func(p Progress) {
-			if !throttle.allow(p.Percent) {
-				return
+		}
+		// runTranscode 跑一遍（自动挂看门狗）：stalled=true 表示被看门狗中止。
+		runTranscode := func(rreq TranscodeRequest) (err error, stalled bool) {
+			throttle := &progressThrottle{}
+			rctx, cancel := context.WithCancel(ctx)
+			w := startStallWatch(hooks.Stall, row.DisplayName(), rreq.Encoder, cancel, hooks.log)
+			err = runner.Transcode(rctx, rreq, func(p Progress) {
+				// 先喂看门狗再限流：限流只影响日志行数，绝不影响"有没有进度"的判据。
+				w.nudge()
+				if p.Pass == 1 {
+					// 2-pass 第一遍只做分析：喂看门狗就够了，不打印（没有出片进度可显示）。
+					return
+				}
+				okLine, heartbeat := throttle.allow(p.Percent)
+				if !okLine {
+					return
+				}
+				hooks.log(tasks.LevelOut, progressLine(p, heartbeat))
+			})
+			reason := w.stop()
+			cancel()
+			if w.killed() {
+				return fmt.Errorf("%s", reason), true
 			}
-			line := fmt.Sprintf("%d%%", int(p.Percent))
-			if strings.TrimSpace(p.Speed) != "" {
-				line += "（" + p.Speed + "）"
+			return err, false
+		}
+		rerr, stalled := runTranscode(req)
+		// 硬件编码失败：如实回退一次软件编码（结果里标出来），绝不整批跟着挂。
+		// 看门狗中止的不在此列：那种情况按用户口径记失败并继续下一个文件。
+		if rerr != nil && row.Encoder == EncoderHardware && ctx.Err() == nil && !stalled {
+			hooks.log(tasks.LevelWarn, "⚠ 硬件编码失败，已回退软件编码重试："+row.DisplayName()+"（"+oneLine(rerr.Error())+"）")
+			_ = os.Remove(part)
+			if ferr, _ := runTranscode(cpuFallback(req)); ferr == nil {
+				rerr, item.EncoderFallback = nil, true
+			} else {
+				rerr = ferr
 			}
-			hooks.log(tasks.LevelOut, line)
-		})
+		}
 		if rerr != nil {
 			_ = os.Remove(part)
 			if ctx.Err() != nil {
@@ -947,6 +1003,9 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		res.Items = append(res.Items, item)
 		// 明细行同时给体积与百分比（算不出百分比时只写体积，绝不写 NaN%）。
 		used := " · 用时 " + item.DurationText
+		if item.EncoderFallback {
+			used += " · 已回退软件编码"
+		}
 		if item.SavedPercentText != "" {
 			hooks.log(tasks.LevelOK, fmt.Sprintf("✓ %s：%s → %s（省 %s，%s%s）",
 				row.DisplayName(), humanBytes(srcBytes), humanBytes(afterBytes),
@@ -1165,31 +1224,240 @@ func hasTwoPass(rows []Plan) bool {
 // maxProgressLines 是单个文件的进度行上限（任务日志有行数上限，绝不刷屏）。
 const maxProgressLines = 20
 
+// progressHeartbeatEvery 是"到行数上限之后"的心跳间隔。
+//
+// 为什么必须有：以前到 20 行就**永久静默**，46 分钟的长片每 1% 约 10 秒 ⇒
+// 日志正好停在 20% 不动，用户只能看到"卡在 20%"（2026-10-05 报障）。
+// 现在改成每 60 秒最多一条，既不刷屏，也绝不无声。
+const progressHeartbeatEvery = 60 * time.Second
+
 // envCheckEvery 是"每处理多少个文件复查一次环境提示"（16578 行的长任务也要能中途发现被抢 CPU）。
 const envCheckEvery = 20
 
-// progressThrottle 限流进度行：每 10% 或每 5 秒一条，且单文件最多 20 条。
+// progressThrottle 限流进度行：每 10% 或每 5 秒一条，且单文件最多 20 条；
+// 到上限后降级成每 progressHeartbeatEvery 一条心跳（绝不彻底静默）。
 type progressThrottle struct {
 	lastPct int
 	lastAt  time.Time
 	n       int
+	// now 是取当前时间的函数（nil = time.Now）；门禁注入假时钟，不必真等 60 秒。
+	now func() time.Time
 }
 
-func (t *progressThrottle) allow(pct float64) bool {
-	if t.n >= maxProgressLines {
-		return false
+func (t *progressThrottle) nowFn() time.Time {
+	if t.now != nil {
+		return t.now()
 	}
+	return time.Now()
+}
+
+// allow 返回 (要不要打印, 是不是心跳行)。
+//
+// 心跳行的语义：进度行已经到上限，但 ffmpeg 仍在编码（帧数在涨）——
+// 必须让用户看得到"还在跑"，否则就是"卡在 20%"那个报障。
+func (t *progressThrottle) allow(pct float64) (bool, bool) {
 	i := int(pct)
-	if i <= t.lastPct {
-		return false
+	if t.n >= maxProgressLines {
+		if t.nowFn().Sub(t.lastAt) < progressHeartbeatEvery {
+			return false, false
+		}
+		t.lastPct, t.lastAt, t.n = i, t.nowFn(), t.n+1
+		return true, true
 	}
-	if t.lastPct > 0 && i-t.lastPct < 10 && time.Since(t.lastAt) < 5*time.Second {
-		return false
+	if i <= t.lastPct {
+		return false, false
+	}
+	if t.lastPct > 0 && i-t.lastPct < 10 && t.nowFn().Sub(t.lastAt) < 5*time.Second {
+		return false, false
 	}
 	t.lastPct = i
-	t.lastAt = time.Now()
+	t.lastAt = t.nowFn()
 	t.n++
-	return true
+	return true, false
+}
+
+// progressLine 渲染一条进度日志行；心跳行必须带上帧数（读得到时）——
+// "帧数在涨"是"编码没卡死"的唯一直接证据。
+func progressLine(p Progress, heartbeat bool) string {
+	if heartbeat {
+		if p.Frame > 0 {
+			return fmt.Sprintf("编码仍在进行（帧数 %d，%d%%）", p.Frame, int(p.Percent))
+		}
+		return fmt.Sprintf("编码仍在进行（%d%%）", int(p.Percent))
+	}
+	line := fmt.Sprintf("%d%%", int(p.Percent))
+	if strings.TrimSpace(p.Speed) != "" {
+		line += "（" + p.Speed + "）"
+	}
+	return line
+}
+
+// ----------------------------------------------------------------------------
+//  卡死看门狗
+// ----------------------------------------------------------------------------
+
+// StallPolicy 是"进度长时间不推进"的判据（零值 = 默认：3 分钟警告、10 分钟中止）。
+//
+// 为什么需要（2026-10-05 用户报障）：硬件编码器可能停在某一帧不再吐进度，
+// 任务会一直挂着不动、批次后面的文件也不跑。参数可注入：门禁用假时钟 +
+// 毫秒级阈值断言，不必真等 10 分钟。
+type StallPolicy struct {
+	WarnAfter time.Duration // 无进度多久先警告一次
+	KillAfter time.Duration // 无进度累计多久终止**这一个文件**
+	Tick      time.Duration // 检查间隔
+	// Now 是取当前时间的函数（nil = time.Now）；门禁注入假时钟。
+	Now func() time.Time
+}
+
+const (
+	// DefaultStallWarn / DefaultStallKill 是生产默认阈值（用户拍板）。
+	DefaultStallWarn = 3 * time.Minute
+	DefaultStallKill = 10 * time.Minute
+	defaultStallTick = 5 * time.Second
+)
+
+func (p StallPolicy) withDefaults() StallPolicy {
+	if p.WarnAfter <= 0 {
+		p.WarnAfter = DefaultStallWarn
+	}
+	if p.KillAfter <= 0 {
+		p.KillAfter = DefaultStallKill
+	}
+	if p.Tick <= 0 {
+		p.Tick = defaultStallTick
+	}
+	if p.Now == nil {
+		p.Now = time.Now
+	}
+	return p
+}
+
+// stallWatch 盯着"最后一次进度"的时刻：超 warn 档警告一次，超 kill 档
+// 中止**当前文件的 ffmpeg**（cancel 只取消这一个文件的上下文，批次照旧往下走）。
+type stallWatch struct {
+	policy  StallPolicy
+	name    string
+	encoder string
+	log     func(level, msg string)
+	cancel  context.CancelFunc
+
+	mu     sync.Mutex
+	last   time.Time
+	warned bool
+	dead   bool
+	reason string
+
+	done chan struct{}
+	once sync.Once
+}
+
+func startStallWatch(p StallPolicy, name, encoder string, cancel context.CancelFunc, log func(level, msg string)) *stallWatch {
+	p = p.withDefaults()
+	w := &stallWatch{
+		policy: p, name: name, encoder: encoder, log: log, cancel: cancel,
+		last: p.Now(), done: make(chan struct{}),
+	}
+	go w.loop()
+	return w
+}
+
+// nudge 记下"进度又动了"（每次进度回调都调，不受日志限流影响）。
+func (w *stallWatch) nudge() {
+	w.mu.Lock()
+	w.last = w.policy.Now()
+	w.mu.Unlock()
+}
+
+func (w *stallWatch) loop() {
+	t := time.NewTicker(w.policy.Tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-t.C:
+			if w.check() {
+				return
+			}
+		}
+	}
+}
+
+// check 返回 true 表示已经中止（看门狗可以退出）。
+func (w *stallWatch) check() bool {
+	w.mu.Lock()
+	idle := w.policy.Now().Sub(w.last)
+	dead, warned := w.dead, w.warned
+	w.mu.Unlock()
+	if dead {
+		return true
+	}
+	if idle >= w.policy.KillAfter {
+		w.mu.Lock()
+		w.dead = true
+		w.reason = w.killReason()
+		w.mu.Unlock()
+		if w.cancel != nil {
+			w.cancel()
+		}
+		return true
+	}
+	if idle >= w.policy.WarnAfter && !warned {
+		w.mu.Lock()
+		w.warned = true
+		w.mu.Unlock()
+		if w.log != nil {
+			w.log(tasks.LevelWarn, fmt.Sprintf("⚠ %s：已 %s 无进度，可能在等硬件编码器",
+				w.name, shortWait(w.policy.WarnAfter)))
+		}
+	}
+	return false
+}
+
+// killReason 是中止原因（写进任务日志与结果，指明下一步怎么办）。
+func (w *stallWatch) killReason() string {
+	wait := shortWait(w.policy.KillAfter)
+	if ResolveEncoder(w.encoder) == EncoderHardware {
+		return fmt.Sprintf("疑似硬件编码器卡死（已 %s 无进度），已中止；可改用 CPU 编码重试", wait)
+	}
+	return fmt.Sprintf("疑似编码器卡死（已 %s 无进度），已中止", wait)
+}
+
+// stop 停掉看门狗并返回"被中止的原因"（空串 = 没被中止）。
+func (w *stallWatch) stop() string {
+	w.once.Do(func() { close(w.done) })
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.reason
+}
+
+func (w *stallWatch) killed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dead
+}
+
+// shortWait 把阈值写成给用户看的短句（门禁注入毫秒级阈值时也能读）。
+func shortWait(d time.Duration) string {
+	switch {
+	case d >= time.Minute:
+		return fmt.Sprintf("%d 分钟", int(d/time.Minute))
+	case d >= time.Second:
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	default:
+		return fmt.Sprintf("%d 毫秒", int(d/time.Millisecond))
+	}
+}
+
+// cpuFallback 把一次硬件转码请求改成 CPU（libx264）等价请求：
+// 码率/尺寸一个不动，只有质量优先模式要把 -q:v 折算成 -crf。
+func cpuFallback(req TranscodeRequest) TranscodeRequest {
+	out := req
+	out.Encoder = EncoderCPU
+	if ResolveMode(req.Mode) == ModeQuality {
+		out.Quality = HardwareQualityToCRF(req.Quality)
+	}
+	return out
 }
 
 // humanBytes 给日志用的体积文本。

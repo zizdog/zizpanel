@@ -719,6 +719,22 @@ func (m *Manager) RunningFor(target string) *Task {
 	return nil
 }
 
+// RunningKind 返回某个**类型**上正在跑的任务（不限 target）。
+//
+// 为什么需要（2026-10-05 用户报障）：视频压缩是重活，两个任务各自一个 ffmpeg
+// 会把速度从 5~8x 拖到 1.4x、负载冲到 15.9；按 target（目录）查重查不出
+// "两个不同目录同时在压"，必须按 kind 查。
+func (m *Manager) RunningKind(kind string) *Task {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tasks {
+		if t.kind == kind && t.Status() == StatusRunning {
+			return t
+		}
+	}
+	return nil
+}
+
 // RunningCount 是运行中的任务数。
 func (m *Manager) RunningCount() int {
 	m.mu.Lock()

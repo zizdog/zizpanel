@@ -421,7 +421,12 @@ type Plan struct {
 
 	TargetWidth  int `json:"target_width"`
 	TargetHeight int `json:"target_height"`
-	VideoKbps    int `json:"video_kbps"`
+	// Aligned/AlignFrom：目标尺寸为了硬件编码器做过宏块对齐（16 的倍数）时，
+	// Aligned=true、AlignFrom 是比例算出来的原始尺寸（如 "1406x1080"）。
+	// 面板与任务日志据此如实说明，绝不静默改分辨率。
+	Aligned   bool   `json:"aligned,omitempty"`
+	AlignFrom string `json:"align_from,omitempty"`
+	VideoKbps int    `json:"video_kbps"`
 	// SuggestedKbps 是"原始档给出的建议码率"（0 = 不适用/用户手填了码率）：
 	// min(该源分辨率的档位建议, 源码率×0.7)。面板据此显示"每个文件用的是哪个建议值"。
 	SuggestedKbps int `json:"suggested_kbps,omitempty"`
@@ -692,6 +697,63 @@ func evenDown(n int) int {
 	return n
 }
 
+// encoderAlign 是硬件编码器（VideoToolbox HEVC）的宏块对齐：宽高取 16 的倍数。
+const encoderAlign = 16
+
+// alignForHardware 把缩放目标对齐到硬件编码器的宏块尺寸。
+//
+// 只向上取，且**绝不放大**：对齐后会超过源尺寸或档位封顶边的那一边保持原值
+// （档位语义不变）。返回 true 表示真的对过齐 —— 调用方必须写进日志，
+// 别让用户以为分辨率写错了。
+func alignForHardware(w, h, srcW, srcH, cap int) (int, int, bool) {
+	aw, ah := upToAlign(w), upToAlign(h)
+	if cap > 0 {
+		// 档位封顶边只封一个方向：横屏封高、竖屏封宽（与 targetSize 同口径）。
+		if srcW >= srcH {
+			if ah > cap {
+				ah = h
+			}
+		} else if aw > cap {
+			aw = w
+		}
+	}
+	if aw > srcW || aw < 2 {
+		aw = w
+	}
+	if ah > srcH || ah < 2 {
+		ah = h
+	}
+	if aw == w && ah == h {
+		return w, h, false
+	}
+	return aw, ah, true
+}
+
+func upToAlign(n int) int {
+	if r := n % encoderAlign; r != 0 {
+		return n + encoderAlign - r
+	}
+	return n
+}
+
+// HardwareQualityToCRF 把硬件 -q:v 折算成 CPU 的 -crf（硬件失败回退软件时用）。
+//
+// 依据本包 2026-09-28 的标定：q:v 45 ≈ CRF 26 同观感，档位刻度每 5 一点，
+// 方向相反 ⇒ CRF ≈ 26 - (q-45)/5（q35→28、q45→26、q50→25）。
+func HardwareQualityToCRF(q int) int {
+	if q <= 0 {
+		return DefaultCRF
+	}
+	crf := CRFBalanced - (q-VTQualityBalanced)/5
+	if crf < 1 {
+		crf = 1
+	}
+	if crf > 51 {
+		crf = 51
+	}
+	return crf
+}
+
 // planBitrates 算出实际使用的视频/音频码率，并把"为什么被压小"讲清楚。
 //
 // 硬要求（用户点名）：转码码率绝不超过原视频。
@@ -806,6 +868,14 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		p.PlaceInOutput = true
 		p.SkipReason = "分辨率不可用，无法转码"
 		return p
+	}
+	// 硬件档（hevc_videotoolbox）按宏块对齐到 16 的倍数：只向上取、绝不放大、
+	// 不顶破档位封顶边。CPU 档不动（x264 任意偶数都收）。
+	if ResolveEncoder(opts.Encoder) == EncoderHardware {
+		if aw, ah, ok := alignForHardware(w, h, info.Width, info.Height, preset.CapHeight); ok {
+			p.Aligned, p.AlignFrom = true, fmt.Sprintf("%dx%d", w, h)
+			w, h = aw, ah
+		}
 	}
 	p.TargetWidth, p.TargetHeight = w, h
 

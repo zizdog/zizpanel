@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
@@ -429,10 +430,31 @@ func (s *Server) handleFileVideoCompress(w http.ResponseWriter, r *http.Request)
 		suffix = " · 含子目录"
 	}
 	title := fmt.Sprintf("压缩视频（%s%s）", opts.Preset.ID, suffix)
-	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress",
-		func(ctx context.Context, log tasks.LogFunc) (any, error) {
-			return s.runVideoCompress(ctx, dir, opts, names, expect, req.Recursive, runner, log)
-		})
+	s.launchVideoCompress(w, r, dir, title, func(ctx context.Context, log tasks.LogFunc) (any, error) {
+		return s.runVideoCompress(ctx, dir, opts, names, expect, req.Recursive, runner, log)
+	})
+}
+
+// videoLaunchMu 把「查有没有在跑的压缩任务」与「建任务」锁成一步。
+//
+// 为什么必须是同一把锁（2026-10-05 用户报障：mini 上同时跑着两个 video_compress，
+// 速度从 5~8x 掉到 1.4x）：两次点击几乎同时到达时，两个请求都会先查到"没有在跑的"，
+// 然后各建一个任务 ⇒ 两个 ffmpeg 抢 CPU。Manager.StartWithTask 是在**返回前**
+// 就把任务按 running 登记进列表的，所以只要"查 + 建"在同一把锁里，后到的那个请求
+// 一定看得到前一个 ⇒ 恰好一个成功。
+var videoLaunchMu sync.Mutex
+
+// launchVideoCompress 是视频压缩建任务的唯一入口（递归/非递归都走它）：
+// 已经有一个压缩任务在跑就 409 + 人话，绝不并排再起一个。
+func (s *Server) launchVideoCompress(w http.ResponseWriter, r *http.Request, dir, title string, run taskRunner) {
+	videoLaunchMu.Lock()
+	defer videoLaunchMu.Unlock()
+	if t := s.Tasks.RunningKind("video_compress"); t != nil {
+		fail(w, http.StatusConflict,
+			"已有压缩任务在跑（「"+t.Meta().Title+"」，可在任务中心中断它），两个一起跑都会变慢")
+		return
+	}
+	s.launchTask(w, r, "video_compress", dir, title, "file_video_compress", run)
 }
 
 // runVideoCompress 是任务体：先探测规划（如实上报 scan 进度），再按同一份计划执行。
