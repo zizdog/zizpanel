@@ -87,6 +87,8 @@ func EncoderCodec(encoder string) string {
 //
 // 硬件档只换 -c:v，码率/质量参数与 CPU **逐字节相同**（用户点名"码率不变"）。
 func TranscodeArgs(req TranscodeRequest, pass int) []string {
+	// 解码**故意不加** -hwaccel：本机 M4 + ffmpeg 9.0.1 实测硬解让同一条链路慢
+	// 2~8 倍（硬解帧要 hwdownload 回内存，x264 的帧级并行也用不上；见 decode_gate_test.go 的实测表）。
 	args := []string{"-hide_banner", "-nostdin", "-y", "-i", req.Src}
 	if ResolveEncoder(req.Encoder) == EncoderHardware {
 		// VideoToolbox 硬件编码，快很多；同码率画质略逊于 x264，码率控制也不够准。
@@ -626,6 +628,9 @@ type Hooks struct {
 	Chown func(path string)
 	// OnProgress 回报执行期的结构化进度（nil = 不上报）。
 	OnProgress func(ItemProgress)
+	// EnvNotes 返回任务期如实观察到的环境提示（nil = 不检测，单测默认）。
+	// 只写日志：绝不改参数、绝不动别人的进程。
+	EnvNotes func() []string
 }
 
 // ItemProgress 是执行期"开始处理第 N 个文件"时的一次进度快照。
@@ -727,6 +732,24 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		hooks.Chown(outDir)
 	}
 
+	// 环境提示：开始时查一次，之后每 envCheckEvery 个文件复查一次（Jellyfin 之类
+	// 可能中途才开始抢 CPU），同一条只打印一次，绝不刷屏。
+	seenNotes := map[string]bool{}
+	checkEnv := func() {
+		if hooks.EnvNotes == nil {
+			return
+		}
+		for _, n := range hooks.EnvNotes() {
+			s := strings.TrimSpace(n)
+			if s == "" || seenNotes[s] {
+				continue
+			}
+			seenNotes[s] = true
+			hooks.log(tasks.LevelWarn, "⚠ "+s)
+		}
+	}
+	checkEnv()
+
 	// 2-pass 的 passlogfile 必须落在临时目录，任务结束（含中断）整目录清掉。
 	passDir := ""
 	if hasTwoPass(rows) {
@@ -749,6 +772,9 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 	}
 	bytesTotal := prefix[total]
 	for i, row := range rows {
+		if i > 0 && i%envCheckEvery == 0 {
+			checkEnv()
+		}
 		item := RunItem{Index: i, Name: row.Name, RelPath: relName(row), Before: row.SourceBytes}
 		if err := ctx.Err(); err != nil {
 			return res, cancelledErr(res)
@@ -1138,6 +1164,9 @@ func hasTwoPass(rows []Plan) bool {
 
 // maxProgressLines 是单个文件的进度行上限（任务日志有行数上限，绝不刷屏）。
 const maxProgressLines = 20
+
+// envCheckEvery 是"每处理多少个文件复查一次环境提示"（16578 行的长任务也要能中途发现被抢 CPU）。
+const envCheckEvery = 20
 
 // progressThrottle 限流进度行：每 10% 或每 5 秒一条，且单文件最多 20 条。
 type progressThrottle struct {

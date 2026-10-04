@@ -48,6 +48,10 @@ const videoEngineTTL = 5 * time.Minute
 // 但又必须能断言执行期的"产物更大就删掉"判据 —— 注入假 Runner 后全用假文件断言。
 var videoRunnerOverride videoopt.Runner
 
+// videoEnvNotes 是执行期的环境提示实现（真机读 ps/sysctl）；单测里由
+// withFakeVideoRunner 置空，保证门禁不去摸真机进程与真实内存状态。
+var videoEnvNotes = videoopt.EnvNotes
+
 // videoRunner 返回这台机器上的 ffmpeg 执行器（路径就地定位，不缓存：用户可能刚装完；
 // 探到的**视频信息**另有进程级缓存 ProbeCache）。
 func (s *Server) videoRunner() videoopt.Runner {
@@ -474,6 +478,8 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 		Log: log,
 		// 面板以 root 跑：产物必须交还真实用户，否则用户在 Finder 里改不动。
 		Chown: mgr.ChownRealUser,
+		// 只写日志的环境提示（别的 ffmpeg 抢 CPU / swap 吃紧 / 负载超核数）。
+		EnvNotes: videoEnvNotes,
 		OnProgress: func(p videoopt.ItemProgress) {
 			msg := fmt.Sprintf("正在压缩 %d/%d：%s", p.Done+1, p.Total, p.Row.DisplayName())
 			if p.SavedBytes > 0 {

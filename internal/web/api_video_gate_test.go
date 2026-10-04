@@ -97,7 +97,13 @@ func withFakeVideoRunner(t *testing.T, r videoopt.Runner) {
 	t.Helper()
 	prev := videoRunnerOverride
 	videoRunnerOverride = r
-	t.Cleanup(func() { videoRunnerOverride = prev })
+	prevNotes := videoEnvNotes
+	// 门禁不许摸真机进程/内存：环境提示在单测里一律关掉（nil = 不检测）。
+	videoEnvNotes = nil
+	t.Cleanup(func() {
+		videoRunnerOverride = prev
+		videoEnvNotes = prevNotes
+	})
 }
 
 // postVideoJSON 直接调 handler（绕过鉴权，与既有 API 单测同一做法）。
