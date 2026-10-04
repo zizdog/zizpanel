@@ -217,20 +217,27 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin-bottom: var(--gap);
   box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
   transition: border-color .2s ease, box-shadow .2s ease;
+  /* 作为网格子项时可收缩到轨道宽度；否则卡片 min-content（宽表格）会把 1fr 轨道顶宽、整页横向溢出。 */
+  min-width: 0;
 }
 .card:hover { border-color: color-mix(in srgb, var(--border) 72%, var(--text-mute)); box-shadow: 0 4px 16px rgba(0, 0, 0, .12); }
 .card-head {
   display: flex; align-items: center; gap: 10px; padding: 13px 16px;
   border-bottom: 1px solid var(--border-soft);
+  /* 卡片头允许换行：标题放不下时右侧说明/工具栏另起一行，绝不把卡片顶宽
+     （用户 2026-10-04 手机端报障："h3 与按钮挤在同一行被压扁/溢出"）。 */
+  flex-wrap: wrap;
 }
-/* 卡片标题与它右侧的说明/按钮同排：标题单行截断，说明单行截断 ——
-   窄屏下"应用市场""数据库管理"这类标题之前会折成多行（同一类问题）。 */
+/* 卡片标题（直接子标题）**独占一行**：占满整行主轴后，同级的说明/按钮只能落到下一行。
+   只认直接子标题，卡片头里嵌套的自定义头（如导航页 .zp-nav-group-head 的 h3）不受影响。 */
+.card-head > h3 { flex: 1 0 100%; }
 .card-head h3 {
   margin: 0; font-size: 13.5px; font-weight: 600;
   min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .card-head .spacer { flex: 1; }
-.card-head .sub { font-size: 11.5px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* min-width:0 才能让长说明真的被省略号截断（flex 项默认缩不到 min-content 以下）。 */
+.card-head .sub { font-size: 11.5px; color: var(--text-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .card-body { padding: 16px; }
 .card-body.tight { padding: 1em; }
 .card-body .hint{padding:0;}
@@ -239,6 +246,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 1rem;}
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* 网格子项一律允许收缩到轨道宽度：子项的 min-content（宽表格）会把轨道顶宽、整页横向溢出
+   （「mac设置」的「电源与睡眠 / 系统更新阻断」卡片就是这一类）。 */
+.grid > * { min-width: 0; }
 
 /* ---------- 指标卡 ---------- */
 .metric {
@@ -274,7 +284,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
    内容变宽由**容器自己横向滚动**兜住，绝不撑破卡片/页面（下面的 :has 规则）。
    `:has` 不支持时退化成今天的折行表现 —— 不会更糟。 */
 .table th, .table td.num { white-space: nowrap; }
-.card-body:has(> .table), .card-body:has(> .zp-table-wrap) { overflow-x: auto; }
+/* 卡片正文里只要有表格（含被 div 包了一层的，如「操作审计」），就让正文自己横向滚动：
+   表格 min-content 大于卡片可用宽度时，撑破的是卡片正文（内部滚动）而不是整页。 */
+.card-body:has(.table), .card-body:has(.zp-table-wrap), .card-body:has(.zp-table-scroll) { overflow-x: auto; }
 
 /* ---------- 徽标 / 状态 ---------- */
 .pill {
@@ -355,6 +367,15 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: #0b0d12; border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-family: var(--mono); font-size: 12px; line-height: 1.65; padding: 12px 14px;
   overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-all; color: #c8d0e0;
+  /* 日志窗口不撑破页面：超长行在框内换行，整块宽度不超过容器（宽屏/窄屏一致）。 */
+  min-width: 0; max-width: 100%;
+}
+/* 日志页：左「日志文件」列表 + 右查看窗。宽屏两栏（左 240~300），窄屏改单栏 ——
+   两栏在 360/390 上右栏 min-content 兜不住，整页会横向溢出（用户 2026-10-04 报障）。
+   内联的 grid-template-columns 优先级更高，窄屏这条必须 !important 才能覆盖。 */
+.zp-split { min-width: 0; min-height: 0; }
+@media (max-width: 760px) {
+  .zp-split { grid-template-columns: minmax(0, 1fr) !important; }
 }
 .code { font-family: var(--mono); font-size: 12px; background: var(--panel-2); padding: 2px 6px; border-radius: 4px; }
 .kv { display: grid; grid-template-columns: 132px 1fr; gap: 7px 14px; font-size: 13px; }
@@ -382,7 +403,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   body.nav-open .overlay { display: block; }
   .main { margin-left: 0; }
   .hamburger { display: inline-flex; }
-  .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
+  .grid-4, .grid-3, .grid-2 { grid-template-columns: minmax(0, 1fr); }
   .content { padding: 13px; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dd { margin-bottom: 8px; }

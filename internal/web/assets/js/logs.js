@@ -48,7 +48,9 @@ export function LogsView(content, ctx = {}) {
   const viewerTools = h('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } });
 
   content.append(
-    h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(240px, 300px) 1fr', gap: 'var(--gap)', alignItems: 'start' } }, [
+    // .zp-split：宽屏两栏（左列表 240~300 + 右查看窗），≤760px 由 CSS 改成单栏 ——
+    // 两栏在 360/390 上右栏 min-content 会把页面顶宽。右栏轨道用 minmax(0,1fr) 才允许收缩。
+    h('div.zp-split', { style: { display: 'grid', gridTemplateColumns: 'minmax(240px, 300px) minmax(0, 1fr)', gap: 'var(--gap)', alignItems: 'start' } }, [
       h('div.card', { style: { marginBottom: 0 } }, [
         h('div.card-head', [h('h3', { text: '日志文件' }), h('div.spacer')]),
         h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border-soft)' } }, [statBar]),
