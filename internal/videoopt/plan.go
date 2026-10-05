@@ -243,17 +243,18 @@ const (
 //     实际平均码率 ≈ 上限×0.666（上限 1200/1500/2000/2500 实测全是 0.666）。
 //
 // ⇒ 质量档 = "-q:v + 明确码率上限"的有上限质量模式；Cap1080p 是 1080p 目标下的上限。
-// 上限必须**低于同级别最小的固定码率选项**（1080p 是 3000 kbps）：用户点名的口径是
-// "质量档要明显比固定码率档小"；实测两小时：1800→1.17GB、2250→1.44GB、2700→1.71GB。
+// 上限按**配对**口径定：质量档 i 与同一级别的第 i 个固定码率档比（用户原话
+// "同级别的选择要比固定码率时文件更小"）——1080p 固定档是 3000/4500/6000，
+// 所以 2500/3000/3600 三档都小于各自的配对档；实测两小时约 1.6/1.9/2.3 GB。
 type hwQualityTier struct {
 	Quality  int
 	Cap1080p int
 }
 
 var hwQualityCalib = []hwQualityTier{
-	{VTQualitySmall, 1800},
-	{VTQualityBalanced, 2250},
-	{VTQualityHigh, 2700},
+	{VTQualitySmall, 2500},
+	{VTQualityBalanced, 3000},
+	{VTQualityHigh, 3600},
 }
 
 // hwQualityRateRatio 是实测"平均码率/上限"系数（VT 只跑到请求上限的 ~0.67；实测 0.666）。

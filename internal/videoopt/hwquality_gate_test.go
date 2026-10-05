@@ -78,7 +78,7 @@ func TestHWQualityArgvHasCapGate(t *testing.T) {
 	want := strings.Join([]string{
 		"-hide_banner", "-nostdin", "-y", "-i", "in.mkv",
 		"-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-prio_speed", "1", "-pix_fmt", "yuv420p",
-		"-q:v", "45", "-maxrate", "2250k", "-bufsize", "4500k",
+		"-q:v", "45", "-maxrate", "3000k", "-bufsize", "6000k",
 		"-vf", "scale=1920:1080",
 		"-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-f", "mp4",
 		"-progress", "pipe:1", "-nostats", "-loglevel", "error", "out.mp4",
@@ -100,7 +100,7 @@ func TestHWQualityArgvHasCapGate(t *testing.T) {
 // ② 标定表：档位 → 1080p 上限；其它分辨率按档位锚点缩放，不出现"480p 用 1080p 的上限"。
 func TestHWQualityCapTableGate(t *testing.T) {
 	p1080, p720, p480 := presetID(t, "1080p"), presetID(t, "720p"), presetID(t, "480p")
-	want := map[int]int{VTQualitySmall: 1800, VTQualityBalanced: 2250, VTQualityHigh: 2700}
+	want := map[int]int{VTQualitySmall: 2500, VTQualityBalanced: 3000, VTQualityHigh: 3600}
 	for q, w := range want {
 		if got := HWQualityCapKbps(q, p1080, 1920, 1080); got != w {
 			t.Errorf("1080p 档位 %d 的上限应为 %d kbps，实际 %d", q, w, got)
@@ -125,22 +125,22 @@ func TestHWQualityCapTableGate(t *testing.T) {
 			t.Errorf("档位 %d 在 720p 的上限应为 %d，实际 %d", tier.Quality, int(math.Round(float64(tier.Cap1080p)*1500/3000)), got)
 		}
 	}
-	if got := HWQualityCapKbps(VTQualityBalanced, p480, 854, 480); got != 600 {
-		t.Errorf("480p 均衡档上限应为 600 kbps，实际 %d", got)
+	if got := HWQualityCapKbps(VTQualityBalanced, p480, 854, 480); got != 800 {
+		t.Errorf("480p 均衡档上限应为 800 kbps，实际 %d", got)
 	}
-	if got := HWQualityCapKbps(VTQualityBalanced, p720, 1280, 720); got != 1125 {
-		t.Errorf("720p 均衡档上限应为 1125 kbps，实际 %d", got)
+	if got := HWQualityCapKbps(VTQualityBalanced, p720, 1280, 720); got != 1500 {
+		t.Errorf("720p 均衡档上限应为 1500 kbps，实际 %d", got)
 	}
 	if HWQualityCapKbps(VTQualityBalanced, p480, 854, 480) >= HWQualityCapKbps(VTQualityBalanced, p1080, 1920, 1080) {
 		t.Error("480p 的上限不许 ≥ 1080p 的上限")
 	}
 	// 面板只给三档；其它 q:v 值按最近档处理（不猜新刻度）。
-	if got := HWQualityCapKbps(100, p1080, 1920, 1080); got != 2700 {
-		t.Errorf("q:v 100 应按最近档（50）取上限 2700，实际 %d", got)
+	if got := HWQualityCapKbps(100, p1080, 1920, 1080); got != 3600 {
+		t.Errorf("q:v 100 应按最近档（50）取上限 3600，实际 %d", got)
 	}
 }
 
-// ③ 预计体积：系数与标定表同源；1080p 两小时普通电影落在用户要的 1.0~1.8GB。
+// ③ 预计体积：系数与标定表同源；1080p 两小时落在按新上限推导的 1.5~2.4GB。
 func TestHWQualityEstimateSharesCalibrationGate(t *testing.T) {
 	p1080 := presetID(t, "1080p")
 	// 用户那段源的真实量级：4K60 10bit、视频 ~25027 kbps、两小时。
@@ -152,7 +152,7 @@ func TestHWQualityEstimateSharesCalibrationGate(t *testing.T) {
 		p := PlanOne("a.mkv", "/t/a.mkv", "/t/out", info,
 			Options{Preset: p1080, Encoder: EncoderHardware, Mode: ModeQuality, Quality: tier.Quality}, false)
 		capKbps := HWQualityCapKbps(tier.Quality, p1080, p.TargetWidth, p.TargetHeight)
-		// 源码率×0.95 = 23775 > 2700 ⇒ 上限不被原片封顶，正是用户那部片子。
+		// 源码率×0.95 = 23775 > 3600 ⇒ 上限不被原片封顶，正是用户那部片子。
 		if p.MaxRateKbps != capKbps {
 			t.Fatalf("档位 %d 的上限应为 %d，实际 %d（MaxRateKbps 没走标定表）", tier.Quality, capKbps, p.MaxRateKbps)
 		}
@@ -170,9 +170,10 @@ func TestHWQualityEstimateSharesCalibrationGate(t *testing.T) {
 		if wantKbps >= p.MaxRateKbps {
 			t.Errorf("档位 %d：预计码率 %d 没有低于上限 %d，系数没生效", tier.Quality, wantKbps, p.MaxRateKbps)
 		}
-		gb := float64(p.EstBytes) / (1 << 30)
-		if gb < 1.0 || gb > 1.8 {
-			t.Errorf("档位 %d：1080p 两小时预计 %.2f GB，不在用户要的 1.0~1.8GB 区间", tier.Quality, gb)
+		// 两小时预计体积区间：按本表与实测系数推导（2500×0.67≈1.6GB、3600×0.67≈2.3GB）。
+		gb := float64(p.EstBytes) / 1e9
+		if gb < 1.5 || gb > 2.4 {
+			t.Errorf("档位 %d：1080p 两小时预计 %.2f GB，不在按标定推导的 1.5~2.4GB 区间", tier.Quality, gb)
 		}
 	}
 	// 读不到上限 ⇒ 返回 0（调用方按"未知"处理，绝不猜体积）。
@@ -217,36 +218,42 @@ func TestCPUQualityArgvUnchangedGate(t *testing.T) {
 	}
 }
 
-// ⑤ 同级更小（用户点名的对比口径）：同一个分辨率级别下，任何质量档的**上限**
-// （= 实际码率的天花板）、**预计实际码率**与**预测体积**都必须严格小于该级别最小的
-// 固定码率选项。不跑真 ffmpeg：全部按标定表 + 源时长算。
-// 变异（必须变红）：把某个质量档上限抬到 ≥ 同级固定码率档。
+// ⑤ 同级更小（用户点名的对比口径）：质量档要跟**对应的**固定码率档配对比较，
+// 而不是跟该级别最小的固定档比 —— 用户原话"同级别的选择要比固定码率时文件更小"。
+// 配对规则：同一级别里，第 i 个质量档 ↔ 第 i 个固定码率档
+// （1080p：质量 35↔3000k、45↔4500k、50↔6000k；360/480/720p 同理按顺序配）。
+// 三样都必须严格更小：上限（实际码率天花板）、预计实际码率、预测体积。
+// 不跑真 ffmpeg：全部按标定表 + 源时长算。
+// 变异（必须变红）：把某个质量档上限抬到 ≥ 它配对的固定码率档。
 func TestHWQualitySmallerThanBitrateGate(t *testing.T) {
 	const audioKbps, durSec = 96.0, 7200.0
 	for _, id := range []string{"360p", "480p", "720p", "1080p"} {
 		p := presetID(t, id)
-		// 该级别最小的固定码率选项：BitrateChoices 的每一项就是面板给的固定码率档。
-		minKbps := 0
-		for _, c := range BitrateChoices(p) {
-			if c.KBps > 0 && (minKbps == 0 || c.KBps < minKbps) {
-				minKbps = c.KBps
+		choices := BitrateChoices(p)
+		if len(choices) != len(hwQualityCalib) {
+			t.Fatalf("%s 级别的固定码率档有 %d 个，质量档有 %d 个，配对数不上",
+				id, len(choices), len(hwQualityCalib))
+		}
+		for i, tier := range hwQualityCalib {
+			pairKbps := choices[i].KBps
+			if pairKbps <= 0 {
+				t.Fatalf("%s 第 %d 个固定码率档不是绝对码率（%d），配对口径不成立", id, i, pairKbps)
 			}
-		}
-		if minKbps <= 0 {
-			t.Fatalf("%s 级别没有固定码率选项，门禁的对比基准不成立", id)
-		}
-		bitrateBytes := estimateBytes(minKbps, int(audioKbps), durSec)
-		for _, tier := range hwQualityCalib {
 			capKbps := HWQualityCapKbps(tier.Quality, p, 1920, 1080)
 			estKbps := HWQualityEstimateKbps(capKbps)
-			if capKbps >= minKbps {
-				t.Errorf("%s 质量档 %d：上限 %d kbps ≥ 同级最小固定码率档 %d kbps", id, tier.Quality, capKbps, minKbps)
+			if capKbps >= pairKbps {
+				t.Errorf("%s 质量档 %d vs 配对固定档 %d kbps：上限 %d kbps 没有更小",
+					id, tier.Quality, pairKbps, capKbps)
 			}
-			if estKbps >= minKbps {
-				t.Errorf("%s 质量档 %d：预计实际 %d kbps ≥ 同级最小固定码率档 %d kbps", id, tier.Quality, estKbps, minKbps)
+			if estKbps >= pairKbps {
+				t.Errorf("%s 质量档 %d vs 配对固定档 %d kbps：预计实际 %d kbps 没有更小",
+					id, tier.Quality, pairKbps, estKbps)
 			}
-			if got := estimateBytes(estKbps, int(audioKbps), durSec); got >= bitrateBytes {
-				t.Errorf("%s 质量档 %d：预计体积 %d 字节 ≥ 同级固定码率档 %d 字节", id, tier.Quality, got, bitrateBytes)
+			want := estimateBytes(estKbps, int(audioKbps), durSec)
+			pair := estimateBytes(pairKbps, int(audioKbps), durSec)
+			if want >= pair {
+				t.Errorf("%s 质量档 %d vs 配对固定档 %d kbps：预计体积 %d 字节 ≥ %d 字节",
+					id, tier.Quality, pairKbps, want, pair)
 			}
 		}
 	}
