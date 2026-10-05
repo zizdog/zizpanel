@@ -2815,6 +2815,63 @@ export function FilesView(content, ctx = {}) {
     });
   }
 
+  // videoPipelineTip 是「按源类型给提示」的唯一渲染处：判据**全部来自后端**
+  // （plan.pipeline / pipeline_reason / 三个计数），前端绝不自己拿分辨率/位深重算
+  // （前端接线门禁盯着）。四类文案：快路 / 软解 / 混合计数 / 判据不足。
+  function videoPipelineTip(plan) {
+    const fast = plan.pipeline_fast || 0;
+    const soft = plan.pipeline_software || 0;
+    const unknown = plan.pipeline_unknown || 0;
+    const kind = plan.pipeline || '';
+    const reason = plan.pipeline_reason || '';
+    if (!fast && !soft && !unknown) return null;
+    let text;
+    if (kind === 'mixed') {
+      const parts = [];
+      if (fast) parts.push('⚡ 硬件管线 ' + fast + ' 个');
+      if (soft) parts.push('🐢 软件解码 ' + soft + ' 个');
+      if (unknown) parts.push('❔ 判据不足 ' + unknown + ' 个');
+      text = parts.join(' · ');
+    } else if (kind === 'fast') {
+      text = '⚡ 此片源适合硬件管线（4K·10bit·高码率），预计快很多';
+    } else if (kind === 'software' && reason !== 'unknown') {
+      text = '🐢 此片源软件解码更快（8bit/低码率），已避开硬件管线';
+    } else {
+      text = '❔ 源信息不足，按默认管线处理（不保证提速）';
+    }
+    return h('div.zp-pipeline-tip', {
+      'data-testid': 'zp-video-pipeline-tip',
+      style: { margin: '0 0 8px', fontWeight: '620' },
+      text,
+      title: videoPipelineTitle(plan),
+    });
+  }
+
+  // videoPipelineTitle 是提示的细节（判据 + 回退），不占主句。
+  function videoPipelineTitle(plan) {
+    const reasons = {
+      '4k_10bit_highbitrate': '4K 级 + 10bit 及以上 + 码率 ≥6 Mbps',
+      'low_bitrate': '4K 级 10bit 但码率不足 6 Mbps',
+      'bit_depth_8': '4K 级但只有 8bit',
+      'not_4k': '分辨率不到 4K 级',
+      'unknown': '位深/码率读不到',
+      'mixed': '目录里不止一类片源',
+    };
+    const reason = plan.pipeline_reason || 'unknown';
+    // 逐文件事实（后端字段）：只在**所有行一致**时写进 title，混合时不挑一个代表。
+    const facts = [...new Set((plan.rows || []).map((r) => {
+      const bits = [];
+      if (r.src_bit_depth) bits.push(r.src_bit_depth + 'bit');
+      if (r.src_bitrate_kbps) bits.push(r.src_bitrate_kbps + ' kbps');
+      if (r.src_fps) bits.push(r.src_fps + 'fps' + (r.cap_fps30 ? '→30fps' : ''));
+      return bits.join(' · ');
+    }).filter(Boolean))];
+    return '快路判据：' + (reasons[reason] || reason)
+      + (facts.length === 1 ? '（源：' + facts[0] + '）' : '')
+      + '；当前编码器 ' + (plan.encoder_codec || plan.encoder || '—')
+      + '；硬件管线失败会自动回退软件解码并写日志';
+  }
+
   // videoCompressModal 是「🎬 压缩视频」弹窗：档位 + 编码器 + 模式 + 计划表 + 走任务中心。
   //
   // 用户点名的硬要求都在这里：
@@ -3225,6 +3282,8 @@ export function FilesView(content, ctx = {}) {
       ]);
 
       body.append(h('div', { style: { lineHeight: '1.7' } }, [
+        // 「按源类型给提示」放在计划区最上面：点「开始压缩」之前就能看到。
+        videoPipelineTip(plan),
         // 码率已到极限的提醒必须是第一眼看到的（判据来自后端 capped）；
         // 细节（硬链接 / 清单文件名）收进 title，不占主句。
         plan.warning ? h('div.banner-warn', [

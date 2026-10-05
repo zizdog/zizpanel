@@ -156,6 +156,14 @@ type videoPlanResponse struct {
 	Recursive   bool                `json:"recursive,omitempty"`
 	ScanSkipped []videoopt.ScanSkip `json:"scan_skipped,omitempty"`
 	ScanNotes   []string            `json:"scan_notes,omitempty"`
+
+	// Pipeline/PipelineReason 是"按源类型"的整体结论（面板只按字段渲染，不自己判源）：
+	// fast / software / mixed；PipelineFast/Software/Unknown 是三类各多少个文件。
+	Pipeline         string `json:"pipeline,omitempty"`
+	PipelineReason   string `json:"pipeline_reason,omitempty"`
+	PipelineFast     int    `json:"pipeline_fast"`
+	PipelineSoftware int    `json:"pipeline_software"`
+	PipelineUnknown  int    `json:"pipeline_unknown"`
 }
 
 // parseVideoReq 校验共用的请求参数（档位 / 码率 / 编码器 / 模式 / 质量档 / 2-pass）。
@@ -253,6 +261,61 @@ func videoSkipNotice(capped int) string {
 const videoSkipNoticeDetail = "跳过的文件仍会放进 output：同卷用硬链接、不占额外空间；并写了 " +
 	videoopt.SkippedListName
 
+// videoPipelineSummary 把逐行的管线判据聚合成面板要显示的整块结论。
+//
+// 前端**只按这些字段渲染**（fast/software/mixed + 三个计数），绝不自己重算判据；
+// 混合时给三个计数，面板据此显示「⚡ 硬件管线 N 个 · 🐢 软件解码 M 个」。
+func videoPipelineSummary(rows []videoopt.Plan) (pipeline, reason string, fast, software, unknown int) {
+	reasons := map[string]int{}
+	for _, r := range rows {
+		switch {
+		case r.PipelineReason == videoopt.PipelineReasonUnknown:
+			unknown++
+		case r.Pipeline == videoopt.PipelineFast:
+			fast++
+		default:
+			software++
+		}
+		if r.PipelineReason != "" {
+			reasons[r.PipelineReason]++
+		}
+	}
+	cats := 0
+	for _, n := range []int{fast, software, unknown} {
+		if n > 0 {
+			cats++
+		}
+	}
+	switch {
+	case cats == 0:
+		return "", "", 0, 0, 0
+	case cats > 1:
+		return "mixed", "mixed", fast, software, unknown
+	case fast > 0:
+		return videoopt.PipelineFast, videoopt.PipelineReason4K10BitHighBitrate, fast, software, unknown
+	case unknown > 0:
+		return videoopt.PipelineSoftware, videoopt.PipelineReasonUnknown, fast, software, unknown
+	default:
+		return videoopt.PipelineSoftware, solePipelineReason(reasons), fast, software, unknown
+	}
+}
+
+// solePipelineReason 返回唯一原因；多种软件原因并存时给 "mixed"
+// （细节在 title 与逐行字段里，绝不编一个假的单一原因）。
+func solePipelineReason(reasons map[string]int) string {
+	got := ""
+	for r := range reasons {
+		if got == "" {
+			got = r
+			continue
+		}
+		if r != got {
+			return "mixed"
+		}
+	}
+	return got
+}
+
 // handleFileVideoPlan 只读规划：每个视频一行（原分辨率/原码率/目标/预计大小/跳过原因）。
 func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	var req fileVideoReq
@@ -326,6 +389,8 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	resp.EstPercent, resp.EstimateUnknown = res.EstPercent, res.EstimateUnknown
 	resp.CappedSkipped, resp.PlaceCount = res.CappedSkipped, res.PlaceCount
 	resp.Recursive, resp.ScanSkipped, resp.ScanNotes = res.Recursive, res.ScanSkipped, res.ScanNotes
+	resp.Pipeline, resp.PipelineReason, resp.PipelineFast, resp.PipelineSoftware, resp.PipelineUnknown =
+		videoPipelineSummary(res.Rows)
 	resp.Warning = videoSkipNotice(res.CappedSkipped)
 	if resp.Warning != "" {
 		resp.WarningDetail = videoSkipNoticeDetail

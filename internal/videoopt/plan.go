@@ -476,6 +476,69 @@ type Plan struct {
 	// CapFPS30 表示源高于 30fps、硬件档产物会降到 30fps（任务日志会写明）。
 	FastPipeline bool `json:"fast_pipeline,omitempty"`
 	CapFPS30     bool `json:"cap_fps30,omitempty"`
+
+	// Pipeline/PipelineReason 是"按源判据这条会走哪条管线 + 为什么"的结构化下发
+	// （fast/software；reason 见 PipelineReason* 常量）——面板只按它渲染提示。
+	Pipeline       string `json:"pipeline"`
+	PipelineReason string `json:"pipeline_reason"`
+	// SrcFPS/SrcBitDepth/SrcBitrateKbps 是"快路判据"这一组的显式事实（名字是面板与
+	// 门禁认的那一组，与 SourceFPS/SourceBitDepth/SourceVideoKbps 同值）。
+	SrcFPS         float64 `json:"src_fps,omitempty"`
+	SrcBitDepth    int     `json:"src_bit_depth,omitempty"`
+	SrcBitrateKbps int     `json:"src_bitrate_kbps,omitempty"`
+}
+
+// 管线（Pipeline）：面板**只按这两个值 + PipelineDecision 的原因**渲染提示，
+// 绝不自己拿分辨率/位深重算（前端接线门禁盯着）。
+const (
+	// PipelineFast 是全 GPU 快路（硬解 + scale_vt + 硬编，见 needFastDecode）。
+	PipelineFast = "fast"
+	// PipelineSoftware 是软解路径，也是判据读不到时的兜底路径（执行时确实是它）。
+	PipelineSoftware = "software"
+)
+
+// 判据原因（机器可读短标识）；面板把它们映射成一句人话，细节进 title。
+const (
+	PipelineReason4K10BitHighBitrate = "4k_10bit_highbitrate"
+	PipelineReasonLowBitrate         = "low_bitrate"
+	PipelineReasonBitDepth8          = "bit_depth_8"
+	PipelineReasonNot4K              = "not_4k"
+	PipelineReasonUnknown            = "unknown"
+)
+
+// 快路判据的三个阈值：needFastDecode 与 PipelineDecision 共用同一份，防两处走样。
+const (
+	fastMinWidth    = 3000
+	fastMinBitDepth = 10
+	fastMinKbps     = 6000
+)
+
+// PipelineDecision 是"按源判据这条源会走哪条管线 + 为什么"的**唯一实现**（纯函数）。
+//
+// 与 needFastDecode 严格等价：pipeline == fast ⟺ needFastDecode(info)。
+// 读不到**决定性**的判据（位深 / 码率）时给 unknown，绝不猜"快"也不猜"慢"；
+// 此时 pipeline 仍是兜底的 software（执行时确实走软解，不承诺提速）。
+// 分辨率不到 4K 级时结论已定，位深/码率不影响它 ⇒ 照实给 not_4k，不报 unknown。
+func PipelineDecision(info MediaInfo) (pipeline, reason string) {
+	if info.Width <= 0 {
+		return PipelineSoftware, PipelineReasonUnknown
+	}
+	if info.Width < fastMinWidth {
+		return PipelineSoftware, PipelineReasonNot4K
+	}
+	if info.BitDepth <= 0 {
+		return PipelineSoftware, PipelineReasonUnknown
+	}
+	if info.BitDepth < fastMinBitDepth {
+		return PipelineSoftware, PipelineReasonBitDepth8
+	}
+	if info.VideoKbps <= 0 {
+		return PipelineSoftware, PipelineReasonUnknown
+	}
+	if info.VideoKbps < fastMinKbps {
+		return PipelineSoftware, PipelineReasonLowBitrate
+	}
+	return PipelineFast, PipelineReason4K10BitHighBitrate
 }
 
 // needFastDecode 判断这个源"软件解码扛不住"，值得把解码也放到 VideoToolbox 上。
@@ -493,10 +556,8 @@ type Plan struct {
 // 硬解反而慢好几倍 ⇒ **只对 4K 级 + 10bit 以上 + 码率 ≥6Mbps 的源开硬解**，
 // 其余一律软解（软解在这些源上本来就更快，硬解只会把整条链路拖慢）。
 func needFastDecode(info MediaInfo) bool {
-	if info.Width < 3000 || info.BitDepth < 10 {
-		return false
-	}
-	return info.VideoKbps >= 6000
+	pipeline, _ := PipelineDecision(info)
+	return pipeline == PipelineFast
 }
 
 // capFPS30 判断硬件档要不要把帧率降到 30（源高于 30fps 才降；读不到帧率就不动）。
@@ -866,6 +927,7 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	}
 	opts = NormalizeOptions(opts)
 	preset := opts.Preset
+	pipeline, pipelineReason := PipelineDecision(info)
 	p := Plan{
 		Name:             name,
 		Path:             srcPath,
@@ -888,6 +950,11 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		SourceBitDepth:   info.BitDepth,
 		FastPipeline:     ResolveEncoder(opts.Encoder) == EncoderHardware && needFastDecode(info),
 		CapFPS30:         ResolveEncoder(opts.Encoder) == EncoderHardware && capFPS30(info),
+		Pipeline:         pipeline,
+		PipelineReason:   pipelineReason,
+		SrcFPS:           info.FPS,
+		SrcBitDepth:      info.BitDepth,
+		SrcBitrateKbps:   info.VideoKbps,
 	}
 	if outDir != "" {
 		p.OutPath = filepath.Join(outDir, p.OutName)
