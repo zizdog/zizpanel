@@ -1,29 +1,37 @@
 package videoopt
 
-// decode_env_gate_test.go —— 「默认软件解码」与「环境提示」的唯一门禁。
+// decode_env_gate_test.go —— 「硬件档：解码策略 / 快路 argv / 三级回退 / 码率标定」的唯一门禁。
 //
-// 为什么默认**不加** -hwaccel（2026-10-04 本机 MacBook Air M4 / macOS 15.6.1 /
-// ffmpeg 9.0.1_1 —— 与面板市场安装的 ffmpeg 同一版本，实测 4K→852x480 libx264 800k）：
+// 为什么改写（2026-10-05 本机 MacBook Air M4 / macOS 15.6.1 / ffmpeg 9.0.1_1 实测，
+// 源 = 用户那段 4K60 10bit 25Mbps HEVC，目标 2592x1080，60 秒/40 秒片段，交错两轮）：
 //
-//	源              解码方式                墙钟     speed   ffmpeg CPU
-//	4K H.264        软件（现状）            1.10s    17.4x   670%
-//	4K H.264        -hwaccel videotoolbox   3.25s     4.9x   160%
-//	4K HEVC         软件（现状）            1.66s     9.3x   840%
-//	4K HEVC         -hwaccel videotoolbox   2.69s     5.7x   180%
-//	4K HEVC 10bit   软件                    1.22s     8.4x   800%
-//	4K HEVC 10bit   -hwaccel videotoolbox   1.73s     5.9x    43%
-//	只解码 4K H.264：软件 0.52s（32x） vs VT 4.29s（3.5x）
-//	硬编路径也一样：软件解码+hevc_videotoolbox 1.53s vs VT 解码 3.70s
+//	配置                                        墙钟(40s)  speed   实际码率
+//	软解+软缩放+hevc_videotoolbox q:v45 上限24M   25~28s   1.5x    14845 kbps
+//	同上 + 缩放前降到 30fps（软解仍瓶颈）          26~27s   1.5x    14808 kbps
+//	硬解 + 软缩放 + 硬编（30fps/prio_speed）       8.1~8.4s 4.8x    15085 kbps
+//	全 GPU：硬解+scale_vt+硬编（30fps/prio_speed） 5.0~5.3s 8.0x    15085 kbps
+//	全 GPU + -b:v 4500k -maxrate 4500k            5.0~5.2s 8.0x     2968 kbps
+//	libx264 veryfast -b:v 3500k（软解）            34s     1.15x     3073 kbps
+//	libx265 medium -b:v 3500k（软解，20s 片段）      —      0.6x     3483 kbps
 //
-// 结论：硬解帧要 hwdownload 回内存，x264 的帧级并行也用不上 ⇒ 加 -hwaccel 会让
-// 用户更慢（用户报障的 mini 与开发机同为 M4）。零拷贝（-hwaccel_output_format
-// videotoolbox + scale_vt）本机 ffmpeg 直接报 -22 不可用。
+// 三条结论（都写进了代码注释）：
+//  1. 硬解的价值不在"零拷贝"，而在"软件解码扛不住"：4K60 8bit 源软解 9.6~16.5x、硬解
+//     只有 2.4x（硬解有固定吞吐上限），10bit 高码率源软解 2.4x、硬解 6.4x ⇒ 判据见
+//     needFastDecode（4K 级 + 10bit↑ + ≥6Mbps 才硬解）。
+//  2. ffmpeg 9.0.1 的 -hwaccel_output_format 取值是 **videotoolbox_vld**；写
+//     `videotoolbox` 会被忽略（只是警告），随后 scale_vt 报 -22/-78 —— 旧注释里
+//     "scale_vt 不可用"其实是这个拼写错的。
+//  3. 降到 30fps 必须放在**缩放之前**：放在最后 5.98x，放最前 8.53x（少一半缩放+编码）。
 //
-// 本门禁把"默认软件解码"钉死：变异测试 = 给 TranscodeArgs 加一行 -hwaccel ⇒ 立刻变红。
+// 门禁覆盖：快路 argv 逐字形态 / 快路判据 / 三级回退（快路→软解软缩放→CPU）/
+// 1080p 档码率落在用户要的 3000~4000 kbps 区间。
+// 变异测试（必须变红）：删掉快路回退、把 fps 挪到 scale_vt 之后、hwdownload 格式猜错。
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,62 +39,357 @@ import (
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
 
-// TestDecodePolicyGate 断言默认命令里没有 -hwaccel，且既有档位参数逐字节没变。
-func TestDecodePolicyGate(t *testing.T) {
-	t.Run("① 默认 argv 逐字节固定（档位参数一个都没变）", func(t *testing.T) {
-		req := TranscodeRequest{
+// TestFastPipelineGate ①-④：argv 的逐字形态与快路判据。
+func TestFastPipelineGate(t *testing.T) {
+	hwFast := TranscodeRequest{
+		Src: "in.mkv", Dst: "out.mp4", Width: 2592, Height: 1080,
+		VideoKbps: 4500, AudioKbps: 96, DurationSec: 5,
+		Encoder: EncoderHardware, Mode: ModeBitrate, Quality: DefaultVTQuality,
+		Fast: true, SourceFPS: 60, SrcBitDepth: 10,
+	}
+
+	t.Run("① 快路 argv 逐字固定（10bit 源：硬解 + scale_vt + p010le 下载 + 降到 30fps）", func(t *testing.T) {
+		got := strings.Join(TranscodeArgs(hwFast, 0), " ")
+		want := "-hide_banner -nostdin -y -hwaccel videotoolbox -hwaccel_output_format videotoolbox_vld " +
+			"-i in.mkv -c:v hevc_videotoolbox -tag:v hvc1 -prio_speed 1 -pix_fmt yuv420p " +
+			"-b:v 4500k -maxrate 4500k -bufsize 9000k " +
+			"-vf fps=30,scale_vt=w=2592:h=1080,hwdownload,format=p010le,format=yuv420p " +
+			"-c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
+			"-loglevel error out.mp4"
+		if got != want {
+			t.Fatalf("快路 argv 变了\n got=%s\nwant=%s", got, want)
+		}
+		// -hwaccel 是输入选项：必须在 -i 之前（放后面会被当成输出选项）。
+		args := TranscodeArgs(hwFast, 0)
+		if idxOf(args, "-hwaccel") > idxOf(args, "-i") {
+			t.Fatalf("-hwaccel 必须在 -i 之前：%v", args)
+		}
+	})
+
+	t.Run("② 8bit 源：下载成 nv12；源 ≤30fps 不补帧", func(t *testing.T) {
+		req := hwFast
+		req.SrcBitDepth, req.SourceFPS = 8, 24
+		args := TranscodeArgs(req, 0)
+		if !argsHave(args, "-vf", "scale_vt=w=2592:h=1080,hwdownload,format=nv12") {
+			t.Fatalf("8bit 源必须下载成 nv12（p010le 会 -22）：%v", args)
+		}
+		for _, a := range args {
+			if strings.Contains(a, "fps=") {
+				t.Fatalf("源 24fps 不该补帧到 30（会白白多编码 25%% 帧）：%v", args)
+			}
+		}
+		// 负向对照：位深认不出（0）时按 8bit 走（拿不准就用能被软解兜住的那个）。
+		req.SrcBitDepth = 0
+		if !argsHave(TranscodeArgs(req, 0), "-vf", "scale_vt=w=2592:h=1080,hwdownload,format=nv12") {
+			t.Fatalf("位深未知时不该猜 p010le：%v", TranscodeArgs(req, 0))
+		}
+	})
+
+	t.Run("③ 非快路的硬件档：软解 + 软缩放（不加 -hwaccel），>30fps 仍降帧", func(t *testing.T) {
+		req := hwFast
+		req.Fast = false
+		args := TranscodeArgs(req, 0)
+		for _, a := range args {
+			if a == "-hwaccel" || a == "-hwaccel_output_format" || strings.Contains(a, "scale_vt") {
+				t.Fatalf("非快路不许出现硬解/GPU 缩放：%v", args)
+			}
+		}
+		if !argsHave(args, "-vf", "fps=30,scale=2592:1080") {
+			t.Fatalf("非快路的硬件档也要降帧：%v", args)
+		}
+		if !argsHave(args, "-prio_speed", "1") {
+			t.Fatalf("硬件编码器要带 -prio_speed 1（实测吞吐 5.5x→9.6x）：%v", args)
+		}
+	})
+
+	t.Run("④ CPU 档一个字不变；硬件档的码率/质量参数与 CPU 逐字相同", func(t *testing.T) {
+		base := TranscodeRequest{
 			Src: "in.mp4", Dst: "out.mp4", Width: 854, Height: 480,
 			VideoKbps: 800, AudioKbps: 96, DurationSec: 5,
 			Encoder: EncoderCPU, Mode: ModeBitrate,
 		}
-		got := strings.Join(TranscodeArgs(req, 0), " ")
+		got := strings.Join(TranscodeArgs(base, 0), " ")
 		want := "-hide_banner -nostdin -y -i in.mp4 -c:v libx264 -preset veryfast -profile:v main " +
 			"-pix_fmt yuv420p -b:v 800k -maxrate 800k -bufsize 1600k -vf scale=854:480 " +
 			"-c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
 			"-loglevel error out.mp4"
 		if got != want {
-			t.Fatalf("默认转码 argv 变了（档位语义必须逐字节不变）\n got=%s\nwant=%s", got, want)
+			t.Fatalf("CPU 档 argv 变了\n got=%s\nwant=%s", got, want)
 		}
-	})
-
-	t.Run("② 任何编码器/模式/遍数都不许出现 -hwaccel（实测硬解慢 2~8 倍）", func(t *testing.T) {
-		base := TranscodeRequest{
+		// 源 60fps 的 CPU 档不许偷偷降帧（用户没要 CPU 档变速；只有硬件档降）。
+		base.SourceFPS = 60
+		if strings.Contains(strings.Join(TranscodeArgs(base, 0), " "), "fps=30") {
+			t.Fatalf("CPU 档不该降帧：%v", TranscodeArgs(base, 0))
+		}
+		// 逐字相同：硬件档（快路/非快路）的 -b:v/-maxrate/-bufsize 必须等于 CPU 档。
+		hwReq := TranscodeRequest{
 			Src: "in.mp4", Dst: "out.mp4", Width: 854, Height: 480,
 			VideoKbps: 800, AudioKbps: 96, DurationSec: 5,
+			Encoder: EncoderHardware, Mode: ModeBitrate, SourceFPS: 60, SrcBitDepth: 10, Fast: true,
 		}
-		reqs := []TranscodeRequest{
-			withOpts(base, EncoderCPU, ModeBitrate, 0, false),
-			withOpts(base, EncoderCPU, ModeQuality, DefaultCRF, false),
-			withOpts(base, EncoderHardware, ModeBitrate, 0, false),
-			withOpts(base, EncoderHardware, ModeQuality, DefaultVTQuality, false),
-			withOpts(base, EncoderCPU, ModeBitrate, 0, true),
-		}
-		for _, req := range reqs {
-			for _, pass := range []int{0, 1, 2} {
-				args := TranscodeArgs(req, pass)
-				for _, a := range args {
-					if a == "-hwaccel" || a == "-hwaccel_output_format" {
-						t.Fatalf("%s/%s pass=%d 出现了硬解开关 %s（实测更慢）\nargv=%v",
-							req.Encoder, req.Mode, pass, a, args)
-					}
-				}
-				// 负向对照：argv 本身不能是空的（"删干净"不算通过）。
-				if !argsHave(args, "-i", "") || !argsHave(args, "-c:v", "") {
-					t.Fatalf("argv 缺 -i/-c:v：%v", args)
+		for _, fast := range []bool{true, false} {
+			hwReq.Fast = fast
+			a := TranscodeArgs(hwReq, 0)
+			for _, w := range [][2]string{{"-b:v", "800k"}, {"-maxrate", "800k"}, {"-bufsize", "1600k"}} {
+				if !argsHave(a, w[0], w[1]) {
+					t.Fatalf("硬件档（Fast=%v）码率参数与 CPU 不一致：缺 %s %s\n%v", fast, w[0], w[1], a)
 				}
 			}
 		}
-		// 档位参数仍在：-crf 26 / -q:v 45 / 缩放。
-		if a := TranscodeArgs(withOpts(base, EncoderCPU, ModeQuality, DefaultCRF, false), 0); !argsHave(a, "-crf", "26") {
-			t.Errorf("CPU 质量优先的 -crf 丢了：%v", a)
+	})
+
+	t.Run("⑤ 快路判据：只对 4K 级 + 10bit↑ + ≥6Mbps 的源开硬解", func(t *testing.T) {
+		cases := []struct {
+			name string
+			info MediaInfo
+			want bool
+		}{
+			{"用户片源 4K60 10bit 25Mbps", MediaInfo{Width: 3840, Height: 1608, BitDepth: 10, VideoKbps: 25283}, true},
+			{"4K 10bit 8Mbps", MediaInfo{Width: 3840, Height: 1608, BitDepth: 10, VideoKbps: 8000}, true},
+			{"4K 10bit 3Mbps（软解更快）", MediaInfo{Width: 3840, Height: 1608, BitDepth: 10, VideoKbps: 3000}, false},
+			{"4K 8bit 25Mbps（硬解慢 6 倍）", MediaInfo{Width: 3840, Height: 1608, BitDepth: 8, VideoKbps: 25000}, false},
+			{"4K 位深未知", MediaInfo{Width: 3840, Height: 1608, BitDepth: 0, VideoKbps: 25000}, false},
+			{"1080p 10bit 8Mbps（像素太少，软解够快）", MediaInfo{Width: 1920, Height: 1080, BitDepth: 10, VideoKbps: 8000}, false},
 		}
-		if a := TranscodeArgs(withOpts(base, EncoderHardware, ModeQuality, DefaultVTQuality, false), 0); !argsHave(a, "-q:v", "45") {
-			t.Errorf("硬件质量优先的 -q:v 丢了：%v", a)
-		}
-		if a := TranscodeArgs(base, 0); !argsHave(a, "-vf", "scale=854:480") {
-			t.Errorf("缩放参数丢了：%v", a)
+		for _, c := range cases {
+			if got := needFastDecode(c.info); got != c.want {
+				t.Errorf("%s：needFastDecode=%v，应为 %v", c.name, got, c.want)
+			}
 		}
 	})
+
+	t.Run("⑧ 探测→规划→argv 一条链：帧率/位深真的传下来了", func(t *testing.T) {
+		// 真实 ffprobe 输出的形状（用户那段 4K60 10bit 源）。
+		raw := []byte(`{"streams":[
+			{"codec_type":"video","codec_name":"hevc","width":3840,"height":1608,
+			 "r_frame_rate":"60/1","avg_frame_rate":"60/1","pix_fmt":"yuv420p10le"},
+			{"codec_type":"audio","codec_name":"eac3","bit_rate":"256000"}],
+			"format":{"duration":"6228.448000","bit_rate":"25283554","size":"19684662933"}}`)
+		info, err := ParseProbeJSON(raw, 19684662933)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.FPS != 60 || info.BitDepth != 10 || info.Width != 3840 || info.Height != 1608 {
+			t.Fatalf("探测结果不对：fps=%v depth=%d %dx%d", info.FPS, info.BitDepth, info.Width, info.Height)
+		}
+		preset, _ := FindPreset("1080p")
+		hw := PlanOne("a.mkv", "/tmp/a.mkv", "/tmp/out", info,
+			Options{Preset: preset, Encoder: EncoderHardware, Mode: ModeBitrate}, false)
+		if !hw.FastPipeline || !hw.CapFPS30 || hw.SourceBitDepth != 10 || hw.SourceFPS != 60 {
+			t.Fatalf("10bit 4K60 高码率源必须走快路且降帧：%+v", hw)
+		}
+		if hw.TargetWidth != 2592 || hw.TargetHeight != 1080 {
+			t.Fatalf("1080p 档对齐后应是 2592x1080：%dx%d", hw.TargetWidth, hw.TargetHeight)
+		}
+		args := TranscodeArgs(TranscodeRequest{
+			Src: hw.Path, Dst: "o.mp4", Width: hw.TargetWidth, Height: hw.TargetHeight,
+			VideoKbps: hw.VideoKbps, Mode: hw.Mode, Encoder: hw.Encoder, Quality: hw.Quality,
+			Fast: hw.FastPipeline, SourceFPS: hw.SourceFPS, SrcBitDepth: hw.SourceBitDepth,
+		}, 0)
+		for _, w := range [][2]string{
+			{"-hwaccel_output_format", "videotoolbox_vld"},
+			{"-prio_speed", "1"},
+			{"-vf", "fps=30,scale_vt=w=2592:h=1080,hwdownload,format=p010le,format=yuv420p"},
+		} {
+			if !argsHave(args, w[0], w[1]) {
+				t.Fatalf("规划出来的 argv 缺 %s %s：%v", w[0], w[1], args)
+			}
+		}
+		// CPU 档同一份源：不快路、也不降帧（CPU 档保持源帧率）。
+		cpu := PlanOne("a.mkv", "/tmp/a.mkv", "/tmp/out", info,
+			Options{Preset: preset, Encoder: EncoderCPU, Mode: ModeBitrate}, false)
+		if cpu.FastPipeline || cpu.CapFPS30 {
+			t.Fatalf("CPU 档不该走快路/降帧：%+v", cpu)
+		}
+		// 8bit 24fps 源：不快路、不补帧；帧率读不到（0/0）时也不动帧率。
+		info8 := info
+		info8.BitDepth, info8.FPS = 8, 24
+		if needFastDecode(info8) || capFPS30(info8) {
+			t.Fatalf("8bit 24fps 源不该快路/降帧")
+		}
+		unknown, err := ParseProbeJSON([]byte(`{"streams":[{"codec_type":"video","codec_name":"h264",
+			"width":3840,"height":1608,"r_frame_rate":"0/0","avg_frame_rate":"0/0","pix_fmt":"yuv420p"}],
+			"format":{"duration":"10","bit_rate":"25283554"}}`), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unknown.FPS != 0 || unknown.BitDepth != 8 || capFPS30(unknown) {
+			t.Fatalf("帧率读不到时不该乱降帧：fps=%v depth=%d", unknown.FPS, unknown.BitDepth)
+		}
+	})
+}
+
+// failRunner 是"按条件失败"的假执行器：用来断言回退链真的换了参数重跑。
+type failRunner struct {
+	gateRunner
+	failFast bool // Fast=true 的请求直接失败（模拟 scale_vt 不可用）
+	failHW   bool // 硬件编码的请求直接失败（模拟 hevc_videotoolbox 不可用）
+}
+
+func (f *failRunner) Transcode(ctx context.Context, req TranscodeRequest, onProgress func(Progress)) error {
+	f.reqs = append(f.reqs, req)
+	if f.failFast && req.Fast {
+		return fmt.Errorf("模拟：No such filter: 'scale_vt'")
+	}
+	if f.failHW && req.Encoder == EncoderHardware {
+		return fmt.Errorf("模拟：hevc_videotoolbox 初始化失败")
+	}
+	if err := os.MkdirAll(filepath.Dir(req.Dst), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(req.Dst, bytes.Repeat([]byte{7}, int(f.outBytes)), 0o644)
+}
+
+// TestFastPipelineFallbackGate ⑥：三级回退（快路 → 软解软缩放 → CPU）逐级生效且写明原因。
+func TestFastPipelineFallbackGate(t *testing.T) {
+	rows := func(dir string) []Plan {
+		name := "a.mkv"
+		return []Plan{{
+			Name: name, Path: filepath.Join(dir, name), OutPath: filepath.Join(dir, "output", name+".1080p.mp4"),
+			SourceBytes: 4096, DurationSec: 5, TargetWidth: 2592, TargetHeight: 1080,
+			VideoKbps: 4500, AudioKbps: 96, Encoder: EncoderHardware, Mode: ModeBitrate,
+			SourceWidth: 3840, SourceHeight: 1608, SourceFPS: 60, SourceBitDepth: 10,
+			FastPipeline: true, CapFPS30: true, Quality: DefaultVTQuality,
+		}}
+	}
+	setup := func(t *testing.T) (string, map[string]MediaInfo) {
+		t.Helper()
+		dir := t.TempDir()
+		p := filepath.Join(dir, "a.mkv")
+		if err := os.WriteFile(p, make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir, map[string]MediaInfo{p: {}}
+	}
+
+	t.Run("快路失败 ⇒ 软解软缩放重试（编码器不变、Fast 清掉、日志写明）", func(t *testing.T) {
+		dir, infos := setup(t)
+		runner := &failRunner{gateRunner: gateRunner{infos: infos, outBytes: 500}, failFast: true}
+		var logs []string
+		res, err := RunPlan(context.Background(), filepath.Join(dir, "output"), rows(dir), runner,
+			Hooks{Log: func(level, msg string) { logs = append(logs, level+"|"+msg) }})
+		if err != nil || res.Done != 1 {
+			t.Fatalf("回退后应成功：err=%v done=%d", err, res.Done)
+		}
+		if len(runner.reqs) != 2 {
+			t.Fatalf("应有 2 次尝试（快路 + 软解软缩放），实际 %d：%+v", len(runner.reqs), runner.reqs)
+		}
+		if !runner.reqs[0].Fast || runner.reqs[1].Fast {
+			t.Fatalf("第二次必须清掉 Fast：%+v", runner.reqs)
+		}
+		if runner.reqs[1].Encoder != EncoderHardware {
+			t.Fatalf("只是解码/缩放回退，编码器不该变：%+v", runner.reqs[1])
+		}
+		// 第二次 argv 不许再出现硬解/GPU 缩放（否则等于没回退）。
+		a2 := TranscodeArgs(runner.reqs[1], 0)
+		for _, a := range a2 {
+			if a == "-hwaccel" || a == "-hwaccel_output_format" || strings.Contains(a, "scale_vt") {
+				t.Fatalf("回退后的 argv 还带着硬解/GPU 缩放：%v", a2)
+			}
+		}
+		if res.Items[0].EncoderFallback {
+			t.Fatalf("这是解码回退、不是编码回退，不该标 EncoderFallback")
+		}
+		if !hasLine(logs, "全 GPU 加速不可用，已回退软件解码/缩放重试") {
+			t.Fatalf("必须如实写明回退原因，实际日志：%v", logs)
+		}
+	})
+
+	t.Run("快路+硬件都失败 ⇒ CPU 编码（清掉 Fast、结果标已回退、两条日志都在）", func(t *testing.T) {
+		dir, infos := setup(t)
+		runner := &failRunner{gateRunner: gateRunner{infos: infos, outBytes: 500}, failFast: true, failHW: true}
+		var logs []string
+		res, err := RunPlan(context.Background(), filepath.Join(dir, "output"), rows(dir), runner,
+			Hooks{Log: func(level, msg string) { logs = append(logs, level+"|"+msg) }})
+		if err != nil || res.Done != 1 {
+			t.Fatalf("CPU 兜底后应成功：err=%v done=%d", err, res.Done)
+		}
+		if len(runner.reqs) != 3 {
+			t.Fatalf("应有 3 次尝试（快路 + 软解软缩放 + CPU），实际 %d：%+v", len(runner.reqs), runner.reqs)
+		}
+		cpu := runner.reqs[2]
+		if cpu.Encoder != EncoderCPU || cpu.Fast {
+			t.Fatalf("第三次必须是 CPU 且不带快路：%+v", cpu)
+		}
+		ca := TranscodeArgs(cpu, 0)
+		if !argsHave(ca, "-c:v", "libx264") {
+			t.Fatalf("CPU 兜底的 argv 不对：%v", ca)
+		}
+		for _, a := range ca {
+			if a == "-hwaccel" || a == "-hwaccel_output_format" {
+				t.Fatalf("CPU 兜底不许带硬解：%v", ca)
+			}
+		}
+		if !res.Items[0].EncoderFallback {
+			t.Fatalf("CPU 兜底必须在结果里标「已回退」")
+		}
+		if !hasLine(logs, "全 GPU 加速不可用，已回退软件解码/缩放重试") || !hasLine(logs, "硬件编码失败，已回退软件编码重试") {
+			t.Fatalf("两条回退都要如实写明，实际日志：%v", logs)
+		}
+	})
+
+	t.Run("负向对照：一切正常时只跑一次，日志里不许出现任何回退", func(t *testing.T) {
+		dir, infos := setup(t)
+		runner := &failRunner{gateRunner: gateRunner{infos: infos, outBytes: 500}}
+		var logs []string
+		res, err := RunPlan(context.Background(), filepath.Join(dir, "output"), rows(dir), runner,
+			Hooks{Log: func(level, msg string) { logs = append(logs, level+"|"+msg) }})
+		if err != nil || res.Done != 1 || len(runner.reqs) != 1 {
+			t.Fatalf("正常路径应只跑一次：err=%v done=%d reqs=%d", err, res.Done, len(runner.reqs))
+		}
+		if !runner.reqs[0].Fast {
+			t.Fatalf("计划标了 FastPipeline，请求就该带 Fast：%+v", runner.reqs[0])
+		}
+		if hasLine(logs, "回退") {
+			t.Fatalf("没失败就不许写回退日志：%v", logs)
+		}
+		// 任务日志要说清楚走的是哪条管线（全 GPU / 软解硬编 / 降到 30fps）。
+		if !hasLine(logs, "全 GPU（硬解+GPU 缩放）") || !hasLine(logs, "降到 30fps") {
+			t.Fatalf("日志必须写明管线与降帧，实际：%v", logs)
+		}
+	})
+}
+
+// TestVideoBitrateCalibrationGate ⑦：1080p 档的码率必须落在用户要的 3000~4000 kbps。
+//
+// 标定依据（本机实测，4K60 10bit → 2592x1080，60 秒片段，hevc_videotoolbox 快路）：
+//
+//	-b:v/-maxrate 3500k → 实测 2439 kbps    4000k → 2752 kbps
+//	4500k → 3052 kbps ✅落在区间              5000k → 3280 kbps ✅
+//
+// 硬件编码器的平均码率只有请求值的 ~0.68 倍（-maxrate 会压低平均），所以 1080p 档
+// 默认 3000（面板下限）与已有的 4500 选项合起来正好覆盖用户要的 3~4 Mbps。
+func TestVideoBitrateCalibrationGate(t *testing.T) {
+	p, ok := FindPreset("1080p")
+	if !ok {
+		t.Fatal("没有 1080p 档")
+	}
+	if p.DefaultKbps < 3000 || p.DefaultKbps > 4000 {
+		t.Errorf("1080p 档默认码率 %d kbps 不在用户要的 3000~4000 区间", p.DefaultKbps)
+	}
+	got4500 := false
+	for _, c := range BitrateChoices(p) {
+		if c.KBps >= 3000 && c.KBps <= 4000 {
+			got4500 = true
+		}
+	}
+	if !got4500 {
+		t.Errorf("1080p 档必须给一个落在 3000~4000 kbps 的选项（硬件档实测要 4500k 请求才够）")
+	}
+	// 标定值真的进 argv：1080p + 目标码率 + 硬件档。
+	req := TranscodeRequest{
+		Src: "in.mkv", Dst: "out.mp4", Width: 2592, Height: 1080,
+		VideoKbps: p.DefaultKbps, AudioKbps: 96, DurationSec: 5,
+		Encoder: EncoderHardware, Mode: ModeBitrate, SourceFPS: 60, SrcBitDepth: 10, Fast: true,
+	}
+	args := TranscodeArgs(req, 0)
+	def := fmt.Sprintf("%dk", p.DefaultKbps)
+	if !argsHave(args, "-b:v", def) || !argsHave(args, "-maxrate", def) {
+		t.Fatalf("1080p 档的标定码率（%s）没进 argv：%v", def, args)
+	}
+	if !argsHave(args, "-vf", "fps=30,scale_vt=w=2592:h=1080,hwdownload,format=p010le,format=yuv420p") {
+		t.Fatalf("1080p 档的快路缩放链不对：%v", args)
+	}
 }
 
 // TestEnvNotesGate 断言环境提示（别的 ffmpeg / swap / 负载）只在真异常时出现。
@@ -201,6 +504,26 @@ func argsHave(args []string, flag, value string) bool {
 			continue
 		}
 		if value == "" || (i+1 < len(args) && args[i+1] == value) {
+			return true
+		}
+	}
+	return false
+}
+
+// idxOf 返回 flag 在 argv 里的下标（找不到返回 len）。
+func idxOf(args []string, flag string) int {
+	for i, a := range args {
+		if a == flag {
+			return i
+		}
+	}
+	return len(args)
+}
+
+// hasLine 断言日志里有包含这段文字的行。
+func hasLine(logs []string, want string) bool {
+	for _, l := range logs {
+		if strings.Contains(l, want) {
 			return true
 		}
 	}

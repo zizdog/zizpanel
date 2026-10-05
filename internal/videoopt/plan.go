@@ -349,7 +349,7 @@ func EncoderChoices() []Choice {
 		{Value: EncoderCPU, Label: "CPU（x264）",
 			Hint: "默认：同码率画质更好、码率控制更准"},
 		{Value: EncoderHardware, Label: "硬件加速（HEVC）",
-			Hint: "改用 hevc_videotoolbox（更快）；码率设置不变，只有质量档刻度不同"},
+			Hint: "hevc_videotoolbox + 硬解/GPU 缩放（快 3~8 倍）；源超过 30fps 时降到 30fps"},
 	}
 }
 
@@ -395,6 +395,10 @@ type MediaInfo struct {
 	HasVideo       bool `json:"has_video"`
 	// Codec 是视频流编码名（ffprobe 的 codec_name，如 h264/hevc/vp9）；读不到为空。
 	Codec string `json:"codec,omitempty"`
+	// FPS 是源帧率（ffprobe r_frame_rate/avg_frame_rate）；0 = 读不到（绝不猜）。
+	FPS float64 `json:"fps,omitempty"`
+	// BitDepth 是源位深（8/10；从 pix_fmt 判）；0 = 认不出（走不依赖位深的软解路）。
+	BitDepth int `json:"bit_depth,omitempty"`
 }
 
 // Plan 是一个视频文件的压缩计划（同时是 /video-plan 的一行）。
@@ -464,7 +468,45 @@ type Plan struct {
 	// EstPercent 是预计省下的百分比；EstimateUnknown=true（质量优先）时无意义。
 	EstPercent      int  `json:"est_percent,omitempty"`
 	EstimateUnknown bool `json:"estimate_unknown,omitempty"`
+	// SourceFPS 是源帧率（0 = 读不到）：硬件档据此决定要不要降到 30fps。
+	SourceFPS float64 `json:"source_fps,omitempty"`
+	// SourceBitDepth 是源位深（8/10；0 = 认不出）：决定 GPU 快路的下载格式。
+	SourceBitDepth int `json:"source_bit_depth,omitempty"`
+	// FastPipeline 表示这个文件走 VideoToolbox 全 GPU 快路（硬解 + GPU 缩放 + 硬编）；
+	// CapFPS30 表示源高于 30fps、硬件档产物会降到 30fps（任务日志会写明）。
+	FastPipeline bool `json:"fast_pipeline,omitempty"`
+	CapFPS30     bool `json:"cap_fps30,omitempty"`
 }
+
+// needFastDecode 判断这个源"软件解码扛不住"，值得把解码也放到 VideoToolbox 上。
+//
+// 本机 MacBook Air M4 / ffmpeg 9.0.1 / 4K60 实测解码吞吐（2026-10-05，20 秒片段，
+// ffmpeg -progress 自报的 speed=）：
+//
+//	8bit   3 Mbps：软解 16.5x · 硬解 2.4x  ⇒ 软解赢
+//	8bit  15 Mbps：软解  9.6x · 硬解 2.3x  ⇒ 软解赢（x264/x265 编的同码率源同样）
+//	10bit  3 Mbps：软解  8.0x · 硬解 7.1x  ⇒ 平
+//	10bit  8 Mbps：软解  5.7x · 硬解 7.1x  ⇒ 硬解赢
+//	10bit 25 Mbps：软解  2.4x · 硬解 6.4x  ⇒ 硬解赢 2.6 倍（用户这段片源）
+//
+// 硬件解码有固定吞吐上限（4K 8bit ≈140fps、10bit ≈400fps），所以低码率/8bit 源上
+// 硬解反而慢好几倍 ⇒ **只对 4K 级 + 10bit 以上 + 码率 ≥6Mbps 的源开硬解**，
+// 其余一律软解（软解在这些源上本来就更快，硬解只会把整条链路拖慢）。
+func needFastDecode(info MediaInfo) bool {
+	if info.Width < 3000 || info.BitDepth < 10 {
+		return false
+	}
+	return info.VideoKbps >= 6000
+}
+
+// capFPS30 判断硬件档要不要把帧率降到 30（源高于 30fps 才降；读不到帧率就不动）。
+func capFPS30(info MediaInfo) bool {
+	return info.FPS > maxOutputFPS
+}
+
+// maxOutputFPS 是硬件档的输出帧率上限：60fps 源压成 30fps 画面几乎无差，
+// 但缩放/编码的工作量少一半（实测 5.98x → 8.53x）。
+const maxOutputFPS = 30
 
 // Runnable 表示这一行真的会被压缩。
 func (p Plan) Runnable() bool { return p.SkipReason == "" && p.VideoKbps > 0 }
@@ -842,6 +884,10 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		Mode:             opts.Mode,
 		Quality:          opts.Quality,
 		TwoPass:          opts.TwoPass,
+		SourceFPS:        info.FPS,
+		SourceBitDepth:   info.BitDepth,
+		FastPipeline:     ResolveEncoder(opts.Encoder) == EncoderHardware && needFastDecode(info),
+		CapFPS30:         ResolveEncoder(opts.Encoder) == EncoderHardware && capFPS30(info),
 	}
 	if outDir != "" {
 		p.OutPath = filepath.Join(outDir, p.OutName)

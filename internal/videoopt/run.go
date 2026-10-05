@@ -73,6 +73,13 @@ type TranscodeRequest struct {
 	TwoPass bool
 	// PassLog 是 2-pass 的日志前缀（必须落在临时目录，任务结束清理）。
 	PassLog string
+	// Fast 表示走 VideoToolbox 全 GPU 快路（硬解 → scale_vt → 硬编，帧不回内存）。
+	// 只有"软件解码扛不住"的源才会开（见 needFastDecode）；跑不通由 RunPlan 逐级回退。
+	Fast bool
+	// SourceFPS 是源帧率（0 = 读不到）：>30 时在缩放前降到 30fps。
+	SourceFPS float64
+	// SrcBitDepth 是源位深（8/10；0 = 认不出）：决定 hwdownload 指名的软件格式。
+	SrcBitDepth int
 }
 
 // EncoderCodec 是"编码器选项 → ffmpeg -c:v"的**唯一映射点**（面板/日志/执行都读它）。
@@ -94,13 +101,24 @@ func EncoderCodec(encoder string) string {
 // quality 与 passlogfile 都走参数，绝不落进 shell 字符串拼接。
 //
 // 硬件档只换 -c:v，码率/质量参数与 CPU **逐字节相同**（用户点名"码率不变"）。
+//
+// 硬件档 = 快路：能硬解就整条管线留在 VideoToolbox（-hwaccel_output_format
+// videotoolbox_vld + scale_vt），源高于 30fps 时在缩放前降到 30fps，编码器加
+// -prio_speed 1；不能硬解（8bit/低码率源，硬解反而慢）就还是软解 + 软缩放。
 func TranscodeArgs(req TranscodeRequest, pass int) []string {
-	// 解码**故意不加** -hwaccel：本机 M4 + ffmpeg 9.0.1 实测硬解让同一条链路慢
-	// 2~8 倍（硬解帧要 hwdownload 回内存，x264 的帧级并行也用不上；见 decode_gate_test.go 的实测表）。
-	args := []string{"-hide_banner", "-nostdin", "-y", "-i", req.Src}
-	if ResolveEncoder(req.Encoder) == EncoderHardware {
+	hw := ResolveEncoder(req.Encoder) == EncoderHardware
+	fast := hw && req.Fast
+	// -hwaccel 是**输入选项**，必须出现在 -i 之前。
+	args := []string{"-hide_banner", "-nostdin", "-y"}
+	if fast {
+		args = append(args, "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld")
+	}
+	args = append(args, "-i", req.Src)
+	if hw {
 		// VideoToolbox 硬件编码，快很多；同码率画质略逊于 x264，码率控制也不够准。
-		args = append(args, "-c:v", EncoderCodec(req.Encoder), "-tag:v", "hvc1")
+		args = append(args, "-c:v", EncoderCodec(req.Encoder), "-tag:v", "hvc1",
+			// -prio_speed 1 实测把硬件编码器吞吐从 5.5x 提到 9.6x（同码率 SSIM 差 <0.1%）。
+			"-prio_speed", "1")
 	} else {
 		args = append(args, "-c:v", EncoderCodec(req.Encoder), "-preset", "veryfast", "-profile:v", "main")
 	}
@@ -126,7 +144,7 @@ func TranscodeArgs(req TranscodeRequest, pass int) []string {
 			"-bufsize", fmt.Sprintf("%dk", req.VideoKbps*2))
 	}
 	if req.Width > 0 && req.Height > 0 {
-		args = append(args, "-vf", fmt.Sprintf("scale=%d:%d", req.Width, req.Height))
+		args = append(args, "-vf", scaleFilter(req, hw))
 	}
 	if req.TwoPass && pass > 0 {
 		args = append(args, "-pass", strconv.Itoa(pass), "-passlogfile", req.PassLog)
@@ -153,6 +171,33 @@ func TranscodeArgs(req TranscodeRequest, pass int) []string {
 		req.Dst,
 	)
 	return args
+}
+
+// scaleFilter 返回缩放的滤镜链（三种形态，门禁逐字断言）。
+//
+//	快路（Fast）：硬解帧留在 GPU，scale_vt 缩放后下载成 8bit yuv420p 交给编码器
+//	  —— 10bit 源的 VT 帧是 p010le、8bit 是 nv12，指名软件格式（猜错 ffmpeg 直接 -22）。
+//	硬件档非快路：软解 + 软缩放，只在源高于 30fps 时先降帧（省一半缩放/编码）。
+//	CPU 档：不变（scale=W:H，保持源帧率）。
+func scaleFilter(req TranscodeRequest, hw bool) string {
+	capFPS := hw && req.SourceFPS > maxOutputFPS
+	if req.Fast {
+		parts := []string{}
+		if capFPS {
+			parts = append(parts, fmt.Sprintf("fps=%d", maxOutputFPS))
+		}
+		parts = append(parts, fmt.Sprintf("scale_vt=w=%d:h=%d", req.Width, req.Height))
+		if req.SrcBitDepth >= 10 {
+			parts = append(parts, "hwdownload,format=p010le", "format=yuv420p")
+		} else {
+			parts = append(parts, "hwdownload,format=nv12")
+		}
+		return strings.Join(parts, ",")
+	}
+	if capFPS {
+		return fmt.Sprintf("fps=%d,scale=%d:%d", maxOutputFPS, req.Width, req.Height)
+	}
+	return fmt.Sprintf("scale=%d:%d", req.Width, req.Height)
 }
 
 // Runner 是"探测一个文件 + 转码一个文件"的能力。
@@ -871,9 +916,21 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		if row.TwoPass {
 			passTag = " · 2-pass"
 		}
-		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s %s%s）",
+		// 硬件档的两种形态都要在日志里说清楚（用户点名"不支持时如实回退 + 日志写明"）。
+		pipeTag := ""
+		if row.Encoder == EncoderHardware {
+			if row.FastPipeline {
+				pipeTag = " · 全 GPU（硬解+GPU 缩放）"
+			} else {
+				pipeTag = " · 软解 + 硬编"
+			}
+			if row.CapFPS30 {
+				pipeTag += fmt.Sprintf(" · 降到 %dfps", maxOutputFPS)
+			}
+		}
+		hooks.log(tasks.LevelStep, fmt.Sprintf("▶ 第 %d/%d 个：%s（%dx%d → %dx%d，%s %s%s%s）",
 			i+1, total, row.DisplayName(), row.SourceWidth, row.SourceHeight,
-			row.TargetWidth, row.TargetHeight, EncoderCodec(row.Encoder), modeTag, passTag))
+			row.TargetWidth, row.TargetHeight, EncoderCodec(row.Encoder), modeTag, pipeTag, passTag))
 		if row.Capped && row.Note != "" {
 			hooks.log(tasks.LevelWarn, row.Note)
 		}
@@ -903,6 +960,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			DurationSec: row.DurationSec,
 			Encoder:     row.Encoder, Mode: row.Mode, Quality: row.Quality,
 			TwoPass: row.TwoPass, PassLog: passLog,
+			Fast: row.FastPipeline, SourceFPS: row.SourceFPS, SrcBitDepth: row.SourceBitDepth,
 		}
 		// runTranscode 跑一遍（自动挂看门狗）：stalled=true 表示被看门狗中止。
 		runTranscode := func(rreq TranscodeRequest) (err error, stalled bool) {
@@ -930,6 +988,14 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			return err, false
 		}
 		rerr, stalled := runTranscode(req)
+		// 全 GPU 快路跑不通（老 ffmpeg 没有 scale_vt / 这个源的硬解或位深不兼容…）：
+		// 如实说明原因，回退**软件解码 + 软件缩放**再跑一遍（硬件编码不变）。
+		if rerr != nil && req.Fast && ctx.Err() == nil && !stalled {
+			hooks.log(tasks.LevelWarn, "⚠ 全 GPU 加速不可用，已回退软件解码/缩放重试："+
+				row.DisplayName()+"（"+oneLine(rerr.Error())+"）")
+			_ = os.Remove(part)
+			rerr, _ = runTranscode(safeFallback(req))
+		}
 		// 硬件编码失败：如实回退一次软件编码（结果里标出来），绝不整批跟着挂。
 		// 看门狗中止的不在此列：那种情况按用户口径记失败并继续下一个文件。
 		if rerr != nil && row.Encoder == EncoderHardware && ctx.Err() == nil && !stalled {
@@ -1449,11 +1515,21 @@ func shortWait(d time.Duration) string {
 	}
 }
 
+// safeFallback 把"全 GPU 快路"降级成"软件解码 + 软件缩放 + 硬件编码"：
+// 只有解码/缩放变回软件，编码器与所有码率/质量参数一个不动。
+func safeFallback(req TranscodeRequest) TranscodeRequest {
+	out := req
+	out.Fast = false
+	return out
+}
+
 // cpuFallback 把一次硬件转码请求改成 CPU（libx264）等价请求：
 // 码率/尺寸一个不动，只有质量优先模式要把 -q:v 折算成 -crf。
+// Fast 必须清掉：CPU 档的解码/缩放一律走软件（-hwaccel/scale_vt 是硬件档专属）。
 func cpuFallback(req TranscodeRequest) TranscodeRequest {
 	out := req
 	out.Encoder = EncoderCPU
+	out.Fast = false
 	if ResolveMode(req.Mode) == ModeQuality {
 		out.Quality = HardwareQualityToCRF(req.Quality)
 	}

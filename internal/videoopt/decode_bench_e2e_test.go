@@ -2,13 +2,16 @@
 
 package videoopt
 
-// decode_bench_e2e_test.go —— 真 ffmpeg 的 4K→480p「解码方式」对照（用户报障的同一形态）。
+// decode_bench_e2e_test.go —— 真 ffmpeg 的 4K→480p「解码方式」对照（CPU 档专用）。
 //
 //	go test -tags ffmpeg_e2e ./internal/videoopt/ -run TestDecodeBenchE2E -v
 //
-// 两遍都是真跑：① 生产代码路径（BuildPlan + RunPlan，当前 = 软件解码）；
-// ② 同样的命令把 -hwaccel videotoolbox 插到 -i 之前（父代理假设的"改动后"）。
-// 报告 speed= 与墙钟 —— 这正是"该不该默认加硬解"的判据。
+// 两遍都是真跑：① 生产代码路径（BuildPlan + RunPlan，CPU 档 = 软件解码）；
+// ② 同样的命令把 -hwaccel videotoolbox 插到 -i 之前。
+//
+// ⚠ 这里的样本是合成 4K30 H.264、目标是 480p + libx264，编码器才是瓶颈 ⇒ **它只说明
+// CPU 档该保持软件解码**。硬件档的快路（硬解 + scale_vt + 硬编、降到 30fps）在
+// 真实 4K60 10bit 高码率源上快 3~8 倍，实测表见 decode_env_gate_test.go 文件头。
 // 样本全在 t.TempDir()，不碰用户目录。
 
 import (
@@ -114,7 +117,7 @@ func TestDecodeBenchE2E(t *testing.T) {
 	if !inserted {
 		t.Fatal("没找到 -i，命令形态变了")
 	}
-	// 断言生产 argv 本身没有硬解（本测试的另一半判据）。
+	// 断言 CPU 档的生产 argv 没有硬解（CPU 档保持软解；硬件档的快路另有门禁）。
 	for _, a := range TranscodeArgs(TranscodeRequest{
 		Src: row.Path, Dst: filepath.Join(dir, "prod.mp4"),
 		Width: row.TargetWidth, Height: row.TargetHeight,
@@ -122,7 +125,7 @@ func TestDecodeBenchE2E(t *testing.T) {
 		Encoder: row.Encoder, Mode: row.Mode, Quality: row.Quality,
 	}, 0) {
 		if a == "-hwaccel" {
-			t.Fatal("生产 argv 里出现了 -hwaccel（实测更慢，不该有）")
+			t.Fatal("CPU 档的 argv 里出现了 -hwaccel（CPU 档保持软件解码）")
 		}
 	}
 	hwWall, hwSpeed := e2eRunArgs(t, ffmpeg, hwArgs)

@@ -47,6 +47,10 @@ type probeJSON struct {
 		Height    int    `json:"height"`
 		BitRate   string `json:"bit_rate"`
 		Duration  string `json:"duration"`
+		// RFrameRate/AvgFrameRate/PixFmt 决定"要不要硬解"与"降到 30fps"（见 needFastDecode）。
+		RFrameRate   string `json:"r_frame_rate"`
+		AvgFrameRate string `json:"avg_frame_rate"`
+		PixFmt       string `json:"pix_fmt"`
 	} `json:"streams"`
 	Format struct {
 		Duration string `json:"duration"`
@@ -83,6 +87,11 @@ func ParseProbeJSON(raw []byte, fileBytes int64) (MediaInfo, error) {
 				info.Width, info.Height = s.Width, s.Height
 				info.VideoKbps = kbpsFromBits(s.BitRate)
 				info.Codec = s.CodecName
+				info.FPS = parseRate(s.RFrameRate)
+				if info.FPS <= 0 {
+					info.FPS = parseRate(s.AvgFrameRate)
+				}
+				info.BitDepth = bitDepthFromPixFmt(s.PixFmt)
 			}
 		case "audio":
 			info.HasAudio = true
@@ -145,6 +154,51 @@ func CodecLabel(codec string) string {
 		return l
 	}
 	return strings.ToUpper(c)
+}
+
+// parseRate 解析 ffprobe 的帧率字符串（"60/1" → 60；"0/0"/"N/A" → 0 = 读不到）。
+func parseRate(s string) float64 {
+	num, den, ok := strings.Cut(strings.TrimSpace(s), "/")
+	if !ok {
+		return 0
+	}
+	n, err1 := strconv.ParseFloat(strings.TrimSpace(num), 64)
+	d, err2 := strconv.ParseFloat(strings.TrimSpace(den), 64)
+	if err1 != nil || err2 != nil || d == 0 || n <= 0 {
+		return 0
+	}
+	return n / d
+}
+
+// bitDepthFromPixFmt 只认能确定的位深：8 / 10；认不出返回 0（=不猜，走不依赖位深的老路）。
+//
+// 为什么要它：全 GPU 快路的 hwdownload 必须指名软件格式（10bit 的 VT 帧是 p010le、
+// 8bit 是 nv12，猜错直接 -22）。nv12/nv16 里带"12/16"但不是位深，所以不能按子串扫。
+func bitDepthFromPixFmt(s string) int {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return 0
+	}
+	tenBit := []string{
+		"yuv420p10le", "yuv420p10be", "yuv422p10le", "yuv422p10be",
+		"yuv444p10le", "yuv444p10be", "p010le", "p010be", "p210le", "p210be",
+		"p410le", "p410be", "x2rgb10le", "x2bgr10le", "gray10le", "gray10be",
+	}
+	for _, p := range tenBit {
+		if s == p {
+			return 10
+		}
+	}
+	eightBit := []string{
+		"yuv420p", "yuvj420p", "yuv422p", "yuvj422p", "yuv444p", "yuvj444p",
+		"nv12", "nv21", "nv16", "nv24", "nv42", "yuyv422", "uyvy422", "gray",
+	}
+	for _, p := range eightBit {
+		if s == p {
+			return 8
+		}
+	}
+	return 0
 }
 
 // parseSeconds 解析 ffprobe 的时长字符串（"N/A" 或空值算 0）。
