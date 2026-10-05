@@ -908,6 +908,10 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			// CRF（越小越好）与 -q:v（越大越好）不是同一把尺子，日志分开写名称。
 			if row.Encoder == EncoderCPU {
 				modeTag = fmt.Sprintf("CRF %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
+			} else if row.EstKbps > 0 {
+				// 硬件无真 CRF：如实写"有上限质量模式"与按标定算出的实际码率。
+				modeTag = fmt.Sprintf("质量档 %d（有上限 %d kbps，实际≈%d kbps）",
+					row.Quality, row.MaxRateKbps, row.EstKbps)
 			} else {
 				modeTag = fmt.Sprintf("质量档 %d（上限 %d kbps）", row.Quality, row.MaxRateKbps)
 			}

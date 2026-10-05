@@ -3197,18 +3197,30 @@ export function FilesView(content, ctx = {}) {
 
       // 目标码率 / 质量档：二选一（由模式决定）。
       // 两者的刻度**方向相反**（CRF 越小越好 / -q:v 越大越好），标签必须写清。
+      // 硬件质量档没有真 CRF（有上限质量模式），细节收进 option 的 title。
       let tuneField;
       if (plan.mode === 'quality') {
         const q = h('select.select', (plan.quality_choices || []).map((c) => h('option', {
-          value: String(c.value), text: c.label,
+          value: String(c.value), text: c.label, title: c.hint || '',
         })));
         q.value = String(plan.quality);
         q.addEventListener('change', () => { quality = Number(q.value) || 0; reload(); });
-        tuneField = h('div.field', [h('label', {
-          text: plan.encoder === 'cpu'
-            ? '质量档 CRF（1~51，越小画质越好、文件越大）'
-            : '质量档 -q:v（1~100，越大画质越好、文件越大，与 CRF 相反）',
-        }), q]);
+        // 预计体积：硬件有上限质量模式按标定系数算；真 CRF 如实说不可预估。
+        // 读不到时长（没有可预估的行）就显示"未知"，绝不猜。
+        const estHint = plan.encoder === 'cpu'
+          ? '真 CRF：体积不可预估'
+          : (plan.est_bytes > 0
+            ? '预计体积合计 约 ' + humanSize(plan.est_bytes)
+            : '预计体积：未知');
+        tuneField = h('div.field', [
+          h('label', {
+            text: plan.encoder === 'cpu'
+              ? '质量档 CRF（1~51，越小画质越好、文件越大）'
+              : '质量档（有上限模式，越大画质越好）',
+          }),
+          q,
+          h('div.hint', { text: estHint, title: plan.note || '' }),
+        ]);
       } else {
         const bitrate = h('select.select', (plan.bitrate_choices || []).map((c) => h('option', {
           value: String(c.kbps), text: c.label, title: c.hint || '',
@@ -3242,8 +3254,9 @@ export function FilesView(content, ctx = {}) {
         if (r.video_kbps) {
           const codec = r.encoder_codec ? r.encoder_codec + ' · ' : '';
           if (r.mode === 'quality') {
+            const est = r.est_kbps ? '，实际≈' + r.est_kbps + ' kbps' : '';
             tune = codec + (r.encoder === 'cpu' ? 'CRF ' + r.quality : '质量档 ' + r.quality)
-              + '（上限 ' + r.maxrate_kbps + ' kbps）';
+              + '（上限 ' + r.maxrate_kbps + ' kbps' + est + '）';
           } else {
             // 原始档的码率是"按这个文件的源分辨率建议"来的；被原片封顶时要写清楚。
             const basis = r.suggested_from === 'rate70' ? '原片码率 70%' : '源分辨率';

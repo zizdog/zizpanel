@@ -39,8 +39,14 @@ const videoEngineAppID = "ffmpeg"
 // 可能压不小 —— 那时执行兜底会删掉产物、原样放进 output 并如实说明。
 const videoShrinkNote = "产物只会更小：码率封顶在原片码率×0.95 以内"
 
-// videoQualityNote 是质量优先模式下必须写出的那句风险提示（用户点名）。
+// videoQualityNote 是 CPU 真 CRF 模式下必须写出的那句风险提示（用户点名）。
 const videoQualityNote = "质量优先不预估体积：可能不小于原文件，届时会跳过并说明"
+
+// videoQualityHWNote 是硬件质量档的如实说明（≤40 字）：硬件没有真 CRF，
+// 面板给的是**有上限的质量模式**，实际码率≈上限×标定系数（系数与标定表同源）。
+func videoQualityHWNote() string {
+	return fmt.Sprintf("硬件无真 CRF：有上限质量模式，实际码率≈上限×%.1f", videoopt.HWQualityRateRatio())
+}
 
 // videoEngineTTL 是 ffmpeg 版本串的缓存存活期（版本只在装/升级 ffmpeg 时变）。
 const videoEngineTTL = 5 * time.Minute
@@ -231,17 +237,20 @@ func newVideoPlanResponse(opts videoopt.Options) videoPlanResponse {
 		Quality:        opts.Quality,
 		TwoPass:        opts.TwoPass,
 		Encoders:       videoopt.EncoderChoices(),
-		Modes:          videoopt.ModeChoices(),
+		Modes:          videoopt.ModeChoices(opts.Encoder),
 		QualityChoices: videoopt.QualityChoices(opts.Encoder),
 		MarketAppID:    videoEngineAppID,
 		Rows:           []videoopt.Plan{},
-		Note:           videoPlanNote(opts.Mode),
+		Note:           videoPlanNote(opts),
 	}
 }
 
-// videoPlanNote 按模式给计划面板那句说明（质量优先必须明说"体积不可预估"）。
-func videoPlanNote(mode string) string {
-	if videoopt.ResolveMode(mode) == videoopt.ModeQuality {
+// videoPlanNote 按编码器/模式给计划面板那句说明（如实区分真 CRF 与有上限质量模式）。
+func videoPlanNote(opts videoopt.Options) string {
+	if videoopt.ResolveMode(opts.Mode) == videoopt.ModeQuality {
+		if videoopt.ResolveEncoder(opts.Encoder) == videoopt.EncoderHardware {
+			return videoQualityHWNote()
+		}
 		return videoQualityNote
 	}
 	return videoShrinkNote

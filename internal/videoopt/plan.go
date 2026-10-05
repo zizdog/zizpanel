@@ -227,14 +227,89 @@ const (
 
 	// 硬件质量优先 = hevc_videotoolbox -q:v N：**越大画质越好、文件越大**
 	//（方向与 CRF 相反 —— 不是同一把尺子，面板必须如实说明）。
-	// 2026-09-28 真机标定（同源 720p/1474kbps）：q:v 35≈SSIM 0.963、45≈0.972、50≈0.980；
-	// x264 crf26≈0.9725 ⇒ **q:v 45 才与 crf26 同观感**，故默认 45。
+	// 硬件没有真正的 CRF：-q:v 只是它的常量质量刻度，必须配 -maxrate 才可控（见 hwQualityCalib）。
 	VTQualitySmall    = 35
 	VTQualityBalanced = 45
 	VTQualityHigh     = 50
-	// DefaultVTQuality 是硬件质量优先的默认质量档（q:v 45 = 与 CPU 默认 crf26 同观感）。
+	// DefaultVTQuality 是硬件质量优先的默认质量档。
 	DefaultVTQuality = VTQualityBalanced
 )
+
+// hwQualityCalib 是硬件质量档的**唯一标定表**（2026-10-06 本机 M4 实测，见 docs/坑清单）。
+//
+// 两个实测事实（用户那段 4K60 10bit 25Mbps 源 → 2592x1080/30fps，同段 120s）：
+//   - `-q:v` 只是常量质量刻度且**不封顶**：q25→1.6Mbps(SSIM .956)…q70→10.0Mbps(.969)。
+//   - 命令行里一旦出现 `-maxrate`，`-q:v` 被**完全忽略**（q:v 20/70 输出逐字节相同），
+//     实际平均码率 ≈ 上限×0.666（上限 1200/1500/2000/2500 实测全是 0.666）。
+//
+// ⇒ 质量档 = "-q:v + 明确码率上限"的有上限质量模式；Cap1080p 是 1080p 目标下的上限。
+// 上限必须**低于同级别最小的固定码率选项**（1080p 是 3000 kbps）：用户点名的口径是
+// "质量档要明显比固定码率档小"；实测两小时：1800→1.17GB、2250→1.44GB、2700→1.71GB。
+type hwQualityTier struct {
+	Quality  int
+	Cap1080p int
+}
+
+var hwQualityCalib = []hwQualityTier{
+	{VTQualitySmall, 1800},
+	{VTQualityBalanced, 2250},
+	{VTQualityHigh, 2700},
+}
+
+// hwQualityRateRatio 是实测"平均码率/上限"系数（VT 只跑到请求上限的 ~0.67；实测 0.666）。
+const hwQualityRateRatio = 0.67
+
+// HWQualityRateRatio 暴露标定系数：预计体积与标定表**同源**（门禁据此比对，别处不许再写数字）。
+func HWQualityRateRatio() float64 { return hwQualityRateRatio }
+
+// hwQualityTierFor 取最近的标定档（面板只给这三档；其它 q:v 值按最近档处理，不猜新刻度）。
+func hwQualityTierFor(q int) hwQualityTier {
+	if q <= 0 {
+		q = DefaultVTQuality
+	}
+	best := hwQualityCalib[0]
+	for _, t := range hwQualityCalib {
+		if absInt(t.Quality-q) < absInt(best.Quality-q) {
+			best = t
+		}
+	}
+	return best
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// HWQualityCapKbps 返回 q:v 档在目标尺寸下的码率上限（kbps）：
+// 1080p 标定值 × 档位锚点/3000，锚点 = 该档位默认码率（原始档按目标分辨率建议）。
+// 这样 480p/720p 的上限随分辨率一起降，不会出现"480p 用 1080p 的上限"。
+func HWQualityCapKbps(q int, p Preset, w, h int) int {
+	cap := hwQualityTierFor(q).Cap1080p
+	anchor := p.DefaultKbps
+	if anchor <= 0 {
+		anchor = tierKBps(w, h)
+	}
+	if anchor <= 0 {
+		return cap
+	}
+	out := int(math.Round(float64(cap) * float64(anchor) / float64(Kbps1080p)))
+	if out < 1 {
+		out = 1
+	}
+	return out
+}
+
+// HWQualityEstimateKbps 返回硬件质量档的预计实际平均码率 = 上限 × 标定系数。
+// 上限<=0（读不到）时返回 0 ⇒ 调用方按"未知"处理，绝不猜体积。
+func HWQualityEstimateKbps(maxRateKbps int) int {
+	if maxRateKbps <= 0 {
+		return 0
+	}
+	return int(math.Round(float64(maxRateKbps) * hwQualityRateRatio))
+}
 
 // Options 是一次规划的全部可选项（纯值，无副作用）。
 type Options struct {
@@ -260,6 +335,8 @@ type Choice struct {
 type QualityChoice struct {
 	Value int    `json:"value"`
 	Label string `json:"label"`
+	// Hint 是这一项的细节（前端放进 option 的 title，不占主句）。
+	Hint string `json:"hint,omitempty"`
 }
 
 // ResolveEncoder 把请求里的编码器归一化（空 = 默认；未知值由 ValidateOptions 拦成 400）。
@@ -354,10 +431,16 @@ func EncoderChoices() []Choice {
 }
 
 // ModeChoices 是面板的模式单选（默认项由 DefaultMode 决定 = 质量优先）。
-func ModeChoices() []Choice {
+//
+// 质量档的 hint 按编码器分开：CPU 是真 CRF（体积不可预估），硬件是**有上限的质量模式**
+// （体积可预估）—— 不能对硬件说"不可预估"（那是假话，见 hwQualityCalib）。
+func ModeChoices(encoder string) []Choice {
+	qualityHint := "按画质档压；体积不可预估、可能不小于原文件，届时会跳过并说明"
+	if ResolveEncoder(encoder) == EncoderHardware {
+		qualityHint = "硬件有上限质量模式：码率有上限，体积可预估（无真 CRF）"
+	}
 	return []Choice{
-		{Value: ModeQuality, Label: "CRF（质量优先）",
-			Hint: "按画质档压；体积不可预估、可能不小于原文件，届时会跳过并说明"},
+		{Value: ModeQuality, Label: "CRF（质量优先）", Hint: qualityHint},
 		{Value: ModeBitrate, Label: "目标码率（体积可预估）",
 			Hint: "按你选的码率压；体积 ≈ 码率×时长，基本能算出来"},
 	}
@@ -367,15 +450,21 @@ func ModeChoices() []Choice {
 func QualityChoices(encoder string) []QualityChoice {
 	if ResolveEncoder(encoder) == EncoderCPU {
 		return []QualityChoice{
-			{CRFHigh, fmt.Sprintf("CRF %d · 高画质（更小数字=更清楚）", CRFHigh)},
-			{CRFBalanced, fmt.Sprintf("CRF %d · 均衡（默认）", CRFBalanced)},
-			{CRFSmall, fmt.Sprintf("CRF %d · 更小", CRFSmall)},
+			{CRFHigh, fmt.Sprintf("CRF %d · 高画质（更小数字=更清楚）", CRFHigh),
+				"真 CRF：越小画质越好、文件越大；体积不可预估"},
+			{CRFBalanced, fmt.Sprintf("CRF %d · 均衡（默认）", CRFBalanced),
+				"真 CRF：越小画质越好、文件越大；体积不可预估"},
+			{CRFSmall, fmt.Sprintf("CRF %d · 更小", CRFSmall),
+				"真 CRF：越小画质越好、文件越大；体积不可预估"},
 		}
 	}
+	// 硬件档的 title 必须写清"没有真 CRF"这条事实（数字全部来自标定表，不另写）。
+	hint := fmt.Sprintf("硬件编码器没有真正的 CRF：这是有上限的质量模式（-q:v + 码率上限），实际码率≈上限×%.1f",
+		HWQualityRateRatio())
 	return []QualityChoice{
-		{VTQualitySmall, fmt.Sprintf("质量档 %d · 更小", VTQualitySmall)},
-		{VTQualityBalanced, fmt.Sprintf("质量档 %d · 均衡（默认，≈CRF %d 观感）", VTQualityBalanced, CRFBalanced)},
-		{VTQualityHigh, fmt.Sprintf("质量档 %d · 高画质", VTQualityHigh)},
+		{VTQualitySmall, fmt.Sprintf("质量档 %d · 更小", VTQualitySmall), hint},
+		{VTQualityBalanced, fmt.Sprintf("质量档 %d · 均衡（默认）", VTQualityBalanced), hint},
+		{VTQualityHigh, fmt.Sprintf("质量档 %d · 高画质", VTQualityHigh), hint},
 	}
 }
 
@@ -463,9 +552,12 @@ type Plan struct {
 	Quality      int    `json:"quality,omitempty"`
 	TwoPass      bool   `json:"two_pass,omitempty"`
 	// MaxRateKbps 是给编码器的 -maxrate 上限：目标码率模式下等于目标码率，
-	// 质量优先模式下等于 floor(原码率×0.95)（保证不超原片码率）。
+	// 硬件质量优先模式下等于标定表给的有上限质量档上限（再受原码率×0.95 封顶）。
 	MaxRateKbps int `json:"maxrate_kbps,omitempty"`
-	// EstPercent 是预计省下的百分比；EstimateUnknown=true（质量优先）时无意义。
+	// EstKbps 是硬件质量档的**预计实际平均码率**（上限×标定系数）；
+	// 0 = 不适用（CPU 质量优先/目标码率模式）。
+	EstKbps int `json:"est_kbps,omitempty"`
+	// EstPercent 是预计省下的百分比；EstimateUnknown=true（真 CRF / 读不到时长）时无意义。
 	EstPercent      int  `json:"est_percent,omitempty"`
 	EstimateUnknown bool `json:"estimate_unknown,omitempty"`
 	// SourceFPS 是源帧率（0 = 读不到）：硬件档据此决定要不要降到 30fps。
@@ -687,14 +779,14 @@ type PlanResult struct {
 	Rows     []Plan `json:"rows"`
 	Runnable int    `json:"runnable"`
 	Skipped  int    `json:"skipped"`
-	// EstBytes 是所有可压行的预计产物合计（质量优先时无意义，见 EstimateUnknown）。
+	// EstBytes 是所有可压行的预计产物合计（真 CRF 时无意义，见 EstimateUnknown）。
 	EstBytes int64 `json:"est_bytes"`
 	// TotalSourceBytes 是可压行的原文件体积合计（面板表尾 "原 → 预计" 用）。
 	TotalSourceBytes int64 `json:"total_source_bytes"`
 	// EstSavedBytes / EstPercent 是预计省下的体积与百分比。
 	EstSavedBytes int64 `json:"est_saved_bytes"`
 	EstPercent    int   `json:"est_percent"`
-	// EstimateUnknown 表示"至少有一行是质量优先，体积不可预估"。
+	// EstimateUnknown 表示"至少有一行体积不可预估"（真 CRF 或读不到时长）。
 	EstimateUnknown bool `json:"estimate_unknown"`
 	// CappedSkipped 是"因原视频码率已到极限而跳过"的行数，
 	// 面板据此提醒"不会转码，但会原样放进 output"（判据只在 planBitrates 里）。
@@ -862,7 +954,8 @@ func HardwareQualityToCRF(q int) int {
 // 硬要求（用户点名）：转码码率绝不超过原视频。
 //
 //	目标码率模式：实际视频码率 = min(用户选的, 原视频视频码率 × 0.95)
-//	质量优先模式：不设目标码率，只把 -maxrate 封在原码率×0.95 以内
+//	CPU 质量优先：不设目标码率，只把 -maxrate 封在原码率×0.95 以内（真 CRF）
+//	硬件质量优先：上限 = min(标定表档位上限, 原码率×0.95)（硬件无真 CRF，见 hwQualityCalib）
 //	音频码率     = min(96k, 原音频码率)；无音轨则 -an
 //
 // 原始档没带码率（kbps=0）时：按**这个文件**的源分辨率取档位下限（见 SuggestedKBps），
@@ -871,7 +964,8 @@ func HardwareQualityToCRF(q int) int {
 // capped 只表示"实际码率 ≥ 原码率×0.95"（这种文件**封顶即跳过**，
 // 不再转码，改为原样放进 output/；判据见 PlanOne）。
 // suggested 是"源分辨率建议值"（仅原始档给），面板据此显示每个文件用的建议值。
-func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggested int, suggestedByRate, capped bool, note, skip string) {
+// w/h 是**目标尺寸**（硬件质量档的上限按分辨率缩放用）。
+func planBitrates(info MediaInfo, opts Options, w, h int) (vKbps, aKbps, maxRate, suggested int, suggestedByRate, capped bool, note, skip string) {
 	if info.VideoKbps <= 0 {
 		return 0, 0, 0, 0, false, false, "", "读不到原视频码率，无法保证压完更小"
 	}
@@ -879,10 +973,14 @@ func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggeste
 	if capKbps < 1 {
 		return 0, 0, 0, 0, false, false, "", "原视频码率太低，没有可压空间"
 	}
-	maxRate = capKbps
 	if opts.Mode == ModeQuality {
-		// 质量优先：不承诺体积，但仍用 -maxrate 兜住"绝不超原片码率"。
 		vKbps = capKbps
+		if ResolveEncoder(opts.Encoder) == EncoderHardware {
+			// 硬件无真 CRF：改成有上限质量模式；上限照旧不许超原片×0.95。
+			if tierCap := HWQualityCapKbps(opts.Quality, opts.Preset, w, h); tierCap < vKbps {
+				vKbps = tierCap
+			}
+		}
 	} else {
 		vKbps = ResolveKBps(opts.Preset, opts.KBps)
 		if vKbps <= 0 {
@@ -906,8 +1004,8 @@ func planBitrates(info MediaInfo, opts Options) (vKbps, aKbps, maxRate, suggeste
 				note = fmt.Sprintf("原始档按源分辨率建议 %d kbps", suggested)
 			}
 		}
-		maxRate = vKbps
 	}
+	maxRate = vKbps
 	if !info.HasAudio {
 		return vKbps, 0, maxRate, suggested, suggestedByRate, capped, note, ""
 	}
@@ -992,7 +1090,7 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	}
 	p.TargetWidth, p.TargetHeight = w, h
 
-	vKbps, aKbps, maxRate, suggested, suggestedByRate, capped, note, skip := planBitrates(info, opts)
+	vKbps, aKbps, maxRate, suggested, suggestedByRate, capped, note, skip := planBitrates(info, opts, w, h)
 	if skip != "" {
 		p.PlaceInOutput = true
 		p.SkipReason = skip
@@ -1026,8 +1124,19 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 	p.MaxRateKbps = maxRate
 	p.AudioDisabled = !info.HasAudio
 	if opts.Mode == ModeQuality {
-		// 质量优先：体积由画面复杂程度决定，**不给假数字**。
-		p.EstimateUnknown = true
+		if ResolveEncoder(opts.Encoder) == EncoderHardware {
+			// 有上限质量模式：预计实际码率 = 上限 × 标定系数（与 hwQualityCalib 同源）。
+			// 读不到时长 ⇒ estimateBytes 返回 0 ⇒ 如实标"未知"，绝不猜。
+			p.EstKbps = HWQualityEstimateKbps(vKbps)
+			if p.EstKbps > 0 {
+				p.EstBytes = estimateBytes(p.EstKbps, aKbps, info.DurationSec)
+				p.EstPercent = savePercent(info.FileBytes, p.EstBytes)
+			}
+			p.EstimateUnknown = p.EstBytes <= 0
+		} else {
+			// 真 CRF：体积由画面复杂程度决定，**不给假数字**。
+			p.EstimateUnknown = true
+		}
 	} else {
 		p.EstBytes = estimateBytes(vKbps, aKbps, info.DurationSec)
 		p.EstPercent = savePercent(info.FileBytes, p.EstBytes)
