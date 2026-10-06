@@ -65,27 +65,36 @@ printf '版本: %s\nHTTP 端口: %s\n面板沙箱端口: %s\n临时目录: %s\n'
 
 # ------------------------------------------------------------- 构建发布包 --
 step "构建发布包"
-# ⚡ 两个提速点（2026-09-22 用户："以大幅缩短发布时间为第一原则"）：
-#   ① 这个测试**只下载 arm64 包**（见下面的 pkg 断言），却一直跑双架构 `make release`
-#      —— 双架构 31s、单架构 15s，白花 16s；
-#   ② 已经有同一版本的 arm64 包时直接复用（`make release` 内部会 `clean` 掉 dist，
-#      在 check-full 里重建一遍、正式发布时再重建一遍是纯重复）。
-# ⚡ 2026-09-22：构建到**自己的临时 DIST**。原来用仓库的 dist/，而 `make release` 开头会
-# `rm -rf dist` —— 与 check-full 里并行跑的 install-test 抢同一个目录（它把开发二进制
-# 写进 dist/）。隔离之后 check-full 才能把三个端到端测试真正并行起来。
+# ⚡ 提速点（2026-09-22 用户："以大幅缩短发布时间为第一原则"）：这个测试**只下载 arm64 包**，
+# 所以只构建单架构（双架构 31s、单架构 15s）。
+#
+# 🚨 2026-10-06 修掉两个会让这个门禁**撒谎/误报**的坑（发 1.13.6 时连撞两次）：
+#   ① 原来"仓库 dist 里已有同版本包就直接复用"—— 版本号相同 **不等于** 内容相同：
+#      仓库里改了代码但还没重新构建时，它会拿**旧包**去比对仓库源码，于是新写的断言
+#      全红（误报）；反过来只改了这个测试不检查的地方时，它会拿旧包**通过**（漏报）。
+#      现在默认**总是重新构建**，要复用请显式 ZP_REUSE_DIST=1（自己承担"验的是旧包"）。
+#   ② 构建命令写成 `DIST=… make release` —— 环境变量**覆盖不了** makefile 里的
+#      `DIST := dist`（make 的赋值优先级高于环境），包照样落回仓库 dist/，
+#      而下面又按 $WORK/dist 找文件 ⇒ "make release 成功"却"缺少 …tar.gz"。
+#      现在用命令行变量：`make release DIST=…`（命令行变量优先级最高）。
 RELDIR="$WORK/dist/release"
 SERVE_DIST="$WORK/dist"
 PKG_ARM="$RELDIR/zizpanel_${VERSION}_darwin_arm64.tar.gz"
-if [ -f "$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz" ] && [ "${ZP_FORCE_REBUILD:-0}" != "1" ]; then
+REUSE_DIST=0
+if [ "${ZP_REUSE_DIST:-0}" = "1" ] && [ -f "$REPO/dist/release/zizpanel_${VERSION}_darwin_arm64.tar.gz" ]; then
   RELDIR="$REPO/dist/release"
   SERVE_DIST="$REPO/dist"
   PKG_ARM="$RELDIR/zizpanel_${VERSION}_darwin_arm64.tar.gz"
-  pass "复用已有发布包（${PKG_ARM}）"
-elif ( cd "$REPO" && DIST="$WORK/dist" make release ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
-  pass "make release（arm64，临时 DIST）成功"
-else
-  fail "make release 失败："
-  tail -25 "$WORK/release.log" | sed 's/^/      /'
+  REUSE_DIST=1
+  warn "ZP_REUSE_DIST=1：复用仓库里的 ${PKG_ARM}（注意：验的是这份旧包，不保证与当前源码一致）"
+fi
+if [ "$REUSE_DIST" != "1" ]; then
+  if ( cd "$REPO" && make release DIST="$WORK/dist" ARCHS=arm64 > "$WORK/release.log" 2>&1 ); then
+    pass "make release（arm64，临时 DIST）成功"
+  else
+    fail "make release 失败："
+    tail -25 "$WORK/release.log" | sed 's/^/      /'
+  fi
 fi
 
 if [ -f "$PKG_ARM" ]; then
