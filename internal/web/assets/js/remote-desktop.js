@@ -52,15 +52,15 @@ function ensureDom() {
     dataset: { testid: 'zp-rd-canvas' },
     style: { width: '100%', height: '100%' },
   });
-  // 画面区（用户 2026-10-06 要求）：
-  //   · 高度按**远端画面的宽高比**算（16:10 的屏就是 宽×10/16），不再固定 66vh —— 否则
-  //     16:9 的画面被"按高度塞进一个又宽又矮的框"，两边留黑、字变小；
-  //   · 画面宽度**不低于 1080 CSS px**（窗口再小也不缩），外层横向滚动；
-  //   · 支持全屏（全屏时铺满屏幕、由 noVNC 按比例缩放）。
+  // 画面区（用户 2026-10-06 实测定版）：
+  //   · 高度固定 **90vh** —— 用户自己在浏览器里试过："height: 90vh 表现不错，上下有黑边不影响操作"。
+  //     比"按远端比例撑高"更实用：不用滚动、画面尽可能大，比例交给 noVNC 缩放（留黑边）；
+  //   · 宽度 `max(100%, 1080px)`：窗口再窄也不把画面缩到 1080 以下，外层横向滚动；
+  //   · 支持全屏（全屏时铺满屏幕）。
   const stage = h('div', {
     dataset: { testid: 'zp-rd-stage' },
     style: {
-      position: 'relative', width: 'max(100%, 1080px)', aspectRatio: '16 / 10',
+      position: 'relative', width: 'max(100%, 1080px)', height: '90vh', minHeight: '420px',
       background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'none',
     },
   }, [canvasHost]);
@@ -107,14 +107,13 @@ function onFullscreenChange() {
   if (document.fullscreenElement === dom.stage) {
     dom.stage.style.width = '100vw';
     dom.stage.style.height = '100vh';
-    dom.stage.style.aspectRatio = 'auto';
+    dom.stage.style.aspectRatio = '';
     dom.stage.style.borderRadius = '0';
   } else {
     dom.stage.style.width = 'max(100%, 1080px)';
-    dom.stage.style.height = '';
+    dom.stage.style.height = '90vh';
+    dom.stage.style.aspectRatio = '';
     dom.stage.style.borderRadius = '8px';
-    const c = dom.host.querySelector('canvas');
-    if (c && c.width > 0) dom.stage.style.aspectRatio = c.width + ' / ' + c.height;
   }
 }
 
@@ -179,20 +178,11 @@ function connect(username, password) {
   session = { rfb, host: d.host, name: '' };
   d.state.textContent = '正在连接…';
 
-  // syncAspect 把画面区的宽高比对齐 noVNC 真正拿到的远端帧缓冲尺寸。
-  const syncAspect = () => {
-    const c = d.host.querySelector('canvas');
-    if (c && c.width > 0 && c.height > 0) {
-      d.stage.style.aspectRatio = c.width + ' / ' + c.height;
-    }
-  };
   rfb.addEventListener('connect', () => {
-    syncAspect();
     d.state.textContent = '已连接：' + (session && session.name ? session.name : '本机桌面');
     renderButtons();
   });
   rfb.addEventListener('desktopname', (ev) => {
-    syncAspect();
     if (session) session.name = (ev.detail && ev.detail.name) || '';
     d.state.textContent = '已连接：' + (session.name || '本机桌面');
   });
