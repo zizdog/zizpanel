@@ -383,8 +383,12 @@ function notesBlock(notes, { title = '本次更新内容', open = true, testid =
 // 用户的要求：动手之前要能看到"这个版本更新了什么" ——
 // 先给一句**摘要**，再给一个可展开的**全文**，而不是只有一个"确定/取消"。
 // notes 同样来自远端清单，走和页面上一样的净化渲染路径。
-function confirmUpgrade(version, notes) {
+//
+// blocking 是"现在正在跑、升级会把它们打断"的任务（后端 blocking_tasks）：
+// 有的话必须显眼写出来（2026-10-06 用户实测：转码中途升级，这次编码白跑）。
+function confirmUpgrade(version, notes, blocking) {
   const raw = typeof notes === 'string' ? notes.trim() : '';
+  const busyList = Array.isArray(blocking) ? blocking : [];
   const full = h('details.zp-notes-details');
   full.append(h('summary.zp-notes-sum', { text: '展开查看完整更新说明' }));
   full.append(h('div.zp-notes-body', [renderNotesMarkdown(raw)]));
@@ -408,6 +412,18 @@ function confirmUpgrade(version, notes) {
     const m = modal({
       title: `确认升级到 v${version || '新版本'}`,
       body: h('div.zp-notes-confirm', [
+        busyList.length ? h('div', {
+          dataset: { testid: 'zp-update-busy-warning' },
+          style: {
+            margin: '0 0 11px', padding: '9px 11px', borderRadius: '8px',
+            border: '1px solid var(--danger)', color: 'var(--danger)', fontSize: '13px', lineHeight: '1.65',
+          },
+        }, [
+          h('div', { text: `⚠️ 现在有 ${busyList.length} 个任务在跑：升级会重启面板，它们会被中断（源文件不动，但这次的工作白跑）：` }),
+          h('ul', { style: { margin: '5px 0 0 18px' } },
+            busyList.slice(0, 6).map((b) => h('li', { text: (b && (b.title || b.kind)) || '任务' }))),
+          h('div', { style: { marginTop: '5px' }, text: '建议等它们结束（或在任务中心先取消）再升级。' }),
+        ]) : null,
         h('div', {
           style: { fontSize: '13.5px', lineHeight: '1.7', marginBottom: '11px' },
           text: '面板会先下载并校验升级包，确认无误后替换程序并自动重启；重启期间页面短暂断开，请不要关闭本页。',
@@ -420,9 +436,10 @@ function confirmUpgrade(version, notes) {
           text: '取消',
           onclick: () => finish(false),
         }),
-        h('button.btn.btn-primary', {
+        h('button.btn', {
+          class: busyList.length ? 'btn btn-danger' : 'btn btn-primary',
           dataset: { testid: 'zp-update-confirm-ok' },
-          text: '立即升级',
+          text: busyList.length ? '仍然升级' : '立即升级',
           onclick: () => finish(true),
         }),
       ],
@@ -1274,7 +1291,7 @@ export function UpdateView(content, ctx = {}) {
       || (info && info.state && typeof info.state.notes === 'string' && info.state.notes)
       || (checkInfo && typeof checkInfo.notes === 'string' && checkInfo.notes)
       || statusNotes;
-    if (!(await confirmUpgrade(targetVer, targetNotes))) return;
+    if (!(await confirmUpgrade(targetVer, targetNotes, (info && info.blocking_tasks) || []))) return;
     busy = true;
     try {
       let staged = !!(info && info.staged);
@@ -1329,8 +1346,10 @@ export function UpdateView(content, ctx = {}) {
       });
       startPoll((st) => st.status === 'applying' || st.status === 'restarting', 10 * 60 * 1000);
 
+      // 有任务在跑时上面已经让用户明确确认过 —— 带 force 让后端放行（否则后端会 409）。
+      const forceApply = !!((info && info.blocking_tasks) || []).length;
       // apply 会重启面板：请求本身可能中断，这属于预期，不能当失败处理。
-      try { await api.upgradeApply(); } catch { /* 连接被重启切断 */ }
+      try { await api.upgradeApply(forceApply); } catch { /* 连接被重启切断 */ }
 
       await watchRestartAndReload();
     } catch (e) {

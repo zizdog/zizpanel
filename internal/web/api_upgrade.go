@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/services"
+	"github.com/zizdog/zizpanel/internal/tasks"
 	"github.com/zizdog/zizpanel/internal/upgrade"
 	"github.com/zizdog/zizpanel/internal/version"
 )
@@ -160,7 +161,56 @@ func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
 		"is_root":    os.Geteuid() == 0,
 		"plain_http": plainHTTP,
 		"notes":      s.Cfg.UpgradeNotes,
+		// blocking_tasks 是"现在升级会被打断的任务"。升级要重启面板，面板拉起的子进程
+		// （ffmpeg / brew / rsync…）会跟着被收走 —— 2026-10-06 用户实测：转码中途升级，
+		// 这次编码白跑（源文件没事，但进度全丢）。不是 bug，但必须让用户先知道。
+		"blocking_tasks": s.upgradeBlockingTasks(),
 	})
+}
+
+// upgradeBlockingTasks 返回当前"正在跑、升级会打断"的任务（只挑 running 的）。
+//
+// 判据刻意用**全部 running 任务**而不是维护一张 kind 白名单：面板起的子进程都会在
+// 重启时被收走，任何一种在跑的任务被中断都是白干；白名单一旦漏了 kind 就会静默骗人。
+func (s *Server) upgradeBlockingTasks() []map[string]string {
+	if s.Tasks == nil {
+		return []map[string]string{}
+	}
+	return blockingUpgradeTasks(s.Tasks.List())
+}
+
+// blockingUpgradeTasks 是纯函数（门禁直接喂任务列表断言，不用起真任务）。
+func blockingUpgradeTasks(metas []tasks.Meta) []map[string]string {
+	out := []map[string]string{}
+	for _, m := range metas {
+		if m.Status != tasks.StatusRunning {
+			continue
+		}
+		out = append(out, map[string]string{
+			"id": m.ID, "kind": m.Kind, "title": m.Title,
+		})
+	}
+	return out
+}
+
+// upgradeBlockedMessage 是"有任务在跑时"给用户看的那句话（空串 = 没有阻塞，放行）。
+// 纯函数：门禁直接断言文案里有没有任务名与"仍然升级"这条出路。
+func upgradeBlockedMessage(blocking []map[string]string) string {
+	if len(blocking) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(blocking))
+	for _, b := range blocking {
+		if t := strings.TrimSpace(b["title"]); t != "" {
+			names = append(names, t)
+		} else if k := strings.TrimSpace(b["kind"]); k != "" {
+			names = append(names, k)
+		}
+	}
+	return fmt.Sprintf(
+		"有 %d 个任务正在跑：升级会重启面板并中断它们（%s）。"+
+			"源文件不会动，但这次的工作白跑 —— 等它们结束（或先取消），"+
+			"确实要现在升级就再点一次「仍然升级」", len(blocking), strings.Join(names, "、"))
 }
 
 // stagedInfo 报告暂存目录里是否已有完整的升级包，以及它的版本。
@@ -729,6 +779,18 @@ func (s *Server) handleUpgradeApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if sameVersion(stagedVer, version.Version) {
 		fail(w, http.StatusBadRequest, fmt.Sprintf("升级包版本 v%s 与当前版本相同，无需升级", stagedVer))
+		return
+	}
+
+	// 有任务在跑时**先拦一次**：升级要重启面板，正在跑的任务（尤其转码）会被打断，
+	// 这次工作白跑。不是禁止——前端确认后带 force=true 再来；但绝不能让用户在
+	// 不知情的情况下点一下就丢掉几小时。
+	var applyReq struct {
+		Force bool `json:"force"`
+	}
+	_ = decode(r, &applyReq)
+	if blocking := s.upgradeBlockingTasks(); len(blocking) > 0 && !applyReq.Force {
+		fail(w, http.StatusConflict, upgradeBlockedMessage(blocking))
 		return
 	}
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zizdog/zizpanel/internal/tasks"
 	"github.com/zizdog/zizpanel/internal/upgrade"
 )
 
@@ -172,5 +173,65 @@ func TestUpgradeStageWithEmptySourceUsesCandidates(t *testing.T) {
 	// 取到清单后要记下"实际用了哪个源"
 	if got := upgrade.LoadState(srv.Cfg.WorkDir).SourceBase; got != upgrade.DefaultSource {
 		t.Errorf("state.source_base 应为 %s，实际 %q", upgrade.DefaultSource, got)
+	}
+}
+
+// TestUpgradeWarnsAboutRunningTasks 锁住"升级会打断正在跑的任务"这条提示。
+//
+// 2026-10-06 用户实测：转码过程中升级面板 ⇒ 面板重启，ffmpeg 被一起收走，这次编码白跑
+// （任务记录本来就只在内存里）。这不是 bug，但用户必须**先知道**再决定 —— 所以：
+//
+//	① 状态接口要把正在跑的任务列出来（前端凭它显示警告）；
+//	② apply 在没有 force 时必须 409（直接调 API 也不能静默丢掉几小时的工作）；
+//	③ 没有任务在跑时不许瞎拦（负向对照）。
+func TestUpgradeWarnsAboutRunningTasks(t *testing.T) {
+	// ① 纯函数：只挑 running，已结束的不算。
+	metas := []tasks.Meta{
+		{ID: "t-1", Kind: "video_compress", Title: "压缩 4K 电影", Status: tasks.StatusRunning},
+		{ID: "t-2", Kind: "video_compress", Title: "压缩 已结束", Status: tasks.StatusSucceeded},
+	}
+	if got := blockingUpgradeTasks(metas); len(got) != 1 || got[0]["title"] != "压缩 4K 电影" {
+		t.Fatalf("blockingUpgradeTasks 应只返回正在跑的那个，实际 %v", got)
+	}
+	if got := blockingUpgradeTasks(nil); len(got) != 0 {
+		t.Fatalf("没有任务时不该有阻塞项，实际 %v", got)
+	}
+	// ② 那句话必须点名任务、并给出"仍然升级"的出路；没有任务时必须是空串（不拦）。
+	msg := upgradeBlockedMessage(blockingUpgradeTasks(metas))
+	for _, want := range []string{"1 个任务", "压缩 4K 电影", "仍然升级"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("升级中断警告里缺少 %q：%s", want, msg)
+		}
+	}
+	if msg := upgradeBlockedMessage(nil); msg != "" {
+		t.Errorf("没有任务在跑时不该产出阻塞文案，实际 %q", msg)
+	}
+
+	srv, ts := newTestServer(t)
+	cookies := loginPanel(t, ts)
+
+	// ② 状态接口带上 blocking_tasks（前端据此显示警告）。
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/system/upgrade", nil, cookies)
+	if got, ok := mapGet(mapGet(out, "data"), "blocking_tasks").([]any); !ok || len(got) != 0 {
+		t.Fatalf("没有任务时 blocking_tasks 应为空数组，实际 %v", mapGet(mapGet(out, "data"), "blocking_tasks"))
+	}
+
+	// 起一个真的在跑的任务（一直等到测试放开为止）。
+	release := make(chan struct{})
+	srv.Tasks.Start("video_compress", "dir:/tmp/probe", "压缩 4K 电影",
+		func(ctx context.Context, log tasks.LogFunc) (any, error) {
+			<-release
+			return nil, nil
+		})
+	t.Cleanup(func() { close(release) })
+
+	_, out, _ = doJSON(t, ts, "GET", "/api/v1/system/upgrade", nil, cookies)
+	list, _ := mapGet(mapGet(out, "data"), "blocking_tasks").([]any)
+	if len(list) != 1 {
+		t.Fatalf("有转码在跑时 blocking_tasks 应有 1 条，实际 %v", mapGet(mapGet(out, "data"), "blocking_tasks"))
+	}
+	first, _ := list[0].(map[string]any)
+	if asString(first["kind"]) != "video_compress" || asString(first["title"]) != "压缩 4K 电影" {
+		t.Fatalf("blocking_tasks 内容不对：%v", first)
 	}
 }
