@@ -51,6 +51,9 @@ var fullDiskReadFn = func(p string) error {
 	return f.Close()
 }
 
+// FullDiskAccessProbeFn 是实测入口的注入点：安装期的"申请"会调用它，单测不许真读系统 TCC 库。
+var FullDiskAccessProbeFn = ProbeFullDiskAccess
+
 // ProbeFullDiskAccess 实测一次完全磁盘访问权限。
 func ProbeFullDiskAccess(home string) FullDiskProbe {
 	tried := 0

@@ -174,6 +174,8 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 		CanApply: hasConsole, LastCheckedAt: at, LastResult: res,
 		Targets:    permissions.ProtectedDirCandidates(home),
 		ManualPath: diskVolumeAuthManualPath(),
+		// 有对应系统设置页 ⇒ 前端给一个「打开设置」按钮（点了就把那一页打开给用户点开关）。
+		SettingsURL: settingsURLForItem(permissions.ItemFullDisk),
 	})
 
 	st, hint, at, res = permItemStatus(h, permissions.ItemRemovable, consoleUser, fda)

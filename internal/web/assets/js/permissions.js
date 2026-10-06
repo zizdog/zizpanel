@@ -168,14 +168,37 @@ export function PermissionsView(content, ctx = {}) {
       }
     }
 
-    const row = h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, [
-      btn,
-      pathInput,
-      h('span.hint', { text: disabled ? why : '点一下会先二次确认：会读一次、系统会弹窗，需要你在机器前点「允许」。' }),
-    ]);
+    const rowChildren = [btn, pathInput];
+    if (it.settings_url) {
+      // 有对应系统设置页的项（完全磁盘访问权限）：给一个按钮直接把那一页打开 ——
+      // macOS 对这项不弹窗，用户只能手动开开关，光给路径等于让人自己翻菜单（坑 242）。
+      rowChildren.push(h('button.btn.btn-sm', {
+        text: '⚙️ 打开设置',
+        disabled,
+        title: disabled ? why : '打开 macOS 的「完全磁盘访问权限」页面，把 zizpanel 的开关打开',
+        onclick: () => openSettingsPage(it),
+      }));
+    }
+    rowChildren.push(h('span.hint', {
+      text: disabled ? why : (it.settings_url
+        ? 'macOS 对这项不弹窗：点「打开设置」打开开关，回来点「刷新」。'
+        : '点一下会先二次确认：会读一次、系统会弹窗，需要你在机器前点「允许」。'),
+    }));
+    const row = h('div', { style: { marginTop: '8px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, rowChildren);
     // 把输入框挂到按钮上，applyPermission 才能取到用户选的目录。
     btn._zpPathInput = pathInput;
     return row;
+  }
+
+  // openSettingsPage 让面板把「完全磁盘访问权限」那一页打开在这台机器的屏幕上。
+  // 打开后用户自己拨开关，再回来点「刷新」——面板的实测探针就会读到"已授权"。
+  async function openSettingsPage(it) {
+    try {
+      const r = await api.permissionOpenSettings(it.id);
+      toast((r && r.hint) || '已在屏幕上打开系统设置，请打开 zizpanel 的开关', 'ok', 12000);
+    } catch (e) {
+      toast('打不开系统设置：' + (e && e.message ? e.message : '未知错误'), 'err', 12000);
+    }
   }
 
   // applyPermission 先二次确认再提交任务（202 + task_id，进度走 SSE）。

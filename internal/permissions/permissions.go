@@ -37,6 +37,10 @@ type Item struct {
 	LastResult    string   `json:"last_result,omitempty"`
 	Targets       []string `json:"targets,omitempty"`
 	ManualPath    string   `json:"manual_path,omitempty"`
+	// SettingsURL 非空表示这一项在 macOS 系统设置里有对应页面（前端显示「打开设置」按钮）：
+	// 面板以控制台用户身份 open 这个深链，把用户要点的那一页直接弹出来（坑 242：
+	// 完全磁盘访问权限不弹窗，只能手动开开关；只给路径等于让人自己翻三层菜单）。
+	SettingsURL string `json:"settings_url,omitempty"`
 	// AcceptsPath 为 true 时前端显示"要申请的目录"选择/输入（外部应用用）。
 	AcceptsPath bool `json:"accepts_path,omitempty"`
 

@@ -3210,17 +3210,53 @@ full_disk_manual_steps() {
   printf '    → 粘贴 %s → 打开 → 打开开关\n' "$BIN_DIR/zizpanel"
 }
 
+# open_full_disk_pane：把「完全磁盘访问权限」那一页**直接打开**在用户屏幕上。
+#
+# 用户 2026-10-06 要求："像其它软件一样弹出这个列表界面，让用户点。" —— 这一项 macOS
+# 不弹窗、只能手动开开关，打开设置页是唯一能让用户点到的办法。
+# ⚠️ 这是对"安装界面不弹任何窗口"（用户 2026-09-19 定的）**刻意的唯一例外**：
+#    只在 真机安装 + 用户当场同意申请 + 真要动手（非干跑/非沙箱）时打开；打不开不阻断安装。
+#    要关掉它：ZP_FULL_DISK_OPEN=0。
+open_full_disk_pane() {
+  local url="x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+  [ "${ZP_FULL_DISK_OPEN:-1}" = "1" ] || { info "已按 ZP_FULL_DISK_OPEN=0 跳过打开系统设置。"; return 1; }
+  [ "${ZIZPANEL_SANDBOX:-0}" = "1" ] && return 1
+  if dry_run; then
+    info "（干跑）将打开：系统设置 → 隐私与安全性 → 完全磁盘访问权限"
+    return 1
+  fi
+  local uid=""
+  uid="$(id -u "${REAL_USER:-}" 2>/dev/null || echo "")"
+  # root（本机安装必然如此）必须把 open 送进**用户的图形会话**，否则窗口根本不出现。
+  if [ "$(id -u)" = "0" ] && [ -n "$uid" ]; then
+    if launchctl asuser "$uid" /usr/bin/open "$url" >/dev/null 2>&1; then
+      ok "已在屏幕上打开 系统设置 → 隐私与安全性 → 完全磁盘访问权限"
+      return 0
+    fi
+  fi
+  if /usr/bin/open "$url" >/dev/null 2>&1; then
+    ok "已在屏幕上打开 系统设置 → 隐私与安全性 → 完全磁盘访问权限"
+    return 0
+  fi
+  warn "没能自动打开系统设置（不影响安装）"
+  return 1
+}
+
 # notice_full_disk_local：本机安装收尾的**醒目区块**（分隔线 + 加粗 + 空行）。
 notice_full_disk_local() {
   printf '\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$C_BOLD" "$C_RESET"
   if [ "${ZP_FULL_DISK_ACK:-0}" = "1" ]; then
     # 🚨 2026-10-06 真机实测：macOS 对「完全磁盘访问权限」**不弹窗**。面板去读受保护
     # 目录时系统是**静默拒绝**，并把 zizpanel 加进列表、开关默认关 —— 只能手动打开。
-    # 原文案写"屏幕上应弹出…请点允许"是错的（用户按它等弹窗，等不到）。
-    printf '  %s⚠ 这一项 macOS 不会弹窗，要你手动打开开关%s\n' "$C_BOLD" "$C_RESET"
-    printf '\n  面板已经在列表里了（安装时申请过一次），打开它即可：\n'
-    printf '    系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 打开 %szizpanel%s 的开关\n' "$C_BOLD" "$C_RESET"
-    printf '  列表里没有它？按这个路径手动加上（30 秒）：\n'
+    # 所以这里把那一页**直接打开在屏幕上**（用户要求："像其它软件一样让用户点"）。
+    printf '  %s⚠ 这一项 macOS 不会弹窗：请在刚打开的窗口里把 zizpanel 的开关打开%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n'
+    if ! open_full_disk_pane; then
+      printf '  请手动打开：系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 打开 zizpanel 的开关\n'
+    else
+      printf '  窗口没停在「完全磁盘访问权限」？左侧点「隐私与安全性」→「完全磁盘访问权限」。\n'
+    fi
+    printf '  列表里一时没有 zizpanel（面板刚启动还没申请过）？点「+」按这个路径加上：\n'
     full_disk_manual_steps
   else
     printf '  %s⚠ 完全磁盘访问权限还没授权%s\n' "$C_BOLD" "$C_RESET"

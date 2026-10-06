@@ -13,6 +13,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -721,4 +722,84 @@ func TestPermissionStatusUsesRealProbeNotHistory(t *testing.T) {
 		t.Errorf("探测无结论且没人在机器前时应是 needs_console，实际 %v", fd2)
 	}
 	_ = srv2
+}
+
+// TestPermissionOpenSettingsEndpoint 是 2026-10-06 用户要求的门禁（坑 242）：
+// 「完全磁盘访问权限」macOS 不弹窗，用户只能手动开开关 ⇒ 面板要能**把那一页打开给用户点**
+// （像别的软件那样），而不是只给一行路径。
+//
+// 锁四件事：① 没人在机器前 → 409（开了也没人看见）；② 有对应页的项 → 用控制台用户身份
+// 打开正确的深链（Privacy_AllFiles）；③ 没有对应页的项（可移除宗卷）→ 404 如实说没有；
+// ④ 打开失败 → 500 如实报错，不许谎报"已打开"。
+func TestPermissionOpenSettingsEndpoint(t *testing.T) {
+	_, ts, cookies := newPermissionsServer(t)
+
+	type call struct{ user, url string }
+	var calls []call
+	prevOpen := permOpenSettingsFn
+	t.Cleanup(func() { permOpenSettingsFn = prevOpen })
+
+	// ① 没人在机器前 ⇒ 409，且**不许**真去开窗口
+	calls = nil
+	stubPermissionsEnv(t, permEnvOpts{consoleUser: ""})
+	permOpenSettingsFn = func(_ context.Context, u, url string) error {
+		calls = append(calls, call{u, url})
+		return nil
+	}
+	res, out, _ := doJSON(t, ts, "POST", "/api/v1/permissions/full_disk/open-settings", map[string]any{}, cookies)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("没人在机器前应 409，实际 %d: %v", res.StatusCode, out["msg"])
+	}
+	if len(calls) != 0 {
+		t.Fatalf("没人在机器前不该去打开窗口，实际调了 %d 次", len(calls))
+	}
+
+	// ② 有人在机器前 ⇒ 以控制台用户身份打开 FDA 那一页
+	calls = nil
+	stubPermissionsEnv(t, permEnvOpts{consoleUser: "zizdog", mounts: []string{"/Volumes/DiskA"}})
+	permOpenSettingsFn = func(_ context.Context, u, url string) error {
+		calls = append(calls, call{u, url})
+		return nil
+	}
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/permissions/full_disk/open-settings", map[string]any{}, cookies)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("有人时应 200，实际 %d: %v", res.StatusCode, out["msg"])
+	}
+	if len(calls) != 1 || calls[0].user != "zizdog" {
+		t.Fatalf("应以控制台用户身份打开，实际 %+v", calls)
+	}
+	if !strings.Contains(calls[0].url, "Privacy_AllFiles") {
+		t.Fatalf("打开的深链不对（应指向完全磁盘访问权限那一页）：%q", calls[0].url)
+	}
+	if data := apiData(t, out); data["opened"] != true {
+		t.Errorf("应如实回 opened=true，实际 %v", data["opened"])
+	}
+	// 权限列表里这一项必须带上可打开的地址，前端才会渲染按钮。
+	_, listOut, _ := doJSON(t, ts, "GET", "/api/v1/permissions", nil, cookies)
+	if fd := permFindItem(t, listOut, permissions.ItemFullDisk); fd == nil || fd["settings_url"] == "" {
+		t.Errorf("完全磁盘访问权限项必须带 settings_url（否则前端没有按钮）：%v", fd)
+	}
+
+	// ③ 没有对应设置页的项（可移除宗卷在 macOS 里没有独立列项）⇒ 404，不假装能开
+	calls = nil
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/permissions/removable/open-settings", map[string]any{}, cookies)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("没有对应页的项应 404，实际 %d: %v", res.StatusCode, out["msg"])
+	}
+	if len(calls) != 0 {
+		t.Fatal("没有对应页的项不该去打开窗口")
+	}
+
+	// ④ 打开失败 ⇒ 500 且如实报错（绝不谎报已打开）
+	stubPermissionsEnv(t, permEnvOpts{consoleUser: "zizdog"})
+	permOpenSettingsFn = func(context.Context, string, string) error {
+		return errors.New("launchctl asuser 失败")
+	}
+	res, out, _ = doJSON(t, ts, "POST", "/api/v1/permissions/full_disk/open-settings", map[string]any{}, cookies)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("打开失败应 500，实际 %d: %v", res.StatusCode, out["msg"])
+	}
+	if msg, _ := out["msg"].(string); !strings.Contains(msg, "打不开系统设置") {
+		t.Errorf("失败原因要如实写出来，实际 %q", msg)
+	}
 }

@@ -393,6 +393,9 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/plugins", s.requireAuth(s.handlePluginList))
 	root.HandleFunc("POST /api/v1/plugins/{id}/toggle", s.requireAuth(s.handlePluginToggle))
 	root.HandleFunc("POST /api/v1/permissions/{id}/apply", s.requireAuth(s.handlePermissionApply))
+	// 「打开系统设置」：把用户要点的那一页直接打开（完全磁盘访问权限 macOS 不弹窗，只能手动开）。
+	root.HandleFunc("POST /api/v1/permissions/{id}/open-settings",
+		s.requireAuth(s.handlePermissionOpenSettings))
 	// 操作审计：检索 + 游标分页 + 导出（facets 给下拉框提供真实出现过的动作名）
 	root.HandleFunc("GET /api/v1/audit", s.requireAuth(s.handleAuditList))
 	root.HandleFunc("GET /api/v1/audit/facets", s.requireAuth(s.handleAuditFacets))

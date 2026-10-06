@@ -81,6 +81,16 @@ func RequestFullDiskAuthorizationOnce(ctx context.Context, markerPath, home, con
 	// —— 用户要做的只是到系统设置把那个开关打开。原文案写"会弹出询问"是错的（坑 240）。
 	log("按安装时的同意，向系统申请完全磁盘访问（macOS 对这项不弹窗：面板会被加进" +
 		"系统设置的「完全磁盘访问权限」列表，把 zizpanel 的开关打开即可）")
+	// 🚨 顺带做一次**FDA 本身**的读取尝试（2026-10-06 用户要求"像其它软件那样把列表打开给我点"）：
+	// macOS 只在进程真的去读受 FDA 保护的东西时，才会把应用列进「完全磁盘访问权限」。
+	// 不先做这一步，安装收尾替用户打开的就是一个**没有面板**的列表 —— 那比不给按钮更糟。
+	// 放在轮询之前：几秒内完成，不跟着下面最多 90 秒的等待一起卡住。
+	if fda := FullDiskAccessProbeFn(home); fda.Granted {
+		log("完全磁盘访问权限：实测已授权（读得到受系统保护的文件，不需要再开开关）")
+	} else {
+		log("完全磁盘访问权限：%s；面板已按同意尝试读取，系统会把它列进"+
+			"「系统设置 → 隐私与安全性 → 完全磁盘访问权限」（开关默认关，打开即可）", fda.Detail)
+	}
 	deadline := time.Now().Add(wait)
 	for {
 		counts := fullDiskProbeFn(ctx, targets)

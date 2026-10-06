@@ -20,12 +20,14 @@ import (
 func stubFullDiskAuth(t *testing.T, results []PathResult) *int {
 	t.Helper()
 	prevProbe := fullDiskProbeFn
+	prevFDA := FullDiskAccessProbeFn
+	FullDiskAccessProbeFn = func(string) FullDiskProbe { return FullDiskProbe{} }
 	calls := 0
 	fullDiskProbeFn = func(context.Context, []string) []PathResult {
 		calls++
 		return results
 	}
-	t.Cleanup(func() { fullDiskProbeFn = prevProbe })
+	t.Cleanup(func() { fullDiskProbeFn = prevProbe; FullDiskAccessProbeFn = prevFDA })
 	return &calls
 }
 

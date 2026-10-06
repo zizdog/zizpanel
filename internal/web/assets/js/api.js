@@ -126,6 +126,9 @@ export const api = {
   // 「权限」页（macOS 授权）：只在仪表盘取"要不要提醒 + 跳去哪"。
   // 判据与权限页一致（关键项真实授权状态），GET 同样不碰受保护路径。
   permissionsNotice: () => request('GET', `${API_BASE}/permissions/notice`),
+  // 打开某一项对应的系统设置页（完全磁盘访问权限 macOS 不弹窗，只能手动开开关）。
+  permissionOpenSettings: (id) =>
+    request('POST', `${API_BASE}/permissions/${encodeURIComponent(id)}/open-settings`, {}),
   // 审计：列表（带检索与游标分页）、筛选项、导出。
   // audit() 保留原样给仪表盘用（它只关心最近的记录）。
   audit: (limit = 60) => request('GET', `${API_BASE}/audit?limit=${limit}`),
