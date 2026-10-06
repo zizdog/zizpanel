@@ -100,6 +100,10 @@ func Plan(o PlanOptions) []Item {
 	add("data/proxy-auth", filepath.Join(o.DataDir, "proxy-auth"), ApplyReplace, true, TargetPanel)
 	add("data/acme", filepath.Join(o.DataDir, "acme"), ApplyReplace, true, TargetPanel)
 	add("data/default-site.json", filepath.Join(o.DataDir, "default-site.json"), ApplyReplace, false, TargetPanel)
+	// 导航页上传的图标（<DataDir>/nav-icons/）。导航页是用户点名"非常重要"的面板数据，
+	// 而图标是**文件**、不在库的快照里 —— 只备份库的话，恢复后导航条目在、图标全裂
+	// （用户 2026-10-06 要求备份导航页；这条是当天查出来的真缺口）。
+	add("data/nav-icons", filepath.Join(o.DataDir, "nav-icons"), ApplyReplace, false, TargetPanel)
 
 	// ---------- nginx / PHP 环境（nginx） ----------
 	if o.BrewPrefix != "" {
@@ -228,7 +232,7 @@ func Selected(itemTargets, targets []string) bool {
 // DataCoveredNames 是 <DataDir> 下进了备份（或由数据库快照等价覆盖）的一级名字。
 func DataCoveredNames() []string {
 	return []string{"config.json", "tls", "certs", "site-certs", "proxy-certs", "proxy-auth", "acme",
-		"default-site.json", "panel.db"}
+		"default-site.json", "nav-icons", "panel.db"}
 }
 
 // DataExcludedNames 是 <DataDir> 下**明确不进**备份的一级名字及原因。

@@ -534,3 +534,44 @@ func TestRestoreBringsBackNavPage(t *testing.T) {
 		t.Errorf("导航设置内容不对：%q", title)
 	}
 }
+
+// TestRestoreBringsBackNavIconFiles：导航页上传的**图标文件**（<DataDir>/nav-icons/）
+// 必须进备份、并且能被恢复 —— 它们不在数据库快照里，只备份库的话恢复后图标全裂。
+//
+// 用户 2026-10-06："备份导航页非常重要"。这条是当天查出的真缺口：图标目录既不在
+// 备份覆盖名单里、也不在排除名单里（门禁当时没抓到，因为它用常量拼路径）。
+func TestRestoreBringsBackNavIconFiles(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ctx := context.Background()
+
+	iconDir := filepath.Join(srv.Cfg.DataDir, "nav-icons")
+	if err := os.MkdirAll(iconDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	iconPath := filepath.Join(iconDir, "abcdef0123456789.png")
+	const iconBytes = "PNG-ICON-CONTENT"
+	if err := os.WriteFile(iconPath, []byte(iconBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := makeArchive(t, srv, []string{backup.TargetPanel})
+
+	// 破坏现场：图标文件被删（换机恢复的常见形态）
+	if err := os.RemoveAll(iconDir); err != nil {
+		t.Fatal(err)
+	}
+
+	logLines := []string{}
+	logf := func(level, text string) { logLines = append(logLines, level+": "+text) }
+	if _, err := srv.runRestore(ctx, logf, res.Path, false); err != nil {
+		t.Fatalf("恢复失败: %v\n日志:\n%s", err, strings.Join(logLines, "\n"))
+	}
+
+	b, err := os.ReadFile(iconPath)
+	if err != nil {
+		t.Fatalf("恢复后导航图标文件没回来（导航页图标会全裂）：%v", err)
+	}
+	if string(b) != iconBytes {
+		t.Errorf("图标内容不对：%q", string(b))
+	}
+}
