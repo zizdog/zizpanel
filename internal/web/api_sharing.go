@@ -204,14 +204,15 @@ func (s *Server) handleSharingStatus(w http.ResponseWriter, r *http.Request) {
 			"开启后局域网内其它设备可访问这些目录；受 macOS 隐私保护的目录可能读不到。随时可在此关闭。",
 		},
 		"notes": []string{
-			"地址里的 IP 是面板只读探测到的本机局域网地址（en0）；读不到就只显示路径，不猜。",
+			"登录 SMB 用 Mac 的用户名与密码（登录这台 Mac 的那个账号），不是面板账号。",
+			"地址里的 IP 是面板只读探测到的本机局域网地址；读不到就只显示路径，不猜。",
 			"SMB 走 launchctl（enable + bootstrap），NFS 走 nfsd（enable + start）；成功后都会回读确认。",
-			"要让某个用户能连 SMB，需要在系统里把它加入 " + sharing.AccessSMBGroup + "；面板只读显示，不自动改组。",
+			sharing.AccessSMBGroup + " 是 Apple 的 SMB 服务 ACL：存在时只有成员能连，不存在时本机任意有密码的用户都能连；面板只读显示，不自动改组。",
 			"NFS 导出写在 " + exec.ExportsPath + "，每次改动前先备份到同目录 .zp-bak-<时间戳>。",
 		},
 	}
 	if ip == "" {
-		out["lan_ip_error"] = "读不到局域网 IP（ipconfig getifaddr en0 没结果），不编地址。"
+		out["lan_ip_error"] = "读不到本机局域网 IP（只看到回环 / VPN / 容器网桥这类别的设备连不上的地址），不编地址。"
 	}
 	if os.Geteuid() != 0 {
 		out["root_error"] = "面板不是以 root 运行：开启/关闭系统共享会失败，请用安装版面板（root LaunchDaemon）。"

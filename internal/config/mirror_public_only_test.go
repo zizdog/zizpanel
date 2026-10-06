@@ -58,8 +58,10 @@ func TestProductPathHasNoLANMirrorAddress(t *testing.T) {
 		"internal/mysql/mysql_test.go":                "MySQL host 授权形式的测试夹具",
 		"internal/sites/sites_test.go":                "站点反代地址的测试夹具",
 		"internal/store/store_test.go":                "存储层的测试夹具",
-		"cmd/zizpanel/http_test.go":                   "明文 HTTP 跳转的测试夹具（Host 头示例）",
-		"tools/sandbox-install-test.sh":               "安装脚本沙箱测试夹具（SSH_CONNECTION 与免授权网段样例，不碰真机）",
+		"internal/sysinfo/lanip_test.go": "「本机对外地址」判定的测试夹具：必须用私有网段样例才能验证" +
+			"「优先挑物理网卡的私有地址、不许把 VPN/容器网桥/169.254 给用户」这几条逻辑（与镜像无关）",
+		"cmd/zizpanel/http_test.go":     "明文 HTTP 跳转的测试夹具（Host 头示例）",
+		"tools/sandbox-install-test.sh": "安装脚本沙箱测试夹具（SSH_CONNECTION 与免授权网段样例，不碰真机）",
 	}
 
 	var bad []string

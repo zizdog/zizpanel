@@ -16,6 +16,7 @@ import (
 
 	"github.com/zizdog/zizpanel/internal/appproxy"
 	"github.com/zizdog/zizpanel/internal/sites"
+	"github.com/zizdog/zizpanel/internal/sysinfo"
 )
 
 // ============================================================================
@@ -437,15 +438,11 @@ func firstNonEmpty(vals ...string) string {
 
 // lanIP 返回本机局域网地址（用于拼"直连端口"的入口）。
 //
-// 取 en0（Apple Silicon 上有线/无线都是它）；取不到就返回空串，
-// 调用方据此不给直连链接（宁可少一个按钮，也不要给一个
-// `http://:8080/` 这种打不开的地址）。
+// 走 sysinfo.LANIPv4：**不写死 en0**（Mac mini 的以太网是 en0、Wi-Fi 是 en1，
+// 拔了网线只看 en0 就会"读不到本机 IP"）；取不到就返回空串，调用方据此不给直连链接
+// （宁可少一个按钮，也不要给一个 `http://:8080/` 这种打不开的地址）。
 func (s *Server) lanIP() string {
-	out, err := execCommand(context.Background(), "/usr/sbin/ipconfig", "getifaddr", "en0").Output()
-	if err != nil {
-		return ""
-	}
-	ip := strings.TrimSpace(string(out))
+	ip := sysinfo.LANIPv4(context.Background())
 	if net.ParseIP(ip) == nil {
 		return ""
 	}

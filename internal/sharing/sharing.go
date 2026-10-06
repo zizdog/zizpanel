@@ -16,6 +16,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/zizdog/zizpanel/internal/sysinfo"
 )
 
 // SMBDPlist 是 SMB 守护进程的 launchd plist（写死但在 Executor 里可参数化）。
@@ -357,20 +359,15 @@ func (e *Executor) NFSAction(ctx context.Context, enable bool) Result {
 	return res
 }
 
+// LocalIPv4Probe 是"本机局域网地址"的探测实现（门禁注入假地址用；生产走 sysinfo.LANIPv4）。
+var LocalIPv4Probe = sysinfo.LANIPv4
+
 // LocalIPv4 是本机局域网地址（只读探测；读不到回空串，调用方如实标"地址未知"）。
+//
+// 实现放在 sysinfo.LANIPv4：那里**不写死 en0**（Mac mini 的以太网是 en0、Wi-Fi 是 en1，
+// 拔了网线只看 en0 就会"读不到本机 IP"，用户 2026-10-06 报障）。
 func LocalIPv4(ctx context.Context) string {
-	bin := LookBin("ipconfig")
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(cctx, bin, "getifaddr", "en0").Output()
-	if err != nil {
-		return ""
-	}
-	ip := strings.TrimSpace(string(out))
-	if ip == "" || strings.ContainsAny(ip, " \t\n/") {
-		return ""
-	}
-	return ip
+	return LocalIPv4Probe(ctx)
 }
 
 // URL 构造客户端挂载地址建议：smb://<ip>/<共享名>；nfs://<ip><导出路径>。

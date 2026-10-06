@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/logx"
+	"github.com/zizdog/zizpanel/internal/sysinfo"
 )
 
 // qwenLog 是日志出口：守温循环的失败必须能在面板日志里看到，
@@ -661,11 +662,14 @@ func atoiSafe(s string) int {
 // primaryIP 返回本机局域网地址，用于拼给插件填的 URL；PrimaryIP 导出给 web 层用。
 // 不能让 web 层用请求里的客户端 IP —— 那是**浏览器**的地址，不是服务所在机器的地址
 // （2026-09-16 真机踩到，凭据弹窗显示成了用户自己电脑的 IP）。
+//
+// 探测走 sysinfo.LANIPv4（**不写死 en0**：Mac mini 的以太网是 en0、Wi-Fi 是 en1，
+// 拔了网线只看 en0 会拿不到地址，用户 2026-10-06 报障）；真拿不到时保留占位符原文，
+// 不编一个地址。
 func (m *Manager) PrimaryIP() string { return m.primaryIP() }
 
 func (m *Manager) primaryIP() string {
-	out := runOutput("/usr/sbin/ipconfig", "getifaddr", "en0")
-	if ip := strings.TrimSpace(out); ip != "" {
+	if ip := sysinfo.LANIPv4(context.Background()); ip != "" {
 		return ip
 	}
 	return "<本机地址>"

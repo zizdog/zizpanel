@@ -19,10 +19,13 @@ package web
 // 变异验证（把回读删掉 / 把注入校验删掉 ⇒ 本门禁必须变红）见函数注释。
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zizdog/zizpanel/internal/sharing"
 )
 
 // ---------- 假命令 ----------
@@ -177,14 +180,6 @@ echo "Group not found." >&2
 exit 64
 `
 
-const shimSharingIpconfig = `#!/bin/sh
-d=$(cd "$(dirname "$0")" && pwd)
-case "$*" in
-  "getifaddr en0") [ -f "$d/state/no_ip" ] && exit 1; echo "192.0.2.7"; exit 0 ;;
-esac
-exit 1
-`
-
 type sharingShim struct {
 	t   *testing.T
 	dir string
@@ -200,7 +195,7 @@ func newSharingShim(t *testing.T) *sharingShim {
 	for name, body := range map[string]string{
 		"launchctl": shimSharingLaunchctl, "sharing": shimSharingSharing,
 		"nfsd": shimSharingNfsd, "pgrep": shimSharingPgrep,
-		"dseditgroup": shimSharingDseditgroup, "ipconfig": shimSharingIpconfig,
+		"dseditgroup": shimSharingDseditgroup,
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -330,6 +325,12 @@ func sharingFindShare(t *testing.T, out map[string]any, kind, name string) map[s
 
 func TestFileSharingGate(t *testing.T) {
 	shim := newSharingShim(t)
+	// 本机 IP 探测：注入固定地址。探测实现自己有门禁（internal/sysinfo/lanip_test.go，
+	// 锁的是"Mac mini 只插 Wi-Fi 也要给得出地址"这类真机布局）；旧实现是 exec
+	// `ipconfig getifaddr en0`，靠 PATH 垫片注入，现在不再 spawn 进程。
+	oldProbe := sharing.LocalIPv4Probe
+	sharing.LocalIPv4Probe = func(context.Context) string { return "192.0.2.7" }
+	t.Cleanup(func() { sharing.LocalIPv4Probe = oldProbe })
 	srv, ts := newTestServer(t)
 	srv.sharingExportsPath = shim.exportsPath()
 

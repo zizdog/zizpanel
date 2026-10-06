@@ -1054,22 +1054,34 @@ function shareSection() {
         style: { marginTop: '6px', color: 'var(--warn)', fontSize: '12px' },
         dataset: { testid: 'zp-share-root-error' }, text: data.root_error,
       }) : null,
+      // 地址那行只说"地址未知"，这里补一句**为什么**（后端给的原因），别让用户干瞪眼。
+      data.lan_ip_error ? h('div', {
+        style: { marginTop: '6px', color: 'var(--warn)', fontSize: '12px' },
+        dataset: { testid: 'zp-share-lan-ip-error' }, text: data.lan_ip_error,
+      }) : null,
       h('div', { style: { marginTop: '12px', display: 'flex', gap: '6px', flexWrap: 'wrap' } }, [
         h('button.btn.btn-sm.btn-primary', { text: '＋ 添加共享', dataset: { testid: 'zp-share-add' }, onclick: openForm }),
       ]),
     );
 
     // 访问组（SMB）：只读显示，面板不自动改组成员。
+    //
+    // 语义（Apple 的服务 ACL）：组**存在**时只有成员能连；**不存在**时等于没这道限制，
+    // 本机任意有密码的用户都能连。旧文案在"组不存在"时写成"要把它加入该组"，
+    // 会让人以为必须加组（反而把 SMB 锁成只允许那一个人）—— 用户 2026-10-06 问到这个。
     const acc = data.access || {};
+    const groupName = acc.group || 'com.apple.access_smb';
     let groupText;
     if (!acc.verified) {
       groupText = '访问组未复核：' + (acc.error || '读不到成员信息');
     } else if (!acc.exists) {
-      groupText = '这台机器上还没有 ' + (acc.group || 'com.apple.access_smb') + ' 组；要让某个用户能连 SMB，需要把它加入该组（面板不自动改）。';
+      groupText = '没有 ' + groupName + ' 服务 ACL：系统没限制 SMB 登录用户，本机任意有密码的用户都能连'
+        + '（登录用 Mac 的用户名与密码，不是面板账号）。';
     } else {
       const members = (acc.members && acc.members.length) ? acc.members.join('、') : '（成员列不出来）';
       const me = acc.user_member_known ? (acc.user_member ? '；当前用户已在组里' : '；当前用户不在组里，需要加进去才能访问') : '';
-      groupText = '访问组 ' + (acc.group || '') + '：' + members + me;
+      groupText = 'SMB 只允许 ' + groupName + ' 的成员登录：' + members + me
+        + '（登录用 Mac 的用户名与密码，不是面板账号；加人用 dseditgroup，面板不自动改）。';
     }
     body.append(h('div.hint', { dataset: { testid: 'zp-share-access' }, style: { marginTop: '8px' }, text: groupText }));
 
