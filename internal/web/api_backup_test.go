@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/zizdog/zizpanel/internal/backup"
+	"github.com/zizdog/zizpanel/internal/offsite"
 )
 
 // TestRestoreReportsArchiveFilesItDoesNotApply：归档里的 sites/数据库导出
@@ -412,4 +413,124 @@ func tarGzForTest(dir, out string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// TestRestoreMergesOffsiteSettingsWithoutTouchingIdentity 是 2026-10-06 用户要求的门禁：
+// 备份/恢复必须**默认**把"异地备份（SMTP/FTP）设置"带回来，同时**不许**动本机身份
+// （面板后缀 / 监听端口 / 升级源）——那是"整份 config.json 默认不恢复"要挡的东西。
+//
+// 负向对照：把 runRestore 里的 mergeOffsiteFromArchive 调用去掉，第一条断言立刻红。
+func TestRestoreMergesOffsiteSettingsWithoutTouchingIdentity(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ctx := context.Background()
+
+	// 备份那一刻的现场：配好异地备份（含口令与收件人），本机身份是 A 套。
+	srv.Cfg.Offsite = &offsite.Settings{
+		Enabled: true, Protocol: "smtp", Host: "smtp.backup-host.example", Port: 465,
+		Encryption: "ssl", Username: "backup-user", Password: "backup-pass",
+		From: "panel@example.com", To: "me@example.com", MaxFileMB: 20,
+	}
+	identitySuffix := srv.Cfg.PanelSuffix
+	if err := srv.Cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	res := makeArchive(t, srv, []string{backup.TargetPanel})
+
+	// 恢复前把本机改成另一套：异地备份清空、身份字段换掉（模拟"换了台机器"）。
+	srv.Cfg.Offsite = nil
+	srv.Cfg.Listen = ":9999"
+	if err := srv.Cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	logLines := []string{}
+	logf := func(level, text string) { logLines = append(logLines, level+": "+text) }
+	rep, err := srv.runRestore(ctx, logf, res.Path, false)
+	if err != nil {
+		t.Fatalf("恢复失败: %v\n日志:\n%s", err, strings.Join(logLines, "\n"))
+	}
+
+	// ① 异地备份设置回来了（含口令与收件人）—— 这是用户点名的"应该包括"。
+	if srv.Cfg.Offsite == nil {
+		t.Fatalf("恢复后异地备份（SMTP）设置没回来（用户报障的原形）\n日志:\n%s", strings.Join(logLines, "\n"))
+	}
+	if srv.Cfg.Offsite.Host != "smtp.backup-host.example" || srv.Cfg.Offsite.To != "me@example.com" {
+		t.Errorf("异地备份设置内容不对：%+v", *srv.Cfg.Offsite)
+	}
+	if srv.Cfg.Offsite.Password != "backup-pass" {
+		t.Errorf("异地备份口令没跟着恢复（恢复后还要重填）：%q", srv.Cfg.Offsite.Password)
+	}
+	// 报告里要如实说"这是局部合并恢复的"，别让用户以为整份 config 都换了。
+	merged := strings.Join(rep.Merged, "；")
+	if !strings.Contains(merged, "异地备份") {
+		t.Errorf("恢复报告没写清异地备份是局部合并恢复的：%v", rep.Merged)
+	}
+	// ② 本机身份字段一个字都不许动。
+	if srv.Cfg.Listen != ":9999" {
+		t.Errorf("本机监听端口被备份覆盖了（默认策略要求保持本机身份）：%q", srv.Cfg.Listen)
+	}
+	if srv.Cfg.PanelSuffix != identitySuffix {
+		t.Errorf("本机面板后缀被覆盖了：%q（应为 %q）", srv.Cfg.PanelSuffix, identitySuffix)
+	}
+	if rep.ConfigRestored {
+		t.Error("没勾选恢复 config.json 时不许标记 ConfigRestored")
+	}
+}
+
+// TestRestoreBringsBackNavPage：导航页（导航分组/条目/设置）是**面板数据的一部分**，
+// 必须跟着备份与恢复一起回来（用户 2026-10-06："备份导航页非常重要"）。
+//
+// 它们在 panel.db 里（nav_groups / nav_items / nav_settings），而数据库是**单事务整表复制**
+// 恢复的 —— 这个门禁就是证明这条链真的覆盖到它们，而不是"应该覆盖"。
+func TestRestoreBringsBackNavPage(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ctx := context.Background()
+
+	if _, err := srv.Store.DB().Exec(`INSERT INTO nav_groups(id,name,sort) VALUES(1,'我的服务',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Store.DB().Exec(
+		`INSERT INTO nav_items(group_id,name,url,icon,description,sort) VALUES(1,'面板','https://127.0.0.1:8443/','🧭','本机面板',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.Store.DB().Exec(
+		`INSERT INTO nav_settings(key,value) VALUES('title','我的导航'),('nav_listen_port','8896')`); err != nil {
+		t.Fatal(err)
+	}
+
+	res := makeArchive(t, srv, []string{backup.TargetPanel})
+
+	// 破坏现场：导航页数据全没了（相当于换机/误删）
+	if _, err := srv.Store.DB().Exec(`DELETE FROM nav_items; DELETE FROM nav_groups; DELETE FROM nav_settings;`); err != nil {
+		t.Fatal(err)
+	}
+
+	logLines := []string{}
+	logf := func(level, text string) { logLines = append(logLines, level+": "+text) }
+	if _, err := srv.runRestore(ctx, logf, res.Path, false); err != nil {
+		t.Fatalf("恢复失败: %v\n日志:\n%s", err, strings.Join(logLines, "\n"))
+	}
+
+	var name, url string
+	if err := srv.Store.DB().QueryRow(`SELECT name,url FROM nav_items WHERE group_id=1`).Scan(&name, &url); err != nil {
+		t.Fatalf("恢复后导航条目没回来（导航页是面板数据的一部分）：%v", err)
+	}
+	if name != "面板" || url != "https://127.0.0.1:8443/" {
+		t.Errorf("导航条目内容不对：%q / %q", name, url)
+	}
+	var gname string
+	if err := srv.Store.DB().QueryRow(`SELECT name FROM nav_groups WHERE id=1`).Scan(&gname); err != nil {
+		t.Fatalf("恢复后导航分组没回来：%v", err)
+	}
+	if gname != "我的服务" {
+		t.Errorf("导航分组内容不对：%q", gname)
+	}
+	var title string
+	if err := srv.Store.DB().QueryRow(`SELECT value FROM nav_settings WHERE key='title'`).Scan(&title); err != nil {
+		t.Fatalf("恢复后导航设置没回来：%v", err)
+	}
+	if title != "我的导航" {
+		t.Errorf("导航设置内容不对：%q", title)
+	}
 }

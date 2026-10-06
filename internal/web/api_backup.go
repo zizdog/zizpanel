@@ -2,9 +2,11 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zizdog/zizpanel/internal/backup"
+	"github.com/zizdog/zizpanel/internal/offsite"
 	"github.com/zizdog/zizpanel/internal/store"
 	"github.com/zizdog/zizpanel/internal/tasks"
 )
@@ -442,6 +445,9 @@ type restoreReport struct {
 	Warnings []string `json:"warnings"`
 	// Partial 为 true 表示数据库/文件已应用，但有部分项没成功。
 	Partial bool `json:"partial"`
+	// Merged 是"只合并了一部分"的条目（当前只有异地备份设置）：它们**已经恢复**，
+	// 只是没有整份覆盖 config.json（保持本机身份）—— 与 Skipped 语义相反，别混。
+	Merged []string `json:"merged,omitempty"`
 	// ConfigRestored / RestartPlanned 描述 config.json 与重启状态。
 	ConfigRestored bool `json:"config_restored"`
 	RestartPlanned bool `json:"restart_planned"`
@@ -531,6 +537,16 @@ func (s *Server) runRestore(ctx context.Context, log tasks.LogFunc, archive stri
 			if !restoreConfig {
 				rep.Skipped = append(rep.Skipped,
 					"data/config.json：按默认策略未恢复（保持本机面板后缀/端口/证书身份）")
+				// 🚨 但"异地备份（SMTP/FTP）设置"不是本机身份的一部分，它是用户配置：
+				// 默认就该跟着备份回来（用户 2026-10-06 明确要求"应该包括"），
+				// 否则换机恢复后要重填一遍 SMTP 主机/账号/口令/收件人。
+				if ok, why := s.mergeOffsiteFromArchive(filepath.Join(tmp, "data", "config.json")); ok {
+					rep.Merged = append(rep.Merged,
+						"异地备份设置（SMTP/FTP）已从备份恢复；本机面板后缀/端口/证书身份保持不变")
+					logf("info", "   已从备份恢复异地备份设置（SMTP/FTP），本机身份字段未改动")
+				} else if why != "" {
+					rep.Skipped = append(rep.Skipped, "异地备份设置未恢复："+why)
+				}
 			}
 			// 勾选了恢复时由第 ⑨ 步统一处理（写盘 + 重启），这里不重复写：
 			// config.json 一落盘就要重启才生效，放在一处才不会出现"写了一半"。
@@ -892,4 +908,38 @@ func relaxPerms(path string, fileMode, dirMode os.FileMode) {
 		}
 		return nil
 	})
+}
+
+// mergeOffsiteFromArchive 只把归档 config.json 里的 **offsite** 段合并进本机配置。
+//
+// 为什么不整份恢复：config.json 里混着"本机身份"（面板后缀、监听端口、升级源、数据目录），
+// 换机恢复时覆盖它们会当场改掉访问地址。而异地备份设置（SMTP/FTP 主机、账号、口令、
+// 收件人、大小上限）纯属用户配置，与机器身份无关 —— 丢了就得重填一遍。
+// 所以默认策略从"整份不恢复"细化为：**身份字段不恢复，offsite 段照常恢复**（用户 2026-10-06 要求）。
+//
+// 返回 (是否合并了, 出问题时给人看的一句话)。归档里没有 config.json / 没有 offsite 段
+// 都算"本来就没东西可恢复"，返回 (false, "")，不制造噪音。
+func (s *Server) mergeOffsiteFromArchive(cfgPath string) (bool, string) {
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, ""
+		}
+		return false, err.Error()
+	}
+	var probe struct {
+		Offsite *offsite.Settings `json:"offsite"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false, "读归档 config.json 失败：" + err.Error()
+	}
+	if probe.Offsite == nil {
+		return false, ""
+	}
+	st := *probe.Offsite
+	s.Cfg.Offsite = &st
+	if err := s.Cfg.Save(); err != nil {
+		return false, "写入本机 config.json 失败：" + err.Error()
+	}
+	return true, ""
 }
