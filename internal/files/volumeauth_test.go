@@ -262,3 +262,57 @@ func TestRequestVolumeAuthorizationNowReadsWhenSomeoneIsPresent(t *testing.T) {
 		t.Errorf("按需入口不该有一次性标记语义，实际 %+v", res)
 	}
 }
+
+// TestConsoleUserJudgeHandlesRootOwnedDevConsole 是坑 237 的门禁：
+// 「谁在屏幕前」这条判据**不能只看 /dev/console 的属主**。
+//
+// 真机事故（本机 macOS 15.6，2026-10-06）：zizdog 已登录在图形界面、屏幕没锁、
+// `who` 与 `scutil` 都报 zizdog，但 /dev/console 的属主是 **root**。旧判据据此认定
+// "现在没人在机器前"：安装期不写一次性授权请求（用户一个弹窗都看不到），「权限」页
+// 逐项点「申请」全被 409 挡回 —— 用户以为是自己安装时选错了选项。
+//
+// 负向对照：把 consoleUserReal 退回"只看 /dev/console"，第一个子用例必红。
+func TestConsoleUserJudgeHandlesRootOwnedDevConsole(t *testing.T) {
+	const scutilOut = `<dictionary> {
+  GID : 20
+  Name : zizdog
+  SessionInfo : <array> {
+    0 : <dictionary> {
+      kCGSSessionOnConsoleKey : TRUE
+      kCGSSessionUserNameKey : zizdog
+    }
+  }
+  UID : 501
+}
+`
+	cases := []struct {
+		name       string
+		scutilOut  string
+		scutilErr  error
+		ioregOut   string
+		wantUser   string
+		wantReason string
+	}{
+		{"scutil 报 zizdog、屏幕没锁 → 有人在（/dev/console 是 root 也不许挡住用户）",
+			scutilOut, nil, `"IOConsoleLocked" = No`, "zizdog", ""},
+		{"锁屏 → 当没人在（弹窗没人点，TCC 会记成 denial）",
+			scutilOut, nil, `      "IOConsoleLocked" = Yes`, "", ""},
+		{"登录窗口界面 → 没人在",
+			"<dictionary> {\n  Name : loginwindow\n}\n", nil, `"IOConsoleLocked" = No`, "", ""},
+		{"只有 SessionInfo 的键（不许误取）→ 没人在",
+			"<dictionary> {\n  SessionInfo : <array> {\n    0 : <dictionary> {\n      kCGSSessionUserNameKey : zizdog\n    }\n  }\n}\n",
+			nil, `"IOConsoleLocked" = No`, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			prevScutil, prevIoreg := scutilConsoleOutputFn, ioregLockOutputFn
+			scutilConsoleOutputFn = func() ([]byte, error) { return []byte(c.scutilOut), c.scutilErr }
+			ioregLockOutputFn = func() ([]byte, error) { return []byte(c.ioregOut), nil }
+			t.Cleanup(func() { scutilConsoleOutputFn, ioregLockOutputFn = prevScutil, prevIoreg })
+
+			if got := consoleUserReal(); got != c.wantUser {
+				t.Errorf("consoleUserReal()=%q，期望 %q（%s）", got, c.wantUser, c.wantReason)
+			}
+		})
+	}
+}

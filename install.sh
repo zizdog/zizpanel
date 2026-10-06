@@ -2820,9 +2820,10 @@ is_remote_session() {
   [ -n "${TERM_SESSION_ID:-}" ] && return 1
   [ -n "${__CFBundleIdentifier:-}" ] && return 1
   # 兜底：谁登录在控制台（物理/图形控制台）。当前用户就是它 → 本机操作。
+  # 用 console_login_user（同一套判据，见坑 237），不要在这里另写一次 stat。
   local console_user=""
-  console_user="$(stat -f '%Su' /dev/console 2>/dev/null || echo "")"
-  if [ -n "$console_user" ] && [ "$console_user" != "root" ] && [ "$console_user" = "${REAL_USER:-}" ]; then
+  console_user="$(console_login_user)"
+  if [ -n "$console_user" ] && [ "$console_user" = "${REAL_USER:-}" ]; then
     return 1
   fi
   return 0
@@ -2890,10 +2891,22 @@ external_volume_list() {
   done
 }
 
-# console_login_user：当前图形控制台（屏幕前）的登录用户；没人时为 root/loginwindow/空。
+# console_login_user：当前图形控制台（屏幕前）的登录用户；没人时输出空串。
+#
+# 判据顺序与面板自己（internal/files/volumeauth.go）**必须一致**，否则同一个"有没有人"
+# 两边给出相反答案：安装期不申请授权，面板里点「申请」又被拒（坑 237 真机实况）。
+#   ① scutil 的图形会话 Name —— 权威；② 兜底 /dev/console 属主。
+# 为什么不能只看 /dev/console：本机 macOS 15.6 实测 zizdog 已登录解锁、who/scutil 都报
+# zizdog，而 /dev/console 的属主是 root —— 旧判据据此拒发授权，用户一个弹窗都看不到。
 console_login_user() {
   local u=""
-  u="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo "")"
+  u="$(/usr/sbin/scutil 2>/dev/null <<<'show State:/Users/ConsoleUser' \
+       | /usr/bin/awk -F' : ' '/^  Name/{print $2; exit}' || echo "")"
+  case "$u" in ""|root|loginwindow)
+    u="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo "")"
+    case "$u" in root|loginwindow) u="" ;; esac
+    ;;
+  esac
   printf '%s' "$u"
 }
 

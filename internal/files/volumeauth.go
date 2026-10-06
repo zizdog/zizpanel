@@ -49,17 +49,105 @@ func VolumeAuthMarkerPath(dataDir string) string {
 }
 
 // consoleUserFn 返回当前图形控制台（物理屏幕）的登录用户名；没有登录会话时返回空串。
+// root 与 loginwindow 都表示"没人在"（登录窗口界面 / 无 GUI），此时**绝不允许**触发任何弹窗。
 //
-// macOS 上 /dev/console 的属主就是"谁在屏幕前"。root 与 loginwindow
-// 都表示"没人在"（登录窗口界面 / 无 GUI），此时**绝不允许**触发任何弹窗。
+// 判据顺序（2026-10-06 修，坑 237）：
+//
+//	① `scutil show State:/Users/ConsoleUser` 的顶层 Name —— 图形会话的登录用户，**权威**；
+//	② 屏幕锁着（ioreg 的 IOConsoleLocked=Yes）→ 当"没人在"：锁屏时弹窗也没人点；
+//	③ ①拿不到才退回 /dev/console 的属主。
+//
+// 为什么不能只看 /dev/console：本机 macOS 15.6 实测 —— zizdog 明明登录在图形界面、
+// 屏幕没锁、`who` 与 `scutil` 都报 zizdog，但 /dev/console 的属主是 **root**。旧判据据此
+// 认定"没人在机器前"：安装期不写一次性授权请求（用户看不到任何弹窗），面板「权限」页
+// 逐项点「申请」一律 409 —— 用户被彻底挡在门外，只能走手动路径。
 var consoleUserFn = consoleUserReal
 
 func consoleUserReal() string {
+	user := consoleUserFromScutil()
+	if user == "" {
+		user = consoleUserFromDevConsole()
+	}
+	if user == "" || consoleIsLocked() {
+		return ""
+	}
+	return user
+}
+
+// scutilConsoleOutputFn / ioregLockOutputFn 是两条判据的外部命令注入点：
+// 单测要能造出"scutil 说是 zizdog、/dev/console 说是 root"这个真机组合，而不改本机状态。
+var (
+	scutilConsoleOutputFn = func() ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/sbin/scutil")
+		cmd.Stdin = strings.NewReader("show State:/Users/ConsoleUser\n")
+		return cmd.Output()
+	}
+	ioregLockOutputFn = func() ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		return exec.CommandContext(ctx, "/usr/sbin/ioreg", "-n", "Root", "-d1").Output()
+	}
+)
+
+func consoleUserFromScutil() string {
+	out, err := scutilConsoleOutputFn()
+	if err != nil {
+		return ""
+	}
+	return parseScutilConsoleUser(string(out))
+}
+
+// parseScutilConsoleUser 只认**顶层** `  Name : xxx`。
+// SessionInfo 里的是 kCGSSessionUserNameKey（键名不同），不会被误取；
+// 登录窗口界面给的是 loginwindow，与 root 一样按"没人在"处理。
+func parseScutilConsoleUser(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " : ")
+		if !ok || strings.TrimSpace(k) != "Name" {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if v == "" || v == "root" || v == "loginwindow" {
+			return ""
+		}
+		return v
+	}
+	return ""
+}
+
+// consoleUserFromDevConsole 是兜底判据：/dev/console 的属主。
+//
+// 与 scutil 那条一样把 root / loginwindow 归一成空串 —— 调用方要的是"有没有人"，
+// 不是"是谁"；让 root 字符串漏出去会变成"看起来有人在"（坑 237 的另一种翻法）。
+func consoleUserFromDevConsole() string {
 	out, err := exec.Command("/usr/bin/stat", "-f", "%Su", "/dev/console").Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	u := strings.TrimSpace(string(out))
+	if u == "root" || u == "loginwindow" {
+		return ""
+	}
+	return u
+}
+
+// consoleIsLocked：锁屏时**没人能点弹窗**，TCC 会把这次访问记成 denial。
+// 读不到 ioreg 时按"没锁"处理 —— 宁可让用户在屏幕前能点，也不许再把人挡在门外（坑 237）。
+func consoleIsLocked() bool {
+	out, err := ioregLockOutputFn()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.Trim(strings.TrimSpace(k), "\"") != "IOConsoleLocked" {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(v), "\"") == "Yes"
+	}
+	return false
 }
 
 // ConsoleUser 返回当前图形控制台（物理屏幕）的登录用户名；没有登录会话时返回空串。
