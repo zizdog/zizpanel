@@ -2352,6 +2352,14 @@ remove_codesign_trust() {
     skip "本来就没有代码签名证书（无需撤销信任）"
     return 0
   fi
+  # 动手前说清即将弹出的系统弹窗（用户 2026-10-06：安装与卸载都撞到这个框，
+  # 不知道那是什么）。撤销信任同样要系统授权，跟安装时那条提示一一对应。
+  if [ "$DRY" != "1" ]; then
+    printf '\n  %s⚠ 马上会弹出系统授权框：「你正在对"系统证书信任设置"进行更改」%s\n' "$C_BOLD" "$C_RESET"
+    printf '    那是%s撤销面板代码签名证书的系统信任%s（安装时加进去的，卸载就该撤掉）：\n' "$C_BOLD" "$C_RESET"
+    printf '    点「使用触控 ID」或输密码允许即可；点「取消」的话，这张受信任证书会留在系统里\n'
+    printf '    （可稍后在「钥匙串访问」里删掉 ZizPanel Release）。\n\n'
+  fi
   begin "正在撤销代码签名证书信任：${crt}"
   if [ "$DRY" = "1" ]; then
     printf '    %s[dry-run]%s 将执行：security remove-trusted-cert -d %s\n' "$C_YELLOW" "$C_RESET" "$crt"
@@ -2949,6 +2957,22 @@ is_remote_session() {
 # -------------------------------------- 代码签名证书信任（授权能否跨升级存活）--
 # macOS 把授权绑在二进制的代码要求上：adhoc 的判据是 cdhash（实测升级即失效），固定证书 +
 # 固定 identifier 后与它无关（2026-09-19 实测 1.4.8→1.4.9 成立）；这里以 root 把证书公钥装进系统钥匙串。
+# notice_codesign_trust_local：本机安装时，**动手前**把即将出现的系统弹窗讲清楚。
+#
+# 用户 2026-10-06：安装/卸载时都遇到「security / 你正在对"系统证书信任设置"进行更改，
+# 使用触控 ID 或输入密码允许此操作」的弹窗，不知道那是什么、该不该点。三句话说清：
+# 是什么（面板自己的自签代码签名证书）、点了有什么用（授权一次、升级重装都不用再授）、
+# 不点会怎样（面板照常能用，只是升级后可能要重授一次）。
+notice_codesign_trust_local() {
+  printf '\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s⚠ 马上会弹出系统授权框：「你正在对"系统证书信任设置"进行更改」%s\n' "$C_BOLD" "$C_RESET"
+  printf '\n  那是把面板自己的%s代码签名证书%s装进系统信任（不是装别的软件，也不联网）：\n' "$C_BOLD" "$C_RESET"
+  printf '    · 点「使用触控 ID」或输入密码允许 —— 桌面/文稿/下载/外接盘的授权\n'
+  printf '      %s一次之后升级、重装都不用再授%s；\n' "$C_BOLD" "$C_RESET"
+  printf '    · 点「取消」也行：面板照常能用，只是升级后可能要求你重新授一次。\n'
+  printf '  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$C_BOLD" "$C_RESET"
+}
+
 install_codesign_trust() {
   title "代码签名证书信任（让面板授权跨升级有效）"
   local crt=""
@@ -2965,9 +2989,15 @@ install_codesign_trust() {
     info "  sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain $crt"
     return 0
   fi
+  # 🚨 动手前**醒目**说清即将弹出的系统弹窗（用户 2026-10-06 要求：他当时看到
+  # 「security / 你正在对"系统证书信任设置"进行更改」的授权框，不知道那是什么）。
+  # 只在真机安装、且真的要动手时才提示：干跑不会弹窗；远程安装走上面的手动命令分支。
   if dry_run; then
     info "（干跑）将导入并信任代码签名证书：$crt"
     return 0
+  fi
+  if ! is_remote_session; then
+    notice_codesign_trust_local
   fi
   # 数据目录留副本：卸载脚本要凭它撤销信任，否则会把受信任的代码签名根永久留在系统里。
   mkdir -p "$DATA_DIR" 2>/dev/null || true

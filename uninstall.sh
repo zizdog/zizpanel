@@ -892,6 +892,14 @@ remove_codesign_trust() {
     skip "本来就没有代码签名证书（无需撤销信任）"
     return 0
   fi
+  # 动手前说清即将弹出的系统弹窗（用户 2026-10-06：安装与卸载都撞到这个框，
+  # 不知道那是什么）。撤销信任同样要系统授权，跟安装时那条提示一一对应。
+  if [ "$DRY" != "1" ]; then
+    printf '\n  %s⚠ 马上会弹出系统授权框：「你正在对"系统证书信任设置"进行更改」%s\n' "$C_BOLD" "$C_RESET"
+    printf '    那是%s撤销面板代码签名证书的系统信任%s（安装时加进去的，卸载就该撤掉）：\n' "$C_BOLD" "$C_RESET"
+    printf '    点「使用触控 ID」或输密码允许即可；点「取消」的话，这张受信任证书会留在系统里\n'
+    printf '    （可稍后在「钥匙串访问」里删掉 ZizPanel Release）。\n\n'
+  fi
   begin "正在撤销代码签名证书信任：${crt}"
   if [ "$DRY" = "1" ]; then
     printf '    %s[dry-run]%s 将执行：security remove-trusted-cert -d %s\n' "$C_YELLOW" "$C_RESET" "$crt"
