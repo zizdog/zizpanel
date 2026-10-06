@@ -242,8 +242,8 @@ func scanTotals(ctx context.Context, items []workItem, b *batchProgress) error {
 	return nil
 }
 
-// copyFileProgress 复制单个文件：按 1MB 块累计字节并检查取消。
-// copyFileProgress 复制一个文件，带"网络盘读超时自动续传"。
+// copyFileProgress 复制一个文件（按 1MB 块累计字节、检查取消），带"网络盘读超时自动续传"。
+// 复制与跨卷移动（EXDEV 回退）都走它 ⇒ 两条路都受益。
 //
 // 为什么需要（用户 2026-10-06 报障）：面板把 NFS 挂成 `soft,timeo=10(1s),retrans=2`
 // —— 这是刻意的（NAS 关机时不能让 I/O 永久挂起），代价是**一次读请求卡超 2 秒就返回
