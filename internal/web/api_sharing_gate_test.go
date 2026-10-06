@@ -771,17 +771,27 @@ func TestFileSharingShareUpdateGate(t *testing.T) {
 	t.Cleanup(func() { sharing.LocalIPv4Probe = oldProbe })
 	srv, ts := newTestServer(t)
 	srv.sharingExportsPath = shim.exportsPath()
+	existedDir := t.TempDir()
 	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
 		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
 
 	// 4 列状态行 = 记录名 ≠ SMB 名（真机 mini 的形状）。
+	// 第二行指向一个**真的存在**的目录，用来对照 path_missing。
 	shim.setState("smbd_running", "1")
-	shim.setState("shares.txt", "ZPMirror\tzpmirror\t/Volumes/ZPMirror\t0\n")
+	shim.setState("shares.txt", "ZPMirror\tzpmirror\t/Volumes/ZPMirror\t0\n"+
+		"Public\tpublic\t"+existedDir+"\t0\n")
 
 	_, out, _ := doJSON(t, ts, "GET", "/api/v1/system/sharing", nil, cookies)
 	row := sharingFindShare(t, out, "smb", "zpmirror")
 	if got := asString(mapGet(row, "record_name")); got != "ZPMirror" {
 		t.Fatalf("回读里没有记录名（record_name=%q）—— 前端只能按 SMB 名猜，写操作会找不到记录", got)
+	}
+	// 目录不在时必须如实标出来：macOS 这时不会广播这条共享，客户端会报"服务器上不存在该共享"。
+	if mapGet(row, "path_missing") != true {
+		t.Errorf("目录不存在的共享没有标 path_missing：%v", row)
+	}
+	if got := sharingFindShare(t, out, "smb", "public"); mapGet(got, "path_missing") == true {
+		t.Errorf("目录存在的共享被误标 path_missing：%v", got)
 	}
 
 	// ---- ① 改名 + 改只读：必须 `-e <记录名>` ----

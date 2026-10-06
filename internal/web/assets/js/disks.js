@@ -1024,6 +1024,12 @@ function shareSection() {
         h('span.pill', { text: kind === 'smb' ? 'SMB' : 'NFS' }),
         h('strong', { text: s.name }),
         s.read_only ? h('span.pill', { text: '只读' }) : null,
+        // 目录不在（外置盘没挂载）时 macOS 不会广播这条共享：客户端会报"服务器上不存在该共享"。
+        s.path_missing ? h('span.pill.warn', {
+          text: '目录不在',
+          title: '这个目录现在不存在（外置盘没挂载？）。macOS 这时不会把这条共享发给客户端，别的设备连它会报「服务器上不存在该共享」。',
+          dataset: { testid: 'zp-share-path-missing' },
+        }) : null,
         unmanaged ? h('span.pill.warn', { text: '系统原有', title: '这一行不是面板写的，只读显示，面板不删它' }) : null,
         shareStatusPill(s.status),
       ]),

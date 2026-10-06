@@ -119,14 +119,17 @@ type sharingShareView struct {
 	Name string `json:"name"`
 	// RecordName 是共享点记录名（`sharing -e/-r` 认它）：前端改/删时原样带回来，
 	// 面板据此定位——SMB 名与记录名可以不一样（真机：zpmirror vs ZPMirror）。
-	RecordName string   `json:"record_name,omitempty"`
-	Path       string   `json:"path"`
-	ReadOnly   bool     `json:"read_only"`
-	Managed    bool     `json:"managed"`
-	Status     string   `json:"status"` // running / stopped / unknown
-	URL        string   `json:"url,omitempty"`
-	Line       string   `json:"line,omitempty"`
-	Options    []string `json:"options,omitempty"`
+	RecordName string `json:"record_name,omitempty"`
+	Path       string `json:"path"`
+	ReadOnly   bool   `json:"read_only"`
+	Managed    bool   `json:"managed"`
+	// PathMissing = 共享目录现在不存在（外置盘没挂载等）。macOS 这时**不广播**这条共享，
+	// 客户端会报"服务器上不存在该共享"，所以界面必须标出来。
+	PathMissing bool     `json:"path_missing,omitempty"`
+	Status      string   `json:"status"` // running / stopped / unknown
+	URL         string   `json:"url,omitempty"`
+	Line        string   `json:"line,omitempty"`
+	Options     []string `json:"options,omitempty"`
 }
 
 type sharingServiceView struct {
@@ -180,9 +183,18 @@ func (s *Server) handleSharingStatus(w http.ResponseWriter, r *http.Request) {
 	smbView := sharingServiceView{Kind: "smb", State: smbState, Status: stateLabel("smb", smbState),
 		Shares: []sharingShareView{}, SharesKnown: smbKnown, SharesError: smbErr}
 	for _, sh := range smbShares {
+		// 路径不存在时 macOS **不会把这条共享广播给客户端** —— 客户端连 `smb://主机/共享名`
+		// 会报「服务器上不存在该共享」（用户 2026-10-06 踩到：外置盘没挂载）。如实标出来。
+		missing := false
+		if sh.Path != "" {
+			if st, err := os.Stat(sh.Path); err != nil || !st.IsDir() {
+				missing = true
+			}
+		}
 		smbView.Shares = append(smbView.Shares, sharingShareView{
 			Kind: "smb", Name: sh.Name, RecordName: sh.RecordName, Path: sh.Path, ReadOnly: sh.ReadOnly,
-			Status: smbView.Status, URL: sharing.URL("smb", ip, sh.Name, sh.ReadOnly),
+			PathMissing: missing,
+			Status:      smbView.Status, URL: sharing.URL("smb", ip, sh.Name, sh.ReadOnly),
 		})
 	}
 	nfsView := sharingServiceView{Kind: "nfs", State: nfsState, Status: stateLabel("nfs", nfsState),
