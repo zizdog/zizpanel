@@ -115,6 +115,17 @@ cat > "$STUB/sysctl" <<'STUBEOF'
 [ "$1" = "-n" ] && [ "$2" = "hw.model" ] && { echo "Mac16,12"; exit 0; }
 /usr/sbin/sysctl "$@"
 STUBEOF
+# stat 桩件：server-mode.sh 用 `stat -f %Su /dev/console` 判"真实登录用户"。
+# 不钉住它，门禁就会随"跑测试时有没有人坐在屏幕前"变红（2026-10-06 踩到：锁屏时
+# /dev/console 归 root，脚本按设计拒绝执行，测试却报"没有发出 launchctl enable"）。
+# 这里固定成当前用户；**生产脚本的这道安全判断一个字都没动**。
+cat > "$STUB/stat" <<STUBEOF
+#!/usr/bin/env bash
+case "\$*" in
+  "-f %Su /dev/console") echo "\${SUDO_USER:-\$(/usr/bin/id -un)}"; exit 0 ;;
+esac
+/usr/bin/stat "\$@"
+STUBEOF
 cat > "$STUB/system_profiler" <<'STUBEOF'
 #!/usr/bin/env bash
 # 模拟笔记本（有电池）—— 用 STUB_DESKTOP=1 变成台式机
@@ -122,7 +133,7 @@ cat > "$STUB/system_profiler" <<'STUBEOF'
 exit 0
 STUBEOF
 chmod +x "$STUB"/*
-pass "桩件就绪（launchctl / lsof / systemsetup / pmset / defaults / mdutil）"
+pass "桩件就绪（launchctl / lsof / systemsetup / pmset / defaults / mdutil / stat）"
 
 export PATH="$STUB:/usr/bin:/bin:/usr/sbin:/sbin"
 export ZIZPANEL_SANDBOX=1
