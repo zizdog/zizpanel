@@ -12,6 +12,7 @@ package web
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,6 +164,150 @@ func TestVideoRecursiveAPIGate(t *testing.T) {
 			map[string]any{"dir": link, "preset": "480p", "recursive": true})
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("越界的目录必须 403，实际 %d：%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestVideoStalePartsGate 是「遗留未完成产物（.part.mp4）」的门禁。
+//
+// 一条覆盖整类：只有 <dir>/output/ 下的 *.part.mp4 会被列出与删除；
+// output/ 外的、非 .part.mp4 的、`../` 越界的、不存在的路径一律拒绝（负向对照逐条断言，
+// 删掉任一条判据这个门禁必须变红）。全用假 Runner 与临时目录，不跑真 ffmpeg。
+func TestVideoStalePartsGate(t *testing.T) {
+	srv, _ := newTestServer(t)
+	dir := filepath.Join(srv.Cfg.WWWRoot, "partvideos")
+	recAPIFile(t, dir, "top.mp4", 4000) // 有一个真实视频，规划才走正常路径
+
+	// 半成品：output/ 根一个 + 子目录一个（子目录的 rel_path 要能区分同名文件）。
+	older := recAPIFile(t, dir, "output/old.480p.mp4.part.mp4", 3000)
+	deep := recAPIFile(t, dir, "output/第1季/01.480p.mp4.part.mp4", 2000)
+	// 负向对照：非半成品、output/ 外的半成品，一个都不许被列出/删除。
+	done := recAPIFile(t, dir, "output/done.480p.mp4", 1500)
+	stray := recAPIFile(t, dir, "stray.part.mp4", 1200)
+
+	withFakeVideoRunner(t, &fakeVideoRunner{outBytes: 100})
+
+	planOf := func(t *testing.T) ([]videoopt.StalePart, string, bool) {
+		t.Helper()
+		rec := postVideoJSON(t, srv.handleFileVideoPlan, map[string]any{"dir": dir, "preset": "480p"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("video-plan 应 200，实际 %d：%s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Data struct {
+				OutDir     string               `json:"out_dir"`
+				StaleParts []videoopt.StalePart `json:"stale_parts"`
+				Truncated  bool                 `json:"stale_parts_truncated"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("响应不是 JSON：%v（%s）", err, string(rec.Body.Bytes()))
+		}
+		return body.Data.StaleParts, body.Data.OutDir, body.Data.Truncated
+	}
+	clean := func(t *testing.T, body map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		return postVideoJSON(t, srv.handleFileVideoCleanParts, body)
+	}
+
+	t.Run("① 只列出 output/ 下的 *.part.mp4（含体积/时间/rel_path）", func(t *testing.T) {
+		parts, outDir, truncated := planOf(t)
+		if truncated {
+			t.Error("没有超上限，不该报截断")
+		}
+		if len(parts) != 2 {
+			t.Fatalf("应恰好列出 output/ 里 2 个半成品，实际 %+v", parts)
+		}
+		byName := map[string]videoopt.StalePart{}
+		for _, p := range parts {
+			if !strings.HasSuffix(p.Name, videoopt.PartSuffix) {
+				t.Errorf("列了非半成品：%+v", p)
+			}
+			if p.SizeBytes <= 0 || p.Modified.IsZero() {
+				t.Errorf("体积/时间没读到真实值：%+v", p)
+			}
+			if !withinDir(outDir, p.Path) {
+				t.Errorf("列出了 output/ 外的：%+v", p)
+			}
+			byName[p.Name] = p
+		}
+		if byName[filepath.Base(older)].RelPath != "old.480p.mp4.part.mp4" {
+			t.Errorf("output/ 根的 rel_path 不对：%+v", byName[filepath.Base(older)])
+		}
+		if byName[filepath.Base(deep)].RelPath != "第1季/01.480p.mp4.part.mp4" {
+			t.Errorf("子目录的 rel_path 不对：%+v", byName[filepath.Base(deep)])
+		}
+	})
+
+	t.Run("② 上限写死且如实说明（超上限不静默）", func(t *testing.T) {
+		parts, truncated := videoopt.ScanStaleParts(filepath.Join(dir, "output"), 1)
+		if !truncated || len(parts) != 1 {
+			t.Fatalf("limit=1 而实际有 2 个时应截断到 1 并报 truncated，实际 %d/%v", len(parts), truncated)
+		}
+	})
+
+	t.Run("③ 越界 / 非半成品 / 不存在一律拒绝", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			path string
+			want int
+		}{
+			{"output/ 外的半成品", stray, http.StatusForbidden},
+			{"../ 越界", filepath.Join(dir, "output", "..", "stray.part.mp4"), http.StatusForbidden},
+			{"非 .part.mp4", done, http.StatusBadRequest},
+			{"不存在", filepath.Join(dir, "output", "ghost.part.mp4"), http.StatusNotFound},
+		} {
+			rec := clean(t, map[string]any{"dir": dir, "paths": []string{tc.path}})
+			if rec.Code != tc.want {
+				t.Errorf("%s 应 %d，实际 %d：%s", tc.name, tc.want, rec.Code, rec.Body.String())
+			}
+		}
+		// 负向对照：被拒的路径一个都没被删掉。
+		for _, p := range []string{stray, done} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("被拒绝的路径不该被删：%s（%v）", p, err)
+			}
+		}
+	})
+
+	t.Run("④ 指定路径：只删 output/ 下的半成品，结果与审计都如实", func(t *testing.T) {
+		rec := clean(t, map[string]any{"dir": dir, "paths": []string{older}})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("合法清理应 200，实际 %d：%s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Data struct {
+				Removed int `json:"removed"`
+				Failed  int `json:"failed"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Data.Removed != 1 || body.Data.Failed != 0 {
+			t.Fatalf("应删 1 个且 0 失败，实际 %+v", body.Data)
+		}
+		if _, err := os.Stat(older); !os.IsNotExist(err) {
+			t.Errorf("半成品没被删掉：%v", err)
+		}
+		// 写接口必须留审计（判据：审计表里确有一条成功记录）。
+		var n int
+		if err := srv.Store.DB().QueryRow(
+			`SELECT COUNT(*) FROM audit_logs WHERE action='file_video_clean_parts' AND ok=1`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Errorf("清理必须写一条成功审计，实际 %d 条", n)
+		}
+	})
+
+	t.Run("⑤ 不传 paths = 清空 output/ 下全部半成品", func(t *testing.T) {
+		rec := clean(t, map[string]any{"dir": dir})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("应 200，实际 %d：%s", rec.Code, rec.Body.String())
+		}
+		if parts, _, _ := planOf(t); len(parts) != 0 {
+			t.Fatalf("应已清空，实际还剩 %+v", parts)
 		}
 	})
 }

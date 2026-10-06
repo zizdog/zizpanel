@@ -6,9 +6,9 @@
 // 写进会话文件，下次起来能续传），等不到再强杀。
 //
 // 为什么是"面板自己的子命令"（用户 2026-09-23 点名，与 zizvideo 同一套）：
-// macOS 的 TCC 授权按 responsible process 的**代码要求**判定。这个 supervisor 与面板
-// 同一代码要求（com.zizpanel.panel，固定自签身份）⇒ 面板在安装时拿到的那次
-// 「完全磁盘访问权限」直接继承给 aria2，`dir=~/Downloads` 才写得进去。
+// 由面板二进制 fork 后 setuid 到真实用户，下载文件归属用户；与面板同一代码要求
+// （com.zizpanel.panel，固定自签身份）⇒ 用户把 dir= 指到受保护目录/外接盘时继承
+// 面板的「完全磁盘访问权限」（默认目录已移出受保护位置，见 internal/services/aria2.go）。
 //
 // 直跑 `/opt/homebrew/bin/aria2c` 不行：它是 adhoc 签名、身份里带二进制哈希
 // （aria2c-55554944…），每次 brew 升级都变，给它的授权就失效；而后台服务弹不出

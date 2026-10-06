@@ -1757,7 +1757,7 @@ func builtinCatalog() []App {
 		//   · 它本身只是个 JSON-RPC 服务（6800），界面 AriaNg 是静态页、由**面板**
 		//     托管在 /aria/（见 internal/web/aria2_web.go；UI.SelfConf=true 表示
 		//     不生成 app-proxy，面板只给「打开」入口）；
-		//   · 下载目录（用户点名 ~/Downloads）、RPC 密钥、会话续传都要真复核。
+		//   · 下载目录（默认 ~/aria/downloads）、RPC 密钥、会话续传都要真复核。
 		{
 			ID: Aria2AppID, Name: "aria2（下载器）", Icon: "⬇️",
 			UI: &AppUI{
@@ -1767,7 +1767,7 @@ func builtinCatalog() []App {
 					"那个端口没在听时退回面板内 /" + Aria2Slug + "/。RPC 在 6800（绑 0.0.0.0，靠 rpc-secret 保护），不是网页入口。",
 			},
 			Summary:     "多协议下载器（HTTP/FTP/BT/磁力）+ 网页界面，多线程、可续传",
-			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/Downloads，重启后队列还能续上。",
+			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/aria/downloads，重启后队列还能续上。",
 			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: "aria2", BrewFormula: Aria2Formula, ServiceLabel: Aria2Label,
 			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
@@ -1779,7 +1779,7 @@ func builtinCatalog() []App {
 			ConfigPath: "~/" + Aria2Slug + "/" + Aria2ConfName,
 			PostInstallHint: "1，入口：http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
 				"2，反代：要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
-				"3，下载目录默认 ~/Downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
+				"3，下载目录默认 ~/aria/downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
 			DocsURL: "https://aria2.github.io/",
 		},
 

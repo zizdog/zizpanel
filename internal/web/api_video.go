@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -162,6 +164,13 @@ type videoPlanResponse struct {
 	Recursive   bool                `json:"recursive,omitempty"`
 	ScanSkipped []videoopt.ScanSkip `json:"scan_skipped,omitempty"`
 	ScanNotes   []string            `json:"scan_notes,omitempty"`
+
+	// StaleParts 是 output/ 下遗留的未完成产物（上次转码中途面板重启留下）：
+	// 只列不删，面板据此给「清理未完成的产物」。坑 236：用户此前看不到"那次到底压完没有"。
+	StaleParts []videoopt.StalePart `json:"stale_parts,omitempty"`
+	// StalePartsTruncated 为 true 表示还有更多没列出（上限 videoopt.MaxStaleParts），
+	// 面板必须如实说明，绝不静默截断。
+	StalePartsTruncated bool `json:"stale_parts_truncated,omitempty"`
 
 	// Pipeline/PipelineReason 是"按源类型"的整体结论（面板只按字段渲染，不自己判源）：
 	// fast / software / mixed；PipelineFast/Software/Unknown 是三类各多少个文件。
@@ -398,6 +407,8 @@ func (s *Server) handleFileVideoPlan(w http.ResponseWriter, r *http.Request) {
 	resp.EstPercent, resp.EstimateUnknown = res.EstPercent, res.EstimateUnknown
 	resp.CappedSkipped, resp.PlaceCount = res.CappedSkipped, res.PlaceCount
 	resp.Recursive, resp.ScanSkipped, resp.ScanNotes = res.Recursive, res.ScanSkipped, res.ScanNotes
+	// 遗留半成品只扫 output/（不跟符号链接、不进隐藏目录）；这里只列，删要靠清理接口。
+	resp.StaleParts, resp.StalePartsTruncated = videoopt.ScanStaleParts(res.OutDir, videoopt.MaxStaleParts)
 	resp.Pipeline, resp.PipelineReason, resp.PipelineFast, resp.PipelineSoftware, resp.PipelineUnknown =
 		videoPipelineSummary(res.Rows)
 	resp.Warning = videoSkipNotice(res.CappedSkipped)
@@ -618,4 +629,119 @@ func (s *Server) runVideoCompress(ctx context.Context, dir string, opts videoopt
 		return res, rerr
 	}
 	return res, nil
+}
+
+// videoCleanPartsReq 是 POST /api/v1/files/video-clean-parts 的请求体。
+//
+// Paths 为空 = 清理这个目录 output/ 下**全部**遗留半成品；指定时逐条校验。
+type videoCleanPartsReq struct {
+	Dir   string   `json:"dir"`
+	Paths []string `json:"paths,omitempty"`
+}
+
+// withinDir 判断 p 是否在 dir 之内（纯路径判据；调用方保证两者都已解析过）。
+func withinDir(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	if err != nil || relEscapes(rel) {
+		return false
+	}
+	return true
+}
+
+// relEscapes 判断相对路径是不是"往上走"（`..` 或 `../…`）。
+func relEscapes(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// handleFileVideoCleanParts 删除 output/ 下遗留的未完成产物（*.part.mp4）。
+//
+// 只允许删**确实以 .part.mp4 结尾、且解析后仍在 <dir>/output/ 内**的条目：
+// 非半成品 400、越界 403、不存在 404；删除复用文件管理包（绝不自己 rm），审计必写。
+// 坑 236：面板重启留下的半成品只能靠这个入口清理，否则要等下次重跑。
+func (s *Server) handleFileVideoCleanParts(w http.ResponseWriter, r *http.Request) {
+	var req videoCleanPartsReq
+	if err := decode(r, &req); err != nil {
+		failFileErr(w, err)
+		return
+	}
+	dir, derr := s.fileResolveDir(req.Dir, false)
+	if derr != nil {
+		failFileErr(w, derr, req.Dir)
+		return
+	}
+	mgr := s.fileManager()
+	outDir := filepath.Join(dir, videoopt.OutputDirName)
+
+	// 目标一律用**已解析的真实路径**收集（去重），删除时再交给 files.Manager.Delete。
+	targets := []string{}
+	seen := map[string]bool{}
+	add := func(real string) {
+		if !seen[real] {
+			seen[real] = true
+			targets = append(targets, real)
+		}
+	}
+	if len(req.Paths) == 0 {
+		// 不指定 = 清理这个 output/ 下扫出来的全部半成品。
+		parts, _ := videoopt.ScanStaleParts(outDir, videoopt.MaxStaleParts)
+		for _, p := range parts {
+			add(p.Path)
+		}
+	} else {
+		for _, raw := range req.Paths {
+			// allowMissing=true：先解析出真实路径（父目录的软链接照样解析、越界 403），
+			// 存在性自己判 —— ResolveNoFollow 对不存在的路径只给 400，这里要如实回 404。
+			real, rerr := mgr.Resolve(raw, true)
+			if rerr != nil {
+				failFileErr(w, rerr, raw)
+				return
+			}
+			if !videoopt.IsStalePartName(filepath.Base(real)) {
+				fail(w, http.StatusBadRequest, "只能删除未完成的产物（*.part.mp4）："+raw)
+				return
+			}
+			if !withinDir(outDir, real) {
+				fail(w, http.StatusForbidden, "只能删除 output/ 目录内的未完成产物："+raw)
+				return
+			}
+			st, serr := os.Lstat(real)
+			if serr != nil {
+				if os.IsNotExist(serr) {
+					fail(w, http.StatusNotFound, "未完成产物不存在："+raw)
+					return
+				}
+				failFileErr(w, serr, raw)
+				return
+			}
+			if st.IsDir() {
+				fail(w, http.StatusBadRequest, "这是一个目录，不是未完成产物："+raw)
+				return
+			}
+			add(real)
+		}
+	}
+
+	var freed int64
+	removed, failed := 0, 0
+	errs := []string{}
+	for _, p := range targets {
+		if st, serr := os.Lstat(p); serr == nil && !st.IsDir() {
+			freed += st.Size()
+		}
+		if derr := mgr.Delete(p, false); derr != nil {
+			failed++
+			errs = append(errs, filepath.Base(p)+"："+derr.Error())
+			continue
+		}
+		removed++
+	}
+	detail := fmt.Sprintf("清理 %d 个未完成产物，释放 %s", removed, humanBytes(freed))
+	if failed > 0 {
+		s.audit(r, "file_video_clean_parts", dir, fmt.Sprintf("%s；失败 %d 个：%s", detail, failed, strings.Join(errs, "；")), false, "")
+	} else {
+		s.audit(r, "file_video_clean_parts", dir, detail, true, "")
+	}
+	ok(w, map[string]any{
+		"removed": removed, "failed": failed, "errors": errs, "freed_bytes": freed,
+	})
 }

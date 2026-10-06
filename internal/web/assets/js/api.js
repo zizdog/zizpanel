@@ -562,6 +562,8 @@ export const api = {
   fileVideoPlanProgress: (dir) =>
     request('GET', `${API_BASE}/files/video-plan-progress?dir=${encodeURIComponent(dir)}`),
   fileVideoCompress: (payload) => request('POST', `${API_BASE}/files/video-compress`, payload),
+  // 清理 output/ 下遗留的未完成产物（*.part.mp4，面板重启留下）；paths 可省 = 清全部。
+  fileVideoCleanParts: (payload) => request('POST', `${API_BASE}/files/video-clean-parts`, payload),
   // 去广告（无损）：plan 只读统计（扩展名口径，不跑 ffmpeg）给确认窗一个真数字；
   // clean 走任务中心（202 + task_id），成功/跳过/失败逐条在结果里。
   // keep_backup 默认 false：校验通过后直接替换原文件（用户报障 .bak 极难清理）；

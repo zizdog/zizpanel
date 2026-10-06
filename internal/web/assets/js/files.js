@@ -3147,6 +3147,47 @@ export function FilesView(content, ctx = {}) {
       return b + ' → ' + humanSize(after) + '（-' + (pct || 0) + '%）';
     }
 
+    // stalePartsTip 是计划表上方那行「遗留未完成产物」提示 + 一键清理（细节收进 title）。
+    // 列表由后端扫 output/ 给出（前端不自己扫）；清理成功后刷新计划，数字随之更新。
+    // 坑 236：面板中途重启会在 output/ 留下 *.part.mp4，用户此前看不到也清不掉。
+    function stalePartsTip() {
+      const parts = plan.stale_parts || [];
+      if (!parts.length) return null;
+      const n = parts.length;
+      const bytes = parts.reduce((s, p) => s + (p.size_bytes || 0), 0);
+      const detail = (plan.stale_parts_truncated
+        ? '还有更多（这里只列出前 ' + n + ' 个），清理后可再刷新'
+        : '共 ' + n + ' 个，占用 ' + humanSize(bytes))
+        + '；只清 output/ 下未写完的 .part.mp4，已压好的成品不动';
+      const btn = h('button.btn.btn-sm', {
+        text: '清理未完成的产物',
+        'data-testid': 'zp-video-clean-parts',
+        title: detail,
+        onclick: async () => {
+          const yes = await confirmBox(
+            '清理 ' + n + ' 个未完成的产物？\n\n' + detail,
+            { title: '清理未完成的产物', danger: true, okText: '清理' });
+          if (!yes) return;
+          try {
+            const res = await api.fileVideoCleanParts({ dir: cwd, paths: parts.map((p) => p.path) });
+            toast('已清理 ' + ((res && res.removed) || 0) + ' 个未完成产物', 'ok');
+            reload();
+          } catch (e) {
+            toast('清理失败：' + ((e && e.message) || e), 'err', 10000);
+          }
+        },
+      });
+      return h('div', {
+        style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '6px' },
+      }, [
+        h('span', {
+          style: { color: 'var(--warn)' }, title: detail,
+          text: '发现 ' + n + ' 个未完成的产物（上次中断留下），可一键清理',
+        }),
+        btn,
+      ]);
+    }
+
     function draw() {
       clear(body); clear(foot);
       renderScope();
@@ -3334,6 +3375,7 @@ export function FilesView(content, ctx = {}) {
           text: '已跳过子目录 ' + s.rel_path + '：' + s.reason,
         })),
         h('div.hint', { text: plan.note || '' }),
+        stalePartsTip(),
         h('div.zp-plan-scroll', [
           h('table.table', { style: { fontSize: '12px' } }, [
             h('thead', [h('tr', ['文件', '源格式', '原分辨率', '目标', '目标码率/质量', '体积（原→预计）', '说明']

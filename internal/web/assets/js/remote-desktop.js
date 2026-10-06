@@ -283,6 +283,19 @@ export function RemoteDesktopView(content, ctx = {}) {
         // 真机踩到（2026-10-06）：从命令行/面板开启屏幕共享时，macOS 可能还没给屏幕共享服务
         // 「屏幕录制」授权 ⇒ 认证能过、帧也在发，但整屏都是黑的。走一次系统设置里的开关就会补上。
         h('p.hint', {
+          dataset: { testid: 'zp-rd-keepalive-hint' },
+          text: '连接在后台保持：切到别的页面再回来不会断线（只有面板重启或屏幕共享重启才会断）。',
+          title: '画面区、连接与画布都是常驻的，切页只把它们移回新页面，不重连、不清屏；'
+            + '面板升级重启、或屏幕共享被关掉时会断开，点「连接」重连即可。',
+        }),
+        h('p.hint', {
+          dataset: { testid: 'zp-rd-loginwindow-hint' },
+          text: '那台 Mac 没人在屏幕上登录时，连上先看到登录窗口，登录一次即可。',
+          title: 'macOS 的屏幕共享在"控制台没有已登录用户"（没人坐在屏幕前）时显示登录窗口；'
+            + '在里面用那台 Mac 的账号密码登录一次就有完整桌面了（这是系统行为，不是面板又让你登录）。'
+            + '想彻底免这一步：让那台 Mac 保持登录状态（或在系统设置里开「自动登录」，代价是安全性下降）。',
+        }),
+        h('p.hint', {
           dataset: { testid: 'zp-rd-blackscreen-hint' },
           text: '画面全黑？到 系统设置 → 通用 → 共享，把「屏幕共享」关一次再开。',
           title: 'macOS 的屏幕共享需要「屏幕录制」授权：用系统设置里的开关过一遍就会补上；'
@@ -307,7 +320,18 @@ export function RemoteDesktopView(content, ctx = {}) {
 
   renderButtons();
   refreshStatus();
-  if (session && session.rfb) d.stage.style.display = '';
+  if (session && session.rfb) {
+    d.stage.style.display = '';
+    // 切页回来会黑屏（用户 2026-10-06 报）：DOM 被移出再挂回时，noVNC 的 ResizeObserver
+    // 不一定回调，画布停在"尺寸 0"的状态。这里强制它重算一次缩放（会从帧缓冲重绘）。
+    requestAnimationFrame(() => {
+      if (!session || !session.rfb) return;
+      try {
+        session.rfb.scaleViewport = false;
+        session.rfb.scaleViewport = true;
+      } catch { /* 连接已断，忽略 */ }
+    });
+  }
 }
 
 // resetSessionForTest 只给自动化测试用：把模块级单例清干净（不影响生产路径）。

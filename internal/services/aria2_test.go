@@ -97,20 +97,21 @@ func fakeAria2Brew(t *testing.T, installed bool) string {
 	return p
 }
 
-// TestAria2ConfMatchesUserRequirements 锁住用户点名的两条：下载目录 ~/Downloads、不弹本地网络授权。
+// TestAria2ConfMatchesUserRequirements 锁住两条：默认下载目录在应用安装根下（不占受保护的
+// ~/Downloads，2026-10-06 用户要求）、不弹本地网络授权。
 func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 	home := "/Users/someone"
 	p := Aria2Paths{Home: home, Root: filepath.Join(home, "aria"),
 		Conf:        Aria2ConfPath(home),
 		Session:     filepath.Join(home, "aria", Aria2SessionName),
-		DownloadDir: filepath.Join(home, "Downloads"),
+		DownloadDir: filepath.Join(home, "aria", "downloads"),
 		OutLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.out.log"),
 		ErrLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.err.log"),
 	}
 	conf := aria2Conf(p, "SECRET123")
 	for _, want := range []string{
-		"dir=" + filepath.Join(home, "Downloads"), // 用户要的默认下载目录
-		"rpc-listen-all=true",                     // 用户 2026-09-23：局域网直连（靠 rpc-secret 保护）
+		"dir=" + filepath.Join(home, "aria", "downloads"), // 默认目录：应用安装根下，不受隐私保护
+		"rpc-listen-all=true",                             // 用户 2026-09-23：局域网直连（靠 rpc-secret 保护）
 		fmt.Sprintf("rpc-listen-port=%d", Aria2RPCPort),
 		"rpc-secret=SECRET123",
 		"enable-rpc=true",
@@ -417,10 +418,10 @@ func TestAria2ReadyRemedyNamesMacPrivacyTrap(t *testing.T) {
 // aria2 由**面板自己的二进制**托管（`<面板> aria2-supervise …`），而不是裸跑
 // /opt/homebrew/bin/aria2c。
 //
-// 为什么必须这样（不是风格问题）：macOS 的 TCC 授权按 responsible process 的代码要求
-// 判定。supervisor 与面板同一代码要求 ⇒ 面板安装时拿到的那次「完全磁盘访问权限」
-// 继承给 aria2，`dir=~/Downloads` 才写得进去；裸跑 aria2c 的 adhoc 身份每次 brew
-// 升级都会变，给它的授权随即失效（真机表现：端口在听、界面永远"连接中…"）。
+// 为什么必须这样（不是风格问题）：panel 二进制 fork 后 setuid 到真实用户，下载文件
+// 归属用户；且与面板同一代码要求 ⇒ 用户把 dir= 指到受保护目录/外接盘时继承面板的
+// 「完全磁盘访问权限」。裸跑 aria2c 的 adhoc 身份每次 brew 升级都会变，给它的授权随即
+// 失效（真机表现：端口在听、界面永远"连接中…"）。
 func TestAria2SuperviseArgsPointAtPanelBinary(t *testing.T) {
 	home := t.TempDir()
 	// BrewBin 必须给：aria2c 的路径由它推导，拿不到就该在安装时拒绝写 plist。
@@ -461,9 +462,9 @@ func TestAria2SuperviseArgsPointAtPanelBinary(t *testing.T) {
 			t.Errorf("参数 %q 不是绝对路径（launchd 的工作目录不是用户家目录）", a)
 		}
 	}
-	// 下载目录仍是 ~/Downloads（用户 2026-09-23 明确要求）：托管只改"谁拉起它"。
-	if p.DownloadDir != filepath.Join(home, "Downloads") {
-		t.Errorf("下载目录默认值必须仍然是 ~/Downloads，实际 %q", p.DownloadDir)
+	// 默认下载目录在应用安装根下（2026-10-06 用户要求：不再用受保护的 ~/Downloads）。
+	if want := filepath.Join(home, "aria", "downloads"); p.DownloadDir != want {
+		t.Errorf("下载目录默认值应为 %s，实际 %q", want, p.DownloadDir)
 	}
 }
 

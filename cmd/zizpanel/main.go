@@ -95,8 +95,8 @@ func main() {
 	case "aria2-supervise":
 		// aria2（下载器）的常驻 supervisor：由**系统级** LaunchDaemon
 		// com.zizdog.aria2 以 root 拉起，fork 后 setuid 到真实用户运行 aria2c ——
-		// 与面板同一代码要求，所以继承面板的 TCC 授权（`dir=~/Downloads` 才写得进去，
-		// 见 cmd/zizpanel/aria2.go 与 internal/services/aria2.go 的 Aria2SuperviseArgs）。
+		// 与面板同一代码要求，用户把 dir= 指到受保护目录/外接盘时继承面板的 TCC 授权
+		// （见 cmd/zizpanel/aria2.go 与 internal/services/aria2.go 的 Aria2SuperviseArgs）。
 		err = cmdAria2Supervise(rest)
 	case "plugin":
 		// 应用插件声明（zizpanel.app/v1）的校验与干跑：`plugin validate|plan <file.json>`。

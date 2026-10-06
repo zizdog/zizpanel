@@ -41,6 +41,9 @@ PANEL_SUFFIX_INPUT="${ZIZPANEL_PANEL_SUFFIX:-${ZP_SUFFIX:-}}"
 ZIZPANEL_YES="${ZIZPANEL_YES:-${ZP_YES:-0}}"
 # ZP_SSH：1 开 / 0 关；空表示"按场景决定"（本机安装才问）
 ZIZPANEL_SSH="${ZIZPANEL_SSH:-${ZP_SSH:-}}"
+# ZP_SCREENSHARE：1 开 / 0 关；空表示"本机交互安装时问一次"（远程安装不问、只提示；
+# 装完也能在面板「远程桌面」里一键开关）。用户 2026-10-06 要求把它做到安装期。
+ZP_SCREENSHARE="${ZP_SCREENSHARE:-}"
 # ZP_LAN_PREAUTH：装完是否开启「免授权访问内网段」；空表示交互询问
 ZIZPANEL_LAN_PREAUTH="${ZIZPANEL_LAN_PREAUTH:-${ZP_LAN_PREAUTH:-}}"
 LAN_CIDR_INPUT="${ZIZPANEL_LAN_CIDR:-${ZP_LAN_CIDR:-}}"
@@ -3177,6 +3180,73 @@ EOF
   return 0
 }
 
+# ------------------------------------------- 是否开启远程桌面（屏幕共享） --
+# 用户 2026-10-06 要求：能在安装时解决的就一并解决（与既有授权逻辑一致 ——
+# 没人在屏幕前就只打印步骤、绝不打开任何界面；远程/无人值守安装不弹窗）。
+# 装完也能在面板「远程桌面」里一键开关，所以这里默认不开。
+#
+# 另一个必须交代的坑：macOS 的屏幕共享需要「屏幕录制」授权，用命令行/面板直接
+# launchctl 打开时可能还没这一步，表现是"能登录、但整屏全黑"。走一次系统设置里的
+# 「屏幕共享」开关就会补上，所以下面要提示用户（有人在屏幕前才顺手把设置面板打开）。
+setup_screenshare_choice() {
+  title "远程桌面（屏幕共享）"
+
+  local want="$ZP_SCREENSHARE"
+  if [ -z "$want" ]; then
+    if is_remote_session; then
+      info "远程安装：不询问远程桌面；装完可在面板「远程桌面」里一键开启。"
+      return 0
+    fi
+    if zp_yes "要不要现在就开启「远程桌面（屏幕共享）」？（开启后面板里可直接操作这台 Mac 的桌面，默认不开）" "n"; then
+      want=1
+    else
+      want=0
+    fi
+  fi
+
+  case "$want" in
+    1|on|yes)
+      if dry_run; then
+        info "（干跑）将开启屏幕共享，并提示「屏幕录制」授权那一步"
+        return 0
+      fi
+      launchctl enable system/com.apple.screensharing >/dev/null 2>&1 || true
+      launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist >/dev/null 2>&1 || true
+      # 回读：**以 5900 是否在听为准**（这两个命令的退出码都出现过"报成功其实没开"）
+      local i=0 listening=0
+      while [ "$i" -lt 20 ]; do
+        if lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then listening=1; break; fi
+        sleep 0.3; i=$((i + 1))
+      done
+      if [ "$listening" = "1" ]; then
+        ok "屏幕共享已开启（5900 端口在监听）—— 面板侧栏「远程桌面」→ 连接即可"
+        screenshare_screen_recording_hint
+      else
+        warn "屏幕共享没能开起来（5900 没在听）。请到 系统设置 → 通用 → 共享 手工打开「屏幕共享」"
+      fi
+      ;;
+    0|off|no) info "按你的选择不开远程桌面（之后可在面板「远程桌面」里一键开启）" ;;
+    *) warn "无法识别的 ZP_SCREENSHARE 值：${want}（按不开启处理）" ;;
+  esac
+  return 0
+}
+
+# screenshare_screen_recording_hint：说明「屏幕录制」授权这一步。
+# 有人在屏幕前才顺手打开设置面板（与"没人在场绝不触发 UI"这条既有纪律一致）。
+screenshare_screen_recording_hint() {
+  local console_user=""
+  console_user="$(console_login_user)"
+  info "提示：若远程桌面画面全黑，到 系统设置 → 通用 → 共享 把「屏幕共享」关一次再开（补「屏幕录制」授权）"
+  case "$console_user" in
+    ""|root|loginwindow) return 0 ;;
+  esac
+  if [ "$console_user" = "${REAL_USER:-}" ]; then
+    sudo -u "$console_user" open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" >/dev/null 2>&1 \
+      || warn "（没能自动打开系统设置，请手工打开：系统设置 → 通用 → 共享）"
+  fi
+  return 0
+}
+
 # ------------------------------------------------------- 是否开启 SSH --
 setup_ssh_choice() {
   title "远程访问（SSH）"
@@ -3734,6 +3804,8 @@ main() {
   setup_server_mode
   # 本机直接安装才问 SSH（远程 SSH 连过来时问它是多余的，见 is_remote_session）
   setup_ssh_choice
+  # 远程桌面：本机交互安装才问（远程安装只提示面板里有一键开关）
+  setup_screenshare_choice
   write_uninstaller
 
   verify_running

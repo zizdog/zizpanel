@@ -72,11 +72,13 @@ func (m *Manager) aria2Paths() Aria2Paths {
 	}
 	root := filepath.Join(home, "aria")
 	return Aria2Paths{
-		Home:        home,
-		Root:        root,
-		Conf:        filepath.Join(root, Aria2ConfName),
-		Session:     filepath.Join(root, Aria2SessionName),
-		DownloadDir: filepath.Join(home, "Downloads"),
+		Home:    home,
+		Root:    root,
+		Conf:    filepath.Join(root, Aria2ConfName),
+		Session: filepath.Join(root, Aria2SessionName),
+		// 默认下载目录放应用自己的安装根下（2026-10-06 用户要求）：不占 macOS 受保护的
+		// ~/Downloads —— 后台守护进程访问受保护目录会挂在 open() 上，界面永远"连接中…"。
+		DownloadDir: filepath.Join(root, "downloads"),
 		Bin:         m.aria2cBin(),
 		Plist:       aria2PlistPath(),
 		OutLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.out.log"),
@@ -203,7 +205,7 @@ func aria2SecretFromConf(confPath string) string {
 //   - rpc-listen-all=true：用户 2026-09-23 要求局域网直连；rpc-secret 是唯一防线
 //     （面板仍提供 /aria/jsonrpc 同源代理，见 aria2_web.go）；
 //   - rpc-secret：面板随机生成，用户不必也不该手工设；
-//   - dir：用户要求的默认下载目录（~/Downloads，Finder 里显示为「下载」）；
+//   - dir：默认落在应用安装根下（~/aria/downloads），不占受保护的 ~/Downloads；
 //   - bt-enable-lpd=false：lpd 走局域网组播，会触发 macOS 的"查找本地网络设备"
 //     授权弹窗（transmission 那次就是这么被烦到的，见坑 229）；
 //     DHT 是公网单播，不触发弹窗，保持开启（否则磁力链只能靠 tracker）；
@@ -241,9 +243,9 @@ func aria2Conf(p Aria2Paths, secret string) string {
 // aria2-supervise + 真实用户与 aria2 的全部路径（冻结契约，改它等于改兼容）。
 //
 // 为什么让面板托管 aria2（与 zizvideo 同一套，2026-09-23 用户点名）：
-// macOS 的 TCC 授权按 responsible process 的**代码要求**判定。supervisor 与面板同一
-// 代码要求（/opt/zizpanel/bin/zizpanel，固定自签身份 com.zizpanel.panel）⇒ 面板在安装时
-// 拿到的那次「完全磁盘访问权限」直接继承给 aria2，`dir=~/Downloads` 才写得进去。
+// 由面板二进制 fork 后 setuid 到真实用户（下载文件归属用户），系统级 LaunchDaemon
+// 保证无头开机就在。与面板同一代码要求 ⇒ 用户把 dir= 指到受保护目录/外接盘时仍继承
+// 面板的「完全磁盘访问权限」（默认目录已移出受保护位置，见 aria2Paths）。
 //
 // 直跑 `/opt/homebrew/bin/aria2c` 不行：它是 adhoc 签名、身份里带二进制哈希
 // （aria2c-55554944…），每次 brew 升级都变，给它的授权会失效；而后台服务弹不出
@@ -479,8 +481,8 @@ func (m *Manager) waitAria2Ready(ctx context.Context, p Aria2Paths, secret strin
 // **挂在 open() 上**（不是拒绝、也不报错：连不需要凭据的 GET / 都不回），界面表现就是
 // 一直"连接中…"。查这个坑花了很久，因为旧文案只说"6800 被占用 / 配置被改坏"。
 //
-// 用户 2026-09-23 明确"下载路径就是 ~/Downloads"，所以这里**不改默认值**，
-// 只把"要么授权、要么换目录"两条路写清楚。
+// 默认目录已在应用安装根下（2026-10-06），这条出路只在用户自己把 dir= 指到
+// 受保护位置时才会出现：要么授权、要么换目录。
 func aria2ReadyRemedy(downloadDir, home string) string {
 	const base = "在「服务管理 → aria2」里点「重启服务」再试"
 	if name := tccProtectedFolderName(downloadDir, home); name != "" {

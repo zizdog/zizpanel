@@ -949,7 +949,7 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 		if st, err := os.Stat(row.Path); err == nil {
 			srcBytes = st.Size()
 		}
-		part := row.OutPath + ".part.mp4"
+		part := row.OutPath + PartSuffix
 		_ = os.Remove(part)
 
 		passLog := ""
