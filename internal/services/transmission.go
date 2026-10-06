@@ -829,6 +829,17 @@ func (m *Manager) InstallTransmission(ctx context.Context, res *InstallResult) e
 		res.step(ctx, "（自动登记到面板失败："+err.Error()+"，可在「应用 → 已安装」里点「+ 注册服务」手动加入）")
 	}
 
+	// ---- 10.5 清掉 brew 时代的旧记录（坑 228） ----
+	//
+	// 只摘 brew 作业不够：面板里那条 homebrew.mxcl.* 的**记录**还在，于是「服务管理」
+	// 出现两张 Transmission 卡片；而旧卡片的健康列打的是同一个 9091（新实例在听）⇒
+	// 显示"运行中"（谎报）。放在登记之后清：安装失败时不会只剩"没有卡片"的半状态。
+	if n, ferr := m.ForgetByLabels(ctx, transmissionBrewLabels()...); ferr != nil {
+		res.step(ctx, "（清理 brew 时代的旧服务记录失败："+ferr.Error()+"）")
+	} else if n > 0 {
+		res.step(ctx, "已清掉 "+strconv.Itoa(n)+" 条 brew 时代的旧服务记录（服务管理里只留一份）")
+	}
+
 	// 绑 0.0.0.0（2026-09-23 局域网直连）⇒ 广告面板探测到的主机地址。
 	res.Address = "http://" + m.primaryIP() + ":" + strconv.Itoa(transmissionPort) + "/transmission/web/"
 	res.Message = "「Transmission（下载）」已安装并纳入管理"

@@ -552,6 +552,16 @@ func TestInstallTransmissionHashesPasswordAndVerifies(t *testing.T) {
 	cfgPath := m.transmissionSettingsPath()
 	plain := ""
 	stopped := false
+	// 造出 brew 时代的旧**服务记录**：迁移前用户在「服务管理」里看到的就是它。
+	// 安装后必须只剩面板自己那条（同一个 9091 上两张卡片 = 一张在谎报运行中）。
+	for _, label := range transmissionBrewLabels() {
+		if err := m.repo.Create(t.Context(), &Service{
+			Name: strings.ReplaceAll(label, ".", "-"), DisplayName: "Transmission",
+			Kind: "native", Category: "tool", LaunchLabel: label, Port: transmissionPort,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// 造出 brew 的旧作业（两套前缀 × 用户级/系统级两处），安装必须把它们摘干净：
 	// 留着任何一份，重启后都会和面板托管的实例抢 9091。
 	for _, label := range transmissionBrewLabels() {
@@ -679,6 +689,24 @@ func TestInstallTransmissionHashesPasswordAndVerifies(t *testing.T) {
 		t.Errorf("安装后必须有服务记录（label=%s）", transmissionLabel)
 	} else if rec.LaunchLabel != transmissionLabel {
 		t.Errorf("服务记录的 label 应是 %s，实际 %s", transmissionLabel, rec.LaunchLabel)
+	}
+	// ---- 2026-10-06 迁移门禁：brew 时代的旧**记录**也必须消失（坑 228） ----
+	//
+	// 只摘 plist 不够：面板里那条 homebrew.mxcl.* 记录还在，就会在「服务管理」里留一张
+	// Transmission 卡片 —— 而它的健康列打的是同一个 9091（新实例在听），于是显示"运行中"，
+	// 属于谎报（真机 2026-10-06 实测到的残留）。负向对照：去掉 InstallTransmission 里
+	// ForgetByLabels 那一步，本断言必红。
+	records, rerr := m.repo.List(t.Context())
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	for _, s := range records {
+		for _, label := range transmissionBrewLabels() {
+			if s.LaunchLabel == label {
+				t.Errorf("brew 时代的旧服务记录还在（label=%s name=%s）：服务管理里会留一张谎报「运行中」的卡片",
+					label, s.Name)
+			}
+		}
 	}
 	if again, err := os.ReadFile(transmissionPlistPath()); err != nil {
 		t.Fatalf("重复安装后读不到 plist：%v", err)
