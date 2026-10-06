@@ -108,6 +108,9 @@ function openCreds(reconnect) {
 function connect(username, password) {
   const d = ensureDom();
   teardown(false);
+  // 先把画面区显示出来再创建 RFB：noVNC 连接时就会量容器尺寸，
+  // 容器还在 display:none（0×0）时它算出的缩放是坏的（2026-10-06 实测：canvas 停在 300×150 不渲染）。
+  d.stage.style.display = '';
   const wsURL = new URL(apiURL('system/remote-desktop/ws'), document.baseURI);
   wsURL.protocol = wsURL.protocol === 'https:' ? 'wss:' : 'ws:';
   let rfb;
@@ -124,7 +127,6 @@ function connect(username, password) {
   rfb.resizeSession = false;
   rfb.viewOnly = false;
   session = { rfb, canvas: d.canvas, host: '' };
-  d.stage.style.display = '';
   d.state.textContent = '正在连接…';
 
   rfb.addEventListener('connect', () => {

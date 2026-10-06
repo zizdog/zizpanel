@@ -137,11 +137,13 @@ func remoteDesktopJobEnabled(ctx context.Context) (bool, bool) {
 			return false, true
 		}
 	}
-	// 没出现在 print-disabled 里 = 没有被显式禁用（macOS 的默认态）；再用端口判一次。
+	// 没出现在 print-disabled 里：再用 `launchctl print` 探一次作业在不在。
 	if _, err := remoteDesktopLaunchctl(ctx, "print", "system/"+screensharingLabel); err == nil {
 		return true, true
 	}
-	return portListening(ctx, remoteDesktopPort()), true
+	// 两个都读不到就**如实说"未复核"**：绝不能拿"5900 有人在听"当"开机自启已开"
+	//（2026-10-06 踩到：调试实例上被别人（假 VNC）占了 5900，界面就显示了"开机自启已开"）。
+	return false, false
 }
 
 // handleRemoteDesktopAction POST /api/v1/system/remote-desktop/{enable|disable}
