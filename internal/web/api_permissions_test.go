@@ -63,6 +63,7 @@ type permEnvOpts struct {
 	registry    []permissions.ExternalApp
 	detect      func(spec permissions.ExternalApp) permissions.DetectedApp
 	probe       func() []permissions.PathResult
+	fda         *permissions.FullDiskProbe
 	check       func(d permissions.DetectedApp, path string) (permissions.CheckResult, error)
 }
 
@@ -72,6 +73,7 @@ func stubPermissionsEnv(t *testing.T, o permEnvOpts) *permCounters {
 	prevConsole, prevMounts, prevProbe := permConsoleUserFn, permVolumeMountsFn, permProbeFn
 	prevDetect, prevCheck, prevHome := permExternalDetectFn, permExternalCheckFn, permUserHomeFn
 	prevRegistry, prevLookup := permRegistryFn, permLookupAppFn
+	prevFDA := permFDAProbeFn
 	c := &permCounters{}
 	if o.detect == nil {
 		o.detect = func(permissions.ExternalApp) permissions.DetectedApp { return permissions.DetectedApp{} }
@@ -82,6 +84,12 @@ func stubPermissionsEnv(t *testing.T, o permEnvOpts) *permCounters {
 		}
 	}
 	permConsoleUserFn = func() string { return o.consoleUser }
+	// 完全磁盘访问权限的**实测**探针：默认不下结论（绝不真去读系统 TCC 库）。
+	fda := permissions.FullDiskProbe{}
+	if o.fda != nil {
+		fda = *o.fda
+	}
+	permFDAProbeFn = func(string) permissions.FullDiskProbe { return fda }
 	permVolumeMountsFn = func() []string { return o.mounts }
 	// 「本地网络」那一项会用局域网预授权探针：门禁里换成假的，绝不真的读偏好域。
 	prevLAN := lanPreauthProbeFn
@@ -126,6 +134,7 @@ func stubPermissionsEnv(t *testing.T, o permEnvOpts) *permCounters {
 		permConsoleUserFn, permVolumeMountsFn, permProbeFn = prevConsole, prevMounts, prevProbe
 		permExternalDetectFn, permExternalCheckFn, permUserHomeFn = prevDetect, prevCheck, prevHome
 		permRegistryFn, permLookupAppFn = prevRegistry, prevLookup
+		permFDAProbeFn = prevFDA
 	})
 	return c
 }
@@ -659,4 +668,57 @@ func TestPermissionApplyUnknownItem(t *testing.T) {
 		t.Errorf("未知项不许读任何路径，实际 %d", c.probe)
 	}
 	permNoTask(t, srv, "未知项")
+}
+
+// TestPermissionStatusUsesRealProbeNotHistory 是 2026-10-06 用户报障的门禁：
+// 面板重装后历史是空的，面板却一直喊「缺可移除宗卷授权」—— 而用户其实早就把面板加进了
+// 完全磁盘访问权限。**实测优先于记录**：
+//
+//	· 实测读得到受系统保护的文件 ⇒ 「完全磁盘访问权限」= 已授权（不看记录、不需要有人在机器前）；
+//	· FDA 涵盖外接盘 ⇒ 「可移除宗卷」也算已授权（否则天天误报）；
+//	· 实测不下结论时才退回"没有人在机器前 / 申请记录 / 未知"。
+//
+// 负向对照：把 permItemStatus 里的实测分支去掉，第一条断言立刻红。
+func TestPermissionStatusUsesRealProbeNotHistory(t *testing.T) {
+	granted := &permissions.FullDiskProbe{Granted: true, Known: true, Detail: "实测可读"}
+
+	// 实测已授权 + 没人在机器前 + 零历史（重装后的真实形态）
+	srv, ts, cookies := newPermissionsServer(t)
+	stubPermissionsEnv(t, permEnvOpts{
+		consoleUser: "", mounts: []string{"/Volumes/DiskA"}, fda: granted,
+	})
+	res, out, _ := doJSON(t, ts, "GET", "/api/v1/permissions", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("权限页失败 %d: %v", res.StatusCode, out)
+	}
+	fd := permFindItem(t, out, permissions.ItemFullDisk)
+	if fd == nil || fd["status"] != permissions.StatusGranted {
+		t.Errorf("实测已授权时「完全磁盘访问权限」应是 granted（不看记录），实际 %v", fd)
+	}
+	rm := permFindItem(t, out, permissions.ItemRemovable)
+	if rm == nil || rm["status"] != permissions.StatusGranted {
+		t.Errorf("FDA 涵盖外接盘：实测已授权时「可移除宗卷」也该是 granted，实际 %v", rm)
+	}
+
+	// 同一台机器上的仪表盘横幅：实测已授权 ⇒ 不该再喊缺授权。
+	res, out, _ = doJSON(t, ts, "GET", "/api/v1/permissions/notice", nil, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("横幅接口失败 %d: %v", res.StatusCode, out)
+	}
+	if needed, _ := out["needed"].(bool); needed {
+		t.Errorf("实测已授权时横幅仍要求授权：%v（用户报障的原形）", out["message"])
+	}
+	_ = srv
+
+	// 对照：实测不下结论 + 没人在机器前 ⇒ 退回"需要你在机器前"（老行为，不能丢）
+	srv2, ts2, cookies2 := newPermissionsServer(t)
+	stubPermissionsEnv(t, permEnvOpts{consoleUser: "", mounts: []string{"/Volumes/DiskA"}})
+	res2, out2, _ := doJSON(t, ts2, "GET", "/api/v1/permissions", nil, cookies2)
+	if res2.StatusCode != 200 {
+		t.Fatalf("权限页失败 %d: %v", res2.StatusCode, out2)
+	}
+	if fd2 := permFindItem(t, out2, permissions.ItemFullDisk); fd2 == nil || fd2["status"] != permissions.StatusNeedsConsole {
+		t.Errorf("探测无结论且没人在机器前时应是 needs_console，实际 %v", fd2)
+	}
+	_ = srv2
 }

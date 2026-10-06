@@ -23,6 +23,10 @@ import (
 // 就能在不插真盘的前提下验证"软链接被排除 / 真实目录被收录"。
 var volumesDir = "/Volumes"
 
+// fsTypeOfMountFn 查一个挂载点的文件系统类型（注入点：单测要能造出"这个 /Volumes
+// 子目录其实是 SMB 网络盘"，而不依赖测试机真的挂着一块网络盘）。
+var fsTypeOfMountFn = fsTypeOfMount
+
 // extraMountsFn 是"非 /Volumes 位置挂载的卷"的探测入口。
 //
 // 变量而不是直接调 extraVolumeMounts：单测必须能把它关掉，否则测试机的真实
@@ -85,6 +89,11 @@ func scanVolumesDir(dir string) []string {
 //  1. /Volumes 下的真实子目录（外接盘、网络卷最标准的挂载位置）；
 //  2. darwin 上由 getfsstat 拿到的、挂在别处（如 /opt/xxx、/mnt/xxx）的非系统卷。
 //
+// **网络卷不算**（2026-10-06 修）：来源 2 本来就把 smbfs/nfs/afpfs/webdav 排除了，
+// 但来源 1 是"readdir 什么都收"，一合并网络盘又从 /Volumes 冒回来 —— 用户看到的
+// 「可移除宗卷」目标列表里混着 SMB 盘就是这么来的（网络盘永远不需要这个 TCC 授权）。
+// 所以统一在这一层按**文件系统类型**过滤一次，两条来源一视同仁。
+//
 // 任何一步失败都只是"少一个候选根"，绝不报错、绝不阻塞文件管理器构造。
 func NonSystemVolumeMounts() []string {
 	cands := scanVolumesDir(volumesDir)
@@ -107,6 +116,11 @@ func NonSystemVolumeMounts() []string {
 		}
 		real := resolveExisting(p)
 		if seen[real] {
+			continue
+		}
+		// 网络卷不是"可移除宗卷"：读它走的是网络协议，不需要（也不会因此获得）
+		// 任何 TCC 授权。读不到挂载类型时**放行**（宁可多列一个，也别把真外接盘挡掉）。
+		if isNetworkFilesystem(fsTypeOfMountFn(real)) {
 			continue
 		}
 		seen[real] = true

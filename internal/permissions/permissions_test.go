@@ -3,6 +3,7 @@ package permissions
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,5 +301,38 @@ func TestCheckAppAccessSudoFailureIsNotUnsupported(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "zizdog") {
 		t.Errorf("报错要点名以谁的身份失败，实际：%v", err)
+	}
+}
+
+// TestProbeFullDiskAccessClassifiesHonestly：实测"到底有没有完全磁盘访问权限"的三种世界。
+//
+// 判据是**真的去读**只有 FDA 读得到的文件（系统 TCC 库）：读得到 = 有；EPERM = 没有；
+// 目标都不存在/错误认不出 = **不下结论**（绝不把"探测不了"说成"没有"，也绝不反过来说成"有"）。
+func TestProbeFullDiskAccessClassifiesHonestly(t *testing.T) {
+	prev := fullDiskReadFn
+	t.Cleanup(func() { fullDiskReadFn = prev })
+
+	cases := []struct {
+		name        string
+		err         error
+		wantGranted bool
+		wantKnown   bool
+	}{
+		{"读得到 ⇒ 真的有权限", nil, true, true},
+		{"被系统拒绝 ⇒ 明确没有", fs.ErrPermission, false, true},
+		{"文件不存在 ⇒ 不下结论", fs.ErrNotExist, false, false},
+		{"认不出的错误 ⇒ 不下结论", errors.New("input/output error"), false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fullDiskReadFn = func(string) error { return c.err }
+			got := ProbeFullDiskAccess("/Users/zizdog")
+			if got.Granted != c.wantGranted || got.Known != c.wantKnown {
+				t.Fatalf("ProbeFullDiskAccess=%+v，期望 granted=%v known=%v", got, c.wantGranted, c.wantKnown)
+			}
+			if strings.TrimSpace(got.Detail) == "" {
+				t.Error("结论必须带一句给人看的说明")
+			}
+		})
 	}
 }

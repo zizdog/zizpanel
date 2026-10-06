@@ -105,8 +105,30 @@ func permItemTitle(id string) string {
 	return id
 }
 
-// permItemStatus 只按控制台会话 + 上次申请的真实结果给状态；读不到就 unknown。
-func permItemStatus(h *permissions.History, id, consoleUser string) (status, hint, at, result string) {
+// permFDAProbeFn 是"实测完全磁盘访问权限"的注入点（单测绝不许真读系统 TCC 库）。
+var permFDAProbeFn = func(home string) permissions.FullDiskProbe {
+	return permissions.ProbeFullDiskAccess(home)
+}
+
+// permItemStatus 判定一项权限的真实状态。
+//
+// 顺序（2026-10-06 改，用户报障"明明授权了却天天喊缺"）：
+//
+//	① **实测**：读得到受系统保护的文件 ⇒ 已授权 —— 不看记录、不看有没有人在机器前；
+//	   FDA 涵盖外接盘，所以实测通过时「可移除宗卷」也算已授权（否则会一直误报）；
+//	② 没人在机器前 ⇒ 需要控制台确认（这一条挡的是"弹窗没人点"）；
+//	③ 有申请记录 ⇒ 用记录里的结论；
+//	④ 都没有 ⇒ unknown（全新安装、还没授过，如实说"需要你在机器前点一次"）。
+func permItemStatus(h *permissions.History, id, consoleUser string, fda permissions.FullDiskProbe) (status, hint, at, result string) {
+	if fda.Granted {
+		if id == permissions.ItemFullDisk {
+			return permissions.StatusGranted, "", "", fda.Detail
+		}
+		if id == permissions.ItemRemovable {
+			// 完全磁盘访问权限包含可移除宗卷：有它就不需要再单独申请这一项。
+			return permissions.StatusGranted, "完全磁盘访问权限已涵盖外接盘", "", ""
+		}
+	}
 	if !permissions.ConsoleOK(consoleUser) {
 		return permissions.StatusNeedsConsole, "需要你在机器前点一次才能确认", "", ""
 	}
@@ -132,9 +154,13 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 		}
 	}
 
+	// 实测一次（一次 open 系统 TCC 库，不弹窗、不读受保护的用户目录）：
+	// 结果对"完全磁盘访问权限"与"可移除宗卷"两项都有效 —— FDA 涵盖外接盘。
+	fda := permFDAProbeFn(home)
+
 	items := make([]permissions.Item, 0, 3)
 
-	st, hint, at, res := permItemStatus(h, permissions.ItemFullDisk, consoleUser)
+	st, hint, at, res := permItemStatus(h, permissions.ItemFullDisk, consoleUser, fda)
 	items = append(items, permissions.Item{
 		ID: permissions.ItemFullDisk, Title: "完全磁盘访问权限",
 		Why:    "让面板能读桌面、文稿、下载等受保护目录",
@@ -144,7 +170,7 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 		ManualPath: diskVolumeAuthManualPath(),
 	})
 
-	st, hint, at, res = permItemStatus(h, permissions.ItemRemovable, consoleUser)
+	st, hint, at, res = permItemStatus(h, permissions.ItemRemovable, consoleUser, fda)
 	mounts := permVolumeMountsFn()
 	if len(mounts) == 0 {
 		// 没插外接盘时如实说清"现在没什么可授权的"（网络盘不算，见 files.extraVolumeMounts）。
@@ -184,7 +210,7 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 		if !d.Installed {
 			continue
 		}
-		st, hint, at, res = permItemStatus(h, spec.ID, consoleUser)
+		st, hint, at, res = permItemStatus(h, spec.ID, consoleUser, fda)
 		items = append(items, permissions.Item{
 			ID: spec.ID, Title: spec.Title, Why: spec.Why,
 			Status: st, StatusHint: hint, ConsoleUser: consoleUser, IsRemote: remote,
@@ -256,6 +282,14 @@ func permNoticeDetail() string {
 func (s *Server) handlePermissionsNotice(w http.ResponseWriter, r *http.Request) {
 	consoleUser := strings.TrimSpace(permConsoleUserFn())
 	h := permissions.HistoryFor(permHistoryPath(s.Cfg.DataDir))
+	// 实测优先（与权限页同一判据）：授权过就不该再天天喊"缺授权"。
+	noticeHome := ""
+	if permissions.ConsoleOK(consoleUser) {
+		if hm, err := permUserHomeFn(consoleUser); err == nil {
+			noticeHome = hm
+		}
+	}
+	fda := permFDAProbeFn(noticeHome)
 
 	missing := make([]string, 0, len(permKeyItemIDs))
 	// 没有外接卷就别提「可移除宗卷」（用户 2026-09-29 报障：本机没插任何外接盘，横幅天天喊它）——
@@ -265,7 +299,7 @@ func (s *Server) handlePermissionsNotice(w http.ResponseWriter, r *http.Request)
 		if id == permissions.ItemRemovable && !hasVolumes {
 			continue
 		}
-		if st, _, _, _ := permItemStatus(h, id, consoleUser); st != permissions.StatusGranted {
+		if st, _, _, _ := permItemStatus(h, id, consoleUser, fda); st != permissions.StatusGranted {
 			missing = append(missing, id)
 		}
 	}

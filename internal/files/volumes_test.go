@@ -80,3 +80,46 @@ func TestNonSystemVolumeMountsFiltersExtra(t *testing.T) {
 		t.Fatalf("只应保留真实存在的非系统卷 %s，实际 %v", real, got)
 	}
 }
+
+// TestNonSystemVolumeMountsDropsNetworkVolumes 是 2026-10-06 用户报障的门禁：
+// 「可移除宗卷」目标列表里混进了网络盘（/Volumes 下挂着的 SMB 共享）。
+//
+// 网络盘永远不需要这个 TCC 授权，判据必须是**文件系统类型**而不是路径名；
+// 负向对照：把 isNetworkFilesystem 那一步去掉，SMB 那个卷立刻会出现在结果里。
+func TestNonSystemVolumeMountsDropsNetworkVolumes(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "ZPMirror") // 真外接盘（随便什么名字都要留）
+	smb := filepath.Join(dir, "zizdog")     // SMB 共享挂在 /Volumes 下的样子
+	for _, d := range []string{local, smb} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prevDir, prevExtra, prevFs := volumesDir, extraMountsFn, fsTypeOfMountFn
+	volumesDir = dir
+	extraMountsFn = func() []string { return nil }
+	fsTypeOfMountFn = func(mp string) string {
+		if mp == resolveExisting(smb) {
+			return "smbfs"
+		}
+		return "apfs"
+	}
+	t.Cleanup(func() { volumesDir, extraMountsFn, fsTypeOfMountFn = prevDir, prevExtra, prevFs })
+
+	got := NonSystemVolumeMounts()
+	for _, g := range got {
+		if g == resolveExisting(smb) {
+			t.Fatalf("SMB 网络盘不该出现在「可移除宗卷」目标里：%v", got)
+		}
+	}
+	found := false
+	for _, g := range got {
+		if g == resolveExisting(local) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("本地外接盘被误删了（过滤只能挡网络盘）：%v", got)
+	}
+}
