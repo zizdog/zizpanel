@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
+
+	"github.com/zizdog/zizpanel/internal/sysinfo"
 )
 
 // ============================================================================
@@ -56,6 +59,10 @@ type OpProgress struct {
 	TotalBytes int64
 	// Current 是当前正在处理的条目名（基名）。
 	Current string
+	// Retries/Note：网络盘读超时触发的**续传**次数与说明（0/空 = 没发生）。
+	// 消费方（任务日志）据此提示用户"续传过"，不许静默。
+	Retries int    `json:"retries,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 // OpProgressFunc 是进度回调。它可能被**高频**调用（按块复制），
@@ -148,6 +155,10 @@ type batchProgress struct {
 	totalBytes int64
 	current    string
 	fn         OpProgressFunc
+	// retries 是"这一轮里发生过多少次网络盘读超时续传"，note 是给人看的一句说明
+	// （0 = 没发生过，前端/任务日志据此提示"续传过"，绝不静默）。
+	retries int
+	note    string
 }
 
 func (b *batchProgress) report() {
@@ -157,6 +168,7 @@ func (b *batchProgress) report() {
 	b.fn(OpProgress{
 		Phase: b.phase, Scanned: b.scanned, FilesDone: b.filesDone, FilesTotal: b.filesTotal,
 		DoneBytes: b.doneBytes, TotalBytes: b.totalBytes, Current: b.current,
+		Retries: b.retries, Note: b.note,
 	})
 }
 
@@ -231,17 +243,106 @@ func scanTotals(ctx context.Context, items []workItem, b *batchProgress) error {
 }
 
 // copyFileProgress 复制单个文件：按 1MB 块累计字节并检查取消。
+// copyFileProgress 复制一个文件，带"网络盘读超时自动续传"。
+//
+// 为什么需要（用户 2026-10-06 报障）：面板把 NFS 挂成 `soft,timeo=10(1s),retrans=2`
+// —— 这是刻意的（NAS 关机时不能让 I/O 永久挂起），代价是**一次读请求卡超 2 秒就返回
+// ETIMEDOUT**。大文件顺序读的请求数以万计，只要踩中一次，原来那种"一次读失败就整份放弃"
+// 的实现就整份失败（10GB 的片子读了几分钟然后报 `read …: operation timed out`）。
+// 现在：读出错且是**可恢复的网络类错误**时，重新打开源、从**已成功落盘的偏移**接着传，
+// 退避重试有上限（每次尝试仍然有界，不会永久挂起）。
 func copyFileProgress(ctx context.Context, src, dst string, perm os.FileMode, b *batchProgress) error {
-	in, err := os.Open(src)
+	var copied int64
+	for attempt := 0; ; attempt++ {
+		err := copyFileFrom(ctx, src, dst, perm, b, &copied)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		if !isResumableReadErr(err) || attempt >= copyReadMaxRetries {
+			if attempt > 0 {
+				return fmt.Errorf("%w（网络盘读超时，已从断点续传重试 %d 次仍失败：已传 %s）",
+					err, attempt, sysinfo.HumanBytes(uint64(copied)))
+			}
+			return err
+		}
+		if b != nil {
+			b.retries++
+			b.note = fmt.Sprintf("网络盘读超时，从 %s 处续传（第 %d/%d 次重试）",
+				sysinfo.HumanBytes(uint64(copied)), attempt+1, copyReadMaxRetries)
+			b.report()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(copyRetryBackoff(attempt)):
+		}
+	}
+}
+
+// copyReadMaxRetries 是单文件的重试上限；copyRetryBackoff 是第 n 次重试前等多久。
+// 退避是有意的：NAS 磁盘唤醒/链路抖动通常在几秒内恢复，立刻重试会继续撞同一个坑。
+const copyReadMaxRetries = 5
+
+func copyRetryBackoff(attempt int) time.Duration {
+	d := time.Duration(1<<uint(attempt)) * time.Second
+	if d > 15*time.Second {
+		d = 15 * time.Second
+	}
+	return d
+}
+
+// copyOpenSrcFn 是"打开复制源"的注入点：门禁要能造出"读到一半超时、重开后能续上"的网络盘，
+// 而不依赖真机挂一块会超时的盘。
+var copyOpenSrcFn = func(path string) (io.ReadSeekCloser, error) { return os.Open(path) }
+
+// isResumableReadErr 判断读错误是不是"网络/传输类、重开通常就好"的那种。
+//
+// 只挑这一类：NFS/SMB 在 soft 挂载下的 ETIMEDOUT、链路抖动（ECONNRESET/ENETDOWN…）、
+// 设备/传输层 EIO，以及挂载被重挂后的 ESTALE（重开会拿到新句柄）。
+// 其它错误（权限、磁盘满、文件不存在）重试没有意义，直接如实失败。
+func isResumableReadErr(err error) bool {
+	for _, e := range []error{
+		syscall.ETIMEDOUT, syscall.EIO, syscall.ECONNRESET, syscall.ECONNABORTED,
+		syscall.ENETDOWN, syscall.ENETUNREACH, syscall.EHOSTDOWN, syscall.EHOSTUNREACH,
+		syscall.ESTALE,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// copyFileFrom 从 *copied 处续传到目标（打开源 → Seek → 打开目标 → Seek → 逐块拷贝），
+// 并把最新已落盘字节数写回 *copied（重试时从这里继续）。
+func copyFileFrom(ctx context.Context, src, dst string, perm os.FileMode, b *batchProgress, copied *int64) error {
+	in, err := copyOpenSrcFn(src)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if *copied > 0 {
+		if _, err := in.Seek(*copied, io.SeekStart); err != nil {
+			return err
+		}
+	}
+	flags := os.O_CREATE | os.O_WRONLY
+	if *copied == 0 {
+		flags |= os.O_TRUNC // 首轮清空；续传轮绝不能截断已经传好的部分
+	}
+	out, err := os.OpenFile(dst, flags, perm)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = out.Close() }()
+	if *copied > 0 {
+		if _, err := out.Seek(*copied, io.SeekStart); err != nil {
+			return err
+		}
+	}
 
 	buf := make([]byte, 1<<20)
 	for {
@@ -253,6 +354,7 @@ func copyFileProgress(ctx context.Context, src, dst string, perm os.FileMode, b 
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
+			*copied += int64(n)
 			if b != nil {
 				b.doneBytes += int64(n)
 				b.report()
@@ -269,6 +371,7 @@ func copyFileProgress(ctx context.Context, src, dst string, perm os.FileMode, b 
 			return nil
 		}
 		if rerr != nil {
+			// 让调用方知道"已经写到哪儿了"，它据此决定续传还是放弃。
 			return rerr
 		}
 	}

@@ -290,25 +290,35 @@ func TestConsoleUserJudgeHandlesRootOwnedDevConsole(t *testing.T) {
 		scutilOut  string
 		scutilErr  error
 		ioregOut   string
+		devConsole string
 		wantUser   string
 		wantReason string
 	}{
 		{"scutil 报 zizdog、屏幕没锁 → 有人在（/dev/console 是 root 也不许挡住用户）",
-			scutilOut, nil, `"IOConsoleLocked" = No`, "zizdog", ""},
+			scutilOut, nil, `"IOConsoleLocked" = No`, "root", "zizdog", ""},
 		{"锁屏 → 当没人在（弹窗没人点，TCC 会记成 denial）",
-			scutilOut, nil, `      "IOConsoleLocked" = Yes`, "", ""},
+			scutilOut, nil, `      "IOConsoleLocked" = Yes`, "", "", ""},
 		{"登录窗口界面 → 没人在",
-			"<dictionary> {\n  Name : loginwindow\n}\n", nil, `"IOConsoleLocked" = No`, "", ""},
+			"<dictionary> {\n  Name : loginwindow\n}\n", nil, `"IOConsoleLocked" = No`, "root", "", ""},
 		{"只有 SessionInfo 的键（不许误取）→ 没人在",
 			"<dictionary> {\n  SessionInfo : <array> {\n    0 : <dictionary> {\n      kCGSSessionUserNameKey : zizdog\n    }\n  }\n}\n",
-			nil, `"IOConsoleLocked" = No`, "", ""},
+			nil, `"IOConsoleLocked" = No`, "root", "", ""},
+		{"scutil 拿不到 → 退回 /dev/console 属主（有人在）",
+			"", errors.New("scutil 挂了"), `"IOConsoleLocked" = No`, "zizdog", "zizdog", ""},
+		{"scutil 拿不到 + /dev/console 是 root → 没人在",
+			"", errors.New("scutil 挂了"), `"IOConsoleLocked" = No`, "root", "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			prevScutil, prevIoreg := scutilConsoleOutputFn, ioregLockOutputFn
+			prevScutil, prevIoreg, prevDev := scutilConsoleOutputFn, ioregLockOutputFn, devConsoleUserFn
 			scutilConsoleOutputFn = func() ([]byte, error) { return []byte(c.scutilOut), c.scutilErr }
 			ioregLockOutputFn = func() ([]byte, error) { return []byte(c.ioregOut), nil }
-			t.Cleanup(func() { scutilConsoleOutputFn, ioregLockOutputFn = prevScutil, prevIoreg })
+			// 兜底判据按用例给：**绝不读真机的 /dev/console**（它的属主会随锁屏/登录变化，
+			// 夹具绑上它就是环境检测 —— 2026-10-06 实测：用户解锁后这个门禁自己变红）。
+			devConsoleUserFn = func() string { return c.devConsole }
+			t.Cleanup(func() {
+				scutilConsoleOutputFn, ioregLockOutputFn, devConsoleUserFn = prevScutil, prevIoreg, prevDev
+			})
 
 			if got := consoleUserReal(); got != c.wantUser {
 				t.Errorf("consoleUserReal()=%q，期望 %q（%s）", got, c.wantUser, c.wantReason)

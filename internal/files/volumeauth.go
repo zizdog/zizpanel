@@ -64,9 +64,13 @@ func VolumeAuthMarkerPath(dataDir string) string {
 var consoleUserFn = consoleUserReal
 
 func consoleUserReal() string {
-	user := consoleUserFromScutil()
+	user := strings.TrimSpace(consoleUserFromScutil())
 	if user == "" {
-		user = consoleUserFromDevConsole()
+		user = strings.TrimSpace(devConsoleUserFn())
+	}
+	// root / loginwindow 一律归一成"没人在"（兜底探针的具体实现不许把这两种值漏出去）。
+	if user == "root" || user == "loginwindow" {
+		user = ""
 	}
 	if user == "" || consoleIsLocked() {
 		return ""
@@ -121,6 +125,10 @@ func parseScutilConsoleUser(out string) string {
 //
 // 与 scutil 那条一样把 root / loginwindow 归一成空串 —— 调用方要的是"有没有人"，
 // 不是"是谁"；让 root 字符串漏出去会变成"看起来有人在"（坑 237 的另一种翻法）。
+// devConsoleUserFn 是兜底判据的注入点：门禁不许依赖跑测试那台机器的 /dev/console 属主
+// （它会随着屏幕锁没锁、有没有人登录而变 —— 夹具一旦绑上它，门禁就成了环境检测）。
+var devConsoleUserFn = consoleUserFromDevConsole
+
 func consoleUserFromDevConsole() string {
 	out, err := exec.Command("/usr/bin/stat", "-f", "%Su", "/dev/console").Output()
 	if err != nil {
