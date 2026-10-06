@@ -45,9 +45,12 @@ function ensureDom() {
     onclick: () => { teardown(true); toast('已断开远程桌面', 'ok'); renderButtons(); },
   });
   const creds = h('div', { dataset: { testid: 'zp-rd-creds' }, style: { display: 'none', marginTop: '10px' } });
-  const canvas = h('canvas', {
+  // ⚠️ noVNC 的第一个参数是**容器元素**：它自己往里 append 一个 canvas。
+  // 早先直接传了一个 <canvas>，结果 noVNC 把画面画进"canvas 里的 canvas"，
+  // 外层那个永远是空的（2026-10-06 端到端实测：登录成功但画面全黑）。
+  const canvasHost = h('div', {
     dataset: { testid: 'zp-rd-canvas' },
-    style: { width: '100%', height: '100%', display: 'block', background: '#000' },
+    style: { width: '100%', height: '100%' },
   });
   const stage = h('div', {
     dataset: { testid: 'zp-rd-stage' },
@@ -55,8 +58,8 @@ function ensureDom() {
       position: 'relative', width: '100%', height: 'min(66vh, 720px)', minHeight: '320px',
       background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'none',
     },
-  }, [canvas]);
-  dom = { info, state, connectBtn, disconnectBtn, creds, canvas, stage };
+  }, [canvasHost]);
+  dom = { info, state, connectBtn, disconnectBtn, creds, host: canvasHost, stage };
   return dom;
 }
 
@@ -118,7 +121,7 @@ function connect(username, password) {
     // 刻意**不传** wsProtocols：面板的 WebSocket 握手不协商子协议，
     // 浏览器如果请求了 'binary' 而服务端没回同名的 Sec-WebSocket-Protocol，连接会被浏览器判失败
     //（2026-10-06 端到端实测踩到：连接一闪就断）。
-    rfb = new RFB(d.canvas, wsURL.toString(), { credentials: { username, password }, shared: true });
+    rfb = new RFB(d.host, wsURL.toString(), { credentials: { username, password }, shared: true });
   } catch (e) {
     toast('创建远程桌面连接失败：' + ((e && e.message) || e), 'err', 15000);
     return;
@@ -126,16 +129,16 @@ function connect(username, password) {
   rfb.scaleViewport = true;
   rfb.resizeSession = false;
   rfb.viewOnly = false;
-  session = { rfb, canvas: d.canvas, host: '' };
+  session = { rfb, host: d.host, name: '' };
   d.state.textContent = '正在连接…';
 
   rfb.addEventListener('connect', () => {
-    d.state.textContent = '已连接：' + (session && session.host ? session.host : '本机桌面');
+    d.state.textContent = '已连接：' + (session && session.name ? session.name : '本机桌面');
     renderButtons();
   });
   rfb.addEventListener('desktopname', (ev) => {
-    if (session) session.host = (ev.detail && ev.detail.name) || '';
-    d.state.textContent = '已连接：' + (session.host || '本机桌面');
+    if (session) session.name = (ev.detail && ev.detail.name) || '';
+    d.state.textContent = '已连接：' + (session.name || '本机桌面');
   });
   rfb.addEventListener('credentialsrequired', () => {
     d.state.textContent = '需要登录这台 Mac（输入账号密码后继续）';
