@@ -745,6 +745,11 @@ fi
   || fail "面板托管的服务作业还在：${SUP_PLIST}（坑 238 复发）"
 grep -q "面板托管的服务会随面板一起卸载" "$SANDBOX/uninstall.log" \
   && pass "动手前明确提醒了哪些服务随面板走" || fail "没有提醒面板托管服务会被卸载"
+# 模式 1 也要连它的 brew 包一起卸（用户 2026-10-06："选 1、2 时也应该卸载它们"）；
+# 公式取自**目录**导出的映射（不是手抄表）—— 手抄表漏了 aria2，这是那次报障的根因。
+grep -q "uninstall --ignore-dependencies aria2" "$SANDBOX/uninstall-brew.log" \
+  && pass "面板托管应用的 brew 包随服务一起卸载（模式 1，映射来自目录）" \
+  || fail "面板托管应用的 brew 包没被卸载（uninstall-brew.log 里没有 aria2）"
 # 负向对照：只说"登记表里有记录"但守护进程不是面板二进制的，模式 1 **不许**动它
 [ -f "$DECOY_PLIST" ] && pass "非面板托管的记录未被误删（模式 1）" \
   || fail "误删了非面板托管的作业：${DECOY_PLIST}"

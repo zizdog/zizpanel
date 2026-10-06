@@ -146,6 +146,8 @@ setup_fixture() {
   printf 'cfg\n' > "$PREFIX/etc/nginx/nginx.conf"
   printf 'cfg\n' > "$PREFIX/etc/my.cnf"
   printf 'cfg\n' > "$PREFIX/etc/php/8.2/php.ini"
+  # 面板写的 phpMyAdmin 配置：卸载器据此认定"面板装过它"（它没有服务记录，别处看不到）
+  printf 'cfg\n' > "$PREFIX/etc/phpmyadmin.config.inc.php"
   printf 'plist\n' > "$PLIST/cn.zizpanel.panel.plist"
   printf 'plist\n' > "$PLIST/cn.zizpanel.cron.daily-backup.plist"
   printf 'plist\n' > "$PLIST/cn.zizdog.nginx.plist"
@@ -228,6 +230,9 @@ out_has "$SANDBOX/out-dry2.log" "brew uninstall --ignore-dependencies nginx" && 
 out_has "$SANDBOX/out-dry2.log" "brew uninstall --ignore-dependencies php@8.2" && pass "出现 PHP 卸载" || fail "缺少 PHP 卸载"
 out_has "$SANDBOX/out-dry2.log" "brew uninstall --ignore-dependencies mariadb" && pass "出现 MariaDB 卸载" || fail "缺少 MariaDB 卸载"
 out_lacks "$SANDBOX/out-dry2.log" "File Browser" && pass "模式 2 不卸载面板应用" || fail "模式 2 误删面板应用"
+# phpMyAdmin 没有常驻服务、也不在服务记录里，靠"面板写的配置"认定（用户 2026-10-06 报障：
+# 彻底卸载后它还在）——模式 2 必须把它列进去。
+out_has "$SANDBOX/out-dry2.log" "phpmyadmin" && pass "模式 2 计划卸载面板装过的 phpMyAdmin" || fail "模式 2 漏了 phpMyAdmin"
 out_lacks "$SANDBOX/out-dry2.log" "brew uninstall --ignore-dependencies redis" && pass "模式 2 不碰用户自己的 Redis" || fail "模式 2 误删用户软件"
 if ! grep -qx -F "  - $ROOT" "$SANDBOX/out-dry2.log"; then pass "模式 2 不整体删面板数据目录"; else fail "模式 2 计划删面板数据目录"; fi
 out_has "$SANDBOX/out-dry2.log" "数据库数据目录" && pass "模式 2 明确保留数据库数据目录" || fail "模式 2 未声明保留数据库数据"

@@ -229,8 +229,14 @@ func TestCPUQualityArgvUnchangedGate(t *testing.T) {
 // 变异（必须变红）：把某个质量档上限抬到 ≥ 它配对的固定码率档。
 func TestHWQualitySmallerThanBitrateGate(t *testing.T) {
 	const audioKbps, durSec = 96.0, 7200.0
+	// 每个预设用**它自己的分辨率**当夹具：锚点按实际输出分辨率取（用户 2026-10-06），
+	// 给 720p 档传 1080p 尺寸构造出来的配对关系在现实中不存在。
+	dims := map[string][2]int{
+		"360p": {640, 360}, "480p": {854, 480}, "720p": {1280, 720}, "1080p": {1920, 1080},
+	}
 	for _, id := range []string{"360p", "480p", "720p", "1080p"} {
 		p := presetID(t, id)
+		d := dims[id]
 		choices := BitrateChoices(p)
 		if len(choices) != len(hwQualityCalib) {
 			t.Fatalf("%s 级别的固定码率档有 %d 个，质量档有 %d 个，配对数不上",
@@ -241,7 +247,7 @@ func TestHWQualitySmallerThanBitrateGate(t *testing.T) {
 			if pairKbps <= 0 {
 				t.Fatalf("%s 第 %d 个固定码率档不是绝对码率（%d），配对口径不成立", id, i, pairKbps)
 			}
-			capKbps := HWQualityCapKbps(tier.Quality, p, 1920, 1080)
+			capKbps := HWQualityCapKbps(tier.Quality, p, d[0], d[1])
 			estKbps := HWQualityEstimateKbps(capKbps)
 			if capKbps >= pairKbps {
 				t.Errorf("%s 质量档 %d vs 配对固定档 %d kbps：上限 %d kbps 没有更小",
@@ -258,5 +264,46 @@ func TestHWQualitySmallerThanBitrateGate(t *testing.T) {
 					id, tier.Quality, pairKbps, want, pair)
 			}
 		}
+	}
+}
+
+// TestSmallerSourceKeepsTierAtItsOwnResolution 是用户 2026-10-06 报障的门禁：
+// 选了「1080p + 中档」，而目录里混着 720p 素材 —— 720p 素材**不该按 1080p 的码率上限**压
+// （画面不会放大，但码率白白偏高）。口径：档位不变（还是中档），锚点换成该素材自己的分辨率。
+//
+// 负向对照：把 HWQualityCapKbps 的锚点改回 p.DefaultKbps，第一条断言立刻红。
+func TestSmallerSourceKeepsTierAtItsOwnResolution(t *testing.T) {
+	p1080 := presetID(t, "1080p")
+	cap1080 := HWQualityCapKbps(VTQualityBalanced, p1080, 1920, 1080)
+	if want := hwQualityTierFor(VTQualityBalanced).Cap1080p; cap1080 != want {
+		t.Fatalf("1080p 素材必须用标定值：cap=%d 期望 %d（标定表不许被这条改动带偏）", cap1080, want)
+	}
+	cap720 := HWQualityCapKbps(VTQualityBalanced, p1080, 1280, 720)
+	want720 := int(math.Round(float64(cap1080) * float64(Kbps720p) / float64(Kbps1080p)))
+	if cap720 != want720 {
+		t.Errorf("720p 素材应按 720p 的锚点缩放：cap=%d 期望 %d（1080p 档的中档换算到 720p）", cap720, want720)
+	}
+	if cap720 >= cap1080 {
+		t.Errorf("720p 素材的上限不该 ≥ 1080p 素材的上限：%d vs %d", cap720, cap1080)
+	}
+
+	// 码率档是同一类问题：1080p 档选 6000k，720p 素材应按 720p 档的最高档（3000k）。
+	info := MediaInfo{
+		Width: 1280, Height: 720, DurationSec: 60, FileBytes: 60 * 1000 * 1000 / 8,
+		VideoKbps: 9000, HasVideo: true, HasAudio: true, AudioKbps: 128, Codec: "h264",
+	}
+	plan := PlanOne("a.mp4", "/t/a.mp4", "/t/out", info,
+		Options{Preset: p1080, Encoder: EncoderCPU, Mode: ModeBitrate, KBps: 6000}, false)
+	if plan.VideoKbps != Kbps720p*2 {
+		t.Errorf("720p 素材在 1080p 档下选了 6000k 时，应按 720p 档的最高档 %dk，实际 %dk",
+			Kbps720p*2, plan.VideoKbps)
+	}
+	// 反向对照：真正的 1080p 素材照旧用用户选的那个码率（不许被缩放）。
+	info1080 := info
+	info1080.Width, info1080.Height = 1920, 1080
+	plan1080 := PlanOne("b.mp4", "/t/b.mp4", "/t/out", info1080,
+		Options{Preset: p1080, Encoder: EncoderCPU, Mode: ModeBitrate, KBps: 6000}, false)
+	if plan1080.VideoKbps != 6000 {
+		t.Errorf("1080p 素材应原样用 6000k，实际 %dk", plan1080.VideoKbps)
 	}
 }

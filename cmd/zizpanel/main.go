@@ -126,6 +126,12 @@ func main() {
 		err = cmdHashPassword(rest)
 	case "gen-cert":
 		err = cmdGenCert(rest)
+	case "removal-formulas":
+		// 给**卸载脚本**用：把"面板装过的应用 → brew 包"从目录导出来（唯一真相在 Go 侧，
+		// 见 services.RemovalFormulas 的注释）。输出 `label<TAB>formula`，一行一条。
+		for _, rf := range services.RemovalFormulas() {
+			fmt.Printf("%s\t%s\n", rf.Label, rf.Formula)
+		}
 	case "version", "-v", "--version":
 		// --json 是给「升级自检」用的机器可读输出。
 		// 升级流程会在**替换二进制之前**先跑一次 `version --json`，

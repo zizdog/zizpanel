@@ -287,11 +287,36 @@ func absInt(n int) int {
 // HWQualityCapKbps 返回 q:v 档在目标尺寸下的码率上限（kbps）：
 // 1080p 标定值 × 档位锚点/3000，锚点 = 该档位默认码率（原始档按目标分辨率建议）。
 // 这样 480p/720p 的上限随分辨率一起降，不会出现"480p 用 1080p 的上限"。
+// scaleBitrateToOutput 把"按预设选的码率"等比缩放到**实际输出分辨率**的档位锚点。
+//
+// 与硬件质量档同一类问题（用户 2026-10-06 报障）：选了 1080p 档，目录里混着 720p 素材时
+// 不该按 1080p 的码率压。口径是"同一个档位选择换到素材自己的分辨率"：1080p 档的 6000k
+// （2×）↔ 720p 档的 3000k（2×），因为两档锚点是 3000 / 1500。
+// 素材不比预设小（或尺寸/锚点读不到）时原样返回 —— 1080p 及以上的行为一个字不变。
+func scaleBitrateToOutput(kbps int, p Preset, w, h int) int {
+	if kbps <= 0 || p.DefaultKbps <= 0 {
+		return kbps
+	}
+	eff := tierKBps(w, h)
+	if eff <= 0 || eff >= p.DefaultKbps {
+		return kbps
+	}
+	out := int(math.Round(float64(kbps) * float64(eff) / float64(p.DefaultKbps)))
+	if out < 1 {
+		out = 1
+	}
+	return out
+}
+
 func HWQualityCapKbps(q int, p Preset, w, h int) int {
 	cap := hwQualityTierFor(q).Cap1080p
-	anchor := p.DefaultKbps
+	// 锚点按**实际输出分辨率**取（用户 2026-10-06 报障）：选了 1080p 档，目录里混着的
+	// 720p 素材不该按 1080p 的上限压 —— 画面不会放大，但码率白白偏高。w/h 是目标尺寸
+	// （不放大，见 targetSize），所以 720p 素材在这里量出 720p 的锚点，档位保持"中档"。
+	// 1080p 素材仍等于 Kbps1080p ⇒ 标定值一个字不变（门禁锁着这条）。
+	anchor := tierKBps(w, h)
 	if anchor <= 0 {
-		anchor = tierKBps(w, h)
+		anchor = p.DefaultKbps
 	}
 	if anchor <= 0 {
 		return cap
@@ -998,7 +1023,7 @@ func planBitrates(info MediaInfo, opts Options, w, h int) (vKbps, aKbps, maxRate
 			}
 		}
 	} else {
-		vKbps = ResolveKBps(opts.Preset, opts.KBps)
+		vKbps = scaleBitrateToOutput(ResolveKBps(opts.Preset, opts.KBps), opts.Preset, w, h)
 		if vKbps <= 0 {
 			suggested = SuggestedKBps(info.Width, info.Height, info.VideoKbps)
 			vKbps = suggested

@@ -1820,7 +1820,27 @@ is_lnmp_formula() {
 # 少数面板应用的"引擎"是另一个 brew 包，登记表只记了应用的 launchd 标签。
 # 这里是 Go 侧 ImgCompressFormula / STTBrewFormula 的镜像；只对登记表已确认由面板
 # 安装的行生效（绝不用 brew list 反推）。新增这类应用时要同步这里。
+# REMOVAL_FORMULAS 是面板二进制从**目录**导出的 "label<TAB>formula" 清单（唯一真相）。
+# 面板根还在时读一次；读不到（旧包/二进制缺失）就退回下面那张手抄兜底表。
+REMOVAL_FORMULAS=""
+load_removal_formulas() {
+  REMOVAL_FORMULAS=""
+  local bin="$PANEL_ROOT/bin/zizpanel"
+  [ -x "$bin" ] || return 0
+  REMOVAL_FORMULAS="$("$bin" removal-formulas 2>/dev/null || true)"
+}
+catalog_formula_for_label() {
+  [ -n "${1:-}" ] || return 0
+  [ -n "$REMOVAL_FORMULAS" ] || return 0
+  printf '%s\n' "$REMOVAL_FORMULAS" | awk -F'\t' -v want="$1" '$1==want{print $2; exit}'
+}
+
 engine_formula_for_label() {
+  # 先问目录（面板二进制导出）—— 手抄表会漂：用户 2026-10-06 报障"彻底卸载后 aria2 /
+  # transmission / vips / colima 还在"，就是因为这几条不在下面那张表里。
+  local fromCatalog=""
+  fromCatalog="$(catalog_formula_for_label "$1")"
+  if [ -n "$fromCatalog" ]; then printf '%s' "$fromCatalog"; return 0; fi
   case "$1" in
     com.zizdog.imgcompress) printf '%s' "vips" ;;
     com.zizdog.stt)         printf '%s' "whisper.cpp" ;;
@@ -2004,6 +2024,21 @@ plan_lnmp() {
   lnmp_config_paths
 }
 
+# phpmyadmin_cleanup：面板装过 phpMyAdmin 才清它（证据 = 面板写的 config.inc.php）。
+#
+# 它既没有常驻服务、也不在服务登记表里，所以既不在 LNMP 名单、也不在登记表循环里 ——
+# 之前**任何模式**都不会删它（用户 2026-10-06："彻底卸载重装后，除了 python 和 ffmpeg
+# 以外，其它软件应该不存在才对"）。有面板写的配置 = 面板装过的实证，不是猜。
+phpmyadmin_cleanup() {
+  local p f
+  for p in "${BREW_PREFIXES[@]}"; do
+    f="$p/etc/phpmyadmin.config.inc.php"
+    [ -f "$f" ] || continue
+    plan_uninstall "phpmyadmin（brew formula）"
+    plan_delete "$f"
+  done
+}
+
 database_data_paths() { # 仅模式 3：数据库数据目录
   # var/mysql 是**当前活动**数据目录（模式 3 删）；
   # var/mysql.* 是切换 MySQL/MariaDB 时特意留下的**旧引擎数据副本**（等同备份）——
@@ -2065,6 +2100,15 @@ plan_supervised_apps() {
     [ -e "${SUPERVISED_PLISTS[$i]}" ] && plan_delete "${SUPERVISED_PLISTS[$i]}"
     i=$((i + 1))
   done
+  # 面板托管的服务：**所有模式**都连 brew 包一起卸（用户 2026-10-06："选 1、2 时也应该
+  # 卸载它们"）。公式从目录导出的映射取 —— 登记表里的 REG_FORMULA 只在模式 3 才有。
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    local sf=""
+    sf="$(engine_formula_for_label "${SUPERVISED_LABELS[$i]}")"
+    [ -n "$sf" ] && plan_uninstall "${sf}（brew formula，随面板托管服务卸载）"
+    i=$((i + 1))
+  done
   # 登记表里那些 supervised=1 的：连程序一起卸（公式/引擎），并声明数据保留。
   i=0
   while [ "$i" -lt "${#REG_NAME[@]}" ]; do
@@ -2109,6 +2153,7 @@ build_plan_mode2() {
   collect_panel_labels
   plan_supervised_apps
   plan_lnmp
+  phpmyadmin_cleanup
   plan_keep "站点文件：${REAL_HOME}/www（绝不删）"
   local p
   for p in "${BREW_PREFIXES[@]}"; do
@@ -2123,6 +2168,7 @@ build_plan_mode3() {
   collect_panel_labels
   plan_supervised_apps
   plan_lnmp
+  phpmyadmin_cleanup
   local i=0 label formula wd cf
   while [ "$i" -lt "${#REG_NAME[@]}" ]; do
     label="${REG_LABEL[$i]}"; formula="${REG_FORMULA[$i]}"
@@ -2239,22 +2285,36 @@ brew_services_stop_from_plan() {
   for f in ${LNMP_DETECTED[@]+"${LNMP_DETECTED[@]}"}; do brew_services_stop "$f"; done
 }
 
+# formula_from_plan_entry：从计划条目里取出 brew 包名。
+# 条目形如 `aria2（brew formula）` / `vips（brew formula，随面板托管服务卸载）`。
+formula_from_plan_entry() {
+  local e="${1%%（*}"
+  printf '%s' "$(printf '%s' "$e" | tr -d '[:space:]')"
+}
+
+# uninstall_formulas_from_plan 以**计划**为准执行 brew 卸载（执行器与 dry-run 清单因此永远一致）。
+#
+# 2026-10-06 修：原来这里自己再算一遍（LNMP_DETECTED + 登记表 REG_*），于是
+# `plan_uninstall "aria2（brew formula…）"` 这种**只进了计划、没人执行**的条目被静默丢掉 ——
+# 沙箱门禁"面板托管应用的 brew 包随服务卸载"就是这么抓出来的（计划里有、brew 调用没有）。
 uninstall_formulas_from_plan() {
   title "卸载软件"
-  local f i=0
-  # LNMP 只在模式 2/3 卸；模式 1 明确保留运行环境。
-  if [ "$MODE" != "1" ]; then
-    for f in ${LNMP_DETECTED[@]+"${LNMP_DETECTED[@]}"}; do brew_uninstall_formula "$f"; done
-  fi
-  while [ "$i" -lt "${#REG_NAME[@]}" ]; do
-    if [ "${REG_ACT[$i]}" = "1" ] && [ -n "${REG_FORMULA[$i]}" ]; then
-      # 模式 1 只动"面板托管"的那些（它们的守护进程就是面板二进制）；其它面板装过的软件
-      # 属于运行环境，模式 1 保留（用户要连它们一起清就走模式 2/3）。
-      if [ "$MODE" != "1" ] || [ "${REG_SUPERVISED[$i]}" = "1" ]; then
-        brew_uninstall_formula "${REG_FORMULA[$i]}"
-      fi
+  local e f onlySupervised
+  for e in ${PLAN_UNINSTALL[@]+"${PLAN_UNINSTALL[@]}"}; do
+    case "$e" in
+      *"（brew formula"*) ;;
+      *) continue ;;   # 只处理 brew 包条目（应用名条目不是 brew 卸载）
+    esac
+    # 模式 1 只动"随面板托管服务卸载"的那些（它们是面板的一部分）；其余属于运行环境，
+    # 模式 1 保留（要连它们一起清就走模式 2/3）。
+    onlySupervised=0
+    case "$e" in *"随面板托管服务卸载"*) onlySupervised=1 ;; esac
+    if [ "$MODE" = "1" ] && [ "$onlySupervised" != "1" ]; then
+      skip "保留 ${e%%（*}（模式 1 不卸运行环境）"
+      continue
     fi
-    i=$((i + 1))
+    f="$(formula_from_plan_entry "$e")"
+    [ -n "$f" ] && brew_uninstall_formula "$f"
   done
 }
 
@@ -2684,6 +2744,8 @@ main() {
     fi
   fi
 
+  # 目录导出的"应用 → brew 包"映射必须在**删掉面板根之前**读（唯一真相在二进制里）。
+  load_removal_formulas
   confirm_all
   build_plan
 
