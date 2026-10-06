@@ -778,7 +778,10 @@ func TestFileSharingShareUpdateGate(t *testing.T) {
 	// 4 列状态行 = 记录名 ≠ SMB 名（真机 mini 的形状）。
 	// 第二行指向一个**真的存在**的目录，用来对照 path_missing。
 	shim.setState("smbd_running", "1")
-	shim.setState("shares.txt", "ZPMirror\tzpmirror\t/Volumes/ZPMirror\t0\n"+
+	// 缺席路径用**保证不存在**的临时路径，不能拿真机上的路径当夹具
+	//（2026-10-06 踩到：夹具写 /Volumes/ZPMirror，而本机那天恰好挂了这个卷 ⇒ 门禁随机器状态红）。
+	missingDir := filepath.Join(t.TempDir(), "not-mounted", "share")
+	shim.setState("shares.txt", "ZPMirror\tzpmirror\t"+missingDir+"\t0\n"+
 		"Public\tpublic\t"+existedDir+"\t0\n")
 
 	_, out, _ := doJSON(t, ts, "GET", "/api/v1/system/sharing", nil, cookies)
@@ -806,7 +809,7 @@ func TestFileSharingShareUpdateGate(t *testing.T) {
 	if !strings.Contains(argv, "-e ZPMirror -s 001 -S media -R 1") {
 		t.Errorf("[①改名] 假 sharing 的 argv 不对（应用记录名 -e ZPMirror）：%s", argv)
 	}
-	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia\t/Volumes/ZPMirror\t1") {
+	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia\t"+missingDir+"\t1") {
 		t.Errorf("[①改名] 垫片侧状态没按预期变：%q", got)
 	}
 
@@ -833,7 +836,7 @@ func TestFileSharingShareUpdateGate(t *testing.T) {
 	if !strings.Contains(delta, "-e ZPMirror -s 001 -R 0") || strings.Contains(delta, "-S ") {
 		t.Errorf("[②只改只读] 应只发 -R、不发 -S，实际：%s", delta)
 	}
-	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia2\t/Volumes/ZPMirror\t0") {
+	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia2\t"+missingDir+"\t0") {
 		t.Errorf("[②只改只读] 垫片侧状态不对：%q", got)
 	}
 

@@ -377,6 +377,11 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("POST /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareCreate))
 	root.HandleFunc("PATCH /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareUpdate))
 	root.HandleFunc("DELETE /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareDelete))
+	// 远程桌面（见 api_remote_desktop.go）：面板内嵌 noVNC，中继本机屏幕共享（127.0.0.1:5900）。
+	// 只走面板会话鉴权，不需要把 5900 暴露出去；ws 是纯字节中继。
+	root.HandleFunc("GET /api/v1/system/remote-desktop", s.requireAuth(s.handleRemoteDesktopStatus))
+	root.HandleFunc("POST /api/v1/system/remote-desktop/{action}", s.requireAuth(s.handleRemoteDesktopAction))
+	root.HandleFunc("GET /api/v1/system/remote-desktop/ws", s.requireAuth(s.handleRemoteDesktopWS))
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。
 	root.HandleFunc("GET /api/v1/permissions", s.requireAuth(s.handlePermissionsList))

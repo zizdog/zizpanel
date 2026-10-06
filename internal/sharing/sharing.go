@@ -32,6 +32,9 @@ const SMBLabel = "com.apple.smbd"
 // AccessSMBGroup 是 macOS 控制 SMB 访问的用户组（成员才允许连 SMB）。
 const AccessSMBGroup = "com.apple.access_smb"
 
+// AccessScreensharingGroup 是屏幕共享的服务 ACL（同一套机制：组存在=成员才允许连）。
+const AccessScreensharingGroup = "com.apple.access_screensharing"
+
 // 可注入/可垫片的命令解析：全部先走 PATH（门禁与隔离实例用假命令垫片），
 // 找不到再退回系统绝对路径（LaunchDaemon 的 PATH 可能很干净）。
 var (

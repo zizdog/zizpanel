@@ -105,10 +105,21 @@ func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 	}
 
 	accept := wsAcceptKey(key)
+	// 客户端如果带了 Sec-WebSocket-Protocol，必须回一个**同名**的，否则浏览器会判定
+	// 握手失败并当场断开（noVNC 早期版本会带 'binary'）。不带就什么都不回 —— 这是合法的。
+	proto := ""
+	if p := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Protocol")); p != "" {
+		if i := strings.Index(p, ","); i >= 0 {
+			p = strings.TrimSpace(p[:i])
+		}
+		if p != "" {
+			proto = "Sec-WebSocket-Protocol: " + p + "\r\n"
+		}
+	}
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+		"Sec-WebSocket-Accept: " + accept + "\r\n" + proto + "\r\n"
 	if _, err := rw.WriteString(resp); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -276,3 +287,7 @@ func (c *wsConn) isClosed() bool {
 
 // SetReadDeadline 设置读超时（用于实现空闲检测）。
 func (c *wsConn) SetReadDeadline(t time.Time) error { return c.conn.SetReadDeadline(t) }
+
+// WriteBinary 发送一帧二进制消息（远程桌面的字节中继用它 —— noVNC 说 RFB 协议，
+// 内容可能是任意字节，不能当文本发）。
+func (c *wsConn) WriteBinary(data []byte) error { return c.writeFrame(wsOpBinary, data) }

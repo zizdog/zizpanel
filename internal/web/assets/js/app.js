@@ -18,6 +18,7 @@ import { LogsHubView } from './logshub.js';
 import { NavView } from './nav.js';
 import { PeersView } from './peers.js';
 import { DisksView } from './disks.js';
+import { RemoteDesktopView } from './remote-desktop.js';
 import { DatabaseView } from './database.js';
 import { DockerView } from './docker.js';
 import { startUpgradeWatcher, hasUpdate, upgradeNotice, dismissUpgradeNotice } from './update.js';
@@ -74,6 +75,9 @@ export const NAV = [
   // 放在「系统」组（与「面板设置 / 日志」同组）：它是 OS 级的存储工具，
   // 不是"面板自己的设置"，也不是「mac设置」那种把 macOS 配成服务器的动作集。
   { id: 'disks', title: '磁盘管理', icon: '💾', view: DisksView },
+  // 「远程桌面」：面板里直接看/操作本机桌面（内嵌 noVNC + 面板自己的 WebSocket 中继）。
+  // 放在「系统」组：它和磁盘管理一样是 OS 级能力，不是面板自己的设置。
+  { id: 'remote', title: '远程桌面', icon: '🖱️', view: RemoteDesktopView },
   // 「权限」（逐项申请 macOS 授权）2026-09-20 从侧栏搬进「面板设置」的 Tab；
   // 旧 hash `#/permissions` 由下面 ROUTE_TARGET 的别名兜住，书签不会白屏。
   // 「日志」把原「日志中心」与「操作审计」合并成一页两个 Tab（见 logshub.js）：
