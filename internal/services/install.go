@@ -744,6 +744,14 @@ func (m *Manager) UpgradeBrewApp(ctx context.Context, app App, res *InstallResul
 		res.step(ctx, fmt.Sprintf("提示：升级已完成，但 %d 端口现在没有监听 —— "+
 			"到「服务管理」或这里点一次「重启」让新版本生效", app.Port))
 	}
+	// 中文界面写在 brew 的 keg 里（见 transmission_webui.go）：`brew upgrade` 会把
+	// 整个目录换回官方英文那一份，所以升级完立刻补一次（否则要等面板重启才自愈）。
+	if app.ID == "transmission" {
+		if err := m.EnsureTransmissionWebUI(ctx, res); err != nil && res != nil {
+			res.Warning = appendWarning(res.Warning,
+				"中文界面没补上（现在打开是官方英文界面）："+err.Error())
+		}
+	}
 	return nil
 }
 

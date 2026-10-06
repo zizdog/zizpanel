@@ -394,6 +394,20 @@ func (m *Manager) InstallTransmission(ctx context.Context, res *InstallResult) e
 	}
 	res.step(ctx, "健康检查通过："+webURL+" 带凭据返回 200（无凭据 401 = 口令已强制）")
 
+	// ---- 8.5 中文界面（面板内嵌的第三方前端，写 web 根目录，不需要重启） ----
+	//
+	// 官方 4.x 网页版只有英文（见 transmission_webui.go 文件头），用户要中文。
+	// 写不进去不影响下载器本体可用 ⇒ 只写警告，并把"现在打开看到的是什么"说清。
+	// 真正生效的判据在最后一步（从 9091 取回页面核对中文），不在这里下结论。
+	webUIApplied := false
+	res.step(ctx, "写入中文界面（Transmission Next UI v"+transmissionWebUIVersion+"）")
+	if err := m.EnsureTransmissionWebUI(ctx, res); err != nil {
+		res.Warning = appendWarning(res.Warning,
+			"中文界面没装上（现在打开是官方英文界面）："+err.Error())
+	} else {
+		webUIApplied = true
+	}
+
 	// ---- 9. 装成系统级服务（开机自启；无头机器不加载用户级 agent，坑 130） ----
 	if app, found := FindApp("transmission"); found && systemDaemonNeeded(app) {
 		if _, _, err := systemDaemonEnsureFn(m, ctx, app, res); err != nil {
@@ -410,6 +424,19 @@ func (m *Manager) InstallTransmission(ctx context.Context, res *InstallResult) e
 					webURL, m.transmissionLogPath())
 			}
 			res.step(ctx, "系统级服务复核通过：重启机器后 Transmission 会自动起来")
+		}
+	}
+
+	// ---- 9.5 中文界面的**端到端**判据（放在服务状态定下来之后） ----
+	//
+	// 文件写进去只证明"磁盘上有"；这里从 9091 把首页与它引用的脚本取回来，
+	// 脚本里必须有中文 —— 否则如实警告（不谎报"已是中文界面"）。
+	if webUIApplied {
+		if err := m.verifyTransmissionWebUIServed(ctx, user, password); err != nil {
+			res.Warning = appendWarning(res.Warning,
+				"中文界面没有生效（现在打开仍是官方英文界面）："+err.Error())
+		} else {
+			res.step(ctx, "已从 "+webURL+" 取回页面核对：界面脚本里有中文（中文界面生效）")
 		}
 	}
 

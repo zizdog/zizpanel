@@ -1703,6 +1703,7 @@ func builtinCatalog() []App {
 				Target:       "/transmission/",
 				PreferDirect: true,
 				Note: "「打开」走面板子路径；RPC 绑 0.0.0.0，局域网可直连 9091（用户名/口令已生成）。" +
+					"网页界面是面板装的中文版（第三方 MIT）。" +
 					"改 RPC 用户名/口令与下载目录请用卡片上的「⚙️ RPC 设置」，别手改 settings.json。",
 			},
 			Summary:     "轻量 BitTorrent 下载器（自带 Web UI 与 RPC）",

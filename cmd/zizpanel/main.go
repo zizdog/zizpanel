@@ -351,6 +351,15 @@ func cmdServe(args []string) error {
 		}
 	}()
 
+	// Transmission 的中文界面（面板内嵌）：`brew upgrade transmission-cli` 会把
+	// web 根目录整个换回官方英文那一份（标记文件也随之消失），这里在后台补一次。
+	// 只读一个标记文件就能判断，没装 Transmission 时立刻返回。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		svcMgr.EnsureTransmissionWebUIQuiet(ctx)
+	}()
+
 	srv, err := web.New(cfg, st, am, col)
 	if err != nil {
 		return err
