@@ -52,14 +52,28 @@ function ensureDom() {
     dataset: { testid: 'zp-rd-canvas' },
     style: { width: '100%', height: '100%' },
   });
+  // 画面区（用户 2026-10-06 要求）：
+  //   · 高度按**远端画面的宽高比**算（16:10 的屏就是 宽×10/16），不再固定 66vh —— 否则
+  //     16:9 的画面被"按高度塞进一个又宽又矮的框"，两边留黑、字变小；
+  //   · 画面宽度**不低于 1080 CSS px**（窗口再小也不缩），外层横向滚动；
+  //   · 支持全屏（全屏时铺满屏幕、由 noVNC 按比例缩放）。
   const stage = h('div', {
     dataset: { testid: 'zp-rd-stage' },
     style: {
-      position: 'relative', width: '100%', height: 'min(66vh, 720px)', minHeight: '320px',
+      position: 'relative', width: 'max(100%, 1080px)', aspectRatio: '16 / 10',
       background: '#000', borderRadius: '8px', overflow: 'hidden', display: 'none',
     },
   }, [canvasHost]);
-  dom = { info, state, connectBtn, disconnectBtn, creds, host: canvasHost, stage };
+  const scroller = h('div', {
+    dataset: { testid: 'zp-rd-scroller' },
+    style: { overflowX: 'auto', overflowY: 'hidden', marginTop: '10px' },
+  }, [stage]);
+  const fsBtn = h('button.btn', {
+    text: '全屏', dataset: { testid: 'zp-rd-fullscreen' },
+    title: '全屏显示远程画面（Esc 退出）',
+    onclick: () => toggleFullscreen(),
+  });
+  dom = { info, state, connectBtn, disconnectBtn, creds, host: canvasHost, stage, scroller, fsBtn };
   return dom;
 }
 
@@ -68,7 +82,40 @@ function renderButtons() {
   const live = !!(session && session.rfb);
   dom.connectBtn.disabled = live;
   dom.disconnectBtn.disabled = !live;
+  if (dom.fsBtn) dom.fsBtn.disabled = !live;
   dom.creds.style.display = 'none';
+}
+
+// toggleFullscreen 让画面区进/出全屏。全屏时铺满屏幕（比例交给 noVNC 缩放），
+// 退出时恢复"按远端比例 + 宽度不低于 1080"的常规尺寸。
+function toggleFullscreen() {
+  const d = ensureDom();
+  if (document.fullscreenElement) {
+    document.exitFullscreen?.();
+    return;
+  }
+  if (!d.stage.requestFullscreen) {
+    toast('这个浏览器不支持全屏显示', 'warn', 8000);
+    return;
+  }
+  d.stage.requestFullscreen().catch((e) => toast('进不了全屏：' + ((e && e.message) || e), 'err', 12000));
+}
+
+// 全屏状态变化时调整容器尺寸（noVNC 会自己把画面缩放到容器里）。
+function onFullscreenChange() {
+  if (!dom) return;
+  if (document.fullscreenElement === dom.stage) {
+    dom.stage.style.width = '100vw';
+    dom.stage.style.height = '100vh';
+    dom.stage.style.aspectRatio = 'auto';
+    dom.stage.style.borderRadius = '0';
+  } else {
+    dom.stage.style.width = 'max(100%, 1080px)';
+    dom.stage.style.height = '';
+    dom.stage.style.borderRadius = '8px';
+    const c = dom.host.querySelector('canvas');
+    if (c && c.width > 0) dom.stage.style.aspectRatio = c.width + ' / ' + c.height;
+  }
 }
 
 // openCreds 显示"用户名 + 密码"输入（用户名默认沿用上次 / 面板账号）。
@@ -132,11 +179,20 @@ function connect(username, password) {
   session = { rfb, host: d.host, name: '' };
   d.state.textContent = '正在连接…';
 
+  // syncAspect 把画面区的宽高比对齐 noVNC 真正拿到的远端帧缓冲尺寸。
+  const syncAspect = () => {
+    const c = d.host.querySelector('canvas');
+    if (c && c.width > 0 && c.height > 0) {
+      d.stage.style.aspectRatio = c.width + ' / ' + c.height;
+    }
+  };
   rfb.addEventListener('connect', () => {
+    syncAspect();
     d.state.textContent = '已连接：' + (session && session.name ? session.name : '本机桌面');
     renderButtons();
   });
   rfb.addEventListener('desktopname', (ev) => {
+    syncAspect();
     if (session) session.name = (ev.detail && ev.detail.name) || '';
     d.state.textContent = '已连接：' + (session.name || '本机桌面');
   });
@@ -227,7 +283,7 @@ export function RemoteDesktopView(content, ctx = {}) {
       h('div.card-head', [
         h('h3', { text: '远程桌面' }),
         h('div.spacer'),
-        enableBtn, disableBtn, refreshBtn, d.connectBtn, d.disconnectBtn,
+        enableBtn, disableBtn, refreshBtn, d.connectBtn, d.disconnectBtn, d.fsBtn,
       ]),
       h('div.card-body', [
         h('p.hint', {
@@ -245,13 +301,19 @@ export function RemoteDesktopView(content, ctx = {}) {
         d.info,
         d.state,
         d.creds,
-        h('div', { style: { marginTop: '10px' } }, [d.stage]),
+        d.scroller,
       ]),
     ]),
   );
 
   // 保活：切页**不**断开、不销毁 canvas；只摘掉本次挂载加的监听。
-  if (ctx.onLeave) ctx.onLeave(() => { /* 刻意什么都不做：这就是保活的关键 */ });
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+  if (ctx.onLeave) {
+    ctx.onLeave(() => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      // 刻意不断开连接、不销毁 canvas：这就是保活的关键。
+    });
+  }
 
   renderButtons();
   refreshStatus();
