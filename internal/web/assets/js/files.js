@@ -3309,13 +3309,23 @@ export function FilesView(content, ctx = {}) {
           }
           if (r.two_pass) tune += ' · 2-pass';
         }
+        // 流保留情况（坑 239）：多音轨影片必须让用户一眼看到"音轨全部保留"，
+        // 图形字幕放不进 mp4 也不能瞒着（细节进 title，主句只留结论）。
+        const keepText = (r.audio_streams > 1 ? ' · 音轨 ' + r.audio_streams + ' 条全保留' : '')
+          + (r.text_subtitles ? ' · 字幕 ' + r.text_subtitles + ' 条' : '');
         const src = (r.source_codec_label || r.source_codec || '')
-          + (r.source_video_kbps ? ' · ' + r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '');
+          + (r.source_video_kbps ? ' · ' + r.source_video_kbps + ' kbps' + (r.source_estimated ? '（估算）' : '') : '')
+          + keepText;
         // 码率已到极限 ⇒ 不转码、原样放进 output（体积不变小）；原因细节收进 title。
         const cappedSkip = !!(r.capped && r.skip_reason);
         return h('tr', [
           h('td.zp-plan-name', { text: r.rel_path || r.name, title: r.rel_path ? r.name : '' }),
-          h('td', { text: src || '—' }),
+          h('td', {
+            text: src || '—',
+            title: r.bitmap_subtitles
+              ? '有 ' + r.bitmap_subtitles + ' 条图形字幕（PGS/DVD）：mp4 放不下，产物里会跳过（原片不动）'
+              : '',
+          }),
           h('td', { text: r.source_width ? r.source_width + 'x' + r.source_height : '—' }),
           h('td', { text: r.target_width ? r.target_width + 'x' + r.target_height : '—' }),
           h('td', { text: tune }),

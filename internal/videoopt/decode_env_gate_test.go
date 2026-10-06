@@ -54,7 +54,7 @@ func TestFastPipelineGate(t *testing.T) {
 			"-i in.mkv -c:v hevc_videotoolbox -tag:v hvc1 -prio_speed 1 -pix_fmt yuv420p " +
 			"-b:v 4500k -maxrate 4500k -bufsize 9000k " +
 			"-vf fps=30,scale_vt=w=2592:h=1080,hwdownload,format=p010le,format=yuv420p " +
-			"-c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
+			"-map 0:v:0 -map 0:a -c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
 			"-loglevel error out.mp4"
 		if got != want {
 			t.Fatalf("快路 argv 变了\n got=%s\nwant=%s", got, want)
@@ -111,7 +111,7 @@ func TestFastPipelineGate(t *testing.T) {
 		got := strings.Join(TranscodeArgs(base, 0), " ")
 		want := "-hide_banner -nostdin -y -i in.mp4 -c:v libx264 -preset veryfast -profile:v main " +
 			"-pix_fmt yuv420p -b:v 800k -maxrate 800k -bufsize 1600k -vf scale=854:480 " +
-			"-c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
+			"-map 0:v:0 -map 0:a -c:a aac -b:a 96k -movflags +faststart -f mp4 -progress pipe:1 -nostats " +
 			"-loglevel error out.mp4"
 		if got != want {
 			t.Fatalf("CPU 档 argv 变了\n got=%s\nwant=%s", got, want)

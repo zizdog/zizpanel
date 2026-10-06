@@ -59,6 +59,18 @@ type probeJSON struct {
 	} `json:"format"`
 }
 
+// isBitmapSubtitleCodec：图形（位图）字幕在 mp4 里放不下，必须与文本字幕区别对待。
+//
+// 只列**确定是位图**的编码；认不出来的一律当文本字幕（让 ffmpeg 转 mov_text）。
+// 宁可转码当场报错，也绝不把字幕悄悄丢掉（用户 2026-10-06 的报障就是这么来的）。
+func isBitmapSubtitleCodec(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub", "dvb_teletext":
+		return true
+	}
+	return false
+}
+
 // ParseProbeJSON 把 ffprobe 的输出转成 MediaInfo（纯函数，门禁可以直接喂 JSON）。
 //
 // 视频流码率拿不到时的估算口径（用户点名的兜底）：
@@ -79,6 +91,7 @@ func ParseProbeJSON(raw []byte, fileBytes int64) (MediaInfo, error) {
 	}
 
 	totalKbps := kbpsFromBits(p.Format.BitRate)
+	audioStreams, subStreams := 0, 0
 	for _, s := range p.Streams {
 		switch s.CodecType {
 		case "video":
@@ -94,10 +107,20 @@ func ParseProbeJSON(raw []byte, fileBytes int64) (MediaInfo, error) {
 				info.BitDepth = bitDepthFromPixFmt(s.PixFmt)
 			}
 		case "audio":
+			audioStreams++
 			info.HasAudio = true
 			info.AudioKbps += kbpsFromBits(s.BitRate)
+		case "subtitle":
+			// 字幕按"字幕流内序号"编号（-map 0:s:N 用的就是它），逐条分类。
+			if isBitmapSubtitleCodec(s.CodecName) {
+				info.BitmapSubtitles++
+			} else {
+				info.TextSubtitleIndexes = append(info.TextSubtitleIndexes, subStreams)
+			}
+			subStreams++
 		}
 	}
+	info.AudioStreams = audioStreams
 
 	// 时长：容器优先，其次视频流。
 	info.DurationSec = parseSeconds(p.Format.Duration)

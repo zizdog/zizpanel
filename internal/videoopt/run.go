@@ -64,6 +64,11 @@ type TranscodeRequest struct {
 	// AudioKbps<=0 表示产物不要音轨（-an）。
 	AudioKbps   int
 	DurationSec float64
+	// TextSubtitleIndexes 是要在产物里保留的**文本字幕**序号（-map 0:s:N）。
+	// 不传就等于不要字幕；图形字幕永远不在这里（mp4 放不下）。
+	TextSubtitleIndexes []int
+	// AudioStreams 是源片音轨条数：产物写完要**回读核对**，一条少了就判定失败（坑 239）。
+	AudioStreams int
 	// Encoder 是 EncoderHardware / EncoderCPU；Mode 是 ModeBitrate / ModeQuality。
 	Encoder string
 	Mode    string
@@ -157,10 +162,26 @@ func TranscodeArgs(req TranscodeRequest, pass int) []string {
 			"-progress", "pipe:1", "-nostats", os.DevNull)
 		return args
 	}
+	// 流映射（坑 239）：**必须显式写 -map**。不写时 ffmpeg 按默认规则只挑"最好的一条"
+	// 视频/音频/字幕 —— 多音轨影片（国语/粤语/英语…）会被**静默砍到只剩第一条**，
+	// 用户 2026-10-06 报障"转码把我的电影文件的多余音轨都删掉了"就是这么来的。
+	// 口径：第一条视频 + **全部音轨** + 全部**文本**字幕；图形字幕（PGS/DVD）mp4 放不下，
+	// 由面板在计划里如实说明（绝不静默丢）。
+	args = append(args, "-map", "0:v:0")
+	if req.AudioKbps > 0 {
+		args = append(args, "-map", "0:a")
+	}
+	for _, idx := range req.TextSubtitleIndexes {
+		args = append(args, "-map", fmt.Sprintf("0:s:%d", idx))
+	}
 	if req.AudioKbps > 0 {
 		args = append(args, "-c:a", "aac", "-b:a", fmt.Sprintf("%dk", req.AudioKbps))
 	} else {
 		args = append(args, "-an")
+	}
+	if len(req.TextSubtitleIndexes) > 0 {
+		// mp4 只认 mov_text（文本）；图形字幕根本不会走到这里。
+		args = append(args, "-c:s", "mov_text")
 	}
 	// -f mp4 是必须的：半成品文件名是 .part.mp4 之外的形态也无所谓，
 	// 但显式指定容器才不会因为临时名后缀而让 ffmpeg 猜错封装。
@@ -961,8 +982,10 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			Src: row.Path, Dst: part,
 			Width: row.TargetWidth, Height: row.TargetHeight,
 			VideoKbps: row.VideoKbps, AudioKbps: row.AudioKbps,
-			DurationSec: row.DurationSec,
-			Encoder:     row.Encoder, Mode: row.Mode, Quality: row.Quality,
+			DurationSec:         row.DurationSec,
+			TextSubtitleIndexes: row.TextSubtitleIndexes,
+			AudioStreams:        row.AudioStreams,
+			Encoder:             row.Encoder, Mode: row.Mode, Quality: row.Quality,
 			TwoPass: row.TwoPass, PassLog: passLog,
 			Fast: row.FastPipeline, SourceFPS: row.SourceFPS, SrcBitDepth: row.SourceBitDepth,
 		}
@@ -1048,6 +1071,35 @@ func RunPlan(ctx context.Context, outDir string, rows []Plan, runner Runner, hoo
 			hooks.log(tasks.LevelWarn, fmt.Sprintf("↷ %s：压不小，已跳过（%s ≥ 原 %s）",
 				row.DisplayName(), humanBytes(afterBytes), humanBytes(srcBytes)))
 			continue
+		}
+
+		// 回读核对（坑 239）：产物必须**一条音轨不少**、文本字幕不少于源片。
+		// 这是"能静默丢数据"的那一类缺陷，只靠 argv 断言不够 —— 必须在真产物上复核。
+		if row.AudioKbps > 0 && row.AudioStreams > 0 {
+			if got, gerr := runner.Probe(ctx, part); gerr != nil {
+				_ = os.Remove(part)
+				item.Error = "回读产物失败（无法确认音轨没丢，拒绝写出）：" + gerr.Error()
+				res.Failed++
+				res.Items = append(res.Items, item)
+				hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+item.Error)
+				continue
+			} else if got.AudioStreams < row.AudioStreams {
+				_ = os.Remove(part)
+				item.Error = fmt.Sprintf("产物音轨只剩 %d 条（源片 %d 条），拒绝写出以免丢音轨",
+					got.AudioStreams, row.AudioStreams)
+				res.Failed++
+				res.Items = append(res.Items, item)
+				hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+item.Error)
+				continue
+			} else if row.TextSubtitles > 0 && len(got.TextSubtitleIndexes) < row.TextSubtitles {
+				_ = os.Remove(part)
+				item.Error = fmt.Sprintf("产物字幕只剩 %d 条（源片 %d 条文本字幕），拒绝写出以免丢字幕",
+					len(got.TextSubtitleIndexes), row.TextSubtitles)
+				res.Failed++
+				res.Items = append(res.Items, item)
+				hooks.log(tasks.LevelErr, "✗ "+row.DisplayName()+"："+item.Error)
+				continue
+			}
 		}
 
 		if err := os.Rename(part, row.OutPath); err != nil {

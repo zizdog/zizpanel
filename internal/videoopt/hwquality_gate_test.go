@@ -80,6 +80,7 @@ func TestHWQualityArgvHasCapGate(t *testing.T) {
 		"-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-prio_speed", "1", "-pix_fmt", "yuv420p",
 		"-q:v", "45", "-maxrate", "3000k", "-bufsize", "6000k",
 		"-vf", "scale=1920:1080",
+		"-map", "0:v:0", "-map", "0:a",
 		"-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-f", "mp4",
 		"-progress", "pipe:1", "-nostats", "-loglevel", "error", "out.mp4",
 	}, " ")
@@ -201,6 +202,7 @@ func TestCPUQualityArgvUnchangedGate(t *testing.T) {
 		"-hide_banner", "-nostdin", "-y", "-i", "in.mp4",
 		"-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main", "-pix_fmt", "yuv420p",
 		"-crf", "26", "-maxrate", "800k", "-bufsize", "1600k", "-vf", "scale=854:480",
+		"-map", "0:v:0", "-map", "0:a",
 		"-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-f", "mp4",
 		"-progress", "pipe:1", "-nostats", "-loglevel", "error", "out.mp4",
 	}, " ")

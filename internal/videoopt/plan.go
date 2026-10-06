@@ -489,6 +489,13 @@ type MediaInfo struct {
 	FPS float64 `json:"fps,omitempty"`
 	// BitDepth 是源位深（8/10；从 pix_fmt 判）；0 = 认不出（走不依赖位深的软解路）。
 	BitDepth int `json:"bit_depth,omitempty"`
+	// AudioStreams 是音频流条数：产物必须**一条不少**（坑 239 —— 不写 -map 时 ffmpeg
+	// 只挑一条，多音轨影片会被静默砍掉）。
+	AudioStreams int `json:"audio_streams,omitempty"`
+	// TextSubtitleIndexes 是**文本字幕**在"字幕流内"的序号（`-map 0:s:N` 的 N）；
+	// BitmapSubtitles 是图形字幕条数（PGS/DVD 这类 mp4 放不下，跳过但必须告知）。
+	TextSubtitleIndexes []int `json:"text_subtitle_indexes,omitempty"`
+	BitmapSubtitles     int   `json:"bitmap_subtitles,omitempty"`
 }
 
 // Plan 是一个视频文件的压缩计划（同时是 /video-plan 的一行）。
@@ -528,9 +535,17 @@ type Plan struct {
 	// "res"（按源分辨率的档位下限）。面板把依据写进 title，不占主句。
 	SuggestedFrom string `json:"suggested_from,omitempty"`
 	// AudioKbps 为 0 且 AudioDisabled 为 true 表示产物不带音轨（-an）。
-	AudioKbps     int   `json:"audio_kbps"`
-	AudioDisabled bool  `json:"audio_disabled"`
-	EstBytes      int64 `json:"est_bytes"`
+	AudioKbps     int  `json:"audio_kbps"`
+	AudioDisabled bool `json:"audio_disabled"`
+	// AudioStreams 是源片音轨条数；>1 时面板明确写"全部保留"（坑 239）。
+	AudioStreams int `json:"audio_streams,omitempty"`
+	// TextSubtitles 是会转成 mov_text 保留的文本字幕条数；
+	// BitmapSubtitles 是 mp4 放不下、被跳过的图形字幕条数（如实告知，不静默丢）。
+	TextSubtitles   int `json:"text_subtitles,omitempty"`
+	BitmapSubtitles int `json:"bitmap_subtitles,omitempty"`
+	// TextSubtitleIndexes 只给执行器用（-map 0:s:N），不下发给前端。
+	TextSubtitleIndexes []int `json:"-"`
+	EstBytes            int64 `json:"est_bytes"`
 	// Capped 表示"因原视频码率低而封顶"，这类文件**封顶即跳过**（不再转码）。
 	Capped bool   `json:"capped"`
 	Note   string `json:"note,omitempty"`
@@ -1054,6 +1069,11 @@ func PlanOne(name, srcPath, outDir string, info MediaInfo, opts Options, outExis
 		SrcFPS:           info.FPS,
 		SrcBitDepth:      info.BitDepth,
 		SrcBitrateKbps:   info.VideoKbps,
+		// 流映射的输入（坑 239）：产物要保留**全部音轨**与全部文本字幕。
+		AudioStreams:        info.AudioStreams,
+		TextSubtitles:       len(info.TextSubtitleIndexes),
+		BitmapSubtitles:     info.BitmapSubtitles,
+		TextSubtitleIndexes: info.TextSubtitleIndexes,
 	}
 	if outDir != "" {
 		p.OutPath = filepath.Join(outDir, p.OutName)
