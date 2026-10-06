@@ -3236,14 +3236,9 @@ setup_screenshare_choice() {
 screenshare_screen_recording_hint() {
   local console_user=""
   console_user="$(console_login_user)"
+  # 刻意**不**打开任何界面：安装器的既有承诺是"安装界面不弹任何窗口"（2026-09-17 用户要求）。
   info "提示：若远程桌面画面全黑，到 系统设置 → 通用 → 共享 把「屏幕共享」关一次再开（补「屏幕录制」授权）"
-  case "$console_user" in
-    ""|root|loginwindow) return 0 ;;
-  esac
-  if [ "$console_user" = "${REAL_USER:-}" ]; then
-    sudo -u "$console_user" open "x-apple.systempreferences:com.apple.Sharing-Settings.extension" >/dev/null 2>&1 \
-      || warn "（没能自动打开系统设置，请手工打开：系统设置 → 通用 → 共享）"
-  fi
+  info "（面板侧栏「远程桌面」页上有同样的提示；这一步只能在图形界面里点。）"
   return 0
 }
 
