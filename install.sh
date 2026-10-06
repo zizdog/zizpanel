@@ -3214,8 +3214,13 @@ full_disk_manual_steps() {
 notice_full_disk_local() {
   printf '\n  %s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$C_BOLD" "$C_RESET"
   if [ "${ZP_FULL_DISK_ACK:-0}" = "1" ]; then
-    printf '  %s⚠ 屏幕上应弹出「完全磁盘访问权限」请求 → 请点『允许』%s\n' "$C_BOLD" "$C_RESET"
-    printf '\n  没弹出来？按这个路径手动加上（30 秒）：\n'
+    # 🚨 2026-10-06 真机实测：macOS 对「完全磁盘访问权限」**不弹窗**。面板去读受保护
+    # 目录时系统是**静默拒绝**，并把 zizpanel 加进列表、开关默认关 —— 只能手动打开。
+    # 原文案写"屏幕上应弹出…请点允许"是错的（用户按它等弹窗，等不到）。
+    printf '  %s⚠ 这一项 macOS 不会弹窗，要你手动打开开关%s\n' "$C_BOLD" "$C_RESET"
+    printf '\n  面板已经在列表里了（安装时申请过一次），打开它即可：\n'
+    printf '    系统设置 → 隐私与安全性 → 完全磁盘访问权限 → 打开 %szizpanel%s 的开关\n' "$C_BOLD" "$C_RESET"
+    printf '  列表里没有它？按这个路径手动加上（30 秒）：\n'
     full_disk_manual_steps
   else
     printf '  %s⚠ 完全磁盘访问权限还没授权%s\n' "$C_BOLD" "$C_RESET"
@@ -3266,9 +3271,10 @@ setup_full_disk_auth_notice() {
       return 0 ;;
   esac
 
-  warn "安装收尾会向系统申请一次「完全磁盘访问权限」（面板要读桌面/文稿/下载）。"
-  info "请**留在这台机器前**：弹出请求时点「允许」，授权就做完了（只需这一次）。"
-  if zp_yes "确认现在申请完全磁盘访问授权（接下来你要在屏幕上点「允许」）？" "y"; then
+  warn "安装收尾会替你申请一次「完全磁盘访问权限」（面板要读桌面/文稿/下载）。"
+  info "注意：这一项 **macOS 不弹窗** —— 面板会被加进「完全磁盘访问权限」列表、开关默认关，"
+  info "装完你到 系统设置 → 隐私与安全性 → 完全磁盘访问权限 把 zizpanel 的开关打开即可（只需这一次）。"
+  if zp_yes "确认现在申请完全磁盘访问授权（装完去系统设置里打开开关）？" "y"; then
     ZP_FULL_DISK_ACK=1
   else
     ZP_FULL_DISK_ACK=0
@@ -3305,7 +3311,8 @@ request_full_disk_auth() {
   if printf '1\n' > "$marker" 2>/dev/null; then
     chmod 600 "$marker" 2>/dev/null || true
     ok "已记录一次性完全磁盘访问授权请求（${marker}）"
-    info "面板启动后会替你申请一次：屏幕上弹出「完全磁盘访问权限」请求时点「允许」。"
+    info "面板启动后会替你申请一次：它会被加进「完全磁盘访问权限」列表（macOS 不弹窗，"
+    info "装完到 系统设置 → 隐私与安全性 → 完全磁盘访问权限 把 zizpanel 的开关打开）。"
   else
     warn "写授权请求失败：${marker}（请稍后按安装完成时给的手动路径授权）"
   fi

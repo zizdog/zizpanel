@@ -76,8 +76,11 @@ func RequestFullDiskAuthorizationOnce(ctx context.Context, markerPath, home, con
 		return res
 	}
 
-	// ② 真的去读一次 —— 这一步才会让 macOS 弹出「完全磁盘访问权限」询问。
-	log("按安装时的同意，向系统申请完全磁盘访问（屏幕上可能弹出授权询问，请点「允许」）")
+	// ② 真的去读一次 —— 🚨 2026-10-06 真机实测：**macOS 对「完全磁盘访问权限」不弹窗**。
+	// 这一步的实际效果是：系统静默拒绝，并把面板加进「完全磁盘访问权限」列表（开关默认关）
+	// —— 用户要做的只是到系统设置把那个开关打开。原文案写"会弹出询问"是错的（坑 240）。
+	log("按安装时的同意，向系统申请完全磁盘访问（macOS 对这项不弹窗：面板会被加进" +
+		"系统设置的「完全磁盘访问权限」列表，把 zizpanel 的开关打开即可）")
 	deadline := time.Now().Add(wait)
 	for {
 		counts := fullDiskProbeFn(ctx, targets)
@@ -93,7 +96,7 @@ func RequestFullDiskAuthorizationOnce(ctx context.Context, markerPath, home, con
 		if res.Denied == 0 || wait <= 0 || !time.Now().Before(deadline) || ctx.Err() != nil {
 			break
 		}
-		log("受保护目录仍被拒（授权询问应已弹出），等待用户点「允许」…")
+		log("受保护目录仍被拒（完全磁盘访问权限还没开：到系统设置里打开 zizpanel 开关），继续等…")
 		select {
 		case <-ctx.Done():
 		case <-time.After(time.Second):

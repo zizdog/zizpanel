@@ -161,6 +161,12 @@ func (s *Server) permissionItems(ctx context.Context, r *http.Request, consoleUs
 	items := make([]permissions.Item, 0, 3)
 
 	st, hint, at, res := permItemStatus(h, permissions.ItemFullDisk, consoleUser, fda)
+	// 🚨 macOS 对「完全磁盘访问权限」**不弹窗**（2026-10-06 真机实测：系统静默拒绝，
+	// 只把面板加进列表、开关默认关）。所以没授权时必须直接告诉用户"去把开关打开"，
+	// 而不是让他等一个永远不会出现的弹窗。
+	if st != permissions.StatusGranted {
+		hint = "这项 macOS 不弹窗：去系统设置把 zizpanel 开关打开"
+	}
 	items = append(items, permissions.Item{
 		ID: permissions.ItemFullDisk, Title: "完全磁盘访问权限",
 		Why:    "让面板能读桌面、文稿、下载等受保护目录",
