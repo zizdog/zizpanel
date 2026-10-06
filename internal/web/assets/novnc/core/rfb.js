@@ -1194,27 +1194,27 @@ export default class RFB extends EventTargetMixin {
 
         // Generate a mouse wheel step event when the accumulated delta
         // for one of the axes is large enough.
-        if (Math.abs(this._accumulatedWheelDeltaX) >= WHEEL_STEP) {
-            if (this._accumulatedWheelDeltaX < 0) {
-                this._handleMouseButton(pos.x, pos.y, true, 1 << 5);
-                this._handleMouseButton(pos.x, pos.y, false, 1 << 5);
-            } else if (this._accumulatedWheelDeltaX > 0) {
-                this._handleMouseButton(pos.x, pos.y, true, 1 << 6);
-                this._handleMouseButton(pos.x, pos.y, false, 1 << 6);
+        //
+        // ⚠️ ZizPanel 本地修改（2026-10-06，见 PROVENANCE.md）：上游发一格就把累积量**清零**，
+        // 余数被丢掉 —— 触控板一次滑动会送来几十个小 delta，等于每 50px 才滚一格、多出来的位移
+        // 白扔，真机手感是"滚半天不动"（用户报障）。这里改成"该发几格发几格、余数留着"。
+        let stepsX = Math.trunc(Math.abs(this._accumulatedWheelDeltaX) / WHEEL_STEP);
+        if (stepsX > 0) {
+            const maskX = this._accumulatedWheelDeltaX < 0 ? (1 << 5) : (1 << 6);
+            for (let i = 0; i < stepsX; i++) {
+                this._handleMouseButton(pos.x, pos.y, true, maskX);
+                this._handleMouseButton(pos.x, pos.y, false, maskX);
             }
-
-            this._accumulatedWheelDeltaX = 0;
+            this._accumulatedWheelDeltaX -= Math.sign(this._accumulatedWheelDeltaX) * stepsX * WHEEL_STEP;
         }
-        if (Math.abs(this._accumulatedWheelDeltaY) >= WHEEL_STEP) {
-            if (this._accumulatedWheelDeltaY < 0) {
-                this._handleMouseButton(pos.x, pos.y, true, 1 << 3);
-                this._handleMouseButton(pos.x, pos.y, false, 1 << 3);
-            } else if (this._accumulatedWheelDeltaY > 0) {
-                this._handleMouseButton(pos.x, pos.y, true, 1 << 4);
-                this._handleMouseButton(pos.x, pos.y, false, 1 << 4);
+        let stepsY = Math.trunc(Math.abs(this._accumulatedWheelDeltaY) / WHEEL_STEP);
+        if (stepsY > 0) {
+            const maskY = this._accumulatedWheelDeltaY < 0 ? (1 << 3) : (1 << 4);
+            for (let i = 0; i < stepsY; i++) {
+                this._handleMouseButton(pos.x, pos.y, true, maskY);
+                this._handleMouseButton(pos.x, pos.y, false, maskY);
             }
-
-            this._accumulatedWheelDeltaY = 0;
+            this._accumulatedWheelDeltaY -= Math.sign(this._accumulatedWheelDeltaY) * stepsY * WHEEL_STEP;
         }
     }
 

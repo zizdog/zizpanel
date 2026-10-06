@@ -1,8 +1,12 @@
 # noVNC（面板内嵌的网页远程桌面客户端）
 
 - 上游：**noVNC v1.5.0**，MPL-2.0（见同目录 `LICENSE.txt`），https://github.com/novnc/noVNC
-- 本目录 = 上游发布包 `v1.5.0.tar.gz`（sha256 见下）里的 `core/` 与 `vendor/pako/`，
-  **一个字节都没有改**；`LICENSE.txt` 是上游仓库的同名文件。
+- 本目录 = 上游发布包 `v1.5.0.tar.gz`（sha256 见下）里的 `core/` 与 `vendor/pako/`；
+  `LICENSE.txt` 是上游仓库的同名文件。
+- ⚠️ **本地修改（唯一一处，必须记录）**：`core/rfb.js` 的滚轮累积逻辑（`_handleWheel`）。
+  上游发一格就把累积量清零、余数丢掉 ⇒ 触控板一次滑动（几十个小 delta）等于"每 50px 才滚一格"，
+  真机手感"滚半天不动"（用户 2026-10-06 报障）。本地改成 **该发几格发几格 + 余数保留**，
+  不再丢输入。升级上游时**必须重打这个补丁**（diff 位置：`const stepsX/stepsY` 那两段）。
   发布包 sha256：`6a73e41f98388a5348b7902f54b02d177cb73b7e5eb0a7a0dcf688cc2c79b42a`
   （2026-10-06 本机 `curl -L https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz` 后
   `shasum -a 256` 实算）
