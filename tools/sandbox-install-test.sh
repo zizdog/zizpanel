@@ -701,6 +701,35 @@ else
   fail "--purge 未映射到模式 3（$SANDBOX/uninstall-purge.log）"
 fi
 
+# 坑 238 门禁：**面板托管的服务**（守护进程就是面板二进制）必须随面板一起卸载 ——
+# 模式 1 也要。造两个作业：一个 supervised（ProgramArguments 指向面板二进制），
+# 一个 decoy（指向别的程序，只是登记表里的一条记录）—— decoy 绝不许被误删。
+SUP_PLIST="$ZIZPANEL_PLIST_DIR/com.zizdog.aria2.plist"
+DECOY_PLIST="$ZIZPANEL_PLIST_DIR/com.zizdog.decoy.plist"
+cat > "$SUP_PLIST" <<SUPEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.zizdog.aria2</string>
+  <key>ProgramArguments</key><array>
+    <string>$SANDBOX/root/bin/zizpanel</string>
+    <string>aria2-supervise</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+SUPEOF
+cat > "$DECOY_PLIST" <<DECOYEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.zizdog.decoy</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>
+</dict></plist>
+DECOYEOF
+sqlite3 "$UNINST_DB" "INSERT INTO services (name,display_name,kind,category,managed,launch_label,plist_path,work_dir,compose_file,container) VALUES
+  ('com-zizdog-aria2','aria2（下载器）','native','tool',0,'com.zizdog.aria2','$SUP_PLIST','','',''),
+  ('com-zizdog-decoy','某个自建服务','native','tool',0,'com.zizdog.decoy','$DECOY_PLIST','','','');" 2>/dev/null || true
+
 if env "${UNINST_ENV[@]}" bash "$SANDBOX/root/uninstall.sh" --mode 1 --yes > "$SANDBOX/uninstall.log" 2>&1; then
   pass "卸载脚本（模式 1）退出码 0"
 else
@@ -711,6 +740,14 @@ fi
 [ ! -f "$ZIZPANEL_SUDOERS_DIR/zizpanel" ] && pass "sudoers 规则已移除" || fail "sudoers 未移除"
 [ ! -f "$SANDBOX/root/bin/zizpanel" ] && pass "程序已移除" || fail "程序未移除"
 [ -f "$SANDBOX/root/data/config.json" ] && pass "数据按预期保留（卸载不删数据）" || fail "数据被意外删除"
+# ↓ 坑 238：模式 1 也必须把"守护进程是面板二进制"的作业停掉并摘掉
+[ ! -f "$SUP_PLIST" ] && pass "面板托管的服务作业已随面板摘掉（模式 1，坑 238）" \
+  || fail "面板托管的服务作业还在：${SUP_PLIST}（坑 238 复发）"
+grep -q "面板托管的服务会随面板一起卸载" "$SANDBOX/uninstall.log" \
+  && pass "动手前明确提醒了哪些服务随面板走" || fail "没有提醒面板托管服务会被卸载"
+# 负向对照：只说"登记表里有记录"但守护进程不是面板二进制的，模式 1 **不许**动它
+[ -f "$DECOY_PLIST" ] && pass "非面板托管的记录未被误删（模式 1）" \
+  || fail "误删了非面板托管的作业：${DECOY_PLIST}"
 
 step "彻底卸载（模式 3）"
 # 重新安装一次再跑模式 3。

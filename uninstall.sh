@@ -9,7 +9,9 @@
 #
 #  三档（交互菜单里选）：
 #    1 仅卸载面板      删程序 / LaunchDaemon / sudoers / CLI 入口 / 证书信任；
-#                      保留面板数据（配置·数据库·证书·备份）与全部运行环境
+#                      **面板托管的服务**（守护进程就是面板二进制的那些：zizvideo/aria2/
+#                      transmission/jellyfin…）也一并停掉+卸掉（面板没了它们起不来，坑 238）；
+#                      保留面板数据（配置·数据库·证书·备份）、LNMP 环境与用户数据
 #    2 面板 + LNMP     再卸 nginx / 各版本 PHP(-FPM) / MySQL / MariaDB 及其配置；
 #                      保留 ~/www（绝不删）与数据库数据目录（结尾会告知位置）
 #    3 面板 + 所有环境 再卸面板登记表里"由面板装过"的全部软件，并删所有配置数据
@@ -391,12 +393,51 @@ detect_lnmp_formulas() {
 # 因为"用户自己 brew install 的"与"面板装的"在 brew 里长得一模一样。
 REG_NAME=(); REG_DISPLAY=(); REG_KIND=(); REG_LABEL=(); REG_PLIST=()
 REG_WORKDIR=(); REG_COMPOSE=(); REG_CONTAINER=(); REG_FORMULA=(); REG_ACT=()
+# REG_SUPERVISED=1：这个作业的**守护进程就是面板二进制**（zizvideo/aria2/transmission/jellyfin…）。
+# 这类服务是"面板的一部分"：面板一卸，它们再也不可能被拉起（程序都没了）⇒ **所有模式**都要
+# 停掉 + 摘掉作业定义 + 卸掉程序（数据仍按模式区分：1/2 保留，3 删）。坑 238。
+REG_SUPERVISED=()
 REG_WHY=""
+
+# plist_is_panel_supervised：判据贴在**运行体**上 —— 直接读 plist 内容看它的守护进程是不是
+# 面板二进制，而不是维护一份"哪些标签是面板应用"的白名单。
+#
+# 为什么不再信白名单（2026-10-06 真机事故）：`PANEL_APP_LABELS` 是手抄的，早就漂了 ——
+# aria2 / transmission / jellyfin / zizvideo 都不在里面，而 `services.managed` 实测**永远是 0**，
+# 于是模式 3 把它们整个跳过（act=0）：卸载完面板，4 个守护进程还在跑（跑的是已被删掉的
+# /opt/zizpanel/bin/zizpanel，内存副本）、plist 也还留在系统里，重启后必然起不来。
+plist_is_panel_supervised() {
+  [ -n "$1" ] && [ -f "$1" ] || return 1
+  local out=""
+  out="$(plutil -p "$1" 2>/dev/null)" || return 1
+  # ⚠️ 不许写成 `plutil … | grep -qF …`：脚本顶部是 `set -uo pipefail`，grep -q 命中就退出，
+  # plutil 吃到 SIGPIPE ⇒ 整条管道返回非 0 —— 同一个文件两次调用可能一次命中一次"没命中"
+  # （2026-10-06 实测竞态，本门禁就是被它害得忽红忽绿）。
+  case "$out" in *"$PANEL_ROOT/bin/zizpanel"*) return 0 ;; esac
+  return 1
+}
+
+# 扫描系统里所有"守护进程是面板二进制"的作业（不依赖登记表：登记表读不到时也要能清干净）。
+SUPERVISED_LABELS=(); SUPERVISED_PLISTS=()
+collect_supervised_services() {
+  SUPERVISED_LABELS=(); SUPERVISED_PLISTS=()
+  local f l
+  for f in "$PLIST_DIR"/*.plist "$REAL_HOME"/Library/LaunchAgents/*.plist; do
+    [ -f "$f" ] || continue
+    case "$f" in *"/$PANEL_LABEL.plist"|*"/cn.zizpanel.upgrade-watchdog.plist") continue ;; esac
+    plist_is_panel_supervised "$f" || continue
+    l="$(plutil -p "$f" 2>/dev/null | awk -F'"' '/"Label" *=>/{print $4; exit}')"
+    [ -n "$l" ] || l="$(basename "$f" .plist)"
+    list_contains "$l" ${SUPERVISED_LABELS[@]+"${SUPERVISED_LABELS[@]}"} && continue
+    SUPERVISED_LABELS+=("$l"); SUPERVISED_PLISTS+=("$f")
+  done
+}
 
 registry_collect() {
   REG_WHY=""
   REG_NAME=(); REG_DISPLAY=(); REG_KIND=(); REG_LABEL=(); REG_PLIST=()
   REG_WORKDIR=(); REG_COMPOSE=(); REG_CONTAINER=(); REG_FORMULA=(); REG_ACT=()
+  REG_SUPERVISED=()
   if ! command -v sqlite3 >/dev/null 2>&1; then
     REG_WHY="系统里找不到 sqlite3，无法读取面板登记表"
     return 1
@@ -432,9 +473,17 @@ registry_collect() {
     if [ "$act" = "1" ] && [ -z "$formula" ]; then
       formula="$(engine_formula_for_label "$l")"
     fi
+    # 守护进程就是面板二进制 ⇒ 无论登记表的 managed/白名单怎么说，它都是"面板的一部分"。
+    local sup=0
+    if plist_is_panel_supervised "$pl" \
+       || plist_is_panel_supervised "$PLIST_DIR/$l.plist" \
+       || plist_is_panel_supervised "$REAL_HOME/Library/LaunchAgents/$l.plist"; then
+      sup=1; act=1
+    fi
     REG_NAME+=("$n"); REG_DISPLAY+=("$d"); REG_KIND+=("$k"); REG_LABEL+=("$l")
     REG_PLIST+=("$pl"); REG_WORKDIR+=("$w"); REG_COMPOSE+=("$cf")
     REG_CONTAINER+=("$ct"); REG_FORMULA+=("$formula"); REG_ACT+=("$act")
+    REG_SUPERVISED+=("$sup")
   done < <(sqlite3 -readonly -separator "$sep" "$DB_FILE" \
     "SELECT 'ZPEND',name,display_name,kind,category,managed,launch_label,plist_path,work_dir,compose_file,container FROM services;" 2>/dev/null)
   return 0
@@ -541,11 +590,56 @@ colima_data_paths() {
   done
 }
 
+# plan_supervised_apps：面板托管的服务（守护进程就是面板二进制）随面板一起卸载。
+#
+# 为什么所有模式都要做（用户 2026-10-06 的明确要求）：zizvideo / aria2 / transmission /
+# jellyfin 这些"和面板共用权限"的服务，本质是面板的一部分 —— 面板一卸，它们既没有守护进程
+# 也没有程序，留着只会在重启后起不来（模式 2/3 连 /opt/zizpanel 都删了）。所以：
+#   停服务 → 摘掉作业定义 → 卸掉程序；**数据保留**（模式 3 才连数据一起删）。
+# 名单来自两处：登记表里 supervised=1 的行 + 直接扫 plist（登记表读不到时也要能清）。
+plan_supervised_apps() {
+  collect_supervised_services
+  local i=0 n=${#SUPERVISED_LABELS[@]}
+  while [ "$i" -lt "$n" ]; do
+    plan_stop "${SUPERVISED_LABELS[$i]}"
+    [ -e "${SUPERVISED_PLISTS[$i]}" ] && plan_delete "${SUPERVISED_PLISTS[$i]}"
+    i=$((i + 1))
+  done
+  # 登记表里那些 supervised=1 的：连程序一起卸（公式/引擎），并声明数据保留。
+  i=0
+  while [ "$i" -lt "${#REG_NAME[@]}" ]; do
+    if [ "${REG_SUPERVISED[$i]}" = "1" ]; then
+      plan_uninstall "${REG_DISPLAY[$i]}（面板托管，随面板卸载）"
+      [ -n "${REG_FORMULA[$i]}" ] && plan_uninstall "${REG_FORMULA[$i]}（brew formula）"
+      plan_keep "数据保留：${REG_DISPLAY[$i]}（配置/下载/媒体；模式 3 才删）"
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# notice_supervised_apps：动手前把"哪些东西随面板一起走"明确说一遍（用户要求"卸载时提醒用户"）。
+# 自己先扫一遍（describe_mode 在 build_plan 之前跑，不能指望那时的数组已填好）。
+notice_supervised_apps() {
+  collect_supervised_services
+  local n=${#SUPERVISED_LABELS[@]} i=0
+  [ "$n" -gt 0 ] || return 0
+  say ""
+  printf '  %s⚠ %s 个面板托管的服务会随面板一起卸载%s（它们的守护进程就是面板二进制，留着也起不来）：\n' \
+    "$C_BOLD" "$n" "$C_RESET"
+  while [ "$i" -lt "$n" ]; do
+    printf '    · %s\n' "${SUPERVISED_LABELS[$i]}"
+    i=$((i + 1))
+  done
+  say "  它们的**数据**不动（下载/媒体/配置都留着）；要连数据一起删请用模式 3。"
+}
+
 build_plan_mode1() {
   collect_panel_program_paths
   collect_panel_labels
+  plan_supervised_apps
   plan_keep "面板数据（配置/数据库/证书/备份）：${PANEL_ROOT}/data"
-  plan_keep "全部运行环境（nginx / PHP / MySQL / MariaDB、Homebrew）"
+  plan_keep "LNMP 运行环境（nginx / PHP / MySQL / MariaDB）、Homebrew 与你自己装的软件"
   plan_keep "站点文件：${REAL_HOME}/www（绝不删）"
 }
 
@@ -553,6 +647,7 @@ build_plan_mode2() {
   detect_lnmp_formulas
   collect_panel_program_paths
   collect_panel_labels
+  plan_supervised_apps
   plan_lnmp
   plan_keep "站点文件：${REAL_HOME}/www（绝不删）"
   local p
@@ -566,6 +661,7 @@ build_plan_mode3() {
   detect_lnmp_formulas
   collect_panel_program_paths
   collect_panel_labels
+  plan_supervised_apps
   plan_lnmp
   local i=0 label formula wd cf
   while [ "$i" -lt "${#REG_NAME[@]}" ]; do
@@ -686,20 +782,41 @@ brew_services_stop_from_plan() {
 uninstall_formulas_from_plan() {
   title "卸载软件"
   local f i=0
-  for f in ${LNMP_DETECTED[@]+"${LNMP_DETECTED[@]}"}; do brew_uninstall_formula "$f"; done
+  # LNMP 只在模式 2/3 卸；模式 1 明确保留运行环境。
+  if [ "$MODE" != "1" ]; then
+    for f in ${LNMP_DETECTED[@]+"${LNMP_DETECTED[@]}"}; do brew_uninstall_formula "$f"; done
+  fi
   while [ "$i" -lt "${#REG_NAME[@]}" ]; do
     if [ "${REG_ACT[$i]}" = "1" ] && [ -n "${REG_FORMULA[$i]}" ]; then
-      brew_uninstall_formula "${REG_FORMULA[$i]}"
+      # 模式 1 只动"面板托管"的那些（它们的守护进程就是面板二进制）；其它面板装过的软件
+      # 属于运行环境，模式 1 保留（用户要连它们一起清就走模式 2/3）。
+      if [ "$MODE" != "1" ] || [ "${REG_SUPERVISED[$i]}" = "1" ]; then
+        brew_uninstall_formula "${REG_FORMULA[$i]}"
+      fi
     fi
     i=$((i + 1))
   done
+}
+
+# 面板托管的应用清单（供汇总点名）：所有模式都要说清楚"哪些随面板走了"。
+supervised_displays() {
+  local i=0 out=""
+  while [ "$i" -lt "${#REG_NAME[@]}" ]; do
+    if [ "${REG_SUPERVISED[$i]}" = "1" ]; then
+      out="${out}${REG_DISPLAY[$i]}（登记表 ${REG_NAME[$i]}）
+"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
 }
 
 uninstall_registry_apps() { # 结尾汇总要点名"面板装过的应用"（真正的删除动作在别处已做）
   [ "$DRY" = "1" ] && return 0
   local i=0
   while [ "$i" -lt "${#REG_NAME[@]}" ]; do
-    if [ "${REG_ACT[$i]}" = "1" ]; then
+    # 模式 3 点名全部"面板装过的"；模式 1/2 只点名随面板一起卸的面板托管应用。
+    if [ "${REG_ACT[$i]}" = "1" ] && { [ "$MODE" = "3" ] || [ "${REG_SUPERVISED[$i]}" = "1" ]; }; then
       record_uninstalled "${REG_DISPLAY[$i]}（登记表 ${REG_NAME[$i]}）"
     fi
     i=$((i + 1))
@@ -865,12 +982,8 @@ execute_plan() {
   fi
   remove_firewall_entry
   remove_codesign_trust
-  if [ "$MODE" != "1" ]; then
-    uninstall_formulas_from_plan
-  fi
-  if [ "$MODE" = "3" ]; then
-    uninstall_registry_apps
-  fi
+  uninstall_formulas_from_plan
+  uninstall_registry_apps
   delete_paths_from_plan
   if [ "$MODE" = "3" ]; then
     remove_panel_root
@@ -947,7 +1060,9 @@ usage() {
   cat <<'EOF'
 用法：sudo bash uninstall.sh [1|2|3] [--mode 1|2|3] [--yes] [--dry-run] [--purge-backups]
 
-  1  仅卸载面板         保留面板数据（配置/数据库/证书/备份）与全部运行环境
+  1  仅卸载面板         保留面板数据与 LNMP 运行环境；
+                       面板托管的服务（守护进程就是面板二进制：zizvideo/aria2/transmission/
+                       jellyfin 等）随面板一起卸载，用户数据保留
   2  卸载面板及 LNMP    再卸 nginx / PHP(-FPM) / MySQL / MariaDB 及其配置；
                        保留 ~/www 与数据库数据目录（结尾会告知位置）
   3  卸载面板及所有环境 再卸面板登记表里由面板装过的所有软件，并删所有配置数据
@@ -990,7 +1105,7 @@ choose_mode() {
     exit 1
   fi
   printf '\n  请选择要做什么：\n\n'
-  printf '    %s1%s  仅卸载面板             保留面板数据与全部运行环境\n' "$C_BOLD" "$C_RESET"
+  printf '    %s1%s  仅卸载面板             保留数据与 LNMP；面板托管的服务随面板一起卸\n' "$C_BOLD" "$C_RESET"
   printf '    %s2%s  卸载面板及 LNMP        保留 ~/www 与数据库数据\n' "$C_BOLD" "$C_RESET"
   printf '    %s3%s  卸载面板及所有环境     删面板数据、数据库数据与面板装过的软件（不可逆）\n' "$C_BOLD" "$C_RESET"
   printf '    %s0%s  退出\n\n' "$C_BOLD" "$C_RESET"
@@ -1025,7 +1140,8 @@ describe_mode() {
       MODE_DESC="仅卸载面板"
       title "模式 1：仅卸载面板"
       say "  会删除：面板程序、LaunchDaemon、sudoers 规则、CLI 入口、证书信任"
-      say "  会保留：面板数据（${PANEL_ROOT}/data）与全部运行环境（nginx/PHP/MySQL/MariaDB）"
+      say "  会删除：面板托管的服务（守护进程就是面板二进制，见下面的清单）"
+      say "  会保留：面板数据（${PANEL_ROOT}/data）与 LNMP 运行环境（nginx/PHP/MySQL/MariaDB）"
       ;;
     2)
       MODE_DESC="卸载面板及 LNMP"
@@ -1041,6 +1157,7 @@ describe_mode() {
       say "  不会删：~/www（你的站点文件）、Homebrew 本身、你自己 brew 装的软件"
       ;;
   esac
+  notice_supervised_apps
 }
 
 confirm_all() {
