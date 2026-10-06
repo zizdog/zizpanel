@@ -92,8 +92,9 @@ func TestSystemDaemonFlagMatchesJudgment(t *testing.T) {
 		"ollama":       true,
 		"php82":        true,
 		"php84":        true,
-		// 下载器半夜要接着下，重启后必须自己回来（2026-09-20 新增）。
-		"transmission": true,
+		// 下载器半夜要接着下，重启后必须自己回来。
+		// transmission 不在这里：2026-10-06 起它由面板自己写系统级 LaunchDaemon
+		// （com.zizdog.transmission），不走 brew services 搬迁这条路（同 zizvideo/jellyfin）。
 		// 同上，aria2 也是下载器（2026-09-22 新增）。
 		"aria2": true,
 		// 2026-09-23 起"填表就能加应用"：下三个是插件表里新增的 brew 服务型应用，

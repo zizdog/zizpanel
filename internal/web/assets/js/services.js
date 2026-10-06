@@ -1494,8 +1494,10 @@ async function resetFilebrowserPassword(s) {
   });
 }
 
-// TRANSMISSION_LABELS 是 Transmission 的 launchd label（brew 两套前缀都可能）。
-const TRANSMISSION_LABELS = ['homebrew.mxcl.transmission-cli', 'sh.brew.transmission-cli'];
+// TRANSMISSION_LABELS 是 Transmission 的 launchd label。
+// 首位是**面板自己写的系统级 LaunchDaemon**（新装唯一会用到的）；后两个是 brew 旧前缀，
+// 保留它们只为"还没重新安装、记录仍指向旧 label"的机器也能看到「⚙️ RPC 设置」。
+const TRANSMISSION_LABELS = ['com.zizdog.transmission', 'homebrew.mxcl.transmission-cli', 'sh.brew.transmission-cli'];
 
 // openTransmissionSettingsModal 改 Transmission 的 RPC 用户名 / 口令 / 下载目录。
 //
@@ -1505,7 +1507,7 @@ async function openTransmissionSettingsModal(s, parentModal) {
   const status = h('div.muted', { text: '正在读取当前设置…' });
   const userInput = h('input', { type: 'text', placeholder: 'RPC 用户名', style: { width: '100%', boxSizing: 'border-box' } });
   const pwInput = h('input', { type: 'password', placeholder: '留空＝保留当前口令；填了立即替换', style: { width: '100%', boxSizing: 'border-box' } });
-  const dirInput = h('input', { type: 'text', placeholder: '/Users/你的用户名/Downloads', style: { width: '100%', boxSizing: 'border-box' } });
+  const dirInput = h('input', { type: 'text', placeholder: '/Users/你的用户名/Downloads/transmission', style: { width: '100%', boxSizing: 'border-box' } });
   const saveBtn = h('button.btn.btn-ok', { text: '保存并重启' });
 
   const body = h('div', [
@@ -1618,6 +1620,7 @@ const WIDGET_BUTTONS = {
   // Transmission：RPC 用户名/口令 + 下载目录（后端固定「停→等→写→起→回读」，坑 226）。
   [TRANSMISSION_LABELS[0]]: (parentModal, s) => transmissionWidgetButtons(parentModal, s),
   [TRANSMISSION_LABELS[1]]: (parentModal, s) => transmissionWidgetButtons(parentModal, s),
+  [TRANSMISSION_LABELS[2]]: (parentModal, s) => transmissionWidgetButtons(parentModal, s),
 };
 
 /**

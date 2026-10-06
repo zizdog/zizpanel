@@ -1365,14 +1365,14 @@ func (m *Manager) installerPlan(ctx context.Context, app App) UninstallPlan {
 			"删掉它等于重置本机身份，重新同步要重新配对设备。**同步目录本身不在这个目录里**，不受影响。"
 	case "transmission":
 		// 下载器：配置目录里只有 settings.json（含 RPC 凭据哈希）与日志，
-		// **下载下来的文件不在那里**（默认 ~/Downloads 或用户自己设的目录），
+		// **下载下来的文件不在那里**（默认 ~/Downloads/transmission 或用户自己设的目录），
 		// 所以勾选"删除数据"也不会碰任何下载内容。
 		p.Steps = []string{
-			"停止并删除 launchd 服务（" + transmissionLabel + "）",
+			"停止并删除 launchd 服务（" + transmissionLabel + "，面板托管的 supervisor）",
 			"从「服务管理」移除记录",
 			"brew uninstall " + transmissionFormula,
 			"⚠️ 保留配置目录 " + m.transmissionConfigDir() + "（RPC 凭据与 daemon 日志）",
-			"⚠️ 已下载的文件**一个都不会删**（它们在你设置的下载目录里，默认 ~/Downloads）",
+			"⚠️ 已下载的文件**一个都不会删**（它们在你设置的下载目录里，默认 ~/Downloads/transmission）",
 		}
 		p.DataPaths = []string{m.transmissionConfigDir()}
 		p.KeepNote = "默认保留配置目录（RPC 凭据哈希在里面，重装后仍是同一个口令）；" +

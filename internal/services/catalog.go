@@ -1656,7 +1656,7 @@ func builtinCatalog() []App {
 		// ---------------- 自托管应用（原生，2026-09-20 新增 Memos/Navidrome/Transmission） ----------------
 		//
 		// 三个都按「原生应用候选评估」的结论落地：Memos/Navidrome 走官方 release
-		// tarball（同 alist 那条轨），Transmission 走 brew（formula 自带 service 块）。
+		// tarball（同 alist 那条轨），Transmission 走 brew + 面板自己的系统级 LaunchDaemon。
 		// 端口全部避开面板既有保留端口（memos 上游默认 8081 会撞 filebrowser）。
 		{
 			ID: "memos", Name: "Memos（笔记）", Icon: "📝",
@@ -1707,19 +1707,24 @@ func builtinCatalog() []App {
 					"改 RPC 用户名/口令与下载目录请用卡片上的「⚙️ RPC 设置」，别手改 settings.json。",
 			},
 			Summary:     "轻量 BitTorrent 下载器（自带 Web UI 与 RPC）",
-			Description: "轻量下载器；RPC 默认无口令 = 裸奔，面板安装时生成口令并回读核对。",
+			Description: "轻量下载器；RPC 默认无口令 = 裸奔，面板安装时生成口令并回读核对；默认下载到 ~/Downloads/transmission。",
 			Category:    CategoryTool, Kind: KindNative,
-			PanelInstaller: "transmission", ServiceLabel: "homebrew.mxcl.transmission-cli",
-			// brew formula 是 transmission-cli（不是 cask 的 GUI App），它自带 service 块。
+			PanelInstaller: "transmission", ServiceLabel: transmissionLabel,
+			// 旧记录可能还挂着 brew 的两套前缀（换托管方式留下的，坑 228）：解析服务记录时必须认，
+			// 否则「已安装」里会多渲染一张同名卡片，或显示成"找不到 plist"。
+			AliasLabels: []string{"homebrew.mxcl.transmission-cli", "sh.brew.transmission-cli"},
+			// brew formula 是 transmission-cli（不是 cask 的 GUI App）。
 			BrewFormula: "transmission-cli",
-			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
-			SystemDaemon: true,
-			// 9091：上游默认；数据/配置由 formula 的 service 块写死在 <brew>/var/transmission/。
+			// ⚠️ 刻意**不标** SystemDaemon（2026-10-06 起）：那个字段驱动的是"把 brew services
+			// 的作业搬成系统级"，而 Transmission 现在由面板自己写系统级 LaunchDaemon
+			// （com.zizdog.transmission = 面板二进制的 supervisor，见 transmission.go）。
+			// 9091：上游默认；数据/配置仍在 <brew>/var/transmission/（面板托管的 config-dir）。
 			Port: 9091, HealthPath: "/transmission/web/",
 			ConfigPath: "{brew}/var/transmission/settings.json",
 			LogPath:    "{brew}/var/transmission/transmission-daemon.log",
 			PostInstallHint: "RPC 用户名/口令见安装结果凭据区（settings.json 里存的是哈希）；" +
-				"要改用户名/口令或下载目录，用卡片上的「⚙️ RPC 设置」（面板会停→写→起→回读）。" +
+				"要改用户名/口令或下载目录，用卡片上的「⚙️ RPC 设置」（面板会停→写→起→回读）；" +
+				"默认下载目录是 ~/Downloads/transmission。" +
 				"手改 settings.json 再重启会被 daemon 退出时的回写覆盖；默认关 LSD/UPnP（DHT 保持开启，磁力链要用）。",
 			DocsURL: "https://transmissionbt.com",
 		},
@@ -1757,7 +1762,7 @@ func builtinCatalog() []App {
 		//   · 它本身只是个 JSON-RPC 服务（6800），界面 AriaNg 是静态页、由**面板**
 		//     托管在 /aria/（见 internal/web/aria2_web.go；UI.SelfConf=true 表示
 		//     不生成 app-proxy，面板只给「打开」入口）；
-		//   · 下载目录（默认 ~/aria/downloads）、RPC 密钥、会话续传都要真复核。
+		//   · 下载目录（默认 <家目录>/Downloads/aria2）、RPC 密钥、会话续传都要真复核。
 		{
 			ID: Aria2AppID, Name: "aria2（下载器）", Icon: "⬇️",
 			UI: &AppUI{
@@ -1767,7 +1772,7 @@ func builtinCatalog() []App {
 					"那个端口没在听时退回面板内 /" + Aria2Slug + "/。RPC 在 6800（绑 0.0.0.0，靠 rpc-secret 保护），不是网页入口。",
 			},
 			Summary:     "多协议下载器（HTTP/FTP/BT/磁力）+ 网页界面，多线程、可续传",
-			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/aria/downloads，重启后队列还能续上。",
+			Description: "命令行下载器的网页版：粘贴链接或磁力就能下，默认存到 ~/Downloads/aria2，重启后队列还能续上。",
 			Category:    CategoryTool, Kind: KindNative,
 			PanelInstaller: "aria2", BrewFormula: Aria2Formula, ServiceLabel: Aria2Label,
 			// 必须开机就在：下载器半夜要接着下（无头机器不加载用户级 agent，坑 130）。
@@ -1779,7 +1784,7 @@ func builtinCatalog() []App {
 			ConfigPath: "~/" + Aria2Slug + "/" + Aria2ConfName,
 			PostInstallHint: "1，入口：http://<本机IP>:8898/（免面板会话，绑 0.0.0.0）——" +
 				"2，反代：要对外用就把域名反代到这个端口，界面里的 RPC 走同源，https 下不会再报必须 SSL/WebSocket。" +
-				"3，下载目录默认 ~/aria/downloads，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
+				"3，下载目录默认 ~/Downloads/aria2，可在「📝 编辑配置文件」里改 dir= 那一行后重启服务。",
 			DocsURL: "https://aria2.github.io/",
 		},
 

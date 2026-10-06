@@ -63,14 +63,16 @@ var (
 	}
 )
 
-// ensureTransmissionService 用 launchd label 判据确认目标（brew 两套前缀都认）。
+// ensureTransmissionService 用 launchd label 判据确认目标。
+// 认三种：面板自己的 com.zizdog.transmission（2026-10-06 起）+ brew 的两套旧前缀
+// （还没重新安装、记录仍指向旧 label 的机器也要能用这个入口）。
 func (s *Server) ensureTransmissionService(ctx context.Context, name string) error {
 	svc, err := s.svcManager().Get(ctx, name)
 	if err != nil {
 		return err
 	}
 	switch strings.ToLower(strings.TrimSpace(svc.LaunchLabel)) {
-	case "homebrew.mxcl.transmission-cli", "sh.brew.transmission-cli":
+	case services.TransmissionLabel, "homebrew.mxcl.transmission-cli", "sh.brew.transmission-cli":
 		return nil
 	}
 	return errNotTransmission

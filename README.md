@@ -128,7 +128,8 @@ ddns-go、Transmission、aria2 等）、**一键建站**（Typecho、WordPress�
 - 「一键建站」会自动下载源码、建库、建站点并套用伪静态。
 - **下载器**：Transmission（网页界面是面板装好的**中文版**，第三方 MIT）、
   aria2（面板托管 AriaNg 界面，入口 `/<面板入口>/aria/`）；
-  Transmission 下载目录仍是它自己的默认 `~/Downloads`；aria2 默认落在 `~/aria/downloads`（应用自己的安装根，不再占你的「下载」）。卸载**不动**里面的文件。
+  两个下载器的默认目录统一为「用户-下载-应用名」：Transmission 落 `~/Downloads/transmission`，
+  aria2 落 `~/Downloads/aria2`（都由面板托管、继承面板权限）。卸载**不动**里面的文件。
 - **基础环境组件不参与"有新版"提醒**（「网站环境」整类：Nginx / PHP / MySQL / MariaDB /
   PostgreSQL，以及 Python 3.10–3.13、FFmpeg）：站点与其它应用都建在它们上面，有版本依赖，
   要升级请自己决定（面板不替你动）。其余应用（如 zizvideo）会正常提醒并支持一键更新。

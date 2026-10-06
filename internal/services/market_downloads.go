@@ -1475,19 +1475,21 @@ var marketDownloadApps = []MarketApp{
 
 	{
 		ID: "transmission", Kind: KindNative, BrewFormula: "transmission-cli", PanelInstaller: "transmission",
-		ServiceLabel: "homebrew.mxcl.transmission-cli",
+		ServiceLabel: transmissionLabel,
 		Runtime: MarketRuntime{
-			Mode: MarketRuntimeLaunchd, Label: "homebrew.mxcl.transmission-cli",
-			LabelSource: "formula 自带 service 块（brew info --json=v2 transmission-cli 的 service.run）；" +
-				"运行期真实 label 由 brewServiceInfo / BrewLabelFor 按磁盘 plist 推 —— " +
-				"本机实测 brew 写的是 **sh.brew.transmission-cli**，两条前缀都认",
+			Mode: MarketRuntimeLaunchd, Label: transmissionLabel,
+			LabelSource: "目录 ServiceLabel（面板安装器写的系统级 LaunchDaemon，跑的是面板二进制的 " +
+				"transmission-supervise）。安装时会把 brew 的旧作业（homebrew.mxcl.transmission-cli / " +
+				"sh.brew.transmission-cli 两套前缀）bootout 并摘掉，只留这一份 —— 否则两份实例抢 9091",
 		},
 		Downloads: []MarketDownloadPoint{
 			brewBottlePoint("transmission-cli", 30*time.Minute, "brew install transmission-cli"),
 		},
 		Note: "走自研安装器（PanelInstaller=transmission）而不是通用 brew 流程：上游默认 " +
 			"rpc-authentication-required=false 且 rpc-whitelist 只含回环 —— 默认无口令 = 裸奔，" +
-			"必须由安装器生成 rpc-username/rpc-password 并回读 settings.json 核对生效。",
+			"必须由安装器生成 rpc-username/rpc-password 并回读 settings.json 核对生效；" +
+			"服务本体是面板自己的 supervisor（继承面板权限，外接盘/受保护目录才写得进去，坑 217），" +
+			"验收除 401/200/Web UI 200 外还要回读进程树（daemon 必须是 supervisor 的子进程、以真实用户运行）。",
 	},
 
 	{
@@ -1546,7 +1548,7 @@ var marketDownloadApps = []MarketApp{
 		},
 		Note: "走自研安装器（PanelInstaller=aria2）而不是通用 brew 流程：aria2 formula 没有 service 块、" +
 			"本体只是 JSON-RPC（6800，绑 0.0.0.0 + rpc-secret）、界面由面板托管在 /aria/（UI.SelfConf=true）；" +
-			"安装器另做三件通用流程做不到的事：写归档配置（随机 rpc-secret + ~/aria/downloads + 会话续传）、" +
+			"安装器另做三件通用流程做不到的事：写归档配置（随机 rpc-secret + ~/Downloads/aria2 + 会话续传）、" +
 			"注册系统级 LaunchDaemon、拿 aria2.getVersion 真复核。" +
 			"界面 AriaNg 1.3.14（MIT）**内置在面板二进制里**（assets/ariang，3.1 MiB，见那里的 PROVENANCE.md），" +
 			"所以安装时没有任何界面相关的网络下载点。",

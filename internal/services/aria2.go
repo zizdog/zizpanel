@@ -76,9 +76,9 @@ func (m *Manager) aria2Paths() Aria2Paths {
 		Root:    root,
 		Conf:    filepath.Join(root, Aria2ConfName),
 		Session: filepath.Join(root, Aria2SessionName),
-		// 默认下载目录放应用自己的安装根下（2026-10-06 用户要求）：不占 macOS 受保护的
-		// ~/Downloads —— 后台守护进程访问受保护目录会挂在 open() 上，界面永远"连接中…"。
-		DownloadDir: filepath.Join(root, "downloads"),
+		// 默认下载目录统一为「用户-下载-应用名」（2026-10-06 用户要求，与 transmission 同规矩）。
+		// 它落在受保护的 ~/Downloads 下，靠面板 supervisor 继承面板的完全磁盘访问权限（坑 217）。
+		DownloadDir: filepath.Join(home, "Downloads", "aria2"),
 		Bin:         m.aria2cBin(),
 		Plist:       aria2PlistPath(),
 		OutLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.out.log"),
@@ -205,7 +205,8 @@ func aria2SecretFromConf(confPath string) string {
 //   - rpc-listen-all=true：用户 2026-09-23 要求局域网直连；rpc-secret 是唯一防线
 //     （面板仍提供 /aria/jsonrpc 同源代理，见 aria2_web.go）；
 //   - rpc-secret：面板随机生成，用户不必也不该手工设；
-//   - dir：默认落在应用安装根下（~/aria/downloads），不占受保护的 ~/Downloads；
+//   - dir：默认落在 <家目录>/Downloads/aria2（2026-10-06 统一路径；受保护的下载目录
+//     由面板 supervisor 继承面板授权，坑 217）；
 //   - bt-enable-lpd=false：lpd 走局域网组播，会触发 macOS 的"查找本地网络设备"
 //     授权弹窗（transmission 那次就是这么被烦到的，见坑 229）；
 //     DHT 是公网单播，不触发弹窗，保持开启（否则磁力链只能靠 tracker）；
@@ -476,19 +477,18 @@ func (m *Manager) waitAria2Ready(ctx context.Context, p Aria2Paths, secret strin
 
 // aria2ReadyRemedy 给"服务起来了但 RPC 不可用"配一条**具体**的出路。
 //
-// 为什么要按目录分岔（mini 真机 2026-09-23，用户报"永远连接中…"）：aria2 是后台
-// LaunchDaemon，macOS 隐私保护（文件与文件夹 → 下载/桌面/文稿）会让它访问这些目录时
-// **挂在 open() 上**（不是拒绝、也不报错：连不需要凭据的 GET / 都不回），界面表现就是
-// 一直"连接中…"。查这个坑花了很久，因为旧文案只说"6800 被占用 / 配置被改坏"。
+// 为什么要按目录分岔（mini 真机 2026-09-23，用户报"永远连接中…"）：macOS 隐私保护
+// （文件与文件夹 → 下载/桌面/文稿）会让后台服务访问这些目录时**挂在 open() 上**
+// （不是拒绝、也不报错：连不需要凭据的 GET / 都不回），界面表现就是一直"连接中…"。
 //
-// 默认目录已在应用安装根下（2026-10-06），这条出路只在用户自己把 dir= 指到
-// 受保护位置时才会出现：要么授权、要么换目录。
+// 默认目录现在是 ~/Downloads/aria2（2026-10-06），正好在保护范围内 —— 但它由面板
+// supervisor 拉起（继承面板授权，坑 217），所以要授权的是**面板程序**，不是 aria2c 本身。
 func aria2ReadyRemedy(downloadDir, home string) string {
 	const base = "在「服务管理 → aria2」里点「重启服务」再试"
 	if name := tccProtectedFolderName(downloadDir, home); name != "" {
-		return "先给 /opt/homebrew/bin/aria2c 开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」" +
-			"（后台服务弹不出授权框，不开就是卡死），再点「重启服务」；" +
-			"或者把「📝 编辑配置文件」里的 dir= 换成不受保护的位置（例如 ~/aria2/downloads）" +
+		return "先给面板程序开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」" +
+			"（aria2 由面板的 supervisor 拉起、继承面板授权；后台服务弹不出授权框，不开就是卡死），" +
+			"再点「重启服务」；或者把「📝 编辑配置文件」里的 dir= 换成不受保护的位置（例如 ~/aria2/downloads）" +
 			"—— 下载目录现在是 " + downloadDir + "（macOS 的" + name + "受隐私保护）。"
 	}
 	return base + "；仍然失败看下面的日志尾部" +

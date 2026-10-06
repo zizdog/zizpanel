@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -386,11 +387,9 @@ func TestTransmissionUninstallPlanIsRunnable(t *testing.T) {
 
 // ---------- 安装器主路径与"不谎报"回归 ----------
 
-// fakeTransmissionBrew 写一个只记录调用、按需报告"包已装/未装"的假 brew。
-//
-// services info 返回沙箱里**真实存在**的 plist 路径：这样 brewServiceInfo 与
-// AdoptCandidate 都不会退到 launchctl 去碰真实服务（单测不许碰真实 launchd）。
-func fakeTransmissionBrew(t *testing.T, marker string, installed bool, plist string) string {
+// fakeTransmissionBrew 写一个只记录调用、按需报告"包已装/未装"的假 brew，
+// 并在同目录造出 transmission-daemon（安装器会 stat 它）。
+func fakeTransmissionBrew(t *testing.T, marker string, installed bool) string {
 	t.Helper()
 	code := "1"
 	if installed {
@@ -406,38 +405,86 @@ if [ "$1" = "list" ] && [ "$2" = "--versions" ]; then
   fi
   exit 1
 fi
-if [ "$1" = "services" ] && [ "$2" = "info" ]; then
-  printf '%s' '[{"name":"transmission-cli","status":"started","file":"` + plist + `"}]'
-  exit 0
-fi
 exit 0
 `
 	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	bin := filepath.Join(filepath.Dir(p), "transmission-daemon")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	return p
 }
 
-// transmissionHarness 造一个完全沙箱化的 Manager + 假 brew + 注入的 HTTP 探测。
+// supervisedTransmissionProcs 造一份**正确**的进程树：daemon 以真实用户运行，
+// 父进程是面板二进制的 transmission-supervise（回读判据的正向输入）。
+func supervisedTransmissionProcs(configDir, user string) []transmissionProc {
+	return []transmissionProc{
+		{PID: 100, PPID: 1, User: "root",
+			Command: "/opt/zizpanel/bin/zizpanel transmission-supervise --user " + user +
+				" --bin /opt/homebrew/bin/transmission-daemon --config-dir " + configDir +
+				" --log " + configDir + "/transmission-daemon.log --home /Users/" + user},
+		{PID: 101, PPID: 100, User: user,
+			Command: "/opt/homebrew/bin/transmission-daemon --foreground --config-dir " + configDir +
+				" --log-info --logfile " + configDir + "/transmission-daemon.log"},
+	}
+}
+
+// transmissionHarness 造一个完全沙箱化的 Manager + 假 brew + 注入的 launchd/进程探针。
 //
 // authCode 是"带凭据"时 RPC 的返回码，unauthCode 是"不带凭据"时的返回码；
 // webCode 是 /transmission/web/ 的返回码。nil 探测函数默认给 200/401/200。
 func transmissionHarness(t *testing.T, opts ...func(m *Manager)) (*Manager, string, *InstallResult) {
 	t.Helper()
-	stubSystemDaemonEnsure(t, nil)
 	m, _ := sandboxIdempotentManager(t)
-	// brew 前缀落在临时目录里（transmissionConfigDir 由它推导）。
-	prefix := t.TempDir()
-	plist := filepath.Join(prefix, "LaunchAgents", transmissionLabel+".plist")
-	if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
-		t.Fatal(err)
+	// 安装器要求真实用户（daemon 以它身份跑）。用当前用户：chown 到自己不需要特权。
+	cur, err := user.Current()
+	if err != nil {
+		t.Skipf("拿不到当前用户：%v", err)
 	}
-	if err := os.WriteFile(plist, []byte("<plist/>"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	m.opt.UserName = cur.Username
+	// 旧作业的 plist 路径（systemDaemonUserPlist / SystemDaemonPlistPath）必须落在临时目录，
+	// 否则 retireBrewTransmission 会去删真实 /Library/LaunchDaemons（本机确实有一份）。
+	oldDaemons := SystemLaunchDaemonsDir
+	SystemLaunchDaemonsDir = t.TempDir()
+	t.Cleanup(func() { SystemLaunchDaemonsDir = oldDaemons })
+	// 我们自己的 plist 落在临时家目录的 LaunchAgents 下：AdoptCandidate 按家目录能找到它
+	// （生产是 /Library/LaunchDaemons，同一套登记逻辑）。
+	plist := filepath.Join(m.opt.UserHome, "Library", "LaunchAgents", transmissionLabel+".plist")
+	oldPlist := transmissionPlistPath
+	transmissionPlistPath = func() string { return plist }
+	oldExec := transmissionExecutable
+	transmissionExecutable = func() (string, error) { return "/opt/zizpanel/bin/zizpanel", nil }
+	oldBoot, oldDisable, oldTable := transmissionBootout, transmissionDisable, transmissionProcessTable
 	marker := filepath.Join(t.TempDir(), "brew-calls")
-	m.opt.BrewBin = fakeTransmissionBrew(t, marker, true, plist)
-	m.opt.UserName = "" // 不在临时目录上 chown
+	// 记录"摘掉 brew 旧作业"的动作（label 列表），供安装门禁断言两套前缀都处理了。
+	bootLog := filepath.Join(m.opt.UserHome, "bootout.log")
+	transmissionBootout = func(_ *Manager, _ context.Context, label string) error {
+		f, err := os.OpenFile(bootLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, _ = f.WriteString(label + "\n")
+		return nil
+	}
+	transmissionDisable = func(*Manager, context.Context, string) error { return nil }
+	transmissionProcessTable = func(context.Context) ([]transmissionProc, error) {
+		return supervisedTransmissionProcs(m.transmissionConfigDir(), cur.Username), nil
+	}
+	t.Cleanup(func() {
+		transmissionPlistPath, transmissionExecutable = oldPlist, oldExec
+		transmissionBootout, transmissionDisable, transmissionProcessTable = oldBoot, oldDisable, oldTable
+	})
+
+	m.opt.BrewBin = fakeTransmissionBrew(t, marker, true)
+	// 写探针默认成功（不真跑 sudo touch；不可写的负向对照由 useTransmissionWriteProbe 注入）。
+	oldProbe := transmissionWriteProbe
+	transmissionWriteProbe = func(_ *Manager, _ context.Context, p string) error {
+		return os.WriteFile(p, nil, 0o600)
+	}
+	t.Cleanup(func() { transmissionWriteProbe = oldProbe })
 	transmissionWaitOverride = 300 * time.Millisecond
 	t.Cleanup(func() { transmissionWaitOverride = 60 * time.Second })
 	// 端口探测必须注入：默认实现跑真实 lsof，单测不许依赖本机 9091 的状态。
@@ -505,6 +552,19 @@ func TestInstallTransmissionHashesPasswordAndVerifies(t *testing.T) {
 	cfgPath := m.transmissionSettingsPath()
 	plain := ""
 	stopped := false
+	// 造出 brew 的旧作业（两套前缀 × 用户级/系统级两处），安装必须把它们摘干净：
+	// 留着任何一份，重启后都会和面板托管的实例抢 9091。
+	for _, label := range transmissionBrewLabels() {
+		for _, p := range []string{m.systemDaemonUserPlist(label), SystemDaemonPlistPath(label)} {
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("<plist/>"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	bootLog := filepath.Join(m.opt.UserHome, "bootout.log")
 	// 顺序门禁：必须先停服务、再写配置、最后启动 —— 真机实测"运行中改写会被
 	// daemon 退出时的回写覆盖"，所以这里的 start 钩子会检查配置已经写好了。
 	useTransmissionProbes(t, nil, func(*Manager, context.Context) error {
@@ -565,6 +625,130 @@ func TestInstallTransmissionHashesPasswordAndVerifies(t *testing.T) {
 	// 也会在顺序错了时让安装失败）。
 	if !stopped {
 		t.Error("安装流程没有先停掉 transmission —— 运行中改配置会被 daemon 退出时的回写覆盖")
+	}
+	// 默认下载目录是新的统一路径 <家目录>/Downloads/transmission（2026-10-06 用户要求）。
+	if raw, err := os.ReadFile(cfgPath); err != nil {
+		t.Fatalf("回读 settings.json 失败：%v", err)
+	} else if got := transmissionSettingsString(raw, "download-dir"); got != m.transmissionPaths().DownloadDir {
+		t.Errorf("默认下载目录应为 %s，实际 %s", m.transmissionPaths().DownloadDir, got)
+	}
+
+	// ---- 2026-10-06 改造的门禁：只留面板自己的 plist，brew 旧作业必须已被摘掉 ----
+	//
+	// 安装前先造出 brew 的旧作业（两套前缀 × 用户级/系统级两处）—— 真机上这是
+	// systemdaemon 搬迁留下的 /Library/LaunchDaemons/homebrew.mxcl.*.plist 与
+	// 用户级 agent。留着任何一份，重启后都会和我们的实例抢 9091。
+	// （plist 在安装前造，所以这段断言放在后面；造文件的语句在下方前置区。）
+	raw, err := os.ReadFile(transmissionPlistPath())
+	if err != nil {
+		t.Fatalf("安装完没有留下面板自己的 plist：%v", err)
+	}
+	for _, want := range []string{
+		"<string>" + transmissionLabel + "</string>",
+		"<string>transmission-supervise</string>",
+		"<string>--config-dir</string>",
+		"<string>" + m.transmissionConfigDir() + "</string>",
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("面板 plist 里缺少 %q：\n%s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), "<key>UserName</key>") {
+		t.Errorf("supervisor 作业必须由 root 跑（fork 后降权），不该有 UserName：\n%s", raw)
+	}
+	booted, _ := os.ReadFile(bootLog)
+	for _, label := range transmissionBrewLabels() {
+		if !strings.Contains(string(booted), label) {
+			t.Errorf("没有 bootout brew 的旧作业 %s（两份实例会抢 9091），实际记录：%q", label, booted)
+		}
+		if p := SystemDaemonPlistPath(label); fileExists(p) {
+			t.Errorf("brew 旧作业的系统级 plist 还在：%s", p)
+		}
+		if p := m.systemDaemonUserPlist(label); fileExists(p) {
+			t.Errorf("brew 旧作业的用户级 plist 还在：%s", p)
+		}
+	}
+	// 幂等：再装一遍不许留下第二份作业（plist 只有一份；旧作业每次都再摘一遍）。
+	if err := m.InstallTransmission(t.Context(), res); err != nil {
+		t.Fatalf("重复安装应成功（幂等），实际: %v", err)
+	}
+	// 必须登记到面板（label 用新的那个，否则卡片上的「⚙️ RPC 设置」挂不上、市场显示未安装）。
+	if app, ok := FindApp("transmission"); !ok {
+		t.Error("目录里没有 transmission")
+	} else if rec := m.installedRecordFor(t.Context(), app); rec == nil {
+		t.Errorf("安装后必须有服务记录（label=%s）", transmissionLabel)
+	} else if rec.LaunchLabel != transmissionLabel {
+		t.Errorf("服务记录的 label 应是 %s，实际 %s", transmissionLabel, rec.LaunchLabel)
+	}
+	if again, err := os.ReadFile(transmissionPlistPath()); err != nil {
+		t.Fatalf("重复安装后读不到 plist：%v", err)
+	} else if n := strings.Count(string(again), "<key>Label</key>"); n != 1 {
+		t.Errorf("重复安装后 plist 里应只有一个 Label，实际 %d 个：\n%s", n, again)
+	}
+	booted2, _ := os.ReadFile(bootLog)
+	for _, label := range transmissionBrewLabels() {
+		if n := strings.Count(string(booted2), label+"\n"); n < 2 {
+			t.Errorf("重复安装没有再次摘掉旧作业 %s（只记录了 %d 次）", label, n)
+		}
+	}
+}
+
+// TestInstallTransmissionFailsWhenDaemonNotSupervisedByPanel 是 2026-10-06 改造的
+// 负向对照：进程树回读对不上时**不许报成功**。
+//
+// 这一类缺陷真会发生：brew 旧作业没摘干净时，9091 在听、RPC 401/200、Web UI 也 200 ——
+// 但跑的是 brew 直接起的 daemon（不继承面板授权、可能以 root/别的身份跑）。
+// 只看端口与 HTTP 是抓不到的，所以必须回读 `ps` 的父子关系与运行用户。
+func TestInstallTransmissionFailsWhenDaemonNotSupervisedByPanel(t *testing.T) {
+	cases := []struct {
+		name  string
+		procs func(configDir, user string) []transmissionProc
+	}{
+		{"父进程不是 supervisor（brew 旧实例）", func(configDir, user string) []transmissionProc {
+			return []transmissionProc{
+				{PID: 200, PPID: 1, User: user,
+					Command: "/opt/homebrew/opt/transmission-cli/bin/transmission-daemon --foreground --config-dir " + configDir},
+			}
+		}},
+		{"daemon 以 root 运行", func(configDir, user string) []transmissionProc {
+			p := supervisedTransmissionProcs(configDir, user)
+			p[1].User = "root"
+			return p
+		}},
+		{"daemon 没在跑", func(configDir, user string) []transmissionProc {
+			return []transmissionProc{
+				{PID: 100, PPID: 1, User: "root", Command: "/opt/zizpanel/bin/zizpanel transmission-supervise --user " + user},
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, res := transmissionHarness(t)
+			cfgPath := m.transmissionSettingsPath()
+			cur, _ := user.Current()
+			transmissionProcessTable = func(context.Context) ([]transmissionProc, error) {
+				return tc.procs(m.transmissionConfigDir(), cur.Username), nil
+			}
+			useTransmissionProbes(t, func(_ *Manager, _ context.Context, url, user, _ string) (int, error) {
+				if strings.Contains(url, "/transmission/rpc") {
+					if user == "" {
+						return http.StatusUnauthorized, nil
+					}
+					return http.StatusConflict, nil
+				}
+				return http.StatusOK, nil
+			}, nil, func(*Manager, context.Context) error {
+				hashTransmissionSettingsLikeDaemon(t, cfgPath)
+				return nil
+			})
+			err := m.InstallTransmission(t.Context(), res)
+			if err == nil {
+				t.Fatal("进程树对不上时安装必须失败（不许把 brew 旧实例当成面板托管成功）")
+			}
+			if !strings.Contains(err.Error(), "进程树") {
+				t.Errorf("失败原因必须说清是进程树回读没过，实际：%v", err)
+			}
+		})
 	}
 }
 

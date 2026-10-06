@@ -114,6 +114,12 @@ func main() {
 		// jellyfin —— 与面板同一代码要求，所以共用面板的 TCC 授权
 		// （读外接盘媒体库不需要第二套授权；见 cmd/zizpanel/jellyfin.go）。
 		err = cmdJellyfinSupervise(rest)
+	case "transmission-supervise":
+		// Transmission（下载器）的常驻 supervisor：由**系统级** LaunchDaemon
+		// com.zizdog.transmission 以 root 拉起，fork 后 setuid 到真实用户运行
+		// transmission-daemon —— 与面板同一代码要求，所以下载到外接盘/受保护目录时
+		// 共用面板的 TCC 授权（见 cmd/zizpanel/transmission.go 与坑 217）。
+		err = cmdTransmissionSupervise(rest)
 	case "reset-password", "passwd":
 		err = cmdResetPassword(rest)
 	case "hash-password":
@@ -185,6 +191,7 @@ func usage() {
   zizpanel plugin plan <file>      干跑：打印"装这台机器会做什么"（不碰机器）
   zizpanel zizvideo-supervise      拉起并保活 zizvideo（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel jellyfin-supervise      拉起并保活 Jellyfin（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
+  zizpanel transmission-supervise  拉起并保活 Transmission（由系统级 LaunchDaemon 以 root 调用，子进程降权到真实用户）
   zizpanel version                 显示版本
 
 常用参数:

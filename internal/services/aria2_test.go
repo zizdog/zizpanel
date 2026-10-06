@@ -97,21 +97,21 @@ func fakeAria2Brew(t *testing.T, installed bool) string {
 	return p
 }
 
-// TestAria2ConfMatchesUserRequirements 锁住两条：默认下载目录在应用安装根下（不占受保护的
-// ~/Downloads，2026-10-06 用户要求）、不弹本地网络授权。
+// TestAria2ConfMatchesUserRequirements 锁住两条：默认下载目录统一为
+// <家目录>/Downloads/aria2（2026-10-06 用户要求，与 transmission 同规矩）、不弹本地网络授权。
 func TestAria2ConfMatchesUserRequirements(t *testing.T) {
 	home := "/Users/someone"
 	p := Aria2Paths{Home: home, Root: filepath.Join(home, "aria"),
 		Conf:        Aria2ConfPath(home),
 		Session:     filepath.Join(home, "aria", Aria2SessionName),
-		DownloadDir: filepath.Join(home, "aria", "downloads"),
+		DownloadDir: filepath.Join(home, "Downloads", "aria2"),
 		OutLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.out.log"),
 		ErrLog:      filepath.Join(home, "Library", "Logs", "zizpanel-aria2.err.log"),
 	}
 	conf := aria2Conf(p, "SECRET123")
 	for _, want := range []string{
-		"dir=" + filepath.Join(home, "aria", "downloads"), // 默认目录：应用安装根下，不受隐私保护
-		"rpc-listen-all=true",                             // 用户 2026-09-23：局域网直连（靠 rpc-secret 保护）
+		"dir=" + filepath.Join(home, "Downloads", "aria2"), // 默认目录：用户-下载-应用名（2026-10-06 统一）
+		"rpc-listen-all=true",                              // 用户 2026-09-23：局域网直连（靠 rpc-secret 保护）
 		fmt.Sprintf("rpc-listen-port=%d", Aria2RPCPort),
 		"rpc-secret=SECRET123",
 		"enable-rpc=true",
@@ -381,15 +381,16 @@ func TestUpgradeBrewAppRestartsRunningService(t *testing.T) {
 // TestAria2ReadyRemedyNamesMacPrivacyTrap 锁住 2026-09-23 真机那次排查最久的一条：
 // aria2 起来但 RPC 不回，绝大多数时候**不是**"端口被占/配置坏"，而是 macOS 隐私保护
 // 挡住了后台服务访问 ~/Downloads（挂在 open() 上，界面永远"连接中…"）。
-// 旧文案只写前者，我们照着它查了一上午 —— 所以这里把两种文案都钉死。
+// 默认目录现在是 ~/Downloads/aria2 ⇒ 授权对象必须是**面板程序**（supervisor 继承它的授权），
+// 不是 /opt/homebrew/bin/aria2c（裸跑它的做法已废弃）。
 func TestAria2ReadyRemedyNamesMacPrivacyTrap(t *testing.T) {
 	home := "/Users/zizdog"
 	got := aria2ReadyRemedy(home+"/Downloads", home)
 	if !strings.Contains(got, "完全磁盘访问权限") {
 		t.Errorf("下载目录被隐私保护时必须给出授权出路，实际：%s", got)
 	}
-	if !strings.Contains(got, "/opt/homebrew/bin/aria2c") {
-		t.Errorf("要写明给哪个二进制授权（否则用户不知道该加谁），实际：%s", got)
+	if !strings.Contains(got, "面板程序") {
+		t.Errorf("要写明给谁授权（面板 supervisor 继承了面板授权），实际：%s", got)
 	}
 	if !strings.Contains(got, home+"/Downloads") {
 		t.Errorf("要写清当前下载目录，实际：%s", got)
@@ -399,7 +400,7 @@ func TestAria2ReadyRemedyNamesMacPrivacyTrap(t *testing.T) {
 		t.Errorf("保护目录的子目录也应给出授权出路，实际：%s", g)
 	}
 	// 非保护目录：给原来的出路（不能把"卡死"当成万能解释）
-	plain := aria2ReadyRemedy(home+"/aria/downloads", home)
+	plain := aria2ReadyRemedy(home+"/aria2/downloads", home)
 	if strings.Contains(plain, "完全磁盘访问权限") {
 		t.Errorf("不受保护的目录不该提隐私授权，实际：%s", plain)
 	}
@@ -462,8 +463,8 @@ func TestAria2SuperviseArgsPointAtPanelBinary(t *testing.T) {
 			t.Errorf("参数 %q 不是绝对路径（launchd 的工作目录不是用户家目录）", a)
 		}
 	}
-	// 默认下载目录在应用安装根下（2026-10-06 用户要求：不再用受保护的 ~/Downloads）。
-	if want := filepath.Join(home, "aria", "downloads"); p.DownloadDir != want {
+	// 默认下载目录统一为 <家目录>/Downloads/aria2（2026-10-06 用户要求）。
+	if want := filepath.Join(home, "Downloads", "aria2"); p.DownloadDir != want {
 		t.Errorf("下载目录默认值应为 %s，实际 %q", want, p.DownloadDir)
 	}
 }
