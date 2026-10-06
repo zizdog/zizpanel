@@ -75,26 +75,31 @@ for a in "$@"; do
   [ "$prev" = "-f" ] && [ "$a" = "json" ] && json=1
   prev="$a"
 done
+# 状态行支持两种格式（真机上"记录名"与"SMB 名"可以不一样，见 internal/sharing/shares.go）：
+#   3 列：record \t path \t ro          （记录名 == SMB 名）
+#   4 列：record \t smbname \t path \t ro
+emit_json() {
+  printf '{'
+  first=1
+  while IFS="$TAB" read -r c1 c2 c3 c4; do
+    [ -z "$c1" ] && continue
+    if [ -n "$c4" ]; then rec="$c1"; smb="$c2"; p="$c3"; ro="$c4"; else rec="$c1"; smb="$c1"; p="$c2"; ro="$c3"; fi
+    [ "$first" = "1" ] || printf ','
+    first=0
+    printf '"%s":{"path":"%s","smb_name":"%s","smb_shared":1,"smb_read_only":%s}' "$rec" "$p" "$smb" "$ro"
+  done < "$S"
+  printf '}\n'
+}
 case "$1" in
   -l)
-    if [ "$json" = "1" ]; then
-      printf '{'
-      first=1
-      while IFS="$TAB" read -r name path ro; do
-        [ -z "$name" ] && continue
-        [ "$first" = "1" ] || printf ','
-        first=0
-        printf '"%s":{"path":"%s","smb_name":"%s","smb_shared":1,"smb_read_only":%s}' "$name" "$path" "$name" "$ro"
-      done < "$S"
-      printf '}\n'
-      exit 0
-    fi
+    if [ "$json" = "1" ]; then emit_json; exit 0; fi
     echo "			List of Share Points"
-    while IFS="$TAB" read -r name path ro; do
-      [ -z "$name" ] && continue
-      printf 'name:\t\t%s\n' "$name"
-      printf 'path:\t\t%s\n' "$path"
-      printf '\tsmb:\t{\n\t\tread-only:\t%s\n\t}\n' "$ro"
+    while IFS="$TAB" read -r c1 c2 c3 c4; do
+      [ -z "$c1" ] && continue
+      if [ -n "$c4" ]; then rec="$c1"; smb="$c2"; p="$c3"; ro="$c4"; else rec="$c1"; smb="$c1"; p="$c2"; ro="$c3"; fi
+      printf 'name:\t\t%s\n' "$rec"
+      printf 'path:\t\t%s\n' "$p"
+      printf '\tsmb:\t{\n\t\tname:\t%s\n\t\tread-only:\t%s\n\t}\n' "$smb" "$ro"
     done < "$S"
     exit 0
     ;;
@@ -115,10 +120,35 @@ case "$1" in
     exit 0
     ;;
   -r)
-    name="$2"
+    rec="$2"
     [ "$mode" = silent ] && exit 0
-    grep -v -F "$(printf '%s\t' "$name")" "$S" > "$S.tmp" 2>/dev/null || true
+    grep -v -F "$(printf '%s\t' "$rec")" "$S" > "$S.tmp" 2>/dev/null || true
     mv "$S.tmp" "$S"
+    exit 0
+    ;;
+  -e)
+    rec="$2"; shift 2; newsmb=""; newro=""; found=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -S) newsmb="$2"; shift 2 ;;
+        -R) newro="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ "$mode" = silent ] && exit 0
+    : > "$S.tmp"
+    while IFS="$TAB" read -r c1 c2 c3 c4; do
+      [ -z "$c1" ] && continue
+      if [ -n "$c4" ]; then r="$c1"; smb="$c2"; p="$c3"; ro="$c4"; else r="$c1"; smb="$c1"; p="$c2"; ro="$c3"; fi
+      if [ "$r" = "$rec" ]; then
+        found=1
+        [ -n "$newsmb" ] && smb="$newsmb"
+        [ -n "$newro" ] && ro="$newro"
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$r" "$smb" "$p" "$ro" >> "$S.tmp"
+    done < "$S"
+    mv "$S.tmp" "$S"
+    [ "$found" = "1" ] || exit 1
     exit 0
     ;;
 esac
@@ -721,5 +751,119 @@ func TestFileSharingGate(t *testing.T) {
 		if !strings.Contains(auditRaw, want) {
 			t.Errorf("[⑨审计] 缺少 %s", want)
 		}
+	}
+}
+
+// TestFileSharingShareUpdateGate 锁住「已添加的 SMB 共享可以改名 / 改只读」这条能力。
+//
+// 用户 2026-10-06 报障：加好的 SMB 共享没有编辑入口，想改名字或改只读只能删了重加。
+// 这里钉死四件事：
+//
+//	① **写操作必须用共享点记录名**（真机 Mac mini：/Volumes/ZPMirror 的记录名是 ZPMirror、
+//	   SMB 名是 zpmirror）——按 SMB 名去 `sharing -e/-r` 会找不到记录；回读里必须带记录名；
+//	② 只改传了的字段：只改名不发 `-R`，只改只读不发 `-S`（免得顺手把别的属性写回默认值）；
+//	③ 退出码 0 但回读没变 ⇒ 如实报失败（不谎报成功）；
+//	④ 找不到的共享 / NFS / 非法新名 / 什么都没改 ⇒ 400/404，且一次写命令都不许发。
+func TestFileSharingShareUpdateGate(t *testing.T) {
+	shim := newSharingShim(t)
+	oldProbe := sharing.LocalIPv4Probe
+	sharing.LocalIPv4Probe = func(context.Context) string { return "192.0.2.7" }
+	t.Cleanup(func() { sharing.LocalIPv4Probe = oldProbe })
+	srv, ts := newTestServer(t)
+	srv.sharingExportsPath = shim.exportsPath()
+	_, _, cookies := doJSON(t, ts, "POST", "/api/v1/setup",
+		map[string]string{"username": "admin", "password": "zizpanel-test-fixture-pass"}, nil)
+
+	// 4 列状态行 = 记录名 ≠ SMB 名（真机 mini 的形状）。
+	shim.setState("smbd_running", "1")
+	shim.setState("shares.txt", "ZPMirror\tzpmirror\t/Volumes/ZPMirror\t0\n")
+
+	_, out, _ := doJSON(t, ts, "GET", "/api/v1/system/sharing", nil, cookies)
+	row := sharingFindShare(t, out, "smb", "zpmirror")
+	if got := asString(mapGet(row, "record_name")); got != "ZPMirror" {
+		t.Fatalf("回读里没有记录名（record_name=%q）—— 前端只能按 SMB 名猜，写操作会找不到记录", got)
+	}
+
+	// ---- ① 改名 + 改只读：必须 `-e <记录名>` ----
+	res, out, raw := doJSON(t, ts, "PATCH", "/api/v1/system/sharing/shares", map[string]any{
+		"kind": "smb", "record_name": "ZPMirror", "name": "zpmirror",
+		"path": "/Volumes/ZPMirror", "new_name": "media", "read_only": true,
+	}, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("[①改名] 应 200，实际 %d：%v\n%s", res.StatusCode, out["msg"], raw)
+	}
+	argv := shim.log("sharing-argv.log")
+	if !strings.Contains(argv, "-e ZPMirror -s 001 -S media -R 1") {
+		t.Errorf("[①改名] 假 sharing 的 argv 不对（应用记录名 -e ZPMirror）：%s", argv)
+	}
+	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia\t/Volumes/ZPMirror\t1") {
+		t.Errorf("[①改名] 垫片侧状态没按预期变：%q", got)
+	}
+
+	// ---- ② 只改名：不许带 -R；只改只读：不许带 -S ----
+	before := shim.log("sharing-argv.log")
+	res, out, _ = doJSON(t, ts, "PATCH", "/api/v1/system/sharing/shares", map[string]any{
+		"kind": "smb", "name": "media", "path": "/Volumes/ZPMirror", "new_name": "media2",
+	}, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("[②只改名] 应 200，实际 %d：%v", res.StatusCode, out["msg"])
+	}
+	delta := shim.log("sharing-argv.log")[len(before):]
+	if !strings.Contains(delta, "-e ZPMirror -s 001 -S media2") || strings.Contains(delta, "-R ") {
+		t.Errorf("[②只改名] 应只发 -S、不发 -R，实际：%s", delta)
+	}
+	before = shim.log("sharing-argv.log")
+	res, out, _ = doJSON(t, ts, "PATCH", "/api/v1/system/sharing/shares", map[string]any{
+		"kind": "smb", "name": "media2", "path": "/Volumes/ZPMirror", "read_only": false,
+	}, cookies)
+	if res.StatusCode != 200 {
+		t.Fatalf("[②只改只读] 应 200，实际 %d：%v", res.StatusCode, out["msg"])
+	}
+	delta = shim.log("sharing-argv.log")[len(before):]
+	if !strings.Contains(delta, "-e ZPMirror -s 001 -R 0") || strings.Contains(delta, "-S ") {
+		t.Errorf("[②只改只读] 应只发 -R、不发 -S，实际：%s", delta)
+	}
+	if got := shim.state("shares.txt"); !strings.Contains(got, "ZPMirror\tmedia2\t/Volumes/ZPMirror\t0") {
+		t.Errorf("[②只改只读] 垫片侧状态不对：%q", got)
+	}
+
+	// ---- ③ 退出码 0 但回读没变 ⇒ 必须报失败 ----
+	shim.setMode("sharing-mode", "silent")
+	res, out, _ = doJSON(t, ts, "PATCH", "/api/v1/system/sharing/shares", map[string]any{
+		"kind": "smb", "name": "media2", "path": "/Volumes/ZPMirror", "new_name": "media3",
+	}, cookies)
+	if res.StatusCode == 200 {
+		t.Fatalf("[③回读] 退出码 0 但列表没变，接口却报成功")
+	}
+	if !strings.Contains(asString(mapGet(out, "msg")), "回读") {
+		t.Errorf("[③回读] 应说明回读对不上，实际 %v", out["msg"])
+	}
+	shim.setMode("sharing-mode", "ok")
+
+	// ---- ④ 负向：这些都不许发写命令 ----
+	writeBefore := strings.Count(shim.log("sharing-argv.log"), "-e ")
+	for _, c := range []struct {
+		name string
+		body map[string]any
+		code int
+	}{
+		{"找不到的共享", map[string]any{"kind": "smb", "name": "nope", "path": "/Volumes/X", "read_only": true}, 404},
+		{"NFS 不在支持范围", map[string]any{"kind": "nfs", "name": "/srv/x", "read_only": true}, 400},
+		{"非法新名字", map[string]any{"kind": "smb", "name": "media2", "new_name": "bad/name"}, 400},
+		{"什么都没改", map[string]any{"kind": "smb", "name": "media2"}, 400},
+	} {
+		res, out, _ = doJSON(t, ts, "PATCH", "/api/v1/system/sharing/shares", c.body, cookies)
+		if res.StatusCode != c.code {
+			t.Errorf("[④%s] 应 %d，实际 %d：%v", c.name, c.code, res.StatusCode, out["msg"])
+		}
+	}
+	if got := strings.Count(shim.log("sharing-argv.log"), "-e "); got != writeBefore {
+		t.Errorf("[④负向] 被拒的请求不该发 `sharing -e`：%d → %d", writeBefore, got)
+	}
+
+	// ---- ⑤ 写操作要留审计 ----
+	_, _, auditRaw := smbDo(t, ts, "GET", "/api/v1/audit?limit=200", nil, cookies)
+	if !strings.Contains(auditRaw, "sharing_share_update") {
+		t.Errorf("[⑤审计] 缺少 sharing_share_update")
 	}
 }

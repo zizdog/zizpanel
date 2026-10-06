@@ -375,6 +375,7 @@ func (s *Server) routes() http.Handler {
 	root.HandleFunc("GET /api/v1/system/sharing", s.requireAuth(s.handleSharingStatus))
 	root.HandleFunc("POST /api/v1/system/sharing/{kind}/{action}", s.requireAuth(s.handleSharingServiceAction))
 	root.HandleFunc("POST /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareCreate))
+	root.HandleFunc("PATCH /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareUpdate))
 	root.HandleFunc("DELETE /api/v1/system/sharing/shares", s.requireAuth(s.handleSharingShareDelete))
 	// 「权限」页（见 api_permissions.go）：逐项申请 macOS 授权。
 	// GET 只用不碰受保护路径的判据；apply 同步预检不通过就当场 4xx，通过才走任务中心。

@@ -76,6 +76,7 @@ export const api = {
   get: (p, o) => request('GET', p, null, o),
   post: (p, b, o) => request('POST', p, b ?? {}, o),
   put: (p, b, o) => request('PUT', p, b ?? {}, o),
+  patch: (p, b, o) => request('PATCH', p, b ?? {}, o),
   del: (p, b, o) => request('DELETE', p, b, o),
 
   // 上传文件走 multipart，不能走 request()（它会强制 JSON Content-Type，

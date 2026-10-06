@@ -1031,6 +1031,12 @@ function shareSection() {
       h('div', { style: { marginTop: '6px', display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, [
         h('span.mono', { dataset: { testid: 'zp-share-url' }, style: { fontSize: '12px', wordBreak: 'break-all' }, text: url || '（地址未知：读不到本机 IP）' }),
         url ? h('button.btn.btn-sm', { text: '复制', dataset: { testid: 'zp-share-copy' }, onclick: () => shareCopy(url) }) : null,
+        // 改名 / 改只读：SMB 才有（NFS 的 ro 写在 /etc/exports 那一行里，改它要另走一条读改写）。
+        kind === 'smb' && !unmanaged ? h('button.btn.btn-sm', {
+          text: '编辑', dataset: { testid: 'zp-share-edit' },
+          title: '改这条共享的名字或只读设置（改完回读确认；目录里的文件不动）',
+          onclick: () => openShareEdit(s),
+        }) : null,
         unmanaged ? null : h('button.btn.btn-sm.btn-danger', { text: '删除', dataset: { testid: 'zp-share-remove' }, onclick: () => removeShare(kind, s) }),
       ]),
     ]);
@@ -1101,12 +1107,57 @@ function shareSection() {
       { title: '删除' + what, danger: true, okText: '删除' });
     if (!okDel) return;
     try {
-      await api.del(apiURL('system/sharing/shares'), { kind, name: s.name });
+      await api.del(apiURL('system/sharing/shares'), { kind, name: s.name, record_name: s.record_name, path: s.path });
       toast('已删除 ' + s.name, 'ok');
     } catch (e) {
       failureToast(e, 20000);
     }
     load(false);
+  }
+
+  // openShareEdit 改一条 SMB 共享：名字与只读。只提交真的变了的东西（没改就不发请求）。
+  function openShareEdit(s) {
+    const nameI = h('input.input', { type: 'text', value: s.name || '', maxlength: 40, dataset: { testid: 'zp-share-edit-name' } });
+    const roI = h('input', { type: 'checkbox', checked: !!s.read_only, dataset: { testid: 'zp-share-edit-readonly' } });
+    const err = h('div.hint', { style: { color: 'var(--danger)', display: 'none' }, dataset: { testid: 'zp-share-edit-error' } });
+    const setErr = (m) => { err.textContent = m || ''; err.style.display = m ? '' : 'none'; };
+    const saveBtn = h('button.btn.btn-primary', { text: '保存', dataset: { testid: 'zp-share-edit-save' } });
+
+    const m = modal({
+      title: '编辑 SMB 共享「' + (s.name || '') + '」',
+      body: h('div', [
+        h('div.field', [h('label', { text: '共享名（别的设备看到的名字）' }), nameI]),
+        h('label', { style: { display: 'flex', gap: '6px', alignItems: 'center', marginTop: '8px' } }, [
+          roI, h('span', { text: '只读（其它设备只能读，不能写）' }),
+        ]),
+        h('div.hint', { style: { marginTop: '6px' }, text: '目录：' + (s.path || '') }),
+        h('div', { style: { margin: '10px 0' } }, [saveBtn]),
+        err,
+        h('p.hint', { text: '改完面板会回读 `sharing -l` 确认；对不上会如实报失败，不会假装成功。' }),
+      ]),
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      const newName = nameI.value.trim();
+      const ro = !!roI.checked;
+      const renamed = newName !== (s.name || '');
+      const roChanged = ro !== !!s.read_only;
+      if (!renamed && !roChanged) { toast('没有改动', 'ok', 6000); m.close(); return; }
+      if (!newName) { setErr('共享名不能为空'); return; }
+      const body = { kind: 'smb', record_name: s.record_name, name: s.name, path: s.path };
+      if (renamed) body.new_name = newName;
+      if (roChanged) body.read_only = ro;
+      saveBtn.disabled = true;
+      try {
+        await api.patch(apiURL('system/sharing/shares'), body);
+        m.close();
+        toast('已保存', 'ok');
+        load(false);
+      } catch (e) {
+        setErr((e && e.message) || String(e));
+        saveBtn.disabled = false;
+      }
+    });
   }
 
   // openForm 是添加共享的唯一入口。路径可以从「可访问目录」里选，也可以手填。

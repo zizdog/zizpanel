@@ -12,6 +12,7 @@ package web
 //  4. 每个写操作都写审计（成功/失败都写）。
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -114,15 +115,18 @@ func (s *Server) checkNFSExportPath(p string) (string, int, error) {
 // ---------- 视图 ----------
 
 type sharingShareView struct {
-	Kind     string   `json:"kind"`
-	Name     string   `json:"name"`
-	Path     string   `json:"path"`
-	ReadOnly bool     `json:"read_only"`
-	Managed  bool     `json:"managed"`
-	Status   string   `json:"status"` // running / stopped / unknown
-	URL      string   `json:"url,omitempty"`
-	Line     string   `json:"line,omitempty"`
-	Options  []string `json:"options,omitempty"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// RecordName 是共享点记录名（`sharing -e/-r` 认它）：前端改/删时原样带回来，
+	// 面板据此定位——SMB 名与记录名可以不一样（真机：zpmirror vs ZPMirror）。
+	RecordName string   `json:"record_name,omitempty"`
+	Path       string   `json:"path"`
+	ReadOnly   bool     `json:"read_only"`
+	Managed    bool     `json:"managed"`
+	Status     string   `json:"status"` // running / stopped / unknown
+	URL        string   `json:"url,omitempty"`
+	Line       string   `json:"line,omitempty"`
+	Options    []string `json:"options,omitempty"`
 }
 
 type sharingServiceView struct {
@@ -177,7 +181,7 @@ func (s *Server) handleSharingStatus(w http.ResponseWriter, r *http.Request) {
 		Shares: []sharingShareView{}, SharesKnown: smbKnown, SharesError: smbErr}
 	for _, sh := range smbShares {
 		smbView.Shares = append(smbView.Shares, sharingShareView{
-			Kind: "smb", Name: sh.Name, Path: sh.Path, ReadOnly: sh.ReadOnly,
+			Kind: "smb", Name: sh.Name, RecordName: sh.RecordName, Path: sh.Path, ReadOnly: sh.ReadOnly,
 			Status: smbView.Status, URL: sharing.URL("smb", ip, sh.Name, sh.ReadOnly),
 		})
 	}
@@ -225,6 +229,78 @@ type sharingShareReq struct {
 	Path     string `json:"path"`
 	Name     string `json:"name"`
 	ReadOnly bool   `json:"read_only"`
+	// RecordName 是共享点记录名（列表回读里带回来的），删/改时用它定位；空则按名字/路径现查。
+	RecordName string `json:"record_name"`
+}
+
+// sharingShareUpdateReq 是"改共享"的请求：只改传了的字段（nil/空 = 不改）。
+type sharingShareUpdateReq struct {
+	Kind       string `json:"kind"`
+	RecordName string `json:"record_name"`
+	Name       string `json:"name"`      // 当前 SMB 名（定位用）
+	Path       string `json:"path"`      // 当前路径（定位用）
+	NewName    string `json:"new_name"`  // 新 SMB 名；空 = 不改名
+	ReadOnly   *bool  `json:"read_only"` // 空 = 不改只读
+}
+
+// validShareRecord 校验共享点**记录名**的形态。记录名可能含空格/中文（系统原有共享就长这样），
+// 所以只挡控制字符与超长；能不能动它由"必须在回读列表里出现过"决定。
+func validShareRecord(record string) error {
+	switch {
+	case strings.TrimSpace(record) == "":
+		return errors.New("缺少共享记录名")
+	case len([]rune(record)) > 255:
+		return errors.New("共享记录名过长")
+	case strings.ContainsAny(record, "\n\r\t\x00"):
+		return errors.New("共享记录名不能含换行/制表/控制字符")
+	}
+	return nil
+}
+
+// canonSharePath 把路径归一化后比较（软链接解析不了就退回 Clean）——
+// 与 sharing 包里回读比对的同一口径，避免 /Volumes/X 与 /private/... 这类差异误判。
+func canonSharePath(p string) string {
+	if p == "" {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
+}
+
+// resolveShareRecord 把"前端看到的那条共享"翻译成**记录名**：
+// 优先用前端带回来的 record_name（来源就是面板自己的回读结果），
+// 否则按 SMB 名（有 path 就一起比对）现读一次列表去匹配。
+func (s *Server) resolveShareRecord(ctx context.Context, exec *sharing.Executor,
+	recordName, name, path string) (string, int, error) {
+	if strings.TrimSpace(recordName) != "" {
+		if err := validShareRecord(recordName); err != nil {
+			return "", http.StatusBadRequest, err
+		}
+		return strings.TrimSpace(recordName), 0, nil
+	}
+	list, known, msg := exec.ListShares(ctx)
+	if !known {
+		return "", http.StatusBadGateway, errors.New("回读不到共享列表（未复核，不敢动手）：" + msg)
+	}
+	wantName := strings.TrimSpace(name)
+	var fallback string
+	for _, sh := range list {
+		if !strings.EqualFold(sh.Name, wantName) {
+			continue
+		}
+		if strings.TrimSpace(path) == "" || canonSharePath(sh.Path) == canonSharePath(path) {
+			return sh.RecordName, 0, nil
+		}
+		if fallback == "" {
+			fallback = sh.RecordName
+		}
+	}
+	if fallback != "" {
+		return fallback, 0, nil
+	}
+	return "", http.StatusNotFound, fmt.Errorf("没有找到共享「%s」（可能已被改动，刷新后再试）", wantName)
 }
 
 func sharingKindOf(v string) (string, bool) {
@@ -325,8 +401,13 @@ func (s *Server) handleSharingShareDelete(w http.ResponseWriter, r *http.Request
 		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res := exec.RemoveShare(r.Context(), name)
-	s.audit(r, "sharing_share_remove", name, "删除 SMB 共享 "+name, res.OK, firstLine(res.Error))
+	record, code, rerr := s.resolveShareRecord(r.Context(), exec, req.RecordName, name, req.Path)
+	if rerr != nil {
+		fail(w, code, rerr.Error())
+		return
+	}
+	res := exec.RemoveShare(r.Context(), record)
+	s.audit(r, "sharing_share_remove", name, "删除 SMB 共享 "+name+"（记录 "+record+"）", res.OK, firstLine(res.Error))
 	if !res.OK {
 		code := http.StatusBadGateway
 		if res.Missing {
@@ -335,7 +416,56 @@ func (s *Server) handleSharingShareDelete(w http.ResponseWriter, r *http.Request
 		fail(w, code, res.Error)
 		return
 	}
-	ok(w, map[string]any{"kind": "smb", "name": name, "result": res})
+	ok(w, map[string]any{"kind": "smb", "name": name, "record_name": record, "result": res})
+}
+
+// handleSharingShareUpdate PATCH /api/v1/system/sharing/shares —— body
+// {kind, record_name, name, path, new_name?, read_only?}：改 SMB 共享的名字 / 只读。
+//
+// 只做 SMB：NFS 的 ro/rw 写在 /etc/exports 那一行里，改它要走导出表的读改写（另一条路）。
+func (s *Server) handleSharingShareUpdate(w http.ResponseWriter, r *http.Request) {
+	var req sharingShareUpdateReq
+	if err := decode(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	kind, okKind := sharingKindOf(req.Kind)
+	if !okKind {
+		fail(w, http.StatusBadRequest, "类型只能是 smb 或 nfs")
+		return
+	}
+	if kind != "smb" {
+		fail(w, http.StatusBadRequest, "NFS 导出改只读请删掉重加（面板不改 /etc/exports 里已有行的选项）")
+		return
+	}
+	if req.NewName != "" {
+		if err := validShareName(strings.TrimSpace(req.NewName)); err != nil {
+			fail(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.NewName == "" && req.ReadOnly == nil {
+		fail(w, http.StatusBadRequest, "没有要改的内容（新名字与只读都没给）")
+		return
+	}
+	exec := s.sharingExec()
+	record, code, rerr := s.resolveShareRecord(r.Context(), exec, req.RecordName, req.Name, req.Path)
+	if rerr != nil {
+		fail(w, code, rerr.Error())
+		return
+	}
+	res := exec.UpdateShare(r.Context(), record, strings.TrimSpace(req.NewName), req.ReadOnly)
+	s.audit(r, "sharing_share_update", record,
+		"改 SMB 共享 "+record+"（新名 "+strings.TrimSpace(req.NewName)+"）", res.OK, firstLine(res.Error))
+	if !res.OK {
+		code := http.StatusBadGateway
+		if res.Missing {
+			code = http.StatusNotFound
+		}
+		fail(w, code, res.Error)
+		return
+	}
+	ok(w, map[string]any{"kind": "smb", "record_name": record, "result": res})
 }
 
 // handleSharingServiceAction POST /api/v1/system/sharing/{smb|nfs}/{enable|disable}
